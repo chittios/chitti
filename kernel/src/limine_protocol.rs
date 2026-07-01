@@ -1,6 +1,8 @@
-//! Hand-rolled bindings for the subset of the Limine boot protocol Phase 0
-//! needs: the base revision handshake, the framebuffer request, and the
-//! memory-map request.
+//! Hand-rolled bindings for the subset of the Limine boot protocol Chitti
+//! needs: the base revision handshake, the framebuffer request, the
+//! memory-map request, and (from Phase 1) the higher-half direct map (HHDM)
+//! request used to reach arbitrary physical frames (page tables, heap
+//! backing memory) by virtual address.
 //!
 //! Struct layouts and magic numbers are taken from the Limine boot protocol
 //! specification (stable since Limine 5.x; the base-revision mechanism
@@ -205,3 +207,85 @@ pub struct MemmapEntry {
 }
 
 pub const MEMMAP_USABLE: u64 = 0;
+
+/// Request the offset of the bootloader's higher-half direct map (HHDM):
+/// physical address `p` is reachable at virtual address `p + offset`.
+#[repr(C)]
+pub struct HhdmRequest {
+    magic: [u64; 2],
+    id: [u64; 2],
+    revision: u64,
+    response: UnsafeCell<*const HhdmResponse>,
+}
+
+// SAFETY: see `BaseRevision`'s impl above.
+unsafe impl Sync for HhdmRequest {}
+
+impl HhdmRequest {
+    pub const fn new() -> Self {
+        Self {
+            magic: COMMON_MAGIC,
+            id: [0x48dcf1cb8ad2b852, 0x63984e959a98244b],
+            revision: 0,
+            response: UnsafeCell::new(core::ptr::null()),
+        }
+    }
+
+    pub fn response(&self) -> Option<&'static HhdmResponse> {
+        // SAFETY: see `FramebufferRequest::response`.
+        let ptr = unsafe { self.response.get().read_volatile() };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*ptr })
+        }
+    }
+}
+
+#[repr(C)]
+pub struct HhdmResponse {
+    revision: u64,
+    pub offset: u64,
+}
+
+/// Request that the bootloader hand back the executable's load addresses,
+/// so we can compute an inclusive physical range for the kernel image
+/// (used to sanity-check the frame allocator excludes it).
+#[repr(C)]
+pub struct ExecutableAddressRequest {
+    magic: [u64; 2],
+    id: [u64; 2],
+    revision: u64,
+    response: UnsafeCell<*const ExecutableAddressResponse>,
+}
+
+// SAFETY: see `BaseRevision`'s impl above.
+unsafe impl Sync for ExecutableAddressRequest {}
+
+impl ExecutableAddressRequest {
+    pub const fn new() -> Self {
+        Self {
+            magic: COMMON_MAGIC,
+            id: [0x71ba76863cc55f63, 0xb2644a48c516a487],
+            revision: 0,
+            response: UnsafeCell::new(core::ptr::null()),
+        }
+    }
+
+    pub fn response(&self) -> Option<&'static ExecutableAddressResponse> {
+        // SAFETY: see `FramebufferRequest::response`.
+        let ptr = unsafe { self.response.get().read_volatile() };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*ptr })
+        }
+    }
+}
+
+#[repr(C)]
+pub struct ExecutableAddressResponse {
+    revision: u64,
+    pub physical_base: u64,
+    pub virtual_base: u64,
+}

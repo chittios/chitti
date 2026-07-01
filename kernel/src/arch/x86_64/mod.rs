@@ -1,6 +1,15 @@
-//! x86_64-specific primitives. Phase 0 only needs raw port I/O and `hlt`;
-//! GDT/IDT/paging land in Phase 1.
+//! x86_64-specific primitives: port I/O, GDT/TSS, IDT + exceptions, the
+//! legacy PIC + PIT timer + keyboard IRQs, FPU/SSE init, and 4-level
+//! paging.
 
+pub mod fpu;
+pub mod gdt;
+pub mod idt;
+pub mod interrupts;
+pub mod keyboard;
+pub mod paging;
+pub mod pic;
+pub mod pit;
 pub mod port;
 
 /// Halt the CPU until the next interrupt.

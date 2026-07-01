@@ -3,8 +3,7 @@
 #![no_main]
 
 use chitti_kernel::{
-    arch, framebuffer, limine_protocol, serial, serial_println, BASE_REVISION,
-    FRAMEBUFFER_REQUEST, MEMMAP_REQUEST,
+    arch, framebuffer, limine_protocol, serial, serial_println, FRAMEBUFFER_REQUEST, MEMMAP_REQUEST,
 };
 use core::fmt::Write as _;
 use core::panic::PanicInfo;
@@ -15,8 +14,6 @@ const BOOT_MSG: &str = "Chitti: boot ok";
 pub extern "C" fn _start() -> ! {
     serial::init();
     serial_println!("{}", BOOT_MSG);
-
-    assert!(BASE_REVISION.is_supported(), "Limine did not accept base revision 3");
 
     if let Some(fb_resp) = FRAMEBUFFER_REQUEST.response() {
         if let Some(fb) = fb_resp.framebuffers().first() {
@@ -40,6 +37,10 @@ pub extern "C" fn _start() -> ! {
     } else {
         serial_println!("Chitti: memory map request was refused");
     }
+
+    // GDT/TSS, IDT + exceptions, FPU/SSE + NX, PIC/PIT/keyboard IRQs, the
+    // frame allocator + kernel heap, then `sti`. See `chitti_kernel::init`.
+    chitti_kernel::init();
 
     loop {
         arch::x86_64::hlt();

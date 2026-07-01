@@ -16,11 +16,11 @@ document is the single source of truth; this README is a map on top of it.
 [`CLAUDE.md`](CLAUDE.md) tracks the current phase for whoever (human or
 agent) picks up work next.
 
-## Status: Phase 0 complete
+## Status: Phase 1 complete
 
 ```
 [x] 0  Boot & harness          Boot via Limine, print to serial + framebuffer, QEMU test exit codes
-[ ] 1  Microkernel core        Interrupts, memory (frames/paging/heap), timer, keyboard, ktrace
+[x] 1  Microkernel core        Interrupts, memory (frames/paging/heap), timer, keyboard, ktrace
 [ ] 2  Execution substrate     Tasks, scheduler, capabilities, IPC, async executor
 [ ] 3  Cortex (inference)      CPU transformer forward pass on a tiny GGUF, KV cache, seeded sampling  — highest risk
 [ ] 4  Synapse (capability ABI) Grammar-constrained tool calls → capability-checked primitives + audit log
@@ -54,20 +54,22 @@ chitti/
     ├── .cargo/config.toml    # target + -Z build-std + the QEMU test runner
     └── src/
         ├── main.rs           # real boot entry: _start, panic handler, boot banner
-        ├── lib.rs             # shared code + custom_test_frameworks harness (`cargo test --lib`)
+        ├── lib.rs             # shared code, init() bring-up sequence, custom_test_frameworks harness
+        ├── ktrace.rs          # deterministic sequence-numbered logging ("strace" equivalent)
         ├── limine_protocol.rs # hand-rolled Limine boot-protocol requests/responses
         ├── serial.rs          # COM1 16550 UART driver + serial_print!/serial_println!
         ├── framebuffer.rs     # 8x8 bitmap text renderer onto the Limine framebuffer
         ├── qemu.rs            # isa-debug-exit wiring for the test harness
-        └── arch/x86_64/       # arch-specific code lives only here (port I/O, hlt, ...)
+        ├── mm/                # frame allocator (memmap-backed bitmap) + linked-list kernel heap
+        └── arch/x86_64/       # arch-specific code lives only here: GDT/TSS, IDT + exceptions,
+                                #   PIC/PIT/keyboard IRQs, FPU/SSE + XSAVE init, 4-level paging
 ```
 
 Everything x86_64-specific stays under `kernel/src/arch/x86_64/`, so a future
 RISC-V port (Phase 7 stretch) only touches that directory. As later phases
-land, `kernel/src/` grows the `mm/`, `sched/`, `cap/`, `ipc/`, `cortex/`,
-`synapse/`, `persona/`, `shell/`, and `security/` modules described in
-`CHITTI_OS_HANDOFF.md` Part 3 — none of that exists yet; Phase 0 is
-intentionally just boot + serial + framebuffer + a test harness.
+land, `kernel/src/` grows the `sched/`, `cap/`, `ipc/`, `cortex/`, `synapse/`,
+`persona/`, `shell/`, and `security/` modules described in
+`CHITTI_OS_HANDOFF.md` Part 3.
 
 ## Quick start
 

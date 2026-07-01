@@ -66,6 +66,19 @@ All project commands go through `cargo xtask` (aliased in
   points at `xtask/run-test-in-qemu.sh` (see Troubleshooting for why that's
   a shell shim and not a direct `cargo run` invocation).
 
+- **PIC over APIC for Phase 1.** `arch::x86_64::pic.rs` remaps the legacy
+  8259 to vectors 32-47 rather than bringing up the I/O-APIC — the handoff
+  doc explicitly allows "APIC (or PIC fallback)", and the PIC needs no
+  ACPI/MADT parsing to find redirection tables, which keeps the
+  highest-risk part of this phase (interrupts working at all) small. APIC
+  is real future work: Phase 7's SMP stretch goal needs a per-core LAPIC
+  timer anyway.
+- **GDT/IDT/paging are hand-rolled** (no `x86_64` crate), continuing Phase
+  0's precedent for `limine_protocol.rs`: every `unsafe` block stays
+  auditable, and it sidesteps another instance of the Phase 0
+  duplicate-`core` build-std issue, since none of it pulls in a third-party
+  dependency at all.
+
 ## Troubleshooting / rough edges hit during Phase 0
 
 These are recorded here because they're easy to reintroduce by accident in
@@ -113,6 +126,41 @@ alone.
   but the test-runner QEMU invocation deliberately omits it so the process
   actually exits and `xtask runner` can read the real exit code back.
   `-no-reboot` is kept everywhere (prevents a triple-fault reboot loop).
+
+## Troubleshooting / rough edges hit during Phase 1
+
+- **Inline-asm `lateout` registers may alias `in` registers — order your
+  writes accordingly.** `arch::x86_64::gdt::init`'s far-return CS reload
+  originally computed the `lateout` return-address register (`tmp`)
+  *before* consuming the `in` selector register (`code_sel`). LLVM is free
+  to assign both to the same physical register since `lateout` promises
+  "don't touch this until every `in` operand has been read" — writing
+  `tmp` first breaks that promise, silently clobbers `code_sel`, and
+  `retfq` jumps through a bogus code selector. Symptom: an instant `#GP`
+  with the IDT still unloaded (limit 0), immediately cascading to a triple
+  fault, with **zero serial output** since it happens before anything
+  after it can log. `qemu-system-x86_64 -d int,cpu_reset -D
+  /tmp/qemu_debug.log` (then `llvm-objdump -d` the test binary and look up
+  the faulting `RIP`) is what actually found this — much faster than
+  bisecting by adding print statements. Fix: order the asm so every `in`
+  operand is consumed before any `lateout` operand is written (push the
+  selector first, *then* compute the return address).
+- **Don't build a large array on the stack before boxing it.**
+  `Box::new([0u8; 64 * 1024])` constructs the 64 KiB array as a stack
+  temporary first, then moves it into the heap allocation — and Limine's
+  boot stack is nowhere near 64 KiB. The overflow doesn't necessarily fault
+  cleanly (no guard page yet); it can silently corrupt adjacent kernel data
+  (in one run, the heap's own free-list pointers), producing symptoms far
+  from the actual cause, like an "allocator" that appears to spin forever.
+  Use `alloc::vec![0u8; n]` instead: `Vec`'s `from_elem` path writes
+  directly into the heap allocation without an `n`-byte stack temporary.
+- **Size the frame-allocator bitmap off `USABLE` memmap entries only.**
+  Some memory maps include a final huge `RESERVED` entry as a sentinel for
+  "the rest of the 64-bit address space." Computing the bitmap's frame
+  count from the highest `base + length` across *all* entries (instead of
+  just `MEMMAP_USABLE` ones) inflates it to cover that entry too — one
+  local repro sized a 2 GiB VM's bitmap for 1 TiB of address space, making
+  every allocator scan needlessly (though not infinitely) slow.
 
 ## Verifying framebuffer output headlessly
 

@@ -1,7 +1,9 @@
 //! Minimal 16550 UART driver on COM1, used as the kernel's primary log
-//! channel. Phase 0 is strictly single-threaded with interrupts disabled,
-//! so this is deliberately lock-free; a real lock lands once Phase 1/2
-//! introduce concurrency.
+//! channel. Since Phase 1, interrupts can fire between any two
+//! instructions, so `serial_print!`/`serial_println!` wrap each full
+//! write in `arch::x86_64::interrupts::without_interrupts` to keep an
+//! IRQ handler's own logging from interleaving with a write already in
+//! progress; there is still no real lock since there is only one core.
 
 use crate::arch::x86_64::port::{inb, outb};
 use core::fmt;
@@ -56,7 +58,9 @@ impl fmt::Write for Serial {
 macro_rules! serial_print {
     ($($arg:tt)*) => {{
         use core::fmt::Write as _;
-        let _ = write!($crate::serial::Serial, $($arg)*);
+        $crate::arch::x86_64::interrupts::without_interrupts(|| {
+            let _ = write!($crate::serial::Serial, $($arg)*);
+        });
     }};
 }
 
