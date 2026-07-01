@@ -10,7 +10,61 @@
 //! with -- this function's body is the entire truth about what a "task"
 //! is, register-wise.
 
-use core::arch::naked_asm;
+use core::arch::{asm, naked_asm};
+
+/// The 512-byte, 16-byte-aligned save area written by `FXSAVE` and read by
+/// `FXRSTOR` (Intel SDM Vol. 1, 10.5.1): the full x87 + SSE register state
+/// (MXCSR, control word, and the XMM/MM registers). Once Phase 3 turns on
+/// SSE codegen, the tensor kernels keep live `f32` accumulators in XMM
+/// registers across many instructions, so a preemptive context switch
+/// mid-matmul (the timer IRQ can fire at any instruction) has to preserve
+/// this state per task -- exactly as it already preserves the GPRs. We use
+/// `FXSAVE`/`FXRSTOR` (not `XSAVE`) because it needs only `CR4.OSFXSR`
+/// (set in `arch::x86_64::fpu::init`) and works on QEMU's default CPU,
+/// which reports no `XSAVE` support.
+#[repr(C, align(16))]
+pub struct FxArea([u8; 512]);
+
+impl FxArea {
+    /// Zeroed is safe here: an area is only ever `FXRSTOR`d *after* the
+    /// owning task has `FXSAVE`d into it at least once (see
+    /// `sched::yield_now`), so the zeroed bytes -- which would be an
+    /// invalid FPU state, e.g. `MXCSR = 0` -- are never actually loaded.
+    pub const fn new() -> Self {
+        Self([0; 512])
+    }
+}
+
+impl Default for FxArea {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Save the live x87/SSE state into `area`.
+///
+/// # Safety
+/// `area` must point at a valid, writable, 16-byte-aligned `FxArea`.
+#[inline]
+pub unsafe fn fxsave(area: *mut FxArea) {
+    // SAFETY: caller guarantees `area` is a valid, writable, aligned
+    // 512-byte region; `fxsave` writes exactly that and touches no other
+    // memory.
+    unsafe { asm!("fxsave [{}]", in(reg) area, options(nostack, preserves_flags)) };
+}
+
+/// Restore the x87/SSE state previously saved by `fxsave`.
+///
+/// # Safety
+/// `area` must point at a valid, 16-byte-aligned `FxArea` previously
+/// written by `fxsave` (a zeroed/garbage area would load an invalid FPU
+/// state).
+#[inline]
+pub unsafe fn fxrstor(area: *const FxArea) {
+    // SAFETY: caller guarantees `area` holds a valid saved FPU state at a
+    // valid, aligned address; `fxrstor` only reads it.
+    unsafe { asm!("fxrstor [{}]", in(reg) area, options(nostack, readonly, preserves_flags)) };
+}
 
 /// Switch from the current stack to `new_rsp`, saving the current stack
 /// pointer through `current_rsp`. Returns -- to whichever caller next

@@ -12,6 +12,11 @@ const BOOT_MSG: &str = "Chitti: boot ok";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    // Must be first: SIMD codegen is on crate-wide (Phase 3), so the
+    // optimizer may emit SSE (XMM) instructions in any code below; they
+    // fault until SSE is enabled at the hardware level. See fpu::enable_sse.
+    arch::x86_64::fpu::enable_sse();
+
     serial::init();
     serial_println!("{}", BOOT_MSG);
 
@@ -39,11 +44,68 @@ pub extern "C" fn _start() -> ! {
     }
 
     // GDT/TSS, IDT + exceptions, FPU/SSE + NX, PIC/PIT/keyboard IRQs, the
-    // frame allocator + kernel heap, then `sti`. See `chitti_kernel::init`.
+    // frame allocator + kernel heap, the scheduler, then `sti`. See
+    // `chitti_kernel::init`.
     chitti_kernel::init();
+
+    // Phase 3: report the Cortex model boot module and run the reference
+    // inference demo, if the model is present.
+    match chitti_kernel::cortex::model_module() {
+        Some(bytes) => {
+            if let Ok(g) = chitti_kernel::cortex::gguf::Gguf::parse(bytes) {
+                serial_println!(
+                    "Chitti: model.gguf loaded ({} MiB): {} layers, dim {}, {} heads/{} kv, ffn {}, vocab {}",
+                    bytes.len() / (1024 * 1024),
+                    g.config.block_count,
+                    g.config.embedding_length,
+                    g.config.head_count,
+                    g.config.head_count_kv,
+                    g.config.feed_forward_length,
+                    g.tokens.len(),
+                );
+            }
+            // `ref-check` builds run the full acceptance gate and exit QEMU
+            // with a pass/fail code; a normal `run` just shows the demo.
+            #[cfg(feature = "refcheck")]
+            {
+                let ok = chitti_kernel::cortex::run_acceptance();
+                chitti_kernel::qemu::exit_qemu(if ok {
+                    chitti_kernel::qemu::QemuExitCode::Success
+                } else {
+                    chitti_kernel::qemu::QemuExitCode::Failed
+                });
+            }
+            #[cfg(not(feature = "refcheck"))]
+            run_inference_demo();
+        }
+        None => serial_println!("Chitti: no model.gguf boot module present"),
+    }
 
     loop {
         arch::x86_64::hlt();
+    }
+}
+
+/// Phase 3 deliverable: generate a coherent, reproducible token stream from
+/// the tiny model and check it against the NumPy reference continuation.
+/// The `REFCHECK:` lines are what `cargo xtask ref-check` parses.
+#[cfg(not(feature = "refcheck"))]
+fn run_inference_demo() {
+    use chitti_kernel::cortex::{self, refcheck};
+    serial_println!("Chitti: prompt = {:?}", refcheck::PROMPT);
+    match cortex::run_reference_inference() {
+        Some(result) => {
+            serial_println!("Chitti: continuation = {:?}", result.continuation_text);
+            serial_println!(
+                "REFCHECK: prompt_final_argmax={} logit={} continuation={:?} matched_reference={}",
+                result.prompt_final_argmax,
+                result.prompt_final_logit,
+                result.continuation,
+                result.matched_reference,
+            );
+            serial_println!("REFCHECK: {}", if result.matched_reference { "PASS" } else { "FAIL" });
+        }
+        None => serial_println!("REFCHECK: FAIL (inference could not run)"),
     }
 }
 

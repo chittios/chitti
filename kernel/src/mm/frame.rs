@@ -12,6 +12,12 @@ pub const FRAME_SIZE: u64 = 4096;
 pub struct BitmapFrameAllocator {
     bitmap: &'static mut [u8],
     frame_count: u64,
+    /// Next-fit cursor: `allocate` starts scanning here rather than from
+    /// frame 0. Without it, allocating N frames is O(N²) (every call
+    /// rescans all already-used low frames), which made mapping the 64 MiB
+    /// heap take minutes under QEMU. With it, a run of sequential
+    /// allocations (heap bring-up, KV growth) is amortized O(1) each.
+    next_hint: u64,
 }
 
 fn get_bit(bitmap: &[u8], i: u64) -> bool {
@@ -81,18 +87,24 @@ impl BitmapFrameAllocator {
         let bitmap_frames = (bitmap_bytes as u64).div_ceil(FRAME_SIZE);
         mark_range(bitmap, bitmap_phys, bitmap_frames * FRAME_SIZE, true);
 
-        Self { bitmap, frame_count }
+        Self { bitmap, frame_count, next_hint: 0 }
     }
 
     /// Allocate one free 4 KiB frame, returning its physical address.
+    /// Next-fit: scan from `next_hint` to the end, then wrap to the start.
     pub fn allocate(&mut self) -> Option<u64> {
-        for frame in 0..self.frame_count {
-            if !get_bit(self.bitmap, frame) {
-                set_bit(self.bitmap, frame, true);
-                return Some(frame * FRAME_SIZE);
+        let scan = |this: &mut Self, range: core::ops::Range<u64>| -> Option<u64> {
+            for frame in range {
+                if !get_bit(this.bitmap, frame) {
+                    set_bit(this.bitmap, frame, true);
+                    this.next_hint = frame + 1;
+                    return Some(frame * FRAME_SIZE);
+                }
             }
-        }
-        None
+            None
+        };
+        let hint = self.next_hint.min(self.frame_count);
+        scan(self, hint..self.frame_count).or_else(|| scan(self, 0..hint))
     }
 
     /// Return a previously allocated frame to the pool.
@@ -100,6 +112,8 @@ impl BitmapFrameAllocator {
         let frame = phys / FRAME_SIZE;
         assert!(frame < self.frame_count, "mm::frame: freeing an out-of-range address");
         set_bit(self.bitmap, frame, false);
+        // Prefer reusing freed low frames on the next allocation.
+        self.next_hint = self.next_hint.min(frame);
     }
 
     pub fn frame_count(&self) -> u64 {

@@ -1,0 +1,3 @@
+# The model is a multi-hundred-MB binary fetched on demand, never committed.
+# Run `xtask/fetch-model.sh` (or `cargo xtask fetch-model` once wired) to get it.
+*.gguf

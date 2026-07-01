@@ -212,6 +212,59 @@ alone.
   either true (preemption works) or the test hangs, with no speed-dependent
   middle ground.
 
+## Troubleshooting / rough edges hit during Phase 3 (Cortex inference)
+
+- **Enable SSE at the hardware level as the very first boot action.** Turning
+  on SIMD codegen crate-wide (`+sse,+sse2` in the target JSON, dropping
+  soft-float) means the optimizer emits XMM instructions in *ordinary* code —
+  vectorized loops, struct moves — anywhere, including the early boot path
+  before `fpu::init` used to run. An SSE instruction with `CR0.EM`/`CR4.OSFXSR`
+  unset faults, and with no IDT loaded yet that's an instant triple fault with
+  zero serial output. Fix: a tiny `fpu::enable_sse` (CR0.EM=0/MP=1, CR4.OSFXSR)
+  called as the *first* statement in every `_start`, long before the fuller
+  `fpu::init`. Symptom before the fix: release builds triple-faulted at boot
+  while debug builds (which didn't vectorize the early path) worked — a classic
+  "works in debug, dies in release" that the `-d int,cpu_reset` QEMU log
+  (CR4=0x20, IDT=0) pinpointed immediately.
+- **Preserve SSE state across context switches.** With SIMD on, tasks keep live
+  `f32` accumulators in XMM across a matmul; the timer can preempt mid-matmul.
+  `sched::context` now `FXSAVE`/`FXRSTOR`s a per-task 512-byte area around the
+  switch. `FXSAVE` (not `XSAVE`) is used deliberately: it needs only
+  `CR4.OSFXSR`, so it works on QEMU's default CPU, which reports no XSAVE.
+  Verified with `llvm-objdump` that the interrupt-handler/scheduler path itself
+  stays XMM-clean, so nothing clobbers the interrupted task's XMM before the
+  save runs.
+- **`debug_assert!` is compiled out in release — bounds bugs surface as OOB.**
+  Two matvec calls in the first forward pass had `n_rows`/`n_cols` swapped; the
+  `debug_assert_eq!(x.len(), n_cols)` guards silently vanished in the release
+  build the model runs in, and the mismatch became a slice-index panic deep in
+  a matmul. Lesson: for release-only code paths, either keep the invariant a
+  real `assert!` or test the exact release configuration.
+- **The frame allocator's linear scan is O(n²) over a bulk mapping.** Mapping
+  the (now 256 MiB) Cortex heap is tens of thousands of single-frame
+  allocations; scanning the bitmap from frame 0 every call made boot hang for
+  minutes at 99% CPU. Fixed with a next-fit cursor (`next_hint`) so a run of
+  sequential allocations is amortized O(1). This also speeds up KV/state growth
+  during inference.
+- **Reconstructing a frontier architecture needs the reference implementation,
+  not guesswork.** The Qwen3.5-0.8B model is a gated-DeltaNet + gated-attention
+  hybrid whose exact recurrence (`g = exp(-exp(A)·softplus(α+dt))`, delta rule
+  `S = g·S + β·kᵀ(v−Sᵀk)`), gate activations (SiLU on the DeltaNet `z`, sigmoid
+  on the attention gate), interleaved per-head query/gate layout, and partial
+  mRoPE cannot be inferred reliably from tensor shapes alone — a from-shapes
+  reconstruction produced fluent gibberish. Building the NumPy reference
+  (`tools/ref_qwen35.py`) against llama.cpp's `src/models/qwen35.cpp` graph got
+  it to coherent, correct output ("Paris is the capital of France, ..."), which
+  then ported cleanly to the kernel. The host-first workflow (get NumPy
+  coherent *before* the slow kernel port) is what made this tractable.
+- **`cargo xtask test` excludes the model; `cargo xtask ref-check` includes it.**
+  The fast unit suite (tensor kernels vs baked-in NumPy vectors, sampler,
+  Phase 0–2) must not bundle or boot the ~812 MB model, or every test run
+  balloons. The `refcheck` cargo feature switches the boot binary from the
+  single-stream demo to the full acceptance gate, which `ref-check` builds in
+  release, boots with the model + 4 GiB RAM, and reads the `REFCHECK:` serial
+  lines / exit code from.
+
 ## Verifying framebuffer output headlessly
 
 `cargo xtask run` opens a normal QEMU display window. To check the

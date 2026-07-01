@@ -289,3 +289,91 @@ pub struct ExecutableAddressResponse {
     pub physical_base: u64,
     pub virtual_base: u64,
 }
+
+/// Request the list of boot modules Limine loaded (per `limine.conf`'s
+/// `module_path` entries). Phase 3 uses this to reach `model.gguf`, loaded
+/// as a module rather than compiled in (`CHITTI_OS_HANDOFF.md` Part 1).
+#[repr(C)]
+pub struct ModuleRequest {
+    magic: [u64; 2],
+    id: [u64; 2],
+    revision: u64,
+    response: UnsafeCell<*const ModuleResponse>,
+}
+
+// SAFETY: see `BaseRevision`'s impl above.
+unsafe impl Sync for ModuleRequest {}
+
+impl ModuleRequest {
+    pub const fn new() -> Self {
+        Self {
+            magic: COMMON_MAGIC,
+            id: [0x3e7e279702be32af, 0xca1c4f3bd1280cee],
+            revision: 0,
+            response: UnsafeCell::new(core::ptr::null()),
+        }
+    }
+
+    pub fn response(&self) -> Option<&'static ModuleResponse> {
+        // SAFETY: see `FramebufferRequest::response`.
+        let ptr = unsafe { self.response.get().read_volatile() };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*ptr })
+        }
+    }
+}
+
+#[repr(C)]
+pub struct ModuleResponse {
+    revision: u64,
+    module_count: u64,
+    modules: *const *const File,
+}
+
+impl ModuleResponse {
+    pub fn modules(&self) -> &'static [&'static File] {
+        // SAFETY: Limine provides `module_count` valid `File` pointers at
+        // `modules` for the lifetime of the boot session.
+        unsafe { core::slice::from_raw_parts(self.modules as *const &File, self.module_count as usize) }
+    }
+}
+
+/// A loaded module. Only the leading fields Cortex needs are declared;
+/// modules are referenced by pointer, so the omitted trailing fields
+/// (media type, disk/partition UUIDs, ...) don't affect field offsets.
+#[repr(C)]
+pub struct File {
+    pub revision: u64,
+    /// Higher-half (HHDM) virtual address of the module's contents --
+    /// directly usable as a pointer since we keep Limine's page tables.
+    pub address: *const u8,
+    pub size: u64,
+    /// Null-terminated absolute path of the module.
+    pub path: *const u8,
+    pub cmdline: *const u8,
+}
+
+impl File {
+    /// The module contents as a byte slice.
+    pub fn data(&self) -> &'static [u8] {
+        // SAFETY: Limine guarantees `address` points at `size` valid,
+        // mapped bytes for the boot session.
+        unsafe { core::slice::from_raw_parts(self.address, self.size as usize) }
+    }
+
+    /// Whether the module's path ends with `suffix` (e.g. ".gguf").
+    pub fn path_ends_with(&self, suffix: &str) -> bool {
+        // SAFETY: `path` is a valid null-terminated C string from Limine;
+        // we scan to the terminator (bounded) to recover its length.
+        let mut len = 0usize;
+        unsafe {
+            while *self.path.add(len) != 0 {
+                len += 1;
+            }
+            let bytes = core::slice::from_raw_parts(self.path, len);
+            bytes.ends_with(suffix.as_bytes())
+        }
+    }
+}
