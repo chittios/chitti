@@ -162,6 +162,56 @@ alone.
   local repro sized a 2 GiB VM's bitmap for 1 TiB of address space, making
   every allocator scan needlessly (though not infinitely) slow.
 
+## Troubleshooting / rough edges hit during Phase 2
+
+- **Naked functions need `#[unsafe(naked)]` + `core::arch::naked_asm!` on
+  this toolchain, not the older `#[naked]` + `asm!(..., options(noreturn))`
+  pattern.** `naked_functions` stabilized without needing a `#![feature(...)]`
+  gate; a stray one just produces a `stable_features` warning. `sched::context`
+  relies on naked functions specifically so nothing (no compiler-generated
+  prologue/epilogue) fights with hand-written stack manipulation: a *non*-naked
+  function's own prologue would push/adjust the stack *before* our asm block
+  runs, and popping only what we explicitly pushed later would leave that
+  extra adjustment unaccounted for, corrupting the stack on `ret`.
+- **A "preempt from inside the timer IRQ handler" context switch has to
+  save/restore `RFLAGS`, not just callee-saved GPRs.** `sched::context::switch_to`
+  saves the outgoing task's flags via `pushfq` and restores the incoming
+  task's via `popfq`, symmetric with the GPR save/restore. Without this, a
+  task preempted while running with interrupts enabled would resume (whenever
+  it's switched back to) with interrupts disabled — because the *timer
+  handler's* interrupt gate had cleared `IF` on entry, and nothing else would
+  ever set it back for that specific task. Wrapping `sched::yield_now`'s
+  bookkeeping-plus-switch in `interrupts::without_interrupts` (already used
+  everywhere else for critical sections) turns out to compose correctly here
+  too: `without_interrupts` only re-enables interrupts if they were enabled
+  *at the point `yield_now` was called*, which is exactly the right answer
+  whether that call came from ordinary task code (interrupts on) or from
+  `on_timer_tick` inside the IRQ handler (interrupts already off).
+- **A freshly spawned task's initial stack has to look exactly like a stack
+  `switch_to` itself would have produced**, i.e. a return address (the
+  trampoline) sitting under a saved `RFLAGS` word and six saved GPR slots, in
+  the exact order `switch_to`'s `pop` sequence expects them. `sched::context::init_stack`
+  smuggles the task's real entry-point function pointer and argument through
+  the (otherwise-unused, for a task that's never run) `r12`/`r13` GPR slots:
+  `switch_to`'s normal restore path pops them into the real registers, and the
+  landing-pad `trampoline` naked function reads them from there before making
+  an ordinary `call` into the task's entry function.
+- **Don't test timer preemption by racing raw iteration counts against the
+  timeslice length.** An early draft picked a target increment count assuming
+  a 5-tick (5 ms) timeslice would only allow a "few" loop iterations; in
+  practice a tight `fetch_add` loop under QEMU blows through hundreds of
+  thousands of iterations in that window, so the first-scheduled task would
+  finish entirely inside its first slice and never actually get preempted
+  mid-run -- the test would "pass" without proving anything. Fixed by
+  splitting into two tests: one fully deterministic cooperative-interleaving
+  test (every worker calls `yield_now` every iteration, so interleaving is
+  guaranteed regardless of host speed, and is checked via a log-transition
+  count, not just final totals) and one preemption-specific test where a
+  *single* task loops forever with no cooperation at all and the assertion is
+  just "the main task's `hlt` loop ever regains control" -- a property that's
+  either true (preemption works) or the test hangs, with no speed-dependent
+  middle ground.
+
 ## Verifying framebuffer output headlessly
 
 `cargo xtask run` opens a normal QEMU display window. To check the

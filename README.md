@@ -16,12 +16,12 @@ document is the single source of truth; this README is a map on top of it.
 [`CLAUDE.md`](CLAUDE.md) tracks the current phase for whoever (human or
 agent) picks up work next.
 
-## Status: Phase 1 complete
+## Status: Phase 2 complete
 
 ```
 [x] 0  Boot & harness          Boot via Limine, print to serial + framebuffer, QEMU test exit codes
 [x] 1  Microkernel core        Interrupts, memory (frames/paging/heap), timer, keyboard, ktrace
-[ ] 2  Execution substrate     Tasks, scheduler, capabilities, IPC, async executor
+[x] 2  Execution substrate     Tasks, scheduler, capabilities, IPC, async executor
 [ ] 3  Cortex (inference)      CPU transformer forward pass on a tiny GGUF, KV cache, seeded sampling  — highest risk
 [ ] 4  Synapse (capability ABI) Grammar-constrained tool calls → capability-checked primitives + audit log
 [ ] 5  Persona + shell         Agents as processes, two-tier memory, intent shell drives plan→act loop
@@ -61,15 +61,18 @@ chitti/
         ├── framebuffer.rs     # 8x8 bitmap text renderer onto the Limine framebuffer
         ├── qemu.rs            # isa-debug-exit wiring for the test harness
         ├── mm/                # frame allocator (memmap-backed bitmap) + linked-list kernel heap
-        └── arch/x86_64/       # arch-specific code lives only here: GDT/TSS, IDT + exceptions,
-                                #   PIC/PIT/keyboard IRQs, FPU/SSE + XSAVE init, 4-level paging
+        ├── arch/x86_64/       # arch-specific code lives only here: GDT/TSS, IDT + exceptions,
+        │                       #   PIC/PIT/keyboard IRQs, FPU/SSE + XSAVE init, 4-level paging
+        ├── sched/             # stackful tasks + naked-fn context switch, round-robin scheduler
+        │                       #   (cooperative + timer-preemptive), the async executor
+        ├── cap/               # unforgeable capability tokens, per-task capability tables
+        └── ipc/                # capability-gated message passing between tasks (seL4-style endpoints)
 ```
 
 Everything x86_64-specific stays under `kernel/src/arch/x86_64/`, so a future
 RISC-V port (Phase 7 stretch) only touches that directory. As later phases
-land, `kernel/src/` grows the `sched/`, `cap/`, `ipc/`, `cortex/`, `synapse/`,
-`persona/`, `shell/`, and `security/` modules described in
-`CHITTI_OS_HANDOFF.md` Part 3.
+land, `kernel/src/` grows the `cortex/`, `synapse/`, `persona/`, `shell/`, and
+`security/` modules described in `CHITTI_OS_HANDOFF.md` Part 3.
 
 ## Quick start
 

@@ -11,10 +11,13 @@
 extern crate alloc;
 
 pub mod arch;
+pub mod cap;
+pub mod ipc;
 pub mod ktrace;
 pub mod limine_protocol;
 pub mod mm;
 pub mod qemu;
+pub mod sched;
 pub mod serial;
 
 // The framebuffer writer pulls in `font8x8` (a normal, non-build-std
@@ -63,11 +66,13 @@ pub static HHDM_REQUEST: limine_protocol::HhdmRequest = limine_protocol::HhdmReq
 static _REQUESTS_END: limine_protocol::RequestsEndMarker =
     limine_protocol::RequestsEndMarker::new();
 
-/// Phase 1 bring-up: GDT/TSS, IDT + exception handlers, FPU/SSE + NX,
-/// the PIC/PIT/keyboard IRQ lines, the frame allocator + kernel heap, and
+/// Phase 0-2 bring-up: GDT/TSS, IDT + exception handlers, FPU/SSE + NX,
+/// the PIC/PIT/keyboard IRQ lines, the frame allocator + kernel heap, the
+/// task scheduler (wrapping this call's own context as task 0), and
 /// finally `sti`. Shared by the real boot binary (`main.rs`) and the
 /// `custom_test_frameworks` harness below, so every test also runs with
-/// interrupts, paging extensions, and a working heap available.
+/// interrupts, paging extensions, a working heap, and a live scheduler
+/// available.
 pub fn init() {
     assert!(BASE_REVISION.is_supported(), "Limine did not accept base revision 3");
 
@@ -84,6 +89,7 @@ pub fn init() {
         .expect("memory map request refused by Limine")
         .entries();
     mm::init(memmap, hhdm_offset);
+    sched::init();
 
     arch::x86_64::interrupts::enable();
     ktrace::log("init", "Phase 1 bring-up complete, interrupts enabled");
@@ -230,4 +236,184 @@ fn breakpoint_exception_is_caught_not_triple_faulted() {
     // Reaching this line at all is the real proof: a triple fault would
     // have reset the VM, and this test (and every later one) would never
     // report a result.
+}
+
+// --- Phase 2 acceptance tests -------------------------------------------
+
+/// (a) 3+ tasks interleave and all make progress, via voluntary
+/// `yield_now` calls -- the cooperative half of "cooperative first, then
+/// timer-preemptive." Each worker yields every single iteration, so a
+/// correct round-robin scheduler produces a heavily interleaved log; a
+/// broken one (e.g. a `switch_to` that corrupts state) would show up as
+/// either a hang (bounded spin catches it) or a log dominated by one
+/// task id (the transitions assertion catches it).
+#[test_case]
+fn cooperative_tasks_interleave_and_progress() {
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTERS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static LOG: mm::Locked<Vec<u8>> = mm::Locked::new(Vec::new());
+    const TARGET: u64 = 50;
+
+    extern "C" fn worker(idx: u64) {
+        let counter = &COUNTERS[idx as usize];
+        while counter.load(Ordering::SeqCst) < TARGET {
+            counter.fetch_add(1, Ordering::SeqCst);
+            LOG.with(|log| log.push(idx as u8));
+            sched::yield_now();
+        }
+    }
+
+    for i in 0..3u64 {
+        sched::spawn("worker", worker, i);
+    }
+
+    let mut spins = 0u64;
+    while COUNTERS.iter().any(|c| c.load(Ordering::SeqCst) < TARGET) {
+        sched::yield_now();
+        spins += 1;
+        assert!(spins < 100_000_000, "not all tasks progressed -- scheduler stuck or a task starved");
+    }
+    for c in &COUNTERS {
+        assert_eq!(c.load(Ordering::SeqCst), TARGET);
+    }
+
+    let transitions = LOG.with(|log| log.windows(2).filter(|w| w[0] != w[1]).count());
+    assert!(transitions > TARGET as usize, "tasks ran sequentially instead of interleaving (only {transitions} switches)");
+}
+
+/// Timer-preemptive half: a task that never calls `yield_now` at all
+/// still gets interrupted and descheduled, proving the PIT tick hook
+/// (`sched::on_timer_tick`, wired from `pit::timer_handler`) actually
+/// forces a switch rather than only supporting voluntary cooperation.
+#[test_case]
+fn timer_preempts_a_non_yielding_task() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn hog(_arg: u64) {
+        loop {
+            COUNTER.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    sched::spawn("hog", hog, 0);
+
+    let mut spins = 0u64;
+    while COUNTER.load(Ordering::SeqCst) < 1000 {
+        arch::x86_64::hlt();
+        spins += 1;
+        assert!(spins < 100_000_000, "timer preemption never returned control -- hog task starved the CPU");
+    }
+    // Reaching this line at all is the proof: `hog` never yields, so
+    // control could only have returned here via `on_timer_tick` forcing
+    // a switch back to this (bootstrap) task.
+}
+
+/// (b) an IPC round-trip delivers a message: the main test task sends a
+/// request on `request_ep`, a spawned responder task receives it, doubles
+/// it, and sends the result back on `reply_ep`.
+#[test_case]
+fn ipc_round_trip_delivers_a_message() {
+    // Capability convention for `responder` (documented here since a
+    // task has no other way to learn its own capability-table layout):
+    // slot 0 is granted an `IpcReceive(request_ep)` right, slot 1 an
+    // `IpcSend(reply_ep)` right, in that order, before the task ever runs.
+    extern "C" fn responder(_arg: u64) {
+        let recv_cap = cap::Cap(0);
+        let send_cap = cap::Cap(1);
+        let request = ipc::receive(recv_cap).expect("responder: receive was denied");
+        ipc::send(send_cap, request.data * 2).expect("responder: send was denied");
+    }
+
+    let request_ep = ipc::create_endpoint();
+    let reply_ep = ipc::create_endpoint();
+
+    let responder_id = sched::spawn("ipc_responder", responder, 0);
+    cap::grant(responder_id, cap::Right::IpcReceive(request_ep)); // responder's slot 0
+    cap::grant(responder_id, cap::Right::IpcSend(reply_ep)); // responder's slot 1
+
+    let my_send_cap = cap::grant(sched::current_task_id(), cap::Right::IpcSend(request_ep));
+    let my_recv_cap = cap::grant(sched::current_task_id(), cap::Right::IpcReceive(reply_ep));
+
+    ipc::send(my_send_cap, 21).expect("main: send was denied");
+    let reply = ipc::receive(my_recv_cap).expect("main: receive was denied");
+    assert_eq!(reply.data, 42, "round trip did not deliver the expected reply");
+    assert_eq!(reply.sender, responder_id, "reply reported the wrong sender");
+}
+
+/// (c) a task lacking a capability is denied the gated operation, and the
+/// denial is `ktrace`d (`cap::record_denial`, asserted here via the
+/// `cap::denials()` counter it also increments).
+#[test_case]
+fn capability_denial_is_refused_and_ktraced() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn unprivileged_sender(_arg: u64) {
+        // This task was never granted any capability, so slot 0 doesn't
+        // exist in its table: the send must be denied, not silently
+        // allowed.
+        let bogus_cap = cap::Cap(0);
+        let result = ipc::send(bogus_cap, 0);
+        assert_eq!(result, Err(ipc::IpcError::CapabilityDenied), "send without a capability was not denied");
+        DONE.store(true, Ordering::SeqCst);
+    }
+
+    let denials_before = cap::denials();
+    sched::spawn("unprivileged_sender", unprivileged_sender, 0);
+
+    let mut spins = 0u64;
+    while !DONE.load(Ordering::SeqCst) {
+        arch::x86_64::hlt();
+        spins += 1;
+        assert!(spins < 100_000_000, "the unprivileged task never ran to completion");
+    }
+    assert_eq!(cap::denials(), denials_before + 1, "the denial was not recorded/ktrace'd");
+}
+
+/// The cooperative async executor (`sched::executor`) is a separate
+/// concurrency layer from the stackful scheduler above -- this proves two
+/// futures interleave (each yields once via a waker-rescheduled `Poll`)
+/// entirely within one stackful task's call to `Executor::run`.
+#[test_case]
+fn async_executor_interleaves_two_futures() {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::task::{Context, Poll};
+
+    struct YieldOnce {
+        yielded: bool,
+    }
+
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.yielded {
+                Poll::Ready(())
+            } else {
+                self.yielded = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut executor = sched::executor::Executor::new();
+    executor.spawn(async {
+        YieldOnce { yielded: false }.await;
+        COUNTER.fetch_add(1, Ordering::SeqCst);
+    });
+    executor.spawn(async {
+        YieldOnce { yielded: false }.await;
+        COUNTER.fetch_add(1, Ordering::SeqCst);
+    });
+    executor.run();
+
+    assert_eq!(COUNTER.load(Ordering::SeqCst), 2, "not all async tasks ran to completion");
 }
