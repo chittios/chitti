@@ -52,25 +52,33 @@ pub fn run_reference_inference() -> Option<InferResult> {
     let mut kv = m.new_cache();
     let mut state = m.new_state();
 
-    // Prefill the prompt.
+    // Prefill the prompt. CPU inference on this model under QEMU is slow
+    // (~10-15s/token), so log progress per token -- otherwise the long
+    // silent gap here looks like a hang.
+    let n_prompt = refcheck::PROMPT_IDS.len();
     let mut logits_pos = 0usize;
     for (pos, &tok) in refcheck::PROMPT_IDS.iter().enumerate() {
-        m.forward(tok as usize, pos, &mut kv, &mut state);
+        crate::serial_println!("cortex.infer: prefill {}/{}", pos + 1, n_prompt);
+        m.forward(tok as usize, pos, &mut kv, &mut state, pos + 1 == n_prompt);
         logits_pos = pos;
     }
     let prompt_final_argmax = model::argmax(&state.logits);
     let prompt_final_logit = state.logits[prompt_final_argmax];
 
-    // Greedy decode.
+    // Greedy decode, streaming each token's text as it is produced.
+    let n_gen = refcheck::EXPECTED_CONTINUATION.len();
     let mut continuation = Vec::new();
     let mut pos = logits_pos + 1;
     let mut next = prompt_final_argmax;
-    for _ in 0..refcheck::EXPECTED_CONTINUATION.len() {
+    crate::serial_print!("Chitti: response> ");
+    for _ in 0..n_gen {
         continuation.push(next);
-        m.forward(next, pos, &mut kv, &mut state);
+        crate::serial_print!("{}", model::detokenize(&m, &[next]));
+        m.forward(next, pos, &mut kv, &mut state, true);
         pos += 1;
         next = model::argmax(&state.logits);
     }
+    crate::serial_println!("");
 
     let matched_reference = continuation.len() == refcheck::EXPECTED_CONTINUATION.len()
         && continuation.iter().zip(refcheck::EXPECTED_CONTINUATION.iter()).all(|(&a, &b)| a == b as usize);
@@ -115,14 +123,14 @@ pub fn run_acceptance() -> bool {
     let greedy = |m: &model::Model, kv: &mut model::Cache, n: usize| -> Vec<usize> {
         let mut state = m.new_state();
         for (pos, &tok) in prompt.iter().enumerate() {
-            m.forward(tok, pos, kv, &mut state);
+            m.forward(tok, pos, kv, &mut state, pos + 1 == prompt.len());
         }
         let mut out = Vec::new();
         let mut pos = prompt.len();
         let mut next = model::argmax(&state.logits);
         for _ in 0..n {
             out.push(next);
-            m.forward(next, pos, kv, &mut state);
+            m.forward(next, pos, kv, &mut state, true);
             pos += 1;
             next = model::argmax(&state.logits);
         }
@@ -140,7 +148,7 @@ pub fn run_acceptance() -> bool {
         let mut kv = m.new_cache();
         let mut state = m.new_state();
         for (pos, &tok) in prompt.iter().enumerate() {
-            m.forward(tok, pos, &mut kv, &mut state);
+            m.forward(tok, pos, &mut kv, &mut state, pos + 1 == prompt.len());
         }
         let mut rng = sampler::Rng::new(seed);
         let mut out = Vec::new();
@@ -148,7 +156,7 @@ pub fn run_acceptance() -> bool {
         for _ in 0..ACCEPT_GEN {
             let next = sampler::sample(&mut state.logits, 0.8, &mut rng, None);
             out.push(next);
-            m.forward(next, pos, &mut kv, &mut state);
+            m.forward(next, pos, &mut kv, &mut state, true);
             pos += 1;
         }
         out

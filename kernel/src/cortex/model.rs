@@ -270,9 +270,14 @@ impl<'a> Model<'a> {
         State::new(&self.config, self.vocab)
     }
 
-    /// One decoder step for `token` at position `pos` (== `cache.len()`),
-    /// writing next-token logits into `state.logits`.
-    pub fn forward(&self, token: usize, pos: usize, cache: &mut Cache, s: &mut State) {
+    /// One decoder step for `token` at position `pos` (== `cache.len()`).
+    /// When `need_logits`, writes next-token logits into `state.logits`;
+    /// otherwise skips the final norm + output projection. The output
+    /// projection is ~254M MACs (the vocab-sized matmul dominates a step),
+    /// and prefill only needs the *last* prompt position's logits, so
+    /// skipping it on the others speeds prefill roughly in proportion to
+    /// the prompt length -- for free, since those logits are discarded.
+    pub fn forward(&self, token: usize, pos: usize, cache: &mut Cache, s: &mut State, need_logits: bool) {
         let c = &self.config;
         let dim = c.embedding_length;
 
@@ -303,8 +308,10 @@ impl<'a> Model<'a> {
             }
         }
 
-        tensor::rmsnorm(&s.hidden, self.output_norm, c.rms_eps, &mut s.norm);
-        tensor::matvec_q8_0(self.token_embd, &s.norm, &mut s.logits, self.vocab, dim);
+        if need_logits {
+            tensor::rmsnorm(&s.hidden, self.output_norm, c.rms_eps, &mut s.norm);
+            tensor::matvec_q8_0(self.token_embd, &s.norm, &mut s.logits, self.vocab, dim);
+        }
 
         cache.positions = cache.positions.max(pos + 1);
     }
