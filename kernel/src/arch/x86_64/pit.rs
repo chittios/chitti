@@ -22,6 +22,7 @@ pub fn ticks() -> u64 {
 extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     TICKS.fetch_add(1, Ordering::SeqCst);
     pic::send_eoi(0);
+    crate::sched::on_timer_tick();
 }
 
 /// Program channel 0 for `PIT_FREQUENCY_HZ` (1kHz: a good balance between
