@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["xtask"]
+
+# `kernel/` is intentionally NOT a workspace member: it targets a custom
+# no_std triple (targets/x86_64-chitti.json) built with -Z build-std, which
+# must not be unified with xtask's ordinary host build. It has its own
+# .cargo/config.toml and Cargo.lock.

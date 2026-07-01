@@ -1,0 +1,32 @@
+[package]
+name = "chitti-kernel"
+version = "0.1.0"
+edition = "2021"
+
+# Stand-alone crate: do NOT let cargo pull this into the repo-root workspace
+# (which builds xtask for the host). This crate has its own target/build-std
+# config in .cargo/config.toml and must not be feature/target-unified with it.
+[workspace]
+
+[lib]
+name = "chitti_kernel"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "chitti-kernel"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+font8x8 = { version = "0.3.1", default-features = false }
+
+# No per-profile `panic = "abort"` override here: the target spec's own
+# "panic-strategy": "abort" is already authoritative. Adding an explicit
+# `-C panic=abort` on top of that makes this package's root profile diverge
+# from -Z build-std's canonical sysroot profile, which cargo then builds as
+# a *second* copy of core/alloc — and font8x8 (any ordinary, non-build-std
+# dependency) ends up linked against a mix of the two ("duplicate lang
+# item" errors).
