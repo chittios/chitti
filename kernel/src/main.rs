@@ -87,25 +87,32 @@ pub extern "C" fn _start() -> ! {
 }
 
 /// Phase 3 deliverable: generate a coherent, reproducible token stream from
-/// the tiny model and check it against the NumPy reference continuation.
-/// The `REFCHECK:` lines are what `cargo xtask ref-check` parses.
+/// the tiny model. Logs the prompt and the model's response to both serial
+/// (what `cargo xtask run` shows on stdio) and the framebuffer window, then
+/// records the parity check the `REFCHECK:` line carries.
 #[cfg(not(feature = "refcheck"))]
 fn run_inference_demo() {
     use chitti_kernel::cortex::{self, refcheck};
-    serial_println!("Chitti: prompt = {:?}", refcheck::PROMPT);
+
+    serial_println!("Chitti: --- Cortex inference ---");
+    serial_println!("Chitti: prompt:   {}", refcheck::PROMPT);
+    // The response streams token-by-token from run_reference_inference
+    // (a "Chitti: response> ..." line) as it is generated.
     match cortex::run_reference_inference() {
         Some(result) => {
-            serial_println!("Chitti: continuation = {:?}", result.continuation_text);
+            serial_println!("Chitti: full:     {}{}", refcheck::PROMPT, result.continuation_text);
             serial_println!(
-                "REFCHECK: prompt_final_argmax={} logit={} continuation={:?} matched_reference={}",
-                result.prompt_final_argmax,
-                result.prompt_final_logit,
+                "Chitti: (tokens={:?}, matches NumPy reference={})",
                 result.continuation,
                 result.matched_reference,
             );
-            serial_println!("REFCHECK: {}", if result.matched_reference { "PASS" } else { "FAIL" });
+            // Also render the prompt + response to the framebuffer window.
+            if let Some(fb) = FRAMEBUFFER_REQUEST.response().and_then(|r| r.framebuffers().first().copied()) {
+                let mut w = framebuffer::Writer::new(fb);
+                let _ = write!(w, "\n\nprompt:   {}\nresponse: {}", refcheck::PROMPT, result.continuation_text);
+            }
         }
-        None => serial_println!("REFCHECK: FAIL (inference could not run)"),
+        None => serial_println!("Chitti: inference could not run"),
     }
 }
 

@@ -47,7 +47,7 @@ impl<'a> Batch<'a> {
         let mut state = self.model.new_state();
         let mut tokens = Vec::with_capacity(prompt.len() + generate);
         for (pos, &tok) in prompt.iter().enumerate() {
-            self.model.forward(tok, pos, &mut kv, &mut state);
+            self.model.forward(tok, pos, &mut kv, &mut state, pos + 1 == prompt.len());
             tokens.push(tok);
         }
         let id = self.streams.len();
@@ -76,7 +76,7 @@ impl<'a> Batch<'a> {
             Some(r) => sample(&mut s.state.logits, temperature, r, grammar),
             None => argmax(&s.state.logits),
         };
-        model.forward(next, s.pos, &mut s.kv, &mut s.state);
+        model.forward(next, s.pos, &mut s.kv, &mut s.state, true);
         s.pos += 1;
         s.tokens.push(next);
         s.to_generate -= 1;
