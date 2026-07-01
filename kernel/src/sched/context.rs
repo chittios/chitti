@@ -12,26 +12,30 @@
 
 use core::arch::{asm, naked_asm};
 
-/// The 512-byte, 16-byte-aligned save area written by `FXSAVE` and read by
-/// `FXRSTOR` (Intel SDM Vol. 1, 10.5.1): the full x87 + SSE register state
-/// (MXCSR, control word, and the XMM/MM registers). Once Phase 3 turns on
-/// SSE codegen, the tensor kernels keep live `f32` accumulators in XMM
-/// registers across many instructions, so a preemptive context switch
-/// mid-matmul (the timer IRQ can fire at any instruction) has to preserve
-/// this state per task -- exactly as it already preserves the GPRs. We use
-/// `FXSAVE`/`FXRSTOR` (not `XSAVE`) because it needs only `CR4.OSFXSR`
-/// (set in `arch::x86_64::fpu::init`) and works on QEMU's default CPU,
-/// which reports no `XSAVE` support.
-#[repr(C, align(16))]
-pub struct FxArea([u8; 512]);
+/// Per-task FPU save area. Sized and 64-byte aligned for `XSAVE` of the
+/// x87 + SSE + AVX state (the YMM upper halves the AVX2 kernels use); when
+/// AVX2 is unavailable it holds a plain 512-byte `FXSAVE` image instead.
+/// 1088 bytes comfortably covers the x87+SSE+AVX `XSAVE` area (~576 B).
+///
+/// Once Phase 3 turns on SIMD codegen, the tensor kernels keep live `f32`
+/// accumulators in vector registers across many instructions, so a
+/// preemptive context switch mid-matmul (the timer IRQ can fire at any
+/// instruction) has to preserve this state per task -- exactly as it
+/// already preserves the GPRs. `FXSAVE` covers only XMM (lower 128 bits),
+/// so once AVX2 is on we must use `XSAVE`/`XRSTOR` to also save the YMM
+/// upper halves; the choice is made at runtime from `fpu::avx2_enabled()`.
+#[repr(C, align(64))]
+pub struct FxArea([u8; 1088]);
+
+/// `XSAVE`/`XRSTOR` feature mask (EDX:EAX): x87 (0) | SSE (1) | AVX (2).
+const XSAVE_MASK: u32 = 0b111;
 
 impl FxArea {
-    /// Zeroed is safe here: an area is only ever `FXRSTOR`d *after* the
-    /// owning task has `FXSAVE`d into it at least once (see
-    /// `sched::yield_now`), so the zeroed bytes -- which would be an
-    /// invalid FPU state, e.g. `MXCSR = 0` -- are never actually loaded.
+    /// Zeroed is safe here: an area is only ever restored *after* the owning
+    /// task has saved into it at least once (see `sched::yield_now`), so the
+    /// zeroed bytes -- an invalid FPU state -- are never actually loaded.
     pub const fn new() -> Self {
-        Self([0; 512])
+        Self([0; 1088])
     }
 }
 
@@ -41,29 +45,41 @@ impl Default for FxArea {
     }
 }
 
-/// Save the live x87/SSE state into `area`.
+/// Save the live x87/SSE(/AVX) state into `area` (`XSAVE` when AVX2 is on,
+/// else `FXSAVE`).
 ///
 /// # Safety
-/// `area` must point at a valid, writable, 16-byte-aligned `FxArea`.
+/// `area` must point at a valid, writable, 64-byte-aligned `FxArea`.
 #[inline]
-pub unsafe fn fxsave(area: *mut FxArea) {
-    // SAFETY: caller guarantees `area` is a valid, writable, aligned
-    // 512-byte region; `fxsave` writes exactly that and touches no other
-    // memory.
-    unsafe { asm!("fxsave [{}]", in(reg) area, options(nostack, preserves_flags)) };
+pub unsafe fn save_fpu(area: *mut FxArea) {
+    if crate::arch::x86_64::fpu::avx2_enabled() {
+        // SAFETY: OSXSAVE + XCR0 were configured in fpu::init; `area` is a
+        // valid, 64-aligned region large enough for the AVX XSAVE image.
+        unsafe {
+            asm!("xsave [{}]", in(reg) area, in("eax") XSAVE_MASK, in("edx") 0u32, options(nostack, preserves_flags))
+        };
+    } else {
+        // SAFETY: `area` is valid/writable/aligned; fxsave writes 512 bytes.
+        unsafe { asm!("fxsave [{}]", in(reg) area, options(nostack, preserves_flags)) };
+    }
 }
 
-/// Restore the x87/SSE state previously saved by `fxsave`.
+/// Restore the state previously written by `save_fpu`.
 ///
 /// # Safety
-/// `area` must point at a valid, 16-byte-aligned `FxArea` previously
-/// written by `fxsave` (a zeroed/garbage area would load an invalid FPU
-/// state).
+/// `area` must hold a valid image previously written by `save_fpu` at a
+/// valid, 64-byte-aligned address, with the same AVX2-enabled state.
 #[inline]
-pub unsafe fn fxrstor(area: *const FxArea) {
-    // SAFETY: caller guarantees `area` holds a valid saved FPU state at a
-    // valid, aligned address; `fxrstor` only reads it.
-    unsafe { asm!("fxrstor [{}]", in(reg) area, options(nostack, readonly, preserves_flags)) };
+pub unsafe fn restore_fpu(area: *const FxArea) {
+    if crate::arch::x86_64::fpu::avx2_enabled() {
+        // SAFETY: see `save_fpu`; xrstor only reads `area`.
+        unsafe {
+            asm!("xrstor [{}]", in(reg) area, in("eax") XSAVE_MASK, in("edx") 0u32, options(nostack, readonly, preserves_flags))
+        };
+    } else {
+        // SAFETY: `area` holds a valid fxsave image; fxrstor only reads it.
+        unsafe { asm!("fxrstor [{}]", in(reg) area, options(nostack, readonly, preserves_flags)) };
+    }
 }
 
 /// Switch from the current stack to `new_rsp`, saving the current stack

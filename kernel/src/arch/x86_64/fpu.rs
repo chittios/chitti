@@ -59,6 +59,39 @@ fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32) {
     (eax, ecx, edx)
 }
 
+/// As `cpuid`, but also returns `ebx` (needed for the AVX2 feature bit in
+/// leaf 7). `ebx` is copied to a scratch register before `rbx` is restored.
+fn cpuid_ebx(leaf: u32, subleaf: u32) -> u32 {
+    let ebx;
+    // SAFETY: `cpuid` has no side effects; `rbx` is restored after the value
+    // is moved into the returned scratch register.
+    unsafe {
+        asm!(
+            "push rbx",
+            "cpuid",
+            "mov {ebx:e}, ebx",
+            "pop rbx",
+            inout("eax") leaf => _,
+            inout("ecx") subleaf => _,
+            out("edx") _,
+            ebx = out(reg) ebx,
+            options(preserves_flags),
+        );
+    }
+    ebx
+}
+
+/// Set once at boot: whether AVX2 + FMA are supported by the CPU *and*
+/// enabled by the OS (`CR4.OSXSAVE` + `XCR0` AVX bit). The tensor kernels
+/// dispatch on this to pick the AVX2/FMA dot path, and the context switch
+/// uses it to choose `XSAVE` (preserves YMM) over `FXSAVE`.
+pub static AVX2_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+pub fn avx2_enabled() -> bool {
+    AVX2_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 fn read_msr(msr: u32) -> u64 {
     let (lo, hi): (u32, u32);
     // SAFETY: reading the EFER MSR (the only one this module touches) is
@@ -124,17 +157,24 @@ pub fn init() {
 
     let (_, ecx1, _) = cpuid(1, 0);
     let xsave_supported = ecx1 & (1 << 26) != 0;
+    let avx_supported = ecx1 & (1 << 28) != 0;
+    // AVX2 is CPUID leaf 7, sub-leaf 0, EBX bit 5; FMA is leaf 1 ECX bit 12.
+    let avx2_supported = cpuid_ebx(7, 0) & (1 << 5) != 0;
+    let fma_supported = ecx1 & (1 << 12) != 0;
+    // Only claim AVX2 if the whole chain is available: XSAVE (to save YMM at
+    // context switches), AVX + AVX2 + FMA (for the kernels).
+    let use_avx2 = xsave_supported && avx_supported && avx2_supported && fma_supported;
 
     // OSFXSR/OSXMMEXCPT are already set by `enable_sse`; only OSXSAVE (gated
     // on CPUID) remains, to unlock XSETBV on CPUs that support XSAVE.
     if xsave_supported {
         let cr4 = read_cr4() | (1 << 18); // OSXSAVE
         write_cr4(cr4);
-        // XCR0: enable the x87 (bit 0) and SSE (bit 1) state components.
-        // AVX (bit 2) stays disabled -- the default QEMU CPU lacks it.
-        let xcr0: u64 = 0b11;
-        // SAFETY: requires CR4.OSXSAVE=1 (just set above); xcr0=0 is
-        // always a valid XCR0 register selector.
+        // XCR0: x87 (bit 0) + SSE (bit 1), plus AVX (bit 2) when usable so
+        // XSAVE/XRSTOR cover the YMM upper halves the AVX2 kernels use.
+        let xcr0: u64 = if use_avx2 { 0b111 } else { 0b11 };
+        // SAFETY: requires CR4.OSXSAVE=1 (just set above); ecx=0 selects
+        // XCR0, and the bits set are all supported (checked via CPUID).
         unsafe {
             asm!(
                 "xsetbv",
@@ -145,10 +185,11 @@ pub fn init() {
             );
         }
     }
+    AVX2_ENABLED.store(use_avx2, core::sync::atomic::Ordering::Relaxed);
 
     enable_nx();
 
     crate::ktrace::log_fmt(format_args!(
-        "fpu: CR0/CR4 configured, xsave_supported={xsave_supported}, EFER.NXE enabled"
+        "fpu: CR0/CR4 configured, xsave_supported={xsave_supported}, avx2_enabled={use_avx2}, EFER.NXE enabled"
     ));
 }

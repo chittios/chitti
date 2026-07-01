@@ -79,12 +79,24 @@ pub fn dequant_q4_0_block(block: &[u8], out: &mut [f32]) {
     }
 }
 
-/// SSE2 dot product of two equal-length `f32` slices. Accumulates four
-/// partial sums in an XMM register, then folds them; the tail (length not
-/// a multiple of 4) is summed scalar. The fixed reduction order makes this
-/// deterministic run-to-run (a Phase 3 acceptance requirement).
+/// Dot product of two equal-length `f32` slices. Dispatches to an AVX2+FMA
+/// path (8-wide) when the CPU/OS support it, else the SSE2 baseline (4-wide);
+/// both use a fixed reduction order so results are deterministic run-to-run
+/// (a Phase 3 acceptance requirement). AVX2 halves the number of guest SIMD
+/// instructions and fuses multiply-add, which is a real win even under
+/// QEMU's TCG emulation.
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
+    if crate::arch::x86_64::fpu::avx2_enabled() {
+        // SAFETY: `avx2_enabled()` is only true once fpu::init has confirmed
+        // AVX2+FMA are supported by the CPU and enabled via XCR0.
+        unsafe { dot_f32_avx2(a, b) }
+    } else {
+        dot_f32_sse2(a, b)
+    }
+}
+
+fn dot_f32_sse2(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len();
     let mut i = 0;
     // SAFETY: `+sse2` is always available (see targets/x86_64-chitti.json);
@@ -107,6 +119,37 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         i += 1;
     }
     sum
+}
+
+/// AVX2 + FMA dot product (8-wide). Only called when `fpu::avx2_enabled()`.
+///
+/// # Safety
+/// Requires the AVX2 and FMA target features to be available at runtime,
+/// which the caller guarantees via `fpu::avx2_enabled()`.
+#[target_feature(enable = "avx,avx2,fma")]
+unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::x86_64::{_mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_storeu_ps};
+    let n = a.len();
+    let mut i = 0;
+    // SAFETY: guarded by `i + 8 <= n`; the store targets a local 8-lane array.
+    unsafe {
+        let mut acc = _mm256_setzero_ps();
+        while i + 8 <= n {
+            let va = _mm256_loadu_ps(a.as_ptr().add(i));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+            acc = _mm256_fmadd_ps(va, vb, acc); // acc += va*vb, fused
+            i += 8;
+        }
+        let mut lanes = [0.0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+        let mut sum =
+            ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])) + ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]));
+        while i < n {
+            sum += a[i] * b[i];
+            i += 1;
+        }
+        sum
+    }
 }
 
 /// `y[r] = sum_c w[r*n_cols + c] * x[c]` for an `f32` weight matrix stored
