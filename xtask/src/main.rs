@@ -225,6 +225,11 @@ fn image(release: bool) -> Result<(), String> {
 const QEMU_BASE_ARGS: &[&str] = &[
     "-M",
     "q35",
+    // `-cpu max`: expose AVX2 + XSAVE under TCG so the Cortex kernels can
+    // use the AVX2/FMA path (the default `qemu64` lacks them, and the kernel
+    // then falls back to SSE2 -- correct, just slower).
+    "-cpu",
+    "max",
     "-m",
     "2G",
     "-device",
@@ -304,7 +309,7 @@ fn cmd_ref_check() -> Result<(), String> {
     // CPU inference on a 0.5B model under QEMU/TCG takes minutes; the model
     // module needs headroom beyond 2 GiB.
     let mut cmd = Command::new("qemu-system-x86_64");
-    cmd.args(["-M", "q35", "-m", "4G", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-no-reboot"]);
+    cmd.args(["-M", "q35", "-cpu", "max", "-m", "4G", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-no-reboot"]);
     cmd.arg("-cdrom").arg(&iso);
     cmd.args(["-serial", "stdio", "-display", "none"]);
     eprintln!("ref-check: running in-kernel acceptance gate under QEMU (this takes a few minutes)...");

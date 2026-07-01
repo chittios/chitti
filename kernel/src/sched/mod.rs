@@ -180,9 +180,9 @@ pub fn yield_now() {
             // still names this task's area -- the incoming task restores
             // its own state symmetrically inside its own `yield_now`.
             unsafe {
-                context::fxsave(fx_ptr);
+                context::save_fpu(fx_ptr);
                 context::switch_to(old_rsp_ptr, new_rsp);
-                context::fxrstor(fx_ptr);
+                context::restore_fpu(fx_ptr);
             }
         }
     });
