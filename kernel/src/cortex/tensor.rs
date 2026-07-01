@@ -166,16 +166,26 @@ pub fn matvec_f32(w: &[f32], x: &[f32], y: &mut [f32], n_rows: usize, n_cols: us
 }
 
 /// `y[r] = sum_c W[r,c] * x[c]` where each weight row is `Q8_0`-quantized.
-/// `n_cols` must be a multiple of `QK` (true for every Qwen2 tensor
-/// dimension). Dequantizes one 32-lane block at a time into a small stack
-/// buffer and dots it with the matching slice of `x`.
+/// `n_cols` must be a multiple of `QK` (true for every Qwen tensor
+/// dimension). This is the single hottest kernel (the vocab-sized output
+/// projection alone is ~254M MACs/token), so on AVX2 it uses a *fused*
+/// path -- SIMD int8→f32 dequant (`vpmovsxbd`), scale, and FMA straight
+/// into a row accumulator, with no per-block scratch buffer or dispatch.
 pub fn matvec_q8_0(w: &[u8], x: &[f32], y: &mut [f32], n_rows: usize, n_cols: usize) {
     debug_assert_eq!(n_cols % QK, 0);
     debug_assert_eq!(x.len(), n_cols);
     debug_assert_eq!(y.len(), n_rows);
+    if crate::arch::x86_64::fpu::avx2_enabled() {
+        // SAFETY: `avx2_enabled()` guarantees AVX2+FMA are available.
+        unsafe { matvec_q8_0_avx2(w, x, y, n_rows, n_cols) };
+    } else {
+        matvec_q8_0_scalar(w, x, y, n_rows, n_cols);
+    }
+}
+
+fn matvec_q8_0_scalar(w: &[u8], x: &[f32], y: &mut [f32], n_rows: usize, n_cols: usize) {
     let blocks_per_row = n_cols / QK;
     let row_bytes = blocks_per_row * Q8_0_BLOCK_BYTES;
-    debug_assert_eq!(w.len(), n_rows * row_bytes);
     let mut buf = [0.0f32; QK];
     for r in 0..n_rows {
         let row = &w[r * row_bytes..(r + 1) * row_bytes];
@@ -186,6 +196,49 @@ pub fn matvec_q8_0(w: &[u8], x: &[f32], y: &mut [f32], n_rows: usize, n_cols: us
             acc += dot_f32(&buf, &x[b * QK..(b + 1) * QK]);
         }
         y[r] = acc;
+    }
+}
+
+/// Fused AVX2+FMA `Q8_0` matvec. Per block: load 32 `i8` quants, widen to
+/// `f32` eight at a time with `vpmovsxbd`+`vcvtdq2ps`, scale by the block's
+/// `f16` `d`, and FMA against `x` into a single 8-lane row accumulator
+/// (one horizontal sum per row). No scratch buffer, no per-block calls.
+///
+/// # Safety
+/// Requires AVX2 + FMA (guaranteed by the `matvec_q8_0` dispatch).
+#[target_feature(enable = "avx,avx2,fma")]
+unsafe fn matvec_q8_0_avx2(w: &[u8], x: &[f32], y: &mut [f32], n_rows: usize, n_cols: usize) {
+    use core::arch::x86_64::{
+        __m128i, _mm256_cvtepi32_ps, _mm256_cvtepi8_epi32, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_mul_ps,
+        _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps, _mm_loadl_epi64,
+    };
+    let blocks = n_cols / QK;
+    let row_bytes = blocks * Q8_0_BLOCK_BYTES;
+    // SAFETY: all loads are in-bounds (n_cols multiple of QK=32, rows are
+    // `row_bytes` apart), and the AVX2/FMA feature is enabled.
+    unsafe {
+        for r in 0..n_rows {
+            let row = w.as_ptr().add(r * row_bytes);
+            let mut acc = _mm256_setzero_ps();
+            for b in 0..blocks {
+                let base = b * Q8_0_BLOCK_BYTES;
+                let d = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
+                let dvec = _mm256_set1_ps(d);
+                let qptr = row.add(base + 2) as *const i8;
+                let xptr = x.as_ptr().add(b * QK);
+                let mut g = 0;
+                while g < QK {
+                    let q8 = _mm_loadl_epi64(qptr.add(g) as *const __m128i); // 8 i8
+                    let qf = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q8)), dvec);
+                    let xf = _mm256_loadu_ps(xptr.add(g));
+                    acc = _mm256_fmadd_ps(qf, xf, acc);
+                    g += 8;
+                }
+            }
+            let mut lanes = [0.0f32; 8];
+            _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+            y[r] = ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])) + ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]));
+        }
     }
 }
 
