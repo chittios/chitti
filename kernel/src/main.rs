@@ -48,6 +48,12 @@ pub extern "C" fn _start() -> ! {
     // `chitti_kernel::init`.
     chitti_kernel::init();
 
+    // Phase 4: demonstrate the Synapse capability ABI end to end (grammar
+    // validation -> capability check -> deterministic execution -> audit).
+    // Fast and model-free, so it runs on every boot regardless of whether
+    // the Cortex model module is present.
+    chitti_kernel::synapse::demo();
+
     // Phase 3: report the Cortex model boot module and run the reference
     // inference demo, if the model is present.
     match chitti_kernel::cortex::model_module() {

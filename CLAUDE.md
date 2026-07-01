@@ -1,6 +1,34 @@
 *"This project is specified in `CHITTI_OS_HANDOFF.md`. Read it fully before acting. Follow the locked decisions in Part 2 and the guardrails in Part 4. Work one phase at a time; do not start the next phase until the current phase's acceptance criteria pass in QEMU."*
 
-**Current phase: 3 (Cortex — CPU inference runtime) — complete.**
+**Current phase: 4 (Synapse — capability ABI) — complete.**
+The syscall layer that turns untrusted model output into deterministic,
+capability-checked, audited effects — the concrete enforcement of the
+determinism boundary. `synapse/registry.rs`: a fixed, MCP-shaped primitive
+catalogue (name + typed input schema) — `console_write`, `mem_fs_read`,
+`mem_fs_write`, `list`, `spawn_agent`, `sleep`, `emit_result`, each with a
+stable id that is also its `cap::Right::InvokePrimitive` discriminant.
+`synapse/grammar.rs`: a GBNF-style constraint grammar *generated from* the
+registry, realized as a prefix-closed recursive-descent parser over canonical
+MCP-flavored JSON (`{"name":..,"arguments":{..}}`) that classifies input as
+complete / viable-prefix / invalid — so the same grammar both validates a
+finished call (`parse`) and, via `ConstrainedDecoder` (impl of
+`cortex::sampler::Grammar`), masks a model's token stream so only well-formed
+calls can be emitted. `synapse/executor.rs`: the one path from call to effect —
+grammar gate → capability gate (`cap::holds`, no ambient authority) → isolated
+native execution — writing exactly one append-only `synapse/audit.rs` entry
+(caller, primitive, args hash, outcome, result hash) for every attempt.
+`synapse/fs.rs`: the in-memory store the FS primitives mutate. `cargo xtask
+test` now runs 45 in-kernel tests (up from 27): a malformed call is rejected by
+the grammar and never mutates state; an uncapable call is denied + audited; a
+valid call mutates the FS observably (from another task) + is logged; the audit
+log is proven append-only (pre-existing entries byte-identical after a burst of
+executed/denied/rejected attempts); plus grammar parse/prefix/constrained-
+decoding unit tests. A model-free `synapse::demo()` runs the full ABI on every
+boot (serial). No provenance/taint gating yet (Phase 6) — capability checks only.
+Next: Phase 5 (Persona — agent runtime + intent shell).
+
+---
+*Prior:* **Phase 3 (Cortex — CPU inference runtime) — complete.**
 SIMD (SSE2) enabled crate-wide with `fpu::enable_sse` run first thing at boot
 and per-task FXSAVE/FXRSTOR across context switches; `cortex/tensor.rs` SSE2
 kernels (Q4_0/Q8_0 dequant, dot/matvec, RMSNorm, RoPE, softmax, SwiGLU, L2-norm,

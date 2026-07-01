@@ -20,6 +20,7 @@ pub mod mm;
 pub mod qemu;
 pub mod sched;
 pub mod serial;
+pub mod synapse;
 
 // The framebuffer writer pulls in `font8x8` (a normal, non-build-std
 // dependency). Building it under `cfg(test)` as well hits a known
@@ -424,4 +425,138 @@ fn async_executor_interleaves_two_futures() {
     executor.run();
 
     assert_eq!(COUNTER.load(Ordering::SeqCst), 2, "not all async tasks ran to completion");
+}
+
+// --- Phase 4 acceptance tests (Synapse capability ABI) ------------------
+
+/// (a) a malformed call is rejected by the grammar and never reaches a
+/// primitive: the would-be `mem_fs_write` (with a bad key) is rejected, the
+/// file it would have created never exists, and exactly one
+/// `RejectedMalformed` audit entry is written.
+#[test_case]
+fn phase4_malformed_call_is_rejected_and_never_executes() {
+    use synapse::{audit, executor::Invocation, fs};
+
+    // Bad argument key -> Malformed. If it *did* run it would write this path.
+    const BAD: &str = r#"{"name":"mem_fs_write","arguments":{"pathx":"phase4_never","text":"x"}}"#;
+    assert!(!fs::exists("phase4_never"));
+    let audit_before = audit::len();
+
+    let inv = synapse::execute_current(BAD);
+    assert!(matches!(inv, Invocation::Rejected(_)), "malformed call was not rejected: {inv:?}");
+    assert!(!fs::exists("phase4_never"), "a rejected call still mutated the FS");
+
+    let snap = audit::snapshot();
+    assert_eq!(snap.len(), audit_before + 1, "rejection must write exactly one audit entry");
+    assert_eq!(snap.last().unwrap().outcome, audit::Outcome::RejectedMalformed);
+}
+
+/// (b) a call to a primitive the agent lacks the capability for is denied
+/// and audited. Runs in a freshly spawned agent task that was granted *no*
+/// capabilities, so its own table cannot confer `InvokePrimitive`.
+#[test_case]
+fn phase4_missing_capability_is_denied_and_audited() {
+    use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    use synapse::{audit, executor::Invocation};
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static WAS_DENIED: AtomicU8 = AtomicU8::new(0);
+
+    // Valid grammar, but this agent holds no InvokePrimitive capability.
+    extern "C" fn agent(_arg: u64) {
+        const CALL: &str = r#"{"name":"mem_fs_write","arguments":{"path":"phase4_denied","text":"x"}}"#;
+        let inv = synapse::execute_current(CALL);
+        WAS_DENIED.store(matches!(inv, Invocation::Denied { .. }) as u8, Ordering::SeqCst);
+        DONE.store(true, Ordering::SeqCst);
+    }
+
+    let denials_before = cap::denials();
+    let audit_before = audit::len();
+    sched::spawn("phase4_denied_agent", agent, 0);
+
+    let mut spins = 0u64;
+    while !DONE.load(Ordering::SeqCst) {
+        sched::yield_now();
+        spins += 1;
+        assert!(spins < 100_000_000, "the denied agent never ran to completion");
+    }
+
+    assert_eq!(WAS_DENIED.load(Ordering::SeqCst), 1, "an uncapable call was not denied");
+    assert_eq!(cap::denials(), denials_before + 1, "the denial was not recorded/ktrace'd");
+    assert!(!synapse::fs::exists("phase4_denied"), "a denied call still mutated the FS");
+    let snap = audit::snapshot();
+    assert_eq!(snap.len(), audit_before + 1);
+    assert_eq!(snap.last().unwrap().outcome, audit::Outcome::DeniedNoCapability);
+}
+
+/// (c) a valid call mutates the in-memory FS observably and is logged. A
+/// spawned agent grants itself `mem_fs_write` and writes a file; the change
+/// is then observable from *this* task's context and present in the audit log.
+#[test_case]
+fn phase4_valid_call_mutates_fs_observably_and_is_logged() {
+    use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    use synapse::{audit, executor::Invocation, registry};
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static WAS_EXECUTED: AtomicU8 = AtomicU8::new(0);
+
+    extern "C" fn agent(_arg: u64) {
+        const CALL: &str = r#"{"name":"mem_fs_write","arguments":{"path":"phase4_notes","text":"persisted"}}"#;
+        cap::grant(sched::current_task_id(), cap::Right::InvokePrimitive(registry::MEM_FS_WRITE));
+        let inv = synapse::execute_current(CALL);
+        WAS_EXECUTED.store(matches!(inv, Invocation::Executed { .. }) as u8, Ordering::SeqCst);
+        DONE.store(true, Ordering::SeqCst);
+    }
+
+    let audit_before = audit::len();
+    sched::spawn("phase4_writer_agent", agent, 0);
+
+    let mut spins = 0u64;
+    while !DONE.load(Ordering::SeqCst) {
+        sched::yield_now();
+        spins += 1;
+        assert!(spins < 100_000_000, "the writer agent never ran to completion");
+    }
+
+    assert_eq!(WAS_EXECUTED.load(Ordering::SeqCst), 1, "a capable, well-formed call did not execute");
+    // Observable from a different task's context: the mutation is real.
+    assert_eq!(
+        synapse::fs::read("phase4_notes").as_deref(),
+        Some(&b"persisted"[..]),
+        "the FS mutation is not observable"
+    );
+    // And logged as executed.
+    let snap = audit::snapshot();
+    assert!(snap.len() > audit_before);
+    assert!(
+        snap.iter().any(|e| e.primitive == "mem_fs_write" && e.outcome == audit::Outcome::Executed),
+        "the executed call was not logged"
+    );
+}
+
+/// (d) the audit log is append-only: entries recorded before a burst of
+/// activity (one of each outcome) are byte-for-byte unchanged afterward, and
+/// the log only grows.
+#[test_case]
+fn phase4_audit_log_is_append_only() {
+    use synapse::{audit, registry};
+
+    let before = audit::snapshot();
+
+    // Rejected (grammar), then denied (task 0 holds no InvokePrimitive cap),
+    // then executed (after granting one) -- one of each outcome.
+    synapse::execute_current(r#"{"name":"nope","arguments":{}}"#);
+    synapse::execute_current(r#"{"name":"mem_fs_write","arguments":{"path":"phase4_d","text":"x"}}"#);
+    cap::grant(sched::current_task_id(), cap::Right::InvokePrimitive(registry::LIST));
+    synapse::execute_current(r#"{"name":"list","arguments":{}}"#);
+
+    let after = audit::snapshot();
+    assert_eq!(after.len(), before.len() + 3, "the log did not grow by exactly the three attempts");
+    assert_eq!(&after[..before.len()], &before[..], "a pre-existing audit entry was mutated -- log is not append-only");
+    // The denied write must not have touched the FS.
+    assert!(!synapse::fs::exists("phase4_d"));
+    // Sanity: the three new entries carry the three distinct outcomes.
+    assert_eq!(after[before.len()].outcome, audit::Outcome::RejectedMalformed);
+    assert_eq!(after[before.len() + 1].outcome, audit::Outcome::DeniedNoCapability);
+    assert_eq!(after[before.len() + 2].outcome, audit::Outcome::Executed);
 }
