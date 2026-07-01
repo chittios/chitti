@@ -14,10 +14,20 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// circular module dependency.
 pub type EndpointId = u64;
 
+/// Identifies a `synapse` capability primitive (`synapse::registry`).
+/// Defined here for the same reason as `EndpointId`: `Right` can name a
+/// primitive structurally (as a small opaque id) without `cap` -- a Phase 2
+/// module -- having to depend upward on the Phase 4 `synapse` layer.
+pub type PrimitiveId = u16;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Right {
     IpcSend(EndpointId),
     IpcReceive(EndpointId),
+    /// Authority to invoke one Synapse primitive (Phase 4). An agent may
+    /// only call a primitive it holds the matching `InvokePrimitive` right
+    /// for -- no ambient authority over the capability ABI.
+    InvokePrimitive(PrimitiveId),
 }
 
 /// An opaque handle into the holder's own `CapTable`. The index is
@@ -49,6 +59,18 @@ impl CapTable {
     fn lookup(&self, cap: Cap) -> Option<Right> {
         self.slots.get(cap.0 as usize).copied().flatten()
     }
+
+    /// Whether this table contains a slot granting exactly `right`.
+    ///
+    /// Unlike `lookup` (which resolves a specific `Cap` index the holder
+    /// already possesses), this answers "does the holder hold *some*
+    /// capability conferring this authority?" -- the shape the Synapse tool
+    /// ABI needs, where an agent names a primitive rather than a slot index.
+    /// It still only ever scans the caller's *own* table (see `holds`), so
+    /// it grants no way to reach into another task's capability space.
+    fn grants(&self, right: Right) -> bool {
+        self.slots.iter().any(|slot| *slot == Some(right))
+    }
 }
 
 /// Count of denied capability checks, incremented (and `ktrace`d)
@@ -79,4 +101,13 @@ pub fn grant(task: TaskId, right: Right) -> Cap {
 /// (`task` here is always `sched::current_task_id()` at the call site).
 pub(crate) fn lookup(task: TaskId, cap: Cap) -> Option<Right> {
     sched::with_cap_table_mut(task, |table| table.lookup(cap))
+}
+
+/// Whether `task` holds a capability conferring `right`. `synapse` uses
+/// this to gate every tool call: an agent may invoke a primitive only if
+/// its own capability table grants `Right::InvokePrimitive(id)`. As with
+/// `lookup`, `task` is always the caller (`sched::current_task_id()`), so
+/// this never inspects another task's authority.
+pub fn holds(task: TaskId, right: Right) -> bool {
+    sched::with_cap_table_mut(task, |table| table.grants(right))
 }
