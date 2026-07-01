@@ -18,7 +18,14 @@ use core::mem;
 use core::ptr::null_mut;
 
 pub const HEAP_START: u64 = 0xffff_a000_0000_0000;
-pub const HEAP_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
+// 256 MiB: Phase 3's Cortex (Qwen3.5 hybrid) needs real room -- each
+// per-stream cache holds ~19 MiB of gated-DeltaNet recurrent state (18
+// linear-attention layers x 16 heads x 128x128 f32), the batching test
+// runs two streams concurrently, and the 248K-token vocab table plus
+// vocab-sized logits add several MiB more. The linked-list allocator does
+// no coalescing, so headroom also absorbs fragmentation from transient
+// caches. Backed by the frame allocator, which has gigabytes free.
+pub const HEAP_SIZE: usize = 256 * 1024 * 1024;
 
 struct ListNode {
     size: usize,

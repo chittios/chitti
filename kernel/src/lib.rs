@@ -12,6 +12,7 @@ extern crate alloc;
 
 pub mod arch;
 pub mod cap;
+pub mod cortex;
 pub mod ipc;
 pub mod ktrace;
 pub mod limine_protocol;
@@ -60,6 +61,10 @@ pub static MEMMAP_REQUEST: limine_protocol::MemmapRequest = limine_protocol::Mem
 #[used]
 #[link_section = ".requests"]
 pub static HHDM_REQUEST: limine_protocol::HhdmRequest = limine_protocol::HhdmRequest::new();
+
+#[used]
+#[link_section = ".requests"]
+pub static MODULE_REQUEST: limine_protocol::ModuleRequest = limine_protocol::ModuleRequest::new();
 
 #[used]
 #[link_section = ".requests_end_marker"]
@@ -128,6 +133,9 @@ pub fn test_panic_handler(info: &core::panic::PanicInfo) -> ! {
 #[cfg(test)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    // First action: enable SSE at the hardware level before any SIMD
+    // codegen runs (see `arch::x86_64::fpu::enable_sse`).
+    arch::x86_64::fpu::enable_sse();
     serial::init();
     init();
     test_main();

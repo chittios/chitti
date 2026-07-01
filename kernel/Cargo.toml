@@ -20,6 +20,14 @@ test = false
 doctest = false
 bench = false
 
+[features]
+# `cargo xtask ref-check` builds with this on: at boot the kernel runs the
+# full Phase 3 acceptance gate (parity + determinism + KV evict/recompute +
+# batching) against the real model, then exits QEMU with a pass/fail code.
+# A normal `cargo xtask run` (feature off) just runs the single-stream
+# inference demo and stays up.
+refcheck = []
+
 [dependencies]
 font8x8 = { version = "0.3.1", default-features = false }
 

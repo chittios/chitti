@@ -18,6 +18,9 @@ fn main() {
         "image" => image(release),
         "run" => cmd_run(release),
         "test" => cmd_test(),
+        // Phase 3 parity gate: build the kernel with the `refcheck` feature,
+        // boot the real model, run the acceptance checks, exit pass/fail.
+        "ref-check" => cmd_ref_check(),
         // Hidden subcommand: installed as `[target.x86_64-chitti] runner` in
         // kernel/.cargo/config.toml so `cargo test` can boot each compiled
         // test binary in QEMU and translate isa-debug-exit into a real exit
@@ -33,7 +36,7 @@ fn main() {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <build|image|run|test> [--release]".to_string()
+    "usage: cargo xtask <build|image|run|test|ref-check> [--release]".to_string()
 }
 
 fn repo_root() -> PathBuf {
@@ -59,6 +62,11 @@ fn run(cmd: &mut Command) -> Result<(), String> {
 
 /// Build the real (non-test) kernel binary. Returns the path to the ELF.
 fn build_kernel(release: bool) -> Result<PathBuf, String> {
+    build_kernel_with(release, &[])
+}
+
+/// As `build_kernel`, but with extra cargo features enabled.
+fn build_kernel_with(release: bool, features: &[&str]) -> Result<PathBuf, String> {
     let kdir = kernel_dir();
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&kdir)
@@ -67,6 +75,9 @@ fn build_kernel(release: bool) -> Result<PathBuf, String> {
         .arg("chitti-kernel");
     if release {
         cmd.arg("--release");
+    }
+    if !features.is_empty() {
+        cmd.arg("--features").arg(features.join(","));
     }
     run(&mut cmd)?;
 
@@ -111,6 +122,14 @@ fn limine_bin() -> Result<PathBuf, String> {
 /// documented `xorriso` + `limine bios-install` recipe
 /// (USAGE.md#bios-uefi-hybrid-iso-creation).
 fn assemble_image(kernel_bin: &Path) -> Result<PathBuf, String> {
+    assemble_image_opt(kernel_bin, true)
+}
+
+/// `include_model`: whether to copy `assets/model.gguf` into the image. The
+/// fast test suite (`cargo xtask test`) passes `false` so it never bundles
+/// or boots the ~644 MiB model it doesn't need; `run`/`image`/`ref-check`
+/// pass `true`.
+fn assemble_image_opt(kernel_bin: &Path, include_model: bool) -> Result<PathBuf, String> {
     let root = repo_root();
     let iso_root = root.join("target/iso_root");
     if iso_root.exists() {
@@ -127,6 +146,28 @@ fn assemble_image(kernel_bin: &Path) -> Result<PathBuf, String> {
         iso_root.join("boot/limine/limine.conf"),
     )
     .map_err(|e| format!("copying limine.conf: {e}"))?;
+
+    // The Phase 3 model is loaded as a Limine boot module, not compiled in.
+    // It's optional at image-assembly time: the tensor-kernel unit tests
+    // (`cargo xtask test`) don't need it, only end-to-end inference does.
+    // `limine.conf` references it unconditionally; Limine tolerates a
+    // missing module (the ModuleRequest response simply omits it).
+    // Bundle the model + declare it in limine.conf ONLY when both requested
+    // and present. Limine panics at boot if `module_path` names a module the
+    // image lacks, so the declaration must track the actual file.
+    let model = root.join("assets/model.gguf");
+    if include_model && model.exists() {
+        fs::copy(&model, iso_root.join("boot/model.gguf")).map_err(|e| format!("copying model.gguf: {e}"))?;
+        let conf_path = iso_root.join("boot/limine/limine.conf");
+        let mut conf = fs::read_to_string(&conf_path).map_err(|e| e.to_string())?;
+        conf.push_str("    module_path: boot():/boot/model.gguf\n");
+        fs::write(&conf_path, conf).map_err(|e| format!("appending module_path: {e}"))?;
+    } else if include_model {
+        eprintln!(
+            "xtask: note: assets/model.gguf not present -- run xtask/fetch-model.sh for inference; \
+             the image boots without it (no module declared)."
+        );
+    }
 
     let share = limine_share_dir()?;
     for f in ["limine-bios.sys", "limine-bios-cd.bin", "limine-uefi-cd.bin"] {
@@ -230,7 +271,10 @@ fn cmd_runner(args: &[String]) -> Result<(), String> {
     let bin_path = args
         .first()
         .ok_or_else(|| "runner: missing test binary path argument".to_string())?;
-    let iso = assemble_image(Path::new(bin_path))?;
+    // Fast test suite: exclude the model so the ISO stays small and boots
+    // quickly (the tensor-kernel tests validate against baked-in NumPy
+    // reference vectors, not the real model).
+    let iso = assemble_image_opt(Path::new(bin_path), false)?;
     let mut cmd = qemu_base_cmd(&iso);
     cmd.args(["-serial", "stdio", "-display", "none"]);
     let status = cmd
@@ -242,5 +286,36 @@ fn cmd_runner(args: &[String]) -> Result<(), String> {
             "QEMU exited with status {other} (expected 33 = isa-debug-exit success)"
         )),
         None => Err("QEMU was terminated by a signal".to_string()),
+    }
+}
+
+/// `cargo xtask ref-check`: the Phase 3 reference-parity gate. Builds the
+/// kernel in release with the `refcheck` feature, boots it with the real
+/// model and extra RAM, and lets the in-kernel acceptance routine
+/// (`cortex::run_acceptance`) exit QEMU with success (33) or failure. Serial
+/// goes to stdio so the `REFCHECK:` lines are visible while it runs.
+fn cmd_ref_check() -> Result<(), String> {
+    let model = repo_root().join("assets/model.gguf");
+    if !model.exists() {
+        return Err("assets/model.gguf not present -- run xtask/fetch-model.sh first".to_string());
+    }
+    let bin = build_kernel_with(true, &["refcheck"])?;
+    let iso = assemble_image(&bin)?;
+    // CPU inference on a 0.5B model under QEMU/TCG takes minutes; the model
+    // module needs headroom beyond 2 GiB.
+    let mut cmd = Command::new("qemu-system-x86_64");
+    cmd.args(["-M", "q35", "-m", "4G", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-no-reboot"]);
+    cmd.arg("-cdrom").arg(&iso);
+    cmd.args(["-serial", "stdio", "-display", "none"]);
+    eprintln!("ref-check: running in-kernel acceptance gate under QEMU (this takes a few minutes)...");
+    let status = cmd.status().map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
+    match status.code() {
+        Some(33) => {
+            println!("ref-check: PASS (all Phase 3 acceptance checks green)");
+            Ok(())
+        }
+        Some(35) => Err("ref-check: FAIL (QemuExitCode::Failed -- an acceptance check did not match)".to_string()),
+        Some(other) => Err(format!("ref-check: QEMU exited with unexpected status {other}")),
+        None => Err("ref-check: QEMU was terminated by a signal".to_string()),
     }
 }

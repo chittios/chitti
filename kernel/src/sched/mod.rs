@@ -44,6 +44,11 @@ struct TaskControlBlock {
     /// Phase 2 does not yet reclaim task memory (there is no safe point
     /// to free a stack you might be executing on).
     _stack: Option<Box<[u8]>>,
+    /// Per-task x87/SSE save area. `Box`ed so its address is stable
+    /// regardless of the `BTreeMap` moving the `TaskControlBlock` around
+    /// -- `yield_now` captures a raw pointer to it and uses that pointer
+    /// across the actual context switch.
+    fx_area: Box<context::FxArea>,
     cap_table: CapTable,
 }
 
@@ -77,6 +82,7 @@ pub fn init() {
                 state: TaskState::Running,
                 rsp: 0,
                 _stack: None,
+                fx_area: Box::new(context::FxArea::new()),
                 cap_table: CapTable::new(),
             },
         );
@@ -102,7 +108,14 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(u64), arg: u64) -> TaskId 
         s.next_id += 1;
         s.tasks.insert(
             id,
-            TaskControlBlock { name, state: TaskState::Ready, rsp, _stack: Some(stack), cap_table: CapTable::new() },
+            TaskControlBlock {
+                name,
+                state: TaskState::Ready,
+                rsp,
+                _stack: Some(stack),
+                fx_area: Box::new(context::FxArea::new()),
+                cap_table: CapTable::new(),
+            },
         );
         s.ready_queue.push_back(id);
         id
@@ -147,19 +160,30 @@ pub fn yield_now() {
                 }
             }
             s.current = next_id;
-            let old_rsp_ptr = &mut s.tasks.get_mut(&current_id).unwrap().rsp as *mut u64;
+            let cur = s.tasks.get_mut(&current_id).unwrap();
+            let old_rsp_ptr: *mut u64 = &mut cur.rsp;
+            // Stable heap address of this task's FX area (see the field
+            // doc): valid across the switch and on resume.
+            let fx_ptr: *mut context::FxArea = &mut *cur.fx_area;
             let new_rsp = s.tasks.get(&next_id).unwrap().rsp;
-            Some((old_rsp_ptr, new_rsp))
+            Some((old_rsp_ptr, new_rsp, fx_ptr))
         });
-        if let Some((old_rsp_ptr, new_rsp)) = switch {
-            // SAFETY: `old_rsp_ptr` points at this task's own saved-rsp
-            // slot in the scheduler's task table (not concurrently
-            // accessed: interrupts are off and there is only one core);
-            // `new_rsp` was produced either by `context::init_stack` for
-            // a never-run task or by a previous `switch_to` save for a
-            // previously-descheduled one -- exactly what `switch_to`
-            // requires.
-            unsafe { context::switch_to(old_rsp_ptr, new_rsp) };
+        if let Some((old_rsp_ptr, new_rsp, fx_ptr)) = switch {
+            // SAFETY: `fx_ptr`/`old_rsp_ptr` point at this task's own,
+            // exclusively-owned FX area and saved-rsp slot (interrupts
+            // off, single core -- no concurrent access); `new_rsp` was
+            // produced either by `context::init_stack` for a never-run
+            // task or by a previous `switch_to` save. We `fxsave` this
+            // task's SSE state before switching away and `fxrstor` it on
+            // resume: `fx_ptr` was captured *before* the switch, so after
+            // `switch_to` returns (this same task, resumed later) it
+            // still names this task's area -- the incoming task restores
+            // its own state symmetrically inside its own `yield_now`.
+            unsafe {
+                context::fxsave(fx_ptr);
+                context::switch_to(old_rsp_ptr, new_rsp);
+                context::fxrstor(fx_ptr);
+            }
         }
     });
 }

@@ -16,13 +16,13 @@ document is the single source of truth; this README is a map on top of it.
 [`CLAUDE.md`](CLAUDE.md) tracks the current phase for whoever (human or
 agent) picks up work next.
 
-## Status: Phase 2 complete
+## Status: Phase 3 complete
 
 ```
 [x] 0  Boot & harness          Boot via Limine, print to serial + framebuffer, QEMU test exit codes
 [x] 1  Microkernel core        Interrupts, memory (frames/paging/heap), timer, keyboard, ktrace
 [x] 2  Execution substrate     Tasks, scheduler, capabilities, IPC, async executor
-[ ] 3  Cortex (inference)      CPU transformer forward pass on a tiny GGUF, KV cache, seeded sampling  — highest risk
+[x] 3  Cortex (inference)      CPU hybrid (gated-DeltaNet + attention) forward pass on Qwen3.5-0.8B, KV/recurrent cache, seeded sampling, batching
 [ ] 4  Synapse (capability ABI) Grammar-constrained tool calls → capability-checked primitives + audit log
 [ ] 5  Persona + shell         Agents as processes, two-tier memory, intent shell drives plan→act loop
 [ ] 6  Differentiators         Taint/provenance security gating + self-compiling agents (compiled intents)
@@ -66,19 +66,32 @@ chitti/
         ├── sched/             # stackful tasks + naked-fn context switch, round-robin scheduler
         │                       #   (cooperative + timer-preemptive), the async executor
         ├── cap/               # unforgeable capability tokens, per-task capability tables
-        └── ipc/                # capability-gated message passing between tasks (seL4-style endpoints)
+        ├── ipc/               # capability-gated message passing between tasks (seL4-style endpoints)
+        └── cortex/            # CPU inference runtime (Phase 3):
+                                #   tensor.rs  SSE2 dequant/matvec/rmsnorm/rope/softmax/silu/l2norm kernels
+                                #   gguf.rs    zero-copy GGUF parser over the Limine boot module
+                                #   model.rs   Qwen3.5-0.8B hybrid forward pass (gated-DeltaNet + gated attention)
+                                #   sampler.rs seeded + temperature + grammar-constrained decoding
+                                #   batch.rs   continuous-batching token scheduler
 ```
 
 Everything x86_64-specific stays under `kernel/src/arch/x86_64/`, so a future
 RISC-V port (Phase 7 stretch) only touches that directory. As later phases
-land, `kernel/src/` grows the `cortex/`, `synapse/`, `persona/`, `shell/`, and
-`security/` modules described in `CHITTI_OS_HANDOFF.md` Part 3.
+land, `kernel/src/` grows the `synapse/`, `persona/`, `shell/`, and `security/`
+modules described in `CHITTI_OS_HANDOFF.md` Part 3.
+
+The Phase 3 model (Qwen3.5-0.8B Q8_0 GGUF) is **not committed** — it's a
+~812 MB boot module fetched on demand. Run `xtask/fetch-model.sh` (writes
+`assets/model.gguf`); numerics are validated against a NumPy reference
+(`tools/ref_qwen35.py`, reconstructed from llama.cpp's `qwen35` graph).
 
 ## Quick start
 
 ```sh
-cargo xtask run     # boot the kernel in QEMU (serial to stdio, text in the framebuffer window)
-cargo xtask test    # run the in-kernel test suite under QEMU
+cargo xtask test        # fast in-kernel test suite under QEMU (no model needed)
+xtask/fetch-model.sh    # fetch the Qwen3.5-0.8B GGUF (~812 MB) into assets/model.gguf
+cargo xtask run         # boot the kernel + run the inference demo (serial to stdio, framebuffer window)
+cargo xtask ref-check   # Phase 3 gate: boot the real model, verify parity/determinism/KV/batching
 ```
 
 See [`DEVELOPMENT.md`](DEVELOPMENT.md) for prerequisites, what each `xtask`
