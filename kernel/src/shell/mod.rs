@@ -112,10 +112,8 @@ pub fn run() -> ! {
         }
         match intent {
             "exit" | "quit" => {
-                serial_println!("Chitti: shell exiting; system idle.");
-                loop {
-                    crate::arch::hlt();
-                }
+                serial_println!("Chitti: shell exiting; powering off.");
+                crate::arch::poweroff();
             }
             "help" => {
                 serial_println!("  intents: write a file called X with the text Y[, then read it back]");

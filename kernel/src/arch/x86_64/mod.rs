@@ -20,3 +20,15 @@ pub fn hlt() {
     // instruction execution until an interrupt arrives.
     unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)) }
 }
+
+/// Power off / exit QEMU cleanly (so typing `exit` at the shell terminates the
+/// emulator instead of leaving it idling). Uses the `isa-debug-exit` device
+/// (present in every `xtask` QEMU invocation): a dword write to port 0xf4
+/// exits QEMU. Falls back to a halt loop if that somehow returns.
+pub fn poweroff() -> ! {
+    // SAFETY: 0xf4 is the isa-debug-exit device port; a write exits QEMU.
+    unsafe { port::outl(0xf4, 0x10) };
+    loop {
+        hlt();
+    }
+}
