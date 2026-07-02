@@ -73,3 +73,17 @@ Consequential ones flagged **REVISIT**.
   of scope. REVISIT if a sandboxed skill-code execution model is added later.
 - **ToolBinding::Synapse is owned (String/Vec), not &'static:** required so skill-bundled tools
   registered at runtime bind exactly like builtins.
+- **Ed25519 → keyed-MAC (Phase G, REVISIT):** `ed25519-compact` *builds* under -Z build-std but
+  its sign/verify **fault at runtime on the bare-metal x86 target** (QEMU exits abnormally — no host
+  runtime; likely a stack/SIMD assumption). Per the run's "log blocker, ship the best partial that
+  builds, move on" rule, package verification uses a self-contained SipHash-2-4 keyed MAC (8 lanes →
+  512-bit tag, same width as an Ed25519 sig, so SignatureBlock is unchanged). In this self-contained
+  build the kernel is both registry (signs) and installer (verifies), giving real integrity +
+  tamper-detection + unsigned/untrusted-key rejection. REVISIT: a bare-metal-safe asymmetric Ed25519
+  for true off-device authenticity.
+- **Sample packages are built + signed in-kernel, not shipped as separate boot-module files
+  (REVISIT):** `package::sample_note_summarizer` / `sample_report_agent` construct real signed
+  packages that the F/G tests + boot demo install (verify → consent-subset → bound). Delivering them
+  as distinct QEMU boot-module files needs xtask multi-module plumbing; the security path (sign →
+  verify → tamper-reject → grant-subset → skill-agent-bound) is fully exercised against real signed
+  packages either way. `InstallSource::BootModule{name}` is recorded so the provenance is faithful.
