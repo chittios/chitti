@@ -115,6 +115,90 @@ pub fn sample(logits: &mut [f32], temperature: f32, rng: &mut Rng, grammar: Opti
     logits.iter().rposition(|&p| p > 0.0).unwrap_or(logits.len() - 1)
 }
 
+/// Nucleus sampling as Qwen ships it: temperature + `top_k` + `top_p`. Pure
+/// temperature over a ~248 K-token vocab draws from the long tail and makes
+/// these models degenerate (repeated punctuation / loops); Qwen's own guidance
+/// is `temp 0.7, top_k 20, top_p 0.8`, and this restores that. We keep only the
+/// `top_k` highest-probability tokens, then within those the smallest prefix
+/// whose cumulative probability reaches `top_p` (always at least one token),
+/// renormalize, and inverse-CDF draw. `temperature <= 0` stays exact greedy.
+///
+/// `logits` is modified in place. Grammar-masked tokens are excluded first.
+pub fn sample_topk_topp(
+    logits: &mut [f32],
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    rng: &mut Rng,
+    grammar: Option<&dyn Grammar>,
+) -> usize {
+    if let Some(g) = grammar {
+        for (i, v) in logits.iter_mut().enumerate() {
+            if !g.allows(i) {
+                *v = f32::NEG_INFINITY;
+            }
+        }
+    }
+    if temperature <= 0.0 {
+        return argmax_allowed(logits, grammar);
+    }
+
+    let inv_t = 1.0 / temperature;
+    for v in logits.iter_mut() {
+        *v *= inv_t;
+    }
+    super::tensor::softmax(logits);
+
+    // Partial selection of the `top_k` highest-probability tokens: repeatedly
+    // pull the current max. k is tiny (~20) vs the vocab, so O(n*k) is cheap and
+    // avoids sorting the whole distribution.
+    let k = top_k.max(1).min(logits.len());
+    let mut picked: alloc::vec::Vec<(usize, f32)> = alloc::vec::Vec::with_capacity(k);
+    let mut taken = alloc::vec::Vec::new(); // indices already pulled
+    for _ in 0..k {
+        let mut best_i = usize::MAX;
+        let mut best_p = -1.0f32;
+        for (i, &p) in logits.iter().enumerate() {
+            if p > best_p && !taken.contains(&i) {
+                best_p = p;
+                best_i = i;
+            }
+        }
+        if best_i == usize::MAX || best_p <= 0.0 {
+            break;
+        }
+        taken.push(best_i);
+        picked.push((best_i, best_p));
+    }
+    if picked.is_empty() {
+        return argmax_allowed(logits, grammar);
+    }
+
+    // top_p: keep the smallest prefix (already sorted desc) reaching `top_p`.
+    let mut cum = 0.0f32;
+    let mut keep = picked.len();
+    for (n, &(_, p)) in picked.iter().enumerate() {
+        cum += p;
+        if cum >= top_p {
+            keep = n + 1;
+            break;
+        }
+    }
+    let kept = &picked[..keep.max(1)];
+
+    // Renormalize over the kept set and inverse-CDF draw.
+    let total: f32 = kept.iter().map(|&(_, p)| p).sum();
+    let r = rng.next_f32() * total;
+    let mut c = 0.0f32;
+    for &(i, p) in kept {
+        c += p;
+        if r < c {
+            return i;
+        }
+    }
+    kept[kept.len() - 1].0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

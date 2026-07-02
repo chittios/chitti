@@ -175,26 +175,31 @@ struct ChatSession {
     kv: crate::cortex::model::Cache,
     state: crate::cortex::model::State,
     pos: usize,
+    rng: crate::cortex::sampler::Rng,
+    /// Token ids generated in the current turn, for the repetition penalty.
+    gen: alloc::vec::Vec<usize>,
 }
 
 impl ChatSession {
     /// Load the bundled model + build the tokenizer. `None` if no model.
     fn load() -> Option<Self> {
-        use crate::cortex::{gguf, model, model_module};
+        use crate::cortex::{gguf, model, model_module, sampler};
         let bytes = model_module()?;
         let g = gguf::Gguf::parse(bytes).ok()?;
         let m = model::Model::load(g).ok()?;
         let tok = m.tokenizer();
         let kv = m.new_cache();
         let state = m.new_state();
-        Some(Self { model: m, tok, kv, state, pos: 0 })
+        // Seed the sampler from the boot clock so sessions vary.
+        let rng = sampler::Rng::new(crate::arch::now_ms().wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        Some(Self { model: m, tok, kv, state, pos: 0, rng, gen: alloc::vec::Vec::new() })
     }
 
     /// Run one chat turn: encode the user message with the Qwen chat template
     /// (continuing the running context), then greedily decode + stream until
     /// the model emits EOS or the user presses Ctrl+C.
     fn turn(&mut self, msg: &str) {
-        use crate::cortex::{model, tokenizer};
+        use crate::cortex::tokenizer;
         let first = self.pos == 0;
         // Build this turn's prompt tokens (chat template).
         let mut ids: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
@@ -216,6 +221,16 @@ impl ChatSession {
         push_text(&mut ids, "\n");
         ids.push(self.tok.im_start as usize);
         push_text(&mut ids, "assistant\n");
+        // No-think priming (Qwen3.5): supply an empty `<think></think>` so the
+        // model answers directly. It's a thinking model; left to itself it emits
+        // an empty think block and then degenerates into repetition, so we close
+        // the reasoning turn up front. Skipped if the model has no think tokens.
+        if self.tok.think_open != u32::MAX && self.tok.think_close != u32::MAX {
+            ids.push(self.tok.think_open as usize);
+            push_text(&mut ids, "\n\n");
+            ids.push(self.tok.think_close as usize);
+            push_text(&mut ids, "\n\n");
+        }
 
         // Prefill this turn, then decode from the last position's logits.
         self.model.prefill(&ids, self.pos, &mut self.kv, &mut self.state);
@@ -223,7 +238,8 @@ impl ChatSession {
 
         let eos = self.model.eos();
         let im_end = self.tok.im_end as usize;
-        let mut next = model::argmax(&self.state.logits);
+        self.gen.clear();
+        let mut next = self.pick();
         let mut stream = tokenizer::Stream::new();
         serial_print!("chitti: ");
         let mut n = 0usize;
@@ -242,15 +258,42 @@ impl ChatSession {
             }
             let piece = stream.push(&self.tok, self.model.token_str(next));
             serial_print!("{}", piece);
+            self.gen.push(next);
             self.model.forward(next, self.pos, &mut self.kv, &mut self.state, true);
             self.pos += 1;
             n += 1;
-            next = model::argmax(&self.state.logits);
+            next = self.pick();
         }
         serial_println!("");
         // Close the assistant turn in the cache so the next turn continues cleanly.
         self.model.forward(im_end, self.pos, &mut self.kv, &mut self.state, false);
         self.pos += 1;
+    }
+
+    /// Choose the next token from `state.logits` with a repetition penalty over
+    /// this turn's generated tokens, then temperature sampling. Pure greedy
+    /// (which `/infer` uses for parity) tends to fall into degenerate repeat
+    /// loops on this thinking model; a repetition penalty + light temperature
+    /// keeps chat coherent and non-repetitive (cf. Qwen's recommended sampling).
+    fn pick(&mut self) -> usize {
+        use crate::cortex::sampler;
+        // Qwen's own recommended decoding: temp 0.7 / top_k 20 / top_p 0.8.
+        // top_k+top_p are the load-bearing part -- pure temperature over a
+        // ~248 K vocab draws from the tail and this model degenerates into
+        // repeated punctuation without them. A light repetition penalty on
+        // top keeps it from looping within the nucleus.
+        const PENALTY: f32 = 1.1;
+        const TEMPERATURE: f32 = 0.7;
+        const TOP_K: usize = 20;
+        const TOP_P: f32 = 0.8;
+        let logits = &mut self.state.logits;
+        // HF-style repetition penalty: push down (or, if negative, further down)
+        // the logits of tokens already emitted this turn.
+        for &t in &self.gen {
+            let l = logits[t];
+            logits[t] = if l > 0.0 { l / PENALTY } else { l * PENALTY };
+        }
+        sampler::sample_topk_topp(logits, TEMPERATURE, TOP_K, TOP_P, &mut self.rng, None)
     }
 }
 

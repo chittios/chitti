@@ -22,6 +22,8 @@ pub struct Tokenizer {
     pub eos: u32,
     pub im_start: u32,
     pub im_end: u32,
+    pub think_open: u32,
+    pub think_close: u32,
 }
 
 /// GPT-2 byte→unicode table: printable bytes map to themselves, the rest to
@@ -69,6 +71,10 @@ impl Tokenizer {
             eos: gguf.config.eos_token_id,
             im_start: special("<|im_start|>", 151644),
             im_end: special("<|im_end|>", gguf.config.eos_token_id),
+            // Fallbacks are u32::MAX (an id no model has) so absent think tokens
+            // are simply never emitted, rather than colliding with a real token.
+            think_open: special("<think>", u32::MAX),
+            think_close: special("</think>", u32::MAX),
             byte_to_unicode,
             unicode_to_byte,
             vocab,
