@@ -15,6 +15,74 @@ enum Arch {
     Aarch64,
 }
 
+/// Which bundled model to build/run for, chosen via `-model <name>` (like
+/// `-arch`). Selects the kernel memory-layout feature, the GGUF file, and the
+/// aarch64 load address + guest RAM. Default is the compact 0.8B.
+#[derive(Clone, Copy, PartialEq)]
+enum Model {
+    Qwen08B,
+    Qwen9B,
+}
+
+impl Model {
+    /// Cargo features that select this model's memory layout in the kernel.
+    fn features(self) -> &'static [&'static str] {
+        match self {
+            Model::Qwen08B => &[],
+            Model::Qwen9B => &["model-9b"],
+        }
+    }
+    /// The GGUF file bundled for this model (relative to the repo root).
+    fn gguf_rel(self) -> &'static str {
+        match self {
+            Model::Qwen08B => "assets/model.gguf",
+            Model::Qwen9B => "assets/model-9b.gguf",
+        }
+    }
+    /// aarch64 guest-physical load address (must match `cortex::model_module`).
+    fn aarch64_addr(self) -> &'static str {
+        match self {
+            Model::Qwen08B => "0x48000000",
+            Model::Qwen9B => "0x80000000",
+        }
+    }
+    /// QEMU `-m` size big enough for the model + heap in the identity map.
+    fn qemu_mem(self) -> &'static str {
+        match self {
+            Model::Qwen08B => "2G",
+            Model::Qwen9B => "12G",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Model::Qwen08B => "qwen3.5-0.8b",
+            Model::Qwen9B => "qwen3.5-9b",
+        }
+    }
+}
+
+/// Parse `-model <value>` (or `-model=<value>`); default the 0.8B model.
+fn parse_model(rest: &[String]) -> Result<Model, String> {
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        let val = if let Some(v) = a.strip_prefix("-model=") {
+            Some(v.to_string())
+        } else if a == "-model" || a == "--model" {
+            it.next().cloned()
+        } else {
+            None
+        };
+        if let Some(v) = val {
+            return match v.as_str() {
+                "qwen3.5-0.8b" | "qwen3.5-0.8B" | "0.8b" | "0.8B" | "qwen0.8b" | "default" => Ok(Model::Qwen08B),
+                "qwen3.5-9b" | "qwen3.5-9B" | "9b" | "9B" | "qwen9b" => Ok(Model::Qwen9B),
+                other => Err(format!("unknown -model '{other}' (expected qwen3.5-0.8b or qwen3.5-9b)")),
+            };
+        }
+    }
+    Ok(Model::Qwen08B)
+}
+
 /// Parse `-arch <value>` (or `-arch=<value>`) from the args; default x86_64.
 fn parse_arch(rest: &[String]) -> Result<Arch, String> {
     let mut it = rest.iter();
@@ -49,11 +117,18 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let model = match parse_model(&rest) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("xtask error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let result = match cmd.as_str() {
-        "build" => cmd_build(release, arch),
+        "build" => cmd_build(release, arch, model),
         "image" => image(release),
-        "run" => cmd_run(release, arch),
+        "run" => cmd_run(release, arch, model),
         "test" => cmd_test(),
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
         // boot the real model, run the acceptance checks, exit pass/fail.
@@ -73,26 +148,32 @@ fn main() {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <build|image|run|test|ref-check> [-arch x86_64|aarch64] [--release]".to_string()
+    "usage: cargo xtask <build|image|run|test|ref-check> [-arch x86_64|aarch64] \
+     [-model qwen3.5-0.8b|qwen3.5-9b] [--release]"
+        .to_string()
 }
 
-/// `cargo xtask build [-arch ...]`: build the unified kernel for the chosen
-/// architecture.
-fn cmd_build(release: bool, arch: Arch) -> Result<(), String> {
+/// `cargo xtask build [-arch ...] [-model ...]`: build the unified kernel for
+/// the chosen architecture and model memory layout.
+fn cmd_build(release: bool, arch: Arch, model: Model) -> Result<(), String> {
     match arch {
-        Arch::X86_64 => build_kernel(release).map(|_| ()),
-        Arch::Aarch64 => build_kernel_aarch64(release).map(|_| ()),
+        Arch::X86_64 => build_kernel_with(release, model.features()).map(|_| ()),
+        Arch::Aarch64 => build_kernel_aarch64(release, model.features()).map(|_| ()),
     }
 }
 
-/// Build the unified kernel for aarch64 (`targets/aarch64-chitti.json`), and
-/// return the path to the resulting ELF (`-M virt -kernel` bootable).
-fn build_kernel_aarch64(release: bool) -> Result<PathBuf, String> {
+/// Build the unified kernel for aarch64 (`targets/aarch64-chitti.json`) with
+/// the given extra cargo `features`, returning the path to the resulting ELF
+/// (`-M virt -kernel` bootable).
+fn build_kernel_aarch64(release: bool, features: &[&str]) -> Result<PathBuf, String> {
     let kdir = kernel_dir();
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&kdir).args(["build", "--target", "../targets/aarch64-chitti.json"]);
     if release {
         cmd.arg("--release");
+    }
+    if !features.is_empty() {
+        cmd.arg("--features").arg(features.join(","));
     }
     run(&mut cmd)?;
     let profile = if release { "release" } else { "debug" };
@@ -108,7 +189,7 @@ fn build_kernel_aarch64(release: bool) -> Result<PathBuf, String> {
 /// Boot the unified kernel built for aarch64 on `qemu-system-aarch64 -M virt`
 /// with `-accel hvf`, so it runs *natively* on this Apple Silicon host (no
 /// cross-arch emulation) with NEON. Serial to stdio (`-nographic`).
-fn cmd_run_aarch64(release: bool) -> Result<(), String> {
+fn cmd_run_aarch64(release: bool, model: Model) -> Result<(), String> {
     // Native inference on aarch64 is only worthwhile optimized: debug NEON is
     // ~30x slower (no inlining of intrinsics, bounds/overflow checks in the hot
     // matvec loop). So this path defaults to a release build regardless of the
@@ -116,28 +197,39 @@ fn cmd_run_aarch64(release: bool) -> Result<(), String> {
     if !release {
         eprintln!("note: building aarch64 in RELEASE (debug NEON inference is ~30x slower)");
     }
-    let elf = build_kernel_aarch64(true)?;
+    let elf = build_kernel_aarch64(true, model.features())?;
     let mut qemu = Command::new("qemu-system-aarch64");
-    // 2 GiB RAM holds the kernel + the ~812 MiB model (loaded at 0x48000000)
-    // + the 256 MiB heap (0x80000000).
-    // `-smp 4`: four vCPUs, which under `-accel hvf` run on four *native* M-series
-    // cores in parallel (unlike TCG, where extra vCPUs only contend). Chitti's
-    // aarch64 SMP brings the secondaries up via PSCI and splits the hot matvec
-    // across them.
-    qemu.args(["-M", "virt", "-cpu", "host", "-accel", "hvf", "-smp", "4", "-m", "2G", "-nographic", "-kernel"]);
+    // Guest RAM holds the kernel + the model (loaded at `model.aarch64_addr`) +
+    // the heap; `model.qemu_mem` is sized for the chosen model's layout (2G for
+    // 0.8B, 12G for 9B). `-smp 4`: four vCPUs, which under `-accel hvf` run on
+    // four *native* M-series cores in parallel (unlike TCG, where extra vCPUs
+    // only contend). Chitti's aarch64 SMP brings the secondaries up via PSCI
+    // and splits the hot matvec across them.
+    qemu.args(["-M", "virt", "-cpu", "host", "-accel", "hvf", "-smp", "4", "-m", model.qemu_mem(), "-nographic", "-kernel"]);
     qemu.arg(&elf);
-    // Place the GGUF model in guest RAM at 0x48000000 (where the aarch64
-    // `cortex::model_module` looks), if present -- the equivalent of the x86
-    // Limine boot module, so `infer` works natively.
-    let model = repo_root().join("assets/model.gguf");
-    if model.exists() {
+    // Place the GGUF in guest RAM at the model's load address (where the aarch64
+    // `cortex::model_module` looks) -- the equivalent of the x86 Limine boot
+    // module, so `infer` works natively.
+    let gguf = repo_root().join(model.gguf_rel());
+    let too_big = gguf.metadata().map(|m| m.len() >= (4u64 << 30)).unwrap_or(false);
+    if gguf.exists() && !too_big {
         qemu.arg("-device")
-            .arg(format!("loader,file={},addr=0x48000000,force-raw=on", model.display()));
-        eprintln!("attaching model.gguf at guest phys 0x48000000");
+            .arg(format!("loader,file={},addr={},force-raw=on", gguf.display(), model.aarch64_addr()));
+        eprintln!("attaching {} at guest phys {}", model.gguf_rel(), model.aarch64_addr());
+    } else if too_big {
+        // QEMU's generic `-device loader` maps the file as a ROM blob and fails
+        // for images >= 4 GiB. Delivering a multi-GB model needs a virtio-blk
+        // disk the kernel reads (an aarch64 driver we don't have yet), so boot
+        // without it -- `infer` will report no model. See the model-9b notes.
+        eprintln!(
+            "note: {} is >=4 GiB; QEMU -device loader can't map it. Booting without a \
+             model (9B delivery via virtio-blk is not wired yet).",
+            model.gguf_rel()
+        );
     } else {
-        eprintln!("note: assets/model.gguf absent -- `infer` will report no model");
+        eprintln!("note: {} absent -- `infer` will report no model", model.gguf_rel());
     }
-    eprintln!("booting aarch64 Chitti natively via HVF (Ctrl-A X to quit qemu)...");
+    eprintln!("booting aarch64 Chitti ({}) natively via HVF (Ctrl-A X to quit qemu)...", model.label());
     run(&mut qemu)
 }
 
@@ -220,18 +312,23 @@ fn limine_bin() -> Result<PathBuf, String> {
     Ok(brew_prefix("limine")?.join("bin/limine"))
 }
 
-/// Assemble a hybrid BIOS/UEFI ISO around `kernel_bin`, per Limine's
-/// documented `xorriso` + `limine bios-install` recipe
-/// (USAGE.md#bios-uefi-hybrid-iso-creation).
+/// Assemble a hybrid BIOS/UEFI ISO around `kernel_bin` with the default (0.8B)
+/// model bundled, per Limine's documented `xorriso` + `limine bios-install`
+/// recipe (USAGE.md#bios-uefi-hybrid-iso-creation).
 fn assemble_image(kernel_bin: &Path) -> Result<PathBuf, String> {
-    assemble_image_opt(kernel_bin, true)
+    assemble_image_opt(kernel_bin, Some("assets/model.gguf"))
 }
 
-/// `include_model`: whether to copy `assets/model.gguf` into the image. The
-/// fast test suite (`cargo xtask test`) passes `false` so it never bundles
-/// or boots the ~644 MiB model it doesn't need; `run`/`image`/`ref-check`
-/// pass `true`.
-fn assemble_image_opt(kernel_bin: &Path, include_model: bool) -> Result<PathBuf, String> {
+/// As `assemble_image`, but bundling the model GGUF at `model_rel`.
+fn assemble_image_with(kernel_bin: &Path, model_rel: &str) -> Result<PathBuf, String> {
+    assemble_image_opt(kernel_bin, Some(model_rel))
+}
+
+/// `model_rel`: repo-relative path of the model GGUF to copy into the image, or
+/// `None` to bundle no model. The fast test suite (`cargo xtask test`) passes
+/// `None` so it never bundles or boots the model it doesn't need;
+/// `run`/`image`/`ref-check` pass the selected model.
+fn assemble_image_opt(kernel_bin: &Path, model_rel: Option<&str>) -> Result<PathBuf, String> {
     let root = repo_root();
     let iso_root = root.join("target/iso_root");
     if iso_root.exists() {
@@ -257,16 +354,16 @@ fn assemble_image_opt(kernel_bin: &Path, include_model: bool) -> Result<PathBuf,
     // Bundle the model + declare it in limine.conf ONLY when both requested
     // and present. Limine panics at boot if `module_path` names a module the
     // image lacks, so the declaration must track the actual file.
-    let model = root.join("assets/model.gguf");
-    if include_model && model.exists() {
+    let model = model_rel.map(|r| root.join(r)).filter(|p| p.exists());
+    if let Some(model) = model {
         fs::copy(&model, iso_root.join("boot/model.gguf")).map_err(|e| format!("copying model.gguf: {e}"))?;
         let conf_path = iso_root.join("boot/limine/limine.conf");
         let mut conf = fs::read_to_string(&conf_path).map_err(|e| e.to_string())?;
         conf.push_str("    module_path: boot():/boot/model.gguf\n");
         fs::write(&conf_path, conf).map_err(|e| format!("appending module_path: {e}"))?;
-    } else if include_model {
+    } else if let Some(r) = model_rel {
         eprintln!(
-            "xtask: note: assets/model.gguf not present -- run xtask/fetch-model.sh for inference; \
+            "xtask: note: {r} not present -- run xtask/fetch-model.sh for inference; \
              the image boots without it (no module declared)."
         );
     }
@@ -353,12 +450,12 @@ fn qemu_base_cmd(iso: &Path) -> Command {
 /// `cargo xtask run [-arch ...]`: boot the unified kernel. On aarch64 it runs
 /// natively via QEMU + HVF; on x86 it boots the Limine image under
 /// qemu-system-x86_64 (TCG on this host).
-fn cmd_run(release: bool, arch: Arch) -> Result<(), String> {
+fn cmd_run(release: bool, arch: Arch, model: Model) -> Result<(), String> {
     if arch == Arch::Aarch64 {
-        return cmd_run_aarch64(release);
+        return cmd_run_aarch64(release, model);
     }
-    let bin = build_kernel(release)?;
-    let iso = assemble_image(&bin)?;
+    let bin = build_kernel_with(release, model.features())?;
+    let iso = assemble_image_with(&bin, model.gguf_rel())?;
     let disk = ensure_disk_image()?;
     let mut cmd = qemu_base_cmd(&iso);
     cmd.args(["-serial", "stdio"]);
@@ -405,7 +502,7 @@ fn cmd_runner(args: &[String]) -> Result<(), String> {
     // Fast test suite: exclude the model so the ISO stays small and boots
     // quickly (the tensor-kernel tests validate against baked-in NumPy
     // reference vectors, not the real model).
-    let iso = assemble_image_opt(Path::new(bin_path), false)?;
+    let iso = assemble_image_opt(Path::new(bin_path), None)?;
     let mut cmd = qemu_base_cmd(&iso);
     // The in-kernel test suite includes the Phase 7 SMP bring-up + spinlock
     // self-test, so the harness runs with four vCPUs.

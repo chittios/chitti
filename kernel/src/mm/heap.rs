@@ -23,7 +23,13 @@ pub const HEAP_START: u64 = 0xffff_a000_0000_0000;
 // vocab-sized logits add several MiB more. The linked-list allocator does
 // no coalescing, so headroom also absorbs fragmentation from transient
 // caches. Backed by the frame allocator, which has gigabytes free.
+#[cfg(not(feature = "model-9b"))]
 pub const HEAP_SIZE: usize = 256 * 1024 * 1024;
+// The 9B model has 33 layers, dim 4096, ffn 12288 and a 248K vocab, so its
+// per-forward state, KV/recurrent cache, and batched-prefill buffers are far
+// larger; give the heap 1 GiB (it sits at 0x2_00000000, past the model).
+#[cfg(feature = "model-9b")]
+pub const HEAP_SIZE: usize = 1024 * 1024 * 1024;
 
 struct ListNode {
     size: usize,

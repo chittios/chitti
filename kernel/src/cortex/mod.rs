@@ -402,8 +402,18 @@ pub fn model_module() -> Option<&'static [u8]> {
 /// actual file; the generous upper bound just needs to cover it.
 #[cfg(not(target_arch = "x86_64"))]
 pub fn model_module() -> Option<&'static [u8]> {
+    // 0.8B: model at 0x48000000, up to the heap at 0x80000000 (896 MiB window).
+    // 9B (`model-9b`): the ~5.8 GiB model is loaded at 0x80000000, with the heap
+    // moved to 0x2_00000000, giving a 6 GiB window. `cargo xtask run -model
+    // qwen3.5-9b` places the GGUF at the matching address via `-device loader`.
+    #[cfg(not(feature = "model-9b"))]
     const MODEL_ADDR: usize = 0x4800_0000;
+    #[cfg(not(feature = "model-9b"))]
     const MODEL_MAX: usize = 0x3800_0000; // 896 MiB, up to the heap at 0x80000000
+    #[cfg(feature = "model-9b")]
+    const MODEL_ADDR: usize = 0x8000_0000;
+    #[cfg(feature = "model-9b")]
+    const MODEL_MAX: usize = 0x1_8000_0000; // 6 GiB, up to the heap at 0x2_00000000
     // SAFETY: `MODEL_ADDR` is identity-mapped normal RAM (arch::aarch64::mmu);
     // reading 4 bytes to check the magic is always in bounds.
     let magic = unsafe { core::slice::from_raw_parts(MODEL_ADDR as *const u8, 4) };
