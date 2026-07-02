@@ -108,12 +108,21 @@ pub struct State {
     ffn_act: Vec<f32>,
     proj: Vec<f32>,
     pub logits: Vec<f32>,
+    // int8-activation scratch for the fast (SDOT) matvec path, sized to the
+    // widest matvec input so it is reused across every projection.
+    xq: Vec<i8>,
+    xs: Vec<f32>,
 }
 
 impl State {
     pub fn new(c: &Config, vocab: usize) -> Self {
         let dim = c.embedding_length;
         let v = |n| alloc::vec![0.0f32; n];
+        // Widest matvec input across all projections (columns): the norm-fed
+        // projections use `dim`, ffn_down uses the FFN width, o_proj uses
+        // head_count*head_dim, and the DeltaNet output uses ssm_inner.
+        let max_cols =
+            dim.max(c.feed_forward_length).max(c.head_count * c.head_dim).max(c.ssm_inner);
         Self {
             hidden: v(dim),
             residual: v(dim),
@@ -134,6 +143,8 @@ impl State {
             ffn_act: v(c.feed_forward_length),
             proj: v(dim),
             logits: v(vocab),
+            xq: alloc::vec![0i8; max_cols],
+            xs: alloc::vec![0.0f32; max_cols / QK],
         }
     }
 }
@@ -299,10 +310,10 @@ impl<'a> Model<'a> {
             s.residual.copy_from_slice(&s.hidden);
             tensor::rmsnorm(&s.hidden, self.layers[l].post_norm, c.rms_eps, &mut s.norm);
             let ffn = c.feed_forward_length;
-            tensor::matvec_q8_0(self.layers[l].ffn_gate, &s.norm, &mut s.ffn_gate, ffn, dim);
-            tensor::matvec_q8_0(self.layers[l].ffn_up, &s.norm, &mut s.ffn_up, ffn, dim);
+            tensor::matvec_q8_0_fast(self.layers[l].ffn_gate, &s.norm, &mut s.ffn_gate, &mut s.xq, &mut s.xs, ffn, dim);
+            tensor::matvec_q8_0_fast(self.layers[l].ffn_up, &s.norm, &mut s.ffn_up, &mut s.xq, &mut s.xs, ffn, dim);
             tensor::silu_mul(&s.ffn_gate, &s.ffn_up, &mut s.ffn_act);
-            tensor::matvec_q8_0(self.layers[l].ffn_down, &s.ffn_act, &mut s.proj, dim, ffn);
+            tensor::matvec_q8_0_fast(self.layers[l].ffn_down, &s.ffn_act, &mut s.proj, &mut s.xq, &mut s.xs, dim, ffn);
             for i in 0..dim {
                 s.hidden[i] = s.residual[i] + s.proj[i];
             }
@@ -310,7 +321,7 @@ impl<'a> Model<'a> {
 
         if need_logits {
             tensor::rmsnorm(&s.hidden, self.output_norm, c.rms_eps, &mut s.norm);
-            tensor::matvec_q8_0(self.token_embd, &s.norm, &mut s.logits, self.vocab, dim);
+            tensor::matvec_q8_0_fast(self.token_embd, &s.norm, &mut s.logits, &mut s.xq, &mut s.xs, self.vocab, dim);
         }
 
         cache.positions = cache.positions.max(pos + 1);
@@ -330,9 +341,9 @@ impl<'a> Model<'a> {
             _ => unreachable!(),
         };
 
-        tensor::matvec_q8_0(q_w, &s.norm, &mut s.q, nq * hd * 2, dim); // query+gate interleaved
-        tensor::matvec_q8_0(k_w, &s.norm, &mut s.k, kv_dim, dim);
-        tensor::matvec_q8_0(v_w, &s.norm, &mut s.v, kv_dim, dim);
+        tensor::matvec_q8_0_fast(q_w, &s.norm, &mut s.q, &mut s.xq, &mut s.xs, nq * hd * 2, dim); // query+gate interleaved
+        tensor::matvec_q8_0_fast(k_w, &s.norm, &mut s.k, &mut s.xq, &mut s.xs, kv_dim, dim);
+        tensor::matvec_q8_0_fast(v_w, &s.norm, &mut s.v, &mut s.xq, &mut s.xs, kv_dim, dim);
 
         // QK-norm per head, partial RoPE on the first rope_dim dims.
         for h in 0..nq {
@@ -374,7 +385,7 @@ impl<'a> Model<'a> {
             }
         }
 
-        tensor::matvec_q8_0(o_w, &s.attn_out, &mut s.proj, dim, nq * hd);
+        tensor::matvec_q8_0_fast(o_w, &s.attn_out, &mut s.proj, &mut s.xq, &mut s.xs, dim, nq * hd);
     }
 
     fn delta_layer(&self, l: usize, cache: &mut Cache, s: &mut State) {
@@ -394,10 +405,10 @@ impl<'a> Model<'a> {
             _ => unreachable!(),
         };
 
-        tensor::matvec_q8_0(qkv_w, &s.norm, &mut s.qkv, conv_dim, dim);
-        tensor::matvec_q8_0(gate_w, &s.norm, &mut s.z, value_dim, dim);
-        tensor::matvec_q8_0(alpha_w, &s.norm, &mut s.gates, nh, dim); // reuse gates as alpha
-        tensor::matvec_q8_0(beta_w, &s.norm, &mut s.betas, nh, dim);
+        tensor::matvec_q8_0_fast(qkv_w, &s.norm, &mut s.qkv, &mut s.xq, &mut s.xs, conv_dim, dim);
+        tensor::matvec_q8_0_fast(gate_w, &s.norm, &mut s.z, &mut s.xq, &mut s.xs, value_dim, dim);
+        tensor::matvec_q8_0_fast(alpha_w, &s.norm, &mut s.gates, &mut s.xq, &mut s.xs, nh, dim); // reuse gates as alpha
+        tensor::matvec_q8_0_fast(beta_w, &s.norm, &mut s.betas, &mut s.xq, &mut s.xs, nh, dim);
 
         // g = -exp(A_log) * softplus(alpha + dt_bias)  (log-decay); beta = sigmoid.
         for h in 0..nh {
@@ -469,7 +480,7 @@ impl<'a> Model<'a> {
             }
         }
 
-        tensor::matvec_q8_0(out_w, &s.delta_o, &mut s.proj, dim, value_dim);
+        tensor::matvec_q8_0_fast(out_w, &s.delta_o, &mut s.proj, &mut s.xq, &mut s.xs, dim, value_dim);
     }
 }
 
