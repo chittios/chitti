@@ -53,10 +53,6 @@ Consequential ones flagged **REVISIT**.
 
 ## Assumptions logged during the run
 
-(appended below as they arise)
-
-## Assumptions logged during the run
-
 - **Phase C SMP concurrency (REVISIT):** `dispatch_batch` assigns each sub-agent a distinct
   core id and records it (`SubagentRecord.core`), but under the single-threaded QEMU test
   harness sub-agents execute sequentially. The prior project note already found multicore
