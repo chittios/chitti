@@ -1,9 +1,10 @@
 //! The numeric core of Cortex: dequantization + the handful of transformer
 //! kernels (`CHITTI_OS_HANDOFF.md` Phase 3). Everything accumulates in
-//! `f32`; the dot-product hot path uses explicit SSE2 intrinsics
-//! (`core::arch::x86_64`), the rest is straight-line scalar `f32` chosen
-//! for legibility and to match the NumPy reference (`tools/ref.py`) bit
-//! layout and math exactly enough to pass the parity gate.
+//! `f32`. The hot paths (dot product, `Q8_0` matvec) are **architecture-
+//! portable**: SSE2/AVX2 on x86_64, NEON on aarch64 (native on Apple Silicon),
+//! and a pure-scalar fallback anywhere else -- all behind one API and matching
+//! the NumPy reference (`tools/ref.py`) within the parity tolerance. The rest
+//! is straight-line scalar `f32` for legibility.
 //!
 //! Quantized weights follow llama.cpp's GGUF block formats verbatim so a
 //! real Qwen2.5 GGUF can be read without transcoding:
@@ -12,8 +13,6 @@
 //! - **Q4_0**: 32 values per block = one `f16` scale `d` + 16 packed bytes
 //!   (18 bytes). Nibble `j` low → `x[j]`, nibble `j` high → `x[j+16]`,
 //!   each dequantized as `d * (nibble - 8)`.
-
-use core::arch::x86_64::{_mm_add_ps, _mm_loadu_ps, _mm_mul_ps, _mm_setzero_ps, _mm_storeu_ps};
 
 pub const QK: usize = 32; // elements per quantization block (both Q4_0/Q8_0)
 pub const Q8_0_BLOCK_BYTES: usize = 2 + QK; // f16 scale + 32 i8
@@ -87,8 +86,35 @@ pub fn dequant_q4_0_block(block: &[u8], out: &mut [f32]) {
 /// QEMU's TCG emulation.
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
+    dot_f32_dispatch(a, b)
+}
+
+/// Pure-scalar dot, reducing in the same 4-lane grouping the SIMD paths use so
+/// results agree closely. The portable fallback (used on non-SIMD targets;
+/// unused on x86_64/aarch64, which have SSE/NEON paths).
+#[allow(dead_code)]
+fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len();
+    let mut lanes = [0.0f32; 4];
+    let mut i = 0;
+    while i + 4 <= n {
+        for (k, lane) in lanes.iter_mut().enumerate() {
+            *lane += a[i + k] * b[i + k];
+        }
+        i += 4;
+    }
+    let mut sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    while i < n {
+        sum += a[i] * b[i];
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+fn dot_f32_dispatch(a: &[f32], b: &[f32]) -> f32 {
     if crate::arch::x86_64::fpu::avx2_enabled() {
-        // SAFETY: `avx2_enabled()` is only true once fpu::init has confirmed
+        // SAFETY: `avx2_enabled()` is only true once fpu::init confirmed
         // AVX2+FMA are supported by the CPU and enabled via XCR0.
         unsafe { dot_f32_avx2(a, b) }
     } else {
@@ -96,12 +122,24 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+fn dot_f32_dispatch(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: NEON is baseline on aarch64 (see targets/aarch64-chitti.json).
+    unsafe { dot_f32_neon(a, b) }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn dot_f32_dispatch(a: &[f32], b: &[f32]) -> f32 {
+    dot_f32_scalar(a, b)
+}
+
+#[cfg(target_arch = "x86_64")]
 fn dot_f32_sse2(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::x86_64::{_mm_add_ps, _mm_loadu_ps, _mm_mul_ps, _mm_setzero_ps, _mm_storeu_ps};
     let n = a.len();
     let mut i = 0;
-    // SAFETY: `+sse2` is always available (see targets/x86_64-chitti.json);
-    // every load reads 4 in-bounds `f32`s (`i + 4 <= n` guard), and the
-    // store targets a local 4-lane array.
+    // SAFETY: `+sse2` is always available (targets/x86_64-chitti.json); every
+    // load reads 4 in-bounds `f32`s (`i + 4 <= n`); the store targets a local.
     let mut sum = unsafe {
         let mut acc = _mm_setzero_ps();
         while i + 4 <= n {
@@ -124,8 +162,8 @@ fn dot_f32_sse2(a: &[f32], b: &[f32]) -> f32 {
 /// AVX2 + FMA dot product (8-wide). Only called when `fpu::avx2_enabled()`.
 ///
 /// # Safety
-/// Requires the AVX2 and FMA target features to be available at runtime,
-/// which the caller guarantees via `fpu::avx2_enabled()`.
+/// Requires AVX2 + FMA at runtime, guaranteed by `fpu::avx2_enabled()`.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
 unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     use core::arch::x86_64::{_mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_storeu_ps};
@@ -144,6 +182,31 @@ unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
         _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
         let mut sum =
             ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])) + ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]));
+        while i < n {
+            sum += a[i] * b[i];
+            i += 1;
+        }
+        sum
+    }
+}
+
+/// NEON dot product (4-wide FMA). Native on Apple Silicon.
+///
+/// # Safety
+/// NEON is baseline on aarch64; all loads are guarded by `i + 4 <= n`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
+    let n = a.len();
+    let mut i = 0;
+    // SAFETY: guarded by `i + 4 <= n`.
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+        while i + 4 <= n {
+            acc = vfmaq_f32(acc, vld1q_f32(a.as_ptr().add(i)), vld1q_f32(b.as_ptr().add(i)));
+            i += 4;
+        }
+        let mut sum = vaddvq_f32(acc);
         while i < n {
             sum += a[i] * b[i];
             i += 1;
@@ -205,12 +268,66 @@ pub unsafe fn matvec_q8_0_rows(
     row_end: usize,
     n_cols: usize,
 ) {
-    if crate::arch::x86_64::fpu::avx2_enabled() {
-        // SAFETY: `avx2_enabled()` guarantees AVX2+FMA; caller guarantees bounds.
-        unsafe { matvec_q8_0_avx2(w, x, y, row_start, row_end, n_cols) };
-    } else {
-        // SAFETY: caller guarantees bounds.
-        unsafe { matvec_q8_0_scalar(w, x, y, row_start, row_end, n_cols) };
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: caller guarantees bounds; avx2 path gated on runtime support.
+    unsafe {
+        if crate::arch::x86_64::fpu::avx2_enabled() {
+            matvec_q8_0_avx2(w, x, y, row_start, row_end, n_cols);
+        } else {
+            matvec_q8_0_scalar(w, x, y, row_start, row_end, n_cols);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: caller guarantees bounds; NEON is baseline on aarch64.
+    unsafe {
+        matvec_q8_0_neon(w, x, y, row_start, row_end, n_cols);
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    // SAFETY: caller guarantees bounds.
+    unsafe {
+        matvec_q8_0_scalar(w, x, y, row_start, row_end, n_cols);
+    }
+}
+
+/// Fused NEON `Q8_0` matvec over rows `[row_start, row_end)`: per block, widen
+/// 8 `i8` at a time to `f32`, scale by the block's `f16` `d`, and FMA against
+/// `x` into two independent 4-lane accumulators (breaking the dependency
+/// chain). Native on Apple Silicon.
+///
+/// # Safety
+/// See `matvec_q8_0_rows`; NEON is baseline on aarch64.
+#[cfg(target_arch = "aarch64")]
+unsafe fn matvec_q8_0_neon(w: *const u8, x: *const f32, y: *mut f32, row_start: usize, row_end: usize, n_cols: usize) {
+    use core::arch::aarch64::{
+        vaddq_f32, vaddvq_f32, vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32, vget_high_s16, vget_low_s16, vld1_s8, vld1q_f32,
+        vmovl_s16, vmovl_s8, vmulq_f32,
+    };
+    let blocks = n_cols / QK;
+    let row_bytes = blocks * Q8_0_BLOCK_BYTES;
+    // SAFETY: all loads in-bounds per the caller's contract.
+    unsafe {
+        for r in row_start..row_end {
+            let row = w.add(r * row_bytes);
+            let mut acc0 = vdupq_n_f32(0.0);
+            let mut acc1 = vdupq_n_f32(0.0);
+            for b in 0..blocks {
+                let base = b * Q8_0_BLOCK_BYTES;
+                let d = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
+                let dv = vdupq_n_f32(d);
+                let q = row.add(base + 2) as *const i8;
+                let xp = x.add(b * QK);
+                let mut g = 0;
+                while g < QK {
+                    let q16 = vmovl_s8(vld1_s8(q.add(g)));
+                    let qflo = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16))), dv);
+                    let qfhi = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16))), dv);
+                    acc0 = vfmaq_f32(acc0, qflo, vld1q_f32(xp.add(g)));
+                    acc1 = vfmaq_f32(acc1, qfhi, vld1q_f32(xp.add(g + 4)));
+                    g += 8;
+                }
+            }
+            *y.add(r) = vaddvq_f32(vaddq_f32(acc0, acc1));
+        }
     }
 }
 
@@ -243,6 +360,7 @@ unsafe fn matvec_q8_0_scalar(w: *const u8, x: *const f32, y: *mut f32, row_start
 ///
 /// # Safety
 /// Requires AVX2 + FMA; see `matvec_q8_0_rows` for the pointer/range contract.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,avx2,fma")]
 unsafe fn matvec_q8_0_avx2(w: *const u8, x: *const f32, y: *mut f32, row_start: usize, row_end: usize, n_cols: usize) {
     use core::arch::x86_64::{
@@ -418,13 +536,34 @@ pub fn l2norm(x: &mut [f32], eps: f32) {
 // polynomial approximations accurate to well within the logit tolerance.
 
 fn libm_sqrtf(x: f32) -> f32 {
-    // SAFETY: `sqrtss` is an SSE2 instruction (always available); it has no
-    // side effects and is defined for all non-negative inputs (our sums of
-    // squares plus a positive eps).
+    // Hardware square root: `sqrtss` on x86 (SSE2), `fsqrt` on aarch64. Both
+    // are exact/IEEE-correct and defined for our non-negative inputs (sums of
+    // squares plus a positive eps). A Newton-Raphson fallback covers any other
+    // target. `core` has no `f32::sqrt` (that lives in `std`).
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `sqrtss` has no side effects; input is non-negative.
     unsafe {
         let mut r = x;
         core::arch::asm!("sqrtss {r}, {r}", r = inout(xmm_reg) r, options(nomem, nostack, preserves_flags));
         r
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `fsqrt` has no side effects; input is non-negative.
+    unsafe {
+        let r: f32;
+        core::arch::asm!("fsqrt {r:s}, {x:s}", r = out(vreg) r, x = in(vreg) x, options(nomem, nostack, preserves_flags));
+        r
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        if x <= 0.0 {
+            return 0.0;
+        }
+        let mut g = x; // Newton-Raphson: g' = (g + x/g) / 2
+        for _ in 0..20 {
+            g = 0.5 * (g + x / g);
+        }
+        g
     }
 }
 
