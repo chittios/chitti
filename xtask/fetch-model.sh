@@ -21,8 +21,9 @@ case "$MODEL" in
     ;;
   qwen3.5-9b|9b)
     DEST="$DIR/assets/model-9b.gguf"
-    URL="https://huggingface.co/huihui-ai/Huihui-Qwythos-9B-Claude-Mythos-5-1M-abliterated-GGUF/resolve/main/Huihui-Qwythos-9B-Claude-Mythos-5-1M-abliterated-Q4_K.gguf"
-    SIZE="~5.4 GB (Q4_K)"
+    # Q4_0 (not Q4_K): Q4_0 is a format Chitti's kernel supports directly.
+    URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_0.gguf"
+    SIZE="~5.0 GB (Q4_0)"
     ;;
   *)
     echo "unknown model '$MODEL' (expected qwen3.5-0.8b or qwen3.5-9b)" >&2

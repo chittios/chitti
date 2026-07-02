@@ -4,6 +4,7 @@
 
 use std::env;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -211,26 +212,65 @@ fn cmd_run_aarch64(release: bool, model: Model) -> Result<(), String> {
     // `cortex::model_module` looks) -- the equivalent of the x86 Limine boot
     // module, so `infer` works natively.
     let gguf = repo_root().join(model.gguf_rel());
-    let too_big = gguf.metadata().map(|m| m.len() >= (4u64 << 30)).unwrap_or(false);
-    if gguf.exists() && !too_big {
-        qemu.arg("-device")
-            .arg(format!("loader,file={},addr={},force-raw=on", gguf.display(), model.aarch64_addr()));
+    if gguf.exists() {
+        let base = u64::from_str_radix(model.aarch64_addr().trim_start_matches("0x"), 16)
+            .map_err(|e| format!("bad model addr {}: {e}", model.aarch64_addr()))?;
+        for arg in model_loader_args(&gguf, base)? {
+            qemu.arg("-device").arg(arg);
+        }
         eprintln!("attaching {} at guest phys {}", model.gguf_rel(), model.aarch64_addr());
-    } else if too_big {
-        // QEMU's generic `-device loader` maps the file as a ROM blob and fails
-        // for images >= 4 GiB. Delivering a multi-GB model needs a virtio-blk
-        // disk the kernel reads (an aarch64 driver we don't have yet), so boot
-        // without it -- `infer` will report no model. See the model-9b notes.
-        eprintln!(
-            "note: {} is >=4 GiB; QEMU -device loader can't map it. Booting without a \
-             model (9B delivery via virtio-blk is not wired yet).",
-            model.gguf_rel()
-        );
     } else {
         eprintln!("note: {} absent -- `infer` will report no model", model.gguf_rel());
     }
     eprintln!("booting aarch64 Chitti ({}) natively via HVF (Ctrl-A X to quit qemu)...", model.label());
     run(&mut qemu)
+}
+
+/// Build the QEMU `-device loader` argument(s) that place `gguf` in guest RAM
+/// starting at `base_addr`. QEMU's generic loader maps each file as a ROM blob
+/// and fails for images >= 4 GiB, so a large model is split into <= 1 GiB
+/// chunk files loaded at consecutive addresses -- the guest sees one contiguous
+/// blob at `base_addr` regardless. Chunks are cached under `target/` and only
+/// rewritten when the model changes.
+fn model_loader_args(gguf: &Path, base_addr: u64) -> Result<Vec<String>, String> {
+    let size = fs::metadata(gguf).map_err(|e| format!("stat {}: {e}", gguf.display()))?.len();
+    const CHUNK: u64 = 1 << 30; // 1 GiB, safely under the loader's 4 GiB limit
+    if size < 4 << 30 {
+        return Ok(vec![format!("loader,file={},addr={:#x},force-raw=on", gguf.display(), base_addr)]);
+    }
+
+    let dir = repo_root().join("target/model-chunks");
+    let meta = dir.join("source.meta");
+    let want = format!("{}:{size}", gguf.display());
+    let n_chunks = size.div_ceil(CHUNK);
+    let fresh = fs::read_to_string(&meta).map(|s| s.trim() == want).unwrap_or(false)
+        && (0..n_chunks).all(|i| dir.join(format!("c{i}")).exists());
+    if !fresh {
+        eprintln!("splitting {} ({size} bytes) into {n_chunks} chunks for QEMU loader...", gguf.display());
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        let mut f = fs::File::open(gguf).map_err(|e| format!("open {}: {e}", gguf.display()))?;
+        let mut buf = vec![0u8; 8 << 20];
+        for i in 0..n_chunks {
+            let mut remaining = CHUNK.min(size - i * CHUNK);
+            let mut out = fs::File::create(dir.join(format!("c{i}"))).map_err(|e| e.to_string())?;
+            while remaining > 0 {
+                let want = buf.len().min(remaining as usize);
+                let got = f.read(&mut buf[..want]).map_err(|e| e.to_string())?;
+                if got == 0 {
+                    break;
+                }
+                out.write_all(&buf[..got]).map_err(|e| e.to_string())?;
+                remaining -= got as u64;
+            }
+        }
+        fs::write(&meta, want).map_err(|e| e.to_string())?;
+    }
+    Ok((0..n_chunks)
+        .map(|i| {
+            format!("loader,file={},addr={:#x},force-raw=on", dir.join(format!("c{i}")).display(), base_addr + i * CHUNK)
+        })
+        .collect())
 }
 
 fn repo_root() -> PathBuf {
