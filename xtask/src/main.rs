@@ -230,13 +230,10 @@ const QEMU_BASE_ARGS: &[&str] = &[
     // then falls back to SSE2 -- correct, just slower).
     "-cpu",
     "max",
-    // Phase 7 SMP: four vCPUs, each on its own host thread under TCG so the
-    // application processors genuinely run in parallel with the BSP (and so a
-    // spinning/working AP doesn't steal the BSP's round-robin slice).
-    "-smp",
-    "4",
-    "-accel",
-    "tcg,thread=multi",
+    // NB: SMP (`-smp 4`) is added only by the test runner (`cmd_runner`), where
+    // the SMP bring-up + spinlock self-test runs. Interactive `run` and
+    // `ref-check` stay single-CPU: inference is BSP-bound, and under
+    // single-thread TCG extra vCPUs only cost round-robin overhead.
     "-m",
     "2G",
     "-device",
@@ -306,7 +303,9 @@ fn cmd_runner(args: &[String]) -> Result<(), String> {
     // reference vectors, not the real model).
     let iso = assemble_image_opt(Path::new(bin_path), false)?;
     let mut cmd = qemu_base_cmd(&iso);
-    cmd.args(["-serial", "stdio", "-display", "none"]);
+    // The in-kernel test suite includes the Phase 7 SMP bring-up + spinlock
+    // self-test, so the harness runs with four vCPUs.
+    cmd.args(["-smp", "4", "-serial", "stdio", "-display", "none"]);
     let status = cmd
         .status()
         .map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
@@ -331,10 +330,13 @@ fn cmd_ref_check() -> Result<(), String> {
     }
     let bin = build_kernel_with(true, &["refcheck"])?;
     let iso = assemble_image(&bin)?;
-    // CPU inference on a 0.5B model under QEMU/TCG takes minutes; the model
-    // module needs headroom beyond 2 GiB.
+    // CPU inference under QEMU/TCG takes minutes; the model module needs
+    // headroom beyond 2 GiB.
     let mut cmd = Command::new("qemu-system-x86_64");
-    cmd.args(["-M", "q35", "-cpu", "max", "-m", "4G", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-no-reboot"]);
+    cmd.args([
+        "-M", "q35", "-cpu", "max", "-smp", "4", "-m", "4G", "-device",
+        "isa-debug-exit,iobase=0xf4,iosize=0x04", "-no-reboot",
+    ]);
     cmd.arg("-cdrom").arg(&iso);
     cmd.args(["-serial", "stdio", "-display", "none"]);
     eprintln!("ref-check: running in-kernel acceptance gate under QEMU (this takes a few minutes)...");

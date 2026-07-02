@@ -175,57 +175,93 @@ pub fn matvec_q8_0(w: &[u8], x: &[f32], y: &mut [f32], n_rows: usize, n_cols: us
     debug_assert_eq!(n_cols % QK, 0);
     debug_assert_eq!(x.len(), n_cols);
     debug_assert_eq!(y.len(), n_rows);
+    // SAFETY: the slices are valid and correctly sized (asserts above); the
+    // range covers every row.
+    //
+    // Note: this splits cleanly across cores by row range (see
+    // `matvec_q8_0_rows`), which is a real speedup on native multi-core x86 but
+    // a net loss under QEMU's cross-arch TCG (measured): `thread=multi` taxes
+    // every emulated instruction and idle worker cores contend for host CPU,
+    // so inference stays single-core here.
+    unsafe { matvec_q8_0_rows(w.as_ptr(), x.as_ptr(), y.as_mut_ptr(), 0, n_rows, n_cols) };
+}
+
+/// Compute rows `[row_start, row_end)` of a `Q8_0` matvec, dispatching to the
+/// fused AVX2 kernel or a scalar fallback. Raw pointers (not slices) and an
+/// explicit row range so a matvec can be split across cores (each core owns a
+/// disjoint range) -- the substrate for data-parallel inference on real
+/// hardware.
+///
+/// # Safety
+/// `w` must point at `n_rows` weight rows of `n_cols/QK` `Q8_0` blocks each,
+/// `x` at `n_cols` `f32`s, and `y` at `n_rows` `f32`s; `row_start <= row_end
+/// <= n_rows`; `n_cols` a multiple of `QK`. Rows are written disjointly, so
+/// distinct callers may safely own distinct ranges of the same `y`.
+pub unsafe fn matvec_q8_0_rows(
+    w: *const u8,
+    x: *const f32,
+    y: *mut f32,
+    row_start: usize,
+    row_end: usize,
+    n_cols: usize,
+) {
     if crate::arch::x86_64::fpu::avx2_enabled() {
-        // SAFETY: `avx2_enabled()` guarantees AVX2+FMA are available.
-        unsafe { matvec_q8_0_avx2(w, x, y, n_rows, n_cols) };
+        // SAFETY: `avx2_enabled()` guarantees AVX2+FMA; caller guarantees bounds.
+        unsafe { matvec_q8_0_avx2(w, x, y, row_start, row_end, n_cols) };
     } else {
-        matvec_q8_0_scalar(w, x, y, n_rows, n_cols);
+        // SAFETY: caller guarantees bounds.
+        unsafe { matvec_q8_0_scalar(w, x, y, row_start, row_end, n_cols) };
     }
 }
 
-fn matvec_q8_0_scalar(w: &[u8], x: &[f32], y: &mut [f32], n_rows: usize, n_cols: usize) {
+/// # Safety
+/// See `matvec_q8_0_rows`.
+unsafe fn matvec_q8_0_scalar(w: *const u8, x: *const f32, y: *mut f32, row_start: usize, row_end: usize, n_cols: usize) {
     let blocks_per_row = n_cols / QK;
     let row_bytes = blocks_per_row * Q8_0_BLOCK_BYTES;
     let mut buf = [0.0f32; QK];
-    for r in 0..n_rows {
-        let row = &w[r * row_bytes..(r + 1) * row_bytes];
-        let mut acc = 0.0f32;
-        for b in 0..blocks_per_row {
-            let block = &row[b * Q8_0_BLOCK_BYTES..(b + 1) * Q8_0_BLOCK_BYTES];
-            dequant_q8_0_block(block, &mut buf);
-            acc += dot_f32(&buf, &x[b * QK..(b + 1) * QK]);
+    // SAFETY: caller guarantees `w`/`x`/`y` bounds and the row range.
+    unsafe {
+        for r in row_start..row_end {
+            let row = core::slice::from_raw_parts(w.add(r * row_bytes), row_bytes);
+            let mut acc = 0.0f32;
+            for b in 0..blocks_per_row {
+                let block = &row[b * Q8_0_BLOCK_BYTES..(b + 1) * Q8_0_BLOCK_BYTES];
+                dequant_q8_0_block(block, &mut buf);
+                let xb = core::slice::from_raw_parts(x.add(b * QK), QK);
+                acc += dot_f32(&buf, xb);
+            }
+            *y.add(r) = acc;
         }
-        y[r] = acc;
     }
 }
 
-/// Fused AVX2+FMA `Q8_0` matvec. Per block: load 32 `i8` quants, widen to
-/// `f32` eight at a time with `vpmovsxbd`+`vcvtdq2ps`, scale by the block's
-/// `f16` `d`, and FMA against `x` into a single 8-lane row accumulator
-/// (one horizontal sum per row). No scratch buffer, no per-block calls.
+/// Fused AVX2+FMA `Q8_0` matvec over rows `[row_start, row_end)`. Per block:
+/// load 32 `i8` quants, widen to `f32` eight at a time with
+/// `vpmovsxbd`+`vcvtdq2ps`, scale by the block's `f16` `d`, and FMA against
+/// `x` into a single 8-lane row accumulator (one horizontal sum per row).
 ///
 /// # Safety
-/// Requires AVX2 + FMA (guaranteed by the `matvec_q8_0` dispatch).
+/// Requires AVX2 + FMA; see `matvec_q8_0_rows` for the pointer/range contract.
 #[target_feature(enable = "avx,avx2,fma")]
-unsafe fn matvec_q8_0_avx2(w: &[u8], x: &[f32], y: &mut [f32], n_rows: usize, n_cols: usize) {
+unsafe fn matvec_q8_0_avx2(w: *const u8, x: *const f32, y: *mut f32, row_start: usize, row_end: usize, n_cols: usize) {
     use core::arch::x86_64::{
         __m128i, _mm256_cvtepi32_ps, _mm256_cvtepi8_epi32, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_mul_ps,
         _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps, _mm_loadl_epi64,
     };
     let blocks = n_cols / QK;
     let row_bytes = blocks * Q8_0_BLOCK_BYTES;
-    // SAFETY: all loads are in-bounds (n_cols multiple of QK=32, rows are
-    // `row_bytes` apart), and the AVX2/FMA feature is enabled.
+    // SAFETY: all loads are in-bounds (caller's contract) and AVX2/FMA is on.
     unsafe {
-        for r in 0..n_rows {
-            let row = w.as_ptr().add(r * row_bytes);
+        for r in row_start..row_end {
+            let row = w.add(r * row_bytes);
             let mut acc = _mm256_setzero_ps();
             for b in 0..blocks {
                 let base = b * Q8_0_BLOCK_BYTES;
                 let d = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
                 let dvec = _mm256_set1_ps(d);
                 let qptr = row.add(base + 2) as *const i8;
-                let xptr = x.as_ptr().add(b * QK);
+                let xptr = x.add(b * QK);
                 let mut g = 0;
                 while g < QK {
                     let q8 = _mm_loadl_epi64(qptr.add(g) as *const __m128i); // 8 i8
@@ -237,7 +273,7 @@ unsafe fn matvec_q8_0_avx2(w: &[u8], x: &[f32], y: &mut [f32], n_rows: usize, n_
             }
             let mut lanes = [0.0f32; 8];
             _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
-            y[r] = ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])) + ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]));
+            *y.add(r) = ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])) + ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]));
         }
     }
 }

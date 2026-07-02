@@ -29,6 +29,13 @@ pub struct InferResult {
     pub continuation: Vec<usize>,
     pub continuation_text: String,
     pub matched_reference: bool,
+    /// Wall-clock milliseconds (PIT ticks) spent prefilling the prompt.
+    pub prefill_ms: u64,
+    /// Wall-clock milliseconds spent decoding the continuation tokens.
+    pub decode_ms: u64,
+    /// Number of prompt tokens prefilled and continuation tokens decoded.
+    pub n_prompt: usize,
+    pub n_decoded: usize,
 }
 
 /// Load the model, run the fixed reference prompt, and greedily decode
@@ -57,11 +64,13 @@ pub fn run_reference_inference() -> Option<InferResult> {
     // silent gap here looks like a hang.
     let n_prompt = refcheck::PROMPT_IDS.len();
     let mut logits_pos = 0usize;
+    let prefill_start = crate::arch::x86_64::pit::ticks();
     for (pos, &tok) in refcheck::PROMPT_IDS.iter().enumerate() {
         crate::serial_println!("cortex.infer: prefill {}/{}", pos + 1, n_prompt);
         m.forward(tok as usize, pos, &mut kv, &mut state, pos + 1 == n_prompt);
         logits_pos = pos;
     }
+    let prefill_ms = crate::arch::x86_64::pit::ticks().saturating_sub(prefill_start);
     let prompt_final_argmax = model::argmax(&state.logits);
     let prompt_final_logit = state.logits[prompt_final_argmax];
 
@@ -71,6 +80,7 @@ pub fn run_reference_inference() -> Option<InferResult> {
     let mut pos = logits_pos + 1;
     let mut next = prompt_final_argmax;
     crate::serial_print!("Chitti: response> ");
+    let decode_start = crate::arch::x86_64::pit::ticks();
     for _ in 0..n_gen {
         continuation.push(next);
         crate::serial_print!("{}", model::detokenize(&m, &[next]));
@@ -78,6 +88,7 @@ pub fn run_reference_inference() -> Option<InferResult> {
         pos += 1;
         next = model::argmax(&state.logits);
     }
+    let decode_ms = crate::arch::x86_64::pit::ticks().saturating_sub(decode_start);
     crate::serial_println!("");
 
     let matched_reference = continuation.len() == refcheck::EXPECTED_CONTINUATION.len()
@@ -87,7 +98,17 @@ pub fn run_reference_inference() -> Option<InferResult> {
     // pay a second ~2.4 MiB GGUF parse just to render the text.
     let continuation_text = model::detokenize(&m, &continuation);
 
-    Some(InferResult { prompt_final_argmax, prompt_final_logit, continuation, continuation_text, matched_reference })
+    Some(InferResult {
+        prompt_final_argmax,
+        prompt_final_logit,
+        continuation,
+        continuation_text,
+        matched_reference,
+        prefill_ms,
+        decode_ms,
+        n_prompt,
+        n_decoded: n_gen,
+    })
 }
 
 fn bytemuck_ids(ids: &[u32]) -> &[u8] {

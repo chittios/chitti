@@ -1,6 +1,20 @@
 *"This project is specified in `CHITTI_OS_HANDOFF.md`. Read it fully before acting. Follow the locked decisions in Part 2 and the guardrails in Part 4. Work one phase at a time; do not start the next phase until the current phase's acceptance criteria pass in QEMU."*
 
 **Current phase: 7 (Stretch) — in progress. SMP + block-device FS + framebuffer TUI: complete.**
+**Inference UX + multicore study.** The shell `infer` builtin now shows the
+prompt, streams the response live (mirrored to the framebuffer TUI), and
+reports throughput (prompt tokens / prefill ms; decode tok/s via PIT timing)
+and reference parity. Multicore inference was implemented (a row-range
+`tensor::matvec_q8_0_rows` split across an AP worker pool) but **measured a net
+loss under QEMU cross-arch TCG** — single-thread TCG can't run vCPUs in
+parallel, and `-accel tcg,thread=multi` taxes every emulated instruction while
+idle worker cores contend for host CPU. Reverted to single-core: APs park after
+the SMP self-test, and the inference paths (`run`, `ref-check`) use a single
+vCPU (fastest for the BSP-bound workload); `-smp 4` is kept only for `cargo
+xtask test` (the SMP self-test). The row-range kernel keeps a real-hardware
+multicore split a drop-in away. Tests remain 69/69 green.
+
+---
 **Framebuffer TUI (Phase 7 track 3) — complete.** The QEMU graphical window is
 now a live terminal, and a human can drive Chitti from it. `framebuffer.rs`
 became a persistent global `Console`: an 8x8-font character grid with a cursor,
