@@ -61,6 +61,10 @@ fn matvec_qw(qw: QWeight, x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &mut [f32
         tensor::matvec_q8_0_fast(qw.data, x, y, xq, xs, n_rows, n_cols);
         return;
     }
+    if qw.qt == tensor::QT_Q4_0 {
+        tensor::matvec_q4_0_fast(qw.data, x, y, xq, xs, n_rows, n_cols);
+        return;
+    }
     debug_assert_eq!(x.len(), n_cols);
     debug_assert_eq!(y.len(), n_rows);
     #[cfg(target_arch = "aarch64")]

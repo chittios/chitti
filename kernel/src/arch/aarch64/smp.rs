@@ -205,7 +205,11 @@ fn worker_loop(slot: usize) -> ! {
             unsafe {
                 if qtype == 0 {
                     tensor::matmul_q8_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols);
+                } else if qtype as u32 == tensor::QT_Q4_0 {
+                    // Q4_0 SDOT: int8 activation (xq/xs), nibbles unpacked on the fly.
+                    tensor::matvec_q4_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols);
                 } else {
+                    // Generic dequant path: f32 activation (xf).
                     tensor::matvec_quant_rows(qtype as u32, w, JOB.xf.load(Ordering::Relaxed), y, rs, re, n_cols);
                 }
             }
@@ -301,6 +305,43 @@ pub unsafe fn matvec_quant(qt: u32, w: *const u8, x: *const f32, y: *mut f32, n_
     JOB.go.store(g, Ordering::Release);
     // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
     unsafe { tensor::matvec_quant_rows(qt, w, x, y, 0, boundary(1), n_cols) };
+    for s in 0..workers {
+        while DONE[s].load(Ordering::Acquire) != g {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Run a `Q4_0` SDOT matvec (int8-quantized activation `xq`/`xs`) across all
+/// online cores by row range -- the fast Q4_0 path (`matvec_q4_0_sdot_rows`),
+/// used for the 9B's many Q4_0 tensors. Falls back to single-core when only the
+/// BSP is online or the matrix is small.
+///
+/// # Safety
+/// Same contract as `tensor::matvec_q4_0_sdot_rows` over `[0, n_rows)`.
+pub unsafe fn matvec_q4_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, n_rows: usize, n_cols: usize) {
+    let workers = N_WORKERS.load(Ordering::Relaxed);
+    if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
+        // SAFETY: caller's contract; whole range on this core.
+        unsafe { tensor::matvec_q4_0_sdot_rows(w, xq, xs, y, 0, n_rows, n_cols) };
+        return;
+    }
+    let n_parts = workers + 1;
+    let boundary = |k: usize| k * n_rows / n_parts;
+    JOB.w.store(w as *mut u8, Ordering::Relaxed);
+    JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
+    JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
+    JOB.y.store(y, Ordering::Relaxed);
+    JOB.n_cols.store(n_cols, Ordering::Relaxed);
+    JOB.qtype.store(tensor::QT_Q4_0 as usize, Ordering::Relaxed); // Q4_0 SDOT mode
+    for s in 0..workers {
+        JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
+    }
+    let g = JOB.go.load(Ordering::Relaxed) + 1;
+    JOB.go.store(g, Ordering::Release);
+    // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    unsafe { tensor::matvec_q4_0_sdot_rows(w, xq, xs, y, 0, boundary(1), n_cols) };
     for s in 0..workers {
         while DONE[s].load(Ordering::Acquire) != g {
             core::hint::spin_loop();
