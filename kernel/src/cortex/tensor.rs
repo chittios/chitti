@@ -271,10 +271,10 @@ pub fn matvec_q8_0_fast(w: &[u8], x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &
         quantize_activations_q8(x, xq, xs);
         // SAFETY: `w` holds `n_rows` rows of `n_cols/QK` Q8_0 blocks; `xq`/`xs`
         // are the just-computed quantized activation and its scales; `y` has
-        // `n_rows` slots; `[0, n_rows)` is in bounds. `matvec_sdot` splits the
-        // row range across the online cores (or runs it here when single-core).
+        // `n_rows` slots; `[0, n_rows)` is in bounds. `matmul_sdot` (m_count=1 =
+        // a matvec) splits the row range across the online cores.
         unsafe {
-            crate::arch::aarch64::smp::matvec_sdot(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), y.as_mut_ptr(), n_rows, n_cols)
+            crate::arch::aarch64::smp::matmul_sdot(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), y.as_mut_ptr(), 1, n_rows, n_cols)
         };
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -453,54 +453,144 @@ pub unsafe fn matvec_q8_0_sdot_rows(
     row_end: usize,
     n_cols: usize,
 ) {
+    let blocks = n_cols / QK;
+    let row_bytes = blocks * Q8_0_BLOCK_BYTES;
+    // SAFETY: caller's contract; each row's dot reads in-bounds.
+    unsafe {
+        for r in row_start..row_end {
+            *y.add(r) = sdot_one_row(w.add(r * row_bytes), xq, xs, blocks);
+        }
+    }
+}
+
+/// **Weight-stationary batched** `Q8_0` × `int8`-activation matmul over rows
+/// `[row_start, row_end)`, computing `y[m][r] = W[r] · xq[m]` for all `m` in
+/// `0..m_count`. Each weight row is loaded once (then L1-resident) and dotted
+/// against every activation column, so the *weight bytes are read from memory
+/// once for the whole batch* instead of once per column -- the amortization
+/// that makes batched prefill much faster than looping the matvec. `y` is laid
+/// out `[m * n_rows + r]` (each activation's output vector contiguous).
+///
+/// # Safety
+/// `w` = `n_rows` `Q8_0` rows of `n_cols/QK` blocks; `xq`/`xs` = `m_count`
+/// activations of `n_cols` `i8` / `n_cols/QK` `f32`; `y` = `m_count * n_rows`
+/// `f32`; `row_start <= row_end <= n_rows`; `n_cols` a multiple of `QK`. Rows
+/// are written disjointly, so distinct callers may own distinct row ranges.
+/// Requires `dotprod` (aarch64 target features).
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn matmul_q8_0_sdot_rows(
+    w: *const u8,
+    xq: *const i8,
+    xs: *const f32,
+    y: *mut f32,
+    m_count: usize,
+    n_rows: usize,
+    row_start: usize,
+    row_end: usize,
+    n_cols: usize,
+) {
     use core::arch::aarch64::{
-        vaddq_f32, vaddq_s32, vaddvq_f32, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32, vfmaq_n_f32, vld1q_s8,
+        vaddq_s32, vaddvq_f32, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32, vfmaq_n_f32, vld1q_s8,
     };
     let blocks = n_cols / QK;
     let row_bytes = blocks * Q8_0_BLOCK_BYTES;
+    let nb = blocks; // scales per activation
 
-    // One block's contribution, scaled and folded into f32 accumulator `$f`:
-    // two independent SDOTs (16 int8 MACs each) -> 4 int32 partial sums ->
-    // `$f += float(partials) * (d_weight * d_activation)`. There is one final
-    // horizontal reduce per row, not one per block.
+    // m_count == 1 (decode) is a plain matvec: use the 4-accumulator per-row
+    // dot, which has better ILP than a 1-wide tile of the batched kernel.
+    if m_count == 1 {
+        // SAFETY: caller's contract.
+        unsafe {
+            for r in row_start..row_end {
+                *y.add(r) = sdot_one_row(w.add(r * row_bytes), xq, xs, blocks);
+            }
+        }
+        return;
+    }
+
+    // Batched: tile the activation columns by 4 and, per weight block, load +
+    // f16-decode the weight *once* and SDOT it against all activations in the
+    // tile. This amortizes the weight load and (scalar) scale decode -- the
+    // per-MAC overhead that dominates when compute-bound -- across the tile,
+    // rather than redoing it per column. Four accumulators = four independent
+    // FMA chains across blocks.
+    const MT: usize = 4;
+    // SAFETY: caller's contract; all loads in-bounds, `y` rows disjoint.
+    unsafe {
+        for r in row_start..row_end {
+            let row = w.add(r * row_bytes);
+            let mut m0 = 0;
+            while m0 < m_count {
+                let mt = core::cmp::min(MT, m_count - m0);
+                let mut acc = [vdupq_n_f32(0.0); MT];
+                for b in 0..blocks {
+                    let base = b * Q8_0_BLOCK_BYTES;
+                    let dw = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
+                    let wq0 = vld1q_s8(row.add(base + 2) as *const i8); // weight lanes 0..16
+                    let wq1 = vld1q_s8(row.add(base + 18) as *const i8); // 16..32
+                    for mm in 0..mt {
+                        let mi = m0 + mm;
+                        let xqp = xq.add(mi * n_cols + b * QK);
+                        let dx = *xs.add(mi * nb + b);
+                        let a0 = vdotq_s32(vdupq_n_s32(0), wq0, vld1q_s8(xqp));
+                        let a1 = vdotq_s32(vdupq_n_s32(0), wq1, vld1q_s8(xqp.add(16)));
+                        acc[mm] = vfmaq_n_f32(acc[mm], vcvtq_f32_s32(vaddq_s32(a0, a1)), dw * dx);
+                    }
+                }
+                for mm in 0..mt {
+                    *y.add((m0 + mm) * n_rows + r) = vaddvq_f32(acc[mm]);
+                }
+                m0 += MT;
+            }
+        }
+    }
+}
+
+/// One `Q8_0`-row · `int8`-activation dot: `Σ_b (d_weight_b · d_act_b) · Σ q·xq`.
+/// Two independent `SDOT`s per block feed a f32x4 accumulator with four
+/// independent chains, so consecutive blocks don't serialize on one FMA's
+/// latency; a single horizontal reduce at the end.
+///
+/// # Safety
+/// `row` points at `blocks` `Q8_0` blocks; `xq`/`xs` at `blocks*QK` `i8` /
+/// `blocks` `f32`. Requires `dotprod`.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn sdot_one_row(row: *const u8, xq: *const i8, xs: *const f32, blocks: usize) -> f32 {
+    use core::arch::aarch64::{
+        vaddq_f32, vaddq_s32, vaddvq_f32, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32, vfmaq_n_f32, vld1q_s8,
+    };
     macro_rules! block_into {
-        ($f:expr, $row:expr, $b:expr) => {{
+        ($f:expr, $b:expr) => {{
             let base = $b * Q8_0_BLOCK_BYTES;
-            let dw = f16_to_f32(u16::from_le_bytes([*$row.add(base), *$row.add(base + 1)]));
+            let dw = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
             let dx = *xs.add($b);
-            let q = $row.add(base + 2) as *const i8;
+            let q = row.add(base + 2) as *const i8;
             let xp = xq.add($b * QK);
             let a0 = vdotq_s32(vdupq_n_s32(0), vld1q_s8(q), vld1q_s8(xp)); // lanes 0..16
             let a1 = vdotq_s32(vdupq_n_s32(0), vld1q_s8(q.add(16)), vld1q_s8(xp.add(16))); // 16..32
             $f = vfmaq_n_f32($f, vcvtq_f32_s32(vaddq_s32(a0, a1)), dw * dx);
         }};
     }
-
-    // SAFETY: all loads in-bounds per the caller's contract; dotprod is enabled.
+    // SAFETY: caller's contract; all loads in-bounds.
     unsafe {
-        for r in row_start..row_end {
-            let row = w.add(r * row_bytes);
-            // Four independent accumulator chains so consecutive blocks don't
-            // serialize on one FMA's latency (the actual bottleneck -- SDOT
-            // throughput far exceeds one dependent FMA chain).
-            let mut f0 = vdupq_n_f32(0.0);
-            let mut f1 = vdupq_n_f32(0.0);
-            let mut f2 = vdupq_n_f32(0.0);
-            let mut f3 = vdupq_n_f32(0.0);
-            let mut b = 0;
-            while b + 4 <= blocks {
-                block_into!(f0, row, b);
-                block_into!(f1, row, b + 1);
-                block_into!(f2, row, b + 2);
-                block_into!(f3, row, b + 3);
-                b += 4;
-            }
-            while b < blocks {
-                block_into!(f0, row, b);
-                b += 1;
-            }
-            *y.add(r) = vaddvq_f32(vaddq_f32(vaddq_f32(f0, f1), vaddq_f32(f2, f3)));
+        let mut f0 = vdupq_n_f32(0.0);
+        let mut f1 = vdupq_n_f32(0.0);
+        let mut f2 = vdupq_n_f32(0.0);
+        let mut f3 = vdupq_n_f32(0.0);
+        let mut b = 0;
+        while b + 4 <= blocks {
+            block_into!(f0, b);
+            block_into!(f1, b + 1);
+            block_into!(f2, b + 2);
+            block_into!(f3, b + 3);
+            b += 4;
         }
+        while b < blocks {
+            block_into!(f0, b);
+            b += 1;
+        }
+        vaddvq_f32(vaddq_f32(vaddq_f32(f0, f1), vaddq_f32(f2, f3)))
     }
 }
 

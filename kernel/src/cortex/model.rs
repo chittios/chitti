@@ -287,9 +287,154 @@ impl<'a> Model<'a> {
     /// needed to pick the first generated token). The single entry point for
     /// prompt ingestion, so prefill optimizations land here.
     pub fn prefill(&self, prompt: &[usize], pos0: usize, cache: &mut Cache, state: &mut State) {
+        // On aarch64, prefill a multi-token prompt with the weight-stationary
+        // batched path (each weight read once for the whole prompt instead of
+        // once per token). It is bit-identical to the sequential loop -- same
+        // int8 quantization, same per-(row,position) SDOT, same sequential
+        // cores -- just far less weight bandwidth. x86 (TCG, no batched matmul
+        // kernel) uses the sequential path; prefill still works, just slower.
+        #[cfg(target_arch = "aarch64")]
+        if prompt.len() >= 2 {
+            self.prefill_batched(prompt, pos0, cache, state);
+            return;
+        }
         let last = prompt.len();
         for (i, &tok) in prompt.iter().enumerate() {
             self.forward(tok, pos0 + i, cache, state, i + 1 == last);
+        }
+    }
+
+    /// Batched (weight-stationary) prefill: process all `M = prompt.len()`
+    /// positions together so each projection weight is read once and applied to
+    /// every position (`matmul_q8_0_sdot_rows`), while the order-dependent
+    /// recurrence/attention still runs per position through the shared
+    /// `attn_core`/`delta_core`. Only the last position needs logits.
+    #[cfg(target_arch = "aarch64")]
+    fn prefill_batched(&self, prompt: &[usize], pos0: usize, cache: &mut Cache, s: &mut State) {
+        let c = &self.config;
+        let dim = c.embedding_length;
+        let ffn = c.feed_forward_length;
+        let hd = c.head_dim;
+        let nq = c.head_count;
+        let kv_dim = c.head_count_kv * hd;
+        let qdim = nq * hd * 2; // query+gate interleaved
+        let ao = nq * hd; // attn_out / o-proj input width
+        let conv_dim = c.ssm_conv_dim();
+        let value_dim = c.ssm_inner;
+        let nh = c.ssm_dt_rank;
+        let m = prompt.len();
+        let max_cols = dim.max(ffn).max(ao).max(value_dim);
+
+        // M-wide buffers (one prefill's worth; freed on return).
+        let mut hidden = alloc::vec![0.0f32; m * dim];
+        let mut norm = alloc::vec![0.0f32; m * dim];
+        let mut q = alloc::vec![0.0f32; m * qdim];
+        let mut k = alloc::vec![0.0f32; m * kv_dim];
+        let mut v = alloc::vec![0.0f32; m * kv_dim];
+        let mut attn_out = alloc::vec![0.0f32; m * ao];
+        let mut qkv = alloc::vec![0.0f32; m * conv_dim];
+        let mut z = alloc::vec![0.0f32; m * value_dim];
+        let mut gates = alloc::vec![0.0f32; m * nh];
+        let mut betas = alloc::vec![0.0f32; m * nh];
+        let mut delta_o = alloc::vec![0.0f32; m * value_dim];
+        let mut ffn_gate = alloc::vec![0.0f32; m * ffn];
+        let mut ffn_up = alloc::vec![0.0f32; m * ffn];
+        let mut ffn_act = alloc::vec![0.0f32; m * ffn];
+        let mut proj_out = alloc::vec![0.0f32; m * dim];
+        // Batched int8-activation scratch (packed tightly per projection's cols).
+        let mut xq = alloc::vec![0i8; m * max_cols];
+        let mut xs = alloc::vec![0.0f32; m * (max_cols / QK)];
+
+        // Embeddings for all positions.
+        let row_bytes = (dim / QK) * tensor::Q8_0_BLOCK_BYTES;
+        for (mi, &tok) in prompt.iter().enumerate() {
+            dequant_row_q8_0(&self.token_embd[tok * row_bytes..(tok + 1) * row_bytes], &mut hidden[mi * dim..(mi + 1) * dim]);
+        }
+
+        for l in 0..self.layers.len() {
+            // rmsnorm(attn_norm) per position.
+            for mi in 0..m {
+                tensor::rmsnorm(&hidden[mi * dim..(mi + 1) * dim], self.layers[l].attn_norm, c.rms_eps, &mut norm[mi * dim..(mi + 1) * dim]);
+            }
+
+            match &self.layers[l].kind {
+                LayerKind::Attn { q: q_w, k: k_w, v: v_w, o: o_w, .. } => {
+                    let (q_w, k_w, v_w, o_w) = (*q_w, *k_w, *v_w, *o_w);
+                    self.batched_proj(q_w, &norm, &mut q, &mut xq, &mut xs, m, qdim, dim);
+                    self.batched_proj(k_w, &norm, &mut k, &mut xq, &mut xs, m, kv_dim, dim);
+                    self.batched_proj(v_w, &norm, &mut v, &mut xq, &mut xs, m, kv_dim, dim);
+                    for mi in 0..m {
+                        s.q.copy_from_slice(&q[mi * qdim..(mi + 1) * qdim]);
+                        s.k.copy_from_slice(&k[mi * kv_dim..(mi + 1) * kv_dim]);
+                        s.v.copy_from_slice(&v[mi * kv_dim..(mi + 1) * kv_dim]);
+                        self.attn_core(l, pos0 + mi, cache, s);
+                        attn_out[mi * ao..(mi + 1) * ao].copy_from_slice(&s.attn_out[..ao]);
+                    }
+                    self.batched_proj(o_w, &attn_out, &mut proj_out, &mut xq, &mut xs, m, dim, ao);
+                }
+                LayerKind::Delta { qkv: qkv_w, gate: gate_w, alpha: alpha_w, beta: beta_w, out: out_w, .. } => {
+                    let (qkv_w, gate_w, alpha_w, beta_w, out_w) = (*qkv_w, *gate_w, *alpha_w, *beta_w, *out_w);
+                    self.batched_proj(qkv_w, &norm, &mut qkv, &mut xq, &mut xs, m, conv_dim, dim);
+                    self.batched_proj(gate_w, &norm, &mut z, &mut xq, &mut xs, m, value_dim, dim);
+                    self.batched_proj(alpha_w, &norm, &mut gates, &mut xq, &mut xs, m, nh, dim);
+                    self.batched_proj(beta_w, &norm, &mut betas, &mut xq, &mut xs, m, nh, dim);
+                    for mi in 0..m {
+                        s.qkv.copy_from_slice(&qkv[mi * conv_dim..(mi + 1) * conv_dim]);
+                        s.z.copy_from_slice(&z[mi * value_dim..(mi + 1) * value_dim]);
+                        s.gates[..nh].copy_from_slice(&gates[mi * nh..(mi + 1) * nh]);
+                        s.betas[..nh].copy_from_slice(&betas[mi * nh..(mi + 1) * nh]);
+                        self.delta_core(l, cache, s);
+                        delta_o[mi * value_dim..(mi + 1) * value_dim].copy_from_slice(&s.delta_o[..value_dim]);
+                    }
+                    self.batched_proj(out_w, &delta_o, &mut proj_out, &mut xq, &mut xs, m, dim, value_dim);
+                }
+            }
+            // Residual after the attn/delta block.
+            for i in 0..m * dim {
+                hidden[i] += proj_out[i];
+            }
+
+            // FFN (SwiGLU) with its own residual.
+            for mi in 0..m {
+                tensor::rmsnorm(&hidden[mi * dim..(mi + 1) * dim], self.layers[l].post_norm, c.rms_eps, &mut norm[mi * dim..(mi + 1) * dim]);
+            }
+            self.batched_proj(self.layers[l].ffn_gate, &norm, &mut ffn_gate, &mut xq, &mut xs, m, ffn, dim);
+            self.batched_proj(self.layers[l].ffn_up, &norm, &mut ffn_up, &mut xq, &mut xs, m, ffn, dim);
+            for i in 0..m * ffn {
+                ffn_act[i] = tensor::silu(ffn_gate[i]) * ffn_up[i];
+            }
+            self.batched_proj(self.layers[l].ffn_down, &ffn_act, &mut proj_out, &mut xq, &mut xs, m, dim, ffn);
+            for i in 0..m * dim {
+                hidden[i] += proj_out[i];
+            }
+        }
+
+        // Only the final position's logits are needed to pick the first token.
+        let last = m - 1;
+        tensor::rmsnorm(&hidden[last * dim..(last + 1) * dim], self.output_norm, c.rms_eps, &mut s.norm);
+        tensor::matvec_q8_0_fast(self.token_embd, &s.norm, &mut s.logits, &mut s.xq, &mut s.xs, self.vocab, dim);
+        cache.positions = cache.positions.max(pos0 + m);
+    }
+
+    /// Weight-stationary batched projection: quantize each of the `m` input
+    /// vectors (`input[mi*cols..]`) to int8, then run one matmul that reads the
+    /// weight once and writes `out[mi*rows + r]`. `xq`/`xs` are packed tightly
+    /// with stride `cols`/`cols/QK` (the layout `matmul_q8_0_sdot_rows` expects).
+    #[cfg(target_arch = "aarch64")]
+    fn batched_proj(&self, w: &[u8], input: &[f32], out: &mut [f32], xq: &mut [i8], xs: &mut [f32], m: usize, rows: usize, cols: usize) {
+        let nb = cols / QK;
+        for mi in 0..m {
+            tensor::quantize_activations_q8(
+                &input[mi * cols..(mi + 1) * cols],
+                &mut xq[mi * cols..(mi + 1) * cols],
+                &mut xs[mi * nb..(mi + 1) * nb],
+            );
+        }
+        // SAFETY: `w` is `rows` Q8_0 rows of `cols/QK` blocks; `xq`/`xs` hold `m`
+        // activations of `cols`/`nb`; `out` has `m*rows` slots. matmul_sdot
+        // splits `[0,rows)` across cores, each writing a disjoint row range.
+        unsafe {
+            crate::arch::aarch64::smp::matmul_sdot(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols);
         }
     }
 
