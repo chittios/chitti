@@ -1,6 +1,26 @@
 *"This project is specified in `CHITTI_OS_HANDOFF.md`. Read it fully before acting. Follow the locked decisions in Part 2 and the guardrails in Part 4. Work one phase at a time; do not start the next phase until the current phase's acceptance criteria pass in QEMU."*
 
-**Current phase: 7 (Stretch) — in progress. SMP + block-device FS: complete.**
+**Current phase: 7 (Stretch) — in progress. SMP + block-device FS + framebuffer TUI: complete.**
+**Framebuffer TUI (Phase 7 track 3) — complete.** The QEMU graphical window is
+now a live terminal, and a human can drive Chitti from it. `framebuffer.rs`
+became a persistent global `Console`: an 8x8-font character grid with a cursor,
+newline handling, backspace, and scrolling (framebuffer memmove) once it fills;
+green-on-black. `serial::Serial::write_str` mirrors every byte to it (gated
+`#[cfg(not(test))]`), so the *entire* session — boot log, ktrace, all phase
+demos, and the interactive shell — appears on screen while serial keeps working
+in parallel. `arch/x86_64/keyboard.rs` gained scan-code-set-1 decoding
+(shift + caps-lock, US layout) feeding a ring buffer drained by `read_char`; a
+new `console.rs` unifies input (`read_byte`: keyboard *or* serial) and echo
+(`put_byte`: both), and the shell's `read_line` now uses it. Verified by
+screendump (135k green text pixels on clean background, top line rendered) and
+by injecting `l i s t <enter>` via QEMU `sendkey` (real PS/2 scancodes, not
+serial) — the shell echoed `chitti> list`, ran the intent, and replied
+`=> ok:[...]`. `cargo xtask test` stays 69 (the framebuffer module isn't
+compiled into the test build; the mirror/echo calls are cfg-gated). Remaining
+Phase 7 track: RISC-V port. (9B model still skipped per the guardrail.)
+
+---
+*Prior in Phase 7:* **Block-device FS — complete.**
 **Block-device FS (Phase 7 track 2) — complete.** A real filesystem on a real
 disk. `block/mod.rs` defines a `BlockDevice` trait (512-byte sectors);
 `block/ramdisk.rs` is a RAM-backed impl (the test suite mounts on it);

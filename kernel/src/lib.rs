@@ -13,6 +13,7 @@ extern crate alloc;
 pub mod arch;
 pub mod block;
 pub mod cap;
+pub mod console;
 pub mod cortex;
 pub mod fs;
 pub mod ipc;

@@ -10,7 +10,6 @@
 //! drives at `cargo xtask run`.
 
 use crate::persona::{self, Agent, Planner, RulePlanner};
-use crate::serial;
 use crate::{serial_print, serial_println};
 use alloc::string::{String, ToString};
 
@@ -158,28 +157,30 @@ fn run_infer() {
     }
 }
 
-/// Read a line from COM1 into `buf`, echoing as it goes and handling
-/// backspace. Cooperatively yields the CPU while no input is available, so
-/// other tasks keep running while the shell waits at the prompt.
+/// Read a line from the console (keyboard *or* serial) into `buf`, echoing to
+/// both the framebuffer and serial and handling backspace. Cooperatively
+/// yields the CPU while no input is available, so other tasks keep running
+/// while the shell waits at the prompt.
 fn read_line(buf: &mut String) {
+    use crate::console;
     loop {
-        match serial::read_byte() {
+        match console::read_byte() {
             Some(b'\r') | Some(b'\n') => {
                 serial_println!("");
                 return;
             }
             Some(0x7f) | Some(0x08) => {
                 if buf.pop().is_some() {
-                    // Erase the character on the terminal: back up, overwrite
+                    // Erase the character on both consoles: back up, overwrite
                     // with a space, back up again.
-                    serial::put_byte(0x08);
-                    serial::put_byte(b' ');
-                    serial::put_byte(0x08);
+                    console::put_byte(0x08);
+                    console::put_byte(b' ');
+                    console::put_byte(0x08);
                 }
             }
             Some(c @ 0x20..=0x7e) => {
                 buf.push(c as char);
-                serial::put_byte(c);
+                console::put_byte(c);
             }
             Some(_) => {} // ignore other control bytes
             None => crate::sched::yield_now(),

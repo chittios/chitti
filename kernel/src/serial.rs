@@ -76,6 +76,12 @@ impl fmt::Write for Serial {
                 _ => write_byte(b'.'), // placeholder for non-ASCII bytes
             }
         }
+        // Mirror to the framebuffer text console (Phase 7), so the graphical
+        // window shows everything the serial port does. No-op until the
+        // console is initialized; absent from the test build (which does not
+        // compile the framebuffer module).
+        #[cfg(not(test))]
+        crate::framebuffer::console_print(s);
         Ok(())
     }
 }
