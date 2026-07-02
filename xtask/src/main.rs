@@ -51,7 +51,7 @@ impl Model {
     fn qemu_mem(self) -> &'static str {
         match self {
             Model::Qwen08B => "2G",
-            Model::Qwen9B => "12G",
+            Model::Qwen9B => "10G",
         }
     }
     fn label(self) -> &'static str {
