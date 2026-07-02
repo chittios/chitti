@@ -22,12 +22,18 @@ both row-split across the 4 cores), and a separate untied `output.weight`.
 Batched prefill stays gated to all-Q8_0 (0.8B); mixed models prefill
 sequentially. **(3) memory** — the `model-9b` layout above. `xtask image` +
 `fetch-model.sh` are model-aware; a release workflow builds the {x86_64,
-aarch64} × {0.8B, 9B} matrix as release assets. Verified on the M2 (16 GB,
-native HVF): the 9B (32 layers, dim 4096, vocab 248320) loads (5.4 GiB, 6
-chunks, -m 12G) and decodes real tokens at **~0.5 tok/s** decode / ~0.23 tok/s
-prefill (cf. llama.cpp CPU ~10 tok/s — we're on the generic scalar-dequant path,
-no Q4_0-SDOT yet). The 0.8B is unchanged (~14 tok/s, matches reference=true);
-69/69 tests green; both arches + both layouts build.
+aarch64} × {0.8B, 9B} matrix as release assets. **(4) Q4_0-SDOT** — the 173
+Q4_0 tensors (of 250) got the fast path: `matvec_q4_0_sdot_rows` unpacks each
+block's nibbles to int8 on the fly and `vdotq_s32`s them against the int8
+activation (the Q8_0-SDOT analogue), row-split across the 4 cores. Verified on
+the M2 (16 GB, native HVF): the 9B (32 layers, dim 4096, vocab 248320) loads
+(5.4 GiB, 6 chunks, -m 12G) and decodes real tokens; Q4_0-SDOT took **prefill
+~4.4→~1 s/tok (~3-4.6x)** and **decode ~1.9→~1.5 s/tok (~0.65 tok/s)** with
+identical greedy output. Decode is now bottlenecked by the **Q6_K output
+projection** (248320 rows, still generic scalar dequant) + Q5_K ssm_out — the
+next lever is a Q6_K/Q5_K SDOT. (cf. llama.cpp CPU ~10 tok/s.) The 0.8B is
+unchanged (~14 tok/s, matches reference=true); 69/69 tests green; both arches +
+both layouts build.
 
 ---
 *Prior:* **Batched prefill + a throughput harness (aarch64).** A `perf` shell builtin
