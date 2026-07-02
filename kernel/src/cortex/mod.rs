@@ -115,6 +115,114 @@ pub fn run_reference_inference() -> Option<InferResult> {
     })
 }
 
+/// Result of the `Q8_0` matvec microbenchmark: total multiply-accumulates
+/// performed and the wall-clock milliseconds they took, so callers can report
+/// throughput (`macs / ms` is kMAC/s).
+pub struct BenchResult {
+    pub macs: u64,
+    pub ms: u64,
+    pub rows: usize,
+    pub cols: usize,
+    pub iters: usize,
+    /// Milliseconds for the experimental int8-activation `SDOT` kernel over the
+    /// same work, or `None` on arches without it (measured, not adopted).
+    pub sdot_ms: Option<u64>,
+    /// Aggregate relative RMS error of the SDOT result vs the f32 result
+    /// (`||sdot-ref|| / ||ref||`) -- robust where individual rows are near zero,
+    /// a proxy for whether int8 activations would preserve token argmax parity.
+    pub sdot_rel_rms: f32,
+}
+
+/// Microbenchmark the hottest kernel (`tensor::matvec_q8_0`) in isolation, so
+/// the NEON/AVX2 path can be measured without the full ~800 MiB model. Builds
+/// a representative `Q8_0` weight matrix (deterministic pseudo-random quants),
+/// runs the matvec `iters` times, and times it with the arch millisecond
+/// clock. Same code on both arches (honours the dual-arch rule); the numbers
+/// only mean anything under native execution (aarch64/HVF), not TCG.
+pub fn bench_matvec() -> BenchResult {
+    use tensor::{Q8_0_BLOCK_BYTES, QK};
+    // Representative of the hot projections: ~1024-wide input, many rows.
+    const ROWS: usize = 4096;
+    const COLS: usize = 1024;
+    const ITERS: usize = 200;
+    let blocks = COLS / QK;
+    let row_bytes = blocks * Q8_0_BLOCK_BYTES;
+
+    // Deterministic pseudo-random Q8_0 weights (a cheap LCG) and an x vector.
+    let mut w = alloc::vec![0u8; ROWS * row_bytes];
+    let mut seed: u32 = 0x1234_5678;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        seed
+    };
+    for r in 0..ROWS {
+        for b in 0..blocks {
+            let base = r * row_bytes + b * Q8_0_BLOCK_BYTES;
+            // A small positive f16 scale (0x2000 ~= 0.125) keeps values sane.
+            w[base] = 0x00;
+            w[base + 1] = 0x20;
+            for i in 0..QK {
+                w[base + 2 + i] = (next() >> 24) as u8;
+            }
+        }
+    }
+    let mut x = alloc::vec![0.0f32; COLS];
+    for (i, xi) in x.iter_mut().enumerate() {
+        *xi = ((i % 17) as f32 - 8.0) * 0.1;
+    }
+    let mut y = alloc::vec![0.0f32; ROWS];
+
+    let start = crate::arch::now_ms();
+    for _ in 0..ITERS {
+        tensor::matvec_q8_0(&w, &x, &mut y, ROWS, COLS);
+    }
+    let ms = crate::arch::now_ms().saturating_sub(start);
+    // Keep the f32 reference result to measure SDOT's numeric error against
+    // (only the aarch64 SDOT path consumes it).
+    #[cfg(target_arch = "aarch64")]
+    let y_ref = y.clone();
+    core::hint::black_box(&y);
+
+    // Experimental int8-activation SDOT path over the same work (aarch64 only).
+    // The activation is quantized once (cheap, O(cols)); the kernel is timed.
+    #[cfg(target_arch = "aarch64")]
+    let (sdot_ms, sdot_rel_rms) = {
+        let mut xq = alloc::vec![0i8; COLS];
+        let mut xs = alloc::vec![0.0f32; blocks];
+        tensor::quantize_activations_q8(&x, &mut xq, &mut xs);
+        let start = crate::arch::now_ms();
+        for _ in 0..ITERS {
+            // SAFETY: buffers sized ROWS/COLS as the kernel's contract requires.
+            unsafe {
+                tensor::matvec_q8_0_sdot_rows(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), y.as_mut_ptr(), 0, ROWS, COLS);
+            }
+        }
+        let d = crate::arch::now_ms().saturating_sub(start);
+        let mut num = 0.0f32; // ||sdot - ref||^2
+        let mut den = 0.0f32; // ||ref||^2
+        for r in 0..ROWS {
+            let diff = y[r] - y_ref[r];
+            num += diff * diff;
+            den += y_ref[r] * y_ref[r];
+        }
+        let rel_rms = if den > 0.0 { tensor::libm_sqrtf(num / den) } else { 0.0 };
+        core::hint::black_box(&y);
+        (Some(d), rel_rms)
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let (sdot_ms, sdot_rel_rms) = (None, 0.0);
+
+    BenchResult {
+        macs: (ROWS as u64) * (COLS as u64) * (ITERS as u64),
+        ms,
+        rows: ROWS,
+        cols: COLS,
+        iters: ITERS,
+        sdot_ms,
+        sdot_rel_rms,
+    }
+}
+
 fn bytemuck_ids(ids: &[u32]) -> &[u8] {
     // SAFETY: reinterpreting a `u32` slice as bytes for hashing only; the
     // pointer is valid for `len*4` bytes and `u8` has no alignment needs.
