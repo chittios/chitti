@@ -26,7 +26,7 @@ agent) picks up work next.
 [x] 4  Synapse (capability ABI) Grammar-constrained tool calls → capability-checked deterministic primitives + append-only audit log
 [x] 5  Persona + shell         Agents as processes (spawn/suspend/resume/kill), two-tier memory w/ recall, intent shell drives plan→act loop, agent-to-agent IPC
 [x] 6  Differentiators         Provenance/taint gate on destructive primitives + self-compiling agents (compiled intents replayed with zero inference)
-[~] 7  Stretch                 DONE: SMP + APIC-per-core (Limine MP, real spinlocks, per-core GDT/TSS, local APIC); block-device FS (virtio-blk + SimpleFS, persists across reboots); framebuffer TUI (scrolling console mirrors all output + PS/2 keyboard input). TODO: RISC-V port (9B model skipped: guardrail + unusable under TCG)
+[~] 7  Stretch                 DONE: SMP + APIC-per-core; block-device FS (virtio-blk + SimpleFS, persists across reboots); framebuffer TUI + PS/2 keyboard; aarch64 native boot under HVF (arm64/) running NEON inference ~100x faster than x86-on-TCG. TODO: full aarch64 stack port; RISC-V (9B model skipped)
 ```
 
 See `CHITTI_OS_HANDOFF.md` Part 5/6 for the full goal/scope/acceptance
@@ -96,10 +96,15 @@ chitti/
         └── shell/             # intent shell over serial (Phase 5): run_intent (one-shot, cache-routed) + interactive run loop
 ```
 
-Everything x86_64-specific stays under `kernel/src/arch/x86_64/`, so a future
-RISC-V port (Phase 7 stretch) only touches that directory. As later phases
-land, `kernel/src/` grows the `synapse/`, `persona/`, `shell/`, and `security/`
-modules described in `CHITTI_OS_HANDOFF.md` Part 3.
+Everything x86_64-specific stays under `kernel/src/arch/x86_64/`. A separate
+top-level `arm64/` crate holds the **aarch64 native port** (Phase 7): a
+standalone bare-metal kernel that boots under `qemu-system-aarch64 -M virt`
+with `-accel hvf`, so it runs *natively* on Apple Silicon (no cross-arch TCG
+emulation) with NEON — `cargo xtask arm64`. It currently boots, brings up the
+MMU, and runs the fused NEON `Q8_0` matvec ~100x faster than the x86 build does
+under emulation; porting the full kernel stack onto it is ongoing. (The port
+touches more than `arch/` because the tensor kernels are SIMD — NEON vs
+SSE2/AVX2 — which is also why a RISC-V port is more than an `arch/` change.)
 
 The Phase 3 model (Qwen3.5-0.8B Q8_0 GGUF) is **not committed** — it's a
 ~812 MB boot module fetched on demand. Run `xtask/fetch-model.sh` (writes

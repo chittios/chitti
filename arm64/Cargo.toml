@@ -1,0 +1,25 @@
+# Standalone aarch64 bare-metal crate (Phase 7: native inference on Apple
+# Silicon). Like `kernel/`, it is intentionally NOT part of the repo-root
+# workspace: it targets a custom no_std triple built with -Z build-std and must
+# not be unified with the host `xtask` build. Its purpose is to run Chitti's
+# compute natively on the M-series CPU under QEMU + HVF (Hypervisor.framework),
+# rather than under the cross-arch TCG emulation the x86 kernel is stuck with.
+[package]
+name = "chitti-arm64"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "chitti-arm64"
+path = "src/main.rs"
+test = false
+doctest = false
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 3

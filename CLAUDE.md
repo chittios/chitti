@@ -1,6 +1,25 @@
 *"This project is specified in `CHITTI_OS_HANDOFF.md`. Read it fully before acting. Follow the locked decisions in Part 2 and the guardrails in Part 4. Work one phase at a time; do not start the next phase until the current phase's acceptance criteria pass in QEMU."*
 
 **Current phase: 7 (Stretch) — in progress. SMP + block-device FS + framebuffer TUI: complete.**
+**aarch64 native port — foundation booting under HVF.** The x86 kernel can only
+run under QEMU cross-arch TCG on this Apple Silicon host (no HW accel for x86
+guests), which is why inference is slow. The fix is an aarch64 build so
+`qemu-system-aarch64 -accel hvf` runs Chitti **natively on the M-series CPU**
+with **NEON**. New standalone `arm64/` crate (`targets/aarch64-chitti.json`,
+own linker/boot) boots directly via `-M virt -kernel` in EL1: `_start` sets the
+stack, enables FP/SIMD (CPACR_EL1), zeroes BSS; `kmain` brings up a minimal
+identity-map **MMU** (1 GiB blocks, RAM = Normal cacheable, MMIO = Device;
+MAIR/TCR/TTBR0/SCTLR) so NEON + caches work, then runs the fused **NEON Q8_0
+matvec** (the kernel that dominates a token) against a scalar reference and
+times it with the ARM generic timer. Verified on the M2 via HVF: boots
+natively, `NEON matches scalar reference: YES`, **~3.7 GMAC/s** (vs the effective
+tens-of-MMAC/s under x86 TCG) → est. **~4 tok/s** for Qwen3.5-0.8B, a ~100x
+compute speedup. `cargo xtask arm64 [--release]` builds + boots it. This is the
+foundation; porting the full kernel stack (scheduler, GIC/timer IRQs, the
+Cortex/Synapse/Persona layers behind an arch facade, NEON tensor kernels) onto
+it is the remaining work. The x86 build is untouched (69/69 tests green).
+
+---
 **Inference UX + multicore study.** The shell `infer` builtin now shows the
 prompt, streams the response live (mirrored to the framebuffer TUI), and
 reports throughput (prompt tokens / prefill ms; decode tok/s via PIT timing)

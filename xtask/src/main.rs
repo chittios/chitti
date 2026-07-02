@@ -21,6 +21,10 @@ fn main() {
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
         // boot the real model, run the acceptance checks, exit pass/fail.
         "ref-check" => cmd_ref_check(),
+        // Phase 7: build + boot the aarch64 kernel natively on Apple Silicon
+        // via QEMU + HVF (Hypervisor.framework). This escapes the x86-on-arm
+        // TCG emulation and runs the NEON inference kernels on the real cores.
+        "arm64" => cmd_arm64(release),
         // Hidden subcommand: installed as `[target.x86_64-chitti] runner` in
         // kernel/.cargo/config.toml so `cargo test` can boot each compiled
         // test binary in QEMU and translate isa-debug-exit into a real exit
@@ -36,7 +40,35 @@ fn main() {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <build|image|run|test|ref-check> [--release]".to_string()
+    "usage: cargo xtask <build|image|run|test|ref-check|arm64> [--release]".to_string()
+}
+
+/// `cargo xtask arm64`: build the standalone aarch64 kernel and boot it on
+/// `qemu-system-aarch64 -M virt` with `-accel hvf`, so it runs *natively* on
+/// this Apple Silicon host (no cross-arch emulation) with NEON. Prints the
+/// boot banner + the native NEON matvec benchmark to the serial console.
+fn cmd_arm64(release: bool) -> Result<(), String> {
+    let arm_dir = repo_root().join("arm64");
+    let mut build = Command::new("cargo");
+    build.current_dir(&arm_dir).arg("build");
+    if release {
+        build.arg("--release");
+    }
+    run(&mut build)?;
+
+    let profile = if release { "release" } else { "debug" };
+    let elf = arm_dir.join(format!("target/aarch64-chitti/{profile}/chitti-arm64"));
+    if !elf.exists() {
+        return Err(format!("aarch64 kernel not found at {}", elf.display()));
+    }
+
+    let mut qemu = Command::new("qemu-system-aarch64");
+    qemu.args([
+        "-M", "virt", "-cpu", "host", "-accel", "hvf", "-m", "512M", "-nographic", "-kernel",
+    ]);
+    qemu.arg(&elf);
+    eprintln!("booting aarch64 kernel natively via HVF (Ctrl-A X to quit qemu)...");
+    run(&mut qemu)
 }
 
 fn repo_root() -> PathBuf {
