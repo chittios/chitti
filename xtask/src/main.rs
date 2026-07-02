@@ -120,7 +120,11 @@ fn cmd_run_aarch64(release: bool) -> Result<(), String> {
     let mut qemu = Command::new("qemu-system-aarch64");
     // 2 GiB RAM holds the kernel + the ~812 MiB model (loaded at 0x48000000)
     // + the 256 MiB heap (0x80000000).
-    qemu.args(["-M", "virt", "-cpu", "host", "-accel", "hvf", "-m", "2G", "-nographic", "-kernel"]);
+    // `-smp 4`: four vCPUs, which under `-accel hvf` run on four *native* M-series
+    // cores in parallel (unlike TCG, where extra vCPUs only contend). Chitti's
+    // aarch64 SMP brings the secondaries up via PSCI and splits the hot matvec
+    // across them.
+    qemu.args(["-M", "virt", "-cpu", "host", "-accel", "hvf", "-smp", "4", "-m", "2G", "-nographic", "-kernel"]);
     qemu.arg(&elf);
     // Place the GGUF model in guest RAM at 0x48000000 (where the aarch64
     // `cortex::model_module` looks), if present -- the equivalent of the x86
