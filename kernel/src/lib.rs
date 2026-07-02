@@ -21,11 +21,13 @@ pub mod ktrace;
 pub mod limine_protocol;
 pub mod mm;
 pub mod persona;
+#[cfg(target_arch = "x86_64")]
 pub mod qemu;
 pub mod sched;
 pub mod security;
 pub mod serial;
 pub mod shell;
+#[cfg(target_arch = "x86_64")]
 pub mod smp;
 pub mod synapse;
 
