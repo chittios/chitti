@@ -1,0 +1,100 @@
+name: release-images
+
+# On a published GitHub Release, build bootable Chitti OS images for the full
+# matrix of {x86_64, aarch64} x {qwen3.5-0.8b, qwen3.5-9b} and attach them as
+# release assets. Also runnable manually (workflow_dispatch), in which case the
+# images are only uploaded as workflow artifacts.
+#
+# Images are shipped WITHOUT the model baked in (the GGUFs are 0.8-5.4 GB, over
+# GitHub's per-asset limit). Each asset includes a RUN.md explaining how to
+# fetch the matching model (xtask/fetch-model.sh) and boot.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        model: [qwen3.5-0.8b, qwen3.5-9b]
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins nightly + rust-src + llvm-tools-preview; this
+      # forces the install before the build (needed for -Z build-std).
+      - name: Set up Rust (from rust-toolchain.toml)
+        run: rustup show && rustc --version
+
+      - name: Install xorriso + Limine (x86_64 ISO only)
+        if: matrix.arch == 'x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso
+          git clone --depth 1 -b v8.x-binary https://github.com/limine-bootloader/limine.git "$RUNNER_TEMP/limine"
+          make -C "$RUNNER_TEMP/limine"
+          echo "CHITTI_LIMINE_BIN=$RUNNER_TEMP/limine/limine" >> "$GITHUB_ENV"
+          echo "CHITTI_LIMINE_SHARE=$RUNNER_TEMP/limine" >> "$GITHUB_ENV"
+
+      - name: Build image (${{ matrix.arch }} / ${{ matrix.model }})
+        run: |
+          set -eux
+          mkdir -p dist
+          NAME="chitti-${{ matrix.arch }}-${{ matrix.model }}"
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            cargo xtask image -model "${{ matrix.model }}" --release
+            cp target/chitti.iso "dist/$NAME.iso"
+            IMG="$NAME.iso"
+          else
+            cargo xtask build -arch aarch64 -model "${{ matrix.model }}" --release
+            cp kernel/target/aarch64-chitti/release/chitti-kernel "dist/$NAME.elf"
+            IMG="$NAME.elf"
+          fi
+          echo "IMG=$IMG" >> "$GITHUB_ENV"
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+
+      - name: Package with RUN.md
+        run: |
+          set -eux
+          cat > "dist/${NAME}.RUN.md" <<EOF
+          # Chitti OS - ${{ matrix.arch }} / ${{ matrix.model }}
+
+          Bootable kernel image: \`${IMG}\`. The model is NOT bundled (too large
+          for a release asset); fetch it first:
+
+              ./xtask/fetch-model.sh ${{ matrix.model }}
+
+          ## Run
+
+          x86_64 (Limine ISO, QEMU TCG):
+              qemu-system-x86_64 -M q35 -cpu max -m 2G -cdrom ${NAME}.iso -serial stdio
+
+          aarch64 (native on Apple Silicon via HVF):
+              cargo xtask run -arch aarch64 -model ${{ matrix.model }}
+
+          NOTE: the qwen3.5-9b images carry the correct 12 GiB memory layout, but
+          end-to-end 9B inference is not functional yet -- it needs Q4_K/Q6_K
+          quant kernels, untied output.weight loading, and a >4 GiB model-delivery
+          path (virtio-blk). The qwen3.5-0.8b images run inference fully.
+          EOF
+          tar -czf "dist/${NAME}.tar.gz" -C dist "${IMG}" "${NAME}.RUN.md"
+          ls -la dist
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: dist/${{ env.NAME }}.tar.gz
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ env.NAME }}.tar.gz
