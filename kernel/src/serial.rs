@@ -90,7 +90,7 @@ impl fmt::Write for Serial {
 macro_rules! serial_print {
     ($($arg:tt)*) => {{
         use core::fmt::Write as _;
-        $crate::arch::x86_64::interrupts::without_interrupts(|| {
+        $crate::arch::interrupts::without_interrupts(|| {
             let _ = write!($crate::serial::Serial, $($arg)*);
         });
     }};
