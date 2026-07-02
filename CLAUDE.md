@@ -2,7 +2,26 @@
 
 > **STANDING RULE — the kernel is dual-architecture (x86_64 + aarch64), and functionality must not diverge between them.** Every change must build and work for BOTH arches. Never guard behaviour behind `target_arch` unless it is genuinely arch-specific (a driver, an instruction) — and then provide the equivalent for the other arch behind the same API, never a stub that drops a feature. After any change, verify both: `cargo xtask build -arch x86_64` + `cargo xtask test` (69/69) **and** `cargo xtask build -arch aarch64` (and boot it via `-arch aarch64` when the change is boot-visible). If a capability exists on one arch, it exists on the other.
 
-**Current phase: 7 (Stretch) — in progress. SMP + block-device FS + framebuffer TUI + dual-arch (x86_64 + aarch64) kernel: complete.**
+**Current phase: Agentic re-architecture (CHITTI_AGENTIC_HANDOFF.md) — Phases A→G COMPLETE.**
+The flat Persona model is superseded by a Claude-Code-style agent layer: a shared type
+contract (`agent/types.rs`, from CHITTI_SCHEMAS.md); first-class **sessions**
+(`session/` — postcard save/resume/fork over the memory store); an **agentic loop**
+(`agent/agent_loop.rs`: model→tool→result→repeat over the `StepSource`/`ToolDispatch`
+seams, with budgets); an **orchestrator** foreground agent; an MCP-shaped **tool layer**
+(`tools/`: registry + Router → Synapse cap+taint gate, builtin toolset, provider
+registration); isolated **sub-agents** (`agent/subagent.rs`: attenuated caps, summary-only
+return, depth cap); **context management** (`agent/context.rs`: auto-compaction + recall,
+todo planning, fork); **permission/safety** (taint-aware Router + `agent/compiled.rs`
+compiled-intent replay); and a **skill subsystem** (`skills/`: L0/L1/L2 progressive
+disclosure, package format, signed install with consent + capability subsetting, installable
+skill-agents bounded by `min(role,grant,parent)`). Three invariants upheld: all effects route
+through Synapse; delegation only narrows authority; an installed skill is bounded by its
+install grant forever. 103/103 x86_64 tests; both arches + both models (0.8B/9B) build; every
+phase demonstrated live at boot (and the full A→G demo suite verified on the aarch64 9B under
+HVF). See PROGRESS.md (per-milestone gate log) + DECISIONS.md (assumptions/deviations). The 9B
+chat degeneration was fixed decode-side (top-k/top-p nucleus sampler + a hard repeat-stop guard).
+
+*Prior:* **Phase 7 (Stretch). SMP + block-device FS + framebuffer TUI + dual-arch (x86_64 + aarch64) kernel: complete.**
 
 **Qwen3.5-9B now generates correct text (~1 tok/s).** The 9B produced garbage
 until three bugs were found and fixed (the last two using the HF
