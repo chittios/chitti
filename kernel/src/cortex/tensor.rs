@@ -271,8 +271,11 @@ pub fn matvec_q8_0_fast(w: &[u8], x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &
         quantize_activations_q8(x, xq, xs);
         // SAFETY: `w` holds `n_rows` rows of `n_cols/QK` Q8_0 blocks; `xq`/`xs`
         // are the just-computed quantized activation and its scales; `y` has
-        // `n_rows` slots; the range `[0, n_rows)` is in bounds.
-        unsafe { matvec_q8_0_sdot_rows(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), y.as_mut_ptr(), 0, n_rows, n_cols) };
+        // `n_rows` slots; `[0, n_rows)` is in bounds. `matvec_sdot` splits the
+        // row range across the online cores (or runs it here when single-core).
+        unsafe {
+            crate::arch::aarch64::smp::matvec_sdot(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), y.as_mut_ptr(), n_rows, n_cols)
+        };
     }
     #[cfg(not(target_arch = "aarch64"))]
     {

@@ -8,6 +8,7 @@
 
 pub mod boot;
 pub mod mmu;
+pub mod smp;
 
 use core::arch::asm;
 

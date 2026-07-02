@@ -134,13 +134,18 @@ pub fn init() {
 
 /// aarch64 bring-up: the boot stub (`arch::aarch64::boot`) has already set the
 /// stack, enabled NEON, and zeroed BSS. Here we enable the MMU + heap
-/// (`mm::init`) and start the scheduler. No IDT/PIC/PIT/Limine: the aarch64
-/// scheduler is cooperative (no timer IRQ yet), and there is no SMP bring-up.
+/// (`mm::init`), start the scheduler, and bring the secondary cores online via
+/// PSCI so the hot matvec can be split across them (native + parallel under
+/// HVF). No IDT/PIC/PIT/Limine: the aarch64 scheduler is cooperative (no timer
+/// IRQ yet).
 #[cfg(target_arch = "aarch64")]
 pub fn init() {
     mm::init();
     sched::init();
-    ktrace::log("init", "aarch64 bring-up complete (MMU + heap + scheduler)");
+    // Bring up the other vCPUs (QEMU `-smp 4`). They enable their MMU, claim a
+    // worker slot, and park spinning on the matvec job pool.
+    arch::aarch64::smp::init(4);
+    ktrace::log("init", "aarch64 bring-up complete (MMU + heap + scheduler + SMP)");
 }
 
 // --- custom_test_frameworks harness -----------------------------------

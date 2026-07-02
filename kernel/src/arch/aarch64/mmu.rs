@@ -24,6 +24,37 @@ pub fn init() {
             let desc = pa | (attr_idx << 2) | (sh << 8) | (1 << 10) | 0b01; // AF=1, block, valid
             *l1.add(i as usize) = desc;
         }
+        enable_mmu(l1);
+    }
+}
+
+/// Enable the MMU + caches on a secondary core, reusing the BSP's already-built
+/// identity map (`L1`). A secondary starts (via PSCI `CPU_ON`) with the MMU
+/// off, where RAM is Device-typed and atomics/`Locked` can't complete -- so
+/// this must run before the core touches any shared, lock-guarded structure.
+/// The translation table is shared read-only across cores; only the per-core
+/// system registers are programmed here.
+///
+/// # Safety
+/// Must run exactly once per secondary core, before any cached/atomic access,
+/// with the `L1` table already initialized by the BSP's `init`.
+pub unsafe fn enable_secondary() {
+    // SAFETY: `L1` is a valid, BSP-initialized identity map; programming the
+    // per-core translation registers to it keeps VA==PA (stack/code stay live).
+    unsafe { enable_mmu(core::ptr::addr_of_mut!(L1) as *mut u64) };
+}
+
+/// Program the EL1 translation registers to `l1` and turn the MMU + I/D caches
+/// on. Shared by the BSP (`init`, after building the table) and each secondary
+/// (`enable_secondary`, reusing it). The register values are identical on every
+/// core (the map is global), so this is deterministic.
+///
+/// # Safety
+/// `l1` must point at a valid, populated L1 translation table for a 39-bit
+/// identity map; caller ensures VA==PA so the running stack/code stay mapped.
+unsafe fn enable_mmu(l1: *mut u64) {
+    // SAFETY: caller's contract; these are the standard EL1 MMU registers.
+    unsafe {
         // MAIR: attr0 = Normal write-back (0xFF), attr1 = Device nGnRnE (0x00).
         let mair: u64 = 0xFF;
         // TCR: T0SZ=25 (39-bit VA), 4 KiB granule, WB cacheable walks,

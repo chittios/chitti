@@ -1,0 +1,248 @@
+//! aarch64 SMP (Phase 7): bring the secondary cores online and split the
+//! hottest kernel across them. Under `qemu-system-aarch64 -accel hvf -smp N`
+//! the vCPUs run on *native* M-series cores in parallel -- unlike x86 under
+//! TCG, where extra vCPUs only contend for one host thread -- so a data-parallel
+//! matvec is a real speedup here.
+//!
+//! Bring-up is via PSCI `CPU_ON` (the same HVC conduit as `poweroff`): the BSP
+//! launches each secondary at [`smp_secondary_entry`], handing it a private
+//! stack through the PSCI `context_id`. Each secondary enables its MMU (reusing
+//! the BSP's identity map), claims a worker slot, and parks in [`ap_rust_entry`]
+//! spinning on a job descriptor.
+//!
+//! The work model is a static-partition barrier, not a scheduler: for one
+//! matvec the BSP writes the shared operands + each worker's disjoint row range,
+//! bumps a generation counter (release), computes its own range, then waits for
+//! every worker to report that generation done (acquire). Weights/activation
+//! are read-only during the pass and each core writes a disjoint slice of `y`,
+//! so it is race-free without per-element locking.
+
+use crate::cortex::tensor;
+use core::arch::global_asm;
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+
+/// Max cores we size the static tables for (QEMU `-smp` is 4 here; the M2 has
+/// 8). Only cores actually brought online are used.
+const MAX_CPUS: usize = 8;
+/// Per-secondary stack. The worker loop is shallow (it just calls the matvec
+/// kernel), so 64 KiB is ample.
+const AP_STACK_SIZE: usize = 64 * 1024;
+/// Below this row count a matvec isn't worth the cross-core sync; the BSP does
+/// it alone.
+const PARALLEL_MIN_ROWS: usize = 256;
+
+#[repr(C, align(16))]
+struct ApStack([u8; AP_STACK_SIZE]);
+/// One private stack per potential secondary core (BSS; never zeroed-critical).
+static mut AP_STACKS: [ApStack; MAX_CPUS] = [const { ApStack([0; AP_STACK_SIZE]) }; MAX_CPUS];
+
+/// Number of secondaries that have come online and claimed a worker slot.
+static N_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// The single matvec job descriptor all workers watch. Shared operands plus a
+/// per-worker-slot row range; `go` is the generation counter / release point.
+struct Job {
+    w: AtomicPtr<u8>,
+    xq: AtomicPtr<i8>,
+    xs: AtomicPtr<f32>,
+    y: AtomicPtr<f32>,
+    n_cols: AtomicUsize,
+    row_start: [AtomicUsize; MAX_CPUS],
+    row_end: [AtomicUsize; MAX_CPUS],
+    go: AtomicU64,
+}
+
+static JOB: Job = Job {
+    w: AtomicPtr::new(core::ptr::null_mut()),
+    xq: AtomicPtr::new(core::ptr::null_mut()),
+    xs: AtomicPtr::new(core::ptr::null_mut()),
+    y: AtomicPtr::new(core::ptr::null_mut()),
+    n_cols: AtomicUsize::new(0),
+    row_start: [const { AtomicUsize::new(0) }; MAX_CPUS],
+    row_end: [const { AtomicUsize::new(0) }; MAX_CPUS],
+    go: AtomicU64::new(0),
+};
+/// Per-worker-slot "generation last completed", so the BSP can barrier on it.
+static DONE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+extern "C" {
+    /// The secondary-core entry stub (in `global_asm!` below). Its address is
+    /// the PSCI `CPU_ON` entry point; it sets SP from the PSCI `context_id`,
+    /// enables FP/SIMD, and calls [`ap_rust_entry`].
+    fn smp_secondary_entry();
+}
+
+global_asm!(
+    r#"
+.section .text
+.global smp_secondary_entry
+smp_secondary_entry:
+    mov  sp, x0                 // x0 = PSCI context_id = this core's stack top
+    mrs  x1, cpacr_el1          // enable FP/SIMD (NEON) at EL1
+    orr  x1, x1, #(3 << 20)
+    msr  cpacr_el1, x1
+    isb
+    bl   ap_rust_entry          // never returns
+1:  wfi
+    b    1b
+"#
+);
+
+/// PSCI `CPU_ON` (64-bit function id `0xC400_0003`) via the HVC conduit the
+/// QEMU `virt` machine advertises. Starts `target`'s core at `entry` with
+/// `ctx` delivered in `x0`. Returns the PSCI status (0 = success).
+fn psci_cpu_on(target: u64, entry: u64, ctx: u64) -> i64 {
+    let ret: u64;
+    // SAFETY: PSCI CPU_ON has no memory effects in this core; per SMCCC it
+    // returns in x0 and preserves x4+. We mark x1-x3 clobbered.
+    unsafe {
+        core::arch::asm!(
+            "hvc #0",
+            inout("x0") 0xC400_0003u64 => ret,
+            in("x1") target,
+            in("x2") entry,
+            in("x3") ctx,
+            options(nostack),
+        );
+    }
+    ret as i64
+}
+
+/// Bring up to `n_cpus` total cores online (BSP + secondaries). Runs on the BSP
+/// after the MMU is on. Each secondary `i` (1..n_cpus) is launched with its own
+/// stack; the BSP then waits briefly for them to register worker slots and logs
+/// how many came online.
+pub fn init(n_cpus: usize) {
+    let n = n_cpus.min(MAX_CPUS);
+    for i in 1..n {
+        // SAFETY: `AP_STACKS[i]` is a distinct static stack region; we hand its
+        // top to core `i` as the PSCI context_id (the asm stub loads it into SP).
+        let stack_top = unsafe {
+            let base = core::ptr::addr_of!(AP_STACKS[i]) as u64;
+            base + AP_STACK_SIZE as u64
+        };
+        let entry_fn: unsafe extern "C" fn() = smp_secondary_entry;
+        let entry = entry_fn as usize as u64;
+        // QEMU `virt` numbers cores' MPIDR affinity 0..N, so target == index.
+        let rc = psci_cpu_on(i as u64, entry, stack_top);
+        if rc != 0 {
+            crate::ktrace::log_fmt(format_args!("smp: CPU_ON core {i} failed (psci={rc})"));
+        }
+    }
+
+    // Wait (bounded) for the secondaries to enable their MMU and register.
+    let want = n.saturating_sub(1);
+    let deadline = crate::arch::now_ms() + 1000;
+    while N_WORKERS.load(Ordering::Acquire) < want && crate::arch::now_ms() < deadline {
+        core::hint::spin_loop();
+    }
+    let online = N_WORKERS.load(Ordering::Acquire) + 1;
+    crate::ktrace::log_fmt(format_args!("smp: {online}/{n} cores online (BSP + {} workers)", online - 1));
+}
+
+/// Number of cores currently participating (BSP + registered workers).
+pub fn online_cpus() -> usize {
+    N_WORKERS.load(Ordering::Relaxed) + 1
+}
+
+/// Secondary-core Rust entry (called from the asm stub with SP already set).
+/// Enables the MMU from the shared identity map (so atomics work), claims a
+/// worker slot, and runs the worker loop forever.
+#[no_mangle]
+extern "C" fn ap_rust_entry() -> ! {
+    // MMU first: before it, RAM is Device-typed and the atomics below can't
+    // complete. `enable_secondary` is pure asm (no atomics), so it is safe here.
+    // SAFETY: the BSP built `L1` before launching us; we only program our own
+    // per-core translation registers to it (VA==PA keeps our stack live).
+    unsafe { super::mmu::enable_secondary() };
+
+    let slot = N_WORKERS.fetch_add(1, Ordering::AcqRel);
+    if slot >= MAX_CPUS {
+        // More cores than we sized for: park.
+        loop {
+            crate::arch::hlt();
+        }
+    }
+    worker_loop(slot);
+}
+
+/// A worker core: spin until the BSP publishes a new job generation, run this
+/// slot's row range through the SDOT matvec, mark the generation done, repeat.
+fn worker_loop(slot: usize) -> ! {
+    let mut last = 0u64;
+    loop {
+        let g = JOB.go.load(Ordering::Acquire);
+        if g == last {
+            core::hint::spin_loop();
+            continue;
+        }
+        last = g;
+        let rs = JOB.row_start[slot].load(Ordering::Relaxed);
+        let re = JOB.row_end[slot].load(Ordering::Relaxed);
+        if re > rs {
+            let w = JOB.w.load(Ordering::Relaxed);
+            let xq = JOB.xq.load(Ordering::Relaxed);
+            let xs = JOB.xs.load(Ordering::Relaxed);
+            let y = JOB.y.load(Ordering::Relaxed);
+            let n_cols = JOB.n_cols.load(Ordering::Relaxed);
+            // SAFETY: the BSP guarantees (via the `go` release/acquire) that the
+            // operands are published and this slot's [rs, re) is in bounds and
+            // disjoint from every other core's range, so the writes to `y` don't
+            // alias. The weights/activation are read-only during the pass.
+            unsafe {
+                tensor::matvec_q8_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols);
+            }
+        }
+        DONE[slot].store(g, Ordering::Release);
+    }
+}
+
+/// Run a full `Q8_0` SDOT matvec (`y[0..n_rows] = W · xq`) across all online
+/// cores by row range. The activation must already be quantized (`xq`/`xs`).
+/// Falls back to a single-core pass when only the BSP is online or the matrix
+/// is small. This is what `tensor::matvec_q8_0_fast` calls on aarch64.
+///
+/// # Safety
+/// Same contract as `tensor::matvec_q8_0_sdot_rows` over `[0, n_rows)`.
+pub unsafe fn matvec_sdot(
+    w: *const u8,
+    xq: *const i8,
+    xs: *const f32,
+    y: *mut f32,
+    n_rows: usize,
+    n_cols: usize,
+) {
+    let workers = N_WORKERS.load(Ordering::Relaxed);
+    if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
+        // SAFETY: caller's contract; whole range on this core.
+        unsafe { tensor::matvec_q8_0_sdot_rows(w, xq, xs, y, 0, n_rows, n_cols) };
+        return;
+    }
+    let n_parts = workers + 1; // BSP + workers
+    let boundary = |k: usize| k * n_rows / n_parts;
+
+    // Publish shared operands, then each worker's chunk (chunk k+1 for slot k).
+    JOB.w.store(w as *mut u8, Ordering::Relaxed);
+    JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
+    JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
+    JOB.y.store(y, Ordering::Relaxed);
+    JOB.n_cols.store(n_cols, Ordering::Relaxed);
+    for s in 0..workers {
+        JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
+    }
+    // Release the job: bump the generation (BSP is the only writer of `go`).
+    let g = JOB.go.load(Ordering::Relaxed) + 1;
+    JOB.go.store(g, Ordering::Release);
+
+    // BSP computes chunk 0 while the workers run theirs.
+    // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    unsafe { tensor::matvec_q8_0_sdot_rows(w, xq, xs, y, 0, boundary(1), n_cols) };
+
+    // Barrier: wait for every worker to finish this generation.
+    for s in 0..workers {
+        while DONE[s].load(Ordering::Acquire) != g {
+            core::hint::spin_loop();
+        }
+    }
+}
