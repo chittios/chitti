@@ -4,7 +4,25 @@
 
 **Current phase: 7 (Stretch) — in progress. SMP + block-device FS + framebuffer TUI + dual-arch (x86_64 + aarch64) kernel: complete.**
 
-**Qwen3.5-9B runs (mixed-quant) + model as a build argument + release CI.** The
+**Claude-Code-style chat shell.** The interactive shell is now a chat REPL:
+plain text is a message to the Cortex model, `/`-prefixed lines are commands
+(`/help /do <intent> /clear /infer /bench /perf /exit`). New `cortex::tokenizer`
+is a byte-level BPE encoder (GPT-2/Qwen) — builds vocab + merge-rank maps from
+the GGUF (parser now reads `tokenizer.ggml.merges`), maps bytes through the
+GPT-2 byte→unicode table, greedily merges by rank; validated in a host
+prototype to reproduce llama.cpp's ids — plus a streaming UTF-8 reassembler.
+A `ChatSession` loads the model + tokenizer once and keeps a persistent
+KV/recurrent cache across turns; each turn wraps the message in the Qwen chat
+template (system prompt on turn 1) and **greedily streams tokens until the model
+emits EOS or the user presses Ctrl+C** (non-blocking `console::read_byte()` poll
+between tokens; 2048-token safety cap), replacing the old fixed-8-token `infer`.
+`/do` keeps the Persona intent path (incl. the taint-gate confirm); `/infer`
+keeps the fixed reference-parity check. Verified on the M2: `hi` streams a real
+reply (`<think>…</think>` "Hello! … I'm Chitti …") that stops at EOS. Both arches
++ both models build; 69/69 green.
+
+---
+*Prior:* **Qwen3.5-9B runs (mixed-quant) + model as a build argument + release CI.** The
 bundled model is a first-class `-model qwen3.5-0.8b|qwen3.5-9b` argument (like
 `-arch`), 0.8B default: xtask threads it into the build (a kernel `model-9b`
 feature selecting the memory layout — model at 0x80000000, heap at 0x2_00000000
