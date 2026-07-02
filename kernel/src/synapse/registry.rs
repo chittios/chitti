@@ -44,6 +44,10 @@ pub struct PrimitiveSpec {
     /// exactly this order, so a well-formed call is unambiguous to parse.
     pub params: &'static [Param],
     pub description: &'static str,
+    /// Whether this primitive is destructive / irreversible. The Synapse
+    /// taint gate (Phase 6) refuses a destructive call whose justification
+    /// traces to untrusted, ingested content unless a human confirms it.
+    pub destructive: bool,
 }
 
 // Stable primitive ids. These are also the `cap::Right::InvokePrimitive`
@@ -55,6 +59,7 @@ pub const LIST: PrimitiveId = 3;
 pub const SPAWN_AGENT: PrimitiveId = 4;
 pub const SLEEP: PrimitiveId = 5;
 pub const EMIT_RESULT: PrimitiveId = 6;
+pub const MEM_FS_DELETE: PrimitiveId = 7;
 
 const STR: ArgType = ArgType::Str;
 const UINT: ArgType = ArgType::Uint;
@@ -67,42 +72,56 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
         name: "console_write",
         params: &[Param { key: "text", ty: STR }],
         description: "Write a line of text to the system console.",
+        destructive: false,
     },
     PrimitiveSpec {
         id: MEM_FS_READ,
         name: "mem_fs_read",
         params: &[Param { key: "path", ty: STR }],
         description: "Read the contents of a file from the in-memory store.",
+        destructive: false,
     },
     PrimitiveSpec {
         id: MEM_FS_WRITE,
         name: "mem_fs_write",
         params: &[Param { key: "path", ty: STR }, Param { key: "text", ty: STR }],
         description: "Write text to a file in the in-memory store, creating or replacing it.",
+        destructive: false,
     },
     PrimitiveSpec {
         id: LIST,
         name: "list",
         params: &[],
         description: "List the file paths present in the in-memory store.",
+        destructive: false,
     },
     PrimitiveSpec {
         id: SPAWN_AGENT,
         name: "spawn_agent",
         params: &[Param { key: "persona", ty: STR }],
         description: "Request a new agent be spawned with the given persona (lifecycle lands in Phase 5).",
+        destructive: false,
     },
     PrimitiveSpec {
         id: SLEEP,
         name: "sleep",
         params: &[Param { key: "ticks", ty: UINT }],
         description: "Yield for a number of scheduler ticks.",
+        destructive: false,
     },
     PrimitiveSpec {
         id: EMIT_RESULT,
         name: "emit_result",
         params: &[Param { key: "text", ty: STR }],
         description: "Report the agent's final result for this intent.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: MEM_FS_DELETE,
+        name: "mem_fs_delete",
+        params: &[Param { key: "path", ty: STR }],
+        description: "Delete a file from the in-memory store. Destructive and irreversible.",
+        destructive: true,
     },
 ];
 
@@ -142,9 +161,17 @@ mod tests {
     #[test_case]
     fn unknown_names_are_absent() {
         assert!(by_name("rm_rf").is_none());
-        assert!(!is_name_prefix("mem_fs_delete"));
+        assert!(!is_name_prefix("mem_fs_destroy"));
         // A genuine prefix of a real name is a viable prefix.
         assert!(is_name_prefix("mem_fs_"));
         assert!(is_name_prefix(""));
+    }
+
+    #[test_case]
+    fn only_mem_fs_delete_is_destructive() {
+        // Exactly one destructive primitive today; the taint gate keys off
+        // this flag, so guard against a careless future addition.
+        let destructive: alloc::vec::Vec<_> = REGISTRY.iter().filter(|p| p.destructive).map(|p| p.name).collect();
+        assert_eq!(destructive, alloc::vec!["mem_fs_delete"]);
     }
 }

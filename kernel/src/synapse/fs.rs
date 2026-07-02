@@ -40,6 +40,13 @@ pub fn list() -> Vec<String> {
     STORE.with(|s| s.keys().cloned().collect())
 }
 
+/// Delete the file at `path`. Returns whether a file was actually removed.
+/// **Destructive / irreversible** -- the reason `mem_fs_delete` is gated on
+/// provenance by the Synapse taint gate (Phase 6).
+pub fn delete(path: &str) -> bool {
+    STORE.with(|s| s.remove(path).is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

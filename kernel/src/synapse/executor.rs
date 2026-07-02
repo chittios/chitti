@@ -22,6 +22,7 @@ use super::registry::{self, PrimitiveSpec};
 use super::{audit, fs};
 use crate::cap::{self, Right};
 use crate::sched::{self, TaskId};
+use crate::security::Justification;
 use alloc::format;
 use alloc::string::{String, ToString};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -36,15 +37,29 @@ pub enum Invocation {
     Denied { primitive: &'static str },
     /// The grammar rejected the call; no primitive ran.
     Rejected(GrammarError),
+    /// A destructive primitive refused by the taint gate (Phase 6): the
+    /// justification traced to untrusted ingested content and no human
+    /// confirmed it. No primitive ran.
+    RefusedTainted { primitive: &'static str },
 }
 
 /// Deterministic id source for `spawn_agent` requests. Real agent lifecycle
 /// is Phase 5; here the primitive only mints a stable, auditable request id.
 static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Run a tool call emitted by `caller`. See the module doc for the three
-/// gates; every path writes exactly one audit entry.
+/// Run a tool call emitted by `caller`, with a fully-trusted justification.
+/// This is the pre-Phase-6 entry point; it never trips the taint gate, so
+/// system/kernel-internal callers keep their prior behaviour. Callers that
+/// carry untrusted context (agents) use [`execute_with_justification`].
 pub fn execute(caller: TaskId, raw: &str) -> Invocation {
+    execute_with_justification(caller, raw, Justification::trusted())
+}
+
+/// Run a tool call emitted by `caller`, gating destructive primitives on the
+/// provenance of `justification`. See the module doc for the ordered gates;
+/// Phase 6 inserts a fourth (taint) gate before execution. Every path writes
+/// exactly one audit entry.
+pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Justification) -> Invocation {
     let args_hash = audit::fnv1a(raw.as_bytes());
 
     // Gate 1: grammar.
@@ -65,14 +80,28 @@ pub fn execute(caller: TaskId, raw: &str) -> Invocation {
         return Invocation::Denied { primitive: spec.name };
     }
 
-    // Gate 3: execute in isolation, then audit the effect.
+    // Gate 3: taint (Phase 6). A destructive primitive whose justification
+    // traces to untrusted ingested content is refused -- this is the
+    // prompt-injection-as-privilege-escalation defence, enforced at the OS
+    // boundary regardless of how the agent phrased the call. Only an explicit
+    // human confirmation at the shell can let it through.
+    if spec.destructive && justification.blocks_destructive() {
+        crate::ktrace::log_fmt(format_args!(
+            "synapse.taint: REFUSED destructive '{}' by task {caller} -- justification is untrusted ingested content ({:?})",
+            spec.name, justification.provenance
+        ));
+        audit::record(caller, spec.name, args_hash, audit::Outcome::RefusedTainted, 0);
+        return Invocation::RefusedTainted { primitive: spec.name };
+    }
+
+    // Gate 4: execute in isolation, then audit the effect.
     let result = run_primitive(spec, &call.args);
     let result_hash = audit::fnv1a(result.as_bytes());
     audit::record(caller, spec.name, args_hash, audit::Outcome::Executed, result_hash);
     Invocation::Executed { primitive: spec.name, result }
 }
 
-/// Convenience wrapper for the currently-running task.
+/// Convenience wrapper for the currently-running task (trusted justification).
 pub fn execute_current(raw: &str) -> Invocation {
     execute(sched::current_task_id(), raw)
 }
@@ -121,6 +150,16 @@ fn run_primitive(spec: &PrimitiveSpec, args: &[ArgValue]) -> String {
         registry::EMIT_RESULT => {
             let text = arg_str(args, 0);
             format!("ok:result={text}")
+        }
+        registry::MEM_FS_DELETE => {
+            // Destructive: only reached once the taint gate (above) has let
+            // this call through.
+            let path = arg_str(args, 0);
+            if fs::delete(path) {
+                format!("ok:deleted {path}")
+            } else {
+                format!("error:not_found:{path}")
+            }
         }
         other => format!("error:unimplemented primitive id {other}"),
     }

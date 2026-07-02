@@ -16,7 +16,7 @@ document is the single source of truth; this README is a map on top of it.
 [`CLAUDE.md`](CLAUDE.md) tracks the current phase for whoever (human or
 agent) picks up work next.
 
-## Status: Phase 5 complete
+## Status: Phase 6 complete
 
 ```
 [x] 0  Boot & harness          Boot via Limine, print to serial + framebuffer, QEMU test exit codes
@@ -25,7 +25,7 @@ agent) picks up work next.
 [x] 3  Cortex (inference)      CPU hybrid (gated-DeltaNet + attention) forward pass on Qwen3.5-0.8B, KV/recurrent cache, seeded sampling, batching
 [x] 4  Synapse (capability ABI) Grammar-constrained tool calls → capability-checked deterministic primitives + append-only audit log
 [x] 5  Persona + shell         Agents as processes (spawn/suspend/resume/kill), two-tier memory w/ recall, intent shell drives plan→act loop, agent-to-agent IPC
-[ ] 6  Differentiators         Taint/provenance security gating + self-compiling agents (compiled intents)
+[x] 6  Differentiators         Provenance/taint gate on destructive primitives + self-compiling agents (compiled intents replayed with zero inference)
 [ ] 7  Stretch                 SMP, APIC-per-core, framebuffer TUI, larger model, RISC-V port
 ```
 
@@ -79,13 +79,16 @@ chitti/
         │                       #   executor.rs  grammar → capability → isolated execution, one path to any effect
         │                       #   fs.rs        in-memory file store the FS primitives mutate
         │                       #   audit.rs     append-only invocation log (caller, primitive, hashes, outcome)
-        ├── persona/           # agent runtime (Phase 5):
+        ├── persona/           # agent runtime (Phase 5-6):
         │                       #   manifest.rs  agent header (model ref, persona prompt, capability set, memory policy)
-        │                       #   memory.rs    two-tier memory: bounded live context + persistent store w/ demand-paging recall
+        │                       #   memory.rs    two-tier memory: bounded live context (w/ provenance tags) + persistent store + recall
         │                       #   planner.rs   Planner trait + deterministic RulePlanner (stand-in for the Cortex planner)
         │                       #   actions.rs   plan vocabulary (Synapse tool-call JSON + memory ops)
-        │                       #   agent.rs     the process: spawn/suspend/resume/kill + plan→act loop
-        └── shell/             # intent shell over serial (Phase 5): run_intent (one-shot) + interactive run loop
+        │                       #   agent.rs     the process: spawn/suspend/resume/kill + plan→act loop w/ taint justification
+        │                       #   compiled.rs  self-compiling agents: record/replay validated capability traces (the /bin analogue)
+        ├── security/          # Phase 6 differentiator substrate:
+        │                       #   taint.rs     provenance tags (system/user/untrusted) + the Justification the taint gate reads
+        └── shell/             # intent shell over serial (Phase 5): run_intent (one-shot, cache-routed) + interactive run loop
 ```
 
 Everything x86_64-specific stays under `kernel/src/arch/x86_64/`, so a future

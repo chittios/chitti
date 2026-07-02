@@ -28,7 +28,7 @@ pub mod fs;
 pub mod grammar;
 pub mod registry;
 
-pub use executor::{execute, execute_current, Invocation};
+pub use executor::{execute, execute_current, execute_with_justification, Invocation};
 
 use crate::cap::{self, Right};
 use crate::sched;
@@ -70,6 +70,9 @@ pub fn demo() {
             }
             Invocation::Rejected(err) => {
                 crate::serial_println!("Chitti: synapse rejected malformed call: {:?}", err);
+            }
+            Invocation::RefusedTainted { primitive } => {
+                crate::serial_println!("Chitti: synapse [{}] REFUSED (tainted justification)", primitive);
             }
         }
     }

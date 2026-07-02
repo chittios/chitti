@@ -23,6 +23,10 @@ pub enum Outcome {
     DeniedNoCapability,
     /// Rejected by the grammar; never reached a primitive.
     RejectedMalformed,
+    /// A destructive primitive refused by the taint gate (Phase 6): its
+    /// justification traced to untrusted ingested content and no human
+    /// confirmed it. The primitive did not run.
+    RefusedTainted,
 }
 
 /// One immutable audit record. Every field is `Copy` (the primitive name is

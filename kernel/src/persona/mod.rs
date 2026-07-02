@@ -22,6 +22,7 @@
 
 pub mod actions;
 pub mod agent;
+pub mod compiled;
 pub mod manifest;
 pub mod memory;
 pub mod planner;
@@ -46,6 +47,10 @@ pub fn default_manifest(name: &str) -> Manifest {
             registry::MEM_FS_WRITE,
             registry::LIST,
             registry::EMIT_RESULT,
+            // The agent *holds* the destructive delete capability; whether a
+            // given call may fire is decided by the Phase 6 taint gate, not by
+            // withholding the capability.
+            registry::MEM_FS_DELETE,
         ],
     )
 }

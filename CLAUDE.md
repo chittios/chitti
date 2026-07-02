@@ -1,6 +1,38 @@
 *"This project is specified in `CHITTI_OS_HANDOFF.md`. Read it fully before acting. Follow the locked decisions in Part 2 and the guardrails in Part 4. Work one phase at a time; do not start the next phase until the current phase's acceptance criteria pass in QEMU."*
 
-**Current phase: 5 (Persona — agent runtime + intent shell) — complete.**
+**Current phase: 6 (Differentiators — taint security + self-compiling agents) — complete.**
+The two features that make Chitti novel. **(1) Provenance/taint.** A new
+`security/taint.rs` defines `Provenance` (`SystemTrusted | UserTyped |
+UntrustedIngested`) and `Justification` (provenance + human-confirmed).
+`persona::memory::Message` now carries provenance — system prompt is trusted,
+a typed intent is `UserTyped`, and anything an agent *ingests* (a file it reads,
+a fact it recalls) is `UntrustedIngested`; `Context::max_taint` folds a context
+to its worst provenance. The Synapse executor gained a **taint gate** (a fourth
+gate, after grammar/capability): `execute_with_justification` refuses a
+*destructive* primitive (`mem_fs_delete`, flagged `destructive: true` in the
+registry) when its justification traces to untrusted ingested content, unless a
+human confirms at the shell — auditing it as the new `Outcome::RefusedTainted`.
+An agent computes each call's justification from `ctx.max_taint()`, so a
+prompt-injected "delete X" read out of a file cannot escalate. **(2)
+Self-compiling agents.** `persona/compiled.rs` is the `/bin` analogue: on first
+satisfaction of an intent it records the validated capability trace keyed by an
+`(intent signature, preconditions)`, where preconditions snapshot the external
+state the trace *read* (file-content / fact hashes). A later matching intent
+with satisfied preconditions **replays the trace with zero inference** (a
+compiled intent); a stale precondition falls back to planning and recompiles;
+refused/denied/rejected runs are never compiled. `shell::run_intent` and the
+interactive loop route through this cache, and the loop offers human
+confirmation when the taint gate fires. `cargo xtask test` now runs 63 in-kernel
+tests (up from 56): (a) an injected "delete secrets" hidden in file content is
+refused by the taint gate and audited, the victim survives, yet a clean
+user-justified delete still works; (b) a repeated intent's second run is a
+ktrace'd cache hit with no planner (inference) call, replayed effects still
+audited; (c) mutating a fact makes its compiled intent stale and it re-plans to
+the fresh result. Phase 6 completes the roadmap's core; remaining work is
+Phase 7 stretch (SMP, APIC-per-core, framebuffer TUI, larger model, RISC-V).
+
+---
+*Prior:* **Phase 5 (Persona — agent runtime + intent shell) — complete.**
 Agents as first-class processes, and a full intent→plan→act→result loop from
 a serial shell. `persona/manifest.rs`: an agent manifest (model ref, persona
 prompt, capability set, memory policy). `persona/memory.rs`: two-tier memory —
