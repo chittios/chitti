@@ -127,7 +127,7 @@ fn main() {
 
     let result = match cmd.as_str() {
         "build" => cmd_build(release, arch, model),
-        "image" => image(release),
+        "image" => image(release, model),
         "run" => cmd_run(release, arch, model),
         "test" => cmd_test(),
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
@@ -252,11 +252,6 @@ fn run(cmd: &mut Command) -> Result<(), String> {
         return Err(format!("command failed ({status}): {cmd:?}"));
     }
     Ok(())
-}
-
-/// Build the real (non-test) kernel binary. Returns the path to the ELF.
-fn build_kernel(release: bool) -> Result<PathBuf, String> {
-    build_kernel_with(release, &[])
 }
 
 /// As `build_kernel`, but with extra cargo features enabled.
@@ -410,9 +405,11 @@ fn assemble_image_opt(kernel_bin: &Path, model_rel: Option<&str>) -> Result<Path
     Ok(iso_path)
 }
 
-fn image(release: bool) -> Result<(), String> {
-    let bin = build_kernel(release)?;
-    let iso = assemble_image(&bin)?;
+fn image(release: bool, model: Model) -> Result<(), String> {
+    let bin = build_kernel_with(release, model.features())?;
+    // Bundle the selected model if present; otherwise a kernel-only bootable
+    // ISO (what CI ships -- the model is fetched separately, being large).
+    let iso = assemble_image_with(&bin, model.gguf_rel())?;
     println!("image: {}", iso.display());
     Ok(())
 }
