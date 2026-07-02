@@ -53,15 +53,19 @@ fn qtensor<'a>(g: &Gguf<'a>, name: &str, n_cols: usize, n_rows: usize) -> Result
     Ok(QWeight { data: g.tensor_bytes(name, bytes)?, qt })
 }
 
-/// Dispatch one matvec `y = W · x` by the weight's quant type. Q8_0 takes the
-/// fast int8-SDOT path (SMP + batched-capable). Every other type takes the
-/// exact-f32 dequant-and-dot path (still row-split across cores): the int8
-/// activation the SDOT relies on is fine for Q8_0 (validated to preserve token
-/// parity), but on the 9B's Q4_0 (4-bit) weights over 32 layers its error
-/// accumulates enough to derail greedy decoding, so those go exact.
+/// Dispatch one matvec `y = W · x` by the weight's quant type. Q8_0 and Q4_0
+/// take the fast int8-activation SDOT path (SMP + batched-capable); the
+/// remaining k-quant types (Q4_1/Q5_K/Q6_K, a minority of tensors) take the
+/// generic exact-f32 dequant-and-dot path (still row-split across cores). The
+/// int8 activation is fine for both Q8_0 and Q4_0 (validated: 9B greedy output
+/// matches llama.cpp byte-for-byte once the DeltaNet head grouping is correct).
 fn matvec_qw(qw: QWeight, x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &mut [f32], n_rows: usize, n_cols: usize) {
     if qw.qt == tensor::QT_Q8_0 {
         tensor::matvec_q8_0_fast(qw.data, x, y, xq, xs, n_rows, n_cols);
+        return;
+    }
+    if qw.qt == tensor::QT_Q4_0 {
+        tensor::matvec_q4_0_fast(qw.data, x, y, xq, xs, n_rows, n_cols);
         return;
     }
     debug_assert_eq!(x.len(), n_cols);
