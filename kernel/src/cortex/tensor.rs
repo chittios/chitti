@@ -333,6 +333,7 @@ unsafe fn matvec_q8_0_neon(w: *const u8, x: *const f32, y: *mut f32, row_start: 
 
 /// # Safety
 /// See `matvec_q8_0_rows`.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))] // aarch64 uses the NEON path
 unsafe fn matvec_q8_0_scalar(w: *const u8, x: *const f32, y: *mut f32, row_start: usize, row_end: usize, n_cols: usize) {
     let blocks_per_row = n_cols / QK;
     let row_bytes = blocks_per_row * Q8_0_BLOCK_BYTES;

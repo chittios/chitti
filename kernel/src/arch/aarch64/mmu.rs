@@ -7,7 +7,7 @@
 use core::arch::asm;
 
 #[repr(align(4096))]
-struct Table([u64; 512]);
+struct Table(#[allow(dead_code)] [u64; 512]);
 static mut L1: Table = Table([0; 512]);
 
 /// Set up the identity map and enable the MMU + caches. Idempotent-ish; call

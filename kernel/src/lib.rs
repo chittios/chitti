@@ -5,9 +5,11 @@
 #![no_std]
 #![cfg_attr(test, no_main)]
 #![feature(custom_test_frameworks)]
-#![feature(abi_x86_interrupt)]
-#![test_runner(crate::test_runner)]
-#![reexport_test_harness_main = "test_main"]
+// The custom_test_frameworks harness and the `x86-interrupt` ABI are x86-only
+// (tests boot via Limine + isa-debug-exit on qemu-system-x86_64).
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
+#![cfg_attr(target_arch = "x86_64", test_runner(crate::test_runner))]
+#![cfg_attr(target_arch = "x86_64", reexport_test_harness_main = "test_main")]
 extern crate alloc;
 
 pub mod arch;
@@ -42,44 +44,53 @@ pub mod synapse;
 #[cfg(not(test))]
 pub mod framebuffer;
 
-// --- Limine requests -------------------------------------------------
+// --- Limine requests (x86_64 boot only) ------------------------------
 //
 // A single definition here is linked into both the real kernel binary
 // (which `use`s these through the lib) and the test-harness binary (which
 // *is* this lib compiled with `--test`), so there is exactly one copy of
-// the wire-format request structs to audit.
+// the wire-format request structs to audit. aarch64 boots directly via
+// `-M virt -kernel` (no Limine), so this whole block is x86-only.
 
+#[cfg(target_arch = "x86_64")]
 #[used]
 #[link_section = ".requests_start_marker"]
 static _REQUESTS_START: limine_protocol::RequestsStartMarker =
     limine_protocol::RequestsStartMarker::new();
 
 /// Base revision 3: stable across all Limine 5.x-12.x releases.
+#[cfg(target_arch = "x86_64")]
 #[used]
 #[link_section = ".requests"]
 pub static BASE_REVISION: limine_protocol::BaseRevision = limine_protocol::BaseRevision::new(3);
 
+#[cfg(target_arch = "x86_64")]
 #[used]
 #[link_section = ".requests"]
 pub static FRAMEBUFFER_REQUEST: limine_protocol::FramebufferRequest =
     limine_protocol::FramebufferRequest::new();
 
+#[cfg(target_arch = "x86_64")]
 #[used]
 #[link_section = ".requests"]
 pub static MEMMAP_REQUEST: limine_protocol::MemmapRequest = limine_protocol::MemmapRequest::new();
 
+#[cfg(target_arch = "x86_64")]
 #[used]
 #[link_section = ".requests"]
 pub static HHDM_REQUEST: limine_protocol::HhdmRequest = limine_protocol::HhdmRequest::new();
 
+#[cfg(target_arch = "x86_64")]
 #[used]
 #[link_section = ".requests"]
 pub static MODULE_REQUEST: limine_protocol::ModuleRequest = limine_protocol::ModuleRequest::new();
 
+#[cfg(target_arch = "x86_64")]
 #[used]
 #[link_section = ".requests"]
 pub static SMP_REQUEST: limine_protocol::SmpRequest = limine_protocol::SmpRequest::new();
 
+#[cfg(target_arch = "x86_64")]
 #[used]
 #[link_section = ".requests_end_marker"]
 static _REQUESTS_END: limine_protocol::RequestsEndMarker =
@@ -92,6 +103,7 @@ static _REQUESTS_END: limine_protocol::RequestsEndMarker =
 /// `custom_test_frameworks` harness below, so every test also runs with
 /// interrupts, paging extensions, a working heap, and a live scheduler
 /// available.
+#[cfg(target_arch = "x86_64")]
 pub fn init() {
     assert!(BASE_REVISION.is_supported(), "Limine did not accept base revision 3");
 
@@ -120,6 +132,17 @@ pub fn init() {
     smp::init();
 }
 
+/// aarch64 bring-up: the boot stub (`arch::aarch64::boot`) has already set the
+/// stack, enabled NEON, and zeroed BSS. Here we enable the MMU + heap
+/// (`mm::init`) and start the scheduler. No IDT/PIC/PIT/Limine: the aarch64
+/// scheduler is cooperative (no timer IRQ yet), and there is no SMP bring-up.
+#[cfg(target_arch = "aarch64")]
+pub fn init() {
+    mm::init();
+    sched::init();
+    ktrace::log("init", "aarch64 bring-up complete (MMU + heap + scheduler)");
+}
+
 // --- custom_test_frameworks harness -----------------------------------
 
 /// A runnable in-kernel test. Blanket-implemented for any `Fn()`, printing
@@ -136,6 +159,7 @@ impl<T: Fn()> Testable for T {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 pub fn test_runner(tests: &[&dyn Testable]) {
     serial_println!("running {} test(s)", tests.len());
     for test in tests {
@@ -144,6 +168,7 @@ pub fn test_runner(tests: &[&dyn Testable]) {
     qemu::exit_qemu(qemu::QemuExitCode::Success);
 }
 
+#[cfg(target_arch = "x86_64")]
 pub fn test_panic_handler(info: &core::panic::PanicInfo) -> ! {
     serial_println!("[failed]");
     serial_println!("{}", info);

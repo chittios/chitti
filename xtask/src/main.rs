@@ -7,24 +7,57 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Target architecture, chosen explicitly via `-arch x86_64|aarch64` (never
+/// auto-detected from the host): the same unified kernel builds for both.
+#[derive(Clone, Copy, PartialEq)]
+enum Arch {
+    X86_64,
+    Aarch64,
+}
+
+/// Parse `-arch <value>` (or `-arch=<value>`) from the args; default x86_64.
+fn parse_arch(rest: &[String]) -> Result<Arch, String> {
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        let val = if let Some(v) = a.strip_prefix("-arch=") {
+            Some(v.to_string())
+        } else if a == "-arch" || a == "--arch" {
+            it.next().cloned()
+        } else {
+            None
+        };
+        if let Some(v) = val {
+            return match v.as_str() {
+                "x86_64" | "x86-64" | "x64" => Ok(Arch::X86_64),
+                "aarch64" | "arm64" => Ok(Arch::Aarch64),
+                other => Err(format!("unknown -arch '{other}' (expected x86_64 or aarch64)")),
+            };
+        }
+    }
+    Ok(Arch::X86_64)
+}
+
 fn main() {
     let mut args = env::args().skip(1);
     let cmd = args.next().unwrap_or_default();
     let rest: Vec<String> = args.collect();
     let release = rest.iter().any(|a| a == "--release");
+    let arch = match parse_arch(&rest) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("xtask error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let result = match cmd.as_str() {
-        "build" => build_kernel(release).map(|_| ()),
+        "build" => cmd_build(release, arch),
         "image" => image(release),
-        "run" => cmd_run(release),
+        "run" => cmd_run(release, arch),
         "test" => cmd_test(),
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
         // boot the real model, run the acceptance checks, exit pass/fail.
         "ref-check" => cmd_ref_check(),
-        // Phase 7: build + boot the aarch64 kernel natively on Apple Silicon
-        // via QEMU + HVF (Hypervisor.framework). This escapes the x86-on-arm
-        // TCG emulation and runs the NEON inference kernels on the real cores.
-        "arm64" => cmd_arm64(release),
         // Hidden subcommand: installed as `[target.x86_64-chitti] runner` in
         // kernel/.cargo/config.toml so `cargo test` can boot each compiled
         // test binary in QEMU and translate isa-debug-exit into a real exit
@@ -40,34 +73,47 @@ fn main() {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <build|image|run|test|ref-check|arm64> [--release]".to_string()
+    "usage: cargo xtask <build|image|run|test|ref-check> [-arch x86_64|aarch64] [--release]".to_string()
+}
+
+/// `cargo xtask build [-arch ...]`: build the unified kernel for the chosen
+/// architecture.
+fn cmd_build(release: bool, arch: Arch) -> Result<(), String> {
+    match arch {
+        Arch::X86_64 => build_kernel(release).map(|_| ()),
+        Arch::Aarch64 => build_kernel_aarch64(release).map(|_| ()),
+    }
+}
+
+/// Build the unified kernel for aarch64 (`targets/aarch64-chitti.json`), and
+/// return the path to the resulting ELF (`-M virt -kernel` bootable).
+fn build_kernel_aarch64(release: bool) -> Result<PathBuf, String> {
+    let kdir = kernel_dir();
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&kdir).args(["build", "--target", "../targets/aarch64-chitti.json"]);
+    if release {
+        cmd.arg("--release");
+    }
+    run(&mut cmd)?;
+    let profile = if release { "release" } else { "debug" };
+    let elf = kdir.join(format!("target/aarch64-chitti/{profile}/chitti-kernel"));
+    if !elf.exists() {
+        return Err(format!("aarch64 kernel not found at {}", elf.display()));
+    }
+    Ok(elf)
 }
 
 /// `cargo xtask arm64`: build the standalone aarch64 kernel and boot it on
 /// `qemu-system-aarch64 -M virt` with `-accel hvf`, so it runs *natively* on
-/// this Apple Silicon host (no cross-arch emulation) with NEON. Prints the
-/// boot banner + the native NEON matvec benchmark to the serial console.
-fn cmd_arm64(release: bool) -> Result<(), String> {
-    let arm_dir = repo_root().join("arm64");
-    let mut build = Command::new("cargo");
-    build.current_dir(&arm_dir).arg("build");
-    if release {
-        build.arg("--release");
-    }
-    run(&mut build)?;
-
-    let profile = if release { "release" } else { "debug" };
-    let elf = arm_dir.join(format!("target/aarch64-chitti/{profile}/chitti-arm64"));
-    if !elf.exists() {
-        return Err(format!("aarch64 kernel not found at {}", elf.display()));
-    }
-
+/// Boot the unified kernel built for aarch64 on `qemu-system-aarch64 -M virt`
+/// with `-accel hvf`, so it runs *natively* on this Apple Silicon host (no
+/// cross-arch emulation) with NEON. Serial to stdio (`-nographic`).
+fn cmd_run_aarch64(release: bool) -> Result<(), String> {
+    let elf = build_kernel_aarch64(release)?;
     let mut qemu = Command::new("qemu-system-aarch64");
-    qemu.args([
-        "-M", "virt", "-cpu", "host", "-accel", "hvf", "-m", "512M", "-nographic", "-kernel",
-    ]);
+    qemu.args(["-M", "virt", "-cpu", "host", "-accel", "hvf", "-m", "512M", "-nographic", "-kernel"]);
     qemu.arg(&elf);
-    eprintln!("booting aarch64 kernel natively via HVF (Ctrl-A X to quit qemu)...");
+    eprintln!("booting aarch64 Chitti natively via HVF (Ctrl-A X to quit qemu)...");
     run(&mut qemu)
 }
 
@@ -280,11 +326,13 @@ fn qemu_base_cmd(iso: &Path) -> Command {
     cmd
 }
 
-/// `cargo xtask run`: boot the real kernel interactively (serial to stdio,
-/// framebuffer in the QEMU display window). Attaches a persistent virtio-blk
-/// disk (`target/chitti-disk.img`) so the Phase 7 filesystem has real storage
-/// -- `disable-modern=on` selects the legacy interface the driver speaks.
-fn cmd_run(release: bool) -> Result<(), String> {
+/// `cargo xtask run [-arch ...]`: boot the unified kernel. On aarch64 it runs
+/// natively via QEMU + HVF; on x86 it boots the Limine image under
+/// qemu-system-x86_64 (TCG on this host).
+fn cmd_run(release: bool, arch: Arch) -> Result<(), String> {
+    if arch == Arch::Aarch64 {
+        return cmd_run_aarch64(release);
+    }
     let bin = build_kernel(release)?;
     let iso = assemble_image(&bin)?;
     let disk = ensure_disk_image()?;
