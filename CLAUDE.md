@@ -4,7 +4,25 @@
 
 **Current phase: 7 (Stretch) — in progress. SMP + block-device FS + framebuffer TUI + dual-arch (x86_64 + aarch64) kernel: complete.**
 
-**Claude-Code-style chat shell.** The interactive shell is now a chat REPL:
+**Qwen3.5-9B now generates correct text (~1 tok/s).** The 9B produced garbage
+until three bugs were found and fixed (the last two using the HF
+`modeling_qwen3_5` + llama.cpp `models/qwen35.cpp` references): **(1)** the
+mixed-quant SMP worker keyed its kernel on `qtype`, colliding Q4_0-SDOT with the
+generic path — added an explicit `mode` selector; **(2, the real one)** the
+gated-DeltaNet GQA maps `nh`=32 value heads onto `n_group`=16 key/query heads,
+and llama.cpp does this with `ggml_repeat` (tiling → value head `h` uses key
+head `h % n_group`), NOT HF's `repeat_interleave` (`h / group_size`) — the GGUF
+is converted for llama.cpp's convention, so **modulo** is correct (identity for
+the 0.8B where `n_group==nh`, so it was never exercised there). With those,
+`hello whats your name` → "My name is **Qwen**.", **byte-for-byte the same
+greedy tokens as `llama-simple`** on the same ids; chat emits a coherent
+`<think>` block. Q4_0-SDOT stays on the fast int8 path (int8 activation was a
+red herring — the divergence was the grouping); Q4_1/Q5_K/Q6_K use exact-f32.
+Debugging built a NumPy reference forward + per-layer checksum diffing against
+Chitti to localize. 0.8B unchanged; both arches build; 69/69 green.
+
+---
+*Prior:* **Claude-Code-style chat shell.** The interactive shell is now a chat REPL:
 plain text is a message to the Cortex model, `/`-prefixed lines are commands
 (`/help /do <intent> /clear /infer /bench /perf /exit`). New `cortex::tokenizer`
 is a byte-level BPE encoder (GPT-2/Qwen) — builds vocab + merge-rank maps from
