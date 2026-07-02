@@ -453,26 +453,53 @@ pub unsafe fn matvec_q8_0_sdot_rows(
     row_end: usize,
     n_cols: usize,
 ) {
-    use core::arch::aarch64::{vaddvq_s32, vdotq_s32, vdupq_n_s32, vld1q_s8};
+    use core::arch::aarch64::{
+        vaddq_f32, vaddq_s32, vaddvq_f32, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32, vfmaq_n_f32, vld1q_s8,
+    };
     let blocks = n_cols / QK;
     let row_bytes = blocks * Q8_0_BLOCK_BYTES;
+
+    // One block's contribution, scaled and folded into f32 accumulator `$f`:
+    // two independent SDOTs (16 int8 MACs each) -> 4 int32 partial sums ->
+    // `$f += float(partials) * (d_weight * d_activation)`. There is one final
+    // horizontal reduce per row, not one per block.
+    macro_rules! block_into {
+        ($f:expr, $row:expr, $b:expr) => {{
+            let base = $b * Q8_0_BLOCK_BYTES;
+            let dw = f16_to_f32(u16::from_le_bytes([*$row.add(base), *$row.add(base + 1)]));
+            let dx = *xs.add($b);
+            let q = $row.add(base + 2) as *const i8;
+            let xp = xq.add($b * QK);
+            let a0 = vdotq_s32(vdupq_n_s32(0), vld1q_s8(q), vld1q_s8(xp)); // lanes 0..16
+            let a1 = vdotq_s32(vdupq_n_s32(0), vld1q_s8(q.add(16)), vld1q_s8(xp.add(16))); // 16..32
+            $f = vfmaq_n_f32($f, vcvtq_f32_s32(vaddq_s32(a0, a1)), dw * dx);
+        }};
+    }
+
     // SAFETY: all loads in-bounds per the caller's contract; dotprod is enabled.
     unsafe {
         for r in row_start..row_end {
             let row = w.add(r * row_bytes);
-            let mut acc = 0.0f32;
-            for b in 0..blocks {
-                let base = b * Q8_0_BLOCK_BYTES;
-                let dw = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
-                let dx = *xs.add(b);
-                let q = row.add(base + 2) as *const i8;
-                let xp = xq.add(b * QK);
-                let mut iacc = vdupq_n_s32(0);
-                iacc = vdotq_s32(iacc, vld1q_s8(q), vld1q_s8(xp)); // lanes 0..16
-                iacc = vdotq_s32(iacc, vld1q_s8(q.add(16)), vld1q_s8(xp.add(16))); // 16..32
-                acc += (vaddvq_s32(iacc) as f32) * dw * dx;
+            // Four independent accumulator chains so consecutive blocks don't
+            // serialize on one FMA's latency (the actual bottleneck -- SDOT
+            // throughput far exceeds one dependent FMA chain).
+            let mut f0 = vdupq_n_f32(0.0);
+            let mut f1 = vdupq_n_f32(0.0);
+            let mut f2 = vdupq_n_f32(0.0);
+            let mut f3 = vdupq_n_f32(0.0);
+            let mut b = 0;
+            while b + 4 <= blocks {
+                block_into!(f0, row, b);
+                block_into!(f1, row, b + 1);
+                block_into!(f2, row, b + 2);
+                block_into!(f3, row, b + 3);
+                b += 4;
             }
-            *y.add(r) = acc;
+            while b < blocks {
+                block_into!(f0, row, b);
+                b += 1;
+            }
+            *y.add(r) = vaddvq_f32(vaddq_f32(vaddq_f32(f0, f1), vaddq_f32(f2, f3)));
         }
     }
 }
