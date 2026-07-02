@@ -79,10 +79,11 @@ jobs:
           aarch64 (native on Apple Silicon via HVF):
               cargo xtask run -arch aarch64 -model ${{ matrix.model }}
 
-          NOTE: the qwen3.5-9b images carry the correct 12 GiB memory layout, but
-          end-to-end 9B inference is not functional yet -- it needs Q4_K/Q6_K
-          quant kernels, untied output.weight loading, and a >4 GiB model-delivery
-          path (virtio-blk). The qwen3.5-0.8b images run inference fully.
+          NOTE: qwen3.5-9b runs but is slow (~0.5 tok/s decode on an M2; mixed
+          Q4_0/Q4_1/Q8_0/Q5_K/Q6_K via the generic dequant path) and needs a
+          16 GB+ host for -m 12G. The 5.4 GB model is delivered by splitting it
+          into <4 GiB chunks for QEMU's loader (automatic in `cargo xtask run`).
+          qwen3.5-0.8b runs fully at ~14 tok/s.
           EOF
           tar -czf "dist/${NAME}.tar.gz" -C dist "${IMG}" "${NAME}.RUN.md"
           ls -la dist
