@@ -31,11 +31,37 @@ fn transmit_empty() -> bool {
     unsafe { inb(COM1 + 5) & 0x20 != 0 }
 }
 
+/// Read one byte from COM1 if the UART has one buffered, else `None`.
+/// Non-blocking: the intent shell (Phase 5) polls this and yields the CPU
+/// between polls rather than busy-waiting. Under QEMU `-serial stdio`, bytes
+/// typed at the terminal arrive here on the receive line.
+pub fn read_byte() -> Option<u8> {
+    crate::arch::x86_64::interrupts::without_interrupts(|| {
+        // SAFETY: LSR bit 0 ("data ready") gates the read; only when it is
+        // set is there a byte in the receive buffer to take from COM1.
+        unsafe {
+            if inb(COM1 + 5) & 0x01 != 0 {
+                Some(inb(COM1))
+            } else {
+                None
+            }
+        }
+    })
+}
+
 fn write_byte(byte: u8) {
     while !transmit_empty() {}
     // SAFETY: only written once `transmit_empty` confirms the UART is
     // ready for the next byte.
     unsafe { outb(COM1, byte) };
+}
+
+/// Write a single raw byte to COM1, bypassing the printable-ASCII filter
+/// `Serial`'s `Write` impl applies. The intent shell uses this to emit the
+/// control bytes for in-line editing (backspace: `\x08 \x08`), which the
+/// filter would otherwise turn into dots.
+pub fn put_byte(byte: u8) {
+    crate::arch::x86_64::interrupts::without_interrupts(|| write_byte(byte));
 }
 
 /// Zero-sized handle used to route `core::fmt::Write` (and thus

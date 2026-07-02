@@ -17,9 +17,11 @@ pub mod ipc;
 pub mod ktrace;
 pub mod limine_protocol;
 pub mod mm;
+pub mod persona;
 pub mod qemu;
 pub mod sched;
 pub mod serial;
+pub mod shell;
 pub mod synapse;
 
 // The framebuffer writer pulls in `font8x8` (a normal, non-build-std
@@ -559,4 +561,137 @@ fn phase4_audit_log_is_append_only() {
     assert_eq!(after[before.len()].outcome, audit::Outcome::RejectedMalformed);
     assert_eq!(after[before.len() + 1].outcome, audit::Outcome::DeniedNoCapability);
     assert_eq!(after[before.len() + 2].outcome, audit::Outcome::Executed);
+}
+
+// --- Phase 5 acceptance tests (Persona + intent shell) ------------------
+
+/// (a) a typed intent completes a 2-3 primitive plan and returns the correct
+/// result: "write a file called X with the text Y, then read it back" plans
+/// two Synapse calls, both execute (and are audited), and the read-back
+/// returns the written text.
+#[test_case]
+fn phase5_intent_completes_multiprimitive_plan() {
+    use synapse::audit;
+
+    let audit_before = audit::len();
+    let result = shell::run_intent("write a file called greeting with the text hi there, then read it back");
+
+    // mem_fs_read returns "ok:<contents>" -- the plan's final result.
+    assert_eq!(result, "ok:hi there", "intent did not return the read-back text: {result}");
+    // The write really happened.
+    assert_eq!(synapse::fs::read("greeting").as_deref(), Some(&b"hi there"[..]));
+    // At least two primitives executed and were audited for this intent.
+    let snap = audit::snapshot();
+    let executed = snap[audit_before..].iter().filter(|e| e.outcome == audit::Outcome::Executed).count();
+    assert!(executed >= 2, "expected a >=2-primitive plan to execute, saw {executed}");
+}
+
+/// (b) suspend->resume reconstructs an agent's working state and it continues
+/// correctly. We run one plan step, suspend (which drops the recomputable
+/// live/KV state), resume (which recomputes rather than restores it), then
+/// run the remaining step and get the same result as an uninterrupted run.
+#[test_case]
+fn phase5_suspend_resume_continues_correctly() {
+    use persona::{Agent, RulePlanner};
+
+    const INTENT: &str = "write a file called sr_test with the text checkpoint ok, then read it back";
+    let baseline = shell::run_intent("write a file called sr_base with the text checkpoint ok, then read it back");
+    assert_eq!(baseline, "ok:checkpoint ok", "baseline run sanity");
+
+    let mut agent = Agent::spawn(persona::default_manifest("sr-agent"));
+    let mut planner = RulePlanner;
+    agent.begin(INTENT, &mut planner);
+
+    // Step 0: the write. The read is still pending.
+    assert!(agent.step());
+    assert!(!agent.finished(), "plan should still have the read step");
+    assert!(agent.live_present());
+    let recomputes_before = agent.recompute_count();
+
+    agent.suspend();
+    assert!(!agent.live_present(), "suspend must drop the recomputable live/KV state");
+
+    agent.resume();
+    assert!(agent.live_present(), "resume must recompute the live state");
+    assert_eq!(agent.recompute_count(), recomputes_before + 1, "resume must recompute, not restore");
+
+    // Step 1: the read, executed after resume, must produce the right result.
+    assert!(agent.step());
+    assert!(agent.finished());
+    let result = agent.result();
+    assert_eq!(result, "ok:checkpoint ok", "resumed agent did not continue correctly");
+    assert_eq!(synapse::fs::read("sr_test").as_deref(), Some(&b"checkpoint ok"[..]));
+    agent.kill();
+}
+
+/// (c) an agent recalls a fact from the persistent store that was never in
+/// its live context. One agent stores the fact; a *different* agent (fresh
+/// live context) answers "what is ..." by demand-paging it from tier 2.
+#[test_case]
+fn phase5_recalls_fact_absent_from_live_context() {
+    use persona::{memory, Agent, RulePlanner};
+
+    let stored = shell::run_intent("remember that capital_of_france is Paris");
+    assert!(stored.starts_with("ok:remembered"), "remember failed: {stored}");
+    assert_eq!(memory::persisted("shell-agent", "capital_of_france").as_deref(), Some("Paris"));
+
+    let mut agent = Agent::spawn(persona::default_manifest("shell-agent"));
+    let mut planner = RulePlanner;
+    agent.begin("what is capital_of_france", &mut planner);
+    // The value is not in live context before the plan runs.
+    assert!(!agent.context().contains("Paris"), "fact must not start in live context");
+
+    let result = agent.run_to_completion();
+    assert_eq!(result, "Paris", "agent did not recall the fact from the persistent store");
+    // And recall paged it into live context.
+    assert!(agent.context().contains("Paris"), "recall should page the fact into live context");
+    agent.kill();
+}
+
+/// (d) two agents coordinate via IPC to complete a split task: a producer
+/// agent computes a value and sends it over a capability-gated endpoint; a
+/// consumer agent receives it and persists it through a capability-checked
+/// Synapse call. The shared FS then holds the producer's value.
+#[test_case]
+fn phase5_two_agents_coordinate_via_ipc() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+
+    // Consumer: receive a value (slot 0 = IpcReceive) and write it to the FS
+    // through Synapse (its table also holds InvokePrimitive(mem_fs_write)).
+    extern "C" fn consumer(_arg: u64) {
+        let msg = ipc::receive(cap::Cap(0)).expect("consumer: receive denied");
+        let call = alloc::format!(
+            r#"{{"name":"mem_fs_write","arguments":{{"path":"ipc_out","text":"{}"}}}}"#,
+            msg.data
+        );
+        let inv = synapse::execute(sched::current_task_id(), &call);
+        assert!(matches!(inv, synapse::Invocation::Executed { .. }), "consumer: write not executed");
+        DONE.store(true, Ordering::SeqCst);
+    }
+    // Producer: compute 21*2 and send it (slot 0 = IpcSend).
+    extern "C" fn producer(_arg: u64) {
+        ipc::send(cap::Cap(0), 21 * 2).expect("producer: send denied");
+    }
+
+    let work_ep = ipc::create_endpoint();
+    let consumer_id = sched::spawn("persona-consumer", consumer, 0);
+    cap::grant(consumer_id, cap::Right::IpcReceive(work_ep)); // consumer slot 0
+    cap::grant(consumer_id, cap::Right::InvokePrimitive(synapse::registry::MEM_FS_WRITE));
+    let producer_id = sched::spawn("persona-producer", producer, 0);
+    cap::grant(producer_id, cap::Right::IpcSend(work_ep)); // producer slot 0
+
+    let mut spins = 0u64;
+    while !DONE.load(Ordering::SeqCst) {
+        sched::yield_now();
+        spins += 1;
+        assert!(spins < 100_000_000, "the two agents never completed the split task");
+    }
+
+    assert_eq!(
+        synapse::fs::read("ipc_out").as_deref(),
+        Some(&b"42"[..]),
+        "consumer did not persist the producer's value via IPC + Synapse"
+    );
 }

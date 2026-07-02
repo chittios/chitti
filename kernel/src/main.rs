@@ -54,8 +54,9 @@ pub extern "C" fn _start() -> ! {
     // the Cortex model module is present.
     chitti_kernel::synapse::demo();
 
-    // Phase 3: report the Cortex model boot module and run the reference
-    // inference demo, if the model is present.
+    // Report the Cortex model boot module, if present (Phase 3). The model
+    // is used on demand via the shell's `infer` builtin rather than in a
+    // blocking boot-time demo -- inference is slow under QEMU TCG.
     match chitti_kernel::cortex::model_module() {
         Some(bytes) => {
             if let Ok(g) = chitti_kernel::cortex::gguf::Gguf::parse(bytes) {
@@ -70,55 +71,34 @@ pub extern "C" fn _start() -> ! {
                     g.tokens.len(),
                 );
             }
-            // `ref-check` builds run the full acceptance gate and exit QEMU
-            // with a pass/fail code; a normal `run` just shows the demo.
-            #[cfg(feature = "refcheck")]
-            {
-                let ok = chitti_kernel::cortex::run_acceptance();
-                chitti_kernel::qemu::exit_qemu(if ok {
-                    chitti_kernel::qemu::QemuExitCode::Success
-                } else {
-                    chitti_kernel::qemu::QemuExitCode::Failed
-                });
-            }
-            #[cfg(not(feature = "refcheck"))]
-            run_inference_demo();
         }
         None => serial_println!("Chitti: no model.gguf boot module present"),
     }
 
+    // `ref-check` builds run the full Phase 3 acceptance gate and exit QEMU
+    // with a pass/fail code, skipping the interactive shell.
+    #[cfg(feature = "refcheck")]
+    {
+        let ok = chitti_kernel::cortex::run_acceptance();
+        chitti_kernel::qemu::exit_qemu(if ok {
+            chitti_kernel::qemu::QemuExitCode::Success
+        } else {
+            chitti_kernel::qemu::QemuExitCode::Failed
+        });
+    }
+
+    // Phase 5: a fast, deterministic demonstration of the intent->plan->act
+    // loop, then hand the console to the interactive intent shell (which
+    // never returns -- it is the system's steady state).
+    #[cfg(not(feature = "refcheck"))]
+    {
+        chitti_kernel::shell::demo();
+        chitti_kernel::shell::run();
+    }
+
+    #[allow(unreachable_code)]
     loop {
         arch::x86_64::hlt();
-    }
-}
-
-/// Phase 3 deliverable: generate a coherent, reproducible token stream from
-/// the tiny model. Logs the prompt and the model's response to both serial
-/// (what `cargo xtask run` shows on stdio) and the framebuffer window, then
-/// records the parity check the `REFCHECK:` line carries.
-#[cfg(not(feature = "refcheck"))]
-fn run_inference_demo() {
-    use chitti_kernel::cortex::{self, refcheck};
-
-    serial_println!("Chitti: --- Cortex inference ---");
-    serial_println!("Chitti: prompt:   {}", refcheck::PROMPT);
-    // The response streams token-by-token from run_reference_inference
-    // (a "Chitti: response> ..." line) as it is generated.
-    match cortex::run_reference_inference() {
-        Some(result) => {
-            serial_println!("Chitti: full:     {}{}", refcheck::PROMPT, result.continuation_text);
-            serial_println!(
-                "Chitti: (tokens={:?}, matches NumPy reference={})",
-                result.continuation,
-                result.matched_reference,
-            );
-            // Also render the prompt + response to the framebuffer window.
-            if let Some(fb) = FRAMEBUFFER_REQUEST.response().and_then(|r| r.framebuffers().first().copied()) {
-                let mut w = framebuffer::Writer::new(fb);
-                let _ = write!(w, "\n\nprompt:   {}\nresponse: {}", refcheck::PROMPT, result.continuation_text);
-            }
-        }
-        None => serial_println!("Chitti: inference could not run"),
     }
 }
 
