@@ -4,7 +4,34 @@
 
 **Current phase: 7 (Stretch) — in progress. SMP + block-device FS + framebuffer TUI + dual-arch (x86_64 + aarch64) kernel: complete.**
 
-**aarch64 inference throughput — ~7x, now ~13 tok/s (0.8B, native HVF).** A
+**Batched prefill + a throughput harness (aarch64).** A `perf` shell builtin
+(`cortex::bench_inference`) reports prefill (pp) and decode (tg) tok/s on a
+synthetic prompt — a regression gauge run alongside `infer` (which still
+asserts reference parity) after every change; directly comparable to
+`llama-bench`. Against it: **(1)** the SDOT decode kernel was squeezed (single
+f32x4 accumulator with one reduce per row, four independent chains) —
+isolated bench ~3.3→~3.6 GMAC/s, but end-to-end decode is flat (~14 tok/s):
+decode is at the **NEON per-core ceiling** (4 cores × ~3.6 GMAC/s ÷ ~1
+GMAC/token). **(2)** *Batched, weight-stationary prefill*: `Model::prefill`
+splits into `Model::prefill_batched`, which processes all prompt positions
+together — the projection matmuls are batched via a new register-blocked
+`tensor::matmul_q8_0_sdot_rows` (per weight block, load + f16-decode the weight
+once, SDOT against a tile of 4 activation columns), while the order-dependent
+recurrence/attention runs per position through the shared `attn_core`/
+`delta_core` (extracted from `attn_layer`/`delta_layer`). Since each column's
+SDOT is identical to the sequential matvec, batched prefill is **bit-identical**
+(`matches reference=true`). The SMP pool was generalized from matvec to matmul
+(`m_count`+`n_rows`), so prefill is split across the four cores too. Result: **pp
+~18→~26 tok/s (~1.44x)**, tg ~14. Batched matmul is aarch64-only; x86 keeps the
+sequential prefill (correct, slower). *Benchmarked vs llama.cpp on the same
+GGUF (M2): llama.cpp CPU+Accelerate ~55 tok/s tg / Metal ~68 tok/s tg — its
+edge is Apple's **AMX** matrix coprocessor (via Accelerate) + Metal, which a
+bare-metal kernel in a VM can't reach; we are compute-bound on NEON, not
+bandwidth-bound (~10% of the M2's ~100 GB/s), which is why reading weights once
+in prefill only helps modestly.* 69/69 tests green; both arches build.
+
+---
+*Prior:* **aarch64 inference throughput — ~7x, now ~13 tok/s (0.8B, native HVF).** A
 push to make bigger models usable. Three levers, all verified with `matches
 reference=true` preserved: **(1)** a `bench` shell builtin times the hottest
 kernel (`matvec_q8_0`) in isolation — it showed the f32-activation NEON matvec
