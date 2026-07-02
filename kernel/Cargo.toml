@@ -37,6 +37,15 @@ model-9b = []
 [dependencies]
 font8x8 = { version = "0.3.1", default-features = false }
 
+# Shared-contract serialization for the agentic re-architecture
+# (CHITTI_SCHEMAS.md). All no_std + alloc, none pull `std`:
+#   serde   — derive for the AgentManifest/Session/SkillManifest structs
+#   postcard — compact no_std wire format for the persistent store
+#   bitflags — the `Rights` flag set, with serde support
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+bitflags = { version = "2", default-features = false, features = ["serde"] }
+
 # No per-profile `panic = "abort"` override here: the target spec's own
 # "panic-strategy": "abort" is already authoritative. Adding an explicit
 # `-C panic=abort` on top of that makes this package's root profile diverge
