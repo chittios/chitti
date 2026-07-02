@@ -4,7 +4,7 @@
 //! each one spinning on a per-CPU `goto_address`; [`init`] writes that field
 //! to launch each AP into [`ap_entry`]. Each core then sets up its own GDT/TSS
 //! (`gdt::init_ap`), loads the shared IDT (`idt::load_ap`), software-enables
-//! its local APIC (`apic`), and runs a bounded self-test before parking.
+//! its local APIC (`apic`), runs a bounded self-test, then parks.
 //!
 //! The self-test is also the **lock-discipline** proof the phase calls for:
 //! every online core (BSP + APs) hammers one shared counter through the
@@ -15,10 +15,17 @@
 //!
 //! APs do a fixed chunk of work and then `hlt` forever (interrupts stay
 //! disabled, as Limine started them), so they never busy-spin stealing vCPU
-//! time from the BSP -- important under QEMU's cross-arch TCG. A richer design
-//! (per-core run queues fed by IPIs, a per-core APIC timer for preemption) is
-//! future work; this establishes the substrate: multiple cores executing
-//! kernel code concurrently under correct locks.
+//! time from the BSP -- important under QEMU's cross-arch TCG. This establishes
+//! the substrate: multiple cores executing kernel code concurrently under
+//! correct locks.
+//!
+//! Data-parallel work (splitting the Cortex `Q8_0` matvec's rows across cores)
+//! is a real speedup on native multi-core x86, but measured a net *loss* under
+//! QEMU TCG -- `thread=multi` taxes every emulated instruction and idle worker
+//! cores contend for host CPU -- so inference is kept single-core here and the
+//! APs park. The row-range kernel (`tensor::matvec_q8_0_rows`) keeps that split
+//! a drop-in away for a real-hardware target. Preemptive per-core run queues +
+//! IPIs remain future work.
 
 use crate::arch::x86_64::{apic, gdt, idt};
 use crate::limine_protocol::SmpInfo;

@@ -148,11 +148,32 @@ pub fn run() -> ! {
     }
 }
 
-/// Builtin: run the Cortex reference inference (Phase 3) on demand from the
-/// shell. Slow under QEMU TCG, hence not on the automatic boot path.
+/// Builtin: run the Cortex model on the reference prompt and show the prompt,
+/// the response (streamed live as it decodes -- `run_reference_inference`
+/// prints a `Chitti: response> ...` line to the console), and the throughput
+/// (prompt tokens/prefill time and decode tokens/sec). Slow under QEMU TCG,
+/// hence on demand rather than on the boot path.
 fn run_infer() {
+    use crate::cortex::refcheck;
+    serial_println!("prompt> {}", refcheck::PROMPT);
     match crate::cortex::run_reference_inference() {
-        Some(r) => serial_println!("=> (tokens={:?}, matches reference={})", r.continuation, r.matched_reference),
+        Some(r) => {
+            serial_println!("=> \"{}\"", r.continuation_text.trim());
+            let decode_tps = if r.decode_ms > 0 {
+                (r.n_decoded as u64 * 1000) / r.decode_ms
+            } else {
+                0
+            };
+            serial_println!(
+                "   {} prompt tok in {} ms; {} tok decoded in {} ms (~{} tok/s); matches reference={}",
+                r.n_prompt,
+                r.prefill_ms,
+                r.n_decoded,
+                r.decode_ms,
+                decode_tps,
+                r.matched_reference
+            );
+        }
         None => serial_println!("=> no model module present; boot with the model bundled to use `infer`"),
     }
 }
