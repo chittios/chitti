@@ -48,8 +48,12 @@ pub fn run_reference_inference() -> Option<InferResult> {
     let m = model::Model::load(gguf).ok()?;
 
     // Provenance log: model hash, seed (greedy => 0), input hash. Greedy
-    // temp-0 decoding is deterministic, so the "seed" is fixed at 0.
-    let model_hash = model::fnv1a(bytes);
+    // temp-0 decoding is deterministic, so the "seed" is fixed at 0. Hash a
+    // bounded header prefix rather than the whole (possibly hundreds-of-MiB)
+    // model -- it is a provenance fingerprint, logged not asserted, and this
+    // keeps it cheap on both arches (and correct when the aarch64 slice is a
+    // generous upper bound rather than the exact file length).
+    let model_hash = model::fnv1a(&bytes[..bytes.len().min(1 << 16)]);
     let input_hash = model::fnv1a(bytemuck_ids(&refcheck::PROMPT_IDS));
     crate::ktrace::log_fmt(format_args!(
         "cortex.infer: model_hash={model_hash:#018x} seed=0 input_hash={input_hash:#018x} prompt_len={}",
@@ -239,11 +243,23 @@ pub fn model_module() -> Option<&'static [u8]> {
         .map(|m| m.data())
 }
 
-/// aarch64 has no Limine boot module yet, so no model is bundled: the agent
-/// OS (Synapse/Persona/shell) runs, but `infer` reports no model. Loading a
-/// GGUF on the `-M virt -kernel` boot path (e.g. via `-initrd` / a DTB region)
-/// is future work.
+/// aarch64: the model is placed in RAM by QEMU's `-device loader` at a fixed
+/// physical address (there is no Limine on the `-M virt -kernel` boot path).
+/// We expose it as a slice bounded by the region between the model base and
+/// the heap, and only if the GGUF magic is present (so `infer` cleanly reports
+/// "no model" when none was loaded). The GGUF parser reads only within the
+/// actual file; the generous upper bound just needs to cover it.
 #[cfg(not(target_arch = "x86_64"))]
 pub fn model_module() -> Option<&'static [u8]> {
-    None
+    const MODEL_ADDR: usize = 0x4800_0000;
+    const MODEL_MAX: usize = 0x3800_0000; // 896 MiB, up to the heap at 0x80000000
+    // SAFETY: `MODEL_ADDR` is identity-mapped normal RAM (arch::aarch64::mmu);
+    // reading 4 bytes to check the magic is always in bounds.
+    let magic = unsafe { core::slice::from_raw_parts(MODEL_ADDR as *const u8, 4) };
+    if magic != b"GGUF" {
+        return None;
+    }
+    // SAFETY: the region [MODEL_ADDR, MODEL_ADDR + MODEL_MAX) is mapped RAM
+    // below the heap; the GGUF parser reads only the real model within it.
+    Some(unsafe { core::slice::from_raw_parts(MODEL_ADDR as *const u8, MODEL_MAX) })
 }
