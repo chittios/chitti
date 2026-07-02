@@ -17,6 +17,14 @@
 pub const QK: usize = 32; // elements per quantization block (both Q4_0/Q8_0)
 pub const Q8_0_BLOCK_BYTES: usize = 2 + QK; // f16 scale + 32 i8
 pub const Q4_0_BLOCK_BYTES: usize = 2 + QK / 2; // f16 scale + 16 packed nibbles
+pub const Q4_1_BLOCK_BYTES: usize = 2 + 2 + QK / 2; // f16 d + f16 min + 16 nibbles
+
+// k-quant super-block: 256 elements. Byte layouts verbatim from llama.cpp
+// (ggml-common.h). Used by the mixed-quant Qwen3.5-9B GGUF (ssm_out=Q5_K,
+// output=Q6_K); the 0.8B model uses none of these.
+pub const QK_K: usize = 256;
+pub const Q5_K_BLOCK_BYTES: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2; // d,dmin,scales[12],qh[32],qs[128] = 176
+pub const Q6_K_BLOCK_BYTES: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2; // ql[128],qh[64],scales[16],d = 210
 
 /// Convert an IEEE-754 half (as raw bits) to `f32`, purely by bit
 /// manipulation (no `std` transcendentals). Exact: every `f16` value is
@@ -75,6 +83,103 @@ pub fn dequant_q4_0_block(block: &[u8], out: &mut [f32]) {
         let hi = (byte >> 4) as i32 - 8;
         out[j] = d * lo as f32;
         out[j + QK / 2] = d * hi as f32;
+    }
+}
+
+/// Dequantize one Q4_1 block (`Q4_1_BLOCK_BYTES`) into 32 `f32`s. Like Q4_0 but
+/// with an affine `min`: `x = d*nibble + m` (nibbles unsigned 0..15, no -8).
+pub fn dequant_q4_1_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), Q4_1_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK);
+    let d = read_f16_le(&block[0..2]);
+    let m = read_f16_le(&block[2..4]);
+    for j in 0..QK / 2 {
+        let byte = block[4 + j];
+        out[j] = d * (byte & 0x0f) as f32 + m;
+        out[j + QK / 2] = d * (byte >> 4) as f32 + m;
+    }
+}
+
+/// `get_scale_min_k4` (llama.cpp): unpack the 6-bit scale + 6-bit min for
+/// sub-block `j` (0..8) from a Q4_K/Q5_K block's 12 packed scale bytes.
+#[inline]
+fn q_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        (
+            (q[j + 4] & 0x0f) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
+    }
+}
+
+/// Dequantize one Q5_K super-block (`Q5_K_BLOCK_BYTES`) into 256 `f32`s, per
+/// llama.cpp `dequantize_row_q5_K`: `d`/`dmin` (f16), 8 packed sub-block
+/// scale/min pairs, a 5th bit per quant in `qh`, and 4-bit `qs`.
+pub fn dequant_q5_k_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), Q5_K_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK_K);
+    let d = read_f16_le(&block[0..2]);
+    let dmin = read_f16_le(&block[2..4]);
+    let scales = &block[4..16]; // 12 bytes
+    let qh = &block[16..48]; // 32 bytes (1 bit / element)
+    let qs = &block[48..176]; // 128 bytes (4 bits / element)
+    let mut is = 0usize;
+    let mut u1 = 1u8;
+    let mut u2 = 2u8;
+    let mut y = 0usize; // output offset (steps by 64)
+    let mut ql = 0usize; // qs offset (steps by 32)
+    for _ in 0..QK_K / 64 {
+        let (sc1, m1s) = q_scale_min_k4(is, scales);
+        let (sc2, m2s) = q_scale_min_k4(is + 1, scales);
+        let d1 = d * sc1 as f32;
+        let m1 = dmin * m1s as f32;
+        let d2 = d * sc2 as f32;
+        let m2 = dmin * m2s as f32;
+        for l in 0..32 {
+            let hi1 = if qh[l] & u1 != 0 { 16.0 } else { 0.0 };
+            out[y + l] = d1 * ((qs[ql + l] & 0x0f) as f32 + hi1) - m1;
+        }
+        for l in 0..32 {
+            let hi2 = if qh[l] & u2 != 0 { 16.0 } else { 0.0 };
+            out[y + 32 + l] = d2 * ((qs[ql + l] >> 4) as f32 + hi2) - m2;
+        }
+        y += 64;
+        ql += 32;
+        is += 2;
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+}
+
+/// Dequantize one Q6_K super-block (`Q6_K_BLOCK_BYTES`) into 256 `f32`s, per
+/// llama.cpp `dequantize_row_q6_K`: 4-bit `ql` + 2-bit `qh` = 6-bit signed
+/// quants (biased by -32), scaled by 16 `i8` sub-block scales and `d` (f16).
+pub fn dequant_q6_k_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), Q6_K_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK_K);
+    let ql_all = &block[0..128];
+    let qh_all = &block[128..192];
+    let sc_all = &block[192..208]; // 16 i8
+    let d = read_f16_le(&block[208..210]);
+    // Two 128-element halves; per half ql+=64, qh+=32, sc+=8.
+    for half in 0..2 {
+        let ql = &ql_all[half * 64..];
+        let qh = &qh_all[half * 32..];
+        let sc = &sc_all[half * 8..];
+        let y = half * 128;
+        for l in 0..32 {
+            let is = l / 16;
+            let q1 = (((ql[l] & 0x0f) | (((qh[l] >> 0) & 3) << 4)) as i32 - 32) as f32;
+            let q2 = (((ql[l + 32] & 0x0f) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32) as f32;
+            let q3 = (((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32 - 32) as f32;
+            let q4 = (((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32 - 32) as f32;
+            out[y + l] = d * sc[is] as i8 as f32 * q1;
+            out[y + l + 32] = d * sc[is + 2] as i8 as f32 * q2;
+            out[y + l + 64] = d * sc[is + 4] as i8 as f32 * q3;
+            out[y + l + 96] = d * sc[is + 6] as i8 as f32 * q4;
+        }
     }
 }
 
@@ -656,6 +761,82 @@ unsafe fn matvec_q8_0_avx2(w: *const u8, x: *const f32, y: *mut f32, row_start: 
             let mut lanes = [0.0f32; 8];
             _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
             *y.add(r) = ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])) + ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]));
+        }
+    }
+}
+
+/// GGML quant type codes (subset Chitti dequantizes), matching the GGUF
+/// on-disk `ggml_type` values so a tensor's type can be carried straight
+/// through from the header.
+pub const QT_Q4_0: u32 = 2;
+pub const QT_Q4_1: u32 = 3;
+pub const QT_Q8_0: u32 = 8;
+pub const QT_Q5_K: u32 = 13;
+pub const QT_Q6_K: u32 = 14;
+
+/// Bytes per quantization block and elements per block for a quant type.
+pub fn block_layout(qt: u32) -> (usize, usize) {
+    match qt {
+        QT_Q4_0 => (Q4_0_BLOCK_BYTES, QK),
+        QT_Q4_1 => (Q4_1_BLOCK_BYTES, QK),
+        QT_Q8_0 => (Q8_0_BLOCK_BYTES, QK),
+        QT_Q5_K => (Q5_K_BLOCK_BYTES, QK_K),
+        QT_Q6_K => (Q6_K_BLOCK_BYTES, QK_K),
+        _ => (0, 0),
+    }
+}
+
+/// Dequantize one block of quant type `qt` into `out` (length = the type's
+/// block element count).
+pub fn dequant_block(qt: u32, block: &[u8], out: &mut [f32]) {
+    match qt {
+        QT_Q4_0 => dequant_q4_0_block(block, out),
+        QT_Q4_1 => dequant_q4_1_block(block, out),
+        QT_Q8_0 => dequant_q8_0_block(block, out),
+        QT_Q5_K => dequant_q5_k_block(block, out),
+        QT_Q6_K => dequant_q6_k_block(block, out),
+        _ => {}
+    }
+}
+
+/// Generic `y[r] = W[r] · x` over rows `[row_start, row_end)` for any supported
+/// quant type: dequantize each weight block to `f32` and dot it against the
+/// matching `x` window, accumulating. Correct for every type (the fallback for
+/// the mixed-quant 9B's Q4_0/Q4_1/Q5_K/Q6_K tensors); Q8_0 has a faster SDOT
+/// path elsewhere. `n_cols` must be a multiple of the type's block element
+/// count.
+///
+/// # Safety
+/// `w` = `n_rows` rows of `n_cols/elems` blocks of `qt`; `x` = `n_cols` f32;
+/// `y` = `n_rows` f32; `row_start <= row_end <= n_rows`. Rows written disjointly.
+pub unsafe fn matvec_quant_rows(
+    qt: u32,
+    w: *const u8,
+    x: *const f32,
+    y: *mut f32,
+    row_start: usize,
+    row_end: usize,
+    n_cols: usize,
+) {
+    let (block_bytes, elems) = block_layout(qt);
+    if block_bytes == 0 {
+        return;
+    }
+    let blocks = n_cols / elems;
+    let row_bytes = blocks * block_bytes;
+    let mut buf = [0.0f32; QK_K]; // holds one dequantized block (32 or 256)
+    // SAFETY: caller's contract; every slice below is in bounds.
+    unsafe {
+        for r in row_start..row_end {
+            let row = core::slice::from_raw_parts(w.add(r * row_bytes), row_bytes);
+            let mut acc = 0.0f32;
+            for b in 0..blocks {
+                let block = &row[b * block_bytes..(b + 1) * block_bytes];
+                dequant_block(qt, block, &mut buf[..elems]);
+                let xb = core::slice::from_raw_parts(x.add(b * elems), elems);
+                acc += dot_f32(&buf[..elems], xb);
+            }
+            *y.add(r) = acc;
         }
     }
 }

@@ -49,6 +49,10 @@ struct Job {
     n_cols: AtomicUsize,
     m_count: AtomicUsize, // activation columns (1 = decode matvec, >1 = batched prefill)
     n_rows: AtomicUsize,  // total rows (the `y` column stride)
+    // Generic (non-Q8_0) mode: `qtype` != 0 selects `matvec_quant_rows` over the
+    // f32 activation `xf`; `qtype` == 0 is the Q8_0 SDOT matmul over `xq`/`xs`.
+    qtype: AtomicUsize,
+    xf: AtomicPtr<f32>,
     row_start: [AtomicUsize; MAX_CPUS],
     row_end: [AtomicUsize; MAX_CPUS],
     go: AtomicU64,
@@ -62,6 +66,8 @@ static JOB: Job = Job {
     n_cols: AtomicUsize::new(0),
     m_count: AtomicUsize::new(1),
     n_rows: AtomicUsize::new(0),
+    qtype: AtomicUsize::new(0),
+    xf: AtomicPtr::new(core::ptr::null_mut()),
     row_start: [const { AtomicUsize::new(0) }; MAX_CPUS],
     row_end: [const { AtomicUsize::new(0) }; MAX_CPUS],
     go: AtomicU64::new(0),
@@ -191,12 +197,17 @@ fn worker_loop(slot: usize) -> ! {
             let n_cols = JOB.n_cols.load(Ordering::Relaxed);
             let m_count = JOB.m_count.load(Ordering::Relaxed);
             let n_rows = JOB.n_rows.load(Ordering::Relaxed);
+            let qtype = JOB.qtype.load(Ordering::Relaxed);
             // SAFETY: the BSP guarantees (via the `go` release/acquire) that the
             // operands are published and this slot's [rs, re) is in bounds and
             // disjoint from every other core's range, so the writes to `y` don't
             // alias. The weights/activation are read-only during the pass.
             unsafe {
-                tensor::matmul_q8_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols);
+                if qtype == 0 {
+                    tensor::matmul_q8_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols);
+                } else {
+                    tensor::matvec_quant_rows(qtype as u32, w, JOB.xf.load(Ordering::Relaxed), y, rs, re, n_cols);
+                }
             }
         }
         DONE[slot].store(g, Ordering::Release);
@@ -238,6 +249,7 @@ pub unsafe fn matmul_sdot(
     JOB.n_cols.store(n_cols, Ordering::Relaxed);
     JOB.m_count.store(m_count, Ordering::Relaxed);
     JOB.n_rows.store(n_rows, Ordering::Relaxed);
+    JOB.qtype.store(0, Ordering::Relaxed); // Q8_0 SDOT mode
     for s in 0..workers {
         JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
         JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
@@ -251,6 +263,44 @@ pub unsafe fn matmul_sdot(
     unsafe { tensor::matmul_q8_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, boundary(1), n_cols) };
 
     // Barrier: wait for every worker to finish this generation.
+    for s in 0..workers {
+        while DONE[s].load(Ordering::Acquire) != g {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Run a generic (non-Q8_0) `Q*`-quant matvec `y = W · x` (f32 activation `x`)
+/// across all online cores by row range, dequantizing each block on the fly
+/// (`tensor::matvec_quant_rows`). Used for the mixed-quant 9B's Q4_0/Q4_1/Q5_K/
+/// Q6_K tensors. Falls back to single-core when only the BSP is online or the
+/// matrix is small.
+///
+/// # Safety
+/// Same contract as `tensor::matvec_quant_rows` over `[0, n_rows)`.
+pub unsafe fn matvec_quant(qt: u32, w: *const u8, x: *const f32, y: *mut f32, n_rows: usize, n_cols: usize) {
+    let workers = N_WORKERS.load(Ordering::Relaxed);
+    if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
+        // SAFETY: caller's contract; whole range on this core.
+        unsafe { tensor::matvec_quant_rows(qt, w, x, y, 0, n_rows, n_cols) };
+        return;
+    }
+    let n_parts = workers + 1;
+    let boundary = |k: usize| k * n_rows / n_parts;
+    JOB.w.store(w as *mut u8, Ordering::Relaxed);
+    JOB.xf.store(x as *mut f32, Ordering::Relaxed);
+    JOB.y.store(y, Ordering::Relaxed);
+    JOB.n_cols.store(n_cols, Ordering::Relaxed);
+    JOB.n_rows.store(n_rows, Ordering::Relaxed);
+    JOB.qtype.store(qt as usize, Ordering::Relaxed); // generic mode
+    for s in 0..workers {
+        JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
+    }
+    let g = JOB.go.load(Ordering::Relaxed) + 1;
+    JOB.go.store(g, Ordering::Release);
+    // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    unsafe { tensor::matvec_quant_rows(qt, w, x, y, 0, boundary(1), n_cols) };
     for s in 0..workers {
         while DONE[s].load(Ordering::Acquire) != g {
             core::hint::spin_loop();
