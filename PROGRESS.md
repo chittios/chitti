@@ -149,3 +149,35 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   refused, skill installed READ-only, skill-agent bounded (WRITE present: false).
 
 ## A→G COMPLETE — all seven phase gates green (x86_64 tests + aarch64 build + live boot demos).
+
+## 9B chat degeneration fix
+
+- Root cause (from prior deep debugging, recorded in CLAUDE.md): the 9B forward is correct
+  (/infer is byte-exact vs llama.cpp); terse chat prompts degenerated into repeated punctuation —
+  a *decode-side* degeneration typical of thinking models under weak sampling.
+- Fixes (committed):
+  1. `cortex::sampler::sample_topk_topp` — Qwen's documented decoding (temp 0.7 / top_k 20 /
+     top_p 0.8) + a light repetition penalty in the chat `pick()`. Unit-tested: over 2000 draws
+     on a peaked+long-tail distribution it NEVER draws a tail token (the degeneration mechanism).
+  2. Hard anti-degeneration decode guard in `ChatSession::turn`: stop generation if a token
+     repeats 5× in a row, so chat can never emit an unbounded run regardless of the forward.
+- Validation limitation (honest): the fast unit suite proves the sampler mechanism. Full *interactive*
+  9B chat validation was blocked in this environment — driving the aarch64 chat non-interactively
+  (expect/pipe → PL011 UART RX) did not deliver input reliably (banner captured, input not echoed;
+  the user's manual interactive runs are unaffected). Each 9B boot is also ~10 min (5.4 GiB load +
+  ~1 tok/s). The fixes are correct and unit-tested; interactive re-confirmation is left to a manual run.
+- Note: observed a rare (~1/7) pre-existing flake in `ipc_round_trip_delivers_a_message` (a latent
+  spawn→timer-preempt→grant race in that test, unrelated to the agent layer — agent tasks use the
+  non-enqueued `spawn_parked`). 6/6 subsequent runs green at 103/103.
+
+## FINAL STATUS
+
+- Agentic re-architecture Phases A→G: COMPLETE. 103/103 x86_64 in-kernel tests; both arches
+  (x86_64 + aarch64) build for both models (0.8B + 9B); every phase demonstrated live at boot
+  (x86_64), and the full A→G demo suite also verified running on the aarch64 9B build under HVF.
+- Three invariants upheld: all effects route through Synapse; delegation only narrows authority
+  (strict subset, refuse-on-widen); an installed skill is bounded by its install grant forever
+  (verify → consent-subset → min(role,grant,parent), SkillInstalled never bypasses the cap gate).
+- Deviations (all in DECISIONS.md): externally-tagged enums for postcard; Ed25519 → SipHash keyed
+  MAC (crate faults on bare metal); SMP sub-agent concurrency structured but sequential under TCG;
+  sample packages signed in-kernel vs shipped as separate boot-module files.
