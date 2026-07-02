@@ -15,14 +15,19 @@
 //! One token per `forward` call; deltanet layers carry a recurrent state +
 //! conv ring in `Cache`, attention layers carry a KV history. Deterministic.
 
-use super::gguf::{Config, Gguf, GgufError, GGML_TYPE_F32, GGML_TYPE_Q8_0};
+use super::gguf::{Config, Gguf, GgufError, GGML_TYPE_F32};
 use super::tensor::{self, QK};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-fn q8_0_bytes(n_cols: usize, n_rows: usize) -> usize {
-    n_rows * (n_cols / QK) * tensor::Q8_0_BLOCK_BYTES
+/// A quantized weight tensor: its raw bytes plus the GGUF quant type, so the
+/// matvec can pick the right kernel per tensor (the 9B GGUF mixes Q4_0, Q4_1,
+/// Q8_0, Q5_K and Q6_K; the 0.8B is all Q8_0).
+#[derive(Clone, Copy)]
+struct QWeight<'a> {
+    data: &'a [u8],
+    qt: u32,
 }
 
 fn f32_tensor<'a>(g: &Gguf<'a>, name: &str, n: usize) -> Result<&'a [f32], GgufError> {
@@ -35,34 +40,62 @@ fn f32_tensor<'a>(g: &Gguf<'a>, name: &str, n: usize) -> Result<&'a [f32], GgufE
     Ok(unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const f32, n) })
 }
 
-fn q8_tensor<'a>(g: &Gguf<'a>, name: &str, n_cols: usize, n_rows: usize) -> Result<&'a [u8], GgufError> {
-    let info = g.tensor(name)?;
-    if info.ggml_type != GGML_TYPE_Q8_0 {
-        return Err(GgufError::MissingTensor);
+/// Load a quantized weight of any supported type: read its `ggml_type`, compute
+/// the on-disk byte size from the type's block layout, validate, and return the
+/// bytes tagged with the type.
+fn qtensor<'a>(g: &Gguf<'a>, name: &str, n_cols: usize, n_rows: usize) -> Result<QWeight<'a>, GgufError> {
+    let qt = g.tensor(name)?.ggml_type;
+    let (block_bytes, elems) = tensor::block_layout(qt);
+    if block_bytes == 0 || n_cols % elems != 0 {
+        return Err(GgufError::MissingTensor); // unsupported quant / bad shape
     }
-    g.tensor_bytes(name, q8_0_bytes(n_cols, n_rows))
+    let bytes = n_rows * (n_cols / elems) * block_bytes;
+    Ok(QWeight { data: g.tensor_bytes(name, bytes)?, qt })
+}
+
+/// Dispatch one matvec `y = W · x` by the weight's quant type: Q8_0 takes the
+/// fast int8-SDOT (+ SMP, batched-capable) path; every other type takes the
+/// generic dequant-and-dot path (still row-split across cores on aarch64).
+fn matvec_qw(qw: QWeight, x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &mut [f32], n_rows: usize, n_cols: usize) {
+    if qw.qt == tensor::QT_Q8_0 {
+        tensor::matvec_q8_0_fast(qw.data, x, y, xq, xs, n_rows, n_cols);
+        return;
+    }
+    debug_assert_eq!(x.len(), n_cols);
+    debug_assert_eq!(y.len(), n_rows);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `qw.data` holds `n_rows` rows for `qw.qt`/`n_cols` (validated at
+    // load); `x`/`y` are `n_cols`/`n_rows`.
+    unsafe {
+        crate::arch::aarch64::smp::matvec_quant(qw.qt, qw.data.as_ptr(), x.as_ptr(), y.as_mut_ptr(), n_rows, n_cols);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    // SAFETY: same contract; single-core generic path.
+    unsafe {
+        tensor::matvec_quant_rows(qw.qt, qw.data.as_ptr(), x.as_ptr(), y.as_mut_ptr(), 0, n_rows, n_cols);
+    }
 }
 
 /// Per-layer weights; one of the two variants depending on layer type.
 enum LayerKind<'a> {
     Attn {
-        q: &'a [u8],   // [dim -> n_head*head_dim*2] (query+gate interleaved)
-        k: &'a [u8],   // [dim -> n_kv*head_dim]
-        v: &'a [u8],
-        o: &'a [u8],   // [n_head*head_dim -> dim]
+        q: QWeight<'a>, // [dim -> n_head*head_dim*2] (query+gate interleaved)
+        k: QWeight<'a>, // [dim -> n_kv*head_dim]
+        v: QWeight<'a>,
+        o: QWeight<'a>, // [n_head*head_dim -> dim]
         q_norm: &'a [f32],
         k_norm: &'a [f32],
     },
     Delta {
-        qkv: &'a [u8],       // [dim -> conv_dim]
-        gate: &'a [u8],      // [dim -> value_dim]  (z)
+        qkv: QWeight<'a>,    // [dim -> conv_dim]
+        gate: QWeight<'a>,   // [dim -> value_dim]  (z)
         conv1d: &'a [f32],   // [conv_dim * conv_kernel], tap j of channel c at c*K+j
         dt_bias: &'a [f32],  // [n_v_heads]
         a_log: &'a [f32],    // [n_v_heads]
-        alpha: &'a [u8],     // [dim -> n_v_heads]
-        beta: &'a [u8],      // [dim -> n_v_heads]
+        alpha: QWeight<'a>,  // [dim -> n_v_heads]
+        beta: QWeight<'a>,   // [dim -> n_v_heads]
         norm: &'a [f32],     // [head_v_dim]
-        out: &'a [u8],       // [value_dim -> dim]
+        out: QWeight<'a>,    // [value_dim -> dim]
     },
 }
 
@@ -70,18 +103,24 @@ struct Layer<'a> {
     attn_norm: &'a [f32],
     post_norm: &'a [f32],
     kind: LayerKind<'a>,
-    ffn_gate: &'a [u8],
-    ffn_up: &'a [u8],
-    ffn_down: &'a [u8],
+    ffn_gate: QWeight<'a>,
+    ffn_up: QWeight<'a>,
+    ffn_down: QWeight<'a>,
 }
 
 pub struct Model<'a> {
     pub config: Config,
     gguf: Gguf<'a>,
-    token_embd: &'a [u8], // Q8_0 [dim, vocab] -- also the tied output
+    token_embd: QWeight<'a>, // [dim, vocab] -- also the tied output when `output` is None
+    output: Option<QWeight<'a>>, // separate (untied) output projection, if present
     output_norm: &'a [f32],
     layers: Vec<Layer<'a>>,
     vocab: usize,
+    /// True when every weight tensor is Q8_0 (the 0.8B) -- enables the
+    /// Q8_0-only batched prefill; mixed-quant models (9B) prefill sequentially.
+    /// Only consulted on aarch64 (the arch with batched prefill).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    all_q8_0: bool,
 }
 
 /// Reusable per-forward scratch (no per-token allocation).
@@ -227,7 +266,9 @@ impl<'a> Model<'a> {
         let value_dim = c.ssm_inner;
         let head_v = c.ssm_head_dim();
 
-        let token_embd = q8_tensor(&gguf, "token_embd.weight", dim, vocab)?;
+        let token_embd = qtensor(&gguf, "token_embd.weight", dim, vocab)?;
+        // Untied output projection if the GGUF has one (the 9B); else tied.
+        let output = qtensor(&gguf, "output.weight", dim, vocab).ok();
         let output_norm = f32_tensor(&gguf, "output_norm.weight", dim)?;
 
         let mut layers = Vec::with_capacity(c.block_count);
@@ -235,37 +276,54 @@ impl<'a> Model<'a> {
             let n = |s: &str| format!("blk.{l}.{s}");
             let kind = if c.is_attention_layer(l) {
                 LayerKind::Attn {
-                    q: q8_tensor(&gguf, &n("attn_q.weight"), dim, attn_q_dim)?,
-                    k: q8_tensor(&gguf, &n("attn_k.weight"), dim, kv_dim)?,
-                    v: q8_tensor(&gguf, &n("attn_v.weight"), dim, kv_dim)?,
-                    o: q8_tensor(&gguf, &n("attn_output.weight"), attn_o_in, dim)?,
+                    q: qtensor(&gguf, &n("attn_q.weight"), dim, attn_q_dim)?,
+                    k: qtensor(&gguf, &n("attn_k.weight"), dim, kv_dim)?,
+                    v: qtensor(&gguf, &n("attn_v.weight"), dim, kv_dim)?,
+                    o: qtensor(&gguf, &n("attn_output.weight"), attn_o_in, dim)?,
                     q_norm: f32_tensor(&gguf, &n("attn_q_norm.weight"), head_dim)?,
                     k_norm: f32_tensor(&gguf, &n("attn_k_norm.weight"), head_dim)?,
                 }
             } else {
                 LayerKind::Delta {
-                    qkv: q8_tensor(&gguf, &n("attn_qkv.weight"), dim, conv_dim)?,
-                    gate: q8_tensor(&gguf, &n("attn_gate.weight"), dim, value_dim)?,
+                    qkv: qtensor(&gguf, &n("attn_qkv.weight"), dim, conv_dim)?,
+                    gate: qtensor(&gguf, &n("attn_gate.weight"), dim, value_dim)?,
                     conv1d: f32_tensor(&gguf, &n("ssm_conv1d.weight"), conv_dim * c.ssm_conv_kernel)?,
                     dt_bias: f32_tensor(&gguf, &n("ssm_dt.bias"), c.ssm_dt_rank)?,
                     a_log: f32_tensor(&gguf, &n("ssm_a"), c.ssm_dt_rank)?,
-                    alpha: q8_tensor(&gguf, &n("ssm_alpha.weight"), dim, c.ssm_dt_rank)?,
-                    beta: q8_tensor(&gguf, &n("ssm_beta.weight"), dim, c.ssm_dt_rank)?,
+                    alpha: qtensor(&gguf, &n("ssm_alpha.weight"), dim, c.ssm_dt_rank)?,
+                    beta: qtensor(&gguf, &n("ssm_beta.weight"), dim, c.ssm_dt_rank)?,
                     norm: f32_tensor(&gguf, &n("ssm_norm.weight"), head_v)?,
-                    out: q8_tensor(&gguf, &n("ssm_out.weight"), value_dim, dim)?,
+                    out: qtensor(&gguf, &n("ssm_out.weight"), value_dim, dim)?,
                 }
             };
             layers.push(Layer {
                 attn_norm: f32_tensor(&gguf, &n("attn_norm.weight"), dim)?,
                 post_norm: f32_tensor(&gguf, &n("post_attention_norm.weight"), dim)?,
                 kind,
-                ffn_gate: q8_tensor(&gguf, &n("ffn_gate.weight"), dim, ffn)?,
-                ffn_up: q8_tensor(&gguf, &n("ffn_up.weight"), dim, ffn)?,
-                ffn_down: q8_tensor(&gguf, &n("ffn_down.weight"), ffn, dim)?,
+                ffn_gate: qtensor(&gguf, &n("ffn_gate.weight"), dim, ffn)?,
+                ffn_up: qtensor(&gguf, &n("ffn_up.weight"), dim, ffn)?,
+                ffn_down: qtensor(&gguf, &n("ffn_down.weight"), ffn, dim)?,
             });
         }
 
-        Ok(Self { config: c, gguf, token_embd, output_norm, layers, vocab })
+        // All-Q8_0 (0.8B) unlocks the batched-prefill fast path; mixed-quant
+        // models fall back to sequential prefill.
+        let q8 = |w: QWeight| w.qt == tensor::QT_Q8_0;
+        let all_q8_0 = q8(token_embd)
+            && output.map(q8).unwrap_or(true)
+            && layers.iter().all(|ly| {
+                q8(ly.ffn_gate)
+                    && q8(ly.ffn_up)
+                    && q8(ly.ffn_down)
+                    && match ly.kind {
+                        LayerKind::Attn { q, k, v, o, .. } => q8(q) && q8(k) && q8(v) && q8(o),
+                        LayerKind::Delta { qkv, gate, alpha, beta, out, .. } => {
+                            q8(qkv) && q8(gate) && q8(alpha) && q8(beta) && q8(out)
+                        }
+                    }
+            });
+
+        Ok(Self { config: c, gguf, token_embd, output, output_norm, layers, vocab, all_q8_0 })
     }
 
     pub fn vocab(&self) -> usize {
@@ -294,7 +352,7 @@ impl<'a> Model<'a> {
         // cores -- just far less weight bandwidth. x86 (TCG, no batched matmul
         // kernel) uses the sequential path; prefill still works, just slower.
         #[cfg(target_arch = "aarch64")]
-        if prompt.len() >= 2 {
+        if prompt.len() >= 2 && self.all_q8_0 {
             self.prefill_batched(prompt, pos0, cache, state);
             return;
         }
@@ -346,9 +404,8 @@ impl<'a> Model<'a> {
         let mut xs = alloc::vec![0.0f32; m * (max_cols / QK)];
 
         // Embeddings for all positions.
-        let row_bytes = (dim / QK) * tensor::Q8_0_BLOCK_BYTES;
         for (mi, &tok) in prompt.iter().enumerate() {
-            dequant_row_q8_0(&self.token_embd[tok * row_bytes..(tok + 1) * row_bytes], &mut hidden[mi * dim..(mi + 1) * dim]);
+            dequant_embed_row(self.token_embd, tok, &mut hidden[mi * dim..(mi + 1) * dim]);
         }
 
         for l in 0..self.layers.len() {
@@ -412,7 +469,8 @@ impl<'a> Model<'a> {
         // Only the final position's logits are needed to pick the first token.
         let last = m - 1;
         tensor::rmsnorm(&hidden[last * dim..(last + 1) * dim], self.output_norm, c.rms_eps, &mut s.norm);
-        tensor::matvec_q8_0_fast(self.token_embd, &s.norm, &mut s.logits, &mut s.xq, &mut s.xs, self.vocab, dim);
+        let out_w = self.output.unwrap_or(self.token_embd);
+        matvec_qw(out_w, &s.norm, &mut s.logits, &mut s.xq, &mut s.xs, self.vocab, dim);
         cache.positions = cache.positions.max(pos0 + m);
     }
 
@@ -421,7 +479,8 @@ impl<'a> Model<'a> {
     /// weight once and writes `out[mi*rows + r]`. `xq`/`xs` are packed tightly
     /// with stride `cols`/`cols/QK` (the layout `matmul_q8_0_sdot_rows` expects).
     #[cfg(target_arch = "aarch64")]
-    fn batched_proj(&self, w: &[u8], input: &[f32], out: &mut [f32], xq: &mut [i8], xs: &mut [f32], m: usize, rows: usize, cols: usize) {
+    fn batched_proj(&self, w: QWeight, input: &[f32], out: &mut [f32], xq: &mut [i8], xs: &mut [f32], m: usize, rows: usize, cols: usize) {
+        debug_assert_eq!(w.qt, tensor::QT_Q8_0); // batched prefill is Q8_0-only (all_q8_0)
         let nb = cols / QK;
         for mi in 0..m {
             tensor::quantize_activations_q8(
@@ -434,7 +493,7 @@ impl<'a> Model<'a> {
         // activations of `cols`/`nb`; `out` has `m*rows` slots. matmul_sdot
         // splits `[0,rows)` across cores, each writing a disjoint row range.
         unsafe {
-            crate::arch::aarch64::smp::matmul_sdot(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols);
+            crate::arch::aarch64::smp::matmul_sdot(w.data.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols);
         }
     }
 
@@ -449,8 +508,7 @@ impl<'a> Model<'a> {
         let c = &self.config;
         let dim = c.embedding_length;
 
-        let row_bytes = (dim / QK) * tensor::Q8_0_BLOCK_BYTES;
-        dequant_row_q8_0(&self.token_embd[token * row_bytes..(token + 1) * row_bytes], &mut s.hidden);
+        dequant_embed_row(self.token_embd, token, &mut s.hidden);
 
         for l in 0..self.layers.len() {
             s.residual.copy_from_slice(&s.hidden);
@@ -467,10 +525,10 @@ impl<'a> Model<'a> {
             s.residual.copy_from_slice(&s.hidden);
             tensor::rmsnorm(&s.hidden, self.layers[l].post_norm, c.rms_eps, &mut s.norm);
             let ffn = c.feed_forward_length;
-            tensor::matvec_q8_0_fast(self.layers[l].ffn_gate, &s.norm, &mut s.ffn_gate, &mut s.xq, &mut s.xs, ffn, dim);
-            tensor::matvec_q8_0_fast(self.layers[l].ffn_up, &s.norm, &mut s.ffn_up, &mut s.xq, &mut s.xs, ffn, dim);
+            matvec_qw(self.layers[l].ffn_gate, &s.norm, &mut s.ffn_gate, &mut s.xq, &mut s.xs, ffn, dim);
+            matvec_qw(self.layers[l].ffn_up, &s.norm, &mut s.ffn_up, &mut s.xq, &mut s.xs, ffn, dim);
             tensor::silu_mul(&s.ffn_gate, &s.ffn_up, &mut s.ffn_act);
-            tensor::matvec_q8_0_fast(self.layers[l].ffn_down, &s.ffn_act, &mut s.proj, &mut s.xq, &mut s.xs, dim, ffn);
+            matvec_qw(self.layers[l].ffn_down, &s.ffn_act, &mut s.proj, &mut s.xq, &mut s.xs, dim, ffn);
             for i in 0..dim {
                 s.hidden[i] = s.residual[i] + s.proj[i];
             }
@@ -478,7 +536,9 @@ impl<'a> Model<'a> {
 
         if need_logits {
             tensor::rmsnorm(&s.hidden, self.output_norm, c.rms_eps, &mut s.norm);
-            tensor::matvec_q8_0_fast(self.token_embd, &s.norm, &mut s.logits, &mut s.xq, &mut s.xs, self.vocab, dim);
+            // Untied output projection if present (9B), else the tied embeddings.
+            let out_w = self.output.unwrap_or(self.token_embd);
+            matvec_qw(out_w, &s.norm, &mut s.logits, &mut s.xq, &mut s.xs, self.vocab, dim);
         }
 
         cache.positions = cache.positions.max(pos + 1);
@@ -497,14 +557,14 @@ impl<'a> Model<'a> {
         };
 
         // Projections into s.q (query+gate interleaved), s.k, s.v.
-        tensor::matvec_q8_0_fast(q_w, &s.norm, &mut s.q, &mut s.xq, &mut s.xs, nq * hd * 2, dim);
-        tensor::matvec_q8_0_fast(k_w, &s.norm, &mut s.k, &mut s.xq, &mut s.xs, kv_dim, dim);
-        tensor::matvec_q8_0_fast(v_w, &s.norm, &mut s.v, &mut s.xq, &mut s.xs, kv_dim, dim);
+        matvec_qw(q_w, &s.norm, &mut s.q, &mut s.xq, &mut s.xs, nq * hd * 2, dim);
+        matvec_qw(k_w, &s.norm, &mut s.k, &mut s.xq, &mut s.xs, kv_dim, dim);
+        matvec_qw(v_w, &s.norm, &mut s.v, &mut s.xq, &mut s.xs, kv_dim, dim);
 
         // Sequential (recurrent/causal) core: consumes s.q/s.k/s.v, writes s.attn_out.
         self.attn_core(l, pos, cache, s);
 
-        tensor::matvec_q8_0_fast(o_w, &s.attn_out, &mut s.proj, &mut s.xq, &mut s.xs, dim, nq * hd);
+        matvec_qw(o_w, &s.attn_out, &mut s.proj, &mut s.xq, &mut s.xs, dim, nq * hd);
     }
 
     /// The position-sequential part of an attention layer, shared by decode
@@ -578,15 +638,15 @@ impl<'a> Model<'a> {
             _ => unreachable!(),
         };
 
-        tensor::matvec_q8_0_fast(qkv_w, &s.norm, &mut s.qkv, &mut s.xq, &mut s.xs, conv_dim, dim);
-        tensor::matvec_q8_0_fast(gate_w, &s.norm, &mut s.z, &mut s.xq, &mut s.xs, value_dim, dim);
-        tensor::matvec_q8_0_fast(alpha_w, &s.norm, &mut s.gates, &mut s.xq, &mut s.xs, nh, dim); // reuse gates as alpha
-        tensor::matvec_q8_0_fast(beta_w, &s.norm, &mut s.betas, &mut s.xq, &mut s.xs, nh, dim);
+        matvec_qw(qkv_w, &s.norm, &mut s.qkv, &mut s.xq, &mut s.xs, conv_dim, dim);
+        matvec_qw(gate_w, &s.norm, &mut s.z, &mut s.xq, &mut s.xs, value_dim, dim);
+        matvec_qw(alpha_w, &s.norm, &mut s.gates, &mut s.xq, &mut s.xs, nh, dim); // reuse gates as alpha
+        matvec_qw(beta_w, &s.norm, &mut s.betas, &mut s.xq, &mut s.xs, nh, dim);
 
         // Sequential (recurrent) core: consumes s.qkv/s.z/s.gates/s.betas, writes s.delta_o.
         self.delta_core(l, cache, s);
 
-        tensor::matvec_q8_0_fast(out_w, &s.delta_o, &mut s.proj, &mut s.xq, &mut s.xs, dim, value_dim);
+        matvec_qw(out_w, &s.delta_o, &mut s.proj, &mut s.xq, &mut s.xs, dim, value_dim);
     }
 
     /// The position-sequential (recurrent) part of a DeltaNet layer, shared by
@@ -680,11 +740,19 @@ impl<'a> Model<'a> {
     }
 }
 
-fn dequant_row_q8_0(row: &[u8], out: &mut [f32]) {
-    let blocks = out.len() / QK;
+/// Dequantize embedding row `tok` of `qw` (`n=out.len()` columns) into `out`,
+/// for any supported quant type (the 9B's token_embd is Q4_0, the 0.8B's is
+/// Q8_0). Reads exactly one row from the weight bytes.
+fn dequant_embed_row(qw: QWeight, tok: usize, out: &mut [f32]) {
+    let n = out.len();
+    let (block_bytes, elems) = tensor::block_layout(qw.qt);
+    let blocks = n / elems;
+    let row_bytes = blocks * block_bytes;
+    let row = &qw.data[tok * row_bytes..(tok + 1) * row_bytes];
+    let mut buf = [0.0f32; tensor::QK_K];
     for b in 0..blocks {
-        let block = &row[b * tensor::Q8_0_BLOCK_BYTES..(b + 1) * tensor::Q8_0_BLOCK_BYTES];
-        tensor::dequant_q8_0_block(block, &mut out[b * QK..(b + 1) * QK]);
+        tensor::dequant_block(qw.qt, &row[b * block_bytes..(b + 1) * block_bytes], &mut buf[..elems]);
+        out[b * elems..(b + 1) * elems].copy_from_slice(&buf[..elems]);
     }
 }
 
