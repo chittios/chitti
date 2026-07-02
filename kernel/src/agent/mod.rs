@@ -67,6 +67,55 @@ pub fn demo() {
     demo_phase_d();
     demo_phase_e();
     demo_phase_f();
+    demo_phase_g();
+}
+
+/// Phase G demo: install a signed skill (refusing a tampered copy), granting
+/// only an approved capability subset, and register a skill-agent whose
+/// effective caps are bounded below the parent's by the install grant.
+#[cfg(not(test))]
+fn demo_phase_g() {
+    use crate::serial_println;
+    use crate::skills::{agent_skill, install, package};
+    serial_println!("Chitti: --- Skill installation: sign, verify, consent, bound (Phase G) ---");
+
+    // A signed plain skill; a tampered copy is refused.
+    let sid = types::next_skill_id();
+    let mut pkg = package::sample_note_summarizer(sid);
+    pkg.sign();
+    let mut tampered = pkg.clone();
+    tampered.body.push_str(" <injected instruction>");
+    let src = types::InstallSource::BootModule { name: "note-summarizer-1.0.0.skill".into() };
+    match install::install(&tampered, &tampered.manifest.requested_capabilities.clone(), "vinoth", src.clone(), orchestrator::now()) {
+        Err(e) => serial_println!("Chitti: install> tampered package REFUSED: {:?}", e),
+        Ok(_) => serial_println!("Chitti: install> BUG: tampered package accepted"),
+    }
+    // Approve only READ of the requested READ|WRITE|LIST.
+    let approved = alloc::vec![types::CapabilityRequest::new(types::CapDomain::Fs, types::Rights::READ, types::Scope::Any)];
+    match install::install(&pkg, &approved, "vinoth", src, orchestrator::now()) {
+        Ok(rec) => serial_println!(
+            "Chitti: install> '{}' verified + installed; granted {}/{} requested caps (READ only)",
+            pkg.manifest.name, rec.granted_capabilities.len(), pkg.manifest.requested_capabilities.len()
+        ),
+        Err(e) => serial_println!("Chitti: install> unexpected refusal: {:?}", e),
+    }
+
+    // A signed skill-agent, installed with a READ-only grant, is bounded below
+    // a parent that holds READ|WRITE.
+    let skill_id = types::next_skill_id();
+    let agent_id = types::next_agent_id();
+    let mut apkg = package::sample_report_agent(skill_id, agent_id);
+    apkg.sign();
+    let approved_ro = alloc::vec![types::CapabilityRequest::new(types::CapDomain::Fs, types::Rights::READ, types::Scope::Any)];
+    let _ = install::install(&apkg, &approved_ro, "vinoth", types::InstallSource::BootModule { name: "report-writer-1.0.0.skill".into() }, orchestrator::now());
+    let parent = alloc::vec![types::CapabilityRequest::new(types::CapDomain::Fs, types::Rights::READ | types::Rights::WRITE, types::Scope::Any)];
+    if let Some(eff) = agent_skill::effective_caps("report-writer-agent", &parent) {
+        let has_write = eff.iter().any(|c| c.rights.contains(types::Rights::WRITE));
+        serial_println!(
+            "Chitti: skill-agent> 'report-writer' dispatchable; effective caps = min(role, grant, parent) — WRITE present: {} (grant bounds it to READ)",
+            has_write
+        );
+    }
 }
 
 /// Phase F demo: place a skill (trusted), keep only L0 metadata until a matching

@@ -132,3 +132,20 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   builds; **live boot**: skill placed L0-only, unrelated task matched=false, matching task loads
   L1 body, bundled note_search runs through Synapse.
 - Next: Phase G — permissioned install (Ed25519 verify + consent + skill-agent) + signed packages.
+
+## Phase G — permissioned skill/agent installation  ✅
+
+- `skills/crypto.rs`: package signing/verification. (Ed25519 crate faults at runtime on bare metal
+  — see DECISIONS; swapped for a self-contained SipHash-2-4 keyed MAC, 512-bit tag.)
+- `skills/package.rs`: `sign`/`verify` over a canonical package message (manifest sans-sig + body +
+  assets), so any tampering invalidates the signature; `sample_report_agent` (signed skill-agent).
+- `skills/install.rs`: the install flow — verify → consent (approved ⊆ requested) → grant only the
+  intersection → register (body/assets/tools/index) + persist an InstallRecord; `uninstall` revokes.
+- `skills/agent_skill.rs`: installable skill-agent roles; dispatch effective caps =
+  min(role, install grant, parent) — never wider than any.
+- Gate: x86_64 `cargo xtask test` = 101/101 (6 new: crypto roundtrip + unsigned/tampered-refused,
+  approved-subset-only, skill-can't-exceed-grant [SkillInstalled doesn't bypass caps], skill-agent-
+  caps-never-widen, uninstall-revokes-and-unloads); aarch64 builds; **live boot**: tampered package
+  refused, skill installed READ-only, skill-agent bounded (WRITE present: false).
+
+## A→G COMPLETE — all seven phase gates green (x86_64 tests + aarch64 build + live boot demos).

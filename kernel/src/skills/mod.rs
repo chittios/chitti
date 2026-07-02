@@ -15,6 +15,8 @@
 //!   signature and takes consent first.
 //! * [`install`] — the permissioned install flow (Phase G).
 
+pub mod agent_skill;
+pub mod crypto;
 pub mod index;
 pub mod install;
 pub mod loader;
@@ -103,5 +105,116 @@ mod tests {
         let bytes = loader::load_asset(&mut session, id, "style-guide").expect("asset");
         assert!(alloc::string::String::from_utf8_lossy(&bytes).contains("terse"));
         assert_eq!(loader::tier(&session, id), Some(LoadTier::Full));
+    }
+
+    // ---- Phase G: permissioned install ------------------------------------
+    use crate::skills::{agent_skill, install};
+
+    /// (a) An unsigned or tampered package is refused at install; a properly
+    /// signed one installs.
+    #[test_case]
+    fn unsigned_or_tampered_package_refused() {
+        install::reset();
+        let id = next_skill_id();
+        // Unsigned (empty signature) → refused.
+        let mut pkg = package::sample_note_summarizer(id);
+        assert!(!pkg.verify(), "unsigned package must not verify");
+        let src = InstallSource::BootModule { name: "note-summarizer.skill".into() };
+        assert_eq!(
+            install::install(&pkg, &pkg.manifest.requested_capabilities.clone(), "vinoth", src.clone(), 1).unwrap_err(),
+            install::InstallError::VerificationFailed
+        );
+        // Sign, then tamper → refused.
+        pkg.sign();
+        assert!(pkg.verify(), "freshly signed package verifies");
+        let mut tampered = pkg.clone();
+        tampered.body.push_str(" <injected>");
+        assert!(!tampered.verify(), "tampering invalidates the signature");
+        assert_eq!(
+            install::install(&tampered, &tampered.manifest.requested_capabilities.clone(), "vinoth", src.clone(), 1).unwrap_err(),
+            install::InstallError::VerificationFailed
+        );
+        // Clean signed package installs.
+        assert!(install::install(&pkg, &pkg.manifest.requested_capabilities.clone(), "vinoth", src, 1).is_ok());
+    }
+
+    /// (b) Install grants only the approved subset of the requested caps.
+    #[test_case]
+    fn install_grants_only_approved_subset() {
+        install::reset();
+        let id = next_skill_id();
+        let mut pkg = package::sample_note_summarizer(id); // requests Fs READ|WRITE|LIST
+        pkg.sign();
+        assert!(install::consent_prompt(&pkg).len() >= 1, "consent prompt lists requested caps");
+        // Approve only READ.
+        let approved = alloc::vec![CapabilityRequest::new(CapDomain::Fs, Rights::READ, Scope::Any)];
+        let rec = install::install(&pkg, &approved, "vinoth", InstallSource::BootModule { name: "n.skill".into() }, 2).unwrap();
+        assert_eq!(rec.granted_capabilities.len(), 1);
+        assert!(rec.granted_capabilities[0].rights.contains(Rights::READ));
+        assert!(!rec.granted_capabilities[0].rights.contains(Rights::WRITE), "WRITE was not approved → not granted");
+        assert!(rec.verified);
+    }
+
+    /// (c) A skill body instructing a capability it was not granted is blocked
+    /// at Synapse and audited — `SkillInstalled` provenance does not bypass the
+    /// grant.
+    #[test_case]
+    fn skill_cannot_exceed_its_grant() {
+        install::reset();
+        let id = next_skill_id();
+        let mut pkg = package::sample_note_summarizer(id);
+        pkg.sign();
+        // Approve only READ (the skill body might "want" to write, but can't).
+        let approved = alloc::vec![CapabilityRequest::new(CapDomain::Fs, Rights::READ, Scope::Any)];
+        let rec = install::install(&pkg, &approved, "vinoth", InstallSource::BootModule { name: "n.skill".into() }, 3).unwrap();
+        // An agent running under exactly the install grant tries to write.
+        let mut m = manifest::orchestrator_manifest();
+        m.capabilities = rec.granted_capabilities.clone(); // Fs READ only
+        let mut orch = orchestrator::Orchestrator::spawn(m, 9);
+        let mut router = crate::tools::Router::new();
+        let before = audit::len();
+        let out = router.call(&mut orch.session, orch.caller, &tool("write", args(&[("path", "g_x"), ("content", "y")])));
+        assert!(out.is_error && out.result.contains("denied"), "write beyond grant must be denied: {}", out.result);
+        assert_eq!(audit::snapshot().last().unwrap().outcome, audit::Outcome::DeniedNoCapability);
+        assert_eq!(audit::len(), before + 1, "the denial was audited");
+    }
+
+    /// (d) A dispatched skill-agent's effective caps are the intersection with
+    /// the parent's — never wider.
+    #[test_case]
+    fn skill_agent_effective_caps_never_widen() {
+        install::reset();
+        agent_skill::reset();
+        let skill_id = next_skill_id();
+        let agent_id = next_agent_id();
+        let mut pkg = package::sample_report_agent(skill_id, agent_id); // requests Fs READ|WRITE
+        pkg.sign();
+        // Approve only READ at install.
+        let approved = alloc::vec![CapabilityRequest::new(CapDomain::Fs, Rights::READ, Scope::Any)];
+        install::install(&pkg, &approved, "vinoth", InstallSource::BootModule { name: "r.skill".into() }, 4).unwrap();
+        // Parent holds READ|WRITE, but the grant capped the skill-agent at READ.
+        let parent = alloc::vec![CapabilityRequest::new(CapDomain::Fs, Rights::READ | Rights::WRITE, Scope::Any)];
+        let eff = agent_skill::effective_caps("report-writer-agent", &parent).expect("role");
+        assert_eq!(eff.len(), 1);
+        assert!(eff[0].rights.contains(Rights::READ));
+        assert!(!eff[0].rights.contains(Rights::WRITE), "install grant (READ) bounds the skill-agent below the parent");
+    }
+
+    /// (e) Uninstall revokes the grant and the skill no longer loads.
+    #[test_case]
+    fn uninstall_revokes_and_unloads() {
+        install::reset();
+        index::reset(); // isolate: only this test's skill in the index
+        let id = next_skill_id();
+        let mut pkg = package::sample_note_summarizer(id);
+        pkg.sign();
+        install::install(&pkg, &pkg.manifest.requested_capabilities.clone(), "vinoth", InstallSource::BootModule { name: "n.skill".into() }, 5).unwrap();
+        assert!(install::is_installed(id));
+        assert!(index::by_name("note-summarizer").is_some());
+        install::uninstall(id);
+        assert!(!install::is_installed(id), "grant revoked");
+        assert!(index::by_name("note-summarizer").is_none(), "L0 metadata removed");
+        let mut s = Session::new(&manifest::orchestrator_manifest(), 1, alloc::vec![], 0);
+        assert!(loader::load_body(&mut s, id, 1).is_none(), "uninstalled skill no longer loads");
     }
 }

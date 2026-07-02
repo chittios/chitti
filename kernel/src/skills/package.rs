@@ -36,6 +36,50 @@ impl SkillPackage {
         postcard::from_bytes(bytes)
     }
 
+    /// The canonical bytes that are signed/verified: the manifest with its
+    /// signature block zeroed, followed by the body and every asset payload.
+    /// Signing over this ties the signature to the *entire* package, so any
+    /// tampering (body, a tool, a requested cap) invalidates it.
+    fn signing_message(&self) -> Vec<u8> {
+        let mut m = self.manifest.clone();
+        m.signature = SignatureBlock {
+            algo: SigAlgo::Ed25519,
+            key_id: m.signature.key_id.clone(),
+            content_hash: [0u8; 32],
+            sig: Vec::new(),
+        };
+        let mut out = postcard::to_allocvec(&m).unwrap_or_default();
+        out.extend_from_slice(self.body.as_bytes());
+        for (name, bytes) in &self.assets {
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(bytes);
+        }
+        out
+    }
+
+    /// Sign the package with the registry key (fills `signature`). Used to
+    /// produce signed sample packages.
+    pub fn sign(&mut self) {
+        let msg = self.signing_message();
+        self.manifest.signature = SignatureBlock {
+            algo: SigAlgo::Ed25519,
+            key_id: crate::skills::crypto::REGISTRY_KEY_ID.to_string(),
+            content_hash: crate::skills::crypto::hash32(&msg),
+            sig: crate::skills::crypto::sign(&msg),
+        };
+    }
+
+    /// Verify the package's signature + content hash against the trust store.
+    /// Returns false for an unsigned, tampered, or untrusted-key package.
+    pub fn verify(&self) -> bool {
+        let msg = self.signing_message();
+        let sb = &self.manifest.signature;
+        if sb.content_hash != crate::skills::crypto::hash32(&msg) {
+            return false;
+        }
+        crate::skills::crypto::verify(&sb.key_id, &msg, &sb.sig)
+    }
+
     /// Write the package's body + assets to the store and register its bundled
     /// tools + L0 metadata. Does NOT verify a signature or gate capabilities —
     /// Phase F treats placed skills as trusted (Phase G adds verify + consent).
@@ -130,4 +174,51 @@ pub fn sample_note_summarizer(id: SkillId) -> SkillPackage {
         body,
         assets: vec![("style-guide".to_string(), b"Style: terse, factual, no fluff.".to_vec())],
     }
+}
+
+/// The Phase-G sample **skill-agent**: an installable agent role (the schema
+/// Part 3 `pdf-filler` example, adapted to the memory FS). Its bundled tool
+/// `note_write` binds to `mem_fs_write`. Requests Fs READ|WRITE; a real install
+/// may approve only a subset. Signed via [`SkillPackage::sign`] by the caller.
+pub fn sample_report_agent(skill_id: SkillId, agent_id: AgentId) -> SkillPackage {
+    let body_ref = StoreKey(alloc::format!("skills/{}/body.md", skill_id.0));
+    let agent = AgentManifest {
+        schema_version: 1,
+        id: agent_id,
+        name: "report-writer-agent".to_string(),
+        version: "1.0.0".to_string(),
+        kind: AgentKind::SkillAgent,
+        description: "Delegate report writing here. Use when the task mentions writing a report.".to_string(),
+        system_prompt: "You write concise reports from provided facts. Never invent data.".to_string(),
+        toolset: vec!["read".to_string(), "write".to_string(), "emit_result".to_string()],
+        capabilities: vec![CapabilityRequest::new(CapDomain::Fs, Rights::READ | Rights::WRITE, Scope::Any)],
+        skills: Vec::new(),
+        sampling: Sampling::deterministic(7),
+        budgets: Budgets {
+            max_turns: 12,
+            max_context_tokens: 4096,
+            compact_threshold: 3500,
+            max_tool_calls: 32,
+            max_subagents: 0,
+            max_depth: 0,
+            max_wall_ticks: 0,
+        },
+        summary: SummaryPolicy { max_tokens: 256, style: SummaryStyle::Terse },
+        origin: Origin::Installed { skill: skill_id },
+    };
+    let manifest = SkillManifest {
+        schema_version: 1,
+        id: skill_id,
+        name: "report-writer".to_string(),
+        version: "1.0.0".to_string(),
+        description: "Write reports from facts. Use when the task mentions writing a report.".to_string(),
+        kind: SkillKind::SkillAgent,
+        requested_capabilities: vec![CapabilityRequest::new(CapDomain::Fs, Rights::READ | Rights::WRITE, Scope::Any)],
+        body_ref,
+        bundled_tools: Vec::new(),
+        assets: Vec::new(),
+        agent: Some(agent),
+        signature: SignatureBlock { algo: SigAlgo::Ed25519, key_id: crate::skills::crypto::REGISTRY_KEY_ID.to_string(), content_hash: [0u8; 32], sig: Vec::new() },
+    };
+    SkillPackage { manifest, body: "Write a clear, factual report from the given facts.".to_string(), assets: Vec::new() }
 }
