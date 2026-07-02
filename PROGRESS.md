@@ -54,3 +54,20 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   turn-budget-stops); aarch64 builds; **live x86_64 QEMU boot** shows the loop (stop=Final,
   turns=3, tool_calls=2) + save→resume(7 msgs)→continue(11 msgs).
 - Next: Phase B — first-class MCP-shaped tool layer (registry + dispatch + builtin toolset).
+
+## Phase B — first-class tool layer  ✅
+
+- Two new Synapse primitives (`mem_fs_edit` id=8, `mem_fs_search` id=9) so `edit`/`search`
+  route through the same capability/taint-gated, audited executor as every other effect.
+- `kernel/src/tools/`: `registry.rs` (MCP-shaped ToolDef catalogue — the 11 builtin tools with
+  JSON input-schemas + `ToolBinding`; provider registration; per-agent `for_agent` discovery +
+  `describe` for prompts), `dispatch.rs` (`Router`: the real ToolDispatch — shape-validate →
+  Synapse cap+taint gate → tool_result; agent-layer bindings (spawn_subagent/load_skill/run)
+  delegate to hooks installed in later phases), `provider.rs` (in-kernel "MCP server" registration,
+  used by Phase F skill-bundled tools).
+- Router supersedes the Phase-A inline dispatcher (SynapseTools removed); orchestrator keeps only
+  the shared `synapse_call` + `to_taint` helpers. Demo/tests now use `tools::Router`.
+- Gate: x86_64 `cargo xtask test` = 81/81 (5 new: malformed-rejected-before-dispatch,
+  ungranted-denied+audited, write/read roundtrip+audit, todo_write updates session, discovery
+  intersects toolset); aarch64 builds; live x86_64 boot demo still completes via the Router.
+- Next: Phase C — sub-agents (spawn_subagent, isolation, cap attenuation, parallel, depth cap).

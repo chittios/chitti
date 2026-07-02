@@ -33,7 +33,7 @@ pub fn demo() {
     serial_println!("Chitti: --- Agentic loop + sessions (Phase A) ---");
 
     let mut orch = orchestrator::Orchestrator::spawn(manifest::orchestrator_manifest(), 42);
-    let mut tools = orchestrator::SynapseTools::new();
+    let mut tools = crate::tools::Router::new();
 
     let intent = "write a file called notes with the text hello world, then read it back";
     serial_println!("Chitti: intent> {}", intent);
@@ -74,7 +74,7 @@ mod tests {
     #[test_case]
     fn loop_completes_task_using_a_tool() {
         let mut orch = orchestrator::Orchestrator::spawn(manifest::orchestrator_manifest(), 42);
-        let mut tools = orchestrator::SynapseTools::new();
+        let mut tools = crate::tools::Router::new();
 
         let steps = vec![
             Step::Tools(vec![tool("write", args(&[("path", "phaseA_notes"), ("content", "hello world")]))]),
@@ -99,7 +99,7 @@ mod tests {
     #[test_case]
     fn session_save_resume_and_continue() {
         let mut orch = orchestrator::Orchestrator::spawn(manifest::orchestrator_manifest(), 7);
-        let mut tools = orchestrator::SynapseTools::new();
+        let mut tools = crate::tools::Router::new();
 
         let steps = vec![Step::Tools(vec![tool("write", args(&[("path", "resume_f"), ("content", "v1")]))]), Step::Final("done".into())];
         let mut src = ScriptedSteps::new(steps);
@@ -128,7 +128,7 @@ mod tests {
         let mut m = manifest::orchestrator_manifest();
         m.budgets.max_turns = 2;
         let mut orch = orchestrator::Orchestrator::spawn(m, 1);
-        let mut tools = orchestrator::SynapseTools::new();
+        let mut tools = crate::tools::Router::new();
         // A source that always asks for another tool call, never finalizes.
         struct Never;
         impl super::agent_loop::StepSource for Never {

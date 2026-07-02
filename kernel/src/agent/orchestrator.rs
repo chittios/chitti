@@ -4,18 +4,17 @@
 //! [`ToolDispatch`]. The Intent shell talks to the orchestrator; it never talks
 //! to tools or sub-agents directly (locked decision).
 //!
-//! Phase A ships a compact [`SynapseTools`] dispatcher covering the core
-//! builtin tools over Synapse (write/read/list/delete/console/emit_result, plus
-//! session-local `todo_write`). Phase B promotes this to the full MCP-shaped
-//! `tools/` registry; the [`ToolDispatch`] trait is the stable seam so the loop
-//! is unchanged.
+//! Tool execution is delegated to the [`tools::Router`](crate::tools::Router)
+//! (Phase B) via the [`ToolDispatch`] seam, so the loop is agnostic to how
+//! tools are catalogued and validated. This module keeps only the small shared
+//! helpers the router needs: the canonical Synapse call builder
+//! ([`synapse_call`]) and the provenance bridge ([`to_taint`]).
 
-use crate::agent::agent_loop::{self, LoopResult, StepSource, ToolDispatch, ToolOutcome};
+use crate::agent::agent_loop::{self, LoopResult, StepSource, ToolDispatch};
 use crate::agent::manifest;
 use crate::agent::types::*;
-use crate::security::taint::{self, Justification};
-use crate::session::{self, todo};
-use crate::synapse::{self, executor::Invocation};
+use crate::security::taint;
+use crate::session;
 use alloc::string::{String, ToString};
 
 /// Monotonic tick source (kernel ms). Ticks only order events; tests don't
@@ -33,102 +32,6 @@ pub fn to_taint(p: Provenance) -> taint::Provenance {
         Provenance::UserTyped => taint::Provenance::UserTyped,
         Provenance::SystemTrusted | Provenance::SkillInstalled(_) => taint::Provenance::SystemTrusted,
         Provenance::UntrustedIngested => taint::Provenance::UntrustedIngested,
-    }
-}
-
-/// The Phase-A tool dispatcher: builtin tools → Synapse primitives, every
-/// effect capability-checked and audited by the executor.
-pub struct SynapseTools {
-    /// When true, the justification for each call is derived from the session's
-    /// current worst provenance (the Phase E injection defense). When false
-    /// (Phase A default), calls are trusted.
-    pub taint_aware: bool,
-    /// Set by the shell when a human has explicitly confirmed a destructive
-    /// action at the prompt.
-    pub human_confirmed: bool,
-}
-
-impl SynapseTools {
-    pub fn new() -> Self {
-        Self { taint_aware: false, human_confirmed: false }
-    }
-    pub fn taint_aware() -> Self {
-        Self { taint_aware: true, human_confirmed: false }
-    }
-
-    fn justification(&self, session: &Session) -> Justification {
-        if !self.taint_aware {
-            return Justification::trusted();
-        }
-        let j = Justification::from_context(to_taint(session.resident_max_taint()));
-        if self.human_confirmed {
-            j.confirmed()
-        } else {
-            j
-        }
-    }
-
-    /// Run a canonical Synapse call and turn its `Invocation` into a
-    /// `ToolOutcome`. FS/tool output is tagged `UntrustedIngested` — that taint
-    /// is what a later destructive call would be justified by.
-    fn run_synapse(&self, session: &Session, caller: crate::sched::TaskId, raw: &str) -> ToolOutcome {
-        match synapse::execute_with_justification(caller, raw, self.justification(session)) {
-            Invocation::Executed { result, .. } => ToolOutcome::ok(result, Provenance::UntrustedIngested),
-            Invocation::Denied { primitive } => {
-                ToolOutcome::error(alloc::format!("denied: no capability for {primitive}"))
-            }
-            Invocation::Rejected(err) => ToolOutcome::error(alloc::format!("rejected: {err:?}")),
-            Invocation::RefusedTainted { primitive } => {
-                ToolOutcome::error(alloc::format!("refused: destructive '{primitive}' justified by untrusted content"))
-            }
-        }
-    }
-}
-
-impl Default for SynapseTools {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ToolDispatch for SynapseTools {
-    fn call(&mut self, session: &mut Session, caller: crate::sched::TaskId, call: &ToolCall) -> ToolOutcome {
-        let a = &call.args;
-        match call.tool.as_str() {
-            "write" => {
-                let (Some(path), Some(content)) = (todo::json_str(a, "path"), todo::json_str(a, "content")) else {
-                    return ToolOutcome::error("write: needs {path, content}");
-                };
-                self.run_synapse(session, caller, &synapse_call("mem_fs_write", &[("path", &path), ("text", &content)]))
-            }
-            "read" => {
-                let Some(path) = todo::json_str(a, "path") else {
-                    return ToolOutcome::error("read: needs {path}");
-                };
-                self.run_synapse(session, caller, &synapse_call("mem_fs_read", &[("path", &path)]))
-            }
-            "list" => self.run_synapse(session, caller, &synapse_call("list", &[])),
-            "delete" => {
-                let Some(path) = todo::json_str(a, "path") else {
-                    return ToolOutcome::error("delete: needs {path}");
-                };
-                self.run_synapse(session, caller, &synapse_call("mem_fs_delete", &[("path", &path)]))
-            }
-            "console" => {
-                let text = todo::json_str(a, "text").unwrap_or_default();
-                self.run_synapse(session, caller, &synapse_call("console_write", &[("text", &text)]))
-            }
-            "emit_result" => {
-                let text = todo::json_str(a, "text").unwrap_or_default();
-                self.run_synapse(session, caller, &synapse_call("emit_result", &[("text", &text)]))
-            }
-            "todo_write" => {
-                let items = todo::parse_args(a);
-                let remaining = todo::write(session, items, now());
-                ToolOutcome::ok(alloc::format!("ok:{remaining} remaining"), Provenance::SystemTrusted)
-            }
-            other => ToolOutcome::error(alloc::format!("unknown or not-yet-wired tool: {other}")),
-        }
     }
 }
 
