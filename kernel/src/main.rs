@@ -5,7 +5,6 @@
 use chitti_kernel::{
     arch, framebuffer, limine_protocol, serial, serial_println, FRAMEBUFFER_REQUEST, MEMMAP_REQUEST,
 };
-use core::fmt::Write as _;
 use core::panic::PanicInfo;
 
 const BOOT_MSG: &str = "Chitti: boot ok";
@@ -18,17 +17,24 @@ pub extern "C" fn _start() -> ! {
     arch::x86_64::fpu::enable_sse();
 
     serial::init();
+
+    // Bring up the framebuffer text console first, so every line below
+    // (serial output is mirrored there) also appears in the graphical window.
+    if let Some(fb) = FRAMEBUFFER_REQUEST.response().and_then(|r| r.framebuffers().first().copied()) {
+        framebuffer::init_console(fb);
+    }
     serial_println!("{}", BOOT_MSG);
 
-    if let Some(fb_resp) = FRAMEBUFFER_REQUEST.response() {
-        if let Some(fb) = fb_resp.framebuffers().first() {
-            let mut writer = framebuffer::Writer::new(fb);
-            let _ = write!(writer, "{}", BOOT_MSG);
-        } else {
-            serial_println!("Chitti: no framebuffers reported");
-        }
+    if let Some(mm) = MEMMAP_REQUEST.response() {
+        let usable: u64 = mm
+            .entries()
+            .iter()
+            .filter(|e| e.entry_type == limine_protocol::MEMMAP_USABLE)
+            .map(|e| e.length)
+            .sum();
+        serial_println!("Chitti: {} usable memory-map bytes across {} entries", usable, mm.entries().len());
     } else {
-        serial_println!("Chitti: framebuffer request was refused");
+        serial_println!("Chitti: memory map request was refused");
     }
 
     if let Some(mm) = MEMMAP_REQUEST.response() {
