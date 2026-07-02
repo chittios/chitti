@@ -92,6 +92,51 @@ pub fn init() {
     crate::ktrace::log("sched", "scheduler initialized, current context is bootstrap task 0");
 }
 
+/// Idle entry for a parked task: it should never actually be scheduled (see
+/// [`spawn_parked`]), but if it ever is, it just yields forever rather than
+/// falling off the end of its stack.
+extern "C" fn park_forever(_arg: u64) {
+    loop {
+        yield_now();
+    }
+}
+
+/// Create a task that exists only to *own a capability table* — an agent's
+/// identity holder — without ever running. Unlike [`spawn`], it is NOT pushed
+/// onto the ready queue, so it never consumes a scheduler turn or interferes
+/// with other tasks' cooperative hand-off. Its cap table is live immediately
+/// (grants/lookups work), which is all the agent layer needs: the agentic loop
+/// runs on the foreground task and only *names* this task as the caller whose
+/// authority Synapse checks. Returns the new task id.
+pub fn spawn_parked(name: &'static str) -> TaskId {
+    let mut stack = alloc::vec![0u8; STACK_SIZE].into_boxed_slice();
+    let stack_top = (stack.as_mut_ptr() as u64 + STACK_SIZE as u64) & !0xf;
+    // SAFETY: freshly allocated, exclusively-owned 64 KiB region; 16-byte
+    // aligned `stack_top` well within it. The task is never scheduled, so the
+    // context is only a placeholder, but we set it up correctly anyway.
+    let rsp = unsafe { context::init_stack(stack_top, park_forever, 0) };
+    let id = SCHED.with(|slot| {
+        let s = slot.as_mut().expect("sched::spawn_parked: scheduler not initialized");
+        let id = s.next_id;
+        s.next_id += 1;
+        s.tasks.insert(
+            id,
+            TaskControlBlock {
+                name,
+                state: TaskState::Ready,
+                rsp,
+                _stack: Some(stack),
+                fx_area: Box::new(context::FxArea::new()),
+                cap_table: CapTable::new(),
+            },
+        );
+        // Deliberately NOT enqueued — a cap-owning identity holder, never run.
+        id
+    });
+    crate::ktrace::log_fmt(format_args!("sched: spawned parked task {id} ({name}) [cap-owner, not scheduled]"));
+    id
+}
+
 /// Spawn a new task running `entry(arg)` on a fresh 64 KiB stack. The
 /// task starts `Ready` and joins the round-robin queue; it does not run
 /// until some task (or the timer) yields to it.
