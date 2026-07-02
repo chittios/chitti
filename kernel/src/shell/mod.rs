@@ -310,6 +310,8 @@ fn run_infer() {
 /// isolation and report throughput in MMAC/s. Meaningful under native
 /// execution (aarch64 on HVF); under x86 TCG it just measures the emulator.
 fn run_bench() {
+    #[cfg(target_arch = "aarch64")]
+    serial_println!("bench> Q4_0 SDOT vs exact rel_rms_err = {}", crate::cortex::check_q4_0_sdot());
     let r = crate::cortex::bench_matvec();
     // MMAC/s = macs / (ms * 1000); guard against a zero interval.
     let mmacs = if r.ms > 0 { r.macs / (r.ms * 1000) } else { 0 };
