@@ -138,6 +138,9 @@ pub fn run(
                     let outcome = tools.call(session, caller, call);
                     session.push_tool_result(call.call_id, outcome.result, outcome.provenance, now());
                 }
+                // Keep the context within budget: compact older turns once the
+                // live-token count approaches the window (Phase D).
+                crate::agent::context::maybe_compact(session, now());
             }
         }
     }

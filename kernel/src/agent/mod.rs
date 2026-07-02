@@ -17,6 +17,7 @@
 //! flows down through Synapse (locked invariant #1).
 
 pub mod agent_loop;
+pub mod context;
 pub mod manifest;
 pub mod orchestrator;
 pub mod rule_steps;
@@ -62,6 +63,37 @@ pub fn demo() {
     }
 
     demo_phase_c();
+    demo_phase_d();
+}
+
+/// Phase D demo: auto-compaction keeps a long session in budget, recall pages a
+/// compacted fact back, and a fork diverges without touching the parent.
+#[cfg(not(test))]
+fn demo_phase_d() {
+    use crate::serial_println;
+    serial_println!("Chitti: --- Context management: compaction + fork (Phase D) ---");
+    let mut m = manifest::orchestrator_manifest();
+    m.budgets.compact_threshold = 40;
+    let mut s = types::Session::new(&m, 123, alloc::vec![], orchestrator::now());
+    let fact_id = s.push_message(types::Role::User, "remember: the vault code is 4815162342".into(), types::Provenance::UserTyped, orchestrator::now());
+    for i in 0..10 {
+        s.push_message(types::Role::Assistant, alloc::format!("working step {i} with filler to grow the context"), types::Provenance::SystemTrusted, orchestrator::now());
+    }
+    let live_before = s.context.live_tokens;
+    context::maybe_compact(&mut s, orchestrator::now());
+    serial_println!(
+        "Chitti: compact> live tokens {} -> {}, {} compaction(s); early turns evicted to the store",
+        live_before, s.context.live_tokens, s.context.compactions.len()
+    );
+    if let Some(text) = context::recall(&mut s, fact_id) {
+        serial_println!("Chitti: recall> paged back a compacted fact: \"{}\"", text);
+    }
+    let mut fork = crate::session::fork(&s, orchestrator::now());
+    fork.push_message(types::Role::User, "fork-only branch".into(), types::Provenance::UserTyped, orchestrator::now());
+    serial_println!(
+        "Chitti: fork> session {} forked to {}; fork has {} msgs, parent still {} (independent)",
+        s.id.0, fork.id.0, fork.messages.len(), s.messages.len()
+    );
 }
 
 /// Phase C demo: the orchestrator dispatches two isolated reader sub-agents on

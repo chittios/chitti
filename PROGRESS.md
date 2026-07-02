@@ -86,3 +86,18 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   (system + 2 summaries — no sub-transcripts).
 - Caveat (DECISIONS.md): SMP true-concurrency deferred under QEMU TCG; per-core structure in place.
 - Next: Phase D — context compaction + todo-driven planning + session fork.
+
+## Phase D — context management + planning  ✅
+
+- `kernel/src/agent/context.rs`: `maybe_compact` (when live_tokens ≥ compact_threshold, evict the
+  oldest non-system, non-recent turns to the store keyed `sess/<id>/cmp/<msg>`, mark them
+  resident=false + store_ref, keep a summary in `ContextState.compactions`, recompute live tokens);
+  `recall` (demand-page a compacted message's full text back into context). Wired into the loop —
+  compaction runs after each tool turn.
+- Todo-driven planning reuses `session::todo::write` (idempotent whole-list replace, returns
+  remaining count) — a 5-step plan is tracked and worked down.
+- Session fork reuses `session::store::fork` (new id, deep clone, independent).
+- Gate: x86_64 `cargo xtask test` = 88/88 (3 new: compaction-evicts+recall-pages-back,
+  5-step-task-via-todos, fork-diverges-without-mutating-parent); aarch64 builds; **live boot**
+  shows compaction (162→127 tokens), recall of a compacted fact verbatim, and an independent fork.
+- Next: Phase E — permission+safety (taint+cap gating in dispatch, compiled-intent replay).
