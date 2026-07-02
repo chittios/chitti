@@ -4,7 +4,28 @@
 
 **Current phase: 7 (Stretch) — in progress. SMP + block-device FS + framebuffer TUI + dual-arch (x86_64 + aarch64) kernel: complete.**
 
-**Batched prefill + a throughput harness (aarch64).** A `perf` shell builtin
+**Model as a build argument + release CI (9B inference still gated).** The
+bundled model is now a first-class `-model qwen3.5-0.8b|qwen3.5-9b` argument
+(like `-arch`), 0.8B default: xtask threads it into the build (a kernel cargo
+feature `model-9b` selecting the memory layout — model region at 0x80000000,
+heap at 0x2_00000000 sized 1 GiB, MMU mapping 12 GiB — vs the compact 0.8B
+layout) and the run (GGUF file, aarch64 load addr, guest `-m 12G`). `xtask
+image` and `fetch-model.sh` are model-aware. A release workflow
+(`.github/workflows/release.yml`) builds the {x86_64, aarch64} × {0.8B, 9B}
+matrix and attaches each bootable image (Limine ISO / `-kernel` ELF, model not
+baked in — too large) as a release asset with a RUN.md. 0.8B is unchanged
+(~14 tok/s, matches reference). **The 9B (Qwen3.5-9B, `qwen35` arch, 33 layers,
+dim 4096, vocab 248320) does NOT run yet** — three confirmed blockers: (1) it's
+**Q4_K** (223 tensors) + **Q6_K** (35) k-quants; our kernel only does Q8_0, so
+it needs new k-quant dequant/matmul kernels; (2) a separate **untied
+`output.weight`** (Q6_K, 834 MB) our loader doesn't handle; (3) the 5.4 GB blob
+can't be delivered via QEMU `-device loader` (fails >4 GiB) — needs a
+virtio-blk disk the aarch64 kernel reads. The model is copied to
+`assets/model-9b.gguf`; the 9B run path guards the too-big loader with a clear
+message rather than crashing.
+
+---
+*Prior:* **Batched prefill + a throughput harness (aarch64).** A `perf` shell builtin
 (`cortex::bench_inference`) reports prefill (pp) and decode (tg) tok/s on a
 synthetic prompt — a regression gauge run alongside `infer` (which still
 asserts reference parity) after every change; directly comparable to
