@@ -48,6 +48,9 @@ pub extern "C" fn _start() -> ! {
     // `chitti_kernel::init`.
     chitti_kernel::init();
 
+    // Phase 7: report the SMP bring-up result (the self-test ran inside init).
+    serial_println!("Chitti: SMP: {} core(s) online (see ktrace 'smp:' lines for the spinlock self-test)", chitti_kernel::smp::cpu_count());
+
     // Phase 4: demonstrate the Synapse capability ABI end to end (grammar
     // validation -> capability check -> deterministic execution -> audit).
     // Fast and model-free, so it runs on every boot regardless of whether

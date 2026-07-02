@@ -6,29 +6,55 @@ pub mod frame;
 pub mod heap;
 
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-/// Single-core critical-section wrapper: disables interrupts around `f`
-/// instead of spinning on a lock, since there is no second core to
-/// contend with until Phase 7's SMP stretch goal.
+/// A mutual-exclusion cell around `T`. Since Phase 7's SMP bring-up there can
+/// be more than one core, so this is a real **spinlock** (a test-and-test-and-
+/// set on `locked`) *and* disables interrupts for the duration of the
+/// critical section. Both are needed:
+///
+/// * the atomic gives mutual exclusion **across cores**;
+/// * disabling interrupts prevents a same-core IRQ handler from trying to take
+///   a lock the interrupted code already holds -- which, with a spinlock,
+///   would deadlock rather than merely alias.
+///
+/// Reentrancy is therefore forbidden: taking the same `Locked` again from
+/// inside its own critical section deadlocks. (This held for the previous
+/// interrupt-disable-only design too, where it would have aliased instead.)
 pub struct Locked<T> {
+    locked: AtomicBool,
     inner: UnsafeCell<T>,
 }
 
-// SAFETY: every access goes through `with`, which disables interrupts for
-// its duration; there is only one core, so that fully serializes access.
+// SAFETY: all access to `inner` goes through `with`, which holds the spinlock
+// (cross-core mutual exclusion) with interrupts disabled (same-core exclusion)
+// for the entire duration -- so there is only ever one live `&mut T`.
 unsafe impl<T> Sync for Locked<T> {}
 
 impl<T> Locked<T> {
     pub const fn new(value: T) -> Self {
-        Self { inner: UnsafeCell::new(value) }
+        Self { locked: AtomicBool::new(false), inner: UnsafeCell::new(value) }
     }
 
     pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         crate::arch::x86_64::interrupts::without_interrupts(|| {
-            // SAFETY: interrupts are disabled for the duration of `f`
-            // (see above), so this is the only live access to `inner`.
+            // Test-and-test-and-set acquire: spin reading (cheap, cache-local)
+            // until the lock looks free, then attempt the atomic swap.
+            while self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                while self.locked.load(Ordering::Relaxed) {
+                    core::hint::spin_loop();
+                }
+            }
+            // SAFETY: the lock is held and interrupts are disabled, so this is
+            // the only live access to `inner` on any core.
             let inner = unsafe { &mut *self.inner.get() };
-            f(inner)
+            let result = f(inner);
+            self.locked.store(false, Ordering::Release);
+            result
         })
     }
 }
@@ -53,4 +79,22 @@ pub fn init(memmap: &[&crate::limine_protocol::MemmapEntry], hhdm_offset: u64) {
     ));
 
     heap::init(&FRAME_ALLOCATOR);
+}
+
+/// Map one 4 KiB MMIO page at physical address `phys` into the HHDM and
+/// return the virtual address `phys` is now reachable at. Used for
+/// memory-mapped device registers Limine's HHDM does not cover -- notably the
+/// local APIC (`arch::x86_64::apic`), whose MMIO page sits in a hole the HHDM
+/// skips. Mapped uncached (PCD|PWT), writable, non-executable.
+pub fn map_mmio_page(phys: u64) -> u64 {
+    use crate::arch::x86_64::paging::{self, NO_EXECUTE, PRESENT, WRITABLE};
+    const PWT: u64 = 1 << 3;
+    const PCD: u64 = 1 << 4;
+    let page = phys & !0xfff;
+    let virt = paging::phys_to_virt(page);
+    FRAME_ALLOCATOR.with(|slot| {
+        let alloc = slot.as_mut().expect("map_mmio_page: frame allocator not initialized");
+        paging::map_page(virt, page, PRESENT | WRITABLE | NO_EXECUTE | PCD | PWT, alloc);
+    });
+    virt + (phys & 0xfff)
 }

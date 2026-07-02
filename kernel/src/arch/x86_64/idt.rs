@@ -248,3 +248,19 @@ pub fn init() {
     }
     crate::ktrace::log("idt", "IDT loaded: CPU exceptions installed");
 }
+
+/// Load the (shared, already-populated) IDT on an application processor. The
+/// IDT table itself is filled once by the BSP's `init`; each core only needs
+/// to point its own `IDTR` at it via `lidt`, so exceptions on that core reach
+/// our handlers instead of triple-faulting.
+pub fn load_ap() {
+    // SAFETY: `IDT` was fully populated by `init` (which runs on the BSP
+    // before any AP starts); `lidt` only reads it and sets this core's IDTR.
+    unsafe {
+        let ptr = DescriptorTablePointer {
+            limit: (size_of::<[IdtEntry; ENTRY_COUNT]>() - 1) as u16,
+            base: core::ptr::addr_of!(IDT) as u64,
+        };
+        asm!("lidt [{}]", in(reg) &ptr, options(readonly, nostack, preserves_flags));
+    }
+}

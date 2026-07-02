@@ -230,6 +230,13 @@ const QEMU_BASE_ARGS: &[&str] = &[
     // then falls back to SSE2 -- correct, just slower).
     "-cpu",
     "max",
+    // Phase 7 SMP: four vCPUs, each on its own host thread under TCG so the
+    // application processors genuinely run in parallel with the BSP (and so a
+    // spinning/working AP doesn't steal the BSP's round-robin slice).
+    "-smp",
+    "4",
+    "-accel",
+    "tcg,thread=multi",
     "-m",
     "2G",
     "-device",

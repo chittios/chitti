@@ -1,6 +1,33 @@
 *"This project is specified in `CHITTI_OS_HANDOFF.md`. Read it fully before acting. Follow the locked decisions in Part 2 and the guardrails in Part 4. Work one phase at a time; do not start the next phase until the current phase's acceptance criteria pass in QEMU."*
 
-**Current phase: 6 (Differentiators — taint security + self-compiling agents) — complete.**
+**Current phase: 7 (Stretch) — in progress. SMP / APIC-per-core: complete.**
+Multiple CPUs now execute kernel code concurrently under correct locks. The
+kernel `Locked` type (`mm/mod.rs`) is now a real **test-and-test-and-set
+spinlock** (atomic + interrupts-off while held) instead of the old
+interrupt-disable-only guard — the load-bearing SMP-safety change, since every
+shared structure (scheduler, heap, frame allocator, Synapse FS/audit, compiled
+intents) locks through it. A Limine **MP request** (`limine_protocol::Smp*`)
+brings up the application processors: `smp::init` (run on the BSP at the end of
+`chitti_kernel::init`) writes each AP's `goto_address` to launch it into
+`smp::ap_entry`, where the core enables SSE, sets up its **own** GDT+TSS
+(`gdt::init_ap`, heap-allocated — a shared TSS can't be `ltr`'d twice), loads
+the shared IDT (`idt::load_ap`), and software-enables its **local APIC**
+(`arch/x86_64/apic.rs`, whose MMIO page the HHDM doesn't cover so `mm::map_mmio_page`
+maps it). Each online core (BSP + APs) then runs a bounded self-test — all
+cores hammer one shared counter through the spinlock — which doubles as the
+lock-discipline proof: the counter lands on exactly `cpus × 5000` with zero
+lost updates under real contention. APs then `hlt`-park (no vCPU-time theft
+under TCG). `cargo xtask test` runs the harness with `-smp 4 -accel
+tcg,thread=multi` and is now 64 tests (up from 63): the new one asserts all 4
+cores came online, the spinlock summed exactly (no lost updates), and work ran
+on ≥2 cores. The scheduler stays BSP-driven for now (APs do bounded work then
+park); per-core run queues + APIC-timer preemption + IPIs are the next SMP
+refinement. Remaining Phase 7 tracks (agreed with the human, one at a time):
+block-device FS, framebuffer TUI, RISC-V port. The **9B model** was explicitly
+skipped (Part 4 guardrail + unusably slow under TCG).
+
+---
+*Prior:* **Phase 6 (Differentiators — taint security + self-compiling agents) — complete.**
 The two features that make Chitti novel. **(1) Provenance/taint.** A new
 `security/taint.rs` defines `Provenance` (`SystemTrusted | UserTyped |
 UntrustedIngested`) and `Justification` (provenance + human-confirmed).
