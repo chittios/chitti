@@ -18,7 +18,9 @@ pub enum ToolBinding {
     /// Lower to this Synapse primitive (by wire name) and execute through the
     /// capability/taint-gated, audited executor. `arg_map` pairs the tool's
     /// JSON keys with the primitive's parameter keys (in primitive order).
-    Synapse { primitive: &'static str, arg_map: &'static [(&'static str, &'static str)] },
+    /// Owned (not `&'static`) so skill-bundled tools registered at runtime bind
+    /// the same way builtins do.
+    Synapse { primitive: String, arg_map: Vec<(String, String)> },
     /// A session-local effect (no FS/console side effect): the todo list.
     SessionTodo,
     /// Dispatch a sub-agent (Phase C) — routed to the agent layer, audited.
@@ -47,15 +49,18 @@ impl ToolDef {
         description: &str,
         schema: &str,
         required: &[&str],
-        primitive: &'static str,
-        arg_map: &'static [(&'static str, &'static str)],
+        primitive: &str,
+        arg_map: &[(&str, &str)],
     ) -> Self {
         Self {
             name: name.to_string(),
             description: description.to_string(),
             input_schema: schema.to_string(),
             required: required.iter().map(|s| s.to_string()).collect(),
-            binding: ToolBinding::Synapse { primitive, arg_map },
+            binding: ToolBinding::Synapse {
+                primitive: primitive.to_string(),
+                arg_map: arg_map.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(),
+            },
         }
     }
 }

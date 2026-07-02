@@ -191,6 +191,21 @@ impl Orchestrator {
                 Err(e) => ToolOutcome::error(alloc::format!("sub-agent refused: {e:?}")),
             }
         }));
+        // `load_skill`: progressive disclosure — load a matched skill's L1 body
+        // into the session context on demand.
+        r.load_skill_hook = Some(alloc::boxed::Box::new(|session, _caller, call| {
+            use crate::agent::agent_loop::ToolOutcome;
+            use crate::session::todo::json_str;
+            use crate::skills::{index, loader};
+            let name = json_str(&call.args, "name").unwrap_or_default();
+            match index::by_name(&name) {
+                Some(meta) => match loader::load_body(session, meta.id, now()) {
+                    Some(_) => ToolOutcome::ok(alloc::format!("loaded skill '{name}' (L1 body now in context)"), Provenance::SkillInstalled(meta.id)),
+                    None => ToolOutcome::error(alloc::format!("skill '{name}' has no body")),
+                },
+                None => ToolOutcome::error(alloc::format!("no installed skill named '{name}'")),
+            }
+        }));
         r
     }
 }

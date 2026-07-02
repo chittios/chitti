@@ -107,7 +107,7 @@ impl ToolDispatch for Router {
                 let mut pairs: alloc::vec::Vec<(&str, String)> = alloc::vec::Vec::new();
                 for (tool_key, prim_key) in arg_map.iter() {
                     let v = todo::json_str(&call.args, tool_key).unwrap_or_default();
-                    pairs.push((prim_key, v));
+                    pairs.push((prim_key.as_str(), v));
                 }
                 let borrowed: alloc::vec::Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
                 self.run_synapse(session, caller, &synapse_call(primitive, &borrowed))
