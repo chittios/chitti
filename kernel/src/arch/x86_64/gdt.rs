@@ -120,18 +120,29 @@ pub fn init() {
             base: core::ptr::addr_of!(GDT) as u64,
         };
         asm!("lgdt [{}]", in(reg) &gdt_ptr, options(readonly, nostack, preserves_flags));
+        reload_segments();
+    }
+    crate::ktrace::log("gdt", "GDT + TSS loaded, IST1 stack ready for double-fault");
+}
 
-        // Reload CS via a far return trick (there's no direct `mov cs`),
-        // then reload the data segment registers and the task register.
-        //
-        // `code_sel` MUST be pushed before `tmp` is computed: `tmp` is a
-        // `lateout` register, which tells LLVM it's free to alias it to
-        // any `in` register (here, `code_sel`'s) once that input has been
-        // consumed. Computing `tmp` first previously clobbered
-        // `code_sel`'s register before its `push` ever ran, silently
-        // pushing the same (wrong) value twice and turning `retfq` into a
-        // jump to a bogus, unmapped code selector -- an instant #GP with
-        // no IDT loaded yet, i.e. a triple fault.
+/// Reload `CS` (via a far return), the data segment registers, and the task
+/// register to this core's freshly-`lgdt`'d GDT. Shared by the BSP `init` and
+/// the per-AP `init_ap`, since both need the identical selector layout.
+///
+/// # Safety
+/// A GDT with the standard Chitti layout (null, code, data, TSS-low, TSS-high)
+/// must already be loaded via `lgdt`.
+unsafe fn reload_segments() {
+    // Reload CS via a far return trick (there's no direct `mov cs`), then the
+    // data segment registers and the task register.
+    //
+    // `code_sel` MUST be pushed before `tmp` is computed: `tmp` is a
+    // `lateout` register, which tells LLVM it's free to alias it to any `in`
+    // register (here, `code_sel`'s) once that input has been consumed.
+    // Computing `tmp` first would clobber `code_sel` before its `push` runs,
+    // pushing the wrong value twice and turning `retfq` into a jump to a bogus
+    // code selector -- an instant #GP / triple fault.
+    unsafe {
         asm!(
             "push {code_sel}",
             "lea {tmp}, [55f + rip]",
@@ -153,5 +164,35 @@ pub fn init() {
         );
         asm!("ltr {sel:x}", sel = in(reg) TSS_SELECTOR, options(nostack, preserves_flags));
     }
-    crate::ktrace::log("gdt", "GDT + TSS loaded, IST1 stack ready for double-fault");
+}
+
+/// Set up this application processor's own GDT + TSS. Each AP needs its *own*
+/// TSS (a TSS's busy bit means one TSS descriptor can't be `ltr`'d on two
+/// cores), so the GDT, TSS, and double-fault IST stack are heap-allocated and
+/// leaked (they live for the core's lifetime). Must run after `mm::init`.
+pub fn init_ap() {
+    use alloc::boxed::Box;
+
+    // Per-CPU double-fault IST stack (leaked).
+    let df_stack: &'static mut [u8] = Box::leak(alloc::vec![0u8; DOUBLE_FAULT_STACK_SIZE].into_boxed_slice());
+    let df_top = df_stack.as_ptr() as u64 + DOUBLE_FAULT_STACK_SIZE as u64;
+
+    let tss: &'static mut Tss = Box::leak(Box::new(Tss::new()));
+    tss.ist[(DOUBLE_FAULT_IST_INDEX - 1) as usize] = df_top;
+    let tss_addr = tss as *const Tss as u64;
+    let (low, high) = tss_descriptor(tss_addr);
+
+    let gdt: &'static mut [u64; 5] = Box::leak(Box::new([0, KERNEL_CODE64, KERNEL_DATA, low, high]));
+
+    // SAFETY: `gdt` is a valid, correctly-laid-out GDT that outlives this
+    // core; loading it and reloading segments to its selectors is the AP
+    // equivalent of what `init` does on the BSP.
+    unsafe {
+        let gdt_ptr = DescriptorTablePointer {
+            limit: (size_of::<[u64; 5]>() - 1) as u16,
+            base: gdt.as_ptr() as u64,
+        };
+        asm!("lgdt [{}]", in(reg) &gdt_ptr, options(readonly, nostack, preserves_flags));
+        reload_segments();
+    }
 }

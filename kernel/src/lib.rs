@@ -23,6 +23,7 @@ pub mod sched;
 pub mod security;
 pub mod serial;
 pub mod shell;
+pub mod smp;
 pub mod synapse;
 
 // The framebuffer writer pulls in `font8x8` (a normal, non-build-std
@@ -71,6 +72,10 @@ pub static HHDM_REQUEST: limine_protocol::HhdmRequest = limine_protocol::HhdmReq
 pub static MODULE_REQUEST: limine_protocol::ModuleRequest = limine_protocol::ModuleRequest::new();
 
 #[used]
+#[link_section = ".requests"]
+pub static SMP_REQUEST: limine_protocol::SmpRequest = limine_protocol::SmpRequest::new();
+
+#[used]
 #[link_section = ".requests_end_marker"]
 static _REQUESTS_END: limine_protocol::RequestsEndMarker =
     limine_protocol::RequestsEndMarker::new();
@@ -102,6 +107,12 @@ pub fn init() {
 
     arch::x86_64::interrupts::enable();
     ktrace::log("init", "Phase 1 bring-up complete, interrupts enabled");
+
+    // Phase 7: bring up the application processors (if Limine reports any),
+    // run the SMP self-test, and park them. Must be after mm::init (APs
+    // heap-allocate their per-core GDT/TSS) and after gdt/idt (their tables
+    // are what APs load). A no-op on a single-CPU boot.
+    smp::init();
 }
 
 // --- custom_test_frameworks harness -----------------------------------
@@ -810,4 +821,34 @@ fn phase6_stale_precondition_falls_back_to_replanning() {
     assert_eq!(r3, "beta", "stale compiled intent must re-plan and return the fresh result");
     assert_eq!(compiled::replays(), replays1, "a stale precondition must NOT replay");
     assert!(planner::invocations() > plans1, "a stale precondition must fall back to planning");
+}
+
+// --- Phase 7 acceptance test (SMP bring-up + lock discipline) -----------
+
+/// SMP: every CPU Limine reported comes online, and the kernel spinlock
+/// provides real cross-core mutual exclusion. The self-test ran once during
+/// `init` (all cores hammering one `Locked` counter); here we check its
+/// result. The harness boots `-smp 4`, so multiple cores must have done work
+/// and the counter must be exact (no lost updates under contention).
+#[test_case]
+fn phase7_smp_online_and_spinlock_has_no_lost_updates() {
+    let s = smp::stats();
+    assert!(s.expected_cpus >= 1);
+    assert_eq!(s.cpus_online, s.expected_cpus, "only {}/{} cores came online", s.cpus_online, s.expected_cpus);
+    // The load-bearing lock-discipline check: concurrent increments from every
+    // core through the spinlock summed exactly, i.e. mutual exclusion held.
+    assert_eq!(
+        s.shared_counter, s.expected_counter,
+        "spinlock lost updates under contention: {} != {}",
+        s.shared_counter, s.expected_counter
+    );
+    // Under `-smp 4` the work genuinely ran on more than one core.
+    if s.expected_cpus > 1 {
+        assert!(
+            s.cpus_that_worked >= 2,
+            "SMP enabled ({} cpus) but only {} core(s) did work",
+            s.expected_cpus,
+            s.cpus_that_worked
+        );
+    }
 }

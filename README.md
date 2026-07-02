@@ -16,7 +16,7 @@ document is the single source of truth; this README is a map on top of it.
 [`CLAUDE.md`](CLAUDE.md) tracks the current phase for whoever (human or
 agent) picks up work next.
 
-## Status: Phase 6 complete
+## Status: Phase 6 complete; Phase 7 in progress (SMP done)
 
 ```
 [x] 0  Boot & harness          Boot via Limine, print to serial + framebuffer, QEMU test exit codes
@@ -26,7 +26,7 @@ agent) picks up work next.
 [x] 4  Synapse (capability ABI) Grammar-constrained tool calls → capability-checked deterministic primitives + append-only audit log
 [x] 5  Persona + shell         Agents as processes (spawn/suspend/resume/kill), two-tier memory w/ recall, intent shell drives plan→act loop, agent-to-agent IPC
 [x] 6  Differentiators         Provenance/taint gate on destructive primitives + self-compiling agents (compiled intents replayed with zero inference)
-[ ] 7  Stretch                 SMP, APIC-per-core, framebuffer TUI, larger model, RISC-V port
+[~] 7  Stretch                 SMP + APIC-per-core: DONE (Limine MP bring-up, real spinlocks, per-core GDT/TSS, local APIC). TODO: block-device FS, framebuffer TUI, RISC-V port (9B model skipped: guardrail + unusable under TCG)
 ```
 
 See `CHITTI_OS_HANDOFF.md` Part 5/6 for the full goal/scope/acceptance
@@ -62,7 +62,9 @@ chitti/
         ├── qemu.rs            # isa-debug-exit wiring for the test harness
         ├── mm/                # frame allocator (memmap-backed bitmap) + linked-list kernel heap
         ├── arch/x86_64/       # arch-specific code lives only here: GDT/TSS, IDT + exceptions,
-        │                       #   PIC/PIT/keyboard IRQs, FPU/SSE + XSAVE init, 4-level paging
+        │                       #   PIC/PIT/keyboard IRQs, FPU/SSE + XSAVE init, 4-level paging,
+        │                       #   apic.rs (local APIC: per-core id + software-enable, Phase 7)
+        ├── smp.rs             # Phase 7 SMP bring-up: Limine MP, per-core GDT/TSS/APIC, spinlock self-test
         ├── sched/             # stackful tasks + naked-fn context switch, round-robin scheduler
         │                       #   (cooperative + timer-preemptive), the async executor
         ├── cap/               # unforgeable capability tokens, per-task capability tables

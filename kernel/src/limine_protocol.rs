@@ -355,6 +355,89 @@ pub struct File {
     pub cmdline: *const u8,
 }
 
+/// Request that Limine start the other CPUs (the SMP / multiprocessor
+/// request). Phase 7 uses this to bring up application processors: Limine
+/// discovers them via ACPI/MADT and parks each spinning on its `goto_address`,
+/// which we then write to launch it. The trailing `flags` field can request
+/// x2APIC; we leave it 0 (xAPIC), which is all the local-APIC code needs.
+#[repr(C)]
+pub struct SmpRequest {
+    magic: [u64; 2],
+    id: [u64; 2],
+    revision: u64,
+    response: UnsafeCell<*const SmpResponse>,
+    flags: u64,
+}
+
+// SAFETY: see `BaseRevision`'s impl above -- Limine writes `response` once
+// before handoff; we only read it afterwards.
+unsafe impl Sync for SmpRequest {}
+
+impl SmpRequest {
+    pub const fn new() -> Self {
+        Self {
+            magic: COMMON_MAGIC,
+            id: [0x95a67b819a1b857e, 0xa0b61b723b6a73e0],
+            revision: 0,
+            response: UnsafeCell::new(core::ptr::null()),
+            flags: 0,
+        }
+    }
+
+    pub fn response(&self) -> Option<&'static SmpResponse> {
+        // SAFETY: see `FramebufferRequest::response`.
+        let ptr = unsafe { self.response.get().read_volatile() };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*ptr })
+        }
+    }
+}
+
+#[repr(C)]
+pub struct SmpResponse {
+    revision: u64,
+    flags: u32,
+    bsp_lapic_id: u32,
+    cpu_count: u64,
+    cpus: *const *const SmpInfo,
+}
+
+impl SmpResponse {
+    /// The local-APIC id of the bootstrap processor (the core `_start` runs
+    /// on). Used to skip the BSP when launching APs.
+    pub fn bsp_lapic_id(&self) -> u32 {
+        self.bsp_lapic_id
+    }
+
+    /// One `SmpInfo` per CPU (including the BSP).
+    pub fn cpus(&self) -> &'static [&'static SmpInfo] {
+        // SAFETY: Limine provides `cpu_count` valid `SmpInfo` pointers at
+        // `cpus` for the lifetime of the boot session.
+        unsafe { core::slice::from_raw_parts(self.cpus as *const &SmpInfo, self.cpu_count as usize) }
+    }
+}
+
+/// Per-CPU control block Limine hands us. Writing a function pointer to
+/// `goto_address` (atomically) launches that AP: it jumps there on a
+/// Limine-provided stack with a pointer to its own `SmpInfo` in `rdi`.
+/// `goto_address`/`extra_argument` are modelled as atomics because we write
+/// them while the AP core is concurrently reading `goto_address`.
+#[repr(C)]
+pub struct SmpInfo {
+    pub processor_id: u32,
+    pub lapic_id: u32,
+    reserved: u64,
+    pub goto_address: core::sync::atomic::AtomicU64,
+    pub extra_argument: core::sync::atomic::AtomicU64,
+}
+
+// SAFETY: `SmpInfo` lives in Limine-owned memory shared across cores; all our
+// access is through atomics (`goto_address`/`extra_argument`) or read-only
+// fields set by Limine before handoff.
+unsafe impl Sync for SmpInfo {}
+
 impl File {
     /// The module contents as a byte slice.
     pub fn data(&self) -> &'static [u8] {
