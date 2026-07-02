@@ -15,7 +15,7 @@
 pub mod context;
 pub mod executor;
 
-use crate::arch::x86_64::interrupts;
+use crate::arch::interrupts;
 use crate::cap::CapTable;
 use crate::mm::Locked;
 use alloc::boxed::Box;
@@ -230,7 +230,7 @@ pub extern "C" fn exit_current_task() -> ! {
             unreachable!("a dead task's stack must never be resumed");
         }
         None => loop {
-            crate::arch::x86_64::hlt();
+            crate::arch::hlt();
         },
     }
 }

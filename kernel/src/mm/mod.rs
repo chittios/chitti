@@ -37,7 +37,7 @@ impl<T> Locked<T> {
     }
 
     pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        crate::arch::x86_64::interrupts::without_interrupts(|| {
+        crate::arch::interrupts::without_interrupts(|| {
             // Test-and-test-and-set acquire: spin reading (cheap, cache-local)
             // until the lock looks free, then attempt the atomic swap.
             while self

@@ -31,7 +31,7 @@ pub fn log_fmt(args: Arguments<'_>) {
     // Disable interrupts for the whole line: an IRQ handler that also
     // logs (e.g. the keyboard handler) must not interleave its bytes with
     // a log line already in progress on another path.
-    crate::arch::x86_64::interrupts::without_interrupts(|| {
+    crate::arch::interrupts::without_interrupts(|| {
         let seq = next_seq();
         let mut serial = crate::serial::Serial;
         let _ = write!(serial, "[ktrace #{seq}] ");

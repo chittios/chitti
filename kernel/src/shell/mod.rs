@@ -114,7 +114,7 @@ pub fn run() -> ! {
             "exit" | "quit" => {
                 serial_println!("Chitti: shell exiting; system idle.");
                 loop {
-                    crate::arch::x86_64::hlt();
+                    crate::arch::hlt();
                 }
             }
             "help" => {
