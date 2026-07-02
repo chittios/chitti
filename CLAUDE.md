@@ -1,6 +1,37 @@
 *"This project is specified in `CHITTI_OS_HANDOFF.md`. Read it fully before acting. Follow the locked decisions in Part 2 and the guardrails in Part 4. Work one phase at a time; do not start the next phase until the current phase's acceptance criteria pass in QEMU."*
 
-**Current phase: 4 (Synapse — capability ABI) — complete.**
+**Current phase: 5 (Persona — agent runtime + intent shell) — complete.**
+Agents as first-class processes, and a full intent→plan→act→result loop from
+a serial shell. `persona/manifest.rs`: an agent manifest (model ref, persona
+prompt, capability set, memory policy). `persona/memory.rs`: two-tier memory —
+a bounded live context (tier 1, the KV-cache-derived working set) and a durable
+persistent store (tier 2, backed by `synapse::fs` under a per-agent namespace)
+with **demand-paging / RAG-style `recall`** that pages a fact into live context
+only when referenced. `persona/planner.rs`: a `Planner` trait (the stochastic
+layer above the determinism boundary) with a deterministic `RulePlanner` that
+maps intents to plans — the real 0.8B model is far too slow under QEMU TCG to
+drive a plan in a test, and a Cortex-backed planner drops into the same seam.
+`persona/actions.rs`: the plan vocabulary (Synapse tool-call JSON + memory ops),
+whose `call_*` builders emit exactly the Phase 4 grammar's canonical shape.
+`persona/agent.rs`: the process itself — lifecycle spawn/suspend/resume/kill,
+where **suspend checkpoints only context + memory pointers + plan cursor and
+drops the recomputable live/KV state, and resume recomputes (never restores)
+it** — plus the plan/act loop that drives every effect through the
+capability-checked, audited Synapse ABI. `shell/mod.rs`: the intent shell over
+COM1 (`serial::read_byte`/`put_byte`) — `run_intent` for one-shot/tested use and
+an interactive `run` read-eval loop, with an `infer` builtin that runs the
+Phase 3 Cortex reference on demand. The default boot now boots into this shell.
+`cargo xtask test` now runs 56 in-kernel tests (up from 45): (a) a typed intent
+completes a 2-primitive plan and returns the correct read-back result (both
+primitives audited); (b) suspend→resume drops then recomputes live state and the
+agent continues correctly to the same result; (c) a fresh agent recalls a fact
+from the persistent store that was never in its live context; (d) two agents
+coordinate a split task via capability-gated IPC + a capability-checked Synapse
+write. No self-compiling / taint yet (Phase 6). Next: Phase 6 (taint/provenance
+gating + self-compiling agents / compiled intents).
+
+---
+*Prior:* **Phase 4 (Synapse — capability ABI) — complete.**
 The syscall layer that turns untrusted model output into deterministic,
 capability-checked, audited effects — the concrete enforcement of the
 determinism boundary. `synapse/registry.rs`: a fixed, MCP-shaped primitive

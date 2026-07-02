@@ -16,7 +16,7 @@ document is the single source of truth; this README is a map on top of it.
 [`CLAUDE.md`](CLAUDE.md) tracks the current phase for whoever (human or
 agent) picks up work next.
 
-## Status: Phase 4 complete
+## Status: Phase 5 complete
 
 ```
 [x] 0  Boot & harness          Boot via Limine, print to serial + framebuffer, QEMU test exit codes
@@ -24,7 +24,7 @@ agent) picks up work next.
 [x] 2  Execution substrate     Tasks, scheduler, capabilities, IPC, async executor
 [x] 3  Cortex (inference)      CPU hybrid (gated-DeltaNet + attention) forward pass on Qwen3.5-0.8B, KV/recurrent cache, seeded sampling, batching
 [x] 4  Synapse (capability ABI) Grammar-constrained tool calls → capability-checked deterministic primitives + append-only audit log
-[ ] 5  Persona + shell         Agents as processes, two-tier memory, intent shell drives plan→act loop
+[x] 5  Persona + shell         Agents as processes (spawn/suspend/resume/kill), two-tier memory w/ recall, intent shell drives plan→act loop, agent-to-agent IPC
 [ ] 6  Differentiators         Taint/provenance security gating + self-compiling agents (compiled intents)
 [ ] 7  Stretch                 SMP, APIC-per-core, framebuffer TUI, larger model, RISC-V port
 ```
@@ -73,12 +73,19 @@ chitti/
         │                       #   model.rs   Qwen3.5-0.8B hybrid forward pass (gated-DeltaNet + gated attention)
         │                       #   sampler.rs seeded + temperature + grammar-constrained decoding
         │                       #   batch.rs   continuous-batching token scheduler
-        └── synapse/           # capability ABI / syscall layer (Phase 4):
-                                #   registry.rs  MCP-shaped primitive catalogue (name + typed schema)
-                                #   grammar.rs   registry-generated, prefix-closed constraint grammar + ConstrainedDecoder
-                                #   executor.rs  grammar → capability → isolated execution, one path to any effect
-                                #   fs.rs        in-memory file store the FS primitives mutate
-                                #   audit.rs     append-only invocation log (caller, primitive, hashes, outcome)
+        ├── synapse/           # capability ABI / syscall layer (Phase 4):
+        │                       #   registry.rs  MCP-shaped primitive catalogue (name + typed schema)
+        │                       #   grammar.rs   registry-generated, prefix-closed constraint grammar + ConstrainedDecoder
+        │                       #   executor.rs  grammar → capability → isolated execution, one path to any effect
+        │                       #   fs.rs        in-memory file store the FS primitives mutate
+        │                       #   audit.rs     append-only invocation log (caller, primitive, hashes, outcome)
+        ├── persona/           # agent runtime (Phase 5):
+        │                       #   manifest.rs  agent header (model ref, persona prompt, capability set, memory policy)
+        │                       #   memory.rs    two-tier memory: bounded live context + persistent store w/ demand-paging recall
+        │                       #   planner.rs   Planner trait + deterministic RulePlanner (stand-in for the Cortex planner)
+        │                       #   actions.rs   plan vocabulary (Synapse tool-call JSON + memory ops)
+        │                       #   agent.rs     the process: spawn/suspend/resume/kill + plan→act loop
+        └── shell/             # intent shell over serial (Phase 5): run_intent (one-shot) + interactive run loop
 ```
 
 Everything x86_64-specific stays under `kernel/src/arch/x86_64/`, so a future
