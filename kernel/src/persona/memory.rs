@@ -16,6 +16,7 @@
 //! acceptance test (c) exercises -- an agent answering from a fact it had to
 //! fetch, because it was never in its live context.
 
+use crate::security::Provenance;
 use crate::synapse::fs;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -33,10 +34,29 @@ pub enum Role {
     Tool,
 }
 
+impl Role {
+    /// The default provenance of content produced by this role (Phase 6).
+    /// System prompt is kernel-authored (trusted); a user intent is
+    /// explicitly typed (trusted); anything a tool returns is ingested from
+    /// outside the agent (untrusted). Callers that ingest external *content*
+    /// (a file read, a recalled fact) tag it explicitly via `push_tagged`.
+    pub fn default_provenance(self) -> Provenance {
+        match self {
+            Role::System => Provenance::SystemTrusted,
+            Role::User => Provenance::UserTyped,
+            Role::Agent => Provenance::UserTyped,
+            Role::Tool => Provenance::UntrustedIngested,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub role: Role,
     pub text: String,
+    /// Where this message's content came from, and thus how far it may be
+    /// trusted to justify a privileged action (Phase 6 taint tracking).
+    pub provenance: Provenance,
 }
 
 /// Tier-1 live working set. Cheap to clone (it is what a checkpoint keeps),
@@ -55,14 +75,32 @@ impl Context {
         Self { messages: Vec::new(), paged_keys: Vec::new(), limit }
     }
 
-    /// Append a message, evicting the oldest live message(s) if the working
-    /// set would exceed its limit. Eviction only drops the *live* copy;
-    /// durable facts live in tier 2 and are unaffected.
+    /// Append a message with `role`'s default provenance, evicting the oldest
+    /// live message(s) if the working set would exceed its limit. Eviction
+    /// only drops the *live* copy; durable facts live in tier 2 and are
+    /// unaffected.
     pub fn push(&mut self, role: Role, text: &str) {
-        self.messages.push(Message { role, text: String::from(text) });
+        self.push_tagged(role, text, role.default_provenance());
+    }
+
+    /// Append a message with an explicit provenance. Used when the provenance
+    /// differs from the role's default -- e.g. a tool *acknowledgement*
+    /// ("wrote 5 bytes") is system-trusted, while a tool *content read* (a
+    /// file's bytes) is untrusted ingested content, though both are `Tool`.
+    pub fn push_tagged(&mut self, role: Role, text: &str, provenance: Provenance) {
+        self.messages.push(Message { role, text: String::from(text), provenance });
         while self.messages.len() > self.limit {
             self.messages.remove(0);
         }
+    }
+
+    /// The most-tainted provenance among all live messages -- the
+    /// justification a call planned from this context carries. Empty context
+    /// is fully trusted.
+    pub fn max_taint(&self) -> Provenance {
+        self.messages
+            .iter()
+            .fold(Provenance::SystemTrusted, |acc, m| acc.join(m.provenance))
     }
 
     /// Whether any live message contains `needle`. Used by the acceptance

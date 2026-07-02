@@ -16,6 +16,18 @@
 use super::actions::Action;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Count of planner invocations. In the shipping design each call is an
+/// inference pass; the compiled-intent cache (Phase 6) exists precisely to
+/// avoid incrementing this on a repeated intent, and the acceptance test
+/// asserts it stays flat across a cache hit ("zero inference").
+static PLAN_INVOCATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Total planner (≈ inference) invocations so far.
+pub fn invocations() -> u64 {
+    PLAN_INVOCATIONS.load(Ordering::SeqCst)
+}
 
 /// Produces a plan (a sequence of [`Action`]s) for an intent. A Cortex-backed
 /// planner and the deterministic [`RulePlanner`] are interchangeable behind
@@ -37,6 +49,7 @@ impl Planner for RulePlanner {
     }
 
     fn plan(&mut self, intent: &str) -> Vec<Action> {
+        PLAN_INVOCATIONS.fetch_add(1, Ordering::SeqCst);
         let low = intent.to_ascii_lowercase();
 
         // "write a file called X with the text Y[, then read it back]"
@@ -47,6 +60,21 @@ impl Planner for RulePlanner {
                     steps.push(Action::call_read(&path));
                 }
                 return steps;
+            }
+        }
+
+        // "delete X" / "remove X" / "delete everything" -- a destructive plan.
+        // (The Synapse taint gate, not the planner, decides whether it may
+        // actually fire, based on the provenance of the justifying context.)
+        if low.contains("delete") || low.contains("remove") {
+            return alloc::vec![Action::call_delete(&extract_delete_target(intent, &low))];
+        }
+
+        // "read the file called X" -- a standalone read (the write+read case
+        // above already handles "...then read it back").
+        if low.contains("read") {
+            if let Some(path) = extract_path(intent, &low) {
+                return alloc::vec![Action::call_read(&path)];
             }
         }
 
@@ -134,6 +162,18 @@ fn split_kv(s: &str) -> Option<(String, String)> {
 /// Normalise a memory key: trim whitespace and trailing punctuation.
 fn clean_key(s: &str) -> String {
     String::from(s.trim().trim_end_matches(['?', '.', '!']).trim())
+}
+
+/// Extract the target of a "delete X" / "remove X" intent: the first token
+/// after the verb, with common filler ("the file called ...") stripped.
+fn extract_delete_target(orig: &str, low: &str) -> String {
+    let rest = after(orig, low, "delete ").or_else(|| after(orig, low, "remove ")).unwrap_or("");
+    let rest = strip_prefix_ci(rest, "the file called ");
+    let rest = strip_prefix_ci(rest, "the file ");
+    let rest = strip_prefix_ci(rest, "file called ");
+    let rest = strip_prefix_ci(rest, "file ");
+    let token = rest.split_whitespace().next().unwrap_or("");
+    clean_key(token)
 }
 
 #[cfg(test)]

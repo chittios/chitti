@@ -47,6 +47,13 @@ impl Action {
     pub fn call_emit(text: &str) -> Action {
         Action::Call(alloc::format!(r#"{{"name":"emit_result","arguments":{{"text":"{}"}}}}"#, escape(text)))
     }
+
+    /// A **destructive** delete call (Phase 6). Grammar-valid like any other,
+    /// but the Synapse taint gate refuses it if the agent's justification is
+    /// untrusted ingested content.
+    pub fn call_delete(path: &str) -> Action {
+        Action::Call(alloc::format!(r#"{{"name":"mem_fs_delete","arguments":{{"path":"{}"}}}}"#, escape(path)))
+    }
 }
 
 /// Escape a string for embedding in a canonical tool-call value, matching the
