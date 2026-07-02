@@ -109,7 +109,14 @@ fn build_kernel_aarch64(release: bool) -> Result<PathBuf, String> {
 /// with `-accel hvf`, so it runs *natively* on this Apple Silicon host (no
 /// cross-arch emulation) with NEON. Serial to stdio (`-nographic`).
 fn cmd_run_aarch64(release: bool) -> Result<(), String> {
-    let elf = build_kernel_aarch64(release)?;
+    // Native inference on aarch64 is only worthwhile optimized: debug NEON is
+    // ~30x slower (no inlining of intrinsics, bounds/overflow checks in the hot
+    // matvec loop). So this path defaults to a release build regardless of the
+    // `--release` flag; the whole point of `-arch aarch64` is native speed.
+    if !release {
+        eprintln!("note: building aarch64 in RELEASE (debug NEON inference is ~30x slower)");
+    }
+    let elf = build_kernel_aarch64(true)?;
     let mut qemu = Command::new("qemu-system-aarch64");
     // 2 GiB RAM holds the kernel + the ~812 MiB model (loaded at 0x48000000)
     // + the 256 MiB heap (0x80000000).
