@@ -71,3 +71,18 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   ungranted-denied+audited, write/read roundtrip+audit, todo_write updates session, discovery
   intersects toolset); aarch64 builds; live x86_64 boot demo still completes via the Router.
 - Next: Phase C — sub-agents (spawn_subagent, isolation, cap attenuation, parallel, depth cap).
+
+## Phase C — sub-agents (isolated delegation)  ✅
+
+- `kernel/src/agent/subagent.rs`: `dispatch` (depth check → `attenuate` subset enforcement →
+  isolated Session on its own cap-owning parked task → run its loop → condensed summary),
+  `integrate`/`record` (summary crosses back, transcript never merged), `dispatch_batch`
+  (per-core assignment, SMP-ready), `attenuate` (strict subset; refuse on widen).
+- `orchestrator.router()` wires the `spawn_subagent` tool hook (enforces parent caps + depth;
+  sub-agents run a rule StepSource, get a plain Router so they can't sub-delegate).
+- Gate: x86_64 `cargo xtask test` = 85/85 (4 new: context-isolated, widening-cap-refused,
+  two-subagents-integrate-both, depth-limit); aarch64 builds; **live x86_64 boot** shows 2
+  sub-agents on cores 0/1 with isolated 5-msg transcripts, parent left with only 3 messages
+  (system + 2 summaries — no sub-transcripts).
+- Caveat (DECISIONS.md): SMP true-concurrency deferred under QEMU TCG; per-core structure in place.
+- Next: Phase D — context compaction + todo-driven planning + session fork.
