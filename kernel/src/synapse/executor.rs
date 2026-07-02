@@ -161,6 +161,40 @@ fn run_primitive(spec: &PrimitiveSpec, args: &[ArgValue]) -> String {
                 format!("error:not_found:{path}")
             }
         }
+        registry::MEM_FS_EDIT => {
+            let path = arg_str(args, 0);
+            let old = arg_str(args, 1);
+            let new = arg_str(args, 2);
+            match fs::read(path) {
+                Some(bytes) => {
+                    let content = String::from_utf8_lossy(&bytes).into_owned();
+                    match content.find(old) {
+                        Some(at) => {
+                            let mut edited = String::with_capacity(content.len() - old.len() + new.len());
+                            edited.push_str(&content[..at]);
+                            edited.push_str(new);
+                            edited.push_str(&content[at + old.len()..]);
+                            fs::write(path, edited.as_bytes());
+                            format!("ok:edited {path}")
+                        }
+                        None => format!("error:not_found_substring:{path}"),
+                    }
+                }
+                None => format!("error:not_found:{path}"),
+            }
+        }
+        registry::MEM_FS_SEARCH => {
+            let query = arg_str(args, 0);
+            let mut hits: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+            for path in fs::list() {
+                if let Some(bytes) = fs::read(&path) {
+                    if String::from_utf8_lossy(&bytes).contains(query) {
+                        hits.push(path);
+                    }
+                }
+            }
+            format!("ok:[{}]", hits.join(","))
+        }
         other => format!("error:unimplemented primitive id {other}"),
     }
 }

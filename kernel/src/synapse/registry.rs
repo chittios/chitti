@@ -60,6 +60,8 @@ pub const SPAWN_AGENT: PrimitiveId = 4;
 pub const SLEEP: PrimitiveId = 5;
 pub const EMIT_RESULT: PrimitiveId = 6;
 pub const MEM_FS_DELETE: PrimitiveId = 7;
+pub const MEM_FS_EDIT: PrimitiveId = 8;
+pub const MEM_FS_SEARCH: PrimitiveId = 9;
 
 const STR: ArgType = ArgType::Str;
 const UINT: ArgType = ArgType::Uint;
@@ -122,6 +124,20 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
         params: &[Param { key: "path", ty: STR }],
         description: "Delete a file from the in-memory store. Destructive and irreversible.",
         destructive: true,
+    },
+    PrimitiveSpec {
+        id: MEM_FS_EDIT,
+        name: "mem_fs_edit",
+        params: &[Param { key: "path", ty: STR }, Param { key: "old", ty: STR }, Param { key: "new", ty: STR }],
+        description: "Replace the first occurrence of `old` with `new` in a file. Not destructive (reversible edit).",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: MEM_FS_SEARCH,
+        name: "mem_fs_search",
+        params: &[Param { key: "query", ty: STR }],
+        description: "List the paths of files whose contents contain `query`.",
+        destructive: false,
     },
 ];
 
