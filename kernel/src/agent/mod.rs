@@ -66,6 +66,39 @@ pub fn demo() {
     demo_phase_c();
     demo_phase_d();
     demo_phase_e();
+    demo_phase_f();
+}
+
+/// Phase F demo: place a skill (trusted), keep only L0 metadata until a matching
+/// task loads the L1 body, and run its bundled tool through Synapse.
+#[cfg(not(test))]
+fn demo_phase_f() {
+    use crate::agent::agent_loop::ToolDispatch;
+    use crate::serial_println;
+    use crate::skills::{index, loader, package};
+    serial_println!("Chitti: --- Skills: progressive disclosure (Phase F) ---");
+    let id = types::next_skill_id();
+    if package::sample_note_summarizer(id).place_trusted().is_err() {
+        serial_println!("Chitti: skill> placement failed");
+        return;
+    }
+    serial_println!("Chitti: skill> placed 'note-summarizer' (L0 metadata in index; body NOT loaded)");
+    crate::synapse::fs::write("mynotes", b"topic: the launch window opens tuesday");
+
+    let mut orch = orchestrator::Orchestrator::spawn(manifest::orchestrator_manifest(), 21);
+    // An unrelated task matches nothing → no body load.
+    let unrelated = index::match_task("calculate orbital mechanics").is_some();
+    serial_println!("Chitti: skill> unrelated task matched a skill: {} (should be false)", unrelated);
+    // A matching task loads the body (L1) on demand.
+    if let Some(meta) = index::match_task("summarize my notes") {
+        loader::load_body(&mut orch.session, meta.id, orchestrator::now());
+        serial_println!("Chitti: skill> matched '{}' → L1 body loaded into context on demand", meta.name);
+    }
+    // The bundled tool runs through Synapse (cap-checked, audited).
+    let mut router = crate::tools::Router::new();
+    let out = router.call(&mut orch.session, orch.caller, &rule_steps::tool("note_search", rule_steps::args(&[("query", "launch")])));
+    serial_println!("Chitti: skill> bundled note_search via Synapse -> {}", out.result);
+    let _ = id;
 }
 
 /// Phase E demo: the taint gate blocks an injected destructive tool call at the

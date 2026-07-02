@@ -34,8 +34,8 @@ pub fn synapse_tool(
     name: &str,
     description: &str,
     input_schema: &str,
-    primitive: &'static str,
-    arg_map: &'static [(&'static str, &'static str)],
+    primitive: &str,
+    arg_map: &[(&str, &str)],
     required: &[&str],
 ) -> ToolDef {
     ToolDef {
@@ -43,6 +43,9 @@ pub fn synapse_tool(
         description: description.to_string(),
         input_schema: input_schema.to_string(),
         required: required.iter().map(|s| s.to_string()).collect(),
-        binding: ToolBinding::Synapse { primitive, arg_map },
+        binding: ToolBinding::Synapse {
+            primitive: primitive.to_string(),
+            arg_map: arg_map.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(),
+        },
     }
 }

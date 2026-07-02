@@ -31,6 +31,7 @@ pub mod security;
 pub mod serial;
 pub mod session;
 pub mod shell;
+pub mod skills;
 pub mod tools;
 #[cfg(target_arch = "x86_64")]
 pub mod smp;

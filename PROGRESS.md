@@ -116,3 +116,19 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   replans); aarch64 builds; **live boot** shows the injected delete blocked (secret survives) and
   a compiled intent replaying with +0 inference.
 - Next: Phase F — skill subsystem (package/index/loader, progressive disclosure) + sample skill.
+
+## Phase F — skill subsystem (progressive disclosure)  ✅
+
+- `kernel/src/skills/`: `index.rs` (L0 metadata registry + description-based `match_task`; full
+  manifest persisted to the store), `loader.rs` (progressive disclosure — `load_body` L1 on match
+  tagged `SkillInstalled`, `load_asset` L2 demand-paged, tier tracking on `skills_in_scope`),
+  `package.rs` (SkillPackage format + `place_trusted` + `sample_note_summarizer`; bundled tools
+  register via `tools::provider` and bind to existing Synapse primitives), `install.rs` (stub → G).
+- `orchestrator.router()` wires the `load_skill` tool hook. `ToolBinding::Synapse` made owned so
+  runtime-registered bundled tools bind like builtins. Fs READ now also grants MEM_FS_SEARCH,
+  WRITE grants MEM_FS_EDIT.
+- Gate: x86_64 `cargo xtask test` = 95/95 (3 new: progressive-disclosure-loads-body-only-on-match
+  [+ unrelated-loads-nothing], bundled-tool-capability-gated, L2-asset-demand-paged); aarch64
+  builds; **live boot**: skill placed L0-only, unrelated task matched=false, matching task loads
+  L1 body, bundled note_search runs through Synapse.
+- Next: Phase G — permissioned install (Ed25519 verify + consent + skill-agent) + signed packages.

@@ -65,3 +65,11 @@ Consequential ones flagged **REVISIT**.
   and acceptance (b) "refused at spawn".
 - **Sub-agents cannot sub-delegate by default:** the `spawn_subagent` hook gives sub-agents a
   plain Router (no spawn hook), and `max_depth` caps recursion regardless.
+- **Skill-bundled tools bind to existing Synapse primitives (Phase F):** the handoff calls
+  bundled code "registered as Synapse primitives, capability-gated." On bare metal we cannot
+  safely load arbitrary native code at runtime, so a `BundledTool.synapse_primitive` names an
+  existing, vetted primitive (the sample `note_search` → `mem_fs_search`). The tool is still a
+  first-class, capability-checked, audited Synapse call; only *arbitrary new native code* is out
+  of scope. REVISIT if a sandboxed skill-code execution model is added later.
+- **ToolBinding::Synapse is owned (String/Vec), not &'static:** required so skill-bundled tools
+  registered at runtime bind exactly like builtins.

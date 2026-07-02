@@ -109,9 +109,11 @@ pub fn primitives_for(caps: &[CapabilityRequest]) -> Vec<PrimitiveId> {
             CapDomain::Fs => {
                 if c.rights.contains(Rights::READ) {
                     prims.push(registry::MEM_FS_READ);
+                    prims.push(registry::MEM_FS_SEARCH); // search is a read-only query
                 }
                 if c.rights.contains(Rights::WRITE) {
                     prims.push(registry::MEM_FS_WRITE);
+                    prims.push(registry::MEM_FS_EDIT); // edit is a guarded write
                 }
                 if c.rights.contains(Rights::LIST) {
                     prims.push(registry::LIST);
