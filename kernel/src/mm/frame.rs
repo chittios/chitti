@@ -107,6 +107,39 @@ impl BitmapFrameAllocator {
         scan(self, hint..self.frame_count).or_else(|| scan(self, 0..hint))
     }
 
+    /// Allocate `count` *physically contiguous* free frames, returning the
+    /// base physical address. Needed for DMA regions (the virtio virtqueue and
+    /// request buffers) that a device accesses by physical address and that
+    /// must be contiguous. A linear first-fit scan; `count` is tiny in
+    /// practice (a virtqueue is a handful of pages).
+    pub fn allocate_contiguous(&mut self, count: u64) -> Option<u64> {
+        if count == 0 {
+            return None;
+        }
+        let mut start = 0u64;
+        while start + count <= self.frame_count {
+            // Find the first free frame at or after `start`.
+            if get_bit(self.bitmap, start) {
+                start += 1;
+                continue;
+            }
+            // Check the next `count` frames are all free.
+            let run_ok = (start..start + count).all(|f| !get_bit(self.bitmap, f));
+            if run_ok {
+                for f in start..start + count {
+                    set_bit(self.bitmap, f, true);
+                }
+                return Some(start * FRAME_SIZE);
+            }
+            // Skip past the blocking used frame.
+            match (start..start + count).find(|&f| get_bit(self.bitmap, f)) {
+                Some(blocker) => start = blocker + 1,
+                None => start += 1,
+            }
+        }
+        None
+    }
+
     /// Return a previously allocated frame to the pool.
     pub fn free(&mut self, phys: u64) {
         let frame = phys / FRAME_SIZE;

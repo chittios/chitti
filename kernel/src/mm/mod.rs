@@ -81,6 +81,20 @@ pub fn init(memmap: &[&crate::limine_protocol::MemmapEntry], hhdm_offset: u64) {
     heap::init(&FRAME_ALLOCATOR);
 }
 
+/// Allocate a physically-contiguous, zeroed DMA region of at least `bytes`,
+/// returning `(physical_address, virtual_address)`. The physical address is
+/// what a device (virtio) is handed; the virtual address (via the HHDM) is how
+/// the CPU accesses the same memory. Leaked for the device's lifetime.
+pub fn alloc_dma(bytes: usize) -> Option<(u64, u64)> {
+    let frames = (bytes as u64).div_ceil(frame::FRAME_SIZE);
+    let phys = FRAME_ALLOCATOR.with(|slot| slot.as_mut().and_then(|a| a.allocate_contiguous(frames)))?;
+    let virt = crate::arch::x86_64::paging::phys_to_virt(phys);
+    // SAFETY: `virt` maps `frames * FRAME_SIZE` freshly-allocated, exclusively
+    // owned bytes through the HHDM; zeroing them is sound.
+    unsafe { core::ptr::write_bytes(virt as *mut u8, 0, (frames * frame::FRAME_SIZE) as usize) };
+    Some((phys, virt))
+}
+
 /// Map one 4 KiB MMIO page at physical address `phys` into the HHDM and
 /// return the virtual address `phys` is now reachable at. Used for
 /// memory-mapped device registers Limine's HHDM does not cover -- notably the
