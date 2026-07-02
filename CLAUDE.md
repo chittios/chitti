@@ -1,6 +1,27 @@
 *"This project is specified in `CHITTI_OS_HANDOFF.md`. Read it fully before acting. Follow the locked decisions in Part 2 and the guardrails in Part 4. Work one phase at a time; do not start the next phase until the current phase's acceptance criteria pass in QEMU."*
 
-**Current phase: 7 (Stretch) — in progress. SMP / APIC-per-core: complete.**
+**Current phase: 7 (Stretch) — in progress. SMP + block-device FS: complete.**
+**Block-device FS (Phase 7 track 2) — complete.** A real filesystem on a real
+disk. `block/mod.rs` defines a `BlockDevice` trait (512-byte sectors);
+`block/ramdisk.rs` is a RAM-backed impl (the test suite mounts on it);
+`block/virtio.rs` is a **virtio-blk driver over the legacy PCI transport**
+(PCI scan on 0xCF8/0xCFC, legacy I/O BAR, feature negotiation, a polled
+single-request virtqueue with DMA buffers from `mm::alloc_dma`, which added
+`frame::allocate_contiguous`). `fs/mod.rs` is **SimpleFS**: superblock +
+fixed 64-byte inode table (8 direct blocks/inode) + data region, free blocks
+found by scanning live inodes (no bitmap to desync), write-through; supports
+format/mount/write/read/list/delete and a `mount_or_format`. `cargo xtask
+test` is now 69 tests (up from 64): 7 FS tests over the RAM disk, including a
+format→write→**unmount→remount**→read round-trip proving data lives in the
+device's blocks. On a real boot with a virtio-blk `-drive`, the boot demo bumps
+an on-disk boot counter — verified to **survive a reboot** ("boot #2 … the
+counter survived a reboot — durable storage works"). SimpleFS is a standalone
+subsystem for now (the Synapse in-memory store is unchanged); wiring it as
+Persona's durable tier-2 is a follow-on. Remaining Phase 7 tracks: framebuffer
+TUI, RISC-V port. (9B model still skipped per the Part 4 guardrail.)
+
+---
+*Prior in Phase 7:* **SMP / APIC-per-core — complete.**
 Multiple CPUs now execute kernel code concurrently under correct locks. The
 kernel `Locked` type (`mm/mod.rs`) is now a real **test-and-test-and-set
 spinlock** (atomic + interrupts-off while held) instead of the old

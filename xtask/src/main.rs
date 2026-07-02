@@ -252,17 +252,35 @@ fn qemu_base_cmd(iso: &Path) -> Command {
 }
 
 /// `cargo xtask run`: boot the real kernel interactively (serial to stdio,
-/// framebuffer in the QEMU display window).
+/// framebuffer in the QEMU display window). Attaches a persistent virtio-blk
+/// disk (`target/chitti-disk.img`) so the Phase 7 filesystem has real storage
+/// -- `disable-modern=on` selects the legacy interface the driver speaks.
 fn cmd_run(release: bool) -> Result<(), String> {
     let bin = build_kernel(release)?;
     let iso = assemble_image(&bin)?;
+    let disk = ensure_disk_image()?;
     let mut cmd = qemu_base_cmd(&iso);
     cmd.args(["-serial", "stdio"]);
+    cmd.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", disk.display()));
+    cmd.args(["-device", "virtio-blk-pci,drive=chittidisk,disable-modern=on"]);
     let status = cmd
         .status()
         .map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
     eprintln!("qemu exited: {status}");
     Ok(())
+}
+
+/// Create `target/chitti-disk.img` (a 4 MiB raw disk) if it does not exist,
+/// so the virtio-blk device has a backing file. Kept across runs so the
+/// SimpleFS boot counter persists.
+fn ensure_disk_image() -> Result<PathBuf, String> {
+    let path = repo_root().join("target/chitti-disk.img");
+    if !path.exists() {
+        let zeros = vec![0u8; 4 * 1024 * 1024];
+        std::fs::write(&path, &zeros).map_err(|e| format!("failed to create disk image: {e}"))?;
+        eprintln!("created fresh 4 MiB disk image at {}", path.display());
+    }
+    Ok(path)
 }
 
 /// `cargo xtask test`: run the in-kernel `custom_test_frameworks` test
