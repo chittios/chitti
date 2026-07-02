@@ -14,6 +14,7 @@ pub mod model;
 pub mod refcheck;
 pub mod sampler;
 pub mod tensor;
+pub mod tokenizer;
 
 #[cfg(test)]
 pub mod testdata;

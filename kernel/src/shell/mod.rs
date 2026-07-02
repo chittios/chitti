@@ -88,63 +88,191 @@ fn demo_phase6() {
     );
 }
 
-/// The interactive intent shell: read a line from COM1, run it as an intent
-/// (or a builtin), print the result, repeat. Never returns -- it is the
-/// system's steady state. A single session agent is reused so live context
-/// (and memory) carries across intents within a session.
+/// The interactive shell -- a Claude-Code-style chat REPL over COM1. Plain text
+/// is a chat message streamed through the Cortex model (generating until the
+/// model emits EOS or the user presses Ctrl+C); `/`-prefixed lines are commands
+/// (`/help`, `/infer`, `/do`, ...). Never returns -- it is the system's steady
+/// state.
 pub fn run() -> ! {
     serial_println!("");
-    serial_println!("Chitti: intent shell ready.");
-    serial_println!("  Type an intent, e.g.: write a file called todo with the text buy milk, then read it back");
-    serial_println!("  Builtins: help | infer | exit");
+    serial_println!("Chitti chat. Type a message; the model replies (Ctrl+C to stop generating).");
+    serial_println!("Commands start with '/': /help for the list.");
 
+    // Persona agent (for `/do <intent>`) reused across the session.
     let mut agent = Agent::spawn(persona::default_manifest("chitti"));
     let mut planner = RulePlanner;
+    // Chat session (model + tokenizer + KV cache), loaded lazily on first chat.
+    let mut chat: Option<ChatSession> = None;
     let mut line = String::new();
 
     loop {
-        serial_print!("chitti> ");
+        serial_print!("> ");
         line.clear();
         read_line(&mut line);
-        let intent = line.trim();
-        if intent.is_empty() {
+        let msg = line.trim();
+        if msg.is_empty() {
             continue;
         }
-        match intent {
-            "exit" | "quit" => {
-                serial_println!("Chitti: shell exiting; powering off.");
-                crate::arch::poweroff();
-            }
-            "help" => {
-                serial_println!("  intents: write a file called X with the text Y[, then read it back]");
-                serial_println!("           remember that K is V | what is K | list | say TEXT");
-                serial_println!("  builtins: infer (reference inference), bench (matvec throughput), perf (pp/tg tok/s), exit");
-            }
-            "infer" => run_infer(),
-            "bench" => run_bench(),
-            "perf" => run_perf(),
-            _ => {
-                let result = persona::compiled::run(&mut agent, intent, &mut planner);
-                // If the taint gate refused a destructive action, offer the
-                // human the explicit confirmation the gate requires.
-                if result.starts_with("refused:tainted:") {
-                    serial_println!("!! Destructive action justified by UNTRUSTED ingested content was refused.");
-                    serial_print!("   Confirm anyway? [y/N] ");
-                    let mut answer = String::new();
-                    read_line(&mut answer);
-                    if answer.trim().eq_ignore_ascii_case("y") {
-                        agent.set_confirm_destructive(true);
-                        let confirmed = persona::compiled::run(&mut agent, intent, &mut planner);
-                        agent.set_confirm_destructive(false);
-                        serial_println!("=> {}", confirmed);
-                    } else {
-                        serial_println!("=> aborted (not confirmed)");
-                    }
-                } else {
-                    serial_println!("=> {}", result);
+        if let Some(cmd) = msg.strip_prefix('/') {
+            let (name, arg) = match cmd.split_once(' ') {
+                Some((n, a)) => (n, a.trim()),
+                None => (cmd, ""),
+            };
+            match name {
+                "exit" | "quit" => {
+                    serial_println!("Chitti: powering off.");
+                    crate::arch::poweroff();
                 }
+                "help" => print_help(),
+                "infer" => run_infer(),
+                "bench" => run_bench(),
+                "perf" => run_perf(),
+                "clear" => {
+                    chat = None;
+                    serial_println!("(chat context cleared)");
+                }
+                "do" | "agent" => {
+                    if arg.is_empty() {
+                        serial_println!("usage: /do <intent>   e.g. /do remember that project is chitti");
+                    } else {
+                        run_intent_interactive(&mut agent, &mut planner, arg);
+                    }
+                }
+                other => serial_println!("unknown command '/{}' -- try /help", other),
             }
+            continue;
         }
+        // Plain text -> chat with the model.
+        if chat.is_none() {
+            serial_println!("(loading model...)");
+            chat = ChatSession::load();
+        }
+        match chat.as_mut() {
+            Some(sess) => sess.turn(msg),
+            None => serial_println!("no model bundled -- chat unavailable (try /infer, /do, /bench)"),
+        }
+    }
+}
+
+fn print_help() {
+    serial_println!("Chitti commands:");
+    serial_println!("  <message>        chat with the model (streams until EOS; Ctrl+C to stop)");
+    serial_println!("  /do <intent>     run a Persona intent (write a file called X with the text Y; ");
+    serial_println!("                   remember that K is V; what is K; list; say TEXT)");
+    serial_println!("  /clear           reset the chat context");
+    serial_println!("  /infer           reference inference (fixed prompt, parity check)");
+    serial_println!("  /bench           matvec kernel throughput");
+    serial_println!("  /perf            end-to-end prefill/decode tok/s");
+    serial_println!("  /help            this list");
+    serial_println!("  /exit            power off");
+}
+
+/// A live chat: the model, its BPE tokenizer, and a persistent KV/recurrent
+/// cache so context carries across turns (`/clear` drops it).
+struct ChatSession {
+    model: crate::cortex::model::Model<'static>,
+    tok: crate::cortex::tokenizer::Tokenizer,
+    kv: crate::cortex::model::Cache,
+    state: crate::cortex::model::State,
+    pos: usize,
+}
+
+impl ChatSession {
+    /// Load the bundled model + build the tokenizer. `None` if no model.
+    fn load() -> Option<Self> {
+        use crate::cortex::{gguf, model, model_module};
+        let bytes = model_module()?;
+        let g = gguf::Gguf::parse(bytes).ok()?;
+        let m = model::Model::load(g).ok()?;
+        let tok = m.tokenizer();
+        let kv = m.new_cache();
+        let state = m.new_state();
+        Some(Self { model: m, tok, kv, state, pos: 0 })
+    }
+
+    /// Run one chat turn: encode the user message with the Qwen chat template
+    /// (continuing the running context), then greedily decode + stream until
+    /// the model emits EOS or the user presses Ctrl+C.
+    fn turn(&mut self, msg: &str) {
+        use crate::cortex::{model, tokenizer};
+        let first = self.pos == 0;
+        // Build this turn's prompt tokens (chat template).
+        let mut ids: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        let push_text = |ids: &mut alloc::vec::Vec<usize>, s: &str| {
+            for t in self.tok.encode(s) {
+                ids.push(t as usize);
+            }
+        };
+        if first {
+            ids.push(self.tok.im_start as usize);
+            push_text(&mut ids, "system\nYou are Chitti, a helpful assistant.");
+            ids.push(self.tok.im_end as usize);
+            push_text(&mut ids, "\n");
+        }
+        ids.push(self.tok.im_start as usize);
+        push_text(&mut ids, "user\n");
+        push_text(&mut ids, msg);
+        ids.push(self.tok.im_end as usize);
+        push_text(&mut ids, "\n");
+        ids.push(self.tok.im_start as usize);
+        push_text(&mut ids, "assistant\n");
+
+        // Prefill this turn, then decode from the last position's logits.
+        self.model.prefill(&ids, self.pos, &mut self.kv, &mut self.state);
+        self.pos += ids.len();
+
+        let eos = self.model.eos();
+        let im_end = self.tok.im_end as usize;
+        let mut next = model::argmax(&self.state.logits);
+        let mut stream = tokenizer::Stream::new();
+        serial_print!("chitti: ");
+        let mut n = 0usize;
+        loop {
+            if next == eos || next == im_end {
+                break;
+            }
+            if n >= 2048 {
+                serial_println!("\n[reached max tokens]");
+                break;
+            }
+            // Non-blocking Ctrl+C (0x03) check between tokens.
+            if let Some(3) = crate::console::read_byte() {
+                serial_println!("\n[stopped]");
+                break;
+            }
+            let piece = stream.push(&self.tok, self.model.token_str(next));
+            serial_print!("{}", piece);
+            self.model.forward(next, self.pos, &mut self.kv, &mut self.state, true);
+            self.pos += 1;
+            n += 1;
+            next = model::argmax(&self.state.logits);
+        }
+        serial_println!("");
+        // Close the assistant turn in the cache so the next turn continues cleanly.
+        self.model.forward(im_end, self.pos, &mut self.kv, &mut self.state, false);
+        self.pos += 1;
+    }
+}
+
+/// Route one typed intent through the Persona agent (used by `/do`), including
+/// the taint-gate confirmation prompt.
+fn run_intent_interactive(agent: &mut Agent, planner: &mut RulePlanner, intent: &str) {
+    let result = persona::compiled::run(agent, intent, planner);
+    if result.starts_with("refused:tainted:") {
+        serial_println!("!! Destructive action justified by UNTRUSTED ingested content was refused.");
+        serial_print!("   Confirm anyway? [y/N] ");
+        let mut answer = String::new();
+        read_line(&mut answer);
+        if answer.trim().eq_ignore_ascii_case("y") {
+            agent.set_confirm_destructive(true);
+            let confirmed = persona::compiled::run(agent, intent, planner);
+            agent.set_confirm_destructive(false);
+            serial_println!("=> {}", confirmed);
+        } else {
+            serial_println!("=> aborted (not confirmed)");
+        }
+    } else {
+        serial_println!("=> {}", result);
     }
 }
 

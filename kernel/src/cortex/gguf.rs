@@ -89,6 +89,9 @@ pub struct Gguf<'a> {
     /// Token id → token string (GPT-2 byte-level encoding), sliced from the
     /// module. Empty if the model carried no token table.
     pub tokens: Vec<&'a str>,
+    /// BPE merge rules in priority order (`"<left> <right>"` per entry), for
+    /// the text encoder (`cortex::tokenizer`). Empty if none were present.
+    pub merges: Vec<&'a str>,
 }
 
 /// Bounds-checked forward cursor over the module bytes.
@@ -209,6 +212,7 @@ impl<'a> Gguf<'a> {
         let mut get_f32: BTreeMap<&str, f32> = BTreeMap::new();
         let mut alignment = DEFAULT_ALIGNMENT;
         let mut tokens: Vec<&str> = Vec::new();
+        let mut merges: Vec<&str> = Vec::new();
 
         for _ in 0..n_kv {
             let key = c.gstr()?;
@@ -228,6 +232,7 @@ impl<'a> Gguf<'a> {
                     get_f32.insert(key, v);
                 }
                 Value::StrArray(v) if key == "tokenizer.ggml.tokens" => tokens = v,
+                Value::StrArray(v) if key == "tokenizer.ggml.merges" => merges = v,
                 _ => {}
             }
         }
@@ -273,7 +278,7 @@ impl<'a> Gguf<'a> {
 
         let tensor_data_base = align_up(c.pos, alignment);
 
-        Ok(Self { data, tensor_data_base, config, tensors, tokens })
+        Ok(Self { data, tensor_data_base, config, tensors, tokens, merges })
     }
 
     pub fn tensor(&self, name: &str) -> Result<&TensorInfo, GgufError> {
