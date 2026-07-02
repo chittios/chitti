@@ -118,6 +118,43 @@ impl Orchestrator {
         result
     }
 
+    /// Handle an intent through the **compiled-intent cache** (Phase E): if a
+    /// validated plan for this intent exists and its preconditions still hold,
+    /// replay it deterministically with **zero inference**; otherwise run the
+    /// loop and compile the resulting plan for next time. Refused/denied runs
+    /// (non-`Final`) are never compiled.
+    pub fn handle_compiled(&mut self, intent: &str, steps: &mut dyn StepSource, tools: &mut dyn ToolDispatch) -> LoopResult {
+        use crate::agent::compiled;
+        if let Some((calls, answer)) = compiled::lookup(intent) {
+            self.session.push_message(Role::User, intent.to_string(), Provenance::UserTyped, now());
+            crate::ktrace::log_fmt(format_args!("orchestrator.compiled_hit: '{}' (no inference)", intent));
+            let ans = compiled::replay(&mut self.session, self.caller, &calls, &answer, tools);
+            let _ = session::save(&self.session);
+            return LoopResult {
+                answer: ans,
+                stop: crate::agent::agent_loop::StopReason::Final,
+                turns: 0,
+                tool_calls: calls.len() as u32,
+            };
+        }
+        let start = self.session.messages.len();
+        let result = self.handle(intent, steps, tools);
+        if result.stop == crate::agent::agent_loop::StopReason::Final {
+            let calls = compiled::collect_calls(&self.session.messages[start..]);
+            if !calls.is_empty() {
+                compiled::compile(intent, calls, result.answer.clone());
+            }
+        }
+        result
+    }
+
+    /// A taint-aware Router for this orchestrator (Phase E): destructive/
+    /// high-privilege tools are gated on the provenance of the justifying
+    /// context. Set `human_confirmed` after an explicit shell confirmation.
+    pub fn safe_router(&self) -> crate::tools::Router {
+        crate::tools::Router::taint_aware()
+    }
+
     /// Tear down the agent: mark it done (its parked task's stack is reclaimed
     /// by the scheduler's existing dead-task policy, as with `persona`).
     pub fn kill(&mut self) {
