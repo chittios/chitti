@@ -14,6 +14,7 @@ const BOOT_MSG: &str = "Chitti: boot ok";
 fn run_os() -> ! {
     chitti_kernel::synapse::demo();
     chitti_kernel::shell::demo();
+    chitti_kernel::agent::demo();
     chitti_kernel::shell::run();
 }
 

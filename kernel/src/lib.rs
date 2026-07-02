@@ -29,6 +29,7 @@ pub mod qemu;
 pub mod sched;
 pub mod security;
 pub mod serial;
+pub mod session;
 pub mod shell;
 #[cfg(target_arch = "x86_64")]
 pub mod smp;
