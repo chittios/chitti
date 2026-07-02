@@ -49,8 +49,12 @@ struct Job {
     n_cols: AtomicUsize,
     m_count: AtomicUsize, // activation columns (1 = decode matvec, >1 = batched prefill)
     n_rows: AtomicUsize,  // total rows (the `y` column stride)
-    // Generic (non-Q8_0) mode: `qtype` != 0 selects `matvec_quant_rows` over the
-    // f32 activation `xf`; `qtype` == 0 is the Q8_0 SDOT matmul over `xq`/`xs`.
+    // Kernel selector, decoupled from `qtype`: 0 = Q8_0 SDOT matmul (xq/xs),
+    // 1 = Q4_0 SDOT (xq/xs), 2 = generic dequant-and-dot over the f32 `xf`
+    // (using `qtype` as the dequant type). Keeping this separate from `qtype`
+    // avoids the collision where Q4_0 could mean either the SDOT or the generic
+    // path.
+    mode: AtomicUsize,
     qtype: AtomicUsize,
     xf: AtomicPtr<f32>,
     row_start: [AtomicUsize; MAX_CPUS],
@@ -66,6 +70,7 @@ static JOB: Job = Job {
     n_cols: AtomicUsize::new(0),
     m_count: AtomicUsize::new(1),
     n_rows: AtomicUsize::new(0),
+    mode: AtomicUsize::new(0),
     qtype: AtomicUsize::new(0),
     xf: AtomicPtr::new(core::ptr::null_mut()),
     row_start: [const { AtomicUsize::new(0) }; MAX_CPUS],
@@ -198,19 +203,16 @@ fn worker_loop(slot: usize) -> ! {
             let m_count = JOB.m_count.load(Ordering::Relaxed);
             let n_rows = JOB.n_rows.load(Ordering::Relaxed);
             let qtype = JOB.qtype.load(Ordering::Relaxed);
+            let mode = JOB.mode.load(Ordering::Relaxed);
             // SAFETY: the BSP guarantees (via the `go` release/acquire) that the
             // operands are published and this slot's [rs, re) is in bounds and
             // disjoint from every other core's range, so the writes to `y` don't
             // alias. The weights/activation are read-only during the pass.
             unsafe {
-                if qtype == 0 {
-                    tensor::matmul_q8_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols);
-                } else if qtype as u32 == tensor::QT_Q4_0 {
-                    // Q4_0 SDOT: int8 activation (xq/xs), nibbles unpacked on the fly.
-                    tensor::matvec_q4_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols);
-                } else {
-                    // Generic dequant path: f32 activation (xf).
-                    tensor::matvec_quant_rows(qtype as u32, w, JOB.xf.load(Ordering::Relaxed), y, rs, re, n_cols);
+                match mode {
+                    0 => tensor::matmul_q8_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols),
+                    1 => tensor::matvec_q4_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols),
+                    _ => tensor::matvec_quant_rows(qtype as u32, w, JOB.xf.load(Ordering::Relaxed), y, rs, re, n_cols),
                 }
             }
         }
@@ -253,7 +255,7 @@ pub unsafe fn matmul_sdot(
     JOB.n_cols.store(n_cols, Ordering::Relaxed);
     JOB.m_count.store(m_count, Ordering::Relaxed);
     JOB.n_rows.store(n_rows, Ordering::Relaxed);
-    JOB.qtype.store(0, Ordering::Relaxed); // Q8_0 SDOT mode
+    JOB.mode.store(0, Ordering::Relaxed); // Q8_0 SDOT matmul
     for s in 0..workers {
         JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
         JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
@@ -296,7 +298,8 @@ pub unsafe fn matvec_quant(qt: u32, w: *const u8, x: *const f32, y: *mut f32, n_
     JOB.y.store(y, Ordering::Relaxed);
     JOB.n_cols.store(n_cols, Ordering::Relaxed);
     JOB.n_rows.store(n_rows, Ordering::Relaxed);
-    JOB.qtype.store(qt as usize, Ordering::Relaxed); // generic mode
+    JOB.qtype.store(qt as usize, Ordering::Relaxed);
+    JOB.mode.store(2, Ordering::Relaxed); // generic dequant+dot
     for s in 0..workers {
         JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
         JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
@@ -333,7 +336,7 @@ pub unsafe fn matvec_q4_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
     JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
     JOB.y.store(y, Ordering::Relaxed);
     JOB.n_cols.store(n_cols, Ordering::Relaxed);
-    JOB.qtype.store(tensor::QT_Q4_0 as usize, Ordering::Relaxed); // Q4_0 SDOT mode
+    JOB.mode.store(1, Ordering::Relaxed); // Q4_0 SDOT
     for s in 0..workers {
         JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
         JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);

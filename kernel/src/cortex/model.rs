@@ -53,28 +53,26 @@ fn qtensor<'a>(g: &Gguf<'a>, name: &str, n_cols: usize, n_rows: usize) -> Result
     Ok(QWeight { data: g.tensor_bytes(name, bytes)?, qt })
 }
 
-/// Dispatch one matvec `y = W · x` by the weight's quant type: Q8_0 takes the
-/// fast int8-SDOT (+ SMP, batched-capable) path; every other type takes the
-/// generic dequant-and-dot path (still row-split across cores on aarch64).
+/// Dispatch one matvec `y = W · x` by the weight's quant type. Q8_0 takes the
+/// fast int8-SDOT path (SMP + batched-capable). Every other type takes the
+/// exact-f32 dequant-and-dot path (still row-split across cores): the int8
+/// activation the SDOT relies on is fine for Q8_0 (validated to preserve token
+/// parity), but on the 9B's Q4_0 (4-bit) weights over 32 layers its error
+/// accumulates enough to derail greedy decoding, so those go exact.
 fn matvec_qw(qw: QWeight, x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &mut [f32], n_rows: usize, n_cols: usize) {
     if qw.qt == tensor::QT_Q8_0 {
         tensor::matvec_q8_0_fast(qw.data, x, y, xq, xs, n_rows, n_cols);
         return;
     }
-    if qw.qt == tensor::QT_Q4_0 {
-        tensor::matvec_q4_0_fast(qw.data, x, y, xq, xs, n_rows, n_cols);
-        return;
-    }
     debug_assert_eq!(x.len(), n_cols);
     debug_assert_eq!(y.len(), n_rows);
+    let _ = (&mut *xq, &mut *xs);
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: `qw.data` holds `n_rows` rows for `qw.qt`/`n_cols` (validated at
-    // load); `x`/`y` are `n_cols`/`n_rows`.
+    // SAFETY: `qw.data` holds `n_rows` rows for `qw.qt`/`n_cols`; `x`/`y` sized.
     unsafe {
         crate::arch::aarch64::smp::matvec_quant(qw.qt, qw.data.as_ptr(), x.as_ptr(), y.as_mut_ptr(), n_rows, n_cols);
     }
     #[cfg(not(target_arch = "aarch64"))]
-    // SAFETY: same contract; single-core generic path.
     unsafe {
         tensor::matvec_quant_rows(qw.qt, qw.data.as_ptr(), x.as_ptr(), y.as_mut_ptr(), 0, n_rows, n_cols);
     }

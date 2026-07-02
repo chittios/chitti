@@ -221,6 +221,62 @@ pub fn bench_matvec() -> BenchResult {
     }
 }
 
+/// Self-check: build a small Q4_0 weight + activation, and compare the exact
+/// scalar `matvec_q4_0` against the int8-activation `matvec_q4_0_sdot_rows`.
+/// Returns the aggregate relative RMS error (should be ~1% -- int8 activation
+/// noise; a much larger value means the SDOT kernel is buggy). aarch64 only.
+#[cfg(target_arch = "aarch64")]
+pub fn check_q4_0_sdot() -> f32 {
+    use tensor::{Q4_0_BLOCK_BYTES, QK};
+    const ROWS: usize = 512;
+    const COLS: usize = 1024;
+    let blocks = COLS / QK;
+    let row_bytes = blocks * Q4_0_BLOCK_BYTES;
+    let mut w = alloc::vec![0u8; ROWS * row_bytes];
+    let mut seed: u32 = 0x9e37_79b9;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        seed
+    };
+    for r in 0..ROWS {
+        for b in 0..blocks {
+            let base = r * row_bytes + b * Q4_0_BLOCK_BYTES;
+            w[base] = 0x00;
+            w[base + 1] = 0x20; // f16 ~0.125
+            for i in 0..QK / 2 {
+                w[base + 2 + i] = (next() >> 24) as u8;
+            }
+        }
+    }
+    let mut x = alloc::vec![0.0f32; COLS];
+    for (i, xi) in x.iter_mut().enumerate() {
+        *xi = ((i % 23) as f32 - 11.0) * 0.07;
+    }
+    let mut y_exact = alloc::vec![0.0f32; ROWS];
+    tensor::matvec_q4_0(&w, &x, &mut y_exact, ROWS, COLS);
+    let mut xq = alloc::vec![0i8; COLS];
+    let mut xs = alloc::vec![0.0f32; blocks];
+    tensor::quantize_activations_q8(&x, &mut xq, &mut xs);
+    let mut y_sdot = alloc::vec![0.0f32; ROWS];
+    // SAFETY: sizes match the kernel's contract.
+    unsafe {
+        tensor::matvec_q4_0_sdot_rows(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), y_sdot.as_mut_ptr(), 0, ROWS, COLS);
+    }
+    let mut num = 0.0f32;
+    let mut den = 0.0f32;
+    for r in 0..ROWS {
+        let d = y_sdot[r] - y_exact[r];
+        num += d * d;
+        den += y_exact[r] * y_exact[r];
+    }
+    crate::serial_println!("q4sdot> y_exact[0..3]={} {} {} y_sdot={} {} {}", y_exact[0], y_exact[1], y_exact[2], y_sdot[0], y_sdot[1], y_sdot[2]);
+    if den > 0.0 {
+        tensor::libm_sqrtf(num / den)
+    } else {
+        0.0
+    }
+}
+
 /// Throughput of an end-to-end inference run, split into prompt prefill (`pp`)
 /// and token generation (`tg`) -- the two numbers `llama-bench` reports, so the
 /// `perf` shell builtin is directly comparable. Correctness is *not* asserted
