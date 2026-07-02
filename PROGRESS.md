@@ -101,3 +101,18 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   5-step-task-via-todos, fork-diverges-without-mutating-parent); aarch64 builds; **live boot**
   shows compaction (162→127 tokens), recall of a compacted fact verbatim, and an independent fork.
 - Next: Phase E — permission+safety (taint+cap gating in dispatch, compiled-intent replay).
+
+## Phase E — permission + safety integration  ✅
+
+- `agent/compiled.rs`: agent-layer compiled intents — record a validated tool-call plan keyed by
+  (intent signature, file-content preconditions); `lookup` replays deterministically with ZERO
+  inference when preconditions hold, `compile` caches after a Final run, stale preconditions
+  re-plan. Replays still flow each call through Router→Synapse (gated + audited).
+- `orchestrator.handle_compiled` (cache-first, compile-on-success) + `safe_router` (taint-aware:
+  justification derived from the session's worst resident provenance; `human_confirmed` flips the
+  shell-approval bit). Destructive/tainted calls hit the existing Synapse taint gate.
+- Gate: x86_64 `cargo xtask test` = 92/92 (4 new: injected-destructive-gated+audited,
+  confirmed-destructive-proceeds, repeated-plan-replays-without-inference, stale-precondition-
+  replans); aarch64 builds; **live boot** shows the injected delete blocked (secret survives) and
+  a compiled intent replaying with +0 inference.
+- Next: Phase F — skill subsystem (package/index/loader, progressive disclosure) + sample skill.
