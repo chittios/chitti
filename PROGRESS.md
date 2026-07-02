@@ -15,3 +15,19 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   `cargo xtask test` (x86_64 QEMU) + aarch64 build. 9B chat fix deferred to the end.
 
 <!-- milestone entries appended below -->
+
+## Milestone 0 — shared type contract  ✅
+
+- Added deps: serde (derive/alloc/no_std), postcard (alloc), bitflags v2 (serde) — all compile
+  under `-Z build-std` on both arches, none pull std.
+- `kernel/src/agent/types.rs`: the full CHITTI_SCHEMAS.md contract — id newtypes + monotonic
+  minters, `Provenance` (+join/is_untrusted), `CapDomain`/`Rights`(bitflags)/`Scope`/
+  `CapabilityRequest` (+`contains`, `intersect_caps` attenuation), `AgentManifest`, `Session`
+  (+ all sub-structs), `SkillManifest`+`InstallRecord`.
+- Deviation: dropped the schema's `#[serde(tag/content)]` on Provenance/Scope/Origin/
+  InstallSource — internally/adjacently-tagged enums need `deserialize_any`, unsupported by
+  postcard (non-self-describing). Externally-tagged instead; postcard is the canonical format,
+  JSON is debug-only. schema_version stays 1 (no field meaning changed). Logged DECISIONS.md.
+- Gate: x86_64 `cargo xtask test` = 73/73 (4 new: postcard roundtrip, provenance/scope survive,
+  taint join, cap attenuation narrows-never-widens). aarch64 builds clean.
+- Next: Phase A — Session object + agentic loop core with the StepSource seam.
