@@ -217,6 +217,32 @@ mod tests {
     }
 
     #[test_case]
+    fn topk_topp_confines_to_the_nucleus() {
+        // A distribution with a few strong tokens and a long, heavy tail (the
+        // shape that makes a thinking model degenerate under pure temperature).
+        let vocab = 200usize;
+        let mut logits = alloc::vec![0.1f32; vocab];
+        logits[10] = 5.0;
+        logits[20] = 4.5;
+        logits[30] = 4.0;
+        // Over many draws, top_k=3 / top_p=0.95 must NEVER pick a tail token.
+        let mut rng = Rng::new(12345);
+        for _ in 0..2000 {
+            let mut l = logits.clone();
+            let pick = sample_topk_topp(&mut l, 0.7, 3, 0.95, &mut rng, None);
+            assert!(matches!(pick, 10 | 20 | 30), "nucleus sampling drew a tail token {pick}");
+        }
+    }
+
+    #[test_case]
+    fn topk_topp_temp_zero_is_greedy() {
+        let mut logits = alloc::vec![0.0f32; 50];
+        logits[7] = 3.0;
+        let mut rng = Rng::new(1);
+        assert_eq!(sample_topk_topp(&mut logits, 0.0, 20, 0.8, &mut rng, None), 7);
+    }
+
+    #[test_case]
     fn rng_f32_in_unit_interval() {
         let mut r = Rng::new(7);
         for _ in 0..10_000 {

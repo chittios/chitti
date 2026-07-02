@@ -243,9 +243,26 @@ impl ChatSession {
         let mut stream = tokenizer::Stream::new();
         serial_print!("chitti: ");
         let mut n = 0usize;
+        // Anti-degeneration guard: a thinking model that slips into a loop can
+        // emit the same token forever. Nucleus sampling (pick) makes that rare,
+        // but as a hard backstop we stop if a token repeats too many times in a
+        // row, so the chat never spews an endless run of "..." / one word.
+        let mut last_tok = usize::MAX;
+        let mut run_len = 0usize;
+        const MAX_RUN: usize = 5;
         loop {
             if next == eos || next == im_end {
                 break;
+            }
+            if next == last_tok {
+                run_len += 1;
+                if run_len >= MAX_RUN {
+                    serial_println!("\n[stopped: repetition]");
+                    break;
+                }
+            } else {
+                run_len = 0;
+                last_tok = next;
             }
             if n >= 2048 {
                 serial_println!("\n[reached max tokens]");
