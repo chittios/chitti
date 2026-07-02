@@ -346,16 +346,40 @@ impl<'a> Model<'a> {
         let nq = c.head_count;
         let nkv = c.head_count_kv;
         let kv_dim = nkv * hd;
-        let group = nq / nkv;
-        let scale = 1.0 / tensor_sqrtf(hd as f32);
-        let (q_w, k_w, v_w, o_w, q_norm, k_norm) = match &self.layers[l].kind {
-            LayerKind::Attn { q, k, v, o, q_norm, k_norm } => (*q, *k, *v, *o, *q_norm, *k_norm),
+        let (q_w, k_w, v_w, o_w) = match &self.layers[l].kind {
+            LayerKind::Attn { q, k, v, o, .. } => (*q, *k, *v, *o),
             _ => unreachable!(),
         };
 
-        tensor::matvec_q8_0_fast(q_w, &s.norm, &mut s.q, &mut s.xq, &mut s.xs, nq * hd * 2, dim); // query+gate interleaved
+        // Projections into s.q (query+gate interleaved), s.k, s.v.
+        tensor::matvec_q8_0_fast(q_w, &s.norm, &mut s.q, &mut s.xq, &mut s.xs, nq * hd * 2, dim);
         tensor::matvec_q8_0_fast(k_w, &s.norm, &mut s.k, &mut s.xq, &mut s.xs, kv_dim, dim);
         tensor::matvec_q8_0_fast(v_w, &s.norm, &mut s.v, &mut s.xq, &mut s.xs, kv_dim, dim);
+
+        // Sequential (recurrent/causal) core: consumes s.q/s.k/s.v, writes s.attn_out.
+        self.attn_core(l, pos, cache, s);
+
+        tensor::matvec_q8_0_fast(o_w, &s.attn_out, &mut s.proj, &mut s.xq, &mut s.xs, dim, nq * hd);
+    }
+
+    /// The position-sequential part of an attention layer, shared by decode
+    /// (`attn_layer`) and batched prefill: QK-norm + partial RoPE, append K/V to
+    /// this layer's history, GQA causal attention, per-head sigmoid gate. Reads
+    /// the projections in `s.q`/`s.k`/`s.v`; writes `s.attn_out`. Kept separate
+    /// so the projections above can be batched across positions while this
+    /// (cheap, order-dependent) core stays identical -- parity by construction.
+    fn attn_core(&self, l: usize, pos: usize, cache: &mut Cache, s: &mut State) {
+        let c = &self.config;
+        let hd = c.head_dim;
+        let nq = c.head_count;
+        let nkv = c.head_count_kv;
+        let kv_dim = nkv * hd;
+        let group = nq / nkv;
+        let scale = 1.0 / tensor_sqrtf(hd as f32);
+        let (q_norm, k_norm) = match &self.layers[l].kind {
+            LayerKind::Attn { q_norm, k_norm, .. } => (*q_norm, *k_norm),
+            _ => unreachable!(),
+        };
 
         // QK-norm per head, partial RoPE on the first rope_dim dims.
         for h in 0..nq {
@@ -396,8 +420,6 @@ impl<'a> Model<'a> {
                 out[i] *= tensor::sigmoid(s.q[h * 2 * hd + hd + i]);
             }
         }
-
-        tensor::matvec_q8_0_fast(o_w, &s.attn_out, &mut s.proj, &mut s.xq, &mut s.xs, dim, nq * hd);
     }
 
     fn delta_layer(&self, l: usize, cache: &mut Cache, s: &mut State) {
@@ -406,14 +428,8 @@ impl<'a> Model<'a> {
         let conv_dim = c.ssm_conv_dim();
         let value_dim = c.ssm_inner;
         let nh = c.ssm_dt_rank; // = n_group; k and v head counts are equal
-        let hk = c.ssm_state; // head_k_dim = 128
-        let hv = c.ssm_head_dim(); // head_v_dim = 128
-        let key_dim = hk * c.ssm_n_group;
-        let ck = c.ssm_conv_kernel;
-        let (qkv_w, gate_w, conv1d, dt_bias, a_log, alpha_w, beta_w, norm_w, out_w) = match &self.layers[l].kind {
-            LayerKind::Delta { qkv, gate, conv1d, dt_bias, a_log, alpha, beta, norm, out } => {
-                (*qkv, *gate, *conv1d, *dt_bias, *a_log, *alpha, *beta, *norm, *out)
-            }
+        let (qkv_w, gate_w, alpha_w, beta_w, out_w) = match &self.layers[l].kind {
+            LayerKind::Delta { qkv, gate, alpha, beta, out, .. } => (*qkv, *gate, *alpha, *beta, *out),
             _ => unreachable!(),
         };
 
@@ -421,6 +437,31 @@ impl<'a> Model<'a> {
         tensor::matvec_q8_0_fast(gate_w, &s.norm, &mut s.z, &mut s.xq, &mut s.xs, value_dim, dim);
         tensor::matvec_q8_0_fast(alpha_w, &s.norm, &mut s.gates, &mut s.xq, &mut s.xs, nh, dim); // reuse gates as alpha
         tensor::matvec_q8_0_fast(beta_w, &s.norm, &mut s.betas, &mut s.xq, &mut s.xs, nh, dim);
+
+        // Sequential (recurrent) core: consumes s.qkv/s.z/s.gates/s.betas, writes s.delta_o.
+        self.delta_core(l, cache, s);
+
+        tensor::matvec_q8_0_fast(out_w, &s.delta_o, &mut s.proj, &mut s.xq, &mut s.xs, dim, value_dim);
+    }
+
+    /// The position-sequential (recurrent) part of a DeltaNet layer, shared by
+    /// decode (`delta_layer`) and batched prefill: gate/beta activation, causal
+    /// conv1d over the ring, and the gated delta rule that advances the
+    /// recurrent state. Reads the projections in `s.qkv`/`s.z`/`s.gates`
+    /// (=alpha)/`s.betas`; writes `s.delta_o`. Split out so the projections can
+    /// be batched while this order-dependent recurrence stays identical.
+    fn delta_core(&self, l: usize, cache: &mut Cache, s: &mut State) {
+        let c = &self.config;
+        let conv_dim = c.ssm_conv_dim();
+        let nh = c.ssm_dt_rank;
+        let hk = c.ssm_state;
+        let hv = c.ssm_head_dim();
+        let key_dim = hk * c.ssm_n_group;
+        let ck = c.ssm_conv_kernel;
+        let (conv1d, dt_bias, a_log, norm_w) = match &self.layers[l].kind {
+            LayerKind::Delta { conv1d, dt_bias, a_log, norm, .. } => (*conv1d, *dt_bias, *a_log, *norm),
+            _ => unreachable!(),
+        };
 
         // g = -exp(A_log) * softplus(alpha + dt_bias)  (log-decay); beta = sigmoid.
         for h in 0..nh {
@@ -491,8 +532,6 @@ impl<'a> Model<'a> {
                 out[vi] *= tensor::silu(s.z[h * hv + vi]);
             }
         }
-
-        tensor::matvec_q8_0_fast(out_w, &s.delta_o, &mut s.proj, &mut s.xq, &mut s.xs, dim, value_dim);
     }
 }
 
