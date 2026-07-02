@@ -229,6 +229,7 @@ pub fn run_acceptance() -> bool {
 /// Returns its raw bytes (a slice into module memory, reachable via the
 /// HHDM). `None` when the image was assembled without the model (the
 /// tensor unit tests don't need it).
+#[cfg(target_arch = "x86_64")]
 pub fn model_module() -> Option<&'static [u8]> {
     let response = crate::MODULE_REQUEST.response()?;
     response
@@ -236,4 +237,13 @@ pub fn model_module() -> Option<&'static [u8]> {
         .iter()
         .find(|m| m.path_ends_with(".gguf"))
         .map(|m| m.data())
+}
+
+/// aarch64 has no Limine boot module yet, so no model is bundled: the agent
+/// OS (Synapse/Persona/shell) runs, but `infer` reports no model. Loading a
+/// GGUF on the `-M virt -kernel` boot path (e.g. via `-initrd` / a DTB region)
+/// is future work.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn model_module() -> Option<&'static [u8]> {
+    None
 }

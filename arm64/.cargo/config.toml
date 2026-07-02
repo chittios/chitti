@@ -1,8 +1,0 @@
-[build]
-target = "../targets/aarch64-chitti.json"
-rustflags = ["-C", "link-arg=-Tlinker.ld"]
-
-[unstable]
-build-std = ["core", "compiler_builtins", "alloc"]
-build-std-features = ["compiler-builtins-mem"]
-json-target-spec = true

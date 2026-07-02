@@ -1,7 +1,30 @@
 *"This project is specified in `CHITTI_OS_HANDOFF.md`. Read it fully before acting. Follow the locked decisions in Part 2 and the guardrails in Part 4. Work one phase at a time; do not start the next phase until the current phase's acceptance criteria pass in QEMU."*
 
-**Current phase: 7 (Stretch) — in progress. SMP + block-device FS + framebuffer TUI: complete.**
-**aarch64 native port — foundation booting under HVF.** The x86 kernel can only
+**Current phase: 7 (Stretch) — in progress. SMP + block-device FS + framebuffer TUI + dual-arch (x86_64 + aarch64) kernel: complete.**
+**Unified dual-architecture kernel.** One `kernel/` crate now builds and boots
+for **both** x86_64 (Limine, under QEMU TCG) and **aarch64** (native on Apple
+Silicon via `qemu-system-aarch64 -accel hvf`). Arch is chosen explicitly, never
+host-detected: `cargo xtask build|run -arch x86_64|aarch64`. The split: an
+`arch` facade (`arch::interrupts`/`hlt`/`now_ms`) the whole kernel uses; per-arch
+modules (`arch/x86_64`, `arch/aarch64` — the latter: `-M virt -kernel` boot stub,
+identity-map MMU, PL011 UART, generic timer, DAIF interrupts, `wfi`); portable
+tensor kernels (SSE2/AVX2 ∣ NEON ∣ scalar behind one API); an arch-split
+`sched::context` (x86 naked switch + FXSAVE ∣ aarch64 cooperative `stp/ldp`
+switch of x19–x30 + d8–d15); arch-dispatched `serial`/`mm`/`console`; and
+x86-only device code (Limine, gdt/idt/pic/pit/keyboard, apic, smp, virtio,
+qemu, frame allocator + paged heap) cfg-gated out of aarch64, which instead uses
+an MMU identity map + a fixed-region heap. **Verified:** x86 builds + `cargo
+xtask test` 69/69 green; aarch64 builds and boots natively under HVF, running
+the full agent OS — Synapse ABI, Persona intent shell, the taint gate refusing a
+prompt-injected `mem_fs_delete`, compiled-intent cache hits, and the scheduler's
+context switch (`sched: task exited` after a `yield_now`). Live model inference
+on aarch64 is the one remaining gap (no Limine boot-module path yet, so
+`model_module` returns `None` there); the NEON matvec itself is proven (~3.7
+GMAC/s in the earlier standalone bring-up). The prior standalone `arm64/` crate
+is retired — the unified kernel supersedes it.
+
+---
+*Prior:* **aarch64 native port — foundation booting under HVF.** The x86 kernel can only
 run under QEMU cross-arch TCG on this Apple Silicon host (no HW accel for x86
 guests), which is why inference is slow. The fix is an aarch64 build so
 `qemu-system-aarch64 -accel hvf` runs Chitti **natively on the M-series CPU**

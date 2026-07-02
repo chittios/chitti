@@ -69,7 +69,9 @@ pub static FRAME_ALLOCATOR: Locked<Option<frame::BitmapFrameAllocator>> = Locked
 /// 0x40080000; the heap sits well past the image and within the identity map.
 #[cfg(target_arch = "aarch64")]
 pub fn init() {
-    crate::arch::aarch64::mmu::init();
+    // The MMU is already enabled by the boot entry (`main::aarch64_start`),
+    // before any atomic/`Locked` use; here we just hand a fixed RAM region to
+    // the heap.
     const HEAP_BASE: usize = 0x5000_0000; // 256 MiB into RAM
     heap::init_static(HEAP_BASE, heap::HEAP_SIZE);
     crate::ktrace::log_fmt(format_args!(

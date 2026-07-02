@@ -9,3 +9,9 @@ json-target-spec = true
 
 [target.x86_64-chitti]
 runner = "../xtask/run-test-in-qemu.sh"
+
+# aarch64 native port: its own linker script (direct `-M virt -kernel` boot).
+# Target-specific rustflags REPLACE `[build].rustflags` for this target, so it
+# gets `-Tlinker-aarch64.ld` instead of the x86 `-Tlinker.ld`.
+[target.aarch64-chitti]
+rustflags = ["-C", "link-arg=-Tlinker-aarch64.ld"]

@@ -482,11 +482,32 @@ fn dequant_row_q8_0(row: &[u8], out: &mut [f32]) {
 }
 
 fn tensor_sqrtf(x: f32) -> f32 {
-    // SAFETY: `sqrtss` (SSE2) has no side effects; argument is positive.
+    // Hardware sqrt per arch (`core` has no `f32::sqrt`): `sqrtss` on x86,
+    // `fsqrt` on aarch64, Newton-Raphson elsewhere. Argument is positive.
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `sqrtss` has no side effects.
     unsafe {
         let mut r = x;
         core::arch::asm!("sqrtss {r}, {r}", r = inout(xmm_reg) r, options(nomem, nostack, preserves_flags));
         r
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `fsqrt` has no side effects.
+    unsafe {
+        let r: f32;
+        core::arch::asm!("fsqrt {r:s}, {x:s}", r = out(vreg) r, x = in(vreg) x, options(nomem, nostack, preserves_flags));
+        r
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        if x <= 0.0 {
+            return 0.0;
+        }
+        let mut g = x;
+        for _ in 0..20 {
+            g = 0.5 * (g + x / g);
+        }
+        g
     }
 }
 

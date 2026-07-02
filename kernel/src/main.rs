@@ -1,25 +1,35 @@
-//! Real boot entry point. `cargo xtask run` boots this binary.
+//! Real boot entry point. `cargo xtask run -arch x86_64` boots the x86 kernel
+//! via Limine; `cargo xtask run -arch aarch64` boots the aarch64 kernel
+//! natively via QEMU + HVF (`-M virt -kernel`, entered at `aarch64_start`).
 #![no_std]
 #![no_main]
 
-use chitti_kernel::{
-    arch, framebuffer, limine_protocol, serial, serial_println, FRAMEBUFFER_REQUEST, MEMMAP_REQUEST,
-};
+use chitti_kernel::serial_println;
 use core::panic::PanicInfo;
 
 const BOOT_MSG: &str = "Chitti: boot ok";
 
+/// Shared OS steady state (arch-independent): the Synapse + Persona demos,
+/// then the interactive intent shell (never returns).
+fn run_os() -> ! {
+    chitti_kernel::synapse::demo();
+    chitti_kernel::shell::demo();
+    chitti_kernel::shell::run();
+}
+
+// --- x86_64 boot (Limine) -----------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    // Must be first: SIMD codegen is on crate-wide (Phase 3), so the
-    // optimizer may emit SSE (XMM) instructions in any code below; they
-    // fault until SSE is enabled at the hardware level. See fpu::enable_sse.
+    use chitti_kernel::{arch, framebuffer, limine_protocol, FRAMEBUFFER_REQUEST, MEMMAP_REQUEST};
+
+    // Must be first: SIMD codegen is on crate-wide, so the optimizer may emit
+    // SSE (XMM) instructions below; they fault until SSE is enabled.
     arch::x86_64::fpu::enable_sse();
+    chitti_kernel::serial::init();
 
-    serial::init();
-
-    // Bring up the framebuffer text console first, so every line below
-    // (serial output is mirrored there) also appears in the graphical window.
+    // Framebuffer console first, so serial output is mirrored to the window.
     if let Some(fb) = FRAMEBUFFER_REQUEST.response().and_then(|r| r.framebuffers().first().copied()) {
         framebuffer::init_console(fb);
     }
@@ -37,40 +47,13 @@ pub extern "C" fn _start() -> ! {
         serial_println!("Chitti: memory map request was refused");
     }
 
-    if let Some(mm) = MEMMAP_REQUEST.response() {
-        let usable: u64 = mm
-            .entries()
-            .iter()
-            .filter(|e| e.entry_type == limine_protocol::MEMMAP_USABLE)
-            .map(|e| e.length)
-            .sum();
-        serial_println!("Chitti: {} usable memory-map bytes across {} entries", usable, mm.entries().len());
-    } else {
-        serial_println!("Chitti: memory map request was refused");
-    }
-
-    // GDT/TSS, IDT + exceptions, FPU/SSE + NX, PIC/PIT/keyboard IRQs, the
-    // frame allocator + kernel heap, the scheduler, then `sti`. See
-    // `chitti_kernel::init`.
     chitti_kernel::init();
-
-    // Phase 7: report the SMP bring-up result (the self-test ran inside init).
-    serial_println!("Chitti: SMP: {} core(s) online (see ktrace 'smp:' lines for the spinlock self-test)", chitti_kernel::smp::cpu_count());
-
-    // Phase 7: block-device filesystem demo. Mounts SimpleFS on a virtio-blk
-    // disk (if QEMU was started with one) and bumps a persistent boot counter
-    // -- run `cargo xtask run` twice to watch it survive a reboot.
+    serial_println!(
+        "Chitti: SMP: {} core(s) online (see ktrace 'smp:' lines for the spinlock self-test)",
+        chitti_kernel::smp::cpu_count()
+    );
     disk_demo();
 
-    // Phase 4: demonstrate the Synapse capability ABI end to end (grammar
-    // validation -> capability check -> deterministic execution -> audit).
-    // Fast and model-free, so it runs on every boot regardless of whether
-    // the Cortex model module is present.
-    chitti_kernel::synapse::demo();
-
-    // Report the Cortex model boot module, if present (Phase 3). The model
-    // is used on demand via the shell's `infer` builtin rather than in a
-    // blocking boot-time demo -- inference is slow under QEMU TCG.
     match chitti_kernel::cortex::model_module() {
         Some(bytes) => {
             if let Ok(g) = chitti_kernel::cortex::gguf::Gguf::parse(bytes) {
@@ -89,8 +72,7 @@ pub extern "C" fn _start() -> ! {
         None => serial_println!("Chitti: no model.gguf boot module present"),
     }
 
-    // `ref-check` builds run the full Phase 3 acceptance gate and exit QEMU
-    // with a pass/fail code, skipping the interactive shell.
+    // `ref-check` builds run the Phase 3 acceptance gate and exit QEMU.
     #[cfg(feature = "refcheck")]
     {
         let ok = chitti_kernel::cortex::run_acceptance();
@@ -100,25 +82,35 @@ pub extern "C" fn _start() -> ! {
             chitti_kernel::qemu::QemuExitCode::Failed
         });
     }
-
-    // Phase 5: a fast, deterministic demonstration of the intent->plan->act
-    // loop, then hand the console to the interactive intent shell (which
-    // never returns -- it is the system's steady state).
     #[cfg(not(feature = "refcheck"))]
-    {
-        chitti_kernel::shell::demo();
-        chitti_kernel::shell::run();
-    }
+    run_os();
 
     #[allow(unreachable_code)]
     loop {
-        arch::x86_64::hlt();
+        arch::hlt();
     }
 }
 
-/// Phase 7 block-device FS demo: mount SimpleFS on the virtio-blk disk and
-/// bump a persistent boot counter. Best-effort -- any error is reported and
-/// boot continues (the RAM-disk filesystem is exercised by the test suite).
+// --- aarch64 boot (QEMU virt + HVF; entered from arch::aarch64::boot) ----
+
+#[cfg(target_arch = "aarch64")]
+#[unsafe(no_mangle)]
+pub extern "C" fn aarch64_start() -> ! {
+    // The boot stub (arch::aarch64::boot) already set the stack, enabled NEON,
+    // and zeroed BSS. Enable the MMU *first* -- with it off, RAM is Device
+    // memory where the LL/SC exclusives that back `Locked`/atomics never
+    // succeed (a spinlock would spin forever). `serial_println!` mirrors to a
+    // `Locked` framebuffer console, so even the banner needs normal memory.
+    chitti_kernel::arch::aarch64::mmu::init();
+    chitti_kernel::serial::init();
+    serial_println!("{} -- NATIVE aarch64 on Apple Silicon (QEMU + HVF)", BOOT_MSG);
+    chitti_kernel::init();
+    run_os();
+}
+
+/// Phase 7 block-device FS demo (x86 only -- the virtio-blk driver uses PCI
+/// port I/O): mount SimpleFS on the disk and bump a persistent boot counter.
+#[cfg(target_arch = "x86_64")]
 fn disk_demo() {
     use chitti_kernel::block::virtio::VirtioBlk;
     use chitti_kernel::block::BlockDevice;
@@ -131,7 +123,6 @@ fn disk_demo() {
     };
     serial_println!("Chitti: disk> virtio-blk found: {} sectors", dev.block_count());
 
-    // Peek to distinguish first-boot (format) from a later boot (mount).
     let mut fs = match SimpleFs::mount_or_format(dev, 64) {
         Ok(fs) => fs,
         Err(e) => {
@@ -140,7 +131,6 @@ fn disk_demo() {
         }
     };
 
-    // A boot counter that lives on disk: proof of cross-reboot persistence.
     let prior = fs
         .read("boots")
         .ok()
@@ -152,11 +142,7 @@ fn disk_demo() {
     match fs.write("boots", text.as_bytes()).and_then(|_| fs.write("banner", b"written by Chitti OS SimpleFS")) {
         Ok(()) => {
             let files = fs.list().unwrap_or_default();
-            serial_println!(
-                "Chitti: disk> boot #{} (persisted on disk); files = {:?}",
-                boots,
-                files
-            );
+            serial_println!("Chitti: disk> boot #{} (persisted on disk); files = {:?}", boots, files);
             if prior > 0 {
                 serial_println!("Chitti: disk> (the counter survived a reboot -- durable storage works)");
             } else {
@@ -168,6 +154,7 @@ fn disk_demo() {
 }
 
 /// Format a `u32` into `buf` without `alloc`, returning the decimal string.
+#[cfg(target_arch = "x86_64")]
 fn fmt_u32(mut n: u32, buf: &mut [u8; 12]) -> &str {
     if n == 0 {
         buf[0] = b'0';
@@ -187,6 +174,6 @@ fn fmt_u32(mut n: u32, buf: &mut [u8; 12]) -> &str {
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("KERNEL PANIC: {}", info);
     loop {
-        arch::x86_64::hlt();
+        chitti_kernel::arch::hlt();
     }
 }
