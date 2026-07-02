@@ -10,6 +10,15 @@ use core::arch::asm;
 struct Table(#[allow(dead_code)] [u64; 512]);
 static mut L1: Table = Table([0; 512]);
 
+/// Number of 1 GiB identity-mapped blocks. The default 4 GiB covers the 0.8B
+/// layout (kernel + model at 0x48000000 + heap at 0x80000000). The `model-9b`
+/// layout needs the ~5.8 GiB model at 0x80000000 and a heap at 0x2_00000000,
+/// so map 12 GiB (matching `cargo xtask run -model qwen3.5-9b`'s `-m 12G`).
+#[cfg(not(feature = "model-9b"))]
+const N_BLOCKS: u64 = 4;
+#[cfg(feature = "model-9b")]
+const N_BLOCKS: u64 = 12;
+
 /// Set up the identity map and enable the MMU + caches. Idempotent-ish; call
 /// once, early, on the boot core.
 pub fn init() {
@@ -17,7 +26,7 @@ pub fn init() {
     // standard EL1 translation registers. VA==PA, so stack/code/UART stay valid.
     unsafe {
         let l1 = core::ptr::addr_of_mut!(L1) as *mut u64;
-        for i in 0..4u64 {
+        for i in 0..N_BLOCKS {
             let pa = i << 30; // 1 GiB blocks
             let attr_idx = if i == 0 { 1u64 } else { 0u64 }; // 0: Device MMIO, else Normal
             let sh = if i == 0 { 0u64 } else { 0b11u64 }; // inner-shareable for Normal

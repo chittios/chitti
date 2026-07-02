@@ -71,10 +71,16 @@ pub static FRAME_ALLOCATOR: Locked<Option<frame::BitmapFrameAllocator>> = Locked
 pub fn init() {
     // The MMU is already enabled by the boot entry (`main::aarch64_start`),
     // before any atomic/`Locked` use; here we just hand a fixed RAM region to
-    // the heap. Layout in the identity-mapped RAM: kernel image at 0x40080000,
-    // the GGUF model (when present) loaded at 0x48000000 (up to ~896 MiB), and
-    // the heap at 0x80000000 -- past the model, no overlap.
+    // the heap. Layout in the identity-mapped RAM:
+    //  - default (0.8B): kernel at 0x40080000, model at 0x48000000 (~896 MiB),
+    //    heap at 0x80000000 -- past the model, no overlap.
+    //  - `model-9b`: the ~5.8 GiB model sits at 0x80000000, so the heap moves to
+    //    0x2_00000000 (8 GiB) and grows to 1 GiB (see `heap::HEAP_SIZE`); the
+    //    MMU maps 12 GiB and `cargo xtask run -model qwen3.5-9b` passes `-m 12G`.
+    #[cfg(not(feature = "model-9b"))]
     const HEAP_BASE: usize = 0x8000_0000;
+    #[cfg(feature = "model-9b")]
+    const HEAP_BASE: usize = 0x2_0000_0000;
     heap::init_static(HEAP_BASE, heap::HEAP_SIZE);
     crate::ktrace::log_fmt(format_args!(
         "mm: aarch64 heap ready, {} bytes at {HEAP_BASE:#x} (identity-mapped normal memory)",

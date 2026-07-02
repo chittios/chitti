@@ -28,6 +28,12 @@ bench = false
 # inference demo and stays up.
 refcheck = []
 
+# `cargo xtask build|run -model qwen3.5-9b` builds with this on: it selects the
+# memory layout for the ~5.8 GiB Qwen3.5-9B model (model region at 0x80000000,
+# heap at 0x2_00000000 sized 1 GiB, MMU mapping 12 GiB) instead of the compact
+# 0.8B layout. Default (feature off) = the 0.8B model.
+model-9b = []
+
 [dependencies]
 font8x8 = { version = "0.3.1", default-features = false }
 
