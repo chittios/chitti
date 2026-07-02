@@ -109,9 +109,10 @@ explicitly (never host-detected): `cargo xtask build|run -arch x86_64|aarch64`.
   Apple-Silicon host — hence slow inference).
 - `-arch aarch64` boots directly (`-M virt -kernel`) under
   `qemu-system-aarch64 -accel hvf`, running **natively** on the M-series CPU
-  with NEON. The full agent OS (Synapse, Persona, taint gate, compiled intents,
-  scheduler) runs; live model inference there is future work (no aarch64 boot-
-  module loader yet).
+  with NEON. The full agent OS runs — Synapse, Persona, taint gate, compiled
+  intents, scheduler — **including model inference**: the GGUF is placed in
+  guest RAM via QEMU `-device loader`, and `infer` decodes on NEON at ~2 tok/s
+  with token-for-token parity to the reference (vs minutes/token under x86 TCG).
 
 The Phase 3 model (Qwen3.5-0.8B Q8_0 GGUF) is **not committed** — it's a
 ~812 MB boot module fetched on demand. Run `xtask/fetch-model.sh` (writes

@@ -1,5 +1,7 @@
 *"This project is specified in `CHITTI_OS_HANDOFF.md`. Read it fully before acting. Follow the locked decisions in Part 2 and the guardrails in Part 4. Work one phase at a time; do not start the next phase until the current phase's acceptance criteria pass in QEMU."*
 
+> **STANDING RULE — the kernel is dual-architecture (x86_64 + aarch64), and functionality must not diverge between them.** Every change must build and work for BOTH arches. Never guard behaviour behind `target_arch` unless it is genuinely arch-specific (a driver, an instruction) — and then provide the equivalent for the other arch behind the same API, never a stub that drops a feature. After any change, verify both: `cargo xtask build -arch x86_64` + `cargo xtask test` (69/69) **and** `cargo xtask build -arch aarch64` (and boot it via `-arch aarch64` when the change is boot-visible). If a capability exists on one arch, it exists on the other.
+
 **Current phase: 7 (Stretch) — in progress. SMP + block-device FS + framebuffer TUI + dual-arch (x86_64 + aarch64) kernel: complete.**
 **Unified dual-architecture kernel.** One `kernel/` crate now builds and boots
 for **both** x86_64 (Limine, under QEMU TCG) and **aarch64** (native on Apple
@@ -13,15 +15,18 @@ tensor kernels (SSE2/AVX2 ∣ NEON ∣ scalar behind one API); an arch-split
 switch of x19–x30 + d8–d15); arch-dispatched `serial`/`mm`/`console`; and
 x86-only device code (Limine, gdt/idt/pic/pit/keyboard, apic, smp, virtio,
 qemu, frame allocator + paged heap) cfg-gated out of aarch64, which instead uses
-an MMU identity map + a fixed-region heap. **Verified:** x86 builds + `cargo
-xtask test` 69/69 green; aarch64 builds and boots natively under HVF, running
-the full agent OS — Synapse ABI, Persona intent shell, the taint gate refusing a
-prompt-injected `mem_fs_delete`, compiled-intent cache hits, and the scheduler's
-context switch (`sched: task exited` after a `yield_now`). Live model inference
-on aarch64 is the one remaining gap (no Limine boot-module path yet, so
-`model_module` returns `None` there); the NEON matvec itself is proven (~3.7
-GMAC/s in the earlier standalone bring-up). The prior standalone `arm64/` crate
-is retired — the unified kernel supersedes it.
+an MMU identity map + a fixed-region heap. **Full functional parity across
+arches, including inference.** On aarch64 the GGUF model is placed in guest RAM
+by QEMU `-device loader` at 0x48000000 (the aarch64 `model_module` reads it
+there, validated by the GGUF magic — the equivalent of the x86 Limine boot
+module); the heap moved to 0x80000000 to sit past it. **Verified:** x86 builds
++ `cargo xtask test` 69/69 green; aarch64 builds and boots natively under HVF,
+running the full agent OS — Synapse ABI, Persona intent shell, the taint gate
+refusing a prompt-injected `mem_fs_delete`, compiled-intent cache hits, the
+scheduler's context switch, **and native NEON inference**: `cargo xtask run
+-arch aarch64` → `infer` decodes the reference prompt at ~2 tok/s with
+`matches reference=true` (token-for-token parity with the x86/NumPy reference),
+vs minutes/token under x86 TCG. The prior standalone `arm64/` crate is retired.
 
 ---
 *Prior:* **aarch64 native port — foundation booting under HVF.** The x86 kernel can only

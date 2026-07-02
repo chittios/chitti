@@ -71,8 +71,10 @@ pub static FRAME_ALLOCATOR: Locked<Option<frame::BitmapFrameAllocator>> = Locked
 pub fn init() {
     // The MMU is already enabled by the boot entry (`main::aarch64_start`),
     // before any atomic/`Locked` use; here we just hand a fixed RAM region to
-    // the heap.
-    const HEAP_BASE: usize = 0x5000_0000; // 256 MiB into RAM
+    // the heap. Layout in the identity-mapped RAM: kernel image at 0x40080000,
+    // the GGUF model (when present) loaded at 0x48000000 (up to ~896 MiB), and
+    // the heap at 0x80000000 -- past the model, no overlap.
+    const HEAP_BASE: usize = 0x8000_0000;
     heap::init_static(HEAP_BASE, heap::HEAP_SIZE);
     crate::ktrace::log_fmt(format_args!(
         "mm: aarch64 heap ready, {} bytes at {HEAP_BASE:#x} (identity-mapped normal memory)",

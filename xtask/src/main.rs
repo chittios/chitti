@@ -111,8 +111,21 @@ fn build_kernel_aarch64(release: bool) -> Result<PathBuf, String> {
 fn cmd_run_aarch64(release: bool) -> Result<(), String> {
     let elf = build_kernel_aarch64(release)?;
     let mut qemu = Command::new("qemu-system-aarch64");
-    qemu.args(["-M", "virt", "-cpu", "host", "-accel", "hvf", "-m", "512M", "-nographic", "-kernel"]);
+    // 2 GiB RAM holds the kernel + the ~812 MiB model (loaded at 0x48000000)
+    // + the 256 MiB heap (0x80000000).
+    qemu.args(["-M", "virt", "-cpu", "host", "-accel", "hvf", "-m", "2G", "-nographic", "-kernel"]);
     qemu.arg(&elf);
+    // Place the GGUF model in guest RAM at 0x48000000 (where the aarch64
+    // `cortex::model_module` looks), if present -- the equivalent of the x86
+    // Limine boot module, so `infer` works natively.
+    let model = repo_root().join("assets/model.gguf");
+    if model.exists() {
+        qemu.arg("-device")
+            .arg(format!("loader,file={},addr=0x48000000,force-raw=on", model.display()));
+        eprintln!("attaching model.gguf at guest phys 0x48000000");
+    } else {
+        eprintln!("note: assets/model.gguf absent -- `infer` will report no model");
+    }
     eprintln!("booting aarch64 Chitti natively via HVF (Ctrl-A X to quit qemu)...");
     run(&mut qemu)
 }
