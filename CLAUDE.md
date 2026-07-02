@@ -3,7 +3,35 @@
 > **STANDING RULE — the kernel is dual-architecture (x86_64 + aarch64), and functionality must not diverge between them.** Every change must build and work for BOTH arches. Never guard behaviour behind `target_arch` unless it is genuinely arch-specific (a driver, an instruction) — and then provide the equivalent for the other arch behind the same API, never a stub that drops a feature. After any change, verify both: `cargo xtask build -arch x86_64` + `cargo xtask test` (69/69) **and** `cargo xtask build -arch aarch64` (and boot it via `-arch aarch64` when the change is boot-visible). If a capability exists on one arch, it exists on the other.
 
 **Current phase: 7 (Stretch) — in progress. SMP + block-device FS + framebuffer TUI + dual-arch (x86_64 + aarch64) kernel: complete.**
-**Unified dual-architecture kernel.** One `kernel/` crate now builds and boots
+
+**aarch64 inference throughput — ~7x, now ~13 tok/s (0.8B, native HVF).** A
+push to make bigger models usable. Three levers, all verified with `matches
+reference=true` preserved: **(1)** a `bench` shell builtin times the hottest
+kernel (`matvec_q8_0`) in isolation — it showed the f32-activation NEON matvec
+is *widening-bound* (i8→i16→i32→f32 + per-block f16 decode), ~1.5 GMAC/s, and
+that restructuring it (fold the block scale into one FMA, four independent
+accumulator chains) is a throughput **wash**; **(2)** the real per-core lever is
+llama.cpp's trick — quantize the activation to int8 (`quantize_activations_q8`)
+and use ARMv8.2 **SDOT** (`vdotq_s32`, 16 int8 MACs/instr, *zero widening*):
+`matvec_q8_0_sdot_rows` measured **2.2x** (3.4 GMAC/s) at **0.36% RMS error**,
+and wired onto the forward pass via `tensor::matvec_q8_0_fast` (aarch64 = int8
+SDOT with per-`State` scratch; x86 = the exact f32 path — same API, per the
+dual-arch rule) it gave ~1.8x end-to-end with token parity intact; **(3)**
+**SMP under HVF** (`arch/aarch64/smp.rs`): PSCI `CPU_ON` brings the secondary
+vCPUs up (asm stub → private stack via context_id → `mmu::enable_secondary`
+from the shared identity map → claim a worker slot), and each Q8_0 matvec is
+split by disjoint row range across all online cores via a lock-free
+static-partition barrier (publish operands + ranges, bump a generation counter
+released/acquired, each core writes a disjoint `y` slice; <256-row matvecs stay
+single-core). Under `-smp 4`, **4/4 cores online** and near-linear ~3.8x. Net:
+decode ~502→~72 ms/tok (**~13 tok/s**, stable), prefill 1675→~300 ms, all with
+`matches reference=true`. `+dotprod` added to the aarch64 target. x86 untouched
+(69/69 green). *Decision (with the human): int8 SDOT adopted as the aarch64
+default; SMP built; the 9B model deferred — it needs a ~5 GB (Q4_0) layout /
+larger guest RAM overhaul, staying on 0.8B for now.*
+
+---
+*Prior:* **Unified dual-architecture kernel.** One `kernel/` crate now builds and boots
 for **both** x86_64 (Limine, under QEMU TCG) and **aarch64** (native on Apple
 Silicon via `qemu-system-aarch64 -accel hvf`). Arch is chosen explicitly, never
 host-detected: `cargo xtask build|run -arch x86_64|aarch64`. The split: an
