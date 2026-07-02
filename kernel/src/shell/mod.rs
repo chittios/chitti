@@ -118,10 +118,11 @@ pub fn run() -> ! {
             "help" => {
                 serial_println!("  intents: write a file called X with the text Y[, then read it back]");
                 serial_println!("           remember that K is V | what is K | list | say TEXT");
-                serial_println!("  builtins: infer (run the Cortex reference inference), bench (matvec throughput), exit");
+                serial_println!("  builtins: infer (reference inference), bench (matvec throughput), perf (pp/tg tok/s), exit");
             }
             "infer" => run_infer(),
             "bench" => run_bench(),
+            "perf" => run_perf(),
             _ => {
                 let result = persona::compiled::run(&mut agent, intent, &mut planner);
                 // If the taint gate refused a destructive action, offer the
@@ -207,6 +208,30 @@ fn run_bench() {
             if sms > 0 { (r.ms * 10 / sms) % 10 } else { 0 },
             r.sdot_rel_rms,
         );
+    }
+}
+
+/// Builtin: end-to-end inference throughput benchmark (prefill `pp` + decode
+/// `tg`), directly comparable to `llama-bench`. A regression gauge to run after
+/// any change; `infer` remains the correctness (reference-parity) check.
+fn run_perf() {
+    const N_PROMPT: usize = 64;
+    const N_DECODE: usize = 32;
+    match crate::cortex::bench_inference(N_PROMPT, N_DECODE) {
+        Some(r) => {
+            let pp = if r.prefill_ms > 0 { (r.n_prompt as u64 * 1000) / r.prefill_ms } else { 0 };
+            let tg = if r.decode_ms > 0 { (r.n_decode as u64 * 1000) / r.decode_ms } else { 0 };
+            serial_println!(
+                "perf> prefill {} tok in {} ms => {} tok/s (pp); decode {} tok in {} ms => {} tok/s (tg)",
+                r.n_prompt,
+                r.prefill_ms,
+                pp,
+                r.n_decode,
+                r.decode_ms,
+                tg,
+            );
+        }
+        None => serial_println!("perf> no model present"),
     }
 }
 
