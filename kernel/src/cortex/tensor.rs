@@ -389,6 +389,33 @@ pub fn matvec_q8_0_fast(w: &[u8], x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &
     }
 }
 
+/// As `matvec_q8_0_fast`, but for `Q4_0` weights: on aarch64, quantize the
+/// activation to int8 once and run the Q4_0 SDOT kernel (unpack nibbles ->
+/// int8 -> `vdotq_s32`, ~the Q8_0 SDOT speed instead of the generic
+/// dequant-and-dot path); elsewhere the exact scalar `matvec_q4_0`.
+pub fn matvec_q4_0_fast(w: &[u8], x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &mut [f32], n_rows: usize, n_cols: usize) {
+    debug_assert_eq!(n_cols % QK, 0);
+    debug_assert_eq!(x.len(), n_cols);
+    debug_assert_eq!(y.len(), n_rows);
+    debug_assert!(xq.len() >= n_cols && xs.len() >= n_cols / QK);
+    #[cfg(target_arch = "aarch64")]
+    {
+        let xq = &mut xq[..n_cols];
+        let xs = &mut xs[..n_cols / QK];
+        quantize_activations_q8(x, xq, xs);
+        // SAFETY: `w` holds `n_rows` Q4_0 rows of `n_cols/QK` blocks; `xq`/`xs`
+        // are the just-computed quantized activation; `[0, n_rows)` in bounds.
+        unsafe {
+            crate::arch::aarch64::smp::matvec_q4_0_sdot(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), y.as_mut_ptr(), n_rows, n_cols)
+        };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (&mut *xq, &mut *xs);
+        matvec_q4_0(w, x, y, n_rows, n_cols);
+    }
+}
+
 /// Compute rows `[row_start, row_end)` of a `Q8_0` matvec, dispatching to the
 /// fused AVX2 kernel or a scalar fallback. Raw pointers (not slices) and an
 /// explicit row range so a matvec can be split across cores (each core owns a
@@ -696,6 +723,86 @@ unsafe fn sdot_one_row(row: *const u8, xq: *const i8, xs: *const f32, blocks: us
             b += 1;
         }
         vaddvq_f32(vaddq_f32(vaddq_f32(f0, f1), vaddq_f32(f2, f3)))
+    }
+}
+
+/// One `Q4_0`-row · `int8`-activation dot, the Q4_0 analogue of `sdot_one_row`:
+/// unpack each block's 16 packed bytes into 32 `int8` weights on the fly (low
+/// nibbles -> elements 0..16, high nibbles -> 16..32, each minus 8, matching
+/// `dequant_q4_0_block`'s layout) and `SDOT` them against the block's int8
+/// activation, scaled by `d_weight · d_activation`. Four independent f32 chains.
+///
+/// # Safety
+/// `row` points at `blocks` `Q4_0` blocks; `xq`/`xs` at `blocks*QK` `i8` /
+/// `blocks` `f32`. Requires `dotprod`.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn sdot_one_row_q4_0(row: *const u8, xq: *const i8, xs: *const f32, blocks: usize) -> f32 {
+    use core::arch::aarch64::{
+        vaddq_f32, vaddq_s32, vaddvq_f32, vandq_u8, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32, vdupq_n_s8,
+        vdupq_n_u8, vfmaq_n_f32, vld1q_s8, vld1q_u8, vreinterpretq_s8_u8, vshrq_n_u8, vsubq_s8,
+    };
+    let mask = vdupq_n_u8(0x0f);
+    let eight = vdupq_n_s8(8);
+    macro_rules! block_into {
+        ($f:expr, $b:expr) => {{
+            let base = $b * Q4_0_BLOCK_BYTES;
+            let dw = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
+            let dx = *xs.add($b);
+            let bytes = vld1q_u8(row.add(base + 2)); // 16 packed nibble pairs
+            let lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(bytes, mask)), eight); // elems 0..16
+            let hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(bytes, 4)), eight); // elems 16..32
+            let xp = xq.add($b * QK);
+            let a0 = vdotq_s32(vdupq_n_s32(0), lo, vld1q_s8(xp));
+            let a1 = vdotq_s32(vdupq_n_s32(0), hi, vld1q_s8(xp.add(16)));
+            $f = vfmaq_n_f32($f, vcvtq_f32_s32(vaddq_s32(a0, a1)), dw * dx);
+        }};
+    }
+    // SAFETY: caller's contract; all loads in-bounds.
+    unsafe {
+        let mut f0 = vdupq_n_f32(0.0);
+        let mut f1 = vdupq_n_f32(0.0);
+        let mut f2 = vdupq_n_f32(0.0);
+        let mut f3 = vdupq_n_f32(0.0);
+        let mut b = 0;
+        while b + 4 <= blocks {
+            block_into!(f0, b);
+            block_into!(f1, b + 1);
+            block_into!(f2, b + 2);
+            block_into!(f3, b + 3);
+            b += 4;
+        }
+        while b < blocks {
+            block_into!(f0, b);
+            b += 1;
+        }
+        vaddvq_f32(vaddq_f32(vaddq_f32(f0, f1), vaddq_f32(f2, f3)))
+    }
+}
+
+/// `Q4_0` matvec with int8-quantized activation (`xq`/`xs`) over rows
+/// `[row_start, row_end)`, via the on-the-fly-unpack SDOT above -- the fast
+/// analogue of `matvec_q8_0_sdot_rows` for the 9B's many Q4_0 tensors.
+///
+/// # Safety
+/// See `sdot_one_row_q4_0`; `w` = `n_rows` Q4_0 rows of `n_cols/QK` blocks.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn matvec_q4_0_sdot_rows(
+    w: *const u8,
+    xq: *const i8,
+    xs: *const f32,
+    y: *mut f32,
+    row_start: usize,
+    row_end: usize,
+    n_cols: usize,
+) {
+    let blocks = n_cols / QK;
+    let row_bytes = blocks * Q4_0_BLOCK_BYTES;
+    // SAFETY: caller's contract.
+    unsafe {
+        for r in row_start..row_end {
+            *y.add(r) = sdot_one_row_q4_0(w.add(r * row_bytes), xq, xs, blocks);
+        }
     }
 }
 
