@@ -47,6 +47,8 @@ struct Job {
     xs: AtomicPtr<f32>,
     y: AtomicPtr<f32>,
     n_cols: AtomicUsize,
+    m_count: AtomicUsize, // activation columns (1 = decode matvec, >1 = batched prefill)
+    n_rows: AtomicUsize,  // total rows (the `y` column stride)
     row_start: [AtomicUsize; MAX_CPUS],
     row_end: [AtomicUsize; MAX_CPUS],
     go: AtomicU64,
@@ -58,6 +60,8 @@ static JOB: Job = Job {
     xs: AtomicPtr::new(core::ptr::null_mut()),
     y: AtomicPtr::new(core::ptr::null_mut()),
     n_cols: AtomicUsize::new(0),
+    m_count: AtomicUsize::new(1),
+    n_rows: AtomicUsize::new(0),
     row_start: [const { AtomicUsize::new(0) }; MAX_CPUS],
     row_end: [const { AtomicUsize::new(0) }; MAX_CPUS],
     go: AtomicU64::new(0),
@@ -185,37 +189,42 @@ fn worker_loop(slot: usize) -> ! {
             let xs = JOB.xs.load(Ordering::Relaxed);
             let y = JOB.y.load(Ordering::Relaxed);
             let n_cols = JOB.n_cols.load(Ordering::Relaxed);
+            let m_count = JOB.m_count.load(Ordering::Relaxed);
+            let n_rows = JOB.n_rows.load(Ordering::Relaxed);
             // SAFETY: the BSP guarantees (via the `go` release/acquire) that the
             // operands are published and this slot's [rs, re) is in bounds and
             // disjoint from every other core's range, so the writes to `y` don't
             // alias. The weights/activation are read-only during the pass.
             unsafe {
-                tensor::matvec_q8_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols);
+                tensor::matmul_q8_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols);
             }
         }
         DONE[slot].store(g, Ordering::Release);
     }
 }
 
-/// Run a full `Q8_0` SDOT matvec (`y[0..n_rows] = W · xq`) across all online
-/// cores by row range. The activation must already be quantized (`xq`/`xs`).
-/// Falls back to a single-core pass when only the BSP is online or the matrix
-/// is small. This is what `tensor::matvec_q8_0_fast` calls on aarch64.
+/// Run a `Q8_0` SDOT matmul (`y[m][r] = W[r] · xq[m]` for all `m` in
+/// `0..m_count`, `r` in `0..n_rows`) across all online cores by row range. The
+/// activations must already be quantized (`xq`/`xs`, `m_count` columns);
+/// `m_count == 1` is the decode matvec. Falls back to a single-core pass when
+/// only the BSP is online or the matrix is small. This is what
+/// `tensor::matvec_q8_0_fast` (decode) and the batched prefill call on aarch64.
 ///
 /// # Safety
-/// Same contract as `tensor::matvec_q8_0_sdot_rows` over `[0, n_rows)`.
-pub unsafe fn matvec_sdot(
+/// Same contract as `tensor::matmul_q8_0_sdot_rows` over `[0, n_rows)`.
+pub unsafe fn matmul_sdot(
     w: *const u8,
     xq: *const i8,
     xs: *const f32,
     y: *mut f32,
+    m_count: usize,
     n_rows: usize,
     n_cols: usize,
 ) {
     let workers = N_WORKERS.load(Ordering::Relaxed);
     if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
         // SAFETY: caller's contract; whole range on this core.
-        unsafe { tensor::matvec_q8_0_sdot_rows(w, xq, xs, y, 0, n_rows, n_cols) };
+        unsafe { tensor::matmul_q8_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, n_rows, n_cols) };
         return;
     }
     let n_parts = workers + 1; // BSP + workers
@@ -227,6 +236,8 @@ pub unsafe fn matvec_sdot(
     JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
     JOB.y.store(y, Ordering::Relaxed);
     JOB.n_cols.store(n_cols, Ordering::Relaxed);
+    JOB.m_count.store(m_count, Ordering::Relaxed);
+    JOB.n_rows.store(n_rows, Ordering::Relaxed);
     for s in 0..workers {
         JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
         JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
@@ -237,7 +248,7 @@ pub unsafe fn matvec_sdot(
 
     // BSP computes chunk 0 while the workers run theirs.
     // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
-    unsafe { tensor::matvec_q8_0_sdot_rows(w, xq, xs, y, 0, boundary(1), n_cols) };
+    unsafe { tensor::matmul_q8_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, boundary(1), n_cols) };
 
     // Barrier: wait for every worker to finish this generation.
     for s in 0..workers {
