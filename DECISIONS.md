@@ -54,3 +54,18 @@ Consequential ones flagged **REVISIT**.
 ## Assumptions logged during the run
 
 (appended below as they arise)
+
+## Assumptions logged during the run
+
+- **Phase C SMP concurrency (REVISIT):** `dispatch_batch` assigns each sub-agent a distinct
+  core id and records it (`SubagentRecord.core`), but under the single-threaded QEMU test
+  harness sub-agents execute sequentially. The prior project note already found multicore
+  inference a net loss under QEMU TCG, so true parallel dispatch is structured (per-core
+  assignment + isolated tasks) but not yet run concurrently. The isolation/attenuation/summary
+  invariants — the correctness-critical ones — are fully enforced and tested.
+- **Sub-agent cap attenuation is strict:** a role that *requests* any capability the parent does
+  not hold is refused at spawn (`DispatchError::CapabilityRefused`), not silently narrowed. Rights
+  are still clamped to the overlap via `intersect_caps`. This satisfies both the subset invariant
+  and acceptance (b) "refused at spawn".
+- **Sub-agents cannot sub-delegate by default:** the `spawn_subagent` hook gives sub-agents a
+  plain Router (no spawn hook), and `max_depth` caps recursion regardless.

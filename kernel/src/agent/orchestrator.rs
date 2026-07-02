@@ -123,4 +123,37 @@ impl Orchestrator {
     pub fn kill(&mut self) {
         crate::ktrace::log_fmt(format_args!("orchestrator.kill: session {} (task {})", self.session.id.0, self.caller));
     }
+
+    /// A [`Router`](crate::tools::Router) for this orchestrator with the
+    /// `spawn_subagent` tool wired to delegate to isolated, capability-attenuated
+    /// sub-agents (Phase C). The hook enforces the parent's caps + depth cap;
+    /// sub-agents run a deterministic rule StepSource (the model stand-in) and
+    /// only their summary crosses back.
+    pub fn router(&self) -> crate::tools::Router {
+        let mut r = crate::tools::Router::new();
+        let parent_caps = self.manifest.capabilities.clone();
+        let max_depth = self.manifest.budgets.max_depth;
+        r.spawn_hook = Some(alloc::boxed::Box::new(move |session, _caller, call| {
+            use crate::agent::agent_loop::ToolOutcome;
+            use crate::agent::{rule_steps, subagent};
+            use crate::session::todo::json_str;
+            let role_name = json_str(&call.args, "role").unwrap_or_default();
+            let task = json_str(&call.args, "task").unwrap_or_default();
+            let role = match role_name.as_str() {
+                "reader" => manifest::reader_subagent_manifest(),
+                other => return ToolOutcome::error(alloc::format!("unknown sub-agent role: {other}")),
+            };
+            let mut sub_router = crate::tools::Router::new(); // sub-agents can't sub-delegate here
+            let mut steps = rule_steps::for_intent(&task);
+            match subagent::dispatch(&parent_caps, 0, max_depth, role, &task, &mut steps, &mut sub_router, Some(0)) {
+                Ok(outcome) => {
+                    let summary = outcome.record.summary.clone().unwrap_or_default();
+                    subagent::record(session, &outcome); // loop appends the tool-result itself
+                    ToolOutcome::ok(summary, Provenance::SystemTrusted)
+                }
+                Err(e) => ToolOutcome::error(alloc::format!("sub-agent refused: {e:?}")),
+            }
+        }));
+        r
+    }
 }

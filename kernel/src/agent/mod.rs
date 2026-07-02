@@ -20,6 +20,7 @@ pub mod agent_loop;
 pub mod manifest;
 pub mod orchestrator;
 pub mod rule_steps;
+pub mod subagent;
 pub mod types;
 
 pub use types::*;
@@ -59,6 +60,55 @@ pub fn demo() {
         let r2 = orch2.handle(follow, &mut steps2, &mut tools);
         serial_println!("Chitti: resume-cont> {} ({} messages now)", r2.answer, orch2.session.messages.len());
     }
+
+    demo_phase_c();
+}
+
+/// Phase C demo: the orchestrator dispatches two isolated reader sub-agents on
+/// distinct cores; only their summaries cross back into the parent context.
+#[cfg(not(test))]
+fn demo_phase_c() {
+    use crate::serial_println;
+    use alloc::string::ToString;
+    serial_println!("Chitti: --- Sub-agents: isolated delegation (Phase C) ---");
+    crate::synapse::fs::write("reportA", b"Q3 revenue up 12%");
+    crate::synapse::fs::write("reportB", b"Q3 churn down 3%");
+
+    let orch = orchestrator::Orchestrator::spawn(manifest::orchestrator_manifest(), 99);
+    let mut parent = orch.session;
+    let mut router = crate::tools::Router::new();
+    let specs = alloc::vec![
+        (manifest::reader_subagent_manifest(), "read reportA".to_string()),
+        (manifest::reader_subagent_manifest(), "read reportB".to_string()),
+    ];
+    let mut make = |i: usize, _t: &str| -> alloc::boxed::Box<dyn agent_loop::StepSource> {
+        let (p, tag) = if i == 0 { ("reportA", "A") } else { ("reportB", "B") };
+        alloc::boxed::Box::new(rule_steps::ScriptedSteps::new(alloc::vec![
+            agent_loop::Step::Tools(alloc::vec![rule_steps::tool("read", rule_steps::args(&[("path", p)]))]),
+            agent_loop::Step::Final(alloc::format!("summary {tag}")),
+        ]))
+    };
+    let caps = manifest::orchestrator_manifest().capabilities;
+    let results = subagent::dispatch_batch(&caps, 0, 2, specs, &mut make, &mut router, 4);
+    for (cid, r) in results.iter().enumerate() {
+        match r {
+            Ok(o) => {
+                subagent::integrate(&mut parent, cid as u64, o);
+                serial_println!(
+                    "Chitti: subagent[core {:?}]> {} (isolated transcript: {} msgs, not merged)",
+                    o.record.core,
+                    o.record.summary.as_deref().unwrap_or(""),
+                    o.sub_session.messages.len()
+                );
+            }
+            Err(e) => serial_println!("Chitti: subagent refused> {:?}", e),
+        }
+    }
+    serial_println!(
+        "Chitti: parent integrated {} summaries; parent context has {} messages (no sub-transcripts)",
+        parent.subagents.len(),
+        parent.messages.len()
+    );
 }
 
 #[cfg(test)]
