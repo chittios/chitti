@@ -281,6 +281,18 @@ impl<'a> Model<'a> {
         State::new(&self.config, self.vocab)
     }
 
+    /// Prefill a prompt: run `prompt[i]` at position `pos0 + i` for every token,
+    /// leaving the recurrent/KV cache advanced and `state.logits` holding the
+    /// logits *after the last* prompt token (the only position whose logits are
+    /// needed to pick the first generated token). The single entry point for
+    /// prompt ingestion, so prefill optimizations land here.
+    pub fn prefill(&self, prompt: &[usize], pos0: usize, cache: &mut Cache, state: &mut State) {
+        let last = prompt.len();
+        for (i, &tok) in prompt.iter().enumerate() {
+            self.forward(tok, pos0 + i, cache, state, i + 1 == last);
+        }
+    }
+
     /// One decoder step for `token` at position `pos` (== `cache.len()`).
     /// When `need_logits`, writes next-token logits into `state.logits`;
     /// otherwise skips the final norm + output projection. The output

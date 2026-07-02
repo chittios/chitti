@@ -67,14 +67,11 @@ pub fn run_reference_inference() -> Option<InferResult> {
     // (~10-15s/token), so log progress per token -- otherwise the long
     // silent gap here looks like a hang.
     let n_prompt = refcheck::PROMPT_IDS.len();
-    let mut logits_pos = 0usize;
+    let prompt: Vec<usize> = refcheck::PROMPT_IDS.iter().map(|&t| t as usize).collect();
     let prefill_start = crate::arch::now_ms();
-    for (pos, &tok) in refcheck::PROMPT_IDS.iter().enumerate() {
-        crate::serial_println!("cortex.infer: prefill {}/{}", pos + 1, n_prompt);
-        m.forward(tok as usize, pos, &mut kv, &mut state, pos + 1 == n_prompt);
-        logits_pos = pos;
-    }
+    m.prefill(&prompt, 0, &mut kv, &mut state);
     let prefill_ms = crate::arch::now_ms().saturating_sub(prefill_start);
+    let logits_pos = n_prompt - 1;
     let prompt_final_argmax = model::argmax(&state.logits);
     let prompt_final_logit = state.logits[prompt_final_argmax];
 
@@ -221,6 +218,52 @@ pub fn bench_matvec() -> BenchResult {
         sdot_ms,
         sdot_rel_rms,
     }
+}
+
+/// Throughput of an end-to-end inference run, split into prompt prefill (`pp`)
+/// and token generation (`tg`) -- the two numbers `llama-bench` reports, so the
+/// `perf` shell builtin is directly comparable. Correctness is *not* asserted
+/// here (the prompt is synthetic); this is a regression gauge, run alongside
+/// `infer` (which does assert reference parity) after every change.
+pub struct InferBench {
+    pub n_prompt: usize,
+    pub prefill_ms: u64,
+    pub n_decode: usize,
+    pub decode_ms: u64,
+}
+
+/// Benchmark inference throughput on a synthetic prompt of `n_prompt` tokens
+/// (the reference ids, cycled) followed by `n_decode` greedy steps. Uses the
+/// real model + forward pass, so it measures exactly what `infer` runs, just
+/// long enough (and without the per-token parity/text work) to be a stable
+/// prefill/decode throughput gauge. Returns `None` if no model is present.
+pub fn bench_inference(n_prompt: usize, n_decode: usize) -> Option<InferBench> {
+    let bytes = model_module()?;
+    let gguf = gguf::Gguf::parse(bytes).ok()?;
+    let m = model::Model::load(gguf).ok()?;
+    let mut kv = m.new_cache();
+    let mut state = m.new_state();
+
+    // Synthetic prompt: cycle the reference ids to the requested length.
+    let base = &refcheck::PROMPT_IDS;
+    let prompt: Vec<usize> = (0..n_prompt).map(|i| base[i % base.len()] as usize).collect();
+
+    let t0 = crate::arch::now_ms();
+    m.prefill(&prompt, 0, &mut kv, &mut state);
+    let prefill_ms = crate::arch::now_ms().saturating_sub(t0);
+
+    let mut pos = n_prompt;
+    let mut next = model::argmax(&state.logits);
+    let t1 = crate::arch::now_ms();
+    for _ in 0..n_decode {
+        m.forward(next, pos, &mut kv, &mut state, true);
+        pos += 1;
+        next = model::argmax(&state.logits);
+    }
+    let decode_ms = crate::arch::now_ms().saturating_sub(t1);
+    core::hint::black_box(next);
+
+    Some(InferBench { n_prompt, prefill_ms, n_decode, decode_ms })
 }
 
 fn bytemuck_ids(ids: &[u32]) -> &[u8] {
