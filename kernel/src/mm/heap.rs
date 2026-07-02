@@ -10,9 +10,7 @@
 //! coalescing of adjacent free blocks — the known limitation the handoff
 //! doc's "buddy if fragmentation bites" already anticipates.
 
-use super::frame::FRAME_SIZE;
 use super::Locked;
-use crate::arch::x86_64::paging::{self, NO_EXECUTE, PRESENT, WRITABLE};
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem;
 use core::ptr::null_mut;
@@ -155,19 +153,22 @@ unsafe impl GlobalAlloc for Locked<LinkedListAllocator> {
 #[global_allocator]
 static ALLOCATOR: Locked<LinkedListAllocator> = Locked::new(LinkedListAllocator::empty());
 
-struct FrameAllocatorAdapter<'a>(&'a Locked<Option<super::frame::BitmapFrameAllocator>>);
-
-impl paging::FrameAllocator for FrameAllocatorAdapter<'_> {
-    fn allocate_frame(&mut self) -> Option<u64> {
-        self.0.with(|slot| slot.as_mut().and_then(|a| a.allocate()))
-    }
-}
-
-/// Map `HEAP_SIZE` bytes at `HEAP_START` to freshly allocated physical
-/// frames and hand the range to the allocator. Must run after
-/// `arch::x86_64::fpu::enable_nx()` (heap pages are mapped `NO_EXECUTE`)
-/// and after `frame_allocator` has been populated.
+/// x86: map `HEAP_SIZE` bytes at `HEAP_START` to freshly allocated physical
+/// frames (via the frame allocator + paging) and hand the range to the
+/// allocator. Must run after `fpu::enable_nx()` (heap pages are `NO_EXECUTE`)
+/// and after the frame allocator is populated.
+#[cfg(target_arch = "x86_64")]
 pub fn init(frame_allocator: &Locked<Option<super::frame::BitmapFrameAllocator>>) {
+    use super::frame::FRAME_SIZE;
+    use crate::arch::x86_64::paging::{self, NO_EXECUTE, PRESENT, WRITABLE};
+
+    struct FrameAllocatorAdapter<'a>(&'a Locked<Option<super::frame::BitmapFrameAllocator>>);
+    impl paging::FrameAllocator for FrameAllocatorAdapter<'_> {
+        fn allocate_frame(&mut self) -> Option<u64> {
+            self.0.with(|slot| slot.as_mut().and_then(|a| a.allocate()))
+        }
+    }
+
     let mut adapter = FrameAllocatorAdapter(frame_allocator);
     for page in (HEAP_START..HEAP_START + HEAP_SIZE as u64).step_by(FRAME_SIZE as usize) {
         let phys = frame_allocator
@@ -176,10 +177,22 @@ pub fn init(frame_allocator: &Locked<Option<super::frame::BitmapFrameAllocator>>
         paging::map_page(page, phys, PRESENT | WRITABLE | NO_EXECUTE, &mut adapter);
     }
 
-    // SAFETY: the whole [HEAP_START, HEAP_START + HEAP_SIZE) range was
-    // just mapped above, is not referenced anywhere else yet, and
-    // HEAP_START is page- (hence `ListNode`-) aligned.
+    // SAFETY: the whole [HEAP_START, HEAP_START + HEAP_SIZE) range was just
+    // mapped above, is not referenced anywhere else yet, and HEAP_START is
+    // page- (hence `ListNode`-) aligned.
     ALLOCATOR.with(|allocator| unsafe { allocator.init(HEAP_START as usize, HEAP_SIZE) });
-
     crate::ktrace::log_fmt(format_args!("mm: heap ready, {HEAP_SIZE} bytes mapped at {HEAP_START:#x}"));
+}
+
+/// aarch64: hand a fixed, already-mapped RAM region to the allocator. No
+/// paging/frame machinery -- the MMU identity-maps RAM as normal cacheable
+/// (`arch::aarch64::mmu`), so `[base, base + size)` is directly usable.
+///
+/// The caller (`mm::init`) guarantees the region is within mapped RAM and
+/// otherwise unused.
+#[cfg(target_arch = "aarch64")]
+pub fn init_static(base: usize, size: usize) {
+    // SAFETY: `[base, base+size)` is identity-mapped normal RAM, `ListNode`-
+    // aligned (page-aligned base), and referenced nowhere else.
+    ALLOCATOR.with(|allocator| unsafe { allocator.init(base, size) });
 }

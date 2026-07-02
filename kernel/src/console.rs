@@ -5,10 +5,18 @@
 //! reaches the framebuffer because `serial::Serial` mirrors there; this module
 //! adds the input side and per-keystroke echo the shell's line editor needs.
 
-/// The next input byte from whichever console has one -- keyboard first, then
-/// serial -- or `None` if neither does.
+/// The next input byte from whichever console has one -- on x86, the PS/2
+/// keyboard first then serial; on aarch64 (QEMU `virt` has no PS/2 keyboard),
+/// serial only -- or `None` if none is available.
 pub fn read_byte() -> Option<u8> {
-    crate::arch::x86_64::keyboard::read_char().or_else(crate::serial::read_byte)
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::x86_64::keyboard::read_char().or_else(crate::serial::read_byte)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        crate::serial::read_byte()
+    }
 }
 
 /// Echo one byte to every output console (serial + framebuffer). Used by the

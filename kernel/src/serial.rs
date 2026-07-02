@@ -5,40 +5,37 @@
 //! IRQ handler's own logging from interleaving with a write already in
 //! progress; there is still no real lock since there is only one core.
 
-use crate::arch::x86_64::port::{inb, outb};
 use core::fmt;
 
-const COM1: u16 = 0x3f8;
+/// Raw, arch-specific byte transport: the 16550 UART (I/O ports) on x86, the
+/// PL011 UART (MMIO) on aarch64. The rest of this module (line buffering,
+/// framebuffer mirroring, the `serial_print!` macros) is arch-independent.
+#[cfg(target_arch = "x86_64")]
+mod raw {
+    use crate::arch::x86_64::port::{inb, outb};
+    const COM1: u16 = 0x3f8;
 
-/// Initialize COM1 to 38400 8N1 with FIFOs enabled. Idempotent.
-pub fn init() {
-    // SAFETY: standard 16550 UART initialization sequence, run once at boot
-    // on COM1 before anything else touches these ports.
-    unsafe {
-        outb(COM1 + 1, 0x00); // disable UART interrupts
-        outb(COM1 + 3, 0x80); // enable DLAB to set the baud rate divisor
-        outb(COM1, 0x03); // divisor low byte -> 38400 baud
-        outb(COM1 + 1, 0x00); // divisor high byte
-        outb(COM1 + 3, 0x03); // 8 bits, no parity, one stop bit; clears DLAB
-        outb(COM1 + 2, 0xc7); // enable + clear 14-byte-threshold FIFOs
-        outb(COM1 + 4, 0x0b); // IRQs enabled (unused for now), RTS/DSR set
+    pub fn init() {
+        // SAFETY: standard 16550 init sequence, once at boot on COM1.
+        unsafe {
+            outb(COM1 + 1, 0x00); // disable UART interrupts
+            outb(COM1 + 3, 0x80); // enable DLAB to set the baud divisor
+            outb(COM1, 0x03); // divisor low -> 38400 baud
+            outb(COM1 + 1, 0x00); // divisor high
+            outb(COM1 + 3, 0x03); // 8N1; clears DLAB
+            outb(COM1 + 2, 0xc7); // enable + clear FIFOs
+            outb(COM1 + 4, 0x0b); // RTS/DSR set
+        }
     }
-}
-
-fn transmit_empty() -> bool {
-    // SAFETY: COM1's line status register; bit 5 is "transmit holding
-    // register empty".
-    unsafe { inb(COM1 + 5) & 0x20 != 0 }
-}
-
-/// Read one byte from COM1 if the UART has one buffered, else `None`.
-/// Non-blocking: the intent shell (Phase 5) polls this and yields the CPU
-/// between polls rather than busy-waiting. Under QEMU `-serial stdio`, bytes
-/// typed at the terminal arrive here on the receive line.
-pub fn read_byte() -> Option<u8> {
-    crate::arch::x86_64::interrupts::without_interrupts(|| {
-        // SAFETY: LSR bit 0 ("data ready") gates the read; only when it is
-        // set is there a byte in the receive buffer to take from COM1.
+    pub fn write(byte: u8) {
+        // SAFETY: spin until LSR bit 5 (THR empty), then write the data port.
+        unsafe {
+            while inb(COM1 + 5) & 0x20 == 0 {}
+            outb(COM1, byte);
+        }
+    }
+    pub fn read() -> Option<u8> {
+        // SAFETY: LSR bit 0 ("data ready") gates the read.
         unsafe {
             if inb(COM1 + 5) & 0x01 != 0 {
                 Some(inb(COM1))
@@ -46,22 +43,39 @@ pub fn read_byte() -> Option<u8> {
                 None
             }
         }
-    })
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod raw {
+    pub fn init() {} // PL011 on QEMU virt needs no setup to transmit
+    pub fn write(byte: u8) {
+        crate::arch::aarch64::uart_putb(byte);
+    }
+    pub fn read() -> Option<u8> {
+        crate::arch::aarch64::uart_getb()
+    }
+}
+
+/// Initialize the console UART. Idempotent.
+pub fn init() {
+    raw::init();
+}
+
+/// Read one byte from the console UART if one is buffered, else `None`.
+/// Non-blocking: the intent shell polls this and yields between polls.
+pub fn read_byte() -> Option<u8> {
+    crate::arch::interrupts::without_interrupts(raw::read)
 }
 
 fn write_byte(byte: u8) {
-    while !transmit_empty() {}
-    // SAFETY: only written once `transmit_empty` confirms the UART is
-    // ready for the next byte.
-    unsafe { outb(COM1, byte) };
+    raw::write(byte);
 }
 
-/// Write a single raw byte to COM1, bypassing the printable-ASCII filter
-/// `Serial`'s `Write` impl applies. The intent shell uses this to emit the
-/// control bytes for in-line editing (backspace: `\x08 \x08`), which the
-/// filter would otherwise turn into dots.
+/// Write a single raw byte, bypassing the printable-ASCII filter `Serial`'s
+/// `Write` impl applies (the shell uses this for backspace: `\x08 \x08`).
 pub fn put_byte(byte: u8) {
-    crate::arch::x86_64::interrupts::without_interrupts(|| write_byte(byte));
+    crate::arch::interrupts::without_interrupts(|| write_byte(byte));
 }
 
 /// Zero-sized handle used to route `core::fmt::Write` (and thus

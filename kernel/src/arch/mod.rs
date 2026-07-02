@@ -20,3 +20,15 @@ pub mod aarch64;
 
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{hlt, interrupts};
+
+/// Milliseconds since boot -- the PIT tick counter on x86, the generic timer
+/// on aarch64. Used for inference throughput timing.
+#[cfg(target_arch = "x86_64")]
+pub fn now_ms() -> u64 {
+    x86_64::pit::ticks()
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn now_ms() -> u64 {
+    aarch64::time_ms()
+}

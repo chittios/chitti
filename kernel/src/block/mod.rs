@@ -6,6 +6,7 @@
 //! disk (persistent across reboots, used at boot).
 
 pub mod ramdisk;
+#[cfg(target_arch = "x86_64")]
 pub mod virtio;
 
 /// Every block device here uses the classic 512-byte sector.

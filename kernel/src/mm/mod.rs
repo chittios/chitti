@@ -2,6 +2,7 @@
 //! the Limine memory map. `chitti_kernel::init` calls `mm::init` once at
 //! boot so callers never touch `frame`/`heap` directly.
 
+#[cfg(target_arch = "x86_64")]
 pub mod frame;
 pub mod heap;
 
@@ -59,11 +60,28 @@ impl<T> Locked<T> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 pub static FRAME_ALLOCATOR: Locked<Option<frame::BitmapFrameAllocator>> = Locked::new(None);
+
+/// aarch64 memory bring-up: enable the MMU (identity map, RAM = normal
+/// cacheable), then hand a fixed RAM region to the linked-list heap. RAM on
+/// the QEMU `virt` machine starts at 0x40000000 and the kernel loads at
+/// 0x40080000; the heap sits well past the image and within the identity map.
+#[cfg(target_arch = "aarch64")]
+pub fn init() {
+    crate::arch::aarch64::mmu::init();
+    const HEAP_BASE: usize = 0x5000_0000; // 256 MiB into RAM
+    heap::init_static(HEAP_BASE, heap::HEAP_SIZE);
+    crate::ktrace::log_fmt(format_args!(
+        "mm: aarch64 heap ready, {} bytes at {HEAP_BASE:#x} (identity-mapped normal memory)",
+        heap::HEAP_SIZE
+    ));
+}
 
 /// Bring up the frame allocator (from the Limine memory map) and the
 /// kernel heap on top of it. Must run after `arch::x86_64::fpu::init()`
 /// (heap pages are mapped `NO_EXECUTE`, which needs `EFER.NXE` set first).
+#[cfg(target_arch = "x86_64")]
 pub fn init(memmap: &[&crate::limine_protocol::MemmapEntry], hhdm_offset: u64) {
     crate::arch::x86_64::paging::set_hhdm_offset(hhdm_offset);
 
@@ -85,6 +103,7 @@ pub fn init(memmap: &[&crate::limine_protocol::MemmapEntry], hhdm_offset: u64) {
 /// returning `(physical_address, virtual_address)`. The physical address is
 /// what a device (virtio) is handed; the virtual address (via the HHDM) is how
 /// the CPU accesses the same memory. Leaked for the device's lifetime.
+#[cfg(target_arch = "x86_64")]
 pub fn alloc_dma(bytes: usize) -> Option<(u64, u64)> {
     let frames = (bytes as u64).div_ceil(frame::FRAME_SIZE);
     let phys = FRAME_ALLOCATOR.with(|slot| slot.as_mut().and_then(|a| a.allocate_contiguous(frames)))?;
@@ -100,6 +119,7 @@ pub fn alloc_dma(bytes: usize) -> Option<(u64, u64)> {
 /// memory-mapped device registers Limine's HHDM does not cover -- notably the
 /// local APIC (`arch::x86_64::apic`), whose MMIO page sits in a hole the HHDM
 /// skips. Mapped uncached (PCD|PWT), writable, non-executable.
+#[cfg(target_arch = "x86_64")]
 pub fn map_mmio_page(phys: u64) -> u64 {
     use crate::arch::x86_64::paging::{self, NO_EXECUTE, PRESENT, WRITABLE};
     const PWT: u64 = 1 << 3;
