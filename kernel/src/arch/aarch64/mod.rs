@@ -18,6 +18,21 @@ pub fn hlt() {
     unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
 }
 
+/// Power off via PSCI `SYSTEM_OFF` (function id 0x84000008) through the HVC
+/// conduit the QEMU `virt` machine advertises -- QEMU turns it into a clean
+/// process exit, so typing `exit` at the shell quits the emulator.
+pub fn poweroff() -> ! {
+    // SAFETY: PSCI SYSTEM_OFF has no memory effects; it does not return.
+    unsafe {
+        asm!(
+            "mov w0, #0x0008",
+            "movk w0, #0x8400, lsl #16", // w0 = 0x84000008 (PSCI_SYSTEM_OFF)
+            "hvc #0",
+            options(nomem, nostack, noreturn),
+        );
+    }
+}
+
 /// CPU interrupt masking via `DAIF.I` (the IRQ mask bit), mirroring the x86
 /// `interrupts` facade so `mm::Locked`, `ktrace`, and the scheduler are
 /// arch-agnostic.
