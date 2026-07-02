@@ -673,10 +673,10 @@ impl<'a> Model<'a> {
         let hk = c.ssm_state;
         let hv = c.ssm_head_dim();
         let key_dim = hk * c.ssm_n_group;
-        // GQA over the recurrent heads: there are `n_group` key/query heads and
-        // `nh` value heads, so `group_size` consecutive value heads share one
-        // q/k head (== 1 when they're equal, e.g. the 0.8B; == 2 for the 9B).
-        let group_size = (nh / c.ssm_n_group).max(1);
+        // GQA over the recurrent heads: `n_group` key/query heads, `nh` value
+        // heads. llama.cpp maps them with `ggml_repeat` (tiling), i.e. value
+        // head h uses key head `h % n_group` -- NOT repeat-interleave. (When
+        // n_group == nh, e.g. the 0.8B, both are the identity.)
         let ck = c.ssm_conv_kernel;
         let (conv1d, dt_bias, a_log, norm_w) = match &self.layers[l].kind {
             LayerKind::Delta { conv1d, dt_bias, a_log, norm, .. } => (*conv1d, *dt_bias, *a_log, *norm),
@@ -712,7 +712,7 @@ impl<'a> Model<'a> {
         let scale = 1.0 / tensor_sqrtf(hk as f32);
         let s_state = &mut cache.delta_s[l];
         for h in 0..nh {
-            let g = h / group_size; // key/query group this value head belongs to (GQA)
+            let g = h % c.ssm_n_group; // key/query head (ggml_repeat tiling, per llama.cpp)
             let q = &mut s.conv[g * hk..(g + 1) * hk].to_vec();
             let k = &mut s.conv[key_dim + g * hk..key_dim + (g + 1) * hk].to_vec();
             let vv = &s.conv[2 * key_dim + h * hv..2 * key_dim + (h + 1) * hv];
