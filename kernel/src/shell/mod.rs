@@ -118,9 +118,10 @@ pub fn run() -> ! {
             "help" => {
                 serial_println!("  intents: write a file called X with the text Y[, then read it back]");
                 serial_println!("           remember that K is V | what is K | list | say TEXT");
-                serial_println!("  builtins: infer (run the Cortex reference inference), exit");
+                serial_println!("  builtins: infer (run the Cortex reference inference), bench (matvec throughput), exit");
             }
             "infer" => run_infer(),
+            "bench" => run_bench(),
             _ => {
                 let result = persona::compiled::run(&mut agent, intent, &mut planner);
                 // If the taint gate refused a destructive action, offer the
@@ -173,6 +174,39 @@ fn run_infer() {
             );
         }
         None => serial_println!("=> no model module present; boot with the model bundled to use `infer`"),
+    }
+}
+
+/// Builtin: microbenchmark the hottest tensor kernel (`matvec_q8_0`) in
+/// isolation and report throughput in MMAC/s. Meaningful under native
+/// execution (aarch64 on HVF); under x86 TCG it just measures the emulator.
+fn run_bench() {
+    let r = crate::cortex::bench_matvec();
+    // MMAC/s = macs / (ms * 1000); guard against a zero interval.
+    let mmacs = if r.ms > 0 { r.macs / (r.ms * 1000) } else { 0 };
+    serial_println!(
+        "bench> matvec_q8_0 (f32 act) {}x{} x{} iters: {} MMAC in {} ms => {} MMAC/s ({}.{} GMAC/s)",
+        r.rows,
+        r.cols,
+        r.iters,
+        r.macs / 1_000_000,
+        r.ms,
+        mmacs,
+        mmacs / 1000,
+        (mmacs % 1000) / 100,
+    );
+    if let Some(sms) = r.sdot_ms {
+        let smmacs = if sms > 0 { r.macs / (sms * 1000) } else { 0 };
+        serial_println!(
+            "bench> matvec_q8_0 (int8 SDOT) same work: {} ms => {} MMAC/s ({}.{} GMAC/s), {}.{}x vs f32; rel_rms_err={}",
+            sms,
+            smmacs,
+            smmacs / 1000,
+            (smmacs % 1000) / 100,
+            if sms > 0 { r.ms / sms } else { 0 },
+            if sms > 0 { (r.ms * 10 / sms) % 10 } else { 0 },
+            r.sdot_rel_rms,
+        );
     }
 }
 

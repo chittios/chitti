@@ -289,44 +289,155 @@ pub unsafe fn matvec_q8_0_rows(
     }
 }
 
-/// Fused NEON `Q8_0` matvec over rows `[row_start, row_end)`: per block, widen
-/// 8 `i8` at a time to `f32`, scale by the block's `f16` `d`, and FMA against
-/// `x` into two independent 4-lane accumulators (breaking the dependency
-/// chain). Native on Apple Silicon.
+/// Fused NEON `Q8_0` matvec over rows `[row_start, row_end)`. Native on Apple
+/// Silicon, and the single hottest kernel, so it is written for maximum
+/// instruction-level parallelism:
+///
+/// - **Scale folded to one FMA per block.** Rather than scaling every widened
+///   `i8` group by the block's `f16` `d` (a `vmulq` per group), the block's
+///   32 products accumulate *unscaled* into partials, then the scale is applied
+///   once via `acc += partial * d` -- the same math (`d·Σqx`), far fewer muls.
+/// - **Four independent accumulator chains** (`acc0..acc3`), each fed once per
+///   block, so consecutive blocks don't serialize on one FMA's latency; and
+///   four *block* partials (`p0..p3`), each fed twice per block, so the two
+///   16-lane halves of a block are independent too. On Firestorm (4 FP/SIMD
+///   pipes, ~4-cycle FMA latency) this keeps enough FMAs in flight to approach
+///   peak throughput instead of stalling on the dependency chain.
+/// - **16 `i8` widened per load** (`vld1q_s8`) to amortize the load and the
+///   `i8→i16→i32→f32` widening across four `f32x4` groups.
 ///
 /// # Safety
-/// See `matvec_q8_0_rows`; NEON is baseline on aarch64.
+/// See `matvec_q8_0_rows`; NEON is baseline on aarch64. `n_cols` is a multiple
+/// of `QK` (32), so each block splits into exactly two 16-lane halves.
 #[cfg(target_arch = "aarch64")]
 unsafe fn matvec_q8_0_neon(w: *const u8, x: *const f32, y: *mut f32, row_start: usize, row_end: usize, n_cols: usize) {
     use core::arch::aarch64::{
-        vaddq_f32, vaddvq_f32, vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32, vget_high_s16, vget_low_s16, vld1_s8, vld1q_f32,
-        vmovl_s16, vmovl_s8, vmulq_f32,
+        vaddq_f32, vaddvq_f32, vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32, vget_high_s16, vget_high_s8, vget_low_s16,
+        vget_low_s8, vld1q_f32, vld1q_s8, vmovl_s16, vmovl_s8,
     };
     let blocks = n_cols / QK;
     let row_bytes = blocks * Q8_0_BLOCK_BYTES;
+
+    // Widen 16 signed `i8` (one `int8x16_t`) to four `float32x4_t` groups
+    // covering lanes [0,4,8,12), and FMA each against the matching `x` window
+    // into the four block partials `p`. A macro (not a closure) so the four
+    // partials stay in registers across invocations.
+    macro_rules! accumulate16 {
+        ($p:expr, $q16:expr, $xp:expr) => {{
+            let v = $q16;
+            let lo = vmovl_s8(vget_low_s8(v)); // i16 x8, lanes 0..8
+            let hi = vmovl_s8(vget_high_s8(v)); // i16 x8, lanes 8..16
+            let f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo)));
+            let f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo)));
+            let f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi)));
+            let f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi)));
+            $p[0] = vfmaq_f32($p[0], f0, vld1q_f32($xp));
+            $p[1] = vfmaq_f32($p[1], f1, vld1q_f32(($xp).add(4)));
+            $p[2] = vfmaq_f32($p[2], f2, vld1q_f32(($xp).add(8)));
+            $p[3] = vfmaq_f32($p[3], f3, vld1q_f32(($xp).add(12)));
+        }};
+    }
+
     // SAFETY: all loads in-bounds per the caller's contract.
     unsafe {
         for r in row_start..row_end {
             let row = w.add(r * row_bytes);
-            let mut acc0 = vdupq_n_f32(0.0);
-            let mut acc1 = vdupq_n_f32(0.0);
+            let mut acc = [vdupq_n_f32(0.0); 4]; // cross-block accumulators
             for b in 0..blocks {
                 let base = b * Q8_0_BLOCK_BYTES;
                 let d = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
                 let dv = vdupq_n_f32(d);
                 let q = row.add(base + 2) as *const i8;
                 let xp = x.add(b * QK);
-                let mut g = 0;
-                while g < QK {
-                    let q16 = vmovl_s8(vld1_s8(q.add(g)));
-                    let qflo = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16))), dv);
-                    let qfhi = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16))), dv);
-                    acc0 = vfmaq_f32(acc0, qflo, vld1q_f32(xp.add(g)));
-                    acc1 = vfmaq_f32(acc1, qfhi, vld1q_f32(xp.add(g + 4)));
-                    g += 8;
-                }
+                let mut p = [vdupq_n_f32(0.0); 4]; // within-block partials (unscaled)
+                accumulate16!(p, vld1q_s8(q), xp); // lanes 0..16
+                accumulate16!(p, vld1q_s8(q.add(16)), xp.add(16)); // lanes 16..32
+                // Fold the block scale in once, into four independent chains.
+                acc[0] = vfmaq_f32(acc[0], p[0], dv);
+                acc[1] = vfmaq_f32(acc[1], p[1], dv);
+                acc[2] = vfmaq_f32(acc[2], p[2], dv);
+                acc[3] = vfmaq_f32(acc[3], p[3], dv);
             }
-            *y.add(r) = vaddvq_f32(vaddq_f32(acc0, acc1));
+            *y.add(r) = vaddvq_f32(vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3])));
+        }
+    }
+}
+
+/// Quantize an activation vector `x` to per-`QK`-block symmetric `int8`
+/// (the "Q8_0 activation" llama.cpp uses to feed the integer dot kernels):
+/// for each block, `scale = max|x| / 127` and `xq[i] = round(x[i]/scale)`.
+/// Writes `xq` (`n_cols` `i8`) and `xs` (`n_cols/QK` `f32` block scales).
+/// Cheap -- `O(n_cols)`, done once per matvec, not once per row.
+pub fn quantize_activations_q8(x: &[f32], xq: &mut [i8], xs: &mut [f32]) {
+    let blocks = x.len() / QK;
+    debug_assert_eq!(xq.len(), x.len());
+    debug_assert_eq!(xs.len(), blocks);
+    for b in 0..blocks {
+        let xb = &x[b * QK..(b + 1) * QK];
+        let mut amax = 0.0f32;
+        for &v in xb {
+            let a = if v < 0.0 { -v } else { v };
+            if a > amax {
+                amax = a;
+            }
+        }
+        let scale = amax / 127.0;
+        let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+        xs[b] = scale;
+        for i in 0..QK {
+            let r = xb[i] * inv;
+            let ri = if r >= 0.0 { (r + 0.5) as i32 } else { (r - 0.5) as i32 };
+            xq[b * QK + i] = ri.clamp(-127, 127) as i8;
+        }
+    }
+}
+
+/// **Experimental** integer-dot `Q8_0` matvec over rows `[row_start, row_end)`,
+/// with the activation pre-quantized to `int8` (`quantize_activations_q8`).
+/// Uses the ARMv8.2 `SDOT` instruction (`vdotq_s32`): 16 `int8`x`int8` products
+/// summed into `int32` lanes *per instruction, with no widening at all* -- the
+/// widening `i8→i16→i32→f32` chain that bottlenecks the f32-activation kernel
+/// disappears. Per block the `int32` dot is reduced and scaled once by
+/// `d_weight · d_activation`. This trades a little accuracy (the activation is
+/// now `int8`, not `f32`) for a large throughput win; it is measured against
+/// the f32 path via the `bench` builtin before being adopted anywhere that
+/// must match the reference.
+///
+/// # Safety
+/// `w` points at the `Q8_0` rows, `xq`/`xs` at the quantized activation and its
+/// per-block scales (`n_cols` `i8` / `n_cols/QK` `f32`), `y` at `n_rows` `f32`;
+/// `row_start <= row_end`; `n_cols` a multiple of `QK`. Requires `dotprod`
+/// (in `targets/aarch64-chitti.json`; baseline on Apple Silicon).
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn matvec_q8_0_sdot_rows(
+    w: *const u8,
+    xq: *const i8,
+    xs: *const f32,
+    y: *mut f32,
+    row_start: usize,
+    row_end: usize,
+    n_cols: usize,
+) {
+    use core::arch::aarch64::{vaddvq_s32, vdotq_s32, vdupq_n_s32, vld1q_s8};
+    let blocks = n_cols / QK;
+    let row_bytes = blocks * Q8_0_BLOCK_BYTES;
+    // SAFETY: all loads in-bounds per the caller's contract; dotprod is enabled.
+    unsafe {
+        for r in row_start..row_end {
+            let row = w.add(r * row_bytes);
+            let mut acc = 0.0f32;
+            for b in 0..blocks {
+                let base = b * Q8_0_BLOCK_BYTES;
+                let dw = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
+                let dx = *xs.add(b);
+                let q = row.add(base + 2) as *const i8;
+                let xp = xq.add(b * QK);
+                let mut iacc = vdupq_n_s32(0);
+                iacc = vdotq_s32(iacc, vld1q_s8(q), vld1q_s8(xp)); // lanes 0..16
+                iacc = vdotq_s32(iacc, vld1q_s8(q.add(16)), vld1q_s8(xp.add(16))); // 16..32
+                acc += (vaddvq_s32(iacc) as f32) * dw * dx;
+            }
+            *y.add(r) = acc;
         }
     }
 }
@@ -536,7 +647,7 @@ pub fn l2norm(x: &mut [f32], eps: f32) {
 // instruction (exact, IEEE-correct). `exp`/`sin`/`cos` use range-reduced
 // polynomial approximations accurate to well within the logit tolerance.
 
-fn libm_sqrtf(x: f32) -> f32 {
+pub fn libm_sqrtf(x: f32) -> f32 {
     // Hardware square root: `sqrtss` on x86 (SSE2), `fsqrt` on aarch64. Both
     // are exact/IEEE-correct and defined for our non-negative inputs (sums of
     // squares plus a positive eps). A Newton-Raphson fallback covers any other

@@ -12,7 +12,7 @@
   "relocation-model": "static",
   "disable-redzone": true,
   "stack-probes": { "kind": "inline" },
-  "features": "+v8a,+strict-align,+neon,+fp-armv8",
+  "features": "+v8a,+strict-align,+neon,+fp-armv8,+dotprod",
   "max-atomic-width": 128,
   "panic-strategy": "abort"
 }
