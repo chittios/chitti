@@ -124,41 +124,103 @@ pub mod interrupts {
 // the ACPI SPCR table (`init_uart`) so we hit the right MMIO on platforms with
 // a different map (e.g. VirtualBox's PL011 at 0xFFDDF000). DR is at base+0x00,
 // FR at base+0x18.
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 static UART_BASE: AtomicUsize = AtomicUsize::new(0x0900_0000);
 const UART_DR: usize = 0x00;
 const UART_FR: usize = 0x18;
 const UART_FR_RXFE: u32 = 1 << 4; // receive FIFO empty
 const UART_FR_TXFF: u32 = 1 << 5; // transmit FIFO full
 
-#[inline]
-fn uart_base() -> usize {
-    UART_BASE.load(core::sync::atomic::Ordering::Relaxed)
+// Recoverable-probe flags for the PL011 MMIO scan (read by the sync handler in
+// `exceptions`), so probing an unbacked candidate address can't crash the boot.
+static UART_PROBING: AtomicBool = AtomicBool::new(false);
+static UART_PROBE_FAULTED: AtomicBool = AtomicBool::new(false);
+
+/// True while probing a candidate UART address (read by the sync handler).
+pub fn uart_probing() -> bool {
+    UART_PROBING.load(Ordering::Acquire)
+}
+/// Called by the sync handler when a probed UART read faults.
+pub fn note_uart_fault() {
+    UART_PROBE_FAULTED.store(true, Ordering::Release);
 }
 
-/// Discover the console UART base from ACPI SPCR (via the stub's boot-info RSDP)
-/// and, if found, map its GiB block as Device MMIO and switch the driver to it.
-/// A no-op on the `-kernel` path (no boot-info) or where there's no SPCR, so
-/// QEMU `virt` keeps the 0x09000000 default. Call once, early (before the first
-/// real UART output), on the BSP.
+#[inline]
+fn uart_base() -> usize {
+    UART_BASE.load(Ordering::Relaxed)
+}
+
+/// Candidate PL011 base addresses to probe when ACPI SPCR doesn't name one.
+/// Each is verified by PrimeCell id before use, so a wrong guess is skipped —
+/// this is discovery-by-probe, not per-hypervisor hardcoding. 0x09000000 is
+/// QEMU `virt` (the default); 0xFFDDF000 is where VirtualBox-ARM maps its PL011.
+const UART_CANDIDATES: [u64; 2] = [0x0900_0000, 0xFFDD_F000];
+
+/// Read a PrimeCell id block (peripheral part @0xFE0, or cell id @0xFF0): four
+/// registers, low byte each, assembled little-endian. Same layout as PL050.
+unsafe fn primecell_block(base: u64, first: u64) -> u32 {
+    use core::ptr::read_volatile;
+    unsafe {
+        (read_volatile((base + first) as *const u32) & 0xff)
+            | ((read_volatile((base + first + 4) as *const u32) & 0xff) << 8)
+            | ((read_volatile((base + first + 8) as *const u32) & 0xff) << 16)
+            | ((read_volatile((base + first + 12) as *const u32) & 0xff) << 24)
+    }
+}
+
+/// Is there a PL011 UART at `base`? Checks the PrimeCell id (0xB105_F00D) and
+/// peripheral part number (0x011). Reads are guarded by the recoverable sync
+/// handler, so an unbacked address just reports "no" instead of faulting.
+fn is_pl011(base: u64) -> bool {
+    UART_PROBE_FAULTED.store(false, Ordering::Release);
+    UART_PROBING.store(true, Ordering::Release);
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    // SAFETY: reads are recovered by the sync handler if `base` is unbacked.
+    let (cell, part) = unsafe { (primecell_block(base, 0xFF0), primecell_block(base, 0xFE0) & 0xfff) };
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    UART_PROBING.store(false, Ordering::Release);
+    !UART_PROBE_FAULTED.load(Ordering::Acquire) && cell == 0xB105_F00D && part == 0x011
+}
+
+/// Discover the console UART base and switch the driver to it. First ACPI SPCR
+/// (via the stub's boot-info RSDP — the firmware-blessed way); then a
+/// PrimeCell-id probe of known PL011 bases (for platforms like VirtualBox that
+/// place the PL011 off QEMU's 0x09000000 and provide no SPCR). Maps the chosen
+/// base's GiB block as Device. A no-op on the `-kernel` path (no boot-info) and
+/// where nothing is found, so QEMU `virt` keeps the 0x09000000 default.
+///
+/// Must run AFTER the exception vectors are installed (the MMIO probe relies on
+/// the recoverable sync handler) and before the first output we want captured.
 pub fn init_uart() {
-    // Boot-info page (magic "CHITTIBI") carries the ACPI RSDP at offset 40.
+    let mut chosen: Option<u64> = None;
+    // 1. ACPI SPCR, if the boot-info carries an RSDP.
     let bi = boot::boot_x1();
-    if bi == 0 {
-        return;
+    if bi != 0 {
+        // SAFETY: `bi` is the stub's identity-mapped boot-info; check the magic.
+        let magic = unsafe { core::slice::from_raw_parts(bi as *const u8, 8) };
+        if magic == b"CHITTIBI" {
+            let rsdp = unsafe { core::ptr::read_volatile((bi + 40) as *const u64) };
+            if let Some((base, iface)) = crate::acpi::uart_from_rsdp(rsdp) {
+                if iface == 0x03 || iface == 0x0e {
+                    chosen = Some(base); // PL011 / ARM SBSA (shared DR/FR layout)
+                }
+            }
+        }
     }
-    // SAFETY: `bi` is the stub's identity-mapped boot-info page; check the magic
-    // before trusting the RSDP field.
-    let magic = unsafe { core::slice::from_raw_parts(bi as *const u8, 8) };
-    if magic != b"CHITTIBI" {
-        return;
+    // 2. Probe known PL011 bases by PrimeCell id (skip the current default).
+    if chosen.is_none() {
+        for &base in &UART_CANDIDATES {
+            if base != uart_base() as u64 && is_pl011(base) {
+                chosen = Some(base);
+                break;
+            }
+        }
     }
-    let rsdp = unsafe { core::ptr::read_volatile((bi + 40) as *const u64) };
-    if let Some((base, iface)) = crate::acpi::uart_from_rsdp(rsdp) {
-        // Accept PL011 (0x03) / ARM SBSA (0x0e), which share the DR/FR layout.
-        if (iface == 0x03 || iface == 0x0e) && base != 0x0900_0000 {
+    if let Some(base) = chosen {
+        if base as usize != uart_base() {
             mmu::map_device_gib(base);
-            UART_BASE.store(base as usize, core::sync::atomic::Ordering::Relaxed);
+            UART_BASE.store(base as usize, Ordering::Relaxed);
+            crate::ktrace::log_fmt(format_args!("uart: PL011 console at {:#x}", base));
         }
     }
 }

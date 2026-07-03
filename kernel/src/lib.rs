@@ -174,6 +174,11 @@ pub fn init() {
     // SAFETY: at EL1 on the BSP; vectors are valid and the GIC MMIO is mapped.
     unsafe {
         arch::aarch64::exceptions::init();
+        // Vectors are up, so the UART MMIO probe can recover from faults: find
+        // the real PL011 base (ACPI SPCR, else a PrimeCell-id probe) so serial
+        // works on platforms that place it off QEMU's 0x09000000 (VirtualBox).
+        // Do it before the GIC so its logs reach the discovered console too.
+        arch::aarch64::init_uart();
         arch::aarch64::gic::init_bsp();
     }
     ktrace::log("init", "aarch64 bring-up complete (MMU + heap + scheduler + SMP + GIC armed)");
