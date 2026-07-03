@@ -446,6 +446,24 @@ impl File {
         unsafe { core::slice::from_raw_parts(self.address, self.size as usize) }
     }
 
+    /// The module's path as a string (e.g. `/boot/model.gguf.001`). Used to
+    /// sort multi-part model modules into order.
+    pub fn path_str(&self) -> &'static str {
+        // SAFETY: `path` is a valid null-terminated C string from Limine.
+        let mut len = 0usize;
+        unsafe {
+            while *self.path.add(len) != 0 {
+                len += 1;
+            }
+            core::str::from_utf8(core::slice::from_raw_parts(self.path, len)).unwrap_or("")
+        }
+    }
+
+    /// Whether the module's path contains `needle`.
+    pub fn path_contains(&self, needle: &str) -> bool {
+        self.path_str().contains(needle)
+    }
+
     /// Whether the module's path ends with `suffix` (e.g. ".gguf").
     pub fn path_ends_with(&self, suffix: &str) -> bool {
         // SAFETY: `path` is a valid null-terminated C string from Limine;

@@ -363,6 +363,40 @@ fn limine_bin() -> Result<PathBuf, String> {
 /// Assemble a hybrid BIOS/UEFI ISO around `kernel_bin` with the default (0.8B)
 /// model bundled, per Limine's documented `xorriso` + `limine bios-install`
 /// recipe (USAGE.md#bios-uefi-hybrid-iso-creation).
+/// Split `model` into `<= part_size`-byte files `model.gguf.000`, `.001`, ...
+/// under `dir`, streaming (never loading the whole file into memory). Returns
+/// the part file names in order. A model that already fits in one part still
+/// becomes a single `model.gguf.000`, so the kernel's collect+sort path is
+/// uniform.
+fn split_model_into_parts(model: &Path, dir: &Path, part_size: u64) -> Result<Vec<String>, String> {
+    use std::io::{Read, Write};
+    let mut f = fs::File::open(model).map_err(|e| format!("opening model: {e}"))?;
+    let mut names = Vec::new();
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    let mut idx = 0usize;
+    loop {
+        let name = format!("model.gguf.{idx:03}");
+        let mut out = fs::File::create(dir.join(&name)).map_err(|e| format!("creating {name}: {e}"))?;
+        let mut written: u64 = 0;
+        while written < part_size {
+            let want = ((part_size - written) as usize).min(buf.len());
+            let n = f.read(&mut buf[..want]).map_err(|e| format!("reading model: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n]).map_err(|e| format!("writing {name}: {e}"))?;
+            written += n as u64;
+        }
+        names.push(name);
+        idx += 1;
+        // If we wrote less than a full part, we hit EOF -- done.
+        if written < part_size {
+            break;
+        }
+    }
+    Ok(names)
+}
+
 fn assemble_image(kernel_bin: &Path) -> Result<PathBuf, String> {
     assemble_image_opt(kernel_bin, Some("assets/model.gguf"))
 }
@@ -404,11 +438,22 @@ fn assemble_image_opt(kernel_bin: &Path, model_rel: Option<&str>) -> Result<Path
     // image lacks, so the declaration must track the actual file.
     let model = model_rel.map(|r| root.join(r)).filter(|p| p.exists());
     if let Some(model) = model {
-        fs::copy(&model, iso_root.join("boot/model.gguf")).map_err(|e| format!("copying model.gguf: {e}"))?;
+        // Split the model into <= part-size chunks named model.gguf.000,
+        // model.gguf.001, ... and declare each as a Limine module. ISO9660
+        // caps a single file at 4 GiB, so a large model (the 9B) must be split
+        // to ship inside one ISO; the kernel reassembles the parts. The part
+        // size is 3 GiB by default (override with CHITTI_MODEL_PART_MB, used by
+        // tests to force multi-part with a small model).
+        let part_mb: u64 = std::env::var("CHITTI_MODEL_PART_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(3072);
+        let part_size = part_mb * 1024 * 1024;
+        let parts = split_model_into_parts(&model, &iso_root.join("boot"), part_size)?;
         let conf_path = iso_root.join("boot/limine/limine.conf");
         let mut conf = fs::read_to_string(&conf_path).map_err(|e| e.to_string())?;
-        conf.push_str("    module_path: boot():/boot/model.gguf\n");
+        for name in &parts {
+            conf.push_str(&format!("    module_path: boot():/boot/{name}\n"));
+        }
         fs::write(&conf_path, conf).map_err(|e| format!("appending module_path: {e}"))?;
+        eprintln!("bundled model as {} Limine module part(s)", parts.len());
     } else if let Some(r) = model_rel {
         eprintln!(
             "xtask: note: {r} not present -- run xtask/fetch-model.sh for inference; \
