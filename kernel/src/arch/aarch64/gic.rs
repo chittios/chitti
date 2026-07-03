@@ -30,13 +30,16 @@ const GICR_IGROUPR0: u64 = GICR_SGI + 0x0080;
 const GICR_ISENABLER0: u64 = GICR_SGI + 0x0100;
 const GICR_IPRIORITYR: u64 = GICR_SGI + 0x0400;
 
-// Generic-timer PPIs: the EL1 physical timer is INTID 30; the EL2 physical
-// timer is INTID 26. Under HVF + `-cpu host` the guest runs at EL2 with VHE
-// (E2H=1), so `CNTP_*_EL0` drives the *EL2* timer (INTID 26); on plain EL1
-// (real hardware / no-VHE) it's INTID 30. We enable + accept both, so the same
-// code is correct regardless of which EL we booted at.
-const TIMER_PPI_EL1: u32 = 30;
-const TIMER_PPI_EL2: u32 = 26;
+// Generic-timer PPIs. We drive the **virtual timer** (CNTV, INTID 27): it is the
+// timer a guest is allowed to use — the *physical* timer (CNTP, INTID 30) is
+// commonly trapped/denied by the hypervisor (VirtualBox raises a GP on a guest
+// `msr CNTP_TVAL_EL0`; KVM/HVF reserve it for the host). The virtual timer works
+// at EL1 under every hypervisor and on real hardware. We also enable + accept
+// the physical (30) and EL2 (26) PPIs so we still tick on a platform that only
+// routes those, but we only *program* CNTV.
+const TIMER_PPI_VIRT: u32 = 27; // virtual timer (CNTV) -- the one we program
+const TIMER_PPI_EL1: u32 = 30; // EL1 physical timer (CNTP)
+const TIMER_PPI_EL2: u32 = 26; // EL2 physical timer (CNTHP)
 const TICK_HZ: u64 = 100; // scheduler tick frequency (cf. x86 PIT 1000 Hz)
 
 /// Current exception level (1, 2, or 3), from `CurrentEL[3:2]`.
@@ -89,13 +92,14 @@ fn cntfrq() -> u64 {
     v
 }
 
-/// Program the EL1 physical timer to fire one tick-interval from now.
+/// Program the **virtual timer** (CNTV) to fire one tick-interval from now.
+/// The virtual timer is the guest-safe generic timer (see `TIMER_PPI_VIRT`).
 fn timer_reload() {
     let interval = (cntfrq() / TICK_HZ).max(1);
-    // SAFETY: CNTP_TVAL/CTL are EL0/EL1-accessible timer registers.
+    // SAFETY: CNTV_TVAL/CTL are EL0/EL1-accessible timer registers.
     unsafe {
-        asm!("msr cntp_tval_el0, {}", in(reg) interval, options(nomem, nostack, preserves_flags));
-        asm!("msr cntp_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack, preserves_flags)); // ENABLE, IMASK=0
+        asm!("msr cntv_tval_el0, {}", in(reg) interval, options(nomem, nostack, preserves_flags));
+        asm!("msr cntv_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack, preserves_flags)); // ENABLE, IMASK=0
     }
 }
 
@@ -125,11 +129,13 @@ pub unsafe fn init_bsp() -> bool {
         }
         // PPIs/SGIs to Group1 (bit per INTID).
         mmio_w32(GICR_BASE, GICR_IGROUPR0, 0xFFFF_FFFF);
-        // Priority for both timer PPIs (byte-addressed): highest usable (0x00).
+        // Priority for all timer PPIs (byte-addressed): highest usable (0x00).
+        write_volatile((GICR_BASE + GICR_IPRIORITYR + TIMER_PPI_VIRT as u64) as *mut u8, 0x00);
         write_volatile((GICR_BASE + GICR_IPRIORITYR + TIMER_PPI_EL1 as u64) as *mut u8, 0x00);
         write_volatile((GICR_BASE + GICR_IPRIORITYR + TIMER_PPI_EL2 as u64) as *mut u8, 0x00);
-        // Enable both timer PPIs (EL1=30, EL2=26).
-        mmio_w32(GICR_BASE, GICR_ISENABLER0, (1 << TIMER_PPI_EL1) | (1 << TIMER_PPI_EL2));
+        // Enable the timer PPIs (virtual=27, physical EL1=30, EL2=26). We only
+        // *program* the virtual timer, but enabling all is harmless.
+        mmio_w32(GICR_BASE, GICR_ISENABLER0, (1 << TIMER_PPI_VIRT) | (1 << TIMER_PPI_EL1) | (1 << TIMER_PPI_EL2));
 
         // --- CPU interface (system registers). ---
         // Enable the system-register interface for our EL. When we run at EL2
@@ -146,24 +152,27 @@ pub unsafe fn init_bsp() -> bool {
         asm!("mrs {}, ICC_SRE_EL1", out(reg) sre, options(nomem, nostack));
         sre |= 1;
         asm!("msr ICC_SRE_EL1, {}", "isb", in(reg) sre, options(nostack));
-        // --- Probe the CPU interface before relying on it. --- Attempt the
-        // first ICC access (PMR) under the recoverable sync handler; if it
-        // UNDEFs (HVF), bail out and let the caller stay cooperative.
+        // --- Probe every system register the interrupt path needs, before
+        // relying on any of it. --- Each of these can be trapped/UNDEF on a
+        // given hypervisor (HVF UNDEFs the ICC_* CPU interface entirely;
+        // VirtualBox raised a GP on the *physical* timer). We run them under the
+        // recoverable sync handler, and if ANY faults we bail to cooperative
+        // scheduling rather than guru-crash: PMR + Group1 enable + start the
+        // virtual timer. (The redistributor/distributor above are MMIO, which
+        // fault differently and are always present, so they stay outside.)
         PROBE_FAULTED.store(false, Ordering::Release);
         PROBING.store(true, Ordering::Release);
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
         asm!("msr ICC_PMR_EL1, {}", "isb", in(reg) 0xFFu64, options(nostack)); // priority mask = allow all
+        asm!("msr ICC_IGRPEN1_EL1, {}", "isb", in(reg) 1u64, options(nostack)); // enable Group1 delivery
+        timer_reload(); // start the virtual timer (CNTV)
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
         PROBING.store(false, Ordering::Release);
         if PROBE_FAULTED.load(Ordering::Acquire) {
-            crate::ktrace::log("gic", "CPU interface (ICC_* sysregs) unavailable -- staying cooperative (HVF has no GICv3 sysreg interface for bare-metal EL1)");
+            crate::ktrace::log("gic", "CPU interface / timer sysreg unavailable -- staying cooperative (hypervisor doesn't expose the GICv3 sysreg interface or virtual timer to a bare-metal EL1 guest)");
             return false;
         }
-
-        // Enable Group1 delivery to this CPU, then start the periodic timer.
-        asm!("msr ICC_IGRPEN1_EL1, {}", in(reg) 1u64, options(nomem, nostack));
-        timer_reload();
-        crate::ktrace::log_fmt(format_args!("gic: GICv3 up at EL{}, timer @ {} Hz (cntfrq {})", current_el(), TICK_HZ, cntfrq()));
+        crate::ktrace::log_fmt(format_args!("gic: GICv3 up at EL{}, virtual timer @ {} Hz (cntfrq {})", current_el(), TICK_HZ, cntfrq()));
         true
     }
 }
@@ -178,7 +187,7 @@ pub fn handle_irq() {
     unsafe { asm!("mrs {}, ICC_IAR1_EL1", out(reg) intid, options(nomem, nostack)) };
     let id = (intid & 0xffffff) as u32;
 
-    if id == TIMER_PPI_EL1 || id == TIMER_PPI_EL2 {
+    if id == TIMER_PPI_VIRT || id == TIMER_PPI_EL1 || id == TIMER_PPI_EL2 {
         TICKS.fetch_add(1, Ordering::Relaxed);
         timer_reload(); // rearm before EOI
         unsafe { asm!("msr ICC_EOIR1_EL1, {}", in(reg) intid, options(nomem, nostack)) };
