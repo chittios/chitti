@@ -471,6 +471,24 @@ fn assemble_image_opt(kernel_bin: &Path, model_rel: Option<&str>) -> Result<Path
             .map_err(|e| format!("copying {f} from {}: {e}", share.display()))?;
     }
 
+    // Installer payload: the files `/install` writes to a target disk to make
+    // it boot standalone -- the Limine UEFI binary + the kernel itself -- are
+    // bundled as extra Limine modules so the running system can read them from
+    // memory and write them to the new disk. (limine.conf for the installed
+    // disk is generated in-kernel, not bundled.)
+    fs::create_dir_all(iso_root.join("boot/payload")).map_err(|e| e.to_string())?;
+    fs::copy(share.join("BOOTX64.EFI"), iso_root.join("boot/payload/BOOTX64.EFI"))
+        .map_err(|e| format!("bundling payload BOOTX64.EFI: {e}"))?;
+    fs::copy(kernel_bin, iso_root.join("boot/payload/chitti-kernel"))
+        .map_err(|e| format!("bundling payload kernel: {e}"))?;
+    {
+        let conf_path = iso_root.join("boot/limine/limine.conf");
+        let mut conf = fs::read_to_string(&conf_path).map_err(|e| e.to_string())?;
+        conf.push_str("    module_path: boot():/boot/payload/BOOTX64.EFI\n");
+        conf.push_str("    module_path: boot():/boot/payload/chitti-kernel\n");
+        fs::write(&conf_path, conf).map_err(|e| format!("declaring payload modules: {e}"))?;
+    }
+
     let iso_path = root.join("target/chitti.iso");
     run(Command::new("xorriso")
         .args([

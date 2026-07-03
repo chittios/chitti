@@ -32,17 +32,16 @@ const INCOMPAT_FILETYPE: u32 = 0x0002;
 const ROCOMPAT_SPARSE_SUPER: u32 = 0x0001;
 const ROCOMPAT_LARGE_FILE: u32 = 0x0002;
 
-/// A file to write into the new filesystem's root: name + one or more data
-/// chunks (the model arrives as multiple module slices — concatenated here
-/// without copying into one buffer).
+/// A file to write into the new filesystem's root: a name + its data (a slice
+/// into module memory — the kernel binary, a model part, or generated text).
 pub struct FileSpec<'a> {
     pub name: &'a str,
-    pub chunks: &'a [&'a [u8]],
+    pub data: &'a [u8],
 }
 
 impl FileSpec<'_> {
     fn len(&self) -> usize {
-        self.chunks.iter().map(|c| c.len()).sum()
+        self.data.len()
     }
 }
 
@@ -266,30 +265,15 @@ impl<'d, D: BlockDevice> Ext4Writer<'d, D> {
         self.write_bitmaps_gdt_super(&inodes)
     }
 
-    /// Write a file's chunk bytes across its data blocks (zero-padding the tail).
+    /// Write a file's bytes across its data blocks (zero-padding the tail).
     fn stream_file(&mut self, f: &FileSpec, data_blocks: &[u64]) -> Result<(), BlockError> {
-        let mut buf = [0u8; EBS];
-        let mut fill = 0usize; // bytes currently in buf
-        let mut bi = 0usize;
-        for chunk in f.chunks {
-            let mut pos = 0usize;
-            while pos < chunk.len() {
-                let take = (EBS - fill).min(chunk.len() - pos);
-                buf[fill..fill + take].copy_from_slice(&chunk[pos..pos + take]);
-                fill += take;
-                pos += take;
-                if fill == EBS {
-                    self.write_eblock(data_blocks[bi], &buf)?;
-                    bi += 1;
-                    fill = 0;
-                }
-            }
-        }
-        if fill > 0 {
-            for b in &mut buf[fill..] {
-                *b = 0;
-            }
-            self.write_eblock(data_blocks[bi], &buf)?;
+        let data = f.data;
+        for (bi, &blk) in data_blocks.iter().enumerate() {
+            let start = bi * EBS;
+            let take = (data.len() - start).min(EBS);
+            let mut buf = [0u8; EBS];
+            buf[..take].copy_from_slice(&data[start..start + take]);
+            self.write_eblock(blk, &buf)?;
         }
         Ok(())
     }

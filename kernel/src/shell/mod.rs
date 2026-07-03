@@ -760,13 +760,20 @@ fn disk_mkfs(_arg: &str) {
 
 #[cfg(target_arch = "x86_64")]
 fn disk_install(arg: &str) {
-    use crate::block::{gpt, virtio::VirtioBlk, BlockDevice, Partition};
+    use crate::block::{ext4::{Ext4Writer, FileSpec}, fat::FatWriter, gpt, virtio::VirtioBlk, BlockDevice, Partition};
+    use alloc::string::String;
+    use alloc::vec::Vec;
     if arg.trim() != "yes" {
-        serial_println!("install> DESTRUCTIVE: repartitions the whole disk (GPT: 512 MiB EFI System");
-        serial_println!("install> partition + a Chitti SimpleFS OS partition) and erases it.");
+        serial_println!("install> DESTRUCTIVE: repartitions the whole disk into a GPT with a 64 MiB");
+        serial_println!("install> FAT ESP (Limine) + an ext4 OS partition (limine.conf + kernel +");
+        serial_println!("install> model), making it boot standalone. Erases everything.");
         serial_println!("install> re-run as '/install yes' to proceed.");
         return;
     }
+    let (Some(efi), Some(kernel)) = (crate::cortex::find_module("BOOTX64.EFI"), crate::cortex::find_module("payload/chitti-kernel")) else {
+        serial_println!("install> installer payload missing (BOOTX64.EFI / kernel modules) -- build the ISO with xtask");
+        return;
+    };
     let Some(mut dev) = VirtioBlk::probe() else {
         serial_println!("install> no block device (boot with a -drive)");
         return;
@@ -776,37 +783,57 @@ fn disk_install(arg: &str) {
         serial_println!("install> disk too small ({} sectors)", total);
         return;
     };
-    // 1. Write the GPT (protective MBR + primary/backup + two partitions).
-    let parts = gpt::standard_parts(&layout);
-    if let Err(e) = gpt::write(&mut dev, &parts) {
+
+    // 1. GPT: FAT ESP + ext4 OS partition.
+    if let Err(e) = gpt::write(&mut dev, &gpt::standard_parts(&layout)) {
         serial_println!("install> GPT write failed: {:?}", e);
         return;
     }
-    serial_println!(
-        "install> GPT written: ESP lba {}..{}, Chitti-OS lba {}..{}",
-        layout.esp_first, layout.esp_last, layout.os_first, layout.os_last
-    );
+    serial_println!("install> GPT: ESP lba {}..{}, ext4 OS lba {}..{}", layout.esp_first, layout.esp_last, layout.os_first, layout.os_last);
 
-    // 2. Format the Chitti OS partition with SimpleFS + drop a marker file.
-    let os_count = layout.os_last - layout.os_first + 1;
-    let part = Partition::new(&mut dev, layout.os_first, os_count);
-    match crate::fs::SimpleFs::format(part, 256) {
-        Ok(mut fs) => {
-            let _ = fs.write("chitti-os", b"Chitti OS installed (SimpleFS root)\n");
-            let _ = fs.write("VERSION", env!("CARGO_PKG_VERSION").as_bytes());
-            serial_println!("install> Chitti OS partition formatted (SimpleFS), marker written.");
-        }
-        Err(e) => {
-            serial_println!("install> SimpleFS format failed: {:?}", e);
+    // 2. FAT ESP: the Limine loader at /EFI/BOOT/BOOTX64.EFI, plus limine.conf
+    //    + the kernel at the root, so the disk boots from FAT alone (UEFI
+    //    firmware requires FAT; Limine reads its config from the boot volume).
+    let esp_conf = b"timeout: 0\n\n/Chitti OS\n    protocol: limine\n    path: boot():/chitti-kernel\n";
+    {
+        let mut esp = Partition::new(&mut dev, layout.esp_first, layout.esp_last - layout.esp_first + 1);
+        let r = FatWriter::format(&mut esp).and_then(|mut fw| {
+            fw.write_efi_boot_file("BOOTX64.EFI", efi)?;
+            fw.write_root_file("limine.conf", esp_conf)?;
+            fw.write_root_file("chitti-kernel", kernel)?;
+            Ok(())
+        });
+        if let Err(e) = r {
+            serial_println!("install> ESP FAT write failed: {:?}", e);
             return;
         }
     }
+    serial_println!("install> ESP (FAT16): BOOTX64.EFI + limine.conf + kernel written.");
 
-    // 3. Boot payload (Limine + kernel + model on the FAT32 ESP) -- REVISIT.
-    serial_println!("install> NOTE: the disk is partitioned + the OS filesystem is created.");
-    serial_println!("install> Populating the FAT32 ESP with Limine + kernel + the model (to boot");
-    serial_println!("install> standalone) needs a FAT32 writer + installer payload -- see DECISIONS.md.");
-    serial_println!("install> Verify now with /disks (GPT + SimpleFS volume) and /ls 1.");
+    // 3. ext4 OS partition: limine.conf + kernel + model parts.
+    let parts = crate::cortex::model_parts();
+    let mut conf = String::from("timeout: 3\n\n/Chitti OS\n    protocol: limine\n    path: boot():/chitti-kernel\n");
+    for (name, _) in &parts {
+        conf.push_str("    module_path: boot():/");
+        conf.push_str(name);
+        conf.push('\n');
+    }
+    let conf_bytes = conf.into_bytes();
+    let mut files: Vec<FileSpec> = Vec::new();
+    files.push(FileSpec { name: "limine.conf", data: &conf_bytes });
+    files.push(FileSpec { name: "chitti-kernel", data: kernel });
+    for (name, data) in &parts {
+        files.push(FileSpec { name, data });
+    }
+    {
+        let mut os = Partition::new(&mut dev, layout.os_first, layout.os_last - layout.os_first + 1);
+        if let Err(e) = Ext4Writer::format(&mut os, &files) {
+            serial_println!("install> ext4 format/write failed: {:?}", e);
+            return;
+        }
+    }
+    serial_println!("install> ext4 OS partition written: limine.conf + kernel + {} model part(s).", parts.len());
+    serial_println!("install> DONE -- the disk now boots Chitti standalone via UEFI. Remove the ISO and reboot.");
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -830,8 +857,8 @@ fn disk_mkext4(arg: &str) {
     let hello = b"hello from Chitti's from-scratch ext4 writer\n";
     let big: alloc::vec::Vec<u8> = (0..200_000u32).map(|i| ((i.wrapping_mul(7)) & 0xff) as u8).collect();
     let files = [
-        FileSpec { name: "hello.txt", chunks: &[&hello[..]] },
-        FileSpec { name: "big.bin", chunks: &[&big[..]] },
+        FileSpec { name: "hello.txt", data: &hello[..] },
+        FileSpec { name: "big.bin", data: &big[..] },
     ];
     match Ext4Writer::format(&mut dev, &files) {
         Ok(()) => serial_println!("mkext4> formatted ext4 + wrote hello.txt (45 B) + big.bin (200000 B)."),

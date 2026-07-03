@@ -482,6 +482,33 @@ pub fn model_module() -> Option<&'static [u8]> {
     Some(unsafe { core::slice::from_raw_parts(virt as *const u8, total) })
 }
 
+/// Find a boot module whose path contains `needle` (x86 Limine). Used by
+/// `/install` to reach the installer payload (BOOTX64.EFI, the kernel binary).
+#[cfg(target_arch = "x86_64")]
+pub fn find_module(needle: &str) -> Option<&'static [u8]> {
+    crate::MODULE_REQUEST.response()?.modules().iter().copied().find(|m| m.path_contains(needle)).map(|m| m.data())
+}
+
+/// The individual model parts (basename, bytes), sorted — for `/install`, which
+/// writes each as a separate file on the ext4 partition (Limine reassembles
+/// them the same way this kernel does).
+#[cfg(target_arch = "x86_64")]
+pub fn model_parts() -> alloc::vec::Vec<(&'static str, &'static [u8])> {
+    use alloc::vec::Vec;
+    let Some(r) = crate::MODULE_REQUEST.response() else { return Vec::new() };
+    let mut parts: Vec<&'static crate::limine_protocol::File> =
+        r.modules().iter().copied().filter(|m| m.path_contains(".gguf")).collect();
+    parts.sort_by_key(|m| m.path_str());
+    parts
+        .iter()
+        .map(|m| {
+            let p = m.path_str();
+            let base = p.rsplit('/').next().unwrap_or(p);
+            (base, m.data())
+        })
+        .collect()
+}
+
 /// aarch64: the model is placed in RAM by QEMU's `-device loader` at a fixed
 /// physical address (there is no Limine on the `-M virt -kernel` boot path).
 /// We expose it as a slice bounded by the region between the model base and
