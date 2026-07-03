@@ -9,6 +9,7 @@ pub mod ext4;
 pub mod ext4_read;
 pub mod ext4_store;
 pub mod fat;
+pub mod fat_read;
 pub mod gpt;
 pub mod ramdisk;
 #[cfg(target_arch = "x86_64")]
@@ -24,15 +25,23 @@ pub type DiskDevice = virtio::VirtioBlk;
 #[cfg(target_arch = "aarch64")]
 pub type DiskDevice = crate::arch::aarch64::virtio_blk::VirtioBlkMmio;
 
-/// Probe for the boot disk on this arch, if present.
+/// Probe for the boot disk on this arch, if present (the first block device).
 pub fn probe_disk() -> Option<DiskDevice> {
+    probe_disk_nth(0)
+}
+
+/// Probe the `n`-th block device (0-based) on this arch, if present. More than
+/// one appears when a boot ESP disk and a data/target disk are both attached
+/// (the aarch64 UEFI flow); `/install` uses this to find the payload source vs
+/// the install target on both arches through the same API.
+pub fn probe_disk_nth(n: usize) -> Option<DiskDevice> {
     #[cfg(target_arch = "x86_64")]
     {
-        virtio::VirtioBlk::probe()
+        virtio::VirtioBlk::probe_nth(n)
     }
     #[cfg(target_arch = "aarch64")]
     {
-        crate::arch::aarch64::virtio_blk::VirtioBlkMmio::probe()
+        crate::arch::aarch64::virtio_blk::VirtioBlkMmio::probe_nth(n)
     }
 }
 

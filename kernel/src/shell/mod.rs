@@ -829,9 +829,128 @@ fn disk_install(arg: &str) {
     serial_println!("install> DONE -- the disk now boots Chitti standalone via UEFI. Remove the ISO and reboot.");
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn disk_install(_arg: &str) {
-    serial_println!("install> block-device support is x86-only");
+/// aarch64 `/install`: make the target disk boot Chitti standalone via UEFI.
+/// Layout: GPT with a FAT ESP carrying the Chitti UEFI stub (BOOTAA64.EFI) +
+/// the kernel + the model — the stub reads all three off the ESP at boot — plus
+/// an ext4 data partition for durable agent state. The installer payload is
+/// read from the **boot ESP** this system was started from (the FAT volume
+/// holding `chitti-kernel`), the aarch64 equivalent of the x86 path's Limine
+/// payload modules.
+#[cfg(target_arch = "aarch64")]
+fn disk_install(arg: &str) {
+    use crate::block::{ext4::Ext4Writer, fat::FatWriter, fat_read::FatReader, gpt, BlockDevice, Partition};
+    if arg.trim() != "yes" {
+        serial_println!("install> DESTRUCTIVE: repartitions the target disk into a GPT with a FAT ESP");
+        serial_println!("install> (Chitti UEFI stub + kernel + model) + an ext4 data partition, making it");
+        serial_println!("install> boot standalone. Erases everything on the target.");
+        serial_println!("install> re-run as '/install yes' to proceed.");
+        return;
+    }
+    // Identify the boot ESP (payload source) vs the target among the attached
+    // block devices: the ESP is the FAT volume containing `chitti-kernel`.
+    let mut esp_idx = None;
+    for i in 0..4 {
+        let Some(mut dev) = crate::block::probe_disk_nth(i) else { break };
+        if let Some(mut r) = FatReader::open(&mut dev) {
+            if r.exists("chitti-kernel") {
+                esp_idx = Some(i);
+                break;
+            }
+        }
+    }
+    let Some(esp_idx) = esp_idx else {
+        serial_println!("install> no boot ESP found (a FAT volume with /chitti-kernel) -- boot via `--uefi` to install");
+        return;
+    };
+    let target_idx = if esp_idx == 0 { 1 } else { 0 };
+    let Some(mut target) = crate::block::probe_disk_nth(target_idx) else {
+        serial_println!("install> no target disk (attach a second disk; the boot ESP is not a valid target)");
+        return;
+    };
+
+    // Read the stub + kernel off the boot ESP. The model is NOT re-read from
+    // FAT (it would not fit the 256 MiB heap): the stub already loaded it into
+    // RAM at the fixed model address, so `cortex::model_module()` hands us the
+    // exact bytes as a zero-copy slice.
+    let Some(mut src_dev) = crate::block::probe_disk_nth(esp_idx) else { return };
+    let (stub, kernel, model_size) = {
+        let Some(mut r) = FatReader::open(&mut src_dev) else {
+            serial_println!("install> boot ESP unreadable");
+            return;
+        };
+        let Some(stub) = r.read_file("EFI/BOOT/BOOTAA64.EFI") else {
+            serial_println!("install> BOOTAA64.EFI missing from the boot ESP");
+            return;
+        };
+        let Some(kernel) = r.read_file("chitti-kernel") else {
+            serial_println!("install> chitti-kernel missing from the boot ESP");
+            return;
+        };
+        (stub, kernel, r.file_size("model.gguf.000"))
+    };
+    // The model's bytes are already in RAM (the stub loaded them at the fixed
+    // model address); `model_module()` exposes the RAM window, and the FAT
+    // directory entry gives the file's true size to slice it by.
+    let model: Option<&'static [u8]> = match (crate::cortex::model_module(), model_size) {
+        (Some(m), Some(sz)) if (sz as usize) <= m.len() => Some(&m[..sz as usize]),
+        _ => None,
+    };
+    let model_len = model.map(|m| m.len()).unwrap_or(0);
+    serial_println!(
+        "install> payload from boot ESP: stub {} B, kernel {} B, model {} B",
+        stub.len(),
+        kernel.len(),
+        model_len
+    );
+
+    // 1. GPT: ESP (payload-sized) + ext4 data.
+    let total = target.block_count();
+    let esp_bytes = (stub.len() + kernel.len() + model_len) as u64;
+    let Some(parts) = gpt::esp_data_parts(total, esp_bytes) else {
+        serial_println!("install> target disk too small ({} sectors for a {} B payload)", total, esp_bytes);
+        return;
+    };
+    if let Err(e) = gpt::write(&mut target, &parts) {
+        serial_println!("install> GPT write failed: {:?}", e);
+        return;
+    }
+    serial_println!(
+        "install> GPT: ESP lba {}..{}, ext4 data lba {}..{}",
+        parts[0].first_lba,
+        parts[0].last_lba,
+        parts[1].first_lba,
+        parts[1].last_lba
+    );
+
+    // 2. FAT ESP: the stub at /EFI/BOOT/BOOTAA64.EFI + kernel + model at the
+    //    root (exactly where the stub looks).
+    {
+        let mut esp = Partition::new(&mut target, parts[0].first_lba, parts[0].last_lba - parts[0].first_lba + 1);
+        let r = FatWriter::format(&mut esp).and_then(|mut fw| {
+            fw.write_efi_boot_file("BOOTAA64.EFI", &stub)?;
+            fw.write_root_file("chitti-kernel", &kernel)?;
+            if let Some(m) = model {
+                fw.write_root_file("model.gguf.000", m)?;
+            }
+            Ok(())
+        });
+        if let Err(e) = r {
+            serial_println!("install> ESP FAT write failed: {:?}", e);
+            return;
+        }
+    }
+    serial_println!("install> ESP (FAT): BOOTAA64.EFI + kernel{} written.", if model.is_some() { " + model" } else { "" });
+
+    // 3. Empty ext4 data partition for durable agent state.
+    {
+        let mut data = Partition::new(&mut target, parts[1].first_lba, parts[1].last_lba - parts[1].first_lba + 1);
+        if let Err(e) = Ext4Writer::format(&mut data, &[]) {
+            serial_println!("install> ext4 data partition format failed: {:?}", e);
+            return;
+        }
+    }
+    serial_println!("install> ext4 data partition formatted for durable agent state.");
+    serial_println!("install> DONE -- the disk now boots Chitti standalone via UEFI. Reboot with --disk-only.");
 }
 
 fn disk_mkext4(arg: &str) {

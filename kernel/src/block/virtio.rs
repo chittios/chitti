@@ -111,12 +111,21 @@ impl VirtioBlk {
     /// up and return it. `None` if no such device is present (e.g. QEMU was
     /// started without a virtio-blk drive).
     pub fn probe() -> Option<VirtioBlk> {
+        Self::probe_nth(0)
+    }
+
+    /// Bring up the `n`-th (0-based, in ascending PCI slot order) virtio-blk.
+    pub fn probe_nth(n: usize) -> Option<VirtioBlk> {
+        let mut seen = 0usize;
         for slot in 0u8..32 {
             let id = pci_read32(0, slot, 0, 0x00);
             let vendor = (id & 0xffff) as u16;
             let device = (id >> 16) as u16;
             if vendor == VIRTIO_VENDOR && device == VIRTIO_BLK_DEVICE {
-                return VirtioBlk::init(0, slot, 0);
+                if seen == n {
+                    return VirtioBlk::init(0, slot, 0);
+                }
+                seen += 1;
             }
         }
         None
