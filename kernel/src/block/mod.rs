@@ -5,23 +5,44 @@
 //! on a RAM disk (deterministic, used by the test suite) or a real virtio-blk
 //! disk (persistent across reboots, used at boot).
 
+pub mod ahci;
 pub mod ext4;
 pub mod ext4_read;
 pub mod ext4_store;
 pub mod fat;
 pub mod fat_read;
 pub mod gpt;
+pub mod nvme;
 pub mod ramdisk;
 #[cfg(target_arch = "x86_64")]
 pub mod virtio;
 
+/// A DMA region: the physical address a device is programmed with, and the
+/// virtual address the CPU touches the same bytes through. On aarch64 (identity
+/// map / stub HHDM) `phys` derives from `virt` via `dma_to_phys`; on x86 the two
+/// differ (the frame allocator gives a physical frame, reached via the HHDM).
+/// This is the platform seam that lets the shared NVMe/AHCI cores allocate and
+/// address DMA memory without knowing the arch — the same idea as the `xhci`
+/// core's `(phys, virt)` allocator.
+#[derive(Clone, Copy)]
+pub struct Dma {
+    pub phys: u64,
+    pub virt: u64,
+}
+
+/// Allocate a physically-contiguous, zeroed, 4 KiB-aligned DMA region of at
+/// least `bytes`, or `None` on failure. Each arch supplies its own (aarch64:
+/// heap `alloc_zeroed` + `dma_to_phys`; x86: `mm::alloc_dma`).
+pub type DmaAlloc = fn(usize) -> Option<Dma>;
+
 /// The concrete disk device for this arch, behind the shared [`BlockDevice`]
-/// API: x86 = virtio-blk over legacy PCI I/O; aarch64 = virtio-blk over
-/// virtio-mmio. Consumers (fs, ext4, install, persistence) name `DiskDevice`
-/// and call [`probe_disk`], so the whole storage stack is arch-independent —
-/// the driver is the only arch-specific piece (per the dual-arch standing rule).
+/// API — a transport-selecting `Disk` enum on both arches (virtio, plus the
+/// real-hardware controllers NVMe and AHCI discovered over PCIe). Consumers
+/// (fs, ext4, install, persistence) name `DiskDevice` and call [`probe_disk`],
+/// so the whole storage stack is arch-independent; only device discovery is
+/// arch-specific (per the dual-arch standing rule).
 #[cfg(target_arch = "x86_64")]
-pub type DiskDevice = virtio::VirtioBlk;
+pub type DiskDevice = crate::arch::x86_64::disk::Disk;
 #[cfg(target_arch = "aarch64")]
 pub type DiskDevice = crate::arch::aarch64::disk::Disk;
 
@@ -37,7 +58,7 @@ pub fn probe_disk() -> Option<DiskDevice> {
 pub fn probe_disk_nth(n: usize) -> Option<DiskDevice> {
     #[cfg(target_arch = "x86_64")]
     {
-        virtio::VirtioBlk::probe_nth(n)
+        crate::arch::x86_64::disk::Disk::probe_nth(n)
     }
     #[cfg(target_arch = "aarch64")]
     {

@@ -131,14 +131,29 @@ pub fn alloc_dma(bytes: usize) -> Option<(u64, u64)> {
 /// skips. Mapped uncached (PCD|PWT), writable, non-executable.
 #[cfg(target_arch = "x86_64")]
 pub fn map_mmio_page(phys: u64) -> u64 {
+    map_mmio(phys, 0x1000)
+}
+
+/// Map a `bytes`-sized MMIO region starting at physical address `phys` into the
+/// HHDM and return the virtual address `phys` is now reachable at. Like
+/// [`map_mmio_page`] but spans as many 4 KiB pages as the region needs — used
+/// for device register blocks larger than one page (NVMe BAR0, AHCI ABAR).
+/// Mapped uncached (PCD|PWT), writable, non-executable.
+#[cfg(target_arch = "x86_64")]
+pub fn map_mmio(phys: u64, bytes: usize) -> u64 {
     use crate::arch::x86_64::paging::{self, NO_EXECUTE, PRESENT, WRITABLE};
     const PWT: u64 = 1 << 3;
     const PCD: u64 = 1 << 4;
-    let page = phys & !0xfff;
-    let virt = paging::phys_to_virt(page);
+    let first = phys & !0xfff;
+    let last = (phys + bytes as u64 - 1) & !0xfff;
     FRAME_ALLOCATOR.with(|slot| {
-        let alloc = slot.as_mut().expect("map_mmio_page: frame allocator not initialized");
-        paging::map_page(virt, page, PRESENT | WRITABLE | NO_EXECUTE | PCD | PWT, alloc);
+        let alloc = slot.as_mut().expect("map_mmio: frame allocator not initialized");
+        let mut page = first;
+        while page <= last {
+            let virt = paging::phys_to_virt(page);
+            paging::map_page(virt, page, PRESENT | WRITABLE | NO_EXECUTE | PCD | PWT, alloc);
+            page += 0x1000;
+        }
     });
-    virt + (phys & 0xfff)
+    paging::phys_to_virt(first) + (phys & 0xfff)
 }

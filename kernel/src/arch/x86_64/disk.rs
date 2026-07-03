@@ -1,31 +1,27 @@
-//! The aarch64 boot disk behind the shared [`BlockDevice`] API, selecting the
-//! transport at probe time: **virtio-pci** (the real PCIe bus, discovered via
-//! ACPI ECAM — real hardware / hypervisors) is preferred; **virtio-mmio** (the
-//! QEMU `virt` window) is the fallback. A given platform uses one transport, so
-//! `probe_nth` tries PCIe first and falls back to mmio.
+//! The x86 boot disk behind the shared [`BlockDevice`] API, selecting the
+//! transport at probe time: **virtio-blk** (legacy PCI I/O — the QEMU/Limine
+//! default) is preferred; then the real-hardware controllers **NVMe** and
+//! **AHCI** over PCI (for hosts/hypervisors that don't expose virtio). A given
+//! platform uses one, so `probe_nth` tries them in order and skips the absent —
+//! the x86 mirror of `arch::aarch64::disk::Disk`.
 
-use crate::arch::aarch64::virtio_blk::VirtioBlkMmio;
-use crate::arch::aarch64::virtio_pci::VirtioBlkPci;
-use crate::arch::aarch64::{ahci, nvme};
+use crate::arch::x86_64::{ahci, nvme};
 use crate::block::ahci::Ahci;
 use crate::block::nvme::Nvme;
+use crate::block::virtio::VirtioBlk;
 use crate::block::{BlockDevice, BlockError};
 
-/// The aarch64 boot disk, one variant per real transport. `probe_nth` tries
-/// them in order of preference — virtio (para-virtual, fast) first, then the
-/// real-hardware controllers NVMe and AHCI, then the QEMU-mmio fallback. A
-/// platform typically exposes exactly one, so ordering just skips the absent.
+/// The x86 boot disk, one variant per real transport.
 pub enum Disk {
-    Pci(VirtioBlkPci),
+    Virtio(VirtioBlk),
     Nvme(Nvme),
     Ahci(Ahci),
-    Mmio(VirtioBlkMmio),
 }
 
 impl Disk {
     pub fn probe_nth(n: usize) -> Option<Disk> {
-        if let Some(d) = VirtioBlkPci::probe_nth(n) {
-            return Some(Disk::Pci(d));
+        if let Some(d) = VirtioBlk::probe_nth(n) {
+            return Some(Disk::Virtio(d));
         }
         if let Some(d) = nvme::probe_nth(n) {
             return Some(Disk::Nvme(d));
@@ -33,17 +29,16 @@ impl Disk {
         if let Some(d) = ahci::probe_nth(n) {
             return Some(Disk::Ahci(d));
         }
-        VirtioBlkMmio::probe_nth(n).map(Disk::Mmio)
+        None
     }
 }
 
 macro_rules! dispatch {
     ($self:ident, $m:ident $(, $a:expr)*) => {
         match $self {
-            Disk::Pci(d) => d.$m($($a),*),
+            Disk::Virtio(d) => d.$m($($a),*),
             Disk::Nvme(d) => d.$m($($a),*),
             Disk::Ahci(d) => d.$m($($a),*),
-            Disk::Mmio(d) => d.$m($($a),*),
         }
     };
 }
