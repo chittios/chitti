@@ -67,6 +67,11 @@ pub fn ticks() -> u64 {
 // fall back to cooperative scheduling instead of crashing the boot.
 static PROBING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static PROBE_FAULTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Set by `init_bsp`: whether the GIC + timer came up (→ preemption available).
+/// Read by `start_preemption`, which actually unmasks IRQs — deferred until the
+/// framebuffer + devices are up, so device bring-up runs with IRQs masked (as in
+/// the cooperative path) and the display is never left uninitialized.
+static PREEMPTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// True while a CPU-interface access is being probed (read by the sync handler).
 pub fn probing() -> bool {
@@ -170,11 +175,32 @@ pub unsafe fn init_bsp() -> bool {
         PROBING.store(false, Ordering::Release);
         if PROBE_FAULTED.load(Ordering::Acquire) {
             crate::ktrace::log("gic", "CPU interface / timer sysreg unavailable -- staying cooperative (hypervisor doesn't expose the GICv3 sysreg interface or virtual timer to a bare-metal EL1 guest)");
+            PREEMPTIVE.store(false, Ordering::Release);
             return false;
         }
-        crate::ktrace::log_fmt(format_args!("gic: GICv3 up at EL{}, virtual timer @ {} Hz (cntfrq {})", current_el(), TICK_HZ, cntfrq()));
+        crate::ktrace::log_fmt(format_args!("gic: GICv3 up at EL{}, virtual timer @ {} Hz (cntfrq {}); IRQs still masked until devices are up", current_el(), TICK_HZ, cntfrq()));
+        PREEMPTIVE.store(true, Ordering::Release);
         true
     }
+}
+
+/// Unmask IRQs to begin timer-preemptive scheduling — called **after** the
+/// framebuffer + devices are brought up (they initialize with IRQs masked, like
+/// the cooperative path, so the display is never left half-initialized). No-op
+/// if the GIC/timer weren't available (`init_bsp` returned false → cooperative).
+pub fn start_preemption() {
+    if !PREEMPTIVE.load(Ordering::Acquire) {
+        crate::ktrace::log("gic", "no timer IRQ -- cooperative scheduling");
+        return;
+    }
+    super::interrupts::enable();
+    // Warmup: confirm the timer IRQ is actually delivered (routing works). At
+    // 100 Hz, ~50 ms yields a few ticks; bounded by the free-running counter.
+    let start = super::time_ms();
+    while super::time_ms().wrapping_sub(start) < 50 {
+        core::hint::spin_loop();
+    }
+    crate::ktrace::log_fmt(format_args!("gic: timer delivering IRQs ({} ticks in 50 ms) -- preemptive scheduling", ticks()));
 }
 
 /// Handle one IRQ: acknowledge via `ICC_IAR1_EL1`, service the timer, complete

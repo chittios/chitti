@@ -200,6 +200,12 @@ pub extern "C" fn aarch64_start() -> ! {
     // without a `-drive`/virtio-blk-device.
     disk_demo();
     mount_persistent_store();
+    // Everything is up (framebuffer, USB/input, disk, persistent store) with IRQs
+    // masked. NOW begin timer-preemptive scheduling: unmask IRQs so the generic
+    // timer preempts the shell. Deferred to here (not inside init()) so device
+    // bring-up — the framebuffer especially — runs identically to the cooperative
+    // path; a no-op where the GIC/timer wasn't available (HVF → cooperative).
+    chitti_kernel::arch::aarch64::gic::start_preemption();
     run_os();
 }
 
