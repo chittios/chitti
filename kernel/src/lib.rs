@@ -392,9 +392,14 @@ fn ipc_round_trip_delivers_a_message() {
     let request_ep = ipc::create_endpoint();
     let reply_ep = ipc::create_endpoint();
 
-    let responder_id = sched::spawn("ipc_responder", responder, 0);
-    cap::grant(responder_id, cap::Right::IpcReceive(request_ep)); // responder's slot 0
-    cap::grant(responder_id, cap::Right::IpcSend(reply_ep)); // responder's slot 1
+    // Spawn + grant atomically w.r.t. the timer, so the responder can't be
+    // scheduled before its slot-0/slot-1 capabilities are in place.
+    let responder_id = arch::interrupts::without_interrupts(|| {
+        let id = sched::spawn("ipc_responder", responder, 0);
+        cap::grant(id, cap::Right::IpcReceive(request_ep)); // responder's slot 0
+        cap::grant(id, cap::Right::IpcSend(reply_ep)); // responder's slot 1
+        id
+    });
 
     let my_send_cap = cap::grant(sched::current_task_id(), cap::Right::IpcSend(request_ep));
     let my_recv_cap = cap::grant(sched::current_task_id(), cap::Right::IpcReceive(reply_ep));
@@ -727,11 +732,16 @@ fn phase5_two_agents_coordinate_via_ipc() {
     }
 
     let work_ep = ipc::create_endpoint();
-    let consumer_id = sched::spawn("persona-consumer", consumer, 0);
-    cap::grant(consumer_id, cap::Right::IpcReceive(work_ep)); // consumer slot 0
-    cap::grant(consumer_id, cap::Right::InvokePrimitive(synapse::registry::MEM_FS_WRITE));
-    let producer_id = sched::spawn("persona-producer", producer, 0);
-    cap::grant(producer_id, cap::Right::IpcSend(work_ep)); // producer slot 0
+    // Spawn + grant under interrupts-off so a timer preemption can't run a
+    // freshly-spawned task before its capabilities are granted (its `Cap(N)`
+    // slot convention would otherwise resolve to an empty table).
+    arch::interrupts::without_interrupts(|| {
+        let consumer_id = sched::spawn("persona-consumer", consumer, 0);
+        cap::grant(consumer_id, cap::Right::IpcReceive(work_ep)); // consumer slot 0
+        cap::grant(consumer_id, cap::Right::InvokePrimitive(synapse::registry::MEM_FS_WRITE));
+        let producer_id = sched::spawn("persona-producer", producer, 0);
+        cap::grant(producer_id, cap::Right::IpcSend(work_ep)); // producer slot 0
+    });
 
     let mut spins = 0u64;
     while !DONE.load(Ordering::SeqCst) {

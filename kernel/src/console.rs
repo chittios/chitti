@@ -11,7 +11,10 @@
 pub fn read_byte() -> Option<u8> {
     #[cfg(target_arch = "x86_64")]
     {
-        crate::arch::x86_64::keyboard::read_char().or_else(crate::serial::read_byte)
+        // PS/2 keyboard, then a USB (xHCI/HID) keyboard, then serial.
+        crate::arch::x86_64::keyboard::read_char()
+            .or_else(crate::arch::x86_64::xhci::poll_key)
+            .or_else(crate::serial::read_byte)
     }
     #[cfg(target_arch = "aarch64")]
     {
