@@ -23,7 +23,7 @@ pub mod virtio;
 #[cfg(target_arch = "x86_64")]
 pub type DiskDevice = virtio::VirtioBlk;
 #[cfg(target_arch = "aarch64")]
-pub type DiskDevice = crate::arch::aarch64::virtio_blk::VirtioBlkMmio;
+pub type DiskDevice = crate::arch::aarch64::disk::Disk;
 
 /// Probe for the boot disk on this arch, if present (the first block device).
 pub fn probe_disk() -> Option<DiskDevice> {
@@ -41,7 +41,7 @@ pub fn probe_disk_nth(n: usize) -> Option<DiskDevice> {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        crate::arch::aarch64::virtio_blk::VirtioBlkMmio::probe_nth(n)
+        crate::arch::aarch64::disk::Disk::probe_nth(n)
     }
 }
 

@@ -8,10 +8,12 @@
 
 pub mod boot;
 pub mod mmu;
+pub mod disk;
 pub mod ramfb;
 pub mod smp;
 pub mod virtio_blk;
 pub mod virtio_input;
+pub mod virtio_pci;
 
 use core::arch::asm;
 

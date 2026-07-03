@@ -37,6 +37,24 @@ pub fn init() {
     }
 }
 
+/// Add a 1 GiB **Device** identity mapping for the block containing `pa`, live.
+/// Used to reach PCIe ECAM config space (discovered from ACPI MCFG at a
+/// high physical address outside the initial low identity map). Idempotent.
+pub fn map_device_gib(pa: u64) {
+    let idx = (pa >> 30) as usize;
+    if idx >= 512 {
+        return; // beyond the single-level L1 (512 GiB)
+    }
+    // SAFETY: L1 is the live TTBR0 table; writing one block descriptor + a TLB
+    // invalidate publishes the new Device mapping. Device attr_idx=1, non-shareable.
+    unsafe {
+        let l1 = core::ptr::addr_of_mut!(L1) as *mut u64;
+        let desc = ((idx as u64) << 30) | (1u64 << 2) | (1 << 10) | 0b01; // AF=1, Device, block, valid
+        *l1.add(idx) = desc;
+        asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb", options(nostack));
+    }
+}
+
 /// Enable the MMU + caches on a secondary core, reusing the BSP's already-built
 /// identity map (`L1`). A secondary starts (via PSCI `CPU_ON`) with the MMU
 /// off, where RAM is Device-typed and atomics/`Locked` can't complete -- so

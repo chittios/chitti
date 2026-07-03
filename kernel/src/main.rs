@@ -178,6 +178,11 @@ pub extern "C" fn aarch64_start() -> ! {
     // framebuffer — works on ANY UEFI platform (VirtualBox-ARM, UTM, real
     // hardware). Fallback: the QEMU-only ramfb device (`-kernel` path). Either
     // needs the heap (from `init()`), so this comes after.
+    // Bring up the PCIe bus from ACPI (ECAM base via MCFG), so the real virtio-
+    // pci transport is available before probing disks. No-op on the `-kernel`
+    // path (no boot-info RSDP) — there the virtio-mmio fallback is used.
+    aarch64_pcie_init();
+
     let fb = bootinfo_framebuffer().or_else(|| unsafe { chitti_kernel::arch::aarch64::ramfb::init() });
     if let Some((addr, w, h, pitch)) = fb {
         chitti_kernel::framebuffer::init_console_raw(addr, w, h, pitch);
@@ -196,7 +201,44 @@ pub extern "C" fn aarch64_start() -> ! {
     run_os();
 }
 
-/// Read the UEFI stub's boot-info page (0x47F00000, magic "CHITTIBI"): the GOP
+/// The stub's boot-info page (address passed in x1, magic "CHITTIBI"), if
+/// present and within the identity map. `None` on the `-kernel` path.
+#[cfg(all(target_arch = "aarch64", not(feature = "boot-limine")))]
+fn bootinfo_page() -> Option<u64> {
+    #[cfg(not(feature = "model-9b"))]
+    const MAP_LIMIT: u64 = 4 << 30;
+    #[cfg(feature = "model-9b")]
+    const MAP_LIMIT: u64 = 12 << 30;
+    let bi = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(chitti_kernel::arch::aarch64::boot::BOOT_X1)) };
+    if bi == 0 || bi >= MAP_LIMIT {
+        return None;
+    }
+    // SAFETY: identity-mapped RAM below the map limit.
+    let magic = unsafe { core::slice::from_raw_parts(bi as *const u8, 8) };
+    (magic == b"CHITTIBI").then_some(bi)
+}
+
+/// Discover + bring up PCIe from the stub's ACPI RSDP (boot-info offset 40):
+/// walk MCFG for the ECAM base, map it Device, init `pci`. No-op without a
+/// boot-info page (the `-kernel` path uses the virtio-mmio fallback).
+#[cfg(all(target_arch = "aarch64", not(feature = "boot-limine")))]
+fn aarch64_pcie_init() {
+    let Some(bi) = bootinfo_page() else { return };
+    // SAFETY: identity-mapped; RSDP pointer is at offset 40.
+    let rsdp = unsafe { core::ptr::read_volatile((bi + 40) as *const u64) };
+    let Some(seg) = chitti_kernel::acpi::ecam_from_rsdp(rsdp) else {
+        serial_println!("Chitti: no ACPI MCFG (RSDP {:#x}) -- PCIe unavailable, using virtio-mmio", rsdp);
+        return;
+    };
+    chitti_kernel::arch::aarch64::mmu::map_device_gib(seg.base);
+    chitti_kernel::pci::init(seg.base, seg.bus_end);
+    serial_println!("Chitti: PCIe ECAM {:#x} (buses {}..{}) mapped -- virtio-pci enabled", seg.base, seg.bus_start, seg.bus_end);
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "boot-limine"))]
+fn aarch64_pcie_init() {}
+
+/// Read the UEFI stub's boot-info page (magic "CHITTIBI"): the GOP
 /// framebuffer `(addr, width, height, pitch)` captured before ExitBootServices.
 /// `None` on the `-kernel` path (no stub) or if the framebuffer lies outside
 /// the identity map. Fields are little-endian u64s after the 8-byte magic.
@@ -207,16 +249,10 @@ fn bootinfo_framebuffer() -> Option<(usize, u64, u64, u64)> {
     const MAP_LIMIT: u64 = 4 << 30;
     #[cfg(feature = "model-9b")]
     const MAP_LIMIT: u64 = 12 << 30;
-    // The boot-info page address the entry received in x1 (0 under `-kernel`).
-    let bi = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(chitti_kernel::arch::aarch64::boot::BOOT_X1)) };
-    if bi == 0 || bi >= MAP_LIMIT {
-        return None;
-    }
+    let bi = bootinfo_page()?;
+    let _ = MAP_LIMIT;
     // SAFETY: `bi` is identity-mapped RAM below the map limit; read 40 bytes.
     let page = unsafe { core::slice::from_raw_parts(bi as *const u8, 40) };
-    if &page[0..8] != b"CHITTIBI" {
-        return None;
-    }
     let f = |o: usize| u64::from_le_bytes(page[o..o + 8].try_into().unwrap());
     let (addr, w, h, pitch) = (f(8), f(16), f(24), f(32));
     if addr == 0 || addr + h * pitch > MAP_LIMIT {
