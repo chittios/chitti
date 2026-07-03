@@ -113,3 +113,18 @@ Answers: detect all 5 FSes read-only (no foreign writes); build-time model choic
   the documented **REVISIT**. `/install` today writes a spec-valid GPT (correct CRC32) + formats
   the SimpleFS OS partition + marker files — the partitioning + native-FS-creation half of a real
   install, verified in QEMU and by host GPT parse.
+
+## ext4-as-primary run (user override: ext4 from scratch, not FAT32/SimpleFS)
+
+- **Layout for standalone boot:** tiny FAT ESP (only `/EFI/BOOT/BOOTX64.EFI` — UEFI firmware
+  requires FAT to find the loader) + an **ext4** partition holding `limine.conf` + kernel + the
+  multi-part model. Limine reads ext4 natively, so ext4 is the primary OS FS; FAT is a ~1 MB stub
+  like every Linux install. exFAT/NTFS/XFS were ruled out (Limine can't boot them).
+- **ext4 driver validated in Python first (against e2fsck), then ported to no_std Rust:** feature
+  set kept minimal for correctness — `filetype + large_file + sparse_super`, 128-byte inodes,
+  block-mapped files (12 direct + single/double indirect) so large files work; no journal/extents
+  (a clean ext2/3/4-family FS the Linux ext4 driver mounts + Limine boots). Verified: multi-block-
+  group mkfs is **e2fsck-clean** and a 300 MB double-indirect file round-trips **byte-identical**
+  via debugfs. Reference: `tools/mkext4_ref.py`.
+- **All ext4 install files live in the ext4 root** (limine.conf, kernel, model.gguf.NNN) so the
+  Rust port needs no subdirectory creation; only the FAT ESP needs one path (`/EFI/BOOT/`).
