@@ -517,6 +517,9 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool) -> Result<(), St
     cmd.args(["-serial", "stdio"]);
     cmd.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", disk.display()));
     cmd.args(["-device", "virtio-blk-pci,drive=chittidisk,disable-modern=on"]);
+    // A USB keyboard on an xHCI controller, so the xhci/HID driver drives the
+    // shell (as a real USB keyboard would); PS/2 also still works.
+    cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
     let status = cmd
         .status()
         .map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
