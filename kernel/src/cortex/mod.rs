@@ -559,7 +559,7 @@ pub fn model_parts() -> alloc::vec::Vec<(&'static str, &'static [u8])> {
 /// the heap, and only if the GGUF magic is present (so `infer` cleanly reports
 /// "no model" when none was loaded). The GGUF parser reads only within the
 /// actual file; the generous upper bound just needs to cover it.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(all(not(target_arch = "x86_64"), not(feature = "boot-limine")))]
 pub fn model_module() -> Option<&'static [u8]> {
     // 0.8B: model at 0x48000000, up to the heap at 0x80000000 (896 MiB window).
     // 9B (`model-9b`): the ~5.8 GiB model is loaded at 0x80000000, with the heap
@@ -582,4 +582,26 @@ pub fn model_module() -> Option<&'static [u8]> {
     // SAFETY: the region [MODEL_ADDR, MODEL_ADDR + MODEL_MAX) is mapped RAM
     // below the heap; the GGUF parser reads only the real model within it.
     Some(unsafe { core::slice::from_raw_parts(MODEL_ADDR as *const u8, MODEL_MAX) })
+}
+
+/// aarch64 booted via Limine (UEFI/AAVMF): the model is a Limine boot module,
+/// exactly like x86. The single-part case (the 0.8B, one `.gguf` module) is a
+/// zero-copy slice into module memory. Multi-part reassembly + the ext4
+/// fallback both need a large contiguous DMA region (`alloc_dma`), which on
+/// aarch64 is a follow-on (B2); until then a split/absent model reports None.
+#[cfg(feature = "boot-limine")]
+pub fn model_module() -> Option<&'static [u8]> {
+    use alloc::vec::Vec;
+    let response = crate::MODULE_REQUEST.response()?;
+    let mut parts: Vec<&'static crate::limine_protocol::File> =
+        response.modules().iter().copied().filter(|m| m.path_contains(".gguf")).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    parts.sort_by_key(|m| m.path_str());
+    if parts.len() == 1 {
+        return Some(parts[0].data());
+    }
+    crate::ktrace::log_fmt(format_args!("cortex: {} model parts on aarch64/Limine -- multi-part reassembly is a B2 follow-on", parts.len()));
+    None
 }

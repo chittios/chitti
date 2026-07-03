@@ -100,9 +100,66 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
+// --- aarch64 boot via the Limine protocol (UEFI/AAVMF, boots from disk) ---
+// Enabled by the `boot-limine` feature. Limine loads the kernel higher-half
+// with the MMU on (identity-mapping the first 4 GiB incl. device MMIO, plus an
+// HHDM) and calls `limine_start`. We take the heap from the Limine memmap and
+// otherwise reuse the exact same steady state as the `-kernel` path.
+#[cfg(all(target_arch = "aarch64", feature = "boot-limine"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn limine_start() -> ! {
+    use chitti_kernel::{limine_protocol, FRAMEBUFFER_REQUEST, MEMMAP_REQUEST};
+    // Enable FP/SIMD (NEON) at EL1 — the tensor kernels need it.
+    unsafe {
+        core::arch::asm!("mrs x9, cpacr_el1", "orr x9, x9, #(3 << 20)", "msr cpacr_el1, x9", "isb", out("x9") _, options(nostack));
+    }
+    chitti_kernel::serial::init();
+    serial_println!("{} -- NATIVE aarch64 via Limine (UEFI/AAVMF), booted from disk", BOOT_MSG);
+    assert!(chitti_kernel::BASE_REVISION.is_supported(), "Limine did not accept base revision 3");
+
+    // Heap: a usable region from the Limine memmap. Limine identity-maps the
+    // first 4 GiB, so a low physical region is directly addressable.
+    let need = chitti_kernel::mm::heap::HEAP_SIZE as u64;
+    let mut base = 0u64;
+    if let Some(mm) = MEMMAP_REQUEST.response() {
+        for e in mm.entries() {
+            if e.entry_type == limine_protocol::MEMMAP_USABLE && e.base >= 0x4000_0000 && e.length >= need && e.base + need <= (4u64 << 30) {
+                base = (e.base + 0xfff) & !0xfff;
+                break;
+            }
+        }
+    }
+    assert!(base != 0, "Limine memmap: no usable <4GiB region of {} bytes for the heap", need);
+    chitti_kernel::mm::heap::init_static(base as usize, chitti_kernel::mm::heap::HEAP_SIZE);
+    serial_println!("Chitti: heap {} MiB at {:#x} (from Limine memmap)", chitti_kernel::mm::heap::HEAP_SIZE / (1024 * 1024), base);
+
+    chitti_kernel::sched::init();
+    if let Some(fb) = FRAMEBUFFER_REQUEST.response().and_then(|r| r.framebuffers().first().copied()) {
+        chitti_kernel::framebuffer::init_console(fb);
+        serial_println!("Chitti: framebuffer up via Limine GOP -- console mirrored to the window");
+    }
+    disk_demo();
+    match chitti_kernel::cortex::model_module() {
+        Some(bytes) => {
+            if let Ok(g) = chitti_kernel::cortex::gguf::Gguf::parse(bytes) {
+                serial_println!(
+                    "Chitti: model.gguf loaded ({} MiB): {} layers, dim {}, vocab {}",
+                    bytes.len() / (1024 * 1024),
+                    g.config.block_count,
+                    g.config.embedding_length,
+                    g.tokens.len(),
+                );
+            }
+        }
+        None => serial_println!("Chitti: no model.gguf (Limine module or ext4)"),
+    }
+    mount_persistent_store();
+    run_os();
+}
+
 // --- aarch64 boot (QEMU virt + HVF; entered from arch::aarch64::boot) ----
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(feature = "boot-limine")))]
 #[unsafe(no_mangle)]
 pub extern "C" fn aarch64_start() -> ! {
     // The boot stub (arch::aarch64::boot) already set the stack, enabled NEON,
