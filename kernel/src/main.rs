@@ -173,12 +173,15 @@ pub extern "C" fn aarch64_start() -> ! {
     chitti_kernel::serial::init();
     serial_println!("{} -- NATIVE aarch64 on Apple Silicon (QEMU + HVF)", BOOT_MSG);
     chitti_kernel::init();
-    // Bring up the ramfb framebuffer TUI — the aarch64 equivalent of the x86
-    // Limine framebuffer. Needs the heap (from `init()`), so it comes after.
-    // Absent if QEMU was launched without `-device ramfb`; then we stay serial.
-    if let Some((addr, w, h, pitch)) = unsafe { chitti_kernel::arch::aarch64::ramfb::init() } {
+    // Bring up the framebuffer TUI. Preferred source: the **boot-info page** the
+    // UEFI stub publishes at 0x47F00000 (magic "CHITTIBI") carrying the GOP
+    // framebuffer — works on ANY UEFI platform (VirtualBox-ARM, UTM, real
+    // hardware). Fallback: the QEMU-only ramfb device (`-kernel` path). Either
+    // needs the heap (from `init()`), so this comes after.
+    let fb = bootinfo_framebuffer().or_else(|| unsafe { chitti_kernel::arch::aarch64::ramfb::init() });
+    if let Some((addr, w, h, pitch)) = fb {
         chitti_kernel::framebuffer::init_console_raw(addr, w, h, pitch);
-        serial_println!("Chitti: framebuffer TUI up ({}x{} ramfb) -- console mirrored to the window", w, h);
+        serial_println!("Chitti: framebuffer TUI up ({}x{}) -- console mirrored to the window", w, h);
         // With a window, wire the virtio-keyboard so it accepts keystrokes too
         // (the `virt` machine has no PS/2). Absent if launched without one.
         if chitti_kernel::arch::aarch64::virtio_input::init() {
@@ -191,6 +194,37 @@ pub extern "C" fn aarch64_start() -> ! {
     disk_demo();
     mount_persistent_store();
     run_os();
+}
+
+/// Read the UEFI stub's boot-info page (0x47F00000, magic "CHITTIBI"): the GOP
+/// framebuffer `(addr, width, height, pitch)` captured before ExitBootServices.
+/// `None` on the `-kernel` path (no stub) or if the framebuffer lies outside
+/// the identity map. Fields are little-endian u64s after the 8-byte magic.
+#[cfg(all(target_arch = "aarch64", not(feature = "boot-limine")))]
+fn bootinfo_framebuffer() -> Option<(usize, u64, u64, u64)> {
+    // Identity-map coverage (arch::aarch64::mmu N_BLOCKS 1-GiB blocks).
+    #[cfg(not(feature = "model-9b"))]
+    const MAP_LIMIT: u64 = 4 << 30;
+    #[cfg(feature = "model-9b")]
+    const MAP_LIMIT: u64 = 12 << 30;
+    // The boot-info page address the entry received in x1 (0 under `-kernel`).
+    let bi = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(chitti_kernel::arch::aarch64::boot::BOOT_X1)) };
+    if bi == 0 || bi >= MAP_LIMIT {
+        return None;
+    }
+    // SAFETY: `bi` is identity-mapped RAM below the map limit; read 40 bytes.
+    let page = unsafe { core::slice::from_raw_parts(bi as *const u8, 40) };
+    if &page[0..8] != b"CHITTIBI" {
+        return None;
+    }
+    let f = |o: usize| u64::from_le_bytes(page[o..o + 8].try_into().unwrap());
+    let (addr, w, h, pitch) = (f(8), f(16), f(24), f(32));
+    if addr == 0 || addr + h * pitch > MAP_LIMIT {
+        serial_println!("Chitti: boot-info framebuffer at {:#x} outside the identity map -- skipping", addr);
+        return None;
+    }
+    serial_println!("Chitti: framebuffer from UEFI boot-info (GOP {}x{} at {:#x})", w, h, addr);
+    Some((addr as usize, w, h, pitch))
 }
 
 /// Point `synapse::fs` at an ext4 *data* partition so agent writes are durable
