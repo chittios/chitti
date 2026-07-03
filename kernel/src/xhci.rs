@@ -111,6 +111,7 @@ const TRB_STATUS: u32 = 4;
 const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
+const TRB_EVALUATE_CONTEXT: u32 = 13;
 // Event TRB types.
 const EVT_TRANSFER: u32 = 32;
 const EVT_CMD_COMPLETION: u32 = 33;
@@ -452,10 +453,38 @@ impl Xhci {
         }
         crate::ktrace::log_fmt(format_args!("xhci: device addressed on slot {slot}"));
 
-        // 7-8. Read the configuration descriptor into a DMA buffer + parse.
+        // 7. Learn the real EP0 max packet size before any multi-byte read.
+        // We addressed the device assuming MPS=8 (full/low) or 64 (high). A
+        // full-speed device may actually use MPS 16/32/64; reading the 9-byte
+        // config descriptor with an under-sized MPS makes the device pack all 9
+        // bytes into one packet → the host sees a packet > its configured MPS →
+        // BABBLE, and enumeration fails (exactly what VirtualBox's full-speed
+        // keyboard hit). Reading only the first 8 bytes of the DEVICE descriptor
+        // is always safe (8 ≤ any MPS), and byte 7 is bMaxPacketSize0.
         let (buf_pa, buf_va) = (self.alloc)(4096)?;
         let buf_va = buf_va as usize;
-        // GET_DESCRIPTOR(Configuration), first 9 bytes for wTotalLength.
+        let got_dev = unsafe {
+            self.control(slot, ep0_va, ep0_pa, &mut ep0_enq, &mut ep0_cycle, setup(0x80, 6, 0x0100, 0, 8), buf_pa, 8, true)
+        };
+        if got_dev {
+            let b = unsafe { read_volatile((buf_va + 7) as *const u8) } as u32;
+            // full/low (speed 1/2): bMaxPacketSize0 is the byte count (8/16/32/64).
+            // super-speed (4): it's an exponent (9 => 512). high (3) is always 64.
+            let real_mps = match speed {
+                1 | 2 => b,
+                4 => 1u32 << b,
+                _ => 64,
+            };
+            if real_mps >= 8 && real_mps != ep0_mps {
+                crate::ktrace::log_fmt(format_args!("xhci: EP0 max packet {ep0_mps} -> {real_mps}; re-evaluating"));
+                unsafe {
+                    self.build_input_eval_mps(in_ctx_va, real_mps);
+                    let _ = self.command(in_ctx_pa, (TRB_EVALUATE_CONTEXT << 10) | ((slot as u32) << 24));
+                }
+            }
+        }
+
+        // 8. Read the configuration descriptor: first 9 bytes for wTotalLength.
         let ok = unsafe {
             self.control(slot, ep0_va, ep0_pa, &mut ep0_enq, &mut ep0_cycle, setup(0x80, 6, 0x0200, 0, 9), buf_pa, 9, true)
         };
@@ -542,6 +571,18 @@ impl Xhci {
             w32(ep0 + 4, (4 << 3) | (ep0_mps << 16) | (3 << 1)); // type=Control, MPS, CErr=3
             w64(ep0 + 8, ep0_pa | 1); // TR dequeue ptr | DCS
             w32(ep0 + 16, 8); // avg TRB length
+        }
+    }
+
+    /// Build the input context for Evaluate Context to update EP0's max packet
+    /// size (learned from the device descriptor). Add flag A1 (EP0) only; set the
+    /// EP0 context's type/MPS/CErr — the controller re-reads MPS from it.
+    unsafe fn build_input_eval_mps(&self, in_ctx_va: usize, ep0_mps: u32) {
+        unsafe {
+            core::ptr::write_bytes(in_ctx_va as *mut u8, 0, self.ctx_size * 3);
+            w32(in_ctx_va + 4, 0b10); // Add flags: A1 (EP0) only
+            let ep0 = in_ctx_va + self.ctx_size * 2;
+            w32(ep0 + 4, (4 << 3) | (ep0_mps << 16) | (3 << 1)); // type=Control, MPS, CErr=3
         }
     }
 
