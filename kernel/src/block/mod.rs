@@ -7,6 +7,8 @@
 
 pub mod ext4;
 pub mod ext4_read;
+#[cfg(target_arch = "x86_64")]
+pub mod ext4_store;
 pub mod fat;
 pub mod gpt;
 pub mod ramdisk;

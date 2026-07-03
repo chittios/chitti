@@ -76,6 +76,11 @@ pub extern "C" fn _start() -> ! {
         None => serial_println!("Chitti: no model.gguf boot module present"),
     }
 
+    // Make agent state durable: if an ext4 *data* partition is present (an
+    // installed system), point synapse::fs at it so runtime writes persist
+    // across reboots. No-op on the live ISO (no data partition).
+    mount_persistent_store();
+
     // `ref-check` builds run the Phase 3 acceptance gate and exit QEMU.
     #[cfg(feature = "refcheck")]
     {
@@ -122,6 +127,57 @@ pub extern "C" fn aarch64_start() -> ! {
         }
     }
     run_os();
+}
+
+/// Point `synapse::fs` at an ext4 *data* partition so agent writes are durable
+/// across reboots (the installed system). Chooses an ext4 volume that does NOT
+/// hold the model (`*.gguf`), so it never adopts the model/OS partition. No-op
+/// on the live ISO, or if there's no writable ext4 data volume.
+#[cfg(target_arch = "x86_64")]
+fn mount_persistent_store() {
+    use chitti_kernel::block::ext4_read::Ext4Reader;
+    use chitti_kernel::block::ext4_store::Ext4Store;
+    use chitti_kernel::block::virtio::VirtioBlk;
+    use chitti_kernel::block::Partition;
+    use chitti_kernel::fs::detect::FsType;
+
+    let Some(mut dev) = VirtioBlk::probe() else { return };
+    let vols = chitti_kernel::fs::detect::probe(&mut dev);
+    let mut chosen: Option<(u64, u64)> = None;
+    for v in vols {
+        if !matches!(v.fs, FsType::Ext2 | FsType::Ext3 | FsType::Ext4) {
+            continue;
+        }
+        let mut part = Partition::new(&mut dev, v.start_lba, v.sectors);
+        if let Some(mut r) = Ext4Reader::open(&mut part) {
+            let has_model = r.list_root().iter().any(|(n, _, _)| n.contains(".gguf"));
+            if !has_model {
+                chosen = Some((v.start_lba, v.sectors));
+                break;
+            }
+        }
+    }
+    let Some((start, count)) = chosen else {
+        serial_println!("Chitti: synapse persistence -> none (no ext4 data partition; state is in-memory only)");
+        return;
+    };
+    if let Some(store) = Ext4Store::mount(dev, start, count) {
+        chitti_kernel::synapse::fs::mount_ext4(store);
+        serial_println!("Chitti: synapse persistence -> ext4 data partition at lba {} ({} sectors); writes are durable", start, count);
+        // Prove the round-trip: a boot counter written *through synapse::fs*.
+        // It only increments if the previous boot's write was recovered from
+        // ext4 on mount — i.e. runtime writes truly persisted across the reboot.
+        let prior = chitti_kernel::synapse::fs::read("synapse_boots")
+            .and_then(|b| core::str::from_utf8(&b).ok().and_then(|s| s.trim().parse::<u32>().ok()))
+            .unwrap_or(0);
+        let boots = prior + 1;
+        let mut buf = [0u8; 12];
+        chitti_kernel::synapse::fs::write("synapse_boots", fmt_u32(boots, &mut buf).as_bytes());
+        serial_println!("Chitti: synapse.fs boot #{} (persisted via ext4); files = {:?}", boots, chitti_kernel::synapse::fs::list());
+        if prior > 0 {
+            serial_println!("Chitti: synapse.fs (the counter survived a reboot -- agent writes persist on ext4)");
+        }
+    }
 }
 
 /// Phase 7 block-device FS demo (x86 only -- the virtio-blk driver uses PCI

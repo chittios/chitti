@@ -278,27 +278,31 @@ impl<'d, D: BlockDevice> Ext4Writer<'d, D> {
         Ok(())
     }
 
-    /// Write the inodes into their inode-table blocks (group 0 for our few
-    /// inodes). Builds each table block in RAM then flushes it.
+    /// Write the inodes into their inode-table blocks (all our inodes land in
+    /// group 0). Zeroes **every** reserved inode-table block in **every** group
+    /// before overlaying the real inodes: we do not mark groups `INODE_UNINIT`,
+    /// so e2fsck scans every inode slot — any block we leave unwritten would be
+    /// read as a stale inode (e.g. leftover bytes from a prior filesystem).
+    /// A correct mkfs must therefore initialise the whole inode table, not just
+    /// the blocks that happen to hold a live inode.
     fn write_inode_table(&mut self, inodes: &[InodeRec]) -> Result<(), BlockError> {
-        // All our inodes are <= a handful and land in group 0. Determine the
-        // range of table blocks touched and build them.
-        let it0 = self.g_inode_table[0];
-        let inodes_per_block = EBS / INODE_SIZE; // 32
-        let max_ino = inodes.iter().map(|i| i.ino).max().unwrap_or(FIRST_INO);
-        let blocks_needed = ((max_ino as usize) + inodes_per_block - 1) / inodes_per_block;
-        for blk in 0..blocks_needed as u64 {
-            let mut buf = [0u8; EBS];
-            let base_ino = blk * inodes_per_block as u64; // inode (index) at buf start = base_ino+1
-            for rec in inodes.iter() {
-                let idx = rec.ino - 1; // 0-based
-                if idx / inodes_per_block as u64 == blk {
-                    let off = (idx % inodes_per_block as u64) as usize * INODE_SIZE;
-                    encode_inode(&mut buf[off..off + INODE_SIZE], rec);
+        let inodes_per_block = (EBS / INODE_SIZE) as u64; // 32
+        for g in 0..self.ngroups {
+            let it0 = self.g_inode_table[g as usize];
+            for blk in 0..self.itable_blocks {
+                let mut buf = [0u8; EBS];
+                // Group 0 holds inodes 1..=IPG; overlay any that fall in `blk`.
+                if g == 0 {
+                    for rec in inodes.iter() {
+                        let idx = rec.ino - 1; // 0-based inode index
+                        if idx / inodes_per_block == blk {
+                            let off = (idx % inodes_per_block) as usize * INODE_SIZE;
+                            encode_inode(&mut buf[off..off + INODE_SIZE], rec);
+                        }
+                    }
                 }
+                self.write_eblock(it0 + blk, &buf)?;
             }
-            let _ = base_ino;
-            self.write_eblock(it0 + blk, &buf)?;
         }
         Ok(())
     }
