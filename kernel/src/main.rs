@@ -56,7 +56,14 @@ pub extern "C" fn _start() -> ! {
     disk_demo();
     // Bring up a USB keyboard (xHCI + HID) if present, so a real USB keyboard
     // drives the shell alongside PS/2. No-op without an xHCI controller.
-    chitti_kernel::arch::x86_64::xhci::init_global();
+    let usb_kbd = chitti_kernel::arch::x86_64::xhci::init_global();
+    // INPUT summary (parity with aarch64): PS/2 (i8042) is always present on a
+    // PC; USB is READY only if a HID keyboard enumerated on the xHCI.
+    serial_println!(
+        "Chitti: INPUT  ps2={}  usb-kbd={}  (serial always works)",
+        "yes",
+        if usb_kbd { "READY" } else { "no" }
+    );
 
     match chitti_kernel::cortex::model_module() {
         Some(bytes) => {
@@ -189,16 +196,24 @@ pub extern "C" fn aarch64_start() -> ! {
         serial_println!("Chitti: framebuffer TUI up ({}x{}) -- console mirrored to the window", w, h);
         // Bring up a USB keyboard (xHCI + HID) if present — the real-hardware
         // input path; needs the PCIe bus from aarch64_pcie_init.
-        chitti_kernel::arch::aarch64::xhci::init_global();
+        let usb_kbd = chitti_kernel::arch::aarch64::xhci::init_global();
         // A PL050 PS/2 keyboard (ARM dev boards / some hypervisors) — the ARM
         // analogue of the x86 i8042. No-op where absent (e.g. QEMU `virt`).
-        if chitti_kernel::arch::aarch64::pl050::init() {
-            serial_println!("Chitti: PL050 PS/2 keyboard up -- type in the window");
-        }
+        let pl050 = chitti_kernel::arch::aarch64::pl050::init();
         // Also wire the virtio-keyboard (QEMU `virt` window). Absent without one.
-        if chitti_kernel::arch::aarch64::virtio_input::init() {
-            serial_println!("Chitti: virtio-keyboard up -- type in the window or the serial terminal");
-        }
+        let virtio_kbd = chitti_kernel::arch::aarch64::virtio_input::init();
+        // A single, non-scrolling INPUT summary right before the shell so the
+        // discovered input path is visible on the framebuffer (the only console
+        // that survives a platform whose serial/UART we don't reach). This is the
+        // ground truth for "why isn't my keyboard working".
+        let ecam = chitti_kernel::pci::ecam_base();
+        serial_println!(
+            "Chitti: INPUT  pcie-ecam={:#x}  usb-kbd={}  pl050={}  virtio-kbd={}  (serial always works)",
+            ecam,
+            if usb_kbd { "READY" } else { "no" },
+            if pl050 { "yes" } else { "no" },
+            if virtio_kbd { "yes" } else { "no" }
+        );
     }
     // Same storage bring-up as x86: mount SimpleFS demo disk (if any) and point
     // synapse::fs at an ext4 data partition for durable agent state. No-op
