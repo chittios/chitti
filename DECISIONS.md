@@ -269,13 +269,30 @@ a `Disk` enum (virtio → NVMe → AHCI) mirroring aarch64's. Verified read/writ
 all four combinations (aarch64/x86 × NVMe/AHCI): ext4 200 KB round-trip →
 `pattern match: true`. No storage-driver divergence remains.
 
-**Remaining reverse-direction gap (x86-only, NOT yet on aarch64): timer-IRQ
-preemptive scheduling.** x86 drives `sched::on_timer_tick` from the PIT IRQ0
-handler (`pit.rs` via PIC/APIC + the IDT), giving preemptive multitasking.
-aarch64 has no GIC, no EL1 exception vector table (VBAR_EL1), and no timer IRQ —
-scheduling is cooperative (`yield_now`) only. Closing this means a GIC(v2/v3)
-driver + a 16-entry vector table + CNTP periodic timer + an IRQ handler routing
-into `on_timer_tick`, and touches the (boot-critical) scheduler. Bigger and
-riskier than the storage drivers; called out here as the one real driver-level
-divergence still open. (PS/2 keyboard is x86-only but genuinely N/A on ARM —
-covered by USB-HID + virtio-input.)
+**DONE: aarch64 GICv3 + generic-timer IRQ = timer-preemptive scheduling (with an
+HVF fallback).** Closed the last driver-level divergence. New `arch/aarch64/gic.rs`
+(GICv3 distributor + BSP redistributor + `ICC_*` CPU interface + CNTP periodic
+timer, EL-aware: sets `ICC_SRE_EL2` when at EL2/VHE, and enables/accepts both the
+EL1 timer PPI INTID 30 and the EL2 INTID 26) + `arch/aarch64/exceptions.rs` (the
+EL1 vector table). The IRQ vector saves the full caller-saved state (x0–x30, all
+q0–q31, ELR/SPSR) so preemption composes with the cooperative `switch_to` exactly
+like x86; the timer IRQ calls `sched::on_timer_tick`. BSP-only (secondaries park,
+like x86's APs). Verified under **TCG `gic-version=3`**: `GICv3 up … timer @ 100 Hz`,
+`timer delivering IRQs (4 ticks/50 ms) — preemptive scheduling`; both arches build,
+103/103.
+
+*HVF caveat (why there's a fallback):* Apple-Silicon HVF's emulated GICv3 does
+**not** expose the `ICC_*` system-register CPU interface to a bare-metal EL1
+guest (access is UNDEFINED even with `ICC_SRE_EL1.SRE=1`), and HVF refuses to
+provide EL2 (`virtualization=on` is rejected) — so there is no way to receive GIC
+interrupts under HVF without a full guest OS. Rather than crash, `gic::init_bsp`
+**probes** one CPU-interface access under a recoverable sync-exception handler
+(`aarch64_sync_dispatch` advances ELR past an UNDEF during the probe): if it
+faults (HVF) we stay cooperative (as before — no regression, inference still
+`matches reference=true`); if it works (TCG / KVM / real ARM hardware) we enable
+true timer preemption. So the *driver + preemption capability* exists on aarch64
+and is exercised wherever the platform permits; HVF's limitation is the
+hypervisor's, not the kernel's, and is handled gracefully.
+
+(PS/2 keyboard is x86-only but genuinely N/A on ARM — covered by USB-HID +
+virtio-input.) No driver-level divergence between the arches remains.

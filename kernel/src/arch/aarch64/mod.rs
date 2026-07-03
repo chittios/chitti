@@ -10,6 +10,8 @@ pub mod boot;
 pub mod mmu;
 pub mod ahci;
 pub mod disk;
+pub mod exceptions;
+pub mod gic;
 pub mod nvme;
 pub mod ramfb;
 pub mod smp;

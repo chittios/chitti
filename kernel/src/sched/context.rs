@@ -5,12 +5,14 @@
 //! frame that lands a fresh task in `trampoline`, which calls its entry point.
 //!
 //! x86_64 additionally saves `RFLAGS` and uses `save_fpu`/`restore_fpu`
-//! (`FXSAVE`/`XSAVE`) around the switch, because it is *preemptive* (the PIT
-//! IRQ can switch mid-computation, so caller-saved vector state must be
-//! preserved). aarch64 here is *cooperative* only (no GIC/timer IRQ wired yet),
-//! so switches happen at call boundaries: `switch_to` saving the callee-saved
-//! GPRs (x19-x30) and FP regs (d8-d15) suffices, and `save_fpu`/`restore_fpu`
-//! are no-ops.
+//! (`FXSAVE`/`XSAVE`) around the switch to preserve *caller-saved* vector state
+//! across a preemptive (PIT IRQ) switch. aarch64 is now preemptive too (GICv3 +
+//! generic-timer IRQ, `arch::aarch64::gic`), but the split is different: the IRQ
+//! **vector** (`arch::aarch64::exceptions`) saves the full caller-saved state
+//! (x0–x30, all of q0–q31, ELR/SPSR) on the interrupted stack, so `switch_to`
+//! only needs the callee-saved GPRs (x19-x30) + FP (d8-d15) — which is also
+//! exactly enough for a *cooperative* `yield_now` call (caller-saved regs need
+//! not survive a normal call). So `save_fpu`/`restore_fpu` stay no-ops here.
 
 #[cfg(target_arch = "x86_64")]
 pub use x86::*;

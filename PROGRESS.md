@@ -523,3 +523,28 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
 - Both arches build; 103/103 x86_64 tests green. **No storage-driver divergence
   remains** — every block transport (virtio-mmio/pci, NVMe, AHCI) that exists on
   one arch exists on the other, behind one shared core.
+
+### aarch64 GICv3 + generic-timer IRQ: timer-preemptive scheduling (reverse gap closed)  ✅
+- The one remaining x86-only capability was **timer-interrupt preemptive
+  scheduling** (x86: PIT IRQ0 → `sched::on_timer_tick`); aarch64 was
+  cooperative-only (no GIC, no vector table, no timer IRQ). Now closed.
+- `arch/aarch64/exceptions.rs`: the EL1 exception vector table (VBAR_EL1) — the
+  aarch64 IDT analogue. The IRQ stub saves the **full** caller-saved state
+  (x0–x30, all q0–q31, ELR/SPSR), so preemption composes with the cooperative
+  `context::switch_to` exactly as x86 does (interrupt frame = caller-saved,
+  `switch_to` = callee-saved). A recoverable sync handler backs the GIC probe.
+- `arch/aarch64/gic.rs`: a **GICv3** driver — distributor + BSP redistributor +
+  `ICC_*` system-register CPU interface + CNTP periodic timer at 100 Hz, calling
+  `on_timer_tick`. EL-aware (sets `ICC_SRE_EL2` under EL2/VHE; enables + accepts
+  both timer PPIs, EL1 INTID 30 and EL2 INTID 26). BSP-only, like x86's APs park.
+- **HVF fallback:** Apple-Silicon HVF's emulated GICv3 doesn't expose the `ICC_*`
+  sysreg CPU interface to a bare-metal EL1 guest (UNDEFs even with SRE=1) and
+  refuses EL2. So `init_bsp` **probes** one CPU-interface access under the
+  recoverable sync handler; on fault (HVF) it stays cooperative (no regression),
+  otherwise it enables true preemption. See DECISIONS.md.
+- **Verified:** under TCG `gic-version=3` → `GICv3 up at EL1, timer @ 100 Hz` +
+  `timer delivering IRQs (4 ticks in 50 ms) — preemptive scheduling`. Under HVF
+  (`-kernel` and the UEFI-stub path) → clean boot, `staying cooperative`,
+  `/infer` still `matches reference=true` (~13 tok/s), framebuffer + disk + shell
+  all up. Both arches build; 103/103 x86_64 tests green. **No driver-level
+  divergence between the arches remains.**
