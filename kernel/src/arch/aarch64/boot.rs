@@ -6,6 +6,15 @@
 #[cfg(not(feature = "boot-limine"))]
 use core::arch::global_asm;
 
+/// The boot-info pointer the entry received in x1: 0 under QEMU `-kernel`
+/// (Linux boot convention), or the UEFI stub's boot-info page (GOP framebuffer)
+/// when booted via the stub. `_start` saves x1 here after zeroing `.bss` (so
+/// this static, which lives in `.bss`, isn't wiped). Read by the boot code to
+/// pick the framebuffer source.
+#[cfg(not(feature = "boot-limine"))]
+#[no_mangle]
+pub static mut BOOT_X1: u64 = 0;
+
 // The `-kernel` boot stub is used only for the default (non-Limine) build; the
 // Limine build provides its own `limine_start` entry (arch::aarch64::limine).
 #[cfg(not(feature = "boot-limine"))]
@@ -14,6 +23,10 @@ global_asm!(
 .section .text.boot
 .global _start
 _start:
+    // Preserve the boot-info pointer (x1) in a callee-saved reg across the .bss
+    // zero (which clobbers x1 and would wipe BOOT_X1 if stored before).
+    mov  x20, x1
+
     adrp x0, __stack_top
     add  x0, x0, :lo12:__stack_top
     mov  sp, x0
@@ -33,7 +46,10 @@ _start:
     b.hs 2f
     str  xzr, [x0], #8
     b    1b
-2:  bl   aarch64_start
+2:  adrp x0, BOOT_X1
+    add  x0, x0, :lo12:BOOT_X1
+    str  x20, [x0]
+    bl   aarch64_start
 3:  wfi
     b    3b
 "#

@@ -98,6 +98,56 @@ fn main() -> Status {
         }
     };
 
+    // Capture the UEFI GOP framebuffer and publish it in a boot-info page at a
+    // fixed address the kernel checks. This is what makes Chitti's console
+    // visible on ANY UEFI platform (VirtualBox-ARM, UTM, real hardware) — the
+    // kernel's own ramfb device is QEMU-only. Best-effort: absent GOP or a
+    // blt-only mode just means no boot-info (kernel falls back to ramfb/serial).
+    let bootinfo: Option<u64> = (|| {
+        use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
+        let h = match boot::get_handle_for_protocol::<GraphicsOutput>() {
+            Ok(h) => h,
+            Err(e) => {
+                log::info!("chitti-stub: no GOP handle: {e:?}");
+                return None;
+            }
+        };
+        // Non-exclusive open: the firmware console (ConSplitter) already owns
+        // GOP, so an exclusive open is denied. GetProtocol just reads it.
+        let mut gop = match unsafe {
+            boot::open_protocol::<GraphicsOutput>(
+                boot::OpenProtocolParams { handle: h, agent: boot::image_handle(), controller: None },
+                boot::OpenProtocolAttributes::GetProtocol,
+            )
+        } {
+            Ok(g) => g,
+            Err(e) => {
+                log::info!("chitti-stub: GOP open failed: {e:?}");
+                return None;
+            }
+        };
+        let mode = gop.current_mode_info();
+        if mode.pixel_format() == PixelFormat::BltOnly {
+            return None;
+        }
+        let (w, hgt) = mode.resolution();
+        let pitch = mode.stride() as u64 * 4;
+        let fb = gop.frame_buffer().as_mut_ptr() as u64;
+        // Boot-info page: AnyPages (fixed low addresses aren't reliably
+        // allocatable — they vary per firmware/platform). Its address is passed
+        // to the kernel in x1 at handoff.
+        let p = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1).ok()?;
+        let addr = p.as_ptr() as u64;
+        let page = unsafe { core::slice::from_raw_parts_mut(p.as_ptr(), 4096) };
+        page[0..8].copy_from_slice(b"CHITTIBI");
+        page[8..16].copy_from_slice(&fb.to_le_bytes());
+        page[16..24].copy_from_slice(&(w as u64).to_le_bytes());
+        page[24..32].copy_from_slice(&(hgt as u64).to_le_bytes());
+        page[32..40].copy_from_slice(&pitch.to_le_bytes());
+        log::info!("chitti-stub: GOP framebuffer {w}x{hgt} at {fb:#x} (pitch {pitch}) -> boot-info {addr:#x}");
+        Some(addr)
+    })();
+
     // Reserve the kernel's FIXED regions so UEFI hasn't parked runtime/ACPI data
     // where the `-kernel` layout puts them (the kernel hardcodes these, as it
     // does under QEMU `-kernel` where they're guaranteed free RAM): the 256 MiB
@@ -136,13 +186,21 @@ fn main() -> Status {
             clean_dcache(m, m + n);
         }
         clean_dcache(tramp_pa, tramp_pa + 128);
+        if let Some(bi) = bootinfo {
+            clean_dcache(bi, bi + 4096);
+        }
+        // x0 = kernel entry, x1 = boot-info page (0 if none); the trampoline
+        // preserves both (it scratches only x8) and branches to x0. The kernel
+        // `_start` stashes x1 for `bootinfo_framebuffer`.
         core::arch::asm!(
             "ic iallu",
             "dsb sy",
             "isb",
             "mov x0, {e}",
+            "mov x1, {bi}",
             "br {t}",
             e = in(reg) entry,
+            bi = in(reg) bootinfo.unwrap_or(0),
             t = in(reg) tramp_pa,
             options(noreturn),
         );
