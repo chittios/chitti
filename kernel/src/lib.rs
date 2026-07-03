@@ -62,11 +62,16 @@ pub mod framebuffer;
 static _REQUESTS_START: limine_protocol::RequestsStartMarker =
     limine_protocol::RequestsStartMarker::new();
 
-/// Base revision 3: stable across all Limine 5.x-12.x releases.
-#[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
+/// Base revision: 3 on x86 (stable across Limine 5.x-12.x); aarch64 requires
+/// >= 6 (Limine rejects older revisions on aarch64 with "minimum: 6").
+#[cfg(not(feature = "boot-limine"))]
 #[used]
 #[link_section = ".requests"]
 pub static BASE_REVISION: limine_protocol::BaseRevision = limine_protocol::BaseRevision::new(3);
+#[cfg(feature = "boot-limine")]
+#[used]
+#[link_section = ".requests"]
+pub static BASE_REVISION: limine_protocol::BaseRevision = limine_protocol::BaseRevision::new(6);
 
 #[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
 #[used]
