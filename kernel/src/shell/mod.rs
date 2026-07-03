@@ -242,6 +242,9 @@ pub fn run() -> ! {
                     }
                 }
                 "info" => print_info(&orch, chat.as_ref()),
+                "disks" => disk_list(),
+                "ls" => disk_ls(arg),
+                "mkfs" => disk_mkfs(arg),
                 other => serial_println!("unknown command '/{}' -- try /help", other),
             }
             continue;
@@ -272,6 +275,9 @@ fn print_help() {
     serial_println!("  /bench           matvec kernel throughput");
     serial_println!("  /perf            end-to-end prefill/decode tok/s");
     serial_println!("  /info            CPU / memory / model / context / OS info");
+    serial_println!("  /disks           list block devices + detected filesystems (read-only)");
+    serial_println!("  /ls [n]          list root dir of detected volume n (FAT32/SimpleFS)");
+    serial_println!("  /mkfs            format the disk with SimpleFS (destructive, explicit)");
     serial_println!("  /help            this list");
     serial_println!("  /exit            power off (or Ctrl+D on an empty line)");
 }
@@ -634,4 +640,113 @@ fn read_line(buf: &mut String) {
             None => crate::sched::yield_now(),
         }
     }
+}
+
+// --- block-device / filesystem commands (x86 virtio-blk over PCI) ---------
+
+#[cfg(target_arch = "x86_64")]
+fn disk_list() {
+    use crate::block::{virtio::VirtioBlk, BlockDevice};
+    let Some(mut dev) = VirtioBlk::probe() else {
+        serial_println!("disks> no block device (boot with a -drive)");
+        return;
+    };
+    let sectors = dev.block_count();
+    serial_println!("disks> virtio-blk: {} sectors ({} MiB)", sectors, sectors * 512 / 1024 / 1024);
+    let vols = crate::fs::detect::probe(&mut dev);
+    if vols.is_empty() {
+        serial_println!("  (no recognizable volumes -- blank or unsupported layout)");
+    }
+    for (i, v) in vols.iter().enumerate() {
+        serial_println!(
+            "  [{}] lba {:<10} {:>6} MiB  {:<8} label={}",
+            i,
+            v.start_lba,
+            v.sectors * 512 / 1024 / 1024,
+            v.fs.name(),
+            v.label.as_deref().unwrap_or("-")
+        );
+    }
+    serial_println!("  (/ls <n> to read a volume's root dir; foreign filesystems are read-only)");
+}
+
+#[cfg(target_arch = "x86_64")]
+fn disk_ls(arg: &str) {
+    use crate::block::virtio::VirtioBlk;
+    use crate::fs::detect::FsType;
+    let n: usize = arg.trim().parse().unwrap_or(0);
+    let Some(mut dev) = VirtioBlk::probe() else {
+        serial_println!("ls> no block device");
+        return;
+    };
+    let vols = crate::fs::detect::probe(&mut dev);
+    let Some(v) = vols.get(n).cloned() else {
+        serial_println!("ls> no volume {} (see /disks)", n);
+        return;
+    };
+    match v.fs {
+        FsType::Fat32 => match crate::fs::roread::fat32_root_list(&mut dev, v.start_lba) {
+            Ok(entries) => {
+                serial_println!("ls> FAT32 volume {} root ({} entries):", n, entries.len());
+                for (name, size, is_dir) in entries {
+                    if is_dir {
+                        serial_println!("  {}/", name);
+                    } else {
+                        serial_println!("  {} ({} bytes)", name, size);
+                    }
+                }
+            }
+            Err(e) => serial_println!("ls> FAT32 read error: {}", e),
+        },
+        FsType::SimpleFs if v.start_lba == 0 => {
+            if let Some(dev2) = VirtioBlk::probe() {
+                match crate::fs::SimpleFs::mount(dev2).and_then(|mut fs| fs.list()) {
+                    Ok(files) => {
+                        serial_println!("ls> SimpleFS volume {} ({} files):", n, files.len());
+                        for f in files {
+                            serial_println!("  {}", f);
+                        }
+                    }
+                    Err(e) => serial_println!("ls> SimpleFS error: {:?}", e),
+                }
+            }
+        }
+        other => serial_println!(
+            "ls> volume {} is {} -- detected read-only; directory listing not implemented for {}",
+            n,
+            other.name(),
+            other.name()
+        ),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn disk_mkfs(arg: &str) {
+    use crate::block::virtio::VirtioBlk;
+    if arg.trim() != "yes" {
+        serial_println!("mkfs> DESTRUCTIVE: formats the whole disk with SimpleFS, erasing it.");
+        serial_println!("mkfs> re-run as '/mkfs yes' to confirm.");
+        return;
+    }
+    let Some(dev) = VirtioBlk::probe() else {
+        serial_println!("mkfs> no block device");
+        return;
+    };
+    match crate::fs::SimpleFs::format(dev, 64) {
+        Ok(_) => serial_println!("mkfs> formatted the disk with SimpleFS."),
+        Err(e) => serial_println!("mkfs> format failed: {:?}", e),
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn disk_list() {
+    serial_println!("disks> block-device support is x86-only (virtio-blk over PCI)");
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn disk_ls(_arg: &str) {
+    serial_println!("ls> block-device support is x86-only");
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn disk_mkfs(_arg: &str) {
+    serial_println!("mkfs> block-device support is x86-only");
 }
