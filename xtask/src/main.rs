@@ -210,23 +210,31 @@ fn build_kernel_aarch64(release: bool, features: &[&str]) -> Result<PathBuf, Str
 /// Boot the unified kernel built for aarch64 on `qemu-system-aarch64 -M virt`
 /// with `-accel hvf`, so it runs *natively* on this Apple Silicon host (no
 /// cross-arch emulation) with NEON. Serial to stdio (`-nographic`).
-/// Build the aarch64 kernel for the Limine boot protocol: the `boot-limine`
-/// feature + the higher-half linker script (passed via RUSTFLAGS, which
-/// replaces the config.toml `-kernel` link-arg for this target). Always release.
-fn build_kernel_aarch64_limine(features: &[&str]) -> Result<PathBuf, String> {
-    let kdir = kernel_dir();
-    let mut feats: Vec<&str> = features.to_vec();
-    feats.push("boot-limine");
+/// Build the Chitti UEFI stub bootloader (`stub/`) for aarch64 — the
+/// BOOTAA64.EFI that AAVMF launches from the ESP. It loads the normal identity
+/// (`-kernel`) Chitti ELF + model off the ESP and hands off MMU-off via an
+/// identity-RAM trampoline, so the kernel boots exactly as under `-kernel`.
+fn build_stub_aarch64() -> Result<PathBuf, String> {
+    let sdir = repo_root().join("stub");
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(&kdir)
-        .env("RUSTFLAGS", "-Clink-arg=-Tlinker-aarch64-limine.ld")
-        .args(["build", "--release", "--target", "../targets/aarch64-chitti.json", "--features", &feats.join(",")]);
+    cmd.current_dir(&sdir).args(["build", "--release", "--target", "aarch64-unknown-uefi"]);
     run(&mut cmd)?;
-    let elf = kdir.join("target/aarch64-chitti/release/chitti-kernel");
-    if !elf.exists() {
-        return Err(format!("aarch64 limine kernel not found at {}", elf.display()));
+    let efi = sdir.join("target/aarch64-unknown-uefi/release/chitti-stub.efi");
+    if !efi.exists() {
+        return Err(format!("stub not found at {}", efi.display()));
     }
-    Ok(elf)
+    Ok(efi)
+}
+
+/// Guard against artifact mixups: assert `elf` is the identity-map `-kernel`
+/// build (entry in low RAM), not a higher-half build sharing the same path.
+fn assert_identity_kernel(elf: &Path) -> Result<(), String> {
+    let bytes = fs::read(elf).map_err(|e| format!("reading {}: {e}", elf.display()))?;
+    let entry = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+    if entry >= 1 << 32 {
+        return Err(format!("{} has entry {entry:#x} (higher-half build?) — expected the identity -kernel build", elf.display()));
+    }
+    Ok(())
 }
 
 /// QEMU pflash args for AAVMF (aarch64 UEFI firmware) — the aarch64 analogue of
@@ -249,57 +257,80 @@ fn aavmf_pflash_args() -> Result<Vec<String>, String> {
     ])
 }
 
-/// Prepare a FAT **ESP directory** for the aarch64 Limine boot: BOOTAA64.EFI +
-/// limine.conf (with `serial: yes`) + the kernel. QEMU serves this directory to
-/// AAVMF as a FAT volume via VVFAT (`-drive file=fat:rw:<dir>`), which is the
-/// reliable aarch64 UEFI boot path — the `-cdrom` El Torito route boots a
-/// separate FAT image on which Limine can't find limine.conf. VVFAT caps around
-/// 504 MiB, so the (~774 MiB) model does NOT ride the boot medium; on aarch64
-/// UEFI the model is read from the ext4 data partition instead.
-fn prepare_aarch64_esp_dir(kernel_bin: &Path) -> Result<PathBuf, String> {
-    let root = repo_root();
-    let esp = root.join("target/esp_aa64");
-    if esp.exists() {
-        fs::remove_dir_all(&esp).map_err(|e| format!("removing {}: {e}", esp.display()))?;
+/// Build a **real FAT32 ESP image** carrying the stub (as BOOTAA64.EFI), the
+/// identity kernel, and (optionally) the model, using macOS hdiutil/newfs_msdos.
+/// A real image — not VVFAT (sparse-sector stalls, ~504 MiB cap) and not a
+/// `-cdrom` El Torito volume — is what boots reliably under AAVMF, and FAT32
+/// carries the ~774 MiB model file directly.
+fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> Result<PathBuf, String> {
+    let img = repo_root().join("target/chitti-esp-aa64.img");
+    let model_bytes = model.map(|m| fs::metadata(m).map(|md| md.len()).unwrap_or(0)).unwrap_or(0);
+    let size_mb = 64 + (model_bytes / (1024 * 1024)) + if model_bytes > 0 { 64 } else { 0 };
+    // Recreate the image only when contents changed (cheap heuristic: sizes).
+    let f = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&img).map_err(|e| e.to_string())?;
+    f.set_len(size_mb * 1024 * 1024).map_err(|e| e.to_string())?;
+    drop(f);
+    // Attach raw, format FAT32, mount, copy, detach — scripted via /bin/sh.
+    let script = format!(
+        r#"set -e
+DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "{img}" | head -1 | awk '{{print $1}}')
+newfs_msdos -F 32 -v CHITTI "$DEV" > /dev/null
+diskutil mount "$DEV" > /dev/null
+MNT=$(diskutil info "$DEV" | awk -F': *' '/Mount Point/{{print $2}}')
+mkdir -p "$MNT/EFI/BOOT"
+cp "{stub}" "$MNT/EFI/BOOT/BOOTAA64.EFI"
+cp "{kernel}" "$MNT/chitti-kernel"
+{model_cp}
+diskutil unmount "$DEV" > /dev/null
+hdiutil detach "$DEV" > /dev/null
+"#,
+        img = img.display(),
+        stub = stub.display(),
+        kernel = kernel.display(),
+        model_cp = model.map(|m| format!("cp \"{}\" \"$MNT/model.gguf.000\"", m.display())).unwrap_or_default(),
+    );
+    let status = Command::new("/bin/sh").arg("-c").arg(&script).status().map_err(|e| format!("building ESP image: {e}"))?;
+    if !status.success() {
+        return Err("ESP image build failed (hdiutil/newfs_msdos)".into());
     }
-    fs::create_dir_all(esp.join("boot/limine")).map_err(|e| e.to_string())?;
-    fs::create_dir_all(esp.join("EFI/BOOT")).map_err(|e| e.to_string())?;
-    fs::copy(kernel_bin, esp.join("boot/chitti-kernel")).map_err(|e| format!("copying kernel: {e}"))?;
-    let base_conf = fs::read_to_string(root.join("kernel/limine.conf")).map_err(|e| e.to_string())?;
-    fs::write(esp.join("boot/limine/limine.conf"), format!("serial: yes\n{base_conf}")).map_err(|e| format!("writing limine.conf: {e}"))?;
-    let share = limine_share_dir()?;
-    fs::copy(share.join("BOOTAA64.EFI"), esp.join("EFI/BOOT/BOOTAA64.EFI")).map_err(|e| format!("copying BOOTAA64.EFI: {e}"))?;
-    Ok(esp)
+    eprintln!("  ESP image: {} ({} MiB{})", img.display(), size_mb, if model.is_some() { ", model bundled" } else { "" });
+    Ok(img)
 }
 
-/// Boot the aarch64 kernel via Limine + AAVMF (UEFI). Without `--disk-only`, the
-/// boot medium is a VVFAT ESP (from which you run `/install`); with it, the
-/// installed disk boots itself (no boot medium). The data disk is attached
-/// first so the in-kernel `probe_disk` finds it (not the FAT ESP).
-fn cmd_run_aarch64_limine(model: Model, disk: Option<PathBuf>, disk_only: bool, no_model: bool) -> Result<(), String> {
-    let _ = no_model; // the model rides the ext4 data partition on aarch64 UEFI, not the boot medium
-    let elf = build_kernel_aarch64_limine(model.features())?;
+/// Boot aarch64 via UEFI firmware (AAVMF) — the Chitti stub loads the normal
+/// identity kernel (+ model) off a real FAT ESP and hands off MMU-off through
+/// an identity-RAM trampoline, so the kernel boots exactly as under `-kernel`.
+/// The data disk is attached first so the in-kernel `probe_disk` (first
+/// virtio-mmio slot) targets it for /install + persistence, not the ESP.
+fn cmd_run_aarch64_uefi(model: Model, disk: Option<PathBuf>, disk_only: bool, no_model: bool) -> Result<(), String> {
+    let elf = build_kernel_aarch64(true, model.features())?;
+    assert_identity_kernel(&elf)?;
+    let stub = build_stub_aarch64()?;
     let mut qemu = Command::new("qemu-system-aarch64");
-    qemu.args(["-M", "virt", "-cpu", "host", "-accel", "hvf", "-m", model.qemu_mem()]);
+    qemu.args(["-M", "virt", "-cpu", "host", "-accel", "hvf", "-smp", "4", "-m", model.qemu_mem()]);
     for a in aavmf_pflash_args()? {
         qemu.arg(a);
     }
     qemu.args(["-device", "ramfb", "-device", "virtio-keyboard-device", "-serial", "mon:stdio"]);
-    // Data disk FIRST (lowest virtio-mmio slot → probe_disk picks it for
-    // /install + persistence, not the FAT ESP).
+    // ESP first, data disk LAST: QEMU assigns later virtio-mmio devices to
+    // LOWER slots, and the kernel's probe_disk takes the first (lowest) match —
+    // so this ordering makes /install + persistence target the data disk, never
+    // the boot ESP.
+    if disk_only {
+        eprintln!("booting aarch64 FROM DISK ONLY via UEFI (no ESP medium)");
+        eprintln!("  note: requires an /install that wrote the aarch64 ESP payload to the disk");
+    } else {
+        let gguf = repo_root().join(model.gguf_rel());
+        let model_path = (!no_model && gguf.exists()).then_some(gguf);
+        let esp = build_esp_image_aarch64(&stub, &elf, model_path.as_deref())?;
+        qemu.arg("-drive").arg(format!("file={},if=none,id=esp,format=raw", esp.display()));
+        qemu.args(["-device", "virtio-blk-device,drive=esp"]);
+        eprintln!("booting aarch64 via the Chitti UEFI stub (AAVMF) -- firmware loads BOOTAA64.EFI from the ESP");
+    }
     if let Some(d) = &disk {
         qemu.arg("-drive").arg(format!("file={},if=none,id=data,format=raw", d.display()));
         qemu.args(["-device", "virtio-blk-device,drive=data"]);
         eprintln!("  data disk: {}", d.display());
-    }
-    if !disk_only {
-        let esp = prepare_aarch64_esp_dir(&elf)?;
-        qemu.arg("-drive").arg(format!("file=fat:rw:{},format=raw,id=esp,if=none", esp.display()));
-        qemu.args(["-device", "virtio-blk-device,drive=esp"]);
-        eprintln!("booting aarch64 via Limine/AAVMF from a VVFAT ESP (run `/install yes`, then --disk-only)");
-        eprintln!("  note: the model loads from the ext4 data partition on this path (not the boot medium)");
-    } else {
-        eprintln!("booting aarch64 FROM DISK ONLY via Limine/AAVMF (no boot medium)");
     }
     run(&mut qemu)
 }
@@ -688,10 +719,12 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
             None if fresh_disk || disk_only => Some(ensure_disk_image(0, true)?),
             None => None,
         };
-        // `--uefi` or `--disk-only` on aarch64 => the Limine/AAVMF boot path
-        // (boots from disk, no -kernel); otherwise the fast -kernel HVF path.
+        // `--uefi` or `--disk-only` on aarch64 => firmware boot via the Chitti
+        // UEFI stub (AAVMF launches BOOTAA64.EFI, which loads the normal
+        // identity kernel + model off a real FAT ESP and hands off MMU-off via
+        // an identity-RAM trampoline). Otherwise the fast -kernel HVF path.
         if uefi || disk_only {
-            return cmd_run_aarch64_limine(model, disk, disk_only, no_model);
+            return cmd_run_aarch64_uefi(model, disk, disk_only, no_model);
         }
         return cmd_run_aarch64(release, model, disk, disk_only);
     }
