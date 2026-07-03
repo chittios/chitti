@@ -1,0 +1,155 @@
+//! A minimal **GPT partition-table writer** for `/install`: lay down a
+//! protective MBR + primary/backup GPT with two partitions — an EFI System
+//! Partition (FAT32, for Limine + the kernel + the model) and a Chitti/Linux
+//! data partition (SimpleFS, our OS volume). Enough of the GPT spec to produce
+//! a table firmware + `sgdisk`/Linux accept; not a general editor.
+
+use crate::block::{BlockDevice, BlockError, BLOCK_SIZE};
+
+/// EFI System Partition type GUID (C12A7328-F81F-11D2-BA4B-00A0C93EC93B).
+const ESP_GUID: [u8; 16] =
+    [0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b];
+/// Linux filesystem data type GUID (0FC63DAF-8483-4772-8E79-3D69D8477DE4) —
+/// used for the Chitti (SimpleFS) OS partition.
+const LINUX_GUID: [u8; 16] =
+    [0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4];
+
+/// A partition to create: (type GUID, first LBA, last LBA, UTF-16 name).
+pub struct PartitionSpec {
+    pub type_guid: [u8; 16],
+    pub first_lba: u64,
+    pub last_lba: u64,
+    pub name: &'static str,
+}
+
+/// The result of laying out a GPT: where each partition lives.
+pub struct Layout {
+    pub esp_first: u64,
+    pub esp_last: u64,
+    pub os_first: u64,
+    pub os_last: u64,
+}
+
+// --- CRC32 (IEEE 802.3, reflected) --------------------------------------
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xffff_ffff;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn le64(buf: &mut [u8], off: usize, v: u64) {
+    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+fn le32(buf: &mut [u8], off: usize, v: u32) {
+    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Compute the standard two-partition layout for a disk of `total_sectors`
+/// 512-byte blocks: a 512 MiB ESP followed by the rest as the OS partition.
+/// GPT reserves LBA0 (PMBR), LBA1 (header), LBA2..33 (entries) and the last 33
+/// sectors (backup). Returns `None` if the disk is too small.
+pub fn default_layout(total_sectors: u64) -> Option<Layout> {
+    let first_usable = 34u64;
+    let last_usable = total_sectors.checked_sub(34)?;
+    let esp_sectors = 512 * 1024 * 1024 / BLOCK_SIZE as u64; // 512 MiB
+    let esp_first = first_usable;
+    let esp_last = esp_first + esp_sectors - 1;
+    let os_first = esp_last + 1;
+    if os_first + 1 >= last_usable {
+        return None;
+    }
+    Some(Layout { esp_first, esp_last, os_first, os_last: last_usable })
+}
+
+/// Write a protective MBR + primary and backup GPT describing `parts` to `dev`.
+/// A fixed disk GUID / partition GUIDs are used (deterministic install).
+pub fn write<D: BlockDevice>(dev: &mut D, parts: &[PartitionSpec]) -> Result<(), BlockError> {
+    let total = dev.block_count();
+    let entries_lba = 2u64;
+    let n_entries = 128u32;
+    let entry_size = 128u32;
+    let entry_sectors = (n_entries * entry_size).div_ceil(BLOCK_SIZE as u32) as u64; // 32
+    let backup_hdr = total - 1;
+    let backup_entries = backup_hdr - entry_sectors;
+
+    // --- protective MBR (LBA0) ---
+    let mut mbr = [0u8; BLOCK_SIZE];
+    mbr[0x1be + 4] = 0xee; // type 0xEE = GPT protective
+    le32(&mut mbr, 0x1be + 8, 1); // starting LBA
+    le32(&mut mbr, 0x1be + 12, (total - 1).min(0xffff_ffff) as u32);
+    mbr[510] = 0x55;
+    mbr[511] = 0xaa;
+    dev.write_block(0, &mbr)?;
+
+    // --- partition entry array (LBA2..) ---
+    let mut entries = [0u8; 128 * 128];
+    for (i, p) in parts.iter().enumerate() {
+        let e = i * 128;
+        entries[e..e + 16].copy_from_slice(&p.type_guid);
+        // Unique partition GUID: deterministic, derived from the index.
+        for b in 0..16 {
+            entries[e + 16 + b] = (0xa0 + i as u8).wrapping_add(b as u8);
+        }
+        le64(&mut entries, e + 32, p.first_lba);
+        le64(&mut entries, e + 40, p.last_lba);
+        // name: UTF-16LE, up to 36 code units.
+        for (k, c) in p.name.encode_utf16().take(36).enumerate() {
+            entries[e + 56 + k * 2..e + 56 + k * 2 + 2].copy_from_slice(&c.to_le_bytes());
+        }
+    }
+    let entries_crc = crc32(&entries);
+    // Write the entry array (primary + backup).
+    write_bytes(dev, entries_lba, &entries)?;
+    write_bytes(dev, backup_entries, &entries)?;
+
+    // --- GPT header (primary at LBA1, backup at last sector) ---
+    let disk_guid: [u8; 16] = *b"CHITTI-OS-DISK01";
+    let write_hdr = |dev: &mut D, my_lba: u64, alt_lba: u64, ent_lba: u64| -> Result<(), BlockError> {
+        let mut h = [0u8; BLOCK_SIZE];
+        h[0..8].copy_from_slice(b"EFI PART");
+        le32(&mut h, 8, 0x0001_0000); // revision 1.0
+        le32(&mut h, 12, 92); // header size
+        le64(&mut h, 24, my_lba);
+        le64(&mut h, 32, alt_lba);
+        le64(&mut h, 40, 34); // first usable
+        le64(&mut h, 48, total - 34); // last usable
+        h[56..72].copy_from_slice(&disk_guid);
+        le64(&mut h, 72, ent_lba);
+        le32(&mut h, 80, n_entries);
+        le32(&mut h, 84, entry_size);
+        le32(&mut h, 88, entries_crc);
+        // header CRC over the 92-byte header with the CRC field (16) zeroed.
+        le32(&mut h, 16, 0);
+        let hc = crc32(&h[0..92]);
+        le32(&mut h, 16, hc);
+        dev.write_block(my_lba, &h)
+    };
+    write_hdr(dev, 1, backup_hdr, entries_lba)?;
+    write_hdr(dev, backup_hdr, 1, backup_entries)?;
+    Ok(())
+}
+
+/// Write a byte buffer spanning multiple sectors, sector-aligned.
+fn write_bytes<D: BlockDevice>(dev: &mut D, start_lba: u64, data: &[u8]) -> Result<(), BlockError> {
+    let mut buf = [0u8; BLOCK_SIZE];
+    for (i, chunk) in data.chunks(BLOCK_SIZE).enumerate() {
+        buf.fill(0);
+        buf[..chunk.len()].copy_from_slice(chunk);
+        dev.write_block(start_lba + i as u64, &buf)?;
+    }
+    Ok(())
+}
+
+/// Build the two standard partition specs (ESP + SimpleFS OS) from a layout.
+pub fn standard_parts(layout: &Layout) -> [PartitionSpec; 2] {
+    [
+        PartitionSpec { type_guid: ESP_GUID, first_lba: layout.esp_first, last_lba: layout.esp_last, name: "EFI System" },
+        PartitionSpec { type_guid: LINUX_GUID, first_lba: layout.os_first, last_lba: layout.os_last, name: "Chitti OS" },
+    ]
+}

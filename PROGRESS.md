@@ -209,3 +209,20 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   `/mkfs [yes]` (explicit destructive SimpleFS format). x86-only (virtio-blk over PCI); aarch64 stubs.
 - Verified: a crafted GPT disk with 5 partitions → `/disks` detected FAT32/exFAT/NTFS/ext4/XFS with
   correct labels. `limine_protocol::File` + `fs::SIMPLEFS_MAGIC` exposed.
+
+### P3 — /install: GPT partitioning + SimpleFS OS partition  ✅ (bootloader payload = REVISIT)
+- `block/gpt.rs`: GPT writer (protective MBR + primary/backup header + 128-entry array, IEEE
+  CRC32) with a 512 MiB ESP + a Chitti/Linux-data (SimpleFS) partition; `default_layout`/`standard_parts`.
+- `block/mod.rs`: `Partition` block-device view (offset+len) so SimpleFS lives inside a partition.
+- Shell `/install [yes]`: writes the GPT, formats the OS partition SimpleFS, writes markers
+  (chitti-os, VERSION). Destructive, explicit (never at boot).
+- Verified: `/install yes` on a 768 MiB disk -> `/disks` re-reads GPT as [EFI System 512 MiB] +
+  [SimpleFS 255 MiB]; `/ls 1` lists chitti-os + VERSION across a reboot; host python confirms a
+  valid GPT with correct header CRC32 and the two named partitions.
+- REVISIT (DECISIONS.md): FAT32 ESP population (Limine + kernel + multi-part model) for standalone
+  UEFI boot -- needs a FAT32 writer + installer-payload modules. The model can't go on SimpleFS
+  (4 KiB file cap), so it targets the ESP. Booting today is still via the USB/ISO.
+
+## Storage/install run status: P1, P2 done + verified; P3 partitioning + SimpleFS install done +
+## verified; standalone-boot ESP population is the honest remaining piece (REVISIT). Both arches
+## build; 103/103 tests throughout.

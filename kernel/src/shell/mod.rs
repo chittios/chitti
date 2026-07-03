@@ -245,6 +245,7 @@ pub fn run() -> ! {
                 "disks" => disk_list(),
                 "ls" => disk_ls(arg),
                 "mkfs" => disk_mkfs(arg),
+                "install" => disk_install(arg),
                 other => serial_println!("unknown command '/{}' -- try /help", other),
             }
             continue;
@@ -278,6 +279,7 @@ fn print_help() {
     serial_println!("  /disks           list block devices + detected filesystems (read-only)");
     serial_println!("  /ls [n]          list root dir of detected volume n (FAT32/SimpleFS)");
     serial_println!("  /mkfs            format the disk with SimpleFS (destructive, explicit)");
+    serial_println!("  /install [yes]   partition the disk (GPT: ESP + SimpleFS OS) and install (destructive)");
     serial_println!("  /help            this list");
     serial_println!("  /exit            power off (or Ctrl+D on an empty line)");
 }
@@ -698,9 +700,12 @@ fn disk_ls(arg: &str) {
             }
             Err(e) => serial_println!("ls> FAT32 read error: {}", e),
         },
-        FsType::SimpleFs if v.start_lba == 0 => {
-            if let Some(dev2) = VirtioBlk::probe() {
-                match crate::fs::SimpleFs::mount(dev2).and_then(|mut fs| fs.list()) {
+        FsType::SimpleFs => {
+            // Mount over a partition view (start_lba may be non-zero — the OS
+            // partition from /install), on a fresh device handle.
+            if let Some(mut dev2) = VirtioBlk::probe() {
+                let part = crate::block::Partition::new(&mut dev2, v.start_lba, v.sectors);
+                match crate::fs::SimpleFs::mount(part).and_then(|mut fs| fs.list()) {
                     Ok(files) => {
                         serial_println!("ls> SimpleFS volume {} ({} files):", n, files.len());
                         for f in files {
@@ -749,4 +754,60 @@ fn disk_ls(_arg: &str) {
 #[cfg(not(target_arch = "x86_64"))]
 fn disk_mkfs(_arg: &str) {
     serial_println!("mkfs> block-device support is x86-only");
+}
+
+#[cfg(target_arch = "x86_64")]
+fn disk_install(arg: &str) {
+    use crate::block::{gpt, virtio::VirtioBlk, BlockDevice, Partition};
+    if arg.trim() != "yes" {
+        serial_println!("install> DESTRUCTIVE: repartitions the whole disk (GPT: 512 MiB EFI System");
+        serial_println!("install> partition + a Chitti SimpleFS OS partition) and erases it.");
+        serial_println!("install> re-run as '/install yes' to proceed.");
+        return;
+    }
+    let Some(mut dev) = VirtioBlk::probe() else {
+        serial_println!("install> no block device (boot with a -drive)");
+        return;
+    };
+    let total = dev.block_count();
+    let Some(layout) = gpt::default_layout(total) else {
+        serial_println!("install> disk too small ({} sectors)", total);
+        return;
+    };
+    // 1. Write the GPT (protective MBR + primary/backup + two partitions).
+    let parts = gpt::standard_parts(&layout);
+    if let Err(e) = gpt::write(&mut dev, &parts) {
+        serial_println!("install> GPT write failed: {:?}", e);
+        return;
+    }
+    serial_println!(
+        "install> GPT written: ESP lba {}..{}, Chitti-OS lba {}..{}",
+        layout.esp_first, layout.esp_last, layout.os_first, layout.os_last
+    );
+
+    // 2. Format the Chitti OS partition with SimpleFS + drop a marker file.
+    let os_count = layout.os_last - layout.os_first + 1;
+    let part = Partition::new(&mut dev, layout.os_first, os_count);
+    match crate::fs::SimpleFs::format(part, 256) {
+        Ok(mut fs) => {
+            let _ = fs.write("chitti-os", b"Chitti OS installed (SimpleFS root)\n");
+            let _ = fs.write("VERSION", env!("CARGO_PKG_VERSION").as_bytes());
+            serial_println!("install> Chitti OS partition formatted (SimpleFS), marker written.");
+        }
+        Err(e) => {
+            serial_println!("install> SimpleFS format failed: {:?}", e);
+            return;
+        }
+    }
+
+    // 3. Boot payload (Limine + kernel + model on the FAT32 ESP) -- REVISIT.
+    serial_println!("install> NOTE: the disk is partitioned + the OS filesystem is created.");
+    serial_println!("install> Populating the FAT32 ESP with Limine + kernel + the model (to boot");
+    serial_println!("install> standalone) needs a FAT32 writer + installer payload -- see DECISIONS.md.");
+    serial_println!("install> Verify now with /disks (GPT + SimpleFS volume) and /ls 1.");
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn disk_install(_arg: &str) {
+    serial_println!("install> block-device support is x86-only");
 }
