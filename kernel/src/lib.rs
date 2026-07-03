@@ -159,6 +159,34 @@ pub fn init() {
     // Bring up the other vCPUs (QEMU `-smp 4`). They enable their MMU, claim a
     // worker slot, and park spinning on the matvec job pool.
     arch::aarch64::smp::init(4);
+    // Install the EL1 exception vectors, then bring up the GICv3 + generic-timer
+    // interrupt — giving aarch64 the same timer-preemptive scheduling x86 gets
+    // from the PIT/IDT (BSP-driven; the parked secondaries keep IRQs masked,
+    // exactly like x86's APs). Must come after `sched::init` (so `on_timer_tick`
+    // has a scheduler) and the vectors before the GIC (which probes the CPU
+    // interface using the recoverable sync handler). `init_bsp` returns false on
+    // Apple-Silicon HVF, whose emulated GICv3 exposes no `ICC_*` sysreg CPU
+    // interface to a bare-metal EL1 guest — there we stay cooperative (already
+    // supported); everywhere else (TCG, KVM, real ARM hardware) we get true
+    // timer preemption.
+    // SAFETY: at EL1 on the BSP; vectors are valid and the GIC MMIO is mapped.
+    let preemptive = unsafe {
+        arch::aarch64::exceptions::init();
+        arch::aarch64::gic::init_bsp()
+    };
+    if preemptive {
+        arch::aarch64::interrupts::enable();
+        // Warmup to confirm timer IRQs are actually delivered (routing works),
+        // not just that init ran: at 100 Hz, ~50 ms yields a few ticks. Bounded
+        // by the free-running counter (`time_ms`).
+        let start = arch::aarch64::time_ms();
+        while arch::aarch64::time_ms().wrapping_sub(start) < 50 {
+            core::hint::spin_loop();
+        }
+        ktrace::log_fmt(format_args!("gic: timer delivering IRQs ({} ticks in 50 ms warmup) -- preemptive scheduling", arch::aarch64::gic::ticks()));
+    } else {
+        ktrace::log("init", "no timer IRQ (GIC CPU interface unavailable) -- cooperative scheduling");
+    }
     ktrace::log("init", "aarch64 bring-up complete (MMU + heap + scheduler + SMP)");
 }
 
