@@ -57,7 +57,9 @@ fn le32(buf: &mut [u8], off: usize, v: u32) {
 pub fn default_layout(total_sectors: u64) -> Option<Layout> {
     let first_usable = 34u64;
     let last_usable = total_sectors.checked_sub(34)?;
-    let esp_sectors = 512 * 1024 * 1024 / BLOCK_SIZE as u64; // 512 MiB
+    // 64 MiB ESP: enough for the Limine loader, and within FAT16's cluster-count
+    // range (the ext4 partition holds limine.conf + kernel + model).
+    let esp_sectors = 64 * 1024 * 1024 / BLOCK_SIZE as u64;
     let esp_first = first_usable;
     let esp_last = esp_first + esp_sectors - 1;
     let os_first = esp_last + 1;

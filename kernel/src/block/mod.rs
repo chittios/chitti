@@ -6,6 +6,7 @@
 //! disk (persistent across reboots, used at boot).
 
 pub mod ext4;
+pub mod fat;
 pub mod gpt;
 pub mod ramdisk;
 #[cfg(target_arch = "x86_64")]
