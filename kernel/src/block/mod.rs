@@ -5,6 +5,7 @@
 //! on a RAM disk (deterministic, used by the test suite) or a real virtio-blk
 //! disk (persistent across reboots, used at boot).
 
+pub mod ext4;
 pub mod gpt;
 pub mod ramdisk;
 #[cfg(target_arch = "x86_64")]

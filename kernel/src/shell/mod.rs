@@ -246,6 +246,7 @@ pub fn run() -> ! {
                 "ls" => disk_ls(arg),
                 "mkfs" => disk_mkfs(arg),
                 "install" => disk_install(arg),
+                "mkext4" => disk_mkext4(arg),
                 other => serial_println!("unknown command '/{}' -- try /help", other),
             }
             continue;
@@ -279,6 +280,7 @@ fn print_help() {
     serial_println!("  /disks           list block devices + detected filesystems (read-only)");
     serial_println!("  /ls [n]          list root dir of detected volume n (FAT32/SimpleFS)");
     serial_println!("  /mkfs            format the disk with SimpleFS (destructive, explicit)");
+    serial_println!("  /mkext4          format the disk with ext4 (destructive; writes test files)");
     serial_println!("  /install [yes]   partition the disk (GPT: ESP + SimpleFS OS) and install (destructive)");
     serial_println!("  /help            this list");
     serial_println!("  /exit            power off (or Ctrl+D on an empty line)");
@@ -810,4 +812,34 @@ fn disk_install(arg: &str) {
 #[cfg(not(target_arch = "x86_64"))]
 fn disk_install(_arg: &str) {
     serial_println!("install> block-device support is x86-only");
+}
+
+#[cfg(target_arch = "x86_64")]
+fn disk_mkext4(arg: &str) {
+    use crate::block::{ext4::{Ext4Writer, FileSpec}, virtio::VirtioBlk};
+    if arg.trim() != "yes" {
+        serial_println!("mkext4> DESTRUCTIVE: formats the whole disk as ext4, erasing it.");
+        serial_println!("mkext4> re-run as '/mkext4 yes' to confirm.");
+        return;
+    }
+    let Some(mut dev) = VirtioBlk::probe() else {
+        serial_println!("mkext4> no block device");
+        return;
+    };
+    // A small file + a ~200 KiB file (forces single-indirect blocks).
+    let hello = b"hello from Chitti's from-scratch ext4 writer\n";
+    let big: alloc::vec::Vec<u8> = (0..200_000u32).map(|i| ((i.wrapping_mul(7)) & 0xff) as u8).collect();
+    let files = [
+        FileSpec { name: "hello.txt", chunks: &[&hello[..]] },
+        FileSpec { name: "big.bin", chunks: &[&big[..]] },
+    ];
+    match Ext4Writer::format(&mut dev, &files) {
+        Ok(()) => serial_println!("mkext4> formatted ext4 + wrote hello.txt (45 B) + big.bin (200000 B)."),
+        Err(e) => serial_println!("mkext4> ext4 format failed: {:?}", e),
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn disk_mkext4(_arg: &str) {
+    serial_println!("mkext4> block-device support is x86-only");
 }
