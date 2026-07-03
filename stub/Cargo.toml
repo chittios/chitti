@@ -1,0 +1,20 @@
+[package]
+name = "chitti-stub"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone crate (do NOT join the repo-root workspace, which builds xtask for
+# the host). Built for aarch64-unknown-uefi by xtask.
+[workspace]
+
+[[bin]]
+name = "chitti-stub"
+path = "src/main.rs"
+
+[dependencies]
+uefi = { version = "0.35", features = ["alloc", "global_allocator", "panic_handler", "logger"] }
+log = "0.4"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
