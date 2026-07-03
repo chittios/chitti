@@ -444,15 +444,18 @@ pub fn run_acceptance() -> bool {
 #[cfg(target_arch = "x86_64")]
 pub fn model_module() -> Option<&'static [u8]> {
     use alloc::vec::Vec;
-    let response = crate::MODULE_REQUEST.response()?;
     // The model may be a single `.gguf` module, or split into multi-part
     // modules `model.gguf.000`, `.001`, ... — the ISO9660 4 GiB per-file limit
     // forces a large model to be split for single-ISO distribution. Collect
     // every model part and order them by path.
-    let mut parts: Vec<&'static crate::limine_protocol::File> =
-        response.modules().iter().copied().filter(|m| m.path_contains(".gguf")).collect();
+    let mut parts: Vec<&'static crate::limine_protocol::File> = match crate::MODULE_REQUEST.response() {
+        Some(r) => r.modules().iter().copied().filter(|m| m.path_contains(".gguf")).collect(),
+        None => Vec::new(),
+    };
     if parts.is_empty() {
-        return None;
+        // No Limine model module: this is an installed system booted from the
+        // FAT ESP (kernel only). Read the model off the ext4 OS partition.
+        return model_from_ext4();
     }
     parts.sort_by_key(|m| m.path_str());
     if parts.len() == 1 {
@@ -480,6 +483,47 @@ pub fn model_module() -> Option<&'static [u8]> {
     crate::ktrace::log_fmt(format_args!("cortex: reassembled model from {} parts ({} bytes) into contiguous frames", parts.len(), total));
     // SAFETY: `virt` maps `total` contiguous, now-initialized bytes (HHDM).
     Some(unsafe { core::slice::from_raw_parts(virt as *const u8, total) })
+}
+
+/// Read the model off the ext4 OS partition of the boot disk (the installed
+/// system, which boots from the FAT ESP with no Limine model module). Finds the
+/// ext4 volume, reads every `*.gguf*` file from its root in name order, and
+/// concatenates them into contiguous frames — the same contiguous blob the
+/// GGUF parser expects. `None` if there's no disk / ext4 / model.
+#[cfg(target_arch = "x86_64")]
+fn model_from_ext4() -> Option<&'static [u8]> {
+    use crate::block::{ext4_read::Ext4Reader, virtio::VirtioBlk, Partition};
+    use crate::fs::detect::FsType;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    let mut dev = VirtioBlk::probe()?;
+    // Find the ext-family OS partition via the GPT/FS detector.
+    let vol = crate::fs::detect::probe(&mut dev)
+        .into_iter()
+        .find(|v| matches!(v.fs, FsType::Ext2 | FsType::Ext3 | FsType::Ext4))?;
+    let mut part = Partition::new(&mut dev, vol.start_lba, vol.sectors);
+    let mut r = Ext4Reader::open(&mut part)?;
+    // Model parts in the ext4 root, ordered.
+    let mut names: Vec<String> = r.list_root().into_iter().filter(|(n, _, d)| !d && n.contains(".gguf")).map(|(n, _, _)| n).collect();
+    names.sort();
+    if names.is_empty() {
+        return None;
+    }
+    let total: usize = names.iter().map(|n| r.file_size(n).unwrap_or(0) as usize).sum();
+    if total == 0 {
+        return None;
+    }
+    let (_phys, virt) = crate::mm::alloc_dma(total)?;
+    // SAFETY: `virt` maps `total` contiguous, freshly-allocated bytes.
+    let dst = unsafe { core::slice::from_raw_parts_mut(virt as *mut u8, total) };
+    let mut off = 0usize;
+    for n in &names {
+        let sz = r.file_size(n).unwrap_or(0) as usize;
+        let got = r.read_root_file(n, &mut dst[off..off + sz])?;
+        off += got;
+    }
+    crate::ktrace::log_fmt(format_args!("cortex: loaded model from ext4 partition ({} part(s), {} bytes)", names.len(), off));
+    Some(&dst[..off])
 }
 
 /// Find a boot module whose path contains `needle` (x86 Limine). Used by

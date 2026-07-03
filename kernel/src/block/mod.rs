@@ -6,6 +6,7 @@
 //! disk (persistent across reboots, used at boot).
 
 pub mod ext4;
+pub mod ext4_read;
 pub mod fat;
 pub mod gpt;
 pub mod ramdisk;
