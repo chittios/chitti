@@ -101,6 +101,11 @@ pub fn run() -> ! {
     // Persona agent (for `/do <intent>`) reused across the session.
     let mut agent = Agent::spawn(persona::default_manifest("chitti"));
     let mut planner = RulePlanner;
+    // The agent-layer orchestrator + its tool router (for `/agent`, `/session`,
+    // `/subagent`), reused across the session so its Session persists.
+    use crate::agent::{manifest as amanifest, orchestrator, rule_steps, subagent};
+    let mut orch = orchestrator::Orchestrator::spawn(amanifest::orchestrator_manifest(), 42);
+    let mut router = orch.router();
     // Chat session (model + tokenizer + KV cache), loaded lazily on first chat.
     let mut chat: Option<ChatSession> = None;
     let mut line = String::new();
@@ -131,11 +136,109 @@ pub fn run() -> ! {
                     chat = None;
                     serial_println!("(chat context cleared)");
                 }
-                "do" | "agent" => {
+                "do" => {
                     if arg.is_empty() {
                         serial_println!("usage: /do <intent>   e.g. /do remember that project is chitti");
                     } else {
                         run_intent_interactive(&mut agent, &mut planner, arg);
+                    }
+                }
+                // --- agent-layer verification commands -----------------------
+                "agent" => {
+                    if arg.is_empty() {
+                        serial_println!("usage: /agent <intent>   (rule-planned; try: write a file called notes with the text hi, then read it back)");
+                    } else {
+                        let mut steps = rule_steps::for_intent(arg);
+                        let r = orch.handle_compiled(arg, &mut steps, &mut router);
+                        serial_println!(
+                            "=> {} [stop={:?}, turns={}, tool_calls={}]",
+                            r.answer, r.stop, r.turns, r.tool_calls
+                        );
+                        serial_println!(
+                            "   session {} now has {} messages, {} todos, {} subagent record(s)",
+                            orch.session.id.0,
+                            orch.session.messages.len(),
+                            orch.session.todos.len(),
+                            orch.session.subagents.len()
+                        );
+                    }
+                }
+                "session" => {
+                    let (sub, sarg) = match arg.split_once(' ') {
+                        Some((s, a)) => (s, a.trim()),
+                        None => (arg, ""),
+                    };
+                    match sub {
+                        "save" => match crate::session::save(&orch.session) {
+                            Ok(()) => serial_println!("=> saved session {}", orch.session.id.0),
+                            Err(_) => serial_println!("=> save failed"),
+                        },
+                        "resume" => match sarg.parse::<u64>() {
+                            Ok(id) => match crate::session::resume(crate::agent::types::SessionId(id)) {
+                                Some(s) => {
+                                    let n = s.messages.len();
+                                    orch = orchestrator::Orchestrator::from_session(amanifest::orchestrator_manifest(), s);
+                                    serial_println!("=> resumed session {} ({} messages reconstructed)", id, n);
+                                }
+                                None => serial_println!("=> no saved session {}", id),
+                            },
+                            Err(_) => serial_println!("usage: /session resume <id>"),
+                        },
+                        _ => {
+                            serial_println!(
+                                "current session {} — {} messages, {} todos, {} subagents, seed {}",
+                                orch.session.id.0,
+                                orch.session.messages.len(),
+                                orch.session.todos.len(),
+                                orch.session.subagents.len(),
+                                orch.session.seed
+                            );
+                            let saved: alloc::vec::Vec<String> =
+                                crate::synapse::fs::list().into_iter().filter(|p| p.starts_with("sess/")).collect();
+                            serial_println!("saved in store: [{}]  (/session save | /session resume <id>)", saved.join(", "));
+                        }
+                    }
+                }
+                "subagent" => {
+                    if arg.is_empty() {
+                        serial_println!("usage: /subagent <path>   (dispatches an isolated reader sub-agent to read <path>)");
+                    } else {
+                        let mut script = rule_steps::ScriptedSteps::new(alloc::vec![
+                            crate::agent::agent_loop::Step::Tools(alloc::vec![rule_steps::tool(
+                                "read",
+                                rule_steps::args(&[("path", arg)])
+                            )]),
+                            crate::agent::agent_loop::Step::Final(alloc::format!("read '{}'", arg)),
+                        ]);
+                        let caps = orch.manifest.capabilities.clone();
+                        let md = orch.manifest.budgets.max_depth;
+                        match subagent::dispatch(&caps, 0, md, amanifest::reader_subagent_manifest(), arg, &mut script, &mut router, Some(0)) {
+                            Ok(o) => {
+                                let sub_msgs = o.sub_session.messages.len();
+                                let summary = o.record.summary.clone().unwrap_or_default();
+                                subagent::integrate(&mut orch.session, 1, &o);
+                                serial_println!("=> sub-agent[core {:?}] summary: {}", o.record.core, summary);
+                                serial_println!(
+                                    "   isolation: sub-agent ran {} msgs (NOT merged); parent now {} msgs, {} subagent record(s), effective caps: {}",
+                                    sub_msgs,
+                                    orch.session.messages.len(),
+                                    orch.session.subagents.len(),
+                                    o.record.effective_caps.len()
+                                );
+                            }
+                            Err(e) => serial_println!("=> sub-agent refused: {:?}", e),
+                        }
+                    }
+                }
+                "skills" => {
+                    let metas = crate::skills::index::metadata();
+                    if metas.is_empty() {
+                        serial_println!("(no skills installed)");
+                    } else {
+                        serial_println!("installed skills (L0 metadata):");
+                        for m in &metas {
+                            serial_println!("  {} [{:?}] — {}", m.name, m.kind, m.description);
+                        }
                     }
                 }
                 other => serial_println!("unknown command '/{}' -- try /help", other),
@@ -159,6 +262,10 @@ fn print_help() {
     serial_println!("  <message>        chat with the model (streams until EOS; Ctrl+C to stop)");
     serial_println!("  /do <intent>     run a Persona intent (write a file called X with the text Y; ");
     serial_println!("                   remember that K is V; what is K; list; say TEXT)");
+    serial_println!("  /agent <intent>  run the orchestrator's agentic loop on <intent> (sessions + tools)");
+    serial_println!("  /session         show the current session; /session save | /session resume <id>");
+    serial_println!("  /subagent <path> dispatch an isolated reader sub-agent (shows context isolation)");
+    serial_println!("  /skills          list installed skills (L0 metadata)");
     serial_println!("  /clear           reset the chat context");
     serial_println!("  /infer           reference inference (fixed prompt, parity check)");
     serial_println!("  /bench           matvec kernel throughput");
