@@ -116,34 +116,19 @@ pub struct VirtioBlkMmio {
 }
 
 impl VirtioBlkMmio {
-    /// Scan the virtio-mmio window for block devices and bring up the LARGEST.
-    /// The `virt` machine can present several (e.g. a small FAT boot ESP + the
-    /// big data disk under the UEFI boot flow); the data disk is the one the FS
-    /// stack wants, and it is the largest, so pick by capacity. The capacity
-    /// (device config @ +0x100) is readable without setting up the queue.
+    /// Scan the virtio-mmio window for the first block device and bring it up.
     pub fn probe() -> Option<VirtioBlkMmio> {
-        let mut best_base = 0usize;
-        let mut best_version = 0u32;
-        let mut best_cap = 0u64;
         for slot in 0..MMIO_SLOTS {
             let b = MMIO_BASE + slot * MMIO_STRIDE;
             // SAFETY: scanning the fixed virtio-mmio window; 32-bit registers.
             unsafe {
                 let v = reg_read(b, VERSION);
                 if reg_read(b, MAGIC) == 0x7472_6976 && (v == 1 || v == 2) && reg_read(b, DEVICE_ID) == VIRTIO_ID_BLOCK {
-                    let cap = (reg_read(b, CONFIG) as u64) | ((reg_read(b, CONFIG + 4) as u64) << 32);
-                    if cap >= best_cap {
-                        best_cap = cap;
-                        best_base = b;
-                        best_version = v;
-                    }
+                    return Self::init(b, v);
                 }
             }
         }
-        if best_base == 0 {
-            return None;
-        }
-        Self::init(best_base, best_version)
+        None
     }
 
     fn init(base: usize, version: u32) -> Option<VirtioBlkMmio> {
