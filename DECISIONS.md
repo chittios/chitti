@@ -104,3 +104,12 @@ Answers: detect all 5 FSes read-only (no foreign writes); build-time model choic
   memory. Still costs the model size in RAM; a zero-copy segmented GGUF reader is a REVISIT.
 - **All block/FS/install work is x86** (ISO/Limine/UEFI + virtio-blk-PCI). aarch64 stays the
   QEMU-native `-kernel` dev path (no ISO); aarch64 virtio-mmio-blk support is a follow-on.
+- **Override applied:** the `/install` OS/data partition is **SimpleFS**, not ext4 (user
+  course-correction). ext4 stays detection + read-only (Q1). Removes the ext4-write problem.
+- **SimpleFS max file = 4 KiB (8 direct blocks, no indirect):** so the model cannot live on the
+  SimpleFS OS partition — it belongs on the FAT32 ESP (where Limine loads it). Populating the ESP
+  (FAT32 write of Limine + kernel + model = standalone UEFI boot) needs a from-scratch FAT32
+  writer + installer-payload modules; not completable/verifiable in the remaining budget, so it is
+  the documented **REVISIT**. `/install` today writes a spec-valid GPT (correct CRC32) + formats
+  the SimpleFS OS partition + marker files — the partitioning + native-FS-creation half of a real
+  install, verified in QEMU and by host GPT parse.
