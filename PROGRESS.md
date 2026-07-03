@@ -388,3 +388,18 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   comes up, and `/info` shows the model parsed (dim 1024, layers 24, vocab
   248320). Remaining wall-clock cost is AAVMF streaming the model off the ESP
   at boot (~1-2 min, inside edk2).
+
+### End-user distribution: `cargo xtask image -arch aarch64` → chitti-aa64.img  ✅
+- Distribution story per platform convention: **x86 = the hybrid BIOS/UEFI ISO**
+  (unchanged: dd/Rufus to USB, live boot, `/install`); **aarch64 = a raw GPT disk
+  image** (the ARM-world norm — Raspberry Pi OS, Ubuntu ARM): users dd/Etcher
+  `chitti-aa64.img` to a USB drive or attach it as a VM disk (UTM/QEMU/
+  VirtualBox-ARM) and it **boots standalone** — it IS the installed disk (FAT32
+  ESP: stub + kernel + model; ext4 data partition for durable agent state).
+- xtask builds it host-side: a std port of the kernel GPT writer + hdiutil/
+  newfs_msdos for the ESP + mke2fs for the data partition (1095 MiB with the
+  0.8B model).
+- **Verified:** attached as the ONLY disk under AAVMF, the image boots to the
+  shell with the model loaded and synapse persistence mounted on its own data
+  partition (boot #1, durable). The stale `chitti-aa64.iso` Limine artifact is
+  superseded by this image.
