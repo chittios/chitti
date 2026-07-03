@@ -10,13 +10,15 @@ static XHCI: Locked<Option<Xhci>> = Locked::new(None);
 
 /// Probe + bring up the xHCI controller and enumerate a HID keyboard. No-op if
 /// absent. Called once at boot on x86.
-pub fn init_global() {
+pub fn init_global() -> bool {
     if let Some(mmio) = discover() {
         if let Some(mut x) = Xhci::bringup(mmio, x86_alloc) {
-            x.enumerate_keyboard();
+            let ok = x.enumerate_keyboard();
             XHCI.with(|s| *s = Some(x));
+            return ok;
         }
     }
+    false
 }
 
 /// The next byte from a USB keyboard, if any. `None` if no controller/keyboard.

@@ -123,6 +123,16 @@ const PORTSC_PR: u32 = 1 << 4; // port reset
 // RW1C/RW1CS bits to preserve (write 0) when doing a read-modify-write.
 const PORTSC_RW1CS: u32 = PORTSC_PED | (0x7f << 17);
 
+/// Crude busy-wait (~`iters` volatile reads); used for the USB reset-recovery
+/// settle where we have no timer in the arch-neutral core. Order of a few ms.
+fn spin_delay(iters: u64) {
+    let mut sink = 0u64;
+    for i in 0..iters {
+        sink = sink.wrapping_add(unsafe { read_volatile(&i) });
+    }
+    let _ = sink;
+}
+
 unsafe fn r32(addr: usize) -> u32 {
     unsafe { read_volatile(addr as *const u32) }
 }
@@ -355,15 +365,21 @@ impl Xhci {
     /// C2/C3: find a connected keyboard, reset its port, address the device,
     /// read its descriptors, set the config + boot protocol, and arm the
     /// interrupt IN endpoint.
-    pub fn enumerate_keyboard(&mut self) {
+    pub fn enumerate_keyboard(&mut self) -> bool {
         // SAFETY: single-threaded boot; all DMA regions are freshly allocated.
         unsafe {
             let Some(kbd) = self.try_enumerate() else {
                 crate::ktrace::log("xhci", "no HID keyboard enumerated");
-                return;
+                return false;
             };
             self.kbd = Some(kbd);
         }
+        true
+    }
+
+    /// Whether a HID keyboard was enumerated (for the boot diagnostic).
+    pub fn has_keyboard(&self) -> bool {
+        self.kbd.is_some()
     }
 
     unsafe fn try_enumerate(&mut self) -> Option<Kbd> {
@@ -380,7 +396,7 @@ impl Xhci {
         }
         let psc = self.portsc(port);
         unsafe {
-            // Reset the port (USB2 needs it; preserve RW1C status bits).
+            // Reset the port (USB2/FullSpeed needs it; preserve RW1C status bits).
             let v = r32(psc) & !PORTSC_RW1CS;
             w32(psc, v | PORTSC_PR);
             let mut spins = 0;
@@ -390,6 +406,11 @@ impl Xhci {
                     return None;
                 }
             }
+            // USB reset-recovery: a device needs time after reset before it will
+            // answer control transfers (the spec allows up to 10 ms). QEMU is
+            // instant, but slower/FullSpeed models (e.g. VirtualBox's HID
+            // keyboard) can NAK Address Device / GET_DESCRIPTOR without this.
+            spin_delay(2_000_000);
         }
         let speed = (unsafe { r32(psc) } >> 10) & 0xf;
         let ep0_mps: u32 = match speed {

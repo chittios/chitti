@@ -14,13 +14,15 @@ static XHCI: Locked<Option<Xhci>> = Locked::new(None);
 
 /// Probe + bring up the xHCI controller and enumerate a HID keyboard. No-op if
 /// there is no PCIe bus (virtio-mmio-only QEMU) or no xHCI controller.
-pub fn init_global() {
+pub fn init_global() -> bool {
     if let Some(mmio) = discover() {
         if let Some(mut x) = Xhci::bringup(mmio, aa_alloc) {
-            x.enumerate_keyboard();
+            let ok = x.enumerate_keyboard();
             XHCI.with(|s| *s = Some(x));
+            return ok;
         }
     }
+    false
 }
 
 /// The next byte from a USB keyboard, if any.
