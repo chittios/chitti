@@ -241,6 +241,7 @@ pub fn run() -> ! {
                         }
                     }
                 }
+                "info" => print_info(&orch, chat.as_ref()),
                 other => serial_println!("unknown command '/{}' -- try /help", other),
             }
             continue;
@@ -270,8 +271,70 @@ fn print_help() {
     serial_println!("  /infer           reference inference (fixed prompt, parity check)");
     serial_println!("  /bench           matvec kernel throughput");
     serial_println!("  /perf            end-to-end prefill/decode tok/s");
+    serial_println!("  /info            CPU / memory / model / context / OS info");
     serial_println!("  /help            this list");
     serial_println!("  /exit            power off");
+}
+
+/// `/info`: a system status panel — OS/build, arch + cores + SIMD, uptime,
+/// heap usage, the bundled model's shape, and the live context (orchestrator
+/// session + chat KV).
+fn print_info(orch: &crate::agent::orchestrator::Orchestrator, chat: Option<&ChatSession>) {
+    let mib = |b: usize| b / (1024 * 1024);
+    serial_println!("Chitti OS — agentic re-architecture (Phases A-G)  v{}", env!("CARGO_PKG_VERSION"));
+
+    // Arch + cores + SIMD.
+    #[cfg(target_arch = "x86_64")]
+    serial_println!("  cpu:     x86_64 (SSE2/AVX2)   cores: {}", crate::smp::cpu_count());
+    #[cfg(target_arch = "aarch64")]
+    serial_println!(
+        "  cpu:     aarch64 (NEON + dotprod)   cores online: {}",
+        crate::arch::aarch64::smp::online_cpus()
+    );
+    serial_println!("  uptime:  {} ms", crate::arch::now_ms());
+
+    // Heap.
+    let (total, free, used) = crate::mm::heap::stats();
+    serial_println!("  memory:  heap {} MiB used / {} MiB total ({} MiB free)", mib(used), mib(total), mib(free));
+
+    // Model (parse the GGUF container header — cheap, zero-copy).
+    let model_name = if cfg!(feature = "model-9b") { "Qwen3.5-9B" } else { "Qwen3.5-0.8B" };
+    match crate::cortex::model_module() {
+        Some(bytes) => match crate::cortex::gguf::Gguf::parse(bytes) {
+            Ok(g) => serial_println!(
+                "  model:   {} — {} MiB GGUF; dim {}, layers {}, ctx {}, vocab {}, eos {}",
+                model_name,
+                mib(bytes.len()),
+                g.config.embedding_length,
+                g.config.block_count,
+                g.config.context_length,
+                g.tokens.len(),
+                g.config.eos_token_id
+            ),
+            Err(_) => serial_println!("  model:   {} — {} MiB GGUF (header parse failed)", model_name, mib(bytes.len())),
+        },
+        None => serial_println!("  model:   none bundled"),
+    }
+
+    // Live context: orchestrator session + chat KV.
+    serial_println!(
+        "  context: session {} — {} msgs, {}/{} live tokens, {} subagents, {} skills in scope",
+        orch.session.id.0,
+        orch.session.messages.len(),
+        orch.session.context.live_tokens,
+        orch.session.context.window_limit,
+        orch.session.subagents.len(),
+        orch.session.skills_in_scope.len()
+    );
+    match chat {
+        Some(c) => serial_println!("  chat:    loaded, {} tokens in KV cache", c.pos),
+        None => serial_println!("  chat:    not loaded (send a message or /infer to load the model)"),
+    }
+    serial_println!(
+        "  skills:  {} installed   audit log: {} entries",
+        crate::skills::index::metadata().len(),
+        crate::synapse::audit::len()
+    );
 }
 
 /// A live chat: the model, its BPE tokenizer, and a persistent KV/recurrent

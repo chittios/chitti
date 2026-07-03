@@ -63,6 +63,18 @@ impl LinkedListAllocator {
         Self { head: ListNode::new(0) }
     }
 
+    /// Sum of all free regions on the free list (bytes). O(free-list length);
+    /// used only by [`stats`] for `/info`, never on a hot path.
+    fn free_bytes(&self) -> usize {
+        let mut total = 0;
+        let mut cur = self.head.next.as_deref();
+        while let Some(node) = cur {
+            total += node.size;
+            cur = node.next.as_deref();
+        }
+        total
+    }
+
     /// # Safety
     /// `[start, start + size)` must be valid, mapped, exclusively-owned
     /// memory; called exactly once, from `mm::heap::init`.
@@ -158,6 +170,14 @@ unsafe impl GlobalAlloc for Locked<LinkedListAllocator> {
 
 #[global_allocator]
 static ALLOCATOR: Locked<LinkedListAllocator> = Locked::new(LinkedListAllocator::empty());
+
+/// Heap usage snapshot for `/info`: `(total, free, used)` bytes. `total` is the
+/// compile-time [`HEAP_SIZE`]; `free` walks the free list; `used = total - free`.
+pub fn stats() -> (usize, usize, usize) {
+    let free = ALLOCATOR.with(|a| a.free_bytes());
+    let total = HEAP_SIZE;
+    (total, free, total.saturating_sub(free))
+}
 
 /// x86: map `HEAP_SIZE` bytes at `HEAP_START` to freshly allocated physical
 /// frames (via the frame allocator + paging) and hand the range to the
