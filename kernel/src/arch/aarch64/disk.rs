@@ -4,12 +4,20 @@
 //! QEMU `virt` window) is the fallback. A given platform uses one transport, so
 //! `probe_nth` tries PCIe first and falls back to mmio.
 
+use crate::arch::aarch64::ahci::Ahci;
+use crate::arch::aarch64::nvme::Nvme;
 use crate::arch::aarch64::virtio_blk::VirtioBlkMmio;
 use crate::arch::aarch64::virtio_pci::VirtioBlkPci;
 use crate::block::{BlockDevice, BlockError};
 
+/// The aarch64 boot disk, one variant per real transport. `probe_nth` tries
+/// them in order of preference — virtio (para-virtual, fast) first, then the
+/// real-hardware controllers NVMe and AHCI, then the QEMU-mmio fallback. A
+/// platform typically exposes exactly one, so ordering just skips the absent.
 pub enum Disk {
     Pci(VirtioBlkPci),
+    Nvme(Nvme),
+    Ahci(Ahci),
     Mmio(VirtioBlkMmio),
 }
 
@@ -18,39 +26,41 @@ impl Disk {
         if let Some(d) = VirtioBlkPci::probe_nth(n) {
             return Some(Disk::Pci(d));
         }
+        if let Some(d) = Nvme::probe_nth(n) {
+            return Some(Disk::Nvme(d));
+        }
+        if let Some(d) = Ahci::probe_nth(n) {
+            return Some(Disk::Ahci(d));
+        }
         VirtioBlkMmio::probe_nth(n).map(Disk::Mmio)
     }
 }
 
+macro_rules! dispatch {
+    ($self:ident, $m:ident $(, $a:expr)*) => {
+        match $self {
+            Disk::Pci(d) => d.$m($($a),*),
+            Disk::Nvme(d) => d.$m($($a),*),
+            Disk::Ahci(d) => d.$m($($a),*),
+            Disk::Mmio(d) => d.$m($($a),*),
+        }
+    };
+}
+
 impl BlockDevice for Disk {
     fn block_count(&self) -> u64 {
-        match self {
-            Disk::Pci(d) => d.block_count(),
-            Disk::Mmio(d) => d.block_count(),
-        }
+        dispatch!(self, block_count)
     }
     fn read_block(&mut self, index: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        match self {
-            Disk::Pci(d) => d.read_block(index, buf),
-            Disk::Mmio(d) => d.read_block(index, buf),
-        }
+        dispatch!(self, read_block, index, buf)
     }
     fn write_block(&mut self, index: u64, buf: &[u8]) -> Result<(), BlockError> {
-        match self {
-            Disk::Pci(d) => d.write_block(index, buf),
-            Disk::Mmio(d) => d.write_block(index, buf),
-        }
+        dispatch!(self, write_block, index, buf)
     }
     fn read_blocks(&mut self, index: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        match self {
-            Disk::Pci(d) => d.read_blocks(index, buf),
-            Disk::Mmio(d) => d.read_blocks(index, buf),
-        }
+        dispatch!(self, read_blocks, index, buf)
     }
     fn write_blocks(&mut self, index: u64, buf: &[u8]) -> Result<(), BlockError> {
-        match self {
-            Disk::Pci(d) => d.write_blocks(index, buf),
-            Disk::Mmio(d) => d.write_blocks(index, buf),
-        }
+        dispatch!(self, write_blocks, index, buf)
     }
 }

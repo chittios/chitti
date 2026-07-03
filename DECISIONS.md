@@ -248,3 +248,21 @@ rushing it at the tail of this session.
 **Also platform-specific storage** (AHCI/NVMe) for hypervisors that expose SATA/
 NVMe instead of virtio — additive `BlockDevice` impls behind the same `Disk`
 enum, same PCIe discovery.
+
+**DONE: NVMe + AHCI over PCIe (aarch64).** Both landed as additive `BlockDevice`s
+in the `Disk` enum (probe order virtio-pci → NVMe → AHCI → virtio-mmio) and were
+verified read/writing an ext4 file on QEMU virt under UEFI (`-device nvme` and
+`-device ahci`+`ide-hd`): `pattern match: true` on a 200 KB round-trip for each.
+Key gotcha found + fixed: the NVMe CQE **phase tag is bit 16 of DWORD3** (bits
+15:0 are the command ID), not bit 0 — the initial bit-0 check made completions
+never register, so `bringup` silently returned None and the probe fell through to
+the ESP. These two drivers are only discovered where ACPI/PCIe exist (the UEFI
+boot); the native `-kernel` dev path has no ACPI and keeps virtio-mmio.
+
+**R7 (follow-on): adopt NVMe/AHCI on x86 via its PCI stack.** The drivers live
+under `arch/aarch64` because non-virtio storage is aarch64's real-hardware
+concern; x86 already has storage via virtio-blk-pci under Limine, so no user-
+visible capability diverges today. The driver cores are largely arch-neutral
+(MMIO reg pokes + DMA), so — like `xhci.rs` — they can be lifted into a shared
+core with a thin x86 discovery/alloc seam when x86 needs to boot a non-virtio
+host. Tracked, not rushed (would need OVMF NVMe-boot verification on x86).
