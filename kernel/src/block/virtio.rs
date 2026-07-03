@@ -45,6 +45,11 @@ const VIRTIO_BLK_T_OUT: u32 = 1; // write to device
 
 const PAGE: u64 = 4096;
 
+/// Max bytes per request (a 64 KiB bounce buffer): one polled round trip moves
+/// up to this much data instead of one 512 B sector — the difference between
+/// minutes and seconds for large files (the model in `/install`).
+const DATA_MAX: usize = 64 * 1024;
+
 fn align_up(x: u64, a: u64) -> u64 {
     (x + a - 1) & !(a - 1)
 }
@@ -101,8 +106,10 @@ pub struct VirtioBlk {
     q_desc: u64,   // virtual address of the descriptor table
     q_avail: u64,  // virtual address of the available ring
     q_used: u64,   // virtual address of the used ring
-    req_virt: u64, // virtual address of the request scratch page
-    req_phys: u64, // physical address of the same
+    req_virt: u64,  // virtual address of the request scratch page
+    req_phys: u64,  // physical address of the same
+    data_virt: u64, // DATA_MAX-byte bounce buffer for multi-sector IO
+    data_phys: u64,
     avail_idx: u16,
 }
 
@@ -179,6 +186,7 @@ impl VirtioBlk {
             // One scratch page holds the request header (@0), status (@16),
             // and the 512-byte data buffer (@512).
             let (req_phys, req_virt) = crate::mm::alloc_dma(PAGE as usize)?;
+            let (data_phys, data_virt) = crate::mm::alloc_dma(DATA_MAX)?;
 
             // Tell the device where the queue lives (by page frame number).
             outl(io_base + R_QUEUE_PFN, (q_phys / PAGE) as u32);
@@ -200,17 +208,19 @@ impl VirtioBlk {
                 q_used: q_virt + used_off,
                 req_virt,
                 req_phys,
+                data_virt,
+                data_phys,
                 avail_idx: 0,
             })
         }
     }
 
-    /// Issue one polled sector request. `buf` is 512 bytes: the source for a
-    /// write, the destination for a read.
-    fn request(&mut self, write: bool, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+    /// Issue one polled request moving `len` bytes (<= DATA_MAX, a BLOCK_SIZE
+    /// multiple) at `sector` through the bounce buffer. `ptr` is the caller's
+    /// buffer: read from on a write, written to on a read.
+    fn request(&mut self, write: bool, sector: u64, ptr: *mut u8, len: usize) -> Result<(), BlockError> {
         const HDR_OFF: u64 = 0;
         const STATUS_OFF: u64 = 16;
-        const DATA_OFF: u64 = 512;
 
         // SAFETY: all addresses are within the two DMA regions allocated in
         // `init`; the descriptor/ring layout follows the legacy virtio spec.
@@ -220,7 +230,7 @@ impl VirtioBlk {
             wr32(self.req_virt + HDR_OFF + 4, 0);
             wr64(self.req_virt + HDR_OFF + 8, sector);
             if write {
-                core::ptr::copy_nonoverlapping(buf.as_ptr(), (self.req_virt + DATA_OFF) as *mut u8, BLOCK_SIZE);
+                core::ptr::copy_nonoverlapping(ptr as *const u8, self.data_virt as *mut u8, len);
             }
             wr8(self.req_virt + STATUS_OFF, 0xff); // sentinel; device overwrites
 
@@ -231,8 +241,8 @@ impl VirtioBlk {
             wr16(d(0) + 12, VIRTQ_DESC_F_NEXT);
             wr16(d(0) + 14, 1);
 
-            wr64(d(1), self.req_phys + DATA_OFF);
-            wr32(d(1) + 8, BLOCK_SIZE as u32);
+            wr64(d(1), self.data_phys);
+            wr32(d(1) + 8, len as u32);
             wr16(d(1) + 12, VIRTQ_DESC_F_NEXT | if write { 0 } else { VIRTQ_DESC_F_WRITE });
             wr16(d(1) + 14, 2);
 
@@ -265,7 +275,7 @@ impl VirtioBlk {
                 return Err(BlockError::DeviceError);
             }
             if !write {
-                core::ptr::copy_nonoverlapping((self.req_virt + DATA_OFF) as *const u8, buf.as_mut_ptr(), BLOCK_SIZE);
+                core::ptr::copy_nonoverlapping(self.data_virt as *const u8, ptr, len);
             }
         }
         Ok(())
@@ -288,7 +298,7 @@ impl BlockDevice for VirtioBlk {
         if index >= self.capacity {
             return Err(BlockError::OutOfRange);
         }
-        self.request(false, index, buf)
+        self.request(false, index, buf.as_mut_ptr(), BLOCK_SIZE)
     }
 
     fn write_block(&mut self, index: u64, buf: &[u8]) -> Result<(), BlockError> {
@@ -298,9 +308,40 @@ impl BlockDevice for VirtioBlk {
         if index >= self.capacity {
             return Err(BlockError::OutOfRange);
         }
-        // `request` needs `&mut [u8]`; copy into a local for the write path.
-        let mut tmp = [0u8; BLOCK_SIZE];
-        tmp.copy_from_slice(buf);
-        self.request(true, index, &mut tmp)
+        self.request(true, index, buf.as_ptr() as *mut u8, BLOCK_SIZE)
+    }
+
+    // Batched IO: one polled request per DATA_MAX chunk instead of per sector.
+    fn read_blocks(&mut self, index: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        if buf.len() % BLOCK_SIZE != 0 {
+            return Err(BlockError::BadBufferLen);
+        }
+        if index + (buf.len() / BLOCK_SIZE) as u64 > self.capacity {
+            return Err(BlockError::OutOfRange);
+        }
+        let mut off = 0usize;
+        while off < buf.len() {
+            let take = (buf.len() - off).min(DATA_MAX);
+            let sector = index + (off / BLOCK_SIZE) as u64;
+            self.request(false, sector, buf[off..].as_mut_ptr(), take)?;
+            off += take;
+        }
+        Ok(())
+    }
+    fn write_blocks(&mut self, index: u64, buf: &[u8]) -> Result<(), BlockError> {
+        if buf.len() % BLOCK_SIZE != 0 {
+            return Err(BlockError::BadBufferLen);
+        }
+        if index + (buf.len() / BLOCK_SIZE) as u64 > self.capacity {
+            return Err(BlockError::OutOfRange);
+        }
+        let mut off = 0usize;
+        while off < buf.len() {
+            let take = (buf.len() - off).min(DATA_MAX);
+            let sector = index + (off / BLOCK_SIZE) as u64;
+            self.request(true, sector, buf[off..].as_ptr() as *mut u8, take)?;
+            off += take;
+        }
+        Ok(())
     }
 }

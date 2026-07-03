@@ -79,6 +79,22 @@ impl<D: BlockDevice> BlockDevice for Partition<'_, D> {
         }
         self.dev.write_block(self.start + index, buf)
     }
+    // Forward batched IO to the underlying device (else the default loop would
+    // fall back to per-sector requests and lose the batching).
+    fn read_blocks(&mut self, index: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        let n = (buf.len() / BLOCK_SIZE) as u64;
+        if index + n > self.count {
+            return Err(BlockError::OutOfRange);
+        }
+        self.dev.read_blocks(self.start + index, buf)
+    }
+    fn write_blocks(&mut self, index: u64, buf: &[u8]) -> Result<(), BlockError> {
+        let n = (buf.len() / BLOCK_SIZE) as u64;
+        if index + n > self.count {
+            return Err(BlockError::OutOfRange);
+        }
+        self.dev.write_blocks(self.start + index, buf)
+    }
 }
 
 /// A fixed-block-size storage device. Reads and writes operate on whole
@@ -93,6 +109,27 @@ pub trait BlockDevice {
 
     /// Write `buf` (which must be `BLOCK_SIZE` bytes) to block `index`.
     fn write_block(&mut self, index: u64, buf: &[u8]) -> Result<(), BlockError>;
+
+    /// Read `buf.len()/BLOCK_SIZE` consecutive blocks starting at `index`.
+    /// Default: a per-block loop. Real devices (virtio) override this with
+    /// multi-sector requests — one polled round trip per tens of KiB instead of
+    /// per 512 bytes, the difference between minutes and seconds for a large
+    /// file (e.g. the model in `/install`). `buf` must be a BLOCK_SIZE multiple.
+    fn read_blocks(&mut self, index: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        for (i, chunk) in buf.chunks_mut(BLOCK_SIZE).enumerate() {
+            self.read_block(index + i as u64, chunk)?;
+        }
+        Ok(())
+    }
+
+    /// Write `buf.len()/BLOCK_SIZE` consecutive blocks starting at `index`.
+    /// See [`BlockDevice::read_blocks`] for the batching contract.
+    fn write_blocks(&mut self, index: u64, buf: &[u8]) -> Result<(), BlockError> {
+        for (i, chunk) in buf.chunks(BLOCK_SIZE).enumerate() {
+            self.write_block(index + i as u64, chunk)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

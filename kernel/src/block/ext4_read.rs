@@ -69,13 +69,10 @@ impl<'d, D: BlockDevice> Ext4Reader<'d, D> {
         })
     }
 
-    /// Read one filesystem block into `buf` (must be `block_size`).
+    /// Read one filesystem block into `buf` (must be `block_size`), batched.
     fn read_fs_block(&mut self, fsblk: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         let spb = (self.block_size / BLOCK_SIZE) as u64;
-        for s in 0..spb {
-            self.dev.read_block(fsblk * spb + s, &mut buf[s as usize * BLOCK_SIZE..(s as usize + 1) * BLOCK_SIZE])?;
-        }
-        Ok(())
+        self.dev.read_blocks(fsblk * spb, buf)
     }
 
     fn read_inode(&mut self, ino: u64) -> Option<Inode> {
