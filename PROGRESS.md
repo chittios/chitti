@@ -197,3 +197,15 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
 - `disk_demo` now mounts SimpleFS ONLY (never `mount_or_format`); a blank/foreign disk is reported
   and left untouched ("NOT auto-formatting; use /install or /mkfs"). Verified: booting a zeroed
   virtio-blk disk leaves it all-zero. 103/103 tests.
+
+### P2 — FS detection + read-only mount + shell commands  ✅
+- `fs/detect.rs`: parse GPT (LBA1 "EFI PART" + entries) and MBR (0x55AA + entries), or treat a
+  bare device as a super-floppy; classify each volume as FAT32/exFAT/NTFS/ext2/3/4/XFS/SimpleFS by
+  on-disk signature, pulling FAT/ext/XFS labels. No writes to foreign filesystems.
+- `fs/roread.rs`: read-only FAT32 root-directory listing (8.3 names, cluster-chain walk); SimpleFS
+  uses native listing. exFAT/NTFS/ext4/XFS are detected but listing is reported unimplemented ("where
+  feasible" per Q1).
+- Shell: `/disks` (list volumes + FS + label + size), `/ls <n>` (root dir of FAT32/SimpleFS volume),
+  `/mkfs [yes]` (explicit destructive SimpleFS format). x86-only (virtio-blk over PCI); aarch64 stubs.
+- Verified: a crafted GPT disk with 5 partitions → `/disks` detected FAT32/exFAT/NTFS/ext4/XFS with
+  correct labels. `limine_protocol::File` + `fs::SIMPLEFS_MAGIC` exposed.

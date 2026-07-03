@@ -21,7 +21,12 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+pub mod detect;
+pub mod roread;
+
 const MAGIC: u32 = 0x0C_11_77_F5;
+/// SimpleFS superblock magic, exposed for `fs::detect` to identify our volumes.
+pub const SIMPLEFS_MAGIC: u32 = MAGIC;
 const VERSION: u32 = 1;
 const INODE_SIZE: usize = 64;
 const INODES_PER_BLOCK: usize = BLOCK_SIZE / INODE_SIZE; // 8
