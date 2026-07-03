@@ -51,10 +51,16 @@ extern "C" fn aarch64_sync_dispatch(frame: *mut u64) {
     let esr: u64;
     // SAFETY: reading ESR_EL1 is always valid at EL1.
     unsafe { core::arch::asm!("mrs {}, esr_el1", out(reg) esr, options(nomem, nostack)) };
-    if super::gic::probing() {
+    // Recoverable probes: the GIC CPU-interface UNDEF probe (detecting HVF's
+    // missing ICC_* sysregs) and the UART MMIO probe (finding the PL011 base on
+    // a platform without ACPI SPCR). While either is active, a trapped
+    // instruction is *recovered* — note the fault and advance the saved ELR
+    // past it (index 32 = byte offset 256; all aarch64 instructions are 4 bytes)
+    // so the `eret` resumes at the next instruction. Any other synchronous
+    // exception is a real kernel bug: log the syndrome and halt.
+    if super::gic::probing() || super::uart_probing() {
         super::gic::note_probe_fault();
-        // Skip the faulting instruction: ELR (saved at byte offset 256 => u64
-        // index 32) += 4 (all aarch64 instructions are 4 bytes here).
+        super::note_uart_fault();
         // SAFETY: `frame` is our own trap frame on the current stack.
         unsafe {
             let elr = frame.add(32);
