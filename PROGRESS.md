@@ -441,3 +441,24 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
 - Remaining for full non-QEMU interactivity: **USB xHCI + HID keyboard over PCIe**
   (next), and device-specific storage (AHCI/NVMe) for hypervisors that don't
   expose virtio. Display already works everywhere via GOP.
+
+### Real-world drivers (2/2): USB xHCI + HID keyboard over PCIe (both arches)  ✅
+- Extracted the working x86 xHCI driver into an **arch-neutral core** (`xhci.rs`:
+  controller reset, DCBAA/command/event rings, slot enable + Address Device, EP0
+  control transfers, config-descriptor parse for the HID boot-keyboard, interrupt
+  IN endpoint, HID usage→ASCII) with a tiny platform seam: `bringup(mmio, alloc)`
+  takes a register base + a `(phys,virt)` DMA allocator. Thin per-arch wrappers
+  handle discovery/mapping: x86 (`arch/x86_64/xhci.rs`) via legacy PCI config
+  ports + HHDM mmio map + `mm::alloc_dma`; aarch64 (`arch/aarch64/xhci.rs`) via
+  `pci::find_class(0x0c,0x03,0x30)` over ACPI ECAM + identity BAR map +
+  `alloc_ident`/`dma_to_phys`. One driver, both arches — no duplication.
+- `console::read_byte` on aarch64 now polls USB-HID first, then virtio-keyboard,
+  then PL011 — so a real USB keyboard drives the shell (ARM has no PS/2).
+- **Verified both arches:** aarch64 via `qemu-xhci` on PCIe (`xhci: controller
+  00:02.0 on PCIe` → `HID keyboard ready` → injected `/info` keystrokes reached
+  the shell); x86 unchanged after the refactor (same enumerate + keystroke).
+  103/103; both build.
+- Net: on aarch64, **display (GOP), disk (virtio-pci/ACPI-ECAM), and keyboard
+  (USB-HID/xHCI) are all real, non-QEMU-specific transports** — Chitti is
+  interactive on any UEFI + PCIe + USB platform. Remaining real-world breadth:
+  AHCI/NVMe storage for hosts without virtio (additive `BlockDevice`s).
