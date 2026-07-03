@@ -687,19 +687,40 @@ fn disk_ls(arg: &str) {
         return;
     };
     match v.fs {
-        FsType::Fat32 => match crate::fs::roread::fat32_root_list(&mut dev, v.start_lba) {
-            Ok(entries) => {
-                serial_println!("ls> FAT32 volume {} root ({} entries):", n, entries.len());
-                for (name, size, is_dir) in entries {
-                    if is_dir {
-                        serial_println!("  {}/", name);
-                    } else {
-                        serial_println!("  {} ({} bytes)", name, size);
+        FsType::Fat16 | FsType::Fat32 => {
+            let mut part = crate::block::Partition::new(&mut dev, v.start_lba, v.sectors);
+            match crate::block::fat_read::FatReader::open(&mut part) {
+                Some(mut r) => {
+                    let entries = r.list_root();
+                    serial_println!("ls> {} volume {} root ({} entries):", v.fs.name(), n, entries.len());
+                    for (name, size, is_dir) in entries {
+                        if is_dir {
+                            serial_println!("  {}/", name);
+                        } else {
+                            serial_println!("  {} ({} bytes)", name, size);
+                        }
                     }
                 }
+                None => serial_println!("ls> FAT volume unreadable"),
             }
-            Err(e) => serial_println!("ls> FAT32 read error: {}", e),
-        },
+        }
+        FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => {
+            let mut part = crate::block::Partition::new(&mut dev, v.start_lba, v.sectors);
+            match crate::block::ext4_read::Ext4Reader::open(&mut part) {
+                Some(mut r) => {
+                    let entries = r.list_root();
+                    serial_println!("ls> {} volume {} root ({} entries):", v.fs.name(), n, entries.len());
+                    for (name, ino, is_dir) in entries {
+                        if is_dir {
+                            serial_println!("  {}/  (inode {})", name, ino);
+                        } else {
+                            serial_println!("  {}  (inode {})", name, ino);
+                        }
+                    }
+                }
+                None => serial_println!("ls> ext volume unreadable"),
+            }
+        }
         FsType::SimpleFs => {
             // Mount over a partition view (start_lba may be non-zero — the OS
             // partition from /install), on a fresh device handle.

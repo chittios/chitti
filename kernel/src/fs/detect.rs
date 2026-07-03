@@ -3,7 +3,8 @@
 //! signatures, and parse MBR / GPT partition tables so per-partition volumes are
 //! recognized. No writes are ever issued to a foreign filesystem (per the
 //! locked decision) — this module only reads a handful of sectors to classify a
-//! volume and pull an easy label. Deeper directory reads live in `fs::roread`.
+//! volume and pull an easy label. Directory listing uses `block::fat_read` /
+//! `block::ext4_read`.
 
 use crate::block::{BlockDevice, BLOCK_SIZE};
 use alloc::string::String;
@@ -12,6 +13,7 @@ use alloc::vec::Vec;
 /// A recognized filesystem type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FsType {
+    Fat16,
     Fat32,
     ExFat,
     Ntfs,
@@ -26,6 +28,7 @@ pub enum FsType {
 impl FsType {
     pub fn name(self) -> &'static str {
         match self {
+            FsType::Fat16 => "FAT16",
             FsType::Fat32 => "FAT32",
             FsType::ExFat => "exFAT",
             FsType::Ntfs => "NTFS",
@@ -166,6 +169,13 @@ fn classify<D: BlockDevice>(dev: &mut D, start_lba: u64, sectors: u64) -> Volume
     }
     if &b0[3..11] == b"NTFS    " {
         vol.fs = FsType::Ntfs;
+        return vol;
+    }
+    // FAT16: "FAT16   " at 0x36 (54), boot signature 0x55AA — what our own ESP
+    // writer produces (label at 0x2b).
+    if &b0[54..62] == b"FAT16   " && b0[510] == 0x55 && b0[511] == 0xaa {
+        vol.fs = FsType::Fat16;
+        vol.label = trim_label(&b0[0x2b..0x36]);
         return vol;
     }
     // FAT32: "FAT32   " at 0x52, boot signature 0x55AA, volume label at 0x47.

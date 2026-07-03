@@ -29,6 +29,10 @@ const S_IFDIR: u16 = 0x4000;
 const S_IFREG: u16 = 0x8000;
 
 const INCOMPAT_FILETYPE: u32 = 0x0002;
+/// Declared so the volume classifies (and mounts) as ext4 everywhere; legal
+/// with zero extent-mapped inodes — the per-inode EXTENTS_FL decides, and all
+/// our files are block-mapped (which ext4 drivers read fine).
+const INCOMPAT_EXTENTS: u32 = 0x0040;
 const ROCOMPAT_SPARSE_SUPER: u32 = 0x0001;
 const ROCOMPAT_LARGE_FILE: u32 = 0x0002;
 
@@ -474,7 +478,7 @@ fn encode_superblock(sb: &mut [u8], total_blocks: u64, total_inodes: u64, free_b
     put32(sb, 84, FIRST_INO as u32); // first_ino
     put16(sb, 88, INODE_SIZE as u16); // inode_size
     put32(sb, 92, 0); // feature_compat
-    put32(sb, 96, INCOMPAT_FILETYPE); // feature_incompat
+    put32(sb, 96, INCOMPAT_FILETYPE | INCOMPAT_EXTENTS); // feature_incompat
     put32(sb, 100, ROCOMPAT_SPARSE_SUPER | ROCOMPAT_LARGE_FILE); // feature_ro_compat
 }
 

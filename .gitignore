@@ -2,3 +2,4 @@
 /kernel/target
 /xtask/target
 target/
+.DS_Store

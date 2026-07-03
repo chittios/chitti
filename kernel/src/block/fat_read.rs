@@ -166,6 +166,51 @@ impl<'d, D: BlockDevice> FatReader<'d, D> {
         None
     }
 
+    /// List the root directory: `(name, size, is_dir)` (LFN-aware).
+    pub fn list_root(&mut self) -> Vec<(String, u32, bool)> {
+        let dir = self.read_dir(0);
+        let mut out = Vec::new();
+        let mut lfn = String::new();
+        let mut i = 0usize;
+        while i + 32 <= dir.len() {
+            let e = &dir[i..i + 32];
+            i += 32;
+            if e[0] == 0 {
+                break;
+            }
+            if e[0] == 0xE5 {
+                lfn.clear();
+                continue;
+            }
+            if e[11] == 0x0F {
+                let mut part = String::new();
+                for &off in &[1usize, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30] {
+                    let c = le16(e, off);
+                    if c == 0 || c == 0xFFFF {
+                        break;
+                    }
+                    part.push(char::from_u32(c as u32).unwrap_or('?'));
+                }
+                part.push_str(&lfn);
+                lfn = part;
+                continue;
+            }
+            let name = if lfn.is_empty() {
+                let base: String = core::str::from_utf8(&e[0..8]).unwrap_or("").trim_end().into();
+                let ext: String = core::str::from_utf8(&e[8..11]).unwrap_or("").trim_end().into();
+                if ext.is_empty() { base } else { alloc::format!("{base}.{ext}") }
+            } else {
+                core::mem::take(&mut lfn)
+            };
+            lfn.clear();
+            if e[11] & 0x08 != 0 || name == "." || name == ".." {
+                continue; // volume label / dot entries
+            }
+            out.push((name, le32(e, 28), e[11] & 0x10 != 0));
+        }
+        out
+    }
+
     /// Read the file at `path` (e.g. `"chitti-kernel"` or `"EFI/BOOT/BOOTAA64.EFI"`,
     /// `/`-separated, from the root) into a Vec. None if any component is missing.
     pub fn read_file(&mut self, path: &str) -> Option<Vec<u8>> {

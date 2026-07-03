@@ -403,3 +403,19 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   shell with the model loaded and synapse persistence mounted on its own data
   partition (boot #1, durable). The stale `chitti-aa64.iso` Limine artifact is
   superseded by this image.
+
+### FS detection + listing fixes: FAT16 + ext4 classification + real /ls  ✅
+- `/disks` showed the installed ESP as "unknown" (the detector knew FAT32 but not
+  FAT16, which our ESP writer produces) and the data partition as "ext2" (the
+  classifier keys ext4 on the EXTENTS incompat bit, which our block-mapped writer
+  never set — technically-correct ext2 classification, wrong UX).
+- Fixes: FAT16 detection (+ label); `Ext4Writer` now declares INCOMPAT_EXTENTS in
+  the superblock (legal with zero extent-mapped inodes — the per-inode flag
+  decides; this is also what makes Linux mount it with the ext4 driver).
+  Verified e2fsck-clean; `dumpe2fs` features = `filetype extent sparse_super
+  large_file`.
+- `/ls` now really lists volumes: FAT16/FAT32 via the LFN-aware `FatReader`,
+  ext2/3/4 via `Ext4Reader` (read-only). The old FAT32-only `fs::roread` is
+  removed (superseded). Verified live: `/disks` → `[0] FAT16 label=CHITTI ESP,
+  [1] ext4`; `/ls 0` lists `EFI/`, `chitti-kernel`, `model.gguf.000`; `/ls 1`
+  lists the (empty) data root. 103/103; both arches build.
