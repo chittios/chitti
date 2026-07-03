@@ -98,6 +98,35 @@ impl PciDevice {
     }
 }
 
+/// Find the first function matching a class code `(base, sub, prog_if)` —
+/// e.g. an xHCI USB controller is `(0x0c, 0x03, 0x30)`. Class triple is at
+/// config offset 0x08 (bits 31:8).
+pub fn find_class(base: u8, sub: u8, prog_if: u8) -> Option<PciDevice> {
+    if ecam_base() == 0 {
+        return None;
+    }
+    let bus_end = BUS_END.with(|b| *b);
+    for bus in 0..=bus_end {
+        for dev in 0u8..32 {
+            for func in 0u8..8 {
+                let id = read32(bus, dev, func, 0x00);
+                let v = (id & 0xffff) as u16;
+                if v == 0xffff {
+                    if func == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                let class = read32(bus, dev, func, 0x08);
+                if ((class >> 24) & 0xff) as u8 == base && ((class >> 16) & 0xff) as u8 == sub && ((class >> 8) & 0xff) as u8 == prog_if {
+                    return Some(PciDevice { bus, dev, func, vendor: v, device: (id >> 16) as u16 });
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Find the `n`-th (0-based) function matching `(vendor, device)`, scanning all
 /// buses in the ECAM range. `device` accepts either the transitional or modern
 /// id via the two-element `devices` list.

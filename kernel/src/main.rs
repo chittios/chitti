@@ -187,8 +187,10 @@ pub extern "C" fn aarch64_start() -> ! {
     if let Some((addr, w, h, pitch)) = fb {
         chitti_kernel::framebuffer::init_console_raw(addr, w, h, pitch);
         serial_println!("Chitti: framebuffer TUI up ({}x{}) -- console mirrored to the window", w, h);
-        // With a window, wire the virtio-keyboard so it accepts keystrokes too
-        // (the `virt` machine has no PS/2). Absent if launched without one.
+        // Bring up a USB keyboard (xHCI + HID) if present — the real-hardware
+        // input path (no PS/2 on ARM); needs the PCIe bus from aarch64_pcie_init.
+        chitti_kernel::arch::aarch64::xhci::init_global();
+        // Also wire the virtio-keyboard (QEMU `virt` window). Absent without one.
         if chitti_kernel::arch::aarch64::virtio_input::init() {
             serial_println!("Chitti: virtio-keyboard up -- type in the window or the serial terminal");
         }

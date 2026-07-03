@@ -18,9 +18,12 @@ pub fn read_byte() -> Option<u8> {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // The virtio-keyboard (graphical window) first, then the PL011 UART
-        // (serial terminal) — so both the window and the terminal drive the shell.
-        crate::arch::aarch64::virtio_input::read_byte().or_else(crate::serial::read_byte)
+        // A USB (xHCI/HID) keyboard — the real-hardware input path — first, then
+        // the virtio-keyboard (QEMU `virt` window), then the PL011 UART, so any
+        // of them drives the shell.
+        crate::arch::aarch64::xhci::poll_key()
+            .or_else(crate::arch::aarch64::virtio_input::read_byte)
+            .or_else(crate::serial::read_byte)
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {

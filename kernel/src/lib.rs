@@ -40,6 +40,7 @@ pub mod tools;
 #[cfg(target_arch = "x86_64")]
 pub mod smp;
 pub mod synapse;
+pub mod xhci;
 
 // The framebuffer writer pulls in `font8x8` (a normal, non-build-std
 // dependency). Building it under `cfg(test)` as well hits a known
