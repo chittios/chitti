@@ -373,3 +373,18 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   completes in **~5 s** (was minutes); the installed FAT ESP is fsck_msdos-clean,
   the ext4 data partition e2fsck-clean, and the model file on the installed disk
   is **sha256-identical** to the source. 103/103; both arches build.
+
+### aarch64 `--disk-only` verified end-to-end (after an xtask disk-wipe bug)  ✅
+- The user's `--disk-only` run dropped to the EFI shell because xtask's aarch64
+  option threading passed `fresh=true` when no `--disk` size was given — it
+  **wiped the just-installed disk** and recreated it as an empty 4 MiB image.
+  Fixed: `--disk-only` keeps the existing disk as-is (wipe only on an explicit
+  `--fresh-disk`).
+- **Full x86-parity cycle now verified on aarch64:** `--uefi` boot → `/install
+  yes` (~5 s with the model) → `--disk-only` → the installed disk boots itself:
+  the stub loads the kernel + 774 MiB model off the installed FAT ESP,
+  `boot ok`, synapse persistence mounts the installed ext4 data partition
+  (**boot #2, agent files recovered — durable across the reboot**), the shell
+  comes up, and `/info` shows the model parsed (dim 1024, layers 24, vocab
+  248320). Remaining wall-clock cost is AAVMF streaming the model off the ESP
+  at boot (~1-2 min, inside edk2).
