@@ -249,47 +249,35 @@ fn aavmf_pflash_args() -> Result<Vec<String>, String> {
     ])
 }
 
-/// Assemble a UEFI-only (aarch64) Limine ISO: BOOTAA64.EFI + limine.conf + the
-/// kernel (+ the model as a Limine module if present and requested). Booted by
-/// AAVMF via El Torito UEFI. No BIOS stage (aarch64 has no legacy BIOS).
-fn assemble_aarch64_limine_iso(kernel_bin: &Path, model_rel: Option<&str>) -> Result<PathBuf, String> {
+/// Prepare a FAT **ESP directory** for the aarch64 Limine boot: BOOTAA64.EFI +
+/// limine.conf (with `serial: yes`) + the kernel. QEMU serves this directory to
+/// AAVMF as a FAT volume via VVFAT (`-drive file=fat:rw:<dir>`), which is the
+/// reliable aarch64 UEFI boot path — the `-cdrom` El Torito route boots a
+/// separate FAT image on which Limine can't find limine.conf. VVFAT caps around
+/// 504 MiB, so the (~774 MiB) model does NOT ride the boot medium; on aarch64
+/// UEFI the model is read from the ext4 data partition instead.
+fn prepare_aarch64_esp_dir(kernel_bin: &Path) -> Result<PathBuf, String> {
     let root = repo_root();
-    let iso_root = root.join("target/iso_root_aa64");
-    if iso_root.exists() {
-        fs::remove_dir_all(&iso_root).map_err(|e| format!("removing {}: {e}", iso_root.display()))?;
+    let esp = root.join("target/esp_aa64");
+    if esp.exists() {
+        fs::remove_dir_all(&esp).map_err(|e| format!("removing {}: {e}", esp.display()))?;
     }
-    fs::create_dir_all(iso_root.join("boot/limine")).map_err(|e| e.to_string())?;
-    fs::create_dir_all(iso_root.join("EFI/BOOT")).map_err(|e| e.to_string())?;
-    fs::copy(kernel_bin, iso_root.join("boot/chitti-kernel")).map_err(|e| format!("copying kernel: {e}"))?;
-    fs::copy(root.join("kernel/limine.conf"), iso_root.join("boot/limine/limine.conf")).map_err(|e| format!("copying limine.conf: {e}"))?;
+    fs::create_dir_all(esp.join("boot/limine")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(esp.join("EFI/BOOT")).map_err(|e| e.to_string())?;
+    fs::copy(kernel_bin, esp.join("boot/chitti-kernel")).map_err(|e| format!("copying kernel: {e}"))?;
+    let base_conf = fs::read_to_string(root.join("kernel/limine.conf")).map_err(|e| e.to_string())?;
+    fs::write(esp.join("boot/limine/limine.conf"), format!("serial: yes\n{base_conf}")).map_err(|e| format!("writing limine.conf: {e}"))?;
     let share = limine_share_dir()?;
-    fs::copy(share.join("limine-uefi-cd.bin"), iso_root.join("boot/limine/limine-uefi-cd.bin")).map_err(|e| format!("copying limine-uefi-cd.bin: {e}"))?;
-    fs::copy(share.join("BOOTAA64.EFI"), iso_root.join("EFI/BOOT/BOOTAA64.EFI")).map_err(|e| format!("copying BOOTAA64.EFI: {e}"))?;
-    // Bundle the model as a single Limine module if present + requested (the
-    // 0.8B is one file; multi-part on aarch64 is a follow-on).
-    if let Some(rel) = model_rel {
-        let gguf = root.join(rel);
-        if gguf.exists() {
-            fs::copy(&gguf, iso_root.join("boot/model.gguf.000")).map_err(|e| format!("copying model: {e}"))?;
-            let conf_path = iso_root.join("boot/limine/limine.conf");
-            let mut conf = fs::read_to_string(&conf_path).map_err(|e| e.to_string())?;
-            conf.push_str("    module_path: boot():/boot/model.gguf.000\n");
-            fs::write(&conf_path, conf).map_err(|e| format!("declaring model module: {e}"))?;
-        }
-    }
-    let iso_path = root.join("target/chitti-aa64.iso");
-    run(Command::new("xorriso").args([
-        "-as", "mkisofs", "-R", "-r", "-J",
-        "--efi-boot", "boot/limine/limine-uefi-cd.bin",
-        "-efi-boot-part", "--efi-boot-image", "--protective-msdos-label",
-    ]).arg(&iso_root).arg("-o").arg(&iso_path))?;
-    Ok(iso_path)
+    fs::copy(share.join("BOOTAA64.EFI"), esp.join("EFI/BOOT/BOOTAA64.EFI")).map_err(|e| format!("copying BOOTAA64.EFI: {e}"))?;
+    Ok(esp)
 }
 
-/// Boot the aarch64 kernel via Limine + AAVMF (UEFI) — from a disk's ESP,
-/// exactly like a real machine. `--disk-only` boots the installed disk with no
-/// ISO; otherwise the Limine ISO (from which you run `/install`).
+/// Boot the aarch64 kernel via Limine + AAVMF (UEFI). Without `--disk-only`, the
+/// boot medium is a VVFAT ESP (from which you run `/install`); with it, the
+/// installed disk boots itself (no boot medium). The data disk is attached
+/// first so the in-kernel `probe_disk` finds it (not the FAT ESP).
 fn cmd_run_aarch64_limine(model: Model, disk: Option<PathBuf>, disk_only: bool, no_model: bool) -> Result<(), String> {
+    let _ = no_model; // the model rides the ext4 data partition on aarch64 UEFI, not the boot medium
     let elf = build_kernel_aarch64_limine(model.features())?;
     let mut qemu = Command::new("qemu-system-aarch64");
     qemu.args(["-M", "virt", "-cpu", "host", "-accel", "hvf", "-m", model.qemu_mem()]);
@@ -297,18 +285,21 @@ fn cmd_run_aarch64_limine(model: Model, disk: Option<PathBuf>, disk_only: bool, 
         qemu.arg(a);
     }
     qemu.args(["-device", "ramfb", "-device", "virtio-keyboard-device", "-serial", "mon:stdio"]);
-    if !disk_only {
-        let model_rel = if no_model { None } else { Some(model.gguf_rel()) };
-        let iso = assemble_aarch64_limine_iso(&elf, model_rel)?;
-        qemu.arg("-cdrom").arg(&iso);
-        eprintln!("booting aarch64 via Limine/AAVMF from ISO (run `/install yes`, then --disk-only)");
-    } else {
-        eprintln!("booting aarch64 FROM DISK ONLY via Limine/AAVMF (no ISO)");
-    }
+    // Data disk FIRST (lowest virtio-mmio slot → probe_disk picks it for
+    // /install + persistence, not the FAT ESP).
     if let Some(d) = &disk {
-        qemu.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", d.display()));
-        qemu.args(["-device", "virtio-blk-device,drive=chittidisk"]);
-        eprintln!("  disk: {}", d.display());
+        qemu.arg("-drive").arg(format!("file={},if=none,id=data,format=raw", d.display()));
+        qemu.args(["-device", "virtio-blk-device,drive=data"]);
+        eprintln!("  data disk: {}", d.display());
+    }
+    if !disk_only {
+        let esp = prepare_aarch64_esp_dir(&elf)?;
+        qemu.arg("-drive").arg(format!("file=fat:rw:{},format=raw,id=esp,if=none", esp.display()));
+        qemu.args(["-device", "virtio-blk-device,drive=esp"]);
+        eprintln!("booting aarch64 via Limine/AAVMF from a VVFAT ESP (run `/install yes`, then --disk-only)");
+        eprintln!("  note: the model loads from the ext4 data partition on this path (not the boot medium)");
+    } else {
+        eprintln!("booting aarch64 FROM DISK ONLY via Limine/AAVMF (no boot medium)");
     }
     run(&mut qemu)
 }
