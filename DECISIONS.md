@@ -184,3 +184,35 @@ the handoff. (2) Confirm/repair the kernel's early serial + heap under Limine.
 (3) B2: aarch64 `alloc_dma` from a Limine memmap region → multi-part + ext4 model
 load; de-gate `/install` to write the aarch64 ESP (BOOTAA64.EFI + limine.conf +
 kernel) + partitions. (4) B3: verify standalone disk boot + model-from-ext4.
+
+## aarch64 UEFI boot — real-FAT-ESP investigation (findings)
+
+Goal: make `run -arch aarch64 --uefi` reliably reach the interactive shell.
+
+**Fixed at the Limine level.** The `-cdrom` El Torito route boots a separate FAT
+image on which Limine can't find limine.conf (silent GOP-menu drop). A **real
+raw FAT32 image** built on the host (hdiutil attach -nomount + newfs_msdos +
+mount + copy) is the reliable boot medium: Limine consistently finds limine.conf,
+loads the kernel, and the kernel reaches **`boot ok` → HHDM heap → scheduler →
+Limine GOP framebuffer** on every run.
+
+**Blocker (unresolved).** After the framebuffer, the boot wedges in the
+aarch64 **virtio-blk-mmio `init`** under Limine (localized to between the device
+reset and the queue setup in the v1 legacy path). The *same* driver on the
+`-kernel` path is reliable (Part A / A3: boot #2, e2fsck-clean), so it is
+specific to the Limine environment — candidate causes: virtio-mmio register
+access semantics under HVF after the UEFI handoff, or a DMA/ordering assumption
+that holds on the identity-mapped `-kernel` path but not under the HHDM.
+
+**Compounding factor.** AAVMF (edk2-aarch64) under HVF is very slow and
+*non-deterministic* to reach the Limine handoff (variable multi-minute firmware
+init: image-enumeration failures, TPM probe timeouts), so boot-to-shell timing
+is unpredictable and obscured the localization.
+
+**Next steps.** (1) Granular per-register-write markers inside virtio-blk-mmio
+`init` under Limine to pin the exact wedge; (2) try forcing modern (v2)
+virtio-mmio (`-global virtio-mmio.force-legacy=false`) to sidestep the legacy
+PFN path; (3) consider mapping virtio DMA through a dedicated identity region
+rather than the HHDM. Until then, `--uefi` is not shell-reliable; the default
+`-kernel` aarch64 path (and all features, incl. storage/persistence) is fully
+reliable.
