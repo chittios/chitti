@@ -15,6 +15,32 @@ pub mod virtio_input;
 
 use core::arch::asm;
 
+/// The Limine HHDM offset, set once at `limine_start`. On the `-kernel` build,
+/// RAM is identity-mapped (VA == PA) so this stays 0 and `dma_to_phys` is the
+/// identity. On the Limine build, heap RAM lives at `phys + hhdm`, so a device
+/// (virtio) handed a heap address needs `va - hhdm` — its physical address.
+#[cfg(feature = "boot-limine")]
+static HHDM_OFFSET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "boot-limine")]
+pub fn set_hhdm(offset: u64) {
+    HHDM_OFFSET.store(offset, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Translate a CPU (heap) virtual address to the physical address a device sees.
+/// Identity on the `-kernel` build; `va - hhdm` on the Limine build.
+#[inline]
+pub fn dma_to_phys(va: u64) -> u64 {
+    #[cfg(feature = "boot-limine")]
+    {
+        va - HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "boot-limine"))]
+    {
+        va
+    }
+}
+
 /// Halt the core until an interrupt (wait-for-interrupt).
 #[inline]
 pub fn hlt() {

@@ -108,30 +108,32 @@ pub extern "C" fn _start() -> ! {
 #[cfg(all(target_arch = "aarch64", feature = "boot-limine"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn limine_start() -> ! {
-    use chitti_kernel::{limine_protocol, FRAMEBUFFER_REQUEST, MEMMAP_REQUEST};
+    use chitti_kernel::{limine_protocol, FRAMEBUFFER_REQUEST, HHDM_REQUEST, MEMMAP_REQUEST};
     // Enable FP/SIMD (NEON) at EL1 — the tensor kernels need it.
     unsafe {
         core::arch::asm!("mrs x9, cpacr_el1", "orr x9, x9, #(3 << 20)", "msr cpacr_el1, x9", "isb", out("x9") _, options(nostack));
     }
     chitti_kernel::serial::init();
     serial_println!("{} -- NATIVE aarch64 via Limine (UEFI/AAVMF), booted from disk", BOOT_MSG);
-    assert!(chitti_kernel::BASE_REVISION.is_supported(), "Limine did not accept base revision 3");
-
-    // Heap: a usable region from the Limine memmap. Limine identity-maps the
-    // first 4 GiB, so a low physical region is directly addressable.
+    // Limine maps usable RAM through the HHDM (higher-half direct map), not a
+    // low identity map, so the heap must be addressed at `phys + hhdm_offset`.
+    // (Device MMIO — PL011, virtio-mmio — is separately low-mapped, which is
+    // why serial already works.)
+    let hhdm = HHDM_REQUEST.response().expect("Limine HHDM request refused").offset;
+    chitti_kernel::arch::aarch64::set_hhdm(hhdm);
     let need = chitti_kernel::mm::heap::HEAP_SIZE as u64;
-    let mut base = 0u64;
-    if let Some(mm) = MEMMAP_REQUEST.response() {
-        for e in mm.entries() {
-            if e.entry_type == limine_protocol::MEMMAP_USABLE && e.base >= 0x4000_0000 && e.length >= need && e.base + need <= (4u64 << 30) {
-                base = (e.base + 0xfff) & !0xfff;
-                break;
-            }
+    let mut phys = 0u64;
+    let mm = MEMMAP_REQUEST.response().expect("Limine memmap request refused");
+    for e in mm.entries() {
+        if e.entry_type == limine_protocol::MEMMAP_USABLE && e.length >= need {
+            phys = (e.base + 0xfff) & !0xfff;
+            break;
         }
     }
-    assert!(base != 0, "Limine memmap: no usable <4GiB region of {} bytes for the heap", need);
-    chitti_kernel::mm::heap::init_static(base as usize, chitti_kernel::mm::heap::HEAP_SIZE);
-    serial_println!("Chitti: heap {} MiB at {:#x} (from Limine memmap)", chitti_kernel::mm::heap::HEAP_SIZE / (1024 * 1024), base);
+    assert!(phys != 0, "Limine memmap: no usable region of {} bytes for the heap", need);
+    let heap_va = (phys + hhdm) as usize;
+    chitti_kernel::mm::heap::init_static(heap_va, chitti_kernel::mm::heap::HEAP_SIZE);
+    serial_println!("Chitti: heap {} MiB at phys {:#x} (hhdm va {:#x})", chitti_kernel::mm::heap::HEAP_SIZE / (1024 * 1024), phys, heap_va);
 
     chitti_kernel::sched::init();
     if let Some(fb) = FRAMEBUFFER_REQUEST.response().and_then(|r| r.framebuffers().first().copied()) {

@@ -13,6 +13,7 @@
 //! virtio-input rely on), handed to the device by physical address; `dsb`
 //! fences order the CPU's writes before each device notification.
 
+use crate::arch::aarch64::dma_to_phys as dma;
 use crate::block::{BlockDevice, BlockError, BLOCK_SIZE};
 use alloc::alloc::{alloc_zeroed, Layout};
 use core::ptr::{read_volatile, write_volatile};
@@ -168,12 +169,14 @@ impl VirtioBlkMmio {
                 let desc = alloc_ident(qs * 16);
                 let avail = alloc_ident(6 + qs * 2);
                 let used = alloc_ident(6 + qs * 8);
-                reg_write(base, QUEUE_DESC_LOW, desc as u32);
-                reg_write(base, QUEUE_DESC_HIGH, (desc >> 32) as u32);
-                reg_write(base, QUEUE_DRIVER_LOW, avail as u32);
-                reg_write(base, QUEUE_DRIVER_HIGH, (avail >> 32) as u32);
-                reg_write(base, QUEUE_DEVICE_LOW, used as u32);
-                reg_write(base, QUEUE_DEVICE_HIGH, (used >> 32) as u32);
+                // Device-facing addresses are physical (heap VA - HHDM under Limine).
+                let (dp, ap, up) = (dma(desc), dma(avail), dma(used));
+                reg_write(base, QUEUE_DESC_LOW, dp as u32);
+                reg_write(base, QUEUE_DESC_HIGH, (dp >> 32) as u32);
+                reg_write(base, QUEUE_DRIVER_LOW, ap as u32);
+                reg_write(base, QUEUE_DRIVER_HIGH, (ap >> 32) as u32);
+                reg_write(base, QUEUE_DEVICE_LOW, up as u32);
+                reg_write(base, QUEUE_DEVICE_HIGH, (up >> 32) as u32);
                 reg_write(base, QUEUE_READY, 1);
                 reg_write(base, STATUS, S_ACK | S_DRIVER | S_FEATURES_OK | S_DRIVER_OK);
                 (desc, avail, used)
@@ -185,7 +188,7 @@ impl VirtioBlkMmio {
                 reg_write(base, QUEUE_ALIGN, 4096);
                 let used_off = align_up(qs * 16 + (6 + qs * 2), 4096);
                 let region = alloc_ident(used_off + 6 + qs * 8);
-                reg_write(base, QUEUE_PFN, (region >> 12) as u32);
+                reg_write(base, QUEUE_PFN, (dma(region) >> 12) as u32);
                 reg_write(base, STATUS, S_ACK | S_DRIVER | S_DRIVER_OK);
                 (region, region + (qs * 16) as u64, region + used_off as u64)
             };
@@ -215,16 +218,17 @@ impl VirtioBlkMmio {
             }
             wr8(self.req + STAT, 0xff);
 
+            // Descriptor `addr` fields are physical; CPU access stays on the VA.
             let d = |i: u64| self.q_desc + i * 16;
-            wr64(d(0), self.req + HDR);
+            wr64(d(0), dma(self.req + HDR));
             wr32(d(0) + 8, 16);
             wr16(d(0) + 12, VIRTQ_DESC_F_NEXT);
             wr16(d(0) + 14, 1);
-            wr64(d(1), self.req + DATA);
+            wr64(d(1), dma(self.req + DATA));
             wr32(d(1) + 8, BLOCK_SIZE as u32);
             wr16(d(1) + 12, VIRTQ_DESC_F_NEXT | if write { 0 } else { VIRTQ_DESC_F_WRITE });
             wr16(d(1) + 14, 2);
-            wr64(d(2), self.req + STAT);
+            wr64(d(2), dma(self.req + STAT));
             wr32(d(2) + 8, 1);
             wr16(d(2) + 12, VIRTQ_DESC_F_WRITE);
             wr16(d(2) + 14, 0);
