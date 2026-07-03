@@ -85,21 +85,24 @@ fn main() -> Status {
     }
 
     // Load the model to the fixed address the kernel reads, if bundled.
-    match fs.read(cstr16!("\\model.gguf.000")) {
+    let model_region: Option<(u64, u64)> = match fs.read(cstr16!("\\model.gguf.000")) {
         Ok(model) => {
             let dst = alloc_at(MODEL_ADDR, model.len());
             dst[..model.len()].copy_from_slice(&model);
             log::info!("chitti-stub: model {} bytes at {MODEL_ADDR:#x}", model.len());
+            Some((MODEL_ADDR, model.len() as u64))
         }
-        Err(_) => log::info!("chitti-stub: no model on ESP (kernel will report no model)"),
-    }
+        Err(_) => {
+            log::info!("chitti-stub: no model on ESP (kernel will report no model)");
+            None
+        }
+    };
 
     // Reserve the kernel's FIXED regions so UEFI hasn't parked runtime/ACPI data
     // where the `-kernel` layout puts them (the kernel hardcodes these, as it
     // does under QEMU `-kernel` where they're guaranteed free RAM): the 256 MiB
-    // heap at 0x80000000, and the model window at 0x48000000 (already backed if
-    // a model was loaded above). Marking them LOADER_DATA keeps them ours across
-    // ExitBootServices and stops UEFI reusing them.
+    // heap at 0x80000000. Marking it LOADER_DATA keeps it ours across
+    // ExitBootServices and stops UEFI reusing it.
     const HEAP_BASE: u64 = 0x8000_0000;
     const HEAP_PAGES: usize = 256 * 1024 * 1024 / 4096;
     match boot::allocate_pages(AllocateType::Address(HEAP_BASE), MemoryType::LOADER_DATA, HEAP_PAGES) {
@@ -107,12 +110,82 @@ fn main() -> Status {
         Err(e) => log::warn!("chitti-stub: could NOT reserve heap {HEAP_BASE:#x}: {e:?} (UEFI may collide)"),
     }
 
-    log::info!("chitti-stub: exiting boot services, jumping to kernel at {entry:#x} (MMU on)");
-    // SAFETY: we are done with boot services; the memory map is discarded (the
-    // kernel builds its own via mmu::init). MMU + caches stay on (UEFI identity
-    // map), so the loaded image is coherent when the kernel reads it.
+    // Hand off through a TRAMPOLINE in identity RAM. The kernel is an
+    // identity-map kernel that expects the QEMU `-kernel` entry state: EL1,
+    // MMU off, image coherent in RAM. We can't disable the MMU while executing
+    // the stub itself (its code is UEFI-mapped; the PC would fault), so we copy
+    // a tiny MMU-off-and-branch trampoline into a page of identity RAM (UEFI
+    // maps allocated RAM at VA == PA on the `virt` machine) and jump through
+    // it. After ExitBootServices we clean the D-cache for everything we wrote
+    // (kernel image, model, trampoline) so RAM is coherent once caches go off.
+    let tramp = alloc_at_any(4096);
+    let tsrc = trampoline as extern "C" fn(u64) -> ! as usize as *const u8;
+    // SAFETY: the trampoline fn is a short flat code sequence (< 128 bytes,
+    // ends in `br`); copying its bytes to RAM and executing them there is the
+    // whole point.
+    unsafe { core::ptr::copy_nonoverlapping(tsrc, tramp.as_mut_ptr(), 128) };
+    let tramp_pa = tramp.as_ptr() as u64;
+    log::info!("chitti-stub: exiting boot services; MMU-off handoff via trampoline {tramp_pa:#x} -> {entry:#x}");
+
+    // SAFETY: done with boot services; clean caches, then enter the trampoline
+    // (identity address, so it survives the MMU turning off) with x0 = entry.
     unsafe {
         let _ = boot::exit_boot_services(Some(MemoryType::LOADER_DATA));
-        core::arch::asm!("br {}", in(reg) entry, options(noreturn));
+        clean_dcache(min_pa, max_end);
+        if let Some((m, n)) = model_region {
+            clean_dcache(m, m + n);
+        }
+        clean_dcache(tramp_pa, tramp_pa + 128);
+        core::arch::asm!(
+            "ic iallu",
+            "dsb sy",
+            "isb",
+            "mov x0, {e}",
+            "br {t}",
+            e = in(reg) entry,
+            t = in(reg) tramp_pa,
+            options(noreturn),
+        );
     }
+}
+
+/// The MMU-off trampoline. Runs from identity RAM (copied there), so the PC
+/// stays valid across the MMU switch-off. x0 = kernel entry. Position-
+/// independent by construction (no loads, no branches except the final `br`).
+#[unsafe(naked)]
+extern "C" fn trampoline(_entry: u64) -> ! {
+    core::arch::naked_asm!(
+        "mrs x8, sctlr_el1",
+        "bic x8, x8, #1",      // M = 0 (MMU off)
+        "bic x8, x8, #4",      // C = 0 (data cache off)
+        "bic x8, x8, #4096",   // I = 0 (instruction cache off)
+        "msr sctlr_el1, x8",
+        "isb",
+        "tlbi vmalle1",
+        "dsb sy",
+        "isb",
+        "br x0",
+    )
+}
+
+/// Allocate one+ pages of identity RAM anywhere below 4 GiB.
+fn alloc_at_any(bytes: usize) -> &'static mut [u8] {
+    let pages = bytes.div_ceil(4096);
+    let ptr = boot::allocate_pages(AllocateType::MaxAddress(0xFFFF_F000), MemoryType::LOADER_DATA, pages)
+        .unwrap_or_else(|e| panic!("allocate_pages (any, {pages} pages) failed: {e:?}"));
+    // SAFETY: freshly allocated pages.
+    unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), pages * 4096) }
+}
+
+/// Clean the D-cache for `[start, end)` by VA (64-byte lines), so writes reach
+/// RAM before the trampoline disables caches.
+unsafe fn clean_dcache(start: u64, end: u64) {
+    let line = 64u64;
+    let mut a = start & !(line - 1);
+    while a < end {
+        // SAFETY: `dc cvac` on a mapped VA is safe.
+        unsafe { core::arch::asm!("dc cvac, {}", in(reg) a, options(nostack, preserves_flags)) };
+        a += line;
+    }
+    unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
 }

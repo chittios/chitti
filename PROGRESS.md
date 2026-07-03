@@ -306,3 +306,30 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   under QEMU TCG (the 17 MB kernel FAT write is cluster-by-cluster over polled virtio-blk) — the
   3-partition GPT layout, empty data format, standalone boot, and synapse persistence are each
   verified; at device speed (real HW / HVF) the combined flow runs normally.
+
+### U1-U4 — aarch64 UEFI boot SOLVED: Chitti stub bootloader + trampoline handoff  ✅
+- **Root causes of the long stall found:** (1) the identity `-kernel` build and the
+  `boot-limine` higher-half build share one artifact path, so test cycles kept
+  loading the WRONG kernel (several "failures" were invalid experiments); (2) the
+  Limine path forces an HHDM memory model our identity-map kernel was never built
+  for; (3) handing off on UEFI's page tables (MMU-on) was fragile, and disabling
+  the MMU *from stub code* faults the stub's own UEFI-mapped PC.
+- **The proper solution — `stub/`, a from-scratch UEFI bootloader:** AAVMF launches
+  `BOOTAA64.EFI` (our stub, `aarch64-unknown-uefi` + uefi-rs); it loads the normal
+  identity `-kernel` ELF + `model.gguf.000` off a **real FAT32 ESP image** (hdiutil-
+  built; no VVFAT cap, carries the 774 MiB model), reserves the kernel's fixed heap,
+  exits boot services, cleans the D-cache for everything written, then jumps through
+  a **trampoline copied into identity RAM** that disables the MMU + caches and
+  branches to the kernel entry — handing the kernel the **exact QEMU `-kernel`
+  state**. Zero kernel changes; the whole proven identity-map path (incl.
+  virtio-blk-mmio) runs as-is.
+- xtask: `run -arch aarch64 --uefi` now uses the stub path (identity kernel with an
+  entry-address guard against artifact mixups; ESP attached before the data disk so
+  `probe_disk` targets the data disk, never the boot ESP). The Limine run-path is
+  retired (kernel `boot-limine` feature remains, documented as superseded).
+- **Verified: 5 consecutive UEFI boots to the interactive shell** (3 harness + 2 via
+  `cargo xtask run -arch aarch64 -model qwen3.5-0.8b --uefi --disk 2G`), with the
+  model loaded by the stub and parsed correctly (`/info`: dim 1024, layers 24,
+  vocab 248320) and the 2 GiB data disk correctly probed. 103/103; all builds green.
+- Follow-on: aarch64 `/install` writes the stub+kernel+model ESP payload so
+  `--disk-only` boots the installed disk standalone (B2/B3).
