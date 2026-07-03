@@ -216,3 +216,35 @@ PFN path; (3) consider mapping virtio DMA through a dedicated identity region
 rather than the HHDM. Until then, `--uefi` is not shell-reliable; the default
 `-kernel` aarch64 path (and all features, incl. storage/persistence) is fully
 reliable.
+
+## Real-world drivers — status + the keyboard (xHCI) plan
+
+**Done + verified (on QEMU virt's GPEX PCIe, the standards-based bus real
+platforms use):**
+- **Display**: UEFI GOP framebuffer via the stub's boot-info page — works on
+  any UEFI platform (VirtualBox-ARM, UTM, real hardware).
+- **Disk**: ACPI (RSDP→MCFG→ECAM) discovery + `pci.rs` (ECAM enumeration, BAR
+  decode, virtio caps) + `virtio_pci.rs` (modern virtio-blk). `Disk` enum picks
+  PCIe first, virtio-mmio fallback. Format/read/write round-trip verified over
+  `virtio-blk-pci`.
+
+**Remaining: keyboard = USB xHCI + HID over PCIe.** On ARM there is no PS/2;
+real input is USB. The x86 `arch/x86_64/xhci.rs` (793 lines: controller reset,
+DCBAA/command/event rings, scratchpad, device slot + EP0, GET_DESCRIPTOR/
+SET_CONFIG enumeration, HID boot-protocol interrupt polling) is a working
+reference. Porting to aarch64 is a bounded, well-scoped effort now that the PCIe
+groundwork exists:
+1. Discovery: replace the x86 PCI-port scan with `pci::find` by class code
+   0x0C/0x03/0x30 (xHCI) — `pci.rs` already does ECAM config + BAR decode.
+2. DMA: replace `mm::alloc_dma` (x86 frame allocator, phys/virt via HHDM) with
+   `alloc_ident` + `dma_to_phys` (aarch64 identity), as the virtio drivers do.
+3. MMIO: the xHCI BAR is in the low PCI window (already Device-mapped); no
+   `map_mmio_page` needed.
+The ring/enumeration/HID core is arch-neutral and reused verbatim. Deferred as a
+dedicated task (a full USB host-controller port warrants its own verification
+pass with `-device qemu-xhci` + `-device usb-kbd` on the PCIe bus) rather than
+rushing it at the tail of this session.
+
+**Also platform-specific storage** (AHCI/NVMe) for hypervisors that expose SATA/
+NVMe instead of virtio — additive `BlockDevice` impls behind the same `Disk`
+enum, same PCIe discovery.
