@@ -56,45 +56,45 @@ pub mod framebuffer;
 // the wire-format request structs to audit. aarch64 boots directly via
 // `-M virt -kernel` (no Limine), so this whole block is x86-only.
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
 #[used]
 #[link_section = ".requests_start_marker"]
 static _REQUESTS_START: limine_protocol::RequestsStartMarker =
     limine_protocol::RequestsStartMarker::new();
 
 /// Base revision 3: stable across all Limine 5.x-12.x releases.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
 #[used]
 #[link_section = ".requests"]
 pub static BASE_REVISION: limine_protocol::BaseRevision = limine_protocol::BaseRevision::new(3);
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
 #[used]
 #[link_section = ".requests"]
 pub static FRAMEBUFFER_REQUEST: limine_protocol::FramebufferRequest =
     limine_protocol::FramebufferRequest::new();
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
 #[used]
 #[link_section = ".requests"]
 pub static MEMMAP_REQUEST: limine_protocol::MemmapRequest = limine_protocol::MemmapRequest::new();
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
 #[used]
 #[link_section = ".requests"]
 pub static HHDM_REQUEST: limine_protocol::HhdmRequest = limine_protocol::HhdmRequest::new();
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
 #[used]
 #[link_section = ".requests"]
 pub static MODULE_REQUEST: limine_protocol::ModuleRequest = limine_protocol::ModuleRequest::new();
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
 #[used]
 #[link_section = ".requests"]
 pub static SMP_REQUEST: limine_protocol::SmpRequest = limine_protocol::SmpRequest::new();
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
 #[used]
 #[link_section = ".requests_end_marker"]
 static _REQUESTS_END: limine_protocol::RequestsEndMarker =

@@ -3,8 +3,12 @@
 //! BSS, and calls the kernel entry (`crate::aarch64_start`). The linker script
 //! (`kernel/linker-aarch64.ld`) provides `__stack_top`/`__bss_start/end`.
 
+#[cfg(not(feature = "boot-limine"))]
 use core::arch::global_asm;
 
+// The `-kernel` boot stub is used only for the default (non-Limine) build; the
+// Limine build provides its own `limine_start` entry (arch::aarch64::limine).
+#[cfg(not(feature = "boot-limine"))]
 global_asm!(
     r#"
 .section .text.boot

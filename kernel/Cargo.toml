@@ -34,6 +34,14 @@ refcheck = []
 # 0.8B layout. Default (feature off) = the 0.8B model.
 model-9b = []
 
+# aarch64 only: build the kernel to boot via the Limine boot protocol
+# (BOOTAA64.EFI under UEFI/AAVMF) so it can boot from a disk's ESP, instead of
+# the default `-M virt -kernel` custom boot stub. Selects the Limine entry +
+# higher-half linker script (linker-aarch64-limine.ld, passed via RUSTFLAGS by
+# xtask) and reads memmap/framebuffer/model from Limine responses. The fast
+# `-kernel -accel hvf` dev path is the default (feature off).
+boot-limine = []
+
 [dependencies]
 font8x8 = { version = "0.3.1", default-features = false }
 

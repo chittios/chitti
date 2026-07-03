@@ -145,3 +145,42 @@ Answers: detect all 5 FSes read-only (no foreign writes); build-time model choic
   model, either (a) grow the ESP to FAT32 and put the model parts there as Limine modules (extend
   the FAT writer to FAT32), or (b) add an in-kernel ext4 *reader* so the running kernel pulls the
   model off the ext4 partition at runtime. Boot + the ext4 write driver are unaffected.
+
+## aarch64 UEFI/Limine boot-from-disk (Part B) — WIP, feature-gated
+
+**Context.** The dual-arch standing rule: a feature on one arch must exist on
+the other. Part A made the *storage + persistence* stack dual-arch (aarch64
+virtio-blk over virtio-mmio + de-gated fs/ext4/install/persistence — verified
+native: boot #2, e2fsck-clean). Part B is the remaining piece: booting an
+installed aarch64 disk *standalone* via firmware (no `-kernel`), the counterpart
+to x86 `--disk-only`.
+
+**Why it is large.** aarch64 today boots via a custom `-M virt -kernel` stub
+(EL1, MMU off, own identity map). Booting from a disk's ESP means AAVMF →
+Limine `BOOTAA64.EFI` → the kernel via the **Limine boot protocol** (MMU on,
+higher-half, memmap/framebuffer/modules from Limine) — a boot-protocol port of
+the working kernel, not a feature add.
+
+**Done (feature-gated behind `boot-limine`, default builds/tests untouched — 103/103,
+both default arches build):**
+- `linker-aarch64-limine.ld` (higher-half + `.requests`), `boot-limine` Cargo feature,
+  the `-kernel` stub gated off under it, Limine request statics opened to aarch64.
+- `limine_start` entry (main.rs): FP/SIMD, serial, heap from the Limine memmap,
+  sched, Limine-GOP framebuffer, storage bring-up, `run_os` — reuses the whole steady state.
+- `cortex::model_module` for boot-limine (Limine-module path; single-part zero-copy).
+- xtask: `build_kernel_aarch64_limine`, `aavmf_pflash_args` (edk2-aarch64), an aarch64
+  UEFI Limine ISO assembler, and `cargo xtask run -arch aarch64 --uefi|--disk-only`.
+
+**Where it stops.** AAVMF boots and launches Limine's `BOOTAA64.EFI`, but the
+Limine→kernel handoff isn't reaching the kernel's serial `boot ok` yet. Limine
+renders to the GOP framebuffer, not the PL011 serial, so its menu/errors are
+invisible on the serial log — the next step is pointing Limine at the serial
+console (to see whether it finds limine.conf/kernel) and confirming the kernel's
+PL011/heap access under Limine's page tables (Limine identity-maps the low 4 GiB,
+so MMIO *should* be reachable, but this needs on-target confirmation).
+
+**Follow-on plan.** (1) Configure Limine serial console in limine.conf to unblind
+the handoff. (2) Confirm/repair the kernel's early serial + heap under Limine.
+(3) B2: aarch64 `alloc_dma` from a Limine memmap region → multi-part + ext4 model
+load; de-gate `/install` to write the aarch64 ESP (BOOTAA64.EFI + limine.conf +
+kernel) + partitions. (4) B3: verify standalone disk boot + model-from-ext4.

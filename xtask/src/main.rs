@@ -210,6 +210,109 @@ fn build_kernel_aarch64(release: bool, features: &[&str]) -> Result<PathBuf, Str
 /// Boot the unified kernel built for aarch64 on `qemu-system-aarch64 -M virt`
 /// with `-accel hvf`, so it runs *natively* on this Apple Silicon host (no
 /// cross-arch emulation) with NEON. Serial to stdio (`-nographic`).
+/// Build the aarch64 kernel for the Limine boot protocol: the `boot-limine`
+/// feature + the higher-half linker script (passed via RUSTFLAGS, which
+/// replaces the config.toml `-kernel` link-arg for this target). Always release.
+fn build_kernel_aarch64_limine(features: &[&str]) -> Result<PathBuf, String> {
+    let kdir = kernel_dir();
+    let mut feats: Vec<&str> = features.to_vec();
+    feats.push("boot-limine");
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&kdir)
+        .env("RUSTFLAGS", "-Clink-arg=-Tlinker-aarch64-limine.ld")
+        .args(["build", "--release", "--target", "../targets/aarch64-chitti.json", "--features", &feats.join(",")]);
+    run(&mut cmd)?;
+    let elf = kdir.join("target/aarch64-chitti/release/chitti-kernel");
+    if !elf.exists() {
+        return Err(format!("aarch64 limine kernel not found at {}", elf.display()));
+    }
+    Ok(elf)
+}
+
+/// QEMU pflash args for AAVMF (aarch64 UEFI firmware) — the aarch64 analogue of
+/// `ovmf_pflash_args`. A per-run writable copy of the vars volume lives under
+/// `target/`.
+fn aavmf_pflash_args() -> Result<Vec<String>, String> {
+    let share = brew_prefix("qemu")?.join("share/qemu");
+    let code = share.join("edk2-aarch64-code.fd");
+    let vars_src = share.join("edk2-arm-vars.fd");
+    if !code.exists() || !vars_src.exists() {
+        return Err(format!("AAVMF firmware not found under {} (need edk2-aarch64-code.fd + edk2-arm-vars.fd)", share.display()));
+    }
+    let vars = repo_root().join("target/aavmf-vars.fd");
+    fs::copy(&vars_src, &vars).map_err(|e| format!("copying AAVMF vars: {e}"))?;
+    Ok(vec![
+        "-drive".into(),
+        format!("if=pflash,format=raw,readonly=on,file={}", code.display()),
+        "-drive".into(),
+        format!("if=pflash,format=raw,file={}", vars.display()),
+    ])
+}
+
+/// Assemble a UEFI-only (aarch64) Limine ISO: BOOTAA64.EFI + limine.conf + the
+/// kernel (+ the model as a Limine module if present and requested). Booted by
+/// AAVMF via El Torito UEFI. No BIOS stage (aarch64 has no legacy BIOS).
+fn assemble_aarch64_limine_iso(kernel_bin: &Path, model_rel: Option<&str>) -> Result<PathBuf, String> {
+    let root = repo_root();
+    let iso_root = root.join("target/iso_root_aa64");
+    if iso_root.exists() {
+        fs::remove_dir_all(&iso_root).map_err(|e| format!("removing {}: {e}", iso_root.display()))?;
+    }
+    fs::create_dir_all(iso_root.join("boot/limine")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(iso_root.join("EFI/BOOT")).map_err(|e| e.to_string())?;
+    fs::copy(kernel_bin, iso_root.join("boot/chitti-kernel")).map_err(|e| format!("copying kernel: {e}"))?;
+    fs::copy(root.join("kernel/limine.conf"), iso_root.join("boot/limine/limine.conf")).map_err(|e| format!("copying limine.conf: {e}"))?;
+    let share = limine_share_dir()?;
+    fs::copy(share.join("limine-uefi-cd.bin"), iso_root.join("boot/limine/limine-uefi-cd.bin")).map_err(|e| format!("copying limine-uefi-cd.bin: {e}"))?;
+    fs::copy(share.join("BOOTAA64.EFI"), iso_root.join("EFI/BOOT/BOOTAA64.EFI")).map_err(|e| format!("copying BOOTAA64.EFI: {e}"))?;
+    // Bundle the model as a single Limine module if present + requested (the
+    // 0.8B is one file; multi-part on aarch64 is a follow-on).
+    if let Some(rel) = model_rel {
+        let gguf = root.join(rel);
+        if gguf.exists() {
+            fs::copy(&gguf, iso_root.join("boot/model.gguf.000")).map_err(|e| format!("copying model: {e}"))?;
+            let conf_path = iso_root.join("boot/limine/limine.conf");
+            let mut conf = fs::read_to_string(&conf_path).map_err(|e| e.to_string())?;
+            conf.push_str("    module_path: boot():/boot/model.gguf.000\n");
+            fs::write(&conf_path, conf).map_err(|e| format!("declaring model module: {e}"))?;
+        }
+    }
+    let iso_path = root.join("target/chitti-aa64.iso");
+    run(Command::new("xorriso").args([
+        "-as", "mkisofs", "-R", "-r", "-J",
+        "--efi-boot", "boot/limine/limine-uefi-cd.bin",
+        "-efi-boot-part", "--efi-boot-image", "--protective-msdos-label",
+    ]).arg(&iso_root).arg("-o").arg(&iso_path))?;
+    Ok(iso_path)
+}
+
+/// Boot the aarch64 kernel via Limine + AAVMF (UEFI) — from a disk's ESP,
+/// exactly like a real machine. `--disk-only` boots the installed disk with no
+/// ISO; otherwise the Limine ISO (from which you run `/install`).
+fn cmd_run_aarch64_limine(model: Model, disk: Option<PathBuf>, disk_only: bool, no_model: bool) -> Result<(), String> {
+    let elf = build_kernel_aarch64_limine(model.features())?;
+    let mut qemu = Command::new("qemu-system-aarch64");
+    qemu.args(["-M", "virt", "-cpu", "host", "-accel", "hvf", "-m", model.qemu_mem()]);
+    for a in aavmf_pflash_args()? {
+        qemu.arg(a);
+    }
+    qemu.args(["-device", "ramfb", "-device", "virtio-keyboard-device", "-serial", "mon:stdio"]);
+    if !disk_only {
+        let model_rel = if no_model { None } else { Some(model.gguf_rel()) };
+        let iso = assemble_aarch64_limine_iso(&elf, model_rel)?;
+        qemu.arg("-cdrom").arg(&iso);
+        eprintln!("booting aarch64 via Limine/AAVMF from ISO (run `/install yes`, then --disk-only)");
+    } else {
+        eprintln!("booting aarch64 FROM DISK ONLY via Limine/AAVMF (no ISO)");
+    }
+    if let Some(d) = &disk {
+        qemu.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", d.display()));
+        qemu.args(["-device", "virtio-blk-device,drive=chittidisk"]);
+        eprintln!("  disk: {}", d.display());
+    }
+    run(&mut qemu)
+}
+
 fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_only: bool) -> Result<(), String> {
     // Native inference on aarch64 is only worthwhile optimized: debug NEON is
     // ~30x slower (no inlining of intrinsics, bounds/overflow checks in the hot
@@ -591,9 +694,14 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
     if arch == Arch::Aarch64 {
         let disk = match &disk_size {
             Some(s) => Some(ensure_disk_image(parse_size(s)?, fresh_disk)?),
-            None if fresh_disk => Some(ensure_disk_image(0, true)?),
+            None if fresh_disk || disk_only => Some(ensure_disk_image(0, true)?),
             None => None,
         };
+        // `--uefi` or `--disk-only` on aarch64 => the Limine/AAVMF boot path
+        // (boots from disk, no -kernel); otherwise the fast -kernel HVF path.
+        if uefi || disk_only {
+            return cmd_run_aarch64_limine(model, disk, disk_only, no_model);
+        }
         return cmd_run_aarch64(release, model, disk, disk_only);
     }
     // Disk size: default 4 MiB for a plain run (the SimpleFS boot-counter demo),
