@@ -12,6 +12,7 @@ pub mod paging;
 pub mod pic;
 pub mod pit;
 pub mod port;
+pub mod xhci;
 
 /// Halt the CPU until the next interrupt.
 #[inline]
