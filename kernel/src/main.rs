@@ -150,8 +150,12 @@ fn mount_persistent_store() {
         }
         let mut part = Partition::new(&mut dev, v.start_lba, v.sectors);
         if let Some(mut r) = Ext4Reader::open(&mut part) {
-            let has_model = r.list_root().iter().any(|(n, _, _)| n.contains(".gguf"));
-            if !has_model {
+            // The data partition is the ext4 that holds neither the model
+            // (*.gguf) nor the boot/OS files (kernel, limine.conf) — so agent
+            // state never lands on the model/OS partition even when the model
+            // is absent (e.g. a --no-model install).
+            let is_os_or_model = r.list_root().iter().any(|(n, _, _)| n.contains(".gguf") || n == "chitti-kernel" || n == "limine.conf");
+            if !is_os_or_model {
                 chosen = Some((v.start_lba, v.sectors));
                 break;
             }
