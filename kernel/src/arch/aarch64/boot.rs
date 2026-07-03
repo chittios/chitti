@@ -15,6 +15,19 @@ use core::arch::global_asm;
 #[no_mangle]
 pub static mut BOOT_X1: u64 = 0;
 
+/// The boot-info pointer the entry received in x1 (0 on the `-kernel` path).
+#[cfg(not(feature = "boot-limine"))]
+pub fn boot_x1() -> u64 {
+    // SAFETY: written once by `_start` before any Rust runs; read-only after.
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(BOOT_X1)) }
+}
+
+/// The Limine build has no `-kernel` boot-info page.
+#[cfg(feature = "boot-limine")]
+pub fn boot_x1() -> u64 {
+    0
+}
+
 // The `-kernel` boot stub is used only for the default (non-Limine) build; the
 // Limine build provides its own `limine_start` entry (arch::aarch64::limine).
 #[cfg(not(feature = "boot-limine"))]

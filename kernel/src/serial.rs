@@ -48,7 +48,12 @@ mod raw {
 
 #[cfg(target_arch = "aarch64")]
 mod raw {
-    pub fn init() {} // PL011 on QEMU virt needs no setup to transmit
+    /// Discover the PL011 base from ACPI SPCR (so we hit the right MMIO on a
+    /// platform whose map differs from QEMU `virt`); PL011 needs no further
+    /// setup to transmit. A no-op fallback keeps QEMU's 0x09000000 default.
+    pub fn init() {
+        crate::arch::aarch64::init_uart();
+    }
     pub fn write(byte: u8) {
         crate::arch::aarch64::uart_putb(byte);
     }

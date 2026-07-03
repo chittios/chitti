@@ -1,8 +1,10 @@
-//! Minimal ACPI table walking — just enough to discover the PCIe ECAM base
-//! from the **MCFG** table, so PCIe is found the real-world way (firmware
-//! tables) rather than a hardcoded per-machine address. The stub captures the
-//! RSDP from the UEFI configuration table and hands it to the kernel; from
-//! there: RSDP → XSDT → MCFG → ECAM base + bus range.
+//! Minimal ACPI table walking — just enough to discover, from firmware tables
+//! (not hardcoded per-machine addresses), the PCIe ECAM base (**MCFG**) and the
+//! console UART base (**SPCR**). The stub captures the RSDP from the UEFI
+//! configuration table and hands it to the kernel; from there: RSDP → XSDT →
+//! {MCFG, SPCR}. This is what lets aarch64 run on platforms whose device map
+//! differs from QEMU `virt` (e.g. VirtualBox puts the PL011 at 0xFFDDF000, not
+//! QEMU's 0x09000000).
 //!
 //! Read-only, no allocation, no interpreter — table headers + one field each.
 
@@ -28,29 +30,26 @@ pub struct EcamSegment {
     pub bus_end: u8,
 }
 
-/// Walk `rsdp` → XSDT → MCFG and return the first ECAM segment, if any. Every
-/// address here is identity-mapped physical (the caller ensures the map covers
-/// the tables, which live in low reserved RAM). `None` if no valid ACPI/MCFG.
-pub fn ecam_from_rsdp(rsdp: u64) -> Option<EcamSegment> {
+/// Find the ACPI table with 4-byte signature `sig` by walking `rsdp` → XSDT
+/// (or RSDT), returning a pointer to its header. Every address is identity-
+/// mapped physical (the caller ensures the map covers the tables, which live in
+/// low reserved RAM). `None` if no valid ACPI or no such table.
+fn find_table(rsdp: u64, sig: &[u8; 4]) -> Option<*const u8> {
     if rsdp == 0 {
         return None;
     }
     let r = rsdp as *const u8;
     // RSDP: "RSD PTR " signature; revision @15; XsdtAddress @24 (8 bytes).
-    let mut sig = [0u8; 8];
-    for (i, b) in sig.iter_mut().enumerate() {
+    let mut rsig = [0u8; 8];
+    for (i, b) in rsig.iter_mut().enumerate() {
         *b = unsafe { *r.add(i) };
     }
-    if &sig != b"RSD PTR " {
+    if &rsig != b"RSD PTR " {
         return None;
     }
     let revision = unsafe { *r.add(15) };
     // XSDT (rev>=2) preferred; else RSDT (32-bit entries).
-    let (table_ptr, entry_size) = if revision >= 2 {
-        (le64(r, 24), 8usize)
-    } else {
-        (le32(r, 16) as u64, 4usize)
-    };
+    let (table_ptr, entry_size) = if revision >= 2 { (le64(r, 24), 8usize) } else { (le32(r, 16) as u64, 4usize) };
     if table_ptr == 0 {
         return None;
     }
@@ -67,15 +66,41 @@ pub fn ecam_from_rsdp(rsdp: u64) -> Option<EcamSegment> {
         for (k, b) in s.iter_mut().enumerate() {
             *b = unsafe { *p.add(k) };
         }
-        if &s == b"MCFG" {
-            // MCFG: 44-byte header (incl. 8 reserved), then allocation entries
-            // of 16 bytes: base@0 (u64), segment@8 (u16), bus_start@10, bus_end@11.
-            let base = le64(p, 44);
-            let bus_start = unsafe { *p.add(44 + 10) };
-            let bus_end = unsafe { *p.add(44 + 11) };
-            let _ = le16(p, 44 + 8);
-            return Some(EcamSegment { base, bus_start, bus_end });
+        if &s == sig {
+            return Some(p);
         }
     }
     None
+}
+
+/// Walk `rsdp` → XSDT → MCFG and return the first ECAM segment, if any.
+pub fn ecam_from_rsdp(rsdp: u64) -> Option<EcamSegment> {
+    let p = find_table(rsdp, b"MCFG")?;
+    // MCFG: 44-byte header (incl. 8 reserved), then allocation entries of 16
+    // bytes: base@0 (u64), segment@8 (u16), bus_start@10, bus_end@11.
+    let base = le64(p, 44);
+    let bus_start = unsafe { *p.add(44 + 10) };
+    let bus_end = unsafe { *p.add(44 + 11) };
+    let _ = le16(p, 44 + 8);
+    Some(EcamSegment { base, bus_start, bus_end })
+}
+
+/// Walk `rsdp` → XSDT → **SPCR** (Serial Port Console Redirection) and return
+/// the console UART's `(base_address, interface_type)`. Interface type 0x03 is
+/// ARM PL011; 0x0e is ARM SBSA (PL011-compatible DR/FR layout). This is how the
+/// UART base is found on a platform whose map differs from QEMU `virt` (e.g.
+/// VirtualBox's PL011 at 0xFFDDF000). `None` if no SPCR or a non-MMIO address.
+pub fn uart_from_rsdp(rsdp: u64) -> Option<(u64, u8)> {
+    let p = find_table(rsdp, b"SPCR")?;
+    // SPCR: 36-byte header, then Interface Type @36 (1 byte), 3 reserved, then a
+    // 12-byte Generic Address Structure @40: AddressSpaceId@0 (0 = system
+    // memory), ..., Address@4 (8 bytes).
+    let iface = unsafe { *p.add(36) };
+    let addr_space = unsafe { *p.add(40) };
+    let base = le64(p, 44);
+    // Only a memory-mapped (addr_space 0) UART with a non-zero base is usable.
+    if addr_space != 0 || base == 0 {
+        return None;
+    }
+    Some((base, iface))
 }
