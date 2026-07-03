@@ -54,6 +54,9 @@ pub extern "C" fn _start() -> ! {
         chitti_kernel::smp::cpu_count()
     );
     disk_demo();
+    // Bring up a USB keyboard (xHCI + HID) if present, so a real USB keyboard
+    // drives the shell alongside PS/2. No-op without an xHCI controller.
+    chitti_kernel::arch::x86_64::xhci::init_global();
 
     match chitti_kernel::cortex::model_module() {
         Some(bytes) => {
