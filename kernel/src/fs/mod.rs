@@ -22,7 +22,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 pub mod detect;
-pub mod roread;
 
 const MAGIC: u32 = 0x0C_11_77_F5;
 /// SimpleFS superblock magic, exposed for `fs::detect` to identify our volumes.
