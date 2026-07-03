@@ -210,7 +210,7 @@ fn build_kernel_aarch64(release: bool, features: &[&str]) -> Result<PathBuf, Str
 /// Boot the unified kernel built for aarch64 on `qemu-system-aarch64 -M virt`
 /// with `-accel hvf`, so it runs *natively* on this Apple Silicon host (no
 /// cross-arch emulation) with NEON. Serial to stdio (`-nographic`).
-fn cmd_run_aarch64(release: bool, model: Model) -> Result<(), String> {
+fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_only: bool) -> Result<(), String> {
     // Native inference on aarch64 is only worthwhile optimized: debug NEON is
     // ~30x slower (no inlining of intrinsics, bounds/overflow checks in the hot
     // matvec loop). So this path defaults to a release build regardless of the
@@ -237,6 +237,14 @@ fn cmd_run_aarch64(release: bool, model: Model) -> Result<(), String> {
         "-device", "ramfb", "-device", "virtio-keyboard-device", "-serial", "mon:stdio", "-kernel",
     ]);
     qemu.arg(&elf);
+    // Attach a virtio-blk disk on the virtio-mmio bus (the aarch64 block driver
+    // scans that window) so /disks, /mkext4, /install, and synapse persistence
+    // work — the aarch64 counterpart to the x86 virtio-blk-pci drive.
+    if let Some(d) = &disk {
+        qemu.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", d.display()));
+        qemu.args(["-device", "virtio-blk-device,drive=chittidisk"]);
+        eprintln!("  disk: {} (virtio-blk over virtio-mmio)", d.display());
+    }
     // Place the GGUF in guest RAM at the model's load address (where the aarch64
     // `cortex::model_module` looks) -- the equivalent of the x86 Limine boot
     // module, so `infer` works natively.
@@ -581,10 +589,12 @@ fn qemu_base_cmd(iso: &Path) -> Command {
 /// qemu-system-x86_64 (TCG on this host).
 fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool, fresh_disk: bool, disk_size: Option<String>, no_model: bool) -> Result<(), String> {
     if arch == Arch::Aarch64 {
-        if disk_only {
-            return Err("--disk-only is x86-only: the block/virtio-blk stack (install, ext4, disk boot) is not available on aarch64".into());
-        }
-        return cmd_run_aarch64(release, model);
+        let disk = match &disk_size {
+            Some(s) => Some(ensure_disk_image(parse_size(s)?, fresh_disk)?),
+            None if fresh_disk => Some(ensure_disk_image(0, true)?),
+            None => None,
+        };
+        return cmd_run_aarch64(release, model, disk, disk_only);
     }
     // Disk size: default 4 MiB for a plain run (the SimpleFS boot-counter demo),
     // but an install needs room for the ESP + model + data partitions — pass e.g.

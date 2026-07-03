@@ -649,10 +649,9 @@ fn read_line(buf: &mut String) {
 
 // --- block-device / filesystem commands (x86 virtio-blk over PCI) ---------
 
-#[cfg(target_arch = "x86_64")]
 fn disk_list() {
-    use crate::block::{virtio::VirtioBlk, BlockDevice};
-    let Some(mut dev) = VirtioBlk::probe() else {
+    use crate::block::BlockDevice;
+    let Some(mut dev) = crate::block::probe_disk() else {
         serial_println!("disks> no block device (boot with a -drive)");
         return;
     };
@@ -675,12 +674,10 @@ fn disk_list() {
     serial_println!("  (/ls <n> to read a volume's root dir; foreign filesystems are read-only)");
 }
 
-#[cfg(target_arch = "x86_64")]
 fn disk_ls(arg: &str) {
-    use crate::block::virtio::VirtioBlk;
     use crate::fs::detect::FsType;
     let n: usize = arg.trim().parse().unwrap_or(0);
-    let Some(mut dev) = VirtioBlk::probe() else {
+    let Some(mut dev) = crate::block::probe_disk() else {
         serial_println!("ls> no block device");
         return;
     };
@@ -706,7 +703,7 @@ fn disk_ls(arg: &str) {
         FsType::SimpleFs => {
             // Mount over a partition view (start_lba may be non-zero — the OS
             // partition from /install), on a fresh device handle.
-            if let Some(mut dev2) = VirtioBlk::probe() {
+            if let Some(mut dev2) = crate::block::probe_disk() {
                 let part = crate::block::Partition::new(&mut dev2, v.start_lba, v.sectors);
                 match crate::fs::SimpleFs::mount(part).and_then(|mut fs| fs.list()) {
                     Ok(files) => {
@@ -728,15 +725,13 @@ fn disk_ls(arg: &str) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 fn disk_mkfs(arg: &str) {
-    use crate::block::virtio::VirtioBlk;
     if arg.trim() != "yes" {
         serial_println!("mkfs> DESTRUCTIVE: formats the whole disk with SimpleFS, erasing it.");
         serial_println!("mkfs> re-run as '/mkfs yes' to confirm.");
         return;
     }
-    let Some(dev) = VirtioBlk::probe() else {
+    let Some(dev) = crate::block::probe_disk() else {
         serial_println!("mkfs> no block device");
         return;
     };
@@ -744,19 +739,6 @@ fn disk_mkfs(arg: &str) {
         Ok(_) => serial_println!("mkfs> formatted the disk with SimpleFS."),
         Err(e) => serial_println!("mkfs> format failed: {:?}", e),
     }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn disk_list() {
-    serial_println!("disks> block-device support is x86-only (virtio-blk over PCI)");
-}
-#[cfg(not(target_arch = "x86_64"))]
-fn disk_ls(_arg: &str) {
-    serial_println!("ls> block-device support is x86-only");
-}
-#[cfg(not(target_arch = "x86_64"))]
-fn disk_mkfs(_arg: &str) {
-    serial_println!("mkfs> block-device support is x86-only");
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -852,16 +834,15 @@ fn disk_install(_arg: &str) {
     serial_println!("install> block-device support is x86-only");
 }
 
-#[cfg(target_arch = "x86_64")]
 fn disk_mkext4(arg: &str) {
-    use crate::block::{ext4::{Ext4Writer, FileSpec}, virtio::VirtioBlk};
+    use crate::block::ext4::{Ext4Writer, FileSpec};
     let a = arg.trim();
     if a != "yes" && a != "empty" {
         serial_println!("mkext4> DESTRUCTIVE: formats the whole disk as ext4, erasing it.");
         serial_println!("mkext4> re-run as '/mkext4 yes' (2 test files) or '/mkext4 empty' (0 files) to confirm.");
         return;
     }
-    let Some(mut dev) = VirtioBlk::probe() else {
+    let Some(mut dev) = crate::block::probe_disk() else {
         serial_println!("mkext4> no block device");
         return;
     };
@@ -885,15 +866,9 @@ fn disk_mkext4(arg: &str) {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn disk_mkext4(_arg: &str) {
-    serial_println!("mkext4> block-device support is x86-only");
-}
-
-#[cfg(target_arch = "x86_64")]
 fn disk_ext4read() {
-    use crate::block::{ext4_read::Ext4Reader, virtio::VirtioBlk};
-    let Some(mut dev) = VirtioBlk::probe() else {
+    use crate::block::ext4_read::Ext4Reader;
+    let Some(mut dev) = crate::block::probe_disk() else {
         serial_println!("ext4read> no block device");
         return;
     };
@@ -919,7 +894,3 @@ fn disk_ext4read() {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn disk_ext4read() {
-    serial_println!("ext4read> block-device support is x86-only");
-}

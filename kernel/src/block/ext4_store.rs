@@ -14,7 +14,7 @@
 
 use crate::block::ext4::{Ext4Writer, FileSpec};
 use crate::block::ext4_read::Ext4Reader;
-use crate::block::{virtio::VirtioBlk, Partition};
+use crate::block::{DiskDevice, Partition};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
@@ -64,7 +64,7 @@ fn key_decode(name: &str) -> String {
 }
 
 pub struct Ext4Store {
-    dev: VirtioBlk,
+    dev: DiskDevice,
     start: u64,
     count: u64,
     cache: BTreeMap<String, Vec<u8>>,
@@ -74,7 +74,7 @@ impl Ext4Store {
     /// Mount the ext4 data partition at `[start, start+count)` of `dev`, reading
     /// its existing root files into the cache. Returns `None` if the partition
     /// is not a readable ext4.
-    pub fn mount(mut dev: VirtioBlk, start: u64, count: u64) -> Option<Ext4Store> {
+    pub fn mount(mut dev: DiskDevice, start: u64, count: u64) -> Option<Ext4Store> {
         let mut cache = BTreeMap::new();
         {
             let mut part = Partition::new(&mut dev, start, count);
