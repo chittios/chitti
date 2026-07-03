@@ -462,3 +462,41 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   (USB-HID/xHCI) are all real, non-QEMU-specific transports** — Chitti is
   interactive on any UEFI + PCIe + USB platform. Remaining real-world breadth:
   AHCI/NVMe storage for hosts without virtio (additive `BlockDevice`s).
+
+### Real-world drivers (2/2 → storage): NVMe + AHCI over PCIe (aarch64)  ✅
+- Two device-specific storage controllers so Chitti installs/persists on
+  hypervisors and hardware that don't expose virtio-blk (VirtualBox default is
+  AHCI/SATA; most cloud/modern NVMe). Both attach to the same ACPI-ECAM PCIe bus
+  and present the same batched `BlockDevice` contract as the virtio drivers — so
+  `/disks`, `/mkfs`, `/mkext4`, `/install`, and synapse persistence all work over
+  them unchanged.
+- `arch/aarch64/nvme.rs`: NVMe over PCIe — `find_class(0x01,0x08,0x02)`, BAR0 regs
+  mapped live. Controller reset (CC.EN=0 → CSTS.RDY=0), admin SQ/CQ (AQA/ASQ/ACQ),
+  enable, Create IO CQ/SQ (0x05/0x01), Identify Namespace (NSZE/FLBAS/LBA format).
+  Submits 64-byte SQEs, rings the stride-scaled doorbell, polls 16-byte CQEs by
+  **phase bit at DWORD3 bit 16** (the bug that first made bringup silently fail:
+  the phase tag is bit 16, not bit 0 — CID occupies bits 15:0). PRP1/PRP2/PRP-list
+  for ≤64 KiB transfers.
+- `arch/aarch64/ahci.rs`: AHCI/SATA over PCIe — `find_class(0x01,0x06,0x01)`, ABAR
+  at BAR5. GHC.AE, first port with SSTS DET=3, stop→program CLB/FB→start (FRE then
+  ST), IDENTIFY (0xEC) for the 48-bit LBA count, H2D register FIS + single PRDT
+  entry to a bounce buffer, CI slot 0 issue + poll, READ/WRITE DMA EXT (0x25/0x35).
+- `disk.rs` `Disk` enum probe order is now **virtio-pci → NVMe → AHCI →
+  virtio-mmio**; a `dispatch!` macro forwards the `BlockDevice` methods. A platform
+  exposes one, so ordering just skips the absent.
+- **Verified on QEMU virt (UEFI/AAVMF, where ACPI+PCIe exist):**
+  - `-device nvme` → `pci 00:02.0 class=01/08/02` → `nvme: up (262144 LBAs x 512 B)`
+    → `/mkext4 yes` + `/ext4read` → hello.txt round-trips, big.bin 200000 B
+    **pattern match: true**.
+  - `-device ahci` + `-device ide-hd` → `pci 00:02.0 class=01/06/01` → `ahci: SATA
+    disk up, 262144 sectors` → same `/mkext4` + `/ext4read` → **pattern match: true**.
+  - Both drivers are discovered only when ACPI/PCIe is present (the UEFI-stub boot);
+    the native `-kernel` fast path has no ACPI so it still uses virtio-mmio — which
+    is fine, that path is the local dev harness, not a real deployment target.
+- Both arches build; 103/103. **Arch-parity note:** these live under `arch/aarch64`
+  because they extend aarch64's reach to *non-virtio* real platforms (its real-world
+  boot story). x86 already has full storage via its virtio-blk-pci path under
+  Limine; wiring the same NVMe/AHCI onto the x86 PCI stack is tracked as follow-on
+  **R7** (the driver cores are largely arch-neutral and could be shared like
+  `xhci.rs`). Storage functionality itself is present on both arches — no user-
+  visible capability diverges.
