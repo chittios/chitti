@@ -122,6 +122,10 @@ fn main() {
     let disk_only = rest.iter().any(|a| a == "--disk-only");
     let fresh_disk = rest.iter().any(|a| a == "--fresh-disk");
     let disk_size = flag_value(&rest, "--disk");
+    // `--no-model`: build the ISO with no model module, so `/install` writes only
+    // the kernel + config + an empty data partition (fast) — for exercising the
+    // install & boot-from-disk flow without the slow ~800 MiB model write.
+    let no_model = rest.iter().any(|a| a == "--no-model");
     let arch = match parse_arch(&rest) {
         Ok(a) => a,
         Err(e) => {
@@ -140,7 +144,7 @@ fn main() {
     let result = match cmd.as_str() {
         "build" => cmd_build(release, arch, model),
         "image" => image(release, model),
-        "run" => cmd_run(release, arch, model, uefi, disk_only, fresh_disk, disk_size),
+        "run" => cmd_run(release, arch, model, uefi, disk_only, fresh_disk, disk_size, no_model),
         "test" => cmd_test(),
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
         // boot the real model, run the acceptance checks, exit pass/fail.
@@ -163,9 +167,10 @@ fn usage() -> String {
     "usage: cargo xtask <build|image|run|test|ref-check> [-arch x86_64|aarch64] \
      [-model qwen3.5-0.8b|qwen3.5-9b] [--release] [--uefi]\n\
      run flags (x86_64): --disk <2G|1500M> size the virtio-blk disk for /install; \
-     --disk-only boot the installed disk via UEFI with no ISO; --fresh-disk wipe it first.\n\
-     install+boot test:  cargo xtask run --uefi --disk 2G   (type `/install yes`, then quit)\n\
-                         cargo xtask run --disk-only         (boots Chitti from the disk alone)"
+     --disk-only boot the installed disk via UEFI with no ISO; --fresh-disk wipe it first; \
+     --no-model install without the model (fast, skips the ~800 MiB write).\n\
+     install+boot test:  cargo xtask run --uefi --disk 2G [--no-model]  (type `/install yes`, then quit)\n\
+                         cargo xtask run --disk-only                    (boots Chitti from the disk alone)"
         .to_string()
 }
 
@@ -574,7 +579,7 @@ fn qemu_base_cmd(iso: &Path) -> Command {
 /// `cargo xtask run [-arch ...]`: boot the unified kernel. On aarch64 it runs
 /// natively via QEMU + HVF; on x86 it boots the Limine image under
 /// qemu-system-x86_64 (TCG on this host).
-fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool, fresh_disk: bool, disk_size: Option<String>) -> Result<(), String> {
+fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool, fresh_disk: bool, disk_size: Option<String>, no_model: bool) -> Result<(), String> {
     if arch == Arch::Aarch64 {
         if disk_only {
             return Err("--disk-only is x86-only: the block/virtio-blk stack (install, ext4, disk boot) is not available on aarch64".into());
@@ -614,7 +619,12 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
 
     // --- Boot the ISO (optionally under UEFI); run `/install` from here ----
     let bin = build_kernel_with(release, model.features())?;
-    let iso = assemble_image_with(&bin, model.gguf_rel())?;
+    let iso = if no_model {
+        eprintln!("--no-model: ISO has no model module -- `/install` writes kernel + config + an empty data partition (fast)");
+        assemble_image_opt(&bin, None)?
+    } else {
+        assemble_image_with(&bin, model.gguf_rel())?
+    };
     let mut cmd = qemu_base_cmd(&iso);
     if uefi {
         for arg in ovmf_pflash_args()? {
