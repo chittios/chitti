@@ -226,3 +226,12 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
 ## Storage/install run status: P1, P2 done + verified; P3 partitioning + SimpleFS install done +
 ## verified; standalone-boot ESP population is the honest remaining piece (REVISIT). Both arches
 ## build; 103/103 tests throughout.
+
+### ext4 write driver (E1/E2) — validated in Python, e2fsck-clean  ✅
+- `tools/mkext4_ref.py`: from-scratch ext2/4-family mkfs + file writer — multi-block-group
+  (superblock + sparse backups + GDT + per-group block/inode bitmaps + inode table + root dir),
+  block-mapped files (direct + single/double indirect). Verified with e2fsprogs: e2fsck -fn is
+  CLEAN on a 5-group 640 MiB image; a 300 MiB double-indirect file dumps byte-identical via debugfs;
+  small file + root dir list correctly. This is the validated spec for the no_std Rust port.
+- Remaining: E3 port to Rust (block/ext4.rs over BlockDevice), E4 minimal FAT ESP writer, E5 wire
+  /install (GPT + FAT ESP[Limine] + ext4[limine.conf+kernel+model]) + verify e2fsck + OVMF boot.
