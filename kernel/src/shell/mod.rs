@@ -790,7 +790,7 @@ fn disk_install(arg: &str) {
         serial_println!("install> GPT write failed: {:?}", e);
         return;
     }
-    serial_println!("install> GPT: ESP lba {}..{}, ext4 OS lba {}..{}", layout.esp_first, layout.esp_last, layout.os_first, layout.os_last);
+    serial_println!("install> GPT: ESP lba {}..{}, ext4 OS lba {}..{}, ext4 data lba {}..{}", layout.esp_first, layout.esp_last, layout.os_first, layout.os_last, layout.data_first, layout.data_last);
 
     // 2. FAT ESP: the Limine loader at /EFI/BOOT/BOOTX64.EFI, plus limine.conf
     //    + the kernel at the root, so the disk boots from FAT alone (UEFI
@@ -834,6 +834,16 @@ fn disk_install(arg: &str) {
         }
     }
     serial_println!("install> ext4 OS partition written: limine.conf + kernel + {} model part(s).", parts.len());
+    {
+        // Empty ext4 data partition for durable agent state (synapse::fs mounts
+        // it at boot, since it holds no *.gguf). No files yet.
+        let mut data = Partition::new(&mut dev, layout.data_first, layout.data_last - layout.data_first + 1);
+        if let Err(e) = Ext4Writer::format(&mut data, &[]) {
+            serial_println!("install> ext4 data partition format failed: {:?}", e);
+            return;
+        }
+    }
+    serial_println!("install> ext4 data partition (lba {}..{}) formatted for durable agent state.", layout.data_first, layout.data_last);
     serial_println!("install> DONE -- the disk now boots Chitti standalone via UEFI. Remove the ISO and reboot.");
 }
 
@@ -845,15 +855,23 @@ fn disk_install(_arg: &str) {
 #[cfg(target_arch = "x86_64")]
 fn disk_mkext4(arg: &str) {
     use crate::block::{ext4::{Ext4Writer, FileSpec}, virtio::VirtioBlk};
-    if arg.trim() != "yes" {
+    let a = arg.trim();
+    if a != "yes" && a != "empty" {
         serial_println!("mkext4> DESTRUCTIVE: formats the whole disk as ext4, erasing it.");
-        serial_println!("mkext4> re-run as '/mkext4 yes' to confirm.");
+        serial_println!("mkext4> re-run as '/mkext4 yes' (2 test files) or '/mkext4 empty' (0 files) to confirm.");
         return;
     }
     let Some(mut dev) = VirtioBlk::probe() else {
         serial_println!("mkext4> no block device");
         return;
     };
+    if a == "empty" {
+        match Ext4Writer::format(&mut dev, &[]) {
+            Ok(()) => serial_println!("mkext4> formatted an empty ext4 (0 files) -- the /install data-partition case."),
+            Err(e) => serial_println!("mkext4> empty ext4 format failed: {:?}", e),
+        }
+        return;
+    }
     // A small file + a ~200 KiB file (forces single-indirect blocks).
     let hello = b"hello from Chitti's from-scratch ext4 writer\n";
     let big: alloc::vec::Vec<u8> = (0..200_000u32).map(|i| ((i.wrapping_mul(7)) & 0xff) as u8).collect();

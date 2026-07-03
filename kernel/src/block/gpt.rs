@@ -28,6 +28,11 @@ pub struct Layout {
     pub esp_last: u64,
     pub os_first: u64,
     pub os_last: u64,
+    /// A separate ext4 *data* partition for durable agent state (synapse::fs).
+    /// Kept apart from the OS/model partition so the running kernel can rewrite
+    /// it freely without touching the model.
+    pub data_first: u64,
+    pub data_last: u64,
 }
 
 // --- CRC32 (IEEE 802.3, reflected) --------------------------------------
@@ -63,10 +68,15 @@ pub fn default_layout(total_sectors: u64) -> Option<Layout> {
     let esp_first = first_usable;
     let esp_last = esp_first + esp_sectors - 1;
     let os_first = esp_last + 1;
-    if os_first + 1 >= last_usable {
+    // Carve a 256 MiB ext4 data partition off the tail for durable agent state.
+    let data_sectors = 256 * 1024 * 1024 / BLOCK_SIZE as u64;
+    if os_first + data_sectors + 2 >= last_usable {
         return None;
     }
-    Some(Layout { esp_first, esp_last, os_first, os_last: last_usable })
+    let data_last = last_usable;
+    let data_first = data_last - data_sectors + 1;
+    let os_last = data_first - 1;
+    Some(Layout { esp_first, esp_last, os_first, os_last, data_first, data_last })
 }
 
 /// Write a protective MBR + primary and backup GPT describing `parts` to `dev`.
@@ -148,10 +158,11 @@ fn write_bytes<D: BlockDevice>(dev: &mut D, start_lba: u64, data: &[u8]) -> Resu
     Ok(())
 }
 
-/// Build the two standard partition specs (ESP + SimpleFS OS) from a layout.
-pub fn standard_parts(layout: &Layout) -> [PartitionSpec; 2] {
+/// Build the three standard partition specs (ESP + ext4 OS/model + ext4 data).
+pub fn standard_parts(layout: &Layout) -> [PartitionSpec; 3] {
     [
         PartitionSpec { type_guid: ESP_GUID, first_lba: layout.esp_first, last_lba: layout.esp_last, name: "EFI System" },
         PartitionSpec { type_guid: LINUX_GUID, first_lba: layout.os_first, last_lba: layout.os_last, name: "Chitti OS" },
+        PartitionSpec { type_guid: LINUX_GUID, first_lba: layout.data_first, last_lba: layout.data_last, name: "Chitti Data" },
     ]
 }

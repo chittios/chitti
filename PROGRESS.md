@@ -276,3 +276,33 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   (811,843,840 bytes)" and the model parsed correctly (24 layers, dim 1024, vocab 248320).
 - Net: the install loop is closed — `/install` writes the model to ext4 (e2fsck-clean), and the
   installed kernel reads it back off ext4 at runtime. Both arches build; 103/103 tests.
+
+### W1-W5 — durable agent state: synapse::fs persisted to ext4 across reboots  ✅
+- `block/ext4_store.rs`: an ext4-backed store for `synapse::fs` — an in-memory cache that
+  **persists on every mutation by rewriting a dedicated ext4 data partition** with the verified
+  `Ext4Writer` (mkfs + write-all) and reads it back with `Ext4Reader` on mount. Reuses the two
+  verified drivers, so each persisted image is e2fsck-clean by construction. This is
+  *rewrite-on-sync* (O(total) per write; fine for KB-scale agent state) — a true incremental RW
+  ext4 driver (live bitmap alloc/free, in-place dir edits) is a documented follow-on.
+- `synapse::fs` is now a pluggable backend: in-memory by default (tests + live ISO), swapped to the
+  ext4 store by `mount_ext4` on an installed system. Migrates any pre-mount writes into ext4.
+- `main::mount_persistent_store` auto-mounts at boot: picks an ext4 volume that holds no `*.gguf`
+  (never the model/OS partition), points synapse::fs at it, and runs a boot counter *through
+  synapse::fs* to prove the round-trip.
+- `/install` now lays down THREE partitions: FAT ESP + ext4 OS/model + a 256 MiB ext4 **data**
+  partition (formatted empty) for durable agent state.
+- **Two writer bugs fixed:** (1) synapse keys contain `/` (`sess/5/cmp/26`), illegal in an ext4
+  filename — the store percent-encodes `/`→`%2F` (and `%`→`%25`), reversibly, on write/mount.
+  (2) `Ext4Writer` only wrote the inode-table blocks that held a live inode but set groups
+  non-`INODE_UNINIT`, so e2fsck read stale bytes in the rest — now it zeroes the **whole** inode
+  table (all blocks, all groups), making a format robust to any prior disk content (the earlier
+  2-file tests passed only because the disk was `dd`-zeroed).
+- **Verified:** boot twice with the same ext4 data disk → boot #2 recovered **34 real agent files**
+  written at runtime (sessions, skills, memory, notes), the synapse.fs boot counter reached #2
+  ("survived a reboot"), and **e2fsck is fully clean** (all 5 passes) after the runtime writes;
+  on-disk names are `%2F`-encoded (legal) and their content round-trips; the empty (0-file)
+  data-partition format is e2fsck-clean too. Both arches build; 103/103 tests.
+- Known limit: a full model-bearing `/install` + standalone boot in one run is impractically slow
+  under QEMU TCG (the 17 MB kernel FAT write is cluster-by-cluster over polled virtio-blk) — the
+  3-partition GPT layout, empty data format, standalone boot, and synapse persistence are each
+  verified; at device speed (real HW / HVF) the combined flow runs normally.
