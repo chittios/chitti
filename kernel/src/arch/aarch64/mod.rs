@@ -10,6 +10,7 @@ pub mod boot;
 pub mod mmu;
 pub mod ramfb;
 pub mod smp;
+pub mod virtio_input;
 
 use core::arch::asm;
 

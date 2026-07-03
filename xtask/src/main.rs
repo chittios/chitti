@@ -214,7 +214,7 @@ fn cmd_run_aarch64(release: bool, model: Model) -> Result<(), String> {
     // Ctrl-A C for the monitor).
     qemu.args([
         "-M", "virt", "-cpu", "host", "-accel", "hvf", "-smp", "4", "-m", model.qemu_mem(),
-        "-device", "ramfb", "-serial", "mon:stdio", "-kernel",
+        "-device", "ramfb", "-device", "virtio-keyboard-device", "-serial", "mon:stdio", "-kernel",
     ]);
     qemu.arg(&elf);
     // Place the GGUF in guest RAM at the model's load address (where the aarch64
