@@ -111,6 +111,10 @@ fn main() {
     let cmd = args.next().unwrap_or_default();
     let rest: Vec<String> = args.collect();
     let release = rest.iter().any(|a| a == "--release");
+    // `--uefi`: boot the hybrid ISO through OVMF (UEFI firmware) instead of the
+    // default SeaBIOS, exercising the same UEFI/GOP framebuffer path a real
+    // machine uses (the BIOS path uses Limine's VBE setup instead).
+    let uefi = rest.iter().any(|a| a == "--uefi");
     let arch = match parse_arch(&rest) {
         Ok(a) => a,
         Err(e) => {
@@ -129,7 +133,7 @@ fn main() {
     let result = match cmd.as_str() {
         "build" => cmd_build(release, arch, model),
         "image" => image(release, model),
-        "run" => cmd_run(release, arch, model),
+        "run" => cmd_run(release, arch, model, uefi),
         "test" => cmd_test(),
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
         // boot the real model, run the acceptance checks, exit pass/fail.
@@ -496,7 +500,7 @@ fn qemu_base_cmd(iso: &Path) -> Command {
 /// `cargo xtask run [-arch ...]`: boot the unified kernel. On aarch64 it runs
 /// natively via QEMU + HVF; on x86 it boots the Limine image under
 /// qemu-system-x86_64 (TCG on this host).
-fn cmd_run(release: bool, arch: Arch, model: Model) -> Result<(), String> {
+fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool) -> Result<(), String> {
     if arch == Arch::Aarch64 {
         return cmd_run_aarch64(release, model);
     }
@@ -504,6 +508,12 @@ fn cmd_run(release: bool, arch: Arch, model: Model) -> Result<(), String> {
     let iso = assemble_image_with(&bin, model.gguf_rel())?;
     let disk = ensure_disk_image()?;
     let mut cmd = qemu_base_cmd(&iso);
+    if uefi {
+        for arg in ovmf_pflash_args()? {
+            cmd.arg(arg);
+        }
+        eprintln!("booting via UEFI (OVMF) -- the same GOP framebuffer path real hardware uses");
+    }
     cmd.args(["-serial", "stdio"]);
     cmd.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", disk.display()));
     cmd.args(["-device", "virtio-blk-pci,drive=chittidisk,disable-modern=on"]);
@@ -512,6 +522,27 @@ fn cmd_run(release: bool, arch: Arch, model: Model) -> Result<(), String> {
         .map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
     eprintln!("qemu exited: {status}");
     Ok(())
+}
+
+/// QEMU `-drive if=pflash` args to boot via OVMF (UEFI). The code volume is
+/// read-only; a per-run writable copy of the vars volume is placed under
+/// `target/`. Both come from QEMU's bundled edk2 firmware.
+fn ovmf_pflash_args() -> Result<Vec<String>, String> {
+    let share = brew_prefix("qemu")?.join("share/qemu");
+    let code = share.join("edk2-x86_64-code.fd");
+    let vars_src = share.join("edk2-i386-vars.fd");
+    if !code.exists() || !vars_src.exists() {
+        return Err(format!("OVMF firmware not found under {} (need edk2-x86_64-code.fd + edk2-i386-vars.fd)", share.display()));
+    }
+    // A fresh writable vars copy per invocation (UEFI writes boot vars).
+    let vars = repo_root().join("target/ovmf-vars.fd");
+    fs::copy(&vars_src, &vars).map_err(|e| format!("copying OVMF vars: {e}"))?;
+    Ok(vec![
+        "-drive".into(),
+        format!("if=pflash,format=raw,unit=0,readonly=on,file={}", code.display()),
+        "-drive".into(),
+        format!("if=pflash,format=raw,unit=1,file={}", vars.display()),
+    ])
 }
 
 /// Create `target/chitti-disk.img` (a 4 MiB raw disk) if it does not exist,
