@@ -87,3 +87,20 @@ Consequential ones flagged **REVISIT**.
   as distinct QEMU boot-module files needs xtask multi-module plumbing; the security path (sign →
   verify → tamper-reject → grant-subset → skill-agent-bound) is fully exercised against real signed
   packages either way. `InstallSource::BootModule{name}` is recorded so the provenance is faithful.
+
+## Storage / install run (over-day autonomous)
+
+Answers: detect all 5 FSes read-only (no foreign writes); build-time model choice
+(default 0.8B) as multi-part modules; full bootable install; ext4 as our OS FS.
+
+- **Bootable install uses a FAT32 ESP for boot (REVISIT ext4-write):** a from-scratch ext4
+  *writer* (mkfs + files + journal) is not correctly completable in one day. So `/install`
+  writes GPT + a FAT32 ESP carrying Limine + kernel + the multi-part model (boots standalone via
+  UEFI using only FAT32, which we can write correctly) and ALSO creates an ext4 OS/data
+  partition per Q4. ext4 gets detection + read-only (Q1); a full ext4 mkfs/writer is best-effort,
+  else the OS partition falls back to SimpleFS. Booting never depends on ext4. REVISIT: real ext4 write.
+- **Multi-part model reassembly copies into contiguous frames (`alloc_dma`), not the heap:** the
+  model dwarfs the 256 MiB kernel heap, so reassembly uses frame-allocator-backed contiguous
+  memory. Still costs the model size in RAM; a zero-copy segmented GGUF reader is a REVISIT.
+- **All block/FS/install work is x86** (ISO/Limine/UEFI + virtio-blk-PCI). aarch64 stays the
+  QEMU-native `-kernel` dev path (no ISO); aarch64 virtio-mmio-blk support is a follow-on.

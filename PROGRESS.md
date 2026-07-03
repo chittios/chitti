@@ -181,3 +181,14 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
 - Deviations (all in DECISIONS.md): externally-tagged enums for postcard; Ed25519 → SipHash keyed
   MAC (crate faults on bare metal); SMP sub-agent concurrency structured but sequential under TCG;
   sample packages signed in-kernel vs shipped as separate boot-module files.
+
+## Storage/install run
+
+### P1a — multi-part model in the ISO  ✅
+- `xtask`: `split_model_into_parts` streams the GGUF into `model.gguf.000/.001/...` (<=3 GiB each,
+  override CHITTI_MODEL_PART_MB), each declared as a Limine module; build-time model choice (default 0.8B).
+- kernel `cortex::model_module` (x86): collect all `model.gguf*` modules, sort by path; 1 part =
+  zero-copy slice; >1 part = reassemble into contiguous frames via `alloc_dma` (heap is only 256 MiB).
+  `limine_protocol::File` gained `path_str`/`path_contains`.
+- Verified: forced the 0.8B into 3 parts (300 MiB); boot reassembled 811,843,840 bytes and `/info`
+  parsed a valid GGUF (dim 1024, layers 24, vocab 248320). Single-ISO distribution, no separate disk.

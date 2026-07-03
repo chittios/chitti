@@ -443,12 +443,43 @@ pub fn run_acceptance() -> bool {
 /// tensor unit tests don't need it).
 #[cfg(target_arch = "x86_64")]
 pub fn model_module() -> Option<&'static [u8]> {
+    use alloc::vec::Vec;
     let response = crate::MODULE_REQUEST.response()?;
-    response
-        .modules()
-        .iter()
-        .find(|m| m.path_ends_with(".gguf"))
-        .map(|m| m.data())
+    // The model may be a single `.gguf` module, or split into multi-part
+    // modules `model.gguf.000`, `.001`, ... — the ISO9660 4 GiB per-file limit
+    // forces a large model to be split for single-ISO distribution. Collect
+    // every model part and order them by path.
+    let mut parts: Vec<&'static crate::limine_protocol::File> =
+        response.modules().iter().copied().filter(|m| m.path_contains(".gguf")).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    parts.sort_by_key(|m| m.path_str());
+    if parts.len() == 1 {
+        // Single module: zero-copy slice into module memory (the common 0.8B
+        // case, and any model that fit in one ISO file).
+        return Some(parts[0].data());
+    }
+    // Multi-part: reassemble into one contiguous region so the GGUF parser +
+    // zero-copy tensor slices see a single blob. The model is far larger than
+    // the linked-list kernel heap (256 MiB), so allocate contiguous physical
+    // frames via `alloc_dma` (backed by the frame allocator) and copy the parts
+    // in. Costs the model size again in RAM; a segmented reader would avoid the
+    // copy (REVISIT in DECISIONS.md). The 0.8B default stays single-part.
+    let total: usize = parts.iter().map(|m| m.data().len()).sum();
+    let (_phys, virt) = crate::mm::alloc_dma(total)?;
+    let dst = virt as *mut u8;
+    let mut off = 0usize;
+    for m in &parts {
+        let d = m.data();
+        // SAFETY: `dst` covers `total` contiguous bytes; each part copied once,
+        // disjointly, within bounds.
+        unsafe { core::ptr::copy_nonoverlapping(d.as_ptr(), dst.add(off), d.len()) };
+        off += d.len();
+    }
+    crate::ktrace::log_fmt(format_args!("cortex: reassembled model from {} parts ({} bytes) into contiguous frames", parts.len(), total));
+    // SAFETY: `virt` maps `total` contiguous, now-initialized bytes (HHDM).
+    Some(unsafe { core::slice::from_raw_parts(virt as *const u8, total) })
 }
 
 /// aarch64: the model is placed in RAM by QEMU's `-device loader` at a fixed
