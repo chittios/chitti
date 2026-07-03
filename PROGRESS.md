@@ -235,3 +235,15 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   small file + root dir list correctly. This is the validated spec for the no_std Rust port.
 - Remaining: E3 port to Rust (block/ext4.rs over BlockDevice), E4 minimal FAT ESP writer, E5 wire
   /install (GPT + FAT ESP[Limine] + ext4[limine.conf+kernel+model]) + verify e2fsck + OVMF boot.
+
+### E3 — ext4 write driver ported to no_std Rust  ✅ (e2fsck-clean in QEMU)
+- `block/ext4.rs`: `Ext4Writer::format(dev, files)` — the validated ext4 mkfs+writer, ported to
+  no_std over `BlockDevice`. Streams file data straight to device blocks (the model dwarfs the
+  heap); builds metadata (bitmaps, GDT, superblock+sparse backups) a block at a time. Multi-block-
+  group, block-mapped files (direct + single/double indirect).
+- New `/mkext4 [yes]` shell command (ext4 format + test files), parallel to `/mkfs`.
+- Verified in QEMU + host e2fsprogs: the KERNEL-written disk is `e2fsck -fn` CLEAN at both 96 MiB
+  (1 group) and 640 MiB (5 groups); `debugfs` reads hello.txt correctly and dumps the 200 KB
+  indirect-block big.bin byte-identical. 103/103 tests; both arches build.
+- Remaining: E4 minimal FAT ESP writer (BOOTX64.EFI) + E5 wire /install to GPT + FAT ESP(Limine) +
+  ext4(limine.conf+kernel+model) and verify standalone OVMF boot.
