@@ -8,7 +8,21 @@
 
 use crate::block::{BlockDevice, BlockError, BLOCK_SIZE};
 
-const SEC_PER_CLUS: u64 = 4; // 2 KiB clusters
+/// Pick the smallest sectors-per-cluster keeping the cluster count within
+/// FAT16's 4085..65525 range for `total` sectors — 2 KiB clusters for a small
+/// ESP, up to 32 KiB for a model-carrying (~1 GiB) one.
+fn pick_spc(total: u64) -> Option<u64> {
+    for spc in [4u64, 8, 16, 32, 64] {
+        let approx = (total - RESERVED - ROOT_DIR_SECTORS) / spc;
+        let fat_sectors = ((approx + 2) * 2).div_ceil(BLOCK_SIZE as u64);
+        let data_sectors = total - RESERVED - NUM_FATS * fat_sectors - ROOT_DIR_SECTORS;
+        let clusters = data_sectors / spc;
+        if (4085..65525).contains(&clusters) {
+            return Some(spc);
+        }
+    }
+    None
+}
 const RESERVED: u64 = 1;
 const NUM_FATS: u64 = 2;
 const ROOT_ENTRIES: u64 = 512;
@@ -24,6 +38,7 @@ pub struct FatWriter<'d, D: BlockDevice> {
     fat_sectors: u64,    // per FAT
     root_start: u64,     // sector of the fixed root directory
     data_start: u64,     // sector of cluster 2
+    spc: u64,            // sectors per cluster (chosen per volume size)
     next_free_clus: u16, // sequential allocator (fresh FS)
 }
 
@@ -32,14 +47,12 @@ impl<'d, D: BlockDevice> FatWriter<'d, D> {
     pub fn format(dev: &'d mut D) -> Result<FatWriter<'d, D>, BlockError> {
         let total = dev.block_count();
         // Iterate FAT size vs cluster count to a consistent solution.
-        let approx_clusters = (total - RESERVED - ROOT_DIR_SECTORS) / SEC_PER_CLUS;
-        let fat_sectors = ((approx_clusters + 2) * 2).div_ceil(BLOCK_SIZE as u64);
-        let data_sectors = total - RESERVED - NUM_FATS * fat_sectors - ROOT_DIR_SECTORS;
-        let clusters = data_sectors / SEC_PER_CLUS;
-        if !(4085..65525).contains(&clusters) {
-            // Outside the FAT16 cluster-count range for this geometry.
+        let Some(spc) = pick_spc(total) else {
+            // No cluster size puts this geometry in FAT16's range.
             return Err(BlockError::OutOfRange);
-        }
+        };
+        let approx_clusters = (total - RESERVED - ROOT_DIR_SECTORS) / spc;
+        let fat_sectors = ((approx_clusters + 2) * 2).div_ceil(BLOCK_SIZE as u64);
         let fat_start = RESERVED;
         let root_start = RESERVED + NUM_FATS * fat_sectors;
         let data_start = root_start + ROOT_DIR_SECTORS;
@@ -51,7 +64,7 @@ impl<'d, D: BlockDevice> FatWriter<'d, D> {
         bs[2] = 0x90; // jmp
         bs[3..11].copy_from_slice(b"MSWIN4.1");
         le16(&mut bs, 11, BLOCK_SIZE as u16); // bytes/sector
-        bs[13] = SEC_PER_CLUS as u8;
+        bs[13] = spc as u8;
         le16(&mut bs, 14, RESERVED as u16);
         bs[16] = NUM_FATS as u8;
         le16(&mut bs, 17, ROOT_ENTRIES as u16);
@@ -82,7 +95,7 @@ impl<'d, D: BlockDevice> FatWriter<'d, D> {
             dev.write_block(root_start + s, &zero)?;
         }
 
-        let mut w = FatWriter { dev, fat_start, fat_sectors, root_start, data_start, next_free_clus: 2 };
+        let mut w = FatWriter { dev, fat_start, fat_sectors, root_start, data_start, spc, next_free_clus: 2 };
         // FAT[0]=media|0xFF00, FAT[1]=EOC.
         w.set_fat(0, 0xfff8)?;
         w.set_fat(1, 0xffff)?;
@@ -105,7 +118,7 @@ impl<'d, D: BlockDevice> FatWriter<'d, D> {
     }
 
     fn cluster_sector(&self, clus: u16) -> u64 {
-        self.data_start + (clus as u64 - 2) * SEC_PER_CLUS
+        self.data_start + (clus as u64 - 2) * self.spc
     }
 
     /// Allocate a chain of `n` clusters, linking them in the FAT (last = EOC).
@@ -124,10 +137,10 @@ impl<'d, D: BlockDevice> FatWriter<'d, D> {
     fn write_clusters(&mut self, first_clus: u16, data: &[u8]) -> Result<(), BlockError> {
         let mut clus = first_clus;
         let mut off = 0usize;
-        let cluster_bytes = SEC_PER_CLUS as usize * BLOCK_SIZE;
+        let cluster_bytes = self.spc as usize * BLOCK_SIZE;
         while off < data.len() {
             let base = self.cluster_sector(clus);
-            for s in 0..SEC_PER_CLUS {
+            for s in 0..self.spc {
                 let mut buf = [0u8; BLOCK_SIZE];
                 let take = (data.len() - off).min(BLOCK_SIZE);
                 if take > 0 {
@@ -165,7 +178,7 @@ impl<'d, D: BlockDevice> FatWriter<'d, D> {
         // Initialize the directory cluster with "." and ".." entries.
         let base = self.cluster_sector(clus);
         let zero = [0u8; BLOCK_SIZE];
-        for s in 0..SEC_PER_CLUS {
+        for s in 0..self.spc {
             self.dev.write_block(base + s, &zero)?;
         }
         let mut first = [0u8; BLOCK_SIZE];
@@ -209,7 +222,7 @@ impl<'d, D: BlockDevice> FatWriter<'d, D> {
         let entries = make_entries(name, attr, first_clus, size);
         let base = self.cluster_sector(dir_clus);
         let mut slot = 0usize;
-        for s in 0..SEC_PER_CLUS {
+        for s in 0..self.spc {
             let mut buf = [0u8; BLOCK_SIZE];
             self.dev.read_block(base + s, &mut buf)?;
             let mut dirty = false;
@@ -232,7 +245,7 @@ impl<'d, D: BlockDevice> FatWriter<'d, D> {
 
     /// Write a file `name` (8.3) into the FAT root directory with `data`.
     pub fn write_root_file(&mut self, name: &str, data: &[u8]) -> Result<(), BlockError> {
-        let nclus = (data.len() as u64).div_ceil(SEC_PER_CLUS * BLOCK_SIZE as u64).max(1);
+        let nclus = (data.len() as u64).div_ceil(self.spc * BLOCK_SIZE as u64).max(1);
         let fclus = self.alloc_chain(nclus)?;
         self.write_clusters(fclus, data)?;
         self.add_root_entry(name, ATTR_ARCHIVE, fclus, data.len() as u32)
@@ -245,7 +258,7 @@ impl<'d, D: BlockDevice> FatWriter<'d, D> {
         // init BOOT dir cluster
         let base = self.cluster_sector(boot);
         let zero = [0u8; BLOCK_SIZE];
-        for s in 0..SEC_PER_CLUS {
+        for s in 0..self.spc {
             self.dev.write_block(base + s, &zero)?;
         }
         let mut firstblk = [0u8; BLOCK_SIZE];
@@ -254,7 +267,7 @@ impl<'d, D: BlockDevice> FatWriter<'d, D> {
         self.dev.write_block(base, &firstblk)?;
         self.add_dir_entry(efi, "BOOT", ATTR_DIR, boot, 0)?;
         // The file itself.
-        let nclus = (data.len() as u64).div_ceil(SEC_PER_CLUS * BLOCK_SIZE as u64).max(1);
+        let nclus = (data.len() as u64).div_ceil(self.spc * BLOCK_SIZE as u64).max(1);
         let fclus = self.alloc_chain(nclus)?;
         self.write_clusters(fclus, data)?;
         self.add_dir_entry(boot, name, ATTR_ARCHIVE, fclus, data.len() as u32)?;

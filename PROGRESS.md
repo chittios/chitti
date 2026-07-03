@@ -333,3 +333,27 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   vocab 248320) and the 2 GiB data disk correctly probed. 103/103; all builds green.
 - Follow-on: aarch64 `/install` writes the stub+kernel+model ESP payload so
   `--disk-only` boots the installed disk standalone (B2/B3).
+
+### V1-V5 — arch-parity audit + aarch64 `/install` (the last feature gap)  ✅
+- **Audit:** every `target_arch` gate reviewed. Agent layers (agent/session/skills/
+  tools/synapse/persona/fs) have ZERO gates. Remaining gates are legitimate
+  arch-specific drivers behind shared APIs (tensor SSE2/AVX2|NEON, context switch,
+  serial 16550|PL011, keyboard PS/2+xHCI|virtio-input, framebuffer GOP|ramfb,
+  virtio-blk PCI|MMIO, mm, SMP) or boot machinery. `/exit` = PSCI SYSTEM_OFF ✓.
+  The ONE feature gap: `/install` was x86-only.
+- **aarch64 `/install` built:** new `block/fat_read.rs` (FAT16/32 reader: VFAT LFN,
+  subdirectory walk, file read + `file_size`); `probe_disk_nth` on both drivers
+  behind the same facade; `FatWriter` clusters now adaptive (2-32 KiB, so a
+  model-carrying ~840 MiB ESP fits FAT16); `gpt::esp_data_parts` (ESP + ext4 data,
+  no OS partition — the stub reads everything off the ESP). The installer payload
+  (BOOTAA64.EFI + kernel) is read from the boot ESP; the model is sliced from RAM
+  (`model_module()` + the FAT dir-entry size) — it can't fit the 256 MiB heap.
+- **Verified:** aarch64 `--uefi` → `/install yes` completes end-to-end: payload
+  read (stub 49 KB + kernel 1 MB + model 774 MB), GPT written (ESP lba 34..1718809
+  + data), FAT ESP written incl. the model, ext4 data formatted → DONE. The
+  `--disk-only` standalone boot of the installed disk uses the same stub/ESP
+  mechanism as the verified `--uefi` boot (per the user, the long full-boot wait
+  was skipped; the firmware streams 774 MB off the ESP, which takes minutes).
+- Both arches build; 103/103 tests. Feature parity: every user-visible capability
+  (chat/inference, storage, /install, persistence, UEFI boot, framebuffer,
+  keyboard, SMP) now exists on both arches.

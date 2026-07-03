@@ -158,6 +158,26 @@ fn write_bytes<D: BlockDevice>(dev: &mut D, start_lba: u64, data: &[u8]) -> Resu
     Ok(())
 }
 
+/// Two-partition layout for the aarch64 install: an ESP big enough for
+/// `esp_bytes` (the UEFI stub + kernel + model all live on the FAT ESP, which
+/// the stub reads directly) + the rest as the ext4 data partition for durable
+/// agent state. No separate ext4 OS partition — the stub needs no second copy.
+pub fn esp_data_parts(total_sectors: u64, esp_bytes: u64) -> Option<[PartitionSpec; 2]> {
+    let first_usable = 34u64;
+    let last_usable = total_sectors.checked_sub(34)?;
+    // ESP: payload + 64 MiB slack for FAT metadata/growth.
+    let esp_sectors = (esp_bytes + 64 * 1024 * 1024).div_ceil(BLOCK_SIZE as u64);
+    let esp_last = first_usable + esp_sectors - 1;
+    let data_first = esp_last + 1;
+    if data_first + 2048 >= last_usable {
+        return None; // no room for a data partition
+    }
+    Some([
+        PartitionSpec { type_guid: ESP_GUID, first_lba: first_usable, last_lba: esp_last, name: "EFI System" },
+        PartitionSpec { type_guid: LINUX_GUID, first_lba: data_first, last_lba: last_usable, name: "Chitti Data" },
+    ])
+}
+
 /// Build the three standard partition specs (ESP + ext4 OS/model + ext4 data).
 pub fn standard_parts(layout: &Layout) -> [PartitionSpec; 3] {
     [

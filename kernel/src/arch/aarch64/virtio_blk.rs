@@ -118,13 +118,22 @@ pub struct VirtioBlkMmio {
 impl VirtioBlkMmio {
     /// Scan the virtio-mmio window for the first block device and bring it up.
     pub fn probe() -> Option<VirtioBlkMmio> {
+        Self::probe_nth(0)
+    }
+
+    /// Bring up the `n`-th (0-based, in ascending slot order) block device.
+    pub fn probe_nth(n: usize) -> Option<VirtioBlkMmio> {
+        let mut seen = 0usize;
         for slot in 0..MMIO_SLOTS {
             let b = MMIO_BASE + slot * MMIO_STRIDE;
             // SAFETY: scanning the fixed virtio-mmio window; 32-bit registers.
             unsafe {
                 let v = reg_read(b, VERSION);
                 if reg_read(b, MAGIC) == 0x7472_6976 && (v == 1 || v == 2) && reg_read(b, DEVICE_ID) == VIRTIO_ID_BLOCK {
-                    return Self::init(b, v);
+                    if seen == n {
+                        return Self::init(b, v);
+                    }
+                    seen += 1;
                 }
             }
         }
