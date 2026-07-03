@@ -273,7 +273,7 @@ fn print_help() {
     serial_println!("  /perf            end-to-end prefill/decode tok/s");
     serial_println!("  /info            CPU / memory / model / context / OS info");
     serial_println!("  /help            this list");
-    serial_println!("  /exit            power off");
+    serial_println!("  /exit            power off (or Ctrl+D on an empty line)");
 }
 
 /// `/info`: a system status panel — OS/build, arch + cores + SIMD, uptime,
@@ -606,6 +606,16 @@ fn read_line(buf: &mut String) {
             Some(b'\r') | Some(b'\n') => {
                 serial_println!("");
                 return;
+            }
+            // Ctrl+D (EOT): EOF-on-empty-line — power off, like typing /exit.
+            // On a non-empty line it's ignored (standard shell behaviour), so an
+            // accidental Ctrl+D mid-typing doesn't shut the system down.
+            Some(0x04) => {
+                if buf.is_empty() {
+                    serial_println!("^D");
+                    serial_println!("Chitti: EOF (Ctrl+D) -- powering off.");
+                    crate::arch::poweroff();
+                }
             }
             Some(0x7f) | Some(0x08) => {
                 if buf.pop().is_some() {
