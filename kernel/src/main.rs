@@ -188,8 +188,13 @@ pub extern "C" fn aarch64_start() -> ! {
         chitti_kernel::framebuffer::init_console_raw(addr, w, h, pitch);
         serial_println!("Chitti: framebuffer TUI up ({}x{}) -- console mirrored to the window", w, h);
         // Bring up a USB keyboard (xHCI + HID) if present — the real-hardware
-        // input path (no PS/2 on ARM); needs the PCIe bus from aarch64_pcie_init.
+        // input path; needs the PCIe bus from aarch64_pcie_init.
         chitti_kernel::arch::aarch64::xhci::init_global();
+        // A PL050 PS/2 keyboard (ARM dev boards / some hypervisors) — the ARM
+        // analogue of the x86 i8042. No-op where absent (e.g. QEMU `virt`).
+        if chitti_kernel::arch::aarch64::pl050::init() {
+            serial_println!("Chitti: PL050 PS/2 keyboard up -- type in the window");
+        }
         // Also wire the virtio-keyboard (QEMU `virt` window). Absent without one.
         if chitti_kernel::arch::aarch64::virtio_input::init() {
             serial_println!("Chitti: virtio-keyboard up -- type in the window or the serial terminal");

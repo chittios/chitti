@@ -5,9 +5,9 @@
 //! reaches the framebuffer because `serial::Serial` mirrors there; this module
 //! adds the input side and per-keystroke echo the shell's line editor needs.
 
-/// The next input byte from whichever console has one -- on x86, the PS/2
-/// keyboard first then serial; on aarch64 (QEMU `virt` has no PS/2 keyboard),
-/// serial only -- or `None` if none is available.
+/// The next input byte from whichever console has one -- x86: PS/2 keyboard →
+/// USB (xHCI/HID) → serial; aarch64: USB (xHCI/HID) → PL050 PS/2 → virtio-keyboard
+/// → PL011 serial -- or `None` if none is available.
 pub fn read_byte() -> Option<u8> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -19,9 +19,12 @@ pub fn read_byte() -> Option<u8> {
     #[cfg(target_arch = "aarch64")]
     {
         // A USB (xHCI/HID) keyboard — the real-hardware input path — first, then
-        // the virtio-keyboard (QEMU `virt` window), then the PL011 UART, so any
-        // of them drives the shell.
+        // a PL050 PS/2 keyboard (ARM dev boards / hypervisors that present one),
+        // then the virtio-keyboard (QEMU `virt` window), then the PL011 UART, so
+        // any of them drives the shell. (PL050 is the ARM analogue of the x86
+        // i8042 PS/2 keyboard, giving both arches a PS/2 input path.)
         crate::arch::aarch64::xhci::poll_key()
+            .or_else(crate::arch::aarch64::pl050::poll_key)
             .or_else(crate::arch::aarch64::virtio_input::read_byte)
             .or_else(crate::serial::read_byte)
     }

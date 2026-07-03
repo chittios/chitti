@@ -13,6 +13,7 @@ pub mod disk;
 pub mod exceptions;
 pub mod gic;
 pub mod nvme;
+pub mod pl050;
 pub mod ramfb;
 pub mod smp;
 pub mod virtio_blk;
