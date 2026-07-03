@@ -143,7 +143,13 @@ fn main() {
 
     let result = match cmd.as_str() {
         "build" => cmd_build(release, arch, model),
-        "image" => image(release, model),
+        // x86: the classic hybrid BIOS/UEFI ISO. aarch64: a raw GPT disk image
+        // (the ARM-world convention — dd/Etcher it to a USB drive, or attach it
+        // in UTM/QEMU/VirtualBox-ARM; it boots standalone via the UEFI stub).
+        "image" => match arch {
+            Arch::Aarch64 => image_aarch64(model),
+            Arch::X86_64 => image(release, model),
+        },
         "run" => cmd_run(release, arch, model, uefi, disk_only, fresh_disk, disk_size, no_model),
         "test" => cmd_test(),
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
@@ -668,6 +674,145 @@ fn assemble_image_opt(kernel_bin: &Path, model_rel: Option<&str>) -> Result<Path
     run(Command::new(limine_bin()?).arg("bios-install").arg(&iso_path))?;
 
     Ok(iso_path)
+}
+
+/// `cargo xtask image -arch aarch64`: build the **distributable aarch64 disk
+/// image** `target/chitti-aa64.img` — a GPT disk with a FAT32 ESP (the Chitti
+/// UEFI stub as BOOTAA64.EFI + the kernel + the model) and an ext4 data
+/// partition for durable agent state. This is the aarch64 counterpart of the
+/// x86 ISO: end users write it to a USB drive (dd / balenaEtcher) and boot any
+/// UEFI aarch64 machine, or attach it as the disk of a UTM/QEMU/VirtualBox-ARM
+/// VM. It boots standalone — it IS the installed disk.
+fn image_aarch64(model: Model) -> Result<(), String> {
+    let elf = build_kernel_aarch64(true, model.features())?;
+    assert_identity_kernel(&elf)?;
+    let stub = build_stub_aarch64()?;
+    let gguf = repo_root().join(model.gguf_rel());
+    let model_path = gguf.exists().then_some(gguf);
+    if model_path.is_none() {
+        eprintln!("note: {} absent -- building a model-less image", model.gguf_rel());
+    }
+
+    // Layout: GPT (34 + 33 reserved sectors) + ESP (payload + 64 MiB slack) +
+    // 256 MiB ext4 data partition.
+    let payload: u64 = fs::metadata(&elf).map(|m| m.len()).unwrap_or(0)
+        + fs::metadata(&stub).map(|m| m.len()).unwrap_or(0)
+        + model_path.as_ref().and_then(|p| fs::metadata(p).ok()).map(|m| m.len()).unwrap_or(0);
+    let esp_secs = (payload + 64 * 1024 * 1024).div_ceil(512);
+    let data_secs = 256 * 1024 * 1024 / 512u64;
+    let total_secs = 34 + esp_secs + data_secs + 34;
+    let esp = (34u64, 34 + esp_secs - 1);
+    let data = (esp.1 + 1, esp.1 + data_secs);
+
+    let img = repo_root().join("target/chitti-aa64.img");
+    let f = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&img).map_err(|e| e.to_string())?;
+    f.set_len(total_secs * 512).map_err(|e| e.to_string())?;
+    write_gpt_host(&f, total_secs, &[(ESP_GUID_H, esp.0, esp.1, "EFI System"), (LINUX_GUID_H, data.0, data.1, "Chitti Data")])?;
+    drop(f);
+
+    // Format + populate the two partitions via macOS hdiutil/diskutil (the GPT
+    // is parsed on attach, exposing slice devices s1/s2 owned by the user).
+    let mke2fs = brew_prefix("e2fsprogs").map(|p| p.join("sbin/mke2fs")).ok().filter(|p| p.exists())
+        .ok_or("mke2fs not found -- brew install e2fsprogs (needed to format the data partition)")?;
+    let script = format!(
+        r#"set -e
+DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "{img}" | head -1 | awk '{{print $1}}')
+newfs_msdos -F 32 -v CHITTI "${{DEV}}s1" > /dev/null
+diskutil mount "${{DEV}}s1" > /dev/null
+MNT=$(diskutil info "${{DEV}}s1" | awk -F': *' '/Mount Point/{{print $2}}')
+mkdir -p "$MNT/EFI/BOOT"
+cp "{stub}" "$MNT/EFI/BOOT/BOOTAA64.EFI"
+cp "{kernel}" "$MNT/chitti-kernel"
+{model_cp}
+diskutil unmount "${{DEV}}s1" > /dev/null
+"{mke2fs}" -F -q -t ext4 -b 4096 "${{DEV}}s2"
+hdiutil detach "$DEV" > /dev/null
+"#,
+        img = img.display(),
+        stub = stub.display(),
+        kernel = elf.display(),
+        mke2fs = mke2fs.display(),
+        model_cp = model_path.as_ref().map(|m| format!("cp \"{}\" \"$MNT/model.gguf.000\"", m.display())).unwrap_or_default(),
+    );
+    let status = Command::new("/bin/sh").arg("-c").arg(&script).status().map_err(|e| format!("populating image: {e}"))?;
+    if !status.success() {
+        return Err("aarch64 image build failed (hdiutil/newfs_msdos/mke2fs)".into());
+    }
+    println!("image: {} ({} MiB, GPT: ESP {}..{} + ext4 data)", img.display(), total_secs * 512 / (1024 * 1024), esp.0, esp.1);
+    println!("  write it to a USB drive (dd/balenaEtcher) or attach as a VM disk -- it boots standalone via UEFI.");
+    Ok(())
+}
+
+const ESP_GUID_H: [u8; 16] = [0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b];
+const LINUX_GUID_H: [u8; 16] = [0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4];
+
+/// Host-side GPT writer (a std port of the kernel's `block::gpt::write`):
+/// protective MBR + primary/backup headers + entry arrays, IEEE CRC32.
+fn write_gpt_host(f: &fs::File, total: u64, parts: &[([u8; 16], u64, u64, &str)]) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::FileExt;
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xffff_ffff;
+        for &b in data {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
+    }
+    let mut w = f;
+    let _ = w.seek(SeekFrom::Start(0));
+    // Protective MBR.
+    let mut mbr = [0u8; 512];
+    mbr[0x1be + 4] = 0xee;
+    mbr[0x1be + 8..0x1be + 12].copy_from_slice(&1u32.to_le_bytes());
+    mbr[0x1be + 12..0x1be + 16].copy_from_slice(&((total - 1).min(0xffff_ffff) as u32).to_le_bytes());
+    mbr[510] = 0x55;
+    mbr[511] = 0xaa;
+    w.write_all(&mbr).map_err(|e| e.to_string())?;
+    // Entry array.
+    let mut entries = vec![0u8; 128 * 128];
+    for (i, (guid, first, last, name)) in parts.iter().enumerate() {
+        let e = i * 128;
+        entries[e..e + 16].copy_from_slice(guid);
+        for b in 0..16 {
+            entries[e + 16 + b] = (0xa0 + i as u8).wrapping_add(b as u8);
+        }
+        entries[e + 32..e + 40].copy_from_slice(&first.to_le_bytes());
+        entries[e + 40..e + 48].copy_from_slice(&last.to_le_bytes());
+        for (k, c) in name.encode_utf16().take(36).enumerate() {
+            entries[e + 56 + k * 2..e + 58 + k * 2].copy_from_slice(&c.to_le_bytes());
+        }
+    }
+    let entries_crc = crc32(&entries);
+    let backup_hdr = total - 1;
+    let backup_entries = backup_hdr - 32;
+    f.write_all_at(&entries, 2 * 512).map_err(|e| e.to_string())?;
+    f.write_all_at(&entries, backup_entries * 512).map_err(|e| e.to_string())?;
+    // Headers.
+    let hdr = |my: u64, alt: u64, ent: u64| -> Vec<u8> {
+        let mut h = vec![0u8; 512];
+        h[0..8].copy_from_slice(b"EFI PART");
+        h[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        h[12..16].copy_from_slice(&92u32.to_le_bytes());
+        h[24..32].copy_from_slice(&my.to_le_bytes());
+        h[32..40].copy_from_slice(&alt.to_le_bytes());
+        h[40..48].copy_from_slice(&34u64.to_le_bytes());
+        h[48..56].copy_from_slice(&(total - 34).to_le_bytes());
+        h[56..72].copy_from_slice(b"CHITTI-OS-DISK01");
+        h[72..80].copy_from_slice(&ent.to_le_bytes());
+        h[80..84].copy_from_slice(&128u32.to_le_bytes());
+        h[84..88].copy_from_slice(&128u32.to_le_bytes());
+        h[88..92].copy_from_slice(&entries_crc.to_le_bytes());
+        let hc = crc32(&h[0..92]);
+        h[16..20].copy_from_slice(&hc.to_le_bytes());
+        h
+    };
+    f.write_all_at(&hdr(1, backup_hdr, 2), 512).map_err(|e| e.to_string())?;
+    f.write_all_at(&hdr(backup_hdr, 1, backup_entries), backup_hdr * 512).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn image(release: bool, model: Model) -> Result<(), String> {
