@@ -115,6 +115,13 @@ fn main() {
     // default SeaBIOS, exercising the same UEFI/GOP framebuffer path a real
     // machine uses (the BIOS path uses Limine's VBE setup instead).
     let uefi = rest.iter().any(|a| a == "--uefi");
+    // `--disk-only`: boot the installed disk via OVMF with NO ISO attached — the
+    // real "boot from disk" path after `/install` (implies UEFI). `--disk <SIZE>`
+    // (e.g. `2G`, `1500M`) sizes target/chitti-disk.img so it can hold the ESP +
+    // model + data partitions; `--fresh-disk` wipes it first.
+    let disk_only = rest.iter().any(|a| a == "--disk-only");
+    let fresh_disk = rest.iter().any(|a| a == "--fresh-disk");
+    let disk_size = flag_value(&rest, "--disk");
     let arch = match parse_arch(&rest) {
         Ok(a) => a,
         Err(e) => {
@@ -133,7 +140,7 @@ fn main() {
     let result = match cmd.as_str() {
         "build" => cmd_build(release, arch, model),
         "image" => image(release, model),
-        "run" => cmd_run(release, arch, model, uefi),
+        "run" => cmd_run(release, arch, model, uefi, disk_only, fresh_disk, disk_size),
         "test" => cmd_test(),
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
         // boot the real model, run the acceptance checks, exit pass/fail.
@@ -154,7 +161,11 @@ fn main() {
 
 fn usage() -> String {
     "usage: cargo xtask <build|image|run|test|ref-check> [-arch x86_64|aarch64] \
-     [-model qwen3.5-0.8b|qwen3.5-9b] [--release]"
+     [-model qwen3.5-0.8b|qwen3.5-9b] [--release] [--uefi]\n\
+     run flags (x86_64): --disk <2G|1500M> size the virtio-blk disk for /install; \
+     --disk-only boot the installed disk via UEFI with no ISO; --fresh-disk wipe it first.\n\
+     install+boot test:  cargo xtask run --uefi --disk 2G   (type `/install yes`, then quit)\n\
+                         cargo xtask run --disk-only         (boots Chitti from the disk alone)"
         .to_string()
 }
 
@@ -563,13 +574,47 @@ fn qemu_base_cmd(iso: &Path) -> Command {
 /// `cargo xtask run [-arch ...]`: boot the unified kernel. On aarch64 it runs
 /// natively via QEMU + HVF; on x86 it boots the Limine image under
 /// qemu-system-x86_64 (TCG on this host).
-fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool) -> Result<(), String> {
+fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool, fresh_disk: bool, disk_size: Option<String>) -> Result<(), String> {
     if arch == Arch::Aarch64 {
+        if disk_only {
+            return Err("--disk-only is x86-only: the block/virtio-blk stack (install, ext4, disk boot) is not available on aarch64".into());
+        }
         return cmd_run_aarch64(release, model);
     }
+    // Disk size: default 4 MiB for a plain run (the SimpleFS boot-counter demo),
+    // but an install needs room for the ESP + model + data partitions — pass e.g.
+    // `--disk 2G`. `--disk-only` boots whatever is already installed.
+    let want_bytes = match &disk_size {
+        Some(s) => parse_size(s)?,
+        None if disk_only => 0, // keep the existing installed disk as-is
+        None => 4 * 1024 * 1024,
+    };
+    let disk = ensure_disk_image(want_bytes, fresh_disk)?;
+
+    // --- Boot from the installed disk only (no ISO) ------------------------
+    if disk_only {
+        let mut cmd = Command::new("qemu-system-x86_64");
+        // No -cdrom: UEFI finds the bootloader on the installed ESP. More RAM so
+        // the ~800 MiB model read off ext4 into contiguous frames has headroom.
+        cmd.args(["-M", "q35", "-cpu", "max", "-m", "3G", "-no-reboot"]);
+        cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+        for arg in ovmf_pflash_args()? {
+            cmd.arg(arg);
+        }
+        cmd.args(["-serial", "stdio"]);
+        cmd.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", disk.display()));
+        cmd.args(["-device", "virtio-blk-pci,drive=chittidisk,disable-modern=on"]);
+        cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
+        eprintln!("booting FROM DISK ONLY via UEFI (OVMF) -- no ISO; the installed Chitti boots itself");
+        eprintln!("  disk: {}", disk.display());
+        let status = cmd.status().map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
+        eprintln!("qemu exited: {status}");
+        return Ok(());
+    }
+
+    // --- Boot the ISO (optionally under UEFI); run `/install` from here ----
     let bin = build_kernel_with(release, model.features())?;
     let iso = assemble_image_with(&bin, model.gguf_rel())?;
-    let disk = ensure_disk_image()?;
     let mut cmd = qemu_base_cmd(&iso);
     if uefi {
         for arg in ovmf_pflash_args()? {
@@ -583,11 +628,31 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool) -> Result<(), St
     // A USB keyboard on an xHCI controller, so the xhci/HID driver drives the
     // shell (as a real USB keyboard would); PS/2 also still works.
     cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
+    if disk_size.is_some() {
+        eprintln!("  disk: {} ({}) -- run `/install yes` at the shell, then reboot with `--disk-only`", disk.display(), disk_size.as_deref().unwrap_or(""));
+    }
     let status = cmd
         .status()
         .map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
     eprintln!("qemu exited: {status}");
     Ok(())
+}
+
+/// Value of a `--flag <value>` option in `args`, if present.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
+}
+
+/// Parse a disk size like `2G`, `1500M`, `800000000` into bytes.
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (num, mult) = match s.chars().last() {
+        Some('G') | Some('g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        Some('M') | Some('m') => (&s[..s.len() - 1], 1024 * 1024),
+        Some('K') | Some('k') => (&s[..s.len() - 1], 1024),
+        _ => (s, 1),
+    };
+    num.trim().parse::<u64>().map(|n| n * mult).map_err(|_| format!("bad --disk size {s:?} (use e.g. 2G, 1500M)"))
 }
 
 /// QEMU `-drive if=pflash` args to boot via OVMF (UEFI). The code volume is
@@ -611,15 +676,24 @@ fn ovmf_pflash_args() -> Result<Vec<String>, String> {
     ])
 }
 
-/// Create `target/chitti-disk.img` (a 4 MiB raw disk) if it does not exist,
-/// so the virtio-blk device has a backing file. Kept across runs so the
-/// SimpleFS boot counter persists.
-fn ensure_disk_image() -> Result<PathBuf, String> {
+/// Ensure `target/chitti-disk.img` exists and is at least `want_bytes` (a sparse
+/// raw disk backing the virtio-blk device). Kept across runs so an install — and
+/// the SimpleFS/synapse persistence — survives a reboot. Grown (never shrunk) if
+/// the existing image is smaller than requested; `fresh` wipes it first.
+fn ensure_disk_image(want_bytes: u64, fresh: bool) -> Result<PathBuf, String> {
     let path = repo_root().join("target/chitti-disk.img");
-    if !path.exists() {
-        let zeros = vec![0u8; 4 * 1024 * 1024];
-        std::fs::write(&path, &zeros).map_err(|e| format!("failed to create disk image: {e}"))?;
-        eprintln!("created fresh 4 MiB disk image at {}", path.display());
+    if fresh && path.exists() {
+        fs::remove_file(&path).map_err(|e| format!("removing disk image: {e}"))?;
+        eprintln!("--fresh-disk: wiped {}", path.display());
+    }
+    let cur = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let want = if want_bytes == 0 { cur.max(4 * 1024 * 1024) } else { want_bytes };
+    if !path.exists() || cur < want {
+        // Sparse allocation: set the length without writing `want` bytes of zeros
+        // (a multi-GiB disk would otherwise take real space + time).
+        let f = fs::OpenOptions::new().create(true).write(true).open(&path).map_err(|e| format!("creating disk image: {e}"))?;
+        f.set_len(want).map_err(|e| format!("sizing disk image: {e}"))?;
+        eprintln!("disk image {} sized to {} MiB (sparse)", path.display(), want / (1024 * 1024));
     }
     Ok(path)
 }
