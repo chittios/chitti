@@ -139,10 +139,14 @@ fn disk_demo() {
     };
     serial_println!("Chitti: disk> virtio-blk found: {} sectors", dev.block_count());
 
-    let mut fs = match SimpleFs::mount_or_format(dev, 64) {
+    // Mount ONLY -- never auto-format. A blank or foreign disk is left
+    // untouched and reported; formatting is an explicit user action (`/install`
+    // or `/mkfs`), like a real OS installer.
+    let mut fs = match SimpleFs::mount(dev) {
         Ok(fs) => fs,
-        Err(e) => {
-            serial_println!("Chitti: disk> filesystem error: {:?}", e);
+        Err(_) => {
+            serial_println!("Chitti: disk> present but not a Chitti (SimpleFS) volume -- NOT auto-formatting.");
+            serial_println!("Chitti: disk> use /install (bootable install) or /mkfs to set it up.");
             return;
         }
     };
@@ -162,7 +166,7 @@ fn disk_demo() {
             if prior > 0 {
                 serial_println!("Chitti: disk> (the counter survived a reboot -- durable storage works)");
             } else {
-                serial_println!("Chitti: disk> (formatted a fresh disk; run again to see the counter increment)");
+                serial_println!("Chitti: disk> (first boot on this Chitti disk; run again to see the counter increment)");
             }
         }
         Err(e) => serial_println!("Chitti: disk> write failed: {:?}", e),

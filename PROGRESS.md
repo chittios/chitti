@@ -192,3 +192,8 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   `limine_protocol::File` gained `path_str`/`path_contains`.
 - Verified: forced the 0.8B into 3 parts (300 MiB); boot reassembled 811,843,840 bytes and `/info`
   parsed a valid GGUF (dim 1024, layers 24, vocab 248320). Single-ISO distribution, no separate disk.
+
+### P1b — no auto-format at boot  ✅
+- `disk_demo` now mounts SimpleFS ONLY (never `mount_or_format`); a blank/foreign disk is reported
+  and left untouched ("NOT auto-formatting; use /install or /mkfs"). Verified: booting a zeroed
+  virtio-blk disk leaves it all-zero. 103/103 tests.
