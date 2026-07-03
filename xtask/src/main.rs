@@ -716,7 +716,9 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
     if arch == Arch::Aarch64 {
         let disk = match &disk_size {
             Some(s) => Some(ensure_disk_image(parse_size(s)?, fresh_disk)?),
-            None if fresh_disk || disk_only => Some(ensure_disk_image(0, true)?),
+            // --disk-only with no size: keep the existing (installed) disk
+            // AS-IS — wipe only if --fresh-disk was explicitly passed.
+            None if fresh_disk || disk_only => Some(ensure_disk_image(0, fresh_disk)?),
             None => None,
         };
         // `--uefi` or `--disk-only` on aarch64 => firmware boot via the Chitti
