@@ -145,7 +145,33 @@ static CONSOLE: Locked<Option<Console>> = Locked::new(None);
 /// Bring up the framebuffer console on `fb` and clear the screen. Called once
 /// at boot, after which `serial` output mirrors here automatically.
 pub fn init_console(fb: &Framebuffer) {
-    let console = Console::from_fb(fb);
+    init_console_from(Console::from_fb(fb));
+}
+
+/// Initialize the console over a raw linear framebuffer, for arches that don't
+/// get one from Limine. The aarch64 `ramfb` driver
+/// (`arch::aarch64::ramfb`) calls this with an `XRGB8888` buffer it configured
+/// via fw_cfg — same `Console` renderer, different framebuffer source.
+pub fn init_console_raw(addr: usize, width: u64, height: u64, pitch: u64) {
+    // XRGB8888: little-endian byte order B,G,R,X → shifts red 16 / green 8 / blue 0.
+    let console = Console {
+        addr,
+        width,
+        height,
+        pitch,
+        bpp_bytes: 4,
+        r_shift: 16,
+        g_shift: 8,
+        b_shift: 0,
+        cols: width / GLYPH,
+        rows: height / GLYPH,
+        col: 0,
+        row: 0,
+    };
+    init_console_from(console);
+}
+
+fn init_console_from(console: Console) {
     // Clear to the background colour.
     for y in 0..console.height {
         for x in 0..console.width {

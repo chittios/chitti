@@ -106,6 +106,13 @@ pub extern "C" fn aarch64_start() -> ! {
     chitti_kernel::serial::init();
     serial_println!("{} -- NATIVE aarch64 on Apple Silicon (QEMU + HVF)", BOOT_MSG);
     chitti_kernel::init();
+    // Bring up the ramfb framebuffer TUI — the aarch64 equivalent of the x86
+    // Limine framebuffer. Needs the heap (from `init()`), so it comes after.
+    // Absent if QEMU was launched without `-device ramfb`; then we stay serial.
+    if let Some((addr, w, h, pitch)) = unsafe { chitti_kernel::arch::aarch64::ramfb::init() } {
+        chitti_kernel::framebuffer::init_console_raw(addr, w, h, pitch);
+        serial_println!("Chitti: framebuffer TUI up ({}x{} ramfb) -- console mirrored to the window", w, h);
+    }
     run_os();
 }
 

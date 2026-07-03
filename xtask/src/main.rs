@@ -206,7 +206,16 @@ fn cmd_run_aarch64(release: bool, model: Model) -> Result<(), String> {
     // four *native* M-series cores in parallel (unlike TCG, where extra vCPUs
     // only contend). Chitti's aarch64 SMP brings the secondaries up via PSCI
     // and splits the hot matvec across them.
-    qemu.args(["-M", "virt", "-cpu", "host", "-accel", "hvf", "-smp", "4", "-m", model.qemu_mem(), "-nographic", "-kernel"]);
+    // `-device ramfb`: a simple linear framebuffer the kernel configures via
+    // fw_cfg (arch::aarch64::ramfb) and renders the TUI into — the aarch64
+    // equivalent of the x86 Limine framebuffer. Dropping `-nographic` lets QEMU
+    // open its display window; `-serial mon:stdio` keeps the serial console (and
+    // QEMU monitor) on stdio so you still type at the terminal (Ctrl-A X quits,
+    // Ctrl-A C for the monitor).
+    qemu.args([
+        "-M", "virt", "-cpu", "host", "-accel", "hvf", "-smp", "4", "-m", model.qemu_mem(),
+        "-device", "ramfb", "-serial", "mon:stdio", "-kernel",
+    ]);
     qemu.arg(&elf);
     // Place the GGUF in guest RAM at the model's load address (where the aarch64
     // `cortex::model_module` looks) -- the equivalent of the x86 Limine boot
