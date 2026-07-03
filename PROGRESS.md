@@ -247,3 +247,16 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   indirect-block big.bin byte-identical. 103/103 tests; both arches build.
 - Remaining: E4 minimal FAT ESP writer (BOOTX64.EFI) + E5 wire /install to GPT + FAT ESP(Limine) +
   ext4(limine.conf+kernel+model) and verify standalone OVMF boot.
+
+### E4/E5 — FAT ESP writer + standalone bootable install  ✅ (boot verified)
+- `block/fat.rs`: minimal FAT16 writer + VFAT LFN (so limine.conf/chitti-kernel keep full names).
+- `/install`: GPT (block/gpt) -> FAT ESP (BOOTX64.EFI + limine.conf + kernel) -> ext4 OS partition
+  (block/ext4: limine.conf + kernel + model parts). xtask bundles BOOTX64.EFI + kernel as payload modules.
+- Verified: installed 256 MiB disk -> e2fsck-clean ext4 + fsck_msdos-clean FAT (LFN names correct);
+  booted STANDALONE under OVMF (no ISO) to "Chitti: boot ok".
+- Finding: Limine can't read our minimal ext4 (kernel therefore boots from the FAT ESP, standard);
+  loading the model on the installed system is a documented REVISIT (FAT32 model partition, or an
+  in-kernel ext4 reader).
+
+## ext4-primary run status: ext4 WRITE driver done + e2fsck-verified; standalone UEFI boot done +
+## verified; model-on-installed-system is the remaining follow-on. Both arches build; 103/103 tests.
