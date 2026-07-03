@@ -128,3 +128,20 @@ Answers: detect all 5 FSes read-only (no foreign writes); build-time model choic
   via debugfs. Reference: `tools/mkext4_ref.py`.
 - **All ext4 install files live in the ext4 root** (limine.conf, kernel, model.gguf.NNN) so the
   Rust port needs no subdirectory creation; only the FAT ESP needs one path (`/EFI/BOOT/`).
+
+### ext4-primary + standalone boot — findings (E4/E5)
+- **The from-scratch ext4 write driver is done + verified** (e2fsck-clean, multi-group, byte-exact
+  files) — the explicit request. It is the OS/data filesystem written by `/install`.
+- **Standalone UEFI boot works**, verified: install to a blank disk, then boot it under OVMF with
+  no ISO → "Chitti: boot ok". Chain: OVMF → FAT ESP → Limine (BOOTX64.EFI) → limine.conf + kernel.
+- **Limine cannot boot from our ext4** (config-on-ext4-only did not boot, though e2fsck accepts the
+  FS): Limine's ext2/3/4 reader is stricter than e2fsck about features/layout. So kernel + limine.conf
+  live on the **FAT ESP** (a standard layout — bootloader + kernel on the ESP, ext4 as root/OS).
+  `block/fat.rs` gained VFAT LFN support so `limine.conf`/`chitti-kernel` keep their real names
+  (8.3 truncation had silently broken Limine's lookup — the root cause of the first boot failure).
+- **REVISIT (model on the installed system):** `/install` also writes the model to ext4, but the
+  installed kernel loads the model via Limine modules from the boot volume — and Limine can't read
+  our ext4, and the FAT16 ESP is too small for the model. To make the installed system load the
+  model, either (a) grow the ESP to FAT32 and put the model parts there as Limine modules (extend
+  the FAT writer to FAT32), or (b) add an in-kernel ext4 *reader* so the running kernel pulls the
+  model off the ext4 partition at runtime. Boot + the ext4 write driver are unaffected.
