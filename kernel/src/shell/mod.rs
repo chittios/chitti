@@ -247,6 +247,7 @@ pub fn run() -> ! {
                 "mkfs" => disk_mkfs(arg),
                 "install" => disk_install(arg),
                 "mkext4" => disk_mkext4(arg),
+                "ext4read" => disk_ext4read(),
                 other => serial_println!("unknown command '/{}' -- try /help", other),
             }
             continue;
@@ -869,4 +870,38 @@ fn disk_mkext4(arg: &str) {
 #[cfg(not(target_arch = "x86_64"))]
 fn disk_mkext4(_arg: &str) {
     serial_println!("mkext4> block-device support is x86-only");
+}
+
+#[cfg(target_arch = "x86_64")]
+fn disk_ext4read() {
+    use crate::block::{ext4_read::Ext4Reader, virtio::VirtioBlk};
+    let Some(mut dev) = VirtioBlk::probe() else {
+        serial_println!("ext4read> no block device");
+        return;
+    };
+    let Some(mut r) = Ext4Reader::open(&mut dev) else {
+        serial_println!("ext4read> not an ext filesystem at LBA 0 (try /mkext4 yes first)");
+        return;
+    };
+    serial_println!("ext4read> block_size={}", r.block_size);
+    for (name, ino, is_dir) in r.list_root() {
+        serial_println!("  {}{}  (inode {})", name, if is_dir { "/" } else { "" }, ino);
+    }
+    // Verify hello.txt round-trips.
+    let mut buf = [0u8; 128];
+    if let Some(n) = r.read_root_file("hello.txt", &mut buf) {
+        serial_println!("ext4read> hello.txt ({} B): {}", n, core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+    // Verify big.bin (200000 B) byte-for-byte against the /mkext4 pattern.
+    if let Some(sz) = r.file_size("big.bin") {
+        let mut big = alloc::vec![0u8; sz as usize];
+        let n = r.read_root_file("big.bin", &mut big).unwrap_or(0);
+        let ok = n == 200_000 && big.iter().enumerate().all(|(i, &b)| b == ((i as u32).wrapping_mul(7) & 0xff) as u8);
+        serial_println!("ext4read> big.bin {} B, pattern match: {}", n, ok);
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn disk_ext4read() {
+    serial_println!("ext4read> block-device support is x86-only");
 }

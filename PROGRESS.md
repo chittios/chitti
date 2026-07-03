@@ -260,3 +260,19 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
 
 ## ext4-primary run status: ext4 WRITE driver done + e2fsck-verified; standalone UEFI boot done +
 ## verified; model-on-installed-system is the remaining follow-on. Both arches build; 103/103 tests.
+
+### R1-R4 — in-kernel ext4 READER + model-from-ext4 at runtime  ✅
+- `block/ext4_read.rs`: read-only ext4/ext2 reader — superblock, block-group descriptors, inodes,
+  root directory, and file data via BOTH block maps (12 direct + single/double indirect — our
+  writer's output) and extent trees (real mke2fs ext4). Streams a block at a time into a caller
+  buffer (no second full-size copy).
+- `cortex::model_module` fallback (`model_from_ext4`): when no Limine model module is present (an
+  installed system booted from the FAT ESP, kernel-only), find the ext4 OS partition, read every
+  `*.gguf*` root file in order into contiguous frames (alloc_dma), and return the blob. New
+  `/ext4read` command for verification.
+- Verified in QEMU: (R2) `/ext4read` reads back our writer's hello.txt + a 200 KB indirect-block
+  big.bin byte-identical, AND reads a real `mke2fs` ext4 (extents) the same way; (R4) booting a
+  model-LESS ISO + an ext4 disk holding the real 0.8B model → "loaded model from ext4 partition
+  (811,843,840 bytes)" and the model parsed correctly (24 layers, dim 1024, vocab 248320).
+- Net: the install loop is closed — `/install` writes the model to ext4 (e2fsck-clean), and the
+  installed kernel reads it back off ext4 at runtime. Both arches build; 103/103 tests.
