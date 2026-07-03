@@ -103,6 +103,11 @@ unsafe fn rd16(a: u64) -> u16 {
     unsafe { read_volatile(a as *const u16) }
 }
 
+/// Max bytes per request: one polled round trip moves up to this much data
+/// (vs one 512 B sector), which is what makes large writes (the model in
+/// `/install`) take seconds instead of minutes.
+const DATA_MAX: usize = 64 * 1024;
+
 /// A polled virtio-mmio block device.
 pub struct VirtioBlkMmio {
     base: usize,
@@ -111,7 +116,8 @@ pub struct VirtioBlkMmio {
     q_desc: u64,
     q_avail: u64,
     q_used: u64,
-    req: u64, // request scratch page (VA==PA)
+    req: u64,      // request header/status scratch page
+    data_buf: u64, // DATA_MAX-byte bounce buffer for multi-sector IO
     avail_idx: u16,
 }
 
@@ -142,6 +148,7 @@ impl VirtioBlkMmio {
 
     fn init(base: usize, version: u32) -> Option<VirtioBlkMmio> {
         let req = alloc_ident(4096);
+        let data_buf = alloc_ident(DATA_MAX);
         // SAFETY: `base` is a confirmed virtio-blk MMIO block; single-core boot.
         unsafe {
             reg_write(base, STATUS, 0);
@@ -200,15 +207,16 @@ impl VirtioBlkMmio {
                 "virtio-blk-mmio: up at {base:#x} (v{version}), {capacity} sectors ({} MiB), q{qsize}",
                 capacity * 512 / (1024 * 1024)
             ));
-            Some(VirtioBlkMmio { base, capacity, qsize, q_desc: desc, q_avail: avail, q_used: used, req, avail_idx: 0 })
+            Some(VirtioBlkMmio { base, capacity, qsize, q_desc: desc, q_avail: avail, q_used: used, req, data_buf, avail_idx: 0 })
         }
     }
 
-    /// Issue one polled sector request. `buf` is 512 bytes.
-    fn request(&mut self, write: bool, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+    /// Issue one polled request moving `len` bytes (<= DATA_MAX, a BLOCK_SIZE
+    /// multiple) at `sector`, through the bounce buffer. `ptr` is the caller's
+    /// buffer: read from it on a write, written to on a read.
+    fn request(&mut self, write: bool, sector: u64, ptr: *mut u8, len: usize) -> Result<(), BlockError> {
         const HDR: u64 = 0;
         const STAT: u64 = 16;
-        const DATA: u64 = 512;
         // SAFETY: all addresses lie within the queue/request DMA regions from
         // `init`; the 3-descriptor chain follows the virtio-blk spec.
         unsafe {
@@ -216,7 +224,7 @@ impl VirtioBlkMmio {
             wr32(self.req + HDR + 4, 0);
             wr64(self.req + HDR + 8, sector);
             if write {
-                core::ptr::copy_nonoverlapping(buf.as_ptr(), (self.req + DATA) as *mut u8, BLOCK_SIZE);
+                core::ptr::copy_nonoverlapping(ptr as *const u8, self.data_buf as *mut u8, len);
             }
             wr8(self.req + STAT, 0xff);
 
@@ -226,8 +234,8 @@ impl VirtioBlkMmio {
             wr32(d(0) + 8, 16);
             wr16(d(0) + 12, VIRTQ_DESC_F_NEXT);
             wr16(d(0) + 14, 1);
-            wr64(d(1), dma(self.req + DATA));
-            wr32(d(1) + 8, BLOCK_SIZE as u32);
+            wr64(d(1), dma(self.data_buf));
+            wr32(d(1) + 8, len as u32);
             wr16(d(1) + 12, VIRTQ_DESC_F_NEXT | if write { 0 } else { VIRTQ_DESC_F_WRITE });
             wr16(d(1) + 14, 2);
             wr64(d(2), dma(self.req + STAT));
@@ -256,7 +264,7 @@ impl VirtioBlkMmio {
                 return Err(BlockError::DeviceError);
             }
             if !write {
-                core::ptr::copy_nonoverlapping((self.req + DATA) as *const u8, buf.as_mut_ptr(), BLOCK_SIZE);
+                core::ptr::copy_nonoverlapping(self.data_buf as *const u8, ptr, len);
             }
         }
         Ok(())
@@ -274,7 +282,7 @@ impl BlockDevice for VirtioBlkMmio {
         if index >= self.capacity {
             return Err(BlockError::OutOfRange);
         }
-        self.request(false, index, buf)
+        self.request(false, index, buf.as_mut_ptr(), BLOCK_SIZE)
     }
     fn write_block(&mut self, index: u64, buf: &[u8]) -> Result<(), BlockError> {
         if buf.len() != BLOCK_SIZE {
@@ -283,8 +291,39 @@ impl BlockDevice for VirtioBlkMmio {
         if index >= self.capacity {
             return Err(BlockError::OutOfRange);
         }
-        let mut tmp = [0u8; BLOCK_SIZE];
-        tmp.copy_from_slice(buf);
-        self.request(true, index, &mut tmp)
+        self.request(true, index, buf.as_ptr() as *mut u8, BLOCK_SIZE)
+    }
+    // Batched IO: one polled request per DATA_MAX chunk instead of per sector.
+    fn read_blocks(&mut self, index: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        if buf.len() % BLOCK_SIZE != 0 {
+            return Err(BlockError::BadBufferLen);
+        }
+        if index + (buf.len() / BLOCK_SIZE) as u64 > self.capacity {
+            return Err(BlockError::OutOfRange);
+        }
+        let mut off = 0usize;
+        while off < buf.len() {
+            let take = (buf.len() - off).min(DATA_MAX);
+            let sector = index + (off / BLOCK_SIZE) as u64;
+            self.request(false, sector, buf[off..].as_mut_ptr(), take)?;
+            off += take;
+        }
+        Ok(())
+    }
+    fn write_blocks(&mut self, index: u64, buf: &[u8]) -> Result<(), BlockError> {
+        if buf.len() % BLOCK_SIZE != 0 {
+            return Err(BlockError::BadBufferLen);
+        }
+        if index + (buf.len() / BLOCK_SIZE) as u64 > self.capacity {
+            return Err(BlockError::OutOfRange);
+        }
+        let mut off = 0usize;
+        while off < buf.len() {
+            let take = (buf.len() - off).min(DATA_MAX);
+            let sector = index + (off / BLOCK_SIZE) as u64;
+            self.request(true, sector, buf[off..].as_ptr() as *mut u8, take)?;
+            off += take;
+        }
+        Ok(())
     }
 }

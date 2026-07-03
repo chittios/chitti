@@ -357,3 +357,19 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
 - Both arches build; 103/103 tests. Feature parity: every user-visible capability
   (chat/inference, storage, /install, persistence, UEFI boot, framebuffer,
   keyboard, SMP) now exists on both arches.
+
+### Batched block IO — `/install` model write: minutes → 5 seconds  ✅
+- The slowness was per-sector polled virtio: 1 request per 512 B meant ~1.6M
+  round trips for the 774 MiB model, plus ~100K FAT read-modify-writes for the
+  ~24K cluster allocations.
+- `BlockDevice` gained `read_blocks`/`write_blocks` (default per-sector loop;
+  `Partition` forwards). **Both** virtio drivers (x86 PCI + aarch64 MMIO, per the
+  parity rule) now move up to 64 KiB per polled request through a DMA bounce
+  buffer. Hot paths batched: FAT `write_clusters` writes whole contiguous runs;
+  `alloc_chain` builds the FAT a sector at a time (256x fewer IOs); ext4
+  `write_eblock`/`stream_file` write 4 KiB blocks / contiguous multi-block runs;
+  `ext4_read` reads whole fs-blocks per request.
+- **Verified:** the full aarch64 `--uefi` `/install yes` (774 MiB model) now
+  completes in **~5 s** (was minutes); the installed FAT ESP is fsck_msdos-clean,
+  the ext4 data partition e2fsck-clean, and the model file on the installed disk
+  is **sha256-identical** to the source. 103/103; both arches build.

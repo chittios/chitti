@@ -88,10 +88,7 @@ struct InodeRec {
 
 impl<'d, D: BlockDevice> Ext4Writer<'d, D> {
     fn write_eblock(&mut self, eblk: u64, buf: &[u8; EBS]) -> Result<(), BlockError> {
-        for s in 0..SPB {
-            self.dev.write_block(eblk * SPB + s, &buf[s as usize * BLOCK_SIZE..(s as usize + 1) * BLOCK_SIZE])?;
-        }
-        Ok(())
+        self.dev.write_blocks(eblk * SPB, buf)
     }
 
     fn group_start(g: u64) -> u64 {
@@ -266,14 +263,38 @@ impl<'d, D: BlockDevice> Ext4Writer<'d, D> {
     }
 
     /// Write a file's bytes across its data blocks (zero-padding the tail).
+    /// Blocks from `alloc_block` are sequential, so consecutive runs are
+    /// written with batched multi-sector requests (vs one 512 B sector each).
     fn stream_file(&mut self, f: &FileSpec, data_blocks: &[u64]) -> Result<(), BlockError> {
         let data = f.data;
-        for (bi, &blk) in data_blocks.iter().enumerate() {
+        let mut bi = 0usize;
+        while bi < data_blocks.len() {
+            // Extend the run while blocks stay consecutive.
+            let mut run = 1usize;
+            while bi + run < data_blocks.len() && data_blocks[bi + run] == data_blocks[bi] + run as u64 {
+                run += 1;
+            }
             let start = bi * EBS;
-            let take = (data.len() - start).min(EBS);
-            let mut buf = [0u8; EBS];
-            buf[..take].copy_from_slice(&data[start..start + take]);
-            self.write_eblock(blk, &buf)?;
+            let end = (start + run * EBS).min(data.len());
+            let full = if end > start { (end - start) / BLOCK_SIZE * BLOCK_SIZE } else { 0 };
+            let sector0 = data_blocks[bi] * SPB;
+            if full > 0 {
+                self.dev.write_blocks(sector0, &data[start..start + full])?;
+            }
+            // Zero-padded tail of the final partial sector + trailing sectors.
+            let written_secs = (full / BLOCK_SIZE) as u64;
+            let total_secs = run as u64 * SPB;
+            if written_secs < total_secs {
+                let mut tail = [0u8; BLOCK_SIZE];
+                let rem = end - (start + full);
+                tail[..rem].copy_from_slice(&data[start + full..end]);
+                self.dev.write_block(sector0 + written_secs, &tail)?;
+                let zero = [0u8; BLOCK_SIZE];
+                for sx in written_secs + 1..total_secs {
+                    self.dev.write_block(sector0 + sx, &zero)?;
+                }
+            }
+            bi += run;
         }
         Ok(())
     }

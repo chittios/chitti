@@ -122,52 +122,49 @@ impl<'d, D: BlockDevice> FatWriter<'d, D> {
     }
 
     /// Allocate a chain of `n` clusters, linking them in the FAT (last = EOC).
+    /// Allocation is sequential on this fresh-FS writer, so the chain is built
+    /// a FAT sector at a time (read-modify-write once per affected sector per
+    /// FAT copy) instead of once per cluster — ~256x fewer IOs for a large file.
     fn alloc_chain(&mut self, n: u64) -> Result<u16, BlockError> {
         let first = self.next_free_clus;
-        for i in 0..n {
-            let c = self.next_free_clus;
-            self.next_free_clus += 1;
-            let val = if i == n - 1 { EOC } else { self.next_free_clus };
-            self.set_fat(c, val)?;
+        let last = first as u64 + n - 1;
+        let ents_per_sec = (BLOCK_SIZE / 2) as u64;
+        let sec_lo = first as u64 / ents_per_sec;
+        let sec_hi = last / ents_per_sec;
+        for sec in sec_lo..=sec_hi {
+            let mut buf = [0u8; BLOCK_SIZE];
+            self.dev.read_block(self.fat_start + sec, &mut buf)?;
+            for e in 0..ents_per_sec {
+                let c = sec * ents_per_sec + e;
+                if c < first as u64 || c > last {
+                    continue;
+                }
+                let val = if c == last { EOC } else { (c + 1) as u16 };
+                le16(&mut buf, (e * 2) as usize, val);
+            }
+            for f in 0..NUM_FATS {
+                self.dev.write_block(self.fat_start + f * self.fat_sectors + sec, &buf)?;
+            }
         }
+        self.next_free_clus = (last + 1) as u16;
         Ok(first)
     }
 
     /// Write `data` into `first_clus`'s chain (chain must already be sized).
+    /// Clusters from this writer are sequential, so the data region is one
+    /// contiguous sector run — written with batched multi-sector requests.
     fn write_clusters(&mut self, first_clus: u16, data: &[u8]) -> Result<(), BlockError> {
-        let mut clus = first_clus;
-        let mut off = 0usize;
-        let cluster_bytes = self.spc as usize * BLOCK_SIZE;
-        while off < data.len() {
-            let base = self.cluster_sector(clus);
-            for s in 0..self.spc {
-                let mut buf = [0u8; BLOCK_SIZE];
-                let take = (data.len() - off).min(BLOCK_SIZE);
-                if take > 0 {
-                    buf[..take].copy_from_slice(&data[off..off + take]);
-                    off += take;
-                }
-                self.dev.write_block(base + s, &buf)?;
-                if off >= data.len() {
-                    break;
-                }
-            }
-            let _ = cluster_bytes;
-            clus = self.next_in_chain(clus)?;
-            if clus >= EOC {
-                break;
-            }
+        let base = self.cluster_sector(first_clus);
+        let full = data.len() / BLOCK_SIZE * BLOCK_SIZE;
+        if full > 0 {
+            self.dev.write_blocks(base, &data[..full])?;
+        }
+        if full < data.len() {
+            let mut tail = [0u8; BLOCK_SIZE];
+            tail[..data.len() - full].copy_from_slice(&data[full..]);
+            self.dev.write_block(base + (full / BLOCK_SIZE) as u64, &tail)?;
         }
         Ok(())
-    }
-
-    fn next_in_chain(&mut self, clus: u16) -> Result<u16, BlockError> {
-        let off = clus as u64 * 2;
-        let sec = self.fat_start + off / BLOCK_SIZE as u64;
-        let within = (off % BLOCK_SIZE as u64) as usize;
-        let mut buf = [0u8; BLOCK_SIZE];
-        self.dev.read_block(sec, &mut buf)?;
-        Ok(u16::from_le_bytes([buf[within], buf[within + 1]]))
     }
 
     /// Create a subdirectory named `name` (8.3) whose entry goes in the
