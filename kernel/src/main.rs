@@ -112,6 +112,11 @@ pub extern "C" fn aarch64_start() -> ! {
     if let Some((addr, w, h, pitch)) = unsafe { chitti_kernel::arch::aarch64::ramfb::init() } {
         chitti_kernel::framebuffer::init_console_raw(addr, w, h, pitch);
         serial_println!("Chitti: framebuffer TUI up ({}x{} ramfb) -- console mirrored to the window", w, h);
+        // With a window, wire the virtio-keyboard so it accepts keystrokes too
+        // (the `virt` machine has no PS/2). Absent if launched without one.
+        if chitti_kernel::arch::aarch64::virtio_input::init() {
+            serial_println!("Chitti: virtio-keyboard up -- type in the window or the serial terminal");
+        }
     }
     run_os();
 }
