@@ -22,7 +22,6 @@ use alloc::vec::Vec;
 /// (`CHITTI_OS_HANDOFF.md` Phase 5 two-tier memory, made durable).
 enum Backend {
     Memory(BTreeMap<String, Vec<u8>>),
-    #[cfg(target_arch = "x86_64")]
     Ext4(crate::block::ext4_store::Ext4Store),
 }
 
@@ -31,7 +30,6 @@ static STORE: Locked<Backend> = Locked::new(Backend::Memory(BTreeMap::new()));
 /// Adopt an ext4-backed store as the persistent backend. Any files already
 /// written to the in-memory backend are migrated into it (and thus persisted),
 /// so a boot sequence that wrote before the disk was mounted keeps its state.
-#[cfg(target_arch = "x86_64")]
 pub fn mount_ext4(mut store: crate::block::ext4_store::Ext4Store) {
     STORE.with(|b| {
         if let Backend::Memory(m) = b {
@@ -49,7 +47,6 @@ pub fn write(path: &str, contents: &[u8]) {
         Backend::Memory(s) => {
             s.insert(String::from(path), contents.to_vec());
         }
-        #[cfg(target_arch = "x86_64")]
         Backend::Ext4(s) => s.write(path, contents),
     });
 }
@@ -58,7 +55,6 @@ pub fn write(path: &str, contents: &[u8]) {
 pub fn read(path: &str) -> Option<Vec<u8>> {
     STORE.with(|b| match b {
         Backend::Memory(s) => s.get(path).cloned(),
-        #[cfg(target_arch = "x86_64")]
         Backend::Ext4(s) => s.read(path),
     })
 }
@@ -67,7 +63,6 @@ pub fn read(path: &str) -> Option<Vec<u8>> {
 pub fn exists(path: &str) -> bool {
     STORE.with(|b| match b {
         Backend::Memory(s) => s.contains_key(path),
-        #[cfg(target_arch = "x86_64")]
         Backend::Ext4(s) => s.exists(path),
     })
 }
@@ -76,7 +71,6 @@ pub fn exists(path: &str) -> bool {
 pub fn list() -> Vec<String> {
     STORE.with(|b| match b {
         Backend::Memory(s) => s.keys().cloned().collect(),
-        #[cfg(target_arch = "x86_64")]
         Backend::Ext4(s) => s.list(),
     })
 }
@@ -87,7 +81,6 @@ pub fn list() -> Vec<String> {
 pub fn delete(path: &str) -> bool {
     STORE.with(|b| match b {
         Backend::Memory(s) => s.remove(path).is_some(),
-        #[cfg(target_arch = "x86_64")]
         Backend::Ext4(s) => s.delete(path),
     })
 }

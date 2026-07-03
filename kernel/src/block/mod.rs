@@ -7,13 +7,34 @@
 
 pub mod ext4;
 pub mod ext4_read;
-#[cfg(target_arch = "x86_64")]
 pub mod ext4_store;
 pub mod fat;
 pub mod gpt;
 pub mod ramdisk;
 #[cfg(target_arch = "x86_64")]
 pub mod virtio;
+
+/// The concrete disk device for this arch, behind the shared [`BlockDevice`]
+/// API: x86 = virtio-blk over legacy PCI I/O; aarch64 = virtio-blk over
+/// virtio-mmio. Consumers (fs, ext4, install, persistence) name `DiskDevice`
+/// and call [`probe_disk`], so the whole storage stack is arch-independent —
+/// the driver is the only arch-specific piece (per the dual-arch standing rule).
+#[cfg(target_arch = "x86_64")]
+pub type DiskDevice = virtio::VirtioBlk;
+#[cfg(target_arch = "aarch64")]
+pub type DiskDevice = crate::arch::aarch64::virtio_blk::VirtioBlkMmio;
+
+/// Probe for the boot disk on this arch, if present.
+pub fn probe_disk() -> Option<DiskDevice> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        virtio::VirtioBlk::probe()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::aarch64::virtio_blk::VirtioBlkMmio::probe()
+    }
+}
 
 /// Every block device here uses the classic 512-byte sector.
 pub const BLOCK_SIZE: usize = 512;

@@ -126,22 +126,27 @@ pub extern "C" fn aarch64_start() -> ! {
             serial_println!("Chitti: virtio-keyboard up -- type in the window or the serial terminal");
         }
     }
+    // Same storage bring-up as x86: mount SimpleFS demo disk (if any) and point
+    // synapse::fs at an ext4 data partition for durable agent state. No-op
+    // without a `-drive`/virtio-blk-device.
+    disk_demo();
+    mount_persistent_store();
     run_os();
 }
 
 /// Point `synapse::fs` at an ext4 *data* partition so agent writes are durable
 /// across reboots (the installed system). Chooses an ext4 volume that does NOT
 /// hold the model (`*.gguf`), so it never adopts the model/OS partition. No-op
-/// on the live ISO, or if there's no writable ext4 data volume.
-#[cfg(target_arch = "x86_64")]
+/// on the live ISO, or if there's no writable ext4 data volume. Arch-generic:
+/// the disk is `block::probe_disk()` (virtio-blk over PCI on x86, over
+/// virtio-mmio on aarch64).
 fn mount_persistent_store() {
     use chitti_kernel::block::ext4_read::Ext4Reader;
     use chitti_kernel::block::ext4_store::Ext4Store;
-    use chitti_kernel::block::virtio::VirtioBlk;
     use chitti_kernel::block::Partition;
     use chitti_kernel::fs::detect::FsType;
 
-    let Some(mut dev) = VirtioBlk::probe() else { return };
+    let Some(mut dev) = chitti_kernel::block::probe_disk() else { return };
     let vols = chitti_kernel::fs::detect::probe(&mut dev);
     let mut chosen: Option<(u64, u64)> = None;
     for v in vols {
@@ -184,16 +189,14 @@ fn mount_persistent_store() {
     }
 }
 
-/// Phase 7 block-device FS demo (x86 only -- the virtio-blk driver uses PCI
-/// port I/O): mount SimpleFS on the disk and bump a persistent boot counter.
-#[cfg(target_arch = "x86_64")]
+/// Phase 7 block-device FS demo: mount SimpleFS on the disk and bump a
+/// persistent boot counter. Arch-generic via `block::probe_disk()`.
 fn disk_demo() {
-    use chitti_kernel::block::virtio::VirtioBlk;
     use chitti_kernel::block::BlockDevice;
     use chitti_kernel::fs::SimpleFs;
 
     serial_println!("Chitti: --- Block-device filesystem (Phase 7) ---");
-    let Some(dev) = VirtioBlk::probe() else {
+    let Some(dev) = chitti_kernel::block::probe_disk() else {
         serial_println!("Chitti: disk> no virtio-blk device present (boot with a -drive to enable persistence)");
         return;
     };
@@ -234,7 +237,6 @@ fn disk_demo() {
 }
 
 /// Format a `u32` into `buf` without `alloc`, returning the decimal string.
-#[cfg(target_arch = "x86_64")]
 fn fmt_u32(mut n: u32, buf: &mut [u8; 12]) -> &str {
     if n == 0 {
         buf[0] = b'0';
