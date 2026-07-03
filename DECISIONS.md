@@ -296,3 +296,33 @@ hypervisor's, not the kernel's, and is handled gracefully.
 
 (PS/2 keyboard is x86-only but genuinely N/A on ARM — covered by USB-HID +
 virtio-input.) No driver-level divergence between the arches remains.
+
+**DONE: PS/2 keyboard on aarch64 (PL050) — input parity.** The x86 PS/2 keyboard
+(i8042) now has its ARM counterpart: `arch/aarch64/pl050.rs`, the PL050 PrimeCell
+KMI (the PS/2 controller on ARM boards — Versatile/RealView/Vexpress). Polled
+(the aarch64 input model), scan-code **set 2** decode (vs the PC i8042's set 1),
+PrimeCell-ID-probed so it's a safe no-op where absent (QEMU virt has no PL050).
+Console input chain: aarch64 `xHCI → PL050 → virtio-input → PL011`, mirroring x86
+`PS/2 → xHCI → serial`. Untestable under QEMU virt (no PL050); written to the TRM.
+Also confirmed **USB-HID/xHCI is already dual-arch** (shared `xhci.rs` core + both
+wrappers) — no change needed.
+
+**Full parity audit (2026-07-04).** Swept every `cfg(target_arch)` and both arch
+trees. All subsystems conform to the standing rule (timers, interrupts, MMU,
+SMP, storage, framebuffer, serial/console, inference kernels, shell commands are
+either shared or per-arch drivers behind a shared API). Two items are *not* code
+gaps for the shipping product, documented here so they aren't re-flagged:
+- **Multi-part model on the aarch64 `boot-limine` path** returns None
+  (`cortex/mod.rs`). NOT a shipping gap: the default aarch64 boot (`-kernel` /
+  UEFI stub) loads *every* model incl. the 9B (placed contiguously at a fixed
+  address by the loader/stub). `boot-limine` on aarch64 is the abandoned
+  experimental path; closing it needs an aarch64 frame allocator (models exceed
+  the fixed 256 MiB heap, so heap reassembly is impossible) — a subsystem for a
+  dead path. Left as-is.
+- **Timer preemption on Apple-Silicon HVF** falls back to cooperative: HVF's
+  emulated GICv3 UNDEFs the `ICC_*` CPU-interface sysregs for a bare-metal EL1
+  guest and refuses EL2, so there is no interrupt path to preempt from.
+  Hypervisor limitation, handled gracefully (`gic::init_bsp` probes + falls
+  back); preemption is real on TCG / KVM / real ARM hardware. Agent tasks yield
+  (step-wise inference, I/O), so cooperative multitasking is functionally fine
+  on HVF. Not fixable in the kernel without HVF exposing the interface.
