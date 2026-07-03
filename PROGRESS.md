@@ -419,3 +419,25 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   removed (superseded). Verified live: `/disks` → `[0] FAT16 label=CHITTI ESP,
   [1] ext4`; `/ls 0` lists `EFI/`, `chitti-kernel`, `model.gguf.000`; `/ls 1`
   lists the (empty) data root. 103/103; both arches build.
+
+### Real-world drivers (1/2): ACPI-discovered PCIe + virtio-pci disk  ✅
+- Moves aarch64 off QEMU's hardcoded virtio-mmio window onto the **real PCIe bus**,
+  discovered the standards way: the stub captures the ACPI RSDP from the UEFI
+  config table into the boot-info page; the kernel walks RSDP → XSDT → MCFG to get
+  the **ECAM base** (`acpi.rs`), maps that 1 GiB Device block live
+  (`mmu::map_device_gib`), and enumerates PCIe over ECAM (`pci.rs`: config
+  read/write, device scan, 32/64-bit BAR decode, virtio capability walk,
+  bus-master enable).
+- `virtio_pci.rs`: virtio-blk over **modern virtio-pci (1.0)** — common/notify/
+  device cfg via capabilities, feature negotiation (VERSION_1), queue setup,
+  batched (64 KiB/req) polled requests — same `BlockDevice` contract as the mmio
+  driver. `arch/aarch64/disk.rs` (`Disk` enum) selects the transport at probe:
+  **PCIe first, virtio-mmio fallback**, so nothing regresses on plain QEMU virt.
+- **Verified on QEMU virt's GPEX PCIe** (`-device virtio-blk-pci`): ACPI RSDP →
+  `PCIe ECAM 0x3f000000 (buses 0..15)` → `virtio-blk-pci: up (00:02.0) 524288
+  sectors` → `/mkext4` + `/ext4read` round-trip (big.bin pattern match: true).
+  Both arches build; 103/103. This is the platform-independent bus every further
+  real driver (AHCI/NVMe/xHCI) attaches to.
+- Remaining for full non-QEMU interactivity: **USB xHCI + HID keyboard over PCIe**
+  (next), and device-specific storage (AHCI/NVMe) for hypervisors that don't
+  expose virtio. Display already works everywhere via GOP.

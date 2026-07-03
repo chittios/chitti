@@ -49,6 +49,19 @@ fn alloc_at(paddr: u64, bytes: usize) -> &'static mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), pages * 4096) }
 }
 
+/// The ACPI 2.0 RSDP physical address from the UEFI configuration table, or 0.
+fn acpi_rsdp() -> u64 {
+    use uefi::table::cfg::{ACPI2_GUID, ACPI_GUID};
+    uefi::system::with_config_table(|entries| {
+        entries
+            .iter()
+            .find(|e| e.guid == ACPI2_GUID)
+            .or_else(|| entries.iter().find(|e| e.guid == ACPI_GUID))
+            .map(|e| e.address as u64)
+            .unwrap_or(0)
+    })
+}
+
 #[entry]
 fn main() -> Status {
     uefi::helpers::init().expect("uefi init");
@@ -144,7 +157,12 @@ fn main() -> Status {
         page[16..24].copy_from_slice(&(w as u64).to_le_bytes());
         page[24..32].copy_from_slice(&(hgt as u64).to_le_bytes());
         page[32..40].copy_from_slice(&pitch.to_le_bytes());
-        log::info!("chitti-stub: GOP framebuffer {w}x{hgt} at {fb:#x} (pitch {pitch}) -> boot-info {addr:#x}");
+        // ACPI RSDP (from the UEFI config table) at offset 40 — the kernel walks
+        // it to find the PCIe ECAM base (MCFG), so PCIe is discovered, not
+        // hardcoded. 0 if absent.
+        let rsdp = acpi_rsdp();
+        page[40..48].copy_from_slice(&rsdp.to_le_bytes());
+        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x}, ACPI RSDP {rsdp:#x} -> boot-info {addr:#x}");
         Some(addr)
     })();
 

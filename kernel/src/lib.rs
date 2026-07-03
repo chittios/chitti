@@ -12,10 +12,14 @@
 #![cfg_attr(target_arch = "x86_64", reexport_test_harness_main = "test_main")]
 extern crate alloc;
 
+#[cfg(target_arch = "aarch64")]
+pub mod acpi;
 pub mod agent;
 pub mod arch;
 pub mod block;
 pub mod cap;
+#[cfg(target_arch = "aarch64")]
+pub mod pci;
 pub mod console;
 pub mod cortex;
 pub mod fs;
