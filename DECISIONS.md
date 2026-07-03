@@ -259,10 +259,23 @@ never register, so `bringup` silently returned None and the probe fell through t
 the ESP. These two drivers are only discovered where ACPI/PCIe exist (the UEFI
 boot); the native `-kernel` dev path has no ACPI and keeps virtio-mmio.
 
-**R7 (follow-on): adopt NVMe/AHCI on x86 via its PCI stack.** The drivers live
-under `arch/aarch64` because non-virtio storage is aarch64's real-hardware
-concern; x86 already has storage via virtio-blk-pci under Limine, so no user-
-visible capability diverges today. The driver cores are largely arch-neutral
-(MMIO reg pokes + DMA), so — like `xhci.rs` — they can be lifted into a shared
-core with a thin x86 discovery/alloc seam when x86 needs to boot a non-virtio
-host. Tracked, not rushed (would need OVMF NVMe-boot verification on x86).
+**R7 DONE: NVMe/AHCI made dual-arch via shared cores.** Rather than leave these
+aarch64-only, both drivers were refactored into arch-neutral cores
+(`block/nvme.rs`, `block/ahci.rs`) behind a `block::Dma { phys, virt }` +
+`DmaAlloc` seam (the `xhci` pattern), with thin per-arch discovery wrappers:
+aarch64 over ACPI-ECAM (`crate::pci`) + identity BAR map; x86 over legacy PCI
+config ports (`arch/x86_64/pci.rs`) + `mm::map_mmio`. x86's `DiskDevice` is now
+a `Disk` enum (virtio → NVMe → AHCI) mirroring aarch64's. Verified read/write on
+all four combinations (aarch64/x86 × NVMe/AHCI): ext4 200 KB round-trip →
+`pattern match: true`. No storage-driver divergence remains.
+
+**Remaining reverse-direction gap (x86-only, NOT yet on aarch64): timer-IRQ
+preemptive scheduling.** x86 drives `sched::on_timer_tick` from the PIT IRQ0
+handler (`pit.rs` via PIC/APIC + the IDT), giving preemptive multitasking.
+aarch64 has no GIC, no EL1 exception vector table (VBAR_EL1), and no timer IRQ —
+scheduling is cooperative (`yield_now`) only. Closing this means a GIC(v2/v3)
+driver + a 16-entry vector table + CNTP periodic timer + an IRQ handler routing
+into `on_timer_tick`, and touches the (boot-critical) scheduler. Bigger and
+riskier than the storage drivers; called out here as the one real driver-level
+divergence still open. (PS/2 keyboard is x86-only but genuinely N/A on ARM —
+covered by USB-HID + virtio-input.)

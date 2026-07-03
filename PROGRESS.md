@@ -493,10 +493,33 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   - Both drivers are discovered only when ACPI/PCIe is present (the UEFI-stub boot);
     the native `-kernel` fast path has no ACPI so it still uses virtio-mmio — which
     is fine, that path is the local dev harness, not a real deployment target.
-- Both arches build; 103/103. **Arch-parity note:** these live under `arch/aarch64`
-  because they extend aarch64's reach to *non-virtio* real platforms (its real-world
-  boot story). x86 already has full storage via its virtio-blk-pci path under
-  Limine; wiring the same NVMe/AHCI onto the x86 PCI stack is tracked as follow-on
-  **R7** (the driver cores are largely arch-neutral and could be shared like
-  `xhci.rs`). Storage functionality itself is present on both arches — no user-
-  visible capability diverges.
+- Both arches build; 103/103.
+
+### NVMe + AHCI made dual-arch: shared cores + x86 wiring (R7 done)  ✅
+- Per the standing dual-arch rule, NVMe + AHCI now exist on **x86 too**, not just
+  aarch64. Refactored both drivers into **arch-neutral cores** (`block/nvme.rs`,
+  `block/ahci.rs`) parameterized by a small platform seam — a `block::Dma
+  { phys, virt }` pair + a `DmaAlloc` fn — exactly the one-driver-both-arches
+  shape the `xhci` core already uses. All device logic (queue setup, IDENTIFY,
+  PRP/PRDT, polling) lives once in the core; the CPU fills descriptors via
+  `.virt`, the device is programmed with `.phys`.
+- Per-arch discovery wrappers are thin: aarch64 (`arch/aarch64/{nvme,ahci}.rs`)
+  finds the function over ACPI-ECAM (`crate::pci`), identity-maps the BAR, and
+  allocs via heap + `dma_to_phys`; x86 (`arch/x86_64/{nvme,ahci}.rs`) finds it
+  over **legacy PCI config ports** (new `arch/x86_64/pci.rs`: 0xCF8/0xCFC config,
+  class scan, 32/64-bit BAR decode, bus-master), maps the BAR via new
+  `mm::map_mmio(phys, bytes)` (multi-page HHDM MMIO map), and allocs via
+  `mm::alloc_dma`.
+- x86's `DiskDevice` is now a `Disk` enum too (`arch/x86_64/disk.rs`: virtio-blk
+  → NVMe → AHCI), mirroring aarch64's — a `dispatch!` macro forwards the
+  `BlockDevice` methods. `block::probe_disk_nth` selects through it on both arches.
+- **Verified read/write on all four combinations** (`/mkext4 yes` + `/ext4read`,
+  200 KB `big.bin` byte-for-byte → **pattern match: true** each):
+  - aarch64 NVMe (`-device nvme`) + aarch64 AHCI (`-device ahci`+`ide-hd`) under
+    UEFI/AAVMF — re-verified after the refactor.
+  - x86 NVMe (`-device nvme`) + x86 AHCI (`-device ich9-ahci`+`ide-hd`) under
+    q35/Limine (TCG): `nvme: up (262144 LBAs)` / `ahci: SATA disk up` then the
+    ext4 round-trip.
+- Both arches build; 103/103 x86_64 tests green. **No storage-driver divergence
+  remains** — every block transport (virtio-mmio/pci, NVMe, AHCI) that exists on
+  one arch exists on the other, behind one shared core.
