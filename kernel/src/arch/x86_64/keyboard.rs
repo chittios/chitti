@@ -17,6 +17,9 @@ pub static SCANCODES_RECEIVED: AtomicU64 = AtomicU64::new(0);
 
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 static CAPS_ON: AtomicBool = AtomicBool::new(false);
+/// True when the previous scancode byte was the 0xE0 extended prefix (arrow
+/// keys, etc. arrive as `E0 <code>`).
+static E0_PREFIX: AtomicBool = AtomicBool::new(false);
 
 // Scan-code set 1 make codes 0x00..0x40 -> ASCII (0 = no character). Break
 // codes are the make code | 0x80 and are handled separately below.
@@ -107,6 +110,32 @@ extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
     // controller's output-buffer-full status so IRQ1 keeps arriving.
     let scancode = unsafe { inb(DATA_PORT) };
     SCANCODES_RECEIVED.fetch_add(1, Ordering::Relaxed);
+
+    // Extended (0xE0-prefixed) keys: arrows become the ANSI sequences a serial
+    // terminal sends (ESC [ A/B/C/D), so the shell decodes one encoding for
+    // every input path (history navigation etc.). Other extended keys are eaten.
+    if scancode == 0xe0 {
+        E0_PREFIX.store(true, Ordering::Relaxed);
+        pic::send_eoi(1);
+        return;
+    }
+    if E0_PREFIX.swap(false, Ordering::Relaxed) {
+        if let Some(fin) = match scancode {
+            0x48 => Some(b'A'), // Up
+            0x50 => Some(b'B'), // Down
+            0x4d => Some(b'C'), // Right
+            0x4b => Some(b'D'), // Left
+            _ => None,
+        } {
+            KEYS.with(|r| {
+                r.push(0x1b);
+                r.push(b'[');
+                r.push(fin);
+            });
+        }
+        pic::send_eoi(1);
+        return;
+    }
 
     match scancode {
         SC_LSHIFT | SC_RSHIFT => SHIFT_DOWN.store(true, Ordering::Relaxed),
