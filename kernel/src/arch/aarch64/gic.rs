@@ -203,17 +203,15 @@ pub fn start_preemption() {
     }
     super::interrupts::enable();
     // Warmup: confirm timer IRQs are actually *delivered* before committing to
-    // preemptive mode. Bounded three ways (ticks observed / elapsed time /
-    // iteration cap, in case the counter itself misbehaves) so a platform whose
-    // GIC accepted programming but never delivers (or delivers brokenly) can't
-    // hang the boot here -- we re-mask and continue cooperatively instead.
-    let start = super::time_ms();
+    // preemptive mode. Deliberately a PURE MEMORY spin on the tick counter --
+    // no counter/system-register reads, because on some hypervisors (VirtualBox)
+    // CNTPCT reads trap to the VMM (making each iteration microseconds) and the
+    // virtual counter may not advance for a bare-metal guest at all, which
+    // turned a "bounded" wait into tens of minutes. ~50M cheap iterations is
+    // 50-200 ms of real time -- several 100 Hz tick periods -- on any host.
     let mut iters = 0u64;
-    while ticks() < 3 {
+    while ticks() == 0 && iters < 50_000_000 {
         iters += 1;
-        if super::time_ms().wrapping_sub(start) >= 200 || iters > 100_000_000 {
-            break;
-        }
         core::hint::spin_loop();
     }
     if ticks() == 0 {
