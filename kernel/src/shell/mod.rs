@@ -495,7 +495,7 @@ fn print_skills() {
 
 fn print_help() {
     serial_println!("Chitti commands:");
-    serial_println!("  <message>        chat with the model (streams until EOS; Ctrl+C to stop)");
+    serial_println!("  <message>        chat with the agent — it calls /commands as tools (Ctrl+C to stop)");
     serial_println!("  /do <intent>     run a Persona intent (write a file called X with the text Y; ");
     serial_println!("                   remember that K is V; what is K; list; say TEXT)");
     serial_println!("  /agent <intent>  run the orchestrator's agentic loop on <intent> (sessions + tools)");
@@ -507,6 +507,9 @@ fn print_help() {
     serial_println!("  /bench           matvec kernel throughput");
     serial_println!("  /perf            end-to-end prefill/decode tok/s");
     serial_println!("  /info            CPU / memory / model / context / OS info");
+    serial_println!("  /network [..]    net status; /network dhcp | static <ip/prefix> [gw] | dns <ip>");
+    serial_println!("  /ping <host>     ICMP echo a host or IP (resolves names via DNS)");
+    serial_println!("  /wifi [..]       /wifi scan | connect <ssid> (password modal) | info");
     serial_println!("  /datetime [..]   show/set the clock: /datetime 2026-07-04 13:45 | /datetime tz +5:30");
     serial_println!("  /ui [config|reload|reset]  view/edit the UI config (/configs/core/ui.json)");
     serial_println!("  /shortcuts       list keyboard shortcuts (/configs/core/shortcuts.json)");
@@ -630,6 +633,50 @@ impl Spinner {
     }
 }
 
+/// System prompt for the tool-using shell agent (the default chat). It teaches
+/// the `TOOL:` ReAct protocol and lists the `/`-commands exposed as tools, so a
+/// plain chat message like "what time is it?" drives a real tool call instead of
+/// the model hallucinating an answer.
+const AGENT_SYSTEM: &str = "You are Chitti, an agentic OS shell agent on bare metal. \
+You operate the machine by calling its commands as tools rather than guessing. \
+To call a tool, reply with EXACTLY one line and nothing else:\n\
+TOOL: /<command> [args]\n\
+You then receive that command's output and continue. When you have the answer for \
+the user, reply in prose (ANSI SGR for emphasis, never markdown) with no TOOL line. \
+Never invent data you could read with a tool (current time, network status, files). \
+Tools: /datetime (current date/time), /network (net status), /ping <host>, /wifi, \
+/info (cpu/mem/model), /disks, /ls [path], /cat <path>, /skills, /session, /help. \
+Examples:\n\
+user: what time is it? -> TOOL: /datetime\n\
+user: are we online? -> TOOL: /network\n\
+user: ping google -> TOOL: /ping www.google.com";
+
+/// Detect a `TOOL: /<cmd> [args]` directive in a model reply. Returns the
+/// command name (leading `/` stripped) and its argument string, or `None` if the
+/// reply is a plain final answer.
+fn parse_tool_call(text: &str) -> Option<(alloc::string::String, alloc::string::String)> {
+    use alloc::string::ToString;
+    for line in text.lines() {
+        let l = line.trim();
+        let rest = l
+            .strip_prefix("TOOL:")
+            .or_else(|| l.strip_prefix("TOOL "))
+            .map(|r| r.trim().trim_start_matches('/').trim());
+        if let Some(rest) = rest {
+            if rest.is_empty() {
+                continue;
+            }
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let cmd = parts.next().unwrap_or("").to_string();
+            let args = parts.next().unwrap_or("").trim().to_string();
+            if !cmd.is_empty() {
+                return Some((cmd, args));
+            }
+        }
+    }
+    None
+}
+
 /// A live chat: the model, its BPE tokenizer, and a persistent KV/recurrent
 /// cache so context carries across turns (`/clear` drops it).
 struct ChatSession {
@@ -667,65 +714,93 @@ impl ChatSession {
     /// Run one chat turn: encode the user message with the Qwen chat template
     /// (continuing the running context), then greedily decode + stream until
     /// the model emits EOS or the user presses Ctrl+C.
+    /// One chat turn as an **agentic ReAct loop**: feed the user message, then
+    /// repeatedly let the model either call a tool (`TOOL: /<cmd> [args]`, whose
+    /// captured output is fed back as an observation) or produce a final answer.
+    /// Bounded by `MAX_TOOL_ITERS` so a confused small model can't loop forever.
     fn turn(&mut self, msg: &str) {
-        use crate::cortex::tokenizer;
-        let first = self.pos == 0;
-        // Build this turn's prompt tokens (chat template).
+        const MAX_TOOL_ITERS: usize = 4;
+        if self.pos == 0 {
+            self.prefill_turn("system\n", AGENT_SYSTEM, false);
+        }
+        self.prefill_turn("user\n", msg, true);
+        for _ in 0..MAX_TOOL_ITERS {
+            let text = self.generate_assistant();
+            match parse_tool_call(&text) {
+                Some((cmd, args)) => {
+                    serial_println!(
+                        "\x1b[33m\u{2192} running\x1b[0m /{}{}{}",
+                        cmd,
+                        if args.is_empty() { "" } else { " " },
+                        args
+                    );
+                    // `run_tool_command` streams the command's output live *and*
+                    // returns a copy; feed that copy back as the observation.
+                    let obs = run_tool_command(&cmd, &args);
+                    let fb = alloc::format!("Output of /{} {}:\n{}", cmd, args, obs);
+                    self.prefill_turn("user\n", &fb, true);
+                }
+                None => return, // final answer already streamed
+            }
+        }
+        serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
+    }
+
+    /// Encode `<|im_start|>{header}{body}<|im_end|>\n` into the running context
+    /// and prefill it through the model. When `prime`, also append an
+    /// `<|im_start|>assistant\n` opener (with an empty `<think></think>` so this
+    /// thinking model answers directly) and leave the KV positioned to decode.
+    fn prefill_turn(&mut self, header: &str, body: &str, prime: bool) {
         let mut ids: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-        let push_text = |ids: &mut alloc::vec::Vec<usize>, s: &str| {
-            for t in self.tok.encode(s) {
+        ids.push(self.tok.im_start as usize);
+        for t in self.tok.encode(header) {
+            ids.push(t as usize);
+        }
+        for t in self.tok.encode(body) {
+            ids.push(t as usize);
+        }
+        ids.push(self.tok.im_end as usize);
+        for t in self.tok.encode("\n") {
+            ids.push(t as usize);
+        }
+        if prime {
+            ids.push(self.tok.im_start as usize);
+            for t in self.tok.encode("assistant\n") {
                 ids.push(t as usize);
             }
-        };
-        if first {
-            ids.push(self.tok.im_start as usize);
-            push_text(
-                &mut ids,
-                "system\nYou are Chitti, a helpful assistant running in a bare-metal terminal. \
-                 Format replies with ANSI escape codes (SGR), NOT markdown: use \x1b[1m for bold, \
-                 \x1b[36m/\x1b[32m/\x1b[33m etc. for colored headings or keywords, and \x1b[0m to \
-                 reset after each. Never use markdown syntax like **bold**, # headings, or ``` fences. \
-                 Keep lines under ~80 columns.",
-            );
-            ids.push(self.tok.im_end as usize);
-            push_text(&mut ids, "\n");
+            if self.tok.think_open != u32::MAX && self.tok.think_close != u32::MAX {
+                ids.push(self.tok.think_open as usize);
+                for t in self.tok.encode("\n\n") {
+                    ids.push(t as usize);
+                }
+                ids.push(self.tok.think_close as usize);
+                for t in self.tok.encode("\n\n") {
+                    ids.push(t as usize);
+                }
+            }
         }
-        ids.push(self.tok.im_start as usize);
-        push_text(&mut ids, "user\n");
-        push_text(&mut ids, msg);
-        ids.push(self.tok.im_end as usize);
-        push_text(&mut ids, "\n");
-        ids.push(self.tok.im_start as usize);
-        push_text(&mut ids, "assistant\n");
-        // No-think priming (Qwen3.5): supply an empty `<think></think>` so the
-        // model answers directly. It's a thinking model; left to itself it emits
-        // an empty think block and then degenerates into repetition, so we close
-        // the reasoning turn up front. Skipped if the model has no think tokens.
-        if self.tok.think_open != u32::MAX && self.tok.think_close != u32::MAX {
-            ids.push(self.tok.think_open as usize);
-            push_text(&mut ids, "\n\n");
-            ids.push(self.tok.think_close as usize);
-            push_text(&mut ids, "\n\n");
-        }
-
-        // Prefill this turn with a live "thinking" spinner (one frame per token
-        // forward — the pre-first-token wait), then decode from the last
-        // position's logits. This is the sequential prefill path (bit-identical
-        // to `Model::prefill`); only the last token needs logits.
         let last = ids.len();
         let mut spin = Spinner::new("thinking");
         for (i, &tok) in ids.iter().enumerate() {
-            self.model.forward(tok, self.pos + i, &mut self.kv, &mut self.state, i + 1 == last);
+            // Only the final token needs logits, and only when we're about to
+            // decode (`prime`); otherwise this is pure context prefill.
+            let want = prime && i + 1 == last;
+            self.model.forward(tok, self.pos + i, &mut self.kv, &mut self.state, want);
             spin.tick();
-            // Inference is a long, un-preempted compute on the cooperative
-            // scheduler, so pump the UI (clock, mouse, caret) and the net stack
-            // between token forwards or the whole screen freezes while we think.
+            // Cooperative scheduler: pump the UI + net stack between forwards or
+            // the screen freezes while we think (see CLAUDE.md UI notes).
             ui_tick();
             crate::net::poll();
         }
         spin.clear();
         self.pos += ids.len();
+    }
 
+    /// Decode one assistant reply from the current logits, streaming it to the
+    /// chat pane and returning the full decoded text (so the caller can detect a
+    /// tool call). Closes the turn with `<|im_end|>` in the KV cache.
+    fn generate_assistant(&mut self) -> alloc::string::String {
+        use crate::cortex::tokenizer;
         let eos = self.model.eos();
         let im_end = self.tok.im_end as usize;
         self.gen.clear();
@@ -733,11 +808,11 @@ impl ChatSession {
         let mut stream = tokenizer::Stream::new();
         // Bold-cyan speaker label (ANSI), then the streamed reply.
         serial_print!("\x1b[1;36mchitti:\x1b[0m ");
+        let mut out = alloc::string::String::new();
         let mut n = 0usize;
         // Anti-degeneration guard: a thinking model that slips into a loop can
         // emit the same token forever. Nucleus sampling (pick) makes that rare,
-        // but as a hard backstop we stop if a token repeats too many times in a
-        // row, so the chat never spews an endless run of "..." / one word.
+        // but as a hard backstop we stop if a token repeats too many times.
         let mut last_tok = usize::MAX;
         let mut run_len = 0usize;
         const MAX_RUN: usize = 5;
@@ -766,6 +841,7 @@ impl ChatSession {
             }
             let piece = stream.push(&self.tok, self.model.token_str(next));
             serial_print!("{}", piece);
+            out.push_str(&piece);
             self.gen.push(next);
             self.model.forward(next, self.pos, &mut self.kv, &mut self.state, true);
             self.pos += 1;
@@ -780,6 +856,7 @@ impl ChatSession {
         // Close the assistant turn in the cache so the next turn continues cleanly.
         self.model.forward(im_end, self.pos, &mut self.kv, &mut self.state, false);
         self.pos += 1;
+        out
     }
 
     /// Choose the next token from `state.logits` with a repetition penalty over
