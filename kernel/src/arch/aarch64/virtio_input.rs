@@ -49,6 +49,22 @@ const S_FEATURES_OK: u32 = 8;
 
 const VIRTIO_ID_INPUT: u32 = 18;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
+const CONFIG: usize = 0x100; // virtio_input_config
+const CFG_EV_BITS: u8 = 0x11;
+const EV_REL_TYPE: u8 = 0x02;
+const EV_ABS_TYPE: u8 = 0x03;
+const EV_KEY_TYPE: u8 = 0x01;
+
+/// Size of a virtio-input config subselection (0 if the device doesn't report
+/// that event type). Used to tell a keyboard from a pointer: both are
+/// virtio-input (device id 18), but only a pointer reports EV_ABS/EV_REL.
+unsafe fn cfg_size(base: usize, select: u8, subsel: u8) -> u8 {
+    unsafe {
+        write_volatile((base + CONFIG) as *mut u8, select);
+        write_volatile((base + CONFIG + 1) as *mut u8, subsel);
+        read_volatile((base + CONFIG + 2) as *const u8)
+    }
+}
 
 // virtio-mmio scan window on QEMU `virt`.
 const MMIO_BASE: usize = 0x0a00_0000;
@@ -176,7 +192,16 @@ pub fn init() -> bool {
         // SAFETY: scanning the fixed virtio-mmio window; registers are 32-bit.
         unsafe {
             let v = reg_read(b, VERSION);
-            if reg_read(b, MAGIC) == 0x7472_6976 && (v == 1 || v == 2) && reg_read(b, DEVICE_ID) == VIRTIO_ID_INPUT {
+            if reg_read(b, MAGIC) != 0x7472_6976 || !(v == 1 || v == 2) || reg_read(b, DEVICE_ID) != VIRTIO_ID_INPUT {
+                continue;
+            }
+            // Pick the KEYBOARD: reports EV_KEY but neither EV_ABS nor EV_REL
+            // (those are the pointer). Without this, a co-present virtio-tablet
+            // could be grabbed here, leaving the keyboard dead.
+            let is_kbd = cfg_size(b, CFG_EV_BITS, EV_KEY_TYPE) > 0
+                && cfg_size(b, CFG_EV_BITS, EV_ABS_TYPE) == 0
+                && cfg_size(b, CFG_EV_BITS, EV_REL_TYPE) == 0;
+            if is_kbd {
                 base = b;
                 version = v;
                 break;
