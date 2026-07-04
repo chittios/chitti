@@ -43,8 +43,6 @@ model-9b = []
 boot-limine = []
 
 [dependencies]
-font8x8 = { version = "0.3.1", default-features = false }
-
 # Shared-contract serialization for the agentic re-architecture
 # (CHITTI_SCHEMAS.md). All no_std + alloc, none pull `std`:
 #   serde   — derive for the AgentManifest/Session/SkillManifest structs
@@ -58,6 +56,5 @@ bitflags = { version = "2", default-features = false, features = ["serde"] }
 # "panic-strategy": "abort" is already authoritative. Adding an explicit
 # `-C panic=abort` on top of that makes this package's root profile diverge
 # from -Z build-std's canonical sysroot profile, which cargo then builds as
-# a *second* copy of core/alloc — and font8x8 (any ordinary, non-build-std
-# dependency) ends up linked against a mix of the two ("duplicate lang
-# item" errors).
+# a *second* copy of core/alloc — and any ordinary (non-build-std) dependency
+# ends up linked against a mix of the two ("duplicate lang item" errors).

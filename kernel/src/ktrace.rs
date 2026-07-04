@@ -33,9 +33,24 @@ pub fn log_fmt(args: Arguments<'_>) {
     // a log line already in progress on another path.
     crate::arch::interrupts::without_interrupts(|| {
         let seq = next_seq();
-        let mut serial = crate::serial::Serial;
-        let _ = write!(serial, "[ktrace #{seq}] ");
-        let _ = serial.write_fmt(args);
-        let _ = writeln!(serial);
+        let mut sink = LogSink;
+        let _ = write!(sink, "[ktrace #{seq}] ");
+        let _ = sink.write_fmt(args);
+        let _ = writeln!(sink);
     });
+}
+
+/// Sink for trace lines: the UART (raw, un-mirrored) plus the framebuffer
+/// **logs** pane. Keeping trace off the [`Serial`](crate::serial::Serial) path
+/// means it draws into the logs pane rather than the chat pane, giving the
+/// framebuffer TUI a tmux-style split (chat left, live ktrace right).
+struct LogSink;
+
+impl Write for LogSink {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        crate::serial::write_str_raw(s);
+        #[cfg(not(test))]
+        crate::framebuffer::log_print(s);
+        Ok(())
+    }
 }

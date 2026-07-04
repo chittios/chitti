@@ -42,16 +42,16 @@ pub mod smp;
 pub mod synapse;
 pub mod xhci;
 
-// The framebuffer writer pulls in `font8x8` (a normal, non-build-std
-// dependency). Building it under `cfg(test)` as well hits a known
-// `-Z build-std` + `cargo test` interaction where the "plain" and
-// "--test" compilations of this crate end up linked against two
-// non-unified copies of `core`/`alloc` ("duplicate lang item" errors) for
-// any ordinary dependency shared between them. The test harness never
-// draws to the framebuffer, so it's simplest to just not compile the
-// module (and font8x8) into the test binary at all.
+// The framebuffer compositor and its Geist Mono glyph atlas are not built into
+// the `--test` binary. The test harness never draws, and gating them out sidesteps
+// a `-Z build-std` + `cargo test` interaction where the "plain" and "--test"
+// compilations end up with two non-unified copies of `core`/`alloc` ("duplicate
+// lang item") for any ordinary dependency shared between them.
 #[cfg(not(test))]
 pub mod framebuffer;
+// The Geist Mono glyph atlas the framebuffer console renders with (data-only).
+#[cfg(not(test))]
+pub mod font_geist;
 
 // --- Limine requests (x86_64 boot only) ------------------------------
 //
