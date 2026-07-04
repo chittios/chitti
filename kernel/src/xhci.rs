@@ -357,8 +357,18 @@ impl Xhci {
             Self::ring_push(va, pa, enq, cycle, 0, 0, (TRB_STATUS << 10) | sdir | (1 << 5));
             self.doorbell(slot, 1); // EP0 = DCI 1
             match self.wait_event(EVT_TRANSFER) {
-                Some(ev) => (ev.status >> 24) & 0xff == CC_SUCCESS || (ev.status >> 24) & 0xff == 13, /* SHORT_PACKET ok */
-                None => false,
+                Some(ev) => {
+                    let cc = (ev.status >> 24) & 0xff;
+                    let ok = cc == CC_SUCCESS || cc == 13 /* SHORT_PACKET */;
+                    if !ok {
+                        crate::ktrace::log_fmt(format_args!("xhci: control transfer cc={cc} (len {len}, in={data_in})"));
+                    }
+                    ok
+                }
+                None => {
+                    crate::ktrace::log_fmt(format_args!("xhci: control transfer TIMEOUT (len {len}, in={data_in})"));
+                    false
+                }
             }
         }
     }
@@ -452,6 +462,11 @@ impl Xhci {
             }
         }
         crate::ktrace::log_fmt(format_args!("xhci: device addressed on slot {slot}"));
+        // SET_ADDRESS recovery: the USB spec gives a device up to 2 ms after
+        // being addressed before it must answer EP0 requests. QEMU replies
+        // instantly, but a real-timed device model (VirtualBox) NAKs a control
+        // transfer issued immediately after Address Device, so wait first.
+        spin_delay(4_000_000);
 
         // 7. Learn the real EP0 max packet size before any multi-byte read.
         // We addressed the device assuming MPS=8 (full/low) or 64 (high). A
