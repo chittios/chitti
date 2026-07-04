@@ -82,7 +82,7 @@ struct Pane {
     row: u64,
     fg: Rgb,
     bg: Rgb,
-    title: &'static str,
+    title: String,
     show_caret: bool,
 }
 
@@ -91,7 +91,7 @@ impl Pane {
     /// reserving a title header and `PAD` interior padding, then computing the
     /// cell grid.
     #[allow(clippy::too_many_arguments)]
-    fn new(x: u64, y: u64, w: u64, h: u64, cw: u64, ch: u64, fg: Rgb, bg: Rgb, title: &'static str, show_caret: bool) -> Pane {
+    fn new(x: u64, y: u64, w: u64, h: u64, cw: u64, ch: u64, fg: Rgb, bg: Rgb, title: String, show_caret: bool) -> Pane {
         let header_h = BORDER + 4 + ch + 6; // top border, title text, separator gap
         let ix = x + BORDER + PAD;
         let iy = y + header_h;
@@ -146,6 +146,25 @@ pub struct Screen {
     caret_last_ms: u64,
 }
 
+/// Config knobs the UI config (`/configs/core/ui.json`) can set for the layout.
+#[derive(Clone)]
+pub struct LayoutCfg {
+    /// Chat pane width as a % of the content region (10..90).
+    pub chat_pct: u64,
+    /// Font scale; 0 = auto from panel height.
+    pub scale: u64,
+    /// Put the chat pane on the right instead of the left.
+    pub swap: bool,
+    pub chat_title: String,
+    pub logs_title: String,
+}
+
+impl Default for LayoutCfg {
+    fn default() -> Self {
+        LayoutCfg { chat_pct: CHAT_PCT, scale: 0, swap: false, chat_title: String::from("chat"), logs_title: String::from("ktrace") }
+    }
+}
+
 impl Screen {
     #[allow(clippy::too_many_arguments)]
     fn layout(
@@ -158,7 +177,22 @@ impl Screen {
         g_shift: u32,
         b_shift: u32,
     ) -> Screen {
-        let scale = pick_scale(height);
+        Screen::build(addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift, &LayoutCfg::default())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        addr: usize,
+        width: u64,
+        height: u64,
+        pitch: u64,
+        bpp_bytes: u64,
+        r_shift: u32,
+        g_shift: u32,
+        b_shift: u32,
+        cfg: &LayoutCfg,
+    ) -> Screen {
+        let scale = if cfg.scale > 0 { cfg.scale } else { pick_scale(height) };
         let cw = CELL_W * scale;
         let ch = CELL_H * scale;
         let status_h = ch + 8;
@@ -166,10 +200,17 @@ impl Screen {
         let box_y = OUTER;
         let box_h = content_h.saturating_sub(2 * OUTER);
         let avail_w = width.saturating_sub(2 * OUTER + GAP);
-        let chat_w = avail_w * CHAT_PCT / 100;
+        let pct = cfg.chat_pct.clamp(10, 90);
+        let chat_w = avail_w * pct / 100;
         let logs_w = avail_w - chat_w;
-        let chat = Pane::new(OUTER, box_y, chat_w, box_h, cw, ch, CHAT_FG, CHAT_BG, "chat", true);
-        let logs = Pane::new(OUTER + chat_w + GAP, box_y, logs_w, box_h, cw, ch, LOGS_FG, LOGS_BG, "ktrace", false);
+        // Left/right box origins; chat takes the right box when swapped.
+        let (chat_x, chat_bw, logs_x, logs_bw) = if cfg.swap {
+            (OUTER + logs_w + GAP, chat_w, OUTER, logs_w)
+        } else {
+            (OUTER, chat_w, OUTER + chat_w + GAP, logs_w)
+        };
+        let chat = Pane::new(chat_x, box_y, chat_bw, box_h, cw, ch, CHAT_FG, CHAT_BG, cfg.chat_title.clone(), true);
+        let logs = Pane::new(logs_x, box_y, logs_bw, box_h, cw, ch, LOGS_FG, LOGS_BG, cfg.logs_title.clone(), false);
         let mut status_left = String::from("Chitti OS v");
         status_left.push_str(crate::VERSION);
         Screen {
@@ -353,7 +394,7 @@ impl Screen {
         // Title, just inside the top border.
         let ty = p.y + BORDER + 4;
         let tx = p.x + BORDER + PAD;
-        let end = self.draw_str(tx, ty, p.title, title_c, p.bg);
+        let end = self.draw_str(tx, ty, &p.title, title_c, p.bg);
         if active {
             self.draw_str(end, ty, " *", ACCENT, p.bg);
         }
@@ -523,6 +564,24 @@ pub fn log_print(s: &str) {
 fn dummy_pane() -> Pane {
     Pane {
         x: 0, y: 0, w: 0, h: 0, ix: 0, iy: 0, cw: 1, ch: 1, cols: 1, rows: 1, col: 0, row: 0,
-        fg: SCREEN_BG, bg: SCREEN_BG, title: "", show_caret: false,
+        fg: SCREEN_BG, bg: SCREEN_BG, title: String::new(), show_caret: false,
     }
+}
+
+/// Rebuild the panes from a new [`LayoutCfg`] (split ratio, font scale, pane
+/// swap, titles) on the live framebuffer and repaint. Used by `/ui` when the
+/// config changes. No-op if the console isn't up.
+pub fn relayout(cfg: &LayoutCfg) {
+    SCREEN.with(|slot| {
+        if let Some(old) = slot {
+            let (left, right) = (old.status_left.clone(), old.status_right.clone());
+            let mut ns = Screen::build(
+                old.addr, old.width, old.height, old.pitch, old.bpp_bytes, old.r_shift, old.g_shift, old.b_shift, cfg,
+            );
+            ns.status_left = left;
+            ns.status_right = right;
+            ns.redraw();
+            *slot = Some(ns);
+        }
+    });
 }

@@ -98,9 +98,11 @@ pub fn run() -> ! {
     serial_println!("Chitti chat. Type a message; the model replies (Ctrl+C to stop generating).");
     serial_println!("Commands start with '/': /help for the list.");
 
-    // Seed the wall clock (RTC or fallback) and paint the status bar once, so
-    // the datetime is right immediately rather than after the first idle tick.
+    // Seed the wall clock (RTC or fallback), load the UI config from
+    // /configs/core/ui.json (applying pane layout + timezone), and paint the
+    // status bar once so the datetime is right immediately.
     crate::clock::init();
+    crate::ui_config::load_and_apply();
     update_status();
 
     // Persona agent (for `/do <intent>`) reused across the session.
@@ -142,6 +144,8 @@ pub fn run() -> ! {
                     serial_println!("(chat context cleared)");
                 }
                 "datetime" | "date" => run_datetime(arg),
+                "ui" => run_ui(arg),
+                "shortcuts" | "keys" => run_shortcuts(),
                 "do" => {
                     if arg.is_empty() {
                         serial_println!("usage: /do <intent>   e.g. /do remember that project is chitti");
@@ -289,6 +293,8 @@ fn print_help() {
     serial_println!("  /perf            end-to-end prefill/decode tok/s");
     serial_println!("  /info            CPU / memory / model / context / OS info");
     serial_println!("  /datetime [..]   show/set the clock: /datetime 2026-07-04 13:45 | /datetime tz +5:30");
+    serial_println!("  /ui [config|reload|reset]  view/edit the UI config (/configs/core/ui.json)");
+    serial_println!("  /shortcuts       list keyboard shortcuts (/configs/core/shortcuts.json)");
     serial_println!("  /disks           list every block device + detected filesystems (read-only)");
     serial_println!("  /ls [n | /path]  list a volume's root: n on disk 0, or a mount path (/mnt)");
     serial_println!("  /mount <d> [v] [/p]  mount disk d's volume v at /p (default /mnt)");
@@ -719,6 +725,38 @@ fn run_datetime(arg: &str) {
             serial_println!("datetime> set to {}  {}", clock::format_datetime(), clock::format_tz());
         }
         None => serial_println!("usage: /datetime YYYY-MM-DD HH:MM[:SS]"),
+    }
+}
+
+/// `/ui` — show or manage the UI config (`/configs/core/ui.json`).
+fn run_ui(arg: &str) {
+    use crate::ui_config;
+    match arg {
+        "" | "config" | "show" => {
+            serial_println!("ui> {} (edit with /open {}, then /ui reload)", ui_config::ui_path(), ui_config::ui_path());
+            for line in ui_config::ui_json_text().lines() {
+                serial_println!("{}", line);
+            }
+        }
+        "reload" => {
+            ui_config::reload_and_apply();
+            update_status();
+            serial_println!("ui> reloaded {} and re-applied the layout", ui_config::ui_path());
+        }
+        "reset" => {
+            ui_config::reset();
+            update_status();
+            serial_println!("ui> reset to defaults and re-applied");
+        }
+        _ => serial_println!("usage: /ui [config|reload|reset]   (edit {} via /open)", ui_config::ui_path()),
+    }
+}
+
+/// `/shortcuts` — list the configured keyboard shortcuts (`shortcuts.json`).
+fn run_shortcuts() {
+    serial_println!("Shortcuts ({}, edit via /open):", crate::ui_config::shortcuts_path());
+    for (keys, desc) in crate::ui_config::shortcuts() {
+        serial_println!("  {:<14} {}", keys, desc);
     }
 }
 
