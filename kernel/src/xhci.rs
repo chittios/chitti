@@ -123,7 +123,26 @@ struct Ptr {
     report_pa: u64,
     report_va: usize,
     report_len: u32,
-    absolute: bool,
+    layout: PtrLayout,
+}
+
+/// Where the fields sit in a pointer's input report, parsed from its HID report
+/// descriptor (so it works for any tablet/mouse layout, not a hardcoded guess).
+/// Byte offsets are absolute in the received report (they already include the
+/// leading report-ID byte when one is present).
+#[derive(Clone, Copy)]
+struct PtrLayout {
+    btn_byte: u8,
+    x_byte: u8,
+    y_byte: u8,
+    field_bytes: u8, // 1 or 2
+    relative: bool,
+    scale_max: i32, // logical max for absolute scaling
+}
+
+impl PtrLayout {
+    /// The standard relative boot-mouse report: `[buttons, dx:i8, dy:i8]`.
+    const BOOT_MOUSE: PtrLayout = PtrLayout { btn_byte: 0, x_byte: 1, y_byte: 2, field_bytes: 1, relative: true, scale_max: 0 };
 }
 
 /// Per-device handles produced by `enumerate_common` (an addressed device with
@@ -137,6 +156,7 @@ struct Common {
     in_ctx_va: usize,
     in_ctx_pa: u64,
     buf_va: usize,
+    buf_pa: u64,
     total: u32,
     cfg_val: u8,
 }
@@ -701,7 +721,7 @@ impl Xhci {
         if !ok {
             return None;
         }
-        Some(Common { slot, ep0_va, ep0_pa, ep0_enq, ep0_cycle, in_ctx_va, in_ctx_pa, buf_va, total, cfg_val })
+        Some(Common { slot, ep0_va, ep0_pa, ep0_enq, ep0_cycle, in_ctx_va, in_ctx_pa, buf_va, buf_pa, total, cfg_val })
     }
 
     /// Set the configuration, put the interface into a protocol, and configure
@@ -761,21 +781,40 @@ impl Xhci {
     /// and arm the first transfer.
     unsafe fn finish_pointer(&mut self, c: &mut Common, iface: u8, ep_addr: u8, ep_mps: u32, interval: u8, proto: u8) -> Option<Ptr> {
         let boot_mouse = proto == 2;
+        // Report-descriptor length from the HID (0x21) descriptor in the config.
+        let rdlen = unsafe { parse_hid_report_len(c.buf_va, c.total as usize, iface) }.unwrap_or(0);
         let (int_dci, int_va, int_pa, report_pa, report_va) =
             unsafe { self.finish_endpoint(c, iface, ep_addr, ep_mps, interval, boot_mouse) }?;
+        // Determine the report layout. A boot mouse (SET_PROTOCOL boot) uses the
+        // fixed 3-byte report; a tablet keeps report protocol, so parse its HID
+        // report descriptor to locate X/Y/buttons (VirtualBox and QEMU tablets
+        // differ, e.g. a leading report-ID byte).
+        let layout = if boot_mouse {
+            PtrLayout::BOOT_MOUSE
+        } else if rdlen > 0 {
+            let got = unsafe {
+                self.control(c.slot, c.ep0_va, c.ep0_pa, &mut c.ep0_enq, &mut c.ep0_cycle, setup(0x81, 6, 0x2200, iface as u16, rdlen), c.buf_pa, (rdlen as u32).min(4096), true)
+            };
+            (got.then(|| unsafe { parse_report_layout(c.buf_va, (rdlen as usize).min(4096)) }).flatten())
+                // Fallback: the common absolute tablet report [buttons, X:u16, Y:u16].
+                .unwrap_or(PtrLayout { btn_byte: 0, x_byte: 1, y_byte: 3, field_bytes: 2, relative: false, scale_max: 0x7fff })
+        } else {
+            PtrLayout { btn_byte: 0, x_byte: 1, y_byte: 3, field_bytes: 2, relative: false, scale_max: 0x7fff }
+        };
         let mut ptr = Ptr {
             slot: c.slot, int_dci, int_ring_va: int_va, int_ring_pa: int_pa,
             int_enqueue: 0, int_cycle: 1, report_pa, report_va,
-            report_len: ep_mps.clamp(4, 8),
-            absolute: !boot_mouse,
+            report_len: ep_mps.clamp(4, 16),
+            layout,
         };
         unsafe {
             self.arm_int(ptr.int_ring_va, ptr.int_ring_pa, &mut ptr.int_enqueue, &mut ptr.int_cycle, ptr.report_pa, ptr.report_len, ptr.slot, ptr.int_dci);
         }
         crate::ktrace::log_fmt(format_args!(
-            "xhci: HID pointer ready (slot {}, ep {ep_addr:#x}, dci {int_dci}, {})",
+            "xhci: HID pointer ready (slot {}, ep {ep_addr:#x}, dci {int_dci}, {}, x@{} y@{} {}B btn@{} max={})",
             c.slot,
-            if boot_mouse { "boot mouse" } else { "absolute tablet" }
+            if layout.relative { "relative" } else { "absolute" },
+            layout.x_byte, layout.y_byte, layout.field_bytes, layout.btn_byte, layout.scale_max
         ));
         Some(ptr)
     }
@@ -892,21 +931,28 @@ impl Xhci {
                 }
                 if let Some(m) = mouse.as_mut() {
                     if m.slot == slot && m.int_dci == dci {
-                        let n = m.report_len as usize;
-                        let mut rep = [0u8; 8];
-                        for (i, b) in rep.iter_mut().enumerate().take(n.min(8)) {
+                        let n = (m.report_len as usize).min(16);
+                        let mut rep = [0u8; 16];
+                        for (i, b) in rep.iter_mut().enumerate().take(n) {
                             *b = read_volatile((m.report_va + i) as *const u8);
                         }
-                        if m.absolute {
-                            // [buttons, X:u16le, Y:u16le] in 0..=0x7fff (tablet).
-                            let x = (rep[1] as u32) | ((rep[2] as u32) << 8);
-                            let y = (rep[3] as u32) | ((rep[4] as u32) << 8);
-                            crate::mouse::set_abs(x as i32, y as i32, 0x7fff);
+                        let lo = m.layout;
+                        let field = |off: u8| -> u32 {
+                            let o = off as usize;
+                            if lo.field_bytes >= 2 {
+                                (rep[o] as u32) | ((*rep.get(o + 1).unwrap_or(&0) as u32) << 8)
+                            } else {
+                                rep[o] as u32
+                            }
+                        };
+                        let (x, y) = (field(lo.x_byte), field(lo.y_byte));
+                        if lo.relative {
+                            let sext = |v: u32| if lo.field_bytes >= 2 { v as u16 as i16 as i32 } else { v as u8 as i8 as i32 };
+                            crate::mouse::move_rel(sext(x), sext(y));
                         } else {
-                            // [buttons, dx:i8, dy:i8] (boot mouse, relative).
-                            crate::mouse::move_rel(rep[1] as i8 as i32, rep[2] as i8 as i32);
+                            crate::mouse::set_abs(x as i32, y as i32, lo.scale_max);
                         }
-                        crate::mouse::set_left(rep[0] & 1 != 0);
+                        crate::mouse::set_left(rep[lo.btn_byte as usize] & 1 != 0);
                         self.arm_int(m.int_ring_va, m.int_ring_pa, &mut m.int_enqueue, &mut m.int_cycle, m.report_pa, m.report_len, m.slot, m.int_dci);
                         continue;
                     }
@@ -1035,6 +1081,110 @@ unsafe fn parse_hid_pointer(buf: usize, len: usize) -> Option<(u8, u8, u32, u8, 
         i += blen;
     }
     None
+}
+
+/// Find the report-descriptor length for interface `iface` from its HID (0x21)
+/// descriptor in the config buffer (wDescriptorLength at offset 7).
+unsafe fn parse_hid_report_len(buf: usize, len: usize, iface: u8) -> Option<u16> {
+    let mut i = 0usize;
+    let mut in_iface = false;
+    while i + 2 <= len {
+        let blen = unsafe { read_volatile((buf + i) as *const u8) } as usize;
+        let btype = unsafe { read_volatile((buf + i + 1) as *const u8) };
+        if blen < 2 {
+            break;
+        }
+        if btype == 0x04 {
+            in_iface = unsafe { read_volatile((buf + i + 2) as *const u8) } == iface;
+        } else if btype == 0x21 && in_iface && i + 9 <= len {
+            return Some(unsafe { read_u16(buf + i + 7) });
+        }
+        i += blen;
+    }
+    None
+}
+
+/// Parse a HID **report descriptor** to locate the pointer's X/Y/button fields
+/// (works for any tablet/mouse layout, incl. a leading report-ID byte). Walks
+/// the item stream tracking usage page / report size / count / id and, on each
+/// Input item, assigns bit offsets to its usages.
+unsafe fn parse_report_layout(buf: usize, len: usize) -> Option<PtrLayout> {
+    let (mut usage_page, mut report_size, mut report_count) = (0u16, 0u32, 0u32);
+    let mut logical_max = 0i32;
+    let mut x_scale = 0i32; // logical max in effect when the X field is seen
+    let mut usages = [0u16; 16];
+    let mut nusg = 0usize;
+    let mut bit = 0u32; // current bit offset within the input report
+    let (mut x, mut y, mut btn, mut rel): (Option<(u32, u32)>, Option<(u32, u32)>, Option<u32>, bool) = (None, None, None, false);
+    let mut i = 0usize;
+    while i < len {
+        let b = unsafe { read_volatile((buf + i) as *const u8) };
+        i += 1;
+        let size = match b & 3 {
+            3 => 4,
+            n => n as usize,
+        };
+        if i + size > len {
+            break;
+        }
+        let mut data = 0u32;
+        for k in 0..size {
+            data |= (unsafe { read_volatile((buf + i + k) as *const u8) } as u32) << (8 * k);
+        }
+        i += size;
+        let (typ, tag) = ((b >> 2) & 3, b >> 4);
+        match (typ, tag) {
+            (1, 0x0) => usage_page = data as u16,
+            (1, 0x7) => report_size = data,
+            (1, 0x9) => report_count = data,
+            (1, 0x8) => bit = 8, // Report ID declared → reports carry a 1-byte ID prefix
+            (1, 0x2) => logical_max = data as i32,
+            (2, 0x0) => {
+                if nusg < usages.len() {
+                    usages[nusg] = data as u16;
+                    nusg += 1;
+                }
+            }
+            (0, 0x8) => {
+                // Input: assign report_count fields of report_size bits.
+                if data & 1 == 0 {
+                    for f in 0..report_count {
+                        let u = if (f as usize) < nusg {
+                            usages[f as usize]
+                        } else if nusg > 0 {
+                            usages[nusg - 1]
+                        } else {
+                            0
+                        };
+                        let fb = bit + f * report_size;
+                        if usage_page == 0x01 && u == 0x30 {
+                            x = Some((fb, report_size));
+                            rel = data & 4 != 0;
+                            x_scale = logical_max; // capture the max in effect for X
+                        } else if usage_page == 0x01 && u == 0x31 {
+                            y = Some((fb, report_size));
+                        } else if usage_page == 0x09 && btn.is_none() {
+                            btn = Some(fb);
+                        }
+                    }
+                }
+                bit += report_count * report_size;
+                nusg = 0;
+            }
+            (0, _) => nusg = 0, // other main items (Output/Feature/Collection): clear locals
+            _ => {}
+        }
+    }
+    let (xb, xs) = x?;
+    let (yb, _) = y?;
+    Some(PtrLayout {
+        btn_byte: btn.map(|b| (b / 8) as u8).unwrap_or(0),
+        x_byte: (xb / 8) as u8,
+        y_byte: (yb / 8) as u8,
+        field_bytes: (xs / 8).max(1) as u8,
+        relative: rel,
+        scale_max: if x_scale > 0 { x_scale } else { 0x7fff },
+    })
 }
 
 /// Map a USB HID keyboard usage id to an ASCII byte (US layout). Handles
