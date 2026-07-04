@@ -625,11 +625,14 @@ impl ChatSession {
 fn run_intent_interactive(agent: &mut Agent, planner: &mut RulePlanner, intent: &str) {
     let result = persona::compiled::run(agent, intent, planner);
     if result.starts_with("refused:tainted:") {
-        serial_println!("!! Destructive action justified by UNTRUSTED ingested content was refused.");
-        serial_print!("   Confirm anyway? [y/N] ");
-        let mut answer = String::new();
-        read_line(&mut answer);
-        if answer.trim().eq_ignore_ascii_case("y") {
+        // Prompt-injection defence: a destructive action justified by untrusted
+        // ingested content needs an explicit human OK — via the approval modal
+        // (keyboard or mouse), not a bare text prompt.
+        let ok = crate::modal::confirm(
+            "Destructive action \u{2014} confirm?",
+            "This action is justified by UNTRUSTED ingested content and was refused. Proceed anyway?",
+        );
+        if ok {
             agent.set_confirm_destructive(true);
             let confirmed = persona::compiled::run(agent, intent, planner);
             agent.set_confirm_destructive(false);

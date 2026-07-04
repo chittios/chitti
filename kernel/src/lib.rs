@@ -33,6 +33,7 @@ pub mod json;
 pub mod ktrace;
 pub mod limine_protocol;
 pub mod mm;
+pub mod modal;
 pub mod mouse;
 pub mod persona;
 #[cfg(target_arch = "x86_64")]

@@ -58,6 +58,14 @@ serde = { version = "1", default-features = false, features = ["alloc", "derive"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 bitflags = { version = "2", default-features = false, features = ["serde"] }
 
+# smoltcp — the no_std TCP/IP stack behind the net subsystem (virtio-net / e1000
+# drivers feed it raw Ethernet frames via its phy::Device trait). alloc-backed
+# socket set; Ethernet + IPv4 + DHCPv4 + DNS + ICMP (ping) + TCP/UDP.
+smoltcp = { version = "0.11", default-features = false, features = [
+    "alloc", "medium-ethernet", "proto-ipv4", "proto-dhcpv4",
+    "socket-tcp", "socket-udp", "socket-icmp", "socket-dhcpv4", "socket-dns",
+] }
+
 # No per-profile `panic = "abort"` override here: the target spec's own
 # "panic-strategy": "abort" is already authoritative. Adding an explicit
 # `-C panic=abort` on top of that makes this package's root profile diverge
