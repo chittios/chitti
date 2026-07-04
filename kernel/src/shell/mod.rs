@@ -366,7 +366,13 @@ fn print_info(orch: &crate::agent::orchestrator::Orchestrator, chat: Option<&Cha
     serial_println!("  memory:  heap {} MiB used / {} MiB total ({} MiB free)", mib(used), mib(total), mib(free));
 
     // Model (parse the GGUF container header — cheap, zero-copy).
-    let model_name = if cfg!(feature = "model-9b") { "Qwen3.5-9B" } else { "Qwen3.5-0.8B" };
+    let model_name = if cfg!(feature = "model-9b") {
+        "Qwen3.5-9B"
+    } else if cfg!(feature = "model-4b") {
+        "Qwen3.5-4B"
+    } else {
+        "Qwen3.5-0.8B"
+    };
     match crate::cortex::model_module() {
         Some(bytes) => match crate::cortex::gguf::Gguf::parse(bytes) {
             Ok(g) => serial_println!(

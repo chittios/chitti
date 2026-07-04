@@ -71,17 +71,22 @@ The underlying `cargo xtask` commands:
 | `cargo xtask image -arch <arch> [-model <m>]` | Assemble a bootable image (x86: hybrid BIOS/UEFI ISO; aarch64: a GPT disk image that boots standalone via UEFI). |
 | `cargo xtask test` | Run the in-kernel `custom_test_frameworks` suite under `qemu-system-x86_64`, headless, asserting via serial + `isa-debug-exit`. **Must stay 104/104.** |
 
-`-model qwen3.5-0.8b` (default) or `-model qwen3.5-9b` selects the bundled model
-and the memory layout. `-arch aarch64 --uefi` boots via the `stub/` UEFI
-bootloader under AAVMF instead of `-kernel`.
+`-model qwen3.5-0.8b`, `-model qwen3.5-4b` (the default in the `Makefile`), or
+`-model qwen3.5-9b` selects the bundled model and its heap-size tier. The memory
+*layout* is **not** hardcoded per model: the kernel discovers RAM at boot (the
+DTB on `-kernel`, the UEFI stub's boot-info on real hardware/VirtualBox) and
+places the heap accordingly, so any `-m`/VM size works and a model that won't fit
+is reported as "not enough memory" rather than corrupting memory. `-arch aarch64
+--uefi` boots via the `stub/` UEFI bootloader under AAVMF instead of `-kernel`.
 
 ## The model
 
-The model is **not committed** (it's hundreds of MB, loaded as a boot module /
-placed in guest RAM). Fetch it once:
+The model is **not committed** (it's hundreds of MB / a few GB, loaded as a boot
+module or placed in guest RAM). Fetch one:
 
 ```sh
-xtask/fetch-model.sh            # writes assets/…  (Qwen3.5-0.8B GGUF, ~812 MB)
+xtask/fetch-model.sh                 # default: Qwen3.5-4B GGUF (Q4_0, ~2.6 GB)
+xtask/fetch-model.sh qwen3.5-0.8b    # the compact model (Q8_0, ~812 MB)
 ```
 
 `cargo xtask test` never loads the model (the fast unit suite validates tensor

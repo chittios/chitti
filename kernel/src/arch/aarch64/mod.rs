@@ -7,6 +7,7 @@
 //! PL011 UART, generic timer) the shared upper layers build on.
 
 pub mod boot;
+pub mod dtb;
 pub mod mmu;
 pub mod ahci;
 pub mod disk;

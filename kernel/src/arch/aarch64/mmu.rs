@@ -5,28 +5,99 @@
 //! there -- so this must run before any NEON/cached work.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[repr(align(4096))]
 struct Table(#[allow(dead_code)] [u64; 512]);
 static mut L1: Table = Table([0; 512]);
 
-/// Number of 1 GiB identity-mapped blocks. The default 4 GiB covers the 0.8B
-/// layout (kernel + model at 0x48000000 + heap at 0x80000000). The `model-9b`
-/// layout needs the ~5.8 GiB model at 0x80000000 and a heap at 0x2_00000000,
-/// so map 12 GiB (matching `cargo xtask run -model qwen3.5-9b`'s `-m 12G`).
-#[cfg(not(feature = "model-9b"))]
-const N_BLOCKS: u64 = 4;
-#[cfg(feature = "model-9b")]
-const N_BLOCKS: u64 = 12;
+/// Top of the RAM/heap region the kernel may use, discovered at boot: on
+/// `-kernel` the top of DTB `/memory`; on UEFI `heap_base + heap_size` reported
+/// by the stub. Bounds the identity map. 0 until [`init`] runs.
+static RAM_END: AtomicU64 = AtomicU64::new(0);
+/// Extent (bytes) of the identity map [`init`] built — `MAP_GIB` 1-GiB blocks.
+static MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// On the UEFI path, the physical base of the heap the stub pre-allocated (right
+/// above the model) and reported in boot-info; the kernel places its heap there
+/// instead of at the top of RAM (the top is where UEFI parks ACPI/runtime data).
+/// 0 on the `-kernel` path (heap goes at the top of RAM instead).
+static UEFI_HEAP_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Minimum GiB to identity-map, regardless of RAM size. The UEFI/GOP framebuffer
+/// the kernel renders into can sit above RAM in a device window; the previous
+/// (hardcoded) big-model layout mapped 12 GiB and that reliably covered it on
+/// VirtualBox/UTM, so keep 12 as the floor. The map only ever *grows* past this
+/// (for hosts with more RAM), never shrinks, so framebuffer coverage can't
+/// regress. Mapping blocks past real RAM is harmless — they're never accessed.
+const MAP_FLOOR_GIB: u64 = 12;
+/// Conservative fallback RAM if neither a DTB nor a stub boot-info field is
+/// present (an unknown boot path): assume the `virt` base + 4 GiB. A model that
+/// needs more will fail the fit check in `mm::init` with a clear message rather
+/// than faulting on an unbacked heap.
+const FALLBACK_RAM_END: u64 = 0x4000_0000 + (4 << 30);
+
+/// What [`detect`] found: the usable top address, and (UEFI only) the stub's
+/// pre-allocated heap base.
+struct RamInfo {
+    ram_end: u64,
+    uefi_heap_base: u64,
+}
+
+/// Discover RAM at boot. Runs with the MMU **off** (before the map is built), so
+/// it only does pure reads — no atomics, no heap.
+fn detect() -> RamInfo {
+    // `-kernel`: QEMU passes the DTB in x0; parse its `/memory` node.
+    // SAFETY: `boot_x0()` is the DTB pointer (or non-FDT, rejected by magic).
+    if let Some((b, s)) = unsafe { super::dtb::memory_region(super::boot::boot_x0()) } {
+        return RamInfo { ram_end: b.saturating_add(s), uefi_heap_base: 0 };
+    }
+    // UEFI/stub: the boot-info page carries the heap region (heap_base@60,
+    // heap_size@68) the stub pre-allocated just above the model.
+    if let Some((hb, hs)) = bootinfo_heap(super::boot::boot_x1()) {
+        return RamInfo { ram_end: hb.saturating_add(hs), uefi_heap_base: hb };
+    }
+    RamInfo { ram_end: FALLBACK_RAM_END, uefi_heap_base: 0 }
+}
+
+/// Read `(heap_base, heap_size)` from the UEFI stub's boot-info page, if present.
+/// Layout: magic "CHITTIBI"@0, heap_base@60..68, heap_size@68..76 (little-endian;
+/// see `stub`). Pure reads (MMU may be off).
+fn bootinfo_heap(bi: u64) -> Option<(u64, u64)> {
+    if bi == 0 {
+        return None;
+    }
+    let p = bi as *const u8;
+    // SAFETY: identity/flat address; read the 8-byte magic then two u64 fields.
+    let magic = unsafe { core::slice::from_raw_parts(p, 8) };
+    if magic != b"CHITTIBI" {
+        return None;
+    }
+    let rd = |off: usize| -> u64 {
+        // SAFETY: within the 4 KiB boot-info page.
+        let b = unsafe { core::slice::from_raw_parts(p.add(off), 8) };
+        u64::from_le_bytes(b.try_into().unwrap())
+    };
+    let (base, size) = (rd(60), rd(68));
+    if base == 0 || size == 0 {
+        return None;
+    }
+    Some((base, size))
+}
 
 /// Set up the identity map and enable the MMU + caches. Idempotent-ish; call
-/// once, early, on the boot core.
+/// once, early, on the boot core. The map spans `max(usable RAM, 12 GiB)` in
+/// 1-GiB blocks, so it always covers RAM (where the heap lives) and the UEFI
+/// framebuffer, on any `-m`/VM size — no per-model constant.
 pub fn init() {
+    let info = detect();
+    // Map enough 1-GiB blocks to cover RAM, never fewer than the floor, capped
+    // at the single L1 table's 512 GiB.
+    let map_gib = info.ram_end.div_ceil(1 << 30).max(MAP_FLOOR_GIB).min(512);
     // SAFETY: single-core boot; builds a valid identity map and programs the
     // standard EL1 translation registers. VA==PA, so stack/code/UART stay valid.
     unsafe {
         let l1 = core::ptr::addr_of_mut!(L1) as *mut u64;
-        for i in 0..N_BLOCKS {
+        for i in 0..map_gib {
             let pa = i << 30; // 1 GiB blocks
             let attr_idx = if i == 0 { 1u64 } else { 0u64 }; // 0: Device MMIO, else Normal
             let sh = if i == 0 { 0u64 } else { 0b11u64 }; // inner-shareable for Normal
@@ -35,6 +106,28 @@ pub fn init() {
         }
         enable_mmu(l1);
     }
+    // MMU is on now, so atomics work; publish what we discovered/mapped.
+    RAM_END.store(info.ram_end, Ordering::Relaxed);
+    UEFI_HEAP_BASE.store(info.uefi_heap_base, Ordering::Relaxed);
+    MAPPED_BYTES.store(map_gib << 30, Ordering::Relaxed);
+}
+
+/// Top usable RAM address discovered at boot. On `-kernel` the heap is placed
+/// just below this (see [`crate::mm`]).
+pub fn ram_end() -> u64 {
+    RAM_END.load(Ordering::Relaxed)
+}
+
+/// The UEFI stub's pre-allocated heap base (above the model), or 0 on the
+/// `-kernel` path (where the kernel places the heap at the top of RAM itself).
+pub fn uefi_heap_base() -> u64 {
+    UEFI_HEAP_BASE.load(Ordering::Relaxed)
+}
+
+/// Extent (bytes) of the identity map — the upper bound for any physical address
+/// the kernel may dereference (e.g. the framebuffer must lie below this).
+pub fn mapped_bytes() -> u64 {
+    MAPPED_BYTES.load(Ordering::Relaxed)
 }
 
 /// Add a 1 GiB **Device** identity mapping for the block containing `pa`, live.

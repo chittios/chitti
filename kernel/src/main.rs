@@ -265,12 +265,9 @@ pub extern "C" fn aarch64_start() -> ! {
 /// present and within the identity map. `None` on the `-kernel` path.
 #[cfg(all(target_arch = "aarch64", not(feature = "boot-limine")))]
 fn bootinfo_page() -> Option<u64> {
-    #[cfg(not(feature = "model-9b"))]
-    const MAP_LIMIT: u64 = 4 << 30;
-    #[cfg(feature = "model-9b")]
-    const MAP_LIMIT: u64 = 12 << 30;
+    let map_limit = chitti_kernel::arch::aarch64::mmu::mapped_bytes();
     let bi = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(chitti_kernel::arch::aarch64::boot::BOOT_X1)) };
-    if bi == 0 || bi >= MAP_LIMIT {
+    if bi == 0 || bi >= map_limit {
         return None;
     }
     // SAFETY: identity-mapped RAM below the map limit.
@@ -306,18 +303,14 @@ fn aarch64_pcie_init() {}
 /// (r_shift, g_shift, b_shift, bytes-per-pixel).
 #[cfg(all(target_arch = "aarch64", not(feature = "boot-limine")))]
 fn bootinfo_framebuffer() -> Option<(usize, u64, u64, u64, u64, u32, u32, u32)> {
-    // Identity-map coverage (arch::aarch64::mmu N_BLOCKS 1-GiB blocks).
-    #[cfg(not(feature = "model-9b"))]
-    const MAP_LIMIT: u64 = 4 << 30;
-    #[cfg(feature = "model-9b")]
-    const MAP_LIMIT: u64 = 12 << 30;
+    // Identity-map coverage (the extent arch::aarch64::mmu actually mapped).
+    let map_limit = chitti_kernel::arch::aarch64::mmu::mapped_bytes();
     let bi = bootinfo_page()?;
-    let _ = MAP_LIMIT;
     // SAFETY: `bi` is identity-mapped RAM below the map limit; read 52 bytes.
     let page = unsafe { core::slice::from_raw_parts(bi as *const u8, 52) };
     let f = |o: usize| u64::from_le_bytes(page[o..o + 8].try_into().unwrap());
     let (addr, w, h, pitch) = (f(8), f(16), f(24), f(32));
-    if addr == 0 || addr + h * pitch > MAP_LIMIT {
+    if addr == 0 || addr + h * pitch > map_limit {
         serial_println!("Chitti: boot-info framebuffer at {:#x} outside the identity map -- skipping", addr);
         return None;
     }

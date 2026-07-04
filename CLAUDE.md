@@ -84,7 +84,7 @@ real UEFI hardware.
 - **Skills** (`skills/`) — L0/L1/L2 progressive disclosure, signed install with
   consent + capability subsetting, installable skill-agents.
 - **Cortex** (`cortex/`) — CPU transformer inference (Qwen3.5, `-model
-  qwen3.5-0.8b|qwen3.5-9b`); SIMD tensor kernels (SSE2/AVX2 ∣ NEON ∣ scalar behind
+  qwen3.5-0.8b|qwen3.5-4b|qwen3.5-9b`); SIMD tensor kernels (SSE2/AVX2 ∣ NEON ∣ scalar behind
   one API); zero-copy GGUF; grammar-constrained sampler; KV/recurrent cache.
 - **Synapse** (`synapse/`) — the capability ABI: primitive registry, GBNF-style
   grammar, deterministic executor, append-only audit log, taint gate.
