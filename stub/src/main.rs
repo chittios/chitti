@@ -139,12 +139,48 @@ fn main() -> Status {
                 return None;
             }
         };
+        // Select the LARGEST available mode so an HDMI monitor runs at its full
+        // native resolution instead of whatever (often 800x600/1024x768) mode
+        // the firmware left GOP in. `Mode` is `Copy`, so pick the best while the
+        // read-only `modes()` iterator is alive, then `set_mode` it.
+        let mut best: Option<(uefi::proto::console::gop::Mode, usize)> = None;
+        for m in gop.modes() {
+            let mi = m.info();
+            if mi.pixel_format() == PixelFormat::BltOnly {
+                continue;
+            }
+            let (mw, mh) = mi.resolution();
+            let area = mw * mh;
+            if best.as_ref().map_or(true, |&(_, ba)| area > ba) {
+                best = Some((m, area));
+            }
+        }
+        if let Some((ref m, _)) = best {
+            let (mw, mh) = m.info().resolution();
+            if let Err(e) = gop.set_mode(m) {
+                log::info!("chitti-stub: GOP set_mode {mw}x{mh} failed: {e:?} (keeping current)");
+            }
+        }
+
         let mode = gop.current_mode_info();
         if mode.pixel_format() == PixelFormat::BltOnly {
             return None;
         }
         let (w, hgt) = mode.resolution();
         let pitch = mode.stride() as u64 * 4;
+        // Pixel-format shifts (bit position of each channel in the LE u32). GOP
+        // "Rgb" stores bytes R,G,B,X → red at bit 0; "Bgr" → red at bit 16 (the
+        // common XRGB8888). A real HDMI panel can report either, and swapping
+        // red/blue would tint the whole UI, so carry the shifts to the kernel.
+        let (rs, gs, bs): (u8, u8, u8) = match mode.pixel_format() {
+            PixelFormat::Rgb => (0, 8, 16),
+            PixelFormat::Bgr => (16, 8, 0),
+            PixelFormat::Bitmask => match mode.pixel_bitmask() {
+                Some(m) => (m.red.trailing_zeros() as u8, m.green.trailing_zeros() as u8, m.blue.trailing_zeros() as u8),
+                None => (16, 8, 0),
+            },
+            PixelFormat::BltOnly => return None,
+        };
         let fb = gop.frame_buffer().as_mut_ptr() as u64;
         // Boot-info page: AnyPages (fixed low addresses aren't reliably
         // allocatable — they vary per firmware/platform). Its address is passed
@@ -162,7 +198,12 @@ fn main() -> Status {
         // hardcoded. 0 if absent.
         let rsdp = acpi_rsdp();
         page[40..48].copy_from_slice(&rsdp.to_le_bytes());
-        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x}, ACPI RSDP {rsdp:#x} -> boot-info {addr:#x}");
+        // Pixel format at 48..52: r_shift, g_shift, b_shift, bytes-per-pixel.
+        page[48] = rs;
+        page[49] = gs;
+        page[50] = bs;
+        page[51] = 4;
+        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x} -> boot-info {addr:#x}");
         Some(addr)
     })();
 

@@ -17,6 +17,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec;
+use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 
 /// fw_cfg MMIO base on the QEMU `virt` machine.
@@ -37,9 +38,13 @@ const CTL_WRITE: u32 = 0x10;
 /// `DRM_FORMAT_XRGB8888` ('XR24').
 const FOURCC_XRGB8888: u32 = 0x3432_5258;
 
-/// Default framebuffer geometry.
-const WIDTH: u64 = 1024;
-const HEIGHT: u64 = 768;
+/// Fallback framebuffer geometry, used only when the launcher did not provide a
+/// resolution (see [`read_fbres`]). ramfb has no preferred-mode/EDID mechanism,
+/// so the guest must choose a size; `xtask` passes the host display's size via
+/// the `opt/chitti/fbres` fw_cfg file, and this is the last resort if it's
+/// absent (e.g. a bare `-kernel` boot). Kept modest so it fits any window.
+const FALLBACK_WIDTH: u64 = 1280;
+const FALLBACK_HEIGHT: u64 = 800;
 
 /// The DMA command block QEMU reads. All fields are big-endian on the wire.
 #[repr(C)]
@@ -94,11 +99,11 @@ unsafe fn dma(control: u32, length: u32, phys: u64) -> bool {
     }
 }
 
-/// Scan the fw_cfg file directory for `etc/ramfb` and return its selector.
+/// Scan the fw_cfg file directory for `name`, returning its `(selector, size)`.
 ///
 /// # Safety
 /// Touches fw_cfg MMIO; call once during single-core boot.
-unsafe fn find_ramfb_selector() -> Option<u16> {
+unsafe fn find_file(name: &[u8]) -> Option<(u16, u32)> {
     // First 4 bytes of the directory are a big-endian entry count.
     let mut count_be: u32 = 0;
     if !unsafe { dma((FW_CFG_FILE_DIR as u32) << 16 | CTL_SELECT | CTL_READ, 4, &mut count_be as *mut u32 as u64) } {
@@ -116,11 +121,48 @@ unsafe fn find_ramfb_selector() -> Option<u16> {
     }
     for e in entries.chunks_exact(64) {
         let name_len = e[8..64].iter().position(|&b| b == 0).unwrap_or(56);
-        if &e[8..8 + name_len] == b"etc/ramfb" {
-            return Some(u16::from_be_bytes([e[4], e[5]]));
+        if &e[8..8 + name_len] == name {
+            let size = u32::from_be_bytes([e[0], e[1], e[2], e[3]]);
+            return Some((u16::from_be_bytes([e[4], e[5]]), size));
         }
     }
     None
+}
+
+/// Read a whole named fw_cfg file into a buffer.
+///
+/// # Safety
+/// Touches fw_cfg MMIO; call once during single-core boot.
+unsafe fn read_file(name: &[u8]) -> Option<Vec<u8>> {
+    let (selector, size) = unsafe { find_file(name) }?;
+    if size == 0 || size > 4096 {
+        return None;
+    }
+    let mut buf = vec![0u8; size as usize];
+    if !unsafe { dma((selector as u32) << 16 | CTL_SELECT | CTL_READ, size, buf.as_mut_ptr() as u64) } {
+        return None;
+    }
+    Some(buf)
+}
+
+/// The framebuffer resolution the launcher wants, from the `opt/chitti/fbres`
+/// fw_cfg file (an ASCII `"WIDTHxHEIGHT"` string `xtask` derives from the host
+/// display). `None` if absent/malformed, in which case the fallback is used.
+///
+/// # Safety
+/// Touches fw_cfg MMIO; call once during single-core boot.
+unsafe fn read_fbres() -> Option<(u64, u64)> {
+    let buf = unsafe { read_file(b"opt/chitti/fbres") }?;
+    let s = core::str::from_utf8(&buf).ok()?.trim();
+    let (w, h) = s.split_once('x')?;
+    let w: u64 = w.trim().parse().ok()?;
+    let h: u64 = h.trim().parse().ok()?;
+    // Sanity clamp: at least VGA, at most 8K.
+    if (320..=7680).contains(&w) && (240..=4320).contains(&h) {
+        Some((w, h))
+    } else {
+        None
+    }
 }
 
 /// Bring up the ramfb framebuffer. Returns `(addr, width, height, pitch)` on
@@ -131,10 +173,13 @@ unsafe fn find_ramfb_selector() -> Option<u16> {
 /// # Safety
 /// Must run once, on the boot core, after the heap is initialized.
 pub unsafe fn init() -> Option<(usize, u64, u64, u64)> {
-    let selector = unsafe { find_ramfb_selector() }?;
+    let (selector, _) = unsafe { find_file(b"etc/ramfb") }?;
 
-    let stride = WIDTH * 4;
-    let fb: &'static mut [u8] = Box::leak(vec![0u8; (stride * HEIGHT) as usize].into_boxed_slice());
+    // Resolution from the launcher (host display size) or the fallback — never
+    // a single baked-in constant.
+    let (width, height) = unsafe { read_fbres() }.unwrap_or((FALLBACK_WIDTH, FALLBACK_HEIGHT));
+    let stride = width * 4;
+    let fb: &'static mut [u8] = Box::leak(vec![0u8; (stride * height) as usize].into_boxed_slice());
     // Identity-mapped RAM on `virt`, so the virtual address is the physical one.
     let fb_pa = fb.as_ptr() as u64;
 
@@ -142,8 +187,8 @@ pub unsafe fn init() -> Option<(usize, u64, u64, u64)> {
         addr: fb_pa.to_be(),
         fourcc: FOURCC_XRGB8888.to_be(),
         flags: 0u32.to_be(),
-        width: (WIDTH as u32).to_be(),
-        height: (HEIGHT as u32).to_be(),
+        width: (width as u32).to_be(),
+        height: (height as u32).to_be(),
         stride: (stride as u32).to_be(),
     };
     // 28 bytes on the wire (u64 + 5×u32), regardless of struct padding.
@@ -151,6 +196,6 @@ pub unsafe fn init() -> Option<(usize, u64, u64, u64)> {
     if !unsafe { dma((selector as u32) << 16 | CTL_SELECT | CTL_WRITE, 28, cfg_pa) } {
         return None;
     }
-    crate::ktrace::log_fmt(format_args!("ramfb: {WIDTH}x{HEIGHT} XRGB8888 framebuffer at {fb_pa:#x} (selector {selector})"));
-    Some((fb_pa as usize, WIDTH, HEIGHT, stride))
+    crate::ktrace::log_fmt(format_args!("ramfb: {width}x{height} XRGB8888 framebuffer at {fb_pa:#x} (selector {selector})"));
+    Some((fb_pa as usize, width, height, stride))
 }
