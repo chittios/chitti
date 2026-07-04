@@ -12,13 +12,12 @@ fn dma_alloc(bytes: usize) -> Option<Dma> {
     crate::mm::alloc_dma(bytes).map(|(phys, virt)| Dma { phys, virt })
 }
 
-/// Probe the `n`-th NVMe controller on the PCI bus (only n==0 supported).
+/// Probe the `n`-th NVMe disk on the PCI bus. One controller is supported, but
+/// it may expose several namespaces; `n` selects namespace `n + 1`. `None` once
+/// namespaces run out.
 pub fn probe_nth(n: usize) -> Option<Nvme> {
     // NVMe class 0x01 (mass storage) / subclass 0x08 / prog-if 0x02.
     let d = pci::find_class(0x01, 0x08, 0x02)?;
-    if n != 0 {
-        return None; // one NVMe controller supported
-    }
     d.enable_bus_master();
     let bar = d.bar(0);
     if bar == 0 {
@@ -26,5 +25,5 @@ pub fn probe_nth(n: usize) -> Option<Nvme> {
     }
     let regs = crate::mm::map_mmio(bar, MMIO_SPAN);
     // SAFETY: `regs` is the HHDM-mapped NVMe register block.
-    unsafe { Nvme::bringup(regs, dma_alloc) }
+    unsafe { Nvme::bringup(regs, dma_alloc, (n + 1) as u32) }
 }
