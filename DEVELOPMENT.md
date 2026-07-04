@@ -69,7 +69,7 @@ The underlying `cargo xtask` commands:
 | `cargo xtask build -arch <arch> [--release] [-model <m>]` | Cross-compile the kernel. |
 | `cargo xtask run   -arch <arch> [--release] [-model <m>]` | Build the image and boot it in QEMU (serial to stdio + a graphical window). |
 | `cargo xtask image -arch <arch> [-model <m>]` | Assemble a bootable image (x86: hybrid BIOS/UEFI ISO; aarch64: a GPT disk image that boots standalone via UEFI). |
-| `cargo xtask test` | Run the in-kernel `custom_test_frameworks` suite under `qemu-system-x86_64`, headless, asserting via serial + `isa-debug-exit`. **Must stay 103/103.** |
+| `cargo xtask test` | Run the in-kernel `custom_test_frameworks` suite under `qemu-system-x86_64`, headless, asserting via serial + `isa-debug-exit`. **Must stay 104/104.** |
 
 `-model qwen3.5-0.8b` (default) or `-model qwen3.5-9b` selects the bundled model
 and the memory layout. `-arch aarch64 --uefi` boots via the `stub/` UEFI
@@ -94,7 +94,7 @@ the chat/inference demo; numerics are validated against `tools/ref_qwen35.py`
 1. **Dual-arch parity.** A change must build and work on **both** arches.
    After any change run **all** of:
    ```sh
-   cargo xtask build -arch x86_64 && cargo xtask test      # 103/103
+   cargo xtask build -arch x86_64 && cargo xtask test      # 104/104
    cargo xtask build -arch aarch64
    cargo xtask run   -arch aarch64                         # if the change is boot-visible
    ```

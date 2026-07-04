@@ -33,7 +33,7 @@ Every change must uphold:
 Run all of these and make sure they pass:
 
 ```sh
-cargo xtask build -arch x86_64 && cargo xtask test    # must stay 103/103
+cargo xtask build -arch x86_64 && cargo xtask test    # must stay 104/104
 cargo xtask build -arch aarch64
 cargo xtask run   -arch aarch64                        # if the change is boot-visible, spot-check the boot
 ```

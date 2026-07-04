@@ -51,7 +51,7 @@ capability exists on one arch, it exists on the other.
 
 After any change, verify both:
 
-- `cargo xtask build -arch x86_64` **and** `cargo xtask test` (must stay **103/103**)
+- `cargo xtask build -arch x86_64` **and** `cargo xtask test` (must stay **104/104**)
 - `cargo xtask build -arch aarch64` (and boot it via `cargo xtask run -arch aarch64`
   when the change is boot-visible)
 
@@ -105,7 +105,7 @@ Everything goes through `cargo xtask`. Arch is chosen explicitly, never
 host-detected. See [DEVELOPMENT.md](DEVELOPMENT.md) for the full setup.
 
 ```sh
-cargo xtask test                       # in-kernel test suite under QEMU (x86) — 103/103, no model
+cargo xtask test                       # in-kernel test suite under QEMU (x86) — 104/104, no model
 cargo xtask build -arch x86_64|aarch64 # cross-build the kernel
 cargo xtask run   -arch x86_64|aarch64 # boot in QEMU (aarch64 = native HVF on Apple Silicon)
 cargo xtask image -arch x86_64|aarch64 # assemble a bootable image/ISO

@@ -135,20 +135,11 @@ pub fn run() -> ! {
                     serial_println!("Chitti: powering off.");
                     crate::arch::poweroff();
                 }
-                "help" => print_help(),
-                "infer" => run_infer(),
-                "bench" => run_bench(),
-                "perf" => run_perf(),
                 "clear" => {
                     chat = None;
                     serial_println!("(chat context cleared)");
                 }
-                "datetime" | "date" => run_datetime(arg),
-                "ui" => run_ui(arg),
-                "shortcuts" | "keys" => run_shortcuts(),
                 "open" | "edit" => run_open(arg),
-                "ktrace" | "logs" => toggle_ktrace(),
-                "close" => close_action(),
                 "do" => {
                     if arg.is_empty() {
                         serial_println!("usage: /do <intent>   e.g. /do remember that project is chitti");
@@ -243,29 +234,14 @@ pub fn run() -> ! {
                         }
                     }
                 }
-                "skills" => {
-                    let metas = crate::skills::index::metadata();
-                    if metas.is_empty() {
-                        serial_println!("(no skills installed)");
-                    } else {
-                        serial_println!("installed skills (L0 metadata):");
-                        for m in &metas {
-                            serial_println!("  {} [{:?}] — {}", m.name, m.kind, m.description);
-                        }
+                "info" => print_info(&orch, chat.as_ref()),
+                // Everything else is a stateless system command, shared with the
+                // agent tool layer (see `dispatch_system` / `run_tool_command`).
+                _ => {
+                    if !dispatch_system(name, arg) {
+                        serial_println!("unknown command '/{}' -- try /help", name);
                     }
                 }
-                "info" => print_info(&orch, chat.as_ref()),
-                "disks" => disk_list(),
-                "ls" => disk_ls(arg),
-                "mount" => disk_mount(arg),
-                "umount" => disk_umount(arg),
-                "mounts" => disk_mounts(),
-                "cat" => disk_cat(arg),
-                "mkfs" => disk_mkfs(arg),
-                "install" => disk_install(arg),
-                "mkext4" => disk_mkext4(arg),
-                "ext4read" => disk_ext4read(),
-                other => serial_println!("unknown command '/{}' -- try /help", other),
             }
             continue;
         }
@@ -277,6 +253,61 @@ pub fn run() -> ! {
         match chat.as_mut() {
             Some(sess) => sess.turn(msg),
             None => serial_println!("no model bundled -- chat unavailable (try /infer, /do, /bench)"),
+        }
+    }
+}
+
+/// Run a **stateless** system `/command` (one that needs no interactive shell
+/// state — the OS/system commands). Returns `true` if `name` was handled. Shared
+/// by the interactive shell loop and the agent tool layer (`run_tool_command`),
+/// so the root agent can drive the machine with exactly the commands a human can.
+pub fn dispatch_system(name: &str, arg: &str) -> bool {
+    match name {
+        "help" => print_help(),
+        "infer" => run_infer(),
+        "bench" => run_bench(),
+        "perf" => run_perf(),
+        "datetime" | "date" => run_datetime(arg),
+        "ui" => run_ui(arg),
+        "shortcuts" | "keys" => run_shortcuts(),
+        "ktrace" | "logs" => toggle_ktrace(),
+        "close" => close_action(),
+        "skills" => print_skills(),
+        "disks" => disk_list(),
+        "ls" => disk_ls(arg),
+        "mount" => disk_mount(arg),
+        "umount" => disk_umount(arg),
+        "mounts" => disk_mounts(),
+        "cat" => disk_cat(arg),
+        "mkfs" => disk_mkfs(arg),
+        "install" => disk_install(arg),
+        "mkext4" => disk_mkext4(arg),
+        "ext4read" => disk_ext4read(),
+        _ => return false,
+    }
+    true
+}
+
+/// Run a system `/command` on behalf of the root agent (the tool layer) and
+/// return its printed output as the tool result. Reuses every existing command
+/// handler unchanged by capturing serial output for the duration of the call.
+pub fn run_tool_command(name: &str, arg: &str) -> alloc::string::String {
+    crate::serial::capture_begin();
+    if !dispatch_system(name, arg) {
+        serial_println!("'/{}' is not available as a tool (interactive or agent-internal command)", name);
+    }
+    crate::serial::capture_end()
+}
+
+/// List installed skills (L0 metadata). Shared by `/skills` and the agent tool.
+fn print_skills() {
+    let metas = crate::skills::index::metadata();
+    if metas.is_empty() {
+        serial_println!("(no skills installed)");
+    } else {
+        serial_println!("installed skills (L0 metadata):");
+        for m in &metas {
+            serial_println!("  {} [{:?}] — {}", m.name, m.kind, m.description);
         }
     }
 }

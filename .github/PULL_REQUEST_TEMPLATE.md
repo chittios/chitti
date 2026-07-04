@@ -22,7 +22,7 @@
 
 <!-- Show what you ran. -->
 
-- [ ] `cargo xtask build -arch x86_64 && cargo xtask test` → **103/103**
+- [ ] `cargo xtask build -arch x86_64 && cargo xtask test` → **104/104**
 - [ ] `cargo xtask build -arch aarch64`
 - [ ] `cargo xtask run -arch aarch64` (boot spot-checked, if boot-visible)
 - [ ] Framebuffer/driver/input change verified via QMP screendump / VirtualBox
