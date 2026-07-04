@@ -169,6 +169,14 @@ pub unsafe fn init_bsp() -> bool {
         PROBING.store(true, Ordering::Release);
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
         asm!("msr ICC_PMR_EL1, {}", "isb", in(reg) 0xFFu64, options(nostack)); // priority mask = allow all
+        // EOImode = 0: a write to ICC_EOIR1 both drops priority AND deactivates
+        // the interrupt. The reset value is implementation-defined; if it were 1,
+        // our EOI would leave the PPI active forever (exactly one tick, then
+        // silence). Set it explicitly (still inside the recoverable probe).
+        let mut ctlr: u64;
+        asm!("mrs {}, ICC_CTLR_EL1", out(reg) ctlr, options(nomem, nostack));
+        ctlr &= !(1 << 1); // EOImode = 0
+        asm!("msr ICC_CTLR_EL1, {}", "isb", in(reg) ctlr, options(nostack));
         asm!("msr ICC_IGRPEN1_EL1, {}", "isb", in(reg) 1u64, options(nostack)); // enable Group1 delivery
         timer_reload(); // start the virtual timer (CNTV)
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
@@ -194,13 +202,26 @@ pub fn start_preemption() {
         return;
     }
     super::interrupts::enable();
-    // Warmup: confirm the timer IRQ is actually delivered (routing works). At
-    // 100 Hz, ~50 ms yields a few ticks; bounded by the free-running counter.
+    // Warmup: confirm timer IRQs are actually *delivered* before committing to
+    // preemptive mode. Bounded three ways (ticks observed / elapsed time /
+    // iteration cap, in case the counter itself misbehaves) so a platform whose
+    // GIC accepted programming but never delivers (or delivers brokenly) can't
+    // hang the boot here -- we re-mask and continue cooperatively instead.
     let start = super::time_ms();
-    while super::time_ms().wrapping_sub(start) < 50 {
+    let mut iters = 0u64;
+    while ticks() < 3 {
+        iters += 1;
+        if super::time_ms().wrapping_sub(start) >= 200 || iters > 100_000_000 {
+            break;
+        }
         core::hint::spin_loop();
     }
-    crate::ktrace::log_fmt(format_args!("gic: timer delivering IRQs ({} ticks in 50 ms) -- preemptive scheduling", ticks()));
+    if ticks() == 0 {
+        super::interrupts::disable();
+        crate::ktrace::log("gic", "timer IRQs not delivered -- re-masked, staying cooperative");
+        return;
+    }
+    crate::ktrace::log_fmt(format_args!("gic: timer delivering IRQs ({} ticks) -- preemptive scheduling", ticks()));
 }
 
 /// Handle one IRQ: acknowledge via `ICC_IAR1_EL1`, service the timer, complete
