@@ -311,8 +311,28 @@ impl Xhci {
             } else {
                 spins += 1;
                 if spins > 20_000_000 {
+                    unsafe { self.dump_event_ring(want_type) };
                     return None;
                 }
+            }
+        }
+    }
+
+    /// Diagnostic dumped when `wait_event` times out: the current dequeue
+    /// position + cycle, and every event-ring TRB's (control, status) so we can
+    /// tell "controller posted nothing" from "event present, cycle mismatch".
+    unsafe fn dump_event_ring(&self, want_type: u32) {
+        crate::ktrace::log_fmt(format_args!(
+            "xhci: wait_event({want_type}) TIMEOUT deq={} cyc={} erdp-based",
+            self.evt_dequeue, self.evt_cycle
+        ));
+        for i in 0..RING_TRBS {
+            let t = unsafe { read_volatile((self.evt_ring_va + i * 16) as *const Trb) };
+            // Only log non-empty slots (control != 0) to keep it short.
+            if t.control != 0 || t.status != 0 {
+                let ty = (t.control >> 10) & 0x3f;
+                let cc = (t.status >> 24) & 0xff;
+                crate::ktrace::log_fmt(format_args!("  evt[{i}] type={ty} cc={cc} c={} ctrl={:#x}", t.control & 1, t.control));
             }
         }
     }
@@ -439,7 +459,8 @@ impl Xhci {
         }
 
         // 3. Device context + DCBAA entry.
-        let (dev_ctx_pa, _dev_ctx_va) = (self.alloc)(4096)?;
+        let (dev_ctx_pa, dev_ctx_va) = (self.alloc)(4096)?;
+        let dev_ctx_va = dev_ctx_va as usize;
         unsafe { write_volatile((self.dcbaa_va as *mut u64).add(slot as usize), dev_ctx_pa) };
 
         // 4. EP0 transfer ring.
@@ -460,6 +481,16 @@ impl Xhci {
                 crate::ktrace::log_fmt(format_args!("xhci: address device failed cc={cc}"));
                 return None;
             }
+        }
+        // Diagnostic: the output device context after Address Device — slot
+        // state (dword3 bits 31:27) + EP0 state (EP-context dword0 bits 2:0) —
+        // so a "transfer never runs" failure can be told from EP0 not being in
+        // the Running state (1). QEMU: slot=2(addressed), ep0=1(running).
+        unsafe {
+            let slot_state = (read_volatile((dev_ctx_va + 12) as *const u32) >> 27) & 0x1f;
+            let ep0_state = read_volatile((dev_ctx_va + self.ctx_size) as *const u32) & 0x7;
+            crate::ktrace::log_fmt(format_args!("xhci: post-address slot_state={slot_state} ep0_state={ep0_state}"));
+            let _ = dev_ctx_pa;
         }
         crate::ktrace::log_fmt(format_args!("xhci: device addressed on slot {slot}"));
         // SET_ADDRESS recovery: the USB spec gives a device up to 2 ms after
