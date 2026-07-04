@@ -717,6 +717,11 @@ impl ChatSession {
         for (i, &tok) in ids.iter().enumerate() {
             self.model.forward(tok, self.pos + i, &mut self.kv, &mut self.state, i + 1 == last);
             spin.tick();
+            // Inference is a long, un-preempted compute on the cooperative
+            // scheduler, so pump the UI (clock, mouse, caret) and the net stack
+            // between token forwards or the whole screen freezes while we think.
+            ui_tick();
+            crate::net::poll();
         }
         spin.clear();
         self.pos += ids.len();
@@ -765,6 +770,10 @@ impl ChatSession {
             self.model.forward(next, self.pos, &mut self.kv, &mut self.state, true);
             self.pos += 1;
             n += 1;
+            // Keep the UI (clock, mouse cursor) and net stack live while the
+            // reply streams — each `forward` above is a full, blocking pass.
+            ui_tick();
+            crate::net::poll();
             next = self.pick();
         }
         serial_println!("");

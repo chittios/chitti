@@ -893,14 +893,14 @@ impl Screen {
         }
     }
 
-    /// Paint the boot splash: the brand mark, "CHITTI OS", and a tagline, centred
+    /// Paint the boot splash: the brand mark, "Chitti OS", and a tagline, centred
     /// on the canvas. Shown briefly at boot (see [`show_splash`]).
     fn draw_splash(&self) {
         self.fill_rect(0, 0, self.width, self.height, self.theme.screen_bg);
         let r = (self.height / 7).max(24);
         let cy = self.height * 2 / 5;
         self.draw_logo(self.width / 2, cy, r, self.theme.chat_fg, self.theme.accent);
-        let name = "CHITTI OS";
+        let name = "Chitti OS";
         let nx = self.width / 2 - (name.len() as u64 * self.cw()) / 2;
         self.draw_str(nx, cy + r + r / 2, name, self.theme.accent, self.theme.screen_bg);
         let tag = "an agentic operating system";
