@@ -21,6 +21,7 @@ pub mod agent;
 pub mod arch;
 pub mod block;
 pub mod cap;
+pub mod clipboard;
 pub mod clock;
 #[cfg(target_arch = "aarch64")]
 pub mod pci;
