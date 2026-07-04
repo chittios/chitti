@@ -47,6 +47,8 @@ pub fn open(path: &str) -> bool {
     if lines.len() > 1 && lines.last().map(|l| l.is_empty()).unwrap_or(false) {
         lines.pop();
     }
+    // Split the action pane first, then measure it.
+    crate::framebuffer::editor_enter();
     let (_cols, rows) = crate::framebuffer::editor_dims().unwrap_or((60, 24));
     let exists = crate::synapse::fs::exists(path);
     let mut ed = Editor {
@@ -64,7 +66,6 @@ pub fn open(path: &str) -> bool {
         pending: 0,
         rows,
     };
-    crate::framebuffer::editor_enter();
     ed.render();
     while !ed.quit {
         match crate::console::read_byte() {

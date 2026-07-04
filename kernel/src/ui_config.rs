@@ -227,12 +227,16 @@ const DEFAULT_SHORTCUTS: &[(&str, &str, &str)] = &[
     ("Enter", "submit", "send the current line (chat message or /command)"),
     ("Ctrl+C", "stop", "stop the model mid-generation"),
     ("Ctrl+D", "exit", "power off on an empty line (EOF)"),
+    ("Ctrl+W", "close-pane", "close the action (right) pane; chat full-width"),
+    ("Ctrl+V", "paste", "paste the clipboard into the shell line"),
     ("Backspace", "erase", "delete the character before the cursor"),
+    ("/ktrace", "toggle-ktrace", "show/hide the ktrace stream in the action pane"),
     ("/open <file>", "open-editor", "open a file in the vim-like editor (right pane)"),
-    ("Esc", "editor:normal", "editor: leave insert mode"),
+    ("Esc", "editor:normal", "editor: leave insert / visual mode"),
     ("i / a / o", "editor:insert", "editor: insert before / after / open line below"),
     ("h j k l", "editor:move", "editor: move left / down / up / right"),
-    ("x / dd", "editor:delete", "editor: delete char / line"),
+    ("v / y / p", "editor:yank", "editor: visual select / yank (copy) / paste"),
+    ("yy / dd / x", "editor:linedit", "editor: yank line / delete line / delete char"),
     (":w / :q / :wq", "editor:exwrite", "editor: write / quit / write-quit"),
 ];
 

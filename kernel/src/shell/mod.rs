@@ -147,6 +147,8 @@ pub fn run() -> ! {
                 "ui" => run_ui(arg),
                 "shortcuts" | "keys" => run_shortcuts(),
                 "open" | "edit" => run_open(arg),
+                "ktrace" | "logs" => toggle_ktrace(),
+                "close" => close_action(),
                 "do" => {
                     if arg.is_empty() {
                         serial_println!("usage: /do <intent>   e.g. /do remember that project is chitti");
@@ -296,7 +298,9 @@ fn print_help() {
     serial_println!("  /datetime [..]   show/set the clock: /datetime 2026-07-04 13:45 | /datetime tz +5:30");
     serial_println!("  /ui [config|reload|reset]  view/edit the UI config (/configs/core/ui.json)");
     serial_println!("  /shortcuts       list keyboard shortcuts (/configs/core/shortcuts.json)");
+    serial_println!("  /ktrace          toggle the ktrace log stream in the action (right) pane");
     serial_println!("  /open <path>     edit a file in the vim-like editor (right pane): hjkl/i/Esc/:w/:q");
+    serial_println!("  /close           close the action pane (chat full-width); also Ctrl+W");
     serial_println!("  /disks           list every block device + detected filesystems (read-only)");
     serial_println!("  /ls [n | /path]  list a volume's root: n on disk 0, or a mount path (/mnt)");
     serial_println!("  /mount <d> [v] [/p]  mount disk d's volume v at /p (default /mnt)");
@@ -650,6 +654,8 @@ fn read_line(buf: &mut String) {
                     crate::arch::poweroff();
                 }
             }
+            // Ctrl+W: close the action (right) pane — a keyboard shortcut for /close.
+            Some(0x17) => close_action(),
             Some(0x7f) | Some(0x08) => {
                 if buf.pop().is_some() {
                     // Erase the character on both consoles: back up, overwrite
@@ -751,6 +757,30 @@ fn run_ui(arg: &str) {
             serial_println!("ui> reset to defaults and re-applied");
         }
         _ => serial_println!("usage: /ui [config|reload|reset]   (edit {} via /open)", ui_config::ui_path()),
+    }
+}
+
+/// `/ktrace` — toggle the ktrace log stream in the action (right) pane.
+fn toggle_ktrace() {
+    #[cfg(not(test))]
+    {
+        use crate::framebuffer::{self, RightMode};
+        if framebuffer::right_mode() == RightMode::Ktrace {
+            framebuffer::close_action();
+            serial_println!("ktrace> hidden (action pane closed)");
+        } else {
+            framebuffer::open_ktrace();
+            serial_println!("ktrace> showing in the action pane (/close or Ctrl+W to hide)");
+        }
+    }
+}
+
+/// `/close` (also Ctrl+W) — close the action pane; chat becomes full-width.
+fn close_action() {
+    #[cfg(not(test))]
+    {
+        crate::framebuffer::close_action();
+        serial_println!("(action pane closed)");
     }
 }
 

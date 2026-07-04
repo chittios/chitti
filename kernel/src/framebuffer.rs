@@ -148,9 +148,25 @@ pub struct Screen {
     /// Blinking-caret state for the chat pane.
     caret_on: bool,
     caret_last_ms: u64,
-    /// When true the right pane is owned by the `/open` editor, so `log_print`
-    /// (ktrace) stops drawing there until the editor closes.
-    editor_active: bool,
+    /// What the right ("action") pane currently shows. `None` = closed, so the
+    /// chat pane is full-width — the default.
+    right: RightMode,
+    /// The right mode to restore when the editor closes.
+    right_before_editor: RightMode,
+    /// The last-applied layout config, reused when opening/closing the action
+    /// pane so the split ratio / titles / scale are preserved.
+    layout: LayoutCfg,
+}
+
+/// What the right ("action") pane shows.
+#[derive(Clone, Copy, PartialEq)]
+pub enum RightMode {
+    /// Closed: chat pane is full-width (the default).
+    Closed,
+    /// The live ktrace log stream.
+    Ktrace,
+    /// The `/open` editor.
+    Editor,
 }
 
 /// Config knobs the UI config (`/configs/core/ui.json`) can set for the layout.
@@ -184,7 +200,9 @@ impl Screen {
         g_shift: u32,
         b_shift: u32,
     ) -> Screen {
-        Screen::build(addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift, &LayoutCfg::default())
+        // Default boot layout: the action pane is closed, so the chat pane is
+        // full-width (only the shell/chat shows until `/ktrace` or `/open`).
+        Screen::build(addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift, &LayoutCfg::default(), false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -198,6 +216,7 @@ impl Screen {
         g_shift: u32,
         b_shift: u32,
         cfg: &LayoutCfg,
+        split: bool,
     ) -> Screen {
         let scale = if cfg.scale > 0 { cfg.scale } else { pick_scale(height) };
         let cw = CELL_W * scale;
@@ -206,18 +225,23 @@ impl Screen {
         let content_h = height.saturating_sub(status_h);
         let box_y = OUTER;
         let box_h = content_h.saturating_sub(2 * OUTER);
-        let avail_w = width.saturating_sub(2 * OUTER + GAP);
         let pct = cfg.chat_pct.clamp(10, 90);
-        let chat_w = avail_w * pct / 100;
-        let logs_w = avail_w - chat_w;
-        // Left/right box origins; chat takes the right box when swapped.
-        let (chat_x, chat_bw, logs_x, logs_bw) = if cfg.swap {
-            (OUTER + logs_w + GAP, chat_w, OUTER, logs_w)
+        let (chat_x, chat_bw, logs_x, logs_bw) = if split {
+            let avail_w = width.saturating_sub(2 * OUTER + GAP);
+            let chat_w = avail_w * pct / 100;
+            let logs_w = avail_w - chat_w;
+            // chat takes the right box when swapped.
+            if cfg.swap {
+                (OUTER + logs_w + GAP, chat_w, OUTER, logs_w)
+            } else {
+                (OUTER, chat_w, OUTER + chat_w + GAP, logs_w)
+            }
         } else {
-            (OUTER, chat_w, OUTER + chat_w + GAP, logs_w)
+            // Single pane: chat spans the whole content width; logs is offscreen.
+            (OUTER, width.saturating_sub(2 * OUTER), width, 0)
         };
         let chat = Pane::new(chat_x, box_y, chat_bw, box_h, cw, ch, CHAT_FG, CHAT_BG, cfg.chat_title.clone(), true);
-        let logs = Pane::new(logs_x, box_y, logs_bw, box_h, cw, ch, LOGS_FG, LOGS_BG, cfg.logs_title.clone(), false);
+        let logs = Pane::new(logs_x, box_y, logs_bw.max(cw), box_h, cw, ch, LOGS_FG, LOGS_BG, cfg.logs_title.clone(), false);
         let mut status_left = String::from("Chitti OS v");
         status_left.push_str(crate::VERSION);
         Screen {
@@ -226,7 +250,9 @@ impl Screen {
             status_right: String::new(),
             caret_on: true,
             caret_last_ms: 0,
-            editor_active: false,
+            right: RightMode::Closed,
+            right_before_editor: RightMode::Closed,
+            layout: cfg.clone(),
         }
     }
 
@@ -440,13 +466,18 @@ impl Screen {
         self.fill_rect(self.chat.cell_x(), self.chat.cell_y(), 2 * self.scale, self.chat.ch, color);
     }
 
-    /// Full repaint: background, both pane boxes + frames, caret, status bar.
+    /// Full repaint: background, chat pane, the action (right) pane if open,
+    /// caret, status bar.
     fn redraw(&self) {
         self.fill_rect(0, 0, self.width, self.height, SCREEN_BG);
         self.fill_rect(self.chat.x, self.chat.y, self.chat.w, self.chat.h, self.chat.bg);
-        self.fill_rect(self.logs.x, self.logs.y, self.logs.w, self.logs.h, self.logs.bg);
-        self.draw_frame(&self.chat, true);
-        self.draw_frame(&self.logs, false);
+        // Focus (active highlight) is on chat unless the editor owns the right pane.
+        self.draw_frame(&self.chat, self.right != RightMode::Editor);
+        if self.right != RightMode::Closed {
+            self.fill_rect(self.logs.x, self.logs.y, self.logs.w, self.logs.h, self.logs.bg);
+            let title = if self.right == RightMode::Editor { "editor" } else { &self.logs.title };
+            self.draw_frame_titled(&self.logs, self.right == RightMode::Editor, title);
+        }
         self.caret_draw(&self.chat);
         self.draw_status();
     }
@@ -562,8 +593,8 @@ pub fn blink(now_ms: u64) {
 pub fn log_print(s: &str) {
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
-            if sc.editor_active {
-                return; // the editor owns the right pane; ktrace still hits serial
+            if sc.right != RightMode::Ktrace {
+                return; // action pane closed or owned by the editor; ktrace still hits serial
             }
             let mut logs = core::mem::replace(&mut sc.logs, dummy_pane());
             for &b in s.as_bytes() {
@@ -598,23 +629,71 @@ pub fn editor_dims() -> Option<(usize, usize)> {
     })
 }
 
-/// Hand the right pane to the `/open` editor (ktrace stops drawing there).
-pub fn editor_enter() {
+/// Rebuild the screen for a new split/right-mode, preserving geometry, layout
+/// config, and status text.
+fn rebuilt(old: &Screen, split: bool, right: RightMode) -> Screen {
+    let mut ns = Screen::build(
+        old.addr, old.width, old.height, old.pitch, old.bpp_bytes, old.r_shift, old.g_shift, old.b_shift, &old.layout, split,
+    );
+    ns.status_left = old.status_left.clone();
+    ns.status_right = old.status_right.clone();
+    ns.right = right;
+    ns.right_before_editor = old.right_before_editor;
+    ns
+}
+
+/// The current action-pane mode.
+pub fn right_mode() -> RightMode {
+    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.right).unwrap_or(RightMode::Closed))
+}
+
+/// Set the action (right) pane mode, relayouting the split and repainting.
+pub fn set_right(mode: RightMode) {
     SCREEN.with(|slot| {
-        if let Some(sc) = slot {
-            sc.editor_active = true;
+        if let Some(old) = slot {
+            if old.right == mode {
+                return;
+            }
+            let ns = rebuilt(old, mode != RightMode::Closed, mode);
+            ns.redraw();
+            *slot = Some(ns);
         }
     });
 }
 
-/// Return the right pane to the ktrace log stream and repaint its frame.
+/// Open the ktrace log stream in the action pane.
+pub fn open_ktrace() {
+    set_right(RightMode::Ktrace);
+}
+
+/// Close the action pane (chat becomes full-width).
+pub fn close_action() {
+    set_right(RightMode::Closed);
+}
+
+/// Hand the action pane to the `/open` editor, splitting if needed and
+/// remembering the prior mode to restore on close.
+pub fn editor_enter() {
+    SCREEN.with(|slot| {
+        if let Some(old) = slot {
+            let before = old.right;
+            let mut ns = rebuilt(old, true, RightMode::Editor);
+            ns.right_before_editor = before;
+            ns.redraw();
+            *slot = Some(ns);
+        }
+    });
+}
+
+/// Return the action pane to whatever it showed before the editor (usually
+/// closed → chat full-width), repainting.
 pub fn editor_leave() {
     SCREEN.with(|slot| {
-        if let Some(sc) = slot {
-            sc.editor_active = false;
-            let p = &sc.logs;
-            sc.fill_rect(p.x, p.y, p.w, p.h, p.bg);
-            sc.draw_frame(p, false);
+        if let Some(old) = slot {
+            let restore = old.right_before_editor;
+            let ns = rebuilt(old, restore != RightMode::Closed, restore);
+            ns.redraw();
+            *slot = Some(ns);
         }
     });
 }
@@ -701,12 +780,16 @@ pub fn editor_render(title: &str, lines: &[alloc::string::String], top: usize, c
 pub fn relayout(cfg: &LayoutCfg) {
     SCREEN.with(|slot| {
         if let Some(old) = slot {
-            let (left, right) = (old.status_left.clone(), old.status_right.clone());
+            let (sl, sr) = (old.status_left.clone(), old.status_right.clone());
+            let mode = old.right;
             let mut ns = Screen::build(
                 old.addr, old.width, old.height, old.pitch, old.bpp_bytes, old.r_shift, old.g_shift, old.b_shift, cfg,
+                mode != RightMode::Closed,
             );
-            ns.status_left = left;
-            ns.status_right = right;
+            ns.status_left = sl;
+            ns.status_right = sr;
+            ns.right = mode;
+            ns.right_before_editor = old.right_before_editor;
             ns.redraw();
             *slot = Some(ns);
         }
