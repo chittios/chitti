@@ -195,3 +195,37 @@ pub fn map_mmio(phys: u64, bytes: usize) -> u64 {
     });
     paging::phys_to_virt(first) + (phys & 0xfff)
 }
+
+// --- aarch64: the same DMA/MMIO surface over the identity map ------------
+//
+// aarch64 runs on a flat identity map (VA == PA), so `alloc_dma` hands the CPU
+// and the device the same address, and `map_mmio` just ensures the containing
+// 1 GiB block is Device-mapped and returns the (identity) address. This keeps
+// the `mm::alloc_dma` / `mm::map_mmio` API identical on both arches, per the
+// dual-architecture parity rule, so the PCI NIC drivers compile unchanged.
+
+/// aarch64 counterpart of the x86 [`alloc_dma`]: a page-aligned, zeroed,
+/// physically-contiguous region from the (identity-mapped) heap. `phys == virt`.
+#[cfg(target_arch = "aarch64")]
+pub fn alloc_dma(bytes: usize) -> Option<(u64, u64)> {
+    use alloc::alloc::{alloc_zeroed, Layout};
+    let layout = Layout::from_size_align(bytes.max(1), 4096).ok()?;
+    // SAFETY: nonzero, 4 KiB-aligned layout; leaked for the device's lifetime and
+    // used only as device-shared DMA memory (VA == PA on the identity map).
+    let p = unsafe { alloc_zeroed(layout) } as u64;
+    (p != 0).then_some((p, p))
+}
+
+/// aarch64 counterpart of the x86 [`map_mmio`]: ensure the 1 GiB block holding
+/// `phys` is Device-mapped, then return the identity-mapped virtual address.
+#[cfg(target_arch = "aarch64")]
+pub fn map_mmio(phys: u64, _bytes: usize) -> u64 {
+    crate::arch::aarch64::mmu::map_device_gib(phys);
+    phys
+}
+
+/// aarch64 counterpart of [`map_mmio_page`].
+#[cfg(target_arch = "aarch64")]
+pub fn map_mmio_page(phys: u64) -> u64 {
+    map_mmio(phys, 0x1000)
+}

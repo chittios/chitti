@@ -105,6 +105,9 @@ pub extern "C" fn _start() -> ! {
             chitti_kernel::qemu::QemuExitCode::Failed
         });
     }
+    // Bring up networking (e1000 / virtio-net-pci over PCI). No-op if absent.
+    #[cfg(not(feature = "refcheck"))]
+    chitti_kernel::net::autodetect();
     #[cfg(not(feature = "refcheck"))]
     run_os();
 
@@ -170,6 +173,8 @@ pub extern "C" fn limine_start() -> ! {
         None => serial_println!("Chitti: no model.gguf (Limine module or ext4)"),
     }
     mount_persistent_store();
+    // Bring up networking (e1000 / virtio-net-pci over PCI). No-op if absent.
+    chitti_kernel::net::autodetect();
     run_os();
 }
 
@@ -252,6 +257,9 @@ pub extern "C" fn aarch64_start() -> ! {
     // without a `-drive`/virtio-blk-device.
     disk_demo();
     mount_persistent_store();
+    // Bring up networking (virtio-net over mmio, else a PCI NIC) so /network,
+    // /ping and /wifi work. No-op if no NIC is present.
+    chitti_kernel::net::autodetect();
     // Everything is up (framebuffer, USB/input, disk, persistent store) with IRQs
     // masked. NOW begin timer-preemptive scheduling: unmask IRQs so the generic
     // timer preempts the shell. Deferred to here (not inside init()) so device

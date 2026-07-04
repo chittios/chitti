@@ -61,7 +61,12 @@ bitflags = { version = "2", default-features = false, features = ["serde"] }
 # smoltcp — the no_std TCP/IP stack behind the net subsystem (virtio-net / e1000
 # drivers feed it raw Ethernet frames via its phy::Device trait). alloc-backed
 # socket set; Ethernet + IPv4 + DHCPv4 + DNS + ICMP (ping) + TCP/UDP.
-smoltcp = { version = "0.11", default-features = false, features = [
+#
+# **Vendored in-tree** at `third_party/smoltcp` (upstream `main`, 0BSD — see
+# THIRDPARTY-LICENSES.md) rather than pulled from crates.io, so we can read,
+# modify, and step-debug the stack alongside the kernel. Its own dependencies
+# (managed, byteorder, bitflags, cfg-if, heapless) still resolve from crates.io.
+smoltcp = { path = "../third_party/smoltcp", default-features = false, features = [
     "alloc", "medium-ethernet", "proto-ipv4", "proto-dhcpv4",
     "socket-tcp", "socket-udp", "socket-icmp", "socket-dhcpv4", "socket-dns",
 ] }

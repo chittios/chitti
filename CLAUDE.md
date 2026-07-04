@@ -101,6 +101,16 @@ real UEFI hardware.
 - **Storage** — virtio/NVMe/AHCI block devices, GPT/MBR/FAT/ext4 detection,
   ext4/FAT/SimpleFS, `/install` (self-hosting install to a disk), durable agent
   state on ext4.
+- **Networking** (`net/`) — a full TCP/IP stack on [smoltcp](third_party/smoltcp)
+  (vendored in-tree, 0BSD — see [THIRDPARTY-LICENSES.md](THIRDPARTY-LICENSES.md)):
+  DHCPv4, static IP, DNS, ICMP (`/ping`), TCP/UDP. NIC drivers behind one
+  `NetDevice` facade — **virtio-net** over virtio-mmio (aarch64 QEMU) and over
+  PCI, plus **e1000** (VirtualBox default + real Intel) — discovered the same way
+  on both arches. Shell surface: `/network` (info/dhcp/static/dns), `/ping`,
+  `/wifi` (scan/connect via the password modal). The stack is polled cooperatively
+  from the shell idle loop. NB: aarch64 MMIO register access must be a single
+  `ldr`/`str` (inline asm) — LLVM otherwise coalesces adjacent volatile accesses
+  into a paired load HVF can't decode (`hvf: isv`).
 
 ## Build / run / test
 

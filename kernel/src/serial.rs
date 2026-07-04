@@ -157,6 +157,10 @@ macro_rules! serial_print {
 #[macro_export]
 macro_rules! serial_println {
     () => { $crate::serial_print!("\n") };
-    ($fmt:expr) => { $crate::serial_print!(concat!($fmt, "\n")) };
-    ($fmt:expr, $($arg:tt)*) => { $crate::serial_print!(concat!($fmt, "\n"), $($arg)*) };
+    // Forward the caller's tokens verbatim (no `concat!`, which would mangle the
+    // string's span and break inline `{var}` format captures), then a newline.
+    ($($arg:tt)*) => {{
+        $crate::serial_print!($($arg)*);
+        $crate::serial_print!("\n");
+    }};
 }
