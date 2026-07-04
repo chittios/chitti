@@ -651,27 +651,39 @@ fn read_line(buf: &mut String) {
 
 fn disk_list() {
     use crate::block::BlockDevice;
-    let Some(mut dev) = crate::block::probe_disk() else {
+    // Enumerate every block device, not just the boot disk: a machine can have
+    // several (e.g. two NVMe namespaces on one controller — VirtualBox presents
+    // each attached disk that way). `probe_disk_nth` walks them until absent.
+    let mut found = 0usize;
+    let mut d = 0usize;
+    while let Some(mut dev) = crate::block::probe_disk_nth(d) {
+        found += 1;
+        let sectors = dev.block_count();
+        serial_println!("disks> disk {}: {} sectors ({} MiB)", d, sectors, sectors * 512 / 1024 / 1024);
+        let vols = crate::fs::detect::probe(&mut dev);
+        if vols.is_empty() {
+            serial_println!("  (no recognizable volumes -- blank or unsupported layout)");
+        }
+        for (i, v) in vols.iter().enumerate() {
+            serial_println!(
+                "  [{}] lba {:<10} {:>6} MiB  {:<8} label={}",
+                i,
+                v.start_lba,
+                v.sectors * 512 / 1024 / 1024,
+                v.fs.name(),
+                v.label.as_deref().unwrap_or("-")
+            );
+        }
+        d += 1;
+        if d >= 16 {
+            break; // safety bound
+        }
+    }
+    if found == 0 {
         serial_println!("disks> no block device (boot with a -drive)");
         return;
-    };
-    let sectors = dev.block_count();
-    serial_println!("disks> virtio-blk: {} sectors ({} MiB)", sectors, sectors * 512 / 1024 / 1024);
-    let vols = crate::fs::detect::probe(&mut dev);
-    if vols.is_empty() {
-        serial_println!("  (no recognizable volumes -- blank or unsupported layout)");
     }
-    for (i, v) in vols.iter().enumerate() {
-        serial_println!(
-            "  [{}] lba {:<10} {:>6} MiB  {:<8} label={}",
-            i,
-            v.start_lba,
-            v.sectors * 512 / 1024 / 1024,
-            v.fs.name(),
-            v.label.as_deref().unwrap_or("-")
-        );
-    }
-    serial_println!("  (/ls <n> to read a volume's root dir; foreign filesystems are read-only)");
+    serial_println!("  ({} disk(s); /ls <n> reads a volume on disk 0; foreign filesystems are read-only)", found);
 }
 
 fn disk_ls(arg: &str) {

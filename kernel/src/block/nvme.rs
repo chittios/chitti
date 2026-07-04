@@ -57,6 +57,7 @@ unsafe fn w64(a: u64, v: u64) {
 pub struct Nvme {
     regs: u64,  // mapped BAR0 (virtual)
     dstrd: u32, // doorbell stride (bytes) = 4 << CAP.DSTRD
+    nsid: u32,  // the namespace this instance drives (1-based)
     capacity: u64,
     lba_bytes: u32,
     // Admin queue.
@@ -77,14 +78,17 @@ pub struct Nvme {
 }
 
 impl Nvme {
-    /// Bring up the controller at the already-mapped MMIO base `regs`, using
-    /// `alloc` for all DMA memory. `None` if the controller never readies or the
-    /// namespace has an unusable LBA size.
+    /// Bring up the controller at the already-mapped MMIO base `regs` and attach
+    /// to namespace `nsid` (1-based), using `alloc` for all DMA memory. `None` if
+    /// the controller never readies, the namespace doesn't exist (NSZE == 0), or
+    /// it has an unusable LBA size. A controller can expose several namespaces
+    /// (e.g. VirtualBox presents each attached disk as NSID 1, 2, …); the
+    /// per-arch `probe_nth(n)` calls this with `nsid = n + 1`.
     ///
     /// # Safety
     /// `regs` must be a valid, mapped NVMe BAR0 (at least [`MMIO_SPAN`] bytes),
     /// and `alloc` must return real physically-contiguous DMA memory.
-    pub unsafe fn bringup(regs: u64, alloc: DmaAlloc) -> Option<Nvme> {
+    pub unsafe fn bringup(regs: u64, alloc: DmaAlloc, nsid: u32) -> Option<Nvme> {
         unsafe {
             let cap = (r32(regs + REG_CAP) as u64) | ((r32(regs + REG_CAP + 4) as u64) << 32);
             let dstrd = 4u32 << ((cap >> 32) & 0xf);
@@ -116,6 +120,7 @@ impl Nvme {
             let mut nv = Nvme {
                 regs,
                 dstrd,
+                nsid,
                 capacity: 0,
                 lba_bytes: 512,
                 asq,
@@ -143,21 +148,28 @@ impl Nvme {
                 return None;
             }
 
-            // Identify Namespace 1 (CNS=0) for capacity + LBA size.
+            // Identify Namespace `nsid` (CNS=0) for capacity + LBA size.
             let idbuf = alloc(4096)?;
-            if !nv.admin(0x06, 1, idbuf.phys, 0, 0, 0) {
+            if !nv.admin(0x06, nsid, idbuf.phys, 0, 0, 0) {
                 return None;
             }
             // NSZE (u64 @ 0) = number of LBAs; FLBAS (@26) selects the LBA format;
             // LBA formats start @128, each u32, LBADS (byte 2) = log2(lba bytes).
             let nsze = read_volatile(idbuf.virt as *const u64);
+            // NSZE == 0 => the namespace doesn't exist. This is how `probe_nth`
+            // discovers how many namespaces a controller actually has (it stops
+            // at the first absent one).
+            if nsze == 0 {
+                return None;
+            }
             let flbas = read_volatile((idbuf.virt + 26) as *const u8) & 0xf;
             let lbaf = read_volatile((idbuf.virt + 128 + flbas as u64 * 4) as *const u32);
             let lbads = (lbaf >> 16) & 0xff;
             nv.lba_bytes = 1u32 << lbads;
             nv.capacity = nsze * (nv.lba_bytes as u64 / BLOCK_SIZE as u64);
             crate::ktrace::log_fmt(format_args!(
-                "nvme: up ({} LBAs x {} B) -> {} 512B-sectors ({} MiB)",
+                "nvme: up (nsid {} : {} LBAs x {} B) -> {} 512B-sectors ({} MiB)",
+                nsid,
                 nsze,
                 nv.lba_bytes,
                 nv.capacity,
@@ -249,7 +261,7 @@ impl Nvme {
                 self.prp_list.phys
             };
             let opcode = if write { 0x01 } else { 0x02 };
-            let ok = self.submit(true, opcode, 1, prp1, prp2, slba as u32, (slba >> 32) as u32, (nlba - 1) as u32, 0);
+            let ok = self.submit(true, opcode, self.nsid, prp1, prp2, slba as u32, (slba >> 32) as u32, (nlba - 1) as u32, 0);
             if !ok {
                 return Err(BlockError::DeviceError);
             }
