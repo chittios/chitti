@@ -92,9 +92,12 @@ real UEFI hardware.
   scheduler, unforgeable capabilities, IPC, SMP, frame allocator + heap, MMU.
 - **UI** — a tmux-style split-pane framebuffer compositor in Geist Mono (chat
   pane + an on-demand "action" pane hosting the ktrace stream or a vim-like
-  editor), a status bar with a live clock, a blinking caret, mouse cursor +
-  click, copy/paste, a `/`-command shell, and an on-disk UI config
-  (`/configs/core/ui.json`, `shortcuts.json`).
+  editor), a boot splash + status-bar **Synapse-C** brand mark, a live clock, a
+  blinking caret, mouse cursor + click, copy/paste, ANSI-coloured agent output, a
+  `/`-command shell, and an on-disk UI config (`/configs/core/ui.json`,
+  `shortcuts.json`). The brand — logo, the terracotta `#cc785c` / warm-ink /
+  cream palette (fully re-themable from `ui.json`), and typography — is specified
+  in [DESIGN.md](DESIGN.md); honour it for any UI change.
 - **Storage** — virtio/NVMe/AHCI block devices, GPT/MBR/FAT/ext4 detection,
   ext4/FAT/SimpleFS, `/install` (self-hosting install to a disk), durable agent
   state on ext4.

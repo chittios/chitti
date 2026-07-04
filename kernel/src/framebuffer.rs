@@ -30,24 +30,101 @@ const CELL_H: u64 = CH as u64;
 
 type Rgb = (u8, u8, u8);
 
-// A dark, Vercel/Claude-Code-flavoured palette.
-const SCREEN_BG: Rgb = (8, 8, 10);
-const CHAT_BG: Rgb = (14, 14, 17);
-const LOGS_BG: Rgb = (10, 10, 13);
-const CHAT_FG: Rgb = (232, 233, 238);
-const LOGS_FG: Rgb = (120, 132, 144);
-const ACCENT: Rgb = (94, 161, 255); // active border / caret / brand
-const BORDER_DIM: Rgb = (48, 50, 58); // inactive border
-const TITLE_ACTIVE: Rgb = (156, 194, 255);
-const TITLE_DIM: Rgb = (120, 126, 140);
-const SEP_DIM: Rgb = (32, 34, 42);
-const STATUS_BG: Rgb = (20, 21, 27);
-const STATUS_FG: Rgb = (140, 148, 162);
-// Editor (right pane, `/open`).
-const EDITOR_BG: Rgb = (16, 18, 24);
-const EDITOR_FG: Rgb = (214, 218, 228);
-const EDITOR_LINENO: Rgb = (86, 92, 104);
-const EDITOR_SEL: Rgb = (40, 66, 110); // visual-mode selection highlight
+/// The console colour palette (see [DESIGN.md](../../DESIGN.md)). Every colour is
+/// a field so the whole theme is configurable from `/configs/core/ui.json`
+/// (`theme` object, hex strings); the default is the Chitti brand **dark**
+/// theme — terracotta `#cc785c` primary on warm-ink surfaces, cream text.
+#[derive(Clone, Copy)]
+pub struct Theme {
+    pub screen_bg: Rgb,
+    pub chat_bg: Rgb,
+    pub logs_bg: Rgb,
+    pub chat_fg: Rgb,
+    pub logs_fg: Rgb,
+    pub accent: Rgb, // active border / caret / brand / logo
+    pub border_dim: Rgb,
+    pub title_active: Rgb,
+    pub title_dim: Rgb,
+    pub sep_dim: Rgb,
+    pub status_bg: Rgb,
+    pub status_fg: Rgb,
+    pub editor_bg: Rgb,
+    pub editor_fg: Rgb,
+    pub editor_lineno: Rgb,
+    pub editor_sel: Rgb,
+}
+
+impl Theme {
+    /// The Chitti brand dark theme: `#cc785c` terracotta on warm-ink surfaces,
+    /// cream (`#faf9f5`) text.
+    pub const BRAND_DARK: Theme = Theme {
+        screen_bg: (24, 23, 21),       // surface-dark #181715
+        chat_bg: (31, 30, 27),         // surface-dark-soft #1f1e1b
+        logs_bg: (20, 19, 17),         // a touch darker than the chat pane
+        chat_fg: (250, 249, 245),      // on-dark / cream #faf9f5
+        logs_fg: (160, 157, 150),      // on-dark-soft #a09d96
+        accent: (204, 120, 92),        // primary #cc785c
+        border_dim: (58, 55, 51),      // inactive border
+        title_active: (204, 120, 92),  // primary
+        title_dim: (108, 106, 100),    // muted #6c6a64
+        sep_dim: (42, 40, 37),
+        status_bg: (37, 35, 32),       // surface-dark-elevated #252320
+        status_fg: (160, 157, 150),    // on-dark-soft
+        editor_bg: (31, 30, 27),       // surface-dark-soft
+        editor_fg: (250, 249, 245),    // cream
+        editor_lineno: (108, 106, 100),
+        editor_sel: (90, 58, 46),      // terracotta-tinted selection
+    };
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme::BRAND_DARK
+    }
+}
+
+/// Parse a `#rrggbb` (or `rrggbb`) hex colour, falling back to `def`.
+pub fn parse_hex(s: &str, def: Rgb) -> Rgb {
+    let h = s.trim().trim_start_matches('#');
+    if h.len() != 6 {
+        return def;
+    }
+    let b = |i: usize| u8::from_str_radix(&h[i..i + 2], 16);
+    match (b(0), b(2), b(4)) {
+        (Ok(r), Ok(g), Ok(bl)) => (r, g, bl),
+        _ => def,
+    }
+}
+
+/// Build a [`Theme`] from `(name, "#rrggbb")` pairs, starting from the brand dark
+/// default and overriding any named field. Unknown names are ignored; malformed
+/// hex keeps the brand value. This is how `ui.json`'s `theme` object is applied.
+pub fn theme_from_pairs(pairs: &[(alloc::string::String, alloc::string::String)]) -> Theme {
+    let mut t = Theme::BRAND_DARK;
+    for (name, hex) in pairs {
+        let slot = match name.as_str() {
+            "screen_bg" => &mut t.screen_bg,
+            "chat_bg" => &mut t.chat_bg,
+            "logs_bg" => &mut t.logs_bg,
+            "chat_fg" => &mut t.chat_fg,
+            "logs_fg" => &mut t.logs_fg,
+            "accent" => &mut t.accent,
+            "border_dim" => &mut t.border_dim,
+            "title_active" => &mut t.title_active,
+            "title_dim" => &mut t.title_dim,
+            "sep_dim" => &mut t.sep_dim,
+            "status_bg" => &mut t.status_bg,
+            "status_fg" => &mut t.status_fg,
+            "editor_bg" => &mut t.editor_bg,
+            "editor_fg" => &mut t.editor_fg,
+            "editor_lineno" => &mut t.editor_lineno,
+            "editor_sel" => &mut t.editor_sel,
+            _ => continue,
+        };
+        *slot = parse_hex(hex, *slot);
+    }
+    t
+}
 
 // Layout metrics, in pixels (independent of font scale).
 const OUTER: u64 = 8; // margin around the whole content region
@@ -284,6 +361,8 @@ pub struct Screen {
     /// The last-applied layout config, reused when opening/closing the action
     /// pane so the split ratio / titles / scale are preserved.
     layout: LayoutCfg,
+    /// The active colour palette (from `layout.theme`).
+    theme: Theme,
     /// Mouse cursor sprite state: position + the framebuffer patch saved beneath
     /// it (restored before each move so the cursor leaves no trail).
     cur_x: u64,
@@ -337,11 +416,23 @@ pub struct LayoutCfg {
     pub swap: bool,
     pub chat_title: String,
     pub logs_title: String,
+    /// Colour palette (from `ui.json` `theme`; default = brand dark).
+    pub theme: Theme,
+    /// Show the boot splash (logo + name). Default true.
+    pub splash: bool,
 }
 
 impl Default for LayoutCfg {
     fn default() -> Self {
-        LayoutCfg { chat_pct: CHAT_PCT, scale: 0, swap: false, chat_title: String::from("chat"), logs_title: String::from("ktrace") }
+        LayoutCfg {
+            chat_pct: CHAT_PCT,
+            scale: 0,
+            swap: false,
+            chat_title: String::from("chat"),
+            logs_title: String::from("ktrace"),
+            theme: Theme::default(),
+            splash: true,
+        }
     }
 }
 
@@ -358,8 +449,9 @@ impl Screen {
         b_shift: u32,
     ) -> Screen {
         // Default boot layout: the action pane is closed, so the chat pane is
-        // full-width (only the shell/chat shows until `/ktrace` or `/open`).
-        Screen::build(addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift, &LayoutCfg::default(), false)
+        // full-width (only the shell/chat shows until `/ktrace` or `/open`). The
+        // theme + splash come from the UI config (brand defaults until it loads).
+        Screen::build(addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift, &crate::ui_config::boot_layout(), false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -397,8 +489,9 @@ impl Screen {
             // Single pane: chat spans the whole content width; logs is offscreen.
             (OUTER, width.saturating_sub(2 * OUTER), width, 0)
         };
-        let chat = Pane::new(chat_x, box_y, chat_bw, box_h, cw, ch, CHAT_FG, CHAT_BG, cfg.chat_title.clone(), true);
-        let logs = Pane::new(logs_x, box_y, logs_bw.max(cw), box_h, cw, ch, LOGS_FG, LOGS_BG, cfg.logs_title.clone(), false);
+        let th = cfg.theme;
+        let chat = Pane::new(chat_x, box_y, chat_bw, box_h, cw, ch, th.chat_fg, th.chat_bg, cfg.chat_title.clone(), true);
+        let logs = Pane::new(logs_x, box_y, logs_bw.max(cw), box_h, cw, ch, th.logs_fg, th.logs_bg, cfg.logs_title.clone(), false);
         let mut status_left = String::from("Chitti OS v");
         status_left.push_str(crate::VERSION);
         Screen {
@@ -412,6 +505,7 @@ impl Screen {
             right: RightMode::Closed,
             right_before_editor: RightMode::Closed,
             layout: cfg.clone(),
+            theme: th,
             cur_x: width / 2,
             cur_y: height / 2,
             cur_vis: false,
@@ -605,7 +699,7 @@ impl Screen {
     }
     fn caret_draw(&self, p: &Pane) {
         if p.show_caret {
-            self.fill_rect(p.cell_x(), p.cell_y(), 2 * self.scale, p.ch, ACCENT);
+            self.fill_rect(p.cell_x(), p.cell_y(), 2 * self.scale, p.ch, self.theme.accent);
         }
     }
 
@@ -696,32 +790,39 @@ impl Screen {
     /// Like [`draw_frame`] but with an explicit title (the editor overrides the
     /// pane title with `editor: <file>`).
     fn draw_frame_titled(&self, p: &Pane, active: bool, title: &str) {
-        let border = if active { ACCENT } else { BORDER_DIM };
-        let title_c = if active { TITLE_ACTIVE } else { TITLE_DIM };
+        let border = if active { self.theme.accent } else { self.theme.border_dim };
+        let title_c = if active { self.theme.title_active } else { self.theme.title_dim };
         self.rect_outline(p.x, p.y, p.w, p.h, BORDER, border);
         // Title, just inside the top border.
         let ty = p.y + BORDER + 4;
         let tx = p.x + BORDER + PAD;
         let end = self.draw_str(tx, ty, title, title_c, p.bg);
         if active {
-            self.draw_str(end, ty, " *", ACCENT, p.bg);
+            self.draw_str(end, ty, " *", self.theme.accent, p.bg);
         }
         // Separator under the title.
         let sep_y = ty + self.ch() + 3;
-        self.fill_rect(p.x + BORDER, sep_y, p.w - 2 * BORDER, 1, SEP_DIM);
+        self.fill_rect(p.x + BORDER, sep_y, p.w - 2 * BORDER, 1, self.theme.sep_dim);
     }
 
     fn draw_status(&self) {
         let bar_h = self.ch() + 8;
         let sy_top = self.height - bar_h;
-        self.fill_rect(0, sy_top, self.width, bar_h, STATUS_BG);
+        self.fill_rect(0, sy_top, self.width, bar_h, self.theme.status_bg);
         let ty = sy_top + 4;
-        // Left = brand (accent), right = datetime (muted), right-aligned. Both
-        // strings come from the UI config templates via `set_status`.
-        self.draw_str(OUTER, ty, &self.status_left, ACCENT, STATUS_BG);
+        // Left: the Synapse-C brand mark, then the brand text (accent). The icon
+        // is sized to the bar height and vertically centred.
+        let icon_r = bar_h / 3;
+        let icon_cx = OUTER + icon_r;
+        let icon_cy = sy_top + bar_h / 2;
+        self.draw_logo(icon_cx, icon_cy, icon_r, self.theme.accent, self.theme.status_bg);
+        let text_x = icon_cx + icon_r + OUTER;
+        self.draw_str(text_x, ty, &self.status_left, self.theme.accent, self.theme.status_bg);
+        // Right = datetime (muted), right-aligned. Both strings come from the UI
+        // config templates via `set_status`.
         let rlen = self.status_right.len() as u64;
         let rx = self.width.saturating_sub(rlen * self.cw() + OUTER);
-        self.draw_str(rx, ty, &self.status_right, STATUS_FG, STATUS_BG);
+        self.draw_str(rx, ty, &self.status_right, self.theme.status_fg, self.theme.status_bg);
     }
 
     /// Paint the chat caret in its current blink state (accent bar, or the pane
@@ -730,14 +831,88 @@ impl Screen {
         if !self.chat.show_caret {
             return;
         }
-        let color = if self.caret_on { ACCENT } else { self.chat.bg };
+        let color = if self.caret_on { self.theme.accent } else { self.chat.bg };
         self.fill_rect(self.chat.cell_x(), self.chat.cell_y(), 2 * self.scale, self.chat.ch, color);
+    }
+
+    /// Fill an integer-centred disc of radius `r` with `c` (round dots/caps).
+    fn fill_disc(&self, cx: i64, cy: i64, r: i64, c: Rgb) {
+        let r2 = r * r;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx * dx + dy * dy <= r2 {
+                    // Negative coords wrap to a huge u64 and are dropped by put_pixel's bounds check.
+                    self.put_pixel((cx + dx) as u64, (cy + dy) as u64, c);
+                }
+            }
+        }
+    }
+
+    /// Draw the **Synapse-C** brand mark centred at `(cx, cy)` with outer radius
+    /// `r`: an open-right "C" arc in `arc_c`, its two round end-caps and the small
+    /// synapse node (dot + four stubs) at the opening in `node_c`. Pure integer
+    /// math — a ring test plus an angular wedge for the opening — so it scales
+    /// from a status-bar glyph to a splash logo. Geometry mirrors the SVG
+    /// (endpoints at ±55°, node at 0.74r; see DESIGN.md).
+    fn draw_logo(&self, cx: u64, cy: u64, r: u64, arc_c: Rgb, node_c: Rgb) {
+        let (cx, cy, r) = (cx as i64, cy as i64, r as i64);
+        let t = (r / 3).max(2); // ring thickness (26/78 of r)
+        let half = t / 2;
+        let (inner, outer) = ((r - half) * (r - half), (r + half) * (r + half));
+        let span = r + half + 1;
+        for dy in -span..=span {
+            for dx in -span..=span {
+                let d2 = dx * dx + dy * dy;
+                if d2 < inner || d2 > outer {
+                    continue;
+                }
+                // The "C" opening: skip the +x wedge between ±55° (tan55 ≈ 1.428).
+                if dx > 0 && dy.abs() * 1000 < dx * 1428 {
+                    continue;
+                }
+                self.put_pixel((cx + dx) as u64, (cy + dy) as u64, arc_c);
+            }
+        }
+        // Round end-caps at ±55° and the synapse node at the opening.
+        let (ex, ey) = (r * 574 / 1000, r * 819 / 1000); // cos55, sin55
+        let cap = (r / 5).max(2);
+        self.fill_disc(cx + ex, cy - ey, cap, node_c);
+        self.fill_disc(cx + ex, cy + ey, cap, node_c);
+        let (nx, ny) = (cx + r * 744 / 1000, cy);
+        let nr = (r / 12).max(1);
+        self.fill_disc(nx, ny, nr, node_c);
+        // Four short stubs radiating from the node (up/down/left/right).
+        let (stub, lw, gap) = ((r / 6).max(2), (t / 6).max(1), nr + 1);
+        let put = |x: i64, y: i64, w: i64, h: i64| {
+            if x >= 0 && y >= 0 {
+                self.fill_rect(x as u64, y as u64, w as u64, h as u64, node_c);
+            }
+        };
+        put(nx - lw / 2, ny - gap - stub, lw, stub); // up
+        put(nx - lw / 2, ny + gap, lw, stub); // down
+        put(nx - gap - stub, ny - lw / 2, stub, lw); // left
+        put(nx + gap, ny - lw / 2, stub, lw); // right
+    }
+
+    /// Paint the boot splash: the brand mark, "CHITTI OS", and a tagline, centred
+    /// on the canvas. Shown briefly at boot (see [`show_splash`]).
+    fn draw_splash(&self) {
+        self.fill_rect(0, 0, self.width, self.height, self.theme.screen_bg);
+        let r = (self.height / 7).max(24);
+        let cy = self.height * 2 / 5;
+        self.draw_logo(self.width / 2, cy, r, self.theme.chat_fg, self.theme.accent);
+        let name = "CHITTI OS";
+        let nx = self.width / 2 - (name.len() as u64 * self.cw()) / 2;
+        self.draw_str(nx, cy + r + r / 2, name, self.theme.accent, self.theme.screen_bg);
+        let tag = "an agentic operating system";
+        let tx = self.width / 2 - (tag.len() as u64 * self.cw()) / 2;
+        self.draw_str(tx, cy + r + r / 2 + self.ch() + 6, tag, self.theme.title_dim, self.theme.screen_bg);
     }
 
     /// Full repaint: background, chat pane, the action (right) pane if open,
     /// caret, status bar.
     fn redraw(&self) {
-        self.fill_rect(0, 0, self.width, self.height, SCREEN_BG);
+        self.fill_rect(0, 0, self.width, self.height, self.theme.screen_bg);
         self.fill_rect(self.chat.x, self.chat.y, self.chat.w, self.chat.h, self.chat.bg);
         // Focus (active highlight) is on chat unless the editor owns the right pane.
         self.draw_frame(&self.chat, self.right != RightMode::Editor);
@@ -803,8 +978,24 @@ pub fn init_console_raw_fmt(
 }
 
 fn init_from(screen: Screen) {
+    // Brand splash first (logo + wordmark), held briefly, then the live UI.
+    if screen.layout.splash {
+        screen.draw_splash();
+        hold_ms(1300);
+    }
     screen.redraw();
     SCREEN.with(|slot| *slot = Some(screen));
+}
+
+/// Busy-wait ~`ms` milliseconds for the splash hold, bounded by an iteration cap
+/// so a frozen monotonic clock (some VBox configs) can't wedge the boot.
+fn hold_ms(ms: u64) {
+    let start = crate::arch::now_ms();
+    let mut iters: u64 = 0;
+    while crate::arch::now_ms().saturating_sub(start) < ms && iters < 300_000_000 {
+        core::hint::spin_loop();
+        iters += 1;
+    }
 }
 
 /// Render `s` into the **chat** pane. Called by `serial::Serial::write_str`, so
@@ -974,7 +1165,7 @@ pub fn log_print(s: &str) {
 fn dummy_pane() -> Pane {
     Pane {
         x: 0, y: 0, w: 0, h: 0, ix: 0, iy: 0, cw: 1, ch: 1, cols: 1, rows: 1, col: 0, row: 0,
-        fg: SCREEN_BG, default_fg: SCREEN_BG, bg: SCREEN_BG,
+        fg: (0, 0, 0), default_fg: (0, 0, 0), bg: (0, 0, 0),
         esc: EscState::Ground, csi: [0; 32], csi_len: 0, bold: false,
         title: String::new(), show_caret: false,
     }
@@ -1084,7 +1275,7 @@ pub fn editor_render(
         let (ix, iy) = (sc.logs.ix, sc.logs.iy);
         sc.draw_frame_titled(&sc.logs, true, title);
         // Clear the interior to the editor background.
-        sc.fill_rect(ix, iy, cols * cw, rows * ch, EDITOR_BG);
+        sc.fill_rect(ix, iy, cols * cw, rows * ch, sc.theme.editor_bg);
         let text_rows = rows.saturating_sub(1);
         // Is text (row, col) inside the inclusive selection range?
         let in_sel = |row: usize, col: usize| -> bool {
@@ -1116,7 +1307,7 @@ pub fn editor_render(
             let num = alloc::format!("{:>width$} ", li + 1, width = (gutter - 1) as usize);
             let mut x = ix;
             for b in num.bytes() {
-                sc.blit_glyph(x, y, b, EDITOR_LINENO, EDITOR_BG);
+                sc.blit_glyph(x, y, b, sc.theme.editor_lineno, sc.theme.editor_bg);
                 x += cw;
             }
             // Text, clipped to the pane width; selected cells get a highlight bg.
@@ -1125,8 +1316,8 @@ pub fn editor_render(
                 if c >= cols {
                     break;
                 }
-                let bg = if in_sel(li, col) { EDITOR_SEL } else { EDITOR_BG };
-                sc.blit_glyph(x, y, b, EDITOR_FG, bg);
+                let bg = if in_sel(li, col) { sc.theme.editor_sel } else { sc.theme.editor_bg };
+                sc.blit_glyph(x, y, b, sc.theme.editor_fg, bg);
                 x += cw;
                 c += 1;
             }
@@ -1140,19 +1331,19 @@ pub fn editor_render(
                 let x = ix + col_on_screen * cw;
                 let byte = lines.get(cur_row).and_then(|l| l.as_bytes().get(cur_col)).copied().unwrap_or(b' ');
                 let byte = if (0x20..=0x7e).contains(&byte) { byte } else { b' ' };
-                sc.blit_glyph(x, y, byte, EDITOR_BG, ACCENT); // fg/bg swapped = block cursor
+                sc.blit_glyph(x, y, byte, sc.theme.editor_bg, sc.theme.accent); // fg/bg swapped = block cursor
             }
         }
         // Mode line across the bottom interior row.
         let sy = iy + text_rows * ch;
-        sc.fill_rect(px + BORDER, sy, pw - 2 * BORDER, ch, STATUS_BG);
+        sc.fill_rect(px + BORDER, sy, pw - 2 * BORDER, ch, sc.theme.status_bg);
         let mut x = ix;
         let mut c = 0u64;
         for b in modeline.bytes() {
             if c >= cols {
                 break;
             }
-            sc.blit_glyph(x, sy, b, TITLE_ACTIVE, STATUS_BG);
+            sc.blit_glyph(x, sy, b, sc.theme.title_active, sc.theme.status_bg);
             x += cw;
             c += 1;
         }
