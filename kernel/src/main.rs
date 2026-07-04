@@ -193,6 +193,14 @@ pub extern "C" fn aarch64_start() -> ! {
     // Preferred: the UEFI GOP framebuffer (with its real pixel format) from the
     // stub's boot-info page — works on real hardware / VirtualBox / UTM at the
     // monitor's native resolution. Fallback: QEMU ramfb (always XRGB8888).
+    // Seed the wall clock from the UEFI stub's captured time (the reliable clock
+    // on VirtualBox-ARM and other UEFI platforms). Before the shell's clock::init,
+    // which then keeps this seed instead of probing the (absent) PL031.
+    if let Some(secs) = bootinfo_unix() {
+        chitti_kernel::clock::set_unix(secs as i64);
+        serial_println!("Chitti: wall clock seeded from UEFI ({} unix)", secs);
+    }
+
     let fb = if let Some((addr, w, h, pitch, bpp, rs, gs, bs)) = bootinfo_framebuffer() {
         chitti_kernel::framebuffer::init_console_raw_fmt(addr, w, h, pitch, bpp, rs, gs, bs);
         Some((w, h))
@@ -309,6 +317,18 @@ fn bootinfo_framebuffer() -> Option<(usize, u64, u64, u64, u64, u32, u32, u32)> 
     }
     serial_println!("Chitti: framebuffer from UEFI boot-info (GOP {}x{} at {:#x}, shifts {}/{}/{})", w, h, addr, rs, gs, bs);
     Some((addr as usize, w, h, pitch, bpp, rs, gs, bs))
+}
+
+/// The UTC Unix time the UEFI stub captured (boot-info offset 52..60), or `None`
+/// if absent/zero. This is the reliable wall clock on VirtualBox-ARM (whose
+/// generic timer doesn't advance) and any UEFI platform.
+#[cfg(all(target_arch = "aarch64", not(feature = "boot-limine")))]
+fn bootinfo_unix() -> Option<u64> {
+    let bi = bootinfo_page()?;
+    // SAFETY: identity-mapped boot-info page; read the 8-byte time field.
+    let page = unsafe { core::slice::from_raw_parts(bi as *const u8, 60) };
+    let secs = u64::from_le_bytes(page[52..60].try_into().unwrap());
+    (secs > 0).then_some(secs)
 }
 
 /// Point `synapse::fs` at an ext4 *data* partition so agent writes are durable
