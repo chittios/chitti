@@ -129,6 +129,19 @@ impl ToolDispatch for Router {
                 Some(h) => h(session, caller, call),
                 None => ToolOutcome::error("run: no compiled-intent path wired"),
             },
+            ToolBinding::Shell { command, destructive } => {
+                // Destructive system commands (format/install) are gated exactly
+                // like a DELETE: refused when justified by untrusted content and
+                // not human-confirmed.
+                if *destructive && self.justification(session).blocks_destructive() {
+                    return ToolOutcome::error(alloc::format!(
+                        "refused: destructive command '/{command}' justified by untrusted content"
+                    ));
+                }
+                let arg = todo::json_str(&call.args, "args").unwrap_or_default();
+                let out = crate::shell::run_tool_command(command, &arg);
+                ToolOutcome::ok(out, Provenance::UntrustedIngested)
+            }
         }
     }
 }

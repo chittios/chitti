@@ -29,6 +29,10 @@ pub enum ToolBinding {
     LoadSkill,
     /// Run an intent through the compiled-intent path (Phase E).
     RunIntent,
+    /// Run a stateless system `/command` (the shell OS commands: disks, mount,
+    /// datetime, install, …) and return its printed output. `destructive`
+    /// commands are taint-gated at dispatch, like a `DELETE`.
+    Shell { command: String, destructive: bool },
 }
 
 /// An agent-facing tool definition (MCP shape).
@@ -63,6 +67,46 @@ impl ToolDef {
             },
         }
     }
+
+    /// A tool bound to a stateless shell system command. Its single optional
+    /// `args` string is passed verbatim as the command's argument line.
+    fn shell(name: &str, description: &str, destructive: bool) -> Self {
+        Self {
+            name: name.to_string(),
+            description: description.to_string(),
+            input_schema: r#"{"type":"object","properties":{"args":{"type":"string","description":"the command's argument line"}}}"#.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::Shell { command: name.to_string(), destructive },
+        }
+    }
+}
+
+/// The system `/command` toolset: the OS commands the shell exposes, so the root
+/// agent can operate the machine exactly as a human can. Destructive ones
+/// (format/install) are taint-gated at dispatch. Agent-layer commands (`/do`,
+/// `/agent`, `/subagent`) are already covered by `run` and `spawn_subagent`.
+fn shell_commands() -> Vec<ToolDef> {
+    alloc::vec![
+        ToolDef::shell("help", "Show the list of available commands.", false),
+        ToolDef::shell("disks", "List every block device and its detected filesystems (read-only).", false),
+        ToolDef::shell("ls", "List a volume's root. args: a disk number (0..), or a mount path like /mnt.", false),
+        ToolDef::shell("mount", "Mount a disk volume. args: '<disk> [volume] [/path]' (default /mnt).", false),
+        ToolDef::shell("umount", "Unmount a mounted path. args: the /path.", false),
+        ToolDef::shell("mounts", "List the currently mounted volumes.", false),
+        ToolDef::shell("cat", "Print a file from a mounted volume. args: a /path/file.", false),
+        ToolDef::shell("datetime", "Show or set the wall clock. args: empty=show, 'YYYY-MM-DD HH:MM'=set, 'tz +5:30'=zone.", false),
+        ToolDef::shell("ui", "View or manage the UI config. args: 'config' | 'reload' | 'reset'.", false),
+        ToolDef::shell("shortcuts", "List the keyboard shortcuts.", false),
+        ToolDef::shell("skills", "List installed skills.", false),
+        ToolDef::shell("ktrace", "Toggle the ktrace log stream in the action pane.", false),
+        ToolDef::shell("close", "Close the action pane (chat becomes full-width).", false),
+        ToolDef::shell("bench", "Benchmark the matvec kernel throughput.", false),
+        ToolDef::shell("perf", "Benchmark end-to-end prefill/decode tokens-per-second.", false),
+        ToolDef::shell("infer", "Run the reference-inference parity check.", false),
+        ToolDef::shell("mkfs", "Format a disk with SimpleFS. DESTRUCTIVE. args: '<disk> yes'.", true),
+        ToolDef::shell("mkext4", "Format a disk with ext4. DESTRUCTIVE. args: '<disk> yes'.", true),
+        ToolDef::shell("install", "Install Chitti to a disk (GPT: ESP + ext4). DESTRUCTIVE. args: '[<disk>] yes'.", true),
+    ]
 }
 
 /// The builtin toolset (schema Part 1 orchestrator example). Each maps to a
@@ -174,6 +218,7 @@ fn with_registry<R>(f: impl FnOnce(&mut Vec<ToolDef>) -> R) -> R {
     REGISTRY.with(|reg| {
         if reg.is_empty() {
             *reg = builtins();
+            reg.extend(shell_commands());
         }
         f(reg)
     })

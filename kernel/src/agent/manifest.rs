@@ -33,6 +33,7 @@ pub fn orchestrator_manifest() -> AgentManifest {
                         when a task is self-contained, and keep the user informed."
             .to_string(),
         toolset: vec![
+            // Agent-layer builtins.
             "read".into(),
             "write".into(),
             "edit".into(),
@@ -43,6 +44,27 @@ pub fn orchestrator_manifest() -> AgentManifest {
             "todo_write".into(),
             "load_skill".into(),
             "emit_result".into(),
+            // System `/command` tools — the root agent drives the machine like a
+            // human at the shell (see tools::registry::shell_commands).
+            "help".into(),
+            "disks".into(),
+            "ls".into(),
+            "mount".into(),
+            "umount".into(),
+            "mounts".into(),
+            "cat".into(),
+            "datetime".into(),
+            "ui".into(),
+            "shortcuts".into(),
+            "skills".into(),
+            "ktrace".into(),
+            "close".into(),
+            "bench".into(),
+            "perf".into(),
+            "infer".into(),
+            "mkfs".into(),
+            "mkext4".into(),
+            "install".into(),
         ],
         capabilities: vec![
             CapabilityRequest::new(CapDomain::Fs, Rights::READ | Rights::WRITE | Rights::LIST, Scope::Any),

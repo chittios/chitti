@@ -5,7 +5,25 @@
 //! IRQ handler's own logging from interleaving with a write already in
 //! progress; there is still no real lock since there is only one core.
 
+use crate::mm::Locked;
+use alloc::string::String;
 use core::fmt;
+
+/// Optional capture sink: when `Some`, every `serial_print!`/`serial_println!`
+/// byte is also appended here (in addition to the UART + framebuffer). The shell
+/// uses this to run a `/command` and return its printed output as a tool result
+/// to the root agent, without rewriting each command handler.
+static CAPTURE: Locked<Option<String>> = Locked::new(None);
+
+/// Begin capturing serial output into an in-memory buffer.
+pub fn capture_begin() {
+    CAPTURE.with(|c| *c = Some(String::new()));
+}
+
+/// Stop capturing and return everything captured since [`capture_begin`].
+pub fn capture_end() -> String {
+    CAPTURE.with(|c| c.take().unwrap_or_default())
+}
 
 /// Raw, arch-specific byte transport: the 16550 UART (I/O ports) on x86, the
 /// PL011 UART (MMIO) on aarch64. The rest of this module (line buffering,
@@ -115,6 +133,13 @@ impl fmt::Write for Serial {
         // compile the framebuffer module).
         #[cfg(not(test))]
         crate::framebuffer::console_print(s);
+        // If a capture is active (a `/command` running as an agent tool), also
+        // append the text so it can be returned as the tool result.
+        CAPTURE.with(|c| {
+            if let Some(buf) = c {
+                buf.push_str(s);
+            }
+        });
         Ok(())
     }
 }

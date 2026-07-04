@@ -31,7 +31,7 @@ help:
 	@echo
 	@echo "Override knobs, e.g.:  make run ARCH=x86_64 MODEL=qwen3.5-9b RELEASE=1"
 
-## test: in-kernel test suite under QEMU (x86_64) — the gate, keep it 103/103
+## test: in-kernel test suite under QEMU (x86_64) — the gate, keep it 104/104
 .PHONY: test
 test:
 	$(XTASK) test
