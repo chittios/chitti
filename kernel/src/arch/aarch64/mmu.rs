@@ -17,11 +17,17 @@ static mut L1: Table = Table([0; 512]);
 static RAM_END: AtomicU64 = AtomicU64::new(0);
 /// Extent (bytes) of the identity map [`init`] built — `MAP_GIB` 1-GiB blocks.
 static MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
-/// On the UEFI path, the physical base of the heap the stub pre-allocated (right
-/// above the model) and reported in boot-info; the kernel places its heap there
+/// On the UEFI path, the physical base of the heap the stub pre-allocated
+/// (AnyPages) and reported in boot-info; the kernel places its heap there
 /// instead of at the top of RAM (the top is where UEFI parks ACPI/runtime data).
 /// 0 on the `-kernel` path (heap goes at the top of RAM instead).
 static UEFI_HEAP_BASE: AtomicU64 = AtomicU64::new(0);
+/// On the UEFI path, the physical base/size of the model the stub loaded
+/// (AnyPages) and reported in boot-info; the kernel reads the model there rather
+/// than at a fixed address (fixed addresses aren't reliably free under UEFI
+/// firmware). Both 0 on the `-kernel` path (model at `cortex::MODEL_LOAD_ADDR`).
+static UEFI_MODEL_BASE: AtomicU64 = AtomicU64::new(0);
+static UEFI_MODEL_SIZE: AtomicU64 = AtomicU64::new(0);
 
 /// Minimum GiB to identity-map, regardless of RAM size. The UEFI/GOP framebuffer
 /// the kernel renders into can sit above RAM in a device window; the previous
@@ -37,10 +43,11 @@ const MAP_FLOOR_GIB: u64 = 12;
 const FALLBACK_RAM_END: u64 = 0x4000_0000 + (4 << 30);
 
 /// What [`detect`] found: the usable top address, and (UEFI only) the stub's
-/// pre-allocated heap base.
+/// pre-allocated heap and model regions.
 struct RamInfo {
     ram_end: u64,
     uefi_heap_base: u64,
+    uefi_model: (u64, u64),
 }
 
 /// Discover RAM at boot. Runs with the MMU **off** (before the map is built), so
@@ -49,25 +56,27 @@ fn detect() -> RamInfo {
     // `-kernel`: QEMU passes the DTB in x0; parse its `/memory` node.
     // SAFETY: `boot_x0()` is the DTB pointer (or non-FDT, rejected by magic).
     if let Some((b, s)) = unsafe { super::dtb::memory_region(super::boot::boot_x0()) } {
-        return RamInfo { ram_end: b.saturating_add(s), uefi_heap_base: 0 };
+        return RamInfo { ram_end: b.saturating_add(s), uefi_heap_base: 0, uefi_model: (0, 0) };
     }
-    // UEFI/stub: the boot-info page carries the heap region (heap_base@60,
-    // heap_size@68) the stub pre-allocated just above the model.
-    if let Some((hb, hs)) = bootinfo_heap(super::boot::boot_x1()) {
-        return RamInfo { ram_end: hb.saturating_add(hs), uefi_heap_base: hb };
+    // UEFI/stub: the boot-info page carries the heap and model regions the stub
+    // allocated (AnyPages). The map must cover both.
+    if let Some((hb, hs, mb, ms)) = bootinfo_regions(super::boot::boot_x1()) {
+        let ram_end = hb.saturating_add(hs).max(mb.saturating_add(ms));
+        return RamInfo { ram_end, uefi_heap_base: hb, uefi_model: (mb, ms) };
     }
-    RamInfo { ram_end: FALLBACK_RAM_END, uefi_heap_base: 0 }
+    RamInfo { ram_end: FALLBACK_RAM_END, uefi_heap_base: 0, uefi_model: (0, 0) }
 }
 
-/// Read `(heap_base, heap_size)` from the UEFI stub's boot-info page, if present.
-/// Layout: magic "CHITTIBI"@0, heap_base@60..68, heap_size@68..76 (little-endian;
-/// see `stub`). Pure reads (MMU may be off).
-fn bootinfo_heap(bi: u64) -> Option<(u64, u64)> {
+/// Read `(heap_base, heap_size, model_base, model_size)` from the UEFI stub's
+/// boot-info page, if present. Layout: magic "CHITTIBI"@0, heap_base@60,
+/// heap_size@68, model_base@76, model_size@84 (little-endian; see `stub`). Pure
+/// reads (MMU may be off). Returns None unless the heap region is present.
+fn bootinfo_regions(bi: u64) -> Option<(u64, u64, u64, u64)> {
     if bi == 0 {
         return None;
     }
     let p = bi as *const u8;
-    // SAFETY: identity/flat address; read the 8-byte magic then two u64 fields.
+    // SAFETY: identity/flat address; read the 8-byte magic then the u64 fields.
     let magic = unsafe { core::slice::from_raw_parts(p, 8) };
     if magic != b"CHITTIBI" {
         return None;
@@ -77,11 +86,11 @@ fn bootinfo_heap(bi: u64) -> Option<(u64, u64)> {
         let b = unsafe { core::slice::from_raw_parts(p.add(off), 8) };
         u64::from_le_bytes(b.try_into().unwrap())
     };
-    let (base, size) = (rd(60), rd(68));
-    if base == 0 || size == 0 {
+    let (hb, hs) = (rd(60), rd(68));
+    if hb == 0 || hs == 0 {
         return None;
     }
-    Some((base, size))
+    Some((hb, hs, rd(76), rd(84)))
 }
 
 /// Set up the identity map and enable the MMU + caches. Idempotent-ish; call
@@ -109,6 +118,8 @@ pub fn init() {
     // MMU is on now, so atomics work; publish what we discovered/mapped.
     RAM_END.store(info.ram_end, Ordering::Relaxed);
     UEFI_HEAP_BASE.store(info.uefi_heap_base, Ordering::Relaxed);
+    UEFI_MODEL_BASE.store(info.uefi_model.0, Ordering::Relaxed);
+    UEFI_MODEL_SIZE.store(info.uefi_model.1, Ordering::Relaxed);
     MAPPED_BYTES.store(map_gib << 30, Ordering::Relaxed);
 }
 
@@ -118,10 +129,23 @@ pub fn ram_end() -> u64 {
     RAM_END.load(Ordering::Relaxed)
 }
 
-/// The UEFI stub's pre-allocated heap base (above the model), or 0 on the
-/// `-kernel` path (where the kernel places the heap at the top of RAM itself).
+/// The UEFI stub's pre-allocated heap base, or 0 on the `-kernel` path (where the
+/// kernel places the heap at the top of RAM itself).
 pub fn uefi_heap_base() -> u64 {
     UEFI_HEAP_BASE.load(Ordering::Relaxed)
+}
+
+/// The UEFI stub's loaded model `(base, size)`, or `None` on the `-kernel` path
+/// (where the model is at `cortex::MODEL_LOAD_ADDR`). Lets `cortex` read the
+/// model wherever the firmware placed it instead of at a fixed address.
+pub fn uefi_model() -> Option<(usize, usize)> {
+    let base = UEFI_MODEL_BASE.load(Ordering::Relaxed);
+    let size = UEFI_MODEL_SIZE.load(Ordering::Relaxed);
+    if base != 0 && size != 0 {
+        Some((base as usize, size as usize))
+    } else {
+        None
+    }
 }
 
 /// Extent (bytes) of the identity map — the upper bound for any physical address

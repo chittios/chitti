@@ -88,34 +88,32 @@ pub fn init() {
     let size = heap::HEAP_SIZE;
     #[cfg(not(feature = "boot-limine"))]
     let base = {
-        let model_floor = crate::cortex::MODEL_LOAD_ADDR;
         let uefi_heap = crate::arch::aarch64::mmu::uefi_heap_base() as usize;
-        let base = if uefi_heap != 0 {
-            // UEFI/stub path: the stub pre-allocated (and reserved from the UEFI
-            // allocator) a heap region just above the model and reported its base.
-            // Use it directly — the top of RAM is where firmware parks ACPI/
-            // runtime data, so we must not place the heap there.
+        if uefi_heap != 0 {
+            // UEFI/stub path: the stub allocated the heap (AnyPages) from the UEFI
+            // allocator and reported its base — a guaranteed-free, non-overlapping
+            // region (the model is a separate allocation the stub also reported).
+            // Use it directly; the top of RAM here holds firmware ACPI/runtime data.
             uefi_heap
         } else {
             // `-kernel` path: no firmware, so place the heap at the very top of
             // discovered RAM (2 MiB-aligned down), leaving the whole span below it
-            // for the model.
+            // for the model at MODEL_LOAD_ADDR. If the heap would start at/below
+            // the model base, there isn't enough RAM for both — fail loudly.
+            let model_floor = crate::cortex::MODEL_LOAD_ADDR;
             let ram_end = crate::arch::aarch64::mmu::ram_end() as usize;
-            ram_end.saturating_sub(size) & !((2 << 20) - 1)
-        };
-        // The model region is [MODEL_LOAD_ADDR, base); if the heap would start at
-        // or below where the model loads, there isn't enough RAM for both. Fail
-        // loudly with actionable numbers instead of overlapping the model.
-        if base <= model_floor || base.checked_add(size).is_none() {
-            panic!(
-                "Chitti: not enough memory -- a {} MiB heap would start at {:#x}, at/below the model region \
-                 base {:#x}. Boot with more RAM (raise -m / the VM's memory).",
-                size >> 20,
-                base,
-                model_floor,
-            );
+            let base = ram_end.saturating_sub(size) & !((2 << 20) - 1);
+            if base <= model_floor || base.checked_add(size).is_none() {
+                panic!(
+                    "Chitti: not enough memory -- a {} MiB heap would start at {:#x}, at/below the model \
+                     region base {:#x}. Boot with more RAM (raise -m / the VM's memory).",
+                    size >> 20,
+                    base,
+                    model_floor,
+                );
+            }
+            base
         }
-        base
     };
     // Limine build: RAM comes from the Limine map and the model is a boot module,
     // not loaded at a fixed physical address, so keep a fixed high heap base.

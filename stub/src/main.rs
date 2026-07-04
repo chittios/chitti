@@ -22,14 +22,9 @@ extern crate alloc;
 use uefi::boot::{self, AllocateType, MemoryType};
 use uefi::prelude::*;
 
-/// The aarch64 model load address the kernel's `cortex::model_module` reads
-/// (mirrors QEMU `-device loader` on the `-kernel` path). One address for every
-/// model (`cortex::MODEL_LOAD_ADDR`); the kernel's heap goes just above it (the
-/// stub reserves that region and reports its base — see below).
-const MODEL_ADDR: u64 = 0x8000_0000;
 /// The most heap the kernel will ever want (its largest per-model tier is 1 GiB
-/// for the 9B). The stub reserves this much just above the model and reports the
-/// base; the kernel uses its own (<= this) tier within the reservation.
+/// for the 9B). The stub reserves this much in free RAM and reports the base; the
+/// kernel uses its own (<= this) tier within the reservation.
 const HEAP_MAX: u64 = 1 << 30;
 
 fn le16(b: &[u8], o: usize) -> u16 {
@@ -130,13 +125,28 @@ fn main() -> Status {
         }
     }
 
-    // Load the model to the fixed address the kernel reads, if bundled.
+    // Load the model into free RAM (AnyPages), if bundled. A *fixed* physical
+    // address is not reliable under UEFI firmware — VirtualBox/AAVMF reserves
+    // regions at fixed addresses and AllocateAddress there returns NOT_FOUND — so
+    // we let the firmware pick a free run and report where it landed in the
+    // boot-info; the kernel reads the model there (not at a hardcoded address).
     let model_region: Option<(u64, u64)> = match fs.read(cstr16!("\\model.gguf.000")) {
         Ok(model) => {
-            let dst = alloc_at(MODEL_ADDR, model.len());
-            dst[..model.len()].copy_from_slice(&model);
-            log::info!("chitti-stub: model {} bytes at {MODEL_ADDR:#x}", model.len());
-            Some((MODEL_ADDR, model.len() as u64))
+            let pages = model.len().div_ceil(4096);
+            match boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages) {
+                Ok(ptr) => {
+                    let base = ptr.as_ptr() as u64;
+                    // SAFETY: freshly allocated, `pages * 4096` bytes at `base`.
+                    let dst = unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), pages * 4096) };
+                    dst[..model.len()].copy_from_slice(&model);
+                    log::info!("chitti-stub: model {} bytes at {base:#x}", model.len());
+                    Some((base, model.len() as u64))
+                }
+                Err(e) => {
+                    log::warn!("chitti-stub: model alloc ({pages} pages) failed: {e:?} -- booting without a model (need more VM RAM)");
+                    None
+                }
+            }
         }
         Err(_) => {
             log::info!("chitti-stub: no model on ESP (kernel will report no model)");
@@ -144,18 +154,25 @@ fn main() -> Status {
         }
     };
 
-    // Reserve the kernel's heap region just ABOVE the model (2 MiB-aligned) and
-    // mark it LOADER_DATA so it survives ExitBootServices and UEFI won't park
-    // anything there. The kernel places its heap here (reported below in the
-    // boot-info) rather than at the top of RAM, which on UEFI holds ACPI/runtime
-    // data. Reserving *before* the boot-info page is allocated keeps that page
-    // (AnyPages) out of this region. Size is HEAP_MAX (>= any model's heap tier).
-    let model_top = model_region.map(|(a, n)| a + n).unwrap_or(MODEL_ADDR);
-    let heap_base = (model_top + 0x1f_ffff) & !0x1f_ffff; // round up to 2 MiB
-    match boot::allocate_pages(AllocateType::Address(heap_base), MemoryType::LOADER_DATA, (HEAP_MAX / 4096) as usize) {
-        Ok(_) => log::info!("chitti-stub: reserved kernel heap {heap_base:#x} ({} MiB)", HEAP_MAX >> 20),
-        Err(e) => log::warn!("chitti-stub: could NOT reserve heap {heap_base:#x}: {e:?} (need more VM RAM)"),
-    }
+    // Reserve the kernel heap in free RAM (AnyPages, HEAP_MAX) and mark it
+    // LOADER_DATA so it survives ExitBootServices. Report its base; the kernel
+    // places its heap here. AnyPages (not a fixed address, and not the top of RAM
+    // where UEFI parks ACPI/runtime data) is what makes this robust across
+    // firmwares.
+    let heap_region: Option<(u64, u64)> = {
+        let pages = (HEAP_MAX / 4096) as usize;
+        match boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages) {
+            Ok(ptr) => {
+                let base = ptr.as_ptr() as u64;
+                log::info!("chitti-stub: reserved kernel heap {base:#x} ({} MiB)", HEAP_MAX >> 20);
+                Some((base, HEAP_MAX))
+            }
+            Err(e) => {
+                log::warn!("chitti-stub: heap reserve ({pages} pages) failed: {e:?} (need more VM RAM)");
+                None
+            }
+        }
+    };
 
     // Capture the UEFI GOP framebuffer and publish it in a boot-info page at a
     // fixed address the kernel checks. This is what makes Chitti's console
@@ -253,12 +270,17 @@ fn main() -> Status {
         // This is the only reliable clock on VirtualBox-ARM, whose generic timer
         // doesn't advance for the guest; 0 if the firmware has no RTC.
         page[52..60].copy_from_slice(&efi_unix().to_le_bytes());
-        // Kernel heap region at 60..76: base@60 (reserved just above the model),
-        // size@68. The kernel places its heap here (arch::aarch64::mmu / mm) so it
-        // never lands on UEFI-reserved high memory.
-        page[60..68].copy_from_slice(&heap_base.to_le_bytes());
-        page[68..76].copy_from_slice(&HEAP_MAX.to_le_bytes());
-        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x}, heap {heap_base:#x} -> boot-info {addr:#x}");
+        // Kernel heap region at 60..76 (base@60, size@68) and model region at
+        // 76..92 (base@76, size@84), both AnyPages-allocated above. The kernel
+        // reads the model at the reported base and places its heap at the heap
+        // base — no fixed physical addresses on the UEFI path.
+        let (hb, hs) = heap_region.unwrap_or((0, 0));
+        page[60..68].copy_from_slice(&hb.to_le_bytes());
+        page[68..76].copy_from_slice(&hs.to_le_bytes());
+        let (mb, ms) = model_region.unwrap_or((0, 0));
+        page[76..84].copy_from_slice(&mb.to_le_bytes());
+        page[84..92].copy_from_slice(&ms.to_le_bytes());
+        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x}, heap {hb:#x}, model {mb:#x} -> boot-info {addr:#x}");
         Some(addr)
     })();
 
