@@ -270,11 +270,14 @@ fn cntfrq() -> u64 {
 
 /// Milliseconds since boot, from the ARM generic timer (the aarch64 analogue
 /// of the x86 PIT tick counter used for inference timing).
+///
+/// VirtualBox-ARM leaves `CNTFRQ_EL0` reading 0 (it never programs the timer
+/// frequency), which would freeze this clock at 0 — and with it the blinking
+/// caret and the status-bar datetime, both of which key off elapsed ms. The
+/// physical counter (`CNTPCT_EL0`) still advances, so fall back to the Apple
+/// Silicon host frequency (24 MHz, what QEMU/HVF also reports) when the register
+/// reads 0.
 pub fn time_ms() -> u64 {
-    let f = cntfrq();
-    if f == 0 {
-        0
-    } else {
-        cntpct() * 1000 / f
-    }
+    let f = if cntfrq() != 0 { cntfrq() } else { 24_000_000 };
+    cntpct() * 1000 / f
 }
