@@ -811,8 +811,9 @@ impl Screen {
         self.fill_rect(0, sy_top, self.width, bar_h, self.theme.status_bg);
         let ty = sy_top + 4;
         // Left: the Synapse-C brand mark, then the brand text (accent). The icon
-        // is sized to the bar height and vertically centred.
-        let icon_r = bar_h / 3;
+        // nearly fills the bar height (bolder + more legible than a third of it)
+        // and is vertically centred.
+        let icon_r = bar_h.saturating_sub(4) / 2;
         let icon_cx = OUTER + icon_r;
         let icon_cy = sy_top + bar_h / 2;
         self.draw_logo(icon_cx, icon_cy, icon_r, self.theme.accent, self.theme.status_bg);
@@ -856,7 +857,7 @@ impl Screen {
     /// (endpoints at ±55°, node at 0.74r; see DESIGN.md).
     fn draw_logo(&self, cx: u64, cy: u64, r: u64, arc_c: Rgb, node_c: Rgb) {
         let (cx, cy, r) = (cx as i64, cy as i64, r as i64);
-        let t = (r / 3).max(2); // ring thickness (26/78 of r)
+        let t = (r / 3).max(3); // ring thickness (26/78 of r), min 3 so a small mark still reads
         let half = t / 2;
         let (inner, outer) = ((r - half) * (r - half), (r + half) * (r + half));
         let span = r + half + 1;
@@ -873,9 +874,9 @@ impl Screen {
                 self.put_pixel((cx + dx) as u64, (cy + dy) as u64, arc_c);
             }
         }
-        // Round end-caps at ±55°.
+        // Round end-caps at ±55° (min 3 so the two dots read at status-bar size).
         let (ex, ey) = (r * 574 / 1000, r * 819 / 1000); // cos55, sin55
-        let cap = (r / 5).max(2);
+        let cap = (r / 5).max(3);
         self.fill_disc(cx + ex, cy - ey, cap, node_c);
         self.fill_disc(cx + ex, cy + ey, cap, node_c);
         // The synapse node + its four stubs are sub-pixel below ~16px radius
