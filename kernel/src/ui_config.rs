@@ -28,6 +28,28 @@ const ARCH: &str = "aarch64";
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 const ARCH: &str = "?";
 
+/// The Chitti brand colour palette (see DESIGN.md). Written into `ui.json`'s
+/// `theme` object so every colour is discoverable + overridable; the framebuffer
+/// applies them over its brand-dark default via `theme_from_pairs`.
+const THEME_DEFAULTS: &[(&str, &str)] = &[
+    ("accent", "#cc785c"),       // primary — active border, caret, brand, logo
+    ("screen_bg", "#181715"),    // surface-dark
+    ("chat_bg", "#1f1e1b"),      // surface-dark-soft
+    ("logs_bg", "#141311"),
+    ("chat_fg", "#faf9f5"),      // cream / on-dark
+    ("logs_fg", "#a09d96"),      // on-dark-soft
+    ("border_dim", "#3a3733"),
+    ("title_active", "#cc785c"),
+    ("title_dim", "#6c6a64"),    // muted
+    ("sep_dim", "#2a2825"),
+    ("status_bg", "#252320"),    // surface-dark-elevated
+    ("status_fg", "#a09d96"),
+    ("editor_bg", "#1f1e1b"),
+    ("editor_fg", "#faf9f5"),
+    ("editor_lineno", "#6c6a64"),
+    ("editor_sel", "#5a3a2e"),   // terracotta-tinted selection
+];
+
 /// The persisted UI configuration.
 #[derive(Clone)]
 pub struct UiConfig {
@@ -39,6 +61,10 @@ pub struct UiConfig {
     pub status_left: String,  // template
     pub status_right: String, // template
     pub tz_offset: i32,       // seconds east of UTC
+    pub splash: bool,         // show the boot splash (logo + wordmark)
+    /// Colour palette as `(name, "#rrggbb")` pairs (kept as strings so the config
+    /// layer stays independent of the framebuffer, which is absent in test builds).
+    pub theme: Vec<(String, String)>,
 }
 
 impl Default for UiConfig {
@@ -52,12 +78,15 @@ impl Default for UiConfig {
             status_left: "Chitti OS v${version}".to_string(),
             status_right: "${datetime}  ${tz}".to_string(),
             tz_offset: 0,
+            splash: true,
+            theme: THEME_DEFAULTS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         }
     }
 }
 
 impl UiConfig {
     fn to_json(&self) -> Json {
+        let theme = Json::Obj(self.theme.iter().map(|(k, v)| (k.clone(), Json::Str(v.clone()))).collect());
         Json::Obj(alloc::vec![
             ("chat_pct".to_string(), Json::Num(self.chat_pct as f64)),
             ("font_scale".to_string(), Json::Num(self.font_scale as f64)),
@@ -67,12 +96,24 @@ impl UiConfig {
             ("status_left".to_string(), Json::Str(self.status_left.clone())),
             ("status_right".to_string(), Json::Str(self.status_right.clone())),
             ("tz_offset".to_string(), Json::Num(self.tz_offset as f64)),
+            ("splash".to_string(), Json::Bool(self.splash)),
+            ("theme".to_string(), theme),
         ])
     }
 
     fn from_json(j: &Json) -> UiConfig {
         let d = UiConfig::default();
         let s = |k: &str, def: &str| j.get(k).and_then(|v| v.as_str()).map(|x| x.to_string()).unwrap_or_else(|| def.to_string());
+        // Theme: start from the brand defaults, override any key present in the
+        // config's `theme` object.
+        let mut theme = d.theme.clone();
+        if let Some(obj) = j.get("theme") {
+            for (name, hex) in theme.iter_mut() {
+                if let Some(v) = obj.get(name).and_then(|v| v.as_str()) {
+                    *hex = v.to_string();
+                }
+            }
+        }
         UiConfig {
             chat_pct: j.get("chat_pct").and_then(|v| v.as_i64()).map(|n| n as u64).unwrap_or(d.chat_pct),
             font_scale: j.get("font_scale").and_then(|v| v.as_i64()).map(|n| n as u64).unwrap_or(d.font_scale),
@@ -82,6 +123,8 @@ impl UiConfig {
             status_left: s("status_left", &d.status_left),
             status_right: s("status_right", &d.status_right),
             tz_offset: j.get("tz_offset").and_then(|v| v.as_i64()).map(|n| n as i32).unwrap_or(d.tz_offset),
+            splash: j.get("splash").and_then(|v| v.as_bool()).unwrap_or(d.splash),
+            theme,
         }
     }
 
@@ -94,6 +137,8 @@ impl UiConfig {
             swap: self.swap_panes,
             chat_title: self.chat_title.clone(),
             logs_title: self.logs_title.clone(),
+            theme: crate::framebuffer::theme_from_pairs(&self.theme),
+            splash: self.splash,
         }
     }
 }
@@ -103,6 +148,13 @@ static CONFIG: Locked<Option<UiConfig>> = Locked::new(None);
 /// The live config (a clone), loading defaults if not yet initialized.
 pub fn current() -> UiConfig {
     CONFIG.with(|c| c.clone()).unwrap_or_default()
+}
+
+/// The framebuffer layout (theme, splash, panes) for the initial boot screen —
+/// the current config if already loaded, else the brand defaults.
+#[cfg(not(test))]
+pub fn boot_layout() -> crate::framebuffer::LayoutCfg {
+    current().layout_cfg()
 }
 
 fn store(cfg: UiConfig) {
