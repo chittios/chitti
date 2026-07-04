@@ -548,3 +548,37 @@ Append one entry per milestone: phase, what landed, gate status per arch, next s
   `/infer` still `matches reference=true` (~13 tok/s), framebuffer + disk + shell
   all up. Both arches build; 103/103 x86_64 tests green. **No driver-level
   divergence between the arches remains.**
+
+### VirtualBox-ARM bring-up: keyboard + boot verified END-TO-END  ✅
+- The full real-hypervisor debugging arc, concluded with the keyboard **verified
+  working on VirtualBox** (injected `/help` via `VBoxManage controlvm
+  keyboardputscancode` — the same IKeyboard path as the GUI — and the shell
+  executed it; serial showed the full help output).
+- Root causes found and fixed along the way (each verified against VBox's own
+  source + `debugvm` live dumps + its release log):
+  1. **CNTP vs CNTV**: VBox GPs a guest `msr CNTP_TVAL_EL0` → switched the tick
+     source to the virtual timer (guest-safe everywhere).
+  2. **UART discovery**: VBox's PL011 is at 0xFFDDF000 with no ACPI SPCR →
+     PrimeCell-id probe (recoverable-fault-guarded) finds it; kernel serial now
+     reaches VBox's log (NB: VBox's serial-to-file drops bytes under load —
+     treat the log as lossy).
+  3. **EP0 max-packet**: full-speed EP0 needs the device-descriptor-first +
+     Evaluate Context dance (same as Linux's xhci_check_ep0_maxpacket).
+  4. **Async VUSB device reset** (the keyboard killer): VBox resets the attached
+     device ~20 ms *after* our controller reset; the first control transfer gets
+     rejected inside VBox with the TD silently dropped (TREP advances, TRDP
+     freezes, no event). Fix: enumeration retry with settle (attempt 2 lands
+     after the window) — VBox log confirms `retrying enumeration (attempt 2)` →
+     `HID keyboard ready` → `INPUT usb-kbd=READY`.
+  5. **MMIO accessors**: LLVM compiled a PORTSC scan loop into a post-indexed
+     load; writeback MMIO faults have no syndrome (ESR.ISV=0) and abort
+     QEMU/HVF. r32/w32/w64 are now single-instruction asm accessors — the same
+     guarantee Linux's readl/writel make.
+  6. **GIC on VBox**: VBox exposes Apple's native hv_gic, so the CPU-interface
+     probe *passes* there (unlike QEMU-HVF) — `start_preemption` now verifies
+     ticks actually arrive (bounded three ways) and re-masks to cooperative if
+     not, and ICC_CTLR.EOImode is programmed explicitly.
+- VBox's SET_PROTOCOL is unimplemented (STALLs, cc=6) — benign: its keyboard
+  always emits boot-format reports; we log and continue.
+- Every fix is in the shared xhci core / arch-neutral paths → **both arches**;
+  QEMU (HVF + TCG) re-verified after each change; 103/103 x86_64 tests green.
