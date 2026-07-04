@@ -75,8 +75,12 @@ pub fn open(path: &str) -> bool {
             Some(b) => {
                 ed.handle(b);
                 ed.render();
+                crate::framebuffer::cursor_move_here();
             }
-            None => crate::sched::yield_now(),
+            None => {
+                ed.mouse_tick();
+                crate::sched::yield_now();
+            }
         }
     }
     crate::framebuffer::editor_leave();
@@ -465,5 +469,70 @@ impl Editor {
         };
         let sel = if self.mode == Mode::Visual { Some(self.sel_range()) } else { None };
         crate::framebuffer::editor_render(&title, &self.lines, self.top, self.cy, self.cx, &modeline, sel);
+    }
+
+    /// Line-number gutter width (matches framebuffer::editor_render).
+    fn gutter(&self) -> u64 {
+        let mut n = self.lines.len().max(1);
+        let mut w = 1u64;
+        while n >= 10 {
+            n /= 10;
+            w += 1;
+        }
+        w + 1
+    }
+
+    /// Map a framebuffer pixel to an editor `(row, col)`, or `None` if outside
+    /// the text area.
+    fn cell_at(&self, px: u64, py: u64) -> Option<(usize, usize)> {
+        let (ix, iy, cw, ch, cols, text_rows) = crate::framebuffer::editor_pane_geom()?;
+        if px < ix || py < iy {
+            return None;
+        }
+        let col_scr = (px - ix) / cw;
+        let row_scr = (py - iy) / ch;
+        if row_scr >= text_rows || col_scr >= cols {
+            return None;
+        }
+        let g = self.gutter();
+        let col = col_scr.saturating_sub(g) as usize;
+        let row = self.top + row_scr as usize;
+        if row >= self.lines.len() {
+            return None;
+        }
+        Some((row, col.min(self.lines[row].len().saturating_sub(1))))
+    }
+
+    /// Mouse handling in the editor: move the cursor, drag to select, release to
+    /// copy the selection to the clipboard.
+    fn mouse_tick(&mut self) {
+        let t = crate::mouse::tick();
+        if t.moved {
+            crate::framebuffer::cursor_move(t.x, t.y);
+        }
+        if t.pressed {
+            if let Some((r, c)) = self.cell_at(t.x, t.y) {
+                self.cy = r;
+                self.cx = c;
+                self.mode = Mode::Visual;
+                self.sel_anchor = Some((r, c));
+                self.render();
+                crate::framebuffer::cursor_move(t.x, t.y);
+            }
+        } else if t.released {
+            if self.mode == Mode::Visual {
+                crate::clipboard::set(self.selected_text(), false);
+                self.msg = "copied (mouse)".to_string();
+                self.render();
+                crate::framebuffer::cursor_move(t.x, t.y);
+            }
+        } else if t.left && t.moved && self.mode == Mode::Visual {
+            if let Some((r, c)) = self.cell_at(t.x, t.y) {
+                self.cy = r;
+                self.cx = c;
+                self.render();
+                crate::framebuffer::cursor_move(t.x, t.y);
+            }
+        }
     }
 }

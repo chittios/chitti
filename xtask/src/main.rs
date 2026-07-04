@@ -362,7 +362,7 @@ fn cmd_run_aarch64_uefi(model: Model, disk: Option<PathBuf>, disk_only: bool, no
         qemu.arg(a);
     }
     qemu.args([
-        "-device", "ramfb", "-device", "virtio-keyboard-device",
+        "-device", "ramfb", "-device", "virtio-keyboard-device", "-device", "virtio-tablet-device",
         "-display", "cocoa,zoom-to-fit=on", "-serial", "mon:stdio",
     ]);
     // ESP first, data disk LAST: QEMU assigns later virtio-mmio devices to
@@ -413,6 +413,8 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
     qemu.args([
         "-M", "virt", "-cpu", "host", "-accel", "hvf", "-smp", "4", "-m", model.qemu_mem(),
         "-device", "ramfb", "-device", "virtio-keyboard-device",
+        // A virtio tablet gives the window an absolute-position mouse.
+        "-device", "virtio-tablet-device",
         // Resizable graphical window (the ramfb surface scales to fit).
         "-display", "cocoa,zoom-to-fit=on",
         "-serial", "mon:stdio", "-kernel",

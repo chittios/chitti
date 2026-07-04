@@ -30,6 +30,15 @@ pub fn poll_key() -> Option<u8> {
     XHCI.with(|s| s.as_mut().and_then(|x| x.poll_key()))
 }
 
+/// Drain USB HID mouse reports into `crate::mouse` (no-op if no USB mouse).
+pub fn poll_mouse() {
+    XHCI.with(|s| {
+        if let Some(x) = s.as_mut() {
+            x.poll_mouse();
+        }
+    });
+}
+
 /// Page-aligned identity DMA: VA == PA on the aarch64 identity map (or via
 /// `dma_to_phys` under the HHDM handoff). Returns `(phys, virt)`.
 fn aa_alloc(bytes: usize) -> Option<(u64, usize)> {
