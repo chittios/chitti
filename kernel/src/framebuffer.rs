@@ -149,6 +149,10 @@ pub struct Screen {
     /// Blinking-caret state for the chat pane.
     caret_on: bool,
     caret_last_ms: u64,
+    /// Fallback blink cadence when the monotonic clock is frozen (some VBox
+    /// configs): the last `now_ms` seen, and a call counter.
+    blink_seen_ms: u64,
+    blink_calls: u32,
     /// What the right ("action") pane currently shows. `None` = closed, so the
     /// chat pane is full-width — the default.
     right: RightMode,
@@ -280,6 +284,8 @@ impl Screen {
             status_right: String::new(),
             caret_on: true,
             caret_last_ms: 0,
+            blink_seen_ms: u64::MAX,
+            blink_calls: 0,
             right: RightMode::Closed,
             right_before_editor: RightMode::Closed,
             layout: cfg.clone(),
@@ -758,7 +764,23 @@ pub fn editor_pane_geom() -> Option<(u64, u64, u64, u64, u64, u64)> {
 pub fn blink(now_ms: u64) {
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
-            if now_ms.saturating_sub(sc.caret_last_ms) >= 500 {
+            // If the clock advances, blink on a 500 ms period. If it's frozen
+            // (some VirtualBox configs), fall back to a call-count cadence so the
+            // caret still blinks.
+            let toggle = if now_ms != sc.blink_seen_ms {
+                sc.blink_seen_ms = now_ms;
+                sc.blink_calls = 0;
+                now_ms.saturating_sub(sc.caret_last_ms) >= 500
+            } else {
+                sc.blink_calls = sc.blink_calls.wrapping_add(1);
+                if sc.blink_calls >= 6000 {
+                    sc.blink_calls = 0;
+                    true
+                } else {
+                    false
+                }
+            };
+            if toggle {
                 sc.cursor_restore();
                 sc.cur_vis = false;
                 sc.caret_on = !sc.caret_on;
