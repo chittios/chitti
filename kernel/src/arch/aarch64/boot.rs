@@ -15,6 +15,16 @@ use core::arch::global_asm;
 #[no_mangle]
 pub static mut BOOT_X1: u64 = 0;
 
+/// The value the entry received in x0. On QEMU `-M virt -kernel` this is the
+/// **flattened device tree (DTB)** physical address (Linux boot convention) —
+/// the kernel parses its `/memory` node to discover RAM size (see [`super::dtb`]
+/// / [`super::mmu`]). On the UEFI-stub path x0 is not a DTB; the parser rejects
+/// it via the FDT magic and RAM size comes from the stub boot-info page instead.
+/// `_start` saves it (from a callee-saved reg) after zeroing `.bss`.
+#[cfg(not(feature = "boot-limine"))]
+#[no_mangle]
+pub static mut BOOT_X0: u64 = 0;
+
 /// The boot-info pointer the entry received in x1 (0 on the `-kernel` path).
 #[cfg(not(feature = "boot-limine"))]
 pub fn boot_x1() -> u64 {
@@ -22,9 +32,22 @@ pub fn boot_x1() -> u64 {
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(BOOT_X1)) }
 }
 
+/// The x0 value at entry — the DTB physical address on the `-kernel` path.
+#[cfg(not(feature = "boot-limine"))]
+pub fn boot_x0() -> u64 {
+    // SAFETY: written once by `_start` before any Rust runs; read-only after.
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(BOOT_X0)) }
+}
+
 /// The Limine build has no `-kernel` boot-info page.
 #[cfg(feature = "boot-limine")]
 pub fn boot_x1() -> u64 {
+    0
+}
+
+/// The Limine build discovers RAM from the Limine memory map, not a DTB.
+#[cfg(feature = "boot-limine")]
+pub fn boot_x0() -> u64 {
     0
 }
 
@@ -36,9 +59,12 @@ global_asm!(
 .section .text.boot
 .global _start
 _start:
-    // Preserve the boot-info pointer (x1) in a callee-saved reg across the .bss
-    // zero (which clobbers x1 and would wipe BOOT_X1 if stored before).
+    // Preserve the entry registers in callee-saved regs across the .bss zero
+    // (which clobbers x0/x1 and would wipe the statics if stored before):
+    //   x1 = boot-info page (UEFI stub) -> BOOT_X1
+    //   x0 = DTB pointer (`-kernel`)     -> BOOT_X0
     mov  x20, x1
+    mov  x21, x0
 
     adrp x0, __stack_top
     add  x0, x0, :lo12:__stack_top
@@ -62,6 +88,9 @@ _start:
 2:  adrp x0, BOOT_X1
     add  x0, x0, :lo12:BOOT_X1
     str  x20, [x0]
+    adrp x0, BOOT_X0
+    add  x0, x0, :lo12:BOOT_X0
+    str  x21, [x0]
     bl   aarch64_start
 3:  wfi
     b    3b

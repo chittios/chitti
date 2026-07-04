@@ -63,28 +63,68 @@ impl<T> Locked<T> {
 #[cfg(target_arch = "x86_64")]
 pub static FRAME_ALLOCATOR: Locked<Option<frame::BitmapFrameAllocator>> = Locked::new(None);
 
-/// aarch64 memory bring-up: enable the MMU (identity map, RAM = normal
-/// cacheable), then hand a fixed RAM region to the linked-list heap. RAM on
-/// the QEMU `virt` machine starts at 0x40000000 and the kernel loads at
-/// 0x40080000; the heap sits well past the image and within the identity map.
+/// Physical base of the kernel heap, published by [`init`] (aarch64) so
+/// `cortex::model_module` can size the model region as `[MODEL_LOAD_ADDR,
+/// heap_base())`. 0 before `init` runs.
+#[cfg(target_arch = "aarch64")]
+static HEAP_BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The kernel heap's physical base address (aarch64). 0 until [`init`] runs.
+#[cfg(target_arch = "aarch64")]
+pub fn heap_base() -> usize {
+    HEAP_BASE.load(Ordering::Relaxed)
+}
+
+/// aarch64 memory bring-up: the MMU (identity map, RAM = normal cacheable) is
+/// already on from the boot entry, which also discovered the RAM window. Here we
+/// place the heap at the **top of discovered RAM**, 2 MiB-aligned, and hand that
+/// region to the linked-list allocator. Nothing about the layout is hardcoded
+/// per model: the model loads at `cortex::MODEL_LOAD_ADDR`, the heap lands just
+/// under `ram_end`, and the model region is everything in between — so any
+/// `-m`/VM size works, and a model that won't fit is reported rather than
+/// silently corrupting memory.
 #[cfg(target_arch = "aarch64")]
 pub fn init() {
-    // The MMU is already enabled by the boot entry (`main::aarch64_start`),
-    // before any atomic/`Locked` use; here we just hand a fixed RAM region to
-    // the heap. Layout in the identity-mapped RAM:
-    //  - default (0.8B): kernel at 0x40080000, model at 0x48000000 (~896 MiB),
-    //    heap at 0x80000000 -- past the model, no overlap.
-    //  - `model-9b`: the ~5.8 GiB model sits at 0x80000000, so the heap moves to
-    //    0x2_00000000 (8 GiB) and grows to 1 GiB (see `heap::HEAP_SIZE`); the
-    //    MMU maps 12 GiB and `cargo xtask run -model qwen3.5-9b` passes `-m 12G`.
-    #[cfg(not(feature = "model-9b"))]
-    const HEAP_BASE: usize = 0x8000_0000;
-    #[cfg(feature = "model-9b")]
-    const HEAP_BASE: usize = 0x2_0000_0000;
-    heap::init_static(HEAP_BASE, heap::HEAP_SIZE);
+    let size = heap::HEAP_SIZE;
+    #[cfg(not(feature = "boot-limine"))]
+    let base = {
+        let model_floor = crate::cortex::MODEL_LOAD_ADDR;
+        let uefi_heap = crate::arch::aarch64::mmu::uefi_heap_base() as usize;
+        let base = if uefi_heap != 0 {
+            // UEFI/stub path: the stub pre-allocated (and reserved from the UEFI
+            // allocator) a heap region just above the model and reported its base.
+            // Use it directly — the top of RAM is where firmware parks ACPI/
+            // runtime data, so we must not place the heap there.
+            uefi_heap
+        } else {
+            // `-kernel` path: no firmware, so place the heap at the very top of
+            // discovered RAM (2 MiB-aligned down), leaving the whole span below it
+            // for the model.
+            let ram_end = crate::arch::aarch64::mmu::ram_end() as usize;
+            ram_end.saturating_sub(size) & !((2 << 20) - 1)
+        };
+        // The model region is [MODEL_LOAD_ADDR, base); if the heap would start at
+        // or below where the model loads, there isn't enough RAM for both. Fail
+        // loudly with actionable numbers instead of overlapping the model.
+        if base <= model_floor || base.checked_add(size).is_none() {
+            panic!(
+                "Chitti: not enough memory -- a {} MiB heap would start at {:#x}, at/below the model region \
+                 base {:#x}. Boot with more RAM (raise -m / the VM's memory).",
+                size >> 20,
+                base,
+                model_floor,
+            );
+        }
+        base
+    };
+    // Limine build: RAM comes from the Limine map and the model is a boot module,
+    // not loaded at a fixed physical address, so keep a fixed high heap base.
+    #[cfg(feature = "boot-limine")]
+    let base: usize = 0x2_0000_0000;
+    heap::init_static(base, size);
+    HEAP_BASE.store(base, Ordering::Relaxed);
     crate::ktrace::log_fmt(format_args!(
-        "mm: aarch64 heap ready, {} bytes at {HEAP_BASE:#x} (identity-mapped normal memory)",
-        heap::HEAP_SIZE
+        "mm: aarch64 heap ready, {size} bytes at {base:#x} (top of RAM, identity-mapped normal memory)"
     ));
 }
 

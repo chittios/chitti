@@ -22,6 +22,7 @@ enum Arch {
 #[derive(Clone, Copy, PartialEq)]
 enum Model {
     Qwen08B,
+    Qwen4B,
     Qwen9B,
 }
 
@@ -30,6 +31,7 @@ impl Model {
     fn features(self) -> &'static [&'static str] {
         match self {
             Model::Qwen08B => &[],
+            Model::Qwen4B => &["model-4b"],
             Model::Qwen9B => &["model-9b"],
         }
     }
@@ -37,26 +39,32 @@ impl Model {
     fn gguf_rel(self) -> &'static str {
         match self {
             Model::Qwen08B => "assets/model.gguf",
+            Model::Qwen4B => "assets/model-4b.gguf",
             Model::Qwen9B => "assets/model-9b.gguf",
         }
     }
-    /// aarch64 guest-physical load address (must match `cortex::model_module`).
+    /// aarch64 guest-physical load address — one address for every model
+    /// (matches `cortex::MODEL_LOAD_ADDR`). The kernel places its heap at the top
+    /// of discovered RAM, so the model region `[addr, heap)` sizes itself to `-m`.
     fn aarch64_addr(self) -> &'static str {
-        match self {
-            Model::Qwen08B => "0x48000000",
-            Model::Qwen9B => "0x80000000",
-        }
+        "0x80000000"
     }
-    /// QEMU `-m` size big enough for the model + heap in the identity map.
+    /// QEMU `-m` size: must hold the model (loaded at 0x80000000 = 2 GiB) plus
+    /// the heap the kernel places at the top of RAM. The kernel errors clearly if
+    /// a model won't fit, so these are simply comfortable sizes per model.
     fn qemu_mem(self) -> &'static str {
         match self {
-            Model::Qwen08B => "2G",
+            // 0.8B (~785 MiB) at 2 GiB + a 256 MiB heap at the top: 3 GiB is ample.
+            Model::Qwen08B => "3G",
+            // ~2.58 GiB model at 2 GiB + a 512 MiB heap at the top of RAM.
+            Model::Qwen4B => "6G",
             Model::Qwen9B => "10G",
         }
     }
     fn label(self) -> &'static str {
         match self {
             Model::Qwen08B => "qwen3.5-0.8b",
+            Model::Qwen4B => "qwen3.5-4b",
             Model::Qwen9B => "qwen3.5-9b",
         }
     }
@@ -76,8 +84,9 @@ fn parse_model(rest: &[String]) -> Result<Model, String> {
         if let Some(v) = val {
             return match v.as_str() {
                 "qwen3.5-0.8b" | "qwen3.5-0.8B" | "0.8b" | "0.8B" | "qwen0.8b" | "default" => Ok(Model::Qwen08B),
+                "qwen3.5-4b" | "qwen3.5-4B" | "4b" | "4B" | "qwen4b" => Ok(Model::Qwen4B),
                 "qwen3.5-9b" | "qwen3.5-9B" | "9b" | "9B" | "qwen9b" => Ok(Model::Qwen9B),
-                other => Err(format!("unknown -model '{other}' (expected qwen3.5-0.8b or qwen3.5-9b)")),
+                other => Err(format!("unknown -model '{other}' (expected qwen3.5-0.8b, qwen3.5-4b, or qwen3.5-9b)")),
             };
         }
     }
@@ -171,7 +180,7 @@ fn main() {
 
 fn usage() -> String {
     "usage: cargo xtask <build|image|run|test|ref-check> [-arch x86_64|aarch64] \
-     [-model qwen3.5-0.8b|qwen3.5-9b] [--release] [--uefi]\n\
+     [-model qwen3.5-0.8b|qwen3.5-4b|qwen3.5-9b] [--release] [--uefi]\n\
      run flags (x86_64): --disk <2G|1500M> size the virtio-blk disk for /install; \
      --disk-only boot the installed disk via UEFI with no ISO; --fresh-disk wipe it first; \
      --no-model install without the model (fast, skips the ~800 MiB write).\n\
@@ -452,15 +461,16 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
 }
 
 /// Build the QEMU `-device loader` argument(s) that place `gguf` in guest RAM
-/// starting at `base_addr`. QEMU's generic loader maps each file as a ROM blob
-/// and fails for images >= 4 GiB, so a large model is split into <= 1 GiB
-/// chunk files loaded at consecutive addresses -- the guest sees one contiguous
-/// blob at `base_addr` regardless. Chunks are cached under `target/` and only
-/// rewritten when the model changes.
+/// starting at `base_addr`. QEMU's generic loader reads the whole file in one
+/// `read(2)`, which on macOS fails with `EINVAL` for images >= 2 GiB (Darwin
+/// caps a single read at `INT_MAX`). So any model >= 2 GiB is split into
+/// <= 1 GiB chunk files loaded at consecutive addresses -- the guest sees one
+/// contiguous blob at `base_addr` regardless. Chunks are cached under `target/`
+/// and only rewritten when the model changes.
 fn model_loader_args(gguf: &Path, base_addr: u64) -> Result<Vec<String>, String> {
     let size = fs::metadata(gguf).map_err(|e| format!("stat {}: {e}", gguf.display()))?.len();
-    const CHUNK: u64 = 1 << 30; // 1 GiB, safely under the loader's 4 GiB limit
-    if size < 4 << 30 {
+    const CHUNK: u64 = 1 << 30; // 1 GiB, safely under the loader's per-read limit
+    if size < 2 << 30 {
         return Ok(vec![format!("loader,file={},addr={:#x},force-raw=on", gguf.display(), base_addr)]);
     }
 

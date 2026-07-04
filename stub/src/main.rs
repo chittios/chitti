@@ -23,8 +23,14 @@ use uefi::boot::{self, AllocateType, MemoryType};
 use uefi::prelude::*;
 
 /// The aarch64 model load address the kernel's `cortex::model_module` reads
-/// (mirrors QEMU `-device loader` on the `-kernel` path). 0.8B layout.
-const MODEL_ADDR: u64 = 0x4800_0000;
+/// (mirrors QEMU `-device loader` on the `-kernel` path). One address for every
+/// model (`cortex::MODEL_LOAD_ADDR`); the kernel's heap goes just above it (the
+/// stub reserves that region and reports its base — see below).
+const MODEL_ADDR: u64 = 0x8000_0000;
+/// The most heap the kernel will ever want (its largest per-model tier is 1 GiB
+/// for the 9B). The stub reserves this much just above the model and reports the
+/// base; the kernel uses its own (<= this) tier within the reservation.
+const HEAP_MAX: u64 = 1 << 30;
 
 fn le16(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
@@ -138,6 +144,19 @@ fn main() -> Status {
         }
     };
 
+    // Reserve the kernel's heap region just ABOVE the model (2 MiB-aligned) and
+    // mark it LOADER_DATA so it survives ExitBootServices and UEFI won't park
+    // anything there. The kernel places its heap here (reported below in the
+    // boot-info) rather than at the top of RAM, which on UEFI holds ACPI/runtime
+    // data. Reserving *before* the boot-info page is allocated keeps that page
+    // (AnyPages) out of this region. Size is HEAP_MAX (>= any model's heap tier).
+    let model_top = model_region.map(|(a, n)| a + n).unwrap_or(MODEL_ADDR);
+    let heap_base = (model_top + 0x1f_ffff) & !0x1f_ffff; // round up to 2 MiB
+    match boot::allocate_pages(AllocateType::Address(heap_base), MemoryType::LOADER_DATA, (HEAP_MAX / 4096) as usize) {
+        Ok(_) => log::info!("chitti-stub: reserved kernel heap {heap_base:#x} ({} MiB)", HEAP_MAX >> 20),
+        Err(e) => log::warn!("chitti-stub: could NOT reserve heap {heap_base:#x}: {e:?} (need more VM RAM)"),
+    }
+
     // Capture the UEFI GOP framebuffer and publish it in a boot-info page at a
     // fixed address the kernel checks. This is what makes Chitti's console
     // visible on ANY UEFI platform (VirtualBox-ARM, UTM, real hardware) — the
@@ -234,21 +253,17 @@ fn main() -> Status {
         // This is the only reliable clock on VirtualBox-ARM, whose generic timer
         // doesn't advance for the guest; 0 if the firmware has no RTC.
         page[52..60].copy_from_slice(&efi_unix().to_le_bytes());
-        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x} -> boot-info {addr:#x}");
+        // Kernel heap region at 60..76: base@60 (reserved just above the model),
+        // size@68. The kernel places its heap here (arch::aarch64::mmu / mm) so it
+        // never lands on UEFI-reserved high memory.
+        page[60..68].copy_from_slice(&heap_base.to_le_bytes());
+        page[68..76].copy_from_slice(&HEAP_MAX.to_le_bytes());
+        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x}, heap {heap_base:#x} -> boot-info {addr:#x}");
         Some(addr)
     })();
 
-    // Reserve the kernel's FIXED regions so UEFI hasn't parked runtime/ACPI data
-    // where the `-kernel` layout puts them (the kernel hardcodes these, as it
-    // does under QEMU `-kernel` where they're guaranteed free RAM): the 256 MiB
-    // heap at 0x80000000. Marking it LOADER_DATA keeps it ours across
-    // ExitBootServices and stops UEFI reusing it.
-    const HEAP_BASE: u64 = 0x8000_0000;
-    const HEAP_PAGES: usize = 256 * 1024 * 1024 / 4096;
-    match boot::allocate_pages(AllocateType::Address(HEAP_BASE), MemoryType::LOADER_DATA, HEAP_PAGES) {
-        Ok(_) => log::info!("chitti-stub: reserved kernel heap {HEAP_BASE:#x} (256 MiB)"),
-        Err(e) => log::warn!("chitti-stub: could NOT reserve heap {HEAP_BASE:#x}: {e:?} (UEFI may collide)"),
-    }
+    // (The kernel heap was reserved above, just past the model, before the
+    // boot-info page was allocated.)
 
     // Hand off through a TRAMPOLINE in identity RAM. The kernel is an
     // identity-map kernel that expects the QEMU `-kernel` entry state: EL1,

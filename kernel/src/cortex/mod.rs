@@ -553,35 +553,44 @@ pub fn model_parts() -> alloc::vec::Vec<(&'static str, &'static [u8])> {
         .collect()
 }
 
-/// aarch64: the model is placed in RAM by QEMU's `-device loader` at a fixed
-/// physical address (there is no Limine on the `-M virt -kernel` boot path).
-/// We expose it as a slice bounded by the region between the model base and
-/// the heap, and only if the GGUF magic is present (so `infer` cleanly reports
-/// "no model" when none was loaded). The GGUF parser reads only within the
-/// actual file; the generous upper bound just needs to cover it.
+/// aarch64 (`-kernel`/UEFI-stub): the guest-physical address the model GGUF is
+/// loaded at — a handshake with `xtask`'s `Model::aarch64_addr` (`-device
+/// loader`) and the UEFI stub. **One address for every model** (2 GiB, past the
+/// kernel image at 0x40080000): the model occupies `[MODEL_LOAD_ADDR,
+/// mm::heap_base())`, and the heap is placed at the top of discovered RAM (see
+/// [`crate::mm`]) — so the model region auto-sizes to whatever RAM the platform
+/// has, with no per-model layout constant to keep in sync with `-m`.
+#[cfg(all(not(target_arch = "x86_64"), not(feature = "boot-limine")))]
+pub const MODEL_LOAD_ADDR: usize = 0x8000_0000;
+
+/// aarch64: the model is placed in RAM by QEMU's `-device loader` (or the UEFI
+/// stub) at [`MODEL_LOAD_ADDR`]. We expose it as a slice spanning the region
+/// between the model base and the heap (which the heap allocator placed at the
+/// top of RAM), and only if the GGUF magic is present (so `infer` cleanly
+/// reports "no model" when none was loaded). The GGUF parser reads only within
+/// the actual file; the window just needs to cover it.
 #[cfg(all(not(target_arch = "x86_64"), not(feature = "boot-limine")))]
 pub fn model_module() -> Option<&'static [u8]> {
-    // 0.8B: model at 0x48000000, up to the heap at 0x80000000 (896 MiB window).
-    // 9B (`model-9b`): the ~5.8 GiB model is loaded at 0x80000000, with the heap
-    // moved to 0x2_00000000, giving a 6 GiB window. `cargo xtask run -model
-    // qwen3.5-9b` places the GGUF at the matching address via `-device loader`.
-    #[cfg(not(feature = "model-9b"))]
-    const MODEL_ADDR: usize = 0x4800_0000;
-    #[cfg(not(feature = "model-9b"))]
-    const MODEL_MAX: usize = 0x3800_0000; // 896 MiB, up to the heap at 0x80000000
-    #[cfg(feature = "model-9b")]
-    const MODEL_ADDR: usize = 0x8000_0000;
-    #[cfg(feature = "model-9b")]
-    const MODEL_MAX: usize = 0x1_8000_0000; // 6 GiB, up to the heap at 0x2_00000000
-    // SAFETY: `MODEL_ADDR` is identity-mapped normal RAM (arch::aarch64::mmu);
+    // SAFETY: `MODEL_LOAD_ADDR` is identity-mapped normal RAM (arch::aarch64::mmu);
     // reading 4 bytes to check the magic is always in bounds.
-    let magic = unsafe { core::slice::from_raw_parts(MODEL_ADDR as *const u8, 4) };
+    let magic = unsafe { core::slice::from_raw_parts(MODEL_LOAD_ADDR as *const u8, 4) };
     if magic != b"GGUF" {
         return None;
     }
-    // SAFETY: the region [MODEL_ADDR, MODEL_ADDR + MODEL_MAX) is mapped RAM
+    // The model region is everything from the load address up to the heap base
+    // (the heap sits at the top of RAM). If the heap isn't up yet, fall back to
+    // the mapped span.
+    let heap_base = crate::mm::heap_base();
+    let window = heap_base.saturating_sub(MODEL_LOAD_ADDR);
+    if window == 0 {
+        crate::ktrace::log_fmt(format_args!(
+            "cortex: model present at {MODEL_LOAD_ADDR:#x} but no room below the heap at {heap_base:#x} -- not enough RAM"
+        ));
+        return None;
+    }
+    // SAFETY: the region [MODEL_LOAD_ADDR, MODEL_LOAD_ADDR + window) is mapped RAM
     // below the heap; the GGUF parser reads only the real model within it.
-    Some(unsafe { core::slice::from_raw_parts(MODEL_ADDR as *const u8, MODEL_MAX) })
+    Some(unsafe { core::slice::from_raw_parts(MODEL_LOAD_ADDR as *const u8, window) })
 }
 
 /// aarch64 booted via Limine (UEFI/AAVMF): the model is a Limine boot module,

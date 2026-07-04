@@ -28,11 +28,15 @@ bench = false
 # inference demo and stays up.
 refcheck = []
 
-# `cargo xtask build|run -model qwen3.5-9b` builds with this on: it selects the
-# memory layout for the ~5.8 GiB Qwen3.5-9B model (model region at 0x80000000,
-# heap at 0x2_00000000 sized 1 GiB, MMU mapping 12 GiB) instead of the compact
-# 0.8B layout. Default (feature off) = the 0.8B model.
+# Model-size selectors. The memory *layout* is no longer hardcoded per model: the
+# model always loads at cortex::MODEL_LOAD_ADDR and the heap is placed by `mm`
+# from discovered RAM (DTB on `-kernel`, the UEFI stub on real hardware). These
+# features now only pick the heap *size* tier (mm::heap::HEAP_SIZE) and the model
+# name string. Default (both off) = the 0.8B model (256 MiB heap).
+# `cargo xtask build|run -model qwen3.5-9b`: the ~5 GiB Qwen3.5-9B (1 GiB heap).
 model-9b = []
+# `cargo xtask build|run -model qwen3.5-4b`: the ~2.6 GiB Qwen3.5-4B (512 MiB heap).
+model-4b = []
 
 # aarch64 only: build the kernel to boot via the Limine boot protocol
 # (BOOTAA64.EFI under UEFI/AAVMF) so it can boot from a disk's ESP, instead of
