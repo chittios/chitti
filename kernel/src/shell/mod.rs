@@ -247,8 +247,9 @@ pub fn run() -> ! {
         }
         // Plain text -> chat with the model.
         if chat.is_none() {
-            serial_println!("(loading model...)");
-            chat = ChatSession::load();
+            let mut spin = Spinner::new("loading model");
+            chat = ChatSession::load(&mut spin);
+            spin.clear();
         }
         match chat.as_mut() {
             Some(sess) => sess.turn(msg),
@@ -413,6 +414,42 @@ fn print_info(orch: &crate::agent::orchestrator::Orchestrator, chat: Option<&Cha
     );
 }
 
+/// A Claude-Code-style in-place progress spinner, drawn on the current console
+/// line via a carriage return so it works on both the serial console and the
+/// framebuffer. Colored with ANSI SGR (rendered by the framebuffer parser and by
+/// a real terminal alike). `tick()` advances one frame; `clear()` erases it.
+struct Spinner {
+    frame: usize,
+    label: &'static str,
+}
+
+impl Spinner {
+    // ASCII frames (the Geist Mono atlas has no braille): a smooth 4-phase spin.
+    const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
+
+    fn new(label: &'static str) -> Self {
+        let s = Self { frame: 0, label };
+        s.draw();
+        s
+    }
+    fn tick(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+        self.draw();
+    }
+    fn draw(&self) {
+        // `\r` back to col 0, then the (bold cyan) frame + label; no newline.
+        serial_print!("\r\x1b[1;36m{}\x1b[0m {}", Self::FRAMES[self.frame % Self::FRAMES.len()], self.label);
+    }
+    /// Erase the spinner line and return the cursor to column 0.
+    fn clear(&self) {
+        serial_print!("\r");
+        for _ in 0..self.label.len() + 2 {
+            serial_print!(" ");
+        }
+        serial_print!("\r");
+    }
+}
+
 /// A live chat: the model, its BPE tokenizer, and a persistent KV/recurrent
 /// cache so context carries across turns (`/clear` drops it).
 struct ChatSession {
@@ -427,15 +464,21 @@ struct ChatSession {
 }
 
 impl ChatSession {
-    /// Load the bundled model + build the tokenizer. `None` if no model.
-    fn load() -> Option<Self> {
+    /// Load the bundled model + build the tokenizer. `None` if no model. Ticks
+    /// `spin` between load steps so the caller's spinner animates.
+    fn load(spin: &mut Spinner) -> Option<Self> {
         use crate::cortex::{gguf, model, model_module, sampler};
         let bytes = model_module()?;
+        spin.tick();
         let g = gguf::Gguf::parse(bytes).ok()?;
+        spin.tick();
         let m = model::Model::load(g).ok()?;
+        spin.tick();
         let tok = m.tokenizer();
+        spin.tick();
         let kv = m.new_cache();
         let state = m.new_state();
+        spin.tick();
         // Seed the sampler from the boot clock so sessions vary.
         let rng = sampler::Rng::new(crate::arch::now_ms().wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         Some(Self { model: m, tok, kv, state, pos: 0, rng, gen: alloc::vec::Vec::new() })
@@ -456,7 +499,14 @@ impl ChatSession {
         };
         if first {
             ids.push(self.tok.im_start as usize);
-            push_text(&mut ids, "system\nYou are Chitti, a helpful assistant.");
+            push_text(
+                &mut ids,
+                "system\nYou are Chitti, a helpful assistant running in a bare-metal terminal. \
+                 Format replies with ANSI escape codes (SGR), NOT markdown: use \x1b[1m for bold, \
+                 \x1b[36m/\x1b[32m/\x1b[33m etc. for colored headings or keywords, and \x1b[0m to \
+                 reset after each. Never use markdown syntax like **bold**, # headings, or ``` fences. \
+                 Keep lines under ~80 columns.",
+            );
             ids.push(self.tok.im_end as usize);
             push_text(&mut ids, "\n");
         }
@@ -478,8 +528,17 @@ impl ChatSession {
             push_text(&mut ids, "\n\n");
         }
 
-        // Prefill this turn, then decode from the last position's logits.
-        self.model.prefill(&ids, self.pos, &mut self.kv, &mut self.state);
+        // Prefill this turn with a live "thinking" spinner (one frame per token
+        // forward — the pre-first-token wait), then decode from the last
+        // position's logits. This is the sequential prefill path (bit-identical
+        // to `Model::prefill`); only the last token needs logits.
+        let last = ids.len();
+        let mut spin = Spinner::new("thinking");
+        for (i, &tok) in ids.iter().enumerate() {
+            self.model.forward(tok, self.pos + i, &mut self.kv, &mut self.state, i + 1 == last);
+            spin.tick();
+        }
+        spin.clear();
         self.pos += ids.len();
 
         let eos = self.model.eos();
@@ -487,7 +546,8 @@ impl ChatSession {
         self.gen.clear();
         let mut next = self.pick();
         let mut stream = tokenizer::Stream::new();
-        serial_print!("chitti: ");
+        // Bold-cyan speaker label (ANSI), then the streamed reply.
+        serial_print!("\x1b[1;36mchitti:\x1b[0m ");
         let mut n = 0usize;
         // Anti-degeneration guard: a thinking model that slips into a loop can
         // emit the same token forever. Nucleus sampling (pick) makes that rare,
