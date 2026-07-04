@@ -48,6 +48,22 @@ The same kernel builds and boots on both:
 
 ## Commands
 
+A [`Makefile`](Makefile) wraps the common flows (`make help` lists them);
+`make` targets take `ARCH=`, `MODEL=`, and `RELEASE=1` knobs and just call the
+`cargo xtask` commands below.
+
+| `make` target | Underlying command |
+|---|---|
+| `make build` / `make build-all` | `cargo xtask build -arch <arch> …` (build-all does both arches) |
+| `make run` / `make run-uefi` | `cargo xtask run -arch <arch> …` (run-uefi adds `--uefi`) |
+| `make image` | `cargo xtask image -arch <arch> …` |
+| `make test` | `cargo xtask test` |
+| `make verify` | x86 build + `test` + aarch64 build (the standing-rule gate) |
+| `make vbox` | rebuild the aarch64 image and reload it into a VirtualBox VM |
+| `make model` / `make fmt` / `make clean` | fetch the GGUF / format / clean |
+
+The underlying `cargo xtask` commands:
+
 | Command | What it does |
 |---|---|
 | `cargo xtask build -arch <arch> [--release] [-model <m>]` | Cross-compile the kernel. |
@@ -141,13 +157,31 @@ comes from GOP.
 ### VirtualBox (real-firmware path on Apple Silicon)
 
 VirtualBox exercises the UEFI/real-hardware drivers (USB HID keyboard + mouse,
-GOP, RTC, NVMe). Build a bootable disk and attach it:
+GOP, RTC, NVMe).
+
+**First time:** create an **ARM** VM (EFI enabled) named `Chitti` with an NVMe
+controller, set the **pointing device to USB Tablet** and the **keyboard to USB**
+so the xHCI/HID drivers pick them up, then attach a disk built from
+`target/chitti-aa64.img`.
+
+**Every rebuild after that:**
+
+```sh
+make vbox                    # or: make vbox VBOX_VM=YourVMName
+```
+
+`make vbox` rebuilds the aarch64 image, powers the VM off, reconverts the image
+to a VDI **preserving the disk's UUID** (so the VM's attachment stays valid),
+reattaches it (`--storagectl nvme --port 0`), and prints the VM's input config.
+Override the VM name / controller / port with `VBOX_VM=`, `VBOX_CTL=`, `VBOX_PORT=`.
+Then start the VM.
+
+Equivalent manual steps, if you prefer:
 
 ```sh
 cargo xtask image -arch aarch64                                  # → target/chitti-aa64.img
 VBoxManage convertfromraw target/chitti-aa64.img chitti.vdi --format VDI
-# attach chitti.vdi to an ARM VM (EFI enabled). Set the pointing device to USB Tablet
-# and the keyboard to USB so the xHCI/HID drivers pick them up.
+# attach chitti.vdi to the ARM VM (USB Tablet + USB keyboard, EFI enabled)
 ```
 
 The boot log's `INPUT` line reports which keyboard/mouse/clock sources were found
