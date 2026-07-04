@@ -21,6 +21,7 @@ pub mod rtc;
 pub mod smp;
 pub mod virtio_blk;
 pub mod virtio_input;
+pub mod virtio_net;
 pub mod virtio_pointer;
 pub mod virtio_pci;
 pub mod xhci;

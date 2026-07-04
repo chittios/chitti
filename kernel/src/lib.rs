@@ -35,6 +35,7 @@ pub mod limine_protocol;
 pub mod mm;
 pub mod modal;
 pub mod mouse;
+pub mod net;
 pub mod persona;
 #[cfg(target_arch = "x86_64")]
 pub mod qemu;

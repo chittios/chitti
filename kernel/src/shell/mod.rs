@@ -284,9 +284,189 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "install" => disk_install(arg),
         "mkext4" => disk_mkext4(arg),
         "ext4read" => disk_ext4read(),
+        "network" | "net" => net_cmd(arg),
+        "ping" => net_ping(arg),
+        "wifi" => wifi_cmd(arg),
         _ => return false,
     }
     true
+}
+
+// --- networking commands -------------------------------------------------
+
+/// Parse a dotted-quad IPv4 address.
+fn parse_ipv4(s: &str) -> Option<smoltcp::wire::Ipv4Address> {
+    let mut o = [0u8; 4];
+    let mut n = 0;
+    for part in s.trim().split('.') {
+        if n >= 4 {
+            return None;
+        }
+        o[n] = part.parse::<u8>().ok()?;
+        n += 1;
+    }
+    if n == 4 {
+        Some(smoltcp::wire::Ipv4Address::new(o[0], o[1], o[2], o[3]))
+    } else {
+        None
+    }
+}
+
+/// `/network [info|dhcp|static <ip/prefix> [gw]|dns <server>]`.
+fn net_cmd(arg: &str) {
+    let (sub, rest) = match arg.trim().split_once(' ') {
+        Some((s, r)) => (s, r.trim()),
+        None => (arg.trim(), ""),
+    };
+    match sub {
+        "" | "info" => {
+            let Some(i) = crate::net::info() else {
+                serial_println!("network> no interface (no NIC detected)");
+                return;
+            };
+            serial_println!("network> {} \x1b[1mup\x1b[0m", i.ifname);
+            serial_println!("  mac    {}", crate::net::fmt_mac(&i.mac));
+            match i.ip {
+                Some(cidr) => serial_println!("  ip     {} ({})", cidr, if i.dhcp { "dhcp" } else { "static" }),
+                None => serial_println!("  ip     (none — try /network dhcp or /network static)"),
+            }
+            match i.gateway {
+                Some(gw) => serial_println!("  gw     {gw}"),
+                None => serial_println!("  gw     (none)"),
+            }
+            if i.dns.is_empty() {
+                serial_println!("  dns    (none)");
+            } else {
+                for d in &i.dns {
+                    serial_println!("  dns    {d}");
+                }
+            }
+        }
+        "dhcp" => match crate::net::dhcp_start() {
+            Ok(()) => {
+                serial_println!("network> DHCP requested; discovering...");
+                // Pump the stack briefly so the lease usually lands before we return.
+                let deadline = crate::arch::now_ms() + 4000;
+                while crate::arch::now_ms() < deadline {
+                    crate::net::poll();
+                    if crate::net::info().and_then(|i| i.ip).is_some() {
+                        break;
+                    }
+                    crate::sched::yield_now();
+                }
+                net_cmd("info");
+            }
+            Err(e) => serial_println!("network> {e}"),
+        },
+        "static" => {
+            // static <ip/prefix> [gateway]
+            let (cidr, gw) = match rest.split_once(' ') {
+                Some((c, g)) => (c, g.trim()),
+                None => (rest, ""),
+            };
+            let (ip_s, prefix) = match cidr.split_once('/') {
+                Some((i, p)) => (i, p.parse::<u8>().unwrap_or(24)),
+                None => (cidr, 24),
+            };
+            let Some(ip) = parse_ipv4(ip_s) else {
+                serial_println!("network> usage: /network static <ip>/<prefix> [gateway]");
+                return;
+            };
+            let gw = if gw.is_empty() { None } else { parse_ipv4(gw) };
+            match crate::net::set_static(ip, prefix, gw) {
+                Ok(()) => {
+                    serial_println!("network> static {ip}/{prefix} set");
+                    net_cmd("info");
+                }
+                Err(e) => serial_println!("network> {e}"),
+            }
+        }
+        "dns" => {
+            let Some(server) = parse_ipv4(rest) else {
+                serial_println!("network> usage: /network dns <server-ip>");
+                return;
+            };
+            match crate::net::set_dns(&[server]) {
+                Ok(()) => serial_println!("network> dns {server} set"),
+                Err(e) => serial_println!("network> {e}"),
+            }
+        }
+        _ => serial_println!("network> usage: /network [info|dhcp|static <ip/prefix> [gw]|dns <ip>]"),
+    }
+}
+
+/// `/ping <ip-or-host>` — one ICMP echo (resolving a hostname via DNS first).
+fn net_ping(arg: &str) {
+    let target = arg.trim();
+    if target.is_empty() {
+        serial_println!("ping> usage: /ping <ip-or-hostname>");
+        return;
+    }
+    let addr = match parse_ipv4(target) {
+        Some(a) => a,
+        None => match crate::net::resolve(target, 5000) {
+            Ok(a) => {
+                serial_println!("ping> {target} is {a}");
+                a
+            }
+            Err(e) => {
+                serial_println!("ping> resolve {target}: {e}");
+                return;
+            }
+        },
+    };
+    match crate::net::ping(addr, 3000) {
+        Ok(rtt) => serial_println!("ping> reply from {addr}: {rtt} ms"),
+        Err(e) => serial_println!("ping> {addr}: {e}"),
+    }
+}
+
+/// `/wifi [scan|connect <ssid>|info]` — a facade over the wired NIC (QEMU/VBox
+/// expose no 802.11 hardware): "connect" takes a password via the approval modal,
+/// then brings the link up with DHCP and presents it as `wlan0`.
+fn wifi_cmd(arg: &str) {
+    let (sub, rest) = match arg.trim().split_once(' ') {
+        Some((s, r)) => (s, r.trim()),
+        None => (arg.trim(), ""),
+    };
+    match sub {
+        "" | "info" => {
+            let Some(i) = crate::net::info() else {
+                serial_println!("wifi> no adapter");
+                return;
+            };
+            serial_println!("wifi> interface {} ({})", i.ifname, if i.ip.is_some() { "connected" } else { "not connected" });
+            serial_println!("  note: emulated platforms expose a wired NIC; /wifi drives it as the wireless link");
+        }
+        "scan" => {
+            serial_println!("wifi> nearby networks:");
+            serial_println!("  chitti-lan      \x1b[32m****\x1b[0m  (wired uplink, DHCP)");
+        }
+        "connect" => {
+            let ssid = if rest.is_empty() { "chitti-lan" } else { rest };
+            let _pw = crate::modal::input("Wi-Fi password", ssid, true);
+            serial_println!("wifi> connecting to '{ssid}'...");
+            crate::net::set_ifname("wlan0");
+            match crate::net::dhcp_start() {
+                Ok(()) => {
+                    let deadline = crate::arch::now_ms() + 5000;
+                    while crate::arch::now_ms() < deadline {
+                        crate::net::poll();
+                        if crate::net::info().and_then(|i| i.ip).is_some() {
+                            break;
+                        }
+                        crate::sched::yield_now();
+                    }
+                    match crate::net::info().and_then(|i| i.ip) {
+                        Some(ip) => serial_println!("wifi> connected to '{ssid}', got {ip}"),
+                        None => serial_println!("wifi> associated with '{ssid}' but no DHCP lease yet"),
+                    }
+                }
+                Err(e) => serial_println!("wifi> {e}"),
+            }
+        }
+        _ => serial_println!("wifi> usage: /wifi [scan|connect <ssid>|info]"),
+    }
 }
 
 /// Run a system `/command` on behalf of the root agent (the tool layer) and
@@ -786,6 +966,7 @@ fn read_line(buf: &mut String) {
             Some(_) => {} // ignore other control bytes
             None => {
                 ui_tick();
+                crate::net::poll(); // pump the net stack (DHCP/ARP) while idle
                 crate::sched::yield_now();
             }
         }
