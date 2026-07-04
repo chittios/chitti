@@ -43,6 +43,10 @@ const TITLE_DIM: Rgb = (120, 126, 140);
 const SEP_DIM: Rgb = (32, 34, 42);
 const STATUS_BG: Rgb = (20, 21, 27);
 const STATUS_FG: Rgb = (140, 148, 162);
+// Editor (right pane, `/open`).
+const EDITOR_BG: Rgb = (16, 18, 24);
+const EDITOR_FG: Rgb = (214, 218, 228);
+const EDITOR_LINENO: Rgb = (86, 92, 104);
 
 // Layout metrics, in pixels (independent of font scale).
 const OUTER: u64 = 8; // margin around the whole content region
@@ -144,6 +148,9 @@ pub struct Screen {
     /// Blinking-caret state for the chat pane.
     caret_on: bool,
     caret_last_ms: u64,
+    /// When true the right pane is owned by the `/open` editor, so `log_print`
+    /// (ktrace) stops drawing there until the editor closes.
+    editor_active: bool,
 }
 
 /// Config knobs the UI config (`/configs/core/ui.json`) can set for the layout.
@@ -219,6 +226,7 @@ impl Screen {
             status_right: String::new(),
             caret_on: true,
             caret_last_ms: 0,
+            editor_active: false,
         }
     }
 
@@ -388,13 +396,19 @@ impl Screen {
     // --- framing ---------------------------------------------------------
 
     fn draw_frame(&self, p: &Pane, active: bool) {
+        self.draw_frame_titled(p, active, &p.title);
+    }
+
+    /// Like [`draw_frame`] but with an explicit title (the editor overrides the
+    /// pane title with `editor: <file>`).
+    fn draw_frame_titled(&self, p: &Pane, active: bool, title: &str) {
         let border = if active { ACCENT } else { BORDER_DIM };
         let title_c = if active { TITLE_ACTIVE } else { TITLE_DIM };
         self.rect_outline(p.x, p.y, p.w, p.h, BORDER, border);
         // Title, just inside the top border.
         let ty = p.y + BORDER + 4;
         let tx = p.x + BORDER + PAD;
-        let end = self.draw_str(tx, ty, &p.title, title_c, p.bg);
+        let end = self.draw_str(tx, ty, title, title_c, p.bg);
         if active {
             self.draw_str(end, ty, " *", ACCENT, p.bg);
         }
@@ -548,6 +562,9 @@ pub fn blink(now_ms: u64) {
 pub fn log_print(s: &str) {
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
+            if sc.editor_active {
+                return; // the editor owns the right pane; ktrace still hits serial
+            }
             let mut logs = core::mem::replace(&mut sc.logs, dummy_pane());
             for &b in s.as_bytes() {
                 Screen::pane_putc(sc, &mut logs, b);
@@ -566,6 +583,116 @@ fn dummy_pane() -> Pane {
         x: 0, y: 0, w: 0, h: 0, ix: 0, iy: 0, cw: 1, ch: 1, cols: 1, rows: 1, col: 0, row: 0,
         fg: SCREEN_BG, bg: SCREEN_BG, title: String::new(), show_caret: false,
     }
+}
+
+/// The editor viewport size `(cols, rows)` inside the right pane — `rows` is the
+/// text area (the bottom row is reserved for the editor's mode line). `None` if
+/// the console isn't up.
+pub fn editor_dims() -> Option<(usize, usize)> {
+    SCREEN.with(|slot| {
+        slot.as_ref().map(|sc| {
+            let cols = sc.logs.cols as usize;
+            let rows = (sc.logs.rows.saturating_sub(1)).max(1) as usize;
+            (cols, rows)
+        })
+    })
+}
+
+/// Hand the right pane to the `/open` editor (ktrace stops drawing there).
+pub fn editor_enter() {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.editor_active = true;
+        }
+    });
+}
+
+/// Return the right pane to the ktrace log stream and repaint its frame.
+pub fn editor_leave() {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.editor_active = false;
+            let p = &sc.logs;
+            sc.fill_rect(p.x, p.y, p.w, p.h, p.bg);
+            sc.draw_frame(p, false);
+        }
+    });
+}
+
+/// Render the editor into the right pane: title `editor: <file>`, the visible
+/// slice of `lines` from `top`, a reverse-video block cursor at
+/// `(cur_row, cur_col)`, and a bottom mode line. `gutter` toggles line numbers.
+#[allow(clippy::too_many_arguments)]
+pub fn editor_render(title: &str, lines: &[alloc::string::String], top: usize, cur_row: usize, cur_col: usize, modeline: &str) {
+    SCREEN.with(|slot| {
+        let Some(sc) = slot else { return };
+        let (px, pw, cw, ch, cols, rows) =
+            (sc.logs.x, sc.logs.w, sc.logs.cw, sc.logs.ch, sc.logs.cols, sc.logs.rows);
+        let (ix, iy) = (sc.logs.ix, sc.logs.iy);
+        sc.draw_frame_titled(&sc.logs, true, title);
+        // Clear the interior to the editor background.
+        sc.fill_rect(ix, iy, cols * cw, rows * ch, EDITOR_BG);
+        let text_rows = rows.saturating_sub(1);
+        // Line-number gutter width (digits + 1 space).
+        let gutter = {
+            let mut n = lines.len().max(1);
+            let mut w = 1;
+            while n >= 10 {
+                n /= 10;
+                w += 1;
+            }
+            (w + 1) as u64
+        };
+        for i in 0..text_rows {
+            let li = top + i as usize;
+            if li >= lines.len() {
+                break;
+            }
+            let y = iy + i * ch;
+            // Gutter: right-aligned 1-based line number.
+            let num = alloc::format!("{:>width$} ", li + 1, width = (gutter - 1) as usize);
+            let mut x = ix;
+            for b in num.bytes() {
+                sc.blit_glyph(x, y, b, EDITOR_LINENO, EDITOR_BG);
+                x += cw;
+            }
+            // Text, clipped to the pane width.
+            let mut c = gutter;
+            for &b in lines[li].as_bytes() {
+                if c >= cols {
+                    break;
+                }
+                sc.blit_glyph(x, y, b, EDITOR_FG, EDITOR_BG);
+                x += cw;
+                c += 1;
+            }
+        }
+        // Reverse-video block cursor.
+        if cur_row >= top && (cur_row - top) < text_rows as usize {
+            let scr = (cur_row - top) as u64;
+            let col_on_screen = gutter + cur_col as u64;
+            if col_on_screen < cols {
+                let y = iy + scr * ch;
+                let x = ix + col_on_screen * cw;
+                let byte = lines.get(cur_row).and_then(|l| l.as_bytes().get(cur_col)).copied().unwrap_or(b' ');
+                let byte = if (0x20..=0x7e).contains(&byte) { byte } else { b' ' };
+                sc.blit_glyph(x, y, byte, EDITOR_BG, ACCENT); // fg/bg swapped = block cursor
+            }
+        }
+        // Mode line across the bottom interior row.
+        let sy = iy + text_rows * ch;
+        sc.fill_rect(px + BORDER, sy, pw - 2 * BORDER, ch, STATUS_BG);
+        let mut x = ix;
+        let mut c = 0u64;
+        for b in modeline.bytes() {
+            if c >= cols {
+                break;
+            }
+            sc.blit_glyph(x, sy, b, TITLE_ACTIVE, STATUS_BG);
+            x += cw;
+            c += 1;
+        }
+    });
 }
 
 /// Rebuild the panes from a new [`LayoutCfg`] (split ratio, font scale, pane

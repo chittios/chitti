@@ -55,6 +55,10 @@ pub mod xhci;
 // lang item") for any ordinary dependency shared between them.
 #[cfg(not(test))]
 pub mod framebuffer;
+// The vim-like `/open` editor draws into the framebuffer, so it shares the same
+// not(test) gate.
+#[cfg(not(test))]
+pub mod editor;
 // The Geist Mono glyph atlas the framebuffer console renders with (data-only).
 #[cfg(not(test))]
 pub mod font_geist;
