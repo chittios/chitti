@@ -15,6 +15,7 @@ pub mod gic;
 pub mod nvme;
 pub mod pl050;
 pub mod ramfb;
+pub mod rtc;
 pub mod smp;
 pub mod virtio_blk;
 pub mod virtio_input;
