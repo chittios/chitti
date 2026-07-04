@@ -50,6 +50,33 @@ fn alloc_at(paddr: u64, bytes: usize) -> &'static mut [u8] {
 }
 
 /// The ACPI 2.0 RSDP physical address from the UEFI configuration table, or 0.
+/// Days since 1970-01-01 for a proleptic-Gregorian date (Hinnant's algorithm;
+/// the kernel's `clock` uses the same math).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// The current UTC time as Unix seconds from the UEFI runtime clock, or 0 if the
+/// firmware has no RTC. Converts the (possibly timezone-local) EFI time to UTC.
+fn efi_unix() -> u64 {
+    let Ok(t) = uefi::runtime::get_time() else { return 0 };
+    let secs = days_from_civil(t.year() as i64, t.month() as i64, t.day() as i64) * 86400
+        + t.hour() as i64 * 3600
+        + t.minute() as i64 * 60
+        + t.second() as i64;
+    // EFI time may carry a timezone offset (minutes east of UTC); 2047 = unspecified.
+    let secs = match t.time_zone() {
+        Some(tz) if tz != 2047 => secs - tz as i64 * 60,
+        _ => secs,
+    };
+    if secs > 0 { secs as u64 } else { 0 }
+}
+
 fn acpi_rsdp() -> u64 {
     use uefi::table::cfg::{ACPI2_GUID, ACPI_GUID};
     uefi::system::with_config_table(|entries| {
@@ -203,6 +230,10 @@ fn main() -> Status {
         page[49] = gs;
         page[50] = bs;
         page[51] = 4;
+        // Real wall-clock time (UTC Unix seconds) at 52..60, from UEFI GetTime.
+        // This is the only reliable clock on VirtualBox-ARM, whose generic timer
+        // doesn't advance for the guest; 0 if the firmware has no RTC.
+        page[52..60].copy_from_slice(&efi_unix().to_le_bytes());
         log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x} -> boot-info {addr:#x}");
         Some(addr)
     })();
