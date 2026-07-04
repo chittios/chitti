@@ -656,6 +656,18 @@ fn read_line(buf: &mut String) {
             }
             // Ctrl+W: close the action (right) pane — a keyboard shortcut for /close.
             Some(0x17) => close_action(),
+            // Ctrl+V: paste the clipboard into the input line (newlines → spaces).
+            Some(0x16) => {
+                if let Some((text, _)) = crate::clipboard::get() {
+                    for ch in text.chars() {
+                        let c = if ch == '\n' || ch == '\r' || ch == '\t' { ' ' } else { ch };
+                        if (' '..='~').contains(&c) {
+                            buf.push(c);
+                            console::put_byte(c as u8);
+                        }
+                    }
+                }
+            }
             Some(0x7f) | Some(0x08) => {
                 if buf.pop().is_some() {
                     // Erase the character on both consoles: back up, overwrite

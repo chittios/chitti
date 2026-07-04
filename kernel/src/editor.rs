@@ -16,6 +16,7 @@ enum Mode {
     Normal,
     Insert,
     Command,
+    Visual,
 }
 
 struct Editor {
@@ -30,7 +31,8 @@ struct Editor {
     dirty: bool,
     saved: bool,
     quit: bool,
-    pending: u8, // pending operator: b'd', b'g', or 0
+    pending: u8, // pending operator: b'd', b'g', b'y', or 0
+    sel_anchor: Option<(usize, usize)>, // (row, col) where Visual selection began
     rows: usize,
 }
 
@@ -64,6 +66,7 @@ pub fn open(path: &str) -> bool {
         saved: false,
         quit: false,
         pending: 0,
+        sel_anchor: None,
         rows,
     };
     ed.render();
@@ -97,13 +100,12 @@ impl Editor {
             Mode::Normal => self.normal(b),
             Mode::Insert => self.insert(b),
             Mode::Command => self.command(b),
+            Mode::Visual => self.visual(b),
         }
     }
 
-    fn normal(&mut self, b: u8) {
-        let pend = self.pending;
-        self.pending = 0;
-        self.msg.clear();
+    /// Cursor motions shared by Normal and Visual modes.
+    fn move_cursor(&mut self, b: u8) {
         match b {
             b'h' => self.cx = self.cx.saturating_sub(1),
             b'l' => {
@@ -127,15 +129,34 @@ impl Editor {
             b'$' => self.cx = self.line_len().saturating_sub(1),
             b'w' => self.word_forward(),
             b'b' => self.word_back(),
+            b'G' => {
+                self.cy = self.lines.len() - 1;
+                self.clamp_normal();
+            }
+            _ => {}
+        }
+    }
+
+    fn normal(&mut self, b: u8) {
+        let pend = self.pending;
+        self.pending = 0;
+        self.msg.clear();
+        match b {
+            b'h' | b'l' | b'k' | b'j' | b'0' | b'$' | b'w' | b'b' | b'G' => self.move_cursor(b),
             b'g' if pend == b'g' => {
                 self.cy = 0;
                 self.cx = 0;
             }
             b'g' => self.pending = b'g',
-            b'G' => {
-                self.cy = self.lines.len() - 1;
-                self.clamp_normal();
+            b'v' => {
+                self.mode = Mode::Visual;
+                self.sel_anchor = Some((self.cy, self.cx));
             }
+            b'y' if pend == b'y' => self.yank_line(),
+            b'y' => self.pending = b'y',
+            b'Y' => self.yank_line(),
+            b'p' => self.paste(true),
+            b'P' => self.paste(false),
             b'i' => self.mode = Mode::Insert,
             b'I' => {
                 self.cx = 0;
@@ -283,6 +304,7 @@ impl Editor {
     }
 
     fn delete_line(&mut self) {
+        crate::clipboard::set(self.lines[self.cy].clone(), true); // dd yanks the line
         if self.lines.len() > 1 {
             self.lines.remove(self.cy);
             if self.cy >= self.lines.len() {
@@ -293,6 +315,113 @@ impl Editor {
         }
         self.cx = 0;
         self.dirty = true;
+    }
+
+    fn yank_line(&mut self) {
+        crate::clipboard::set(self.lines[self.cy].clone(), true);
+        self.msg = "yanked 1 line".to_string();
+    }
+
+    /// The ordered, inclusive selection endpoints in Visual mode.
+    fn sel_range(&self) -> ((usize, usize), (usize, usize)) {
+        let a = self.sel_anchor.unwrap_or((self.cy, self.cx));
+        let b = (self.cy, self.cx);
+        if a <= b {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+
+    fn selected_text(&self) -> String {
+        let ((r1, c1), (r2, c2)) = self.sel_range();
+        if r1 == r2 {
+            let l = &self.lines[r1];
+            let end = (c2 + 1).min(l.len());
+            let start = c1.min(l.len());
+            return l.get(start..end).unwrap_or("").to_string();
+        }
+        let mut s = String::new();
+        let first = &self.lines[r1];
+        s.push_str(first.get(c1.min(first.len())..).unwrap_or(""));
+        s.push('\n');
+        for r in r1 + 1..r2 {
+            s.push_str(&self.lines[r]);
+            s.push('\n');
+        }
+        let last = &self.lines[r2];
+        s.push_str(last.get(..(c2 + 1).min(last.len())).unwrap_or(""));
+        s
+    }
+
+    fn delete_selection(&mut self) {
+        let ((r1, c1), (r2, c2)) = self.sel_range();
+        if r1 == r2 {
+            let l = &mut self.lines[r1];
+            let end = (c2 + 1).min(l.len());
+            let start = c1.min(l.len());
+            l.replace_range(start..end, "");
+        } else {
+            let head = self.lines[r1].get(..c1.min(self.lines[r1].len())).unwrap_or("").to_string();
+            let tail = self.lines[r2].get((c2 + 1).min(self.lines[r2].len())..).unwrap_or("").to_string();
+            for _ in r1..r2 {
+                self.lines.remove(r1 + 1);
+            }
+            self.lines[r1] = head + &tail;
+        }
+        self.cy = r1;
+        self.cx = c1;
+        self.clamp_normal();
+        self.dirty = true;
+    }
+
+    fn visual(&mut self, b: u8) {
+        self.msg.clear();
+        match b {
+            b'h' | b'l' | b'k' | b'j' | b'0' | b'$' | b'w' | b'b' | b'G' => self.move_cursor(b),
+            0x1b => {
+                self.mode = Mode::Normal;
+                self.sel_anchor = None;
+            }
+            b'y' => {
+                crate::clipboard::set(self.selected_text(), false);
+                let (start, _) = self.sel_range();
+                self.cy = start.0;
+                self.cx = start.1;
+                self.mode = Mode::Normal;
+                self.sel_anchor = None;
+                self.msg = "yanked selection".to_string();
+            }
+            b'd' | b'x' => {
+                crate::clipboard::set(self.selected_text(), false);
+                self.delete_selection();
+                self.mode = Mode::Normal;
+                self.sel_anchor = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn paste(&mut self, after: bool) {
+        let Some((text, linewise)) = crate::clipboard::get() else {
+            self.msg = "clipboard empty".to_string();
+            return;
+        };
+        if linewise || text.contains('\n') {
+            let at = if after { self.cy + 1 } else { self.cy };
+            for (k, line) in text.split('\n').enumerate() {
+                self.lines.insert(at + k, line.to_string());
+            }
+            self.cy = at;
+            self.cx = 0;
+        } else {
+            let at = if after && self.line_len() > 0 { self.cx + 1 } else { self.cx };
+            let at = at.min(self.line_len());
+            self.lines[self.cy].insert_str(at, &text);
+            self.cx = at + text.len().saturating_sub(1);
+        }
+        self.dirty = true;
+        self.msg = "pasted".to_string();
     }
 
     fn word_forward(&mut self) {
@@ -331,8 +460,10 @@ impl Editor {
         let modeline = match self.mode {
             Mode::Normal => alloc::format!("-- NORMAL --  {}:{}  {}", self.cy + 1, self.cx + 1, self.msg),
             Mode::Insert => alloc::format!("-- INSERT --  {}:{}", self.cy + 1, self.cx + 1),
+            Mode::Visual => alloc::format!("-- VISUAL --  {}:{}  (y copy, d cut, Esc)", self.cy + 1, self.cx + 1),
             Mode::Command => alloc::format!(":{}", self.cmd),
         };
-        crate::framebuffer::editor_render(&title, &self.lines, self.top, self.cy, self.cx, &modeline);
+        let sel = if self.mode == Mode::Visual { Some(self.sel_range()) } else { None };
+        crate::framebuffer::editor_render(&title, &self.lines, self.top, self.cy, self.cx, &modeline, sel);
     }
 }

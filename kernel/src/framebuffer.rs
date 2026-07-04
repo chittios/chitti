@@ -47,6 +47,7 @@ const STATUS_FG: Rgb = (140, 148, 162);
 const EDITOR_BG: Rgb = (16, 18, 24);
 const EDITOR_FG: Rgb = (214, 218, 228);
 const EDITOR_LINENO: Rgb = (86, 92, 104);
+const EDITOR_SEL: Rgb = (40, 66, 110); // visual-mode selection highlight
 
 // Layout metrics, in pixels (independent of font scale).
 const OUTER: u64 = 8; // margin around the whole content region
@@ -702,7 +703,15 @@ pub fn editor_leave() {
 /// slice of `lines` from `top`, a reverse-video block cursor at
 /// `(cur_row, cur_col)`, and a bottom mode line. `gutter` toggles line numbers.
 #[allow(clippy::too_many_arguments)]
-pub fn editor_render(title: &str, lines: &[alloc::string::String], top: usize, cur_row: usize, cur_col: usize, modeline: &str) {
+pub fn editor_render(
+    title: &str,
+    lines: &[alloc::string::String],
+    top: usize,
+    cur_row: usize,
+    cur_col: usize,
+    modeline: &str,
+    sel: Option<((usize, usize), (usize, usize))>,
+) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
         let (px, pw, cw, ch, cols, rows) =
@@ -712,6 +721,16 @@ pub fn editor_render(title: &str, lines: &[alloc::string::String], top: usize, c
         // Clear the interior to the editor background.
         sc.fill_rect(ix, iy, cols * cw, rows * ch, EDITOR_BG);
         let text_rows = rows.saturating_sub(1);
+        // Is text (row, col) inside the inclusive selection range?
+        let in_sel = |row: usize, col: usize| -> bool {
+            let Some(((r1, c1), (r2, c2))) = sel else { return false };
+            if row < r1 || row > r2 {
+                return false;
+            }
+            let after_start = row > r1 || col >= c1;
+            let before_end = row < r2 || col <= c2;
+            after_start && before_end
+        };
         // Line-number gutter width (digits + 1 space).
         let gutter = {
             let mut n = lines.len().max(1);
@@ -735,13 +754,14 @@ pub fn editor_render(title: &str, lines: &[alloc::string::String], top: usize, c
                 sc.blit_glyph(x, y, b, EDITOR_LINENO, EDITOR_BG);
                 x += cw;
             }
-            // Text, clipped to the pane width.
+            // Text, clipped to the pane width; selected cells get a highlight bg.
             let mut c = gutter;
-            for &b in lines[li].as_bytes() {
+            for (col, &b) in lines[li].as_bytes().iter().enumerate() {
                 if c >= cols {
                     break;
                 }
-                sc.blit_glyph(x, y, b, EDITOR_FG, EDITOR_BG);
+                let bg = if in_sel(li, col) { EDITOR_SEL } else { EDITOR_BG };
+                sc.blit_glyph(x, y, b, EDITOR_FG, bg);
                 x += cw;
                 c += 1;
             }
