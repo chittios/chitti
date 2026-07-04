@@ -82,6 +82,21 @@ pub fn put_byte(byte: u8) {
     crate::arch::interrupts::without_interrupts(|| write_byte(byte));
 }
 
+/// Write a string to the UART only, **without** mirroring to the framebuffer
+/// chat pane the way [`Serial`] does. `ktrace` uses this (plus its own mirror to
+/// the framebuffer *logs* pane) so trace output and chat output land in
+/// different panes instead of interleaving in one.
+pub fn write_str_raw(s: &str) {
+    crate::arch::interrupts::without_interrupts(|| {
+        for byte in s.bytes() {
+            match byte {
+                0x20..=0x7e | b'\n' | b'\r' | b'\t' => write_byte(byte),
+                _ => write_byte(b'.'),
+            }
+        }
+    });
+}
+
 /// Zero-sized handle used to route `core::fmt::Write` (and thus
 /// `write!`/the `serial_print!` macros) to COM1.
 pub struct Serial;
