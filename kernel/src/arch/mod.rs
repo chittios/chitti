@@ -32,3 +32,21 @@ pub fn now_ms() -> u64 {
 pub fn now_ms() -> u64 {
     aarch64::time_ms()
 }
+
+/// Current wall-clock time as a Unix timestamp read from the hardware RTC, or
+/// `None` if no RTC is readable (the wall clock then falls back to a default
+/// until `/datetime` sets it). CMOS on x86, PL031 on aarch64.
+#[cfg(target_arch = "x86_64")]
+pub fn rtc_unix() -> Option<u64> {
+    x86_64::rtc::read_unix()
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn rtc_unix() -> Option<u64> {
+    aarch64::rtc::read_unix()
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn rtc_unix() -> Option<u64> {
+    None
+}

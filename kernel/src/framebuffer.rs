@@ -23,6 +23,7 @@
 use crate::font_geist::{CELL_H as CH, CELL_W as CW, FIRST, GLYPHS, LAST};
 use crate::limine_protocol::Framebuffer;
 use crate::mm::Locked;
+use alloc::string::String;
 
 const CELL_W: u64 = CW as u64;
 const CELL_H: u64 = CH as u64;
@@ -49,17 +50,6 @@ const GAP: u64 = 10; // between the two panes
 const BORDER: u64 = 2; // pane border thickness
 const PAD: u64 = 10; // interior padding inside a pane
 const CHAT_PCT: u64 = 56; // chat pane width as a % of the content region
-
-#[cfg(target_arch = "x86_64")]
-const ARCH: &str = "x86_64";
-#[cfg(target_arch = "aarch64")]
-const ARCH: &str = "aarch64";
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-const ARCH: &str = "?";
-#[cfg(feature = "model-9b")]
-const MODEL: &str = "qwen3.5-9b";
-#[cfg(not(feature = "model-9b"))]
-const MODEL: &str = "qwen3.5-0.8b";
 
 /// Pick an integer font scale from the panel height so glyphs stay a legible
 /// physical size across resolutions: 1x up to ~1600 tall, 2x for 4K-class
@@ -147,6 +137,13 @@ pub struct Screen {
     scale: u64,
     chat: Pane,
     logs: Pane,
+    /// Status-bar text (left = brand, right = datetime); set by the shell from
+    /// the UI-config templates + clock, so it stays configurable.
+    status_left: String,
+    status_right: String,
+    /// Blinking-caret state for the chat pane.
+    caret_on: bool,
+    caret_last_ms: u64,
 }
 
 impl Screen {
@@ -173,7 +170,15 @@ impl Screen {
         let logs_w = avail_w - chat_w;
         let chat = Pane::new(OUTER, box_y, chat_w, box_h, cw, ch, CHAT_FG, CHAT_BG, "chat", true);
         let logs = Pane::new(OUTER + chat_w + GAP, box_y, logs_w, box_h, cw, ch, LOGS_FG, LOGS_BG, "ktrace", false);
-        Screen { addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift, scale, chat, logs }
+        let mut status_left = String::from("Chitti OS v");
+        status_left.push_str(crate::VERSION);
+        Screen {
+            addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift, scale, chat, logs,
+            status_left,
+            status_right: String::new(),
+            caret_on: true,
+            caret_last_ms: 0,
+        }
     }
 
     fn cw(&self) -> u64 {
@@ -362,19 +367,22 @@ impl Screen {
         let sy_top = self.height - bar_h;
         self.fill_rect(0, sy_top, self.width, bar_h, STATUS_BG);
         let ty = sy_top + 4;
-        // Left: brand + pane tabs.
-        let mut x = self.draw_str(OUTER, ty, "chitti-os", ACCENT, STATUS_BG);
-        x = self.draw_str(x, ty, "   ", STATUS_FG, STATUS_BG);
-        x = self.draw_str(x, ty, "chat", TITLE_ACTIVE, STATUS_BG);
-        x = self.draw_str(x, ty, " * ", ACCENT, STATUS_BG);
-        let _ = self.draw_str(x, ty, "ktrace", STATUS_FG, STATUS_BG);
-        // Right: model + arch, right-aligned.
-        let right = " * ";
-        let text_cells = (MODEL.len() + right.len() + ARCH.len()) as u64;
-        let rx = self.width.saturating_sub(text_cells * self.cw() + OUTER);
-        let mut x = self.draw_str(rx, ty, MODEL, STATUS_FG, STATUS_BG);
-        x = self.draw_str(x, ty, right, ACCENT, STATUS_BG);
-        let _ = self.draw_str(x, ty, ARCH, TITLE_ACTIVE, STATUS_BG);
+        // Left = brand (accent), right = datetime (muted), right-aligned. Both
+        // strings come from the UI config templates via `set_status`.
+        self.draw_str(OUTER, ty, &self.status_left, ACCENT, STATUS_BG);
+        let rlen = self.status_right.len() as u64;
+        let rx = self.width.saturating_sub(rlen * self.cw() + OUTER);
+        self.draw_str(rx, ty, &self.status_right, STATUS_FG, STATUS_BG);
+    }
+
+    /// Paint the chat caret in its current blink state (accent bar, or the pane
+    /// background to erase it).
+    fn paint_caret(&self) {
+        if !self.chat.show_caret {
+            return;
+        }
+        let color = if self.caret_on { ACCENT } else { self.chat.bg };
+        self.fill_rect(self.chat.cell_x(), self.chat.cell_y(), 2 * self.scale, self.chat.ch, color);
     }
 
     /// Full repaint: background, both pane boxes + frames, caret, status bar.
@@ -448,6 +456,7 @@ pub fn console_print(s: &str) {
                 Screen::pane_putc(sc, &mut chat, b);
             }
             sc.chat = chat;
+            sc.caret_on = true; // keep the caret lit right after output
         }
     });
 }
@@ -459,6 +468,36 @@ pub fn console_put_byte(byte: u8) {
             let mut chat = core::mem::replace(&mut sc.chat, dummy_pane());
             Screen::pane_putc(sc, &mut chat, byte);
             sc.chat = chat;
+            sc.caret_on = true;
+        }
+    });
+}
+
+/// Set the status-bar text (left = brand, right = datetime), then repaint just
+/// the bar. The shell calls this every second with the UI-config templates
+/// resolved against the clock.
+pub fn set_status(left: &str, right: &str) {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.status_left.clear();
+            sc.status_left.push_str(left);
+            sc.status_right.clear();
+            sc.status_right.push_str(right);
+            sc.draw_status();
+        }
+    });
+}
+
+/// Advance the caret blink. Called from the shell's idle poll with the current
+/// `now_ms()`; toggles the chat caret roughly twice a second.
+pub fn blink(now_ms: u64) {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            if now_ms.saturating_sub(sc.caret_last_ms) >= 500 {
+                sc.caret_on = !sc.caret_on;
+                sc.caret_last_ms = now_ms;
+                sc.paint_caret();
+            }
         }
     });
 }

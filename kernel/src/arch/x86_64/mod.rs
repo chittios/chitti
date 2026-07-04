@@ -16,6 +16,7 @@ pub mod pci;
 pub mod pic;
 pub mod pit;
 pub mod port;
+pub mod rtc;
 pub mod xhci;
 
 /// Halt the CPU until the next interrupt.

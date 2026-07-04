@@ -12,12 +12,16 @@
 #![cfg_attr(target_arch = "x86_64", reexport_test_harness_main = "test_main")]
 extern crate alloc;
 
+/// Chitti OS version, shown in the status bar and `/info`.
+pub const VERSION: &str = "0.1.0";
+
 #[cfg(target_arch = "aarch64")]
 pub mod acpi;
 pub mod agent;
 pub mod arch;
 pub mod block;
 pub mod cap;
+pub mod clock;
 #[cfg(target_arch = "aarch64")]
 pub mod pci;
 pub mod console;
@@ -37,6 +41,7 @@ pub mod session;
 pub mod shell;
 pub mod skills;
 pub mod tools;
+pub mod ui_config;
 #[cfg(target_arch = "x86_64")]
 pub mod smp;
 pub mod synapse;

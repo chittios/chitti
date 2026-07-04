@@ -98,6 +98,11 @@ pub fn run() -> ! {
     serial_println!("Chitti chat. Type a message; the model replies (Ctrl+C to stop generating).");
     serial_println!("Commands start with '/': /help for the list.");
 
+    // Seed the wall clock (RTC or fallback) and paint the status bar once, so
+    // the datetime is right immediately rather than after the first idle tick.
+    crate::clock::init();
+    update_status();
+
     // Persona agent (for `/do <intent>`) reused across the session.
     let mut agent = Agent::spawn(persona::default_manifest("chitti"));
     let mut planner = RulePlanner;
@@ -136,6 +141,7 @@ pub fn run() -> ! {
                     chat = None;
                     serial_println!("(chat context cleared)");
                 }
+                "datetime" | "date" => run_datetime(arg),
                 "do" => {
                     if arg.is_empty() {
                         serial_println!("usage: /do <intent>   e.g. /do remember that project is chitti");
@@ -282,6 +288,7 @@ fn print_help() {
     serial_println!("  /bench           matvec kernel throughput");
     serial_println!("  /perf            end-to-end prefill/decode tok/s");
     serial_println!("  /info            CPU / memory / model / context / OS info");
+    serial_println!("  /datetime [..]   show/set the clock: /datetime 2026-07-04 13:45 | /datetime tz +5:30");
     serial_println!("  /disks           list every block device + detected filesystems (read-only)");
     serial_println!("  /ls [n | /path]  list a volume's root: n on disk 0, or a mount path (/mnt)");
     serial_println!("  /mount <d> [v] [/p]  mount disk d's volume v at /p (default /mnt)");
@@ -649,9 +656,106 @@ fn read_line(buf: &mut String) {
                 console::put_byte(c);
             }
             Some(_) => {} // ignore other control bytes
-            None => crate::sched::yield_now(),
+            None => {
+                ui_tick();
+                crate::sched::yield_now();
+            }
         }
     }
+}
+
+use core::sync::atomic::{AtomicU64, Ordering};
+static LAST_STATUS_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Per-idle UI upkeep: blink the caret and refresh the status-bar datetime
+/// (throttled to once a second). No-op in the test build (no framebuffer).
+fn ui_tick() {
+    #[cfg(not(test))]
+    {
+        let now = crate::arch::now_ms();
+        crate::framebuffer::blink(now);
+        if now.saturating_sub(LAST_STATUS_MS.load(Ordering::Relaxed)) >= 1000 {
+            LAST_STATUS_MS.store(now, Ordering::Relaxed);
+            update_status();
+        }
+    }
+}
+
+/// Resolve the status-bar templates (from the UI config, phase 2) against the
+/// clock and push them to the framebuffer. No-op in the test build.
+fn update_status() {
+    #[cfg(not(test))]
+    {
+        let (left, right) = crate::ui_config::status_strings();
+        crate::framebuffer::set_status(&left, &right);
+    }
+}
+
+/// `/datetime` — show or set the wall clock and timezone.
+fn run_datetime(arg: &str) {
+    use crate::clock;
+    if arg.is_empty() {
+        serial_println!("datetime> {}  {}", clock::format_datetime(), clock::format_tz());
+        serial_println!("  set time: /datetime 2026-07-04 13:45[:00]");
+        serial_println!("  set zone: /datetime tz +5:30   (also -8, +05:30, 0/UTC)");
+        return;
+    }
+    if let Some(tz) = arg.strip_prefix("tz") {
+        match parse_tz(tz.trim()) {
+            Some(secs) => {
+                clock::set_tz(secs);
+                crate::ui_config::persist_tz(secs);
+                update_status();
+                serial_println!("datetime> timezone {}  (now {})", clock::format_tz(), clock::format_datetime());
+            }
+            None => serial_println!("usage: /datetime tz +5:30"),
+        }
+        return;
+    }
+    match parse_datetime(arg) {
+        Some((y, mo, d, h, mi, s)) => {
+            clock::set_local(y, mo, d, h, mi, s);
+            update_status();
+            serial_println!("datetime> set to {}  {}", clock::format_datetime(), clock::format_tz());
+        }
+        None => serial_println!("usage: /datetime YYYY-MM-DD HH:MM[:SS]"),
+    }
+}
+
+/// Parse a timezone like `+5:30`, `-8`, `+05:30`, `0`, `UTC` → seconds east of UTC.
+fn parse_tz(s: &str) -> Option<i32> {
+    let s = s.trim();
+    if s.is_empty() || s == "0" || s.eq_ignore_ascii_case("utc") {
+        return Some(0);
+    }
+    let (sign, rest) = match s.strip_prefix('+') {
+        Some(r) => (1, r),
+        None => match s.strip_prefix('-') {
+            Some(r) => (-1, r),
+            None => (1, s),
+        },
+    };
+    let (hh, mm) = rest.split_once(':').unwrap_or((rest, "0"));
+    let h: i32 = hh.trim().parse().ok()?;
+    let m: i32 = mm.trim().parse().ok()?;
+    if h > 14 || m >= 60 {
+        return None;
+    }
+    Some(sign * (h * 3600 + m * 60))
+}
+
+/// Parse `YYYY-MM-DD HH:MM[:SS]` into calendar components.
+fn parse_datetime(s: &str) -> Option<(i64, i64, i64, i64, i64, i64)> {
+    let (date, time) = s.trim().split_once(' ')?;
+    let mut dp = date.split('-');
+    let y = dp.next()?.trim().parse().ok()?;
+    let mo = dp.next()?.trim().parse().ok()?;
+    let d = dp.next()?.trim().parse().ok()?;
+    let mut tp = time.trim().split(':');
+    let h = tp.next()?.trim().parse().ok()?;
+    let mi = tp.next()?.trim().parse().ok()?;
+    let s = tp.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+    Some((y, mo, d, h, mi, s))
 }
 
 // --- block-device / filesystem commands (x86 virtio-blk over PCI) ---------
