@@ -86,6 +86,13 @@ pub struct Xhci {
     alloc: Alloc,
     // The enumerated keyboard, if one was found + configured.
     kbd: Option<Kbd>,
+    // The enumerated pointer (USB tablet / mouse), if one was found.
+    mouse: Option<Ptr>,
+    // Small ring of decoded keyboard bytes (the shared event ring is drained by
+    // `pump_events`, which routes reports; `poll_key` pops from here).
+    key_buf: [u8; 16],
+    key_head: usize,
+    key_tail: usize,
 }
 
 /// A configured HID boot keyboard.
@@ -99,6 +106,39 @@ struct Kbd {
     report_pa: u64,    // 8-byte HID boot report buffer
     report_va: usize,
     prev: [u8; 8],     // last report, to detect newly-pressed keys
+}
+
+/// A configured HID pointer (USB tablet or mouse). The absolute-tablet report
+/// (what QEMU `usb-tablet` and VirtualBox's USB pointing device emit) is
+/// `[buttons, X:u16le, Y:u16le, wheel]` with X/Y in `0..=0x7fff`; a relative
+/// boot mouse is `[buttons, dx:i8, dy:i8]`. `absolute` picks how `poll_mouse`
+/// interprets the report.
+struct Ptr {
+    slot: u8,
+    int_dci: u8,
+    int_ring_va: usize,
+    int_ring_pa: u64,
+    int_enqueue: usize,
+    int_cycle: u32,
+    report_pa: u64,
+    report_va: usize,
+    report_len: u32,
+    absolute: bool,
+}
+
+/// Per-device handles produced by `enumerate_common` (an addressed device with
+/// its config descriptor read), consumed by `finish_keyboard`/`finish_pointer`.
+struct Common {
+    slot: u8,
+    ep0_va: usize,
+    ep0_pa: u64,
+    ep0_enq: usize,
+    ep0_cycle: u32,
+    in_ctx_va: usize,
+    in_ctx_pa: u64,
+    buf_va: usize,
+    total: u32,
+    cfg_val: u8,
 }
 
 const RING_TRBS: usize = 64; // TRBs per ring (last is a Link on the command ring)
@@ -292,6 +332,10 @@ impl Xhci {
                 ctx_size,
                 alloc,
                 kbd: None,
+                mouse: None,
+                key_buf: [0; 16],
+                key_head: 0,
+                key_tail: 0,
             })
         }
     }
@@ -439,55 +483,85 @@ impl Xhci {
     /// read its descriptors, set the config + boot protocol, and arm the
     /// interrupt IN endpoint.
     pub fn enumerate_keyboard(&mut self) -> bool {
-        // Fast path out: nothing connected on any port -> no retries, no delays
-        // (keeps a keyboard-less boot quick, esp. under TCG).
+        self.enumerate_input()
+    }
+
+    /// Enumerate the connected USB HID devices — a boot keyboard and/or a
+    /// pointer (USB tablet / mouse), which may sit on separate ports.
+    pub fn enumerate_input(&mut self) -> bool {
+        // Fast path out: nothing connected on any port -> no retries, no delays.
         let any_port = (1..=self.max_ports).any(|p| unsafe { r32(self.portsc(p)) } & PORTSC_CCS != 0);
         if !any_port {
             crate::ktrace::log("xhci", "no USB device connected");
             return false;
         }
-        // A device is present: enumerate with RETRIES. VirtualBox resets the
-        // attached VUSB device *asynchronously* after our controller reset
-        // (~20 ms; its VBox.log shows "power off ignored, the device is
-        // resetting!"), and a control transfer submitted in that window is
-        // rejected inside VBox with the TD silently dropped -- no event, no
-        // error. QEMU's resets are instantaneous, so it never needs this. A
-        // settle + fresh attempt (new slot, fresh port reset) succeeds once the
-        // device-level reset has finished.
+        // Enumerate with RETRIES. VirtualBox resets the attached VUSB device
+        // *asynchronously* after our controller reset (~20 ms); a control
+        // transfer submitted in that window is silently dropped. A settle +
+        // fresh attempt succeeds once the device-level reset has finished. QEMU
+        // is instantaneous and never needs the retry.
         for attempt in 0..3 {
             if attempt > 0 {
-                spin_delay(100_000_000); // let an async device reset finish
+                spin_delay(100_000_000);
                 crate::ktrace::log_fmt(format_args!("xhci: retrying enumeration (attempt {})", attempt + 1));
             }
             // SAFETY: single-threaded boot; all DMA regions are freshly allocated.
-            unsafe {
-                if let Some(kbd) = self.try_enumerate() {
-                    self.kbd = Some(kbd);
-                    return true;
-                }
-            }
-        }
-        crate::ktrace::log("xhci", "no HID keyboard enumerated");
-        false
-    }
-
-    /// Whether a HID keyboard was enumerated (for the boot diagnostic).
-    pub fn has_keyboard(&self) -> bool {
-        self.kbd.is_some()
-    }
-
-    unsafe fn try_enumerate(&mut self) -> Option<Kbd> {
-        // 1. Find + reset a connected port.
-        let mut port = 0u8;
-        for p in 1..=self.max_ports {
-            if unsafe { r32(self.portsc(p)) } & PORTSC_CCS != 0 {
-                port = p;
+            unsafe { self.scan_ports() };
+            if self.kbd.is_some() && self.mouse.is_some() {
                 break;
             }
         }
-        if port == 0 {
-            return None;
+        if self.kbd.is_none() {
+            crate::ktrace::log("xhci", "no HID keyboard enumerated");
         }
+        self.kbd.is_some() || self.mouse.is_some()
+    }
+
+    /// Whether a HID keyboard / pointer was enumerated (boot diagnostic).
+    pub fn has_keyboard(&self) -> bool {
+        self.kbd.is_some()
+    }
+    pub fn has_mouse(&self) -> bool {
+        self.mouse.is_some()
+    }
+
+    /// Enumerate every connected port once, classifying each device as a boot
+    /// keyboard or a pointer and configuring whichever slot we still need. A
+    /// tablet on the first port no longer starves the keyboard (each port is
+    /// tried, not just the first).
+    unsafe fn scan_ports(&mut self) {
+        for port in 1..=self.max_ports {
+            if self.kbd.is_some() && self.mouse.is_some() {
+                break;
+            }
+            if unsafe { r32(self.portsc(port)) } & PORTSC_CCS == 0 {
+                continue;
+            }
+            let Some(mut c) = (unsafe { self.enumerate_common(port) }) else { continue };
+            if self.kbd.is_none() {
+                if let Some((iface, ep, mps, ivl)) = unsafe { parse_hid_keyboard(c.buf_va, c.total as usize) } {
+                    if let Some(k) = unsafe { self.finish_keyboard(&mut c, iface, ep, mps, ivl) } {
+                        self.kbd = Some(k);
+                        continue;
+                    }
+                }
+            }
+            if self.mouse.is_none() {
+                if let Some((iface, ep, mps, ivl, proto)) = unsafe { parse_hid_pointer(c.buf_va, c.total as usize) } {
+                    if let Some(p) = unsafe { self.finish_pointer(&mut c, iface, ep, mps, ivl, proto) } {
+                        self.mouse = Some(p);
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Steps 1–8 shared by keyboard + pointer enumeration: reset `port`, enable a
+    /// slot, address the device, learn EP0 max-packet, and read its full config
+    /// descriptor into a buffer. Returns the per-device handles; the caller then
+    /// classifies the config and finishes as a keyboard or pointer.
+    unsafe fn enumerate_common(&mut self, port: u8) -> Option<Common> {
         let psc = self.portsc(port);
         unsafe {
             // Reset the port (USB2/FullSpeed needs it; preserve RW1C status bits).
@@ -627,54 +701,83 @@ impl Xhci {
         if !ok {
             return None;
         }
-        let Some((iface, ep_addr, ep_mps, interval)) = (unsafe { parse_hid_keyboard(buf_va, total as usize) }) else {
-            crate::ktrace::log("xhci", "no HID boot-keyboard interface in config descriptor");
-            return None;
-        };
+        Some(Common { slot, ep0_va, ep0_pa, ep0_enq, ep0_cycle, in_ctx_va, in_ctx_pa, buf_va, total, cfg_val })
+    }
 
-        // 9. Set configuration, 10. boot protocol.
+    /// Set the configuration, put the interface into a protocol, and configure
+    /// the interrupt IN endpoint. Shared tail of keyboard/pointer setup; returns
+    /// the endpoint's DCI + ring/report allocations.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn finish_endpoint(
+        &mut self,
+        c: &mut Common,
+        iface: u8,
+        ep_addr: u8,
+        ep_mps: u32,
+        interval: u8,
+        set_boot: bool,
+    ) -> Option<(u8, usize, u64, u64, usize)> {
         unsafe {
-            self.control(slot, ep0_va, ep0_pa, &mut ep0_enq, &mut ep0_cycle, setup(0x00, 9, cfg_val as u16, 0, 0), 0, 0, false);
-            // SET_PROTOCOL(boot=0) to the HID interface (class request).
-            self.control(slot, ep0_va, ep0_pa, &mut ep0_enq, &mut ep0_cycle, setup(0x21, 0x0b, 0, iface as u16, 0), 0, 0, false);
+            // Set configuration.
+            self.control(c.slot, c.ep0_va, c.ep0_pa, &mut c.ep0_enq, &mut c.ep0_cycle, setup(0x00, 9, c.cfg_val as u16, 0, 0), 0, 0, false);
+            if set_boot {
+                // SET_PROTOCOL(boot=0) to the HID interface (class request).
+                self.control(c.slot, c.ep0_va, c.ep0_pa, &mut c.ep0_enq, &mut c.ep0_cycle, setup(0x21, 0x0b, 0, iface as u16, 0), 0, 0, false);
+            }
         }
-
-        // 11. Interrupt IN ring + report buffer.
         let (int_pa, int_va) = (self.alloc)(RING_TRBS * 16)?;
         let int_va = int_va as usize;
         unsafe { self.init_link(int_va, int_pa) };
         let (report_pa, report_va) = (self.alloc)(4096)?;
         let report_va = report_va as usize;
-        let epnum = (ep_addr & 0x0f) as u32;
-        let int_dci = (epnum * 2 + 1) as u8; // IN endpoint
-
-        // 12. Configure Endpoint (add slot + the interrupt endpoint).
+        let int_dci = (((ep_addr & 0x0f) as u32) * 2 + 1) as u8; // IN endpoint DCI
         unsafe {
-            self.build_input_configure(in_ctx_va, int_dci, ep_mps, interval, int_pa);
-            let (cc, _) = self.command(in_ctx_pa, (TRB_CONFIGURE_ENDPOINT << 10) | ((slot as u32) << 24))?;
+            self.build_input_configure(c.in_ctx_va, int_dci, ep_mps, interval, int_pa);
+            let (cc, _) = self.command(c.in_ctx_pa, (TRB_CONFIGURE_ENDPOINT << 10) | ((c.slot as u32) << 24))?;
             if cc != CC_SUCCESS {
                 crate::ktrace::log_fmt(format_args!("xhci: configure endpoint failed cc={cc}"));
                 return None;
             }
         }
+        Some((int_dci, int_va, int_pa, report_pa, report_va))
+    }
 
+    /// Finish a boot keyboard: set config + boot protocol, configure its
+    /// interrupt endpoint, and arm the first transfer.
+    unsafe fn finish_keyboard(&mut self, c: &mut Common, iface: u8, ep_addr: u8, ep_mps: u32, interval: u8) -> Option<Kbd> {
+        let (int_dci, int_va, int_pa, report_pa, report_va) =
+            unsafe { self.finish_endpoint(c, iface, ep_addr, ep_mps, interval, true) }?;
         let mut kbd = Kbd {
-            slot,
-            int_dci,
-            int_ring_va: int_va,
-            int_ring_pa: int_pa,
-            int_enqueue: 0,
-            int_cycle: 1,
-            report_pa,
-            report_va,
-            prev: [0; 8],
+            slot: c.slot, int_dci, int_ring_va: int_va, int_ring_pa: int_pa,
+            int_enqueue: 0, int_cycle: 1, report_pa, report_va, prev: [0; 8],
         };
-        // 13. Arm the first interrupt transfer.
         unsafe { self.queue_interrupt(&mut kbd) };
-        crate::ktrace::log_fmt(format_args!(
-            "xhci: HID keyboard ready (slot {slot}, ep {ep_addr:#x}, dci {int_dci}) -- type in the window"
-        ));
+        crate::ktrace::log_fmt(format_args!("xhci: HID keyboard ready (slot {}, ep {ep_addr:#x}, dci {int_dci})", c.slot));
         Some(kbd)
+    }
+
+    /// Finish a pointer: a boot mouse (proto 2, relative) gets boot protocol; a
+    /// tablet (proto 0) keeps report protocol (absolute). Configure the endpoint
+    /// and arm the first transfer.
+    unsafe fn finish_pointer(&mut self, c: &mut Common, iface: u8, ep_addr: u8, ep_mps: u32, interval: u8, proto: u8) -> Option<Ptr> {
+        let boot_mouse = proto == 2;
+        let (int_dci, int_va, int_pa, report_pa, report_va) =
+            unsafe { self.finish_endpoint(c, iface, ep_addr, ep_mps, interval, boot_mouse) }?;
+        let mut ptr = Ptr {
+            slot: c.slot, int_dci, int_ring_va: int_va, int_ring_pa: int_pa,
+            int_enqueue: 0, int_cycle: 1, report_pa, report_va,
+            report_len: ep_mps.clamp(4, 8),
+            absolute: !boot_mouse,
+        };
+        unsafe {
+            self.arm_int(ptr.int_ring_va, ptr.int_ring_pa, &mut ptr.int_enqueue, &mut ptr.int_cycle, ptr.report_pa, ptr.report_len, ptr.slot, ptr.int_dci);
+        }
+        crate::ktrace::log_fmt(format_args!(
+            "xhci: HID pointer ready (slot {}, ep {ep_addr:#x}, dci {int_dci}, {})",
+            c.slot,
+            if boot_mouse { "boot mouse" } else { "absolute tablet" }
+        ));
+        Some(ptr)
     }
 
     /// Initialize a transfer ring's trailing Link TRB (back to its own start).
@@ -738,61 +841,106 @@ impl Xhci {
     /// Queue one interrupt IN transfer for the keyboard's 8-byte boot report.
     unsafe fn queue_interrupt(&self, kbd: &mut Kbd) {
         unsafe {
-            Self::ring_push(
-                kbd.int_ring_va,
-                kbd.int_ring_pa,
-                &mut kbd.int_enqueue,
-                &mut kbd.int_cycle,
-                kbd.report_pa,
-                8,
-                (TRB_NORMAL << 10) | (1 << 5), // IOC
-            );
-            self.doorbell(kbd.slot, kbd.int_dci as u32);
+            self.arm_int(kbd.int_ring_va, kbd.int_ring_pa, &mut kbd.int_enqueue, &mut kbd.int_cycle, kbd.report_pa, 8, kbd.slot, kbd.int_dci);
         }
     }
 
-    /// C4: drain a pending HID boot report into ASCII bytes (there may be
-    /// several newly-pressed keys in one report). Returns the first, buffering
-    /// the rest is unnecessary for a keyboard (one key/report in practice).
-    pub fn poll_key(&mut self) -> Option<u8> {
-        let mut kbd = self.kbd.take()?;
-        let mut out = None;
-        // SAFETY: kbd's rings/buffer are live for the controller's lifetime.
+    /// Queue one interrupt IN transfer of `len` bytes on `(ring, slot, dci)`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn arm_int(&self, ring_va: usize, ring_pa: u64, enq: &mut usize, cycle: &mut u32, report_pa: u64, len: u32, slot: u8, dci: u8) {
+        unsafe {
+            Self::ring_push(ring_va, ring_pa, enq, cycle, report_pa, len, (TRB_NORMAL << 10) | (1 << 5));
+            self.doorbell(slot, dci as u32);
+        }
+    }
+
+    /// Drain the shared event ring once, routing each transfer event to the
+    /// keyboard (→ decoded bytes into `key_buf`) or the pointer (→ `crate::mouse`)
+    /// by slot + endpoint DCI, and re-arm that endpoint. Both `poll_key` and
+    /// `poll_mouse` call this; a single drainer avoids the two stealing each
+    /// other's events off the one ring.
+    fn pump_events(&mut self) {
+        let mut kbd = self.kbd.take();
+        let mut mouse = self.mouse.take();
+        // SAFETY: rings/buffers are live for the controller's lifetime.
         unsafe {
             while let Some(ev) = self.next_event() {
                 if (ev.control >> 10) & 0x3f != EVT_TRANSFER {
                     continue;
                 }
-                // A boot report arrived. Parse newly-pressed keys.
-                let mut report = [0u8; 8];
-                for (i, b) in report.iter_mut().enumerate() {
-                    *b = read_volatile((kbd.report_va + i) as *const u8);
-                }
-                let shift = report[0] & 0x22 != 0;
-                let ctrl = report[0] & 0x11 != 0;
-                for &usage in &report[2..8] {
-                    if usage != 0 && !kbd.prev[2..8].contains(&usage) {
-                        if let Some(a) = hid_to_ascii(usage, shift, ctrl) {
-                            out = out.or(Some(a));
+                let slot = ((ev.control >> 24) & 0xff) as u8;
+                let dci = ((ev.control >> 16) & 0x1f) as u8;
+                if let Some(k) = kbd.as_mut() {
+                    if k.slot == slot && k.int_dci == dci {
+                        let mut report = [0u8; 8];
+                        for (i, b) in report.iter_mut().enumerate() {
+                            *b = read_volatile((k.report_va + i) as *const u8);
                         }
+                        let shift = report[0] & 0x22 != 0;
+                        let ctrl = report[0] & 0x11 != 0;
+                        for &usage in &report[2..8] {
+                            if usage != 0 && !k.prev[2..8].contains(&usage) {
+                                if let Some(a) = hid_to_ascii(usage, shift, ctrl) {
+                                    self.key_push(a);
+                                }
+                            }
+                        }
+                        k.prev = report;
+                        self.queue_interrupt(k);
+                        continue;
                     }
                 }
-                kbd.prev = report;
-                self.queue_interrupt(&mut kbd); // re-arm
-                if out.is_some() {
-                    break;
+                if let Some(m) = mouse.as_mut() {
+                    if m.slot == slot && m.int_dci == dci {
+                        let n = m.report_len as usize;
+                        let mut rep = [0u8; 8];
+                        for (i, b) in rep.iter_mut().enumerate().take(n.min(8)) {
+                            *b = read_volatile((m.report_va + i) as *const u8);
+                        }
+                        if m.absolute {
+                            // [buttons, X:u16le, Y:u16le] in 0..=0x7fff (tablet).
+                            let x = (rep[1] as u32) | ((rep[2] as u32) << 8);
+                            let y = (rep[3] as u32) | ((rep[4] as u32) << 8);
+                            crate::mouse::set_abs(x as i32, y as i32, 0x7fff);
+                        } else {
+                            // [buttons, dx:i8, dy:i8] (boot mouse, relative).
+                            crate::mouse::move_rel(rep[1] as i8 as i32, rep[2] as i8 as i32);
+                        }
+                        crate::mouse::set_left(rep[0] & 1 != 0);
+                        self.arm_int(m.int_ring_va, m.int_ring_pa, &mut m.int_enqueue, &mut m.int_cycle, m.report_pa, m.report_len, m.slot, m.int_dci);
+                        continue;
+                    }
                 }
             }
         }
-        self.kbd = Some(kbd);
-        out
+        self.kbd = kbd;
+        self.mouse = mouse;
     }
 
-    /// Drain USB HID boot-mouse reports into [`crate::mouse`]. No-op until a USB
-    /// mouse is enumerated (implemented on top of the keyboard enumeration path).
+    fn key_push(&mut self, b: u8) {
+        let n = (self.key_head + 1) % self.key_buf.len();
+        if n != self.key_tail {
+            self.key_buf[self.key_head] = b;
+            self.key_head = n;
+        }
+    }
+
+    /// The next decoded keyboard byte, if any (drains + routes events first).
+    pub fn poll_key(&mut self) -> Option<u8> {
+        self.pump_events();
+        if self.key_head == self.key_tail {
+            None
+        } else {
+            let b = self.key_buf[self.key_tail];
+            self.key_tail = (self.key_tail + 1) % self.key_buf.len();
+            Some(b)
+        }
+    }
+
+    /// Drain pending pointer reports into [`crate::mouse`] (no-op without a USB
+    /// pointer). Shares the event drain with `poll_key`.
     pub fn poll_mouse(&mut self) {
-        // Placeholder: USB HID mouse enumeration + report parsing is wired
-        // through this method; see `enumerate_keyboard` for the analogous path.
+        self.pump_events();
     }
 }
 
@@ -839,6 +987,47 @@ unsafe fn parse_hid_keyboard(buf: usize, len: usize) -> Option<(u8, u8, u32, u8)
                     let mps = unsafe { read_u16(buf + i + 4) } as u32 & 0x7ff;
                     let interval = unsafe { read_volatile((buf + i + 6) as *const u8) };
                     return Some((iface_num, addr, mps.max(8), interval));
+                }
+            }
+            _ => {}
+        }
+        i += blen;
+    }
+    None
+}
+
+/// Walk a config descriptor for a HID **pointer** interface — a USB tablet
+/// (class 3, protocol 0) or a boot mouse (class 3, protocol 2) — and its
+/// interrupt IN endpoint. Returns `(interface, endpoint addr, max packet,
+/// bInterval, bInterfaceProtocol)`. Skips the keyboard (protocol 1).
+unsafe fn parse_hid_pointer(buf: usize, len: usize) -> Option<(u8, u8, u32, u8, u8)> {
+    let mut i = 0usize;
+    let mut in_ptr_iface = false;
+    let mut iface_num = 0u8;
+    let mut proto = 0u8;
+    while i + 2 <= len {
+        let blen = unsafe { read_volatile((buf + i) as *const u8) } as usize;
+        let btype = unsafe { read_volatile((buf + i + 1) as *const u8) };
+        if blen < 2 {
+            break;
+        }
+        match btype {
+            0x04 => {
+                iface_num = unsafe { read_volatile((buf + i + 2) as *const u8) };
+                let class = unsafe { read_volatile((buf + i + 5) as *const u8) };
+                let p = unsafe { read_volatile((buf + i + 7) as *const u8) };
+                // HID pointer: mouse (proto 2) or tablet/absolute (proto 0). Not
+                // the keyboard (proto 1).
+                in_ptr_iface = class == 3 && (p == 2 || p == 0);
+                proto = p;
+            }
+            0x05 if in_ptr_iface => {
+                let addr = unsafe { read_volatile((buf + i + 2) as *const u8) };
+                let attr = unsafe { read_volatile((buf + i + 3) as *const u8) };
+                if addr & 0x80 != 0 && attr & 0x3 == 3 {
+                    let mps = unsafe { read_u16(buf + i + 4) } as u32 & 0x7ff;
+                    let interval = unsafe { read_volatile((buf + i + 6) as *const u8) };
+                    return Some((iface_num, addr, mps.max(4), interval, proto));
                 }
             }
             _ => {}
