@@ -100,7 +100,7 @@ impl Pane {
         let header_h = BORDER + 4 + ch + 6; // top border, title text, separator gap
         let ix = x + BORDER + PAD;
         let iy = y + header_h;
-        let iw = (w - 2 * (BORDER + PAD)).max(cw);
+        let iw = w.saturating_sub(2 * (BORDER + PAD)).max(cw);
         let ih = (y + h).saturating_sub(iy + BORDER + PAD).max(ch);
         Pane {
             x,

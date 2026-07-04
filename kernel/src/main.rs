@@ -29,12 +29,13 @@ pub extern "C" fn _start() -> ! {
     // SSE (XMM) instructions below; they fault until SSE is enabled.
     arch::x86_64::fpu::enable_sse();
     chitti_kernel::serial::init();
-
-    // Framebuffer console first, so serial output is mirrored to the window.
-    if let Some(fb) = FRAMEBUFFER_REQUEST.response().and_then(|r| r.framebuffers().first().copied()) {
-        framebuffer::init_console(fb);
-    }
     serial_println!("{}", BOOT_MSG);
+
+    // Capture the Limine framebuffer descriptor NOW: the response lives in
+    // bootloader-reclaimable memory, so it must be copied before `init()`
+    // reclaims it. The (heap-allocating) `init_console` is deferred until after
+    // `init()` brings the heap up.
+    let fb_info = FRAMEBUFFER_REQUEST.response().and_then(|r| r.framebuffers().first().copied());
 
     if let Some(mm) = MEMMAP_REQUEST.response() {
         let usable: u64 = mm
@@ -49,6 +50,12 @@ pub extern "C" fn _start() -> ! {
     }
 
     chitti_kernel::init();
+    // Framebuffer console AFTER the heap is up (Screen::build allocates its
+    // pane titles / status strings), using the descriptor captured before
+    // `init()` reclaimed the bootloader response memory.
+    if let Some(fb) = fb_info {
+        framebuffer::init_console(fb);
+    }
     serial_println!(
         "Chitti: SMP: {} core(s) online (see ktrace 'smp:' lines for the spinlock self-test)",
         chitti_kernel::smp::cpu_count()
