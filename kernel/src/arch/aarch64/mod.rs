@@ -254,10 +254,10 @@ pub fn uart_getb() -> Option<u8> {
 
 // --- generic timer (millisecond clock) -----------------------------------
 
-fn cntpct() -> u64 {
+fn cntvct() -> u64 {
     let v: u64;
-    // SAFETY: reading the physical counter is valid at EL1.
-    unsafe { asm!("mrs {}, cntpct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: reading the virtual counter is valid at EL1.
+    unsafe { asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
     v
 }
 
@@ -271,13 +271,13 @@ fn cntfrq() -> u64 {
 /// Milliseconds since boot, from the ARM generic timer (the aarch64 analogue
 /// of the x86 PIT tick counter used for inference timing).
 ///
-/// VirtualBox-ARM leaves `CNTFRQ_EL0` reading 0 (it never programs the timer
-/// frequency), which would freeze this clock at 0 — and with it the blinking
-/// caret and the status-bar datetime, both of which key off elapsed ms. The
-/// physical counter (`CNTPCT_EL0`) still advances, so fall back to the Apple
-/// Silicon host frequency (24 MHz, what QEMU/HVF also reports) when the register
-/// reads 0.
+/// Uses the **virtual** counter `CNTVCT_EL0`, the counter a guest is meant to
+/// read: HVF-based hypervisors (QEMU-HVF, VirtualBox) virtualize it against host
+/// time, whereas the *physical* counter `CNTPCT_EL0` is frozen/denied to a
+/// bare-metal guest on VirtualBox (so the clock — and with it the blinking caret
+/// and status-bar datetime — froze). VirtualBox also leaves `CNTFRQ_EL0` reading
+/// 0, so fall back to the Apple-Silicon host frequency (24 MHz) then.
 pub fn time_ms() -> u64 {
     let f = if cntfrq() != 0 { cntfrq() } else { 24_000_000 };
-    cntpct() * 1000 / f
+    cntvct() * 1000 / f
 }
