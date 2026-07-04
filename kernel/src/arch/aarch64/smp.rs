@@ -193,14 +193,33 @@ extern "C" fn ap_rust_entry() -> ! {
     worker_loop(slot);
 }
 
-/// A worker core: spin until the BSP publishes a new job generation, run this
-/// slot's row range through the SDOT matvec, mark the generation done, repeat.
+/// Publish prior stores to other cores, then wake any `WFE`-parked workers.
+/// `SEV` sets a sticky per-core event flag on every core, so there's no
+/// lost-wakeup race with a worker about to `WFE` (its `WFE` consumes the flag
+/// and returns immediately).
+#[inline]
+fn signal_workers() {
+    // SAFETY: `dsb ishst` orders the preceding job stores before the event;
+    // `sev` has no memory effects.
+    unsafe { core::arch::asm!("dsb ishst", "sev", options(nomem, nostack, preserves_flags)) };
+}
+
+/// A worker core: **park on `WFE`** until the BSP publishes a new job
+/// generation, run this slot's row range through the SDOT matvec, mark the
+/// generation done, repeat. `WFE` (not a busy `spin_loop`) is essential on
+/// hypervisors: a busy-spinning idle secondary pegs a host core, and with many
+/// vCPUs (e.g. an 8-CPU VirtualBox VM) the spinning secondaries starve the boot
+/// core during time-sensitive work like USB xHCI enumeration — which then times
+/// out, leaving no keyboard and (with the timer IRQ also cooperative) a frozen
+/// console. Parked workers cost nothing until the BSP `signal_workers()`.
 fn worker_loop(slot: usize) -> ! {
     let mut last = 0u64;
     loop {
         let g = JOB.go.load(Ordering::Acquire);
         if g == last {
-            core::hint::spin_loop();
+            // SAFETY: `wfe` just parks until an event/IRQ; spurious wakes are
+            // fine — we re-check `go` on the next iteration.
+            unsafe { core::arch::asm!("wfe", options(nomem, nostack, preserves_flags)) };
             continue;
         }
         last = g;
@@ -275,6 +294,7 @@ pub unsafe fn matmul_sdot(
     // Release the job: bump the generation (BSP is the only writer of `go`).
     let g = JOB.go.load(Ordering::Relaxed) + 1;
     JOB.go.store(g, Ordering::Release);
+    signal_workers(); // wake WFE-parked workers
 
     // BSP computes chunk 0 while the workers run theirs.
     // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
@@ -318,6 +338,7 @@ pub unsafe fn matvec_quant(qt: u32, w: *const u8, x: *const f32, y: *mut f32, n_
     }
     let g = JOB.go.load(Ordering::Relaxed) + 1;
     JOB.go.store(g, Ordering::Release);
+    signal_workers(); // wake WFE-parked workers
     // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
     unsafe { tensor::matvec_quant_rows(qt, w, x, y, 0, boundary(1), n_cols) };
     for s in 0..workers {
@@ -355,6 +376,7 @@ pub unsafe fn matvec_q4_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
     }
     let g = JOB.go.load(Ordering::Relaxed) + 1;
     JOB.go.store(g, Ordering::Release);
+    signal_workers(); // wake WFE-parked workers
     // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
     unsafe { tensor::matvec_q4_0_sdot_rows(w, xq, xs, y, 0, boundary(1), n_cols) };
     for s in 0..workers {
