@@ -123,36 +123,48 @@ fn psci_cpu_on(target: u64, entry: u64, ctx: u64) -> i64 {
     ret as i64
 }
 
-/// Bring up to `n_cpus` total cores online (BSP + secondaries). Runs on the BSP
-/// after the MMU is on. Each secondary `i` (1..n_cpus) is launched with its own
-/// stack; the BSP then waits briefly for them to register worker slots and logs
-/// how many came online.
-pub fn init(n_cpus: usize) {
-    let n = n_cpus.min(MAX_CPUS);
-    for i in 1..n {
+/// PSCI status for "no such target CPU" — how `CPU_ON` reports an index past the
+/// last core, which is how we discover the CPU count (cores are numbered
+/// contiguously from 0 on the `virt` machine and under VirtualBox/UEFI).
+const PSCI_INVALID_PARAMETERS: i64 = -2;
+
+/// Bring **every available** secondary core online (BSP + secondaries). Runs on
+/// the BSP after the MMU is on. The core count is discovered dynamically, not
+/// hardcoded: we `CPU_ON` indices 1, 2, … until PSCI reports no such core
+/// (`INVALID_PARAMETERS`), capped at `MAX_CPUS` (the per-core stack array bound).
+/// This tracks the actual `-smp`/hardware CPU count — the parity match to x86's
+/// `smp::init`, which brings up whatever APs Limine's SMP response lists. The BSP
+/// then waits briefly for the launched cores to register worker slots.
+pub fn init() {
+    let entry_fn: unsafe extern "C" fn() = smp_secondary_entry;
+    let entry = entry_fn as usize as u64;
+    let mut started = 0usize;
+    for i in 1..MAX_CPUS {
         // SAFETY: `AP_STACKS[i]` is a distinct static stack region; we hand its
         // top to core `i` as the PSCI context_id (the asm stub loads it into SP).
         let stack_top = unsafe {
             let base = core::ptr::addr_of!(AP_STACKS[i]) as u64;
             base + AP_STACK_SIZE as u64
         };
-        let entry_fn: unsafe extern "C" fn() = smp_secondary_entry;
-        let entry = entry_fn as usize as u64;
         // QEMU `virt` numbers cores' MPIDR affinity 0..N, so target == index.
         let rc = psci_cpu_on(i as u64, entry, stack_top);
-        if rc != 0 {
+        if rc == 0 {
+            started += 1;
+        } else if rc == PSCI_INVALID_PARAMETERS {
+            break; // no core at this index -> we've enumerated them all
+        } else {
             crate::ktrace::log_fmt(format_args!("smp: CPU_ON core {i} failed (psci={rc})"));
+            break;
         }
     }
 
-    // Wait (bounded) for the secondaries to enable their MMU and register.
-    let want = n.saturating_sub(1);
+    // Wait (bounded) for the launched secondaries to enable their MMU and register.
     let deadline = crate::arch::now_ms() + 1000;
-    while N_WORKERS.load(Ordering::Acquire) < want && crate::arch::now_ms() < deadline {
+    while N_WORKERS.load(Ordering::Acquire) < started && crate::arch::now_ms() < deadline {
         core::hint::spin_loop();
     }
     let online = N_WORKERS.load(Ordering::Acquire) + 1;
-    crate::ktrace::log_fmt(format_args!("smp: {online}/{n} cores online (BSP + {} workers)", online - 1));
+    crate::ktrace::log_fmt(format_args!("smp: {online} cores online (BSP + {} workers, discovered via PSCI)", online - 1));
 }
 
 /// Number of cores currently participating (BSP + registered workers).

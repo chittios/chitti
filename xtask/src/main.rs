@@ -18,19 +18,21 @@ enum Arch {
 
 /// Which bundled model to build/run for, chosen via `-model <name>` (like
 /// `-arch`). Selects the kernel memory-layout feature, the GGUF file, and the
-/// aarch64 load address + guest RAM. Default is the compact 0.8B.
+/// aarch64 load address + guest RAM. Default is the 2B.
 #[derive(Clone, Copy, PartialEq)]
 enum Model {
     Qwen08B,
+    Qwen2B,
     Qwen4B,
     Qwen9B,
 }
 
 impl Model {
-    /// Cargo features that select this model's memory layout in the kernel.
+    /// Cargo features that select this model's heap-size tier in the kernel.
     fn features(self) -> &'static [&'static str] {
         match self {
             Model::Qwen08B => &[],
+            Model::Qwen2B => &["model-2b"],
             Model::Qwen4B => &["model-4b"],
             Model::Qwen9B => &["model-9b"],
         }
@@ -39,6 +41,7 @@ impl Model {
     fn gguf_rel(self) -> &'static str {
         match self {
             Model::Qwen08B => "assets/model.gguf",
+            Model::Qwen2B => "assets/model-2b.gguf",
             Model::Qwen4B => "assets/model-4b.gguf",
             Model::Qwen9B => "assets/model-9b.gguf",
         }
@@ -56,6 +59,8 @@ impl Model {
         match self {
             // 0.8B (~785 MiB) at 2 GiB + a 256 MiB heap at the top: 3 GiB is ample.
             Model::Qwen08B => "3G",
+            // ~1.2 GiB model at 2 GiB + a 512 MiB heap at the top of RAM.
+            Model::Qwen2B => "4G",
             // ~2.58 GiB model at 2 GiB + a 512 MiB heap at the top of RAM.
             Model::Qwen4B => "6G",
             Model::Qwen9B => "10G",
@@ -64,13 +69,14 @@ impl Model {
     fn label(self) -> &'static str {
         match self {
             Model::Qwen08B => "qwen3.5-0.8b",
+            Model::Qwen2B => "qwen3.5-2b",
             Model::Qwen4B => "qwen3.5-4b",
             Model::Qwen9B => "qwen3.5-9b",
         }
     }
 }
 
-/// Parse `-model <value>` (or `-model=<value>`); default the 0.8B model.
+/// Parse `-model <value>` (or `-model=<value>`); default the 2B model.
 fn parse_model(rest: &[String]) -> Result<Model, String> {
     let mut it = rest.iter();
     while let Some(a) = it.next() {
@@ -83,14 +89,15 @@ fn parse_model(rest: &[String]) -> Result<Model, String> {
         };
         if let Some(v) = val {
             return match v.as_str() {
-                "qwen3.5-0.8b" | "qwen3.5-0.8B" | "0.8b" | "0.8B" | "qwen0.8b" | "default" => Ok(Model::Qwen08B),
+                "qwen3.5-0.8b" | "qwen3.5-0.8B" | "0.8b" | "0.8B" | "qwen0.8b" => Ok(Model::Qwen08B),
+                "qwen3.5-2b" | "qwen3.5-2B" | "2b" | "2B" | "qwen2b" | "default" => Ok(Model::Qwen2B),
                 "qwen3.5-4b" | "qwen3.5-4B" | "4b" | "4B" | "qwen4b" => Ok(Model::Qwen4B),
                 "qwen3.5-9b" | "qwen3.5-9B" | "9b" | "9B" | "qwen9b" => Ok(Model::Qwen9B),
-                other => Err(format!("unknown -model '{other}' (expected qwen3.5-0.8b, qwen3.5-4b, or qwen3.5-9b)")),
+                other => Err(format!("unknown -model '{other}' (expected qwen3.5-0.8b, qwen3.5-2b, qwen3.5-4b, or qwen3.5-9b)")),
             };
         }
     }
-    Ok(Model::Qwen08B)
+    Ok(Model::Qwen2B)
 }
 
 /// Parse `-arch <value>` (or `-arch=<value>`) from the args; default x86_64.
@@ -180,7 +187,7 @@ fn main() {
 
 fn usage() -> String {
     "usage: cargo xtask <build|image|run|test|ref-check> [-arch x86_64|aarch64] \
-     [-model qwen3.5-0.8b|qwen3.5-4b|qwen3.5-9b] [--release] [--uefi]\n\
+     [-model qwen3.5-0.8b|qwen3.5-2b|qwen3.5-4b|qwen3.5-9b] [--release] [--uefi]\n\
      run flags (x86_64): --disk <2G|1500M> size the virtio-blk disk for /install; \
      --disk-only boot the installed disk via UEFI with no ISO; --fresh-disk wipe it first; \
      --no-model install without the model (fast, skips the ~800 MiB write).\n\

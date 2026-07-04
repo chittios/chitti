@@ -168,14 +168,14 @@ pub fn init() {
 pub fn init() {
     mm::init();
     sched::init();
-    // Bring up the other vCPUs. They enable their MMU, claim a worker slot, and
-    // park spinning on the matvec job pool. We bring up 4 — matching the 4
-    // *performance* cores on an Apple-Silicon host. Measured: going to 8 (adding
-    // the 4 efficiency cores) *regresses* decode (~1.9 -> ~1.2 tok/s) because
-    // `smp::matvec_*` splits rows evenly and then barriers on the slowest core,
-    // so the slow E-cores gate the whole matvec. Using more cores would require a
-    // throughput-weighted row split (not an even one) — a future kernel change.
-    arch::aarch64::smp::init(4);
+    // Bring up the other vCPUs (count discovered via PSCI, like x86 discovers APs
+    // from Limine). They enable their MMU, claim a worker slot, and park spinning
+    // on the matvec job pool. On an Apple-Silicon host we run QEMU with `-smp 4`
+    // (the 4 performance cores): measured, adding the 4 efficiency cores
+    // *regresses* decode (~1.9 -> ~1.2 tok/s) because `smp::matvec_*` splits rows
+    // evenly and then barriers on the slowest core, so the slow E-cores gate the
+    // whole matvec. Using more cores well would need a throughput-weighted split.
+    arch::aarch64::smp::init();
     // Install the EL1 exception vectors and bring up the GICv3 + generic-timer,
     // giving aarch64 the same timer-preemptive scheduling x86 gets from the
     // PIT/IDT (BSP-driven; parked secondaries keep IRQs masked, like x86's APs).

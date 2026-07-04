@@ -370,6 +370,8 @@ fn print_info(orch: &crate::agent::orchestrator::Orchestrator, chat: Option<&Cha
         "Qwen3.5-9B"
     } else if cfg!(feature = "model-4b") {
         "Qwen3.5-4B"
+    } else if cfg!(feature = "model-2b") {
+        "Qwen3.5-2B"
     } else {
         "Qwen3.5-0.8B"
     };
