@@ -149,23 +149,35 @@ pub fn is_up() -> bool {
     NET.with(|n| n.is_some())
 }
 
-/// Discover and bring up the first available NIC (link only — no address until
-/// DHCP or a static config). Tries virtio-net, then e1000, over each transport
-/// the platform exposes. No-op if none is found. Called once at boot.
+/// Discover and bring up the first available NIC, then **auto-start DHCP** so the
+/// link comes up with an address on boot — the way a desktop OS does — without
+/// the user running `/network dhcp`. Tries virtio-net, then a PCI NIC, over each
+/// transport the platform exposes. No-op if none is found. Called once at boot.
 pub fn autodetect() {
     if is_up() {
         return;
     }
+    let mut brought_up = false;
     #[cfg(target_arch = "aarch64")]
     {
         if let Some(nic) = crate::arch::aarch64::virtio_net::VirtioNetMmio::probe() {
             init(Box::new(nic), "eth0");
-            return;
+            brought_up = true;
         }
     }
     // PCI NICs (virtio-net-pci, e1000) — VBox + real Intel hardware.
-    if let Some(nic) = crate::net::pci::probe() {
-        init(nic, "eth0");
+    if !brought_up {
+        if let Some(nic) = crate::net::pci::probe() {
+            init(nic, "eth0");
+            brought_up = true;
+        }
+    }
+    // Autoconnect: kick off DHCP immediately; the shell idle loop pumps `poll`
+    // and the lease lands a moment later (or the user sets a static IP, which
+    // supersedes it).
+    if brought_up {
+        let _ = dhcp_start();
+        crate::ktrace::log("net", "autoconnect: DHCP started on eth0");
     }
 }
 

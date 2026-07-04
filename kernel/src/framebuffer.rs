@@ -1033,7 +1033,10 @@ pub fn draw_input(title: &str, prompt: &str, buf: &str, masked: bool, caret_on: 
             sc.cursor_restore();
             sc.cur_vis = false;
             MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
-            let (ix, iy, cols) = sc.modal_box(title, 3);
+            // 4 content rows: the prompt, the input field, and the OK button each
+            // occupy a row and the inter-row gaps (ch/2 + a few px) need the
+            // extra row so the button clears the bottom border.
+            let (ix, iy, cols) = sc.modal_box(title, 4);
             let ch = sc.ch();
             let cw = sc.cw();
             sc.draw_str(ix, iy, prompt, sc.theme.title_dim, sc.theme.status_bg);
