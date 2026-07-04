@@ -23,12 +23,12 @@ pub const HEAP_START: u64 = 0xffff_a000_0000_0000;
 // vocab-sized logits add several MiB more. The linked-list allocator does
 // no coalescing, so headroom also absorbs fragmentation from transient
 // caches. Backed by the frame allocator, which has gigabytes free.
-#[cfg(not(any(feature = "model-4b", feature = "model-9b")))]
+#[cfg(not(any(feature = "model-2b", feature = "model-4b", feature = "model-9b")))]
 pub const HEAP_SIZE: usize = 256 * 1024 * 1024;
-// The 4B model's per-forward state, KV/recurrent cache, and batched-prefill
-// buffers sit between the 0.8B's and the 9B's; give the heap 512 MiB (it sits
-// at 0x2_00000000, past the model).
-#[cfg(feature = "model-4b")]
+// The 2B and 4B models' per-forward state, KV/recurrent cache, and
+// batched-prefill buffers sit between the 0.8B's and the 9B's; give the heap
+// 512 MiB (placed at the top of RAM, past the model — see `mm::init`).
+#[cfg(any(feature = "model-2b", feature = "model-4b"))]
 pub const HEAP_SIZE: usize = 512 * 1024 * 1024;
 // The 9B model has 33 layers, dim 4096, ffn 12288 and a 248K vocab, so its
 // per-forward state, KV/recurrent cache, and batched-prefill buffers are far

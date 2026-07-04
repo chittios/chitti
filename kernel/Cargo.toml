@@ -37,6 +37,8 @@ refcheck = []
 model-9b = []
 # `cargo xtask build|run -model qwen3.5-4b`: the ~2.6 GiB Qwen3.5-4B (512 MiB heap).
 model-4b = []
+# `cargo xtask build|run -model qwen3.5-2b`: the ~1.2 GiB Qwen3.5-2B (512 MiB heap).
+model-2b = []
 
 # aarch64 only: build the kernel to boot via the Limine boot protocol
 # (BOOTAA64.EFI under UEFI/AAVMF) so it can boot from a disk's ESP, instead of

@@ -4,10 +4,10 @@
 
 # --- knobs (override on the command line: `make run ARCH=x86_64 MODEL=qwen3.5-9b RELEASE=1`) ---
 # ARCH:    aarch64 (native HVF on Apple Silicon) | x86_64
-# MODEL:   qwen3.5-0.8b | qwen3.5-9b | qwen3.5-4b (default)
+# MODEL:   qwen3.5-2b (default) | qwen3.5-0.8b | qwen3.5-4b | qwen3.5-9b
 # RELEASE: set to 1 for an optimized build
 ARCH    ?= aarch64
-MODEL   ?= qwen3.5-4b
+MODEL   ?= qwen3.5-2b
 RELEASE ?=
 
 # VirtualBox (the `vbox` target): which VM to (re)load the aarch64 image into,

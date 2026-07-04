@@ -17,7 +17,9 @@ const SHORTCUTS_PATH: &str = "/configs/core/shortcuts.json";
 const MODEL: &str = "qwen3.5-9b";
 #[cfg(feature = "model-4b")]
 const MODEL: &str = "qwen3.5-4b";
-#[cfg(not(any(feature = "model-4b", feature = "model-9b")))]
+#[cfg(feature = "model-2b")]
+const MODEL: &str = "qwen3.5-2b";
+#[cfg(not(any(feature = "model-2b", feature = "model-4b", feature = "model-9b")))]
 const MODEL: &str = "qwen3.5-0.8b";
 #[cfg(target_arch = "x86_64")]
 const ARCH: &str = "x86_64";

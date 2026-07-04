@@ -71,7 +71,7 @@ The underlying `cargo xtask` commands:
 | `cargo xtask image -arch <arch> [-model <m>]` | Assemble a bootable image (x86: hybrid BIOS/UEFI ISO; aarch64: a GPT disk image that boots standalone via UEFI). |
 | `cargo xtask test` | Run the in-kernel `custom_test_frameworks` suite under `qemu-system-x86_64`, headless, asserting via serial + `isa-debug-exit`. **Must stay 104/104.** |
 
-`-model qwen3.5-0.8b`, `-model qwen3.5-4b` (the default in the `Makefile`), or
+`-model qwen3.5-2b` (the default), `-model qwen3.5-0.8b`, `-model qwen3.5-4b`, or
 `-model qwen3.5-9b` selects the bundled model and its heap-size tier. The memory
 *layout* is **not** hardcoded per model: the kernel discovers RAM at boot (the
 DTB on `-kernel`, the UEFI stub's boot-info on real hardware/VirtualBox) and
