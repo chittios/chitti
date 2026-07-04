@@ -146,6 +146,7 @@ pub fn run() -> ! {
                 "datetime" | "date" => run_datetime(arg),
                 "ui" => run_ui(arg),
                 "shortcuts" | "keys" => run_shortcuts(),
+                "open" | "edit" => run_open(arg),
                 "do" => {
                     if arg.is_empty() {
                         serial_println!("usage: /do <intent>   e.g. /do remember that project is chitti");
@@ -295,6 +296,7 @@ fn print_help() {
     serial_println!("  /datetime [..]   show/set the clock: /datetime 2026-07-04 13:45 | /datetime tz +5:30");
     serial_println!("  /ui [config|reload|reset]  view/edit the UI config (/configs/core/ui.json)");
     serial_println!("  /shortcuts       list keyboard shortcuts (/configs/core/shortcuts.json)");
+    serial_println!("  /open <path>     edit a file in the vim-like editor (right pane): hjkl/i/Esc/:w/:q");
     serial_println!("  /disks           list every block device + detected filesystems (read-only)");
     serial_println!("  /ls [n | /path]  list a volume's root: n on disk 0, or a mount path (/mnt)");
     serial_println!("  /mount <d> [v] [/p]  mount disk d's volume v at /p (default /mnt)");
@@ -750,6 +752,28 @@ fn run_ui(arg: &str) {
         }
         _ => serial_println!("usage: /ui [config|reload|reset]   (edit {} via /open)", ui_config::ui_path()),
     }
+}
+
+/// `/open <path>` — edit a store file in the vim-like editor (right pane). If a
+/// config file was written, re-apply it so changes take effect immediately.
+fn run_open(arg: &str) {
+    if arg.is_empty() {
+        serial_println!("usage: /open <path>   e.g. /open {}", crate::ui_config::ui_path());
+        serial_println!("  editor: hjkl move, i insert, Esc normal, :w write, :q quit, :wq save+quit");
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        let saved = crate::editor::open(arg);
+        serial_println!("editor> closed {}", arg);
+        if saved && arg == crate::ui_config::ui_path() {
+            crate::ui_config::reload_and_apply();
+            update_status();
+            serial_println!("ui> re-applied edited config");
+        }
+    }
+    #[cfg(test)]
+    let _ = arg;
 }
 
 /// `/shortcuts` — list the configured keyboard shortcuts (`shortcuts.json`).
