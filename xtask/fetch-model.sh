@@ -3,18 +3,18 @@
 # QEMU -device loader on aarch64). Models are deliberately NOT committed
 # (see assets/.gitignore) -- they're large and freely re-fetchable.
 #
-# Usage: fetch-model.sh [qwen3.5-0.8b | qwen3.5-2b | qwen3.5-4b | qwen3.5-9b]  (default: qwen3.5-2b)
+# Usage: fetch-model.sh [qwen3.5-0.8b | qwen3.5-2b | qwen3.5-4b | qwen3.5-9b]  (default: qwen3.5-0.8b)
 #
-#   qwen3.5-0.8b -> assets/model.gguf     (Q8_0, ~812 MB) -- the compact model;
+#   qwen3.5-0.8b -> assets/model.gguf     (Q8_0, ~812 MB) -- the DEFAULT (compact) model;
 #                   the Phase 3 reference-parity gate (tools/ref.py) uses it.
-#   qwen3.5-2b   -> assets/model-2b.gguf  (Q4_0, ~1.2 GB) -- the DEFAULT model.
+#   qwen3.5-2b   -> assets/model-2b.gguf  (Q4_0, ~1.2 GB) -- a small fast model.
 #   qwen3.5-4b   -> assets/model-4b.gguf  (Q4_0, ~2.6 GB) -- mid-size model, built
 #                   with `-model qwen3.5-4b`.
 #   qwen3.5-9b   -> assets/model-9b.gguf  (Q4_0, ~5.0 GB) -- larger model, built
 #                   with `-model qwen3.5-9b` (see CLAUDE.md for the caveats).
 set -e
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-MODEL="${1:-qwen3.5-2b}"
+MODEL="${1:-qwen3.5-0.8b}"
 
 case "$MODEL" in
   qwen3.5-0.8b|0.8b)

@@ -29,13 +29,6 @@ static UEFI_HEAP_BASE: AtomicU64 = AtomicU64::new(0);
 static UEFI_MODEL_BASE: AtomicU64 = AtomicU64::new(0);
 static UEFI_MODEL_SIZE: AtomicU64 = AtomicU64::new(0);
 
-/// Minimum GiB to identity-map, regardless of RAM size. The UEFI/GOP framebuffer
-/// the kernel renders into can sit above RAM in a device window; the previous
-/// (hardcoded) big-model layout mapped 12 GiB and that reliably covered it on
-/// VirtualBox/UTM, so keep 12 as the floor. The map only ever *grows* past this
-/// (for hosts with more RAM), never shrinks, so framebuffer coverage can't
-/// regress. Mapping blocks past real RAM is harmless — they're never accessed.
-const MAP_FLOOR_GIB: u64 = 12;
 /// Conservative fallback RAM if neither a DTB nor a stub boot-info field is
 /// present (an unknown boot path): assume the `virt` base + 4 GiB. A model that
 /// needs more will fail the fit check in `mm::init` with a clear message rather
@@ -63,6 +56,13 @@ fn detect() -> RamInfo {
     if let Some((hb, hs, mb, ms)) = bootinfo_regions(super::boot::boot_x1()) {
         let ram_end = hb.saturating_add(hs).max(mb.saturating_add(ms));
         return RamInfo { ram_end, uefi_heap_base: hb, uefi_model: (mb, ms) };
+    }
+    // QEMU `-kernel`: no DTB in x0 under HVF and no stub, so read the RAM size the
+    // launcher (`xtask`) published via fw_cfg (`opt/chitti/ramsize`). RAM on the
+    // `virt` machine starts at 0x40000000.
+    // SAFETY: single-core early boot; fw_cfg MMIO + stack buffers only.
+    if let Some(bytes) = unsafe { super::ramfb::read_ram_bytes() } {
+        return RamInfo { ram_end: 0x4000_0000 + bytes, uefi_heap_base: 0, uefi_model: (0, 0) };
     }
     RamInfo { ram_end: FALLBACK_RAM_END, uefi_heap_base: 0, uefi_model: (0, 0) }
 }
@@ -94,14 +94,18 @@ fn bootinfo_regions(bi: u64) -> Option<(u64, u64, u64, u64)> {
 }
 
 /// Set up the identity map and enable the MMU + caches. Idempotent-ish; call
-/// once, early, on the boot core. The map spans `max(usable RAM, 12 GiB)` in
-/// 1-GiB blocks, so it always covers RAM (where the heap lives) and the UEFI
-/// framebuffer, on any `-m`/VM size — no per-model constant.
+/// once, early, on the boot core. The map spans **exactly the discovered RAM**
+/// (rounded up to a 1-GiB block), so it never over-maps into unbacked physical
+/// space — Apple's hypervisor asserts (`isv`) on a speculative/actual access to
+/// an unbacked *Normal* mapping, which a generous over-map would invite on a VM
+/// with less RAM. Device MMIO above RAM (framebuffer, PCIe ECAM) is mapped
+/// on demand via [`map_device_gib`]. The rounding gives up-to-1 GiB of headroom
+/// above `ram_end`, covering a framebuffer that sits just past the heap.
 pub fn init() {
     let info = detect();
-    // Map enough 1-GiB blocks to cover RAM, never fewer than the floor, capped
+    // Map exactly enough 1-GiB blocks to cover RAM (>=2: base is at 1 GiB), capped
     // at the single L1 table's 512 GiB.
-    let map_gib = info.ram_end.div_ceil(1 << 30).max(MAP_FLOOR_GIB).min(512);
+    let map_gib = info.ram_end.div_ceil(1 << 30).clamp(2, 512);
     // SAFETY: single-core boot; builds a valid identity map and programs the
     // standard EL1 translation registers. VA==PA, so stack/code/UART stay valid.
     unsafe {

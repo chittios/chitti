@@ -140,6 +140,14 @@ const UART_FR_TXFF: u32 = 1 << 5; // transmit FIFO full
 static UART_PROBING: AtomicBool = AtomicBool::new(false);
 static UART_PROBE_FAULTED: AtomicBool = AtomicBool::new(false);
 
+// Whether the console UART is a *real, verified* PL011 we may read RX from.
+// Defaults true (QEMU `virt` `-kernel` has a PL011 at the default base); set
+// authoritatively by `init_uart`. On a platform with NO PL011 (e.g. VirtualBox
+// with the serial port disabled) reading the phantom base returns garbage whose
+// "RX not empty" flag is set, which would flood the shell with spurious
+// keystrokes — so `uart_getb` returns `None` unless a PL011 is verified.
+static UART_RX_OK: AtomicBool = AtomicBool::new(true);
+
 /// True while probing a candidate UART address (read by the sync handler).
 pub fn uart_probing() -> bool {
     UART_PROBING.load(Ordering::Acquire)
@@ -227,6 +235,18 @@ pub fn init_uart() {
             crate::ktrace::log_fmt(format_args!("uart: PL011 console at {:#x}", base));
         }
     }
+    // Serial RX is the QEMU `-kernel` dev console (input on stdio). On the
+    // UEFI/stub path (boot-info present — VirtualBox, UTM, real hardware) there is
+    // no interactive serial console; input comes from USB/PS-2, and reading a
+    // flaky or absent platform UART's RX can flood the shell with garbage
+    // "keystrokes". So enable RX only on `-kernel` (no boot-info) and only for a
+    // PrimeCell-verified PL011.
+    let effective = chosen.unwrap_or(uart_base() as u64);
+    let rx_ok = boot::boot_x1() == 0 && is_pl011(effective);
+    UART_RX_OK.store(rx_ok, Ordering::Relaxed);
+    if !rx_ok {
+        crate::ktrace::log_fmt(format_args!("uart: serial RX disabled at {effective:#x} (input via USB/PS-2)"));
+    }
 }
 
 /// Write one byte to the console (blocks briefly if the TX FIFO is full).
@@ -242,6 +262,11 @@ pub fn uart_putb(byte: u8) {
 
 /// Read one byte from the console if the RX FIFO has one, else `None`.
 pub fn uart_getb() -> Option<u8> {
+    // No verified PL011 => never read RX (a phantom UART's flags/data are garbage
+    // and would flood the shell). See `UART_RX_OK`.
+    if !UART_RX_OK.load(Ordering::Relaxed) {
+        return None;
+    }
     let base = uart_base();
     // SAFETY: PL011 MMIO; only reads DR once the "RX empty" flag is clear.
     unsafe {

@@ -129,6 +129,59 @@ unsafe fn find_file(name: &[u8]) -> Option<(u16, u32)> {
     None
 }
 
+/// Read the launcher-supplied RAM size (bytes) from the `opt/chitti/ramsize`
+/// fw_cfg file, if present. Heap-free (stack buffers only) so it can run in
+/// early boot before the allocator exists, and it scans the file directory one
+/// 64-byte entry at a time to avoid a large allocation. `None` if fw_cfg has no
+/// such file (e.g. a non-QEMU platform) or the value doesn't parse.
+///
+/// # Safety
+/// Touches fw_cfg MMIO; call once during single-core boot.
+pub unsafe fn read_ram_bytes() -> Option<u64> {
+    let mut count_be: u32 = 0;
+    if !unsafe { dma((FW_CFG_FILE_DIR as u32) << 16 | CTL_SELECT | CTL_READ, 4, &mut count_be as *mut u32 as u64) } {
+        return None;
+    }
+    let count = u32::from_be(count_be) as usize;
+    if count == 0 || count > 4096 {
+        return None;
+    }
+    // Directory reads continue from the current offset; pull one 64-byte entry
+    // { u32 size; u16 select; u16 rsvd; char name[56] } at a time.
+    let mut sel: Option<(u16, u32)> = None;
+    let mut e = [0u8; 64];
+    for _ in 0..count {
+        if !unsafe { dma(CTL_READ, 64, e.as_mut_ptr() as u64) } {
+            return None;
+        }
+        let name_len = e[8..64].iter().position(|&b| b == 0).unwrap_or(56);
+        if &e[8..8 + name_len] == b"opt/chitti/ramsize" {
+            sel = Some((u16::from_be_bytes([e[4], e[5]]), u32::from_be_bytes([e[0], e[1], e[2], e[3]])));
+            break;
+        }
+    }
+    let (selector, size) = sel?;
+    if size == 0 || size > 31 {
+        return None;
+    }
+    let mut buf = [0u8; 32];
+    if !unsafe { dma((selector as u32) << 16 | CTL_SELECT | CTL_READ, size, buf.as_mut_ptr() as u64) } {
+        return None;
+    }
+    // Parse the leading decimal integer (bytes).
+    let mut v: u64 = 0;
+    let mut any = false;
+    for &b in &buf[..size as usize] {
+        if b.is_ascii_digit() {
+            v = v.saturating_mul(10) + (b - b'0') as u64;
+            any = true;
+        } else if any {
+            break;
+        }
+    }
+    any.then_some(v)
+}
+
 /// Read a whole named fw_cfg file into a buffer.
 ///
 /// # Safety
