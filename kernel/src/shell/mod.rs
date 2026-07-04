@@ -704,6 +704,14 @@ fn ui_tick() {
             LAST_STATUS_MS.store(now, Ordering::Relaxed);
             update_status();
         }
+        // Mouse: move the cursor; a click on the action-pane [x] closes it.
+        let t = crate::mouse::tick();
+        if t.moved {
+            crate::framebuffer::cursor_move(t.x, t.y);
+        }
+        if t.pressed && crate::framebuffer::hit_close(t.x, t.y) {
+            crate::framebuffer::close_action();
+        }
     }
 }
 

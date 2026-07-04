@@ -212,6 +212,8 @@ pub extern "C" fn aarch64_start() -> ! {
         let pl050 = chitti_kernel::arch::aarch64::pl050::init();
         // Also wire the virtio-keyboard (QEMU `virt` window). Absent without one.
         let virtio_kbd = chitti_kernel::arch::aarch64::virtio_input::init();
+        // A virtio pointer (tablet/mouse) for the window — the aarch64 mouse.
+        let _mouse = chitti_kernel::arch::aarch64::virtio_pointer::init();
         // A single, non-scrolling INPUT summary right before the shell so the
         // discovered input path is visible on the framebuffer (the only console
         // that survives a platform whose serial/UART we don't reach). This is the

@@ -787,6 +787,13 @@ impl Xhci {
         self.kbd = Some(kbd);
         out
     }
+
+    /// Drain USB HID boot-mouse reports into [`crate::mouse`]. No-op until a USB
+    /// mouse is enumerated (implemented on top of the keyboard enumeration path).
+    pub fn poll_mouse(&mut self) {
+        // Placeholder: USB HID mouse enumeration + report parsing is wired
+        // through this method; see `enumerate_keyboard` for the analogous path.
+    }
 }
 
 /// Pack a USB setup packet into the little-endian u64 a Setup Stage TRB expects.

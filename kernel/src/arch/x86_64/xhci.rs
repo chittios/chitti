@@ -26,6 +26,15 @@ pub fn poll_key() -> Option<u8> {
     XHCI.with(|s| s.as_mut().and_then(|x| x.poll_key()))
 }
 
+/// Drain USB HID mouse reports into `crate::mouse` (no-op if no USB mouse).
+pub fn poll_mouse() {
+    XHCI.with(|s| {
+        if let Some(x) = s.as_mut() {
+            x.poll_mouse();
+        }
+    });
+}
+
 /// `mm::alloc_dma` adapted to the core's `(phys, virt)` allocator shape.
 fn x86_alloc(bytes: usize) -> Option<(u64, usize)> {
     alloc_dma(bytes).map(|(pa, va)| (pa, va as usize))

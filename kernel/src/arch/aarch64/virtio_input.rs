@@ -131,6 +131,14 @@ impl VirtioInput {
 static DEV: Locked<Option<VirtioInput>> = Locked::new(None);
 /// A small byte ring the poll fills and `read_byte` drains.
 static RING: Locked<InputRing> = Locked::new(InputRing::new());
+/// The mmio base this keyboard claimed, so the pointer driver skips it (both are
+/// virtio-input; this is the reliable way to tell them apart). 0 = none.
+static KBD_BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The virtio-input mmio base claimed by the keyboard (0 if none).
+pub fn claimed_base() -> usize {
+    KBD_BASE.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 struct InputRing {
     buf: [u8; 64],
@@ -258,6 +266,7 @@ pub fn init() -> bool {
         dev.notify();
     }
     DEV.with(|slot| *slot = Some(dev));
+    KBD_BASE.store(base, core::sync::atomic::Ordering::Relaxed);
     crate::ktrace::log_fmt(format_args!("virtio-input: keyboard up at {base:#x} (v{version}, window keystrokes enabled)"));
     true
 }
