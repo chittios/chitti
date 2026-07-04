@@ -28,6 +28,7 @@ pub mod console;
 pub mod cortex;
 pub mod fs;
 pub mod ipc;
+pub mod json;
 pub mod ktrace;
 pub mod limine_protocol;
 pub mod mm;

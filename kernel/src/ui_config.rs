@@ -1,20 +1,276 @@
-//! UI / shortcuts configuration, persisted as JSON under `/configs/core/`
-//! (`ui.json`, `shortcuts.json`) in the Synapse store. Phase 1 provides just the
-//! status-bar text resolution + timezone persistence hook; Phase 2 fills in the
-//! full JSON schema (pane layout, statusbar templates with variables) and the
-//! `/ui` and `/shortcuts` editors.
+//! UI / shortcuts configuration, persisted as JSON under `/configs/core/` in the
+//! Synapse store (`ui.json`, `shortcuts.json`) so it is durable on an installed
+//! system and editable from the shell (`/ui`, `/shortcuts`) or the `/open`
+//! editor. The UI config drives the framebuffer layout (pane split, font scale,
+//! pane placement, titles) and the status-bar text templates; the status
+//! templates support `${var}` substitution against the clock and system info.
 
-use alloc::format;
-use alloc::string::String;
+use crate::json::Json;
+use crate::mm::Locked;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
-/// Resolve the status-bar `(left, right)` strings. Phase 1: brand + datetime;
-/// Phase 2 resolves configurable templates with `${var}` substitution.
-pub fn status_strings() -> (String, String) {
-    let left = format!("Chitti OS v{}", crate::VERSION);
-    let right = format!("{}  {}", crate::clock::format_datetime(), crate::clock::format_tz());
-    (left, right)
+const UI_PATH: &str = "/configs/core/ui.json";
+const SHORTCUTS_PATH: &str = "/configs/core/shortcuts.json";
+
+#[cfg(feature = "model-9b")]
+const MODEL: &str = "qwen3.5-9b";
+#[cfg(not(feature = "model-9b"))]
+const MODEL: &str = "qwen3.5-0.8b";
+#[cfg(target_arch = "x86_64")]
+const ARCH: &str = "x86_64";
+#[cfg(target_arch = "aarch64")]
+const ARCH: &str = "aarch64";
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const ARCH: &str = "?";
+
+/// The persisted UI configuration.
+#[derive(Clone)]
+pub struct UiConfig {
+    pub chat_pct: u64,
+    pub font_scale: u64, // 0 = auto
+    pub swap_panes: bool,
+    pub chat_title: String,
+    pub logs_title: String,
+    pub status_left: String,  // template
+    pub status_right: String, // template
+    pub tz_offset: i32,       // seconds east of UTC
 }
 
-/// Persist the timezone offset so it survives a reboot. Phase 1: no-op (the
-/// clock keeps it in memory); Phase 2 writes it into `/configs/core/ui.json`.
-pub fn persist_tz(_offset_secs: i32) {}
+impl Default for UiConfig {
+    fn default() -> Self {
+        UiConfig {
+            chat_pct: 56,
+            font_scale: 0,
+            swap_panes: false,
+            chat_title: "chat".to_string(),
+            logs_title: "ktrace".to_string(),
+            status_left: "Chitti OS v${version}".to_string(),
+            status_right: "${datetime}  ${tz}".to_string(),
+            tz_offset: 0,
+        }
+    }
+}
+
+impl UiConfig {
+    fn to_json(&self) -> Json {
+        Json::Obj(alloc::vec![
+            ("chat_pct".to_string(), Json::Num(self.chat_pct as f64)),
+            ("font_scale".to_string(), Json::Num(self.font_scale as f64)),
+            ("swap_panes".to_string(), Json::Bool(self.swap_panes)),
+            ("chat_title".to_string(), Json::Str(self.chat_title.clone())),
+            ("logs_title".to_string(), Json::Str(self.logs_title.clone())),
+            ("status_left".to_string(), Json::Str(self.status_left.clone())),
+            ("status_right".to_string(), Json::Str(self.status_right.clone())),
+            ("tz_offset".to_string(), Json::Num(self.tz_offset as f64)),
+        ])
+    }
+
+    fn from_json(j: &Json) -> UiConfig {
+        let d = UiConfig::default();
+        let s = |k: &str, def: &str| j.get(k).and_then(|v| v.as_str()).map(|x| x.to_string()).unwrap_or_else(|| def.to_string());
+        UiConfig {
+            chat_pct: j.get("chat_pct").and_then(|v| v.as_i64()).map(|n| n as u64).unwrap_or(d.chat_pct),
+            font_scale: j.get("font_scale").and_then(|v| v.as_i64()).map(|n| n as u64).unwrap_or(d.font_scale),
+            swap_panes: j.get("swap_panes").and_then(|v| v.as_bool()).unwrap_or(d.swap_panes),
+            chat_title: s("chat_title", &d.chat_title),
+            logs_title: s("logs_title", &d.logs_title),
+            status_left: s("status_left", &d.status_left),
+            status_right: s("status_right", &d.status_right),
+            tz_offset: j.get("tz_offset").and_then(|v| v.as_i64()).map(|n| n as i32).unwrap_or(d.tz_offset),
+        }
+    }
+
+    /// The framebuffer layout knobs derived from this config.
+    #[cfg(not(test))]
+    fn layout_cfg(&self) -> crate::framebuffer::LayoutCfg {
+        crate::framebuffer::LayoutCfg {
+            chat_pct: self.chat_pct,
+            scale: self.font_scale,
+            swap: self.swap_panes,
+            chat_title: self.chat_title.clone(),
+            logs_title: self.logs_title.clone(),
+        }
+    }
+}
+
+static CONFIG: Locked<Option<UiConfig>> = Locked::new(None);
+
+/// The live config (a clone), loading defaults if not yet initialized.
+pub fn current() -> UiConfig {
+    CONFIG.with(|c| c.clone()).unwrap_or_default()
+}
+
+fn store(cfg: UiConfig) {
+    CONFIG.with(|c| *c = Some(cfg));
+}
+
+/// Read `ui.json` from the store into the live config, writing defaults first if
+/// it does not exist. Also syncs the clock's timezone from the config.
+pub fn load() {
+    let cfg = match crate::synapse::fs::read(UI_PATH) {
+        Some(bytes) => core::str::from_utf8(&bytes)
+            .ok()
+            .and_then(Json::parse)
+            .map(|j| UiConfig::from_json(&j))
+            .unwrap_or_default(),
+        None => {
+            let d = UiConfig::default();
+            write_ui(&d);
+            d
+        }
+    };
+    crate::clock::set_tz(cfg.tz_offset);
+    store(cfg);
+}
+
+fn write_ui(cfg: &UiConfig) {
+    let text = cfg.to_json().to_pretty();
+    crate::synapse::fs::write(UI_PATH, text.as_bytes());
+}
+
+/// Load `ui.json`, apply it to the framebuffer layout, and ensure the shortcuts
+/// file exists. Called once at shell start.
+pub fn load_and_apply() {
+    load();
+    ensure_shortcuts();
+    #[cfg(not(test))]
+    crate::framebuffer::relayout(&current().layout_cfg());
+}
+
+/// Re-read the config from disk and re-apply the layout (`/ui reload`).
+pub fn reload_and_apply() {
+    load();
+    #[cfg(not(test))]
+    crate::framebuffer::relayout(&current().layout_cfg());
+}
+
+/// Reset the config to defaults, persist, and re-apply (`/ui reset`).
+pub fn reset() {
+    let d = UiConfig::default();
+    write_ui(&d);
+    crate::clock::set_tz(d.tz_offset);
+    store(d);
+    #[cfg(not(test))]
+    crate::framebuffer::relayout(&current().layout_cfg());
+}
+
+/// The current `ui.json` text (pretty-printed) for `/ui`.
+pub fn ui_json_text() -> String {
+    current().to_json().to_pretty()
+}
+
+/// The on-disk config file path (for `/open` / `/ui`).
+pub fn ui_path() -> &'static str {
+    UI_PATH
+}
+pub fn shortcuts_path() -> &'static str {
+    SHORTCUTS_PATH
+}
+
+/// Persist a new timezone offset into the config (called by `/datetime tz`).
+pub fn persist_tz(offset_secs: i32) {
+    let mut cfg = current();
+    cfg.tz_offset = offset_secs;
+    write_ui(&cfg);
+    store(cfg);
+}
+
+/// Resolve the status-bar `(left, right)` strings from the config templates.
+pub fn status_strings() -> (String, String) {
+    let cfg = current();
+    (resolve_template(&cfg.status_left), resolve_template(&cfg.status_right))
+}
+
+/// Substitute `${var}` tokens: brand, version, date, time, datetime, tz, model,
+/// arch, uptime. Unknown vars are left as-is.
+fn resolve_template(t: &str) -> String {
+    let mut out = String::new();
+    let bytes = t.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some(end) = t[i + 2..].find('}') {
+                let var = &t[i + 2..i + 2 + end];
+                out.push_str(&resolve_var(var));
+                i += 2 + end + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn resolve_var(var: &str) -> String {
+    match var {
+        "brand" => "Chitti OS".to_string(),
+        "version" => crate::VERSION.to_string(),
+        "date" => crate::clock::format_date(),
+        "time" => crate::clock::format_time(),
+        "datetime" => crate::clock::format_datetime(),
+        "tz" => crate::clock::format_tz(),
+        "model" => MODEL.to_string(),
+        "arch" => ARCH.to_string(),
+        "uptime" => {
+            let s = crate::arch::now_ms() / 1000;
+            alloc::format!("up {}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+        }
+        other => alloc::format!("${{{}}}", other),
+    }
+}
+
+// --- Shortcuts -----------------------------------------------------------
+
+const DEFAULT_SHORTCUTS: &[(&str, &str, &str)] = &[
+    ("Enter", "submit", "send the current line (chat message or /command)"),
+    ("Ctrl+C", "stop", "stop the model mid-generation"),
+    ("Ctrl+D", "exit", "power off on an empty line (EOF)"),
+    ("Backspace", "erase", "delete the character before the cursor"),
+    ("/open <file>", "open-editor", "open a file in the vim-like editor (right pane)"),
+    ("Esc", "editor:normal", "editor: leave insert mode"),
+    ("i / a / o", "editor:insert", "editor: insert before / after / open line below"),
+    ("h j k l", "editor:move", "editor: move left / down / up / right"),
+    ("x / dd", "editor:delete", "editor: delete char / line"),
+    (":w / :q / :wq", "editor:exwrite", "editor: write / quit / write-quit"),
+];
+
+fn ensure_shortcuts() {
+    if !crate::synapse::fs::exists(SHORTCUTS_PATH) {
+        crate::synapse::fs::write(SHORTCUTS_PATH, default_shortcuts_json().as_bytes());
+    }
+}
+
+fn default_shortcuts_json() -> String {
+    let arr: Vec<Json> = DEFAULT_SHORTCUTS
+        .iter()
+        .map(|(keys, action, desc)| {
+            Json::Obj(alloc::vec![
+                ("keys".to_string(), Json::Str(keys.to_string())),
+                ("action".to_string(), Json::Str(action.to_string())),
+                ("desc".to_string(), Json::Str(desc.to_string())),
+            ])
+        })
+        .collect();
+    Json::Arr(arr).to_pretty()
+}
+
+/// The shortcuts list as `(keys, desc)` pairs, read from `shortcuts.json` (or the
+/// built-in defaults).
+pub fn shortcuts() -> Vec<(String, String)> {
+    let text = crate::synapse::fs::read(SHORTCUTS_PATH)
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(default_shortcuts_json);
+    match Json::parse(&text).and_then(|j| j.as_array().map(|a| a.to_vec())) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|item| {
+                let keys = item.get("keys")?.as_str()?.to_string();
+                let desc = item.get("desc").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                Some((keys, desc))
+            })
+            .collect(),
+        None => DEFAULT_SHORTCUTS.iter().map(|(k, _, d)| (k.to_string(), d.to_string())).collect(),
+    }
+}
