@@ -873,25 +873,29 @@ impl Screen {
                 self.put_pixel((cx + dx) as u64, (cy + dy) as u64, arc_c);
             }
         }
-        // Round end-caps at ±55° and the synapse node at the opening.
+        // Round end-caps at ±55°.
         let (ex, ey) = (r * 574 / 1000, r * 819 / 1000); // cos55, sin55
         let cap = (r / 5).max(2);
         self.fill_disc(cx + ex, cy - ey, cap, node_c);
         self.fill_disc(cx + ex, cy + ey, cap, node_c);
-        let (nx, ny) = (cx + r * 744 / 1000, cy);
-        let nr = (r / 12).max(1);
-        self.fill_disc(nx, ny, nr, node_c);
-        // Four short stubs radiating from the node (up/down/left/right).
-        let (stub, lw, gap) = ((r / 6).max(2), (t / 6).max(1), nr + 1);
-        let put = |x: i64, y: i64, w: i64, h: i64| {
-            if x >= 0 && y >= 0 {
-                self.fill_rect(x as u64, y as u64, w as u64, h as u64, node_c);
-            }
-        };
-        put(nx - lw / 2, ny - gap - stub, lw, stub); // up
-        put(nx - lw / 2, ny + gap, lw, stub); // down
-        put(nx - gap - stub, ny - lw / 2, stub, lw); // left
-        put(nx + gap, ny - lw / 2, stub, lw); // right
+        // The synapse node + its four stubs are sub-pixel below ~16px radius
+        // (they'd render as mud), so draw them only when the mark is large enough
+        // — a status-bar glyph is just the C with its two end dots.
+        if r >= 16 {
+            let (nx, ny) = (cx + r * 744 / 1000, cy);
+            let nr = (r / 12).max(1);
+            self.fill_disc(nx, ny, nr, node_c);
+            let (stub, lw, gap) = ((r / 6).max(2), (t / 6).max(1), nr + 1);
+            let put = |x: i64, y: i64, w: i64, h: i64| {
+                if x >= 0 && y >= 0 {
+                    self.fill_rect(x as u64, y as u64, w as u64, h as u64, node_c);
+                }
+            };
+            put(nx - lw / 2, ny - gap - stub, lw, stub); // up
+            put(nx - lw / 2, ny + gap, lw, stub); // down
+            put(nx - gap - stub, ny - lw / 2, stub, lw); // left
+            put(nx + gap, ny - lw / 2, stub, lw); // right
+        }
     }
 
     /// Paint the boot splash: the brand mark, "CHITTI OS", and a tagline, centred
