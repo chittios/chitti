@@ -18,7 +18,7 @@ enum Arch {
 
 /// Which bundled model to build/run for, chosen via `-model <name>` (like
 /// `-arch`). Selects the kernel memory-layout feature, the GGUF file, and the
-/// aarch64 load address + guest RAM. Default is the 2B.
+/// aarch64 load address + guest RAM. Default is the 0.8B.
 #[derive(Clone, Copy, PartialEq)]
 enum Model {
     Qwen08B,
@@ -76,7 +76,20 @@ impl Model {
     }
 }
 
-/// Parse `-model <value>` (or `-model=<value>`); default the 2B model.
+/// Convert a QEMU `-m` size string (`"3G"`, `"512M"`, or a raw byte count) to
+/// bytes, for the `opt/chitti/ramsize` fw_cfg the kernel reads.
+fn mem_bytes(m: &str) -> u64 {
+    let m = m.trim();
+    let (num, mult) = match m.chars().last() {
+        Some('G') | Some('g') => (&m[..m.len() - 1], 1u64 << 30),
+        Some('M') | Some('m') => (&m[..m.len() - 1], 1u64 << 20),
+        Some('K') | Some('k') => (&m[..m.len() - 1], 1u64 << 10),
+        _ => (m, 1),
+    };
+    num.parse::<u64>().unwrap_or(4).saturating_mul(mult)
+}
+
+/// Parse `-model <value>` (or `-model=<value>`); default the 0.8B model.
 fn parse_model(rest: &[String]) -> Result<Model, String> {
     let mut it = rest.iter();
     while let Some(a) = it.next() {
@@ -89,15 +102,15 @@ fn parse_model(rest: &[String]) -> Result<Model, String> {
         };
         if let Some(v) = val {
             return match v.as_str() {
-                "qwen3.5-0.8b" | "qwen3.5-0.8B" | "0.8b" | "0.8B" | "qwen0.8b" => Ok(Model::Qwen08B),
-                "qwen3.5-2b" | "qwen3.5-2B" | "2b" | "2B" | "qwen2b" | "default" => Ok(Model::Qwen2B),
+                "qwen3.5-0.8b" | "qwen3.5-0.8B" | "0.8b" | "0.8B" | "qwen0.8b" | "default" => Ok(Model::Qwen08B),
+                "qwen3.5-2b" | "qwen3.5-2B" | "2b" | "2B" | "qwen2b" => Ok(Model::Qwen2B),
                 "qwen3.5-4b" | "qwen3.5-4B" | "4b" | "4B" | "qwen4b" => Ok(Model::Qwen4B),
                 "qwen3.5-9b" | "qwen3.5-9B" | "9b" | "9B" | "qwen9b" => Ok(Model::Qwen9B),
                 other => Err(format!("unknown -model '{other}' (expected qwen3.5-0.8b, qwen3.5-2b, qwen3.5-4b, or qwen3.5-9b)")),
             };
         }
     }
-    Ok(Model::Qwen2B)
+    Ok(Model::Qwen08B)
 }
 
 /// Parse `-arch <value>` (or `-arch=<value>`) from the args; default x86_64.
@@ -441,6 +454,10 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
     for a in ramfb_res_fw_cfg() {
         qemu.arg(a);
     }
+    // Publish the guest RAM size so the kernel places its heap at the top of RAM.
+    // On the `-kernel` HVF path QEMU passes no DTB (x0=0), so this fw_cfg file is
+    // how the kernel learns how much RAM it has (see `mmu::detect`).
+    qemu.arg("-fw_cfg").arg(format!("name=opt/chitti/ramsize,string={}", mem_bytes(model.qemu_mem())));
     // Attach a virtio-blk disk on the virtio-mmio bus (the aarch64 block driver
     // scans that window) so /disks, /mkext4, /install, and synapse persistence
     // work — the aarch64 counterpart to the x86 virtio-blk-pci drive.

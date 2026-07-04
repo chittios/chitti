@@ -310,9 +310,20 @@ fn bootinfo_framebuffer() -> Option<(usize, u64, u64, u64, u64, u32, u32, u32)> 
     let page = unsafe { core::slice::from_raw_parts(bi as *const u8, 52) };
     let f = |o: usize| u64::from_le_bytes(page[o..o + 8].try_into().unwrap());
     let (addr, w, h, pitch) = (f(8), f(16), f(24), f(32));
-    if addr == 0 || addr + h * pitch > map_limit {
-        serial_println!("Chitti: boot-info framebuffer at {:#x} outside the identity map -- skipping", addr);
+    if addr == 0 {
         return None;
+    }
+    // The RAM identity map is sized to RAM only (no unbacked over-map — see
+    // mmu::init). A framebuffer that lives in a device window above RAM won't be
+    // covered, so map its GiB block(s) as Device on demand rather than skipping.
+    let fb_end = addr + h * pitch;
+    if fb_end > map_limit {
+        let mut a = addr & !((1u64 << 30) - 1);
+        while a < fb_end {
+            chitti_kernel::arch::aarch64::mmu::map_device_gib(a);
+            a += 1 << 30;
+        }
+        serial_println!("Chitti: boot-info framebuffer at {:#x} above RAM map -- mapped its window (Device)", addr);
     }
     // Pixel format at 48..52. An older stub that left these zero (all shifts 0,
     // bpp 0) is treated as the common XRGB8888 default.
