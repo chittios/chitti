@@ -97,7 +97,13 @@ real UEFI hardware.
   `/`-command shell, and an on-disk UI config (`/configs/core/ui.json`,
   `shortcuts.json`). The brand — logo, the terracotta `#cc785c` / warm-ink /
   cream palette (fully re-themable from `ui.json`), and typography — is specified
-  in [DESIGN.md](DESIGN.md); honour it for any UI change.
+  in [DESIGN.md](DESIGN.md); honour it for any UI change. NB: the scheduler is
+  cooperative, so **any long or blocking operation must pump the UI itself** —
+  call `shell::ui_tick()` (caret blink + status/datetime + mouse cursor) and
+  `net::poll()` inside its loop, exactly as the per-token inference loops in
+  `Chat::turn` do. A tight compute loop that never yields freezes the clock,
+  mouse, and net stack until it returns. Any new UI surface or blocking command
+  must keep this upkeep running.
 - **Storage** — virtio/NVMe/AHCI block devices, GPT/MBR/FAT/ext4 detection,
   ext4/FAT/SimpleFS, `/install` (self-hosting install to a disk), durable agent
   state on ext4.
