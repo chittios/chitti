@@ -1128,6 +1128,7 @@ fn disk_install(arg: &str) {
 #[cfg(target_arch = "aarch64")]
 fn disk_install(arg: &str) {
     use crate::block::{ext4::Ext4Writer, fat::FatWriter, fat_read::FatReader, gpt, BlockDevice, Partition};
+    use crate::fs::detect::FsType;
     let (confirm, target_override) = parse_install_args(arg);
     if !confirm {
         serial_println!("install> DESTRUCTIVE: repartitions the target disk into a GPT with a FAT ESP");
@@ -1137,20 +1138,27 @@ fn disk_install(arg: &str) {
         serial_println!("install>        first disk that isn't the boot ESP)");
         return;
     }
-    // Identify the boot ESP (payload source) among the attached block devices:
-    // the ESP is the FAT volume containing `chitti-kernel`. It's never a valid
-    // install target (we'd overwrite the payload we're reading).
-    let mut esp_idx = None;
-    for i in 0..16 {
+    // Identify the boot ESP (payload source): the FAT volume containing
+    // `chitti-kernel`. Scan every disk's *volumes* (via the FS detector), so it
+    // is found whether the ESP is a bare FAT disk (fresh `--uefi` boot) OR a GPT
+    // partition (an already-installed disk — the common case). Its disk is never
+    // a valid install target (we'd overwrite the payload we're reading).
+    let mut esp: Option<(usize, u64, u64)> = None; // (disk, start_lba, sectors)
+    'scan: for i in 0..16 {
         let Some(mut dev) = crate::block::probe_disk_nth(i) else { break };
-        if let Some(mut r) = FatReader::open(&mut dev) {
-            if r.exists("chitti-kernel") {
-                esp_idx = Some(i);
-                break;
+        for v in crate::fs::detect::probe(&mut dev) {
+            if matches!(v.fs, FsType::Fat16 | FsType::Fat32) {
+                let mut part = Partition::new(&mut dev, v.start_lba, v.sectors);
+                if let Some(mut r) = FatReader::open(&mut part) {
+                    if r.exists("chitti-kernel") {
+                        esp = Some((i, v.start_lba, v.sectors));
+                        break 'scan;
+                    }
+                }
             }
         }
     }
-    let Some(esp_idx) = esp_idx else {
+    let Some((esp_idx, esp_lba, esp_sectors)) = esp else {
         serial_println!("install> no boot ESP found (a FAT volume with /chitti-kernel) -- boot via `--uefi` to install");
         return;
     };
@@ -1160,22 +1168,24 @@ fn disk_install(arg: &str) {
         None => (0..16).find(|&i| i != esp_idx && crate::block::probe_disk_nth(i).is_some()).unwrap_or(esp_idx),
     };
     if target_idx == esp_idx {
-        serial_println!("install> disk {} is the boot ESP -- cannot install onto it (pick another; see /disks)", target_idx);
+        serial_println!("install> disk {} holds the boot ESP -- cannot install onto it (pick another; see /disks)", target_idx);
         return;
     }
     let Some(mut target) = crate::block::probe_disk_nth(target_idx) else {
         serial_println!("install> no disk {} (see /disks)", target_idx);
         return;
     };
-    serial_println!("install> target disk {} (boot ESP is disk {})", target_idx, esp_idx);
+    serial_println!("install> target disk {} (boot ESP is on disk {}, lba {})", target_idx, esp_idx, esp_lba);
 
-    // Read the stub + kernel off the boot ESP. The model is NOT re-read from
-    // FAT (it would not fit the 256 MiB heap): the stub already loaded it into
-    // RAM at the fixed model address, so `cortex::model_module()` hands us the
-    // exact bytes as a zero-copy slice.
+    // Read the stub + kernel off the boot ESP partition. The model is NOT re-read
+    // from FAT (it would not fit the 256 MiB heap): the stub already loaded it
+    // into RAM at the fixed model address, so `cortex::model_module()` hands us
+    // the exact bytes. (Reading the ESP disk + writing the target disk at the
+    // same time is safe now that the NVMe controller is shared.)
     let Some(mut src_dev) = crate::block::probe_disk_nth(esp_idx) else { return };
+    let mut esp_part = Partition::new(&mut src_dev, esp_lba, esp_sectors);
     let (stub, kernel, model_size) = {
-        let Some(mut r) = FatReader::open(&mut src_dev) else {
+        let Some(mut r) = FatReader::open(&mut esp_part) else {
             serial_println!("install> boot ESP unreadable");
             return;
         };
