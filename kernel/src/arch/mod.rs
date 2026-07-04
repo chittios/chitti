@@ -57,6 +57,7 @@ pub fn rtc_unix() -> Option<u64> {
 #[cfg(target_arch = "aarch64")]
 pub fn mouse_poll() {
     aarch64::virtio_pointer::poll();
+    aarch64::pl050_mouse::poll();
     aarch64::xhci::poll_mouse();
 }
 

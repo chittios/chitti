@@ -38,6 +38,12 @@ const CANDIDATE_BASES: [u64; 2] = [
 
 /// The located PL050 base, or 0 if none present. Set once by [`init`].
 static BASE: Locked<u64> = Locked::new(0);
+
+/// The PL050 base the keyboard claimed (0 if none), so the mouse KMI driver
+/// skips it when scanning.
+pub fn keyboard_base() -> u64 {
+    BASE.with(|b| *b)
+}
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 static CAPS_ON: AtomicBool = AtomicBool::new(false);
 /// Set 2 sends a byte's *break* code as `0xF0 <code>`; this holds across polls.
