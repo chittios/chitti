@@ -149,17 +149,40 @@ fn spin_delay(iters: u64) {
     let _ = sink;
 }
 
+// MMIO accessors. On aarch64 these are single-instruction register-offset
+// loads/stores via inline asm — the same guarantee Linux's readl()/writel()
+// make. `read_volatile` lets LLVM pick the addressing mode, and in a loop it
+// can emit a post-indexed `ldr` (writeback); an MMIO fault from a writeback
+// access has no instruction syndrome (ESR.ISV=0), which a hypervisor cannot
+// emulate — QEMU/HVF aborts with "Assertion failed: (isv)". Plain `[reg]`
+// addressing always faults with ISV=1.
 unsafe fn r32(addr: usize) -> u32 {
-    unsafe { read_volatile(addr as *const u32) }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let v: u32;
+        core::arch::asm!("ldr {v:w}, [{a}]", v = out(reg) v, a = in(reg) addr, options(nostack, preserves_flags));
+        v
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    unsafe {
+        read_volatile(addr as *const u32)
+    }
 }
 unsafe fn w32(addr: usize, v: u32) {
-    unsafe { write_volatile(addr as *mut u32, v) };
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("str {v:w}, [{a}]", v = in(reg) v, a = in(reg) addr, options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    unsafe {
+        write_volatile(addr as *mut u32, v)
+    };
 }
 unsafe fn w64(addr: usize, v: u64) {
     // xHCI 64-bit registers: write low then high dword.
     unsafe {
-        write_volatile(addr as *mut u32, v as u32);
-        write_volatile((addr + 4) as *mut u32, (v >> 32) as u32);
+        w32(addr, v as u32);
+        w32(addr + 4, (v >> 32) as u32);
     }
 }
 
@@ -416,15 +439,36 @@ impl Xhci {
     /// read its descriptors, set the config + boot protocol, and arm the
     /// interrupt IN endpoint.
     pub fn enumerate_keyboard(&mut self) -> bool {
-        // SAFETY: single-threaded boot; all DMA regions are freshly allocated.
-        unsafe {
-            let Some(kbd) = self.try_enumerate() else {
-                crate::ktrace::log("xhci", "no HID keyboard enumerated");
-                return false;
-            };
-            self.kbd = Some(kbd);
+        // Fast path out: nothing connected on any port -> no retries, no delays
+        // (keeps a keyboard-less boot quick, esp. under TCG).
+        let any_port = (1..=self.max_ports).any(|p| unsafe { r32(self.portsc(p)) } & PORTSC_CCS != 0);
+        if !any_port {
+            crate::ktrace::log("xhci", "no USB device connected");
+            return false;
         }
-        true
+        // A device is present: enumerate with RETRIES. VirtualBox resets the
+        // attached VUSB device *asynchronously* after our controller reset
+        // (~20 ms; its VBox.log shows "power off ignored, the device is
+        // resetting!"), and a control transfer submitted in that window is
+        // rejected inside VBox with the TD silently dropped -- no event, no
+        // error. QEMU's resets are instantaneous, so it never needs this. A
+        // settle + fresh attempt (new slot, fresh port reset) succeeds once the
+        // device-level reset has finished.
+        for attempt in 0..3 {
+            if attempt > 0 {
+                spin_delay(100_000_000); // let an async device reset finish
+                crate::ktrace::log_fmt(format_args!("xhci: retrying enumeration (attempt {})", attempt + 1));
+            }
+            // SAFETY: single-threaded boot; all DMA regions are freshly allocated.
+            unsafe {
+                if let Some(kbd) = self.try_enumerate() {
+                    self.kbd = Some(kbd);
+                    return true;
+                }
+            }
+        }
+        crate::ktrace::log("xhci", "no HID keyboard enumerated");
+        false
     }
 
     /// Whether a HID keyboard was enumerated (for the boot diagnostic).
@@ -447,12 +491,19 @@ impl Xhci {
         let psc = self.portsc(port);
         unsafe {
             // Reset the port (USB2/FullSpeed needs it; preserve RW1C status bits).
-            let v = r32(psc) & !PORTSC_RW1CS;
+            let before = r32(psc);
+            crate::ktrace::log_fmt(format_args!("xhci: resetting port {port} (portsc={before:#x})"));
+            let v = before & !PORTSC_RW1CS;
             w32(psc, v | PORTSC_PR);
-            let mut spins = 0;
+            // Wait for the port to come back enabled. Each read is an MMIO trap
+            // (slow under a hypervisor), so the bound is in reads, not time:
+            // ~2M reads is seconds of real time, far beyond a real port reset
+            // (~10 ms on VirtualBox; instant on QEMU).
+            let mut spins = 0u64;
             while r32(psc) & PORTSC_PED == 0 {
                 spins += 1;
-                if spins > 5_000_000 {
+                if spins > 2_000_000 {
+                    crate::ktrace::log_fmt(format_args!("xhci: port {port} did not re-enable after reset (portsc={:#x})", r32(psc)));
                     return None;
                 }
             }
