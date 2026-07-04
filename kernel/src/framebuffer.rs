@@ -85,10 +85,30 @@ struct Pane {
     // Cursor, cells.
     col: u64,
     row: u64,
+    // `fg` is the *current* text colour (mutated by ANSI SGR codes in the byte
+    // stream); `default_fg` is what a reset (`\x1b[0m`/`\x1b[39m`) restores.
     fg: Rgb,
+    default_fg: Rgb,
     bg: Rgb,
+    // ANSI escape-sequence parser state (see `pane_putc`).
+    esc: EscState,
+    csi: [u8; 32],
+    csi_len: usize,
+    bold: bool,
     title: String,
     show_caret: bool,
+}
+
+/// Minimal ANSI escape-sequence parser state for a pane's byte stream: we
+/// recognise `ESC [ … <final>` (CSI) and honour SGR (`… m`) colour/emphasis so
+/// the shell agent can format replies with [ANSI codes]. Other CSI sequences
+/// (cursor moves, erase) are consumed and ignored — enough to render coloured
+/// text without a full terminal emulator.
+#[derive(Clone, Copy, PartialEq)]
+enum EscState {
+    Ground,
+    Esc,
+    Csi,
 }
 
 impl Pane {
@@ -116,7 +136,12 @@ impl Pane {
             col: 0,
             row: 0,
             fg,
+            default_fg: fg,
             bg,
+            esc: EscState::Ground,
+            csi: [0; 32],
+            csi_len: 0,
+            bold: false,
             title,
             show_caret,
         }
@@ -126,6 +151,104 @@ impl Pane {
     }
     fn cell_y(&self) -> u64 {
         self.iy + self.row * self.ch
+    }
+
+    /// Apply the buffered CSI `… m` (SGR) parameters to this pane's colour state.
+    /// Supports reset (0), bold (1/22), default fg (39), the 8 normal (30–37) and
+    /// bright (90–97) foreground colours, and 24-bit / 256-colour `38;2;r;g;b` /
+    /// `38;5;n`. Background and other attributes are ignored.
+    fn apply_sgr(&mut self) {
+        // Parse the `;`-separated numeric params (empty => 0).
+        let mut params = [0i32; 16];
+        let mut np = 0usize;
+        let (mut cur, mut has) = (0i32, false);
+        for &b in &self.csi[..self.csi_len] {
+            if b == b';' {
+                if np < params.len() {
+                    params[np] = cur;
+                    np += 1;
+                }
+                cur = 0;
+                has = false;
+            } else if b.is_ascii_digit() {
+                cur = cur.saturating_mul(10) + (b - b'0') as i32;
+                has = true;
+            }
+        }
+        if np < params.len() {
+            params[np] = cur;
+            np += 1;
+        }
+        let _ = has;
+        let mut i = 0;
+        while i < np {
+            match params[i] {
+                0 => {
+                    self.fg = self.default_fg;
+                    self.bold = false;
+                }
+                1 => self.bold = true,
+                22 => self.bold = false,
+                39 => self.fg = self.default_fg,
+                30..=37 => self.fg = ansi_color((params[i] - 30) as usize, self.bold),
+                90..=97 => self.fg = ansi_color((params[i] - 90) as usize, true),
+                38 => {
+                    if i + 4 < np && params[i + 1] == 2 {
+                        self.fg = (params[i + 2] as u8, params[i + 3] as u8, params[i + 4] as u8);
+                        i += 4;
+                    } else if i + 2 < np && params[i + 1] == 5 {
+                        self.fg = ansi_256(params[i + 2] as u8);
+                        i += 2;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+}
+
+/// The 8 ANSI foreground colours (and their bright variants), tuned to read well
+/// on the dark pane background.
+fn ansi_color(idx: usize, bright: bool) -> Rgb {
+    const NORMAL: [Rgb; 8] = [
+        (98, 104, 118),  // "black" -> dim gray (pure black is invisible here)
+        (255, 106, 110), // red
+        (126, 214, 150), // green
+        (240, 200, 120), // yellow
+        (94, 161, 255),  // blue (the accent)
+        (200, 140, 255), // magenta
+        (110, 214, 224), // cyan
+        (232, 233, 238), // white (the default fg)
+    ];
+    const BRIGHT: [Rgb; 8] = [
+        (140, 148, 162),
+        (255, 140, 150),
+        (170, 240, 190),
+        (255, 224, 150),
+        (150, 190, 255),
+        (220, 170, 255),
+        (150, 235, 245),
+        (255, 255, 255),
+    ];
+    (if bright { &BRIGHT } else { &NORMAL })[idx & 7]
+}
+
+/// Map an ANSI 256-colour index to RGB: 0–15 the base/bright palette, 16–231 the
+/// 6×6×6 colour cube, 232–255 the 24-step grayscale ramp.
+fn ansi_256(n: u8) -> Rgb {
+    match n {
+        0..=7 => ansi_color(n as usize, false),
+        8..=15 => ansi_color((n - 8) as usize, true),
+        16..=231 => {
+            let c = n - 16;
+            let steps = [0u8, 95, 135, 175, 215, 255];
+            (steps[(c / 36) as usize], steps[((c / 6) % 6) as usize], steps[(c % 6) as usize])
+        }
+        _ => {
+            let v = 8 + (n - 232) * 10;
+            (v, v, v)
+        }
     }
 }
 
@@ -495,8 +618,40 @@ impl Screen {
         }
     }
 
-    /// Feed one byte to a pane (the per-pane analogue of a terminal write).
+    /// Feed one byte to a pane (the per-pane analogue of a terminal write),
+    /// running the ANSI escape parser first so `\x1b[…m` SGR codes recolour the
+    /// stream instead of printing as garbage.
     fn pane_putc(s: &Screen, p: &mut Pane, byte: u8) {
+        match p.esc {
+            EscState::Esc => {
+                // Only CSI (`ESC [`) is supported; anything else ends the escape.
+                p.esc = if byte == b'[' {
+                    p.csi_len = 0;
+                    EscState::Csi
+                } else {
+                    EscState::Ground
+                };
+                return;
+            }
+            EscState::Csi => {
+                if (0x40..=0x7e).contains(&byte) {
+                    // Final byte: apply SGR (`m`); ignore other CSI (cursor/erase).
+                    if byte == b'm' {
+                        p.apply_sgr();
+                    }
+                    p.esc = EscState::Ground;
+                } else if p.csi_len < p.csi.len() {
+                    p.csi[p.csi_len] = byte;
+                    p.csi_len += 1;
+                }
+                return;
+            }
+            EscState::Ground => {}
+        }
+        if byte == 0x1b {
+            p.esc = EscState::Esc;
+            return;
+        }
         s.caret_erase(p);
         match byte {
             b'\n' => Screen::newline(p, s),
@@ -819,7 +974,9 @@ pub fn log_print(s: &str) {
 fn dummy_pane() -> Pane {
     Pane {
         x: 0, y: 0, w: 0, h: 0, ix: 0, iy: 0, cw: 1, ch: 1, cols: 1, rows: 1, col: 0, row: 0,
-        fg: SCREEN_BG, bg: SCREEN_BG, title: String::new(), show_caret: false,
+        fg: SCREEN_BG, default_fg: SCREEN_BG, bg: SCREEN_BG,
+        esc: EscState::Ground, csi: [0; 32], csi_len: 0, bold: false,
+        title: String::new(), show_caret: false,
     }
 }
 
