@@ -571,26 +571,32 @@ pub const MODEL_LOAD_ADDR: usize = 0x8000_0000;
 /// the actual file; the window just needs to cover it.
 #[cfg(all(not(target_arch = "x86_64"), not(feature = "boot-limine")))]
 pub fn model_module() -> Option<&'static [u8]> {
-    // SAFETY: `MODEL_LOAD_ADDR` is identity-mapped normal RAM (arch::aarch64::mmu);
-    // reading 4 bytes to check the magic is always in bounds.
-    let magic = unsafe { core::slice::from_raw_parts(MODEL_LOAD_ADDR as *const u8, 4) };
+    // On UEFI the stub loaded the model at a firmware-chosen address and reported
+    // (base, size); use that exact span. On `-kernel` the model is at the fixed
+    // MODEL_LOAD_ADDR and the window runs up to the heap (top of RAM).
+    let (addr, window) = match crate::arch::aarch64::mmu::uefi_model() {
+        Some((base, size)) => (base, size),
+        None => {
+            let heap_base = crate::mm::heap_base();
+            let window = heap_base.saturating_sub(MODEL_LOAD_ADDR);
+            if window == 0 {
+                crate::ktrace::log_fmt(format_args!(
+                    "cortex: model present at {MODEL_LOAD_ADDR:#x} but no room below the heap at {heap_base:#x} -- not enough RAM"
+                ));
+                return None;
+            }
+            (MODEL_LOAD_ADDR, window)
+        }
+    };
+    // SAFETY: `addr` is identity-mapped normal RAM (arch::aarch64::mmu); reading
+    // 4 bytes to check the GGUF magic is in bounds.
+    let magic = unsafe { core::slice::from_raw_parts(addr as *const u8, 4) };
     if magic != b"GGUF" {
         return None;
     }
-    // The model region is everything from the load address up to the heap base
-    // (the heap sits at the top of RAM). If the heap isn't up yet, fall back to
-    // the mapped span.
-    let heap_base = crate::mm::heap_base();
-    let window = heap_base.saturating_sub(MODEL_LOAD_ADDR);
-    if window == 0 {
-        crate::ktrace::log_fmt(format_args!(
-            "cortex: model present at {MODEL_LOAD_ADDR:#x} but no room below the heap at {heap_base:#x} -- not enough RAM"
-        ));
-        return None;
-    }
-    // SAFETY: the region [MODEL_LOAD_ADDR, MODEL_LOAD_ADDR + window) is mapped RAM
-    // below the heap; the GGUF parser reads only the real model within it.
-    Some(unsafe { core::slice::from_raw_parts(MODEL_LOAD_ADDR as *const u8, window) })
+    // SAFETY: [addr, addr + window) is mapped RAM holding the model; the GGUF
+    // parser reads only the real model within it.
+    Some(unsafe { core::slice::from_raw_parts(addr as *const u8, window) })
 }
 
 /// aarch64 booted via Limine (UEFI/AAVMF): the model is a Limine boot module,
