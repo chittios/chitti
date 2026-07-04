@@ -124,6 +124,21 @@ const PORTSC_PR: u32 = 1 << 4; // port reset
 // RW1C/RW1CS bits to preserve (write 0) when doing a read-modify-write.
 const PORTSC_RW1CS: u32 = PORTSC_PED | (0x7f << 17);
 
+/// Full barrier between CPU writes to (cacheable) DMA memory and the following
+/// device MMIO write. On aarch64 a `dsb sy` orders the Normal-memory TRB writes
+/// ahead of the Device-memory doorbell (a `dmb ish` would not order across the
+/// Normal/Device boundary); on x86 a `SeqCst` fence suffices.
+#[inline]
+fn dma_barrier() {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `dsb sy` is a barrier with no memory-safety implications.
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 /// Crude busy-wait (~`iters` volatile reads); used for the USB reset-recovery
 /// settle where we have no timer in the arch-neutral core. Order of a few ms.
 fn spin_delay(iters: u64) {
@@ -264,7 +279,11 @@ impl Xhci {
     }
 
     /// Ring a doorbell (slot 0 = command ring; slot N, target = endpoint DCI).
+    /// A full DMA barrier first ensures the TRBs we just wrote to (cacheable)
+    /// memory are globally visible before the controller sees the doorbell —
+    /// required on real hardware / VirtualBox (QEMU's coherent emulation hid it).
     unsafe fn doorbell(&self, slot: u8, target: u32) {
+        dma_barrier();
         unsafe { w32(self.db + slot as usize * 4, target) };
     }
 
@@ -512,6 +531,18 @@ impl Xhci {
         let got_dev = unsafe {
             self.control(slot, ep0_va, ep0_pa, &mut ep0_enq, &mut ep0_cycle, setup(0x80, 6, 0x0100, 0, 8), buf_pa, 8, true)
         };
+        if !got_dev {
+            // Diagnostic: did the controller consume the EP0 TRBs? Read the EP0
+            // TR-dequeue pointer back from the output device context — if it
+            // advanced past the ring base, the transfer executed but the event
+            // was lost; if not, the controller never processed the doorbell.
+            // Plus USBSTS (HSE = a DMA/host error reading the ring).
+            unsafe {
+                let deq = read_volatile((dev_ctx_va + self.ctx_size + 8) as *const u64);
+                let usbsts = r32(self.op + OP_USBSTS);
+                crate::ktrace::log_fmt(format_args!("xhci: EP0 stuck: tr_deq={:#x} ring_base={:#x} usbsts={:#x}", deq, ep0_pa, usbsts));
+            }
+        }
         if got_dev {
             let b = unsafe { read_volatile((buf_va + 7) as *const u8) } as u32;
             // full/low (speed 1/2): bMaxPacketSize0 is the byte count (8/16/32/64).
