@@ -3,13 +3,18 @@
 //! when not using virtio). Polled admin + one I/O queue pair; read/write via
 //! PRP lists; presented behind the shared [`BlockDevice`] API.
 //!
-//! This module is the *logic*; device discovery is per-arch (each arch finds
-//! the NVMe function on its PCI bus, maps BAR0, and hands the mapped MMIO base
-//! + a [`DmaAlloc`] to [`Nvme::bringup`]). x86 (`arch::x86_64::nvme`) and
-//! aarch64 (`arch::aarch64::nvme`) are thin wrappers over this one core — the
-//! same one-driver-both-arches structure as the `xhci` core.
+//! A controller can expose several **namespaces** (VirtualBox presents each
+//! attached disk as NSID 1, 2, …). The controller is brought up **once** into a
+//! global ([`CONTROLLER`]); each namespace is a lightweight [`NvmeNamespace`]
+//! handle that routes its I/O through the shared controller under a lock, so
+//! multiple namespaces coexist and are usable simultaneously (no per-disk
+//! controller re-reset). Device discovery is per-arch (each arch finds the NVMe
+//! function on its PCI bus, maps BAR0, and hands the mapped MMIO base + a
+//! [`DmaAlloc`] to [`probe_namespace`]) — the same one-driver-both-arches shape
+//! as the `xhci` core.
 
 use crate::block::{BlockDevice, BlockError, Dma, DmaAlloc, BLOCK_SIZE};
+use crate::mm::Locked;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 
@@ -35,6 +40,11 @@ pub const MMIO_SPAN: usize = 0x2000;
 
 const DATA_MAX: usize = 64 * 1024;
 
+/// The single, shared NVMe controller — brought up once, then every namespace's
+/// I/O routes through it (serialized by this lock; the driver is polled, one
+/// request at a time).
+pub static CONTROLLER: Locked<Option<NvmeController>> = Locked::new(None);
+
 /// Ring a submission (is_cq=false) tail / completion (is_cq=true) head doorbell.
 unsafe fn ring_doorbell(regs: u64, dstrd: u32, qid: u32, is_cq: bool, val: u32) {
     let idx = 2 * qid + if is_cq { 1 } else { 0 };
@@ -51,15 +61,11 @@ unsafe fn w64(a: u64, v: u64) {
     unsafe { write_volatile(a as *mut u64, v) };
 }
 
-/// A polled NVMe controller + its single I/O queue pair. Buffers are [`Dma`]
-/// pairs: the CPU fills queue entries via `.virt`, the device is programmed
-/// with `.phys`.
-pub struct Nvme {
+/// A polled NVMe controller + its single admin + I/O queue pair. Owns the DMA
+/// rings + a shared bounce buffer; namespace I/O is serialized through it.
+pub struct NvmeController {
     regs: u64,  // mapped BAR0 (virtual)
     dstrd: u32, // doorbell stride (bytes) = 4 << CAP.DSTRD
-    nsid: u32,  // the namespace this instance drives (1-based)
-    capacity: u64,
-    lba_bytes: u32,
     // Admin queue.
     asq: Dma,
     acq: Dma,
@@ -74,21 +80,17 @@ pub struct Nvme {
     io_phase: u32,
     cid: u16,
     prp_list: Dma, // one page for PRP lists on multi-page transfers
-    data_buf: Dma, // 64 KiB bounce buffer
+    data_buf: Dma, // 64 KiB bounce buffer (also used for Identify)
 }
 
-impl Nvme {
-    /// Bring up the controller at the already-mapped MMIO base `regs` and attach
-    /// to namespace `nsid` (1-based), using `alloc` for all DMA memory. `None` if
-    /// the controller never readies, the namespace doesn't exist (NSZE == 0), or
-    /// it has an unusable LBA size. A controller can expose several namespaces
-    /// (e.g. VirtualBox presents each attached disk as NSID 1, 2, …); the
-    /// per-arch `probe_nth(n)` calls this with `nsid = n + 1`.
+impl NvmeController {
+    /// Reset the controller and set up the admin + one I/O queue pair. Does NOT
+    /// touch any namespace. `None` if the controller never becomes ready.
     ///
     /// # Safety
-    /// `regs` must be a valid, mapped NVMe BAR0 (at least [`MMIO_SPAN`] bytes),
-    /// and `alloc` must return real physically-contiguous DMA memory.
-    pub unsafe fn bringup(regs: u64, alloc: DmaAlloc, nsid: u32) -> Option<Nvme> {
+    /// `regs` must be a valid, mapped NVMe BAR0 (≥ [`MMIO_SPAN`] bytes) and
+    /// `alloc` must return real physically-contiguous DMA memory.
+    unsafe fn bringup(regs: u64, alloc: DmaAlloc) -> Option<NvmeController> {
         unsafe {
             let cap = (r32(regs + REG_CAP) as u64) | ((r32(regs + REG_CAP + 4) as u64) << 32);
             let dstrd = 4u32 << ((cap >> 32) & 0xf);
@@ -117,12 +119,9 @@ impl Nvme {
                 }
             }
 
-            let mut nv = Nvme {
+            let mut ctrl = NvmeController {
                 regs,
                 dstrd,
-                nsid,
-                capacity: 0,
-                lba_bytes: 512,
                 asq,
                 acq,
                 a_sq_tail: 0,
@@ -140,46 +139,50 @@ impl Nvme {
 
             // Create the I/O completion + submission queues (qid 1).
             // Create IO CQ: opcode 0x05; CDW10 = (size-1)<<16 | qid; CDW11 = PC(1).
-            if !nv.admin(0x05, 0, nv.iocq.phys, 0, (((QDEPTH - 1) as u32) << 16) | 1, 1) {
+            if !ctrl.admin(0x05, 0, ctrl.iocq.phys, 0, (((QDEPTH - 1) as u32) << 16) | 1, 1) {
                 return None;
             }
             // Create IO SQ: opcode 0x01; CDW11 = cqid(1)<<16 | PC(1).
-            if !nv.admin(0x01, 0, nv.iosq.phys, 0, (((QDEPTH - 1) as u32) << 16) | 1, (1 << 16) | 1) {
+            if !ctrl.admin(0x01, 0, ctrl.iosq.phys, 0, (((QDEPTH - 1) as u32) << 16) | 1, (1 << 16) | 1) {
                 return None;
             }
+            crate::ktrace::log("nvme", "controller up (admin + 1 I/O queue)");
+            Some(ctrl)
+        }
+    }
 
-            // Identify Namespace `nsid` (CNS=0) for capacity + LBA size.
-            let idbuf = alloc(4096)?;
-            if !nv.admin(0x06, nsid, idbuf.phys, 0, 0, 0) {
+    /// Identify namespace `nsid` (CNS=0); return `(capacity_in_512B_sectors,
+    /// lba_bytes)`, or `None` if the namespace is absent (NSZE==0) or has an
+    /// unusable LBA size. Reuses the shared bounce buffer (no concurrent I/O at
+    /// probe time).
+    fn identify_namespace(&mut self, nsid: u32) -> Option<(u64, u32)> {
+        // SAFETY: admin queue + data_buf from bringup.
+        unsafe {
+            let buf = self.data_buf;
+            if !self.admin(0x06, nsid, buf.phys, 0, 0, 0) {
                 return None;
             }
-            // NSZE (u64 @ 0) = number of LBAs; FLBAS (@26) selects the LBA format;
-            // LBA formats start @128, each u32, LBADS (byte 2) = log2(lba bytes).
-            let nsze = read_volatile(idbuf.virt as *const u64);
-            // NSZE == 0 => the namespace doesn't exist. This is how `probe_nth`
-            // discovers how many namespaces a controller actually has (it stops
-            // at the first absent one).
+            let nsze = read_volatile(buf.virt as *const u64);
             if nsze == 0 {
-                return None;
+                return None; // namespace doesn't exist (enumeration terminator)
             }
-            let flbas = read_volatile((idbuf.virt + 26) as *const u8) & 0xf;
-            let lbaf = read_volatile((idbuf.virt + 128 + flbas as u64 * 4) as *const u32);
-            let lbads = (lbaf >> 16) & 0xff;
-            nv.lba_bytes = 1u32 << lbads;
-            nv.capacity = nsze * (nv.lba_bytes as u64 / BLOCK_SIZE as u64);
-            crate::ktrace::log_fmt(format_args!(
-                "nvme: up (nsid {} : {} LBAs x {} B) -> {} 512B-sectors ({} MiB)",
-                nsid,
-                nsze,
-                nv.lba_bytes,
-                nv.capacity,
-                nv.capacity * 512 / (1024 * 1024)
-            ));
-            if nv.lba_bytes % BLOCK_SIZE as u32 != 0 {
+            let flbas = read_volatile((buf.virt + 26) as *const u8) & 0xf;
+            let lbaf = read_volatile((buf.virt + 128 + flbas as u64 * 4) as *const u32);
+            let lba_bytes = 1u32 << ((lbaf >> 16) & 0xff);
+            if lba_bytes == 0 || lba_bytes % BLOCK_SIZE as u32 != 0 {
                 crate::ktrace::log("nvme", "unsupported LBA size (not a multiple of 512)");
                 return None;
             }
-            Some(nv)
+            let capacity = nsze * (lba_bytes as u64 / BLOCK_SIZE as u64);
+            crate::ktrace::log_fmt(format_args!(
+                "nvme: namespace {} : {} LBAs x {} B -> {} 512B-sectors ({} MiB)",
+                nsid,
+                nsze,
+                lba_bytes,
+                capacity,
+                capacity * 512 / (1024 * 1024)
+            ));
+            Some((capacity, lba_bytes))
         }
     }
 
@@ -236,12 +239,12 @@ impl Nvme {
         }
     }
 
-    /// One I/O read (opcode 0x02) or write (0x01) of `len` bytes at 512-sector
-    /// `index`, through the bounce buffer + PRP list.
-    fn rw(&mut self, write: bool, index: u64, ptr: *mut u8, len: usize) -> Result<(), BlockError> {
-        let per = self.lba_bytes as u64 / BLOCK_SIZE as u64; // 512-sectors per NVMe LBA
+    /// One I/O read (opcode 0x02) / write (0x01) on `nsid` of `len` bytes at
+    /// 512-sector `index`, through the shared bounce buffer + PRP list.
+    fn rw(&mut self, nsid: u32, lba_bytes: u32, write: bool, index: u64, ptr: *mut u8, len: usize) -> Result<(), BlockError> {
+        let per = lba_bytes as u64 / BLOCK_SIZE as u64; // 512-sectors per NVMe LBA
         let slba = index / per;
-        let nlba = (len as u64 / self.lba_bytes as u64).max(1);
+        let nlba = (len as u64 / lba_bytes as u64).max(1);
         // SAFETY: buffers from bringup; PRP list built for the transfer.
         unsafe {
             if write {
@@ -254,14 +257,13 @@ impl Nvme {
             } else if pages == 2 {
                 self.data_buf.phys + 4096
             } else {
-                // PRP list: entries for pages 2..N (page 1 is PRP1).
                 for i in 0..pages - 1 {
                     w64(self.prp_list.virt + i as u64 * 8, self.data_buf.phys + (i as u64 + 1) * 4096);
                 }
                 self.prp_list.phys
             };
             let opcode = if write { 0x01 } else { 0x02 };
-            let ok = self.submit(true, opcode, self.nsid, prp1, prp2, slba as u32, (slba >> 32) as u32, (nlba - 1) as u32, 0);
+            let ok = self.submit(true, opcode, nsid, prp1, prp2, slba as u32, (slba >> 32) as u32, (nlba - 1) as u32, 0);
             if !ok {
                 return Err(BlockError::DeviceError);
             }
@@ -273,7 +275,45 @@ impl Nvme {
     }
 }
 
-impl BlockDevice for Nvme {
+/// Bring up the controller (once) and attach to the `n`-th namespace (NSID
+/// `n+1`). `None` once namespaces run out. Called by the per-arch `probe_nth`.
+///
+/// # Safety
+/// `regs` must be a valid mapped NVMe BAR0; `alloc` real DMA memory.
+pub unsafe fn probe_namespace(regs: u64, alloc: DmaAlloc, n: usize) -> Option<NvmeNamespace> {
+    CONTROLLER.with(|slot| {
+        if slot.is_none() {
+            // SAFETY: forwarded from the caller's contract.
+            *slot = unsafe { NvmeController::bringup(regs, alloc) };
+        }
+        let ctrl = slot.as_mut()?;
+        let nsid = (n + 1) as u32;
+        let (capacity, lba_bytes) = ctrl.identify_namespace(nsid)?;
+        Some(NvmeNamespace { nsid, capacity, lba_bytes })
+    })
+}
+
+/// A single NVMe namespace behind the shared [`BlockDevice`] API. Cheap handle;
+/// every operation routes through the shared [`CONTROLLER`] under its lock, so
+/// several namespaces can be held and used at once.
+pub struct NvmeNamespace {
+    nsid: u32,
+    capacity: u64,
+    lba_bytes: u32,
+}
+
+impl NvmeNamespace {
+    /// Run `f` on the shared controller under the lock; `DeviceError` if the
+    /// controller went away (never, in practice, once brought up).
+    fn with_ctrl<F: FnOnce(&mut NvmeController) -> Result<(), BlockError>>(&self, f: F) -> Result<(), BlockError> {
+        CONTROLLER.with(|slot| match slot.as_mut() {
+            Some(c) => f(c),
+            None => Err(BlockError::DeviceError),
+        })
+    }
+}
+
+impl BlockDevice for NvmeNamespace {
     fn block_count(&self) -> u64 {
         self.capacity
     }
@@ -289,30 +329,36 @@ impl BlockDevice for Nvme {
         }
         let mut tmp = [0u8; BLOCK_SIZE];
         tmp.copy_from_slice(buf);
-        self.rw(true, index, tmp.as_mut_ptr(), BLOCK_SIZE)
+        self.write_blocks(index, &tmp)
     }
     fn read_blocks(&mut self, index: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         if buf.len() % BLOCK_SIZE != 0 {
             return Err(BlockError::BadBufferLen);
         }
-        let mut off = 0usize;
-        while off < buf.len() {
-            let take = (buf.len() - off).min(DATA_MAX);
-            self.rw(false, index + (off / BLOCK_SIZE) as u64, buf[off..].as_mut_ptr(), take)?;
-            off += take;
-        }
-        Ok(())
+        let (nsid, lba) = (self.nsid, self.lba_bytes);
+        self.with_ctrl(|c| {
+            let mut off = 0usize;
+            while off < buf.len() {
+                let take = (buf.len() - off).min(DATA_MAX);
+                c.rw(nsid, lba, false, index + (off / BLOCK_SIZE) as u64, buf[off..].as_mut_ptr(), take)?;
+                off += take;
+            }
+            Ok(())
+        })
     }
     fn write_blocks(&mut self, index: u64, buf: &[u8]) -> Result<(), BlockError> {
         if buf.len() % BLOCK_SIZE != 0 {
             return Err(BlockError::BadBufferLen);
         }
-        let mut off = 0usize;
-        while off < buf.len() {
-            let take = (buf.len() - off).min(DATA_MAX);
-            self.rw(true, index + (off / BLOCK_SIZE) as u64, buf[off..].as_ptr() as *mut u8, take)?;
-            off += take;
-        }
-        Ok(())
+        let (nsid, lba) = (self.nsid, self.lba_bytes);
+        self.with_ctrl(|c| {
+            let mut off = 0usize;
+            while off < buf.len() {
+                let take = (buf.len() - off).min(DATA_MAX);
+                c.rw(nsid, lba, true, index + (off / BLOCK_SIZE) as u64, buf[off..].as_ptr() as *mut u8, take)?;
+                off += take;
+            }
+            Ok(())
+        })
     }
 }

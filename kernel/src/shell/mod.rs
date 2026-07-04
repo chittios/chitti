@@ -244,6 +244,10 @@ pub fn run() -> ! {
                 "info" => print_info(&orch, chat.as_ref()),
                 "disks" => disk_list(),
                 "ls" => disk_ls(arg),
+                "mount" => disk_mount(arg),
+                "umount" => disk_umount(arg),
+                "mounts" => disk_mounts(),
+                "cat" => disk_cat(arg),
                 "mkfs" => disk_mkfs(arg),
                 "install" => disk_install(arg),
                 "mkext4" => disk_mkext4(arg),
@@ -278,11 +282,14 @@ fn print_help() {
     serial_println!("  /bench           matvec kernel throughput");
     serial_println!("  /perf            end-to-end prefill/decode tok/s");
     serial_println!("  /info            CPU / memory / model / context / OS info");
-    serial_println!("  /disks           list block devices + detected filesystems (read-only)");
-    serial_println!("  /ls [n]          list root dir of detected volume n (FAT32/SimpleFS)");
+    serial_println!("  /disks           list every block device + detected filesystems (read-only)");
+    serial_println!("  /ls [n | /path]  list a volume's root: n on disk 0, or a mount path (/mnt)");
+    serial_println!("  /mount <d> [v] [/p]  mount disk d's volume v at /p (default /mnt)");
+    serial_println!("  /umount </path>  unmount   /mounts   list mounts");
+    serial_println!("  /cat </path/file>  print a file from a mounted volume (FAT/ext4)");
     serial_println!("  /mkfs            format the disk with SimpleFS (destructive, explicit)");
     serial_println!("  /mkext4          format the disk with ext4 (destructive; writes test files)");
-    serial_println!("  /install [yes]   partition the disk (GPT: ESP + SimpleFS OS) and install (destructive)");
+    serial_println!("  /install [<disk>] yes   install to a disk (GPT: ESP + ext4); default = non-ESP disk");
     serial_println!("  /help            this list");
     serial_println!("  /exit            power off (or Ctrl+D on an empty line)");
 }
@@ -649,6 +656,227 @@ fn read_line(buf: &mut String) {
 
 // --- block-device / filesystem commands (x86 virtio-blk over PCI) ---------
 
+/// A mounted volume: a (disk, volume) bound to a path like `/mnt`, so `/ls` and
+/// `/cat` can address it by path (a lightweight, Linux-flavored mount table —
+/// not a full VFS: paths resolve to a volume's root, one directory level).
+#[derive(Clone)]
+struct Mount {
+    path: alloc::string::String,
+    disk: usize,
+    start_lba: u64,
+    sectors: u64,
+    fs: crate::fs::detect::FsType,
+    label: Option<alloc::string::String>,
+}
+
+static MOUNTS: crate::mm::Locked<alloc::vec::Vec<Mount>> = crate::mm::Locked::new(alloc::vec::Vec::new());
+
+/// The mount whose path is `path` (exact), if any.
+fn mount_lookup(path: &str) -> Option<Mount> {
+    MOUNTS.with(|m| m.iter().find(|mt| mt.path == path).cloned())
+}
+
+/// `/mount <disk> [vol] [/path]` — bind volume `vol` (default 0) of disk `disk`
+/// to a mount path (default the first free `/mnt`, `/mnt2`, …). The volume is
+/// discovered via the FS detector, exactly as `/disks` shows it.
+fn disk_mount(arg: &str) {
+    use alloc::string::{String, ToString};
+    let mut disk: Option<usize> = None;
+    let mut vol: usize = 0;
+    let mut path: Option<String> = None;
+    let mut nums = 0;
+    for tok in arg.split_whitespace() {
+        if let Some(p) = tok.strip_prefix('/') {
+            path = Some(alloc::format!("/{}", p));
+        } else if let Ok(n) = tok.parse::<usize>() {
+            if nums == 0 {
+                disk = Some(n);
+            } else {
+                vol = n;
+            }
+            nums += 1;
+        }
+    }
+    let Some(disk) = disk else {
+        serial_println!("mount> usage: /mount <disk> [vol] [/path]   (see /disks for disk + volume indices)");
+        return;
+    };
+    let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
+        serial_println!("mount> no disk {} (see /disks)", disk);
+        return;
+    };
+    let vols = crate::fs::detect::probe(&mut dev);
+    let Some(v) = vols.get(vol).cloned() else {
+        serial_println!("mount> disk {} has no volume {} (see /disks)", disk, vol);
+        return;
+    };
+    // Default mount point: first free /mnt, /mnt2, /mnt3, ...
+    let path = path.unwrap_or_else(|| {
+        MOUNTS.with(|m| {
+            if !m.iter().any(|x| x.path == "/mnt") {
+                return "/mnt".to_string();
+            }
+            (2..).map(|i| alloc::format!("/mnt{}", i)).find(|p| !m.iter().any(|x| x.path == *p)).unwrap()
+        })
+    });
+    if mount_lookup(&path).is_some() {
+        serial_println!("mount> {} already mounted (/umount it first)", path);
+        return;
+    }
+    let mt = Mount { path: path.clone(), disk, start_lba: v.start_lba, sectors: v.sectors, fs: v.fs, label: v.label.clone() };
+    MOUNTS.with(|m| m.push(mt));
+    serial_println!(
+        "mount> {} -> disk {} vol {} ({}, {} MiB, label={})",
+        path,
+        disk,
+        vol,
+        v.fs.name(),
+        v.sectors * 512 / 1024 / 1024,
+        v.label.as_deref().unwrap_or("-")
+    );
+}
+
+/// `/umount <path>` — remove a mount.
+fn disk_umount(arg: &str) {
+    let path = arg.trim();
+    let removed = MOUNTS.with(|m| {
+        let before = m.len();
+        m.retain(|x| x.path != path);
+        before - m.len()
+    });
+    if removed > 0 {
+        serial_println!("umount> {} unmounted", path);
+    } else {
+        serial_println!("umount> {} not mounted (see /mounts)", path);
+    }
+}
+
+/// `/mounts` — list the mount table.
+fn disk_mounts() {
+    MOUNTS.with(|m| {
+        if m.is_empty() {
+            serial_println!("mounts> (nothing mounted; /mount <disk> [vol] [/path])");
+            return;
+        }
+        for mt in m.iter() {
+            serial_println!(
+                "  {:<8} disk {} lba {:<10} {:>6} MiB  {:<8} label={}",
+                mt.path,
+                mt.disk,
+                mt.start_lba,
+                mt.sectors * 512 / 1024 / 1024,
+                mt.fs.name(),
+                mt.label.as_deref().unwrap_or("-")
+            );
+        }
+    });
+}
+
+/// List the root directory of a mounted volume (`/ls /mnt`). Shared FAT/ext4/
+/// SimpleFS readers over a partition view at the mount's LBA range.
+fn ls_mount(mt: &Mount) {
+    use crate::fs::detect::FsType;
+    let Some(mut dev) = crate::block::probe_disk_nth(mt.disk) else {
+        serial_println!("ls> disk {} gone", mt.disk);
+        return;
+    };
+    match mt.fs {
+        FsType::Fat16 | FsType::Fat32 => {
+            let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
+            match crate::block::fat_read::FatReader::open(&mut part) {
+                Some(mut r) => {
+                    let entries = r.list_root();
+                    serial_println!("ls> {} ({}) root ({} entries):", mt.path, mt.fs.name(), entries.len());
+                    for (name, size, is_dir) in entries {
+                        if is_dir {
+                            serial_println!("  {}/", name);
+                        } else {
+                            serial_println!("  {} ({} bytes)", name, size);
+                        }
+                    }
+                }
+                None => serial_println!("ls> {} unreadable", mt.path),
+            }
+        }
+        FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => {
+            let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
+            match crate::block::ext4_read::Ext4Reader::open(&mut part) {
+                Some(mut r) => {
+                    let entries = r.list_root();
+                    serial_println!("ls> {} ({}) root ({} entries):", mt.path, mt.fs.name(), entries.len());
+                    for (name, ino, is_dir) in entries {
+                        serial_println!("  {}{}  (inode {})", name, if is_dir { "/" } else { "" }, ino);
+                    }
+                }
+                None => serial_println!("ls> {} unreadable", mt.path),
+            }
+        }
+        FsType::SimpleFs => {
+            let part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
+            match crate::fs::SimpleFs::mount(part).and_then(|mut fs| fs.list()) {
+                Ok(names) => {
+                    serial_println!("ls> {} (SimpleFS) root ({} entries):", mt.path, names.len());
+                    for n in names {
+                        serial_println!("  {}", n);
+                    }
+                }
+                Err(_) => serial_println!("ls> {} unreadable", mt.path),
+            }
+        }
+        other => serial_println!("ls> {} is {} -- listing unimplemented", mt.path, other.name()),
+    }
+}
+
+/// `/cat <path>` — print a file from a mounted volume, e.g. `/cat /mnt/notes`.
+/// FAT + ext4 root files (one directory level, matching the mount model).
+fn disk_cat(arg: &str) {
+    use crate::fs::detect::FsType;
+    let full = arg.trim();
+    // Find the mount whose path is the longest prefix, and the file name after it.
+    let mt = MOUNTS.with(|m| {
+        m.iter()
+            .filter(|mt| full == mt.path || full.starts_with(&alloc::format!("{}/", mt.path)))
+            .max_by_key(|mt| mt.path.len())
+            .cloned()
+    });
+    let Some(mt) = mt else {
+        serial_println!("cat> {} not under any mount (see /mounts)", full);
+        return;
+    };
+    let rel = full[mt.path.len()..].trim_start_matches('/');
+    if rel.is_empty() {
+        serial_println!("cat> {} is a mount point, not a file", full);
+        return;
+    }
+    let Some(mut dev) = crate::block::probe_disk_nth(mt.disk) else {
+        serial_println!("cat> disk {} gone", mt.disk);
+        return;
+    };
+    let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
+    let data: Option<alloc::vec::Vec<u8>> = match mt.fs {
+        FsType::Fat16 | FsType::Fat32 => crate::block::fat_read::FatReader::open(&mut part).and_then(|mut r| r.read_file(rel)),
+        FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => crate::block::ext4_read::Ext4Reader::open(&mut part).and_then(|mut r| {
+            let sz = r.file_size(rel)? as usize;
+            let mut buf = alloc::vec![0u8; sz];
+            let n = r.read_root_file(rel, &mut buf)?;
+            buf.truncate(n);
+            Some(buf)
+        }),
+        _ => None,
+    };
+    match data {
+        Some(bytes) => {
+            serial_println!("cat> {} ({} bytes):", full, bytes.len());
+            // Print as UTF-8 text if it is, else note it's binary.
+            match core::str::from_utf8(&bytes) {
+                Ok(s) => serial_println!("{}", s),
+                Err(_) => serial_println!("(binary; {} bytes)", bytes.len()),
+            }
+        }
+        None => serial_println!("cat> {} not found on {}", rel, mt.path),
+    }
+}
+
 fn disk_list() {
     use crate::block::BlockDevice;
     // Enumerate every block device, not just the boot disk: a machine can have
@@ -688,7 +916,16 @@ fn disk_list() {
 
 fn disk_ls(arg: &str) {
     use crate::fs::detect::FsType;
-    let n: usize = arg.trim().parse().unwrap_or(0);
+    // A path argument (e.g. `/ls /mnt`) lists a mounted volume's root.
+    let a = arg.trim();
+    if a.starts_with('/') {
+        match mount_lookup(a) {
+            Some(mt) => ls_mount(&mt),
+            None => serial_println!("ls> {} not mounted (see /mounts, or /mount <disk>)", a),
+        }
+        return;
+    }
+    let n: usize = a.parse().unwrap_or(0);
     let Some(mut dev) = crate::block::probe_disk() else {
         serial_println!("ls> no block device");
         return;
@@ -774,26 +1011,45 @@ fn disk_mkfs(arg: &str) {
     }
 }
 
+/// Parse `/install` arguments: `(confirm, target_disk_index)`. Accepts the
+/// confirmation token `yes` and an optional numeric disk index in any order —
+/// e.g. `yes`, `1 yes`, `yes 1`.
+fn parse_install_args(arg: &str) -> (bool, Option<usize>) {
+    let mut confirm = false;
+    let mut target = None;
+    for tok in arg.split_whitespace() {
+        if tok == "yes" {
+            confirm = true;
+        } else if let Ok(n) = tok.parse::<usize>() {
+            target = Some(n);
+        }
+    }
+    (confirm, target)
+}
+
 #[cfg(target_arch = "x86_64")]
 fn disk_install(arg: &str) {
-    use crate::block::{ext4::{Ext4Writer, FileSpec}, fat::FatWriter, gpt, virtio::VirtioBlk, BlockDevice, Partition};
+    use crate::block::{ext4::{Ext4Writer, FileSpec}, fat::FatWriter, gpt, BlockDevice, Partition};
     use alloc::string::String;
     use alloc::vec::Vec;
-    if arg.trim() != "yes" {
+    let (confirm, target_override) = parse_install_args(arg);
+    if !confirm {
         serial_println!("install> DESTRUCTIVE: repartitions the whole disk into a GPT with a 64 MiB");
         serial_println!("install> FAT ESP (Limine) + an ext4 OS partition (limine.conf + kernel +");
         serial_println!("install> model), making it boot standalone. Erases everything.");
-        serial_println!("install> re-run as '/install yes' to proceed.");
+        serial_println!("install> usage: /install [<disk>] yes   (disk index from /disks; default 0)");
         return;
     }
     let (Some(efi), Some(kernel)) = (crate::cortex::find_module("BOOTX64.EFI"), crate::cortex::find_module("payload/chitti-kernel")) else {
         serial_println!("install> installer payload missing (BOOTX64.EFI / kernel modules) -- build the ISO with xtask");
         return;
     };
-    let Some(mut dev) = VirtioBlk::probe() else {
-        serial_println!("install> no block device (boot with a -drive)");
+    let target_idx = target_override.unwrap_or(0);
+    let Some(mut dev) = crate::block::probe_disk_nth(target_idx) else {
+        serial_println!("install> no disk {} (see /disks; boot with a -drive)", target_idx);
         return;
     };
+    serial_println!("install> target disk {}", target_idx);
     let total = dev.block_count();
     let Some(layout) = gpt::default_layout(total) else {
         serial_println!("install> disk too small ({} sectors)", total);
@@ -872,17 +1128,20 @@ fn disk_install(arg: &str) {
 #[cfg(target_arch = "aarch64")]
 fn disk_install(arg: &str) {
     use crate::block::{ext4::Ext4Writer, fat::FatWriter, fat_read::FatReader, gpt, BlockDevice, Partition};
-    if arg.trim() != "yes" {
+    let (confirm, target_override) = parse_install_args(arg);
+    if !confirm {
         serial_println!("install> DESTRUCTIVE: repartitions the target disk into a GPT with a FAT ESP");
         serial_println!("install> (Chitti UEFI stub + kernel + model) + an ext4 data partition, making it");
         serial_println!("install> boot standalone. Erases everything on the target.");
-        serial_println!("install> re-run as '/install yes' to proceed.");
+        serial_println!("install> usage: /install [<disk>] yes   (disk index from /disks; default = the");
+        serial_println!("install>        first disk that isn't the boot ESP)");
         return;
     }
-    // Identify the boot ESP (payload source) vs the target among the attached
-    // block devices: the ESP is the FAT volume containing `chitti-kernel`.
+    // Identify the boot ESP (payload source) among the attached block devices:
+    // the ESP is the FAT volume containing `chitti-kernel`. It's never a valid
+    // install target (we'd overwrite the payload we're reading).
     let mut esp_idx = None;
-    for i in 0..4 {
+    for i in 0..16 {
         let Some(mut dev) = crate::block::probe_disk_nth(i) else { break };
         if let Some(mut r) = FatReader::open(&mut dev) {
             if r.exists("chitti-kernel") {
@@ -895,11 +1154,20 @@ fn disk_install(arg: &str) {
         serial_println!("install> no boot ESP found (a FAT volume with /chitti-kernel) -- boot via `--uefi` to install");
         return;
     };
-    let target_idx = if esp_idx == 0 { 1 } else { 0 };
+    // Target: the explicit index if given, else the first non-ESP disk.
+    let target_idx = match target_override {
+        Some(n) => n,
+        None => (0..16).find(|&i| i != esp_idx && crate::block::probe_disk_nth(i).is_some()).unwrap_or(esp_idx),
+    };
+    if target_idx == esp_idx {
+        serial_println!("install> disk {} is the boot ESP -- cannot install onto it (pick another; see /disks)", target_idx);
+        return;
+    }
     let Some(mut target) = crate::block::probe_disk_nth(target_idx) else {
-        serial_println!("install> no target disk (attach a second disk; the boot ESP is not a valid target)");
+        serial_println!("install> no disk {} (see /disks)", target_idx);
         return;
     };
+    serial_println!("install> target disk {} (boot ESP is disk {})", target_idx, esp_idx);
 
     // Read the stub + kernel off the boot ESP. The model is NOT re-read from
     // FAT (it would not fit the 256 MiB heap): the stub already loaded it into

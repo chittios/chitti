@@ -8,7 +8,7 @@ use crate::arch::aarch64::virtio_blk::VirtioBlkMmio;
 use crate::arch::aarch64::virtio_pci::VirtioBlkPci;
 use crate::arch::aarch64::{ahci, nvme};
 use crate::block::ahci::Ahci;
-use crate::block::nvme::Nvme;
+use crate::block::nvme::NvmeNamespace;
 use crate::block::{BlockDevice, BlockError};
 
 /// The aarch64 boot disk, one variant per real transport. `probe_nth` tries
@@ -17,23 +17,35 @@ use crate::block::{BlockDevice, BlockError};
 /// platform typically exposes exactly one, so ordering just skips the absent.
 pub enum Disk {
     Pci(VirtioBlkPci),
-    Nvme(Nvme),
+    Nvme(NvmeNamespace),
     Ahci(Ahci),
     Mmio(VirtioBlkMmio),
 }
 
 impl Disk {
+    /// The `n`-th block device across ALL transports, counted globally: every
+    /// virtio-pci disk, then every NVMe namespace, then AHCI, then virtio-mmio.
+    /// (Passing `n` to each transport would let one transport's disks shadow
+    /// another's — e.g. two NVMe namespaces hiding the virtio-mmio ESP.)
     pub fn probe_nth(n: usize) -> Option<Disk> {
-        if let Some(d) = VirtioBlkPci::probe_nth(n) {
-            return Some(Disk::Pci(d));
+        let mut idx = 0usize;
+        macro_rules! scan {
+            ($probe:path, $variant:path) => {{
+                let mut k = 0usize;
+                while let Some(d) = $probe(k) {
+                    if idx == n {
+                        return Some($variant(d));
+                    }
+                    idx += 1;
+                    k += 1;
+                }
+            }};
         }
-        if let Some(d) = nvme::probe_nth(n) {
-            return Some(Disk::Nvme(d));
-        }
-        if let Some(d) = ahci::probe_nth(n) {
-            return Some(Disk::Ahci(d));
-        }
-        VirtioBlkMmio::probe_nth(n).map(Disk::Mmio)
+        scan!(VirtioBlkPci::probe_nth, Disk::Pci);
+        scan!(nvme::probe_nth, Disk::Nvme);
+        scan!(ahci::probe_nth, Disk::Ahci);
+        scan!(VirtioBlkMmio::probe_nth, Disk::Mmio);
+        None
     }
 }
 
