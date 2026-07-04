@@ -343,6 +343,23 @@ fn handle_event(dev: &mut VirtioInput, ev: InputEvent) {
     if ev.value == 0 {
         return; // key release of a normal key: nothing to emit
     }
+    // Arrow keys (Linux keycodes) become the ANSI sequences a serial terminal
+    // sends (ESC [ A/B/C/D), so the shell decodes one encoding for every input
+    // path (history navigation etc.).
+    if let Some(fin) = match ev.code {
+        103 => Some(b'A'), // KEY_UP
+        108 => Some(b'B'), // KEY_DOWN
+        106 => Some(b'C'), // KEY_RIGHT
+        105 => Some(b'D'), // KEY_LEFT
+        _ => None,
+    } {
+        RING.with(|r| {
+            r.push(0x1b);
+            r.push(b'[');
+            r.push(fin);
+        });
+        return;
+    }
     if let Some(ascii) = keycode_to_ascii(ev.code, dev.shift, dev.ctrl) {
         RING.with(|r| r.push(ascii));
     }

@@ -48,8 +48,11 @@ static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 static CAPS_ON: AtomicBool = AtomicBool::new(false);
 /// Set 2 sends a byte's *break* code as `0xF0 <code>`; this holds across polls.
 static BREAK_NEXT: AtomicBool = AtomicBool::new(false);
-/// Extended keys are prefixed `0xE0`; we consume the next byte and ignore it.
+/// Extended keys are prefixed `0xE0`; arrows map to ANSI sequences, others are ignored.
 static EXT_NEXT: AtomicBool = AtomicBool::new(false);
+/// Bytes still owed to the caller (arrow keys expand to a 3-byte ANSI escape,
+/// but `poll_key` returns one byte per call).
+static PENDING: Locked<alloc::vec::Vec<u8>> = Locked::new(alloc::vec::Vec::new());
 
 unsafe fn r32(a: u64) -> u32 {
     unsafe { read_volatile(a as *const u32) }
@@ -132,6 +135,10 @@ const SC_CAPS: u8 = 0x58;
 /// received bytes until it produces a character or the receive register drains.
 /// Non-blocking; `None` if no PL050 or nothing typed.
 pub fn poll_key() -> Option<u8> {
+    // Drain any queued escape-sequence bytes first (arrow-key expansion).
+    if let Some(b) = PENDING.with(|p| if p.is_empty() { None } else { Some(p.remove(0)) }) {
+        return Some(b);
+    }
     let base = BASE.with(|b| *b);
     if base == 0 {
         return None;
@@ -159,7 +166,26 @@ pub fn poll_key() -> Option<u8> {
                 let breaking = BREAK_NEXT.swap(false, Ordering::Relaxed);
                 let extended = EXT_NEXT.swap(false, Ordering::Relaxed);
                 if extended {
-                    continue; // ignore extended keys (arrows, etc.) for now
+                    // Arrow keys (set-2 extended make codes) become the ANSI
+                    // sequences a serial terminal sends (ESC [ A/B/C/D), one
+                    // encoding for every input path. Other extended keys are
+                    // still ignored.
+                    if !breaking {
+                        if let Some(fin) = match sc {
+                            0x75 => Some(b'A'), // Up
+                            0x72 => Some(b'B'), // Down
+                            0x74 => Some(b'C'), // Right
+                            0x6b => Some(b'D'), // Left
+                            _ => None,
+                        } {
+                            PENDING.with(|p| {
+                                p.push(b'[');
+                                p.push(fin);
+                            });
+                            return Some(0x1b);
+                        }
+                    }
+                    continue;
                 }
                 match sc {
                     SC_LSHIFT | SC_RSHIFT => SHIFT_DOWN.store(!breaking, Ordering::Relaxed),

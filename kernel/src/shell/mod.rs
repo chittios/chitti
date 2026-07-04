@@ -9,6 +9,7 @@
 //! and [`run`] is the interactive read-eval loop over COM1 that a person
 //! drives at `cargo xtask run`.
 
+use crate::mm::Locked;
 use crate::persona::{self, Agent, Planner, RulePlanner};
 use crate::{serial_print, serial_println};
 use alloc::string::{String, ToString};
@@ -501,6 +502,7 @@ fn print_help() {
     serial_println!("  /agent <intent>  run the orchestrator's agentic loop on <intent> (sessions + tools)");
     serial_println!("  /session         show the current session; /session save | /session resume <id>");
     serial_println!("  /subagent <path> dispatch an isolated reader sub-agent (shows context isolation)");
+    serial_println!("                   (the chat agent can also delegate: TOOL: /subagent <task>)");
     serial_println!("  /skills          list installed skills (L0 metadata)");
     serial_println!("  /clear           reset the chat context");
     serial_println!("  /infer           reference inference (fixed prompt, parity check)");
@@ -645,11 +647,25 @@ You then receive that command's output and continue. When you have the answer fo
 the user, reply in prose (ANSI SGR for emphasis, never markdown) with no TOOL line. \
 Never invent data you could read with a tool (current time, network status, files). \
 Tools: /datetime (current date/time), /network (net status), /ping <host>, /wifi, \
-/info (cpu/mem/model), /disks, /ls [path], /cat <path>, /skills, /session, /help. \
+/info (cpu/mem/model), /disks, /ls [path], /cat <path>, /skills, /session, /help, \
+/subagent <task> (delegate a self-contained task to an isolated sub-agent that runs \
+its own tool loop; you receive only its summary). \
 Examples:\n\
 user: what time is it? -> TOOL: /datetime\n\
 user: are we online? -> TOOL: /network\n\
-user: ping google -> TOOL: /ping www.google.com";
+user: ping google -> TOOL: /ping www.google.com\n\
+user: have a subagent check the disks -> TOOL: /subagent list the disks and report what is present";
+
+/// System prompt for a delegated **worker sub-agent**: same `TOOL:` protocol,
+/// but its final prose reply is a *report to the parent agent* (only the
+/// summary crosses the isolation boundary), and it cannot delegate further.
+const SUBAGENT_SYSTEM: &str = "You are an isolated Chitti sub-agent completing one delegated task. \
+To run a tool, reply with EXACTLY one line like: TOOL: /disks\n\
+You then receive its output. Never repeat a tool call you already ran. \
+Tools that take no arguments: /datetime /network /wifi /info /disks /ls /skills /help. \
+Tools with an argument: /ping 10.0.2.2, /cat /mnt/file.txt. \
+You cannot delegate further. When you have the facts, reply in plain prose with a \
+concise factual report of EXACTLY what the tool output showed - never invent details.";
 
 /// Detect a `TOOL: /<cmd> [args]` directive in a model reply. Returns the
 /// command name (leading `/` stripped) and its argument string, or `None` if the
@@ -658,9 +674,10 @@ fn parse_tool_call(text: &str) -> Option<(alloc::string::String, alloc::string::
     use alloc::string::ToString;
     for line in text.lines() {
         let l = line.trim();
-        let rest = l
-            .strip_prefix("TOOL:")
-            .or_else(|| l.strip_prefix("TOOL "))
+        // Tolerant matching: small models drift to "TOOLS:", "Tool:", etc.
+        let rest = ["TOOL:", "TOOLS:", "Tool:", "tool:", "TOOL "]
+            .iter()
+            .find_map(|p| l.strip_prefix(p))
             .map(|r| r.trim().trim_start_matches('/').trim());
         if let Some(rest) = rest {
             if rest.is_empty() {
@@ -724,9 +741,32 @@ impl ChatSession {
             self.prefill_turn("system\n", AGENT_SYSTEM, false);
         }
         self.prefill_turn("user\n", msg, true);
+        // Repeat guard (same rationale as the sub-agent loop): a small model
+        // that re-emits the identical call already has its output.
+        let mut last_call: Option<(alloc::string::String, alloc::string::String)> = None;
         for _ in 0..MAX_TOOL_ITERS {
-            let text = self.generate_assistant();
+            let text = self.generate_assistant("\x1b[1;36mchitti:\x1b[0m ");
+            if let Some(pair) = parse_tool_call(&text) {
+                if last_call.as_ref() == Some(&pair) {
+                    self.prefill_turn(
+                        "user\n",
+                        "You already ran that tool and have its output above. Do not call any more tools; give your final answer in prose now.",
+                        true,
+                    );
+                    last_call = None;
+                    continue;
+                }
+                last_call = Some(pair);
+            }
             match parse_tool_call(&text) {
+                Some((cmd, args)) if cmd == "subagent" => {
+                    // Delegate to an isolated, tool-using sub-agent; only its
+                    // summary comes back as the observation.
+                    serial_println!("\x1b[33m\u{2192} dispatching subagent:\x1b[0m {}", args);
+                    let summary = self.run_subagent(&args);
+                    let fb = alloc::format!("Subagent report:\n{}", summary);
+                    self.prefill_turn("user\n", &fb, true);
+                }
                 Some((cmd, args)) => {
                     serial_println!(
                         "\x1b[33m\u{2192} running\x1b[0m /{}{}{}",
@@ -797,17 +837,17 @@ impl ChatSession {
     }
 
     /// Decode one assistant reply from the current logits, streaming it to the
-    /// chat pane and returning the full decoded text (so the caller can detect a
-    /// tool call). Closes the turn with `<|im_end|>` in the KV cache.
-    fn generate_assistant(&mut self) -> alloc::string::String {
+    /// chat pane (labelled `label`) and returning the full decoded text (so the
+    /// caller can detect a tool call). Closes the turn with `<|im_end|>`.
+    fn generate_assistant(&mut self, label: &str) -> alloc::string::String {
         use crate::cortex::tokenizer;
         let eos = self.model.eos();
         let im_end = self.tok.im_end as usize;
         self.gen.clear();
         let mut next = self.pick();
         let mut stream = tokenizer::Stream::new();
-        // Bold-cyan speaker label (ANSI), then the streamed reply.
-        serial_print!("\x1b[1;36mchitti:\x1b[0m ");
+        // Bold speaker label (ANSI), then the streamed reply.
+        serial_print!("{}", label);
         let mut out = alloc::string::String::new();
         let mut n = 0usize;
         // Anti-degeneration guard: a thinking model that slips into a loop can
@@ -883,6 +923,116 @@ impl ChatSession {
             logits[t] = if l > 0.0 { l / PENALTY } else { l * PENALTY };
         }
         sampler::sample_topk_topp(logits, TEMPERATURE, TOP_K, TOP_P, &mut self.rng, None)
+    }
+
+    /// Dispatch an isolated, **model-driven** sub-agent for `task` and return
+    /// its summary. Goes through `agent::subagent::dispatch`, so all Phase C
+    /// invariants hold: the sub-agent gets a fresh KV/context (we swap the chat
+    /// context out and back), its capabilities are attenuated from the
+    /// orchestrator's, the depth cap applies, and only the condensed summary
+    /// crosses back to the parent.
+    fn run_subagent(&mut self, task: &str) -> alloc::string::String {
+        use crate::agent::{manifest, subagent};
+        // Isolation: hand the sub-agent a fresh model context; the parent chat's
+        // KV/position are restored afterwards untouched.
+        let saved_kv = core::mem::replace(&mut self.kv, self.model.new_cache());
+        let saved_state = core::mem::replace(&mut self.state, self.model.new_state());
+        let saved_pos = core::mem::replace(&mut self.pos, 0);
+        let saved_gen = core::mem::take(&mut self.gen);
+
+        self.prefill_turn("system\n", SUBAGENT_SYSTEM, false);
+
+        let parent = manifest::orchestrator_manifest();
+        let role = manifest::worker_subagent_manifest();
+        let result = {
+            let mut steps = ModelSteps { chat: self, seen: 0, call_id: 0, last_call: None };
+            let mut tools = CommandTools;
+            subagent::dispatch(&parent.capabilities, 0, parent.budgets.max_depth, role, task, &mut steps, &mut tools, None)
+        };
+
+        self.kv = saved_kv;
+        self.state = saved_state;
+        self.pos = saved_pos;
+        self.gen = saved_gen;
+
+        match result {
+            Ok(outcome) => outcome.record.summary.unwrap_or_default(),
+            Err(e) => alloc::format!("subagent dispatch refused: {:?}", e),
+        }
+    }
+}
+
+/// [`StepSource`] backed by the live Cortex model: each `next()` prefills any
+/// session messages not yet in the model context (the delegated task, then tool
+/// results), decodes one assistant reply, and parses it into a tool call or a
+/// final answer. This is what makes a sub-agent's loop *inference-driven* rather
+/// than scripted.
+struct ModelSteps<'a> {
+    chat: &'a mut ChatSession,
+    /// Messages of the sub-session already prefilled into the model context.
+    seen: usize,
+    call_id: u64,
+    /// The previous tool call, to stop a small model that loops on the exact
+    /// same call (it already has that output; re-running gains nothing).
+    last_call: Option<(alloc::string::String, alloc::string::String)>,
+}
+
+impl crate::agent::agent_loop::StepSource for ModelSteps<'_> {
+    fn next(&mut self, session: &crate::agent::types::Session) -> crate::agent::agent_loop::Step {
+        use crate::agent::agent_loop::Step;
+        use crate::agent::types::{Role, ToolCall};
+        // Prefill new user/tool messages (assistant text is already in the KV
+        // from generation; skip those). Prime decode on the last one.
+        let fresh: alloc::vec::Vec<(usize, alloc::string::String)> = session.messages[self.seen..]
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m.role, Role::User | Role::Tool))
+            .map(|(i, m)| (i, m.content.clone()))
+            .collect();
+        self.seen = session.messages.len();
+        let last = fresh.len();
+        for (i, (_, content)) in fresh.iter().enumerate() {
+            self.chat.prefill_turn("user\n", content, i + 1 == last);
+        }
+        let text = self.chat.generate_assistant("\x1b[1;35msubagent:\x1b[0m ");
+        match parse_tool_call(&text) {
+            // A sub-agent cannot delegate further (depth is enforced by
+            // dispatch, but there is no nested ChatSession either) — treat a
+            // nested subagent request as a final answer.
+            Some((cmd, _)) if cmd == "subagent" => Step::Final(text),
+            Some((cmd, args)) => {
+                // Repeat guard: the exact same call again means the model is
+                // stuck — it already has that output, so end the loop with what
+                // has been gathered instead of burning the tool budget.
+                if self.last_call.as_ref() == Some(&(cmd.clone(), args.clone())) {
+                    return Step::Final(text);
+                }
+                self.last_call = Some((cmd.clone(), args.clone()));
+                self.call_id += 1;
+                Step::Tools(alloc::vec![ToolCall { call_id: self.call_id, tool: cmd, args }])
+            }
+            None => Step::Final(text),
+        }
+    }
+}
+
+/// [`ToolDispatch`] that runs the system `/command` toolset — the same
+/// `run_tool_command` surface the root shell agent (and a human) uses. Output is
+/// tool/world data, so it re-enters context tainted `UntrustedIngested`.
+struct CommandTools;
+
+impl crate::agent::agent_loop::ToolDispatch for CommandTools {
+    fn call(
+        &mut self,
+        _session: &mut crate::agent::types::Session,
+        _caller: crate::sched::TaskId,
+        call: &crate::agent::types::ToolCall,
+    ) -> crate::agent::agent_loop::ToolOutcome {
+        use crate::agent::agent_loop::ToolOutcome;
+        use crate::agent::types::Provenance;
+        serial_println!("\x1b[33m\u{2192} subagent running\x1b[0m /{} {}", call.tool, call.args);
+        let out = run_tool_command(&call.tool, &call.args);
+        ToolOutcome::ok(alloc::format!("Output of /{} {}:\n{}", call.tool, call.args, out), Provenance::UntrustedIngested)
     }
 }
 
@@ -1004,14 +1154,154 @@ fn run_perf() {
 /// both the framebuffer and serial and handling backspace. Cooperatively
 /// yields the CPU while no input is available, so other tasks keep running
 /// while the shell waits at the prompt.
+/// Shell command history (most recent last), navigated with Up/Down in
+/// [`read_line`]. Consecutive duplicates are not stored.
+static HISTORY: Locked<alloc::vec::Vec<String>> = Locked::new(alloc::vec::Vec::new());
+
+/// Top-level `/command` names, for Tab completion (canonical names only, not
+/// aliases). Keep in sync with `dispatch_system` + the interactive arms.
+const COMMANDS: &[&str] = &[
+    "agent", "bench", "cat", "clear", "close", "datetime", "disks", "do", "exit", "help", "infer", "info",
+    "install", "ktrace", "ls", "mkext4", "mkfs", "mount", "mounts", "network", "open", "perf", "ping",
+    "session", "shortcuts", "skills", "subagent", "ui", "umount", "wifi",
+];
+
+/// Visually erase the `n` characters most recently echoed on the input line.
+fn erase_chars(n: usize) {
+    use crate::console;
+    for _ in 0..n {
+        console::put_byte(0x08);
+        console::put_byte(b' ');
+        console::put_byte(0x08);
+    }
+}
+
+/// Replace the input line (both in `buf` and on screen) with `new`.
+fn replace_line(buf: &mut String, new: &str) {
+    use crate::console;
+    erase_chars(buf.chars().count());
+    buf.clear();
+    buf.push_str(new);
+    for b in new.bytes() {
+        console::put_byte(b);
+    }
+}
+
+/// After ESC, wait briefly for the rest of an ANSI sequence (the bytes of a
+/// multi-byte arrow key may still be in flight over serial). Bounded.
+fn next_seq_byte() -> Option<u8> {
+    use crate::console;
+    for _ in 0..2000 {
+        if let Some(b) = console::read_byte() {
+            return Some(b);
+        }
+        crate::sched::yield_now();
+    }
+    None
+}
+
+/// Tab-complete a `/command` prefix: unique match completes in place; multiple
+/// matches are listed and the prompt+line re-echoed.
+fn tab_complete(buf: &mut String) {
+    use crate::console;
+    // Only complete a lone leading /command (no arguments yet).
+    if !buf.starts_with('/') || buf.contains(' ') {
+        return;
+    }
+    let prefix = &buf[1..];
+    let matches: alloc::vec::Vec<&&str> = COMMANDS.iter().filter(|c| c.starts_with(prefix)).collect();
+    match matches.len() {
+        0 => {}
+        1 => {
+            let rest = &matches[0][prefix.len()..];
+            for b in rest.bytes() {
+                console::put_byte(b);
+            }
+            buf.push_str(rest);
+            buf.push(' ');
+            console::put_byte(b' ');
+        }
+        _ => {
+            serial_println!("");
+            let mut line = String::new();
+            for m in &matches {
+                line.push('/');
+                line.push_str(m);
+                line.push(' ');
+                line.push(' ');
+            }
+            serial_println!("{}", line.trim_end());
+            // Re-echo the prompt + partial line.
+            serial_print!("> {}", buf);
+        }
+    }
+}
+
 fn read_line(buf: &mut String) {
     use crate::console;
+    // History navigation state: index into HISTORY while browsing, plus the
+    // draft line that was being typed when Up was first pressed.
+    let mut hist_idx: Option<usize> = None;
+    let mut draft = String::new();
     loop {
         match console::read_byte() {
             Some(b'\r') | Some(b'\n') => {
                 serial_println!("");
+                let line = buf.trim();
+                if !line.is_empty() {
+                    HISTORY.with(|h| {
+                        if h.last().map(|l| l.as_str()) != Some(line) {
+                            h.push(String::from(line));
+                        }
+                    });
+                }
                 return;
             }
+            // ESC: decode an ANSI sequence (arrow keys from serial terminals and
+            // all keyboard drivers). Up/Down navigate history; others ignored.
+            Some(0x1b) => {
+                if next_seq_byte() != Some(b'[') {
+                    continue; // bare ESC or unknown sequence: ignore
+                }
+                match next_seq_byte() {
+                    Some(b'A') => {
+                        // Up: step back through history.
+                        let n = HISTORY.with(|h| h.len());
+                        if n == 0 {
+                            continue;
+                        }
+                        let idx = match hist_idx {
+                            None => {
+                                draft = buf.clone();
+                                n - 1
+                            }
+                            Some(0) => 0,
+                            Some(i) => i - 1,
+                        };
+                        hist_idx = Some(idx);
+                        let entry = HISTORY.with(|h| h[idx].clone());
+                        replace_line(buf, &entry);
+                    }
+                    Some(b'B') => {
+                        // Down: step forward; past the end restores the draft.
+                        if let Some(i) = hist_idx {
+                            let n = HISTORY.with(|h| h.len());
+                            if i + 1 < n {
+                                hist_idx = Some(i + 1);
+                                let entry = HISTORY.with(|h| h[i + 1].clone());
+                                replace_line(buf, &entry);
+                            } else {
+                                hist_idx = None;
+                                let d = draft.clone();
+                                replace_line(buf, &d);
+                            }
+                        }
+                    }
+                    _ => {} // Left/Right/other finals: consumed, not yet used
+                }
+            }
+            // Tab: complete a /command prefix.
+            Some(b'\t') => tab_complete(buf),
             // Ctrl+D (EOT): EOF-on-empty-line — power off, like typing /exit.
             // On a non-empty line it's ignored (standard shell behaviour), so an
             // accidental Ctrl+D mid-typing doesn't shut the system down.

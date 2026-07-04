@@ -89,6 +89,42 @@ pub fn orchestrator_manifest() -> AgentManifest {
     }
 }
 
+/// A general **worker** sub-agent role for model-driven delegation from the
+/// shell agent: it runs its own inference-backed agentic loop and may call the
+/// system `/command` tools, with authority strictly attenuated from its parent
+/// (read/list files, console, inference — no writes, no skill management).
+/// `max_depth: 0` so it cannot itself delegate.
+pub fn worker_subagent_manifest() -> AgentManifest {
+    AgentManifest {
+        schema_version: 1,
+        id: next_agent_id(),
+        name: "worker".to_string(),
+        version: "1.0.0".to_string(),
+        kind: AgentKind::Subagent,
+        description: "Complete a self-contained task with tools and report a summary.".to_string(),
+        system_prompt: "You complete the delegated task using tools and report the result.".to_string(),
+        toolset: vec!["*".into()],
+        capabilities: vec![
+            CapabilityRequest::new(CapDomain::Fs, Rights::READ | Rights::LIST, Scope::Any),
+            CapabilityRequest::new(CapDomain::Console, Rights::READ | Rights::WRITE, Scope::Any),
+            CapabilityRequest::new(CapDomain::Inference, Rights::EXEC, Scope::Any),
+        ],
+        skills: Vec::new(),
+        sampling: Sampling { temperature: 0.7, top_p: 0.8, seed: 7, max_output_tokens: 1024 },
+        budgets: Budgets {
+            max_turns: 8,
+            max_context_tokens: 4096,
+            compact_threshold: 3500,
+            max_tool_calls: 8,
+            max_subagents: 0,
+            max_depth: 0,
+            max_wall_ticks: 0,
+        },
+        summary: SummaryPolicy { max_tokens: 256, style: SummaryStyle::Terse },
+        origin: Origin::Builtin,
+    }
+}
+
 /// A minimal read-only sub-agent role for Phase C tests/demos: it can read and
 /// list files and emit a result, nothing else. `max_depth: 0` so it cannot
 /// itself delegate.
