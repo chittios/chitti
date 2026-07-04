@@ -71,19 +71,62 @@ model from ever directly touching hardware.
 - **Microkernel core.** Unforgeable capabilities (seL4-inspired), capability-gated
   IPC, a cooperative + timer-preemptive scheduler, SMP, and a hand-rolled MMU.
 
-## Building & running
+## Try it (real hardware or a VM)
 
-Everything goes through `cargo xtask`; the target architecture is always
-explicit. In short:
+You don't need the toolchain to run Chitti — grab a prebuilt image, or build one.
+
+1. **Get an image.** Download the latest from
+   [**Releases**](https://github.com/chittios/chitti/releases), or build one
+   locally (see below):
+   - **aarch64** (Apple Silicon / ARM, UEFI): `chitti-aa64.img` — a full GPT disk image.
+   - **x86_64** (PC, BIOS or UEFI): `chitti.iso` — a hybrid boot ISO.
+
+2. **Write it to a USB stick.**
+   - **[balenaEtcher](https://etcher.balena.io/)** (easiest, cross-platform):
+     select the `.img`/`.iso`, select your USB drive, Flash.
+   - **`dd`** (macOS/Linux) — ⚠ this **erases** the target device; triple-check
+     the name:
+     ```sh
+     # macOS:  diskutil list  →  find /dev/diskN, then:
+     diskutil unmountDisk /dev/diskN
+     sudo dd if=chitti-aa64.img of=/dev/rdiskN bs=4m         # rdisk = raw, faster
+     # Linux:  lsblk  →  find /dev/sdX, then:
+     sudo dd if=chitti-aa64.img of=/dev/sdX bs=4M status=progress conv=fsync
+     ```
+
+3. **Boot it.**
+   - **Real hardware:** plug in the USB, open the firmware boot menu (often F12 /
+     F2 / Del / Option at power-on), and pick the USB stick — in **UEFI** mode for
+     the aarch64 image.
+   - **A VM** (VirtualBox / UTM / QEMU): create a VM with **EFI enabled**, attach
+     the image as its disk (an *ARM* VM for `chitti-aa64.img`, an *x86* VM for the
+     ISO). In VirtualBox, set the pointing device to **USB Tablet** and the
+     keyboard to **USB** so the USB-HID drivers pick them up. On macOS,
+     `make vbox` does the VirtualBox setup for you (see DEVELOPMENT.md).
+
+Once booted you land in the chat shell — type a message, or `/help` for commands.
+
+> Reminder: this is research software — **boot it from removable media / in a VM,
+> not on a machine whose data you care about.** See the warning above.
+
+## Building & running (development)
+
+Everything goes through `cargo xtask`; a `Makefile` wraps the common commands.
+The target architecture is always explicit. In short:
 
 ```sh
-cargo xtask test                        # in-kernel test suite under QEMU (x86_64) — no model needed
-cargo xtask run -arch aarch64           # boot natively on Apple Silicon (QEMU + HVF)
-cargo xtask run -arch x86_64            # boot the Limine image under QEMU
+make test                 # in-kernel test suite under QEMU (x86_64) — no model needed
+make run  ARCH=aarch64    # boot natively on Apple Silicon (QEMU + HVF)
+make image ARCH=x86_64    # assemble a bootable ISO under target/
+make help                 # list all targets
+
+# …or call the underlying tool directly:
+cargo xtask run -arch aarch64
 ```
 
-Full prerequisites, the model fetch, per-arch/VirtualBox/real-hardware boot, and
-headless framebuffer verification are in **[DEVELOPMENT.md](DEVELOPMENT.md)**.
+`make vbox` rebuilds the aarch64 image and reloads it into a VirtualBox VM.
+Full prerequisites, the model fetch, per-arch boot, VirtualBox, and headless
+framebuffer verification are in **[DEVELOPMENT.md](DEVELOPMENT.md)**.
 
 ## Contributing
 

@@ -10,6 +10,12 @@ ARCH    ?= aarch64
 MODEL   ?= qwen3.5-0.8b
 RELEASE ?=
 
+# VirtualBox (the `vbox` target): which VM to (re)load the aarch64 image into,
+# and where its boot disk is attached. Override e.g. `make vbox VBOX_VM=MyVM`.
+VBOX_VM   ?= Chitti
+VBOX_CTL  ?= nvme
+VBOX_PORT ?= 0
+
 XTASK   := cargo xtask
 REL     := $(if $(filter 1 true yes,$(RELEASE)),--release,)
 FLAGS   := -arch $(ARCH) -model $(MODEL) $(REL)
@@ -55,6 +61,24 @@ run-uefi:
 .PHONY: image
 image:
 	$(XTASK) image $(FLAGS)
+
+## vbox: rebuild the aarch64 image and (re)load it into VirtualBox VM VBOX_VM
+.PHONY: vbox
+vbox:
+	$(XTASK) image -arch aarch64 -model $(MODEL)
+	@command -v VBoxManage >/dev/null || { echo "VBoxManage not found — install VirtualBox"; exit 1; }
+	@set -e; \
+	VM='$(VBOX_VM)'; CTL='$(VBOX_CTL)'; PORT='$(VBOX_PORT)'; \
+	IMG=target/chitti-aa64.img; VDI=target/chitti-aa64.vdi; \
+	UUID=$$(VBoxManage showvminfo "$$VM" --machinereadable 2>/dev/null | sed -n "s/^\"$$CTL-ImageUUID-$$PORT-0\"=//p" | tr -d '"'); \
+	echo "vbox: reloading VM '$$VM' (ctl=$$CTL port=$$PORT), preserving disk UUID $${UUID:-<new>}"; \
+	VBoxManage controlvm "$$VM" poweroff 2>/dev/null || true; sleep 1; \
+	VBoxManage closemedium disk "$$VDI" 2>/dev/null || true; rm -f "$$VDI"; \
+	VBoxManage convertfromraw "$$IMG" "$$VDI" --format VDI; \
+	if [ -n "$$UUID" ]; then VBoxManage internalcommands sethduuid "$$VDI" "$$UUID"; fi; \
+	VBoxManage storageattach "$$VM" --storagectl "$$CTL" --port "$$PORT" --device 0 --type hdd --medium "$$(pwd)/$$VDI"; \
+	VBoxManage showvminfo "$$VM" --machinereadable | grep -iE "hidpointing|hidkeyboard" || true; \
+	echo "vbox: done — start '$$VM' (pointing device = USB Tablet, keyboard = USB)"
 
 ## ref-check: boot the real model and verify inference parity/determinism
 .PHONY: ref-check
