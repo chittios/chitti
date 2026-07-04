@@ -190,9 +190,19 @@ pub extern "C" fn aarch64_start() -> ! {
     // path (no boot-info RSDP) — there the virtio-mmio fallback is used.
     aarch64_pcie_init();
 
-    let fb = bootinfo_framebuffer().or_else(|| unsafe { chitti_kernel::arch::aarch64::ramfb::init() });
-    if let Some((addr, w, h, pitch)) = fb {
+    // Preferred: the UEFI GOP framebuffer (with its real pixel format) from the
+    // stub's boot-info page — works on real hardware / VirtualBox / UTM at the
+    // monitor's native resolution. Fallback: QEMU ramfb (always XRGB8888).
+    let fb = if let Some((addr, w, h, pitch, bpp, rs, gs, bs)) = bootinfo_framebuffer() {
+        chitti_kernel::framebuffer::init_console_raw_fmt(addr, w, h, pitch, bpp, rs, gs, bs);
+        Some((w, h))
+    } else if let Some((addr, w, h, pitch)) = unsafe { chitti_kernel::arch::aarch64::ramfb::init() } {
         chitti_kernel::framebuffer::init_console_raw(addr, w, h, pitch);
+        Some((w, h))
+    } else {
+        None
+    };
+    if let Some((w, h)) = fb {
         serial_println!("Chitti: framebuffer TUI up ({}x{}) -- console mirrored to the window", w, h);
         // Bring up a USB keyboard (xHCI + HID) if present — the real-hardware
         // input path; needs the PCIe bus from aarch64_pcie_init.
@@ -266,12 +276,14 @@ fn aarch64_pcie_init() {
 #[cfg(all(target_arch = "aarch64", feature = "boot-limine"))]
 fn aarch64_pcie_init() {}
 
-/// Read the UEFI stub's boot-info page (magic "CHITTIBI"): the GOP
-/// framebuffer `(addr, width, height, pitch)` captured before ExitBootServices.
-/// `None` on the `-kernel` path (no stub) or if the framebuffer lies outside
-/// the identity map. Fields are little-endian u64s after the 8-byte magic.
+/// Read the UEFI stub's boot-info page (magic "CHITTIBI"): the GOP framebuffer
+/// `(addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift)` captured
+/// before ExitBootServices. `None` on the `-kernel` path (no stub) or if the
+/// framebuffer lies outside the identity map. The geometry is little-endian u64s
+/// after the 8-byte magic; the pixel format is 4 bytes at offset 48
+/// (r_shift, g_shift, b_shift, bytes-per-pixel).
 #[cfg(all(target_arch = "aarch64", not(feature = "boot-limine")))]
-fn bootinfo_framebuffer() -> Option<(usize, u64, u64, u64)> {
+fn bootinfo_framebuffer() -> Option<(usize, u64, u64, u64, u64, u32, u32, u32)> {
     // Identity-map coverage (arch::aarch64::mmu N_BLOCKS 1-GiB blocks).
     #[cfg(not(feature = "model-9b"))]
     const MAP_LIMIT: u64 = 4 << 30;
@@ -279,16 +291,22 @@ fn bootinfo_framebuffer() -> Option<(usize, u64, u64, u64)> {
     const MAP_LIMIT: u64 = 12 << 30;
     let bi = bootinfo_page()?;
     let _ = MAP_LIMIT;
-    // SAFETY: `bi` is identity-mapped RAM below the map limit; read 40 bytes.
-    let page = unsafe { core::slice::from_raw_parts(bi as *const u8, 40) };
+    // SAFETY: `bi` is identity-mapped RAM below the map limit; read 52 bytes.
+    let page = unsafe { core::slice::from_raw_parts(bi as *const u8, 52) };
     let f = |o: usize| u64::from_le_bytes(page[o..o + 8].try_into().unwrap());
     let (addr, w, h, pitch) = (f(8), f(16), f(24), f(32));
     if addr == 0 || addr + h * pitch > MAP_LIMIT {
         serial_println!("Chitti: boot-info framebuffer at {:#x} outside the identity map -- skipping", addr);
         return None;
     }
-    serial_println!("Chitti: framebuffer from UEFI boot-info (GOP {}x{} at {:#x})", w, h, addr);
-    Some((addr as usize, w, h, pitch))
+    // Pixel format at 48..52. An older stub that left these zero (all shifts 0,
+    // bpp 0) is treated as the common XRGB8888 default.
+    let (mut rs, mut gs, mut bs, mut bpp) = (page[48] as u32, page[49] as u32, page[50] as u32, page[51] as u64);
+    if bpp == 0 {
+        (rs, gs, bs, bpp) = (16, 8, 0, 4);
+    }
+    serial_println!("Chitti: framebuffer from UEFI boot-info (GOP {}x{} at {:#x}, shifts {}/{}/{})", w, h, addr, rs, gs, bs);
+    Some((addr as usize, w, h, pitch, bpp, rs, gs, bs))
 }
 
 /// Point `synapse::fs` at an ext4 *data* partition so agent writes are durable

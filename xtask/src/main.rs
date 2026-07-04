@@ -232,6 +232,50 @@ fn build_stub_aarch64() -> Result<PathBuf, String> {
     Ok(efi)
 }
 
+/// The framebuffer resolution to hand the guest ramfb, as a `-fw_cfg` argument
+/// (the kernel reads `opt/chitti/fbres`). Not a baked constant: honours
+/// `$CHITTI_FB_RES=WxH`, else auto-detects the host display, else a safe
+/// default. Real hardware / the UEFI path takes its resolution from GOP instead,
+/// so this only shapes the QEMU ramfb window.
+fn ramfb_res_fw_cfg() -> Vec<String> {
+    let (w, h) = std::env::var("CHITTI_FB_RES")
+        .ok()
+        .and_then(|s| parse_wxh(&s))
+        .or_else(detect_host_res)
+        .unwrap_or((1600, 1000));
+    eprintln!("  framebuffer: {w}x{h} (set CHITTI_FB_RES=WxH to override)");
+    vec!["-fw_cfg".into(), format!("name=opt/chitti/fbres,string={w}x{h}")]
+}
+
+/// Parse a `WIDTHxHEIGHT` string.
+fn parse_wxh(s: &str) -> Option<(u32, u32)> {
+    let (a, b) = s.trim().split_once(['x', 'X'])?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+}
+
+/// Best-effort host main-display resolution on macOS via `system_profiler`.
+/// Retina reports are physical pixels, so halve them to a logical size that
+/// makes a window roughly filling the screen; leave headroom for chrome.
+fn detect_host_res() -> Option<(u32, u32)> {
+    let out = Command::new("system_profiler").arg("SPDisplaysDataType").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("Resolution:") else { continue };
+        // e.g. "3456 x 2234 Retina" or "2560 x 1440"
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.len() >= 3 && parts[1] == "x" {
+            if let (Ok(mut w), Ok(mut h)) = (parts[0].parse::<u32>(), parts[2].parse::<u32>()) {
+                if rest.contains("Retina") {
+                    w /= 2;
+                    h /= 2;
+                }
+                return Some((w.max(1024), h.saturating_sub(80).max(720)));
+            }
+        }
+    }
+    None
+}
+
 /// Guard against artifact mixups: assert `elf` is the identity-map `-kernel`
 /// build (entry in low RAM), not a higher-half build sharing the same path.
 fn assert_identity_kernel(elf: &Path) -> Result<(), String> {
@@ -317,7 +361,10 @@ fn cmd_run_aarch64_uefi(model: Model, disk: Option<PathBuf>, disk_only: bool, no
     for a in aavmf_pflash_args()? {
         qemu.arg(a);
     }
-    qemu.args(["-device", "ramfb", "-device", "virtio-keyboard-device", "-serial", "mon:stdio"]);
+    qemu.args([
+        "-device", "ramfb", "-device", "virtio-keyboard-device",
+        "-display", "cocoa,zoom-to-fit=on", "-serial", "mon:stdio",
+    ]);
     // ESP first, data disk LAST: QEMU assigns later virtio-mmio devices to
     // LOWER slots, and the kernel's probe_disk takes the first (lowest) match —
     // so this ordering makes /install + persistence target the data disk, never
@@ -365,9 +412,17 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
     // Ctrl-A C for the monitor).
     qemu.args([
         "-M", "virt", "-cpu", "host", "-accel", "hvf", "-smp", "4", "-m", model.qemu_mem(),
-        "-device", "ramfb", "-device", "virtio-keyboard-device", "-serial", "mon:stdio", "-kernel",
+        "-device", "ramfb", "-device", "virtio-keyboard-device",
+        // Resizable graphical window (the ramfb surface scales to fit).
+        "-display", "cocoa,zoom-to-fit=on",
+        "-serial", "mon:stdio", "-kernel",
     ]);
     qemu.arg(&elf);
+    // Hand the guest ramfb the framebuffer resolution to use (the kernel reads
+    // opt/chitti/fbres) — derived from the host display, not hardcoded.
+    for a in ramfb_res_fw_cfg() {
+        qemu.arg(a);
+    }
     // Attach a virtio-blk disk on the virtio-mmio bus (the aarch64 block driver
     // scans that window) so /disks, /mkext4, /install, and synapse persistence
     // work — the aarch64 counterpart to the x86 virtio-blk-pci drive.

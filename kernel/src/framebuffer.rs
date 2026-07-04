@@ -6,6 +6,13 @@
 //! Geist Mono glyph atlas ([`crate::font_geist`]) alpha-blended per pixel, so
 //! the panes show antialiased type rather than a bare bitmap grid.
 //!
+//! The framebuffer geometry and pixel format are always taken from the boot
+//! source -- the Limine framebuffer (x86), the UEFI GOP handed over by the stub
+//! (aarch64 real hardware / VirtualBox / UTM), or QEMU ramfb -- never hardcoded.
+//! On a high-resolution panel (a 4K HDMI monitor) the 10x22 atlas cell would be
+//! microscopic, so the console picks an integer font `scale` from the panel
+//! height: text stays legible while the panes still fill the whole screen.
+//!
 //! It is a global singleton ([`SCREEN`]) rather than a transient writer because
 //! the two log channels mirror here automatically: `serial::Serial` (every
 //! `serial_print!`/`serial_println!`, i.e. the shell + chat) draws into the
@@ -36,11 +43,11 @@ const SEP_DIM: Rgb = (32, 34, 42);
 const STATUS_BG: Rgb = (20, 21, 27);
 const STATUS_FG: Rgb = (140, 148, 162);
 
-// Layout metrics, in pixels.
-const OUTER: u64 = 6; // margin around the whole content region
-const GAP: u64 = 8; // between the two panes
+// Layout metrics, in pixels (independent of font scale).
+const OUTER: u64 = 8; // margin around the whole content region
+const GAP: u64 = 10; // between the two panes
 const BORDER: u64 = 2; // pane border thickness
-const PAD: u64 = 8; // interior padding inside a pane
+const PAD: u64 = 10; // interior padding inside a pane
 const CHAT_PCT: u64 = 56; // chat pane width as a % of the content region
 
 #[cfg(target_arch = "x86_64")]
@@ -54,9 +61,17 @@ const MODEL: &str = "qwen3.5-9b";
 #[cfg(not(feature = "model-9b"))]
 const MODEL: &str = "qwen3.5-0.8b";
 
+/// Pick an integer font scale from the panel height so glyphs stay a legible
+/// physical size across resolutions: 1x up to ~1600 tall, 2x for 4K-class
+/// panels, 3x beyond. Normal 1080p/1440p monitors render the crisp native
+/// 10x22 atlas; a 4K HDMI display doubles it instead of showing 6px text.
+fn pick_scale(height: u64) -> u64 {
+    ((height + 550) / 1100).max(1)
+}
+
 /// One bordered text pane: an outer box plus the interior character grid it
-/// scrolls text within. Colours and cursor live here; the pixel plumbing lives
-/// on [`Screen`], which owns the framebuffer.
+/// scrolls text within. Colours, cursor, and the (scaled) cell size live here;
+/// the pixel plumbing lives on [`Screen`], which owns the framebuffer.
 struct Pane {
     // Outer box (border-inclusive), pixels.
     x: u64,
@@ -66,6 +81,9 @@ struct Pane {
     // Interior text origin (top-left of cell 0,0), pixels.
     ix: u64,
     iy: u64,
+    // Scaled cell size, pixels.
+    cw: u64,
+    ch: u64,
     // Interior size, cells.
     cols: u64,
     rows: u64,
@@ -79,14 +97,16 @@ struct Pane {
 }
 
 impl Pane {
-    /// Build a pane inside outer box `(x,y,w,h)`, reserving a title header at
-    /// the top and `PAD` interior padding, and computing the cell grid.
-    fn new(x: u64, y: u64, w: u64, h: u64, fg: Rgb, bg: Rgb, title: &'static str, show_caret: bool) -> Pane {
-        let header_h = BORDER + 4 + CELL_H + 6; // top border, title text, separator gap
+    /// Build a pane inside outer box `(x,y,w,h)` with scaled cell `(cw,ch)`,
+    /// reserving a title header and `PAD` interior padding, then computing the
+    /// cell grid.
+    #[allow(clippy::too_many_arguments)]
+    fn new(x: u64, y: u64, w: u64, h: u64, cw: u64, ch: u64, fg: Rgb, bg: Rgb, title: &'static str, show_caret: bool) -> Pane {
+        let header_h = BORDER + 4 + ch + 6; // top border, title text, separator gap
         let ix = x + BORDER + PAD;
         let iy = y + header_h;
-        let iw = (w - 2 * (BORDER + PAD)).max(CELL_W);
-        let ih = (y + h).saturating_sub(iy + BORDER + PAD).max(CELL_H);
+        let iw = (w - 2 * (BORDER + PAD)).max(cw);
+        let ih = (y + h).saturating_sub(iy + BORDER + PAD).max(ch);
         Pane {
             x,
             y,
@@ -94,8 +114,10 @@ impl Pane {
             h,
             ix,
             iy,
-            cols: (iw / CELL_W).max(1),
-            rows: (ih / CELL_H).max(1),
+            cw,
+            ch,
+            cols: (iw / cw).max(1),
+            rows: (ih / ch).max(1),
             col: 0,
             row: 0,
             fg,
@@ -104,11 +126,11 @@ impl Pane {
             show_caret,
         }
     }
-    fn caret_x(&self) -> u64 {
-        self.ix + self.col * CELL_W
+    fn cell_x(&self) -> u64 {
+        self.ix + self.col * self.cw
     }
-    fn caret_y(&self) -> u64 {
-        self.iy + self.row * CELL_H
+    fn cell_y(&self) -> u64 {
+        self.iy + self.row * self.ch
     }
 }
 
@@ -122,11 +144,13 @@ pub struct Screen {
     r_shift: u32,
     g_shift: u32,
     b_shift: u32,
+    scale: u64,
     chat: Pane,
     logs: Pane,
 }
 
 impl Screen {
+    #[allow(clippy::too_many_arguments)]
     fn layout(
         addr: usize,
         width: u64,
@@ -137,16 +161,26 @@ impl Screen {
         g_shift: u32,
         b_shift: u32,
     ) -> Screen {
-        let status_h = CELL_H + 8;
+        let scale = pick_scale(height);
+        let cw = CELL_W * scale;
+        let ch = CELL_H * scale;
+        let status_h = ch + 8;
         let content_h = height.saturating_sub(status_h);
         let box_y = OUTER;
         let box_h = content_h.saturating_sub(2 * OUTER);
         let avail_w = width.saturating_sub(2 * OUTER + GAP);
         let chat_w = avail_w * CHAT_PCT / 100;
         let logs_w = avail_w - chat_w;
-        let chat = Pane::new(OUTER, box_y, chat_w, box_h, CHAT_FG, CHAT_BG, "chat", true);
-        let logs = Pane::new(OUTER + chat_w + GAP, box_y, logs_w, box_h, LOGS_FG, LOGS_BG, "ktrace", false);
-        Screen { addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift, chat, logs }
+        let chat = Pane::new(OUTER, box_y, chat_w, box_h, cw, ch, CHAT_FG, CHAT_BG, "chat", true);
+        let logs = Pane::new(OUTER + chat_w + GAP, box_y, logs_w, box_h, cw, ch, LOGS_FG, LOGS_BG, "ktrace", false);
+        Screen { addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift, scale, chat, logs }
+    }
+
+    fn cw(&self) -> u64 {
+        CELL_W * self.scale
+    }
+    fn ch(&self) -> u64 {
+        CELL_H * self.scale
     }
 
     // --- pixel plumbing --------------------------------------------------
@@ -184,31 +218,43 @@ impl Screen {
         self.fill_rect(x + w - t, y, t, h, c); // right
     }
 
-    /// Alpha-blend one printable glyph onto `(px,py)` over background `bg`.
-    /// Non-printable bytes render as a blank cell (clearing whatever was there).
+    /// Alpha-blend one printable glyph at `(px,py)`, each atlas pixel expanded to
+    /// a `scale`x`scale` block. Non-printable bytes render as a blank cell.
     fn blit_glyph(&self, px: u64, py: u64, byte: u8, fg: Rgb, bg: Rgb) {
         let idx = if (FIRST..=LAST).contains(&byte) { (byte - FIRST) as usize } else { 0 };
         let g = &GLYPHS[idx];
-        for dy in 0..CH {
-            for dx in 0..CW {
-                let a = g[dy * CW + dx] as u32;
-                let mix = |b: u8, f: u8| (((b as u32) * (255 - a) + (f as u32) * a) / 255) as u8;
-                let color = if a == 0 { bg } else { (mix(bg.0, fg.0), mix(bg.1, fg.1), mix(bg.2, fg.2)) };
-                self.put_pixel(px + dx as u64, py + dy as u64, color);
+        let s = self.scale;
+        for gy in 0..CH {
+            for gx in 0..CW {
+                let a = g[gy * CW + gx] as u32;
+                let color = if a == 0 {
+                    bg
+                } else {
+                    let mix = |b: u8, f: u8| (((b as u32) * (255 - a) + (f as u32) * a) / 255) as u8;
+                    (mix(bg.0, fg.0), mix(bg.1, fg.1), mix(bg.2, fg.2))
+                };
+                let bx = px + gx as u64 * s;
+                let by = py + gy as u64 * s;
+                for sy in 0..s {
+                    for sx in 0..s {
+                        self.put_pixel(bx + sx, by + sy, color);
+                    }
+                }
             }
         }
     }
 
-    /// Render `s` at pixel `(px,py)`, advancing one cell per byte. Returns the x
-    /// past the last glyph. Clips at `self.width`. Used for titles + status bar.
+    /// Render `s` at pixel `(px,py)`, advancing one scaled cell per byte. Returns
+    /// the x past the last glyph. Clips at `self.width`. Titles + status bar.
     fn draw_str(&self, px: u64, py: u64, s: &str, fg: Rgb, bg: Rgb) -> u64 {
         let mut x = px;
+        let cw = self.cw();
         for &b in s.as_bytes() {
-            if x + CELL_W > self.width {
+            if x + cw > self.width {
                 break;
             }
             self.blit_glyph(x, py, b, fg, bg);
-            x += CELL_W;
+            x += cw;
         }
         x
     }
@@ -218,33 +264,32 @@ impl Screen {
     /// Scroll a pane's interior up by one text row, clearing the freed row.
     fn scroll_pane(&self, p: &Pane) {
         let x0 = p.ix;
-        let w = p.cols * CELL_W;
+        let w = p.cols * p.cw;
         let top = p.iy;
-        let h = p.rows * CELL_H;
-        let step = (self.pitch * CELL_H) as usize;
+        let h = p.rows * p.ch;
+        let step = (self.pitch * p.ch) as usize;
         let row_bytes = (w * self.bpp_bytes) as usize;
         // SAFETY: every source/destination row lies inside the framebuffer and
-        // inside this pane's x-span; source and destination never overlap
-        // within a single `copy_nonoverlapping` (they are `CELL_H` rows apart).
+        // inside this pane's x-span; source and destination never overlap within
+        // a single `copy_nonoverlapping` (they are `p.ch` rows apart).
         unsafe {
             let base = self.addr as *mut u8;
-            for row in 0..(h - CELL_H) {
+            for row in 0..(h - p.ch) {
                 let dst = ((top + row) * self.pitch + x0 * self.bpp_bytes) as usize;
-                base.add(dst)
-                    .copy_from_nonoverlapping(base.add(dst + step), row_bytes);
+                base.add(dst).copy_from_nonoverlapping(base.add(dst + step), row_bytes);
             }
         }
-        self.fill_rect(x0, top + h - CELL_H, w, CELL_H, p.bg);
+        self.fill_rect(x0, top + h - p.ch, w, p.ch, p.bg);
     }
 
     fn caret_erase(&self, p: &Pane) {
         if p.show_caret {
-            self.fill_rect(p.caret_x(), p.caret_y(), 2, CELL_H, p.bg);
+            self.fill_rect(p.cell_x(), p.cell_y(), 2 * self.scale, p.ch, p.bg);
         }
     }
     fn caret_draw(&self, p: &Pane) {
         if p.show_caret {
-            self.fill_rect(p.caret_x(), p.caret_y(), 2, CELL_H, ACCENT);
+            self.fill_rect(p.cell_x(), p.cell_y(), 2 * self.scale, p.ch, ACCENT);
         }
     }
 
@@ -266,7 +311,7 @@ impl Screen {
             b'\t' => {
                 let next = (p.col / 4 + 1) * 4;
                 while p.col < next && p.col < p.cols {
-                    s.blit_glyph(p.ix + p.col * CELL_W, p.iy + p.row * CELL_H, b' ', p.fg, p.bg);
+                    s.blit_glyph(p.cell_x(), p.cell_y(), b' ', p.fg, p.bg);
                     p.col += 1;
                 }
                 if p.col >= p.cols {
@@ -280,10 +325,10 @@ impl Screen {
                     p.row -= 1;
                     p.col = p.cols - 1;
                 }
-                s.blit_glyph(p.ix + p.col * CELL_W, p.iy + p.row * CELL_H, b' ', p.fg, p.bg);
+                s.blit_glyph(p.cell_x(), p.cell_y(), b' ', p.fg, p.bg);
             }
             0x20..=0x7e => {
-                s.blit_glyph(p.ix + p.col * CELL_W, p.iy + p.row * CELL_H, byte, p.fg, p.bg);
+                s.blit_glyph(p.cell_x(), p.cell_y(), byte, p.fg, p.bg);
                 p.col += 1;
                 if p.col >= p.cols {
                     Screen::newline(p, s);
@@ -305,17 +350,17 @@ impl Screen {
         let tx = p.x + BORDER + PAD;
         let end = self.draw_str(tx, ty, p.title, title_c, p.bg);
         if active {
-            // A small "●" is not in ASCII; use a bright marker instead.
             self.draw_str(end, ty, " *", ACCENT, p.bg);
         }
         // Separator under the title.
-        let sep_y = ty + CELL_H + 3;
+        let sep_y = ty + self.ch() + 3;
         self.fill_rect(p.x + BORDER, sep_y, p.w - 2 * BORDER, 1, SEP_DIM);
     }
 
     fn draw_status(&self) {
-        let sy_top = self.height - (CELL_H + 8);
-        self.fill_rect(0, sy_top, self.width, CELL_H + 8, STATUS_BG);
+        let bar_h = self.ch() + 8;
+        let sy_top = self.height - bar_h;
+        self.fill_rect(0, sy_top, self.width, bar_h, STATUS_BG);
         let ty = sy_top + 4;
         // Left: brand + pane tabs.
         let mut x = self.draw_str(OUTER, ty, "chitti-os", ACCENT, STATUS_BG);
@@ -326,7 +371,7 @@ impl Screen {
         // Right: model + arch, right-aligned.
         let right = " * ";
         let text_cells = (MODEL.len() + right.len() + ARCH.len()) as u64;
-        let rx = self.width.saturating_sub(text_cells * CELL_W + OUTER);
+        let rx = self.width.saturating_sub(text_cells * self.cw() + OUTER);
         let mut x = self.draw_str(rx, ty, MODEL, STATUS_FG, STATUS_BG);
         x = self.draw_str(x, ty, right, ACCENT, STATUS_BG);
         let _ = self.draw_str(x, ty, ARCH, TITLE_ACTIVE, STATUS_BG);
@@ -362,12 +407,29 @@ pub fn init_console(fb: &Framebuffer) {
     init_from(s);
 }
 
-/// Bring up the compositor over a raw linear framebuffer, for arches that don't
-/// get one from Limine. The aarch64 `ramfb` driver (`arch::aarch64::ramfb`)
-/// calls this with an `XRGB8888` buffer it configured via fw_cfg.
+/// Bring up the compositor over a raw linear framebuffer whose pixels are
+/// **XRGB8888** (little-endian B,G,R,X → red 16 / green 8 / blue 0) — the common
+/// case (QEMU ramfb, most UEFI GOP / VirtualBox).
 pub fn init_console_raw(addr: usize, width: u64, height: u64, pitch: u64) {
-    // XRGB8888: little-endian B,G,R,X → red 16 / green 8 / blue 0.
-    let s = Screen::layout(addr, width, height, pitch, 4, 16, 8, 0);
+    init_console_raw_fmt(addr, width, height, pitch, 4, 16, 8, 0);
+}
+
+/// Bring up the compositor over a raw linear framebuffer with an explicit pixel
+/// format. Used by the aarch64 UEFI path, which reads the GOP pixel format from
+/// the boot-info page (a real HDMI monitor may report RGB rather than BGR, and
+/// swapping red/blue would tint the whole UI).
+#[allow(clippy::too_many_arguments)]
+pub fn init_console_raw_fmt(
+    addr: usize,
+    width: u64,
+    height: u64,
+    pitch: u64,
+    bpp_bytes: u64,
+    r_shift: u32,
+    g_shift: u32,
+    b_shift: u32,
+) {
+    let s = Screen::layout(addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift);
     init_from(s);
 }
 
@@ -420,5 +482,8 @@ pub fn log_print(s: &str) {
 /// which needs immutable access to the screen's pixel plumbing while mutating a
 /// pane). Its geometry is degenerate so it never draws anything if used.
 fn dummy_pane() -> Pane {
-    Pane { x: 0, y: 0, w: 0, h: 0, ix: 0, iy: 0, cols: 1, rows: 1, col: 0, row: 0, fg: SCREEN_BG, bg: SCREEN_BG, title: "", show_caret: false }
+    Pane {
+        x: 0, y: 0, w: 0, h: 0, ix: 0, iy: 0, cw: 1, ch: 1, cols: 1, rows: 1, col: 0, row: 0,
+        fg: SCREEN_BG, bg: SCREEN_BG, title: "", show_caret: false,
+    }
 }
