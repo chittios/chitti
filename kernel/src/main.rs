@@ -218,6 +218,9 @@ pub extern "C" fn aarch64_start() -> ! {
         // A PL050 PS/2 keyboard (ARM dev boards / some hypervisors) — the ARM
         // analogue of the x86 i8042. No-op where absent (e.g. QEMU `virt`).
         let pl050 = chitti_kernel::arch::aarch64::pl050::init();
+        // A PL050 PS/2 mouse (a second KMI) — the ARM PS/2 pointing device, as
+        // VirtualBox-ARM presents (hidpointing=ps2mouse). No-op where absent.
+        let _pl050_mouse = chitti_kernel::arch::aarch64::pl050_mouse::init();
         // Also wire the virtio-keyboard (QEMU `virt` window). Absent without one.
         let virtio_kbd = chitti_kernel::arch::aarch64::virtio_input::init();
         // A virtio pointer (tablet/mouse) for the window — the aarch64 mouse.
@@ -228,11 +231,13 @@ pub extern "C" fn aarch64_start() -> ! {
         // ground truth for "why isn't my keyboard working".
         let ecam = chitti_kernel::pci::ecam_base();
         serial_println!(
-            "Chitti: INPUT  pcie-ecam={:#x}  usb-kbd={}  pl050={}  virtio-kbd={}  (serial always works)",
+            "Chitti: INPUT  pcie-ecam={:#x}  usb-kbd={}  pl050-kbd={}  virtio-kbd={}  mouse[virtio={} ps2={}]  (serial always works)",
             ecam,
             if usb_kbd { "READY" } else { "no" },
             if pl050 { "yes" } else { "no" },
-            if virtio_kbd { "yes" } else { "no" }
+            if virtio_kbd { "yes" } else { "no" },
+            if _mouse { "yes" } else { "no" },
+            if _pl050_mouse { "yes" } else { "no" }
         );
     }
     // Same storage bring-up as x86: mount SimpleFS demo disk (if any) and point

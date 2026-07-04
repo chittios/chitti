@@ -14,6 +14,7 @@ pub mod exceptions;
 pub mod gic;
 pub mod nvme;
 pub mod pl050;
+pub mod pl050_mouse;
 pub mod ramfb;
 pub mod rtc;
 pub mod smp;
