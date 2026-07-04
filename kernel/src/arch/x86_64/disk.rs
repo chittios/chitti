@@ -7,28 +7,38 @@
 
 use crate::arch::x86_64::{ahci, nvme};
 use crate::block::ahci::Ahci;
-use crate::block::nvme::Nvme;
+use crate::block::nvme::NvmeNamespace;
 use crate::block::virtio::VirtioBlk;
 use crate::block::{BlockDevice, BlockError};
 
 /// The x86 boot disk, one variant per real transport.
 pub enum Disk {
     Virtio(VirtioBlk),
-    Nvme(Nvme),
+    Nvme(NvmeNamespace),
     Ahci(Ahci),
 }
 
 impl Disk {
+    /// The `n`-th block device across ALL transports, counted globally: every
+    /// virtio-blk disk, then every NVMe namespace, then AHCI. (Passing `n` to
+    /// each transport would let one transport's disks shadow another's.)
     pub fn probe_nth(n: usize) -> Option<Disk> {
-        if let Some(d) = VirtioBlk::probe_nth(n) {
-            return Some(Disk::Virtio(d));
+        let mut idx = 0usize;
+        macro_rules! scan {
+            ($probe:path, $variant:path) => {{
+                let mut k = 0usize;
+                while let Some(d) = $probe(k) {
+                    if idx == n {
+                        return Some($variant(d));
+                    }
+                    idx += 1;
+                    k += 1;
+                }
+            }};
         }
-        if let Some(d) = nvme::probe_nth(n) {
-            return Some(Disk::Nvme(d));
-        }
-        if let Some(d) = ahci::probe_nth(n) {
-            return Some(Disk::Ahci(d));
-        }
+        scan!(VirtioBlk::probe_nth, Disk::Virtio);
+        scan!(nvme::probe_nth, Disk::Nvme);
+        scan!(ahci::probe_nth, Disk::Ahci);
         None
     }
 }

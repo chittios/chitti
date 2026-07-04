@@ -4,7 +4,7 @@
 //! identity/HHDM DMA allocator to the arch-neutral driver.
 
 use crate::arch::aarch64::dma_to_phys;
-use crate::block::nvme::{Nvme, MMIO_SPAN};
+use crate::block::nvme::{probe_namespace, NvmeNamespace, MMIO_SPAN};
 use crate::block::Dma;
 use crate::pci;
 use alloc::alloc::{alloc_zeroed, Layout};
@@ -25,7 +25,7 @@ fn dma_alloc(bytes: usize) -> Option<Dma> {
 /// Probe the `n`-th NVMe disk on the PCIe bus. One controller is supported, but
 /// it may expose several namespaces (VirtualBox presents each attached disk as
 /// NSID 1, 2, …); `n` selects namespace `n + 1`. `None` once namespaces run out.
-pub fn probe_nth(n: usize) -> Option<Nvme> {
+pub fn probe_nth(n: usize) -> Option<NvmeNamespace> {
     // NVMe class 0x01 (mass storage) / subclass 0x08 / prog-if 0x02.
     let d = pci::find_class(0x01, 0x08, 0x02)?;
     d.enable_bus_master();
@@ -35,6 +35,7 @@ pub fn probe_nth(n: usize) -> Option<Nvme> {
     }
     let _ = MMIO_SPAN; // the identity Device block covers the whole BAR window
     crate::arch::aarch64::mmu::map_device_gib(regs);
-    // SAFETY: `regs` is the BAR-mapped NVMe register block (Device memory).
-    unsafe { Nvme::bringup(regs, dma_alloc, (n + 1) as u32) }
+    // SAFETY: `regs` is the BAR-mapped NVMe register block (Device memory). The
+    // controller is brought up once; this attaches namespace n+1 through it.
+    unsafe { probe_namespace(regs, dma_alloc, n) }
 }
