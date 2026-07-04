@@ -23,7 +23,8 @@
 use crate::font_geist::{CELL_H as CH, CELL_W as CW, FIRST, GLYPHS, LAST};
 use crate::limine_protocol::Framebuffer;
 use crate::mm::Locked;
-use alloc::string::String;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 const CELL_W: u64 = CW as u64;
 const CELL_H: u64 = CH as u64;
@@ -810,15 +811,8 @@ impl Screen {
         let sy_top = self.height - bar_h;
         self.fill_rect(0, sy_top, self.width, bar_h, self.theme.status_bg);
         let ty = sy_top + 4;
-        // Left: the Synapse-C brand mark, then the brand text (accent). The icon
-        // nearly fills the bar height (bolder + more legible than a third of it)
-        // and is vertically centred.
-        let icon_r = bar_h.saturating_sub(4) / 2;
-        let icon_cx = OUTER + icon_r;
-        let icon_cy = sy_top + bar_h / 2;
-        self.draw_logo(icon_cx, icon_cy, icon_r, self.theme.accent, self.theme.status_bg);
-        let text_x = icon_cx + icon_r + OUTER;
-        self.draw_str(text_x, ty, &self.status_left, self.theme.accent, self.theme.status_bg);
+        // Left = brand text (accent), right = datetime (muted), right-aligned.
+        self.draw_str(OUTER, ty, &self.status_left, self.theme.accent, self.theme.status_bg);
         // Right = datetime (muted), right-aligned. Both strings come from the UI
         // config templates via `set_status`.
         let rlen = self.status_right.len() as u64;
@@ -939,6 +933,164 @@ impl Screen {
 }
 
 static SCREEN: Locked<Option<Screen>> = Locked::new(None);
+
+// --- modal overlay (approval / input dialogs) ---------------------------
+
+/// Which modal control the mouse hit, for [`modal_hit`].
+#[derive(Clone, Copy, PartialEq)]
+pub enum ModalHit {
+    None,
+    Yes,
+    No,
+    Ok,
+}
+
+/// Pixel rects of the modal's clickable controls: `[yes, no, ok]`. Set when a
+/// modal is drawn, read by [`modal_hit`] for mouse routing. Zero-size = absent.
+static MODAL_RECTS: Locked<[(u64, u64, u64, u64); 3]> = Locked::new([(0, 0, 0, 0); 3]);
+
+fn in_rect(x: u64, y: u64, r: (u64, u64, u64, u64)) -> bool {
+    r.2 != 0 && x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3
+}
+
+/// Hit-test the modal controls against a click at `(x, y)`.
+pub fn modal_hit(x: u64, y: u64) -> ModalHit {
+    let r = MODAL_RECTS.with(|m| *m);
+    if in_rect(x, y, r[0]) {
+        ModalHit::Yes
+    } else if in_rect(x, y, r[1]) {
+        ModalHit::No
+    } else if in_rect(x, y, r[2]) {
+        ModalHit::Ok
+    } else {
+        ModalHit::None
+    }
+}
+
+impl Screen {
+    /// Draw a centred modal box and return its interior text origin + width in
+    /// cells `(ix, iy, cols)`. Dims the screen isn't done (kept cheap); the box
+    /// simply overpaints the middle of the canvas.
+    fn modal_box(&self, title: &str, rows: u64) -> (u64, u64, u64) {
+        let cw = self.cw();
+        let ch = self.ch();
+        let cols = (self.width / cw).clamp(20, 64) * 2 / 3;
+        let bw = cols * cw + 2 * (BORDER + PAD);
+        let bh = (rows + 2) * ch + 2 * (BORDER + PAD);
+        let bx = (self.width - bw) / 2;
+        let by = (self.height - bh) / 2;
+        self.fill_rect(bx, by, bw, bh, self.theme.status_bg);
+        self.rect_outline(bx, by, bw, bh, BORDER, self.theme.accent);
+        let ix = bx + BORDER + PAD;
+        let iy = by + BORDER + PAD;
+        self.draw_str(ix, iy, title, self.theme.accent, self.theme.status_bg);
+        self.fill_rect(ix, iy + ch + 2, cols * cw, 1, self.theme.sep_dim);
+        (ix, iy + 2 * ch, cols)
+    }
+
+    /// Draw a labelled button at `(x, y)`, filled when `focused`; record its rect
+    /// in `MODAL_RECTS[slot]` for mouse hit-testing. Returns the x just past it.
+    fn modal_button(&self, x: u64, y: u64, label: &str, focused: bool, slot: usize) -> u64 {
+        let cw = self.cw();
+        let ch = self.ch();
+        let w = (label.len() as u64 + 2) * cw;
+        let (fg, bg) = if focused { (self.theme.status_bg, self.theme.accent) } else { (self.theme.accent, self.theme.status_bg) };
+        self.fill_rect(x, y, w, ch, bg);
+        self.rect_outline(x, y, w, ch, 1, self.theme.accent);
+        self.draw_str(x + cw, y, label, fg, bg);
+        MODAL_RECTS.with(|m| m[slot] = (x, y, w, ch));
+        x + w + cw
+    }
+}
+
+/// Draw an approval (yes/no) modal. `focus_yes` highlights the Yes button.
+pub fn draw_confirm(title: &str, msg: &str, focus_yes: bool) {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.cursor_restore();
+            sc.cur_vis = false;
+            MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
+            let (ix, iy, cols) = sc.modal_box(title, 3);
+            let ch = sc.ch();
+            // Wrap the message to the box width.
+            let mut y = iy;
+            for line in wrap(msg, cols as usize) {
+                sc.draw_str(ix, y, &line, sc.theme.chat_fg, sc.theme.status_bg);
+                y += ch;
+            }
+            let by = iy + 2 * ch;
+            let x2 = sc.modal_button(ix, by, "Yes", focus_yes, 0);
+            sc.modal_button(x2, by, "No", !focus_yes, 1);
+            sc.cursor_overlay();
+        }
+    });
+}
+
+/// Draw a text-input modal (masked = password dots). `caret_on` blinks the caret.
+pub fn draw_input(title: &str, prompt: &str, buf: &str, masked: bool, caret_on: bool) {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.cursor_restore();
+            sc.cur_vis = false;
+            MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
+            let (ix, iy, cols) = sc.modal_box(title, 3);
+            let ch = sc.ch();
+            let cw = sc.cw();
+            sc.draw_str(ix, iy, prompt, sc.theme.title_dim, sc.theme.status_bg);
+            // Input field: a framed row showing the (optionally masked) text.
+            let fy = iy + ch + 4;
+            sc.fill_rect(ix, fy, cols * cw, ch, sc.theme.chat_bg);
+            sc.rect_outline(ix, fy, cols * cw, ch, 1, sc.theme.border_dim);
+            let shown: String = if masked { core::iter::repeat('*').take(buf.chars().count()).collect() } else { buf.to_string() };
+            let end = sc.draw_str(ix + cw / 2, fy, &shown, sc.theme.chat_fg, sc.theme.chat_bg);
+            if caret_on {
+                sc.fill_rect(end, fy, 2 * sc.scale, ch, sc.theme.accent);
+            }
+            let by = fy + ch + ch / 2;
+            sc.modal_button(ix, by, "OK", true, 2);
+            sc.cursor_overlay();
+        }
+    });
+}
+
+/// Dismiss any modal and repaint the normal UI.
+pub fn modal_dismiss() {
+    MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.redraw();
+            sc.cur_vis = false;
+        }
+    });
+}
+
+/// Word-wrap `s` to `cols` columns (breaking long words), for modal messages.
+fn wrap(s: &str, cols: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in s.split_whitespace() {
+        if !line.is_empty() && line.len() + 1 + word.len() > cols {
+            out.push(core::mem::take(&mut line));
+        }
+        for chunk in word.as_bytes().chunks(cols.max(1)) {
+            let w = core::str::from_utf8(chunk).unwrap_or("");
+            if line.len() + 1 + w.len() > cols && !line.is_empty() {
+                out.push(core::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(w);
+        }
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
 
 /// Bring up the compositor on a Limine framebuffer and paint the initial UI.
 pub fn init_console(fb: &Framebuffer) {
