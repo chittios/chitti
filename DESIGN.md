@@ -38,7 +38,7 @@ terracotta; the status-bar mark is all terracotta.
 
 Where it appears:
 
-- **Boot splash** — the mark, `CHITTI OS`, and the tagline *an agentic operating
+- **Boot splash** — the mark, `Chitti OS`, and the tagline *an agentic operating
   system*, centred on the canvas, held ~1.3 s before the shell (`draw_splash`).
 - **Status bar** — a small mark at the bottom-left, before the brand text.
 
