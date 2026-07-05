@@ -45,6 +45,8 @@ const MTU: usize = 1514;
 /// Adapts a [`NetDevice`] to smoltcp's `phy::Device`. `receive` copies the frame
 /// into an owned token (so the returned TX token can borrow the device);
 /// `transmit` fills a scratch buffer the closure writes, then hands it to the NIC.
+pub mod http;
+
 pub struct ChittiPhy {
     dev: Box<dyn NetDevice>,
 }

@@ -9,6 +9,8 @@
 //! and [`run`] is the interactive read-eval loop over COM1 that a person
 //! drives at `cargo xtask run`.
 
+pub mod remote;
+
 use crate::mm::Locked;
 use crate::persona::{self, Agent, Planner, RulePlanner};
 use crate::{serial_print, serial_println};
@@ -131,6 +133,14 @@ pub fn run() -> ! {
         ));
     }
     let mut chat: Option<ChatSession> = None;
+    // Remote (hosted-model) backend: config persisted at /configs/core/model.json.
+    let (mut remote_on, mut remote_cfg) = remote::load();
+    let mut remote_chat: Option<remote::RemoteChat> = None;
+    if remote_on {
+        if let Some(c) = &remote_cfg {
+            serial_println!("model> remote backend active: {} ({})  — /model local to switch back", c.url, c.model);
+        }
+    }
     let mut line = String::new();
 
     loop {
@@ -153,6 +163,7 @@ pub fn run() -> ! {
                 }
                 "clear" => {
                     chat = None;
+                    remote_chat = None;
                     #[cfg(not(test))]
                     crate::framebuffer::clear_chat();
                     serial_println!("(chat context + screen cleared)");
@@ -160,10 +171,21 @@ pub fn run() -> ! {
                 "open" | "edit" => run_open(arg),
                 // --- agents-as-processes ------------------------------------
                 "agents" => run_agents(arg, &mut chat),
-                "compact" => match chat.as_mut() {
-                    Some(sess) => sess.compact(),
-                    None => serial_println!("(no chat session yet — nothing to compact)"),
-                },
+                "compact" => {
+                    if remote_on {
+                        match remote_chat.as_mut() {
+                            Some(rc) => rc.compact(),
+                            None => serial_println!("(no remote chat yet — nothing to compact)"),
+                        }
+                    } else {
+                        match chat.as_mut() {
+                            Some(sess) => sess.compact(),
+                            None => serial_println!("(no chat session yet — nothing to compact)"),
+                        }
+                    }
+                }
+                "model" => run_model(arg, &mut remote_on, &mut remote_cfg, &mut remote_chat),
+                "http" => run_http(arg),
                 "session" => {
                     let (sub, sarg) = match arg.split_once(' ') {
                         Some((s, a)) => (s, a.trim()),
@@ -215,7 +237,18 @@ pub fn run() -> ! {
             }
             continue;
         }
-        // Plain text -> chat with the model.
+        // Plain text -> chat with the model (hosted backend when /model remote
+        // is active; the embedded GGUF otherwise).
+        if remote_on {
+            match &remote_cfg {
+                Some(cfg) => {
+                    let rc = remote_chat.get_or_insert_with(|| remote::RemoteChat::new(cfg.clone()));
+                    rc.turn(msg);
+                }
+                None => serial_println!("model> remote mode but no endpoint — /model remote http://host:port [name]"),
+            }
+            continue;
+        }
         if chat.is_none() {
             let mut spin = Spinner::new("loading model");
             chat = ChatSession::load(&mut spin);
@@ -225,7 +258,7 @@ pub fn run() -> ! {
             Some(sess) => {
                 sess.turn(msg);
             }
-            None => serial_println!("no model bundled -- chat unavailable (try /infer, /bench)"),
+            None => serial_println!("no model bundled -- chat unavailable (try /infer, /bench, or /model remote)"),
         }
     }
 }
@@ -494,6 +527,8 @@ fn print_help() {
     serial_println!("  /agents [..]     agent process list; /agents switch <id> | kill <id>");
     serial_println!("  /session         show the current session; /session save | /session resume <id>");
     serial_println!("  /compact         compact the chat context (model-written summary, fresh KV)");
+    serial_println!("  /model [..]      chat backend: local (embedded) | remote <http://host:port> [name]");
+    serial_println!("  /http get|post   one-shot HTTP over the LAN (plain http, no TLS)");
     serial_println!("  /skills          list installed skills (L0 metadata)");
     serial_println!("  /clear           reset the chat context + clear the pane (incl. scrollback)");
     serial_println!("  /infer           reference inference (fixed prompt, parity check)");
@@ -1940,6 +1975,144 @@ impl crate::agent::agent_loop::ToolDispatch for CommandTools {
     }
 }
 
+/// `/model` — choose the chat backend: the embedded local GGUF, or a hosted
+/// OpenAI-compatible endpoint (llama.cpp server / Ollama / vLLM / LM Studio)
+/// over plain http (no in-kernel TLS — host/LAN endpoints). Persisted at
+/// /configs/core/model.json. Deliberately NOT an agent tool: letting the
+/// model repoint its own brain at a remote server would be a prompt-injection
+/// escalation, so only the human at the shell can switch backends.
+fn run_model(
+    arg: &str,
+    remote_on: &mut bool,
+    remote_cfg: &mut Option<remote::RemoteConfig>,
+    remote_chat: &mut Option<remote::RemoteChat>,
+) {
+    let toks: alloc::vec::Vec<&str> = arg.split_whitespace().collect();
+    match toks.first().copied().unwrap_or("") {
+        "" => {
+            let local_name = crate::cortex::model_module().map(|_| "embedded GGUF").unwrap_or("none bundled");
+            serial_println!("model> active: {}", if *remote_on { "remote" } else { "local" });
+            serial_println!("model>   local:  {}", local_name);
+            match remote_cfg {
+                Some(c) => serial_println!(
+                    "model>   remote: {} ({}{})",
+                    c.url,
+                    c.model,
+                    if c.key.is_some() { ", bearer key set" } else { "" }
+                ),
+                None => serial_println!("model>   remote: not configured"),
+            }
+            serial_println!("model> usage: /model local | /model remote <http://host:port> [name] [key <k>]");
+            serial_println!("model>        (voice + /infer//perf always use the local model)");
+        }
+        "local" => {
+            *remote_on = false;
+            *remote_chat = None;
+            remote::save(false, remote_cfg.as_ref());
+            serial_println!("model> local (embedded) model active");
+        }
+        "remote" => {
+            // /model remote [<url>] [name] [key <k>] — with no url, re-activate
+            // the stored endpoint.
+            let mut url: Option<&str> = None;
+            let mut name: Option<&str> = None;
+            let mut key: Option<&str> = None;
+            let mut i = 1;
+            while i < toks.len() {
+                match toks[i] {
+                    "key" if i + 1 < toks.len() => {
+                        key = Some(toks[i + 1]);
+                        i += 2;
+                    }
+                    t if t.starts_with("http") => {
+                        url = Some(t);
+                        i += 1;
+                    }
+                    t => {
+                        name = Some(t);
+                        i += 1;
+                    }
+                }
+            }
+            let cfg = match (url, remote_cfg.as_ref()) {
+                (Some(u), _) => {
+                    if u.starts_with("https://") {
+                        serial_println!("model> https is not supported (no in-kernel TLS) — use http:// on the host/LAN");
+                        return;
+                    }
+                    remote::RemoteConfig {
+                        url: u.trim_end_matches('/').to_string(),
+                        model: name.unwrap_or("default").to_string(),
+                        key: key.map(|k| k.to_string()),
+                    }
+                }
+                (None, Some(c)) => {
+                    let mut c = c.clone();
+                    if let Some(n) = name {
+                        c.model = n.to_string();
+                    }
+                    if let Some(k) = key {
+                        c.key = Some(k.to_string());
+                    }
+                    c
+                }
+                (None, None) => {
+                    serial_println!("model> usage: /model remote <http://host:port> [name] [key <k>]");
+                    serial_println!("model>   e.g. /model remote http://192.168.1.20:8080 llama-3.1-8b");
+                    serial_println!("model>        /model remote http://192.168.1.20:11434 qwen3:8b   (Ollama)");
+                    return;
+                }
+            };
+            *remote_cfg = Some(cfg.clone());
+            *remote_on = true;
+            *remote_chat = None; // fresh history against the new endpoint
+            remote::save(true, Some(&cfg));
+            serial_println!("model> remote backend active: {} ({})", cfg.url, cfg.model);
+            serial_println!("model> tip: /http get {}/v1/models to check reachability", cfg.url);
+        }
+        other => serial_println!("model> unknown '{}' — usage: /model [local | remote <url> [name] [key <k>]]", other),
+    }
+}
+
+/// `/http` — one-shot HTTP client over the net stack (also the agent's `http`
+/// tool): `get <url>` or `post <url> <json-body>`. Plain http only; bodies are
+/// truncated for display/prompt sanity.
+fn run_http(arg: &str) {
+    let (verb, rest) = match arg.split_once(' ') {
+        Some((v, r)) => (v, r.trim()),
+        None => (arg.trim(), ""),
+    };
+    const CAP: usize = 4096;
+    let show = |resp: crate::net::http::Response| {
+        let text = resp.text();
+        let body = text.trim();
+        serial_println!("http> {} ({} bytes)", resp.status, resp.body.len());
+        if body.len() > CAP {
+            serial_println!("{}", &body[..CAP]);
+            serial_println!("http> … truncated ({} of {} bytes shown)", CAP, body.len());
+        } else if !body.is_empty() {
+            serial_println!("{}", body);
+        }
+    };
+    match verb {
+        "get" if !rest.is_empty() => match crate::net::http::get(rest, 30_000) {
+            Ok(r) => show(r),
+            Err(e) => serial_println!("http> error: {}", e),
+        },
+        "post" => match rest.split_once(' ') {
+            Some((url, body)) => match crate::net::http::post_json(url, body.trim(), None, 60_000) {
+                Ok(r) => show(r),
+                Err(e) => serial_println!("http> error: {}", e),
+            },
+            None => serial_println!("usage: /http post <url> <json-body>"),
+        },
+        _ => {
+            serial_println!("usage: /http get <url> | /http post <url> <json-body>");
+            serial_println!("  plain http:// only (no TLS) — host/LAN endpoints; needs /network up");
+        }
+    }
+}
+
 /// `/agents` — agents are processes in Chitti OS. List the live scheduler
 /// tasks that carry agent identity (the shell agent, parked orchestrator /
 /// sub-agent capability holders), switch the shell chat to another agent's
@@ -2079,7 +2252,7 @@ static HISTORY: Locked<alloc::vec::Vec<String>> = Locked::new(alloc::vec::Vec::n
 /// Top-level `/command` names, for Tab completion (canonical names only, not
 /// aliases). Keep in sync with `dispatch_system` + the interactive arms.
 const COMMANDS: &[&str] = &[
-    "agents", "bench", "cat", "clear", "close", "compact", "datetime", "disks", "exit", "help", "infer", "info",
+    "agents", "bench", "cat", "clear", "close", "compact", "datetime", "disks", "exit", "help", "http", "infer", "info", "model",
     "install", "ktrace", "ls", "mkext4", "mode", "mount", "mounts", "network", "open", "perf",
     "lspci", "onnx", "ping", "session", "shortcuts", "skills", "think", "ui", "umount", "voice", "wifi",
 ];

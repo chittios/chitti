@@ -169,8 +169,14 @@ real UEFI hardware.
   `NetDevice` facade — **virtio-net** over virtio-mmio (aarch64 QEMU) and over
   PCI, plus **e1000** (VirtualBox default + real Intel) — discovered the same way
   on both arches. Shell surface: `/network` (info/dhcp/static/dns), `/ping`,
-  `/wifi` (scan/connect via the password modal). The stack is polled cooperatively
-  from the shell idle loop. NB: aarch64 MMIO register access must be a single
+  `/wifi` (scan/connect via the password modal), `/http get|post` (a minimal
+  HTTP/1.1 client in `net/http.rs` — plain http, no in-kernel TLS; also the
+  agent's `http` tool). `/model remote <http://host:port> [name]` points the
+  shell agent at a **hosted** OpenAI-compatible model (llama.cpp server /
+  Ollama / vLLM) via `shell/remote.rs` — same system prompt, tool calls, and
+  approval gates; only generation moves off-box (config persisted at
+  `/configs/core/model.json`; switching backends is human-only, never an agent
+  tool). The stack is polled cooperatively from the shell idle loop. NB: aarch64 MMIO register access must be a single
   `ldr`/`str` (inline asm) — LLVM otherwise coalesces adjacent volatile accesses
   into a paired load HVF can't decode (`hvf: isv`).
 - **Sound & voice** (`sound/`, `onnx/`) — virtio-snd PCM in/out (S16 mono,
