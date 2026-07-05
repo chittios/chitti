@@ -42,9 +42,11 @@ const FOURCC_XRGB8888: u32 = 0x3432_5258;
 /// resolution (see [`read_fbres`]). ramfb has no preferred-mode/EDID mechanism,
 /// so the guest must choose a size; `xtask` passes the host display's size via
 /// the `opt/chitti/fbres` fw_cfg file, and this is the last resort if it's
-/// absent (e.g. a bare `-kernel` boot). Kept modest so it fits any window.
-const FALLBACK_WIDTH: u64 = 1280;
-const FALLBACK_HEIGHT: u64 = 800;
+/// absent (e.g. a bare `-kernel` boot). Full HD: QEMU's display scales the
+/// window (`zoom-to-fit`), so a large surface beats a tiny one that must be
+/// stretched blurry.
+const FALLBACK_WIDTH: u64 = 1920;
+const FALLBACK_HEIGHT: u64 = 1080;
 
 /// The DMA command block QEMU reads. All fields are big-endian on the wire.
 #[repr(C)]
