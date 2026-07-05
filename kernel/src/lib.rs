@@ -151,6 +151,8 @@ pub fn init() {
     arch::x86_64::pic::init();
     arch::x86_64::pit::init();
     arch::x86_64::keyboard::init();
+    // PS/2 mouse (i8042 aux port, polled) — VirtualBox/QEMU q35/real PCs.
+    arch::x86_64::i8042::init();
 
     let hhdm_offset = HHDM_REQUEST.response().expect("HHDM request refused by Limine").offset;
     let memmap = MEMMAP_REQUEST

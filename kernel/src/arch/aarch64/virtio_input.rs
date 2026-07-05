@@ -343,20 +343,27 @@ fn handle_event(dev: &mut VirtioInput, ev: InputEvent) {
     if ev.value == 0 {
         return; // key release of a normal key: nothing to emit
     }
-    // Arrow keys (Linux keycodes) become the ANSI sequences a serial terminal
-    // sends (ESC [ A/B/C/D), so the shell decodes one encoding for every input
-    // path (history navigation etc.).
-    if let Some(fin) = match ev.code {
-        103 => Some(b'A'), // KEY_UP
-        108 => Some(b'B'), // KEY_DOWN
-        106 => Some(b'C'), // KEY_RIGHT
-        105 => Some(b'D'), // KEY_LEFT
+    // Arrow/nav keys (Linux keycodes) become the ANSI sequences a serial
+    // terminal sends, so the shell/editor decode one encoding for every input
+    // path. Ctrl+Tab is the pane-focus toggle (private CSI `ESC [ T`).
+    if let Some(seq) = match ev.code {
+        103 => Some(&b"[A"[..]),           // KEY_UP
+        108 => Some(&b"[B"[..]),           // KEY_DOWN
+        106 => Some(&b"[C"[..]),           // KEY_RIGHT
+        105 => Some(&b"[D"[..]),           // KEY_LEFT
+        102 => Some(&b"[H"[..]),           // KEY_HOME
+        107 => Some(&b"[F"[..]),           // KEY_END
+        104 => Some(&b"[5~"[..]),          // KEY_PAGEUP
+        109 => Some(&b"[6~"[..]),          // KEY_PAGEDOWN
+        111 => Some(&b"[3~"[..]),          // KEY_DELETE
+        15 if dev.ctrl => Some(&b"[T"[..]), // Ctrl+Tab
         _ => None,
     } {
         RING.with(|r| {
             r.push(0x1b);
-            r.push(b'[');
-            r.push(fin);
+            for &b in seq {
+                r.push(b);
+            }
         });
         return;
     }
@@ -378,6 +385,7 @@ pub fn read_byte() -> Option<u8> {
 fn keycode_to_ascii(code: u16, shift: bool, ctrl: bool) -> Option<u8> {
     // (base, shifted) for codes 1..=57.
     const MAP: &[(u16, u8, u8)] = &[
+        (1, 0x1b, 0x1b), // KEY_ESC
         (2, b'1', b'!'), (3, b'2', b'@'), (4, b'3', b'#'), (5, b'4', b'$'), (6, b'5', b'%'),
         (7, b'6', b'^'), (8, b'7', b'&'), (9, b'8', b'*'), (10, b'9', b'('), (11, b'0', b')'),
         (12, b'-', b'_'), (13, b'=', b'+'), (14, 0x08, 0x08), (15, b'\t', b'\t'),

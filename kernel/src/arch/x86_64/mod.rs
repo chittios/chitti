@@ -11,6 +11,7 @@ pub mod fpu;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;
+pub mod i8042;
 pub mod keyboard;
 pub mod nvme;
 pub mod paging;
