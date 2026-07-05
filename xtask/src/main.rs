@@ -1182,7 +1182,7 @@ fn cmd_runner(args: &[String]) -> Result<(), String> {
     let mut cmd = qemu_base_cmd(&iso);
     // The in-kernel test suite includes the Phase 7 SMP bring-up + spinlock
     // self-test, so the harness runs with four vCPUs.
-    cmd.args(["-smp", "4", "-serial", "stdio", "-display", "none"]);
+    cmd.args(["-smp", "4", "-serial", "stdio", "-display", "none"]); cmd.args(["-d","int,cpu_reset","-D","/tmp/qint2.log"]);
     let status = cmd
         .status()
         .map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;

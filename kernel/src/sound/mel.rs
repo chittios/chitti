@@ -47,6 +47,10 @@ fn cosf(x: f32) -> f32 {
 fn sinf(x: f32) -> f32 {
     cosf(x - core::f32::consts::FRAC_PI_2)
 }
+/// Accurate `cos` exposed for the ONNX executor's trig ops.
+pub fn cosf_pub(x: f32) -> f32 {
+    cosf(x)
+}
 /// `(cos r, sin r)` for `|r| <= π/4` via short Taylor series (err < 1e-7).
 fn cos_sin_small(r: f32) -> (f32, f32) {
     let r2 = r * r;

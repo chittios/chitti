@@ -81,15 +81,51 @@ pub fn transcribe(pcm: &[i16]) -> String {
         return String::from("(clip too short)");
     }
     let (mels, frames) = (feat.len(), feat[0].len());
-    match super::model_store::parakeet() {
-        Some(_model) => {
-            // The int8 conformer runs here once the executor's quantized op-set
-            // is complete; the decode half (ctc_greedy) is ready and tested.
-            alloc::format!("(acoustic model loaded; {mels}x{frames} mel features — conformer op-set in progress)")
+    let bytes = match super::model_store::parakeet() {
+        Some(b) => b,
+        None => {
+            return alloc::format!(
+                "(STT front-end ready: {mels}x{frames} log-mel features; load the parakeet model to decode — see /voice models)"
+            );
         }
-        None => alloc::format!(
-            "(STT front-end ready: {mels}x{frames} log-mel features; load the parakeet model to decode — see /voice models)"
-        ),
+    };
+    // Load the parakeet tokens (bundled next to the model on the data partition).
+    let toks_txt = crate::synapse::fs::read("/voice/parakeet_tokens.txt")
+        .or_else(|| crate::synapse::fs::read("/mnt/parakeet_tokens.txt"))
+        .map(|b| alloc::string::String::from_utf8_lossy(&b).into_owned());
+    let tokens = toks_txt.as_deref().map(parse_tokens);
+
+    let model = match crate::onnx::parse(bytes) {
+        Some(m) => m,
+        None => return String::from("(parakeet model failed to parse)"),
+    };
+    // audio_signal [1, 80, T] (row-major: mel-major then time).
+    let mut sig = alloc::vec::Vec::with_capacity(mels * frames);
+    for m in &feat {
+        sig.extend_from_slice(m);
+    }
+    use crate::onnx::exec::Val;
+    let x = Val::new(alloc::vec![1, mels, frames], sig);
+    let len = Val { dims: alloc::vec![1], f: alloc::vec![frames as f32], i: Some(alloc::vec![frames as i64]) };
+    crate::ktrace::log_fmt(format_args!("stt: running parakeet on {mels}x{frames} features (this is slow on the scalar interpreter)"));
+    let out = match crate::onnx::exec::run(&model, &[("audio_signal", x), ("length", len)]) {
+        Ok(o) => o,
+        Err(e) => return alloc::format!("(parakeet run failed: {e})"),
+    };
+    let lp = match out.values().next() {
+        Some(v) => v,
+        None => return String::from("(parakeet produced no output)"),
+    };
+    // logprobs [1, T', vocab] → [T'][vocab].
+    let vocab = *lp.dims.last().unwrap_or(&0);
+    if vocab == 0 {
+        return String::from("(parakeet output shape unexpected)");
+    }
+    let tprime = lp.f.len() / vocab;
+    let rows: alloc::vec::Vec<alloc::vec::Vec<f32>> = (0..tprime).map(|t| lp.f[t * vocab..(t + 1) * vocab].to_vec()).collect();
+    match tokens {
+        Some(tk) => ctc_greedy(&rows, &tk),
+        None => alloc::format!("(decoded {tprime} frames; load /voice/parakeet_tokens.txt for text)"),
     }
 }
 
