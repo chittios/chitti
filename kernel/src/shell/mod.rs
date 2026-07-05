@@ -290,6 +290,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "wifi" => wifi_cmd(arg),
         "think" => run_think(arg),
         "mode" => run_mode(arg),
+        "voice" => run_voice(arg),
         _ => return false,
     }
     true
@@ -516,6 +517,7 @@ fn print_help() {
     serial_println!("  /wifi [..]       /wifi scan | connect <ssid> (password modal) | info");
     serial_println!("  /think [on|off]  toggle model thinking (<think> reasoning, streamed dim; default on)");
     serial_println!("  /mode [m]        agent-tool approvals: manual (all) | auto (destructive only) | bypass");
+    serial_println!("  /voice [test]    voice session (mic waveform modal); test = tone + 2s mic check");
     serial_println!("  /datetime [..]   show/set the clock: /datetime 2026-07-04 13:45 | /datetime tz +5:30");
     serial_println!("  /ui [config|reload|reset]  view/edit the UI config (/configs/core/ui.json)");
     serial_println!("  /shortcuts       list keyboard shortcuts (/configs/core/shortcuts.json)");
@@ -830,6 +832,129 @@ fn approval_mode() -> ApprovalMode {
         2 => ApprovalMode::Bypass,
         _ => ApprovalMode::Auto,
     }
+}
+
+/// `/voice [test]` — the voice session (mic waveform modal + level-gated
+/// utterance capture) or a sound-hardware self-test (tone + 2 s mic sample).
+fn run_voice(arg: &str) {
+    if !crate::sound::is_up() {
+        serial_println!("voice> no sound device (QEMU: -audiodev coreaudio,id=a -device virtio-sound-device,audiodev=a)");
+        return;
+    }
+    match arg.trim() {
+        "test" => voice_test(),
+        _ => voice_talk(),
+    }
+}
+
+/// Sound self-test: play a short tone, then sample the mic for 2 s and report
+/// the peak level — proves playback and capture end-to-end.
+fn voice_test() {
+    serial_println!("voice> playing test tone\u{2026}");
+    let tone = crate::sound::test_tone(440, 600, 16000);
+    match crate::sound::play(&tone, 16000) {
+        Ok(()) => {
+            while crate::sound::playing() {
+                ui_tick();
+                crate::sched::yield_now();
+            }
+            serial_println!("voice> tone done");
+        }
+        Err(e) => {
+            serial_println!("voice> play failed: {}", e);
+            return;
+        }
+    }
+    serial_println!("voice> capturing 2 s from the mic\u{2026}");
+    if let Err(e) = crate::sound::capture_start(16000) {
+        serial_println!("voice> capture failed: {}", e);
+        return;
+    }
+    let mut frame = [0i16; 1600]; // 100 ms at 16 kHz
+    let mut peak = 0f32;
+    let mut got = 0usize;
+    let t0 = crate::arch::now_ms();
+    while crate::arch::now_ms().saturating_sub(t0) < 2000 {
+        let n = crate::sound::capture_read(&mut frame);
+        if n > 0 {
+            got += n;
+            let r = crate::sound::rms(&frame[..n]);
+            if r > peak {
+                peak = r;
+            }
+        }
+        ui_tick();
+        crate::sched::yield_now();
+    }
+    crate::sound::capture_stop();
+    serial_println!("voice> captured {} samples, peak level {}%", got, (peak * 100.0) as u32);
+}
+
+/// The interactive voice session: live waveform modal driven by mic RMS, with
+/// level-based endpointing (speech starts above the threshold, an utterance
+/// ends after ~800 ms of silence). Esc / q / Ctrl+C or the Stop button end the
+/// session. STT/TTS attach here as their models land; until then each captured
+/// utterance is reported with its length.
+fn voice_talk() {
+    serial_println!("voice> listening \u{2014} Esc (or the Stop button) ends the session");
+    if let Err(e) = crate::sound::capture_start(16000) {
+        serial_println!("voice> capture failed: {}", e);
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        let mut levels: alloc::vec::Vec<f32> = alloc::vec::Vec::new();
+        let mut frame = [0i16; 1600];
+        let mut utter: alloc::vec::Vec<i16> = alloc::vec::Vec::new();
+        let mut in_speech = false;
+        let mut silent_ms = 0u32;
+        const THRESH: f32 = 0.02; // level gate until the silero VAD model lands
+        crate::framebuffer::draw_voice(&levels, "listening\u{2026}");
+        loop {
+            if let Some(b) = crate::console::read_byte() {
+                if b == 0x1b || b == b'q' || b == 3 {
+                    break;
+                }
+            }
+            let t = crate::mouse::tick();
+            if t.moved {
+                crate::framebuffer::cursor_move(t.x, t.y);
+            }
+            if t.pressed && matches!(crate::framebuffer::modal_hit(t.x, t.y), crate::framebuffer::ModalHit::Ok) {
+                break;
+            }
+            let n = crate::sound::capture_read(&mut frame);
+            if n > 0 {
+                let r = crate::sound::rms(&frame[..n]);
+                levels.push(r);
+                if levels.len() > 256 {
+                    levels.remove(0);
+                }
+                if r > THRESH {
+                    in_speech = true;
+                    silent_ms = 0;
+                    utter.extend_from_slice(&frame[..n]);
+                } else if in_speech {
+                    silent_ms += (n as u32) * 1000 / 16000;
+                    utter.extend_from_slice(&frame[..n]);
+                    if silent_ms > 800 {
+                        let ms = utter.len() as u32 / 16;
+                        serial_println!("voice> utterance captured: {} ms ({} samples) \u{2014} STT lands with the parakeet model", ms, utter.len());
+                        utter.clear();
+                        in_speech = false;
+                        silent_ms = 0;
+                    }
+                }
+                let status = if in_speech { "listening\u{2026} (speech)" } else { "listening\u{2026} (Esc or Stop to end)" };
+                crate::framebuffer::draw_voice(&levels, status);
+            }
+            crate::net::poll();
+            crate::sched::yield_now();
+        }
+        crate::framebuffer::modal_dismiss();
+    }
+    crate::sound::capture_stop();
+    serial_println!("voice> session ended");
 }
 
 /// `/mode manual|auto|bypass` — set (or show) the approval mode.
@@ -1428,7 +1553,7 @@ static HISTORY: Locked<alloc::vec::Vec<String>> = Locked::new(alloc::vec::Vec::n
 const COMMANDS: &[&str] = &[
     "agent", "bench", "cat", "clear", "close", "datetime", "disks", "do", "exit", "help", "infer", "info",
     "install", "ktrace", "ls", "mkext4", "mkfs", "mode", "mount", "mounts", "network", "open", "perf",
-    "ping", "session", "shortcuts", "skills", "subagent", "think", "ui", "umount", "wifi",
+    "ping", "session", "shortcuts", "skills", "subagent", "think", "ui", "umount", "voice", "wifi",
 ];
 
 /// `/think on|off` — toggle Qwen thinking mode (default on; streamed dim).

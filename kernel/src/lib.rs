@@ -45,6 +45,7 @@ pub mod serial;
 pub mod session;
 pub mod shell;
 pub mod skills;
+pub mod sound;
 pub mod tools;
 pub mod ui_config;
 #[cfg(target_arch = "x86_64")]
