@@ -129,8 +129,16 @@ pub fn autodetect() {
         }
         if let Some(dev) = crate::arch::x86_64::sb16::Sb16::probe() {
             init(dev);
+            return;
         }
     }
+    // Nothing matched: dump the multimedia-class PCI devices so an unsupported
+    // controller (or a PCI-discovery gap) is diagnosable from the boot log.
+    crate::ktrace::log("sound", "no audio device matched — multimedia (class 0x04) PCI devices:");
+    #[cfg(target_arch = "aarch64")]
+    crate::pci::log_class(0x04);
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::pci::log_class(0x04);
 }
 
 /// Queue `pcm` (S16 mono at `hz`) for playback.

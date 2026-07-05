@@ -644,8 +644,11 @@ impl Spinner {
 }
 
 /// Global thinking toggle (Qwen3.5 `<think>` reasoning before the answer).
-/// Default **on**; `/think off` disables it. Streamed dim when on.
-static THINK_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// Default **off**: the small on-device models (0.8B/2B) ramble indefinitely
+/// in a primed `<think>` block instead of answering (a big context of tool
+/// instructions makes it worse). `/think on` enables it for larger models
+/// where step-by-step reasoning actually helps. Streamed dim when on.
+static THINK_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn think_enabled() -> bool {
     THINK_ON.load(core::sync::atomic::Ordering::Relaxed)
