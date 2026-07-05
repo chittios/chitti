@@ -664,26 +664,23 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
         .filter(|d| matches!(d.binding, ToolBinding::Shell { .. } | ToolBinding::SpawnSubagent))
         .collect();
     let mut s = String::from(persona);
-    s.push_str(
-        "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
-         You are provided with function signatures within <tools></tools> XML tags:\n<tools>",
-    );
+    // Compact one-line-per-tool listing rather than full JSON `<tools>` schemas:
+    // on a CPU-bound prefill the schema boilerplate was ~1400 tokens (~3 min to
+    // first token). Every shell tool takes a single `args` string, so a terse
+    // "name — description" line is enough; the model still emits, and we still
+    // parse, the standard `<tool_call>` JSON.
+    s.push_str("\n\nTools you can call. To use one, reply with ONE line and nothing else:\n");
+    s.push_str("<tool_call>{\"name\": \"<name>\", \"arguments\": {\"args\": \"<args>\"}}</tool_call>\n");
     for d in &defs {
-        s.push_str("\n{\"type\": \"function\", \"function\": {\"name\": \"");
+        s.push_str("- ");
         s.push_str(&d.name);
-        s.push_str("\", \"description\": \"");
-        // The descriptions are ASCII with no quotes-in-quotes surprises beyond
-        // the odd apostrophe; normalise any double quote so the JSON stays valid.
-        s.push_str(&d.description.replace('"', "'"));
-        s.push_str("\", \"parameters\": ");
-        s.push_str(&d.input_schema);
-        s.push_str("}}");
+        s.push_str(" \u{2014} ");
+        // First sentence of the description keeps the listing tight.
+        let short = d.description.split(". ").next().unwrap_or(&d.description);
+        s.push_str(short);
+        s.push('\n');
     }
-    s.push_str(
-        "\n</tools>\n\nFor each function call, return a json object with function name and \
-         arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \
-         \"arguments\": <args-json-object>}\n</tool_call>",
-    );
+    s.push_str("After a tool runs you get its output in <tool_response>...; then answer, or call another tool.");
     s
 }
 
