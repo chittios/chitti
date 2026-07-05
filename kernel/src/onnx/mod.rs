@@ -12,6 +12,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+pub mod exec;
+
 /// A parsed model: IR metadata + the top-level graph.
 pub struct Model<'a> {
     pub ir_version: i64,

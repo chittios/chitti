@@ -170,6 +170,7 @@ fn libm_sqrt(x: f64) -> f64 {
     r
 }
 
+pub mod vad;
 pub mod virtio_snd_pci;
 
 /// A short test tone (sine-ish square blend) for `/voice test`.
