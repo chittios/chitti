@@ -23,6 +23,7 @@
 use crate::font_geist::{CELL_H as CH, CELL_W as CW, FIRST, GLYPHS, LAST};
 use crate::limine_protocol::Framebuffer;
 use crate::mm::Locked;
+use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -30,6 +31,16 @@ const CELL_W: u64 = CW as u64;
 const CELL_H: u64 = CH as u64;
 
 type Rgb = (u8, u8, u8);
+
+/// One character cell of a pane's text grid: the byte drawn (0 = empty) and its
+/// colour at draw time. The grid (plus the scrollback ring behind it) is the
+/// source of truth for a pane's text, so content survives redraws, relayouts,
+/// and modal dismissals, and can be scrolled back through.
+type Cell = (u8, Rgb);
+
+/// Scrollback depth per pane, in lines. At 200 cols a full ring is ~3 MB —
+/// noise next to the model heap. Cleared only by `/clear`.
+const HIST_MAX: usize = 2000;
 
 /// The console colour palette (see [DESIGN.md](../../DESIGN.md)). Every colour is
 /// a field so the whole theme is configurable from `/configs/core/ui.json`
@@ -175,6 +186,14 @@ struct Pane {
     bold: bool,
     title: String,
     show_caret: bool,
+    /// The live character grid (`cols * rows` cells) mirroring what is drawn.
+    grid: Vec<Cell>,
+    /// Scrollback: lines evicted off the top of the grid, oldest first.
+    hist: VecDeque<Vec<Cell>>,
+    /// Scrollback view offset in lines back from live (0 = live). While > 0,
+    /// incoming bytes still update the grid/hist but pixels are frozen on the
+    /// scrolled view; the offset auto-advances so the view stays anchored.
+    view: usize,
 }
 
 /// Minimal ANSI escape-sequence parser state for a pane's byte stream: we
@@ -200,6 +219,8 @@ impl Pane {
         let iy = y + header_h;
         let iw = w.saturating_sub(2 * (BORDER + PAD)).max(cw);
         let ih = (y + h).saturating_sub(iy + BORDER + PAD).max(ch);
+        let cols = (iw / cw).max(1);
+        let rows = (ih / ch).max(1);
         Pane {
             x,
             y,
@@ -209,8 +230,8 @@ impl Pane {
             iy,
             cw,
             ch,
-            cols: (iw / cw).max(1),
-            rows: (ih / ch).max(1),
+            cols,
+            rows,
             col: 0,
             row: 0,
             fg,
@@ -222,7 +243,79 @@ impl Pane {
             bold: false,
             title,
             show_caret,
+            grid: alloc::vec![(0u8, fg); (cols * rows) as usize],
+            hist: VecDeque::new(),
+            view: 0,
         }
+    }
+
+    /// Write `byte` into the grid cell under the cursor (0 erases).
+    fn set_cell(&mut self, byte: u8) {
+        let idx = (self.row * self.cols + self.col) as usize;
+        if let Some(c) = self.grid.get_mut(idx) {
+            *c = (byte, self.fg);
+        }
+    }
+
+    /// First numeric CSI parameter (0 if absent) — enough for `ESC[nC`/`nD`/`nK`.
+    fn csi_param(&self) -> u64 {
+        let mut v: u64 = 0;
+        for &b in &self.csi[..self.csi_len] {
+            if b.is_ascii_digit() {
+                v = v.saturating_mul(10) + (b - b'0') as u64;
+            } else {
+                break;
+            }
+        }
+        v
+    }
+
+    /// Carry another pane's text (scrollback + grid + cursor + colour state)
+    /// into this freshly-built pane, re-wrapping to the new geometry. Used when
+    /// the layout is rebuilt (action pane toggled, `/ui` relayout) so pane
+    /// content is never lost by a split change.
+    fn adopt(&mut self, old: &Pane) {
+        if old.grid.is_empty() || self.grid.is_empty() {
+            return;
+        }
+        let ocols = old.cols as usize;
+        let mut lines: VecDeque<Vec<Cell>> = old.hist.clone();
+        // Grid rows up to and including the cursor row are content.
+        let used = ((old.row + 1).min(old.rows)) as usize;
+        for r in 0..used {
+            lines.push_back(old.grid[r * ocols..(r + 1) * ocols].to_vec());
+        }
+        let cur_gi = lines.len() - used + old.row.min(old.rows - 1) as usize;
+        let (rows, cols) = (self.rows as usize, self.cols as usize);
+        let keep = lines.len().min(rows);
+        let start = lines.len() - keep;
+        for (r, line) in lines.iter().skip(start).enumerate() {
+            for c in 0..cols.min(line.len()) {
+                self.grid[r * cols + c] = line[c];
+            }
+        }
+        self.hist = lines.iter().take(start).cloned().collect();
+        while self.hist.len() > HIST_MAX {
+            self.hist.pop_front();
+        }
+        self.row = if cur_gi >= start { (cur_gi - start) as u64 } else { 0 };
+        self.col = old.col.min(self.cols - 1);
+        self.fg = old.fg;
+        self.default_fg = old.default_fg;
+        self.bold = old.bold;
+    }
+
+    /// Drop all text content (grid + scrollback) — the `/clear` reset.
+    fn clear_content(&mut self) {
+        for c in self.grid.iter_mut() {
+            *c = (0, self.default_fg);
+        }
+        self.hist.clear();
+        self.view = 0;
+        self.col = 0;
+        self.row = 0;
+        self.fg = self.default_fg;
+        self.bold = false;
     }
     fn cell_x(&self) -> u64 {
         self.ix + self.col * self.cw
@@ -351,9 +444,16 @@ pub struct Screen {
     caret_on: bool,
     caret_last_ms: u64,
     /// Fallback blink cadence when the monotonic clock is frozen (some VBox
-    /// configs): the last `now_ms` seen, and a call counter.
+    /// configs): the last `now_ms` seen, and a call counter. `clock_alive`
+    /// latches once `now_ms` is ever seen advancing — after that the fallback
+    /// is never used (on a fast host thousands of calls land in the same
+    /// millisecond, which used to trip the counter and blink far too fast).
     blink_seen_ms: u64,
     blink_calls: u32,
+    clock_alive: bool,
+    /// Whether keyboard focus is on the action (right) pane. Only meaningful
+    /// while the action pane shows ktrace; the editor always owns focus.
+    focus_action: bool,
     /// What the right ("action") pane currently shows. `None` = closed, so the
     /// chat pane is full-width — the default.
     right: RightMode,
@@ -375,24 +475,31 @@ pub struct Screen {
     cur_saved: [Rgb; (CUR_W * CUR_H) as usize],
 }
 
-// Mouse cursor arrow: 0 = transparent, 1 = fill (white), 2 = outline (black).
-const CUR_W: u64 = 8;
-const CUR_H: u64 = 13;
+// Mouse cursor arrow (macOS-style: black fill, white outline so it reads on
+// both dark and light content): 0 = transparent, 1 = fill, 2 = outline.
+const CUR_W: u64 = 12;
+const CUR_H: u64 = 19;
 #[rustfmt::skip]
 const CURSOR: [u8; (CUR_W * CUR_H) as usize] = [
-    2,0,0,0,0,0,0,0,
-    2,2,0,0,0,0,0,0,
-    2,1,2,0,0,0,0,0,
-    2,1,1,2,0,0,0,0,
-    2,1,1,1,2,0,0,0,
-    2,1,1,1,1,2,0,0,
-    2,1,1,1,1,1,2,0,
-    2,1,1,1,1,1,1,2,
-    2,1,1,1,2,2,2,2,
-    2,1,2,1,1,2,0,0,
-    2,2,0,1,1,2,0,0,
-    0,0,0,2,1,1,2,0,
-    0,0,0,0,2,2,0,0,
+    2,0,0,0,0,0,0,0,0,0,0,0,
+    2,2,0,0,0,0,0,0,0,0,0,0,
+    2,1,2,0,0,0,0,0,0,0,0,0,
+    2,1,1,2,0,0,0,0,0,0,0,0,
+    2,1,1,1,2,0,0,0,0,0,0,0,
+    2,1,1,1,1,2,0,0,0,0,0,0,
+    2,1,1,1,1,1,2,0,0,0,0,0,
+    2,1,1,1,1,1,1,2,0,0,0,0,
+    2,1,1,1,1,1,1,1,2,0,0,0,
+    2,1,1,1,1,1,1,1,1,2,0,0,
+    2,1,1,1,1,1,1,1,1,1,2,0,
+    2,1,1,1,1,1,1,1,1,1,1,2,
+    2,1,1,1,1,1,2,2,2,2,2,2,
+    2,1,1,2,1,1,2,0,0,0,0,0,
+    2,1,2,0,2,1,1,2,0,0,0,0,
+    2,2,0,0,2,1,1,2,0,0,0,0,
+    2,0,0,0,0,2,1,1,2,0,0,0,
+    0,0,0,0,0,2,1,1,2,0,0,0,
+    0,0,0,0,0,0,2,2,0,0,0,0,
 ];
 
 /// What the right ("action") pane shows.
@@ -429,7 +536,7 @@ impl Default for LayoutCfg {
             chat_pct: CHAT_PCT,
             scale: 0,
             swap: false,
-            chat_title: String::from("chat"),
+            chat_title: String::from("Shell Agent"),
             logs_title: String::from("ktrace"),
             theme: Theme::default(),
             splash: true,
@@ -503,6 +610,8 @@ impl Screen {
             caret_last_ms: 0,
             blink_seen_ms: u64::MAX,
             blink_calls: 0,
+            clock_alive: false,
+            focus_action: false,
             right: RightMode::Closed,
             right_before_editor: RightMode::Closed,
             layout: cfg.clone(),
@@ -593,8 +702,8 @@ impl Screen {
         for dy in 0..CUR_H {
             for dx in 0..CUR_W {
                 match CURSOR[(dy * CUR_W + dx) as usize] {
-                    1 => self.put_pixel(self.cur_x + dx, self.cur_y + dy, (240, 240, 245)),
-                    2 => self.put_pixel(self.cur_x + dx, self.cur_y + dy, (10, 10, 12)),
+                    1 => self.put_pixel(self.cur_x + dx, self.cur_y + dy, (15, 15, 17)),
+                    2 => self.put_pixel(self.cur_x + dx, self.cur_y + dy, (245, 245, 248)),
                     _ => {}
                 }
             }
@@ -672,8 +781,29 @@ impl Screen {
 
     // --- pane text -------------------------------------------------------
 
-    /// Scroll a pane's interior up by one text row, clearing the freed row.
-    fn scroll_pane(&self, p: &Pane) {
+    /// Scroll a pane's interior up by one text row: the top grid row is evicted
+    /// into the scrollback ring, the grid shifts up, and (when the view is live)
+    /// the pixels shift with it.
+    fn scroll_pane(&self, p: &mut Pane) {
+        // Grid + scrollback first — the source of truth.
+        let cols = p.cols as usize;
+        if p.grid.len() >= cols {
+            p.hist.push_back(p.grid[..cols].to_vec());
+            while p.hist.len() > HIST_MAX {
+                p.hist.pop_front();
+            }
+            p.grid.copy_within(cols.., 0);
+            let start = p.grid.len() - cols;
+            let fg = p.fg;
+            for c in &mut p.grid[start..] {
+                *c = (0, fg);
+            }
+            if p.view > 0 {
+                // Keep the scrolled view anchored on the same content.
+                p.view = (p.view + 1).min(p.hist.len());
+                return; // pixels are frozen on the scrolled view
+            }
+        }
         let x0 = p.ix;
         let w = p.cols * p.cw;
         let top = p.iy;
@@ -691,6 +821,41 @@ impl Screen {
             }
         }
         self.fill_rect(x0, top + h - p.ch, w, p.ch, p.bg);
+    }
+
+    /// Repaint a pane's interior from its scrollback + grid at the current view
+    /// offset. The one text renderer used by scroll, redraw, and relayout.
+    fn render_view(&self, p: &Pane) {
+        self.fill_rect(p.ix, p.iy, p.cols * p.cw, p.rows * p.ch, p.bg);
+        let cols = p.cols as usize;
+        if p.grid.len() < cols {
+            return;
+        }
+        let view = p.view.min(p.hist.len());
+        let first = p.hist.len() - view;
+        for r in 0..p.rows as usize {
+            let gi = first + r;
+            let line: &[Cell] = if gi < p.hist.len() {
+                &p.hist[gi]
+            } else {
+                let gr = gi - p.hist.len();
+                if gr >= p.rows as usize {
+                    break;
+                }
+                &p.grid[gr * cols..(gr + 1) * cols]
+            };
+            for (c, &(b, fg)) in line.iter().enumerate().take(cols) {
+                if (0x21..=0x7e).contains(&b) {
+                    self.blit_glyph(p.ix + c as u64 * p.cw, p.iy + r as u64 * p.ch, b, fg, p.bg);
+                }
+            }
+        }
+        // A scrolled-back view gets a position marker in the top-right corner.
+        if view > 0 {
+            let tag = alloc::format!("[-{}] ", view);
+            let tx = (p.ix + p.cols * p.cw).saturating_sub(tag.len() as u64 * p.cw);
+            self.draw_str(tx, p.iy, &tag, self.theme.accent, p.bg);
+        }
     }
 
     fn caret_erase(&self, p: &Pane) {
@@ -730,9 +895,39 @@ impl Screen {
             }
             EscState::Csi => {
                 if (0x40..=0x7e).contains(&byte) {
-                    // Final byte: apply SGR (`m`); ignore other CSI (cursor/erase).
-                    if byte == b'm' {
-                        p.apply_sgr();
+                    // Final byte: SGR (`m`) recolours; `K`/`C`/`D` (erase to end
+                    // of line / cursor right / cursor left) support the shell's
+                    // in-line editing. Other CSI are consumed and ignored.
+                    let live = p.view == 0;
+                    match byte {
+                        b'm' => p.apply_sgr(),
+                        b'K' => {
+                            if live {
+                                s.caret_erase(p);
+                            }
+                            let cols = p.cols as usize;
+                            let (row, col) = (p.row as usize, p.col as usize);
+                            for c in col..cols {
+                                if let Some(cell) = p.grid.get_mut(row * cols + c) {
+                                    *cell = (0, p.fg);
+                                }
+                            }
+                            if live {
+                                s.fill_rect(p.cell_x(), p.cell_y(), (p.cols - p.col) * p.cw, p.ch, p.bg);
+                                s.caret_draw(p);
+                            }
+                        }
+                        b'C' | b'D' => {
+                            let n = p.csi_param().max(1);
+                            if live {
+                                s.caret_erase(p);
+                            }
+                            p.col = if byte == b'C' { (p.col + n).min(p.cols - 1) } else { p.col.saturating_sub(n) };
+                            if live {
+                                s.caret_draw(p);
+                            }
+                        }
+                        _ => {}
                     }
                     p.esc = EscState::Ground;
                 } else if p.csi_len < p.csi.len() {
@@ -747,14 +942,22 @@ impl Screen {
             p.esc = EscState::Esc;
             return;
         }
-        s.caret_erase(p);
+        // While scrolled back, the grid/scrollback still update but the pixels
+        // stay frozen on the scrolled view (`scroll_pane` keeps it anchored).
+        let live = p.view == 0;
+        if live {
+            s.caret_erase(p);
+        }
         match byte {
             b'\n' => Screen::newline(p, s),
             b'\r' => p.col = 0,
             b'\t' => {
                 let next = (p.col / 4 + 1) * 4;
                 while p.col < next && p.col < p.cols {
-                    s.blit_glyph(p.cell_x(), p.cell_y(), b' ', p.fg, p.bg);
+                    p.set_cell(b' ');
+                    if live {
+                        s.blit_glyph(p.cell_x(), p.cell_y(), b' ', p.fg, p.bg);
+                    }
                     p.col += 1;
                 }
                 if p.col >= p.cols {
@@ -768,10 +971,16 @@ impl Screen {
                     p.row -= 1;
                     p.col = p.cols - 1;
                 }
-                s.blit_glyph(p.cell_x(), p.cell_y(), b' ', p.fg, p.bg);
+                p.set_cell(0);
+                if live {
+                    s.blit_glyph(p.cell_x(), p.cell_y(), b' ', p.fg, p.bg);
+                }
             }
             0x20..=0x7e => {
-                s.blit_glyph(p.cell_x(), p.cell_y(), byte, p.fg, p.bg);
+                p.set_cell(byte);
+                if live {
+                    s.blit_glyph(p.cell_x(), p.cell_y(), byte, p.fg, p.bg);
+                }
                 p.col += 1;
                 if p.col >= p.cols {
                     Screen::newline(p, s);
@@ -779,7 +988,9 @@ impl Screen {
             }
             _ => {}
         }
-        s.caret_draw(p);
+        if p.view == 0 {
+            s.caret_draw(p);
+        }
     }
 
     // --- framing ---------------------------------------------------------
@@ -823,7 +1034,7 @@ impl Screen {
     /// Paint the chat caret in its current blink state (accent bar, or the pane
     /// background to erase it).
     fn paint_caret(&self) {
-        if !self.chat.show_caret {
+        if !self.chat.show_caret || self.chat.view != 0 {
             return;
         }
         let color = if self.caret_on { self.theme.accent } else { self.chat.bg };
@@ -908,20 +1119,36 @@ impl Screen {
         self.draw_str(tx, cy + r + r / 2 + self.ch() + 6, tag, self.theme.title_dim, self.theme.screen_bg);
     }
 
-    /// Full repaint: background, chat pane, the action (right) pane if open,
-    /// caret, status bar.
+    /// Whether the action (right) pane holds keyboard focus: always while the
+    /// editor owns it, by toggle (`focus_toggle` / click) while it shows ktrace.
+    fn action_focused(&self) -> bool {
+        match self.right {
+            RightMode::Editor => true,
+            RightMode::Closed => false,
+            RightMode::Ktrace => self.focus_action,
+        }
+    }
+
+    /// Full repaint: background, chat pane (content re-rendered from its grid),
+    /// the action (right) pane if open, caret, status bar.
     fn redraw(&self) {
         self.fill_rect(0, 0, self.width, self.height, self.theme.screen_bg);
         self.fill_rect(self.chat.x, self.chat.y, self.chat.w, self.chat.h, self.chat.bg);
-        // Focus (active highlight) is on chat unless the editor owns the right pane.
-        self.draw_frame(&self.chat, self.right != RightMode::Editor);
+        self.draw_frame(&self.chat, !self.action_focused());
+        self.render_view(&self.chat);
         if self.right != RightMode::Closed {
             self.fill_rect(self.logs.x, self.logs.y, self.logs.w, self.logs.h, self.logs.bg);
             let title = if self.right == RightMode::Editor { "editor" } else { &self.logs.title };
-            self.draw_frame_titled(&self.logs, self.right == RightMode::Editor, title);
+            self.draw_frame_titled(&self.logs, self.action_focused(), title);
             self.draw_close_btn();
+            // The editor repaints its own interior; ktrace re-renders from grid.
+            if self.right == RightMode::Ktrace {
+                self.render_view(&self.logs);
+            }
         }
-        self.caret_draw(&self.chat);
+        if self.chat.view == 0 {
+            self.caret_draw(&self.chat);
+        }
         self.draw_status();
     }
 
@@ -948,6 +1175,10 @@ pub enum ModalHit {
 /// Pixel rects of the modal's clickable controls: `[yes, no, ok]`. Set when a
 /// modal is drawn, read by [`modal_hit`] for mouse routing. Zero-size = absent.
 static MODAL_RECTS: Locked<[(u64, u64, u64, u64); 3]> = Locked::new([(0, 0, 0, 0); 3]);
+
+/// True while a modal overlays the panes: upkeep ticks running under it (long
+/// compute pumps `shell::upkeep`) must not blink the pane caret into the box.
+static MODAL_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn in_rect(x: u64, y: u64, r: (u64, u64, u64, u64)) -> bool {
     r.2 != 0 && x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3
@@ -1005,6 +1236,7 @@ impl Screen {
 
 /// Draw an approval (yes/no) modal. `focus_yes` highlights the Yes button.
 pub fn draw_confirm(title: &str, msg: &str, focus_yes: bool) {
+    MODAL_ON.store(true, core::sync::atomic::Ordering::Relaxed);
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
             sc.cursor_restore();
@@ -1028,6 +1260,7 @@ pub fn draw_confirm(title: &str, msg: &str, focus_yes: bool) {
 
 /// Draw a text-input modal (masked = password dots). `caret_on` blinks the caret.
 pub fn draw_input(title: &str, prompt: &str, buf: &str, masked: bool, caret_on: bool) {
+    MODAL_ON.store(true, core::sync::atomic::Ordering::Relaxed);
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
             sc.cursor_restore();
@@ -1060,6 +1293,7 @@ pub fn draw_input(title: &str, prompt: &str, buf: &str, masked: bool, caret_on: 
 /// level, newest on the right) above a status line and a Stop button. Called
 /// every capture frame, so it repaints only the modal region.
 pub fn draw_voice(levels: &[f32], status: &str) {
+    MODAL_ON.store(true, core::sync::atomic::Ordering::Relaxed);
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
             sc.cursor_restore();
@@ -1096,6 +1330,7 @@ pub fn draw_voice(levels: &[f32], status: &str) {
 
 /// Dismiss any modal and repaint the normal UI.
 pub fn modal_dismiss() {
+    MODAL_ON.store(false, core::sync::atomic::Ordering::Relaxed);
     MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
@@ -1306,18 +1541,29 @@ pub fn editor_pane_geom() -> Option<(u64, u64, u64, u64, u64, u64)> {
 /// Advance the caret blink. Called from the shell's idle poll with the current
 /// `now_ms()`; toggles the chat caret roughly twice a second.
 pub fn blink(now_ms: u64) {
+    if MODAL_ON.load(core::sync::atomic::Ordering::Relaxed) {
+        return; // a modal overlays the panes; do not paint the caret under it
+    }
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
-            // If the clock advances, blink on a 500 ms period. If it's frozen
-            // (some VirtualBox configs), fall back to a call-count cadence so the
-            // caret still blinks.
+            // If the clock advances, blink on a 500 ms period. Only if it has
+            // NEVER been seen advancing (a genuinely frozen monotonic clock)
+            // fall back to a call-count cadence. On a fast host thousands of
+            // idle polls land inside one millisecond, so the counter alone
+            // must not trigger once the clock is known-good — that made the
+            // caret strobe on VirtualBox.
             let toggle = if now_ms != sc.blink_seen_ms {
+                if sc.blink_seen_ms != u64::MAX {
+                    sc.clock_alive = true;
+                }
                 sc.blink_seen_ms = now_ms;
                 sc.blink_calls = 0;
                 now_ms.saturating_sub(sc.caret_last_ms) >= 500
+            } else if sc.clock_alive {
+                false
             } else {
                 sc.blink_calls = sc.blink_calls.wrapping_add(1);
-                if sc.blink_calls >= 6000 {
+                if sc.blink_calls >= 300_000 {
                     sc.blink_calls = 0;
                     true
                 } else {
@@ -1366,6 +1612,7 @@ fn dummy_pane() -> Pane {
         fg: (0, 0, 0), default_fg: (0, 0, 0), bg: (0, 0, 0),
         esc: EscState::Ground, csi: [0; 32], csi_len: 0, bold: false,
         title: String::new(), show_caret: false,
+        grid: Vec::new(), hist: VecDeque::new(), view: 0,
     }
 }
 
@@ -1383,7 +1630,7 @@ pub fn editor_dims() -> Option<(usize, usize)> {
 }
 
 /// Rebuild the screen for a new split/right-mode, preserving geometry, layout
-/// config, and status text.
+/// config, status text, and — via [`Pane::adopt`] — the pane text content.
 fn rebuilt(old: &Screen, split: bool, right: RightMode) -> Screen {
     let mut ns = Screen::build(
         old.addr, old.width, old.height, old.pitch, old.bpp_bytes, old.r_shift, old.g_shift, old.b_shift, &old.layout, split,
@@ -1392,6 +1639,9 @@ fn rebuilt(old: &Screen, split: bool, right: RightMode) -> Screen {
     ns.status_right = old.status_right.clone();
     ns.right = right;
     ns.right_before_editor = old.right_before_editor;
+    ns.clock_alive = old.clock_alive;
+    ns.chat.adopt(&old.chat);
+    ns.logs.adopt(&old.logs);
     ns
 }
 
@@ -1565,8 +1815,121 @@ pub fn relayout(cfg: &LayoutCfg) {
             ns.status_right = sr;
             ns.right = mode;
             ns.right_before_editor = old.right_before_editor;
+            ns.clock_alive = old.clock_alive;
+            ns.chat.adopt(&old.chat);
+            ns.logs.adopt(&old.logs);
             ns.redraw();
             *slot = Some(ns);
+        }
+    });
+}
+
+/// Scroll a pane's view by `delta` lines (`+` = back in time, `-` = toward
+/// live); `action` picks the ktrace pane, else chat. Snaps caret handling
+/// automatically: the caret only draws on a live view.
+pub fn scroll_view(action: bool, delta: i64) {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            if action && sc.right != RightMode::Ktrace {
+                return;
+            }
+            sc.cursor_restore();
+            sc.cur_vis = false;
+            let p = if action { &mut sc.logs } else { &mut sc.chat };
+            let max = p.hist.len();
+            let v = (p.view as i64 + delta).clamp(0, max as i64) as usize;
+            if v != p.view {
+                p.view = v;
+                let p = if action { &sc.logs } else { &sc.chat };
+                sc.render_view(p);
+                if !action && v == 0 {
+                    sc.caret_draw(&sc.chat);
+                }
+            }
+            sc.cursor_overlay();
+        }
+    });
+}
+
+/// Scroll a pane's view by one page (its row count minus one).
+pub fn scroll_page(action: bool, up: bool) {
+    let rows = SCREEN.with(|slot| {
+        slot.as_ref().map(|sc| if action { sc.logs.rows } else { sc.chat.rows }).unwrap_or(1)
+    }) as i64;
+    scroll_view(action, if up { rows - 1 } else { -(rows - 1) });
+}
+
+/// Snap a pane back to the live view (offset 0).
+pub fn scroll_live(action: bool) {
+    scroll_view(action, i64::MIN / 2);
+}
+
+/// Toggle keyboard focus between the chat pane and an open ktrace action pane.
+/// Returns true if the action pane now holds focus. No-op (false) when the
+/// action pane is closed or owned by the editor.
+pub fn focus_toggle() -> bool {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            if sc.right != RightMode::Ktrace {
+                return false;
+            }
+            sc.focus_action = !sc.focus_action;
+            sc.cursor_restore();
+            sc.cur_vis = false;
+            sc.draw_frame(&sc.chat, !sc.action_focused());
+            sc.draw_frame_titled(&sc.logs, sc.action_focused(), &sc.logs.title);
+            sc.draw_close_btn();
+            sc.cursor_overlay();
+            sc.focus_action
+        } else {
+            false
+        }
+    })
+}
+
+/// Whether keyboard focus is on the action pane (see [`focus_toggle`]).
+pub fn focus_is_action() -> bool {
+    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.action_focused()).unwrap_or(false))
+}
+
+/// Give keyboard focus to the action pane (true) or the chat pane (false),
+/// e.g. from a mouse click. Same constraints as [`focus_toggle`].
+pub fn focus_set(action: bool) {
+    let flips = SCREEN.with(|slot| {
+        slot.as_ref().map(|sc| sc.right == RightMode::Ktrace && sc.focus_action != action).unwrap_or(false)
+    });
+    if flips {
+        focus_toggle();
+    }
+}
+
+/// Which pane a click at `(x, y)` landed in: `Some(true)` = action pane,
+/// `Some(false)` = chat pane, `None` = neither (status bar / margins).
+pub fn pane_hit(x: u64, y: u64) -> Option<bool> {
+    SCREEN.with(|slot| {
+        slot.as_ref().and_then(|sc| {
+            let hit = |p: &Pane| x >= p.x && x < p.x + p.w && y >= p.y && y < p.y + p.h;
+            if sc.right != RightMode::Closed && hit(&sc.logs) {
+                Some(true)
+            } else if hit(&sc.chat) {
+                Some(false)
+            } else {
+                None
+            }
+        })
+    })
+}
+
+/// Wipe the chat pane's text (grid + scrollback) and repaint it — `/clear`.
+pub fn clear_chat() {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.cursor_restore();
+            sc.cur_vis = false;
+            sc.chat.clear_content();
+            sc.fill_rect(sc.chat.ix, sc.chat.iy, sc.chat.cols * sc.chat.cw, sc.chat.rows * sc.chat.ch, sc.chat.bg);
+            sc.caret_draw(&sc.chat);
+            sc.cursor_overlay();
         }
     });
 }

@@ -157,7 +157,9 @@ pub fn run() -> ! {
                 }
                 "clear" => {
                     chat = None;
-                    serial_println!("(chat context cleared)");
+                    #[cfg(not(test))]
+                    crate::framebuffer::clear_chat();
+                    serial_println!("(chat context + screen cleared)");
                 }
                 "open" | "edit" => run_open(arg),
                 "do" => {
@@ -2027,15 +2029,30 @@ fn erase_chars(n: usize) {
     }
 }
 
-/// Replace the input line (both in `buf` and on screen) with `new`.
-fn replace_line(buf: &mut String, new: &str) {
-    use crate::console;
+/// Echo a string to both consoles byte-by-byte.
+fn emit(s: &str) {
+    for b in s.bytes() {
+        crate::console::put_byte(b);
+    }
+}
+
+/// Move the on-screen cursor `n` cells left/right with `ESC[nD`/`ESC[nC`
+/// (understood by both the framebuffer pane parser and serial terminals).
+fn cursor_shift(n: usize, right: bool) {
+    if n > 0 {
+        emit(&alloc::format!("\x1b[{}{}", n, if right { 'C' } else { 'D' }));
+    }
+}
+
+/// Replace the input line (both in `buf` and on screen) with `new`, leaving the
+/// cursor at the end. `cur` is the current cursor offset within `buf`.
+fn replace_line(buf: &mut String, cur: &mut usize, new: &str) {
+    cursor_shift(buf.len() - *cur, true); // jump to end before erasing
     erase_chars(buf.chars().count());
     buf.clear();
     buf.push_str(new);
-    for b in new.bytes() {
-        console::put_byte(b);
-    }
+    *cur = buf.len();
+    emit(new);
 }
 
 /// After ESC, wait briefly for the rest of an ANSI sequence (the bytes of a
@@ -2088,15 +2105,68 @@ fn tab_complete(buf: &mut String) {
     }
 }
 
+// Framebuffer shims: the test build has no framebuffer module, so the line
+// editor's pane-scroll/focus hooks compile away there.
+fn fb_scroll_live(action: bool) {
+    #[cfg(not(test))]
+    crate::framebuffer::scroll_live(action);
+    #[cfg(test)]
+    let _ = action;
+}
+fn fb_scroll_view(action: bool, delta: i64) {
+    #[cfg(not(test))]
+    crate::framebuffer::scroll_view(action, delta);
+    #[cfg(test)]
+    let _ = (action, delta);
+}
+fn fb_scroll_page(action: bool, up: bool) {
+    #[cfg(not(test))]
+    crate::framebuffer::scroll_page(action, up);
+    #[cfg(test)]
+    let _ = (action, up);
+}
+fn fb_focus_is_action() -> bool {
+    #[cfg(not(test))]
+    return crate::framebuffer::focus_is_action();
+    #[cfg(test)]
+    false
+}
+fn fb_focus_toggle() {
+    #[cfg(not(test))]
+    crate::framebuffer::focus_toggle();
+}
+
+/// Insert `c` into `buf` at the cursor, re-echoing the shifted tail.
+fn insert_at(buf: &mut String, cur: &mut usize, c: char) {
+    buf.insert(*cur, c);
+    emit(&buf[*cur..]);
+    *cur += 1;
+    cursor_shift(buf.len() - *cur, false);
+}
+
+/// Delete the character at `cur` (the "Delete" key), re-echoing the tail.
+fn delete_at(buf: &mut String, cur: &mut usize) {
+    if *cur < buf.len() {
+        buf.remove(*cur);
+        emit(&buf[*cur..]);
+        emit(" ");
+        cursor_shift(buf.len() - *cur + 1, false);
+    }
+}
+
 fn read_line(buf: &mut String) {
     use crate::console;
     // History navigation state: index into HISTORY while browsing, plus the
-    // draft line that was being typed when Up was first pressed.
+    // draft line that was being typed when Up was first pressed. `cur` is the
+    // cursor offset within `buf` (Left/Right/Ctrl+A/Ctrl+E move it).
     let mut hist_idx: Option<usize> = None;
     let mut draft = String::new();
+    let mut cur: usize = 0;
     loop {
         match console::read_byte() {
             Some(b'\r') | Some(b'\n') => {
+                fb_scroll_live(false);
+                cursor_shift(buf.len() - cur, true);
                 serial_println!("");
                 let line = buf.trim();
                 if !line.is_empty() {
@@ -2108,13 +2178,25 @@ fn read_line(buf: &mut String) {
                 }
                 return;
             }
-            // ESC: decode an ANSI sequence (arrow keys from serial terminals and
-            // all keyboard drivers). Up/Down navigate history; others ignored.
+            // ESC: decode an ANSI CSI sequence (arrow/nav keys from serial
+            // terminals and all keyboard drivers): params, then a final byte.
             Some(0x1b) => {
                 if next_seq_byte() != Some(b'[') {
                     continue; // bare ESC or unknown sequence: ignore
                 }
-                match next_seq_byte() {
+                let mut param: u64 = 0;
+                let fin = loop {
+                    match next_seq_byte() {
+                        Some(b @ 0x40..=0x7e) => break Some(b),
+                        Some(d @ b'0'..=b'9') => param = param.saturating_mul(10) + (d - b'0') as u64,
+                        Some(_) => {}
+                        None => break None,
+                    }
+                };
+                let action = fb_focus_is_action();
+                match fin {
+                    Some(b'A') if action => fb_scroll_view(true, 1),
+                    Some(b'B') if action => fb_scroll_view(true, -1),
                     Some(b'A') => {
                         // Up: step back through history.
                         let n = HISTORY.with(|h| h.len());
@@ -2131,7 +2213,7 @@ fn read_line(buf: &mut String) {
                         };
                         hist_idx = Some(idx);
                         let entry = HISTORY.with(|h| h[idx].clone());
-                        replace_line(buf, &entry);
+                        replace_line(buf, &mut cur, &entry);
                     }
                     Some(b'B') => {
                         // Down: step forward; past the end restores the draft.
@@ -2140,19 +2222,71 @@ fn read_line(buf: &mut String) {
                             if i + 1 < n {
                                 hist_idx = Some(i + 1);
                                 let entry = HISTORY.with(|h| h[i + 1].clone());
-                                replace_line(buf, &entry);
+                                replace_line(buf, &mut cur, &entry);
                             } else {
                                 hist_idx = None;
                                 let d = draft.clone();
-                                replace_line(buf, &d);
+                                replace_line(buf, &mut cur, &d);
                             }
                         }
                     }
-                    _ => {} // Left/Right/other finals: consumed, not yet used
+                    Some(b'C') if !action => {
+                        if cur < buf.len() {
+                            cur += 1;
+                            cursor_shift(1, true);
+                        }
+                    }
+                    Some(b'D') if !action => {
+                        if cur > 0 {
+                            cur -= 1;
+                            cursor_shift(1, false);
+                        }
+                    }
+                    Some(b'H') => {
+                        cursor_shift(cur, false);
+                        cur = 0;
+                    }
+                    Some(b'F') => {
+                        cursor_shift(buf.len() - cur, true);
+                        cur = buf.len();
+                    }
+                    // Ctrl+Tab (driver-encoded) / Shift+Tab: toggle pane focus.
+                    Some(b'T') | Some(b'Z') => {
+                        fb_focus_toggle();
+                    }
+                    Some(b'~') => match param {
+                        1 | 7 => {
+                            cursor_shift(cur, false);
+                            cur = 0;
+                        }
+                        4 | 8 => {
+                            cursor_shift(buf.len() - cur, true);
+                            cur = buf.len();
+                        }
+                        3 => delete_at(buf, &mut cur),
+                        5 => fb_scroll_page(action, true),
+                        6 => fb_scroll_page(action, false),
+                        _ => {}
+                    },
+                    _ => {}
                 }
             }
-            // Tab: complete a /command prefix.
-            Some(b'\t') => tab_complete(buf),
+            // Tab: complete a /command prefix (only with the cursor at the end).
+            Some(b'\t') => {
+                if cur == buf.len() {
+                    tab_complete(buf);
+                    cur = buf.len();
+                }
+            }
+            // Ctrl+A / Ctrl+E: jump to line start / end (readline-style).
+            Some(0x01) => {
+                cursor_shift(cur, false);
+                cur = 0;
+            }
+            Some(0x05) => {
+                cursor_shift(buf.len() - cur, true);
+                cur = buf.len();
+            }
             // Ctrl+D (EOT): EOF-on-empty-line — power off, like typing /exit.
             // On a non-empty line it's ignored (standard shell behaviour), so an
             // accidental Ctrl+D mid-typing doesn't shut the system down.
@@ -2171,24 +2305,26 @@ fn read_line(buf: &mut String) {
                     for ch in text.chars() {
                         let c = if ch == '\n' || ch == '\r' || ch == '\t' { ' ' } else { ch };
                         if (' '..='~').contains(&c) {
-                            buf.push(c);
-                            console::put_byte(c as u8);
+                            insert_at(buf, &mut cur, c);
                         }
                     }
                 }
             }
             Some(0x7f) | Some(0x08) => {
-                if buf.pop().is_some() {
-                    // Erase the character on both consoles: back up, overwrite
-                    // with a space, back up again.
+                if cur > 0 {
+                    buf.remove(cur - 1);
+                    cur -= 1;
+                    // Back up, re-echo the shifted tail, blank the freed cell,
+                    // and walk the cursor back into place.
                     console::put_byte(0x08);
-                    console::put_byte(b' ');
-                    console::put_byte(0x08);
+                    emit(&buf[cur..]);
+                    emit(" ");
+                    cursor_shift(buf.len() - cur + 1, false);
                 }
             }
             Some(c @ 0x20..=0x7e) => {
-                buf.push(c as char);
-                console::put_byte(c);
+                fb_scroll_live(false);
+                insert_at(buf, &mut cur, c as char);
             }
             Some(_) => {} // ignore other control bytes
             None => {
@@ -2202,10 +2338,92 @@ fn read_line(buf: &mut String) {
 
 use core::sync::atomic::{AtomicU64, Ordering};
 static LAST_STATUS_MS: AtomicU64 = AtomicU64::new(0);
+// CPU-usage accounting: gaps between upkeep ticks longer than IDLE_GAP_MS mean
+// the CPU was busy computing (this scheduler is cooperative — an idle shell
+// ticks sub-millisecond). Windows of ~2 s roll into `CPU_PCT`.
+static LAST_TICK_MS: AtomicU64 = AtomicU64::new(0);
+static BUSY_MS: AtomicU64 = AtomicU64::new(0);
+static WIN_START_MS: AtomicU64 = AtomicU64::new(0);
+static CPU_PCT: AtomicU64 = AtomicU64::new(0);
+static ICON_STATE: AtomicU64 = AtomicU64::new(u64::MAX);
+const IDLE_GAP_MS: u64 = 20;
+
+/// Approximate CPU busy percentage over the last ~2 s window (0..=100), for the
+/// status bar. Cooperative-scheduler proxy: time between upkeep ticks that
+/// exceeded [`IDLE_GAP_MS`] counts as busy.
+pub fn cpu_percent() -> u64 {
+    CPU_PCT.load(Ordering::Relaxed)
+}
+
+/// The status-bar device/net indicator state: bit0 keyboard active (<1.5 s),
+/// bit1 mouse active, bit2 net up. A change forces a status-bar refresh.
+#[cfg(not(test))]
+fn icon_state(now: u64) -> u64 {
+    let kbd = now.saturating_sub(crate::console::input_activity_ms()) < 1500;
+    let mse = now.saturating_sub(crate::mouse::activity_ms()) < 1500;
+    let net = crate::net::is_up();
+    (kbd as u64) | ((mse as u64) << 1) | ((net as u64) << 2)
+}
 
 /// Per-idle UI upkeep: blink the caret and refresh the status-bar datetime
 /// (throttled to once a second). No-op in the test build (no framebuffer).
 fn ui_tick() {
+    #[cfg(not(test))]
+    {
+        let now = crate::arch::now_ms();
+        // CPU accounting: a long gap since the last tick = busy compute.
+        let last = LAST_TICK_MS.swap(now, Ordering::Relaxed);
+        if last != 0 && now > last {
+            let dt = now - last;
+            if dt > IDLE_GAP_MS {
+                BUSY_MS.fetch_add(dt, Ordering::Relaxed);
+            }
+        }
+        let w0 = WIN_START_MS.load(Ordering::Relaxed);
+        if w0 == 0 {
+            WIN_START_MS.store(now, Ordering::Relaxed);
+        } else if now.saturating_sub(w0) >= 2000 {
+            let pct = BUSY_MS.load(Ordering::Relaxed) * 100 / now.saturating_sub(w0).max(1);
+            CPU_PCT.store(pct.min(100), Ordering::Relaxed);
+            BUSY_MS.store(0, Ordering::Relaxed);
+            WIN_START_MS.store(now, Ordering::Relaxed);
+        }
+        crate::framebuffer::blink(now);
+        let icons = icon_state(now);
+        let icons_changed = ICON_STATE.swap(icons, Ordering::Relaxed) != icons;
+        if icons_changed || now.saturating_sub(LAST_STATUS_MS.load(Ordering::Relaxed)) >= 1000 {
+            LAST_STATUS_MS.store(now, Ordering::Relaxed);
+            update_status();
+        }
+        // Mouse: move the cursor; a click on the action-pane [x] closes it,
+        // a click elsewhere focuses the pane under the pointer.
+        let t = crate::mouse::tick();
+        if t.moved {
+            crate::framebuffer::cursor_move(t.x, t.y);
+        }
+        if t.pressed {
+            if crate::framebuffer::hit_close(t.x, t.y) {
+                crate::framebuffer::close_action();
+            } else if let Some(action) = crate::framebuffer::pane_hit(t.x, t.y) {
+                crate::framebuffer::focus_set(action);
+            }
+        }
+    }
+}
+
+/// Cooperative upkeep for long-running work (model loading, ONNX inference,
+/// big disk reads): keeps the clock, caret, mouse cursor, and net stack alive
+/// while a compute/IO loop holds the CPU. Call it from inside any loop that
+/// can run longer than ~50 ms — the standing UI rule.
+pub fn upkeep() {
+    ui_tick();
+    crate::net::poll();
+}
+
+/// Lighter upkeep for loops that consume their own mouse events (modals, the
+/// editor): caret blink + status bar + net only — no `mouse::tick()`, which
+/// would steal their clicks.
+pub fn status_tick() {
     #[cfg(not(test))]
     {
         let now = crate::arch::now_ms();
@@ -2214,15 +2432,8 @@ fn ui_tick() {
             LAST_STATUS_MS.store(now, Ordering::Relaxed);
             update_status();
         }
-        // Mouse: move the cursor; a click on the action-pane [x] closes it.
-        let t = crate::mouse::tick();
-        if t.moved {
-            crate::framebuffer::cursor_move(t.x, t.y);
-        }
-        if t.pressed && crate::framebuffer::hit_close(t.x, t.y) {
-            crate::framebuffer::close_action();
-        }
     }
+    crate::net::poll();
 }
 
 /// Resolve the status-bar templates (from the UI config, phase 2) against the

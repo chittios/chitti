@@ -229,6 +229,10 @@ impl<'d, D: BlockDevice> Ext4Reader<'d, D> {
             dst[done..done + take].copy_from_slice(&buf[..take]);
             done += take;
             lb += 1;
+            // UI/net upkeep every ~1 MiB so a large read doesn't freeze the UI.
+            if lb % 256 == 0 {
+                crate::shell::upkeep();
+            }
         }
         Some(done)
     }

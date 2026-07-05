@@ -73,10 +73,10 @@ impl Default for UiConfig {
             chat_pct: 56,
             font_scale: 0,
             swap_panes: false,
-            chat_title: "chat".to_string(),
+            chat_title: "Shell Agent".to_string(),
             logs_title: "ktrace".to_string(),
             status_left: "Chitti OS v${version}".to_string(),
-            status_right: "${datetime}  ${tz}".to_string(),
+            status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu}  ${datetime} ${tz}".to_string(),
             tz_offset: 0,
             splash: true,
             theme: THEME_DEFAULTS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
@@ -114,14 +114,25 @@ impl UiConfig {
                 }
             }
         }
+        // Migrate stale persisted defaults: configs written before the pane was
+        // renamed / the status bar grew system info keep the old literal — map
+        // it forward rather than pinning users to it forever.
+        let chat_title = match s("chat_title", &d.chat_title) {
+            t if t == "chat" => d.chat_title.clone(),
+            t => t,
+        };
+        let status_right = match s("status_right", &d.status_right) {
+            t if t == "${datetime}  ${tz}" => d.status_right.clone(),
+            t => t,
+        };
         UiConfig {
             chat_pct: j.get("chat_pct").and_then(|v| v.as_i64()).map(|n| n as u64).unwrap_or(d.chat_pct),
             font_scale: j.get("font_scale").and_then(|v| v.as_i64()).map(|n| n as u64).unwrap_or(d.font_scale),
             swap_panes: j.get("swap_panes").and_then(|v| v.as_bool()).unwrap_or(d.swap_panes),
-            chat_title: s("chat_title", &d.chat_title),
+            chat_title,
             logs_title: s("logs_title", &d.logs_title),
             status_left: s("status_left", &d.status_left),
-            status_right: s("status_right", &d.status_right),
+            status_right,
             tz_offset: j.get("tz_offset").and_then(|v| v.as_i64()).map(|n| n as i32).unwrap_or(d.tz_offset),
             splash: j.get("splash").and_then(|v| v.as_bool()).unwrap_or(d.splash),
             theme,
@@ -272,6 +283,24 @@ fn resolve_var(var: &str) -> String {
         "uptime" => {
             let s = crate::arch::now_ms() / 1000;
             alloc::format!("up {}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+        }
+        // System info: heap usage, CPU busy %, net link, input-device activity
+        // (`*` = active within the last 1.5 s).
+        "mem" => {
+            let (total, _free, used) = crate::mm::heap::stats();
+            alloc::format!("mem {}/{}M", used / (1024 * 1024), total / (1024 * 1024))
+        }
+        "cpu" => alloc::format!("cpu {:>3}%", crate::shell::cpu_percent()),
+        "net" => (if crate::net::is_up() { "net up" } else { "net --" }).to_string(),
+        "kbd" => {
+            let last = crate::console::input_activity_ms();
+            let active = last != 0 && crate::arch::now_ms().saturating_sub(last) < 1500;
+            (if active { "kbd*" } else { "kbd " }).to_string()
+        }
+        "mouse" => {
+            let last = crate::mouse::activity_ms();
+            let active = last != 0 && crate::arch::now_ms().saturating_sub(last) < 1500;
+            (if active { "mse*" } else { "mse " }).to_string()
         }
         other => alloc::format!("${{{}}}", other),
     }

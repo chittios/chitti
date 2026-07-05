@@ -45,6 +45,7 @@ pub fn confirm(title: &str, msg: &str) -> bool {
                 _ => {}
             }
         }
+        crate::shell::status_tick(); // status bar + net stay alive under the modal
         crate::sched::yield_now();
     }
 }
@@ -95,6 +96,7 @@ pub fn input(title: &str, prompt: &str, masked: bool) -> String {
             caret_on = !caret_on;
             framebuffer::draw_input(title, prompt, &buf, masked, caret_on);
         }
+        crate::shell::status_tick(); // status bar + net stay alive under the modal
         crate::sched::yield_now();
     }
 }

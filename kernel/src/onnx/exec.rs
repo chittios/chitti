@@ -1118,6 +1118,11 @@ fn exec_graph<'t>(g: &'t Graph<'t>, env: &mut BTreeMap<String, Val>, outer_inits
     }
     for (pos, &ni) in order.iter().enumerate() {
         let node = &g.nodes[ni];
+        // Cooperative upkeep between nodes: a full STT/TTS run is seconds of
+        // compute, and the scheduler is cooperative — without this the clock,
+        // caret, mouse, and net stack freeze for the whole inference.
+        #[cfg(target_os = "none")]
+        crate::shell::upkeep();
         // Materialise any initializer inputs this node needs, right before it
         // runs (and liveness frees them after their last use).
         for &inp in &node.inputs {

@@ -266,7 +266,18 @@ impl<'d, D: BlockDevice> FatReader<'d, D> {
                 let full = want / BLOCK_SIZE * BLOCK_SIZE;
                 let lba = self.cluster_lba(c0);
                 if full > 0 {
-                    self.dev.read_blocks(lba, &mut out[done..done + full]).ok()?;
+                    // Read the run in <=2 MiB slices with UI/net upkeep between
+                    // them: a 100+ MB contiguous model file is otherwise one
+                    // blocking transfer that freezes the clock, mouse, and net
+                    // stack for its whole duration (cooperative scheduler).
+                    const SLICE: usize = 2 * 1024 * 1024;
+                    let mut off = 0usize;
+                    while off < full {
+                        let n = SLICE.min(full - off);
+                        self.dev.read_blocks(lba + (off / BLOCK_SIZE) as u64, &mut out[done + off..done + off + n]).ok()?;
+                        off += n;
+                        crate::shell::upkeep();
+                    }
                     done += full;
                 }
                 if done < out.len() && want > full {

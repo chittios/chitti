@@ -79,6 +79,7 @@ pub fn open(path: &str) -> bool {
             }
             None => {
                 ed.mouse_tick();
+                crate::shell::status_tick(); // keep clock/status/net alive while editing
                 crate::sched::yield_now();
             }
         }
