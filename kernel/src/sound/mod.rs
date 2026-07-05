@@ -1,8 +1,12 @@
-//! **Sound** — PCM audio in and out for the voice pipeline (`/voice`): a
-//! virtio-snd NIC-style driver captures microphone frames and plays synthesized
-//! speech. Drivers implement [`SndDevice`] (16-bit signed PCM, mono); the
-//! transports are **virtio-sound over virtio-mmio** (aarch64 QEMU `virt`) and
-//! **virtio-sound over PCI** (x86 QEMU/VBox), discovered like the net drivers.
+//! **Sound** — PCM audio in and out for the voice pipeline (`/voice`). Drivers
+//! implement [`SndDevice`] (16-bit signed PCM, mono); three back-ends cover
+//! every target the standing rule requires:
+//! - **virtio-sound over virtio-mmio** — aarch64 QEMU `virt` (`-kernel`),
+//! - **virtio-sound over PCI** — QEMU x86/aarch64 with a PCI bus,
+//! - **Intel HDA** ([`hda`]) — **VirtualBox** (x86 *and* ARM) and real Intel/ARM
+//!   machines, plus QEMU's `intel-hda` for testing.
+//! `autodetect` tries them in that order, so the same image gets audio on QEMU,
+//! VirtualBox, and bare metal.
 //!
 //! The virtio-snd protocol (virtio spec §5.14) rides four virtqueues:
 //! control(0) / event(1) / tx(2, playback) / rx(3, capture). We poll — no
@@ -94,8 +98,9 @@ pub fn is_up() -> bool {
     SND.with(|s| s.is_some())
 }
 
-/// Discover and bring up the first available sound device (virtio-snd over
-/// mmio, then over PCI). No-op if none is present. Called once at boot.
+/// Discover and bring up the first available sound device: virtio-snd over
+/// mmio (aarch64 QEMU `-kernel`), virtio-snd over PCI (QEMU), then **Intel
+/// HDA** — VirtualBox (x86 + ARM) and real machines. No-op if none is present.
 pub fn autodetect() {
     if is_up() {
         return;
@@ -108,6 +113,10 @@ pub fn autodetect() {
         }
     }
     if let Some(dev) = virtio_snd_pci::VirtioSndPci::probe() {
+        init(dev);
+        return;
+    }
+    if let Some(dev) = hda::Hda::probe() {
         init(dev);
     }
 }
@@ -170,6 +179,7 @@ fn libm_sqrt(x: f64) -> f64 {
     r
 }
 
+pub mod hda;
 pub mod mel;
 pub mod model_store;
 pub mod stt;
