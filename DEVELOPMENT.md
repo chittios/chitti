@@ -236,3 +236,21 @@ chitti/
   bytes) — put them under `/tmp` when scripting QEMU.
 - Regenerate the Geist Mono glyph atlas after a font change:
   `python3 tools/fonts/gen_geist.py` → `kernel/src/font_geist.rs`.
+
+## Voice (`/voice`) — audio + models
+
+- **Microphone permission (macOS).** QEMU's coreaudio *input* only opens once
+  the process running QEMU has been granted Microphone access. A headless /
+  background launch (e.g. from a CI or an editor's task runner) can't be granted
+  and fails at startup with `audio: Can not open 'virtio-sound.in' (no host
+  audio driver)`. Run `cargo xtask run` from a **real terminal** and grant the
+  first-run prompt, or pre-authorize the terminal in **System Settings →
+  Privacy & Security → Microphone**. Playback (the `/voice test` tone) needs no
+  permission; capture does. Without a mic you can still exercise the full STT
+  front-end with `/voice stt <file.wav>` (mount a volume holding a 16 kHz mono
+  WAV).
+- **Models.** `cargo xtask voice-assets` downloads silero-vad (embedded in the
+  kernel), parakeet STT (~131 MB) and KittenTTS (~78 MB) into `assets/voice/`
+  (gitignored). The two large models are loaded at runtime — `/voice models
+  load parakeet|kitten <mounted-path>` — not embedded. `/voice models` shows
+  what's loaded.
