@@ -39,6 +39,225 @@ fn le64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(v)
 }
 
+/// Load `\model.gguf.000` off the ESP via **raw Block I/O with our own FAT32
+/// walk**, straight into freshly allocated pages. The firmware's FAT driver
+/// (`fs.read`) reads a ~774 MB model cluster-by-cluster through small internal
+/// buffers — minutes on VirtualBox — and costs two extra full copies (the read
+/// Vec + the copy into place). Here: the whole FAT is read in one Block I/O
+/// call, the cluster chain is coalesced into contiguous runs, and each run is
+/// read directly into the destination (capped at 16 MiB per request). Returns
+/// `(base, len)`, or `None` for any surprise (caller falls back to `fs.read`).
+fn load_model_blockio() -> Option<(u64, u64)> {
+    use uefi::proto::loaded_image::LoadedImage;
+    use uefi::proto::media::block::BlockIO;
+
+    // GetProtocol: the firmware owns LoadedImage; we only read `.device()`.
+    // SAFETY: read-only access to our own image's protocol.
+    let li = unsafe {
+        boot::open_protocol::<LoadedImage>(
+            boot::OpenProtocolParams {
+                handle: boot::image_handle(),
+                agent: boot::image_handle(),
+                controller: None,
+            },
+            boot::OpenProtocolAttributes::GetProtocol,
+        )
+        .ok()?
+    };
+    let dev = li.device()?;
+    // GetProtocol (non-exclusive): the firmware's FAT stack keeps its own open.
+    // SAFETY: read-only Block I/O alongside the firmware driver; we never write.
+    let bio = unsafe {
+        boot::open_protocol::<BlockIO>(
+            boot::OpenProtocolParams {
+                handle: dev,
+                agent: boot::image_handle(),
+                controller: None,
+            },
+            boot::OpenProtocolAttributes::GetProtocol,
+        )
+        .ok()?
+    };
+    let media_id = bio.media().media_id();
+    let bs = bio.media().block_size() as usize;
+    if bs != 512 {
+        return None; // only 512-byte sectors (matches the image builder)
+    }
+
+    // BPB → FAT32 geometry (partition-relative LBA 0).
+    let mut bpb = [0u8; 512];
+    bio.read_blocks(media_id, 0, &mut bpb).ok()?;
+    if bpb[510] != 0x55 || bpb[511] != 0xAA || le16(&bpb, 11) as usize != 512 {
+        return None;
+    }
+    let spc = bpb[13] as u64;
+    let reserved = le16(&bpb, 14) as u64;
+    let nfats = bpb[16] as u64;
+    let fat_size = {
+        let f16 = le16(&bpb, 22) as u64;
+        if f16 != 0 {
+            f16
+        } else {
+            le32(&bpb, 36) as u64
+        }
+    };
+    let root_entries = le16(&bpb, 17) as u64;
+    if spc == 0 || fat_size == 0 || root_entries != 0 {
+        return None; // FAT32 only (root as cluster chain)
+    }
+    let root_clus = le32(&bpb, 44);
+    let fat_lba = reserved;
+    let data_lba = reserved + nfats * fat_size;
+    let cluster_lba = |c: u32| data_lba + (c as u64 - 2) * spc;
+
+    // The whole FAT in one read (a few hundred KiB for our ESP sizes), so the
+    // chain walk below is pure memory.
+    if fat_size * 512 > 64 << 20 {
+        return None; // implausible FAT size — don't trust the parse
+    }
+    let mut fat = alloc::vec![0u8; (fat_size * 512) as usize];
+    bio.read_blocks(media_id, fat_lba, &mut fat).ok()?;
+    let next = |c: u32| -> Option<u32> {
+        // Bounds-checked: a corrupt chain must fall back, not fault the stub.
+        let off = c as usize * 4;
+        if off + 4 > fat.len() {
+            return None;
+        }
+        let n = le32(&fat, off) & 0x0fff_ffff;
+        (n >= 2 && n < 0x0fff_fff8).then_some(n)
+    };
+
+    // Walk the root directory for `model.gguf.000` (VFAT long name: accumulate
+    // LFN entries; 8.3 fallback compares the padded short name).
+    const WANT: &str = "model.gguf.000";
+    let bpc = (spc * 512) as usize;
+    let mut dirbuf = alloc::vec![0u8; bpc];
+    let (mut start, mut size) = (0u32, 0u32);
+    let mut lfn = alloc::string::String::new();
+    let mut c = Some(root_clus);
+    let mut dir_clusters = 0u32;
+    'outer: while let Some(cl) = c {
+        // Cycle guard: a corrupt chain must not spin the stub forever.
+        dir_clusters += 1;
+        if dir_clusters > 65_536 {
+            return None;
+        }
+        bio.read_blocks(media_id, cluster_lba(cl), &mut dirbuf)
+            .ok()?;
+        for e in dirbuf.chunks_exact(32) {
+            match e[0] {
+                0 => break 'outer, // end of directory
+                0xe5 => {
+                    lfn.clear();
+                    continue;
+                }
+                _ => {}
+            }
+            if e[11] == 0x0f {
+                // LFN entry: 13 UCS-2 chars at offsets 1..11, 14..26, 28..32.
+                let mut part = alloc::string::String::new();
+                for &o in &[1usize, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30] {
+                    let ch = le16(e, o);
+                    if ch == 0 || ch == 0xffff {
+                        break;
+                    }
+                    part.push(char::from_u32(ch as u32).unwrap_or('?'));
+                }
+                // Entries arrive last-part-first; prepend.
+                part.push_str(&lfn);
+                lfn = part;
+                continue;
+            }
+            let name = if !lfn.is_empty() {
+                core::mem::take(&mut lfn)
+            } else {
+                short_name(e)
+            };
+            if name.eq_ignore_ascii_case(WANT) && e[11] & 0x10 == 0 {
+                start = (le16(e, 20) as u32) << 16 | le16(e, 26) as u32;
+                size = le32(e, 28);
+                break 'outer;
+            }
+        }
+        c = next(cl);
+    }
+    if start < 2 || size == 0 {
+        return None;
+    }
+
+    // Destination pages, then the chain as coalesced runs, ≤16 MiB per read.
+    let pages = (size as usize).div_ceil(4096);
+    let ptr = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages).ok()?;
+    // SAFETY: freshly allocated `pages * 4096` bytes.
+    let dst = unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), pages * 4096) };
+    // 1 MiB per request: comfortably under any firmware Block I/O limit —
+    // VirtualBox's EFI NVMe driver does not split oversized transfers the way
+    // QEMU's EDK2 does (NVMe MDTS), and a too-big read hangs it.
+    const MAX_RUN: usize = 1 << 20;
+    let mut done = 0usize;
+    let mut cur = Some(start);
+    let mut chain_guard = 0u64;
+    let mut next_progress = 256usize << 20;
+    while done < size as usize {
+        // Cycle guard: never walk more clusters than the file can hold.
+        chain_guard += 1;
+        if chain_guard > (size as u64 / bpc as u64) + 16 {
+            return None;
+        }
+        let c0 = cur?;
+        let mut run = 1u64;
+        let mut tail = c0;
+        cur = None;
+        while done + (run as usize) * bpc < size as usize && (run as usize) * bpc < MAX_RUN {
+            match next(tail) {
+                Some(n) if n == tail + 1 => {
+                    tail = n;
+                    run += 1;
+                }
+                other => {
+                    cur = other;
+                    break;
+                }
+            }
+        }
+        if cur.is_none() && done + (run as usize) * bpc < size as usize {
+            cur = next(tail); // run was cut by MAX_RUN, not by the chain
+        }
+        let want = (size as usize - done).min(run as usize * bpc);
+        let sectors = want.div_ceil(512);
+        bio.read_blocks(
+            media_id,
+            cluster_lba(c0),
+            &mut dst[done..done + sectors * 512],
+        )
+        .ok()?;
+        done += want;
+        if done >= next_progress {
+            log::info!("chitti-stub: model {} / {} MiB…", done >> 20, size >> 20);
+            next_progress += 256 << 20;
+        }
+    }
+    log::info!(
+        "chitti-stub: model {} bytes at {:#x} (Block I/O fast path)",
+        size,
+        ptr.as_ptr() as u64
+    );
+    Some((ptr.as_ptr() as u64, size as u64))
+}
+
+/// The 8.3 short name of a directory entry, dot-joined and lowercased-ish
+/// (enough for a case-insensitive compare).
+fn short_name(e: &[u8]) -> alloc::string::String {
+    let base: alloc::string::String = e[0..8].iter().map(|&b| b as char).collect();
+    let ext: alloc::string::String = e[8..11].iter().map(|&b| b as char).collect();
+    let (base, ext) = (base.trim_end(), ext.trim_end());
+    if ext.is_empty() {
+        alloc::string::String::from(base)
+    } else {
+        alloc::format!("{base}.{ext}")
+    }
+}
+
 /// Allocate `bytes` physical pages at page-aligned `paddr`, returning a slice
 /// over them. Used once for the whole kernel span and once for the model.
 fn alloc_at(paddr: u64, bytes: usize) -> &'static mut [u8] {
@@ -65,7 +284,9 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// The current UTC time as Unix seconds from the UEFI runtime clock, or 0 if the
 /// firmware has no RTC. Converts the (possibly timezone-local) EFI time to UTC.
 fn efi_unix() -> u64 {
-    let Ok(t) = uefi::runtime::get_time() else { return 0 };
+    let Ok(t) = uefi::runtime::get_time() else {
+        return 0;
+    };
     let secs = days_from_civil(t.year() as i64, t.month() as i64, t.day() as i64) * 86400
         + t.hour() as i64 * 3600
         + t.minute() as i64 * 60
@@ -75,7 +296,11 @@ fn efi_unix() -> u64 {
         Some(tz) if tz != 2047 => secs - tz as i64 * 60,
         _ => secs,
     };
-    if secs > 0 { secs as u64 } else { 0 }
+    if secs > 0 {
+        secs as u64
+    } else {
+        0
+    }
 }
 
 fn acpi_rsdp() -> u64 {
@@ -96,8 +321,12 @@ fn main() -> Status {
     log::info!("chitti-stub: loading kernel off the ESP");
 
     // Read the kernel ELF (and the model, if present) from the boot volume.
-    let mut fs = uefi::fs::FileSystem::new(boot::get_image_file_system(boot::image_handle()).expect("no ESP filesystem"));
-    let kernel = fs.read(cstr16!("\\chitti-kernel")).expect("read \\chitti-kernel");
+    let mut fs = uefi::fs::FileSystem::new(
+        boot::get_image_file_system(boot::image_handle()).expect("no ESP filesystem"),
+    );
+    let kernel = fs
+        .read(cstr16!("\\chitti-kernel"))
+        .expect("read \\chitti-kernel");
     log::info!("chitti-stub: kernel {} bytes", kernel.len());
 
     // Parse the ELF64 header; find the PT_LOAD span, allocate it once (segments
@@ -108,9 +337,19 @@ fn main() -> Status {
     let phoff = le64(&kernel, 32) as usize;
     let phentsize = le16(&kernel, 54) as usize;
     let phnum = le16(&kernel, 56) as usize;
-    let loads = || (0..phnum).map(|i| phoff + i * phentsize).filter(|&ph| le32(&kernel, ph) == 1);
-    let min_pa = loads().map(|ph| le64(&kernel, ph + 24)).min().expect("no PT_LOAD");
-    let max_end = loads().map(|ph| le64(&kernel, ph + 24) + le64(&kernel, ph + 40)).max().unwrap();
+    let loads = || {
+        (0..phnum)
+            .map(|i| phoff + i * phentsize)
+            .filter(|&ph| le32(&kernel, ph) == 1)
+    };
+    let min_pa = loads()
+        .map(|ph| le64(&kernel, ph + 24))
+        .min()
+        .expect("no PT_LOAD");
+    let max_end = loads()
+        .map(|ph| le64(&kernel, ph + 24) + le64(&kernel, ph + 40))
+        .max()
+        .unwrap();
     log::info!("chitti-stub: kernel span {min_pa:#x}..{max_end:#x} entry={entry:#x}");
     let region = alloc_at(min_pa, (max_end - min_pa) as usize);
     for ph in loads() {
@@ -130,27 +369,48 @@ fn main() -> Status {
     // regions at fixed addresses and AllocateAddress there returns NOT_FOUND — so
     // we let the firmware pick a free run and report where it landed in the
     // boot-info; the kernel reads the model there (not at a hardcoded address).
-    let model_region: Option<(u64, u64)> = match fs.read(cstr16!("\\model.gguf.000")) {
-        Ok(model) => {
-            let pages = model.len().div_ceil(4096);
-            match boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages) {
-                Ok(ptr) => {
-                    let base = ptr.as_ptr() as u64;
-                    // SAFETY: freshly allocated, `pages * 4096` bytes at `base`.
-                    let dst = unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), pages * 4096) };
-                    dst[..model.len()].copy_from_slice(&model);
-                    log::info!("chitti-stub: model {} bytes at {base:#x}", model.len());
-                    Some((base, model.len() as u64))
+    //
+    // Fast path first: raw Block I/O + our own FAT32 walk reads the ~774 MB
+    // model in big contiguous requests with zero extra copies; the firmware's
+    // FAT driver (fallback) reads it cluster-by-cluster — minutes on VBox.
+    let model_region: Option<(u64, u64)> = match load_model_blockio() {
+        Some(r) => Some(r),
+        None => {
+            log::info!(
+                "chitti-stub: Block I/O fast path unavailable; firmware FAT fallback (slow)"
+            );
+            match fs.read(cstr16!("\\model.gguf.000")) {
+                Ok(model) => {
+                    let pages = model.len().div_ceil(4096);
+                    match boot::allocate_pages(
+                        AllocateType::AnyPages,
+                        MemoryType::LOADER_DATA,
+                        pages,
+                    ) {
+                        Ok(ptr) => {
+                            let base = ptr.as_ptr() as u64;
+                            // SAFETY: freshly allocated, `pages * 4096` bytes at `base`.
+                            let dst = unsafe {
+                                core::slice::from_raw_parts_mut(ptr.as_ptr(), pages * 4096)
+                            };
+                            dst[..model.len()].copy_from_slice(&model);
+                            log::info!(
+                                "chitti-stub: model {} bytes at {base:#x} (firmware FAT path)",
+                                model.len()
+                            );
+                            Some((base, model.len() as u64))
+                        }
+                        Err(e) => {
+                            log::warn!("chitti-stub: model alloc ({pages} pages) failed: {e:?} -- booting without a model (need more VM RAM)");
+                            None
+                        }
+                    }
                 }
-                Err(e) => {
-                    log::warn!("chitti-stub: model alloc ({pages} pages) failed: {e:?} -- booting without a model (need more VM RAM)");
+                Err(_) => {
+                    log::info!("chitti-stub: no model on ESP (kernel will report no model)");
                     None
                 }
             }
-        }
-        Err(_) => {
-            log::info!("chitti-stub: no model on ESP (kernel will report no model)");
-            None
         }
     };
 
@@ -164,11 +424,16 @@ fn main() -> Status {
         match boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages) {
             Ok(ptr) => {
                 let base = ptr.as_ptr() as u64;
-                log::info!("chitti-stub: reserved kernel heap {base:#x} ({} MiB)", HEAP_MAX >> 20);
+                log::info!(
+                    "chitti-stub: reserved kernel heap {base:#x} ({} MiB)",
+                    HEAP_MAX >> 20
+                );
                 Some((base, HEAP_MAX))
             }
             Err(e) => {
-                log::warn!("chitti-stub: heap reserve ({pages} pages) failed: {e:?} (need more VM RAM)");
+                log::warn!(
+                    "chitti-stub: heap reserve ({pages} pages) failed: {e:?} (need more VM RAM)"
+                );
                 None
             }
         }
@@ -192,7 +457,11 @@ fn main() -> Status {
         // GOP, so an exclusive open is denied. GetProtocol just reads it.
         let mut gop = match unsafe {
             boot::open_protocol::<GraphicsOutput>(
-                boot::OpenProtocolParams { handle: h, agent: boot::image_handle(), controller: None },
+                boot::OpenProtocolParams {
+                    handle: h,
+                    agent: boot::image_handle(),
+                    controller: None,
+                },
                 boot::OpenProtocolAttributes::GetProtocol,
             )
         } {
@@ -239,7 +508,11 @@ fn main() -> Status {
             PixelFormat::Rgb => (0, 8, 16),
             PixelFormat::Bgr => (16, 8, 0),
             PixelFormat::Bitmask => match mode.pixel_bitmask() {
-                Some(m) => (m.red.trailing_zeros() as u8, m.green.trailing_zeros() as u8, m.blue.trailing_zeros() as u8),
+                Some(m) => (
+                    m.red.trailing_zeros() as u8,
+                    m.green.trailing_zeros() as u8,
+                    m.blue.trailing_zeros() as u8,
+                ),
                 None => (16, 8, 0),
             },
             PixelFormat::BltOnly => return None,
@@ -341,9 +614,9 @@ fn main() -> Status {
 extern "C" fn trampoline(_entry: u64) -> ! {
     core::arch::naked_asm!(
         "mrs x8, sctlr_el1",
-        "bic x8, x8, #1",      // M = 0 (MMU off)
-        "bic x8, x8, #4",      // C = 0 (data cache off)
-        "bic x8, x8, #4096",   // I = 0 (instruction cache off)
+        "bic x8, x8, #1",    // M = 0 (MMU off)
+        "bic x8, x8, #4",    // C = 0 (data cache off)
+        "bic x8, x8, #4096", // I = 0 (instruction cache off)
         "msr sctlr_el1, x8",
         "isb",
         "tlbi vmalle1",
@@ -356,8 +629,12 @@ extern "C" fn trampoline(_entry: u64) -> ! {
 /// Allocate one+ pages of identity RAM anywhere below 4 GiB.
 fn alloc_at_any(bytes: usize) -> &'static mut [u8] {
     let pages = bytes.div_ceil(4096);
-    let ptr = boot::allocate_pages(AllocateType::MaxAddress(0xFFFF_F000), MemoryType::LOADER_DATA, pages)
-        .unwrap_or_else(|e| panic!("allocate_pages (any, {pages} pages) failed: {e:?}"));
+    let ptr = boot::allocate_pages(
+        AllocateType::MaxAddress(0xFFFF_F000),
+        MemoryType::LOADER_DATA,
+        pages,
+    )
+    .unwrap_or_else(|e| panic!("allocate_pages (any, {pages} pages) failed: {e:?}"));
     // SAFETY: freshly allocated pages.
     unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), pages * 4096) }
 }

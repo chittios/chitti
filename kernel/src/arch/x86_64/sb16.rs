@@ -133,15 +133,18 @@ impl Sb16 {
         }
     }
 
-    fn set_rate(&self, out: bool) {
+    fn set_rate(&self, out: bool, hz: u32) {
+        // SB16 DSP programs an arbitrary rate (5000..=44100); clamp and use the
+        // caller's rate directly (16 kHz mic/tones, 24 kHz TTS).
+        let hz = hz.clamp(5000, 44100);
         dsp_write(if out { 0x41 } else { 0x42 }); // set output/input sample rate
-        dsp_write((RATE >> 8) as u8);
-        dsp_write((RATE & 0xff) as u8);
+        dsp_write((hz >> 8) as u8);
+        dsp_write((hz & 0xff) as u8);
     }
 }
 
 impl SndDevice for Sb16 {
-    fn play(&mut self, pcm: &[i16], _hz: u32) -> Result<(), &'static str> {
+    fn play(&mut self, pcm: &[i16], hz: u32) -> Result<(), &'static str> {
         let n = pcm.len().min(BUF_SAMPLES);
         if n == 0 {
             return Ok(());
@@ -151,7 +154,7 @@ impl SndDevice for Sb16 {
             core::ptr::copy_nonoverlapping(pcm.as_ptr(), self.buf.1 as *mut i16, n);
         }
         self.program_dma(n * 2, true);
-        self.set_rate(true);
+        self.set_rate(true, hz);
         // 0xB6 = 16-bit output, single-cycle; mode 0x10 = signed mono.
         dsp_write(0xb0); // 16-bit output, single-cycle, D/A
         dsp_write(0x10); // signed, mono
@@ -187,7 +190,7 @@ impl SndDevice for Sb16 {
             return Ok(());
         }
         self.program_dma(BUF_SAMPLES * 2, false);
-        self.set_rate(false);
+        self.set_rate(false, RATE);
         dsp_write(0xbe); // 16-bit input, auto-init
         dsp_write(0x10); // signed mono
         let words = (BUF_SAMPLES - 1) as u16;

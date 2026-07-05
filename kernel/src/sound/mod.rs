@@ -70,10 +70,30 @@ pub mod proto {
     }
 }
 
+/// Resample mono PCM from `hz` to a device's fixed `out_hz` by nearest-neighbor
+/// (exact sample-repetition for the integer ratios in use: 16→48 kHz ×3,
+/// 24→48 kHz ×2). Fixed-rate devices (HDA @48 k, AC'97 @48 k) call this instead
+/// of assuming the input rate — playing 24 kHz TTS through a hardcoded 16 kHz
+/// assumption is how "hello there" became "helllloooo theeeere" (1.5× slow).
+pub fn resample(pcm: &[i16], hz: u32, out_hz: u32) -> Vec<i16> {
+    if hz == out_hz || hz == 0 {
+        return pcm.to_vec();
+    }
+    let out_len = (pcm.len() as u64 * out_hz as u64 / hz as u64) as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        out.push(pcm[(i as u64 * hz as u64 / out_hz as u64) as usize]);
+    }
+    out
+}
+
 /// A PCM sound device: play and capture 16-bit signed mono samples. Poll-driven.
 pub trait SndDevice {
     /// Start (or restart) the output stream at `hz`, then queue `pcm` for
     /// playback. Blocks only to enqueue (the device drains asynchronously).
+    /// Implementations **must honor `hz`** — set the hardware rate to it, or
+    /// [`resample`] to the device's fixed rate. Callers pass 16 kHz (mic/test
+    /// tones) *and* 24 kHz (KittenTTS).
     fn play(&mut self, pcm: &[i16], hz: u32) -> Result<(), &'static str>;
     /// True while queued playback is still draining.
     fn playing(&mut self) -> bool;
