@@ -65,7 +65,7 @@ model from ever directly touching hardware.
   PCIe; input via USB xHCI/HID + virtio-input + PL050/PS-2; discovery via
   ACPI/ECAM, fw_cfg, HID report descriptors. The same image runs on QEMU,
   VirtualBox, and real UEFI hardware.
-- **Storage & self-install.** GPT/MBR/FAT/ext4 detection, an ext4/FAT/SimpleFS
+- **Storage & self-install.** GPT/MBR/FAT/ext4 detection, an ext4/FAT
   stack, durable agent state, and `/install` to a real disk that boots
   standalone via UEFI.
 - **Microkernel core.** Unforgeable capabilities (seL4-inspired), capability-gated

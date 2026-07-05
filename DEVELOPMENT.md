@@ -214,7 +214,7 @@ chitti/
         ├── cortex/                 # CPU inference: gguf, tensor kernels, model, sampler, batch
         ├── synapse/                # capability ABI: registry, grammar, executor, audit, fs, taint
         ├── agent/ session/ tools/ skills/  # the agent layer, sessions, tools, skills
-        ├── block/ fs/              # block devices (virtio/nvme/ahci) + FAT/ext4/SimpleFS
+        ├── block/ fs/              # block devices (virtio/nvme/ahci) + FAT/ext4
         ├── framebuffer.rs font_geist.rs editor.rs mouse.rs clock.rs ui_config.rs json.rs
         ├── console.rs serial.rs ktrace.rs   # I/O + deterministic logging
         └── shell/                  # the `/`-command + chat shell
