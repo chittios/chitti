@@ -53,6 +53,9 @@ pub fn orchestrator_manifest() -> AgentManifest {
             "umount".into(),
             "mounts".into(),
             "cat".into(),
+            "network".into(),
+            "ping".into(),
+            "wifi".into(),
             "datetime".into(),
             "ui".into(),
             "shortcuts".into(),
@@ -103,7 +106,20 @@ pub fn worker_subagent_manifest() -> AgentManifest {
         kind: AgentKind::Subagent,
         description: "Complete a self-contained task with tools and report a summary.".to_string(),
         system_prompt: "You complete the delegated task using tools and report the result.".to_string(),
-        toolset: vec!["*".into()],
+        // Read-only system tools: a worker can inspect the machine but not
+        // format/install/write — mirroring its attenuated capability set.
+        toolset: vec![
+            "help".into(),
+            "disks".into(),
+            "ls".into(),
+            "mounts".into(),
+            "cat".into(),
+            "network".into(),
+            "ping".into(),
+            "wifi".into(),
+            "datetime".into(),
+            "skills".into(),
+        ],
         capabilities: vec![
             CapabilityRequest::new(CapDomain::Fs, Rights::READ | Rights::LIST, Scope::Any),
             CapabilityRequest::new(CapDomain::Console, Rights::READ | Rights::WRITE, Scope::Any),

@@ -19,6 +19,7 @@
 pub mod agent_loop;
 pub mod compiled;
 pub mod context;
+pub mod home;
 pub mod manifest;
 pub mod orchestrator;
 pub mod rule_steps;
