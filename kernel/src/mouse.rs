@@ -73,6 +73,16 @@ pub struct Tick {
     pub left: bool,     // current left-button state
 }
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// `now_ms` of the last mouse motion/click — drives the status-bar indicator.
+static ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// When mouse activity was last seen (`arch::now_ms` timebase; 0 = never).
+pub fn activity_ms() -> u64 {
+    ACTIVITY_MS.load(Ordering::Relaxed)
+}
+
 /// Poll the transport drivers and fold the state into edge events for this tick.
 pub fn tick() -> Tick {
     crate::arch::mouse_poll();
@@ -89,6 +99,9 @@ pub fn tick() -> Tick {
         };
         s.prev_left = s.left;
         s.moved = false;
+        if t.moved || pressed || released {
+            ACTIVITY_MS.store(crate::arch::now_ms(), Ordering::Relaxed);
+        }
         t
     })
 }

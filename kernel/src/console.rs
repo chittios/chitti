@@ -5,10 +5,29 @@
 //! reaches the framebuffer because `serial::Serial` mirrors there; this module
 //! adds the input side and per-keystroke echo the shell's line editor needs.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// `now_ms` of the last keyboard byte read — drives the status-bar keyboard
+/// activity indicator.
+static INPUT_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// When keyboard input was last seen (`arch::now_ms` timebase; 0 = never).
+pub fn input_activity_ms() -> u64 {
+    INPUT_ACTIVITY_MS.load(Ordering::Relaxed)
+}
+
 /// The next input byte from whichever console has one -- x86: PS/2 keyboard →
 /// USB (xHCI/HID) → serial; aarch64: USB (xHCI/HID) → PL050 PS/2 → virtio-keyboard
 /// → PL011 serial -- or `None` if none is available.
 pub fn read_byte() -> Option<u8> {
+    let b = read_byte_raw();
+    if b.is_some() {
+        INPUT_ACTIVITY_MS.store(crate::arch::now_ms(), Ordering::Relaxed);
+    }
+    b
+}
+
+fn read_byte_raw() -> Option<u8> {
     #[cfg(target_arch = "x86_64")]
     {
         // PS/2 keyboard, then a USB (xHCI/HID) keyboard, then serial.
