@@ -24,6 +24,10 @@ pub struct Tokenizer {
     pub im_end: u32,
     pub think_open: u32,
     pub think_close: u32,
+    /// Qwen tool-call delimiters (`<tool_call>` / `</tool_call>`), or u32::MAX
+    /// when the vocab lacks them.
+    pub tool_open: u32,
+    pub tool_close: u32,
 }
 
 /// GPT-2 byte→unicode table: printable bytes map to themselves, the rest to
@@ -75,6 +79,8 @@ impl Tokenizer {
             // are simply never emitted, rather than colliding with a real token.
             think_open: special("<think>", u32::MAX),
             think_close: special("</think>", u32::MAX),
+            tool_open: special("<tool_call>", u32::MAX),
+            tool_close: special("</tool_call>", u32::MAX),
             byte_to_unicode,
             unicode_to_byte,
             vocab,

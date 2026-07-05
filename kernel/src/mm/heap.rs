@@ -4,11 +4,14 @@
 //! via the frame allocator + `arch::x86_64::paging`.
 //!
 //! Free blocks form an intrusive singly linked list threaded through the
-//! freed memory itself. `alloc` does a first-fit scan, splitting off any
-//! leftover tail large enough to hold another free-list node; `dealloc`
-//! just pushes the freed region back onto the list head. There is no
-//! coalescing of adjacent free blocks — the known limitation the handoff
-//! doc's "buddy if fragmentation bites" already anticipates.
+//! freed memory itself, kept **sorted by address** so freeing can **coalesce**
+//! with both neighbours in O(1) once the insert position is found. `alloc`
+//! does a first-fit scan, splitting off any leftover tail large enough to
+//! hold another free-list node. (Coalescing became necessary — the handoff
+//! doc's "buddy if fragmentation bites" moment — when Cortex KV caches began
+//! doubling repeatedly during long prefills: without merging, the freed
+//! halves of every realloc fragmented the heap until multi-MiB allocations
+//! failed with hundreds of MiB nominally free.)
 
 use super::Locked;
 use core::alloc::{GlobalAlloc, Layout};
@@ -16,15 +19,16 @@ use core::mem;
 use core::ptr::null_mut;
 
 pub const HEAP_START: u64 = 0xffff_a000_0000_0000;
-// 256 MiB: Phase 3's Cortex (Qwen3.5 hybrid) needs real room -- each
+// 512 MiB: Phase 3's Cortex (Qwen3.5 hybrid) needs real room -- each
 // per-stream cache holds ~19 MiB of gated-DeltaNet recurrent state (18
-// linear-attention layers x 16 heads x 128x128 f32), the batching test
-// runs two streams concurrently, and the 248K-token vocab table plus
-// vocab-sized logits add several MiB more. The linked-list allocator does
-// no coalescing, so headroom also absorbs fragmentation from transient
-// caches. Backed by the frame allocator, which has gigabytes free.
+// linear-attention layers x 16 heads x 128x128 f32) plus attention-layer KV
+// that grows with every token; the agentic chat (tools JSON in the system
+// prompt + thinking + multi-iteration tool loops) runs multi-thousand-token
+// contexts, and the 248K-token vocab table plus vocab-sized logits add
+// tens of MiB more. Backed by the frame allocator (0.8B runs with 3 GiB
+// RAM, model ~774 MiB — ample headroom).
 #[cfg(not(any(feature = "model-2b", feature = "model-4b", feature = "model-9b")))]
-pub const HEAP_SIZE: usize = 256 * 1024 * 1024;
+pub const HEAP_SIZE: usize = 512 * 1024 * 1024;
 // The 2B and 4B models' per-forward state, KV/recurrent cache, and
 // batched-prefill buffers sit between the 0.8B's and the 9B's; give the heap
 // 512 MiB (placed at the top of RAM, past the model — see `mm::init`).
@@ -87,18 +91,47 @@ impl LinkedListAllocator {
         unsafe { self.add_free_region(start, size) };
     }
 
-    unsafe fn add_free_region(&mut self, addr: usize, size: usize) {
+    unsafe fn add_free_region(&mut self, addr: usize, mut size: usize) {
         assert_eq!(align_up(addr, mem::align_of::<ListNode>()), addr);
         assert!(size >= mem::size_of::<ListNode>());
 
-        let mut node = ListNode::new(size);
-        node.next = self.head.next.take();
-        let node_ptr = addr as *mut ListNode;
         // SAFETY: caller guarantees `addr..addr+size` is valid, aligned,
-        // owned memory not referenced anywhere else.
+        // owned memory not referenced anywhere else. The raw-pointer walk
+        // below only dereferences live list nodes (or the head sentinel).
         unsafe {
+            // Address-ordered insert: find `prev`, the last node (or the head
+            // sentinel) starting below `addr`. Keeping the list sorted makes
+            // both merges O(1) here and preserves first-fit behaviour.
+            let mut prev: *mut ListNode = &mut self.head;
+            while let Some(next) = (*prev).next.as_deref_mut() {
+                if next.start_addr() < addr {
+                    prev = next;
+                } else {
+                    break;
+                }
+            }
+            // Coalesce with the successor when `addr..addr+size` abuts it.
+            if let Some(next) = (*prev).next.take() {
+                if addr + size == next.start_addr() {
+                    size += next.size;
+                    (*prev).next = next.next.take();
+                } else {
+                    (*prev).next = Some(next);
+                }
+            }
+            // Coalesce with the predecessor when it ends exactly at `addr`
+            // (never the sentinel, which is a zero-size node outside the heap).
+            let sentinel = &mut self.head as *mut ListNode;
+            if prev != sentinel && (*prev).end_addr() == addr {
+                (*prev).size += size;
+                return;
+            }
+            // No predecessor merge: link a fresh node in address order.
+            let mut node = ListNode::new(size);
+            node.next = (*prev).next.take();
+            let node_ptr = addr as *mut ListNode;
             node_ptr.write(node);
-            self.head.next = Some(&mut *node_ptr);
+            (*prev).next = Some(&mut *node_ptr);
         }
     }
 

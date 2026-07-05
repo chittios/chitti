@@ -57,7 +57,7 @@ impl Model {
     /// a model won't fit, so these are simply comfortable sizes per model.
     fn qemu_mem(self) -> &'static str {
         match self {
-            // 0.8B (~785 MiB) at 2 GiB + a 256 MiB heap at the top: 3 GiB is ample.
+            // 0.8B (~785 MiB) at 2 GiB + a 512 MiB heap at the top: 3 GiB is ample.
             Model::Qwen08B => "3G",
             // ~1.2 GiB model at 2 GiB + a 512 MiB heap at the top of RAM.
             Model::Qwen2B => "4G",
