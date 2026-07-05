@@ -873,11 +873,16 @@ fn image_aarch64(model: Model) -> Result<(), String> {
         eprintln!("note: {} absent -- building a model-less image", model.gguf_rel());
     }
 
+    // Voice models bundled on the ESP too, so the kernel's `find_on_disks`
+    // auto-loads them (VirtualBox/real-hardware path). Present-only.
+    let voice: Vec<(String, PathBuf)> = voice_model_assets().into_iter().filter(|(_, p)| p.exists()).map(|(n, p)| (n.to_string(), p)).collect();
+    let voice_bytes: u64 = voice.iter().map(|(_, p)| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
     // Layout: GPT (34 + 33 reserved sectors) + ESP (payload + 64 MiB slack) +
     // 256 MiB ext4 data partition.
     let payload: u64 = fs::metadata(&elf).map(|m| m.len()).unwrap_or(0)
         + fs::metadata(&stub).map(|m| m.len()).unwrap_or(0)
-        + model_path.as_ref().and_then(|p| fs::metadata(p).ok()).map(|m| m.len()).unwrap_or(0);
+        + model_path.as_ref().and_then(|p| fs::metadata(p).ok()).map(|m| m.len()).unwrap_or(0)
+        + voice_bytes;
     let esp_secs = (payload + 64 * 1024 * 1024).div_ceil(512);
     let data_secs = 256 * 1024 * 1024 / 512u64;
     let total_secs = 34 + esp_secs + data_secs + 34;
@@ -904,6 +909,7 @@ mkdir -p "$MNT/EFI/BOOT"
 cp "{stub}" "$MNT/EFI/BOOT/BOOTAA64.EFI"
 cp "{kernel}" "$MNT/chitti-kernel"
 {model_cp}
+{voice_cp}
 diskutil unmount "${{DEV}}s1" > /dev/null
 "{mke2fs}" -F -q -t ext4 -b 4096 "${{DEV}}s2"
 hdiutil detach "$DEV" > /dev/null
@@ -913,6 +919,7 @@ hdiutil detach "$DEV" > /dev/null
         kernel = elf.display(),
         mke2fs = mke2fs.display(),
         model_cp = model_path.as_ref().map(|m| format!("cp \"{}\" \"$MNT/model.gguf.000\"", m.display())).unwrap_or_default(),
+        voice_cp = voice.iter().map(|(n, p)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), n)).collect::<Vec<_>>().join("\n"),
     );
     let status = Command::new("/bin/sh").arg("-c").arg(&script).status().map_err(|e| format!("populating image: {e}"))?;
     if !status.success() {
