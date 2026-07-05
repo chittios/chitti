@@ -57,8 +57,35 @@ fn tensor_to_val(t: &Tensor<'_>) -> Val {
             let f = ints.iter().map(|&v| v as f32).collect();
             Val { dims, f, i: Some(ints), seq: None }
         }
+        10 => {
+            // float16: 2 bytes/elem → f32.
+            let f: Vec<f32> = t.raw.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
+            Val::new(dims, f)
+        }
+        2 | 3 => {
+            // uint8 / int8 (quantized weights): 1 byte/elem → f32. int8 is signed.
+            let signed = t.dtype == 3;
+            let mut f = Vec::with_capacity(t.raw.len());
+            let mut iv = Vec::with_capacity(t.raw.len());
+            for &b in t.raw {
+                let v = if signed { b as i8 as i64 } else { b as i64 };
+                f.push(v as f32);
+                iv.push(v);
+            }
+            Val { dims, f, i: Some(iv), seq: None }
+        }
+        6 => {
+            // int32: 4 bytes/elem, but as integers (keep an i64 view).
+            let iv: Vec<i64> = if !t.raw.is_empty() {
+                t.raw.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64).collect()
+            } else {
+                t.ints.clone()
+            };
+            let f = iv.iter().map(|&v| v as f32).collect();
+            Val { dims, f, i: Some(iv), seq: None }
+        }
         _ => {
-            // treat everything else as f32
+            // float32 (1) and anything else: 4 bytes/elem.
             let mut f = Vec::with_capacity(n);
             if !t.raw.is_empty() {
                 for c in t.raw.chunks_exact(4) {
@@ -70,6 +97,33 @@ fn tensor_to_val(t: &Tensor<'_>) -> Val {
             Val::new(dims, f)
         }
     }
+}
+
+/// IEEE-754 half → single precision.
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h >> 15) & 1;
+    let exp = (h >> 10) & 0x1f;
+    let mant = h & 0x3ff;
+    let bits = if exp == 0 {
+        if mant == 0 {
+            (sign as u32) << 31 // ±0
+        } else {
+            // subnormal → normalize
+            let mut e: i32 = -1;
+            let mut m = mant;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e += 1;
+            }
+            let mant = (m & 0x3ff) as u32;
+            ((sign as u32) << 31) | (((127 - 15 - e) as u32) << 23) | (mant << 13)
+        }
+    } else if exp == 0x1f {
+        ((sign as u32) << 31) | (0xff << 23) | ((mant as u32) << 13) // inf/NaN
+    } else {
+        ((sign as u32) << 31) | (((exp as i32 - 15 + 127) as u32) << 23) | ((mant as u32) << 13)
+    };
+    f32::from_bits(bits)
 }
 
 /// `ln(x)` — exposed for the mel frontend (same series used internally).
@@ -193,7 +247,9 @@ fn matmul(a: &Val, b: &Val, azp: f32, bzp: f32) -> Val {
     let mut last_bo = usize::MAX;
     for bi in 0..batch {
         let ao = bi * m * k;
-        let bo = (if b_batch == 1 { 0 } else { bi }) * k * n;
+        // B broadcasts over A's batch: index modulo B's own batch count so a
+        // shared (b_batch < batch) weight isn't read out of bounds.
+        let bo = (bi % b_batch) * k * n;
         if bo != last_bo {
             for j in 0..n {
                 for kk in 0..k {
@@ -531,7 +587,7 @@ fn dynamic_quantize_lstm(node: &super::Node<'_>, x: &Val, wq: &Val, rq: &Val, bi
 /// ONNX `Loop`: `(M, cond, v_init...)` → body `(iter, cond_in, v_in...)` yields
 /// `(cond_out, v_out..., scan_out...)`. Carried deps thread through; scan
 /// outputs are stacked along a new leading axis.
-fn exec_loop(node: &super::Node<'_>, env: &BTreeMap<String, Val>) -> Result<Vec<Val>, String> {
+fn exec_loop<'t>(node: &super::Node<'t>, env: &BTreeMap<String, Val>, inits: &BTreeMap<&'t str, &'t super::Tensor<'t>>) -> Result<Vec<Val>, String> {
     let body = node.attrs.iter().find(|a| a.name == "body").and_then(|a| a.graph.as_ref()).ok_or("Loop: no body")?;
     let get = |i: usize| env.get(node.inputs.get(i).copied().unwrap_or("")).cloned();
     let max_trip = get(0).and_then(|v| v.f.first().copied()).map(|x| x as i64).unwrap_or(i64::MAX);
@@ -551,7 +607,7 @@ fn exec_loop(node: &super::Node<'_>, env: &BTreeMap<String, Val>) -> Result<Vec<
         for (c, name) in carried.iter().zip(body.inputs.iter().skip(2)) {
             child.insert(name.to_string(), c.clone());
         }
-        exec_graph(body, &mut child)?;
+        exec_graph(body, &mut child, inits)?;
         cond = child.get(body.outputs[0]).and_then(|v| v.f.first().copied()).unwrap_or(0.0) != 0.0;
         for c in 0..n_carried {
             if let Some(v) = child.get(body.outputs[1 + c]) {
@@ -605,7 +661,10 @@ fn bcast_get(v: &Val, od: &[usize], idx: &[usize]) -> f32 {
     for k in (0..vr).rev() {
         let ok = idx[r - vr + k];
         let dk = v.dims[k];
-        let i = if dk == 1 { 0 } else { ok };
+        // `dk == 1` → broadcast; else clamp defensively (a valid broadcast keeps
+        // `ok < dk`, so clamping only guards against an upstream shape mismatch
+        // rather than faulting).
+        let i = if dk == 1 { 0 } else { ok.min(dk - 1) };
         off += i * stride;
         stride *= dk;
     }
@@ -635,13 +694,12 @@ fn elementwise2(a: &Val, b: &Val, f: impl Fn(f32, f32) -> f32) -> Val {
 pub fn run(model: &Model<'_>, feeds: &[(&str, Val)]) -> Result<BTreeMap<String, Val>, String> {
     let g = &model.graph;
     let mut env: BTreeMap<String, Val> = BTreeMap::new();
-    for t in &g.initializers {
-        env.insert(t.name.to_string(), tensor_to_val(t));
-    }
     for (name, v) in feeds {
         env.insert((*name).to_string(), v.clone());
     }
-    exec_graph(g, &mut env)?;
+    // Initializers are materialised lazily, per node, so a big quantized model
+    // (int8/f16 weights expand 4×/2× to f32) doesn't all sit resident at once.
+    exec_graph(g, &mut env, &BTreeMap::new())?;
     let mut out = BTreeMap::new();
     for o in &g.outputs {
         let v = env.get(*o).ok_or_else(|| alloc::format!("missing output {o}"))?;
@@ -657,8 +715,152 @@ fn attr_ints(n: &super::Node<'_>, name: &str) -> Option<Vec<i64>> {
     n.attrs.iter().find(|a| a.name == name).map(|a| a.ints.clone())
 }
 
-fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), String> {
-    for node in &g.nodes {
+/// Free variables of a graph: tensor names its nodes (or their subgraphs) read
+/// but that are not produced within it (initializers, formal inputs, or node
+/// outputs). These are the values a subgraph captures from an enclosing scope.
+fn free_vars<'t>(g: &super::Graph<'t>) -> alloc::collections::BTreeSet<&'t str> {
+    use alloc::collections::BTreeSet;
+    let mut produced: BTreeSet<&str> = BTreeSet::new();
+    for t in &g.initializers {
+        produced.insert(t.name);
+    }
+    for i in &g.inputs {
+        produced.insert(i);
+    }
+    for n in &g.nodes {
+        for o in &n.outputs {
+            if !o.is_empty() {
+                produced.insert(o);
+            }
+        }
+    }
+    let mut free = BTreeSet::new();
+    for n in &g.nodes {
+        for inp in &n.inputs {
+            if !inp.is_empty() && !produced.contains(inp) {
+                free.insert(*inp);
+            }
+        }
+        for a in &n.attrs {
+            if let Some(sub) = &a.graph {
+                for v in free_vars(sub) {
+                    if !produced.contains(v) {
+                        free.insert(v);
+                    }
+                }
+            }
+        }
+    }
+    free
+}
+
+/// Topologically order a graph's nodes. A node depends on the producers of its
+/// explicit inputs **and** of any tensor its subgraph bodies capture from this
+/// scope (Loop/If) — the latter is why file order can be invalid. Kahn's
+/// algorithm, stable by original index; any cycle remnant falls back to file order.
+fn topo_order(g: &super::Graph<'_>) -> Vec<usize> {
+    let n = g.nodes.len();
+    let mut producer: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, node) in g.nodes.iter().enumerate() {
+        for o in &node.outputs {
+            if !o.is_empty() {
+                producer.entry(*o).or_insert(i);
+            }
+        }
+    }
+    let mut indeg = alloc::vec![0usize; n];
+    let mut consumers: Vec<Vec<usize>> = alloc::vec![Vec::new(); n];
+    for (i, node) in g.nodes.iter().enumerate() {
+        let mut deps: alloc::collections::BTreeSet<&str> = node.inputs.iter().copied().filter(|s| !s.is_empty()).collect();
+        for a in &node.attrs {
+            if let Some(sub) = &a.graph {
+                for v in free_vars(sub) {
+                    deps.insert(v);
+                }
+            }
+        }
+        for d in deps {
+            if let Some(&p) = producer.get(d) {
+                if p != i {
+                    consumers[p].push(i);
+                    indeg[i] += 1;
+                }
+            }
+        }
+    }
+    let mut order = Vec::with_capacity(n);
+    let mut ready: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
+    let mut head = 0;
+    while head < ready.len() {
+        let i = ready[head];
+        head += 1;
+        order.push(i);
+        for &c in &consumers[i] {
+            indeg[c] -= 1;
+            if indeg[c] == 0 {
+                ready.push(c);
+            }
+        }
+    }
+    if order.len() < n {
+        // Cycle (shouldn't happen in a valid ONNX DAG) — append the rest as-is.
+        let done: alloc::collections::BTreeSet<usize> = order.iter().copied().collect();
+        for i in 0..n {
+            if !done.contains(&i) {
+                order.push(i);
+            }
+        }
+    }
+    order
+}
+
+fn exec_graph<'t>(g: &'t Graph<'t>, env: &mut BTreeMap<String, Val>, outer_inits: &BTreeMap<&'t str, &'t super::Tensor<'t>>) -> Result<(), String> {
+    // Merge this graph's initializers over any inherited from an enclosing
+    // graph (If/Loop subgraphs can reference outer initializers). Values here
+    // are just `&Tensor` pointers, so the clone is cheap.
+    let mut inits: BTreeMap<&str, &super::Tensor<'_>> = outer_inits.clone();
+    for t in &g.initializers {
+        inits.insert(t.name, t);
+    }
+    // Execute in **topological** order, not file order: a node's inputs include
+    // the tensors its subgraph bodies capture from this scope (a Loop can be
+    // emitted before the node that produces a value its body reads — as in the
+    // KittenTTS decoder). `order` is node indices in a valid execution order.
+    let order = topo_order(g);
+    // Liveness keyed by execution position: the last position that reads each
+    // tensor, so intermediates are dropped once consumed (a 3000-node graph
+    // otherwise keeps every activation resident and exhausts the heap).
+    let mut last_use: BTreeMap<&str, usize> = BTreeMap::new();
+    for (pos, &ni) in order.iter().enumerate() {
+        let node = &g.nodes[ni];
+        for &inp in &node.inputs {
+            if !inp.is_empty() {
+                last_use.insert(inp, pos);
+            }
+        }
+        // A subgraph body may read outer tensors: keep those alive to the end.
+        for a in &node.attrs {
+            if let Some(sub) = &a.graph {
+                for v in free_vars(sub) {
+                    last_use.insert(v, order.len());
+                }
+            }
+        }
+    }
+    for out in &g.outputs {
+        last_use.insert(out, order.len()); // graph outputs live to the end
+    }
+    for (pos, &ni) in order.iter().enumerate() {
+        let node = &g.nodes[ni];
+        // Materialise any initializer inputs this node needs, right before it
+        // runs (and liveness frees them after their last use).
+        for &inp in &node.inputs {
+            if !inp.is_empty() && !env.contains_key(inp) {
+                if let Some(t) = inits.get(inp) {
+                    env.insert(inp.to_string(), tensor_to_val(t));
+                }
+            }
+        }
         let get = |env: &BTreeMap<String, Val>, i: usize| -> Result<Val, String> {
             let name = node.inputs.get(i).copied().unwrap_or("");
             if name.is_empty() {
@@ -856,7 +1058,10 @@ fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), Stri
                         len.max(0) as usize
                     })
                     .collect();
-                let n: usize = od.iter().product::<usize>().max(1);
+                // NB: no `.max(1)` — an empty slice (a 0-length output dim) must
+                // produce 0 elements, not read one out-of-bounds value. A scalar
+                // (r == 0) still gives the empty-product 1.
+                let n: usize = od.iter().product::<usize>();
                 let mut istr = vec![1usize; r];
                 for k in (0..r.saturating_sub(1)).rev() {
                     istr[k] = istr[k + 1] * v.dims[k + 1];
@@ -1620,10 +1825,10 @@ fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), Stri
                 let name = if cond { "then_branch" } else { "else_branch" };
                 let sub = node.attrs.iter().find(|a| a.name == name).and_then(|a| a.graph.as_ref()).ok_or("If: missing branch")?;
                 let mut child = env.clone();
-                exec_graph(sub, &mut child)?;
+                exec_graph(sub, &mut child, &inits)?;
                 sub.outputs.iter().map(|o| child.get(*o).cloned().ok_or_else(|| alloc::format!("If: missing {o}"))).collect::<Result<Vec<_>, _>>()?
             }
-            "Loop" => exec_loop(node, env)?,
+            "Loop" => exec_loop(node, env, &inits)?,
             "DynamicQuantizeLSTM" => {
                 let x = get(env, 0)?;
                 let wq = get(env, 1)?;
@@ -1863,6 +2068,13 @@ fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), Stri
                 }
             }
         }
+        // Drop tensors whose last use was this node (frees activations as the
+        // graph advances so a large model fits in the heap). Never drop this
+        // node's own outputs, graph outputs, or sequence values (rare, and their
+        // consumers may live inside a subgraph the liveness scan under-counts).
+        env.retain(|name, v| {
+            v.seq.is_some() || node.outputs.contains(&name.as_str()) || last_use.get(name.as_str()).map(|&l| l > pos).unwrap_or(true)
+        });
     }
     Ok(())
 }

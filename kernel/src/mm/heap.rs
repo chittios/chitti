@@ -27,8 +27,12 @@ pub const HEAP_START: u64 = 0xffff_a000_0000_0000;
 // contexts, and the 248K-token vocab table plus vocab-sized logits add
 // tens of MiB more. Backed by the frame allocator (0.8B runs with 3 GiB
 // RAM, model ~774 MiB — ample headroom).
+// 1 GiB: the 0.8B LLM needs ~512 MiB, but the ONNX voice runtime (KittenTTS's
+// 78 MiB model + its activations, run through `onnx::exec`) needs more headroom,
+// and a linked-list allocator fragments — so give it room. Sits at the top of
+// RAM past the model (see `mm::init`), so the VM needs enough RAM (≥ 4 GiB).
 #[cfg(not(any(feature = "model-2b", feature = "model-4b", feature = "model-9b")))]
-pub const HEAP_SIZE: usize = 512 * 1024 * 1024;
+pub const HEAP_SIZE: usize = 1024 * 1024 * 1024;
 // The 2B and 4B models' per-forward state, KV/recurrent cache, and
 // batched-prefill buffers sit between the 0.8B's and the 9B's; give the heap
 // 512 MiB (placed at the top of RAM, past the model — see `mm::init`).
