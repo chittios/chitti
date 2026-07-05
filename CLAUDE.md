@@ -51,9 +51,60 @@ capability exists on one arch, it exists on the other.
 
 After any change, verify both:
 
-- `cargo xtask build -arch x86_64` **and** `cargo xtask test` (must stay **111/111**)
+- `cargo xtask build -arch x86_64` **and** `cargo xtask test` (must stay **112/112**)
 - `cargo xtask build -arch aarch64` (and boot it via `cargo xtask run -arch aarch64`
   when the change is boot-visible)
+
+## STANDING RULE — performance: know the three traps before optimizing
+
+Hard-won findings (commits `f2bd8f7`, `06a62b4`) that apply to **any new
+compute- or I/O-heavy feature**. Measure first, always — every one of these was
+found by profiling, and the obvious suspect was wrong every time.
+
+1. **`+strict-align` silently scalarizes NEON.** The aarch64 target builds with
+   `+strict-align` (required for the pre-MMU boot window and device MMIO).
+   Under it, LLVM lowers *any* unaligned vector load/store — the `vld1q_*`
+   intrinsics **and auto-vectorized plain loops** — into a 16×`ldrb`+`orr`+
+   stack-spill byte-assembly: ~25 instructions per load, ~100× slower. The
+   binary still contains `fmla`, so it looks fine until you disassemble the
+   *loads*. Hot SIMD loops must do their memory access via **inline asm**
+   (`ldr q`/`ldp q`/`stp q` — correct at runtime: Normal cacheable RAM,
+   `SCTLR_EL1.A=0`), the same pattern as the MMIO single-`ldr`/`str` rule.
+   Reusable kernels live in `cortex/tensor.rs`: `dot_f32`, `axpy_f32`,
+   `scale_f32`, the `ldq_s8/u8/f32` load helpers, and the Q8_0/Q4_0 SDOT
+   matvecs. **Prefer composing these** over writing new intrinsics code; if
+   you must write a new SIMD loop, verify with `objdump -d` (count `ldrb` in
+   the hot function) and `/onnx bench` in the booted kernel (dot_f32 ≥ 10
+   GMAC/s under HVF; ~1 GMAC/s means the disease is back).
+2. **Batch block I/O or die waiting.** One `read_block` = one polled virtio
+   round trip (~0.5 ms). Anything reading more than a few KiB must use
+   `read_blocks` (all drivers implement multi-sector requests; `Partition`
+   forwards). FAT `read_file` coalesces contiguous cluster runs — loading the
+   131 MB parakeet model went from ~2.5 min to ~2 s. New filesystem or loader
+   code must follow the same pattern (and cache FAT-chain sectors).
+3. **The kernel allocator punishes churn.** First-fit linked list: cloning
+   multi-MB tensors per node, or cloning a whole env per loop iteration, is
+   real time. Borrow instead of clone on hot paths; move values into maps
+   instead of cloning them. Heap pressure counters exist
+   (`mm::heap::alloc_stats()` — allocs + free-list scan steps).
+
+Layout matters as much as SIMD: iterate state **row-wise/contiguous** (the
+DeltaNet delta rule went from stride-512B scalar walks to contiguous AXPYs —
+that alone nearly doubled tokens/sec). Per-op wall-time accounting for the
+ONNX executor prints one `onnx: op time:` ktrace line per run; `/perf` gives
+prefill/decode tok/s; `tools/onnxdiff/` runs the kernel's own ONNX interpreter
+natively on the host (seconds per iteration, layer-by-layer diff vs
+onnxruntime) — use it for any voice-model numeric or perf work before touching
+QEMU.
+
+Current figures (aarch64 HVF, 0.8B Q8): prefill 53 tok/s, decode 19 tok/s,
+`/voice stt` ~2 s, `/voice say` ~14 s for 3.5 s of audio. Decode is
+compute-bound on the **single-core** SDOT matvec; llama.cpp's remaining edge
+on the same silicon is threading. The row-range kernels
+(`matvec_q8_0_sdot_rows`) are ready to split across cores — the missing piece
+is aarch64 AP bring-up (PSCI `CPU_ON`) + a work-distribution primitive; x86
+APs already boot and park (`smp.rs`). That is the designated next perf step;
+prefer it over further single-core micro-tuning.
 
 ## STANDING RULE — real hardware, nothing hardcoded to an emulator
 
@@ -120,10 +171,15 @@ real UEFI hardware.
 - **Sound & voice** (`sound/`, `onnx/`) — virtio-snd PCM in/out (S16 mono,
   poll-driven, descriptor chains) over virtio-mmio (aarch64) and virtio-PCI
   (x86 QEMU), **Intel HDA** for VirtualBox (x86+ARM) and real hardware, plus **AC'97** and **Sound Blaster 16** (x86 legacy; SB16 needs a <16 MiB ISA-DMA buffer, not yet reserved at boot); `/voice` (waveform modal, level-gated utterances) and `/voice test`
-  (tone + mic check). `onnx/` is a zero-copy no_std ONNX (protobuf) reader for
-  the voice models — silero-vad v5 parses today; the op executor + parakeet STT
-  and KittenTTS land incrementally. `cargo xtask voice-assets` downloads the
-  models into `assets/voice/` (gitignored).
+  (tone + mic check). `onnx/` is a zero-copy no_std ONNX (protobuf) reader +
+  **op interpreter** that runs the real voice models end-to-end: silero-vad v5
+  (VAD), parakeet-ctc int8 (STT — `/voice stt <wav>` transcribes), and
+  KittenTTS (TTS — `/voice say <text>` speaks); bare `/voice` is the full
+  mic → VAD → STT → LLM → TTS conversation loop. Models load lazily from any
+  disk volume (bundled in the images; `cargo xtask voice-assets` downloads
+  them into `assets/voice/`, gitignored). For any numeric or perf work on this
+  path, use `tools/onnxdiff/` (host-side layer-by-layer diff of the kernel's
+  own interpreter against onnxruntime) — not QEMU round trips.
 - **Agent chat protocol** — the shell chat is an agentic ReAct loop on the
   Qwen3.5 template: tools come **dynamically from the registry** (manifest
   toolset ∩ `tools::registry`; never hardcode a tool list in a prompt),
@@ -138,7 +194,7 @@ Everything goes through `cargo xtask`. Arch is chosen explicitly, never
 host-detected. See [DEVELOPMENT.md](DEVELOPMENT.md) for the full setup.
 
 ```sh
-cargo xtask test                       # in-kernel test suite under QEMU (x86) — 111/111, no model
+cargo xtask test                       # in-kernel test suite under QEMU (x86) — 112/112, no model
 cargo xtask build -arch x86_64|aarch64 # cross-build the kernel
 cargo xtask run   -arch x86_64|aarch64 # boot in QEMU (aarch64 = native HVF on Apple Silicon)
 cargo xtask image -arch x86_64|aarch64 # assemble a bootable image/ISO
