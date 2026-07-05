@@ -524,7 +524,7 @@ fn print_help() {
     serial_println!("  /wifi [..]       /wifi scan | connect <ssid> (password modal) | info");
     serial_println!("  /think [on|off]  toggle model thinking (<think> reasoning, streamed dim; default on)");
     serial_println!("  /mode [m]        agent-tool approvals: manual (all) | auto (destructive only) | bypass");
-    serial_println!("  /voice [..]      voice session (mic modal); test = tone+mic; models; stt <file.wav>");
+    serial_println!("  /voice [..]      test = tone+mic; models; stt <file.wav>; say <text> (TTS)");
     serial_println!("  /onnx info|run <path>  inspect or run any ONNX model from a mounted volume");
     serial_println!("  /lspci           list every PCI device (bus:dev.func vendor:device class)");
     serial_println!("  /datetime [..]   show/set the clock: /datetime 2026-07-04 13:45 | /datetime tz +5:30");
@@ -867,8 +867,31 @@ fn run_voice(arg: &str) {
         }
     } else if let Some(path) = arg.strip_prefix("stt ") {
         voice_stt_file(path.trim());
+    } else if let Some(text) = arg.strip_prefix("say ") {
+        voice_say(text.trim());
     } else {
         voice_talk();
+    }
+}
+
+/// `/voice say <text>` — text-to-speech via KittenTTS (G2P → model → playback).
+fn voice_say(text: &str) {
+    if !crate::sound::is_up() {
+        serial_println!("voice> no sound device");
+        return;
+    }
+    serial_println!("voice> synthesizing \u{201c}{}\u{201d}\u{2026}", text);
+    match crate::sound::tts::synth(text) {
+        Ok(pcm) => {
+            serial_println!("voice> {} samples; playing", pcm.len());
+            let _ = crate::sound::play(&pcm, crate::sound::tts::RATE);
+            while crate::sound::playing() {
+                ui_tick();
+                crate::sched::yield_now();
+            }
+            serial_println!("voice> done");
+        }
+        Err(e) => serial_println!("voice> {}", e),
     }
 }
 

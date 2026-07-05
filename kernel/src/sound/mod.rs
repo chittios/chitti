@@ -204,6 +204,7 @@ pub mod hda;
 pub mod mel;
 pub mod model_store;
 pub mod stt;
+pub mod tts;
 pub mod vad;
 pub mod virtio_snd_pci;
 

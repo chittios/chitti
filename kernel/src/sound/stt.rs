@@ -106,7 +106,7 @@ pub fn transcribe(pcm: &[i16]) -> String {
     }
     use crate::onnx::exec::Val;
     let x = Val::new(alloc::vec![1, mels, frames], sig);
-    let len = Val { dims: alloc::vec![1], f: alloc::vec![frames as f32], i: Some(alloc::vec![frames as i64]) };
+    let len = Val { dims: alloc::vec![1], f: alloc::vec![frames as f32], i: Some(alloc::vec![frames as i64]), seq: None };
     crate::ktrace::log_fmt(format_args!("stt: running parakeet on {mels}x{frames} features (this is slow on the scalar interpreter)"));
     let out = match crate::onnx::exec::run(&model, &[("audio_signal", x), ("length", len)]) {
         Ok(o) => o,
