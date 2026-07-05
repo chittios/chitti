@@ -105,6 +105,7 @@ pub fn run() -> ! {
     crate::clock::init();
     crate::ui_config::load_and_apply();
     auto_mount_root();
+    voice_autoload();
     update_status();
 
     // Persona agent (for `/do <intent>`) reused across the session.
@@ -856,22 +857,18 @@ fn run_voice(arg: &str) {
         voice_test();
     } else if arg == "models" {
         voice_models();
-    } else if let Some(rest) = arg.strip_prefix("models load ") {
-        // /voice models load parakeet|kitten <mounted-path>
-        let mut it = rest.splitn(2, ' ');
-        match (it.next(), it.next()) {
-            (Some(which), Some(path)) => {
-                let path = path.trim();
-                serial_println!("voice> reading {} \u{2026}", path);
-                match read_mounted(path) {
-                    Some(bytes) => match crate::sound::model_store::load_bytes(which, bytes) {
-                        Ok(n) => serial_println!("voice> loaded {} ({} bytes) from {}", which, n, path),
-                        Err(e) => serial_println!("voice> load failed: {}", e),
-                    },
-                    None => serial_println!("voice> {} not found on any mount (see /mounts; /mount a disk first)", path),
+    } else if let Some(rest) = arg.strip_prefix("models load") {
+        // /voice models load <which> [path]   (path optional → default search)
+        let mut it = rest.trim().splitn(2, ' ');
+        match it.next().filter(|s| !s.is_empty()) {
+            Some(which) => {
+                let path = it.next().map(|s| s.trim());
+                match voice_load(which, path) {
+                    Ok((n, src)) => serial_println!("voice> loaded {} ({} bytes) from {}", which, n, src),
+                    Err(e) => serial_println!("voice> {}", e),
                 }
             }
-            _ => serial_println!("voice> usage: /voice models load parakeet|kitten <path>"),
+            None => serial_println!("voice> usage: /voice models load parakeet|kitten [path]"),
         }
     } else if let Some(path) = arg.strip_prefix("stt ") {
         voice_stt_file(path.trim());
@@ -968,13 +965,64 @@ fn run_onnx(arg: &str) {
     }
 }
 
+/// Default filenames a voice model may be shipped under (checked in order,
+/// across the mounted `/` and common voice dirs, plus x86 Limine boot modules).
+fn voice_candidates(which: &str) -> &'static [&'static str] {
+    match which {
+        "kitten" => &["/voice/kitten_tts_mini.onnx", "/kitten_tts_mini.onnx", "/kitten.onnx", "/voice/kitten.onnx", "/mnt/kitten.onnx"],
+        "parakeet" => &["/voice/parakeet_ctc_int8.onnx", "/parakeet.onnx", "/voice/parakeet.onnx", "/mnt/parakeet.onnx"],
+        _ => &[],
+    }
+}
+
+/// Load a voice model. With an explicit `path`, read it from the mounts;
+/// otherwise search the default locations — a bundled x86 Limine boot module
+/// first, then the known filesystem paths on whatever is mounted. Returns
+/// `(bytes, source)`.
+fn voice_load(which: &str, path: Option<&str>) -> Result<(usize, alloc::string::String), alloc::string::String> {
+    if which != "kitten" && which != "parakeet" {
+        return Err("unknown model (parakeet|kitten)".into());
+    }
+    if let Some(p) = path {
+        serial_println!("voice> reading {} \u{2026}", p);
+        let bytes = read_mounted(p).ok_or_else(|| alloc::format!("{} not found on any mount (see /mounts)", p))?;
+        let n = crate::sound::model_store::load_bytes(which, bytes)?;
+        return Ok((n, p.into()));
+    }
+    // No path: a bundled boot module (x86), then default filesystem locations.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(m) = crate::cortex::find_module(which) {
+        let n = crate::sound::model_store::load_bytes(which, m.to_vec())?;
+        return Ok((n, alloc::format!("boot module ({which})")));
+    }
+    for cand in voice_candidates(which) {
+        if let Some(bytes) = read_mounted(cand) {
+            serial_println!("voice> found {} at {}", which, cand);
+            let n = crate::sound::model_store::load_bytes(which, bytes)?;
+            return Ok((n, (*cand).into()));
+        }
+    }
+    Err(alloc::format!("no {which} model bundled or on disk (put it at /voice/ or pass a path)"))
+}
+
+/// Best-effort auto-load of the voice models at boot (after `/` is mounted), so
+/// `/voice say` / STT work without a manual `load`. Silent when absent.
+fn voice_autoload() {
+    for which in ["kitten", "parakeet"] {
+        if let Ok((n, src)) = voice_load(which, None) {
+            serial_println!("Chitti: voice {} auto-loaded ({} bytes) from {} [auto]", which, n, src);
+        }
+    }
+}
+
 /// `/voice models` — show which voice models are loaded + how to get them.
 fn voice_models() {
     let mk = |b: bool| if b { "\x1b[32mloaded\x1b[0m" } else { "not loaded" };
     serial_println!("voice> models:");
     serial_println!("  silero-vad   \x1b[32membedded\x1b[0m (VAD, 630 KB)");
-    serial_println!("  parakeet-stt {} (STT; /voice models load parakeet <path>)", mk(crate::sound::model_store::parakeet().is_some()));
-    serial_println!("  kitten-tts   {} (TTS; /voice models load kitten <path>)", mk(crate::sound::model_store::kitten().is_some()));
+    serial_println!("  parakeet-stt {} (STT; /voice models load parakeet [path])", mk(crate::sound::model_store::parakeet().is_some()));
+    serial_println!("  kitten-tts   {} (TTS; /voice models load kitten [path])", mk(crate::sound::model_store::kitten().is_some()));
+    serial_println!("  (no path = search boot module + /voice/*.onnx on the mounted disk; auto-loaded at boot)");
     serial_println!("  host: cargo xtask voice-assets  (downloads into assets/voice/)");
 }
 
