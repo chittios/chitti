@@ -79,3 +79,12 @@ smoltcp = { path = "../third_party/smoltcp", default-features = false, features 
 # from -Z build-std's canonical sysroot profile, which cargo then builds as
 # a *second* copy of core/alloc — and any ordinary (non-build-std) dependency
 # ends up linked against a mix of the two ("duplicate lang item" errors).
+
+# In-kernel TLS 1.3 client (for `https://` hosted-model endpoints). Pure-Rust,
+# no_std, RustCrypto-backed — no C/assembly, so it builds under our build-std
+# custom target. Blocking API over an embedded-io transport (our smoltcp TCP
+# socket adapter). Cert verification is opt-in; see net::tls.
+embedded-tls = { version = "0.17", default-features = false, features = ["alloc"] }
+embedded-io = { version = "0.6", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+rand_chacha = { version = "0.3", default-features = false }

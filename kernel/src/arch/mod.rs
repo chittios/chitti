@@ -70,3 +70,37 @@ pub fn mouse_poll() {
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub fn mouse_poll() {}
+
+/// A best-effort hardware entropy word, for seeding the CSPRNG (TLS handshake
+/// keys). x86: `RDRAND` when the CPU reports it, else 0. aarch64: `RNDR`
+/// (FEAT_RNG) when present, else 0. `net::tls::seed_rng` mixes several of these
+/// with the cycle counter, so a 0 (facility absent — QEMU/HVF often lack both)
+/// degrades to counter-jitter entropy rather than failing. Not audited crypto
+/// entropy; adequate for a research OS talking to a model server over the LAN.
+#[cfg(target_arch = "x86_64")]
+pub fn hw_rand() -> u64 {
+    x86_64::hw_rand()
+}
+#[cfg(target_arch = "aarch64")]
+pub fn hw_rand() -> u64 {
+    aarch64::hw_rand()
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn hw_rand() -> u64 {
+    0
+}
+
+/// A monotonically-advancing cycle/tick counter for entropy mixing (finer than
+/// `now_ms`): the TSC on x86, `CNTVCT_EL0` on aarch64.
+#[cfg(target_arch = "x86_64")]
+pub fn cycle_count() -> u64 {
+    x86_64::cycle_count()
+}
+#[cfg(target_arch = "aarch64")]
+pub fn cycle_count() -> u64 {
+    aarch64::cycle_count()
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn cycle_count() -> u64 {
+    now_ms()
+}

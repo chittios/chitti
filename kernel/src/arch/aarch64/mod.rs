@@ -289,6 +289,42 @@ fn cntvct() -> u64 {
     v
 }
 
+/// Raw cycle/tick counter for entropy mixing (see `arch::cycle_count`).
+pub fn cycle_count() -> u64 {
+    cntvct()
+}
+
+/// A hardware random word via `RNDR` (FEAT_RNG), or 0 when the feature is
+/// absent (QEMU `virt`/HVF usually lack it). See `arch::hw_rand`.
+pub fn hw_rand() -> u64 {
+    // ID_AA64ISAR0_EL1.RNDR is bits [63:60]; nonzero => RNDR/RNDRRS present.
+    let isar0: u64;
+    // SAFETY: reading the ID register is valid at EL1.
+    unsafe { asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack, preserves_flags)) };
+    if (isar0 >> 60) & 0xf == 0 {
+        return 0;
+    }
+    let v: u64;
+    let ok: u64;
+    // SAFETY: RNDR (s3_3_c2_c4_0) is implemented per the ID check above; it sets
+    // NZCV — PSTATE.Z=1 means the RNG wasn't ready, so we read the flags and
+    // treat a not-ready result as 0 (the caller mixes multiple samples).
+    unsafe {
+        asm!(
+            "mrs {v}, s3_3_c2_c4_0",  // RNDR
+            "cset {ok}, ne",          // ok = 1 if Z clear (value valid)
+            v = out(reg) v,
+            ok = out(reg) ok,
+            options(nomem, nostack),
+        );
+    }
+    if ok != 0 {
+        v
+    } else {
+        0
+    }
+}
+
 fn cntfrq() -> u64 {
     let v: u64;
     // SAFETY: reading the counter frequency register is valid.

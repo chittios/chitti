@@ -170,10 +170,10 @@ real UEFI hardware.
   PCI, plus **e1000** (VirtualBox default + real Intel) — discovered the same way
   on both arches. Shell surface: `/network` (info/dhcp/static/dns), `/ping`,
   `/wifi` (scan/connect via the password modal), `/http get|post` (a minimal
-  HTTP/1.1 client in `net/http.rs` — plain http, no in-kernel TLS; also the
-  agent's `http` tool). `/model remote <http://host:port> [name]` points the
+  HTTP/1.1 client in `net/http.rs`, `http://` **and** `https://` — TLS 1.3 via
+  `net/tls.rs`/embedded-tls; also the agent's `http` tool). `/model remote <http://host:port> [name]` points the
   shell agent at a **hosted** OpenAI-compatible model (llama.cpp server /
-  Ollama / vLLM) via `shell/remote.rs` — same system prompt, tool calls, and
+  Ollama / vLLM), over http or https, via `shell/remote.rs` — same system prompt, tool calls, and
   approval gates; only generation moves off-box (config persisted at
   `/configs/core/model.json`; switching backends is human-only, never an agent
   tool). The stack is polled cooperatively from the shell idle loop. NB: aarch64 MMIO register access must be a single
