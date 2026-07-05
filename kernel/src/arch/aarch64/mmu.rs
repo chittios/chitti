@@ -10,6 +10,15 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[repr(align(4096))]
 struct Table(#[allow(dead_code)] [u64; 512]);
 static mut L1: Table = Table([0; 512]);
+/// L2 tables for GiB blocks that must be **split** (a device window inside a
+/// RAM block — VirtualBox puts the GOP framebuffer at 0xE000_0000, inside
+/// mapped RAM, and remapping that whole GiB as Device turned the tail of the
+/// model region into Device memory: unaligned SIMD loads alignment-faulted).
+/// A small fixed pool; each entry maps one GiB as 512 × 2 MiB blocks.
+static mut L2_POOL: [Table; 4] = [const { Table([0; 512]) }; 4];
+/// Which L1 index each pool slot serves (u64::MAX = free). Single-core boot
+/// path; no locking needed (map_device_gib runs during init, BSP only).
+static L2_OWNER: [AtomicU64; 4] = [const { AtomicU64::new(u64::MAX) }; 4];
 
 /// Top of the RAM/heap region the kernel may use, discovered at boot: on
 /// `-kernel` the top of DTB `/memory`; on UEFI `heap_base + heap_size` reported
@@ -166,12 +175,79 @@ pub fn map_device_gib(pa: u64) {
     if idx >= 512 {
         return; // beyond the single-level L1 (512 GiB)
     }
+    // A device inside a **RAM** GiB block (VirtualBox's GOP framebuffer sits at
+    // 0xE000_0000, below RAM's end) must not demote the whole block: the model
+    // and heap can share it, and Device-typed RAM alignment-faults every
+    // unaligned SIMD access. Split such a block into 2 MiB L2 entries and punch
+    // a 64 MiB Device window (covers any framebuffer) around `pa` instead.
+    let in_ram = idx >= 1 && ((idx as u64) << 30) < MAPPED_BYTES.load(Ordering::Relaxed);
+    if in_ram {
+        map_device_window_2m(pa, 64 << 20);
+        return;
+    }
     // SAFETY: L1 is the live TTBR0 table; writing one block descriptor + a TLB
     // invalidate publishes the new Device mapping. Device attr_idx=1, non-shareable.
     unsafe {
         let l1 = core::ptr::addr_of_mut!(L1) as *mut u64;
         let desc = ((idx as u64) << 30) | (1u64 << 2) | (1 << 10) | 0b01; // AF=1, Device, block, valid
         *l1.add(idx) = desc;
+        asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb", options(nostack));
+    }
+}
+
+/// Split the GiB block containing `pa` into 512 × 2 MiB L2 blocks (RAM stays
+/// Normal) and mark `[pa & !2MiB-1, +len)` Device. Idempotent per block; falls
+/// back to the whole-GiB Device demotion if the small L2 pool is exhausted
+/// (previous behavior — correct for the device, slow if RAM shares the block).
+fn map_device_window_2m(pa: u64, len: u64) {
+    let idx = (pa >> 30) as usize;
+    // Find (or claim) the pool slot for this L1 index.
+    let mut slot = usize::MAX;
+    for (i, owner) in L2_OWNER.iter().enumerate() {
+        let o = owner.load(Ordering::Relaxed);
+        if o == idx as u64 {
+            slot = i;
+            break;
+        }
+        if o == u64::MAX && slot == usize::MAX {
+            slot = i;
+        }
+    }
+    if slot == usize::MAX {
+        // Pool exhausted: previous whole-GiB behavior.
+        // SAFETY: same single-descriptor write as map_device_gib's device path.
+        unsafe {
+            let l1 = core::ptr::addr_of_mut!(L1) as *mut u64;
+            *l1.add(idx) = ((idx as u64) << 30) | (1u64 << 2) | (1 << 10) | 0b01;
+            asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb", options(nostack));
+        }
+        return;
+    }
+    // SAFETY: single-core init path (BSP); the pool table is exclusively ours
+    // once L2_OWNER is claimed, and the L1 slot swap below is a single aligned
+    // 64-bit store followed by TLB invalidation.
+    unsafe {
+        let l2 = core::ptr::addr_of_mut!(L2_POOL[slot]) as *mut u64;
+        if L2_OWNER[slot].load(Ordering::Relaxed) != idx as u64 {
+            // Fresh split: fill all 512 entries as Normal 2 MiB blocks.
+            for j in 0..512 {
+                let base = ((idx as u64) << 30) | ((j as u64) << 21);
+                *l2.add(j) = base | (0u64 << 2) | (0b11 << 8) | (1 << 10) | 0b01; // Normal, inner-shareable
+            }
+            L2_OWNER[slot].store(idx as u64, Ordering::Relaxed);
+        }
+        // Punch the Device window (2 MiB granules).
+        let start = (pa & !((1 << 21) - 1)).max((idx as u64) << 30);
+        let end = (pa + len).min(((idx as u64) + 1) << 30);
+        let mut a = start;
+        while a < end {
+            let j = ((a >> 21) & 0x1ff) as usize;
+            *l2.add(j) = a | (1u64 << 2) | (1 << 10) | 0b01; // Device, non-shareable
+            a += 1 << 21;
+        }
+        // Swap the L1 entry to the table descriptor and publish.
+        let l1 = core::ptr::addr_of_mut!(L1) as *mut u64;
+        *l1.add(idx) = (l2 as u64) | 0b11; // table descriptor
         asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb", options(nostack));
     }
 }
@@ -215,6 +291,12 @@ unsafe fn enable_mmu(l1: *mut u64) {
         let mut sctlr: u64;
         asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nostack));
         sctlr |= (1 << 0) | (1 << 2) | (1 << 12); // M (MMU), C (data cache), I (instr cache)
+        // A (alignment check) must be OFF: the SIMD hot loops (tensor.rs
+        // `ldq_*`/`dot_f32_neon` — `ldr q`/`ldp q` on 1-/2-byte-aligned Q8_0
+        // block data) rely on Normal-memory unaligned access. QEMU's EDK2
+        // hands off with A=0, but VirtualBox's EFI leaves A=1 — inheriting it
+        // made the first quantized matvec alignment-fault (ESR DFSC 0x21).
+        sctlr &= !(1 << 1);
         asm!("msr sctlr_el1, {}", in(reg) sctlr, options(nostack));
         asm!("isb", options(nostack));
     }
