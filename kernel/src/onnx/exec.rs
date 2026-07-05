@@ -19,11 +19,18 @@ pub struct Val {
     pub dims: Vec<usize>,
     pub f: Vec<f32>,
     pub i: Option<Vec<i64>>,
+    /// When `Some`, this value is an ONNX **sequence** of tensors (the `dims`/`f`
+    /// fields are unused). Produced/consumed by the `*Sequence*` ops.
+    pub seq: Option<Vec<Val>>,
 }
 
 impl Val {
     pub fn new(dims: Vec<usize>, f: Vec<f32>) -> Self {
-        Self { dims, f, i: None }
+        Self { dims, f, i: None, seq: None }
+    }
+    /// A sequence value holding `items`.
+    pub fn seq(items: Vec<Val>) -> Self {
+        Self { dims: Vec::new(), f: Vec::new(), i: None, seq: Some(items) }
     }
     fn ints(&self) -> Vec<i64> {
         match &self.i {
@@ -48,7 +55,7 @@ fn tensor_to_val(t: &Tensor<'_>) -> Val {
                 t.ints.clone()
             };
             let f = ints.iter().map(|&v| v as f32).collect();
-            Val { dims, f, i: Some(ints) }
+            Val { dims, f, i: Some(ints), seq: None }
         }
         _ => {
             // treat everything else as f32
@@ -113,6 +120,22 @@ fn logf(x: f32) -> f32 {
     let t2 = t * t;
     let ln_m = 2.0 * t * (1.0 + t2 / 3.0 + t2 * t2 / 5.0 + t2 * t2 * t2 / 7.0 + t2 * t2 * t2 * t2 / 9.0);
     ln_m + e as f32 * core::f32::consts::LN_2
+}
+
+/// Concatenate two tensors along `axis` (used by ConcatFromSequence).
+fn concat2(a: &Val, b: &Val, axis: usize) -> Val {
+    let mut dims = a.dims.clone();
+    dims[axis] = a.dims[axis] + b.dims[axis];
+    let outer: usize = dims[..axis].iter().product::<usize>().max(1);
+    let inner: usize = dims[axis + 1..].iter().product::<usize>().max(1);
+    let mut f = Vec::with_capacity(dims.iter().product());
+    for o in 0..outer {
+        let sa = o * a.dims[axis] * inner;
+        f.extend_from_slice(&a.f[sa..sa + a.dims[axis] * inner]);
+        let sb = o * b.dims[axis] * inner;
+        f.extend_from_slice(&b.f[sb..sb + b.dims[axis] * inner]);
+    }
+    Val::new(dims, f)
 }
 
 /// Row-major strides for `dims` (element strides, innermost = 1).
@@ -431,6 +454,80 @@ fn resize(x: &Val, scales: Option<&[f32]>, sizes: Option<&[i64]>, linear: bool) 
     Val::new(od, out)
 }
 
+/// `DynamicQuantizeLSTM` (com.microsoft): a bidirectional LSTM whose recurrence
+/// weights are int8-quantized per direction. Layout (from the model): quantized
+/// `W` is `[dir, input, 4h]`, `R` is `[dir, hidden, 4h]` (transposed for X·W),
+/// scale is per-direction, zero-point 0. Gates along 4h are i, o, f, c.
+/// Returns `Y [T, dir, batch, hidden]`, `Y_h`, `Y_c`.
+fn dynamic_quantize_lstm(node: &super::Node<'_>, x: &Val, wq: &Val, rq: &Val, bias: Option<&Val>, ws: &Val, rs: &Val) -> Vec<Val> {
+    let h = attr_i(node, "hidden_size", 256) as usize;
+    let ndir = if wq.dims[0] == 2 { 2 } else { 1 };
+    let (t_len, batch, input) = (x.dims[0], x.dims[1], x.dims[2]);
+    let g4 = 4 * h;
+    // Dequantize + transpose W[d] to [4h, input] and R[d] to [4h, hidden] so the
+    // gate pre-activations run through the SIMD dot kernel.
+    let mut wt = vec![vec![0f32; input]; ndir * g4];
+    let mut rt = vec![vec![0f32; h]; ndir * g4];
+    for d in 0..ndir {
+        let wsc = ws.f.get(d).copied().unwrap_or(1.0);
+        let rsc = rs.f.get(d).copied().unwrap_or(1.0);
+        for k in 0..input {
+            for j in 0..g4 {
+                wt[d * g4 + j][k] = wq.f[(d * input + k) * g4 + j] * wsc;
+            }
+        }
+        for k in 0..h {
+            for j in 0..g4 {
+                rt[d * g4 + j][k] = rq.f[(d * h + k) * g4 + j] * rsc;
+            }
+        }
+    }
+    // Combined bias per gate: Wb[g] + Rb[g] (B is [dir, 8h]).
+    let bcomb = |d: usize, j: usize| -> f32 {
+        match bias {
+            Some(b) => b.f[d * 8 * h + j] + b.f[d * 8 * h + g4 + j],
+            None => 0.0,
+        }
+    };
+    let sig = |v: f32| 1.0 / (1.0 + expf(-v));
+    // Y: [T, ndir, batch, h].
+    let mut y = vec![0f32; t_len * ndir * batch * h];
+    let mut yh = vec![0f32; ndir * batch * h];
+    let mut yc = vec![0f32; ndir * batch * h];
+    for d in 0..ndir {
+        for bi in 0..batch {
+            let mut hs = vec![0f32; h];
+            let mut cs = vec![0f32; h];
+            for step in 0..t_len {
+                let t = if d == 0 { step } else { t_len - 1 - step }; // backward dir
+                let xt = &x.f[(t * batch + bi) * input..(t * batch + bi) * input + input];
+                let mut gate = vec![0f32; g4];
+                for j in 0..g4 {
+                    gate[j] = bcomb(d, j) + crate::cortex::tensor::dot_f32(xt, &wt[d * g4 + j]) + crate::cortex::tensor::dot_f32(&hs, &rt[d * g4 + j]);
+                }
+                for k in 0..h {
+                    let it = sig(gate[k]);
+                    let ot = sig(gate[h + k]);
+                    let ft = sig(gate[2 * h + k]);
+                    let ct = tanhf(gate[3 * h + k]);
+                    cs[k] = ft * cs[k] + it * ct;
+                    hs[k] = ot * tanhf(cs[k]);
+                }
+                let yo = ((t * ndir + d) * batch + bi) * h;
+                y[yo..yo + h].copy_from_slice(&hs);
+            }
+            let ho = (d * batch + bi) * h;
+            yh[ho..ho + h].copy_from_slice(&hs);
+            yc[ho..ho + h].copy_from_slice(&cs);
+        }
+    }
+    vec![
+        Val::new(vec![t_len, ndir, batch, h], y),
+        Val::new(vec![ndir, batch, h], yh),
+        Val::new(vec![ndir, batch, h], yc),
+    ]
+}
+
 /// ONNX `Loop`: `(M, cond, v_init...)` → body `(iter, cond_in, v_in...)` yields
 /// `(cond_out, v_out..., scan_out...)`. Carried deps thread through; scan
 /// outputs are stacked along a new leading axis.
@@ -447,7 +544,7 @@ fn exec_loop(node: &super::Node<'_>, env: &BTreeMap<String, Val>) -> Result<Vec<
     let mut iter = 0i64;
     while cond && iter < max_trip && iter < 100_000 {
         let mut child = env.clone();
-        child.insert(body.inputs[0].to_string(), Val { dims: vec![], f: vec![iter as f32], i: Some(vec![iter]) });
+        child.insert(body.inputs[0].to_string(), Val { dims: vec![], f: vec![iter as f32], i: Some(vec![iter]), seq: None });
         if body.inputs.len() > 1 {
             child.insert(body.inputs[1].to_string(), Val::new(vec![], vec![if cond { 1.0 } else { 0.0 }]));
         }
@@ -598,7 +695,7 @@ fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), Stri
                 let v = get(env, 0)?;
                 let ints: Vec<i64> = v.dims.iter().map(|&d| d as i64).collect();
                 let f = ints.iter().map(|&d| d as f32).collect();
-                vec![Val { dims: vec![ints.len()], f, i: Some(ints) }]
+                vec![Val { dims: vec![ints.len()], f, i: Some(ints), seq: None }]
             }
             "Unsqueeze" => {
                 let v = get(env, 0)?;
@@ -611,7 +708,7 @@ fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), Stri
                     let a = if ax < 0 { ax + r } else { ax } as usize;
                     dims.insert(a, 1);
                 }
-                vec![Val { dims, f: v.f, i: v.i }]
+                vec![Val { dims, f: v.f, i: v.i, seq: None }]
             }
             "Squeeze" => {
                 let v = get(env, 0)?;
@@ -630,7 +727,7 @@ fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), Stri
                         dims.push(d);
                     }
                 }
-                vec![Val { dims, f: v.f, i: v.i }]
+                vec![Val { dims, f: v.f, i: v.i, seq: None }]
             }
             "Reshape" => {
                 let v = get(env, 0)?;
@@ -655,7 +752,7 @@ fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), Stri
                 if let Some(k) = infer {
                     dims[k] = total / known.max(1);
                 }
-                vec![Val { dims, f: v.f, i: v.i }]
+                vec![Val { dims, f: v.f, i: v.i, seq: None }]
             }
             "Concat" => {
                 let axis = attr_i(node, "axis", 0);
@@ -689,7 +786,7 @@ fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), Stri
                 } else {
                     None
                 };
-                vec![Val { dims, f, i: ints }]
+                vec![Val { dims, f, i: ints, seq: None }]
             }
             "Transpose" => {
                 let v = get(env, 0)?;
@@ -1039,7 +1136,7 @@ fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), Stri
                         }
                     }
                 }
-                vec![Val { dims: od, f: out, i: if want_i { Some(oi) } else { None } }]
+                vec![Val { dims: od, f: out, i: if want_i { Some(oi) } else { None }, seq: None }]
             }
             "Split" => {
                 let v = get(env, 0)?;
@@ -1079,7 +1176,7 @@ fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), Stri
                 let n = (ceilf((limit - start) / delta) as i64).max(0) as usize;
                 let f: Vec<f32> = (0..n).map(|i| start + i as f32 * delta).collect();
                 let iv: Vec<i64> = f.iter().map(|&x| x as i64).collect();
-                vec![Val { dims: vec![n], f, i: Some(iv) }]
+                vec![Val { dims: vec![n], f, i: Some(iv), seq: None }]
             }
             "MatMul" => vec![matmul(&get(env, 0)?, &get(env, 1)?, 0.0, 0.0)],
             "MatMulInteger" => {
@@ -1433,7 +1530,7 @@ fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), Stri
                     od.remove(axis);
                 }
                 let iv: Vec<i64> = out.iter().map(|&x| x as i64).collect();
-                vec![Val { dims: od, f: out, i: Some(iv) }]
+                vec![Val { dims: od, f: out, i: Some(iv), seq: None }]
             }
             "CumSum" => {
                 let v = get(env, 0)?;
@@ -1527,6 +1624,105 @@ fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), Stri
                 sub.outputs.iter().map(|o| child.get(*o).cloned().ok_or_else(|| alloc::format!("If: missing {o}"))).collect::<Result<Vec<_>, _>>()?
             }
             "Loop" => exec_loop(node, env)?,
+            "DynamicQuantizeLSTM" => {
+                let x = get(env, 0)?;
+                let wq = get(env, 1)?;
+                let rq = get(env, 2)?;
+                let bias = get(env, 3).ok();
+                let ws = get(env, 8)?;
+                let rs = get(env, 10)?;
+                dynamic_quantize_lstm(node, &x, &wq, &rq, bias.as_ref(), &ws, &rs)
+            }
+            "SequenceEmpty" => vec![Val::seq(Vec::new())],
+            "SequenceInsert" => {
+                let s = get(env, 0)?;
+                let tensor = get(env, 1)?;
+                let mut items = s.seq.clone().unwrap_or_default();
+                match get(env, 2).ok().and_then(|p| p.ints().first().copied()) {
+                    Some(p) => {
+                        let idx = if p < 0 { (items.len() as i64 + p) as usize } else { p as usize };
+                        items.insert(idx.min(items.len()), tensor);
+                    }
+                    None => items.push(tensor),
+                }
+                vec![Val::seq(items)]
+            }
+            "SequenceAt" => {
+                let items = get(env, 0)?.seq.clone().unwrap_or_default();
+                let pos = get(env, 1)?.ints().first().copied().unwrap_or(0);
+                let idx = if pos < 0 { (items.len() as i64 + pos) as usize } else { pos as usize };
+                vec![items.into_iter().nth(idx).ok_or("SequenceAt: out of range")?]
+            }
+            "SplitToSequence" => {
+                let v = get(env, 0)?;
+                let r = v.dims.len();
+                let axis = {
+                    let a = attr_i(node, "axis", 0);
+                    (if a < 0 { a + r as i64 } else { a }) as usize
+                };
+                let al = v.dims[axis];
+                let split = get(env, 1).ok();
+                let keepdims = split.is_some();
+                let sizes: Vec<usize> = match &split {
+                    Some(s) if s.f.len() <= 1 => {
+                        let chunk = s.ints().first().copied().unwrap_or(1).max(1) as usize;
+                        let (mut v, mut left) = (Vec::new(), al);
+                        while left > 0 {
+                            let c = chunk.min(left);
+                            v.push(c);
+                            left -= c;
+                        }
+                        v
+                    }
+                    Some(s) => s.ints().iter().map(|&x| x as usize).collect(),
+                    None => alloc::vec![1usize; al],
+                };
+                let outer: usize = v.dims[..axis].iter().product::<usize>().max(1);
+                let inner: usize = v.dims[axis + 1..].iter().product::<usize>().max(1);
+                let mut items = Vec::new();
+                let mut off = 0usize;
+                for &sz in &sizes {
+                    let mut dims = v.dims.clone();
+                    if keepdims {
+                        dims[axis] = sz;
+                    } else {
+                        dims.remove(axis);
+                    }
+                    let mut f = Vec::with_capacity(outer * sz * inner);
+                    for o in 0..outer {
+                        let start = (o * al + off) * inner;
+                        f.extend_from_slice(&v.f[start..start + sz * inner]);
+                    }
+                    items.push(Val::new(dims, f));
+                    off += sz;
+                }
+                vec![Val::seq(items)]
+            }
+            "ConcatFromSequence" => {
+                let items = get(env, 0)?.seq.clone().unwrap_or_default();
+                if items.is_empty() {
+                    vec![Val::new(alloc::vec![0], Vec::new())]
+                } else if attr_i(node, "new_axis", 0) == 1 {
+                    let mut dims = alloc::vec![items.len()];
+                    dims.extend_from_slice(&items[0].dims);
+                    let mut f = Vec::new();
+                    for it in &items {
+                        f.extend_from_slice(&it.f);
+                    }
+                    vec![Val::new(dims, f)]
+                } else {
+                    let axis = {
+                        let a = attr_i(node, "axis", 0);
+                        let r = items[0].dims.len();
+                        (if a < 0 { a + r as i64 } else { a }) as usize
+                    };
+                    let mut acc = items[0].clone();
+                    for it in &items[1..] {
+                        acc = concat2(&acc, it, axis);
+                    }
+                    vec![acc]
+                }
+            }
             "GatherElements" => {
                 // out[i] = data[... indices[i] at axis ...], same shape as indices.
                 let data = get(env, 0)?;
@@ -1656,7 +1852,7 @@ fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), Stri
                 let vi: Vec<f32> = idxs.iter().map(|&x| x as f32).collect();
                 let vif = reorder(&vi);
                 let ii: Vec<i64> = vif.iter().map(|&x| x as i64).collect();
-                vec![Val::new(od.clone(), vf), Val { dims: od, f: vif, i: Some(ii) }]
+                vec![Val::new(od.clone(), vf), Val { dims: od, f: vif, i: Some(ii), seq: None }]
             }
             other => return Err(alloc::format!("unsupported op {other}")),
         };
