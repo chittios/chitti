@@ -92,7 +92,7 @@ fn demo_phase6() {
 /// The interactive shell -- a Claude-Code-style chat REPL over COM1. Plain text
 /// is a chat message streamed through the Cortex model (generating until the
 /// model emits EOS or the user presses Ctrl+C); `/`-prefixed lines are commands
-/// (`/help`, `/infer`, `/do`, ...). Never returns -- it is the system's steady
+/// (`/help`, `/infer`, `/agents`, ...). Never returns -- it is the system's steady
 /// state.
 pub fn run() -> ! {
     serial_println!("");
@@ -107,14 +107,10 @@ pub fn run() -> ! {
     auto_mount_root();
     update_status();
 
-    // Persona agent (for `/do <intent>`) reused across the session.
-    let mut agent = Agent::spawn(persona::default_manifest("chitti"));
-    let mut planner = RulePlanner;
-    // The agent-layer orchestrator + its tool router (for `/agent`, `/session`,
-    // `/subagent`), reused across the session so its Session persists.
-    use crate::agent::{manifest as amanifest, orchestrator, rule_steps, subagent};
+    // The agent-layer orchestrator (session persistence for the shell agent —
+    // `/session`, `/info`), reused across the session so its Session persists.
+    use crate::agent::{manifest as amanifest, orchestrator};
     let mut orch = orchestrator::Orchestrator::spawn(amanifest::orchestrator_manifest(), 42);
-    let mut router = orch.router();
     // Chat session (model + tokenizer + KV cache), loaded lazily on first chat.
     // Boot-time model-region probe: FNV-1a of the first 4 MiB + how long the
     // read took. One line of serial diagnoses both a corrupt load (hash
@@ -162,33 +158,12 @@ pub fn run() -> ! {
                     serial_println!("(chat context + screen cleared)");
                 }
                 "open" | "edit" => run_open(arg),
-                "do" => {
-                    if arg.is_empty() {
-                        serial_println!("usage: /do <intent>   e.g. /do remember that project is chitti");
-                    } else {
-                        run_intent_interactive(&mut agent, &mut planner, arg);
-                    }
-                }
-                // --- agent-layer verification commands -----------------------
-                "agent" => {
-                    if arg.is_empty() {
-                        serial_println!("usage: /agent <intent>   (rule-planned; try: write a file called notes with the text hi, then read it back)");
-                    } else {
-                        let mut steps = rule_steps::for_intent(arg);
-                        let r = orch.handle_compiled(arg, &mut steps, &mut router);
-                        serial_println!(
-                            "=> {} [stop={:?}, turns={}, tool_calls={}]",
-                            r.answer, r.stop, r.turns, r.tool_calls
-                        );
-                        serial_println!(
-                            "   session {} now has {} messages, {} todos, {} subagent record(s)",
-                            orch.session.id.0,
-                            orch.session.messages.len(),
-                            orch.session.todos.len(),
-                            orch.session.subagents.len()
-                        );
-                    }
-                }
+                // --- agents-as-processes ------------------------------------
+                "agents" => run_agents(arg, &mut chat),
+                "compact" => match chat.as_mut() {
+                    Some(sess) => sess.compact(),
+                    None => serial_println!("(no chat session yet — nothing to compact)"),
+                },
                 "session" => {
                     let (sub, sarg) = match arg.split_once(' ') {
                         Some((s, a)) => (s, a.trim()),
@@ -225,37 +200,6 @@ pub fn run() -> ! {
                         }
                     }
                 }
-                "subagent" => {
-                    if arg.is_empty() {
-                        serial_println!("usage: /subagent <path>   (dispatches an isolated reader sub-agent to read <path>)");
-                    } else {
-                        let mut script = rule_steps::ScriptedSteps::new(alloc::vec![
-                            crate::agent::agent_loop::Step::Tools(alloc::vec![rule_steps::tool(
-                                "read",
-                                rule_steps::args(&[("path", arg)])
-                            )]),
-                            crate::agent::agent_loop::Step::Final(alloc::format!("read '{}'", arg)),
-                        ]);
-                        let caps = orch.manifest.capabilities.clone();
-                        let md = orch.manifest.budgets.max_depth;
-                        match subagent::dispatch(&caps, 0, md, amanifest::reader_subagent_manifest(), arg, &mut script, &mut router, Some(0)) {
-                            Ok(o) => {
-                                let sub_msgs = o.sub_session.messages.len();
-                                let summary = o.record.summary.clone().unwrap_or_default();
-                                subagent::integrate(&mut orch.session, 1, &o);
-                                serial_println!("=> sub-agent[core {:?}] summary: {}", o.record.core, summary);
-                                serial_println!(
-                                    "   isolation: sub-agent ran {} msgs (NOT merged); parent now {} msgs, {} subagent record(s), effective caps: {}",
-                                    sub_msgs,
-                                    orch.session.messages.len(),
-                                    orch.session.subagents.len(),
-                                    o.record.effective_caps.len()
-                                );
-                            }
-                            Err(e) => serial_println!("=> sub-agent refused: {:?}", e),
-                        }
-                    }
-                }
                 "info" => print_info(&orch, chat.as_ref()),
                 // `/voice` with no (or an unknown) subcommand is the interactive
                 // hear->think->speak conversation loop, which needs the live
@@ -281,7 +225,7 @@ pub fn run() -> ! {
             Some(sess) => {
                 sess.turn(msg);
             }
-            None => serial_println!("no model bundled -- chat unavailable (try /infer, /do, /bench)"),
+            None => serial_println!("no model bundled -- chat unavailable (try /infer, /bench)"),
         }
     }
 }
@@ -548,14 +492,11 @@ fn print_skills() {
 fn print_help() {
     serial_println!("Chitti commands:");
     serial_println!("  <message>        chat with the agent — it calls /commands as tools (Ctrl+C to stop)");
-    serial_println!("  /do <intent>     run a Persona intent (write a file called X with the text Y; ");
-    serial_println!("                   remember that K is V; what is K; list; say TEXT)");
-    serial_println!("  /agent <intent>  run the orchestrator's agentic loop on <intent> (sessions + tools)");
+    serial_println!("  /agents [..]     agent process list; /agents switch <id> | kill <id>");
     serial_println!("  /session         show the current session; /session save | /session resume <id>");
-    serial_println!("  /subagent <path> dispatch an isolated reader sub-agent (shows context isolation)");
-    serial_println!("                   (the chat agent can also delegate: TOOL: /subagent <task>)");
+    serial_println!("  /compact         compact the chat context (model-written summary, fresh KV)");
     serial_println!("  /skills          list installed skills (L0 metadata)");
-    serial_println!("  /clear           reset the chat context");
+    serial_println!("  /clear           reset the chat context + clear the pane (incl. scrollback)");
     serial_println!("  /infer           reference inference (fixed prompt, parity check)");
     serial_println!("  /bench           matvec kernel throughput");
     serial_println!("  /perf            end-to-end prefill/decode tok/s");
@@ -702,6 +643,29 @@ fn think_enabled() -> bool {
     THINK_ON.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Non-blocking cancel check for inference loops: Ctrl+C, or a bare Esc key
+/// (an Esc that begins an ANSI CSI sequence — an arrow key — is swallowed
+/// without cancelling).
+fn poll_cancel() -> bool {
+    match crate::console::read_byte() {
+        Some(3) => true,
+        Some(0x1b) => {
+            if next_seq_byte() == Some(b'[') {
+                // Swallow the rest of the CSI sequence (params + final byte).
+                while let Some(b) = next_seq_byte() {
+                    if (0x40..=0x7e).contains(&b) {
+                        break;
+                    }
+                }
+                false
+            } else {
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Assemble a Qwen3.5 tool-use system prompt: `persona` text followed by the
 /// standard `# Tools` block, with the function signatures generated **from the
 /// tool registry** filtered by the agent's manifest `toolset` — the registry is
@@ -719,12 +683,13 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
     let mut s = String::from(persona);
     // Compact one-line-per-tool listing rather than full JSON `<tools>` schemas:
     // on a CPU-bound prefill the schema boilerplate was ~1400 tokens (~3 min to
-    // first token). Every shell tool takes a single `args` string, so a terse
-    // "name — description" line is enough; the model still emits, and we still
-    // parse, the standard `<tool_call>` JSON.
+    // first token). Only a small CORE set is advertised inline; everything else
+    // is discoverable on demand via `search_tools` (Claude-Code-style tool
+    // search) — the full registry listing both bloated the prefill and tempted
+    // small models into calling the first listed tool on a bare "hello".
     s.push_str("\n\nTools you can call. To use one, reply with ONE line and nothing else:\n");
     s.push_str("<tool_call>{\"name\": \"<name>\", \"arguments\": {\"args\": \"<args>\"}}</tool_call>\n");
-    for d in &defs {
+    for d in defs.iter().filter(|d| CORE_TOOLS.contains(&d.name.as_str())) {
         s.push_str("- ");
         s.push_str(&d.name);
         s.push_str(" \u{2014} ");
@@ -733,24 +698,69 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
         s.push_str(short);
         s.push('\n');
     }
+    s.push_str("- search_tools \u{2014} Find more tools by keyword (e.g. wifi, install, voice); call this when no listed tool fits.\n");
     s.push_str("After a tool runs you get its output in <tool_response>...; then answer, or call another tool.");
     s
 }
 
-/// The root shell agent's persona + dynamically generated toolset. The persona
-/// starts from the agent's own `/agent/1/SOUL.md` (created on first boot,
-/// user-editable), followed by the operating rules.
+/// The tools advertised inline in the system prompt; the rest of the registry
+/// is reachable through `search_tools`. Keep this list short — prefill on a
+/// CPU is the latency budget for every chat turn.
+const CORE_TOOLS: &[&str] = &["ls", "cat", "disks", "network", "datetime", "spawn_subagent"];
+
+/// `search_tools` — the chat-level tool-discovery tool. Case-insensitive
+/// keyword match over the executable registry entries' names + descriptions;
+/// returns the same "name — description" lines the prompt uses.
+fn search_tools(query: &str) -> String {
+    use crate::tools::registry::ToolBinding;
+    let manifest = crate::agent::manifest::orchestrator_manifest();
+    let q = query.trim().to_lowercase();
+    let words: alloc::vec::Vec<&str> = q.split_whitespace().collect();
+    let mut out = String::new();
+    let mut n = 0;
+    for d in crate::tools::registry::for_agent(&manifest.toolset) {
+        if !matches!(d.binding, ToolBinding::Shell { .. } | ToolBinding::SpawnSubagent) {
+            continue;
+        }
+        let hay = alloc::format!("{} {}", d.name, d.description).to_lowercase();
+        if words.is_empty() || words.iter().any(|w| hay.contains(w)) {
+            out.push_str(&alloc::format!("- {} \u{2014} {}\n", d.name, d.description));
+            n += 1;
+            if n >= 12 {
+                break;
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push_str("no tools matched; try a broader keyword or call with no args to list all");
+    }
+    out
+}
+
+/// Which agent the interactive chat currently runs as (`/agents switch`).
+/// Default: the shell agent (orchestrator, id 1).
+static ACTIVE_AGENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+fn active_agent_id() -> u64 {
+    ACTIVE_AGENT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The shell agent's persona + dynamically generated toolset. The persona
+/// starts from the active agent's own `/agent/<id>/SOUL.md` (created on first
+/// boot, user-editable), followed by the operating rules.
 fn agent_system_prompt() -> String {
     let manifest = crate::agent::manifest::orchestrator_manifest();
-    crate::agent::home::ensure(crate::agent::manifest::ORCHESTRATOR_ID.0, "chitti");
+    let id = active_agent_id();
+    crate::agent::home::ensure(id, if id == crate::agent::manifest::ORCHESTRATOR_ID.0 { "chitti" } else { "agent" });
     let mut persona = String::new();
-    if let Some(soul) = crate::agent::home::soul(crate::agent::manifest::ORCHESTRATOR_ID.0) {
+    if let Some(soul) = crate::agent::home::soul(id) {
         persona.push_str(&soul);
         persona.push_str("\n\n");
     }
     persona.push_str(
-        "You are Chitti, an agentic OS shell agent on bare metal. You operate the machine by \
-         calling tools rather than guessing: never invent data a tool can read (current time, \
+        "You are Chitti, an agentic OS shell agent on bare metal. For greetings and small \
+         talk, just reply in prose — do NOT call a tool. Call a tool only when the task needs \
+         machine state or an action, and never invent data a tool can read (current time, \
          network status, files, disks). Delegate a self-contained task with spawn_subagent. \
          When you have the answer, reply in short plain prose (ANSI SGR escape codes for \
          emphasis if needed, never markdown).",
@@ -1436,6 +1446,10 @@ fn run_mode(arg: &str) {
 /// `spawn_subagent` before this.
 fn execute_chat_tool(name: &str, args: &str) -> alloc::string::String {
     use crate::tools::registry::{self, ToolBinding};
+    // Tool discovery is chat-level, side-effect-free, and never needs approval.
+    if name == "search_tools" {
+        return search_tools(args);
+    }
     let (command, destructive) = match registry::get(name) {
         Some(def) => match def.binding {
             ToolBinding::Shell { command, destructive } => (command, destructive),
@@ -1476,6 +1490,9 @@ struct ChatSession {
     rng: crate::cortex::sampler::Rng,
     /// Token ids generated in the current turn, for the repetition penalty.
     gen: alloc::vec::Vec<usize>,
+    /// Set when the user cancels (Ctrl+C / Esc) mid-prefill or mid-decode;
+    /// `turn` checks it after every phase and ends the turn.
+    cancelled: bool,
 }
 
 impl ChatSession {
@@ -1496,7 +1513,7 @@ impl ChatSession {
         spin.tick();
         // Seed the sampler from the boot clock so sessions vary.
         let rng = sampler::Rng::new(crate::arch::now_ms().wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-        Some(Self { model: m, tok, kv, state, pos: 0, rng, gen: alloc::vec::Vec::new() })
+        Some(Self { model: m, tok, kv, state, pos: 0, rng, gen: alloc::vec::Vec::new(), cancelled: false })
     }
 
     /// One chat turn as an **agentic ReAct loop** over the Qwen3.5 tool
@@ -1508,10 +1525,15 @@ impl ChatSession {
     /// loop to speak the reply; the interactive shell caller ignores it.
     fn turn(&mut self, msg: &str) -> alloc::string::String {
         const MAX_TOOL_ITERS: usize = 4;
+        self.cancelled = false;
         if self.pos == 0 {
             self.prefill_turn("system\n", &agent_system_prompt(), false);
         }
         self.prefill_turn("user\n", msg, true);
+        if self.cancelled {
+            serial_println!("\x1b[33m[cancelled]\x1b[0m");
+            return alloc::string::String::new();
+        }
         // Repeat guard (same rationale as the sub-agent loop): a small model
         // that re-emits the identical call already has its output. First repeat
         // gets one "answer now" nudge; a repeat after that ends the turn.
@@ -1519,6 +1541,9 @@ impl ChatSession {
         let mut nudged = false;
         for _ in 0..MAX_TOOL_ITERS {
             let text = self.generate_assistant("\x1b[1;36mchitti:\x1b[0m ");
+            if self.cancelled {
+                return text; // user cancelled: no tool parsing, turn over
+            }
             if let Some(pair) = parse_tool_call(&text) {
                 if last_call.as_ref() == Some(&pair) {
                     if nudged {
@@ -1562,6 +1587,40 @@ impl ChatSession {
         }
         serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
         alloc::string::String::new()
+    }
+
+    /// `/compact` — shrink the live context: the model itself summarizes the
+    /// conversation so far, then the KV cache is rebuilt from the system
+    /// prompt + that summary (the same shape as an agent-layer compaction,
+    /// but for the interactive chat's model context).
+    fn compact(&mut self) {
+        if self.pos == 0 {
+            serial_println!("(nothing to compact — empty context)");
+            return;
+        }
+        self.cancelled = false;
+        self.prefill_turn(
+            "user\n",
+            "Summarize this conversation so far in under 120 words: key facts, decisions, and open tasks. Reply with only the summary.",
+            true,
+        );
+        if self.cancelled {
+            serial_println!("\x1b[33m[cancelled]\x1b[0m");
+            return;
+        }
+        let summary = self.generate_assistant("\x1b[1;36msummary:\x1b[0m ");
+        let before = self.pos;
+        self.kv = self.model.new_cache();
+        self.state = self.model.new_state();
+        self.pos = 0;
+        self.gen.clear();
+        self.prefill_turn("system\n", &agent_system_prompt(), false);
+        let s = summary.trim();
+        if !s.is_empty() && !self.cancelled {
+            self.prefill_turn("system\n", &alloc::format!("Conversation so far (compacted): {}", s), false);
+        }
+        crate::ktrace::log_fmt(format_args!("chat.compact: {} -> {} tokens", before, self.pos));
+        serial_println!("(compacted: context {} -> {} tokens)", before, self.pos);
     }
 
     /// Encode `<|im_start|>{header}{body}<|im_end|>\n` into the running context
@@ -1613,19 +1672,28 @@ impl ChatSession {
         // ktrace every inference call (project convention): one line per prefill.
         crate::ktrace::log_fmt(format_args!("chat.prefill: {} tokens at pos {}", last, self.pos));
         let mut spin = Spinner::new("thinking");
+        let mut fed = 0usize;
         for (i, &tok) in ids.iter().enumerate() {
             // Only the final token needs logits, and only when we're about to
             // decode (`prime`); otherwise this is pure context prefill.
             let want = prime && i + 1 == last;
             self.model.forward(tok, self.pos + i, &mut self.kv, &mut self.state, want);
+            fed = i + 1;
             spin.tick();
             // Cooperative scheduler: pump the UI + net stack between forwards or
             // the screen freezes while we think (see CLAUDE.md UI notes).
             ui_tick();
             crate::net::poll();
+            // The user can cancel a long prefill too (Ctrl+C / Esc). The KV
+            // holds a truncated turn; `turn` ends immediately, and the next
+            // message simply continues from here.
+            if poll_cancel() {
+                self.cancelled = true;
+                break;
+            }
         }
         spin.clear();
-        self.pos += ids.len();
+        self.pos += fed;
     }
 
     /// Decode one assistant reply from the current logits, streaming it to the
@@ -1696,8 +1764,9 @@ impl ChatSession {
                 serial_println!("\n[reached max tokens]");
                 break;
             }
-            // Non-blocking Ctrl+C (0x03) check between tokens.
-            if let Some(3) = crate::console::read_byte() {
+            // Non-blocking cancel (Ctrl+C or Esc) check between tokens.
+            if poll_cancel() {
+                self.cancelled = true;
                 serial_println!("\n[stopped]");
                 break;
             }
@@ -1872,28 +1941,42 @@ impl crate::agent::agent_loop::ToolDispatch for CommandTools {
     }
 }
 
-/// Route one typed intent through the Persona agent (used by `/do`), including
-/// the taint-gate confirmation prompt.
-fn run_intent_interactive(agent: &mut Agent, planner: &mut RulePlanner, intent: &str) {
-    let result = persona::compiled::run(agent, intent, planner);
-    if result.starts_with("refused:tainted:") {
-        // Prompt-injection defence: a destructive action justified by untrusted
-        // ingested content needs an explicit human OK — via the approval modal
-        // (keyboard or mouse), not a bare text prompt.
-        let ok = crate::modal::confirm(
-            "Destructive action \u{2014} confirm?",
-            "This action is justified by UNTRUSTED ingested content and was refused. Proceed anyway?",
-        );
-        if ok {
-            agent.set_confirm_destructive(true);
-            let confirmed = persona::compiled::run(agent, intent, planner);
-            agent.set_confirm_destructive(false);
-            serial_println!("=> {}", confirmed);
-        } else {
-            serial_println!("=> aborted (not confirmed)");
+/// `/agents` — agents are processes in Chitti OS. List the live scheduler
+/// tasks that carry agent identity (the shell agent, parked orchestrator /
+/// sub-agent capability holders), switch the shell chat to another agent's
+/// home (SOUL.md persona), or kill one.
+fn run_agents(arg: &str, chat: &mut Option<ChatSession>) {
+    let (sub, sarg) = match arg.split_once(' ') {
+        Some((s, a)) => (s, a.trim()),
+        None => (arg.trim(), ""),
+    };
+    match sub {
+        "" | "list" => {
+            let active = active_agent_id();
+            serial_println!("agents> id   name              state     (agent tasks are scheduler processes)");
+            for (id, name, state) in crate::sched::list() {
+                let marker = if id == active { " *chat" } else { "" };
+                serial_println!("agents> {:<4} {:<17} {:<9}{}", id, name, state, marker);
+            }
+            serial_println!("agents> /agents switch <id> — chat as that agent; /agents kill <id> — terminate");
         }
-    } else {
-        serial_println!("=> {}", result);
+        "switch" => match sarg.parse::<u64>() {
+            Ok(id) => {
+                ACTIVE_AGENT.store(id, core::sync::atomic::Ordering::Relaxed);
+                *chat = None; // next message rebuilds the session with the new persona
+                crate::agent::home::ensure(id, "agent");
+                serial_println!("agents> chat now runs as agent {} (SOUL: /agent/{}/SOUL.md)", id, id);
+            }
+            Err(_) => serial_println!("usage: /agents switch <id>"),
+        },
+        "kill" => match sarg.parse::<u64>() {
+            Ok(id) => match crate::sched::kill(id) {
+                Ok(()) => serial_println!("agents> task {} killed (capabilities revoked)", id),
+                Err(e) => serial_println!("agents> cannot kill {}: {}", id, e),
+            },
+            Err(_) => serial_println!("usage: /agents kill <id>"),
+        },
+        other => serial_println!("agents> unknown '{}' — usage: /agents [list|switch <id>|kill <id>]", other),
     }
 }
 
@@ -1997,9 +2080,9 @@ static HISTORY: Locked<alloc::vec::Vec<String>> = Locked::new(alloc::vec::Vec::n
 /// Top-level `/command` names, for Tab completion (canonical names only, not
 /// aliases). Keep in sync with `dispatch_system` + the interactive arms.
 const COMMANDS: &[&str] = &[
-    "agent", "bench", "cat", "clear", "close", "datetime", "disks", "do", "exit", "help", "infer", "info",
+    "agents", "bench", "cat", "clear", "close", "compact", "datetime", "disks", "exit", "help", "infer", "info",
     "install", "ktrace", "ls", "mkext4", "mkfs", "mode", "mount", "mounts", "network", "open", "perf",
-    "lspci", "onnx", "ping", "session", "shortcuts", "skills", "subagent", "think", "ui", "umount", "voice", "wifi",
+    "lspci", "onnx", "ping", "session", "shortcuts", "skills", "think", "ui", "umount", "voice", "wifi",
 ];
 
 /// `/think on|off` — toggle Qwen thinking mode (default on; streamed dim).
