@@ -919,20 +919,27 @@ impl Xhci {
                         let ctrl = report[0] & 0x11 != 0;
                         for &usage in &report[2..8] {
                             if usage != 0 && !k.prev[2..8].contains(&usage) {
-                                // Arrow keys (usage 0x4f..0x52) become the ANSI
-                                // sequences a serial terminal sends (ESC [ A/B/C/D),
-                                // so the shell decodes one encoding for every
-                                // input path (history navigation etc.).
-                                if let Some(fin) = match usage {
-                                    0x52 => Some(b'A'), // Up
-                                    0x51 => Some(b'B'), // Down
-                                    0x4f => Some(b'C'), // Right
-                                    0x50 => Some(b'D'), // Left
+                                // Arrow/nav keys become the ANSI sequences a
+                                // serial terminal sends, so the shell/editor
+                                // decode one encoding for every input path.
+                                // Ctrl+Tab = pane-focus toggle (`ESC [ T`).
+                                if let Some(seq) = match usage {
+                                    0x52 => Some(&b"[A"[..]),  // Up
+                                    0x51 => Some(&b"[B"[..]),  // Down
+                                    0x4f => Some(&b"[C"[..]),  // Right
+                                    0x50 => Some(&b"[D"[..]),  // Left
+                                    0x4a => Some(&b"[H"[..]),  // Home
+                                    0x4d => Some(&b"[F"[..]),  // End
+                                    0x4b => Some(&b"[5~"[..]), // PgUp
+                                    0x4e => Some(&b"[6~"[..]), // PgDn
+                                    0x4c => Some(&b"[3~"[..]), // Delete
+                                    0x2b if ctrl => Some(&b"[T"[..]), // Ctrl+Tab
                                     _ => None,
                                 } {
                                     self.key_push(0x1b);
-                                    self.key_push(b'[');
-                                    self.key_push(fin);
+                                    for &b in seq {
+                                        self.key_push(b);
+                                    }
                                 } else if let Some(a) = hid_to_ascii(usage, shift, ctrl) {
                                     self.key_push(a);
                                 }

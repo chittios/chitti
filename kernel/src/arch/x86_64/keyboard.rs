@@ -16,6 +16,7 @@ const DATA_PORT: u16 = 0x60;
 pub static SCANCODES_RECEIVED: AtomicU64 = AtomicU64::new(0);
 
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
+static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 static CAPS_ON: AtomicBool = AtomicBool::new(false);
 /// True when the previous scancode byte was the 0xE0 extended prefix (arrow
 /// keys, etc. arrive as `E0 <code>`).
@@ -25,14 +26,14 @@ static E0_PREFIX: AtomicBool = AtomicBool::new(false);
 // codes are the make code | 0x80 and are handled separately below.
 #[rustfmt::skip]
 static UNSHIFTED: [u8; 0x40] = [
-    0,    0,    b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'=', 0x08, b'\t',
+    0,    0x1b, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'=', 0x08, b'\t',
     b'q', b'w', b'e', b'r', b't', b'y', b'u', b'i', b'o', b'p', b'[', b']', b'\n', 0,   b'a', b's',
     b'd', b'f', b'g', b'h', b'j', b'k', b'l', b';', b'\'', b'`', 0,   b'\\', b'z', b'x', b'c', b'v',
     b'b', b'n', b'm', b',', b'.', b'/', 0,    b'*', 0,    b' ', 0,    0,    0,    0,    0,    0,
 ];
 #[rustfmt::skip]
 static SHIFTED: [u8; 0x40] = [
-    0,    0,    b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'_', b'+', 0x08, b'\t',
+    0,    0x1b, b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'_', b'+', 0x08, b'\t',
     b'Q', b'W', b'E', b'R', b'T', b'Y', b'U', b'I', b'O', b'P', b'{', b'}', b'\n', 0,   b'A', b'S',
     b'D', b'F', b'G', b'H', b'J', b'K', b'L', b':', b'"',  b'~', 0,   b'|',  b'Z', b'X', b'C', b'V',
     b'B', b'N', b'M', b'<', b'>', b'?', 0,    b'*', 0,    b' ', 0,    0,    0,    0,    0,    0,
@@ -64,6 +65,10 @@ fn decode(scancode: u8) -> Option<u8> {
     } else {
         base
     };
+    // Ctrl+letter -> control code (Ctrl+C=3, Ctrl+D=4 reach the shell).
+    if CTRL_DOWN.load(Ordering::Relaxed) && ch.is_ascii_alphabetic() {
+        return Some(ch.to_ascii_uppercase() & 0x1f);
+    }
     Some(ch)
 }
 
@@ -120,18 +125,32 @@ extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
         return;
     }
     if E0_PREFIX.swap(false, Ordering::Relaxed) {
-        if let Some(fin) = match scancode {
-            0x48 => Some(b'A'), // Up
-            0x50 => Some(b'B'), // Down
-            0x4d => Some(b'C'), // Right
-            0x4b => Some(b'D'), // Left
-            _ => None,
-        } {
-            KEYS.with(|r| {
-                r.push(0x1b);
-                r.push(b'[');
-                r.push(fin);
-            });
+        match scancode {
+            0x1d => CTRL_DOWN.store(true, Ordering::Relaxed), // right Ctrl make
+            0x9d => CTRL_DOWN.store(false, Ordering::Relaxed), // right Ctrl break
+            _ => {
+                // Nav keys become the ANSI sequences a serial terminal sends,
+                // so the shell/editor decode one encoding for every input path.
+                if let Some(seq) = match scancode {
+                    0x48 => Some(&b"[A"[..]),  // Up
+                    0x50 => Some(&b"[B"[..]),  // Down
+                    0x4d => Some(&b"[C"[..]),  // Right
+                    0x4b => Some(&b"[D"[..]),  // Left
+                    0x47 => Some(&b"[H"[..]),  // Home
+                    0x4f => Some(&b"[F"[..]),  // End
+                    0x49 => Some(&b"[5~"[..]), // PgUp
+                    0x51 => Some(&b"[6~"[..]), // PgDn
+                    0x53 => Some(&b"[3~"[..]), // Delete
+                    _ => None,
+                } {
+                    KEYS.with(|r| {
+                        r.push(0x1b);
+                        for &b in seq {
+                            r.push(b);
+                        }
+                    });
+                }
+            }
         }
         pic::send_eoi(1);
         return;
@@ -141,9 +160,17 @@ extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
         SC_LSHIFT | SC_RSHIFT => SHIFT_DOWN.store(true, Ordering::Relaxed),
         // Shift release (make code | 0x80).
         0xaa | 0xb6 => SHIFT_DOWN.store(false, Ordering::Relaxed),
+        0x1d => CTRL_DOWN.store(true, Ordering::Relaxed),
+        0x9d => CTRL_DOWN.store(false, Ordering::Relaxed),
         SC_CAPS => {
             CAPS_ON.fetch_xor(true, Ordering::Relaxed);
         }
+        // Ctrl+Tab: pane-focus toggle, encoded as the private CSI `ESC [ T`.
+        0x0f if CTRL_DOWN.load(Ordering::Relaxed) => KEYS.with(|r| {
+            r.push(0x1b);
+            r.push(b'[');
+            r.push(b'T');
+        }),
         _ if scancode < 0x80 => {
             if let Some(ch) = decode(scancode) {
                 KEYS.with(|r| r.push(ch));

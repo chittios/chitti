@@ -52,8 +52,9 @@ pub fn rtc_unix() -> Option<u64> {
 }
 
 /// Poll every present mouse transport, feeding motion/buttons into
-/// [`crate::mouse`]. aarch64: virtio pointer + USB (xHCI/HID). x86: USB
-/// (xHCI/HID). Cheap; called from the UI idle loops via `mouse::tick`.
+/// [`crate::mouse`]. aarch64: virtio pointer + PL050 PS/2 + USB (xHCI/HID).
+/// x86: i8042 PS/2 aux + USB (xHCI/HID). Cheap; called from the UI idle
+/// loops via `mouse::tick`.
 #[cfg(target_arch = "aarch64")]
 pub fn mouse_poll() {
     aarch64::virtio_pointer::poll();
@@ -63,6 +64,7 @@ pub fn mouse_poll() {
 
 #[cfg(target_arch = "x86_64")]
 pub fn mouse_poll() {
+    x86_64::i8042::poll_mouse();
     x86_64::xhci::poll_mouse();
 }
 

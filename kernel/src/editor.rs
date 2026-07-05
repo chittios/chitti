@@ -72,6 +72,31 @@ pub fn open(path: &str) -> bool {
     ed.render();
     while !ed.quit {
         match crate::console::read_byte() {
+            // Esc is ambiguous over a byte stream: a bare Esc key, or the
+            // start of an ANSI CSI sequence (arrow/nav keys — all keyboard
+            // drivers emit terminal encodings). Coalesce like the shell's
+            // line editor does, so arrows move the cursor instead of Esc+'['
+            // +'A' dropping the editor to Normal mode and inserting garbage.
+            Some(0x1b) => {
+                if seq_byte() == Some(b'[') {
+                    let mut param: u64 = 0;
+                    let fin = loop {
+                        match seq_byte() {
+                            Some(b @ 0x40..=0x7e) => break Some(b),
+                            Some(d @ b'0'..=b'9') => param = param.saturating_mul(10) + (d - b'0') as u64,
+                            Some(_) => {}
+                            None => break None,
+                        }
+                    };
+                    if let Some(f) = fin {
+                        ed.nav(f, param);
+                    }
+                } else {
+                    ed.handle(0x1b); // a real Esc keypress
+                }
+                ed.render();
+                crate::framebuffer::cursor_move_here();
+            }
             Some(b) => {
                 ed.handle(b);
                 ed.render();
@@ -86,6 +111,18 @@ pub fn open(path: &str) -> bool {
     }
     crate::framebuffer::editor_leave();
     ed.saved
+}
+
+/// After an Esc, wait briefly for the rest of an ANSI sequence (multi-byte
+/// arrow keys may still be in flight over serial). Bounded, like the shell's.
+fn seq_byte() -> Option<u8> {
+    for _ in 0..2000 {
+        if let Some(b) = crate::console::read_byte() {
+            return Some(b);
+        }
+        crate::sched::yield_now();
+    }
+    None
 }
 
 impl Editor {
@@ -106,6 +143,48 @@ impl Editor {
             Mode::Insert => self.insert(b),
             Mode::Command => self.command(b),
             Mode::Visual => self.visual(b),
+        }
+    }
+
+    /// Navigation from decoded ANSI sequences (arrow/Home/End/PgUp/PgDn/Del),
+    /// valid in **every** mode — arrows must move the cursor mid-insert too.
+    fn nav(&mut self, fin: u8, param: u64) {
+        match fin {
+            b'A' => self.move_cursor(b'k'),
+            b'B' => self.move_cursor(b'j'),
+            b'D' => self.move_cursor(b'h'),
+            b'C' => {
+                // In insert mode the cursor may sit one past the last char.
+                let max = if self.mode == Mode::Insert { self.line_len() } else { self.line_len().saturating_sub(1) };
+                if self.cx < max {
+                    self.cx += 1;
+                }
+            }
+            b'H' => self.cx = 0,
+            b'F' => self.cx = if self.mode == Mode::Insert { self.line_len() } else { self.line_len().saturating_sub(1) },
+            b'~' => match param {
+                1 | 7 => self.cx = 0,
+                4 | 8 => self.cx = self.line_len(),
+                3 => {
+                    // Delete key: remove the char under the cursor.
+                    if self.cx < self.line_len() {
+                        self.lines[self.cy].remove(self.cx);
+                        self.dirty = true;
+                    }
+                }
+                5 | 6 => {
+                    // Page up/down by a viewport height.
+                    let page = self.rows.saturating_sub(1).max(1);
+                    if param == 5 {
+                        self.cy = self.cy.saturating_sub(page);
+                    } else {
+                        self.cy = (self.cy + page).min(self.lines.len() - 1);
+                    }
+                    self.clamp_normal();
+                }
+                _ => {}
+            },
+            _ => {}
         }
     }
 
