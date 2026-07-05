@@ -2036,10 +2036,6 @@ fn run_model(
             }
             let cfg = match (url, remote_cfg.as_ref()) {
                 (Some(u), _) => {
-                    if u.starts_with("https://") {
-                        serial_println!("model> https is not supported (no in-kernel TLS) — use http:// on the host/LAN");
-                        return;
-                    }
                     remote::RemoteConfig {
                         url: u.trim_end_matches('/').to_string(),
                         model: name.unwrap_or("default").to_string(),

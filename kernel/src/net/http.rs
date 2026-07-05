@@ -32,25 +32,29 @@ impl Response {
     }
 }
 
-/// Split `http://host[:port]/path` into `(host, port, path)`. Rejects
-/// `https://` with a pointed error (no in-kernel TLS).
-fn parse_url(url: &str) -> Result<(String, u16, String), String> {
-    if url.starts_with("https://") {
-        return Err("https is not supported (no in-kernel TLS) — use a plain http:// LAN endpoint".into());
-    }
-    let rest = url.strip_prefix("http://").ok_or("URL must start with http://")?;
+/// Split `http[s]://host[:port]/path` into `(tls, host, port, path)`. `https`
+/// tunnels through [`super::tls`]; `http` is plaintext. Default port follows
+/// the scheme (80 / 443).
+fn parse_url(url: &str) -> Result<(bool, String, u16, String), String> {
+    let (tls, rest, default_port) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r, 443u16)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r, 80u16)
+    } else {
+        return Err("URL must start with http:// or https://".into());
+    };
     let (hostport, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
     let (host, port) = match hostport.rsplit_once(':') {
         Some((h, p)) => (h, p.parse::<u16>().map_err(|_| "bad port")?),
-        None => (hostport, 80),
+        None => (hostport, default_port),
     };
     if host.is_empty() {
         return Err("empty host".into());
     }
-    Ok((host.to_string(), port, path.to_string()))
+    Ok((tls, host.to_string(), port, path.to_string()))
 }
 
 /// `host` as an IPv4 literal, or resolved via DNS.
@@ -83,7 +87,7 @@ fn host_ip(host: &str) -> Result<Ipv4Address, String> {
 /// the whole exchange (a hosted LLM can legitimately take a minute to answer,
 /// so callers pass a generous budget).
 pub fn request(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8], timeout_ms: u64) -> Result<Response, String> {
-    let (host, port, path) = parse_url(url)?;
+    let (tls, host, port, path) = parse_url(url)?;
     let ip = host_ip(&host)?;
     let deadline = crate::arch::now_ms() + timeout_ms;
 
@@ -99,8 +103,25 @@ pub fn request(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8], t
     let mut wire = req.into_bytes();
     wire.extend_from_slice(body);
 
-    // A dedicated TCP socket for this request. 64 KiB rx: a chat completion
-    // JSON is a few KB, but generous buffers keep the window open.
+    let handle = tcp_connect(ip, port, deadline)?;
+    // Drive the exchange to completion; always remove the socket on exit.
+    let result = if tls {
+        exchange_tls(handle, &host, &wire, deadline)
+    } else {
+        drive(handle, &wire, deadline)
+    };
+    NET.with(|n| {
+        if let Some(s) = n.as_mut() {
+            s.sockets.remove(handle);
+        }
+    });
+    parse_response(&result?)
+}
+
+/// Open a TCP socket to `ip:port` and wait for the connection to establish
+/// (bounded by `deadline`). Returns the socket handle (caller removes it).
+fn tcp_connect(ip: Ipv4Address, port: u16, deadline: u64) -> Result<smoltcp::iface::SocketHandle, String> {
+    // 64 KiB rx keeps the window open for a large completion; 16 KiB tx.
     let handle = NET.with(|n| {
         let s = n.as_mut().ok_or("no network interface (try /network dhcp)")?;
         if s.ip.is_none() {
@@ -111,7 +132,6 @@ pub fn request(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8], t
             tcp::SocketBuffer::new(vec![0u8; 16 * 1024]),
         );
         let h = s.sockets.add(sock);
-        // Ephemeral local port from the boot clock (fine for one-shot sockets).
         let local = 49152 + (crate::arch::now_ms() % 16000) as u16;
         let cx = s.iface.context();
         s.sockets
@@ -121,16 +141,77 @@ pub fn request(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8], t
         Ok(h)
     })
     .map_err(|e: &str| e.to_string())?;
-
-    // Drive the socket to completion; always remove it from the set on exit.
-    let result = drive(handle, &wire, deadline);
-    NET.with(|n| {
-        if let Some(s) = n.as_mut() {
-            s.sockets.remove(handle);
+    // Wait for the handshake so TLS starts on an established socket.
+    loop {
+        if crate::arch::now_ms() >= deadline {
+            NET.with(|n| {
+                if let Some(s) = n.as_mut() {
+                    s.sockets.remove(handle);
+                }
+            });
+            return Err("TCP connect timeout".into());
         }
-    });
-    let raw = result?;
-    parse_response(&raw)
+        super::poll();
+        let st = NET.with(|n| n.as_mut().map(|s| s.sockets.get_mut::<tcp::Socket>(handle).state()));
+        match st {
+            Some(tcp::State::Established) => return Ok(handle),
+            Some(tcp::State::Closed) => return Err("connection refused".into()),
+            _ => {}
+        }
+        crate::shell::upkeep();
+        crate::sched::yield_now();
+    }
+}
+
+/// TLS path: handshake over the connected socket, send `wire`, read the
+/// response to completion (Content-Length / chunked / close).
+fn exchange_tls(handle: smoltcp::iface::SocketHandle, host: &str, wire: &[u8], deadline: u64) -> Result<Vec<u8>, String> {
+    let stream = super::tls::TcpStream { handle, deadline };
+    let mut sess = super::tls::handshake(stream, host)?;
+    sess.write_all(wire)?;
+    let mut raw: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        if crate::arch::now_ms() >= deadline {
+            return Err("HTTPS timeout".into());
+        }
+        let k = sess.read(&mut buf);
+        if k == 0 {
+            return Ok(raw); // TLS close / EOF
+        }
+        raw.extend_from_slice(&buf[..k]);
+        if response_complete(&raw) {
+            return Ok(raw);
+        }
+    }
+}
+
+/// True once `raw` holds a complete HTTP response: header terminator present
+/// and either the full Content-Length body, the chunked terminator, or (no
+/// length given) we defer to EOF by returning false.
+fn response_complete(raw: &[u8]) -> bool {
+    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = match core::str::from_utf8(&raw[..split]) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let body_len = raw.len() - (split + 4);
+    for l in head.split("\r\n") {
+        if let Some((k, v)) = l.split_once(':') {
+            let k = k.trim().to_ascii_lowercase();
+            if k == "content-length" {
+                if let Ok(n) = v.trim().parse::<usize>() {
+                    return body_len >= n;
+                }
+            }
+            if k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked") {
+                return raw.ends_with(b"0\r\n\r\n");
+            }
+        }
+    }
+    false
 }
 
 /// Poll the stack until `wire` is sent and the peer's response is fully read

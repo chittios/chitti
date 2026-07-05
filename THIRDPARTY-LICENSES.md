@@ -32,3 +32,23 @@ WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
 AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
 OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
+
+---
+
+## embedded-tls + RustCrypto — crates.io (TLS 1.3 client)
+
+`https://` support ([`net/tls.rs`](kernel/src/net/tls.rs)) is built on
+[`embedded-tls`](https://github.com/drogue-iot/embedded-tls) (a `no_std`,
+allocator-optional TLS 1.3 client) driven in blocking mode over an
+`embedded-io` adapter around the smoltcp TCP socket. Its cryptography comes
+from the pure-Rust [RustCrypto](https://github.com/RustCrypto) crates it depends
+on — `aes-gcm`, `sha2`, `hkdf`, `hmac`, `p256`, `digest` — plus `rand_core` /
+`rand_chacha` for the handshake CSPRNG. All resolve from crates.io (no C or
+assembly, so they build under the kernel's custom `build-std` targets).
+
+- **embedded-tls**, **embedded-io**: Apache-2.0.
+- **RustCrypto** crates (aes-gcm, sha2, hkdf, hmac, p256, digest, …),
+  **rand_core**, **rand_chacha**: dual-licensed **MIT OR Apache-2.0**.
+
+Full license texts ship in each crate's source under
+`~/.cargo/registry/` and in the respective upstream repositories.
