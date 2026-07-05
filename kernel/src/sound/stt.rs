@@ -18,6 +18,11 @@ use alloc::vec::Vec;
 /// CTC blank id for this model = last vocab index (1024; vocab 1025).
 pub const BLANK: usize = 1024;
 
+/// Parakeet's SentencePiece vocab (`<piece> <id>` per line). Only ~10 KB, so it
+/// is embedded rather than loaded from disk — the CTC decode always has its
+/// id→text table the moment the (large, on-disk) acoustic model is present.
+static TOKENS: &str = include_str!("testdata/parakeet_tokens.txt");
+
 /// Parse a sherpa/NeMo `tokens.txt` (`<piece> <id>` per line) into an
 /// id-indexed table. SentencePiece word-boundary marker `▁` (U+2581) becomes a
 /// leading space at join time.
@@ -89,11 +94,7 @@ pub fn transcribe(pcm: &[i16]) -> String {
             );
         }
     };
-    // Load the parakeet tokens (bundled next to the model on the data partition).
-    let toks_txt = crate::synapse::fs::read("/voice/parakeet_tokens.txt")
-        .or_else(|| crate::synapse::fs::read("/mnt/parakeet_tokens.txt"))
-        .map(|b| alloc::string::String::from_utf8_lossy(&b).into_owned());
-    let tokens = toks_txt.as_deref().map(parse_tokens);
+    let tokens = parse_tokens(TOKENS);
 
     let model = match crate::onnx::parse(bytes) {
         Some(m) => m,
@@ -123,10 +124,8 @@ pub fn transcribe(pcm: &[i16]) -> String {
     }
     let tprime = lp.f.len() / vocab;
     let rows: alloc::vec::Vec<alloc::vec::Vec<f32>> = (0..tprime).map(|t| lp.f[t * vocab..(t + 1) * vocab].to_vec()).collect();
-    match tokens {
-        Some(tk) => ctc_greedy(&rows, &tk),
-        None => alloc::format!("(decoded {tprime} frames; load /voice/parakeet_tokens.txt for text)"),
-    }
+    crate::ktrace::log_fmt(format_args!("stt: decoded {tprime} conformer frames (vocab {vocab})"));
+    ctc_greedy(&rows, &tokens)
 }
 
 #[cfg(test)]
