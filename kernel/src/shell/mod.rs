@@ -116,6 +116,24 @@ pub fn run() -> ! {
     let mut orch = orchestrator::Orchestrator::spawn(amanifest::orchestrator_manifest(), 42);
     let mut router = orch.router();
     // Chat session (model + tokenizer + KV cache), loaded lazily on first chat.
+    // Boot-time model-region probe: FNV-1a of the first 4 MiB + how long the
+    // read took. One line of serial diagnoses both a corrupt load (hash
+    // mismatch vs the host file) and an uncached/slow mapping (time ≫ ms).
+    if let Some(m) = crate::cortex::model_module() {
+        let n = m.len().min(4 << 20);
+        let t0 = crate::arch::now_ms();
+        let mut h = 0xcbf29ce484222325u64;
+        for &b in &m[..n] {
+            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+        crate::ktrace::log_fmt(format_args!(
+            "cortex: model probe: len {} first {} bytes fnv1a {:#018x} in {} ms",
+            m.len(),
+            n,
+            h,
+            crate::arch::now_ms().saturating_sub(t0)
+        ));
+    }
     let mut chat: Option<ChatSession> = None;
     let mut line = String::new();
 
@@ -276,6 +294,20 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "infer" => run_infer(),
         "bench" => run_bench(),
         "perf" => run_perf(),
+        "modelhash" => {
+            // Integrity probe for the bundled model region (diagnoses a corrupt
+            // load on the various boot paths): FNV-1a over the mapped bytes.
+            match crate::cortex::model_module() {
+                Some(m) => {
+                    let mut h = 0xcbf29ce484222325u64;
+                    for &b in m.iter() {
+                        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+                    }
+                    serial_println!("modelhash> len {} fnv1a {:#018x}", m.len(), h);
+                }
+                None => serial_println!("modelhash> no model"),
+            }
+        }
         "datetime" | "date" => run_datetime(arg),
         "ui" => run_ui(arg),
         "shortcuts" | "keys" => run_shortcuts(),
