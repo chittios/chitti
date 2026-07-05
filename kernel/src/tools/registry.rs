@@ -106,7 +106,6 @@ fn shell_commands() -> Vec<ToolDef> {
         ToolDef::shell("bench", "Benchmark the matvec kernel throughput.", false),
         ToolDef::shell("perf", "Benchmark end-to-end prefill/decode tokens-per-second.", false),
         ToolDef::shell("infer", "Run the reference-inference parity check.", false),
-        ToolDef::shell("mkfs", "Format a disk with SimpleFS. DESTRUCTIVE. args: '<disk> yes'.", true),
         ToolDef::shell("mkext4", "Format a disk with ext4. DESTRUCTIVE. args: '<disk> yes'.", true),
         ToolDef::shell("install", "Install Chitti to a disk (GPT: ESP + ext4). DESTRUCTIVE. args: '[<disk>] yes'.", true),
     ]

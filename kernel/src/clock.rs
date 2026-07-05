@@ -46,10 +46,22 @@ pub fn init() {
 
 /// Current UTC Unix timestamp (seconds).
 pub fn now_unix() -> i64 {
+    now_unix_ms() / 1000
+}
+
+/// Current UTC Unix timestamp in **milliseconds**.
+pub fn now_unix_ms() -> i64 {
     CLOCK.with(|c| {
-        let elapsed = crate::arch::now_ms().saturating_sub(c.base_ms) as i64 / 1000;
-        c.base_unix + elapsed
+        let elapsed = crate::arch::now_ms().saturating_sub(c.base_ms) as i64;
+        c.base_unix * 1000 + elapsed
     })
+}
+
+/// The current local `(hour, min, sec, millis)` — the ktrace timestamp.
+pub fn local_hms_ms() -> (i64, i64, i64, i64) {
+    let ms = now_unix_ms() + tz_offset() as i64 * 1000;
+    let (.., h, mi, s, _) = civil_from_unix(ms.div_euclid(1000));
+    (h, mi, s, ms.rem_euclid(1000))
 }
 
 /// The configured timezone offset from UTC, in seconds.
@@ -58,9 +70,22 @@ pub fn tz_offset() -> i32 {
 }
 
 /// Set the timezone offset (seconds east of UTC). Persisted by the caller into
-/// the UI config so it survives a reboot.
+/// the UI config so it survives a reboot. Used at boot (applying the persisted
+/// offset to the RTC-seeded UTC base) — display shifts by the offset.
 pub fn set_tz(offset_secs: i32) {
     CLOCK.with(|c| c.tz_offset = offset_secs);
+}
+
+/// Change the timezone **without changing the wall time shown** — the
+/// `/datetime tz` semantics. The user set the displayed local time earlier
+/// (or trusts what the clock shows); relabeling the zone must not jump the
+/// clock, so the UTC base shifts by the offset delta instead.
+pub fn set_tz_keep_local(offset_secs: i32) {
+    CLOCK.with(|c| {
+        let delta = c.tz_offset as i64 - offset_secs as i64; // old - new
+        c.base_unix += delta;
+        c.tz_offset = offset_secs;
+    });
 }
 
 /// Set the current UTC time to `unix` seconds (rebasing against `now_ms`).

@@ -37,7 +37,9 @@ fn key_encode(key: &str) -> String {
     out
 }
 
-fn key_decode(name: &str) -> String {
+/// Decode a store-encoded ext4 dir-entry name back to its synapse key
+/// (`%2F` -> `/`, `%25` -> `%`). Public so `/ls` can display store keys.
+pub fn key_decode(name: &str) -> String {
     let b = name.as_bytes();
     let mut out = String::with_capacity(name.len());
     let mut i = 0;

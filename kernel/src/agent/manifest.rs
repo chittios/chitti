@@ -65,7 +65,6 @@ pub fn orchestrator_manifest() -> AgentManifest {
             "bench".into(),
             "perf".into(),
             "infer".into(),
-            "mkfs".into(),
             "mkext4".into(),
             "install".into(),
         ],

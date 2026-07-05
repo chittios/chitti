@@ -1,12 +1,12 @@
 //! virtio-blk over the **legacy PCI transport** (`CHITTI_OS_HANDOFF.md`
 //! Phase 7): a real, reboot-persistent disk. This is the block device the
-//! boot path mounts SimpleFS on when QEMU is started with a virtio-blk drive
+//! boot path mounts filesystems on when QEMU is started with a virtio-blk drive
 //! (`disable-modern=on` selects the legacy I/O interface this driver speaks).
 //!
 //! The driver is deliberately synchronous and **polled** (no interrupt): one
 //! request in flight at a time, wait on the used ring, return. That is plenty
 //! for a boot-time filesystem and keeps the code small and auditable. It
-//! covers exactly what SimpleFS needs -- read one sector, write one sector.
+//! covers exactly what a filesystem needs -- read one sector, write one sector.
 //!
 //! DMA note: the virtqueue and the request buffers must be physically
 //! contiguous and are handed to the device *by physical address*
