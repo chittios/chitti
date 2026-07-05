@@ -1,0 +1,14 @@
+[package]
+name = "onnxdiff"
+version = "0.1.0"
+edition = "2021"
+
+# Host-side calibration harness: mounts the kernel's own `onnx` interpreter
+# (kernel/src/onnx) natively via #[path] so it can be diffed layer-by-layer
+# against an onnxruntime reference without QEMU round-trips. Standalone crate
+# (not a workspace member), like kernel/.
+
+[workspace]
+
+[profile.release]
+debug = true

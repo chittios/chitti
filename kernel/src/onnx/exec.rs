@@ -13,6 +13,35 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
+/// Per-node trace for numeric calibration: when enabled, every node execution
+/// prints `NODE <op> '<output>' dims=[..] n=<len> maxabs= mean= v[..4]=` via
+/// `serial_println!`. The host-side `onnxdiff` harness (which mounts this module
+/// natively and maps `serial_println!` to stdout) flips this to diff the
+/// interpreter layer-by-layer against an onnxruntime reference. Off by default —
+/// tracing every node of a 3000-node model over serial would swamp the kernel.
+pub static NODE_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn trace_node(op: &str, name: &str, v: &Val) {
+    if !NODE_TRACE.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut maxabs = 0f32;
+    let mut sum = 0f64;
+    for &x in &v.f {
+        let a = if x < 0.0 { -x } else { x };
+        if a > maxabs || a.is_nan() {
+            maxabs = a;
+        }
+        sum += x as f64;
+    }
+    let mean = if v.f.is_empty() { 0.0 } else { sum / v.f.len() as f64 };
+    let k = v.f.len().min(4);
+    crate::serial_println!(
+        "NODE {} '{}' dims={:?} n={} maxabs={:.6} mean={:.6} v={:?}",
+        op, name, v.dims, v.f.len(), maxabs, mean, &v.f[..k]
+    );
+}
+
 /// A runtime value: dims + f32 data, with optional exact i64 view (shape math).
 #[derive(Clone)]
 pub struct Val {
@@ -63,15 +92,22 @@ fn tensor_to_val(t: &Tensor<'_>) -> Val {
             Val::new(dims, f)
         }
         2 | 3 => {
-            // uint8 / int8 (quantized weights): 1 byte/elem → f32. int8 is signed.
+            // uint8 / int8 (quantized weights): 1 byte/elem → f32. int8 is
+            // signed. Small tensors (zero_points) may come via `int32_data`
+            // (`t.ints`) instead of raw bytes.
             let signed = t.dtype == 3;
-            let mut f = Vec::with_capacity(t.raw.len());
-            let mut iv = Vec::with_capacity(t.raw.len());
-            for &b in t.raw {
-                let v = if signed { b as i8 as i64 } else { b as i64 };
-                f.push(v as f32);
-                iv.push(v);
-            }
+            let (f, iv): (Vec<f32>, Vec<i64>) = if !t.raw.is_empty() {
+                let mut f = Vec::with_capacity(t.raw.len());
+                let mut iv = Vec::with_capacity(t.raw.len());
+                for &b in t.raw {
+                    let v = if signed { b as i8 as i64 } else { b as i64 };
+                    f.push(v as f32);
+                    iv.push(v);
+                }
+                (f, iv)
+            } else {
+                (t.ints.iter().map(|&v| v as f32).collect(), t.ints.clone())
+            };
             Val { dims, f, i: Some(iv), seq: None }
         }
         6 => {
@@ -219,7 +255,20 @@ fn powf(a: f32, b: f32) -> f32 {
     if b == 2.0 {
         return a * a;
     }
-    if a <= 0.0 {
+    if b == 3.0 {
+        return a * a * a; // GELU's x^3 — exact, sign-correct
+    }
+    if a < 0.0 {
+        // Negative base is defined for integer exponents: |a|^b with the sign
+        // from the exponent's parity. (A truncated "return 0" here zeroed the
+        // negative half of BERT's GELU x^3 and skewed everything after it.)
+        if b == floorf(b) {
+            let m = expf(b * logf(-a));
+            return if (b as i64) & 1 == 0 { m } else { -m };
+        }
+        return f32::NAN;
+    }
+    if a == 0.0 {
         return if b == 0.0 { 1.0 } else { 0.0 };
     }
     expf(b * logf(a))
@@ -477,11 +526,16 @@ fn conv2d(x: &Val, w: &Val, bias: Option<&Val>, node: &super::Node<'_>, xzp: f32
     Val::new(vec![nb, m, oh, ow], out)
 }
 
-/// 1-D transposed convolution (upsampling), enough for the TTS vocoder path.
+/// 1-D transposed convolution (upsampling), grouped/depthwise included —
+/// the TTS vocoder upsamples with plain ConvTranspose and pools F0/N curves
+/// with a depthwise (`group == C`) one.
 fn conv_transpose1d(x: &Val, w: &Val, bias: Option<&Val>, node: &super::Node<'_>) -> Val {
-    // x[N,C,W], w[C,M,K] (note: in-channels first for ConvTranspose).
+    // x[N,C,W], w[C,M/g,K] (note: in-channels first for ConvTranspose).
     let (nb, c, iw) = (x.dims[0], x.dims[1], x.dims[2]);
-    let (_wc, m, k) = (w.dims[0], w.dims[1], w.dims[2]);
+    let (_wc, m_per_g, k) = (w.dims[0], w.dims[1], w.dims[2]);
+    let groups = node.attrs.iter().find(|a| a.name == "group").map(|a| a.i as usize).unwrap_or(1);
+    let m = m_per_g * groups;
+    let c_per_g = c / groups.max(1);
     let strides = node.attrs.iter().find(|a| a.name == "strides").map(|a| a.ints.clone()).unwrap_or_else(|| vec![1]);
     let pads = node.attrs.iter().find(|a| a.name == "pads").map(|a| a.ints.clone()).unwrap_or_else(|| vec![0, 0]);
     let s = strides[0] as usize;
@@ -498,14 +552,16 @@ fn conv_transpose1d(x: &Val, w: &Val, bias: Option<&Val>, node: &super::Node<'_>
     }
     for n in 0..nb {
         for ic in 0..c {
+            let g = ic / c_per_g.max(1);
             for i in 0..iw {
-                for om in 0..m {
+                for mm in 0..m_per_g {
+                    let om = g * m_per_g + mm;
                     for kk in 0..k {
                         let pos = i * s + kk;
                         if pos < p0 || pos - p0 >= ow {
                             continue;
                         }
-                        out[(n * m + om) * ow + (pos - p0)] += x.f[(n * c + ic) * iw + i] * w.f[(ic * m + om) * k + kk];
+                        out[(n * m + om) * ow + (pos - p0)] += x.f[(n * c + ic) * iw + i] * w.f[(ic * m_per_g + mm) * k + kk];
                     }
                 }
             }
@@ -670,7 +726,10 @@ fn exec_loop<'t>(node: &super::Node<'t>, env: &BTreeMap<String, Val>, inits: &BT
             child.insert(name.to_string(), c.clone());
         }
         exec_graph(body, &mut child, inits)?;
-        cond = child.get(body.outputs[0]).and_then(|v| v.f.first().copied()).unwrap_or(0.0) != 0.0;
+        // A body cond output that resolves to nothing (kitten's alignment loop
+        // names one that no node anywhere produces) means "no termination
+        // condition" — a pure trip-count for-loop — so default to *true*.
+        cond = child.get(body.outputs[0]).and_then(|v| v.f.first().copied()).map(|x| x != 0.0).unwrap_or(true);
         for c in 0..n_carried {
             if let Some(v) = child.get(body.outputs[1 + c]) {
                 carried[c] = v.clone();
@@ -797,6 +856,15 @@ fn free_vars<'t>(g: &super::Graph<'t>) -> alloc::collections::BTreeSet<&'t str> 
         }
     }
     let mut free = BTreeSet::new();
+    // A graph *output* no node produces is also captured from the enclosing
+    // scope (e.g. a Loop body whose condition output is an outer constant —
+    // kitten's alignment loop does exactly this). Missing it broke both the
+    // topological order and liveness of the outer producer.
+    for o in &g.outputs {
+        if !o.is_empty() && !produced.contains(o) {
+            free.insert(*o);
+        }
+    }
     for n in &g.nodes {
         for inp in &n.inputs {
             if !inp.is_empty() && !produced.contains(inp) {
@@ -1876,14 +1944,21 @@ fn exec_graph<'t>(g: &'t Graph<'t>, env: &mut BTreeMap<String, Val>, outer_inits
                 let n = v.f.len();
                 let mut out = vec![0f32; n];
                 let normal = node.op == "RandomNormalLike";
-                for (i, o) in out.iter_mut().enumerate() {
-                    let u = rng_next(env_seed(node, i));
+                // One LCG *iterated* across all draws (seed-hopping from the
+                // element index yields correlated draws — it biased the vocoder
+                // noise source to mean ≈ -0.25 instead of 0).
+                let mut state = env_seed(node, 0);
+                let mut next_u = move || {
+                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (((state >> 8) & 0xffff) as f32 + 0.5) / 65536.0
+                };
+                for o in out.iter_mut() {
                     *o = if normal {
-                        // Box–Muller from two LCG draws.
-                        let u2 = rng_next(env_seed(node, i).wrapping_add(0x9e3779b9));
-                        sqrtf(-2.0 * logf(u.max(1e-7))) * cosf(2.0 * core::f32::consts::PI * u2)
+                        // Box–Muller from two consecutive LCG draws.
+                        let (u1, u2) = (next_u(), next_u());
+                        sqrtf(-2.0 * logf(u1)) * cosf(2.0 * core::f32::consts::PI * u2)
                     } else {
-                        u
+                        next_u()
                     };
                 }
                 vec![Val::new(v.dims.clone(), out)]
@@ -2132,6 +2207,7 @@ fn exec_graph<'t>(g: &'t Graph<'t>, env: &mut BTreeMap<String, Val>, outer_inits
         for (k, o) in node.outputs.iter().enumerate() {
             if !o.is_empty() {
                 if let Some(v) = out.get(k) {
+                    trace_node(node.op, o, v);
                     env.insert((*o).to_string(), v.clone());
                 }
             }

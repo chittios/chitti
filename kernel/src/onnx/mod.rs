@@ -283,6 +283,16 @@ fn parse_tensor(bytes: &[u8]) -> Option<Tensor<'_>> {
                 }
             }
             (4, 5) => t.floats.push(f32::from_bits(r.fixed32()?)),
+            // int32_data (field 5): used for small int8/uint8/int32 tensors —
+            // notably every quantized-weight zero_point in the voice models —
+            // when the exporter doesn't pack them into raw_data.
+            (5, 2) => {
+                let mut rr = Reader::new(r.bytes()?);
+                while !rr.eof() {
+                    t.ints.push(as_i64(rr.varint()?));
+                }
+            }
+            (5, 0) => t.ints.push(as_i64(r.varint()?)),
             (7, 2) => {
                 let mut rr = Reader::new(r.bytes()?);
                 while !rr.eof() {
