@@ -170,6 +170,9 @@ fn libm_sqrt(x: f64) -> f64 {
     r
 }
 
+pub mod mel;
+pub mod model_store;
+pub mod stt;
 pub mod vad;
 pub mod virtio_snd_pci;
 
