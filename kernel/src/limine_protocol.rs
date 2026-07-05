@@ -70,6 +70,38 @@ impl RequestsEndMarker {
     }
 }
 
+/// Ask Limine to switch to a stack of at least `stack_size` bytes before
+/// handing off to the kernel. The default (64 KiB) overflows when the ONNX
+/// interpreter's large debug stack frame runs; the voice/STT path needs more.
+#[repr(C)]
+pub struct StackSizeRequest {
+    magic: [u64; 2],
+    id: [u64; 2],
+    revision: u64,
+    response: UnsafeCell<*const u8>,
+    stack_size: u64,
+}
+
+// SAFETY: as the other requests — one bootloader write before handoff.
+unsafe impl Sync for StackSizeRequest {}
+
+impl StackSizeRequest {
+    pub const fn new(stack_size: u64) -> Self {
+        Self {
+            magic: COMMON_MAGIC,
+            id: [0x224ef0460a8e8926, 0xe1cb0fc25f46ded2],
+            revision: 0,
+            response: UnsafeCell::new(core::ptr::null()),
+            stack_size,
+        }
+    }
+    /// True if Limine acknowledged the request (switched to the larger stack).
+    pub fn honored(&self) -> bool {
+        // SAFETY: single bootloader write before handoff.
+        !unsafe { self.response.get().read_volatile() }.is_null()
+    }
+}
+
 /// Request that Limine hand back a framebuffer.
 #[repr(C)]
 pub struct FramebufferRequest {

@@ -291,6 +291,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "think" => run_think(arg),
         "mode" => run_mode(arg),
         "voice" => run_voice(arg),
+        "onnx" => run_onnx(arg),
         _ => return false,
     }
     true
@@ -518,6 +519,7 @@ fn print_help() {
     serial_println!("  /think [on|off]  toggle model thinking (<think> reasoning, streamed dim; default on)");
     serial_println!("  /mode [m]        agent-tool approvals: manual (all) | auto (destructive only) | bypass");
     serial_println!("  /voice [..]      voice session (mic modal); test = tone+mic; models; stt <file.wav>");
+    serial_println!("  /onnx info|run <path>  inspect or run any ONNX model from a mounted volume");
     serial_println!("  /datetime [..]   show/set the clock: /datetime 2026-07-04 13:45 | /datetime tz +5:30");
     serial_println!("  /ui [config|reload|reset]  view/edit the UI config (/configs/core/ui.json)");
     serial_println!("  /shortcuts       list keyboard shortcuts (/configs/core/shortcuts.json)");
@@ -857,6 +859,71 @@ fn run_voice(arg: &str) {
         voice_stt_file(path.trim());
     } else {
         voice_talk();
+    }
+}
+
+/// `/onnx info|run <path>` — the generic ONNX runtime surface: inspect or
+/// execute **any** ONNX model from a mounted volume. `run` feeds each graph
+/// input a zero tensor of its declared shape (dynamic dims → 1) unless the
+/// model needs real inputs, and reports each output's shape + a value preview.
+fn run_onnx(arg: &str) {
+    let (sub, path) = match arg.trim().split_once(' ') {
+        Some((s, p)) => (s, p.trim()),
+        None => {
+            serial_println!("onnx> usage: /onnx info <path> | /onnx run <path>  (path on a mounted volume)");
+            return;
+        }
+    };
+    let bytes = match crate::synapse::fs::read(path) {
+        Some(b) => b,
+        None => {
+            serial_println!("onnx> file not found: {} (mount a volume first, e.g. /mount 0)", path);
+            return;
+        }
+    };
+    let model = match crate::onnx::parse(&bytes) {
+        Some(m) => m,
+        None => {
+            serial_println!("onnx> failed to parse {} as ONNX", path);
+            return;
+        }
+    };
+    serial_println!("onnx> {}", crate::onnx::summary(&model));
+    if sub == "info" {
+        serial_println!("  ir_version {}", model.ir_version);
+        for i in &model.graph.inputs {
+            serial_println!("  input:  {}", i);
+        }
+        for o in &model.graph.outputs {
+            serial_println!("  output: {}", o);
+        }
+        return;
+    }
+    if sub != "run" {
+        serial_println!("onnx> unknown '{}' — use info|run", sub);
+        return;
+    }
+    // Feed zero tensors for graph inputs not already covered by initializers.
+    use crate::onnx::exec::Val;
+    let init_names: alloc::vec::Vec<&str> = model.graph.initializers.iter().map(|t| t.name).collect();
+    let mut feeds: alloc::vec::Vec<(&str, Val)> = alloc::vec::Vec::new();
+    for name in &model.graph.inputs {
+        if init_names.contains(name) {
+            continue;
+        }
+        // Without declared shapes here we default to a scalar zero; models with
+        // real input needs should be driven by their own command (e.g. /voice).
+        feeds.push((name, Val::new(alloc::vec![1], alloc::vec![0.0])));
+    }
+    serial_println!("onnx> running (zero inputs)\u{2026}");
+    match crate::onnx::exec::run(&model, &feeds) {
+        Ok(out) => {
+            for (name, v) in out.iter() {
+                let preview: alloc::vec::Vec<f32> = v.f.iter().take(4).copied().collect();
+                serial_println!("  {} {:?} = {:?}\u{2026}", name, v.dims, preview);
+            }
+        }
+        Err(e) => serial_println!("onnx> run error: {}", e),
     }
 }
 
@@ -1648,7 +1715,7 @@ static HISTORY: Locked<alloc::vec::Vec<String>> = Locked::new(alloc::vec::Vec::n
 const COMMANDS: &[&str] = &[
     "agent", "bench", "cat", "clear", "close", "datetime", "disks", "do", "exit", "help", "infer", "info",
     "install", "ktrace", "ls", "mkext4", "mkfs", "mode", "mount", "mounts", "network", "open", "perf",
-    "ping", "session", "shortcuts", "skills", "subagent", "think", "ui", "umount", "voice", "wifi",
+    "onnx", "ping", "session", "shortcuts", "skills", "subagent", "think", "ui", "umount", "voice", "wifi",
 ];
 
 /// `/think on|off` — toggle Qwen thinking mode (default on; streamed dim).

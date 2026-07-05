@@ -67,7 +67,13 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// before `on_timer_tick` forces a switch.
 const TIME_SLICE_TICKS: u64 = 5;
 
-const STACK_SIZE: usize = 64 * 1024;
+// 256 KiB per task. The ONNX executor's op dispatch (`onnx::exec::exec_graph`)
+// is one function with a ~55-arm match, whose *debug* stack frame alone runs
+// ~64 KiB (no stack-slot coalescing); a deep model graph plus a couple levels
+// of If/Loop subgraph recursion overflowed the old 64 KiB stack (a silent
+// triple fault). 256 KiB gives the interpreter — and the LLM forward — comfortable
+// headroom; release frames are far smaller.
+const STACK_SIZE: usize = 256 * 1024;
 
 /// Bring up the scheduler, wrapping whatever's currently executing
 /// (`chitti_kernel::init`'s caller) as task 0 ("bootstrap"). Must run

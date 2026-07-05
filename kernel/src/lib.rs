@@ -100,6 +100,14 @@ pub static BASE_REVISION: limine_protocol::BaseRevision = limine_protocol::BaseR
 pub static FRAMEBUFFER_REQUEST: limine_protocol::FramebufferRequest =
     limine_protocol::FramebufferRequest::new();
 
+/// Ask Limine for a 2 MiB boot stack (default is 64 KiB): the ONNX interpreter's
+/// large debug stack frame + subgraph recursion needs the headroom.
+#[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
+#[used]
+#[link_section = ".requests"]
+pub static STACK_SIZE_REQUEST: limine_protocol::StackSizeRequest =
+    limine_protocol::StackSizeRequest::new(2 * 1024 * 1024);
+
 #[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
 #[used]
 #[link_section = ".requests"]
@@ -245,6 +253,30 @@ pub extern "C" fn _start() -> ! {
     arch::x86_64::fpu::enable_sse();
     serial::init();
     init();
+    // Run the suite on a large heap stack. Limine's default 64 KiB boot stack
+    // overflows on the ONNX interpreter's big debug stack frame (and the stack
+    // size request isn't honored by the bundled Limine); the real kernel runs
+    // inference on 256 KiB scheduler-task stacks. 8 MiB is ample headroom.
+    const TEST_STACK: usize = 8 * 1024 * 1024;
+    let stack = alloc::vec![0u8; TEST_STACK].into_boxed_slice();
+    let top = (stack.as_ptr() as u64 + TEST_STACK as u64) & !0xf;
+    core::mem::forget(stack); // leaked for the rest of the run
+    // SAFETY: switch RSP to the fresh stack top, then call the test harness
+    // main (which exits QEMU when done and never returns).
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {top}",
+            "call {f}",
+            top = in(reg) top,
+            f = sym test_main_trampoline,
+            options(noreturn),
+        );
+    }
+}
+
+/// Wrapper so the `test_main` harness entry can be named as an asm `sym`.
+#[cfg(test)]
+extern "C" fn test_main_trampoline() -> ! {
     test_main();
     loop {
         arch::x86_64::hlt();
