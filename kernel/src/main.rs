@@ -9,12 +9,11 @@ use core::panic::PanicInfo;
 
 const BOOT_MSG: &str = "Chitti: boot ok";
 
-/// Shared OS steady state (arch-independent): the Synapse + Persona demos,
-/// then the interactive intent shell (never returns).
+/// Shared OS steady state (arch-independent): the interactive shell agent
+/// (never returns). The Synapse/persona/agent boot demos that used to run here
+/// (and spawned demo agents + files on every boot) live on in the test suite;
+/// the only default agent is the shell agent.
 fn run_os() -> ! {
-    chitti_kernel::synapse::demo();
-    chitti_kernel::shell::demo();
-    chitti_kernel::agent::demo();
     chitti_kernel::shell::run();
 }
 

@@ -179,6 +179,56 @@ pub fn current_task_id() -> TaskId {
     SCHED.with(|slot| slot.as_ref().expect("sched not initialized").current)
 }
 
+/// Snapshot of the task table for the shell's `/agents` process list:
+/// `(id, name, state)`. Parked capability-owner tasks (agents) show as
+/// "parked" — Ready but never enqueued.
+pub fn list() -> alloc::vec::Vec<(TaskId, &'static str, &'static str)> {
+    SCHED.with(|slot| {
+        let s = match slot.as_ref() {
+            Some(s) => s,
+            None => return alloc::vec::Vec::new(),
+        };
+        s.tasks
+            .iter()
+            .map(|(&id, tcb)| {
+                let state = match tcb.state {
+                    TaskState::Running => "running",
+                    TaskState::Dead => "dead",
+                    TaskState::Ready if s.ready_queue.contains(&id) => "ready",
+                    TaskState::Ready => "parked",
+                };
+                (id, tcb.name, state)
+            })
+            .collect()
+    })
+}
+
+/// Terminate task `id`: mark it Dead, drop it from the ready queue, and drop
+/// its capability table (all its authority is revoked). Refuses the bootstrap
+/// task and the currently running task. The stack is reclaimed by the dead-
+/// task policy, same as a normal exit.
+pub fn kill(id: TaskId) -> Result<(), &'static str> {
+    SCHED.with(|slot| {
+        let s = slot.as_mut().ok_or("scheduler not initialized")?;
+        if id == 0 {
+            return Err("refusing to kill the bootstrap task");
+        }
+        if id == s.current {
+            return Err("refusing to kill the current task");
+        }
+        let tcb = s.tasks.get_mut(&id).ok_or("no such task")?;
+        if tcb.state == TaskState::Dead {
+            return Err("already dead");
+        }
+        tcb.state = TaskState::Dead;
+        tcb.cap_table = CapTable::new(); // revoke all authority
+        s.ready_queue.retain(|&t| t != id);
+        Ok(())
+    })?;
+    crate::ktrace::log_fmt(format_args!("sched: task {id} killed"));
+    Ok(())
+}
+
 pub(crate) fn with_cap_table_mut<R>(task: TaskId, f: impl FnOnce(&mut CapTable) -> R) -> R {
     SCHED.with(|slot| {
         let s = slot.as_mut().expect("sched not initialized");
