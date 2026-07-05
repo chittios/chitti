@@ -251,20 +251,29 @@ fn matmul(a: &Val, b: &Val, azp: f32, bzp: f32) -> Val {
         // shared (b_batch < batch) weight isn't read out of bounds.
         let bo = (bi % b_batch) * k * n;
         if bo != last_bo {
+            let blen = b.f.len();
             for j in 0..n {
                 for kk in 0..k {
-                    bt[j * k + kk] = b.f[bo + kk * n + j] - bzp;
+                    // Clamp defensively: a valid matmul keeps this in range, so
+                    // the guard only prevents an OS-fatal panic if an upstream op
+                    // produced a shape/data mismatch (degrade, don't crash).
+                    bt[j * k + kk] = b.f[(bo + kk * n + j).min(blen - 1)] - bzp;
                 }
             }
             last_bo = bo;
         }
+        let alen = a.f.len();
         for i in 0..m {
             if azp != 0.0 {
                 for kk in 0..k {
-                    arow[kk] = a.f[ao + i * k + kk] - azp;
+                    arow[kk] = a.f[(ao + i * k + kk).min(alen - 1)] - azp;
                 }
-            } else {
+            } else if ao + i * k + k <= alen {
                 arow.copy_from_slice(&a.f[ao + i * k..ao + i * k + k]);
+            } else {
+                for kk in 0..k {
+                    arow[kk] = a.f[(ao + i * k + kk).min(alen - 1)];
+                }
             }
             let orow = (bi * m + i) * n;
             for j in 0..n {
@@ -413,6 +422,59 @@ fn conv1d(x: &Val, w: &Val, bias: Option<&Val>, node: &super::Node<'_>, xzp: f32
         }
     }
     Val::new(vec![nb, m, ow], out)
+}
+
+/// 2-D convolution (grouped/depthwise), shared by `Conv`/`ConvInteger` when the
+/// input is 4-D `[N, C, H, W]` with a 4-D weight `[M, C/groups, kH, kW]` — the
+/// shape NeMo's conv-subsampling ("dw_striding") front-end uses. Strides, pads
+/// (ONNX order `[hb, wb, he, we]`), dilations, and groups are all honoured, and
+/// integer zero-points fold in (0 for float `Conv`). Output `[N, M, OH, OW]`.
+fn conv2d(x: &Val, w: &Val, bias: Option<&Val>, node: &super::Node<'_>, xzp: f32, wzp: f32) -> Val {
+    let (nb, c, ih, iw) = (x.dims[0], x.dims[1], x.dims[2], x.dims[3]);
+    let (m, cg, kh, kw) = (w.dims[0], w.dims[1], w.dims[2], w.dims[3]);
+    let groups = node.attrs.iter().find(|a| a.name == "group").map(|a| a.i as usize).unwrap_or(1);
+    let strides = node.attrs.iter().find(|a| a.name == "strides").map(|a| a.ints.clone()).unwrap_or_else(|| vec![1, 1]);
+    let pads = node.attrs.iter().find(|a| a.name == "pads").map(|a| a.ints.clone()).unwrap_or_else(|| vec![0, 0, 0, 0]);
+    let dil = node.attrs.iter().find(|a| a.name == "dilations").map(|a| a.ints.clone()).unwrap_or_else(|| vec![1, 1]);
+    let (sh, sw) = (strides[0] as usize, strides[1] as usize);
+    let (dh, dw) = (dil[0] as usize, dil[1] as usize);
+    let (ph0, pw0, ph1, pw1) = (pads[0] as usize, pads[1] as usize, pads[2] as usize, pads[3] as usize);
+    let oh = (ih + ph0 + ph1).saturating_sub(dh * (kh - 1) + 1) / sh + 1;
+    let ow = (iw + pw0 + pw1).saturating_sub(dw * (kw - 1) + 1) / sw + 1;
+    let cpg = c / groups;
+    let mpg = m / groups;
+    let mut out = vec![0f32; nb * m * oh * ow];
+    for n in 0..nb {
+        for om in 0..m {
+            let g = om / mpg;
+            let bv = bias.map(|bb| bb.f[om]).unwrap_or(0.0);
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let mut acc = bv;
+                    for ic in 0..cg.min(cpg) {
+                        let xc = g * cpg + ic;
+                        for ky in 0..kh {
+                            let yi = (oy * sh + ky * dh) as i64 - ph0 as i64;
+                            if yi < 0 || yi >= ih as i64 {
+                                continue;
+                            }
+                            for kx in 0..kw {
+                                let xi = (ox * sw + kx * dw) as i64 - pw0 as i64;
+                                if xi < 0 || xi >= iw as i64 {
+                                    continue;
+                                }
+                                let xv = x.f[((n * c + xc) * ih + yi as usize) * iw + xi as usize] - xzp;
+                                let wv = w.f[((om * cg + ic) * kh + ky) * kw + kx] - wzp;
+                                acc += xv * wv;
+                            }
+                        }
+                    }
+                    out[((n * m + om) * oh + oy) * ow + ox] = acc;
+                }
+            }
+        }
+    }
+    Val::new(vec![nb, m, oh, ow], out)
 }
 
 /// 1-D transposed convolution (upsampling), enough for the TTS vocoder path.
@@ -1507,10 +1569,11 @@ fn exec_graph<'t>(g: &'t Graph<'t>, env: &mut BTreeMap<String, Val>, outer_inits
                 let x = get(env, 0)?;
                 let w = get(env, 1)?;
                 let b = get(env, 2).ok();
-                if x.dims.len() != 3 || w.dims.len() != 3 {
-                    return Err(alloc::format!("Conv: only 1-D supported (got x{:?} w{:?})", x.dims, w.dims));
+                match w.dims.len() {
+                    3 => vec![conv1d(&x, &w, b.as_ref(), node, 0.0, 0.0)],
+                    4 => vec![conv2d(&x, &w, b.as_ref(), node, 0.0, 0.0)],
+                    _ => return Err(alloc::format!("Conv: only 1-D/2-D supported (got x{:?} w{:?})", x.dims, w.dims)),
                 }
-                vec![conv1d(&x, &w, b.as_ref(), node, 0.0, 0.0)]
             }
             "LSTM" => {
                 // Single-direction ONNX LSTM: X[T,B,I], W[1,4H,I], R[1,4H,H],
@@ -1787,12 +1850,17 @@ fn exec_graph<'t>(g: &'t Graph<'t>, env: &mut BTreeMap<String, Val>, outer_inits
                 vec![Val::new(x.dims.clone(), out)]
             }
             "ConvInteger" => {
-                // 1-D int8 conv: like Conv, x/w are u8, optional zero-points.
+                // int8 conv: like Conv, x/w are u8, optional zero-points. 1-D and
+                // 2-D (NeMo conv-subsampling front-end) both route here.
                 let x = get(env, 0)?;
                 let w = get(env, 1)?;
                 let xzp = get(env, 2).ok().and_then(|t| t.f.first().copied()).unwrap_or(0.0);
                 let wzp = get(env, 3).ok().and_then(|t| t.f.first().copied()).unwrap_or(0.0);
-                vec![conv1d(&x, &w, None, node, xzp, wzp)]
+                match w.dims.len() {
+                    3 => vec![conv1d(&x, &w, None, node, xzp, wzp)],
+                    4 => vec![conv2d(&x, &w, None, node, xzp, wzp)],
+                    _ => return Err(alloc::format!("ConvInteger: only 1-D/2-D supported (got x{:?} w{:?})", x.dims, w.dims)),
+                }
             }
             "ConvTranspose" => vec![conv_transpose1d(&get(env, 0)?, &get(env, 1)?, get(env, 2).ok().as_ref(), node)],
             "Resize" => {
