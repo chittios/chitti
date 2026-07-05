@@ -292,6 +292,12 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "mode" => run_mode(arg),
         "voice" => run_voice(arg),
         "onnx" => run_onnx(arg),
+        "lspci" => {
+            #[cfg(target_arch = "aarch64")]
+            crate::pci::dump_all();
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::x86_64::pci::dump_all();
+        }
         _ => return false,
     }
     true
@@ -520,6 +526,7 @@ fn print_help() {
     serial_println!("  /mode [m]        agent-tool approvals: manual (all) | auto (destructive only) | bypass");
     serial_println!("  /voice [..]      voice session (mic modal); test = tone+mic; models; stt <file.wav>");
     serial_println!("  /onnx info|run <path>  inspect or run any ONNX model from a mounted volume");
+    serial_println!("  /lspci           list every PCI device (bus:dev.func vendor:device class)");
     serial_println!("  /datetime [..]   show/set the clock: /datetime 2026-07-04 13:45 | /datetime tz +5:30");
     serial_println!("  /ui [config|reload|reset]  view/edit the UI config (/configs/core/ui.json)");
     serial_println!("  /shortcuts       list keyboard shortcuts (/configs/core/shortcuts.json)");
@@ -1718,7 +1725,7 @@ static HISTORY: Locked<alloc::vec::Vec<String>> = Locked::new(alloc::vec::Vec::n
 const COMMANDS: &[&str] = &[
     "agent", "bench", "cat", "clear", "close", "datetime", "disks", "do", "exit", "help", "infer", "info",
     "install", "ktrace", "ls", "mkext4", "mkfs", "mode", "mount", "mounts", "network", "open", "perf",
-    "onnx", "ping", "session", "shortcuts", "skills", "subagent", "think", "ui", "umount", "voice", "wifi",
+    "lspci", "onnx", "ping", "session", "shortcuts", "skills", "subagent", "think", "ui", "umount", "voice", "wifi",
 ];
 
 /// `/think on|off` — toggle Qwen thinking mode (default on; streamed dim).

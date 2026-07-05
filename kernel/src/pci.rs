@@ -156,6 +156,45 @@ pub fn find_class_sub(base: u8, sub: u8) -> Option<PciDevice> {
     None
 }
 
+/// Print **every** PCI function to the chat pane (`serial_println!`) — the
+/// `/lspci` shell command. Shows vendor:device, the full class triple, and the
+/// ECAM base, so an unrecognised audio controller on a VM is directly visible.
+pub fn dump_all() {
+    let base = ecam_base();
+    crate::serial_println!("pci> ECAM base {:#x}", base);
+    if base == 0 {
+        crate::serial_println!("pci> PCIe not discovered (no ACPI MCFG) — using virtio-mmio");
+        return;
+    }
+    let bus_end = BUS_END.with(|b| *b);
+    let mut n = 0;
+    for bus in 0..=bus_end {
+        for dev in 0u8..32 {
+            for func in 0u8..8 {
+                let id = read32(bus, dev, func, 0x00);
+                let v = (id & 0xffff) as u16;
+                if v == 0xffff {
+                    if func == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                let class = read32(bus, dev, func, 0x08);
+                crate::serial_println!(
+                    "pci> {bus:02x}:{dev:02x}.{func} {:04x}:{:04x} class {:02x}:{:02x}:{:02x}",
+                    v,
+                    (id >> 16) as u16,
+                    (class >> 24) & 0xff,
+                    (class >> 16) & 0xff,
+                    (class >> 8) & 0xff
+                );
+                n += 1;
+            }
+        }
+    }
+    crate::serial_println!("pci> {n} device(s) on buses 0..={bus_end}");
+}
+
 /// Log every function of PCI base class `base` (diagnostic — used when audio
 /// autodetect finds nothing, so the actual VM device layout is visible).
 pub fn log_class(base: u8) {
