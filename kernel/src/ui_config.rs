@@ -274,6 +274,7 @@ fn resolve_var(var: &str) -> String {
     match var {
         "brand" => "Chitti OS".to_string(),
         "version" => crate::VERSION.to_string(),
+        "build" => crate::BUILD_TIME.to_string(),
         "date" => crate::clock::format_date(),
         "time" => crate::clock::format_time(),
         "datetime" => crate::clock::format_datetime(),

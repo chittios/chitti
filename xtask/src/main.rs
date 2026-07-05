@@ -155,6 +155,11 @@ fn main() {
     // the kernel + config + an empty data partition (fast) — for exercising the
     // install & boot-from-disk flow without the slow ~800 MiB model write.
     let no_model = rest.iter().any(|a| a == "--no-model");
+    // `-server`: headless server build — no framebuffer console / GUI tools
+    // (kernel `server` feature). Applied to build/run/image via the env below.
+    if rest.iter().any(|a| a == "-server" || a == "--server") {
+        env::set_var("CHITTI_SERVER", "1");
+    }
     let arch = match parse_arch(&rest) {
         Ok(a) => a,
         Err(e) => {
@@ -229,6 +234,11 @@ fn build_kernel_aarch64(release: bool, features: &[&str]) -> Result<PathBuf, Str
     if release {
         cmd.arg("--release");
     }
+    let mut feats: Vec<&str> = features.to_vec();
+    if env::var("CHITTI_SERVER").is_ok() {
+        feats.push("server");
+    }
+    let features = &feats[..];
     if !features.is_empty() {
         cmd.arg("--features").arg(features.join(","));
     }
@@ -287,6 +297,9 @@ fn parse_wxh(s: &str) -> Option<(u32, u32)> {
 /// Retina reports are physical pixels, so halve them to a logical size that
 /// makes a window roughly filling the screen; leave headroom for chrome.
 fn detect_host_res() -> Option<(u32, u32)> {
+    if !cfg!(target_os = "macos") {
+        return None; // Linux hosts: use the default (or CHITTI_FBRES)
+    }
     let out = Command::new("system_profiler").arg("SPDisplaysDataType").output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
@@ -321,11 +334,22 @@ fn assert_identity_kernel(elf: &Path) -> Result<(), String> {
 /// `ovmf_pflash_args`. A per-run writable copy of the vars volume lives under
 /// `target/`.
 fn aavmf_pflash_args() -> Result<Vec<String>, String> {
-    let share = brew_prefix("qemu")?.join("share/qemu");
-    let code = share.join("edk2-aarch64-code.fd");
-    let vars_src = share.join("edk2-arm-vars.fd");
+    let (code, vars_src) = if cfg!(target_os = "macos") {
+        let share = brew_prefix("qemu")?.join("share/qemu");
+        (share.join("edk2-aarch64-code.fd"), share.join("edk2-arm-vars.fd"))
+    } else {
+        let code = find_path(
+            "CHITTI_AAVMF_CODE",
+            &["/usr/share/AAVMF/AAVMF_CODE.fd", "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd", "/usr/share/qemu/edk2-aarch64-code.fd"],
+        );
+        let vars = find_path("CHITTI_AAVMF_VARS", &["/usr/share/AAVMF/AAVMF_VARS.fd", "/usr/share/qemu/edk2-arm-vars.fd"]);
+        match (code, vars) {
+            (Some(c), Some(v)) => (c, v),
+            _ => return Err("AAVMF firmware not found (install qemu-efi-aarch64, or set CHITTI_AAVMF_CODE/CHITTI_AAVMF_VARS)".into()),
+        }
+    };
     if !code.exists() || !vars_src.exists() {
-        return Err(format!("AAVMF firmware not found under {} (need edk2-aarch64-code.fd + edk2-arm-vars.fd)", share.display()));
+        return Err(format!("AAVMF firmware not found ({} / {})", code.display(), vars_src.display()));
     }
     let vars = repo_root().join("target/aavmf-vars.fd");
     fs::copy(&vars_src, &vars).map_err(|e| format!("copying AAVMF vars: {e}"))?;
@@ -342,6 +366,48 @@ fn aavmf_pflash_args() -> Result<Vec<String>, String> {
 /// A real image — not VVFAT (sparse-sector stalls, ~504 MiB cap) and not a
 /// `-cdrom` El Torito volume — is what boots reliably under AAVMF, and FAT32
 /// carries the ~774 MiB model file directly.
+/// Run a host command, failing with a readable error.
+fn run_host(prog: &str, args: &[&str]) -> Result<(), String> {
+    let st = Command::new(prog).args(args).status().map_err(|e| format!("running {prog}: {e}"))?;
+    if !st.success() {
+        return Err(format!("{prog} {} failed: {st}", args.join(" ")));
+    }
+    Ok(())
+}
+
+/// Copy `part`'s bytes into `img` starting at byte `offset` (how the Linux
+/// image path populates GPT partitions: format a temp file, splice it in).
+fn splice_into(img: &Path, offset: u64, part: &Path) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut src = fs::File::open(part).map_err(|e| e.to_string())?;
+    let mut dst = fs::OpenOptions::new().write(true).open(img).map_err(|e| e.to_string())?;
+    dst.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    loop {
+        let n = src.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        dst.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Populate a plain FAT32 image file with `(host_path, image_path)` copies —
+/// Linux path via dosfstools/mtools (no root needed). `dirs` are `::/`-style
+/// mtools directories created first.
+fn populate_fat_linux(img: &Path, label: &str, dirs: &[&str], copies: &[(PathBuf, String)]) -> Result<(), String> {
+    let img_s = img.to_string_lossy().to_string();
+    run_host("mkfs.vfat", &["-F", "32", "-n", label, &img_s])?;
+    for d in dirs {
+        run_host("mmd", &["-i", &img_s, d])?;
+    }
+    for (src, dst) in copies {
+        run_host("mcopy", &["-i", &img_s, &src.to_string_lossy(), dst])?;
+    }
+    Ok(())
+}
+
 fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> Result<PathBuf, String> {
     let img = repo_root().join("target/chitti-esp-aa64.img");
     let model_bytes = model.map(|m| fs::metadata(m).map(|md| md.len()).unwrap_or(0)).unwrap_or(0);
@@ -354,7 +420,22 @@ fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> 
     let f = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&img).map_err(|e| e.to_string())?;
     f.set_len(size_mb * 1024 * 1024).map_err(|e| e.to_string())?;
     drop(f);
-    // Attach raw, format FAT32, mount, copy, detach — scripted via /bin/sh.
+    if cfg!(target_os = "linux") {
+        let mut copies: Vec<(PathBuf, String)> = vec![
+            (stub.to_path_buf(), "::/EFI/BOOT/BOOTAA64.EFI".into()),
+            (kernel.to_path_buf(), "::/chitti-kernel".into()),
+        ];
+        if let Some(m) = model {
+            copies.push((m.to_path_buf(), "::/model.gguf.000".into()));
+        }
+        for (n, pth) in &voice {
+            copies.push((pth.clone(), format!("::/{n}")));
+        }
+        populate_fat_linux(&img, "CHITTI", &["::/EFI", "::/EFI/BOOT"], &copies)?;
+        eprintln!("  ESP image: {} ({} MiB{})", img.display(), size_mb, if model.is_some() { ", model bundled" } else { "" });
+        return Ok(img);
+    }
+    // macOS: attach raw, format FAT32, mount, copy, detach — via /bin/sh.
     let script = format!(
         r#"set -e
 DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "{img}" | head -1 | awk '{{print $1}}')
@@ -404,6 +485,15 @@ fn build_voice_disk() -> Option<PathBuf> {
     let f = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&img).ok()?;
     f.set_len(size_mb * 1024 * 1024).ok()?;
     drop(f);
+    if cfg!(target_os = "linux") {
+        let copies: Vec<(PathBuf, String)> = voice.iter().map(|(n, p)| (p.clone(), format!("::/{n}"))).collect();
+        if populate_fat_linux(&img, "VOICE", &[], &copies).is_err() {
+            return None;
+        }
+        let _ = fs::write(&meta, &want);
+        eprintln!("  voice disk: {} ({} MiB, {} model(s))", img.display(), size_mb, voice.len());
+        return Some(img);
+    }
     let cps = voice.iter().map(|(n, p)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), n)).collect::<Vec<_>>().join("\n");
     let script = format!(
         r#"set -e
@@ -436,14 +526,14 @@ fn cmd_run_aarch64_uefi(model: Model, disk: Option<PathBuf>, disk_only: bool, no
     assert_identity_kernel(&elf)?;
     let stub = build_stub_aarch64()?;
     let mut qemu = Command::new("qemu-system-aarch64");
-    qemu.args(["-M", "virt", "-cpu", "host", "-accel", "hvf", "-smp", "4", "-m", model.qemu_mem()]);
+    qemu.args(["-M", "virt", "-smp", "4", "-m", model.qemu_mem()]);
+    qemu.args(accel_args("aarch64"));
     for a in aavmf_pflash_args()? {
         qemu.arg(a);
     }
-    qemu.args([
-        "-device", "ramfb", "-device", "virtio-keyboard-device", "-device", "virtio-tablet-device",
-        "-display", "cocoa,zoom-to-fit=on", "-serial", "mon:stdio",
-    ]);
+    qemu.args(["-device", "ramfb", "-device", "virtio-keyboard-device", "-device", "virtio-tablet-device"]);
+    qemu.args(display_args());
+    qemu.args(["-serial", "mon:stdio"]);
     // ESP first, data disk LAST: QEMU assigns later virtio-mmio devices to
     // LOWER slots, and the kernel's probe_disk takes the first (lowest) match —
     // so this ordering makes /install + persistence target the data disk, never
@@ -489,15 +579,16 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
     // open its display window; `-serial mon:stdio` keeps the serial console (and
     // QEMU monitor) on stdio so you still type at the terminal (Ctrl-A X quits,
     // Ctrl-A C for the monitor).
+    qemu.args(["-M", "virt", "-smp", "4", "-m", model.qemu_mem()]);
+    qemu.args(accel_args("aarch64"));
     qemu.args([
-        "-M", "virt", "-cpu", "host", "-accel", "hvf", "-smp", "4", "-m", model.qemu_mem(),
         "-device", "ramfb", "-device", "virtio-keyboard-device",
         // A virtio tablet gives the window an absolute-position mouse.
         "-device", "virtio-tablet-device",
-        // Resizable graphical window (the ramfb surface scales to fit).
-        "-display", "cocoa,zoom-to-fit=on",
-        "-serial", "mon:stdio", "-kernel",
     ]);
+    // Resizable graphical window (the ramfb surface scales to fit).
+    qemu.args(display_args());
+    qemu.args(["-serial", "mon:stdio", "-kernel"]);
     qemu.arg(&elf);
     // Hand the guest ramfb the framebuffer resolution to use (the kernel reads
     // opt/chitti/fbres) — derived from the host display, not hardcoded.
@@ -511,8 +602,8 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
     // A virtio-net NIC on user-mode networking (built-in DHCP 10.0.2.15 / gw
     // 10.0.2.2 / dns 10.0.2.3) so /network, /ping and /wifi work out of the box.
     qemu.args(["-netdev", "user,id=chittinet", "-device", "virtio-net-device,netdev=chittinet"]);
-    // virtio-snd on the host's CoreAudio (mic + speaker) for /voice.
-    qemu.args(["-audiodev", "coreaudio,id=chittiaudio", "-device", "virtio-sound-device,audiodev=chittiaudio"]);
+    // virtio-snd on the host's audio backend (mic + speaker) for /voice.
+    qemu.args(audio_args("virtio-sound-device"));
     // Attach a virtio-blk disk on the virtio-mmio bus (the aarch64 block driver
     // scans that window) so /disks, /mkext4, /install, and synapse persistence
     // work — the aarch64 counterpart to the x86 virtio-blk-pci drive.
@@ -624,6 +715,11 @@ fn build_kernel_with(release: bool, features: &[&str]) -> Result<PathBuf, String
     if release {
         cmd.arg("--release");
     }
+    let mut feats: Vec<&str> = features.to_vec();
+    if env::var("CHITTI_SERVER").is_ok() {
+        feats.push("server");
+    }
+    let features = &feats[..];
     if !features.is_empty() {
         cmd.arg("--features").arg(features.join(","));
     }
@@ -634,6 +730,61 @@ fn build_kernel_with(release: bool, features: &[&str]) -> Result<PathBuf, String
         .join("target/x86_64-chitti")
         .join(profile)
         .join("chitti-kernel"))
+}
+
+/// QEMU audio flags for `device` (virtio-sound-pci / virtio-sound-device).
+/// Driver from `CHITTI_AUDIO` (coreaudio|pa|alsa|pipewire|sdl|none|off); the
+/// default is the host OS's native backend. `off` omits the device entirely —
+/// the escape hatch when the host backend can't open (e.g. macOS mic
+/// permission denied: QEMU prints "Can not open `virtio-sound.in'" but boots
+/// on with audio input dead).
+fn audio_args(device: &str) -> Vec<String> {
+    let drv = env::var("CHITTI_AUDIO").unwrap_or_else(|_| {
+        if cfg!(target_os = "macos") { "coreaudio".into() } else { "pa".into() }
+    });
+    if drv == "off" {
+        return Vec::new();
+    }
+    vec![
+        "-audiodev".into(),
+        format!("{drv},id=chittiaudio"),
+        "-device".into(),
+        format!("{device},audiodev=chittiaudio"),
+    ]
+}
+
+/// QEMU display flags: Cocoa on macOS, GTK elsewhere (override: CHITTI_DISPLAY).
+fn display_args() -> Vec<String> {
+    let d = env::var("CHITTI_DISPLAY").unwrap_or_else(|_| {
+        if cfg!(target_os = "macos") { "cocoa,zoom-to-fit=on".into() } else { "gtk,zoom-to-fit=on".into() }
+    });
+    vec!["-display".into(), d]
+}
+
+/// QEMU accelerator for a target arch: HVF on macOS, KVM on a same-arch Linux
+/// host, else TCG (override: CHITTI_ACCEL).
+fn accel_args(target_arch: &str) -> Vec<String> {
+    if let Ok(a) = env::var("CHITTI_ACCEL") {
+        return vec!["-accel".into(), a, "-cpu".into(), "host".into()];
+    }
+    if cfg!(target_os = "macos") && std::env::consts::ARCH == target_arch {
+        return vec!["-accel".into(), "hvf".into(), "-cpu".into(), "host".into()];
+    }
+    if cfg!(target_os = "linux") && std::env::consts::ARCH == target_arch {
+        return vec!["-accel".into(), "kvm".into(), "-cpu".into(), "host".into()];
+    }
+    vec!["-cpu".into(), "max".into()]
+}
+
+/// First existing path among `candidates`, with an env-var override.
+fn find_path(env_key: &str, candidates: &[&str]) -> Option<PathBuf> {
+    if let Ok(p) = env::var(env_key) {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    candidates.iter().map(PathBuf::from).find(|p| p.exists())
 }
 
 fn brew_prefix(pkg: &str) -> Result<PathBuf, String> {
@@ -656,14 +807,22 @@ fn limine_share_dir() -> Result<PathBuf, String> {
     if let Ok(dir) = env::var("CHITTI_LIMINE_SHARE") {
         return Ok(PathBuf::from(dir));
     }
-    Ok(brew_prefix("limine")?.join("share/limine"))
+    if cfg!(target_os = "macos") {
+        return Ok(brew_prefix("limine")?.join("share/limine"));
+    }
+    find_path("CHITTI_LIMINE_SHARE", &["/usr/local/share/limine", "/usr/share/limine"])
+        .ok_or_else(|| "limine share dir not found (install limine, or set CHITTI_LIMINE_SHARE)".into())
 }
 
 fn limine_bin() -> Result<PathBuf, String> {
     if let Ok(bin) = env::var("CHITTI_LIMINE_BIN") {
         return Ok(PathBuf::from(bin));
     }
-    Ok(brew_prefix("limine")?.join("bin/limine"))
+    if cfg!(target_os = "macos") {
+        return Ok(brew_prefix("limine")?.join("bin/limine"));
+    }
+    find_path("CHITTI_LIMINE_BIN", &["/usr/local/bin/limine", "/usr/bin/limine"])
+        .ok_or_else(|| "limine binary not found (install limine, or set CHITTI_LIMINE_BIN)".into())
 }
 
 /// Assemble a hybrid BIOS/UEFI ISO around `kernel_bin` with the default (0.8B)
@@ -895,6 +1054,39 @@ fn image_aarch64(model: Model) -> Result<(), String> {
     write_gpt_host(&f, total_secs, &[(ESP_GUID_H, esp.0, esp.1, "EFI System"), (LINUX_GUID_H, data.0, data.1, "Chitti Data")])?;
     drop(f);
 
+    if cfg!(target_os = "linux") {
+        // Format each partition into a temp file (dosfstools/mtools + e2fsprogs,
+        // no root needed), then splice the bytes into the GPT image.
+        let esp_tmp = repo_root().join("target/chitti-aa64-esp.tmp");
+        let f = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&esp_tmp).map_err(|e| e.to_string())?;
+        f.set_len(esp_secs * 512).map_err(|e| e.to_string())?;
+        drop(f);
+        let mut copies: Vec<(PathBuf, String)> = vec![
+            (stub.clone(), "::/EFI/BOOT/BOOTAA64.EFI".into()),
+            (elf.clone(), "::/chitti-kernel".into()),
+        ];
+        if let Some(m) = &model_path {
+            copies.push((m.clone(), "::/model.gguf.000".into()));
+        }
+        for (n, pth) in &voice {
+            copies.push((pth.clone(), format!("::/{n}")));
+        }
+        populate_fat_linux(&esp_tmp, "CHITTI", &["::/EFI", "::/EFI/BOOT"], &copies)?;
+        splice_into(&img, esp.0 * 512, &esp_tmp)?;
+        let _ = fs::remove_file(&esp_tmp);
+
+        let data_tmp = repo_root().join("target/chitti-aa64-data.tmp");
+        let f = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&data_tmp).map_err(|e| e.to_string())?;
+        f.set_len(data_secs * 512).map_err(|e| e.to_string())?;
+        drop(f);
+        run_host("mke2fs", &["-F", "-q", "-t", "ext4", "-b", "4096", &data_tmp.to_string_lossy()])?;
+        splice_into(&img, data.0 * 512, &data_tmp)?;
+        let _ = fs::remove_file(&data_tmp);
+
+        println!("image: {} ({} MiB, GPT: ESP {}..{} + ext4 data)", img.display(), total_secs * 512 / (1024 * 1024), esp.0, esp.1);
+        println!("  write it to a USB drive (dd/balenaEtcher) or attach as a VM disk -- it boots standalone via UEFI.");
+        return Ok(());
+    }
     // Format + populate the two partitions via macOS hdiutil/diskutil (the GPT
     // is parsed on attach, exposing slice devices s1/s2 owned by the user).
     let mke2fs = brew_prefix("e2fsprogs").map(|p| p.join("sbin/mke2fs")).ok().filter(|p| p.exists())
@@ -1118,8 +1310,8 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
     cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
     // Intel e1000 NIC on user-mode networking (DHCP 10.0.2.15 / gw 10.0.2.2).
     cmd.args(["-netdev", "user,id=chittinet", "-device", "e1000,netdev=chittinet"]);
-    // virtio-snd on the host's CoreAudio (mic + speaker) for /voice.
-    cmd.args(["-audiodev", "coreaudio,id=chittiaudio", "-device", "virtio-sound-pci,audiodev=chittiaudio"]);
+    // virtio-snd on the host's audio backend (mic + speaker) for /voice.
+    cmd.args(audio_args("virtio-sound-pci"));
     if disk_size.is_some() {
         eprintln!("  disk: {} ({}) -- run `/install yes` at the shell, then reboot with `--disk-only`", disk.display(), disk_size.as_deref().unwrap_or(""));
     }
@@ -1151,11 +1343,26 @@ fn parse_size(s: &str) -> Result<u64, String> {
 /// read-only; a per-run writable copy of the vars volume is placed under
 /// `target/`. Both come from QEMU's bundled edk2 firmware.
 fn ovmf_pflash_args() -> Result<Vec<String>, String> {
-    let share = brew_prefix("qemu")?.join("share/qemu");
-    let code = share.join("edk2-x86_64-code.fd");
-    let vars_src = share.join("edk2-i386-vars.fd");
+    // macOS: the qemu brew keg's edk2 files. Linux: distro OVMF/edk2 packages.
+    let (code, vars_src) = if cfg!(target_os = "macos") {
+        let share = brew_prefix("qemu")?.join("share/qemu");
+        (share.join("edk2-x86_64-code.fd"), share.join("edk2-i386-vars.fd"))
+    } else {
+        let code = find_path(
+            "CHITTI_OVMF_CODE",
+            &["/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/qemu/edk2-x86_64-code.fd"],
+        );
+        let vars = find_path(
+            "CHITTI_OVMF_VARS",
+            &["/usr/share/OVMF/OVMF_VARS.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/edk2/x64/OVMF_VARS.4m.fd", "/usr/share/qemu/edk2-i386-vars.fd"],
+        );
+        match (code, vars) {
+            (Some(c), Some(v)) => (c, v),
+            _ => return Err("OVMF firmware not found (install ovmf, or set CHITTI_OVMF_CODE/CHITTI_OVMF_VARS)".into()),
+        }
+    };
     if !code.exists() || !vars_src.exists() {
-        return Err(format!("OVMF firmware not found under {} (need edk2-x86_64-code.fd + edk2-i386-vars.fd)", share.display()));
+        return Err(format!("OVMF firmware not found ({} / {})", code.display(), vars_src.display()));
     }
     // A fresh writable vars copy per invocation (UEFI writes boot vars).
     let vars = repo_root().join("target/ovmf-vars.fd");

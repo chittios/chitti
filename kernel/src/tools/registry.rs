@@ -98,6 +98,7 @@ fn shell_commands() -> Vec<ToolDef> {
         ToolDef::shell("ping", "ICMP-ping a host to check connectivity. args: a hostname or IPv4 address, e.g. 'www.google.com'.", false),
         ToolDef::shell("wifi", "Wi-Fi facade over the NIC. args: 'scan' | 'connect <ssid>' | 'info'.", false),
         ToolDef::shell("datetime", "Show or set the wall clock. args: empty=show, 'YYYY-MM-DD HH:MM'=set, 'tz +5:30'=zone.", false),
+        #[cfg(not(feature = "server"))] // GUI tool: absent from server builds
         ToolDef::shell("ui", "View or manage the UI config. args: 'config' | 'reload' | 'reset'.", false),
         ToolDef::shell("shortcuts", "List the keyboard shortcuts.", false),
         ToolDef::shell("skills", "List installed skills.", false),

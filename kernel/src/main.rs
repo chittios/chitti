@@ -52,9 +52,12 @@ pub extern "C" fn _start() -> ! {
     // Framebuffer console AFTER the heap is up (Screen::build allocates its
     // pane titles / status strings), using the descriptor captured before
     // `init()` reclaimed the bootloader response memory.
+    #[cfg(not(feature = "server"))]
     if let Some(fb) = fb_info {
         framebuffer::init_console(fb);
     }
+    #[cfg(feature = "server")]
+    let _ = fb_info; // server build: serial console only
     serial_println!(
         "Chitti: SMP: {} core(s) online (see ktrace 'smp:' lines for the spinlock self-test)",
         chitti_kernel::smp::cpu_count()
@@ -154,6 +157,7 @@ pub extern "C" fn limine_start() -> ! {
     serial_println!("Chitti: heap {} MiB at phys {:#x} (hhdm va {:#x})", chitti_kernel::mm::heap::HEAP_SIZE / (1024 * 1024), phys, heap_va);
 
     chitti_kernel::sched::init();
+    #[cfg(not(feature = "server"))]
     if let Some(fb) = FRAMEBUFFER_REQUEST.response().and_then(|r| r.framebuffers().first().copied()) {
         chitti_kernel::framebuffer::init_console(fb);
         serial_println!("Chitti: framebuffer up via Limine GOP -- console mirrored to the window");
@@ -215,6 +219,9 @@ pub extern "C" fn aarch64_start() -> ! {
         serial_println!("Chitti: wall clock seeded from UEFI ({} unix)", secs);
     }
 
+    #[cfg(feature = "server")]
+    let fb: Option<(u64, u64)> = None; // server build: serial console only
+    #[cfg(not(feature = "server"))]
     let fb = if let Some((addr, w, h, pitch, bpp, rs, gs, bs)) = bootinfo_framebuffer() {
         chitti_kernel::framebuffer::init_console_raw_fmt(addr, w, h, pitch, bpp, rs, gs, bs);
         Some((w, h))

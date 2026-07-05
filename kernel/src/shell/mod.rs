@@ -531,7 +531,7 @@ fn print_help() {
 /// session + chat KV).
 fn print_info(orch: &crate::agent::orchestrator::Orchestrator, chat: Option<&ChatSession>) {
     let mib = |b: usize| b / (1024 * 1024);
-    serial_println!("Chitti OS — agentic re-architecture (Phases A-G)  v{}", env!("CARGO_PKG_VERSION"));
+    serial_println!("Chitti OS — agentic re-architecture (Phases A-G)  v{} (built {})", crate::VERSION, crate::BUILD_TIME);
 
     // Arch + cores + SIMD.
     #[cfg(target_arch = "x86_64")]
@@ -2564,6 +2564,18 @@ fn run_datetime(arg: &str) {
 
 /// `/ui` — show or manage the UI config (`/configs/core/ui.json`).
 fn run_ui(arg: &str) {
+    #[cfg(feature = "server")]
+    {
+        let _ = arg;
+        serial_println!("ui> unavailable in the server build (no GUI)");
+        return;
+    }
+    #[cfg(not(feature = "server"))]
+    run_ui_inner(arg);
+}
+
+#[cfg(not(feature = "server"))]
+fn run_ui_inner(arg: &str) {
     use crate::ui_config;
     match arg {
         "" | "config" | "show" => {
@@ -2613,6 +2625,18 @@ fn close_action() {
 /// `/open <path>` — edit a store file in the vim-like editor (right pane). If a
 /// config file was written, re-apply it so changes take effect immediately.
 fn run_open(arg: &str) {
+    #[cfg(feature = "server")]
+    {
+        let _ = arg;
+        serial_println!("open> unavailable in the server build (no GUI); edit files off-box");
+        return;
+    }
+    #[cfg(not(feature = "server"))]
+    run_open_inner(arg);
+}
+
+#[cfg(not(feature = "server"))]
+fn run_open_inner(arg: &str) {
     if arg.is_empty() {
         serial_println!("usage: /open <path>   e.g. /open {}", crate::ui_config::ui_path());
         serial_println!("  editor: hjkl move, i insert, Esc normal, :w write, :q quit, :wq save+quit");
