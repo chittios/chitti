@@ -989,20 +989,25 @@ fn voice_load(which: &str, path: Option<&str>) -> Result<(usize, alloc::string::
         let n = crate::sound::model_store::load_bytes(which, bytes)?;
         return Ok((n, p.into()));
     }
-    // No path: a bundled boot module (x86), then default filesystem locations.
+    // No path: a bundled boot module (x86 Limine) first, then any disk volume
+    // (the FAT ESP / ext4 data partition — aarch64 image), then the mounts.
     #[cfg(target_arch = "x86_64")]
     if let Some(m) = crate::cortex::find_module(which) {
         let n = crate::sound::model_store::load_bytes(which, m.to_vec())?;
         return Ok((n, alloc::format!("boot module ({which})")));
     }
+    let fname = alloc::format!("{which}.onnx");
+    if let Some(bytes) = find_on_disks(&[&fname]) {
+        let n = crate::sound::model_store::load_bytes(which, bytes)?;
+        return Ok((n, alloc::format!("{fname} (disk)")));
+    }
     for cand in voice_candidates(which) {
         if let Some(bytes) = read_mounted(cand) {
-            serial_println!("voice> found {} at {}", which, cand);
             let n = crate::sound::model_store::load_bytes(which, bytes)?;
             return Ok((n, (*cand).into()));
         }
     }
-    Err(alloc::format!("no {which} model bundled or on disk (put it at /voice/ or pass a path)"))
+    Err(alloc::format!("no {which} model bundled or on disk (pass a path, or bundle via the image)"))
 }
 
 /// Best-effort auto-load of the voice models at boot (after `/` is mounted), so
@@ -2394,6 +2399,39 @@ fn ls_mount(mt: &Mount) {
 
 /// `/cat <path>` — print a file from a mounted volume, e.g. `/cat /mnt/notes`.
 /// FAT + ext4 root files (one directory level, matching the mount model).
+/// Scan every disk + volume for the first readable root file named one of
+/// `names` (FAT or ext4). Independent of `/mount`, so it finds a bundled voice
+/// model on the FAT ESP (aarch64) or the ext4 data partition regardless of what
+/// is mounted where.
+fn find_on_disks(names: &[&str]) -> Option<alloc::vec::Vec<u8>> {
+    use crate::fs::detect::FsType;
+    for disk in 0..4usize {
+        let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
+            continue;
+        };
+        for v in crate::fs::detect::probe(&mut dev) {
+            let mut part = crate::block::Partition::new(&mut dev, v.start_lba, v.sectors);
+            for name in names {
+                let data = match v.fs {
+                    FsType::Fat16 | FsType::Fat32 => crate::block::fat_read::FatReader::open(&mut part).and_then(|mut r| r.read_file(name)),
+                    FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => crate::block::ext4_read::Ext4Reader::open(&mut part).and_then(|mut r| {
+                        let sz = r.file_size(name)? as usize;
+                        let mut buf = alloc::vec![0u8; sz];
+                        let n = r.read_root_file(name, &mut buf)?;
+                        buf.truncate(n);
+                        Some(buf)
+                    }),
+                    _ => None,
+                };
+                if data.is_some() {
+                    return data;
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Read a file at an absolute path under some active `/mount` (FAT or ext4).
 /// Shared by `/cat` and `/voice models load`. `None` if not under a mount or
 /// not found.

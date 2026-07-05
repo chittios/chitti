@@ -345,7 +345,11 @@ fn aavmf_pflash_args() -> Result<Vec<String>, String> {
 fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> Result<PathBuf, String> {
     let img = repo_root().join("target/chitti-esp-aa64.img");
     let model_bytes = model.map(|m| fs::metadata(m).map(|md| md.len()).unwrap_or(0)).unwrap_or(0);
-    let size_mb = 64 + (model_bytes / (1024 * 1024)) + if model_bytes > 0 { 64 } else { 0 };
+    // Voice models bundled onto the ESP too (kernel mounts the FAT ESP and reads
+    // them). Grow the image to fit them.
+    let voice: Vec<(String, PathBuf)> = voice_model_assets().into_iter().filter(|(_, p)| p.exists()).map(|(n, p)| (n.to_string(), p)).collect();
+    let voice_bytes: u64 = voice.iter().map(|(_, p)| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
+    let size_mb = 64 + ((model_bytes + voice_bytes) / (1024 * 1024)) + if model_bytes > 0 { 64 } else { 0 };
     // Recreate the image only when contents changed (cheap heuristic: sizes).
     let f = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&img).map_err(|e| e.to_string())?;
     f.set_len(size_mb * 1024 * 1024).map_err(|e| e.to_string())?;
@@ -361,6 +365,7 @@ mkdir -p "$MNT/EFI/BOOT"
 cp "{stub}" "$MNT/EFI/BOOT/BOOTAA64.EFI"
 cp "{kernel}" "$MNT/chitti-kernel"
 {model_cp}
+{voice_cp}
 diskutil unmount "$DEV" > /dev/null
 hdiutil detach "$DEV" > /dev/null
 "#,
@@ -368,6 +373,8 @@ hdiutil detach "$DEV" > /dev/null
         stub = stub.display(),
         kernel = kernel.display(),
         model_cp = model.map(|m| format!("cp \"{}\" \"$MNT/model.gguf.000\"", m.display())).unwrap_or_default(),
+        // Voice models at the ESP root, so the kernel's root-file readers find them.
+        voice_cp = voice.iter().map(|(n, p)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), n)).collect::<Vec<_>>().join("\n"),
     );
     let status = Command::new("/bin/sh").arg("-c").arg(&script).status().map_err(|e| format!("building ESP image: {e}"))?;
     if !status.success() {
@@ -649,6 +656,19 @@ fn split_model_into_parts(model: &Path, dir: &Path, part_size: u64) -> Result<Ve
     Ok(names)
 }
 
+/// The voice models to bundle into images, as `(bundled-name, repo-relative
+/// path)`. Bundled only when present (gitignored; `cargo xtask voice-assets`
+/// downloads them). `bundled-name` is what the kernel matches: `find_module`
+/// (x86 Limine) and the on-disk filename (aarch64 ESP) both look for
+/// "kitten"/"parakeet".
+fn voice_model_assets() -> [(&'static str, PathBuf); 2] {
+    let root = repo_root();
+    [
+        ("kitten.onnx", root.join("assets/voice/kitten_tts_mini.onnx")),
+        ("parakeet.onnx", root.join("assets/voice/parakeet_ctc_int8.onnx")),
+    ]
+}
+
 fn assemble_image(kernel_bin: &Path) -> Result<PathBuf, String> {
     assemble_image_opt(kernel_bin, Some("assets/model.gguf"))
 }
@@ -739,6 +759,22 @@ fn assemble_image_opt(kernel_bin: &Path, model_rel: Option<&str>) -> Result<Path
         conf.push_str("    module_path: boot():/boot/payload/BOOTX64.EFI\n");
         conf.push_str("    module_path: boot():/boot/payload/chitti-kernel\n");
         fs::write(&conf_path, conf).map_err(|e| format!("declaring payload modules: {e}"))?;
+    }
+
+    // Bundle the voice models (STT/TTS) as Limine boot modules when present, so
+    // the kernel finds them by name (`find_module`) and auto-loads them — no
+    // manual `/voice models load`.
+    {
+        let conf_path = iso_root.join("boot/limine/limine.conf");
+        let mut conf = fs::read_to_string(&conf_path).map_err(|e| e.to_string())?;
+        for (name, path) in voice_model_assets() {
+            if path.exists() {
+                fs::copy(&path, iso_root.join("boot").join(name)).map_err(|e| format!("bundling voice model {name}: {e}"))?;
+                conf.push_str(&format!("    module_path: boot():/boot/{name}\n"));
+                eprintln!("bundled voice model {name} ({} MiB)", fs::metadata(&path).map(|m| m.len() >> 20).unwrap_or(0));
+            }
+        }
+        fs::write(&conf_path, conf).map_err(|e| format!("declaring voice modules: {e}"))?;
     }
 
     let iso_path = root.join("target/chitti.iso");
