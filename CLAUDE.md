@@ -51,7 +51,7 @@ capability exists on one arch, it exists on the other.
 
 After any change, verify both:
 
-- `cargo xtask build -arch x86_64` **and** `cargo xtask test` (must stay **112/112**)
+- `cargo xtask build -arch x86_64` **and** `cargo xtask test` (must stay **107/107**)
 - `cargo xtask build -arch aarch64` (and boot it via `cargo xtask run -arch aarch64`
   when the change is boot-visible)
 
@@ -150,14 +150,19 @@ real UEFI hardware.
   cream palette (fully re-themable from `ui.json`), and typography — is specified
   in [DESIGN.md](DESIGN.md); honour it for any UI change. NB: the scheduler is
   cooperative, so **any long or blocking operation must pump the UI itself** —
-  call `shell::ui_tick()` (caret blink + status/datetime + mouse cursor) and
-  `net::poll()` inside its loop, exactly as the per-token inference loops in
-  `Chat::turn` do. A tight compute loop that never yields freezes the clock,
-  mouse, and net stack until it returns. Any new UI surface or blocking command
-  must keep this upkeep running.
+  call `shell::upkeep()` (blink + status + mouse + `net::poll`) inside its
+  loop, exactly as the per-token inference loops, the ONNX per-node loop, and
+  the sliced FAT/ext4 readers do; loops that consume their own mouse events
+  (modals, the editor) use `shell::status_tick()` instead. A tight compute
+  loop that never yields freezes the clock, mouse, and net stack until it
+  returns. Any new UI surface or blocking command must keep this upkeep
+  running. The chat pane keeps a 2000-line scrollback (PgUp/PgDn; /clear
+  wipes it); Shift+Tab / Ctrl+Tab / clicking switches pane focus.
 - **Storage** — virtio/NVMe/AHCI block devices, GPT/MBR/FAT/ext4 detection,
-  ext4/FAT/SimpleFS, `/install` (self-hosting install to a disk), durable agent
-  state on ext4.
+  ext4 (the default filesystem) + FAT, `/install` (self-hosting install to a
+  disk; detects an existing Chitti GPT and **updates in place**, preserving the
+  data partition — destructive actions confirm via the permission modal),
+  durable agent state on ext4.
 - **Networking** (`net/`) — a full TCP/IP stack on [smoltcp](third_party/smoltcp)
   (vendored in-tree, 0BSD — see [THIRDPARTY-LICENSES.md](THIRDPARTY-LICENSES.md)):
   DHCPv4, static IP, DNS, ICMP (`/ping`), TCP/UDP. NIC drivers behind one
@@ -181,12 +186,17 @@ real UEFI hardware.
   path, use `tools/onnxdiff/` (host-side layer-by-layer diff of the kernel's
   own interpreter against onnxruntime) — not QEMU round trips.
 - **Agent chat protocol** — the shell chat is an agentic ReAct loop on the
-  Qwen3.5 template: tools come **dynamically from the registry** (manifest
+  Qwen3.5 template: the prompt advertises a small CORE tool set plus
+  `search_tools` (Claude-Code-style discovery over the registry — manifest
   toolset ∩ `tools::registry`; never hardcode a tool list in a prompt),
-  `<tool_call>` JSON in, `<tool_response>` back, thinking on by default
+  `<tool_call>` JSON in, `<tool_response>` back, thinking off by default
   (`/think`), `/mode manual|auto|bypass` gates agent tool calls through the
-  modal. Every agent has `/agent/<id>/{SOUL.md,skills/,memory/}`; SOUL.md is
-  prepended to its system prompt.
+  modal, Ctrl+C/Esc cancels prefill *and* decode, `/compact` rebuilds the KV
+  from a model-written summary. Agents are processes: `/agents` lists the
+  scheduler tasks that carry agent identity, `switch` re-homes the chat,
+  `kill` revokes a task's capability table. Every agent has
+  `/agent/<id>/{SOUL.md,skills/,memory/}`; SOUL.md is prepended to its system
+  prompt. The shell agent is the only default agent (boot demos removed).
 
 ## Build / run / test
 
@@ -194,7 +204,7 @@ Everything goes through `cargo xtask`. Arch is chosen explicitly, never
 host-detected. See [DEVELOPMENT.md](DEVELOPMENT.md) for the full setup.
 
 ```sh
-cargo xtask test                       # in-kernel test suite under QEMU (x86) — 112/112, no model
+cargo xtask test                       # in-kernel test suite under QEMU (x86) — 107/107, no model
 cargo xtask build -arch x86_64|aarch64 # cross-build the kernel
 cargo xtask run   -arch x86_64|aarch64 # boot in QEMU (aarch64 = native HVF on Apple Silicon)
 cargo xtask image -arch x86_64|aarch64 # assemble a bootable image/ISO
