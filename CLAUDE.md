@@ -119,7 +119,7 @@ real UEFI hardware.
   into a paired load HVF can't decode (`hvf: isv`).
 - **Sound & voice** (`sound/`, `onnx/`) — virtio-snd PCM in/out (S16 mono,
   poll-driven, descriptor chains) over virtio-mmio (aarch64) and virtio-PCI
-  (x86); `/voice` (waveform modal, level-gated utterances) and `/voice test`
+  (x86 QEMU), plus **Intel HDA** for VirtualBox (x86+ARM) and real hardware; `/voice` (waveform modal, level-gated utterances) and `/voice test`
   (tone + mic check). `onnx/` is a zero-copy no_std ONNX (protobuf) reader for
   the voice models — silero-vad v5 parses today; the op executor + parakeet STT
   and KittenTTS land incrementally. `cargo xtask voice-assets` downloads the

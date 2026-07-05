@@ -837,7 +837,7 @@ fn approval_mode() -> ApprovalMode {
 /// utterance capture) or a sound-hardware self-test (tone + 2 s mic sample).
 fn run_voice(arg: &str) {
     if !crate::sound::is_up() {
-        serial_println!("voice> no sound device (QEMU: -audiodev coreaudio,id=a -device virtio-sound-device,audiodev=a)");
+        serial_println!("voice> no sound device found");
         return;
     }
     let arg = arg.trim();
