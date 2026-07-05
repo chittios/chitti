@@ -115,6 +115,15 @@ fn logf(x: f32) -> f32 {
     ln_m + e as f32 * core::f32::consts::LN_2
 }
 
+/// Row-major strides for `dims` (element strides, innermost = 1).
+fn strides(dims: &[usize]) -> Vec<usize> {
+    let r = dims.len();
+    let mut s = vec![1usize; r];
+    for k in (0..r.saturating_sub(1)).rev() {
+        s[k] = s[k + 1] * dims[k + 1];
+    }
+    s
+}
 fn floorf(x: f32) -> f32 {
     let t = x as i64 as f32;
     if t > x {
@@ -1518,6 +1527,137 @@ fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), Stri
                 sub.outputs.iter().map(|o| child.get(*o).cloned().ok_or_else(|| alloc::format!("If: missing {o}"))).collect::<Result<Vec<_>, _>>()?
             }
             "Loop" => exec_loop(node, env)?,
+            "GatherElements" => {
+                // out[i] = data[... indices[i] at axis ...], same shape as indices.
+                let data = get(env, 0)?;
+                let ind = get(env, 1)?;
+                let r = data.dims.len();
+                let axis = {
+                    let a = attr_i(node, "axis", 0);
+                    (if a < 0 { a + r as i64 } else { a }) as usize
+                };
+                let istr = strides(&data.dims);
+                let axd = data.dims[axis] as i64;
+                let idxs = ind.ints();
+                let mut out = Vec::with_capacity(idxs.len());
+                let mut idx = vec![0usize; ind.dims.len()];
+                for &ix in &idxs {
+                    let mut off = 0usize;
+                    for k in 0..r {
+                        let coord = if k == axis { (if ix < 0 { ix + axd } else { ix }).clamp(0, axd - 1) as usize } else { idx[k] };
+                        off += coord * istr[k];
+                    }
+                    out.push(data.f[off]);
+                    for k in (0..ind.dims.len()).rev() {
+                        idx[k] += 1;
+                        if idx[k] < ind.dims[k] {
+                            break;
+                        }
+                        idx[k] = 0;
+                    }
+                }
+                vec![Val::new(ind.dims.clone(), out)]
+            }
+            "ScatterElements" => {
+                // copy of data, then out[scatter(indices)] = updates along axis.
+                let data = get(env, 0)?;
+                let ind = get(env, 1)?;
+                let upd = get(env, 2)?;
+                let r = data.dims.len();
+                let axis = {
+                    let a = attr_i(node, "axis", 0);
+                    (if a < 0 { a + r as i64 } else { a }) as usize
+                };
+                let istr = strides(&data.dims);
+                let axd = data.dims[axis] as i64;
+                let idxs = ind.ints();
+                let mut out = data.f.clone();
+                let mut idx = vec![0usize; ind.dims.len()];
+                for (n, &ix) in idxs.iter().enumerate() {
+                    let mut off = 0usize;
+                    for k in 0..r {
+                        let coord = if k == axis { (if ix < 0 { ix + axd } else { ix }).clamp(0, axd - 1) as usize } else { idx[k] };
+                        off += coord * istr[k];
+                    }
+                    out[off] = upd.f[n];
+                    for k in (0..ind.dims.len()).rev() {
+                        idx[k] += 1;
+                        if idx[k] < ind.dims[k] {
+                            break;
+                        }
+                        idx[k] = 0;
+                    }
+                }
+                vec![Val::new(data.dims.clone(), out)]
+            }
+            "ScatterND" => {
+                // indices[..,k] address the first k dims of data; updates fill the rest.
+                let data = get(env, 0)?;
+                let ind = get(env, 1)?;
+                let upd = get(env, 2)?;
+                let k = *ind.dims.last().unwrap_or(&0);
+                let n_updates: usize = ind.dims[..ind.dims.len() - 1].iter().product::<usize>().max(1);
+                let istr = strides(&data.dims);
+                let slice: usize = data.dims[k..].iter().product::<usize>().max(1);
+                let ii = ind.ints();
+                let mut out = data.f.clone();
+                for u in 0..n_updates {
+                    let mut base = 0usize;
+                    for d in 0..k {
+                        base += (ii[u * k + d].max(0) as usize) * istr[d];
+                    }
+                    for s in 0..slice {
+                        out[base + s] = upd.f[u * slice + s];
+                    }
+                }
+                vec![Val::new(data.dims.clone(), out)]
+            }
+            "TopK" => {
+                // Largest `k` along `axis`; returns (values, indices).
+                let x = get(env, 0)?;
+                let r = x.dims.len();
+                let axis = {
+                    let a = attr_i(node, "axis", -1);
+                    (if a < 0 { a + r as i64 } else { a }) as usize
+                };
+                let k = get(env, 1).ok().and_then(|t| t.ints().first().copied()).unwrap_or(1).max(0) as usize;
+                let al = x.dims[axis];
+                let inner: usize = x.dims[axis + 1..].iter().product::<usize>().max(1);
+                let outer: usize = x.dims[..axis].iter().product::<usize>().max(1);
+                let mut od = x.dims.clone();
+                od[axis] = k;
+                let mut vals = Vec::with_capacity(outer * k * inner);
+                let mut idxs: Vec<i64> = Vec::with_capacity(outer * k * inner);
+                for o in 0..outer {
+                    for s in 0..inner {
+                        let mut col: Vec<(f32, usize)> = (0..al).map(|a| (x.f[(o * al + a) * inner + s], a)).collect();
+                        col.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(core::cmp::Ordering::Equal));
+                        for t in 0..k {
+                            vals.push(col[t].0);
+                            idxs.push(col[t].1 as i64);
+                        }
+                    }
+                }
+                // Re-interleave into [outer, k, inner] layout.
+                let reorder = |flat: &[f32]| -> Vec<f32> {
+                    let mut out = vec![0f32; outer * k * inner];
+                    let mut p = 0;
+                    for o in 0..outer {
+                        for s in 0..inner {
+                            for t in 0..k {
+                                out[(o * k + t) * inner + s] = flat[p];
+                                p += 1;
+                            }
+                        }
+                    }
+                    out
+                };
+                let vf = reorder(&vals);
+                let vi: Vec<f32> = idxs.iter().map(|&x| x as f32).collect();
+                let vif = reorder(&vi);
+                let ii: Vec<i64> = vif.iter().map(|&x| x as i64).collect();
+                vec![Val::new(od.clone(), vf), Val { dims: od, f: vif, i: Some(ii) }]
+            }
             other => return Err(alloc::format!("unsupported op {other}")),
         };
         for (k, o) in node.outputs.iter().enumerate() {
@@ -1630,6 +1770,8 @@ mod tests {
         // ReduceSum axis 0 of [[1,2],[3,4]] = [4,6].
         let m = Val::new(alloc::vec![2, 2], alloc::vec![1., 2., 3., 4.]);
         assert_eq!(reduce(&m, &[0], false, "ReduceSum").f, alloc::vec![4., 6.]);
+        // strides([2,3,4]) = [12,4,1].
+        assert_eq!(strides(&[2, 3, 4]), alloc::vec![12, 4, 1]);
         // Tile [5,6] x3.
         let t = Val::new(alloc::vec![2], alloc::vec![5., 6.]);
         // (Tile is inline in the match; verify the reps logic via a direct build.)
