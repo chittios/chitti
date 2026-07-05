@@ -237,6 +237,10 @@ pub fn run() -> ! {
                     }
                 }
                 "info" => print_info(&orch, chat.as_ref()),
+                // `/voice` with no (or an unknown) subcommand is the interactive
+                // hear->think->speak conversation loop, which needs the live
+                // ChatSession; subcommands stay on the stateless system path.
+                "voice" if !voice_is_subcommand(arg) => voice_talk(&mut chat),
                 // Everything else is a stateless system command, shared with the
                 // agent tool layer (see `dispatch_system` / `run_tool_command`).
                 _ => {
@@ -254,7 +258,9 @@ pub fn run() -> ! {
             spin.clear();
         }
         match chat.as_mut() {
-            Some(sess) => sess.turn(msg),
+            Some(sess) => {
+                sess.turn(msg);
+            }
             None => serial_println!("no model bundled -- chat unavailable (try /infer, /do, /bench)"),
         }
     }
@@ -846,6 +852,14 @@ fn approval_mode() -> ApprovalMode {
 
 /// `/voice [test]` — the voice session (mic waveform modal + level-gated
 /// utterance capture) or a sound-hardware self-test (tone + 2 s mic sample).
+/// True if `/voice <arg>` names a stateless subcommand (test/models/stt/say) —
+/// i.e. not the bare conversation loop. Used by the shell to route bare `/voice`
+/// to the chat-driven `voice_talk` and everything else to `dispatch_system`.
+fn voice_is_subcommand(arg: &str) -> bool {
+    let a = arg.trim();
+    a == "test" || a == "models" || a.starts_with("models load") || a.starts_with("stt ") || a.starts_with("say ")
+}
+
 fn run_voice(arg: &str) {
     // Only audio playback/capture needs a sound device; model loading and STT
     // (which reads a WAV file) do not — so the check is per-branch, not here.
@@ -872,7 +886,11 @@ fn run_voice(arg: &str) {
     } else if let Some(text) = arg.strip_prefix("say ") {
         voice_say(text.trim());
     } else {
-        voice_talk();
+        // Bare `/voice` is the interactive conversation loop, which needs the
+        // shell's live ChatSession; the interactive loop intercepts it before
+        // reaching here (see `run_os`). Reaching this arm means the agent tool
+        // layer invoked it, where there is no chat to drive.
+        serial_println!("voice> conversation mode runs from the shell prompt (type /voice there); subcommands: test|models|stt <wav>|say <text>");
     }
 }
 
@@ -1155,10 +1173,28 @@ fn voice_test() {
 /// ends after ~800 ms of silence). Esc / q / Ctrl+C or the Stop button end the
 /// session. STT/TTS attach here as their models land; until then each captured
 /// utterance is reported with its length.
-fn voice_talk() {
+fn voice_talk(chat: &mut Option<ChatSession>) {
     if !crate::sound::is_up() {
         serial_println!("voice> no sound device found");
         return;
+    }
+    // The conversation loop needs STT (hear) and TTS (speak); load both up front
+    // so the first utterance doesn't stall mid-turn. Missing models degrade the
+    // loop rather than abort it (STT-only or TTS-only still narrates).
+    let have_stt = ensure_voice_model("parakeet");
+    let have_tts = ensure_voice_model("kitten");
+    if !have_stt {
+        serial_println!("voice> no parakeet (STT) model — utterances will be captured but not transcribed");
+    }
+    if !have_tts {
+        serial_println!("voice> no kitten (TTS) model — replies will be printed, not spoken");
+    }
+    // The LLM is what turns a transcript into a reply; load it now (same model
+    // the text chat uses) so a captured utterance can drive a turn.
+    if chat.is_none() {
+        let mut spin = Spinner::new("loading model");
+        *chat = ChatSession::load(&mut spin);
+        spin.clear();
     }
     serial_println!("voice> listening \u{2014} Esc (or the Stop button) ends the session");
     if let Err(e) = crate::sound::capture_start(16000) {
@@ -1214,14 +1250,19 @@ fn voice_talk() {
                         utter.extend_from_slice(&win);
                         if silent_ms > 800 {
                             let ms = utter.len() as u32 / 16;
-                            serial_println!(
-                                "voice> utterance captured: {} ms ({} samples, silero-gated) \u{2014} STT lands with the parakeet model",
-                                ms,
-                                utter.len()
-                            );
-                            utter.clear();
+                            serial_println!("voice> utterance captured: {} ms ({} samples, silero-gated)", ms, utter.len());
+                            let clip = core::mem::take(&mut utter);
                             in_speech = false;
                             silent_ms = 0;
+                            // Full pipeline: hear -> think -> speak. Playback and
+                            // capture share the device, so stop capture first, run
+                            // the turn, then resume listening (VAD reset).
+                            crate::sound::capture_stop();
+                            voice_converse_turn(chat, &clip, have_stt, have_tts, &mut levels);
+                            crate::sound::vad::reset();
+                            vadbuf.clear();
+                            let _ = crate::sound::capture_start(16000);
+                            crate::framebuffer::draw_voice(&levels, "listening\u{2026}");
                         }
                     }
                 }
@@ -1235,6 +1276,64 @@ fn voice_talk() {
     }
     crate::sound::capture_stop();
     serial_println!("voice> session ended");
+}
+
+/// One voice-conversation turn: transcribe the captured `clip` (STT), feed the
+/// transcript to the LLM (`ChatSession::turn`), then speak the reply (TTS). Each
+/// stage degrades independently — no STT model → the clip is only reported; no
+/// LLM → nothing to say; no TTS → the reply is printed but not synthesised.
+#[cfg(not(test))]
+fn voice_converse_turn(
+    chat: &mut Option<ChatSession>,
+    clip: &[i16],
+    have_stt: bool,
+    have_tts: bool,
+    levels: &mut alloc::vec::Vec<f32>,
+) {
+    // 1. Hear.
+    let heard = if have_stt {
+        crate::framebuffer::draw_voice(levels, "transcribing\u{2026}");
+        let t = crate::sound::stt::transcribe(clip);
+        serial_println!("voice> you: {}", t);
+        t
+    } else {
+        alloc::string::String::new()
+    };
+    let heard = heard.trim();
+    if heard.is_empty() {
+        // STT unavailable or produced nothing intelligible: keep listening.
+        serial_println!("voice> (nothing to transcribe \u{2014} continuing to listen)");
+        return;
+    }
+    // 2. Think.
+    let reply = match chat.as_mut() {
+        Some(sess) => {
+            crate::framebuffer::draw_voice(levels, "thinking\u{2026}");
+            sess.turn(heard)
+        }
+        None => {
+            serial_println!("voice> (no LLM loaded \u{2014} cannot reply)");
+            return;
+        }
+    };
+    let reply = reply.trim();
+    if reply.is_empty() {
+        return;
+    }
+    // 3. Speak.
+    if have_tts {
+        crate::framebuffer::draw_voice(levels, "speaking\u{2026}");
+        match crate::sound::tts::synth(reply) {
+            Ok(pcm) => {
+                let _ = crate::sound::play(&pcm, crate::sound::tts::RATE);
+                while crate::sound::playing() {
+                    ui_tick();
+                    crate::sched::yield_now();
+                }
+            }
+            Err(e) => serial_println!("voice> tts: {}", e),
+        }
+    }
 }
 
 /// `/mode manual|auto|bypass` — set (or show) the approval mode.
@@ -1341,7 +1440,9 @@ impl ChatSession {
     /// emit a `<tool_call>` (executed; its output returned in a
     /// `<tool_response>` block) or a final answer. Bounded by `MAX_TOOL_ITERS`
     /// so a confused small model can't loop forever.
-    fn turn(&mut self, msg: &str) {
+    /// Returns the final assistant answer (post-`<think>`) — used by the voice
+    /// loop to speak the reply; the interactive shell caller ignores it.
+    fn turn(&mut self, msg: &str) -> alloc::string::String {
         const MAX_TOOL_ITERS: usize = 4;
         if self.pos == 0 {
             self.prefill_turn("system\n", &agent_system_prompt(), false);
@@ -1358,7 +1459,7 @@ impl ChatSession {
                 if last_call.as_ref() == Some(&pair) {
                     if nudged {
                         serial_println!("\x1b[33m[tool loop stopped: repeated call]\x1b[0m");
-                        return;
+                        return alloc::string::String::new();
                     }
                     nudged = true;
                     self.prefill_turn(
@@ -1392,10 +1493,11 @@ impl ChatSession {
                     let fb = alloc::format!("<tool_response>\n{}\n</tool_response>", obs);
                     self.prefill_turn("user\n", &fb, true);
                 }
-                None => return, // final answer already streamed
+                None => return text, // final answer already streamed
             }
         }
         serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
+        alloc::string::String::new()
     }
 
     /// Encode `<|im_start|>{header}{body}<|im_end|>\n` into the running context
