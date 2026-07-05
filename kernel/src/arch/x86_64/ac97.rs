@@ -128,14 +128,10 @@ impl Ac97 {
 }
 
 impl SndDevice for Ac97 {
-    fn play(&mut self, pcm: &[i16], _hz: u32) -> Result<(), &'static str> {
-        // 3:1 upsample to 48 kHz.
-        let mut up: Vec<i16> = Vec::with_capacity(pcm.len() * 3);
-        for &s in pcm {
-            up.push(s);
-            up.push(s);
-            up.push(s);
-        }
+    fn play(&mut self, pcm: &[i16], hz: u32) -> Result<(), &'static str> {
+        // AC'97 PCM-out runs at a fixed 48 kHz; resample whatever the caller
+        // provides (16 kHz tones, 24 kHz TTS) instead of assuming 16 kHz.
+        let up: Vec<i16> = crate::sound::resample(pcm, hz, 48_000);
         // SAFETY: DMA buffers + AC'97 I/O ports are the driver's.
         unsafe {
             // Reset PCM Out engine.

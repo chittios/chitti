@@ -511,19 +511,14 @@ impl Hda {
 }
 
 impl SndDevice for Hda {
-    fn play(&mut self, pcm: &[i16], _hz: u32) -> Result<(), &'static str> {
-        // Upsample 3:1 if the codec has no native 16 kHz.
-        let samples: Vec<i16> = if self.native_16k {
-            pcm.to_vec()
-        } else {
-            let mut v = Vec::with_capacity(pcm.len() * 3);
-            for &s in pcm {
-                v.push(s);
-                v.push(s);
-                v.push(s);
-            }
-            v
-        };
+    fn play(&mut self, pcm: &[i16], hz: u32) -> Result<(), &'static str> {
+        // Playback always runs the stream at 48 kHz (every codec's base rate)
+        // and resamples the input to it — `hz` varies by caller: 16 kHz test
+        // tones/mic loops, 24 kHz KittenTTS. (Capture keeps the native-16k
+        // path; see `fmt`/`hw_rate`.)
+        const PLAY_HZ: u32 = 48_000;
+        const PLAY_FMT: u16 = 1 << 4; // base 48 kHz, 16-bit, mono
+        let samples: Vec<i16> = crate::sound::resample(pcm, hz, PLAY_HZ);
         let bytes = samples.len() * 2;
         if bytes == 0 {
             return Ok(());
@@ -549,10 +544,10 @@ impl SndDevice for Hda {
             w32(sd + SD_BDPU, (bdl.0 >> 32) as u32);
             w32(sd + SD_CBL, bytes as u32);
             w16(sd + SD_LVI, 1);
-            w16(sd + SD_FMT, self.fmt());
+            w16(sd + SD_FMT, PLAY_FMT);
             // Bind the converter to stream tag 1, channel 0 + format.
             self.verb(self.dac, V_SET_STREAM, 1 << 4);
-            self.verb16(self.dac, V_SET_FORMAT, self.fmt() as u32);
+            self.verb16(self.dac, V_SET_FORMAT, PLAY_FMT as u32);
             // Tag 1 into CTL byte 2, IOC enable, run.
             w32(sd + SD_CTL, (1 << 20) | SDCTL_IOCE | SDCTL_RUN);
         }
