@@ -21,6 +21,44 @@ use alloc::vec::Vec;
 /// tracing every node of a 3000-node model over serial would swamp the kernel.
 pub static NODE_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Per-op wall-time accounting (kernel only — the host harness has its own
+/// timestamps). One `ktrace` summary line per `run()`: where a synthesis
+/// actually spent its time, by op type. Fixed table + linear scan; op-name
+/// sets are tiny.
+#[cfg(target_os = "none")]
+mod optime {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    /// Known-hot ops; anything else lands in the trailing "other" bucket.
+    pub const OPS: [&str; 16] = [
+        "ConvInteger", "Conv", "ConvTranspose", "MatMulInteger", "MatMul", "Mul", "Add", "Resize", "Expand",
+        "InstanceNormalization", "LeakyRelu", "DynamicQuantizeLinear", "DynamicQuantizeLSTM", "ScatterND", "Loop",
+        "other",
+    ];
+    static MS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+
+    pub fn add(op: &str, ms: u64) {
+        if ms == 0 {
+            return;
+        }
+        let i = OPS.iter().position(|&o| o == op).unwrap_or(OPS.len() - 1);
+        MS[i].fetch_add(ms, Ordering::Relaxed);
+    }
+
+    /// Log the per-op totals (descending) and reset.
+    pub fn dump() {
+        let mut rows: alloc::vec::Vec<(&str, u64)> =
+            OPS.iter().enumerate().map(|(i, &o)| (o, MS[i].swap(0, Ordering::Relaxed))).filter(|&(_, ms)| ms > 0).collect();
+        rows.sort_by_key(|&(_, ms)| core::cmp::Reverse(ms));
+        let mut line = alloc::string::String::new();
+        for (op, ms) in rows.iter().take(8) {
+            line.push_str(&alloc::format!("{op}={ms}ms "));
+        }
+        if !line.is_empty() {
+            crate::ktrace::log_fmt(format_args!("onnx: op time: {line}"));
+        }
+    }
+}
+
 fn trace_node(op: &str, name: &str, v: &Val) {
     if !NODE_TRACE.load(core::sync::atomic::Ordering::Relaxed) {
         return;
@@ -437,6 +475,14 @@ fn reduce(v: &Val, axes: &[i64], keep: bool, op: &str) -> Val {
 
 /// 1-D convolution (grouped/depthwise), shared by `Conv` and `ConvInteger`
 /// (the latter passes input/weight zero-points).
+///
+/// Organised as **im2col tiles + the SIMD dot kernel**: the input is copied
+/// once into a zero-padded, zero-point-folded buffer (padding contributes
+/// exactly 0, so the inner loops need no bounds checks), weights are zp-folded
+/// once, and each tile of output positions is gathered into contiguous
+/// `[ccg*k]` columns dotted against each output channel's contiguous weight
+/// row via `tensor::dot_f32` (NEON/AVX2/SSE2). This is the vocoder's hot loop —
+/// the naive quadruple scalar loop it replaces was ~90 % of `/voice say`.
 fn conv1d(x: &Val, w: &Val, bias: Option<&Val>, node: &super::Node<'_>, xzp: f32, wzp: f32) -> Val {
     let (nb, c, iw) = (x.dims[0], x.dims[1], x.dims[2]);
     let (m, cg, k) = (w.dims[0], w.dims[1], w.dims[2]);
@@ -449,25 +495,80 @@ fn conv1d(x: &Val, w: &Val, bias: Option<&Val>, node: &super::Node<'_>, xzp: f32
     let ow = (iw + p0 + p1).saturating_sub(d * (k - 1) + 1) / s + 1;
     let cpg = c / groups;
     let mpg = m / groups;
+    let ccg = cg.min(cpg);
+    // Weight rows with the zero-point folded in: wp[om] is contiguous [cg*k].
+    let wp: Vec<f32> = if wzp == 0.0 {
+        w.f.clone()
+    } else {
+        w.f.iter().map(|&v| v - wzp).collect()
+    };
+    // Input with padding + zero-point folded: xp[c][p0 + iw + p1]; padded cells
+    // hold 0 == (xzp - xzp), the exact ConvInteger padding semantics.
+    let iwp = p0 + iw + p1;
     let mut out = vec![0f32; nb * m * ow];
+    let mut xp = vec![0f32; c * iwp];
+    // One gathered tile of output positions (bounded scratch, reused).
+    const TILE: usize = 32;
+    let mut col = vec![0f32; TILE * ccg * k];
     for n in 0..nb {
-        for om in 0..m {
-            let g = om / mpg;
-            let b = bias.map(|bb| bb.f[om]).unwrap_or(0.0);
-            for o in 0..ow {
-                let mut acc = b;
-                for ic in 0..cg.min(cpg) {
-                    let xc = g * cpg + ic;
-                    for kk in 0..k {
-                        let xi = (o * s + kk * d) as i64 - p0 as i64;
-                        if xi < 0 || xi >= iw as i64 {
-                            continue;
+        for ch in 0..c {
+            let src = &x.f[(n * c + ch) * iw..(n * c + ch) * iw + iw];
+            let dst = &mut xp[ch * iwp + p0..ch * iwp + p0 + iw];
+            if xzp == 0.0 {
+                dst.copy_from_slice(src);
+            } else {
+                for (dv, &sv) in dst.iter_mut().zip(src) {
+                    *dv = sv - xzp;
+                }
+            }
+        }
+        #[cfg(target_os = "none")]
+        let (mut gather_ms, mut dot_ms) = (0u64, 0u64);
+        for g in 0..groups {
+            for o0 in (0..ow).step_by(TILE) {
+                let tn = TILE.min(ow - o0);
+                #[cfg(target_os = "none")]
+                let tg = crate::arch::now_ms();
+                // Gather: col[t][ic*k + kk] = xp[g*cpg+ic][(o0+t)*s + kk*d].
+                for t in 0..tn {
+                    let base = (o0 + t) * s;
+                    let crow = &mut col[t * ccg * k..(t + 1) * ccg * k];
+                    for ic in 0..ccg {
+                        let xrow = &xp[(g * cpg + ic) * iwp..(g * cpg + ic + 1) * iwp];
+                        let dst = &mut crow[ic * k..ic * k + k];
+                        if d == 1 {
+                            dst.copy_from_slice(&xrow[base..base + k]);
+                        } else {
+                            for (kk, dv) in dst.iter_mut().enumerate() {
+                                *dv = xrow[base + kk * d];
+                            }
                         }
-                        acc += (x.f[(n * c + xc) * iw + xi as usize] - xzp) * (w.f[(om * cg + ic) * k + kk] - wzp);
                     }
                 }
-                out[(n * m + om) * ow + o] = acc;
+                #[cfg(target_os = "none")]
+                let td = crate::arch::now_ms();
+                #[cfg(target_os = "none")]
+                {
+                    gather_ms += td.saturating_sub(tg);
+                }
+                for mm in 0..mpg {
+                    let om = g * mpg + mm;
+                    let b = bias.map(|bb| bb.f[om]).unwrap_or(0.0);
+                    let wrow = &wp[om * cg * k..om * cg * k + ccg * k];
+                    let orow = (n * m + om) * ow + o0;
+                    for t in 0..tn {
+                        out[orow + t] = b + crate::cortex::tensor::dot_f32(wrow, &col[t * ccg * k..(t + 1) * ccg * k]);
+                    }
+                }
+                #[cfg(target_os = "none")]
+                {
+                    dot_ms += crate::arch::now_ms().saturating_sub(td);
+                }
             }
+        }
+        #[cfg(target_os = "none")]
+        if gather_ms + dot_ms > 500 {
+            crate::ktrace::log_fmt(format_args!("conv1d [{m},{cg},{k}]x{ow} d={d}: gather {gather_ms} ms, dot {dot_ms} ms"));
         }
     }
     Val::new(vec![nb, m, ow], out)
@@ -716,8 +817,12 @@ fn exec_loop<'t>(node: &super::Node<'t>, env: &BTreeMap<String, Val>, inits: &BT
     let n_scan = body.outputs.len().saturating_sub(1 + n_carried);
     let mut scans: Vec<Vec<Val>> = vec![Vec::new(); n_scan];
     let mut iter = 0i64;
+    // One child env for the whole loop (a fresh clone of the enclosing scope
+    // per iteration copied every captured tensor 15× in kitten's alignment
+    // loop). Reuse is safe: body-produced names are simply overwritten next
+    // iteration, and carried values are re-inserted below.
+    let mut child = env.clone();
     while cond && iter < max_trip && iter < 100_000 {
-        let mut child = env.clone();
         child.insert(body.inputs[0].to_string(), Val { dims: vec![], f: vec![iter as f32], i: Some(vec![iter]), seq: None });
         if body.inputs.len() > 1 {
             child.insert(body.inputs[1].to_string(), Val::new(vec![], vec![if cond { 1.0 } else { 0.0 }]));
@@ -795,6 +900,24 @@ fn bcast_get(v: &Val, od: &[usize], idx: &[usize]) -> f32 {
 fn elementwise2(a: &Val, b: &Val, f: impl Fn(f32, f32) -> f32) -> Val {
     let od = broadcast_dims(&a.dims, &b.dims);
     let n: usize = od.iter().product::<usize>().max(1);
+    // Fast paths for the overwhelmingly common cases — same shape, or one side
+    // scalar — skip the per-element multi-index/stride machinery entirely
+    // (dequant applies a scalar scale to multi-megabyte tensors; the generic
+    // path made that one of the hottest "ops" in TTS).
+    if a.f.len() == n && b.f.len() == n {
+        let out = a.f.iter().zip(&b.f).map(|(&x, &y)| f(x, y)).collect();
+        return Val::new(od, out);
+    }
+    if b.f.len() == 1 {
+        let y = b.f[0];
+        let out = a.f.iter().map(|&x| f(x, y)).collect();
+        return Val::new(od, out);
+    }
+    if a.f.len() == 1 {
+        let x = a.f[0];
+        let out = b.f.iter().map(|&y| f(x, y)).collect();
+        return Val::new(od, out);
+    }
     let mut out = Vec::with_capacity(n);
     let mut idx = vec![0usize; od.len()];
     for _ in 0..n {
@@ -821,12 +944,25 @@ pub fn run(model: &Model<'_>, feeds: &[(&str, Val)]) -> Result<BTreeMap<String, 
     // Initializers are materialised lazily, per node, so a big quantized model
     // (int8/f16 weights expand 4×/2× to f32) doesn't all sit resident at once.
     exec_graph(g, &mut env, &BTreeMap::new())?;
+    #[cfg(target_os = "none")]
+    optime::dump();
     let mut out = BTreeMap::new();
     for o in &g.outputs {
         let v = env.get(*o).ok_or_else(|| alloc::format!("missing output {o}"))?;
         out.insert((*o).to_string(), v.clone());
     }
     Ok(out)
+}
+
+/// Borrowing input lookup for the heavy ops (elementwise/matmul/conv): they
+/// only read their inputs, and cloning a multi-MB activation per access is
+/// real time on the kernel's linked-list allocator.
+fn getr_impl<'e>(env: &'e BTreeMap<String, Val>, node: &super::Node<'_>, i: usize) -> Result<&'e Val, String> {
+    let name = node.inputs.get(i).copied().unwrap_or("");
+    if name.is_empty() {
+        return Err(alloc::format!("{}: missing input {i}", node.op));
+    }
+    env.get(name).ok_or_else(|| alloc::format!("{}: unbound input '{name}'", node.op))
 }
 
 fn attr_i(n: &super::Node<'_>, name: &str, dflt: i64) -> i64 {
@@ -998,6 +1134,9 @@ fn exec_graph<'t>(g: &'t Graph<'t>, env: &mut BTreeMap<String, Val>, outer_inits
             }
             env.get(name).cloned().ok_or_else(|| alloc::format!("{}: unbound input '{name}'", node.op))
         };
+        let getr = |env, i| getr_impl(env, node, i);
+        #[cfg(target_os = "none")]
+        let t_op = crate::arch::now_ms();
         let out: Vec<Val> = match node.op {
             "Constant" => {
                 let t = node
@@ -1267,15 +1406,15 @@ fn exec_graph<'t>(g: &'t Graph<'t>, env: &mut BTreeMap<String, Val>, outer_inits
                 }
                 vec![Val::new(od, out)]
             }
-            "Add" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| a + b)],
-            "Sub" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| a - b)],
-            "Mul" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| a * b)],
-            "Div" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| a / b)],
-            "Pow" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| powf(a, b))],
-            "Equal" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| if a == b { 1.0 } else { 0.0 })],
-            "Less" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| if a < b { 1.0 } else { 0.0 })],
-            "Greater" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| if a > b { 1.0 } else { 0.0 })],
-            "And" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| if a != 0.0 && b != 0.0 { 1.0 } else { 0.0 })],
+            "Add" => vec![elementwise2(getr(env, 0)?, getr(env, 1)?, |a, b| a + b)],
+            "Sub" => vec![elementwise2(getr(env, 0)?, getr(env, 1)?, |a, b| a - b)],
+            "Mul" => vec![elementwise2(getr(env, 0)?, getr(env, 1)?, |a, b| a * b)],
+            "Div" => vec![elementwise2(getr(env, 0)?, getr(env, 1)?, |a, b| a / b)],
+            "Pow" => vec![elementwise2(getr(env, 0)?, getr(env, 1)?, |a, b| powf(a, b))],
+            "Equal" => vec![elementwise2(getr(env, 0)?, getr(env, 1)?, |a, b| if a == b { 1.0 } else { 0.0 })],
+            "Less" => vec![elementwise2(getr(env, 0)?, getr(env, 1)?, |a, b| if a < b { 1.0 } else { 0.0 })],
+            "Greater" => vec![elementwise2(getr(env, 0)?, getr(env, 1)?, |a, b| if a > b { 1.0 } else { 0.0 })],
+            "And" => vec![elementwise2(getr(env, 0)?, getr(env, 1)?, |a, b| if a != 0.0 && b != 0.0 { 1.0 } else { 0.0 })],
             "Not" => {
                 let mut v = get(env, 0)?;
                 for x in &mut v.f {
@@ -1513,18 +1652,16 @@ fn exec_graph<'t>(g: &'t Graph<'t>, env: &mut BTreeMap<String, Val>, outer_inits
                 let iv: Vec<i64> = f.iter().map(|&x| x as i64).collect();
                 vec![Val { dims: vec![n], f, i: Some(iv), seq: None }]
             }
-            "MatMul" => vec![matmul(&get(env, 0)?, &get(env, 1)?, 0.0, 0.0)],
+            "MatMul" => vec![matmul(getr(env, 0)?, getr(env, 1)?, 0.0, 0.0)],
             "MatMulInteger" => {
-                let a = get(env, 0)?;
-                let b = get(env, 1)?;
                 let azp = get(env, 2).ok().and_then(|t| t.f.first().copied()).unwrap_or(0.0);
                 let bzp = get(env, 3).ok().and_then(|t| t.f.first().copied()).unwrap_or(0.0);
-                vec![matmul(&a, &b, azp, bzp)]
+                vec![matmul(getr(env, 0)?, getr(env, 1)?, azp, bzp)]
             }
             "DynamicQuantizeLinear" => {
                 // y = clamp(round(x/scale)+zp,0,255); scale=(hi-lo)/255 over
                 // [min(x,0), max(x,0)]; zp=round(-lo/scale).
-                let x = get(env, 0)?;
+                let x = getr(env, 0)?;
                 let mut lo = 0f32;
                 let mut hi = 0f32;
                 for &v in &x.f {
@@ -1634,12 +1771,12 @@ fn exec_graph<'t>(g: &'t Graph<'t>, env: &mut BTreeMap<String, Val>, outer_inits
                 vec![Val::new(od, acc)]
             }
             "Conv" => {
-                let x = get(env, 0)?;
-                let w = get(env, 1)?;
+                let x = getr(env, 0)?;
+                let w = getr(env, 1)?;
                 let b = get(env, 2).ok();
                 match w.dims.len() {
-                    3 => vec![conv1d(&x, &w, b.as_ref(), node, 0.0, 0.0)],
-                    4 => vec![conv2d(&x, &w, b.as_ref(), node, 0.0, 0.0)],
+                    3 => vec![conv1d(x, w, b.as_ref(), node, 0.0, 0.0)],
+                    4 => vec![conv2d(x, w, b.as_ref(), node, 0.0, 0.0)],
                     _ => return Err(alloc::format!("Conv: only 1-D/2-D supported (got x{:?} w{:?})", x.dims, w.dims)),
                 }
             }
@@ -1920,17 +2057,20 @@ fn exec_graph<'t>(g: &'t Graph<'t>, env: &mut BTreeMap<String, Val>, outer_inits
             "ConvInteger" => {
                 // int8 conv: like Conv, x/w are u8, optional zero-points. 1-D and
                 // 2-D (NeMo conv-subsampling front-end) both route here.
-                let x = get(env, 0)?;
-                let w = get(env, 1)?;
                 let xzp = get(env, 2).ok().and_then(|t| t.f.first().copied()).unwrap_or(0.0);
                 let wzp = get(env, 3).ok().and_then(|t| t.f.first().copied()).unwrap_or(0.0);
+                let x = getr(env, 0)?;
+                let w = getr(env, 1)?;
                 match w.dims.len() {
-                    3 => vec![conv1d(&x, &w, None, node, xzp, wzp)],
-                    4 => vec![conv2d(&x, &w, None, node, xzp, wzp)],
+                    3 => vec![conv1d(x, w, None, node, xzp, wzp)],
+                    4 => vec![conv2d(x, w, None, node, xzp, wzp)],
                     _ => return Err(alloc::format!("ConvInteger: only 1-D/2-D supported (got x{:?} w{:?})", x.dims, w.dims)),
                 }
             }
-            "ConvTranspose" => vec![conv_transpose1d(&get(env, 0)?, &get(env, 1)?, get(env, 2).ok().as_ref(), node)],
+            "ConvTranspose" => {
+                let b = get(env, 2).ok();
+                vec![conv_transpose1d(getr(env, 0)?, getr(env, 1)?, b.as_ref(), node)]
+            }
             "Resize" => {
                 // Nearest / linear resize; scales in input 2 or sizes in input 3.
                 let x = get(env, 0)?;
@@ -2204,12 +2344,14 @@ fn exec_graph<'t>(g: &'t Graph<'t>, env: &mut BTreeMap<String, Val>, outer_inits
             }
             other => return Err(alloc::format!("unsupported op {other}")),
         };
-        for (k, o) in node.outputs.iter().enumerate() {
+        #[cfg(target_os = "none")]
+        optime::add(node.op, crate::arch::now_ms().saturating_sub(t_op));
+        // Move (not clone) each output into the env — a clone here was a full
+        // tensor copy per node, painful on the kernel allocator.
+        for (v, o) in out.into_iter().zip(node.outputs.iter()) {
             if !o.is_empty() {
-                if let Some(v) = out.get(k) {
-                    trace_node(node.op, o, v);
-                    env.insert((*o).to_string(), v.clone());
-                }
+                trace_node(node.op, o, &v);
+                env.insert((*o).to_string(), v);
             }
         }
         // Drop tensors whose last use was this node (frees activations as the

@@ -26,6 +26,10 @@ pub struct FatReader<'d, D: BlockDevice> {
     root_secs: u64,  // FAT16: root-dir sectors
     root_clus: u32,  // FAT32: root directory first cluster
     data_lba: u64,   // first sector of cluster 2
+    /// Last FAT sector read (`(lba, data)`) — chain walks hit the same sector
+    /// ~128 times in a row (FAT32: 128 entries/sector), so this one-line cache
+    /// turns per-cluster FAT reads into one read per 64 KiB of file.
+    fat_cache: Option<(u64, [u8; BLOCK_SIZE])>,
 }
 
 impl<'d, D: BlockDevice> FatReader<'d, D> {
@@ -61,7 +65,7 @@ impl<'d, D: BlockDevice> FatReader<'d, D> {
         let clusters = (total - data_lba) / spc;
         let fat32 = clusters >= 65525;
         let root_clus = if fat32 { le32(&bs, 44) } else { 0 };
-        Some(FatReader { dev, fat32, spc, fat_lba, root_lba, root_secs, root_clus, data_lba })
+        Some(FatReader { dev, fat32, spc, fat_lba, root_lba, root_secs, root_clus, data_lba, fat_cache: None })
     }
 
     fn cluster_lba(&self, clus: u32) -> u64 {
@@ -70,16 +74,19 @@ impl<'d, D: BlockDevice> FatReader<'d, D> {
 
     /// Next cluster in the chain, or None at end-of-chain.
     fn next_cluster(&mut self, clus: u32) -> Option<u32> {
-        let mut sec = [0u8; BLOCK_SIZE];
+        let off = clus as u64 * if self.fat32 { 4 } else { 2 };
+        let lba = self.fat_lba + off / BLOCK_SIZE as u64;
+        if self.fat_cache.map(|(l, _)| l) != Some(lba) {
+            let mut sec = [0u8; BLOCK_SIZE];
+            self.dev.read_block(lba, &mut sec).ok()?;
+            self.fat_cache = Some((lba, sec));
+        }
+        let sec = &self.fat_cache.as_ref().unwrap().1;
         if self.fat32 {
-            let off = clus as u64 * 4;
-            self.dev.read_block(self.fat_lba + off / BLOCK_SIZE as u64, &mut sec).ok()?;
-            let n = le32(&sec, (off % BLOCK_SIZE as u64) as usize) & 0x0FFF_FFFF;
+            let n = le32(sec, (off % BLOCK_SIZE as u64) as usize) & 0x0FFF_FFFF;
             (n >= 2 && n < 0x0FFF_FFF8).then_some(n)
         } else {
-            let off = clus as u64 * 2;
-            self.dev.read_block(self.fat_lba + off / BLOCK_SIZE as u64, &mut sec).ok()?;
-            let n = le16(&sec, (off % BLOCK_SIZE as u64) as usize) as u32;
+            let n = le16(sec, (off % BLOCK_SIZE as u64) as usize) as u32;
             (n >= 2 && n < 0xFFF8).then_some(n)
         }
     }
@@ -225,26 +232,50 @@ impl<'d, D: BlockDevice> FatReader<'d, D> {
                 dir = clus;
                 continue;
             }
-            // Final component: read the file's cluster chain.
+            // Final component: read the file's cluster chain. Contiguous
+            // cluster runs are coalesced into one `read_blocks` (virtio issues
+            // a single multi-sector request) straight into the output buffer —
+            // a per-sector loop here made a 131 MB model take minutes to load.
             if is_dir {
                 return None;
             }
+            let bpc = self.spc as usize * BLOCK_SIZE;
             let mut out = vec![0u8; size as usize];
             let mut done = 0usize;
-            let mut c = clus;
-            let mut sec = [0u8; BLOCK_SIZE];
+            let mut cur = Some(clus);
             while done < out.len() {
-                for s in 0..self.spc {
-                    if done >= out.len() {
-                        break;
+                let c0 = cur?;
+                // Extend the run [c0, c0+run) while the chain stays contiguous
+                // and more clusters are needed.
+                let mut run = 1usize;
+                let mut tail = c0;
+                cur = None;
+                while done + run * bpc < out.len() {
+                    match self.next_cluster(tail) {
+                        Some(n) if n == tail as u32 + 1 => {
+                            tail = n;
+                            run += 1;
+                        }
+                        next => {
+                            cur = next;
+                            break;
+                        }
                     }
-                    self.dev.read_block(self.cluster_lba(c) + s, &mut sec).ok()?;
-                    let take = (out.len() - done).min(BLOCK_SIZE);
+                }
+                let want = (out.len() - done).min(run * bpc);
+                let full = want / BLOCK_SIZE * BLOCK_SIZE;
+                let lba = self.cluster_lba(c0);
+                if full > 0 {
+                    self.dev.read_blocks(lba, &mut out[done..done + full]).ok()?;
+                    done += full;
+                }
+                if done < out.len() && want > full {
+                    // Trailing partial sector: bounce through a sector buffer.
+                    let mut sec = [0u8; BLOCK_SIZE];
+                    self.dev.read_block(lba + (full / BLOCK_SIZE) as u64, &mut sec).ok()?;
+                    let take = want - full;
                     out[done..done + take].copy_from_slice(&sec[..take]);
                     done += take;
-                }
-                if done < out.len() {
-                    c = self.next_cluster(c)?;
                 }
             }
             return Some(out);

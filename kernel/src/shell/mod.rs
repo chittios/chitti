@@ -924,10 +924,40 @@ fn voice_say(text: &str) {
 /// input a zero tensor of its declared shape (dynamic dims → 1) unless the
 /// model needs real inputs, and reports each output's shape + a value preview.
 fn run_onnx(arg: &str) {
+    if arg.trim() == "bench" {
+        // Raw dot_f32 throughput: the inner kernel of every conv/matmul the
+        // voice models run — isolates SIMD/memory speed from graph overhead.
+        let n = 1408usize;
+        let a = alloc::vec![1.0f32; n];
+        let b = alloc::vec![0.5f32; n];
+        let iters = 200_000u64;
+        let t0 = crate::arch::now_ms();
+        let mut acc = 0f32;
+        for _ in 0..iters {
+            acc += crate::cortex::tensor::dot_f32(&a, &b);
+        }
+        let ms = crate::arch::now_ms().saturating_sub(t0).max(1);
+        let gmacs = (iters as f64 * n as f64) / (ms as f64 * 1e6);
+        serial_println!("onnx> dot_f32 (NEON) len {}: {} ms = {:.2} GMAC/s (acc {})", n, ms, gmacs, acc);
+        // Scalar f32 baseline: distinguishes "NEON is slow" from "all FP is slow".
+        let t1 = crate::arch::now_ms();
+        let mut acc2 = 0f32;
+        for _ in 0..iters / 10 {
+            let mut s = 0f32;
+            for i in 0..n {
+                s += a[i] * b[i];
+            }
+            acc2 += s;
+        }
+        let ms2 = crate::arch::now_ms().saturating_sub(t1).max(1);
+        let gm2 = (iters as f64 / 10.0 * n as f64) / (ms2 as f64 * 1e6);
+        serial_println!("onnx> dot scalar len {}: {} ms = {:.2} GMAC/s (acc {})", n, ms2, gm2, acc2);
+        return;
+    }
     let (sub, path) = match arg.trim().split_once(' ') {
         Some((s, p)) => (s, p.trim()),
         None => {
-            serial_println!("onnx> usage: /onnx info <path> | /onnx run <path>  (path on a mounted volume)");
+            serial_println!("onnx> usage: /onnx info <path> | /onnx run <path> | /onnx bench");
             return;
         }
     };

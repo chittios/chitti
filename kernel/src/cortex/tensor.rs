@@ -243,10 +243,25 @@ fn dot_f32_sse2(a: &[f32], b: &[f32]) -> f32 {
     use core::arch::x86_64::{_mm_add_ps, _mm_loadu_ps, _mm_mul_ps, _mm_setzero_ps, _mm_storeu_ps};
     let n = a.len();
     let mut i = 0;
-    // SAFETY: `+sse2` is always available (targets/x86_64-chitti.json); every
-    // load reads 4 in-bounds `f32`s (`i + 4 <= n`); the store targets a local.
+    // SAFETY: `+sse2` is always available (targets/x86_64-chitti.json); all
+    // vector loads are guarded (`i + 16 <= n` / `i + 4 <= n`); the store
+    // targets a local.
     let mut sum = unsafe {
-        let mut acc = _mm_setzero_ps();
+        // Four independent accumulators (see `dot_f32_neon` for the latency
+        // rationale — SSE2 mul+add chains stall the same way).
+        let mut acc0 = _mm_setzero_ps();
+        let mut acc1 = _mm_setzero_ps();
+        let mut acc2 = _mm_setzero_ps();
+        let mut acc3 = _mm_setzero_ps();
+        while i + 16 <= n {
+            let (pa, pb) = (a.as_ptr().add(i), b.as_ptr().add(i));
+            acc0 = _mm_add_ps(acc0, _mm_mul_ps(_mm_loadu_ps(pa), _mm_loadu_ps(pb)));
+            acc1 = _mm_add_ps(acc1, _mm_mul_ps(_mm_loadu_ps(pa.add(4)), _mm_loadu_ps(pb.add(4))));
+            acc2 = _mm_add_ps(acc2, _mm_mul_ps(_mm_loadu_ps(pa.add(8)), _mm_loadu_ps(pb.add(8))));
+            acc3 = _mm_add_ps(acc3, _mm_mul_ps(_mm_loadu_ps(pa.add(12)), _mm_loadu_ps(pb.add(12))));
+            i += 16;
+        }
+        let mut acc = _mm_add_ps(_mm_add_ps(acc0, acc1), _mm_add_ps(acc2, acc3));
         while i + 4 <= n {
             let va = _mm_loadu_ps(a.as_ptr().add(i));
             let vb = _mm_loadu_ps(b.as_ptr().add(i));
@@ -274,9 +289,25 @@ unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     use core::arch::x86_64::{_mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_storeu_ps};
     let n = a.len();
     let mut i = 0;
-    // SAFETY: guarded by `i + 8 <= n`; the store targets a local 8-lane array.
+    // SAFETY: all vector loads are guarded (`i + 32 <= n` / `i + 8 <= n`); the
+    // store targets a local 8-lane array.
     unsafe {
-        let mut acc = _mm256_setzero_ps();
+        use core::arch::x86_64::_mm256_add_ps;
+        // Four independent accumulators — a single chain is FMA-latency-bound
+        // (see `dot_f32_neon`); this keeps both FMA ports busy.
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+        while i + 32 <= n {
+            let (pa, pb) = (a.as_ptr().add(i), b.as_ptr().add(i));
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa), _mm256_loadu_ps(pb), acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(8)), _mm256_loadu_ps(pb.add(8)), acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(16)), _mm256_loadu_ps(pb.add(16)), acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(24)), _mm256_loadu_ps(pb.add(24)), acc3);
+            i += 32;
+        }
+        let mut acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
         while i + 8 <= n {
             let va = _mm256_loadu_ps(a.as_ptr().add(i));
             let vb = _mm256_loadu_ps(b.as_ptr().add(i));
@@ -295,29 +326,117 @@ unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// NEON dot product (4-wide FMA). Native on Apple Silicon.
+/// NEON dot product — the whole 16-wide hot loop is **inline asm**, not
+/// intrinsics. The kernel target builds with `+strict-align` (required for the
+/// pre-MMU boot window and device MMIO), and under strict-align LLVM lowers
+/// `vld1q_f32` (an align-4 vector load) to a 16×`ldrb`+`orr` byte-assembly
+/// with a stack round-trip — ~25 instructions per load, which made NEON ~100×
+/// slower than scalar. At runtime this data is Normal cacheable memory with
+/// `SCTLR_EL1.A = 0`, where unaligned `ldp q` is architecturally fine — the
+/// same "inline asm to get the exact access" pattern the MMIO drivers use.
+/// Four independent accumulators keep the FMA pipes saturated.
 ///
 /// # Safety
-/// NEON is baseline on aarch64; all loads are guarded by `i + 4 <= n`.
+/// NEON is baseline on aarch64; the asm loop reads exactly `n/16*16` floats
+/// from each slice, and the scalar tail is bounds-checked.
 #[cfg(target_arch = "aarch64")]
 unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
-    use core::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
     let n = a.len();
-    let mut i = 0;
-    // SAFETY: guarded by `i + 4 <= n`.
+    let n16 = n / 16;
+    let mut sum: f32;
+    // SAFETY: the loop consumes exactly `n16 * 16` f32 from both pointers
+    // (guarded by `n16` computed from the slice length); v8–v15 (callee-saved)
+    // are untouched; pointers advance inside the asm and are discarded.
     unsafe {
-        let mut acc = vdupq_n_f32(0.0);
-        while i + 4 <= n {
-            acc = vfmaq_f32(acc, vld1q_f32(a.as_ptr().add(i)), vld1q_f32(b.as_ptr().add(i)));
-            i += 4;
-        }
-        let mut sum = vaddvq_f32(acc);
-        while i < n {
-            sum += a[i] * b[i];
-            i += 1;
-        }
-        sum
+        core::arch::asm!(
+            "movi v0.16b, #0",
+            "movi v1.16b, #0",
+            "movi v2.16b, #0",
+            "movi v3.16b, #0",
+            "cbz {cnt}, 2f",
+            "1:",
+            "ldp q4, q5, [{pa}], #32",
+            "ldp q6, q7, [{pb}], #32",
+            "ldp q16, q17, [{pa}], #32",
+            "ldp q18, q19, [{pb}], #32",
+            "fmla v0.4s, v4.4s, v6.4s",
+            "fmla v1.4s, v5.4s, v7.4s",
+            "fmla v2.4s, v16.4s, v18.4s",
+            "fmla v3.4s, v17.4s, v19.4s",
+            "subs {cnt}, {cnt}, #1",
+            "b.ne 1b",
+            "2:",
+            "fadd v0.4s, v0.4s, v1.4s",
+            "fadd v2.4s, v2.4s, v3.4s",
+            "fadd v0.4s, v0.4s, v2.4s",
+            "faddp v0.4s, v0.4s, v0.4s",
+            "faddp s0, v0.2s",
+            pa = inout(reg) a.as_ptr() => _,
+            pb = inout(reg) b.as_ptr() => _,
+            cnt = inout(reg) n16 => _,
+            out("v0") sum,
+            out("v1") _, out("v2") _, out("v3") _, out("v4") _, out("v5") _,
+            out("v6") _, out("v7") _, out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            options(nostack, readonly),
+        );
     }
+    let mut i = n16 * 16;
+    while i < n {
+        sum += a[i] * b[i];
+        i += 1;
+    }
+    sum
+}
+
+/// 16-byte NEON loads via inline asm. Under the kernel's `+strict-align` LLVM
+/// lowers the (align-4/align-1) `vld1q_*` intrinsics to a 16×`ldrb`+`orr`
+/// byte-assembly with a stack round-trip (~25 instructions per load, ~100×
+/// slower — see `dot_f32_neon`). A single `ldr q` is architecturally correct
+/// at runtime: this data lives in Normal cacheable RAM and `SCTLR_EL1.A = 0`,
+/// where unaligned SIMD loads are supported. Same pattern as the MMIO
+/// single-`ldr`/`str` accessors.
+///
+/// # Safety
+/// `p` must point at 16 readable bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ldq_s8(p: *const i8) -> core::arch::aarch64::int8x16_t {
+    let v;
+    // SAFETY: caller guarantees 16 readable bytes at `p`.
+    unsafe {
+        core::arch::asm!("ldr {v:q}, [{p}]", v = out(vreg) v, p = in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    v
+}
+
+/// See [`ldq_s8`].
+///
+/// # Safety
+/// `p` must point at 16 readable bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ldq_u8(p: *const u8) -> core::arch::aarch64::uint8x16_t {
+    let v;
+    // SAFETY: caller guarantees 16 readable bytes at `p`.
+    unsafe {
+        core::arch::asm!("ldr {v:q}, [{p}]", v = out(vreg) v, p = in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    v
+}
+
+/// See [`ldq_s8`].
+///
+/// # Safety
+/// `p` must point at 4 readable `f32`s.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ldq_f32(p: *const f32) -> core::arch::aarch64::float32x4_t {
+    let v;
+    // SAFETY: caller guarantees 16 readable bytes at `p`.
+    unsafe {
+        core::arch::asm!("ldr {v:q}, [{p}]", v = out(vreg) v, p = in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    v
 }
 
 /// `y[r] = sum_c w[r*n_cols + c] * x[c]` for an `f32` weight matrix stored
@@ -480,7 +599,7 @@ pub unsafe fn matvec_q8_0_rows(
 unsafe fn matvec_q8_0_neon(w: *const u8, x: *const f32, y: *mut f32, row_start: usize, row_end: usize, n_cols: usize) {
     use core::arch::aarch64::{
         vaddq_f32, vaddvq_f32, vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32, vget_high_s16, vget_high_s8, vget_low_s16,
-        vget_low_s8, vld1q_f32, vld1q_s8, vmovl_s16, vmovl_s8,
+        vget_low_s8, vmovl_s16, vmovl_s8,
     };
     let blocks = n_cols / QK;
     let row_bytes = blocks * Q8_0_BLOCK_BYTES;
@@ -498,10 +617,10 @@ unsafe fn matvec_q8_0_neon(w: *const u8, x: *const f32, y: *mut f32, row_start: 
             let f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo)));
             let f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi)));
             let f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi)));
-            $p[0] = vfmaq_f32($p[0], f0, vld1q_f32($xp));
-            $p[1] = vfmaq_f32($p[1], f1, vld1q_f32(($xp).add(4)));
-            $p[2] = vfmaq_f32($p[2], f2, vld1q_f32(($xp).add(8)));
-            $p[3] = vfmaq_f32($p[3], f3, vld1q_f32(($xp).add(12)));
+            $p[0] = vfmaq_f32($p[0], f0, ldq_f32($xp));
+            $p[1] = vfmaq_f32($p[1], f1, ldq_f32(($xp).add(4)));
+            $p[2] = vfmaq_f32($p[2], f2, ldq_f32(($xp).add(8)));
+            $p[3] = vfmaq_f32($p[3], f3, ldq_f32(($xp).add(12)));
         }};
     }
 
@@ -517,8 +636,8 @@ unsafe fn matvec_q8_0_neon(w: *const u8, x: *const f32, y: *mut f32, row_start: 
                 let q = row.add(base + 2) as *const i8;
                 let xp = x.add(b * QK);
                 let mut p = [vdupq_n_f32(0.0); 4]; // within-block partials (unscaled)
-                accumulate16!(p, vld1q_s8(q), xp); // lanes 0..16
-                accumulate16!(p, vld1q_s8(q.add(16)), xp.add(16)); // lanes 16..32
+                accumulate16!(p, ldq_s8(q), xp); // lanes 0..16
+                accumulate16!(p, ldq_s8(q.add(16)), xp.add(16)); // lanes 16..32
                 // Fold the block scale in once, into four independent chains.
                 acc[0] = vfmaq_f32(acc[0], p[0], dv);
                 acc[1] = vfmaq_f32(acc[1], p[1], dv);
@@ -622,7 +741,7 @@ pub unsafe fn matmul_q8_0_sdot_rows(
     n_cols: usize,
 ) {
     use core::arch::aarch64::{
-        vaddq_s32, vaddvq_f32, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32, vfmaq_n_f32, vld1q_s8,
+        vaddq_s32, vaddvq_f32, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32, vfmaq_n_f32,
     };
     let blocks = n_cols / QK;
     let row_bytes = blocks * Q8_0_BLOCK_BYTES;
@@ -658,14 +777,14 @@ pub unsafe fn matmul_q8_0_sdot_rows(
                 for b in 0..blocks {
                     let base = b * Q8_0_BLOCK_BYTES;
                     let dw = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
-                    let wq0 = vld1q_s8(row.add(base + 2) as *const i8); // weight lanes 0..16
-                    let wq1 = vld1q_s8(row.add(base + 18) as *const i8); // 16..32
+                    let wq0 = ldq_s8(row.add(base + 2) as *const i8); // weight lanes 0..16
+                    let wq1 = ldq_s8(row.add(base + 18) as *const i8); // 16..32
                     for mm in 0..mt {
                         let mi = m0 + mm;
                         let xqp = xq.add(mi * n_cols + b * QK);
                         let dx = *xs.add(mi * nb + b);
-                        let a0 = vdotq_s32(vdupq_n_s32(0), wq0, vld1q_s8(xqp));
-                        let a1 = vdotq_s32(vdupq_n_s32(0), wq1, vld1q_s8(xqp.add(16)));
+                        let a0 = vdotq_s32(vdupq_n_s32(0), wq0, ldq_s8(xqp));
+                        let a1 = vdotq_s32(vdupq_n_s32(0), wq1, ldq_s8(xqp.add(16)));
                         acc[mm] = vfmaq_n_f32(acc[mm], vcvtq_f32_s32(vaddq_s32(a0, a1)), dw * dx);
                     }
                 }
@@ -690,7 +809,7 @@ pub unsafe fn matmul_q8_0_sdot_rows(
 #[inline]
 unsafe fn sdot_one_row(row: *const u8, xq: *const i8, xs: *const f32, blocks: usize) -> f32 {
     use core::arch::aarch64::{
-        vaddq_f32, vaddq_s32, vaddvq_f32, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32, vfmaq_n_f32, vld1q_s8,
+        vaddq_f32, vaddq_s32, vaddvq_f32, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32, vfmaq_n_f32,
     };
     macro_rules! block_into {
         ($f:expr, $b:expr) => {{
@@ -699,8 +818,8 @@ unsafe fn sdot_one_row(row: *const u8, xq: *const i8, xs: *const f32, blocks: us
             let dx = *xs.add($b);
             let q = row.add(base + 2) as *const i8;
             let xp = xq.add($b * QK);
-            let a0 = vdotq_s32(vdupq_n_s32(0), vld1q_s8(q), vld1q_s8(xp)); // lanes 0..16
-            let a1 = vdotq_s32(vdupq_n_s32(0), vld1q_s8(q.add(16)), vld1q_s8(xp.add(16))); // 16..32
+            let a0 = vdotq_s32(vdupq_n_s32(0), ldq_s8(q), ldq_s8(xp)); // lanes 0..16
+            let a1 = vdotq_s32(vdupq_n_s32(0), ldq_s8(q.add(16)), ldq_s8(xp.add(16))); // 16..32
             $f = vfmaq_n_f32($f, vcvtq_f32_s32(vaddq_s32(a0, a1)), dw * dx);
         }};
     }
@@ -740,7 +859,7 @@ unsafe fn sdot_one_row(row: *const u8, xq: *const i8, xs: *const f32, blocks: us
 unsafe fn sdot_one_row_q4_0(row: *const u8, xq: *const i8, xs: *const f32, blocks: usize) -> f32 {
     use core::arch::aarch64::{
         vaddq_f32, vaddq_s32, vaddvq_f32, vandq_u8, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32, vdupq_n_s8,
-        vdupq_n_u8, vfmaq_n_f32, vld1q_s8, vld1q_u8, vreinterpretq_s8_u8, vshrq_n_u8, vsubq_s8,
+        vdupq_n_u8, vfmaq_n_f32, vreinterpretq_s8_u8, vshrq_n_u8, vsubq_s8,
     };
     let mask = vdupq_n_u8(0x0f);
     let eight = vdupq_n_s8(8);
@@ -749,12 +868,12 @@ unsafe fn sdot_one_row_q4_0(row: *const u8, xq: *const i8, xs: *const f32, block
             let base = $b * Q4_0_BLOCK_BYTES;
             let dw = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
             let dx = *xs.add($b);
-            let bytes = vld1q_u8(row.add(base + 2)); // 16 packed nibble pairs
+            let bytes = ldq_u8(row.add(base + 2)); // 16 packed nibble pairs
             let lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(bytes, mask)), eight); // elems 0..16
             let hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(bytes, 4)), eight); // elems 16..32
             let xp = xq.add($b * QK);
-            let a0 = vdotq_s32(vdupq_n_s32(0), lo, vld1q_s8(xp));
-            let a1 = vdotq_s32(vdupq_n_s32(0), hi, vld1q_s8(xp.add(16)));
+            let a0 = vdotq_s32(vdupq_n_s32(0), lo, ldq_s8(xp));
+            let a1 = vdotq_s32(vdupq_n_s32(0), hi, ldq_s8(xp.add(16)));
             $f = vfmaq_n_f32($f, vcvtq_f32_s32(vaddq_s32(a0, a1)), dw * dx);
         }};
     }

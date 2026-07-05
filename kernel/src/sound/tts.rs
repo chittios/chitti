@@ -27,13 +27,25 @@ pub fn synth(text: &str) -> Result<Vec<i16>, alloc::string::String> {
     if ids.len() <= 2 {
         return Err("nothing to say (no phonemes)".into());
     }
+    let t0 = crate::arch::now_ms();
     let model = crate::onnx::parse(bytes).ok_or("kitten model parse failed")?;
+    let t_parse = crate::arch::now_ms();
     let n = ids.len();
     let input_ids = Val { dims: alloc::vec![1, n], f: ids.iter().map(|&x| x as f32).collect(), i: Some(ids), seq: None };
     let style = Val::new(alloc::vec![1, 256], voice_row(n));
     let speed = Val::new(alloc::vec![1], alloc::vec![1.0]);
     crate::ktrace::log_fmt(format_args!("tts: running kitten on {n} tokens (slow on the scalar interpreter)"));
+    let (a0, s0) = crate::mm::heap::alloc_stats();
     let out = crate::onnx::exec::run(&model, &[("input_ids", input_ids), ("style", style), ("speed", speed)]).map_err(|e| alloc::format!("kitten run failed: {e}"))?;
+    let (a1, s1) = crate::mm::heap::alloc_stats();
+    crate::ktrace::log_fmt(format_args!(
+        "tts: parse {} ms, run {} ms, {} allocs, {} scan steps ({} avg)",
+        t_parse.saturating_sub(t0),
+        crate::arch::now_ms().saturating_sub(t_parse),
+        a1 - a0,
+        s1 - s0,
+        (s1 - s0) / (a1 - a0).max(1)
+    ));
     // The waveform is the largest float output (the model also emits short
     // per-token tensors like durations); pick by length, not map order.
     let wav = out.values().max_by_key(|v| v.f.len()).ok_or("kitten produced no output")?;
