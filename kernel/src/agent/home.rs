@@ -21,13 +21,11 @@ pub fn ensure(id: u64, name: &str) {
     let home = path(id);
     let soul = format!("{}/SOUL.md", home);
     if !fs::exists(&soul) {
+        // A concise *persona* the model adopts — not documentation about the
+        // file (a chatty meta description gets parroted back as an answer).
         let default = format!(
-            "# SOUL — {name}\n\n\
-             I am {name}, an agent of Chitti OS (agent id {id}).\n\n\
-             This file is my persona: it is prepended to my system prompt every\n\
-             session. Edit it to change how I behave — tone, priorities, standing\n\
-             instructions. My skills live in {home}/skills/, my durable notes in\n\
-             {home}/memory/ (I read and write them with my fs tools).\n"
+            "You are {name}, the shell agent of Chitti OS. You are concise, direct, and \
+             practical. You operate the machine through tools and answer in plain prose."
         );
         fs::write(&soul, default.as_bytes());
         crate::ktrace::log_fmt(format_args!("agent.home: created {} (SOUL.md + skills/ + memory/)", home));
