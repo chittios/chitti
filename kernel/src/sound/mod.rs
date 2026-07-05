@@ -199,6 +199,7 @@ fn libm_sqrt(x: f64) -> f64 {
     r
 }
 
+pub mod g2p;
 pub mod hda;
 pub mod mel;
 pub mod model_store;
