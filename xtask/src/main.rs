@@ -461,6 +461,8 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
     // A virtio-net NIC on user-mode networking (built-in DHCP 10.0.2.15 / gw
     // 10.0.2.2 / dns 10.0.2.3) so /network, /ping and /wifi work out of the box.
     qemu.args(["-netdev", "user,id=chittinet", "-device", "virtio-net-device,netdev=chittinet"]);
+    // virtio-snd on the host's CoreAudio (mic + speaker) for /voice.
+    qemu.args(["-audiodev", "coreaudio,id=chittiaudio", "-device", "virtio-sound-device,audiodev=chittiaudio"]);
     // Attach a virtio-blk disk on the virtio-mmio bus (the aarch64 block driver
     // scans that window) so /disks, /mkext4, /install, and synapse persistence
     // work — the aarch64 counterpart to the x86 virtio-blk-pci drive.
@@ -1025,6 +1027,8 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
     cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
     // Intel e1000 NIC on user-mode networking (DHCP 10.0.2.15 / gw 10.0.2.2).
     cmd.args(["-netdev", "user,id=chittinet", "-device", "e1000,netdev=chittinet"]);
+    // virtio-snd on the host's CoreAudio (mic + speaker) for /voice.
+    cmd.args(["-audiodev", "coreaudio,id=chittiaudio", "-device", "virtio-sound-pci,audiodev=chittiaudio"]);
     if disk_size.is_some() {
         eprintln!("  disk: {} ({}) -- run `/install yes` at the shell, then reboot with `--disk-only`", disk.display(), disk_size.as_deref().unwrap_or(""));
     }

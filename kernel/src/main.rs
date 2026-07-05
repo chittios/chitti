@@ -108,6 +108,9 @@ pub extern "C" fn _start() -> ! {
     // Bring up networking (e1000 / virtio-net-pci over PCI). No-op if absent.
     #[cfg(not(feature = "refcheck"))]
     chitti_kernel::net::autodetect();
+    // Bring up audio (virtio-snd) for the /voice pipeline. No-op if absent.
+    #[cfg(not(feature = "refcheck"))]
+    chitti_kernel::sound::autodetect();
     #[cfg(not(feature = "refcheck"))]
     run_os();
 
@@ -175,6 +178,8 @@ pub extern "C" fn limine_start() -> ! {
     mount_persistent_store();
     // Bring up networking (e1000 / virtio-net-pci over PCI). No-op if absent.
     chitti_kernel::net::autodetect();
+    // Bring up audio (virtio-snd) for the /voice pipeline. No-op if absent.
+    chitti_kernel::sound::autodetect();
     run_os();
 }
 
@@ -260,6 +265,8 @@ pub extern "C" fn aarch64_start() -> ! {
     // Bring up networking (virtio-net over mmio, else a PCI NIC) so /network,
     // /ping and /wifi work. No-op if no NIC is present.
     chitti_kernel::net::autodetect();
+    // Bring up audio (virtio-snd) for the /voice pipeline. No-op if absent.
+    chitti_kernel::sound::autodetect();
     // Everything is up (framebuffer, USB/input, disk, persistent store) with IRQs
     // masked. NOW begin timer-preemptive scheduling: unmask IRQs so the generic
     // timer preempts the shell. Deferred to here (not inside init()) so device

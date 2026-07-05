@@ -1056,6 +1056,44 @@ pub fn draw_input(title: &str, prompt: &str, buf: &str, masked: bool, caret_on: 
     });
 }
 
+/// Draw the `/voice` modal: a live waveform (one vertical bar per recent RMS
+/// level, newest on the right) above a status line and a Stop button. Called
+/// every capture frame, so it repaints only the modal region.
+pub fn draw_voice(levels: &[f32], status: &str) {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.cursor_restore();
+            sc.cur_vis = false;
+            MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
+            let (ix, iy, cols) = sc.modal_box("Voice", 8);
+            let ch = sc.ch();
+            let cw = sc.cw();
+            // Waveform region: 5 text rows tall, one 3px bar per level.
+            let wave_h = 5 * ch;
+            let wave_w = cols * cw;
+            sc.fill_rect(ix, iy, wave_w, wave_h, sc.theme.chat_bg);
+            let barw = 3 * sc.scale.max(1);
+            let nbars = (wave_w / (barw + sc.scale)) as usize;
+            let take = levels.len().min(nbars);
+            let mid = iy + wave_h / 2;
+            for (i, &lv) in levels[levels.len() - take..].iter().enumerate() {
+                // Bar height from the RMS level (log-ish response for visibility).
+                let l = if lv < 0.0 { 0.0 } else if lv > 1.0 { 1.0 } else { lv };
+                let boost = l * (2.0 - l); // gentle curve
+                let h = ((wave_h / 2) as f32 * boost) as u64 + sc.scale;
+                let x = ix + (i as u64) * (barw + sc.scale);
+                sc.fill_rect(x, mid - h, barw, 2 * h, sc.theme.accent);
+            }
+            // Status line + Stop button.
+            let sy = iy + wave_h + ch / 2;
+            sc.fill_rect(ix, sy, wave_w, ch, sc.theme.status_bg);
+            sc.draw_str(ix, sy, status, sc.theme.title_dim, sc.theme.status_bg);
+            sc.modal_button(ix, sy + ch + ch / 2, "Stop", true, 2);
+            sc.cursor_overlay();
+        }
+    });
+}
+
 /// Dismiss any modal and repaint the normal UI.
 pub fn modal_dismiss() {
     MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
