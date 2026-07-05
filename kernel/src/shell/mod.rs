@@ -3198,7 +3198,7 @@ fn disk_install(arg: &str) {
     // 2. FAT ESP: the Limine loader at /EFI/BOOT/BOOTX64.EFI, plus limine.conf
     //    + the kernel at the root, so the disk boots from FAT alone (UEFI
     //    firmware requires FAT; Limine reads its config from the boot volume).
-    let esp_conf = b"timeout: 0\n\n/Chitti OS\n    protocol: limine\n    path: boot():/chitti-kernel\n";
+    let esp_conf = b"timeout: 0\n\n/Chitti OS\n    protocol: limine\n    resolution: 1920x1080\n    path: boot():/chitti-kernel\n";
     {
         let mut esp = Partition::new(&mut dev, esp_range.0, esp_range.1 - esp_range.0 + 1);
         let r = FatWriter::format(&mut esp).and_then(|mut fw| {
@@ -3216,7 +3216,7 @@ fn disk_install(arg: &str) {
 
     // 3. ext4 OS partition: limine.conf + kernel + model parts.
     let parts = crate::cortex::model_parts();
-    let mut conf = String::from("timeout: 3\n\n/Chitti OS\n    protocol: limine\n    path: boot():/chitti-kernel\n");
+    let mut conf = String::from("timeout: 3\n\n/Chitti OS\n    protocol: limine\n    resolution: 1920x1080\n    path: boot():/chitti-kernel\n");
     for (name, _) in &parts {
         conf.push_str("    module_path: boot():/");
         conf.push_str(name);
