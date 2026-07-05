@@ -65,6 +65,15 @@ fn tensor_to_val(t: &Tensor<'_>) -> Val {
     }
 }
 
+/// `ln(x)` — exposed for the mel frontend (same series used internally).
+pub fn logf_pub(x: f32) -> f32 {
+    logf(x)
+}
+/// `sqrt(x)` — exposed for the mel frontend.
+pub fn sqrtf_pub(x: f32) -> f32 {
+    sqrtf(x)
+}
+
 fn expf(x: f32) -> f32 {
     crate::cortex::tensor::expf(x)
 }
@@ -104,6 +113,72 @@ fn logf(x: f32) -> f32 {
     let t2 = t * t;
     let ln_m = 2.0 * t * (1.0 + t2 / 3.0 + t2 * t2 / 5.0 + t2 * t2 * t2 / 7.0 + t2 * t2 * t2 * t2 / 9.0);
     ln_m + e as f32 * core::f32::consts::LN_2
+}
+
+fn floorf(x: f32) -> f32 {
+    let t = x as i64 as f32;
+    if t > x {
+        t - 1.0
+    } else {
+        t
+    }
+}
+fn ceilf(x: f32) -> f32 {
+    -floorf(-x)
+}
+fn sinf(x: f32) -> f32 {
+    cosf(x - core::f32::consts::FRAC_PI_2)
+}
+fn cosf(x: f32) -> f32 {
+    use core::f32::consts::PI;
+    let mut a = x % (2.0 * PI);
+    if a > PI {
+        a -= 2.0 * PI;
+    }
+    if a < -PI {
+        a += 2.0 * PI;
+    }
+    let x2 = a * a;
+    1.0 - x2 * (0.5 - x2 * (1.0 / 24.0 - x2 * (1.0 / 720.0 - x2 / 40320.0)))
+}
+fn powf(a: f32, b: f32) -> f32 {
+    if b == 2.0 {
+        return a * a;
+    }
+    if a <= 0.0 {
+        return if b == 0.0 { 1.0 } else { 0.0 };
+    }
+    expf(b * logf(a))
+}
+
+/// Batched matmul of the last two dims: `A[.., m, k] · B[.., k, n] -> [.., m, n]`,
+/// with optional integer zero-points subtracted first (MatMulInteger). Leading
+/// batch dims broadcast. B may be 2-D (shared across A's batch).
+fn matmul(a: &Val, b: &Val, azp: f32, bzp: f32) -> Val {
+    let (ar, br) = (a.dims.len(), b.dims.len());
+    let m = a.dims[ar - 2];
+    let k = a.dims[ar - 1];
+    let n = b.dims[br - 1];
+    let batch: usize = a.dims[..ar - 2].iter().product::<usize>().max(1);
+    let b_batch: usize = b.dims[..br - 2].iter().product::<usize>().max(1);
+    let mut out = vec![0f32; batch * m * n];
+    for bi in 0..batch {
+        let ao = bi * m * k;
+        let bo = (if b_batch == 1 { 0 } else { bi }) * k * n;
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f32;
+                for kk in 0..k {
+                    acc += (a.f[ao + i * k + kk] - azp) * (b.f[bo + kk * n + j] - bzp);
+                }
+                out[(bi * m + i) * n + j] = acc;
+            }
+        }
+    }
+    let mut od: Vec<usize> = a.dims[..ar - 2].to_vec();
+    od.push(m);
+    od.push(n);
+    Val::new(od, out)
 }
 
 /// Broadcast two shapes (numpy rules), returning the output dims.
@@ -459,6 +534,279 @@ fn exec_graph(g: &Graph<'_>, env: &mut BTreeMap<String, Val>) -> Result<(), Stri
             "Sub" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| a - b)],
             "Mul" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| a * b)],
             "Div" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| a / b)],
+            "Pow" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| powf(a, b))],
+            "Equal" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| if a == b { 1.0 } else { 0.0 })],
+            "Less" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| if a < b { 1.0 } else { 0.0 })],
+            "Greater" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| if a > b { 1.0 } else { 0.0 })],
+            "And" => vec![elementwise2(&get(env, 0)?, &get(env, 1)?, |a, b| if a != 0.0 && b != 0.0 { 1.0 } else { 0.0 })],
+            "Not" => {
+                let mut v = get(env, 0)?;
+                for x in &mut v.f {
+                    *x = if *x == 0.0 { 1.0 } else { 0.0 };
+                }
+                vec![v]
+            }
+            "Tanh" => {
+                let mut v = get(env, 0)?;
+                for x in &mut v.f {
+                    *x = tanhf(*x);
+                }
+                v.i = None;
+                vec![v]
+            }
+            "Exp" => {
+                let mut v = get(env, 0)?;
+                for x in &mut v.f {
+                    *x = expf(*x);
+                }
+                v.i = None;
+                vec![v]
+            }
+            "Sin" => {
+                let mut v = get(env, 0)?;
+                for x in &mut v.f {
+                    *x = sinf(*x);
+                }
+                v.i = None;
+                vec![v]
+            }
+            "Cos" => {
+                let mut v = get(env, 0)?;
+                for x in &mut v.f {
+                    *x = cosf(*x);
+                }
+                v.i = None;
+                vec![v]
+            }
+            "LeakyRelu" => {
+                let a = node.attrs.iter().find(|at| at.name == "alpha").map(|at| at.f).unwrap_or(0.01);
+                let mut v = get(env, 0)?;
+                for x in &mut v.f {
+                    if *x < 0.0 {
+                        *x *= a;
+                    }
+                }
+                v.i = None;
+                vec![v]
+            }
+            "Clip" => {
+                let mut v = get(env, 0)?;
+                let lo = get(env, 1).ok().and_then(|t| t.f.first().copied()).unwrap_or(f32::NEG_INFINITY);
+                let hi = get(env, 2).ok().and_then(|t| t.f.first().copied()).unwrap_or(f32::INFINITY);
+                for x in &mut v.f {
+                    *x = x.clamp(lo, hi);
+                }
+                vec![v]
+            }
+            "Floor" => {
+                let mut v = get(env, 0)?;
+                for x in &mut v.f {
+                    *x = floorf(*x);
+                }
+                vec![v]
+            }
+            "Round" => {
+                let mut v = get(env, 0)?;
+                for x in &mut v.f {
+                    *x = floorf(*x + 0.5);
+                }
+                vec![v]
+            }
+            "Where" => {
+                // condition ? x : y, all broadcast.
+                let cond = get(env, 0)?;
+                let a = get(env, 1)?;
+                let b = get(env, 2)?;
+                let od = broadcast_dims(&broadcast_dims(&cond.dims, &a.dims), &b.dims);
+                let n: usize = od.iter().product::<usize>().max(1);
+                let mut out = Vec::with_capacity(n);
+                let mut idx = vec![0usize; od.len()];
+                for _ in 0..n {
+                    let c = bcast_get(&cond, &od, &idx);
+                    out.push(if c != 0.0 { bcast_get(&a, &od, &idx) } else { bcast_get(&b, &od, &idx) });
+                    for k in (0..od.len()).rev() {
+                        idx[k] += 1;
+                        if idx[k] < od[k] {
+                            break;
+                        }
+                        idx[k] = 0;
+                    }
+                }
+                vec![Val::new(od, out)]
+            }
+            "Softmax" | "LogSoftmax" => {
+                let v = get(env, 0)?;
+                let r = v.dims.len();
+                let axis = {
+                    let ax = attr_i(node, "axis", -1);
+                    (if ax < 0 { ax + r as i64 } else { ax }) as usize
+                };
+                let inner: usize = v.dims[axis..].iter().product::<usize>().max(1);
+                let ax_len = v.dims[axis];
+                let stride: usize = v.dims[axis + 1..].iter().product::<usize>().max(1);
+                let groups = v.f.len() / inner;
+                let mut out = v.f.clone();
+                let logmode = node.op == "LogSoftmax";
+                for g in 0..groups {
+                    for s in 0..stride {
+                        let mut mx = f32::NEG_INFINITY;
+                        for a in 0..ax_len {
+                            let o = g * inner + a * stride + s;
+                            if out[o] > mx {
+                                mx = out[o];
+                            }
+                        }
+                        let mut sum = 0f32;
+                        for a in 0..ax_len {
+                            let o = g * inner + a * stride + s;
+                            let e = expf(out[o] - mx);
+                            out[o] = e;
+                            sum += e;
+                        }
+                        for a in 0..ax_len {
+                            let o = g * inner + a * stride + s;
+                            out[o] = if logmode { logf(out[o] / sum) } else { out[o] / sum };
+                        }
+                    }
+                }
+                vec![Val::new(v.dims.clone(), out)]
+            }
+            "LayerNormalization" => {
+                let x = get(env, 0)?;
+                let scale = get(env, 1)?;
+                let bias = get(env, 2).ok();
+                let eps = node.attrs.iter().find(|a| a.name == "epsilon").map(|a| a.f).unwrap_or(1e-5);
+                let r = x.dims.len();
+                let ax = {
+                    let a = attr_i(node, "axis", -1);
+                    (if a < 0 { a + r as i64 } else { a }) as usize
+                };
+                let norm: usize = x.dims[ax..].iter().product::<usize>().max(1);
+                let groups = x.f.len() / norm;
+                let mut out = x.f.clone();
+                for g in 0..groups {
+                    let base = g * norm;
+                    let mut mean = 0f32;
+                    for i in 0..norm {
+                        mean += out[base + i];
+                    }
+                    mean /= norm as f32;
+                    let mut var = 0f32;
+                    for i in 0..norm {
+                        let d = out[base + i] - mean;
+                        var += d * d;
+                    }
+                    var /= norm as f32;
+                    let inv = 1.0 / sqrtf(var + eps);
+                    for i in 0..norm {
+                        let sc = scale.f[i % scale.f.len()];
+                        let b = bias.as_ref().map(|bb| bb.f[i % bb.f.len()]).unwrap_or(0.0);
+                        out[base + i] = (out[base + i] - mean) * inv * sc + b;
+                    }
+                }
+                vec![Val::new(x.dims.clone(), out)]
+            }
+            "Gather" => {
+                let data = get(env, 0)?;
+                let ind = get(env, 1)?;
+                let r = data.dims.len();
+                let axis = {
+                    let a = attr_i(node, "axis", 0);
+                    (if a < 0 { a + r as i64 } else { a }) as usize
+                };
+                let idxs = ind.ints();
+                let axd = data.dims[axis] as i64;
+                let outer: usize = data.dims[..axis].iter().product::<usize>().max(1);
+                let inner: usize = data.dims[axis + 1..].iter().product::<usize>().max(1);
+                let mut od: Vec<usize> = data.dims[..axis].to_vec();
+                od.extend_from_slice(&ind.dims);
+                od.extend_from_slice(&data.dims[axis + 1..]);
+                let mut out = Vec::with_capacity(outer * idxs.len() * inner);
+                let want_i = data.i.is_some();
+                let mut oi = Vec::new();
+                for o in 0..outer {
+                    for &ix in &idxs {
+                        let a = (if ix < 0 { ix + axd } else { ix }).clamp(0, axd - 1) as usize;
+                        let start = (o * data.dims[axis] + a) * inner;
+                        out.extend_from_slice(&data.f[start..start + inner]);
+                        if want_i {
+                            oi.extend_from_slice(&data.i.as_ref().unwrap()[start..start + inner]);
+                        }
+                    }
+                }
+                vec![Val { dims: od, f: out, i: if want_i { Some(oi) } else { None } }]
+            }
+            "Split" => {
+                let v = get(env, 0)?;
+                let r = v.dims.len();
+                let axis = {
+                    let a = attr_i(node, "axis", 0);
+                    (if a < 0 { a + r as i64 } else { a }) as usize
+                };
+                let sizes: Vec<usize> = attr_ints(node, "split")
+                    .or_else(|| get(env, 1).ok().map(|s| s.ints()))
+                    .map(|v| v.iter().map(|&x| x as usize).collect())
+                    .unwrap_or_else(|| {
+                        let k = node.outputs.len().max(1);
+                        vec![v.dims[axis] / k; k]
+                    });
+                let outer: usize = v.dims[..axis].iter().product::<usize>().max(1);
+                let inner: usize = v.dims[axis + 1..].iter().product::<usize>().max(1);
+                let mut res = Vec::new();
+                let mut off = 0usize;
+                for &sz in &sizes {
+                    let mut dims = v.dims.clone();
+                    dims[axis] = sz;
+                    let mut f = Vec::with_capacity(outer * sz * inner);
+                    for o in 0..outer {
+                        let start = (o * v.dims[axis] + off) * inner;
+                        f.extend_from_slice(&v.f[start..start + sz * inner]);
+                    }
+                    res.push(Val::new(dims, f));
+                    off += sz;
+                }
+                res
+            }
+            "Range" => {
+                let start = get(env, 0)?.f.first().copied().unwrap_or(0.0);
+                let limit = get(env, 1)?.f.first().copied().unwrap_or(0.0);
+                let delta = get(env, 2)?.f.first().copied().unwrap_or(1.0);
+                let n = (ceilf((limit - start) / delta) as i64).max(0) as usize;
+                let f: Vec<f32> = (0..n).map(|i| start + i as f32 * delta).collect();
+                let iv: Vec<i64> = f.iter().map(|&x| x as i64).collect();
+                vec![Val { dims: vec![n], f, i: Some(iv) }]
+            }
+            "MatMul" => vec![matmul(&get(env, 0)?, &get(env, 1)?, 0.0, 0.0)],
+            "MatMulInteger" => {
+                let a = get(env, 0)?;
+                let b = get(env, 1)?;
+                let azp = get(env, 2).ok().and_then(|t| t.f.first().copied()).unwrap_or(0.0);
+                let bzp = get(env, 3).ok().and_then(|t| t.f.first().copied()).unwrap_or(0.0);
+                vec![matmul(&a, &b, azp, bzp)]
+            }
+            "DynamicQuantizeLinear" => {
+                // y = clamp(round(x/scale)+zp,0,255); scale=(hi-lo)/255 over
+                // [min(x,0), max(x,0)]; zp=round(-lo/scale).
+                let x = get(env, 0)?;
+                let mut lo = 0f32;
+                let mut hi = 0f32;
+                for &v in &x.f {
+                    if v < lo {
+                        lo = v;
+                    }
+                    if v > hi {
+                        hi = v;
+                    }
+                }
+                let scale = if hi - lo > 0.0 { (hi - lo) / 255.0 } else { 1.0 };
+                let zp = floorf(-lo / scale + 0.5).clamp(0.0, 255.0);
+                let y: Vec<f32> = x.f.iter().map(|&v| floorf(v / scale + 0.5 + zp).clamp(0.0, 255.0)).collect();
+                vec![
+                    Val::new(x.dims.clone(), y),
+                    Val::new(vec![], vec![scale]),
+                    Val::new(vec![], vec![zp]),
+                ]
+            }
             "Relu" => {
                 let mut v = get(env, 0)?;
                 for x in &mut v.f {
@@ -696,5 +1044,60 @@ mod tests {
         let out = run(&m, &[("x", x), ("h", h), ("c", c)]).expect("run");
         let prob = out.get("prob").unwrap().f[0];
         assert!((prob - 0.041476).abs() < 3e-3, "silence prob {prob}");
+    }
+
+    /// DynamicQuantizeLinear + MatMulInteger against hand/onnxruntime values.
+    #[test_case]
+    fn quant_ops_match_reference() {
+        // DynamicQuantizeLinear
+        let x = Val::new(alloc::vec![8], alloc::vec![0.2, -0.5, 1.3, -2.1, 0.0, 3.0, -1.0, 0.75]);
+        let (mut lo, mut hi) = (0f32, 0f32);
+        for &v in &x.f {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        let scale = (hi - lo) / 255.0;
+        let zp = floorf(-lo / scale + 0.5);
+        assert!((scale - 0.02).abs() < 1e-6, "scale {scale}");
+        assert_eq!(zp as i32, 105);
+        let q: alloc::vec::Vec<i32> = x.f.iter().map(|&v| floorf(v / scale + 0.5 + zp).clamp(0.0, 255.0) as i32).collect();
+        assert_eq!(q, alloc::vec![115, 80, 170, 0, 105, 255, 55, 143]);
+
+        // MatMulInteger: A[2x3] azp=5, B[3x2] bzp=1 -> [[130,175],[310,445]].
+        let a = Val::new(alloc::vec![2, 3], alloc::vec![10., 20., 30., 40., 50., 60.]);
+        let b = Val::new(alloc::vec![3, 2], alloc::vec![1., 2., 3., 4., 5., 6.]);
+        let y = matmul(&a, &b, 5.0, 1.0);
+        assert_eq!(y.dims, alloc::vec![2, 2]);
+        assert_eq!(y.f, alloc::vec![130.0, 175.0, 310.0, 445.0]);
+    }
+
+    /// LayerNormalization + Softmax sanity: LN → mean 0 / unit var (scale 1,
+    /// bias 0); Softmax rows sum to 1.
+    #[test_case]
+    fn layernorm_and_softmax() {
+        let x = Val::new(alloc::vec![1, 4], alloc::vec![1.0, 2.0, 3.0, 4.0]);
+        let scale = Val::new(alloc::vec![4], alloc::vec![1.0, 1.0, 1.0, 1.0]);
+        let m = super::super::Model {
+            ir_version: 7,
+            graph: super::super::Graph {
+                name: "t",
+                nodes: alloc::vec![super::super::Node {
+                    op: "LayerNormalization",
+                    name: "ln",
+                    inputs: alloc::vec!["x", "s"],
+                    outputs: alloc::vec!["y"],
+                    attrs: alloc::vec![],
+                }],
+                initializers: alloc::vec![],
+                inputs: alloc::vec!["x", "s"],
+                outputs: alloc::vec!["y"],
+            },
+        };
+        let out = run(&m, &[("x", x), ("s", scale)]).unwrap();
+        let y = &out.get("y").unwrap().f;
+        let mean: f32 = y.iter().sum::<f32>() / 4.0;
+        assert!(mean.abs() < 1e-4, "LN mean {mean}");
+        let var: f32 = y.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / 4.0;
+        assert!((var - 1.0).abs() < 1e-2, "LN var {var}");
     }
 }

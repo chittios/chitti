@@ -517,7 +517,7 @@ fn print_help() {
     serial_println!("  /wifi [..]       /wifi scan | connect <ssid> (password modal) | info");
     serial_println!("  /think [on|off]  toggle model thinking (<think> reasoning, streamed dim; default on)");
     serial_println!("  /mode [m]        agent-tool approvals: manual (all) | auto (destructive only) | bypass");
-    serial_println!("  /voice [test]    voice session (mic waveform modal); test = tone + 2s mic check");
+    serial_println!("  /voice [..]      voice session (mic modal); test = tone+mic; models; stt <file.wav>");
     serial_println!("  /datetime [..]   show/set the clock: /datetime 2026-07-04 13:45 | /datetime tz +5:30");
     serial_println!("  /ui [config|reload|reset]  view/edit the UI config (/configs/core/ui.json)");
     serial_println!("  /shortcuts       list keyboard shortcuts (/configs/core/shortcuts.json)");
@@ -841,10 +841,92 @@ fn run_voice(arg: &str) {
         serial_println!("voice> no sound device (QEMU: -audiodev coreaudio,id=a -device virtio-sound-device,audiodev=a)");
         return;
     }
-    match arg.trim() {
-        "test" => voice_test(),
-        _ => voice_talk(),
+    let arg = arg.trim();
+    if arg == "test" {
+        voice_test();
+    } else if arg == "models" {
+        voice_models();
+    } else if let Some(rest) = arg.strip_prefix("models load ") {
+        // /voice models load parakeet|kitten <mounted-path>
+        let mut it = rest.splitn(2, ' ');
+        match (it.next(), it.next()) {
+            (Some(which), Some(path)) => match crate::sound::model_store::load(which, path.trim()) {
+                Ok(n) => serial_println!("voice> loaded {} ({} bytes) from {}", which, n, path.trim()),
+                Err(e) => serial_println!("voice> load failed: {}", e),
+            },
+            _ => serial_println!("voice> usage: /voice models load parakeet|kitten <path>"),
+        }
+    } else if let Some(path) = arg.strip_prefix("stt ") {
+        voice_stt_file(path.trim());
+    } else {
+        voice_talk();
     }
+}
+
+/// `/voice models` — show which voice models are loaded + how to get them.
+fn voice_models() {
+    let mk = |b: bool| if b { "\x1b[32mloaded\x1b[0m" } else { "not loaded" };
+    serial_println!("voice> models:");
+    serial_println!("  silero-vad   \x1b[32membedded\x1b[0m (VAD, 630 KB)");
+    serial_println!("  parakeet-stt {} (STT; /voice models load parakeet <path>)", mk(crate::sound::model_store::parakeet().is_some()));
+    serial_println!("  kitten-tts   {} (TTS; /voice models load kitten <path>)", mk(crate::sound::model_store::kitten().is_some()));
+    serial_println!("  host: cargo xtask voice-assets  (downloads into assets/voice/)");
+}
+
+/// `/voice stt </path/file.wav>` — transcribe a 16 kHz mono WAV from a mounted
+/// volume through the STT front-end. Mic-independent, so the mel + CTC path is
+/// exercisable without microphone hardware/permission.
+fn voice_stt_file(path: &str) {
+    let bytes = match crate::synapse::fs::read(path) {
+        Some(b) => b,
+        None => {
+            serial_println!("voice> file not found: {} (mount a volume first, e.g. /mount 0)", path);
+            return;
+        }
+    };
+    let pcm = match wav_to_pcm16(&bytes) {
+        Some(p) => p,
+        None => {
+            serial_println!("voice> not a 16-bit PCM WAV: {}", path);
+            return;
+        }
+    };
+    serial_println!("voice> {}: {} samples; transcribing\u{2026}", path, pcm.len());
+    let text = crate::sound::stt::transcribe(&pcm);
+    serial_println!("voice> stt> {}", text);
+}
+
+/// Minimal RIFF/WAVE parser: returns mono S16LE samples (averaging stereo).
+/// Handles the standard 44-byte header; scans chunks for `data`.
+fn wav_to_pcm16(b: &[u8]) -> Option<alloc::vec::Vec<i16>> {
+    if b.len() < 12 || &b[0..4] != b"RIFF" || &b[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12;
+    let mut channels = 1u16;
+    let mut data: Option<&[u8]> = None;
+    while pos + 8 <= b.len() {
+        let id = &b[pos..pos + 4];
+        let sz = u32::from_le_bytes([b[pos + 4], b[pos + 5], b[pos + 6], b[pos + 7]]) as usize;
+        let body = b.get(pos + 8..pos + 8 + sz)?;
+        if id == b"fmt " && body.len() >= 4 {
+            channels = u16::from_le_bytes([body[2], body[3]]).max(1);
+        } else if id == b"data" {
+            data = Some(body);
+        }
+        pos += 8 + sz + (sz & 1); // chunks are word-aligned
+    }
+    let data = data?;
+    let ch = channels as usize;
+    let mut out = alloc::vec::Vec::with_capacity(data.len() / 2 / ch);
+    for frame in data.chunks_exact(2 * ch) {
+        let mut acc = 0i32;
+        for c in 0..ch {
+            acc += i16::from_le_bytes([frame[c * 2], frame[c * 2 + 1]]) as i32;
+        }
+        out.push((acc / ch as i32) as i16);
+    }
+    Some(out)
 }
 
 /// Sound self-test: play a short tone, then sample the mic for 2 s and report
