@@ -8,6 +8,12 @@ name: release-images
 # Images are shipped WITHOUT the model baked in (the GGUFs are 0.8-5.4 GB, over
 # GitHub's per-asset limit). Each asset includes a RUN.md explaining how to
 # fetch the matching model (xtask/fetch-model.sh) and boot.
+#
+# The kernel embeds the release tag + build time via CHITTI_VERSION /
+# CHITTI_BUILD_TIME (kernel/build.rs); local builds fall back to the crate
+# version + "dev". xtask's image paths are host-portable: on Linux the aarch64
+# GPT disk image is assembled with dosfstools/mtools/e2fsprogs (no root), so
+# both arches ship real bootable images from ubuntu runners.
 
 on:
   release:
@@ -33,6 +39,15 @@ jobs:
       - name: Set up Rust (from rust-toolchain.toml)
         run: rustup show && rustc --version
 
+      - name: Embed version + build time
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "CHITTI_VERSION=${{ github.event.release.tag_name }}" >> "$GITHUB_ENV"
+          else
+            echo "CHITTI_VERSION=$(git describe --tags --always)" >> "$GITHUB_ENV"
+          fi
+          echo "CHITTI_BUILD_TIME=$(date -u +'%Y-%m-%d %H:%M UTC')" >> "$GITHUB_ENV"
+
       - name: Install xorriso + Limine (x86_64 ISO only)
         if: matrix.arch == 'x86_64'
         run: |
@@ -42,6 +57,12 @@ jobs:
           make -C "$RUNNER_TEMP/limine"
           echo "CHITTI_LIMINE_BIN=$RUNNER_TEMP/limine/limine" >> "$GITHUB_ENV"
           echo "CHITTI_LIMINE_SHARE=$RUNNER_TEMP/limine" >> "$GITHUB_ENV"
+
+      - name: Install image tooling (aarch64 GPT disk image)
+        if: matrix.arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dosfstools mtools e2fsprogs
 
       - name: Build image (${{ matrix.arch }} / ${{ matrix.model }})
         run: |
@@ -53,9 +74,9 @@ jobs:
             cp target/chitti.iso "dist/$NAME.iso"
             IMG="$NAME.iso"
           else
-            cargo xtask build -arch aarch64 -model "${{ matrix.model }}" --release
-            cp kernel/target/aarch64-chitti/release/chitti-kernel "dist/$NAME.elf"
-            IMG="$NAME.elf"
+            cargo xtask image -arch aarch64 -model "${{ matrix.model }}" --release
+            cp target/chitti-aa64.img "dist/$NAME.img"
+            IMG="$NAME.img"
           fi
           echo "IMG=$IMG" >> "$GITHUB_ENV"
           echo "NAME=$NAME" >> "$GITHUB_ENV"
@@ -64,25 +85,27 @@ jobs:
         run: |
           set -eux
           cat > "dist/${NAME}.RUN.md" <<EOF
-          # Chitti OS - ${{ matrix.arch }} / ${{ matrix.model }}
+          # Chitti OS - ${{ matrix.arch }} / ${{ matrix.model }} (${CHITTI_VERSION})
 
-          Bootable kernel image: \`${IMG}\`. The model is NOT bundled (too large
-          for a release asset); fetch it first:
+          Bootable image: \`${IMG}\`. The model is NOT bundled (too large for a
+          release asset); fetch it first:
 
               ./xtask/fetch-model.sh ${{ matrix.model }}
 
           ## Run
 
-          x86_64 (Limine ISO, QEMU TCG):
+          x86_64 (Limine ISO, BIOS or UEFI):
               qemu-system-x86_64 -M q35 -cpu max -m 2G -cdrom ${NAME}.iso -serial stdio
 
-          aarch64 (native on Apple Silicon via HVF):
-              cargo xtask run -arch aarch64 -model ${{ matrix.model }}
+          aarch64 (raw GPT disk image; boots standalone via UEFI):
+              dd it to a USB drive (or balenaEtcher), attach it as a VM disk
+              (UTM / VirtualBox-ARM / QEMU + AAVMF), or:
+              cargo xtask run -arch aarch64 -model ${{ matrix.model }} --uefi
 
           NOTE: qwen3.5-9b runs but is slow (~0.5 tok/s decode on an M2; mixed
           Q4_0/Q4_1/Q8_0/Q5_K/Q6_K via the generic dequant path) and needs a
           16 GB+ host for -m 12G. The 5.4 GB model is delivered by splitting it
-          into <4 GiB chunks for QEMU's loader (automatic in `cargo xtask run`).
+          into <4 GiB chunks for QEMU's loader (automatic in \`cargo xtask run\`).
           qwen3.5-0.8b runs fully at ~14 tok/s.
           EOF
           tar -czf "dist/${NAME}.tar.gz" -C dist "${IMG}" "${NAME}.RUN.md"

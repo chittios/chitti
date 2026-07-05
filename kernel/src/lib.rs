@@ -13,7 +13,9 @@
 extern crate alloc;
 
 /// Chitti OS version, shown in the status bar and `/info`.
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = env!("CHITTI_VERSION");
+/// Build timestamp (release workflows inject the real one; local = "dev").
+pub const BUILD_TIME: &str = env!("CHITTI_BUILD_TIME");
 
 #[cfg(target_arch = "aarch64")]
 pub mod acpi;
