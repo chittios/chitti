@@ -93,7 +93,7 @@ pub fn phonemize(text: &str) -> String {
     let mut out = String::new();
     with_lex(|lex| {
         let mut word = String::new();
-        let mut flush = |word: &mut String, out: &mut String| {
+        let flush = |word: &mut String, out: &mut String| {
             if !word.is_empty() {
                 if !out.is_empty() {
                     out.push(' ');
