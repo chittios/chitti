@@ -116,6 +116,38 @@ pub fn find_class_sub(base: u8, sub: u8) -> Option<PciDevice> {
     None
 }
 
+/// Print every PCI function to the chat pane — the `/lspci` shell command.
+pub fn dump_all() {
+    crate::serial_println!("pci> legacy port config (0xCF8/0xCFC)");
+    let mut n = 0;
+    for bus in 0u16..256 {
+        let bus = bus as u8;
+        for dev in 0u8..32 {
+            for func in 0u8..8 {
+                let id = read32(bus, dev, func, 0x00);
+                let v = (id & 0xffff) as u16;
+                if v == 0xffff {
+                    if func == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                let class = read32(bus, dev, func, 0x08);
+                crate::serial_println!(
+                    "pci> {bus:02x}:{dev:02x}.{func} {:04x}:{:04x} class {:02x}:{:02x}:{:02x}",
+                    v,
+                    (id >> 16) as u16,
+                    (class >> 24) & 0xff,
+                    (class >> 16) & 0xff,
+                    (class >> 8) & 0xff
+                );
+                n += 1;
+            }
+        }
+    }
+    crate::serial_println!("pci> {n} device(s)");
+}
+
 /// Log every function of PCI base class `base` (diagnostic for audio autodetect).
 pub fn log_class(base: u8) {
     for bus in 0u16..256 {

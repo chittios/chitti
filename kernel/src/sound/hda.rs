@@ -48,6 +48,7 @@ const RIRBUBASE: u64 = 0x54;
 const RIRBWP: u64 = 0x58;
 const RINTCNT: u64 = 0x5a;
 const RIRBCTL: u64 = 0x5c;
+const RIRBSTS: u64 = 0x5d;
 const RIRBSIZE: u64 = 0x5e;
 const SD_BASE: u64 = 0x80;
 const SD_STRIDE: u64 = 0x20;
@@ -162,7 +163,10 @@ pub struct Hda {
     corb: (u64, u64), // (phys, virt)
     rirb: (u64, u64),
     corb_wp: u16,
-    rirb_rp: u16,
+    // Command transport: some controllers implement only one. QEMU's ich9 uses
+    // the immediate-command registers; VirtualBox's ICH6 uses CORB/RIRB. We
+    // detect which returns a sane codec id and use that.
+    imm: bool,
     // Codec graph results.
     dac: u32,
     adc: u32,
@@ -267,7 +271,7 @@ impl Hda {
                 corb,
                 rirb,
                 corb_wp: 0,
-                rirb_rp: 0,
+                imm: false,
                 dac: 0,
                 adc: 0,
                 out_sd,
@@ -280,6 +284,17 @@ impl Hda {
                 pending: VecDeque::new(),
                 cap_decim: [0; 2],
             };
+            // Detect the command transport. Try the immediate-command registers
+            // first (QEMU ich9 answers there and its CORB is quirky); if they
+            // time out (VirtualBox's ICH6 doesn't implement them) fall back to
+            // CORB/RIRB. A valid codec vendor id is non-zero and not all-ones.
+            hda.imm = true;
+            let mut vid = hda.param(0, 0x00);
+            if vid == 0 || vid == 0xffff_ffff {
+                hda.imm = false;
+                vid = hda.param(0, 0x00);
+            }
+            crate::ktrace::log_fmt(format_args!("hda: transport={} codec vid={vid:#x}", if hda.imm { "immediate" } else { "CORB/RIRB" }));
             if !hda.codec_setup() {
                 crate::ktrace::log("hda", "codec_setup failed (no DAC/output pin)");
                 return None;
@@ -314,25 +329,49 @@ impl Hda {
         self.push_verb(cmd)
     }
 
-    /// Send `cmd` via the **immediate command** registers and return the codec
-    /// response. Simpler and sync-free vs CORB/RIRB (which QEMU/VBox/real HW all
-    /// still support alongside the rings).
+    /// Send `cmd` and return the codec response, over whichever transport this
+    /// controller implements (`imm` selects immediate-command registers vs the
+    /// CORB/RIRB DMA rings). QEMU's ich9 only answers on the immediate registers;
+    /// VirtualBox's ICH6 only on CORB/RIRB — so we support both.
     fn push_verb(&mut self, cmd: u32) -> u32 {
+        if self.imm {
+            self.push_verb_imm(cmd)
+        } else {
+            self.push_verb_corb(cmd)
+        }
+    }
+
+    /// Immediate-command path (ICOI/ICII/ICIS).
+    fn push_verb_imm(&mut self, cmd: u32) -> u32 {
         // SAFETY: immediate-command registers on the live controller.
         unsafe {
             let s = self.regs;
-            // Wait until not busy, clear a stale valid bit.
             spin_wait(1_000_000, || r16(s + ICIS) & 0x1 == 0);
             w32(s + ICOI, cmd);
-            // Set ICB (send); write-1-clear IRV at the same time.
-            w16(s + ICIS, 0b11);
-            // Wait for the result-valid bit.
+            w16(s + ICIS, 0b11); // set ICB, write-1-clear IRV
             if !spin_wait(2_000_000, || r16(s + ICIS) & 0x2 != 0) {
                 return 0;
             }
             let resp = r32(s + ICII);
-            w16(s + ICIS, 0x2); // clear IRV
+            w16(s + ICIS, 0x2);
             resp
+        }
+    }
+
+    /// CORB/RIRB DMA-ring path. CORB and RIRB stay in lockstep (one response per
+    /// command), so the response for the command at write-pointer `i` lands in
+    /// `RIRB[i]`.
+    fn push_verb_corb(&mut self, cmd: u32) -> u32 {
+        // SAFETY: ring DMA memory + controller registers, live for its lifetime.
+        unsafe {
+            let s = self.regs;
+            self.corb_wp = if self.corb_wp >= 255 { 1 } else { self.corb_wp + 1 };
+            core::ptr::write_volatile((self.corb.1 + self.corb_wp as u64 * 4) as *mut u32, cmd);
+            w16(s + CORBWP, self.corb_wp);
+            if !spin_wait(2_000_000, || (r16(s + RIRBWP) & 0xff) == self.corb_wp) {
+                return 0;
+            }
+            core::ptr::read_volatile((self.rirb.1 + self.corb_wp as u64 * 8) as *const u32)
         }
     }
 
