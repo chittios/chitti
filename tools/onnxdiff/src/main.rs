@@ -21,10 +21,13 @@ pub static SINK: Mutex<Option<std::fs::File>> = Mutex::new(None);
 macro_rules! serial_println {
     ($($arg:tt)*) => {{
         let line = format!($($arg)*);
+        // Microsecond timestamp prefix: per-node time = delta between
+        // consecutive NODE lines (the op executes between the prints).
+        let us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros();
         let mut sink = $crate::SINK.lock().unwrap();
         match sink.as_mut() {
-            Some(f) => { use std::io::Write as _; writeln!(f, "{}", line).unwrap(); }
-            None => println!("{}", line),
+            Some(f) => { use std::io::Write as _; writeln!(f, "[{}] {}", us, line).unwrap(); }
+            None => println!("[{}] {}", us, line),
         }
     }};
 }
@@ -34,14 +37,52 @@ macro_rules! serial_println {
 /// bit-for-bit (std `exp`/`cos` would hide approximation error).
 pub mod cortex {
     pub mod tensor {
+        /// The kernel's exact NEON dot (4 independent accumulators) on aarch64
+        /// hosts — same silicon as the HVF VM, so host timing ≈ kernel timing.
+        #[cfg(target_arch = "aarch64")]
         pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-            // Kernel SIMD kernels accumulate in f32 lanes; plain f32 fold is the
-            // scalar-equivalent reference.
-            let mut acc = 0f32;
-            for i in 0..a.len().min(b.len()) {
-                acc += a[i] * b[i];
+            use core::arch::aarch64::{vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
+            let n = a.len().min(b.len());
+            let mut i = 0;
+            unsafe {
+                let (mut a0, mut a1) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+                let (mut a2, mut a3) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+                while i + 16 <= n {
+                    let (pa, pb) = (a.as_ptr().add(i), b.as_ptr().add(i));
+                    a0 = vfmaq_f32(a0, vld1q_f32(pa), vld1q_f32(pb));
+                    a1 = vfmaq_f32(a1, vld1q_f32(pa.add(4)), vld1q_f32(pb.add(4)));
+                    a2 = vfmaq_f32(a2, vld1q_f32(pa.add(8)), vld1q_f32(pb.add(8)));
+                    a3 = vfmaq_f32(a3, vld1q_f32(pa.add(12)), vld1q_f32(pb.add(12)));
+                    i += 16;
+                }
+                let mut acc = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
+                while i + 4 <= n {
+                    acc = vfmaq_f32(acc, vld1q_f32(a.as_ptr().add(i)), vld1q_f32(b.as_ptr().add(i)));
+                    i += 4;
+                }
+                let mut sum = vaddvq_f32(acc);
+                while i < n {
+                    sum += a[i] * b[i];
+                    i += 1;
+                }
+                sum
             }
-            acc
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+            let n = a.len().min(b.len());
+            let mut acc = [0f32; 4];
+            let chunks = n / 4;
+            for i in 0..chunks {
+                for l in 0..4 {
+                    acc[l] += a[i * 4 + l] * b[i * 4 + l];
+                }
+            }
+            let mut s = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+            for i in chunks * 4..n {
+                s += a[i] * b[i];
+            }
+            s
         }
         const LN2: f32 = core::f32::consts::LN_2;
         pub fn expf(x: f32) -> f32 {

@@ -109,10 +109,20 @@ pub fn transcribe(pcm: &[i16]) -> String {
     let x = Val::new(alloc::vec![1, mels, frames], sig);
     let len = Val { dims: alloc::vec![1], f: alloc::vec![frames as f32], i: Some(alloc::vec![frames as i64]), seq: None };
     crate::ktrace::log_fmt(format_args!("stt: running parakeet on {mels}x{frames} features (this is slow on the scalar interpreter)"));
+    let (a0, s0) = crate::mm::heap::alloc_stats();
+    let t0 = crate::arch::now_ms();
     let out = match crate::onnx::exec::run(&model, &[("audio_signal", x), ("length", len)]) {
         Ok(o) => o,
         Err(e) => return alloc::format!("(parakeet run failed: {e})"),
     };
+    let (a1, s1) = crate::mm::heap::alloc_stats();
+    crate::ktrace::log_fmt(format_args!(
+        "stt: run {} ms, {} allocs, {} scan steps ({} avg)",
+        crate::arch::now_ms().saturating_sub(t0),
+        a1 - a0,
+        s1 - s0,
+        (s1 - s0) / (a1 - a0).max(1)
+    ));
     let lp = match out.values().next() {
         Some(v) => v,
         None => return String::from("(parakeet produced no output)"),

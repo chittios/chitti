@@ -17,6 +17,18 @@ use super::Locked;
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem;
 use core::ptr::null_mut;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Allocator pressure counters (diagnosis: is the first-fit scan the ONNX
+/// interpreter's bottleneck?). `SCAN_STEPS / ALLOC_CALLS` = average free-list
+/// nodes walked per allocation; read via [`alloc_stats`].
+static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
+static SCAN_STEPS: AtomicU64 = AtomicU64::new(0);
+
+/// `(allocations, free-list steps walked)` since boot.
+pub fn alloc_stats() -> (u64, u64) {
+    (ALLOC_CALLS.load(Ordering::Relaxed), SCAN_STEPS.load(Ordering::Relaxed))
+}
 
 pub const HEAP_START: u64 = 0xffff_a000_0000_0000;
 // 512 MiB: Phase 3's Cortex (Qwen3.5 hybrid) needs real room -- each
@@ -155,8 +167,10 @@ impl LinkedListAllocator {
     }
 
     fn find_region(&mut self, size: usize, align: usize) -> Option<(&'static mut ListNode, usize)> {
+        ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
         let mut current = &mut self.head;
         while let Some(ref mut region) = current.next {
+            SCAN_STEPS.fetch_add(1, Ordering::Relaxed);
             if let Ok(alloc_start) = Self::alloc_from_region(region, size, align) {
                 let next = region.next.take();
                 let region = current.next.take().unwrap();
