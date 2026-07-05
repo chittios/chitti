@@ -905,10 +905,12 @@ fn voice_talk() {
     {
         let mut levels: alloc::vec::Vec<f32> = alloc::vec::Vec::new();
         let mut frame = [0i16; 1600];
+        // VAD works on 512-sample windows; capture chunks are re-framed here.
+        let mut vadbuf: alloc::vec::Vec<i16> = alloc::vec::Vec::new();
         let mut utter: alloc::vec::Vec<i16> = alloc::vec::Vec::new();
         let mut in_speech = false;
         let mut silent_ms = 0u32;
-        const THRESH: f32 = 0.02; // level gate until the silero VAD model lands
+        crate::sound::vad::reset();
         crate::framebuffer::draw_voice(&levels, "listening\u{2026}");
         loop {
             if let Some(b) = crate::console::read_byte() {
@@ -930,22 +932,36 @@ fn voice_talk() {
                 if levels.len() > 256 {
                     levels.remove(0);
                 }
-                if r > THRESH {
-                    in_speech = true;
-                    silent_ms = 0;
-                    utter.extend_from_slice(&frame[..n]);
-                } else if in_speech {
-                    silent_ms += (n as u32) * 1000 / 16000;
-                    utter.extend_from_slice(&frame[..n]);
-                    if silent_ms > 800 {
-                        let ms = utter.len() as u32 / 16;
-                        serial_println!("voice> utterance captured: {} ms ({} samples) \u{2014} STT lands with the parakeet model", ms, utter.len());
-                        utter.clear();
-                        in_speech = false;
+                vadbuf.extend_from_slice(&frame[..n]);
+                // Run silero VAD over each complete 512-sample window (32 ms).
+                while vadbuf.len() >= 512 {
+                    let win: alloc::vec::Vec<i16> = vadbuf.drain(..512).collect();
+                    // Falls back to a simple level gate if the model failed.
+                    let speech = match crate::sound::vad::prob(&win) {
+                        Some(p) => p > 0.5,
+                        None => crate::sound::rms(&win) > 0.02,
+                    };
+                    if speech {
+                        in_speech = true;
                         silent_ms = 0;
+                        utter.extend_from_slice(&win);
+                    } else if in_speech {
+                        silent_ms += 32;
+                        utter.extend_from_slice(&win);
+                        if silent_ms > 800 {
+                            let ms = utter.len() as u32 / 16;
+                            serial_println!(
+                                "voice> utterance captured: {} ms ({} samples, silero-gated) \u{2014} STT lands with the parakeet model",
+                                ms,
+                                utter.len()
+                            );
+                            utter.clear();
+                            in_speech = false;
+                            silent_ms = 0;
+                        }
                     }
                 }
-                let status = if in_speech { "listening\u{2026} (speech)" } else { "listening\u{2026} (Esc or Stop to end)" };
+                let status = if in_speech { "listening\u{2026} (speech detected)" } else { "listening\u{2026} (Esc or Stop to end)" };
                 crate::framebuffer::draw_voice(&levels, status);
             }
             crate::net::poll();
