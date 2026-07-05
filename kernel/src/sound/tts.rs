@@ -34,8 +34,15 @@ pub fn synth(text: &str) -> Result<Vec<i16>, alloc::string::String> {
     let speed = Val::new(alloc::vec![1], alloc::vec![1.0]);
     crate::ktrace::log_fmt(format_args!("tts: running kitten on {n} tokens (slow on the scalar interpreter)"));
     let out = crate::onnx::exec::run(&model, &[("input_ids", input_ids), ("style", style), ("speed", speed)]).map_err(|e| alloc::format!("kitten run failed: {e}"))?;
-    // First output is the waveform (float, ~24 kHz). Convert to S16.
-    let wav = out.values().next().ok_or("kitten produced no output")?;
+    // The waveform is the largest float output (the model also emits short
+    // per-token tensors like durations); pick by length, not map order.
+    let wav = out.values().max_by_key(|v| v.f.len()).ok_or("kitten produced no output")?;
+    // The StyleTTS2 decoder currently overflows to NaN/inf on the scalar int8
+    // interpreter (its intermediate activations run ~30x hot, compounding
+    // through the residual/upsample chain) — refuse to "play" garbage.
+    if wav.f.iter().any(|s| !s.is_finite()) {
+        return Err("kitten waveform is non-finite (decoder int8 numerics overflow — see parakeet-stt-numerics)".into());
+    }
     let pcm: Vec<i16> = wav.f.iter().map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16).collect();
     Ok(pcm)
 }
