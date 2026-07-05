@@ -127,6 +127,70 @@ pub fn find_class(base: u8, sub: u8, prog_if: u8) -> Option<PciDevice> {
     None
 }
 
+/// Find the first function matching class `base`+subclass `sub`, **ignoring
+/// prog_if** — audio controllers report varying prog_if across hypervisors
+/// (VirtualBox HDA in particular), so device drivers match on subclass.
+pub fn find_class_sub(base: u8, sub: u8) -> Option<PciDevice> {
+    if ecam_base() == 0 {
+        return None;
+    }
+    let bus_end = BUS_END.with(|b| *b);
+    for bus in 0..=bus_end {
+        for dev in 0u8..32 {
+            for func in 0u8..8 {
+                let id = read32(bus, dev, func, 0x00);
+                let v = (id & 0xffff) as u16;
+                if v == 0xffff {
+                    if func == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                let class = read32(bus, dev, func, 0x08);
+                if ((class >> 24) & 0xff) as u8 == base && ((class >> 16) & 0xff) as u8 == sub {
+                    return Some(PciDevice { bus, dev, func, vendor: v, device: (id >> 16) as u16 });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Log every function of PCI base class `base` (diagnostic — used when audio
+/// autodetect finds nothing, so the actual VM device layout is visible).
+pub fn log_class(base: u8) {
+    if ecam_base() == 0 {
+        crate::ktrace::log("pci", "log_class: ECAM base is 0 (PCIe not discovered)");
+        return;
+    }
+    let bus_end = BUS_END.with(|b| *b);
+    for bus in 0..=bus_end {
+        for dev in 0u8..32 {
+            for func in 0u8..8 {
+                let id = read32(bus, dev, func, 0x00);
+                let v = (id & 0xffff) as u16;
+                if v == 0xffff {
+                    if func == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                let class = read32(bus, dev, func, 0x08);
+                if ((class >> 24) & 0xff) as u8 == base {
+                    crate::ktrace::log_fmt(format_args!(
+                        "pci: {:04x}:{:04x} class {:02x}:{:02x}:{:02x} at {bus}:{dev}.{func}",
+                        v,
+                        (id >> 16) as u16,
+                        (class >> 24) & 0xff,
+                        (class >> 16) & 0xff,
+                        (class >> 8) & 0xff
+                    ));
+                }
+            }
+        }
+    }
+}
+
 /// Find the `n`-th (0-based) function matching `(vendor, device)`, scanning all
 /// buses in the ECAM range. `device` accepts either the transitional or modern
 /// id via the two-element `devices` list.

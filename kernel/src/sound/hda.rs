@@ -184,7 +184,7 @@ pub struct Hda {
 impl Hda {
     /// Find an HDA controller (PCI class 04.03) and bring it up.
     pub fn probe() -> Option<alloc::boxed::Box<dyn SndDevice>> {
-        let d = match pci::find_class(0x04, 0x03, 0x00) {
+        let d = match pci::find_class_sub(0x04, 0x03) {
             Some(d) => d,
             None => {
                 crate::ktrace::log("hda", "probe: no PCI class 04.03 device found");

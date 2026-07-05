@@ -73,7 +73,7 @@ fn io_bar(d: &PciDevice, idx: u8) -> u16 {
 
 impl Ac97 {
     pub fn probe() -> Option<Box<dyn SndDevice>> {
-        let d = match pci::find_class(0x04, 0x01, 0x00) {
+        let d = match pci::find_class_sub(0x04, 0x01) {
             Some(d) => d,
             None => {
                 crate::ktrace::log("ac97", "probe: no PCI class 04.01 device");

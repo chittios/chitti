@@ -89,3 +89,59 @@ pub fn find_class(base: u8, sub: u8, prog_if: u8) -> Option<PciDevice> {
     }
     None
 }
+
+/// Find the first function matching class `base`+subclass `sub`, ignoring
+/// prog_if (audio controllers vary it across hypervisors — VirtualBox HDA in
+/// particular).
+pub fn find_class_sub(base: u8, sub: u8) -> Option<PciDevice> {
+    for bus in 0u16..256 {
+        let bus = bus as u8;
+        for dev in 0u8..32 {
+            for func in 0u8..8 {
+                let id = read32(bus, dev, func, 0x00);
+                let v = (id & 0xffff) as u16;
+                if v == 0xffff {
+                    if func == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                let class = read32(bus, dev, func, 0x08);
+                if ((class >> 24) & 0xff) as u8 == base && ((class >> 16) & 0xff) as u8 == sub {
+                    return Some(PciDevice { bus, dev, func, vendor: v, device: (id >> 16) as u16 });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Log every function of PCI base class `base` (diagnostic for audio autodetect).
+pub fn log_class(base: u8) {
+    for bus in 0u16..256 {
+        let bus = bus as u8;
+        for dev in 0u8..32 {
+            for func in 0u8..8 {
+                let id = read32(bus, dev, func, 0x00);
+                let v = (id & 0xffff) as u16;
+                if v == 0xffff {
+                    if func == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                let class = read32(bus, dev, func, 0x08);
+                if ((class >> 24) & 0xff) as u8 == base {
+                    crate::ktrace::log_fmt(format_args!(
+                        "pci: {:04x}:{:04x} class {:02x}:{:02x}:{:02x} at {bus}:{dev}.{func}",
+                        v,
+                        (id >> 16) as u16,
+                        (class >> 24) & 0xff,
+                        (class >> 16) & 0xff,
+                        (class >> 8) & 0xff
+                    ));
+                }
+            }
+        }
+    }
+}
