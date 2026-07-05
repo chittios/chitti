@@ -26,9 +26,33 @@ pub const QK_K: usize = 256;
 pub const Q5_K_BLOCK_BYTES: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2; // d,dmin,scales[12],qh[32],qs[128] = 176
 pub const Q6_K_BLOCK_BYTES: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2; // ql[128],qh[64],scales[16],d = 210
 
+/// Convert an IEEE-754 half (as raw bits) to `f32`. On aarch64 this is the
+/// single `fcvt s, h` instruction (`+fp-armv8` baseline) — it runs once per
+/// Q8_0 block scale in the matvec hot loop, where the bit-manipulation
+/// fallback's ~10 scalar ops per 64-MAC block were measurable. Elsewhere,
+/// pure bit manipulation (exact, handles subnormals/inf/NaN).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub fn f16_to_f32(bits: u16) -> f32 {
+    let out: f32;
+    // SAFETY: register-only conversion instruction; no memory access.
+    unsafe {
+        core::arch::asm!(
+            "fmov {tmp:s}, {bits:w}",
+            "fcvt {out:s}, {tmp:h}",
+            bits = in(reg) bits as u32,
+            tmp = out(vreg) _,
+            out = out(vreg) out,
+            options(nostack, nomem, pure, preserves_flags),
+        );
+    }
+    out
+}
+
 /// Convert an IEEE-754 half (as raw bits) to `f32`, purely by bit
 /// manipulation (no `std` transcendentals). Exact: every `f16` value is
 /// representable in `f32`. Handles subnormals, inf, and NaN.
+#[cfg(not(target_arch = "aarch64"))]
 pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = (bits as u32 & 0x8000) << 16; // f16 sign -> f32 sign bit
     let exp = (bits >> 10) & 0x1f;
@@ -386,6 +410,90 @@ unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
         i += 1;
     }
     sum
+}
+
+/// `y[i] += a * x[i]` — contiguous AXPY, the row kernel of the DeltaNet
+/// recurrent update (state/kv_mem/out rows are contiguous slices). On aarch64
+/// this is an inline-asm NEON loop for the same reason as [`dot_f32_neon`]:
+/// `+strict-align` scalarizes any vector load/store LLVM emits, including
+/// auto-vectorized plain loops. x86 auto-vectorizes the fallback fine (no
+/// strict-align there).
+pub fn axpy_f32(y: &mut [f32], x: &[f32], a: f32) {
+    let n = y.len().min(x.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        let n8 = n / 8;
+        if n8 > 0 {
+            // SAFETY: reads/writes exactly `n8 * 8` in-bounds f32 from x/y;
+            // v8–v15 (callee-saved) untouched.
+            unsafe {
+                core::arch::asm!(
+                    "dup v0.4s, {a:v}.s[0]",
+                    "1:",
+                    "ldp q1, q2, [{px}], #32",
+                    "ldp q3, q4, [{py}]",
+                    "fmla v3.4s, v1.4s, v0.4s",
+                    "fmla v4.4s, v2.4s, v0.4s",
+                    "stp q3, q4, [{py}], #32",
+                    "subs {cnt}, {cnt}, #1",
+                    "b.ne 1b",
+                    px = inout(reg) x.as_ptr() => _,
+                    py = inout(reg) y.as_mut_ptr() => _,
+                    cnt = inout(reg) n8 => _,
+                    a = in(vreg) a,
+                    out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _,
+                    options(nostack),
+                );
+            }
+        }
+        for i in n8 * 8..n {
+            y[i] += a * x[i];
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for i in 0..n {
+        y[i] += a * x[i];
+    }
+}
+
+/// `y[i] *= a` — contiguous scale (the DeltaNet per-token state decay touches
+/// every 128×128 state cell of every head). Inline-asm NEON on aarch64 (see
+/// [`axpy_f32`]); plain loop elsewhere.
+pub fn scale_f32(y: &mut [f32], a: f32) {
+    let n = y.len();
+    #[cfg(target_arch = "aarch64")]
+    {
+        let n8 = n / 8;
+        if n8 > 0 {
+            // SAFETY: reads/writes exactly `n8 * 8` in-bounds f32 from y.
+            unsafe {
+                core::arch::asm!(
+                    "dup v0.4s, {a:v}.s[0]",
+                    "1:",
+                    "ldp q1, q2, [{py}]",
+                    "fmul v1.4s, v1.4s, v0.4s",
+                    "fmul v2.4s, v2.4s, v0.4s",
+                    "stp q1, q2, [{py}], #32",
+                    "subs {cnt}, {cnt}, #1",
+                    "b.ne 1b",
+                    py = inout(reg) y.as_mut_ptr() => _,
+                    cnt = inout(reg) n8 => _,
+                    a = in(vreg) a,
+                    out("v0") _, out("v1") _, out("v2") _,
+                    options(nostack),
+                );
+            }
+        }
+        for i in n8 * 8..n {
+            y[i] *= a;
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for i in 0..n {
+        y[i] *= a;
+    }
 }
 
 /// 16-byte NEON loads via inline asm. Under the kernel's `+strict-align` LLVM

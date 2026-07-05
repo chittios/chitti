@@ -728,28 +728,31 @@ impl<'a> Model<'a> {
             let sh = &mut s_state[h * hk * hv..(h + 1) * hk * hv]; // S[k*hv + v]
             let gd = s.gates[h];
             let beta = s.betas[h];
-            for x in sh.iter_mut() {
-                *x *= gd;
-            }
+            tensor::scale_f32(sh, gd);
             let out = &mut s.delta_o[h * hv..(h + 1) * hv];
             // kv_mem[v] = sum_k S[k,v]*k[k]; delta = (v - kv_mem)*beta;
             // S[k,v] += k[k]*delta[v]; o[v] = sum_k S[k,v]*q[k]
-            for vi in 0..hv {
-                let mut kv_mem = 0.0f32;
-                for ki in 0..hk {
-                    kv_mem += sh[ki * hv + vi] * k[ki];
-                }
-                let delta = (vv[vi] - kv_mem) * beta;
-                for ki in 0..hk {
-                    sh[ki * hv + vi] += k[ki] * delta;
-                }
+            //
+            // Iterated **row-wise** (ki outer): each S row `sh[ki*hv..]` is a
+            // contiguous [hv] slice, so every pass is a SIMD AXPY instead of a
+            // stride-hv scalar walk — this delta rule (18 layers × 16 heads ×
+            // 128×128 state, every token) was the decode-time hot spot.
+            debug_assert!(hv <= 256, "DeltaNet head_v dim {hv} exceeds the fixed delta scratch");
+            let mut delta = [0.0f32; 256]; // hv <= 256 for the supported models
+            let delta = &mut delta[..hv];
+            delta.copy_from_slice(vv);
+            for ki in 0..hk {
+                // delta[v] -= k[ki] * S[ki, v]  (accumulating -kv_mem into vv)
+                tensor::axpy_f32(delta, &sh[ki * hv..(ki + 1) * hv], -k[ki]);
             }
-            for vi in 0..hv {
-                let mut acc = 0.0f32;
-                for ki in 0..hk {
-                    acc += sh[ki * hv + vi] * q[ki];
-                }
-                out[vi] = acc;
+            for d in delta.iter_mut() {
+                *d *= beta;
+            }
+            out.fill(0.0);
+            for ki in 0..hk {
+                let row = &mut sh[ki * hv..(ki + 1) * hv];
+                tensor::axpy_f32(row, delta, k[ki]);
+                tensor::axpy_f32(out, row, q[ki]);
             }
             // gated RMSNorm: RMSNorm(out over hv) * SiLU(z_head)
             tensor::rmsnorm_inplace(out, norm_w, c.rms_eps);
