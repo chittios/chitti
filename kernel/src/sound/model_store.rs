@@ -23,10 +23,10 @@ pub fn kitten() -> Option<&'static [u8]> {
     KITTEN.with(|k| *k)
 }
 
-/// Load a voice model from a mounted filesystem path into the store. Returns
-/// the byte length on success. `which` is `"parakeet"` or `"kitten"`.
-pub fn load(which: &str, path: &str) -> Result<usize, &'static str> {
-    let bytes = crate::synapse::fs::read(path).ok_or("model file not found")?;
+/// Store pre-read model `bytes` under `which` (`"parakeet"` or `"kitten"`),
+/// leaking them to `'static` for the zero-copy ONNX reader. The shell reads the
+/// file from a mounted disk (`read_mounted`) and hands the bytes here.
+pub fn load_bytes(which: &str, bytes: alloc::vec::Vec<u8>) -> Result<usize, &'static str> {
     let leaked: &'static [u8] = alloc::boxed::Box::leak(bytes.into_boxed_slice());
     let n = leaked.len();
     match which {
@@ -34,6 +34,6 @@ pub fn load(which: &str, path: &str) -> Result<usize, &'static str> {
         "kitten" => KITTEN.with(|k| *k = Some(leaked)),
         _ => return Err("unknown model (parakeet|kitten)"),
     }
-    crate::ktrace::log_fmt(format_args!("model_store: loaded {which} ({n} bytes) from {path}"));
+    crate::ktrace::log_fmt(format_args!("model_store: loaded {which} ({n} bytes)"));
     Ok(n)
 }

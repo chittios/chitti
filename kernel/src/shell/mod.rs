@@ -104,6 +104,7 @@ pub fn run() -> ! {
     // status bar once so the datetime is right immediately.
     crate::clock::init();
     crate::ui_config::load_and_apply();
+    auto_mount_root();
     update_status();
 
     // Persona agent (for `/do <intent>`) reused across the session.
@@ -859,10 +860,17 @@ fn run_voice(arg: &str) {
         // /voice models load parakeet|kitten <mounted-path>
         let mut it = rest.splitn(2, ' ');
         match (it.next(), it.next()) {
-            (Some(which), Some(path)) => match crate::sound::model_store::load(which, path.trim()) {
-                Ok(n) => serial_println!("voice> loaded {} ({} bytes) from {}", which, n, path.trim()),
-                Err(e) => serial_println!("voice> load failed: {}", e),
-            },
+            (Some(which), Some(path)) => {
+                let path = path.trim();
+                serial_println!("voice> reading {} \u{2026}", path);
+                match read_mounted(path) {
+                    Some(bytes) => match crate::sound::model_store::load_bytes(which, bytes) {
+                        Ok(n) => serial_println!("voice> loaded {} ({} bytes) from {}", which, n, path),
+                        Err(e) => serial_println!("voice> load failed: {}", e),
+                    },
+                    None => serial_println!("voice> {} not found on any mount (see /mounts; /mount a disk first)", path),
+                }
+            }
             _ => serial_println!("voice> usage: /voice models load parakeet|kitten <path>"),
         }
     } else if let Some(path) = arg.strip_prefix("stt ") {
@@ -2156,6 +2164,38 @@ fn mount_lookup(path: &str) -> Option<Mount> {
 /// `/mount <disk> [vol] [/path]` — bind volume `vol` (default 0) of disk `disk`
 /// to a mount path (default the first free `/mnt`, `/mnt2`, …). The volume is
 /// discovered via the FS detector, exactly as `/disks` shows it.
+/// Auto-mount the ext4 **data** partition at `/` on boot, so `/ls`, `/cat`, and
+/// `/voice models load` work without a manual `/mount`. Picks the same partition
+/// the persistent store uses: the first ext4 that holds neither the model
+/// (`*.gguf`) nor the OS (kernel / `limine.conf`). No-op if none is present.
+fn auto_mount_root() {
+    use crate::block::{ext4_read::Ext4Reader, Partition};
+    use crate::fs::detect::FsType;
+    for disk in 0..4usize {
+        let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
+            continue;
+        };
+        let vols = crate::fs::detect::probe(&mut dev);
+        for (vi, v) in vols.iter().enumerate() {
+            if !matches!(v.fs, FsType::Ext2 | FsType::Ext3 | FsType::Ext4) {
+                continue;
+            }
+            let mut part = Partition::new(&mut dev, v.start_lba, v.sectors);
+            let is_os_or_model = Ext4Reader::open(&mut part)
+                .map(|mut r| r.list_root().iter().any(|(n, _, _)| n.contains(".gguf") || n == "chitti-kernel" || n == "limine.conf"))
+                .unwrap_or(true);
+            if is_os_or_model {
+                continue;
+            }
+            MOUNTS.with(|m| {
+                m.push(Mount { path: alloc::string::String::from("/"), disk, start_lba: v.start_lba, sectors: v.sectors, fs: v.fs, label: v.label.clone() });
+            });
+            serial_println!("Chitti: mounted / -> disk {} vol {} ({}, {} MiB) [auto]", disk, vi, v.fs.name(), v.sectors * 512 / 1024 / 1024);
+            return;
+        }
+    }
+}
+
 fn disk_mount(arg: &str) {
     use alloc::string::{String, ToString};
     let mut disk: Option<usize> = None;
@@ -2306,31 +2346,24 @@ fn ls_mount(mt: &Mount) {
 
 /// `/cat <path>` — print a file from a mounted volume, e.g. `/cat /mnt/notes`.
 /// FAT + ext4 root files (one directory level, matching the mount model).
-fn disk_cat(arg: &str) {
+/// Read a file at an absolute path under some active `/mount` (FAT or ext4).
+/// Shared by `/cat` and `/voice models load`. `None` if not under a mount or
+/// not found.
+fn read_mounted(full: &str) -> Option<alloc::vec::Vec<u8>> {
     use crate::fs::detect::FsType;
-    let full = arg.trim();
-    // Find the mount whose path is the longest prefix, and the file name after it.
     let mt = MOUNTS.with(|m| {
         m.iter()
             .filter(|mt| full == mt.path || full.starts_with(&alloc::format!("{}/", mt.path)))
             .max_by_key(|mt| mt.path.len())
             .cloned()
-    });
-    let Some(mt) = mt else {
-        serial_println!("cat> {} not under any mount (see /mounts)", full);
-        return;
-    };
+    })?;
     let rel = full[mt.path.len()..].trim_start_matches('/');
     if rel.is_empty() {
-        serial_println!("cat> {} is a mount point, not a file", full);
-        return;
+        return None;
     }
-    let Some(mut dev) = crate::block::probe_disk_nth(mt.disk) else {
-        serial_println!("cat> disk {} gone", mt.disk);
-        return;
-    };
+    let mut dev = crate::block::probe_disk_nth(mt.disk)?;
     let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
-    let data: Option<alloc::vec::Vec<u8>> = match mt.fs {
+    match mt.fs {
         FsType::Fat16 | FsType::Fat32 => crate::block::fat_read::FatReader::open(&mut part).and_then(|mut r| r.read_file(rel)),
         FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => crate::block::ext4_read::Ext4Reader::open(&mut part).and_then(|mut r| {
             let sz = r.file_size(rel)? as usize;
@@ -2340,7 +2373,17 @@ fn disk_cat(arg: &str) {
             Some(buf)
         }),
         _ => None,
-    };
+    }
+}
+
+fn disk_cat(arg: &str) {
+    let full = arg.trim();
+    if let Some(mt) = MOUNTS.with(|m| m.iter().find(|mt| full == mt.path).cloned()) {
+        let _ = mt;
+        serial_println!("cat> {} is a mount point, not a file", full);
+        return;
+    }
+    let data = read_mounted(full);
     match data {
         Some(bytes) => {
             serial_println!("cat> {} ({} bytes):", full, bytes.len());
@@ -2350,7 +2393,7 @@ fn disk_cat(arg: &str) {
                 Err(_) => serial_println!("(binary; {} bytes)", bytes.len()),
             }
         }
-        None => serial_println!("cat> {} not found on {}", rel, mt.path),
+        None => serial_println!("cat> {} not found under any mount (see /mounts)", full),
     }
 }
 
