@@ -2,9 +2,11 @@
 //! legacy PIC + PIT timer + keyboard IRQs, FPU/SSE init, and 4-level
 //! paging.
 
+pub mod ac97;
 pub mod ahci;
 pub mod apic;
 pub mod disk;
+pub mod sb16;
 pub mod fpu;
 pub mod gdt;
 pub mod idt;

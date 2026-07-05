@@ -118,6 +118,18 @@ pub fn autodetect() {
     }
     if let Some(dev) = hda::Hda::probe() {
         init(dev);
+        return;
+    }
+    // Legacy x86 audio: AC'97 (VirtualBox/ICH), then Sound Blaster 16 (ISA).
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Some(dev) = crate::arch::x86_64::ac97::Ac97::probe() {
+            init(dev);
+            return;
+        }
+        if let Some(dev) = crate::arch::x86_64::sb16::Sb16::probe() {
+            init(dev);
+        }
     }
 }
 
