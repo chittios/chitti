@@ -51,7 +51,7 @@ capability exists on one arch, it exists on the other.
 
 After any change, verify both:
 
-- `cargo xtask build -arch x86_64` **and** `cargo xtask test` (must stay **104/104**)
+- `cargo xtask build -arch x86_64` **and** `cargo xtask test` (must stay **105/105**)
 - `cargo xtask build -arch aarch64` (and boot it via `cargo xtask run -arch aarch64`
   when the change is boot-visible)
 
@@ -117,6 +117,20 @@ real UEFI hardware.
   from the shell idle loop. NB: aarch64 MMIO register access must be a single
   `ldr`/`str` (inline asm) — LLVM otherwise coalesces adjacent volatile accesses
   into a paired load HVF can't decode (`hvf: isv`).
+- **Sound & voice** (`sound/`, `onnx/`) — virtio-snd PCM in/out (S16 mono,
+  poll-driven, descriptor chains) over virtio-mmio (aarch64) and virtio-PCI
+  (x86); `/voice` (waveform modal, level-gated utterances) and `/voice test`
+  (tone + mic check). `onnx/` is a zero-copy no_std ONNX (protobuf) reader for
+  the voice models — silero-vad v5 parses today; the op executor + parakeet STT
+  and KittenTTS land incrementally. `cargo xtask voice-assets` downloads the
+  models into `assets/voice/` (gitignored).
+- **Agent chat protocol** — the shell chat is an agentic ReAct loop on the
+  Qwen3.5 template: tools come **dynamically from the registry** (manifest
+  toolset ∩ `tools::registry`; never hardcode a tool list in a prompt),
+  `<tool_call>` JSON in, `<tool_response>` back, thinking on by default
+  (`/think`), `/mode manual|auto|bypass` gates agent tool calls through the
+  modal. Every agent has `/agent/<id>/{SOUL.md,skills/,memory/}`; SOUL.md is
+  prepended to its system prompt.
 
 ## Build / run / test
 
@@ -124,7 +138,7 @@ Everything goes through `cargo xtask`. Arch is chosen explicitly, never
 host-detected. See [DEVELOPMENT.md](DEVELOPMENT.md) for the full setup.
 
 ```sh
-cargo xtask test                       # in-kernel test suite under QEMU (x86) — 104/104, no model
+cargo xtask test                       # in-kernel test suite under QEMU (x86) — 105/105, no model
 cargo xtask build -arch x86_64|aarch64 # cross-build the kernel
 cargo xtask run   -arch x86_64|aarch64 # boot in QEMU (aarch64 = native HVF on Apple Silicon)
 cargo xtask image -arch x86_64|aarch64 # assemble a bootable image/ISO

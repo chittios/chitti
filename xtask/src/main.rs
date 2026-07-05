@@ -181,6 +181,7 @@ fn main() {
         },
         "run" => cmd_run(release, arch, model, uefi, disk_only, fresh_disk, disk_size, no_model),
         "test" => cmd_test(),
+        "voice-assets" => cmd_voice_assets(),
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
         // boot the real model, run the acceptance checks, exit pass/fail.
         "ref-check" => cmd_ref_check(),
@@ -1097,6 +1098,63 @@ fn ensure_disk_image(want_bytes: u64, fresh: bool) -> Result<PathBuf, String> {
         eprintln!("disk image {} sized to {} MiB (sparse)", path.display(), want / (1024 * 1024));
     }
     Ok(path)
+}
+
+/// `cargo xtask voice-assets`: download the /voice ONNX models into
+/// `assets/voice/` (cached — skips files already present): silero-vad v5
+/// (VAD), NeMo parakeet-tdt-ctc-110m int8 (STT, from the sherpa-onnx release
+/// bundle, plus its tokens.txt) and KittenTTS mini (TTS).
+fn cmd_voice_assets() -> Result<(), String> {
+    let dir = repo_root().join("assets/voice");
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let fetch = |name: &str, url: &str| -> Result<(), String> {
+        let dst = dir.join(name);
+        if dst.exists() {
+            eprintln!("voice-assets: {name} already present");
+            return Ok(());
+        }
+        eprintln!("voice-assets: downloading {name}…");
+        let st = Command::new("curl")
+            .args(["-sL", "-o"])
+            .arg(&dst)
+            .arg(url)
+            .status()
+            .map_err(|e| format!("curl: {e}"))?;
+        if !st.success() {
+            return Err(format!("download failed for {name}"));
+        }
+        Ok(())
+    };
+    fetch("silero_vad.onnx", "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx")?;
+    fetch(
+        "kitten_tts_mini.onnx",
+        "https://huggingface.co/KittenML/kitten-tts-mini-0.8/resolve/main/kitten_tts_mini_v0_8.onnx",
+    )?;
+    // The parakeet STT model ships inside a tar.bz2 bundle with its tokens.
+    if !dir.join("parakeet_ctc_int8.onnx").exists() {
+        eprintln!("voice-assets: downloading parakeet (STT) bundle…");
+        let tmp = std::env::temp_dir().join("parakeet.tar.bz2");
+        let st = Command::new("curl")
+            .args(["-sL", "-o"])
+            .arg(&tmp)
+            .arg("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8.tar.bz2")
+            .status()
+            .map_err(|e| format!("curl: {e}"))?;
+        if !st.success() {
+            return Err("parakeet download failed".into());
+        }
+        let st = Command::new("tar").args(["-xjf"]).arg(&tmp).arg("-C").arg(std::env::temp_dir()).status().map_err(|e| format!("tar: {e}"))?;
+        if !st.success() {
+            return Err("parakeet extract failed".into());
+        }
+        let src = std::env::temp_dir().join("sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8");
+        fs::copy(src.join("model.int8.onnx"), dir.join("parakeet_ctc_int8.onnx")).map_err(|e| format!("copy: {e}"))?;
+        fs::copy(src.join("tokens.txt"), dir.join("parakeet_tokens.txt")).map_err(|e| format!("copy: {e}"))?;
+    } else {
+        eprintln!("voice-assets: parakeet already present");
+    }
+    eprintln!("voice-assets: done — assets/voice/ ready");
+    Ok(())
 }
 
 /// `cargo xtask test`: run the in-kernel `custom_test_frameworks` test
