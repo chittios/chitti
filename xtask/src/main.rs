@@ -384,6 +384,48 @@ hdiutil detach "$DEV" > /dev/null
     Ok(img)
 }
 
+/// Build a small FAT "voice disk" holding the voice models (`kitten.onnx`,
+/// `parakeet.onnx`) so `cargo xtask run` can attach them as an extra virtio-blk
+/// disk — the kernel's `find_on_disks` scans it and auto-loads them. Returns
+/// `None` if no voice assets are present. Cached; rebuilt when the models change.
+fn build_voice_disk() -> Option<PathBuf> {
+    let voice: Vec<(String, PathBuf)> = voice_model_assets().into_iter().filter(|(_, p)| p.exists()).map(|(n, p)| (n.to_string(), p)).collect();
+    if voice.is_empty() {
+        return None;
+    }
+    let img = repo_root().join("target/chitti-voice.img");
+    let total: u64 = voice.iter().map(|(_, p)| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
+    let want = format!("{total}:{}", voice.len());
+    let meta = repo_root().join("target/chitti-voice.meta");
+    if img.exists() && fs::read_to_string(&meta).map(|s| s.trim() == want).unwrap_or(false) {
+        return Some(img);
+    }
+    let size_mb = 64 + total / (1024 * 1024) + 32;
+    let f = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&img).ok()?;
+    f.set_len(size_mb * 1024 * 1024).ok()?;
+    drop(f);
+    let cps = voice.iter().map(|(n, p)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), n)).collect::<Vec<_>>().join("\n");
+    let script = format!(
+        r#"set -e
+DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "{img}" | head -1 | awk '{{print $1}}')
+newfs_msdos -F 32 -v VOICE "$DEV" > /dev/null
+diskutil mount "$DEV" > /dev/null
+MNT=$(diskutil info "$DEV" | awk -F': *' '/Mount Point/{{print $2}}')
+{cps}
+diskutil unmount "$DEV" > /dev/null
+hdiutil detach "$DEV" > /dev/null
+"#,
+        img = img.display(),
+    );
+    let ok = Command::new("/bin/sh").arg("-c").arg(&script).status().map(|s| s.success()).unwrap_or(false);
+    if !ok {
+        return None;
+    }
+    let _ = fs::write(&meta, &want);
+    eprintln!("  voice disk: {} ({} MiB, {} model(s))", img.display(), size_mb, voice.len());
+    Some(img)
+}
+
 /// Boot aarch64 via UEFI firmware (AAVMF) — the Chitti stub loads the normal
 /// identity kernel (+ model) off a real FAT ESP and hands off MMU-off through
 /// an identity-RAM trampoline, so the kernel boots exactly as under `-kernel`.
@@ -478,6 +520,11 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
         qemu.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", d.display()));
         qemu.args(["-device", "virtio-blk-device,drive=chittidisk"]);
         eprintln!("  disk: {} (virtio-blk over virtio-mmio)", d.display());
+    }
+    // Voice models on an extra FAT disk (kernel `find_on_disks` auto-loads them).
+    if let Some(vd) = build_voice_disk() {
+        qemu.arg("-drive").arg(format!("file={},if=none,id=voicedisk,format=raw", vd.display()));
+        qemu.args(["-device", "virtio-blk-device,drive=voicedisk"]);
     }
     // Place the GGUF in guest RAM at the model's load address (where the aarch64
     // `cortex::model_module` looks) -- the equivalent of the x86 Limine boot

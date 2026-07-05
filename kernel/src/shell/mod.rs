@@ -105,7 +105,6 @@ pub fn run() -> ! {
     crate::clock::init();
     crate::ui_config::load_and_apply();
     auto_mount_root();
-    voice_autoload();
     update_status();
 
     // Persona agent (for `/do <intent>`) reused across the session.
@@ -848,10 +847,8 @@ fn approval_mode() -> ApprovalMode {
 /// `/voice [test]` — the voice session (mic waveform modal + level-gated
 /// utterance capture) or a sound-hardware self-test (tone + 2 s mic sample).
 fn run_voice(arg: &str) {
-    if !crate::sound::is_up() {
-        serial_println!("voice> no sound device found");
-        return;
-    }
+    // Only audio playback/capture needs a sound device; model loading and STT
+    // (which reads a WAV file) do not — so the check is per-branch, not here.
     let arg = arg.trim();
     if arg == "test" {
         voice_test();
@@ -883,6 +880,10 @@ fn run_voice(arg: &str) {
 fn voice_say(text: &str) {
     if !crate::sound::is_up() {
         serial_println!("voice> no sound device");
+        return;
+    }
+    if !ensure_voice_model("kitten") {
+        serial_println!("voice> no kitten model found (bundle it in the image, or /voice models load kitten <path>)");
         return;
     }
     serial_println!("voice> synthesizing \u{201c}{}\u{201d}\u{2026}", text);
@@ -1010,13 +1011,24 @@ fn voice_load(which: &str, path: Option<&str>) -> Result<(usize, alloc::string::
     Err(alloc::format!("no {which} model bundled or on disk (pass a path, or bundle via the image)"))
 }
 
-/// Best-effort auto-load of the voice models at boot (after `/` is mounted), so
-/// `/voice say` / STT work without a manual `load`. Silent when absent.
-fn voice_autoload() {
-    for which in ["kitten", "parakeet"] {
-        if let Ok((n, src)) = voice_load(which, None) {
-            serial_println!("Chitti: voice {} auto-loaded ({} bytes) from {} [auto]", which, n, src);
+/// Ensure a voice model is loaded, searching the default locations on first use
+/// (lazy — reading the 78/131 MB models at boot would stall the shell). Returns
+/// true if loaded (already or just now).
+fn ensure_voice_model(which: &str) -> bool {
+    let loaded = match which {
+        "kitten" => crate::sound::model_store::kitten().is_some(),
+        "parakeet" => crate::sound::model_store::parakeet().is_some(),
+        _ => false,
+    };
+    if loaded {
+        return true;
+    }
+    match voice_load(which, None) {
+        Ok((n, src)) => {
+            serial_println!("voice> {} loaded ({} bytes) from {}", which, n, src);
+            true
         }
+        Err(_) => false,
     }
 }
 
@@ -1027,7 +1039,7 @@ fn voice_models() {
     serial_println!("  silero-vad   \x1b[32membedded\x1b[0m (VAD, 630 KB)");
     serial_println!("  parakeet-stt {} (STT; /voice models load parakeet [path])", mk(crate::sound::model_store::parakeet().is_some()));
     serial_println!("  kitten-tts   {} (TTS; /voice models load kitten [path])", mk(crate::sound::model_store::kitten().is_some()));
-    serial_println!("  (no path = search boot module + /voice/*.onnx on the mounted disk; auto-loaded at boot)");
+    serial_println!("  (no path = search boot module + any disk for <model>.onnx; loaded on first /voice use)");
     serial_println!("  host: cargo xtask voice-assets  (downloads into assets/voice/)");
 }
 
@@ -1035,7 +1047,11 @@ fn voice_models() {
 /// volume through the STT front-end. Mic-independent, so the mel + CTC path is
 /// exercisable without microphone hardware/permission.
 fn voice_stt_file(path: &str) {
-    let bytes = match crate::synapse::fs::read(path) {
+    if !ensure_voice_model("parakeet") {
+        serial_println!("voice> no parakeet model found (bundle it in the image, or /voice models load parakeet <path>)");
+        return;
+    }
+    let bytes = match read_mounted(path) {
         Some(b) => b,
         None => {
             serial_println!("voice> file not found: {} (mount a volume first, e.g. /mount 0)", path);
@@ -1090,6 +1106,10 @@ fn wav_to_pcm16(b: &[u8]) -> Option<alloc::vec::Vec<i16>> {
 /// Sound self-test: play a short tone, then sample the mic for 2 s and report
 /// the peak level — proves playback and capture end-to-end.
 fn voice_test() {
+    if !crate::sound::is_up() {
+        serial_println!("voice> no sound device found");
+        return;
+    }
     serial_println!("voice> playing test tone\u{2026}");
     let tone = crate::sound::test_tone(440, 600, 16000);
     match crate::sound::play(&tone, 16000) {
@@ -1136,6 +1156,10 @@ fn voice_test() {
 /// session. STT/TTS attach here as their models land; until then each captured
 /// utterance is reported with its length.
 fn voice_talk() {
+    if !crate::sound::is_up() {
+        serial_println!("voice> no sound device found");
+        return;
+    }
     serial_println!("voice> listening \u{2014} Esc (or the Stop button) ends the session");
     if let Err(e) = crate::sound::capture_start(16000) {
         serial_println!("voice> capture failed: {}", e);
