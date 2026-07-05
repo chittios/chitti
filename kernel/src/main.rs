@@ -59,7 +59,6 @@ pub extern "C" fn _start() -> ! {
         "Chitti: SMP: {} core(s) online (see ktrace 'smp:' lines for the spinlock self-test)",
         chitti_kernel::smp::cpu_count()
     );
-    disk_demo();
     // Bring up a USB keyboard (xHCI + HID) if present, so a real USB keyboard
     // drives the shell alongside PS/2. No-op without an xHCI controller.
     let usb_kbd = chitti_kernel::arch::x86_64::xhci::init_global();
@@ -159,7 +158,6 @@ pub extern "C" fn limine_start() -> ! {
         chitti_kernel::framebuffer::init_console(fb);
         serial_println!("Chitti: framebuffer up via Limine GOP -- console mirrored to the window");
     }
-    disk_demo();
     match chitti_kernel::cortex::model_module() {
         Some(bytes) => {
             if let Ok(g) = chitti_kernel::cortex::gguf::Gguf::parse(bytes) {
@@ -256,10 +254,9 @@ pub extern "C" fn aarch64_start() -> ! {
             if _pl050_mouse { "yes" } else { "no" }
         );
     }
-    // Same storage bring-up as x86: mount SimpleFS demo disk (if any) and point
+    // Same storage bring-up as x86: point
     // synapse::fs at an ext4 data partition for durable agent state. No-op
     // without a `-drive`/virtio-blk-device.
-    disk_demo();
     mount_persistent_store();
     // Bring up networking (virtio-net over mmio, else a PCI NIC) so /network,
     // /ping and /wifi work. No-op if no NIC is present.
@@ -416,52 +413,6 @@ fn mount_persistent_store() {
     }
 }
 
-/// Phase 7 block-device FS demo: mount SimpleFS on the disk and bump a
-/// persistent boot counter. Arch-generic via `block::probe_disk()`.
-fn disk_demo() {
-    use chitti_kernel::block::BlockDevice;
-    use chitti_kernel::fs::SimpleFs;
-
-    serial_println!("Chitti: --- Block-device filesystem (Phase 7) ---");
-    let Some(dev) = chitti_kernel::block::probe_disk() else {
-        serial_println!("Chitti: disk> no virtio-blk device present (boot with a -drive to enable persistence)");
-        return;
-    };
-    serial_println!("Chitti: disk> virtio-blk found: {} sectors", dev.block_count());
-
-    // Mount ONLY -- never auto-format. A blank or foreign disk is left
-    // untouched and reported; formatting is an explicit user action (`/install`
-    // or `/mkfs`), like a real OS installer.
-    let mut fs = match SimpleFs::mount(dev) {
-        Ok(fs) => fs,
-        Err(_) => {
-            serial_println!("Chitti: disk> present but not a Chitti (SimpleFS) volume -- NOT auto-formatting.");
-            serial_println!("Chitti: disk> use /install (bootable install) or /mkfs to set it up.");
-            return;
-        }
-    };
-
-    let prior = fs
-        .read("boots")
-        .ok()
-        .and_then(|b| core::str::from_utf8(&b).ok().and_then(|s| s.trim().parse::<u32>().ok()))
-        .unwrap_or(0);
-    let boots = prior + 1;
-    let mut buf = [0u8; 12];
-    let text = fmt_u32(boots, &mut buf);
-    match fs.write("boots", text.as_bytes()).and_then(|_| fs.write("banner", b"written by Chitti OS SimpleFS")) {
-        Ok(()) => {
-            let files = fs.list().unwrap_or_default();
-            serial_println!("Chitti: disk> boot #{} (persisted on disk); files = {:?}", boots, files);
-            if prior > 0 {
-                serial_println!("Chitti: disk> (the counter survived a reboot -- durable storage works)");
-            } else {
-                serial_println!("Chitti: disk> (first boot on this Chitti disk; run again to see the counter increment)");
-            }
-        }
-        Err(e) => serial_println!("Chitti: disk> write failed: {:?}", e),
-    }
-}
 
 /// Format a `u32` into `buf` without `alloc`, returning the decimal string.
 fn fmt_u32(mut n: u32, buf: &mut [u8; 12]) -> &str {

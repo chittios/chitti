@@ -1,5 +1,5 @@
 //! Read-only **filesystem detection** for external disks / USB drives: identify
-//! FAT32, exFAT, NTFS, ext2/3/4, XFS, and our own SimpleFS by their on-disk
+//! FAT32, exFAT, NTFS, ext2/3/4, and XFS by their on-disk
 //! signatures, and parse MBR / GPT partition tables so per-partition volumes are
 //! recognized. No writes are ever issued to a foreign filesystem (per the
 //! locked decision) — this module only reads a handful of sectors to classify a
@@ -21,7 +21,6 @@ pub enum FsType {
     Ext3,
     Ext4,
     Xfs,
-    SimpleFs,
     Unknown,
 }
 
@@ -36,7 +35,6 @@ impl FsType {
             FsType::Ext3 => "ext3",
             FsType::Ext4 => "ext4",
             FsType::Xfs => "XFS",
-            FsType::SimpleFs => "SimpleFS",
             FsType::Unknown => "unknown",
         }
     }
@@ -182,11 +180,6 @@ fn classify<D: BlockDevice>(dev: &mut D, start_lba: u64, sectors: u64) -> Volume
     if &b0[0x52..0x5a] == b"FAT32   " && b0[510] == 0x55 && b0[511] == 0xaa {
         vol.fs = FsType::Fat32;
         vol.label = trim_label(&b0[0x47..0x52]);
-        return vol;
-    }
-    // SimpleFS: our superblock magic (u32 LE at offset 0).
-    if le32(&b0, 0) == crate::fs::SIMPLEFS_MAGIC {
-        vol.fs = FsType::SimpleFs;
         return vol;
     }
     // XFS: superblock magic "XFSB" at offset 0 of the volume.

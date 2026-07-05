@@ -266,7 +266,6 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "umount" => disk_umount(arg),
         "mounts" => disk_mounts(),
         "cat" => disk_cat(arg),
-        "mkfs" => disk_mkfs(arg),
         "install" => disk_install(arg),
         "mkext4" => disk_mkext4(arg),
         "ext4read" => disk_ext4read(),
@@ -520,9 +519,9 @@ fn print_help() {
     serial_println!("  /mount <d> [v] [/p]  mount disk d's volume v at /p (default /mnt)");
     serial_println!("  /umount </path>  unmount   /mounts   list mounts");
     serial_println!("  /cat </path/file>  print a file from a mounted volume (FAT/ext4)");
-    serial_println!("  /mkfs            format the disk with SimpleFS (destructive, explicit)");
     serial_println!("  /mkext4          format the disk with ext4 (destructive; writes test files)");
-    serial_println!("  /install [<disk>] yes   install to a disk (GPT: ESP + ext4); default = non-ESP disk");
+    serial_println!("  /install [<disk>]  install/UPDATE Chitti on a disk (modal-confirmed; update keeps data)");
+    serial_println!("                   tokens: 'format' = full erase, 'yes' = skip the modal (scripted)");
     serial_println!("  /help            this list");
     serial_println!("  /exit            power off (or Ctrl+D on an empty line)");
 }
@@ -2081,7 +2080,7 @@ static HISTORY: Locked<alloc::vec::Vec<String>> = Locked::new(alloc::vec::Vec::n
 /// aliases). Keep in sync with `dispatch_system` + the interactive arms.
 const COMMANDS: &[&str] = &[
     "agents", "bench", "cat", "clear", "close", "compact", "datetime", "disks", "exit", "help", "infer", "info",
-    "install", "ktrace", "ls", "mkext4", "mkfs", "mode", "mount", "mounts", "network", "open", "perf",
+    "install", "ktrace", "ls", "mkext4", "mode", "mount", "mounts", "network", "open", "perf",
     "lspci", "onnx", "ping", "session", "shortcuts", "skills", "think", "ui", "umount", "voice", "wifi",
 ];
 
@@ -2541,7 +2540,10 @@ fn run_datetime(arg: &str) {
     if let Some(tz) = arg.strip_prefix("tz") {
         match parse_tz(tz.trim()) {
             Some(secs) => {
-                clock::set_tz(secs);
+                // Keep the displayed wall time fixed when relabeling the zone
+                // (the common case: the clock already shows the right local
+                // time; only the zone label was wrong).
+                clock::set_tz_keep_local(secs);
                 crate::ui_config::persist_tz(secs);
                 update_status();
                 serial_println!("datetime> timezone {}  (now {})", clock::format_tz(), clock::format_datetime());
@@ -2825,7 +2827,7 @@ fn disk_mounts() {
 }
 
 /// List the root directory of a mounted volume (`/ls /mnt`). Shared FAT/ext4/
-/// SimpleFS readers over a partition view at the mount's LBA range.
+/// FAT/ext4 readers over a partition view at the mount's LBA range.
 fn ls_mount(mt: &Mount) {
     use crate::fs::detect::FsType;
     let Some(mut dev) = crate::block::probe_disk_nth(mt.disk) else {
@@ -2857,22 +2859,14 @@ fn ls_mount(mt: &Mount) {
                     let entries = r.list_root();
                     serial_println!("ls> {} ({}) root ({} entries):", mt.path, mt.fs.name(), entries.len());
                     for (name, ino, is_dir) in entries {
-                        serial_println!("  {}{}  (inode {})", name, if is_dir { "/" } else { "" }, ino);
+                        // Store files are written with `/` percent-encoded
+                        // (ext4 dir-entry names cannot contain `/`); show the
+                        // decoded key, not the raw %2F form.
+                        let shown = crate::block::ext4_store::key_decode(&name);
+                        serial_println!("  {}{}  (inode {})", shown, if is_dir { "/" } else { "" }, ino);
                     }
                 }
                 None => serial_println!("ls> {} unreadable", mt.path),
-            }
-        }
-        FsType::SimpleFs => {
-            let part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
-            match crate::fs::SimpleFs::mount(part).and_then(|mut fs| fs.list()) {
-                Ok(names) => {
-                    serial_println!("ls> {} (SimpleFS) root ({} entries):", mt.path, names.len());
-                    for n in names {
-                        serial_println!("  {}", n);
-                    }
-                }
-                Err(_) => serial_println!("ls> {} unreadable", mt.path),
             }
         }
         other => serial_println!("ls> {} is {} -- listing unimplemented", mt.path, other.name()),
@@ -3048,30 +3042,17 @@ fn disk_ls(arg: &str) {
                     let entries = r.list_root();
                     serial_println!("ls> {} volume {} root ({} entries):", v.fs.name(), n, entries.len());
                     for (name, ino, is_dir) in entries {
+                        // Show store keys decoded (the ext4 store percent-
+                        // encodes `/` in dir-entry names), not the raw %2F.
+                        let shown = crate::block::ext4_store::key_decode(&name);
                         if is_dir {
-                            serial_println!("  {}/  (inode {})", name, ino);
+                            serial_println!("  {}/  (inode {})", shown, ino);
                         } else {
-                            serial_println!("  {}  (inode {})", name, ino);
+                            serial_println!("  {}  (inode {})", shown, ino);
                         }
                     }
                 }
                 None => serial_println!("ls> ext volume unreadable"),
-            }
-        }
-        FsType::SimpleFs => {
-            // Mount over a partition view (start_lba may be non-zero — the OS
-            // partition from /install), on a fresh device handle.
-            if let Some(mut dev2) = crate::block::probe_disk() {
-                let part = crate::block::Partition::new(&mut dev2, v.start_lba, v.sectors);
-                match crate::fs::SimpleFs::mount(part).and_then(|mut fs| fs.list()) {
-                    Ok(files) => {
-                        serial_println!("ls> SimpleFS volume {} ({} files):", n, files.len());
-                        for f in files {
-                            serial_println!("  {}", f);
-                        }
-                    }
-                    Err(e) => serial_println!("ls> SimpleFS error: {:?}", e),
-                }
             }
         }
         other => serial_println!(
@@ -3083,36 +3064,56 @@ fn disk_ls(arg: &str) {
     }
 }
 
-fn disk_mkfs(arg: &str) {
-    if arg.trim() != "yes" {
-        serial_println!("mkfs> DESTRUCTIVE: formats the whole disk with SimpleFS, erasing it.");
-        serial_println!("mkfs> re-run as '/mkfs yes' to confirm.");
-        return;
-    }
-    let Some(dev) = crate::block::probe_disk() else {
-        serial_println!("mkfs> no block device");
-        return;
-    };
-    match crate::fs::SimpleFs::format(dev, 64) {
-        Ok(_) => serial_println!("mkfs> formatted the disk with SimpleFS."),
-        Err(e) => serial_println!("mkfs> format failed: {:?}", e),
-    }
-}
-
-/// Parse `/install` arguments: `(confirm, target_disk_index)`. Accepts the
-/// confirmation token `yes` and an optional numeric disk index in any order —
-/// e.g. `yes`, `1 yes`, `yes 1`.
-fn parse_install_args(arg: &str) -> (bool, Option<usize>) {
+/// Parse `/install` arguments: `(pre_confirmed, force_format, target_disk)`.
+/// Tokens in any order: an optional numeric disk index, `yes` (skip the
+/// confirmation modal — for scripted use), and `format` (force a full
+/// repartition even when an existing Chitti install would be updated in
+/// place).
+fn parse_install_args(arg: &str) -> (bool, bool, Option<usize>) {
     let mut confirm = false;
+    let mut format = false;
     let mut target = None;
     for tok in arg.split_whitespace() {
-        if tok == "yes" {
-            confirm = true;
-        } else if let Ok(n) = tok.parse::<usize>() {
-            target = Some(n);
+        match tok {
+            "yes" => confirm = true,
+            "format" => format = true,
+            t => {
+                if let Ok(n) = t.parse::<usize>() {
+                    target = Some(n);
+                }
+            }
         }
     }
-    (confirm, target)
+    (confirm, format, target)
+}
+
+/// The `/install` human gate: a permission modal (destructive actions are
+/// confirmed via the modal, not an inline `yes` token — `yes` remains only as
+/// a scripted pre-confirmation). Returns true to proceed.
+fn confirm_install(pre_confirmed: bool, update: bool, disk: usize) -> bool {
+    if pre_confirmed {
+        return true;
+    }
+    let (title, msg) = if update {
+        (
+            "Update Chitti OS \u{2014} confirm?",
+            alloc::format!(
+                "Disk {} already has Chitti installed. The system partitions (boot loader, kernel, model) will be REWRITTEN; the data partition (agent state) is preserved. Add 'format' to erase everything instead. Proceed?",
+                disk
+            ),
+        )
+    } else {
+        (
+            "Install Chitti OS \u{2014} confirm?",
+            alloc::format!("This ERASES EVERYTHING on disk {} and repartitions it (GPT: ESP + ext4). Proceed?", disk),
+        )
+    };
+    if crate::modal::confirm(title, &msg) {
+        true
+    } else {
+        serial_println!("install> aborted (not confirmed)");
+        false
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3120,14 +3121,7 @@ fn disk_install(arg: &str) {
     use crate::block::{ext4::{Ext4Writer, FileSpec}, fat::FatWriter, gpt, BlockDevice, Partition};
     use alloc::string::String;
     use alloc::vec::Vec;
-    let (confirm, target_override) = parse_install_args(arg);
-    if !confirm {
-        serial_println!("install> DESTRUCTIVE: repartitions the whole disk into a GPT with a 64 MiB");
-        serial_println!("install> FAT ESP (Limine) + an ext4 OS partition (limine.conf + kernel +");
-        serial_println!("install> model), making it boot standalone. Erases everything.");
-        serial_println!("install> usage: /install [<disk>] yes   (disk index from /disks; default 0)");
-        return;
-    }
+    let (pre_confirmed, force_format, target_override) = parse_install_args(arg);
     let (Some(efi), Some(kernel)) = (crate::cortex::find_module("BOOTX64.EFI"), crate::cortex::find_module("payload/chitti-kernel")) else {
         serial_println!("install> installer payload missing (BOOTX64.EFI / kernel modules) -- build the ISO with xtask");
         return;
@@ -3137,26 +3131,52 @@ fn disk_install(arg: &str) {
         serial_println!("install> no disk {} (see /disks; boot with a -drive)", target_idx);
         return;
     };
-    serial_println!("install> target disk {}", target_idx);
-    let total = dev.block_count();
-    let Some(layout) = gpt::default_layout(total) else {
-        serial_println!("install> disk too small ({} sectors)", total);
-        return;
-    };
-
-    // 1. GPT: FAT ESP + ext4 OS partition.
-    if let Err(e) = gpt::write(&mut dev, &gpt::standard_parts(&layout)) {
-        serial_println!("install> GPT write failed: {:?}", e);
+    // An existing Chitti install (our GPT disk GUID) is UPDATED in place: the
+    // system partitions are rewritten, the data partition (durable agent
+    // state) is untouched. `format` forces the old erase-everything path.
+    let existing = gpt::read(&mut dev).and_then(|(chitti, parts)| {
+        if !chitti || force_format {
+            return None;
+        }
+        let find = |n: &str| parts.iter().find(|p| p.name == n).map(|p| (p.first_lba, p.last_lba));
+        match (find("EFI System"), find("Chitti OS")) {
+            (Some(e), Some(o)) => Some((e, o)),
+            _ => None,
+        }
+    });
+    if !confirm_install(pre_confirmed, existing.is_some(), target_idx) {
         return;
     }
-    serial_println!("install> GPT: ESP lba {}..{}, ext4 OS lba {}..{}, ext4 data lba {}..{}", layout.esp_first, layout.esp_last, layout.os_first, layout.os_last, layout.data_first, layout.data_last);
+    serial_println!("install> target disk {}", target_idx);
+    let total = dev.block_count();
+
+    // 1. Partitions: reuse the existing GPT on an update; otherwise write a
+    //    fresh GPT (FAT ESP + ext4 OS + ext4 data).
+    let (esp_range, os_range, fresh_layout) = match existing {
+        Some((e, o)) => {
+            serial_println!("install> existing Chitti install detected -- updating in place (data partition preserved)");
+            (e, o, None)
+        }
+        None => {
+            let Some(layout) = gpt::default_layout(total) else {
+                serial_println!("install> disk too small ({} sectors)", total);
+                return;
+            };
+            if let Err(e) = gpt::write(&mut dev, &gpt::standard_parts(&layout)) {
+                serial_println!("install> GPT write failed: {:?}", e);
+                return;
+            }
+            serial_println!("install> GPT: ESP lba {}..{}, ext4 OS lba {}..{}, ext4 data lba {}..{}", layout.esp_first, layout.esp_last, layout.os_first, layout.os_last, layout.data_first, layout.data_last);
+            ((layout.esp_first, layout.esp_last), (layout.os_first, layout.os_last), Some(layout))
+        }
+    };
 
     // 2. FAT ESP: the Limine loader at /EFI/BOOT/BOOTX64.EFI, plus limine.conf
     //    + the kernel at the root, so the disk boots from FAT alone (UEFI
     //    firmware requires FAT; Limine reads its config from the boot volume).
     let esp_conf = b"timeout: 0\n\n/Chitti OS\n    protocol: limine\n    path: boot():/chitti-kernel\n";
     {
-        let mut esp = Partition::new(&mut dev, layout.esp_first, layout.esp_last - layout.esp_first + 1);
+        let mut esp = Partition::new(&mut dev, esp_range.0, esp_range.1 - esp_range.0 + 1);
         let r = FatWriter::format(&mut esp).and_then(|mut fw| {
             fw.write_efi_boot_file("BOOTX64.EFI", efi)?;
             fw.write_root_file("limine.conf", esp_conf)?;
@@ -3186,23 +3206,26 @@ fn disk_install(arg: &str) {
         files.push(FileSpec { name, data });
     }
     {
-        let mut os = Partition::new(&mut dev, layout.os_first, layout.os_last - layout.os_first + 1);
+        let mut os = Partition::new(&mut dev, os_range.0, os_range.1 - os_range.0 + 1);
         if let Err(e) = Ext4Writer::format(&mut os, &files) {
             serial_println!("install> ext4 format/write failed: {:?}", e);
             return;
         }
     }
     serial_println!("install> ext4 OS partition written: limine.conf + kernel + {} model part(s).", parts.len());
-    {
-        // Empty ext4 data partition for durable agent state (synapse::fs mounts
-        // it at boot, since it holds no *.gguf). No files yet.
+    if let Some(layout) = fresh_layout {
+        // Fresh install only: an empty ext4 data partition for durable agent
+        // state (synapse::fs mounts it at boot, since it holds no *.gguf). An
+        // update never touches it.
         let mut data = Partition::new(&mut dev, layout.data_first, layout.data_last - layout.data_first + 1);
         if let Err(e) = Ext4Writer::format(&mut data, &[]) {
             serial_println!("install> ext4 data partition format failed: {:?}", e);
             return;
         }
+        serial_println!("install> ext4 data partition (lba {}..{}) formatted for durable agent state.", layout.data_first, layout.data_last);
+    } else {
+        serial_println!("install> data partition preserved (agent state intact).");
     }
-    serial_println!("install> ext4 data partition (lba {}..{}) formatted for durable agent state.", layout.data_first, layout.data_last);
     serial_println!("install> DONE -- the disk now boots Chitti standalone via UEFI. Remove the ISO and reboot.");
 }
 
@@ -3217,15 +3240,7 @@ fn disk_install(arg: &str) {
 fn disk_install(arg: &str) {
     use crate::block::{ext4::Ext4Writer, fat::FatWriter, fat_read::FatReader, gpt, BlockDevice, Partition};
     use crate::fs::detect::FsType;
-    let (confirm, target_override) = parse_install_args(arg);
-    if !confirm {
-        serial_println!("install> DESTRUCTIVE: repartitions the target disk into a GPT with a FAT ESP");
-        serial_println!("install> (Chitti UEFI stub + kernel + model) + an ext4 data partition, making it");
-        serial_println!("install> boot standalone. Erases everything on the target.");
-        serial_println!("install> usage: /install [<disk>] yes   (disk index from /disks; default = the");
-        serial_println!("install>        first disk that isn't the boot ESP)");
-        return;
-    }
+    let (pre_confirmed, force_format, target_override) = parse_install_args(arg);
     // Identify the boot ESP (payload source): the FAT volume containing
     // `chitti-kernel`. Scan every disk's *volumes* (via the FS detector), so it
     // is found whether the ESP is a bare FAT disk (fresh `--uefi` boot) OR a GPT
@@ -3263,6 +3278,18 @@ fn disk_install(arg: &str) {
         serial_println!("install> no disk {} (see /disks)", target_idx);
         return;
     };
+    // Existing Chitti install on the target? Update in place: rewrite the ESP
+    // (stub + kernel + model), preserve the ext4 data partition. `format`
+    // forces a full repartition.
+    let existing = gpt::read(&mut target).and_then(|(chitti, parts_read)| {
+        if !chitti || force_format {
+            return None;
+        }
+        parts_read.iter().find(|p| p.name == "EFI System").map(|p| (p.first_lba, p.last_lba))
+    });
+    if !confirm_install(pre_confirmed, existing.is_some(), target_idx) {
+        return;
+    }
     serial_println!("install> target disk {} (boot ESP is on disk {}, lba {})", target_idx, esp_idx, esp_lba);
 
     // Read the stub + kernel off the boot ESP partition. The model is NOT re-read
@@ -3302,29 +3329,44 @@ fn disk_install(arg: &str) {
         model_len
     );
 
-    // 1. GPT: ESP (payload-sized) + ext4 data.
+    // 1. Partitions: reuse the existing ESP range on an update; otherwise
+    //    write a fresh GPT (ESP sized for the payload + ext4 data).
     let total = target.block_count();
     let esp_bytes = (stub.len() + kernel.len() + model_len) as u64;
-    let Some(parts) = gpt::esp_data_parts(total, esp_bytes) else {
-        serial_println!("install> target disk too small ({} sectors for a {} B payload)", total, esp_bytes);
-        return;
+    let (esp_range, fresh_data) = match existing {
+        Some((first, last)) => {
+            let cap = (last - first + 1) * 512;
+            if cap < esp_bytes {
+                serial_println!("install> existing ESP too small ({} B for a {} B payload) -- re-run with 'format'", cap, esp_bytes);
+                return;
+            }
+            serial_println!("install> existing Chitti install detected -- updating the ESP in place (data preserved)");
+            ((first, last), None)
+        }
+        None => {
+            let Some(parts) = gpt::esp_data_parts(total, esp_bytes) else {
+                serial_println!("install> target disk too small ({} sectors for a {} B payload)", total, esp_bytes);
+                return;
+            };
+            if let Err(e) = gpt::write(&mut target, &parts) {
+                serial_println!("install> GPT write failed: {:?}", e);
+                return;
+            }
+            serial_println!(
+                "install> GPT: ESP lba {}..{}, ext4 data lba {}..{}",
+                parts[0].first_lba,
+                parts[0].last_lba,
+                parts[1].first_lba,
+                parts[1].last_lba
+            );
+            ((parts[0].first_lba, parts[0].last_lba), Some((parts[1].first_lba, parts[1].last_lba)))
+        }
     };
-    if let Err(e) = gpt::write(&mut target, &parts) {
-        serial_println!("install> GPT write failed: {:?}", e);
-        return;
-    }
-    serial_println!(
-        "install> GPT: ESP lba {}..{}, ext4 data lba {}..{}",
-        parts[0].first_lba,
-        parts[0].last_lba,
-        parts[1].first_lba,
-        parts[1].last_lba
-    );
 
     // 2. FAT ESP: the stub at /EFI/BOOT/BOOTAA64.EFI + kernel + model at the
     //    root (exactly where the stub looks).
     {
-        let mut esp = Partition::new(&mut target, parts[0].first_lba, parts[0].last_lba - parts[0].first_lba + 1);
+        let mut esp = Partition::new(&mut target, esp_range.0, esp_range.1 - esp_range.0 + 1);
         let r = FatWriter::format(&mut esp).and_then(|mut fw| {
             fw.write_efi_boot_file("BOOTAA64.EFI", &stub)?;
             fw.write_root_file("chitti-kernel", &kernel)?;
@@ -3340,25 +3382,35 @@ fn disk_install(arg: &str) {
     }
     serial_println!("install> ESP (FAT): BOOTAA64.EFI + kernel{} written.", if model.is_some() { " + model" } else { "" });
 
-    // 3. Empty ext4 data partition for durable agent state.
-    {
-        let mut data = Partition::new(&mut target, parts[1].first_lba, parts[1].last_lba - parts[1].first_lba + 1);
+    // 3. Fresh install only: an empty ext4 data partition for durable agent
+    //    state. An update never touches it.
+    if let Some((first, last)) = fresh_data {
+        let mut data = Partition::new(&mut target, first, last - first + 1);
         if let Err(e) = Ext4Writer::format(&mut data, &[]) {
             serial_println!("install> ext4 data partition format failed: {:?}", e);
             return;
         }
+        serial_println!("install> ext4 data partition formatted for durable agent state.");
+    } else {
+        serial_println!("install> data partition preserved (agent state intact).");
     }
-    serial_println!("install> ext4 data partition formatted for durable agent state.");
     serial_println!("install> DONE -- the disk now boots Chitti standalone via UEFI. Reboot with --disk-only.");
 }
 
 fn disk_mkext4(arg: &str) {
     use crate::block::ext4::{Ext4Writer, FileSpec};
     let a = arg.trim();
+    // Destructive: confirmed via the permission modal ('yes'/'empty' inline
+    // still accepted as a scripted pre-confirmation).
     if a != "yes" && a != "empty" {
-        serial_println!("mkext4> DESTRUCTIVE: formats the whole disk as ext4, erasing it.");
-        serial_println!("mkext4> re-run as '/mkext4 yes' (2 test files) or '/mkext4 empty' (0 files) to confirm.");
-        return;
+        let ok = crate::modal::confirm(
+            "Format disk as ext4 \u{2014} confirm?",
+            "This ERASES the whole disk and formats it ext4 (with 2 test files). Proceed?",
+        );
+        if !ok {
+            serial_println!("mkext4> aborted (not confirmed; scripted: /mkext4 yes | empty)");
+            return;
+        }
     }
     let Some(mut dev) = crate::block::probe_disk() else {
         serial_println!("mkext4> no block device");

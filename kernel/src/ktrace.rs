@@ -7,9 +7,10 @@
 //! site unchanged.
 //!
 //! Every log line is prefixed with a monotonically increasing sequence
-//! number rather than a wall-clock timestamp: Phase 1 has no
-//! battery-backed clock, and a plain counter is exactly as useful for
-//! ordering events while staying fully deterministic and reproducible.
+//! number (deterministic ordering) plus the local wall-clock time with
+//! milliseconds (`HH:MM:SS.mmm`, from [`crate::clock`]) — the timestamp is
+//! what makes latency between two trace lines readable during performance
+//! analysis.
 
 use core::fmt::{Arguments, Write};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -33,8 +34,9 @@ pub fn log_fmt(args: Arguments<'_>) {
     // a log line already in progress on another path.
     crate::arch::interrupts::without_interrupts(|| {
         let seq = next_seq();
+        let (h, m, sec, ms) = crate::clock::local_hms_ms();
         let mut sink = LogSink;
-        let _ = write!(sink, "[ktrace #{seq}] ");
+        let _ = write!(sink, "[ktrace #{seq} {h:02}:{m:02}:{sec:02}.{ms:03}] ");
         let _ = sink.write_fmt(args);
         let _ = writeln!(sink);
     });

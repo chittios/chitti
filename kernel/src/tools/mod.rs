@@ -113,7 +113,7 @@ mod tests {
         use crate::agent::types::Provenance;
         let orch_manifest = manifest::orchestrator_manifest();
         let seen = registry::for_agent(&orch_manifest.toolset);
-        for name in ["disks", "datetime", "mount", "install", "mkfs"] {
+        for name in ["disks", "datetime", "mount", "install", "mkext4"] {
             assert!(seen.iter().any(|t| t.name == name), "orchestrator should see /{name} as a tool");
         }
 

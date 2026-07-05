@@ -1,7 +1,7 @@
 //! A minimal **GPT partition-table writer** for `/install`: lay down a
 //! protective MBR + primary/backup GPT with two partitions — an EFI System
 //! Partition (FAT32, for Limine + the kernel + the model) and a Chitti/Linux
-//! data partition (SimpleFS, our OS volume). Enough of the GPT spec to produce
+//! data partition (ext4, our OS volume). Enough of the GPT spec to produce
 //! a table firmware + `sgdisk`/Linux accept; not a general editor.
 
 use crate::block::{BlockDevice, BlockError, BLOCK_SIZE};
@@ -10,7 +10,7 @@ use crate::block::{BlockDevice, BlockError, BLOCK_SIZE};
 const ESP_GUID: [u8; 16] =
     [0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b];
 /// Linux filesystem data type GUID (0FC63DAF-8483-4772-8E79-3D69D8477DE4) —
-/// used for the Chitti (SimpleFS) OS partition.
+/// used for the Chitti (ext4) OS partition.
 const LINUX_GUID: [u8; 16] =
     [0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4];
 
@@ -156,6 +156,68 @@ fn write_bytes<D: BlockDevice>(dev: &mut D, start_lba: u64, data: &[u8]) -> Resu
         dev.write_block(start_lba + i as u64, &buf)?;
     }
     Ok(())
+}
+
+/// One partition read back from an on-disk GPT: `(first_lba, last_lba, name)`.
+pub struct ReadPart {
+    pub first_lba: u64,
+    pub last_lba: u64,
+    pub name: alloc::string::String,
+}
+
+/// Read a disk's GPT: `Some((is_chitti_disk, partitions))` if a valid GPT
+/// header is present at LBA 1. `is_chitti_disk` = the disk GUID matches the
+/// one [`write`] stamps — how `/install` detects an existing Chitti install
+/// and updates the system partitions in place instead of erasing the disk.
+pub fn read<D: BlockDevice>(dev: &mut D) -> Option<(bool, alloc::vec::Vec<ReadPart>)> {
+    let mut h = [0u8; BLOCK_SIZE];
+    dev.read_block(1, &mut h).ok()?;
+    if &h[0..8] != b"EFI PART" {
+        return None;
+    }
+    let is_chitti = &h[56..72] == b"CHITTI-OS-DISK01";
+    let ent_lba = rd64(&h, 72);
+    let n = rd32(&h, 80).min(128) as usize;
+    let esz = rd32(&h, 84) as usize;
+    if esz < 128 {
+        return None;
+    }
+    let mut parts = alloc::vec::Vec::new();
+    let mut sec = [0u8; BLOCK_SIZE];
+    for i in 0..n {
+        let byte_off = i * esz;
+        let lba = ent_lba + (byte_off / BLOCK_SIZE) as u64;
+        let off = byte_off % BLOCK_SIZE;
+        if off + 128 > BLOCK_SIZE {
+            continue; // entries are 128-byte aligned within sectors for esz=128
+        }
+        dev.read_block(lba, &mut sec).ok()?;
+        let e = &sec[off..off + 128];
+        if e[0..16].iter().all(|&b| b == 0) {
+            continue; // unused entry
+        }
+        let first_lba = rd64(e, 32);
+        let last_lba = rd64(e, 40);
+        let mut name = alloc::string::String::new();
+        for k in 0..36 {
+            let c = u16::from_le_bytes([e[56 + k * 2], e[56 + k * 2 + 1]]);
+            if c == 0 {
+                break;
+            }
+            if let Some(ch) = char::from_u32(c as u32) {
+                name.push(ch);
+            }
+        }
+        parts.push(ReadPart { first_lba, last_lba, name });
+    }
+    Some((is_chitti, parts))
+}
+
+fn rd32(b: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+fn rd64(b: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3], b[off + 4], b[off + 5], b[off + 6], b[off + 7]])
 }
 
 /// Two-partition layout for the aarch64 install: an ESP big enough for

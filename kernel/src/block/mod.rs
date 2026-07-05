@@ -71,7 +71,7 @@ pub const BLOCK_SIZE: usize = 512;
 
 /// A view of a sub-range of another block device — a single partition. Block
 /// `i` of the partition maps to block `start + i` of the underlying device, so
-/// a filesystem (e.g. SimpleFS) can be created/mounted within a partition.
+/// a filesystem (e.g. ext4) can be created/mounted within a partition.
 pub struct Partition<'a, D: BlockDevice> {
     dev: &'a mut D,
     start: u64,
