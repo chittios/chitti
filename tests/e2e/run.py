@@ -350,15 +350,15 @@ def s_agents_install_registry(g):
 
 
 def s_system_agents(g):
-    # The built-in network/http/doc/ssh agents are installed into /agent/ at boot
-    # from their bundled markdown + manifest. The boot log proves install_all ran
-    # (which signs each package and place_agent_home's its SOUL); /agents lists them.
-    booted = g.wait_for("system agents installed", 5, 0)  # printed at boot
+    # Only agents that reason from a SOUL are installed agents (doc, ssh); the
+    # network/http stages are pure service-layer plumbing, not agents. The boot
+    # log proves install_all ran (signs each package + places its SOUL/assets).
+    booted = g.wait_for("system agents installed (doc, ssh)", 5, 0)  # printed at boot
     m = g.mark()
     g.send("/agents")
     listed = g.wait_for("system agents", 15, m) and g.wait_for("/agent/9001/SOUL.md", 3, m)
     ok = booted and listed
-    return ok, "network/http/doc/ssh installed as system agents in /agent/" if ok else "system agents not installed/listed"
+    return ok, "doc + ssh installed as system agents in /agent/ (network/http are plumbing)" if ok else "system agents not installed/listed"
 
 
 def s_ssh_agent(g):
