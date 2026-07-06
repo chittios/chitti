@@ -137,8 +137,17 @@ impl RemoteChat {
         self.messages.push(("user".to_string(), msg.to_string()));
         let mut last_call: Option<(String, String)> = None;
         for _ in 0..MAX_TOOL_ITERS {
-            let reply = match chat_completion(&self.cfg, &self.messages) {
+            // The remote round-trip blocks in `net::http`; show a thinking spinner
+            // (driven by `upkeep`, which the HTTP poll loop calls) while we wait.
+            crate::shell::begin_thinking("thinking");
+            let result = chat_completion(&self.cfg, &self.messages);
+            crate::shell::end_thinking();
+            let reply = match result {
                 Ok(r) => r,
+                Err(e) if e == "cancelled" => {
+                    crate::serial_println!("\x1b[33m[stopped]\x1b[0m");
+                    return String::new();
+                }
                 Err(e) => {
                     crate::serial_println!("\x1b[31mremote model error:\x1b[0m {} (see /model)", e);
                     return String::new();

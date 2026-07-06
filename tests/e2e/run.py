@@ -152,6 +152,27 @@ def s_ws(g):
     return ok, "ws echo round-trip" if ok else "no ws echo"
 
 
+def s_cancel(g):
+    # Ctrl+C interrupts a *running command*, not just model generation: a /http
+    # to an unroutable TEST-NET address (RFC 5737) hangs connecting until its
+    # timeout; Ctrl+C (0x03) must abort it near-instantly. Then a normal command
+    # must still work — proving the cancel-poll pushes non-Ctrl+C input back
+    # rather than swallowing the next command's keystrokes.
+    m = g.mark()
+    g.send("/http http://192.0.2.1/")
+    time.sleep(2.0)  # let it get stuck in connect
+    t0 = time.time()
+    g.send_raw(b"\x03")  # Ctrl+C
+    stopped = g.wait_for("cancelled", 8, m)
+    dt = time.time() - t0
+    fast = stopped and dt < 5.0  # aborted well before the multi-second timeout
+    m2 = g.mark()
+    g.send("/network")  # the next command must still be read
+    followed = g.wait_for("10.0.2.15", 10, m2)
+    ok = fast and followed
+    return ok, f"Ctrl+C aborted /http in {dt:.1f}s; next command ran" if ok else f"cancel={stopped}/{dt:.1f}s, next-cmd={followed}"
+
+
 def s_wss(g):
     m = g.mark()
     g.send(f"/ws wss://{HOST}:{TLS_PORT}/ws secret-wss")
@@ -409,7 +430,7 @@ def s_surface(g):
 
 OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS]
 AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface)]
-NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_stream", s_http_stream), ("ws", s_ws)]
+NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_stream", s_http_stream), ("ws", s_ws), ("cancel", s_cancel)]
 NET_TLS = [("wss", s_wss), ("model_remote_https", s_model_remote_https)]
 MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("compact", s_compact), ("doc_website", s_doc_website)]
 VOICE = [("voice_models", s_voice_models), ("voice_say", s_voice_say)]

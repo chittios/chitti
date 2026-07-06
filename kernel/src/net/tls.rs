@@ -111,6 +111,9 @@ impl IoRead for TcpStream {
             if self.timed_out() {
                 return Err(StreamError("TLS read timeout"));
             }
+            if crate::shell::poll_interrupt() {
+                return Err(StreamError("cancelled"));
+            }
             super::poll();
             let r = NET.with(|n| {
                 let s = n.as_mut().ok_or(StreamError("network down"))?;
@@ -139,6 +142,9 @@ impl IoWrite for TcpStream {
         loop {
             if self.timed_out() {
                 return Err(StreamError("TLS write timeout"));
+            }
+            if crate::shell::poll_interrupt() {
+                return Err(StreamError("cancelled"));
             }
             super::poll();
             let r = NET.with(|n| {

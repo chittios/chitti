@@ -105,6 +105,12 @@ class Guest:
         self.proc.stdin.write((line + "\n").encode())
         self.proc.stdin.flush()
 
+    def send_raw(self, data: bytes):
+        """Send raw bytes with no trailing newline — for control keys (Ctrl+C =
+        b'\\x03', Ctrl+V = b'\\x16') and partial input lines."""
+        self.proc.stdin.write(data)
+        self.proc.stdin.flush()
+
     def close(self):
         try:
             self.send("/exit")

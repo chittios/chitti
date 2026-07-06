@@ -201,6 +201,9 @@ fn drive_stream(conn: &mut Conn, wire: &[u8], deadline: u64, on_head: &mut dyn F
         if crate::arch::now_ms() >= deadline {
             return Err("HTTP timeout".into());
         }
+        if crate::shell::poll_interrupt() {
+            return Err("cancelled".into());
+        }
         let k = conn.read(&mut buf);
         if k == 0 {
             break; // EOF / close
@@ -284,13 +287,14 @@ pub(crate) fn tcp_connect(ip: Ipv4Address, port: u16, deadline: u64) -> Result<s
     .map_err(|e: &str| e.to_string())?;
     // Wait for the handshake so TLS starts on an established socket.
     loop {
-        if crate::arch::now_ms() >= deadline {
+        if crate::arch::now_ms() >= deadline || crate::shell::poll_interrupt() {
+            let cancelled = crate::arch::now_ms() < deadline;
             NET.with(|n| {
                 if let Some(s) = n.as_mut() {
                     s.tcp_set(handle).remove(handle.handle);
                 }
             });
-            return Err("TCP connect timeout".into());
+            return Err(if cancelled { "cancelled".into() } else { "TCP connect timeout".into() });
         }
         super::poll();
         let st = NET.with(|n| n.as_mut().map(|s| s.tcp_set(handle).get_mut::<tcp::Socket>(handle.handle).state()));

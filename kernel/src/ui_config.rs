@@ -322,7 +322,7 @@ fn resolve_var(var: &str) -> String {
 
 const DEFAULT_SHORTCUTS: &[(&str, &str, &str)] = &[
     ("Enter", "submit", "send the current line (chat message or /command)"),
-    ("Ctrl+C", "stop", "stop the model mid-generation"),
+    ("Ctrl+C", "stop", "stop the model, or interrupt a running command (/http, /ping, /ws…)"),
     ("Ctrl+D", "exit", "power off on an empty line (EOF)"),
     ("Ctrl+W", "close-pane", "close the action (right) pane; chat full-width"),
     ("Ctrl+V", "paste", "paste the clipboard into the shell line"),

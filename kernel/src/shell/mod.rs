@@ -686,6 +686,44 @@ impl Spinner {
     }
 }
 
+/// A shared "thinking" spinner advanced by [`upkeep`]. The local inference loops
+/// own their `Spinner` and `tick()` it per token, but the **remote model** call
+/// blocks inside `net::http` (one HTTP round-trip, no token stream), so there is
+/// nothing on this side to tick. Instead `begin_thinking` starts a spinner that
+/// `upkeep` — which the net poll loop calls while waiting — advances, and
+/// `end_thinking` erases it. Rate-limited so it spins smoothly, not frantically.
+static THINKING: crate::mm::Locked<Option<Spinner>> = crate::mm::Locked::new(None);
+static THINKING_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Start the shared thinking spinner (replaces any prior one).
+pub(crate) fn begin_thinking(label: &'static str) {
+    THINKING.with(|t| *t = Some(Spinner::new(label)));
+    THINKING_LAST_MS.store(0, Ordering::Relaxed);
+}
+
+/// Stop and erase the shared thinking spinner.
+pub(crate) fn end_thinking() {
+    THINKING.with(|t| {
+        if let Some(s) = t.take() {
+            s.clear();
+        }
+    });
+}
+
+/// Advance the shared thinking spinner (~10 fps), called from [`upkeep`].
+fn thinking_tick() {
+    let now = crate::arch::now_ms();
+    if now.saturating_sub(THINKING_LAST_MS.load(Ordering::Relaxed)) < 100 {
+        return;
+    }
+    THINKING_LAST_MS.store(now, Ordering::Relaxed);
+    THINKING.with(|t| {
+        if let Some(s) = t.as_mut() {
+            s.tick();
+        }
+    });
+}
+
 /// Global thinking toggle (Qwen3.5 `<think>` reasoning before the answer).
 /// Default **off**: the small on-device models (0.8B/2B) ramble indefinitely
 /// in a primed `<think>` block instead of answering (a big context of tool
@@ -697,10 +735,27 @@ fn think_enabled() -> bool {
     THINK_ON.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Non-blocking cancel check for inference loops: Ctrl+C, or a bare Esc key
-/// (an Esc that begins an ANSI CSI sequence — an arrow key — is swallowed
-/// without cancelling).
-fn poll_cancel() -> bool {
+/// Non-blocking **interrupt** check for a running command (`/http`, `/ping`,
+/// DNS, TLS): true only on Ctrl+C. Unlike [`poll_cancel`], any other byte read
+/// is pushed back (`console::unread`) so a long command's polling doesn't eat the
+/// *next* command's keystrokes — it only steals a Ctrl+C. This is what lets
+/// Ctrl+C interrupt a stuck/streaming command without disturbing typed input.
+pub(crate) fn poll_interrupt() -> bool {
+    match crate::console::read_byte() {
+        Some(3) => true,
+        Some(b) => {
+            crate::console::unread(b);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Non-blocking cancel check: Ctrl+C, or a bare Esc key (an Esc that begins an
+/// ANSI CSI sequence — an arrow key — is swallowed without cancelling). Used by
+/// the inference loops (a decode turn owns the console, so consuming input is
+/// fine there).
+pub(crate) fn poll_cancel() -> bool {
     match crate::console::read_byte() {
         Some(3) => true,
         Some(0x1b) => {
@@ -3329,6 +3384,7 @@ pub fn upkeep() {
     ui_tick();
     crate::net::poll();
     crate::service::supervise_tick();
+    thinking_tick();
 }
 
 /// Lighter upkeep for loops that consume their own mouse events (modals, the
@@ -4346,6 +4402,21 @@ mod agent_flow_tests {
         assert_eq!((name.as_str(), args.as_str()), ("disks", ""));
         // Plain prose (a normal answer / greeting) → no tool call.
         assert!(parse_tool_call("Hello! How can I help you today?").is_none());
+    }
+
+    /// `poll_interrupt` (the cancel-poll for running commands like `/http`)
+    /// interrupts on Ctrl+C only, and pushes any other byte back so it isn't
+    /// stolen from the input stream — the fix that keeps a streaming command from
+    /// eating the next command's keystrokes.
+    #[test_case]
+    fn poll_interrupt_ctrl_c_only_and_pushes_back() {
+        // Ctrl+C (0x03) → interrupt.
+        crate::console::unread(0x03);
+        assert!(poll_interrupt());
+        // A non-Ctrl+C byte → no interrupt, and it survives for the next read.
+        crate::console::unread(b'x');
+        assert!(!poll_interrupt());
+        assert_eq!(crate::console::read_byte(), Some(b'x'));
     }
 
     /// The system prompt advertises only the small CORE set + search_tools —
