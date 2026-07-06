@@ -77,6 +77,11 @@ Two layers, and new work adds to **both** where they apply:
    assets). A fix for something the harness could have caught gets a scenario
    too. Run `make e2e` before shipping boot-visible or networked changes.
 
+CI (`.github/workflows/ci.yml`) runs both on every push/PR: `unit` builds both
+arches + `cargo xtask test`; `e2e` boots the kernel and runs the os+net groups.
+It is **fork-PR-safe** — `pull_request` (never `pull_request_target`),
+`contents: read`, no secrets, GitHub-hosted runners only. Keep it that way.
+
 ## STANDING RULE — performance: know the three traps before optimizing
 
 Hard-won findings (commits `f2bd8f7`, `06a62b4`) that apply to **any new

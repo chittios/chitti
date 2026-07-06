@@ -770,7 +770,10 @@ fn accel_args(target_arch: &str) -> Vec<String> {
     if cfg!(target_os = "macos") && std::env::consts::ARCH == target_arch {
         return vec!["-accel".into(), "hvf".into(), "-cpu".into(), "host".into()];
     }
-    if cfg!(target_os = "linux") && std::env::consts::ARCH == target_arch {
+    // Same-arch Linux host: KVM only if it's actually available (a CI runner
+    // may not expose /dev/kvm) — otherwise `-accel kvm` hard-fails, so fall
+    // back to TCG (`-cpu max`) rather than refusing to boot.
+    if cfg!(target_os = "linux") && std::env::consts::ARCH == target_arch && std::path::Path::new("/dev/kvm").exists() {
         return vec!["-accel".into(), "kvm".into(), "-cpu".into(), "host".into()];
     }
     vec!["-cpu".into(), "max".into()]
@@ -1233,6 +1236,27 @@ fn qemu_base_cmd(iso: &Path) -> Command {
     cmd
 }
 
+/// Extra x86 `run` args for headless / CI use:
+/// - `-display none` when `CHITTI_DISPLAY=none` (the e2e harness + CI set this;
+///   otherwise QEMU opens a window that has nowhere to go on a CI runner).
+/// - `-accel kvm` when `CHITTI_ACCEL=kvm`, or automatically when `/dev/kvm`
+///   exists on a Linux host (GitHub's Linux runners expose it) — TCG otherwise.
+fn x86_run_extra_args() -> Vec<String> {
+    let mut v = Vec::new();
+    if env::var("CHITTI_DISPLAY").as_deref() == Ok("none") {
+        v.push("-display".into());
+        v.push("none".into());
+    }
+    let accel = env::var("CHITTI_ACCEL").ok();
+    let use_kvm = accel.as_deref() == Some("kvm")
+        || (accel.is_none() && cfg!(target_os = "linux") && std::path::Path::new("/dev/kvm").exists());
+    if use_kvm {
+        v.push("-accel".into());
+        v.push("kvm".into());
+    }
+    v
+}
+
 /// `cargo xtask run [-arch ...]`: boot the unified kernel. On aarch64 it runs
 /// natively via QEMU + HVF; on x86 it boots the Limine image under
 /// qemu-system-x86_64 (TCG on this host).
@@ -1303,6 +1327,7 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         eprintln!("booting via UEFI (OVMF) -- the same GOP framebuffer path real hardware uses");
     }
     cmd.args(["-serial", "stdio"]);
+    cmd.args(x86_run_extra_args()); // headless (-display none) + KVM on CI
     cmd.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", disk.display()));
     cmd.args(["-device", "virtio-blk-pci,drive=chittidisk,disable-modern=on"]);
     // A USB keyboard on an xHCI controller, so the xhci/HID driver drives the
