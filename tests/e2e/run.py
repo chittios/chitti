@@ -258,16 +258,33 @@ def s_agents_uninstall(g):
 
 
 def _http_get(port, path):
+    # Read the whole response to EOF (the server sends Connection: close), so we
+    # can validate the received body length against the Content-Length header —
+    # catching any truncation-on-close.
     with socket.create_connection(("127.0.0.1", port), timeout=15) as s:
         s.sendall(f"GET {path} HTTP/1.1\r\nHost: chitti\r\nConnection: close\r\n\r\n".encode())
         s.settimeout(15)
         resp = b""
-        while b"</html>" not in resp and len(resp) < 16384:
-            chunk = s.recv(1024)
+        while len(resp) < 65536:
+            chunk = s.recv(2048)
             if not chunk:
                 break
             resp += chunk
     return resp
+
+
+def _content_length_ok(resp):
+    # True iff the response declares a Content-Length that matches the bytes of
+    # the received body (headers/body split on the blank line).
+    sep = resp.find(b"\r\n\r\n")
+    if sep < 0:
+        return False
+    head, body = resp[:sep], resp[sep + 4:]
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            declared = int(line.split(b":", 1)[1].strip())
+            return declared == len(body)
+    return False
 
 
 def s_doc_website(g):
@@ -289,10 +306,13 @@ def s_doc_website(g):
     ok = (
         home.startswith(b"HTTP/1.1 200")
         and b"Chitti" in home
+        and _content_length_ok(home)
         and docs.startswith(b"HTTP/1.1 200")
-        and b"Documentation" in docs
+        and b"Served by the Doc agent" in docs  # the footer — proves the body isn't truncated
+        and _content_length_ok(docs)
     )
-    return ok, "network->http->doc served index.html + docs.html" if ok else f"bad response: {home[:60]!r}"
+    detail = "network->http->doc served full index.html + docs.html (Content-Length matches)"
+    return ok, detail if ok else f"bad/truncated response (home cl_ok={_content_length_ok(home)}, docs cl_ok={_content_length_ok(docs)})"
 
 
 def s_agents_search(g):
