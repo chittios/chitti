@@ -80,6 +80,13 @@ pub const NET_LISTEN: PrimitiveId = 15;
 pub const NET_ACCEPT: PrimitiveId = 16;
 pub const NET_HTTP_GET: PrimitiveId = 17;
 pub const NET_HTTP_POST: PrimitiveId = 18;
+// UI surfaces (Phase 4): a Chess/Image/Video/Browser/Doc agent owns a surface
+// and paints it with a bounded draw-op DSL. Gated by surface ownership, not just
+// the primitive right. None are destructive (drawing is reversible).
+pub const UI_SURFACE_REQUEST: PrimitiveId = 19;
+pub const UI_DRAW: PrimitiveId = 20;
+pub const UI_EVENT_POLL: PrimitiveId = 21;
+pub const UI_SURFACE_CLOSE: PrimitiveId = 22;
 
 const STR: ArgType = ArgType::Str;
 const UINT: ArgType = ArgType::Uint;
@@ -219,6 +226,34 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
         params: &[Param { key: "url", ty: STR }, Param { key: "body", ty: STR }],
         description: "HTTP POST a body to a URL (scope-gated). Destructive: network egress that can exfiltrate.",
         destructive: true,
+    },
+    PrimitiveSpec {
+        id: UI_SURFACE_REQUEST,
+        name: "ui_surface_request",
+        params: &[Param { key: "kind", ty: STR }],
+        description: "Request a drawing surface (kind: canvas|board|image|video|html). Returns its surface id.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: UI_DRAW,
+        name: "ui_draw",
+        params: &[Param { key: "surface", ty: UINT }, Param { key: "ops", ty: STR }],
+        description: "Paint a surface you own with draw ops: 'clear <hex>; rect x y w h <hex>; line x0 y0 x1 y1 <hex>; pixel x y <hex>'.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: UI_EVENT_POLL,
+        name: "ui_event_poll",
+        params: &[Param { key: "surface", ty: UINT }],
+        description: "Poll one input event (click/key) for a surface you own. Returns the event or none.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: UI_SURFACE_CLOSE,
+        name: "ui_surface_close",
+        params: &[Param { key: "surface", ty: UINT }],
+        description: "Close a surface you own.",
+        destructive: false,
     },
 ];
 

@@ -282,8 +282,17 @@ def s_net_service_echo(g):
     return ok, "inbound connection echoed via Tcp-backed channel" if ok else f"bad echo: {got!r}"
 
 
+def s_surface(g):
+    # The UI-surface capability: request a surface + draw ops through Synapse and
+    # confirm a deterministic rasterization checksum (pixels aren't on serial).
+    m = g.mark()
+    g.send("/surface demo")
+    ok = g.wait_for("surface> rendered surface", 15, m) and g.wait_for("checksum=0x", 5, m)
+    return ok, "surface drawn (grammar-validated draw ops rasterized)" if ok else "no surface render"
+
+
 OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS]
-AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("net_service_echo", s_net_service_echo)]
+AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("net_service_echo", s_net_service_echo), ("surface", s_surface)]
 NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_stream", s_http_stream), ("ws", s_ws)]
 NET_TLS = [("wss", s_wss), ("model_remote_https", s_model_remote_https)]
 MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("compact", s_compact)]

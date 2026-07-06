@@ -226,6 +226,20 @@ pub fn primitives_for(caps: &[CapabilityRequest]) -> Vec<PrimitiveId> {
                     prims.push(registry::NET_HTTP_POST);
                 }
             }
+            CapDomain::Ui => {
+                // EXEC = request/own a surface + poll its input; WRITE = draw;
+                // DELETE = close. Which surface is gated by ownership, not scope.
+                if c.rights.contains(Rights::EXEC) {
+                    prims.push(registry::UI_SURFACE_REQUEST);
+                    prims.push(registry::UI_EVENT_POLL);
+                }
+                if c.rights.contains(Rights::WRITE) {
+                    prims.push(registry::UI_DRAW);
+                }
+                if c.rights.contains(Rights::DELETE) {
+                    prims.push(registry::UI_SURFACE_CLOSE);
+                }
+            }
             CapDomain::Inference | CapDomain::Todo | CapDomain::Ipc | CapDomain::SkillManage => {}
         }
     }
