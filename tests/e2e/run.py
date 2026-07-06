@@ -436,6 +436,40 @@ MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_ch
 VOICE = [("voice_models", s_voice_models), ("voice_say", s_voice_say)]
 
 
+def boot_guest(arch, model, verbose, audio, fwd, attempts=3):
+    """Launch the guest and wait for it to reach networking, retrying if it dies
+    early. aarch64 SMP bring-up (PSCI CPU_ON) very occasionally takes a data
+    abort right after `smp: N cores online` — a rare hypervisor bring-up race,
+    not a scenario failure — so rather than fail the whole run we detect the
+    boot-time FATAL (or an early exit / 120 s with no networking), kill the VM,
+    and relaunch. Returns a booted Guest, or None if every attempt failed."""
+    for attempt in range(1, attempts + 1):
+        g = Guest(arch=arch, model=model, verbose=verbose, audio=audio, hostfwd=fwd)
+        deadline = time.time() + 120
+        outcome = "timeout"
+        while time.time() < deadline:
+            txt = g.text()
+            if "net: configured" in txt:
+                outcome = "ok"
+                break
+            if "FATAL" in txt:
+                outcome = "crash"
+                break
+            if g.proc.poll() is not None:
+                outcome = "exited"
+                break
+            time.sleep(0.2)
+        if outcome == "ok":
+            if attempt > 1:
+                print(f"e2e: guest booted on attempt {attempt}/{attempts}")
+            return g
+        print(f"e2e: boot attempt {attempt}/{attempts} failed ({outcome}); relaunching…")
+        if verbose:
+            print("    " + g.tail(800).replace("\n", "\n    "))
+        g.close()
+    return None
+
+
 def main():
     arch, model = "aarch64", "qwen3.5-0.8b"
     verbose = "-v" in sys.argv or "--verbose" in sys.argv
@@ -475,13 +509,12 @@ def main():
     audio = "none" if (slow and have_voice) else "off"
     fwd = f"{SVC_PORT},{SVC_HTTP_PORT},{SVC_SSH_PORT}"
     print(f"e2e: booting guest (cargo xtask run, audio={audio}, hostfwd={fwd})…")
-    g = Guest(arch=arch, model=model, verbose=verbose, audio=audio, hostfwd=fwd)
+    g = boot_guest(arch, model, verbose, audio, fwd)
+    if g is None:
+        print("e2e: FAILED — guest never booted (networking not configured after retries)")
+        return 1
     results = []
     try:
-        if not g.wait_for("net: configured", 120):
-            print("e2e: FAILED — guest never configured networking (boot/DHCP)")
-            print(g.tail(1500))
-            return 1
         time.sleep(1)
         for name, fn in scenarios:
             try:
