@@ -2520,15 +2520,6 @@ fn run_agent_start(arg: &str) {
     };
     let port = port_str.parse::<u16>().ok().filter(|p| *p != 0);
     match name {
-        "network" | "http" | "doc" | "web" => {
-            let port = port.unwrap_or(8080);
-            let home = crate::agent::system::home_for("doc").unwrap_or_else(|| alloc::string::String::from("/agent/9003"));
-            crate::service::pipeline::start(port, &home);
-            serial_println!(
-                "agents> started 'network' service — web pipeline network->http->doc on TCP :{} (GET / for the docs)",
-                port
-            );
-        }
         "ssh" => {
             if let Some(p) = port {
                 crate::service::ssh::set_port(p);
@@ -2536,7 +2527,27 @@ fn run_agent_start(arg: &str) {
             let task = crate::service::start(&crate::service::ssh::SSH_SERVICE);
             serial_println!("agents> started 'ssh' service (task {})", task);
         }
-        other => serial_println!("agents> unknown system agent '{}' (network|http|doc|ssh)", other),
+        _ => {
+            // Serve a content agent over the web pipeline (network + http + the
+            // generic server stage). `web`/`network`/`http` default to the docs
+            // site; any installed content agent (its SOUL + assets) can be served
+            // by name — no per-agent code.
+            let port = port.unwrap_or(8080);
+            let content = if matches!(name, "web" | "network" | "http" | "") { "doc" } else { name };
+            let home = match crate::agent::system::home_for(content) {
+                Some(h) => h,
+                None => {
+                    serial_println!("agents> unknown agent '{}' (try: doc, ssh, or an installed server agent)", name);
+                    return;
+                }
+            };
+            crate::service::pipeline::start(port, &home);
+            serial_println!(
+                "agents> serving '{}' over the web pipeline network->http->server on TCP :{} (GET / to fetch)",
+                content,
+                port
+            );
+        }
     }
 }
 

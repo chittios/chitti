@@ -63,8 +63,8 @@ pub fn format_response(reply: &[u8]) -> Vec<u8> {
 }
 
 extern "C" fn http_serve(_arg: u64) {
-    let (Some(from_net), Some(to_net), Some(to_doc), Some(from_doc)) =
-        (pipeline::net_to_http(), pipeline::http_to_net(), pipeline::http_to_doc(), pipeline::doc_to_http())
+    let (Some(from_net), Some(to_net), Some(to_server), Some(from_server)) =
+        (pipeline::net_to_http(), pipeline::http_to_net(), pipeline::http_to_server(), pipeline::server_to_http())
     else {
         crate::ktrace::log("service.http", "pipeline channels not wired");
         return;
@@ -76,12 +76,12 @@ extern "C" fn http_serve(_arg: u64) {
                 Some(r) => (r.method, r.path),
                 None => (String::from("GET"), String::from("/")),
             };
-            crate::ktrace::log_fmt(format_args!("service.http: {method} {path} -> doc"));
+            crate::ktrace::log_fmt(format_args!("service.http: {method} {path} -> content agent"));
             let req = alloc::format!("{method} {path}");
             let d = crate::arch::now_ms() + pipeline::STAGE_DEADLINE_MS;
-            pipeline::send_frame(to_doc, req.as_bytes(), d);
+            pipeline::send_frame(to_server, req.as_bytes(), d);
             // Await the content agent's body, then format + return the response.
-            if let Some(reply) = pipeline::recv_deadline(from_doc, crate::arch::now_ms() + pipeline::STAGE_DEADLINE_MS) {
+            if let Some(reply) = pipeline::recv_deadline(from_server, crate::arch::now_ms() + pipeline::STAGE_DEADLINE_MS) {
                 let resp = format_response(&reply);
                 pipeline::send_frame(to_net, &resp, crate::arch::now_ms() + pipeline::STAGE_DEADLINE_MS);
             }
