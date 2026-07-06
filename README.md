@@ -44,14 +44,37 @@ model from ever directly touching hardware.
   hand-written SIMD tensor kernels — SSE2/AVX2 on x86, NEON on aarch64 — with a
   zero-copy GGUF loader and an OS-managed KV cache. No GPU, no host runtime.
 - **The capability ABI (Synapse).** The model emits grammar-constrained,
-  MCP-shaped tool calls; every one is capability-checked, taint-gated, executed
-  by deterministic native code, and written to an append-only audit log.
+  MCP-shaped tool calls; every one is capability-checked, **scope-checked**
+  (a granted fs-path glob or host/port range is enforced against the concrete
+  target), taint-gated, executed by deterministic native code, and written to an
+  append-only audit log.
 - **Prompt-injection defense at the OS boundary.** Provenance/taint tags follow
-  every token; a destructive action justified by untrusted, ingested content is
-  refused or requires explicit human confirmation.
+  every token; a destructive action — including **network egress** and moving a
+  channel to another agent — justified by untrusted, ingested content is refused
+  or requires explicit human confirmation.
 - **Skills.** Portable, **signed**, permissioned packages of procedural knowledge
   (+ optional tools and agent roles), loaded with progressive disclosure and
   bounded forever by their install-time capability grant.
+- **Agents as installable apps.** An agent is "programmed" in **markdown** — a
+  SOUL (persona) + skill docs + a manifest that declares its tools (= permissions),
+  UI/network access, and optional ONNX assets. Install from a **public registry**
+  (`/agents search`, `/agents install <name>`) with a per-capability consent
+  prompt that grants only the approved subset. Registry packages are authenticated
+  with **ECDSA P-256** against a baked publisher trust store.
+- **Agents that talk — channels.** Capability-gated **byte-stream and datagram
+  IPC** between agents, the Linux-pipe/socket analog: a producer streams raw bytes,
+  a consumer reads them, and a service agent can hand an accepted TCP connection to
+  another agent as an ordinary channel. Handles are unforgeable capabilities, not
+  ambient global ids.
+- **Service agents.** Long-running native daemons (vs. request/response reasoning
+  agents), supervised with bounded restarts. A **Network** agent listens on a port
+  and forwards connections; an **HTTP/Doc** agent parses HTTP/1.1 natively and
+  serves documentation. Protocol/codec logic is deterministic native code *below*
+  the boundary — the model never implements a protocol, it only plans policy over
+  capabilities.
+- **Agent-owned UI surfaces.** A Chess/Image/Doc-style agent can request a
+  compositor surface and paint it with a bounded, grammar-validated draw-op DSL,
+  fenced to its own surface — never raw pixels.
 - **A real windowed console.** A tmux-style split-pane framebuffer compositor in
   the Geist Mono font: a chat pane, an on-demand action pane (live ktrace or a
   vim-like editor), a status bar with a **live clock**, a **blinking caret**, a
@@ -69,7 +92,8 @@ model from ever directly touching hardware.
   stack, durable agent state, and `/install` to a real disk that boots
   standalone via UEFI.
 - **Microkernel core.** Unforgeable capabilities (seL4-inspired), capability-gated
-  IPC, a cooperative + timer-preemptive scheduler, SMP, and a hand-rolled MMU.
+  IPC and byte-stream channels, a cooperative + timer-preemptive scheduler, SMP,
+  and a hand-rolled MMU.
 
 ## Try it (real hardware or a VM)
 
@@ -115,7 +139,8 @@ Everything goes through `cargo xtask`; a `Makefile` wraps the common commands.
 The target architecture is always explicit. In short:
 
 ```sh
-make test                 # in-kernel test suite under QEMU (x86_64) — no model needed
+make test                 # in-kernel unit suite under QEMU (x86_64) — pure logic, no model
+make e2e                  # end-to-end: boot the real kernel, drive the shell over serial
 make run  ARCH=aarch64    # boot natively on Apple Silicon (QEMU + HVF)
 make image ARCH=x86_64    # assemble a bootable ISO under target/
 make help                 # list all targets
@@ -123,6 +148,11 @@ make help                 # list all targets
 # …or call the underlying tool directly:
 cargo xtask run -arch aarch64
 ```
+
+Two test layers back every change: **unit tests** (`cargo xtask test`) for the
+pure logic, and **end-to-end scenarios** (`make e2e`) that boot the real kernel
+and exercise every shell command plus the networked, agent-install, service, and
+UI flows. New features add to both.
 
 `make vbox` rebuilds the aarch64 image and reloads it into a VirtualBox VM.
 Full prerequisites, the model fetch, per-arch boot, VirtualBox, and headless
