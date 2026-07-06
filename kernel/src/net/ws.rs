@@ -5,11 +5,12 @@
 //! server frames (text / binary / ping / pong / close), answering pings
 //! automatically.
 //!
-//! Scope: plaintext `ws://` only. `wss://` needs the TLS transport to expose a
-//! per-read deadline (embedded-tls owns the socket), which it doesn't yet —
-//! rejected with a clear message rather than silently downgrading. For a
-//! self-hosted / LAN WebSocket endpoint (the same audience as the no-TLS HTTP
-//! client) plaintext is the common case.
+//! Supports `ws://` (plaintext) and `wss://` (over the in-kernel TLS 1.3 from
+//! [`super::tls`]). For `wss://` the TLS session reads with a **rolling**
+//! deadline (a shared atomic bumped before each read) so a long-lived session
+//! never hits a fixed expiry, and idle polls skip the TLS read entirely when
+//! no TCP bytes are pending — keeping an interactive `/ws` responsive to the
+//! keyboard. As with the HTTP client, server certificates are not verified.
 
 use super::NET;
 use alloc::string::{String, ToString};
@@ -194,14 +195,29 @@ fn decode_frame(buf: &[u8]) -> Option<Frame> {
     Some(Frame { opcode, payload, consumed: off + len })
 }
 
-// --- transport (raw smoltcp socket, so recv can poll with a short timeout) --
+// --- transport (plaintext smoltcp socket, or TLS over it for wss://) --------
 
-/// A connected WebSocket. Sends masked frames and decodes server frames,
-/// polling the smoltcp socket directly so [`Self::recv`] can honour a short
-/// per-call timeout (needed for an interactive `/ws` that also watches the
-/// keyboard).
+/// How WebSocket bytes move: plaintext straight over the smoltcp socket, or
+/// through a TLS session (`wss://`). Both cases keep the raw socket `handle`
+/// so an idle poll can cheaply check for pending bytes and stay
+/// keyboard-responsive.
+enum Transport {
+    Plain,
+    /// TLS session + a `more` flag (embedded-tls may have decrypted data
+    /// buffered beyond one `read`, so keep reading it even when the TCP socket
+    /// shows no new bytes).
+    Secure { tls: super::tls::TlsSession, more: bool },
+}
+
+/// A connected WebSocket. Sends masked frames and decodes server frames.
+/// `recv` polls with a short per-call timeout so an interactive `/ws` can also
+/// watch the keyboard; for `wss://` the TLS session's read deadline is a
+/// rolling atomic (`roll`) bumped before each read.
 pub struct WebSocket {
     handle: smoltcp::iface::SocketHandle,
+    transport: Transport,
+    /// Rolling read deadline for the TLS transport (unused for plaintext).
+    roll: Option<&'static core::sync::atomic::AtomicU64>,
     rx: Vec<u8>, // bytes received but not yet forming a complete frame
     closed: bool,
 }
@@ -219,14 +235,15 @@ fn rand4() -> [u8; 4] {
 }
 
 impl WebSocket {
-    /// Connect to `ws://host[:port]/path` and complete the Upgrade handshake.
+    /// Connect to `ws://` (plaintext) or `wss://` (TLS) and complete the
+    /// Upgrade handshake.
     pub fn connect(url: &str) -> Result<WebSocket, String> {
-        let rest = if let Some(r) = url.strip_prefix("ws://") {
-            r
-        } else if url.starts_with("wss://") {
-            return Err("wss:// (WebSocket over TLS) is not supported yet — use ws:// on the LAN".into());
+        let (secure, rest, default_port) = if let Some(r) = url.strip_prefix("wss://") {
+            (true, r, 443u16)
+        } else if let Some(r) = url.strip_prefix("ws://") {
+            (false, r, 80u16)
         } else {
-            return Err("URL must start with ws://".into());
+            return Err("URL must start with ws:// or wss://".into());
         };
         let (hostport, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
@@ -234,12 +251,34 @@ impl WebSocket {
         };
         let (host, port) = match hostport.rsplit_once(':') {
             Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| "bad port")?),
-            None => (hostport.to_string(), 80u16),
+            None => (hostport.to_string(), default_port),
         };
         let ip = super::http::host_ip(&host)?;
-        let deadline = now() + 10_000;
+        let deadline = now() + 15_000;
         let handle = super::http::tcp_connect(ip, port, deadline)?;
-        let mut ws = WebSocket { handle, rx: Vec::new(), closed: false };
+
+        // Build the transport: for wss, do the TLS handshake over a stream with
+        // a *rolling* deadline (a leaked atomic we bump before each read), so a
+        // long-lived session never hits a fixed expiry.
+        let (transport, roll) = if secure {
+            let roll: &'static core::sync::atomic::AtomicU64 =
+                alloc::boxed::Box::leak(alloc::boxed::Box::new(core::sync::atomic::AtomicU64::new(deadline)));
+            let stream = super::tls::TcpStream::with_rolling(handle, roll);
+            match super::tls::handshake(stream, &host) {
+                Ok(tls) => (Transport::Secure { tls, more: false }, Some(roll)),
+                Err(e) => {
+                    NET.with(|n| {
+                        if let Some(s) = n.as_mut() {
+                            s.sockets.remove(handle);
+                        }
+                    });
+                    return Err(e);
+                }
+            }
+        } else {
+            (Transport::Plain, None)
+        };
+        let mut ws = WebSocket { handle, transport, roll, rx: Vec::new(), closed: false };
 
         // Handshake: GET with the Upgrade headers + a random 16-byte key.
         let mut keybytes = [0u8; 16];
@@ -355,54 +394,98 @@ impl WebSocket {
         self.abort();
     }
 
-    // --- raw socket I/O over smoltcp ---
+    // --- transport I/O (plaintext socket, or TLS over it) ---
     fn send_raw(&mut self, data: &[u8], deadline: u64) -> Result<(), String> {
-        let mut sent = 0;
-        while sent < data.len() {
-            if now() >= deadline {
-                return Err("WebSocket send timeout".into());
-            }
-            super::poll();
-            let n = NET.with(|n| {
-                let s = n.as_mut()?;
-                let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
-                if sock.can_send() {
-                    sock.send_slice(&data[sent..]).ok()
-                } else {
-                    Some(0)
+        let roll = self.roll;
+        match &mut self.transport {
+            Transport::Secure { tls, .. } => {
+                if let Some(r) = roll {
+                    r.store(now() + 3_000, core::sync::atomic::Ordering::Relaxed);
                 }
-            });
-            match n {
-                Some(k) => sent += k,
-                None => return Err("network down".into()),
+                tls.write_all(data)
             }
-            super::poll();
-            crate::sched::yield_now();
+            Transport::Plain => {
+                let mut sent = 0;
+                while sent < data.len() {
+                    if now() >= deadline {
+                        return Err("WebSocket send timeout".into());
+                    }
+                    super::poll();
+                    let n = NET.with(|n| {
+                        let s = n.as_mut()?;
+                        let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
+                        if sock.can_send() {
+                            sock.send_slice(&data[sent..]).ok()
+                        } else {
+                            Some(0)
+                        }
+                    });
+                    match n {
+                        Some(k) => sent += k,
+                        None => return Err("network down".into()),
+                    }
+                    super::poll();
+                    crate::sched::yield_now();
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
-    /// Read whatever is available now (non-blocking-ish, bounded by `deadline`
-    /// only for the single poll). Returns an empty vec if nothing is pending.
+    /// Read whatever is available now. Returns an empty vec if nothing is
+    /// pending (so the caller can poll again and check the keyboard). For TLS,
+    /// only touches the (blocking) `tls.read` when TCP bytes are pending or the
+    /// session has more buffered decrypted data.
     fn recv_raw(&mut self, _deadline: u64) -> Result<Vec<u8>, String> {
         super::poll();
-        NET.with(|n| {
-            let s = n.as_mut().ok_or("network down")?;
-            let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
-            let mut out = Vec::new();
-            let mut buf = [0u8; 2048];
-            while sock.can_recv() {
-                match sock.recv_slice(&mut buf) {
-                    Ok(0) => break,
-                    Ok(k) => out.extend_from_slice(&buf[..k]),
-                    Err(_) => break,
+        let roll = self.roll;
+        let handle = self.handle;
+        let mut mark_closed = false;
+        let out = match &mut self.transport {
+            Transport::Secure { tls, more } => {
+                let has_tcp = NET.with(|n| n.as_mut().map(|s| s.sockets.get_mut::<tcp::Socket>(handle).can_recv()).unwrap_or(false));
+                if !has_tcp && !*more {
+                    // Idle: detect a peer close so recv() can report it.
+                    let closed = NET.with(|n| {
+                        n.as_mut().map(|s| matches!(s.sockets.get_mut::<tcp::Socket>(handle).state(), tcp::State::CloseWait | tcp::State::Closed | tcp::State::TimeWait)).unwrap_or(true)
+                    });
+                    mark_closed = closed;
+                    Ok(Vec::new())
+                } else {
+                    if let Some(r) = roll {
+                        r.store(now() + 3_000, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    let mut buf = [0u8; 4096];
+                    let k = tls.read(&mut buf);
+                    if k == 0 {
+                        mark_closed = true;
+                    }
+                    *more = k == buf.len(); // a full buffer may mean more is buffered
+                    Ok(buf[..k].to_vec())
                 }
             }
-            if out.is_empty() && matches!(sock.state(), tcp::State::CloseWait | tcp::State::Closed | tcp::State::TimeWait) {
-                self.closed = true;
-            }
-            Ok(out)
-        })
+            Transport::Plain => NET.with(|n| {
+                let s = n.as_mut().ok_or("network down")?;
+                let sock = s.sockets.get_mut::<tcp::Socket>(handle);
+                let mut out = Vec::new();
+                let mut buf = [0u8; 2048];
+                while sock.can_recv() {
+                    match sock.recv_slice(&mut buf) {
+                        Ok(0) => break,
+                        Ok(k) => out.extend_from_slice(&buf[..k]),
+                        Err(_) => break,
+                    }
+                }
+                if out.is_empty() && matches!(sock.state(), tcp::State::CloseWait | tcp::State::Closed | tcp::State::TimeWait) {
+                    mark_closed = true;
+                }
+                Ok(out)
+            }),
+        };
+        if mark_closed {
+            self.closed = true;
+        }
+        out
     }
 
     fn abort(&mut self) {
