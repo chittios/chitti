@@ -1,0 +1,15 @@
+{
+  "name": "ssh",
+  "version": "0.1.0",
+  "kind": "service",
+  "description": "Handles the SSH transport (version exchange) on an accepted connection; tunnels the shell agent (stub).",
+  "toolset": ["net_accept", "channel_read", "channel_write", "spawn_subagent"],
+  "capabilities": [
+    { "domain": "net", "rights": ["exec"], "scope": "any" },
+    { "domain": "channel", "rights": ["read", "write"], "scope": "any" },
+    { "domain": "spawn", "rights": ["exec"], "scope": "any" }
+  ],
+  "service": "ssh",
+  "autostart": false,
+  "default_port": 2222
+}

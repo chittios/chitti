@@ -2388,6 +2388,10 @@ fn run_agents(arg: &str, chat: &mut Option<ChatSession>) {
                 let marker = if id == active { " *chat" } else { "" };
                 serial_println!("agents> {:<4} {:<17} {:<9}{}", id, name, state, marker);
             }
+            serial_println!("agents> system agents (installed in /agent/, start with /agents start <name>):");
+            for (name, agent_id) in crate::agent::system::list() {
+                serial_println!("agents>   {:<10} /agent/{}/SOUL.md", name, agent_id);
+            }
             serial_println!("agents> /agents switch <id> — chat as that agent; /agents kill <id> — terminate");
         }
         "switch" => match sarg.parse::<u64>() {
@@ -2420,24 +2424,12 @@ fn run_agents(arg: &str, chat: &mut Option<ChatSession>) {
         "search" => run_agent_search(sarg),
         "install" => run_agent_install(sarg, chat),
         "uninstall" => run_agent_uninstall(sarg),
-        "start-net" => match sarg.parse::<u16>() {
-            Ok(port) if port != 0 => {
-                crate::service::network::set_echo_port(port);
-                let t = crate::service::start(&crate::service::network::ECHO_SERVICE);
-                serial_println!("agents> network-echo service listening on TCP :{} (task {})", port, t);
-            }
-            _ => serial_println!("usage: /agents start-net <port>"),
-        },
-        "start-http" => match sarg.parse::<u16>() {
-            Ok(port) if port != 0 => {
-                crate::service::http::set_port(port);
-                let t = crate::service::start(&crate::service::http::HTTP_SERVICE);
-                serial_println!("agents> http-doc service serving docs on TCP :{} (task {})", port, t);
-            }
-            _ => serial_println!("usage: /agents start-http <port>"),
-        },
+        "start" => run_agent_start(sarg),
+        // Back-compat aliases for the two originally-named service starters.
+        "start-net" => run_agent_start(&alloc::format!("network {}", sarg)),
+        "start-http" => run_agent_start(&alloc::format!("http {}", sarg)),
         other => serial_println!(
-            "agents> unknown '{}' — usage: /agents [list|switch <id>|kill <id>|services|start-net <port>|search <url> [q]|install <name> [--yes] [--registry <url>]|uninstall <name>]",
+            "agents> unknown '{}' — usage: /agents [list|switch <id>|kill <id>|services|start <name> [port]|search <url> [q]|install <name> [--yes] [--registry <url>]|uninstall <name>]",
             other
         ),
     }
@@ -2455,6 +2447,26 @@ fn built_in_package(name: &str) -> Option<crate::skills::package::SkillPackage> 
     };
     pkg.sign(); // sign with the registry key so verify() passes
     Some(pkg)
+}
+
+/// `/agents start <name> [port]` — launch a system agent's native service loop
+/// (network / http / ssh). Uses the agent's manifest default port if none given.
+fn run_agent_start(arg: &str) {
+    let (name, port_str) = match arg.split_once(' ') {
+        Some((n, p)) => (n.trim(), p.trim()),
+        None => (arg.trim(), ""),
+    };
+    let Some((spec, set_port)) = crate::agent::system::service_for(name) else {
+        serial_println!("agents> unknown system agent '{}' (network|http|ssh)", name);
+        return;
+    };
+    if let Ok(port) = port_str.parse::<u16>() {
+        if port != 0 {
+            set_port(port);
+        }
+    }
+    let task = crate::service::start(spec);
+    serial_println!("agents> started '{}' service (task {}) — see /agents services", name, task);
 }
 
 /// `/agents search <index-url> [query]` — fetch a public registry index over

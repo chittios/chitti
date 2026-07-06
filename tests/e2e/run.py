@@ -39,6 +39,7 @@ PLAIN_PORT = 8100
 TLS_PORT = 9100
 SVC_PORT = 7099  # guest echo-service listener, reachable via slirp hostfwd
 SVC_HTTP_PORT = 7100  # guest http-doc-service listener
+SVC_SSH_PORT = 7101  # guest ssh-service listener
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 CERT = os.path.join(HERE, "certs", "ec.pem")
@@ -262,8 +263,8 @@ def s_net_service_echo(g):
     # Proves the full inbound path: net_listen -> try_accept -> channel::adopt_tcp
     # -> channel read/write over a live TCP connection.
     m = g.mark()
-    g.send(f"/agents start-net {SVC_PORT}")
-    if not g.wait_for("network-echo service listening", 15, m):
+    g.send(f"/agents start network {SVC_PORT}")
+    if not g.wait_for("started 'network' service", 15, m):
         return False, "service did not start"
     time.sleep(0.5)
     payload = b"svc-echo-ping-4242"
@@ -301,13 +302,44 @@ def s_agents_install_registry(g):
     return ok, "installed from registry via consent flow" if ok else "registry install did not complete"
 
 
+def s_system_agents(g):
+    # The built-in network/http/ssh agents are installed into /agent/ at boot
+    # from their bundled markdown + manifest. The boot log proves install_all ran
+    # (which signs each package and place_agent_home's its SOUL); /agents lists them.
+    booted = g.wait_for("system agents installed", 5, 0)  # printed at boot
+    m = g.mark()
+    g.send("/agents")
+    listed = g.wait_for("system agents", 15, m) and g.wait_for("/agent/9001/SOUL.md", 3, m)
+    ok = booted and listed
+    return ok, "network/http/ssh installed as system agents in /agent/" if ok else "system agents not installed/listed"
+
+
+def s_ssh_agent(g):
+    # Start the SSH system agent and confirm it does the RFC 4253 version
+    # exchange (sends its identification banner) on an inbound connection.
+    m = g.mark()
+    g.send(f"/agents start ssh {SVC_SSH_PORT}")
+    if not g.wait_for("started 'ssh' service", 15, m):
+        return False, "ssh agent did not start"
+    time.sleep(0.5)
+    try:
+        with socket.create_connection(("127.0.0.1", SVC_SSH_PORT), timeout=15) as s:
+            s.sendall(b"SSH-2.0-e2eClient\r\n")
+            s.settimeout(15)
+            banner = s.recv(64)
+    except OSError as e:
+        return False, f"ssh connect failed: {e}"
+    ok = banner.startswith(b"SSH-2.0-Chitti")
+    return ok, "SSH agent completed the version exchange" if ok else f"bad banner: {banner!r}"
+
+
 def s_http_service_agent(g):
     # Start the HTTP/Doc service agent, then GET the docs page from the host over
     # the slirp hostfwd. Proves a NATIVE protocol service agent (HTTP RFC handling)
     # fed by the same accept -> adopt_tcp -> channel path as the echo service.
     m = g.mark()
-    g.send(f"/agents start-http {SVC_HTTP_PORT}")
-    if not g.wait_for("http-doc service serving docs", 15, m):
+    g.send(f"/agents start http {SVC_HTTP_PORT}")
+    if not g.wait_for("started 'http' service", 15, m):
         return False, "http service did not start"
     time.sleep(0.5)
     try:
@@ -336,7 +368,7 @@ def s_surface(g):
 
 
 OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS]
-AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("net_service_echo", s_net_service_echo), ("http_service_agent", s_http_service_agent), ("surface", s_surface)]
+AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("net_service_echo", s_net_service_echo), ("http_service_agent", s_http_service_agent), ("ssh_agent", s_ssh_agent), ("surface", s_surface)]
 NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_stream", s_http_stream), ("ws", s_ws)]
 NET_TLS = [("wss", s_wss), ("model_remote_https", s_model_remote_https)]
 MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("compact", s_compact)]
@@ -380,7 +412,7 @@ def main():
 
     # Voice needs a sound device; give the guest a silent audio backend then.
     audio = "none" if (slow and have_voice) else "off"
-    fwd = f"{SVC_PORT},{SVC_HTTP_PORT}"
+    fwd = f"{SVC_PORT},{SVC_HTTP_PORT},{SVC_SSH_PORT}"
     print(f"e2e: booting guest (cargo xtask run, audio={audio}, hostfwd={fwd})…")
     g = Guest(arch=arch, model=model, verbose=verbose, audio=audio, hostfwd=fwd)
     results = []

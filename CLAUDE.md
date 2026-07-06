@@ -189,11 +189,17 @@ real UEFI hardware.
   caps}`, `start`/`stop`/`task_for`/`supervise_tick` (pumped from
   `shell::upkeep`, bounded restarts). Their protocol/codec logic is native,
   deterministic code **below** the determinism boundary — the LLM never
-  implements a protocol. Shipped: `network` (echo, proves listen→accept→channel
-  handoff) and `http` (a Doc agent parsing HTTP/1.1 natively and serving docs).
-  `/agents start-net <port>` / `start-http <port>`, `/agents services`.
-  SSH/Git follow the identical shape (a native protocol module over an accepted
-  channel).
+  implements a protocol. The built-in **system agents** live as markdown +
+  a JSON manifest under the repo's [`agents/`](agents/) folder (`network`,
+  `http`, `ssh`), are compiled into the image via `include_str!`, and are signed
+  then installed into `/agent/<id>/` at boot by `agent::system::install_all` (same
+  permissioned flow as any package, pre-trusted). Each fronts a native serve
+  loop: `network` (accept→channel handoff, echo), `http` (a Doc agent parsing
+  HTTP/1.1 and serving docs), `ssh` (RFC 4253 version exchange; transport is a
+  stub). `/agents start <name> [port]` brings one up; `/agents services` lists
+  the running ones. Git and full SSH transport follow the identical shape (a
+  native protocol module over an accepted channel). To add a system agent: drop
+  `agents/<name>/{SOUL.md,manifest.json}` and register it in `agent/system.rs`.
 - **Cortex** (`cortex/`) — CPU transformer inference (Qwen3.5, `-model
   qwen3.5-0.8b|qwen3.5-4b|qwen3.5-9b`); SIMD tensor kernels (SSE2/AVX2 ∣ NEON ∣ scalar behind
   one API); zero-copy GGUF; grammar-constrained sampler; KV/recurrent cache.
