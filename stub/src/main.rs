@@ -78,6 +78,39 @@ fn efi_unix() -> u64 {
     if secs > 0 { secs as u64 } else { 0 }
 }
 
+/// Total installed physical RAM, from the UEFI memory map: the span from the
+/// lowest to the highest RAM-backed descriptor (everything except the two MMIO
+/// types). Approximates the machine's DRAM (e.g. 6 GiB) closely enough for a
+/// status display; 0 if the map can't be read. Must be called before
+/// `exit_boot_services`.
+fn total_ram_bytes() -> u64 {
+    use uefi::boot::MemoryType;
+    use uefi::mem::memory_map::MemoryMap; // brings `entries()` into scope
+    let Ok(map) = boot::memory_map(MemoryType::LOADER_DATA) else {
+        return 0;
+    };
+    let (mut lo, mut hi) = (u64::MAX, 0u64);
+    for d in map.entries() {
+        // Skip memory-mapped I/O (11) and I/O port space (12): not DRAM.
+        if matches!(d.ty, MemoryType::MMIO | MemoryType::MMIO_PORT_SPACE) {
+            continue;
+        }
+        let start = d.phys_start;
+        let end = start + d.page_count * 4096;
+        if start < lo {
+            lo = start;
+        }
+        if end > hi {
+            hi = end;
+        }
+    }
+    if hi > lo {
+        hi - lo
+    } else {
+        0
+    }
+}
+
 fn acpi_rsdp() -> u64 {
     use uefi::table::cfg::{ACPI2_GUID, ACPI_GUID};
     uefi::system::with_config_table(|entries| {
@@ -280,7 +313,13 @@ fn main() -> Status {
         let (mb, ms) = model_region.unwrap_or((0, 0));
         page[76..84].copy_from_slice(&mb.to_le_bytes());
         page[84..92].copy_from_slice(&ms.to_le_bytes());
-        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x}, heap {hb:#x}, model {mb:#x} -> boot-info {addr:#x}");
+        // Total physical RAM at 92..100: the span of RAM-backed descriptors in
+        // the UEFI memory map. This is the machine's installed RAM (e.g. 6 GiB)
+        // the kernel shows in the status bar / `/top`, distinct from its fixed
+        // heap. 0 if the map can't be read.
+        let ram = total_ram_bytes();
+        page[92..100].copy_from_slice(&ram.to_le_bytes());
+        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x}, heap {hb:#x}, model {mb:#x}, RAM {} MiB -> boot-info {addr:#x}", ram >> 20);
         Some(addr)
     })();
 

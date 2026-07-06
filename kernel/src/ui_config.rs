@@ -76,7 +76,7 @@ impl Default for UiConfig {
             chat_title: "Shell Agent".to_string(),
             logs_title: "ktrace".to_string(),
             status_left: "Chitti OS v${version}".to_string(),
-            status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu}  ${datetime} ${tz}".to_string(),
+            status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${datetime} ${tz}".to_string(),
             tz_offset: 0,
             splash: true,
             theme: THEME_DEFAULTS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
@@ -122,7 +122,9 @@ impl UiConfig {
             t => t,
         };
         let status_right = match s("status_right", &d.status_right) {
+            // Forward-migrate the earlier built-in defaults to the current one.
             t if t == "${datetime}  ${tz}" => d.status_right.clone(),
+            t if t == "${kbd} ${mouse}  ${net}  ${mem}  ${cpu}  ${datetime} ${tz}" => d.status_right.clone(),
             t => t,
         };
         UiConfig {
@@ -285,13 +287,22 @@ fn resolve_var(var: &str) -> String {
             let s = crate::arch::now_ms() / 1000;
             alloc::format!("up {}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
         }
-        // System info: heap usage, CPU busy %, net link, input-device activity
-        // (`*` = active within the last 1.5 s).
+        // System info: memory (kernel heap used out of total physical RAM),
+        // CPU busy %, net link, input-device activity (`*` = active <1.5 s).
         "mem" => {
-            let (total, _free, used) = crate::mm::heap::stats();
-            alloc::format!("mem {}/{}M", used / (1024 * 1024), total / (1024 * 1024))
+            let m = crate::mm::mem_stats();
+            let mib = 1024 * 1024;
+            let gib = 1024 * mib;
+            // Denominator is the machine's RAM (e.g. 6.0G); numerator is what
+            // the kernel actually uses (heap allocated + loaded model).
+            if m.ram_total >= gib {
+                alloc::format!("mem {}M/{}.{}G", (m.heap_used + (m.ram_reserved - m.heap_total)) / mib, m.ram_total / gib, (m.ram_total % gib) * 10 / gib)
+            } else {
+                alloc::format!("mem {}/{}M", m.heap_used / mib, m.ram_total / mib)
+            }
         }
         "cpu" => alloc::format!("cpu {:>3}%", crate::shell::cpu_percent()),
+        "cores" => alloc::format!("{}c", crate::arch::cpu_count()),
         "net" => (if crate::net::is_up() { "net up" } else { "net --" }).to_string(),
         "kbd" => {
             let last = crate::console::input_activity_ms();

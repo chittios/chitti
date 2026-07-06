@@ -59,6 +59,7 @@ const EV_REL: u16 = 0x02;
 const EV_ABS: u16 = 0x03;
 const REL_X: u16 = 0x00;
 const REL_Y: u16 = 0x01;
+const REL_WHEEL: u16 = 0x08;
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
 const BTN_LEFT: u16 = 0x110;
@@ -284,6 +285,9 @@ pub fn poll() {
                     EV_ABS if ev.code == ABS_Y => pend_y = Some(ev.value as i32),
                     EV_REL if ev.code == REL_X => crate::mouse::move_rel(ev.value as i32, 0),
                     EV_REL if ev.code == REL_Y => crate::mouse::move_rel(0, ev.value as i32),
+                    // Scroll wheel: the value is signed (+ = up/away). Both the
+                    // virtio tablet and mouse report it as EV_REL/REL_WHEEL.
+                    EV_REL if ev.code == REL_WHEEL => crate::mouse::add_wheel(ev.value as i32),
                     EV_KEY if ev.code == BTN_LEFT => crate::mouse::set_left(ev.value != 0),
                     EV_SYN => {
                         if let (Some(x), Some(y)) = (pend_x.take(), pend_y.take()) {

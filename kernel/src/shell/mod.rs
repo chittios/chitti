@@ -171,6 +171,15 @@ pub fn run() -> ! {
                 "open" | "edit" => run_open(arg),
                 // --- agents-as-processes ------------------------------------
                 "agents" => run_agents(arg, &mut chat),
+                "top" =>
+                {
+                    #[cfg(not(test))]
+                    {
+                        crate::framebuffer::open_top();
+                        refresh_top();
+                        serial_println!("top> live system monitor in the action pane (/close or Ctrl+W to hide)");
+                    }
+                }
                 "compact" => {
                     if remote_on {
                         match remote_chat.as_mut() {
@@ -535,6 +544,7 @@ fn print_help() {
     serial_println!("  /bench           matvec kernel throughput");
     serial_println!("  /perf            end-to-end prefill/decode tok/s");
     serial_println!("  /info            CPU / memory / model / context / OS info");
+    serial_println!("  /top             live CPU + memory monitor in the action pane (htop-style)");
     serial_println!("  /network [..]    net status; /network dhcp | static <ip/prefix> [gw] | dns <ip>");
     serial_println!("  /ping <host>     ICMP echo a host or IP (resolves names via DNS)");
     serial_println!("  /wifi [..]       /wifi scan | connect <ssid> (password modal) | info");
@@ -570,7 +580,7 @@ fn print_info(orch: &crate::agent::orchestrator::Orchestrator, chat: Option<&Cha
 
     // Arch + cores + SIMD.
     #[cfg(target_arch = "x86_64")]
-    serial_println!("  cpu:     x86_64 (SSE2/AVX2)   cores: {}", crate::smp::cpu_count());
+    serial_println!("  cpu:     x86_64 (SSE2/AVX2)   cores: {}", crate::arch::cpu_count());
     #[cfg(target_arch = "aarch64")]
     serial_println!(
         "  cpu:     aarch64 (NEON + dotprod)   cores online: {}",
@@ -578,9 +588,16 @@ fn print_info(orch: &crate::agent::orchestrator::Orchestrator, chat: Option<&Cha
     );
     serial_println!("  uptime:  {} ms", crate::arch::now_ms());
 
-    // Heap.
-    let (total, free, used) = crate::mm::heap::stats();
-    serial_println!("  memory:  heap {} MiB used / {} MiB total ({} MiB free)", mib(used), mib(total), mib(free));
+    // Memory: physical RAM the machine has, and the kernel heap within it.
+    let m = crate::mm::mem_stats();
+    serial_println!(
+        "  memory:  {} MiB RAM installed; kernel uses {} MiB (heap {}/{} MiB + model {} MiB)",
+        mib(m.ram_total as usize),
+        mib(m.ram_reserved as usize),
+        mib(m.heap_used as usize),
+        mib(m.heap_total as usize),
+        mib((m.ram_reserved - m.heap_total) as usize)
+    );
 
     // Model (parse the GGUF container header — cheap, zero-copy).
     let model_name = if cfg!(feature = "model-9b") {
@@ -2248,7 +2265,7 @@ static HISTORY: Locked<alloc::vec::Vec<String>> = Locked::new(alloc::vec::Vec::n
 /// Top-level `/command` names, for Tab completion (canonical names only, not
 /// aliases). Keep in sync with `dispatch_system` + the interactive arms.
 const COMMANDS: &[&str] = &[
-    "agents", "bench", "cat", "clear", "close", "compact", "datetime", "disks", "exit", "help", "http", "infer", "info", "model",
+    "agents", "bench", "cat", "clear", "close", "compact", "datetime", "disks", "exit", "help", "http", "infer", "info", "model", "top",
     "install", "ktrace", "ls", "mkext4", "mode", "mount", "mounts", "network", "open", "perf",
     "lspci", "onnx", "ping", "session", "shortcuts", "skills", "think", "ui", "umount", "voice", "wifi",
 ];
@@ -2647,7 +2664,8 @@ fn ui_tick() {
             update_status();
         }
         // Mouse: move the cursor; a click on the action-pane [x] closes it,
-        // a click elsewhere focuses the pane under the pointer.
+        // a click elsewhere focuses the pane under the pointer; the wheel
+        // scrolls the pane under the pointer (3 lines per notch).
         let t = crate::mouse::tick();
         if t.moved {
             crate::framebuffer::cursor_move(t.x, t.y);
@@ -2659,7 +2677,55 @@ fn ui_tick() {
                 crate::framebuffer::focus_set(action);
             }
         }
+        if t.wheel != 0 {
+            // + wheel = up = back in history; scroll the pane under the pointer.
+            let action = crate::framebuffer::pane_hit(t.x, t.y).unwrap_or(false);
+            crate::framebuffer::scroll_view(action, t.wheel as i64 * 3);
+        }
+        // Live `/top` dashboard: refresh ~1 Hz while its pane is open.
+        if crate::framebuffer::is_top() && now.saturating_sub(LAST_TOP_MS.load(Ordering::Relaxed)) >= 1000 {
+            LAST_TOP_MS.store(now, Ordering::Relaxed);
+            refresh_top();
+        }
     }
+}
+
+static LAST_TOP_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Gather a system snapshot and paint the `/top` action-pane dashboard. No-op
+/// unless the pane is in `/top` mode. Called ~1 Hz from `ui_tick`.
+#[cfg(not(test))]
+fn refresh_top() {
+    let m = crate::mm::mem_stats();
+    let ncores = crate::arch::cpu_count().max(1) as usize;
+    // Only core 0 runs work (cooperative scheduler; APs park), so it carries
+    // the measured CPU%; the rest are online-but-idle.
+    let mut cores = alloc::vec::Vec::with_capacity(ncores);
+    cores.push(cpu_percent());
+    for _ in 1..ncores {
+        cores.push(0);
+    }
+    let secs = crate::arch::now_ms() / 1000;
+    let uptime = alloc::format!("{}:{:02}:{:02}", secs / 3600, secs % 3600 / 60, secs % 60);
+    let dt = crate::clock::format_datetime();
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+    let view = crate::framebuffer::TopView {
+        cores: &cores,
+        cores_online: crate::arch::cpu_count(),
+        ram_used: m.ram_reserved,
+        ram_total: m.ram_total,
+        heap_used: m.heap_used,
+        heap_total: m.heap_total,
+        model_bytes: crate::cortex::model_module().map(|x| x.len() as u64).unwrap_or(0),
+        uptime: &uptime,
+        arch,
+        allocs: crate::mm::heap::alloc_stats().0,
+        datetime: &dt,
+    };
+    crate::framebuffer::draw_top(&view);
 }
 
 /// Cooperative upkeep for long-running work (model loading, ONNX inference,

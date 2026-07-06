@@ -511,6 +511,8 @@ pub enum RightMode {
     Ktrace,
     /// The `/open` editor.
     Editor,
+    /// The live `/top` system dashboard (CPU + memory).
+    Top,
 }
 
 /// Config knobs the UI config (`/configs/core/ui.json`) can set for the layout.
@@ -1125,7 +1127,9 @@ impl Screen {
         match self.right {
             RightMode::Editor => true,
             RightMode::Closed => false,
-            RightMode::Ktrace => self.focus_action,
+            // ktrace / top: chat keeps focus by default so you can keep typing;
+            // Ctrl+Tab / a click can move focus to the pane (for scrollback).
+            RightMode::Ktrace | RightMode::Top => self.focus_action,
         }
     }
 
@@ -1138,10 +1142,15 @@ impl Screen {
         self.render_view(&self.chat);
         if self.right != RightMode::Closed {
             self.fill_rect(self.logs.x, self.logs.y, self.logs.w, self.logs.h, self.logs.bg);
-            let title = if self.right == RightMode::Editor { "editor" } else { &self.logs.title };
+            let title = match self.right {
+                RightMode::Editor => "editor",
+                RightMode::Top => "top",
+                _ => &self.logs.title,
+            };
             self.draw_frame_titled(&self.logs, self.action_focused(), title);
             self.draw_close_btn();
-            // The editor repaints its own interior; ktrace re-renders from grid.
+            // The editor + /top repaint their own interiors; ktrace re-renders
+            // from the grid. (/top fills in on the next idle tick.)
             if self.right == RightMode::Ktrace {
                 self.render_view(&self.logs);
             }
@@ -1157,6 +1166,125 @@ impl Screen {
         let (x, y, _, _) = self.close_btn();
         self.draw_str(x, y, "[x]", (230, 120, 120), self.logs.bg);
     }
+
+    /// A labelled horizontal usage bar filled proportional to `pct` (0..=100)
+    /// and coloured green/amber/red by load, over background `bg`. Returns the
+    /// y below the bar.
+    fn usage_bar_bg(&self, x: u64, y: u64, w: u64, label: &str, pct: u64, detail: &str, bg: Rgb) -> u64 {
+        let cw = self.cw();
+        let ch = self.ch();
+        let lab_w = 7 * cw; // fixed label column
+        self.draw_str(x, y, label, self.theme.chat_fg, bg);
+        let bx = x + lab_w;
+        let bw = w.saturating_sub(lab_w + 10 * cw); // leave room for the detail text
+        let bh = ch;
+        // Track + border.
+        self.fill_rect(bx, y, bw, bh, self.theme.chat_bg);
+        self.rect_outline(bx, y, bw, bh, 1, self.theme.border_dim);
+        let p = pct.min(100);
+        let fill = bw.saturating_sub(2) * p / 100;
+        let color = if p < 60 {
+            (126, 214, 150) // green
+        } else if p < 85 {
+            (240, 200, 120) // amber
+        } else {
+            (255, 106, 110) // red
+        };
+        if fill > 0 {
+            self.fill_rect(bx + 1, y + 1, fill, bh.saturating_sub(2), color);
+        }
+        // Detail (e.g. "512M/6.0G") after the bar.
+        self.draw_str(bx + bw + cw, y, detail, self.theme.title_dim, bg);
+        y + ch + ch / 3
+    }
+
+    /// Shorthand: [`draw_str`] with an explicit background (the `/top` panel
+    /// draws over the logs-pane background, not the screen background).
+    fn draw_str_bg(&self, x: u64, y: u64, s: &str, fg: Rgb, bg: Rgb) -> u64 {
+        self.draw_str(x, y, s, fg, bg)
+    }
+}
+
+/// A snapshot for [`draw_top`] — the `/top` dashboard's inputs, gathered by the
+/// shell so the framebuffer layer stays free of `mm`/`smp` coupling.
+pub struct TopView<'a> {
+    /// Per-core busy percentage (index = core id).
+    pub cores: &'a [u64],
+    pub cores_online: u64,
+    pub ram_used: u64,
+    pub ram_total: u64,
+    pub heap_used: u64,
+    pub heap_total: u64,
+    pub model_bytes: u64,
+    pub uptime: &'a str,
+    pub arch: &'a str,
+    pub allocs: u64,
+    pub datetime: &'a str,
+}
+
+/// Render the `/top` dashboard (htop-style: per-core CPU bars, memory bars, a
+/// stats footer) into the **action pane**. No-op unless the action pane is in
+/// [`RightMode::Top`]. The shell's idle tick calls this ~1 Hz with a fresh
+/// snapshot, so it updates live while the chat pane stays interactive.
+pub fn draw_top(v: &TopView) {
+    SCREEN.with(|slot| {
+        let Some(sc) = slot else { return };
+        if sc.right != RightMode::Top {
+            return;
+        }
+        sc.cursor_restore();
+        sc.cur_vis = false;
+        let ch = sc.ch();
+        let (px, iy, iw) = (sc.logs.ix, sc.logs.iy, sc.logs.cols * sc.logs.cw);
+        // Clear the pane interior.
+        sc.fill_rect(px, iy, iw, sc.logs.rows * sc.logs.ch, sc.logs.bg);
+        let x = px;
+        let mut y = iy;
+        let bg = sc.logs.bg;
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        let fmt = |b: u64| -> String {
+            if b >= gib {
+                alloc::format!("{}.{}G", b / gib, (b % gib) * 10 / gib)
+            } else {
+                alloc::format!("{}M", b / mib)
+            }
+        };
+        // CPU section — one bar per core (only core 0 runs; the scheduler is
+        // cooperative and the APs park, so the rest read 0%).
+        sc.draw_str_bg(x, y, "CPU", sc.theme.accent, bg);
+        y += ch + ch / 4;
+        for (i, &pct) in v.cores.iter().enumerate() {
+            let online = (i as u64) < v.cores_online;
+            let lab = alloc::format!("core {:<2}", i);
+            let detail = if online { alloc::format!("{}%", pct) } else { String::from("--") };
+            y = sc.usage_bar_bg(x, y, iw, &lab, if online { pct } else { 0 }, &detail, bg);
+        }
+        y += ch / 3;
+        // Memory: kernel footprint out of physical RAM, then heap used/total.
+        sc.draw_str_bg(x, y, "Memory", sc.theme.accent, bg);
+        y += ch + ch / 4;
+        let ram_pct = if v.ram_total > 0 { v.ram_used * 100 / v.ram_total } else { 0 };
+        y = sc.usage_bar_bg(x, y, iw, "RAM    ", ram_pct, &alloc::format!("{}/{}", fmt(v.ram_used), fmt(v.ram_total)), bg);
+        let heap_pct = if v.heap_total > 0 { v.heap_used * 100 / v.heap_total } else { 0 };
+        y = sc.usage_bar_bg(x, y, iw, "heap   ", heap_pct, &alloc::format!("{}/{}", fmt(v.heap_used), fmt(v.heap_total)), bg);
+        y += ch / 2;
+        // Footer stats.
+        for s in [
+            alloc::format!("cores online : {}  ({})", v.cores_online, v.arch),
+            alloc::format!("model loaded : {}", fmt(v.model_bytes)),
+            alloc::format!("heap allocs  : {}", v.allocs),
+            alloc::format!("uptime {}", v.uptime),
+            v.datetime.to_string(),
+        ] {
+            if y + ch > iy + sc.logs.rows * sc.logs.ch {
+                break;
+            }
+            sc.draw_str_bg(x, y, &s, sc.theme.logs_fg, bg);
+            y += ch;
+        }
+        sc.cursor_overlay();
+    });
 }
 
 static SCREEN: Locked<Option<Screen>> = Locked::new(None);
@@ -1324,6 +1452,17 @@ pub fn draw_voice(levels: &[f32], status: &str) {
             sc.draw_str(ix, sy, status, sc.theme.title_dim, sc.theme.status_bg);
             sc.modal_button(ix, sy + ch + ch / 2, "Stop", true, 2);
             sc.cursor_overlay();
+        }
+    });
+}
+
+/// Repaint the normal split-pane UI — used to restore the screen after the
+/// full-screen `/top` dashboard exits.
+pub fn redraw_all() {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.redraw();
+            sc.cur_vis = false;
         }
     });
 }
@@ -1667,6 +1806,17 @@ pub fn set_right(mode: RightMode) {
 /// Open the ktrace log stream in the action pane.
 pub fn open_ktrace() {
     set_right(RightMode::Ktrace);
+}
+
+/// Open the `/top` dashboard in the action pane (filled by the shell's idle
+/// tick). Returns true if it is now open (false if it was already).
+pub fn open_top() {
+    set_right(RightMode::Top);
+}
+
+/// Whether the action pane currently shows `/top`.
+pub fn is_top() -> bool {
+    right_mode() == RightMode::Top
 }
 
 /// Close the action pane (chat becomes full-width).

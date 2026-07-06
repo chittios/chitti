@@ -12,9 +12,12 @@ struct Mouse {
     left: bool,
     prev_left: bool,
     moved: bool,
+    /// Accumulated scroll-wheel delta since the last [`tick`] (+ = wheel up /
+    /// away from the user). Drained per tick.
+    wheel: i32,
 }
 
-static M: Locked<Mouse> = Locked::new(Mouse { x: 400, y: 300, left: false, prev_left: false, moved: false });
+static M: Locked<Mouse> = Locked::new(Mouse { x: 400, y: 300, left: false, prev_left: false, moved: false, wheel: 0 });
 
 /// Framebuffer size, or `None` in the test build (no framebuffer compiled).
 #[cfg(not(test))]
@@ -63,6 +66,11 @@ pub fn set_left(down: bool) {
     M.with(|s| s.left = down);
 }
 
+/// Feed a scroll-wheel delta (+ = wheel up / away). Accumulated until [`tick`].
+pub fn add_wheel(dz: i32) {
+    M.with(|s| s.wheel += dz);
+}
+
 /// One idle tick's worth of mouse activity.
 pub struct Tick {
     pub moved: bool,
@@ -71,6 +79,7 @@ pub struct Tick {
     pub pressed: bool,  // left button just went down
     pub released: bool, // left button just came up
     pub left: bool,     // current left-button state
+    pub wheel: i32,     // scroll delta this tick (+ = up / away from the user)
 }
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -96,10 +105,12 @@ pub fn tick() -> Tick {
             pressed,
             released,
             left: s.left,
+            wheel: s.wheel,
         };
         s.prev_left = s.left;
         s.moved = false;
-        if t.moved || pressed || released {
+        s.wheel = 0;
+        if t.moved || pressed || released || t.wheel != 0 {
             ACTIVITY_MS.store(crate::arch::now_ms(), Ordering::Relaxed);
         }
         t
