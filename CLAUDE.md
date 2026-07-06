@@ -190,15 +190,19 @@ real UEFI hardware.
   `shell::upkeep`, bounded restarts). Their protocol/codec logic is native,
   deterministic code **below** the determinism boundary — the LLM never
   implements a protocol. The built-in **system agents** live as markdown +
-  a JSON manifest under the repo's [`agents/`](agents/) folder (`network`,
-  `http`, `ssh`), are compiled into the image via `include_str!`, and are signed
+  a JSON manifest under the repo's [`agents/`](agents/) folder (`network`, `http`,
+  `doc`, `ssh`), are compiled into the image via `include_str!`, and are signed
   then installed into `/agent/<id>/` at boot by `agent::system::install_all` (same
-  permissioned flow as any package, pre-trusted). Each fronts a native serve
-  loop: `network` (accept→channel handoff, echo), `http` (a Doc agent parsing
-  HTTP/1.1 and serving docs), `ssh` (RFC 4253 version exchange; transport is a
-  stub). `/agents start <name> [port]` brings one up; `/agents services` lists
-  the running ones. Git and full SSH transport follow the identical shape (a
-  native protocol module over an accepted channel). To add a system agent: drop
+  permissioned flow as any package, pre-trusted; the Doc agent's HTML+logo assets
+  land in `/agent/<id>/assets/`). The web agents form a **pipeline**
+  (`service/pipeline.rs`), each single-responsibility, connected by datagram
+  channels: `network` owns the socket and relays raw bytes; `http` parses the
+  request + formats the response (no FS, no socket); `doc` maps a path to a file
+  and **reads it with a capability- and scope-gated `mem_fs_read` tool call**,
+  bounded to read-only access to its own install folder. `ssh` runs standalone
+  (RFC 4253 version exchange; transport is a stub). `/agents start doc [port]`
+  brings up the web pipeline; `/agents services` lists running stages. Git and
+  full SSH transport follow the same shape. To add a system agent: drop
   `agents/<name>/{SOUL.md,manifest.json}` and register it in `agent/system.rs`.
 - **Cortex** (`cortex/`) — CPU transformer inference (Qwen3.5, `-model
   qwen3.5-0.8b|qwen3.5-4b|qwen3.5-9b`); SIMD tensor kernels (SSE2/AVX2 ∣ NEON ∣ scalar behind

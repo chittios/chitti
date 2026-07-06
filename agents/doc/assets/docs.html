@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chitti OS — Documentation</title>
+<style>
+  :root { --ink:#2b2622; --cream:#f5efe6; --paper:#fbf8f3; --accent:#cc785c; --muted:#8a7f74; --line:#e6ddcf; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; color:var(--ink); background:var(--paper); }
+  a { color:var(--accent); }
+  .wrap { max-width:760px; margin:0 auto; padding:0 24px; }
+  header { display:flex; align-items:center; gap:12px; padding:28px 0; border-bottom:1px solid var(--line); }
+  header img { width:36px; height:36px; }
+  header b { font-size:1.15rem; }
+  header .sp { flex:1; }
+  h1 { font-size:2rem; margin:34px 0 8px; letter-spacing:-0.02em; }
+  h2 { font-size:1.3rem; margin:32px 0 10px; padding-top:8px; border-top:1px solid var(--line); }
+  p, li { color:#3a342e; }
+  code { background:var(--cream); border:1px solid var(--line); border-radius:6px; padding:1px 6px; font-size:0.9em; }
+  pre { background:var(--cream); border:1px solid var(--line); border-radius:10px; padding:14px; overflow-x:auto; }
+  pre code { border:0; padding:0; background:none; }
+  .lead { color:var(--muted); font-size:1.1rem; }
+  footer { border-top:1px solid var(--line); padding:26px 0 60px; color:var(--muted); font-size:0.9rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <img src="/logo.svg" alt=""><b>Chitti OS</b><span class="sp"></span><a href="/">Home</a>
+  </header>
+
+  <h1>Documentation</h1>
+  <p class="lead">How an OS is arranged when an agent — not a binary — is the thing you run.</p>
+
+  <h2>The determinism boundary</h2>
+  <p>The load-bearing invariant. Model output is an <strong>untrusted plan</strong>; it is
+  parsed, grammar-validated, capability-checked, scope-checked, taint-gated, and only
+  then executed by deterministic native code (<em>Synapse</em>). Above the boundary:
+  stochastic. Below: deterministic and audited.</p>
+
+  <h2>Agents as installable apps</h2>
+  <p>An agent is "programmed" in markdown — a <code>SOUL.md</code> persona, skill docs, and a
+  manifest declaring its toolset (= permissions), UI/network access, and optional
+  models. Install from a public registry with a per-capability consent prompt that can
+  only ever <em>narrow</em> what the package requested:</p>
+  <pre><code>/agents search  https://registry/index
+/agents install doc --registry https://registry/index
+/agents list</code></pre>
+
+  <h2>Channels</h2>
+  <p>Capability-gated byte-stream and datagram IPC between agents — the Linux
+  pipe/socket analog. A handle is an unforgeable capability resolved in the caller's
+  own table, never an ambient global id. A service agent can hand an accepted TCP
+  connection to another agent as an ordinary channel.</p>
+
+  <h2>Service agents</h2>
+  <p>Long-running native daemons. The <strong>Network</strong> agent listens and forwards
+  connections; the <strong>Doc</strong> agent (serving this page) parses HTTP/1.1 natively and
+  reads its documents from its own install folder; the <strong>SSH</strong> agent handles the
+  transport. Protocol logic is deterministic native code — the model plans policy over
+  capabilities, it never implements a protocol.</p>
+  <pre><code>/agents start doc 8080
+/agents services</code></pre>
+
+  <h2>Least privilege</h2>
+  <p>Delegation only ever narrows authority, and a skill or agent is bounded by its
+  install-time grant forever. This Doc agent, for instance, holds only <em>read</em> access
+  to its own install folder and memory — enough to serve its pages, nothing more.</p>
+
+  <footer>Served by the Doc agent · <a href="/">Home</a></footer>
+</div>
+</body>
+</html>

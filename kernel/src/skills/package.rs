@@ -86,6 +86,12 @@ impl SkillPackage {
         for (name, md) in &self.skill_docs {
             crate::synapse::fs::write(&alloc::format!("{home}/skills/{name}"), md.as_bytes());
         }
+        // Bundled assets (e.g. the Doc agent's HTML + logo) land in the agent's
+        // own install folder, which it then reads at runtime with read-only
+        // authority scoped to its home.
+        for (name, bytes) in &self.assets {
+            crate::synapse::fs::write(&alloc::format!("{home}/assets/{name}"), bytes);
+        }
         // Seed the memory area so the agent's fs tools have a place to write.
         let keep = alloc::format!("{home}/memory/.keep");
         if !crate::synapse::fs::exists(&keep) {

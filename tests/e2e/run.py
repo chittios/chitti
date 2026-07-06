@@ -257,31 +257,42 @@ def s_agents_uninstall(g):
     return ok, "skill-agent uninstalled" if ok else "uninstall did not complete"
 
 
-def s_net_service_echo(g):
-    # Start the Network service agent listening on SVC_PORT, then connect to it
-    # from the host (via the slirp hostfwd) and confirm it echoes bytes back.
-    # Proves the full inbound path: net_listen -> try_accept -> channel::adopt_tcp
-    # -> channel read/write over a live TCP connection.
+def _http_get(port, path):
+    with socket.create_connection(("127.0.0.1", port), timeout=15) as s:
+        s.sendall(f"GET {path} HTTP/1.1\r\nHost: chitti\r\nConnection: close\r\n\r\n".encode())
+        s.settimeout(15)
+        resp = b""
+        while b"</html>" not in resp and len(resp) < 16384:
+            chunk = s.recv(1024)
+            if not chunk:
+                break
+            resp += chunk
+    return resp
+
+
+def s_doc_website(g):
+    # Start the web pipeline (network -> http -> doc) and fetch the docs site from
+    # the host. Proves the full multi-agent path: the Network agent relays the
+    # socket bytes, the HTTP agent parses the request + formats the response, and
+    # the Doc agent reads index.html/docs.html from its own install folder via a
+    # capability- and scope-gated mem_fs_read tool call.
     m = g.mark()
-    g.send(f"/agents start network {SVC_PORT}")
-    if not g.wait_for("started 'network' service", 15, m):
-        return False, "service did not start"
-    time.sleep(0.5)
-    payload = b"svc-echo-ping-4242"
+    g.send(f"/agents start doc {SVC_HTTP_PORT}")
+    if not g.wait_for("web pipeline network->http->doc", 15, m):
+        return False, "web pipeline did not start"
+    time.sleep(0.6)
     try:
-        with socket.create_connection(("127.0.0.1", SVC_PORT), timeout=15) as s:
-            s.sendall(payload)
-            s.settimeout(15)
-            got = b""
-            while len(got) < len(payload):
-                chunk = s.recv(64)
-                if not chunk:
-                    break
-                got += chunk
+        home = _http_get(SVC_HTTP_PORT, "/")
+        docs = _http_get(SVC_HTTP_PORT, "/docs")
     except OSError as e:
-        return False, f"connect/echo failed: {e}"
-    ok = got == payload
-    return ok, "inbound connection echoed via Tcp-backed channel" if ok else f"bad echo: {got!r}"
+        return False, f"http request failed: {e}"
+    ok = (
+        home.startswith(b"HTTP/1.1 200")
+        and b"Chitti" in home
+        and docs.startswith(b"HTTP/1.1 200")
+        and b"Documentation" in docs
+    )
+    return ok, "network->http->doc served index.html + docs.html" if ok else f"bad response: {home[:60]!r}"
 
 
 def s_agents_search(g):
@@ -303,7 +314,7 @@ def s_agents_install_registry(g):
 
 
 def s_system_agents(g):
-    # The built-in network/http/ssh agents are installed into /agent/ at boot
+    # The built-in network/http/doc/ssh agents are installed into /agent/ at boot
     # from their bundled markdown + manifest. The boot log proves install_all ran
     # (which signs each package and place_agent_home's its SOUL); /agents lists them.
     booted = g.wait_for("system agents installed", 5, 0)  # printed at boot
@@ -311,7 +322,7 @@ def s_system_agents(g):
     g.send("/agents")
     listed = g.wait_for("system agents", 15, m) and g.wait_for("/agent/9001/SOUL.md", 3, m)
     ok = booted and listed
-    return ok, "network/http/ssh installed as system agents in /agent/" if ok else "system agents not installed/listed"
+    return ok, "network/http/doc/ssh installed as system agents in /agent/" if ok else "system agents not installed/listed"
 
 
 def s_ssh_agent(g):
@@ -333,31 +344,6 @@ def s_ssh_agent(g):
     return ok, "SSH agent completed the version exchange" if ok else f"bad banner: {banner!r}"
 
 
-def s_http_service_agent(g):
-    # Start the HTTP/Doc service agent, then GET the docs page from the host over
-    # the slirp hostfwd. Proves a NATIVE protocol service agent (HTTP RFC handling)
-    # fed by the same accept -> adopt_tcp -> channel path as the echo service.
-    m = g.mark()
-    g.send(f"/agents start http {SVC_HTTP_PORT}")
-    if not g.wait_for("started 'http' service", 15, m):
-        return False, "http service did not start"
-    time.sleep(0.5)
-    try:
-        with socket.create_connection(("127.0.0.1", SVC_HTTP_PORT), timeout=15) as s:
-            s.sendall(b"GET /docs HTTP/1.1\r\nHost: chitti\r\nConnection: close\r\n\r\n")
-            s.settimeout(15)
-            resp = b""
-            while b"</html>" not in resp and len(resp) < 8192:
-                chunk = s.recv(1024)
-                if not chunk:
-                    break
-                resp += chunk
-    except OSError as e:
-        return False, f"http request failed: {e}"
-    ok = resp.startswith(b"HTTP/1.1 200") and b"Chitti OS" in resp
-    return ok, "Doc agent served HTML over the native HTTP service" if ok else f"bad response: {resp[:80]!r}"
-
-
 def s_surface(g):
     # The UI-surface capability: request a surface + draw ops through Synapse and
     # confirm a deterministic rasterization checksum (pixels aren't on serial).
@@ -368,7 +354,7 @@ def s_surface(g):
 
 
 OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS]
-AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("net_service_echo", s_net_service_echo), ("http_service_agent", s_http_service_agent), ("ssh_agent", s_ssh_agent), ("surface", s_surface)]
+AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_website", s_doc_website), ("ssh_agent", s_ssh_agent), ("surface", s_surface)]
 NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_stream", s_http_stream), ("ws", s_ws)]
 NET_TLS = [("wss", s_wss), ("model_remote_https", s_model_remote_https)]
 MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("compact", s_compact)]
