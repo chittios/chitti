@@ -83,13 +83,13 @@ impl Model {
 /// can reach a guest TCP listener (used by the e2e Network-service scenario).
 /// Opt-in, so normal `run` invocations keep plain user-mode networking.
 fn user_netdev(id: &str) -> String {
-    match std::env::var("CHITTI_HOSTFWD") {
-        Ok(p) if !p.trim().is_empty() => {
-            let p = p.trim();
-            format!("user,id={id},hostfwd=tcp:127.0.0.1:{p}-:{p}")
+    let mut s = format!("user,id={id}");
+    if let Ok(ports) = std::env::var("CHITTI_HOSTFWD") {
+        for p in ports.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            s.push_str(&format!(",hostfwd=tcp:127.0.0.1:{p}-:{p}"));
         }
-        _ => format!("user,id={id}"),
     }
+    s
 }
 
 fn mem_bytes(m: &str) -> u64 {

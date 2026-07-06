@@ -2428,6 +2428,14 @@ fn run_agents(arg: &str, chat: &mut Option<ChatSession>) {
             }
             _ => serial_println!("usage: /agents start-net <port>"),
         },
+        "start-http" => match sarg.parse::<u16>() {
+            Ok(port) if port != 0 => {
+                crate::service::http::set_port(port);
+                let t = crate::service::start(&crate::service::http::HTTP_SERVICE);
+                serial_println!("agents> http-doc service serving docs on TCP :{} (task {})", port, t);
+            }
+            _ => serial_println!("usage: /agents start-http <port>"),
+        },
         other => serial_println!(
             "agents> unknown '{}' — usage: /agents [list|switch <id>|kill <id>|services|start-net <port>|search <url> [q]|install <name> [--yes] [--registry <url>]|uninstall <name>]",
             other

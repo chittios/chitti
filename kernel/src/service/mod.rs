@@ -11,6 +11,7 @@
 //! (accept a connection, copy bytes, parse a protocol) is native and audited at
 //! the Synapse boundary exactly like any other effect.
 
+pub mod http;
 pub mod network;
 
 use crate::cap::{self, Right};
