@@ -553,11 +553,36 @@ pub fn tcp_may_recv(handle: SocketHandle) -> bool {
     NET.with(|n| n.as_mut().map(|s| s.sockets.get_mut::<tcp::Socket>(handle).may_recv()).unwrap_or(false))
 }
 
-/// Close (and remove) a TCP socket adopted by a channel.
+/// Bytes still queued in the socket's transmit buffer (not yet sent *and* acked
+/// by the peer — smoltcp keeps them buffered until acknowledged).
+pub fn tcp_send_queue(handle: SocketHandle) -> usize {
+    NET.with(|n| n.as_mut().map(|s| s.sockets.get_mut::<tcp::Socket>(handle).send_queue()).unwrap_or(0))
+}
+
+/// Gracefully close (and remove) a TCP socket adopted by a channel. Crucially,
+/// this first **drains the transmit buffer** — a `tcp_send`/`try_write` only
+/// queues bytes into the socket's TX buffer; removing the socket before smoltcp
+/// has actually transmitted (and had acked) those bytes would truncate the
+/// response and give an HTTP client a Content-Length mismatch. So: initiate the
+/// close (queues a FIN after the pending data), poll until the TX buffer drains
+/// or a deadline, then remove.
 pub fn tcp_close(handle: SocketHandle) {
     NET.with(|n| {
         if let Some(s) = n.as_mut() {
             s.sockets.get_mut::<tcp::Socket>(handle).close();
+        }
+    });
+    let deadline = crate::arch::now_ms() + 5_000;
+    loop {
+        poll();
+        if tcp_send_queue(handle) == 0 || crate::arch::now_ms() >= deadline {
+            break;
+        }
+        crate::shell::upkeep();
+        crate::sched::yield_now();
+    }
+    NET.with(|n| {
+        if let Some(s) = n.as_mut() {
             s.sockets.remove(handle);
         }
     });
