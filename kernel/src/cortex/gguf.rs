@@ -293,3 +293,35 @@ impl<'a> Gguf<'a> {
         self.data.get(start..start + len).ok_or(GgufError::Truncated)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The model-load flow's first guardrails: reject a non-GGUF blob and an
+    /// unsupported container version, rather than reading garbage as a model.
+    /// (A full valid parse needs the real ~800 MB GGUF, exercised by booting
+    /// with the model and `cargo xtask ref-check`; here we pin the header
+    /// validation that a bad/short file must not slip past.)
+    #[test_case]
+    fn rejects_bad_magic() {
+        let not_gguf = [0u8, 1, 2, 3, 4, 5, 6, 7];
+        assert!(matches!(Gguf::parse(&not_gguf), Err(GgufError::BadMagic)));
+    }
+
+    #[test_case]
+    fn rejects_unsupported_version() {
+        // "GGUF" magic (LE) + version 2 (we only support v3).
+        let mut buf = alloc::vec![0x47u8, 0x47, 0x55, 0x46];
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        assert!(matches!(Gguf::parse(&buf), Err(GgufError::UnsupportedVersion(2))));
+    }
+
+    #[test_case]
+    fn rejects_truncated_header() {
+        // Correct magic + v3 but nothing after → must error, not panic.
+        let mut buf = alloc::vec![0x47u8, 0x47, 0x55, 0x46];
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        assert!(Gguf::parse(&buf).is_err());
+    }
+}
