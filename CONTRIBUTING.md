@@ -14,7 +14,10 @@ Every change must uphold:
 
 1. **The determinism boundary** — model output is an untrusted plan; it never
    causes a side effect directly. All effects route through Synapse
-   (grammar → capability → taint gate → deterministic execution → audit).
+   (grammar → capability → scope → taint gate → deterministic execution → audit).
+   A **service agent**'s protocol/codec logic is deterministic native code
+   *below* the boundary; the model plans policy over capabilities, it never
+   implements a protocol.
 2. **Dual-architecture parity** — the kernel builds and works on **both**
    `x86_64` and `aarch64` from one codebase. Never gate behaviour behind
    `target_arch` unless it is genuinely arch-specific, and then provide the
@@ -25,17 +28,34 @@ Every change must uphold:
    PrimeCell IDs) and degrade gracefully. Don't hardcode addresses, resolutions,
    or device layouts to QEMU/VirtualBox. The same image must run on QEMU,
    VirtualBox, and real UEFI hardware.
-4. **Delegation only narrows authority**, and **a skill is bounded by its
-   install-time grant, forever.**
+4. **No ambient authority** — a resource an agent names (a Synapse primitive, a
+   channel end, a listener, a UI surface) is reachable only through a capability
+   it holds in its **own** table; never a global id anyone can guess. Handles the
+   model emits are resolved against the caller's own capability space.
+5. **Delegation only narrows authority**, and **a skill/agent is bounded by its
+   install-time grant, forever.** Consent can only shrink a package's requested
+   capabilities; a scope (fs path, host/port) granted narrowly is enforced at the
+   executor, not just declared.
+
+### Every feature/fix ships with tests
+
+Two layers, and new work adds to **both** where they apply:
+
+- **Unit tests** (`cargo xtask test`) for the pure logic — pull the fiddly logic
+  into a pure function and test it with cases.
+- **End-to-end scenarios** (`tests/e2e/`, `make e2e`) for anything that only
+  exists on the running OS: a shell command, a networked/service/UI/model/voice
+  flow. Adding one of those means adding an e2e scenario.
 
 ## Before you open a PR
 
 Run all of these and make sure they pass:
 
 ```sh
-cargo xtask build -arch x86_64 && cargo xtask test    # must stay 104/104
+cargo xtask build -arch x86_64 && cargo xtask test    # keep the unit suite green
 cargo xtask build -arch aarch64
 cargo xtask run   -arch aarch64                        # if the change is boot-visible, spot-check the boot
+make e2e                                               # if the change is boot-visible or networked
 ```
 
 If the change touches the framebuffer, drivers, or input, verify it with a QMP
