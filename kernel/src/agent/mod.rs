@@ -24,6 +24,7 @@ pub mod manifest;
 pub mod orchestrator;
 pub mod rule_steps;
 pub mod subagent;
+pub mod system;
 pub mod types;
 
 pub use types::*;

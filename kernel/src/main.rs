@@ -14,6 +14,9 @@ const BOOT_MSG: &str = "Chitti: boot ok";
 /// (and spawned demo agents + files on every boot) live on in the test suite;
 /// the only default agent is the shell agent.
 fn run_os() -> ! {
+    // Install the built-in system agents (network, http, ssh) into /agent/ from
+    // their bundled markdown + manifest, before the shell comes up.
+    chitti_kernel::agent::system::install_all(chitti_kernel::arch::now_ms());
     chitti_kernel::shell::run();
 }
 

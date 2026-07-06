@@ -1,0 +1,14 @@
+{
+  "name": "network",
+  "version": "1.0.0",
+  "kind": "service",
+  "description": "Listens on TCP ports and forwards accepted connections to other agents as channels.",
+  "toolset": ["net_listen", "net_accept", "channel_read", "channel_write", "channel_grant"],
+  "capabilities": [
+    { "domain": "net", "rights": ["exec"], "scope": "any" },
+    { "domain": "channel", "rights": ["read", "write"], "scope": "any" }
+  ],
+  "service": "network-echo",
+  "autostart": false,
+  "default_port": 2323
+}

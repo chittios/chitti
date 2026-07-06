@@ -13,6 +13,7 @@
 
 pub mod http;
 pub mod network;
+pub mod ssh;
 
 use crate::cap::{self, Right};
 use crate::mm::Locked;
