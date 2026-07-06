@@ -74,6 +74,9 @@ pub fn demo() {
             Invocation::RefusedTainted { primitive } => {
                 crate::serial_println!("Chitti: synapse [{}] REFUSED (tainted justification)", primitive);
             }
+            Invocation::DeniedScope { primitive } => {
+                crate::serial_println!("Chitti: synapse [{}] DENIED (target outside granted scope)", primitive);
+            }
         }
     }
     crate::serial_println!("Chitti: synapse audit log has {} entries", audit::len());

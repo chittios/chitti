@@ -21,6 +21,7 @@ use crate::mm::Locked;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use smoltcp::iface::SocketHandle;
 
 /// Which flavour of conduit a channel is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +55,11 @@ struct Dgram {
 enum Backend {
     Pipe(Ring),
     Datagram(Dgram),
+    /// A live TCP connection adopted as a channel (`adopt_tcp`), so a service
+    /// agent that accepts a connection can hand its stream to another agent as
+    /// an ordinary channel — the Network→SSH connection handoff. Byte I/O routes
+    /// straight through smoltcp; the channel refcount owns the socket's removal.
+    Tcp(SocketHandle),
 }
 
 struct Channel {
@@ -106,10 +112,39 @@ pub fn create(kind: ChannelKind, ring_cap: usize) -> ChannelId {
     id
 }
 
+/// Adopt an already-connected TCP socket as a stream channel. Used by a Network
+/// service agent's accept path: the accepted `SocketHandle` becomes a channel
+/// whose ends can be granted to another agent. Starts with `ends = 2` (a read
+/// and a write end to grant); byte I/O routes through smoltcp and the socket is
+/// removed when the last end closes.
+pub fn adopt_tcp(handle: SocketHandle) -> ChannelId {
+    let id = NEXT_CHANNEL.fetch_add(1, Ordering::SeqCst);
+    CHANNELS.with(|m| m.insert(id, Channel { backend: Backend::Tcp(handle), ends: 2 }));
+    id
+}
+
 /// Non-blocking write of raw bytes into a stream channel. Returns the number of
 /// bytes accepted (may be fewer than `data.len()` under back-pressure, or 0 if
 /// the ring is full). `Closed` if the reader end was dropped.
 pub fn try_write(id: ChannelId, data: &[u8]) -> Result<usize, ChannelError> {
+    // Snapshot a Tcp handle first, so the net call doesn't run under CHANNELS.
+    let tcp = CHANNELS.with(|m| match m.get(&id) {
+        None => Some(None),
+        Some(ch) => match &ch.backend {
+            Backend::Tcp(h) => Some(Some(*h)),
+            _ => None,
+        },
+    });
+    match tcp {
+        Some(None) => return Err(ChannelError::NoSuchChannel),
+        Some(Some(h)) => {
+            return match crate::net::tcp_send(h, data) {
+                Some(n) => Ok(n),
+                None => Err(ChannelError::Closed),
+            }
+        }
+        None => {}
+    }
     CHANNELS.with(|m| {
         let ch = m.get_mut(&id).ok_or(ChannelError::NoSuchChannel)?;
         match &mut ch.backend {
@@ -123,6 +158,7 @@ pub fn try_write(id: ChannelId, data: &[u8]) -> Result<usize, ChannelError> {
                 Ok(n)
             }
             Backend::Datagram(_) => Err(ChannelError::TooLarge), // use try_send_dgram
+            Backend::Tcp(_) => unreachable!("handled above"),
         }
     })
 }
@@ -130,6 +166,20 @@ pub fn try_write(id: ChannelId, data: &[u8]) -> Result<usize, ChannelError> {
 /// Non-blocking read of up to `buf.len()` bytes from a stream channel. `Ok(0)`
 /// with [`is_eof`] true means the writer closed and the ring is drained.
 pub fn try_read(id: ChannelId, buf: &mut [u8]) -> Result<usize, ChannelError> {
+    // Snapshot the Tcp handle (if any) without holding the CHANNELS lock across
+    // a net call (net::tcp_recv takes the NET lock and pumps poll()).
+    let tcp = CHANNELS.with(|m| match m.get(&id) {
+        None => Some(None),
+        Some(ch) => match &ch.backend {
+            Backend::Tcp(h) => Some(Some(*h)),
+            _ => None,
+        },
+    });
+    match tcp {
+        Some(None) => return Err(ChannelError::NoSuchChannel),
+        Some(Some(h)) => return Ok(crate::net::tcp_recv(h, buf).unwrap_or(0)),
+        None => {}
+    }
     CHANNELS.with(|m| {
         let ch = m.get_mut(&id).ok_or(ChannelError::NoSuchChannel)?;
         match &mut ch.backend {
@@ -141,6 +191,7 @@ pub fn try_read(id: ChannelId, buf: &mut [u8]) -> Result<usize, ChannelError> {
                 Ok(n)
             }
             Backend::Datagram(_) => Err(ChannelError::TooLarge), // use try_recv_dgram
+            Backend::Tcp(_) => unreachable!("handled above"),
         }
     })
 }
@@ -161,7 +212,7 @@ pub fn try_send_dgram(id: ChannelId, frame: &[u8]) -> Result<(), ChannelError> {
                 d.frames.push_back(frame.to_vec());
                 Ok(())
             }
-            Backend::Pipe(_) => Err(ChannelError::TooLarge),
+            Backend::Pipe(_) | Backend::Tcp(_) => Err(ChannelError::TooLarge),
         }
     })
 }
@@ -172,7 +223,7 @@ pub fn try_recv_dgram(id: ChannelId) -> Result<Option<Vec<u8>>, ChannelError> {
         let ch = m.get_mut(&id).ok_or(ChannelError::NoSuchChannel)?;
         match &mut ch.backend {
             Backend::Datagram(d) => Ok(d.frames.pop_front()),
-            Backend::Pipe(_) => Err(ChannelError::TooLarge),
+            Backend::Pipe(_) | Backend::Tcp(_) => Err(ChannelError::TooLarge),
         }
     })
 }
@@ -181,11 +232,24 @@ pub fn try_recv_dgram(id: ChannelId) -> Result<Option<Vec<u8>>, ChannelError> {
 /// been closed *and* all buffered bytes/frames have been drained. A torn-down
 /// channel also reports EOF.
 pub fn is_eof(id: ChannelId) -> bool {
+    let tcp = CHANNELS.with(|m| match m.get(&id) {
+        None => Some(None),
+        Some(ch) => match &ch.backend {
+            Backend::Tcp(h) => Some(Some(*h)),
+            _ => None,
+        },
+    });
+    match tcp {
+        Some(None) => return true, // gone
+        Some(Some(h)) => return !crate::net::tcp_may_recv(h), // peer closed for reading
+        None => {}
+    }
     CHANNELS.with(|m| match m.get(&id) {
         None => true,
         Some(ch) => match &ch.backend {
             Backend::Pipe(r) => r.write_closed && r.buf.is_empty(),
             Backend::Datagram(d) => d.write_closed && d.frames.is_empty(),
+            Backend::Tcp(_) => unreachable!("handled above"),
         },
     })
 }
@@ -197,17 +261,20 @@ pub fn readable_len(id: ChannelId) -> usize {
         Some(ch) => match &ch.backend {
             Backend::Pipe(r) => r.buf.len(),
             Backend::Datagram(d) => d.frames.len(),
+            Backend::Tcp(_) => 0, // unknown without a recv; readers just try_read
         },
     })
 }
 
-/// Mark the writer end closed (readers will see EOF once drained).
+/// Mark the writer end closed (readers will see EOF once drained). For a Tcp
+/// backend this is a no-op flag — teardown (`close_end`) shuts the socket.
 pub fn close_write(id: ChannelId) {
     CHANNELS.with(|m| {
         if let Some(ch) = m.get_mut(&id) {
             match &mut ch.backend {
                 Backend::Pipe(r) => r.write_closed = true,
                 Backend::Datagram(d) => d.write_closed = true,
+                Backend::Tcp(_) => {}
             }
         }
     });
@@ -220,6 +287,7 @@ pub fn close_read(id: ChannelId) {
             match &mut ch.backend {
                 Backend::Pipe(r) => r.read_closed = true,
                 Backend::Datagram(d) => d.read_closed = true,
+                Backend::Tcp(_) => {}
             }
         }
     });
@@ -242,14 +310,21 @@ pub fn dup_end(id: ChannelId) -> bool {
 /// torn down and its buffers freed. Callers that know their direction should
 /// also call [`close_write`]/[`close_read`] first so the peer observes EOF.
 pub fn close_end(id: ChannelId) {
-    CHANNELS.with(|m| {
+    // If this drops the last end of a Tcp-backed channel, close the socket too.
+    let closed_tcp = CHANNELS.with(|m| {
         if let Some(ch) = m.get_mut(&id) {
             ch.ends = ch.ends.saturating_sub(1);
             if ch.ends == 0 {
+                let tcp = if let Backend::Tcp(h) = ch.backend { Some(h) } else { None };
                 m.remove(&id);
+                return tcp;
             }
         }
+        None
     });
+    if let Some(h) = closed_tcp {
+        crate::net::tcp_close(h);
+    }
 }
 
 /// Cooperatively block until data is available, EOF is reached, or `deadline_ms`

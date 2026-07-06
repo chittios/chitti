@@ -24,6 +24,7 @@ model/voice scenarios auto-skip when the bundled model / voice assets are absent
 """
 
 import os
+import socket
 import ssl
 import subprocess
 import sys
@@ -36,6 +37,7 @@ from servers import Server, tls_context  # noqa: E402
 HOST = "10.0.2.2"  # QEMU user-net alias for the host
 PLAIN_PORT = 8100
 TLS_PORT = 9100
+SVC_PORT = 7099  # guest TCP listener, reachable from the host via slirp hostfwd
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 CERT = os.path.join(HERE, "certs", "ec.pem")
@@ -253,8 +255,35 @@ def s_agents_uninstall(g):
     return ok, "skill-agent uninstalled" if ok else "uninstall did not complete"
 
 
+def s_net_service_echo(g):
+    # Start the Network service agent listening on SVC_PORT, then connect to it
+    # from the host (via the slirp hostfwd) and confirm it echoes bytes back.
+    # Proves the full inbound path: net_listen -> try_accept -> channel::adopt_tcp
+    # -> channel read/write over a live TCP connection.
+    m = g.mark()
+    g.send(f"/agents start-net {SVC_PORT}")
+    if not g.wait_for("network-echo service listening", 15, m):
+        return False, "service did not start"
+    time.sleep(0.5)
+    payload = b"svc-echo-ping-4242"
+    try:
+        with socket.create_connection(("127.0.0.1", SVC_PORT), timeout=15) as s:
+            s.sendall(payload)
+            s.settimeout(15)
+            got = b""
+            while len(got) < len(payload):
+                chunk = s.recv(64)
+                if not chunk:
+                    break
+                got += chunk
+    except OSError as e:
+        return False, f"connect/echo failed: {e}"
+    ok = got == payload
+    return ok, "inbound connection echoed via Tcp-backed channel" if ok else f"bad echo: {got!r}"
+
+
 OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS]
-AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall)]
+AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("net_service_echo", s_net_service_echo)]
 NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_stream", s_http_stream), ("ws", s_ws)]
 NET_TLS = [("wss", s_wss), ("model_remote_https", s_model_remote_https)]
 MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("compact", s_compact)]
@@ -298,8 +327,8 @@ def main():
 
     # Voice needs a sound device; give the guest a silent audio backend then.
     audio = "none" if (slow and have_voice) else "off"
-    print(f"e2e: booting guest (cargo xtask run, audio={audio})…")
-    g = Guest(arch=arch, model=model, verbose=verbose, audio=audio)
+    print(f"e2e: booting guest (cargo xtask run, audio={audio}, hostfwd={SVC_PORT})…")
+    g = Guest(arch=arch, model=model, verbose=verbose, audio=audio, hostfwd=SVC_PORT)
     results = []
     try:
         if not g.wait_for("net: configured", 120):

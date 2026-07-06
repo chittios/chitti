@@ -126,6 +126,7 @@ pub enum CapDomain {
     Ipc,         // send/receive IPC
     SkillManage, // install/uninstall skills (privileged)
     Channel,     // create inter-agent byte/datagram channels; use granted ends
+    Net,         // network: listen/accept + outbound http (host/port scoped)
 }
 
 bitflags::bitflags! {
@@ -147,20 +148,46 @@ pub enum Scope {
     Any,
     Path(String),     // glob, e.g. "/skills/pdf/**"
     Resource(String), // named resource
+    /// A network host + inclusive port range. Host is a glob (`*.example.com`
+    /// or `*` for any host); a *granted* scope names a range, a *target* names a
+    /// single point (`port_lo == port_hi`).
+    Net { host: String, port_lo: u16, port_hi: u16 },
 }
 
 impl Scope {
     /// Whether `self` is at least as permissive as `other` (subset check for
     /// attenuation). `Any` covers everything; a path/resource covers only an
-    /// equal or more-specific-under-glob target.
+    /// equal or more-specific-under-glob target. Unknown pairings are `false`,
+    /// so a broader grant can never be synthesized from a narrower one.
     pub fn covers(&self, other: &Scope) -> bool {
         match (self, other) {
             (Scope::Any, _) => true,
             (Scope::Path(a), Scope::Path(b)) => glob_covers(a, b),
             (Scope::Resource(a), Scope::Resource(b)) => a == b,
+            (
+                Scope::Net { host: ha, port_lo: la, port_hi: ua },
+                Scope::Net { host: hb, port_lo: lb, port_hi: ub },
+            ) => host_glob_covers(ha, hb) && la <= lb && ub <= ua,
             _ => false,
         }
     }
+}
+
+/// Host-glob cover: `a` covers `b` if `a` is `*`, an exact match, or a
+/// `*.suffix` wildcard that `b` ends with (matching a label boundary).
+fn host_glob_covers(a: &str, b: &str) -> bool {
+    if a == "*" || a == b {
+        return true;
+    }
+    if let Some(suffix) = a.strip_prefix("*.") {
+        // "*.example.com" covers "api.example.com" and "example.com".
+        return b == suffix || b.ends_with(&{
+            let mut s = String::from(".");
+            s.push_str(suffix);
+            s
+        });
+    }
+    false
 }
 
 /// Minimal glob cover: `a` covers `b` when `a` equals `b`, or `a` ends in `**`

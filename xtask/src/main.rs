@@ -78,6 +78,20 @@ impl Model {
 
 /// Convert a QEMU `-m` size string (`"3G"`, `"512M"`, or a raw byte count) to
 /// bytes, for the `opt/chitti/ramsize` fw_cfg the kernel reads.
+/// Build the slirp user-net `-netdev` value for `id`. If `CHITTI_HOSTFWD=<port>`
+/// is set, add a host-forward `tcp:127.0.0.1:<port>-:<port>` so a host process
+/// can reach a guest TCP listener (used by the e2e Network-service scenario).
+/// Opt-in, so normal `run` invocations keep plain user-mode networking.
+fn user_netdev(id: &str) -> String {
+    match std::env::var("CHITTI_HOSTFWD") {
+        Ok(p) if !p.trim().is_empty() => {
+            let p = p.trim();
+            format!("user,id={id},hostfwd=tcp:127.0.0.1:{p}-:{p}")
+        }
+        _ => format!("user,id={id}"),
+    }
+}
+
 fn mem_bytes(m: &str) -> u64 {
     let m = m.trim();
     let (num, mult) = match m.chars().last() {
@@ -601,7 +615,10 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
     qemu.arg("-fw_cfg").arg(format!("name=opt/chitti/ramsize,string={}", mem_bytes(model.qemu_mem())));
     // A virtio-net NIC on user-mode networking (built-in DHCP 10.0.2.15 / gw
     // 10.0.2.2 / dns 10.0.2.3) so /network, /ping and /wifi work out of the box.
-    qemu.args(["-netdev", "user,id=chittinet", "-device", "virtio-net-device,netdev=chittinet"]);
+    // CHITTI_HOSTFWD=<port> adds a slirp host-forward so a host process can reach
+    // a guest listener (used by the e2e Network-service-agent scenario). Opt-in
+    // so normal runs keep the plain user-net.
+    qemu.args(["-netdev", &user_netdev("chittinet"), "-device", "virtio-net-device,netdev=chittinet"]);
     // virtio-snd on the host's audio backend (mic + speaker) for /voice.
     qemu.args(audio_args("virtio-sound-device"));
     // Attach a virtio-blk disk on the virtio-mmio bus (the aarch64 block driver
@@ -1303,7 +1320,7 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         cmd.args(["-device", "virtio-blk-pci,drive=chittidisk,disable-modern=on"]);
         cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
         // Intel e1000 NIC on user-mode networking (DHCP 10.0.2.15 / gw 10.0.2.2).
-        cmd.args(["-netdev", "user,id=chittinet", "-device", "e1000,netdev=chittinet"]);
+        cmd.args(["-netdev", &user_netdev("chittinet"), "-device", "e1000,netdev=chittinet"]);
         eprintln!("booting FROM DISK ONLY via UEFI (OVMF) -- no ISO; the installed Chitti boots itself");
         eprintln!("  disk: {}", disk.display());
         let status = cmd.status().map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
@@ -1334,7 +1351,7 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
     // shell (as a real USB keyboard would); PS/2 also still works.
     cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
     // Intel e1000 NIC on user-mode networking (DHCP 10.0.2.15 / gw 10.0.2.2).
-    cmd.args(["-netdev", "user,id=chittinet", "-device", "e1000,netdev=chittinet"]);
+    cmd.args(["-netdev", &user_netdev("chittinet"), "-device", "e1000,netdev=chittinet"]);
     // virtio-snd on the host's audio backend (mic + speaker) for /voice.
     cmd.args(audio_args("virtio-sound-pci"));
     if disk_size.is_some() {

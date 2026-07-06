@@ -36,7 +36,7 @@ impl Response {
 /// Split `http[s]://host[:port]/path` into `(tls, host, port, path)`. `https`
 /// tunnels through [`super::tls`]; `http` is plaintext. Default port follows
 /// the scheme (80 / 443).
-fn parse_url(url: &str) -> Result<(bool, String, u16, String), String> {
+pub(crate) fn parse_url(url: &str) -> Result<(bool, String, u16, String), String> {
     let (tls, rest, default_port) = if let Some(r) = url.strip_prefix("https://") {
         (true, r, 443u16)
     } else if let Some(r) = url.strip_prefix("http://") {

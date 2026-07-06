@@ -1021,6 +1021,51 @@ fn channel_grant_hands_an_end_to_another_agent() {
     channel::close_end(c);
 }
 
+/// The executor's scope gate (Gate 2.5) enforces a granted *path* scope, not
+/// just primitive-granularity authority (Phase 3/7). A task granted Fs WRITE
+/// scoped to `/work/**` may write under it but is denied outside it — even
+/// though it holds the same `InvokePrimitive(mem_fs_write)` either way. A task
+/// with no scope ledger entry is unconstrained (back-compat).
+#[test_case]
+fn scope_gate_enforces_fs_path_scope() {
+    use agent::types::{CapabilityRequest, CapDomain, Rights, Scope};
+
+    let task = sched::spawn_parked("scoped-writer");
+    // Grant WRITE, but only within /work/**. grant_to_task records the scope.
+    let caps = alloc::vec![CapabilityRequest::new(CapDomain::Fs, Rights::WRITE, Scope::Path("/work/**".into()))];
+    agent::manifest::grant_to_task(task, &caps);
+
+    // In-scope write: allowed and executed.
+    let ok = synapse::execute(task, r#"{"name":"mem_fs_write","arguments":{"path":"/work/out.txt","text":"hi"}}"#);
+    assert!(matches!(ok, synapse::Invocation::Executed { .. }), "in-scope write should execute: {ok:?}");
+    assert_eq!(synapse::fs::read("/work/out.txt").as_deref(), Some(&b"hi"[..]));
+
+    // Out-of-scope write: denied by the scope gate, and the file is not created.
+    let denied = synapse::execute(task, r#"{"name":"mem_fs_write","arguments":{"path":"/etc/passwd","text":"x"}}"#);
+    assert!(matches!(denied, synapse::Invocation::DeniedScope { .. }), "out-of-scope write should be denied: {denied:?}");
+    assert!(!synapse::fs::exists("/etc/passwd"), "out-of-scope write must not have happened");
+
+    let _ = sched::kill(task);
+}
+
+/// `Scope::Net` coverage (host glob + port range) — the pure attenuation math
+/// the Net scope gate relies on. Narrows, never widens.
+#[test_case]
+fn net_scope_covers_host_and_port_range() {
+    use agent::types::Scope;
+    let grant = Scope::Net { host: "*.example.com".into(), port_lo: 80, port_hi: 443 };
+    // In range + matching host suffix.
+    assert!(grant.covers(&Scope::Net { host: "api.example.com".into(), port_lo: 443, port_hi: 443 }));
+    assert!(grant.covers(&Scope::Net { host: "example.com".into(), port_lo: 80, port_hi: 80 }));
+    // Port out of range -> not covered.
+    assert!(!grant.covers(&Scope::Net { host: "api.example.com".into(), port_lo: 8080, port_hi: 8080 }));
+    // Different host -> not covered.
+    assert!(!grant.covers(&Scope::Net { host: "evil.com".into(), port_lo: 443, port_hi: 443 }));
+    // A "*" host grant covers anything (in range).
+    let any_host = Scope::Net { host: "*".into(), port_lo: 1, port_hi: 65535 };
+    assert!(any_host.covers(&Scope::Net { host: "anything.net".into(), port_lo: 22, port_hi: 22 }));
+}
+
 // --- Phase 6 acceptance tests (taint gate + compiled intents) -----------
 
 /// (a) an injection test: a file whose *contents* say to delete another file

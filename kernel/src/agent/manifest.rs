@@ -213,6 +213,19 @@ pub fn primitives_for(caps: &[CapabilityRequest]) -> Vec<PrimitiveId> {
                     prims.push(registry::CHANNEL_READ);
                 }
             }
+            CapDomain::Net => {
+                // EXEC = listen/accept (a server); READ = http GET; WRITE = http POST.
+                if c.rights.contains(Rights::EXEC) {
+                    prims.push(registry::NET_LISTEN);
+                    prims.push(registry::NET_ACCEPT);
+                }
+                if c.rights.contains(Rights::READ) {
+                    prims.push(registry::NET_HTTP_GET);
+                }
+                if c.rights.contains(Rights::WRITE) {
+                    prims.push(registry::NET_HTTP_POST);
+                }
+            }
             CapDomain::Inference | CapDomain::Todo | CapDomain::Ipc | CapDomain::SkillManage => {}
         }
     }
@@ -229,6 +242,9 @@ pub fn grant_to_task(task: crate::sched::TaskId, granted: &[CapabilityRequest]) 
     for prim in primitives_for(granted) {
         crate::cap::grant(task, crate::cap::Right::InvokePrimitive(prim));
     }
+    // Record the granted scopes so the executor's Gate 2.5 can enforce
+    // path/host/port limits (not just primitive-granularity authority).
+    crate::cap::grant_scopes(task, granted);
     granted
         .iter()
         .map(|req| Capability { id: next_cap_id(), req: req.clone() })
@@ -242,6 +258,13 @@ pub fn render_cap(c: &CapabilityRequest) -> String {
         Scope::Any => "any".to_string(),
         Scope::Path(p) => alloc::format!("path:{p}"),
         Scope::Resource(r) => alloc::format!("resource:{r}"),
+        Scope::Net { host, port_lo, port_hi } => {
+            if port_lo == port_hi {
+                alloc::format!("net:{host}:{port_lo}")
+            } else {
+                alloc::format!("net:{host}:{port_lo}-{port_hi}")
+            }
+        }
     };
     alloc::format!("{:?} {:?} @ {}", c.domain, c.rights, scope)
 }
