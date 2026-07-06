@@ -10,8 +10,9 @@
 use crate::service::{pipeline, ServiceSpec};
 
 /// How long to wait for a request head / the HTTP agent's response before
-/// dropping the connection.
-const CONN_DEADLINE_MS: u64 = 12_000;
+/// dropping the connection. Generous: the HTTP agent's response waits on the Doc
+/// agent planning the route with a live model turn (+ a one-time model load).
+const CONN_DEADLINE_MS: u64 = 65_000;
 
 extern "C" fn network_serve(_arg: u64) {
     let port = pipeline::net_port();

@@ -130,5 +130,7 @@ pub fn send_frame(id: ChannelId, data: &[u8], deadline_ms: u64) -> bool {
     }
 }
 
-/// Per-request budget for a stage waiting on the next stage.
-pub const STAGE_DEADLINE_MS: u64 = 10_000;
+/// Per-request budget for a stage waiting on the next stage. Generous because
+/// the Doc agent plans each route with a live model turn (and pays a one-time
+/// model load on the first request) — routing is a judgment, not a table lookup.
+pub const STAGE_DEADLINE_MS: u64 = 60_000;
