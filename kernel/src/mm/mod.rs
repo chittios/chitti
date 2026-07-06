@@ -63,6 +63,54 @@ impl<T> Locked<T> {
 #[cfg(target_arch = "x86_64")]
 pub static FRAME_ALLOCATOR: Locked<Option<frame::BitmapFrameAllocator>> = Locked::new(None);
 
+use core::sync::atomic::AtomicU64;
+
+/// Total physical RAM in bytes, as discovered at boot (x86: the sum of usable
+/// Limine memmap entries; aarch64 UEFI: the stub's memory-map total; aarch64
+/// `-kernel`: the fw_cfg `ramsize`). 0 until [`set_ram_total`] runs. This is
+/// the machine's installed RAM — distinct from the kernel's fixed heap
+/// ([`heap::HEAP_SIZE`]), which is only the slice the allocator manages.
+static RAM_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record the total physical RAM (see [`RAM_TOTAL`]). Called once at boot.
+pub fn set_ram_total(bytes: u64) {
+    RAM_TOTAL.store(bytes, Ordering::Relaxed);
+}
+
+/// A memory-usage snapshot for the status bar and `/top`.
+pub struct MemStats {
+    /// Total physical RAM installed in the machine.
+    pub ram_total: u64,
+    /// Bytes reserved out of RAM by the kernel: the heap + the loaded model
+    /// region (the kernel image itself is small and not counted).
+    pub ram_reserved: u64,
+    /// The kernel heap's size (the allocator's arena).
+    pub heap_total: u64,
+    /// Bytes currently allocated within the heap.
+    pub heap_used: u64,
+}
+
+/// Gather a [`MemStats`]. `ram_total` falls back to the heap size when RAM
+/// discovery reported nothing (so callers always get a sane denominator).
+pub fn mem_stats() -> MemStats {
+    let (heap_total, _free, heap_used) = heap::stats();
+    let model = crate::cortex::model_module().map(|m| m.len() as u64).unwrap_or(0);
+    let ram_total = {
+        let r = RAM_TOTAL.load(Ordering::Relaxed);
+        if r == 0 {
+            heap_total as u64
+        } else {
+            r
+        }
+    };
+    MemStats {
+        ram_total,
+        ram_reserved: heap_total as u64 + model,
+        heap_total: heap_total as u64,
+        heap_used: heap_used as u64,
+    }
+}
+
 /// Physical base of the kernel heap, published by [`init`] (aarch64) so
 /// `cortex::model_module` can size the model region as `[MODEL_LOAD_ADDR,
 /// heap_base())`. 0 before `init` runs.

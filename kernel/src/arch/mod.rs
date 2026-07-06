@@ -90,6 +90,22 @@ pub fn hw_rand() -> u64 {
     0
 }
 
+/// Number of CPU cores online — x86 SMP APs (`smp`) or aarch64 PSCI-started
+/// secondaries (`arch::aarch64::smp`), behind one API for the status bar and
+/// `/top`.
+#[cfg(target_arch = "x86_64")]
+pub fn cpu_count() -> u64 {
+    crate::smp::cpu_count()
+}
+#[cfg(target_arch = "aarch64")]
+pub fn cpu_count() -> u64 {
+    aarch64::smp::online_cpus() as u64
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn cpu_count() -> u64 {
+    1
+}
+
 /// A monotonically-advancing cycle/tick counter for entropy mixing (finer than
 /// `now_ms`): the TSC on x86, `CNTVCT_EL0` on aarch64.
 #[cfg(target_arch = "x86_64")]

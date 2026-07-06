@@ -44,6 +44,7 @@ pub extern "C" fn _start() -> ! {
             .map(|e| e.length)
             .sum();
         serial_println!("Chitti: {} usable memory-map bytes across {} entries", usable, mm.entries().len());
+        chitti_kernel::mm::set_ram_total(usable);
     } else {
         serial_println!("Chitti: memory map request was refused");
     }
@@ -231,6 +232,15 @@ pub extern "C" fn aarch64_start() -> ! {
     } else {
         None
     };
+    // Record total physical RAM for the status bar / `/top`: the UEFI stub's
+    // memory-map total (VBox / real hardware), else the fw_cfg `ramsize` the
+    // launcher published (`-kernel`), else the discovered RAM span.
+    {
+        let ram = bootinfo_ram_bytes()
+            .or_else(|| unsafe { chitti_kernel::arch::aarch64::ramfb::read_ram_bytes() })
+            .unwrap_or_else(|| chitti_kernel::arch::aarch64::mmu::ram_end().saturating_sub(0x4000_0000));
+        chitti_kernel::mm::set_ram_total(ram);
+    }
     if let Some((w, h)) = fb {
         serial_println!("Chitti: framebuffer TUI up ({}x{}) -- console mirrored to the window", w, h);
         // Bring up a USB keyboard (xHCI + HID) if present — the real-hardware
@@ -363,6 +373,17 @@ fn bootinfo_unix() -> Option<u64> {
     let page = unsafe { core::slice::from_raw_parts(bi as *const u8, 60) };
     let secs = u64::from_le_bytes(page[52..60].try_into().unwrap());
     (secs > 0).then_some(secs)
+}
+
+/// Total physical RAM (bytes) the UEFI stub reported at boot-info offset 92,
+/// or `None` if there's no boot-info page or the field is 0.
+#[cfg(all(target_arch = "aarch64", not(feature = "boot-limine")))]
+fn bootinfo_ram_bytes() -> Option<u64> {
+    let bi = bootinfo_page()?;
+    // SAFETY: identity-mapped boot-info page; read the 8-byte RAM-total field.
+    let page = unsafe { core::slice::from_raw_parts(bi as *const u8, 100) };
+    let bytes = u64::from_le_bytes(page[92..100].try_into().unwrap());
+    (bytes > 0).then_some(bytes)
 }
 
 /// Point `synapse::fs` at an ext4 *data* partition so agent writes are durable
