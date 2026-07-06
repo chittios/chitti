@@ -88,6 +88,11 @@ pub struct Xhci {
     kbd: Option<Kbd>,
     // The enumerated pointer (USB tablet / mouse), if one was found.
     mouse: Option<Ptr>,
+    // Ports that already produced a working device. On an enumeration retry
+    // (VirtualBox's async VUSB reset makes the *other* device time out) these
+    // are skipped so we don't reset a port whose device already enumerated —
+    // re-resetting port 1 after the keyboard was ready is what killed it.
+    done_ports: u32,
     // Small ring of decoded keyboard bytes (the shared event ring is drained by
     // `pump_events`, which routes reports; `poll_key` pops from here).
     key_buf: [u8; 16],
@@ -356,6 +361,7 @@ impl Xhci {
                 alloc,
                 kbd: None,
                 mouse: None,
+                done_ports: 0,
                 key_buf: [0; 16],
                 key_head: 0,
                 key_tail: 0,
@@ -557,6 +563,13 @@ impl Xhci {
             if self.kbd.is_some() && self.mouse.is_some() {
                 break;
             }
+            // Never re-touch a port that already gave us a device: resetting it
+            // on a retry (to enumerate the *other*, still-missing device) would
+            // knock the working one offline. This is the keyboard-dies-when-the-
+            // mouse-retries bug.
+            if port < 32 && self.done_ports & (1 << port) != 0 {
+                continue;
+            }
             if unsafe { r32(self.portsc(port)) } & PORTSC_CCS == 0 {
                 continue;
             }
@@ -565,6 +578,7 @@ impl Xhci {
                 if let Some((iface, ep, mps, ivl)) = unsafe { parse_hid_keyboard(c.buf_va, c.total as usize) } {
                     if let Some(k) = unsafe { self.finish_keyboard(&mut c, iface, ep, mps, ivl) } {
                         self.kbd = Some(k);
+                        if port < 32 { self.done_ports |= 1 << port; }
                         continue;
                     }
                 }
@@ -573,6 +587,7 @@ impl Xhci {
                 if let Some((iface, ep, mps, ivl, proto)) = unsafe { parse_hid_pointer(c.buf_va, c.total as usize) } {
                     if let Some(p) = unsafe { self.finish_pointer(&mut c, iface, ep, mps, ivl, proto) } {
                         self.mouse = Some(p);
+                        if port < 32 { self.done_ports |= 1 << port; }
                         continue;
                     }
                 }
