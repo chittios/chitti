@@ -39,29 +39,17 @@ struct SystemAgentDef {
 const SYSTEM_SKILL_BASE: u64 = 9000;
 const SYSTEM_AGENT_BASE: u64 = 9000;
 
+// Only agents that actually reason from a SOUL are installed agents. The
+// `network` and `http` stages are pure mechanical plumbing (relay bytes, parse a
+// protocol) — no judgment, no SOUL — so they live entirely in `crate::service`,
+// not here. `doc` routes from its SOUL; `ssh` carries a login/tunnel persona.
 static SYSTEM_AGENTS: &[SystemAgentDef] = &[
-    SystemAgentDef {
-        name: "network",
-        soul: include_str!("../../../agents/network/SOUL.md"),
-        manifest_json: include_str!("../../../agents/network/manifest.json"),
-        skill_id: SkillId(SYSTEM_SKILL_BASE + 1),
-        agent_id: AgentId(SYSTEM_AGENT_BASE + 1),
-        assets: &[],
-    },
-    SystemAgentDef {
-        name: "http",
-        soul: include_str!("../../../agents/http/SOUL.md"),
-        manifest_json: include_str!("../../../agents/http/manifest.json"),
-        skill_id: SkillId(SYSTEM_SKILL_BASE + 2),
-        agent_id: AgentId(SYSTEM_AGENT_BASE + 2),
-        assets: &[],
-    },
     SystemAgentDef {
         name: "doc",
         soul: include_str!("../../../agents/doc/SOUL.md"),
         manifest_json: include_str!("../../../agents/doc/manifest.json"),
-        skill_id: SkillId(SYSTEM_SKILL_BASE + 3),
-        agent_id: AgentId(SYSTEM_AGENT_BASE + 3),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 1),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 1),
         assets: &[
             ("index.html", include_str!("../../../agents/doc/assets/index.html")),
             ("docs.html", include_str!("../../../agents/doc/assets/docs.html")),
@@ -72,8 +60,8 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
         name: "ssh",
         soul: include_str!("../../../agents/ssh/SOUL.md"),
         manifest_json: include_str!("../../../agents/ssh/manifest.json"),
-        skill_id: SkillId(SYSTEM_SKILL_BASE + 4),
-        agent_id: AgentId(SYSTEM_AGENT_BASE + 4),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 2),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 2),
         assets: &[],
     },
 ];
@@ -300,7 +288,7 @@ pub fn install_all(now: Ticks) {
             Err(e) => crate::ktrace::log_fmt(format_args!("system-agent: install '{}' failed: {:?}", def.name, e)),
         }
     }
-    crate::serial_println!("Chitti: system agents installed (network, http, doc, ssh) in /agent/");
+    crate::serial_println!("Chitti: system agents installed (doc, ssh) in /agent/");
 }
 
 /// The installed system agents, for `/agents list`/display: (name, agent_id).
@@ -313,20 +301,13 @@ mod tests {
     use super::*;
 
     #[test_case]
-    fn parses_the_bundled_network_manifest() {
-        let m = parse_manifest(SYSTEM_AGENTS[0].manifest_json).expect("network manifest parses");
-        assert_eq!(m.name, "network");
+    fn parses_the_bundled_doc_manifest() {
+        let doc = SYSTEM_AGENTS.iter().find(|d| d.name == "doc").expect("doc agent");
+        let m = parse_manifest(doc.manifest_json).expect("doc manifest parses");
+        assert_eq!(m.name, "doc");
         assert_eq!(m.kind, AgentKind::Service);
-        assert!(m.toolset.iter().any(|t| t == "net_accept"));
-        // Declares Net EXEC (listen/accept) and Channel READ|WRITE (relay to http).
-        assert!(m
-            .capabilities
-            .iter()
-            .any(|c| c.domain == CapDomain::Net && c.rights.contains(Rights::EXEC)));
-        assert!(m
-            .capabilities
-            .iter()
-            .any(|c| c.domain == CapDomain::Channel && c.rights.contains(Rights::READ | Rights::WRITE)));
+        // The Doc agent reads files (channel + fs read), scoped to its home.
+        assert!(m.capabilities.iter().any(|c| c.domain == CapDomain::Fs && c.rights.contains(Rights::READ)));
     }
 
     #[test_case]
@@ -336,8 +317,10 @@ mod tests {
             assert_eq!(m.name, def.name);
             assert!(!m.capabilities.is_empty(), "{} declares capabilities", def.name);
         }
-        // The four system agents: the web pipeline (network/http/doc) + ssh.
-        assert_eq!(SYSTEM_AGENTS.len(), 4);
+        // Only agents that reason from a SOUL are installed: doc + ssh. The
+        // network/http stages are pure service-layer plumbing, not agents.
+        assert_eq!(SYSTEM_AGENTS.len(), 2);
+        assert!(!SYSTEM_AGENTS.iter().any(|d| d.name == "network" || d.name == "http"));
     }
 
     #[test_case]

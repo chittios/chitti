@@ -189,12 +189,15 @@ real UEFI hardware.
   caps}`, `start`/`stop`/`task_for`/`supervise_tick` (pumped from
   `shell::upkeep`, bounded restarts). Their protocol/codec logic is native,
   deterministic code **below** the determinism boundary — the LLM never
-  implements a protocol. The built-in **system agents** live as markdown +
-  a JSON manifest under the repo's [`agents/`](agents/) folder (`network`, `http`,
-  `doc`, `ssh`), are compiled into the image via `include_str!`, and are signed
-  then installed into `/agent/<id>/` at boot by `agent::system::install_all` (same
-  permissioned flow as any package, pre-trusted; a content agent's assets land in
-  `/agent/<id>/assets/`). The web is a **generic pipeline** (`service/pipeline.rs`)
+  implements a protocol. Only agents that actually reason from a SOUL are
+  **installed agents**: the built-in ones are `doc` and `ssh`, each a markdown
+  SOUL plus a JSON manifest under the repo's [`agents/`](agents/) folder, compiled into
+  the image via `include_str!`, signed and installed into `/agent/<id>/` at boot
+  by `agent::system::install_all` (same permissioned flow as any package,
+  pre-trusted; a content agent's assets land in `/agent/<id>/assets/`).
+  `network`/`http` are **not agents** — pure mechanical plumbing (relay bytes,
+  parse a protocol; no judgment, no SOUL), living entirely in `crate::service`.
+  The web is a **generic pipeline** (`service/pipeline.rs`)
   of single-responsibility stages connected by datagram channels — **all reusable
   infrastructure, none app-specific**: `network` (`service/network.rs`) owns the
   socket and relays raw bytes; `http` (`service/http.rs`) parses the request +
