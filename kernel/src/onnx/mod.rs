@@ -341,9 +341,13 @@ mod tests {
     use super::*;
 
     /// The real silero-vad v5 model (630 KB), embedded so the parser is proven
-    /// against production ONNX, not a toy fixture.
+    /// against production ONNX, not a toy fixture. Compiled only when the
+    /// (gitignored) asset is present at build time — see the `voice_vad_embedded`
+    /// cfg in `build.rs`; absent (CI / fresh clone) this test is skipped.
+    #[cfg(voice_vad_embedded)]
     static SILERO: &[u8] = include_bytes!("../../../assets/voice/silero_vad.onnx");
 
+    #[cfg(voice_vad_embedded)]
     #[test_case]
     fn parses_silero_vad_graph() {
         let m = parse(SILERO).expect("silero_vad.onnx must parse");

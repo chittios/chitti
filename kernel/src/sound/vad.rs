@@ -9,7 +9,14 @@ use crate::onnx::{self, exec};
 use alloc::vec;
 use alloc::vec::Vec;
 
+// The silero model is embedded only when present at build time (gitignored;
+// fetched by `cargo xtask voice-assets`). Absent → an empty slice and `ensure`
+// reports VAD unavailable, so the kernel still builds without the voice assets
+// (CI, a fresh clone). See `build.rs` for the `voice_vad_embedded` cfg.
+#[cfg(voice_vad_embedded)]
 static MODEL_BYTES: &[u8] = include_bytes!("../../../assets/voice/silero_vad.onnx");
+#[cfg(not(voice_vad_embedded))]
+static MODEL_BYTES: &[u8] = &[];
 
 struct Vad {
     model: onnx::Model<'static>,
@@ -28,6 +35,10 @@ fn ensure() -> bool {
     VAD.with(|v| {
         if v.is_some() {
             return true;
+        }
+        if MODEL_BYTES.is_empty() {
+            crate::ktrace::log("vad", "silero not bundled (build without assets/voice/) — VAD unavailable");
+            return false;
         }
         match onnx::parse(MODEL_BYTES) {
             Some(model) => {
