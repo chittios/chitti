@@ -68,6 +68,10 @@ pub const CHANNEL_CREATE: PrimitiveId = 10;
 pub const CHANNEL_WRITE: PrimitiveId = 11;
 pub const CHANNEL_READ: PrimitiveId = 12;
 pub const CHANNEL_CLOSE: PrimitiveId = 13;
+// Hand (a copy of) a channel end to another agent (Phase 2). Destructive: it
+// moves authority to another principal, so injected content can't silently
+// exfiltrate a stream to an attacker-controlled agent without a human confirm.
+pub const CHANNEL_GRANT: PrimitiveId = 14;
 
 const STR: ArgType = ArgType::Str;
 const UINT: ArgType = ArgType::Uint;
@@ -173,6 +177,13 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
         description: "Close the caller's channel end named by cap slot `chan`.",
         destructive: false,
     },
+    PrimitiveSpec {
+        id: CHANNEL_GRANT,
+        name: "channel_grant",
+        params: &[Param { key: "chan", ty: UINT }, Param { key: "to_agent", ty: STR }],
+        description: "Hand the channel end at cap slot `chan` to another agent (by service name or task id). Destructive: moves authority to another principal.",
+        destructive: true,
+    },
 ];
 
 /// Look up a primitive by its wire name. `None` for any name not in the
@@ -218,10 +229,12 @@ mod tests {
     }
 
     #[test_case]
-    fn only_mem_fs_delete_is_destructive() {
-        // Exactly one destructive primitive today; the taint gate keys off
-        // this flag, so guard against a careless future addition.
+    fn destructive_primitives_are_exactly_the_known_set() {
+        // The taint gate keys off this flag, so guard against a careless future
+        // addition: any new destructive primitive must be a deliberate edit here.
+        // `mem_fs_delete` (irreversible), `channel_grant` (moves authority to
+        // another principal — an exfiltration vector under prompt injection).
         let destructive: alloc::vec::Vec<_> = REGISTRY.iter().filter(|p| p.destructive).map(|p| p.name).collect();
-        assert_eq!(destructive, alloc::vec!["mem_fs_delete"]);
+        assert_eq!(destructive, alloc::vec!["mem_fs_delete", "channel_grant"]);
     }
 }

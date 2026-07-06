@@ -22,7 +22,14 @@ use serde::{Deserialize, Serialize};
 pub struct SkillPackage {
     pub manifest: SkillManifest,
     pub body: String,
+    /// The agent's SOUL.md persona text (a SkillAgent package). Placed into
+    /// `/agent/<id>/SOUL.md` on install so it seeds the agent's system prompt.
+    pub soul: Option<String>,
+    /// `(doc name, markdown)` — matched to `manifest.skill_docs` by name; placed
+    /// into `/agent/<id>/skills/<name>`.
+    pub skill_docs: Vec<(String, String)>,
     /// `(asset name, bytes)` — matched to `manifest.assets` by name on placement.
+    /// ONNX models for an ML agent live here (demand-paged as L2 assets).
     pub assets: Vec<(String, Vec<u8>)>,
 }
 
@@ -50,11 +57,40 @@ impl SkillPackage {
         };
         let mut out = postcard::to_allocvec(&m).unwrap_or_default();
         out.extend_from_slice(self.body.as_bytes());
+        // Cover the soul + skill docs so a tampered persona/procedure invalidates
+        // the signature just like a tampered body or requested-cap would.
+        if let Some(soul) = &self.soul {
+            out.extend_from_slice(soul.as_bytes());
+        }
+        for (name, md) in &self.skill_docs {
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(md.as_bytes());
+        }
         for (name, bytes) in &self.assets {
             out.extend_from_slice(name.as_bytes());
             out.extend_from_slice(bytes);
         }
         out
+    }
+
+    /// Place the agent-home artifacts a SkillAgent package carries: its SOUL.md
+    /// persona and any markdown procedure docs, under `/agent/<id>/`. Called by
+    /// [`crate::skills::install`] when `manifest.agent` is present, *before* the
+    /// agent's home is first `ensure`d, so a packaged soul is never clobbered by
+    /// the default persona.
+    pub fn place_agent_home(&self, agent_id: AgentId) {
+        let home = crate::agent::home::path(agent_id.0);
+        if let Some(soul) = &self.soul {
+            crate::synapse::fs::write(&alloc::format!("{home}/SOUL.md"), soul.as_bytes());
+        }
+        for (name, md) in &self.skill_docs {
+            crate::synapse::fs::write(&alloc::format!("{home}/skills/{name}"), md.as_bytes());
+        }
+        // Seed the memory area so the agent's fs tools have a place to write.
+        let keep = alloc::format!("{home}/memory/.keep");
+        if !crate::synapse::fs::exists(&keep) {
+            crate::synapse::fs::write(&keep, b"");
+        }
     }
 
     /// Sign the package with the registry key (fills `signature`). Used to
@@ -167,11 +203,15 @@ pub fn sample_note_summarizer(id: SkillId) -> SkillPackage {
         }],
         assets: vec![Asset { name: "style-guide".to_string(), store_ref: asset_ref, bytes: 48 }],
         agent: None,
+        soul_ref: None,
+        skill_docs: Vec::new(),
         signature: SignatureBlock { algo: SigAlgo::Ed25519, key_id: "chitti-registry-key-1".to_string(), content_hash: [0u8; 32], sig: Vec::new() },
     };
     SkillPackage {
         manifest,
         body,
+        soul: None,
+        skill_docs: Vec::new(),
         assets: vec![("style-guide".to_string(), b"Style: terse, factual, no fluff.".to_vec())],
     }
 }
@@ -206,6 +246,7 @@ pub fn sample_report_agent(skill_id: SkillId, agent_id: AgentId) -> SkillPackage
         summary: SummaryPolicy { max_tokens: 256, style: SummaryStyle::Terse },
         origin: Origin::Installed { skill: skill_id },
     };
+    let soul_ref = StoreKey(alloc::format!("/agent/{}/SOUL.md", agent_id.0));
     let manifest = SkillManifest {
         schema_version: 1,
         id: skill_id,
@@ -218,7 +259,15 @@ pub fn sample_report_agent(skill_id: SkillId, agent_id: AgentId) -> SkillPackage
         bundled_tools: Vec::new(),
         assets: Vec::new(),
         agent: Some(agent),
+        soul_ref: Some(soul_ref),
+        skill_docs: Vec::new(),
         signature: SignatureBlock { algo: SigAlgo::Ed25519, key_id: crate::skills::crypto::REGISTRY_KEY_ID.to_string(), content_hash: [0u8; 32], sig: Vec::new() },
     };
-    SkillPackage { manifest, body: "Write a clear, factual report from the given facts.".to_string(), assets: Vec::new() }
+    SkillPackage {
+        manifest,
+        body: "Write a clear, factual report from the given facts.".to_string(),
+        soul: Some("You are the report-writer agent. You turn facts into concise, factual reports and never invent data.".to_string()),
+        skill_docs: Vec::new(),
+        assets: Vec::new(),
+    }
 }

@@ -2360,7 +2360,108 @@ fn run_agents(arg: &str, chat: &mut Option<ChatSession>) {
             },
             Err(_) => serial_println!("usage: /agents kill <id>"),
         },
-        other => serial_println!("agents> unknown '{}' — usage: /agents [list|switch <id>|kill <id>]", other),
+        "services" => {
+            let svcs = crate::service::list();
+            if svcs.is_empty() {
+                serial_println!("agents> no service agents running");
+            } else {
+                serial_println!("agents> service           task   state");
+                for (name, task, alive) in svcs {
+                    serial_println!("agents> {:<17} {:<6} {}", name, task, if alive { "running" } else { "dead" });
+                }
+            }
+        }
+        "install" => run_agent_install(sarg, chat),
+        "uninstall" => run_agent_uninstall(sarg),
+        other => serial_println!(
+            "agents> unknown '{}' — usage: /agents [list|switch <id>|kill <id>|services|install <name> [--yes]|uninstall <name>]",
+            other
+        ),
+    }
+}
+
+/// The available installable agent packages (Phase 2 ships built-in signed
+/// samples; the public registry lands in a later phase). Returns a freshly-minted,
+/// signed package for `name`, or `None`.
+fn built_in_package(name: &str) -> Option<crate::skills::package::SkillPackage> {
+    use crate::agent::types::{next_agent_id, next_skill_id};
+    let mut pkg = match name {
+        "report-writer" => crate::skills::package::sample_report_agent(next_skill_id(), next_agent_id()),
+        "note-summarizer" => crate::skills::package::sample_note_summarizer(next_skill_id()),
+        _ => return None,
+    };
+    pkg.sign(); // sign with the registry key so verify() passes
+    Some(pkg)
+}
+
+/// `/agents install <name> [--yes]` — the consent install flow: fetch the
+/// package, verify its signature, ask the human per requested capability
+/// (`modal::confirm`), then install granting only the approved subset. `--yes`
+/// approves every requested capability without prompting (scripting/e2e).
+fn run_agent_install(arg: &str, chat: &mut Option<ChatSession>) {
+    let (name, auto_yes) = match arg.split_once(' ') {
+        Some((n, rest)) => (n.trim(), rest.contains("--yes")),
+        None => (arg.trim(), false),
+    };
+    if name.is_empty() {
+        serial_println!("usage: /agents install <name> [--yes]   (available: report-writer, note-summarizer)");
+        return;
+    }
+    let pkg = match built_in_package(name) {
+        Some(p) => p,
+        None => {
+            serial_println!("install> no such package '{}' (available: report-writer, note-summarizer)", name);
+            return;
+        }
+    };
+    if !pkg.verify() {
+        serial_println!("install> refused: package signature/hash did not verify");
+        return;
+    }
+    let reqs = pkg.manifest.requested_capabilities.clone();
+    let lines = crate::skills::install::consent_prompt(&pkg);
+    serial_println!("install> '{}' requests {} capabilit(ies):", pkg.manifest.name, reqs.len());
+    let mut approved = alloc::vec::Vec::new();
+    for (line, cap) in lines.iter().zip(reqs.iter()) {
+        let ok = if auto_yes {
+            serial_println!("install>   [--yes] grant: {}", line);
+            true
+        } else {
+            let msg = alloc::format!("Grant to '{}':\n{}", pkg.manifest.name, line);
+            crate::modal::confirm("Install agent — permission", &msg)
+        };
+        if ok {
+            approved.push(cap.clone());
+        } else {
+            serial_println!("install>   denied: {}", line);
+        }
+    }
+    let source = crate::agent::types::InstallSource::BootModule { name: name.into() };
+    match crate::skills::install::install(&pkg, &approved, "user", source, crate::arch::now_ms()) {
+        Ok(rec) => {
+            serial_println!(
+                "install> '{}' installed; granted {}/{} requested caps",
+                pkg.manifest.name,
+                rec.granted_capabilities.len(),
+                reqs.len()
+            );
+            // A freshly installed agent may have a new home/persona; drop the
+            // cached chat so the next turn can pick it up if switched to.
+            let _ = chat;
+        }
+        Err(e) => serial_println!("install> failed: {:?}", e),
+    }
+}
+
+fn run_agent_uninstall(arg: &str) {
+    let name = arg.trim();
+    // Map the installed skill by name via its L0 index entry.
+    match crate::skills::index::by_name(name) {
+        Some(meta) => {
+            crate::skills::install::uninstall(meta.id);
+            serial_println!("uninstall> '{}' removed (capabilities revoked)", name);
+        }
+        None => serial_println!("uninstall> '{}' is not installed", name),
     }
 }
 
@@ -2949,6 +3050,7 @@ fn refresh_top() {
 pub fn upkeep() {
     ui_tick();
     crate::net::poll();
+    crate::service::supervise_tick();
 }
 
 /// Lighter upkeep for loops that consume their own mouse events (modals, the

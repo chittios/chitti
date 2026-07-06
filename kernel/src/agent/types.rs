@@ -260,6 +260,10 @@ pub enum AgentKind {
     Orchestrator,
     Subagent,
     SkillAgent,
+    /// A long-running daemon (Network/SSH/HTTP/Doc/…): runs as a real scheduled
+    /// task with a native `serve()` loop, not a request/response reasoning agent.
+    /// Started/supervised by `crate::service`.
+    Service,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -494,7 +498,22 @@ pub struct SkillManifest {
     pub bundled_tools: Vec<BundledTool>,
     pub assets: Vec<Asset>,             // L2 — demand-paged on use
     pub agent: Option<AgentManifest>,   // present iff kind == SkillAgent
+    /// The agent's SOUL.md (persona) text ref — `Some` for a SkillAgent whose
+    /// package ships a soul. Placed into `/agent/<id>/SOUL.md` on install.
+    pub soul_ref: Option<StoreKey>,
+    /// Extra markdown procedure docs placed into `/agent/<id>/skills/*.md`.
+    pub skill_docs: Vec<SkillDoc>,
     pub signature: SignatureBlock,
+}
+
+/// One markdown procedure doc shipped in an agent package — the "programming in
+/// markdown" surface beyond the single L1 body. Placed into the agent's home
+/// `skills/` dir; `trigger` is an optional match hint (None = always available).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SkillDoc {
+    pub name: String,
+    pub store_ref: StoreKey,
+    pub trigger: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]

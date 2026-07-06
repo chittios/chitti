@@ -205,6 +205,7 @@ pub fn primitives_for(caps: &[CapabilityRequest]) -> Vec<PrimitiveId> {
                 // grant resolved by the executor, so this stays broad on purpose.
                 prims.push(registry::CHANNEL_CREATE);
                 prims.push(registry::CHANNEL_CLOSE);
+                prims.push(registry::CHANNEL_GRANT);
                 if c.rights.contains(Rights::WRITE) {
                     prims.push(registry::CHANNEL_WRITE);
                 }

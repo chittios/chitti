@@ -23,6 +23,7 @@ use super::{audit, fs};
 use crate::cap::{self, Cap, ChannelId, Right};
 use crate::channel;
 use crate::sched::{self, TaskId};
+use crate::service;
 use crate::security::Justification;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -126,6 +127,19 @@ fn resolve_channel_end(caller: TaskId, args: &[ArgValue], i: usize) -> Option<(C
         Some(Right::ChannelRead(c)) => Some((c, false)),
         _ => None,
     }
+}
+
+/// Resolve a `channel_grant` target agent: either a numeric task id, or a
+/// running service name. Returns the target task id, or `None` if it names no
+/// live task/service.
+fn resolve_agent_target(name: &str) -> Option<TaskId> {
+    if let Ok(id) = name.parse::<TaskId>() {
+        if sched::is_alive(id) {
+            return Some(id);
+        }
+        return None;
+    }
+    service::task_for(name)
 }
 
 /// Dispatch a validated call to its native implementation. Each arm sees
@@ -285,6 +299,30 @@ fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> Str
                     "error:denied_channel_handle".to_string()
                 }
             }
+        }
+        registry::CHANNEL_GRANT => {
+            // Move-authority op: the caller may only grant an end it actually
+            // holds (attenuation), to a target it can name. Destructive, so the
+            // taint gate already refused it if the justification is untrusted.
+            let (chan, is_write) = match resolve_channel_end(caller, args, 0) {
+                Some(x) => x,
+                None => {
+                    cap::record_denial(caller, "channel_grant (handle)");
+                    return "error:denied_channel_handle".to_string();
+                }
+            };
+            let target_name = arg_str(args, 1);
+            let target = match resolve_agent_target(target_name) {
+                Some(t) => t,
+                None => return format!("error:no_such_agent:{target_name}"),
+            };
+            // Register an extra live end for the new holder, then grant it the
+            // same direction the caller holds.
+            channel::dup_end(chan);
+            let right = if is_write { Right::ChannelWrite(chan) } else { Right::ChannelRead(chan) };
+            let slot = cap::grant(target, right).0;
+            let dir = if is_write { "write" } else { "read" };
+            format!("ok:granted {dir} end to task {target} (slot {slot})")
         }
         other => format!("error:unimplemented primitive id {other}"),
     }
