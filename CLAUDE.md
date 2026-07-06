@@ -169,9 +169,12 @@ real UEFI hardware.
   `NetDevice` facade — **virtio-net** over virtio-mmio (aarch64 QEMU) and over
   PCI, plus **e1000** (VirtualBox default + real Intel) — discovered the same way
   on both arches. Shell surface: `/network` (info/dhcp/static/dns), `/ping`,
-  `/wifi` (scan/connect via the password modal), `/http get|post` (a minimal
-  HTTP/1.1 client in `net/http.rs`, `http://` **and** `https://` — TLS 1.3 via
-  `net/tls.rs`/embedded-tls; also the agent's `http` tool). `/model remote <http://host:port> [name]` points the
+  `/wifi` (scan/connect via the password modal), `/http` (a curl-like
+  HTTP/1.1 client in `net/http.rs` — `-X`/`-H`/`-d`/`-v`/`--stream`, all
+  methods, live chunked/SSE streaming; `http://` **and** `https://` via
+  `net/tls.rs`/embedded-tls; also the agent's `http` tool), `/ws` (a
+  plaintext WebSocket client in `net/ws.rs` — RFC 6455 handshake with
+  Sec-WebSocket-Accept verification, masked frames, ping/pong). `/model remote <http://host:port> [name]` points the
   shell agent at a **hosted** OpenAI-compatible model (llama.cpp server /
   Ollama / vLLM), over http or https, via `shell/remote.rs` — same system prompt, tool calls, and
   approval gates; only generation moves off-box (config persisted at

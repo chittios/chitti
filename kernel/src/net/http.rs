@@ -19,9 +19,10 @@ use alloc::vec::Vec;
 use smoltcp::socket::tcp;
 use smoltcp::wire::{IpAddress, Ipv4Address};
 
-/// A parsed HTTP response: status code + (de-chunked) body bytes.
+/// A parsed HTTP response: status code, headers, and (de-chunked) body bytes.
 pub struct Response {
     pub status: u16,
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
@@ -58,7 +59,7 @@ fn parse_url(url: &str) -> Result<(bool, String, u16, String), String> {
 }
 
 /// `host` as an IPv4 literal, or resolved via DNS.
-fn host_ip(host: &str) -> Result<Ipv4Address, String> {
+pub(crate) fn host_ip(host: &str) -> Result<Ipv4Address, String> {
     let mut parts = [0u8; 4];
     let mut n = 0;
     for (i, seg) in host.split('.').enumerate() {
@@ -83,20 +84,82 @@ fn host_ip(host: &str) -> Result<Ipv4Address, String> {
     resolve(host, 5_000).map_err(|e| format!("DNS {host}: {e}"))
 }
 
-/// Issue one HTTP request and collect the full response. `timeout_ms` bounds
-/// the whole exchange (a hosted LLM can legitimately take a minute to answer,
-/// so callers pass a generous budget).
-pub fn request(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8], timeout_ms: u64) -> Result<Response, String> {
+/// Response head: status + all headers (curl `-v` prints these; the hosted-
+/// model path reads `content-length`/`transfer-encoding`).
+pub struct Head {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+}
+
+impl Head {
+    /// Case-insensitive header lookup.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str())
+    }
+}
+
+/// A live HTTP connection — plaintext over the smoltcp socket, or TLS over it.
+/// Both expose the same blocking `read`/`write_all` so the request driver is
+/// scheme-agnostic.
+enum Conn {
+    Plain(super::tls::TcpStream),
+    Secure(super::tls::TlsSession),
+}
+
+impl Conn {
+    fn write_all(&mut self, d: &[u8]) -> Result<(), String> {
+        match self {
+            Conn::Plain(s) => {
+                use embedded_io::Write;
+                s.write_all(d).map_err(|_| "send failed".to_string())
+            }
+            Conn::Secure(t) => t.write_all(d),
+        }
+    }
+    /// Read up to `buf.len()` bytes; `0` = EOF / closed / timed out.
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+        match self {
+            Conn::Plain(s) => {
+                use embedded_io::Read;
+                s.read(buf).unwrap_or(0)
+            }
+            Conn::Secure(t) => t.read(buf),
+        }
+    }
+}
+
+/// Issue one HTTP request and **stream** the decoded body: `on_body` is called
+/// with each newly-arrived (de-chunked) body slice as it lands, so a caller can
+/// print an SSE / chunked response live. The response head is returned once the
+/// headers are in. `timeout_ms` bounds the whole exchange. This is the engine
+/// under [`request`] (which just buffers) and the `/http --stream` path.
+pub fn perform(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    timeout_ms: u64,
+    on_head: &mut dyn FnMut(&Head),
+    on_body: &mut dyn FnMut(&[u8]),
+) -> Result<Head, String> {
     let (tls, host, port, path) = parse_url(url)?;
     let ip = host_ip(&host)?;
     let deadline = crate::arch::now_ms() + timeout_ms;
 
-    // Build the request bytes up front (Connection: close = read-to-EOF).
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: */*\r\n");
+    // Build the request bytes. `Connection: close` so the body ends at EOF when
+    // no length/chunking is given; callers may override any header.
+    let has = |name: &str| headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+    if !has("connection") {
+        req.push_str("Connection: close\r\n");
+    }
+    if !has("accept") {
+        req.push_str("Accept: */*\r\n");
+    }
     for (k, v) in headers {
         req.push_str(&format!("{k}: {v}\r\n"));
     }
-    if !body.is_empty() {
+    if !body.is_empty() && !has("content-length") {
         req.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     req.push_str("\r\n");
@@ -104,23 +167,85 @@ pub fn request(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8], t
     wire.extend_from_slice(body);
 
     let handle = tcp_connect(ip, port, deadline)?;
-    // Drive the exchange to completion; always remove the socket on exit.
-    let result = if tls {
-        exchange_tls(handle, &host, &wire, deadline)
+    let mut conn = if tls {
+        Conn::Secure(super::tls::handshake(super::tls::TcpStream { handle, deadline }, &host)?)
     } else {
-        drive(handle, &wire, deadline)
+        Conn::Plain(super::tls::TcpStream { handle, deadline })
     };
+
+    let result = drive_stream(&mut conn, &wire, deadline, on_head, on_body);
     NET.with(|n| {
         if let Some(s) = n.as_mut() {
             s.sockets.remove(handle);
         }
     });
-    parse_response(&result?)
+    result
+}
+
+/// Send `wire`, then read the response, parsing the head once and emitting the
+/// decoded body incrementally via `on_body`. Shared by plaintext + TLS.
+fn drive_stream(conn: &mut Conn, wire: &[u8], deadline: u64, on_head: &mut dyn FnMut(&Head), on_body: &mut dyn FnMut(&[u8])) -> Result<Head, String> {
+    conn.write_all(wire)?;
+    let mut raw: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut head: Option<Head> = None;
+    let mut body_at = 0usize; // index in `raw` where the body starts
+    let mut chunked = false;
+    let mut clen: Option<usize> = None;
+    let mut emitted = 0usize; // decoded body bytes already handed to on_body
+    loop {
+        if crate::arch::now_ms() >= deadline {
+            return Err("HTTP timeout".into());
+        }
+        let k = conn.read(&mut buf);
+        if k == 0 {
+            break; // EOF / close
+        }
+        raw.extend_from_slice(&buf[..k]);
+        if head.is_none() {
+            if let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                let h = parse_head(&raw[..split])?;
+                chunked = h.get("transfer-encoding").map(|v| v.to_ascii_lowercase().contains("chunked")).unwrap_or(false);
+                clen = h.get("content-length").and_then(|v| v.trim().parse().ok());
+                body_at = split + 4;
+                on_head(&h);
+                head = Some(h);
+            }
+        }
+        if head.is_some() {
+            let region = &raw[body_at..];
+            let decoded = if chunked {
+                dechunk_partial(region)
+            } else {
+                let n = clen.unwrap_or(region.len()).min(region.len());
+                region[..n].to_vec()
+            };
+            if decoded.len() > emitted {
+                on_body(&decoded[emitted..]);
+                emitted = decoded.len();
+            }
+            if response_complete(&raw) {
+                break;
+            }
+        }
+        // Keep the UI + net stack alive during a long/streamed response.
+        crate::shell::upkeep();
+        crate::sched::yield_now();
+    }
+    head.ok_or_else(|| "no response head (connection closed early)".to_string())
+}
+
+/// Issue one HTTP request and collect the full response (buffered). The
+/// convenience path for callers that want the whole body at once.
+pub fn request(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8], timeout_ms: u64) -> Result<Response, String> {
+    let mut body_buf: Vec<u8> = Vec::new();
+    let head = perform(method, url, headers, body, timeout_ms, &mut |_| {}, &mut |chunk| body_buf.extend_from_slice(chunk))?;
+    Ok(Response { status: head.status, headers: head.headers, body: body_buf })
 }
 
 /// Open a TCP socket to `ip:port` and wait for the connection to establish
 /// (bounded by `deadline`). Returns the socket handle (caller removes it).
-fn tcp_connect(ip: Ipv4Address, port: u16, deadline: u64) -> Result<smoltcp::iface::SocketHandle, String> {
+pub(crate) fn tcp_connect(ip: Ipv4Address, port: u16, deadline: u64) -> Result<smoltcp::iface::SocketHandle, String> {
     // 64 KiB rx keeps the window open for a large completion; 16 KiB tx.
     let handle = NET.with(|n| {
         let s = n.as_mut().ok_or("no network interface (try /network dhcp)")?;
@@ -163,29 +288,6 @@ fn tcp_connect(ip: Ipv4Address, port: u16, deadline: u64) -> Result<smoltcp::ifa
     }
 }
 
-/// TLS path: handshake over the connected socket, send `wire`, read the
-/// response to completion (Content-Length / chunked / close).
-fn exchange_tls(handle: smoltcp::iface::SocketHandle, host: &str, wire: &[u8], deadline: u64) -> Result<Vec<u8>, String> {
-    let stream = super::tls::TcpStream { handle, deadline };
-    let mut sess = super::tls::handshake(stream, host)?;
-    sess.write_all(wire)?;
-    let mut raw: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        if crate::arch::now_ms() >= deadline {
-            return Err("HTTPS timeout".into());
-        }
-        let k = sess.read(&mut buf);
-        if k == 0 {
-            return Ok(raw); // TLS close / EOF
-        }
-        raw.extend_from_slice(&buf[..k]);
-        if response_complete(&raw) {
-            return Ok(raw);
-        }
-    }
-}
-
 /// True once `raw` holds a complete HTTP response: header terminator present
 /// and either the full Content-Length body, the chunked terminator, or (no
 /// length given) we defer to EOF by returning false.
@@ -214,109 +316,62 @@ fn response_complete(raw: &[u8]) -> bool {
     false
 }
 
-/// Poll the stack until `wire` is sent and the peer's response is fully read
-/// (connection closed). Returns the raw response bytes (status line + headers
-/// + body).
-fn drive(handle: smoltcp::iface::SocketHandle, wire: &[u8], deadline: u64) -> Result<Vec<u8>, String> {
-    let mut sent = 0usize;
-    let mut raw: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        if crate::arch::now_ms() >= deadline {
-            NET.with(|n| {
-                if let Some(s) = n.as_mut() {
-                    s.sockets.get_mut::<tcp::Socket>(handle).abort();
-                }
-            });
-            return Err("HTTP timeout".into());
-        }
-        super::poll();
-        let done = NET.with(|n| {
-            let s = n.as_mut().ok_or("network went down")?;
-            let sock = s.sockets.get_mut::<tcp::Socket>(handle);
-            if sent < wire.len() && sock.may_send() {
-                if let Ok(k) = sock.send_slice(&wire[sent..]) {
-                    sent += k;
-                }
-            }
-            while sock.may_recv() {
-                match sock.recv_slice(&mut buf) {
-                    Ok(0) => break,
-                    Ok(k) => raw.extend_from_slice(&buf[..k]),
-                    Err(_) => break,
-                }
-            }
-            // Done when the peer has closed and nothing is left to read.
-            let closed = matches!(sock.state(), tcp::State::Closed | tcp::State::CloseWait | tcp::State::TimeWait)
-                && !sock.may_recv();
-            if closed && sent < wire.len() {
-                return Err("connection closed before the request was sent");
-            }
-            Ok(closed)
-        })
-        .map_err(|e: &str| e.to_string())?;
-        if done {
-            // smoltcp keeps buffered rx readable in CloseWait; one last drain
-            // happened above, so the response is complete.
-            return Ok(raw);
-        }
-        // Keep the UI + rest of the net stack alive while we wait (a hosted
-        // model can take a minute to generate) — the standing upkeep rule.
-        crate::shell::upkeep();
-        crate::sched::yield_now();
-    }
-}
-
-/// Parse the status line, find the header/body split, and de-chunk if needed.
-fn parse_response(raw: &[u8]) -> Result<Response, String> {
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or("malformed HTTP response (no header terminator)")?;
-    let head = core::str::from_utf8(&raw[..split]).map_err(|_| "non-UTF8 headers")?;
+/// Parse the response head (status line + headers) from the bytes before the
+/// `\r\n\r\n` terminator.
+fn parse_head(head_bytes: &[u8]) -> Result<Head, String> {
+    let head = core::str::from_utf8(head_bytes).map_err(|_| "non-UTF8 headers")?;
     let mut lines = head.split("\r\n");
     let status_line = lines.next().unwrap_or("");
     let status: u16 = status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).ok_or("bad status line")?;
-    let mut chunked = false;
-    let mut content_length: Option<usize> = None;
+    let mut headers = Vec::new();
     for l in lines {
-        let Some((k, v)) = l.split_once(':') else { continue };
-        let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
-        if k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked") {
-            chunked = true;
-        }
-        if k == "content-length" {
-            content_length = v.parse().ok();
+        if let Some((k, v)) = l.split_once(':') {
+            headers.push((k.trim().to_string(), v.trim().to_string()));
         }
     }
-    let body_raw = &raw[split + 4..];
-    let body = if chunked {
-        dechunk(body_raw)?
-    } else {
-        let n = content_length.unwrap_or(body_raw.len()).min(body_raw.len());
-        body_raw[..n].to_vec()
-    };
-    Ok(Response { status, body })
+    Ok(Head { status, headers })
 }
 
-/// Decode a `Transfer-Encoding: chunked` body.
-fn dechunk(mut b: &[u8]) -> Result<Vec<u8>, String> {
+/// Parse a full raw response (head + body) into a [`Response`], de-chunking
+/// the body if needed. (Used by tests and any full-buffer caller.)
+fn parse_response(raw: &[u8]) -> Result<Response, String> {
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or("malformed HTTP response (no header terminator)")?;
+    let head = parse_head(&raw[..split])?;
+    let chunked = head.get("transfer-encoding").map(|v| v.to_ascii_lowercase().contains("chunked")).unwrap_or(false);
+    let clen: Option<usize> = head.get("content-length").and_then(|v| v.trim().parse().ok());
+    let body_raw = &raw[split + 4..];
+    let body = if chunked {
+        dechunk_partial(body_raw)
+    } else {
+        let n = clen.unwrap_or(body_raw.len()).min(body_raw.len());
+        body_raw[..n].to_vec()
+    };
+    Ok(Response { status: head.status, headers: head.headers, body })
+}
+
+/// Decode as much of a `Transfer-Encoding: chunked` body as is complete,
+/// stopping at the first incomplete chunk (so it works incrementally while a
+/// chunked/SSE response is still arriving). Never errors — a partial chunk
+/// header or a short chunk just means "nothing more decodable yet".
+fn dechunk_partial(mut b: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
-        let nl = b.windows(2).position(|w| w == b"\r\n").ok_or("bad chunk header")?;
-        let size_str = core::str::from_utf8(&b[..nl]).map_err(|_| "bad chunk size")?;
-        let size = usize::from_str_radix(size_str.trim().split(';').next().unwrap_or("0"), 16).map_err(|_| "bad chunk size")?;
-        b = &b[nl + 2..];
+        let Some(nl) = b.windows(2).position(|w| w == b"\r\n") else { return out };
+        let Ok(size_str) = core::str::from_utf8(&b[..nl]) else { return out };
+        let Ok(size) = usize::from_str_radix(size_str.trim().split(';').next().unwrap_or("0"), 16) else { return out };
+        let rest = &b[nl + 2..];
         if size == 0 {
-            return Ok(out);
+            return out; // terminating chunk
         }
-        if b.len() < size {
-            return Err("truncated chunk".into());
+        if rest.len() < size {
+            return out; // chunk body not fully arrived yet
         }
-        out.extend_from_slice(&b[..size]);
-        b = &b[size..];
+        out.extend_from_slice(&rest[..size]);
+        b = &rest[size..];
         if b.len() >= 2 {
             b = &b[2..]; // trailing CRLF
+        } else {
+            return out;
         }
     }
 }
@@ -410,5 +465,24 @@ mod tests {
     #[test_case]
     fn parse_response_rejects_headerless() {
         assert!(parse_response(b"garbage with no terminator").is_err());
+    }
+
+    #[test_case]
+    fn dechunk_partial_incremental() {
+        // Complete chunks decode; a trailing incomplete chunk yields only the
+        // complete prefix (this is what lets a streamed response render live).
+        assert_eq!(dechunk_partial(b"5\r\nhello\r\n0\r\n\r\n"), b"hello");
+        assert_eq!(dechunk_partial(b"5\r\nhello\r\n6\r\n wor"), b"hello"); // 2nd chunk short
+        assert_eq!(dechunk_partial(b"3\r\n"), b""); // header only, no body yet
+        assert_eq!(dechunk_partial(b""), b"");
+    }
+
+    #[test_case]
+    fn parse_head_headers_captured() {
+        let h = parse_head(b"HTTP/1.1 204 No Content\r\nX-Foo: bar\r\nContent-Length: 0").unwrap();
+        assert_eq!(h.status, 204);
+        assert_eq!(h.get("x-foo"), Some("bar")); // case-insensitive lookup
+        assert_eq!(h.get("content-length"), Some("0"));
+        assert_eq!(h.get("missing"), None);
     }
 }

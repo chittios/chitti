@@ -47,6 +47,7 @@ const MTU: usize = 1514;
 /// `transmit` fills a scratch buffer the closure writes, then hands it to the NIC.
 pub mod http;
 pub mod tls;
+pub mod ws;
 
 pub struct ChittiPhy {
     dev: Box<dyn NetDevice>,
