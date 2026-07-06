@@ -2,13 +2,12 @@
   "name": "http",
   "version": "1.0.0",
   "kind": "service",
-  "description": "Parses HTTP/1.1 natively and serves documents; the Doc agent renders through it.",
-  "toolset": ["net_accept", "channel_read", "channel_write"],
+  "description": "Parses HTTP/1.1 requests from the Network agent, forwards them to a content agent, and formats the response.",
+  "toolset": ["channel_read", "channel_write"],
   "capabilities": [
-    { "domain": "net", "rights": ["exec", "read"], "scope": "any" },
     { "domain": "channel", "rights": ["read", "write"], "scope": "any" }
   ],
-  "service": "http-doc",
+  "service": "http",
   "autostart": false,
-  "default_port": 8080
+  "default_port": 0
 }

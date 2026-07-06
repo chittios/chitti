@@ -2449,24 +2449,35 @@ fn built_in_package(name: &str) -> Option<crate::skills::package::SkillPackage> 
     Some(pkg)
 }
 
-/// `/agents start <name> [port]` — launch a system agent's native service loop
-/// (network / http / ssh). Uses the agent's manifest default port if none given.
+/// `/agents start <name> [port]` — launch a system agent. `network`/`http`/`doc`
+/// bring up the web pipeline (Network→HTTP→Doc serving the docs site); `ssh`
+/// starts the SSH transport service. Uses port 8080 (web) / 2222 (ssh) if none
+/// is given.
 fn run_agent_start(arg: &str) {
     let (name, port_str) = match arg.split_once(' ') {
         Some((n, p)) => (n.trim(), p.trim()),
         None => (arg.trim(), ""),
     };
-    let Some((spec, set_port)) = crate::agent::system::service_for(name) else {
-        serial_println!("agents> unknown system agent '{}' (network|http|ssh)", name);
-        return;
-    };
-    if let Ok(port) = port_str.parse::<u16>() {
-        if port != 0 {
-            set_port(port);
+    let port = port_str.parse::<u16>().ok().filter(|p| *p != 0);
+    match name {
+        "network" | "http" | "doc" | "web" => {
+            let port = port.unwrap_or(8080);
+            let home = crate::agent::system::home_for("doc").unwrap_or_else(|| alloc::string::String::from("/agent/9003"));
+            crate::service::pipeline::start(port, &home);
+            serial_println!(
+                "agents> started 'network' service — web pipeline network->http->doc on TCP :{} (GET / for the docs)",
+                port
+            );
         }
+        "ssh" => {
+            if let Some(p) = port {
+                crate::service::ssh::set_port(p);
+            }
+            let task = crate::service::start(&crate::service::ssh::SSH_SERVICE);
+            serial_println!("agents> started 'ssh' service (task {})", task);
+        }
+        other => serial_println!("agents> unknown system agent '{}' (network|http|doc|ssh)", other),
     }
-    let task = crate::service::start(spec);
-    serial_println!("agents> started '{}' service (task {}) — see /agents services", name, task);
 }
 
 /// `/agents search <index-url> [query]` — fetch a public registry index over

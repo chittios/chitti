@@ -15,21 +15,23 @@
 
 use crate::agent::types::*;
 use crate::json::Json;
-use crate::service::ServiceSpec;
 use crate::skills::package::SkillPackage;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 /// A built-in system agent: its markdown SOUL + JSON manifest (compiled in),
-/// stable ids, and the native service it fronts.
+/// stable ids, and any bundled assets that land in its install folder. The
+/// web agents (network/http/doc) run together as the [`super::super::service::pipeline`];
+/// ssh runs standalone. Wiring is done by the `/agents start` command.
 struct SystemAgentDef {
     name: &'static str,
     soul: &'static str,
     manifest_json: &'static str,
     skill_id: SkillId,
     agent_id: AgentId,
-    /// The native serve loop + its port setter, if this is a service agent.
-    service: Option<(&'static ServiceSpec, fn(u16))>,
+    /// `(filename, contents)` written to `/agent/<id>/assets/` on install (e.g.
+    /// the Doc agent's HTML + logo). All text, compiled in via `include_str!`.
+    assets: &'static [(&'static str, &'static str)],
 }
 
 // Stable ids so `/agent/<id>/` is consistent across boots and doesn't collide
@@ -44,7 +46,7 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
         manifest_json: include_str!("../../../agents/network/manifest.json"),
         skill_id: SkillId(SYSTEM_SKILL_BASE + 1),
         agent_id: AgentId(SYSTEM_AGENT_BASE + 1),
-        service: Some((&crate::service::network::ECHO_SERVICE, crate::service::network::set_echo_port)),
+        assets: &[],
     },
     SystemAgentDef {
         name: "http",
@@ -52,17 +54,34 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
         manifest_json: include_str!("../../../agents/http/manifest.json"),
         skill_id: SkillId(SYSTEM_SKILL_BASE + 2),
         agent_id: AgentId(SYSTEM_AGENT_BASE + 2),
-        service: Some((&crate::service::http::HTTP_SERVICE, crate::service::http::set_port)),
+        assets: &[],
+    },
+    SystemAgentDef {
+        name: "doc",
+        soul: include_str!("../../../agents/doc/SOUL.md"),
+        manifest_json: include_str!("../../../agents/doc/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 3),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 3),
+        assets: &[
+            ("index.html", include_str!("../../../agents/doc/assets/index.html")),
+            ("docs.html", include_str!("../../../agents/doc/assets/docs.html")),
+            ("logo.svg", include_str!("../../../agents/doc/assets/logo.svg")),
+        ],
     },
     SystemAgentDef {
         name: "ssh",
         soul: include_str!("../../../agents/ssh/SOUL.md"),
         manifest_json: include_str!("../../../agents/ssh/manifest.json"),
-        skill_id: SkillId(SYSTEM_SKILL_BASE + 3),
-        agent_id: AgentId(SYSTEM_AGENT_BASE + 3),
-        service: Some((&crate::service::ssh::SSH_SERVICE, crate::service::ssh::set_port)),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 4),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 4),
+        assets: &[],
     },
 ];
+
+/// The install-folder path (`/agent/<id>`) of a system agent by name.
+pub fn home_for(name: &str) -> Option<String> {
+    SYSTEM_AGENTS.iter().find(|d| d.name == name).map(|d| crate::agent::home::path(d.agent_id.0))
+}
 
 /// The parsed, portable part of a system agent's `manifest.json`.
 pub struct ParsedManifest {
@@ -108,6 +127,12 @@ fn parse_rights(arr: &[Json]) -> Rights {
 }
 
 fn parse_scope(s: &str) -> Scope {
+    // "home" = read/write only within the agent's own install folder + memory.
+    // Resolved to the concrete `/agent/<id>/**` path in `build_package` (which
+    // knows the id) via the `$HOME` sentinel.
+    if s == "home" {
+        return Scope::Path("$HOME/**".to_string());
+    }
     if let Some(rest) = s.strip_prefix("path:") {
         return Scope::Path(rest.to_string());
     }
@@ -164,9 +189,25 @@ pub fn parse_manifest(json: &str) -> Option<ParsedManifest> {
     })
 }
 
+/// The agent's declared capabilities with the `$HOME` sentinel resolved to its
+/// concrete install folder (so a `scope: "home"` grant becomes a real path).
+fn resolved_caps(def: &SystemAgentDef, m: &ParsedManifest) -> Vec<CapabilityRequest> {
+    let home = crate::agent::home::path(def.agent_id.0);
+    m.capabilities
+        .iter()
+        .map(|c| {
+            let scope = match &c.scope {
+                Scope::Path(p) if p.contains("$HOME") => Scope::Path(p.replace("$HOME", &home)),
+                other => other.clone(),
+            };
+            CapabilityRequest::new(c.domain, c.rights, scope)
+        })
+        .collect()
+}
+
 /// Build the signed `SkillPackage` for a system agent from its parsed manifest,
-/// SOUL, and stable ids.
-fn build_package(def: &SystemAgentDef, m: &ParsedManifest) -> SkillPackage {
+/// SOUL, resolved capabilities, and bundled assets.
+fn build_package(def: &SystemAgentDef, m: &ParsedManifest, caps: &[CapabilityRequest]) -> SkillPackage {
     let agent = AgentManifest {
         schema_version: 1,
         id: def.agent_id,
@@ -176,7 +217,7 @@ fn build_package(def: &SystemAgentDef, m: &ParsedManifest) -> SkillPackage {
         description: m.description.clone(),
         system_prompt: def.soul.to_string(),
         toolset: m.toolset.clone(),
-        capabilities: m.capabilities.clone(),
+        capabilities: caps.to_vec(),
         skills: Vec::new(),
         sampling: Sampling::deterministic(1),
         budgets: Budgets {
@@ -191,6 +232,19 @@ fn build_package(def: &SystemAgentDef, m: &ParsedManifest) -> SkillPackage {
         summary: SummaryPolicy { max_tokens: 256, style: SummaryStyle::Terse },
         origin: Origin::Installed { skill: def.skill_id },
     };
+    // Bundled assets → manifest.assets (declared) + package payload (placed into
+    // the agent's install folder by `place_agent_home`).
+    let asset_meta: Vec<Asset> = def
+        .assets
+        .iter()
+        .map(|(name, content)| Asset {
+            name: (*name).to_string(),
+            store_ref: StoreKey(alloc::format!("/agent/{}/assets/{name}", def.agent_id.0)),
+            bytes: content.len() as u32,
+        })
+        .collect();
+    let asset_payload: Vec<(String, Vec<u8>)> =
+        def.assets.iter().map(|(name, content)| ((*name).to_string(), content.as_bytes().to_vec())).collect();
     let manifest = SkillManifest {
         schema_version: 2,
         id: def.skill_id,
@@ -198,10 +252,10 @@ fn build_package(def: &SystemAgentDef, m: &ParsedManifest) -> SkillPackage {
         version: m.version.clone(),
         description: m.description.clone(),
         kind: SkillKind::SkillAgent,
-        requested_capabilities: m.capabilities.clone(),
+        requested_capabilities: caps.to_vec(),
         body_ref: StoreKey(alloc::format!("skills/{}/body.md", def.skill_id.0)),
         bundled_tools: Vec::new(),
-        assets: Vec::new(),
+        assets: asset_meta,
         agent: Some(agent),
         soul_ref: Some(StoreKey(alloc::format!("/agent/{}/SOUL.md", def.agent_id.0))),
         skill_docs: Vec::new(),
@@ -217,47 +271,36 @@ fn build_package(def: &SystemAgentDef, m: &ParsedManifest) -> SkillPackage {
         body: alloc::format!("System {} agent.", m.name),
         soul: Some(def.soul.to_string()),
         skill_docs: Vec::new(),
-        assets: Vec::new(),
+        assets: asset_payload,
     };
     pkg.sign();
     pkg
 }
 
-/// Install every built-in system agent (idempotent per boot): sign its package,
-/// install it granting its full declared capability set (system agents are
-/// pre-trusted), land its SOUL in `/agent/<id>/`, register its role, and set its
-/// service's default port. Called once from `run_os` after the FS + net are up.
+/// Install every built-in system agent (idempotent per boot): sign its package
+/// and install it granting its full declared (home-resolved) capability set
+/// (system agents are pre-trusted), landing its SOUL + assets in `/agent/<id>/`
+/// and registering its role. Called once from `run_os` after the FS + net are up.
 pub fn install_all(now: Ticks) {
     for def in SYSTEM_AGENTS {
         let Some(m) = parse_manifest(def.manifest_json) else {
             crate::ktrace::log_fmt(format_args!("system-agent: '{}' manifest.json failed to parse", def.name));
             continue;
         };
-        let pkg = build_package(def, &m);
-        // Grant the full declared set (pre-trusted); consent-subsetting applies to
-        // third-party packages, not the OS's own system agents.
-        let approved = m.capabilities.clone();
-        match crate::skills::install::install(&pkg, &approved, "system", InstallSource::BootModule { name: alloc::format!("system:{}", def.name) }, now) {
+        let caps = resolved_caps(def, &m);
+        let pkg = build_package(def, &m, &caps);
+        match crate::skills::install::install(&pkg, &caps, "system", InstallSource::BootModule { name: alloc::format!("system:{}", def.name) }, now) {
             Ok(rec) => crate::ktrace::log_fmt(format_args!(
-                "system-agent: installed '{}' -> /agent/{} ({} caps)",
+                "system-agent: installed '{}' -> /agent/{} ({} caps, {} asset(s))",
                 def.name,
                 def.agent_id.0,
-                rec.granted_capabilities.len()
+                rec.granted_capabilities.len(),
+                def.assets.len()
             )),
             Err(e) => crate::ktrace::log_fmt(format_args!("system-agent: install '{}' failed: {:?}", def.name, e)),
         }
-        // Pre-load the service's default port so `/agents start <name>` works
-        // with no explicit port.
-        if let (Some((_, set_port)), true) = (def.service, m.default_port != 0) {
-            set_port(m.default_port);
-        }
     }
-    crate::serial_println!("Chitti: system agents installed (network, http, ssh) in /agent/");
-}
-
-/// Look up a system agent's native service by name, for `/agents start <name>`.
-pub fn service_for(name: &str) -> Option<(&'static ServiceSpec, fn(u16))> {
-    SYSTEM_AGENTS.iter().find(|d| d.name == name).and_then(|d| d.service)
+    crate::serial_println!("Chitti: system agents installed (network, http, doc, ssh) in /agent/");
 }
 
 /// The installed system agents, for `/agents list`/display: (name, agent_id).
@@ -274,8 +317,8 @@ mod tests {
         let m = parse_manifest(SYSTEM_AGENTS[0].manifest_json).expect("network manifest parses");
         assert_eq!(m.name, "network");
         assert_eq!(m.kind, AgentKind::Service);
-        assert!(m.toolset.iter().any(|t| t == "channel_grant"));
-        // Declares Net EXEC and Channel READ|WRITE.
+        assert!(m.toolset.iter().any(|t| t == "net_accept"));
+        // Declares Net EXEC (listen/accept) and Channel READ|WRITE (relay to http).
         assert!(m
             .capabilities
             .iter()
@@ -287,12 +330,27 @@ mod tests {
     }
 
     #[test_case]
-    fn all_system_manifests_parse_and_bind_a_service() {
+    fn all_system_manifests_parse_and_declare_caps() {
         for def in SYSTEM_AGENTS {
             let m = parse_manifest(def.manifest_json).unwrap_or_else(|| panic!("{} manifest", def.name));
             assert_eq!(m.name, def.name);
             assert!(!m.capabilities.is_empty(), "{} declares capabilities", def.name);
-            assert!(def.service.is_some(), "{} binds a native service", def.name);
+        }
+        // The four system agents: the web pipeline (network/http/doc) + ssh.
+        assert_eq!(SYSTEM_AGENTS.len(), 4);
+    }
+
+    #[test_case]
+    fn doc_home_scope_resolves_to_the_agent_folder() {
+        let doc = SYSTEM_AGENTS.iter().find(|d| d.name == "doc").unwrap();
+        let m = parse_manifest(doc.manifest_json).unwrap();
+        let caps = resolved_caps(doc, &m);
+        // The doc agent's Fs READ scope is its own install folder, not "$HOME".
+        let fs = caps.iter().find(|c| c.domain == CapDomain::Fs).expect("doc has an Fs cap");
+        assert_eq!(fs.rights, Rights::READ);
+        match &fs.scope {
+            Scope::Path(p) => assert_eq!(p, &alloc::format!("/agent/{}/**", doc.agent_id.0)),
+            other => panic!("expected a resolved path scope, got {other:?}"),
         }
     }
 

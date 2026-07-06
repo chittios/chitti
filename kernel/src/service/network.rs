@@ -1,33 +1,20 @@
-//! A minimal **Network service agent**: a native daemon that listens on a TCP
-//! port and, for each inbound connection, adopts the socket as a channel and
-//! echoes bytes back. It is the smallest faithful instance of the vision's
-//! "Network agent listens on a port, forwards connections" — here the forward
-//! target is an in-loop echo, but the accept → `channel::adopt_tcp` → channel
-//! I/O path is exactly what a real forward (e.g. handing the stream to an SSH
-//! agent via `channel_grant`) uses.
+//! The native service behind the **Network agent**: it owns the inbound TCP
+//! edge. It listens on a port, accepts a connection, reads the request bytes off
+//! the socket, and relays them to the HTTP agent over a channel; when the HTTP
+//! agent hands back the formatted response bytes, the Network agent writes them
+//! to the socket. It never parses a protocol — it is the wire.
 //!
-//! The serve loop is native, deterministic code (no model) — protocol/byte
-//! handling lives below the determinism boundary, as the standing rule requires.
-//! It pumps `shell::upkeep()` + `yield_now()` on every idle spin so the net
-//! stack and UI stay alive while it holds the CPU cooperatively.
+//! Determinism boundary: this is native, deterministic code below the boundary.
+//! The Network / HTTP / Doc split is wired in [`super::pipeline`].
 
-use crate::service::ServiceSpec;
-use core::sync::atomic::{AtomicU16, Ordering};
+use crate::service::{pipeline, ServiceSpec};
 
-/// The port the echo service listens on; set by the shell before `start`.
-static ECHO_PORT: AtomicU16 = AtomicU16::new(0);
+/// How long to wait for a request head / the HTTP agent's response before
+/// dropping the connection.
+const CONN_DEADLINE_MS: u64 = 12_000;
 
-/// Configure the listen port for the next start of [`ECHO_SERVICE`].
-pub fn set_echo_port(port: u16) {
-    ECHO_PORT.store(port, Ordering::SeqCst);
-}
-
-/// Per-connection idle budget: stop echoing a connection that goes quiet for
-/// this long (so a half-open peer can't pin the loop forever).
-const CONN_IDLE_MS: u64 = 15_000;
-
-extern "C" fn echo_serve(_arg: u64) {
-    let port = ECHO_PORT.load(Ordering::SeqCst);
+extern "C" fn network_serve(_arg: u64) {
+    let port = pipeline::net_port();
     if port == 0 {
         return;
     }
@@ -38,22 +25,29 @@ extern "C" fn echo_serve(_arg: u64) {
             return;
         }
     };
-    let mut buf = [0u8; 1024];
+    let (Some(to_http), Some(from_http)) = (pipeline::net_to_http(), pipeline::http_to_net()) else {
+        crate::ktrace::log("service.network", "pipeline channels not wired");
+        return;
+    };
+    let mut buf = [0u8; 2048];
     loop {
         if let Some(handle) = crate::net::try_accept(listener) {
-            let ch = crate::channel::adopt_tcp(handle);
-            crate::ktrace::log_fmt(format_args!("service.network: accepted a connection on :{port}"));
-            let mut deadline = crate::arch::now_ms() + CONN_IDLE_MS;
+            let conn = crate::channel::adopt_tcp(handle);
+            // Read the request head (until the header terminator) off the socket.
+            let mut req = alloc::vec::Vec::new();
+            let deadline = crate::arch::now_ms() + CONN_DEADLINE_MS;
             loop {
-                match crate::channel::try_read(ch, &mut buf) {
+                match crate::channel::try_read(conn, &mut buf) {
                     Ok(0) => {
-                        if crate::channel::is_eof(ch) {
+                        if crate::channel::is_eof(conn) {
                             break;
                         }
                     }
                     Ok(n) => {
-                        let _ = crate::channel::try_write(ch, &buf[..n]);
-                        deadline = crate::arch::now_ms() + CONN_IDLE_MS; // reset idle timer
+                        req.extend_from_slice(&buf[..n]);
+                        if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
                     }
                     Err(_) => break,
                 }
@@ -63,18 +57,33 @@ extern "C" fn echo_serve(_arg: u64) {
                 crate::shell::upkeep();
                 crate::sched::yield_now();
             }
-            crate::channel::close_write(ch);
-            crate::channel::close_read(ch);
-            crate::channel::close_end(ch);
-            crate::channel::close_end(ch);
+            if !req.is_empty() {
+                // Hand the raw request to the HTTP agent and relay its response.
+                let d = crate::arch::now_ms() + CONN_DEADLINE_MS;
+                pipeline::send_frame(to_http, &req, d);
+                if let Some(resp) = pipeline::recv_deadline(from_http, crate::arch::now_ms() + CONN_DEADLINE_MS) {
+                    let mut off = 0;
+                    while off < resp.len() {
+                        match crate::channel::try_write(conn, &resp[off..]) {
+                            Ok(0) => {
+                                crate::shell::upkeep();
+                                crate::sched::yield_now();
+                            }
+                            Ok(n) => off += n,
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+            crate::channel::close_write(conn);
+            crate::channel::close_read(conn);
+            crate::channel::close_end(conn);
+            crate::channel::close_end(conn);
         }
         crate::shell::upkeep();
         crate::sched::yield_now();
     }
 }
 
-/// The Network echo service. Native, so it needs no Synapse `InvokePrimitive`
-/// grants (it calls the deterministic kernel net/channel APIs directly, below
-/// the determinism boundary). Not autostarted — brought up on demand by
-/// `/agents start-net <port>`.
-pub static ECHO_SERVICE: ServiceSpec = ServiceSpec { name: "network-echo", entry: echo_serve, autostart: false, caps: &[] };
+/// The Network edge service. Native; started as part of the web pipeline.
+pub static NETWORK_STAGE: ServiceSpec = ServiceSpec { name: "network", entry: network_serve, autostart: false, caps: &[] };

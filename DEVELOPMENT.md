@@ -233,7 +233,7 @@ chitti/
 ├── targets/              # custom bare-metal target JSONs (x86_64-chitti, aarch64-chitti)
 ├── xtask/                # build orchestration: image assembly + QEMU + tests
 ├── stub/                 # aarch64 UEFI bootloader (BOOTAA64.EFI): GOP + boot-info handoff
-├── agents/               # built-in system agents as markdown SOUL + JSON manifest (network, http, ssh)
+├── agents/               # built-in system agents as markdown SOUL + JSON manifest (network, http, doc, ssh)
 ├── assets/               # Geist Mono font (+ generator); model fetched here, not committed
 ├── tools/                # NumPy inference reference, font atlas generator, mkext4 reference
 ├── tests/e2e/            # end-to-end harness: boots the kernel, drives the shell over serial
