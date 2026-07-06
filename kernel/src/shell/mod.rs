@@ -1885,29 +1885,75 @@ impl ChatSession {
         sampler::sample_topk_topp(logits, temp, TOP_K, TOP_P, &mut self.rng, None)
     }
 
-    /// One-shot planning turn for a service agent: reset to a fresh context,
-    /// prefill `system_prompt` (the agent's SOUL) + `user`, and decode a single
-    /// assistant reply — returned raw so the caller can parse the tool call the
-    /// model chose. Unlike `turn`, there is no ReAct loop and no shell persona:
-    /// the agent's own SOUL is the whole system prompt.
-    fn plan_once(&mut self, system_prompt: &str, user: &str) -> alloc::string::String {
+    /// One **content-agent turn** for a service (web) agent: a bounded ReAct loop
+    /// with the agent's SOUL as the whole system prompt (plus a short response
+    /// protocol) and exactly one tool — `mem_fs_read`, executed through the
+    /// capability- and scope-gated, `assets/`-confined reader
+    /// (`service::server::read_asset_arg`). So the *agent itself* reads the file
+    /// it decides to serve, then emits its final answer: a JSON response object
+    /// (`{status, content_type/headers, body}`) the server parses and frames.
+    ///
+    /// Returns `(final_answer, last_read)` where `last_read` is the
+    /// `(path, bytes)` of the last asset the agent read — the server uses it as
+    /// the body when the JSON omits one, so a small model never has to echo a
+    /// whole file. Fresh context per request (routing must not accrete KV);
+    /// thinking off + greedy for a fast, deterministic decision.
+    fn serve_loop(&mut self, soul: &str, user: &str, home: &str) -> (alloc::string::String, Option<(alloc::string::String, alloc::vec::Vec<u8>)>) {
         use core::sync::atomic::Ordering;
-        // Force thinking off for a planning turn: a service agent must answer
-        // fast (within the pipeline deadline), not ruminate. Restore afterwards.
+        const MAX_ITERS: usize = 4;
         let prev_think = THINK_ON.swap(false, Ordering::Relaxed);
-        self.greedy = true; // deterministic routing decision
-        // Independent context per plan (routing one request must not accrete KV).
+        self.greedy = true;
         self.kv = self.model.new_cache();
         self.state = self.model.new_state();
         self.pos = 0;
         self.gen.clear();
         self.cancelled = false;
-        self.prefill_turn("system\n", system_prompt, false);
+        let sys = alloc::format!("{soul}\n\n{}", serve_protocol());
+        self.prefill_turn("system\n", &sys, false);
         self.prefill_turn("user\n", user, true);
-        let out = self.generate_assistant("\x1b[2mdoc-agent plans:\x1b[0m ");
+        let mut last_read: Option<(alloc::string::String, alloc::vec::Vec<u8>)> = None;
+        let mut last_arg: Option<alloc::string::String> = None;
+        let mut result = alloc::string::String::new();
+        for _ in 0..MAX_ITERS {
+            let text = self.generate_assistant("\x1b[2mserver-agent:\x1b[0m ");
+            if self.cancelled {
+                break;
+            }
+            match parse_tool_call(&text) {
+                Some((cmd, arg)) if cmd == "mem_fs_read" => {
+                    // Repeat guard: if it re-reads the same file, it already has
+                    // the bytes — nudge it to answer with the JSON now.
+                    if last_arg.as_deref() == Some(arg.as_str()) {
+                        self.prefill_turn("user\n", "<tool_response>\nYou already read that file. Reply now with ONLY the JSON response object.\n</tool_response>", true);
+                        last_arg = None;
+                        continue;
+                    }
+                    last_arg = Some(arg.clone());
+                    let obs = match crate::service::server::read_asset_arg(home, &arg) {
+                        Some(bytes) => {
+                            let body = alloc::string::String::from_utf8_lossy(&bytes).into_owned();
+                            last_read = Some((arg.clone(), bytes));
+                            body
+                        }
+                        None => alloc::format!("error: no such file in assets/ ({arg})"),
+                    };
+                    serial_println!("\x1b[33m\u{2192} server-agent read\x1b[0m {}", arg);
+                    let fb = alloc::format!("<tool_response>\n{}\n</tool_response>", obs);
+                    self.prefill_turn("user\n", &fb, true);
+                }
+                Some(_) => {
+                    // Only mem_fs_read is available to a content agent.
+                    self.prefill_turn("user\n", "<tool_response>\nOnly mem_fs_read is available. Read the asset for the request, then reply with ONLY the JSON response object.\n</tool_response>", true);
+                }
+                None => {
+                    result = text; // final answer (the JSON response object)
+                    break;
+                }
+            }
+        }
         self.greedy = false;
         THINK_ON.store(prev_think, Ordering::Relaxed);
-        out
+        (result, last_read)
     }
 
     /// Dispatch an isolated, **model-driven** sub-agent for `task` and return
@@ -1954,15 +2000,27 @@ impl ChatSession {
 /// only the KV/state are per-context.
 static DOC_PLANNER: crate::mm::Locked<Option<ChatSession>> = crate::mm::Locked::new(None);
 
-/// Run one **planning turn** for a service agent: prefill `system_prompt` (the
-/// agent's SOUL) + `user` and decode a single reply, returned raw for the caller
-/// to interpret. This is the agent's *mind* — it makes the decision (e.g. which
-/// document to serve) from its SOUL; the caller then acts on that decision
-/// through the Synapse gate (capability + scope checked). Returns `None` if no
-/// model is loaded (the agent then can't plan). The planner context is taken out
-/// of the lock during inference so a multi-second forward pass never runs with
-/// the lock held.
-pub(crate) fn plan_reply(system_prompt: &str, user: &str) -> Option<alloc::string::String> {
+/// The response protocol appended to a content agent's SOUL: the one tool it may
+/// call and the JSON shape of its final answer. Kept terse so a small model
+/// follows it. `serve_loop` executes the `mem_fs_read` calls (gated + confined to
+/// the agent's `assets/`) and `service::server` parses the JSON.
+fn serve_protocol() -> alloc::string::String {
+    alloc::string::String::from(
+        "You serve one HTTP request. Reply with ONLY a JSON object describing the response — no prose, no code fence:\n\
+         {\"status\": 200, \"content_type\": \"text/html; charset=utf-8\", \"file\": \"<asset filename>\"}\n\
+         The server reads that file from your assets/ and sends it as the body — you need not repeat it. \
+         Use {\"status\": 404} with no file when nothing matches. If you need a file's contents to decide, you \
+         may first read it with a <tool_call>{\"name\": \"mem_fs_read\", \"arguments\": {\"path\": \"<filename>\"}}</tool_call>.",
+    )
+}
+
+/// Run one **content-agent turn** for a service (web) agent over its dedicated
+/// planner context: the agent (driven by its SOUL) reads the file it serves via a
+/// gated `mem_fs_read` tool call and returns a JSON response object. Returns the
+/// final answer plus the last `(path, bytes)` it read (the server frames one or
+/// the other). `None` if no model is loaded. The context is taken out of the lock
+/// during inference so a multi-second forward pass never holds the lock.
+pub(crate) fn serve_reply(soul: &str, user: &str, home: &str) -> Option<(alloc::string::String, Option<(alloc::string::String, alloc::vec::Vec<u8>)>)> {
     let taken: Option<ChatSession> = DOC_PLANNER.with(|p| {
         if p.is_none() {
             let mut spin = Spinner::new("doc-planner");
@@ -1971,9 +2029,9 @@ pub(crate) fn plan_reply(system_prompt: &str, user: &str) -> Option<alloc::strin
         p.take()
     });
     let mut sess = taken?;
-    let raw = sess.plan_once(system_prompt, user);
+    let out = sess.serve_loop(soul, user, home);
     DOC_PLANNER.with(|p| *p = Some(sess));
-    Some(raw)
+    Some(out)
 }
 
 /// [`StepSource`] backed by the live Cortex model: each `next()` prefills any

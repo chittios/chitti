@@ -203,9 +203,14 @@ real UEFI hardware.
   socket and relays raw bytes; `http` (`service/http.rs`) parses the request +
   formats the response (no FS, no socket); `server` (`service/server.rs`) is a
   **generic content runtime** that serves *whichever* content agent the pipeline
-  was started for — it asks that agent's model (prompted with the agent's own
-  `SOUL.md`) which file to serve, then reads it with a capability- and
-  scope-gated `mem_fs_read` tool call confined to the agent's own `assets/`.
+  was started for — it runs that agent's model as a bounded ReAct loop (prompted
+  with the agent's own `SOUL.md`) which returns a **JSON response object**
+  (`{status, content_type/headers, file/body}`); `server.rs` parses that JSON and
+  frames the reply. The body is either inline `body` or an asset the agent
+  **names** (`file`) / **reads itself** (a `mem_fs_read` `<tool_call>`) — both go
+  through the capability- and scope-gated reader confined to the agent's own
+  `assets/`, so the SOUL agent *decides and reads* the content while native code
+  only parses + frames (determinism boundary intact).
   So **a web server is just `agents/<name>/{SOUL.md, manifest.json, assets/…}`** —
   the SOUL carries the routing/behaviour (model-planned per request, greedy), the
   assets carry the content, and no per-server Rust is written. `doc` is exactly
