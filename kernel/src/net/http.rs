@@ -168,9 +168,9 @@ pub fn perform(
 
     let handle = tcp_connect(ip, port, deadline)?;
     let mut conn = if tls {
-        Conn::Secure(super::tls::handshake(super::tls::TcpStream { handle, deadline }, &host)?)
+        Conn::Secure(super::tls::handshake(super::tls::TcpStream::new(handle, deadline), &host)?)
     } else {
-        Conn::Plain(super::tls::TcpStream { handle, deadline })
+        Conn::Plain(super::tls::TcpStream::new(handle, deadline))
     };
 
     let result = drive_stream(&mut conn, &wire, deadline, on_head, on_body);

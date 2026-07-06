@@ -539,7 +539,7 @@ fn print_help() {
     serial_println!("  /compact         compact the chat context (model-written summary, fresh KV)");
     serial_println!("  /model [..]      chat backend: local (embedded) | remote <http://host:port> [name]");
     serial_println!("  /http [..] <url> curl-like: -X, -H, -d, -v, --stream (http:// + https://)");
-    serial_println!("  /ws <url> [msg]  connect a ws:// WebSocket and stream frames");
+    serial_println!("  /ws <url> [msg]  WebSocket (ws:// or wss://): connect, send, stream frames");
     serial_println!("  /skills          list installed skills (L0 metadata)");
     serial_println!("  /clear           reset the chat context + clear the pane (incl. scrollback)");
     serial_println!("  /infer           reference inference (fixed prompt, parity check)");
@@ -2281,7 +2281,7 @@ fn run_ws(arg: &str) {
     if tokens.is_empty() {
         serial_println!("usage: /ws <ws://host:port/path> [message]");
         serial_println!("  connects, sends [message] if given, then streams frames (Ctrl+C/Esc to stop)");
-        serial_println!("  ws:// only (plaintext, LAN); needs /network up");
+        serial_println!("  ws:// (plaintext) or wss:// (TLS); needs /network up");
         return;
     }
     let url = &tokens[0];

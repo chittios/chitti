@@ -55,7 +55,27 @@ pub fn seed_rng() -> ChaCha20Rng {
 /// every wait.
 pub struct TcpStream {
     pub handle: SocketHandle,
+    /// Fixed absolute read/write deadline (`arch::now_ms` value) — used by the
+    /// one-shot HTTP path.
     pub deadline: u64,
+    /// Optional **rolling** deadline: when set, this atomic overrides
+    /// `deadline`, so a long-lived owner (the `wss://` WebSocket) can push the
+    /// timeout forward before each read instead of the session expiring at a
+    /// fixed instant. embedded-tls holds this `TcpStream` and reads the same
+    /// atomic, so bumping it here extends the deadline it observes.
+    pub rolling: Option<&'static core::sync::atomic::AtomicU64>,
+}
+
+impl TcpStream {
+    /// A stream with a fixed absolute `deadline` (the HTTP request path).
+    pub fn new(handle: SocketHandle, deadline: u64) -> Self {
+        TcpStream { handle, deadline, rolling: None }
+    }
+    /// A stream whose deadline is read from (and bumped through) a shared
+    /// atomic — for a long-lived TLS session (`wss://`).
+    pub fn with_rolling(handle: SocketHandle, rolling: &'static core::sync::atomic::AtomicU64) -> Self {
+        TcpStream { handle, deadline: 0, rolling: Some(rolling) }
+    }
 }
 
 /// The one error kind we surface to embedded-tls; it only inspects
@@ -74,8 +94,15 @@ impl ErrorType for TcpStream {
 }
 
 impl TcpStream {
+    /// The deadline in effect: the rolling atomic if present, else the fixed one.
+    fn effective_deadline(&self) -> u64 {
+        match self.rolling {
+            Some(a) => a.load(core::sync::atomic::Ordering::Relaxed),
+            None => self.deadline,
+        }
+    }
     fn timed_out(&self) -> bool {
-        crate::arch::now_ms() >= self.deadline
+        crate::arch::now_ms() >= self.effective_deadline()
     }
 }
 
