@@ -23,6 +23,7 @@ pub mod agent;
 pub mod arch;
 pub mod block;
 pub mod cap;
+pub mod channel;
 pub mod clipboard;
 pub mod clock;
 #[cfg(target_arch = "aarch64")]
@@ -844,6 +845,110 @@ fn phase5_two_agents_coordinate_via_ipc() {
         Some(&b"42"[..]),
         "consumer did not persist the producer's value via IPC + Synapse"
     );
+}
+
+/// Two agents exchange RAW BYTES over a cap-gated channel (Phase 1). A client
+/// writes "ping" into one channel; an echo agent reads it and writes it into a
+/// second channel; the client reads it back. This exercises every new Phase-1
+/// mechanism: `channel::create`, both `Right::Channel{Read,Write}` directions,
+/// the two-gate check (`InvokePrimitive(CHANNEL_*)` *and* per-call cap-slot
+/// resolution against the caller's own table), and the cooperative blocking
+/// read — with a spin bound guarding against a hang. Unlike `ipc` (a single
+/// u64), this proves a byte stream crosses between two real scheduled tasks.
+#[test_case]
+fn channels_two_agents_echo_bytes() {
+    use channel::ChannelKind;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static OK: AtomicBool = AtomicBool::new(false);
+
+    fn data_of(inv: synapse::Invocation) -> alloc::string::String {
+        match inv {
+            synapse::Invocation::Executed { result, .. } => {
+                result.strip_prefix("ok:data=").map(alloc::string::ToString::to_string).unwrap_or(result)
+            }
+            other => alloc::format!("{other:?}"),
+        }
+    }
+
+    // Echo agent: read one message from its read end (slot 0), write it back on
+    // its write end (slot 1), then exit — so it leaves no lingering task.
+    extern "C" fn echoer(_arg: u64) {
+        let got = data_of(synapse::execute(
+            sched::current_task_id(),
+            r#"{"name":"channel_read","arguments":{"chan":0,"max":64}}"#,
+        ));
+        let call = alloc::format!(r#"{{"name":"channel_write","arguments":{{"chan":1,"text":"{got}"}}}}"#);
+        synapse::execute(sched::current_task_id(), &call);
+    }
+    // Client: write "ping" (write end slot 0), read the echo back (read end
+    // slot 1), assert it matches.
+    extern "C" fn client(_arg: u64) {
+        synapse::execute(
+            sched::current_task_id(),
+            r#"{"name":"channel_write","arguments":{"chan":0,"text":"ping"}}"#,
+        );
+        let echoed = data_of(synapse::execute(
+            sched::current_task_id(),
+            r#"{"name":"channel_read","arguments":{"chan":1,"max":64}}"#,
+        ));
+        OK.store(echoed == "ping", Ordering::SeqCst);
+        DONE.store(true, Ordering::SeqCst);
+    }
+
+    let c2s = channel::create(ChannelKind::Stream, 4096); // client -> echo
+    let s2c = channel::create(ChannelKind::Stream, 4096); // echo -> client
+    // Spawn + grant under interrupts-off (the cap-slot convention needs the
+    // table populated before the task first runs — same guard as the IPC test).
+    arch::interrupts::without_interrupts(|| {
+        let echo = sched::spawn("echo-agent", echoer, 0);
+        cap::grant(echo, cap::Right::ChannelRead(c2s)); // echo slot 0
+        cap::grant(echo, cap::Right::ChannelWrite(s2c)); // echo slot 1
+        cap::grant(echo, cap::Right::InvokePrimitive(synapse::registry::CHANNEL_READ));
+        cap::grant(echo, cap::Right::InvokePrimitive(synapse::registry::CHANNEL_WRITE));
+
+        let cli = sched::spawn("client-agent", client, 0);
+        cap::grant(cli, cap::Right::ChannelWrite(c2s)); // client slot 0
+        cap::grant(cli, cap::Right::ChannelRead(s2c)); // client slot 1
+        cap::grant(cli, cap::Right::InvokePrimitive(synapse::registry::CHANNEL_WRITE));
+        cap::grant(cli, cap::Right::InvokePrimitive(synapse::registry::CHANNEL_READ));
+    });
+
+    let mut spins = 0u64;
+    while !DONE.load(Ordering::SeqCst) {
+        sched::yield_now();
+        spins += 1;
+        assert!(spins < 100_000_000, "the two agents never completed the byte echo");
+    }
+    assert!(OK.load(Ordering::SeqCst), "client did not read back the bytes it sent");
+}
+
+/// A channel handle is unforgeable: a task holding only `InvokePrimitive`
+/// authority (but no `ChannelRead/Write` end) cannot read or write a channel by
+/// naming a slot — the executor's per-call cap-slot resolution denies it. This
+/// is the "no ambient authority over channels" invariant.
+#[test_case]
+fn channel_handle_without_end_is_denied() {
+    use channel::ChannelKind;
+
+    let ch = channel::create(ChannelKind::Stream, 64);
+    let me = sched::current_task_id();
+    // Grant the coarse ABI right but NOT an end naming `ch`.
+    cap::grant(me, cap::Right::InvokePrimitive(synapse::registry::CHANNEL_WRITE));
+    // Slot 0 in this (bootstrap) table does not resolve to ChannelWrite(ch);
+    // the write must be denied at the handle-resolution gate, not executed.
+    let inv = synapse::execute(me, r#"{"name":"channel_write","arguments":{"chan":999,"text":"x"}}"#);
+    match inv {
+        synapse::Invocation::Executed { result, .. } => {
+            assert!(result.starts_with("error:denied_channel_handle"), "unexpected: {result}");
+        }
+        other => panic!("expected an executed-with-denial result, got {other:?}"),
+    }
+    // The channel never received the bytes.
+    assert_eq!(channel::readable_len(ch), 0, "bytes leaked into a channel the caller holds no end to");
+    channel::close_end(ch);
+    channel::close_end(ch);
 }
 
 // --- Phase 6 acceptance tests (taint gate + compiled intents) -----------
