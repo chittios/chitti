@@ -225,6 +225,19 @@ pub fn close_read(id: ChannelId) {
     });
 }
 
+/// Register an additional live end (a `channel_grant` handed a copy of an end to
+/// another agent, so teardown must wait for that holder to close too). Returns
+/// false if the channel no longer exists.
+pub fn dup_end(id: ChannelId) -> bool {
+    CHANNELS.with(|m| match m.get_mut(&id) {
+        Some(ch) => {
+            ch.ends = ch.ends.saturating_add(1);
+            true
+        }
+        None => false,
+    })
+}
+
 /// Drop one end of the channel. When the last end is dropped the channel is
 /// torn down and its buffers freed. Callers that know their direction should
 /// also call [`close_write`]/[`close_read`] first so the peer observes EOF.

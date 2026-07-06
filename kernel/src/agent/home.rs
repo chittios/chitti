@@ -17,6 +17,8 @@ pub fn path(id: u64) -> String {
 
 /// Ensure agent `id`'s home exists: `SOUL.md` (seeded with a default persona on
 /// first boot), `skills/` and `memory/` markers. Idempotent; cheap when present.
+/// A SOUL.md placed by an installed package (see `skills::package::place_agent_home`)
+/// already exists here, so `ensure` never overwrites a packaged persona.
 pub fn ensure(id: u64, name: &str) {
     let home = path(id);
     let soul = format!("{}/SOUL.md", home);

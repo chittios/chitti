@@ -82,8 +82,12 @@ pub fn install(
     // the grant. (Bundled tools are gated by caps at call time regardless.)
     let _ = pkg.place_trusted();
 
-    // A skill-agent package registers a dispatchable role bounded by the grant.
+    // A skill-agent package registers a dispatchable role bounded by the grant,
+    // and lands its SOUL.md + procedure docs into the agent's home *before* the
+    // home is first ensured, so the packaged persona is never clobbered by the
+    // default one.
     if let Some(role) = &pkg.manifest.agent {
+        pkg.place_agent_home(role.id);
         agent_skill::register(role.clone(), granted.clone());
     }
 

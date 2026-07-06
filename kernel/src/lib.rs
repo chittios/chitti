@@ -46,6 +46,7 @@ pub mod qemu;
 pub mod sched;
 pub mod security;
 pub mod serial;
+pub mod service;
 pub mod session;
 pub mod shell;
 pub mod skills;
@@ -949,6 +950,75 @@ fn channel_handle_without_end_is_denied() {
     assert_eq!(channel::readable_len(ch), 0, "bytes leaked into a channel the caller holds no end to");
     channel::close_end(ch);
     channel::close_end(ch);
+}
+
+/// Installing a skill-agent package places its packaged SOUL.md into the agent's
+/// home and grants only the approved capability subset (Phase 2). Proves the
+/// "markdown-programmed installable agent" + "bounded by its install grant"
+/// path: the package requests Fs READ|WRITE, but the human approves READ only.
+#[test_case]
+fn agent_install_places_soul_and_grants_read_only_subset() {
+    use agent::types::{next_agent_id, next_skill_id, CapDomain, CapabilityRequest, InstallSource, Rights, Scope};
+
+    let skill = next_skill_id();
+    let agent_id = next_agent_id();
+    let mut pkg = skills::package::sample_report_agent(skill, agent_id);
+    pkg.sign();
+    assert!(pkg.verify(), "freshly signed sample must verify");
+
+    // Human approves READ only (the package requested READ|WRITE).
+    let approved = alloc::vec![CapabilityRequest::new(CapDomain::Fs, Rights::READ, Scope::Any)];
+    let rec = skills::install::install(&pkg, &approved, "tester", InstallSource::BootModule { name: "report-writer".into() }, 100)
+        .expect("install should succeed for a signed package + subset approval");
+
+    // The packaged SOUL.md landed in the agent's home (not the default persona).
+    let soul = synapse::fs::read(&alloc::format!("/agent/{}/SOUL.md", agent_id.0)).expect("SOUL.md placed");
+    assert!(
+        alloc::string::String::from_utf8_lossy(&soul).contains("report-writer agent"),
+        "packaged persona should be placed, got {:?}",
+        alloc::string::String::from_utf8_lossy(&soul)
+    );
+    // The grant is the intersection: READ survives, WRITE was never approved.
+    assert_eq!(rec.granted_capabilities.len(), 1);
+    assert!(rec.granted_capabilities[0].rights.contains(Rights::READ));
+    assert!(!rec.granted_capabilities[0].rights.contains(Rights::WRITE), "WRITE must not be granted — bounded by consent");
+    skills::install::uninstall(skill);
+}
+
+/// `channel_grant` moves a channel end to another agent (Phase 2): a holder of a
+/// write end hands it to a target task, which then genuinely holds
+/// `ChannelWrite`. Proves capability delegation across agents (the Network→SSH
+/// handoff primitive) — attenuation-only, since the caller can only grant an end
+/// it holds.
+#[test_case]
+fn channel_grant_hands_an_end_to_another_agent() {
+    use channel::ChannelKind;
+
+    let c = channel::create(ChannelKind::Stream, 64);
+    let me = sched::current_task_id();
+    cap::grant(me, cap::Right::InvokePrimitive(synapse::registry::CHANNEL_GRANT));
+    let write_slot = cap::grant(me, cap::Right::ChannelWrite(c)).0;
+    let target = sched::spawn_parked("grant-target");
+    assert!(!cap::holds(target, cap::Right::ChannelWrite(c)), "target starts with no end");
+
+    let call = alloc::format!(
+        r#"{{"name":"channel_grant","arguments":{{"chan":{write_slot},"to_agent":"{target}"}}}}"#
+    );
+    match synapse::execute(me, &call) {
+        synapse::Invocation::Executed { result, .. } => {
+            assert!(result.starts_with("ok:granted"), "unexpected grant result: {result}");
+        }
+        other => panic!("channel_grant did not execute: {other:?}"),
+    }
+    assert!(cap::holds(target, cap::Right::ChannelWrite(c)), "target must now hold the granted write end");
+    // Grant to a non-existent agent is refused cleanly.
+    let bad = alloc::format!(r#"{{"name":"channel_grant","arguments":{{"chan":{write_slot},"to_agent":"no-such-svc"}}}}"#);
+    match synapse::execute(me, &bad) {
+        synapse::Invocation::Executed { result, .. } => assert!(result.starts_with("error:no_such_agent")),
+        other => panic!("expected a clean no-such-agent result, got {other:?}"),
+    }
+    channel::close_end(c);
+    channel::close_end(c);
 }
 
 // --- Phase 6 acceptance tests (taint gate + compiled intents) -----------

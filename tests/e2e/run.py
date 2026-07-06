@@ -228,7 +228,33 @@ def s_voice_say(g):
     return ok, "TTS synth + play" if ok else "no voice output"
 
 
+# --- agents-as-apps scenarios (install/consent + service lifecycle) ---------
+
+def s_agents_services(g):
+    m = g.mark()
+    g.send("/agents services")
+    ok = g.wait_for("agents>", 15, m)
+    return ok, "service list rendered" if ok else "no /agents services output"
+
+
+def s_agents_install(g):
+    # Install a built-in signed skill-agent, approving every requested cap
+    # (--yes bypasses the per-cap consent modal for scripted runs).
+    m = g.mark()
+    g.send("/agents install report-writer --yes")
+    ok = g.wait_for("installed; granted", 25, m)
+    return ok, "skill-agent installed via consent flow" if ok else "install did not complete"
+
+
+def s_agents_uninstall(g):
+    m = g.mark()
+    g.send("/agents uninstall report-writer")
+    ok = g.wait_for("removed", 15, m)
+    return ok, "skill-agent uninstalled" if ok else "uninstall did not complete"
+
+
 OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS]
+AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall)]
 NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_stream", s_http_stream), ("ws", s_ws)]
 NET_TLS = [("wss", s_wss), ("model_remote_https", s_model_remote_https)]
 MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("compact", s_compact)]
@@ -259,7 +285,7 @@ def main():
         else:
             have_tls = False
 
-    scenarios = list(OS) + list(NET) + (list(NET_TLS) if have_tls else [])
+    scenarios = list(OS) + list(AGENTS) + list(NET) + (list(NET_TLS) if have_tls else [])
     if slow:
         if have_model:
             scenarios += list(MODEL)
