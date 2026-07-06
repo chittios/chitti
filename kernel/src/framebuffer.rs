@@ -1026,8 +1026,14 @@ impl Screen {
         let sy_top = self.height - bar_h;
         self.fill_rect(0, sy_top, self.width, bar_h, self.theme.status_bg);
         let ty = sy_top + 4;
-        // Left = brand text (accent), right = datetime (muted), right-aligned.
-        self.draw_str(OUTER, ty, &self.status_left, self.theme.accent, self.theme.status_bg);
+        // Left = the brand mark then the brand text (accent). The glyph radius is
+        // sized so the ring (extent ≈ 7/6·r) fits within the bar height.
+        let lr = (((bar_h / 2).saturating_sub(2)) * 6 / 7).max(5);
+        let lhalf = ((lr / 3).max(3)) / 2;
+        let lcx = OUTER + lr + lhalf;
+        self.draw_logo(lcx, sy_top + bar_h / 2, lr, self.theme.accent, self.theme.chat_fg);
+        let text_x = lcx + lr + lhalf + self.cw() / 2;
+        self.draw_str(text_x, ty, &self.status_left, self.theme.accent, self.theme.status_bg);
         // Right = datetime (muted), right-aligned. Both strings come from the UI
         // config templates via `set_status`.
         let rlen = self.status_right.len() as u64;
@@ -1058,15 +1064,17 @@ impl Screen {
         }
     }
 
-    /// Draw the **Synapse-C** brand mark centred at `(cx, cy)` with outer radius
-    /// `r`: an open-right "C" arc in `arc_c`, its two round end-caps and the small
-    /// synapse node (dot + four stubs) at the opening in `node_c`. Pure integer
-    /// math — a ring test plus an angular wedge for the opening — so it scales
-    /// from a status-bar glyph to a splash logo. Geometry mirrors the SVG
-    /// (endpoints at ±55°, node at 0.74r; see DESIGN.md).
+    /// Draw the **Synapse-C** brand mark centred at `(cx, cy)` with ring radius
+    /// `r`: a single open ring (the capability) in `arc_c` with round end-caps,
+    /// and a filled node (the agent) at the centre in `node_c`. Pure integer math
+    /// — a ring test plus one angular gap — so it scales from a status-bar glyph
+    /// to a splash logo. Geometry mirrors the SVG in DESIGN.md: stroke width ≈
+    /// `6/17·r`, a ~91° opening (dasharray 80/27) whose centre sits ~10° above the
+    /// +x axis (the SVG's `rotate(35)` on a dash starting at 3 o'clock), and a
+    /// centre node of radius ≈ `0.32·r` (SVG r 5.5 against ring r 17).
     fn draw_logo(&self, cx: u64, cy: u64, r: u64, arc_c: Rgb, node_c: Rgb) {
         let (cx, cy, r) = (cx as i64, cy as i64, r as i64);
-        let t = (r / 3).max(3); // ring thickness (26/78 of r), min 3 so a small mark still reads
+        let t = (r / 3).max(3); // stroke width, min 3 so a small mark still reads
         let half = t / 2;
         let (inner, outer) = ((r - half) * (r - half), (r + half) * (r + half));
         let span = r + half + 1;
@@ -1076,36 +1084,24 @@ impl Screen {
                 if d2 < inner || d2 > outer {
                     continue;
                 }
-                // The "C" opening: skip the +x wedge between ±55° (tan55 ≈ 1.428).
-                if dx > 0 && dy.abs() * 1000 < dx * 1428 {
+                // Skip the opening: a pixel is inside the gap when its direction is
+                // within ~45.4° of the gap centre (984,-180) ≈ (cos-10.4°,
+                // sin-10.4°); cos45.4° ≈ 0.701. `n` is the dot product ×1000.
+                let n = dx * 984 - dy * 180;
+                if n > 0 && n * n > 701 * 701 * d2 {
                     continue;
                 }
                 self.put_pixel((cx + dx) as u64, (cy + dy) as u64, arc_c);
             }
         }
-        // Round end-caps at ±55° (min 3 so the two dots read at status-bar size).
-        let (ex, ey) = (r * 574 / 1000, r * 819 / 1000); // cos55, sin55
-        let cap = (r / 5).max(3);
-        self.fill_disc(cx + ex, cy - ey, cap, node_c);
-        self.fill_disc(cx + ex, cy + ey, cap, node_c);
-        // The synapse node + its four stubs are sub-pixel below ~16px radius
-        // (they'd render as mud), so draw them only when the mark is large enough
-        // — a status-bar glyph is just the C with its two end dots.
-        if r >= 16 {
-            let (nx, ny) = (cx + r * 744 / 1000, cy);
-            let nr = (r / 12).max(1);
-            self.fill_disc(nx, ny, nr, node_c);
-            let (stub, lw, gap) = ((r / 6).max(2), (t / 6).max(1), nr + 1);
-            let put = |x: i64, y: i64, w: i64, h: i64| {
-                if x >= 0 && y >= 0 {
-                    self.fill_rect(x as u64, y as u64, w as u64, h as u64, node_c);
-                }
-            };
-            put(nx - lw / 2, ny - gap - stub, lw, stub); // up
-            put(nx - lw / 2, ny + gap, lw, stub); // down
-            put(nx - gap - stub, ny - lw / 2, stub, lw); // left
-            put(nx + gap, ny - lw / 2, stub, lw); // right
-        }
+        // Round line-caps at the two arc ends (35° and 304.6° in screen coords),
+        // in the ring colour, matching stroke-linecap="round".
+        let cap = half.max(1);
+        self.fill_disc(cx + r * 819 / 1000, cy + r * 574 / 1000, cap, arc_c); // 35°
+        self.fill_disc(cx + r * 562 / 1000, cy - r * 827 / 1000, cap, arc_c); // 304.6°
+        // The synapse node: a filled disc at the centre.
+        let nr = (r * 32 / 100).max(2);
+        self.fill_disc(cx, cy, nr, node_c);
     }
 
     /// Paint the boot splash: the brand mark, "Chitti OS", and a tagline, centred
@@ -1114,7 +1110,8 @@ impl Screen {
         self.fill_rect(0, 0, self.width, self.height, self.theme.screen_bg);
         let r = (self.height / 7).max(24);
         let cy = self.height * 2 / 5;
-        self.draw_logo(self.width / 2, cy, r, self.theme.chat_fg, self.theme.accent);
+        // Ring in terracotta (accent), node in cream (chat_fg) — see the SVG.
+        self.draw_logo(self.width / 2, cy, r, self.theme.accent, self.theme.chat_fg);
         let name = "Chitti OS";
         let nx = self.width / 2 - (name.len() as u64 * self.cw()) / 2;
         self.draw_str(nx, cy + r + r / 2, name, self.theme.accent, self.theme.screen_bg);

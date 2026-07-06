@@ -58,8 +58,12 @@ pub(crate) fn parse_url(url: &str) -> Result<(bool, String, u16, String), String
     Ok((tls, host.to_string(), port, path.to_string()))
 }
 
-/// `host` as an IPv4 literal, or resolved via DNS.
+/// `host` as an IPv4 literal, or resolved via DNS. `localhost` is the loopback
+/// address 127.0.0.1 (no DNS), so in-OS servers are reachable by name.
 pub(crate) fn host_ip(host: &str) -> Result<Ipv4Address, String> {
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(Ipv4Address::new(127, 0, 0, 1));
+    }
     let mut parts = [0u8; 4];
     let mut n = 0;
     for (i, seg) in host.split('.').enumerate() {
@@ -176,7 +180,7 @@ pub fn perform(
     let result = drive_stream(&mut conn, &wire, deadline, on_head, on_body);
     NET.with(|n| {
         if let Some(s) = n.as_mut() {
-            s.sockets.remove(handle);
+            s.tcp_set(handle).remove(handle.handle);
         }
     });
     result
@@ -245,25 +249,37 @@ pub fn request(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8], t
 
 /// Open a TCP socket to `ip:port` and wait for the connection to establish
 /// (bounded by `deadline`). Returns the socket handle (caller removes it).
-pub(crate) fn tcp_connect(ip: Ipv4Address, port: u16, deadline: u64) -> Result<smoltcp::iface::SocketHandle, String> {
+pub(crate) fn tcp_connect(ip: Ipv4Address, port: u16, deadline: u64) -> Result<super::TcpHandle, String> {
     // 64 KiB rx keeps the window open for a large completion; 16 KiB tx.
+    let is_loopback = ip.is_loopback();
     let handle = NET.with(|n| {
         let s = n.as_mut().ok_or("no network interface (try /network dhcp)")?;
-        if s.ip.is_none() {
+        // A loopback destination is always reachable via the loopback interface
+        // (127.0.0.1/8), so it needs no DHCP/static address; anything else does.
+        if !is_loopback && s.ip.is_none() {
             return Err("no IPv4 address (try /network dhcp)");
         }
         let sock = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
             tcp::SocketBuffer::new(vec![0u8; 16 * 1024]),
         );
-        let h = s.sockets.add(sock);
+        // The socket lives in the interface's own set, connected via that
+        // interface's context so its source address is chosen from it: 127.0.0.1
+        // for loopback (segments loop back to a local listener), the NIC address
+        // otherwise. The two sets are polled independently, never cross-dispatched.
         let local = 49152 + (crate::arch::now_ms() % 16000) as u16;
-        let cx = s.iface.context();
-        s.sockets
-            .get_mut::<tcp::Socket>(h)
-            .connect(cx, (IpAddress::Ipv4(ip), port), local)
-            .map_err(|_| "TCP connect failed to start")?;
-        Ok(h)
+        let h = if is_loopback {
+            let h = s.lo_sockets.add(sock);
+            let cx = s.lo_iface.context();
+            s.lo_sockets.get_mut::<tcp::Socket>(h).connect(cx, (IpAddress::Ipv4(ip), port), local).map_err(|_| "TCP connect failed to start")?;
+            h
+        } else {
+            let h = s.sockets.add(sock);
+            let cx = s.iface.context();
+            s.sockets.get_mut::<tcp::Socket>(h).connect(cx, (IpAddress::Ipv4(ip), port), local).map_err(|_| "TCP connect failed to start")?;
+            h
+        };
+        Ok(super::TcpHandle { handle: h, loopback: is_loopback })
     })
     .map_err(|e: &str| e.to_string())?;
     // Wait for the handshake so TLS starts on an established socket.
@@ -271,13 +287,13 @@ pub(crate) fn tcp_connect(ip: Ipv4Address, port: u16, deadline: u64) -> Result<s
         if crate::arch::now_ms() >= deadline {
             NET.with(|n| {
                 if let Some(s) = n.as_mut() {
-                    s.sockets.remove(handle);
+                    s.tcp_set(handle).remove(handle.handle);
                 }
             });
             return Err("TCP connect timeout".into());
         }
         super::poll();
-        let st = NET.with(|n| n.as_mut().map(|s| s.sockets.get_mut::<tcp::Socket>(handle).state()));
+        let st = NET.with(|n| n.as_mut().map(|s| s.tcp_set(handle).get_mut::<tcp::Socket>(handle.handle).state()));
         match st {
             Some(tcp::State::Established) => return Ok(handle),
             Some(tcp::State::Closed) => return Err("connection refused".into()),
@@ -424,6 +440,18 @@ mod tests {
         // A non-literal falls through to DNS, which errors with no interface up
         // (rather than misparsing) — we just assert it doesn't panic/parse.
         assert!(host_ip("not.an.ip.literal").is_err());
+    }
+
+    #[test_case]
+    fn host_ip_maps_localhost_to_loopback() {
+        // `localhost` resolves to the loopback address without DNS, and is
+        // recognised as loopback so connects route through the lo interface.
+        let lo = host_ip("localhost").unwrap();
+        assert_eq!(lo, Ipv4Address::new(127, 0, 0, 1));
+        assert!(lo.is_loopback());
+        assert!(host_ip("LOCALHOST").unwrap().is_loopback());
+        // A dotted-quad in 127/8 is also loopback (routes through lo, no NIC IP).
+        assert!(host_ip("127.0.0.1").unwrap().is_loopback());
     }
 
     #[test_case]

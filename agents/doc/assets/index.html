@@ -1,62 +1,190 @@
 <!doctype html>
 <html lang="en">
+
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Chitti OS — the agent is the driver</title>
-<style>
-  :root { --ink:#2b2622; --cream:#f5efe6; --paper:#fbf8f3; --accent:#cc785c; --muted:#8a7f74; --line:#e6ddcf; }
-  * { box-sizing: border-box; }
-  body { margin:0; font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; color:var(--ink); background:var(--paper); }
-  a { color:var(--accent); }
-  .wrap { max-width:760px; margin:0 auto; padding:0 24px; }
-  header { padding:72px 0 40px; text-align:center; }
-  header img { width:72px; height:72px; }
-  h1 { font-size:2.6rem; margin:18px 0 6px; letter-spacing:-0.02em; }
-  .tag { color:var(--muted); font-size:1.15rem; margin:0 0 8px; }
-  .cta { margin-top:26px; }
-  .cta a { display:inline-block; background:var(--accent); color:#fff; text-decoration:none; padding:11px 22px; border-radius:9px; font-weight:600; }
-  .cta a.ghost { background:transparent; color:var(--accent); border:1px solid var(--line); margin-left:10px; }
-  section { border-top:1px solid var(--line); padding:36px 0; }
-  h2 { font-size:1.4rem; margin:0 0 14px; }
-  .grid { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
-  @media (max-width:560px){ .grid{ grid-template-columns:1fr; } }
-  .card { background:var(--cream); border:1px solid var(--line); border-radius:12px; padding:18px; }
-  .card h3 { margin:0 0 6px; font-size:1.05rem; }
-  .card p { margin:0; color:var(--muted); font-size:0.95rem; }
-  code { background:var(--cream); border:1px solid var(--line); border-radius:6px; padding:1px 6px; font-size:0.9em; }
-  footer { border-top:1px solid var(--line); padding:28px 0 60px; color:var(--muted); font-size:0.9rem; text-align:center; }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chitti OS — the agent is the driver</title>
+  <style>
+    :root {
+      --ink: #2b2622;
+      --cream: #f5efe6;
+      --paper: #fbf8f3;
+      --accent: #cc785c;
+      --muted: #8a7f74;
+      --line: #e6ddcf;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: var(--ink);
+      background: var(--paper);
+    }
+
+    a {
+      color: var(--accent);
+    }
+
+    .wrap {
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    header {
+      padding: 72px 0 40px;
+      text-align: center;
+    }
+
+    header img {
+      width: 72px;
+      height: 72px;
+    }
+
+    h1 {
+      font-size: 2.6rem;
+      margin: 18px 0 6px;
+      letter-spacing: -0.02em;
+    }
+
+    .tag {
+      color: var(--muted);
+      font-size: 1.15rem;
+      margin: 0 0 8px;
+    }
+
+    .cta {
+      margin-top: 26px;
+    }
+
+    .cta a {
+      display: inline-block;
+      background: var(--accent);
+      color: #fff;
+      text-decoration: none;
+      padding: 11px 22px;
+      border-radius: 9px;
+      font-weight: 600;
+    }
+
+    .cta a.ghost {
+      background: transparent;
+      color: var(--accent);
+      border: 1px solid var(--line);
+      margin-left: 10px;
+    }
+
+    section {
+      border-top: 1px solid var(--line);
+      padding: 36px 0;
+    }
+
+    h2 {
+      font-size: 1.4rem;
+      margin: 0 0 14px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }
+
+    @media (max-width:560px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .card {
+      background: var(--cream);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 18px;
+    }
+
+    .card h3 {
+      margin: 0 0 6px;
+      font-size: 1.05rem;
+    }
+
+    .card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    code {
+      background: var(--cream);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 1px 6px;
+      font-size: 0.9em;
+    }
+
+    footer {
+      border-top: 1px solid var(--line);
+      padding: 28px 0 60px;
+      color: var(--muted);
+      font-size: 0.9rem;
+      text-align: center;
+    }
+  </style>
 </head>
+
 <body>
-<div class="wrap">
-  <header>
-    <img src="/logo.svg" alt="Chitti OS logo">
-    <h1>Chitti&nbsp;OS</h1>
-    <p class="tag">An agentic operating system, built from scratch, where the <em>agent</em> is the driver.</p>
-    <p class="cta"><a href="/docs">Read the docs</a><a class="ghost" href="https://github.com/chittios/chitti">Source</a></p>
-  </header>
+  <div class="wrap">
+    <header>
+      <img src="/logo.svg" alt="Chitti OS logo">
+      <h1>Chitti&nbsp;OS</h1>
+      <p class="tag">An agentic operating system, built from scratch, where the <em>agent</em> is the driver.</p>
+      <p class="cta"><a href="/docs">Read the docs</a><a class="ghost"
+          href="https://github.com/chittios/chitti">Source</a></p>
+    </header>
 
-  <section>
-    <p>There is no <code>exec(binary) → trap into syscalls</code>. Instead a tiny language model
-    runs on the CPU, on bare metal, and every effect it wants flows through a
-    capability-checked, audited, grammar-constrained ABI. Model output is an
-    <strong>untrusted plan</strong> — it never causes a side effect directly.</p>
-  </section>
+    <section>
+      <p>There is no <code>exec(binary) → trap into syscalls</code>. Instead a tiny language model
+        runs on the CPU, on bare metal, and every effect it wants flows through a
+        capability-checked, audited, grammar-constrained ABI. Model output is an
+        <strong>untrusted plan</strong> — it never causes a side effect directly.
+      </p>
+    </section>
 
-  <section>
-    <h2>What makes it different</h2>
-    <div class="grid">
-      <div class="card"><h3>Agents as apps</h3><p>Installed from a signed public registry, "programmed" in markdown — a SOUL, skills, and a manifest of permissions.</p></div>
-      <div class="card"><h3>Capability ABI</h3><p>Every tool call is capability-checked, scope-checked, taint-gated, and written to an append-only audit log.</p></div>
-      <div class="card"><h3>Agents that talk</h3><p>Byte-stream and datagram channels between agents — the Linux-pipe/socket analog, as unforgeable capabilities.</p></div>
-      <div class="card"><h3>Service agents</h3><p>Long-running native daemons: this very page is served by the Doc agent over the native HTTP service agent.</p></div>
-    </div>
-  </section>
+    <section>
+      <h2>What makes it different</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>Agents as apps</h3>
+          <p>Installed from a signed public registry, "programmed" in markdown — a SOUL, skills, and a manifest of
+            permissions.</p>
+        </div>
+        <div class="card">
+          <h3>Capability ABI</h3>
+          <p>Every tool call is capability-checked, scope-checked, taint-gated, and written to an append-only audit log.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Agents that talk</h3>
+          <p>Byte-stream and datagram channels between agents — the Linux-pipe/socket analog, as unforgeable
+            capabilities.</p>
+        </div>
+        <div class="card">
+          <h3>Service agents</h3>
+          <p>Long-running native daemons: this very page is served by the Doc agent over the native HTTP service agent.
+          </p>
+        </div>
+      </div>
+    </section>
 
-  <footer>
-    Served live by the <strong>Doc agent</strong> reading its own install folder. · GPLv3
-  </footer>
-</div>
+    <footer>
+      Served live by the <strong>Doc agent</strong> reading its own install folder. · GPLv3
+    </footer>
+  </div>
 </body>
+
 </html>

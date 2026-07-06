@@ -21,7 +21,6 @@ use crate::mm::Locked;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use smoltcp::iface::SocketHandle;
 
 /// Which flavour of conduit a channel is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,7 +58,7 @@ enum Backend {
     /// agent that accepts a connection can hand its stream to another agent as
     /// an ordinary channel — the Network→SSH connection handoff. Byte I/O routes
     /// straight through smoltcp; the channel refcount owns the socket's removal.
-    Tcp(SocketHandle),
+    Tcp(crate::net::TcpHandle),
 }
 
 struct Channel {
@@ -113,11 +112,12 @@ pub fn create(kind: ChannelKind, ring_cap: usize) -> ChannelId {
 }
 
 /// Adopt an already-connected TCP socket as a stream channel. Used by a Network
-/// service agent's accept path: the accepted `SocketHandle` becomes a channel
-/// whose ends can be granted to another agent. Starts with `ends = 2` (a read
-/// and a write end to grant); byte I/O routes through smoltcp and the socket is
-/// removed when the last end closes.
-pub fn adopt_tcp(handle: SocketHandle) -> ChannelId {
+/// service agent's accept path: the accepted [`TcpHandle`](crate::net::TcpHandle)
+/// (which records whether it lives in the NIC or loopback socket set) becomes a
+/// channel whose ends can be granted to another agent. Starts with `ends = 2` (a
+/// read and a write end to grant); byte I/O routes through smoltcp and the socket
+/// is removed when the last end closes.
+pub fn adopt_tcp(handle: crate::net::TcpHandle) -> ChannelId {
     let id = NEXT_CHANNEL.fetch_add(1, Ordering::SeqCst);
     CHANNELS.with(|m| m.insert(id, Channel { backend: Backend::Tcp(handle), ends: 2 }));
     id
