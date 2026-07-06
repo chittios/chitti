@@ -294,6 +294,11 @@ def s_doc_pipeline(g):
     # returns a well-formed 503 (still exercising all three agents); WITH a model
     # it serves the page (see the --slow doc_website scenario). Either way the
     # response must be a well-formed HTTP/1.1 message with a matching Content-Length.
+    #
+    # Also proves loopback: the SAME server is reached from the OS *itself* over
+    # 127.0.0.1 and by the name `localhost` — the guest `/http` client connects
+    # through the in-kernel loopback interface (never the NIC), so an in-OS client
+    # can talk to an in-OS listener.
     m = g.mark()
     g.send(f"/agents start doc {SVC_HTTP_PORT}")
     if not g.wait_for("web pipeline network->http->server", 15, m):
@@ -305,7 +310,20 @@ def s_doc_pipeline(g):
         return False, f"http request failed: {e}"
     ok = resp.startswith(b"HTTP/1.1 ") and _content_length_ok(resp)
     code = resp.split(b"\r\n", 1)[0].decode(errors="replace") if resp else "(no response)"
-    return ok, f"network->http->doc round-trips a valid HTTP response ({code})" if ok else f"bad response: {resp[:60]!r}"
+    if not ok:
+        return False, f"bad response: {resp[:60]!r}"
+    # Loopback: in-guest client → in-guest listener. Only a completed response
+    # prints "http> <status> (<n> bytes)"; a refused/timed-out connect takes the
+    # error path ("http> error: …") and never prints "bytes)".
+    lm = g.mark()
+    g.send(f"/http http://127.0.0.1:{SVC_HTTP_PORT}/")
+    lo_ip = g.wait_for("bytes)", 20, lm)
+    nm = g.mark()
+    g.send(f"/http http://localhost:{SVC_HTTP_PORT}/")
+    lo_name = g.wait_for("bytes)", 20, nm)
+    if not (lo_ip and lo_name):
+        return False, f"loopback failed (127.0.0.1={lo_ip}, localhost={lo_name})"
+    return True, f"network->http->doc round-trips over host + loopback (127.0.0.1, localhost) ({code})"
 
 
 def s_doc_website(g):

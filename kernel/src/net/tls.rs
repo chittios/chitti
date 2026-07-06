@@ -20,7 +20,6 @@ use alloc::string::String;
 use embedded_io::{ErrorType, Read as IoRead, Write as IoWrite};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
-use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 
 /// Seed a ChaCha20 CSPRNG for the TLS handshake. Mixes several hardware-random
@@ -54,7 +53,7 @@ pub fn seed_rng() -> ChaCha20Rng {
 /// on top of our poll-driven stack. `deadline` (an `arch::now_ms` value) bounds
 /// every wait.
 pub struct TcpStream {
-    pub handle: SocketHandle,
+    pub handle: super::TcpHandle,
     /// Fixed absolute read/write deadline (`arch::now_ms` value) — used by the
     /// one-shot HTTP path.
     pub deadline: u64,
@@ -68,12 +67,12 @@ pub struct TcpStream {
 
 impl TcpStream {
     /// A stream with a fixed absolute `deadline` (the HTTP request path).
-    pub fn new(handle: SocketHandle, deadline: u64) -> Self {
+    pub fn new(handle: super::TcpHandle, deadline: u64) -> Self {
         TcpStream { handle, deadline, rolling: None }
     }
     /// A stream whose deadline is read from (and bumped through) a shared
     /// atomic — for a long-lived TLS session (`wss://`).
-    pub fn with_rolling(handle: SocketHandle, rolling: &'static core::sync::atomic::AtomicU64) -> Self {
+    pub fn with_rolling(handle: super::TcpHandle, rolling: &'static core::sync::atomic::AtomicU64) -> Self {
         TcpStream { handle, deadline: 0, rolling: Some(rolling) }
     }
 }
@@ -115,7 +114,7 @@ impl IoRead for TcpStream {
             super::poll();
             let r = NET.with(|n| {
                 let s = n.as_mut().ok_or(StreamError("network down"))?;
-                let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
+                let sock = s.tcp_set(self.handle).get_mut::<tcp::Socket>(self.handle.handle);
                 if sock.can_recv() {
                     let k = sock.recv_slice(buf).map_err(|_| StreamError("recv"))?;
                     return Ok(Some(k));
@@ -144,7 +143,7 @@ impl IoWrite for TcpStream {
             super::poll();
             let r = NET.with(|n| {
                 let s = n.as_mut().ok_or(StreamError("network down"))?;
-                let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
+                let sock = s.tcp_set(self.handle).get_mut::<tcp::Socket>(self.handle.handle);
                 if !sock.may_send() {
                     return Err(StreamError("connection closed"));
                 }

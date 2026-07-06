@@ -256,14 +256,24 @@ real UEFI hardware.
   durable agent state on ext4.
 - **Networking** (`net/`) — a full TCP/IP stack on [smoltcp](third_party/smoltcp)
   (vendored in-tree, 0BSD — see [THIRDPARTY-LICENSES.md](THIRDPARTY-LICENSES.md)):
-  DHCPv4, static IP, DNS, ICMP (`/ping`), TCP/UDP. NIC drivers behind one
+  DHCPv4, static IP, DNS, ICMP (`/ping`), TCP/UDP, plus **loopback**
+  (`127.0.0.0/8` + the name `localhost`) so an in-OS client can reach an in-OS
+  listener. Loopback is a **second smoltcp interface** (Ethernet-medium
+  `phy::Loopback`, `127.0.0.1/8`) with its **own** socket set, polled alongside
+  the NIC interface — NOT the same set: sharing one set lets the loopback
+  interface's egress steal/drop the NIC sockets' segments. A `TcpHandle` tags
+  which set a socket lives in; a connect to a `127/8` address opens its socket in
+  the loopback set via that interface's context. A vendored RFC-1122 guard in
+  smoltcp `route()` keeps the NIC from ever emitting loopback traffic on the wire.
+  NIC drivers behind one
   `NetDevice` facade — **virtio-net** over virtio-mmio (aarch64 QEMU) and over
   PCI, plus **e1000** (VirtualBox default + real Intel) — discovered the same way
   on both arches. Shell surface: `/network` (info/dhcp/static/dns), `/ping`,
   `/wifi` (scan/connect via the password modal), a **TCP listener**
-  (`net::listen`/`try_accept`, backed by a pool of Listen-state sockets;
-  accept hands out an Established `SocketHandle` a service agent adopts as a
-  channel), `/http` (a curl-like
+  (`net::listen`/`try_accept`, backed by a pool of Listen-state sockets in
+  *both* the NIC and loopback sets, so one listener serves external/hostfwd and
+  `localhost` clients alike; accept hands out an Established `TcpHandle` a service
+  agent adopts as a channel), `/http` (a curl-like
   HTTP/1.1 client in `net/http.rs` — `-X`/`-H`/`-d`/`-v`/`--stream`, all
   methods, live chunked/SSE streaming; `http://` **and** `https://` via
   `net/tls.rs`/embedded-tls; also the agent's `http` tool), `/ws` (a
