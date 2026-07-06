@@ -142,7 +142,10 @@ mod tests {
         reset();
         RUNS.store(0, Ordering::SeqCst);
         let t0 = start(&ONESHOT);
-        assert!(task_for("test-oneshot").is_some(), "service should be registered");
+        // Registered under supervision (via `list`, not `task_for` — the one-shot
+        // may have already run to completion and died, and `task_for` is
+        // liveness-gated).
+        assert!(list().iter().any(|(n, _, _)| *n == "test-oneshot"), "service should be registered");
         // Let it run to completion (it just bumps RUNS and exits).
         let mut spins = 0;
         while sched::is_alive(t0) && spins < 10_000_000 {

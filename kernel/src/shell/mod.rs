@@ -890,7 +890,7 @@ fn json_args(body: &str) -> String {
 /// `<tool_call>{"name": .., "arguments": ..}</tool_call>`. Fallback: a
 /// `TOOL: /<cmd> [args]` line (small-model drift from older prompts). Returns
 /// the tool name and its flattened argument line.
-fn parse_tool_call(text: &str) -> Option<(alloc::string::String, alloc::string::String)> {
+pub(crate) fn parse_tool_call(text: &str) -> Option<(alloc::string::String, alloc::string::String)> {
     use alloc::string::ToString;
     // Qwen template.
     if let Some(start) = text.find("<tool_call>") {
@@ -1547,6 +1547,10 @@ struct ChatSession {
     /// Set when the user cancels (Ctrl+C / Esc) mid-prefill or mid-decode;
     /// `turn` checks it after every phase and ends the turn.
     cancelled: bool,
+    /// Greedy (argmax) decoding instead of temperature sampling — used for a
+    /// service agent's planning turn, where a deterministic decision (e.g. a
+    /// routing lookup) is wanted, not creative chat.
+    greedy: bool,
 }
 
 impl ChatSession {
@@ -1567,7 +1571,7 @@ impl ChatSession {
         spin.tick();
         // Seed the sampler from the boot clock so sessions vary.
         let rng = sampler::Rng::new(crate::arch::now_ms().wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-        Some(Self { model: m, tok, kv, state, pos: 0, rng, gen: alloc::vec::Vec::new(), cancelled: false })
+        Some(Self { model: m, tok, kv, state, pos: 0, rng, gen: alloc::vec::Vec::new(), cancelled: false, greedy: false })
     }
 
     /// One chat turn as an **agentic ReAct loop** over the Qwen3.5 tool
@@ -1875,7 +1879,35 @@ impl ChatSession {
             let l = logits[t];
             logits[t] = if l > 0.0 { l / PENALTY } else { l * PENALTY };
         }
-        sampler::sample_topk_topp(logits, TEMPERATURE, TOP_K, TOP_P, &mut self.rng, None)
+        // A planning turn decodes greedily (temperature 0 → argmax) for a stable
+        // decision; chat uses Qwen's recommended temperature sampling.
+        let temp = if self.greedy { 0.0 } else { TEMPERATURE };
+        sampler::sample_topk_topp(logits, temp, TOP_K, TOP_P, &mut self.rng, None)
+    }
+
+    /// One-shot planning turn for a service agent: reset to a fresh context,
+    /// prefill `system_prompt` (the agent's SOUL) + `user`, and decode a single
+    /// assistant reply — returned raw so the caller can parse the tool call the
+    /// model chose. Unlike `turn`, there is no ReAct loop and no shell persona:
+    /// the agent's own SOUL is the whole system prompt.
+    fn plan_once(&mut self, system_prompt: &str, user: &str) -> alloc::string::String {
+        use core::sync::atomic::Ordering;
+        // Force thinking off for a planning turn: a service agent must answer
+        // fast (within the pipeline deadline), not ruminate. Restore afterwards.
+        let prev_think = THINK_ON.swap(false, Ordering::Relaxed);
+        self.greedy = true; // deterministic routing decision
+        // Independent context per plan (routing one request must not accrete KV).
+        self.kv = self.model.new_cache();
+        self.state = self.model.new_state();
+        self.pos = 0;
+        self.gen.clear();
+        self.cancelled = false;
+        self.prefill_turn("system\n", system_prompt, false);
+        self.prefill_turn("user\n", user, true);
+        let out = self.generate_assistant("\x1b[2mdoc-agent plans:\x1b[0m ");
+        self.greedy = false;
+        THINK_ON.store(prev_think, Ordering::Relaxed);
+        out
     }
 
     /// Dispatch an isolated, **model-driven** sub-agent for `task` and return
@@ -1914,6 +1946,34 @@ impl ChatSession {
             Err(e) => alloc::format!("subagent dispatch refused: {:?}", e),
         }
     }
+}
+
+/// A dedicated planner model context for service agents (e.g. the Doc agent),
+/// separate from the interactive chat. Lazily loaded on first use; shares the
+/// model weights (a `Model<'static>` borrowing the static GGUF) with the chat —
+/// only the KV/state are per-context.
+static DOC_PLANNER: crate::mm::Locked<Option<ChatSession>> = crate::mm::Locked::new(None);
+
+/// Run one **planning turn** for a service agent: prefill `system_prompt` (the
+/// agent's SOUL) + `user` and decode a single reply, returned raw for the caller
+/// to interpret. This is the agent's *mind* — it makes the decision (e.g. which
+/// document to serve) from its SOUL; the caller then acts on that decision
+/// through the Synapse gate (capability + scope checked). Returns `None` if no
+/// model is loaded (the agent then can't plan). The planner context is taken out
+/// of the lock during inference so a multi-second forward pass never runs with
+/// the lock held.
+pub(crate) fn plan_reply(system_prompt: &str, user: &str) -> Option<alloc::string::String> {
+    let taken: Option<ChatSession> = DOC_PLANNER.with(|p| {
+        if p.is_none() {
+            let mut spin = Spinner::new("doc-planner");
+            *p = ChatSession::load(&mut spin);
+        }
+        p.take()
+    });
+    let mut sess = taken?;
+    let raw = sess.plan_once(system_prompt, user);
+    DOC_PLANNER.with(|p| *p = Some(sess));
+    Some(raw)
 }
 
 /// [`StepSource`] backed by the live Cortex model: each `next()` prefills any

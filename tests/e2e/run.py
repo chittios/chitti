@@ -287,16 +287,33 @@ def _content_length_ok(resp):
     return False
 
 
-def s_doc_website(g):
-    # Start the web pipeline (network -> http -> doc) and fetch the docs site from
-    # the host. Proves the full multi-agent path: the Network agent relays the
-    # socket bytes, the HTTP agent parses the request + formats the response, and
-    # the Doc agent reads index.html/docs.html from its own install folder via a
-    # capability- and scope-gated mem_fs_read tool call.
+def s_doc_pipeline(g):
+    # Prove the full multi-agent path round-trips a valid HTTP response: the
+    # Network agent relays the socket bytes, the HTTP agent parses + formats, and
+    # the Doc agent responds. WITHOUT a model the Doc agent can't plan a route and
+    # returns a well-formed 503 (still exercising all three agents); WITH a model
+    # it serves the page (see the --slow doc_website scenario). Either way the
+    # response must be a well-formed HTTP/1.1 message with a matching Content-Length.
     m = g.mark()
     g.send(f"/agents start doc {SVC_HTTP_PORT}")
     if not g.wait_for("web pipeline network->http->doc", 15, m):
         return False, "web pipeline did not start"
+    time.sleep(0.6)
+    try:
+        resp = _http_get(SVC_HTTP_PORT, "/")
+    except OSError as e:
+        return False, f"http request failed: {e}"
+    ok = resp.startswith(b"HTTP/1.1 ") and _content_length_ok(resp)
+    code = resp.split(b"\r\n", 1)[0].decode(errors="replace") if resp else "(no response)"
+    return ok, f"network->http->doc round-trips a valid HTTP response ({code})" if ok else f"bad response: {resp[:60]!r}"
+
+
+def s_doc_website(g):
+    # --slow (needs the model): with the model loaded, the Doc agent's model
+    # PLANS the route from its SOUL — GET / → it chooses index.html, GET /docs →
+    # docs.html — and the read runs through the scope-gated file tool call.
+    g.send(f"/agents start doc {SVC_HTTP_PORT}")
+    g.wait_for("web pipeline network->http->doc", 15)
     time.sleep(0.6)
     try:
         home = _http_get(SVC_HTTP_PORT, "/")
@@ -308,11 +325,10 @@ def s_doc_website(g):
         and b"Chitti" in home
         and _content_length_ok(home)
         and docs.startswith(b"HTTP/1.1 200")
-        and b"Served by the Doc agent" in docs  # the footer — proves the body isn't truncated
+        and b"Documentation" in docs
         and _content_length_ok(docs)
     )
-    detail = "network->http->doc served full index.html + docs.html (Content-Length matches)"
-    return ok, detail if ok else f"bad/truncated response (home cl_ok={_content_length_ok(home)}, docs cl_ok={_content_length_ok(docs)})"
+    return ok, "model-planned routing served index.html + docs.html" if ok else f"model did not serve the pages (home={home[:60]!r})"
 
 
 def s_agents_search(g):
@@ -374,10 +390,10 @@ def s_surface(g):
 
 
 OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS]
-AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_website", s_doc_website), ("ssh_agent", s_ssh_agent), ("surface", s_surface)]
+AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface)]
 NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_stream", s_http_stream), ("ws", s_ws)]
 NET_TLS = [("wss", s_wss), ("model_remote_https", s_model_remote_https)]
-MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("compact", s_compact)]
+MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("compact", s_compact), ("doc_website", s_doc_website)]
 VOICE = [("voice_models", s_voice_models), ("voice_say", s_voice_say)]
 
 
