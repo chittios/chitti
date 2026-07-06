@@ -193,17 +193,25 @@ real UEFI hardware.
   a JSON manifest under the repo's [`agents/`](agents/) folder (`network`, `http`,
   `doc`, `ssh`), are compiled into the image via `include_str!`, and are signed
   then installed into `/agent/<id>/` at boot by `agent::system::install_all` (same
-  permissioned flow as any package, pre-trusted; the Doc agent's HTML+logo assets
-  land in `/agent/<id>/assets/`). The web agents form a **pipeline**
-  (`service/pipeline.rs`), each single-responsibility, connected by datagram
-  channels: `network` owns the socket and relays raw bytes; `http` parses the
-  request + formats the response (no FS, no socket); `doc` maps a path to a file
-  and **reads it with a capability- and scope-gated `mem_fs_read` tool call**,
-  bounded to read-only access to its own install folder. `ssh` runs standalone
-  (RFC 4253 version exchange; transport is a stub). `/agents start doc [port]`
-  brings up the web pipeline; `/agents services` lists running stages. Git and
-  full SSH transport follow the same shape. To add a system agent: drop
-  `agents/<name>/{SOUL.md,manifest.json}` and register it in `agent/system.rs`.
+  permissioned flow as any package, pre-trusted; a content agent's assets land in
+  `/agent/<id>/assets/`). The web is a **generic pipeline** (`service/pipeline.rs`)
+  of single-responsibility stages connected by datagram channels — **all reusable
+  infrastructure, none app-specific**: `network` (`service/network.rs`) owns the
+  socket and relays raw bytes; `http` (`service/http.rs`) parses the request +
+  formats the response (no FS, no socket); `server` (`service/server.rs`) is a
+  **generic content runtime** that serves *whichever* content agent the pipeline
+  was started for — it asks that agent's model (prompted with the agent's own
+  `SOUL.md`) which file to serve, then reads it with a capability- and
+  scope-gated `mem_fs_read` tool call confined to the agent's own `assets/`.
+  So **a web server is just `agents/<name>/{SOUL.md, manifest.json, assets/…}`** —
+  the SOUL carries the routing/behaviour (model-planned per request, greedy), the
+  assets carry the content, and no per-server Rust is written. `doc` is exactly
+  such an agent (data, not code). `/agents start <name> [port]` serves that agent
+  over the pipeline; `ssh` runs standalone (RFC 4253 version exchange; transport
+  is a stub). `/agents services` lists running stages. Git + full SSH transport
+  follow the same native-protocol shape. To add a built-in server agent: drop
+  `agents/<name>/{SOUL.md,manifest.json,assets/…}` and register it in
+  `agent/system.rs` (one line) — or publish it to the registry.
 - **Cortex** (`cortex/`) — CPU transformer inference (Qwen3.5, `-model
   qwen3.5-0.8b|qwen3.5-4b|qwen3.5-9b`); SIMD tensor kernels (SSE2/AVX2 ∣ NEON ∣ scalar behind
   one API); zero-copy GGUF; grammar-constrained sampler; KV/recurrent cache.

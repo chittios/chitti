@@ -296,7 +296,7 @@ def s_doc_pipeline(g):
     # response must be a well-formed HTTP/1.1 message with a matching Content-Length.
     m = g.mark()
     g.send(f"/agents start doc {SVC_HTTP_PORT}")
-    if not g.wait_for("web pipeline network->http->doc", 15, m):
+    if not g.wait_for("web pipeline network->http->server", 15, m):
         return False, "web pipeline did not start"
     time.sleep(0.6)
     try:
@@ -313,7 +313,7 @@ def s_doc_website(g):
     # PLANS the route from its SOUL — GET / → it chooses index.html, GET /docs →
     # docs.html — and the read runs through the scope-gated file tool call.
     g.send(f"/agents start doc {SVC_HTTP_PORT}")
-    g.wait_for("web pipeline network->http->doc", 15)
+    g.wait_for("web pipeline network->http->server", 15)
     time.sleep(0.6)
     try:
         home = _http_get(SVC_HTTP_PORT, "/")
