@@ -71,6 +71,48 @@ pub fn add_wheel(dz: i32) {
     M.with(|s| s.wheel += dz);
 }
 
+/// A decoded PS/2 mouse packet: screen-oriented motion, button, wheel.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct Ps2Delta {
+    /// Horizontal motion (right positive).
+    pub dx: i32,
+    /// Vertical motion in **screen** orientation (down positive — PS/2's
+    /// up-positive Y is already negated here).
+    pub dy: i32,
+    /// Left button currently down.
+    pub left: bool,
+    /// Scroll delta (+ = wheel up / away from the user — PS/2's toward-user-
+    /// positive Z is negated to match [`add_wheel`]'s convention). 0 for a
+    /// 3-byte packet with no wheel.
+    pub wheel: i32,
+}
+
+/// Decode a standard PS/2 mouse packet (shared by the aarch64 PL050 and x86
+/// i8042 aux drivers, and unit-tested — the packet layout is fiddly and easy
+/// to break). `size` is 3 (plain) or 4 (IntelliMouse wheel). Byte 0 is the
+/// flags/sign byte; on an X/Y **overflow** the motion is dropped (garbage) but
+/// the button state is still reported. Returns `None` if `pkt` is too short.
+pub fn decode_ps2_packet(pkt: &[u8], size: usize) -> Option<Ps2Delta> {
+    if pkt.len() < size || size < 3 {
+        return None;
+    }
+    let flags = pkt[0];
+    let left = flags & 0x01 != 0;
+    // X/Y overflow bits (0x40/0x80): the movement bytes are meaningless, so
+    // report zero motion but keep the button state.
+    let (dx, dy) = if flags & 0xc0 != 0 {
+        (0, 0)
+    } else {
+        let dx = pkt[1] as i32 - if flags & 0x10 != 0 { 256 } else { 0 };
+        let dy = pkt[2] as i32 - if flags & 0x20 != 0 { 256 } else { 0 };
+        (dx, -dy) // PS/2 Y is up-positive; screen is down-positive
+    };
+    // IntelliMouse Z (byte 3): +1 = wheel toward the user (scroll down); negate
+    // so "wheel up" is positive, matching the wheel convention elsewhere.
+    let wheel = if size >= 4 { -(pkt[3] as i8 as i32) } else { 0 };
+    Some(Ps2Delta { dx, dy, left, wheel })
+}
+
 /// One idle tick's worth of mouse activity.
 pub struct Tick {
     pub moved: bool,
@@ -115,4 +157,54 @@ pub fn tick() -> Tick {
         }
         t
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Byte 0 always has bit 3 set on a real packet; include it in `flags`.
+    #[test_case]
+    fn ps2_basic_motion_and_button() {
+        // right 5, up 3 (PS/2 up-positive) → screen dy = -3; left down.
+        let d = decode_ps2_packet(&[0x09, 5, 3], 3).unwrap();
+        assert_eq!(d.dx, 5);
+        assert_eq!(d.dy, -3);
+        assert!(d.left);
+        assert_eq!(d.wheel, 0);
+    }
+
+    #[test_case]
+    fn ps2_sign_bits() {
+        // X sign bit (0x10): byte 0xFE → -2. Y sign bit (0x20): byte 0xFE →
+        // raw -2 → screen +2. No button.
+        let d = decode_ps2_packet(&[0x08 | 0x10 | 0x20, 0xFE, 0xFE], 3).unwrap();
+        assert_eq!(d.dx, -2);
+        assert_eq!(d.dy, 2);
+        assert!(!d.left);
+    }
+
+    #[test_case]
+    fn ps2_overflow_drops_motion_keeps_button() {
+        // X-overflow (0x40) → motion zeroed, but the left button still reports.
+        let d = decode_ps2_packet(&[0x08 | 0x40 | 0x01, 0x7F, 0x7F], 3).unwrap();
+        assert_eq!((d.dx, d.dy), (0, 0));
+        assert!(d.left);
+    }
+
+    #[test_case]
+    fn ps2_wheel_sign() {
+        // IntelliMouse Z: +1 = toward the user (scroll down) → wheel -1;
+        // 0xFF (-1) = away (scroll up) → wheel +1.
+        assert_eq!(decode_ps2_packet(&[0x08, 0, 0, 0x01], 4).unwrap().wheel, -1);
+        assert_eq!(decode_ps2_packet(&[0x08, 0, 0, 0xFF], 4).unwrap().wheel, 1);
+        // A 3-byte packet never yields a wheel delta, even with a 4th byte present.
+        assert_eq!(decode_ps2_packet(&[0x08, 0, 0, 0x01], 3).unwrap().wheel, 0);
+    }
+
+    #[test_case]
+    fn ps2_short_packet_is_rejected() {
+        assert!(decode_ps2_packet(&[0x08, 1], 3).is_none());
+        assert!(decode_ps2_packet(&[0x08, 1, 2], 4).is_none());
+    }
 }
