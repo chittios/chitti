@@ -137,12 +137,15 @@ struct PtrLayout {
     y_byte: u8,
     field_bytes: u8, // 1 or 2
     relative: bool,
-    scale_max: i32, // logical max for absolute scaling
+    scale_max: i32,         // logical max for absolute scaling
+    wheel_byte: Option<u8>, // byte offset of the scroll-wheel field (Usage 0x38), if present
 }
 
 impl PtrLayout {
-    /// The standard relative boot-mouse report: `[buttons, dx:i8, dy:i8]`.
-    const BOOT_MOUSE: PtrLayout = PtrLayout { btn_byte: 0, x_byte: 1, y_byte: 2, field_bytes: 1, relative: true, scale_max: 0 };
+    /// The standard relative boot-mouse report: `[buttons, dx:i8, dy:i8]`
+    /// (plus a wheel byte at offset 3 on wheel mice).
+    const BOOT_MOUSE: PtrLayout =
+        PtrLayout { btn_byte: 0, x_byte: 1, y_byte: 2, field_bytes: 1, relative: true, scale_max: 0, wheel_byte: Some(3) };
 }
 
 /// Per-device handles produced by `enumerate_common` (an addressed device with
@@ -797,9 +800,9 @@ impl Xhci {
             };
             (got.then(|| unsafe { parse_report_layout(c.buf_va, (rdlen as usize).min(4096)) }).flatten())
                 // Fallback: the common absolute tablet report [buttons, X:u16, Y:u16].
-                .unwrap_or(PtrLayout { btn_byte: 0, x_byte: 1, y_byte: 3, field_bytes: 2, relative: false, scale_max: 0x7fff })
+                .unwrap_or(PtrLayout { btn_byte: 0, x_byte: 1, y_byte: 3, field_bytes: 2, relative: false, scale_max: 0x7fff, wheel_byte: None })
         } else {
-            PtrLayout { btn_byte: 0, x_byte: 1, y_byte: 3, field_bytes: 2, relative: false, scale_max: 0x7fff }
+            PtrLayout { btn_byte: 0, x_byte: 1, y_byte: 3, field_bytes: 2, relative: false, scale_max: 0x7fff, wheel_byte: None }
         };
         let mut ptr = Ptr {
             slot: c.slot, int_dci, int_ring_va: int_va, int_ring_pa: int_pa,
@@ -974,6 +977,17 @@ impl Xhci {
                             crate::mouse::set_abs(x as i32, y as i32, lo.scale_max);
                         }
                         crate::mouse::set_left(rep[lo.btn_byte as usize] & 1 != 0);
+                        // Scroll wheel (HID Usage 0x38): a signed 8-bit delta,
+                        // +1 = wheel away from the user (scroll up). Feed it
+                        // straight through — mouse::add_wheel treats + as up.
+                        if let Some(wb) = lo.wheel_byte {
+                            if let Some(&z) = rep.get(wb as usize) {
+                                let dz = z as i8 as i32;
+                                if dz != 0 {
+                                    crate::mouse::add_wheel(dz);
+                                }
+                            }
+                        }
                         self.arm_int(m.int_ring_va, m.int_ring_pa, &mut m.int_enqueue, &mut m.int_cycle, m.report_pa, m.report_len, m.slot, m.int_dci);
                         continue;
                     }
@@ -1137,6 +1151,7 @@ unsafe fn parse_report_layout(buf: usize, len: usize) -> Option<PtrLayout> {
     let mut nusg = 0usize;
     let mut bit = 0u32; // current bit offset within the input report
     let (mut x, mut y, mut btn, mut rel): (Option<(u32, u32)>, Option<(u32, u32)>, Option<u32>, bool) = (None, None, None, false);
+    let mut wheel: Option<u32> = None; // bit offset of the Wheel field (Usage 0x38)
     let mut i = 0usize;
     while i < len {
         let b = unsafe { read_volatile((buf + i) as *const u8) };
@@ -1184,6 +1199,8 @@ unsafe fn parse_report_layout(buf: usize, len: usize) -> Option<PtrLayout> {
                             x_scale = logical_max; // capture the max in effect for X
                         } else if usage_page == 0x01 && u == 0x31 {
                             y = Some((fb, report_size));
+                        } else if usage_page == 0x01 && u == 0x38 && wheel.is_none() {
+                            wheel = Some(fb); // Generic Desktop / Wheel
                         } else if usage_page == 0x09 && btn.is_none() {
                             btn = Some(fb);
                         }
@@ -1205,6 +1222,7 @@ unsafe fn parse_report_layout(buf: usize, len: usize) -> Option<PtrLayout> {
         field_bytes: (xs / 8).max(1) as u8,
         relative: rel,
         scale_max: if x_scale > 0 { x_scale } else { 0x7fff },
+        wheel_byte: wheel.map(|w| (w / 8) as u8),
     })
 }
 
