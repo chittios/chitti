@@ -43,23 +43,51 @@ pub fn parse_request(buf: &[u8]) -> Option<Request> {
 }
 
 /// Format an HTTP/1.1 response from a content agent's reply frame, which is
-/// `"<status>\n<content-type>\n<body…>"` (status e.g. `200 OK`). This is the
-/// only place HTTP framing is produced.
+/// `"<status>\n<Header: Value>\n…\n\n<body…>"` — a status line, the agent's
+/// response headers, a blank line, then the raw body. This is the only place HTTP
+/// framing is produced: it emits the status + those headers and always appends a
+/// correct `Content-Length` (from the actual body) and `Connection: close`,
+/// defaulting `Content-Type` if the agent omitted one.
 pub fn format_response(reply: &[u8]) -> Vec<u8> {
-    // Split off the two header lines (status, content-type); the rest is body.
-    let mut nl = reply.splitn(3, |&b| b == b'\n');
-    let status = nl.next().unwrap_or(b"200 OK");
-    let ctype = nl.next().unwrap_or(b"application/octet-stream");
-    let body = nl.next().unwrap_or(b"");
-    let head = alloc::format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        String::from_utf8_lossy(status),
-        String::from_utf8_lossy(ctype),
-        body.len()
-    );
-    let mut out = head.into_bytes();
+    // Split the header block from the body at the first blank line.
+    let (head, body): (&[u8], &[u8]) = match find_blank_line(reply) {
+        Some(i) => (&reply[..i], &reply[i + 2..]),
+        None => (reply, b""),
+    };
+    let mut lines = head.split(|&b| b == b'\n');
+    let status = lines.next().unwrap_or(b"200 OK");
+    let mut out = alloc::format!("HTTP/1.1 {}\r\n", String::from_utf8_lossy(status)).into_bytes();
+    let mut has_ctype = false;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if line.len() >= 13 && line[..13].eq_ignore_ascii_case(b"content-type:") {
+            has_ctype = true;
+        }
+        // Skip any Content-Length/Connection the agent tried to set; we own those.
+        if starts_ci(line, b"content-length:") || starts_ci(line, b"connection:") {
+            continue;
+        }
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+    }
+    if !has_ctype {
+        out.extend_from_slice(b"Content-Type: application/octet-stream\r\n");
+    }
+    out.extend_from_slice(alloc::format!("Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes());
     out.extend_from_slice(body);
     out
+}
+
+/// Index of the first blank line (`\n\n`) separating headers from body, or `None`.
+fn find_blank_line(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\n\n")
+}
+
+/// Case-insensitive header-name prefix test.
+fn starts_ci(line: &[u8], prefix: &[u8]) -> bool {
+    line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 extern "C" fn http_serve(_arg: u64) {
@@ -115,19 +143,34 @@ mod tests {
 
     #[test_case]
     fn formats_a_response_from_a_content_reply() {
-        let resp = format_response(b"200 OK\ntext/html\n<h1>hi</h1>");
+        // New frame: status line, headers, blank line, then body.
+        let resp = format_response(b"200 OK\nContent-Type: text/html\n\n<h1>hi</h1>");
         let s = String::from_utf8(resp).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "status line: {s}");
         assert!(s.contains("Content-Type: text/html\r\n"));
         assert!(s.contains("Content-Length: 11\r\n"));
+        assert!(s.contains("Connection: close\r\n"));
         assert!(s.ends_with("\r\n\r\n<h1>hi</h1>"));
     }
 
     #[test_case]
-    fn formats_a_404_reply() {
-        let resp = format_response(b"404 Not Found\ntext/html\nnope");
+    fn passes_through_extra_headers_and_owns_length() {
+        // The agent's own headers are emitted; Content-Length is (re)computed and
+        // an agent-supplied Content-Length/Connection is dropped.
+        let resp = format_response(b"200 OK\nContent-Type: text/html\nX-Agent: doc\nContent-Length: 999\n\nhello");
+        let s = String::from_utf8(resp).unwrap();
+        assert!(s.contains("X-Agent: doc\r\n"), "{s}");
+        assert!(s.contains("Content-Length: 5\r\n"), "{s}"); // body len, not 999
+        assert_eq!(s.matches("Content-Length:").count(), 1);
+    }
+
+    #[test_case]
+    fn formats_a_404_reply_and_defaults_content_type() {
+        // No Content-Type header → a default is supplied.
+        let resp = format_response(b"404 Not Found\n\nnope");
         let s = String::from_utf8(resp).unwrap();
         assert!(s.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(s.contains("Content-Type: application/octet-stream\r\n"));
         assert!(s.contains("Content-Length: 4\r\n"));
     }
 }
