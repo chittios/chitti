@@ -1,0 +1,92 @@
+name: ci
+
+# Build + unit tests + end-to-end tests.
+#
+# FORK-PR SAFETY (why this can't be exploited by a malicious pull request):
+#   * Trigger is `pull_request`, NOT `pull_request_target`. A PR from a fork
+#     therefore runs with a **read-only** GITHUB_TOKEN and **no access to
+#     secrets** — the untrusted code has nothing to steal or push with. Do NOT
+#     change this to `pull_request_target` (that runs untrusted PR code in the
+#     base-repo context WITH secrets — the classic CI takeover).
+#   * `permissions:` is `contents: read` only, so even the token this workflow
+#     does get can't write to the repo, releases, packages, or issues.
+#   * No secrets are referenced anywhere; this workflow needs none.
+#   * Only GitHub-hosted runners are used (never self-hosted — a fork PR on a
+#     self-hosted runner is arbitrary code execution on your own infra).
+#   * `actions/checkout` is pinned to a commit SHA and checks out with
+#     `persist-credentials: false`, so the token isn't left in `.git/config`
+#     for the untrusted build steps that follow.
+# Net effect: a hostile PR can at worst waste ephemeral runner minutes.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# Least privilege: read the code, nothing else.
+permissions:
+  contents: read
+
+# One run per ref; cancel superseded runs (a force-push supersedes its predecessor).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast, reliable gate: cross-build both arches and run the in-kernel unit
+  # suite (x86 under QEMU, pure logic — no model/network/hardware needed).
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (no persisted credentials)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install QEMU (x86 test runner)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86
+
+      - name: Rust toolchain (from rust-toolchain.toml — nightly + rust-src + llvm-tools)
+        run: rustup show && rustc --version
+
+      - name: Build (x86_64)
+        run: cargo xtask build -arch x86_64
+
+      - name: Build (aarch64)
+        run: cargo xtask build -arch aarch64
+
+      - name: Unit tests (in-kernel, x86 under QEMU)
+        run: cargo xtask test
+
+  # End-to-end: boot the real kernel under QEMU and drive the shell over serial,
+  # exercising every OS command + the http/https/ws/wss/ping/hosted-model flows
+  # against local host servers (tests/e2e/). Runs on an aarch64 runner so it is
+  # the same path validated in dev (KVM when the runner exposes /dev/kvm, TCG
+  # otherwise — xtask picks automatically). Ubuntu's system python3 is OpenSSL 3,
+  # so the https/wss scenarios run (no extra deps). The bundled model is absent
+  # in CI, so the --slow model/voice groups aren't run here.
+  #
+  # If aarch64 runners aren't available for this repo, change `runs-on` to
+  # `ubuntu-latest` and add `-arch x86_64` to the make invocation.
+  e2e:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - name: Checkout (no persisted credentials)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install QEMU (aarch64) + openssl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-arm openssl
+
+      - name: Rust toolchain (from rust-toolchain.toml)
+        run: rustup show && rustc --version
+
+      - name: End-to-end tests (os + net groups)
+        run: make e2e ARCH=aarch64
