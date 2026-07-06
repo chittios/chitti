@@ -106,6 +106,19 @@ pub fn cpu_count() -> u64 {
     1
 }
 
+/// Cumulative compute-cycles core `core` has spent in the parallel matmul
+/// workers, for `/top`'s per-core utilisation. aarch64 splits inference across
+/// cores (`aarch64::smp`); x86 runs it single-core, so only core 0 is ever
+/// busy there (returns 0 for the rest).
+#[cfg(target_arch = "aarch64")]
+pub fn core_busy_cycles(core: usize) -> u64 {
+    aarch64::smp::core_busy_cycles(core)
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub fn core_busy_cycles(_core: usize) -> u64 {
+    0
+}
+
 /// A monotonically-advancing cycle/tick counter for entropy mixing (finer than
 /// `now_ms`): the TSC on x86, `CNTVCT_EL0` on aarch64.
 #[cfg(target_arch = "x86_64")]

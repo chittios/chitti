@@ -80,6 +80,28 @@ static JOB: Job = Job {
 /// Per-worker-slot "generation last completed", so the BSP can barrier on it.
 static DONE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
+/// Cumulative cycles (CNTVCT_EL0) each core has spent *computing* a matmul
+/// chunk — the numerator for `/top`'s per-core utilisation. Index = core id
+/// (0 = BSP). Workers accumulate in [`worker_loop`]; the BSP accumulates its
+/// own chunk in the `matmul_sdot`/`matvec_*` drivers. Since CNTVCT is a
+/// wall-clock counter shared by all cores, a core's busy% over a window is
+/// `(busy_delta) / (cntvct window)` — no frequency needed.
+static CORE_BUSY: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Cumulative compute-cycles for `core` (see [`CORE_BUSY`]). 0 for an unknown
+/// core. Read by the shell's `/top` to derive per-core busy percentages.
+pub fn core_busy_cycles(core: usize) -> u64 {
+    CORE_BUSY.get(core).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0)
+}
+
+/// Add `cycles` to `core`'s busy accumulator (the BSP records its own chunk).
+#[inline]
+fn add_busy(core: usize, cycles: u64) {
+    if let Some(a) = CORE_BUSY.get(core) {
+        a.fetch_add(cycles, Ordering::Relaxed);
+    }
+}
+
 extern "C" {
     /// The secondary-core entry stub (in `global_asm!` below). Its address is
     /// the PSCI `CPU_ON` entry point; it sets SP from the PSCI `context_id`,
@@ -226,6 +248,7 @@ fn worker_loop(slot: usize) -> ! {
         let rs = JOB.row_start[slot].load(Ordering::Relaxed);
         let re = JOB.row_end[slot].load(Ordering::Relaxed);
         if re > rs {
+            let t0 = super::cycle_count();
             let w = JOB.w.load(Ordering::Relaxed);
             let xq = JOB.xq.load(Ordering::Relaxed);
             let xs = JOB.xs.load(Ordering::Relaxed);
@@ -246,6 +269,8 @@ fn worker_loop(slot: usize) -> ! {
                     _ => tensor::matvec_quant_rows(qtype as u32, w, JOB.xf.load(Ordering::Relaxed), y, rs, re, n_cols),
                 }
             }
+            // Worker slot s runs on core s+1 (core 0 is the BSP).
+            add_busy(slot + 1, super::cycle_count().wrapping_sub(t0));
         }
         DONE[slot].store(g, Ordering::Release);
     }
@@ -298,7 +323,9 @@ pub unsafe fn matmul_sdot(
 
     // BSP computes chunk 0 while the workers run theirs.
     // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    let t0 = super::cycle_count();
     unsafe { tensor::matmul_q8_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, boundary(1), n_cols) };
+    add_busy(0, super::cycle_count().wrapping_sub(t0));
 
     // Barrier: wait for every worker to finish this generation.
     for s in 0..workers {
@@ -340,7 +367,9 @@ pub unsafe fn matvec_quant(qt: u32, w: *const u8, x: *const f32, y: *mut f32, n_
     JOB.go.store(g, Ordering::Release);
     signal_workers(); // wake WFE-parked workers
     // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    let t0 = super::cycle_count();
     unsafe { tensor::matvec_quant_rows(qt, w, x, y, 0, boundary(1), n_cols) };
+    add_busy(0, super::cycle_count().wrapping_sub(t0));
     for s in 0..workers {
         while DONE[s].load(Ordering::Acquire) != g {
             core::hint::spin_loop();
@@ -378,7 +407,9 @@ pub unsafe fn matvec_q4_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
     JOB.go.store(g, Ordering::Release);
     signal_workers(); // wake WFE-parked workers
     // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    let t0 = super::cycle_count();
     unsafe { tensor::matvec_q4_0_sdot_rows(w, xq, xs, y, 0, boundary(1), n_cols) };
+    add_busy(0, super::cycle_count().wrapping_sub(t0));
     for s in 0..workers {
         while DONE[s].load(Ordering::Acquire) != g {
             core::hint::spin_loop();
