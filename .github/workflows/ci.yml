@@ -33,21 +33,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Fast, reliable gate: cross-build both arches and run the in-kernel unit
-  # suite (x86 under QEMU, pure logic — no model/network/hardware needed).
+  # Cross-build both arches and run the in-kernel unit suite (pure logic — no
+  # model/network/hardware). The suite is x86: `cargo xtask test` builds an
+  # x86_64-chitti kernel, wraps it in a Limine ISO, and boots it under
+  # qemu-system-x86_64. On this aarch64 runner the x86 build cross-compiles
+  # (rust-lld, no external toolchain) and QEMU runs the guest under TCG.
+  #
+  # The x86 boot ISO needs Limine + xorriso (mtools too, for FAT paths). Ubuntu's
+  # apt `limine` is too old for the `limine.conf` (v8+) the kernel uses, so we
+  # clone a pinned Limine *binary* release and point xtask at it via
+  # CHITTI_LIMINE_SHARE/BIN. Fork-PR-safe: a public git clone over HTTPS, no
+  # secrets, pinned to a branch; the `limine` host tool is built with the runner's
+  # cc.
   unit:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
     steps:
       - name: Checkout (no persisted credentials)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
 
-      - name: Install QEMU (x86 test runner)
+      - name: Install QEMU (x86 guest, via TCG) + ISO tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso mtools
+
+      - name: Install Limine (pinned binary release for the x86 boot ISO)
+        run: |
+          git clone --depth 1 --branch v8.x-binary https://github.com/limine-bootloader/limine.git "$RUNNER_TEMP/limine"
+          make -C "$RUNNER_TEMP/limine"
+          echo "CHITTI_LIMINE_SHARE=$RUNNER_TEMP/limine" >> "$GITHUB_ENV"
+          echo "CHITTI_LIMINE_BIN=$RUNNER_TEMP/limine/limine" >> "$GITHUB_ENV"
 
       - name: Rust toolchain (from rust-toolchain.toml — nightly + rust-src + llvm-tools)
         run: rustup show && rustc --version
@@ -58,35 +75,45 @@ jobs:
       - name: Build (aarch64)
         run: cargo xtask build -arch aarch64
 
-      - name: Unit tests (in-kernel, x86 under QEMU)
+      - name: Unit tests (in-kernel, x86 under QEMU/TCG)
         run: cargo xtask test
 
   # End-to-end: boot the real kernel under QEMU and drive the shell over serial,
   # exercising every OS command + the http/https/ws/wss/ping/hosted-model flows
-  # against local host servers (tests/e2e/). Runs on an aarch64 runner so it is
-  # the same path validated in dev (KVM when the runner exposes /dev/kvm, TCG
-  # otherwise — xtask picks automatically). Ubuntu's system python3 is OpenSSL 3,
-  # so the https/wss scenarios run (no extra deps). The bundled model is absent
-  # in CI, so the --slow model/voice groups aren't run here.
+  # against local host servers, PLUS the --slow local-inference group (the model
+  # is fetched below) — /infer, /perf, chat, /compact, and the model-driven Doc
+  # web server (tests/e2e/). Runs on an aarch64 runner so it is the same path
+  # validated in dev (KVM when the runner exposes /dev/kvm, TCG otherwise — xtask
+  # picks automatically). Ubuntu's system python3 is OpenSSL 3, so the https/wss
+  # scenarios run (no extra deps). The voice bundle isn't fetched, so the --slow
+  # voice group auto-skips.
+  #
+  # The model GGUF is fetched over HTTPS from a public HuggingFace repo
+  # (`make model` -> `xtask/fetch-model.sh`, ~812 MB) — a public URL, no secrets,
+  # so this stays fork-PR-safe. It's downloaded fresh each run (no cache action to
+  # pin); add `actions/cache` on `assets/model.gguf` later if bandwidth matters.
   #
   # If aarch64 runners aren't available for this repo, change `runs-on` to
-  # `ubuntu-latest` and add `-arch x86_64` to the make invocation.
+  # `ubuntu-latest` and add `-arch x86_64` to the make invocations.
   e2e:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - name: Checkout (no persisted credentials)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
 
-      - name: Install QEMU (aarch64) + openssl
+      - name: Install QEMU (aarch64) + openssl + curl
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-arm openssl
+          sudo apt-get install -y --no-install-recommends qemu-system-arm openssl curl ca-certificates
 
       - name: Rust toolchain (from rust-toolchain.toml)
         run: rustup show && rustc --version
 
-      - name: End-to-end tests (os + net groups)
-        run: make e2e ARCH=aarch64
+      - name: Fetch the model (Qwen3.5-0.8B GGUF, ~812 MB, public HuggingFace)
+        run: make model
+
+      - name: End-to-end tests (os + net + agents, and --slow model group)
+        run: make e2e-full ARCH=aarch64
