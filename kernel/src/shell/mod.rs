@@ -195,6 +195,7 @@ pub fn run() -> ! {
                 }
                 "model" => run_model(arg, &mut remote_on, &mut remote_cfg, &mut remote_chat),
                 "http" => run_http(arg),
+                "ws" => run_ws(arg),
                 "session" => {
                     let (sub, sarg) = match arg.split_once(' ') {
                         Some((s, a)) => (s, a.trim()),
@@ -537,7 +538,8 @@ fn print_help() {
     serial_println!("  /session         show the current session; /session save | /session resume <id>");
     serial_println!("  /compact         compact the chat context (model-written summary, fresh KV)");
     serial_println!("  /model [..]      chat backend: local (embedded) | remote <http://host:port> [name]");
-    serial_println!("  /http get|post   one-shot HTTP over the LAN (plain http, no TLS)");
+    serial_println!("  /http [..] <url> curl-like: -X, -H, -d, -v, --stream (http:// + https://)");
+    serial_println!("  /ws <url> [msg]  connect a ws:// WebSocket and stream frames");
     serial_println!("  /skills          list installed skills (L0 metadata)");
     serial_println!("  /clear           reset the chat context + clear the pane (incl. scrollback)");
     serial_println!("  /infer           reference inference (fixed prompt, parity check)");
@@ -2090,39 +2092,236 @@ fn run_model(
 /// `/http` — one-shot HTTP client over the net stack (also the agent's `http`
 /// tool): `get <url>` or `post <url> <json-body>`. Plain http only; bodies are
 /// truncated for display/prompt sanity.
+/// Split a command line into tokens, honouring single/double quotes so a
+/// header or body with spaces stays one token (`-H "Content-Type: x"`). Pure +
+/// unit-tested.
+fn tokenize_args(s: &str) -> alloc::vec::Vec<String> {
+    let mut out = alloc::vec::Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut had = false; // saw a token boundary (so an empty quoted "" counts)
+    for c in s.chars() {
+        match quote {
+            Some(q) if c == q => {
+                quote = None;
+                had = true;
+            }
+            Some(_) => cur.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                had = true;
+            }
+            None if c.is_whitespace() => {
+                if !cur.is_empty() || had {
+                    out.push(core::mem::take(&mut cur));
+                    had = false;
+                }
+            }
+            None => cur.push(c),
+        }
+    }
+    if !cur.is_empty() || had {
+        out.push(cur);
+    }
+    out
+}
+
+/// A parsed curl-style `/http` invocation.
+struct HttpArgs {
+    method: String,
+    url: String,
+    headers: alloc::vec::Vec<(String, String)>,
+    body: String,
+    verbose: bool,
+    stream: bool,
+    err: Option<String>,
+}
+
+/// Parse curl-like flags: `-X <method>`, `-H "K: V"` (repeatable), `-d <body>`
+/// / `--data <body>`, `-v`/`--verbose`, `-N`/`--stream`. First bare token is
+/// the URL. Method defaults to GET, or POST when a body is given. Pure +
+/// unit-tested.
+fn parse_http_args(tokens: &[String]) -> HttpArgs {
+    let mut a = HttpArgs {
+        method: String::new(),
+        url: String::new(),
+        headers: alloc::vec::Vec::new(),
+        body: String::new(),
+        verbose: false,
+        stream: false,
+        err: None,
+    };
+    // Fetch the value token after a flag at index `i`; records an error and
+    // returns None when it's missing.
+    fn value(tokens: &[String], i: &mut usize, flag: &str, err: &mut Option<String>) -> Option<String> {
+        *i += 1;
+        if *i < tokens.len() {
+            Some(tokens[*i].clone())
+        } else {
+            if err.is_none() {
+                *err = Some(alloc::format!("{flag} needs a value"));
+            }
+            None
+        }
+    }
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i].as_str() {
+            "-X" | "--request" => {
+                if let Some(m) = value(tokens, &mut i, "-X", &mut a.err) {
+                    a.method = m.to_ascii_uppercase();
+                }
+            }
+            "-H" | "--header" => {
+                if let Some(h) = value(tokens, &mut i, "-H", &mut a.err) {
+                    if let Some((k, v)) = h.split_once(':') {
+                        a.headers.push((k.trim().to_string(), v.trim().to_string()));
+                    } else if a.err.is_none() {
+                        a.err = Some(alloc::format!("bad header '{h}' (expected 'Key: Value')"));
+                    }
+                }
+            }
+            "-d" | "--data" => {
+                if let Some(b) = value(tokens, &mut i, "-d", &mut a.err) {
+                    a.body = b;
+                }
+            }
+            "-v" | "--verbose" => a.verbose = true,
+            "-N" | "--stream" => a.stream = true,
+            "-I" | "--head" => a.method = "HEAD".to_string(),
+            t if t.starts_with('-') => a.err = Some(alloc::format!("unknown flag '{t}'")),
+            t if a.url.is_empty() => a.url = t.to_string(),
+            _ => {} // extra positional args ignored
+        }
+        i += 1;
+    }
+    if a.method.is_empty() {
+        a.method = if a.body.is_empty() { "GET".into() } else { "POST".into() };
+    }
+    a
+}
+
+/// `/http` — a curl-like HTTP client (also the agent's `http` tool): any
+/// method, custom headers, a request body, verbose head dump, and live
+/// streaming of chunked/SSE responses. http:// and https:// (TLS 1.3).
 fn run_http(arg: &str) {
-    let (verb, rest) = match arg.split_once(' ') {
-        Some((v, r)) => (v, r.trim()),
-        None => (arg.trim(), ""),
-    };
-    const CAP: usize = 4096;
-    let show = |resp: crate::net::http::Response| {
-        let text = resp.text();
-        let body = text.trim();
-        serial_println!("http> {} ({} bytes)", resp.status, resp.body.len());
-        if body.len() > CAP {
-            serial_println!("{}", &body[..CAP]);
-            serial_println!("http> … truncated ({} of {} bytes shown)", CAP, body.len());
-        } else if !body.is_empty() {
-            serial_println!("{}", body);
+    let tokens = tokenize_args(arg);
+    if tokens.is_empty() {
+        serial_println!("usage: /http [-X METHOD] [-H \"K: V\"]... [-d BODY] [-v] [--stream] <url>");
+        serial_println!("  e.g. /http https://host/v1/models");
+        serial_println!("       /http -X POST -H \"Content-Type: application/json\" -d '{{\"n\":1}}' http://host/api");
+        serial_println!("       /http --stream -H \"Accept: text/event-stream\" http://host/sse   (live)");
+        serial_println!("  needs /network up; https uses in-kernel TLS (server certs are NOT verified)");
+        return;
+    }
+    let a = parse_http_args(&tokens);
+    if let Some(e) = a.err {
+        serial_println!("http> {}", e);
+        return;
+    }
+    if a.url.is_empty() {
+        serial_println!("http> no URL given");
+        return;
+    }
+    let hdrs: alloc::vec::Vec<(&str, &str)> = a.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    // Verbose: print the request line + headers before sending.
+    if a.verbose {
+        serial_println!("\x1b[2m> {} {}\x1b[0m", a.method, a.url);
+        for (k, v) in &a.headers {
+            serial_println!("\x1b[2m> {}: {}\x1b[0m", k, v);
+        }
+    }
+    let verbose = a.verbose;
+    let mut on_head = |h: &crate::net::http::Head| {
+        if verbose {
+            serial_println!("\x1b[2m< {}\x1b[0m", h.status);
+            for (k, v) in &h.headers {
+                serial_println!("\x1b[2m< {}: {}\x1b[0m", k, v);
+            }
         }
     };
-    match verb {
-        "get" if !rest.is_empty() => match crate::net::http::get(rest, 30_000) {
-            Ok(r) => show(r),
-            Err(e) => serial_println!("http> error: {}", e),
-        },
-        "post" => match rest.split_once(' ') {
-            Some((url, body)) => match crate::net::http::post_json(url, body.trim(), None, 60_000) {
-                Ok(r) => show(r),
-                Err(e) => serial_println!("http> error: {}", e),
-            },
-            None => serial_println!("usage: /http post <url> <json-body>"),
-        },
-        _ => {
-            serial_println!("usage: /http get <url> | /http post <url> <json-body>");
-            serial_println!("  plain http:// only (no TLS) — host/LAN endpoints; needs /network up");
+    // Streaming: print body bytes live as UTF-8. Buffered: collect + cap.
+    const CAP: usize = 8192;
+    let mut collected: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let stream = a.stream;
+    let mut on_body = |chunk: &[u8]| {
+        if stream {
+            serial_print!("{}", core::str::from_utf8(chunk).unwrap_or("<binary>"));
+        } else if collected.len() < CAP {
+            collected.extend_from_slice(chunk);
         }
+    };
+    // A streamed response (SSE) can run long; give it a generous budget.
+    let timeout = if a.stream { 300_000 } else { 60_000 };
+    match crate::net::http::perform(&a.method, &a.url, &hdrs, a.body.as_bytes(), timeout, &mut on_head, &mut on_body) {
+        Ok(head) => {
+            if a.stream {
+                serial_println!("");
+                serial_println!("http> {} (streamed)", head.status);
+            } else {
+                let text = String::from_utf8_lossy(&collected);
+                let body = text.trim();
+                serial_println!("http> {} ({} bytes)", head.status, collected.len());
+                if !body.is_empty() {
+                    serial_println!("{}", body);
+                    if collected.len() >= CAP {
+                        serial_println!("http> … truncated at {} bytes", CAP);
+                    }
+                }
+            }
+        }
+        Err(e) => serial_println!("http> error: {}", e),
+    }
+}
+
+/// `/ws` — connect to a `ws://` WebSocket, optionally send a message, then
+/// stream incoming frames live until the peer closes, Ctrl+C, or Esc.
+fn run_ws(arg: &str) {
+    let tokens = tokenize_args(arg);
+    if tokens.is_empty() {
+        serial_println!("usage: /ws <ws://host:port/path> [message]");
+        serial_println!("  connects, sends [message] if given, then streams frames (Ctrl+C/Esc to stop)");
+        serial_println!("  ws:// only (plaintext, LAN); needs /network up");
+        return;
+    }
+    let url = &tokens[0];
+    let msg = tokens.get(1).cloned();
+    let mut ws = match crate::net::ws::WebSocket::connect(url) {
+        Ok(w) => w,
+        Err(e) => {
+            serial_println!("ws> error: {}", e);
+            return;
+        }
+    };
+    serial_println!("ws> connected — {} (Ctrl+C or Esc to close)", url);
+    if let Some(m) = &msg {
+        if let Err(e) = ws.send_text(m) {
+            serial_println!("ws> send error: {}", e);
+        } else {
+            serial_println!("\x1b[2mws> sent: {}\x1b[0m", m);
+        }
+    }
+    loop {
+        match ws.recv(400) {
+            Ok(Some(crate::net::ws::Msg::Text(t))) => serial_println!("\x1b[36mws<\x1b[0m {}", t),
+            Ok(Some(crate::net::ws::Msg::Binary(b))) => serial_println!("\x1b[36mws<\x1b[0m <{} binary bytes>", b.len()),
+            Ok(Some(crate::net::ws::Msg::Closed)) => {
+                serial_println!("ws> closed by peer");
+                break;
+            }
+            Ok(None) => {} // nothing this window; fall through to the key check
+            Err(e) => {
+                serial_println!("ws> error: {}", e);
+                break;
+            }
+        }
+        // Ctrl+C (0x03) or Esc (0x1b) ends the session.
+        if matches!(crate::console::read_byte(), Some(3) | Some(0x1b)) {
+            serial_println!("ws> closing");
+            ws.close();
+            break;
+        }
+        ui_tick();
     }
 }
 
@@ -2265,7 +2464,7 @@ static HISTORY: Locked<alloc::vec::Vec<String>> = Locked::new(alloc::vec::Vec::n
 /// Top-level `/command` names, for Tab completion (canonical names only, not
 /// aliases). Keep in sync with `dispatch_system` + the interactive arms.
 const COMMANDS: &[&str] = &[
-    "agents", "bench", "cat", "clear", "close", "compact", "datetime", "disks", "exit", "help", "http", "infer", "info", "model", "top",
+    "agents", "bench", "cat", "clear", "close", "compact", "datetime", "disks", "exit", "help", "http", "infer", "info", "model", "top", "ws",
     "install", "ktrace", "ls", "mkext4", "mode", "mount", "mounts", "network", "open", "perf",
     "lspci", "onnx", "ping", "session", "shortcuts", "skills", "think", "ui", "umount", "voice", "wifi",
 ];
@@ -3771,6 +3970,35 @@ mod agent_flow_tests {
 
     /// The system prompt advertises only the small CORE set + search_tools —
     /// this is what stops the 0.8B model calling `help` on a bare "hello".
+    #[test_case]
+    fn http_arg_tokenize_quotes() {
+        // Quoted header + body stay single tokens.
+        let t = tokenize_args("-X POST -H \"Content-Type: application/json\" -d '{\"n\":1}' http://h/api");
+        assert_eq!(t, alloc::vec![
+            "-X".to_string(), "POST".to_string(), "-H".to_string(),
+            "Content-Type: application/json".to_string(), "-d".to_string(),
+            "{\"n\":1}".to_string(), "http://h/api".to_string(),
+        ]);
+    }
+
+    #[test_case]
+    fn http_args_parse_curl_flags() {
+        let a = parse_http_args(&tokenize_args("-X put -H \"A: 1\" -H \"B: 2\" -d body -v --stream http://h/x"));
+        assert!(a.err.is_none());
+        assert_eq!(a.method, "PUT"); // upper-cased
+        assert_eq!(a.url, "http://h/x");
+        assert_eq!(a.headers.len(), 2);
+        assert_eq!(a.headers[0], ("A".to_string(), "1".to_string()));
+        assert_eq!(a.body, "body");
+        assert!(a.verbose && a.stream);
+        // Body with no explicit method defaults to POST; bare URL defaults GET.
+        assert_eq!(parse_http_args(&tokenize_args("-d x http://h")).method, "POST");
+        assert_eq!(parse_http_args(&tokenize_args("http://h")).method, "GET");
+        // -I is HEAD; a bad header is reported.
+        assert_eq!(parse_http_args(&tokenize_args("-I http://h")).method, "HEAD");
+        assert!(parse_http_args(&tokenize_args("-H nocolon http://h")).err.is_some());
+    }
+
     #[test_case]
     fn system_prompt_is_compact_with_search_tools() {
         let toolset: alloc::vec::Vec<String> = alloc::vec!["ls".into(), "cat".into(), "help".into(), "wifi".into()];
