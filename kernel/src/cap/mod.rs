@@ -20,6 +20,18 @@ pub type EndpointId = u64;
 /// module -- having to depend upward on the Phase 4 `synapse` layer.
 pub type PrimitiveId = u16;
 
+/// Identifies an inter-agent byte/datagram channel (`channel::create`).
+/// Defined here (not in `channel`) for the same structural-naming reason as
+/// [`EndpointId`]: `Right` can name a channel without a circular dependency on
+/// the `channel` module. A channel end is granted per-direction, so a channel
+/// handle held by a task is unforgeable in exactly the way an IPC endpoint cap
+/// is — see [`Right::ChannelWrite`]/[`Right::ChannelRead`].
+pub type ChannelId = u64;
+
+/// Identifies a network listener (`net::listen`). Same structural-naming
+/// rationale as [`EndpointId`]/[`ChannelId`].
+pub type ListenerId = u64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Right {
     IpcSend(EndpointId),
@@ -28,6 +40,20 @@ pub enum Right {
     /// only call a primitive it holds the matching `InvokePrimitive` right
     /// for -- no ambient authority over the capability ABI.
     InvokePrimitive(PrimitiveId),
+    /// Authority to push bytes/datagrams into a channel. Held per-direction:
+    /// granting the write end never confers the read end, so attenuation is
+    /// structural (exactly like `IpcSend` vs `IpcReceive`). A channel handle
+    /// argument the model emits is resolved as a `Cap` slot in the caller's
+    /// own table (`synapse::executor`), so a guessed integer only ever indexes
+    /// the caller's own capability space — no ambient authority over channels.
+    ChannelWrite(ChannelId),
+    /// Authority to pull bytes/datagrams out of a channel. See
+    /// [`Right::ChannelWrite`].
+    ChannelRead(ChannelId),
+    /// Authority to accept inbound connections on a network listener
+    /// (`net::listen`/`net_accept`). Minted by `net_listen` into the caller's
+    /// own table, resolved as a `Cap` slot the same way channel ends are.
+    NetListen(ListenerId),
 }
 
 /// An opaque handle into the holder's own `CapTable`. The index is

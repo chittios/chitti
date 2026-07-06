@@ -199,6 +199,19 @@ pub fn primitives_for(caps: &[CapabilityRequest]) -> Vec<PrimitiveId> {
             }
             CapDomain::Console => prims.push(registry::CONSOLE_WRITE),
             CapDomain::Spawn => prims.push(registry::SPAWN_AGENT),
+            CapDomain::Channel => {
+                // Coarse "may touch the channel ABI" authority. Which specific
+                // channel/direction is a separate per-end `ChannelRead/Write`
+                // grant resolved by the executor, so this stays broad on purpose.
+                prims.push(registry::CHANNEL_CREATE);
+                prims.push(registry::CHANNEL_CLOSE);
+                if c.rights.contains(Rights::WRITE) {
+                    prims.push(registry::CHANNEL_WRITE);
+                }
+                if c.rights.contains(Rights::READ) {
+                    prims.push(registry::CHANNEL_READ);
+                }
+            }
             CapDomain::Inference | CapDomain::Todo | CapDomain::Ipc | CapDomain::SkillManage => {}
         }
     }

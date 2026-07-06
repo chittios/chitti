@@ -62,6 +62,12 @@ pub const EMIT_RESULT: PrimitiveId = 6;
 pub const MEM_FS_DELETE: PrimitiveId = 7;
 pub const MEM_FS_EDIT: PrimitiveId = 8;
 pub const MEM_FS_SEARCH: PrimitiveId = 9;
+// Inter-agent channels (Phase 1). Handle args (`chan`) are the caller's own
+// `Cap` slot index, resolved by the executor — never a global id.
+pub const CHANNEL_CREATE: PrimitiveId = 10;
+pub const CHANNEL_WRITE: PrimitiveId = 11;
+pub const CHANNEL_READ: PrimitiveId = 12;
+pub const CHANNEL_CLOSE: PrimitiveId = 13;
 
 const STR: ArgType = ArgType::Str;
 const UINT: ArgType = ArgType::Uint;
@@ -137,6 +143,34 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
         name: "mem_fs_search",
         params: &[Param { key: "query", ty: STR }],
         description: "List the paths of files whose contents contain `query`.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: CHANNEL_CREATE,
+        name: "channel_create",
+        params: &[Param { key: "kind", ty: STR }],
+        description: "Create an inter-agent channel (kind: \"stream\" or \"datagram\"). Returns the read and write end cap slots granted to the caller.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: CHANNEL_WRITE,
+        name: "channel_write",
+        params: &[Param { key: "chan", ty: UINT }, Param { key: "text", ty: STR }],
+        description: "Write text bytes to a channel. `chan` is the caller's write-end cap slot. Returns bytes written or blocked.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: CHANNEL_READ,
+        name: "channel_read",
+        params: &[Param { key: "chan", ty: UINT }, Param { key: "max", ty: UINT }],
+        description: "Read up to `max` bytes from a channel. `chan` is the caller's read-end cap slot. Cooperatively blocks briefly; returns data or eof.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: CHANNEL_CLOSE,
+        name: "channel_close",
+        params: &[Param { key: "chan", ty: UINT }],
+        description: "Close the caller's channel end named by cap slot `chan`.",
         destructive: false,
     },
 ];

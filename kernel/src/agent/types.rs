@@ -125,6 +125,7 @@ pub enum CapDomain {
     Inference,   // request Cortex forward passes
     Ipc,         // send/receive IPC
     SkillManage, // install/uninstall skills (privileged)
+    Channel,     // create inter-agent byte/datagram channels; use granted ends
 }
 
 bitflags::bitflags! {

@@ -20,11 +20,13 @@
 use super::grammar::{self, ArgValue, Call, GrammarError};
 use super::registry::{self, PrimitiveSpec};
 use super::{audit, fs};
-use crate::cap::{self, Right};
+use crate::cap::{self, Cap, ChannelId, Right};
+use crate::channel;
 use crate::sched::{self, TaskId};
 use crate::security::Justification;
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The structured result of an invocation attempt, returned to the caller
@@ -95,7 +97,7 @@ pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Just
     }
 
     // Gate 4: execute in isolation, then audit the effect.
-    let result = run_primitive(spec, &call.args);
+    let result = run_primitive(caller, spec, &call.args);
     let result_hash = audit::fnv1a(result.as_bytes());
     audit::record(caller, spec.name, args_hash, audit::Outcome::Executed, result_hash);
     Invocation::Executed { primitive: spec.name, result }
@@ -106,12 +108,34 @@ pub fn execute_current(raw: &str) -> Invocation {
     execute(sched::current_task_id(), raw)
 }
 
+/// Cooperative-blocking budget for `channel_read`: the model never sees an
+/// infinite hang — after this many ms with no data it gets `ok:blocked` and
+/// re-plans. Native service loops use `channel::read_blocking` directly with
+/// their own budget.
+const CHANNEL_READ_DEADLINE_MS: u64 = 30_000;
+
+/// Resolve a model-emitted channel handle (`chan`/`max` arg `i`, a `Uint`) as a
+/// `Cap` slot index into the CALLER'S OWN table. Returns the channel id and
+/// whether the end is the write side. This is what keeps channel handles
+/// unforgeable: a guessed integer only ever indexes the caller's own capability
+/// space (mirrors `ipc::send`'s `cap::lookup`), never a global channel id.
+fn resolve_channel_end(caller: TaskId, args: &[ArgValue], i: usize) -> Option<(ChannelId, bool)> {
+    let slot = arg_uint(args, i) as u32;
+    match cap::lookup(caller, Cap(slot)) {
+        Some(Right::ChannelWrite(c)) => Some((c, true)),
+        Some(Right::ChannelRead(c)) => Some((c, false)),
+        _ => None,
+    }
+}
+
 /// Dispatch a validated call to its native implementation. Each arm sees
 /// only its typed arguments and the one subsystem its registry entry names;
 /// none can reach the caller's memory or another task's state. The grammar
 /// has already guaranteed argument arity and types, so the accessors below
-/// are total for any call the grammar accepted.
-fn run_primitive(spec: &PrimitiveSpec, args: &[ArgValue]) -> String {
+/// are total for any call the grammar accepted. `caller` is threaded in so the
+/// channel primitives can resolve a handle arg against the caller's own cap
+/// table (the fine-grained second gate, on top of `InvokePrimitive`).
+fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> String {
     match spec.id {
         registry::CONSOLE_WRITE => {
             let text = arg_str(args, 0);
@@ -194,6 +218,73 @@ fn run_primitive(spec: &PrimitiveSpec, args: &[ArgValue]) -> String {
                 }
             }
             format!("ok:[{}]", hits.join(","))
+        }
+        registry::CHANNEL_CREATE => {
+            let kind = match arg_str(args, 0) {
+                "stream" => channel::ChannelKind::Stream,
+                "datagram" => channel::ChannelKind::Datagram,
+                other => return format!("error:bad_kind:{other}"),
+            };
+            let id = channel::create(kind, 64 * 1024);
+            // Mint both ends into the CALLER'S OWN table and hand back the two
+            // slot indices; the caller reads them out of this result and uses
+            // them as the `chan` arg on later calls — a capability round-trip
+            // that never leaves its own table.
+            let read_slot = cap::grant(caller, Right::ChannelRead(id)).0;
+            let write_slot = cap::grant(caller, Right::ChannelWrite(id)).0;
+            format!("ok:channel_read={read_slot} channel_write={write_slot}")
+        }
+        registry::CHANNEL_WRITE => {
+            match resolve_channel_end(caller, args, 0) {
+                Some((c, true)) => {
+                    let text = arg_str(args, 1);
+                    match channel::try_write(c, text.as_bytes()) {
+                        Ok(0) => "ok:blocked".to_string(),
+                        Ok(n) => format!("ok:wrote={n}"),
+                        Err(e) => format!("error:{e:?}"),
+                    }
+                }
+                _ => {
+                    cap::record_denial(caller, "channel_write (handle)");
+                    "error:denied_channel_handle".to_string()
+                }
+            }
+        }
+        registry::CHANNEL_READ => {
+            match resolve_channel_end(caller, args, 0) {
+                Some((c, false)) => {
+                    let max = (arg_uint(args, 1) as usize).clamp(1, 64 * 1024);
+                    let mut buf = vec![0u8; max];
+                    let deadline = crate::arch::now_ms() + CHANNEL_READ_DEADLINE_MS;
+                    match channel::read_blocking(c, &mut buf, deadline) {
+                        Ok(0) => "ok:eof".to_string(),
+                        Ok(n) => format!("ok:data={}", String::from_utf8_lossy(&buf[..n])),
+                        Err(channel::ChannelError::WouldBlock) => "ok:blocked".to_string(),
+                        Err(e) => format!("error:{e:?}"),
+                    }
+                }
+                _ => {
+                    cap::record_denial(caller, "channel_read (handle)");
+                    "error:denied_channel_handle".to_string()
+                }
+            }
+        }
+        registry::CHANNEL_CLOSE => {
+            match resolve_channel_end(caller, args, 0) {
+                Some((c, is_write)) => {
+                    if is_write {
+                        channel::close_write(c);
+                    } else {
+                        channel::close_read(c);
+                    }
+                    channel::close_end(c);
+                    "ok:closed".to_string()
+                }
+                _ => {
+                    cap::record_denial(caller, "channel_close (handle)");
+                    "error:denied_channel_handle".to_string()
+                }
+            }
         }
         other => format!("error:unimplemented primitive id {other}"),
     }
