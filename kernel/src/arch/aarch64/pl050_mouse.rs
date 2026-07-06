@@ -32,9 +32,11 @@ const CANDIDATE_BASES: [u64; 4] = [
 ];
 
 static BASE: Locked<u64> = Locked::new(0);
-/// 3-byte PS/2 packet accumulator.
-static PKT: Locked<[u8; 3]> = Locked::new([0; 3]);
+/// PS/2 packet accumulator (4 bytes when the IntelliMouse wheel is enabled).
+static PKT: Locked<[u8; 4]> = Locked::new([0; 4]);
 static PKT_LEN: Locked<usize> = Locked::new(0);
+/// Packet size: 4 once the scroll wheel (IntelliMouse) is negotiated, else 3.
+static PKT_SIZE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(3);
 
 unsafe fn r32(a: u64) -> u32 {
     unsafe { read_volatile(a as *const u32) }
@@ -100,11 +102,28 @@ pub fn init() -> bool {
                 }
                 let _ = r32(base + KMIDATA);
             }
+            // Enable the IntelliMouse scroll wheel: the magic sample-rate knock
+            // (200, 100, 80) then read the device id — 0x03 means the device
+            // switched to 4-byte packets whose 4th byte is a signed Z (wheel).
+            let _ = cmd(base, 0xF3);
+            let _ = cmd(base, 200);
+            let _ = cmd(base, 0xF3);
+            let _ = cmd(base, 100);
+            let _ = cmd(base, 0xF3);
+            let _ = cmd(base, 80);
+            let _ = cmd(base, 0xF2); // get device id
+            let id = if r32(base + KMISTAT) & KMISTAT_RXFULL != 0 { (r32(base + KMIDATA) & 0xff) as u8 } else { 0 };
+            let wheel = id == 0x03;
+            PKT_SIZE.store(if wheel { 4 } else { 3 }, core::sync::atomic::Ordering::Relaxed);
             if cmd(base, 0xF4).is_none() {
                 continue;
             }
             BASE.with(|b| *b = base);
-            crate::ktrace::log_fmt(format_args!("pl050: PS/2 mouse at {:#x} (data reporting enabled)", base));
+            crate::ktrace::log_fmt(format_args!(
+                "pl050: PS/2 mouse at {:#x} (data reporting on{})",
+                base,
+                if wheel { ", scroll wheel" } else { "" }
+            ));
             return true;
         }
     }
@@ -134,13 +153,23 @@ pub fn poll() {
         PKT.with(|p| p[len] = byte);
         let len = len + 1;
         PKT_LEN.with(|l| *l = len);
-        if len == 3 {
+        let size = PKT_SIZE.load(core::sync::atomic::Ordering::Relaxed);
+        if len == size {
             PKT_LEN.with(|l| *l = 0);
-            let (flags, bx, by) = PKT.with(|p| (p[0], p[1], p[2]));
+            let (flags, bx, by, bz) = PKT.with(|p| (p[0], p[1], p[2], p[3]));
             let dx = bx as i32 - if flags & 0x10 != 0 { 256 } else { 0 };
             let dy = by as i32 - if flags & 0x20 != 0 { 256 } else { 0 };
             crate::mouse::move_rel(dx, -dy); // PS/2 Y is up-positive
             crate::mouse::set_left(flags & 0x01 != 0);
+            if size == 4 {
+                // 4th byte is a signed Z: +1 = wheel toward the user (scroll
+                // down). Negate so "wheel up" is a positive delta (scroll back
+                // through history), matching the virtio pointer's convention.
+                let dz = bz as i8 as i32;
+                if dz != 0 {
+                    crate::mouse::add_wheel(-dz);
+                }
+            }
         }
     }
 }

@@ -45,6 +45,7 @@ pub fn keyboard_base() -> u64 {
     BASE.with(|b| *b)
 }
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
+static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 static CAPS_ON: AtomicBool = AtomicBool::new(false);
 /// Set 2 sends a byte's *break* code as `0xF0 <code>`; this holds across polls.
 static BREAK_NEXT: AtomicBool = AtomicBool::new(false);
@@ -123,11 +124,16 @@ fn decode(sc: u8) -> Option<u8> {
     } else {
         base
     };
+    // Ctrl+letter → control code (Ctrl+C = 3 stops generation, etc.).
+    if CTRL_DOWN.load(Ordering::Relaxed) && ch.is_ascii_alphabetic() {
+        return Some(ch.to_ascii_uppercase() & 0x1f);
+    }
     Some(ch)
 }
 
 const SC_LSHIFT: u8 = 0x12;
 const SC_RSHIFT: u8 = 0x59;
+const SC_LCTRL: u8 = 0x14;
 const SC_CAPS: u8 = 0x58;
 
 /// Poll the PL050 for the next typed character, decoding set-2 codes + tracking
@@ -166,31 +172,47 @@ pub fn poll_key() -> Option<u8> {
                 let breaking = BREAK_NEXT.swap(false, Ordering::Relaxed);
                 let extended = EXT_NEXT.swap(false, Ordering::Relaxed);
                 if extended {
-                    // Arrow keys (set-2 extended make codes) become the ANSI
-                    // sequences a serial terminal sends (ESC [ A/B/C/D), one
-                    // encoding for every input path. Other extended keys are
-                    // still ignored.
+                    // Extended (E0-prefixed set-2) keys become the ANSI escape
+                    // sequences a serial terminal sends — one encoding for every
+                    // input path. Arrows + Home/End/PgUp/PgDn/Delete so the
+                    // shell's history nav and pane scrollback work from a PS/2
+                    // keyboard (VirtualBox-ARM presents one). Ctrl+Tab (E0 0x14)
+                    // is the pane-focus toggle.
                     if !breaking {
-                        if let Some(fin) = match sc {
-                            0x75 => Some(b'A'), // Up
-                            0x72 => Some(b'B'), // Down
-                            0x74 => Some(b'C'), // Right
-                            0x6b => Some(b'D'), // Left
+                        if sc == 0x14 {
+                            CTRL_DOWN.store(true, Ordering::Relaxed);
+                            continue;
+                        }
+                        if let Some(seq) = match sc {
+                            0x75 => Some(&b"[A"[..]),  // Up
+                            0x72 => Some(&b"[B"[..]),  // Down
+                            0x74 => Some(&b"[C"[..]),  // Right
+                            0x6b => Some(&b"[D"[..]),  // Left
+                            0x6c => Some(&b"[H"[..]),  // Home
+                            0x69 => Some(&b"[F"[..]),  // End
+                            0x7d => Some(&b"[5~"[..]), // Page Up
+                            0x7a => Some(&b"[6~"[..]), // Page Down
+                            0x71 => Some(&b"[3~"[..]), // Delete
                             _ => None,
                         } {
-                            PENDING.with(|p| {
-                                p.push(b'[');
-                                p.push(fin);
-                            });
+                            PENDING.with(|p| p.extend_from_slice(seq));
                             return Some(0x1b);
                         }
+                    } else if sc == 0x14 {
+                        CTRL_DOWN.store(false, Ordering::Relaxed); // right Ctrl release
                     }
                     continue;
                 }
                 match sc {
                     SC_LSHIFT | SC_RSHIFT => SHIFT_DOWN.store(!breaking, Ordering::Relaxed),
+                    SC_LCTRL => CTRL_DOWN.store(!breaking, Ordering::Relaxed),
                     SC_CAPS if !breaking => {
                         CAPS_ON.fetch_xor(true, Ordering::Relaxed);
+                    }
+                    // Ctrl+Tab: pane-focus toggle, encoded as the private CSI `ESC [ T`.
+                    0x0D if !breaking && CTRL_DOWN.load(Ordering::Relaxed) => {
+                        PENDING.with(|p| p.extend_from_slice(b"[T"));
+                        return Some(0x1b);
                     }
                     _ if !breaking => {
                         if let Some(ch) = decode(sc) {

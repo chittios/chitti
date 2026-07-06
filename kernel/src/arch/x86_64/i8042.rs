@@ -17,13 +17,15 @@ const ST_IN_FULL: u8 = 1 << 1; // input buffer full (controller busy)
 const ST_AUX: u8 = 1 << 5; // the readable byte is from the aux (mouse) port
 
 static UP: AtomicBool = AtomicBool::new(false);
+/// Packet size: 4 once the IntelliMouse scroll wheel is negotiated, else 3.
+static PKT_SIZE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(3);
 
-/// 3-byte mouse packet assembly state.
+/// PS/2 mouse packet assembly state (4 bytes with the IntelliMouse wheel).
 struct Pkt {
-    buf: [u8; 3],
+    buf: [u8; 4],
     n: usize,
 }
-static PKT: Locked<Pkt> = Locked::new(Pkt { buf: [0; 3], n: 0 });
+static PKT: Locked<Pkt> = Locked::new(Pkt { buf: [0; 4], n: 0 });
 
 /// Wait until the controller can accept a command/data byte. Bounded.
 fn wait_write() -> bool {
@@ -109,11 +111,22 @@ pub fn init() {
     if !aux_write(0xf6) || wait_read() != Some(0xfa) {
         return;
     }
+    // Enable the IntelliMouse scroll wheel: the magic sample-rate knock (200,
+    // 100, 80), then read the device id — 0x03 = the mouse switched to 4-byte
+    // packets whose 4th byte is a signed Z (wheel).
+    let set_rate = |r: u8| aux_write(0xf3) && wait_read() == Some(0xfa) && aux_write(r) && wait_read() == Some(0xfa);
+    let _ = set_rate(200) && set_rate(100) && set_rate(80);
+    let id = if aux_write(0xf2) && wait_read() == Some(0xfa) { wait_read() } else { None };
+    let wheel = id == Some(0x03);
+    PKT_SIZE.store(if wheel { 4 } else { 3 }, Ordering::Relaxed);
     if !aux_write(0xf4) || wait_read() != Some(0xfa) {
         return;
     }
     UP.store(true, Ordering::Relaxed);
-    crate::ktrace::log("i8042", "PS/2 mouse up (aux port, polled, 3-byte packets)");
+    crate::ktrace::log(
+        "i8042",
+        if wheel { "PS/2 mouse up (aux port, polled, 4-byte + scroll wheel)" } else { "PS/2 mouse up (aux port, polled, 3-byte packets)" },
+    );
 }
 
 /// Drain any pending aux bytes into [`crate::mouse`]. Called from the UI idle
@@ -138,7 +151,8 @@ pub fn poll_mouse() {
             }
             p.buf[p.n] = b;
             p.n += 1;
-            if p.n == 3 {
+            if p.n == PKT_SIZE.load(Ordering::Relaxed) {
+                let size = p.n;
                 p.n = 0;
                 let (flags, dx8, dy8) = (p.buf[0], p.buf[1], p.buf[2]);
                 // Overflow packets are garbage; drop them.
@@ -148,6 +162,14 @@ pub fn poll_mouse() {
                     crate::mouse::move_rel(dx, -dy);
                 }
                 crate::mouse::set_left(flags & 0x01 != 0);
+                if size == 4 {
+                    // 4th byte = signed Z (wheel); +1 = toward the user (scroll
+                    // down). Negate so "wheel up" is positive = scroll back.
+                    let dz = p.buf[3] as i8 as i32;
+                    if dz != 0 {
+                        crate::mouse::add_wheel(-dz);
+                    }
+                }
             }
         });
     }
