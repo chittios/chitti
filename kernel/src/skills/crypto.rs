@@ -116,6 +116,77 @@ pub fn verify(key_id: &str, msg: &[u8], sig: &[u8]) -> bool {
     sig.len() == expected.len() && sig == expected.as_slice()
 }
 
+// --- Asymmetric (ECDSA P-256) verification for public-registry packages -----
+//
+// A public registry has many publishers, so the symmetric MAC above (kernel is
+// both signer and verifier) isn't enough — we need real off-device authenticity.
+// P-256 ECDSA over SHA-256 (RustCrypto `p256`, verify-only, no RNG) does it: a
+// publisher signs a package off-device with their private key; the kernel ships
+// their PUBLIC key in the trust store below and verifies. Same curve family the
+// TLS client already uses, so it builds under our custom target.
+
+/// A trusted publisher/registry P-256 key: an id and its SEC1 uncompressed
+/// public point (65 bytes, `0x04||X||Y`) as hex. Baked at build time — there is
+/// no runtime path to add a trusted key.
+struct P256Key {
+    key_id: &'static str,
+    sec1_hex: &'static str,
+}
+
+static P256_TRUST: &[P256Key] = &[
+    // The registry test publisher (used by the registry-client tests). Replace
+    // with real publisher keys as they are onboarded.
+    P256Key {
+        key_id: "chitti-publisher-test",
+        sec1_hex: "04936bb4ad6d7101c2d23ac8d6db1e3ad08f81fd1cf90ecae0501454eae357cd31cd655551ed2f854a75197588cf5b2e97d5ef1fdc826b0039f43f049197b8a4e1",
+    },
+];
+
+/// The SEC1 public point for a trusted P-256 key id, if any.
+fn p256_pubkey(key_id: &str) -> Option<Vec<u8>> {
+    P256_TRUST.iter().find(|k| k.key_id == key_id).and_then(|k| from_hex(k.sec1_hex))
+}
+
+/// Whether `key_id` is a trusted P-256 publisher.
+pub fn is_trusted_p256(key_id: &str) -> bool {
+    P256_TRUST.iter().any(|k| k.key_id == key_id)
+}
+
+/// Verify a DER-encoded ECDSA/P-256/SHA-256 `sig` over `msg` for a trusted
+/// publisher `key_id`. False for an unknown key, a malformed key/signature, or
+/// any mismatch.
+pub fn verify_p256(key_id: &str, msg: &[u8], sig_der: &[u8]) -> bool {
+    use p256::ecdsa::signature::Verifier;
+    use p256::ecdsa::{Signature, VerifyingKey};
+    let Some(point) = p256_pubkey(key_id) else { return false };
+    let Ok(vk) = VerifyingKey::from_sec1_bytes(&point) else { return false };
+    let Ok(sig) = Signature::from_der(sig_der) else { return false };
+    vk.verify(msg, &sig).is_ok()
+}
+
+/// Decode an even-length ASCII hex string into bytes; `None` on any bad char.
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let nib = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut i = 0;
+    while i < b.len() {
+        out.push((nib(b[i])? << 4) | nib(b[i + 1])?);
+        i += 2;
+    }
+    Some(out)
+}
+
 /// A 32-byte content digest (four SipHash lanes) for the `content_hash` field.
 pub fn hash32(msg: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -138,5 +209,23 @@ mod tests {
         assert!(!verify(REGISTRY_KEY_ID, b"tampered", &sig), "wrong message fails");
         assert!(!verify("unknown-key", msg, &sig), "untrusted key fails");
         assert!(!verify(REGISTRY_KEY_ID, msg, &[]), "empty signature fails");
+    }
+
+    #[test_case]
+    fn p256_verifies_a_real_signature() {
+        // A genuine ECDSA/P-256/SHA-256 signature (openssl) over the message
+        // below, by the private key whose public point is the "chitti-publisher-
+        // test" trust-store entry. Proves real asymmetric verification works on
+        // the bare-metal target.
+        let msg = b"chitti-registry-package-v1";
+        let sig = from_hex(
+            "3045022028dbf55d56f51d67777054ace805e8b591d6339fb850aca39478fa21535ae2d7022100ca5f4a0620e5e50ae97b376a361c36e0a61f99d665d104f7fa7fba80d1bceb4b",
+        )
+        .unwrap();
+        assert!(verify_p256("chitti-publisher-test", msg, &sig), "valid P-256 signature must verify");
+        assert!(!verify_p256("chitti-publisher-test", b"tampered", &sig), "wrong message must fail");
+        assert!(!verify_p256("unknown-publisher", msg, &sig), "untrusted key must fail");
+        assert!(!verify_p256("chitti-publisher-test", msg, b"\x30\x00"), "malformed signature must fail");
+        assert!(is_trusted_p256("chitti-publisher-test") && !is_trusted_p256("nope"));
     }
 }

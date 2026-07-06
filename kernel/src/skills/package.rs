@@ -105,15 +105,21 @@ impl SkillPackage {
         };
     }
 
-    /// Verify the package's signature + content hash against the trust store.
-    /// Returns false for an unsigned, tampered, or untrusted-key package.
+    /// Verify the package's signature + content hash against the trust store,
+    /// dispatching on the signature algorithm: `Ed25519` = the self-contained
+    /// keyed-MAC scheme (local dev/boot packages); `P256` = real ECDSA against
+    /// the baked publisher trust store (public-registry packages). Returns false
+    /// for an unsigned, tampered, or untrusted-key package.
     pub fn verify(&self) -> bool {
         let msg = self.signing_message();
         let sb = &self.manifest.signature;
         if sb.content_hash != crate::skills::crypto::hash32(&msg) {
             return false;
         }
-        crate::skills::crypto::verify(&sb.key_id, &msg, &sb.sig)
+        match sb.algo {
+            SigAlgo::Ed25519 => crate::skills::crypto::verify(&sb.key_id, &msg, &sb.sig),
+            SigAlgo::P256 => crate::skills::crypto::verify_p256(&sb.key_id, &msg, &sb.sig),
+        }
     }
 
     /// Write the package's body + assets to the store and register its bundled

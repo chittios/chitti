@@ -2417,6 +2417,7 @@ fn run_agents(arg: &str, chat: &mut Option<ChatSession>) {
                 }
             }
         }
+        "search" => run_agent_search(sarg),
         "install" => run_agent_install(sarg, chat),
         "uninstall" => run_agent_uninstall(sarg),
         "start-net" => match sarg.parse::<u16>() {
@@ -2428,7 +2429,7 @@ fn run_agents(arg: &str, chat: &mut Option<ChatSession>) {
             _ => serial_println!("usage: /agents start-net <port>"),
         },
         other => serial_println!(
-            "agents> unknown '{}' — usage: /agents [list|switch <id>|kill <id>|services|start-net <port>|install <name> [--yes]|uninstall <name>]",
+            "agents> unknown '{}' — usage: /agents [list|switch <id>|kill <id>|services|start-net <port>|search <url> [q]|install <name> [--yes] [--registry <url>]|uninstall <name>]",
             other
         ),
     }
@@ -2448,23 +2449,82 @@ fn built_in_package(name: &str) -> Option<crate::skills::package::SkillPackage> 
     Some(pkg)
 }
 
-/// `/agents install <name> [--yes]` — the consent install flow: fetch the
-/// package, verify its signature, ask the human per requested capability
+/// `/agents search <index-url> [query]` — fetch a public registry index over
+/// HTTP(S) and list the installable agents it advertises (discovery over the
+/// network); install with `/agents install <name> --registry <index-url>`.
+fn run_agent_search(arg: &str) {
+    let (url, query) = match arg.split_once(' ') {
+        Some((u, q)) => (u.trim(), q.trim()),
+        None => (arg.trim(), ""),
+    };
+    if url.is_empty() {
+        serial_println!("usage: /agents search <index-url> [query]");
+        return;
+    }
+    match crate::skills::registry_client::search(url, query) {
+        Ok(entries) if entries.is_empty() => serial_println!("search> no matching agents in the registry"),
+        Ok(entries) => {
+            serial_println!("search> {} agent(s) in the registry:", entries.len());
+            for e in entries {
+                serial_println!("search>   {} {} — {} [publisher {}]", e.name, e.version, e.description, e.key_id);
+            }
+        }
+        Err(e) => serial_println!("search> {}", e),
+    }
+}
+
+/// `/agents install <name> [--yes] [--registry <index-url>]` — the consent
+/// install flow: (optionally confirm the name is listed in a registry index),
+/// verify the package signature, ask the human per requested capability
 /// (`modal::confirm`), then install granting only the approved subset. `--yes`
 /// approves every requested capability without prompting (scripting/e2e).
 fn run_agent_install(arg: &str, chat: &mut Option<ChatSession>) {
-    let (name, auto_yes) = match arg.split_once(' ') {
-        Some((n, rest)) => (n.trim(), rest.contains("--yes")),
-        None => (arg.trim(), false),
-    };
+    // Parse: first token is the name; flags may follow (--yes, --registry <url>).
+    let mut toks = arg.split_whitespace();
+    let name = toks.next().unwrap_or("").trim();
+    let mut auto_yes = false;
+    let mut registry: Option<&str> = None;
+    let rest: alloc::vec::Vec<&str> = toks.collect();
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i] {
+            "--yes" => auto_yes = true,
+            "--registry" => {
+                registry = rest.get(i + 1).copied();
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
     if name.is_empty() {
-        serial_println!("usage: /agents install <name> [--yes]   (available: report-writer, note-summarizer)");
+        serial_println!("usage: /agents install <name> [--yes] [--registry <index-url>]   (built-in: report-writer, note-summarizer)");
         return;
+    }
+    // If a registry index was given, confirm the agent is advertised there
+    // (network discovery) before resolving its payload.
+    if let Some(url) = registry {
+        match crate::skills::registry_client::resolve(url, name) {
+            Ok(Some(entry)) => serial_println!(
+                "install> '{}' {} found in registry (publisher {})",
+                entry.name,
+                entry.version,
+                entry.key_id
+            ),
+            Ok(None) => {
+                serial_println!("install> '{}' is not listed in the registry index", name);
+                return;
+            }
+            Err(e) => {
+                serial_println!("install> registry lookup failed: {}", e);
+                return;
+            }
+        }
     }
     let pkg = match built_in_package(name) {
         Some(p) => p,
         None => {
-            serial_println!("install> no such package '{}' (available: report-writer, note-summarizer)", name);
+            serial_println!("install> no such package '{}' (built-in: report-writer, note-summarizer)", name);
             return;
         }
     };
@@ -2490,7 +2550,11 @@ fn run_agent_install(arg: &str, chat: &mut Option<ChatSession>) {
             serial_println!("install>   denied: {}", line);
         }
     }
-    let source = crate::agent::types::InstallSource::BootModule { name: name.into() };
+    let source = if registry.is_some() {
+        crate::agent::types::InstallSource::Registry { name: name.into(), version: pkg.manifest.version.clone() }
+    } else {
+        crate::agent::types::InstallSource::BootModule { name: name.into() }
+    };
     match crate::skills::install::install(&pkg, &approved, "user", source, crate::arch::now_ms()) {
         Ok(rec) => {
             serial_println!(

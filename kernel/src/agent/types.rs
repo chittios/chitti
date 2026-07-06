@@ -578,7 +578,13 @@ pub struct SignatureBlock {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SigAlgo {
+    /// The self-contained keyed-MAC scheme (kernel is signer + verifier). Used
+    /// for local boot-module / built-in dev packages. (Named Ed25519 for schema
+    /// history; the backing implementation is a SipHash MAC — see skills::crypto.)
     Ed25519,
+    /// ECDSA over P-256 / SHA-256 — real off-device authenticity for packages
+    /// from a public registry, verified against a baked publisher trust store.
+    P256,
 }
 
 /// Produced at install; the authoritative record of what was APPROVED. Not
@@ -598,6 +604,8 @@ pub struct InstallRecord {
 pub enum InstallSource {
     BootModule { name: String },
     Store { key: StoreKey },
+    /// Installed from a public package registry (audit provenance).
+    Registry { name: String, version: String },
 }
 
 #[cfg(test)]
