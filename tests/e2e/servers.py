@@ -103,6 +103,22 @@ def _handle(conn):
         elif path == "/json":
             body = b'{"ok":true,"who":"e2e"}'
             conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+        elif path == "/registry":
+            # A public agent-registry index (discovery over the network).
+            body = json.dumps({
+                "schema": 1,
+                "entries": [
+                    {"name": "report-writer", "version": "1.0.0",
+                     "description": "Write reports from facts",
+                     "download": "http://10.0.2.2:8100/pkg/report-writer",
+                     "key_id": "chitti-publisher-test"},
+                    {"name": "note-summarizer", "version": "1.0.0",
+                     "description": "Summarize and search note files",
+                     "download": "http://10.0.2.2:8100/pkg/note-summarizer",
+                     "key_id": "chitti-publisher-test"},
+                ],
+            }).encode()
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
         elif path == "/sse":
             conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
             for i in range(3):

@@ -21,6 +21,7 @@ pub mod index;
 pub mod install;
 pub mod loader;
 pub mod package;
+pub mod registry_client;
 
 #[cfg(test)]
 mod tests {

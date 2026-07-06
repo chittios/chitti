@@ -282,6 +282,24 @@ def s_net_service_echo(g):
     return ok, "inbound connection echoed via Tcp-backed channel" if ok else f"bad echo: {got!r}"
 
 
+def s_agents_search(g):
+    # Fetch the registry index over HTTP and list advertised agents.
+    m = g.mark()
+    g.send(f"/agents search http://{HOST}:{PLAIN_PORT}/registry report")
+    ok = g.wait_for("report-writer", 20, m) and g.wait_for("chitti-publisher-test", 5, m)
+    return ok, "registry index fetched + searched" if ok else "no registry results"
+
+
+def s_agents_install_registry(g):
+    # Install an agent confirmed present in the registry index (network
+    # discovery), through the consent flow.
+    m = g.mark()
+    g.send(f"/agents install note-summarizer --yes --registry http://{HOST}:{PLAIN_PORT}/registry")
+    ok = g.wait_for("found in registry", 20, m) and g.wait_for("installed; granted", 15, m)
+    g.send("/agents uninstall note-summarizer")
+    return ok, "installed from registry via consent flow" if ok else "registry install did not complete"
+
+
 def s_surface(g):
     # The UI-surface capability: request a surface + draw ops through Synapse and
     # confirm a deterministic rasterization checksum (pixels aren't on serial).
@@ -292,7 +310,7 @@ def s_surface(g):
 
 
 OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS]
-AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("net_service_echo", s_net_service_echo), ("surface", s_surface)]
+AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("net_service_echo", s_net_service_echo), ("surface", s_surface)]
 NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_stream", s_http_stream), ("ws", s_ws)]
 NET_TLS = [("wss", s_wss), ("model_remote_https", s_model_remote_https)]
 MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("compact", s_compact)]
