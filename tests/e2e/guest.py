@@ -8,6 +8,7 @@ xtask's QEMU invocation so the harness doesn't have to reconstruct it.
 
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -36,6 +37,10 @@ class Guest:
         if hostfwd:
             env["CHITTI_HOSTFWD"] = str(hostfwd)
         cmd = ["cargo", "xtask", "run", "-arch", arch, "-model", model]
+        # New session/process group so `close()` can kill the whole tree
+        # (cargo → xtask → qemu) at once — SIGTERM to just `cargo` would orphan
+        # the qemu grandchild, which would keep the HVF/hostfwd ports and block a
+        # relaunch on boot retry.
         self.proc = subprocess.Popen(
             cmd,
             cwd=_repo_root(),
@@ -44,6 +49,7 @@ class Guest:
             stderr=subprocess.STDOUT,
             env=env,
             bufsize=0,
+            start_new_session=True,
         )
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
@@ -117,14 +123,20 @@ class Guest:
             time.sleep(0.5)
         except Exception:
             pass
+        # Kill the whole process group (cargo → xtask → qemu), not just `cargo`,
+        # so no orphaned qemu lingers holding the HVF/hostfwd ports.
         try:
-            self.proc.terminate()
+            pgid = os.getpgid(self.proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
             self.proc.wait(timeout=5)
         except Exception:
             try:
-                self.proc.kill()
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
             except Exception:
-                pass
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
 
     def tail(self, n=800):
         return self.text()[-n:]
