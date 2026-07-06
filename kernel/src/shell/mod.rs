@@ -169,6 +169,7 @@ pub fn run() -> ! {
                     serial_println!("(chat context + screen cleared)");
                 }
                 "open" | "edit" => run_open(arg),
+                "surface" => run_surface(arg),
                 // --- agents-as-processes ------------------------------------
                 "agents" => run_agents(arg, &mut chat),
                 "top" =>
@@ -2329,6 +2330,51 @@ fn run_ws(arg: &str) {
 /// tasks that carry agent identity (the shell agent, parked orchestrator /
 /// sub-agent capability holders), switch the shell chat to another agent's
 /// home (SOUL.md persona), or kill one.
+/// `/surface [demo]` — a UI-surface capability demo: grant this task UI
+/// authority, then drive `ui_surface_request` + `ui_draw` through Synapse (so
+/// the whole gated, grammar-validated path runs) to paint a checkerboard into
+/// the action pane. Prints a deterministic checksum of the rasterized buffer so
+/// the render is verifiable on serial (the pixels themselves aren't).
+fn run_surface(_arg: &str) {
+    use crate::agent::types::{CapDomain, CapabilityRequest, Rights, Scope};
+    let me = crate::sched::current_task_id();
+    crate::agent::manifest::grant_to_task(
+        me,
+        &alloc::vec![CapabilityRequest::new(CapDomain::Ui, Rights::EXEC | Rights::WRITE | Rights::DELETE, Scope::Any)],
+    );
+    // Request a surface (board kind).
+    let req = crate::synapse::execute(me, r#"{"name":"ui_surface_request","arguments":{"kind":"board"}}"#);
+    let sid = match req {
+        crate::synapse::Invocation::Executed { result, .. } => {
+            result.strip_prefix("ok:surface=").and_then(|s| s.trim().parse::<u32>().ok())
+        }
+        _ => None,
+    };
+    let Some(sid) = sid else {
+        serial_println!("surface> could not create a surface");
+        return;
+    };
+    // Paint an 8x8 checkerboard of 24px cells, then draw a diagonal.
+    let mut ops = alloc::string::String::from("clear 202020;");
+    for r in 0..8 {
+        for c in 0..8 {
+            if (r + c) % 2 == 0 {
+                let (x, y) = (c * 24, r * 24);
+                ops.push_str(&alloc::format!(" rect {} {} 24 24 e0e0e0;", x, y));
+            }
+        }
+    }
+    ops.push_str(" line 0 0 191 191 cc785c");
+    let call = alloc::format!(r#"{{"name":"ui_draw","arguments":{{"surface":{sid},"ops":"{ops}"}}}}"#);
+    let drew = match crate::synapse::execute(me, &call) {
+        crate::synapse::Invocation::Executed { result, .. } => result,
+        other => alloc::format!("{other:?}"),
+    };
+    let sum = crate::synapse::ui::checksum(sid).unwrap_or(0);
+    serial_println!("surface> rendered surface {} ({}), checksum=0x{:016x}", sid, drew, sum);
+    serial_println!("surface> painted into the action pane (/close to hide)");
+}
+
 fn run_agents(arg: &str, chat: &mut Option<ChatSession>) {
     let (sub, sarg) = match arg.split_once(' ') {
         Some((s, a)) => (s, a.trim()),

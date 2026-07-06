@@ -438,6 +438,43 @@ fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> Str
                 Err(e) => format!("error:{e}"),
             }
         }
+        registry::UI_SURFACE_REQUEST => {
+            let kind = match super::ui::SurfaceKind::parse(arg_str(args, 0)) {
+                Some(k) => k,
+                None => return format!("error:bad_surface_kind:{}", arg_str(args, 0)),
+            };
+            let id = super::ui::request(caller, kind);
+            format!("ok:surface={id}")
+        }
+        registry::UI_DRAW => {
+            let surface = arg_uint(args, 0) as u32;
+            let ops = arg_str(args, 1);
+            match super::ui::draw(caller, surface, ops) {
+                Ok(n) => format!("ok:drew={n}"),
+                Err(super::ui::DrawErr::NotOwner) => {
+                    cap::record_denial(caller, "ui_draw (not surface owner)");
+                    "error:not_surface_owner".to_string()
+                }
+                Err(e) => format!("error:{e:?}"),
+            }
+        }
+        registry::UI_EVENT_POLL => {
+            let surface = arg_uint(args, 0) as u32;
+            match super::ui::poll(caller, surface) {
+                Ok(Some(super::ui::UiEvent::Click { x, y })) => format!("ok:click={x},{y}"),
+                Ok(Some(super::ui::UiEvent::Key(k))) => format!("ok:key={k}"),
+                Ok(None) => "ok:none".to_string(),
+                Err(super::ui::DrawErr::NotOwner) => "error:not_surface_owner".to_string(),
+                Err(e) => format!("error:{e:?}"),
+            }
+        }
+        registry::UI_SURFACE_CLOSE => {
+            let surface = arg_uint(args, 0) as u32;
+            match super::ui::close(caller, surface) {
+                Ok(()) => "ok:closed".to_string(),
+                Err(e) => format!("error:{e:?}"),
+            }
+        }
         other => format!("error:unimplemented primitive id {other}"),
     }
 }

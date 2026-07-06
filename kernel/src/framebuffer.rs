@@ -513,6 +513,8 @@ pub enum RightMode {
     Editor,
     /// The live `/top` system dashboard (CPU + memory).
     Top,
+    /// An agent-owned drawing surface (`synapse::ui`), by surface id.
+    Surface(u32),
 }
 
 /// Config knobs the UI config (`/configs/core/ui.json`) can set for the layout.
@@ -1127,9 +1129,9 @@ impl Screen {
         match self.right {
             RightMode::Editor => true,
             RightMode::Closed => false,
-            // ktrace / top: chat keeps focus by default so you can keep typing;
-            // Ctrl+Tab / a click can move focus to the pane (for scrollback).
-            RightMode::Ktrace | RightMode::Top => self.focus_action,
+            // ktrace / top / surface: chat keeps focus by default so you can keep
+            // typing; Ctrl+Tab / a click can move focus to the pane.
+            RightMode::Ktrace | RightMode::Top | RightMode::Surface(_) => self.focus_action,
         }
     }
 
@@ -1145,6 +1147,7 @@ impl Screen {
             let title = match self.right {
                 RightMode::Editor => "editor",
                 RightMode::Top => "top",
+                RightMode::Surface(_) => "surface",
                 _ => &self.logs.title,
             };
             self.draw_frame_titled(&self.logs, self.action_focused(), title);
@@ -1806,6 +1809,55 @@ pub fn set_right(mode: RightMode) {
 /// Open the ktrace log stream in the action pane.
 pub fn open_ktrace() {
     set_right(RightMode::Ktrace);
+}
+
+/// Present an agent's surface backing buffer (`sw`×`sh`, 0xRRGGBB pixels) into
+/// the action pane, opening it in `Surface(id)` mode on first present. The image
+/// is nearest-neighbour scaled to fit the pane interior, letterboxed. Called by
+/// `synapse::ui` after a `ui_draw`; the compositor is the only place surface
+/// pixels reach the screen (the determinism boundary stays intact — the agent
+/// emitted grammar-validated draw ops, never raw pixels here).
+pub fn present_surface(id: u32, sw: usize, sh: usize, buf: &[u32]) {
+    SCREEN.with(|slot| {
+        // Open the pane in this surface's mode once (rebuilds the split layout).
+        let need_open = slot.as_ref().map(|sc| sc.right != RightMode::Surface(id)).unwrap_or(false);
+        if need_open {
+            if let Some(old) = slot {
+                let ns = rebuilt(old, true, RightMode::Surface(id));
+                ns.redraw();
+                *slot = Some(ns);
+            }
+        }
+        let Some(sc) = slot else { return };
+        if sc.right != RightMode::Surface(id) || sw == 0 || sh == 0 {
+            return;
+        }
+        sc.cursor_restore();
+        sc.cur_vis = false;
+        let (px, py) = (sc.logs.ix, sc.logs.iy);
+        let (pw, ph) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
+        // Integer scale-to-fit (letterboxed), so the surface keeps its aspect.
+        let scale = core::cmp::max(1, core::cmp::min(pw / sw as u64, ph / sh as u64));
+        let dw = sw as u64 * scale;
+        let dh = sh as u64 * scale;
+        let ox = px + (pw.saturating_sub(dw)) / 2;
+        let oy = py + (ph.saturating_sub(dh)) / 2;
+        sc.fill_rect(px, py, pw, ph, sc.logs.bg); // clear the pane interior
+        for sy in 0..sh as u64 {
+            for sx in 0..sw as u64 {
+                let c = buf[(sy * sw as u64 + sx) as usize];
+                let rgb = (((c >> 16) & 0xff) as u8, ((c >> 8) & 0xff) as u8, (c & 0xff) as u8);
+                let bx = ox + sx * scale;
+                let by = oy + sy * scale;
+                for j in 0..scale {
+                    for i in 0..scale {
+                        sc.put_pixel(bx + i, by + j, rgb);
+                    }
+                }
+            }
+        }
+        sc.cursor_overlay();
+    });
 }
 
 /// Open the `/top` dashboard in the action pane (filled by the shell's idle

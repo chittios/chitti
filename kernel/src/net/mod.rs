@@ -481,13 +481,13 @@ pub fn try_accept(id: ListenerId) -> Option<SocketHandle> {
     NET.with(|n| {
         let s = n.as_mut()?;
         let port = s.listeners.get(&id)?.port;
-        // Find a backlog slot whose socket is now connected.
+        // Find a backlog slot whose socket is fully established. Requiring
+        // Established (not merely "left Listen") avoids handing out a
+        // half-open SynReceived socket whose `may_recv` is transiently false —
+        // which an echo loop would misread as an immediate EOF.
         let idx = {
             let lis = s.listeners.get(&id)?;
-            lis.backlog.iter().position(|&h| {
-                let st = s.sockets.get::<tcp::Socket>(h).state();
-                st != tcp::State::Listen && st != tcp::State::Closed
-            })?
+            lis.backlog.iter().position(|&h| s.sockets.get::<tcp::Socket>(h).state() == tcp::State::Established)?
         };
         let established = s.listeners.get(&id)?.backlog[idx];
         // Refill the slot with a fresh listener so the backlog stays open.

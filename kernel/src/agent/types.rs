@@ -127,6 +127,7 @@ pub enum CapDomain {
     SkillManage, // install/uninstall skills (privileged)
     Channel,     // create inter-agent byte/datagram channels; use granted ends
     Net,         // network: listen/accept + outbound http (host/port scoped)
+    Ui,          // own a compositor surface and draw to it
 }
 
 bitflags::bitflags! {
