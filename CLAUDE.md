@@ -213,7 +213,11 @@ Everything goes through `cargo xtask`. Arch is chosen explicitly, never
 host-detected. See [DEVELOPMENT.md](DEVELOPMENT.md) for the full setup.
 
 ```sh
-cargo xtask test                       # in-kernel test suite under QEMU (x86) — 107/107, no model
+cargo xtask test                       # in-kernel unit suite under QEMU (x86) — pure logic, no model
+make e2e                               # end-to-end: boot the kernel, drive the shell, exercise
+                                       #   http/https + ws/wss + hosted-model chat vs local servers
+                                       #   (tests/e2e/, dependency-free python; TLS scenarios need a
+                                       #    TLS-1.3 python — Homebrew's)
 cargo xtask build -arch x86_64|aarch64 # cross-build the kernel
 cargo xtask run   -arch x86_64|aarch64 # boot in QEMU (aarch64 = native HVF on Apple Silicon)
 cargo xtask image -arch x86_64|aarch64 # assemble a bootable image/ISO

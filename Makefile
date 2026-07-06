@@ -111,3 +111,10 @@ clean:
 	cargo clean --manifest-path kernel/Cargo.toml
 	cargo clean --manifest-path xtask/Cargo.toml
 	cargo clean --manifest-path stub/Cargo.toml
+
+# End-to-end tests: boot the kernel under QEMU and exercise the networked flows
+# (http/https, ws/wss, hosted-model chat) against local host servers. Uses a
+# TLS-1.3-capable python for the https/wss scenarios (Homebrew's, if present).
+E2E_PY ?= $(shell [ -x /opt/homebrew/bin/python3 ] && echo /opt/homebrew/bin/python3 || echo python3)
+e2e:
+	$(E2E_PY) tests/e2e/run.py -arch $(ARCH) -model $(MODEL)
