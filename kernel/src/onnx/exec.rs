@@ -2374,9 +2374,14 @@ fn exec_graph<'t>(g: &'t Graph<'t>, env: &mut BTreeMap<String, Val>, outer_inits
 mod tests {
     use super::*;
 
+    // Embedded (and this numeric test compiled) only when the gitignored asset
+    // is present at build time — see the `voice_vad_embedded` cfg in `build.rs`;
+    // absent (CI / fresh clone) this test is skipped.
+    #[cfg(voice_vad_embedded)]
     static SILERO: &[u8] = include_bytes!("../../../assets/voice/silero_vad.onnx");
 
     /// The LCG used to generate the host-side onnxruntime reference input.
+    #[cfg(voice_vad_embedded)]
     fn lcg_frame(seed: u32, n: usize) -> Vec<f32> {
         let mut v = seed;
         (0..n)
@@ -2390,6 +2395,7 @@ mod tests {
     /// Run the real silero VAD and match onnxruntime's probabilities:
     /// three chained steps on LCG noise -> [0.054053, 0.035221, 0.013769],
     /// silence -> 0.041476 (host reference, tolerance 3e-3).
+    #[cfg(voice_vad_embedded)]
     #[test_case]
     fn silero_vad_matches_onnxruntime() {
         let m = super::super::parse(SILERO).expect("parse");
