@@ -118,3 +118,6 @@ clean:
 E2E_PY ?= $(shell [ -x /opt/homebrew/bin/python3 ] && echo /opt/homebrew/bin/python3 || echo python3)
 e2e:
 	$(E2E_PY) tests/e2e/run.py -arch $(ARCH) -model $(MODEL)
+# Full e2e incl. local inference + voice (slow; needs assets/model.gguf + assets/voice/).
+e2e-full:
+	$(E2E_PY) tests/e2e/run.py -arch $(ARCH) -model $(MODEL) --slow
