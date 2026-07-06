@@ -529,9 +529,14 @@ impl Xhci {
         // transfer submitted in that window is silently dropped. A settle +
         // fresh attempt succeeds once the device-level reset has finished. QEMU
         // is instantaneous and never needs the retry.
-        for attempt in 0..3 {
+        // Up to 6 passes with a 250 ms settle between them. VirtualBox's async
+        // VUSB reset makes a device time out on an early pass; `done_ports`
+        // keeps a device that already came up from being re-reset, so the extra
+        // passes only re-try whatever is still missing and never disturb a
+        // working device. QEMU gets both on the first pass and exits at once.
+        for attempt in 0..6 {
             if attempt > 0 {
-                spin_delay(100_000_000);
+                spin_delay(250_000_000);
                 crate::ktrace::log_fmt(format_args!("xhci: retrying enumeration (attempt {})", attempt + 1));
             }
             // SAFETY: single-threaded boot; all DMA regions are freshly allocated.
@@ -1304,3 +1309,64 @@ fn shift_ascii(c: u8) -> u8 {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A boot mouse with a scroll wheel: 3 button bits + 5 pad, then X, Y,
+    /// Wheel as three 8-bit relative fields — the classic descriptor VBox's
+    /// USB pointer and most USB mice emit. Verifies the parser locates all four
+    /// fields (the wheel offset is what makes scroll work).
+    #[test_case]
+    fn parses_boot_mouse_with_wheel() {
+        #[rustfmt::skip]
+        let desc: &[u8] = &[
+            0x05,0x01, 0x09,0x02, 0xA1,0x01, 0x09,0x01, 0xA1,0x00,
+            0x05,0x09, 0x19,0x01, 0x29,0x03, 0x15,0x00, 0x25,0x01,
+            0x95,0x03, 0x75,0x01, 0x81,0x02,             // 3 button bits
+            0x95,0x01, 0x75,0x05, 0x81,0x03,             // 5 pad bits
+            0x05,0x01, 0x09,0x30, 0x09,0x31, 0x09,0x38,  // X, Y, Wheel
+            0x75,0x08, 0x95,0x03, 0x81,0x06,             // 3 x 8-bit relative
+            0xC0, 0xC0,
+        ];
+        let lo = unsafe { parse_report_layout(desc.as_ptr() as usize, desc.len()) }.expect("layout");
+        assert_eq!(lo.btn_byte, 0);
+        assert_eq!(lo.x_byte, 1);
+        assert_eq!(lo.y_byte, 2);
+        assert_eq!(lo.field_bytes, 1);
+        assert!(lo.relative);
+        assert_eq!(lo.wheel_byte, Some(3), "the scroll wheel field must be located");
+    }
+
+    /// An absolute tablet (16-bit X/Y, no wheel): the fallback layout QEMU's
+    /// usb-tablet uses. Verifies absolute mode, 2-byte fields, and that a
+    /// missing wheel stays `None` (so we never inject phantom scroll).
+    #[test_case]
+    fn parses_absolute_tablet_without_wheel() {
+        #[rustfmt::skip]
+        let desc: &[u8] = &[
+            0x05,0x01, 0x09,0x02, 0xA1,0x01, 0x09,0x01, 0xA1,0x00,
+            0x05,0x09, 0x19,0x01, 0x29,0x03, 0x15,0x00, 0x25,0x01,
+            0x95,0x03, 0x75,0x01, 0x81,0x02,             // 3 button bits
+            0x95,0x01, 0x75,0x05, 0x81,0x03,             // 5 pad bits
+            0x05,0x01, 0x09,0x30, 0x09,0x31,             // X, Y
+            0x75,0x10, 0x95,0x02, 0x81,0x02,             // 2 x 16-bit absolute
+        ];
+        let lo = unsafe { parse_report_layout(desc.as_ptr() as usize, desc.len()) }.expect("layout");
+        assert!(!lo.relative);
+        assert_eq!(lo.field_bytes, 2);
+        assert_eq!(lo.x_byte, 1); // byte 0 = buttons, X at byte 1
+        assert_eq!(lo.wheel_byte, None);
+    }
+
+    #[test_case]
+    fn hid_keyboard_ascii_mapping() {
+        assert_eq!(hid_to_ascii(0x04, false, false), Some(b'a')); // 'a'
+        assert_eq!(hid_to_ascii(0x04, true, false), Some(b'A')); // Shift+a
+        assert_eq!(hid_to_ascii(0x06, false, true), Some(3)); // Ctrl+c = 0x03
+        assert_eq!(hid_to_ascii(0x28, false, false), Some(b'\r')); // Enter
+        assert_eq!(hid_to_ascii(0x2c, false, false), Some(b' ')); // Space
+        assert_eq!(hid_to_ascii(0x00, false, false), None); // no key
+    }
+}

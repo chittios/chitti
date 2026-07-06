@@ -156,18 +156,11 @@ pub fn poll() {
         let size = PKT_SIZE.load(core::sync::atomic::Ordering::Relaxed);
         if len == size {
             PKT_LEN.with(|l| *l = 0);
-            let (flags, bx, by, bz) = PKT.with(|p| (p[0], p[1], p[2], p[3]));
-            let dx = bx as i32 - if flags & 0x10 != 0 { 256 } else { 0 };
-            let dy = by as i32 - if flags & 0x20 != 0 { 256 } else { 0 };
-            crate::mouse::move_rel(dx, -dy); // PS/2 Y is up-positive
-            crate::mouse::set_left(flags & 0x01 != 0);
-            if size == 4 {
-                // 4th byte is a signed Z: +1 = wheel toward the user (scroll
-                // down). Negate so "wheel up" is a positive delta (scroll back
-                // through history), matching the virtio pointer's convention.
-                let dz = bz as i8 as i32;
-                if dz != 0 {
-                    crate::mouse::add_wheel(-dz);
+            if let Some(d) = crate::mouse::decode_ps2_packet(&PKT.with(|p| *p), size) {
+                crate::mouse::move_rel(d.dx, d.dy);
+                crate::mouse::set_left(d.left);
+                if d.wheel != 0 {
+                    crate::mouse::add_wheel(d.wheel);
                 }
             }
         }

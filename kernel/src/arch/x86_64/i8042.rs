@@ -151,23 +151,14 @@ pub fn poll_mouse() {
             }
             p.buf[p.n] = b;
             p.n += 1;
-            if p.n == PKT_SIZE.load(Ordering::Relaxed) {
-                let size = p.n;
+            let size = PKT_SIZE.load(Ordering::Relaxed);
+            if p.n == size {
                 p.n = 0;
-                let (flags, dx8, dy8) = (p.buf[0], p.buf[1], p.buf[2]);
-                // Overflow packets are garbage; drop them.
-                if flags & 0xc0 == 0 {
-                    let dx = dx8 as i8 as i32;
-                    let dy = dy8 as i8 as i32; // PS/2 y is up-positive
-                    crate::mouse::move_rel(dx, -dy);
-                }
-                crate::mouse::set_left(flags & 0x01 != 0);
-                if size == 4 {
-                    // 4th byte = signed Z (wheel); +1 = toward the user (scroll
-                    // down). Negate so "wheel up" is positive = scroll back.
-                    let dz = p.buf[3] as i8 as i32;
-                    if dz != 0 {
-                        crate::mouse::add_wheel(-dz);
+                if let Some(d) = crate::mouse::decode_ps2_packet(&p.buf, size) {
+                    crate::mouse::move_rel(d.dx, d.dy);
+                    crate::mouse::set_left(d.left);
+                    if d.wheel != 0 {
+                        crate::mouse::add_wheel(d.wheel);
                     }
                 }
             }
