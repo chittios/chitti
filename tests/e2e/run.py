@@ -37,7 +37,8 @@ from servers import Server, tls_context  # noqa: E402
 HOST = "10.0.2.2"  # QEMU user-net alias for the host
 PLAIN_PORT = 8100
 TLS_PORT = 9100
-SVC_PORT = 7099  # guest TCP listener, reachable from the host via slirp hostfwd
+SVC_PORT = 7099  # guest echo-service listener, reachable via slirp hostfwd
+SVC_HTTP_PORT = 7100  # guest http-doc-service listener
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 CERT = os.path.join(HERE, "certs", "ec.pem")
@@ -300,6 +301,31 @@ def s_agents_install_registry(g):
     return ok, "installed from registry via consent flow" if ok else "registry install did not complete"
 
 
+def s_http_service_agent(g):
+    # Start the HTTP/Doc service agent, then GET the docs page from the host over
+    # the slirp hostfwd. Proves a NATIVE protocol service agent (HTTP RFC handling)
+    # fed by the same accept -> adopt_tcp -> channel path as the echo service.
+    m = g.mark()
+    g.send(f"/agents start-http {SVC_HTTP_PORT}")
+    if not g.wait_for("http-doc service serving docs", 15, m):
+        return False, "http service did not start"
+    time.sleep(0.5)
+    try:
+        with socket.create_connection(("127.0.0.1", SVC_HTTP_PORT), timeout=15) as s:
+            s.sendall(b"GET /docs HTTP/1.1\r\nHost: chitti\r\nConnection: close\r\n\r\n")
+            s.settimeout(15)
+            resp = b""
+            while b"</html>" not in resp and len(resp) < 8192:
+                chunk = s.recv(1024)
+                if not chunk:
+                    break
+                resp += chunk
+    except OSError as e:
+        return False, f"http request failed: {e}"
+    ok = resp.startswith(b"HTTP/1.1 200") and b"Chitti OS" in resp
+    return ok, "Doc agent served HTML over the native HTTP service" if ok else f"bad response: {resp[:80]!r}"
+
+
 def s_surface(g):
     # The UI-surface capability: request a surface + draw ops through Synapse and
     # confirm a deterministic rasterization checksum (pixels aren't on serial).
@@ -310,7 +336,7 @@ def s_surface(g):
 
 
 OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS]
-AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("net_service_echo", s_net_service_echo), ("surface", s_surface)]
+AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("net_service_echo", s_net_service_echo), ("http_service_agent", s_http_service_agent), ("surface", s_surface)]
 NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_stream", s_http_stream), ("ws", s_ws)]
 NET_TLS = [("wss", s_wss), ("model_remote_https", s_model_remote_https)]
 MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("compact", s_compact)]
@@ -354,8 +380,9 @@ def main():
 
     # Voice needs a sound device; give the guest a silent audio backend then.
     audio = "none" if (slow and have_voice) else "off"
-    print(f"e2e: booting guest (cargo xtask run, audio={audio}, hostfwd={SVC_PORT})…")
-    g = Guest(arch=arch, model=model, verbose=verbose, audio=audio, hostfwd=SVC_PORT)
+    fwd = f"{SVC_PORT},{SVC_HTTP_PORT}"
+    print(f"e2e: booting guest (cargo xtask run, audio={audio}, hostfwd={fwd})…")
+    g = Guest(arch=arch, model=model, verbose=verbose, audio=audio, hostfwd=fwd)
     results = []
     try:
         if not g.wait_for("net: configured", 120):
