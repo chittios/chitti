@@ -66,15 +66,21 @@ Two layers, and new work adds to **both** where they apply:
    of the hardware/IO path into a pure function and test it with cases (e.g.
    `mouse::decode_ps2_packet`, `xhci::parse_report_layout`, `net::http`
    `parse_url`/`dechunk_partial`, `shell::parse_tool_call`,
-   `ws::{base64,sha1,encode_frame}`). If logic broke before, it gets a test.
+   `ws::{base64,sha1,encode_frame}`, `channel` ring/EOF, `synapse::ui` draw-op
+   raster + ownership, `service::http::parse_request`, `crypto::verify_p256`,
+   the executor scope gate, `registry_client::parse_index`). If logic broke
+   before, it gets a test.
 
 2. **End-to-end tests** (`tests/e2e/`, `make e2e` / `make e2e-full`) for
    anything that only exists **on the running OS** — a shell command, a
    network/TLS/WebSocket exchange, a model or voice flow. The harness boots the
    real kernel under QEMU and drives the shell over serial. **Adding a shell
    command or a networked/model/voice feature means adding an e2e scenario**
-   (`os`/`net` groups always run; `model`/`voice` are `--slow`, gated on
-   assets). A fix for something the harness could have caught gets a scenario
+   (`os`/`agents`/`net` groups always run; `model`/`voice` are `--slow`, gated
+   on assets). The `agents` group covers install/consent, service lifecycle,
+   the network + HTTP/Doc service agents (the host reaches guest listeners via
+   an opt-in slirp `CHITTI_HOSTFWD` port), registry search/install, and UI
+   surfaces. A fix for something the harness could have caught gets a scenario
    too. Run `make e2e` before shipping boot-visible or networked changes.
 
 CI (`.github/workflows/ci.yml`) runs both on every push/PR: `unit` builds both
@@ -160,12 +166,49 @@ real UEFI hardware.
 - **Tools** (`tools/`) — MCP-shaped registry → Router → Synapse cap+taint gate;
   builtin toolset; provider registration.
 - **Skills** (`skills/`) — L0/L1/L2 progressive disclosure, signed install with
-  consent + capability subsetting, installable skill-agents.
+  consent + capability subsetting, installable skill-agents. **Agents as
+  installable apps**: a package is markdown (SOUL.md persona + `skills/*.md`
+  procedures) + a manifest (toolset = permissions, `capabilities`, optional ONNX
+  assets) + a signature; installed via `/agents install <name> [--yes]`
+  (consent modal → grant only the approved subset → `place_agent_home` lands the
+  SOUL/docs in `/agent/<id>/`). A **public registry** (`skills/registry_client.rs`)
+  fetches a signed index over HTTP(S) — `/agents search <url> [q]`,
+  `/agents install <name> --registry <url>`; registry packages authenticate with
+  **ECDSA P-256** (`skills::crypto::verify_p256`, RustCrypto `p256`/`sha2`,
+  baked publisher trust store) while local dev/boot packages use the keyed-MAC.
+- **Channels** (`channel/`) — cap-gated **byte-stream + datagram IPC** between
+  agents (the Linux pipe/socket analog; distinct from `ipc` u64 endpoints).
+  `Right::Channel{Read,Write}(ChannelId)` are per-direction ends; a model-emitted
+  channel handle is a `Cap` slot in the caller's own table (executor resolves it
+  — no ambient authority). Backends: heap ring (`Pipe`), datagram queue, or a
+  live TCP socket (`Tcp`, via `adopt_tcp`) so a service agent can hand an
+  accepted connection to another agent (`channel_grant`). Synapse primitives
+  `channel_create/write/read/close/grant`.
+- **Service agents** (`service/`) — long-running native daemons (vs
+  request/response reasoning agents): `ServiceSpec {entry serve loop, autostart,
+  caps}`, `start`/`stop`/`task_for`/`supervise_tick` (pumped from
+  `shell::upkeep`, bounded restarts). Their protocol/codec logic is native,
+  deterministic code **below** the determinism boundary — the LLM never
+  implements a protocol. Shipped: `network` (echo, proves listen→accept→channel
+  handoff) and `http` (a Doc agent parsing HTTP/1.1 natively and serving docs).
+  `/agents start-net <port>` / `start-http <port>`, `/agents services`.
+  SSH/Git follow the identical shape (a native protocol module over an accepted
+  channel).
 - **Cortex** (`cortex/`) — CPU transformer inference (Qwen3.5, `-model
   qwen3.5-0.8b|qwen3.5-4b|qwen3.5-9b`); SIMD tensor kernels (SSE2/AVX2 ∣ NEON ∣ scalar behind
   one API); zero-copy GGUF; grammar-constrained sampler; KV/recurrent cache.
 - **Synapse** (`synapse/`) — the capability ABI: primitive registry, GBNF-style
-  grammar, deterministic executor, append-only audit log, taint gate.
+  grammar, deterministic executor, append-only audit log, taint gate. Primitives
+  now span fs/console/spawn, **channels** (10–14), **net** listen/accept + http
+  (15–18), and **UI surfaces** (19–22). The executor runs a **scope gate
+  (Gate 2.5)**: a granted narrow scope (an fs path glob, a `Net{host,port}` range)
+  is enforced against the concrete target (`scope_target` + `cap::scope_check`) —
+  deny-only-when-recorded, so `Scope::Any` grants and un-scoped tasks are
+  unaffected. `CapDomain` gained `Channel`/`Net`/`Ui`; `synapse::ui` owns the
+  surface registry + bounded draw-op DSL (ownership-gated: an agent can only
+  draw to its own surface). NB: sessions that use net egress or UI input aren't
+  replayable from a seed alone (the I/O is external) — the audit log records the
+  effects; treat such a session as non-deterministic to replay.
 - **Microkernel** — tasks + context switch, cooperative + timer-preemptive
   scheduler, unforgeable capabilities, IPC, SMP, frame allocator + heap, MMU.
 - **UI** — a tmux-style split-pane framebuffer compositor in Geist Mono (chat
@@ -196,7 +239,10 @@ real UEFI hardware.
   `NetDevice` facade — **virtio-net** over virtio-mmio (aarch64 QEMU) and over
   PCI, plus **e1000** (VirtualBox default + real Intel) — discovered the same way
   on both arches. Shell surface: `/network` (info/dhcp/static/dns), `/ping`,
-  `/wifi` (scan/connect via the password modal), `/http` (a curl-like
+  `/wifi` (scan/connect via the password modal), a **TCP listener**
+  (`net::listen`/`try_accept`, backed by a pool of Listen-state sockets;
+  accept hands out an Established `SocketHandle` a service agent adopts as a
+  channel), `/http` (a curl-like
   HTTP/1.1 client in `net/http.rs` — `-X`/`-H`/`-d`/`-v`/`--stream`, all
   methods, live chunked/SSE streaming; `http://` **and** `https://` via
   `net/tls.rs`/embedded-tls; also the agent's `http` tool), `/ws` (a
