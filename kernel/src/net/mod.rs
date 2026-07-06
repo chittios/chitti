@@ -439,6 +439,9 @@ pub fn resolve(name: &str, timeout_ms: u64) -> Result<Ipv4Address, &'static str>
         if crate::arch::now_ms() >= deadline {
             return Err("DNS timeout");
         }
+        if crate::shell::poll_interrupt() {
+            return Err("cancelled");
+        }
         crate::sched::yield_now();
     }
 }
@@ -495,6 +498,9 @@ pub fn ping(addr: Ipv4Address, timeout_ms: u64) -> Result<u64, &'static str> {
         }
         if crate::arch::now_ms() >= deadline {
             break Err("ping timeout");
+        }
+        if crate::shell::poll_interrupt() {
+            break Err("cancelled");
         }
         crate::sched::yield_now();
     };

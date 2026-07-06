@@ -254,6 +254,27 @@ real UEFI hardware.
   returns. Any new UI surface or blocking command must keep this upkeep
   running. The chat pane keeps a 2000-line scrollback (PgUp/PgDn; /clear
   wipes it); Shift+Tab / Ctrl+Tab / clicking switches pane focus.
+
+## STANDING RULE — Ctrl+C interrupts every command and process
+
+**Any new command or long-running process must respond to Ctrl+C.** A blocking
+loop already has to pump `shell::upkeep()` (above); in the *same* loop it must
+also poll for interrupt and bail when it fires — otherwise a stuck/streaming
+command can only be escaped by killing the VM, which is not acceptable.
+
+- **A shell command / networked loop** (`/http`, `/ping`, DNS, TLS, a `/ws`-style
+  stream, any future protocol client) calls `shell::poll_interrupt()` — true only
+  on Ctrl+C (`0x03`), and it **pushes any other byte back** (`console::unread`) so
+  it never swallows the *next* command's keystrokes. Return an `Err("cancelled")`
+  / break the loop on true.
+- **An inference / decode loop** calls `shell::poll_cancel()` (Ctrl+C **or** bare
+  Esc; a decode turn owns the console, so consuming input there is fine).
+
+Both are cheap — call them once per loop iteration next to `upkeep()`. A command
+that can block without an interrupt check is a bug; cover it with an e2e `cancel`
+scenario (drive raw `b"\x03"` via `guest.send_raw`, assert it aborts fast **and**
+the next command still runs) and a unit test on the pure poll logic
+(`poll_interrupt_ctrl_c_only_and_pushes_back`, `console::pushback_*`).
 - **Storage** — virtio/NVMe/AHCI block devices, GPT/MBR/FAT/ext4 detection,
   ext4 (the default filesystem) + FAT, `/install` (self-hosting install to a
   disk; detects an existing Chitti GPT and **updates in place**, preserving the
