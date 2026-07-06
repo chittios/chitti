@@ -4,3 +4,7 @@
 target/
 .DS_Store
 assets/voice/
+
+__pycache__/
+# e2e test-generated TLS certs
+tests/e2e/certs/
