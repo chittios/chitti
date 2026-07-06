@@ -51,9 +51,31 @@ capability exists on one arch, it exists on the other.
 
 After any change, verify both:
 
-- `cargo xtask build -arch x86_64` **and** `cargo xtask test` (must stay **107/107**)
+- `cargo xtask build -arch x86_64` **and** `cargo xtask test` (the in-kernel
+  unit suite — keep it green; add cases for new logic)
 - `cargo xtask build -arch aarch64` (and boot it via `cargo xtask run -arch aarch64`
   when the change is boot-visible)
+
+## STANDING RULE — every feature/fix ships with tests
+
+Two layers, and new work adds to **both** where they apply:
+
+1. **Unit tests** (`cargo xtask test`, x86 under QEMU, no model/hardware) for
+   the **pure logic** — parsers, decoders, codecs, format/build functions,
+   capability math. The pattern that keeps us safe: pull the fiddly logic out
+   of the hardware/IO path into a pure function and test it with cases (e.g.
+   `mouse::decode_ps2_packet`, `xhci::parse_report_layout`, `net::http`
+   `parse_url`/`dechunk_partial`, `shell::parse_tool_call`,
+   `ws::{base64,sha1,encode_frame}`). If logic broke before, it gets a test.
+
+2. **End-to-end tests** (`tests/e2e/`, `make e2e` / `make e2e-full`) for
+   anything that only exists **on the running OS** — a shell command, a
+   network/TLS/WebSocket exchange, a model or voice flow. The harness boots the
+   real kernel under QEMU and drives the shell over serial. **Adding a shell
+   command or a networked/model/voice feature means adding an e2e scenario**
+   (`os`/`net` groups always run; `model`/`voice` are `--slow`, gated on
+   assets). A fix for something the harness could have caught gets a scenario
+   too. Run `make e2e` before shipping boot-visible or networked changes.
 
 ## STANDING RULE — performance: know the three traps before optimizing
 
@@ -214,10 +236,12 @@ host-detected. See [DEVELOPMENT.md](DEVELOPMENT.md) for the full setup.
 
 ```sh
 cargo xtask test                       # in-kernel unit suite under QEMU (x86) — pure logic, no model
-make e2e                               # end-to-end: boot the kernel, drive the shell, exercise
-                                       #   http/https + ws/wss + hosted-model chat vs local servers
-                                       #   (tests/e2e/, dependency-free python; TLS scenarios need a
-                                       #    TLS-1.3 python — Homebrew's)
+make e2e                               # end-to-end: boot the kernel, drive the shell over serial,
+                                       #   exercise every OS command + the http/https/ws/wss/ping/
+                                       #   hosted-model flows vs local servers (tests/e2e/, stdlib-only
+                                       #   python; TLS scenarios need a TLS-1.3 python — Homebrew's)
+make e2e-full                          # + local inference (/infer,/perf,chat,/compact) and voice
+                                       #   (/voice say) — slow; needs assets/model.gguf + assets/voice/
 cargo xtask build -arch x86_64|aarch64 # cross-build the kernel
 cargo xtask run   -arch x86_64|aarch64 # boot in QEMU (aarch64 = native HVF on Apple Silicon)
 cargo xtask image -arch x86_64|aarch64 # assemble a bootable image/ISO

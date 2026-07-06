@@ -12,6 +12,10 @@ console, exercising the **networked core flows** against local host servers:
 | `ws` | `/ws ws://…` — WebSocket handshake + echo round-trip |
 | `wss` | `/ws wss://…` — WebSocket over TLS 1.3 |
 | `model_remote_https` | `/model remote https://…` — hosted-model chat over TLS |
+| `ping` | `/ping` — ICMP echo to the gateway |
+| *os group* | every shell command: `/help /info /datetime /disks /lspci /mounts /ls /skills /shortcuts /mode /think /agents /ui /ktrace /close /top /clear /wifi` |
+| *model group* (`--slow`) | `/bench`, `/infer`, `/perf`, a local chat turn, `/compact` — needs `assets/model.gguf` |
+| *voice group* (`--slow`) | `/voice models`, `/voice say` (TTS) — needs `assets/voice/` + a sound device |
 
 The in-kernel unit suite (`cargo xtask test`, x86 under QEMU) covers the pure
 logic — parsing, decoding, crypto vectors, frame codecs. These e2e tests cover
@@ -22,7 +26,8 @@ a fake OpenAI server, so generation is remote.
 ## Running
 
 ```sh
-make e2e                              # aarch64, 0.8B (uses a TLS-1.3 python if found)
+make e2e                              # os + net groups (~3 min); TLS-1.3 python for https/wss
+make e2e-full                         # + model + voice groups (slow; needs assets/model.gguf + voice)
 # or directly, with a TLS-1.3-capable interpreter for the https/wss scenarios:
 /opt/homebrew/bin/python3 tests/e2e/run.py
 /opt/homebrew/bin/python3 tests/e2e/run.py -v          # stream guest serial live

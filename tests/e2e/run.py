@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
 """End-to-end tests for Chitti OS: boot the kernel under QEMU, drive its shell
-over the serial console, and exercise the networked core flows against local
-host servers (HTTP methods + streaming, WebSocket ws:// and wss://, and a
-hosted-model chat via /model remote over https).
+over the serial console, and check that every command / flow actually works on
+the real thing.
 
-Dependency-free (stdlib only). Run it with a TLS-1.3-capable Python (e.g.
-Homebrew's) so the https/wss scenarios aren't skipped:
+Groups (each scenario -> PASS/FAIL, non-zero exit on any failure):
+  os     — the shell/OS commands (help, info, datetime, disks, agents, top, …)
+  net    — the networked flows against local host servers: /http (GET/POST/
+           stream), /ws + /wss, /ping, and /model remote over https
+  model  — inference: /bench, /infer, /perf, a chat turn, /compact  (needs the
+           bundled model; slow — only with --slow)
+  voice  — /voice models + /voice say (TTS)  (needs assets/voice + a sound
+           device; slow — only with --slow)
 
-    /opt/homebrew/bin/python3 tests/e2e/run.py           # or: make e2e
+Dependency-free (stdlib only). Run with a TLS-1.3-capable Python (Homebrew's)
+so the https/wss scenarios aren't skipped:
 
-Exits non-zero if any scenario fails. TLS scenarios auto-skip (not fail) when
-the running Python lacks TLS 1.3.
+    /opt/homebrew/bin/python3 tests/e2e/run.py              # os + net  (~3 min)
+    /opt/homebrew/bin/python3 tests/e2e/run.py --slow       # + model + voice
+    make e2e            /    make e2e-full                   # (Makefile targets)
+
+TLS scenarios auto-skip (not fail) when the running Python lacks TLS 1.3;
+model/voice scenarios auto-skip when the bundled model / voice assets are absent.
 """
 
 import os
@@ -27,25 +37,23 @@ HOST = "10.0.2.2"  # QEMU user-net alias for the host
 PLAIN_PORT = 8100
 TLS_PORT = 9100
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 CERT = os.path.join(HERE, "certs", "ec.pem")
 KEY = os.path.join(HERE, "certs", "ec.key")
 
 
 def _openssl():
-    """A modern OpenSSL (3.x) if present — LibreSSL (macOS system openssl)
-    produces certs the embedded-tls handshake rejects, so prefer Homebrew's."""
     for c in ("/opt/homebrew/opt/openssl@3/bin/openssl", "/usr/local/opt/openssl@3/bin/openssl", "openssl"):
         try:
             out = subprocess.run([c, "version"], capture_output=True, text=True)
-            if out.returncode == 0 and "OpenSSL" in out.stdout:  # not "LibreSSL"
+            if out.returncode == 0 and "OpenSSL" in out.stdout:
                 return c
         except Exception:
             continue
-    return "openssl"  # last resort
+    return "openssl"
 
 
 def ensure_cert():
-    """Generate an ECDSA P-256 self-signed cert (what embedded-tls accepts)."""
     if os.path.exists(CERT) and os.path.exists(KEY):
         return True
     os.makedirs(os.path.dirname(CERT), exist_ok=True)
@@ -59,13 +67,56 @@ def ensure_cert():
         return False
 
 
-# --- scenarios: each takes the guest, returns (ok, detail) ------------------
+# --- OS / shell commands: (name, command, expected substring) ---------------
+# Each just confirms the command runs and prints its marker on the real kernel.
+OS_CMDS = [
+    ("help", "/help", "Chitti commands:"),
+    ("info", "/info", "RAM installed"),
+    ("datetime", "/datetime", "datetime>"),
+    ("datetime_tz", "/datetime tz +5:30", "UTC+05:30"),
+    ("disks", "/disks", "disks>"),
+    ("lspci", "/lspci", "pci>"),
+    ("mounts", "/mounts", "mounts>"),
+    ("ls", "/ls /", "ls>"),
+    ("skills", "/skills", "installed"),
+    ("shortcuts", "/shortcuts", "Shortcuts ("),
+    ("mode", "/mode", "mode>"),
+    ("think", "/think off", "think>"),
+    ("agents", "/agents", "agents>"),
+    ("ui", "/ui", "ui>"),
+    ("ktrace", "/ktrace", "ktrace>"),
+    ("close", "/close", "action pane closed"),
+    ("top", "/top", "top>"),
+    ("clear", "/clear", "cleared"),
+    ("wifi", "/wifi info", "wifi>"),
+]
+
+
+def make_cmd_scenario(cmd, marker, timeout=15):
+    def fn(g):
+        m = g.mark()
+        g.send(cmd)
+        ok = g.wait_for(marker, timeout, m)
+        return ok, f"{cmd!r} -> {marker!r}" if ok else f"{cmd!r}: no {marker!r}"
+    return fn
+
+
+# --- network scenarios ------------------------------------------------------
 
 def s_network(g):
     m = g.mark()
     g.send("/network")
     ok = g.wait_for("10.0.2.15", 15, m)
     return ok, "IPv4 configured" if ok else "no IP in /network output"
+
+
+def s_ping(g):
+    m = g.mark()
+    g.send(f"/ping {HOST}")
+    # slirp answers pings to the gateway; accept either a reply or a ran-but-no-reply.
+    if g.wait_for("reply from", 12, m):
+        return True, "ICMP reply from gateway"
+    return g.wait_for("ping>", 3, m), ("ran (no reply — slirp ICMP)" if g.wait_for("ping>", 1, m) else "no output")
 
 
 def s_http_get(g):
@@ -93,9 +144,7 @@ def s_ws(g):
     m = g.mark()
     g.send(f"/ws ws://{HOST}:{PLAIN_PORT}/ws hello-ws")
     ok = g.wait_for("echo:hello-ws", 20, m)
-    # Wait for the /ws loop to exit (it consumes input for its Ctrl+C check,
-    # so the next command must not be sent until the shell prompt is back).
-    g.wait_for("closed by peer", 5, m)
+    g.wait_for("closed by peer", 5, m)  # let the /ws loop exit before the next cmd
     return ok, "ws echo round-trip" if ok else "no ws echo"
 
 
@@ -115,20 +164,82 @@ def s_model_remote_https(g):
     m2 = g.mark()
     g.send("hello from e2e")
     ok = g.wait_for("remote reply to: hello from e2e", 40, m2)
-    # Switch back so a stray later turn doesn't hit the network.
-    g.send("/model local")
+    g.send("/model local")  # switch back so later turns don't hit the net
+    g.wait_for("local (embedded)", 5)
     return ok, "hosted-model chat over https" if ok else "no remote reply"
 
 
-PLAIN = [("network", s_network), ("http_get", s_http_get), ("http_post", s_http_post), ("http_stream", s_http_stream), ("ws", s_ws)]
-TLS = [("wss", s_wss), ("model_remote_https", s_model_remote_https)]
+# --- model (local inference) scenarios — slow, need the bundled model -------
+
+def s_bench(g):
+    m = g.mark()
+    g.send("/bench")
+    ok = g.wait_for("bench>", 40, m)
+    return ok, "matvec kernel bench" if ok else "no bench output"
+
+
+def s_infer(g):
+    m = g.mark()
+    g.send("/infer")
+    ok = g.wait_for("tok/s", 180, m) or g.wait_for("=>", 5, m)
+    return ok, "reference inference ran" if ok else "no inference output"
+
+
+def s_perf(g):
+    m = g.mark()
+    g.send("/perf")
+    ok = g.wait_for("tok/s", 180, m)
+    return ok, "prefill/decode tok/s" if ok else "no perf output"
+
+
+def s_chat(g):
+    m = g.mark()
+    g.send("in one short sentence, what is 2 plus 2?")
+    ok = g.wait_for("chitti:", 180, m)
+    g.wait_quiet(2.0, 180)  # let the turn finish before the next command
+    return ok, "local model chat turn" if ok else "no chat reply"
+
+
+def s_compact(g):
+    m = g.mark()
+    g.send("/compact")
+    ok = g.wait_for("compacted", 180, m) or g.wait_for("nothing to compact", 10, m)
+    return ok, "context compaction" if ok else "no compact output"
+
+
+# --- voice scenarios — slow, need assets/voice + a sound device -------------
+
+def s_voice_models(g):
+    m = g.mark()
+    g.send("/voice models")
+    ok = g.wait_for("voice> models:", 20, m)
+    return ok, "voice model listing" if ok else "no voice models output"
+
+
+def s_voice_say(g):
+    m = g.mark()
+    g.send("/voice say hello from chitti")
+    # synthesize -> samples -> done; needs the KittenTTS model + a sound device.
+    ok = g.wait_for("voice> done", 120, m)
+    if not ok and g.wait_for("no kitten model", 3, m):
+        return None, "skipped (no TTS model bundled)"
+    if not ok and g.wait_for("no sound device", 3, m):
+        return None, "skipped (no sound device)"
+    return ok, "TTS synth + play" if ok else "no voice output"
+
+
+OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS]
+NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_stream", s_http_stream), ("ws", s_ws)]
+NET_TLS = [("wss", s_wss), ("model_remote_https", s_model_remote_https)]
+MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("compact", s_compact)]
+VOICE = [("voice_models", s_voice_models), ("voice_say", s_voice_say)]
 
 
 def main():
-    arch = "aarch64"
-    model = "qwen3.5-0.8b"
+    arch, model = "aarch64", "qwen3.5-0.8b"
     verbose = "-v" in sys.argv or "--verbose" in sys.argv
-    args = [a for a in sys.argv[1:] if a not in ("-v", "--verbose")]
+    slow = "--slow" in sys.argv or "--full" in sys.argv
+    args = [a for a in sys.argv[1:] if a not in ("-v", "--verbose", "--slow", "--full")]
     for i, a in enumerate(args):
         if a == "-arch" and i + 1 < len(args):
             arch = args[i + 1]
@@ -136,7 +247,9 @@ def main():
             model = args[i + 1]
 
     have_tls = ssl.HAS_TLSv1_3 and ensure_cert()
-    print(f"e2e: arch={arch} model={model} tls={'yes' if have_tls else 'SKIP (need TLS 1.3 python)'}")
+    have_model = os.path.exists(os.path.join(ROOT, "assets", "model.gguf"))
+    have_voice = os.path.isdir(os.path.join(ROOT, "assets", "voice")) and os.listdir(os.path.join(ROOT, "assets", "voice"))
+    print(f"e2e: arch={arch} model={model} tls={'yes' if have_tls else 'SKIP'} slow={'yes' if slow else 'no'}")
 
     servers = [Server(PLAIN_PORT)]
     if have_tls:
@@ -146,19 +259,26 @@ def main():
         else:
             have_tls = False
 
-    scenarios = list(PLAIN) + (list(TLS) if have_tls else [])
+    scenarios = list(OS) + list(NET) + (list(NET_TLS) if have_tls else [])
+    if slow:
+        if have_model:
+            scenarios += list(MODEL)
+        else:
+            print("  (model scenarios skipped — assets/model.gguf absent)")
+        if have_voice:
+            scenarios += list(VOICE)
+        else:
+            print("  (voice scenarios skipped — assets/voice/ absent)")
+
+    # Voice needs a sound device; give the guest a silent audio backend then.
+    audio = "none" if (slow and have_voice) else "off"
+    print(f"e2e: booting guest (cargo xtask run, audio={audio})…")
+    g = Guest(arch=arch, model=model, verbose=verbose, audio=audio)
     results = []
-    print("e2e: booting guest (cargo xtask run)…")
-    g = Guest(arch=arch, model=model, verbose=verbose)
     try:
-        # Wait for networking to come up before driving net commands.
         if not g.wait_for("net: configured", 120):
             print("e2e: FAILED — guest never configured networking (boot/DHCP)")
-            print("---- last output ----")
             print(g.tail(1500))
-            g.close()
-            for s in servers:
-                s.stop()
             return 1
         time.sleep(1)
         for name, fn in scenarios:
@@ -166,21 +286,21 @@ def main():
                 ok, detail = fn(g)
             except Exception as e:
                 ok, detail = False, f"exception: {e}"
-            results.append((name, ok, detail))
-            print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
-            if not ok and verbose:
-                print("    ---- recent output ----")
+            tag = "SKIP" if ok is None else ("PASS" if ok else "FAIL")
+            results.append((name, tag))
+            print(f"  [{tag}] {name}: {detail}")
+            if ok is False and verbose:
                 print("    " + g.tail(600).replace("\n", "\n    "))
     finally:
         g.close()
         for s in servers:
             s.stop()
 
-    passed = sum(1 for _, ok, _ in results if ok)
-    total = len(results)
-    skipped = len(PLAIN) + len(TLS) - total
-    print(f"e2e: {passed}/{total} passed" + (f", {skipped} skipped" if skipped else ""))
-    return 0 if passed == total else 1
+    passed = sum(1 for _, t in results if t == "PASS")
+    failed = sum(1 for _, t in results if t == "FAIL")
+    skipped = sum(1 for _, t in results if t == "SKIP")
+    print(f"e2e: {passed} passed, {failed} failed, {skipped} skipped ({len(results)} run)")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

@@ -21,14 +21,16 @@ def _repo_root():
 
 
 class Guest:
-    def __init__(self, arch="aarch64", model="qwen3.5-0.8b", verbose=False):
+    def __init__(self, arch="aarch64", model="qwen3.5-0.8b", verbose=False, audio="off"):
         self.verbose = verbose
         self.buf = bytearray()
         self.lock = threading.Lock()
         env = dict(os.environ)
-        # Headless: no display window, no host audio backend to open.
+        # Headless: no display window. `audio="none"` gives the guest a
+        # virtio-snd device on a silent backend (so /voice has a sound device to
+        # enumerate); "off" omits audio entirely (faster; net/OS tests).
         env["CHITTI_DISPLAY"] = "none"
-        env["CHITTI_AUDIO"] = "off"
+        env["CHITTI_AUDIO"] = audio
         cmd = ["cargo", "xtask", "run", "-arch", arch, "-model", model]
         self.proc = subprocess.Popen(
             cmd,
@@ -75,6 +77,24 @@ class Guest:
             if pattern in self.text()[since:]:
                 return True
             time.sleep(0.1)
+        return False
+
+    def wait_quiet(self, quiet=1.5, timeout=180.0):
+        """Wait until the serial output has been idle for `quiet` seconds — i.e.
+        a generating turn (chat/infer) has finished and the prompt is back, so
+        the next command isn't typed mid-generation (the decode loop's Ctrl+C
+        check would eat it)."""
+        deadline = time.time() + timeout
+        last_len = len(self.text())
+        last_change = time.time()
+        while time.time() < deadline:
+            n = len(self.text())
+            if n != last_len:
+                last_len = n
+                last_change = time.time()
+            elif time.time() - last_change >= quiet:
+                return True
+            time.sleep(0.2)
         return False
 
     def send(self, line):
