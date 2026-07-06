@@ -2373,8 +2373,16 @@ fn run_agents(arg: &str, chat: &mut Option<ChatSession>) {
         }
         "install" => run_agent_install(sarg, chat),
         "uninstall" => run_agent_uninstall(sarg),
+        "start-net" => match sarg.parse::<u16>() {
+            Ok(port) if port != 0 => {
+                crate::service::network::set_echo_port(port);
+                let t = crate::service::start(&crate::service::network::ECHO_SERVICE);
+                serial_println!("agents> network-echo service listening on TCP :{} (task {})", port, t);
+            }
+            _ => serial_println!("usage: /agents start-net <port>"),
+        },
         other => serial_println!(
-            "agents> unknown '{}' — usage: /agents [list|switch <id>|kill <id>|services|install <name> [--yes]|uninstall <name>]",
+            "agents> unknown '{}' — usage: /agents [list|switch <id>|kill <id>|services|start-net <port>|install <name> [--yes]|uninstall <name>]",
             other
         ),
     }

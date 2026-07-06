@@ -234,6 +234,7 @@ pub fn kill(id: TaskId) -> Result<(), &'static str> {
         s.ready_queue.retain(|&t| t != id);
         Ok(())
     })?;
+    crate::cap::clear_scopes(id); // drop the fine-grained scope ledger too
     crate::ktrace::log_fmt(format_args!("sched: task {id} killed"));
     Ok(())
 }

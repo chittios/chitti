@@ -72,6 +72,14 @@ pub const CHANNEL_CLOSE: PrimitiveId = 13;
 // moves authority to another principal, so injected content can't silently
 // exfiltrate a stream to an attacker-controlled agent without a human confirm.
 pub const CHANNEL_GRANT: PrimitiveId = 14;
+// Network capability (Phase 3). `net_listen` binds a port (destructive: an
+// externally-visible effect). `net_accept` hands out an inbound connection as a
+// channel. `net_http_get`/`net_http_post` are scope-gated egress; POST is
+// destructive (an exfiltration vector under prompt injection).
+pub const NET_LISTEN: PrimitiveId = 15;
+pub const NET_ACCEPT: PrimitiveId = 16;
+pub const NET_HTTP_GET: PrimitiveId = 17;
+pub const NET_HTTP_POST: PrimitiveId = 18;
 
 const STR: ArgType = ArgType::Str;
 const UINT: ArgType = ArgType::Uint;
@@ -184,6 +192,34 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
         description: "Hand the channel end at cap slot `chan` to another agent (by service name or task id). Destructive: moves authority to another principal.",
         destructive: true,
     },
+    PrimitiveSpec {
+        id: NET_LISTEN,
+        name: "net_listen",
+        params: &[Param { key: "port", ty: UINT }, Param { key: "proto", ty: STR }],
+        description: "Listen for inbound TCP connections on a port. Returns a listener cap slot. Destructive: binds an externally-visible port.",
+        destructive: true,
+    },
+    PrimitiveSpec {
+        id: NET_ACCEPT,
+        name: "net_accept",
+        params: &[Param { key: "listener", ty: UINT }],
+        description: "Accept one inbound connection on a listener (cap slot). Returns the connection's read/write channel end cap slots. Blocks briefly.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: NET_HTTP_GET,
+        name: "net_http_get",
+        params: &[Param { key: "url", ty: STR }],
+        description: "HTTP GET a URL (scope-gated by host/port). Returns the response body.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: NET_HTTP_POST,
+        name: "net_http_post",
+        params: &[Param { key: "url", ty: STR }, Param { key: "body", ty: STR }],
+        description: "HTTP POST a body to a URL (scope-gated). Destructive: network egress that can exfiltrate.",
+        destructive: true,
+    },
 ];
 
 /// Look up a primitive by its wire name. `None` for any name not in the
@@ -235,6 +271,6 @@ mod tests {
         // `mem_fs_delete` (irreversible), `channel_grant` (moves authority to
         // another principal — an exfiltration vector under prompt injection).
         let destructive: alloc::vec::Vec<_> = REGISTRY.iter().filter(|p| p.destructive).map(|p| p.name).collect();
-        assert_eq!(destructive, alloc::vec!["mem_fs_delete", "channel_grant"]);
+        assert_eq!(destructive, alloc::vec!["mem_fs_delete", "channel_grant", "net_listen", "net_http_post"]);
     }
 }

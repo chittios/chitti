@@ -11,6 +11,8 @@
 //! (accept a connection, copy bytes, parse a protocol) is native and audited at
 //! the Synapse boundary exactly like any other effect.
 
+pub mod network;
+
 use crate::cap::{self, Right};
 use crate::mm::Locked;
 use crate::sched::{self, TaskId};

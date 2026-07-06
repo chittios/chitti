@@ -20,6 +20,7 @@
 use super::grammar::{self, ArgValue, Call, GrammarError};
 use super::registry::{self, PrimitiveSpec};
 use super::{audit, fs};
+use crate::agent::types::{CapDomain, Rights, Scope};
 use crate::cap::{self, Cap, ChannelId, Right};
 use crate::channel;
 use crate::sched::{self, TaskId};
@@ -44,6 +45,9 @@ pub enum Invocation {
     /// justification traced to untrusted ingested content and no human
     /// confirmed it. No primitive ran.
     RefusedTainted { primitive: &'static str },
+    /// The caller held the primitive but the concrete target (path/host/port)
+    /// fell outside its granted scope (Gate 2.5). No primitive ran.
+    DeniedScope { primitive: &'static str },
 }
 
 /// Deterministic id source for `spawn_agent` requests. Real agent lifecycle
@@ -97,6 +101,22 @@ pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Just
         return Invocation::RefusedTainted { primitive: spec.name };
     }
 
+    // Gate 3.5: scope. If the caller was granted a *narrow* scope for this
+    // domain (a path glob, a host/port range), the concrete target this call
+    // touches must fall within it. Tasks with no scope ledger for the domain are
+    // unconstrained (preserves primitive-granularity behaviour); a Scope::Any
+    // grant covers everything. See `cap::scope_check`.
+    if let Some((domain, want, target)) = scope_target(spec, &call.args) {
+        if !cap::scope_check(caller, domain, want, &target) {
+            crate::ktrace::log_fmt(format_args!(
+                "synapse.scope: DENIED '{}' by task {caller} -- target outside granted scope",
+                spec.name
+            ));
+            audit::record(caller, spec.name, args_hash, audit::Outcome::DeniedScope, 0);
+            return Invocation::DeniedScope { primitive: spec.name };
+        }
+    }
+
     // Gate 4: execute in isolation, then audit the effect.
     let result = run_primitive(caller, spec, &call.args);
     let result_hash = audit::fnv1a(result.as_bytes());
@@ -125,6 +145,41 @@ fn resolve_channel_end(caller: TaskId, args: &[ArgValue], i: usize) -> Option<(C
     match cap::lookup(caller, Cap(slot)) {
         Some(Right::ChannelWrite(c)) => Some((c, true)),
         Some(Right::ChannelRead(c)) => Some((c, false)),
+        _ => None,
+    }
+}
+
+/// Map a validated call to the concrete (domain, rights, target scope) it
+/// touches, for the executor's scope gate. `None` = the primitive names no
+/// scopeable resource (console, sleep, emit_result, channel ops — channels are
+/// gated by their per-end cap, not a scope). This is the single place a
+/// primitive's arguments become the scope target the ledger is checked against.
+fn scope_target(spec: &PrimitiveSpec, args: &[ArgValue]) -> Option<(CapDomain, Rights, Scope)> {
+    match spec.id {
+        registry::MEM_FS_READ => Some((CapDomain::Fs, Rights::READ, Scope::Path(arg_str(args, 0).into()))),
+        registry::MEM_FS_WRITE => Some((CapDomain::Fs, Rights::WRITE, Scope::Path(arg_str(args, 0).into()))),
+        registry::MEM_FS_EDIT => Some((CapDomain::Fs, Rights::WRITE, Scope::Path(arg_str(args, 0).into()))),
+        registry::MEM_FS_DELETE => Some((CapDomain::Fs, Rights::DELETE, Scope::Path(arg_str(args, 0).into()))),
+        registry::NET_HTTP_GET => net_scope(arg_str(args, 0), Rights::READ),
+        registry::NET_HTTP_POST => net_scope(arg_str(args, 0), Rights::WRITE),
+        _ => None,
+    }
+}
+
+/// Build a `Net` scope *target* (a single host:port point) from a URL, for the
+/// scope gate. Returns `None` (unconstrained) if the URL doesn't parse — the
+/// primitive itself will then reject the malformed URL.
+fn net_scope(url: &str, want: Rights) -> Option<(CapDomain, Rights, Scope)> {
+    let (_https, host, port, _path) = crate::net::http::parse_url(url).ok()?;
+    Some((CapDomain::Net, want, Scope::Net { host, port_lo: port, port_hi: port }))
+}
+
+/// Resolve a `net_accept` listener handle (a `Uint` = the caller's cap slot) as
+/// a `NetListen` right in the caller's own table.
+fn resolve_listener(caller: TaskId, args: &[ArgValue], i: usize) -> Option<crate::cap::ListenerId> {
+    let slot = arg_uint(args, i) as u32;
+    match cap::lookup(caller, Cap(slot)) {
+        Some(Right::NetListen(l)) => Some(l),
         _ => None,
     }
 }
@@ -323,6 +378,65 @@ fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> Str
             let slot = cap::grant(target, right).0;
             let dir = if is_write { "write" } else { "read" };
             format!("ok:granted {dir} end to task {target} (slot {slot})")
+        }
+        registry::NET_LISTEN => {
+            let port = arg_uint(args, 0);
+            let proto = arg_str(args, 1);
+            if proto != "tcp" {
+                return format!("error:unsupported_proto:{proto}");
+            }
+            if port == 0 || port > 65535 {
+                return format!("error:bad_port:{port}");
+            }
+            match crate::net::listen(port as u16) {
+                Ok(listener) => {
+                    let slot = cap::grant(caller, Right::NetListen(listener)).0;
+                    format!("ok:listener={slot} port={port}")
+                }
+                Err(e) => format!("error:{e}"),
+            }
+        }
+        registry::NET_ACCEPT => match resolve_listener(caller, args, 0) {
+            Some(listener) => {
+                // Cooperative accept, bounded (the model never hangs forever).
+                let deadline = crate::arch::now_ms() + CHANNEL_READ_DEADLINE_MS;
+                loop {
+                    if let Some(handle) = crate::net::try_accept(listener) {
+                        let chan = channel::adopt_tcp(handle);
+                        let read_slot = cap::grant(caller, Right::ChannelRead(chan)).0;
+                        let write_slot = cap::grant(caller, Right::ChannelWrite(chan)).0;
+                        break format!("ok:channel_read={read_slot} channel_write={write_slot}");
+                    }
+                    if crate::arch::now_ms() >= deadline {
+                        break "ok:no_connection".to_string();
+                    }
+                    crate::shell::upkeep();
+                    crate::sched::yield_now();
+                }
+            }
+            _ => {
+                cap::record_denial(caller, "net_accept (listener handle)");
+                "error:denied_listener_handle".to_string()
+            }
+        },
+        registry::NET_HTTP_GET => {
+            let url = arg_str(args, 0);
+            match crate::net::http::get(url, 15_000) {
+                Ok(resp) => {
+                    let body = resp.text();
+                    let capped = if body.len() > 4096 { &body[..4096] } else { &body };
+                    format!("ok:status={} body={}", resp.status, capped)
+                }
+                Err(e) => format!("error:{e}"),
+            }
+        }
+        registry::NET_HTTP_POST => {
+            let url = arg_str(args, 0);
+            let body = arg_str(args, 1);
+            match crate::net::http::post_json(url, body, None, 15_000) {
+                Ok(resp) => format!("ok:status={}", resp.status),
+                Err(e) => format!("error:{e}"),
+            }
         }
         other => format!("error:unimplemented primitive id {other}"),
     }

@@ -78,6 +78,9 @@ impl Router {
             Invocation::RefusedTainted { primitive } => {
                 ToolOutcome::error(alloc::format!("refused: destructive '{primitive}' justified by untrusted content"))
             }
+            Invocation::DeniedScope { primitive } => {
+                ToolOutcome::error(alloc::format!("denied: '{primitive}' target outside granted scope"))
+            }
         }
     }
 }

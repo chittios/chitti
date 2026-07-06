@@ -21,7 +21,7 @@ def _repo_root():
 
 
 class Guest:
-    def __init__(self, arch="aarch64", model="qwen3.5-0.8b", verbose=False, audio="off"):
+    def __init__(self, arch="aarch64", model="qwen3.5-0.8b", verbose=False, audio="off", hostfwd=None):
         self.verbose = verbose
         self.buf = bytearray()
         self.lock = threading.Lock()
@@ -31,6 +31,10 @@ class Guest:
         # enumerate); "off" omits audio entirely (faster; net/OS tests).
         env["CHITTI_DISPLAY"] = "none"
         env["CHITTI_AUDIO"] = audio
+        # Opt-in slirp host-forward so the host can reach a guest TCP listener
+        # (the Network-service-agent e2e). xtask adds hostfwd for this port.
+        if hostfwd:
+            env["CHITTI_HOSTFWD"] = str(hostfwd)
         cmd = ["cargo", "xtask", "run", "-arch", arch, "-model", model]
         self.proc = subprocess.Popen(
             cmd,

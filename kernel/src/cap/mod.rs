@@ -5,7 +5,10 @@
 //! table. A task can only ever exercise a `Right` the kernel explicitly
 //! `grant`ed it -- no ambient authority, no capability by convention.
 
+use crate::agent::types::{CapDomain, CapabilityRequest, Rights, Scope};
+use crate::mm::Locked;
 use crate::sched::{self, TaskId};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -136,4 +139,57 @@ pub(crate) fn lookup(task: TaskId, cap: Cap) -> Option<Right> {
 /// this never inspects another task's authority.
 pub fn holds(task: TaskId, right: Right) -> bool {
     sched::with_cap_table_mut(task, |table| table.grants(right))
+}
+
+// --- Scope ledger (fine-grained, per-task) ----------------------------------
+//
+// The live `Right`/`CapTable` is primitive-granularity ("may you call
+// mem_fs_write at all"). The *scope* of a granted capability (which paths, which
+// hosts/ports) is recorded here alongside it, and the Synapse executor's Gate
+// 2.5 consults it to enforce path/host/port limits the manifest declared. Kept
+// as a side table so the `Copy` `Right` enum stays small and unchanged.
+//
+// Enforcement is deny-only-when-recorded: a task with NO ledger entry for a
+// domain is not scope-constrained for it (preserves the behaviour of the many
+// call sites that `grant` an `InvokePrimitive` directly without scopes). A
+// domain present in the ledger is enforced — a `Scope::Any` entry (the common
+// grant) covers everything, so it passes; a narrow entry bites.
+
+static SCOPES: Locked<BTreeMap<TaskId, Vec<CapabilityRequest>>> = Locked::new(BTreeMap::new());
+
+/// Record the granted capability scopes for `task` (called by
+/// `agent::manifest::grant_to_task`, the one place declarative caps become live
+/// authority). Appends, so multiple grants accumulate.
+pub fn grant_scopes(task: TaskId, caps: &[CapabilityRequest]) {
+    if caps.is_empty() {
+        return;
+    }
+    SCOPES.with(|m| m.entry(task).or_default().extend_from_slice(caps));
+}
+
+/// Gate 2.5 predicate: may `task` exercise `want` rights in `domain` on the
+/// concrete `target` scope? Returns `true` (allow) unless `domain` is present in
+/// the task's ledger and no recorded entry covers the target with the needed
+/// rights. See the module note on deny-only-when-recorded.
+pub fn scope_check(task: TaskId, domain: CapDomain, want: Rights, target: &Scope) -> bool {
+    SCOPES.with(|m| match m.get(&task) {
+        None => true,
+        Some(caps) => {
+            let mut constrained = false;
+            for c in caps.iter().filter(|c| c.domain == domain) {
+                constrained = true;
+                if c.rights.contains(want) && c.scope.covers(target) {
+                    return true;
+                }
+            }
+            !constrained // no entry for this domain -> not scope-constrained
+        }
+    })
+}
+
+/// Drop a task's scope ledger (called on `kill`, alongside the cap-table wipe).
+pub fn clear_scopes(task: TaskId) {
+    SCOPES.with(|m| {
+        m.remove(&task);
+    });
 }
