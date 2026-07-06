@@ -3738,3 +3738,47 @@ fn disk_ext4read() {
     }
 }
 
+
+#[cfg(test)]
+mod agent_flow_tests {
+    use super::*;
+
+    /// The agent chat flow parses the Qwen `<tool_call>` JSON: name + flattened
+    /// `args`. A leading `/` on the name is stripped (models drift into `/ls`).
+    #[test_case]
+    fn parse_tool_call_qwen_json() {
+        let (name, args) = parse_tool_call("<tool_call>{\"name\": \"ls\", \"arguments\": {\"args\": \"/mnt\"}}</tool_call>").unwrap();
+        assert_eq!(name, "ls");
+        assert_eq!(args, "/mnt");
+        // A bare-string arguments value is used as-is; a leading slash is dropped.
+        let (name, args) = parse_tool_call("thinking...\n<tool_call>{\"name\": \"/ping\", \"arguments\": \"1.1.1.1\"}</tool_call>").unwrap();
+        assert_eq!(name, "ping");
+        assert_eq!(args, "1.1.1.1");
+        // spawn_subagent (delegation) with a task string.
+        let (name, args) = parse_tool_call("<tool_call>{\"name\":\"spawn_subagent\",\"arguments\":{\"task\":\"read notes\"}}</tool_call>").unwrap();
+        assert_eq!(name, "spawn_subagent");
+        assert_eq!(args, "read notes");
+    }
+
+    #[test_case]
+    fn parse_tool_call_legacy_and_none() {
+        // Legacy `TOOL:` fallback (older prompt drift).
+        let (name, args) = parse_tool_call("TOOL: /disks").unwrap();
+        assert_eq!((name.as_str(), args.as_str()), ("disks", ""));
+        // Plain prose (a normal answer / greeting) → no tool call.
+        assert!(parse_tool_call("Hello! How can I help you today?").is_none());
+    }
+
+    /// The system prompt advertises only the small CORE set + search_tools —
+    /// this is what stops the 0.8B model calling `help` on a bare "hello".
+    #[test_case]
+    fn system_prompt_is_compact_with_search_tools() {
+        let toolset: alloc::vec::Vec<String> = alloc::vec!["ls".into(), "cat".into(), "help".into(), "wifi".into()];
+        let p = tools_system_prompt("You are Chitti.", &toolset);
+        assert!(p.contains("search_tools"), "must advertise the discovery tool");
+        assert!(p.contains("- ls "), "core tools are listed");
+        // `help`/`wifi` are NOT core, so they stay out of the inline prompt.
+        assert!(!p.contains("- help "), "non-core tools are found via search_tools, not listed");
+        assert!(!p.contains("- wifi "));
+    }
+}

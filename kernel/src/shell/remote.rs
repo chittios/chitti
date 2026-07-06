@@ -68,19 +68,40 @@ fn jstr(s: &str) -> Json {
     Json::Str(s.to_string())
 }
 
-/// One OpenAI-style chat completion: POST the full message history, return
-/// the assistant text.
-pub fn chat_completion(cfg: &RemoteConfig, messages: &[(String, String)]) -> Result<String, String> {
+/// Build the OpenAI `/v1/chat/completions` request body for `model` +
+/// `messages` (role/content pairs). Pure — unit-tested so the wire shape can't
+/// silently drift.
+pub fn build_chat_request(model: &str, messages: &[(String, String)]) -> String {
     let msgs: Vec<Json> = messages
         .iter()
         .map(|(role, content)| Json::Obj(vec![("role".to_string(), jstr(role)), ("content".to_string(), jstr(content))]))
         .collect();
-    let body = Json::Obj(vec![
-        ("model".to_string(), jstr(&cfg.model)),
+    Json::Obj(vec![
+        ("model".to_string(), jstr(model)),
         ("messages".to_string(), Json::Arr(msgs)),
         ("stream".to_string(), Json::Bool(false)),
     ])
-    .to_pretty();
+    .to_pretty()
+}
+
+/// Extract `choices[0].message.content` from an OpenAI-style completion
+/// response body. `None` if the JSON is malformed or the field is absent.
+/// Pure — unit-tested (the response shape is what hosted backends must match).
+pub fn parse_completion(body: &str) -> Option<String> {
+    let j = Json::parse(body)?;
+    j.get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
+}
+
+/// One OpenAI-style chat completion: POST the full message history, return
+/// the assistant text.
+pub fn chat_completion(cfg: &RemoteConfig, messages: &[(String, String)]) -> Result<String, String> {
+    let body = build_chat_request(&cfg.model, messages);
     let url = format!("{}/v1/chat/completions", cfg.url);
     crate::ktrace::log_fmt(format_args!("remote: POST {url} ({} messages)", messages.len()));
     let resp = crate::net::http::post_json(&url, &body, cfg.key.as_deref(), HTTP_TIMEOUT_MS)?;
@@ -89,16 +110,7 @@ pub fn chat_completion(cfg: &RemoteConfig, messages: &[(String, String)]) -> Res
         let snip = &text[..text.len().min(300)];
         return Err(format!("HTTP {}: {}", resp.status, snip));
     }
-    let j = Json::parse(&resp.text()).ok_or("unparseable completion JSON")?;
-    let content = j
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|a| a.first())
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|s| s.as_str())
-        .ok_or("no choices[0].message.content in response")?;
-    Ok(content.to_string())
+    parse_completion(&resp.text()).ok_or_else(|| "no choices[0].message.content in response".to_string())
 }
 
 /// A remote chat session: the plain-text message history (system prompt
@@ -183,5 +195,48 @@ impl RemoteChat {
 
     pub fn model_name(&self) -> &str {
         &self.cfg.model
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hosted-model request is the OpenAI `/v1/chat/completions` shape:
+    /// model + role/content messages, non-streaming.
+    #[test_case]
+    fn builds_openai_chat_request() {
+        let msgs = alloc::vec![
+            ("system".to_string(), "You are Chitti.".to_string()),
+            ("user".to_string(), "hi".to_string()),
+        ];
+        let body = build_chat_request("llama-3.1-8b", &msgs);
+        assert!(body.contains("\"model\""));
+        assert!(body.contains("llama-3.1-8b"));
+        assert!(body.contains("\"role\""));
+        assert!(body.contains("\"system\""));
+        assert!(body.contains("\"user\""));
+        assert!(body.contains("\"stream\""));
+    }
+
+    /// The assistant text is pulled from choices[0].message.content; malformed
+    /// or empty responses yield None (the caller surfaces an error).
+    #[test_case]
+    fn parses_completion_content() {
+        let ok = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"the answer is 42\"}}]}";
+        assert_eq!(parse_completion(ok).as_deref(), Some("the answer is 42"));
+        assert!(parse_completion("{\"choices\":[]}").is_none());
+        assert!(parse_completion("not json").is_none());
+        assert!(parse_completion("{\"error\":\"bad key\"}").is_none());
+    }
+
+    /// `/model` config round-trips through model.json (mode + endpoint + key).
+    #[test_case]
+    fn config_json_roundtrip() {
+        // Persisted "remote" config parses back with mode active.
+        let json = "{\"mode\":\"remote\",\"url\":\"http://192.168.1.20:8080\",\"model\":\"qwen3\",\"key\":\"sk-abc\"}";
+        let j = crate::json::Json::parse(json).unwrap();
+        assert_eq!(j.get("mode").and_then(|v| v.as_str()), Some("remote"));
+        assert_eq!(j.get("url").and_then(|v| v.as_str()), Some("http://192.168.1.20:8080"));
     }
 }

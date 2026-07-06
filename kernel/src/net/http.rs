@@ -336,3 +336,79 @@ pub fn post_json(url: &str, json: &str, bearer: Option<&str>, timeout_ms: u64) -
     }
     request("POST", url, &headers, json.as_bytes(), timeout_ms)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn parse_url_schemes_ports_paths() {
+        // http default port 80, no path → "/".
+        let (tls, host, port, path) = parse_url("http://192.168.1.20:8080/v1/models").unwrap();
+        assert!(!tls);
+        assert_eq!(host, "192.168.1.20");
+        assert_eq!(port, 8080);
+        assert_eq!(path, "/v1/models");
+        // https defaults to 443, tls flag set.
+        let (tls, host, port, path) = parse_url("https://example.com").unwrap();
+        assert!(tls);
+        assert_eq!((host.as_str(), port, path.as_str()), ("example.com", 443, "/"));
+        // plain http default port.
+        let (_, _, port, _) = parse_url("http://host/x").unwrap();
+        assert_eq!(port, 80);
+        // A bad scheme is rejected.
+        assert!(parse_url("ftp://x").is_err());
+        assert!(parse_url("http://").is_err());
+    }
+
+    #[test_case]
+    fn host_ip_parses_ipv4_literals() {
+        // Dotted-quad literals bypass DNS (this is the /ping + /http fast path).
+        assert_eq!(host_ip("10.0.2.2").unwrap(), Ipv4Address::new(10, 0, 2, 2));
+        assert_eq!(host_ip("192.168.1.255").unwrap(), Ipv4Address::new(192, 168, 1, 255));
+        // A non-literal falls through to DNS, which errors with no interface up
+        // (rather than misparsing) — we just assert it doesn't panic/parse.
+        assert!(host_ip("not.an.ip.literal").is_err());
+    }
+
+    #[test_case]
+    fn response_complete_content_length() {
+        // Headers present, body shorter than Content-Length → not complete.
+        assert!(!response_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab"));
+        // Full body → complete.
+        assert!(response_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabcde"));
+        // No header terminator yet → not complete.
+        assert!(!response_complete(b"HTTP/1.1 200 OK\r\nContent-Len"));
+    }
+
+    #[test_case]
+    fn response_complete_chunked_terminator() {
+        assert!(!response_complete(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"));
+        assert!(response_complete(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
+    }
+
+    #[test_case]
+    fn parse_response_status_and_body() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 7\r\n\r\n{\"a\":1}";
+        let r = parse_response(raw).unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(r.text(), "{\"a\":1}");
+        // A non-200 status is still parsed (the caller decides what to do).
+        let r = parse_response(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").unwrap();
+        assert_eq!(r.status, 404);
+        assert!(r.body.is_empty());
+    }
+
+    #[test_case]
+    fn parse_response_dechunks() {
+        // Two chunks (5 + 6 bytes) then the 0-terminator → "hello world".
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let r = parse_response(raw).unwrap();
+        assert_eq!(r.text(), "hello world");
+    }
+
+    #[test_case]
+    fn parse_response_rejects_headerless() {
+        assert!(parse_response(b"garbage with no terminator").is_err());
+    }
+}

@@ -245,3 +245,45 @@ pub fn test_tone(hz_tone: u32, ms: u32, rate: u32) -> Vec<i16> {
     }
     v
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The resampler is what made "hello there" play as "helllloooo theeeere"
+    /// when a driver ignored the rate — assert the exact-ratio behaviour.
+    #[test_case]
+    fn resample_integer_ratios() {
+        // Identity: same rate returns the input unchanged.
+        assert_eq!(resample(&[1, 2, 3], 16_000, 16_000), alloc::vec![1, 2, 3]);
+        // 16k -> 48k is x3 upsampling: length triples (nearest-neighbour).
+        let up = resample(&[10, 20], 16_000, 48_000);
+        assert_eq!(up.len(), 6);
+        assert_eq!(up[0], 10);
+        assert_eq!(up[5], 20);
+        // 24k -> 48k is x2.
+        assert_eq!(resample(&[5, 6, 7], 24_000, 48_000).len(), 6);
+        // Downsample 48k -> 16k halves-and-thirds (len scales by ratio).
+        assert_eq!(resample(&[0; 6], 48_000, 16_000).len(), 2);
+        // hz == 0 is a no-op guard (never divide by zero).
+        assert_eq!(resample(&[9], 0, 48_000), alloc::vec![9]);
+    }
+
+    #[test_case]
+    fn rms_bounds() {
+        // Silence is 0.
+        assert_eq!(rms(&[0, 0, 0, 0]), 0.0);
+        // Empty is 0 (no divide-by-zero).
+        assert_eq!(rms(&[]), 0.0);
+        // Full-scale square wave ~= 1.0 (within the Newton-sqrt tolerance).
+        let full = [i16::MAX, i16::MIN, i16::MAX, i16::MIN];
+        let r = rms(&full);
+        assert!(r > 0.99 && r <= 1.01, "full-scale RMS ~= 1.0, got {}", r);
+    }
+
+    #[test_case]
+    fn test_tone_length_matches_duration() {
+        // A 200 ms tone at 16 kHz is 3200 samples.
+        assert_eq!(test_tone(440, 200, 16_000).len(), 3200);
+    }
+}
