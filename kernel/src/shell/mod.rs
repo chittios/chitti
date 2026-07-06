@@ -2691,19 +2691,34 @@ fn ui_tick() {
 }
 
 static LAST_TOP_MS: AtomicU64 = AtomicU64::new(0);
+/// `/top` per-core utilisation is measured across refreshes: the previous
+/// CNTVCT reading and each core's previous busy-cycle total.
+const TOP_MAX_CORES: usize = 16;
+static TOP_PREV_CYC: AtomicU64 = AtomicU64::new(0);
+static TOP_PREV_BUSY: [AtomicU64; TOP_MAX_CORES] = [const { AtomicU64::new(0) }; TOP_MAX_CORES];
 
 /// Gather a system snapshot and paint the `/top` action-pane dashboard. No-op
 /// unless the pane is in `/top` mode. Called ~1 Hz from `ui_tick`.
 #[cfg(not(test))]
 fn refresh_top() {
     let m = crate::mm::mem_stats();
-    let ncores = crate::arch::cpu_count().max(1) as usize;
-    // Only core 0 runs work (cooperative scheduler; APs park), so it carries
-    // the measured CPU%; the rest are online-but-idle.
+    let ncores = (crate::arch::cpu_count().max(1) as usize).min(TOP_MAX_CORES);
+    // Core 0 (BSP) runs the whole inference loop, so its utilisation is the
+    // gap-based `cpu_percent()` (≈100% under load). The worker cores (1..N)
+    // only compute matmul chunks; measure their true busy fraction as
+    // compute-cycles / wall-cycles over this refresh window (same CNTVCT
+    // clock, so no frequency conversion is needed).
+    let cyc = crate::arch::cycle_count();
+    let prev_cyc = TOP_PREV_CYC.swap(cyc, Ordering::Relaxed);
+    let window = cyc.wrapping_sub(prev_cyc);
     let mut cores = alloc::vec::Vec::with_capacity(ncores);
     cores.push(cpu_percent());
-    for _ in 1..ncores {
-        cores.push(0);
+    for c in 1..ncores {
+        let busy = crate::arch::core_busy_cycles(c);
+        let prev = TOP_PREV_BUSY[c].swap(busy, Ordering::Relaxed);
+        let delta = busy.wrapping_sub(prev);
+        let pct = if window > 0 { (delta.saturating_mul(100) / window).min(100) } else { 0 };
+        cores.push(pct);
     }
     let secs = crate::arch::now_ms() / 1000;
     let uptime = alloc::format!("{}:{:02}:{:02}", secs / 3600, secs % 3600 / 60, secs % 60);
