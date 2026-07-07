@@ -104,11 +104,13 @@ found by profiling, and the obvious suspect was wrong every time.
    (`ldr q`/`ldp q`/`stp q` — correct at runtime: Normal cacheable RAM,
    `SCTLR_EL1.A=0`), the same pattern as the MMIO single-`ldr`/`str` rule.
    Reusable kernels live in `cortex/tensor.rs`: `dot_f32`, `axpy_f32`,
-   `scale_f32`, the `ldq_s8/u8/f32` load helpers, and the Q8_0/Q4_0 SDOT
+   `scale_f32`, the `ldq_s8/u8/f32` load helpers, and the Q8_0/Q4_0/Q4_K SDOT
    matvecs. **Prefer composing these** over writing new intrinsics code; if
    you must write a new SIMD loop, verify with `objdump -d` (count `ldrb` in
-   the hot function) and `/onnx bench` in the booted kernel (dot_f32 ≥ 10
-   GMAC/s under HVF; ~1 GMAC/s means the disease is back).
+   the hot function — the Q4_K kernel disassembles to 0 ldrb / 32 sdot) and
+   `/onnx bench` in the booted kernel (dot_f32 ≥ 10 GMAC/s under HVF;
+   ~1 GMAC/s means the disease is back). `/bench` prints the SDOT-vs-exact
+   rel-RMS error per fast kernel (`check_q4_0_sdot`, `check_q4_k_sdot`).
 2. **Batch block I/O or die waiting.** One `read_block` = one polled virtio
    round trip (~0.5 ms). Anything reading more than a few KiB must use
    `read_blocks` (all drivers implement multi-sector requests; `Partition`
@@ -220,9 +222,35 @@ real UEFI hardware.
   follow the same native-protocol shape. To add a built-in server agent: drop
   `agents/<name>/{SOUL.md,manifest.json,assets/…}` and register it in
   `agent/system.rs` (one line) — or publish it to the registry.
-- **Cortex** (`cortex/`) — CPU transformer inference (Qwen3.5, `-model
-  qwen3.5-0.8b|qwen3.5-4b|qwen3.5-9b`); SIMD tensor kernels (SSE2/AVX2 ∣ NEON ∣ scalar behind
-  one API); zero-copy GGUF; grammar-constrained sampler; KV/recurrent cache.
+- **Cortex** (`cortex/`) — CPU transformer inference, **architecture-dynamic
+  like the ONNX interpreter**: `general.architecture` in the GGUF names the
+  hyperparameter key prefix and resolves to a `Family` — `QwenHybrid`
+  (Qwen3.5/3.6 DeltaNet+attention hybrid; finetunes like Ornith load via a
+  key-shape sniff) or `Gemma4` (sliding-window/global interleave with per-kind
+  geometry — GQA ring-KV local layers, MQA global layers with V=K + p-RoPE
+  freq factors — sandwich norms, GELU, √dim embed scale, logit softcap,
+  `layer_output_scale`, suppress-token bias). Nothing numeric is compiled in.
+  **All mainstream GGML quants dequantize** (legacy Q4_0/Q4_1/Q5_0/Q5_1/Q8_0,
+  K-quants Q2_K–Q8_K, i-quants IQ2/IQ3/IQ4 via `iq_tables.rs` — generated
+  verbatim from ggml by `tools/gen_iq_tables.py` — plus F16/BF16 rows), so any
+  unsloth file incl. UD-* dynamic mixes runs; fast SDOT matvecs for
+  Q8_0/Q4_0/**Q4_K**, everything else through the generic dequant path (still
+  SMP row-split). Two tokenizer flavors behind one API (GPT-2 byte-BPE ∣
+  gemma4 raw-UTF-8 ▁-BPE with `<0xXX>` fallback), per-family chat format in
+  the shell (ChatML ∣ `<start_of_turn>` gemma turns, BOS per `add_bos`).
+  Select with `-model qwen3.5-0.8b|2b|4b|9b` **or any path**
+  (`-model path/to/file.gguf` — guest RAM derived from file size), or at
+  runtime with **`/model load <file.gguf>`** (reads off any FAT/ext4 volume
+  into DMA frames and re-homes chat on it; the status bar shows the GGUF's own
+  `general.name`). Zero-copy GGUF; grammar-constrained sampler; KV/recurrent
+  cache (fixed W-slot rings on sliding layers). **`tools/cortexdiff/`** is the
+  host-side harness (the onnxdiff pattern: mounts `kernel/src/cortex` natively;
+  greedy decode in seconds; `diff.py` cross-checks tokenization + continuation
+  against llama.cpp) — it generates the `refcheck.rs` fixtures (keyed by
+  `general.name`; the numpy `tools/ref*.py` are gone) and is the required
+  bring-up tool for any new family/quant. `cargo xtask ref-check
+  [-arch aarch64] [-model …]` runs the acceptance gate natively under HVF
+  (minutes, vs TCG hours) and powers off via PSCI.
 - **Synapse** (`synapse/`) — the capability ABI: primitive registry, GBNF-style
   grammar, deterministic executor, append-only audit log, taint gate. Primitives
   now span fs/console/spawn, **channels** (10–14), **net** listen/accept + http

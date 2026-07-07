@@ -194,7 +194,7 @@ pub fn run() -> ! {
                         }
                     }
                 }
-                "model" => run_model(arg, &mut remote_on, &mut remote_cfg, &mut remote_chat),
+                "model" => run_model(arg, &mut remote_on, &mut remote_cfg, &mut remote_chat, &mut chat),
                 "http" => run_http(arg),
                 "ws" => run_ws(arg),
                 "session" => {
@@ -602,16 +602,9 @@ fn print_info(orch: &crate::agent::orchestrator::Orchestrator, chat: Option<&Cha
         mib((m.ram_reserved - m.heap_total) as usize)
     );
 
-    // Model (parse the GGUF container header — cheap, zero-copy).
-    let model_name = if cfg!(feature = "model-9b") {
-        "Qwen3.5-9B"
-    } else if cfg!(feature = "model-4b") {
-        "Qwen3.5-4B"
-    } else if cfg!(feature = "model-2b") {
-        "Qwen3.5-2B"
-    } else {
-        "Qwen3.5-0.8B"
-    };
+    // Model name from the GGUF header itself (`general.name`) — any model
+    // file can be booted, so nothing per-model is compiled in.
+    let model_name = crate::cortex::model_name().unwrap_or_else(|| alloc::string::String::from("(no model)"));
     match crate::cortex::model_module() {
         Some(bytes) => match crate::cortex::gguf::Gguf::parse(bytes) {
             Ok(g) => serial_println!(
@@ -1736,26 +1729,47 @@ impl ChatSession {
         serial_println!("(compacted: context {} -> {} tokens)", before, self.pos);
     }
 
-    /// Encode `<|im_start|>{header}{body}<|im_end|>\n` into the running context
-    /// and prefill it through the model. When `prime`, also append an
-    /// `<|im_start|>assistant\n` opener (with an empty `<think></think>` so this
-    /// thinking model answers directly) and leave the KV positioned to decode.
+    /// Encode one chat turn into the running context and prefill it through
+    /// the model, in the loaded model's chat format:
+    /// - **ChatML** (qwen): `<|im_start|>{header}{body}<|im_end|>\n`, priming
+    ///   with `<|im_start|>assistant\n` (+ `<think>` handling).
+    /// - **Gemma turns**: `<start_of_turn>{header}{body}<end_of_turn>\n`,
+    ///   priming with `<start_of_turn>model\n` (BOS prepended once at context
+    ///   start per `add_bos`; gemma has no think tokens, so that path is
+    ///   naturally skipped).
+    /// The format is picked by which delimiter tokens the vocab carries — the
+    /// same dispatch the tokenizer itself used.
     fn prefill_turn(&mut self, header: &str, body: &str, prime: bool) {
+        let gemma = self.tok.kind == crate::cortex::tokenizer::Kind::Gemma;
+        let (open, close) = if gemma {
+            (self.tok.turn_open as usize, self.tok.turn_close as usize)
+        } else {
+            (self.tok.im_start as usize, self.tok.im_end as usize)
+        };
+        // Gemma prompts role "model", ChatML "assistant"; user/system headers
+        // pass through unchanged (gemma-4 has a native system role).
+        let assistant_header = if gemma { "model\n" } else { "assistant\n" };
         let mut ids: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-        ids.push(self.tok.im_start as usize);
+        // BOS once at the very start of the context, when the model asks.
+        if self.pos == 0 && self.model.config.add_bos {
+            if let Some(b) = self.model.config.bos_token_id {
+                ids.push(b as usize);
+            }
+        }
+        ids.push(open);
         for t in self.tok.encode(header) {
             ids.push(t as usize);
         }
         for t in self.tok.encode(body) {
             ids.push(t as usize);
         }
-        ids.push(self.tok.im_end as usize);
+        ids.push(close);
         for t in self.tok.encode("\n") {
             ids.push(t as usize);
         }
         if prime {
-            ids.push(self.tok.im_start as usize);
-            for t in self.tok.encode("assistant\n") {
+            ids.push(open);
+            for t in self.tok.encode(assistant_header) {
                 ids.push(t as usize);
             }
             if self.tok.think_open != u32::MAX && self.tok.think_close != u32::MAX {
@@ -2179,11 +2193,13 @@ fn run_model(
     remote_on: &mut bool,
     remote_cfg: &mut Option<remote::RemoteConfig>,
     remote_chat: &mut Option<remote::RemoteChat>,
+    chat: &mut Option<ChatSession>,
 ) {
     let toks: alloc::vec::Vec<&str> = arg.split_whitespace().collect();
     match toks.first().copied().unwrap_or("") {
         "" => {
-            let local_name = crate::cortex::model_module().map(|_| "embedded GGUF").unwrap_or("none bundled");
+            let local_name = crate::cortex::model_name()
+                .unwrap_or_else(|| alloc::string::String::from("none bundled"));
             serial_println!("model> active: {}", if *remote_on { "remote" } else { "local" });
             serial_println!("model>   local:  {}", local_name);
             match remote_cfg {
@@ -2195,8 +2211,30 @@ fn run_model(
                 ),
                 None => serial_println!("model>   remote: not configured"),
             }
-            serial_println!("model> usage: /model local | /model remote <http://host:port> [name] [key <k>]");
+            serial_println!("model> usage: /model local | /model load <file.gguf> | /model remote <http://host:port> [name] [key <k>]");
             serial_println!("model>        (voice + /infer//perf always use the local model)");
+        }
+        // /model load <file.gguf> — load a GGUF off any mounted disk volume
+        // (FAT / ext4 root) and make it the active local model. Any supported
+        // family/quant works: the kernel discovers the architecture from the
+        // file itself. The current chat session restarts on the new model.
+        "load" => {
+            let Some(path) = toks.get(1).copied() else {
+                serial_println!("model> usage: /model load <file.gguf>  (a file on any disk volume, e.g. /data/gemma4.gguf)");
+                return;
+            };
+            serial_println!("model> loading {} from disk (multi-GB files take a moment)...", path);
+            match crate::cortex::load_model_from_disk(path) {
+                Ok(name) => {
+                    // Restart chat on the new model; remote mode stays as-is.
+                    *chat = None;
+                    serial_println!(
+                        "model> loaded '{}' -- chat restarted on it (/model to inspect)",
+                        name.unwrap_or_else(|| alloc::string::String::from(path))
+                    );
+                }
+                Err(e) => serial_println!("model> load failed: {}", e),
+            }
         }
         "local" => {
             *remote_on = false;
@@ -2821,7 +2859,11 @@ fn run_infer() {
                 r.n_decoded,
                 r.decode_ms,
                 decode_tps,
-                r.matched_reference
+                match r.matched_reference {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "SKIP (no fixture)",
+                }
             );
         }
         None => serial_println!("=> no model module present; boot with the model bundled to use `infer`"),
@@ -2834,6 +2876,8 @@ fn run_infer() {
 fn run_bench() {
     #[cfg(target_arch = "aarch64")]
     serial_println!("bench> Q4_0 SDOT vs exact rel_rms_err = {}", crate::cortex::check_q4_0_sdot());
+    #[cfg(target_arch = "aarch64")]
+    serial_println!("bench> Q4_K SDOT vs exact rel_rms_err = {}", crate::cortex::check_q4_k_sdot());
     let r = crate::cortex::bench_matvec();
     // MMAC/s = macs / (ms * 1000); guard against a zero interval.
     let mmacs = if r.ms > 0 { r.macs / (r.ms * 1000) } else { 0 };

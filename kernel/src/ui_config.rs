@@ -13,14 +13,6 @@ use alloc::vec::Vec;
 const UI_PATH: &str = "/configs/core/ui.json";
 const SHORTCUTS_PATH: &str = "/configs/core/shortcuts.json";
 
-#[cfg(feature = "model-9b")]
-const MODEL: &str = "qwen3.5-9b";
-#[cfg(feature = "model-4b")]
-const MODEL: &str = "qwen3.5-4b";
-#[cfg(feature = "model-2b")]
-const MODEL: &str = "qwen3.5-2b";
-#[cfg(not(any(feature = "model-2b", feature = "model-4b", feature = "model-9b")))]
-const MODEL: &str = "qwen3.5-0.8b";
 #[cfg(target_arch = "x86_64")]
 const ARCH: &str = "x86_64";
 #[cfg(target_arch = "aarch64")]
@@ -281,7 +273,8 @@ fn resolve_var(var: &str) -> String {
         "time" => crate::clock::format_time(),
         "datetime" => crate::clock::format_datetime(),
         "tz" => crate::clock::format_tz(),
-        "model" => MODEL.to_string(),
+        // The booted GGUF's own `general.name` (runtime, not compiled in).
+        "model" => crate::cortex::model_name().unwrap_or_else(|| "no model".to_string()),
         "arch" => ARCH.to_string(),
         "uptime" => {
             let s = crate::arch::now_ms() / 1000;
