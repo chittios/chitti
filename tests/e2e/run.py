@@ -7,8 +7,10 @@ Groups (each scenario -> PASS/FAIL, non-zero exit on any failure):
   os     — the shell/OS commands (help, info, datetime, disks, agents, top, …)
   net    — the networked flows against local host servers: /http (GET/POST/
            stream), /ws + /wss, /ping, and /model remote over https
-  model  — inference: /bench, /infer, /perf, a chat turn, /compact  (needs the
-           bundled model; slow — only with --slow)
+  model  — inference: /bench, /infer, /perf, a chat turn, /compact, plus the
+           runtime `/model load` flow (a --no-model guest loads chat.gguf off
+           an attached FAT disk and chat answers)  (needs the bundled model;
+           slow — only with --slow)
   voice  — /voice models + /voice say (TTS)  (needs assets/voice + a sound
            device; slow — only with --slow)
 
@@ -85,6 +87,10 @@ OS_CMDS = [
     ("skills", "/skills", "installed"),
     ("shortcuts", "/shortcuts", "Shortcuts ("),
     ("mode", "/mode", "mode>"),
+    # /model status: prints the active backend + the runtime model name (the
+    # GGUF's own general.name, or "none bundled") — validates the dynamic-model
+    # plumbing without needing inference.
+    ("model_status", "/model", "model> active:"),
     ("think", "/think off", "think>"),
     ("agents", "/agents", "agents>"),
     ("ui", "/ui", "ui>"),
@@ -230,6 +236,39 @@ def s_compact(g):
     g.send("/compact")
     ok = g.wait_for("compacted", 180, m) or g.wait_for("nothing to compact", 10, m)
     return ok, "context compaction" if ok else "no compact output"
+
+
+def s_model_load(_g):
+    """Prove the runtime `/model load` path end-to-end, from nothing: boot a
+    second guest with NO model in RAM but a FAT model disk attached
+    (CHITTI_MODEL_DISK -> chat.gguf), assert chat is unavailable, load the
+    GGUF off the disk at runtime, then assert chat answers on it."""
+    gguf = os.path.join(ROOT, "assets", "model.gguf")
+    if not os.path.exists(gguf):
+        return None, "skipped (assets/model.gguf absent)"
+    g2 = Guest(arch=RUN_ARCH, verbose=RUN_VERBOSE, no_model=True, model_disk=gguf)
+    try:
+        if not g2.wait_for("net: configured", 180):
+            return False, "no-model guest never booted"
+        # Before the load: no model in RAM, so chat must refuse (fast, no
+        # inference involved).
+        m = g2.mark()
+        g2.send("hello")
+        if not g2.wait_for("chat unavailable", 30, m):
+            return False, "expected 'chat unavailable' before /model load"
+        # Runtime-load the GGUF off the attached FAT volume into DMA frames.
+        m = g2.mark()
+        g2.send("/model load chat.gguf")
+        if not g2.wait_for("model> loaded", 240, m):
+            return False, "/model load chat.gguf did not complete"
+        # Chat now runs on the runtime-loaded model — a real reply must come.
+        m = g2.mark()
+        g2.send("in one short sentence, what is 2 plus 2?")
+        ok = g2.wait_for("chitti:", 300, m)
+        g2.wait_quiet(2.0, 180)
+        return ok, "runtime-loaded model answered chat" if ok else "no chat reply after /model load"
+    finally:
+        g2.close()
 
 
 # --- voice scenarios — slow, need assets/voice + a sound device -------------
@@ -439,8 +478,13 @@ NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("htt
 # it still fails, reported [FLAKY] without gating the run's exit code; a
 # consistently-failing one still shows up in every run's output.
 FLAKY = {"doc_pipeline", "ssh_agent"}
+
+# The run's arch/verbosity, published for scenarios that boot their own guest
+# (model_load boots a --no-model guest with a model disk). Set by main().
+RUN_ARCH = "aarch64"
+RUN_VERBOSE = False
 NET_TLS = [("wss", s_wss), ("model_remote_https", s_model_remote_https)]
-MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("compact", s_compact), ("doc_website", s_doc_website)]
+MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("compact", s_compact), ("model_load", s_model_load), ("doc_website", s_doc_website)]
 VOICE = [("voice_models", s_voice_models), ("voice_say", s_voice_say)]
 
 
@@ -479,6 +523,7 @@ def boot_guest(arch, model, verbose, audio, fwd, attempts=3):
 
 
 def main():
+    global RUN_ARCH, RUN_VERBOSE
     arch, model = "aarch64", "qwen3.5-0.8b"
     verbose = "-v" in sys.argv or "--verbose" in sys.argv
     slow = "--slow" in sys.argv or "--full" in sys.argv
@@ -488,6 +533,7 @@ def main():
             arch = args[i + 1]
         if a == "-model" and i + 1 < len(args):
             model = args[i + 1]
+    RUN_ARCH, RUN_VERBOSE = arch, verbose
 
     have_tls = ssl.HAS_TLSv1_3 and ensure_cert()
     have_model = os.path.exists(os.path.join(ROOT, "assets", "model.gguf"))

@@ -221,6 +221,17 @@ impl<'d, D: BlockDevice> FatReader<'d, D> {
     /// Read the file at `path` (e.g. `"chitti-kernel"` or `"EFI/BOOT/BOOTAA64.EFI"`,
     /// `/`-separated, from the root) into a Vec. None if any component is missing.
     pub fn read_file(&mut self, path: &str) -> Option<Vec<u8>> {
+        let size = self.file_size(path)? as usize;
+        let mut out = vec![0u8; size];
+        let n = self.read_file_into(path, &mut out)?;
+        out.truncate(n);
+        Some(out)
+    }
+
+    /// As [`read_file`](Self::read_file), but into a caller-provided buffer —
+    /// so a multi-GB model can land in DMA frames instead of the kernel heap.
+    /// Reads `min(file size, dst.len())` bytes; returns the count.
+    pub fn read_file_into(&mut self, path: &str, dst: &mut [u8]) -> Option<usize> {
         let mut dir = 0u32; // root
         let mut parts = path.split('/').filter(|p| !p.is_empty()).peekable();
         while let Some(part) = parts.next() {
@@ -240,7 +251,8 @@ impl<'d, D: BlockDevice> FatReader<'d, D> {
                 return None;
             }
             let bpc = self.spc as usize * BLOCK_SIZE;
-            let mut out = vec![0u8; size as usize];
+            let want_total = (size as usize).min(dst.len());
+            let out = &mut dst[..want_total];
             let mut done = 0usize;
             let mut cur = Some(clus);
             while done < out.len() {
@@ -289,7 +301,7 @@ impl<'d, D: BlockDevice> FatReader<'d, D> {
                     done += take;
                 }
             }
-            return Some(out);
+            return Some(done);
         }
         None
     }

@@ -22,7 +22,8 @@ def _repo_root():
 
 
 class Guest:
-    def __init__(self, arch="aarch64", model="qwen3.5-0.8b", verbose=False, audio="off", hostfwd=None):
+    def __init__(self, arch="aarch64", model="qwen3.5-0.8b", verbose=False, audio="off", hostfwd=None,
+                 no_model=False, model_disk=None):
         self.verbose = verbose
         self.buf = bytearray()
         self.lock = threading.Lock()
@@ -36,7 +37,14 @@ class Guest:
         # (the Network-service-agent e2e). xtask adds hostfwd for this port.
         if hostfwd:
             env["CHITTI_HOSTFWD"] = str(hostfwd)
+        # Opt-in FAT disk carrying `model_disk` as chat.gguf, for the runtime
+        # `/model load` scenario; `no_model` boots with no model in RAM so the
+        # runtime-load path is proven from nothing.
+        if model_disk:
+            env["CHITTI_MODEL_DISK"] = str(model_disk)
         cmd = ["cargo", "xtask", "run", "-arch", arch, "-model", model]
+        if no_model:
+            cmd.append("--no-model")
         # New session/process group so `close()` can kill the whole tree
         # (cargo → xtask → qemu) at once — SIGTERM to just `cargo` would orphan
         # the qemu grandchild, which would keep the HVF/hostfwd ports and block a

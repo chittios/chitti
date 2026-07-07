@@ -1,0 +1,15 @@
+[package]
+name = "cortexdiff"
+version = "0.1.0"
+edition = "2021"
+
+# Host-side calibration harness for the kernel's GGUF/transformer engine:
+# mounts kernel/src/cortex/{gguf,tensor,tokenizer,model}.rs natively via
+# #[path] (the tools/onnxdiff pattern) so a real GGUF loads and greedy-decodes
+# in seconds on the host, diffable token-by-token against llama.cpp
+# (tools/cortexdiff/diff.py) — no QEMU round-trips. Standalone crate.
+
+[workspace]
+
+[profile.release]
+debug = true

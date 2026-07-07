@@ -278,18 +278,36 @@ pub extern "C" fn aarch64_start() -> ! {
     // synapse::fs at an ext4 data partition for durable agent state. No-op
     // without a `-drive`/virtio-blk-device.
     mount_persistent_store();
+    // `ref-check` builds run the acceptance gate and power off via PSCI (the
+    // aarch64 analogue of the x86 isa-debug-exit path above); the host side
+    // (`cargo xtask ref-check -arch aarch64`) greps serial for `ALL PASS`.
+    #[cfg(feature = "refcheck")]
+    {
+        let ok = chitti_kernel::cortex::run_acceptance();
+        serial_println!("refcheck: {} -- powering off", if ok { "PASS" } else { "FAIL" });
+        chitti_kernel::arch::aarch64::psci_system_off();
+    }
     // Bring up networking (virtio-net over mmio, else a PCI NIC) so /network,
     // /ping and /wifi work. No-op if no NIC is present.
+    #[cfg(not(feature = "refcheck"))]
     chitti_kernel::net::autodetect();
     // Bring up audio (virtio-snd) for the /voice pipeline. No-op if absent.
+    #[cfg(not(feature = "refcheck"))]
     chitti_kernel::sound::autodetect();
     // Everything is up (framebuffer, USB/input, disk, persistent store) with IRQs
     // masked. NOW begin timer-preemptive scheduling: unmask IRQs so the generic
     // timer preempts the shell. Deferred to here (not inside init()) so device
     // bring-up — the framebuffer especially — runs identically to the cooperative
     // path; a no-op where the GIC/timer wasn't available (HVF → cooperative).
-    chitti_kernel::arch::aarch64::gic::start_preemption();
-    run_os();
+    #[cfg(not(feature = "refcheck"))]
+    {
+        chitti_kernel::arch::aarch64::gic::start_preemption();
+        run_os();
+    }
+    #[allow(unreachable_code)]
+    loop {
+        chitti_kernel::arch::aarch64::hlt();
+    }
 }
 
 /// The stub's boot-info page (address passed in x1, magic "CHITTIBI"), if
