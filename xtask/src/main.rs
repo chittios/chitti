@@ -440,7 +440,9 @@ fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> 
             (kernel.to_path_buf(), "::/chitti-kernel".into()),
         ];
         if let Some(m) = model {
-            copies.push((m.to_path_buf(), "::/model.gguf.000".into()));
+            for (src, name) in esp_model_parts(m)? {
+                copies.push((src, format!("::/{name}")));
+            }
         }
         for (n, pth) in &voice {
             copies.push((pth.clone(), format!("::/{n}")));
@@ -450,6 +452,14 @@ fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> 
         return Ok(img);
     }
     // macOS: attach raw, format FAT32, mount, copy, detach — via /bin/sh.
+    let model_cp = match model {
+        Some(m) => esp_model_parts(m)?
+            .into_iter()
+            .map(|(src, name)| format!("cp \"{}\" \"$MNT/{}\"", src.display(), name))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => String::new(),
+    };
     let script = format!(
         r#"set -e
 DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "{img}" | head -1 | awk '{{print $1}}')
@@ -467,7 +477,7 @@ hdiutil detach "$DEV" > /dev/null
         img = img.display(),
         stub = stub.display(),
         kernel = kernel.display(),
-        model_cp = model.map(|m| format!("cp \"{}\" \"$MNT/model.gguf.000\"", m.display())).unwrap_or_default(),
+        model_cp = model_cp,
         // Voice models at the ESP root, so the kernel's root-file readers find them.
         voice_cp = voice.iter().map(|(n, p)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), n)).collect::<Vec<_>>().join("\n"),
     );
@@ -882,6 +892,22 @@ fn split_model_into_parts(model: &Path, dir: &Path, part_size: u64) -> Result<Ve
     Ok(names)
 }
 
+/// Split a bundled model into FAT32-safe parts under `target/esp-model-parts`
+/// and return `(part_path, "model.gguf.NNN")` pairs to copy onto the ESP. FAT32
+/// caps a single file at 4 GiB, so a large model (the 9B) cannot be copied whole
+/// — it is split, and the UEFI stub concatenates the sorted parts back (as every
+/// other loader path already does). A model under one part size still becomes a
+/// single `model.gguf.000`, so the copy/reassembly path is uniform for all tiers.
+fn esp_model_parts(model: &Path) -> Result<Vec<(PathBuf, String)>, String> {
+    // 1 GiB: well under FAT32's 4 GiB file cap, and bounds the stub's per-part
+    // read buffer (it reads one part at a time into a transient allocation).
+    const ESP_PART: u64 = 1 << 30;
+    let dir = repo_root().join("target/esp-model-parts");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let names = split_model_into_parts(model, &dir, ESP_PART)?;
+    Ok(names.into_iter().map(|n| (dir.join(&n), n)).collect())
+}
+
 /// The voice models to bundle into images, as `(bundled-name, repo-relative
 /// path)`. Bundled only when present (gitignored; `cargo xtask voice-assets`
 /// downloads them). `bundled-name` is what the kernel matches: `find_module`
@@ -1086,7 +1112,9 @@ fn image_aarch64(model: Model) -> Result<(), String> {
             (elf.clone(), "::/chitti-kernel".into()),
         ];
         if let Some(m) = &model_path {
-            copies.push((m.clone(), "::/model.gguf.000".into()));
+            for (src, name) in esp_model_parts(m)? {
+                copies.push((src, format!("::/{name}")));
+            }
         }
         for (n, pth) in &voice {
             copies.push((pth.clone(), format!("::/{n}")));
@@ -1111,6 +1139,14 @@ fn image_aarch64(model: Model) -> Result<(), String> {
     // is parsed on attach, exposing slice devices s1/s2 owned by the user).
     let mke2fs = brew_prefix("e2fsprogs").map(|p| p.join("sbin/mke2fs")).ok().filter(|p| p.exists())
         .ok_or("mke2fs not found -- brew install e2fsprogs (needed to format the data partition)")?;
+    let model_cp = match &model_path {
+        Some(m) => esp_model_parts(m)?
+            .into_iter()
+            .map(|(src, name)| format!("cp \"{}\" \"$MNT/{}\"", src.display(), name))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => String::new(),
+    };
     let script = format!(
         r#"set -e
 DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "{img}" | head -1 | awk '{{print $1}}')
@@ -1130,7 +1166,7 @@ hdiutil detach "$DEV" > /dev/null
         stub = stub.display(),
         kernel = elf.display(),
         mke2fs = mke2fs.display(),
-        model_cp = model_path.as_ref().map(|m| format!("cp \"{}\" \"$MNT/model.gguf.000\"", m.display())).unwrap_or_default(),
+        model_cp = model_cp,
         voice_cp = voice.iter().map(|(n, p)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), n)).collect::<Vec<_>>().join("\n"),
     );
     let status = Command::new("/bin/sh").arg("-c").arg(&script).status().map_err(|e| format!("populating image: {e}"))?;
