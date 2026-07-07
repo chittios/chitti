@@ -1585,7 +1585,7 @@ fn execute_chat_tool(name: &str, args: &str) -> alloc::string::String {
 /// cache so context carries across turns (`/clear` drops it).
 struct ChatSession {
     model: crate::cortex::model::Model<'static>,
-    tok: crate::cortex::tokenizer::Tokenizer,
+    tok: crate::cortex::tokenizer::Tokenizer<'static>,
     kv: crate::cortex::model::Cache,
     state: crate::cortex::model::State,
     pos: usize,
