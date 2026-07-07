@@ -50,6 +50,65 @@ fn alloc_at(paddr: u64, bytes: usize) -> &'static mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), pages * 4096) }
 }
 
+/// Reassemble the model from split parts `\model.gguf.000`, `.001`, … into one
+/// contiguous allocation, returning `(base, len)`. FAT32 caps a single file at
+/// 4 GiB, so the image build splits a large model (the 9B) into <= 1 GiB parts;
+/// every loader path concatenates the sorted parts, and this is that path for
+/// the UEFI/ESP boot. A lone `\model.gguf.000` is just the one-part case.
+/// Returns `None` (boot without a model) if no parts are present or the
+/// allocation fails.
+fn load_model(fs: &mut uefi::fs::FileSystem) -> Option<(u64, u64)> {
+    use uefi::fs::PathBuf;
+    use uefi::CString16;
+    // Pass 1: total the sizes of the consecutive parts (metadata only — no data
+    // read yet), so we can allocate one contiguous region up front.
+    let mut parts: alloc::vec::Vec<PathBuf> = alloc::vec::Vec::new();
+    let mut total: usize = 0;
+    for idx in 0.. {
+        let name = alloc::format!("\\model.gguf.{idx:03}");
+        let path = PathBuf::from(CString16::try_from(name.as_str()).expect("model part path"));
+        match fs.metadata(&path) {
+            Ok(info) => {
+                total += info.file_size() as usize;
+                parts.push(path);
+            }
+            Err(_) => break,
+        }
+    }
+    if parts.is_empty() || total == 0 {
+        log::info!("chitti-stub: no model on ESP (kernel will report no model)");
+        return None;
+    }
+    let pages = total.div_ceil(4096);
+    let ptr = match boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("chitti-stub: model alloc ({pages} pages) failed: {e:?} -- booting without a model (need more VM RAM)");
+            return None;
+        }
+    };
+    let base = ptr.as_ptr() as u64;
+    // SAFETY: freshly allocated, `pages * 4096` contiguous bytes at `base`.
+    let dst = unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), pages * 4096) };
+    // Pass 2: read each part (one at a time — the transient buffer is one part,
+    // <= 1 GiB) and copy it into the contiguous region, in order.
+    let mut off = 0usize;
+    for path in &parts {
+        match fs.read(path) {
+            Ok(bytes) => {
+                dst[off..off + bytes.len()].copy_from_slice(&bytes);
+                off += bytes.len();
+            }
+            Err(e) => {
+                log::warn!("chitti-stub: reading model part failed: {e:?} -- booting without a model");
+                return None;
+            }
+        }
+    }
+    log::info!("chitti-stub: model {off} bytes at {base:#x} ({} part(s))", parts.len());
+    Some((base, off as u64))
+}
+
 /// The ACPI 2.0 RSDP physical address from the UEFI configuration table, or 0.
 /// Days since 1970-01-01 for a proleptic-Gregorian date (Hinnant's algorithm;
 /// the kernel's `clock` uses the same math).
@@ -163,29 +222,7 @@ fn main() -> Status {
     // regions at fixed addresses and AllocateAddress there returns NOT_FOUND — so
     // we let the firmware pick a free run and report where it landed in the
     // boot-info; the kernel reads the model there (not at a hardcoded address).
-    let model_region: Option<(u64, u64)> = match fs.read(cstr16!("\\model.gguf.000")) {
-        Ok(model) => {
-            let pages = model.len().div_ceil(4096);
-            match boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages) {
-                Ok(ptr) => {
-                    let base = ptr.as_ptr() as u64;
-                    // SAFETY: freshly allocated, `pages * 4096` bytes at `base`.
-                    let dst = unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), pages * 4096) };
-                    dst[..model.len()].copy_from_slice(&model);
-                    log::info!("chitti-stub: model {} bytes at {base:#x}", model.len());
-                    Some((base, model.len() as u64))
-                }
-                Err(e) => {
-                    log::warn!("chitti-stub: model alloc ({pages} pages) failed: {e:?} -- booting without a model (need more VM RAM)");
-                    None
-                }
-            }
-        }
-        Err(_) => {
-            log::info!("chitti-stub: no model on ESP (kernel will report no model)");
-            None
-        }
-    };
+    let model_region: Option<(u64, u64)> = load_model(&mut fs);
 
     // Reserve the kernel heap in free RAM (AnyPages, HEAP_MAX) and mark it
     // LOADER_DATA so it survives ExitBootServices. Report its base; the kernel
