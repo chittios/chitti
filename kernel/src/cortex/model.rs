@@ -464,7 +464,7 @@ impl<'a> Model<'a> {
     }
     /// Build the BPE text encoder from this model's vocab + merges (owns its
     /// maps, so it outlives borrows of the model). ~40 MiB / ~200 ms for the 9B.
-    pub fn tokenizer(&self) -> crate::cortex::tokenizer::Tokenizer {
+    pub fn tokenizer(&self) -> crate::cortex::tokenizer::Tokenizer<'a> {
         crate::cortex::tokenizer::Tokenizer::build(&self.gguf)
     }
     /// The model's EOS token id (generation stops here).

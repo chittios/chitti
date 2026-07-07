@@ -50,6 +50,43 @@ fn alloc_at(paddr: u64, bytes: usize) -> &'static mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), pages * 4096) }
 }
 
+/// Allocate `pages` from conventional RAM **at or above `min_addr`**, falling
+/// back to AnyPages when no such region exists. The kernel's identity map
+/// types GiB block 0 as **Device MMIO**; on platforms whose RAM includes
+/// low physical memory (VirtualBox-ARM), an AnyPages model/heap allocation
+/// can land there — byte reads work but the NEON matvec's unaligned vector
+/// loads take an alignment fault (Device memory), and everything is uncached.
+/// So the big regions the kernel computes over must sit >= 1 GiB.
+fn alloc_pages_min_addr(pages: usize, min_addr: u64) -> uefi::Result<core::ptr::NonNull<u8>> {
+    use uefi::mem::memory_map::MemoryMap;
+    let need = pages as u64 * 4096;
+    if let Ok(mm) = boot::memory_map(MemoryType::LOADER_DATA) {
+        // Pick the highest fitting conventional region top >= min_addr (the
+        // top stays clear of the kernel image and other low allocations).
+        let mut best: Option<u64> = None;
+        for d in mm.entries() {
+            if d.ty != MemoryType::CONVENTIONAL {
+                continue;
+            }
+            let start = d.phys_start.max(min_addr);
+            let end = d.phys_start + d.page_count * 4096;
+            if end > start && end - start >= need {
+                let base = (end - need) & !0xfff;
+                if base >= start {
+                    best = Some(best.map_or(base, |b: u64| b.max(base)));
+                }
+            }
+        }
+        if let Some(base) = best {
+            if let Ok(p) = boot::allocate_pages(AllocateType::Address(base), MemoryType::LOADER_DATA, pages) {
+                return Ok(p);
+            }
+        }
+    }
+    // No suitable high region (tiny VM): AnyPages keeps small setups booting.
+    boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
+}
+
 /// Reassemble the model from split parts `\model.gguf.000`, `.001`, … into one
 /// contiguous allocation, returning `(base, len)`. FAT32 caps a single file at
 /// 4 GiB, so the image build splits a large model (the 9B) into <= 1 GiB parts;
@@ -80,7 +117,9 @@ fn load_model(fs: &mut uefi::fs::FileSystem) -> Option<(u64, u64)> {
         return None;
     }
     let pages = total.div_ceil(4096);
-    let ptr = match boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages) {
+    // >= 1 GiB: the kernel maps GiB block 0 as Device — NEON over a model
+    // placed there alignment-faults (see `alloc_pages_min_addr`).
+    let ptr = match alloc_pages_min_addr(pages, 1 << 30) {
         Ok(p) => p,
         Err(e) => {
             log::warn!("chitti-stub: model alloc ({pages} pages) failed: {e:?} -- booting without a model (need more VM RAM)");
@@ -224,14 +263,16 @@ fn main() -> Status {
     // boot-info; the kernel reads the model there (not at a hardcoded address).
     let model_region: Option<(u64, u64)> = load_model(&mut fs);
 
-    // Reserve the kernel heap in free RAM (AnyPages, HEAP_MAX) and mark it
-    // LOADER_DATA so it survives ExitBootServices. Report its base; the kernel
-    // places its heap here. AnyPages (not a fixed address, and not the top of RAM
-    // where UEFI parks ACPI/runtime data) is what makes this robust across
-    // firmwares.
+    // Reserve the kernel heap in free RAM (>= 1 GiB, else AnyPages; HEAP_MAX)
+    // and mark it LOADER_DATA so it survives ExitBootServices. Report its
+    // base; the kernel places its heap here. A firmware-chosen address (not a
+    // fixed one, and not the top of RAM where UEFI parks ACPI/runtime data)
+    // is what makes this robust across firmwares; the >= 1 GiB floor keeps it
+    // out of the kernel's Device-typed GiB block 0 (VirtualBox-ARM has RAM
+    // there — a heap in Device memory is uncached and NEON-hostile).
     let heap_region: Option<(u64, u64)> = {
         let pages = (HEAP_MAX / 4096) as usize;
-        match boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages) {
+        match alloc_pages_min_addr(pages, 1 << 30) {
             Ok(ptr) => {
                 let base = ptr.as_ptr() as u64;
                 log::info!("chitti-stub: reserved kernel heap {base:#x} ({} MiB)", HEAP_MAX >> 20);

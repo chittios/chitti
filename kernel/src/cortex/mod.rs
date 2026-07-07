@@ -467,9 +467,11 @@ pub fn bench_inference(n_prompt: usize, n_decode: usize) -> Option<InferBench> {
     let mut kv = m.new_cache();
     let mut state = m.new_state();
 
-    // Synthetic prompt: cycle the encoded reference prompt to the length.
-    let base = reference_prompt(&m);
-    let prompt: Vec<usize> = (0..n_prompt).map(|i| base[i % base.len()]).collect();
+    // Synthetic prompt: fixed ids cycled to the requested length. A
+    // throughput gauge needs valid token ids, not real text — building the
+    // tokenizer here (500K-alloc BTreeMaps) would dwarf the bench itself.
+    let vocab = m.vocab().max(3);
+    let prompt: Vec<usize> = (0..n_prompt).map(|i| 1 + (i * 97) % (vocab - 2)).collect();
 
     let t0 = crate::arch::now_ms();
     m.prefill(&prompt, 0, &mut kv, &mut state);

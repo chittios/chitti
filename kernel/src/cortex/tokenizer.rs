@@ -31,12 +31,16 @@ pub enum Kind {
     Gemma,
 }
 
-pub struct Tokenizer {
+pub struct Tokenizer<'a> {
     pub kind: Kind,
     byte_to_unicode: [char; 256],
     unicode_to_byte: BTreeMap<char, u8>,
-    vocab: BTreeMap<String, u32>, // token string -> id
-    ranks: BTreeMap<String, u32>, // "<left> <right>" merge -> priority (lower = earlier)
+    /// Token string -> id. Keys **borrow the GGUF module memory** (like the
+    /// zero-copy tensor slices): a 248 K-entry map of owned `String`s is
+    /// ~500 K allocations on the first-fit kernel heap — real seconds of
+    /// build time — where borrowed keys are just the BTree nodes.
+    vocab: BTreeMap<&'a str, u32>,
+    ranks: BTreeMap<&'a str, u32>, // "<left> <right>" merge -> priority (lower = earlier)
     pub eos: u32,
     pub im_start: u32,
     pub im_end: u32,
@@ -74,11 +78,13 @@ fn build_byte_to_unicode() -> [char; 256] {
     map
 }
 
-impl Tokenizer {
-    /// Build the tokenizer from a parsed GGUF's vocab + merges. Allocates owned
-    /// lookup maps (~40 MiB for the 9B's 248 K vocab / 247 K merges), so build
-    /// it once and keep it.
-    pub fn build(gguf: &Gguf) -> Self {
+impl<'a> Tokenizer<'a> {
+    /// Build the tokenizer from a parsed GGUF's vocab + merges. The lookup
+    /// maps borrow the token/merge strings straight from the module memory
+    /// (zero string copies); building the two ~250 K-entry BTreeMaps is still
+    /// a long, blocking pass, so the loop pumps `shell::upkeep()` (the
+    /// cooperative-scheduler rule — same as the ONNX per-node loop).
+    pub fn build(gguf: &Gguf<'a>) -> Self {
         let byte_to_unicode = build_byte_to_unicode();
         let mut unicode_to_byte = BTreeMap::new();
         for (b, &c) in byte_to_unicode.iter().enumerate() {
@@ -86,11 +92,17 @@ impl Tokenizer {
         }
         let mut vocab = BTreeMap::new();
         for (i, &t) in gguf.tokens.iter().enumerate() {
-            vocab.insert(t.to_string(), i as u32);
+            vocab.insert(t, i as u32);
+            if i % 16384 == 0 {
+                crate::shell::upkeep();
+            }
         }
         let mut ranks = BTreeMap::new();
         for (i, &m) in gguf.merges.iter().enumerate() {
-            ranks.insert(m.to_string(), i as u32);
+            ranks.insert(m, i as u32);
+            if i % 16384 == 0 {
+                crate::shell::upkeep();
+            }
         }
         let kind = match gguf.tokenizer_model {
             "gemma4" => Kind::Gemma,
@@ -140,7 +152,7 @@ impl Tokenizer {
         }
         self.merge_by_rank(&mut syms);
         // Symbols → ids (byte-level BPE guarantees each byte-symbol is in vocab).
-        syms.iter().filter_map(|s| self.vocab.get(s).copied()).collect()
+        syms.iter().filter_map(|s| self.vocab.get(s.as_str()).copied()).collect()
     }
 
     /// Gemma-4 raw-UTF-8 BPE: `▁` whitespace escaping, newline-run splitting,
@@ -173,7 +185,7 @@ impl Tokenizer {
             let mut syms: Vec<String> = word.chars().map(|c| c.to_string()).collect();
             self.merge_by_rank(&mut syms);
             for s in &syms {
-                if let Some(&id) = self.vocab.get(s) {
+                if let Some(&id) = self.vocab.get(s.as_str()) {
                     out.push(id);
                 } else {
                     for b in s.as_bytes() {
@@ -199,7 +211,7 @@ impl Tokenizer {
                 pair.push_str(&syms[i]);
                 pair.push(' ');
                 pair.push_str(&syms[i + 1]);
-                if let Some(&r) = self.ranks.get(&pair) {
+                if let Some(&r) = self.ranks.get(pair.as_str()) {
                     if r < best_rank {
                         best_rank = r;
                         best_i = i;
@@ -271,19 +283,19 @@ mod tests {
     use alloc::vec;
 
     /// Build a tokenizer directly from token/merge lists (no GGUF needed).
-    fn tok(kind: Kind, tokens: &[&str], merges: &[&str]) -> Tokenizer {
+    fn tok(kind: Kind, tokens: &'static [&'static str], merges: &'static [&'static str]) -> Tokenizer<'static> {
         let byte_to_unicode = build_byte_to_unicode();
         let mut unicode_to_byte = BTreeMap::new();
         for (b, &c) in byte_to_unicode.iter().enumerate() {
             unicode_to_byte.insert(c, b as u8);
         }
         let mut vocab = BTreeMap::new();
-        for (i, t) in tokens.iter().enumerate() {
-            vocab.insert(t.to_string(), i as u32);
+        for (i, &t) in tokens.iter().enumerate() {
+            vocab.insert(t, i as u32);
         }
         let mut ranks = BTreeMap::new();
-        for (i, m) in merges.iter().enumerate() {
-            ranks.insert(m.to_string(), i as u32);
+        for (i, &m) in merges.iter().enumerate() {
+            ranks.insert(m, i as u32);
         }
         Tokenizer {
             kind,

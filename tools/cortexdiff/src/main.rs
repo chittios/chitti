@@ -18,6 +18,12 @@
 
 extern crate alloc;
 
+/// Stub of the kernel's cooperative-scheduler upkeep pump (the tokenizer
+/// build calls it): a no-op on the host.
+pub mod shell {
+    pub fn upkeep() {}
+}
+
 /// Stub of the kernel's ktrace: forwarded to stderr so decode output on
 /// stdout stays machine-parseable.
 pub mod ktrace {
