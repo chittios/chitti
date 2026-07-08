@@ -768,6 +768,41 @@ impl Screen {
         (x, y, w, self.ch())
     }
 
+    /// A soft drop shadow for a box at `(x,y,w,h)` — two offset dark rectangles
+    /// (a web-style elevation cue), drawn *before* the box so the box overpaints
+    /// all but the bottom-right offset strip. Clipped at the screen edges by
+    /// `fill_rect`. Darkens whatever is behind (screen bg for panes, the panes
+    /// for a modal) toward black.
+    fn drop_shadow(&self, x: u64, y: u64, w: u64, h: u64) {
+        let s = 4 * self.scale; // shadow depth in px
+        // Only the right + bottom bands stay visible once the box is filled on
+        // top, so shade just those (cheap): a darker inner band nearest the box
+        // fading to a fainter outer band — a soft web-style drop shadow.
+        // Right side.
+        self.shade_rect(x + w, y + s, s, h, 0.35); // inner (darkest)
+        self.shade_rect(x + w + s, y + s, s, h, 0.60); // outer (fainter)
+        // Bottom side.
+        self.shade_rect(x + s, y + h, w, s, 0.35);
+        self.shade_rect(x + s, y + h + s, w + s, s, 0.60);
+        // Bottom-right corner, so the two bands meet cleanly.
+        self.shade_rect(x + w, y + h, s, s, 0.35);
+    }
+
+    /// Fill `(x,y,w,h)` with the pixels beneath it darkened toward black by
+    /// `factor` (0 = black, 1 = unchanged) — a cheap translucent-shadow effect
+    /// without an alpha channel. Reads + rewrites each pixel.
+    fn shade_rect(&self, x: u64, y: u64, w: u64, h: u64, factor: f32) {
+        let x1 = (x + w).min(self.width);
+        let y1 = (y + h).min(self.height);
+        for py in y..y1 {
+            for px in x..x1 {
+                let (r, g, b) = self.get_pixel(px, py);
+                let d = |c: u8| (c as f32 * factor) as u8;
+                self.put_pixel(px, py, (d(r), d(g), d(b)));
+            }
+        }
+    }
+
     /// Draw a `t`-thick rectangle outline (the pane border).
     fn rect_outline(&self, x: u64, y: u64, w: u64, h: u64, t: u64, c: Rgb) {
         self.fill_rect(x, y, w, t, c); // top
@@ -1183,10 +1218,13 @@ impl Screen {
     /// the action (right) pane if open, caret, status bar.
     fn redraw(&self) {
         self.fill_rect(0, 0, self.width, self.height, self.theme.screen_bg);
+        // Drop shadows lift the panes off the background (web-modal feel).
+        self.drop_shadow(self.chat.x, self.chat.y, self.chat.w, self.chat.h);
         self.fill_rect(self.chat.x, self.chat.y, self.chat.w, self.chat.h, self.chat.bg);
         self.draw_frame(&self.chat, !self.action_focused());
         self.render_view(&self.chat);
         if self.right != RightMode::Closed {
+            self.drop_shadow(self.logs.x, self.logs.y, self.logs.w, self.logs.h);
             self.fill_rect(self.logs.x, self.logs.y, self.logs.w, self.logs.h, self.logs.bg);
             // The header is a tmux-style tab bar (drawn by draw_tab_bar), so the
             // frame is drawn with an empty title.
@@ -1450,14 +1488,21 @@ impl Screen {
     /// Draw a centred modal box and return its interior text origin + width in
     /// cells `(ix, iy, cols)`. Dims the screen isn't done (kept cheap); the box
     /// simply overpaints the middle of the canvas.
+    /// The modal content width in cells (roomy but bounded), so callers can wrap
+    /// their text to it *before* sizing the box height.
+    fn modal_cols(&self) -> u64 {
+        ((self.width / self.cw()) * 3 / 5).clamp(28, 56)
+    }
+
     fn modal_box(&self, title: &str, rows: u64) -> (u64, u64, u64) {
         let cw = self.cw();
         let ch = self.ch();
-        let cols = (self.width / cw).clamp(20, 64) * 2 / 3;
+        let cols = self.modal_cols();
         let bw = cols * cw + 2 * (BORDER + PAD);
         let bh = (rows + 2) * ch + 2 * (BORDER + PAD);
         let bx = (self.width - bw) / 2;
         let by = (self.height - bh) / 2;
+        self.drop_shadow(bx, by, bw, bh); // web-style elevation over the panes
         self.fill_rect(bx, by, bw, bh, self.theme.status_bg);
         self.rect_outline(bx, by, bw, bh, BORDER, self.theme.accent);
         let ix = bx + BORDER + PAD;
@@ -1490,15 +1535,17 @@ pub fn draw_confirm(title: &str, msg: &str, focus_yes: bool) {
             sc.cursor_restore();
             sc.cur_vis = false;
             MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
-            let (ix, iy, cols) = sc.modal_box(title, 3);
+            // Wrap first, then size the box to the wrapped line count + a gap +
+            // the button row, so a long consent message never overflows.
+            let lines = wrap(msg, sc.modal_cols() as usize);
+            let (ix, iy, _cols) = sc.modal_box(title, lines.len() as u64 + 2);
             let ch = sc.ch();
-            // Wrap the message to the box width.
             let mut y = iy;
-            for line in wrap(msg, cols as usize) {
-                sc.draw_str(ix, y, &line, sc.theme.chat_fg, sc.theme.status_bg);
+            for line in &lines {
+                sc.draw_str(ix, y, line, sc.theme.chat_fg, sc.theme.status_bg);
                 y += ch;
             }
-            let by = iy + 2 * ch;
+            let by = y + ch / 2; // buttons just below the last message line
             let x2 = sc.modal_button(ix, by, "Yes", focus_yes, 0);
             sc.modal_button(x2, by, "No", !focus_yes, 1);
             sc.cursor_overlay();
