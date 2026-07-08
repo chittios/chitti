@@ -2850,7 +2850,9 @@ fn built_in_package(name: &str) -> Option<crate::skills::package::SkillPackage> 
         // is the e2e harness gateway (inert off-test; retryable via /mcp).
         "mcp-agent" => {
             let mut p = crate::skills::package::sample_report_agent(next_skill_id(), next_agent_id());
+            p.manifest.name = "mcp-agent".into();
             if let Some(a) = p.manifest.agent.as_mut() {
+                a.name = "mcp-agent".into();
                 a.mcp_servers.push(crate::agent::types::McpServerSpec {
                     name: "harness".into(),
                     url: "http://10.0.2.2:8100/mcp".into(),
@@ -3000,7 +3002,7 @@ fn run_agent_install(arg: &str, chat: &mut Option<ChatSession>) {
         // "full filesystem access" is the thing a human most needs to see.
         let broad_fs = cap.domain == crate::agent::types::CapDomain::Fs
             && !matches!(&cap.scope, crate::agent::types::Scope::Path(p) if p.starts_with("/agent/") || p.contains("$HOME"));
-        let line = if broad_fs { alloc::format!("{} \u{2014} \u{26a0} FULL filesystem access (beyond its own folder)", line) } else { line.clone() };
+        let line = if broad_fs { alloc::format!("{} -- WARNING: FULL filesystem access, beyond its own folder", line) } else { line.clone() };
         let ok = if auto_yes {
             serial_println!("install>   [--yes] grant: {}", line);
             true
