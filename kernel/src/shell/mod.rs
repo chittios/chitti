@@ -108,6 +108,10 @@ pub fn run() -> ! {
     crate::ui_config::load_and_apply();
     auto_mount_root();
     update_status();
+    // Ask the host terminal to bracket pastes, so a host->guest paste arrives as
+    // one `ESC[200~ … ESC[201~` block the line editor can capture (see
+    // `crate::clipboard`). Copy-out uses OSC 52 from `clipboard::set`.
+    crate::clipboard::enable_host_paste();
 
     // The agent-layer orchestrator (session persistence for the shell agent —
     // `/session`, `/info`), reused across the session so its Session persists.
@@ -302,6 +306,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "datetime" | "date" => run_datetime(arg),
         "ui" => run_ui(arg),
         "shortcuts" | "keys" => run_shortcuts(),
+        "clip" | "clipboard" => run_clip(arg),
         "ktrace" | "logs" => toggle_ktrace(),
         "close" => close_action(),
         "skills" => print_skills(),
@@ -561,6 +566,7 @@ fn print_help() {
     serial_println!("  /datetime [..]   show/set the clock: /datetime 2026-07-04 13:45 | /datetime tz +5:30");
     serial_println!("  /ui [config|reload|reset]  view/edit the UI config (/configs/core/ui.json)");
     serial_println!("  /shortcuts       list keyboard shortcuts (/configs/core/shortcuts.json)");
+    serial_println!("  /clip [text]     shared clipboard; syncs with the host (OSC52 out / bracketed paste in)");
     serial_println!("  /ktrace          toggle the ktrace log stream in the action (right) pane");
     serial_println!("  /open <path>     edit a file in the vim-like editor (right pane): hjkl/i/Esc/:w/:q");
     serial_println!("                   .png/.jpg preview in the action pane; .wav/.mp3 play (Ctrl+C stops)");
@@ -3185,7 +3191,7 @@ static HISTORY: Locked<alloc::vec::Vec<String>> = Locked::new(alloc::vec::Vec::n
 const COMMANDS: &[&str] = &[
     "agents", "bench", "cat", "clear", "close", "compact", "datetime", "disks", "exit", "help", "http", "infer", "info", "mcp", "model", "top", "ws",
     "install", "ktrace", "ls", "mkext4", "mode", "mount", "mounts", "network", "open", "perf",
-    "lspci", "onnx", "ping", "session", "shortcuts", "skills", "think", "ui", "umount", "voice", "wifi",
+    "lspci", "onnx", "ping", "session", "shortcuts", "skills", "think", "ui", "umount", "voice", "wifi", "clip",
 ];
 
 /// `/think on|off` — toggle Qwen thinking mode (default on; streamed dim).
@@ -3252,6 +3258,43 @@ fn next_seq_byte() -> Option<u8> {
         crate::sched::yield_now();
     }
     None
+}
+
+/// Read a bracketed-paste body: everything after `ESC[200~` up to the closing
+/// `ESC[201~`, which is consumed. Content bytes (including newlines) are
+/// returned verbatim; a stray CSI inside the paste is skipped. Bounded in total
+/// length so a malformed stream can't spin forever.
+fn read_bracketed_paste() -> String {
+    let mut out = String::new();
+    const CAP: usize = 256 * 1024;
+    while out.len() < CAP {
+        let b = match next_seq_byte() {
+            Some(b) => b,
+            None => break, // paced-out: treat what we have as the paste
+        };
+        if b == 0x1b {
+            // Possible end marker `ESC [ 201 ~`. Decode the CSI.
+            if next_seq_byte() != Some(b'[') {
+                continue; // stray ESC in content; drop it
+            }
+            let mut param: u64 = 0;
+            let fin = loop {
+                match next_seq_byte() {
+                    Some(f @ 0x40..=0x7e) => break Some(f),
+                    Some(d @ b'0'..=b'9') => param = param.saturating_mul(10) + (d - b'0') as u64,
+                    Some(_) => {}
+                    None => break None,
+                }
+            };
+            if fin == Some(b'~') && param == 201 {
+                break; // end of paste
+            }
+            // Any other CSI inside a paste is ignored (very unusual).
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
 }
 
 /// Tab-complete a `/command` prefix: unique match completes in place; multiple
@@ -3434,6 +3477,28 @@ fn read_line(buf: &mut String) {
                         None => break None,
                     }
                 };
+                // Bracketed paste from the host terminal: `ESC[200~ … ESC[201~`.
+                // Capture the whole paste into the clipboard (host->guest sync)
+                // and insert it — into the editor tab literally (newlines split
+                // lines), else into the chat line with newlines flattened.
+                if fin == Some(b'~') && param == 200 {
+                    let pasted = read_bracketed_paste();
+                    crate::clipboard::set_from_host(pasted.clone());
+                    if fb_editor_active() {
+                        for b in pasted.bytes() {
+                            editor_feed(b);
+                        }
+                    } else {
+                        fb_scroll_live(false);
+                        for ch in pasted.chars() {
+                            let c = if ch == '\n' || ch == '\r' || ch == '\t' { ' ' } else { ch };
+                            if (' '..='~').contains(&c) {
+                                insert_at(buf, &mut cur, c);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // Ctrl+Tab / Shift+Tab: cycle action-pane tabs (tmux-style), a
                 // global chord that works even while the editor tab is focused.
                 if matches!(fin, Some(b'T')) {
@@ -4208,6 +4273,27 @@ fn repaint_audio() {
 }
 #[cfg(not(all(not(feature = "server"), not(test))))]
 fn repaint_audio() {}
+
+/// `/clip [text]` — the shared clipboard. With no argument it prints the
+/// current contents; with text it sets the clipboard, which also pushes to the
+/// host clipboard via OSC 52 (`clipboard::set`). Copy in the editor/chat and it
+/// lands on the host; paste on the host and bracketed paste lands it here.
+fn run_clip(arg: &str) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        match crate::clipboard::get() {
+            Some((text, _)) => {
+                serial_println!("clip> {} byte(s):", text.len());
+                serial_println!("{}", text);
+                serial_println!("clip> (copy in the editor/chat syncs to the host; host paste syncs here)");
+            }
+            None => serial_println!("clip> empty (copy something, or paste from the host)"),
+        }
+    } else {
+        crate::clipboard::set(String::from(arg), false);
+        serial_println!("clip> set {} byte(s) + pushed to the host clipboard", arg.len());
+    }
+}
 
 /// `/shortcuts` — list the configured keyboard shortcuts (`shortcuts.json`).
 fn run_shortcuts() {

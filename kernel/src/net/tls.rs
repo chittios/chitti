@@ -215,8 +215,14 @@ pub fn handshake(stream: TcpStream, server_name: &str) -> Result<TlsSession, Str
 
     // Record buffers live as long as the connection; leak them (one per
     // request, freed implicitly at process teardown — a request is short-lived
-    // and the heap is large). 16640 = the max TLS record; 4 KiB write buffer.
-    let rd: &'static mut [u8] = alloc::vec![0u8; 16 * 1024 + 256].leak();
+    // and the heap is large). The read buffer must hold the largest incoming
+    // TLS record *including* the 5-byte record header and AEAD overhead: a max
+    // 2^14 plaintext + 256 expansion + 5 header ≈ 16645 bytes. The old
+    // `16*1024 + 256` (16640) was a few bytes short, so a server that sends a
+    // full-size record (e.g. a big certificate chain — upload.wikimedia.org)
+    // overflowed it and the handshake died with `DecodeError`. Use 32 KiB for
+    // comfortable headroom over any single record. 4 KiB write buffer.
+    let rd: &'static mut [u8] = alloc::vec![0u8; 32 * 1024].leak();
     let wr: &'static mut [u8] = alloc::vec![0u8; 4096].leak();
     // SNI must outlive the config borrow; leak the small hostname string.
     let name: &'static str = String::from(server_name).leak();
@@ -227,6 +233,6 @@ pub fn handshake(stream: TcpStream, server_name: &str) -> Result<TlsSession, Str
 
     let mut tls = TlsConnection::new(stream, rd, wr);
     tls.open::<ChaCha20Rng, NoVerify>(TlsContext::new(config, &mut rng))
-        .map_err(|e| alloc::format!("TLS handshake failed: {:?} (server must support TLS 1.3)", e))?;
+        .map_err(|e| alloc::format!("TLS handshake failed: {:?} (in-kernel client is TLS 1.3, AES-128-GCM, no cert verification)", e))?;
     Ok(TlsSession { tls })
 }
