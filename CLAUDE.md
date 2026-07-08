@@ -282,9 +282,17 @@ real UEFI hardware.
   (pumped chunk-by-chunk from `ui_tick`, not a blocking loop), ktrace keeps
   streaming, the editor keeps its buffer. The editor is non-blocking: its state
   lives in a static and `read_line` routes bytes to it while its tab is
-  focused. The **image viewer** decodes in-kernel — `image/` is a pure no_std
-  PNG+DEFLATE and baseline-JPEG decoder set, unit-tested against real fixture
-  files — then presents box-downscaled + letterboxed), a boot splash +
+  focused. **Both media tabs take key controls while the action pane is focused**
+  (Ctrl+Tab / click — same gating as pane scroll, so typing at the prompt is
+  never intercepted): the image viewer does `+`/`-` zoom, `r`/`l` rotate,
+  arrows pan, `0` reset (retaining the source, capped to ~4 MP, and re-rendering
+  via the pure `image::render_view`/`rotate90`); the audio player does space
+  play/pause, `←`/`→` seek ±5 s, `↑`/`↓` ±30 s, `0`/Home restart (state on the
+  `AudioPlayer` static, seek just moves the PCM cursor, pause holds it while the
+  device drains its queued chunk to silence). The **image viewer** decodes
+  in-kernel — `image/` is a pure no_std PNG+DEFLATE and baseline-JPEG decoder
+  set, unit-tested against real fixture files (plus `rotate90`/`render_view`
+  transform tests) — then presents box-downscaled + letterboxed), a boot splash +
   status-bar **Synapse-C** brand mark, a live
   clock, a blinking caret, mouse cursor + click, **mouse text selection in the
   chat pane** (drag-to-copy → clipboard, paste with Ctrl+V; absolute-indexed

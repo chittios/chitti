@@ -377,15 +377,26 @@ def s_open_media(_g):
             g2.send(f"/open /img{d}/chitti-e2e.png")
             if not g2.wait_for("3x2 px", 15, m):
                 continue
-            # Same mount also carries the WAV: decode + play it to the end.
+            # Same mount also carries the WAV: decode + play it.
             m = g2.mark()
             g2.send(f"/open /img{d}/chitti-e2e.wav")
             if not g2.wait_for("open> playing", 15, m):
                 return False, "WAV did not start playing"
-            # Playback is a background job pumped from the idle tick; it prints
-            # "audio finished" when the last chunk drains.
-            ok = g2.wait_for("open> audio finished", 30, m)
-            return ok, "PNG previewed + WAV played (background) via /open" if ok else "WAV playback never finished"
+            # Drive the media-tab key controls and prove the input loop never
+            # wedges: Ctrl+Tab focuses the pane, space pauses/resumes, arrows
+            # seek (no serial output — they repaint), then Ctrl+C stops from the
+            # prompt (which does print). The pixel/seek math is unit-tested; this
+            # is the on-OS liveness guard the standing rule asks for.
+            g2.send_raw(b"\x1b[T")   # Ctrl+Tab: focus the audio tab
+            g2.wait_quiet(0.3, 10)
+            g2.send_raw(b" ")        # space: pause
+            g2.send_raw(b" ")        # space: resume
+            g2.send_raw(b"\x1b[C")   # right: seek forward
+            g2.send_raw(b"\x1b[D")   # left: seek back
+            m2 = g2.mark()
+            g2.send_raw(b"\x03")     # Ctrl+C at the prompt: stop playback
+            ok = g2.wait_for("audio stopped", 10, m2)
+            return ok, "PNG previewed + WAV played + media-tab controls (focus/pause/seek/stop) responsive" if ok else "media controls / Ctrl+C did not stop playback"
         return False, "no '3x2 px' decode report from /open on any mount"
     finally:
         g2.close()

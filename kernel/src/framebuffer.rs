@@ -1497,6 +1497,7 @@ pub struct AudioView<'a> {
     pub total_ms: u64,
     pub rate: u32,
     pub playing: bool,
+    pub paused: bool,
 }
 
 /// Paint the audio-player tab: the track name, a scrubber bar at the current
@@ -1519,7 +1520,14 @@ pub fn draw_audio(v: &AudioView) {
         // and the padded time detail, so the ~4 Hz refresh never blanks.
         let bg = sc.logs.bg;
         let mut y = iy + ch;
-        sc.draw_str_bg(px, y, if v.playing { "> playing" } else { "= paused " }, sc.theme.accent, bg);
+        let state = if v.paused {
+            "|| paused "
+        } else if v.playing {
+            "> playing "
+        } else {
+            "= ended   "
+        };
+        sc.draw_str_bg(px, y, state, sc.theme.accent, bg);
         y += ch + ch / 2;
         sc.draw_str_bg(px, y, v.name, sc.theme.logs_fg, bg);
         y += ch + ch / 2;
@@ -1530,7 +1538,11 @@ pub fn draw_audio(v: &AudioView) {
         y += ch * 2;
         sc.draw_str_bg(px, y, &alloc::format!("{} Hz mono", v.rate), sc.theme.title_dim, bg);
         y += ch + ch / 2;
-        sc.draw_str_bg(px, y, "Ctrl+C stops - switch tabs, keeps playing", sc.theme.title_dim, bg);
+        // Key controls (only when the action pane is focused; switch tabs freely).
+        for line in ["space play/pause  0 restart", "<- ->  seek 5s   up/dn  30s", "Ctrl+C stops"] {
+            sc.draw_str_bg(px, y, line, sc.theme.title_dim, bg);
+            y += ch;
+        }
         sc.cursor_overlay();
     });
 }
@@ -2243,6 +2255,18 @@ pub fn action_dims_px() -> Option<(u64, u64)> {
     SCREEN.with(|slot| {
         slot.as_ref().and_then(|sc| {
             (sc.right != RightMode::Closed).then(|| (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch))
+        })
+    })
+}
+
+/// The action pane's interior background colour, packed `0x00RRGGBB` to match
+/// the pixel buffer [`present_surface`] blits — the image viewer letterboxes
+/// with this so the padding around a zoomed/rotated image matches the pane.
+pub fn pane_bg() -> Option<u32> {
+    SCREEN.with(|slot| {
+        slot.as_ref().map(|sc| {
+            let (r, g, b) = sc.logs.bg;
+            ((r as u32) << 16) | ((g as u32) << 8) | b as u32
         })
     })
 }
