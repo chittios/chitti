@@ -1217,14 +1217,20 @@ impl Screen {
     /// Full repaint: background, chat pane (content re-rendered from its grid),
     /// the action (right) pane if open, caret, status bar.
     fn redraw(&self) {
-        self.fill_rect(0, 0, self.width, self.height, self.theme.screen_bg);
-        // Drop shadows lift the panes off the background (web-modal feel).
+        // Paint only the background *gutters* (margins + the gap between panes),
+        // never a full-screen clear — the panes are painted over their own areas
+        // below, so their content is never flashed to background. This is what
+        // makes opening/closing the action pane not flicker the whole screen.
+        self.paint_gutters();
+        // Drop shadows sit in the gutters (right/bottom bands of each pane).
         self.drop_shadow(self.chat.x, self.chat.y, self.chat.w, self.chat.h);
+        if self.right != RightMode::Closed {
+            self.drop_shadow(self.logs.x, self.logs.y, self.logs.w, self.logs.h);
+        }
         self.fill_rect(self.chat.x, self.chat.y, self.chat.w, self.chat.h, self.chat.bg);
         self.draw_frame(&self.chat, !self.action_focused());
         self.render_view(&self.chat);
         if self.right != RightMode::Closed {
-            self.drop_shadow(self.logs.x, self.logs.y, self.logs.w, self.logs.h);
             self.fill_rect(self.logs.x, self.logs.y, self.logs.w, self.logs.h, self.logs.bg);
             // The header is a tmux-style tab bar (drawn by draw_tab_bar), so the
             // frame is drawn with an empty title.
@@ -1241,6 +1247,61 @@ impl Screen {
             self.caret_draw(&self.chat);
         }
         self.draw_status();
+    }
+
+    /// Fill just the screen-background gutters: the top/bottom strips and the
+    /// left/right margins + the gap between the panes. Everything the panes
+    /// cover is left untouched (painted over directly), so `redraw` never blanks
+    /// the whole screen.
+    fn paint_gutters(&self) {
+        let bg = self.theme.screen_bg;
+        let (by, bh) = (self.chat.y, self.chat.h);
+        // Top strip (above the pane band) + bottom strip (down to the status bar).
+        self.fill_rect(0, 0, self.width, by, bg);
+        let below = by + bh;
+        let status_top = self.height.saturating_sub(self.ch() + 8);
+        self.fill_rect(0, below, self.width, status_top.saturating_sub(below), bg);
+        // Horizontal gutters within the pane band. Order the two panes by x
+        // (the layout may put chat on the right when swapped).
+        let (mut a, mut b) = ((self.chat.x, self.chat.x + self.chat.w), (0u64, 0u64));
+        let two = self.right != RightMode::Closed;
+        if two {
+            b = (self.logs.x, self.logs.x + self.logs.w);
+            if a.0 > b.0 {
+                core::mem::swap(&mut a, &mut b);
+            }
+        }
+        self.fill_rect(0, by, a.0, bh, bg); // left margin
+        if two {
+            self.fill_rect(a.1, by, b.0.saturating_sub(a.1), bh, bg); // gap between panes
+            self.fill_rect(b.1, by, self.width.saturating_sub(b.1), bh, bg); // right margin
+        } else {
+            self.fill_rect(a.1, by, self.width.saturating_sub(a.1), bh, bg); // right margin
+        }
+    }
+
+    /// Repaint **only the action pane** for a tab switch (geometry unchanged):
+    /// clear its interior once for the new tab, redraw its frame + tab bar, and
+    /// re-render ktrace from its grid. The chat pane and the whole background are
+    /// left untouched — so switching tabs never flickers the rest of the screen.
+    /// The active tab's dynamic interior (top/audio/image/editor) is repainted by
+    /// the shell right after (`repaint_active_tab`).
+    fn repaint_action(&mut self) {
+        if self.right == RightMode::Closed {
+            return;
+        }
+        self.cursor_restore();
+        // Update the chat frame's active state (border colour) without touching
+        // its content — cheap, no blank.
+        self.draw_frame(&self.chat, !self.action_focused());
+        self.fill_rect(self.logs.ix, self.logs.iy, self.logs.cols * self.logs.cw, self.logs.rows * self.logs.ch, self.logs.bg);
+        self.draw_frame_titled(&self.logs, self.action_focused(), "");
+        self.draw_tab_bar();
+        self.draw_close_btn();
+        if self.right == RightMode::Ktrace {
+            self.render_view(&self.logs);
+        }
+        self.cursor_overlay();
     }
 
     /// Draw the `[x]` close button at the top-right of the action pane title.
@@ -1269,6 +1330,10 @@ impl Screen {
     fn draw_tab_bar(&self) {
         let ty = self.logs.y + BORDER + 4;
         let (close_x, ..) = self.close_btn();
+        // Clear the tab-bar row (up to the close button) first, so switching
+        // tabs leaves no stale glyphs from a longer previous label.
+        let x0 = self.logs.x + BORDER + PAD;
+        self.fill_rect(x0, ty, close_x.saturating_sub(x0), self.ch(), self.logs.bg);
         for (i, (m, x, w)) in self.tab_layout().into_iter().enumerate() {
             if x + w >= close_x {
                 break; // ran into the close button; overflow tabs are hidden
@@ -1292,13 +1357,15 @@ impl Screen {
         let lab_w = 7 * cw; // fixed label column
         self.draw_str(x, y, label, self.theme.chat_fg, bg);
         let bx = x + lab_w;
-        let bw = w.saturating_sub(lab_w + 10 * cw); // leave room for the detail text
+        // Reserve gap(1) + detail(11) + margin(1) = 13 cells after the bar, so
+        // the padded detail text never runs past the pane's right edge/border.
+        let bw = w.saturating_sub(lab_w + 13 * cw);
         let bh = ch;
-        // Track + border.
-        self.fill_rect(bx, y, bw, bh, self.theme.chat_bg);
+        // Border (static — re-stroking the same pixels never blanks).
         self.rect_outline(bx, y, bw, bh, 1, self.theme.border_dim);
         let p = pct.min(100);
-        let fill = bw.saturating_sub(2) * p / 100;
+        let inner = bw.saturating_sub(2);
+        let fill = inner * p / 100;
         let color = if p < 60 {
             (126, 214, 150) // green
         } else if p < 85 {
@@ -1306,11 +1373,26 @@ impl Screen {
         } else {
             (255, 106, 110) // red
         };
+        // Repaint in place: colour the filled span, then background the rest —
+        // the coloured region is never blanked to bg first, so no flicker.
         if fill > 0 {
             self.fill_rect(bx + 1, y + 1, fill, bh.saturating_sub(2), color);
         }
-        // Detail (e.g. "512M/6.0G") after the bar.
-        self.draw_str(bx + bw + cw, y, detail, self.theme.title_dim, bg);
+        if inner > fill {
+            self.fill_rect(bx + 1 + fill, y + 1, inner - fill, bh.saturating_sub(2), self.theme.chat_bg);
+        }
+        // Detail (e.g. "512M/6.0G") after the bar. Clamp it to the space left
+        // before the pane's right edge (x + w): truncate if somehow longer, and
+        // pad to that width so a shrinking value leaves no residue AND the text
+        // can never overflow the pane border.
+        let detail_x = bx + bw + cw;
+        let avail = ((x + w).saturating_sub(detail_x) / cw) as usize;
+        let mut d = alloc::string::String::from(detail);
+        d.truncate(avail);
+        while d.len() < avail {
+            d.push(' ');
+        }
+        self.draw_str(detail_x, y, &d, self.theme.title_dim, bg);
         y + ch + ch / 3
     }
 
@@ -1352,8 +1434,12 @@ pub fn draw_top(v: &TopView) {
         sc.cur_vis = false;
         let ch = sc.ch();
         let (px, iy, iw) = (sc.logs.ix, sc.logs.iy, sc.logs.cols * sc.logs.cw);
-        // Clear the pane interior.
-        sc.fill_rect(px, iy, iw, sc.logs.rows * sc.logs.ch, sc.logs.bg);
+        // NO full-interior clear here: that blank-then-repaint is what made the
+        // 1 Hz refresh flicker on the single-buffered framebuffer. The pane is
+        // cleared once when the tab opens (by `redraw`); each refresh below
+        // overwrites every element in place (bars self-fill, text is padded to a
+        // fixed width so shrinking values leave no residue), so nothing is ever
+        // blanked mid-frame.
         let x = px;
         let mut y = iy;
         let bg = sc.logs.bg;
@@ -1385,7 +1471,8 @@ pub fn draw_top(v: &TopView) {
         let heap_pct = if v.heap_total > 0 { v.heap_used * 100 / v.heap_total } else { 0 };
         y = sc.usage_bar_bg(x, y, iw, "heap   ", heap_pct, &alloc::format!("{}/{}", fmt(v.heap_used), fmt(v.heap_total)), bg);
         y += ch / 2;
-        // Footer stats.
+        // Footer stats — each padded to a fixed width so a value that shrinks
+        // between refreshes (uptime, alloc count) leaves no stale trailing text.
         for s in [
             alloc::format!("cores online : {}  ({})", v.cores_online, v.arch),
             alloc::format!("model loaded : {}", fmt(v.model_bytes)),
@@ -1396,7 +1483,7 @@ pub fn draw_top(v: &TopView) {
             if y + ch > iy + sc.logs.rows * sc.logs.ch {
                 break;
             }
-            sc.draw_str_bg(x, y, &s, sc.theme.logs_fg, bg);
+            sc.draw_str_bg(x, y, &alloc::format!("{:<40}", s), sc.theme.logs_fg, bg);
             y += ch;
         }
         sc.cursor_overlay();
@@ -1426,10 +1513,13 @@ pub fn draw_audio(v: &AudioView) {
         sc.cur_vis = false;
         let ch = sc.ch();
         let (px, iy, iw) = (sc.logs.ix, sc.logs.iy, sc.logs.cols * sc.logs.cw);
-        sc.fill_rect(px, iy, iw, sc.logs.rows * sc.logs.ch, sc.logs.bg);
+        let _ = iw;
+        // Repaint in place (no full clear — the pane was cleared once when the
+        // tab opened); the only moving parts are the progress bar (self-filling)
+        // and the padded time detail, so the ~4 Hz refresh never blanks.
         let bg = sc.logs.bg;
         let mut y = iy + ch;
-        sc.draw_str_bg(px, y, if v.playing { "> playing" } else { "= paused" }, sc.theme.accent, bg);
+        sc.draw_str_bg(px, y, if v.playing { "> playing" } else { "= paused " }, sc.theme.accent, bg);
         y += ch + ch / 2;
         sc.draw_str_bg(px, y, v.name, sc.theme.logs_fg, bg);
         y += ch + ch / 2;
@@ -1538,15 +1628,20 @@ pub fn draw_confirm(title: &str, msg: &str, focus_yes: bool) {
             // Wrap first, then size the box to the wrapped line count + a gap +
             // the button row, so a long consent message never overflows.
             let lines = wrap(msg, sc.modal_cols() as usize);
-            let (ix, iy, _cols) = sc.modal_box(title, lines.len() as u64 + 2);
+            let (ix, iy, cols) = sc.modal_box(title, lines.len() as u64 + 2);
             let ch = sc.ch();
+            let cw = sc.cw();
             let mut y = iy;
             for line in &lines {
                 sc.draw_str(ix, y, line, sc.theme.chat_fg, sc.theme.status_bg);
                 y += ch;
             }
-            let by = y + ch / 2; // buttons just below the last message line
-            let x2 = sc.modal_button(ix, by, "Yes", focus_yes, 0);
+            // Buttons on the RIGHT of the box, just below the message.
+            let by = y + ch / 2;
+            let btn_w = |label: &str| (label.len() as u64 + 2) * cw;
+            let total = btn_w("Yes") + cw + btn_w("No");
+            let start = ix + cols * cw - total;
+            let x2 = sc.modal_button(start, by, "Yes", focus_yes, 0);
             sc.modal_button(x2, by, "No", !focus_yes, 1);
             sc.cursor_overlay();
         }
@@ -1977,11 +2072,11 @@ fn open_view_slot(slot: &mut Option<Screen>, mode: RightMode) {
     if let Some(i) = old.tabs.iter().position(|&m| m == mode) {
         old.active = i;
         old.right = mode;
-        old.redraw();
+        old.repaint_action(); // geometry unchanged → action pane only
         return;
     }
     if old.tabs.is_empty() {
-        // First tab: rebuild the split open.
+        // First tab: the chat pane resizes, so a full relayout + redraw.
         let mut ns = rebuilt(old, true, mode);
         ns.tabs = alloc::vec![mode];
         ns.active = 0;
@@ -1989,11 +2084,12 @@ fn open_view_slot(slot: &mut Option<Screen>, mode: RightMode) {
         ns.redraw();
         *slot = Some(ns);
     } else {
-        // Additional tab: geometry is unchanged; append + select + repaint.
+        // Additional tab: geometry is unchanged; append + select + repaint just
+        // the action pane (no whole-screen redraw → no flicker).
         old.tabs.push(mode);
         old.active = old.tabs.len() - 1;
         old.right = mode;
-        old.redraw();
+        old.repaint_action();
     }
 }
 
@@ -2016,7 +2112,7 @@ pub fn cycle_tab(forward: bool) -> RightMode {
         }
         old.active = if forward { (old.active + 1) % n } else { (old.active + n - 1) % n };
         old.right = old.tabs[old.active];
-        old.redraw();
+        old.repaint_action();
         old.right
     })
 }
@@ -2030,7 +2126,7 @@ pub fn select_tab(i: usize) -> RightMode {
         }
         old.active = i;
         old.right = old.tabs[i];
-        old.redraw();
+        old.repaint_action();
         old.right
     })
 }
@@ -2077,11 +2173,12 @@ fn close_active_slot(slot: &mut Option<Screen>) {
         ns.redraw();
         *slot = Some(ns);
     } else {
+        // Other tabs remain → geometry unchanged; repaint just the action pane.
         if old.active >= old.tabs.len() {
             old.active = old.tabs.len() - 1;
         }
         old.right = old.tabs[old.active];
-        old.redraw();
+        old.repaint_action();
     }
 }
 

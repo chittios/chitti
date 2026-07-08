@@ -3418,7 +3418,12 @@ fn read_line(buf: &mut String) {
             // terminals and all keyboard drivers): params, then a final byte.
             Some(0x1b) => {
                 if next_seq_byte() != Some(b'[') {
-                    continue; // bare ESC or unknown sequence: ignore
+                    // Bare Esc (no CSI): if the editor tab owns input, deliver it
+                    // so Insert mode exits to Normal; otherwise ignore.
+                    if fb_editor_active() {
+                        editor_feed(0x1b);
+                    }
+                    continue;
                 }
                 let mut param: u64 = 0;
                 let fin = loop {

@@ -380,7 +380,10 @@ fn bootinfo_framebuffer() -> Option<(usize, u64, u64, u64, u64, u32, u32, u32)> 
     if bpp == 0 {
         (rs, gs, bs, bpp) = (16, 8, 0, 4);
     }
-    serial_println!("Chitti: framebuffer from UEFI boot-info (GOP {}x{} at {:#x}, shifts {}/{}/{})", w, h, addr, rs, gs, bs);
+    serial_println!(
+        "Chitti: framebuffer from UEFI boot-info (GOP {}x{} at {:#x}, pitch {} bytes = {} px/line, {} bpp, shifts {}/{}/{})",
+        w, h, addr, pitch, if bpp > 0 { pitch / bpp } else { 0 }, bpp, rs, gs, bs
+    );
     Some((addr as usize, w, h, pitch, bpp, rs, gs, bs))
 }
 
