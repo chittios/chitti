@@ -3372,6 +3372,102 @@ fn fb_editor_active() -> bool {
     #[cfg(test)]
     false
 }
+/// The focused action tab if it's a media viewer/player (image or audio) —
+/// keys route to its controls only while the action pane is focused, so typing
+/// in the chat line is never intercepted.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn media_focused() -> Option<crate::framebuffer::RightMode> {
+    if !crate::framebuffer::focus_is_action() {
+        return None;
+    }
+    match crate::framebuffer::right_mode() {
+        m @ (crate::framebuffer::RightMode::Audio | crate::framebuffer::RightMode::Surface(_)) => Some(m),
+        _ => None,
+    }
+}
+
+/// Handle a printable control key for the focused media tab. Returns true if it
+/// was consumed (so `read_line` shouldn't treat it as chat input).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn media_key(c: u8) -> bool {
+    match media_focused() {
+        Some(crate::framebuffer::RightMode::Surface(_)) => match c {
+            b'+' | b'=' | b'-' | b'_' | b'r' | b'R' | b'l' | b'L' | b'0' => {
+                image_cmd(c);
+                true
+            }
+            _ => false,
+        },
+        Some(crate::framebuffer::RightMode::Audio) => match c {
+            b' ' => {
+                audio_toggle_pause();
+                true
+            }
+            b'0' => {
+                audio_restart();
+                true
+            }
+            b',' => {
+                audio_seek(-5000);
+                true
+            }
+            b'.' => {
+                audio_seek(5000);
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn media_key(_c: u8) -> bool {
+    false
+}
+
+/// Handle an arrow/Home nav key (`A`/`B`/`C`/`D`/`H`) for the focused media tab:
+/// pan the image, or seek the audio. Returns true if consumed.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn media_nav(fin: u8) -> bool {
+    match media_focused() {
+        Some(crate::framebuffer::RightMode::Surface(_)) => match fin {
+            b'A' | b'B' | b'C' | b'D' => {
+                image_cmd(fin);
+                true
+            }
+            _ => false,
+        },
+        Some(crate::framebuffer::RightMode::Audio) => match fin {
+            b'C' => {
+                audio_seek(5000);
+                true
+            }
+            b'D' => {
+                audio_seek(-5000);
+                true
+            }
+            b'A' => {
+                audio_seek(30000);
+                true
+            }
+            b'B' => {
+                audio_seek(-30000);
+                true
+            }
+            b'H' => {
+                audio_restart();
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn media_nav(_fin: u8) -> bool {
+    false
+}
+
 /// Switch to the next/previous action tab, focus the pane, repaint it.
 fn tab_switch(forward: bool) {
     #[cfg(not(test))]
@@ -3516,6 +3612,12 @@ fn read_line(buf: &mut String) {
                     }
                     continue;
                 }
+                // Focused media tab: arrows pan the image / seek the audio.
+                if let Some(f) = fin {
+                    if media_nav(f) {
+                        continue;
+                    }
+                }
                 let action = fb_focus_is_action();
                 // Held arrows accelerate (multi-step) like held Backspace.
                 let steps = match fin {
@@ -3653,6 +3755,10 @@ fn read_line(buf: &mut String) {
                 }
             }
             Some(c @ 0x20..=0x7e) => {
+                // A focused image/audio tab consumes its control keys first.
+                if media_key(c) {
+                    continue;
+                }
                 fb_scroll_live(false);
                 insert_at(buf, &mut cur, c as char);
             }
@@ -4077,16 +4183,25 @@ fn run_open_inner(arg: &str) {
 #[cfg(not(feature = "server"))]
 const VIEWER_SURFACE: u32 = u32::MAX; // == framebuffer::IMAGE_SURFACE (labelled "image")
 
-/// The last decoded+scaled image, retained so the image tab repaints when you
-/// switch back to it (surfaces aren't otherwise backed).
+/// The retained source image plus interactive view state (zoom / rotation /
+/// pan), so the image tab can be zoomed, rotated, and panned and repaints when
+/// you switch back to it (surfaces aren't otherwise backed). The source is
+/// capped to `IMAGE_MAX_PX` at load so a huge photo can't exhaust the heap
+/// while still holding enough detail for a few zoom steps.
 #[cfg(not(feature = "server"))]
 struct ImageTab {
-    w: usize,
-    h: usize,
-    pixels: alloc::vec::Vec<u32>,
+    src: crate::image::Image,
+    zoom: u32, // percent of fit-to-pane; 100 = fit
+    rot: u32,  // 90° quadrants clockwise
+    pan_x: i64,
+    pan_y: i64,
 }
 #[cfg(not(feature = "server"))]
 static IMAGE: crate::mm::Locked<Option<ImageTab>> = crate::mm::Locked::new(None);
+/// Cap the retained source image (≈16 MiB of u32) — bounds heap use for a huge
+/// photo; box-downscaled once at load, aspect preserved by halving.
+#[cfg(not(feature = "server"))]
+const IMAGE_MAX_PX: usize = 4_000_000;
 
 /// `/open <path>.png|.jpg` — decode and show an image in an action-pane tab.
 /// Reads from a mounted volume (`/mnt/...`) or the Synapse store; the decoded
@@ -4104,18 +4219,28 @@ fn view_image(path: &str) {
             let (iw, ih) = (img.w, img.h);
             #[cfg(not(test))]
             {
-                // Open the tab first so the downscale can target its real size.
+                // Cap the retained source (halving preserves aspect) so a huge
+                // photo can't exhaust the heap.
+                let mut src = img;
+                let (mut nw, mut nh) = (src.w, src.h);
+                while nw * nh > IMAGE_MAX_PX {
+                    nw = nw.div_ceil(2);
+                    nh = nh.div_ceil(2);
+                }
+                if (nw, nh) != (src.w, src.h) {
+                    src = crate::image::resize(&src, nw, nh);
+                }
+                IMAGE.with(|s| *s = Some(ImageTab { src, zoom: 100, rot: 0, pan_x: 0, pan_y: 0 }));
+                // Open the tab and render the fitted view. Controls activate
+                // once the action pane is focused (Ctrl+Tab / click) — the same
+                // gating as pane scroll, so typing at the prompt is never eaten.
                 crate::framebuffer::set_right(crate::framebuffer::RightMode::Surface(VIEWER_SURFACE));
-                let (pw, ph) = crate::framebuffer::action_dims_px().unwrap_or((640, 480));
-                let (nw, nh) = crate::image::fit(img.w, img.h, pw as usize, ph as usize);
-                let scaled = if (nw, nh) == (img.w, img.h) { img } else { crate::image::resize(&img, nw, nh) };
-                crate::framebuffer::present_surface(VIEWER_SURFACE, scaled.w, scaled.h, &scaled.pixels);
-                IMAGE.with(|s| *s = Some(ImageTab { w: scaled.w, h: scaled.h, pixels: scaled.pixels }));
+                render_image();
             }
             #[cfg(test)]
             drop(img);
             serial_println!(
-                "open> {} — {}x{} px, {} KiB, decoded in {} ms (Ctrl+Tab switches tabs, /close hides)",
+                "open> {} — {}x{} px, {} KiB, decoded in {} ms  (Ctrl+Tab to focus, then +/- zoom, r/l rotate, arrows pan, 0 reset; /close hides)",
                 path,
                 iw,
                 ih,
@@ -4127,17 +4252,78 @@ fn view_image(path: &str) {
     }
 }
 
-/// Repaint the retained image into its tab (after a tab switch back to it).
-#[cfg(not(all(not(feature = "server"), not(test))))]
-fn repaint_image() {}
+/// Render the retained image at its current zoom/rotation/pan into the tab.
+/// Also the repaint-on-switch path (surfaces aren't otherwise backed).
 #[cfg(all(not(feature = "server"), not(test)))]
-fn repaint_image() {
+fn render_image() {
+    let (pw, ph) = crate::framebuffer::action_dims_px().unwrap_or((640, 480));
+    let bg = crate::framebuffer::pane_bg().unwrap_or(0);
     IMAGE.with(|s| {
-        if let Some(img) = s.as_ref() {
-            crate::framebuffer::present_surface(VIEWER_SURFACE, img.w, img.h, &img.pixels);
+        if let Some(t) = s.as_ref() {
+            let v = crate::image::render_view(&t.src, pw as usize, ph as usize, t.zoom, t.rot, t.pan_x, t.pan_y, bg);
+            crate::framebuffer::present_surface(VIEWER_SURFACE, v.w, v.h, &v.pixels);
         }
     });
 }
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn render_image() {}
+#[cfg(not(test))]
+fn repaint_image() {
+    render_image();
+}
+
+/// Apply an interactive image-viewer command (zoom/rotate/pan/reset) and
+/// re-render the tab. No-op unless the image tab is loaded.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn image_cmd(c: u8) {
+    let (pw, ph) = crate::framebuffer::action_dims_px().unwrap_or((640, 480));
+    let (pw, ph) = (pw as i64, ph as i64);
+    IMAGE.with(|s| {
+        let Some(t) = s.as_mut() else { return };
+        // Pan step scales with the pane so it feels the same at any resolution.
+        let step = (pw / 6).max(16);
+        match c {
+            b'+' | b'=' => t.zoom = (t.zoom + 25).min(800),
+            b'-' | b'_' => t.zoom = t.zoom.saturating_sub(25).max(10),
+            b'r' | b'R' => {
+                t.rot = (t.rot + 1) % 4;
+                t.pan_x = 0;
+                t.pan_y = 0;
+            }
+            b'l' | b'L' => {
+                t.rot = (t.rot + 3) % 4;
+                t.pan_x = 0;
+                t.pan_y = 0;
+            }
+            b'0' => {
+                t.zoom = 100;
+                t.rot = 0;
+                t.pan_x = 0;
+                t.pan_y = 0;
+            }
+            // Arrow bytes forwarded as A/B/C/D: pan the image (only meaningful
+            // once zoomed past the pane).
+            b'A' => t.pan_y += step,
+            b'B' => t.pan_y -= step,
+            b'C' => t.pan_x += step,
+            b'D' => t.pan_x -= step,
+            _ => return,
+        }
+        // Clamp pan so the image can't be dragged entirely off the pane.
+        let (ow, oh) = if t.rot % 2 == 1 { (t.src.h, t.src.w) } else { (t.src.w, t.src.h) };
+        let (fw, fh) = crate::image::fit(ow, oh, pw as usize, ph as usize);
+        let dw = (fw as i64 * t.zoom as i64 / 100).max(1);
+        let dh = (fh as i64 * t.zoom as i64 / 100).max(1);
+        let maxx = (dw - pw).max(0) / 2 + pw / 4;
+        let maxy = (dh - ph).max(0) / 2 + ph / 4;
+        t.pan_x = t.pan_x.clamp(-maxx, maxx);
+        t.pan_y = t.pan_y.clamp(-maxy, maxy);
+    });
+    render_image();
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+#[allow(dead_code)]
+fn image_cmd(_c: u8) {}
 
 /// A background audio player: the decoded PCM plus a cursor. Lives in a static
 /// so playback continues while you switch tabs or run other commands — it is
@@ -4151,6 +4337,7 @@ struct AudioPlayer {
     name: String,
     total_ms: u64,
     done: bool,
+    paused: bool,
     finished_announced: bool,
 }
 #[cfg(not(feature = "server"))]
@@ -4190,10 +4377,19 @@ fn play_audio(path: &str) {
         serial_println!("open> no sound device — decoded OK but cannot play");
         return;
     }
-    serial_println!("open>   switch tabs freely, it keeps playing; Ctrl+C or /close stops");
+    serial_println!("open>   switch tabs freely, it keeps playing; Ctrl+Tab to focus then space=pause <-/->=seek 0=restart; Ctrl+C or /close stops");
     let name = path.rsplit('/').next().unwrap_or(path).to_string();
     AUDIO.with(|a| {
-        *a = Some(AudioPlayer { pcm: audio.pcm, rate: audio.rate, at: 0, name, total_ms, done: false, finished_announced: false })
+        *a = Some(AudioPlayer {
+            pcm: audio.pcm,
+            rate: audio.rate,
+            at: 0,
+            name,
+            total_ms,
+            done: false,
+            paused: false,
+            finished_announced: false,
+        })
     });
     #[cfg(not(test))]
     {
@@ -4216,6 +4412,52 @@ fn stop_audio() {
         serial_println!("\ropen> audio stopped");
     }
 }
+/// Headless build has no `/open` media player; the tab-close path still calls
+/// this generically, so provide a no-op.
+#[cfg(feature = "server")]
+fn stop_audio() {}
+
+/// Toggle play/pause on the background track (space key on the audio tab).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn audio_toggle_pause() {
+    AUDIO.with(|a| {
+        if let Some(p) = a.as_mut() {
+            p.paused = !p.paused;
+        }
+    });
+    repaint_audio();
+}
+
+/// Seek the background track by `delta_ms` (negative = rewind), clamped to the
+/// track. Takes effect after the device drains its already-queued ~200 ms.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn audio_seek(delta_ms: i64) {
+    AUDIO.with(|a| {
+        if let Some(p) = a.as_mut() {
+            let samples = delta_ms * p.rate as i64 / 1000;
+            let n = (p.at as i64 + samples).clamp(0, p.pcm.len() as i64) as usize;
+            p.at = n;
+            if p.at < p.pcm.len() {
+                p.done = false;
+                p.finished_announced = false;
+            }
+        }
+    });
+    repaint_audio();
+}
+
+/// Restart the background track from the beginning (0 / Home on the audio tab).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn audio_restart() {
+    AUDIO.with(|a| {
+        if let Some(p) = a.as_mut() {
+            p.at = 0;
+            p.done = false;
+            p.finished_announced = false;
+        }
+    });
+    repaint_audio();
+}
 
 /// Feed the next chunk to the sound device when it has drained the previous
 /// one — the background-player heartbeat, called every idle tick. Copies the
@@ -4228,6 +4470,9 @@ fn pump_audio() {
     }
     let next = AUDIO.with(|a| {
         let p = a.as_mut()?;
+        if p.paused {
+            return None; // hold position; the device drains its last chunk to silence
+        }
         if p.done || p.at >= p.pcm.len() {
             p.done = true;
             return None;
@@ -4266,7 +4511,8 @@ fn repaint_audio() {
                 pos_ms: pos_ms.min(p.total_ms),
                 total_ms: p.total_ms,
                 rate: p.rate,
-                playing: !p.done,
+                playing: !p.done && !p.paused,
+                paused: p.paused,
             });
         }
     });
