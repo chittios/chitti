@@ -143,6 +143,19 @@ def s_http_post(g):
     return ok, "POST body echoed" if ok else "body not echoed"
 
 
+def s_http_download(g):
+    """`/http -O` downloads a real PNG from the harness server into the store,
+    then `/open` decodes it back — network → store → image viewer roundtrip."""
+    m = g.mark()
+    g.send(f"/http -O http://{HOST}:{PLAIN_PORT}/logo.png")
+    if not g.wait_for("http> saved", 20, m) or not g.wait_for("/downloads/logo.png", 5, m):
+        return False, "download did not save"
+    m = g.mark()
+    g.send("/open /downloads/logo.png")
+    ok = g.wait_for("3x2 px", 15, m)
+    return ok, "downloaded PNG opened from the store" if ok else "saved file did not decode"
+
+
 def s_http_stream(g):
     m = g.mark()
     g.send(f"/http --stream http://{HOST}:{PLAIN_PORT}/sse")
@@ -526,7 +539,7 @@ def s_surface(g):
 
 OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [("open_media", s_open_media)]
 AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface)]
-NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_stream", s_http_stream), ("ws", s_ws), ("cancel", s_cancel)]
+NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("ws", s_ws), ("cancel", s_cancel)]
 
 # Known-flaky scenarios: timing-fragile, not code-buggy. The Doc web server's
 # reply is model-driven and prefill-bound (~10-15s for the ~530-token serve

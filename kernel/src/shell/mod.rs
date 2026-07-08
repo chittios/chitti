@@ -539,7 +539,7 @@ fn print_help() {
     serial_println!("  /session         show the current session; /session save | /session resume <id>");
     serial_println!("  /compact         compact the chat context (model-written summary, fresh KV)");
     serial_println!("  /model [..]      chat backend: local (embedded) | remote <http://host:port> [name]");
-    serial_println!("  /http [..] <url> curl-like: -X, -H, -d, -v, --stream (http:// + https://)");
+    serial_println!("  /http [..] <url> curl-like: -X, -H, -d, -v, --stream; -O/-o downloads to /downloads/");
     serial_println!("  /ws <url> [msg]  WebSocket (ws:// or wss://): connect, send, stream frames");
     serial_println!("  /skills          list installed skills (L0 metadata)");
     serial_println!("  /clear           reset the chat context + clear the pane (incl. scrollback)");
@@ -2352,13 +2352,17 @@ struct HttpArgs {
     body: String,
     verbose: bool,
     stream: bool,
+    /// `-O`: save the body to a file named after the URL's basename.
+    save_auto: bool,
+    /// `-o <file>`: save the body to this file (relative → `/downloads/`).
+    save_path: Option<String>,
     err: Option<String>,
 }
 
 /// Parse curl-like flags: `-X <method>`, `-H "K: V"` (repeatable), `-d <body>`
-/// / `--data <body>`, `-v`/`--verbose`, `-N`/`--stream`. First bare token is
-/// the URL. Method defaults to GET, or POST when a body is given. Pure +
-/// unit-tested.
+/// / `--data <body>`, `-v`/`--verbose`, `-N`/`--stream`, `-O` / `-o <file>`
+/// (download to the store). First bare token is the URL. Method defaults to
+/// GET, or POST when a body is given. Pure + unit-tested.
 fn parse_http_args(tokens: &[String]) -> HttpArgs {
     let mut a = HttpArgs {
         method: String::new(),
@@ -2367,6 +2371,8 @@ fn parse_http_args(tokens: &[String]) -> HttpArgs {
         body: String::new(),
         verbose: false,
         stream: false,
+        save_auto: false,
+        save_path: None,
         err: None,
     };
     // Fetch the value token after a flag at index `i`; records an error and
@@ -2407,6 +2413,12 @@ fn parse_http_args(tokens: &[String]) -> HttpArgs {
             "-v" | "--verbose" => a.verbose = true,
             "-N" | "--stream" => a.stream = true,
             "-I" | "--head" => a.method = "HEAD".to_string(),
+            "-O" | "--remote-name" => a.save_auto = true,
+            "-o" | "--output" => {
+                if let Some(p) = value(tokens, &mut i, "-o", &mut a.err) {
+                    a.save_path = Some(p);
+                }
+            }
             t if t.starts_with('-') => a.err = Some(alloc::format!("unknown flag '{t}'")),
             t if a.url.is_empty() => a.url = t.to_string(),
             _ => {} // extra positional args ignored
@@ -2419,16 +2431,30 @@ fn parse_http_args(tokens: &[String]) -> HttpArgs {
     a
 }
 
+/// The filename part of a URL's path, query/fragment stripped — what
+/// `curl -O` names a download. `None` when the URL has no path component or
+/// it ends in `/`. Pure + unit-tested.
+fn url_basename(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let path = after_scheme.split(['?', '#']).next().unwrap_or("");
+    if !path.contains('/') {
+        return None; // host only — no path to take a name from
+    }
+    let base = path.rsplit('/').next().unwrap_or("");
+    (!base.is_empty()).then_some(base)
+}
+
 /// `/http` — a curl-like HTTP client (also the agent's `http` tool): any
 /// method, custom headers, a request body, verbose head dump, and live
 /// streaming of chunked/SSE responses. http:// and https:// (TLS 1.3).
 fn run_http(arg: &str) {
     let tokens = tokenize_args(arg);
     if tokens.is_empty() {
-        serial_println!("usage: /http [-X METHOD] [-H \"K: V\"]... [-d BODY] [-v] [--stream] <url>");
+        serial_println!("usage: /http [-X METHOD] [-H \"K: V\"]... [-d BODY] [-v] [--stream] [-O | -o FILE] <url>");
         serial_println!("  e.g. /http https://host/v1/models");
         serial_println!("       /http -X POST -H \"Content-Type: application/json\" -d '{{\"n\":1}}' http://host/api");
         serial_println!("       /http --stream -H \"Accept: text/event-stream\" http://host/sse   (live)");
+        serial_println!("       /http -O https://host/pic.png     download to /downloads/pic.png (then /open it)");
         serial_println!("  needs /network up; https uses in-kernel TLS (server certs are NOT verified)");
         return;
     }
@@ -2440,6 +2466,32 @@ fn run_http(arg: &str) {
     if a.url.is_empty() {
         serial_println!("http> no URL given");
         return;
+    }
+    // Download destination (`-O` / `-o`): a Synapse-store path — durable on an
+    // ext4 data partition, in-memory otherwise — readable back via /open (text
+    // in the editor, images in the viewer, wav/mp3 in the player). This is the
+    // interactive shell (human-typed); agents get HTTP through the Synapse net
+    // primitives, never this writer.
+    let save_dest: Option<String> = if let Some(p) = a.save_path.clone() {
+        Some(if p.starts_with('/') { p } else { alloc::format!("/downloads/{}", p) })
+    } else if a.save_auto {
+        match url_basename(&a.url) {
+            Some(b) => Some(alloc::format!("/downloads/{}", b)),
+            None => {
+                serial_println!("http> -O: the URL has no filename to use — pass -o <name>");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(dest) = &save_dest {
+        if crate::synapse::fs::exists(dest)
+            && !crate::modal::confirm("Overwrite file?", &alloc::format!("{} already exists in the store.\nReplace it with this download?", dest))
+        {
+            serial_println!("http> download cancelled ({} kept)", dest);
+            return;
+        }
     }
     let hdrs: alloc::vec::Vec<(&str, &str)> = a.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     // Verbose: print the request line + headers before sending.
@@ -2458,22 +2510,45 @@ fn run_http(arg: &str) {
             }
         }
     };
-    // Streaming: print body bytes live as UTF-8. Buffered: collect + cap.
+    // Streaming: print body bytes live as UTF-8. Downloading: collect it all
+    // (progress once a second). Buffered: collect + cap for terminal print.
     const CAP: usize = 8192;
+    const DL_MAX: usize = 128 << 20; // download heap guard
     let mut collected: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    let stream = a.stream;
+    let stream = a.stream && save_dest.is_none();
+    let saving = save_dest.is_some();
+    let mut dl_last_ms = 0u64;
     let mut on_body = |chunk: &[u8]| {
         if stream {
             serial_print!("{}", core::str::from_utf8(chunk).unwrap_or("<binary>"));
+        } else if saving {
+            if collected.len() < DL_MAX {
+                collected.extend_from_slice(chunk);
+            }
+            let now = crate::arch::now_ms();
+            if now.saturating_sub(dl_last_ms) >= 1000 {
+                dl_last_ms = now;
+                emit(&alloc::format!("\r  {} KiB\u{2026} ", collected.len() / 1024));
+            }
         } else if collected.len() < CAP {
             collected.extend_from_slice(chunk);
         }
     };
-    // A streamed response (SSE) can run long; give it a generous budget.
-    let timeout = if a.stream { 300_000 } else { 60_000 };
+    // A streamed response (SSE) or a big download can run long.
+    let timeout = if a.stream || saving { 300_000 } else { 60_000 };
     match crate::net::http::perform(&a.method, &a.url, &hdrs, a.body.as_bytes(), timeout, &mut on_head, &mut on_body) {
         Ok(head) => {
-            if a.stream {
+            if let Some(dest) = save_dest {
+                if !(200..300).contains(&head.status) {
+                    serial_println!("\rhttp> {} — not saved (non-2xx response)", head.status);
+                } else if collected.len() >= DL_MAX {
+                    serial_println!("\rhttp> body exceeds the {} MiB download cap — not saved", DL_MAX >> 20);
+                } else {
+                    crate::synapse::fs::write(&dest, &collected);
+                    serial_println!("\rhttp> saved {} bytes to {} ({})", collected.len(), dest, head.status);
+                    serial_println!("http>   read it back with /open {} (editor / image viewer / audio player)", dest);
+                }
+            } else if a.stream {
                 serial_println!("");
                 serial_println!("http> {} (streamed)", head.status);
             } else {
@@ -4670,6 +4745,26 @@ mod agent_flow_tests {
         // -I is HEAD; a bad header is reported.
         assert_eq!(parse_http_args(&tokenize_args("-I http://h")).method, "HEAD");
         assert!(parse_http_args(&tokenize_args("-H nocolon http://h")).err.is_some());
+    }
+
+    #[test_case]
+    fn http_args_download_flags() {
+        let a = parse_http_args(&tokenize_args("-O http://h/dir/pic.png"));
+        assert!(a.save_auto && a.save_path.is_none() && a.err.is_none());
+        let a = parse_http_args(&tokenize_args("-o out.bin http://h/x"));
+        assert_eq!(a.save_path.as_deref(), Some("out.bin"));
+        assert!(!a.save_auto);
+        assert!(parse_http_args(&tokenize_args("http://h/x -o")).err.is_some(), "-o needs a value");
+    }
+
+    #[test_case]
+    fn url_basename_extraction() {
+        assert_eq!(url_basename("http://h:8080/a/b/pic.png?x=1#f"), Some("pic.png"));
+        assert_eq!(url_basename("https://h/file.tar.gz"), Some("file.tar.gz"));
+        assert_eq!(url_basename("http://host"), None, "no path at all");
+        assert_eq!(url_basename("http://host/"), None, "trailing slash");
+        assert_eq!(url_basename("http://host/a/"), None);
+        assert_eq!(url_basename("host/plain.txt"), Some("plain.txt"), "schemeless");
     }
 
     #[test_case]
