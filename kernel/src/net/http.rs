@@ -160,6 +160,11 @@ pub fn perform(
     if !has("accept") {
         req.push_str("Accept: */*\r\n");
     }
+    if !has("user-agent") {
+        // Many hosts (e.g. upload.wikimedia.org) reject requests with no
+        // User-Agent — a descriptive default gets a 200 instead of a 403.
+        req.push_str(&format!("User-Agent: Chitti-OS/{} (https://github.com/chitti-os)\r\n", crate::VERSION));
+    }
     for (k, v) in headers {
         req.push_str(&format!("{k}: {v}\r\n"));
     }

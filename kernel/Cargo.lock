@@ -313,8 +313,6 @@ dependencies = [
 [[package]]
 name = "embedded-tls"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6efb76fdd004a4ef787640177237b83449e6c5847765ea50bf15900061fd601"
 dependencies = [
  "aes-gcm",
  "atomic-polyfill",

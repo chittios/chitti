@@ -72,3 +72,21 @@ copyright and related and neighboring rights to this software to the
 public domain worldwide. This software is distributed without any
 warranty. See <http://creativecommons.org/publicdomain/zero/1.0/>.
 ```
+
+---
+
+## embedded-tls — `third_party/embedded-tls/`
+
+The `https://` client ([`net/tls.rs`](kernel/src/net/tls.rs)) is built on
+[embedded-tls](https://github.com/drogue-iot/embedded-tls) (a `no_std` TLS 1.3
+client). It is **vendored in-tree** (upstream 0.17.0) rather than pulled from
+crates.io so its handshake parser can be patched for real-world CDN
+compatibility — modern servers (e.g. `upload.wikimedia.org`) advertise
+post-quantum hybrid key-exchange groups (X25519MLKEM768) in their
+EncryptedExtensions `supported_groups`, which the stock crate's `NamedGroup`
+enum rejects, aborting the handshake over an informational field. The in-tree
+copy parses that (and a few over-tight extension vectors) leniently. Its
+dependencies (heapless, p256, aes-gcm, sha2, rand_core, …) still resolve from
+crates.io.
+
+Licensed under **Apache-2.0** (see `third_party/embedded-tls/LICENSE`).
