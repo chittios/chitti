@@ -111,6 +111,10 @@ struct Kbd {
     report_pa: u64,    // 8-byte HID boot report buffer
     report_va: usize,
     prev: [u8; 8],     // last report, to detect newly-pressed keys
+    // USB HID boot keyboards report only press/release edges, so a held key
+    // would never repeat; synthesize accelerating typematic in software.
+    rep: crate::keyrepeat::Typematic,
+    rep_usage: u8, // the held usage the typematic is armed for (0 = none)
 }
 
 /// A configured HID pointer (USB tablet or mouse). The absolute-tablet report
@@ -793,6 +797,7 @@ impl Xhci {
         let mut kbd = Kbd {
             slot: c.slot, int_dci, int_ring_va: int_va, int_ring_pa: int_pa,
             int_enqueue: 0, int_cycle: 1, report_pa, report_va, prev: [0; 8],
+            rep: crate::keyrepeat::Typematic::new(), rep_usage: 0,
         };
         unsafe { self.queue_interrupt(&mut kbd) };
         crate::ktrace::log_fmt(format_args!("xhci: HID keyboard ready (slot {}, ep {ep_addr:#x}, dci {int_dci})", c.slot));
@@ -946,7 +951,9 @@ impl Xhci {
                                 // serial terminal sends, so the shell/editor
                                 // decode one encoding for every input path.
                                 // Ctrl+Tab = pane-focus toggle (`ESC [ T`).
-                                if let Some(seq) = match usage {
+                                let mut seq = [0u8; crate::keyrepeat::SEQ_MAX];
+                                let mut n = 0usize;
+                                if let Some(s) = match usage {
                                     0x52 => Some(&b"[A"[..]),  // Up
                                     0x51 => Some(&b"[B"[..]),  // Down
                                     0x4f => Some(&b"[C"[..]),  // Right
@@ -959,14 +966,30 @@ impl Xhci {
                                     0x2b if ctrl => Some(&b"[T"[..]), // Ctrl+Tab
                                     _ => None,
                                 } {
-                                    self.key_push(0x1b);
-                                    for &b in seq {
-                                        self.key_push(b);
+                                    seq[0] = 0x1b;
+                                    n = 1;
+                                    for &b in s.iter().take(seq.len() - 1) {
+                                        seq[n] = b;
+                                        n += 1;
                                     }
                                 } else if let Some(a) = hid_to_ascii(usage, shift, ctrl) {
-                                    self.key_push(a);
+                                    seq[0] = a;
+                                    n = 1;
+                                }
+                                for &b in &seq[..n] {
+                                    self.key_push(b);
+                                }
+                                // Arm software typematic for the newest press.
+                                if n > 0 {
+                                    k.rep.press(&seq[..n], crate::arch::now_ms());
+                                    k.rep_usage = usage;
                                 }
                             }
+                        }
+                        // The armed key was released: stop repeating it.
+                        if k.rep_usage != 0 && !report[2..8].contains(&k.rep_usage) {
+                            k.rep.release();
+                            k.rep_usage = 0;
                         }
                         k.prev = report;
                         self.queue_interrupt(k);
@@ -1027,8 +1050,17 @@ impl Xhci {
     }
 
     /// The next decoded keyboard byte, if any (drains + routes events first).
+    /// Also where held-key repeats are synthesized: USB HID reports only
+    /// press/release edges, so the armed [`crate::keyrepeat::Typematic`]
+    /// re-emits the held key's bytes at an accelerating rate.
     pub fn poll_key(&mut self) -> Option<u8> {
         self.pump_events();
+        let rep = self.kbd.as_mut().and_then(|k| k.rep.poll(crate::arch::now_ms()));
+        if let Some((seq, n)) = rep {
+            for &b in &seq[..n] {
+                self.key_push(b);
+            }
+        }
         if self.key_head == self.key_tail {
             None
         } else {

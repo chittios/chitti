@@ -266,11 +266,22 @@ real UEFI hardware.
 - **Microkernel** — tasks + context switch, cooperative + timer-preemptive
   scheduler, unforgeable capabilities, IPC, SMP, frame allocator + heap, MMU.
 - **UI** — a tmux-style split-pane framebuffer compositor in Geist Mono (chat
-  pane + an on-demand "action" pane hosting the ktrace stream or a vim-like
-  editor), a boot splash + status-bar **Synapse-C** brand mark, a live clock, a
-  blinking caret, mouse cursor + click, copy/paste, ANSI-coloured agent output, a
-  `/`-command shell, and an on-disk UI config (`/configs/core/ui.json`,
-  `shortcuts.json`). The brand — logo, the terracotta `#cc785c` / warm-ink /
+  pane + an on-demand "action" pane hosting the ktrace stream, a vim-like
+  editor, or the **image viewer**: `/open <path>.png|.jpg` decodes in-kernel —
+  `image/` is a pure no_std PNG+DEFLATE and baseline-JPEG decoder set, unit-
+  tested against real fixture files — then presents box-downscaled +
+  letterboxed), a boot splash + status-bar **Synapse-C** brand mark, a live
+  clock, a blinking caret, mouse cursor + click, **mouse text selection in the
+  chat pane** (drag-to-copy → clipboard, paste with Ctrl+V; absolute-indexed
+  over scrollback via `textsel`, like the editor's drag-select), **key
+  auto-repeat** (`keyrepeat`: software typematic in `xhci` — USB HID boot
+  keyboards report only press edges — plus an accelerating streak amplifier:
+  held Backspace/arrows erase/scroll 2/4/8 steps per repeat in the shell and
+  editor), **syntax highlighting** (`highlight`: JSON/Markdown/Rust/Python/C/
+  JS/TOML/sh lexers colour the editor per-cell, `/cat` output, and the chat's
+  streamed markdown — fence-tagged code blocks are lexed per language without
+  breaking token streaming), ANSI-coloured agent output, a `/`-command shell,
+  and an on-disk UI config (`/configs/core/ui.json`, `shortcuts.json`). The brand — logo, the terracotta `#cc785c` / warm-ink /
   cream palette (fully re-themable from `ui.json`), and typography — is specified
   in [DESIGN.md](DESIGN.md); honour it for any UI change. NB: the scheduler is
   cooperative, so **any long or blocking operation must pump the UI itself** —
@@ -343,7 +354,14 @@ the next command still runs) and a unit test on the pure poll logic
 - **Sound & voice** (`sound/`, `onnx/`) — virtio-snd PCM in/out (S16 mono,
   poll-driven, descriptor chains) over virtio-mmio (aarch64) and virtio-PCI
   (x86 QEMU), **Intel HDA** for VirtualBox (x86+ARM) and real hardware, plus **AC'97** and **Sound Blaster 16** (x86 legacy; SB16 needs a <16 MiB ISA-DMA buffer, not yet reserved at boot); `/voice` (waveform modal, level-gated utterances) and `/voice test`
-  (tone + mic check). `onnx/` is a zero-copy no_std ONNX (protobuf) reader +
+  (tone + mic check). **`audio/`** is the pure media-decoder layer behind the
+  `/open <file>.wav|.mp3` **player**: a full RIFF/WAVE parser (PCM
+  8/16/24/32-bit + float32, any channel count downmixed) and an MPEG Layer III
+  decoder — a no_std Rust **port of minimp3** (CC0; tables generated verbatim
+  by `tools/gen_mp3_tables.py`), validated ±1 LSB against minimp3's own scalar
+  decode (stereo MS/short-blocks, MPEG-2 LSF, bit reservoir). Playback feeds
+  the device in ~50 ms chunks — queue backpressure paces it — pumping
+  `upkeep()` and answering Ctrl+C between chunks. `onnx/` is a zero-copy no_std ONNX (protobuf) reader +
   **op interpreter** that runs the real voice models end-to-end: silero-vad v5
   (VAD), parakeet-ctc int8 (STT — `/voice stt <wav>` transcribes), and
   KittenTTS (TTS — `/voice say <text>` speaks); bare `/voice` is the full

@@ -52,3 +52,23 @@ assembly, so they build under the kernel's custom `build-std` targets).
 
 Full license texts ship in each crate's source under
 `~/.cargo/registry/` and in the respective upstream repositories.
+
+---
+
+## minimp3 (Rust port) — `kernel/src/audio/mp3.rs`
+
+The `/open <file>.mp3` player's MPEG Layer III decoder is a hand-written
+`no_std` Rust **port** of [minimp3](https://github.com/lieff/minimp3)
+(scalar path, Layer III only); its numeric tables are generated verbatim from
+`minimp3.h` by [`tools/gen_mp3_tables.py`](tools/gen_mp3_tables.py) into
+[`kernel/src/audio/mp3_tables.rs`](kernel/src/audio/mp3_tables.rs). The port
+is validated sample-for-sample (±1 LSB) against minimp3's own scalar decode.
+
+minimp3 is dedicated to the public domain under **CC0 1.0**:
+
+```
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty. See <http://creativecommons.org/publicdomain/zero/1.0/>.
+```

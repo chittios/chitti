@@ -21,6 +21,7 @@ pub const BUILD_TIME: &str = env!("CHITTI_BUILD_TIME");
 pub mod acpi;
 pub mod agent;
 pub mod arch;
+pub mod audio;
 pub mod block;
 pub mod cap;
 pub mod channel;
@@ -32,7 +33,10 @@ pub mod console;
 pub mod cortex;
 pub mod fs;
 pub mod ipc;
+pub mod highlight;
+pub mod image;
 pub mod json;
+pub mod keyrepeat;
 pub mod ktrace;
 pub mod limine_protocol;
 pub mod mm;
@@ -56,6 +60,7 @@ pub mod ui_config;
 #[cfg(target_arch = "x86_64")]
 pub mod smp;
 pub mod synapse;
+pub mod textsel;
 pub mod xhci;
 
 // The framebuffer compositor and its Geist Mono glyph atlas are not built into

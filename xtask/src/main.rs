@@ -518,8 +518,13 @@ hdiutil detach "$DEV" > /dev/null
 /// Build a small FAT "voice disk" holding the voice models (`kitten.onnx`,
 /// `parakeet.onnx`) so `cargo xtask run` can attach them as an extra virtio-blk
 /// disk — the kernel's `find_on_disks` scans it and auto-loads them. Returns
-/// `None` if no voice assets are present. Cached; rebuilt when the models change.
+/// `None` if no voice assets are present, or if `CHITTI_VOICE_DISK=off`
+/// (QEMU write-locks the image, so a second concurrent guest — an e2e
+/// scenario booting its own — must skip it or fail to launch).
 fn build_voice_disk() -> Option<PathBuf> {
+    if env::var("CHITTI_VOICE_DISK").map(|v| v.trim() == "off").unwrap_or(false) {
+        return None;
+    }
     let voice: Vec<(String, PathBuf)> = voice_model_assets().into_iter().filter(|(_, p)| p.exists()).map(|(n, p)| (n.to_string(), p)).collect();
     if voice.is_empty() {
         return None;
@@ -566,41 +571,56 @@ hdiutil detach "$DEV" > /dev/null
     Some(img)
 }
 
-/// Build a small FAT "model disk" holding `gguf` as `chat.gguf`, for the
-/// `/model load` runtime-loading path (opt-in via `CHITTI_MODEL_DISK=<path>`;
-/// the e2e model_load scenario uses it). Cached; rebuilt when the source
-/// changes. FAT32 caps a file at 4 GiB — larger models must be loaded from an
+/// Build a small FAT "model disk" holding the given files — a `.gguf` source
+/// lands as `chat.gguf` (the `/model load` runtime-loading path; the e2e
+/// model_load scenario), any other file keeps its own name (the e2e `/open`
+/// image/audio scenario ships media this way). Opt-in via
+/// `CHITTI_MODEL_DISK=<path>[:<path>...]`. Cached; rebuilt when the sources
+/// change. FAT32 caps a file at 4 GiB — larger models must be loaded from an
 /// ext4 data disk instead.
-fn build_model_disk(gguf: &Path) -> Result<PathBuf, String> {
-    let size = fs::metadata(gguf).map_err(|e| format!("CHITTI_MODEL_DISK {}: {e}", gguf.display()))?.len();
-    if size >= 4 * (1u64 << 30) {
-        return Err("CHITTI_MODEL_DISK: FAT32 caps a file at 4 GiB; use an ext4 data disk for larger models".into());
+fn build_model_disk(files: &[PathBuf]) -> Result<PathBuf, String> {
+    let mut total = 0u64;
+    let mut copies: Vec<(PathBuf, String)> = Vec::new();
+    for f in files {
+        let size = fs::metadata(f).map_err(|e| format!("CHITTI_MODEL_DISK {}: {e}", f.display()))?.len();
+        if size >= 4 * (1u64 << 30) {
+            return Err("CHITTI_MODEL_DISK: FAT32 caps a file at 4 GiB; use an ext4 data disk for larger models".into());
+        }
+        total += size;
+        let is_gguf = f.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("gguf")).unwrap_or(false);
+        let dest = if is_gguf {
+            "chat.gguf".to_string()
+        } else {
+            f.file_name().and_then(|n| n.to_str()).unwrap_or("file.bin").to_string()
+        };
+        copies.push((f.clone(), dest));
     }
     let img = repo_root().join("target/chitti-model-disk.img");
-    let want = format!("{}:{size}", gguf.display());
+    let want = copies.iter().map(|(p, d)| format!("{}>{d}", p.display())).collect::<Vec<_>>().join(":") + &format!(":{total}");
     let meta = repo_root().join("target/chitti-model-disk.meta");
     if img.exists() && fs::read_to_string(&meta).map(|s| s.trim() == want).unwrap_or(false) {
         return Ok(img);
     }
-    let size_mb = 64 + size / (1024 * 1024) + 32;
+    let size_mb = 64 + total / (1024 * 1024) + 32;
     let f = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&img).map_err(|e| e.to_string())?;
     f.set_len(size_mb * 1024 * 1024).map_err(|e| e.to_string())?;
     drop(f);
     if cfg!(target_os = "linux") {
-        populate_fat_linux(&img, "MODEL", &[], &[(gguf.to_path_buf(), "::/chat.gguf".into())])?;
+        let cps: Vec<(PathBuf, String)> = copies.iter().map(|(p, d)| (p.clone(), format!("::/{d}"))).collect();
+        populate_fat_linux(&img, "MODEL", &[], &cps)?;
     } else {
+        let cps = copies.iter().map(|(p, d)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), d)).collect::<Vec<_>>().join("\n");
         let script = format!(
             r#"set -e
 DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "{img}" | head -1 | awk '{{print $1}}')
 newfs_msdos -F 32 -v MODEL "$DEV" > /dev/null
 diskutil mount "$DEV" > /dev/null
 MNT=$(diskutil info "$DEV" | awk -F': *' '/Mount Point/{{print $2}}')
-cp "{gguf}" "$MNT/chat.gguf"
+{cps}
 diskutil unmount "$DEV" > /dev/null
 hdiutil detach "$DEV" > /dev/null
 "#,
             img = img.display(),
-            gguf = gguf.display(),
         );
         let ok = Command::new("/bin/sh").arg("-c").arg(&script).status().map(|s| s.success()).unwrap_or(false);
         if !ok {
@@ -608,14 +628,19 @@ hdiutil detach "$DEV" > /dev/null
         }
     }
     let _ = fs::write(&meta, &want);
-    eprintln!("  model disk: {} ({} MiB, chat.gguf for /model load)", img.display(), size_mb);
+    let names = copies.iter().map(|(_, d)| d.as_str()).collect::<Vec<_>>().join(", ");
+    eprintln!("  model disk: {} ({} MiB, {names})", img.display(), size_mb);
     Ok(img)
 }
 
-/// The `CHITTI_MODEL_DISK` FAT disk, if requested via the environment.
+/// The `CHITTI_MODEL_DISK` FAT disk, if requested via the environment
+/// (colon-separated paths land on one disk).
 fn model_disk_from_env() -> Result<Option<PathBuf>, String> {
     match env::var("CHITTI_MODEL_DISK") {
-        Ok(p) if !p.trim().is_empty() => Ok(Some(build_model_disk(Path::new(p.trim()))?)),
+        Ok(p) if !p.trim().is_empty() => {
+            let files: Vec<PathBuf> = p.split(':').map(|s| PathBuf::from(s.trim())).filter(|s| s.as_os_str().len() > 0).collect();
+            Ok(Some(build_model_disk(&files)?))
+        }
         _ => Ok(None),
     }
 }
