@@ -20,16 +20,6 @@ enum Mode {
     Visual,
 }
 
-/// Byte-at-a-time ANSI escape decode state — replaces the old blocking
-/// `seq_byte()` spin so the editor can be driven one fed byte at a time (it is
-/// a background tab now, not a blocking modal loop).
-#[derive(PartialEq, Clone, Copy)]
-enum Esc {
-    Ground,
-    Esc,
-    Csi(u64),
-}
-
 struct Editor {
     path: String,
     lines: Vec<String>,
@@ -45,7 +35,6 @@ struct Editor {
     pending: u8, // pending operator: b'd', b'g', b'y', or 0
     sel_anchor: Option<(usize, usize)>, // (row, col) where Visual selection began
     rows: usize,
-    esc: Esc,
     accel: crate::keyrepeat::Accel,
 }
 
@@ -90,7 +79,6 @@ pub fn open(path: &str) {
         pending: 0,
         sel_anchor: None,
         rows,
-        esc: Esc::Ground,
         accel: crate::keyrepeat::Accel::new(),
     };
     EDITOR.with(|e| *e = Some(ed));
@@ -198,42 +186,14 @@ impl Editor {
         }
     }
 
-    /// One fed byte through the ANSI-escape accumulator. Mirrors the old
-    /// blocking loop: bare Esc → Normal; `ESC [ … <final>` → `nav`; anything
-    /// else → `handle`, with held Backspace/arrows accelerated.
+    /// One decoded key byte. The shell's line loop already coalesces ANSI escape
+    /// sequences (it forwards arrows via [`nav_seq`] and a **bare Esc as `0x1b`**),
+    /// so the editor just dispatches the byte through `handle` — no escape
+    /// accumulator here. Held Backspace accelerates.
     fn feed(&mut self, b: u8) {
-        match self.esc {
-            Esc::Ground => {
-                if b == 0x1b {
-                    self.esc = Esc::Esc;
-                } else {
-                    let n = if b == 0x7f || b == 0x08 { self.accel.steps(0x08, crate::arch::now_ms()) } else { 1 };
-                    for _ in 0..n {
-                        self.handle(b);
-                    }
-                }
-            }
-            Esc::Esc => {
-                if b == b'[' {
-                    self.esc = Esc::Csi(0);
-                } else {
-                    // A bare Esc keypress, then reprocess this byte in Ground.
-                    self.handle(0x1b);
-                    self.esc = Esc::Ground;
-                    self.feed(b);
-                }
-            }
-            Esc::Csi(param) => match b {
-                b'0'..=b'9' => self.esc = Esc::Csi(param.saturating_mul(10) + (b - b'0') as u64),
-                0x40..=0x7e => {
-                    self.esc = Esc::Ground;
-                    let n = if matches!(b, b'A' | b'B') { self.accel.steps(b, crate::arch::now_ms()) } else { 1 };
-                    for _ in 0..n {
-                        self.nav(b, param);
-                    }
-                }
-                _ => {} // intermediate byte: ignore, stay in CSI
-            },
+        let n = if b == 0x7f || b == 0x08 { self.accel.steps(0x08, crate::arch::now_ms()) } else { 1 };
+        for _ in 0..n {
+            self.handle(b);
         }
     }
 
