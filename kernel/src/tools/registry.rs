@@ -33,6 +33,26 @@ pub enum ToolBinding {
     /// datetime, install, …) and return its printed output. `destructive`
     /// commands are taint-gated at dispatch, like a `DELETE`.
     Shell { command: String, destructive: bool },
+    /// Call a tool on a connected MCP server (JSON-RPC `tools/call` over HTTP).
+    /// Registered dynamically by `/mcp connect`; the model calls it like any
+    /// other tool and the arguments are forwarded verbatim as the JSON-RPC
+    /// `arguments` object. `server` is the local connection name.
+    Mcp { server: String, tool: String },
+}
+
+impl ToolDef {
+    /// A tool bound to a connected MCP server tool. `name` is the namespaced
+    /// registry name (`mcp__<server>__<tool>`); `server`/`tool` identify the
+    /// remote. `schema` is the server-provided JSON input schema.
+    pub fn mcp(name: &str, description: &str, schema: &str, server: &str, tool: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            description: description.to_string(),
+            input_schema: schema.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::Mcp { server: server.to_string(), tool: tool.to_string() },
+        }
+    }
 }
 
 /// An agent-facing tool definition (MCP shape).
@@ -238,6 +258,22 @@ pub fn register(def: ToolDef) {
         crate::ktrace::log_fmt(format_args!("tools.register: provider tool '{}'", def.name));
         reg.push(def);
     });
+}
+
+/// Register or replace a tool by name — for dynamic sources (MCP servers) that
+/// re-connect and refresh their tool set. Unlike [`register`], it overwrites an
+/// existing entry of the same name.
+pub fn register_replace(def: ToolDef) {
+    with_registry(|reg| {
+        reg.retain(|t| t.name != def.name);
+        reg.push(def);
+    });
+}
+
+/// Remove a tool by name (e.g. `/mcp disconnect` dropping a server's tools).
+/// No-op if absent.
+pub fn deregister(name: &str) {
+    with_registry(|reg| reg.retain(|t| t.name != name));
 }
 
 /// Look up a tool by name (clones the def — small, and avoids holding the lock).

@@ -225,7 +225,14 @@ fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> Str
             format!("ok:wrote {} bytes to {path}", text.len())
         }
         registry::LIST => {
-            let paths = fs::list();
+            // Scope-filtered: a task constrained to a home path (an installed
+            // agent) sees only paths it may read, so `list` can't enumerate the
+            // whole store. `scope_target` returns None for LIST (no single
+            // target), so the confinement is applied here, per result.
+            let paths: alloc::vec::Vec<String> = fs::list()
+                .into_iter()
+                .filter(|p| cap::scope_check(caller, CapDomain::Fs, Rights::READ, &Scope::Path(p.clone())))
+                .collect();
             format!("ok:[{}]", paths.join(","))
         }
         registry::SPAWN_AGENT => {
@@ -277,9 +284,14 @@ fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> Str
             }
         }
         registry::MEM_FS_SEARCH => {
+            // Content search, confined to the caller's readable scope (same
+            // gate as LIST): an installed agent searches only its own home.
             let query = arg_str(args, 0);
             let mut hits: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
             for path in fs::list() {
+                if !cap::scope_check(caller, CapDomain::Fs, Rights::READ, &Scope::Path(path.clone())) {
+                    continue;
+                }
                 if let Some(bytes) = fs::read(&path) {
                     if String::from_utf8_lossy(&bytes).contains(query) {
                         hits.push(path);

@@ -145,6 +145,16 @@ impl ToolDispatch for Router {
                 let out = crate::shell::run_tool_command(command, &arg);
                 ToolOutcome::ok(out, Provenance::UntrustedIngested)
             }
+            ToolBinding::Mcp { server, tool } => {
+                // Forward to the connected MCP server. The whole `arguments`
+                // object is passed through as JSON. The result is external
+                // content, so it enters context as UntrustedIngested (taint
+                // gate applies to anything it later justifies).
+                match crate::mcp::call(server, tool, &call.args) {
+                    Ok(text) => ToolOutcome::ok(text, Provenance::UntrustedIngested),
+                    Err(e) => ToolOutcome::error(e),
+                }
+            }
         }
     }
 }

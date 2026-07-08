@@ -280,6 +280,21 @@ pub struct AgentManifest {
     pub budgets: Budgets,
     pub summary: SummaryPolicy, // how a sub-agent condenses its result on return
     pub origin: Origin,         // where this manifest came from (trust)
+    /// MCP servers this agent declares. Shown on the install consent screen;
+    /// each approved one is connected at install and its tools registered for
+    /// the agent (namespaced `mcp__<name>__<tool>`). `#[serde(default)]` keeps
+    /// older signed manifests (without the field) loadable.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerSpec>,
+}
+
+/// An MCP server an agent wants connected at install time.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct McpServerSpec {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub bearer: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]

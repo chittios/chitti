@@ -173,7 +173,15 @@ real UEFI hardware.
   procedures) + a manifest (toolset = permissions, `capabilities`, optional ONNX
   assets) + a signature; installed via `/agents install <name> [--yes]`
   (consent modal → grant only the approved subset → `place_agent_home` lands the
-  SOUL/docs in `/agent/<id>/`). A **public registry** (`skills/registry_client.rs`)
+  SOUL/docs in `/agent/<id>/`). **Per-agent filesystem sandbox:** every
+  non-orchestrator agent is confined to its own `/agent/<id>/` folder — the
+  install grants a baseline `Fs @ /agent/<id>/**` cap (`skills::install::
+  with_home_sandbox`) and nothing wider unless the manifest explicitly requests
+  a broader `Fs` scope, which the consent screen flags as "FULL filesystem
+  access". Enforcement is the executor's scope gate (Gate 2.5); `list`/`search`
+  are result-filtered by that same gate so a confined agent can't even
+  enumerate paths outside its home. The shell agent (orchestrator) is the root
+  and keeps `Scope::Any`. A **public registry** (`skills/registry_client.rs`)
   fetches a signed index over HTTP(S) — `/agents search <url> [q]`,
   `/agents install <name> --registry <url>`; registry packages authenticate with
   **ECDSA P-256** (`skills::crypto::verify_p256`, RustCrypto `p256`/`sha2`,
@@ -266,11 +274,18 @@ real UEFI hardware.
 - **Microkernel** — tasks + context switch, cooperative + timer-preemptive
   scheduler, unforgeable capabilities, IPC, SMP, frame allocator + heap, MMU.
 - **UI** — a tmux-style split-pane framebuffer compositor in Geist Mono (chat
-  pane + an on-demand "action" pane hosting the ktrace stream, a vim-like
-  editor, or the **image viewer**: `/open <path>.png|.jpg` decodes in-kernel —
-  `image/` is a pure no_std PNG+DEFLATE and baseline-JPEG decoder set, unit-
-  tested against real fixture files — then presents box-downscaled +
-  letterboxed), a boot splash + status-bar **Synapse-C** brand mark, a live
+  pane + an on-demand **tabbed "action" pane**: opening the ktrace stream, the
+  `/top` dashboard, a vim-like editor, an **image viewer** (`/open .png|.jpg`),
+  or the **audio player** (`/open .wav|.mp3`) each adds a tab; a tab bar in the
+  pane header switches them (Ctrl+Tab / Shift+Tab / click), and every tab keeps
+  its process alive when you switch away — the audio player keeps playing
+  (pumped chunk-by-chunk from `ui_tick`, not a blocking loop), ktrace keeps
+  streaming, the editor keeps its buffer. The editor is non-blocking: its state
+  lives in a static and `read_line` routes bytes to it while its tab is
+  focused. The **image viewer** decodes in-kernel — `image/` is a pure no_std
+  PNG+DEFLATE and baseline-JPEG decoder set, unit-tested against real fixture
+  files — then presents box-downscaled + letterboxed), a boot splash +
+  status-bar **Synapse-C** brand mark, a live
   clock, a blinking caret, mouse cursor + click, **mouse text selection in the
   chat pane** (drag-to-copy → clipboard, paste with Ctrl+V; absolute-indexed
   over scrollback via `textsel`, like the editor's drag-select), **key
@@ -346,7 +361,14 @@ the next command still runs) and a unit test on the pure poll logic
   confirms via the modal, human-typed only) where `/open` reads it back —
   editor, image viewer, or audio player), `/ws` (a
   plaintext WebSocket client in `net/ws.rs` — RFC 6455 handshake with
-  Sec-WebSocket-Accept verification, masked frames, ping/pong). `/model remote <http://host:port> [name]` points the
+  Sec-WebSocket-Accept verification, masked frames, ping/pong), **`/mcp`** (an
+  **MCP client** in `mcp.rs` — Model Context Protocol over HTTP/JSON-RPC 2.0,
+  Streamable-HTTP transport with SSE + `Mcp-Session-Id`: `/mcp connect <name>
+  <url>` runs initialize→tools/list and registers each remote tool into the
+  tool registry as `mcp__<name>__<tool>`, so the shell agent calls it like any
+  builtin — `tools/call` forwarded on invoke, results taint-tracked as
+  UntrustedIngested; agents declare MCP servers in their manifest
+  (`mcp_servers`), shown + connected on the install consent screen). `/model remote <http://host:port> [name]` points the
   shell agent at a **hosted** OpenAI-compatible model (llama.cpp server /
   Ollama / vLLM), over http or https, via `shell/remote.rs` — same system prompt, tool calls, and
   approval gates; only generation moves off-box (config persisted at

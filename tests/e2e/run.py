@@ -95,7 +95,7 @@ OS_CMDS = [
     ("agents", "/agents", "agents>"),
     ("ui", "/ui", "ui>"),
     ("ktrace", "/ktrace", "ktrace>"),
-    ("close", "/close", "action pane closed"),
+    ("close", "/close", "closed the active tab"),
     ("top", "/top", "top>"),
     ("clear", "/clear", "cleared"),
     ("wifi", "/wifi info", "wifi>"),
@@ -284,6 +284,34 @@ def s_model_load(_g):
         g2.close()
 
 
+def s_tabs(g):
+    """Tmux-style action-pane tabs: /ktrace and /top open as two coexisting
+    tabs; /close closes them one at a time (the active tab), collapsing the
+    pane only when the last closes. (Switching/keeping-alive is visual; the
+    process-liveness of the audio tab is proven by open_media.)"""
+    m = g.mark()
+    g.send("/ktrace")
+    if not g.wait_for("action tab", 15, m):
+        # already open from a prior scenario — close and retry once
+        g.send("/close")
+        g.wait_for("closed the active tab", 5)
+        m = g.mark()
+        g.send("/ktrace")
+        if not g.wait_for("action tab", 10, m):
+            return False, "ktrace tab did not open"
+    m = g.mark()
+    g.send("/top")
+    if not g.wait_for("top>", 15, m):
+        return False, "top tab did not open"
+    m = g.mark()
+    g.send("/close")
+    ok1 = g.wait_for("closed the active tab", 10, m)
+    m = g.mark()
+    g.send("/close")
+    ok2 = g.wait_for("closed the active tab", 10, m)
+    return (ok1 and ok2), "two action tabs opened + closed one-by-one" if (ok1 and ok2) else "tab close did not report"
+
+
 def s_open_media(_g):
     """Prove the `/open` media paths end-to-end: boot a guest (audio="none" =
     a real virtio-snd device on a silent backend) with a FAT disk carrying a
@@ -334,8 +362,10 @@ def s_open_media(_g):
             g2.send(f"/open /img{d}/chitti-e2e.wav")
             if not g2.wait_for("open> playing", 15, m):
                 return False, "WAV did not start playing"
-            ok = g2.wait_for("open> played", 30, m)
-            return ok, "PNG previewed + WAV played via /open" if ok else "WAV playback never finished"
+            # Playback is a background job pumped from the idle tick; it prints
+            # "audio finished" when the last chunk drains.
+            ok = g2.wait_for("open> audio finished", 30, m)
+            return ok, "PNG previewed + WAV played (background) via /open" if ok else "WAV playback never finished"
         return False, "no '3x2 px' decode report from /open on any mount"
     finally:
         g2.close()
@@ -385,6 +415,46 @@ def s_agents_uninstall(g):
     g.send("/agents uninstall report-writer")
     ok = g.wait_for("removed", 15, m)
     return ok, "skill-agent uninstalled" if ok else "uninstall did not complete"
+
+
+def s_agent_fs_consent(g):
+    """The per-agent filesystem consent line: installing an agent shows that
+    its own /agent/<id>/ folder is granted (the sandbox floor), and a broad
+    Fs request would be flagged. report-writer is home-scoped, so we assert the
+    baseline-folder line appears on the install screen."""
+    m = g.mark()
+    g.send("/agents install report-writer --yes")
+    ok = g.wait_for("its own folder /agent/", 25, m) and g.wait_for("installed; granted", 10, m)
+    g.send("/agents uninstall report-writer")
+    g.wait_for("removed", 10)
+    return ok, "install screen shows the per-agent folder grant" if ok else "no fs-scope line on install"
+
+
+def s_mcp_connect(g):
+    """`/mcp connect` end-to-end: connect to the harness MCP server, list its
+    tools (echo), and call it directly — the in-kernel JSON-RPC client."""
+    m = g.mark()
+    g.send(f"/mcp connect harness http://{HOST}:{PLAIN_PORT}/mcp")
+    if not g.wait_for("registered 1 tool", 20, m) or not g.wait_for("mcp__harness__echo", 5, m):
+        return False, "connect/list did not register the echo tool"
+    m = g.mark()
+    g.send('/mcp call harness echo {"text":"pong-9271"}')
+    ok = g.wait_for("echo: pong-9271", 20, m)
+    return ok, "MCP tool connected + called over JSON-RPC" if ok else "MCP call did not echo"
+
+
+def s_mcp_manifest(g):
+    """An agent that declares an MCP server in its manifest: the install consent
+    screen shows the server, and on approval it connects + registers the tool
+    for the agent."""
+    m = g.mark()
+    g.send("/agents install mcp-agent --yes")
+    ok = g.wait_for("MCP server 'harness'", 25, m) and g.wait_for("MCP 'harness' connected", 20, m)
+    g.send("/mcp disconnect harness")
+    g.wait_for("disconnected", 10)
+    g.send("/agents uninstall mcp-agent")
+    g.wait_for("removed", 10)
+    return ok, "manifest MCP server shown on install + connected" if ok else "manifest MCP not surfaced/connected"
 
 
 def _http_get(port, path):
@@ -537,9 +607,9 @@ def s_surface(g):
     return ok, "surface drawn (grammar-validated draw ops rasterized)" if ok else "no surface render"
 
 
-OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [("open_media", s_open_media)]
-AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface)]
-NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("ws", s_ws), ("cancel", s_cancel)]
+OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [("open_media", s_open_media), ("tabs", s_tabs)]
+AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("mcp_manifest", s_mcp_manifest)]
+NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 
 # Known-flaky scenarios: timing-fragile, not code-buggy. The Doc web server's
 # reply is model-driven and prefill-bound (~10-15s for the ~530-token serve

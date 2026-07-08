@@ -460,10 +460,17 @@ pub struct Screen {
     /// Whether keyboard focus is on the action (right) pane. Only meaningful
     /// while the action pane shows ktrace; the editor always owns focus.
     focus_action: bool,
-    /// What the right ("action") pane currently shows. `None` = closed, so the
-    /// chat pane is full-width — the default.
+    /// What the active tab in the right ("action") pane shows. Mirrors
+    /// `tabs[active]` (or `Closed` when `tabs` is empty). Kept as a field so the
+    /// many `self.right == …` readers stay valid.
     right: RightMode,
-    /// The right mode to restore when the editor closes.
+    /// The open action-pane tabs, tmux-style: opening a view adds/selects a tab,
+    /// switching keeps every other tab's process alive (audio keeps playing,
+    /// ktrace keeps streaming, the editor keeps its buffer). Empty = pane closed.
+    tabs: Vec<RightMode>,
+    /// Index of the active tab within `tabs`.
+    active: usize,
+    /// Unused since the action pane became tabbed (kept for struct stability).
     right_before_editor: RightMode,
     /// The last-applied layout config, reused when opening/closing the action
     /// pane so the split ratio / titles / scale are preserved.
@@ -519,8 +526,27 @@ pub enum RightMode {
     Editor,
     /// The live `/top` system dashboard (CPU + memory).
     Top,
+    /// The `/open <file>.wav|.mp3` background audio player.
+    Audio,
     /// An agent-owned drawing surface (`synapse::ui`), by surface id.
     Surface(u32),
+}
+
+/// Surface id the `/open` image viewer uses (also known to the shell). A
+/// `Surface(IMAGE_SURFACE)` tab is labelled "image" in the tab bar.
+pub const IMAGE_SURFACE: u32 = u32::MAX;
+
+/// The short tab-bar label for a view.
+fn tab_label(m: RightMode) -> &'static str {
+    match m {
+        RightMode::Closed => "",
+        RightMode::Ktrace => "ktrace",
+        RightMode::Editor => "editor",
+        RightMode::Top => "top",
+        RightMode::Audio => "audio",
+        RightMode::Surface(IMAGE_SURFACE) => "image",
+        RightMode::Surface(_) => "surface",
+    }
 }
 
 /// Config knobs the UI config (`/configs/core/ui.json`) can set for the layout.
@@ -623,6 +649,8 @@ impl Screen {
             clock_alive: false,
             focus_action: false,
             right: RightMode::Closed,
+            tabs: Vec::new(),
+            active: 0,
             right_before_editor: RightMode::Closed,
             layout: cfg.clone(),
             theme: th,
@@ -1147,7 +1175,7 @@ impl Screen {
             RightMode::Closed => false,
             // ktrace / top / surface: chat keeps focus by default so you can keep
             // typing; Ctrl+Tab / a click can move focus to the pane.
-            RightMode::Ktrace | RightMode::Top | RightMode::Surface(_) => self.focus_action,
+            RightMode::Ktrace | RightMode::Top | RightMode::Audio | RightMode::Surface(_) => self.focus_action,
         }
     }
 
@@ -1160,16 +1188,13 @@ impl Screen {
         self.render_view(&self.chat);
         if self.right != RightMode::Closed {
             self.fill_rect(self.logs.x, self.logs.y, self.logs.w, self.logs.h, self.logs.bg);
-            let title = match self.right {
-                RightMode::Editor => "editor",
-                RightMode::Top => "top",
-                RightMode::Surface(_) => "surface",
-                _ => &self.logs.title,
-            };
-            self.draw_frame_titled(&self.logs, self.action_focused(), title);
+            // The header is a tmux-style tab bar (drawn by draw_tab_bar), so the
+            // frame is drawn with an empty title.
+            self.draw_frame_titled(&self.logs, self.action_focused(), "");
+            self.draw_tab_bar();
             self.draw_close_btn();
-            // The editor + /top repaint their own interiors; ktrace re-renders
-            // from the grid. (/top fills in on the next idle tick.)
+            // The editor + /top + audio repaint their own interiors (from the
+            // shell, on switch + idle tick); ktrace re-renders from the grid.
             if self.right == RightMode::Ktrace {
                 self.render_view(&self.logs);
             }
@@ -1184,6 +1209,40 @@ impl Screen {
     fn draw_close_btn(&self) {
         let (x, y, _, _) = self.close_btn();
         self.draw_str(x, y, "[x]", (230, 120, 120), self.logs.bg);
+    }
+
+    /// Per-tab header layout: `(mode, x_pixel, width_pixels)` for each open tab,
+    /// laid out left-to-right on the action pane's title row. Used by both the
+    /// tab-bar renderer and the click hit-test so they never disagree.
+    fn tab_layout(&self) -> Vec<(RightMode, u64, u64)> {
+        let cw = self.cw();
+        let mut x = self.logs.x + BORDER + PAD;
+        let mut out = Vec::with_capacity(self.tabs.len());
+        for &m in &self.tabs {
+            let w = (tab_label(m).len() as u64 + 1) * cw; // label + trailing space
+            out.push((m, x, w));
+            x += w + cw; // one cell gap between tabs
+        }
+        out
+    }
+
+    /// Draw the tab bar on the action pane's title row: active tab in accent
+    /// with a `▸` marker, the rest dim. Stops before the `[x]` close button.
+    fn draw_tab_bar(&self) {
+        let ty = self.logs.y + BORDER + 4;
+        let (close_x, ..) = self.close_btn();
+        for (i, (m, x, w)) in self.tab_layout().into_iter().enumerate() {
+            if x + w >= close_x {
+                break; // ran into the close button; overflow tabs are hidden
+            }
+            let is_active = i == self.active;
+            let fg = if is_active { self.theme.title_active } else { self.theme.title_dim };
+            let mut lx = x;
+            if is_active {
+                lx = self.draw_str(lx, ty, ">", self.theme.accent, self.logs.bg);
+            }
+            self.draw_str(lx, ty, tab_label(m), fg, self.logs.bg);
+        }
     }
 
     /// A labelled horizontal usage bar filled proportional to `pct` (0..=100)
@@ -1302,6 +1361,48 @@ pub fn draw_top(v: &TopView) {
             sc.draw_str_bg(x, y, &s, sc.theme.logs_fg, bg);
             y += ch;
         }
+        sc.cursor_overlay();
+    });
+}
+
+/// A snapshot of the background audio player, for [`draw_audio`].
+pub struct AudioView<'a> {
+    pub name: &'a str,
+    pub pos_ms: u64,
+    pub total_ms: u64,
+    pub rate: u32,
+    pub playing: bool,
+}
+
+/// Paint the audio-player tab: the track name, a scrubber bar at the current
+/// position, and mm:ss / mm:ss. No-op unless the audio tab is active. Called
+/// from the shell's idle tick while the player runs (the audio keeps playing
+/// regardless of which tab is shown — this only draws when it's on top).
+pub fn draw_audio(v: &AudioView) {
+    SCREEN.with(|slot| {
+        let Some(sc) = slot else { return };
+        if sc.right != RightMode::Audio {
+            return;
+        }
+        sc.cursor_restore();
+        sc.cur_vis = false;
+        let ch = sc.ch();
+        let (px, iy, iw) = (sc.logs.ix, sc.logs.iy, sc.logs.cols * sc.logs.cw);
+        sc.fill_rect(px, iy, iw, sc.logs.rows * sc.logs.ch, sc.logs.bg);
+        let bg = sc.logs.bg;
+        let mut y = iy + ch;
+        sc.draw_str_bg(px, y, if v.playing { "> playing" } else { "= paused" }, sc.theme.accent, bg);
+        y += ch + ch / 2;
+        sc.draw_str_bg(px, y, v.name, sc.theme.logs_fg, bg);
+        y += ch + ch / 2;
+        let pct = if v.total_ms > 0 { (v.pos_ms * 100 / v.total_ms).min(100) } else { 0 };
+        let mmss = |ms: u64| alloc::format!("{}:{:02}", ms / 60000, ms % 60000 / 1000);
+        let detail = alloc::format!("{} / {}", mmss(v.pos_ms), mmss(v.total_ms));
+        sc.usage_bar_bg(px, y, iw, "", pct, &detail, bg);
+        y += ch * 2;
+        sc.draw_str_bg(px, y, &alloc::format!("{} Hz mono", v.rate), sc.theme.title_dim, bg);
+        y += ch + ch / 2;
+        sc.draw_str_bg(px, y, "Ctrl+C stops - switch tabs, keeps playing", sc.theme.title_dim, bg);
         sc.cursor_overlay();
     });
 }
@@ -1796,6 +1897,8 @@ fn rebuilt(old: &Screen, split: bool, right: RightMode) -> Screen {
     ns.status_left = old.status_left.clone();
     ns.status_right = old.status_right.clone();
     ns.right = right;
+    ns.tabs = old.tabs.clone();
+    ns.active = old.active;
     ns.right_before_editor = old.right_before_editor;
     ns.clock_alive = old.clock_alive;
     ns.chat.adopt(&old.chat);
@@ -1803,23 +1906,136 @@ fn rebuilt(old: &Screen, split: bool, right: RightMode) -> Screen {
     ns
 }
 
-/// The current action-pane mode.
+/// The current (active tab's) action-pane mode.
 pub fn right_mode() -> RightMode {
     SCREEN.with(|slot| slot.as_ref().map(|sc| sc.right).unwrap_or(RightMode::Closed))
 }
 
-/// Set the action (right) pane mode, relayouting the split and repainting.
+/// The open tab modes, in bar order (for the shell to know what's open).
+pub fn tab_modes() -> Vec<RightMode> {
+    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.tabs.clone()).unwrap_or_default())
+}
+
+/// True if a tab of `mode` is currently open.
+pub fn has_tab(mode: RightMode) -> bool {
+    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.tabs.contains(&mode)).unwrap_or(false))
+}
+
+/// Open a tab for `mode`, or select it if already open. First tab opens the
+/// split; additional tabs reuse the geometry (every other tab stays alive).
+/// Operates on the slot directly so surface/editor openers can reuse it without
+/// re-entering `SCREEN.with`.
+fn open_view_slot(slot: &mut Option<Screen>, mode: RightMode) {
+    let Some(old) = slot else { return };
+    if let Some(i) = old.tabs.iter().position(|&m| m == mode) {
+        old.active = i;
+        old.right = mode;
+        old.redraw();
+        return;
+    }
+    if old.tabs.is_empty() {
+        // First tab: rebuild the split open.
+        let mut ns = rebuilt(old, true, mode);
+        ns.tabs = alloc::vec![mode];
+        ns.active = 0;
+        ns.right = mode;
+        ns.redraw();
+        *slot = Some(ns);
+    } else {
+        // Additional tab: geometry is unchanged; append + select + repaint.
+        old.tabs.push(mode);
+        old.active = old.tabs.len() - 1;
+        old.right = mode;
+        old.redraw();
+    }
+}
+
+/// Open (or focus) a tab for `mode`. `Closed` is a no-op (use `close_action`).
 pub fn set_right(mode: RightMode) {
+    if mode == RightMode::Closed {
+        return;
+    }
+    SCREEN.with(|slot| open_view_slot(slot, mode));
+}
+
+/// Cycle to the next/previous tab, returning the newly active mode. Keeps every
+/// tab's state — the switch only changes which one paints into the pane.
+pub fn cycle_tab(forward: bool) -> RightMode {
     SCREEN.with(|slot| {
-        if let Some(old) = slot {
-            if old.right == mode {
-                return;
+        let Some(old) = slot else { return RightMode::Closed };
+        let n = old.tabs.len();
+        if n <= 1 {
+            return old.right;
+        }
+        old.active = if forward { (old.active + 1) % n } else { (old.active + n - 1) % n };
+        old.right = old.tabs[old.active];
+        old.redraw();
+        old.right
+    })
+}
+
+/// Select tab `i` (clamped), returning the active mode.
+pub fn select_tab(i: usize) -> RightMode {
+    SCREEN.with(|slot| {
+        let Some(old) = slot else { return RightMode::Closed };
+        if i >= old.tabs.len() {
+            return old.right;
+        }
+        old.active = i;
+        old.right = old.tabs[i];
+        old.redraw();
+        old.right
+    })
+}
+
+/// The tab index under pixel `(x, y)`, if the click hit the tab bar.
+pub fn tab_hit(x: u64, y: u64) -> Option<usize> {
+    SCREEN.with(|slot| {
+        slot.as_ref().and_then(|sc| {
+            if sc.tabs.is_empty() {
+                return None;
             }
-            let ns = rebuilt(old, mode != RightMode::Closed, mode);
-            ns.redraw();
-            *slot = Some(ns);
+            let ty = sc.logs.y + BORDER + 4;
+            if y < ty || y >= ty + sc.ch() {
+                return None;
+            }
+            sc.tab_layout().into_iter().position(|(_, tx, w)| x >= tx && x < tx + w)
+        })
+    })
+}
+
+/// Close the tab of `mode` if open (used by `editor_leave`, `/ktrace` toggle).
+pub fn close_tab_mode(mode: RightMode) {
+    SCREEN.with(|slot| {
+        let Some(old) = slot else { return };
+        if let Some(i) = old.tabs.iter().position(|&m| m == mode) {
+            old.active = i;
+            close_active_slot(slot);
         }
     });
+}
+
+/// Close the active tab. If it was the last, collapse the split.
+fn close_active_slot(slot: &mut Option<Screen>) {
+    let Some(old) = slot else { return };
+    if old.tabs.is_empty() {
+        return;
+    }
+    old.tabs.remove(old.active);
+    if old.tabs.is_empty() {
+        let mut ns = rebuilt(old, false, RightMode::Closed);
+        ns.tabs.clear();
+        ns.active = 0;
+        ns.right = RightMode::Closed;
+        ns.redraw();
+        *slot = Some(ns);
+    } else {
+        if old.active >= old.tabs.len() {
+            old.active = old.tabs.len() - 1;
+        }
+        old.right = old.tabs[old.active];
+        old.redraw();
+    }
 }
 
 /// Open the ktrace log stream in the action pane.
@@ -1835,14 +2051,11 @@ pub fn open_ktrace() {
 /// emitted grammar-validated draw ops, never raw pixels here).
 pub fn present_surface(id: u32, sw: usize, sh: usize, buf: &[u32]) {
     SCREEN.with(|slot| {
-        // Open the pane in this surface's mode once (rebuilds the split layout).
-        let need_open = slot.as_ref().map(|sc| sc.right != RightMode::Surface(id)).unwrap_or(false);
-        if need_open {
-            if let Some(old) = slot {
-                let ns = rebuilt(old, true, RightMode::Surface(id));
-                ns.redraw();
-                *slot = Some(ns);
-            }
+        // Open (or focus) this surface's tab, then paint over its cleared
+        // interior. Idempotent: re-presenting the active surface tab is cheap.
+        let active_surface = slot.as_ref().map(|sc| sc.right == RightMode::Surface(id)).unwrap_or(false);
+        if !active_surface {
+            open_view_slot(slot, RightMode::Surface(id));
         }
         let Some(sc) = slot else { return };
         if sc.right != RightMode::Surface(id) || sw == 0 || sh == 0 {
@@ -1901,36 +2114,20 @@ pub fn is_top() -> bool {
     right_mode() == RightMode::Top
 }
 
-/// Close the action pane (chat becomes full-width).
+/// Close the **active** tab (chat becomes full-width once the last tab closes).
 pub fn close_action() {
-    set_right(RightMode::Closed);
+    SCREEN.with(close_active_slot);
 }
 
-/// Hand the action pane to the `/open` editor, splitting if needed and
-/// remembering the prior mode to restore on close.
+/// Open (or focus) the `/open` editor tab.
 pub fn editor_enter() {
-    SCREEN.with(|slot| {
-        if let Some(old) = slot {
-            let before = old.right;
-            let mut ns = rebuilt(old, true, RightMode::Editor);
-            ns.right_before_editor = before;
-            ns.redraw();
-            *slot = Some(ns);
-        }
-    });
+    set_right(RightMode::Editor);
 }
 
-/// Return the action pane to whatever it showed before the editor (usually
-/// closed → chat full-width), repainting.
+/// Close the editor tab (the editor quit); the active tab falls back to a
+/// sibling, or the pane collapses if the editor was the only tab.
 pub fn editor_leave() {
-    SCREEN.with(|slot| {
-        if let Some(old) = slot {
-            let restore = old.right_before_editor;
-            let ns = rebuilt(old, restore != RightMode::Closed, restore);
-            ns.redraw();
-            *slot = Some(ns);
-        }
-    });
+    close_tab_mode(RightMode::Editor);
 }
 
 /// Render the editor into the right pane: title `editor: <file>`, the visible
@@ -2054,6 +2251,8 @@ pub fn relayout(cfg: &LayoutCfg) {
             ns.status_left = sl;
             ns.status_right = sr;
             ns.right = mode;
+            ns.tabs = old.tabs.clone();
+            ns.active = old.active;
             ns.right_before_editor = old.right_before_editor;
             ns.clock_alive = old.clock_alive;
             ns.chat.adopt(&old.chat);
@@ -2110,14 +2309,16 @@ pub fn scroll_live(action: bool) {
 pub fn focus_toggle() -> bool {
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
-            if sc.right != RightMode::Ktrace {
-                return false;
+            if sc.right == RightMode::Closed || sc.right == RightMode::Editor {
+                // Nothing to focus (closed), or the editor already owns input.
+                return sc.right == RightMode::Editor;
             }
             sc.focus_action = !sc.focus_action;
             sc.cursor_restore();
             sc.cur_vis = false;
             sc.draw_frame(&sc.chat, !sc.action_focused());
-            sc.draw_frame_titled(&sc.logs, sc.action_focused(), &sc.logs.title);
+            sc.draw_frame_titled(&sc.logs, sc.action_focused(), "");
+            sc.draw_tab_bar();
             sc.draw_close_btn();
             sc.cursor_overlay();
             sc.focus_action
@@ -2136,7 +2337,9 @@ pub fn focus_is_action() -> bool {
 /// e.g. from a mouse click. Same constraints as [`focus_toggle`].
 pub fn focus_set(action: bool) {
     let flips = SCREEN.with(|slot| {
-        slot.as_ref().map(|sc| sc.right == RightMode::Ktrace && sc.focus_action != action).unwrap_or(false)
+        slot.as_ref()
+            .map(|sc| !matches!(sc.right, RightMode::Closed | RightMode::Editor) && sc.focus_action != action)
+            .unwrap_or(false)
     });
     if flips {
         focus_toggle();
