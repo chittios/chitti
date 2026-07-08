@@ -312,6 +312,26 @@ def s_tabs(g):
     return (ok1 and ok2), "two action tabs opened + closed one-by-one" if (ok1 and ok2) else "tab close did not report"
 
 
+def s_clipboard(g):
+    """Host<->guest clipboard over the serial console: a bracketed paste
+    (ESC[200~ … ESC[201~) is captured into the clipboard (host->guest), and an
+    in-OS copy emits an OSC 52 escape (guest->host)."""
+    # host -> guest: bracketed paste lands in the clipboard.
+    g.send_raw(b"\x1b[200~clip-4821\x1b[201~")
+    time.sleep(0.5)
+    g.send_raw(b"\x7f" * 40)  # clear whatever the paste inserted on the prompt line
+    time.sleep(0.3)
+    m = g.mark()
+    g.send("/clip")
+    got_paste = g.wait_for("clip-4821", 10, m)
+    # guest -> host: setting the clipboard emits the OSC 52 set-clipboard escape.
+    m = g.mark()
+    g.send("/clip syncme-2937")
+    got_osc = g.wait_for("]52;c;", 10, m)
+    ok = got_paste and got_osc
+    return ok, "bracketed paste captured + OSC52 copy-out emitted" if ok else f"paste={got_paste} osc52={got_osc}"
+
+
 def s_open_media(_g):
     """Prove the `/open` media paths end-to-end: boot a guest (audio="none" =
     a real virtio-snd device on a silent backend) with a FAT disk carrying a
@@ -607,7 +627,7 @@ def s_surface(g):
     return ok, "surface drawn (grammar-validated draw ops rasterized)" if ok else "no surface render"
 
 
-OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [("open_media", s_open_media), ("tabs", s_tabs)]
+OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [("open_media", s_open_media), ("tabs", s_tabs), ("clipboard", s_clipboard)]
 AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("mcp_manifest", s_mcp_manifest)]
 NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 

@@ -288,7 +288,12 @@ real UEFI hardware.
   status-bar **Synapse-C** brand mark, a live
   clock, a blinking caret, mouse cursor + click, **mouse text selection in the
   chat pane** (drag-to-copy → clipboard, paste with Ctrl+V; absolute-indexed
-  over scrollback via `textsel`, like the editor's drag-select), **key
+  over scrollback via `textsel`, like the editor's drag-select), a **host
+  clipboard bridge** (`clipboard`: an in-OS copy emits an **OSC 52** escape so a
+  terminal-attached host copies it to the macOS/Linux clipboard; a host paste
+  arrives as a **bracketed-paste** `ESC[200~…ESC[201~` block the line editor
+  captures — works the same on QEMU and VBox over the serial console, no
+  guest-additions driver; `/clip` shows/sets it), **key
   auto-repeat** (`keyrepeat`: software typematic in `xhci` — USB HID boot
   keyboards report only press edges — plus an accelerating streak amplifier:
   held Backspace/arrows erase/scroll 2/4/8 steps per repeat in the shell and
