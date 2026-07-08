@@ -341,7 +341,10 @@ the next command still runs) and a unit test on the pure poll logic
   agent adopts as a channel), `/http` (a curl-like
   HTTP/1.1 client in `net/http.rs` — `-X`/`-H`/`-d`/`-v`/`--stream`, all
   methods, live chunked/SSE streaming; `http://` **and** `https://` via
-  `net/tls.rs`/embedded-tls; also the agent's `http` tool), `/ws` (a
+  `net/tls.rs`/embedded-tls; also the agent's `http` tool; **`-O`/`-o <file>`
+  download the body to the Synapse store** (`/downloads/<name>`, overwrite
+  confirms via the modal, human-typed only) where `/open` reads it back —
+  editor, image viewer, or audio player), `/ws` (a
   plaintext WebSocket client in `net/ws.rs` — RFC 6455 handshake with
   Sec-WebSocket-Accept verification, masked frames, ping/pong). `/model remote <http://host:port> [name]` points the
   shell agent at a **hosted** OpenAI-compatible model (llama.cpp server /

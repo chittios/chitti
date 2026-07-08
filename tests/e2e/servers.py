@@ -103,6 +103,20 @@ def _handle(conn):
         elif path == "/json":
             body = b'{"ok":true,"who":"e2e"}'
             conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+        elif path == "/logo.png":
+            # A real 3x2 PNG for the `/http -O` download → `/open` roundtrip.
+            import struct as _s
+            import zlib as _z
+
+            def _chunk(t, d):
+                c = _s.pack(">I", len(d)) + t + d
+                return c + _s.pack(">I", _z.crc32(t + d) & 0xFFFFFFFF)
+
+            raw = (b"\x00" + bytes([255, 0, 0, 0, 255, 0, 0, 0, 255])
+                   + b"\x00" + bytes([10, 20, 30, 40, 50, 60, 250, 249, 245]))
+            body = (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", _s.pack(">IIBBBBB", 3, 2, 8, 2, 0, 0, 0))
+                    + _chunk(b"IDAT", _z.compress(raw, 9)) + _chunk(b"IEND", b""))
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
         elif path == "/registry":
             # A public agent-registry index (discovery over the network).
             body = json.dumps({
