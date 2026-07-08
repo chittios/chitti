@@ -561,12 +561,13 @@ fn print_help() {
     serial_println!("  /shortcuts       list keyboard shortcuts (/configs/core/shortcuts.json)");
     serial_println!("  /ktrace          toggle the ktrace log stream in the action (right) pane");
     serial_println!("  /open <path>     edit a file in the vim-like editor (right pane): hjkl/i/Esc/:w/:q");
+    serial_println!("                   .png/.jpg preview in the action pane; .wav/.mp3 play (Ctrl+C stops)");
     serial_println!("  /close           close the action pane (chat full-width); also Ctrl+W");
     serial_println!("  /disks           list every block device + detected filesystems (read-only)");
     serial_println!("  /ls [n | /path]  list a volume's root: n on disk 0, or a mount path (/mnt)");
     serial_println!("  /mount <d> [v] [/p]  mount disk d's volume v at /p (default /mnt)");
     serial_println!("  /umount </path>  unmount   /mounts   list mounts");
-    serial_println!("  /cat </path/file>  print a file from a mounted volume (FAT/ext4)");
+    serial_println!("  /cat </path/file>  print a file from a mounted volume (FAT/ext4), syntax-coloured");
     serial_println!("  /mkext4          format the disk with ext4 (destructive; writes test files)");
     serial_println!("  /install [<disk>]  install/UPDATE Chitti on a disk (modal-confirmed; update keeps data)");
     serial_println!("                   tokens: 'format' = full erase, 'yes' = skip the modal (scripted)");
@@ -1846,6 +1847,9 @@ impl ChatSession {
             serial_print!("\x1b[2m"); // dim the streamed reasoning
         }
         let mut out = alloc::string::String::new();
+        // Markdown-aware colouring of the streamed answer: headings + fenced
+        // code blocks (lexed per language tag) — prose streams through raw.
+        let mut md = crate::highlight::StreamMd::new();
         let mut n = 0usize;
         let mut n_think = 0usize;
         // Anti-degeneration guard: a thinking model that slips into a loop can
@@ -1898,11 +1902,12 @@ impl ChatSession {
                 break;
             }
             let piece = stream.push(&self.tok, self.model.token_str(next));
-            serial_print!("{}", piece);
             if in_think {
+                serial_print!("{}", piece); // thinking stays dim + uncoloured
                 n_think += 1;
             } else {
-                out.push_str(&piece);
+                md.feed(&piece, &mut |s| serial_print!("{}", s));
+                out.push_str(&piece); // the returned text stays raw (tool parsing)
             }
             self.gen.push(next);
             self.model.forward(next, self.pos, &mut self.kv, &mut self.state, true);
@@ -1918,6 +1923,7 @@ impl ChatSession {
             // Ended (EOS/stop) while still thinking: restore normal video.
             serial_print!("\x1b[0m");
         }
+        md.finish(&mut |s| serial_print!("{}", s)); // flush a held partial line
         serial_println!("");
         // Close the assistant turn in the cache so the next turn continues cleanly.
         self.model.forward(im_end, self.pos, &mut self.kv, &mut self.state, false);
@@ -3107,6 +3113,10 @@ fn read_line(buf: &mut String) {
     let mut hist_idx: Option<usize> = None;
     let mut draft = String::new();
     let mut cur: usize = 0;
+    // Streak amplifier for held erase/nav keys: a fast repeat stream (hardware
+    // typematic or the drivers' software one) buys 2/4/8 steps per event, so a
+    // long-held Backspace/arrow erases or moves progressively faster.
+    let mut accel = crate::keyrepeat::Accel::new();
     loop {
         match console::read_byte() {
             Some(b'\r') | Some(b'\n') => {
@@ -3139,9 +3149,14 @@ fn read_line(buf: &mut String) {
                     }
                 };
                 let action = fb_focus_is_action();
+                // Held arrows accelerate (multi-step) like held Backspace.
+                let steps = match fin {
+                    Some(f @ (b'A' | b'B' | b'C' | b'D')) => accel.steps(f, crate::arch::now_ms()),
+                    _ => 1,
+                };
                 match fin {
-                    Some(b'A') if action => fb_scroll_view(true, 1),
-                    Some(b'B') if action => fb_scroll_view(true, -1),
+                    Some(b'A') if action => fb_scroll_view(true, steps as i64),
+                    Some(b'B') if action => fb_scroll_view(true, -(steps as i64)),
                     Some(b'A') => {
                         // Up: step back through history.
                         let n = HISTORY.with(|h| h.len());
@@ -3153,8 +3168,7 @@ fn read_line(buf: &mut String) {
                                 draft = buf.clone();
                                 n - 1
                             }
-                            Some(0) => 0,
-                            Some(i) => i - 1,
+                            Some(i) => i.saturating_sub(steps),
                         };
                         hist_idx = Some(idx);
                         let entry = HISTORY.with(|h| h[idx].clone());
@@ -3164,9 +3178,9 @@ fn read_line(buf: &mut String) {
                         // Down: step forward; past the end restores the draft.
                         if let Some(i) = hist_idx {
                             let n = HISTORY.with(|h| h.len());
-                            if i + 1 < n {
-                                hist_idx = Some(i + 1);
-                                let entry = HISTORY.with(|h| h[i + 1].clone());
+                            if i + steps < n {
+                                hist_idx = Some(i + steps);
+                                let entry = HISTORY.with(|h| h[i + steps].clone());
                                 replace_line(buf, &mut cur, &entry);
                             } else {
                                 hist_idx = None;
@@ -3176,15 +3190,17 @@ fn read_line(buf: &mut String) {
                         }
                     }
                     Some(b'C') if !action => {
-                        if cur < buf.len() {
-                            cur += 1;
-                            cursor_shift(1, true);
+                        let n = steps.min(buf.len() - cur);
+                        if n > 0 {
+                            cur += n;
+                            cursor_shift(n, true);
                         }
                     }
                     Some(b'D') if !action => {
-                        if cur > 0 {
-                            cur -= 1;
-                            cursor_shift(1, false);
+                        let n = steps.min(cur);
+                        if n > 0 {
+                            cur -= n;
+                            cursor_shift(n, false);
                         }
                     }
                     Some(b'H') => {
@@ -3256,15 +3272,19 @@ fn read_line(buf: &mut String) {
                 }
             }
             Some(0x7f) | Some(0x08) => {
-                if cur > 0 {
-                    buf.remove(cur - 1);
-                    cur -= 1;
-                    // Back up, re-echo the shifted tail, blank the freed cell,
-                    // and walk the cursor back into place.
-                    console::put_byte(0x08);
+                // A held Backspace streak erases 2/4/8 chars per repeat.
+                let n = accel.steps(0x08, crate::arch::now_ms()).min(cur);
+                if n > 0 {
+                    buf.drain(cur - n..cur);
+                    cur -= n;
+                    // Back up, re-echo the shifted tail, blank the freed
+                    // cells, and walk the cursor back into place.
+                    cursor_shift(n, false);
                     emit(&buf[cur..]);
-                    emit(" ");
-                    cursor_shift(buf.len() - cur + 1, false);
+                    for _ in 0..n {
+                        emit(" ");
+                    }
+                    cursor_shift(buf.len() - cur + n, false);
                 }
             }
             Some(c @ 0x20..=0x7e) => {
@@ -3352,6 +3372,24 @@ fn ui_tick() {
                 crate::framebuffer::close_action();
             } else if let Some(action) = crate::framebuffer::pane_hit(t.x, t.y) {
                 crate::framebuffer::focus_set(action);
+                if action {
+                    crate::framebuffer::chat_sel_clear();
+                } else {
+                    // Press in the chat pane anchors a mouse text selection.
+                    crate::framebuffer::chat_sel_begin(t.x, t.y);
+                }
+            } else {
+                crate::framebuffer::chat_sel_clear();
+            }
+        }
+        // Drag extends the selection; release copies it (like the editor's
+        // drag-select; paste back with Ctrl+V).
+        if t.left && t.moved {
+            crate::framebuffer::chat_sel_drag(t.x, t.y);
+        }
+        if t.released {
+            if let Some(text) = crate::framebuffer::chat_sel_end() {
+                crate::clipboard::set(text, false);
             }
         }
         if t.wheel != 0 {
@@ -3569,6 +3607,19 @@ fn run_open_inner(arg: &str) {
     if arg.is_empty() {
         serial_println!("usage: /open <path>   e.g. /open {}", crate::ui_config::ui_path());
         serial_println!("  editor: hjkl move, i insert, Esc normal, :w write, :q quit, :wq save+quit");
+        serial_println!("  images: /open photo.png|.jpg previews in the action pane (/close to hide)");
+        serial_println!("  audio:  /open song.wav|.mp3 plays through the sound device (Ctrl+C stops)");
+        return;
+    }
+    // A .png/.jpg path is an image preview, a .wav/.mp3 an audio playback —
+    // not a text buffer.
+    let lower = arg.to_ascii_lowercase();
+    if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        view_image(arg);
+        return;
+    }
+    if lower.ends_with(".wav") || lower.ends_with(".mp3") {
+        play_audio(arg);
         return;
     }
     #[cfg(not(test))]
@@ -3583,6 +3634,124 @@ fn run_open_inner(arg: &str) {
     }
     #[cfg(test)]
     let _ = arg;
+}
+
+/// Surface id the `/open` image viewer presents on (distinct from any
+/// agent-allocated `synapse::ui` surface).
+#[cfg(not(feature = "server"))]
+const VIEWER_SURFACE: u32 = u32::MAX;
+
+/// `/open <path>.png|.jpg` — decode and show an image in the action pane.
+/// Reads from a mounted volume (`/mnt/...`) or the Synapse store; the decoded
+/// image is box-downscaled to the pane, then integer-upscaled/letterboxed by
+/// the compositor.
+#[cfg(not(feature = "server"))]
+fn view_image(path: &str) {
+    let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
+        serial_println!("open> {} not found under any mount or in the store (see /mounts)", path);
+        return;
+    };
+    let t0 = crate::arch::now_ms();
+    match crate::image::decode(&bytes) {
+        Ok(img) => {
+            let (iw, ih) = (img.w, img.h);
+            #[cfg(not(test))]
+            {
+                // Open the pane first so the downscale can target its real size.
+                crate::framebuffer::set_right(crate::framebuffer::RightMode::Surface(VIEWER_SURFACE));
+                let (pw, ph) = crate::framebuffer::action_dims_px().unwrap_or((640, 480));
+                let (nw, nh) = crate::image::fit(img.w, img.h, pw as usize, ph as usize);
+                let scaled = if (nw, nh) == (img.w, img.h) { img } else { crate::image::resize(&img, nw, nh) };
+                crate::framebuffer::present_surface(VIEWER_SURFACE, scaled.w, scaled.h, &scaled.pixels);
+            }
+            #[cfg(test)]
+            drop(img);
+            serial_println!(
+                "open> {} — {}x{} px, {} KiB, decoded in {} ms (/close to hide)",
+                path,
+                iw,
+                ih,
+                bytes.len() / 1024,
+                crate::arch::now_ms().saturating_sub(t0)
+            );
+        }
+        Err(e) => serial_println!("open> cannot decode {}: {}", path, e),
+    }
+}
+
+/// `/open <path>.wav|.mp3` — decode (RIFF/WAVE or MPEG Layer III) and play
+/// through the sound device at the file's own sample rate. The PCM is fed in
+/// ~50 ms chunks so the queue-full backpressure paces the loop in real time
+/// while `upkeep()` keeps the UI alive, and Ctrl+C stops within a chunk (the
+/// device just drains its last few periods) — the standing interrupt rule.
+#[cfg(not(feature = "server"))]
+fn play_audio(path: &str) {
+    let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
+        serial_println!("open> {} not found under any mount or in the store (see /mounts)", path);
+        return;
+    };
+    let t0 = crate::arch::now_ms();
+    let audio = match crate::audio::decode(&bytes) {
+        Ok(a) => a,
+        Err(e) => {
+            serial_println!("open> cannot decode {}: {}", path, e);
+            return;
+        }
+    };
+    let total_ms = audio.duration_ms();
+    serial_println!(
+        "open> playing {} — {}:{:02} at {} Hz ({} KiB, decoded in {} ms; Ctrl+C stops)",
+        path,
+        total_ms / 60000,
+        total_ms % 60000 / 1000,
+        audio.rate,
+        bytes.len() / 1024,
+        crate::arch::now_ms().saturating_sub(t0)
+    );
+    if !crate::sound::is_up() {
+        serial_println!("open> no sound device — decoded OK but cannot play");
+        return;
+    }
+    let chunk = (audio.rate as usize / 20).max(64); // ~50 ms of samples
+    let mut at = 0usize;
+    let mut cancelled = false;
+    let mut last_line_ms = 0u64;
+    while at < audio.pcm.len() {
+        if poll_interrupt() {
+            cancelled = true;
+            break;
+        }
+        let end = (at + chunk).min(audio.pcm.len());
+        if let Err(e) = crate::sound::play(&audio.pcm[at..end], audio.rate) {
+            serial_println!("open> play failed: {}", e);
+            return;
+        }
+        at = end;
+        upkeep();
+        // One status line, rewritten in place about once a second.
+        let now = crate::arch::now_ms();
+        if now.saturating_sub(last_line_ms) >= 1000 {
+            last_line_ms = now;
+            let pos = at as u64 * 1000 / audio.rate.max(1) as u64;
+            emit(&alloc::format!("\r  {}:{:02} / {}:{:02} ", pos / 60000, pos % 60000 / 1000, total_ms / 60000, total_ms % 60000 / 1000));
+        }
+    }
+    // Let the device drain what is already queued (a Ctrl+C skips this: the
+    // last ≤50 ms fade out on their own).
+    while !cancelled && crate::sound::playing() {
+        if poll_interrupt() {
+            cancelled = true;
+            break;
+        }
+        upkeep();
+        crate::sched::yield_now();
+    }
+    if cancelled {
+        let pos = at as u64 * 1000 / audio.rate.max(1) as u64;
+        serial_println!("\ropen> stopped at {}:{:02} (Ctrl+C)", pos / 60000, pos % 60000 / 1000);
+    } else {
+        serial_println!("\ropen> played {} ({}:{:02})", path, total_ms / 60000, total_ms % 60000 / 1000);
+    }
 }
 
 /// `/shortcuts` — list the configured keyboard shortcuts (`shortcuts.json`).
@@ -3902,9 +4071,18 @@ fn disk_cat(arg: &str) {
     match data {
         Some(bytes) => {
             serial_println!("cat> {} ({} bytes):", full, bytes.len());
-            // Print as UTF-8 text if it is, else note it's binary.
+            // Print as UTF-8 text if it is (syntax-coloured when the extension
+            // names a known language), else note it's binary.
             match core::str::from_utf8(&bytes) {
-                Ok(s) => serial_println!("{}", s),
+                Ok(s) => match crate::highlight::lang_for_path(full) {
+                    Some(lang) => {
+                        let mut st = crate::highlight::State::default();
+                        for line in s.lines() {
+                            serial_println!("{}", crate::highlight::ansi_line(lang, line, &mut st));
+                        }
+                    }
+                    None => serial_println!("{}", s),
+                },
                 Err(_) => serial_println!("(binary; {} bytes)", bytes.len()),
             }
         }

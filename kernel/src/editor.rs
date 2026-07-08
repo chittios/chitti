@@ -70,6 +70,8 @@ pub fn open(path: &str) -> bool {
         rows,
     };
     ed.render();
+    // Held-key streaks (arrows, Backspace) accelerate: see `crate::keyrepeat`.
+    let mut accel = crate::keyrepeat::Accel::new();
     while !ed.quit {
         match crate::console::read_byte() {
             // Esc is ambiguous over a byte stream: a bare Esc key, or the
@@ -89,7 +91,11 @@ pub fn open(path: &str) -> bool {
                         }
                     };
                     if let Some(f) = fin {
-                        ed.nav(f, param);
+                        // Held Up/Down accelerates to multi-line steps.
+                        let n = if matches!(f, b'A' | b'B') { accel.steps(f, crate::arch::now_ms()) } else { 1 };
+                        for _ in 0..n {
+                            ed.nav(f, param);
+                        }
                     }
                 } else {
                     ed.handle(0x1b); // a real Esc keypress
@@ -98,7 +104,11 @@ pub fn open(path: &str) -> bool {
                 crate::framebuffer::cursor_move_here();
             }
             Some(b) => {
-                ed.handle(b);
+                // A held Backspace streak erases multiple chars per repeat.
+                let n = if b == 0x7f || b == 0x08 { accel.steps(0x08, crate::arch::now_ms()) } else { 1 };
+                for _ in 0..n {
+                    ed.handle(b);
+                }
                 ed.render();
                 crate::framebuffer::cursor_move_here();
             }
@@ -548,7 +558,27 @@ impl Editor {
             Mode::Command => alloc::format!(":{}", self.cmd),
         };
         let sel = if self.mode == Mode::Visual { Some(self.sel_range()) } else { None };
-        crate::framebuffer::editor_render(&title, &self.lines, self.top, self.cy, self.cx, &modeline, sel);
+        // Syntax highlighting: per-byte colours for the visible lines (None =
+        // the theme's editor_fg). The lexer state (block comments, md fences)
+        // is seeded by a cheap scan of the lines above the viewport.
+        let hl: Option<Vec<Vec<Option<(u8, u8, u8)>>>> = crate::highlight::lang_for_path(&self.path).map(|lang| {
+            let mut st = crate::highlight::State::default();
+            for line in self.lines.iter().take(self.top) {
+                crate::highlight::advance(lang, line, &mut st);
+            }
+            self.lines
+                .iter()
+                .skip(self.top)
+                .take(self.rows)
+                .map(|line| {
+                    crate::highlight::classes(lang, line, &mut st)
+                        .into_iter()
+                        .map(|c| (c != crate::highlight::Class::Text).then(|| crate::highlight::rgb(c)))
+                        .collect()
+                })
+                .collect()
+        });
+        crate::framebuffer::editor_render(&title, &self.lines, self.top, self.cy, self.cx, &modeline, sel, hl.as_deref());
     }
 
     /// Line-number gutter width (matches framebuffer::editor_render).

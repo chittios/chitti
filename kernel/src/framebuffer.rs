@@ -194,6 +194,10 @@ struct Pane {
     /// incoming bytes still update the grid/hist but pixels are frozen on the
     /// scrolled view; the offset auto-advances so the view stays anchored.
     view: usize,
+    /// Mouse text selection `(anchor, head)`, both inclusive `(line, col)` in
+    /// **absolute** coordinates over `hist` + grid (see `crate::textsel`), so
+    /// it stays glued to its text while the pane scrolls. `None` = no selection.
+    sel: Option<((usize, usize), (usize, usize))>,
 }
 
 /// Minimal ANSI escape-sequence parser state for a pane's byte stream: we
@@ -246,6 +250,7 @@ impl Pane {
             grid: alloc::vec![(0u8, fg); (cols * rows) as usize],
             hist: VecDeque::new(),
             view: 0,
+            sel: None,
         }
     }
 
@@ -312,6 +317,7 @@ impl Pane {
         }
         self.hist.clear();
         self.view = 0;
+        self.sel = None;
         self.col = 0;
         self.row = 0;
         self.fg = self.default_fg;
@@ -795,6 +801,11 @@ impl Screen {
             p.hist.push_back(p.grid[..cols].to_vec());
             while p.hist.len() > HIST_MAX {
                 p.hist.pop_front();
+                // Absolute selection coordinates shift with the evicted line;
+                // a selection that loses its first line is dropped.
+                p.sel = p.sel.and_then(|((r1, c1), (r2, c2))| {
+                    (r1.min(r2) > 0).then(|| ((r1 - 1, c1), (r2 - 1, c2)))
+                });
             }
             p.grid.copy_within(cols.., 0);
             let start = p.grid.len() - cols;
@@ -828,13 +839,15 @@ impl Screen {
     }
 
     /// Repaint a pane's interior from its scrollback + grid at the current view
-    /// offset. The one text renderer used by scroll, redraw, and relayout.
+    /// offset. The one text renderer used by scroll, redraw, relayout, and the
+    /// mouse selection (whose cells get the selection background).
     fn render_view(&self, p: &Pane) {
         self.fill_rect(p.ix, p.iy, p.cols * p.cw, p.rows * p.ch, p.bg);
         let cols = p.cols as usize;
         if p.grid.len() < cols {
             return;
         }
+        let sel = p.sel.map(|(a, b)| crate::textsel::normalize(a, b));
         let view = p.view.min(p.hist.len());
         let first = p.hist.len() - view;
         for r in 0..p.rows as usize {
@@ -849,8 +862,14 @@ impl Screen {
                 &p.grid[gr * cols..(gr + 1) * cols]
             };
             for (c, &(b, fg)) in line.iter().enumerate().take(cols) {
+                let x = p.ix + c as u64 * p.cw;
+                let y = p.iy + r as u64 * p.ch;
+                let selected = sel.is_some_and(|s| crate::textsel::contains(s, gi, c));
+                if selected {
+                    self.fill_rect(x, y, p.cw, p.ch, self.theme.editor_sel);
+                }
                 if (0x21..=0x7e).contains(&b) {
-                    self.blit_glyph(p.ix + c as u64 * p.cw, p.iy + r as u64 * p.ch, b, fg, p.bg);
+                    self.blit_glyph(x, y, b, fg, if selected { self.theme.editor_sel } else { p.bg });
                 }
             }
         }
@@ -1751,7 +1770,7 @@ fn dummy_pane() -> Pane {
         fg: (0, 0, 0), default_fg: (0, 0, 0), bg: (0, 0, 0),
         esc: EscState::Ground, csi: [0; 32], csi_len: 0, bold: false,
         title: String::new(), show_caret: false,
-        grid: Vec::new(), hist: VecDeque::new(), view: 0,
+        grid: Vec::new(), hist: VecDeque::new(), view: 0, sel: None,
     }
 }
 
@@ -1840,8 +1859,12 @@ pub fn present_surface(id: u32, sw: usize, sh: usize, buf: &[u32]) {
         let ox = px + (pw.saturating_sub(dw)) / 2;
         let oy = py + (ph.saturating_sub(dh)) / 2;
         sc.fill_rect(px, py, pw, ph, sc.logs.bg); // clear the pane interior
-        for sy in 0..sh as u64 {
-            for sx in 0..sw as u64 {
+        // Clamp to the interior: a buffer wider than the pane at scale 1 must
+        // clip at the pane edge, never paint over the neighbouring pane.
+        let sw_vis = (sw as u64).min(pw / scale);
+        let sh_vis = (sh as u64).min(ph / scale);
+        for sy in 0..sh_vis {
+            for sx in 0..sw_vis {
                 let c = buf[(sy * sw as u64 + sx) as usize];
                 let rgb = (((c >> 16) & 0xff) as u8, ((c >> 8) & 0xff) as u8, (c & 0xff) as u8);
                 let bx = ox + sx * scale;
@@ -1855,6 +1878,16 @@ pub fn present_surface(id: u32, sw: usize, sh: usize, buf: &[u32]) {
         }
         sc.cursor_overlay();
     });
+}
+
+/// The action pane's interior size in pixels, if the split is open — the
+/// image viewer sizes its downscale to this before presenting.
+pub fn action_dims_px() -> Option<(u64, u64)> {
+    SCREEN.with(|slot| {
+        slot.as_ref().and_then(|sc| {
+            (sc.right != RightMode::Closed).then(|| (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch))
+        })
+    })
 }
 
 /// Open the `/top` dashboard in the action pane (filled by the shell's idle
@@ -1903,6 +1936,8 @@ pub fn editor_leave() {
 /// Render the editor into the right pane: title `editor: <file>`, the visible
 /// slice of `lines` from `top`, a reverse-video block cursor at
 /// `(cur_row, cur_col)`, and a bottom mode line. `gutter` toggles line numbers.
+/// `hl` is optional per-byte syntax colours for the visible lines (indexed
+/// from `top`; `None` entries fall back to the theme's `editor_fg`).
 #[allow(clippy::too_many_arguments)]
 pub fn editor_render(
     title: &str,
@@ -1912,6 +1947,7 @@ pub fn editor_render(
     cur_col: usize,
     modeline: &str,
     sel: Option<((usize, usize), (usize, usize))>,
+    hl: Option<&[Vec<Option<Rgb>>]>,
 ) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
@@ -1957,14 +1993,19 @@ pub fn editor_render(
                 sc.blit_glyph(x, y, b, sc.theme.editor_lineno, sc.theme.editor_bg);
                 x += cw;
             }
-            // Text, clipped to the pane width; selected cells get a highlight bg.
+            // Text, clipped to the pane width; selected cells get a highlight
+            // bg; syntax-highlighted bytes their class colour.
             let mut c = gutter;
             for (col, &b) in lines[li].as_bytes().iter().enumerate() {
                 if c >= cols {
                     break;
                 }
                 let bg = if in_sel(li, col) { sc.theme.editor_sel } else { sc.theme.editor_bg };
-                sc.blit_glyph(x, y, b, sc.theme.editor_fg, bg);
+                let fg = hl
+                    .and_then(|h| h.get(i as usize))
+                    .and_then(|v| v.get(col).copied().flatten())
+                    .unwrap_or(sc.theme.editor_fg);
+                sc.blit_glyph(x, y, b, fg, bg);
                 x += cw;
                 c += 1;
             }
@@ -2117,6 +2158,117 @@ pub fn pane_hit(x: u64, y: u64) -> Option<bool> {
             }
         })
     })
+}
+
+// --- chat-pane mouse text selection ---------------------------------------
+//
+// The editor already had drag-to-copy; this gives the chat pane the same:
+// press anchors a selection, drag extends it (highlight painted by
+// `render_view`), release hands the text to the shell for the clipboard.
+// Coordinates are absolute over scrollback + grid (`crate::textsel`), so a
+// selection stays glued to its text while output scrolls past.
+
+/// Map a pixel to a chat-pane cell `(absolute line, col)`. With `clamp`, a
+/// point outside the interior snaps to the nearest cell (so a drag past the
+/// pane edge keeps extending); without it, outside is `None`.
+fn chat_abs_cell(sc: &Screen, x: u64, y: u64, clamp: bool) -> Option<(usize, usize)> {
+    let p = &sc.chat;
+    let (x0, y0) = (p.ix, p.iy);
+    let (x1, y1) = (p.ix + p.cols * p.cw, p.iy + p.rows * p.ch);
+    let (cx, cy) = if clamp {
+        (x.clamp(x0, x1 - 1), y.clamp(y0, y1 - 1))
+    } else {
+        if x < x0 || x >= x1 || y < y0 || y >= y1 {
+            return None;
+        }
+        (x, y)
+    };
+    let col = (((cx - x0) / p.cw) as usize).min(p.cols as usize - 1);
+    let row = ((cy - y0) / p.ch) as usize;
+    let first = p.hist.len() - p.view.min(p.hist.len());
+    Some((first + row, col))
+}
+
+/// Repaint the chat pane after a selection change (sprite-safe).
+fn chat_sel_repaint(sc: &mut Screen) {
+    sc.cursor_restore();
+    sc.cur_vis = false;
+    sc.render_view(&sc.chat);
+    if sc.chat.view == 0 {
+        sc.caret_draw(&sc.chat);
+    }
+    sc.cursor_overlay();
+}
+
+/// Begin a mouse text selection at pixel `(x, y)`; replaces any previous one.
+/// No-op (but still clears) outside the chat pane interior.
+pub fn chat_sel_begin(x: u64, y: u64) {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            let cell = chat_abs_cell(sc, x, y, false);
+            let had = sc.chat.sel.take().is_some();
+            sc.chat.sel = cell.map(|c| (c, c));
+            if had || cell.is_some() {
+                chat_sel_repaint(sc);
+            }
+        }
+    });
+}
+
+/// Extend the active selection's head to the cell under `(x, y)` (clamped into
+/// the pane, so dragging past an edge selects to it). No-op without an anchor.
+pub fn chat_sel_drag(x: u64, y: u64) {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            let Some((anchor, head)) = sc.chat.sel else { return };
+            let Some(new_head) = chat_abs_cell(sc, x, y, true) else { return };
+            if new_head != head {
+                sc.chat.sel = Some((anchor, new_head));
+                chat_sel_repaint(sc);
+            }
+        }
+    });
+}
+
+/// Finish the selection on mouse release: returns the selected text when it
+/// spans more than one cell (a plain click copies nothing and just clears any
+/// stale highlight). The highlight stays visible until the next click.
+pub fn chat_sel_end() -> Option<String> {
+    SCREEN.with(|slot| {
+        let sc = slot.as_mut()?;
+        let (a, b) = sc.chat.sel?;
+        if a == b {
+            sc.chat.sel = None;
+            chat_sel_repaint(sc);
+            return None;
+        }
+        let p = &sc.chat;
+        let cols = p.cols as usize;
+        let text = crate::textsel::selection_text(
+            |i| {
+                if i < p.hist.len() {
+                    Some(p.hist[i].as_slice())
+                } else {
+                    let gr = i - p.hist.len();
+                    (gr < p.rows as usize && p.grid.len() >= (gr + 1) * cols).then(|| &p.grid[gr * cols..(gr + 1) * cols])
+                }
+            },
+            a,
+            b,
+        );
+        (!text.is_empty()).then_some(text)
+    })
+}
+
+/// Drop any chat selection and its highlight (e.g. a click somewhere else).
+pub fn chat_sel_clear() {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            if sc.chat.sel.take().is_some() {
+                chat_sel_repaint(sc);
+            }
+        }
+    });
 }
 
 /// Wipe the chat pane's text (grid + scrollback) and repaint it — `/clear`.

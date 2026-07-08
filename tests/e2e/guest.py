@@ -39,9 +39,13 @@ class Guest:
             env["CHITTI_HOSTFWD"] = str(hostfwd)
         # Opt-in FAT disk carrying `model_disk` as chat.gguf, for the runtime
         # `/model load` scenario; `no_model` boots with no model in RAM so the
-        # runtime-load path is proven from nothing.
+        # runtime-load path is proven from nothing. Such guests boot *next to*
+        # the main e2e guest, which holds QEMU's write lock on the shared
+        # voice-assets disk — skip it or the second QEMU fails to launch.
         if model_disk:
             env["CHITTI_MODEL_DISK"] = str(model_disk)
+        if no_model:
+            env["CHITTI_VOICE_DISK"] = "off"
         cmd = ["cargo", "xtask", "run", "-arch", arch, "-model", model]
         if no_model:
             cmd.append("--no-model")

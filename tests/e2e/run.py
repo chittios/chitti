@@ -271,6 +271,63 @@ def s_model_load(_g):
         g2.close()
 
 
+def s_open_media(_g):
+    """Prove the `/open` media paths end-to-end: boot a guest (audio="none" =
+    a real virtio-snd device on a silent backend) with a FAT disk carrying a
+    generated 3x2 PNG and a 0.3 s WAV, mount it, /open both. Headless, so the
+    assertions are the decode/playback reports on serial; the pixel/PCM math
+    is covered by the in-kernel unit tests."""
+    import struct
+    import tempfile
+    import wave
+    import zlib
+
+    def chunk(typ, data):
+        c = struct.pack(">I", len(data)) + typ + data
+        return c + struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", 3, 2, 8, 2, 0, 0, 0)
+    raw = (b"\x00" + bytes([255, 0, 0, 0, 255, 0, 0, 0, 255])
+           + b"\x00" + bytes([10, 20, 30, 40, 50, 60, 250, 249, 245]))
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+           + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+    png_path = os.path.join(tempfile.gettempdir(), "chitti-e2e.png")
+    with open(png_path, "wb") as f:
+        f.write(png)
+    wav_path = os.path.join(tempfile.gettempdir(), "chitti-e2e.wav")
+    w = wave.open(wav_path, "w")
+    w.setnchannels(1)
+    w.setsampwidth(2)
+    w.setframerate(16000)
+    n = 4800  # 0.3 s
+    w.writeframes(b"".join(struct.pack("<h", int(8000 * ((i // 20) % 2 * 2 - 1))) for i in range(n)))
+    w.close()
+    g2 = Guest(arch=RUN_ARCH, verbose=RUN_VERBOSE, no_model=True, audio="none",
+               model_disk=f"{png_path}:{wav_path}")
+    try:
+        if not g2.wait_for("net: configured", 180):
+            return False, "media guest never booted"
+        # The harness FAT disk's index varies by arch/attach order: mount each
+        # candidate and /open until the decode report appears.
+        for d in range(4):
+            g2.send(f"/mount {d} 0 /img{d}")
+            g2.wait_quiet(0.5, 30)
+            m = g2.mark()
+            g2.send(f"/open /img{d}/chitti-e2e.png")
+            if not g2.wait_for("3x2 px", 15, m):
+                continue
+            # Same mount also carries the WAV: decode + play it to the end.
+            m = g2.mark()
+            g2.send(f"/open /img{d}/chitti-e2e.wav")
+            if not g2.wait_for("open> playing", 15, m):
+                return False, "WAV did not start playing"
+            ok = g2.wait_for("open> played", 30, m)
+            return ok, "PNG previewed + WAV played via /open" if ok else "WAV playback never finished"
+        return False, "no '3x2 px' decode report from /open on any mount"
+    finally:
+        g2.close()
+
+
 # --- voice scenarios — slow, need assets/voice + a sound device -------------
 
 def s_voice_models(g):
@@ -467,7 +524,7 @@ def s_surface(g):
     return ok, "surface drawn (grammar-validated draw ops rasterized)" if ok else "no surface render"
 
 
-OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS]
+OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [("open_media", s_open_media)]
 AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface)]
 NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_stream", s_http_stream), ("ws", s_ws), ("cancel", s_cancel)]
 
