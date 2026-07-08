@@ -270,7 +270,13 @@ pub(crate) fn tcp_connect(ip: Ipv4Address, port: u16, deadline: u64) -> Result<s
         // interface's context so its source address is chosen from it: 127.0.0.1
         // for loopback (segments loop back to a local listener), the NIC address
         // otherwise. The two sets are polled independently, never cross-dispatched.
-        let local = 49152 + (crate::arch::now_ms() % 16000) as u16;
+        // Ephemeral source port from a monotonically-advancing counter (not the
+        // clock): rapid back-to-back connects — e.g. an MCP `/mcp connect`'s
+        // initialize→notify→tools/list within a few ms — must not reuse the same
+        // port while the prior socket is still closing, which would stall the
+        // new connect. Wraps over the 49152..=65535 ephemeral range.
+        static EPHEMERAL: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+        let local = 49152 + (EPHEMERAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 16000);
         let h = if is_loopback {
             let h = s.lo_sockets.add(sock);
             let cx = s.lo_iface.context();

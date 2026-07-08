@@ -39,6 +39,7 @@ pub mod json;
 pub mod keyrepeat;
 pub mod ktrace;
 pub mod limine_protocol;
+pub mod mcp;
 pub mod mm;
 pub mod modal;
 pub mod mouse;
@@ -1049,6 +1050,57 @@ fn scope_gate_enforces_fs_path_scope() {
     let denied = synapse::execute(task, r#"{"name":"mem_fs_write","arguments":{"path":"/etc/passwd","text":"x"}}"#);
     assert!(matches!(denied, synapse::Invocation::DeniedScope { .. }), "out-of-scope write should be denied: {denied:?}");
     assert!(!synapse::fs::exists("/etc/passwd"), "out-of-scope write must not have happened");
+
+    let _ = sched::kill(task);
+}
+
+/// A home-sandboxed agent (the default for every non-orchestrator agent) may
+/// read/write inside its own `/agent/<id>/` folder but is denied everywhere
+/// else, and `list`/`search` are scope-filtered so they cannot enumerate the
+/// store outside the sandbox — the per-agent filesystem confinement.
+#[test_case]
+fn agent_home_sandbox_confines_fs_and_list() {
+    use agent::types::{AgentId, AgentKind, CapabilityRequest, CapDomain, Rights, Scope};
+
+    // Two files the agent must NOT see: one outside, one is another agent's.
+    synapse::fs::write("/etc/other", b"secret");
+    synapse::fs::write("/agent/9999/note", b"neighbour");
+
+    // The baseline sandbox an installed (non-orchestrator) agent gets.
+    let id = AgentId(4242);
+    let base = alloc::vec::Vec::new();
+    let caps = skills::install::with_home_sandbox(&base, id, AgentKind::SkillAgent);
+    assert!(caps.iter().any(|c| c.domain == CapDomain::Fs), "home Fs cap injected");
+
+    let task = sched::spawn_parked("sandboxed");
+    agent::manifest::grant_to_task(task, &caps);
+
+    // In-home write + read: allowed.
+    let w = synapse::execute(task, r#"{"name":"mem_fs_write","arguments":{"path":"/agent/4242/memory/x","text":"mine"}}"#);
+    assert!(matches!(w, synapse::Invocation::Executed { .. }), "in-home write: {w:?}");
+    let r = synapse::execute(task, r#"{"name":"mem_fs_read","arguments":{"path":"/agent/4242/memory/x"}}"#);
+    assert!(matches!(r, synapse::Invocation::Executed { .. }), "in-home read: {r:?}");
+
+    // Out-of-home read + write: denied by the scope gate.
+    let ro = synapse::execute(task, r#"{"name":"mem_fs_read","arguments":{"path":"/etc/other"}}"#);
+    assert!(matches!(ro, synapse::Invocation::DeniedScope { .. }), "out-of-home read denied: {ro:?}");
+    let wo = synapse::execute(task, r#"{"name":"mem_fs_write","arguments":{"path":"/agent/9999/steal","text":"x"}}"#);
+    assert!(matches!(wo, synapse::Invocation::DeniedScope { .. }), "cross-agent write denied: {wo:?}");
+    assert!(!synapse::fs::exists("/agent/9999/steal"));
+
+    // list + search: only the agent's own file, never /etc/other or 9999's.
+    if let synapse::Invocation::Executed { result, .. } = synapse::execute(task, r#"{"name":"list","arguments":{}}"#) {
+        assert!(result.contains("/agent/4242/memory/x"), "own file listed: {result}");
+        assert!(!result.contains("/etc/other") && !result.contains("/agent/9999/"), "list leaked outside home: {result}");
+    }
+    let s = synapse::execute(task, r#"{"name":"mem_fs_search","arguments":{"query":"secret"}}"#);
+    if let synapse::Invocation::Executed { result, .. } = s {
+        assert!(!result.contains("/etc/other"), "search leaked outside home: {result}");
+    }
+
+    // The orchestrator (root) is never sandboxed: with_home_sandbox is a no-op.
+    let root = skills::install::with_home_sandbox(&base, AgentId(1), AgentKind::Orchestrator);
+    assert!(root.is_empty(), "orchestrator keeps its own (full) caps, no home injection");
 
     let _ = sched::kill(task);
 }

@@ -89,6 +89,7 @@ pub fn orchestrator_manifest() -> AgentManifest {
         },
         summary: SummaryPolicy { max_tokens: 512, style: SummaryStyle::Structured },
         origin: Origin::Builtin,
+        mcp_servers: alloc::vec::Vec::new(),
     }
 }
 
@@ -139,6 +140,7 @@ pub fn worker_subagent_manifest() -> AgentManifest {
         },
         summary: SummaryPolicy { max_tokens: 256, style: SummaryStyle::Terse },
         origin: Origin::Builtin,
+        mcp_servers: alloc::vec::Vec::new(),
     }
 }
 
@@ -169,6 +171,7 @@ pub fn reader_subagent_manifest() -> AgentManifest {
         },
         summary: SummaryPolicy { max_tokens: 256, style: SummaryStyle::Terse },
         origin: Origin::Builtin,
+        mcp_servers: alloc::vec::Vec::new(),
     }
 }
 

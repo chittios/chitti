@@ -257,6 +257,7 @@ pub fn sample_report_agent(skill_id: SkillId, agent_id: AgentId) -> SkillPackage
         },
         summary: SummaryPolicy { max_tokens: 256, style: SummaryStyle::Terse },
         origin: Origin::Installed { skill: skill_id },
+        mcp_servers: alloc::vec::Vec::new(),
     };
     let soul_ref = StoreKey(alloc::format!("/agent/{}/SOUL.md", agent_id.0));
     let manifest = SkillManifest {

@@ -81,6 +81,7 @@ pub struct ParsedManifest {
     pub capabilities: Vec<CapabilityRequest>,
     pub default_port: u16,
     pub autostart: bool,
+    pub mcp_servers: Vec<crate::agent::types::McpServerSpec>,
 }
 
 fn parse_domain(s: &str) -> Option<CapDomain> {
@@ -165,6 +166,21 @@ pub fn parse_manifest(json: &str) -> Option<ParsedManifest> {
             }
         }
     }
+    // Optional `mcp_servers`: [{ "name", "url", "bearer"? }, …].
+    let mut mcp_servers = Vec::new();
+    if let Some(arr) = j.get("mcp_servers").and_then(|m| m.as_array()) {
+        for s in arr {
+            if let (Some(name), Some(url)) =
+                (s.get("name").and_then(|v| v.as_str()), s.get("url").and_then(|v| v.as_str()))
+            {
+                mcp_servers.push(crate::agent::types::McpServerSpec {
+                    name: name.to_string(),
+                    url: url.to_string(),
+                    bearer: s.get("bearer").and_then(|v| v.as_str()).map(|b| b.to_string()),
+                });
+            }
+        }
+    }
     Some(ParsedManifest {
         name: j.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         version: j.get("version").and_then(|v| v.as_str()).unwrap_or("0.0.0").to_string(),
@@ -174,6 +190,7 @@ pub fn parse_manifest(json: &str) -> Option<ParsedManifest> {
         capabilities: caps,
         default_port: j.get("default_port").and_then(|v| v.as_i64()).unwrap_or(0) as u16,
         autostart: j.get("autostart").and_then(|v| v.as_bool()).unwrap_or(false),
+        mcp_servers,
     })
 }
 
@@ -219,6 +236,7 @@ fn build_package(def: &SystemAgentDef, m: &ParsedManifest, caps: &[CapabilityReq
         },
         summary: SummaryPolicy { max_tokens: 256, style: SummaryStyle::Terse },
         origin: Origin::Installed { skill: def.skill_id },
+        mcp_servers: m.mcp_servers.clone(),
     };
     // Bundled assets → manifest.assets (declared) + package payload (placed into
     // the agent's install folder by `place_agent_home`).

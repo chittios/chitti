@@ -10,6 +10,7 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use crate::mm::Locked;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
@@ -17,6 +18,16 @@ enum Mode {
     Insert,
     Command,
     Visual,
+}
+
+/// Byte-at-a-time ANSI escape decode state — replaces the old blocking
+/// `seq_byte()` spin so the editor can be driven one fed byte at a time (it is
+/// a background tab now, not a blocking modal loop).
+#[derive(PartialEq, Clone, Copy)]
+enum Esc {
+    Ground,
+    Esc,
+    Csi(u64),
 }
 
 struct Editor {
@@ -34,14 +45,26 @@ struct Editor {
     pending: u8, // pending operator: b'd', b'g', b'y', or 0
     sel_anchor: Option<(usize, usize)>, // (row, col) where Visual selection began
     rows: usize,
+    esc: Esc,
+    accel: crate::keyrepeat::Accel,
 }
 
-/// Open `path` in the editor. Returns `true` if the buffer was written at least
-/// once (so the caller can reload config, etc.). Blocks until `:q`/`:wq`.
-pub fn open(path: &str) -> bool {
+/// The single live editor, owned by its action-pane tab. Persists across tab
+/// switches — switching away leaves the buffer intact; switching back resumes
+/// exactly where it was. `None` when no editor tab is open.
+static EDITOR: Locked<Option<Editor>> = Locked::new(None);
+
+/// Set when the editor tab closes (`:q`), for the shell to pick up in its idle
+/// tick: `(path, saved)`. Used to re-apply an edited UI config.
+static CLOSED: Locked<Option<(String, bool)>> = Locked::new(None);
+
+/// Open `path` in an editor **tab** (the action pane). Non-blocking: it builds
+/// the buffer, opens the tab, focuses it, and returns immediately. Input is
+/// then routed one byte at a time via [`feed`] from the shell's line loop, so
+/// other tabs (a playing audio track, ktrace) keep running while you edit.
+pub fn open(path: &str) {
     let content = crate::synapse::fs::read(path).and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
-    let mut lines: Vec<String> =
-        content.split('\n').map(|s| s.trim_end_matches('\r').to_string()).collect();
+    let mut lines: Vec<String> = content.split('\n').map(|s| s.trim_end_matches('\r').to_string()).collect();
     if lines.is_empty() {
         lines.push(String::new());
     }
@@ -49,11 +72,10 @@ pub fn open(path: &str) -> bool {
     if lines.len() > 1 && lines.last().map(|l| l.is_empty()).unwrap_or(false) {
         lines.pop();
     }
-    // Split the action pane first, then measure it.
-    crate::framebuffer::editor_enter();
+    crate::framebuffer::editor_enter(); // add/select the editor tab
     let (_cols, rows) = crate::framebuffer::editor_dims().unwrap_or((60, 24));
     let exists = crate::synapse::fs::exists(path);
-    let mut ed = Editor {
+    let ed = Editor {
         path: path.to_string(),
         lines,
         cx: 0,
@@ -68,71 +90,91 @@ pub fn open(path: &str) -> bool {
         pending: 0,
         sel_anchor: None,
         rows,
+        esc: Esc::Ground,
+        accel: crate::keyrepeat::Accel::new(),
     };
-    ed.render();
-    // Held-key streaks (arrows, Backspace) accelerate: see `crate::keyrepeat`.
-    let mut accel = crate::keyrepeat::Accel::new();
-    while !ed.quit {
-        match crate::console::read_byte() {
-            // Esc is ambiguous over a byte stream: a bare Esc key, or the
-            // start of an ANSI CSI sequence (arrow/nav keys — all keyboard
-            // drivers emit terminal encodings). Coalesce like the shell's
-            // line editor does, so arrows move the cursor instead of Esc+'['
-            // +'A' dropping the editor to Normal mode and inserting garbage.
-            Some(0x1b) => {
-                if seq_byte() == Some(b'[') {
-                    let mut param: u64 = 0;
-                    let fin = loop {
-                        match seq_byte() {
-                            Some(b @ 0x40..=0x7e) => break Some(b),
-                            Some(d @ b'0'..=b'9') => param = param.saturating_mul(10) + (d - b'0') as u64,
-                            Some(_) => {}
-                            None => break None,
-                        }
-                    };
-                    if let Some(f) = fin {
-                        // Held Up/Down accelerates to multi-line steps.
-                        let n = if matches!(f, b'A' | b'B') { accel.steps(f, crate::arch::now_ms()) } else { 1 };
-                        for _ in 0..n {
-                            ed.nav(f, param);
-                        }
-                    }
-                } else {
-                    ed.handle(0x1b); // a real Esc keypress
-                }
-                ed.render();
-                crate::framebuffer::cursor_move_here();
-            }
-            Some(b) => {
-                // A held Backspace streak erases multiple chars per repeat.
-                let n = if b == 0x7f || b == 0x08 { accel.steps(0x08, crate::arch::now_ms()) } else { 1 };
-                for _ in 0..n {
-                    ed.handle(b);
-                }
-                ed.render();
-                crate::framebuffer::cursor_move_here();
-            }
-            None => {
-                ed.mouse_tick();
-                crate::shell::status_tick(); // keep clock/status/net alive while editing
-                crate::sched::yield_now();
-            }
-        }
-    }
-    crate::framebuffer::editor_leave();
-    ed.saved
+    EDITOR.with(|e| *e = Some(ed));
+    render_current();
+    crate::framebuffer::cursor_move_here();
 }
 
-/// After an Esc, wait briefly for the rest of an ANSI sequence (multi-byte
-/// arrow keys may still be in flight over serial). Bounded, like the shell's.
-fn seq_byte() -> Option<u8> {
-    for _ in 0..2000 {
-        if let Some(b) = crate::console::read_byte() {
-            return Some(b);
-        }
-        crate::sched::yield_now();
+/// Whether an editor tab is currently open.
+pub fn is_open() -> bool {
+    EDITOR.with(|e| e.is_some())
+}
+
+/// Feed one input byte to the editor (called by the shell when the editor tab
+/// is the focused action tab). Decodes ANSI escapes byte-by-byte via the
+/// `Esc` accumulator. On `:q` the tab closes.
+pub fn feed(byte: u8) {
+    let quit = EDITOR.with(|slot| {
+        let Some(ed) = slot.as_mut() else { return false };
+        ed.feed(byte);
+        ed.quit
+    });
+    if quit {
+        let (path, saved) = EDITOR.with(|slot| {
+            let ed = slot.take();
+            ed.map(|e| (e.path, e.saved)).unwrap_or_default()
+        });
+        crate::framebuffer::editor_leave();
+        CLOSED.with(|c| *c = Some((path, saved)));
+    } else {
+        render_current();
+        crate::framebuffer::cursor_move_here();
     }
-    None
+}
+
+/// Route a decoded ANSI navigation sequence (arrow/Home/End/PgUp/PgDn/Del) to
+/// the editor — the shell decodes CSI itself (to catch tab-switch chords), so
+/// it hands the rest here rather than replaying raw bytes.
+pub fn nav_seq(fin: u8, param: u64) {
+    EDITOR.with(|slot| {
+        if let Some(ed) = slot.as_mut() {
+            let n = if matches!(fin, b'A' | b'B') { ed.accel.steps(fin, crate::arch::now_ms()) } else { 1 };
+            for _ in 0..n {
+                ed.nav(fin, param);
+            }
+        }
+    });
+    render_current();
+    crate::framebuffer::cursor_move_here();
+}
+
+/// Force the editor tab shut (e.g. `/close` or `[x]` on the editor tab), without
+/// waiting for `:q`. Drops the buffer; the pane teardown is the caller's.
+pub fn force_close() {
+    EDITOR.with(|e| *e = None);
+}
+
+/// Repaint the editor into the pane (after a tab switch back to it).
+pub fn repaint() {
+    render_current();
+    crate::framebuffer::cursor_move_here();
+}
+
+/// Mouse handling while the editor tab is active (called from the shell's idle
+/// tick, which owns `mouse::tick`).
+pub fn mouse_tick() {
+    EDITOR.with(|slot| {
+        if let Some(ed) = slot.as_mut() {
+            ed.mouse_tick();
+        }
+    });
+}
+
+/// Take the just-closed `(path, saved)` note, if the editor quit since the last
+/// poll (so the shell can re-apply an edited UI config).
+pub fn take_closed() -> Option<(String, bool)> {
+    CLOSED.with(|c| c.take())
+}
+
+fn render_current() {
+    EDITOR.with(|slot| {
+        if let Some(ed) = slot.as_mut() {
+            ed.render();
+        }
+    });
 }
 
 impl Editor {
@@ -153,6 +195,45 @@ impl Editor {
             Mode::Insert => self.insert(b),
             Mode::Command => self.command(b),
             Mode::Visual => self.visual(b),
+        }
+    }
+
+    /// One fed byte through the ANSI-escape accumulator. Mirrors the old
+    /// blocking loop: bare Esc → Normal; `ESC [ … <final>` → `nav`; anything
+    /// else → `handle`, with held Backspace/arrows accelerated.
+    fn feed(&mut self, b: u8) {
+        match self.esc {
+            Esc::Ground => {
+                if b == 0x1b {
+                    self.esc = Esc::Esc;
+                } else {
+                    let n = if b == 0x7f || b == 0x08 { self.accel.steps(0x08, crate::arch::now_ms()) } else { 1 };
+                    for _ in 0..n {
+                        self.handle(b);
+                    }
+                }
+            }
+            Esc::Esc => {
+                if b == b'[' {
+                    self.esc = Esc::Csi(0);
+                } else {
+                    // A bare Esc keypress, then reprocess this byte in Ground.
+                    self.handle(0x1b);
+                    self.esc = Esc::Ground;
+                    self.feed(b);
+                }
+            }
+            Esc::Csi(param) => match b {
+                b'0'..=b'9' => self.esc = Esc::Csi(param.saturating_mul(10) + (b - b'0') as u64),
+                0x40..=0x7e => {
+                    self.esc = Esc::Ground;
+                    let n = if matches!(b, b'A' | b'B') { self.accel.steps(b, crate::arch::now_ms()) } else { 1 };
+                    for _ in 0..n {
+                        self.nav(b, param);
+                    }
+                }
+                _ => {} // intermediate byte: ignore, stay in CSI
+            },
         }
     }
 

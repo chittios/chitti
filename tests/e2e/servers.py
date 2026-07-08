@@ -103,6 +103,41 @@ def _handle(conn):
         elif path == "/json":
             body = b'{"ok":true,"who":"e2e"}'
             conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+        elif path == "/mcp":
+            # A minimal MCP server (JSON-RPC 2.0 over Streamable HTTP): supports
+            # initialize / notifications/initialized / tools/list / tools/call,
+            # exposing one "echo" tool. Enough to prove the in-kernel client.
+            n = int(hdrs.get("content-length", "0"))
+            raw = rest
+            while len(raw) < n:
+                raw += conn.recv(4096)
+            try:
+                req_obj = json.loads(raw or b"{}")
+            except Exception:
+                req_obj = {}
+            rpc_id = req_obj.get("id")
+            rpc_method = req_obj.get("method", "")
+            if rpc_id is None:
+                # A notification (e.g. notifications/initialized): 202, no body.
+                conn.sendall(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+            else:
+                if rpc_method == "initialize":
+                    result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                              "serverInfo": {"name": "e2e-mcp", "version": "1.0"}}
+                elif rpc_method == "tools/list":
+                    result = {"tools": [{"name": "echo",
+                                         "description": "Echo the given text back",
+                                         "inputSchema": {"type": "object",
+                                                         "properties": {"text": {"type": "string"}},
+                                                         "required": ["text"]}}]}
+                elif rpc_method == "tools/call":
+                    args = (req_obj.get("params") or {}).get("arguments") or {}
+                    text = args.get("text", args.get("input", ""))
+                    result = {"content": [{"type": "text", "text": "echo: " + str(text)}]}
+                else:
+                    result = {}
+                out = json.dumps({"jsonrpc": "2.0", "id": rpc_id, "result": result}).encode()
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: e2e-sess\r\nContent-Length: %d\r\n\r\n%s" % (len(out), out))
         elif path == "/logo.png":
             # A real 3x2 PNG for the `/http -O` download → `/open` roundtrip.
             import struct as _s

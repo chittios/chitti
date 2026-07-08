@@ -197,6 +197,7 @@ pub fn run() -> ! {
                 "model" => run_model(arg, &mut remote_on, &mut remote_cfg, &mut remote_chat, &mut chat),
                 "http" => run_http(arg),
                 "ws" => run_ws(arg),
+                "mcp" => run_mcp(arg),
                 "session" => {
                     let (sub, sarg) = match arg.split_once(' ') {
                         Some((s, a)) => (s, a.trim()),
@@ -541,6 +542,7 @@ fn print_help() {
     serial_println!("  /model [..]      chat backend: local (embedded) | remote <http://host:port> [name]");
     serial_println!("  /http [..] <url> curl-like: -X, -H, -d, -v, --stream; -O/-o downloads to /downloads/");
     serial_println!("  /ws <url> [msg]  WebSocket (ws:// or wss://): connect, send, stream frames");
+    serial_println!("  /mcp [..]        MCP client: connect <name> <url>; tools become agent-callable");
     serial_println!("  /skills          list installed skills (L0 metadata)");
     serial_println!("  /clear           reset the chat context + clear the pane (incl. scrollback)");
     serial_println!("  /infer           reference inference (fixed prompt, parity check)");
@@ -821,8 +823,16 @@ fn search_tools(query: &str) -> String {
     let words: alloc::vec::Vec<&str> = q.split_whitespace().collect();
     let mut out = String::new();
     let mut n = 0;
-    for d in crate::tools::registry::for_agent(&manifest.toolset) {
-        if !matches!(d.binding, ToolBinding::Shell { .. } | ToolBinding::SpawnSubagent) {
+    // The shell agent's discoverable set = its manifest toolset + every tool a
+    // connected MCP server registered (added at runtime by `/mcp connect`).
+    let mut toolset = manifest.toolset.clone();
+    for (srv, _, _) in crate::mcp::servers() {
+        for (t, _) in crate::mcp::server_tools(&srv) {
+            toolset.push(crate::mcp::tool_registry_name(&srv, &t));
+        }
+    }
+    for d in crate::tools::registry::for_agent(&toolset) {
+        if !matches!(d.binding, ToolBinding::Shell { .. } | ToolBinding::SpawnSubagent | ToolBinding::Mcp { .. }) {
             continue;
         }
         let hay = alloc::format!("{} {}", d.name, d.description).to_lowercase();
@@ -1552,6 +1562,25 @@ fn execute_chat_tool(name: &str, args: &str) -> alloc::string::String {
     // Tool discovery is chat-level, side-effect-free, and never needs approval.
     if name == "search_tools" {
         return search_tools(args);
+    }
+    // MCP tools (registered by `/mcp connect`) are called over the network,
+    // not through the shell dispatcher. They go through the same approval gate.
+    if let Some(ToolBinding::Mcp { server, tool }) = registry::get(name).map(|d| d.binding) {
+        let needs_approval = !matches!(approval_mode(), ApprovalMode::Bypass);
+        if needs_approval {
+            let ok = crate::modal::confirm(
+                "Agent MCP tool call \u{2014} approve?",
+                &alloc::format!("The agent wants to call MCP tool '{tool}' on server '{server}':\n{args}"),
+            );
+            if !ok {
+                serial_println!("\x1b[33m[denied by user]\x1b[0m");
+                return String::from("Denied: the user rejected this MCP tool call. Continue without it or explain what you needed.");
+            }
+        }
+        return match crate::mcp::call(&server, &tool, args) {
+            Ok(text) => text,
+            Err(e) => alloc::format!("MCP call failed: {e}"),
+        };
     }
     let (command, destructive) = match registry::get(name) {
         Some(def) => match def.binding {
@@ -2569,6 +2598,87 @@ fn run_http(arg: &str) {
 
 /// `/ws` — connect to a `ws://` WebSocket, optionally send a message, then
 /// stream incoming frames live until the peer closes, Ctrl+C, or Esc.
+/// `/mcp` — Model Context Protocol client (Claude-Code-style). Connect to an
+/// MCP server over HTTP; its tools become callable by the shell agent (via
+/// `search_tools` → the namespaced `mcp__<server>__<tool>` name). Subcommands:
+///   /mcp                      list connected servers + tool counts
+///   /mcp connect <name> <url> [bearer <token>]   connect + register its tools
+///   /mcp tools <name>         list a server's tools
+///   /mcp call <name> <tool> [json-args]          call a tool directly
+///   /mcp disconnect <name>    drop the server + its tools
+fn run_mcp(arg: &str) {
+    let toks = tokenize_args(arg);
+    let sub = toks.first().map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "" | "list" | "status" => {
+            let servers = crate::mcp::servers();
+            if servers.is_empty() {
+                serial_println!("mcp> no servers connected. Connect one:");
+                serial_println!("mcp>   /mcp connect <name> <http://host:port/mcp> [bearer <token>]");
+                return;
+            }
+            serial_println!("mcp> connected servers:");
+            for (name, url, count) in servers {
+                serial_println!("  {} \u{2014} {} ({} tool(s), call via mcp__{}__<tool>)", name, url, count, name);
+            }
+        }
+        "connect" => {
+            let name = toks.get(1).map(|s| s.as_str()).unwrap_or("");
+            let url = toks.get(2).map(|s| s.as_str()).unwrap_or("");
+            if name.is_empty() || url.is_empty() {
+                serial_println!("usage: /mcp connect <name> <url> [bearer <token>]");
+                serial_println!("  e.g. /mcp connect weather http://10.0.2.2:9000/mcp");
+                return;
+            }
+            let bearer = if toks.get(3).map(|s| s.as_str()) == Some("bearer") { toks.get(4).map(|s| s.as_str()) } else { None };
+            serial_println!("mcp> connecting to {} \u{2026}", url);
+            match crate::mcp::connect(name, url, bearer) {
+                Ok(count) => {
+                    serial_println!("mcp> connected '{}' \u{2014} registered {} tool(s):", name, count);
+                    for (t, desc) in crate::mcp::server_tools(name) {
+                        serial_println!("  mcp__{}__{}  \u{2014} {}", name, t, desc);
+                    }
+                    serial_println!("mcp> the shell agent can now call these (ask it, or /mcp call {} <tool>)", name);
+                }
+                Err(e) => serial_println!("mcp> connect failed: {}", e),
+            }
+        }
+        "tools" => {
+            let name = toks.get(1).map(|s| s.as_str()).unwrap_or("");
+            let tools = crate::mcp::server_tools(name);
+            if tools.is_empty() {
+                serial_println!("mcp> no tools (server '{}' not connected?)", name);
+            } else {
+                for (t, desc) in tools {
+                    serial_println!("  {} \u{2014} {}", t, desc);
+                }
+            }
+        }
+        "call" => {
+            let name = toks.get(1).map(|s| s.as_str()).unwrap_or("");
+            let tool = toks.get(2).map(|s| s.as_str()).unwrap_or("");
+            if name.is_empty() || tool.is_empty() {
+                serial_println!("usage: /mcp call <server> <tool> [json-args]");
+                return;
+            }
+            // Everything after the tool name is the JSON arguments (may contain spaces).
+            let args = arg.splitn(4, char::is_whitespace).nth(3).unwrap_or("").trim();
+            match crate::mcp::call(name, tool, args) {
+                Ok(text) => serial_println!("mcp> {}", text),
+                Err(e) => serial_println!("mcp> {}", e),
+            }
+        }
+        "disconnect" | "remove" => {
+            let name = toks.get(1).map(|s| s.as_str()).unwrap_or("");
+            match crate::mcp::disconnect(name) {
+                Some(n) => serial_println!("mcp> disconnected '{}' ({} tool(s) removed)", name, n),
+                None => serial_println!("mcp> no server '{}'", name),
+            }
+        }
+        other => serial_println!("mcp> unknown subcommand '{}' (list|connect|tools|call|disconnect)", other),
+    }
+}
+
 fn run_ws(arg: &str) {
     let tokens = tokenize_args(arg);
     if tokens.is_empty() {
@@ -2735,9 +2845,23 @@ fn built_in_package(name: &str) -> Option<crate::skills::package::SkillPackage> 
     let mut pkg = match name {
         "report-writer" => crate::skills::package::sample_report_agent(next_skill_id(), next_agent_id()),
         "note-summarizer" => crate::skills::package::sample_note_summarizer(next_skill_id()),
+        // A skill-agent that declares an MCP server in its manifest — the
+        // install consent screen shows it and connects it on approval. The URL
+        // is the e2e harness gateway (inert off-test; retryable via /mcp).
+        "mcp-agent" => {
+            let mut p = crate::skills::package::sample_report_agent(next_skill_id(), next_agent_id());
+            if let Some(a) = p.manifest.agent.as_mut() {
+                a.mcp_servers.push(crate::agent::types::McpServerSpec {
+                    name: "harness".into(),
+                    url: "http://10.0.2.2:8100/mcp".into(),
+                    bearer: None,
+                });
+            }
+            p
+        }
         _ => return None,
     };
-    pkg.sign(); // sign with the registry key so verify() passes
+    pkg.sign(); // sign with the registry key so verify() passes (covers mcp_servers)
     Some(pkg)
 }
 
@@ -2869,8 +2993,14 @@ fn run_agent_install(arg: &str, chat: &mut Option<ChatSession>) {
     let reqs = pkg.manifest.requested_capabilities.clone();
     let lines = crate::skills::install::consent_prompt(&pkg);
     serial_println!("install> '{}' requests {} capabilit(ies):", pkg.manifest.name, reqs.len());
+    serial_println!("install>   (its own folder /agent/{}/ is always granted; anything below is extra)", pkg.manifest.agent.as_ref().map(|a| a.id.0).unwrap_or(0));
     let mut approved = alloc::vec::Vec::new();
     for (line, cap) in lines.iter().zip(reqs.iter()) {
+        // Flag a filesystem grant that reaches beyond the agent's own home —
+        // "full filesystem access" is the thing a human most needs to see.
+        let broad_fs = cap.domain == crate::agent::types::CapDomain::Fs
+            && !matches!(&cap.scope, crate::agent::types::Scope::Path(p) if p.starts_with("/agent/") || p.contains("$HOME"));
+        let line = if broad_fs { alloc::format!("{} \u{2014} \u{26a0} FULL filesystem access (beyond its own folder)", line) } else { line.clone() };
         let ok = if auto_yes {
             serial_println!("install>   [--yes] grant: {}", line);
             true
@@ -2882,6 +3012,25 @@ fn run_agent_install(arg: &str, chat: &mut Option<ChatSession>) {
             approved.push(cap.clone());
         } else {
             serial_println!("install>   denied: {}", line);
+        }
+    }
+    // MCP servers the agent declares: shown on the consent screen and, if
+    // approved, connected now so the agent's tools are live (their tools become
+    // callable as mcp__<name>__<tool>).
+    let mcp_servers = pkg.manifest.agent.as_ref().map(|a| a.mcp_servers.clone()).unwrap_or_default();
+    let mut approved_mcp = alloc::vec::Vec::new();
+    for s in &mcp_servers {
+        let line = alloc::format!("MCP server '{}' at {}", s.name, s.url);
+        let ok = if auto_yes {
+            serial_println!("install>   [--yes] connect: {}", line);
+            true
+        } else {
+            crate::modal::confirm("Install agent — MCP server", &alloc::format!("'{}' wants to connect an {}", pkg.manifest.name, line))
+        };
+        if ok {
+            approved_mcp.push(s.clone());
+        } else {
+            serial_println!("install>   declined: {}", line);
         }
     }
     let source = if registry.is_some() {
@@ -2900,6 +3049,15 @@ fn run_agent_install(arg: &str, chat: &mut Option<ChatSession>) {
             // A freshly installed agent may have a new home/persona; drop the
             // cached chat so the next turn can pick it up if switched to.
             let _ = chat;
+            // Connect the approved MCP servers now (needs the network up). A
+            // failed connect is a warning, not an install failure — the grant
+            // stands and the server can be reconnected with `/mcp connect`.
+            for s in &approved_mcp {
+                match crate::mcp::connect(&s.name, &s.url, s.bearer.as_deref()) {
+                    Ok(n) => serial_println!("install>   MCP '{}' connected ({} tool(s) registered)", s.name, n),
+                    Err(e) => serial_println!("install>   MCP '{}' not reachable now: {} (retry: /mcp connect {} {})", s.name, e, s.name, s.url),
+                }
+            }
         }
         Err(e) => serial_println!("install> failed: {:?}", e),
     }
@@ -3023,7 +3181,7 @@ static HISTORY: Locked<alloc::vec::Vec<String>> = Locked::new(alloc::vec::Vec::n
 /// Top-level `/command` names, for Tab completion (canonical names only, not
 /// aliases). Keep in sync with `dispatch_system` + the interactive arms.
 const COMMANDS: &[&str] = &[
-    "agents", "bench", "cat", "clear", "close", "compact", "datetime", "disks", "exit", "help", "http", "infer", "info", "model", "top", "ws",
+    "agents", "bench", "cat", "clear", "close", "compact", "datetime", "disks", "exit", "help", "http", "infer", "info", "mcp", "model", "top", "ws",
     "install", "ktrace", "ls", "mkext4", "mode", "mount", "mounts", "network", "open", "perf",
     "lspci", "onnx", "ping", "session", "shortcuts", "skills", "think", "ui", "umount", "voice", "wifi",
 ];
@@ -3157,9 +3315,42 @@ fn fb_focus_is_action() -> bool {
     #[cfg(test)]
     false
 }
+#[allow(dead_code)] // retained for a future explicit focus-toggle binding
 fn fb_focus_toggle() {
     #[cfg(not(test))]
     crate::framebuffer::focus_toggle();
+}
+/// True when the active action tab is the editor (so input routes to it).
+fn fb_editor_active() -> bool {
+    #[cfg(not(test))]
+    return crate::framebuffer::right_mode() == crate::framebuffer::RightMode::Editor;
+    #[cfg(test)]
+    false
+}
+/// Switch to the next/previous action tab, focus the pane, repaint it.
+fn tab_switch(forward: bool) {
+    #[cfg(not(test))]
+    {
+        crate::framebuffer::cycle_tab(forward);
+        crate::framebuffer::focus_set(true);
+        repaint_active_tab();
+    }
+    #[cfg(test)]
+    let _ = forward;
+}
+/// Feed one byte to the editor tab (test build: no-op).
+fn editor_feed(b: u8) {
+    #[cfg(not(test))]
+    crate::editor::feed(b);
+    #[cfg(test)]
+    let _ = b;
+}
+/// Route a decoded nav sequence to the editor tab (test build: no-op).
+fn editor_nav(fin: u8, param: u64) {
+    #[cfg(not(test))]
+    crate::editor::nav_seq(fin, param);
+    #[cfg(test)]
+    let _ = (fin, param);
 }
 
 /// Insert `c` into `buf` at the cursor, re-echoing the shifted tail.
@@ -3194,6 +3385,19 @@ fn read_line(buf: &mut String) {
     let mut accel = crate::keyrepeat::Accel::new();
     loop {
         match console::read_byte() {
+            // Ctrl+C at the prompt stops the background audio player (global).
+            Some(0x03) => {
+                #[cfg(not(feature = "server"))]
+                if audio_loaded() {
+                    stop_audio();
+                }
+            }
+            // The editor tab owns input while it's the active action tab: every
+            // byte except ESC (nav, handled below) and the reserved globals
+            // Ctrl+C / Ctrl+W goes to the editor. Enter/Tab/Backspace all edit.
+            Some(b) if fb_editor_active() && b != 0x1b && b != 0x03 && b != 0x17 => {
+                editor_feed(b);
+            }
             Some(b'\r') | Some(b'\n') => {
                 fb_scroll_live(false);
                 cursor_shift(buf.len() - cur, true);
@@ -3223,6 +3427,23 @@ fn read_line(buf: &mut String) {
                         None => break None,
                     }
                 };
+                // Ctrl+Tab / Shift+Tab: cycle action-pane tabs (tmux-style), a
+                // global chord that works even while the editor tab is focused.
+                if matches!(fin, Some(b'T')) {
+                    tab_switch(true);
+                    continue;
+                }
+                if matches!(fin, Some(b'Z')) {
+                    tab_switch(false);
+                    continue;
+                }
+                // Editor tab active: forward arrow/nav sequences to the editor.
+                if fb_editor_active() {
+                    if let Some(f) = fin {
+                        editor_nav(f, param);
+                    }
+                    continue;
+                }
                 let action = fb_focus_is_action();
                 // Held arrows accelerate (multi-step) like held Backspace.
                 let steps = match fin {
@@ -3286,10 +3507,7 @@ fn read_line(buf: &mut String) {
                         cursor_shift(buf.len() - cur, true);
                         cur = buf.len();
                     }
-                    // Ctrl+Tab (driver-encoded) / Shift+Tab: toggle pane focus.
-                    Some(b'T') | Some(b'Z') => {
-                        fb_focus_toggle();
-                    }
+                    // (Ctrl+Tab / Shift+Tab handled above as tab switching.)
                     Some(b'~') => match param {
                         1 | 7 => {
                             cursor_shift(cur, false);
@@ -3334,7 +3552,7 @@ fn read_line(buf: &mut String) {
                 }
             }
             // Ctrl+W: close the action (right) pane — a keyboard shortcut for /close.
-            Some(0x17) => close_action(),
+            Some(0x17) => close_active_tab(),
             // Ctrl+V: paste the clipboard into the input line (newlines → spaces).
             Some(0x16) => {
                 if let Some((text, _)) = crate::clipboard::get() {
@@ -3444,7 +3662,13 @@ fn ui_tick() {
         }
         if t.pressed {
             if crate::framebuffer::hit_close(t.x, t.y) {
-                crate::framebuffer::close_action();
+                close_active_tab();
+            } else if let Some(i) = crate::framebuffer::tab_hit(t.x, t.y) {
+                // Click a tab label: select it, focus the action pane, repaint.
+                crate::framebuffer::select_tab(i);
+                crate::framebuffer::focus_set(true);
+                repaint_active_tab();
+                crate::framebuffer::chat_sel_clear();
             } else if let Some(action) = crate::framebuffer::pane_hit(t.x, t.y) {
                 crate::framebuffer::focus_set(action);
                 if action {
@@ -3472,13 +3696,75 @@ fn ui_tick() {
             let action = crate::framebuffer::pane_hit(t.x, t.y).unwrap_or(false);
             crate::framebuffer::scroll_view(action, t.wheel as i64 * 3);
         }
-        // Live `/top` dashboard: refresh ~1 Hz while its pane is open.
-        if crate::framebuffer::is_top() && now.saturating_sub(LAST_TOP_MS.load(Ordering::Relaxed)) >= 1000 {
-            LAST_TOP_MS.store(now, Ordering::Relaxed);
-            refresh_top();
+        // Background audio: feed the sound device chunk-by-chunk regardless of
+        // which tab is shown, so playback continues across tab switches.
+        pump_audio();
+        // Editor closed (`:q`) since last tick → re-apply an edited UI config.
+        if let Some((path, saved)) = crate::editor::take_closed() {
+            serial_println!("editor> closed {}", path);
+            if saved && path == crate::ui_config::ui_path() {
+                crate::ui_config::reload_and_apply();
+                update_status();
+                serial_println!("ui> re-applied edited config");
+            }
+        }
+        // Per-active-tab idle repaint: /top ~1 Hz, audio ~4 Hz, editor mouse.
+        match crate::framebuffer::right_mode() {
+            crate::framebuffer::RightMode::Top => {
+                if now.saturating_sub(LAST_TOP_MS.load(Ordering::Relaxed)) >= 1000 {
+                    LAST_TOP_MS.store(now, Ordering::Relaxed);
+                    refresh_top();
+                }
+            }
+            crate::framebuffer::RightMode::Audio => {
+                if now.saturating_sub(LAST_AUDIO_MS.load(Ordering::Relaxed)) >= 250 {
+                    LAST_AUDIO_MS.store(now, Ordering::Relaxed);
+                    repaint_audio();
+                }
+            }
+            crate::framebuffer::RightMode::Editor => crate::editor::mouse_tick(),
+            _ => {}
         }
     }
 }
+
+static LAST_AUDIO_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Repaint the active action tab's interior (after a tab switch): /top, audio,
+/// image, and the editor own their pixels and must be re-drawn on switch;
+/// ktrace repaints from its grid during the switch's `redraw`.
+#[cfg(not(test))]
+fn repaint_active_tab() {
+    match crate::framebuffer::right_mode() {
+        crate::framebuffer::RightMode::Top => refresh_top(),
+        crate::framebuffer::RightMode::Audio => repaint_audio(),
+        crate::framebuffer::RightMode::Surface(_) => repaint_image(),
+        crate::framebuffer::RightMode::Editor => crate::editor::repaint(),
+        _ => {}
+    }
+}
+#[cfg(test)]
+fn repaint_active_tab() {}
+
+/// Close the active action tab, tearing down its background process: stop audio
+/// if the audio tab, drop the editor if the editor tab.
+#[cfg(not(test))]
+fn close_active_tab() {
+    match crate::framebuffer::right_mode() {
+        crate::framebuffer::RightMode::Audio => {
+            stop_audio();
+            crate::framebuffer::close_action();
+        }
+        crate::framebuffer::RightMode::Editor => {
+            crate::editor::force_close();
+            crate::framebuffer::close_action();
+        }
+        _ => crate::framebuffer::close_action(),
+    }
+    repaint_active_tab();
+}
+#[cfg(test)]
+fn close_active_tab() {}
 
 static LAST_TOP_MS: AtomicU64 = AtomicU64::new(0);
 /// `/top` per-core utilisation is measured across refreshes: the previous
@@ -3645,22 +3931,25 @@ fn toggle_ktrace() {
     #[cfg(not(test))]
     {
         use crate::framebuffer::{self, RightMode};
-        if framebuffer::right_mode() == RightMode::Ktrace {
-            framebuffer::close_action();
-            serial_println!("ktrace> hidden (action pane closed)");
+        if framebuffer::has_tab(RightMode::Ktrace) {
+            framebuffer::close_tab_mode(RightMode::Ktrace);
+            repaint_active_tab();
+            serial_println!("ktrace> tab closed");
         } else {
             framebuffer::open_ktrace();
-            serial_println!("ktrace> showing in the action pane (/close or Ctrl+W to hide)");
+            serial_println!("ktrace> showing as an action tab (Ctrl+Tab switches tabs, /close closes it)");
         }
     }
 }
 
-/// `/close` (also Ctrl+W) — close the action pane; chat becomes full-width.
+/// `/close` (also Ctrl+W) — close the **active** action tab; the pane collapses
+/// once the last tab closes. Tears down that tab's process (stops audio,
+/// drops the editor buffer).
 fn close_action() {
     #[cfg(not(test))]
     {
-        crate::framebuffer::close_action();
-        serial_println!("(action pane closed)");
+        close_active_tab();
+        serial_println!("(closed the active tab)");
     }
 }
 
@@ -3699,27 +3988,38 @@ fn run_open_inner(arg: &str) {
     }
     #[cfg(not(test))]
     {
-        let saved = crate::editor::open(arg);
-        serial_println!("editor> closed {}", arg);
-        if saved && arg == crate::ui_config::ui_path() {
-            crate::ui_config::reload_and_apply();
-            update_status();
-            serial_println!("ui> re-applied edited config");
-        }
+        // Non-blocking: opens an editor tab and focuses it; input is routed
+        // from the shell loop, so audio/ktrace tabs keep running. The tab
+        // stays alive across switches; `:q` closes it (the ui.json re-apply
+        // happens then, via `editor::take_closed()` polled in `ui_tick`).
+        crate::editor::open(arg);
+        crate::framebuffer::focus_set(true);
+        serial_println!("editor> {} open in a tab — i insert, Esc normal, :w write, :q quit; Ctrl+Tab switches tabs", arg);
     }
     #[cfg(test)]
     let _ = arg;
 }
 
-/// Surface id the `/open` image viewer presents on (distinct from any
-/// agent-allocated `synapse::ui` surface).
+/// Surface id the `/open` image viewer presents on (labelled "image" in the
+/// tab bar; distinct from any agent-allocated `synapse::ui` surface).
 #[cfg(not(feature = "server"))]
-const VIEWER_SURFACE: u32 = u32::MAX;
+const VIEWER_SURFACE: u32 = u32::MAX; // == framebuffer::IMAGE_SURFACE (labelled "image")
 
-/// `/open <path>.png|.jpg` — decode and show an image in the action pane.
+/// The last decoded+scaled image, retained so the image tab repaints when you
+/// switch back to it (surfaces aren't otherwise backed).
+#[cfg(not(feature = "server"))]
+struct ImageTab {
+    w: usize,
+    h: usize,
+    pixels: alloc::vec::Vec<u32>,
+}
+#[cfg(not(feature = "server"))]
+static IMAGE: crate::mm::Locked<Option<ImageTab>> = crate::mm::Locked::new(None);
+
+/// `/open <path>.png|.jpg` — decode and show an image in an action-pane tab.
 /// Reads from a mounted volume (`/mnt/...`) or the Synapse store; the decoded
 /// image is box-downscaled to the pane, then integer-upscaled/letterboxed by
-/// the compositor.
+/// the compositor, and retained so switching back to the tab repaints it.
 #[cfg(not(feature = "server"))]
 fn view_image(path: &str) {
     let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
@@ -3732,17 +4032,18 @@ fn view_image(path: &str) {
             let (iw, ih) = (img.w, img.h);
             #[cfg(not(test))]
             {
-                // Open the pane first so the downscale can target its real size.
+                // Open the tab first so the downscale can target its real size.
                 crate::framebuffer::set_right(crate::framebuffer::RightMode::Surface(VIEWER_SURFACE));
                 let (pw, ph) = crate::framebuffer::action_dims_px().unwrap_or((640, 480));
                 let (nw, nh) = crate::image::fit(img.w, img.h, pw as usize, ph as usize);
                 let scaled = if (nw, nh) == (img.w, img.h) { img } else { crate::image::resize(&img, nw, nh) };
                 crate::framebuffer::present_surface(VIEWER_SURFACE, scaled.w, scaled.h, &scaled.pixels);
+                IMAGE.with(|s| *s = Some(ImageTab { w: scaled.w, h: scaled.h, pixels: scaled.pixels }));
             }
             #[cfg(test)]
             drop(img);
             serial_println!(
-                "open> {} — {}x{} px, {} KiB, decoded in {} ms (/close to hide)",
+                "open> {} — {}x{} px, {} KiB, decoded in {} ms (Ctrl+Tab switches tabs, /close hides)",
                 path,
                 iw,
                 ih,
@@ -3754,11 +4055,41 @@ fn view_image(path: &str) {
     }
 }
 
-/// `/open <path>.wav|.mp3` — decode (RIFF/WAVE or MPEG Layer III) and play
-/// through the sound device at the file's own sample rate. The PCM is fed in
-/// ~50 ms chunks so the queue-full backpressure paces the loop in real time
-/// while `upkeep()` keeps the UI alive, and Ctrl+C stops within a chunk (the
-/// device just drains its last few periods) — the standing interrupt rule.
+/// Repaint the retained image into its tab (after a tab switch back to it).
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn repaint_image() {}
+#[cfg(all(not(feature = "server"), not(test)))]
+fn repaint_image() {
+    IMAGE.with(|s| {
+        if let Some(img) = s.as_ref() {
+            crate::framebuffer::present_surface(VIEWER_SURFACE, img.w, img.h, &img.pixels);
+        }
+    });
+}
+
+/// A background audio player: the decoded PCM plus a cursor. Lives in a static
+/// so playback continues while you switch tabs or run other commands — it is
+/// pumped one chunk at a time from `ui_tick` (`pump_audio`), like `/top`
+/// refreshes. `done` latches at end-of-track.
+#[cfg(not(feature = "server"))]
+struct AudioPlayer {
+    pcm: alloc::vec::Vec<i16>,
+    rate: u32,
+    at: usize,
+    name: String,
+    total_ms: u64,
+    done: bool,
+    finished_announced: bool,
+}
+#[cfg(not(feature = "server"))]
+static AUDIO: crate::mm::Locked<Option<AudioPlayer>> = crate::mm::Locked::new(None);
+
+/// `/open <path>.wav|.mp3` — decode (RIFF/WAVE or MPEG Layer III) and play in
+/// the background at the file's own sample rate, in an "audio" action-pane tab.
+/// Non-blocking: it starts playback and returns; `pump_audio` (idle tick) feeds
+/// the device chunk by chunk, so switching tabs, editing, or running other
+/// commands never interrupts the track. `/close` (or Ctrl+C at the prompt)
+/// stops it.
 #[cfg(not(feature = "server"))]
 fn play_audio(path: &str) {
     let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
@@ -3775,7 +4106,7 @@ fn play_audio(path: &str) {
     };
     let total_ms = audio.duration_ms();
     serial_println!(
-        "open> playing {} — {}:{:02} at {} Hz ({} KiB, decoded in {} ms; Ctrl+C stops)",
+        "open> playing {} — {}:{:02} at {} Hz ({} KiB, decoded in {} ms)",
         path,
         total_ms / 60000,
         total_ms % 60000 / 1000,
@@ -3787,47 +4118,89 @@ fn play_audio(path: &str) {
         serial_println!("open> no sound device — decoded OK but cannot play");
         return;
     }
-    let chunk = (audio.rate as usize / 20).max(64); // ~50 ms of samples
-    let mut at = 0usize;
-    let mut cancelled = false;
-    let mut last_line_ms = 0u64;
-    while at < audio.pcm.len() {
-        if poll_interrupt() {
-            cancelled = true;
-            break;
-        }
-        let end = (at + chunk).min(audio.pcm.len());
-        if let Err(e) = crate::sound::play(&audio.pcm[at..end], audio.rate) {
-            serial_println!("open> play failed: {}", e);
-            return;
-        }
-        at = end;
-        upkeep();
-        // One status line, rewritten in place about once a second.
-        let now = crate::arch::now_ms();
-        if now.saturating_sub(last_line_ms) >= 1000 {
-            last_line_ms = now;
-            let pos = at as u64 * 1000 / audio.rate.max(1) as u64;
-            emit(&alloc::format!("\r  {}:{:02} / {}:{:02} ", pos / 60000, pos % 60000 / 1000, total_ms / 60000, total_ms % 60000 / 1000));
-        }
-    }
-    // Let the device drain what is already queued (a Ctrl+C skips this: the
-    // last ≤50 ms fade out on their own).
-    while !cancelled && crate::sound::playing() {
-        if poll_interrupt() {
-            cancelled = true;
-            break;
-        }
-        upkeep();
-        crate::sched::yield_now();
-    }
-    if cancelled {
-        let pos = at as u64 * 1000 / audio.rate.max(1) as u64;
-        serial_println!("\ropen> stopped at {}:{:02} (Ctrl+C)", pos / 60000, pos % 60000 / 1000);
-    } else {
-        serial_println!("\ropen> played {} ({}:{:02})", path, total_ms / 60000, total_ms % 60000 / 1000);
+    serial_println!("open>   switch tabs freely, it keeps playing; Ctrl+C or /close stops");
+    let name = path.rsplit('/').next().unwrap_or(path).to_string();
+    AUDIO.with(|a| {
+        *a = Some(AudioPlayer { pcm: audio.pcm, rate: audio.rate, at: 0, name, total_ms, done: false, finished_announced: false })
+    });
+    #[cfg(not(test))]
+    {
+        crate::framebuffer::set_right(crate::framebuffer::RightMode::Audio);
+        repaint_audio();
     }
 }
+
+/// Whether a track is loaded (playing or paused at end).
+#[cfg(not(feature = "server"))]
+fn audio_loaded() -> bool {
+    AUDIO.with(|a| a.is_some())
+}
+
+/// Stop + unload the background track (Ctrl+C / closing the audio tab).
+#[cfg(not(feature = "server"))]
+fn stop_audio() {
+    let was = AUDIO.with(|a| a.take().is_some());
+    if was {
+        serial_println!("\ropen> audio stopped");
+    }
+}
+
+/// Feed the next chunk to the sound device when it has drained the previous
+/// one — the background-player heartbeat, called every idle tick. Copies the
+/// chunk out before playing so the `AUDIO` lock isn't held across the device
+/// enqueue. No-op when nothing is loaded or the device is still draining.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn pump_audio() {
+    if crate::sound::playing() {
+        return; // still draining the last chunk
+    }
+    let next = AUDIO.with(|a| {
+        let p = a.as_mut()?;
+        if p.done || p.at >= p.pcm.len() {
+            p.done = true;
+            return None;
+        }
+        let chunk = (p.rate as usize / 5).max(256); // ~200 ms
+        let end = (p.at + chunk).min(p.pcm.len());
+        let slice = p.pcm[p.at..end].to_vec();
+        p.at = end;
+        Some((slice, p.rate))
+    });
+    if let Some((slice, rate)) = next {
+        let _ = crate::sound::play(&slice, rate);
+    }
+    // Announce end-of-track once.
+    let finished = AUDIO.with(|a| a.as_mut().map(|p| p.done && !p.finished_announced && !crate::sound::playing()).unwrap_or(false));
+    if finished {
+        AUDIO.with(|a| {
+            if let Some(p) = a.as_mut() {
+                p.finished_announced = true;
+            }
+        });
+        serial_println!("\ropen> audio finished");
+    }
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn pump_audio() {}
+
+/// Repaint the audio tab (progress). Called on switch + ~4 Hz while active.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn repaint_audio() {
+    AUDIO.with(|a| {
+        if let Some(p) = a.as_ref() {
+            let pos_ms = p.at as u64 * 1000 / p.rate.max(1) as u64;
+            crate::framebuffer::draw_audio(&crate::framebuffer::AudioView {
+                name: &p.name,
+                pos_ms: pos_ms.min(p.total_ms),
+                total_ms: p.total_ms,
+                rate: p.rate,
+                playing: !p.done,
+            });
+        }
+    });
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn repaint_audio() {}
 
 /// `/shortcuts` — list the configured keyboard shortcuts (`shortcuts.json`).
 fn run_shortcuts() {
