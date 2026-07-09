@@ -340,7 +340,7 @@ mod tests {
 
     #[test_case]
     fn into_matches_alloc() {
-        let refp: alloc::vec::Vec<u8> = (0..256u8).collect();
+        let refp: alloc::vec::Vec<u8> = (0..=255u8).collect();
         let a = luma_block(&refp, 16, 16, 4, 4, 8, 8, 5, 3);
         let mut b = [0i32; 64];
         luma_block_into(&mut b, &refp, 16, 16, 4, 4, 8, 8, 5, 3);

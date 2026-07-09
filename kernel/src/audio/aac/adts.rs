@@ -199,18 +199,18 @@ mod tests {
 
     #[test_case]
     fn parse_header_lc_stereo() {
-        // Craft minimal ADTS: sync, MPEG4, LC profile, 44100, stereo, len=7+1
+        // Craft minimal ADTS: sync, MPEG4, LC profile, 44100, stereo, len=7+1.
+        // Channel config is 3 bits: bit0 of byte2 (MSB of cfg) + top 2 of byte3.
+        // stereo = 2 = 0b010 → chan_hi=0, chan_lo=0b10.
         let mut h = [0u8; 8];
         h[0] = 0xff;
-        h[1] = 0xf1; // MPEG-4, layer 0, CRC absent
-        // profile=1 (LC) → bits 01xxxxxx, freq_idx=4 (44100)=0100, chan starts
-        // byte2: profile(2) sampling(4) private(1) chan_hi(1)
-        // profile=1 → 01, freq=4 → 0100, private=0, chan_hi=1 (for ch=2 → 010)
-        h[2] = 0b01_0100_0_1;
-        // byte3: chan_lo(2)=10, original, home, copyright, copy_start, frame_len hi(2)
-        // ch=2 → 10; frame_len=8 → ...
+        h[1] = 0xf1; // MPEG-4, layer 0, CRC absent (protection_absent=1)
+        // byte2: profile(2)=01 LC, sampling(4)=0100 (44.1k), private=0, chan_hi=0
+        h[2] = 0b01_0100_0_0;
+        // byte3: chan_lo(2)=10, orig/home/copy/copy_start=0, frame_len[12:11]=00
         h[3] = 0b10_0_0_0_0_00;
-        h[4] = 0x01; // frame_len mid: (1<<3)=8 with lo=0
+        // frame_length = 8: bits in [3:5] → value 8 with hdr=7
+        h[4] = 0x01; // frame_len mid contributes (1<<3)=8 when lo bits of byte5 are 0
         h[5] = 0x00;
         h[6] = 0x00;
         h[7] = 0x00;
@@ -220,5 +220,6 @@ mod tests {
         assert_eq!(info.sample_rate, 44100);
         assert_eq!(info.channels, 2);
         assert_eq!(info.aot, 2); // LC
+        assert_eq!(info.chan_cfg, 2);
     }
 }

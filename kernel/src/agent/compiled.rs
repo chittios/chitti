@@ -115,7 +115,8 @@ pub fn replay(session: &mut Session, caller: crate::sched::TaskId, calls: &[Tool
         session.push_assistant_tool_calls(String::new(), alloc::vec![call.clone()], now());
         session.budget.tool_calls_used += 1;
         let outcome = tools.call(session, caller, call);
-        session.push_tool_result(call.call_id, outcome.result, outcome.provenance, now());
+        let text = crate::agent::agent_loop::format_tool_result(outcome.is_error, outcome.result);
+        session.push_tool_result(call.call_id, text, outcome.provenance, now());
     }
     session.push_message(Role::Assistant, answer.to_string(), Provenance::SystemTrusted, now());
     answer.to_string()

@@ -831,8 +831,10 @@ mod tests {
     #[test_case]
     fn parse_asc_mono_48k() {
         // AOT=2, freq_idx=3 (48000), chcfg=1, frame 1024
-        // bits: 00010 0011 0001 000 → 0x13 0x10
-        let a = parse_asc(&[0x13, 0x10]).unwrap();
+        // bits MSB-first: 00010 0011 0001 000 → 00010001 10001000 = 0x11 0x88
+        // (the old 0x13 0x10 fixture mis-packed the 4-bit freq across the byte
+        // boundary and actually decoded as 24 kHz / 2 ch).
+        let a = parse_asc(&[0x11, 0x88]).unwrap();
         assert_eq!(a.sample_rate, 48000);
         assert_eq!(a.channels, 1);
     }

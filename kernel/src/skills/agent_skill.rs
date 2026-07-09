@@ -49,6 +49,16 @@ pub fn by_name(name: &str) -> Option<AgentManifest> {
     ROLES.with(|roles| roles.iter().find(|r| r.manifest.name == name).map(|r| r.manifest.clone()))
 }
 
+/// Look up a registered skill-agent role by agent id (used by `/agents switch`).
+pub fn by_id(id: AgentId) -> Option<AgentManifest> {
+    ROLES.with(|roles| roles.iter().find(|r| r.manifest.id == id).map(|r| r.manifest.clone()))
+}
+
+/// Install-time grant for the skill-agent with id `id`, if registered.
+pub fn install_grant(id: AgentId) -> Option<Vec<CapabilityRequest>> {
+    ROLES.with(|roles| roles.iter().find(|r| r.manifest.id == id).map(|r| r.install_grant.clone()))
+}
+
 /// The effective caps a dispatch of `name` would run with, given `parent_caps`:
 /// `min(role.capabilities, install grant, parent caps)`. `None` if no such role.
 pub fn effective_caps(name: &str, parent_caps: &[CapabilityRequest]) -> Option<Vec<CapabilityRequest>> {

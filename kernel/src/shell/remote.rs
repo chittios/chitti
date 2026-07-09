@@ -126,16 +126,56 @@ impl RemoteChat {
         RemoteChat { cfg, messages: Vec::new() }
     }
 
+    /// True when no messages have been exchanged yet (used to seed from a
+    /// resumed orchestrator session).
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// Seed the remote message list from a resumed orchestrator session so
+    /// `/session resume` continues the conversation on the hosted backend too.
+    pub fn hydrate_from_session(&mut self, session: &crate::agent::types::Session) {
+        use crate::agent::types::Role;
+        self.messages.clear();
+        for m in &session.messages {
+            match m.role {
+                Role::System if !m.content.is_empty() => {
+                    self.messages.push(("system".to_string(), m.content.clone()));
+                }
+                Role::User => self.messages.push(("user".to_string(), m.content.clone())),
+                Role::Assistant if !m.content.is_empty() => {
+                    self.messages.push(("assistant".to_string(), m.content.clone()));
+                }
+                Role::Tool => {
+                    self.messages.push((
+                        "user".to_string(),
+                        format!("<tool_response>\n{}\n</tool_response>", m.content),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if self.messages.is_empty() {
+            self.messages.push(("system".to_string(), super::agent_system_prompt()));
+        }
+    }
+
     /// One chat turn: the same bounded ReAct loop as the local
-    /// `ChatSession::turn`, with generation done by the hosted model. Returns
-    /// the final assistant answer (the voice loop speaks it).
-    pub fn turn(&mut self, msg: &str) -> String {
+    /// `ChatSession::turn`, with generation done by the hosted model. Records
+    /// into `session` so `/session save|resume` works for remote chat too.
+    /// Returns the final assistant answer (the voice loop speaks it).
+    pub fn turn(&mut self, msg: &str, session: &mut crate::agent::types::Session) -> String {
+        use crate::agent::orchestrator::now;
+        use crate::agent::types::{Provenance, Role, ToolCall};
         const MAX_TOOL_ITERS: usize = 4;
         if self.messages.is_empty() {
             self.messages.push(("system".to_string(), super::agent_system_prompt()));
         }
         self.messages.push(("user".to_string(), msg.to_string()));
+        session.push_message(Role::User, msg.to_string(), Provenance::UserTyped, now());
+        session.budget.turns_used = session.budget.turns_used.saturating_add(1);
         let mut last_call: Option<(String, String)> = None;
+        let mut call_id = 1u64;
         for _ in 0..MAX_TOOL_ITERS {
             // The remote round-trip blocks in `net::http`; show a thinking spinner
             // (driven by `upkeep`, which the HTTP poll loop calls) while we wait.
@@ -146,10 +186,12 @@ impl RemoteChat {
                 Ok(r) => r,
                 Err(e) if e == "cancelled" => {
                     crate::serial_println!("\x1b[33m[stopped]\x1b[0m");
+                    let _ = crate::session::save(session);
                     return String::new();
                 }
                 Err(e) => {
                     crate::serial_println!("\x1b[31mremote model error:\x1b[0m {} (see /model)", e);
+                    let _ = crate::session::save(session);
                     return String::new();
                 }
             };
@@ -158,23 +200,42 @@ impl RemoteChat {
             match super::parse_tool_call(&reply) {
                 Some(pair) if last_call.as_ref() == Some(&pair) => {
                     crate::serial_println!("\x1b[33m[tool loop stopped: repeated call]\x1b[0m");
+                    let _ = crate::session::save(session);
                     return String::new();
                 }
                 Some((cmd, args)) => {
                     last_call = Some((cmd.clone(), args.clone()));
                     crate::serial_println!("\x1b[33m\u{2192} running\x1b[0m /{} {}", cmd, args);
+                    session.push_assistant_tool_calls(
+                        String::new(),
+                        alloc::vec![ToolCall { call_id, tool: cmd.clone(), args: args.clone() }],
+                        now(),
+                    );
+                    session.budget.tool_calls_used = session.budget.tool_calls_used.saturating_add(1);
                     let obs = if cmd == "spawn_subagent" || cmd == "subagent" {
                         // Sub-agents stay on the local model; without one, say so.
                         "spawn_subagent is unavailable on the remote backend; do the task yourself with tools".to_string()
                     } else {
-                        super::execute_chat_tool(&cmd, &args)
+                        super::execute_chat_tool(&cmd, &args, session)
                     };
+                    let prov = if obs.starts_with("error:") || obs.starts_with("Denied:") {
+                        Provenance::SystemTrusted
+                    } else {
+                        Provenance::UntrustedIngested
+                    };
+                    session.push_tool_result(call_id, obs.clone(), prov, now());
+                    call_id += 1;
                     self.messages.push(("user".to_string(), format!("<tool_response>\n{}\n</tool_response>", obs)));
                 }
-                None => return reply,
+                None => {
+                    session.push_message(Role::Assistant, reply.clone(), Provenance::SystemTrusted, now());
+                    let _ = crate::session::save(session);
+                    return reply;
+                }
             }
         }
         crate::serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
+        let _ = crate::session::save(session);
         String::new()
     }
 

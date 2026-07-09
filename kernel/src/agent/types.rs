@@ -58,19 +58,26 @@ impl StoreKey {
 // --- Monotonic id minting (deterministic, from 1) ---
 
 macro_rules! id_minter {
-    ($fn_name:ident, $ty:ident, $counter:ident) => {
+    ($fn_name:ident, $notice:ident, $ty:ident, $counter:ident) => {
         static $counter: AtomicU64 = AtomicU64::new(1);
         /// Mint the next unique id of this kind (monotonic, process-global).
         pub fn $fn_name() -> $ty {
             $ty($counter.fetch_add(1, Ordering::Relaxed))
         }
+        /// Ensure subsequent mints never collide with a previously-seen id
+        /// (e.g. after resuming a session that was minted in a prior boot).
+        pub fn $notice(id: $ty) {
+            // Next mint must be strictly greater than `id`.
+            let min_next = id.0.saturating_add(1);
+            let _ = $counter.fetch_max(min_next, Ordering::Relaxed);
+        }
     };
 }
-id_minter!(next_agent_id, AgentId, AGENT_CTR);
-id_minter!(next_session_id, SessionId, SESSION_CTR);
-id_minter!(next_skill_id, SkillId, SKILL_CTR);
-id_minter!(next_msg_id, MsgId, MSG_CTR);
-id_minter!(next_cap_id, CapId, CAP_CTR);
+id_minter!(next_agent_id, notice_agent_id, AgentId, AGENT_CTR);
+id_minter!(next_session_id, notice_session_id, SessionId, SESSION_CTR);
+id_minter!(next_skill_id, notice_skill_id, SkillId, SKILL_CTR);
+id_minter!(next_msg_id, notice_msg_id, MsgId, MSG_CTR);
+id_minter!(next_cap_id, notice_cap_id, CapId, CAP_CTR);
 
 // --- Provenance: the ONE taint type read by Phase E gating and Phase G bounding ---
 

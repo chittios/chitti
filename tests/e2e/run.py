@@ -148,6 +148,56 @@ def s_memory(g):
     return True, "add/get/list + miss + traversal reject"
 
 
+def s_session(g):
+    """`/session` save → resume continuity (agent-loop polish).
+
+    Interactive chat writes into the orchestrator session and auto-saves; this
+    scenario exercises the human shell surface without needing a model:
+      1. `/session` shows a live session id + message count
+      2. `/session save` persists it (capture the id)
+      3. `/clear` drops the transcript (keeps identity)
+      4. `/session resume <id>` reconstructs the saved snapshot
+    """
+    import re
+
+    m = g.mark()
+    g.send("/session")
+    if not g.wait_for("current session", 15, m):
+        return False, "no current session banner"
+    m = g.mark()
+    g.send("/session save")
+    if not g.wait_for("saved session", 15, m):
+        return False, "session save failed"
+    # Parse the id from output after the save mark.
+    tail = g.text()[m:]
+    ids = re.findall(r"saved session (\d+)", tail)
+    if not ids:
+        return False, f"could not parse session id from: {tail[-200:]!r}"
+    sid = ids[-1]
+    m = g.mark()
+    g.send("/clear")
+    if not g.wait_for("cleared", 15, m):
+        return False, "clear did not report"
+    m = g.mark()
+    g.send("/session")
+    if not g.wait_for("current session", 15, m):
+        return False, "session missing after clear"
+    # Resume the id we saved (cleared transcript was auto-saved under same id,
+    # so resume still reconstructs — message count may be 1 system prompt).
+    m = g.mark()
+    g.send(f"/session resume {sid}")
+    if not g.wait_for("resumed session", 15, m):
+        return False, f"resume of {sid} failed"
+    if not g.wait_for("messages reconstructed", 5, m):
+        return False, "resume did not report message reconstruction"
+    # Store listing still names the sess key.
+    m = g.mark()
+    g.send("/session")
+    if not g.wait_for("saved in store:", 15, m):
+        return False, "no saved-in-store listing after resume"
+    return True, f"save/clear/resume session {sid}"
+
+
 def s_restart(g):
     """`/restart` reboots the machine via `arch::reboot`.
 
@@ -914,6 +964,7 @@ def s_surface(g):
 OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("help_restart", s_help_restart),
     ("memory", s_memory),
+    ("session", s_session),
     ("open_media", s_open_media),
     ("open_video", s_open_video),
     ("tabs", s_tabs),
