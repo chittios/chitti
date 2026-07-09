@@ -1,22 +1,63 @@
-//! Categorised command catalogue for the **Commands** help browser
-//! (searchable, scrollable modal opened by `/help`).
+//! Categorised command catalogue — **single source of truth** for:
 //!
-//! Pure data + filter/scroll helpers — no framebuffer. Keep entries in sync
-//! with `COMMANDS` in `shell/mod.rs` and the slash-suggest list.
+//! * the **Commands** help browser (`/help` modal)
+//! * **slash-command suggestions** in the composer (`shell::suggest`)
+//! * tab-completion name discovery (canonical names; aliases live in
+//!   [`COMMAND_ALIASES`])
+//!
+//! When you add or rename a shell `/command`, **update [`ENTRIES`] here**
+//! (and the `dispatch_system` match arm). Do not maintain a parallel list in
+//! `suggest.rs`.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-/// One installable / slash command in the browser.
+/// One installable / slash command in the browser **and** composer popup.
 #[derive(Clone, Copy, Debug)]
 pub struct Entry {
     pub category: &'static str,
-    /// Friendly title shown on the left (e.g. "Compact History").
+    /// Friendly title — help modal left column **and** slash-suggestion detail.
     pub title: &'static str,
-    /// Canonical command name without `/` (e.g. `compact`).
+    /// Canonical command name without `/` (e.g. `compact`, `channel`).
     pub name: &'static str,
     /// Optional shortcut hint (e.g. `Ctrl+W`), else empty.
     pub shortcut: &'static str,
+}
+
+/// Extra names accepted by Tab completion that are **aliases** of a catalogue
+/// entry (not listed as their own `ENTRIES` row).
+pub const COMMAND_ALIASES: &[&str] = &[
+    "channels", // → channel
+    "date",     // → datetime
+    "net",      // → network
+    "keys",     // → shortcuts
+    "logs",     // → ktrace
+    "todo",     // → todos
+    "quit",     // → exit
+    "reboot",   // → restart
+    "perms",    // → permissions
+    "panes",    // → pane (if present)
+];
+
+/// Whether `name` is a known slash command or alias (for completion).
+pub fn is_command_name(name: &str) -> bool {
+    ENTRIES.iter().any(|e| e.name == name) || COMMAND_ALIASES.iter().any(|&a| a == name)
+}
+
+/// Names matching `prefix` for Tab completion (catalogue + aliases).
+pub fn complete_names(prefix: &str) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for e in ENTRIES {
+        if e.name.starts_with(prefix) {
+            out.push(e.name);
+        }
+    }
+    for &a in COMMAND_ALIASES {
+        if a.starts_with(prefix) && !out.iter().any(|&n| n == a) {
+            out.push(a);
+        }
+    }
+    out
 }
 
 /// A rendered row in the filtered list (category header or command).
@@ -77,6 +118,12 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "Network", title: "HTTP Client", name: "http", shortcut: "" },
     Entry { category: "Network", title: "WebSocket", name: "ws", shortcut: "" },
     Entry { category: "Network", title: "MCP Client", name: "mcp", shortcut: "" },
+    Entry {
+        category: "Network",
+        title: "Messaging channels (Telegram…)",
+        name: "channel",
+        shortcut: "",
+    },
     // System & UI
     Entry { category: "System & UI", title: "System Info", name: "info", shortcut: "" },
     Entry { category: "System & UI", title: "Process Monitor", name: "top", shortcut: "" },
@@ -212,5 +259,27 @@ mod tests {
         assert_eq!(clamp_scroll(0, 0, 5, 20), 0);
         assert_eq!(clamp_scroll(7, 0, 5, 20), 3); // 7 visible when scroll=3 (3..8)
         assert_eq!(clamp_scroll(2, 5, 5, 20), 2); // scroll back
+    }
+
+    #[test_case]
+    fn channel_in_catalogue_and_complete() {
+        assert!(ENTRIES.iter().any(|e| e.name == "channel"));
+        assert!(is_command_name("channel"));
+        assert!(is_command_name("channels"));
+        let m = complete_names("chan");
+        assert!(m.iter().any(|n| *n == "channel"));
+        assert!(m.iter().any(|n| *n == "channels"));
+    }
+
+    /// Catalogue names must be unique (no duplicate rows).
+    #[test_case]
+    fn entry_names_unique() {
+        for (i, e) in ENTRIES.iter().enumerate() {
+            for (j, o) in ENTRIES.iter().enumerate() {
+                if i != j {
+                    assert_ne!(e.name, o.name, "duplicate catalogue name {}", e.name);
+                }
+            }
+        }
     }
 }

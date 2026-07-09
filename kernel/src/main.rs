@@ -22,6 +22,8 @@ fn run_os() -> ! {
     // Optional allow/ask/deny tool patterns (creates a default file if missing).
     chitti_kernel::tools::permissions::ensure_default();
     chitti_kernel::tools::permissions::load();
+    // External messaging channels (Telegram, …) — load after the store is up.
+    chitti_kernel::msgchan::load();
     chitti_kernel::shell::run();
 }
 

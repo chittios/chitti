@@ -3,12 +3,20 @@
 # See DEVELOPMENT.md for the full setup.
 
 # --- knobs (override on the command line: `make run ARCH=x86_64 MODEL=qwen3.5-9b RELEASE=1`) ---
-# ARCH:    aarch64 (native HVF on Apple Silicon) | x86_64
-# MODEL:   qwen3.5-0.8b (default) | qwen3.5-2b | qwen3.5-4b | qwen3.5-9b
-# RELEASE: set to 1 for an optimized build
-ARCH    ?= aarch64
-MODEL   ?= qwen3.5-0.8b
-RELEASE ?=
+# ARCH:         aarch64 (native HVF on Apple Silicon) | x86_64
+# MODEL:        qwen3.5-0.8b (default) | qwen3.5-2b | qwen3.5-4b | qwen3.5-9b
+# RELEASE:      set to 1 for an optimized build
+# BRIDGE:       host NIC to L2-bridge (empty = QEMU user-net / slirp). macOS
+#               vmnet-bridged needs sudo — leave empty for host services via 10.0.2.2
+# REMOTE_URL:   auto `/model remote` at boot (empty = no seed). Under user-net
+#               the host is always 10.0.2.2 (not the Mac's LAN IP).
+# REMOTE_MODEL: model name sent to the hosted server (LM Studio / Ollama / …)
+ARCH         ?= aarch64
+MODEL        ?= qwen3.5-0.8b
+RELEASE      ?=
+BRIDGE       ?=
+REMOTE_URL   ?= http://10.0.2.2:1234
+REMOTE_MODEL ?= ornith-1.0-9b
 
 # VirtualBox (the `vbox` target): which VM to (re)load the aarch64 image into,
 # and where its boot disk is attached. Override e.g. `make vbox VBOX_VM=MyVM`.
@@ -26,10 +34,15 @@ FLAGS   := -arch $(ARCH) -model $(MODEL) $(REL)
 .PHONY: help
 help:
 	@echo "Chitti OS — make targets (ARCH=$(ARCH) MODEL=$(MODEL) RELEASE=$(RELEASE))"
+	@echo "  BRIDGE=$(BRIDGE)  REMOTE_URL=$(REMOTE_URL)  REMOTE_MODEL=$(REMOTE_MODEL)"
 	@echo
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /'
 	@echo
-	@echo "Override knobs, e.g.:  make run ARCH=x86_64 MODEL=qwen3.5-9b RELEASE=1"
+	@echo "Override knobs, e.g.:"
+	@echo "  make run ARCH=x86_64 MODEL=qwen3.5-9b RELEASE=1"
+	@echo "  make run REMOTE_URL=http://10.0.2.2:1234 REMOTE_MODEL=ornith-1.0-9b"
+	@echo "  make run REMOTE_URL=          # no auto /model remote"
+	@echo "  make run BRIDGE=en0           # L2 bridge (often needs sudo on macOS)"
 
 ## test: in-kernel test suite under QEMU (x86_64) — the gate, keep it 104/104
 .PHONY: test
@@ -48,8 +61,12 @@ build-all:
 	$(XTASK) build -arch aarch64 -model $(MODEL) $(REL)
 
 ## run: boot the kernel in QEMU for ARCH (serial on stdio + a graphical window)
+##      seeds /model remote from REMOTE_URL + REMOTE_MODEL (LM Studio default)
 .PHONY: run
 run:
+	CHITTI_NET_BRIDGE='$(BRIDGE)' \
+	CHITTI_REMOTE_URL='$(REMOTE_URL)' \
+	CHITTI_REMOTE_MODEL='$(REMOTE_MODEL)' \
 	$(XTASK) run $(FLAGS)
 
 ## run-uefi: boot aarch64 via the UEFI stub under AAVMF (not -kernel)

@@ -187,7 +187,8 @@ pub unsafe fn read_ram_bytes() -> Option<u64> {
 /// Read a whole named fw_cfg file into a buffer.
 ///
 /// # Safety
-/// Touches fw_cfg MMIO; call once during single-core boot.
+/// Touches fw_cfg MMIO; call when no concurrent fw_cfg use is in flight
+/// (boot + single-threaded shell init are fine).
 unsafe fn read_file(name: &[u8]) -> Option<Vec<u8>> {
     let (selector, size) = unsafe { find_file(name) }?;
     if size == 0 || size > 4096 {
@@ -198,6 +199,14 @@ unsafe fn read_file(name: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(buf)
+}
+
+/// Read a launcher-supplied `opt/chitti/*` fw_cfg file after the heap is up
+/// (e.g. `opt/chitti/model` for a boot-time `/model remote` seed). `None` if
+/// the file is absent (non-QEMU, or the launcher did not publish it).
+pub fn read_opt_file(name: &[u8]) -> Option<Vec<u8>> {
+    // SAFETY: shell init / single-threaded; no concurrent fw_cfg DMA.
+    unsafe { read_file(name) }
 }
 
 /// The framebuffer resolution the launcher wants, from the `opt/chitti/fbres`

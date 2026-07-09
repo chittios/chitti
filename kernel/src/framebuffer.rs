@@ -1666,37 +1666,94 @@ impl Screen {
 
     /// Erase the previous suggestion popup (and the gap down to the composer).
     ///
-    /// The popup sits in the `COMPOSER_TOP_GAP` strip *below* the chat text
-    /// grid, so `render_view` alone never paints those pixels — without an
-    /// explicit fill the rounded outline and fill linger as a ghost box
-    /// after the menu closes.
-    fn suggest_clear_region(&self) {
+    /// **Fast path:** fill the old popup rect with `chat.bg` and restore only
+    /// the chat rows that intersect it. Avoids a full-pane `render_view` on
+    /// every keystroke (that made typing feel multi-hundred-ms laggy).
+    ///
+    /// When `full_restore` is true (menu fully dismissed), also re-paints
+    /// composer chrome without the popup.
+    fn suggest_clear_region(&self, full_restore: bool) {
         if self.chat.w == 0 {
             return;
         }
         let (bx, by, bw, _bh, _tx, _ty, _hy) = self.composer_geom();
-        // Prefer the recorded rect; fall back to the full strip above the box.
         let (x, y, w, _h) = self.suggest_rect.unwrap_or_else(|| {
-            let h = by.saturating_sub(self.chat.iy).min(bw); // whole reserved strip
+            let h = by.saturating_sub(self.chat.iy).min(bw);
             (bx, by.saturating_sub(h), bw, h)
         });
-        // Expand a few px for the rounded outline / soft edge.
         let pad = 4u64;
         let left = x.saturating_sub(pad).max(self.chat.x + BORDER);
         let top = y.saturating_sub(pad).max(self.chat.iy);
-        // Clear all the way down to the composer top (includes the 6px gap).
         let bottom = by;
         let right = (x + w + pad).min(self.chat.x + self.chat.w - BORDER);
-        let cw = right.saturating_sub(left);
-        let ch = bottom.saturating_sub(top);
-        if cw > 0 && ch > 0 {
-            self.fill_rect(left, top, cw, ch, self.chat.bg);
+        let rw = right.saturating_sub(left);
+        let rh = bottom.saturating_sub(top);
+        if rw > 0 && rh > 0 {
+            self.fill_rect(left, top, rw, rh, self.chat.bg);
         }
-        // Also wipe any overpaint that landed on the last grid rows, then
-        // restore cell contents + the composer chrome (without re-drawing a
-        // popup — suggest_open is false by the time we get here).
-        self.render_view(&self.chat);
-        self.paint_composer_box_only();
+        // Restore only grid rows overlapping the erased band (not the whole pane).
+        self.render_view_rows_intersecting(top, bottom);
+        if full_restore {
+            self.paint_composer_box_only();
+        }
+    }
+
+    /// Re-paint chat grid rows whose vertical span intersects `[y0, y1)`.
+    fn render_view_rows_intersecting(&self, y0: u64, y1: u64) {
+        let p = &self.chat;
+        if p.w == 0 || p.rows == 0 {
+            return;
+        }
+        let ch = p.ch;
+        let first = if y0 <= p.iy {
+            0
+        } else {
+            ((y0 - p.iy) / ch) as usize
+        };
+        let last = if y1 <= p.iy {
+            0
+        } else {
+            (((y1 - p.iy) + ch - 1) / ch).min(p.rows) as usize
+        };
+        if first >= last {
+            return;
+        }
+        self.render_view_row_range(p, first, last);
+    }
+
+    /// Like [`render_view`] but only rows `[row0, row1)`.
+    fn render_view_row_range(&self, p: &Pane, row0: usize, row1: usize) {
+        let cols = p.cols as usize;
+        if p.grid.len() < cols {
+            return;
+        }
+        let sel = p.sel.map(|(a, b)| crate::textsel::normalize(a, b));
+        let view = p.view.min(p.hist.len());
+        let first = p.hist.len() - view;
+        let row1 = row1.min(p.rows as usize);
+        for r in row0..row1 {
+            let gi = first + r;
+            let line: Option<&[Cell]> = if gi < p.hist.len() {
+                Some(&p.hist[gi])
+            } else {
+                let gr = gi - p.hist.len();
+                if gr >= p.rows as usize {
+                    break;
+                }
+                Some(&p.grid[gr * cols..(gr + 1) * cols])
+            };
+            for c in 0..cols {
+                let (b, fg) = line.and_then(|l| l.get(c).copied()).unwrap_or((0, p.default_fg));
+                let x = p.ix + c as u64 * p.cw;
+                let y = p.iy + r as u64 * p.ch;
+                let selected = sel.is_some_and(|s| crate::textsel::contains(s, gi, c));
+                let bg = if selected { self.theme.editor_sel } else { p.bg };
+                self.fill_rect(x, y, p.cw, p.ch, bg);
+                if (0x21..=0x7e).contains(&b) {
+                    self.blit_glyph(x, y, b, fg, bg);
+                }
+            }
+        }
     }
 
     /// Composer chrome without the suggestion popup (used when clearing).
@@ -3297,7 +3354,7 @@ pub fn composer_end() {
                 sc.suggest_open = false;
                 sc.suggest_items.clear();
                 sc.suggest_sel = 0;
-                sc.suggest_clear_region();
+                sc.suggest_clear_region(true);
                 sc.suggest_rect = None;
             }
             sc.draw_composer(); // empty idle box
@@ -3313,12 +3370,19 @@ pub fn composer_end() {
 /// Update the slash-command / @file suggestion popup.
 /// `items` is `(label, detail)` rows; `selected` is the highlighted index.
 /// Empty `items` dismisses the menu.
+///
+/// **Typing performance:** does **not** full-repaint the chat pane on every
+/// key. Old popup rect is erased cheaply; only the popup (and optional
+/// composer box) is redrawn. Composer line text is already painted by
+/// [`composer_set`].
 pub fn suggest_set(items: &[(alloc::string::String, alloc::string::String)], selected: usize) {
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
             sc.cursor_restore();
             sc.cur_vis = false;
             let was_open = sc.suggest_open || sc.suggest_rect.is_some();
+            let old_len = sc.suggest_items.len();
+            let old_sel = sc.suggest_sel;
             sc.suggest_items.clear();
             for (l, d) in items {
                 sc.suggest_items.push((l.clone(), d.clone()));
@@ -3329,25 +3393,35 @@ pub fn suggest_set(items: &[(alloc::string::String, alloc::string::String)], sel
                 selected.min(items.len() - 1)
             };
             sc.suggest_open = !items.is_empty();
-            // Always erase the previous rect first (size can shrink as the
-            // filter tightens, and dismiss must wipe the COMPOSER_TOP_GAP strip
-            // that render_view never covers).
-            if was_open {
-                sc.suggest_clear_region();
-                sc.suggest_rect = None;
-            }
-            if sc.suggest_open {
-                if let Some(rect) = sc.suggest_geom() {
-                    sc.suggest_rect = Some(rect);
-                } else {
+
+            if !sc.suggest_open {
+                if was_open {
+                    sc.suggest_clear_region(true);
                     sc.suggest_rect = None;
-                    sc.suggest_open = false;
                 }
-                sc.draw_composer(); // composer + popup
-            } else {
-                sc.suggest_rect = None;
-                sc.draw_composer();
+                // Composer already current from composer_set — avoid a second
+                // full chrome paint on every non-slash key.
+                sc.cursor_overlay();
+                return;
             }
+
+            // Erase previous popup footprint if it was taller / different.
+            if was_open {
+                sc.suggest_clear_region(false);
+                sc.suggest_rect = None;
+            }
+            if let Some(rect) = sc.suggest_geom() {
+                sc.suggest_rect = Some(rect);
+            } else {
+                sc.suggest_open = false;
+                sc.suggest_rect = None;
+                sc.cursor_overlay();
+                return;
+            }
+            // Popup only — composer text already drawn by the line editor.
+            // When row count/selection changed a lot, still just the popup.
+            let _ = (old_len, old_sel);
+            sc.draw_suggest_popup();
             sc.cursor_overlay();
         }
     });

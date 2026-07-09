@@ -150,6 +150,11 @@ fn shell_commands() -> Vec<ToolDef> {
         ToolDef::shell("network", "Show the network status (ip/gw/dns), or configure it. args: empty=status, 'dhcp', 'static <ip/prefix> [gw]', 'dns <ip>'.", false),
         ToolDef::shell("ping", "ICMP-ping a host to check connectivity. args: a hostname or IPv4 address, e.g. 'www.google.com'.", false),
         ToolDef::shell("wifi", "Wi-Fi facade over the NIC. args: 'scan' | 'connect <ssid>' | 'info'.", false),
+        ToolDef::shell(
+            "channel",
+            "Messaging channels (Telegram…). args: list|add telegram <name> <token>|start|stop|send|reply|pair|allow|status.",
+            false,
+        ),
         ToolDef::shell("http", "curl-like HTTP client. args: [-X M] [-H \"K: V\"] [-d body] [--stream] <url> (http/https).", false),
         ToolDef::shell("datetime", "Show or set the wall clock. args: empty=show, 'YYYY-MM-DD HH:MM'=set, 'tz +5:30'=zone.", false),
         #[cfg(not(feature = "server"))] // GUI tool: absent from server builds
