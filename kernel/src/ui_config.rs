@@ -144,6 +144,7 @@ impl UiConfig {
             logs_title: self.logs_title.clone(),
             theme: crate::framebuffer::theme_from_pairs(&self.theme),
             splash: self.splash,
+            fullscreen: 0,
         }
     }
 }

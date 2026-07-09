@@ -535,6 +535,8 @@ pub enum RightMode {
 /// Surface id the `/open` image viewer uses (also known to the shell). A
 /// `Surface(IMAGE_SURFACE)` tab is labelled "image" in the tab bar.
 pub const IMAGE_SURFACE: u32 = u32::MAX;
+/// Surface id the `/open` video player presents frames on (labelled "video").
+pub const VIDEO_SURFACE: u32 = u32::MAX - 1;
 
 /// The short tab-bar label for a view.
 fn tab_label(m: RightMode) -> &'static str {
@@ -545,6 +547,7 @@ fn tab_label(m: RightMode) -> &'static str {
         RightMode::Top => "top",
         RightMode::Audio => "audio",
         RightMode::Surface(IMAGE_SURFACE) => "image",
+        RightMode::Surface(VIDEO_SURFACE) => "video",
         RightMode::Surface(_) => "surface",
     }
 }
@@ -564,6 +567,9 @@ pub struct LayoutCfg {
     pub theme: Theme,
     /// Show the boot splash (logo + name). Default true.
     pub splash: bool,
+    /// Fullscreen state: 0 = normal split, 1 = chat fills the screen, 2 = the
+    /// action pane fills the screen. Toggled at runtime (F11 / `/fullscreen`).
+    pub fullscreen: u8,
 }
 
 impl Default for LayoutCfg {
@@ -576,6 +582,7 @@ impl Default for LayoutCfg {
             logs_title: String::from("ktrace"),
             theme: Theme::default(),
             splash: true,
+            fullscreen: 0,
         }
     }
 }
@@ -619,7 +626,14 @@ impl Screen {
         let box_y = OUTER;
         let box_h = content_h.saturating_sub(2 * OUTER);
         let pct = cfg.chat_pct.clamp(10, 90);
-        let (chat_x, chat_bw, logs_x, logs_bw) = if split {
+        let full_w = width.saturating_sub(2 * OUTER);
+        let (chat_x, chat_bw, logs_x, logs_bw) = if cfg.fullscreen == 2 && split {
+            // Action pane fills the screen; chat parked offscreen.
+            (width, 0, OUTER, full_w)
+        } else if cfg.fullscreen == 1 || !split {
+            // Chat fills the screen; action parked offscreen.
+            (OUTER, full_w, width, 0)
+        } else {
             let avail_w = width.saturating_sub(2 * OUTER + GAP);
             let chat_w = avail_w * pct / 100;
             let logs_w = avail_w - chat_w;
@@ -629,9 +643,6 @@ impl Screen {
             } else {
                 (OUTER, chat_w, OUTER + chat_w + GAP, logs_w)
             }
-        } else {
-            // Single pane: chat spans the whole content width; logs is offscreen.
-            (OUTER, width.saturating_sub(2 * OUTER), width, 0)
         };
         let th = cfg.theme;
         let chat = Pane::new(chat_x, box_y, chat_bw, box_h, cw, ch, th.chat_fg, th.chat_bg, cfg.chat_title.clone(), true);
@@ -1547,6 +1558,51 @@ pub fn draw_audio(v: &AudioView) {
     });
 }
 
+/// Overlay the video player's control/status bar along the bottom of the video
+/// surface pane: playback state, mm:ss / mm:ss, frame counter, mute, a scrubber,
+/// and the key-shortcut hints. Drawn *after* the frame blit (present_surface
+/// clears the pane each present), so it sits on top like a real player's HUD.
+/// No-op unless the video surface tab is active.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_video_status(name: &str, playing: bool, muted: bool, has_audio: bool, frame: usize, frames: usize, pos_ms: u64, total_ms: u64) {
+    SCREEN.with(|slot| {
+        let Some(sc) = slot else { return };
+        if sc.right != RightMode::Surface(VIDEO_SURFACE) {
+            return;
+        }
+        sc.cursor_restore();
+        sc.cur_vis = false;
+        let ch = sc.ch();
+        let cw = sc.cw();
+        let (px, py) = (sc.logs.ix, sc.logs.iy);
+        let (pw, ph) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
+        let bg = sc.theme.status_bg;
+        // A three-line control bar hugging the pane bottom (status + scrubber +
+        // shortcuts), overpainting the lower strip of the frame.
+        let barh = ch * 3 + ch;
+        let by = py + ph.saturating_sub(barh);
+        sc.fill_rect(px, by, pw, barh, bg);
+        sc.fill_rect(px, by, pw, 1, sc.theme.accent); // top hairline
+        let mmss = |ms: u64| alloc::format!("{}:{:02}", ms / 60000, ms % 60000 / 1000);
+        let state = if playing { ">  playing" } else { "|| paused " };
+        let vol = if !has_audio { "[no audio]" } else if muted { "[muted]" } else { "[vol]" };
+        let mut y = by + ch / 2;
+        let line1 = alloc::format!("{}   {}   {} / {}   frame {}/{}   {}", state, name, mmss(pos_ms), mmss(total_ms), frame, frames, vol);
+        sc.draw_str_bg(px + cw, y, &line1, sc.theme.accent, bg);
+        y += ch + ch / 3;
+        // Scrubber: a full-width track with a filled portion for progress.
+        let track_x = px + cw;
+        let track_w = pw.saturating_sub(2 * cw);
+        let filled = if total_ms > 0 { (track_w * pos_ms.min(total_ms) / total_ms).min(track_w) } else { 0 };
+        sc.fill_rect(track_x, y + ch / 3, track_w, ch / 4, sc.theme.title_dim);
+        sc.fill_rect(track_x, y + ch / 3, filled, ch / 4, sc.theme.accent);
+        y += ch + ch / 3;
+        let hints = "space play/pause   <-/-> seek 1f   up/dn 10f   0 restart   m mute   Ctrl+C stop";
+        sc.draw_str_bg(px + cw, y, hints, sc.theme.title_dim, bg);
+        sc.cursor_overlay();
+    });
+}
+
 static SCREEN: Locked<Option<Screen>> = Locked::new(None);
 
 // --- modal overlay (approval / input dialogs) ---------------------------
@@ -2429,6 +2485,103 @@ pub fn relayout(cfg: &LayoutCfg) {
             *slot = Some(ns);
         }
     });
+}
+
+/// Toggle fullscreen: maximise the focused pane to fill the screen, or restore
+/// the split. Returns the new state (0 normal, 1 chat-full, 2 action-full).
+pub fn toggle_fullscreen() -> u8 {
+    let cfg = SCREEN.with(|slot| {
+        slot.as_mut().map(|sc| {
+            let action_open = sc.right != RightMode::Closed;
+            let mut c = sc.layout.clone();
+            c.fullscreen = if c.fullscreen != 0 {
+                0
+            } else if sc.focus_action && action_open {
+                2
+            } else {
+                1
+            };
+            c
+        })
+    });
+    match cfg {
+        Some(c) => {
+            let st = c.fullscreen;
+            relayout(&c);
+            st
+        }
+        None => 0,
+    }
+}
+
+/// The current chat-pane split percentage (10..90).
+pub fn split_pct() -> u64 {
+    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.layout.chat_pct).unwrap_or(CHAT_PCT))
+}
+
+/// The default chat-pane split percentage (`/pane reset`).
+pub fn default_chat_pct() -> u64 {
+    CHAT_PCT
+}
+
+/// Set the chat|action split to `pct` percent (clamped 10..90) and relayout,
+/// clearing any fullscreen state.
+pub fn set_split_pct(pct: u64) {
+    let cfg = SCREEN.with(|slot| {
+        slot.as_mut().map(|sc| {
+            let mut c = sc.layout.clone();
+            c.chat_pct = pct.clamp(10, 90);
+            c.fullscreen = 0;
+            c
+        })
+    });
+    if let Some(c) = cfg {
+        relayout(&c);
+    }
+}
+
+/// Nudge the split ratio by `delta` percent (keyboard resize).
+pub fn nudge_split(delta: i64) {
+    let p = split_pct() as i64;
+    set_split_pct((p + delta).clamp(10, 90) as u64);
+}
+
+/// If `(x,y)` is on the draggable divider between the two panes, return its
+/// current gap centre x (so the caller can enter a resize drag). `None` when
+/// fullscreen/closed (no divider) or the point is elsewhere.
+pub fn divider_hit(x: u64, y: u64) -> Option<u64> {
+    SCREEN.with(|slot| {
+        let sc = slot.as_ref()?;
+        if sc.right == RightMode::Closed || sc.layout.fullscreen != 0 {
+            return None;
+        }
+        // The gap sits between the two pane boxes.
+        let (a, b) = (&sc.chat, &sc.logs);
+        let gap_l = a.x.min(b.x) + if a.x < b.x { a.w } else { b.w };
+        let gap_r = gap_l + GAP;
+        let within_y = y >= a.y && y < a.y + a.h;
+        // Give the divider a few px of grab tolerance either side.
+        if within_y && x + 4 >= gap_l && x <= gap_r + 4 {
+            Some((gap_l + gap_r) / 2)
+        } else {
+            None
+        }
+    })
+}
+
+/// Set the split so the divider sits at pixel `x` (from a resize drag).
+pub fn set_divider_x(x: u64) {
+    let pct = SCREEN.with(|slot| {
+        slot.as_ref().map(|sc| {
+            let avail = sc.width.saturating_sub(2 * OUTER + GAP).max(1);
+            // x measured from the content's left edge to the chat width.
+            let chat_w = if sc.layout.swap { (sc.width.saturating_sub(x)).min(avail) } else { x.saturating_sub(OUTER).min(avail) };
+            (chat_w * 100 / avail).clamp(10, 90)
+        })
+    });
+    if let Some(p) = pct {
+        set_split_pct(p);
+    }
 }
 
 /// Scroll a pane's view by `delta` lines (`+` = back in time, `-` = toward

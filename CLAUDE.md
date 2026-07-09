@@ -273,7 +273,13 @@ real UEFI hardware.
   effects; treat such a session as non-deterministic to replay.
 - **Microkernel** — tasks + context switch, cooperative + timer-preemptive
   scheduler, unforgeable capabilities, IPC, SMP, frame allocator + heap, MMU.
-- **UI** — a tmux-style split-pane framebuffer compositor in Geist Mono (chat
+- **UI** — a tmux-style split-pane framebuffer compositor in Geist Mono. The
+  chat|action split is **resizable** (drag the divider with the mouse, or
+  `/pane split <10-90>`; persisted to `/configs/core/panes.json` and reloaded at
+  boot) and either pane can go **fullscreen** (Ctrl+F, or `/pane full` —
+  `LayoutCfg.fullscreen`). (`panes.json` also carries `num_action_panes` 1–6;
+  the N-pane split + inter-pane tab drag-drop is a scoped follow-up — today one
+  action pane.) The compositor pairs the chat
   pane + an on-demand **tabbed "action" pane**: opening the ktrace stream, the
   `/top` dashboard, a vim-like editor, an **image viewer** (`/open .png|.jpg`),
   or the **audio player** (`/open .wav|.mp3`) each adds a tab; a tab bar in the
@@ -408,6 +414,63 @@ the next command still runs) and a unit test on the pure poll logic
   them into `assets/voice/`, gitignored). For any numeric or perf work on this
   path, use `tools/onnxdiff/` (host-side layer-by-layer diff of the kernel's
   own interpreter against onnxruntime) — not QEMU round trips.
+- **Video** (`video/`) — H.264/AVC **baseline decoder + player** for
+  `/open .mp4|.mov` (mkv/webm/hls demuxers pending), built **in stages, each pure
+  + unit-tested off-hardware** and **validated bit-exact against ffmpeg/PyAV via
+  the `tools/h264diff/` host harness** (mounts `video/*.rs` via `#[path]`; the
+  onnxdiff/cortexdiff pattern — CAVLC VLC + alpha/beta/tc0 tables are parsed
+  from the FFmpeg source, never hand-transcribed). **Full baseline pipeline:**
+  `mp4`/`mkv` demux → CAVLC residual (`h264/cavlc.rs`) → **I + P** macroblock
+  decode (`h264/decoder.rs`: I_4x4/I_16x16/I_PCM, P_L0_16x16/16x8/8x16/8x8/Skip,
+  **multiple slices per frame** with slice-aware neighbour availability) → intra
+  (`h264/intra.rs`) + **inter** (`h264/inter.rs`: median MV prediction + 6-tap
+  luma / bilinear chroma MC) → inverse transform (`h264/transform.rs`) →
+  **in-loop deblocking** (`h264/deblock.rs`) → YUV→RGB → a **video tab** with
+  a **player HUD** (`framebuffer::draw_video_status`: state, mm:ss, frame
+  counter, scrubber, mute, shortcut hints — drawn *after* each frame blit) and
+  transport controls (Ctrl+Tab focus, space pause, ←/→ seek, ↑/↓ ±10 frames,
+  0 restart, `m` mute, Ctrl+C stop), frame-paced by pts. **Streaming decode:**
+  `video::StreamDecoder` holds the source + sample table + **one** reference
+  frame and decodes on demand (`seek_decode`, rewinding to the latest keyframe
+  on a backward seek). Do **not** decode a whole clip into a `Vec<Frame>` up
+  front — a 1300-frame 480p clip is ~700 MB of RGB, which overruns the first-fit
+  heap, corrupts a reference frame's chroma under allocation pressure, and every
+  dependent P-frame then renders **all-green** (a real bug; the decode itself
+  was bit-clean). **Audio:** `mp4::parse_audio` demuxes the AAC (`mp4a`/`esds`
+  → AudioSpecificConfig) track and `video::audio_info` reports it, but the
+  **AAC-LC decoder is not yet built** (a full codec on the scale of the H.264
+  one — spectral Huffman/iquant/M-S/TNS/**PNS**/intensity + IMDCT filterbank;
+  note PNS's seeded noise makes bit-exact-vs-PyAV validation impossible, unlike
+  H.264), so video plays silently and the HUD shows `[no audio]`. **Validated
+  bit-exact against PyAV/ffmpeg** — synthetic x264 clips (I/P, multi-slice,
+  deblocked) and hundreds of consecutive frames of real-world mp4/mkv. In-kernel
+  fixture tests hash an embedded I-only and an I+P clip against PyAV, and
+  `stream_decoder_seek_matches_sequential` proves random/backward seeks match a
+  sequential decode frame-for-frame.
+  **Deblock gotchas (both bit us):** a chroma edge's QP is `avg(qpc(QPp),
+  qpc(QPq))` not `qpc(avg(QPp,QPq))` (differs only across slices with differing
+  QP); and the luma normal filter's `tc = tc0 + (ap<β) + (aq<β)` can be nonzero
+  even when `tc0==0` (don't force-skip). **Remaining:** CABAC (High/Main
+  profiles — big fraction of real files), HLS/TS, and a rare corner-MB edge case
+  on very long P-sequences. **Stage 1 (done):** `video/bits.rs`
+  (RBSP emulation-prevention unescape + a big-endian `BitReader` with H.264
+  Exp-Golomb `ue`/`se`/`te`), `video/mp4.rs` (ISO-BMFF box-tree demuxer →
+  `avcC` SPS/PPS + the `stsz`/`stsc`/`stco`/`stts`/`stss` sample table assembled
+  by the pure `build_samples`), and `video/h264.rs` (Annex-B **and** AVCC NAL
+  splitting + SPS/PPS parse → geometry/profile/entropy mode). `video::probe`
+  reports a stream (container, codec, `W×H`, frame count, CAVLC/CABAC) without
+  decoding pixels; `/open clip.mp4` shows it. Scope: **H.264 baseline** (I/P
+  slices, CAVLC, 4:2:0), the common mp4/mov case. **Remaining:** the **AAC-LC
+  audio decoder** + playback sync (demux done; see above), CABAC (High/Main
+  profiles — big fraction of real files), HLS/TS demux, a rare corner-MB edge
+  case on very long P-sequences, and the multi-pane split + tab drag-drop.
+  **Host reference for the numeric stages:** PyAV
+  (self-contained ffmpeg) decodes the same clip to YUV for a frame-by-frame diff
+  harness (`tools/h264diff/`, the onnxdiff/cortexdiff pattern — mounts
+  `video/*.rs` via `#[path]`, runs on the host in seconds, no QEMU round-trips).
+  The e2e `open_video` scenario muxes a real x264 baseline multi-slice clip into
+  mp4 (stdlib muxer) and asserts the on-kernel probe + streaming decode ("N
+  frame(s), ready in …") + transport controls; it auto-skips where x264 is absent.
 - **Agent chat protocol** — the shell chat is an agentic ReAct loop on the
   Qwen3.5 template: the prompt advertises a small CORE tool set plus
   `search_tools` (Claude-Code-style discovery over the registry — manifest

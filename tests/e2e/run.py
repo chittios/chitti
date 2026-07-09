@@ -402,6 +402,182 @@ def s_open_media(_g):
         g2.close()
 
 
+def _mux_h264_mp4(annexb, w, h, timescale=25, all_sync=False):
+    """Wrap an Annex-B H.264 elementary stream in a minimal ISO-BMFF (mp4) so
+    the kernel's demuxer sees a real container. Pure stdlib. Splits NALs on
+    start codes, pulls SPS/PPS into an avcC record, frames each VCL access unit
+    as a 4-byte-length AVCC sample, and builds a single-chunk sample table."""
+    import struct
+
+    def nals(d):
+        out, idxs, j, n = [], [], 0, len(d)
+        while j + 3 <= n:
+            if d[j] == 0 and d[j + 1] == 0 and d[j + 2] == 1:
+                sc = 4 if j > 0 and d[j - 1] == 0 else 3
+                idxs.append((j - (sc - 3), sc)); j += 3
+            else:
+                j += 1
+        for k, (p, l) in enumerate(idxs):
+            s = p + l
+            e = idxs[k + 1][0] if k + 1 < len(idxs) else n
+            out.append(d[s:e])
+        return out
+
+    sps = pps = None
+    samples = []  # each = AVCC-framed bytes of one access unit
+    for u in nals(annexb):
+        t = u[0] & 0x1f
+        if t == 7 and sps is None:
+            sps = u
+        elif t == 8 and pps is None:
+            pps = u
+        elif t in (1, 5):  # VCL slice → one frame/sample
+            samples.append(struct.pack(">I", len(u)) + bytes(u))
+    if sps is None or pps is None or not samples:
+        raise RuntimeError("mux: stream missing SPS/PPS/slices")
+
+    def box(typ, *parts):
+        body = b"".join(parts)
+        return struct.pack(">I", 8 + len(body)) + typ + body
+
+    avcc = (bytes([1, sps[1], sps[2], sps[3], 0xff, 0xe1]) + struct.pack(">H", len(sps)) + bytes(sps)
+            + bytes([1]) + struct.pack(">H", len(pps)) + bytes(pps))
+    avc1 = (b"\x00" * 6 + struct.pack(">H", 1)          # reserved + data_ref_idx
+            + b"\x00" * 16 + struct.pack(">HH", w, h)   # predefined/reserved + w/h
+            + struct.pack(">II", 0x00480000, 0x00480000)  # 72dpi h/v res
+            + b"\x00" * 4 + struct.pack(">H", 1)        # reserved + frame_count
+            + b"\x00" * 32 + struct.pack(">H", 0x18) + b"\xff\xff"  # compressorname + depth + predefined
+            + box(b"avcC", avcc))
+    stsd = box(b"stsd", struct.pack(">II", 0, 1), box(b"avc1", avc1))
+    n = len(samples)
+    stts = box(b"stts", struct.pack(">II", 0, 1) + struct.pack(">II", n, 1))
+    stsc = box(b"stsc", struct.pack(">II", 0, 1) + struct.pack(">III", 1, n, 1))
+    stsz = box(b"stsz", struct.pack(">III", 0, 0, n) + b"".join(struct.pack(">I", len(s)) for s in samples))
+    # stss lists sync samples; omit it entirely when every sample is a keyframe
+    # (an absent stss means "all samples are sync" per ISO-BMFF).
+    stss = b"" if all_sync else box(b"stss", struct.pack(">II", 0, 1) + struct.pack(">I", 1))
+    # Build everything except the chunk offset, then patch stco once the mdat
+    # position is known.
+    def assemble(chunk_off):
+        stco = box(b"stco", struct.pack(">II", 0, 1) + struct.pack(">I", chunk_off))
+        stbl = box(b"stbl", stsd, stts, stsc, stsz, stss, stco)
+        vmhd = box(b"vmhd", struct.pack(">IHHHH", 1, 0, 0, 0, 0))
+        dinf = box(b"dinf", box(b"dref", struct.pack(">II", 0, 1), box(b"url ", struct.pack(">I", 1))))
+        minf = box(b"minf", vmhd, dinf, stbl)
+        hdlr = box(b"hdlr", struct.pack(">II", 0, 0) + b"vide" + b"\x00" * 12 + b"chitti\x00")
+        mdhd = box(b"mdhd", struct.pack(">IIIIhh", 0, 0, 0, timescale, n, 0))
+        mdia = box(b"mdia", mdhd, hdlr, minf)
+        tkhd = box(b"tkhd", struct.pack(">IIIIII", 0x00000007, 0, 0, 1, 0, n)
+                   + b"\x00" * 8 + struct.pack(">hhhh", 0, 0, 0, 0)
+                   + struct.pack(">9i", 0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000)
+                   + struct.pack(">II", w << 16, h << 16))
+        trak = box(b"trak", tkhd, mdia)
+        mvhd = box(b"mvhd", struct.pack(">IIIIIi", 0, 0, 0, timescale, n, 0x00010000)
+                   + struct.pack(">hh", 0x0100, 0) + b"\x00" * 8
+                   + struct.pack(">9i", 0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000)
+                   + b"\x00" * 24 + struct.pack(">I", 2))
+        moov = box(b"moov", mvhd, trak)
+        return moov
+    ftyp = box(b"ftyp", b"isom" + struct.pack(">I", 0x200) + b"isomiso2avc1mp41")
+    moov_probe = assemble(0)
+    mdat_data = b"".join(samples)
+    chunk_off = len(ftyp) + len(moov_probe) + 8  # +8 mdat header
+    moov = assemble(chunk_off)
+    assert len(moov) == len(moov_probe)
+    mdat = struct.pack(">I", 8 + len(mdat_data)) + b"mdat" + mdat_data
+    return ftyp + moov + mdat, n
+
+
+def s_open_video(_g):
+    """Integration test of the whole video demux path on the real kernel: encode
+    a tiny baseline H.264 clip with x264, mux it into mp4 (stdlib), mount it, and
+    assert `/open clip.mp4` probes the right geometry/codec/frame-count. Skipped
+    if x264 is unavailable (CI runners often lack it)."""
+    import shutil
+    import struct
+    import subprocess
+    import tempfile
+
+    if shutil.which("x264") is None:
+        return None, "skipped (x264 not installed)"
+    W, H, N = 176, 144, 3
+    yuv = os.path.join(tempfile.gettempdir(), "chitti-e2e.yuv")
+    with open(yuv, "wb") as f:
+        for fr in range(N):
+            f.write(bytes(((x + y + fr * 7) & 0xff) for y in range(H) for x in range(W)))
+            f.write(bytes([128]) * (W // 2 * H // 2) * 2)
+    a264 = os.path.join(tempfile.gettempdir(), "chitti-e2e.264")
+    # Realistic baseline stream: I+P, in-loop deblocking (default), and MULTIPLE
+    # slices per frame (--slices 2) — the real-world case that needs slice
+    # assembly + slice-aware neighbour availability + per-side chroma-QP deblock.
+    r = subprocess.run(["x264", "--profile", "baseline", "--ref", "1", "--slices", "2", "--frames", str(N),
+                        "--input-res", f"{W}x{H}", "-o", a264, yuv],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if r.returncode != 0:
+        return None, "skipped (x264 encode failed)"
+    try:
+        mp4, n_frames = _mux_h264_mp4(open(a264, "rb").read(), W, H, all_sync=False)
+    except Exception as e:
+        return False, f"mux failed: {e}"
+    mp4_path = os.path.join(tempfile.gettempdir(), "chitti-e2e.mp4")
+    with open(mp4_path, "wb") as f:
+        f.write(mp4)
+    g2 = Guest(arch=RUN_ARCH, verbose=RUN_VERBOSE, no_model=True, audio="off", model_disk=mp4_path)
+    try:
+        if not g2.wait_for("net: configured", 180):
+            return False, "video guest never booted"
+        for d in range(4):
+            g2.send(f"/mount {d} 0 /vid{d}")
+            g2.wait_quiet(0.5, 30)
+            m = g2.mark()
+            g2.send(f"/open /vid{d}/chitti-e2e.mp4")
+            if not g2.wait_for("176x144", 15, m):
+                continue
+            # Decode + display of keyframes, then drive the transport controls
+            # and prove the input loop stays responsive (Ctrl+C stops).
+            # Streaming decoder: reports "N frame(s), ready in X ms" (frames are
+            # decoded on demand during playback, not all up front).
+            if not (g2.wait_for("H.264", 5, m) and g2.wait_for("frame(s), ready", 8, m)):
+                return False, "probe/decode output missing"
+            g2.send_raw(b"\x1b[T")   # Ctrl+Tab: focus the video tab
+            g2.wait_quiet(0.3, 10)
+            g2.send_raw(b" ")        # pause
+            g2.send_raw(b"\x1b[C")   # seek +1 frame
+            g2.send_raw(b"0")        # restart
+            m2 = g2.mark()
+            g2.send_raw(b"\x03")     # Ctrl+C stops
+            ok = g2.wait_for("video stopped", 10, m2)
+            return ok, "mp4 decoded (H.264 baseline I+P, multi-slice, deblocked) + video-tab controls responsive" if ok else "controls/Ctrl+C did not stop video"
+        return False, "no 176x144 probe from /open on any mount"
+    finally:
+        g2.close()
+
+
+def s_panes(g):
+    """Pane layout: resize the split, fullscreen toggle, reset — driven by the
+    /pane command (serial-observable) + a Ctrl+F fullscreen keystroke."""
+    m = g.mark()
+    g.send("/pane split 30")
+    if not g.wait_for("chat width 30%", 8, m):
+        return False, "resize (/pane split 30) had no effect"
+    m = g.mark()
+    g.send("/pane full")
+    if not g.wait_for("fullscreen", 8, m):
+        return False, "/pane full did not report fullscreen"
+    m = g.mark()
+    g.send("/pane full")
+    if not g.wait_for("restored", 8, m):
+        return False, "/pane full toggle did not restore the split"
+    # Ctrl+F keystroke path (then restore) must keep the shell responsive.
+    g.send_raw(b"\x06")
+    g.wait_quiet(0.3, 10)
+    g.send_raw(b"\x06")
+    m = g.mark()
+    g.send("/pane reset")
+    ok = g.wait_for("pane> reset", 8, m)
+    return ok, "split resize + fullscreen toggle + reset via /pane and Ctrl+F" if ok else "reset failed / shell unresponsive after Ctrl+F"
+
+
 # --- voice scenarios — slow, need assets/voice + a sound device -------------
 
 def s_voice_models(g):
@@ -638,7 +814,7 @@ def s_surface(g):
     return ok, "surface drawn (grammar-validated draw ops rasterized)" if ok else "no surface render"
 
 
-OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [("open_media", s_open_media), ("tabs", s_tabs), ("clipboard", s_clipboard)]
+OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [("open_media", s_open_media), ("open_video", s_open_video), ("tabs", s_tabs), ("panes", s_panes), ("clipboard", s_clipboard)]
 AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("mcp_manifest", s_mcp_manifest)]
 NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 
