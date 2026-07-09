@@ -565,6 +565,10 @@ cargo xtask image -arch x86_64|aarch64 # assemble a bootable image/ISO
 
 ## Conventions
 
+- **The OS is named `ChittiOS` — one word, no space.** Use it everywhere: docs,
+  boot banner, status bar, SOULs, served pages, commit messages. "Chitti" alone
+  refers to the project/brand; the spaced two-word form is wrong — fix it on
+  sight (and rebuild any `tools/*-wasm` module whose strings embed it).
 - No `unsafe` without an adjacent `// SAFETY:` comment justifying each invariant.
 - Every public module has a doc comment stating its responsibility.
 - Deterministic by default: tests use fixed seeds + temperature 0; any RNG is seeded.
