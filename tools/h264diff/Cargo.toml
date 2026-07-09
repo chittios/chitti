@@ -1,0 +1,13 @@
+[package]
+name = "h264diff"
+version = "0.1.0"
+edition = "2021"
+
+# Host-side calibration harness: mounts the kernel's own `video` decoder
+# (kernel/src/video) natively via #[path] so its output can be diffed
+# bit-exactly against PyAV/ffmpeg without QEMU. Standalone crate, like onnxdiff.
+
+[workspace]
+
+[profile.release]
+debug = true

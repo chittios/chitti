@@ -62,6 +62,7 @@ pub mod ui_config;
 pub mod smp;
 pub mod synapse;
 pub mod textsel;
+pub mod video;
 pub mod xhci;
 
 // The framebuffer compositor and its Geist Mono glyph atlas are not built into

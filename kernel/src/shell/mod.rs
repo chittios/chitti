@@ -107,6 +107,8 @@ pub fn run() -> ! {
     crate::clock::init();
     crate::ui_config::load_and_apply();
     auto_mount_root();
+    #[cfg(all(not(feature = "server"), not(test)))]
+    load_panes_config();
     update_status();
     // Ask the host terminal to bracket pastes, so a host->guest paste arrives as
     // one `ESC[200~ … ESC[201~` block the line editor can capture (see
@@ -305,6 +307,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         }
         "datetime" | "date" => run_datetime(arg),
         "ui" => run_ui(arg),
+        "pane" | "panes" => run_pane(arg),
         "shortcuts" | "keys" => run_shortcuts(),
         "clip" | "clipboard" => run_clip(arg),
         "ktrace" | "logs" => toggle_ktrace(),
@@ -3391,6 +3394,29 @@ fn media_focused() -> Option<crate::framebuffer::RightMode> {
 #[cfg(all(not(feature = "server"), not(test)))]
 fn media_key(c: u8) -> bool {
     match media_focused() {
+        Some(crate::framebuffer::RightMode::Surface(id)) if id == VIDEO_SURFACE => match c {
+            b' ' => {
+                video_toggle_pause();
+                true
+            }
+            b'0' => {
+                video_restart();
+                true
+            }
+            b',' => {
+                video_seek(-1);
+                true
+            }
+            b'.' => {
+                video_seek(1);
+                true
+            }
+            b'm' | b'M' => {
+                video_toggle_mute();
+                true
+            }
+            _ => false,
+        },
         Some(crate::framebuffer::RightMode::Surface(_)) => match c {
             b'+' | b'=' | b'-' | b'_' | b'r' | b'R' | b'l' | b'L' | b'0' => {
                 image_cmd(c);
@@ -3430,6 +3456,29 @@ fn media_key(_c: u8) -> bool {
 #[cfg(all(not(feature = "server"), not(test)))]
 fn media_nav(fin: u8) -> bool {
     match media_focused() {
+        Some(crate::framebuffer::RightMode::Surface(id)) if id == VIDEO_SURFACE => match fin {
+            b'C' => {
+                video_seek(1);
+                true
+            }
+            b'D' => {
+                video_seek(-1);
+                true
+            }
+            b'A' => {
+                video_seek(10);
+                true
+            }
+            b'B' => {
+                video_seek(-10);
+                true
+            }
+            b'H' => {
+                video_restart();
+                true
+            }
+            _ => false,
+        },
         Some(crate::framebuffer::RightMode::Surface(_)) => match fin {
             b'A' | b'B' | b'C' | b'D' => {
                 image_cmd(fin);
@@ -3526,11 +3575,15 @@ fn read_line(buf: &mut String) {
     let mut accel = crate::keyrepeat::Accel::new();
     loop {
         match console::read_byte() {
-            // Ctrl+C at the prompt stops the background audio player (global).
+            // Ctrl+C at the prompt stops the background audio/video player.
             Some(0x03) => {
                 #[cfg(not(feature = "server"))]
                 if audio_loaded() {
                     stop_audio();
+                }
+                #[cfg(not(feature = "server"))]
+                if video_loaded() {
+                    stop_video();
                 }
             }
             // The editor tab owns input while it's the active action tab: every
@@ -3727,6 +3780,8 @@ fn read_line(buf: &mut String) {
             }
             // Ctrl+W: close the action (right) pane — a keyboard shortcut for /close.
             Some(0x17) => close_active_tab(),
+            // Ctrl+F: toggle fullscreen for the focused pane.
+            Some(0x06) => fb_toggle_fullscreen(),
             // Ctrl+V: paste the clipboard into the input line (newlines → spaces).
             Some(0x16) => {
                 if let Some((text, _)) = crate::clipboard::get() {
@@ -3839,7 +3894,10 @@ fn ui_tick() {
             crate::framebuffer::cursor_move(t.x, t.y);
         }
         if t.pressed {
-            if crate::framebuffer::hit_close(t.x, t.y) {
+            if crate::framebuffer::divider_hit(t.x, t.y).is_some() {
+                // Grab the pane divider to resize the split.
+                DIVIDER_DRAG.store(true, Ordering::Relaxed);
+            } else if crate::framebuffer::hit_close(t.x, t.y) {
                 close_active_tab();
             } else if let Some(i) = crate::framebuffer::tab_hit(t.x, t.y) {
                 // Click a tab label: select it, focus the action pane, repaint.
@@ -3859,13 +3917,19 @@ fn ui_tick() {
                 crate::framebuffer::chat_sel_clear();
             }
         }
-        // Drag extends the selection; release copies it (like the editor's
-        // drag-select; paste back with Ctrl+V).
+        // Drag: resize the split if the divider was grabbed, else extend the
+        // chat selection (release copies it; paste back with Ctrl+V).
         if t.left && t.moved {
-            crate::framebuffer::chat_sel_drag(t.x, t.y);
+            if DIVIDER_DRAG.load(Ordering::Relaxed) {
+                crate::framebuffer::set_divider_x(t.x);
+            } else {
+                crate::framebuffer::chat_sel_drag(t.x, t.y);
+            }
         }
         if t.released {
-            if let Some(text) = crate::framebuffer::chat_sel_end() {
+            if DIVIDER_DRAG.swap(false, Ordering::Relaxed) {
+                save_panes_config();
+            } else if let Some(text) = crate::framebuffer::chat_sel_end() {
                 crate::clipboard::set(text, false);
             }
         }
@@ -3877,6 +3941,9 @@ fn ui_tick() {
         // Background audio: feed the sound device chunk-by-chunk regardless of
         // which tab is shown, so playback continues across tab switches.
         pump_audio();
+        // Background video: advance frames by presentation time (presents only
+        // when the video tab is the active surface).
+        pump_video();
         // Editor closed (`:q`) since last tick → re-apply an edited UI config.
         if let Some((path, saved)) = crate::editor::take_closed() {
             serial_println!("editor> closed {}", path);
@@ -3916,6 +3983,7 @@ fn repaint_active_tab() {
     match crate::framebuffer::right_mode() {
         crate::framebuffer::RightMode::Top => refresh_top(),
         crate::framebuffer::RightMode::Audio => repaint_audio(),
+        crate::framebuffer::RightMode::Surface(id) if id == crate::framebuffer::VIDEO_SURFACE => present_video_frame(),
         crate::framebuffer::RightMode::Surface(_) => repaint_image(),
         crate::framebuffer::RightMode::Editor => crate::editor::repaint(),
         _ => {}
@@ -3931,6 +3999,10 @@ fn close_active_tab() {
     match crate::framebuffer::right_mode() {
         crate::framebuffer::RightMode::Audio => {
             stop_audio();
+            crate::framebuffer::close_action();
+        }
+        crate::framebuffer::RightMode::Surface(id) if id == crate::framebuffer::VIDEO_SURFACE => {
+            stop_video();
             crate::framebuffer::close_action();
         }
         crate::framebuffer::RightMode::Editor => {
@@ -4151,6 +4223,7 @@ fn run_open_inner(arg: &str) {
         serial_println!("  editor: hjkl move, i insert, Esc normal, :w write, :q quit, :wq save+quit");
         serial_println!("  images: /open photo.png|.jpg previews in the action pane (/close to hide)");
         serial_println!("  audio:  /open song.wav|.mp3 plays through the sound device (Ctrl+C stops)");
+        serial_println!("  video:  /open clip.mp4|.mov plays H.264 baseline keyframes (Ctrl+Tab focus: space/seek/0; Ctrl+C stops)");
         return;
     }
     // A .png/.jpg path is an image preview, a .wav/.mp3 an audio playback —
@@ -4162,6 +4235,10 @@ fn run_open_inner(arg: &str) {
     }
     if lower.ends_with(".wav") || lower.ends_with(".mp3") {
         play_audio(arg);
+        return;
+    }
+    if lower.ends_with(".mp4") || lower.ends_with(".mov") || lower.ends_with(".mkv") || lower.ends_with(".webm") {
+        play_video(arg);
         return;
     }
     #[cfg(not(test))]
@@ -4176,6 +4253,348 @@ fn run_open_inner(arg: &str) {
     }
     #[cfg(test)]
     let _ = arg;
+}
+
+/// True while the pane divider is being dragged with the mouse (resize).
+static DIVIDER_DRAG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Persistent pane layout config.
+#[cfg(not(feature = "server"))]
+const PANES_PATH: &str = "/configs/core/panes.json";
+
+/// Toggle fullscreen on the focused pane (Ctrl+F / `/pane full`).
+fn fb_toggle_fullscreen() {
+    #[cfg(not(test))]
+    {
+        let st = crate::framebuffer::toggle_fullscreen();
+        serial_println!(
+            "pane> {}",
+            match st {
+                1 => "chat fullscreen (Ctrl+F to restore)",
+                2 => "action pane fullscreen (Ctrl+F to restore)",
+                _ => "split restored",
+            }
+        );
+    }
+}
+
+/// Persist the current split ratio to `panes.json` (called after a resize drag).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn save_panes_config() {
+    let pct = crate::framebuffer::split_pct();
+    let text = alloc::format!(
+        "{{\n  \"chat_pct\": {},\n  \"num_action_panes\": 1\n}}\n",
+        pct
+    );
+    crate::synapse::fs::write(PANES_PATH, text.as_bytes());
+}
+#[cfg(any(feature = "server", test))]
+fn save_panes_config() {}
+
+/// Load `panes.json` at boot and apply the split ratio. `num_action_panes` is
+/// read + clamped to 1..6; a value >1 is noted (the N-pane split is a scoped
+/// follow-up, so 1 is used for now).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn load_panes_config() {
+    let Some(bytes) = crate::synapse::fs::read(PANES_PATH) else { return };
+    let Some(text) = core::str::from_utf8(&bytes).ok() else { return };
+    let Some(j) = crate::json::Json::parse(text) else { return };
+    if let Some(p) = j.get("chat_pct").and_then(|v| v.as_i64()) {
+        crate::framebuffer::set_split_pct(p.clamp(10, 90) as u64);
+    }
+    if let Some(n) = j.get("num_action_panes").and_then(|v| v.as_i64()) {
+        if n.clamp(1, 6) > 1 {
+            serial_println!("panes> num_action_panes={} configured — multi-pane split lands in a follow-up; using 1", n);
+        }
+    }
+}
+
+/// `/pane` — inspect/adjust the pane layout. Subcommands: `full` (toggle
+/// fullscreen), `split <10-90>` (set the chat width %), `swap`, `reset`.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn run_pane(arg: &str) {
+    let mut it = arg.split_whitespace();
+    match it.next() {
+        None | Some("status") => {
+            serial_println!("pane> split chat={}%  (F=fullscreen; /pane split <10-90>, /pane swap)", crate::framebuffer::split_pct());
+        }
+        Some("full") | Some("fullscreen") => fb_toggle_fullscreen(),
+        Some("split") => {
+            if let Some(p) = it.next().and_then(|s| s.parse::<u64>().ok()) {
+                crate::framebuffer::set_split_pct(p);
+                save_panes_config();
+                serial_println!("pane> chat width {}%", crate::framebuffer::split_pct());
+            } else {
+                serial_println!("usage: /pane split <10-90>");
+            }
+        }
+        Some("reset") => {
+            crate::framebuffer::set_split_pct(crate::framebuffer::default_chat_pct());
+            save_panes_config();
+            serial_println!("pane> reset");
+        }
+        Some(other) => serial_println!("pane> unknown '{}' (full | split <pct> | reset)", other),
+    }
+}
+#[cfg(any(feature = "server", test))]
+fn run_pane(_arg: &str) {}
+
+/// Surface id the video player presents frames on (== framebuffer::VIDEO_SURFACE).
+#[cfg(not(feature = "server"))]
+const VIDEO_SURFACE: u32 = u32::MAX - 1;
+
+/// A background video player: decoded keyframes plus a playback clock. Frames
+/// are advanced by presentation timestamp from `ui_tick` (`pump_video`), so it
+/// keeps playing/advancing across tab switches like the audio player. Baseline
+/// H.264 decodes every frame (I keyframes + P inter frames), so playback is
+/// full-motion, not keyframe-only.
+#[cfg(not(feature = "server"))]
+struct VideoPlayer {
+    dec: crate::video::StreamDecoder,
+    frame_count: usize,
+    idx: usize,
+    playing: bool,
+    base_ms: u64,     // wall-clock at which pts 0 plays
+    paused_at: u64,   // playback-time when paused
+    total_ms: u64,
+    name: String,
+    finished_announced: bool,
+    muted: bool,
+    has_audio: bool,
+}
+#[cfg(not(feature = "server"))]
+static VIDEO: crate::mm::Locked<Option<VideoPlayer>> = crate::mm::Locked::new(None);
+
+/// `/open <path>.mp4|.mov` — demux + decode H.264 keyframes and play them in a
+/// "video" action-pane tab. Non-blocking: `pump_video` advances frames from the
+/// idle tick. `/close` or Ctrl+C stops it.
+#[cfg(not(feature = "server"))]
+fn play_video(path: &str) {
+    let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
+        serial_println!("open> {} not found under any mount or in the store (see /mounts)", path);
+        return;
+    };
+    let t0 = crate::arch::now_ms();
+    // Probe first so we can report clearly and handle unsupported streams.
+    match crate::video::probe(&bytes) {
+        Ok(info) => {
+            serial_println!("open> {} — {} {}x{} {} frames {}:{:02}", path, info.codec, info.width, info.height, info.frame_count, info.duration_ms / 60000, info.duration_ms % 60000 / 1000);
+            if !info.decodable {
+                serial_println!("open>   cannot decode yet: {}", if info.cabac { "CABAC entropy coding (baseline/CAVLC only)" } else { "unsupported profile" });
+                return;
+            }
+        }
+        Err(e) => {
+            serial_println!("open> cannot open {}: {}", path, e);
+            return;
+        }
+    }
+    // Report the audio track if present (decode/playback is a later stage).
+    let has_audio = match crate::video::audio_info(&bytes) {
+        Some(a) => {
+            serial_println!("open>   audio: {} {} Hz {}ch (decode pending — video plays silently)", a.codec, a.sample_rate, a.channels);
+            true
+        }
+        None => false,
+    };
+    match crate::video::StreamDecoder::open(bytes) {
+        Ok(mut dec) => {
+            let frame_count = dec.frame_count();
+            let total_ms = dec.duration_ms;
+            dec.seek_decode(0); // decode + present the first frame now
+            serial_println!(
+                "open>   {} frame(s), ready in {} ms — Ctrl+Tab to focus, space=pause <-/->=seek 0=restart m=mute; Ctrl+C/close stops",
+                frame_count,
+                crate::arch::now_ms().saturating_sub(t0)
+            );
+            let name = path.rsplit('/').next().unwrap_or(path).to_string();
+            let now = crate::arch::now_ms();
+            VIDEO.with(|v| {
+                *v = Some(VideoPlayer {
+                    dec,
+                    frame_count,
+                    idx: 0,
+                    playing: true,
+                    base_ms: now,
+                    paused_at: 0,
+                    total_ms,
+                    name,
+                    finished_announced: false,
+                    muted: false,
+                    has_audio,
+                })
+            });
+            #[cfg(not(test))]
+            {
+                crate::framebuffer::set_right(crate::framebuffer::RightMode::Surface(VIDEO_SURFACE));
+                present_video_frame();
+            }
+        }
+        Err(e) => serial_println!("open> decode failed: {}", e),
+    }
+}
+
+/// Present the current video frame into the video tab (no-op if not active).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn present_video_frame() {
+    VIDEO.with(|v| {
+        if let Some(p) = v.as_ref() {
+            if let Some(f) = p.dec.cur_frame() {
+                crate::framebuffer::present_surface(VIDEO_SURFACE, f.w, f.h, &f.pixels);
+            }
+        }
+    });
+    present_video_status();
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn present_video_frame() {}
+
+/// Whether a video is loaded.
+#[cfg(not(feature = "server"))]
+fn video_loaded() -> bool {
+    VIDEO.with(|v| v.is_some())
+}
+
+/// Stop + unload the video (Ctrl+C / closing the video tab).
+#[cfg(not(feature = "server"))]
+fn stop_video() {
+    if VIDEO.with(|v| v.take().is_some()) {
+        serial_println!("\ropen> video stopped");
+    }
+}
+#[cfg(feature = "server")]
+fn stop_video() {}
+
+/// Advance the video by presentation time; the idle-tick heartbeat.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn pump_video() {
+    let now = crate::arch::now_ms();
+    let present = VIDEO.with(|v| {
+        let Some(p) = v.as_mut() else { return false };
+        if !p.playing || p.frame_count == 0 {
+            return false;
+        }
+        let t = now.saturating_sub(p.base_ms);
+        // Find the last frame whose pts <= t (pts read from the sample table,
+        // no decode needed).
+        let mut target = p.idx;
+        while target + 1 < p.frame_count && p.dec.pts_ms(target + 1) <= t {
+            target += 1;
+        }
+        // End of clip: stop on the last frame.
+        if t >= p.total_ms && target + 1 >= p.frame_count {
+            p.playing = false;
+            if !p.finished_announced {
+                p.finished_announced = true;
+                p.idx = target;
+                p.dec.seek_decode(target);
+                return true; // present final frame once
+            }
+            return false;
+        }
+        if target != p.idx {
+            p.idx = target;
+            p.dec.seek_decode(target);
+            return true;
+        }
+        false
+    });
+    if present {
+        present_video_frame();
+    }
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn pump_video() {}
+
+/// Toggle play/pause on the video (space on the video tab).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn video_toggle_pause() {
+    let now = crate::arch::now_ms();
+    VIDEO.with(|v| {
+        if let Some(p) = v.as_mut() {
+            if p.playing {
+                p.paused_at = now.saturating_sub(p.base_ms);
+                p.playing = false;
+            } else {
+                p.base_ms = now.saturating_sub(p.paused_at);
+                p.playing = true;
+                p.finished_announced = false;
+            }
+        }
+    });
+    present_video_status();
+}
+
+/// Toggle mute on the video's audio track (`m` on the video tab).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn video_toggle_mute() {
+    VIDEO.with(|v| {
+        if let Some(p) = v.as_mut() {
+            p.muted = !p.muted;
+        }
+    });
+    present_video_status();
+}
+
+/// Draw the video player's status bar into the surface tab: playback state,
+/// position/duration, mute, and the key-shortcut hints (mirrors the audio
+/// player's footer). No-op when the video tab isn't the focused surface.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn present_video_status() {
+    VIDEO.with(|v| {
+        if let Some(p) = v.as_ref() {
+            let pos = p.dec.pts_ms(p.idx);
+            crate::framebuffer::draw_video_status(
+                &p.name,
+                p.playing,
+                p.muted,
+                p.has_audio,
+                p.idx + 1,
+                p.frame_count,
+                pos,
+                p.total_ms,
+            );
+        }
+    });
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn present_video_status() {}
+
+/// Seek the video by whole frames (arrows on the video tab).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn video_seek(delta: i64) {
+    let now = crate::arch::now_ms();
+    VIDEO.with(|v| {
+        if let Some(p) = v.as_mut() {
+            let n = p.frame_count as i64;
+            let ni = (p.idx as i64 + delta).clamp(0, n - 1) as usize;
+            p.idx = ni;
+            // Re-anchor the clock to the sought frame's pts.
+            let pts = p.dec.pts_ms(ni);
+            p.base_ms = now.saturating_sub(pts);
+            p.paused_at = pts;
+            p.finished_announced = false;
+            p.dec.seek_decode(ni);
+        }
+    });
+    present_video_frame();
+}
+
+/// Restart the video from the first frame (0 / Home).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn video_restart() {
+    let now = crate::arch::now_ms();
+    VIDEO.with(|v| {
+        if let Some(p) = v.as_mut() {
+            p.idx = 0;
+            p.base_ms = now;
+            p.paused_at = 0;
+            p.playing = true;
+            p.finished_announced = false;
+            p.dec.seek_decode(0);
+        }
+    });
+    present_video_frame();
 }
 
 /// Surface id the `/open` image viewer presents on (labelled "image" in the
