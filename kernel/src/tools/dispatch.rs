@@ -155,6 +155,20 @@ impl ToolDispatch for Router {
                     Err(e) => ToolOutcome::error(e),
                 }
             }
+            ToolBinding::AgentMemory => {
+                // The session's agent owns the memory namespace
+                // (`/agent/<id>/memory/`).
+                let agent_id = session.agent.manifest_id.0;
+                let out = crate::agent::home::run_memory_tool(&call.tool, agent_id, &call.args);
+                if out.starts_with("error:") {
+                    ToolOutcome::error(out)
+                } else {
+                    // Recalled facts are durable agent state the human installed
+                    // into the agent's home — treat as system-trusted content
+                    // (same as a skill body), not untrusted web ingest.
+                    ToolOutcome::ok(out, Provenance::SystemTrusted)
+                }
+            }
         }
     }
 }

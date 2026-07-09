@@ -514,7 +514,13 @@ fn decode_slice_into(c: &mut Ctx, sps: &Sps, pps: &Pps, rbsp: &[u8], is_idr: boo
     let mut mb = first_mb;
     let mut skip = 0u32;
     let mut pending = false;
-    while mb < total && r.more_rbsp_data() {
+    // A P-slice may END with a trailing `mb_skip_run` that skips the final MBs
+    // with no coded macroblock after it — at which point `more_rbsp_data()`
+    // goes false. Those inferred skips must still be applied, so keep looping
+    // while a skip run is draining (`skip > 0`); otherwise the last MB(s) are
+    // left at plane-init 0 → a black corner block that inter-prediction then
+    // propagates into an ever-growing green region over a long P-sequence.
+    while mb < total && (r.more_rbsp_data() || skip > 0) {
         let mb_x = mb % mbw;
         let mb_y = mb / mbw;
         let bx = mb_x * 16;

@@ -167,6 +167,10 @@ pub fn run() -> ! {
                     serial_println!("Chitti: powering off.");
                     crate::arch::poweroff();
                 }
+                "restart" | "reboot" => {
+                    serial_println!("Chitti: restarting.");
+                    crate::arch::reboot();
+                }
                 "clear" => {
                     chat = None;
                     remote_chat = None;
@@ -313,6 +317,8 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "ktrace" | "logs" => toggle_ktrace(),
         "close" => close_action(),
         "skills" => print_skills(),
+        // Human/e2e surface over the same store as the agent `memory_*` tools.
+        "memory" => run_memory_cmd(arg),
         "disks" => disk_list(),
         "ls" => disk_ls(arg),
         "mount" => disk_mount(arg),
@@ -541,6 +547,60 @@ fn print_skills() {
     }
 }
 
+/// `/memory [list|get <key>|add <key> <value>]` — human/e2e surface over the
+/// active agent's durable store (`/agent/<id>/memory/`). Agents use the
+/// `memory_add` / `memory_get` / `memory_list` tools; this command is the
+/// keyboard equivalent (and the path the e2e harness drives).
+fn run_memory_cmd(arg: &str) {
+    let id = active_agent_id();
+    let arg = arg.trim();
+    let (sub, rest) = match arg.split_once(char::is_whitespace) {
+        Some((s, r)) => (s, r.trim()),
+        None => (arg, ""),
+    };
+    match sub {
+        "" | "list" | "ls" => {
+            let out = crate::agent::home::run_memory_tool("memory_list", id, "");
+            if out.starts_with('(') {
+                serial_println!("memory> {out}");
+            } else {
+                serial_println!("memory> keys for agent {id}:");
+                for line in out.lines() {
+                    serial_println!("  {line}");
+                }
+            }
+        }
+        "get" | "recall" => {
+            if rest.is_empty() {
+                serial_println!("memory> usage: /memory get <key>");
+                return;
+            }
+            let out = crate::agent::home::run_memory_tool("memory_get", id, rest);
+            serial_println!("memory> {out}");
+        }
+        "add" | "set" | "remember" => {
+            let Some((key, value)) = rest.split_once(char::is_whitespace) else {
+                serial_println!("memory> usage: /memory add <key> <value>");
+                return;
+            };
+            let value = value.trim_start();
+            // Flat form the tool helper already understands (`key value…`).
+            let flat = alloc::format!("{key} {value}");
+            let out = crate::agent::home::run_memory_tool("memory_add", id, &flat);
+            serial_println!("memory> {out}");
+        }
+        _ => {
+            // Bare `/memory <key>` is a get, when it isn't a known subcommand.
+            if !sub.is_empty() && rest.is_empty() {
+                let out = crate::agent::home::run_memory_tool("memory_get", id, sub);
+                serial_println!("memory> {out}");
+            } else {
+                serial_println!("memory> usage: /memory [list | get <key> | add <key> <value>]");
+            }
+        }
+    }
+}
+
 fn print_help() {
     serial_println!("Chitti commands:");
     serial_println!("  <message>        chat with the agent — it calls /commands as tools (Ctrl+C to stop)");
@@ -552,6 +612,7 @@ fn print_help() {
     serial_println!("  /ws <url> [msg]  WebSocket (ws:// or wss://): connect, send, stream frames");
     serial_println!("  /mcp [..]        MCP client: connect <name> <url>; tools become agent-callable");
     serial_println!("  /skills          list installed skills (L0 metadata)");
+    serial_println!("  /memory [..]     active agent's durable memory: list | get <k> | add <k> <v>");
     serial_println!("  /clear           reset the chat context + clear the pane (incl. scrollback)");
     serial_println!("  /infer           reference inference (fixed prompt, parity check)");
     serial_println!("  /bench           matvec kernel throughput");
@@ -583,6 +644,7 @@ fn print_help() {
     serial_println!("  /install [<disk>]  install/UPDATE Chitti on a disk (modal-confirmed; update keeps data)");
     serial_println!("                   tokens: 'format' = full erase, 'yes' = skip the modal (scripted)");
     serial_println!("  /help            this list");
+    serial_println!("  /restart         reboot the machine (QEMU with -no-reboot exits instead)");
     serial_println!("  /exit            power off (or Ctrl+D on an empty line)");
 }
 
@@ -792,7 +854,12 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
     // model to call tools that would only error.
     let defs: alloc::vec::Vec<_> = crate::tools::registry::for_agent(toolset)
         .into_iter()
-        .filter(|d| matches!(d.binding, ToolBinding::Shell { .. } | ToolBinding::SpawnSubagent))
+        .filter(|d| {
+            matches!(
+                d.binding,
+                ToolBinding::Shell { .. } | ToolBinding::SpawnSubagent | ToolBinding::AgentMemory
+            )
+        })
         .collect();
     let mut s = String::from(persona);
     // Compact one-line-per-tool listing rather than full JSON `<tools>` schemas:
@@ -803,6 +870,7 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
     // small models into calling the first listed tool on a bare "hello".
     s.push_str("\n\nTools you can call. To use one, reply with ONE line and nothing else:\n");
     s.push_str("<tool_call>{\"name\": \"<name>\", \"arguments\": {\"args\": \"<args>\"}}</tool_call>\n");
+    s.push_str("Memory tools use {\"key\":\"…\"} / {\"key\":\"…\",\"value\":\"…\"} instead of args.\n");
     for d in defs.iter().filter(|d| CORE_TOOLS.contains(&d.name.as_str())) {
         s.push_str("- ");
         s.push_str(&d.name);
@@ -820,7 +888,8 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
 /// The tools advertised inline in the system prompt; the rest of the registry
 /// is reachable through `search_tools`. Keep this list short — prefill on a
 /// CPU is the latency budget for every chat turn.
-const CORE_TOOLS: &[&str] = &["ls", "cat", "disks", "network", "datetime", "spawn_subagent"];
+const CORE_TOOLS: &[&str] =
+    &["ls", "cat", "disks", "network", "datetime", "spawn_subagent", "memory_add", "memory_get", "memory_list"];
 
 /// `search_tools` — the chat-level tool-discovery tool. Case-insensitive
 /// keyword match over the executable registry entries' names + descriptions;
@@ -841,7 +910,13 @@ fn search_tools(query: &str) -> String {
         }
     }
     for d in crate::tools::registry::for_agent(&toolset) {
-        if !matches!(d.binding, ToolBinding::Shell { .. } | ToolBinding::SpawnSubagent | ToolBinding::Mcp { .. }) {
+        if !matches!(
+            d.binding,
+            ToolBinding::Shell { .. }
+                | ToolBinding::SpawnSubagent
+                | ToolBinding::Mcp { .. }
+                | ToolBinding::AgentMemory
+        ) {
             continue;
         }
         let hay = alloc::format!("{} {}", d.name, d.description).to_lowercase();
@@ -935,12 +1010,25 @@ fn json_str(obj: &str, key: &str) -> Option<String> {
 /// Flatten a tool call's `"arguments"` into the single argument line our
 /// dispatchers take: a bare-string arguments value is used as-is; an object is
 /// probed for the conventional keys the builtin schemas use.
+///
+/// Memory tools encode multi-field args as `key\\x1fvalue` (unit separator) so
+/// both key and value survive the flatten step into `execute_chat_tool`.
 fn json_args(body: &str) -> String {
     if let Some(i) = body.find("\"arguments\"") {
         let rest = &body[i..];
         // `"arguments": "..."` (string form).
         if let Some(v) = json_str(rest, "arguments") {
             return v;
+        }
+        // memory_add / memory_get: preserve key (+ value) as a structured line.
+        if let Some(k) = json_str(rest, "key") {
+            if let Some(v) = json_str(rest, "value") {
+                let mut s = k;
+                s.push('\u{1f}');
+                s.push_str(&v);
+                return s;
+            }
+            return k;
         }
         // `"arguments": {...}` (object form): first conventional key present.
         for key in ["args", "task", "path", "host", "query", "text", "intent", "name"] {
@@ -1571,6 +1659,13 @@ fn execute_chat_tool(name: &str, args: &str) -> alloc::string::String {
     // Tool discovery is chat-level, side-effect-free, and never needs approval.
     if name == "search_tools" {
         return search_tools(args);
+    }
+    // Durable agent memory — always scoped to the active chat agent; never
+    // needs approval (write stays inside `/agent/<id>/memory/`).
+    if matches!(name, "memory_add" | "memory_get" | "memory_list")
+        || registry::get(name).is_some_and(|d| matches!(d.binding, ToolBinding::AgentMemory))
+    {
+        return crate::agent::home::run_memory_tool(name, active_agent_id(), args);
     }
     // MCP tools (registered by `/mcp connect`) are called over the network,
     // not through the shell dispatcher. They go through the same approval gate.
@@ -5821,6 +5916,17 @@ mod agent_flow_tests {
         let (name, args) = parse_tool_call("<tool_call>{\"name\":\"spawn_subagent\",\"arguments\":{\"task\":\"read notes\"}}</tool_call>").unwrap();
         assert_eq!(name, "spawn_subagent");
         assert_eq!(args, "read notes");
+        // memory_add keeps key + value across the flatten step (unit separator).
+        let (name, args) = parse_tool_call(
+            "<tool_call>{\"name\":\"memory_add\",\"arguments\":{\"key\":\"colour\",\"value\":\"teal\"}}</tool_call>",
+        )
+        .unwrap();
+        assert_eq!(name, "memory_add");
+        assert_eq!(args, "colour\u{1f}teal");
+        let (name, args) =
+            parse_tool_call("<tool_call>{\"name\":\"memory_get\",\"arguments\":{\"key\":\"colour\"}}</tool_call>").unwrap();
+        assert_eq!(name, "memory_get");
+        assert_eq!(args, "colour");
     }
 
     #[test_case]
@@ -5907,5 +6013,49 @@ mod agent_flow_tests {
         // `help`/`wifi` are NOT core, so they stay out of the inline prompt.
         assert!(!p.contains("- help "), "non-core tools are found via search_tools, not listed");
         assert!(!p.contains("- wifi "));
+    }
+
+    /// Memory tools are CORE (listed inline) when the agent toolset includes them.
+    #[test_case]
+    fn system_prompt_lists_memory_tools() {
+        let toolset: alloc::vec::Vec<String> = alloc::vec![
+            "ls".into(),
+            "memory_add".into(),
+            "memory_get".into(),
+            "memory_list".into(),
+        ];
+        let p = tools_system_prompt("You are Chitti.", &toolset);
+        assert!(p.contains("- memory_add "), "memory_add is core");
+        assert!(p.contains("- memory_get "), "memory_get is core");
+        assert!(p.contains("- memory_list "), "memory_list is core");
+        assert!(p.contains("Memory tools use"), "prompt documents key/value arg shape");
+    }
+
+    /// `/memory` shell surface + the chat-flattened tool path share one store.
+    #[test_case]
+    fn memory_shell_cmd_roundtrips_via_dispatch() {
+        // Empty list on a fresh agent id path still prints the memory> prefix.
+        let out = run_tool_command("memory", "list");
+        assert!(out.contains("memory>"), "list output: {out}");
+        let out = run_tool_command("memory", "add e2e_unit teal-42");
+        assert!(out.contains("ok:"), "add output: {out}");
+        let out = run_tool_command("memory", "get e2e_unit");
+        assert!(out.contains("teal-42"), "get output: {out}");
+        let out = run_tool_command("memory", "list");
+        assert!(out.contains("e2e_unit"), "list after add: {out}");
+        let out = run_tool_command("memory", "get missing_zzz");
+        assert!(out.contains("no memory"), "miss output: {out}");
+        // Bad key is rejected, not written.
+        let out = run_tool_command("memory", "add ../x secret");
+        assert!(out.contains("error:"), "traversal: {out}");
+    }
+
+    /// `search_tools` discovers the memory tools by keyword.
+    #[test_case]
+    fn search_tools_finds_memory() {
+        let out = search_tools("memory");
+        assert!(out.contains("memory_add"), "search: {out}");
+        assert!(out.contains("memory_get"), "search: {out}");
+        assert!(out.contains("memory_list"), "search: {out}");
     }
 }

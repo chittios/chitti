@@ -99,6 +99,8 @@ OS_CMDS = [
     ("top", "/top", "top>"),
     ("clear", "/clear", "cleared"),
     ("wifi", "/wifi info", "wifi>"),
+    # /memory and /restart are covered by dedicated scenarios below (round-trip
+    # + help listing / reboot-exit); listed here only for discoverability.
 ]
 
 
@@ -109,6 +111,72 @@ def make_cmd_scenario(cmd, marker, timeout=15):
         ok = g.wait_for(marker, timeout, m)
         return ok, f"{cmd!r} -> {marker!r}" if ok else f"{cmd!r}: no {marker!r}"
     return fn
+
+
+def s_help_restart(g):
+    """`/help` documents `/restart` (the command itself reboots and is tested last)."""
+    m = g.mark()
+    g.send("/help")
+    ok = g.wait_for("/restart", 15, m) and g.wait_for("/memory", 5, m)
+    return ok, "help lists /restart and /memory" if ok else "missing /restart or /memory in help"
+
+
+def s_memory(g):
+    """Active-agent durable memory: add → get → list → miss, via the human shell
+    surface that shares the store with the agent `memory_*` tools."""
+    m = g.mark()
+    g.send("/memory add e2e_key e2e_value_42")
+    if not g.wait_for("ok:", 12, m):
+        return False, "memory add did not report ok"
+    m = g.mark()
+    g.send("/memory get e2e_key")
+    if not g.wait_for("e2e_value_42", 12, m):
+        return False, "memory get missed stored value"
+    m = g.mark()
+    g.send("/memory list")
+    if not g.wait_for("e2e_key", 12, m):
+        return False, "memory list missing key"
+    m = g.mark()
+    g.send("/memory get missing_key_zzz")
+    if not g.wait_for("no memory", 12, m):
+        return False, "missing key should report absence"
+    # Path traversal must be rejected (same sanitise as the tool path).
+    m = g.mark()
+    g.send("/memory add ../escape secret")
+    if not g.wait_for("error:", 12, m):
+        return False, "traversal key was not rejected"
+    return True, "add/get/list + miss + traversal reject"
+
+
+def s_restart(g):
+    """`/restart` reboots the machine via `arch::reboot`.
+
+    On aarch64 `xtask run` (no `-no-reboot`), PSCI SYSTEM_RESET cold-boots the
+    guest in-place — we assert the banner + a second boot. On x86 with
+    `-no-reboot` the emulator may exit instead; that also counts as success.
+    Must run **last**: a live reboot drops in-memory state and the shell
+    session, so later scenarios would race a rebooting guest."""
+    m = g.mark()
+    g.send("/restart")
+    if not g.wait_for("restarting", 15, m):
+        # x86 -no-reboot may exit before the serial line is fully flushed.
+        if g.proc.poll() is not None:
+            return True, "guest exited on /restart (x86 -no-reboot)"
+        return False, "no 'restarting' banner"
+    # Process exited (x86 -no-reboot) — done.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if g.proc.poll() is not None:
+            return True, "guest exited on /restart"
+        time.sleep(0.1)
+    # aarch64 / real hardware: guest reboots in-place — wait for a second boot.
+    if g.wait_for("boot ok", 60, m):
+        # Confirm networking came back so the reboot completed, not a hang.
+        g.wait_for("net: configured", 60, m)
+        return True, "guest rebooted in-place (banner + second boot)"
+    if g.proc.poll() is not None:
+        return True, "guest exited on /restart"
+    return False, "no second boot after /restart"
 
 
 # --- network scenarios ------------------------------------------------------
@@ -814,9 +882,19 @@ def s_surface(g):
     return ok, "surface drawn (grammar-validated draw ops rasterized)" if ok else "no surface render"
 
 
-OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [("open_media", s_open_media), ("open_video", s_open_video), ("tabs", s_tabs), ("panes", s_panes), ("clipboard", s_clipboard)]
+OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
+    ("help_restart", s_help_restart),
+    ("memory", s_memory),
+    ("open_media", s_open_media),
+    ("open_video", s_open_video),
+    ("tabs", s_tabs),
+    ("panes", s_panes),
+    ("clipboard", s_clipboard),
+]
 AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("mcp_manifest", s_mcp_manifest)]
 NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
+# Runs after every other group: kills the guest (QEMU -no-reboot → exit).
+FINAL = [("restart", s_restart)]
 
 # Known-flaky scenarios: timing-fragile, not code-buggy. The Doc web server's
 # reply is model-driven and prefill-bound (~10-15s for the ~530-token serve
@@ -895,6 +973,7 @@ def main():
         else:
             have_tls = False
 
+    # `FINAL` (`/restart`) is always last — it reboots/exits the guest.
     scenarios = list(OS) + list(AGENTS) + list(NET) + (list(NET_TLS) if have_tls else [])
     if slow:
         if have_model:
@@ -905,6 +984,7 @@ def main():
             scenarios += list(VOICE)
         else:
             print("  (voice scenarios skipped — assets/voice/ absent)")
+    scenarios += list(FINAL)
 
     # Voice needs a sound device; give the guest a silent audio backend then.
     audio = "none" if (slow and have_voice) else "off"

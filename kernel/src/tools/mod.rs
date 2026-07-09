@@ -105,6 +105,66 @@ mod tests {
         assert!(!seen.iter().any(|t| t.name == "delete"));
     }
 
+    /// Agents can add/retrieve durable memory via tool calls (scoped to the
+    /// session's agent id under `/agent/<id>/memory/`).
+    #[test_case]
+    fn memory_tools_roundtrip_via_router() {
+        let mut orch = orchestrator::Orchestrator::spawn(manifest::orchestrator_manifest(), 30);
+        let mut router = Router::new();
+        let add = router.call(
+            &mut orch.session,
+            orch.caller,
+            &tool("memory_add", args(&[("key", "project"), ("value", "chitti")])),
+        );
+        assert!(!add.is_error, "memory_add failed: {}", add.result);
+        assert!(add.result.contains("ok:"), "got: {}", add.result);
+        let get = router.call(
+            &mut orch.session,
+            orch.caller,
+            &tool("memory_get", args(&[("key", "project")])),
+        );
+        assert!(!get.is_error, "memory_get failed: {}", get.result);
+        assert_eq!(get.result, "chitti");
+        let list = router.call(&mut orch.session, orch.caller, &tool("memory_list", args(&[])));
+        assert!(!list.is_error);
+        assert!(list.result.contains("project"), "list: {}", list.result);
+        // Orchestrator toolset must advertise the memory tools.
+        let seen = registry::for_agent(&manifest::orchestrator_manifest().toolset);
+        for name in ["memory_add", "memory_get", "memory_list"] {
+            assert!(seen.iter().any(|t| t.name == name), "orchestrator should see {name}");
+        }
+        // Worker sub-agents also get the memory tools (task-local notes).
+        let worker = registry::for_agent(&manifest::worker_subagent_manifest().toolset);
+        for name in ["memory_add", "memory_get", "memory_list"] {
+            assert!(worker.iter().any(|t| t.name == name), "worker should see {name}");
+        }
+    }
+
+    /// Malformed / unknown memory tool calls are refused with a clean error
+    /// and never write a fact.
+    #[test_case]
+    fn memory_tools_reject_malformed() {
+        let mut orch = orchestrator::Orchestrator::spawn(manifest::orchestrator_manifest(), 31);
+        let mut router = Router::new();
+        // Missing required `value`.
+        let bad = router.call(
+            &mut orch.session,
+            orch.caller,
+            &tool("memory_add", args(&[("key", "orphan")])),
+        );
+        assert!(bad.is_error, "missing value must error: {}", bad.result);
+        let miss = router.call(
+            &mut orch.session,
+            orch.caller,
+            &tool("memory_get", args(&[("key", "orphan")])),
+        );
+        assert!(!miss.is_error);
+        assert!(miss.result.contains("no memory"), "got: {}", miss.result);
+        // Missing required `key`.
+        let no_key = router.call(&mut orch.session, orch.caller, &tool("memory_get", args(&[])));
+        assert!(no_key.is_error, "missing key must error: {}", no_key.result);
+    }
+
     /// The system `/command` toolset is registered, visible to the root agent,
     /// dispatchable (returns the command's output), and destructive commands are
     /// taint-gated exactly like a DELETE.

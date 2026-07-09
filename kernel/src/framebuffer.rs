@@ -915,8 +915,11 @@ impl Screen {
     /// Repaint a pane's interior from its scrollback + grid at the current view
     /// offset. The one text renderer used by scroll, redraw, relayout, and the
     /// mouse selection (whose cells get the selection background).
+    ///
+    /// **No full-interior clear** — blank-then-repaint is what made selection
+    /// drag (and scroll) flicker on the single-buffered framebuffer. Every cell
+    /// is painted in place (bg + glyph), so nothing is ever blanked mid-frame.
     fn render_view(&self, p: &Pane) {
-        self.fill_rect(p.ix, p.iy, p.cols * p.cw, p.rows * p.ch, p.bg);
         let cols = p.cols as usize;
         if p.grid.len() < cols {
             return;
@@ -926,24 +929,26 @@ impl Screen {
         let first = p.hist.len() - view;
         for r in 0..p.rows as usize {
             let gi = first + r;
-            let line: &[Cell] = if gi < p.hist.len() {
-                &p.hist[gi]
+            let line: Option<&[Cell]> = if gi < p.hist.len() {
+                Some(&p.hist[gi])
             } else {
                 let gr = gi - p.hist.len();
                 if gr >= p.rows as usize {
                     break;
                 }
-                &p.grid[gr * cols..(gr + 1) * cols]
+                Some(&p.grid[gr * cols..(gr + 1) * cols])
             };
-            for (c, &(b, fg)) in line.iter().enumerate().take(cols) {
+            for c in 0..cols {
+                let (b, fg) = line.and_then(|l| l.get(c).copied()).unwrap_or((0, p.default_fg));
                 let x = p.ix + c as u64 * p.cw;
                 let y = p.iy + r as u64 * p.ch;
                 let selected = sel.is_some_and(|s| crate::textsel::contains(s, gi, c));
-                if selected {
-                    self.fill_rect(x, y, p.cw, p.ch, self.theme.editor_sel);
-                }
+                let bg = if selected { self.theme.editor_sel } else { p.bg };
+                // Always fill the cell first so deselected / empty cells leave
+                // no residue (selection highlight, partial glyphs).
+                self.fill_rect(x, y, p.cw, p.ch, bg);
                 if (0x21..=0x7e).contains(&b) {
-                    self.blit_glyph(x, y, b, fg, if selected { self.theme.editor_sel } else { p.bg });
+                    self.blit_glyph(x, y, b, fg, bg);
                 }
             }
         }
@@ -952,6 +957,76 @@ impl Screen {
             let tag = alloc::format!("[-{}] ", view);
             let tx = (p.ix + p.cols * p.cw).saturating_sub(tag.len() as u64 * p.cw);
             self.draw_str(tx, p.iy, &tag, self.theme.accent, p.bg);
+        }
+    }
+
+    /// Paint one chat-pane cell at absolute line `gi`, column `c` (selection
+    /// highlight applied when `selected`). Used by differential selection
+    /// updates so a drag only touches cells that actually changed.
+    fn paint_chat_cell(&self, p: &Pane, gi: usize, c: usize, selected: bool) {
+        let cols = p.cols as usize;
+        if c >= cols || p.grid.len() < cols {
+            return;
+        }
+        let view = p.view.min(p.hist.len());
+        let first = p.hist.len() - view;
+        if gi < first || gi >= first + p.rows as usize {
+            return; // off-screen
+        }
+        let r = gi - first;
+        let (b, fg) = if gi < p.hist.len() {
+            p.hist[gi].get(c).copied().unwrap_or((0, p.default_fg))
+        } else {
+            let gr = gi - p.hist.len();
+            if gr >= p.rows as usize {
+                return;
+            }
+            p.grid.get(gr * cols + c).copied().unwrap_or((0, p.default_fg))
+        };
+        let x = p.ix + c as u64 * p.cw;
+        let y = p.iy + r as u64 * p.ch;
+        let bg = if selected { self.theme.editor_sel } else { p.bg };
+        self.fill_rect(x, y, p.cw, p.ch, bg);
+        if (0x21..=0x7e).contains(&b) {
+            self.blit_glyph(x, y, b, fg, bg);
+        }
+    }
+
+    /// Repaint only the cells whose selection membership differs between
+    /// `old_sel` and `new_sel` (both raw anchor/head pairs). Avoids the
+    /// full-pane flash that a drag-triggered `render_view` used to cause.
+    fn repaint_sel_diff(
+        &self,
+        p: &Pane,
+        old_sel: Option<((usize, usize), (usize, usize))>,
+        new_sel: Option<((usize, usize), (usize, usize))>,
+    ) {
+        let old = old_sel.map(|(a, b)| crate::textsel::normalize(a, b));
+        let new = new_sel.map(|(a, b)| crate::textsel::normalize(a, b));
+        if old == new {
+            return;
+        }
+        let cols = p.cols as usize;
+        let view = p.view.min(p.hist.len());
+        let first = p.hist.len() - view;
+        let last = first + p.rows as usize;
+        // Bound the walk to the union of the two ranges (clamped to the view).
+        let span = |s: Option<((usize, usize), (usize, usize))>| -> Option<(usize, usize)> {
+            s.map(|((r1, _), (r2, _))| (r1.max(first), (r2 + 1).min(last)))
+        };
+        let (lo, hi) = match (span(old), span(new)) {
+            (Some((a, b)), Some((c, d))) => (a.min(c), b.max(d)),
+            (Some((a, b)), None) | (None, Some((a, b))) => (a, b),
+            (None, None) => return,
+        };
+        for gi in lo..hi {
+            for c in 0..cols {
+                let was = old.is_some_and(|s| crate::textsel::contains(s, gi, c));
+                let now = new.is_some_and(|s| crate::textsel::contains(s, gi, c));
+                if was != now {
+                    self.paint_chat_cell(p, gi, c, now);
+                }
+            }
         }
     }
 
@@ -2713,11 +2788,12 @@ fn chat_abs_cell(sc: &Screen, x: u64, y: u64, clamp: bool) -> Option<(usize, usi
     Some((first + row, col))
 }
 
-/// Repaint the chat pane after a selection change (sprite-safe).
-fn chat_sel_repaint(sc: &mut Screen) {
+/// Sprite-safe wrapper around a selection-highlight update: hide the cursor,
+/// apply `paint`, redraw the caret if the view is live, restore the cursor.
+fn chat_sel_with_cursor(sc: &mut Screen, paint: impl FnOnce(&mut Screen)) {
     sc.cursor_restore();
     sc.cur_vis = false;
-    sc.render_view(&sc.chat);
+    paint(sc);
     if sc.chat.view == 0 {
         sc.caret_draw(&sc.chat);
     }
@@ -2730,10 +2806,11 @@ pub fn chat_sel_begin(x: u64, y: u64) {
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
             let cell = chat_abs_cell(sc, x, y, false);
-            let had = sc.chat.sel.take().is_some();
+            let old = sc.chat.sel.take();
             sc.chat.sel = cell.map(|c| (c, c));
-            if had || cell.is_some() {
-                chat_sel_repaint(sc);
+            if old.is_some() || cell.is_some() {
+                let new = sc.chat.sel;
+                chat_sel_with_cursor(sc, |sc| sc.repaint_sel_diff(&sc.chat, old, new));
             }
         }
     });
@@ -2747,8 +2824,10 @@ pub fn chat_sel_drag(x: u64, y: u64) {
             let Some((anchor, head)) = sc.chat.sel else { return };
             let Some(new_head) = chat_abs_cell(sc, x, y, true) else { return };
             if new_head != head {
+                let old = Some((anchor, head));
                 sc.chat.sel = Some((anchor, new_head));
-                chat_sel_repaint(sc);
+                let new = sc.chat.sel;
+                chat_sel_with_cursor(sc, |sc| sc.repaint_sel_diff(&sc.chat, old, new));
             }
         }
     });
@@ -2762,8 +2841,8 @@ pub fn chat_sel_end() -> Option<String> {
         let sc = slot.as_mut()?;
         let (a, b) = sc.chat.sel?;
         if a == b {
-            sc.chat.sel = None;
-            chat_sel_repaint(sc);
+            let old = sc.chat.sel.take();
+            chat_sel_with_cursor(sc, |sc| sc.repaint_sel_diff(&sc.chat, old, None));
             return None;
         }
         let p = &sc.chat;
@@ -2788,8 +2867,9 @@ pub fn chat_sel_end() -> Option<String> {
 pub fn chat_sel_clear() {
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
-            if sc.chat.sel.take().is_some() {
-                chat_sel_repaint(sc);
+            let old = sc.chat.sel.take();
+            if old.is_some() {
+                chat_sel_with_cursor(sc, |sc| sc.repaint_sel_diff(&sc.chat, old, None));
             }
         }
     });

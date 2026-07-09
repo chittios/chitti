@@ -77,6 +77,21 @@ pub fn poweroff() -> ! {
     }
 }
 
+/// Reboot via PSCI `SYSTEM_RESET` (function id 0x84000009). On real hardware
+/// and most hypervisors this cold-resets the board; under QEMU with
+/// `-no-reboot` the process exits instead (same as SYSTEM_OFF for the host).
+pub fn reboot() -> ! {
+    // SAFETY: PSCI SYSTEM_RESET has no memory effects; it does not return.
+    unsafe {
+        asm!(
+            "mov w0, #0x0009",
+            "movk w0, #0x8400, lsl #16", // w0 = 0x84000009 (PSCI_SYSTEM_RESET)
+            "hvc #0",
+            options(nomem, nostack, noreturn),
+        );
+    }
+}
+
 /// CPU interrupt masking via `DAIF.I` (the IRQ mask bit), mirroring the x86
 /// `interrupts` facade so `mm::Locked`, `ktrace`, and the scheduler are
 /// arch-agnostic.
