@@ -37,6 +37,10 @@ Where it appears:
 - **Boot splash** — the mark, `Chitti OS`, and the tagline *an agentic operating
   system*, centred on the canvas, held ~1.3 s before the shell (`draw_splash`).
 - **Status bar** — a small mark at the bottom-left, before the brand text.
+- **Input composer** — a Grok-style bordered box at the bottom of the chat pane
+  (elevated `composer_bg`, rounded outline, accent when focused) with a `>`
+  prompt and blinking caret; a muted hint row under it lists shortcuts (left)
+  and backend/mode (right). Scrollback never paints into this reserved strip.
 
 ## Palette
 

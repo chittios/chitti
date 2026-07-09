@@ -12,9 +12,12 @@
 use super::bits::{unescape_rbsp, BitReader};
 use alloc::vec::Vec;
 
+pub mod cabac;
+pub mod cabac_tables;
 pub mod cavlc;
 pub mod deblock;
 pub mod decoder;
+pub mod decoder_cabac;
 pub mod inter;
 pub mod intra;
 pub mod transform;
@@ -303,6 +306,13 @@ pub struct Pps {
     pub deblocking_filter_control_present: bool,
     pub constrained_intra_pred: bool,
     pub redundant_pic_cnt_present: bool,
+    /// High-profile extension: adaptive 4x4/8x8 transform per macroblock.
+    pub transform_8x8_mode: bool,
+    /// High-profile extension: separate Cr QP offset (Cb uses
+    /// `chroma_qp_index_offset`). Set to the Cb offset when absent.
+    pub second_chroma_qp_index_offset: i32,
+    /// PPS scaling matrices present — not supported; the decoder refuses.
+    pub scaling_matrix_present: bool,
 }
 
 /// Parse a PPS from its RBSP. Only the pre-`slice_group` fields are read in
@@ -331,6 +341,16 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, &'static str> {
     p.deblocking_filter_control_present = r.flag()?;
     p.constrained_intra_pred = r.flag()?;
     p.redundant_pic_cnt_present = r.flag()?;
+    // High-profile PPS extension (present iff more RBSP data follows).
+    p.second_chroma_qp_index_offset = p.chroma_qp_index_offset;
+    if r.more_rbsp_data() {
+        p.transform_8x8_mode = r.flag()?;
+        p.scaling_matrix_present = r.flag()?;
+        if p.scaling_matrix_present {
+            return Ok(p); // refused downstream; don't parse the lists
+        }
+        p.second_chroma_qp_index_offset = r.se()?;
+    }
     Ok(p)
 }
 

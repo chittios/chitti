@@ -19,6 +19,7 @@ pub mod bits;
 pub mod h264;
 pub mod mkv;
 pub mod mp4;
+pub mod yuv;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -71,7 +72,7 @@ pub fn probe(bytes: &[u8]) -> Result<VideoInfo, &'static str> {
         frame_count,
         duration_ms,
         cabac: pps.entropy_coding_mode,
-        decodable: !pps.entropy_coding_mode,
+        decodable: true,
     })
 }
 
@@ -127,58 +128,157 @@ fn sniff(bytes: &[u8]) -> Container {
     Container::Unknown
 }
 
-/// BT.601 limited-range YUV → packed `0x00RRGGBB` (integer approximation, the
-/// standard SD coefficients).
-fn yuv_to_rgb(y: u8, u: u8, v: u8) -> u32 {
-    let c = y as i32 - 16;
-    let d = u as i32 - 128;
-    let e = v as i32 - 128;
-    let clip = |x: i32| x.clamp(0, 255) as u32;
-    let r = clip((298 * c + 409 * e + 128) >> 8);
-    let g = clip((298 * c - 100 * d - 208 * e + 128) >> 8);
-    let b = clip((298 * c + 516 * d + 128) >> 8);
-    (r << 16) | (g << 8) | b
+/// Preferred max edge for display RGB. Full-res 4K RGB is ~33 MiB/frame; the
+/// DPB keeps full-res YUV only for active references. 640 keeps convert cheap
+/// on 1080p/4K while still filling the action pane.
+const DISPLAY_MAX_EDGE: usize = 640;
+
+/// Short look-ahead ring (display RGB) — like VLC's jitter buffer, **not** a
+/// full-clip cache. ~8 frames × 640×360×4 ≈ 7 MiB max.
+const RGB_RING: usize = 8;
+
+/// Fit `(w,h)` into a box of max edge `max_edge`, preserving aspect (at least 1×1).
+fn fit_display(w: usize, h: usize, max_edge: usize) -> (usize, usize) {
+    if w == 0 || h == 0 {
+        return (1, 1);
+    }
+    let long = w.max(h);
+    if long <= max_edge {
+        return (w, h);
+    }
+    let dw = (w * max_edge / long).max(1);
+    let dh = (h * max_edge / long).max(1);
+    (dw, dh)
 }
 
-fn frame_from_yuv(df: &h264::decoder::DecodedFrame, pts_ms: u64) -> Frame {
-    let (w, h, cw) = (df.w, df.h, df.w / 2);
-    let mut pixels = alloc::vec![0u32; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let yy = df.y[y * w + x];
-            let uu = df.cb[(y / 2) * cw + x / 2];
-            let vv = df.cr[(y / 2) * cw + x / 2];
-            pixels[y * w + x] = yuv_to_rgb(yy, uu, vv);
+/// Convert a decoded YUV frame to RGB for presentation. Large sources are
+/// nearest-neighbour downscaled to `max_edge`. Uses **NEON SIMD** via [`yuv`];
+/// on aarch64 with online APs, **multi-core row split**.
+fn frame_from_yuv(df: &h264::decoder::DecodedFrame, pts_ms: u64, max_edge: usize) -> Frame {
+    let (sw, sh, scw) = (df.w, df.h, df.w / 2);
+    let (dw, dh) = fit_display(sw, sh, max_edge);
+    let mut pixels = alloc::vec![0u32; dw * dh];
+    #[cfg(all(target_arch = "aarch64", not(test)))]
+    {
+        if crate::arch::aarch64::smp::online_cpus() > 1 && dh >= 32 {
+            let mut ctx = yuv::ConvertCtx {
+                y: df.y.as_ptr(),
+                cb: df.cb.as_ptr(),
+                cr: df.cr.as_ptr(),
+                out: pixels.as_mut_ptr(),
+                y_len: df.y.len(),
+                cb_len: df.cb.len(),
+                cr_len: df.cr.len(),
+                out_len: pixels.len(),
+                sw,
+                sh,
+                scw,
+                dw,
+                dh,
+            };
+            // SAFETY: ctx lives for parallel_for; workers write disjoint rows.
+            unsafe {
+                crate::arch::aarch64::smp::parallel_for(
+                    dh,
+                    16,
+                    yuv::convert_worker,
+                    &mut ctx as *mut yuv::ConvertCtx as *mut u8,
+                );
+            }
+            return Frame { w: dw, h: dh, pixels, pts_ms };
         }
     }
-    Frame { w, h, pixels, pts_ms }
+    yuv::convert_display(&df.y, &df.cb, &df.cr, sw, sh, scw, dw, dh, &mut pixels);
+    Frame { w: dw, h: dh, pixels, pts_ms }
 }
 
-/// A **streaming** H.264 decoder: holds the source bytes + the demuxed sample
-/// table and decodes frames on demand, keeping only *one* reference frame and
-/// *one* presented RGB frame in RAM (~6 MB total for a 480p clip).
+/// A **streaming** H.264 player pipeline — the same shape as VLC/mpv/ffmpeg:
 ///
-/// The alternative — decoding every frame up front into a `Vec<Frame>` — is a
-/// trap: a 1300-frame 480×272 clip is ~700 MB of RGB, which overruns the
-/// kernel's first-fit heap, corrupts a reference frame's chroma plane under
-/// allocation pressure, and every dependent P-frame then builds on zeroed
-/// chroma → whole frames render **green**. Baseline H.264 has no B-frames, so
-/// decode order == display order and each P-frame references only the previous
-/// frame; forward playback needs just the running reference.
+/// 1. **Demux once** (sample table + SPS/PPS) — kilobytes, not gigabytes.
+/// 2. **Keep the compressed file** (or map it) and read one access unit at a time.
+/// 3. **Decode on demand** as the play clock advances — never rasterize the
+///    whole movie up front.
+/// 4. **RAM stays O(1)**: one current display RGB + a few H.264 DPB reference
+///    pictures (YUV). A 2‑hour 4K file does **not** become hundreds of MB of RGB.
+///
+/// Full-clip RGB caching is deliberately not done: it makes open take minutes
+/// and blows the heap. If the player falls behind, it drops frames (soft clock
+/// re-anchor in `pump_video`), same idea as VLC under CPU pressure.
 pub struct StreamDecoder {
+    /// Compressed container bytes (mp4/mkv). Demux indexes into this; we do
+    /// **not** expand it to per-frame RGB.
     bytes: Vec<u8>,
     sps: h264::Sps,
     pps: h264::Pps,
     length_size: u8,
+    /// Sample table only (offsets/sizes/cts) — O(frames), a few bytes each.
     samples: Vec<mp4::Sample>,
     timescale: u32,
     /// Track duration in ms (public: the player's clock reads it).
     pub duration_ms: u64,
-    /// Index of the next sample to decode (so `reference` holds frame `next-1`).
+    /// Index of the next sample to decode (so the newest picture is `next-1`).
     next: usize,
-    reference: Option<h264::decoder::DecodedFrame>,
-    /// The last RGB frame produced, tagged with its display index.
-    cur: Option<(usize, Frame)>,
+    engine: Engine,
+    /// display index → decode sample index (identity for baseline; B-frame
+    /// streams are sorted by composition timestamp).
+    display: Vec<usize>,
+    /// Display index of the single current RGB frame.
+    cur_idx: Option<usize>,
+    /// The one RGB frame currently shown (also stored in `ring` when present).
+    cur: Option<Frame>,
+    /// Short look-ahead of recent display RGB frames (evict oldest). Forward
+    /// play often hits the ring; backward/seek misses and re-decodes.
+    ring: alloc::collections::BTreeMap<usize, Frame>,
+    /// Source coded width/height (full res, may be 4K).
+    pub src_w: u32,
+    pub src_h: u32,
+    /// Display max edge for YUV→RGB downscale (pane-sized, not full 4K RGB).
+    display_edge: usize,
+    /// Raw SPS/PPS NALs (with header) for re-initialising rust_h264 on seek.
+    avcc_sps: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    avcc_pps: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    /// Which backend is active (for status / debugging).
+    pub backend: &'static str,
+}
+
+/// Decode backend. Prefer **rust_h264** (vendored Main/High + CABAC); on
+/// init/decode failure fall back to our hand-rolled CAVLC / CABAC ports.
+enum Engine {
+    /// Primary: `third_party/rust_h264` (pure Rust, no_std-patched).
+    RustH264 {
+        dec: rust_h264::decoder::Decoder,
+        /// Decode-order sample index → YUV planes ready for display convert.
+        pending: alloc::collections::BTreeMap<usize, h264::decoder::DecodedFrame>,
+        /// Sample index of the picture currently being assembled (rust_h264
+        /// returns the *previous* picture when a new one starts).
+        open_sample: Option<usize>,
+    },
+    /// Backup: our baseline CAVLC path.
+    Cavlc { reference: Option<h264::decoder::DecodedFrame> },
+    /// Backup: our Main/High CABAC path.
+    Cabac {
+        dec: h264::decoder_cabac::H264Dec,
+        pending: alloc::collections::BTreeMap<usize, alloc::rc::Rc<h264::decoder_cabac::Pic>>,
+    },
+}
+
+fn rust_h264_from_avcc(sps_nals: &[alloc::vec::Vec<u8>], pps_nals: &[alloc::vec::Vec<u8>]) -> Result<rust_h264::decoder::Decoder, &'static str> {
+    let mut dec = rust_h264::decoder::Decoder::new();
+    for raw in sps_nals.iter().chain(pps_nals.iter()) {
+        let nal = rust_h264::nal::parse_nal_bytes(raw).ok_or("rust_h264: bad param NAL")?;
+        dec.decode_nal(&nal).map_err(|_| "rust_h264: param set rejected")?;
+    }
+    Ok(dec)
+}
+
+fn yuv_from_rust_h264(f: rust_h264::decoder::Frame) -> h264::decoder::DecodedFrame {
+    h264::decoder::DecodedFrame {
+        w: f.width as usize,
+        h: f.height as usize,
+        y: f.y,
+        cb: f.u,
+        cr: f.v,
+    }
 }
 
 impl StreamDecoder {
@@ -189,12 +289,35 @@ impl StreamDecoder {
         let pps_nal = d.avcc.pps.first().ok_or("video: no PPS")?;
         let sps = h264::parse_sps(&bits::unescape_rbsp(&sps_nal[1..]))?;
         let pps = h264::parse_pps(&bits::unescape_rbsp(&pps_nal[1..]))?;
-        if pps.entropy_coding_mode {
-            return Err("video: CABAC not supported yet (baseline/CAVLC only)");
-        }
         if d.samples.is_empty() {
             return Err("video: no decodable frames found");
         }
+        // Prefer rust_h264; keep our CAVLC/CABAC ports as fallback.
+        let (engine, backend) = match rust_h264_from_avcc(&d.avcc.sps, &d.avcc.pps) {
+            Ok(dec) => (
+                Engine::RustH264 {
+                    dec,
+                    pending: alloc::collections::BTreeMap::new(),
+                    open_sample: None,
+                },
+                "rust_h264",
+            ),
+            Err(_) if pps.entropy_coding_mode => (
+                Engine::Cabac {
+                    dec: h264::decoder_cabac::H264Dec::new(sps.clone(), pps.clone())?,
+                    pending: alloc::collections::BTreeMap::new(),
+                },
+                "native-cabac",
+            ),
+            Err(_) => (Engine::Cavlc { reference: None }, "native-cavlc"),
+        };
+        // Display order: sort sample indices by composition timestamp (stable,
+        // so equal timestamps keep decode order). Baseline streams have
+        // cts == dts and this is the identity.
+        let mut display: Vec<usize> = (0..d.samples.len()).collect();
+        display.sort_by_key(|&i| (d.samples[i].cts, i));
+        let src_w = sps.width();
+        let src_h = sps.height();
         Ok(StreamDecoder {
             length_size: d.avcc.length_size,
             samples: d.samples,
@@ -204,9 +327,44 @@ impl StreamDecoder {
             sps,
             pps,
             next: 0,
-            reference: None,
+            engine,
+            display,
+            cur_idx: None,
             cur: None,
+            ring: alloc::collections::BTreeMap::new(),
+            src_w,
+            src_h,
+            display_edge: DISPLAY_MAX_EDGE,
+            avcc_sps: d.avcc.sps,
+            avcc_pps: d.avcc.pps,
+            backend,
         })
+    }
+
+    /// Switch from rust_h264 to the native backup (call on hard decode error).
+    fn fallback_to_native(&mut self) {
+        self.engine = if self.pps.entropy_coding_mode {
+            match h264::decoder_cabac::H264Dec::new(self.sps.clone(), self.pps.clone()) {
+                Ok(dec) => {
+                    self.backend = "native-cabac";
+                    Engine::Cabac {
+                        dec,
+                        pending: alloc::collections::BTreeMap::new(),
+                    }
+                }
+                Err(_) => {
+                    self.backend = "native-cavlc";
+                    Engine::Cavlc { reference: None }
+                }
+            }
+        } else {
+            self.backend = "native-cavlc";
+            Engine::Cavlc { reference: None }
+        };
+        self.next = 0;
+        self.ring.clear();
+        self.cur = None;
+        self.cur_idx = None;
     }
 
     /// Total number of frames (samples) in the track.
@@ -217,10 +375,44 @@ impl StreamDecoder {
     /// Presentation timestamp of display frame `idx`, in ms — read from the
     /// sample table without decoding, so the playback clock can seek freely.
     pub fn pts_ms(&self, idx: usize) -> u64 {
-        self.samples
+        self.display
             .get(idx)
-            .map(|s| if self.timescale > 0 { s.dts * 1000 / self.timescale as u64 } else { 0 })
+            .and_then(|&si| self.samples.get(si))
+            .map(|s| if self.timescale > 0 { s.cts * 1000 / self.timescale as u64 } else { 0 })
             .unwrap_or(0)
+    }
+
+    /// Nearest display index whose decode sample is a sync/IDR frame at or
+    /// before `idx` (for VLC-style frame-drop when the decoder can't keep up).
+    pub fn keyframe_at_or_before(&self, idx: usize) -> usize {
+        let idx = idx.min(self.display.len().saturating_sub(1));
+        let mut si = self.display[idx];
+        while si > 0 && !self.samples[si].is_sync {
+            si -= 1;
+        }
+        // Map decode sample → a display index that shows it (first with that sample).
+        self.display
+            .iter()
+            .position(|&d| d == si)
+            .unwrap_or(0)
+    }
+
+    fn ring_insert(&mut self, idx: usize, frame: Frame) {
+        self.ring.insert(idx, frame);
+        while self.ring.len() > RGB_RING {
+            if let Some((&k, _)) = self.ring.iter().next() {
+                // Prefer dropping frames older than current playhead.
+                if self.cur_idx.map(|c| k < c).unwrap_or(true) {
+                    self.ring.remove(&k);
+                } else {
+                    // All frames are ahead — drop the furthest.
+                    let last = *self.ring.keys().next_back().unwrap();
+                    self.ring.remove(&last);
+                }
+            } else {
+                break;
+            }
+        }
     }
 
     /// Decode sample `self.next` into `reference`, always advancing `next` (even
@@ -234,56 +426,263 @@ impl StreamDecoder {
         let data = &self.bytes[s.offset..s.offset + s.size];
         // One mp4/mkv sample = one access unit = a full frame, possibly split
         // into multiple slice NALs. Collect them all and decode as one frame.
-        let mut slices: Vec<(alloc::vec::Vec<u8>, bool)> = Vec::new();
-        for nal in h264::split_avcc(data, self.length_size) {
-            if nal.kind.is_slice() {
-                slices.push((nal.rbsp(), nal.kind == h264::NalType::SliceIdr));
+        let sample_i = self.next - 1;
+        match &mut self.engine {
+            Engine::RustH264 {
+                dec,
+                pending,
+                open_sample,
+            } => {
+                let nals = rust_h264::nal::parse_avcc(data, self.length_size as usize);
+                if nals.is_empty() {
+                    return Err("video: sample has no NALs");
+                }
+                for nal in &nals {
+                    match dec.decode_nal(nal) {
+                        Ok(Some(frame)) => {
+                            // Frame for the previously opened sample (decode order).
+                            if let Some(prev) = *open_sample {
+                                pending.insert(prev, yuv_from_rust_h264(frame));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => return Err("rust_h264: decode_nal failed"),
+                    }
+                }
+                // One sample ≈ one access unit / picture.
+                *open_sample = Some(sample_i);
+                while pending.len() > 24 {
+                    let k = *pending.keys().next().unwrap();
+                    pending.remove(&k);
+                }
+            }
+            Engine::Cavlc { reference } => {
+                let mut slices: Vec<(alloc::vec::Vec<u8>, bool)> = Vec::new();
+                for nal in h264::split_avcc(data, self.length_size) {
+                    if nal.kind.is_slice() {
+                        slices.push((nal.rbsp(), nal.kind == h264::NalType::SliceIdr));
+                    }
+                }
+                if slices.is_empty() {
+                    return Err("video: sample has no slices");
+                }
+                let df = h264::decoder::decode_access_unit(
+                    &self.sps,
+                    &self.pps,
+                    &slices,
+                    reference.as_ref(),
+                )?;
+                *reference = Some(df);
+            }
+            Engine::Cabac { dec, pending } => {
+                let mut slices: Vec<(alloc::vec::Vec<u8>, bool, u8)> = Vec::new();
+                for nal in h264::split_avcc(data, self.length_size) {
+                    if nal.kind.is_slice() {
+                        slices.push((nal.rbsp(), nal.kind == h264::NalType::SliceIdr, nal.ref_idc));
+                    }
+                }
+                if slices.is_empty() {
+                    return Err("video: sample has no slices");
+                }
+                let pic = dec.decode_au(&slices)?;
+                pending.insert(sample_i, pic);
+                while pending.len() > 20 {
+                    let k = *pending.keys().next().unwrap();
+                    pending.remove(&k);
+                }
             }
         }
-        if slices.is_empty() {
-            return Err("video: sample has no slices");
-        }
-        let df = h264::decoder::decode_access_unit(&self.sps, &self.pps, &slices, self.reference.as_ref())?;
-        self.reference = Some(df); // previous frame is the reference for the next P slice
         Ok(())
     }
 
+    /// Ensure picture for decode sample `si` is in the engine pending map
+    /// (rust_h264 needs a following AU or flush to release the last picture).
+    fn ensure_rust_h264_frame(&mut self, si: usize) {
+        let has = matches!(
+            &self.engine,
+            Engine::RustH264 { pending, .. } if pending.contains_key(&si)
+        );
+        if has {
+            return;
+        }
+        if self.next < self.samples.len() {
+            // Feed one more sample to force finalize of `si`.
+            let _ = self.decode_one();
+        } else if let Engine::RustH264 {
+            dec,
+            pending,
+            open_sample,
+        } = &mut self.engine
+        {
+            if let Some(frame) = dec.flush() {
+                if let Some(prev) = *open_sample {
+                    pending.insert(prev, yuv_from_rust_h264(frame));
+                }
+            }
+            *open_sample = None;
+        }
+    }
+
     /// Ensure the current RGB frame is display index `idx`, decoding forward as
-    /// needed. A backward seek rewinds to the latest sync (IDR) sample ≤ `idx`
-    /// and re-decodes forward (baseline P-frames can't be decoded in reverse).
-    /// Returns `true` if the presented frame changed.
+    /// needed. A backward seek rewinds to the latest sync (IDR) sample ≤ the
+    /// target in *decode* order and re-decodes forward (P/B frames can't be
+    /// decoded in reverse). Returns `true` if the presented frame changed.
     pub fn seek_decode(&mut self, idx: usize) -> bool {
-        let idx = idx.min(self.samples.len().saturating_sub(1));
-        if matches!(&self.cur, Some((ci, _)) if *ci == idx) {
+        let idx = idx.min(self.display.len().saturating_sub(1));
+        if self.cur_idx == Some(idx) {
             return false;
         }
-        // Behind what we've decoded? Rewind to the latest keyframe ≤ idx.
-        if idx + 1 < self.next {
-            let mut s = idx;
+        // Ring hit (look-ahead / recent frame) — no re-decode.
+        if let Some(f) = self.ring.get(&idx) {
+            self.cur_idx = Some(idx);
+            self.cur = Some(Frame {
+                w: f.w,
+                h: f.h,
+                pixels: f.pixels.clone(),
+                pts_ms: f.pts_ms,
+            });
+            return true;
+        }
+        // The picture shown at display position `idx` is the output of decode
+        // sample `target`; decoding runs in decode (stored) order — same as
+        // VLC: walk forward from the last keyframe, never reverse through P/B.
+        let target = self.display[idx];
+        let cached = matches!(
+            &self.engine,
+            Engine::Cabac { pending, .. } if pending.contains_key(&target)
+        ) || matches!(
+            &self.engine,
+            Engine::RustH264 { pending, .. } if pending.contains_key(&target)
+        );
+        if target + 1 < self.next && !cached {
+            // Rewind to the latest keyframe ≤ target and reset decode state.
+            let mut s = target;
             while s > 0 && !self.samples[s].is_sync {
                 s -= 1;
             }
             self.next = s;
-            self.reference = None;
+            match &mut self.engine {
+                Engine::RustH264 {
+                    dec,
+                    pending,
+                    open_sample,
+                } => {
+                    // Re-init rust_h264 (no public reset API).
+                    if let Ok(d) = rust_h264_from_avcc(&self.avcc_sps, &self.avcc_pps) {
+                        *dec = d;
+                    }
+                    pending.clear();
+                    *open_sample = None;
+                }
+                Engine::Cavlc { reference } => *reference = None,
+                Engine::Cabac { dec, pending } => {
+                    dec.reset();
+                    pending.clear();
+                }
+            }
+            self.ring.clear();
         }
-        // Decode forward until `reference` holds frame `idx` (next == idx+1).
-        while self.next <= idx {
+        while self.next <= target {
             if self.decode_one().is_err() {
-                break; // decode_one advanced `next`, so this terminates
+                // Primary path failed — switch to native backup and retry once.
+                if matches!(self.engine, Engine::RustH264 { .. }) {
+                    self.fallback_to_native();
+                    // Rewind to keyframe and continue with backup.
+                    let mut s = target;
+                    while s > 0 && !self.samples[s].is_sync {
+                        s -= 1;
+                    }
+                    self.next = s;
+                    continue;
+                }
+                break;
             }
         }
+        // rust_h264 holds the last picture until the next AU or flush.
+        if matches!(self.engine, Engine::RustH264 { .. }) {
+            self.ensure_rust_h264_frame(target);
+        }
         let pts = self.pts_ms(idx);
-        if let Some(df) = self.reference.as_ref() {
-            self.cur = Some((idx, frame_from_yuv(df, pts)));
+        let edge = self.display_edge;
+        let frame = match &mut self.engine {
+            Engine::RustH264 { pending, .. } => {
+                let f = pending.get(&target).map(|df| frame_from_yuv(df, pts, edge));
+                let min_future = self.display[idx..].iter().copied().min().unwrap_or(target);
+                let dead: Vec<usize> = pending.range(..min_future).map(|(&k, _)| k).collect();
+                for k in dead {
+                    pending.remove(&k);
+                }
+                f
+            }
+            Engine::Cavlc { reference } => {
+                reference.as_ref().map(|df| frame_from_yuv(df, pts, edge))
+            }
+            Engine::Cabac { pending, .. } => {
+                let f = pending.get(&target).map(|pic| frame_from_yuv(&pic.f, pts, edge));
+                let min_future = self.display[idx..].iter().copied().min().unwrap_or(target);
+                let dead: Vec<usize> = pending.range(..min_future).map(|(&k, _)| k).collect();
+                for k in dead {
+                    pending.remove(&k);
+                }
+                f
+            }
+        };
+        if let Some(f) = frame {
+            self.cur_idx = Some(idx);
+            self.ring_insert(
+                idx,
+                Frame {
+                    w: f.w,
+                    h: f.h,
+                    pixels: f.pixels.clone(),
+                    pts_ms: f.pts_ms,
+                },
+            );
+            self.cur = Some(f);
             true
         } else {
             false
         }
     }
 
+    /// Decode forward into the ring up to `play_idx + n` without changing the
+    /// currently displayed frame (look-ahead only).
+    pub fn prefetch(&mut self, play_idx: usize, n: usize) {
+        if n == 0 || self.frame_count() == 0 {
+            return;
+        }
+        let end = (play_idx + n).min(self.frame_count() - 1);
+        let restore_idx = self.cur_idx;
+        let restore = self.cur.take();
+        for i in (play_idx + 1)..=end {
+            if self.ring.contains_key(&i) {
+                continue;
+            }
+            let _ = self.seek_decode(i);
+        }
+        // Put the playhead picture back (seek_decode may have moved `cur`).
+        if let Some(i) = restore_idx {
+            if let Some(f) = self.ring.get(&i) {
+                self.cur_idx = Some(i);
+                self.cur = Some(Frame {
+                    w: f.w,
+                    h: f.h,
+                    pixels: f.pixels.clone(),
+                    pts_ms: f.pts_ms,
+                });
+            } else if let Some(f) = restore {
+                self.cur_idx = Some(i);
+                self.cur = Some(f);
+            }
+        } else {
+            self.cur_idx = None;
+            self.cur = restore;
+        }
+    }
+
     /// The currently presented RGB frame, if any.
     pub fn cur_frame(&self) -> Option<&Frame> {
-        self.cur.as_ref().map(|(_, f)| f)
+        self.cur.as_ref()
     }
 }
 
@@ -292,22 +691,67 @@ pub struct AudioInfo {
     pub codec: &'static str,
     pub sample_rate: u32,
     pub channels: u8,
-    /// True once the audio pipeline can actually decode + play this track.
-    /// (AAC decode is a separate, in-progress stage — the track is demuxed and
-    /// described here, but not yet turned into PCM.)
+    /// True when the in-kernel AAC-LC decoder can turn this track into PCM.
     pub decodable: bool,
 }
 
-/// Describe a file's audio track, if it has a demuxable one. Currently reports
-/// the AAC track from an mp4/mov (the `esds` `AudioSpecificConfig`); the decode
-/// path (AAC-LC → PCM) is a later stage, so `decodable` is false for now.
+/// Describe a file's audio track, if it has a demuxable one. Reports the AAC
+/// track from an mp4/mov (`esds` `AudioSpecificConfig`); `decodable` is true
+/// for any ASC whose core we can decode (plain AAC-LC and HE-AAC / HE-AACv2
+/// with full SBR/PS reconstruction). `sample_rate` is the **playback** rate
+/// (SBR output rate when HE-AAC).
 pub fn audio_info(bytes: &[u8]) -> Option<AudioInfo> {
     match sniff(bytes) {
         Container::Mp4 => match mp4::parse_audio(bytes) {
-            Ok(Some(t)) => Some(AudioInfo { codec: "AAC (mp4a)", sample_rate: t.sample_rate, channels: t.channels, decodable: false }),
+            Ok(Some(t)) => {
+                let (sample_rate, channels, decodable, codec) = match crate::audio::aac::parse_asc(&t.asc) {
+                    Ok(a) => {
+                        let codec = match (a.sbr, a.ps, a.aot) {
+                            (true, true, _) => "HE-AACv2 (SBR+PS)",
+                            (true, false, _) => "HE-AAC (SBR)",
+                            (_, _, 1) => "AAC Main",
+                            (_, _, 3) => "AAC SSR",
+                            (_, _, 4) => "AAC LTP",
+                            _ => "AAC (mp4a)",
+                        };
+                        // Prefer ASC **output** rate (SBR) for display/playback.
+                        (a.output_rate(), a.channels, true, codec)
+                    }
+                    Err(_) => (t.sample_rate, t.channels, false, "AAC (mp4a)"),
+                };
+                Some(AudioInfo {
+                    codec,
+                    sample_rate,
+                    channels,
+                    decodable,
+                })
+            }
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Demux + decode an mp4/mov AAC audio track to mono S16 PCM.
+///
+/// Uses [`mp4::parse_audio`] for the sample table and ASC, then the AAC-LC
+/// decoder. Returns `Err` when there is no audio track or the ASC is outside
+/// the supported LC subset.
+pub fn decode_audio(bytes: &[u8]) -> Result<crate::audio::Audio, &'static str> {
+    match sniff(bytes) {
+        Container::Mp4 => {
+            let track = mp4::parse_audio(bytes)?.ok_or("video: no AAC audio track")?;
+            let sample_pairs: alloc::vec::Vec<(usize, usize)> =
+                track.samples.iter().map(|s| (s.offset, s.size)).collect();
+            crate::audio::aac::decode_track(
+                track.sample_rate,
+                track.channels,
+                &track.asc,
+                bytes,
+                &sample_pairs,
+            )
+        }
+        _ => Err("video: audio decode only for mp4/mov"),
     }
 }
 
@@ -661,4 +1105,90 @@ mod decode_fixture_test {
         // Re-seeking the same frame is a no-op (returns false, frame unchanged).
         assert!(!ra.seek_decode(0), "re-seeking the current frame changes nothing");
     }
+
+    // 64x64 **High-profile** clip (x264: CABAC, 8x8 transform, I+P+B with
+    // 2 B-frames), muxed by the e2e stdlib muxer; expected hash captured from
+    // PyAV (frames matched by POC — the test muxer writes no ctts, so the
+    // comparison runs in decode order).
+    const HICLIP_MP4: [u8; 1098] = [
+    0, 0, 0, 32, 102, 116, 121, 112, 105, 115, 111, 109, 0, 0, 2, 0, 105, 115, 111, 109, 105, 115, 111, 50,
+    97, 118, 99, 49, 109, 112, 52, 49, 0, 0, 2, 134, 109, 111, 111, 118, 0, 0, 0, 108, 109, 118, 104, 100,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 0, 0, 0, 5, 0, 1, 0, 0,
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 2, 0, 0, 2, 18, 116, 114, 97, 107, 0, 0, 0, 92, 116, 107, 104, 100, 0, 0, 0, 7,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0,
+    0, 64, 0, 0, 0, 64, 0, 0, 0, 0, 1, 174, 109, 100, 105, 97, 0, 0, 0, 28, 109, 100, 104, 100,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 0, 5, 0, 0, 0, 0, 0, 39,
+    104, 100, 108, 114, 0, 0, 0, 0, 0, 0, 0, 0, 118, 105, 100, 101, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 99, 104, 105, 116, 116, 105, 0, 0, 0, 1, 99, 109, 105, 110, 102, 0, 0, 0, 20, 118,
+    109, 104, 100, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 36, 100, 105, 110, 102, 0,
+    0, 0, 28, 100, 114, 101, 102, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 12, 117, 114, 108, 32, 0,
+    0, 0, 1, 0, 0, 1, 35, 115, 116, 98, 108, 0, 0, 0, 151, 115, 116, 115, 100, 0, 0, 0, 0, 0,
+    0, 0, 1, 0, 0, 0, 135, 97, 118, 99, 49, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 64, 0, 72, 0, 0, 0, 72, 0, 0, 0,
+    0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24, 255, 255, 0, 0, 0, 49, 97, 118, 99,
+    67, 1, 100, 0, 10, 255, 225, 0, 24, 103, 100, 0, 10, 172, 217, 68, 38, 192, 68, 0, 0, 3, 0, 4,
+    0, 0, 3, 0, 202, 60, 72, 150, 88, 1, 0, 6, 104, 235, 225, 50, 200, 176, 0, 0, 0, 24, 115, 116,
+    116, 115, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 28, 115, 116,
+    115, 99, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 1, 0, 0,
+    0, 40, 115, 116, 115, 122, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 227, 0, 0,
+    0, 79, 0, 0, 0, 30, 0, 0, 0, 28, 0, 0, 0, 48, 0, 0, 0, 20, 115, 116, 115, 115, 0, 0,
+    0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 20, 115, 116, 99, 111, 0, 0, 0, 0, 0, 0,
+    0, 1, 0, 0, 2, 174, 0, 0, 1, 164, 109, 100, 97, 116, 0, 0, 0, 223, 101, 136, 132, 0, 255, 147,
+    6, 106, 124, 139, 89, 12, 6, 101, 132, 7, 79, 55, 172, 203, 126, 236, 150, 11, 50, 117, 31, 192, 45, 32,
+    118, 66, 174, 248, 179, 243, 108, 48, 240, 53, 116, 118, 159, 107, 203, 192, 214, 146, 194, 8, 60, 81, 27, 166,
+    161, 50, 26, 152, 29, 71, 243, 112, 19, 255, 254, 115, 133, 27, 36, 250, 100, 5, 235, 111, 203, 107, 226, 76,
+    97, 240, 163, 75, 228, 174, 130, 14, 137, 65, 164, 39, 158, 116, 127, 122, 194, 15, 252, 227, 165, 109, 144, 47,
+    0, 180, 21, 76, 82, 221, 238, 27, 172, 28, 224, 221, 122, 189, 186, 1, 137, 179, 114, 177, 47, 41, 122, 198,
+    37, 70, 211, 23, 224, 137, 232, 189, 251, 70, 175, 13, 82, 12, 100, 235, 34, 81, 16, 86, 221, 5, 79, 186,
+    198, 164, 56, 219, 62, 254, 211, 35, 91, 243, 10, 129, 111, 70, 99, 117, 116, 4, 97, 96, 56, 89, 155, 226,
+    166, 133, 176, 219, 222, 133, 220, 117, 203, 239, 118, 56, 11, 246, 159, 130, 136, 119, 92, 156, 247, 6, 204, 205,
+    181, 243, 233, 186, 111, 19, 6, 192, 133, 243, 178, 251, 238, 44, 129, 29, 125, 202, 190, 213, 25, 84, 8, 23,
+    241, 0, 0, 0, 75, 65, 154, 35, 99, 224, 126, 10, 31, 247, 141, 145, 164, 62, 97, 244, 114, 249, 165, 110,
+    154, 222, 151, 155, 149, 11, 93, 113, 255, 255, 135, 240, 40, 88, 50, 224, 84, 128, 221, 160, 26, 164, 122, 255,
+    128, 10, 198, 156, 220, 32, 48, 18, 198, 139, 191, 120, 49, 105, 194, 150, 30, 32, 166, 60, 35, 220, 135, 202,
+    214, 238, 219, 20, 191, 162, 149, 208, 0, 0, 0, 26, 65, 158, 65, 120, 175, 248, 115, 7, 11, 21, 102, 67,
+    147, 255, 223, 217, 173, 1, 28, 216, 7, 31, 166, 227, 136, 161, 0, 0, 0, 24, 1, 158, 98, 106, 73, 255,
+    244, 212, 165, 163, 247, 25, 42, 67, 249, 43, 108, 145, 188, 234, 119, 20, 228, 159, 0, 0, 0, 44, 65, 154,
+    100, 75, 168, 66, 16, 90, 32, 140, 7, 240, 132, 7, 241, 128, 63, 208, 5, 85, 195, 147, 183, 42, 231, 142,
+    130, 218, 75, 190, 255, 114, 99, 136, 243, 186, 59, 55, 158, 184, 48, 3, 221, 171,
+    ];
+    const HI_EXPECT_HASH: u32 = 2499348351;
+    const HI_EXPECT_FRAMES: usize = 5;
+
+    #[test_case]
+    fn decodes_embedded_cabac_high_profile_clip() {
+        // Full CABAC decode of an embedded High-profile clip (I/P/B slices,
+        // 8x8 transform): every decoded picture's YUV, hashed in decode order,
+        // must match the PyAV-derived reference.
+        let track = mp4::parse(&HICLIP_MP4).unwrap();
+        let sps = h264::parse_sps(&bits::unescape_rbsp(&track.avcc.sps[0][1..])).unwrap();
+        let pps = h264::parse_pps(&bits::unescape_rbsp(&track.avcc.pps[0][1..])).unwrap();
+        assert!(pps.entropy_coding_mode, "fixture must be CABAC");
+        let mut dec = h264::decoder_cabac::H264Dec::new(sps, pps).unwrap();
+        let mut hh: u32 = 0;
+        let mut nf = 0usize;
+        for s in &track.samples {
+            let data = &HICLIP_MP4[s.offset..s.offset + s.size];
+            let mut slices: alloc::vec::Vec<(alloc::vec::Vec<u8>, bool, u8)> = alloc::vec::Vec::new();
+            for nal in h264::split_avcc(data, track.avcc.length_size) {
+                if nal.kind.is_slice() {
+                    slices.push((nal.rbsp(), nal.kind == h264::NalType::SliceIdr, nal.ref_idc));
+                }
+            }
+            let pic = dec.decode_au(&slices).unwrap();
+            for &b in pic.f.y.iter().chain(pic.f.cb.iter()).chain(pic.f.cr.iter()) {
+                hh = hh.wrapping_mul(31).wrapping_add(b as u32);
+            }
+            nf += 1;
+        }
+        assert_eq!(nf, HI_EXPECT_FRAMES, "decoded frame count");
+        assert_eq!(hh, HI_EXPECT_HASH, "CABAC decode must match the PyAV reference");
+    }
+
 }

@@ -221,7 +221,7 @@ fn walk_cluster(data: &[u8], start: usize, end: usize, samples: &mut Vec<Sample>
                 let frame_size = (body + sz) - frame_off;
                 let is_sync = flags & 0x80 != 0; // keyframe bit
                 let dts = (cluster_ts as i64 + tc).max(0) as u64;
-                samples.push(Sample { offset: frame_off, size: frame_size, dts, is_sync });
+                samples.push(Sample { offset: frame_off, size: frame_size, dts, cts: dts, is_sync });
             }
         }
         _ => {}

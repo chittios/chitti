@@ -11,3 +11,12 @@ edition = "2021"
 
 [profile.release]
 debug = true
+
+[features]
+default = ["std", "real-audio"]
+std = []
+real-audio = []
+h264diff-dbg = []
+
+[dependencies]
+rust_h264 = { path = "../../third_party/rust_h264", default-features = false }

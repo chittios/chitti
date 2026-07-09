@@ -414,12 +414,30 @@ the next command still runs) and a unit test on the pure poll logic
   them into `assets/voice/`, gitignored). For any numeric or perf work on this
   path, use `tools/onnxdiff/` (host-side layer-by-layer diff of the kernel's
   own interpreter against onnxruntime) — not QEMU round trips.
-- **Video** (`video/`) — H.264/AVC **baseline decoder + player** for
-  `/open .mp4|.mov` (mkv/webm/hls demuxers pending), built **in stages, each pure
-  + unit-tested off-hardware** and **validated bit-exact against ffmpeg/PyAV via
-  the `tools/h264diff/` host harness** (mounts `video/*.rs` via `#[path]`; the
-  onnxdiff/cortexdiff pattern — CAVLC VLC + alpha/beta/tc0 tables are parsed
-  from the FFmpeg source, never hand-transcribed). **Full baseline pipeline:**
+- **Video** (`video/`) — H.264/AVC **baseline + Main/High-profile decoder +
+  player** for `/open .mp4|.mov|.mkv|.webm` (hls/ts pending), built **in
+  stages, each pure + unit-tested off-hardware** and **validated bit-exact
+  against ffmpeg/PyAV via the `tools/h264diff/` host harness** (mounts
+  `video/*.rs` via `#[path]`; the onnxdiff/cortexdiff pattern — the CAVLC VLC,
+  deblock alpha/beta/tc0, and all CABAC tables are parsed/generated from the
+  FFmpeg sources, `tools/gen_cabac_tables.py`, never hand-transcribed).
+  **CABAC / High profile** (`h264/cabac.rs` engine + generated
+  `h264/cabac_tables.rs` + `h264/decoder_cabac.rs`): I/P/**B** slices, adaptive
+  **8x8 transform** + Intra_8x8, a POC-ordered multi-frame **DPB** with
+  ref-list construction/reordering + sliding window/MMCO-1, **explicit
+  weighted P**, **implicit weighted bi-prediction**, **spatial + temporal
+  direct** — validated **bit-exact on full real-world clips**: 171/171 frames
+  (sample-5s-720p: High, pyramid B, weightp) and 300/300 (Big Buck Bunny 720p:
+  High, temporal direct, 16-ref). Hard-won availability rules: MV prediction
+  may only use 4x4 cells whose motion **for that list** is final (per-list
+  `mvok` stamps — an above-right cell of a later same-MB partition is
+  *unavailable*, while a partition not using the list becomes
+  available-with-ref -1 immediately, FFmpeg's LIST_NOT_USED fill); the
+  **ref-idx context** reads refs-as-parsed (pre-MV); the B mb_type context
+  tests the *MB-level* direct flag, not the per-4x4 one. Unsupported CABAC
+  features (interlaced/MBAFF, FMO, scaling matrices, I_PCM-in-CABAC, long-term
+  refs, poc type 1) are *refused* cleanly, never mis-decoded.
+  **Full baseline pipeline:**
   `mp4`/`mkv` demux → CAVLC residual (`h264/cavlc.rs`) → **I + P** macroblock
   decode (`h264/decoder.rs`: I_4x4/I_16x16/I_PCM, P_L0_16x16/16x8/8x16/8x8/Skip,
   **multiple slices per frame** with slice-aware neighbour availability) → intra
@@ -429,14 +447,26 @@ the next command still runs) and a unit test on the pure poll logic
   a **player HUD** (`framebuffer::draw_video_status`: state, mm:ss, frame
   counter, scrubber, mute, shortcut hints — drawn *after* each frame blit) and
   transport controls (Ctrl+Tab focus, space pause, ←/→ seek, ↑/↓ ±10 frames,
-  0 restart, `m` mute, Ctrl+C stop), frame-paced by pts. **Streaming decode:**
-  `video::StreamDecoder` holds the source + sample table + **one** reference
-  frame and decodes on demand (`seek_decode`, rewinding to the latest keyframe
-  on a backward seek). Do **not** decode a whole clip into a `Vec<Frame>` up
-  front — a 1300-frame 480p clip is ~700 MB of RGB, which overruns the first-fit
-  heap, corrupts a reference frame's chroma under allocation pressure, and every
-  dependent P-frame then renders **all-green** (a real bug; the decode itself
-  was bit-clean). **Audio:** `mp4::parse_audio` demuxes the AAC (`mp4a`/`esds`
+  0 restart, `m` mute, Ctrl+C stop), frame-paced by pts. The HUD sits in a
+  **reserved bottom strip** (`present_surface_reserve` + `video_hud_height`) the
+  per-frame blit never repaints, its text **wrapped to the pane width** and
+  repainted in place — so it neither flickers nor overflows. **Streaming
+  decode:** `video::StreamDecoder` holds the source + sample table and decodes
+  on demand (`seek_decode`, rewinding to the latest keyframe on a backward
+  seek) — a whole-clip `Vec<Frame>` would be ~700 MB of RGB for a 1300-frame
+  480p clip (heap-hostile; trap #3). Baseline keeps **one** reference frame;
+  CABAC keeps the DPB plus a bounded **reorder cache** (pictures pending their
+  display slot, keyed by decode index — without it every backward hop of the
+  B-pyramid display order re-decodes from the previous IDR, O(n²)). Display
+  order comes from the container (`ctts`-adjusted `Sample.cts`, stable-sorted). **The "green frames"
+  bug** was NOT memory: a P-slice that **ends with a trailing `mb_skip_run`**
+  (skips the final MBs, no coded MB after → `more_rbsp_data()` goes false
+  mid-drain) left the last MB(s) at plane-init 0 → black luma / green chroma,
+  which inter-prediction then propagated into a growing green region. Fix: keep
+  draining inferred skips while `skip > 0` even past `more_rbsp_data()`
+  (`decoder.rs` MB loop). Lesson: **render + eyeball vs PyAV, don't trust a
+  single green-fraction metric** (the first scan's threshold missed it).
+  **Audio:** `mp4::parse_audio` demuxes the AAC (`mp4a`/`esds`
   → AudioSpecificConfig) track and `video::audio_info` reports it, but the
   **AAC-LC decoder is not yet built** (a full codec on the scale of the H.264
   one — spectral Huffman/iquant/M-S/TNS/**PNS**/intensity + IMDCT filterbank;
@@ -450,9 +480,7 @@ the next command still runs) and a unit test on the pure poll logic
   **Deblock gotchas (both bit us):** a chroma edge's QP is `avg(qpc(QPp),
   qpc(QPq))` not `qpc(avg(QPp,QPq))` (differs only across slices with differing
   QP); and the luma normal filter's `tc = tc0 + (ap<β) + (aq<β)` can be nonzero
-  even when `tc0==0` (don't force-skip). **Remaining:** CABAC (High/Main
-  profiles — big fraction of real files), HLS/TS, and a rare corner-MB edge case
-  on very long P-sequences. **Stage 1 (done):** `video/bits.rs`
+  even when `tc0==0` (don't force-skip). **Stage 1 (done):** `video/bits.rs`
   (RBSP emulation-prevention unescape + a big-endian `BitReader` with H.264
   Exp-Golomb `ue`/`se`/`te`), `video/mp4.rs` (ISO-BMFF box-tree demuxer →
   `avcC` SPS/PPS + the `stsz`/`stsc`/`stco`/`stts`/`stss` sample table assembled
@@ -460,10 +488,15 @@ the next command still runs) and a unit test on the pure poll logic
   splitting + SPS/PPS parse → geometry/profile/entropy mode). `video::probe`
   reports a stream (container, codec, `W×H`, frame count, CAVLC/CABAC) without
   decoding pixels; `/open clip.mp4` shows it. Scope: **H.264 baseline** (I/P
-  slices, CAVLC, 4:2:0), the common mp4/mov case. **Remaining:** the **AAC-LC
-  audio decoder** + playback sync (demux done; see above), CABAC (High/Main
-  profiles — big fraction of real files), HLS/TS demux, a rare corner-MB edge
-  case on very long P-sequences, and the multi-pane split + tab drag-drop.
+  slices, CAVLC, 4:2:0) **plus Main/High CABAC** (see above). **Remaining:**
+  the **AAC-LC audio decoder** + playback sync (demux done; in progress in a
+  parallel effort), HLS/TS demux, 720p CABAC decode speed (bit-serial engine
+  ≈ 50 ms/frame host-native; SIMD/multicore is the designated perf step), and
+  the multi-pane split + tab drag-drop. NB: the e2e stdlib muxer writes no
+  `ctts`, so its B-frame clips carry no display-reorder info — e2e CABAC clips
+  use `--bframes 0`; the in-kernel fixture decodes an I/P/B clip in decode
+  order and a media-key rule: a focused-but-stopped video tab must not eat
+  keystrokes (`media_key` gates on `video_loaded()`).
   **Host reference for the numeric stages:** PyAV
   (self-contained ffmpeg) decodes the same clip to YUV for a frame-by-frame diff
   harness (`tools/h264diff/`, the onnxdiff/cortexdiff pattern — mounts

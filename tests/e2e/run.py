@@ -590,7 +590,24 @@ def s_open_video(_g):
     mp4_path = os.path.join(tempfile.gettempdir(), "chitti-e2e.mp4")
     with open(mp4_path, "wb") as f:
         f.write(mp4)
-    g2 = Guest(arch=RUN_ARCH, verbose=RUN_VERBOSE, no_model=True, audio="off", model_disk=mp4_path)
+    # A second clip: HIGH profile — CABAC entropy coding + adaptive 8x8
+    # transform (I/P only: the stdlib muxer writes no ctts, so B-frame display
+    # reordering could not be derived container-side).
+    hi264 = os.path.join(tempfile.gettempdir(), "chitti-e2e-hi.264")
+    r = subprocess.run(["x264", "--profile", "high", "--bframes", "0", "--frames", str(N),
+                        "--input-res", f"{W}x{H}", "-o", hi264, yuv],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    hi_path = None
+    if r.returncode == 0:
+        try:
+            himp4, _ = _mux_h264_mp4(open(hi264, "rb").read(), W, H, all_sync=False)
+            hi_path = os.path.join(tempfile.gettempdir(), "chitti-e2e-hi.mp4")
+            with open(hi_path, "wb") as f:
+                f.write(himp4)
+        except Exception:
+            hi_path = None
+    disk = mp4_path if hi_path is None else f"{mp4_path}:{hi_path}"
+    g2 = Guest(arch=RUN_ARCH, verbose=RUN_VERBOSE, no_model=True, audio="off", model_disk=disk)
     try:
         if not g2.wait_for("net: configured", 180):
             return False, "video guest never booted"
@@ -615,7 +632,19 @@ def s_open_video(_g):
             m2 = g2.mark()
             g2.send_raw(b"\x03")     # Ctrl+C stops
             ok = g2.wait_for("video stopped", 10, m2)
-            return ok, "mp4 decoded (H.264 baseline I+P, multi-slice, deblocked) + video-tab controls responsive" if ok else "controls/Ctrl+C did not stop video"
+            if not ok:
+                return False, "controls/Ctrl+C did not stop video"
+            # High-profile (CABAC + 8x8 transform) clip on the same disk.
+            if hi_path is not None:
+                m3 = g2.mark()
+                g2.send(f"/open /vid{d}/chitti-e2e-hi.mp4")
+                if not (g2.wait_for("profile 100", 15, m3) and g2.wait_for("frame(s), ready", 10, m3)):
+                    return False, "High-profile CABAC clip did not decode"
+                m4 = g2.mark()
+                g2.send_raw(b"\x03")
+                if not g2.wait_for("video stopped", 10, m4):
+                    return False, "Ctrl+C did not stop the CABAC clip"
+            return True, "mp4 decoded (baseline multi-slice + High/CABAC) + video-tab controls responsive"
         return False, "no 176x144 probe from /open on any mount"
     finally:
         g2.close()

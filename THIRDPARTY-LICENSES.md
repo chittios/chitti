@@ -90,3 +90,71 @@ dependencies (heapless, p256, aes-gcm, sha2, rand_core, …) still resolve from
 crates.io.
 
 Licensed under **Apache-2.0** (see `third_party/embedded-tls/LICENSE`).
+
+---
+
+## Symphonia AAC-LC (Rust port) — `kernel/src/audio/aac/`
+
+The in-kernel AAC-LC decoder used by `/open <file>.mp4` (audio track) is a
+`no_std` port of the [Symphonia](https://github.com/pdeljanov/Symphonia)
+`symphonia-codec-aac` path (which itself ported NihAV's AAC decoder with the
+author's permission). Spectral Huffman tables, ICS/CPE/TNS/pulse decode, the
+Kaiser-Bessel / sine windows, and the FFT-based IMDCT follow that implementation.
+
+Copyright (c) 2019–2026 The Project Symphonia Developers.  
+Previous Author: Kostya Shishkov \<kostya.shiskov@gmail.com\>
+
+Licensed under the **Mozilla Public License 2.0 (MPL-2.0)**:
+
+```
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this
+file, You can obtain one at https://mozilla.org/MPL/2.0/.
+```
+
+---
+
+## oxideav-aac SBR/PS (Rust port) — `kernel/src/audio/aac/sbr/`
+
+HE-AAC Spectral Band Replication and Parametric Stereo reconstruction is a
+`no_std` port of [oxideav-aac](https://github.com/OxideAV/oxideav-aac)
+(`sbr_*.rs`, `ps_*.rs`) by Karpelès Lab Inc. Bit-reader calls were retargeted
+to the in-tree AAC `BitReader`; float math uses local pure-Rust helpers under
+`sbr/math.rs`.
+
+Copyright (c) 2026 Karpelès Lab Inc.
+
+Licensed under the **MIT License**:
+
+```
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+## rust_h264 — `third_party/rust_h264/`
+
+Pure-Rust H.264/AVC decoder (Baseline/Main/High, CAVLC + CABAC) used as the
+**primary** video decode backend for `/open`. Vendored from crates.io
+`rust_h264` 0.4.0 and patched for `no_std` + `alloc` (BTreeMap, spin::Once,
+etc.). Our hand-rolled CAVLC/CABAC path in `kernel/src/video/h264/` remains as
+an automatic fallback if rust_h264 rejects a stream.
+
+Licensed under **MIT OR Apache-2.0** — see `third_party/rust_h264/LICENSE-MIT`
+and `LICENSE-APACHE`. Upstream: https://github.com/roticv/rust_h264

@@ -144,6 +144,8 @@ pub struct Sample {
     pub offset: usize,
     pub size: usize,
     pub dts: u64,
+    /// Composition (display) timestamp: `dts + ctts offset` (== dts without ctts).
+    pub cts: u64,
     pub is_sync: bool,
 }
 
@@ -157,6 +159,8 @@ pub struct SampleTables {
     pub stsc: Vec<(u32, u32)>,
     /// `stts` runs: (sample_count, delta).
     pub stts: Vec<(u32, u32)>,
+    /// `ctts` runs (sample_count, composition offset), empty when absent.
+    pub ctts: Vec<(u32, i64)>,
     /// Sync-sample indices (`stss`, 1-based in the file); empty ⇒ all sync.
     pub sync: Vec<u32>,
 }
@@ -207,7 +211,20 @@ pub fn build_samples(t: &SampleTables) -> Vec<Sample> {
                 }
                 next_sync < sync_set.len() && sync_set[next_sync] == one_based
             };
-            samples.push(Sample { offset: off, size, dts, is_sync });
+            // Composition offset from the ctts runs (0 when absent).
+            let mut coff = 0i64;
+            if !t.ctts.is_empty() {
+                let mut acc = 0usize;
+                for &(cnt, o) in &t.ctts {
+                    if si < acc + cnt as usize {
+                        coff = o;
+                        break;
+                    }
+                    acc += cnt as usize;
+                }
+            }
+            let cts = (dts as i64 + coff).max(0) as u64;
+            samples.push(Sample { offset: off, size, dts, cts, is_sync });
             off += size;
             // advance DTS
             while stts_left == 0 && stts_run + 1 < t.stts.len() {
@@ -277,6 +294,24 @@ fn parse_stts(body: &[u8]) -> Result<Vec<(u32, u32)>, &'static str> {
         v.push((sc, delta));
     }
     Ok(v)
+}
+
+/// `ctts`: composition offset runs (v0 unsigned / v1 signed offsets).
+fn parse_ctts(body: &[u8]) -> Result<Vec<(u32, i64)>, &'static str> {
+    let mut r = Reader::new(body);
+    let ver = r.u32()? >> 24;
+    let n = r.u32()? as usize;
+    if n > body.len() / 8 {
+        return Err("mp4: ctts count too large");
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let cnt = r.u32()?;
+        let off = r.u32()?;
+        let off = if ver == 1 { off as i32 as i64 } else { off as i64 };
+        out.push((cnt, off));
+    }
+    Ok(out)
 }
 
 fn parse_stss(body: &[u8]) -> Result<Vec<u32>, &'static str> {
@@ -400,7 +435,11 @@ fn parse_trak(trak_body: &[u8]) -> Result<Option<VideoTrack>, &'static str> {
         Some(s) => parse_stss(s.body)?,
         None => Vec::new(),
     };
-    let samples = build_samples(&SampleTables { sizes, chunk_offsets, stsc, stts, sync });
+    let ctts = match find(&stbl, b"ctts") {
+        Some(c) => parse_ctts(c.body)?,
+        None => Vec::new(),
+    };
+    let samples = build_samples(&SampleTables { sizes, chunk_offsets, stsc, stts, ctts, sync });
 
     let width = if sw != 0 { sw } else { tk_w };
     let height = if sh != 0 { sh } else { tk_h };
@@ -520,12 +559,12 @@ fn parse_trak_audio(trak_body: &[u8]) -> Result<Option<AudioTrack>, &'static str
     let stts = parse_stts(find(&stbl, b"stts").ok_or("mp4: no stts")?.body)?;
     // Audio is all keyframes (no stss) — every access unit is independently
     // decodable.
-    let samples = build_samples(&SampleTables { sizes, chunk_offsets, stsc, stts, sync: Vec::new() });
+    let samples = build_samples(&SampleTables { sizes, chunk_offsets, stsc, stts, ctts: Vec::new(), sync: Vec::new() });
     Ok(Some(AudioTrack { sample_rate, channels, asc, timescale, duration, samples }))
 }
 
-/// Parse `stsd` → the first `mp4a` entry's sample rate/channels + the
-/// `AudioSpecificConfig` extracted from its `esds` descriptor chain.
+/// Parse `stsd` → the first AAC (`mp4a`) entry's sample rate/channels + the
+/// `AudioSpecificConfig` from its `esds` (ISO or QuickTime `wave` nesting).
 fn parse_stsd_audio(body: &[u8]) -> Result<(u32, u8, Vec<u8>), &'static str> {
     let mut r = Reader::new(body);
     r.u32()?; // version/flags
@@ -535,71 +574,187 @@ fn parse_stsd_audio(body: &[u8]) -> Result<(u32, u8, Vec<u8>), &'static str> {
     let rest = &body[8..];
     for b in boxes(rest) {
         if &b.typ == b"mp4a" {
-            // AudioSampleEntry: 6 reserved + 2 data_ref_idx, then (v0) 8 reserved,
-            // channelcount(2), samplesize(2), pre_defined(2), reserved(2),
-            // samplerate(16.16, 4). Child boxes (esds) follow at offset 28.
-            let mut ar = Reader::new(b.body);
-            ar.skip(8)?; // SampleEntry
-            ar.skip(8)?; // reserved[2] (v0)
-            let channels = ar.u16()? as u8;
-            ar.skip(2 + 2 + 2)?; // samplesize, pre_defined, reserved
-            let sample_rate = ar.u32()? >> 16; // 16.16 fixed
-            let children = &b.body[ar.p..];
-            let child_boxes = boxes(children);
-            let esds = find(&child_boxes, b"esds").ok_or("mp4: no esds in mp4a")?;
-            let asc = parse_esds_asc(esds.body)?;
-            return Ok((sample_rate, channels, asc));
+            return parse_mp4a_entry(b.body);
         }
     }
     Err("mp4: no mp4a sample entry (unsupported audio codec)")
 }
 
-/// Walk the `esds` MPEG-4 descriptor chain (ES_Descriptor → DecoderConfig →
-/// DecoderSpecificInfo) and return the `AudioSpecificConfig` bytes (tag 0x05).
+/// Decode one `mp4a` AudioSampleEntry body (ISO v0 or QuickTime v1/v2).
+fn parse_mp4a_entry(body: &[u8]) -> Result<(u32, u8, Vec<u8>), &'static str> {
+    // SampleEntry: 6 reserved + 2 data_reference_index.
+    if body.len() < 28 {
+        return Err("mp4: mp4a entry too short");
+    }
+    // Bytes 8..10 are version for QuickTime SoundDescription; 0 for pure ISO.
+    let version = u16::from_be_bytes([body[8], body[9]]);
+    let channels = u16::from_be_bytes([body[16], body[17]]) as u8;
+    let sample_rate = u32::from_be_bytes([body[24], body[25], body[26], body[27]]) >> 16;
+    // ISO v0: children start at 28. QT v1: +16 bytes of packet info. QT v2: +36.
+    let mut child_off = 28usize;
+    match version {
+        0 => {}
+        1 => child_off = 28 + 16,
+        2 => child_off = 28 + 36,
+        _ => {
+            // Unknown — try 28 first, then scan for esds.
+            child_off = 28;
+        }
+    }
+    if child_off > body.len() {
+        child_off = 28.min(body.len());
+    }
+    let asc = find_esds_asc(&body[child_off..])
+        .or_else(|_| find_esds_asc_anywhere(body))
+        .map_err(|_| "mp4: no esds/AudioSpecificConfig in mp4a")?;
+    Ok((sample_rate, channels.max(1), asc))
+}
+
+/// Look for `esds` (or QuickTime `wave` → `esds`) among child boxes of `mp4a`.
+fn find_esds_asc(children: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let child_boxes = boxes(children);
+    if let Some(esds) = find(&child_boxes, b"esds") {
+        return parse_esds_asc(esds.body);
+    }
+    // QuickTime: esds lives under a `wave` atom (alongside `frma`/`mp4a`).
+    if let Some(wave) = find(&child_boxes, b"wave") {
+        let wave_boxes = boxes(wave.body);
+        if let Some(esds) = find(&wave_boxes, b"esds") {
+            return parse_esds_asc(esds.body);
+        }
+        // Some files nest another mp4a inside wave.
+        if let Some(inner) = find(&wave_boxes, b"mp4a") {
+            if let Ok(a) = find_esds_asc(inner.body) {
+                return Ok(a);
+            }
+        }
+    }
+    Err("mp4: no esds")
+}
+
+/// Last-resort scan: any top-level-looking `esds` box anywhere in the entry.
+fn find_esds_asc_anywhere(body: &[u8]) -> Result<Vec<u8>, &'static str> {
+    // Walk every 4-byte-aligned "esds" tag candidate.
+    let mut i = 0;
+    while i + 8 <= body.len() {
+        if &body[i + 4..i + 8] == b"esds" {
+            let size = u32::from_be_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]) as usize;
+            if size >= 8 && i + size <= body.len() {
+                if let Ok(asc) = parse_esds_asc(&body[i + 8..i + size]) {
+                    return Ok(asc);
+                }
+            }
+        }
+        i += 1;
+    }
+    Err("mp4: esds not found")
+}
+
+/// Expandable MPEG-4 descriptor length (7 bits/byte, MSB=continue).
+fn esds_read_len(r: &mut Reader) -> Result<usize, &'static str> {
+    let mut len = 0usize;
+    for _ in 0..4 {
+        let b = r.u8()?;
+        len = (len << 7) | (b & 0x7f) as usize;
+        if b & 0x80 == 0 {
+            break;
+        }
+    }
+    Ok(len)
+}
+
+/// Walk the `esds` MPEG-4 descriptor chain and return the `AudioSpecificConfig`
+/// (DecoderSpecificInfo, tag 0x05). Tolerates version/flags prefix and nested
+/// descriptors that aren't strictly ordered.
 fn parse_esds_asc(body: &[u8]) -> Result<Vec<u8>, &'static str> {
+    // Skip optional 4-byte version/flags when present (fullbox style).
+    let start = if body.len() >= 4 && body[0] == 0 && body[1] == 0 && body[2] == 0 {
+        4
+    } else {
+        0
+    };
+    // Prefer structured walk; fall back to a linear tag scan for tag 0x05.
+    if let Ok(asc) = parse_esds_structured(&body[start..]) {
+        return Ok(asc);
+    }
+    parse_esds_scan(&body[start..])
+}
+
+fn parse_esds_structured(body: &[u8]) -> Result<Vec<u8>, &'static str> {
     let mut r = Reader::new(body);
-    r.u32()?; // version/flags
-    // Expandable-length descriptor reader: len is 7 bits/byte, MSB=continue.
-    fn read_len(r: &mut Reader) -> Result<usize, &'static str> {
+    // ES_Descriptor (tag 0x03) — optional wrapper.
+    let tag = r.u8()?;
+    if tag == 0x03 {
+        esds_read_len(&mut r)?;
+        r.skip(2)?; // ES_ID
+        let flags = r.u8()?;
+        if flags & 0x80 != 0 {
+            r.skip(2)?;
+        }
+        if flags & 0x40 != 0 {
+            let url_len = r.u8()? as usize;
+            r.skip(url_len)?;
+        }
+        if flags & 0x20 != 0 {
+            r.skip(2)?;
+        }
+        if r.u8()? != 0x04 {
+            return Err("mp4: no DecoderConfigDescriptor");
+        }
+    } else if tag != 0x04 {
+        return Err("mp4: esds unexpected tag");
+    }
+    esds_read_len(&mut r)?;
+    r.skip(1 + 1 + 3 + 4 + 4)?; // objectType, streamType, bufferSize, max/avg bitrate
+    if r.u8()? != 0x05 {
+        return Err("mp4: no DecoderSpecificInfo (AudioSpecificConfig)");
+    }
+    let len = esds_read_len(&mut r)?;
+    Ok(r.take(len)?.to_vec())
+}
+
+/// Linear scan for tag 0x05 (DecoderSpecificInfo) — handles odd descriptor
+/// layouts some remuxers produce.
+fn parse_esds_scan(body: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let mut i = 0;
+    while i < body.len() {
+        let tag = body[i];
+        i += 1;
+        if i >= body.len() {
+            break;
+        }
+        // Expandable length
         let mut len = 0usize;
         for _ in 0..4 {
-            let b = r.u8()?;
+            if i >= body.len() {
+                return Err("mp4: esds truncated");
+            }
+            let b = body[i];
+            i += 1;
             len = (len << 7) | (b & 0x7f) as usize;
             if b & 0x80 == 0 {
                 break;
             }
         }
-        Ok(len)
+        if tag == 0x05 {
+            if i + len <= body.len() && len > 0 && len < 64 {
+                return Ok(body[i..i + len].to_vec());
+            }
+            return Err("mp4: bad ASC length in esds");
+        }
+        // Skip this descriptor's payload and continue scanning inside it too
+        // (nested) by not jumping — just advance past header; nested tags will
+        // be seen as we walk byte-by-byte only at tag boundaries. Jump payload:
+        if i + len > body.len() {
+            break;
+        }
+        // Recurse into payload for nested descriptors.
+        if let Ok(asc) = parse_esds_scan(&body[i..i + len]) {
+            return Ok(asc);
+        }
+        i += len;
     }
-    // ES_Descriptor (tag 0x03).
-    if r.u8()? != 0x03 {
-        return Err("mp4: esds not an ES_Descriptor");
-    }
-    read_len(&mut r)?;
-    r.skip(2)?; // ES_ID
-    let flags = r.u8()?;
-    if flags & 0x80 != 0 {
-        r.skip(2)?; // dependsOn_ES_ID
-    }
-    if flags & 0x40 != 0 {
-        let url_len = r.u8()? as usize;
-        r.skip(url_len)?;
-    }
-    if flags & 0x20 != 0 {
-        r.skip(2)?; // OCR_ES_Id
-    }
-    // DecoderConfigDescriptor (tag 0x04).
-    if r.u8()? != 0x04 {
-        return Err("mp4: no DecoderConfigDescriptor");
-    }
-    read_len(&mut r)?;
-    r.skip(1 + 1 + 3 + 4 + 4)?; // objectType, streamType, bufferSize, max/avg bitrate
-    // DecoderSpecificInfo (tag 0x05) = AudioSpecificConfig.
-    if r.u8()? != 0x05 {
-        return Err("mp4: no DecoderSpecificInfo (AudioSpecificConfig)");
-    }
-    let len = read_len(&mut r)?;
-    Ok(r.take(len)?.to_vec())
+    Err("mp4: AudioSpecificConfig not found in esds")
 }
 
 #[cfg(test)]
@@ -643,13 +798,14 @@ mod tests {
             chunk_offsets: vec![100],
             stsc: vec![(0, 3)],
             stts: vec![(3, 40)],
+            ctts: vec![],
             sync: vec![],
         };
         let s = build_samples(&t);
         assert_eq!(s.len(), 3);
-        assert_eq!(s[0], Sample { offset: 100, size: 10, dts: 0, is_sync: true });
-        assert_eq!(s[1], Sample { offset: 110, size: 20, dts: 40, is_sync: true });
-        assert_eq!(s[2], Sample { offset: 130, size: 30, dts: 80, is_sync: true });
+        assert_eq!(s[0], Sample { offset: 100, size: 10, dts: 0, cts: 0, is_sync: true });
+        assert_eq!(s[1], Sample { offset: 110, size: 20, dts: 40, cts: 40, is_sync: true });
+        assert_eq!(s[2], Sample { offset: 130, size: 30, dts: 80, cts: 80, is_sync: true });
     }
 
     #[test_case]
@@ -661,6 +817,7 @@ mod tests {
             chunk_offsets: vec![0, 500],
             stsc: vec![(0, 2)],
             stts: vec![(4, 100)],
+            ctts: vec![],
             sync: vec![1],
         };
         let s = build_samples(&t);

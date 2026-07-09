@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Generate kernel/src/video/h264/cabac_tables.rs from the FFmpeg sources.
+
+Authoritative-source rule: the CABAC context-init tables (1024 contexts x 4
+init sets), the arithmetic engine tables (rangeTabLPS, transIdxMPS/LPS), and
+the residual context-offset maps are parsed out of FFmpeg's h264_cabac.c and
+cabac.c — never hand-transcribed. The engine tables are stored by FFmpeg in an
+s-encoded layout (s = 2*state + valMPS); this script derives the spec-form
+(state-indexed) tables from them and cross-checks the redundant entries.
+
+Usage:
+    curl -sLO https://raw.githubusercontent.com/FFmpeg/FFmpeg/master/libavcodec/h264_cabac.c
+    curl -sL  https://raw.githubusercontent.com/FFmpeg/FFmpeg/master/libavcodec/cabac.c -o ffcabac.c
+    python3 tools/gen_cabac_tables.py h264_cabac.c ffcabac.c > kernel/src/video/h264/cabac_tables.rs
+"""
+import re
+import sys
+
+
+def strip_comments(src):
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    return re.sub(r"//[^\n]*", "", src)
+
+
+def parse_array(src, name):
+    m = re.search(re.escape(name) + r"[^=]*=\s*\{(.*?)\}\s*;", src, re.S)
+    if not m:
+        raise SystemExit(f"missing array {name}")
+    # Entries are ints, hex, or simple `a+b` sums (e.g. `105+15`).
+    toks = re.findall(r"-?0[xX][0-9a-fA-F]+|-?\d+\s*\+\s*\d+|-?\d+", m.group(1))
+    out = []
+    for t in toks:
+        if "+" in t:
+            a, b = t.split("+")
+            out.append(int(a) + int(b))
+        else:
+            out.append(int(t, 0))
+    return out
+
+
+def main():
+    h264_cabac = strip_comments(open(sys.argv[1]).read())
+    ffcabac = strip_comments(open(sys.argv[2]).read())
+
+    # --- context init tables: (m, n) pairs -> runtime state per QP ---
+    init_i = parse_array(h264_cabac, "cabac_context_init_I")
+    init_pb = parse_array(h264_cabac, "cabac_context_init_PB")
+    assert len(init_i) == 2048, len(init_i)
+    assert len(init_pb) == 3 * 2048, len(init_pb)
+
+    # --- engine tables from ff_h264_cabac_tables (norm_shift | lps_range |
+    # mlps_state | last_coeff_flag_offset_8x8) ---
+    tab = parse_array(ffcabac, "ff_h264_cabac_tables")
+    assert len(tab) == 512 + 4 * 2 * 64 + 4 * 64 + 63, len(tab)
+    tab = [v & 0xFF for v in tab]  # the C array is uint8_t with wrapped negative literals
+    lps = tab[512:1024]      # [128*qidx + s], s = 2*state+mps (mps-duplicated)
+    mlps = tab[1024:1280]    # MPS next at [128+s], LPS next at [127-s]
+    last8 = tab[1280:1343]   # last_coeff_flag_offset_8x8[63]
+
+    range_lps = [[0] * 4 for _ in range(64)]
+    for st in range(64):
+        for q in range(4):
+            a = lps[128 * q + 2 * st]
+            b = lps[128 * q + 2 * st + 1]
+            assert a == b, (st, q, a, b)  # mps bit must not affect LPS range
+            range_lps[st][q] = a
+    trans_mps = [0] * 64
+    trans_lps = [0] * 64
+    for st in range(64):
+        s0 = 2 * st  # mps = 0
+        nm = mlps[128 + s0]
+        nl = mlps[127 - s0]
+        # cross-check the mps=1 encoding agrees
+        s1 = 2 * st + 1
+        assert mlps[128 + s1] >> 1 == nm >> 1, st
+        if st > 0:
+            assert mlps[127 - s1] >> 1 == nl >> 1, st
+            assert nm & 1 == 0 and nl & 1 == 0, st
+        else:
+            # state 0 LPS flips valMPS (spec: pStateIdx==0 -> valMPS = 1-valMPS)
+            assert nl == 1 and mlps[127 - s1] == 0, (nl, mlps[127 - s1])
+        trans_mps[st] = nm >> 1
+        trans_lps[st] = nl >> 1
+
+    # --- residual context offset maps (frame-coding row [0] only; no MBAFF) ---
+    sig_off = parse_array(h264_cabac, "significant_coeff_flag_offset")[:14]
+    last_off = parse_array(h264_cabac, "last_coeff_flag_offset")[:14]
+    abs_off = parse_array(h264_cabac, "coeff_abs_level_m1_offset")
+    sig8 = parse_array(h264_cabac, "significant_coeff_flag_offset_8x8")[:63]
+    lvl1_ctx = parse_array(h264_cabac, "coeff_abs_level1_ctx")
+    lvlgt1_ctx = parse_array(h264_cabac, "coeff_abs_levelgt1_ctx")[:8]  # [0] = non-chroma422
+    lvl_trans = parse_array(h264_cabac, "coeff_abs_level_transition")
+    assert len(abs_off) == 14 and len(sig8) == 63 and len(lvl1_ctx) == 8
+    assert len(lvl_trans) == 16
+
+    def dump(name, ty, vals, per=16):
+        out = [f"pub const {name}: {ty} = ["]
+        for i in range(0, len(vals), per):
+            out.append("    " + ", ".join(str(v) for v in vals[i:i + per]) + ",")
+        out.append("];")
+        return "\n".join(out)
+
+    def dump2(name, ty, rows, per=16):
+        out = [f"pub const {name}: {ty} = ["]
+        for r in rows:
+            out.append("    [")
+            for i in range(0, len(r), per):
+                out.append("        " + ", ".join(str(v) for v in r[i:i + per]) + ",")
+            out.append("    ],")
+        out.append("];")
+        return "\n".join(out)
+
+    pairs_i = [[init_i[2 * i], init_i[2 * i + 1]] for i in range(1024)]
+    pairs_pb = [[[init_pb[k * 2048 + 2 * i], init_pb[k * 2048 + 2 * i + 1]] for i in range(1024)] for k in range(3)]
+
+    print("//! CABAC tables, GENERATED by tools/gen_cabac_tables.py from the FFmpeg")
+    print("//! sources (libavcodec/h264_cabac.c + cabac.c) — do not edit by hand.")
+    print("//! Engine tables are converted from FFmpeg's s-encoded layout to the")
+    print("//! spec-form state-indexed layout (cross-checked during generation).")
+    print("#![allow(clippy::all)]")
+    print()
+    print("/// rangeTabLPS[pStateIdx][qCodIRangeIdx] (spec Table 9-44).")
+    print(dump2("RANGE_LPS", "[[u8; 4]; 64]", range_lps, per=4))
+    print()
+    print("/// transIdxMPS[pStateIdx] (spec Table 9-45).")
+    print(dump("TRANS_MPS", "[u8; 64]", trans_mps))
+    print()
+    print("/// transIdxLPS[pStateIdx] (spec Table 9-45; state 0 also flips valMPS).")
+    print(dump("TRANS_LPS", "[u8; 64]", trans_lps))
+    print()
+    print("/// Context init (m, n) pairs for I slices.")
+    print(dump2("CTX_INIT_I", "[[i8; 2]; 1024]", pairs_i, per=16))
+    print()
+    print("/// Context init (m, n) pairs for P/B slices, by cabac_init_idc.")
+    print("pub const CTX_INIT_PB: [[[i8; 2]; 1024]; 3] = [")
+    for k in range(3):
+        print("    [")
+        for i in range(0, 1024, 8):
+            row = ", ".join(f"[{p[0]}, {p[1]}]" for p in pairs_pb[k][i:i + 8])
+            print("        " + row + ",")
+        print("    ],")
+    print("];")
+    print()
+    print("/// significant_coeff_flag ctx base per block category (frame coding).")
+    print(dump("SIG_COEFF_OFFSET", "[u16; 14]", sig_off))
+    print()
+    print("/// last_significant_coeff_flag ctx base per block category (frame).")
+    print(dump("LAST_COEFF_OFFSET", "[u16; 14]", last_off))
+    print()
+    print("/// coeff_abs_level_minus1 ctx base per block category.")
+    print(dump("ABS_LEVEL_OFFSET", "[u16; 14]", abs_off))
+    print()
+    print("/// significant_coeff_flag ctxIdxInc map for 8x8 blocks (frame).")
+    print(dump("SIG_COEFF_8X8", "[u8; 63]", sig8))
+    print()
+    print("/// last_significant_coeff_flag ctxIdxInc map for 8x8 blocks.")
+    print(dump("LAST_COEFF_8X8", "[u8; 63]", last8))
+    print()
+    print("/// coeff_abs_level ctx for the first (>0) bin, by node state.")
+    print(dump("LVL1_CTX", "[u8; 8]", lvl1_ctx))
+    print()
+    print("/// coeff_abs_level ctx for the >1 bins, by node state (4:2:0 row).")
+    print(dump("LVLGT1_CTX", "[u8; 8]", lvlgt1_ctx))
+    print()
+    print("/// coeff_abs_level node-state transitions: [0] after ==1, [1] after >1.")
+    print(dump2("LVL_TRANSITION", "[[u8; 8]; 2]", [lvl_trans[:8], lvl_trans[8:]], per=8))
+
+
+if __name__ == "__main__":
+    main()
