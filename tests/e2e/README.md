@@ -13,7 +13,8 @@ console, exercising the **networked core flows** against local host servers:
 | `wss` | `/ws wss://…` — WebSocket over TLS 1.3 |
 | `model_remote_https` | `/model remote https://…` — hosted-model chat over TLS |
 | `ping` | `/ping` — ICMP echo to the gateway |
-| *os group* | every shell command: `/help /info /datetime /disks /lspci /mounts /ls /skills /shortcuts /mode /think /agents /ui /ktrace /close /top /clear /wifi` |
+| *os group* | every shell command: `/help /info /datetime /disks /lspci /mounts /ls /skills /shortcuts /mode /think /agents /ui /ktrace /close /top /clear /wifi`, plus `memory` (add/get/list), `help_restart` (`/help` lists `/restart` + `/memory`) |
+| `restart` (final) | `/restart` reboots (aarch64: in-place second boot; x86 `-no-reboot`: guest may exit) — always last |
 | *model group* (`--slow`) | `/bench`, `/infer`, `/perf`, a local chat turn, `/compact` — needs `assets/model.gguf` |
 | *voice group* (`--slow`) | `/voice models`, `/voice say` (TTS) — needs `assets/voice/` + a sound device |
 

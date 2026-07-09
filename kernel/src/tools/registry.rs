@@ -38,6 +38,10 @@ pub enum ToolBinding {
     /// other tool and the arguments are forwarded verbatim as the JSON-RPC
     /// `arguments` object. `server` is the local connection name.
     Mcp { server: String, tool: String },
+    /// Durable per-agent memory under `/agent/<id>/memory/` — `memory_add`,
+    /// `memory_get`, `memory_list`. No Synapse primitive; the store is the
+    /// agent's own home (already sandboxed for non-orchestrator agents).
+    AgentMemory,
 }
 
 impl ToolDef {
@@ -228,6 +232,27 @@ fn builtins() -> Vec<ToolDef> {
             input_schema: r#"{"type":"object","properties":{"intent":{"type":"string"}},"required":["intent"]}"#.to_string(),
             required: alloc::vec!["intent".to_string()],
             binding: ToolBinding::RunIntent,
+        },
+        ToolDef {
+            name: "memory_add".to_string(),
+            description: "Store a durable key/value fact in this agent's memory (survives context compaction).".to_string(),
+            input_schema: r#"{"type":"object","properties":{"key":{"type":"string","description":"fact name ([A-Za-z0-9._-])"},"value":{"type":"string","description":"fact contents"}},"required":["key","value"]}"#.to_string(),
+            required: alloc::vec!["key".to_string(), "value".to_string()],
+            binding: ToolBinding::AgentMemory,
+        },
+        ToolDef {
+            name: "memory_get".to_string(),
+            description: "Retrieve a previously stored fact from this agent's durable memory by key.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"key":{"type":"string","description":"fact name to look up"}},"required":["key"]}"#.to_string(),
+            required: alloc::vec!["key".to_string()],
+            binding: ToolBinding::AgentMemory,
+        },
+        ToolDef {
+            name: "memory_list".to_string(),
+            description: "List the keys currently stored in this agent's durable memory.".to_string(),
+            input_schema: r#"{"type":"object","properties":{}}"#.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::AgentMemory,
         },
     ]
 }

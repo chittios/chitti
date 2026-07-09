@@ -110,4 +110,38 @@ mod tests {
         let text = selection_text(|i| lines.get(i).map(|v| v.as_slice()), (0, 0), (5, 99));
         assert_eq!(text, "ab");
     }
+
+    /// Differential selection paint only touches cells whose membership flips
+    /// (used by the chat drag path to avoid a full-pane clear flash).
+    #[test_case]
+    fn sel_membership_differs_only_on_delta() {
+        let old = normalize((0, 0), (0, 3)); // cols 0..=3
+        let new = normalize((0, 2), (0, 5)); // cols 2..=5
+        // 0,1 leave; 2,3 stay; 4,5 enter.
+        assert!(contains(old, 0, 0) && !contains(new, 0, 0));
+        assert!(contains(old, 0, 1) && !contains(new, 0, 1));
+        assert!(contains(old, 0, 2) && contains(new, 0, 2));
+        assert!(contains(old, 0, 3) && contains(new, 0, 3));
+        assert!(!contains(old, 0, 4) && contains(new, 0, 4));
+        assert!(!contains(old, 0, 5) && contains(new, 0, 5));
+    }
+
+    /// Multi-line selection: middle rows are fully selected; endpoints clamp.
+    #[test_case]
+    fn multi_line_contains_and_clear() {
+        let r = normalize((1, 2), (3, 1));
+        assert!(!contains(r, 0, 9));
+        assert!(!contains(r, 1, 1));
+        assert!(contains(r, 1, 2));
+        assert!(contains(r, 2, 0)); // full middle line
+        assert!(contains(r, 2, 99));
+        assert!(contains(r, 3, 1));
+        assert!(!contains(r, 3, 2));
+        assert!(!contains(r, 4, 0));
+        // Empty selection (same cell) is still a single-cell range.
+        let one = normalize((5, 5), (5, 5));
+        assert!(contains(one, 5, 5));
+        assert!(!contains(one, 5, 4));
+        assert!(!contains(one, 5, 6));
+    }
 }

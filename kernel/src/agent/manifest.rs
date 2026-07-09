@@ -44,6 +44,10 @@ pub fn orchestrator_manifest() -> AgentManifest {
             "todo_write".into(),
             "load_skill".into(),
             "emit_result".into(),
+            // Durable per-agent memory under `/agent/<id>/memory/`.
+            "memory_add".into(),
+            "memory_get".into(),
+            "memory_list".into(),
             // System `/command` tools — the root agent drives the machine like a
             // human at the shell (see tools::registry::shell_commands).
             "help".into(),
@@ -121,6 +125,10 @@ pub fn worker_subagent_manifest() -> AgentManifest {
             "http".into(),
             "datetime".into(),
             "skills".into(),
+            // Workers may keep notes for the task (scoped to their own home).
+            "memory_add".into(),
+            "memory_get".into(),
+            "memory_list".into(),
         ],
         capabilities: vec![
             CapabilityRequest::new(CapDomain::Fs, Rights::READ | Rights::LIST, Scope::Any),

@@ -93,3 +93,32 @@ pub fn poweroff() -> ! {
         hlt();
     }
 }
+
+/// Reboot the machine. Pulse the 8042 keyboard-controller reset line (port
+/// `0x64` command `0xFE`) — the standard PC soft-reset path, works on real
+/// hardware and most hypervisors. Under QEMU started with `-no-reboot` the
+/// emulator exits instead of looping; either way `/restart` does not hang.
+pub fn reboot() -> ! {
+    // SAFETY: writing 0xFE to the 8042 status port is the architected
+    // keyboard-controller CPU reset pulse; it does not return on success.
+    unsafe {
+        // Drain the input buffer so the controller accepts the command.
+        for _ in 0..100_000 {
+            if port::inb(0x64) & 0x02 == 0 {
+                break;
+            }
+        }
+        port::outb(0x64, 0xFE);
+    }
+    // Fallback: triple-fault via a zero-limit IDT load (if the 8042 is absent).
+    // SAFETY: loading a null IDT then triggering an interrupt resets the CPU.
+    unsafe {
+        let null_idt: [u64; 2] = [0, 0];
+        core::arch::asm!(
+            "lidt [{0}]",
+            "int3",
+            in(reg) &null_idt,
+            options(nostack, noreturn),
+        );
+    }
+}
