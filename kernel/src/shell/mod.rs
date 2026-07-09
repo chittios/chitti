@@ -1304,6 +1304,13 @@ fn agent_system_prompt() -> String {
         persona.push_str(&mem);
         persona.push_str("\n\n");
     }
+    // KV facts (memory_add) — inject so they survive /compact even when the
+    // model forgets the exact key (e.g. stored user.name, later asks "name").
+    if let Some(kv) = crate::agent::home::memory_kv_digest(id) {
+        persona.push_str("## Stored facts\n");
+        persona.push_str(&kv);
+        persona.push('\n');
+    }
     // L0 skill index only — full bodies load via `skill` / `load_skill`.
     let skills = crate::skills::index::metadata();
     if !skills.is_empty() {
@@ -1322,9 +1329,10 @@ fn agent_system_prompt() -> String {
          talk, just reply in prose — do NOT call a tool. Call a tool only when the task needs \
          machine state or an action, and never invent data a tool can read (current time, \
          network status, files, disks). Use read/write/edit/glob/grep for files, memory_* for \
-         durable notes, skill to load a procedure, todo_write for multi-step work, \
-         spawn_subagent to delegate. When you have the answer, reply in short plain prose \
-         (ANSI SGR escape codes for emphasis if needed, never markdown).",
+         durable notes (prefer the exact keys listed under Stored facts; if unsure call \
+         memory_list or memory_search before guessing a key), skill to load a procedure, \
+         todo_write for multi-step work, spawn_subagent to delegate. When you have the answer, \
+         reply in short plain prose (ANSI SGR escape codes for emphasis if needed, never markdown).",
     );
     tools_system_prompt(&persona, &toolset)
 }
@@ -2856,28 +2864,61 @@ impl ChatSession {
         let last = ids.len();
         // ktrace every inference call (project convention): one line per prefill.
         crate::ktrace::log_fmt(format_args!("chat.prefill: {} tokens at pos {}", last, self.pos));
-        let mut spin = Spinner::new("thinking");
+        if last > 200 {
+            // First local turn prefills the whole system prompt (~800 tok). On
+            // QEMU+HVF that's seconds; on VirtualBox it can be many minutes —
+            // say so up front so it is not mistaken for a hang.
+            serial_println!(
+                "model> prefilling {} tokens (first local reply is slow under VirtualBox; \
+                 use `/model remote http://HOST:1234 name` for LM Studio)",
+                last
+            );
+        }
+        let mut spin = Spinner::new("prefill");
         let mut fed = 0usize;
+        let t0 = crate::arch::now_ms();
+        // Rate-limit UI/spinner/cancel to ~10 Hz. Per-token FB/serial mirror on
+        // a 2560×1440 VBox GOP dominates wall time and looks like a hang.
+        let mut last_ui = t0;
+        let mut last_log = 0usize;
         for (i, &tok) in ids.iter().enumerate() {
             // Only the final token needs logits, and only when we're about to
             // decode (`prime`); otherwise this is pure context prefill.
             let want = prime && i + 1 == last;
             self.model.forward(tok, self.pos + i, &mut self.kv, &mut self.state, want);
             fed = i + 1;
-            spin.tick();
-            // Cooperative scheduler: pump the UI + net stack between forwards or
-            // the screen freezes while we think (see CLAUDE.md UI notes).
-            ui_tick();
-            crate::net::poll();
-            // Cancel mid-prefill: stop feeding. Caller (`prefill_committed` or
-            // `turn`) rebuilds from committed history so the KV is never left
-            // half-way through a turn.
-            if poll_cancel() {
-                self.cancelled = true;
-                break;
+            let now = crate::arch::now_ms();
+            if now.saturating_sub(last_ui) >= 100 || fed == last || fed == 1 {
+                last_ui = now;
+                spin.tick();
+                ui_tick();
+                crate::net::poll();
+                if poll_cancel() {
+                    self.cancelled = true;
+                    break;
+                }
+            }
+            // Dense early progress (1, 16, 32…) so a slow host shows life quickly.
+            let step = if fed <= 64 { 16 } else { 64 };
+            if fed == 1 || fed - last_log >= step || fed == last {
+                last_log = fed;
+                let dt = now.saturating_sub(t0).max(1);
+                let rate = (fed as u64).saturating_mul(1000) / dt;
+                crate::ktrace::log_fmt(format_args!(
+                    "chat.prefill: {}/{} ({} tok/s)",
+                    fed, last, rate
+                ));
             }
         }
         spin.clear();
+        let dt = crate::arch::now_ms().saturating_sub(t0).max(1);
+        crate::ktrace::log_fmt(format_args!(
+            "chat.prefill: done {} tokens in {} ms ({} tok/s){}",
+            fed,
+            dt,
+            (fed as u64).saturating_mul(1000) / dt,
+            if self.cancelled { " [cancelled]" } else { "" }
+        ));
         self.pos += fed;
     }
 

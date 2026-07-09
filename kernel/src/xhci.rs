@@ -161,6 +161,9 @@ impl PtrLayout {
 /// its config descriptor read), consumed by `finish_keyboard`/`finish_pointer`.
 struct Common {
     slot: u8,
+    /// Output Device Context (DCBAA[slot]) — source of truth for Slot Context
+    /// when building Configure Endpoint (must not re-zero port/speed).
+    dev_ctx_va: usize,
     ep0_va: usize,
     ep0_pa: u64,
     ep0_enq: usize,
@@ -184,10 +187,13 @@ const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 const TRB_EVALUATE_CONTEXT: u32 = 13;
+const TRB_RESET_ENDPOINT: u32 = 14;
+const TRB_SET_TR_DEQUEUE: u32 = 16;
 // Event TRB types.
 const EVT_TRANSFER: u32 = 32;
 const EVT_CMD_COMPLETION: u32 = 33;
 const CC_SUCCESS: u32 = 1;
+const CC_STALL: u32 = 6;
 
 // PORTSC bits.
 const PORTSC_CCS: u32 = 1 << 0; // current connect status
@@ -420,7 +426,10 @@ impl Xhci {
     }
 
     /// Block (bounded) for the next event of `want_type`; returns its TRB.
-    unsafe fn wait_event(&mut self, want_type: u32) -> Option<Trb> {
+    /// Non-matching events are discarded (port-status etc.) — only one waiter.
+    /// `max_spins` caps how long we poll; VirtualBox can stall a control TD
+    /// forever if EP0 is Halted, so optional requests must use a tight bound.
+    unsafe fn wait_event_bounded(&mut self, want_type: u32, max_spins: u64) -> Option<Trb> {
         let mut spins = 0u64;
         loop {
             if let Some(ev) = unsafe { self.next_event() } {
@@ -429,12 +438,43 @@ impl Xhci {
                 }
             } else {
                 spins += 1;
-                if spins > 20_000_000 {
+                if spins > max_spins {
                     unsafe { self.dump_event_ring(want_type) };
                     return None;
                 }
             }
         }
+    }
+
+    unsafe fn wait_event(&mut self, want_type: u32) -> Option<Trb> {
+        // ~seconds under a hypervisor; enough for a healthy control TD.
+        unsafe { self.wait_event_bounded(want_type, 5_000_000) }
+    }
+
+    /// After a STALL or timed-out control TD, EP0 is Halted and its transfer
+    /// ring may have an unfinished TD. VirtualBox then never completes further
+    /// EP0 traffic (and host KeyboardQueue fills → VERR_PDM_NO_QUEUE_ITEMS).
+    /// Reset Endpoint + Set TR Dequeue Pointer rewinds EP0 so enum can continue.
+    unsafe fn recover_ep0(&mut self, slot: u8, ep0_va: usize, ep0_pa: u64, enq: &mut usize, cycle: &mut u32) {
+        // Reset Endpoint, DCI 1 (EP0). TSP=0 → drop halted transfer state.
+        let _ = unsafe {
+            self.command(0, (TRB_RESET_ENDPOINT << 10) | (1u32 << 16) | ((slot as u32) << 24))
+        };
+        // Software ring rewind + Link TRB at the end.
+        *enq = 0;
+        *cycle = 1;
+        unsafe {
+            core::ptr::write_bytes(ep0_va as *mut u8, 0, RING_TRBS * 16);
+            self.init_link(ep0_va, ep0_pa);
+        }
+        // Point the HC at the fresh ring (DCS=1 matches cycle 1).
+        let _ = unsafe {
+            self.command(
+                ep0_pa | 1,
+                (TRB_SET_TR_DEQUEUE << 10) | (1u32 << 16) | ((slot as u32) << 24),
+            )
+        };
+        crate::ktrace::log_fmt(format_args!("xhci: recovered EP0 on slot {slot} after stall/timeout"));
     }
 
     /// Diagnostic dumped when `wait_event` times out: the current dequeue
@@ -501,11 +541,17 @@ impl Xhci {
                     let ok = cc == CC_SUCCESS || cc == 13 /* SHORT_PACKET */;
                     if !ok {
                         crate::ktrace::log_fmt(format_args!("xhci: control transfer cc={cc} (len {len}, in={data_in})"));
+                        // STALL (6) leaves EP0 Halted — must Reset Endpoint before
+                        // the next setup packet or every later control TD times out.
+                        if cc == CC_STALL {
+                            unsafe { self.recover_ep0(slot, va, pa, enq, cycle) };
+                        }
                     }
                     ok
                 }
                 None => {
                     crate::ktrace::log_fmt(format_args!("xhci: control transfer TIMEOUT (len {len}, in={data_in})"));
+                    unsafe { self.recover_ep0(slot, va, pa, enq, cycle) };
                     false
                 }
             }
@@ -522,6 +568,12 @@ impl Xhci {
     /// Enumerate the connected USB HID devices — a boot keyboard and/or a
     /// pointer (USB tablet / mouse), which may sit on separate ports.
     pub fn enumerate_input(&mut self) -> bool {
+        // After our HCRST, VirtualBox re-attaches HidKeyboard / HidMouse
+        // asynchronously and often races a guest port-reset with its own
+        // device-level reset ("reset request is ignored, already resetting").
+        // Wait before the first scan so the first pass has a chance; QEMU is
+        // instantaneous so the extra settle is just a few ms of busy-wait.
+        spin_delay(80_000_000);
         // Fast path out: nothing connected on any port -> no retries, no delays.
         let any_port = (1..=self.max_ports).any(|p| unsafe { r32(self.portsc(p)) } & PORTSC_CCS != 0);
         if !any_port {
@@ -533,14 +585,13 @@ impl Xhci {
         // transfer submitted in that window is silently dropped. A settle +
         // fresh attempt succeeds once the device-level reset has finished. QEMU
         // is instantaneous and never needs the retry.
-        // Up to 6 passes with a 250 ms settle between them. VirtualBox's async
-        // VUSB reset makes a device time out on an early pass; `done_ports`
-        // keeps a device that already came up from being re-reset, so the extra
-        // passes only re-try whatever is still missing and never disturb a
-        // working device. QEMU gets both on the first pass and exits at once.
-        for attempt in 0..6 {
+        // Up to 8 passes with a settle between them. `done_ports` keeps a device
+        // that already came up from being re-reset, so the extra passes only
+        // re-try whatever is still missing and never disturb a working device.
+        // QEMU gets both on the first pass and exits at once.
+        for attempt in 0..8 {
             if attempt > 0 {
-                spin_delay(250_000_000);
+                spin_delay(300_000_000);
                 crate::ktrace::log_fmt(format_args!("xhci: retrying enumeration (attempt {})", attempt + 1));
             }
             // SAFETY: single-threaded boot; all DMA regions are freshly allocated.
@@ -551,6 +602,9 @@ impl Xhci {
         }
         if self.kbd.is_none() {
             crate::ktrace::log("xhci", "no HID keyboard enumerated");
+        }
+        if self.mouse.is_none() {
+            crate::ktrace::log("xhci", "no HID pointer enumerated");
         }
         self.kbd.is_some() || self.mouse.is_some()
     }
@@ -748,7 +802,20 @@ impl Xhci {
         if !ok {
             return None;
         }
-        Some(Common { slot, ep0_va, ep0_pa, ep0_enq, ep0_cycle, in_ctx_va, in_ctx_pa, buf_va, buf_pa, total, cfg_val })
+        Some(Common {
+            slot,
+            dev_ctx_va,
+            ep0_va,
+            ep0_pa,
+            ep0_enq,
+            ep0_cycle,
+            in_ctx_va,
+            in_ctx_pa,
+            buf_va,
+            buf_pa,
+            total,
+            cfg_val,
+        })
     }
 
     /// Set the configuration, put the interface into a protocol, and configure
@@ -765,12 +832,59 @@ impl Xhci {
         set_boot: bool,
     ) -> Option<(u8, usize, u64, u64, usize)> {
         unsafe {
-            // Set configuration.
-            self.control(c.slot, c.ep0_va, c.ep0_pa, &mut c.ep0_enq, &mut c.ep0_cycle, setup(0x00, 9, c.cfg_val as u16, 0, 0), 0, 0, false);
-            if set_boot {
-                // SET_PROTOCOL(boot=0) to the HID interface (class request).
-                self.control(c.slot, c.ep0_va, c.ep0_pa, &mut c.ep0_enq, &mut c.ep0_cycle, setup(0x21, 0x0b, 0, iface as u16, 0), 0, 0, false);
+            // Set configuration (required before the device will answer interrupt IN).
+            if !self.control(
+                c.slot,
+                c.ep0_va,
+                c.ep0_pa,
+                &mut c.ep0_enq,
+                &mut c.ep0_cycle,
+                setup(0x00, 9, c.cfg_val as u16, 0, 0),
+                0,
+                0,
+                false,
+            ) {
+                crate::ktrace::log_fmt(format_args!(
+                    "xhci: SET_CONFIGURATION({}) failed — retrying once after EP0 recover",
+                    c.cfg_val
+                ));
+                // recover_ep0 already ran inside control(); try once more.
+                if !self.control(
+                    c.slot,
+                    c.ep0_va,
+                    c.ep0_pa,
+                    &mut c.ep0_enq,
+                    &mut c.ep0_cycle,
+                    setup(0x00, 9, c.cfg_val as u16, 0, 0),
+                    0,
+                    0,
+                    false,
+                ) {
+                    crate::ktrace::log("xhci", "SET_CONFIGURATION failed twice");
+                    return None;
+                }
             }
+            if set_boot {
+                // SET_PROTOCOL(boot=0). VBox often stalls when already in boot
+                // mode — control() recovers EP0 so later GET_DESCRIPTOR still works.
+                if !self.control(
+                    c.slot,
+                    c.ep0_va,
+                    c.ep0_pa,
+                    &mut c.ep0_enq,
+                    &mut c.ep0_cycle,
+                    setup(0x21, 0x0b, 0, iface as u16, 0),
+                    0,
+                    0,
+                    false,
+                ) {
+                    crate::ktrace::log("xhci", "SET_PROTOCOL(boot) stalled (recovered EP0; continuing)");
+                }
+            }
+            // Do NOT issue SET_IDLE here: on VBox a stall mid-enum left EP0 Halted
+            // and the follow-up control TD hung until wait_event timed out, while
+            // the host KeyboardQueue filled (VERR_PDM_NO_QUEUE_ITEMS). Idle default
+            // is fine for boot keyboards/tablets.
         }
         let (int_pa, int_va) = (self.alloc)(RING_TRBS * 16)?;
         let int_va = int_va as usize;
@@ -779,11 +893,25 @@ impl Xhci {
         let report_va = report_va as usize;
         let int_dci = (((ep_addr & 0x0f) as u32) * 2 + 1) as u8; // IN endpoint DCI
         unsafe {
-            self.build_input_configure(c.in_ctx_va, int_dci, ep_mps, interval, int_pa);
+            self.build_input_configure(c, int_dci, ep_mps, interval, int_pa);
             let (cc, _) = self.command(c.in_ctx_pa, (TRB_CONFIGURE_ENDPOINT << 10) | ((c.slot as u32) << 24))?;
             if cc != CC_SUCCESS {
                 crate::ktrace::log_fmt(format_args!("xhci: configure endpoint failed cc={cc}"));
                 return None;
+            }
+            // EP state in Output Context: 1 = Running. Anything else means the
+            // interrupt IN will never complete (VBox used to show READY with
+            // a wiped Slot Context → port/speed 0 after Evaluate Context).
+            let ep_ctx = c.dev_ctx_va + self.ctx_size * (int_dci as usize + 1);
+            let ep_state = read_volatile(ep_ctx as *const u32) & 0x7;
+            let slot_d0 = read_volatile((c.dev_ctx_va) as *const u32);
+            let slot_d1 = read_volatile((c.dev_ctx_va + 4) as *const u32);
+            crate::ktrace::log_fmt(format_args!(
+                "xhci: after configure dci={int_dci} ep_state={ep_state} slot_ctx0={slot_d0:#x} port={}",
+                (slot_d1 >> 16) & 0xff
+            ));
+            if ep_state != 1 {
+                crate::ktrace::log("xhci", "interrupt EP not Running — reports will not arrive");
             }
         }
         Some((int_dci, int_va, int_pa, report_pa, report_va))
@@ -873,35 +1001,47 @@ impl Xhci {
     }
 
     /// Build the input context for Evaluate Context to update EP0's max packet
-    /// size (learned from the device descriptor). Add flag A1 (EP0) only; set the
-    /// EP0 context's type/MPS/CErr — the controller re-reads MPS from it.
+    /// size (learned from the device descriptor). Add flag A1 (EP0) only.
+    ///
+    /// **Must not wipe the Slot Context** — a prior version zeroed control+slot+EP0
+    /// here, so the later Configure Endpoint inherited port=0/speed=0 and VBox
+    /// never scheduled interrupt INs (control still worked; kbd queue overflowed).
     unsafe fn build_input_eval_mps(&self, in_ctx_va: usize, ep0_mps: u32) {
         unsafe {
-            core::ptr::write_bytes(in_ctx_va as *mut u8, 0, self.ctx_size * 3);
-            w32(in_ctx_va + 4, 0b10); // Add flags: A1 (EP0) only
+            w32(in_ctx_va, 0); // Drop flags
+            w32(in_ctx_va + 4, 0b10); // Add flags: A1 (EP0) only — leave Slot alone
             let ep0 = in_ctx_va + self.ctx_size * 2;
+            core::ptr::write_bytes(ep0 as *mut u8, 0, self.ctx_size);
             w32(ep0 + 4, (4 << 3) | (ep0_mps << 16) | (3 << 1)); // type=Control, MPS, CErr=3
         }
     }
 
-    /// Extend the input context for Configure Endpoint: add the interrupt IN
-    /// endpoint at `dci` and bump the slot's context-entries count.
-    unsafe fn build_input_configure(&self, in_ctx_va: usize, dci: u8, mps: u32, interval: u8, int_pa: u64) {
+    /// Input Context for Configure Endpoint: copy the live Output Slot Context
+    /// (port, speed, route — still valid after Address Device), bump Context
+    /// Entries, and install the interrupt IN endpoint at `dci`.
+    unsafe fn build_input_configure(&self, c: &Common, dci: u8, mps: u32, interval: u8, int_pa: u64) {
         unsafe {
-            w32(in_ctx_va, 0); // drop flags
-            w32(in_ctx_va + 4, 0b1 | (1 << dci)); // add A0 (slot) + the endpoint
-            let slot_ctx = in_ctx_va + self.ctx_size;
-            let d0 = r32(slot_ctx) & !(0x1f << 27);
-            w32(slot_ctx, d0 | ((dci as u32) << 27)); // context entries = dci
+            let in_ctx_va = c.in_ctx_va;
+            // Control: Drop none; Add Slot (A0) + interrupt EP (A_dci).
+            w32(in_ctx_va, 0);
+            w32(in_ctx_va + 4, 0b1 | (1u32 << dci));
+            // Copy Output Slot Context → Input Slot Context, then set entries=dci.
+            let in_slot = in_ctx_va + self.ctx_size;
+            core::ptr::copy_nonoverlapping(c.dev_ctx_va as *const u8, in_slot as *mut u8, self.ctx_size);
+            let d0 = r32(in_slot) & !(0x1f << 27);
+            w32(in_slot, d0 | ((dci as u32) << 27));
+            // Interrupt IN endpoint context at index dci+1.
             let ep = in_ctx_va + self.ctx_size * (dci as usize + 1);
             core::ptr::write_bytes(ep as *mut u8, 0, self.ctx_size);
-            // Interrupt interval: xHCI encodes it as 2^(Interval) * 125us. For a
-            // full-speed 1ms endpoint that's ~8; clamp bInterval into range.
-            let ivl = (interval.max(1).min(16) as u32).ilog2() + 3;
+            // Interval: 2^(Interval)*125µs; FS bInterval is in frames → log2+3.
+            let biv = interval.max(1) as u32;
+            let ivl = (biv.ilog2()).min(12) + 3; // 3..=15
             w32(ep, ivl << 16);
-            w32(ep + 4, (7 << 3) | (mps << 16) | (3 << 1)); // type=Interrupt IN, MPS, CErr=3
-            w64(ep + 8, int_pa | 1);
-            w32(ep + 16, mps); // avg TRB length ~ max packet
+            w32(ep + 4, (7 << 3) | (mps << 16) | (3 << 1)); // Interrupt IN, MPS, CErr=3
+            w64(ep + 8, int_pa | 1); // TR Dequeue | DCS=1
+            // Avg TRB Length | Max ESIT Payload (FS INT requires ESIT == MPS).
+            let esit = mps.min(0xffff);
+            w32(ep + 16, esit | (esit << 16));
         }
     }
 
@@ -1369,6 +1509,20 @@ mod tests {
         assert_eq!(lo.field_bytes, 1);
         assert!(lo.relative);
         assert_eq!(lo.wheel_byte, Some(3), "the scroll wheel field must be located");
+    }
+
+    /// Endpoint Context dword 4 packing: Average TRB Length + Max ESIT Payload
+    /// (the VBox interrupt-IN fix — payload must be non-zero for FS INT).
+    #[test_case]
+    fn ep_context_esit_payload_packing() {
+        // Mirror build_input_configure's dword-4 formula: both halves = mps.
+        let mps = 8u32;
+        let esit = mps.min(0xffff);
+        let dw4 = esit | (esit << 16);
+        assert_eq!(dw4 & 0xffff, 8, "Average TRB Length");
+        assert_eq!(dw4 >> 16, 8, "Max ESIT Payload Lo");
+        // Zero payload is the bug we ship against.
+        assert_ne!(0u32, dw4 >> 16);
     }
 
     /// An absolute tablet (16-bit X/Y, no wheel): the fallback layout QEMU's

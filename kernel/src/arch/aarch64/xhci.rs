@@ -12,17 +12,36 @@ use alloc::alloc::{alloc_zeroed, Layout};
 
 static XHCI: Locked<Option<Xhci>> = Locked::new(None);
 
-/// Probe + bring up the xHCI controller and enumerate a HID keyboard. No-op if
-/// there is no PCIe bus (virtio-mmio-only QEMU) or no xHCI controller.
+/// Probe + bring up the xHCI controller and enumerate HID keyboard + pointer.
+/// No-op if there is no PCIe bus (virtio-mmio-only QEMU) or no xHCI controller.
+/// Returns true when **at least one** of keyboard / mouse came up (boot
+/// diagnostics use [`has_keyboard`] / [`has_mouse`] separately).
 pub fn init_global() -> bool {
     if let Some(mmio) = discover() {
         if let Some(mut x) = Xhci::bringup(mmio, aa_alloc) {
             let ok = x.enumerate_keyboard();
+            let kbd = x.has_keyboard();
+            let mse = x.has_mouse();
+            crate::ktrace::log_fmt(format_args!(
+                "xhci: enum done kbd={} mouse={}",
+                if kbd { "yes" } else { "no" },
+                if mse { "yes" } else { "no" }
+            ));
             XHCI.with(|s| *s = Some(x));
             return ok;
         }
     }
     false
+}
+
+/// Whether a USB HID keyboard was enumerated (for the INPUT boot line).
+pub fn has_keyboard() -> bool {
+    XHCI.with(|s| s.as_ref().map(|x| x.has_keyboard()).unwrap_or(false))
+}
+
+/// Whether a USB HID pointer/tablet was enumerated (for the INPUT boot line).
+pub fn has_mouse() -> bool {
+    XHCI.with(|s| s.as_ref().map(|x| x.has_mouse()).unwrap_or(false))
 }
 
 /// The next byte from a USB keyboard, if any.

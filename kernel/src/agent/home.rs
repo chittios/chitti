@@ -164,6 +164,8 @@ pub fn memory_add(id: u64, key: &str, value: &str) -> Result<(), &'static str> {
 }
 
 /// Read a durable fact for agent `id`. `None` if the key is invalid or absent.
+/// Exact key only — see [`memory_resolve`] for suffix/case-insensitive lookup
+/// (models often store `user.name` then later ask for `name` after compact).
 pub fn memory_get(id: u64, key: &str) -> Option<String> {
     let p = memory_path(id, key)?;
     fs::read(&p).map(|b| String::from_utf8_lossy(&b).into_owned())
@@ -184,6 +186,119 @@ pub fn memory_list(id: u64) -> Vec<String> {
         .collect();
     keys.sort();
     keys
+}
+
+/// Resolve `want` against stored keys for agent `id`.
+///
+/// Order: exact → case-insensitive exact → unique dotted/segment suffix
+/// (`name` → `user.name`) → unique substring. Pure over the key list + gets;
+/// unit-tested so post-compact recall stays reliable.
+pub fn memory_resolve(id: u64, want: &str) -> Option<(String, String)> {
+    let want_raw = want.trim();
+    if want_raw.is_empty() {
+        return None;
+    }
+    if let Some(v) = memory_get(id, want_raw) {
+        return Some((want_raw.to_string(), v));
+    }
+    let want = want_raw.to_ascii_lowercase();
+    let keys = memory_list(id);
+    if keys.is_empty() {
+        return None;
+    }
+    // Case-insensitive exact.
+    for k in &keys {
+        if k.to_ascii_lowercase() == want {
+            if let Some(v) = memory_get(id, k) {
+                return Some((k.clone(), v));
+            }
+        }
+    }
+    // Suffix / last path segment: "name" matches "user.name" or "profile_name".
+    let mut suffix: Vec<&String> = keys
+        .iter()
+        .filter(|k| {
+            let kl = k.to_ascii_lowercase();
+            kl.ends_with(&format!(".{want}"))
+                || kl.ends_with(&format!("_{want}"))
+                || kl.ends_with(&format!("-{want}"))
+                || kl.split(|c| c == '.' || c == '_' || c == '-').last() == Some(want.as_str())
+        })
+        .collect();
+    suffix.sort();
+    suffix.dedup();
+    if suffix.len() == 1 {
+        let k = suffix[0].clone();
+        if let Some(v) = memory_get(id, &k) {
+            return Some((k, v));
+        }
+    }
+    // Unique substring hit (e.g. "user" → sole key containing "user").
+    let contains: Vec<&String> = keys
+        .iter()
+        .filter(|k| k.to_ascii_lowercase().contains(&want))
+        .collect();
+    if contains.len() == 1 {
+        let k = contains[0].clone();
+        if let Some(v) = memory_get(id, &k) {
+            return Some((k, v));
+        }
+    }
+    None
+}
+
+/// Compact key→value listing for the system prompt so durable facts survive
+/// `/compact` without relying on the model remembering exact keys.
+/// Caps entries so a large store cannot blow the prefill budget.
+pub fn memory_kv_digest(id: u64) -> Option<String> {
+    let keys = memory_list(id);
+    if keys.is_empty() {
+        return None;
+    }
+    const MAX_KEYS: usize = 24;
+    const MAX_VAL: usize = 96;
+    let mut out = String::from(
+        "Durable memory (use the exact key with memory_get; on miss use memory_list / memory_search):\n",
+    );
+    for k in keys.iter().take(MAX_KEYS) {
+        let val = memory_get(id, k).unwrap_or_default();
+        let snip = if val.len() > MAX_VAL {
+            format!("{}…", &val[..MAX_VAL])
+        } else {
+            val
+        };
+        out.push_str("- ");
+        out.push_str(k);
+        out.push_str(": ");
+        out.push_str(&snip);
+        out.push('\n');
+    }
+    if keys.len() > MAX_KEYS {
+        out.push_str(&format!(
+            "… and {} more keys (call memory_list)\n",
+            keys.len() - MAX_KEYS
+        ));
+    }
+    Some(out)
+}
+
+/// Keys that *almost* match `want` (for miss diagnostics). Pure-ish helper.
+fn memory_near_keys(id: u64, want: &str) -> Vec<String> {
+    let want = want.trim().to_ascii_lowercase();
+    if want.is_empty() {
+        return Vec::new();
+    }
+    memory_list(id)
+        .into_iter()
+        .filter(|k| {
+            let kl = k.to_ascii_lowercase();
+            kl.contains(&want)
+                || want.contains(&kl)
+                || kl.ends_with(&want)
+                || kl.split(|c| c == '.' || c == '_' || c == '-').any(|s| s == want)
+        })
+        .take(8)
+        .collect()
 }
 
 /// Run a `memory_add` / `memory_get` / `memory_list` / `memory_search` tool
@@ -223,9 +338,30 @@ pub fn run_memory_tool(name: &str, agent_id: u64, args: &str) -> String {
             if key.is_empty() {
                 return String::from("error: memory_get needs a key");
             }
-            match memory_get(agent_id, &key) {
-                Some(v) => v,
-                None => format!("(no memory for key '{key}')"),
+            match memory_resolve(agent_id, &key) {
+                Some((resolved, v)) if resolved == key => v,
+                Some((resolved, v)) => {
+                    // Model asked for a short/alias key; surface the real name
+                    // so the next turn can use the exact key after compact.
+                    format!("{v}\n(key: {resolved})")
+                }
+                None => {
+                    let near = memory_near_keys(agent_id, &key);
+                    let all = memory_list(agent_id);
+                    if all.is_empty() {
+                        format!("(no memory for key '{key}' — store is empty; use memory_add first)")
+                    } else if !near.is_empty() {
+                        format!(
+                            "(no memory for key '{key}'; closest: {} — try memory_get with one of those, or memory_search)",
+                            near.join(", ")
+                        )
+                    } else {
+                        format!(
+                            "(no memory for key '{key}'; known keys: {} — or memory_search / memory_list)",
+                            all.iter().take(12).cloned().collect::<Vec<_>>().join(", ")
+                        )
+                    }
+                }
             }
         }
         "memory_list" => {
@@ -358,5 +494,33 @@ mod tests {
         let _ = hits2;
         let tool = run_memory_tool("memory_search", id, r#"{"query":"terracotta"}"#);
         assert!(tool.contains("colour"), "tool={tool}");
+    }
+
+    /// Post-compact recall: store under `user.name`, get with short `name`.
+    #[test_case]
+    fn memory_resolve_suffix_and_digest() {
+        let id = 66_u64;
+        assert!(memory_add(id, "user.name", "Vinoth").is_ok());
+        assert!(memory_add(id, "project", "chitti").is_ok());
+        // Exact still works.
+        assert_eq!(
+            memory_resolve(id, "user.name").map(|(_, v)| v).as_deref(),
+            Some("Vinoth")
+        );
+        // Short key resolves uniquely via dotted suffix.
+        let r = memory_resolve(id, "name").expect("suffix resolve");
+        assert_eq!(r.0, "user.name");
+        assert_eq!(r.1, "Vinoth");
+        // Tool surface returns the value (+ resolved key annotation).
+        let out = run_memory_tool("memory_get", id, r#"{"key":"name"}"#);
+        assert!(out.contains("Vinoth"), "out={out}");
+        assert!(out.contains("user.name"), "should cite resolved key: {out}");
+        // Digest lists both facts for system-prompt injection.
+        let dig = memory_kv_digest(id).expect("digest");
+        assert!(dig.contains("user.name") && dig.contains("Vinoth"), "dig={dig}");
+        assert!(dig.contains("project") && dig.contains("chitti"), "dig={dig}");
+        // Miss with near keys.
+        let miss = run_memory_tool("memory_get", id, r#"{"key":"username"}"#);
+        assert!(miss.contains("no memory") || miss.contains("closest") || miss.contains("known"), "miss={miss}");
     }
 }

@@ -49,10 +49,19 @@ pub fn parse_config_json(bytes: &[u8]) -> Option<(bool, Option<RemoteConfig>)> {
 }
 
 /// Launcher boot seed (`opt/chitti/model` fw_cfg), if the host published one.
-/// Present on aarch64 QEMU when `CHITTI_REMOTE_URL` is set (`make run`).
+///
+/// **Only on the QEMU `-kernel` path** (`boot_x1() == 0`). UEFI/stub boots
+/// (VirtualBox, real hardware) have a boot-info block and **no** fw_cfg — we
+/// must not probe it at all. A prior infinite DMA spin on missing fw_cfg wedged
+/// the shell before the input loop (host `VERR_PDM_NO_QUEUE_ITEMS`). Even with
+/// a spin bound, probing on every VBox boot is useless work.
 fn boot_seed() -> Option<(bool, Option<RemoteConfig>)> {
     #[cfg(all(target_arch = "aarch64", not(test)))]
     {
+        // boot-info present ⇒ UEFI/stub (VBox / real HW), not QEMU -kernel.
+        if crate::arch::aarch64::boot::boot_x1() != 0 {
+            return None;
+        }
         let bytes = crate::arch::aarch64::ramfb::read_opt_file(b"opt/chitti/model")?;
         return parse_config_json(&bytes);
     }
@@ -72,6 +81,7 @@ pub fn load() -> (bool, Option<RemoteConfig>) {
     if let Some((on, cfg)) = boot_seed() {
         if on {
             save(true, cfg.as_ref());
+            crate::ktrace::log("model", "remote seed from fw_cfg applied");
         }
         return (on, cfg);
     }
@@ -189,6 +199,19 @@ impl RemoteChat {
         }
     }
 
+    /// Keep the leading system message current (SOUL, tool list, **memory
+    /// digest**). Remote history is re-sent whole each turn, so refreshing
+    /// here makes `memory_add` facts visible without requiring `/compact`.
+    fn refresh_system(&mut self) {
+        let prompt = super::agent_system_prompt();
+        match self.messages.first_mut() {
+            Some((role, body)) if role == "system" && !body.starts_with("Conversation so far") => {
+                *body = prompt;
+            }
+            _ => self.messages.insert(0, ("system".to_string(), prompt)),
+        }
+    }
+
     /// One chat turn: the same bounded ReAct loop as the local
     /// `ChatSession::turn`, with generation done by the hosted model. Records
     /// into `session` so `/session save|resume` works for remote chat too.
@@ -197,9 +220,7 @@ impl RemoteChat {
         use crate::agent::orchestrator::now;
         use crate::agent::types::{Provenance, Role, ToolCall};
         const MAX_TOOL_ITERS: usize = 4;
-        if self.messages.is_empty() {
-            self.messages.push(("system".to_string(), super::agent_system_prompt()));
-        }
+        self.refresh_system();
         self.messages.push(("user".to_string(), msg.to_string()));
         session.push_message(Role::User, msg.to_string(), Provenance::UserTyped, now());
         session.budget.turns_used = session.budget.turns_used.saturating_add(1);
