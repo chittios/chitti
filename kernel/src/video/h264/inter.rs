@@ -25,6 +25,30 @@ fn tap(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
     a - 5 * b + 20 * c + 20 * d - 5 * e + f
 }
 
+/// Copy a contiguous u8 row (SIMD when available).
+#[inline]
+fn copy_row_u8(src: &[u8], dst: &mut [u8]) {
+    let n = src.len().min(dst.len());
+    let mut i = 0;
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is baseline on aarch64-chitti; pointers are from slices.
+    unsafe {
+        while i + 16 <= n {
+            let v = core::arch::aarch64::vld1q_u8(src.as_ptr().add(i));
+            core::arch::aarch64::vst1q_u8(dst.as_mut_ptr().add(i), v);
+            i += 16;
+        }
+        while i + 8 <= n {
+            let v = core::arch::aarch64::vld1_u8(src.as_ptr().add(i));
+            core::arch::aarch64::vst1_u8(dst.as_mut_ptr().add(i), v);
+            i += 8;
+        }
+    }
+    if i < n {
+        dst[i..n].copy_from_slice(&src[i..n]);
+    }
+}
+
 /// Full-pel copy from reference plane into a destination plane (u8→u8).
 /// Hot path for P_Skip / integer-MV partitions — no i32 bounce buffer.
 /// `mv_shift`: 2 for luma (quarter-pel MV → full-pel), 3 for chroma (→ eighth).
@@ -58,7 +82,8 @@ pub fn copy_fullpel_u8(
         for j in 0..bh {
             let src = (oy + j) * rw + ox;
             let dst_i = (dy0 + j) * dst_stride + dx0;
-            dst[dst_i..dst_i + bw].copy_from_slice(&refp[src..src + bw]);
+            // Wide copy: NEON 16 B at a time when aligned enough for the path.
+            copy_row_u8(&refp[src..src + bw], &mut dst[dst_i..dst_i + bw]);
         }
         return;
     }

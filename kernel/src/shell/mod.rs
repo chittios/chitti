@@ -4120,6 +4120,8 @@ fn ui_tick() {
         if t.left && t.moved {
             if DIVIDER_DRAG.load(Ordering::Relaxed) {
                 crate::framebuffer::set_divider_x(t.x);
+                // Live-resize: re-letterbox video/image into the new action pane.
+                repaint_active_tab();
             } else {
                 crate::framebuffer::chat_sel_drag(t.x, t.y);
             }
@@ -4127,6 +4129,7 @@ fn ui_tick() {
         if t.released {
             if DIVIDER_DRAG.swap(false, Ordering::Relaxed) {
                 save_panes_config();
+                repaint_active_tab();
             } else if let Some(text) = crate::framebuffer::chat_sel_end() {
                 crate::clipboard::set(text, false);
             }
@@ -4484,6 +4487,9 @@ fn fb_toggle_fullscreen() {
     #[cfg(not(test))]
     {
         let st = crate::framebuffer::toggle_fullscreen();
+        // Geometry changed — re-present the active tab (video must re-letterbox
+        // into the new pane size; without this the last small frame stays put).
+        repaint_active_tab();
         serial_println!(
             "pane> {}",
             match st {
@@ -4540,6 +4546,7 @@ fn run_pane(arg: &str) {
             if let Some(p) = it.next().and_then(|s| s.parse::<u64>().ok()) {
                 crate::framebuffer::set_split_pct(p);
                 save_panes_config();
+                repaint_active_tab();
                 serial_println!("pane> chat width {}%", crate::framebuffer::split_pct());
             } else {
                 serial_println!("usage: /pane split <10-90>");
@@ -4548,6 +4555,7 @@ fn run_pane(arg: &str) {
         Some("reset") => {
             crate::framebuffer::set_split_pct(crate::framebuffer::default_chat_pct());
             save_panes_config();
+            repaint_active_tab();
             serial_println!("pane> reset");
         }
         Some(other) => serial_println!("pane> unknown '{}' (full | split <pct> | reset)", other),
@@ -4663,7 +4671,7 @@ fn play_video(path: &str) {
             // Stream like VLC: demux + first frame only — no full-clip RGB cache.
             dec.seek_decode(0);
             serial_println!(
-                "open>   {}x{}  {} frame(s)  decoder={}  ready in {} ms (streaming) — Ctrl+Tab focus, space=pause; Ctrl+C/close stops",
+                "open>   {}x{}  {} frame(s)  decoder={}  ready in {} ms (streaming) — Ctrl+Tab focus, space=pause",
                 dec.src_w,
                 dec.src_h,
                 frame_count,

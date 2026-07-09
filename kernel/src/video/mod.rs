@@ -19,6 +19,7 @@ pub mod bits;
 pub mod h264;
 pub mod mkv;
 pub mod mp4;
+pub mod mt;
 pub mod yuv;
 
 use alloc::string::String;
@@ -153,42 +154,35 @@ fn fit_display(w: usize, h: usize, max_edge: usize) -> (usize, usize) {
 
 /// Convert a decoded YUV frame to RGB for presentation. Large sources are
 /// nearest-neighbour downscaled to `max_edge`. Uses **NEON SIMD** via [`yuv`];
-/// on aarch64 with online APs, **multi-core row split**.
+/// on aarch64 with online APs, **multi-core row split** ([`mt`]).
 fn frame_from_yuv(df: &h264::decoder::DecodedFrame, pts_ms: u64, max_edge: usize) -> Frame {
     let (sw, sh, scw) = (df.w, df.h, df.w / 2);
     let (dw, dh) = fit_display(sw, sh, max_edge);
     let mut pixels = alloc::vec![0u32; dw * dh];
-    #[cfg(all(target_arch = "aarch64", not(test)))]
-    {
-        if crate::arch::aarch64::smp::online_cpus() > 1 && dh >= 32 {
-            let mut ctx = yuv::ConvertCtx {
-                y: df.y.as_ptr(),
-                cb: df.cb.as_ptr(),
-                cr: df.cr.as_ptr(),
-                out: pixels.as_mut_ptr(),
-                y_len: df.y.len(),
-                cb_len: df.cb.len(),
-                cr_len: df.cr.len(),
-                out_len: pixels.len(),
-                sw,
-                sh,
-                scw,
-                dw,
-                dh,
-            };
-            // SAFETY: ctx lives for parallel_for; workers write disjoint rows.
-            unsafe {
-                crate::arch::aarch64::smp::parallel_for(
-                    dh,
-                    16,
-                    yuv::convert_worker,
-                    &mut ctx as *mut yuv::ConvertCtx as *mut u8,
-                );
-            }
-            return Frame { w: dw, h: dh, pixels, pts_ms };
-        }
+    let mut ctx = yuv::ConvertCtx {
+        y: df.y.as_ptr(),
+        cb: df.cb.as_ptr(),
+        cr: df.cr.as_ptr(),
+        out: pixels.as_mut_ptr(),
+        y_len: df.y.len(),
+        cb_len: df.cb.len(),
+        cr_len: df.cr.len(),
+        out_len: pixels.len(),
+        sw,
+        sh,
+        scw,
+        dw,
+        dh,
+    };
+    // SAFETY: ctx lives for the call; workers write disjoint rows.
+    unsafe {
+        mt::parallel_rows(
+            dh,
+            8,
+            yuv::convert_worker,
+            &mut ctx as *mut yuv::ConvertCtx as *mut u8,
+        );
     }
-    yuv::convert_display(&df.y, &df.cb, &df.cr, sw, sh, scw, dw, dh, &mut pixels);
     Frame { w: dw, h: dh, pixels, pts_ms }
 }
 

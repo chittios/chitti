@@ -913,6 +913,21 @@ impl Screen {
     }
 
     fn fill_rect(&self, x: u64, y: u64, w: u64, h: u64, c: Rgb) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        // Fast path: pack once and blast whole scanlines (critical for video
+        // letterbox / status bars — per-pixel put_pixel was multi-ms flashes).
+        let packed = ((c.0 as u32) << 16) | ((c.1 as u32) << 8) | c.2 as u32;
+        if self.bpp_bytes == 4 && self.r_shift == 16 && self.g_shift == 8 && self.b_shift == 0 {
+            let mut row = alloc::vec![packed; w as usize];
+            for dy in 0..h {
+                self.blit_rgb32_row(x, y + dy, &row);
+            }
+            // silence unused mut if n=0 — row is mut for potential reuse
+            let _ = &mut row;
+            return;
+        }
         for dy in 0..h {
             for dx in 0..w {
                 self.put_pixel(x + dx, y + dy, c);
@@ -2176,14 +2191,14 @@ pub fn draw_video_status(
         let cw = sc.cw();
         let (px, py) = (sc.logs.ix, sc.logs.iy);
         let (pw, ph) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
-        // Draw on the pane background (the reserved strip is left clean by
-        // `present_surface_reserve`), repainting text *in place* padded to the
-        // full width — never a per-frame full-strip clear, so no flicker on the
-        // single-buffered framebuffer (same discipline as `draw_audio`).
+        // Reserved HUD strip (below the video frame). Fill the whole strip once
+        // so time/fps string length changes never leave glyph trails; the strip
+        // is small (~4 lines) so this is cheap and does not flash the picture.
         let bg = sc.logs.bg;
         let barh = ch * 4 + ch / 2;
         let by = py + ph.saturating_sub(barh);
-        sc.fill_rect(px, by, pw, 1, sc.theme.accent); // top hairline (1px, no flicker)
+        sc.fill_rect(px, by, pw, barh, bg);
+        sc.fill_rect(px, by, pw, 1, sc.theme.accent); // top hairline
         // Usable text width in whole glyph cells, with a one-cell left margin.
         let cols = (pw / cw).saturating_sub(2).max(4) as usize;
         let fit = |s: &str| crate::textsel::fit_width(s, cols);
@@ -3073,25 +3088,45 @@ pub fn present_surface_reserve(id: u32, sw: usize, sh: usize, buf: &[u32], reser
             sc.cursor_overlay();
             return;
         }
-        sc.fill_rect(px, py, pw, ph, sc.logs.bg);
-        // Letterbox the source into the pane (upscale or downscale).
-        let src_a = sw as u64 * ph;
-        let dst_a = sh as u64 * pw;
-        let (dw, dh) = if sw as u64 <= pw && sh as u64 <= ph {
-            // Integer upscale when the source fits.
-            let scale = core::cmp::max(1, core::cmp::min(pw / sw as u64, ph / sh as u64));
-            (sw as u64 * scale, sh as u64 * scale)
-        } else if src_a > dst_a {
-            let dw = pw;
-            let dh = (sh as u64 * pw / sw as u64).max(1).min(ph);
-            (dw, dh)
-        } else {
-            let dh = ph;
-            let dw = (sw as u64 * ph / sh as u64).max(1).min(pw);
-            (dw, dh)
+        // Aspect-fit ("contain") into the pane: scale up *or* down so the
+        // picture uses as much of the pane as possible without cropping.
+        // (Integer-only upscale left large empty bars in fullscreen when the
+        // source was smaller than the pane — e.g. 640×360 in a full-HD action
+        // pane.)
+        let (dw, dh) = {
+            // Compare sw/pw vs sh/ph via cross-multiply to pick the limiting edge.
+            let fit_w = pw;
+            let fit_h = (sh as u64).saturating_mul(pw).saturating_div(sw as u64).max(1);
+            if fit_h <= ph {
+                (fit_w, fit_h)
+            } else {
+                let fit_h = ph;
+                let fit_w = (sw as u64).saturating_mul(ph).saturating_div(sh as u64).max(1);
+                (fit_w.min(pw), fit_h)
+            }
         };
         let ox = px + (pw.saturating_sub(dw)) / 2;
         let oy = py + (ph.saturating_sub(dh)) / 2;
+        // **No full-pane clear.** Clearing the whole surface with fill_rect
+        // (then painting the frame) flashed background on the single-buffered
+        // FB for tens of ms every present — visible as a once-per-second
+        // (or every-frame) flicker. Only paint letterbox *margins*; the frame
+        // blit overwrites the content rectangle in place.
+        let bg = sc.logs.bg;
+        if oy > py {
+            sc.fill_rect(px, py, pw, oy - py, bg); // top bar
+        }
+        let bottom = oy + dh;
+        if bottom < py + ph {
+            sc.fill_rect(px, bottom, pw, (py + ph) - bottom, bg); // bottom bar
+        }
+        if ox > px {
+            sc.fill_rect(px, oy, ox - px, dh, bg); // left bar
+        }
+        let right = ox + dw;
+        if right < px + pw {
+            sc.fill_rect(right, oy, (px + pw) - right, dh, bg); // right bar
+        }
         // Build one destination row at a time and blit — sequential stores beat
         // hundreds of thousands of put_pixel calls for video.
         let mut row = alloc::vec![0u32; dw as usize];
