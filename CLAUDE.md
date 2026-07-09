@@ -506,7 +506,7 @@ the next command still runs) and a unit test on the pure poll logic
   frame(s), ready in …") + transport controls; it auto-skips where x264 is absent.
 - **Agent chat protocol** — the shell chat is an agentic ReAct loop on the
   Qwen3.5 template: the prompt advertises a small CORE tool set plus
-  `search_tools` (Claude-Code-style discovery over the registry — manifest
+  `search_tools` (progressive discovery over the registry — manifest
   toolset ∩ `tools::registry`; never hardcode a tool list in a prompt),
   `<tool_call>` JSON in, `<tool_response>` back, thinking off by default
   (`/think`), `/mode manual|auto|bypass` gates agent tool calls through the

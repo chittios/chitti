@@ -122,7 +122,8 @@ def _handle(conn):
                 conn.sendall(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
             else:
                 if rpc_method == "initialize":
-                    result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                    result = {"protocolVersion": "2025-06-18",
+                              "capabilities": {"tools": {}, "resources": {}},
                               "serverInfo": {"name": "e2e-mcp", "version": "1.0"}}
                 elif rpc_method == "tools/list":
                     result = {"tools": [{"name": "echo",
@@ -134,6 +135,20 @@ def _handle(conn):
                     args = (req_obj.get("params") or {}).get("arguments") or {}
                     text = args.get("text", args.get("input", ""))
                     result = {"content": [{"type": "text", "text": "echo: " + str(text)}]}
+                elif rpc_method == "resources/list":
+                    result = {"resources": [{
+                        "uri": "file:///e2e/notes.txt",
+                        "name": "notes",
+                        "description": "e2e demo resource",
+                        "mimeType": "text/plain",
+                    }]}
+                elif rpc_method == "resources/read":
+                    uri = (req_obj.get("params") or {}).get("uri", "")
+                    result = {"contents": [{
+                        "uri": uri,
+                        "mimeType": "text/plain",
+                        "text": "resource-body: e2e-notes-42",
+                    }]}
                 else:
                     result = {}
                 out = json.dumps({"jsonrpc": "2.0", "id": rpc_id, "result": result}).encode()

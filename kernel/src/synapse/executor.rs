@@ -262,22 +262,21 @@ fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> Str
             }
         }
         registry::MEM_FS_EDIT => {
+            // Safer edit: refuse empty `old` and refuse multi-match unless the
+            // tools Router rewrote to a single unique occurrence. Default path:
+            // unique match only.
             let path = arg_str(args, 0);
             let old = arg_str(args, 1);
             let new = arg_str(args, 2);
             match fs::read(path) {
                 Some(bytes) => {
                     let content = String::from_utf8_lossy(&bytes).into_owned();
-                    match content.find(old) {
-                        Some(at) => {
-                            let mut edited = String::with_capacity(content.len() - old.len() + new.len());
-                            edited.push_str(&content[..at]);
-                            edited.push_str(new);
-                            edited.push_str(&content[at + old.len()..]);
+                    match crate::tools::pathutil::safe_edit(&content, old, new, false) {
+                        Ok(edited) => {
                             fs::write(path, edited.as_bytes());
                             format!("ok:edited {path}")
                         }
-                        None => format!("error:not_found_substring:{path}"),
+                        Err(e) => format!("error:{e}:{path}"),
                     }
                 }
                 None => format!("error:not_found:{path}"),

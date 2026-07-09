@@ -1,7 +1,7 @@
-//! **Agent** — the Claude-Code-style agent layer (`CHITTI_AGENTIC_HANDOFF.md`).
-//! Replaces the flat `persona` model with an orchestrator that runs a tool-use
-//! loop over a first-class [`tool`](crate::tools) layer, dispatches isolated
-//! sub-agents, and persists to first-class [`session`](crate::session)s.
+//! **Agent** — the agent layer (`CHITTI_AGENTIC_HANDOFF.md`). Replaces the flat
+//! `persona` model with an orchestrator that runs a tool-use loop over a
+//! first-class [`tool`](crate::tools) layer, dispatches isolated sub-agents, and
+//! persists to first-class [`session`](crate::session)s.
 //!
 //! * [`types`] — the shared contract (`CHITTI_SCHEMAS.md`): `AgentManifest`,
 //!   `Session`, `SkillManifest`, and the Part-0 primitives.

@@ -1,7 +1,6 @@
-//! The **agentic loop** (`CHITTI_AGENTIC_HANDOFF.md` Phase A): the Claude-Code
-//! control cycle `model → (tool_calls) → Synapse validate+execute →
-//! tool_results → model`, repeated until the agent emits a final result or a
-//! budget stops it.
+//! The **agentic loop** (`CHITTI_AGENTIC_HANDOFF.md` Phase A): the control
+//! cycle `model → (tool_calls) → Synapse validate+execute → tool_results →
+//! model`, repeated until the agent emits a final result or a budget stops it.
 //!
 //! Two seams keep the loop testable and the real model a drop-in:
 //!
@@ -163,9 +162,24 @@ pub fn run_with_cancel(
                 // Record the assistant's tool-call turn, then execute each call
                 // and append its result. Tool-call budget is checked per call.
                 session.push_assistant_tool_calls(String::new(), calls.clone(), now());
+                // Concurrent-safe (read-only) batches: still run on one core
+                // (cooperative scheduler) but skip intermediate cancel/budget
+                // checks between pure reads — one compact after the batch.
+                let all_readonly = !calls.is_empty()
+                    && calls
+                        .iter()
+                        .all(|c| crate::tools::permissions::is_readonly_tool(&c.tool));
+                if all_readonly && calls.len() > 1 {
+                    crate::ktrace::log_fmt(format_args!(
+                        "agent.loop: concurrent-safe batch of {} read-only tools",
+                        calls.len()
+                    ));
+                }
                 for call in &calls {
-                    if cancel() {
-                        return cancelled(session, &now);
+                    if !all_readonly {
+                        if cancel() {
+                            return cancelled(session, &now);
+                        }
                     }
                     if session.budget.tool_calls_used >= limits.max_tool_calls {
                         let answer = "stopped: tool-call budget exhausted".to_string();
@@ -184,6 +198,9 @@ pub fn run_with_cancel(
                     // so a stable `error:` prefix is the contract.
                     let text = format_tool_result(outcome.is_error, outcome.result);
                     session.push_tool_result(call.call_id, text, outcome.provenance, now());
+                }
+                if all_readonly && cancel() {
+                    return cancelled(session, &now);
                 }
                 // Keep the context within budget: compact older turns once the
                 // live-token count approaches the window (Phase D).

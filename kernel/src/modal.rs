@@ -174,3 +174,177 @@ pub fn confirm(_title: &str, _msg: &str) -> bool {
 pub fn input(_title: &str, _prompt: &str, _masked: bool) -> String {
     String::new()
 }
+
+/// Open the searchable **Commands** browser (the `/help` modal). Returns the
+/// selected command **name** (without `/`) on Enter, or `None` if dismissed.
+/// Typing filters the list; ↑/↓ move the highlight (skipping category headers);
+/// PgUp/PgDn page the list; Esc / Ctrl+C / `[x]` cancel.
+#[cfg(not(test))]
+pub fn browse_commands() -> Option<String> {
+    use crate::framebuffer::{self, CommandsRow, ModalHit};
+    use crate::shell::catalog::{self, Row};
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    const VIEW: usize = 12;
+    let mut query = String::new();
+    let mut rows = catalog::filter_rows("");
+    let mut sel = catalog::first_sel(&rows);
+    let mut scroll = 0usize;
+    let mut caret_on = true;
+    let mut last_blink = crate::arch::now_ms();
+
+    fn paint(query: &str, rows: &[Row], sel: usize, scroll: usize, caret_on: bool) {
+        let scroll = scroll.min(rows.len());
+        let end = (scroll + VIEW).min(rows.len());
+        let slice = &rows[scroll..end];
+        let mut slash_buf: Vec<String> = Vec::new();
+        for r in slice {
+            if let Row::Item { name, .. } = r {
+                slash_buf.push(alloc::format!("/{name}"));
+            }
+        }
+        let mut si = 0usize;
+        let mut view: Vec<CommandsRow<'_>> = Vec::new();
+        for (i, r) in slice.iter().enumerate() {
+            let abs = scroll + i;
+            match r {
+                Row::Header(h) => view.push(CommandsRow::Header(h.as_str())),
+                Row::Item { title, shortcut, .. } => {
+                    let slash = slash_buf[si].as_str();
+                    si += 1;
+                    view.push(CommandsRow::Item {
+                        title: title.as_str(),
+                        slash,
+                        shortcut: shortcut.as_str(),
+                        selected: abs == sel,
+                    });
+                }
+            }
+        }
+        framebuffer::draw_commands_browser(query, &view, scroll, rows.len(), caret_on);
+    }
+
+    fn refilter(query: &str) -> (Vec<Row>, usize, usize) {
+        let rows = catalog::filter_rows(query);
+        let sel = catalog::first_sel(&rows);
+        let scroll = catalog::clamp_scroll(sel, 0, VIEW, rows.len());
+        (rows, sel, scroll)
+    }
+
+    paint(&query, &rows, sel, scroll, caret_on);
+
+    loop {
+        if let Some(b) = crate::console::read_byte() {
+            match b {
+                b'\r' | b'\n' => {
+                    if let Some(name) = catalog::name_at(&rows, sel) {
+                        let n = String::from(name);
+                        crate::framebuffer::modal_dismiss();
+                        return Some(n);
+                    }
+                }
+                0x1b => match esc_seq_param() {
+                    // ↑ / ↓
+                    Some((0, b'A')) => {
+                        sel = catalog::move_sel(&rows, sel, -1);
+                        scroll = catalog::clamp_scroll(sel, scroll, VIEW, rows.len());
+                        paint(&query, &rows, sel, scroll, caret_on);
+                    }
+                    Some((0, b'B')) => {
+                        sel = catalog::move_sel(&rows, sel, 1);
+                        scroll = catalog::clamp_scroll(sel, scroll, VIEW, rows.len());
+                        paint(&query, &rows, sel, scroll, caret_on);
+                    }
+                    // PgUp / PgDn
+                    Some((5, b'~')) => {
+                        sel = catalog::move_sel(&rows, sel, -(VIEW as i32));
+                        scroll = catalog::clamp_scroll(sel, scroll, VIEW, rows.len());
+                        paint(&query, &rows, sel, scroll, caret_on);
+                    }
+                    Some((6, b'~')) => {
+                        sel = catalog::move_sel(&rows, sel, VIEW as i32);
+                        scroll = catalog::clamp_scroll(sel, scroll, VIEW, rows.len());
+                        paint(&query, &rows, sel, scroll, caret_on);
+                    }
+                    Some(_) => {}
+                    None => {
+                        crate::framebuffer::modal_dismiss();
+                        return None;
+                    }
+                },
+                0x03 => {
+                    crate::framebuffer::modal_dismiss();
+                    return None;
+                }
+                0x7f | 0x08 => {
+                    query.pop();
+                    let r = refilter(&query);
+                    rows = r.0;
+                    sel = r.1;
+                    scroll = r.2;
+                    paint(&query, &rows, sel, scroll, caret_on);
+                }
+                0x15 => {
+                    // Ctrl+U: clear search
+                    query.clear();
+                    let r = refilter("");
+                    rows = r.0;
+                    sel = r.1;
+                    scroll = r.2;
+                    paint(&query, &rows, sel, scroll, caret_on);
+                }
+                0x20..=0x7e => {
+                    query.push(b as char);
+                    let r = refilter(&query);
+                    rows = r.0;
+                    sel = r.1;
+                    scroll = r.2;
+                    paint(&query, &rows, sel, scroll, caret_on);
+                }
+                _ => {}
+            }
+        }
+        let t = crate::mouse::tick();
+        if t.moved {
+            framebuffer::cursor_move(t.x, t.y);
+        }
+        if t.pressed && framebuffer::modal_hit(t.x, t.y) == ModalHit::Close {
+            crate::framebuffer::modal_dismiss();
+            return None;
+        }
+        let now = crate::arch::now_ms();
+        if now.saturating_sub(last_blink) >= 500 {
+            last_blink = now;
+            caret_on = !caret_on;
+            paint(&query, &rows, sel, scroll, caret_on);
+        }
+        crate::shell::status_tick();
+        crate::sched::yield_now();
+    }
+}
+
+/// Like [`esc_seq`] but also returns the numeric CSI parameter (for PgUp=5,
+/// PgDn=6). Bare Esc → `None`.
+#[cfg(not(test))]
+fn esc_seq_param() -> Option<(u64, u8)> {
+    let next = seq_byte()?;
+    if next != b'[' {
+        return None;
+    }
+    let mut param: u64 = 0;
+    loop {
+        match seq_byte() {
+            Some(b @ 0x40..=0x7e) => return Some((param, b)),
+            Some(d @ b'0'..=b'9') => param = param.saturating_mul(10) + (d - b'0') as u64,
+            Some(_) => {}
+            None => return None,
+        }
+    }
+}
+
+/// Test stub: no framebuffer browser.
+#[cfg(test)]
+pub fn browse_commands() -> Option<String> {
+    None
+}

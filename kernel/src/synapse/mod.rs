@@ -28,6 +28,7 @@ pub mod fs;
 pub mod grammar;
 pub mod registry;
 pub mod ui;
+pub mod vpath;
 
 pub use executor::{execute, execute_current, execute_with_justification, Invocation};
 

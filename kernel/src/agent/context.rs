@@ -17,7 +17,9 @@ use alloc::vec::Vec;
 
 /// Keep the system prompt (message 0) and this many most-recent messages
 /// resident; everything older is eligible for compaction.
-const KEEP_RECENT: usize = 3;
+/// Tuned for small on-device models: keep less recent history live so prefill
+/// stays under the compact_threshold sooner.
+const KEEP_RECENT: usize = 2;
 
 /// Recompute `live_tokens` from what is actually resident: resident message
 /// tokens + compaction-summary tokens.

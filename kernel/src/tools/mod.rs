@@ -16,10 +16,13 @@
 //!   register additional toolsets (used by Phase F skill-bundled tools).
 
 pub mod dispatch;
+pub mod pathutil;
+pub mod permissions;
 pub mod provider;
 pub mod registry;
 
 pub use dispatch::Router;
+pub use permissions::{check as permission_check, Decision as PermissionDecision};
 pub use registry::{ToolBinding, ToolDef};
 
 #[cfg(test)]
@@ -30,6 +33,7 @@ mod tests {
     use crate::agent::types::TodoStatus;
     use crate::agent::{manifest, orchestrator};
     use crate::synapse::audit;
+    use alloc::string::String;
 
     /// (a) A malformed call (missing a required arg) is refused before any
     /// effect — the Synapse audit log does not grow.
@@ -163,6 +167,200 @@ mod tests {
         // Missing required `key`.
         let no_key = router.call(&mut orch.session, orch.caller, &tool("memory_get", args(&[])));
         assert!(no_key.is_error, "missing key must error: {}", no_key.result);
+    }
+
+    /// Glob / grep over the store, scoped by capabilities; line-range read;
+    /// safer edit refuses multi-match without replace_all.
+    #[test_case]
+    fn glob_grep_read_range_and_safe_edit() {
+        let mut orch = orchestrator::Orchestrator::spawn(manifest::orchestrator_manifest(), 40);
+        let mut router = Router::new();
+        let _ = router.call(
+            &mut orch.session,
+            orch.caller,
+            &tool("write", args(&[("path", "/agent/1/note.md"), ("content", "alpha\nbeta\nalpha again")])),
+        );
+        let _ = router.call(
+            &mut orch.session,
+            orch.caller,
+            &tool("write", args(&[("path", "/agent/1/other.txt"), ("content", "zzz")])),
+        );
+        let g = router.call(
+            &mut orch.session,
+            orch.caller,
+            &tool("glob", args(&[("pattern", "*.md")])),
+        );
+        assert!(!g.is_error, "glob: {}", g.result);
+        assert!(g.result.contains("note.md"), "glob hits: {}", g.result);
+
+        let gr = router.call(
+            &mut orch.session,
+            orch.caller,
+            &tool("grep", args(&[("query", "beta")])),
+        );
+        assert!(!gr.is_error, "grep: {}", gr.result);
+        assert!(gr.result.contains("beta"), "grep: {}", gr.result);
+
+        // Line-range read: only line 2.
+        let r = router.call(
+            &mut orch.session,
+            orch.caller,
+            &tool(
+                "read",
+                r#"{"path":"/agent/1/note.md","start_line":2,"end_line":2}"#.into(),
+            ),
+        );
+        assert!(!r.is_error, "read range: {}", r.result);
+        assert!(r.result.contains("beta"), "expected line 2, got {}", r.result);
+        assert!(!r.result.contains("alpha again"), "should not include line 3");
+
+        // Multi-match edit without replace_all → error.
+        let bad = router.call(
+            &mut orch.session,
+            orch.caller,
+            &tool("edit", args(&[("path", "/agent/1/note.md"), ("old", "alpha"), ("new", "ALPHA")])),
+        );
+        assert!(bad.is_error || bad.result.contains("ambiguous") || bad.result.contains("error:"), "got {}", bad.result);
+
+        // Unique edit works.
+        let ok = router.call(
+            &mut orch.session,
+            orch.caller,
+            &tool("edit", args(&[("path", "/agent/1/note.md"), ("old", "beta"), ("new", "BETA")])),
+        );
+        assert!(!ok.is_error, "unique edit: {}", ok.result);
+        let body = crate::synapse::fs::read("/agent/1/note.md").unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("BETA"));
+
+        // Home-sandbox agent cannot write outside its folder.
+        let home_caps = crate::skills::install::with_home_sandbox(
+            &[],
+            crate::agent::types::AgentId(9001),
+            crate::agent::types::AgentKind::Subagent,
+        );
+        let task = crate::sched::spawn_parked("cap-deny-test");
+        crate::agent::manifest::grant_to_task(task, &home_caps);
+        let mut sandboxed = orchestrator::Orchestrator::spawn(manifest::reader_subagent_manifest(), 41);
+        // Point session agent id at the sandboxed home so memory paths align.
+        sandboxed.session.agent.manifest_id = crate::agent::types::AgentId(9001);
+        let denied = router.call(
+            &mut sandboxed.session,
+            task,
+            &tool("write", args(&[("path", "/secret"), ("content", "nope")])),
+        );
+        assert!(
+            denied.is_error
+                && (denied.result.contains("denied") || denied.result.contains("scope") || denied.result.contains("capability")),
+            "outside-home write must fail: {}",
+            denied.result
+        );
+        assert!(!crate::synapse::fs::exists("/secret"));
+        let _ = crate::sched::kill(task);
+    }
+
+    /// CORE toolset used by the shell prompt includes coding + memory tools.
+    #[test_case]
+    fn core_tools_include_coding_and_memory() {
+        for name in ["read", "write", "edit", "glob", "grep", "todo_write", "memory_search", "skill"] {
+            assert!(
+                crate::shell::CORE_TOOLS.contains(&name),
+                "CORE_TOOLS missing {name}"
+            );
+            assert!(registry::get(name).is_some(), "registry missing {name}");
+        }
+    }
+
+    /// Plan mode + permissions patterns gate tools before the Router.
+    #[test_case]
+    fn plan_mode_and_permissions_gate() {
+        use crate::tools::permissions::{self, Decision};
+        assert!(permissions::is_readonly_tool("read"));
+        assert!(!permissions::is_readonly_tool("write"));
+        // Seed deny rules and check.
+        permissions::ensure_default();
+        permissions::load();
+        // Default deny includes install.
+        assert_eq!(permissions::check("install"), Some(Decision::Deny));
+        assert_eq!(permissions::check("read"), Some(Decision::Allow));
+        // explore/plan role presets exist.
+        assert!(crate::agent::manifest::subagent_role("explore").is_some());
+        assert!(crate::agent::manifest::subagent_role("plan").is_some());
+        assert!(crate::agent::manifest::subagent_role("worker").is_some());
+        assert!(crate::agent::manifest::subagent_role("nope").is_none());
+    }
+
+    /// Concurrent-safe batches of read-only tools execute and leave results.
+    #[test_case]
+    fn readonly_tool_batch_via_agent_loop() {
+        use crate::agent::agent_loop::{self, Step, StepSource, StopReason};
+        use crate::agent::rule_steps::{args, tool};
+        use alloc::vec;
+        let mut orch = orchestrator::Orchestrator::spawn(manifest::orchestrator_manifest(), 88);
+        // Seed files.
+        let mut router = Router::new();
+        let _ = router.call(
+            &mut orch.session,
+            orch.caller,
+            &tool("write", args(&[("path", "batch_a"), ("content", "aaa")])),
+        );
+        let _ = router.call(
+            &mut orch.session,
+            orch.caller,
+            &tool("write", args(&[("path", "batch_b"), ("content", "bbb")])),
+        );
+        struct Batch;
+        impl StepSource for Batch {
+            fn next(&mut self, _s: &crate::agent::types::Session) -> Step {
+                static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+                if !ONCE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    Step::Tools(vec![
+                        tool("read", args(&[("path", "batch_a")])),
+                        tool("read", args(&[("path", "batch_b")])),
+                        tool("list", "{}".into()),
+                    ])
+                } else {
+                    Step::Final("done".into())
+                }
+            }
+        }
+        let mut steps = Batch;
+        let r = agent_loop::run(&mut orch.session, &mut steps, &mut router, orch.caller, || 0);
+        assert_eq!(r.stop, StopReason::Final);
+        assert!(r.tool_calls >= 3);
+        let tools: alloc::vec::Vec<_> = orch
+            .session
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::agent::types::Role::Tool)
+            .collect();
+        assert!(tools.len() >= 3, "expected 3 tool results");
+    }
+
+    /// `skill` / `load_skill` invoke progressive L0→L1 (+ optional L2).
+    #[test_case]
+    fn skill_tool_loads_body_and_asset() {
+        crate::skills::index::reset();
+        crate::skills::bundled::install_all();
+        let mut orch = orchestrator::Orchestrator::spawn(manifest::orchestrator_manifest(), 70);
+        let mut router = Router::new(); // default skill path (no hook)
+        let out = router.call(
+            &mut orch.session,
+            orch.caller,
+            &tool("skill", args(&[("name", "remember")])),
+        );
+        assert!(!out.is_error, "skill invoke: {}", out.result);
+        assert!(out.result.contains("memory_add"), "L1 body missing: {}", out.result);
+        assert!(
+            orch.session.messages.iter().any(|m| matches!(m.provenance, crate::agent::types::Provenance::SkillInstalled(_))),
+            "session should carry SkillInstalled provenance"
+        );
+        let l2 = router.call(
+            &mut orch.session,
+            orch.caller,
+            &tool("skill", r#"{"name":"remember","asset":"examples"}"#.into()),
+        );
+        assert!(!l2.is_error, "L2: {}", l2.result);
+        assert!(l2.result.contains("Examples") || l2.result.contains("examples"), "L2 text: {}", l2.result);
     }
 
     /// The system `/command` toolset is registered, visible to the root agent,

@@ -18,9 +18,10 @@ pub fn path(id: u64) -> String {
 }
 
 /// Ensure agent `id`'s home exists: `SOUL.md` (seeded with a default persona on
-/// first boot), `skills/` and `memory/` markers. Idempotent; cheap when present.
-/// A SOUL.md placed by an installed package (see `skills::package::place_agent_home`)
-/// already exists here, so `ensure` never overwrites a packaged persona.
+/// first boot), optional `MEMORY.md` seed, `skills/` and `memory/` markers.
+/// Idempotent; cheap when present. A SOUL.md placed by an installed package
+/// (see `skills::package::place_agent_home`) already exists here, so `ensure`
+/// never overwrites a packaged persona.
 pub fn ensure(id: u64, name: &str) {
     let home = path(id);
     let soul = format!("{}/SOUL.md", home);
@@ -34,6 +35,15 @@ pub fn ensure(id: u64, name: &str) {
         fs::write(&soul, default.as_bytes());
         crate::ktrace::log_fmt(format_args!("agent.home: created {} (SOUL.md + skills/ + memory/)", home));
     }
+    // MEMORY.md is the hierarchical memory entrypoint (project facts). Seed
+    // only if missing — never clobber user notes.
+    let mem_md = format!("{}/MEMORY.md", home);
+    if !fs::exists(&mem_md) {
+        fs::write(
+            &mem_md,
+            b"# Memory\n\nDurable notes for this agent. Keep entries short; detail goes in memory/<key>.\n",
+        );
+    }
     for marker in [format!("{}/skills/.keep", home), format!("{}/memory/.keep", home)] {
         if !fs::exists(&marker) {
             fs::write(&marker, b"");
@@ -44,6 +54,71 @@ pub fn ensure(id: u64, name: &str) {
 /// Agent `id`'s SOUL.md contents, if present (lossy UTF-8).
 pub fn soul(id: u64) -> Option<String> {
     fs::read(&format!("{}/SOUL.md", path(id))).map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Max lines / bytes of MEMORY.md injected into the system prompt.
+pub const MEMORY_MD_MAX_LINES: usize = 200;
+pub const MEMORY_MD_MAX_BYTES: usize = 25_000;
+
+/// Agent `id`'s MEMORY.md body, truncated for prompt injection. `None` if empty
+/// or missing (after strip of the default seed heading-only content is still
+/// returned so the agent knows the file exists).
+pub fn memory_md(id: u64) -> Option<String> {
+    let raw = fs::read(&format!("{}/MEMORY.md", path(id)))?;
+    let text = String::from_utf8_lossy(&raw);
+    if text.trim().is_empty() {
+        return None;
+    }
+    let (body, _) = crate::tools::pathutil::truncate_memory_md(&text, MEMORY_MD_MAX_LINES, MEMORY_MD_MAX_BYTES);
+    Some(body)
+}
+
+/// Append a short line to MEMORY.md (used by humans and the remember path).
+pub fn memory_md_append(id: u64, line: &str) -> Result<(), &'static str> {
+    ensure(id, "agent");
+    let p = format!("{}/MEMORY.md", path(id));
+    let mut cur = fs::read(&p).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    if !cur.ends_with('\n') && !cur.is_empty() {
+        cur.push('\n');
+    }
+    cur.push_str("- ");
+    cur.push_str(line.trim());
+    cur.push('\n');
+    fs::write(&p, cur.as_bytes());
+    Ok(())
+}
+
+/// Search keys + values in durable KV memory for `query` (case-insensitive
+/// substring). Returns `key: snippet` lines.
+pub fn memory_search(id: u64, query: &str) -> Vec<String> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for key in memory_list(id) {
+        let val = memory_get(id, &key).unwrap_or_default();
+        let hay_k = key.to_ascii_lowercase();
+        let hay_v = val.to_ascii_lowercase();
+        if hay_k.contains(&q) || hay_v.contains(&q) {
+            let snip = if val.len() > 120 {
+                alloc::format!("{}…", &val[..120])
+            } else {
+                val
+            };
+            hits.push(format!("{key}: {snip}"));
+        }
+    }
+    // Also scan MEMORY.md lines.
+    if let Some(md) = fs::read(&format!("{}/MEMORY.md", path(id))) {
+        let text = String::from_utf8_lossy(&md);
+        for (i, line) in text.lines().enumerate() {
+            if line.to_ascii_lowercase().contains(&q) {
+                hits.push(format!("MEMORY.md:{}: {line}", i + 1));
+            }
+        }
+    }
+    hits
 }
 
 // --- durable agent memory (tool-call surface) -----------------------------
@@ -111,8 +186,8 @@ pub fn memory_list(id: u64) -> Vec<String> {
     keys
 }
 
-/// Run a `memory_add` / `memory_get` / `memory_list` tool for `agent_id`.
-/// Accepts either:
+/// Run a `memory_add` / `memory_get` / `memory_list` / `memory_search` tool
+/// for `agent_id`. Accepts either:
 /// * chat-flattened args — `key`, `key\\x1fvalue`, or `key value…`
 /// * full JSON object args from the Router — `{"key":"…","value":"…"}`
 ///
@@ -121,6 +196,7 @@ pub fn run_memory_tool(name: &str, agent_id: u64, args: &str) -> String {
     // Prefer JSON fields when the Router (or a well-formed model call) sent them.
     let json_key = crate::session::todo::json_str(args, "key");
     let json_val = crate::session::todo::json_str(args, "value");
+    let json_query = crate::session::todo::json_str(args, "query");
     let (key, value) = if let Some(k) = json_key {
         (k, json_val.unwrap_or_default())
     } else if let Some((k, v)) = args.split_once('\u{1f}') {
@@ -158,6 +234,27 @@ pub fn run_memory_tool(name: &str, agent_id: u64, args: &str) -> String {
                 String::from("(no memories stored)")
             } else {
                 keys.join("\n")
+            }
+        }
+        "memory_search" => {
+            let q = json_query.unwrap_or_else(|| {
+                // Flat form: whole args string is the query.
+                if key.is_empty() {
+                    String::new()
+                } else if value.is_empty() {
+                    key.clone()
+                } else {
+                    alloc::format!("{key} {value}")
+                }
+            });
+            if q.trim().is_empty() {
+                return String::from("error: memory_search needs a query");
+            }
+            let hits = memory_search(agent_id, &q);
+            if hits.is_empty() {
+                String::from("(no memory matches)")
+            } else {
+                hits.join("\n")
             }
         }
         other => format!("error: unknown memory tool '{other}'"),
@@ -244,5 +341,22 @@ mod tests {
         assert_eq!(p, "/agent/7/memory/note");
         assert!(memory_path(7, "a/b").is_none());
         assert!(memory_path(7, "").is_none());
+    }
+
+    #[test_case]
+    fn memory_md_and_search() {
+        let id = 55_u64;
+        ensure(id, "mem_md");
+        assert!(memory_md(id).is_some());
+        assert!(memory_add(id, "project", "chitti-os").is_ok());
+        assert!(memory_add(id, "colour", "terracotta").is_ok());
+        let hits = memory_search(id, "chitti");
+        assert!(hits.iter().any(|h| h.contains("project")), "hits={hits:?}");
+        let hits2 = memory_search(id, "MEMORY");
+        // Default MEMORY.md heading or content should match loosely; at least
+        // search over md lines is exercised without panic.
+        let _ = hits2;
+        let tool = run_memory_tool("memory_search", id, r#"{"query":"terracotta"}"#);
+        assert!(tool.contains("colour"), "tool={tool}");
     }
 }
