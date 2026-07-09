@@ -16,6 +16,7 @@
 //! * [`install`] — the permissioned install flow (Phase G).
 
 pub mod agent_skill;
+pub mod bundled;
 pub mod crypto;
 pub mod index;
 pub mod install;

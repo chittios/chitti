@@ -1,5 +1,5 @@
 //! **MCP client** — Model Context Protocol over HTTP (JSON-RPC 2.0), the
-//! Claude-Code-style `/mcp connect <url>`. A connected server's tools are
+//! `/mcp connect <url>`. A connected server's tools are
 //! registered into the tool registry under namespaced names
 //! (`mcp__<server>__<tool>`) so the shell agent can call them exactly like a
 //! built-in tool; the call is forwarded as a JSON-RPC `tools/call`.
@@ -33,6 +33,15 @@ pub struct McpTool {
     pub input_schema: String,
 }
 
+/// An MCP resource (URI-addressable content).
+#[derive(Clone)]
+pub struct McpResource {
+    pub uri: String,
+    pub name: String,
+    pub description: String,
+    pub mime_type: String,
+}
+
 /// A live MCP server connection.
 struct Server {
     name: String,
@@ -40,6 +49,7 @@ struct Server {
     bearer: Option<String>,
     session: Option<String>,
     tools: Vec<McpTool>,
+    resources: Vec<McpResource>,
 }
 
 static SERVERS: Locked<Vec<Server>> = Locked::new(Vec::new());
@@ -132,6 +142,31 @@ fn parse_tools(result: &Json) -> Vec<McpTool> {
     out
 }
 
+/// Parse a `resources/list` result.
+fn parse_resources(result: &Json) -> Vec<McpResource> {
+    let mut out = Vec::new();
+    let Some(arr) = result.get("resources").and_then(|t| t.as_array()) else {
+        return out;
+    };
+    for r in arr {
+        let Some(uri) = r.get("uri").and_then(|u| u.as_str()) else { continue };
+        let name = r.get("name").and_then(|n| n.as_str()).unwrap_or(uri).to_string();
+        let description = r.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
+        let mime_type = r
+            .get("mimeType")
+            .and_then(|m| m.as_str())
+            .unwrap_or("text/plain")
+            .to_string();
+        out.push(McpResource {
+            uri: uri.to_string(),
+            name,
+            description,
+            mime_type,
+        });
+    }
+    out
+}
+
 /// The `initialize` params (client info + capabilities).
 fn init_params() -> Json {
     Json::Obj(vec![
@@ -149,10 +184,13 @@ fn init_params() -> Json {
 
 /// Connect to an MCP server at `url` (optionally bearer-authenticated), naming
 /// the connection `name`. Runs `initialize` → `notifications/initialized` →
-/// `tools/list`, registers every tool into the tool registry, and stores the
-/// connection. Returns the tool count on success. Re-connecting the same name
-/// refreshes it.
+/// `tools/list` (+ best-effort `resources/list`), registers every tool into the
+/// tool registry, and stores the connection. Returns the tool count on success.
+/// Re-connecting the same name refreshes tools/resources (see [`reconnect`]).
 pub fn connect(name: &str, url: &str, bearer: Option<&str>) -> Result<usize, String> {
+    // Drop prior registration for this name so reconnect is clean.
+    let _ = disconnect(name);
+
     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let (result, session) = rpc(url, bearer, None, Some(id), "initialize", init_params())?;
     let server_name = result
@@ -168,6 +206,19 @@ pub fn connect(name: &str, url: &str, bearer: Option<&str>) -> Result<usize, Str
     let list_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let (tools_result, session2) = rpc(url, bearer, session.as_deref(), Some(list_id), "tools/list", Json::Obj(vec![]))?;
     let tools = parse_tools(&tools_result);
+    let mut session = session2.or(session);
+
+    // Best-effort resources/list — servers without resources just skip.
+    let mut resources = Vec::new();
+    {
+        let rid = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        if let Ok((res_result, session3)) = rpc(url, bearer, session.as_deref(), Some(rid), "resources/list", Json::Obj(vec![])) {
+            resources = parse_resources(&res_result);
+            if let Some(s) = session3 {
+                session = Some(s);
+            }
+        }
+    }
 
     // Register each tool under its namespaced name (replacing on reconnect).
     for t in &tools {
@@ -176,19 +227,36 @@ pub fn connect(name: &str, url: &str, bearer: Option<&str>) -> Result<usize, Str
         crate::tools::registry::register_replace(crate::tools::registry::ToolDef::mcp(&reg_name, &desc, &t.input_schema, name, &t.name));
     }
 
+    let n_tools = tools.len();
+    let n_res = resources.len();
     let server = Server {
         name: name.to_string(),
         url: url.to_string(),
         bearer: bearer.map(|b| b.to_string()),
-        session: session2.or(session),
-        tools: tools.clone(),
+        session,
+        tools,
+        resources,
     };
     SERVERS.with(|s| {
         s.retain(|old| old.name != name);
         s.push(server);
     });
-    crate::ktrace::log_fmt(format_args!("mcp: connected '{name}' ({url}) — {} tool(s)", tools.len()));
-    Ok(tools.len())
+    crate::ktrace::log_fmt(format_args!(
+        "mcp: connected '{name}' ({url}) — {n_tools} tool(s), {n_res} resource(s)"
+    ));
+    Ok(n_tools)
+}
+
+/// Re-run connect for an existing server (same name/url/bearer). Fails if
+/// unknown. Used by `/mcp reconnect`.
+pub fn reconnect(name: &str) -> Result<usize, String> {
+    let (url, bearer) = SERVERS.with(|s| {
+        s.iter()
+            .find(|sv| sv.name == name)
+            .map(|sv| (sv.url.clone(), sv.bearer.clone()))
+            .ok_or_else(|| format!("mcp: no connected server '{name}'"))
+    })?;
+    connect(name, &url, bearer.as_deref())
 }
 
 /// Call `tool` on connected `server` with a JSON `arguments` object (parsed
@@ -278,6 +346,24 @@ pub fn servers() -> Vec<(String, String, usize)> {
     SERVERS.with(|s| s.iter().map(|sv| (sv.name.clone(), sv.url.clone(), sv.tools.len())).collect())
 }
 
+/// Rich status lines for `/mcp status`: name, url, tools, resources, session.
+pub fn status_lines() -> Vec<String> {
+    SERVERS.with(|s| {
+        s.iter()
+            .map(|sv| {
+                format!(
+                    "{} — {} ({} tool(s), {} resource(s){})",
+                    sv.name,
+                    sv.url,
+                    sv.tools.len(),
+                    sv.resources.len(),
+                    if sv.session.is_some() { ", session live" } else { "" }
+                )
+            })
+            .collect()
+    })
+}
+
 /// The tools of a connected server as `(tool_name, description)`.
 pub fn server_tools(name: &str) -> Vec<(String, String)> {
     SERVERS.with(|s| {
@@ -286,6 +372,97 @@ pub fn server_tools(name: &str) -> Vec<(String, String)> {
             .map(|sv| sv.tools.iter().map(|t| (t.name.clone(), t.description.clone())).collect())
             .unwrap_or_default()
     })
+}
+
+/// Full tool def for deferred discovery (`select:mcp__…`).
+pub fn server_tool_schema(server: &str, tool: &str) -> Option<(String, String)> {
+    SERVERS.with(|s| {
+        s.iter().find(|sv| sv.name == server).and_then(|sv| {
+            sv.tools
+                .iter()
+                .find(|t| t.name == tool)
+                .map(|t| (t.description.clone(), t.input_schema.clone()))
+        })
+    })
+}
+
+/// Resources for one server, or all if `server` is `None`.
+pub fn list_resources(server: Option<&str>) -> String {
+    SERVERS.with(|s| {
+        let mut out = String::new();
+        for sv in s.iter() {
+            if let Some(want) = server {
+                if sv.name != want {
+                    continue;
+                }
+            }
+            if sv.resources.is_empty() {
+                if server.is_some() {
+                    out.push_str(&format!("(no resources on '{}')\n", sv.name));
+                }
+                continue;
+            }
+            for r in &sv.resources {
+                out.push_str(&format!(
+                    "[{}] {} — {} ({})\n",
+                    sv.name, r.uri, r.name, r.mime_type
+                ));
+                if !r.description.is_empty() {
+                    out.push_str(&format!("    {}\n", r.description));
+                }
+            }
+        }
+        if out.is_empty() {
+            if server.is_some() {
+                String::from("(server not connected or has no resources)")
+            } else {
+                String::from("(no MCP resources; connect a server with /mcp connect)")
+            }
+        } else {
+            out
+        }
+    })
+}
+
+/// Read a resource URI from a connected server via `resources/read`.
+pub fn read_resource(server: &str, uri: &str) -> Result<String, String> {
+    let (url, bearer, session) = SERVERS.with(|s| {
+        s.iter()
+            .find(|sv| sv.name == server)
+            .map(|sv| (sv.url.clone(), sv.bearer.clone(), sv.session.clone()))
+            .ok_or_else(|| format!("mcp: no connected server '{server}'"))
+    })?;
+    let params = Json::Obj(vec![("uri".to_string(), Json::Str(uri.to_string()))]);
+    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+    let (result, new_session) = rpc(&url, bearer.as_deref(), session.as_deref(), Some(id), "resources/read", params)?;
+    if let Some(ns) = new_session {
+        SERVERS.with(|s| {
+            if let Some(sv) = s.iter_mut().find(|sv| sv.name == server) {
+                sv.session = Some(ns);
+            }
+        });
+    }
+    // contents[] with text or blob.
+    if let Some(contents) = result.get("contents").and_then(|c| c.as_array()) {
+        let mut out = String::new();
+        for c in contents {
+            if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(t);
+            } else if let Some(b) = c.get("blob").and_then(|t| t.as_str()) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&format!("[blob {} bytes base64]", b.len()));
+            }
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+    }
+    Ok(result.to_pretty())
 }
 
 #[cfg(test)]
@@ -332,5 +509,17 @@ mod tests {
         assert_eq!(render_content(&ok), "hello\nworld");
         let err = Json::parse(r#"{"isError":true,"content":[{"type":"text","text":"boom"}]}"#).unwrap();
         assert!(render_content(&err).starts_with("[tool error] boom"));
+    }
+
+    #[test_case]
+    fn parse_resources_list() {
+        let listed = Json::parse(
+            r#"{"resources":[{"uri":"file:///notes.txt","name":"notes","description":"demo","mimeType":"text/plain"}]}"#,
+        )
+        .unwrap();
+        let res = parse_resources(&listed);
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].uri, "file:///notes.txt");
+        assert_eq!(res[0].name, "notes");
     }
 }

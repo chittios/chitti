@@ -187,9 +187,13 @@ impl Orchestrator {
             use crate::session::todo::json_str;
             let role_name = json_str(&call.args, "role").unwrap_or_default();
             let task = json_str(&call.args, "task").unwrap_or_default();
-            let role = match role_name.as_str() {
-                "reader" => manifest::reader_subagent_manifest(),
-                other => return ToolOutcome::error(alloc::format!("unknown sub-agent role: {other}")),
+            let role = match manifest::subagent_role(&role_name) {
+                Some(r) => r,
+                None => {
+                    return ToolOutcome::error(alloc::format!(
+                        "unknown sub-agent role '{role_name}' (try: explore|plan|worker|reader)"
+                    ))
+                }
             };
             let mut sub_router = crate::tools::Router::new(); // sub-agents can't sub-delegate here
             let mut steps = rule_steps::for_intent(&task);
@@ -207,14 +211,17 @@ impl Orchestrator {
         r.load_skill_hook = Some(alloc::boxed::Box::new(|session, _caller, call| {
             use crate::agent::agent_loop::ToolOutcome;
             use crate::session::todo::json_str;
-            use crate::skills::{index, loader};
+            use crate::skills::loader;
             let name = json_str(&call.args, "name").unwrap_or_default();
-            match index::by_name(&name) {
-                Some(meta) => match loader::load_body(session, meta.id, now()) {
-                    Some(_) => ToolOutcome::ok(alloc::format!("loaded skill '{name}' (L1 body now in context)"), Provenance::SkillInstalled(meta.id)),
-                    None => ToolOutcome::error(alloc::format!("skill '{name}' has no body")),
-                },
-                None => ToolOutcome::error(alloc::format!("no installed skill named '{name}'")),
+            let asset = json_str(&call.args, "asset");
+            match loader::invoke(session, &name, asset.as_deref().filter(|s| !s.is_empty()), now()) {
+                Ok(text) => {
+                    let sid = crate::skills::index::by_name(&name)
+                        .map(|m| m.id)
+                        .unwrap_or(crate::agent::types::SkillId(0));
+                    ToolOutcome::ok(text, Provenance::SkillInstalled(sid))
+                }
+                Err(e) => ToolOutcome::error(e),
             }
         }));
         r

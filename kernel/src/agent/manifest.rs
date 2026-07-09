@@ -39,15 +39,23 @@ pub fn orchestrator_manifest() -> AgentManifest {
             "edit".into(),
             "list".into(),
             "search".into(),
+            "glob".into(),
+            "grep".into(),
             "run".into(),
             "spawn_subagent".into(),
             "todo_write".into(),
             "load_skill".into(),
+            "skill".into(),
+            "enter_plan_mode".into(),
+            "exit_plan_mode".into(),
+            "mcp_resources".into(),
+            "mcp_read_resource".into(),
             "emit_result".into(),
             // Durable per-agent memory under `/agent/<id>/memory/`.
             "memory_add".into(),
             "memory_get".into(),
             "memory_list".into(),
+            "memory_search".into(),
             // System `/command` tools — the root agent drives the machine like a
             // human at the shell (see tools::registry::shell_commands).
             "help".into(),
@@ -84,14 +92,115 @@ pub fn orchestrator_manifest() -> AgentManifest {
         sampling: Sampling { temperature: 0.2, top_p: 0.9, seed: 42, max_output_tokens: 1024 },
         budgets: Budgets {
             max_turns: 64,
-            max_context_tokens: 8192,
-            compact_threshold: 6500,
+            // Tuned for small on-device models (~0.8B–2B): earlier auto-compact
+            // keeps prefill cheap once the KV fills with tool transcripts.
+            max_context_tokens: 4096,
+            compact_threshold: 2800,
             max_tool_calls: 256,
             max_subagents: 8,
             max_depth: 2,
             max_wall_ticks: 0,
         },
         summary: SummaryPolicy { max_tokens: 512, style: SummaryStyle::Structured },
+        origin: Origin::Builtin,
+        mcp_servers: alloc::vec::Vec::new(),
+    }
+}
+
+/// Resolve a sub-agent **role preset** by name for `spawn_subagent`.
+pub fn subagent_role(name: &str) -> Option<AgentManifest> {
+    match name {
+        "" | "worker" => Some(worker_subagent_manifest()),
+        "reader" => Some(reader_subagent_manifest()),
+        "explore" => Some(explore_subagent_manifest()),
+        "plan" => Some(plan_subagent_manifest()),
+        _ => None,
+    }
+}
+
+/// Read-only **explore** sub-agent: glob/grep/read/list only — good for
+/// "find where X is defined" without risk of writes.
+pub fn explore_subagent_manifest() -> AgentManifest {
+    AgentManifest {
+        schema_version: 1,
+        id: next_agent_id(),
+        name: "explore".to_string(),
+        version: "1.0.0".to_string(),
+        kind: AgentKind::Subagent,
+        description: "Read-only codebase/store explorer. Use for find/search/read tasks.".to_string(),
+        system_prompt: "You explore files with read/list/glob/grep only. Never write or delete. \
+                        Return a concise factual report of paths and snippets found."
+            .to_string(),
+        toolset: vec![
+            "read".into(),
+            "list".into(),
+            "glob".into(),
+            "grep".into(),
+            "search".into(),
+            "memory_get".into(),
+            "memory_list".into(),
+            "emit_result".into(),
+        ],
+        capabilities: vec![
+            CapabilityRequest::new(CapDomain::Fs, Rights::READ | Rights::LIST, Scope::Any),
+            CapabilityRequest::new(CapDomain::Inference, Rights::EXEC, Scope::Any),
+        ],
+        skills: Vec::new(),
+        sampling: Sampling::deterministic(11),
+        budgets: Budgets {
+            max_turns: 10,
+            max_context_tokens: 3072,
+            compact_threshold: 2200,
+            max_tool_calls: 16,
+            max_subagents: 0,
+            max_depth: 0,
+            max_wall_ticks: 0,
+        },
+        summary: SummaryPolicy { max_tokens: 320, style: SummaryStyle::Terse },
+        origin: Origin::Builtin,
+        mcp_servers: alloc::vec::Vec::new(),
+    }
+}
+
+/// **Plan** sub-agent: read-only + todos — drafts a step plan without side effects.
+pub fn plan_subagent_manifest() -> AgentManifest {
+    AgentManifest {
+        schema_version: 1,
+        id: next_agent_id(),
+        name: "plan".to_string(),
+        version: "1.0.0".to_string(),
+        kind: AgentKind::Subagent,
+        description: "Draft a multi-step plan using read-only tools + todos. No writes.".to_string(),
+        system_prompt: "You plan. Use read/list/glob/grep and todo_write only. Do not write files \
+                        or run destructive commands. End with a numbered plan in prose."
+            .to_string(),
+        toolset: vec![
+            "read".into(),
+            "list".into(),
+            "glob".into(),
+            "grep".into(),
+            "todo_write".into(),
+            "memory_get".into(),
+            "memory_list".into(),
+            "emit_result".into(),
+        ],
+        capabilities: vec![
+            CapabilityRequest::new(CapDomain::Fs, Rights::READ | Rights::LIST, Scope::Any),
+            CapabilityRequest::new(CapDomain::Todo, Rights::READ | Rights::WRITE, Scope::Any),
+            CapabilityRequest::new(CapDomain::Inference, Rights::EXEC, Scope::Any),
+        ],
+        skills: Vec::new(),
+        sampling: Sampling::deterministic(13),
+        budgets: Budgets {
+            max_turns: 8,
+            max_context_tokens: 3072,
+            compact_threshold: 2200,
+            max_tool_calls: 12,
+            max_subagents: 0,
+            max_depth: 0,
+            max_wall_ticks: 0,
+        },
+        summary: SummaryPolicy { max_tokens: 400, style: SummaryStyle::Structured },
         origin: Origin::Builtin,
         mcp_servers: alloc::vec::Vec::new(),
     }
@@ -119,6 +228,10 @@ pub fn worker_subagent_manifest() -> AgentManifest {
             "ls".into(),
             "mounts".into(),
             "cat".into(),
+            "read".into(),
+            "list".into(),
+            "glob".into(),
+            "grep".into(),
             "network".into(),
             "ping".into(),
             "wifi".into(),
@@ -139,8 +252,8 @@ pub fn worker_subagent_manifest() -> AgentManifest {
         sampling: Sampling { temperature: 0.7, top_p: 0.8, seed: 7, max_output_tokens: 1024 },
         budgets: Budgets {
             max_turns: 8,
-            max_context_tokens: 4096,
-            compact_threshold: 3500,
+            max_context_tokens: 3072,
+            compact_threshold: 2200,
             max_tool_calls: 8,
             max_subagents: 0,
             max_depth: 0,

@@ -591,6 +591,14 @@ pub struct Screen {
     /// Hint bar under the composer (left / right halves).
     composer_hint_l: String,
     composer_hint_r: String,
+    /// Slash-command / @file suggestion popup above the composer.
+    suggest_open: bool,
+    suggest_items: alloc::vec::Vec<(String, String)>, // (label, detail)
+    suggest_sel: usize,
+    /// Last painted popup rect `(x, y, w, h)` — used to erase the dirty region
+    /// cleanly (includes the gap above the composer that the chat grid does
+    /// not cover).
+    suggest_rect: Option<(u64, u64, u64, u64)>,
     /// Fallback blink cadence when the monotonic clock is frozen (some VBox
     /// configs): the last `now_ms` seen, and a call counter. `clock_alive`
     /// latches once `now_ms` is ever seen advancing — after that the fallback
@@ -668,6 +676,8 @@ pub enum RightMode {
     Editor,
     /// The live `/top` system dashboard (CPU + memory).
     Top,
+    /// Live session todo list (`/todos open`).
+    Todos,
     /// The `/open <file>.wav|.mp3` background audio player.
     Audio,
     /// An agent-owned drawing surface (`synapse::ui`), by surface id.
@@ -687,6 +697,7 @@ fn tab_label(m: RightMode) -> &'static str {
         RightMode::Ktrace => "ktrace",
         RightMode::Editor => "editor",
         RightMode::Top => "top",
+        RightMode::Todos => "todos",
         RightMode::Audio => "audio",
         RightMode::Surface(IMAGE_SURFACE) => "image",
         RightMode::Surface(VIDEO_SURFACE) => "video",
@@ -804,8 +815,12 @@ impl Screen {
             composer_active: false,
             composer_line: String::new(),
             composer_cur: 0,
-            composer_hint_l: String::from("Ctrl+C cancel · Ctrl+W close · Ctrl+F full · /help"),
+            composer_hint_l: String::from("Tab select · ↑↓ menu · Enter send · /cmds · @files"),
             composer_hint_r: String::new(),
+            suggest_open: false,
+            suggest_items: alloc::vec::Vec::new(),
+            suggest_sel: 0,
+            suggest_rect: None,
             blink_seen_ms: u64::MAX,
             blink_calls: 0,
             clock_alive: false,
@@ -1624,6 +1639,200 @@ impl Screen {
             let rlen = right.chars().count() as u64 * cw;
             self.draw_str(hx + hw.saturating_sub(rlen), hy, &right, self.theme.composer_hint, self.chat.bg);
         }
+        // Suggestion menu sits above the composer (slash commands / @files).
+        self.draw_suggest_popup();
+    }
+
+    /// Geometry of the suggestion popup: `(x, y, w, h)` above the composer.
+    fn suggest_geom(&self) -> Option<(u64, u64, u64, u64)> {
+        if !self.suggest_open || self.suggest_items.is_empty() || !self.chat.has_composer {
+            return None;
+        }
+        let (bx, by, bw, _bh, _tx, _ty, _hy) = self.composer_geom();
+        let n = self.suggest_items.len().min(8) as u64;
+        let row_h = self.chat.ch + 4;
+        let vpad = 6u64;
+        let h = vpad + n * row_h + vpad;
+        let y = by.saturating_sub(h + 6);
+        // Keep the popup inside the chat pane (below the title header).
+        let min_y = self.chat.iy;
+        let y = y.max(min_y);
+        let h = by.saturating_sub(y + 4).min(h);
+        if h < self.chat.ch + vpad {
+            return None;
+        }
+        Some((bx, y, bw, h))
+    }
+
+    /// Erase the previous suggestion popup (and the gap down to the composer).
+    ///
+    /// The popup sits in the `COMPOSER_TOP_GAP` strip *below* the chat text
+    /// grid, so `render_view` alone never paints those pixels — without an
+    /// explicit fill the rounded outline and fill linger as a ghost box
+    /// after the menu closes.
+    fn suggest_clear_region(&self) {
+        if self.chat.w == 0 {
+            return;
+        }
+        let (bx, by, bw, _bh, _tx, _ty, _hy) = self.composer_geom();
+        // Prefer the recorded rect; fall back to the full strip above the box.
+        let (x, y, w, _h) = self.suggest_rect.unwrap_or_else(|| {
+            let h = by.saturating_sub(self.chat.iy).min(bw); // whole reserved strip
+            (bx, by.saturating_sub(h), bw, h)
+        });
+        // Expand a few px for the rounded outline / soft edge.
+        let pad = 4u64;
+        let left = x.saturating_sub(pad).max(self.chat.x + BORDER);
+        let top = y.saturating_sub(pad).max(self.chat.iy);
+        // Clear all the way down to the composer top (includes the 6px gap).
+        let bottom = by;
+        let right = (x + w + pad).min(self.chat.x + self.chat.w - BORDER);
+        let cw = right.saturating_sub(left);
+        let ch = bottom.saturating_sub(top);
+        if cw > 0 && ch > 0 {
+            self.fill_rect(left, top, cw, ch, self.chat.bg);
+        }
+        // Also wipe any overpaint that landed on the last grid rows, then
+        // restore cell contents + the composer chrome (without re-drawing a
+        // popup — suggest_open is false by the time we get here).
+        self.render_view(&self.chat);
+        self.paint_composer_box_only();
+    }
+
+    /// Composer chrome without the suggestion popup (used when clearing).
+    fn paint_composer_box_only(&self) {
+        if !self.chat.has_composer || self.chat.w == 0 {
+            return;
+        }
+        let (bx, by, bw, bh, tx, ty, hy) = self.composer_geom();
+        self.fill_rect(bx + 1, by + 1, bw.saturating_sub(2), bh.saturating_sub(2), self.theme.composer_bg);
+        let border = if self.composer_active && !self.action_focused() {
+            self.theme.accent
+        } else {
+            self.theme.composer_border
+        };
+        let radius = (4 * self.scale).max(4);
+        self.rounded_outline(bx, by, bw, bh, radius, border);
+        let prompt = "> ";
+        let max_cols = ((bw.saturating_sub(16)) / self.chat.cw).saturating_sub(2) as usize;
+        let (_vis_start, vis, caret_col) = self.composer_visible(max_cols);
+        let mut x = self.draw_str(tx, ty, prompt, self.theme.accent, self.theme.composer_bg);
+        x = self.draw_str(x, ty, vis, self.theme.chat_fg, self.theme.composer_bg);
+        let rest = (bx + bw).saturating_sub(x + 4);
+        if rest > 0 {
+            self.fill_rect(x, ty, rest, self.chat.ch, self.theme.composer_bg);
+        }
+        if self.composer_active && !self.action_focused() {
+            let cx = tx + (prompt.len() as u64 + caret_col as u64) * self.chat.cw;
+            let color = if self.caret_on { self.theme.accent } else { self.theme.composer_bg };
+            self.fill_rect(cx, ty, 2 * self.scale.max(1), self.chat.ch, color);
+        }
+        let hx = bx;
+        let hw = bw;
+        let cw = self.chat.cw;
+        self.fill_rect(hx, hy, hw, self.chat.ch, self.chat.bg);
+        let total_cols = (hw / cw).max(1) as usize;
+        let gap = 2usize;
+        let right_raw = self.composer_hint_r.chars().count();
+        let right_cols = right_raw.min(total_cols / 3).min(total_cols.saturating_sub(gap + 4));
+        let left_cols = total_cols.saturating_sub(right_cols + if right_cols > 0 { gap } else { 0 });
+        let left = crate::textsel::ellipsize(&self.composer_hint_l, left_cols);
+        let right = crate::textsel::ellipsize(&self.composer_hint_r, right_cols);
+        self.draw_str(hx, hy, &left, self.theme.composer_hint, self.chat.bg);
+        if !right.is_empty() {
+            let rlen = right.chars().count() as u64 * cw;
+            self.draw_str(hx + hw.saturating_sub(rlen), hy, &right, self.theme.composer_hint, self.chat.bg);
+        }
+    }
+
+    /// Paint the slash / @file suggestion list above the composer.
+    ///
+    /// Text is hard-clamped to the interior of the box so long `@/path/…`
+    /// labels never paint past the rounded border (the previous layout gave
+    /// labels only `cols/3` then right-aligned a detail that ran under the
+    /// pane edge).
+    fn draw_suggest_popup(&self) {
+        let Some((x, y, w, h)) = self.suggest_geom() else {
+            return;
+        };
+        let ch = self.chat.ch;
+        let cw = self.chat.cw;
+        let row_h = ch + 4;
+        let vpad = 6u64;
+        let hpad = 8u64; // left/right inset inside the rounded border
+        let bg = self.theme.composer_bg;
+        let sel_bg = self.theme.status_bg; // elevated highlight bar
+        // Soft fill + border (matches composer chrome).
+        self.fill_rect(x, y, w, h, bg);
+        let radius = (4 * self.scale).max(4);
+        self.rounded_outline(x, y, w, h, radius, self.theme.composer_border);
+
+        // Usable text columns strictly inside the border + padding.
+        let inner_x = x + hpad;
+        let inner_w = w.saturating_sub(2 * hpad);
+        let cols = (inner_w / cw).max(1) as usize;
+        let text_right = inner_x + cols as u64 * cw; // last pixel exclusive of next col
+        let n = self.suggest_items.len().min(8);
+        let mut row_y = y + vpad;
+        for i in 0..n {
+            if row_y + ch > y + h.saturating_sub(2) {
+                break;
+            }
+            let (ref label, ref detail) = self.suggest_items[i];
+            let selected = i == self.suggest_sel;
+            let row_bg = if selected { sel_bg } else { bg };
+            self.fill_rect(x + 2, row_y.saturating_sub(1), w.saturating_sub(4), row_h, row_bg);
+
+            // Selected: terracotta chevron; 2 columns reserved for the mark.
+            let mark = if selected { "> " } else { "  " };
+            let mark_fg = if selected { self.theme.accent } else { self.theme.composer_hint };
+            let mut px = self.draw_str(inner_x, row_y, mark, mark_fg, row_bg);
+            let mark_cols = 2usize;
+            let avail = cols.saturating_sub(mark_cols);
+
+            // Column split: short command labels leave room for a muted detail
+            // on the right; long `@path` labels take the full row (no detail).
+            let has_detail = !detail.is_empty() && label.chars().count() <= avail / 2;
+            let det_cols = if has_detail {
+                detail.chars().count().min(avail / 3).min(28).max(6)
+            } else {
+                0
+            };
+            let lab_cols = avail.saturating_sub(if det_cols > 0 { det_cols + 1 } else { 0 });
+
+            let lab_fg = if selected { self.theme.accent } else { self.theme.chat_fg };
+            // Paths: keep the trailing end (`../SOUL.md`); commands: head.
+            let lab = if label.starts_with('@') || label.contains('/') {
+                crate::textsel::ellipsize_end(label, lab_cols)
+            } else {
+                crate::textsel::ellipsize(label, lab_cols)
+            };
+            // Clamp drawn label so it never crosses into the detail zone.
+            let lab_max_px = px + lab_cols as u64 * cw;
+            px = self.draw_str(px, row_y, &lab, lab_fg, row_bg);
+            if px > lab_max_px {
+                // Shouldn't happen after ellipsize; blank any overflow residue.
+                self.fill_rect(lab_max_px, row_y, px.saturating_sub(lab_max_px), ch, row_bg);
+                px = lab_max_px;
+            }
+
+            if det_cols > 0 {
+                let det = crate::textsel::ellipsize(detail, det_cols);
+                let dlen = det.chars().count() as u64 * cw;
+                // Right-align detail inside the inner box — never past text_right.
+                let dx = text_right.saturating_sub(dlen).max(px + cw);
+                if dx + dlen <= text_right && dx + dlen <= x + w.saturating_sub(4) {
+                    self.draw_str(dx, row_y, &det, self.theme.composer_hint, row_bg);
+                }
+            }
+            // Wipe any leftover pixels to the right of the last drawn glyph so
+            // a previous longer selection highlight doesn't ghost.
+            if text_right > px {
+                // (row bg already filled; no-op unless we over-drew)
+                let _ = px;
+            }
+            row_y += row_h;
+        }
     }
 
     /// Paint the caret in its current blink state. When the chat pane has a
@@ -1721,7 +1930,9 @@ impl Screen {
             RightMode::Closed => false,
             // ktrace / top / surface: chat keeps focus by default so you can keep
             // typing; Ctrl+Tab / a click can move focus to the pane.
-            RightMode::Ktrace | RightMode::Top | RightMode::Audio | RightMode::Surface(_) => self.focus_action,
+            RightMode::Ktrace | RightMode::Top | RightMode::Todos | RightMode::Audio | RightMode::Surface(_) => {
+                self.focus_action
+            }
         }
     }
 
@@ -1742,7 +1953,7 @@ impl Screen {
             self.fill_rect(self.chat.x, self.chat.y, self.chat.w, self.chat.h, self.chat.bg);
             self.draw_frame(&self.chat, !self.action_focused());
             self.render_view(&self.chat);
-            self.draw_composer();
+            self.draw_composer(); // includes suggest popup when open
         }
         if self.right != RightMode::Closed && self.logs.w > 0 {
             self.drop_shadow(self.logs.x, self.logs.y, self.logs.w, self.logs.h);
@@ -1907,11 +2118,67 @@ impl Screen {
         y + ch + ch / 3
     }
 
+    /// Compact htop-style meter: `1 [████░░░░] 34%` — short label, thin bar
+    /// with green→amber→red fill, fixed-width detail. Returns next y.
+    fn htop_meter(&self, x: u64, y: u64, w: u64, label: &str, pct: u64, detail: &str, bg: Rgb) -> u64 {
+        let cw = self.cw();
+        let ch = self.ch();
+        let lab = crate::textsel::fit_width(label, 4);
+        self.draw_str(x, y, &lab, self.theme.chat_fg, bg);
+        let bx = x + 5 * cw;
+        // Reserve space for detail (already padded by caller, ~4–11 cells).
+        let det_cols = detail.chars().count().max(4) as u64 + 1;
+        let bw = w.saturating_sub(5 * cw + det_cols * cw);
+        let bh = ch.saturating_sub(2).max(ch * 3 / 4);
+        let by = y + (ch.saturating_sub(bh)) / 2;
+        // Track outline + fill (htop-like).
+        self.rect_outline(bx, by, bw, bh, 1, self.theme.border_dim);
+        let p = pct.min(100);
+        let inner = bw.saturating_sub(2);
+        let fill = inner * p / 100;
+        // Gradient-ish: green low, amber mid, red high — solid for simplicity.
+        let color = if p < 50 {
+            (80, 200, 120) // htop green
+        } else if p < 75 {
+            (220, 180, 60) // yellow
+        } else if p < 90 {
+            (230, 120, 50) // orange
+        } else {
+            (230, 60, 60) // red
+        };
+        if fill > 0 {
+            self.fill_rect(bx + 1, by + 1, fill, bh.saturating_sub(2), color);
+        }
+        if inner > fill {
+            self.fill_rect(
+                bx + 1 + fill,
+                by + 1,
+                inner - fill,
+                bh.saturating_sub(2),
+                self.theme.chat_bg,
+            );
+        }
+        let detail_x = bx + bw + cw;
+        let avail = ((x + w).saturating_sub(detail_x) / cw) as usize;
+        let d = crate::textsel::fit_width(detail, avail);
+        self.draw_str(detail_x, y, &d, self.theme.title_dim, bg);
+        y + ch
+    }
+
     /// Shorthand: [`draw_str`] with an explicit background (the `/top` panel
     /// draws over the logs-pane background, not the screen background).
     fn draw_str_bg(&self, x: u64, y: u64, s: &str, fg: Rgb, bg: Rgb) -> u64 {
         self.draw_str(x, y, s, fg, bg)
     }
+}
+
+/// One row in the `/top` process table (kernel tasks / agents / services).
+pub struct TopTask<'a> {
+    pub id: u64,
+    pub name: &'a str,
+    pub state: &'a str,
+    /// Optional tree prefix (`|- `, `` ` - ``) for a light process-tree look.
+    pub tree: &'a str,
 }
 
 /// A snapshot for [`draw_top`] — the `/top` dashboard's inputs, gathered by the
@@ -1929,12 +2196,20 @@ pub struct TopView<'a> {
     pub arch: &'a str,
     pub allocs: u64,
     pub datetime: &'a str,
+    /// Process table rows (already sorted by the shell).
+    pub tasks: &'a [TopTask<'a>],
+    pub tasks_total: u64,
+    pub tasks_running: u64,
+    /// Average core utilisation (0..=100), shown as a load stand-in.
+    pub load_pct: u64,
+    pub net_up: bool,
+    pub model_name: &'a str,
 }
 
-/// Render the `/top` dashboard (htop-style: per-core CPU bars, memory bars, a
-/// stats footer) into the **action pane**. No-op unless the action pane is in
-/// [`RightMode::Top`]. The shell's idle tick calls this ~1 Hz with a fresh
-/// snapshot, so it updates live while the chat pane stays interactive.
+/// Render the `/top` dashboard in an **htop-like** layout into the action pane:
+/// dual-column header (CPU/Mem meters | Tasks/Load/Uptime), a process table,
+/// and an F-key footer. No-op unless the pane is in [`RightMode::Top`].
+/// Refreshed ~1 Hz from the shell idle tick.
 pub fn draw_top(v: &TopView) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
@@ -1944,59 +2219,231 @@ pub fn draw_top(v: &TopView) {
         sc.cursor_restore();
         sc.cur_vis = false;
         let ch = sc.ch();
+        let cw = sc.cw();
         let (px, iy, iw) = (sc.logs.ix, sc.logs.iy, sc.logs.cols * sc.logs.cw);
-        // NO full-interior clear here: that blank-then-repaint is what made the
-        // 1 Hz refresh flicker on the single-buffered framebuffer. The pane is
-        // cleared once when the tab opens (by `redraw`); each refresh below
-        // overwrites every element in place (bars self-fill, text is padded to a
-        // fixed width so shrinking values leave no residue), so nothing is ever
-        // blanked mid-frame.
-        let x = px;
-        let mut y = iy;
+        let bottom = iy + sc.logs.rows * sc.logs.ch;
+        // NO full-interior clear: overwrite in place (padded strings + self-
+        // filling bars) so the 1 Hz refresh does not flicker.
         let bg = sc.logs.bg;
         let mib = 1024 * 1024;
         let gib = 1024 * mib;
         let fmt = |b: u64| -> String {
             if b >= gib {
                 alloc::format!("{}.{}G", b / gib, (b % gib) * 10 / gib)
-            } else {
+            } else if b >= mib {
                 alloc::format!("{}M", b / mib)
+            } else {
+                alloc::format!("{}K", b / 1024)
             }
         };
-        // CPU section — one bar per core (only core 0 runs; the scheduler is
-        // cooperative and the APs park, so the rest read 0%).
-        sc.draw_str_bg(x, y, "CPU", sc.theme.accent, bg);
-        y += ch + ch / 4;
+        let cols = (iw / cw).max(1) as usize;
+        let gap = 2 * cw;
+        // Two-column header when the pane is wide enough (≥ 48 cells).
+        let two_col = cols >= 48;
+        let left_w = if two_col { (iw - gap) / 2 } else { iw };
+        let right_x = px + left_w + gap;
+        let right_w = iw.saturating_sub(left_w + gap);
+
+        // --- left: CPU + Mem + Heap meters (htop style) ---------------------
+        let mut y_l = iy;
+        // Compact meters: `1 [████░░░░] 34%` — 1-based like htop.
         for (i, &pct) in v.cores.iter().enumerate() {
-            let online = (i as u64) < v.cores_online;
-            let lab = alloc::format!("core {:<2}", i);
-            let detail = if online { alloc::format!("{}%", pct) } else { String::from("--") };
-            y = sc.usage_bar_bg(x, y, iw, &lab, if online { pct } else { 0 }, &detail, bg);
-        }
-        y += ch / 3;
-        // Memory: kernel footprint out of physical RAM, then heap used/total.
-        sc.draw_str_bg(x, y, "Memory", sc.theme.accent, bg);
-        y += ch + ch / 4;
-        let ram_pct = if v.ram_total > 0 { v.ram_used * 100 / v.ram_total } else { 0 };
-        y = sc.usage_bar_bg(x, y, iw, "RAM    ", ram_pct, &alloc::format!("{}/{}", fmt(v.ram_used), fmt(v.ram_total)), bg);
-        let heap_pct = if v.heap_total > 0 { v.heap_used * 100 / v.heap_total } else { 0 };
-        y = sc.usage_bar_bg(x, y, iw, "heap   ", heap_pct, &alloc::format!("{}/{}", fmt(v.heap_used), fmt(v.heap_total)), bg);
-        y += ch / 2;
-        // Footer stats — fit to pane width (ellipsis + pad) so a narrow action
-        // pane never overflows, and shrinking values leave no residue.
-        let footer_cols = (iw / sc.cw()).max(1) as usize;
-        for s in [
-            alloc::format!("cores online : {}  ({})", v.cores_online, v.arch),
-            alloc::format!("model loaded : {}", fmt(v.model_bytes)),
-            alloc::format!("heap allocs  : {}", v.allocs),
-            alloc::format!("uptime {}", v.uptime),
-            v.datetime.to_string(),
-        ] {
-            if y + ch > iy + sc.logs.rows * sc.logs.ch {
+            if y_l + ch > bottom {
                 break;
             }
-            sc.draw_str_bg(x, y, &crate::textsel::fit_width(&s, footer_cols), sc.theme.logs_fg, bg);
+            let online = (i as u64) < v.cores_online;
+            let lab = alloc::format!("{}", i + 1);
+            let detail = if online {
+                crate::textsel::fit_width(&alloc::format!("{}%", pct.min(100)), 4)
+            } else {
+                crate::textsel::fit_width("--%", 4)
+            };
+            y_l = sc.htop_meter(px, y_l, left_w, &lab, if online { pct } else { 0 }, &detail, bg);
+        }
+        let ram_pct = if v.ram_total > 0 { v.ram_used * 100 / v.ram_total } else { 0 };
+        let heap_pct = if v.heap_total > 0 { v.heap_used * 100 / v.heap_total } else { 0 };
+        if y_l + ch <= bottom {
+            y_l = sc.htop_meter(
+                px,
+                y_l,
+                left_w,
+                "Mem",
+                ram_pct,
+                &crate::textsel::fit_width(&alloc::format!("{}/{}", fmt(v.ram_used), fmt(v.ram_total)), 11),
+                bg,
+            );
+        }
+        if y_l + ch <= bottom {
+            y_l = sc.htop_meter(
+                px,
+                y_l,
+                left_w,
+                "Heap",
+                heap_pct,
+                &crate::textsel::fit_width(&alloc::format!("{}/{}", fmt(v.heap_used), fmt(v.heap_total)), 11),
+                bg,
+            );
+        }
+        // Model as a third "resource" bar (htop's Swp analog for our OS).
+        if y_l + ch <= bottom && v.model_bytes > 0 {
+            let model_pct = if v.ram_total > 0 {
+                (v.model_bytes * 100 / v.ram_total).min(100)
+            } else {
+                0
+            };
+            y_l = sc.htop_meter(
+                px,
+                y_l,
+                left_w,
+                "Mdl",
+                model_pct,
+                &crate::textsel::fit_width(&fmt(v.model_bytes), 11),
+                bg,
+            );
+        }
+
+        // --- right: Tasks / Load / Uptime (htop info column) ---------------
+        let mut y_r = iy;
+        if two_col {
+            let rcols = (right_w / cw).max(1) as usize;
+            // Load as "N.NN" from average core % (htop's loadavg stand-in).
+            let load_i = v.load_pct.min(999);
+            let info = [
+                alloc::format!("Tasks: {}, {} running", v.tasks_total, v.tasks_running),
+                alloc::format!("Load average: {}.{:02}", load_i / 100, load_i % 100),
+                alloc::format!("CPU avg: {}%", v.load_pct.min(100)),
+                alloc::format!("Uptime: {}", v.uptime),
+                alloc::format!("{}", v.datetime),
+                alloc::format!("Arch: {}  ({} cores)", v.arch, v.cores_online),
+                alloc::format!("Network: {}", if v.net_up { "up" } else { "down" }),
+                alloc::format!(
+                    "Model: {}",
+                    crate::textsel::ellipsize(v.model_name, rcols.saturating_sub(8))
+                ),
+                alloc::format!("Heap allocs: {}", v.allocs),
+            ];
+            for s in &info {
+                if y_r + ch > bottom {
+                    break;
+                }
+                sc.draw_str_bg(
+                    right_x,
+                    y_r,
+                    &crate::textsel::fit_width(s, rcols),
+                    sc.theme.logs_fg,
+                    bg,
+                );
+                y_r += ch;
+            }
+        }
+
+        // Header block ends at the taller of the two columns.
+        let mut y = y_l.max(y_r) + ch / 2;
+        if y + 3 * ch > bottom {
+            // Still paint footer if almost full.
+            sc.cursor_overlay();
+            return;
+        }
+
+        // --- process table header (htop green bar) -------------------------
+        let hdr_bg = (0, 140, 80); // classic htop green
+        let hdr_fg = (0, 0, 0);
+        let hdr = if cols >= 60 {
+            "  PID  STATE    NAME / COMMAND"
+        } else if cols >= 40 {
+            "  PID  STATE  COMMAND"
+        } else {
+            "  PID  COMMAND"
+        };
+        sc.fill_rect(px, y, iw, ch, hdr_bg);
+        sc.draw_str_bg(px, y, &crate::textsel::fit_width(hdr, cols), hdr_fg, hdr_bg);
+        y += ch;
+
+        // --- process rows --------------------------------------------------
+        let footer_h = ch; // reserve one line for F-keys
+        let mut first_running_painted = false;
+        for t in v.tasks {
+            if y + ch + footer_h > bottom {
+                break;
+            }
+            let is_run = t.state == "running";
+            let sel = is_run && !first_running_painted;
+            if sel {
+                first_running_painted = true;
+            }
+            let row_bg = if sel {
+                (0, 180, 200) // htop cyan selection
+            } else {
+                bg
+            };
+            let row_fg = if sel { (0, 0, 0) } else { sc.theme.chat_fg };
+            let state_fg = if sel {
+                (0, 0, 0)
+            } else {
+                match t.state {
+                    "running" => (126, 214, 150),
+                    "ready" => (240, 200, 120),
+                    "parked" => sc.theme.title_dim,
+                    "dead" => (255, 106, 110),
+                    _ => sc.theme.logs_fg,
+                }
+            };
+            sc.fill_rect(px, y, iw, ch, row_bg);
+            // Columns: PID (5) STATE (8) tree+name
+            let pid = crate::textsel::fit_width(&alloc::format!("{}", t.id), 5);
+            let st = crate::textsel::fit_width(t.state, 8);
+            let name_cols = cols.saturating_sub(5 + 1 + 8 + 1);
+            let name = crate::textsel::fit_width(
+                &alloc::format!("{}{}", t.tree, t.name),
+                name_cols,
+            );
+            let mut xx = px;
+            xx = sc.draw_str(xx, y, &pid, row_fg, row_bg);
+            xx = sc.draw_str(xx, y, " ", row_fg, row_bg);
+            xx = sc.draw_str(xx, y, &st, state_fg, row_bg);
+            xx = sc.draw_str(xx, y, " ", row_fg, row_bg);
+            let _ = sc.draw_str(xx, y, &name, row_fg, row_bg);
             y += ch;
+        }
+        // Blank any leftover process-area rows so a shrinking task list
+        // leaves no ghost lines.
+        let blank = crate::textsel::fit_width("", cols);
+        while y + ch + footer_h <= bottom {
+            sc.draw_str_bg(px, y, &blank, bg, bg);
+            y += ch;
+        }
+
+        // --- F-key footer (htop style) -------------------------------------
+        let foot_y = bottom.saturating_sub(ch);
+        let foot_bg = sc.theme.status_bg;
+        sc.fill_rect(px, foot_y, iw, ch, foot_bg);
+        // Number in reverse / label dim — approximate with accent digits.
+        let keys = [
+            ("F1", "Help"),
+            ("F2", "Setup"),
+            ("F3", "Search"),
+            ("F4", "Filter"),
+            ("F5", "Tree"),
+            ("F6", "Sort"),
+            ("F9", "Kill"),
+            ("F10", "Quit"),
+        ];
+        let mut fx = px;
+        for (k, lab) in keys {
+            if fx + (k.len() + lab.len() + 2) as u64 * cw > px + iw {
+                break;
+            }
+            fx = sc.draw_str(fx, foot_y, k, foot_bg, sc.theme.accent); // reverse-ish
+            fx = sc.draw_str(fx, foot_y, lab, sc.theme.logs_fg, foot_bg);
+            fx += cw; // gap
+        }
+        // Right-align a short quit hint if room.
+        let hint = " /close ";
+        if cols > 20 {
+            let hx = px + iw.saturating_sub(hint.len() as u64 * cw);
+            if hx > fx {
+                sc.draw_str(hx, foot_y, hint, sc.theme.title_dim, foot_bg);
+            }
         }
         sc.cursor_overlay();
     });
@@ -2281,6 +2728,8 @@ pub enum ModalHit {
     Yes,
     No,
     Ok,
+    /// Commands-browser close `[x]` (slot 0 reused when that modal is up).
+    Close,
 }
 
 /// Pixel rects of the modal's clickable controls: `[yes, no, ok]`. Set when a
@@ -2298,8 +2747,14 @@ fn in_rect(x: u64, y: u64, r: (u64, u64, u64, u64)) -> bool {
 /// Hit-test the modal controls against a click at `(x, y)`.
 pub fn modal_hit(x: u64, y: u64) -> ModalHit {
     let r = MODAL_RECTS.with(|m| *m);
+    // Commands browser stashes Close in slot 0 and leaves 1 empty; confirm uses
+    // Yes/No in 0/1. Disambiguate: if slot 1 is empty and slot 0 is set, it's Close.
     if in_rect(x, y, r[0]) {
-        ModalHit::Yes
+        if r[1] == (0, 0, 0, 0) && r[2] == (0, 0, 0, 0) {
+            ModalHit::Close
+        } else {
+            ModalHit::Yes
+        }
     } else if in_rect(x, y, r[1]) {
         ModalHit::No
     } else if in_rect(x, y, r[2]) {
@@ -2307,6 +2762,17 @@ pub fn modal_hit(x: u64, y: u64) -> ModalHit {
     } else {
         ModalHit::None
     }
+}
+
+/// One visible row for [`draw_commands_browser`].
+pub enum CommandsRow<'a> {
+    Header(&'a str),
+    Item {
+        title: &'a str,
+        slash: &'a str,
+        shortcut: &'a str,
+        selected: bool,
+    },
 }
 
 impl Screen {
@@ -2411,6 +2877,149 @@ pub fn draw_input(title: &str, prompt: &str, buf: &str, masked: bool, caret_on: 
             sc.modal_button(ix, by, "OK", true, 2);
             sc.cursor_overlay();
         }
+    });
+}
+
+/// Draw the **Commands** browser modal (opened by `/help`): title + search
+/// field, scrollable categorised list, scrollbar, footer hints.
+///
+/// `rows` is the **visible slice** (already scrolled). `query` is the search
+/// box contents; `caret_on` blinks the search caret; `scroll`/`total` drive the
+/// scrollbar thumb.
+pub fn draw_commands_browser(
+    query: &str,
+    rows: &[CommandsRow<'_>],
+    scroll: usize,
+    total: usize,
+    caret_on: bool,
+) {
+    MODAL_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+    SCREEN.with(|slot| {
+        let Some(sc) = slot else { return };
+        sc.cursor_restore();
+        sc.cur_vis = false;
+        MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
+
+        let cw = sc.cw();
+        let ch = sc.ch();
+        let bg = sc.theme.status_bg;
+        let list_bg = sc.theme.chat_bg;
+        // Roomier than the default confirm modal — ~ half the screen.
+        let cols = ((sc.width / cw) * 5 / 10).clamp(36, 64);
+        let view_rows = 12u64; // visible list lines
+        let chrome_rows = 5u64; // title + search + gap + footer
+        let rows_h = view_rows + chrome_rows;
+        let bw = cols * cw + 2 * (BORDER + PAD);
+        let bh = rows_h * ch + 2 * (BORDER + PAD) + 12;
+        let bx = (sc.width - bw) / 2;
+        let by = (sc.height - bh) / 2;
+        sc.drop_shadow(bx, by, bw, bh);
+        sc.fill_rect(bx, by, bw, bh, bg);
+        sc.rect_outline(bx, by, bw, bh, BORDER, sc.theme.accent);
+
+        let ix = bx + BORDER + PAD;
+        let mut y = by + BORDER + PAD;
+        let content_w = cols * cw;
+
+        // Title + [x] close.
+        sc.draw_str(ix, y, "Commands", sc.theme.accent, bg);
+        let close = "[x]";
+        let cx = ix + content_w - close.len() as u64 * cw;
+        sc.draw_str(cx, y, close, sc.theme.title_dim, bg);
+        MODAL_RECTS.with(|m| m[0] = (cx, y, close.len() as u64 * cw, ch));
+        y += ch + 4;
+        sc.fill_rect(ix, y, content_w, 1, sc.theme.sep_dim);
+        y += 6;
+
+        // Search field.
+        sc.draw_str(ix, y, "search:", sc.theme.title_dim, bg);
+        let field_x = ix + 8 * cw;
+        let field_w = content_w.saturating_sub(8 * cw);
+        sc.fill_rect(field_x, y, field_w, ch, list_bg);
+        sc.rect_outline(field_x, y, field_w, ch, 1, sc.theme.border_dim);
+        let qshow = crate::textsel::ellipsize(query, (field_w / cw).saturating_sub(1) as usize);
+        let qend = sc.draw_str(field_x + 4, y, &qshow, sc.theme.chat_fg, list_bg);
+        if caret_on {
+            sc.fill_rect(qend, y, 2 * sc.scale.max(1), ch, sc.theme.accent);
+        }
+        y += ch + 6;
+
+        // List region.
+        let list_top = y;
+        let list_h = view_rows * ch;
+        let list_w = content_w.saturating_sub(cw); // leave a col for scrollbar
+        sc.fill_rect(ix, list_top, list_w, list_h, list_bg);
+
+        let mut ly = list_top;
+        for row in rows.iter().take(view_rows as usize) {
+            match row {
+                CommandsRow::Header(h) => {
+                    let line = crate::textsel::ellipsize(h, (list_w / cw) as usize);
+                    sc.draw_str(ix + 2, ly, &line, sc.theme.title_dim, list_bg);
+                    // Dim rule under the category label.
+                    sc.fill_rect(ix + 2, ly + ch - 2, list_w.saturating_sub(4), 1, sc.theme.sep_dim);
+                }
+                CommandsRow::Item {
+                    title,
+                    slash,
+                    shortcut,
+                    selected,
+                } => {
+                    let row_bg = if *selected { sc.theme.status_bg } else { list_bg };
+                    sc.fill_rect(ix, ly, list_w, ch, row_bg);
+                    let mark = if *selected { "> " } else { "* " };
+                    let mark_fg = if *selected { sc.theme.accent } else { sc.theme.composer_hint };
+                    let mut px = sc.draw_str(ix + 2, ly, mark, mark_fg, row_bg);
+                    let title_fg = if *selected { sc.theme.accent } else { sc.theme.chat_fg };
+                    // Right column: shortcut if present, else /name.
+                    let right = if !shortcut.is_empty() {
+                        *shortcut
+                    } else {
+                        *slash
+                    };
+                    let right_cols = right.chars().count().min(18);
+                    let left_cols = (list_w / cw)
+                        .saturating_sub(3 + right_cols as u64 + 2) as usize;
+                    let t = crate::textsel::ellipsize(title, left_cols);
+                    px = sc.draw_str(px, ly, &t, title_fg, row_bg);
+                    let rtxt = crate::textsel::ellipsize(right, right_cols);
+                    let rlen = rtxt.chars().count() as u64 * cw;
+                    let rx = ix + list_w.saturating_sub(rlen + 4);
+                    if rx > px {
+                        sc.draw_str(rx, ly, &rtxt, sc.theme.composer_hint, row_bg);
+                    }
+                }
+            }
+            ly += ch;
+        }
+
+        // Scrollbar (right edge of list).
+        let sb_x = ix + list_w + 2;
+        let sb_h = list_h;
+        sc.fill_rect(sb_x, list_top, 3 * sc.scale.max(1), sb_h, sc.theme.composer_border);
+        if total > view_rows as usize && total > 0 {
+            let thumb_h = ((sb_h as usize * view_rows as usize) / total)
+                .max(ch as usize)
+                .min(sb_h as usize) as u64;
+            let max_scroll = total.saturating_sub(view_rows as usize).max(1);
+            let thumb_y = list_top
+                + ((sb_h.saturating_sub(thumb_h)) as usize * scroll / max_scroll) as u64;
+            sc.fill_rect(sb_x, thumb_y, 3 * sc.scale.max(1), thumb_h, sc.theme.accent);
+        }
+
+        // Footer.
+        y = list_top + list_h + 6;
+        sc.fill_rect(ix, y, content_w, 1, sc.theme.sep_dim);
+        y += 4;
+        let foot = "up/dn nav  |  Enter fill input  |  Esc close";
+        sc.draw_str(
+            ix,
+            y,
+            &crate::textsel::ellipsize(foot, cols as usize),
+            sc.theme.composer_hint,
+            bg,
+        );
+        sc.cursor_overlay();
     });
 }
 
@@ -2683,6 +3292,14 @@ pub fn composer_end() {
             sc.composer_active = false;
             sc.composer_line.clear();
             sc.composer_cur = 0;
+            // Drop any open suggestion menu with the prompt.
+            if sc.suggest_open || sc.suggest_rect.is_some() {
+                sc.suggest_open = false;
+                sc.suggest_items.clear();
+                sc.suggest_sel = 0;
+                sc.suggest_clear_region();
+                sc.suggest_rect = None;
+            }
             sc.draw_composer(); // empty idle box
             // Ensure the chat grid never shows a caret while a reply streams.
             if sc.chat.view == 0 {
@@ -2691,6 +3308,59 @@ pub fn composer_end() {
             sc.cursor_overlay();
         }
     });
+}
+
+/// Update the slash-command / @file suggestion popup.
+/// `items` is `(label, detail)` rows; `selected` is the highlighted index.
+/// Empty `items` dismisses the menu.
+pub fn suggest_set(items: &[(alloc::string::String, alloc::string::String)], selected: usize) {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.cursor_restore();
+            sc.cur_vis = false;
+            let was_open = sc.suggest_open || sc.suggest_rect.is_some();
+            sc.suggest_items.clear();
+            for (l, d) in items {
+                sc.suggest_items.push((l.clone(), d.clone()));
+            }
+            sc.suggest_sel = if items.is_empty() {
+                0
+            } else {
+                selected.min(items.len() - 1)
+            };
+            sc.suggest_open = !items.is_empty();
+            // Always erase the previous rect first (size can shrink as the
+            // filter tightens, and dismiss must wipe the COMPOSER_TOP_GAP strip
+            // that render_view never covers).
+            if was_open {
+                sc.suggest_clear_region();
+                sc.suggest_rect = None;
+            }
+            if sc.suggest_open {
+                if let Some(rect) = sc.suggest_geom() {
+                    sc.suggest_rect = Some(rect);
+                } else {
+                    sc.suggest_rect = None;
+                    sc.suggest_open = false;
+                }
+                sc.draw_composer(); // composer + popup
+            } else {
+                sc.suggest_rect = None;
+                sc.draw_composer();
+            }
+            sc.cursor_overlay();
+        }
+    });
+}
+
+/// Dismiss the suggestion popup (if any).
+pub fn suggest_clear() {
+    suggest_set(&[], 0);
+}
+
+/// Whether the suggestion popup currently has rows.
+pub fn suggest_is_open() -> bool {
+    SCREEN.with(|slot| slot.as_ref().is_some_and(|sc| sc.suggest_open && !sc.suggest_items.is_empty()))
 }
 
 /// Erase any leftover grid caret in the chat response area (call after a
@@ -2882,6 +3552,10 @@ fn preserve_interactive(ns: &mut Screen, old: &Screen) {
     ns.composer_cur = old.composer_cur;
     ns.composer_hint_l = old.composer_hint_l.clone();
     ns.composer_hint_r = old.composer_hint_r.clone();
+    ns.suggest_open = old.suggest_open;
+    ns.suggest_items = old.suggest_items.clone();
+    ns.suggest_sel = old.suggest_sel;
+    ns.suggest_rect = old.suggest_rect;
     ns.focus_action = old.focus_action;
     ns.caret_on = old.caret_on;
     ns.caret_last_ms = old.caret_last_ms;
@@ -3180,6 +3854,82 @@ pub fn open_top() {
 /// Whether the action pane currently shows `/top`.
 pub fn is_top() -> bool {
     right_mode() == RightMode::Top
+}
+
+/// Open the live todos pane.
+pub fn open_todos() {
+    set_right(RightMode::Todos);
+}
+
+/// Whether the action pane shows todos.
+pub fn is_todos() -> bool {
+    right_mode() == RightMode::Todos
+}
+
+/// One row for [`draw_todos`].
+pub struct TodoViewItem<'a> {
+    pub id: u32,
+    pub text: &'a str,
+    pub status: &'a str,
+}
+
+/// Render the session todo list into the action pane (checklist view).
+pub fn draw_todos(items: &[TodoViewItem<'_>], title: &str) {
+    SCREEN.with(|slot| {
+        let Some(sc) = slot else { return };
+        if sc.right != RightMode::Todos {
+            return;
+        }
+        sc.cursor_restore();
+        sc.cur_vis = false;
+        let ch = sc.ch();
+        let (px, iy, iw) = (sc.logs.ix, sc.logs.iy, sc.logs.cols * sc.logs.cw);
+        let bg = sc.logs.bg;
+        let cols = (iw / sc.cw()).max(1) as usize;
+        let mut y = iy;
+        let head = if title.is_empty() { "Todos" } else { title };
+        let head_fmt = pad_trunc(head, cols);
+        sc.draw_str_bg(px, y, &head_fmt, sc.theme.accent, bg);
+        y += ch + ch / 4;
+        if items.is_empty() {
+            sc.draw_str_bg(px, y, &pad_trunc("(no todos — agent todo_write)", cols), sc.theme.title_dim, bg);
+            sc.cursor_overlay();
+            return;
+        }
+        for it in items {
+            let mark = match it.status {
+                "done" => "[x]",
+                "in_progress" => "[>]",
+                "cancelled" => "[-]",
+                _ => "[ ]",
+            };
+            let row = alloc::format!("{mark} {}: {}", it.id, it.text);
+            let fg = match it.status {
+                "done" => sc.theme.title_dim,
+                "in_progress" => sc.theme.accent,
+                _ => sc.theme.logs_fg,
+            };
+            sc.draw_str_bg(px, y, &pad_trunc(&row, cols), fg, bg);
+            y += ch;
+            if y + ch > iy + sc.logs.rows * ch {
+                break;
+            }
+        }
+        let blank = pad_trunc("", cols);
+        while y + ch <= iy + sc.logs.rows * ch {
+            sc.draw_str_bg(px, y, &blank, bg, bg);
+            y += ch;
+        }
+        sc.cursor_overlay();
+    });
+}
+
+fn pad_trunc(s: &str, cols: usize) -> alloc::string::String {
+    let mut out: alloc::string::String = s.chars().take(cols).collect();
+    while out.chars().count() < cols {
+        out.push(' ');
+    }
+    out
 }
 
 /// Close the **active** tab (chat becomes full-width once the last tab closes).

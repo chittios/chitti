@@ -68,3 +68,44 @@ pub fn load_asset(session: &mut Session, id: SkillId, asset_name: &str) -> Optio
     ));
     Some(bytes)
 }
+
+/// **Skill invoke**: load L1 body by name (and optional L2 `asset`). Returns a
+/// model-facing summary. Idempotent body load.
+pub fn invoke(
+    session: &mut Session,
+    name: &str,
+    asset: Option<&str>,
+    now: Ticks,
+) -> Result<alloc::string::String, alloc::string::String> {
+    use alloc::format;
+    use alloc::string::ToString;
+    let meta = index::by_name(name).ok_or_else(|| format!("no installed skill named '{name}'"))?;
+    let body = load_body(session, meta.id, now).ok_or_else(|| format!("skill '{name}' has no body"))?;
+    let mut out = format!(
+        "loaded skill '{name}' (L1, {} bytes). Instructions are now in context.\n\n{}",
+        body.len(),
+        body
+    );
+    if let Some(a) = asset {
+        if a.is_empty() {
+            return Ok(out);
+        }
+        match load_asset(session, meta.id, a) {
+            Some(bytes) => {
+                let text = alloc::string::String::from_utf8_lossy(&bytes);
+                out.push_str(&format!("\n\n[L2 asset '{a}']\n{text}"));
+            }
+            None => {
+                // List available asset names to help the model.
+                let names: alloc::vec::Vec<_> = index::get(meta.id)
+                    .map(|m| m.assets.iter().map(|x| x.name.clone()).collect())
+                    .unwrap_or_default();
+                return Err(format!(
+                    "skill '{name}' has no L2 asset '{a}' (available: [{}])",
+                    names.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(out)
+}

@@ -17,6 +17,11 @@ fn run_os() -> ! {
     // Install the built-in system agents (network, http, ssh) into /agent/ from
     // their bundled markdown + manifest, before the shell comes up.
     chitti_kernel::agent::system::install_all(chitti_kernel::arch::now_ms());
+    // Bundled skills (L0 index only until `skill` is invoked).
+    chitti_kernel::skills::bundled::install_all();
+    // Optional allow/ask/deny tool patterns (creates a default file if missing).
+    chitti_kernel::tools::permissions::ensure_default();
+    chitti_kernel::tools::permissions::load();
     chitti_kernel::shell::run();
 }
 

@@ -1,7 +1,7 @@
 //! The session todo list + `todo_write` semantics
 //! (`CHITTI_AGENTIC_HANDOFF.md` Phase A/D). `todo_write` replaces the whole
-//! list from a structured payload — the same shape Claude Code's TodoWrite tool
-//! uses — so the orchestrator can plan and work down a multi-step task.
+//! list from a structured payload — so the orchestrator can plan and work down
+//! a multi-step task.
 
 use crate::agent::types::*;
 use alloc::string::String;
@@ -14,7 +14,7 @@ pub struct TodoInput {
     pub status: TodoStatus,
 }
 
-/// Replace the session's todo list wholesale (idempotent, matches TodoWrite).
+/// Replace the session's todo list wholesale (idempotent full replace).
 /// Returns the number of items now pending/in-progress (the remaining work).
 pub fn write(session: &mut Session, items: Vec<TodoInput>, now: Ticks) -> usize {
     session.todos = items

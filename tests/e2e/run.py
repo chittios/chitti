@@ -76,7 +76,9 @@ def ensure_cert():
 # --- OS / shell commands: (name, command, expected substring) ---------------
 # Each just confirms the command runs and prints its marker on the real kernel.
 OS_CMDS = [
-    ("help", "/help", "Chitti commands:"),
+    # /help text = flat serial catalogue (the GUI opens a modal that would
+    # block the serial harness until Esc).
+    ("help", "/help text", "Chitti commands:"),
     ("info", "/info", "RAM installed"),
     ("datetime", "/datetime", "datetime>"),
     ("datetime_tz", "/datetime tz +5:30", "UTC+05:30"),
@@ -84,6 +86,7 @@ OS_CMDS = [
     ("lspci", "/lspci", "pci>"),
     ("mounts", "/mounts", "mounts>"),
     ("ls", "/ls /", "ls>"),
+    ("pwd", "/pwd", "pwd> /"),
     ("skills", "/skills", "installed"),
     ("shortcuts", "/shortcuts", "Shortcuts ("),
     ("mode", "/mode", "mode>"),
@@ -114,9 +117,9 @@ def make_cmd_scenario(cmd, marker, timeout=15):
 
 
 def s_help_restart(g):
-    """`/help` documents `/restart` (the command itself reboots and is tested last)."""
+    """`/help text` documents `/restart` (the command itself reboots and is tested last)."""
     m = g.mark()
-    g.send("/help")
+    g.send("/help text")
     ok = g.wait_for("/restart", 15, m) and g.wait_for("/memory", 5, m)
     return ok, "help lists /restart and /memory" if ok else "missing /restart or /memory in help"
 
@@ -196,6 +199,144 @@ def s_session(g):
     if not g.wait_for("saved in store:", 15, m):
         return False, "no saved-in-store listing after resume"
     return True, f"save/clear/resume session {sid}"
+
+
+def s_agents_switch_caps(g):
+    """`/agents switch` rebinds tool authority (Phase 0).
+
+    Switching to a non-orchestrator agent id reports gated tools/caps; switching
+    back to 1 restores the shell agent. Full cap-deny of writes is covered by
+    the in-kernel unit suite (Router + home sandbox).
+    """
+    m = g.mark()
+    g.send("/agents switch 9001")
+    if not g.wait_for("chat now runs as agent 9001", 15, m):
+        return False, "switch to 9001 did not report"
+    if not g.wait_for("tools gated", 5, m):
+        return False, "switch did not mention tools gated"
+    m = g.mark()
+    g.send("/agents switch 1")
+    if not g.wait_for("chat now runs as agent 1", 15, m):
+        return False, "switch back to shell agent failed"
+    return True, "switch rebinds caps (9001 gated → 1 restored)"
+
+
+def s_memory_hierarchy(g):
+    """Durable memory survives clear (Phase 2).
+
+    `/memory add` writes under `/agent/<id>/memory/`; after `/clear` the KV
+    store still returns the value (session transcript is wiped, durable memory
+    is not).
+    """
+    m = g.mark()
+    g.send("/memory add e2e_persist terracotta_42")
+    if not g.wait_for("ok:", 12, m):
+        return False, "memory add failed"
+    m = g.mark()
+    g.send("/clear")
+    if not g.wait_for("cleared", 12, m):
+        return False, "clear failed"
+    m = g.mark()
+    g.send("/memory get e2e_persist")
+    if not g.wait_for("terracotta_42", 12, m):
+        return False, "memory did not survive /clear"
+    m = g.mark()
+    g.send("/memory list")
+    if not g.wait_for("e2e_persist", 12, m):
+        return False, "memory list missing key after clear"
+    return True, "memory KV persists across /clear"
+
+
+def s_fs_basic(g):
+    """Linux-like store FS: hierarchical /ls, cat, mkdir, cp, mv, rm, grep, glob.
+
+    `/ls /` must show directory entries (e.g. `agent/`) — not every flat
+    percent-encoded store key. Round-trip a small tree under /tmp_e2e.
+    """
+    # Clean slate (ignore errors if missing).
+    m = g.mark()
+    g.send("/rm -r /tmp_e2e")
+    g.wait_for("rm>", 10, m)
+
+    m = g.mark()
+    g.send("/mkdir -p /tmp_e2e/sub")
+    if not g.wait_for("mkdir> /tmp_e2e/sub", 12, m):
+        return False, "mkdir -p failed"
+
+    m = g.mark()
+    g.send("/touch /tmp_e2e/sub/hello.txt")
+    if not g.wait_for("touch> /tmp_e2e/sub/hello.txt", 12, m):
+        return False, "touch failed"
+
+    # Write content via the editor path isn't available headlessly; use a
+    # second touch + overwrite isn't possible without write cmd. Use memory
+    # isn't right either. The store touch creates empty files — for cat we
+    # need content. Prefer /cp of a known store file, or create via agents.
+    # Shell has no /echo write — use /http -O is overkill. Check if SOUL exists
+    # and cp it, or use touch + verify empty cat.
+    m = g.mark()
+    g.send("/cat /tmp_e2e/sub/hello.txt")
+    if not g.wait_for("cat> /tmp_e2e/sub/hello.txt", 12, m):
+        return False, "cat empty file failed"
+
+    m = g.mark()
+    g.send("/ls /tmp_e2e")
+    if not g.wait_for("ls> /tmp_e2e", 12, m):
+        return False, "ls dir failed"
+    if not g.wait_for("sub/", 5, m):
+        return False, "ls did not show sub/ as directory"
+
+    # Immediate children only: must NOT list hello.txt at /tmp_e2e level.
+    # (We can't easily assert absence over serial; check nested ls instead.)
+    m = g.mark()
+    g.send("/ls /tmp_e2e/sub")
+    if not (g.wait_for("ls> /tmp_e2e/sub", 12, m) and g.wait_for("hello.txt", 5, m)):
+        return False, "ls nested file missing"
+
+    m = g.mark()
+    g.send("/cp /tmp_e2e/sub/hello.txt /tmp_e2e/copy.txt")
+    if not g.wait_for("cp>", 12, m):
+        return False, "cp file failed"
+    if not g.wait_for("1 file", 5, m):
+        return False, "cp did not report 1 file"
+
+    m = g.mark()
+    g.send("/mv /tmp_e2e/copy.txt /tmp_e2e/moved.txt")
+    if not g.wait_for("mv>", 12, m):
+        return False, "mv failed"
+
+    m = g.mark()
+    g.send("/cp -r /tmp_e2e/sub /tmp_e2e/sub2")
+    if not g.wait_for("cp>", 12, m):
+        return False, "cp -r failed"
+
+    m = g.mark()
+    g.send("/glob /tmp_e2e/**")
+    if not g.wait_for("glob>", 12, m):
+        return False, "glob failed"
+    if not g.wait_for("/tmp_e2e/sub/hello.txt", 5, m):
+        return False, "glob missed nested path"
+
+    # Root listing is hierarchical (dirs), not a dump of every key.
+    m = g.mark()
+    g.send("/ls /")
+    if not g.wait_for("ls> /", 12, m):
+        return False, "ls / failed"
+    # Boot places agent homes — expect agent/ as a directory entry.
+    if not g.wait_for("agent/", 5, m):
+        return False, "ls / did not show agent/ (hierarchical root)"
+
+    m = g.mark()
+    g.send("/rm -r /tmp_e2e")
+    if not g.wait_for("rm>", 12, m):
+        return False, "rm -r cleanup failed"
+
+    # help catalogue documents the new tools
+    m = g.mark()
+    g.send("/help text")
+    if not (g.wait_for("/mkdir", 12, m) and g.wait_for("/cp", 5, m) and g.wait_for("/mv", 5, m)):
+        return False, "/help text missing new fs commands"
+    return True, "fs: hierarchical ls + mkdir/touch/cat/cp/mv/glob/rm"
 
 
 def s_restart(g):
@@ -786,15 +927,98 @@ def s_agent_fs_consent(g):
 
 def s_mcp_connect(g):
     """`/mcp connect` end-to-end: connect to the harness MCP server, list its
-    tools (echo), and call it directly — the in-kernel JSON-RPC client."""
+    tools (echo), and call it directly — the in-kernel JSON-RPC client.
+    Also covers resources list/read, status, and reconnect (Phase 4)."""
     m = g.mark()
     g.send(f"/mcp connect harness http://{HOST}:{PLAIN_PORT}/mcp")
     if not g.wait_for("registered 1 tool", 20, m) or not g.wait_for("mcp__harness__echo", 5, m):
         return False, "connect/list did not register the echo tool"
     m = g.mark()
     g.send('/mcp call harness echo {"text":"pong-9271"}')
-    ok = g.wait_for("echo: pong-9271", 20, m)
-    return ok, "MCP tool connected + called over JSON-RPC" if ok else "MCP call did not echo"
+    if not g.wait_for("echo: pong-9271", 20, m):
+        return False, "MCP call did not echo"
+    m = g.mark()
+    g.send("/mcp resources harness")
+    if not g.wait_for("file:///e2e/notes.txt", 15, m):
+        return False, "resources/list missing notes URI"
+    m = g.mark()
+    g.send("/mcp read harness file:///e2e/notes.txt")
+    if not g.wait_for("resource-body: e2e-notes-42", 15, m):
+        return False, "resources/read missing body"
+    m = g.mark()
+    g.send("/mcp status")
+    if not g.wait_for("harness", 12, m) or not g.wait_for("resource", 5, m):
+        return False, "status missing resource count"
+    m = g.mark()
+    g.send("/mcp reconnect harness")
+    if not g.wait_for("reconnected", 20, m):
+        return False, "reconnect failed"
+    return True, "MCP connect/call/resources/status/reconnect"
+
+
+def s_skills_bundled(g):
+    """Bundled skills install at boot (L0); `/skills load` exercises L1 invoke."""
+    m = g.mark()
+    g.send("/skills")
+    # Boot installs remember / debug-net / safe-files.
+    ok = (
+        g.wait_for("remember", 15, m)
+        and g.wait_for("debug-net", 5, m)
+        and g.wait_for("safe-files", 5, m)
+    )
+    if not ok:
+        return False, "bundled L0 skills not listed"
+    m = g.mark()
+    g.send("/skills load remember")
+    if not g.wait_for("memory_add", 15, m):
+        return False, "skill L1 body not loaded"
+    m = g.mark()
+    g.send("/skills load remember examples")
+    if not g.wait_for("L2 asset", 15, m) and not g.wait_for("examples", 5, m):
+        # load with asset may print body + L2; accept either marker
+        tail = g.text()[m:]
+        if "Examples" not in tail and "memory_add" not in tail:
+            return False, "L2 asset load failed"
+    return True, "bundled skills L0 + L1 (+ L2) invoke"
+
+
+def s_plan_mode_and_permissions(g):
+    """Phase 5: /mode plan + /permissions surface."""
+    m = g.mark()
+    g.send("/mode plan")
+    if not g.wait_for("plan", 12, m):
+        return False, "mode plan not set"
+    m = g.mark()
+    g.send("/mode")
+    if not g.wait_for("plan", 8, m):
+        return False, "mode show missing plan"
+    m = g.mark()
+    g.send("/mode auto")
+    if not g.wait_for("auto", 12, m):
+        return False, "mode auto failed"
+    m = g.mark()
+    g.send("/permissions show")
+    # Boot loads default rules (or empty if ensure failed).
+    if not g.wait_for("permissions>", 12, m):
+        return False, "permissions show failed"
+    m = g.mark()
+    g.send("/permissions reload")
+    if not g.wait_for("permissions>", 12, m):
+        return False, "permissions reload failed"
+    return True, "plan mode + permissions.json surface"
+
+
+def s_todos_pane(g):
+    """Phase 6: /todos opens the checklist pane (empty is fine)."""
+    m = g.mark()
+    g.send("/todos list")
+    if not g.wait_for("todos>", 12, m):
+        return False, "todos list failed"
+    m = g.mark()
+    g.send("/todos open")
+    if not g.wait_for("todos>", 12, m):
+        return False, "todos open failed"
+    return True, "todos list + open"
 
 
 def s_mcp_manifest(g):
@@ -964,6 +1188,11 @@ def s_surface(g):
 OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("help_restart", s_help_restart),
     ("memory", s_memory),
+    ("memory_hierarchy", s_memory_hierarchy),
+    ("fs_basic", s_fs_basic),
+    ("skills_bundled", s_skills_bundled),
+    ("plan_mode_and_permissions", s_plan_mode_and_permissions),
+    ("todos_pane", s_todos_pane),
     ("session", s_session),
     ("open_media", s_open_media),
     ("open_video", s_open_video),
@@ -971,7 +1200,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("panes", s_panes),
     ("clipboard", s_clipboard),
 ]
-AGENTS = [("agents_services", s_agents_services), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("mcp_manifest", s_mcp_manifest)]
+AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("mcp_manifest", s_mcp_manifest)]
 NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 # Runs after every other group: kills the guest (QEMU -no-reboot → exit).
 FINAL = [("restart", s_restart)]

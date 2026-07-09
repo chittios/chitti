@@ -138,6 +138,25 @@ pub fn ellipsize(s: &str, max: usize) -> String {
     t
 }
 
+/// Ellipsize keeping the **end** of `s` (useful for file paths so the basename
+/// stays visible). ASCII `..` prefix; never exceeds `max` columns.
+pub fn ellipsize_end(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let n = s.chars().count();
+    if n <= max {
+        return String::from(s);
+    }
+    if max <= 2 {
+        return s.chars().skip(n.saturating_sub(max)).collect();
+    }
+    let keep = max - 2;
+    let mut t = String::from("..");
+    t.extend(s.chars().skip(n.saturating_sub(keep)));
+    t
+}
+
 /// Pad `s` with trailing spaces to exactly `cols` columns, or ellipsize when
 /// longer — so a redraw never leaves residue and never overflows.
 pub fn fit_width(s: &str, cols: usize) -> String {
@@ -322,6 +341,11 @@ mod tests {
         assert_eq!(fit_width("hi", 5), "hi   ");
         assert_eq!(fit_width("hello world", 6).chars().count(), 6);
         assert!(fit_width("hello world", 6).ends_with(".."));
+        // Path-style: keep the trailing basename.
+        let e = ellipsize_end("@/agent/9001/SOUL.md", 14);
+        assert_eq!(e.chars().count(), 14);
+        assert!(e.ends_with("SOUL.md"), "got {e}");
+        assert!(e.starts_with(".."), "got {e}");
     }
 
     /// Multi-line selection: middle rows are fully selected; endpoints clamp.
