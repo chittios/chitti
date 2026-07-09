@@ -11,13 +11,11 @@
 pub mod batch;
 pub mod gguf;
 pub mod model;
+pub mod iq_tables;
 pub mod refcheck;
 pub mod sampler;
 pub mod tensor;
 pub mod tokenizer;
-
-#[cfg(test)]
-pub mod testdata;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -29,7 +27,8 @@ pub struct InferResult {
     pub prompt_final_logit: f32,
     pub continuation: Vec<usize>,
     pub continuation_text: String,
-    pub matched_reference: bool,
+    /// Greedy parity vs the model's fixture (`None` = no fixture: SKIP).
+    pub matched_reference: Option<bool>,
     /// Wall-clock milliseconds (PIT ticks) spent prefilling the prompt.
     pub prefill_ms: u64,
     /// Wall-clock milliseconds spent decoding the continuation tokens.
@@ -39,14 +38,120 @@ pub struct InferResult {
     pub n_decoded: usize,
 }
 
-/// Load the model, run the fixed reference prompt, and greedily decode
-/// `refcheck::EXPECTED_CONTINUATION.len()` tokens. Logs the mandatory
-/// per-inference provenance (`model hash + seed + input hash`) and compares
-/// the greedy continuation to the NumPy reference (`tools/ref_forward.py`).
+/// A runtime-loaded model (`/model load <file>`): overrides the boot-time
+/// module for every consumer of [`model_module`]. The bytes live in DMA
+/// frames for the kernel's lifetime (models are far larger than the heap).
+static MODEL_OVERRIDE: crate::mm::Locked<Option<&'static [u8]>> = crate::mm::Locked::new(None);
+/// Cached `general.name` of the active model (see [`model_name`]).
+static MODEL_NAME: crate::mm::Locked<Option<Option<String>>> = crate::mm::Locked::new(None);
+
+/// The loaded model's display name (`general.name` from the GGUF header),
+/// parsed once and cached — replaces the old compile-time per-feature model
+/// strings now that any GGUF can be booted. `None` when no model is present.
+pub fn model_name() -> Option<String> {
+    if let Some(cached) = MODEL_NAME.with(|n| n.clone()) {
+        return cached;
+    }
+    let name = model_module()
+        .and_then(|bytes| gguf::Gguf::parse(bytes).ok().and_then(|g| g.name.map(String::from)));
+    MODEL_NAME.with(|n| *n = Some(name.clone()));
+    name
+}
+
+/// Load a GGUF from a mounted disk volume at runtime and make it the active
+/// model. Scans every disk's FAT/ext4 volumes for `name` (a root filename or
+/// FAT path), reads it into DMA frames (batched multi-sector reads with UI
+/// upkeep — the perf standing rule), validates the header parses, and
+/// installs it as the [`model_module`] override. Returns the parsed
+/// `general.name` on success. The previous override's frames are not
+/// reclaimed (models are loaded a handful of times per boot at most).
+pub fn load_model_from_disk(name: &str) -> Result<Option<String>, &'static str> {
+    use crate::fs::detect::FsType;
+    let bare = name.trim_start_matches('/');
+    for disk in 0..4usize {
+        let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
+            continue;
+        };
+        for v in crate::fs::detect::probe(&mut dev) {
+            let mut part = crate::block::Partition::new(&mut dev, v.start_lba, v.sectors);
+            let read: Option<(usize, u64)> = match v.fs {
+                FsType::Fat16 | FsType::Fat32 => {
+                    let mut r = match crate::block::fat_read::FatReader::open(&mut part) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let Some(size) = r.file_size(name).or_else(|| r.file_size(bare)) else { continue };
+                    let Some((_phys, virt)) = crate::mm::alloc_dma(size as usize) else {
+                        return Err("model does not fit in free RAM");
+                    };
+                    // SAFETY: `virt` maps `size` contiguous, freshly-allocated bytes.
+                    let dst = unsafe { core::slice::from_raw_parts_mut(virt as *mut u8, size as usize) };
+                    let n = r.read_file_into(name, dst).or_else(|| r.read_file_into(bare, dst));
+                    n.map(|n| (n, virt))
+                }
+                FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => {
+                    let mut r = match crate::block::ext4_read::Ext4Reader::open(&mut part) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let Some(size) = r.file_size(bare) else { continue };
+                    let Some((_phys, virt)) = crate::mm::alloc_dma(size as usize) else {
+                        return Err("model does not fit in free RAM");
+                    };
+                    // SAFETY: `virt` maps `size` contiguous, freshly-allocated bytes.
+                    let dst = unsafe { core::slice::from_raw_parts_mut(virt as *mut u8, size as usize) };
+                    r.read_root_file(bare, dst).map(|n| (n, virt))
+                }
+                _ => None,
+            };
+            if let Some((n, virt)) = read {
+                // SAFETY: `virt` maps `n` contiguous, now-initialized bytes,
+                // never reclaimed (leaked to 'static like the boot module).
+                let bytes: &'static [u8] = unsafe { core::slice::from_raw_parts(virt as *const u8, n) };
+                let g = gguf::Gguf::parse(bytes).map_err(|_| "file is not a loadable GGUF (parse failed)")?;
+                let loaded = g.name.map(String::from);
+                crate::ktrace::log_fmt(format_args!(
+                    "cortex: runtime-loaded model '{}' ({} MiB, arch {}) from disk {}",
+                    loaded.as_deref().unwrap_or(name),
+                    n >> 20,
+                    g.arch,
+                    disk
+                ));
+                MODEL_OVERRIDE.with(|m| *m = Some(bytes));
+                MODEL_NAME.with(|c| *c = Some(loaded.clone()));
+                return Ok(loaded);
+            }
+        }
+    }
+    Err("file not found on any disk volume")
+}
+
+/// Encode the reference prompt with the loaded model's own tokenizer,
+/// prepending BOS when the model asks for it (`add_bos`) — the shared prompt
+/// builder for the acceptance checks and `tools/cortexdiff` fixtures.
+fn reference_prompt(m: &model::Model) -> Vec<usize> {
+    let mut prompt: Vec<usize> = Vec::new();
+    if m.config.add_bos {
+        if let Some(b) = m.config.bos_token_id {
+            prompt.push(b as usize);
+        }
+    }
+    prompt.extend(m.tokenizer().encode(refcheck::PROMPT).iter().map(|&t| t as usize));
+    prompt
+}
+
+/// Load the model, run the fixed reference prompt (encoded at runtime by the
+/// model's own tokenizer), and greedily decode the fixture's length. Logs the
+/// mandatory per-inference provenance (`model hash + seed + input hash`) and
+/// compares the greedy continuation to the model's fixture
+/// (`refcheck::FIXTURES`, generated by `tools/cortexdiff`; no fixture → SKIP).
 pub fn run_reference_inference() -> Option<InferResult> {
     let bytes = model_module()?;
     let gguf = gguf::Gguf::parse(bytes).ok()?;
+    let fixture = refcheck::for_model(gguf.name);
     let m = model::Model::load(gguf).ok()?;
+
+    let prompt = reference_prompt(&m);
 
     // Provenance log: model hash, seed (greedy => 0), input hash. Greedy
     // temp-0 decoding is deterministic, so the "seed" is fixed at 0. Hash a
@@ -55,10 +160,11 @@ pub fn run_reference_inference() -> Option<InferResult> {
     // keeps it cheap on both arches (and correct when the aarch64 slice is a
     // generous upper bound rather than the exact file length).
     let model_hash = model::fnv1a(&bytes[..bytes.len().min(1 << 16)]);
-    let input_hash = model::fnv1a(bytemuck_ids(&refcheck::PROMPT_IDS));
+    let prompt_u32: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
+    let input_hash = model::fnv1a(bytemuck_ids(&prompt_u32));
     crate::ktrace::log_fmt(format_args!(
         "cortex.infer: model_hash={model_hash:#018x} seed=0 input_hash={input_hash:#018x} prompt_len={}",
-        refcheck::PROMPT_IDS.len()
+        prompt.len()
     ));
 
     let mut kv = m.new_cache();
@@ -67,8 +173,7 @@ pub fn run_reference_inference() -> Option<InferResult> {
     // Prefill the prompt. CPU inference on this model under QEMU is slow
     // (~10-15s/token), so log progress per token -- otherwise the long
     // silent gap here looks like a hang.
-    let n_prompt = refcheck::PROMPT_IDS.len();
-    let prompt: Vec<usize> = refcheck::PROMPT_IDS.iter().map(|&t| t as usize).collect();
+    let n_prompt = prompt.len();
     let prefill_start = crate::arch::now_ms();
     m.prefill(&prompt, 0, &mut kv, &mut state);
     let prefill_ms = crate::arch::now_ms().saturating_sub(prefill_start);
@@ -77,7 +182,7 @@ pub fn run_reference_inference() -> Option<InferResult> {
     let prompt_final_logit = state.logits[prompt_final_argmax];
 
     // Greedy decode, streaming each token's text as it is produced.
-    let n_gen = refcheck::EXPECTED_CONTINUATION.len();
+    let n_gen = fixture.map(|f| f.expected.len()).unwrap_or(8);
     let mut continuation = Vec::new();
     let mut pos = logits_pos + 1;
     let mut next = prompt_final_argmax;
@@ -93,8 +198,10 @@ pub fn run_reference_inference() -> Option<InferResult> {
     let decode_ms = crate::arch::now_ms().saturating_sub(decode_start);
     crate::serial_println!("");
 
-    let matched_reference = continuation.len() == refcheck::EXPECTED_CONTINUATION.len()
-        && continuation.iter().zip(refcheck::EXPECTED_CONTINUATION.iter()).all(|(&a, &b)| a == b as usize);
+    let matched_reference = fixture.map(|f| {
+        continuation.len() == f.expected.len()
+            && continuation.iter().zip(f.expected.iter()).all(|(&a, &b)| a == b as usize)
+    });
 
     // Detokenize here (reusing the already-parsed model) so callers don't
     // pay a second ~2.4 MiB GGUF parse just to render the text.
@@ -277,6 +384,65 @@ pub fn check_q4_0_sdot() -> f32 {
     }
 }
 
+/// Relative RMS error of the fast Q4_K SDOT matvec vs the exact dequant path
+/// on random super-blocks — the aarch64 acceptance check for the Q4_K kernel
+/// (the counterpart to [`check_q4_0_sdot`]; run by `/bench`).
+#[cfg(target_arch = "aarch64")]
+pub fn check_q4_k_sdot() -> f32 {
+    use tensor::{Q4_K_BLOCK_BYTES, QK, QK_K, QT_Q4_K};
+    const ROWS: usize = 512;
+    const COLS: usize = 1024;
+    let superblocks = COLS / QK_K;
+    let row_bytes = superblocks * Q4_K_BLOCK_BYTES;
+    let mut w = alloc::vec![0u8; ROWS * row_bytes];
+    let mut seed: u32 = 0x517c_c1b7;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        seed
+    };
+    for r in 0..ROWS {
+        for b in 0..superblocks {
+            let base = r * row_bytes + b * Q4_K_BLOCK_BYTES;
+            // d ~ 0.125, dmin ~ 0.0625 (f16), then random scales + nibbles.
+            w[base..base + 2].copy_from_slice(&0x3000u16.to_le_bytes());
+            w[base + 2..base + 4].copy_from_slice(&0x2C00u16.to_le_bytes());
+            for i in 4..Q4_K_BLOCK_BYTES {
+                w[base + i] = (next() >> 24) as u8;
+            }
+        }
+    }
+    let mut x = alloc::vec![0.0f32; COLS];
+    for (i, xi) in x.iter_mut().enumerate() {
+        *xi = ((i % 23) as f32 - 11.0) * 0.07;
+    }
+    let mut y_exact = alloc::vec![0.0f32; ROWS];
+    // SAFETY: sizes match the generic kernel's contract.
+    unsafe {
+        tensor::matvec_quant_rows(QT_Q4_K, w.as_ptr(), x.as_ptr(), y_exact.as_mut_ptr(), 0, ROWS, COLS);
+    }
+    let mut xq = alloc::vec![0i8; COLS];
+    let mut xs = alloc::vec![0.0f32; COLS / QK];
+    tensor::quantize_activations_q8(&x, &mut xq, &mut xs);
+    let mut y_sdot = alloc::vec![0.0f32; ROWS];
+    // SAFETY: sizes match the kernel's contract.
+    unsafe {
+        tensor::matvec_q4_k_sdot_rows(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), y_sdot.as_mut_ptr(), 0, ROWS, COLS);
+    }
+    let mut num = 0.0f32;
+    let mut den = 0.0f32;
+    for r in 0..ROWS {
+        let d = y_sdot[r] - y_exact[r];
+        num += d * d;
+        den += y_exact[r] * y_exact[r];
+    }
+    crate::serial_println!("q4ksdot> y_exact[0..3]={} {} {} y_sdot={} {} {}", y_exact[0], y_exact[1], y_exact[2], y_sdot[0], y_sdot[1], y_sdot[2]);
+    if den > 0.0 {
+        tensor::libm_sqrtf(num / den)
+    } else {
+        0.0
+    }
+}
+
 /// Throughput of an end-to-end inference run, split into prompt prefill (`pp`)
 /// and token generation (`tg`) -- the two numbers `llama-bench` reports, so the
 /// `perf` shell builtin is directly comparable. Correctness is *not* asserted
@@ -301,9 +467,11 @@ pub fn bench_inference(n_prompt: usize, n_decode: usize) -> Option<InferBench> {
     let mut kv = m.new_cache();
     let mut state = m.new_state();
 
-    // Synthetic prompt: cycle the reference ids to the requested length.
-    let base = &refcheck::PROMPT_IDS;
-    let prompt: Vec<usize> = (0..n_prompt).map(|i| base[i % base.len()] as usize).collect();
+    // Synthetic prompt: fixed ids cycled to the requested length. A
+    // throughput gauge needs valid token ids, not real text — building the
+    // tokenizer here (500K-alloc BTreeMaps) would dwarf the bench itself.
+    let vocab = m.vocab().max(3);
+    let prompt: Vec<usize> = (0..n_prompt).map(|i| 1 + (i * 97) % (vocab - 2)).collect();
 
     let t0 = crate::arch::now_ms();
     m.prefill(&prompt, 0, &mut kv, &mut state);
@@ -329,9 +497,11 @@ fn bytemuck_ids(ids: &[u32]) -> &[u8] {
     unsafe { core::slice::from_raw_parts(ids.as_ptr() as *const u8, ids.len() * 4) }
 }
 
-/// The full Phase 3 acceptance gate, run in-kernel against the real model
-/// (via `cargo xtask ref-check`): reference parity, sampler determinism,
-/// KV evict+recompute reproducibility, and 2-agent continuous batching.
+/// The full acceptance gate, run in-kernel against whichever model was booted
+/// (via `cargo xtask ref-check [-model …]`): reference parity (against the
+/// model's `refcheck::FIXTURES` entry; SKIP when it has none), sampler
+/// determinism, KV evict+recompute reproducibility, and 2-agent continuous
+/// batching (which must also agree with the single-stream greedy run).
 /// Prints one `REFCHECK:` line per check and a final `REFCHECK: ALL PASS`
 /// / `ALL FAIL` the harness greps for. Returns whether everything passed.
 pub fn run_acceptance() -> bool {
@@ -343,13 +513,17 @@ pub fn run_acceptance() -> bool {
         crate::serial_println!("REFCHECK: ALL FAIL (gguf parse)");
         return false;
     };
+    let name: Option<alloc::string::String> = gguf.name.map(alloc::string::String::from);
+    let fixture = refcheck::for_model(gguf.name);
     let Ok(m) = model::Model::load(gguf) else {
         crate::serial_println!("REFCHECK: ALL FAIL (model load)");
         return false;
     };
 
-    let prompt: Vec<usize> = refcheck::PROMPT_IDS.iter().map(|&i| i as usize).collect();
-    let reference: Vec<usize> = refcheck::EXPECTED_CONTINUATION.iter().map(|&i| i as usize).collect();
+    // The prompt comes from the model's own tokenizer (exercising encode per
+    // family); the expected continuation from the per-model fixture table.
+    let prompt = reference_prompt(&m);
+    let reference: Vec<usize> = fixture.map(|f| f.expected.iter().map(|&i| i as usize).collect()).unwrap_or_default();
     const ACCEPT_GEN: usize = 3;
 
     // Greedy decode helper: prefill `prompt` then generate `n` tokens.
@@ -370,11 +544,19 @@ pub fn run_acceptance() -> bool {
         out
     };
 
-    // (a) Reference parity: greedy continuation matches the NumPy reference.
-    let mut kv = m.new_cache();
-    let parity_cont = greedy(&m, &mut kv, reference.len());
-    let parity = parity_cont == reference;
-    crate::serial_println!("REFCHECK: parity matched={} got={:?} want={:?}", parity, parity_cont, reference);
+    // (a) Reference parity: greedy continuation matches the model's fixture
+    // (generated by tools/cortexdiff, llama.cpp-cross-checked). No fixture →
+    // SKIP (the self-consistency checks below still gate).
+    let parity = if let Some(f) = fixture {
+        let mut kv = m.new_cache();
+        let parity_cont = greedy(&m, &mut kv, reference.len());
+        let ok = parity_cont == reference;
+        crate::serial_println!("REFCHECK: parity matched={} got={:?} want={:?}", ok, parity_cont, f.expected);
+        ok
+    } else {
+        crate::serial_println!("REFCHECK: parity SKIP (no fixture for model name {:?})", name.as_deref());
+        true
+    };
 
     // (b) Determinism: two sampled runs with the same seed are identical.
     let sampled = |seed: u64| -> Vec<usize> {
@@ -400,12 +582,14 @@ pub fn run_acceptance() -> bool {
     crate::serial_println!("REFCHECK: determinism matched={} run1={:?} run2={:?}", determinism, run1, run2);
 
     // (c) KV evict + recompute: evicting the cache and replaying the prompt
-    // reproduces the identical continuation.
+    // reproduces the identical continuation (and the fixture prefix, when
+    // the model has one).
     let mut kv2 = m.new_cache();
     let before = greedy(&m, &mut kv2, ACCEPT_GEN);
     kv2.evict();
     let after = greedy(&m, &mut kv2, ACCEPT_GEN);
-    let evict_recompute = before == after && before == reference[..ACCEPT_GEN];
+    let evict_recompute =
+        before == after && fixture.map(|_| before == reference[..ACCEPT_GEN]).unwrap_or(true);
     crate::serial_println!(
         "REFCHECK: kv_evict_recompute matched={} before={:?} after={:?}",
         evict_recompute,
@@ -414,8 +598,9 @@ pub fn run_acceptance() -> bool {
     );
 
     // (d) Continuous batching: two agents advance in interleaved forward
-    // passes; both reproduce the reference continuation, and the step order
-    // is interleaved (alternating stream ids), not sequential.
+    // passes; both must agree with the *single-stream* greedy run (batched ==
+    // sequential parity), and the step order is interleaved (alternating
+    // stream ids), not sequential.
     let mut b = batch::Batch::new(&m);
     b.add_stream(&prompt, ACCEPT_GEN);
     b.add_stream(&prompt, ACCEPT_GEN);
@@ -423,7 +608,7 @@ pub fn run_acceptance() -> bool {
     let g0 = b.generated(0, prompt.len()).to_vec();
     let g1 = b.generated(1, prompt.len()).to_vec();
     let interleaved = b.step_order.windows(2).any(|w| w[0] != w[1]);
-    let batching = g0 == reference[..ACCEPT_GEN] && g1 == reference[..ACCEPT_GEN] && interleaved;
+    let batching = g0 == before && g1 == before && interleaved;
     crate::serial_println!(
         "REFCHECK: batching matched={} stream0={:?} stream1={:?} order={:?}",
         batching,
@@ -444,6 +629,10 @@ pub fn run_acceptance() -> bool {
 #[cfg(target_arch = "x86_64")]
 pub fn model_module() -> Option<&'static [u8]> {
     use alloc::vec::Vec;
+    // A runtime `/model load` override wins over the boot-time module.
+    if let Some(b) = MODEL_OVERRIDE.with(|m| *m) {
+        return Some(b);
+    }
     // The model may be a single `.gguf` module, or split into multi-part
     // modules `model.gguf.000`, `.001`, ... — the ISO9660 4 GiB per-file limit
     // forces a large model to be split for single-ISO distribution. Collect
@@ -571,6 +760,10 @@ pub const MODEL_LOAD_ADDR: usize = 0x8000_0000;
 /// the actual file; the window just needs to cover it.
 #[cfg(all(not(target_arch = "x86_64"), not(feature = "boot-limine")))]
 pub fn model_module() -> Option<&'static [u8]> {
+    // A runtime `/model load` override wins over the boot-time module.
+    if let Some(b) = MODEL_OVERRIDE.with(|m| *m) {
+        return Some(b);
+    }
     // On UEFI the stub loaded the model at a firmware-chosen address and reported
     // (base, size); use that exact span. On `-kernel` the model is at the fixed
     // MODEL_LOAD_ADDR and the window runs up to the heap (top of RAM).
@@ -607,6 +800,10 @@ pub fn model_module() -> Option<&'static [u8]> {
 #[cfg(feature = "boot-limine")]
 pub fn model_module() -> Option<&'static [u8]> {
     use alloc::vec::Vec;
+    // A runtime `/model load` override wins over the boot-time module.
+    if let Some(b) = MODEL_OVERRIDE.with(|m| *m) {
+        return Some(b);
+    }
     let response = crate::MODULE_REQUEST.response()?;
     let mut parts: Vec<&'static crate::limine_protocol::File> =
         response.modules().iter().copied().filter(|m| m.path_contains(".gguf")).collect();

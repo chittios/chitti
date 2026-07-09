@@ -8,39 +8,39 @@ console renders them. Everything here is driven by the framebuffer compositor
 
 ## The mark — "Synapse C"
 
-An open **C** (for Chitti) drawn as a single rounded stroke, with two terracotta
-end-caps and a small **synapse node** (a dot with four radiating stubs) sitting
-in the opening. It reads as a *C*, as a neuron/synapse, and as a terminal caret
-— the agent as the driver. The console draws it programmatically (an integer
-ring test plus an angular wedge for the opening, `Screen::draw_logo`), so the
-same geometry scales from the boot splash to the status-bar glyph.
+An open **ring** (the capability) in terracotta with round end-caps, and a filled
+**node** (the agent) at its centre in cream. It reads as a *C*, as a
+neuron/synapse, and as a terminal caret — the agent as the driver. The console
+draws it programmatically (an integer ring test plus one angular gap,
+`Screen::draw_logo`), so the same geometry scales from the boot splash to the
+status-bar glyph.
 
-Reference SVGs (endpoints at ±55° on a radius-78 circle centred at 120,120; node
-at 0.74·r):
+Reference SVG (ring `r 17`, stroke `6`, a ~91° opening via `dasharray 80 27`
+rotated 35°, centre node `r 5.5`; stroke width ≈ `6/17·r` and node ≈ `0.32·r`
+drive the integer form):
 
 ```svg
-<!-- light background -->
-<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240" role="img" aria-label="Chitti OS — Synapse C">
-<path d="M164.74 56.10 A78 78 0 1 0 164.74 183.90" fill="none" stroke="#141413" stroke-width="26" stroke-linecap="round"/>
-<circle cx="164.74" cy="56.10" r="16" fill="#CC785C"/>
-<circle cx="164.74" cy="183.90" r="16" fill="#CC785C"/>
-<circle cx="178" cy="120" r="5" fill="#CC785C"/>
-<line x1="178" y1="110" x2="178" y2="101" stroke="#CC785C" stroke-width="3" stroke-linecap="round"/>
-<line x1="178" y1="130" x2="178" y2="139" stroke="#CC785C" stroke-width="3" stroke-linecap="round"/>
-<line x1="168" y1="120" x2="159" y2="120" stroke="#CC785C" stroke-width="3" stroke-linecap="round"/>
-<line x1="188" y1="120" x2="197" y2="120" stroke="#CC785C" stroke-width="3" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Chitti OS">
+  <rect width="64" height="64" rx="14" fill="#1c1917"/>
+  <!-- Synapse-C mark: an open ring (capability) with a node (the agent) -->
+  <circle cx="32" cy="32" r="17" fill="none" stroke="#cc785c" stroke-width="6" stroke-linecap="round" stroke-dasharray="80 27" transform="rotate(35 32 32)"/>
+  <circle cx="32" cy="32" r="5.5" fill="#f5efe6"/>
 </svg>
 ```
 
-The **dark** variant is identical but with the arc stroke in cream `#FAF9F5`. On
-the dark console the splash draws the arc in cream and the caps + node in
-terracotta; the status-bar mark is all terracotta.
+On the dark console both the splash and the status-bar mark draw the **ring in
+terracotta** (`accent`) and the **node in cream** (`chat_fg`), over the warm-ink
+surface (the SVG's `#1c1917` tile).
 
 Where it appears:
 
 - **Boot splash** — the mark, `Chitti OS`, and the tagline *an agentic operating
   system*, centred on the canvas, held ~1.3 s before the shell (`draw_splash`).
 - **Status bar** — a small mark at the bottom-left, before the brand text.
+- **Input composer** — a Grok-style bordered box at the bottom of the chat pane
+  (elevated `composer_bg`, rounded outline, accent when focused) with a `>`
+  prompt and blinking caret; a muted hint row under it lists shortcuts (left)
+  and backend/mode (right). Scrollback never paints into this reserved strip.
 
 ## Palette
 

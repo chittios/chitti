@@ -82,9 +82,20 @@ pub fn install(
     // the grant. (Bundled tools are gated by caps at call time regardless.)
     let _ = pkg.place_trusted();
 
-    // A skill-agent package registers a dispatchable role bounded by the grant.
+    // A skill-agent package registers a dispatchable role bounded by the grant,
+    // and lands its SOUL.md + procedure docs into the agent's home *before* the
+    // home is first ensured, so the packaged persona is never clobbered by the
+    // default one.
     if let Some(role) = &pkg.manifest.agent {
-        agent_skill::register(role.clone(), granted.clone());
+        pkg.place_agent_home(role.id);
+        // Baseline sandbox: every installed agent gets read/write/list/delete
+        // over its OWN home (`/agent/<id>/**`) and nothing else, unless its
+        // manifest explicitly requested (and the human approved) a broader Fs
+        // scope. Home access is the floor, not a privilege — the equivalent of
+        // a process's own working directory — so it is not part of the consent
+        // prompt; anything wider IS a requested capability shown at install.
+        let effective = with_home_sandbox(&granted, role.id, role.kind);
+        agent_skill::register(role.clone(), effective);
     }
 
     let record = InstallRecord {
@@ -121,6 +132,31 @@ pub fn uninstall(id: SkillId) {
     agent_skill::deregister_for_skill(id);
     index::deregister(id);
     crate::ktrace::log_fmt(format_args!("skills.uninstall: skill {} revoked + de-registered", id.0));
+}
+
+/// Add the per-agent home sandbox (`Fs READ|WRITE|LIST|DELETE @ /agent/<id>/**`)
+/// to a grant, unless the agent is the orchestrator (the root, full-FS) or its
+/// manifest already carries an Fs capability the human approved (which may be
+/// broader — a deliberately privileged agent). Returns the effective grant the
+/// agent's task will be given. This is what confines every installed agent to
+/// its own folder by default.
+pub fn with_home_sandbox(granted: &[CapabilityRequest], id: AgentId, kind: AgentKind) -> Vec<CapabilityRequest> {
+    let mut out = granted.to_vec();
+    // The orchestrator (shell agent) is the root — never sandboxed.
+    if kind == AgentKind::Orchestrator {
+        return out;
+    }
+    // An explicit, approved Fs grant wins (it was shown on the install screen).
+    if out.iter().any(|c| c.domain == CapDomain::Fs) {
+        return out;
+    }
+    let home = crate::agent::home::path(id.0);
+    out.push(CapabilityRequest::new(
+        CapDomain::Fs,
+        Rights::READ | Rights::WRITE | Rights::LIST | Rights::DELETE,
+        Scope::Path(alloc::format!("{home}/**")),
+    ));
+    out
 }
 
 /// Render the consent prompt lines for a package's requested capabilities.

@@ -1,7 +1,7 @@
-//! **Agent** — the Claude-Code-style agent layer (`CHITTI_AGENTIC_HANDOFF.md`).
-//! Replaces the flat `persona` model with an orchestrator that runs a tool-use
-//! loop over a first-class [`tool`](crate::tools) layer, dispatches isolated
-//! sub-agents, and persists to first-class [`session`](crate::session)s.
+//! **Agent** — the agent layer (`CHITTI_AGENTIC_HANDOFF.md`). Replaces the flat
+//! `persona` model with an orchestrator that runs a tool-use loop over a
+//! first-class [`tool`](crate::tools) layer, dispatches isolated sub-agents, and
+//! persists to first-class [`session`](crate::session)s.
 //!
 //! * [`types`] — the shared contract (`CHITTI_SCHEMAS.md`): `AgentManifest`,
 //!   `Session`, `SkillManifest`, and the Part-0 primitives.
@@ -24,6 +24,7 @@ pub mod manifest;
 pub mod orchestrator;
 pub mod rule_steps;
 pub mod subagent;
+pub mod system;
 pub mod types;
 
 pub use types::*;
@@ -353,5 +354,98 @@ mod tests {
         let r = orch.handle("loop forever", &mut never, &mut tools);
         assert_eq!(r.stop, StopReason::BudgetTurns);
         assert!(r.turns <= 2);
+    }
+
+    /// Tool errors land in the session with a stable `error:` prefix so a
+    /// StepSource / model can tell success from failure without a schema field.
+    #[test_case]
+    fn tool_error_is_prefixed_in_session() {
+        use super::agent_loop::format_tool_result;
+        assert_eq!(format_tool_result(false, "ok".into()), "ok");
+        assert_eq!(format_tool_result(true, "missing arg".into()), "error: missing arg");
+        assert_eq!(format_tool_result(true, "denied: no cap".into()), "denied: no cap");
+        assert_eq!(format_tool_result(true, "Denied: no".into()), "Denied: no");
+
+        // A real router denial (reader can't write) is recorded as an error-ish
+        // tool result on the session transcript.
+        let mut orch = orchestrator::Orchestrator::spawn(manifest::reader_subagent_manifest(), 99);
+        let mut tools = crate::tools::Router::new();
+        let steps = vec![
+            Step::Tools(vec![tool("write", args(&[("path", "nope"), ("content", "x")]))]),
+            Step::Final("gave up".into()),
+        ];
+        let mut src = ScriptedSteps::new(steps);
+        let _ = orch.handle("try write", &mut src, &mut tools);
+        let tool_msg = orch.session.messages.iter().rev().find(|m| m.role == Role::Tool).expect("tool result");
+        assert!(
+            tool_msg.content.starts_with("error:")
+                || tool_msg.content.starts_with("denied:")
+                || tool_msg.content.contains("denied"),
+            "tool error content should be recognizable, got: {}",
+            tool_msg.content
+        );
+    }
+
+    /// `/clear`-equivalent: transcript drops but system prompt + session id stay.
+    #[test_case]
+    fn session_clear_transcript_keeps_identity() {
+        let mut orch = orchestrator::Orchestrator::spawn(manifest::orchestrator_manifest(), 11);
+        let sid = orch.session.id;
+        orch.session.push_message(Role::User, "hi".into(), Provenance::UserTyped, 0);
+        orch.session.push_message(Role::Assistant, "hello".into(), Provenance::SystemTrusted, 1);
+        assert!(orch.session.messages.len() >= 3);
+        orch.session.clear_transcript(2);
+        assert_eq!(orch.session.id, sid);
+        assert_eq!(orch.session.messages.len(), 1);
+        assert_eq!(orch.session.messages[0].role, Role::System);
+        assert_eq!(orch.session.budget.turns_used, 0);
+    }
+
+    /// Resuming a high-id session advances the minter so a fresh session never
+    /// reuses that id (counters otherwise restart at 1 each boot).
+    #[test_case]
+    fn resume_advances_session_id_minter() {
+        let mut orch = orchestrator::Orchestrator::spawn(manifest::orchestrator_manifest(), 3);
+        // Force a high id as if this snapshot came from a long-lived prior boot.
+        orch.session.id = SessionId(1000);
+        crate::session::save(&orch.session).expect("save");
+        let resumed = crate::session::resume(SessionId(1000)).expect("resume");
+        assert_eq!(resumed.id.0, 1000);
+        let next = next_session_id();
+        assert!(next.0 > 1000, "next session id {} must be > 1000 after resume", next.0);
+    }
+
+    /// `run_with_cancel` stops with [`StopReason::Cancelled`] when the cancel
+    /// hook fires, before further tool calls run.
+    #[test_case]
+    fn cancel_stops_the_loop() {
+        use super::agent_loop::{self, Step, StopReason};
+        let mut orch = orchestrator::Orchestrator::spawn(manifest::orchestrator_manifest(), 5);
+        let mut tools = crate::tools::Router::new();
+        // Never finalizes; cancel fires on the second step.
+        struct AlwaysTools;
+        impl super::agent_loop::StepSource for AlwaysTools {
+            fn next(&mut self, _s: &Session) -> Step {
+                Step::Tools(vec![tool("list", "{}".into())])
+            }
+        }
+        let mut steps = AlwaysTools;
+        let mut n = 0u32;
+        let r = agent_loop::run_with_cancel(
+            &mut orch.session,
+            &mut steps,
+            &mut tools,
+            orch.caller,
+            || 0,
+            || {
+                n += 1;
+                n > 1 // cancel after first turn starts
+            },
+        );
+        assert_eq!(r.stop, StopReason::Cancelled);
+        assert!(
+            orch.session.messages.iter().any(|m| m.content.contains("cancelled")),
+            "cancelled message should be on the session"
+        );
     }
 }

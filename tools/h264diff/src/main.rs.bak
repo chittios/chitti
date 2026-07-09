@@ -1,0 +1,150 @@
+//! Decode an MP4's first keyframe with the KERNEL's own H.264 decoder (mounted
+//! via #[path]) and write its YUV planes to stdout, so diff.py can compare them
+//! bit-for-bit against PyAV/ffmpeg. The onnxdiff/cortexdiff pattern.
+extern crate alloc;
+
+// Shims for the kernel modules the audio decoder leans on (host: std floats).
+mod sound {
+    pub mod mel {
+        pub fn cosf_pub(x: f32) -> f32 {
+            x.cos()
+        }
+    }
+}
+mod shell {
+    pub fn upkeep() {}
+}
+mod cortex {
+    pub mod tensor {
+        pub fn libm_sqrtf(x: f32) -> f32 {
+            x.sqrt()
+        }
+    }
+}
+#[path = "../../../kernel/src/audio/mod.rs"]
+mod audio;
+#[path = "../../../kernel/src/video/mod.rs"]
+mod video;
+
+use std::io::Write;
+use video::h264;
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let path = args.get(1).expect("usage: h264diff <file.mp4> [--stream[=jump]]");
+    let bytes = std::fs::read(path).expect("read file");
+    // --stream[=N]: decode via the kernel's StreamDecoder exactly as the player
+    // does (on-demand seek_decode), optionally jumping N frames per step to
+    // mimic pump_video pacing. Outputs the displayed RGB (0x00RRGGBB, LE u32).
+    if let Some(sa) = args.iter().find(|a| a.starts_with("--stream")) {
+        let jump: usize = sa.split('=').nth(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+        let mut dec = video::StreamDecoder::open(bytes).expect("open stream");
+        let n = dec.frame_count();
+        eprintln!("h264diff: STREAM frames={} jump={}", n, jump);
+        let mut out = std::io::stdout();
+        let mut i = 0usize;
+        while i < n {
+            dec.seek_decode(i);
+            let f = dec.cur_frame().expect("frame");
+            for &p in &f.pixels {
+                out.write_all(&p.to_le_bytes()).unwrap();
+            }
+            i += jump;
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--idct8test") {
+        // stdin: lines of 64 raster dequantised coeffs -> stdout: 64 residuals.
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let line = line.unwrap();
+            let vals: Vec<i32> = line.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+            if vals.len() != 64 {
+                break;
+            }
+            let mut blk = [0i32; 64];
+            blk.copy_from_slice(&vals);
+            h264::transform::idct8_residual(&mut blk);
+            let out: Vec<String> = blk.iter().map(|v| v.to_string()).collect();
+            println!("{}", out.join(" "));
+        }
+        return;
+    }
+    // Demux either container → (avcc, samples).
+    let (avcc, samples): (video::mp4::AvcC, Vec<video::mp4::Sample>) = if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        let t = video::mkv::parse(&bytes).expect("demux mkv");
+        (t.avcc, t.samples)
+    } else {
+        let t = video::mp4::parse(&bytes).expect("demux mp4");
+        (t.avcc, t.samples)
+    };
+    let sps = h264::parse_sps(&video::bits::unescape_rbsp(&avcc.sps[0][1..])).expect("sps");
+    let pps = h264::parse_pps(&video::bits::unescape_rbsp(&avcc.pps[0][1..])).expect("pps");
+    eprintln!("h264diff: {}x{} samples={} lenSize={} cabac={}", sps.width(), sps.height(), samples.len(), avcc.length_size, pps.entropy_coding_mode);
+    if pps.entropy_coding_mode {
+        // CABAC path: decode all AUs in decode order via H264Dec, then write
+        // YUV in display (cts) order for the PyAV frame-by-frame diff.
+        let mut dec = h264::decoder_cabac::H264Dec::new(sps.clone(), pps.clone()).expect("cabac init");
+        dec.trace = std::env::var("H264_TRACE").is_ok();
+        let mut decoded: Vec<(u64, std::rc::Rc<h264::decoder_cabac::Pic>)> = Vec::new();
+        for (i, s) in samples.iter().enumerate() {
+            let data = &bytes[s.offset..s.offset + s.size];
+            let mut slices: Vec<(Vec<u8>, bool, u8)> = Vec::new();
+            for nal in h264::split_avcc(data, avcc.length_size) {
+                if nal.kind.is_slice() {
+                    slices.push((nal.rbsp(), nal.kind == h264::NalType::SliceIdr, nal.ref_idc));
+                }
+            }
+            if slices.is_empty() {
+                continue;
+            }
+            match dec.decode_au(&slices) {
+                Ok(pic) => {
+                    eprintln!("h264diff: sample {} ok poc={} dpb={}", i, pic.poc, dec.dpb_len());
+                    if dec.trace && i <= 3 {
+                        for l in &dec.trace_log {
+                            eprintln!("T {}", l);
+                        }
+                    }
+                    decoded.push((s.cts, pic));
+                }
+                Err(e) => {
+                    eprintln!("h264diff: decode error at sample {}: {}", i, e);
+                    break;
+                }
+            }
+        }
+        decoded.sort_by_key(|(cts, _)| *cts);
+        let mut out = std::io::stdout();
+        for (_, pic) in &decoded {
+            out.write_all(&pic.f.y).unwrap();
+            out.write_all(&pic.f.cb).unwrap();
+            out.write_all(&pic.f.cr).unwrap();
+        }
+        eprintln!("h264diff: wrote {} frame(s) (display order)", decoded.len());
+        return;
+    }
+    let mut out = std::io::stdout();
+    let mut n = 0;
+    let mut reference: Option<h264::decoder::DecodedFrame> = None;
+    for s in &samples {
+        let data = &bytes[s.offset..s.offset + s.size];
+        let mut slices: Vec<(Vec<u8>, bool)> = Vec::new();
+        for nal in h264::split_avcc(data, avcc.length_size) {
+            if nal.kind.is_slice() {
+                slices.push((nal.rbsp(), nal.kind == h264::NalType::SliceIdr));
+            }
+        }
+        if slices.is_empty() {
+            continue;
+        }
+        let df = h264::decoder::decode_access_unit(&sps, &pps, &slices, reference.as_ref()).expect("decode");
+        out.write_all(&df.y).unwrap();
+        out.write_all(&df.cb).unwrap();
+        out.write_all(&df.cr).unwrap();
+        reference = Some(df);
+        n += 1;
+    }
+    eprintln!("h264diff: wrote {} frame(s)", n);
+}

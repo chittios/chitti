@@ -179,6 +179,15 @@ pub fn current_task_id() -> TaskId {
     SCHED.with(|slot| slot.as_ref().expect("sched not initialized").current)
 }
 
+/// Whether task `id` exists and is not `Dead`. Used by the service supervisor
+/// to decide whether a daemon needs restarting.
+pub fn is_alive(id: TaskId) -> bool {
+    SCHED.with(|slot| match slot.as_ref() {
+        Some(s) => s.tasks.get(&id).map(|t| t.state != TaskState::Dead).unwrap_or(false),
+        None => false,
+    })
+}
+
 /// Snapshot of the task table for the shell's `/agents` process list:
 /// `(id, name, state)`. Parked capability-owner tasks (agents) show as
 /// "parked" — Ready but never enqueued.
@@ -225,6 +234,7 @@ pub fn kill(id: TaskId) -> Result<(), &'static str> {
         s.ready_queue.retain(|&t| t != id);
         Ok(())
     })?;
+    crate::cap::clear_scopes(id); // drop the fine-grained scope ledger too
     crate::ktrace::log_fmt(format_args!("sched: task {id} killed"));
     Ok(())
 }

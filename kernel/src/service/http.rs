@@ -1,0 +1,176 @@
+//! The native service behind the **HTTP agent**: pure HTTP/1.1 protocol. It
+//! receives the raw request bytes from the Network agent, parses the request
+//! line + headers, forwards the method + path to the content agent (Doc) over a
+//! channel, and — when that agent returns a body — formats a proper HTTP/1.1
+//! response (status line, content-type, content-length) and hands it back to the
+//! Network agent to put on the wire.
+//!
+//! It never touches the socket and never touches the filesystem: it is the
+//! protocol layer between the network edge and the application. The parse and
+//! format functions are pure and unit-tested; the serve loop just wires them to
+//! the pipeline channels.
+
+use crate::service::{pipeline, ServiceSpec};
+use alloc::string::String;
+use alloc::vec::Vec;
+
+/// A parsed HTTP request: the parts a content agent needs. `headers` is the raw
+/// header lines (kept so the protocol layer *could* forward them; the Doc agent
+/// only needs method + path).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Request {
+    pub method: String,
+    pub path: String,
+    pub headers: Vec<String>,
+}
+
+/// Parse an HTTP request head: the request line (`METHOD SP path SP HTTP/x.y`)
+/// plus header lines up to the blank line. `None` if the request line is absent
+/// or malformed.
+pub fn parse_request(buf: &[u8]) -> Option<Request> {
+    let text = core::str::from_utf8(buf).ok()?;
+    let mut lines = text.split("\r\n");
+    let line = lines.next()?;
+    let mut parts = line.split(' ');
+    let method = parts.next()?;
+    let path = parts.next()?;
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") || method.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+    let headers = lines.take_while(|l| !l.is_empty()).map(String::from).collect();
+    Some(Request { method: method.into(), path: path.into(), headers })
+}
+
+/// Format an HTTP/1.1 response from a content agent's reply frame, which is
+/// `"<status>\n<Header: Value>\n…\n\n<body…>"` — a status line, the agent's
+/// response headers, a blank line, then the raw body. This is the only place HTTP
+/// framing is produced: it emits the status + those headers and always appends a
+/// correct `Content-Length` (from the actual body) and `Connection: close`,
+/// defaulting `Content-Type` if the agent omitted one.
+pub fn format_response(reply: &[u8]) -> Vec<u8> {
+    // Split the header block from the body at the first blank line.
+    let (head, body): (&[u8], &[u8]) = match find_blank_line(reply) {
+        Some(i) => (&reply[..i], &reply[i + 2..]),
+        None => (reply, b""),
+    };
+    let mut lines = head.split(|&b| b == b'\n');
+    let status = lines.next().unwrap_or(b"200 OK");
+    let mut out = alloc::format!("HTTP/1.1 {}\r\n", String::from_utf8_lossy(status)).into_bytes();
+    let mut has_ctype = false;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if line.len() >= 13 && line[..13].eq_ignore_ascii_case(b"content-type:") {
+            has_ctype = true;
+        }
+        // Skip any Content-Length/Connection the agent tried to set; we own those.
+        if starts_ci(line, b"content-length:") || starts_ci(line, b"connection:") {
+            continue;
+        }
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+    }
+    if !has_ctype {
+        out.extend_from_slice(b"Content-Type: application/octet-stream\r\n");
+    }
+    out.extend_from_slice(alloc::format!("Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// Index of the first blank line (`\n\n`) separating headers from body, or `None`.
+fn find_blank_line(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\n\n")
+}
+
+/// Case-insensitive header-name prefix test.
+fn starts_ci(line: &[u8], prefix: &[u8]) -> bool {
+    line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+extern "C" fn http_serve(_arg: u64) {
+    let (Some(from_net), Some(to_net), Some(to_server), Some(from_server)) =
+        (pipeline::net_to_http(), pipeline::http_to_net(), pipeline::http_to_server(), pipeline::server_to_http())
+    else {
+        crate::ktrace::log("service.http", "pipeline channels not wired");
+        return;
+    };
+    loop {
+        if let Ok(Some(raw)) = crate::channel::try_recv_dgram(from_net) {
+            // Parse the request; forward "METHOD path" to the content agent.
+            let (method, path) = match parse_request(&raw) {
+                Some(r) => (r.method, r.path),
+                None => (String::from("GET"), String::from("/")),
+            };
+            crate::ktrace::log_fmt(format_args!("service.http: {method} {path} -> content agent"));
+            let req = alloc::format!("{method} {path}");
+            let d = crate::arch::now_ms() + pipeline::STAGE_DEADLINE_MS;
+            pipeline::send_frame(to_server, req.as_bytes(), d);
+            // Await the content agent's body, then format + return the response.
+            if let Some(reply) = pipeline::recv_deadline(from_server, crate::arch::now_ms() + pipeline::STAGE_DEADLINE_MS) {
+                let resp = format_response(&reply);
+                pipeline::send_frame(to_net, &resp, crate::arch::now_ms() + pipeline::STAGE_DEADLINE_MS);
+            }
+        }
+        crate::shell::upkeep();
+        crate::sched::yield_now();
+    }
+}
+
+/// The HTTP protocol service. Native; started as part of the web pipeline.
+pub static HTTP_STAGE: ServiceSpec = ServiceSpec { name: "http", entry: http_serve, autostart: false, caps: &[] };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn parses_request_line_and_headers() {
+        let r = parse_request(b"GET /docs HTTP/1.1\r\nHost: chitti\r\nAccept: */*\r\n\r\n").unwrap();
+        assert_eq!(r.method, "GET");
+        assert_eq!(r.path, "/docs");
+        assert_eq!(r.headers, alloc::vec![String::from("Host: chitti"), String::from("Accept: */*")]);
+    }
+
+    #[test_case]
+    fn rejects_malformed_request_lines() {
+        assert!(parse_request(b"garbage").is_none());
+        assert!(parse_request(b"GET /docs FTP/1\r\n").is_none()); // not HTTP
+        assert!(parse_request(b"GET docs HTTP/1.1\r\n").is_none()); // path not absolute
+    }
+
+    #[test_case]
+    fn formats_a_response_from_a_content_reply() {
+        // New frame: status line, headers, blank line, then body.
+        let resp = format_response(b"200 OK\nContent-Type: text/html\n\n<h1>hi</h1>");
+        let s = String::from_utf8(resp).unwrap();
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "status line: {s}");
+        assert!(s.contains("Content-Type: text/html\r\n"));
+        assert!(s.contains("Content-Length: 11\r\n"));
+        assert!(s.contains("Connection: close\r\n"));
+        assert!(s.ends_with("\r\n\r\n<h1>hi</h1>"));
+    }
+
+    #[test_case]
+    fn passes_through_extra_headers_and_owns_length() {
+        // The agent's own headers are emitted; Content-Length is (re)computed and
+        // an agent-supplied Content-Length/Connection is dropped.
+        let resp = format_response(b"200 OK\nContent-Type: text/html\nX-Agent: doc\nContent-Length: 999\n\nhello");
+        let s = String::from_utf8(resp).unwrap();
+        assert!(s.contains("X-Agent: doc\r\n"), "{s}");
+        assert!(s.contains("Content-Length: 5\r\n"), "{s}"); // body len, not 999
+        assert_eq!(s.matches("Content-Length:").count(), 1);
+    }
+
+    #[test_case]
+    fn formats_a_404_reply_and_defaults_content_type() {
+        // No Content-Type header → a default is supplied.
+        let resp = format_response(b"404 Not Found\n\nnope");
+        let s = String::from_utf8(resp).unwrap();
+        assert!(s.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(s.contains("Content-Type: application/octet-stream\r\n"));
+        assert!(s.contains("Content-Length: 4\r\n"));
+    }
+}

@@ -167,6 +167,19 @@ impl Address {
         }
     }
 
+    /// Query whether the address is a loopback address (IPv4 127.0.0.0/8 or the
+    /// IPv6 `::1`). Per RFC 1122 a datagram to such an address must never leave
+    /// the host; [`Interface`](crate::iface::Interface) routing relies on this to
+    /// keep loopback traffic off non-loopback interfaces.
+    pub fn is_loopback(&self) -> bool {
+        match self {
+            #[cfg(feature = "proto-ipv4")]
+            Address::Ipv4(addr) => addr.is_loopback(),
+            #[cfg(feature = "proto-ipv6")]
+            Address::Ipv6(addr) => addr.is_loopback(),
+        }
+    }
+
     /// If `self` is a CIDR-compatible subnet mask, return `Some(prefix_len)`,
     /// where `prefix_len` is the number of leading zeroes. Return `None` otherwise.
     pub fn prefix_len(&self) -> Option<u8> {

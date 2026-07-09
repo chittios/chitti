@@ -70,7 +70,17 @@ extern "C" fn aarch64_sync_dispatch(frame: *mut u64) {
     }
     // SAFETY: `frame` is our own trap frame; index 32 is the saved ELR.
     let elr = unsafe { *frame.add(32) };
-    crate::ktrace::log_fmt(format_args!("aarch64 FATAL sync exception: ESR_EL1={:#x} ELR_EL1={:#x}", esr, elr));
+    // FAR_EL1 names the faulting *data* address (valid for aborts) — with the
+    // ESR's DFSC it distinguishes an unmapped access (translation fault, DFSC
+    // 0x4-0x7) from Device-typed memory hit with an unaligned NEON load
+    // (alignment fault, DFSC 0x21 — the VBox low-RAM trap).
+    let far: u64;
+    // SAFETY: reading FAR_EL1 is always valid at EL1.
+    unsafe { core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack)) };
+    crate::ktrace::log_fmt(format_args!(
+        "aarch64 FATAL sync exception: ESR_EL1={:#x} ELR_EL1={:#x} FAR_EL1={:#x}",
+        esr, elr, far
+    ));
     loop {
         super::hlt();
     }

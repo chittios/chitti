@@ -50,6 +50,104 @@ fn alloc_at(paddr: u64, bytes: usize) -> &'static mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), pages * 4096) }
 }
 
+/// Allocate `pages` from conventional RAM **at or above `min_addr`**, falling
+/// back to AnyPages when no such region exists. The kernel's identity map
+/// types GiB block 0 as **Device MMIO**; on platforms whose RAM includes
+/// low physical memory (VirtualBox-ARM), an AnyPages model/heap allocation
+/// can land there — byte reads work but the NEON matvec's unaligned vector
+/// loads take an alignment fault (Device memory), and everything is uncached.
+/// So the big regions the kernel computes over must sit >= 1 GiB.
+fn alloc_pages_min_addr(pages: usize, min_addr: u64) -> uefi::Result<core::ptr::NonNull<u8>> {
+    use uefi::mem::memory_map::MemoryMap;
+    let need = pages as u64 * 4096;
+    if let Ok(mm) = boot::memory_map(MemoryType::LOADER_DATA) {
+        // Pick the highest fitting conventional region top >= min_addr (the
+        // top stays clear of the kernel image and other low allocations).
+        let mut best: Option<u64> = None;
+        for d in mm.entries() {
+            if d.ty != MemoryType::CONVENTIONAL {
+                continue;
+            }
+            let start = d.phys_start.max(min_addr);
+            let end = d.phys_start + d.page_count * 4096;
+            if end > start && end - start >= need {
+                let base = (end - need) & !0xfff;
+                if base >= start {
+                    best = Some(best.map_or(base, |b: u64| b.max(base)));
+                }
+            }
+        }
+        if let Some(base) = best {
+            if let Ok(p) = boot::allocate_pages(AllocateType::Address(base), MemoryType::LOADER_DATA, pages) {
+                return Ok(p);
+            }
+        }
+    }
+    // No suitable high region (tiny VM): AnyPages keeps small setups booting.
+    boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
+}
+
+/// Reassemble the model from split parts `\model.gguf.000`, `.001`, … into one
+/// contiguous allocation, returning `(base, len)`. FAT32 caps a single file at
+/// 4 GiB, so the image build splits a large model (the 9B) into <= 1 GiB parts;
+/// every loader path concatenates the sorted parts, and this is that path for
+/// the UEFI/ESP boot. A lone `\model.gguf.000` is just the one-part case.
+/// Returns `None` (boot without a model) if no parts are present or the
+/// allocation fails.
+fn load_model(fs: &mut uefi::fs::FileSystem) -> Option<(u64, u64)> {
+    use uefi::fs::PathBuf;
+    use uefi::CString16;
+    // Pass 1: total the sizes of the consecutive parts (metadata only — no data
+    // read yet), so we can allocate one contiguous region up front.
+    let mut parts: alloc::vec::Vec<PathBuf> = alloc::vec::Vec::new();
+    let mut total: usize = 0;
+    for idx in 0.. {
+        let name = alloc::format!("\\model.gguf.{idx:03}");
+        let path = PathBuf::from(CString16::try_from(name.as_str()).expect("model part path"));
+        match fs.metadata(&path) {
+            Ok(info) => {
+                total += info.file_size() as usize;
+                parts.push(path);
+            }
+            Err(_) => break,
+        }
+    }
+    if parts.is_empty() || total == 0 {
+        log::info!("chitti-stub: no model on ESP (kernel will report no model)");
+        return None;
+    }
+    let pages = total.div_ceil(4096);
+    // >= 1 GiB: the kernel maps GiB block 0 as Device — NEON over a model
+    // placed there alignment-faults (see `alloc_pages_min_addr`).
+    let ptr = match alloc_pages_min_addr(pages, 1 << 30) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("chitti-stub: model alloc ({pages} pages) failed: {e:?} -- booting without a model (need more VM RAM)");
+            return None;
+        }
+    };
+    let base = ptr.as_ptr() as u64;
+    // SAFETY: freshly allocated, `pages * 4096` contiguous bytes at `base`.
+    let dst = unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), pages * 4096) };
+    // Pass 2: read each part (one at a time — the transient buffer is one part,
+    // <= 1 GiB) and copy it into the contiguous region, in order.
+    let mut off = 0usize;
+    for path in &parts {
+        match fs.read(path) {
+            Ok(bytes) => {
+                dst[off..off + bytes.len()].copy_from_slice(&bytes);
+                off += bytes.len();
+            }
+            Err(e) => {
+                log::warn!("chitti-stub: reading model part failed: {e:?} -- booting without a model");
+                return None;
+            }
+        }
+    }
+    log::info!("chitti-stub: model {off} bytes at {base:#x} ({} part(s))", parts.len());
+    Some((base, off as u64))
+}
+
 /// The ACPI 2.0 RSDP physical address from the UEFI configuration table, or 0.
 /// Days since 1970-01-01 for a proleptic-Gregorian date (Hinnant's algorithm;
 /// the kernel's `clock` uses the same math).
@@ -163,38 +261,18 @@ fn main() -> Status {
     // regions at fixed addresses and AllocateAddress there returns NOT_FOUND — so
     // we let the firmware pick a free run and report where it landed in the
     // boot-info; the kernel reads the model there (not at a hardcoded address).
-    let model_region: Option<(u64, u64)> = match fs.read(cstr16!("\\model.gguf.000")) {
-        Ok(model) => {
-            let pages = model.len().div_ceil(4096);
-            match boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages) {
-                Ok(ptr) => {
-                    let base = ptr.as_ptr() as u64;
-                    // SAFETY: freshly allocated, `pages * 4096` bytes at `base`.
-                    let dst = unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), pages * 4096) };
-                    dst[..model.len()].copy_from_slice(&model);
-                    log::info!("chitti-stub: model {} bytes at {base:#x}", model.len());
-                    Some((base, model.len() as u64))
-                }
-                Err(e) => {
-                    log::warn!("chitti-stub: model alloc ({pages} pages) failed: {e:?} -- booting without a model (need more VM RAM)");
-                    None
-                }
-            }
-        }
-        Err(_) => {
-            log::info!("chitti-stub: no model on ESP (kernel will report no model)");
-            None
-        }
-    };
+    let model_region: Option<(u64, u64)> = load_model(&mut fs);
 
-    // Reserve the kernel heap in free RAM (AnyPages, HEAP_MAX) and mark it
-    // LOADER_DATA so it survives ExitBootServices. Report its base; the kernel
-    // places its heap here. AnyPages (not a fixed address, and not the top of RAM
-    // where UEFI parks ACPI/runtime data) is what makes this robust across
-    // firmwares.
+    // Reserve the kernel heap in free RAM (>= 1 GiB, else AnyPages; HEAP_MAX)
+    // and mark it LOADER_DATA so it survives ExitBootServices. Report its
+    // base; the kernel places its heap here. A firmware-chosen address (not a
+    // fixed one, and not the top of RAM where UEFI parks ACPI/runtime data)
+    // is what makes this robust across firmwares; the >= 1 GiB floor keeps it
+    // out of the kernel's Device-typed GiB block 0 (VirtualBox-ARM has RAM
+    // there — a heap in Device memory is uncached and NEON-hostile).
     let heap_region: Option<(u64, u64)> = {
         let pages = (HEAP_MAX / 4096) as usize;
-        match boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages) {
+        match alloc_pages_min_addr(pages, 1 << 30) {
             Ok(ptr) => {
                 let base = ptr.as_ptr() as u64;
                 log::info!("chitti-stub: reserved kernel heap {base:#x} ({} MiB)", HEAP_MAX >> 20);

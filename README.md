@@ -35,41 +35,111 @@ model from ever directly touching hardware.
 
 ## Features
 
+### Agent & security core
+
 - **Agent as the process.** An orchestrator runs a real tool-use loop
   (`model → tool → result → repeat`) and can delegate to isolated **sub-agents**
-  whose authority is a strict subset of the parent's.
+  (roles such as explore / plan / worker / reader) whose authority is a strict
+  subset of the parent's.
 - **A shell that is an agent.** Plain text is a message to the model; `/`-commands
-  drive the OS. First-class **sessions** save, resume, and fork.
-- **CPU-only inference on bare metal.** A quantized Qwen3.5 (0.8B or 9B) runs on
-  hand-written SIMD tensor kernels — SSE2/AVX2 on x86, NEON on aarch64 — with a
-  zero-copy GGUF loader and an OS-managed KV cache. No GPU, no host runtime.
-- **The capability ABI (Synapse).** The model emits grammar-constrained,
-  MCP-shaped tool calls; every one is capability-checked, taint-gated, executed
-  by deterministic native code, and written to an append-only audit log.
-- **Prompt-injection defense at the OS boundary.** Provenance/taint tags follow
-  every token; a destructive action justified by untrusted, ingested content is
-  refused or requires explicit human confirmation.
-- **Skills.** Portable, **signed**, permissioned packages of procedural knowledge
-  (+ optional tools and agent roles), loaded with progressive disclosure and
-  bounded forever by their install-time capability grant.
-- **A real windowed console.** A tmux-style split-pane framebuffer compositor in
-  the Geist Mono font: a chat pane, an on-demand action pane (live ktrace or a
-  vim-like editor), a status bar with a **live clock**, a **blinking caret**, a
-  **todo-list**-driven planner, **mouse** (cursor, click, drag-select/copy) and
-  **keyboard** input, with an editable on-disk UI config.
-- **Dual-architecture, one codebase.** `x86_64` and `aarch64` from the same tree,
-  behind a small `arch` facade; aarch64 runs natively on Apple Silicon under
-  QEMU-HVF. Functionality never diverges between the two.
-- **Real, standards-based drivers — nothing hardcoded to an emulator.** Display
-  via UEFI GOP / Limine / ramfb; disks via virtio / NVMe / AHCI over discovered
-  PCIe; input via USB xHCI/HID + virtio-input + PL050/PS-2; discovery via
-  ACPI/ECAM, fw_cfg, HID report descriptors. The same image runs on QEMU,
-  VirtualBox, and real UEFI hardware.
-- **Storage & self-install.** GPT/MBR/FAT/ext4 detection, an ext4/FAT
-  stack, durable agent state, and `/install` to a real disk that boots
-  standalone via UEFI.
-- **Microkernel core.** Unforgeable capabilities (seL4-inspired), capability-gated
-  IPC, a cooperative + timer-preemptive scheduler, SMP, and a hand-rolled MMU.
+  drive the OS. First-class **sessions** save, resume, and fork; **todos** drive
+  multi-step work in a live action pane.
+- **Plan mode & permissions.** `/mode manual|auto|bypass|plan` and
+  `/permissions` (allow / ask / deny patterns in
+  `/configs/core/permissions.json`) gate agent tool calls before the modal.
+- **CPU-only inference on bare metal.** Architecture-dynamic GGUF loaders
+  (Qwen hybrid, Gemma4, …), mainstream GGML quants, hand-written SIMD tensor
+  kernels (SSE2/AVX2 / NEON+SDOT), OS-managed KV/recurrent cache. Select at boot
+  or with `/model load` / `/model remote` (hosted OpenAI-compatible servers).
+- **The capability ABI (Synapse).** Grammar-constrained, MCP-shaped tool calls;
+  capability + **scope** gate (fs path globs, host/port ranges); taint gate;
+  deterministic executor; append-only audit log.
+- **Prompt-injection defense at the OS boundary.** Provenance tags follow every
+  token; destructive work justified only by untrusted content is refused or
+  requires human confirmation.
+- **Skills & installable agents.** Signed, progressive-disclosure skills; agents
+  as markdown packages (SOUL + skills + manifest). Install from a **public
+  registry** (`/agents search`, `/agents install`) with consent and **ECDSA
+  P-256** publisher trust. Per-agent home sandbox: `/agent/<id>/**`.
+
+### Messaging & IPC
+
+- **Messaging channels (Telegram first).** OpenClaw-style external inboxes:
+  `/channel add telegram …`, pairing / allowlist, poll over HTTPS Bot API,
+  inbound → shell agent → reply. Config at `/configs/core/channels.json`.
+  **See [CHANNELS.md](CHANNELS.md)** for full setup and how to add backends
+  (Discord, Slack, …).
+- **Inter-agent channels.** Capability-gated **byte-stream and datagram IPC**
+  between agents (and TCP handoff for service pipelines) — distinct from
+  messaging channels above.
+- **MCP client.** `/mcp connect` registers remote tools as `mcp__…` for the
+  agent; manifests can declare MCP servers at install time.
+
+### Filesystem & shell UX
+
+- **Linux-like store FS.** Hierarchical `/ls` (not a flat dump of every key),
+  `/cat`, `/mkdir`, `/cp`, `/mv`, `/rm`, `/touch`, `/glob`, `/grep`, `/pwd` over
+  the Synapse path store (and mount-aware reads for media/models).
+- **Composer UX.** Grok-style input box; **slash-command** and **`@file`**
+  suggestion menus (↑↓ / Tab / Enter); **Commands** browser for `/help`
+  (search + scroll + fill the composer on select).
+- **Host clipboard bridge.** OSC 52 copy-out and bracketed paste so the guest
+  clipboard syncs with the host terminal.
+
+### UI, media & services
+
+- **Windowed console.** Tmux-style resizable chat | action split, tabbed action
+  pane (ktrace, **htop-style `/top`**, todos, editor, image / audio / video),
+  mouse + keyboard, selection, syntax highlighting, live clock, Geist Mono,
+  themable brand ([DESIGN.md](DESIGN.md)).
+- **Service agents & web pipeline.** Native **network / http / server** stages;
+  content agents (e.g. **doc**) are data + SOUL, not per-site Rust.
+  `/agents start <name> [port]`; **ssh** agent for version exchange (transport
+  evolving).
+- **Sound & voice.** virtio-snd / HDA (and legacy paths); `/voice` (VAD → STT →
+  LLM → TTS) with ONNX models (silero, parakeet, KittenTTS).
+- **Media.** In-kernel PNG/JPEG; WAV/MP3/AAC player; H.264 baseline video player
+  (`/open .mp4|.mov`) with streaming decode and transport controls.
+- **Networking.** Full TCP/IP (smoltcp): DHCP, DNS, ping, loopback, HTTP(S)
+  client, WebSocket client, downloads to `/downloads/`.
+
+### Platform
+
+- **Dual-architecture, one codebase.** `x86_64` and `aarch64`; aarch64 runs
+  natively on Apple Silicon under QEMU-HVF. Features do not diverge by arch.
+- **Real, standards-based drivers.** UEFI/Limine/GOP display; virtio/NVMe/AHCI
+  disks; USB xHCI/HID + virtio-input + PL050/PS-2; PCIe/ACPI discovery. Same
+  image for QEMU, VirtualBox, and real UEFI hardware.
+- **Storage & self-install.** GPT/MBR/FAT/ext4; durable agent state on ext4;
+  `/install` update-in-place with modal confirm.
+- **Microkernel core.** Unforgeable capabilities, scheduler (cooperative +
+  preemptive), SMP bring-up, MMU, heap.
+
+## Messaging channels (short path)
+
+Full guide: **[CHANNELS.md](CHANNELS.md)**.
+
+```text
+# 1. Create a bot with @BotFather → copy the token
+# 2. On a networked Chitti:
+
+/channel add telegram home <BOT_TOKEN> pairing
+/channel start home
+
+# 3. DM the bot; note the pairing code it sends
+/channel pair home <CODE>
+
+# 4. Chat — messages go to the shell agent; replies return on Telegram
+# Console helpers:
+/channel send home <chat_id> Hello from Chitti
+/channel reply home Got it
+/channel status
+```
+
+To add another platform (Discord, Slack, …), see
+[Adding a new channel backend](CHANNELS.md#adding-a-new-channel-backend) —
+extend `msgchan::Kind`, implement poll/send, wire match arms; the `/channel`
+CLI stays the same.
 
 ## Try it (real hardware or a VM)
 
@@ -104,7 +174,8 @@ You don't need the toolchain to run Chitti — grab a prebuilt image, or build o
      keyboard to **USB** so the USB-HID drivers pick them up. On macOS,
      `make vbox` does the VirtualBox setup for you (see DEVELOPMENT.md).
 
-Once booted you land in the chat shell — type a message, or `/help` for commands.
+Once booted you land in the chat shell — type a message, or `/help` for the
+Commands browser (searchable). `/help text` prints a flat list over serial.
 
 > Reminder: this is research software — **boot it from removable media / in a VM,
 > not on a machine whose data you care about.** See the warning above.
@@ -115,7 +186,8 @@ Everything goes through `cargo xtask`; a `Makefile` wraps the common commands.
 The target architecture is always explicit. In short:
 
 ```sh
-make test                 # in-kernel test suite under QEMU (x86_64) — no model needed
+make test                 # in-kernel unit suite under QEMU (x86_64) — pure logic, no model
+make e2e                  # end-to-end: boot the real kernel, drive the shell over serial
 make run  ARCH=aarch64    # boot natively on Apple Silicon (QEMU + HVF)
 make image ARCH=x86_64    # assemble a bootable ISO under target/
 make help                 # list all targets
@@ -124,9 +196,25 @@ make help                 # list all targets
 cargo xtask run -arch aarch64
 ```
 
+Two test layers back every change: **unit tests** (`cargo xtask test`) for the
+pure logic, and **end-to-end scenarios** (`make e2e`) that boot the real kernel
+and exercise shell commands plus networked, agent-install, service, and UI flows.
+New features add to both.
+
 `make vbox` rebuilds the aarch64 image and reloads it into a VirtualBox VM.
 Full prerequisites, the model fetch, per-arch boot, VirtualBox, and headless
 framebuffer verification are in **[DEVELOPMENT.md](DEVELOPMENT.md)**.
+
+## Documentation
+
+| Doc | Contents |
+|---|---|
+| **[CHANNELS.md](CHANNELS.md)** | Messaging channels: Telegram setup, `/channel` reference, adding backends |
+| **[DEVELOPMENT.md](DEVELOPMENT.md)** | Toolchain, build/run/test, VirtualBox |
+| **[DESIGN.md](DESIGN.md)** | Brand, palette, compositor UX |
+| **[CLAUDE.md](CLAUDE.md)** | Invariants & standing rules for work in-tree |
+| **[CONTRIBUTING.md](CONTRIBUTING.md)** | Contribution workflow |
+| **[SECURITY.md](SECURITY.md)** | Security reporting |
 
 ## Contributing
 

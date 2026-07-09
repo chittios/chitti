@@ -15,7 +15,7 @@
 //! One token per `forward` call; deltanet layers carry a recurrent state +
 //! conv ring in `Cache`, attention layers carry a KV history. Deterministic.
 
-use super::gguf::{Config, Gguf, GgufError, GGML_TYPE_F32};
+use super::gguf::{Config, Family, Gguf, GgufError, GGML_TYPE_F32};
 use super::tensor::{self, QK};
 use alloc::format;
 use alloc::string::String;
@@ -68,6 +68,10 @@ fn matvec_qw(qw: QWeight, x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &mut [f32
         tensor::matvec_q4_0_fast(qw.data, x, y, xq, xs, n_rows, n_cols);
         return;
     }
+    if qw.qt == tensor::QT_Q4_K && n_cols % tensor::QK_K == 0 {
+        tensor::matvec_q4_k_fast(qw.data, x, y, xq, xs, n_rows, n_cols);
+        return;
+    }
     debug_assert_eq!(x.len(), n_cols);
     debug_assert_eq!(y.len(), n_rows);
     let _ = (&mut *xq, &mut *xs);
@@ -103,11 +107,37 @@ enum LayerKind<'a> {
         norm: &'a [f32],     // [head_v_dim]
         out: QWeight<'a>,    // [value_dim -> dim]
     },
+    /// Gemma-4 attention (llama.cpp `gemma4.cpp` graph): per-layer geometry
+    /// (sliding layers GQA with a windowed KV ring; global layers MQA with a
+    /// larger head_dim, `v` absent → K reused as V, p-RoPE freq factors),
+    /// per-head QK-norms with an *unweighted* RMS on V, attention scale 1.0.
+    GemmaAttn {
+        q: QWeight<'a>,         // [dim -> n_head*head_dim]
+        k: QWeight<'a>,         // [dim -> n_kv*head_dim]
+        v: Option<QWeight<'a>>, // absent on global layers (V = K)
+        o: QWeight<'a>,         // [n_head*head_dim -> dim]
+        q_norm: &'a [f32],      // [head_dim]
+        k_norm: &'a [f32],      // [head_dim]
+        n_kv: usize,
+        head_dim: usize,
+        /// `Some(W)` = sliding-window layer (KV ring of W); `None` = global.
+        window: Option<usize>,
+        rope_base: f32,
+        /// p-RoPE frequency divisors (global layers; `rope_freqs.weight`).
+        freq_factors: Option<&'a [f32]>,
+    },
 }
 
 struct Layer<'a> {
     attn_norm: &'a [f32],
+    /// The norm feeding the FFN (qwen `post_attention_norm` / gemma `ffn_norm`).
     post_norm: &'a [f32],
+    /// Gemma sandwich norms: applied to the attention/FFN block *output*
+    /// before its residual add. `None` (qwen) leaves the math untouched.
+    post_attn_norm: Option<&'a [f32]>,
+    ffn_post_norm: Option<&'a [f32]>,
+    /// Gemma per-layer output scalar (`layer_output_scale`); 1.0 = absent.
+    out_scale: f32,
     kind: LayerKind<'a>,
     ffn_gate: QWeight<'a>,
     ffn_up: QWeight<'a>,
@@ -163,26 +193,39 @@ impl State {
     pub fn new(c: &Config, vocab: usize) -> Self {
         let dim = c.embedding_length;
         let v = |n| alloc::vec![0.0f32; n];
+        // DeltaNet scratch exists only for hybrid families; zero-sized else.
+        let (ssm_inner, ssm_conv, ssm_heads) =
+            c.ssm.map(|s| (s.inner, s.conv_dim(), s.dt_rank)).unwrap_or((0, 0, 0));
+        // SWA families have a second (global-layer) attention geometry; the
+        // scratch must cover the wider of the two.
+        let hd_g = c.swa.map(|s| s.head_dim_global).unwrap_or(0);
+        let kv_g = c.swa.map(|s| s.head_count_kv_global * s.head_dim_global).unwrap_or(0);
+        let q_width = (c.head_count * c.head_dim * 2).max(c.head_count * hd_g);
+        let kv_width = (c.head_count_kv * c.head_dim).max(kv_g);
         // Widest matvec input across all projections (columns): the norm-fed
         // projections use `dim`, ffn_down uses the FFN width, o_proj uses
-        // head_count*head_dim, and the DeltaNet output uses ssm_inner.
-        let max_cols =
-            dim.max(c.feed_forward_length).max(c.head_count * c.head_dim).max(c.ssm_inner);
+        // head_count*head_dim (per geometry), and the DeltaNet output uses
+        // ssm_inner.
+        let max_cols = dim
+            .max(c.feed_forward_length)
+            .max(c.head_count * c.head_dim)
+            .max(c.head_count * hd_g)
+            .max(ssm_inner);
         Self {
             hidden: v(dim),
             residual: v(dim),
             norm: v(dim),
-            q: v(c.head_count * c.head_dim * 2),
-            k: v(c.head_count_kv * c.head_dim),
-            v: v(c.head_count_kv * c.head_dim),
-            attn_out: v(c.head_count * c.head_dim),
+            q: v(q_width),
+            k: v(kv_width),
+            v: v(kv_width),
+            attn_out: v(q_width),
             scores: v(c.context_length),
-            qkv: v(c.ssm_conv_dim()),
-            z: v(c.ssm_inner),
-            gates: v(c.ssm_dt_rank),
-            betas: v(c.ssm_dt_rank),
-            conv: v(c.ssm_conv_dim()),
-            delta_o: v(c.ssm_inner),
+            qkv: v(ssm_conv),
+            z: v(ssm_inner),
+            gates: v(ssm_heads),
+            betas: v(ssm_heads),
+            conv: v(ssm_conv),
+            delta_o: v(ssm_inner),
             ffn_gate: v(c.feed_forward_length),
             ffn_up: v(c.feed_forward_length),
             ffn_act: v(c.feed_forward_length),
@@ -194,11 +237,15 @@ impl State {
     }
 }
 
-/// Hybrid per-stream cache: KV history for attention layers, recurrent
-/// state + conv ring for gated-DeltaNet layers.
+/// Per-stream cache: KV history for attention layers (a fixed W-slot ring on
+/// sliding-window layers), recurrent state + conv ring for gated-DeltaNet
+/// layers.
 pub struct Cache {
-    attn_k: Vec<Vec<f32>>, // [layer] -> flattened [pos * (n_kv*head_dim)]
+    attn_k: Vec<Vec<f32>>, // [layer] -> flattened [pos * (n_kv*head_dim)] (or a W-slot ring)
     attn_v: Vec<Vec<f32>>,
+    /// Per layer: true when attn_k/attn_v is a preallocated sliding-window
+    /// ring (fixed length; evict zeroes it) rather than a growing history.
+    ring: Vec<bool>,
     delta_s: Vec<Vec<f32>>, // [layer] -> [n_v_heads * state * head_v_dim]
     conv: Vec<Vec<f32>>,    // [layer] -> conv ring [conv_kernel * conv_dim]
     positions: usize,
@@ -207,28 +254,44 @@ pub struct Cache {
 impl Cache {
     pub fn new(c: &Config) -> Self {
         let n = c.block_count;
-        let head_k = c.ssm_state;
-        let head_v = c.ssm_head_dim();
-        let s_size = c.ssm_dt_rank * head_k * head_v;
-        let conv_size = c.ssm_conv_kernel * c.ssm_conv_dim();
+        // DeltaNet state sizes; attention-only families never take the else
+        // branch below, so zero sizes are never allocated.
+        let (s_size, conv_size) = c
+            .ssm
+            .map(|s| (s.dt_rank * s.state * s.head_dim(), s.conv_kernel * s.conv_dim()))
+            .unwrap_or((0, 0));
         let mut attn_k = Vec::with_capacity(n);
         let mut attn_v = Vec::with_capacity(n);
+        let mut ring = Vec::with_capacity(n);
         let mut delta_s = Vec::with_capacity(n);
         let mut conv = Vec::with_capacity(n);
         for l in 0..n {
             if c.is_attention_layer(l) {
-                attn_k.push(Vec::new());
-                attn_v.push(Vec::new());
+                // Sliding-window layers bound their KV to a W-slot ring (the
+                // base config geometry is the sliding-layer one); global /
+                // full-history layers grow with the actual sequence.
+                if c.is_sliding(l) {
+                    let w = c.swa.map(|s| s.window).unwrap_or(0);
+                    let kv_dim = c.head_count_kv * c.head_dim;
+                    attn_k.push(alloc::vec![0.0f32; w * kv_dim]);
+                    attn_v.push(alloc::vec![0.0f32; w * kv_dim]);
+                    ring.push(true);
+                } else {
+                    attn_k.push(Vec::new());
+                    attn_v.push(Vec::new());
+                    ring.push(false);
+                }
                 delta_s.push(Vec::new());
                 conv.push(Vec::new());
             } else {
                 attn_k.push(Vec::new());
                 attn_v.push(Vec::new());
+                ring.push(false);
                 delta_s.push(alloc::vec![0.0f32; s_size]);
                 conv.push(alloc::vec![0.0f32; conv_size]);
             }
         }
-        Self { attn_k, attn_v, delta_s, conv, positions: 0 }
+        Self { attn_k, attn_v, ring, delta_s, conv, positions: 0 }
     }
 
     pub fn len(&self) -> usize {
@@ -240,12 +303,22 @@ impl Cache {
 
     /// Reset all recurrent state / KV history (KV evict). The continuation
     /// is reproduced by replaying tokens through the deterministic pass.
+    /// Ring layers keep their fixed length and are zeroed; growing layers
+    /// are truncated.
     pub fn evict(&mut self) {
-        for k in &mut self.attn_k {
-            k.clear();
+        for (l, k) in self.attn_k.iter_mut().enumerate() {
+            if self.ring[l] {
+                k.iter_mut().for_each(|x| *x = 0.0);
+            } else {
+                k.clear();
+            }
         }
-        for v in &mut self.attn_v {
-            v.clear();
+        for (l, v) in self.attn_v.iter_mut().enumerate() {
+            if self.ring[l] {
+                v.iter_mut().for_each(|x| *x = 0.0);
+            } else {
+                v.clear();
+            }
         }
         for s in &mut self.delta_s {
             s.iter_mut().for_each(|x| *x = 0.0);
@@ -254,7 +327,7 @@ impl Cache {
             c.iter_mut().for_each(|x| *x = 0.0);
         }
         self.positions = 0;
-        crate::ktrace::log("cortex.kv", "hybrid cache evicted (KV + recurrent state reset)");
+        crate::ktrace::log("cortex.kv", "cache evicted (KV + recurrent state reset)");
     }
 }
 
@@ -268,43 +341,91 @@ impl<'a> Model<'a> {
         let attn_q_dim = c.head_count * head_dim * 2;
         let kv_dim = c.head_count_kv * head_dim;
         let attn_o_in = c.head_count * head_dim;
-        let conv_dim = c.ssm_conv_dim();
-        let value_dim = c.ssm_inner;
-        let head_v = c.ssm_head_dim();
 
         let token_embd = qtensor(&gguf, "token_embd.weight", dim, vocab)?;
         // Untied output projection if the GGUF has one (the 9B); else tied.
         let output = qtensor(&gguf, "output.weight", dim, vocab).ok();
         let output_norm = f32_tensor(&gguf, "output_norm.weight", dim)?;
+        // Gemma p-RoPE frequency divisors for global layers (one shared root
+        // tensor, `head_dim_global/2` entries). Absent elsewhere.
+        let rope_freqs: Option<&[f32]> = c
+            .swa
+            .and_then(|swa| f32_tensor(&gguf, "rope_freqs.weight", swa.rope_dim_global / 2).ok());
 
         let mut layers = Vec::with_capacity(c.block_count);
         for l in 0..c.block_count {
             let n = |s: &str| format!("blk.{l}.{s}");
-            let kind = if c.is_attention_layer(l) {
-                LayerKind::Attn {
-                    q: qtensor(&gguf, &n("attn_q.weight"), dim, attn_q_dim)?,
-                    k: qtensor(&gguf, &n("attn_k.weight"), dim, kv_dim)?,
-                    v: qtensor(&gguf, &n("attn_v.weight"), dim, kv_dim)?,
-                    o: qtensor(&gguf, &n("attn_output.weight"), attn_o_in, dim)?,
-                    q_norm: f32_tensor(&gguf, &n("attn_q_norm.weight"), head_dim)?,
-                    k_norm: f32_tensor(&gguf, &n("attn_k_norm.weight"), head_dim)?,
+            // Gemma sandwich norms + per-layer output scalar; None/1.0 for
+            // hybrid families keeps their forward math untouched.
+            let mut post_attn_norm = None;
+            let mut ffn_post_norm = None;
+            let mut out_scale = 1.0f32;
+            let (kind, post_norm) = match c.family {
+                Family::Gemma4 => {
+                    // Per-layer geometry: base config carries the sliding-layer
+                    // values; global layers override from SwaConfig.
+                    let swa = c.swa.expect("gemma requires swa config");
+                    let sliding = c.is_sliding(l);
+                    let (hd, n_kv, rope_base, window, freq_factors) = if sliding {
+                        (c.head_dim, c.head_count_kv, c.rope_freq_base, Some(swa.window), None)
+                    } else {
+                        (swa.head_dim_global, swa.head_count_kv_global, swa.freq_base_global, None, rope_freqs)
+                    };
+                    post_attn_norm = Some(f32_tensor(&gguf, &n("post_attention_norm.weight"), dim)?);
+                    ffn_post_norm = Some(f32_tensor(&gguf, &n("post_ffw_norm.weight"), dim)?);
+                    out_scale = f32_tensor(&gguf, &n("layer_output_scale.weight"), 1).map(|s| s[0]).unwrap_or(1.0);
+                    let kind = LayerKind::GemmaAttn {
+                        q: qtensor(&gguf, &n("attn_q.weight"), dim, c.head_count * hd)?,
+                        k: qtensor(&gguf, &n("attn_k.weight"), dim, n_kv * hd)?,
+                        // Global layers have no V projection: V = K.
+                        v: qtensor(&gguf, &n("attn_v.weight"), dim, n_kv * hd).ok(),
+                        o: qtensor(&gguf, &n("attn_output.weight"), c.head_count * hd, dim)?,
+                        q_norm: f32_tensor(&gguf, &n("attn_q_norm.weight"), hd)?,
+                        k_norm: f32_tensor(&gguf, &n("attn_k_norm.weight"), hd)?,
+                        n_kv,
+                        head_dim: hd,
+                        window,
+                        rope_base,
+                        freq_factors,
+                    };
+                    (kind, f32_tensor(&gguf, &n("ffn_norm.weight"), dim)?)
                 }
-            } else {
-                LayerKind::Delta {
-                    qkv: qtensor(&gguf, &n("attn_qkv.weight"), dim, conv_dim)?,
-                    gate: qtensor(&gguf, &n("attn_gate.weight"), dim, value_dim)?,
-                    conv1d: f32_tensor(&gguf, &n("ssm_conv1d.weight"), conv_dim * c.ssm_conv_kernel)?,
-                    dt_bias: f32_tensor(&gguf, &n("ssm_dt.bias"), c.ssm_dt_rank)?,
-                    a_log: f32_tensor(&gguf, &n("ssm_a"), c.ssm_dt_rank)?,
-                    alpha: qtensor(&gguf, &n("ssm_alpha.weight"), dim, c.ssm_dt_rank)?,
-                    beta: qtensor(&gguf, &n("ssm_beta.weight"), dim, c.ssm_dt_rank)?,
-                    norm: f32_tensor(&gguf, &n("ssm_norm.weight"), head_v)?,
-                    out: qtensor(&gguf, &n("ssm_out.weight"), value_dim, dim)?,
+                Family::QwenHybrid if c.is_attention_layer(l) => {
+                    let kind = LayerKind::Attn {
+                        q: qtensor(&gguf, &n("attn_q.weight"), dim, attn_q_dim)?,
+                        k: qtensor(&gguf, &n("attn_k.weight"), dim, kv_dim)?,
+                        v: qtensor(&gguf, &n("attn_v.weight"), dim, kv_dim)?,
+                        o: qtensor(&gguf, &n("attn_output.weight"), attn_o_in, dim)?,
+                        q_norm: f32_tensor(&gguf, &n("attn_q_norm.weight"), head_dim)?,
+                        k_norm: f32_tensor(&gguf, &n("attn_k_norm.weight"), head_dim)?,
+                    };
+                    (kind, f32_tensor(&gguf, &n("post_attention_norm.weight"), dim)?)
+                }
+                Family::QwenHybrid => {
+                    // Delta layers exist only in hybrid families, so `ssm` is
+                    // present here.
+                    let s = c.ssm.expect("delta layer requires ssm config");
+                    let (conv_dim, value_dim) = (s.conv_dim(), s.inner);
+                    let kind = LayerKind::Delta {
+                        qkv: qtensor(&gguf, &n("attn_qkv.weight"), dim, conv_dim)?,
+                        gate: qtensor(&gguf, &n("attn_gate.weight"), dim, value_dim)?,
+                        conv1d: f32_tensor(&gguf, &n("ssm_conv1d.weight"), conv_dim * s.conv_kernel)?,
+                        dt_bias: f32_tensor(&gguf, &n("ssm_dt.bias"), s.dt_rank)?,
+                        a_log: f32_tensor(&gguf, &n("ssm_a"), s.dt_rank)?,
+                        alpha: qtensor(&gguf, &n("ssm_alpha.weight"), dim, s.dt_rank)?,
+                        beta: qtensor(&gguf, &n("ssm_beta.weight"), dim, s.dt_rank)?,
+                        norm: f32_tensor(&gguf, &n("ssm_norm.weight"), s.head_dim())?,
+                        out: qtensor(&gguf, &n("ssm_out.weight"), value_dim, dim)?,
+                    };
+                    (kind, f32_tensor(&gguf, &n("post_attention_norm.weight"), dim)?)
                 }
             };
             layers.push(Layer {
                 attn_norm: f32_tensor(&gguf, &n("attn_norm.weight"), dim)?,
-                post_norm: f32_tensor(&gguf, &n("post_attention_norm.weight"), dim)?,
+                post_norm,
+                post_attn_norm,
+                ffn_post_norm,
+                out_scale,
                 kind,
                 ffn_gate: qtensor(&gguf, &n("ffn_gate.weight"), dim, ffn)?,
                 ffn_up: qtensor(&gguf, &n("ffn_up.weight"), dim, ffn)?,
@@ -326,6 +447,9 @@ impl<'a> Model<'a> {
                         LayerKind::Delta { qkv, gate, alpha, beta, out, .. } => {
                             q8(qkv) && q8(gate) && q8(alpha) && q8(beta) && q8(out)
                         }
+                        // The batched-prefill fast path is qwen-shaped; gemma
+                        // always prefills sequentially.
+                        LayerKind::GemmaAttn { .. } => false,
                     }
             });
 
@@ -340,7 +464,7 @@ impl<'a> Model<'a> {
     }
     /// Build the BPE text encoder from this model's vocab + merges (owns its
     /// maps, so it outlives borrows of the model). ~40 MiB / ~200 ms for the 9B.
-    pub fn tokenizer(&self) -> crate::cortex::tokenizer::Tokenizer {
+    pub fn tokenizer(&self) -> crate::cortex::tokenizer::Tokenizer<'a> {
         crate::cortex::tokenizer::Tokenizer::build(&self.gguf)
     }
     /// The model's EOS token id (generation stops here).
@@ -392,9 +516,8 @@ impl<'a> Model<'a> {
         let kv_dim = c.head_count_kv * hd;
         let qdim = nq * hd * 2; // query+gate interleaved
         let ao = nq * hd; // attn_out / o-proj input width
-        let conv_dim = c.ssm_conv_dim();
-        let value_dim = c.ssm_inner;
-        let nh = c.ssm_dt_rank;
+        let (conv_dim, value_dim, nh) =
+            c.ssm.map(|s| (s.conv_dim(), s.inner, s.dt_rank)).unwrap_or((0, 0, 0));
         let m = prompt.len();
         let max_cols = dim.max(ffn).max(ao).max(value_dim);
 
@@ -444,6 +567,10 @@ impl<'a> Model<'a> {
                     }
                     self.batched_proj(o_w, &attn_out, &mut proj_out, &mut xq, &mut xs, m, dim, ao);
                 }
+                // Batched prefill is gated on `all_q8_0`, which is always
+                // false for Gemma models (see `Model::load`), so this arm can
+                // never be reached.
+                LayerKind::GemmaAttn { .. } => unreachable!("gemma never takes the batched-prefill path"),
                 LayerKind::Delta { qkv: qkv_w, gate: gate_w, alpha: alpha_w, beta: beta_w, out: out_w, .. } => {
                     let (qkv_w, gate_w, alpha_w, beta_w, out_w) = (*qkv_w, *gate_w, *alpha_w, *beta_w, *out_w);
                     self.batched_proj(qkv_w, &norm, &mut qkv, &mut xq, &mut xs, m, conv_dim, dim);
@@ -524,28 +651,51 @@ impl<'a> Model<'a> {
         let dim = c.embedding_length;
 
         dequant_embed_row(self.token_embd, token, &mut s.hidden);
+        // Gemma scales embeddings by sqrt(dim); skipped entirely elsewhere so
+        // the hybrid path's math is untouched.
+        if c.family == Family::Gemma4 {
+            let es = tensor_sqrtf(dim as f32);
+            s.hidden.iter_mut().for_each(|x| *x *= es);
+        }
 
         for l in 0..self.layers.len() {
+            let ly = &self.layers[l];
             s.residual.copy_from_slice(&s.hidden);
-            tensor::rmsnorm(&s.hidden, self.layers[l].attn_norm, c.rms_eps, &mut s.norm);
-            match &self.layers[l].kind {
+            tensor::rmsnorm(&s.hidden, ly.attn_norm, c.rms_eps, &mut s.norm);
+            match &ly.kind {
                 LayerKind::Attn { .. } => self.attn_layer(l, pos, cache, s),
                 LayerKind::Delta { .. } => self.delta_layer(l, cache, s),
+                LayerKind::GemmaAttn { .. } => self.gemma_attn_layer(l, pos, cache, s),
+            }
+            // Gemma sandwich: normalize the block output before its residual.
+            if let Some(w) = ly.post_attn_norm {
+                tensor::rmsnorm_inplace(&mut s.proj, w, c.rms_eps);
             }
             // attn residual: hidden = residual + proj
             for i in 0..dim {
                 s.hidden[i] = s.residual[i] + s.proj[i];
             }
-            // FFN block (SwiGLU) with its own residual.
+            // FFN block (SwiGLU / GELU-par) with its own residual.
             s.residual.copy_from_slice(&s.hidden);
-            tensor::rmsnorm(&s.hidden, self.layers[l].post_norm, c.rms_eps, &mut s.norm);
+            tensor::rmsnorm(&s.hidden, ly.post_norm, c.rms_eps, &mut s.norm);
             let ffn = c.feed_forward_length;
-            matvec_qw(self.layers[l].ffn_gate, &s.norm, &mut s.ffn_gate, &mut s.xq, &mut s.xs, ffn, dim);
-            matvec_qw(self.layers[l].ffn_up, &s.norm, &mut s.ffn_up, &mut s.xq, &mut s.xs, ffn, dim);
-            tensor::silu_mul(&s.ffn_gate, &s.ffn_up, &mut s.ffn_act);
-            matvec_qw(self.layers[l].ffn_down, &s.ffn_act, &mut s.proj, &mut s.xq, &mut s.xs, dim, ffn);
+            matvec_qw(ly.ffn_gate, &s.norm, &mut s.ffn_gate, &mut s.xq, &mut s.xs, ffn, dim);
+            matvec_qw(ly.ffn_up, &s.norm, &mut s.ffn_up, &mut s.xq, &mut s.xs, ffn, dim);
+            match c.family {
+                Family::Gemma4 => tensor::gelu_mul(&s.ffn_gate, &s.ffn_up, &mut s.ffn_act),
+                _ => tensor::silu_mul(&s.ffn_gate, &s.ffn_up, &mut s.ffn_act),
+            }
+            matvec_qw(ly.ffn_down, &s.ffn_act, &mut s.proj, &mut s.xq, &mut s.xs, dim, ffn);
+            if let Some(w) = ly.ffn_post_norm {
+                tensor::rmsnorm_inplace(&mut s.proj, w, c.rms_eps);
+            }
             for i in 0..dim {
                 s.hidden[i] = s.residual[i] + s.proj[i];
+            }
+            // Gemma per-layer output scalar (scales the whole stream).
+            if ly.out_scale != 1.0 {
+                let os = ly.out_scale;
+                s.hidden.iter_mut().for_each(|x| *x *= os);
             }
         }
 
@@ -554,9 +704,125 @@ impl<'a> Model<'a> {
             // Untied output projection if present (9B), else the tied embeddings.
             let out_w = self.output.unwrap_or(self.token_embd);
             matvec_qw(out_w, &s.norm, &mut s.logits, &mut s.xq, &mut s.xs, self.vocab, dim);
+            // Gemma final-logit softcap + suppressed-token bias.
+            if let Some(swa) = c.swa {
+                if swa.logit_softcap != 0.0 {
+                    let cap = swa.logit_softcap;
+                    s.logits.iter_mut().for_each(|x| *x = cap * tensor::tanhf(*x / cap));
+                }
+            }
+            for &id in &self.gguf.suppress_tokens {
+                if let Some(lg) = s.logits.get_mut(id as usize) {
+                    *lg = f32::NEG_INFINITY;
+                }
+            }
         }
 
         cache.positions = cache.positions.max(pos + 1);
+    }
+
+    fn gemma_attn_layer(&self, l: usize, pos: usize, cache: &mut Cache, s: &mut State) {
+        let c = &self.config;
+        let dim = c.embedding_length;
+        let (q_w, k_w, v_w, o_w, n_kv, hd) = match &self.layers[l].kind {
+            LayerKind::GemmaAttn { q, k, v, o, n_kv, head_dim, .. } => (*q, *k, *v, *o, *n_kv, *head_dim),
+            _ => unreachable!(),
+        };
+        let nq = c.head_count;
+        let kv_dim = n_kv * hd;
+
+        // Exact-length slices: the scratch is sized for the widest geometry
+        // (`State::new`), and the int8-quantize path requires x.len == n_cols.
+        matvec_qw(q_w, &s.norm, &mut s.q[..nq * hd], &mut s.xq, &mut s.xs, nq * hd, dim);
+        matvec_qw(k_w, &s.norm, &mut s.k[..kv_dim], &mut s.xq, &mut s.xs, kv_dim, dim);
+        match v_w {
+            Some(v) => matvec_qw(v, &s.norm, &mut s.v[..kv_dim], &mut s.xq, &mut s.xs, kv_dim, dim),
+            // Global layers have no V projection: V = K (pre-norm/rope copy).
+            None => {
+                let (k, v) = (&s.k[..kv_dim], &mut s.v[..kv_dim]);
+                v.copy_from_slice(k);
+            }
+        }
+
+        self.gemma_attn_core(l, pos, cache, s);
+
+        matvec_qw(o_w, &s.attn_out[..nq * hd], &mut s.proj, &mut s.xq, &mut s.xs, dim, nq * hd);
+    }
+
+    /// The position-sequential core of a Gemma-4 attention layer (llama.cpp
+    /// `gemma4.cpp`): per-head weighted QK-norms + an *unweighted* RMS on V,
+    /// full-dim NeoX RoPE (per-layer base; p-RoPE freq divisors on global
+    /// layers), KV append (sliding layers write a W-slot ring), causal
+    /// attention at scale 1.0 over the layer's window.
+    fn gemma_attn_core(&self, l: usize, pos: usize, cache: &mut Cache, s: &mut State) {
+        let c = &self.config;
+        let (q_norm, k_norm, n_kv, hd, window, rope_base, freq_factors) = match &self.layers[l].kind {
+            LayerKind::GemmaAttn { q_norm, k_norm, n_kv, head_dim, window, rope_base, freq_factors, .. } => {
+                (*q_norm, *k_norm, *n_kv, *head_dim, *window, *rope_base, *freq_factors)
+            }
+            _ => unreachable!(),
+        };
+        let nq = c.head_count;
+        let kv_dim = n_kv * hd;
+        let group = nq / n_kv;
+
+        // Per-head norms + full-dim RoPE. V gets a bare (unweighted) RMS norm.
+        for h in 0..nq {
+            let q = &mut s.q[h * hd..(h + 1) * hd];
+            tensor::rmsnorm_inplace(q, q_norm, c.rms_eps);
+            tensor::rope_ext(q, pos, hd, rope_base, freq_factors);
+        }
+        for h in 0..n_kv {
+            let k = &mut s.k[h * hd..(h + 1) * hd];
+            tensor::rmsnorm_inplace(k, k_norm, c.rms_eps);
+            let v = &mut s.v[h * hd..(h + 1) * hd];
+            rms_scale(v, c.rms_eps);
+            tensor::rope_ext(k, pos, hd, rope_base, freq_factors);
+        }
+
+        // KV store: sliding layers keep a fixed W-slot ring (keys roped at
+        // absolute position before insertion, so eviction never re-ropes);
+        // global layers append full history.
+        let (t_lo, ring) = match window {
+            Some(w) => {
+                let slot = (pos % w) * kv_dim;
+                cache.attn_k[l][slot..slot + kv_dim].copy_from_slice(&s.k[..kv_dim]);
+                cache.attn_v[l][slot..slot + kv_dim].copy_from_slice(&s.v[..kv_dim]);
+                ((pos + 1).saturating_sub(w), Some(w))
+            }
+            None => {
+                cache.attn_k[l].extend_from_slice(&s.k[..kv_dim]);
+                cache.attn_v[l].extend_from_slice(&s.v[..kv_dim]);
+                (0, None)
+            }
+        };
+
+        // Causal attention, scale 1.0 (Gemma-4: the QK-norms replace 1/sqrt(d)).
+        for h in 0..nq {
+            let kvh = h / group;
+            let q_head = &s.q[h * hd..(h + 1) * hd];
+            for t in t_lo..=pos {
+                let off = match ring {
+                    Some(w) => (t % w) * kv_dim + kvh * hd,
+                    None => t * kv_dim + kvh * hd,
+                };
+                s.scores[t - t_lo] = tensor::dot_f32(q_head, &cache.attn_k[l][off..off + hd]);
+            }
+            tensor::softmax(&mut s.scores[0..=pos - t_lo]);
+            let out = &mut s.attn_out[h * hd..(h + 1) * hd];
+            out.iter_mut().for_each(|x| *x = 0.0);
+            for t in t_lo..=pos {
+                let off = match ring {
+                    Some(w) => (t % w) * kv_dim + kvh * hd,
+                    None => t * kv_dim + kvh * hd,
+                };
+                let v_t = &cache.attn_v[l][off..off + hd];
+                let w = s.scores[t - t_lo];
+                for i in 0..hd {
+                    out[i] += w * v_t[i];
+                }
+            }
+        }
     }
 
     fn attn_layer(&self, l: usize, pos: usize, cache: &mut Cache, s: &mut State) {
@@ -572,14 +838,16 @@ impl<'a> Model<'a> {
         };
 
         // Projections into s.q (query+gate interleaved), s.k, s.v.
-        matvec_qw(q_w, &s.norm, &mut s.q, &mut s.xq, &mut s.xs, nq * hd * 2, dim);
-        matvec_qw(k_w, &s.norm, &mut s.k, &mut s.xq, &mut s.xs, kv_dim, dim);
-        matvec_qw(v_w, &s.norm, &mut s.v, &mut s.xq, &mut s.xs, kv_dim, dim);
+        // Exact-length slices: the scratch is sized for the widest geometry
+        // (`State::new`), and the int8-quantize path requires x.len == n_cols.
+        matvec_qw(q_w, &s.norm, &mut s.q[..nq * hd * 2], &mut s.xq, &mut s.xs, nq * hd * 2, dim);
+        matvec_qw(k_w, &s.norm, &mut s.k[..kv_dim], &mut s.xq, &mut s.xs, kv_dim, dim);
+        matvec_qw(v_w, &s.norm, &mut s.v[..kv_dim], &mut s.xq, &mut s.xs, kv_dim, dim);
 
         // Sequential (recurrent/causal) core: consumes s.q/s.k/s.v, writes s.attn_out.
         self.attn_core(l, pos, cache, s);
 
-        matvec_qw(o_w, &s.attn_out, &mut s.proj, &mut s.xq, &mut s.xs, dim, nq * hd);
+        matvec_qw(o_w, &s.attn_out[..nq * hd], &mut s.proj, &mut s.xq, &mut s.xs, dim, nq * hd);
     }
 
     /// The position-sequential part of an attention layer, shared by decode
@@ -645,9 +913,10 @@ impl<'a> Model<'a> {
     fn delta_layer(&self, l: usize, cache: &mut Cache, s: &mut State) {
         let c = &self.config;
         let dim = c.embedding_length;
-        let conv_dim = c.ssm_conv_dim();
-        let value_dim = c.ssm_inner;
-        let nh = c.ssm_dt_rank; // = n_group; k and v head counts are equal
+        let ssm = c.ssm.expect("delta layer requires ssm config");
+        let conv_dim = ssm.conv_dim();
+        let value_dim = ssm.inner;
+        let nh = ssm.dt_rank; // = n_group; k and v head counts are equal
         let (qkv_w, gate_w, alpha_w, beta_w, out_w) = match &self.layers[l].kind {
             LayerKind::Delta { qkv, gate, alpha, beta, out, .. } => (*qkv, *gate, *alpha, *beta, *out),
             _ => unreachable!(),
@@ -672,16 +941,17 @@ impl<'a> Model<'a> {
     /// be batched while this order-dependent recurrence stays identical.
     fn delta_core(&self, l: usize, cache: &mut Cache, s: &mut State) {
         let c = &self.config;
-        let conv_dim = c.ssm_conv_dim();
-        let nh = c.ssm_dt_rank; // value heads
-        let hk = c.ssm_state;
-        let hv = c.ssm_head_dim();
-        let key_dim = hk * c.ssm_n_group;
+        let ssm = c.ssm.expect("delta core requires ssm config");
+        let conv_dim = ssm.conv_dim();
+        let nh = ssm.dt_rank; // value heads
+        let hk = ssm.state;
+        let hv = ssm.head_dim();
+        let key_dim = hk * ssm.n_group;
         // GQA over the recurrent heads: `n_group` key/query heads, `nh` value
         // heads. llama.cpp maps them with `ggml_repeat` (tiling), i.e. value
         // head h uses key head `h % n_group` -- NOT repeat-interleave. (When
         // n_group == nh, e.g. the 0.8B, both are the identity.)
-        let ck = c.ssm_conv_kernel;
+        let ck = ssm.conv_kernel;
         let (conv1d, dt_bias, a_log, norm_w) = match &self.layers[l].kind {
             LayerKind::Delta { conv1d, dt_bias, a_log, norm, .. } => (*conv1d, *dt_bias, *a_log, *norm),
             _ => unreachable!(),
@@ -716,7 +986,7 @@ impl<'a> Model<'a> {
         let scale = 1.0 / tensor_sqrtf(hk as f32);
         let s_state = &mut cache.delta_s[l];
         for h in 0..nh {
-            let g = h % c.ssm_n_group; // key/query head (ggml_repeat tiling, per llama.cpp)
+            let g = h % ssm.n_group; // key/query head (ggml_repeat tiling, per llama.cpp)
             let q = &mut s.conv[g * hk..(g + 1) * hk].to_vec();
             let k = &mut s.conv[key_dim + g * hk..key_dim + (g + 1) * hk].to_vec();
             let vv = &s.conv[2 * key_dim + h * hv..2 * key_dim + (h + 1) * hv];
@@ -779,6 +1049,18 @@ fn dequant_embed_row(qw: QWeight, tok: usize, out: &mut [f32]) {
     }
 }
 
+/// Unweighted in-place RMS normalization (`x / sqrt(mean(x²)+eps)`) — Gemma-4
+/// applies this to V per head (a bare `ggml_rms_norm`, no weight tensor).
+fn rms_scale(x: &mut [f32], eps: f32) {
+    let mut ms = 0.0f32;
+    for &v in x.iter() {
+        ms += v * v;
+    }
+    ms = ms / x.len() as f32 + eps;
+    let inv = 1.0 / tensor_sqrtf(ms);
+    x.iter_mut().for_each(|v| *v *= inv);
+}
+
 fn tensor_sqrtf(x: f32) -> f32 {
     // Hardware sqrt per arch (`core` has no `f32::sqrt`): `sqrtss` on x86,
     // `fsqrt` on aarch64, Newton-Raphson elsewhere. Argument is positive.
@@ -832,14 +1114,28 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 pub fn detokenize(model: &Model, ids: &[usize]) -> String {
+    // Flavor-aware unmapping: GPT-2 byte-BPE tokens carry the Ġ/Ċ/ĉ byte
+    // aliases; gemma tokens are raw UTF-8 with ▁ whitespace + <0xXX> bytes.
+    let gemma = model.gguf.tokenizer_model == "gemma4";
     let mut out = String::new();
     for &id in ids {
-        for ch in model.token_str(id).chars() {
-            match ch {
-                'Ġ' => out.push(' '),
-                'Ċ' => out.push('\n'),
-                'ĉ' => out.push('\t'),
-                other => out.push(other),
+        let t = model.token_str(id);
+        if gemma {
+            if let Some(b) = crate::cortex::tokenizer::parse_byte_token(t) {
+                out.push(b as char);
+                continue;
+            }
+            for ch in t.chars() {
+                out.push(if ch == '\u{2581}' { ' ' } else { ch });
+            }
+        } else {
+            for ch in t.chars() {
+                match ch {
+                    'Ġ' => out.push(' '),
+                    'Ċ' => out.push('\n'),
+                    'ĉ' => out.push('\t'),
+                    other => out.push(other),
+                }
             }
         }
     }

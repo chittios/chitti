@@ -14,6 +14,16 @@ const BOOT_MSG: &str = "Chitti: boot ok";
 /// (and spawned demo agents + files on every boot) live on in the test suite;
 /// the only default agent is the shell agent.
 fn run_os() -> ! {
+    // Install the built-in system agents (network, http, ssh) into /agent/ from
+    // their bundled markdown + manifest, before the shell comes up.
+    chitti_kernel::agent::system::install_all(chitti_kernel::arch::now_ms());
+    // Bundled skills (L0 index only until `skill` is invoked).
+    chitti_kernel::skills::bundled::install_all();
+    // Optional allow/ask/deny tool patterns (creates a default file if missing).
+    chitti_kernel::tools::permissions::ensure_default();
+    chitti_kernel::tools::permissions::load();
+    // External messaging channels (Telegram, …) — load after the store is up.
+    chitti_kernel::msgchan::load();
     chitti_kernel::shell::run();
 }
 
@@ -63,15 +73,16 @@ pub extern "C" fn _start() -> ! {
         "Chitti: SMP: {} core(s) online (see ktrace 'smp:' lines for the spinlock self-test)",
         chitti_kernel::smp::cpu_count()
     );
-    // Bring up a USB keyboard (xHCI + HID) if present, so a real USB keyboard
-    // drives the shell alongside PS/2. No-op without an xHCI controller.
-    let usb_kbd = chitti_kernel::arch::x86_64::xhci::init_global();
+    // Bring up USB HID keyboard + pointer (xHCI) if present, so a real USB
+    // keyboard/tablet drives the shell alongside PS/2. No-op without xHCI.
+    let _usb = chitti_kernel::arch::x86_64::xhci::init_global();
     // INPUT summary (parity with aarch64): PS/2 (i8042) is always present on a
-    // PC; USB is READY only if a HID keyboard enumerated on the xHCI.
+    // PC; USB is READY only if a HID device enumerated on the xHCI.
     serial_println!(
-        "Chitti: INPUT  ps2={}  usb-kbd={}  (serial always works)",
+        "Chitti: INPUT  ps2={}  usb-kbd={}  usb-mse={}  (serial always works)",
         "yes",
-        if usb_kbd { "READY" } else { "no" }
+        if chitti_kernel::arch::x86_64::xhci::has_keyboard() { "READY" } else { "no" },
+        if chitti_kernel::arch::x86_64::xhci::has_mouse() { "READY" } else { "no" }
     );
 
     match chitti_kernel::cortex::model_module() {
@@ -243,14 +254,17 @@ pub extern "C" fn aarch64_start() -> ! {
     }
     if let Some((w, h)) = fb {
         serial_println!("Chitti: framebuffer TUI up ({}x{}) -- console mirrored to the window", w, h);
-        // Bring up a USB keyboard (xHCI + HID) if present — the real-hardware
-        // input path; needs the PCIe bus from aarch64_pcie_init.
-        let usb_kbd = chitti_kernel::arch::aarch64::xhci::init_global();
+        // Bring up USB HID keyboard + tablet (xHCI) — the VirtualBox / real-
+        // hardware input path; needs the PCIe bus from aarch64_pcie_init.
+        let _usb = chitti_kernel::arch::aarch64::xhci::init_global();
+        let usb_kbd = chitti_kernel::arch::aarch64::xhci::has_keyboard();
+        let usb_mse = chitti_kernel::arch::aarch64::xhci::has_mouse();
         // A PL050 PS/2 keyboard (ARM dev boards / some hypervisors) — the ARM
         // analogue of the x86 i8042. No-op where absent (e.g. QEMU `virt`).
         let pl050 = chitti_kernel::arch::aarch64::pl050::init();
         // A PL050 PS/2 mouse (a second KMI) — the ARM PS/2 pointing device, as
-        // VirtualBox-ARM presents (hidpointing=ps2mouse). No-op where absent.
+        // VirtualBox-ARM presents when hidpointing=ps2mouse (we force usbtablet
+        // via `make vbox`). No-op where absent.
         let _pl050_mouse = chitti_kernel::arch::aarch64::pl050_mouse::init();
         // Also wire the virtio-keyboard (QEMU `virt` window). Absent without one.
         let virtio_kbd = chitti_kernel::arch::aarch64::virtio_input::init();
@@ -259,12 +273,14 @@ pub extern "C" fn aarch64_start() -> ! {
         // A single, non-scrolling INPUT summary right before the shell so the
         // discovered input path is visible on the framebuffer (the only console
         // that survives a platform whose serial/UART we don't reach). This is the
-        // ground truth for "why isn't my keyboard working".
+        // ground truth for "why isn't my keyboard/mouse working".
+        // On VirtualBox-ARM expect: usb-kbd=READY usb-mse=READY (virtio/ps2 no).
         let ecam = chitti_kernel::pci::ecam_base();
         serial_println!(
-            "Chitti: INPUT  pcie-ecam={:#x}  usb-kbd={}  pl050-kbd={}  virtio-kbd={}  mouse[virtio={} ps2={}]  (serial always works)",
+            "Chitti: INPUT  pcie-ecam={:#x}  usb-kbd={}  usb-mse={}  pl050-kbd={}  virtio-kbd={}  mouse[virtio={} ps2={}]  (serial always works)",
             ecam,
             if usb_kbd { "READY" } else { "no" },
+            if usb_mse { "READY" } else { "no" },
             if pl050 { "yes" } else { "no" },
             if virtio_kbd { "yes" } else { "no" },
             if _mouse { "yes" } else { "no" },
@@ -275,18 +291,36 @@ pub extern "C" fn aarch64_start() -> ! {
     // synapse::fs at an ext4 data partition for durable agent state. No-op
     // without a `-drive`/virtio-blk-device.
     mount_persistent_store();
+    // `ref-check` builds run the acceptance gate and power off via PSCI (the
+    // aarch64 analogue of the x86 isa-debug-exit path above); the host side
+    // (`cargo xtask ref-check -arch aarch64`) greps serial for `ALL PASS`.
+    #[cfg(feature = "refcheck")]
+    {
+        let ok = chitti_kernel::cortex::run_acceptance();
+        serial_println!("refcheck: {} -- powering off", if ok { "PASS" } else { "FAIL" });
+        chitti_kernel::arch::aarch64::psci_system_off();
+    }
     // Bring up networking (virtio-net over mmio, else a PCI NIC) so /network,
     // /ping and /wifi work. No-op if no NIC is present.
+    #[cfg(not(feature = "refcheck"))]
     chitti_kernel::net::autodetect();
     // Bring up audio (virtio-snd) for the /voice pipeline. No-op if absent.
+    #[cfg(not(feature = "refcheck"))]
     chitti_kernel::sound::autodetect();
     // Everything is up (framebuffer, USB/input, disk, persistent store) with IRQs
     // masked. NOW begin timer-preemptive scheduling: unmask IRQs so the generic
     // timer preempts the shell. Deferred to here (not inside init()) so device
     // bring-up — the framebuffer especially — runs identically to the cooperative
     // path; a no-op where the GIC/timer wasn't available (HVF → cooperative).
-    chitti_kernel::arch::aarch64::gic::start_preemption();
-    run_os();
+    #[cfg(not(feature = "refcheck"))]
+    {
+        chitti_kernel::arch::aarch64::gic::start_preemption();
+        run_os();
+    }
+    #[allow(unreachable_code)]
+    loop {
+        chitti_kernel::arch::aarch64::hlt();
+    }
 }
 
 /// The stub's boot-info page (address passed in x1, magic "CHITTIBI"), if
@@ -359,7 +393,10 @@ fn bootinfo_framebuffer() -> Option<(usize, u64, u64, u64, u64, u32, u32, u32)> 
     if bpp == 0 {
         (rs, gs, bs, bpp) = (16, 8, 0, 4);
     }
-    serial_println!("Chitti: framebuffer from UEFI boot-info (GOP {}x{} at {:#x}, shifts {}/{}/{})", w, h, addr, rs, gs, bs);
+    serial_println!(
+        "Chitti: framebuffer from UEFI boot-info (GOP {}x{} at {:#x}, pitch {} bytes = {} px/line, {} bpp, shifts {}/{}/{})",
+        w, h, addr, pitch, if bpp > 0 { pitch / bpp } else { 0 }, bpp, rs, gs, bs
+    );
     Some((addr as usize, w, h, pitch, bpp, rs, gs, bs))
 }
 

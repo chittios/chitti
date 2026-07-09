@@ -51,12 +51,16 @@ struct Job {
     n_rows: AtomicUsize,  // total rows (the `y` column stride)
     // Kernel selector, decoupled from `qtype`: 0 = Q8_0 SDOT matmul (xq/xs),
     // 1 = Q4_0 SDOT (xq/xs), 2 = generic dequant-and-dot over the f32 `xf`
-    // (using `qtype` as the dequant type). Keeping this separate from `qtype`
-    // avoids the collision where Q4_0 could mean either the SDOT or the generic
-    // path.
+    // (using `qtype` as the dequant type), 3 = Q4_K SDOT (xq/xs),
+    // 4 = generic row work (`fn_ptr(ctx)` over `[row_start, row_end)` — video
+    // YUV→RGB and other data-parallel kernels).
     mode: AtomicUsize,
     qtype: AtomicUsize,
     xf: AtomicPtr<f32>,
+    /// Function pointer for mode 4: `unsafe fn(start, end, ctx)`.
+    fn_ptr: AtomicUsize,
+    /// Opaque context pointer for mode 4.
+    ctx: AtomicPtr<u8>,
     row_start: [AtomicUsize; MAX_CPUS],
     row_end: [AtomicUsize; MAX_CPUS],
     go: AtomicU64,
@@ -73,6 +77,8 @@ static JOB: Job = Job {
     mode: AtomicUsize::new(0),
     qtype: AtomicUsize::new(0),
     xf: AtomicPtr::new(core::ptr::null_mut()),
+    fn_ptr: AtomicUsize::new(0),
+    ctx: AtomicPtr::new(core::ptr::null_mut()),
     row_start: [const { AtomicUsize::new(0) }; MAX_CPUS],
     row_end: [const { AtomicUsize::new(0) }; MAX_CPUS],
     go: AtomicU64::new(0),
@@ -266,6 +272,16 @@ fn worker_loop(slot: usize) -> ! {
                 match mode {
                     0 => tensor::matmul_q8_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols),
                     1 => tensor::matvec_q4_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols),
+                    3 => tensor::matvec_q4_k_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols),
+                    4 => {
+                        // Generic row work (video YUV→RGB, etc.).
+                        let fp = JOB.fn_ptr.load(Ordering::Relaxed);
+                        let ctx = JOB.ctx.load(Ordering::Relaxed);
+                        if fp != 0 {
+                            let f: unsafe fn(usize, usize, *mut u8) = core::mem::transmute(fp);
+                            f(rs, re, ctx);
+                        }
+                    }
                     _ => tensor::matvec_quant_rows(qtype as u32, w, JOB.xf.load(Ordering::Relaxed), y, rs, re, n_cols),
                 }
             }
@@ -409,6 +425,87 @@ pub unsafe fn matvec_q4_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
     // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
     let t0 = super::cycle_count();
     unsafe { tensor::matvec_q4_0_sdot_rows(w, xq, xs, y, 0, boundary(1), n_cols) };
+    add_busy(0, super::cycle_count().wrapping_sub(t0));
+    for s in 0..workers {
+        while DONE[s].load(Ordering::Acquire) != g {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Run a generic data-parallel job over `[0, n)` split across online cores.
+/// Each core invokes `f(start, end, ctx)` on a disjoint half-open range.
+/// Falls back to a single call on the BSP when only one core is online or
+/// `n < min_chunk * 2`. Used by the video player for YUV→RGB row convert.
+///
+/// # Safety
+/// `f` must be safe for concurrent calls on disjoint `[start, end)` ranges
+/// with the same `ctx`; `ctx` must remain live until this returns.
+pub unsafe fn parallel_for(
+    n: usize,
+    min_chunk: usize,
+    f: unsafe fn(usize, usize, *mut u8),
+    ctx: *mut u8,
+) {
+    let workers = N_WORKERS.load(Ordering::Relaxed);
+    if workers == 0 || n < min_chunk.saturating_mul(2).max(16) {
+        f(0, n, ctx);
+        return;
+    }
+    let n_parts = workers + 1;
+    let boundary = |k: usize| k * n / n_parts;
+    JOB.fn_ptr.store(f as usize, Ordering::Relaxed);
+    JOB.ctx.store(ctx, Ordering::Relaxed);
+    JOB.mode.store(4, Ordering::Relaxed);
+    for s in 0..workers {
+        JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
+    }
+    let g = JOB.go.load(Ordering::Relaxed) + 1;
+    JOB.go.store(g, Ordering::Release);
+    signal_workers();
+    let t0 = super::cycle_count();
+    f(0, boundary(1), ctx);
+    add_busy(0, super::cycle_count().wrapping_sub(t0));
+    for s in 0..workers {
+        while DONE[s].load(Ordering::Acquire) != g {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Run a `Q4_K` SDOT matvec (int8-quantized activation `xq`/`xs`) across all
+/// online cores by row range -- the fast path for Q4_K_M-dominant models
+/// (Ornith, Qwen3.6, Gemma-4 quants). Falls back to single-core when only the
+/// BSP is online or the matrix is small.
+///
+/// # Safety
+/// Same contract as `tensor::matvec_q4_k_sdot_rows` over `[0, n_rows)`.
+pub unsafe fn matvec_q4_k_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, n_rows: usize, n_cols: usize) {
+    let workers = N_WORKERS.load(Ordering::Relaxed);
+    if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
+        // SAFETY: caller's contract; whole range on this core.
+        unsafe { tensor::matvec_q4_k_sdot_rows(w, xq, xs, y, 0, n_rows, n_cols) };
+        return;
+    }
+    let n_parts = workers + 1;
+    let boundary = |k: usize| k * n_rows / n_parts;
+    JOB.w.store(w as *mut u8, Ordering::Relaxed);
+    JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
+    JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
+    JOB.y.store(y, Ordering::Relaxed);
+    JOB.n_cols.store(n_cols, Ordering::Relaxed);
+    JOB.mode.store(3, Ordering::Relaxed); // Q4_K SDOT
+    for s in 0..workers {
+        JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
+    }
+    let g = JOB.go.load(Ordering::Relaxed) + 1;
+    JOB.go.store(g, Ordering::Release);
+    signal_workers(); // wake WFE-parked workers
+    // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    let t0 = super::cycle_count();
+    unsafe { tensor::matvec_q4_k_sdot_rows(w, xq, xs, y, 0, boundary(1), n_cols) };
     add_busy(0, super::cycle_count().wrapping_sub(t0));
     for s in 0..workers {
         while DONE[s].load(Ordering::Acquire) != g {

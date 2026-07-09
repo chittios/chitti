@@ -215,6 +215,13 @@ unsafe fn enable_mmu(l1: *mut u64) {
         let mut sctlr: u64;
         asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nostack));
         sctlr |= (1 << 0) | (1 << 2) | (1 << 12); // M (MMU), C (data cache), I (instr cache)
+        // A=0 (bit 1): alignment checking OFF — a load-bearing invariant, not
+        // an inherited default. The NEON kernels use unaligned `ldr q` inline
+        // asm (the +strict-align rule), which is only architecturally legal on
+        // Normal memory with A=0; on the UEFI path the firmware's SCTLR is
+        // whatever it left behind (VirtualBox-ARM can hand off with A=1, which
+        // alignment-faults the first SDOT matvec).
+        sctlr &= !(1 << 1);
         asm!("msr sctlr_el1, {}", in(reg) sctlr, options(nostack));
         asm!("isb", options(nostack));
     }

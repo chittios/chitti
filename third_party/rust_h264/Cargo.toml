@@ -1,0 +1,19 @@
+[package]
+name = "rust_h264"
+version = "0.4.0"
+edition = "2021"
+description = "Pure Rust H.264/AVC video decoder (vendored, no_std-patched for Chitti)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/roticv/rust_h264"
+publish = false
+
+[features]
+default = []
+dev-internals = []
+
+[lib]
+name = "rust_h264"
+path = "src/lib.rs"
+
+[dependencies]
+spin = { version = "0.9", default-features = false, features = ["once"] }

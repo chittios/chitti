@@ -5,7 +5,10 @@
 //! table. A task can only ever exercise a `Right` the kernel explicitly
 //! `grant`ed it -- no ambient authority, no capability by convention.
 
+use crate::agent::types::{CapDomain, CapabilityRequest, Rights, Scope};
+use crate::mm::Locked;
 use crate::sched::{self, TaskId};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -20,6 +23,18 @@ pub type EndpointId = u64;
 /// module -- having to depend upward on the Phase 4 `synapse` layer.
 pub type PrimitiveId = u16;
 
+/// Identifies an inter-agent byte/datagram channel (`channel::create`).
+/// Defined here (not in `channel`) for the same structural-naming reason as
+/// [`EndpointId`]: `Right` can name a channel without a circular dependency on
+/// the `channel` module. A channel end is granted per-direction, so a channel
+/// handle held by a task is unforgeable in exactly the way an IPC endpoint cap
+/// is — see [`Right::ChannelWrite`]/[`Right::ChannelRead`].
+pub type ChannelId = u64;
+
+/// Identifies a network listener (`net::listen`). Same structural-naming
+/// rationale as [`EndpointId`]/[`ChannelId`].
+pub type ListenerId = u64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Right {
     IpcSend(EndpointId),
@@ -28,6 +43,20 @@ pub enum Right {
     /// only call a primitive it holds the matching `InvokePrimitive` right
     /// for -- no ambient authority over the capability ABI.
     InvokePrimitive(PrimitiveId),
+    /// Authority to push bytes/datagrams into a channel. Held per-direction:
+    /// granting the write end never confers the read end, so attenuation is
+    /// structural (exactly like `IpcSend` vs `IpcReceive`). A channel handle
+    /// argument the model emits is resolved as a `Cap` slot in the caller's
+    /// own table (`synapse::executor`), so a guessed integer only ever indexes
+    /// the caller's own capability space — no ambient authority over channels.
+    ChannelWrite(ChannelId),
+    /// Authority to pull bytes/datagrams out of a channel. See
+    /// [`Right::ChannelWrite`].
+    ChannelRead(ChannelId),
+    /// Authority to accept inbound connections on a network listener
+    /// (`net::listen`/`net_accept`). Minted by `net_listen` into the caller's
+    /// own table, resolved as a `Cap` slot the same way channel ends are.
+    NetListen(ListenerId),
 }
 
 /// An opaque handle into the holder's own `CapTable`. The index is
@@ -110,4 +139,57 @@ pub(crate) fn lookup(task: TaskId, cap: Cap) -> Option<Right> {
 /// this never inspects another task's authority.
 pub fn holds(task: TaskId, right: Right) -> bool {
     sched::with_cap_table_mut(task, |table| table.grants(right))
+}
+
+// --- Scope ledger (fine-grained, per-task) ----------------------------------
+//
+// The live `Right`/`CapTable` is primitive-granularity ("may you call
+// mem_fs_write at all"). The *scope* of a granted capability (which paths, which
+// hosts/ports) is recorded here alongside it, and the Synapse executor's Gate
+// 2.5 consults it to enforce path/host/port limits the manifest declared. Kept
+// as a side table so the `Copy` `Right` enum stays small and unchanged.
+//
+// Enforcement is deny-only-when-recorded: a task with NO ledger entry for a
+// domain is not scope-constrained for it (preserves the behaviour of the many
+// call sites that `grant` an `InvokePrimitive` directly without scopes). A
+// domain present in the ledger is enforced — a `Scope::Any` entry (the common
+// grant) covers everything, so it passes; a narrow entry bites.
+
+static SCOPES: Locked<BTreeMap<TaskId, Vec<CapabilityRequest>>> = Locked::new(BTreeMap::new());
+
+/// Record the granted capability scopes for `task` (called by
+/// `agent::manifest::grant_to_task`, the one place declarative caps become live
+/// authority). Appends, so multiple grants accumulate.
+pub fn grant_scopes(task: TaskId, caps: &[CapabilityRequest]) {
+    if caps.is_empty() {
+        return;
+    }
+    SCOPES.with(|m| m.entry(task).or_default().extend_from_slice(caps));
+}
+
+/// Gate 2.5 predicate: may `task` exercise `want` rights in `domain` on the
+/// concrete `target` scope? Returns `true` (allow) unless `domain` is present in
+/// the task's ledger and no recorded entry covers the target with the needed
+/// rights. See the module note on deny-only-when-recorded.
+pub fn scope_check(task: TaskId, domain: CapDomain, want: Rights, target: &Scope) -> bool {
+    SCOPES.with(|m| match m.get(&task) {
+        None => true,
+        Some(caps) => {
+            let mut constrained = false;
+            for c in caps.iter().filter(|c| c.domain == domain) {
+                constrained = true;
+                if c.rights.contains(want) && c.scope.covers(target) {
+                    return true;
+                }
+            }
+            !constrained // no entry for this domain -> not scope-constrained
+        }
+    })
+}
+
+/// Drop a task's scope ledger (called on `kill`, alongside the cap-table wipe).
+pub fn clear_scopes(task: TaskId) {
+    SCOPES.with(|m| {
+        m.remove(&task);
+    });
 }

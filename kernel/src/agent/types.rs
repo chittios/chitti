@@ -58,19 +58,26 @@ impl StoreKey {
 // --- Monotonic id minting (deterministic, from 1) ---
 
 macro_rules! id_minter {
-    ($fn_name:ident, $ty:ident, $counter:ident) => {
+    ($fn_name:ident, $notice:ident, $ty:ident, $counter:ident) => {
         static $counter: AtomicU64 = AtomicU64::new(1);
         /// Mint the next unique id of this kind (monotonic, process-global).
         pub fn $fn_name() -> $ty {
             $ty($counter.fetch_add(1, Ordering::Relaxed))
         }
+        /// Ensure subsequent mints never collide with a previously-seen id
+        /// (e.g. after resuming a session that was minted in a prior boot).
+        pub fn $notice(id: $ty) {
+            // Next mint must be strictly greater than `id`.
+            let min_next = id.0.saturating_add(1);
+            let _ = $counter.fetch_max(min_next, Ordering::Relaxed);
+        }
     };
 }
-id_minter!(next_agent_id, AgentId, AGENT_CTR);
-id_minter!(next_session_id, SessionId, SESSION_CTR);
-id_minter!(next_skill_id, SkillId, SKILL_CTR);
-id_minter!(next_msg_id, MsgId, MSG_CTR);
-id_minter!(next_cap_id, CapId, CAP_CTR);
+id_minter!(next_agent_id, notice_agent_id, AgentId, AGENT_CTR);
+id_minter!(next_session_id, notice_session_id, SessionId, SESSION_CTR);
+id_minter!(next_skill_id, notice_skill_id, SkillId, SKILL_CTR);
+id_minter!(next_msg_id, notice_msg_id, MsgId, MSG_CTR);
+id_minter!(next_cap_id, notice_cap_id, CapId, CAP_CTR);
 
 // --- Provenance: the ONE taint type read by Phase E gating and Phase G bounding ---
 
@@ -125,6 +132,9 @@ pub enum CapDomain {
     Inference,   // request Cortex forward passes
     Ipc,         // send/receive IPC
     SkillManage, // install/uninstall skills (privileged)
+    Channel,     // create inter-agent byte/datagram channels; use granted ends
+    Net,         // network: listen/accept + outbound http (host/port scoped)
+    Ui,          // own a compositor surface and draw to it
 }
 
 bitflags::bitflags! {
@@ -146,20 +156,46 @@ pub enum Scope {
     Any,
     Path(String),     // glob, e.g. "/skills/pdf/**"
     Resource(String), // named resource
+    /// A network host + inclusive port range. Host is a glob (`*.example.com`
+    /// or `*` for any host); a *granted* scope names a range, a *target* names a
+    /// single point (`port_lo == port_hi`).
+    Net { host: String, port_lo: u16, port_hi: u16 },
 }
 
 impl Scope {
     /// Whether `self` is at least as permissive as `other` (subset check for
     /// attenuation). `Any` covers everything; a path/resource covers only an
-    /// equal or more-specific-under-glob target.
+    /// equal or more-specific-under-glob target. Unknown pairings are `false`,
+    /// so a broader grant can never be synthesized from a narrower one.
     pub fn covers(&self, other: &Scope) -> bool {
         match (self, other) {
             (Scope::Any, _) => true,
             (Scope::Path(a), Scope::Path(b)) => glob_covers(a, b),
             (Scope::Resource(a), Scope::Resource(b)) => a == b,
+            (
+                Scope::Net { host: ha, port_lo: la, port_hi: ua },
+                Scope::Net { host: hb, port_lo: lb, port_hi: ub },
+            ) => host_glob_covers(ha, hb) && la <= lb && ub <= ua,
             _ => false,
         }
     }
+}
+
+/// Host-glob cover: `a` covers `b` if `a` is `*`, an exact match, or a
+/// `*.suffix` wildcard that `b` ends with (matching a label boundary).
+fn host_glob_covers(a: &str, b: &str) -> bool {
+    if a == "*" || a == b {
+        return true;
+    }
+    if let Some(suffix) = a.strip_prefix("*.") {
+        // "*.example.com" covers "api.example.com" and "example.com".
+        return b == suffix || b.ends_with(&{
+            let mut s = String::from(".");
+            s.push_str(suffix);
+            s
+        });
+    }
+    false
 }
 
 /// Minimal glob cover: `a` covers `b` when `a` equals `b`, or `a` ends in `**`
@@ -251,6 +287,21 @@ pub struct AgentManifest {
     pub budgets: Budgets,
     pub summary: SummaryPolicy, // how a sub-agent condenses its result on return
     pub origin: Origin,         // where this manifest came from (trust)
+    /// MCP servers this agent declares. Shown on the install consent screen;
+    /// each approved one is connected at install and its tools registered for
+    /// the agent (namespaced `mcp__<name>__<tool>`). `#[serde(default)]` keeps
+    /// older signed manifests (without the field) loadable.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerSpec>,
+}
+
+/// An MCP server an agent wants connected at install time.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct McpServerSpec {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub bearer: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -259,6 +310,10 @@ pub enum AgentKind {
     Orchestrator,
     Subagent,
     SkillAgent,
+    /// A long-running daemon (Network/SSH/HTTP/Doc/…): runs as a real scheduled
+    /// task with a native `serve()` loop, not a request/response reasoning agent.
+    /// Started/supervised by `crate::service`.
+    Service,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -493,7 +548,22 @@ pub struct SkillManifest {
     pub bundled_tools: Vec<BundledTool>,
     pub assets: Vec<Asset>,             // L2 — demand-paged on use
     pub agent: Option<AgentManifest>,   // present iff kind == SkillAgent
+    /// The agent's SOUL.md (persona) text ref — `Some` for a SkillAgent whose
+    /// package ships a soul. Placed into `/agent/<id>/SOUL.md` on install.
+    pub soul_ref: Option<StoreKey>,
+    /// Extra markdown procedure docs placed into `/agent/<id>/skills/*.md`.
+    pub skill_docs: Vec<SkillDoc>,
     pub signature: SignatureBlock,
+}
+
+/// One markdown procedure doc shipped in an agent package — the "programming in
+/// markdown" surface beyond the single L1 body. Placed into the agent's home
+/// `skills/` dir; `trigger` is an optional match hint (None = always available).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SkillDoc {
+    pub name: String,
+    pub store_ref: StoreKey,
+    pub trigger: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -530,7 +600,13 @@ pub struct SignatureBlock {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SigAlgo {
+    /// The self-contained keyed-MAC scheme (kernel is signer + verifier). Used
+    /// for local boot-module / built-in dev packages. (Named Ed25519 for schema
+    /// history; the backing implementation is a SipHash MAC — see skills::crypto.)
     Ed25519,
+    /// ECDSA over P-256 / SHA-256 — real off-device authenticity for packages
+    /// from a public registry, verified against a baked publisher trust store.
+    P256,
 }
 
 /// Produced at install; the authoritative record of what was APPROVED. Not
@@ -550,6 +626,8 @@ pub struct InstallRecord {
 pub enum InstallSource {
     BootModule { name: String },
     Store { key: StoreKey },
+    /// Installed from a public package registry (audit provenance).
+    Registry { name: String, version: String },
 }
 
 #[cfg(test)]

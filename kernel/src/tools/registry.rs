@@ -33,6 +33,51 @@ pub enum ToolBinding {
     /// datetime, install, …) and return its printed output. `destructive`
     /// commands are taint-gated at dispatch, like a `DELETE`.
     Shell { command: String, destructive: bool },
+    /// Call a tool on a connected MCP server (JSON-RPC `tools/call` over HTTP).
+    /// Registered dynamically by `/mcp connect`; the model calls it like any
+    /// other tool and the arguments are forwarded verbatim as the JSON-RPC
+    /// `arguments` object. `server` is the local connection name.
+    Mcp { server: String, tool: String },
+    /// Durable per-agent memory under `/agent/<id>/memory/` — `memory_add`,
+    /// `memory_get`, `memory_list`, `memory_search`. No Synapse primitive; the
+    /// store is the agent's own home (already sandboxed for non-orchestrator
+    /// agents).
+    AgentMemory,
+    /// Path/content query over the capability-scoped store listing (`glob` /
+    /// `grep`). Pure matching after a scope-filtered `list`/`read` — no new
+    /// Synapse primitive (Gate 2.5 applied per path).
+    StoreQuery { kind: StoreQueryKind },
+    /// MCP resources list / read (not tools/call).
+    McpResources { kind: McpResourceKind },
+}
+
+/// Which store query the [`ToolBinding::StoreQuery`] tool performs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StoreQueryKind {
+    Glob,
+    Grep,
+}
+
+/// MCP resource tool kind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum McpResourceKind {
+    List,
+    Read,
+}
+
+impl ToolDef {
+    /// A tool bound to a connected MCP server tool. `name` is the namespaced
+    /// registry name (`mcp__<server>__<tool>`); `server`/`tool` identify the
+    /// remote. `schema` is the server-provided JSON input schema.
+    pub fn mcp(name: &str, description: &str, schema: &str, server: &str, tool: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            description: description.to_string(),
+            input_schema: schema.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::Mcp { server: server.to_string(), tool: tool.to_string() },
+        }
+    }
 }
 
 /// An agent-facing tool definition (MCP shape).
@@ -87,16 +132,29 @@ impl ToolDef {
 /// `/agent`, `/subagent`) are already covered by `run` and `spawn_subagent`.
 fn shell_commands() -> Vec<ToolDef> {
     alloc::vec![
-        ToolDef::shell("help", "Show the list of available commands.", false),
+        ToolDef::shell("help", "Open the Commands browser (search + scroll). args: empty=modal, 'text'=flat list.", false),
         ToolDef::shell("disks", "List every block device and its detected filesystems (read-only).", false),
-        ToolDef::shell("ls", "List a volume's root. args: a disk number (0..), or a mount path like /mnt.", false),
+        ToolDef::shell("ls", "List a store directory (Linux-like). args: '[path] [-l]' (default /). Numeric arg lists a disk volume root.", false),
+        ToolDef::shell("cat", "Print a store or mounted file. args: a /path.", false),
+        ToolDef::shell("grep", "Search store file contents. args: '<query> [path_glob]'.", false),
+        ToolDef::shell("glob", "List store paths matching a glob. args: a pattern (e.g. **/*.md).", false),
+        ToolDef::shell("mkdir", "Create a store directory. args: '[-p] <path>'.", false),
+        ToolDef::shell("cp", "Copy a store file or tree. args: '[-r] <src> <dst>'.", false),
+        ToolDef::shell("mv", "Rename/move a store file or tree. args: '<src> <dst>'.", false),
+        ToolDef::shell("rm", "Remove a store file or tree. args: '[-r] <path>'.", true),
+        ToolDef::shell("touch", "Create an empty store file. args: a /path.", false),
+        ToolDef::shell("pwd", "Print the working directory (always /).", false),
         ToolDef::shell("mount", "Mount a disk volume. args: '<disk> [volume] [/path]' (default /mnt).", false),
         ToolDef::shell("umount", "Unmount a mounted path. args: the /path.", false),
         ToolDef::shell("mounts", "List the currently mounted volumes.", false),
-        ToolDef::shell("cat", "Print a file from a mounted volume. args: a /path/file.", false),
         ToolDef::shell("network", "Show the network status (ip/gw/dns), or configure it. args: empty=status, 'dhcp', 'static <ip/prefix> [gw]', 'dns <ip>'.", false),
         ToolDef::shell("ping", "ICMP-ping a host to check connectivity. args: a hostname or IPv4 address, e.g. 'www.google.com'.", false),
         ToolDef::shell("wifi", "Wi-Fi facade over the NIC. args: 'scan' | 'connect <ssid>' | 'info'.", false),
+        ToolDef::shell(
+            "channel",
+            "Messaging channels (Telegram…). args: list|add telegram <name> <token>|start|stop|send|reply|pair|allow|status.",
+            false,
+        ),
         ToolDef::shell("http", "curl-like HTTP client. args: [-X M] [-H \"K: V\"] [-d body] [--stream] <url> (http/https).", false),
         ToolDef::shell("datetime", "Show or set the wall clock. args: empty=show, 'YYYY-MM-DD HH:MM'=set, 'tz +5:30'=zone.", false),
         #[cfg(not(feature = "server"))] // GUI tool: absent from server builds
@@ -119,8 +177,8 @@ fn builtins() -> Vec<ToolDef> {
     alloc::vec![
         ToolDef::synapse(
             "read",
-            "Read a file's contents from the store.",
-            r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#,
+            "Read a file from the store. Optional start_line/end_line (1-based) limit the excerpt.",
+            r#"{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}"#,
             &["path"],
             "mem_fs_read",
             &[("path", "path")],
@@ -135,15 +193,15 @@ fn builtins() -> Vec<ToolDef> {
         ),
         ToolDef::synapse(
             "edit",
-            "Replace the first occurrence of `old` with `new` in a file.",
-            r#"{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}"#,
+            "Replace `old` with `new` in a file. Fails if `old` is empty, missing, or matches more than once unless replace_all is true.",
+            r#"{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old","new"]}"#,
             &["path", "old", "new"],
             "mem_fs_edit",
             &[("path", "path"), ("old", "old"), ("new", "new")],
         ),
         ToolDef::synapse(
             "list",
-            "List the file paths present in the store.",
+            "List store file paths (flat; use glob for patterns, or the /ls shell command for a directory tree).",
             r#"{"type":"object","properties":{}}"#,
             &[],
             "list",
@@ -157,6 +215,20 @@ fn builtins() -> Vec<ToolDef> {
             "mem_fs_search",
             &[("query", "query")],
         ),
+        ToolDef {
+            name: "glob".to_string(),
+            description: "List store paths matching a glob (e.g. *.md, /agent/1/**, **/memory/*).".to_string(),
+            input_schema: r#"{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}"#.to_string(),
+            required: alloc::vec!["pattern".to_string()],
+            binding: ToolBinding::StoreQuery { kind: StoreQueryKind::Glob },
+        },
+        ToolDef {
+            name: "grep".to_string(),
+            description: "Search file contents for a substring; returns path:line:text hits (scoped to readable paths).".to_string(),
+            input_schema: r#"{"type":"object","properties":{"query":{"type":"string"},"path_glob":{"type":"string"}},"required":["query"]}"#.to_string(),
+            required: alloc::vec!["query".to_string()],
+            binding: ToolBinding::StoreQuery { kind: StoreQueryKind::Grep },
+        },
         ToolDef::synapse(
             "delete",
             "Delete a file. Destructive — gated on provenance.",
@@ -190,17 +262,52 @@ fn builtins() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "spawn_subagent".to_string(),
-            description: "Delegate a self-contained task to an isolated sub-agent; get back a summary.".to_string(),
-            input_schema: r#"{"type":"object","properties":{"role":{"type":"string"},"task":{"type":"string"}},"required":["role","task"]}"#.to_string(),
-            required: alloc::vec!["role".to_string(), "task".to_string()],
+            description: "Delegate a task to an isolated sub-agent. role: explore|plan|worker|reader (default worker).".to_string(),
+            input_schema: r#"{"type":"object","properties":{"role":{"type":"string","description":"explore|plan|worker|reader"},"task":{"type":"string"}},"required":["task"]}"#.to_string(),
+            required: alloc::vec!["task".to_string()],
             binding: ToolBinding::SpawnSubagent,
         },
         ToolDef {
             name: "load_skill".to_string(),
-            description: "Load an installed skill's instructions when a task matches it.".to_string(),
-            input_schema: r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"#.to_string(),
+            description: "Load an installed skill's L1 instructions into context (optional L2 asset). Alias: skill.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"name":{"type":"string","description":"skill name from /skills"},"asset":{"type":"string","description":"optional L2 asset name"}},"required":["name"]}"#.to_string(),
             required: alloc::vec!["name".to_string()],
             binding: ToolBinding::LoadSkill,
+        },
+        ToolDef {
+            name: "skill".to_string(),
+            description: "Invoke an installed skill by name: loads L1 body into context; optional asset for L2 progressive disclosure.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"name":{"type":"string"},"asset":{"type":"string"}},"required":["name"]}"#.to_string(),
+            required: alloc::vec!["name".to_string()],
+            binding: ToolBinding::LoadSkill,
+        },
+        ToolDef {
+            name: "enter_plan_mode".to_string(),
+            description: "Enter plan mode: only read-only tools + todos/skills until exit_plan_mode.".to_string(),
+            input_schema: r#"{"type":"object","properties":{}}"#.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::SessionTodo, // handled specially in execute_chat_tool before Router
+        },
+        ToolDef {
+            name: "exit_plan_mode".to_string(),
+            description: "Leave plan mode (requires human confirmation); re-enables write tools.".to_string(),
+            input_schema: r#"{"type":"object","properties":{}}"#.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::SessionTodo,
+        },
+        ToolDef {
+            name: "mcp_resources".to_string(),
+            description: "List resources on a connected MCP server (or all servers if name omitted).".to_string(),
+            input_schema: r#"{"type":"object","properties":{"server":{"type":"string"}}}"#.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::McpResources { kind: McpResourceKind::List },
+        },
+        ToolDef {
+            name: "mcp_read_resource".to_string(),
+            description: "Read one MCP resource by URI from a connected server.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"server":{"type":"string"},"uri":{"type":"string"}},"required":["server","uri"]}"#.to_string(),
+            required: alloc::vec!["server".to_string(), "uri".to_string()],
+            binding: ToolBinding::McpResources { kind: McpResourceKind::Read },
         },
         ToolDef {
             name: "run".to_string(),
@@ -208,6 +315,34 @@ fn builtins() -> Vec<ToolDef> {
             input_schema: r#"{"type":"object","properties":{"intent":{"type":"string"}},"required":["intent"]}"#.to_string(),
             required: alloc::vec!["intent".to_string()],
             binding: ToolBinding::RunIntent,
+        },
+        ToolDef {
+            name: "memory_add".to_string(),
+            description: "Store a durable key/value fact in this agent's memory (survives context compaction).".to_string(),
+            input_schema: r#"{"type":"object","properties":{"key":{"type":"string","description":"fact name ([A-Za-z0-9._-])"},"value":{"type":"string","description":"fact contents"}},"required":["key","value"]}"#.to_string(),
+            required: alloc::vec!["key".to_string(), "value".to_string()],
+            binding: ToolBinding::AgentMemory,
+        },
+        ToolDef {
+            name: "memory_get".to_string(),
+            description: "Retrieve a previously stored fact by key (exact or short suffix, e.g. name → user.name). On miss, lists closest keys — or use memory_list / memory_search.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"key":{"type":"string","description":"fact name to look up (prefer exact key from memory_list)"}},"required":["key"]}"#.to_string(),
+            required: alloc::vec!["key".to_string()],
+            binding: ToolBinding::AgentMemory,
+        },
+        ToolDef {
+            name: "memory_list".to_string(),
+            description: "List the keys currently stored in this agent's durable memory.".to_string(),
+            input_schema: r#"{"type":"object","properties":{}}"#.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::AgentMemory,
+        },
+        ToolDef {
+            name: "memory_search".to_string(),
+            description: "Search this agent's durable memory keys and values for a substring.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#.to_string(),
+            required: alloc::vec!["query".to_string()],
+            binding: ToolBinding::AgentMemory,
         },
     ]
 }
@@ -238,6 +373,22 @@ pub fn register(def: ToolDef) {
         crate::ktrace::log_fmt(format_args!("tools.register: provider tool '{}'", def.name));
         reg.push(def);
     });
+}
+
+/// Register or replace a tool by name — for dynamic sources (MCP servers) that
+/// re-connect and refresh their tool set. Unlike [`register`], it overwrites an
+/// existing entry of the same name.
+pub fn register_replace(def: ToolDef) {
+    with_registry(|reg| {
+        reg.retain(|t| t.name != def.name);
+        reg.push(def);
+    });
+}
+
+/// Remove a tool by name (e.g. `/mcp disconnect` dropping a server's tools).
+/// No-op if absent.
+pub fn deregister(name: &str) {
+    with_registry(|reg| reg.retain(|t| t.name != name));
 }
 
 /// Look up a tool by name (clones the def — small, and avoids holding the lock).

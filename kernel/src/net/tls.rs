@@ -20,7 +20,6 @@ use alloc::string::String;
 use embedded_io::{ErrorType, Read as IoRead, Write as IoWrite};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
-use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 
 /// Seed a ChaCha20 CSPRNG for the TLS handshake. Mixes several hardware-random
@@ -54,7 +53,7 @@ pub fn seed_rng() -> ChaCha20Rng {
 /// on top of our poll-driven stack. `deadline` (an `arch::now_ms` value) bounds
 /// every wait.
 pub struct TcpStream {
-    pub handle: SocketHandle,
+    pub handle: super::TcpHandle,
     /// Fixed absolute read/write deadline (`arch::now_ms` value) — used by the
     /// one-shot HTTP path.
     pub deadline: u64,
@@ -68,12 +67,12 @@ pub struct TcpStream {
 
 impl TcpStream {
     /// A stream with a fixed absolute `deadline` (the HTTP request path).
-    pub fn new(handle: SocketHandle, deadline: u64) -> Self {
+    pub fn new(handle: super::TcpHandle, deadline: u64) -> Self {
         TcpStream { handle, deadline, rolling: None }
     }
     /// A stream whose deadline is read from (and bumped through) a shared
     /// atomic — for a long-lived TLS session (`wss://`).
-    pub fn with_rolling(handle: SocketHandle, rolling: &'static core::sync::atomic::AtomicU64) -> Self {
+    pub fn with_rolling(handle: super::TcpHandle, rolling: &'static core::sync::atomic::AtomicU64) -> Self {
         TcpStream { handle, deadline: 0, rolling: Some(rolling) }
     }
 }
@@ -112,10 +111,13 @@ impl IoRead for TcpStream {
             if self.timed_out() {
                 return Err(StreamError("TLS read timeout"));
             }
+            if crate::shell::poll_interrupt() {
+                return Err(StreamError("cancelled"));
+            }
             super::poll();
             let r = NET.with(|n| {
                 let s = n.as_mut().ok_or(StreamError("network down"))?;
-                let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
+                let sock = s.tcp_set(self.handle).get_mut::<tcp::Socket>(self.handle.handle);
                 if sock.can_recv() {
                     let k = sock.recv_slice(buf).map_err(|_| StreamError("recv"))?;
                     return Ok(Some(k));
@@ -141,10 +143,13 @@ impl IoWrite for TcpStream {
             if self.timed_out() {
                 return Err(StreamError("TLS write timeout"));
             }
+            if crate::shell::poll_interrupt() {
+                return Err(StreamError("cancelled"));
+            }
             super::poll();
             let r = NET.with(|n| {
                 let s = n.as_mut().ok_or(StreamError("network down"))?;
-                let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
+                let sock = s.tcp_set(self.handle).get_mut::<tcp::Socket>(self.handle.handle);
                 if !sock.may_send() {
                     return Err(StreamError("connection closed"));
                 }
@@ -210,8 +215,14 @@ pub fn handshake(stream: TcpStream, server_name: &str) -> Result<TlsSession, Str
 
     // Record buffers live as long as the connection; leak them (one per
     // request, freed implicitly at process teardown — a request is short-lived
-    // and the heap is large). 16640 = the max TLS record; 4 KiB write buffer.
-    let rd: &'static mut [u8] = alloc::vec![0u8; 16 * 1024 + 256].leak();
+    // and the heap is large). The read buffer must hold the largest incoming
+    // TLS record *including* the 5-byte record header and AEAD overhead: a max
+    // 2^14 plaintext + 256 expansion + 5 header ≈ 16645 bytes. The old
+    // `16*1024 + 256` (16640) was a few bytes short, so a server that sends a
+    // full-size record (e.g. a big certificate chain — upload.wikimedia.org)
+    // overflowed it and the handshake died with `DecodeError`. Use 32 KiB for
+    // comfortable headroom over any single record. 4 KiB write buffer.
+    let rd: &'static mut [u8] = alloc::vec![0u8; 32 * 1024].leak();
     let wr: &'static mut [u8] = alloc::vec![0u8; 4096].leak();
     // SNI must outlive the config borrow; leak the small hostname string.
     let name: &'static str = String::from(server_name).leak();
@@ -222,6 +233,6 @@ pub fn handshake(stream: TcpStream, server_name: &str) -> Result<TlsSession, Str
 
     let mut tls = TlsConnection::new(stream, rd, wr);
     tls.open::<ChaCha20Rng, NoVerify>(TlsContext::new(config, &mut rng))
-        .map_err(|e| alloc::format!("TLS handshake failed: {:?} (server must support TLS 1.3)", e))?;
+        .map_err(|e| alloc::format!("TLS handshake failed: {:?} (in-kernel client is TLS 1.3, AES-128-GCM, no cert verification)", e))?;
     Ok(TlsSession { tls })
 }

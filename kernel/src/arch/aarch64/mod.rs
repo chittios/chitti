@@ -77,6 +77,21 @@ pub fn poweroff() -> ! {
     }
 }
 
+/// Reboot via PSCI `SYSTEM_RESET` (function id 0x84000009). On real hardware
+/// and most hypervisors this cold-resets the board; under QEMU with
+/// `-no-reboot` the process exits instead (same as SYSTEM_OFF for the host).
+pub fn reboot() -> ! {
+    // SAFETY: PSCI SYSTEM_RESET has no memory effects; it does not return.
+    unsafe {
+        asm!(
+            "mov w0, #0x0009",
+            "movk w0, #0x8400, lsl #16", // w0 = 0x84000009 (PSCI_SYSTEM_RESET)
+            "hvc #0",
+            options(nomem, nostack, noreturn),
+        );
+    }
+}
+
 /// CPU interrupt masking via `DAIF.I` (the IRQ mask bit), mirroring the x86
 /// `interrupts` facade so `mm::Locked`, `ktrace`, and the scheduler are
 /// arch-agnostic.
@@ -344,4 +359,26 @@ fn cntfrq() -> u64 {
 pub fn time_ms() -> u64 {
     let f = if cntfrq() != 0 { cntfrq() } else { 24_000_000 };
     cntvct() * 1000 / f
+}
+
+/// PSCI `SYSTEM_OFF` (function 0x8400_0008): power the machine off — how a
+/// `refcheck` build terminates QEMU on aarch64 (the x86 analogue is the
+/// isa-debug-exit device). QEMU `virt` exposes PSCI over HVC to an EL1 guest
+/// (the HVF/KVM conduit); platforms that use the SMC conduit fall through to
+/// the SMC call; if both return (no PSCI at all), park the core.
+pub fn psci_system_off() -> ! {
+    // SAFETY: PSCI calls take the function id in x0; per SMCCC the callee may
+    // clobber x0-x3 (declared). SYSTEM_OFF does not return on success, and an
+    // unimplemented conduit just returns NOT_SUPPORTED in x0 — attempting
+    // both conduits is safe.
+    unsafe {
+        let mut f: u64 = 0x8400_0008;
+        asm!("hvc #0", inout("x0") f, lateout("x1") _, lateout("x2") _, lateout("x3") _, options(nomem, nostack));
+        f = 0x8400_0008;
+        asm!("smc #0", inout("x0") f, lateout("x1") _, lateout("x2") _, lateout("x3") _, options(nomem, nostack));
+        let _ = f;
+    }
+    loop {
+        hlt();
+    }
 }

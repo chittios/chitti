@@ -27,6 +27,9 @@ pub enum Outcome {
     /// justification traced to untrusted ingested content and no human
     /// confirmed it. The primitive did not run.
     RefusedTainted,
+    /// Capability held, but the concrete target (path/host/port) fell outside
+    /// the granted scope (Gate 2.5). The primitive did not run.
+    DeniedScope,
 }
 
 /// One immutable audit record. Every field is `Copy` (the primitive name is

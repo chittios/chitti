@@ -18,13 +18,34 @@ pub const QK: usize = 32; // elements per quantization block (both Q4_0/Q8_0)
 pub const Q8_0_BLOCK_BYTES: usize = 2 + QK; // f16 scale + 32 i8
 pub const Q4_0_BLOCK_BYTES: usize = 2 + QK / 2; // f16 scale + 16 packed nibbles
 pub const Q4_1_BLOCK_BYTES: usize = 2 + 2 + QK / 2; // f16 d + f16 min + 16 nibbles
+pub const Q5_0_BLOCK_BYTES: usize = 2 + 4 + QK / 2; // f16 d + qh[4] + 16 nibbles = 22
+pub const Q5_1_BLOCK_BYTES: usize = 2 + 2 + 4 + QK / 2; // f16 d + f16 m + qh[4] + 16 nibbles = 24
 
 // k-quant super-block: 256 elements. Byte layouts verbatim from llama.cpp
-// (ggml-common.h). Used by the mixed-quant Qwen3.5-9B GGUF (ssm_out=Q5_K,
-// output=Q6_K); the 0.8B model uses none of these.
+// (ggml-common.h). Mixed-quant GGUFs (Q4_K_M/Q5_K_M/UD-* files) tag these
+// per tensor.
 pub const QK_K: usize = 256;
+pub const Q2_K_BLOCK_BYTES: usize = QK_K / 16 + QK_K / 4 + 2 + 2; // scales[16],qs[64],d,dmin = 84
+pub const Q3_K_BLOCK_BYTES: usize = QK_K / 8 + QK_K / 4 + 12 + 2; // hmask[32],qs[64],scales[12],d = 110
+pub const Q4_K_BLOCK_BYTES: usize = 2 + 2 + 12 + QK_K / 2; // d,dmin,scales[12],qs[128] = 144
 pub const Q5_K_BLOCK_BYTES: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2; // d,dmin,scales[12],qh[32],qs[128] = 176
 pub const Q6_K_BLOCK_BYTES: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2; // ql[128],qh[64],scales[16],d = 210
+pub const Q8_K_BLOCK_BYTES: usize = 4 + QK_K + QK_K / 16 * 2; // d(f32),qs[256],bsums[16 i16] = 292
+
+// i-quants (codebook/grid formats; layouts verbatim from ggml-common.h).
+pub const IQ2_XXS_BLOCK_BYTES: usize = 2 + QK_K / 4; // d + qs u16[32] = 66
+pub const IQ2_XS_BLOCK_BYTES: usize = 2 + QK_K / 4 + QK_K / 32; // + scales[8] = 74
+pub const IQ2_S_BLOCK_BYTES: usize = 2 + QK_K / 4 + QK_K / 32 + QK_K / 32; // qs[64] + qh[8] + scales[8] = 82
+pub const IQ3_XXS_BLOCK_BYTES: usize = 2 + 3 * QK_K / 8; // qs[64] + scales_and_signs[32] = 98
+pub const IQ3_S_BLOCK_BYTES: usize = 2 + QK_K / 4 + QK_K / 32 + QK_K / 8 + QK_K / 64; // qs+qh+signs+scales = 110
+pub const IQ4_NL_BLOCK_BYTES: usize = 2 + QK / 2; // d + 16 nibbles = 18 (32-elem block)
+pub const IQ4_XS_BLOCK_BYTES: usize = 2 + 2 + QK_K / 64 + QK_K / 2; // d + scales_h + scales_l[4] + qs[128] = 136
+
+// Unquantized weight tensors (F16/BF16, e.g. in UD-*_XL mixes) run through
+// the same block machinery in 32-element chunks so the generic matvec and
+// the SMP row-split work unchanged.
+pub const F16_BLOCK_BYTES: usize = 2 * QK; // 32 halves
+pub const BF16_BLOCK_BYTES: usize = 2 * QK; // 32 bfloat16
 
 /// Convert an IEEE-754 half (as raw bits) to `f32`. On aarch64 this is the
 /// single `fcvt s, h` instruction (`+fp-armv8` baseline) — it runs once per
@@ -204,6 +225,389 @@ pub fn dequant_q6_k_block(block: &[u8], out: &mut [f32]) {
             out[y + l + 64] = d * sc[is + 4] as i8 as f32 * q3;
             out[y + l + 96] = d * sc[is + 6] as i8 as f32 * q4;
         }
+    }
+}
+
+/// Dequantize one Q5_0 block (`Q5_0_BLOCK_BYTES`) into 32 `f32`s, per
+/// llama.cpp `dequantize_row_q5_0`: 4-bit nibbles + a 5th bit from the packed
+/// `qh` word, biased by -16. Element `j` takes qh bit `j`, element `j+16`
+/// takes qh bit `j+16` (via the `>> (j+12)` trick on the low-shifted word).
+pub fn dequant_q5_0_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), Q5_0_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK);
+    let d = read_f16_le(&block[0..2]);
+    let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+    for j in 0..QK / 2 {
+        let xh0 = ((qh >> j) << 4) & 0x10;
+        let xh1 = (qh >> (j + 12)) & 0x10;
+        let x0 = ((block[6 + j] & 0x0f) as u32 | xh0) as i32 - 16;
+        let x1 = ((block[6 + j] >> 4) as u32 | xh1) as i32 - 16;
+        out[j] = d * x0 as f32;
+        out[j + QK / 2] = d * x1 as f32;
+    }
+}
+
+/// Dequantize one Q5_1 block (`Q5_1_BLOCK_BYTES`) into 32 `f32`s. Like Q5_0
+/// but affine: `x = d*q5 + m` (quants unsigned 0..31, no -16 bias).
+pub fn dequant_q5_1_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), Q5_1_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK);
+    let d = read_f16_le(&block[0..2]);
+    let m = read_f16_le(&block[2..4]);
+    let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+    for j in 0..QK / 2 {
+        let xh0 = ((qh >> j) << 4) & 0x10;
+        let xh1 = (qh >> (j + 12)) & 0x10;
+        let x0 = (block[8 + j] & 0x0f) as u32 | xh0;
+        let x1 = (block[8 + j] >> 4) as u32 | xh1;
+        out[j] = d * x0 as f32 + m;
+        out[j + QK / 2] = d * x1 as f32 + m;
+    }
+}
+
+/// Dequantize one Q2_K super-block (`Q2_K_BLOCK_BYTES`) into 256 `f32`s, per
+/// llama.cpp `dequantize_row_q2_K`: 16 groups of 16 elements, each with a
+/// 4-bit scale + 4-bit min packed in one `scales` byte; 2-bit quants walked
+/// in two 128-element halves by shift (0/2/4/6). `x = d*sc*q2 - dmin*m`.
+pub fn dequant_q2_k_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), Q2_K_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK_K);
+    let scales = &block[0..16];
+    let qs = &block[16..80];
+    let d = read_f16_le(&block[80..82]);
+    let dmin = read_f16_le(&block[82..84]);
+    let mut y = 0usize;
+    let mut is = 0usize;
+    for half in 0..2 {
+        let q = &qs[half * 32..];
+        let mut shift = 0u32;
+        for _ in 0..4 {
+            for sub in 0..2 {
+                let sc = scales[is];
+                is += 1;
+                let dl = d * (sc & 0x0f) as f32;
+                let ml = dmin * (sc >> 4) as f32;
+                for l in 0..16 {
+                    out[y] = dl * ((q[sub * 16 + l] >> shift) & 3) as f32 - ml;
+                    y += 1;
+                }
+            }
+            shift += 2;
+        }
+    }
+}
+
+/// Dequantize one Q3_K super-block (`Q3_K_BLOCK_BYTES`) into 256 `f32`s, per
+/// llama.cpp `dequantize_row_q3_K`: 2-bit low quants + a high bit from
+/// `hmask` (subtracting 4 when the mask bit is *clear*), 16 6-bit signed
+/// scales unpacked from 12 bytes with the kmask shuffle. `x = d*(sc-32)*q3`.
+pub fn dequant_q3_k_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), Q3_K_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK_K);
+    let hm = &block[0..32];
+    let qs = &block[32..96];
+    let sc_packed = &block[96..108];
+    let d_all = read_f16_le(&block[108..110]);
+
+    // Unpack the 16 6-bit scales exactly as llama.cpp's kmask shuffle: three
+    // u32 words -> four u32 words of 8-bit lanes (low 4 bits from words 0/1,
+    // high 2 bits from word 2), read back as i8 lanes.
+    const KMASK1: u32 = 0x0303_0303;
+    const KMASK2: u32 = 0x0f0f_0f0f;
+    let w = |i: usize| u32::from_le_bytes([sc_packed[i * 4], sc_packed[i * 4 + 1], sc_packed[i * 4 + 2], sc_packed[i * 4 + 3]]);
+    let (a0, a1, tmp) = (w(0), w(1), w(2));
+    let aux = [
+        (a0 & KMASK2) | (((tmp) & KMASK1) << 4),
+        (a1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4),
+        ((a0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4),
+        ((a1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4),
+    ];
+    let mut scales = [0i8; 16];
+    for (i, a) in aux.iter().enumerate() {
+        scales[i * 4..i * 4 + 4].copy_from_slice(&a.to_le_bytes().map(|b| b as i8));
+    }
+
+    let mut y = 0usize;
+    let mut is = 0usize;
+    let mut m = 1u8;
+    for half in 0..2 {
+        let q = &qs[half * 32..];
+        let mut shift = 0u32;
+        for _ in 0..4 {
+            for sub in 0..2 {
+                let dl = d_all * (scales[is] as f32 - 32.0);
+                is += 1;
+                for l in 0..16 {
+                    let idx = sub * 16 + l;
+                    let hi = if hm[idx] & m != 0 { 0 } else { 4 };
+                    out[y] = dl * (((q[idx] >> shift) & 3) as i32 - hi) as f32;
+                    y += 1;
+                }
+            }
+            shift += 2;
+            m <<= 1;
+        }
+    }
+}
+
+/// Dequantize one Q4_K super-block (`Q4_K_BLOCK_BYTES`) into 256 `f32`s, per
+/// llama.cpp `dequantize_row_q4_K`: 8 sub-blocks of 32 with packed 6-bit
+/// scale/min pairs (same `get_scale_min_k4` as Q5_K), 4-bit quants split
+/// low-nibbles-first per 64. `x = d*sc*q4 - dmin*m`.
+pub fn dequant_q4_k_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), Q4_K_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK_K);
+    let d = read_f16_le(&block[0..2]);
+    let dmin = read_f16_le(&block[2..4]);
+    let scales = &block[4..16];
+    let qs = &block[16..144];
+    let mut y = 0usize;
+    let mut is = 0usize;
+    let mut ql = 0usize;
+    for _ in 0..QK_K / 64 {
+        let (sc1, m1s) = q_scale_min_k4(is, scales);
+        let (sc2, m2s) = q_scale_min_k4(is + 1, scales);
+        let d1 = d * sc1 as f32;
+        let m1 = dmin * m1s as f32;
+        let d2 = d * sc2 as f32;
+        let m2 = dmin * m2s as f32;
+        for l in 0..32 {
+            out[y + l] = d1 * (qs[ql + l] & 0x0f) as f32 - m1;
+        }
+        for l in 0..32 {
+            out[y + 32 + l] = d2 * (qs[ql + l] >> 4) as f32 - m2;
+        }
+        y += 64;
+        ql += 32;
+        is += 2;
+    }
+}
+
+/// Dequantize one Q8_K super-block (`Q8_K_BLOCK_BYTES`) into 256 `f32`s:
+/// an f32 scale and plain i8 quants (`bsums` are an activation-side aid,
+/// ignored when Q8_K appears as a weight type, e.g. in UD-Q8_K_XL mixes).
+pub fn dequant_q8_k_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), Q8_K_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK_K);
+    let d = f32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+    for i in 0..QK_K {
+        out[i] = d * block[4 + i] as i8 as f32;
+    }
+}
+
+/// "Dequantize" a 32-element chunk of an F16 weight tensor.
+pub fn dequant_f16_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), F16_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK);
+    for i in 0..QK {
+        out[i] = read_f16_le(&block[i * 2..i * 2 + 2]);
+    }
+}
+
+/// "Dequantize" a 32-element chunk of a BF16 weight tensor: a bfloat16 is
+/// the top 16 bits of the equivalent f32.
+pub fn dequant_bf16_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), BF16_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK);
+    for i in 0..QK {
+        let bits = u16::from_le_bytes([block[i * 2], block[i * 2 + 1]]) as u32;
+        out[i] = f32::from_bits(bits << 16);
+    }
+}
+
+// --- i-quants: codebook/grid formats (IQ2/IQ3/IQ4 families). Ports of
+// llama.cpp's `dequantize_row_iq*` with the tables generated verbatim into
+// `iq_tables` (tools/gen_iq_tables.py), so decoding is byte-identical to
+// ggml's. Each 8-element group looks its magnitudes up in a grid entry (the
+// bytes of a u64/u32 table value) and applies a 7-bit codebook sign mask. ---
+
+use super::iq_tables as iqt;
+
+/// Apply grid byte `g` and codebook sign bit `j` of `signs`: the shared
+/// magnitude×sign step of every IQ2/IQ3 format.
+#[inline(always)]
+fn iq_signed(db: f32, g: u8, signs: u8, j: usize) -> f32 {
+    let v = db * g as f32;
+    if signs & iqt::KMASK_IQ2XS[j] != 0 {
+        -v
+    } else {
+        v
+    }
+}
+
+/// Dequantize one IQ2_XXS super-block (`IQ2_XXS_BLOCK_BYTES`) into 256 f32s:
+/// per 32 elements, 4 grid-index bytes (u64 grid entries = 8 magnitudes) and
+/// a u32 carrying 4×7-bit sign indices + a 4-bit scale in the top bits.
+pub fn dequant_iq2_xxs_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), IQ2_XXS_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK_K);
+    let d = read_f16_le(&block[0..2]);
+    let qs = &block[2..66];
+    let mut y = 0usize;
+    for ib32 in 0..QK_K / 32 {
+        let a = &qs[8 * ib32..8 * ib32 + 8];
+        let aux0 = [a[0], a[1], a[2], a[3]];
+        let aux1 = u32::from_le_bytes([a[4], a[5], a[6], a[7]]);
+        let db = d * (0.5 + (aux1 >> 28) as f32) * 0.25;
+        for l in 0..4 {
+            let grid = iqt::IQ2XXS_GRID[aux0[l] as usize].to_le_bytes();
+            let signs = iqt::KSIGNS_IQ2XS[((aux1 >> (7 * l)) & 127) as usize];
+            for j in 0..8 {
+                out[y + j] = iq_signed(db, grid[j], signs, j);
+            }
+            y += 8;
+        }
+    }
+}
+
+/// Dequantize one IQ2_XS super-block (`IQ2_XS_BLOCK_BYTES`): per element
+/// group a u16 packs a 9-bit grid index + 7-bit sign index; nibble scales.
+pub fn dequant_iq2_xs_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), IQ2_XS_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK_K);
+    let d = read_f16_le(&block[0..2]);
+    let qs = &block[2..66]; // u16[32]
+    let scales = &block[66..74];
+    let mut y = 0usize;
+    for ib32 in 0..QK_K / 32 {
+        let db = [
+            d * (0.5 + (scales[ib32] & 0x0f) as f32) * 0.25,
+            d * (0.5 + (scales[ib32] >> 4) as f32) * 0.25,
+        ];
+        for l in 0..4 {
+            let q = u16::from_le_bytes([qs[(4 * ib32 + l) * 2], qs[(4 * ib32 + l) * 2 + 1]]);
+            let grid = iqt::IQ2XS_GRID[(q & 511) as usize].to_le_bytes();
+            let signs = iqt::KSIGNS_IQ2XS[(q >> 9) as usize];
+            for j in 0..8 {
+                out[y + j] = iq_signed(db[l / 2], grid[j], signs, j);
+            }
+            y += 8;
+        }
+    }
+}
+
+/// Dequantize one IQ2_S super-block (`IQ2_S_BLOCK_BYTES`): 8-bit grid index
+/// extended by 2 bits from `qh`; explicit sign bytes in the second half of
+/// the qs region; nibble scales.
+pub fn dequant_iq2_s_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), IQ2_S_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK_K);
+    let d = read_f16_le(&block[0..2]);
+    let qs_all = &block[2..66]; // 32 grid bytes + 32 sign bytes
+    let qh = &block[66..74];
+    let scales = &block[74..82];
+    let (mut qs_off, mut sg_off) = (0usize, 32usize);
+    let mut y = 0usize;
+    for ib32 in 0..QK_K / 32 {
+        let db = [
+            d * (0.5 + (scales[ib32] & 0x0f) as f32) * 0.25,
+            d * (0.5 + (scales[ib32] >> 4) as f32) * 0.25,
+        ];
+        for l in 0..4 {
+            let idx = qs_all[qs_off + l] as usize | (((qh[ib32] as usize) << (8 - 2 * l)) & 0x300);
+            let grid = iqt::IQ2S_GRID[idx].to_le_bytes();
+            let signs = qs_all[sg_off + l];
+            for j in 0..8 {
+                out[y + j] = iq_signed(db[l / 2], grid[j], signs, j);
+            }
+            y += 8;
+        }
+        qs_off += 4;
+        sg_off += 4;
+    }
+}
+
+/// Dequantize one IQ3_XXS super-block (`IQ3_XXS_BLOCK_BYTES`): 8-bit grid
+/// indices into the u32 grid (4 magnitudes each, two entries per 8 elements),
+/// with a trailing u32 per 32 elements carrying signs + a 4-bit scale.
+pub fn dequant_iq3_xxs_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), IQ3_XXS_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK_K);
+    let d = read_f16_le(&block[0..2]);
+    let qs = &block[2..66];
+    let ss = &block[66..98]; // scales_and_signs: u32 per ib32
+    let mut y = 0usize;
+    for ib32 in 0..QK_K / 32 {
+        let aux = u32::from_le_bytes([ss[4 * ib32], ss[4 * ib32 + 1], ss[4 * ib32 + 2], ss[4 * ib32 + 3]]);
+        let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+        for l in 0..4 {
+            let signs = iqt::KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+            let g1 = iqt::IQ3XXS_GRID[qs[8 * ib32 + 2 * l] as usize].to_le_bytes();
+            let g2 = iqt::IQ3XXS_GRID[qs[8 * ib32 + 2 * l + 1] as usize].to_le_bytes();
+            for j in 0..4 {
+                out[y + j] = iq_signed(db, g1[j], signs, j);
+                out[y + 4 + j] = iq_signed(db, g2[j], signs, 4 + j);
+            }
+            y += 8;
+        }
+    }
+}
+
+/// Dequantize one IQ3_S super-block (`IQ3_S_BLOCK_BYTES`): 8-bit grid indices
+/// extended by 1 bit from `qh`, explicit sign bytes, nibble scales over
+/// 64-element pairs.
+pub fn dequant_iq3_s_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), IQ3_S_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK_K);
+    let d = read_f16_le(&block[0..2]);
+    let qs = &block[2..66];
+    let qh = &block[66..74];
+    let signs = &block[74..106];
+    let scales = &block[106..110];
+    let (mut qs_off, mut sg_off) = (0usize, 0usize);
+    let mut y = 0usize;
+    for ib64 in 0..QK_K / 64 {
+        let db1 = d * (1 + 2 * (scales[ib64] & 0x0f) as i32) as f32;
+        let db2 = d * (1 + 2 * (scales[ib64] >> 4) as i32) as f32;
+        let qh0 = qh[2 * ib64] as usize;
+        let qh1 = qh[2 * ib64 + 1] as usize;
+        for (db, qhb) in [(db1, qh0), (db2, qh1)] {
+            for l in 0..4 {
+                let g1 = iqt::IQ3S_GRID[qs[qs_off + 2 * l] as usize | ((qhb << (8 - 2 * l)) & 256)].to_le_bytes();
+                let g2 = iqt::IQ3S_GRID[qs[qs_off + 2 * l + 1] as usize | ((qhb << (7 - 2 * l)) & 256)].to_le_bytes();
+                let sg = signs[sg_off + l];
+                for j in 0..4 {
+                    out[y + j] = iq_signed(db, g1[j], sg, j);
+                    out[y + 4 + j] = iq_signed(db, g2[j], sg, 4 + j);
+                }
+                y += 8;
+            }
+            qs_off += 8;
+            sg_off += 4;
+        }
+    }
+}
+
+/// Dequantize one IQ4_NL block (`IQ4_NL_BLOCK_BYTES`, 32 elements): plain
+/// nibbles mapped through the non-linear 16-entry codebook.
+pub fn dequant_iq4_nl_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), IQ4_NL_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK);
+    let d = read_f16_le(&block[0..2]);
+    for j in 0..QK / 2 {
+        out[j] = d * iqt::KVALUES_IQ4NL[(block[2 + j] & 0x0f) as usize] as f32;
+        out[j + QK / 2] = d * iqt::KVALUES_IQ4NL[(block[2 + j] >> 4) as usize] as f32;
+    }
+}
+
+/// Dequantize one IQ4_XS super-block (`IQ4_XS_BLOCK_BYTES`): the IQ4_NL
+/// codebook with per-32 6-bit scales split across `scales_l`/`scales_h`.
+pub fn dequant_iq4_xs_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), IQ4_XS_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK_K);
+    let d = read_f16_le(&block[0..2]);
+    let scales_h = u16::from_le_bytes([block[2], block[3]]);
+    let scales_l = &block[4..8];
+    let qs = &block[8..136];
+    let mut y = 0usize;
+    for ib in 0..QK_K / 32 {
+        let ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0f) as i32 | ((((scales_h >> (2 * ib)) & 3) as i32) << 4);
+        let dl = d * (ls - 32) as f32;
+        for j in 0..16 {
+            out[y + j] = dl * iqt::KVALUES_IQ4NL[(qs[16 * ib + j] & 0x0f) as usize] as f32;
+            out[y + 16 + j] = dl * iqt::KVALUES_IQ4NL[(qs[16 * ib + j] >> 4) as usize] as f32;
+        }
+        y += 32;
     }
 }
 
@@ -620,6 +1024,113 @@ pub fn matvec_q8_0_fast(w: &[u8], x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &
 /// activation to int8 once and run the Q4_0 SDOT kernel (unpack nibbles ->
 /// int8 -> `vdotq_s32`, ~the Q8_0 SDOT speed instead of the generic
 /// dequant-and-dot path); elsewhere the exact scalar `matvec_q4_0`.
+/// One Q4_K row · int8-quantized activation, NEON SDOT. Per 32-element
+/// sub-block `j` of each 256-element super-block:
+/// `d·sc_j·xs_j·SDOT(q, xq)  −  dmin·m_j·xs_j·SDOT(xq, 1)`
+/// (the affine min-term needs the activation *sum*, an SDOT against ones).
+/// Nibble layout per 64-element pair: 32 bytes, low nibbles = first sub-block,
+/// high nibbles = second. All vector loads go through the `ldq_*` inline-asm
+/// helpers (the `+strict-align` rule — plain `vld1q` scalarizes into ldrb).
+#[cfg(target_arch = "aarch64")]
+unsafe fn sdot_one_row_q4_k(row: *const u8, xq: *const i8, xs: *const f32, superblocks: usize) -> f32 {
+    use core::arch::aarch64::{
+        vaddq_s32, vaddvq_s32, vandq_u8, vdotq_s32, vdupq_n_s32, vdupq_n_s8, vdupq_n_u8, vreinterpretq_s8_u8,
+        vshrq_n_u8,
+    };
+    let mask = vdupq_n_u8(0x0f);
+    let ones = vdupq_n_s8(1);
+    // SAFETY: caller's contract; all loads in-bounds.
+    unsafe {
+        let mut acc = 0.0f32;
+        for b in 0..superblocks {
+            let base = b * Q4_K_BLOCK_BYTES;
+            let d = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
+            let dmin = f16_to_f32(u16::from_le_bytes([*row.add(base + 2), *row.add(base + 3)]));
+            let scales = core::slice::from_raw_parts(row.add(base + 4), 12);
+            let qs = row.add(base + 16);
+            // 4 pairs of 32-element sub-blocks (8 sub-blocks) per super-block.
+            for pair in 0..4 {
+                let (sc0, m0) = q_scale_min_k4(2 * pair, scales);
+                let (sc1, m1) = q_scale_min_k4(2 * pair + 1, scales);
+                let bytes_a = ldq_u8(qs.add(pair * 32));
+                let bytes_b = ldq_u8(qs.add(pair * 32 + 16));
+                let lo_a = vreinterpretq_s8_u8(vandq_u8(bytes_a, mask)); // sub 2p elems 0..16
+                let lo_b = vreinterpretq_s8_u8(vandq_u8(bytes_b, mask)); // sub 2p elems 16..32
+                let hi_a = vreinterpretq_s8_u8(vshrq_n_u8(bytes_a, 4)); // sub 2p+1 elems 0..16
+                let hi_b = vreinterpretq_s8_u8(vshrq_n_u8(bytes_b, 4)); // sub 2p+1 elems 16..32
+                let x0 = ldq_s8(xq.add(b * QK_K + pair * 64));
+                let x0b = ldq_s8(xq.add(b * QK_K + pair * 64 + 16));
+                let x1 = ldq_s8(xq.add(b * QK_K + pair * 64 + 32));
+                let x1b = ldq_s8(xq.add(b * QK_K + pair * 64 + 48));
+                // q·x and Σx per sub-block (SDOT against ones for the sum).
+                let qd0 = vaddvq_s32(vaddq_s32(vdotq_s32(vdupq_n_s32(0), lo_a, x0), vdotq_s32(vdupq_n_s32(0), lo_b, x0b)));
+                let sx0 = vaddvq_s32(vaddq_s32(vdotq_s32(vdupq_n_s32(0), ones, x0), vdotq_s32(vdupq_n_s32(0), ones, x0b)));
+                let qd1 = vaddvq_s32(vaddq_s32(vdotq_s32(vdupq_n_s32(0), hi_a, x1), vdotq_s32(vdupq_n_s32(0), hi_b, x1b)));
+                let sx1 = vaddvq_s32(vaddq_s32(vdotq_s32(vdupq_n_s32(0), ones, x1), vdotq_s32(vdupq_n_s32(0), ones, x1b)));
+                let xs0 = *xs.add(b * (QK_K / QK) + pair * 2);
+                let xs1 = *xs.add(b * (QK_K / QK) + pair * 2 + 1);
+                // Scalar accumulate is fine here: two affine terms per 64
+                // MACs — the SDOTs above are the hot part.
+                acc += (d * sc0 as f32 * qd0 as f32 - dmin * m0 as f32 * sx0 as f32) * xs0
+                    + (d * sc1 as f32 * qd1 as f32 - dmin * m1 as f32 * sx1 as f32) * xs1;
+            }
+        }
+        acc
+    }
+}
+
+/// Q4_K rows over `[row_start, row_end)` against int8-quantized activations.
+///
+/// # Safety
+/// `w` = rows of `n_cols/QK_K` Q4_K super-blocks; `xq` = `n_cols` i8;
+/// `xs` = `n_cols/QK` f32; `y` = `n_rows` f32; ranges in bounds and disjoint.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn matvec_q4_k_sdot_rows(
+    w: *const u8,
+    xq: *const i8,
+    xs: *const f32,
+    y: *mut f32,
+    row_start: usize,
+    row_end: usize,
+    n_cols: usize,
+) {
+    let superblocks = n_cols / QK_K;
+    let row_bytes = superblocks * Q4_K_BLOCK_BYTES;
+    // SAFETY: caller's contract.
+    unsafe {
+        for r in row_start..row_end {
+            *y.add(r) = sdot_one_row_q4_k(w.add(r * row_bytes), xq, xs, superblocks);
+        }
+    }
+}
+
+/// `y = W·x` for Q4_K weights: quantize the activation once to int8 and run
+/// the SDOT row kernel across cores (aarch64); elsewhere the exact generic
+/// dequant path. Requires `n_cols % QK_K == 0` (Q4_K super-blocks).
+pub fn matvec_q4_k_fast(w: &[u8], x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &mut [f32], n_rows: usize, n_cols: usize) {
+    debug_assert_eq!(n_cols % QK_K, 0);
+    debug_assert_eq!(x.len(), n_cols);
+    debug_assert_eq!(y.len(), n_rows);
+    debug_assert!(xq.len() >= n_cols && xs.len() >= n_cols / QK);
+    #[cfg(target_arch = "aarch64")]
+    {
+        let xq = &mut xq[..n_cols];
+        let xs = &mut xs[..n_cols / QK];
+        quantize_activations_q8(x, xq, xs);
+        // SAFETY: `w` holds `n_rows` Q4_K rows of `n_cols/QK_K` super-blocks;
+        // `xq`/`xs` are the just-computed quantized activation.
+        unsafe {
+            crate::arch::aarch64::smp::matvec_q4_k_sdot(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), y.as_mut_ptr(), n_rows, n_cols)
+        };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (&mut *xq, &mut *xs);
+        // SAFETY: caller's slices sized per the debug asserts above.
+        unsafe { matvec_quant_rows(QT_Q4_K, w.as_ptr(), x.as_ptr(), y.as_mut_ptr(), 0, n_rows, n_cols) };
+    }
+}
+
 pub fn matvec_q4_0_fast(w: &[u8], x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &mut [f32], n_rows: usize, n_cols: usize) {
     debug_assert_eq!(n_cols % QK, 0);
     debug_assert_eq!(x.len(), n_cols);
@@ -1099,23 +1610,53 @@ unsafe fn matvec_q8_0_avx2(w: *const u8, x: *const f32, y: *mut f32, row_start: 
     }
 }
 
-/// GGML quant type codes (subset Chitti dequantizes), matching the GGUF
+/// GGML quant type codes (the set Chitti dequantizes), matching the GGUF
 /// on-disk `ggml_type` values so a tensor's type can be carried straight
 /// through from the header.
+pub const QT_F16: u32 = 1;
 pub const QT_Q4_0: u32 = 2;
 pub const QT_Q4_1: u32 = 3;
+pub const QT_Q5_0: u32 = 6;
+pub const QT_Q5_1: u32 = 7;
 pub const QT_Q8_0: u32 = 8;
+pub const QT_Q2_K: u32 = 10;
+pub const QT_Q3_K: u32 = 11;
+pub const QT_Q4_K: u32 = 12;
 pub const QT_Q5_K: u32 = 13;
 pub const QT_Q6_K: u32 = 14;
+pub const QT_Q8_K: u32 = 15;
+pub const QT_IQ2_XXS: u32 = 16;
+pub const QT_IQ2_XS: u32 = 17;
+pub const QT_IQ3_XXS: u32 = 18;
+pub const QT_IQ4_NL: u32 = 20;
+pub const QT_IQ3_S: u32 = 21;
+pub const QT_IQ2_S: u32 = 22;
+pub const QT_IQ4_XS: u32 = 23;
+pub const QT_BF16: u32 = 30;
 
 /// Bytes per quantization block and elements per block for a quant type.
 pub fn block_layout(qt: u32) -> (usize, usize) {
     match qt {
+        QT_F16 => (F16_BLOCK_BYTES, QK),
         QT_Q4_0 => (Q4_0_BLOCK_BYTES, QK),
         QT_Q4_1 => (Q4_1_BLOCK_BYTES, QK),
+        QT_Q5_0 => (Q5_0_BLOCK_BYTES, QK),
+        QT_Q5_1 => (Q5_1_BLOCK_BYTES, QK),
         QT_Q8_0 => (Q8_0_BLOCK_BYTES, QK),
+        QT_Q2_K => (Q2_K_BLOCK_BYTES, QK_K),
+        QT_Q3_K => (Q3_K_BLOCK_BYTES, QK_K),
+        QT_Q4_K => (Q4_K_BLOCK_BYTES, QK_K),
         QT_Q5_K => (Q5_K_BLOCK_BYTES, QK_K),
         QT_Q6_K => (Q6_K_BLOCK_BYTES, QK_K),
+        QT_Q8_K => (Q8_K_BLOCK_BYTES, QK_K),
+        QT_IQ2_XXS => (IQ2_XXS_BLOCK_BYTES, QK_K),
+        QT_IQ2_XS => (IQ2_XS_BLOCK_BYTES, QK_K),
+        QT_IQ2_S => (IQ2_S_BLOCK_BYTES, QK_K),
+        QT_IQ3_XXS => (IQ3_XXS_BLOCK_BYTES, QK_K),
+        QT_IQ3_S => (IQ3_S_BLOCK_BYTES, QK_K),
+        QT_IQ4_NL => (IQ4_NL_BLOCK_BYTES, QK),
+        QT_IQ4_XS => (IQ4_XS_BLOCK_BYTES, QK_K),
+        QT_BF16 => (BF16_BLOCK_BYTES, QK),
         _ => (0, 0),
     }
 }
@@ -1124,11 +1665,26 @@ pub fn block_layout(qt: u32) -> (usize, usize) {
 /// block element count).
 pub fn dequant_block(qt: u32, block: &[u8], out: &mut [f32]) {
     match qt {
+        QT_F16 => dequant_f16_block(block, out),
         QT_Q4_0 => dequant_q4_0_block(block, out),
         QT_Q4_1 => dequant_q4_1_block(block, out),
+        QT_Q5_0 => dequant_q5_0_block(block, out),
+        QT_Q5_1 => dequant_q5_1_block(block, out),
         QT_Q8_0 => dequant_q8_0_block(block, out),
+        QT_Q2_K => dequant_q2_k_block(block, out),
+        QT_Q3_K => dequant_q3_k_block(block, out),
+        QT_Q4_K => dequant_q4_k_block(block, out),
         QT_Q5_K => dequant_q5_k_block(block, out),
         QT_Q6_K => dequant_q6_k_block(block, out),
+        QT_Q8_K => dequant_q8_k_block(block, out),
+        QT_IQ2_XXS => dequant_iq2_xxs_block(block, out),
+        QT_IQ2_XS => dequant_iq2_xs_block(block, out),
+        QT_IQ2_S => dequant_iq2_s_block(block, out),
+        QT_IQ3_XXS => dequant_iq3_xxs_block(block, out),
+        QT_IQ3_S => dequant_iq3_s_block(block, out),
+        QT_IQ4_NL => dequant_iq4_nl_block(block, out),
+        QT_IQ4_XS => dequant_iq4_xs_block(block, out),
+        QT_BF16 => dequant_bf16_block(block, out),
         _ => {}
     }
 }
@@ -1274,6 +1830,57 @@ pub fn silu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
     debug_assert_eq!(gate.len(), out.len());
     for i in 0..gate.len() {
         out[i] = silu(gate[i]) * up[i];
+    }
+}
+
+/// NeoX RoPE with per-frequency factors (llama.cpp `ggml_rope_ext` with
+/// `freq_factors`, defaults otherwise): angle_i = pos · base^(-2i/d) / ff[i].
+/// Gemma-4's proportional RoPE stores the divisors in `rope_freqs.weight`
+/// (global layers); `None` reduces exactly to [`rope`].
+pub fn rope_ext(vec: &mut [f32], pos: usize, head_dim: usize, theta_base: f32, freq_factors: Option<&[f32]>) {
+    debug_assert_eq!(vec.len(), head_dim);
+    let half = head_dim / 2;
+    for i in 0..half {
+        let mut freq = 1.0 / powf(theta_base, (2 * i) as f32 / head_dim as f32);
+        if let Some(ff) = freq_factors {
+            freq /= ff[i];
+        }
+        let angle = pos as f32 * freq;
+        let (sin, cos) = (sinf(angle), cosf(angle));
+        let a = vec[i];
+        let b = vec[i + half];
+        vec[i] = a * cos - b * sin;
+        vec[i + half] = b * cos + a * sin;
+    }
+}
+
+/// tanh via [`expf`]: (e^{2x} − 1)/(e^{2x} + 1), saturating at |x| > 10 —
+/// the final-logit softcap (`ggml_tanh`) and the GELU approximation use it.
+pub fn tanhf(x: f32) -> f32 {
+    if x > 10.0 {
+        return 1.0;
+    }
+    if x < -10.0 {
+        return -1.0;
+    }
+    let e = expf(2.0 * x);
+    (e - 1.0) / (e + 1.0)
+}
+
+/// GELU, the tanh approximation ggml uses (`ggml_gelu`):
+/// 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³))).
+pub fn gelu(x: f32) -> f32 {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_56;
+    0.5 * x * (1.0 + tanhf(SQRT_2_OVER_PI * (x + 0.044715 * x * x * x)))
+}
+
+/// `out[i] = gelu(gate[i]) * up[i]` — the Gemma FFN activation (parallel
+/// gate/up, GELU-gated; the SwiGLU counterpart is [`silu_mul`]).
+pub fn gelu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+    debug_assert_eq!(gate.len(), out.len());
+    for i in 0..gate.len() {
+        out[i] = gelu(gate[i]) * up[i];
     }
 }
 
@@ -1429,7 +2036,7 @@ fn lnf(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cortex::testdata as td;
+    use alloc::vec::Vec;
 
     fn assert_slice_close(got: &[f32], want: &[f32], atol: f32, rtol: f32, name: &str) {
         assert_eq!(got.len(), want.len(), "{name}: length mismatch");
@@ -1444,60 +2051,209 @@ mod tests {
         }
     }
 
+    /// Tiny deterministic LCG so quant blocks / activations are reproducible
+    /// without an external reference file (seeds fixed per the repo rule).
+    fn lcg(seed: &mut u32) -> u32 {
+        *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        *seed
+    }
+
+    /// f16 bit pattern for a small set of exact values used to build blocks.
+    /// 1.0 = 0x3C00, 0.5 = 0x3800, 2.0 = 0x4000 (IEEE 754 half).
+    const F16_ONE: [u8; 2] = [0x00, 0x3C];
+    const F16_HALF: [u8; 2] = [0x00, 0x38];
+
+    /// A Q8_0 block is `[d: f16][qs: 32 x i8]`; element i = d * qs[i].
+    /// Handcrafted block with d=0.5 and qs = -16..16, so the expected values
+    /// are exact halves — pins both the scale decode and the sign handling.
     #[test_case]
-    fn dequant_q8_0_matches_reference() {
+    fn dequant_q8_0_layout_and_scale() {
+        let mut block = [0u8; Q8_0_BLOCK_BYTES];
+        block[..2].copy_from_slice(&F16_HALF);
+        for i in 0..QK {
+            block[2 + i] = (i as i32 - 16) as i8 as u8;
+        }
         let mut out = [0.0f32; QK];
-        dequant_q8_0_block(&td::Q8_0_BLOCK, &mut out);
-        assert_slice_close(&out, &td::Q8_0_EXPECTED, 1e-4, 1e-5, "dequant_q8_0");
+        dequant_q8_0_block(&block, &mut out);
+        for i in 0..QK {
+            let want = 0.5 * (i as f32 - 16.0);
+            assert!((out[i] - want).abs() < 1e-6, "q8_0 idx {i}: got {} want {want}", out[i]);
+        }
     }
 
+    /// A Q4_0 block is `[d: f16][qs: 16 bytes]`; low nibble of byte j is
+    /// element j, high nibble element j+16, each nibble-8 then scaled by d.
+    /// d=1.0 with distinct nibbles pins the nibble order (a swapped layout
+    /// fails by whole integers, not epsilon).
     #[test_case]
-    fn dequant_q4_0_matches_reference() {
+    fn dequant_q4_0_nibble_order() {
+        let mut block = [0u8; Q4_0_BLOCK_BYTES];
+        block[..2].copy_from_slice(&F16_ONE);
+        for j in 0..16 {
+            let lo = (j % 16) as u8; // element j     = lo - 8
+            let hi = 15 - (j % 16) as u8; // element j+16  = hi - 8
+            block[2 + j] = (hi << 4) | lo;
+        }
         let mut out = [0.0f32; QK];
-        dequant_q4_0_block(&td::Q4_0_BLOCK, &mut out);
-        assert_slice_close(&out, &td::Q4_0_EXPECTED, 1e-4, 1e-5, "dequant_q4_0");
+        dequant_q4_0_block(&block, &mut out);
+        for j in 0..16 {
+            let want_lo = j as f32 - 8.0;
+            let want_hi = (15 - j) as f32 - 8.0;
+            assert!((out[j] - want_lo).abs() < 1e-6, "q4_0 lo idx {j}: got {} want {want_lo}", out[j]);
+            assert!((out[16 + j] - want_hi).abs() < 1e-6, "q4_0 hi idx {j}: got {} want {want_hi}", out[16 + j]);
+        }
     }
 
+    /// Build `rows x cols` of random Q8_0 blocks + a random activation, and
+    /// check the fast matvec against an f64 accumulation over the *dequantized*
+    /// values (dequant itself is pinned by the layout tests above) — an
+    /// oracle-free reference that catches indexing/blocking errors.
     #[test_case]
-    fn matvec_q8_0_matches_reference() {
-        let mut y = [0.0f32; td::MV_Q8_ROWS];
-        matvec_q8_0(&td::MV_Q8_W, &td::MV_Q8_X, &mut y, td::MV_Q8_ROWS, td::MV_Q8_COLS);
-        assert_slice_close(&y, &td::MV_Q8_Y, 1e-2, 1e-3, "matvec_q8_0");
+    fn matvec_q8_0_matches_f64_reference() {
+        let (rows, cols) = (4usize, 64usize);
+        let blocks_per_row = cols / QK;
+        let mut seed = 0xC0FFEEu32;
+        let mut w = Vec::new();
+        for _ in 0..rows * blocks_per_row {
+            let mut block = [0u8; Q8_0_BLOCK_BYTES];
+            block[..2].copy_from_slice(&F16_HALF);
+            for i in 0..QK {
+                block[2 + i] = (lcg(&mut seed) % 255) as u8;
+            }
+            w.extend_from_slice(&block);
+        }
+        let x: Vec<f32> = (0..cols).map(|_| (lcg(&mut seed) % 1000) as f32 / 500.0 - 1.0).collect();
+
+        let mut y = alloc::vec![0.0f32; rows];
+        matvec_q8_0(&w, &x, &mut y, rows, cols);
+
+        for r in 0..rows {
+            let mut want = 0.0f64;
+            for b in 0..blocks_per_row {
+                let mut dq = [0.0f32; QK];
+                dequant_q8_0_block(&w[(r * blocks_per_row + b) * Q8_0_BLOCK_BYTES..][..Q8_0_BLOCK_BYTES], &mut dq);
+                for i in 0..QK {
+                    want += dq[i] as f64 * x[b * QK + i] as f64;
+                }
+            }
+            assert!(
+                (y[r] as f64 - want).abs() <= 1e-2 + 1e-3 * want.abs(),
+                "matvec_q8_0 row {r}: got {} want {want}",
+                y[r]
+            );
+        }
     }
 
+    /// Same construction for Q4_0 (nibble-packed weights).
     #[test_case]
-    fn matvec_q4_0_matches_reference() {
-        let mut y = [0.0f32; td::MV_Q4_ROWS];
-        matvec_q4_0(&td::MV_Q4_W, &td::MV_Q4_X, &mut y, td::MV_Q4_ROWS, td::MV_Q4_COLS);
-        assert_slice_close(&y, &td::MV_Q4_Y, 1e-2, 1e-3, "matvec_q4_0");
+    fn matvec_q4_0_matches_f64_reference() {
+        let (rows, cols) = (4usize, 64usize);
+        let blocks_per_row = cols / QK;
+        let mut seed = 0xBEEFu32;
+        let mut w = Vec::new();
+        for _ in 0..rows * blocks_per_row {
+            let mut block = [0u8; Q4_0_BLOCK_BYTES];
+            block[..2].copy_from_slice(&F16_ONE);
+            for j in 0..16 {
+                block[2 + j] = (lcg(&mut seed) % 255) as u8;
+            }
+            w.extend_from_slice(&block);
+        }
+        let x: Vec<f32> = (0..cols).map(|_| (lcg(&mut seed) % 1000) as f32 / 500.0 - 1.0).collect();
+
+        let mut y = alloc::vec![0.0f32; rows];
+        matvec_q4_0(&w, &x, &mut y, rows, cols);
+
+        for r in 0..rows {
+            let mut want = 0.0f64;
+            for b in 0..blocks_per_row {
+                let mut dq = [0.0f32; QK];
+                dequant_q4_0_block(&w[(r * blocks_per_row + b) * Q4_0_BLOCK_BYTES..][..Q4_0_BLOCK_BYTES], &mut dq);
+                for i in 0..QK {
+                    want += dq[i] as f64 * x[b * QK + i] as f64;
+                }
+            }
+            assert!(
+                (y[r] as f64 - want).abs() <= 1e-2 + 1e-3 * want.abs(),
+                "matvec_q4_0 row {r}: got {} want {want}",
+                y[r]
+            );
+        }
     }
 
+    /// rmsnorm(x, w) = x / sqrt(mean(x²)+eps) * w — for constant x=c the rms
+    /// is |c|, so the output is exactly sign(c)*w (as eps→0). A second,
+    /// non-constant case checks against an explicit f64 evaluation.
     #[test_case]
-    fn rmsnorm_matches_reference() {
-        let mut out = [0.0f32; 128];
-        rmsnorm(&td::RMS_X, &td::RMS_W, td::RMS_EPS, &mut out);
-        assert_slice_close(&out, &td::RMS_Y, 1e-3, 1e-3, "rmsnorm");
+    fn rmsnorm_closed_form() {
+        let x = [2.0f32; 8];
+        let w = [3.0f32, -1.0, 0.5, 2.0, 1.0, 4.0, -2.0, 0.25];
+        let mut out = [0.0f32; 8];
+        rmsnorm(&x, &w, 1e-12, &mut out);
+        for i in 0..8 {
+            assert!((out[i] - w[i]).abs() < 1e-4, "rmsnorm const idx {i}: got {} want {}", out[i], w[i]);
+        }
+
+        let x2 = [1.0f32, -2.0, 3.0, -4.0];
+        let w2 = [1.0f32, 1.0, 1.0, 1.0];
+        let mut out2 = [0.0f32; 4];
+        let eps = 1e-6f32;
+        rmsnorm(&x2, &w2, eps, &mut out2);
+        let ms = (1.0 + 4.0 + 9.0 + 16.0) / 4.0f32 + eps;
+        let inv = 1.0 / libm_sqrtf(ms) as f64;
+        for i in 0..4 {
+            let want = (x2[i] as f64 * inv) as f32;
+            assert!((out2[i] - want).abs() < 1e-4, "rmsnorm idx {i}: got {} want {want}", out2[i]);
+        }
     }
 
+    /// RoPE at pos=0 is the identity; at pos=1 the first pair rotates by
+    /// exactly 1 radian (theta^0). cos(1)/sin(1) are pinned as f64 constants,
+    /// so a wrong pair layout (interleaved vs rotate-half) fails by ~1.0.
     #[test_case]
-    fn rope_matches_reference() {
-        let mut v = td::ROPE_IN;
-        rope(&mut v, td::ROPE_POS, td::ROPE_HEAD_DIM, td::ROPE_THETA);
-        assert_slice_close(&v, &td::ROPE_OUT, 1e-3, 1e-3, "rope");
+    fn rope_identity_and_one_radian() {
+        let head_dim = 4;
+        let mut v = [1.0f32, 2.0, 3.0, 4.0];
+        rope(&mut v, 0, head_dim, 10000.0);
+        assert_slice_close(&v, &[1.0, 2.0, 3.0, 4.0], 1e-5, 1e-5, "rope pos0");
+
+        // NeoX rotate-half: pairs are (v[i], v[i+d/2]). Pair 0 = (1,3) rotates
+        // by 1 rad; pair 1 = (2,4) by theta^(-2/4) = 0.01 rad.
+        let (c1, s1) = (0.5403023058681398f32, 0.8414709848078965f32);
+        let (c2, s2) = (0.9999500004166653f32, 0.009999833334166664f32);
+        let mut v = [1.0f32, 2.0, 3.0, 4.0];
+        rope(&mut v, 1, head_dim, 10000.0);
+        let want = [
+            1.0 * c1 - 3.0 * s1,
+            2.0 * c2 - 4.0 * s2,
+            1.0 * s1 + 3.0 * c1,
+            2.0 * s2 + 4.0 * c2,
+        ];
+        assert_slice_close(&v, &want, 1e-3, 1e-3, "rope pos1");
     }
 
+    /// softmax: equal inputs → uniform; [0, ln 3] → exactly [0.25, 0.75].
     #[test_case]
-    fn softmax_matches_reference() {
-        let mut x = td::SOFTMAX_IN;
+    fn softmax_closed_form() {
+        let mut x = [1.5f32; 4];
         softmax(&mut x);
-        assert_slice_close(&x, &td::SOFTMAX_OUT, 1e-4, 1e-4, "softmax");
+        assert_slice_close(&x, &[0.25; 4], 1e-5, 1e-5, "softmax uniform");
+
+        let mut x2 = [0.0f32, 1.0986123];
+        softmax(&mut x2);
+        assert_slice_close(&x2, &[0.25, 0.75], 1e-4, 1e-4, "softmax 1:3");
     }
 
+    /// silu(x)·up with pinned values: silu(0)=0, silu(1)=1/(1+e⁻¹)≈0.731059,
+    /// silu(-1)=-0.268941; large +x → x, large −x → 0.
     #[test_case]
-    fn silu_mul_matches_reference() {
-        let mut out = [0.0f32; 96];
-        silu_mul(&td::SILU_GATE, &td::SILU_UP, &mut out);
-        assert_slice_close(&out, &td::SILU_OUT, 1e-4, 1e-4, "silu_mul");
+    fn silu_mul_closed_form() {
+        let gate = [0.0f32, 1.0, -1.0, 20.0, -20.0];
+        let up = [5.0f32, 2.0, 2.0, 1.0, 1.0];
+        let mut out = [0.0f32; 5];
+        silu_mul(&gate, &up, &mut out);
+        let want = [0.0f32, 1.4621172, -0.5378828, 20.0, 0.0];
+        assert_slice_close(&out, &want, 1e-3, 1e-3, "silu_mul");
     }
 
     /// `dot_f32` is exercised indirectly by the matvec tests, but a direct
@@ -1509,5 +2265,178 @@ mod tests {
         let got = dot_f32(&a, &b);
         let want = 2.0 * (1.0 + 2.0 + 3.0 + 4.0 + 5.0 + 6.0 + 7.0);
         assert!((got - want).abs() < 1e-4, "dot_f32 tail: got {got} want {want}");
+    }
+
+    /// Q5_0: the 5th bit comes from the packed `qh` word — element j takes
+    /// bit j, element j+16 takes bit j+16 (the `>> (j+12)` trick). Setting
+    /// only bit 16 must lift exactly element 16 by +16.
+    #[test_case]
+    fn dequant_q5_0_fifth_bit_placement() {
+        let mut block = [0u8; Q5_0_BLOCK_BYTES];
+        block[..2].copy_from_slice(&F16_ONE);
+        block[2..6].copy_from_slice(&(1u32 << 16).to_le_bytes()); // qh: only bit 16
+        // qs: all nibbles = 5 → base value 5 - 16 = -11 without the high bit.
+        for j in 0..16 {
+            block[6 + j] = 0x55;
+        }
+        let mut out = [0.0f32; QK];
+        dequant_q5_0_block(&block, &mut out);
+        for j in 0..QK {
+            let want = if j == 16 { (5 + 16 - 16) as f32 } else { (5 - 16) as f32 };
+            assert!((out[j] - want).abs() < 1e-6, "q5_0 idx {j}: got {} want {want}", out[j]);
+        }
+    }
+
+    /// Q2_K: each `scales` byte packs a 4-bit scale (low) + 4-bit min (high)
+    /// for one 16-element group; quants are 2-bit at shift 0/2/4/6 over two
+    /// 128-element halves. Group 0 with sc=2/m=1 and all-q=3 gives 2·3−1=5.
+    #[test_case]
+    fn dequant_q2_k_scales_and_shift_walk() {
+        let mut block = [0u8; Q2_K_BLOCK_BYTES];
+        block[0] = 0x12; // group 0: sc=2, min=1
+        block[1] = 0x01; // group 1 (elems 16..32): sc=1, min=0
+        for b in 16..80 {
+            block[b] = 0b1110_0111; // 2-bit lanes: shift0=3, shift2=1, shift4=2, shift6=3
+        }
+        block[80..82].copy_from_slice(&F16_ONE); // d = 1.0
+        block[82..84].copy_from_slice(&F16_ONE); // dmin = 1.0
+        let mut out = [0.0f32; QK_K];
+        dequant_q2_k_block(&block, &mut out);
+        // Group 0 (shift 0, q=3): 1*2*3 - 1*1 = 5. Group 1 (shift 0, q=3): 1*1*3 - 0 = 3.
+        assert!((out[0] - 5.0).abs() < 1e-6, "q2_k g0: got {}", out[0]);
+        assert!((out[16] - 3.0).abs() < 1e-6, "q2_k g1: got {}", out[16]);
+        // Elements 32..48 use scales[2]=0 → dl=0, ml=0 → exactly 0 (pins the
+        // group→scale-byte mapping; a wrong is-walk would reuse sc=2).
+        assert_eq!(out[32], 0.0, "q2_k g2 should use scales[2]=0");
+    }
+
+    /// Q3_K: 6-bit scales unpacked via the kmask shuffle; the high bit comes
+    /// from `hmask` with *clear = subtract 4*. scales[0]=36 → dl=4; q=3 with
+    /// hmask set → 4·3=12; q=0 with hmask clear → 4·(0−4)=−16.
+    #[test_case]
+    fn dequant_q3_k_kmask_and_hmask_polarity() {
+        let mut block = [0u8; Q3_K_BLOCK_BYTES];
+        // hmask: set bit 0 (m=1 for the first shift group) for element 0 only.
+        block[0] = 0x01;
+        // qs[0]: element 0 low-2-bits (shift 0) = 3.
+        block[32] = 0b0000_0011;
+        // scales: scales[0] = 36 = low4 (4) from byte 0 | high2 (2) from byte 8.
+        block[96] = 0x04;
+        block[96 + 8] = 0x02;
+        block[108..110].copy_from_slice(&F16_ONE); // d = 1.0
+        let mut out = [0.0f32; QK_K];
+        dequant_q3_k_block(&block, &mut out);
+        assert!((out[0] - 12.0).abs() < 1e-6, "q3_k elem0 (hm set): got {}", out[0]);
+        // Element 1: q=0, hmask bit clear → (0-4); same dl=4 → -16.
+        assert!((out[1] + 16.0).abs() < 1e-6, "q3_k elem1 (hm clear): got {}", out[1]);
+    }
+
+    /// Q4_K: 8 sub-blocks of 32 with `get_scale_min_k4`-packed 6-bit
+    /// scale/min pairs; per 64 elements the low nibbles come first. Sub-block
+    /// 0 with sc=5/m=3, nibble 7 → 1·5·7 − 1·3 = 32.
+    #[test_case]
+    fn dequant_q4_k_scale_min_pairing() {
+        let mut block = [0u8; Q4_K_BLOCK_BYTES];
+        block[0..2].copy_from_slice(&F16_ONE); // d = 1.0
+        block[2..4].copy_from_slice(&F16_ONE); // dmin = 1.0
+        block[4] = 5; // scales[0]: sc(sub0) = 5
+        block[4 + 4] = 3; // scales[4]: min(sub0) = 3
+        block[5] = 2; // scales[1]: sc(sub1, the high nibbles of the same 32 bytes) = 2
+        block[4 + 5] = 1; // scales[5]: min(sub1) = 1
+        for j in 0..32 {
+            block[16 + j] = 0x97; // low nibble 7 (sub0), high nibble 9 (sub1)
+        }
+        let mut out = [0.0f32; QK_K];
+        dequant_q4_k_block(&block, &mut out);
+        assert!((out[0] - 32.0).abs() < 1e-6, "q4_k sub0: got {} want 32", out[0]);
+        assert!((out[32] - 17.0).abs() < 1e-6, "q4_k sub1: got {} want 2*9-1", out[32]);
+    }
+
+    /// IQ4_NL: nibbles map through the fixed non-linear codebook — nibble 0
+    /// is -127, nibble 8 is 1, nibble 15 is 113 (pins the table + order).
+    #[test_case]
+    fn dequant_iq4_nl_codebook() {
+        let mut block = [0u8; IQ4_NL_BLOCK_BYTES];
+        block[..2].copy_from_slice(&F16_ONE);
+        block[2] = 0x80; // elem 0: nibble 0 -> -127; elem 16: nibble 8 -> 1
+        block[3] = 0x0f; // elem 1: nibble 15 -> 113; elem 17: nibble 0 -> -127
+        let mut out = [0.0f32; QK];
+        dequant_iq4_nl_block(&block, &mut out);
+        assert_eq!((out[0], out[16]), (-127.0, 1.0));
+        assert_eq!((out[1], out[17]), (113.0, -127.0));
+    }
+
+    /// IQ2_XXS: an all-zeros block decodes through grid entry 0 with sign
+    /// index 0 and scale nibble 0 — every output must be `d * 0.125 * grid0`
+    /// with all-positive signs (ksigns[0] = 0). Pins the grid byte order.
+    #[test_case]
+    fn dequant_iq2_xxs_grid_and_scale() {
+        let mut block = [0u8; IQ2_XXS_BLOCK_BYTES];
+        block[..2].copy_from_slice(&F16_ONE);
+        let mut out = [0.0f32; QK_K];
+        dequant_iq2_xxs_block(&block, &mut out);
+        let g0 = super::iqt::IQ2XXS_GRID[0].to_le_bytes();
+        for j in 0..8 {
+            let want = 0.125 * g0[j] as f32; // d=1, scale nibble 0 -> (0.5+0)*0.25
+            assert!((out[j] - want).abs() < 1e-6, "iq2_xxs j{j}: got {} want {want}", out[j]);
+        }
+    }
+
+    /// BF16 is the top half of an f32; F16 goes through `f16_to_f32`.
+    #[test_case]
+    fn dequant_f16_and_bf16_chunks() {
+        let mut f16 = [0u8; F16_BLOCK_BYTES];
+        f16[0..2].copy_from_slice(&F16_HALF); // 0.5
+        f16[2..4].copy_from_slice(&F16_ONE); // 1.0
+        let mut out = [0.0f32; QK];
+        dequant_f16_block(&f16, &mut out);
+        assert_eq!((out[0], out[1]), (0.5, 1.0));
+
+        let mut bf16 = [0u8; BF16_BLOCK_BYTES];
+        let bits = (3.5f32.to_bits() >> 16) as u16;
+        bf16[0..2].copy_from_slice(&bits.to_le_bytes());
+        dequant_bf16_block(&bf16, &mut out);
+        assert_eq!(out[0], 3.5);
+        assert_eq!(out[1], 0.0);
+    }
+
+    /// Every supported quant type: `matvec_quant_rows` must equal an f64
+    /// accumulation over `dequant_block` outputs on LCG-random data — pins
+    /// the block stride / row indexing for each entry in `block_layout`.
+    #[test_case]
+    fn matvec_quant_rows_consistent_for_all_types() {
+        let types = [
+            QT_F16, QT_Q4_0, QT_Q4_1, QT_Q5_0, QT_Q5_1, QT_Q8_0, QT_Q2_K, QT_Q3_K, QT_Q4_K, QT_Q5_K,
+            QT_Q6_K, QT_Q8_K, QT_IQ2_XXS, QT_IQ2_XS, QT_IQ2_S, QT_IQ3_XXS, QT_IQ3_S, QT_IQ4_NL,
+            QT_IQ4_XS, QT_BF16,
+        ];
+        let mut seed = 0x5EED_1234u32;
+        for &qt in &types {
+            let (block_bytes, elems) = block_layout(qt);
+            let (rows, cols) = (2usize, elems * 2);
+            let blocks = cols / elems;
+            // Random bytes are a valid block for every one of these formats.
+            let w: Vec<u8> = (0..rows * blocks * block_bytes).map(|_| (lcg(&mut seed) >> 8) as u8).collect();
+            // Clamp f16-scale fields being NaN/inf is fine for consistency (both
+            // sides read the same bytes), but keep x small and finite.
+            let x: Vec<f32> = (0..cols).map(|_| (lcg(&mut seed) % 100) as f32 / 50.0 - 1.0).collect();
+            let mut y = alloc::vec![0.0f32; rows];
+            // SAFETY: w/x/y sized exactly per the contract above.
+            unsafe { matvec_quant_rows(qt, w.as_ptr(), x.as_ptr(), y.as_mut_ptr(), 0, rows, cols) };
+            let mut buf = [0.0f32; QK_K];
+            for r in 0..rows {
+                let mut want = 0.0f64;
+                for b in 0..blocks {
+                    let off = (r * blocks + b) * block_bytes;
+                    dequant_block(qt, &w[off..off + block_bytes], &mut buf[..elems]);
+                    for i in 0..elems {
+                        want += buf[i] as f64 * x[b * elems + i] as f64;
+                    }
+                }
+                let got = y[r] as f64;
+                let ok = if want.is_finite() { (got - want).abs() <= 1e-2 + 1e-3 * want.abs() } else { !got.is_finite() };
+                assert!(ok, "qt {qt} row {r}: got {got} want {want}");
+            }
+        }
     }
 }

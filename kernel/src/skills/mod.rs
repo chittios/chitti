@@ -16,11 +16,13 @@
 //! * [`install`] — the permissioned install flow (Phase G).
 
 pub mod agent_skill;
+pub mod bundled;
 pub mod crypto;
 pub mod index;
 pub mod install;
 pub mod loader;
 pub mod package;
+pub mod registry_client;
 
 #[cfg(test)]
 mod tests {

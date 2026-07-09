@@ -75,9 +75,16 @@ fn dsb() {
     unsafe { core::arch::asm!("dsb sy", options(nomem, nostack, preserves_flags)) };
 }
 
+/// Cap on fw_cfg DMA polls. QEMU completes in a handful of iterations; without
+/// a bound, platforms that have **no** fw_cfg at `0x09020000` (VirtualBox UEFI,
+/// real hardware) spin forever after `write_volatile` to unbacked MMIO — the
+/// shell hangs in `remote::boot_seed` / `read_opt_file` and never polls USB,
+/// so the host keyboard queue overflows (`VERR_PDM_NO_QUEUE_ITEMS`).
+const DMA_MAX_SPINS: u32 = 1_000_000;
+
 /// Run one fw_cfg DMA operation. `control` is in native endianness (converted
 /// here); `phys` is the (identity-mapped) address of the transfer buffer.
-/// Returns false on device error.
+/// Returns false on device error, timeout, or missing fw_cfg.
 ///
 /// # Safety
 /// `phys`/`length` must describe a valid, exclusively-owned buffer.
@@ -88,7 +95,9 @@ unsafe fn dma(control: u32, length: u32, phys: u64) -> bool {
     // Writing the (big-endian) address of the command block triggers the DMA.
     unsafe { write_volatile(FW_CFG_DMA_ADDR, acc_pa.to_be()) };
     dsb();
-    // Poll until QEMU clears control (0 = done) or sets the error bit.
+    // Poll until QEMU clears control (0 = done) or sets the error bit. Bound
+    // the wait so non-QEMU hosts return false instead of wedging the kernel.
+    let mut spins = 0u32;
     loop {
         let c = u32::from_be(unsafe { read_volatile(&acc.control as *const u32) });
         if c & CTL_ERROR != 0 {
@@ -96,6 +105,10 @@ unsafe fn dma(control: u32, length: u32, phys: u64) -> bool {
         }
         if c == 0 {
             return true;
+        }
+        spins = spins.saturating_add(1);
+        if spins > DMA_MAX_SPINS {
+            return false;
         }
         core::hint::spin_loop();
     }
@@ -187,7 +200,8 @@ pub unsafe fn read_ram_bytes() -> Option<u64> {
 /// Read a whole named fw_cfg file into a buffer.
 ///
 /// # Safety
-/// Touches fw_cfg MMIO; call once during single-core boot.
+/// Touches fw_cfg MMIO; call when no concurrent fw_cfg use is in flight
+/// (boot + single-threaded shell init are fine).
 unsafe fn read_file(name: &[u8]) -> Option<Vec<u8>> {
     let (selector, size) = unsafe { find_file(name) }?;
     if size == 0 || size > 4096 {
@@ -198,6 +212,14 @@ unsafe fn read_file(name: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(buf)
+}
+
+/// Read a launcher-supplied `opt/chitti/*` fw_cfg file after the heap is up
+/// (e.g. `opt/chitti/model` for a boot-time `/model remote` seed). `None` if
+/// the file is absent (non-QEMU, or the launcher did not publish it).
+pub fn read_opt_file(name: &[u8]) -> Option<Vec<u8>> {
+    // SAFETY: shell init / single-threaded; no concurrent fw_cfg DMA.
+    unsafe { read_file(name) }
 }
 
 /// The framebuffer resolution the launcher wants, from the `opt/chitti/fbres`

@@ -13,14 +13,6 @@ use alloc::vec::Vec;
 const UI_PATH: &str = "/configs/core/ui.json";
 const SHORTCUTS_PATH: &str = "/configs/core/shortcuts.json";
 
-#[cfg(feature = "model-9b")]
-const MODEL: &str = "qwen3.5-9b";
-#[cfg(feature = "model-4b")]
-const MODEL: &str = "qwen3.5-4b";
-#[cfg(feature = "model-2b")]
-const MODEL: &str = "qwen3.5-2b";
-#[cfg(not(any(feature = "model-2b", feature = "model-4b", feature = "model-9b")))]
-const MODEL: &str = "qwen3.5-0.8b";
 #[cfg(target_arch = "x86_64")]
 const ARCH: &str = "x86_64";
 #[cfg(target_arch = "aarch64")]
@@ -48,6 +40,9 @@ const THEME_DEFAULTS: &[(&str, &str)] = &[
     ("editor_fg", "#faf9f5"),
     ("editor_lineno", "#6c6a64"),
     ("editor_sel", "#5a3a2e"),   // terracotta-tinted selection
+    ("composer_bg", "#252320"),  // elevated input box (Grok-style)
+    ("composer_border", "#3a3733"),
+    ("composer_hint", "#6c6a64"),
 ];
 
 /// The persisted UI configuration.
@@ -152,6 +147,7 @@ impl UiConfig {
             logs_title: self.logs_title.clone(),
             theme: crate::framebuffer::theme_from_pairs(&self.theme),
             splash: self.splash,
+            fullscreen: 0,
         }
     }
 }
@@ -281,7 +277,8 @@ fn resolve_var(var: &str) -> String {
         "time" => crate::clock::format_time(),
         "datetime" => crate::clock::format_datetime(),
         "tz" => crate::clock::format_tz(),
-        "model" => MODEL.to_string(),
+        // The booted GGUF's own `general.name` (runtime, not compiled in).
+        "model" => crate::cortex::model_name().unwrap_or_else(|| "no model".to_string()),
         "arch" => ARCH.to_string(),
         "uptime" => {
             let s = crate::arch::now_ms() / 1000;
@@ -322,7 +319,7 @@ fn resolve_var(var: &str) -> String {
 
 const DEFAULT_SHORTCUTS: &[(&str, &str, &str)] = &[
     ("Enter", "submit", "send the current line (chat message or /command)"),
-    ("Ctrl+C", "stop", "stop the model mid-generation"),
+    ("Ctrl+C", "stop", "stop the model, or interrupt a running command (/http, /ping, /ws…)"),
     ("Ctrl+D", "exit", "power off on an empty line (EOF)"),
     ("Ctrl+W", "close-pane", "close the action (right) pane; chat full-width"),
     ("Ctrl+V", "paste", "paste the clipboard into the shell line"),

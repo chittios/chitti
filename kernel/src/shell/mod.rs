@@ -9,7 +9,9 @@
 //! and [`run`] is the interactive read-eval loop over COM1 that a person
 //! drives at `cargo xtask run`.
 
+pub mod catalog;
 pub mod remote;
+pub mod suggest;
 
 use crate::mm::Locked;
 use crate::persona::{self, Agent, Planner, RulePlanner};
@@ -91,7 +93,7 @@ fn demo_phase6() {
     );
 }
 
-/// The interactive shell -- a Claude-Code-style chat REPL over COM1. Plain text
+/// The interactive shell -- a chat REPL over COM1. Plain text
 /// is a chat message streamed through the Cortex model (generating until the
 /// model emits EOS or the user presses Ctrl+C); `/`-prefixed lines are commands
 /// (`/help`, `/infer`, `/agents`, ...). Never returns -- it is the system's steady
@@ -107,12 +109,20 @@ pub fn run() -> ! {
     crate::clock::init();
     crate::ui_config::load_and_apply();
     auto_mount_root();
+    #[cfg(all(not(feature = "server"), not(test)))]
+    load_panes_config();
     update_status();
+    // Ask the host terminal to bracket pastes, so a host->guest paste arrives as
+    // one `ESC[200~ … ESC[201~` block the line editor can capture (see
+    // `crate::clipboard`). Copy-out uses OSC 52 from `clipboard::set`.
+    crate::clipboard::enable_host_paste();
 
     // The agent-layer orchestrator (session persistence for the shell agent —
     // `/session`, `/info`), reused across the session so its Session persists.
     use crate::agent::{manifest as amanifest, orchestrator};
     let mut orch = orchestrator::Orchestrator::spawn(amanifest::orchestrator_manifest(), 42);
+    // Chat tools run through the Synapse Router under this task's caps.
+    bind_chat_tools_to_orchestrator(&orch);
     // Chat session (model + tokenizer + KV cache), loaded lazily on first chat.
     // Boot-time model-region probe: FNV-1a of the first 4 MiB + how long the
     // read took. One line of serial diagnoses both a corrupt load (hash
@@ -141,16 +151,55 @@ pub fn run() -> ! {
             serial_println!("model> remote backend active: {} ({})  — /model local to switch back", c.url, c.model);
         }
     }
+    // Draft preserved across channel-wake interruptions of read_line.
     let mut line = String::new();
+    // Right-side composer hint: model / approval mode (Grok shell layout).
+    #[cfg(not(test))]
+    update_composer_hint(remote_on, remote_cfg.as_ref());
 
     loop {
+        // External channel inbox → agent turn → reply. Must run whenever
+        // messages are queued — including right after a channel-wake from
+        // idle read_line (otherwise Telegram DMs sit unprocessed forever).
+        drain_channel_inbound(&mut chat, &mut orch.session);
+
+        // Grok-style bordered input box on the framebuffer; **serial always**
+        // gets a classic `>` prompt + character echo so `make run` / mon:stdio
+        // still works as a full line editor (composer must not swallow that).
+        #[cfg(not(test))]
+        if crate::framebuffer::composer_available() {
+            crate::framebuffer::composer_begin();
+            update_composer_hint(remote_on, remote_cfg.as_ref());
+            // UART-only prompt — `serial_print!` would also paint into the chat
+            // grid, which is not the input surface when the composer is up.
+            crate::serial::write_str_raw("> ");
+        } else {
+            serial_print!("> ");
+        }
+        #[cfg(test)]
         serial_print!("> ");
-        line.clear();
-        read_line(&mut line);
-        let msg = line.trim();
-        if msg.is_empty() {
+        // Prefer an explicit prefill (help browser); otherwise keep draft from
+        // a previous channel-wake so we don't wipe half-typed input.
+        if let Some(pre) = take_pending_input() {
+            line = pre;
+        }
+        let outcome = read_line(&mut line);
+        #[cfg(not(test))]
+        if crate::framebuffer::composer_available() {
+            crate::framebuffer::composer_end();
+        }
+        // Inbound channel work interrupted the prompt — do not treat `line` as
+        // a submitted command; loop to drain, then re-open the prompt with the
+        // same draft still in `line`.
+        if matches!(outcome, ReadOutcome::ChannelWake) {
             continue;
         }
+        let submitted = alloc::string::String::from(line.trim());
+        line.clear();
+        if submitted.is_empty() {
+            continue;
+        }
+        let msg = submitted.as_str();
         if let Some(cmd) = msg.strip_prefix('/') {
             let (name, arg) = match cmd.split_once(' ') {
                 Some((n, a)) => (n, a.trim()),
@@ -161,23 +210,32 @@ pub fn run() -> ! {
                     serial_println!("Chitti: powering off.");
                     crate::arch::poweroff();
                 }
+                "restart" | "reboot" => {
+                    serial_println!("Chitti: restarting.");
+                    crate::arch::reboot();
+                }
                 "clear" => {
                     chat = None;
                     remote_chat = None;
+                    // Keep session id/caps; drop the transcript so `/session`
+                    // matches the empty chat (not a hollow "N messages" ghost).
+                    orch.session.clear_transcript(orchestrator::now());
+                    let _ = crate::session::save(&orch.session);
                     #[cfg(not(test))]
                     crate::framebuffer::clear_chat();
                     serial_println!("(chat context + screen cleared)");
                 }
                 "open" | "edit" => run_open(arg),
+                "surface" => run_surface(arg),
                 // --- agents-as-processes ------------------------------------
-                "agents" => run_agents(arg, &mut chat),
+                "agents" => run_agents(arg, &mut chat, &mut orch),
                 "top" =>
                 {
                     #[cfg(not(test))]
                     {
                         crate::framebuffer::open_top();
                         refresh_top();
-                        serial_println!("top> live system monitor in the action pane (/close or Ctrl+W to hide)");
+                        serial_println!("top> htop-style monitor in the action pane (/close or Ctrl+W to hide)");
                     }
                 }
                 "compact" => {
@@ -193,9 +251,11 @@ pub fn run() -> ! {
                         }
                     }
                 }
-                "model" => run_model(arg, &mut remote_on, &mut remote_cfg, &mut remote_chat),
+                "model" => run_model(arg, &mut remote_on, &mut remote_cfg, &mut remote_chat, &mut chat),
                 "http" => run_http(arg),
                 "ws" => run_ws(arg),
+                "mcp" => run_mcp(arg),
+                "todos" | "todo" => run_todos(arg, &orch.session),
                 "session" => {
                     let (sub, sarg) = match arg.split_once(' ') {
                         Some((s, a)) => (s, a.trim()),
@@ -211,6 +271,10 @@ pub fn run() -> ! {
                                 Some(s) => {
                                     let n = s.messages.len();
                                     orch = orchestrator::Orchestrator::from_session(amanifest::orchestrator_manifest(), s);
+                                    // Drop live model context — next chat turn
+                                    // rehydrates the KV from the resumed transcript.
+                                    chat = None;
+                                    remote_chat = None;
                                     serial_println!("=> resumed session {} ({} messages reconstructed)", id, n);
                                 }
                                 None => serial_println!("=> no saved session {}", id),
@@ -236,7 +300,7 @@ pub fn run() -> ! {
                 // `/voice` with no (or an unknown) subcommand is the interactive
                 // hear->think->speak conversation loop, which needs the live
                 // ChatSession; subcommands stay on the stateless system path.
-                "voice" if !voice_is_subcommand(arg) => voice_talk(&mut chat),
+                "voice" if !voice_is_subcommand(arg) => voice_talk(&mut chat, &mut orch.session),
                 // Everything else is a stateless system command, shared with the
                 // agent tool layer (see `dispatch_system` / `run_tool_command`).
                 _ => {
@@ -253,23 +317,40 @@ pub fn run() -> ! {
             match &remote_cfg {
                 Some(cfg) => {
                     let rc = remote_chat.get_or_insert_with(|| remote::RemoteChat::new(cfg.clone()));
-                    rc.turn(msg);
+                    // Seed remote history from a resumed orch.session once.
+                    if rc.is_empty() && orch.session.messages.len() > 1 {
+                        rc.hydrate_from_session(&orch.session);
+                    }
+                    rc.turn(msg, &mut orch.session);
                 }
                 None => serial_println!("model> remote mode but no endpoint — /model remote http://host:port [name]"),
             }
+            #[cfg(not(test))]
+            crate::framebuffer::clear_chat_caret();
             continue;
         }
         if chat.is_none() {
             let mut spin = Spinner::new("loading model");
             chat = ChatSession::load(&mut spin);
             spin.clear();
+            // After `/session resume`, rebuild the KV from the persisted transcript
+            // so the next turn continues the conversation coherently.
+            if let Some(sess) = chat.as_mut() {
+                if orch.session.messages.len() > 1 {
+                    sess.hydrate_from_session(&orch.session);
+                }
+            }
         }
         match chat.as_mut() {
             Some(sess) => {
-                sess.turn(msg);
+                sess.turn(msg, &mut orch.session);
             }
             None => serial_println!("no model bundled -- chat unavailable (try /infer, /bench, or /model remote)"),
         }
+        // Drop any residual scrollback caret left at the end of the reply so
+        // only the Grok-style composer shows a cursor.
+        #[cfg(not(test))]
+        crate::framebuffer::clear_chat_caret();
     }
 }
 
@@ -279,7 +360,7 @@ pub fn run() -> ! {
 /// so the root agent can drive the machine with exactly the commands a human can.
 pub fn dispatch_system(name: &str, arg: &str) -> bool {
     match name {
-        "help" => print_help(),
+        "help" => print_help(arg),
         "infer" => run_infer(),
         "bench" => run_bench(),
         "perf" => run_perf(),
@@ -299,16 +380,29 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         }
         "datetime" | "date" => run_datetime(arg),
         "ui" => run_ui(arg),
+        "pane" | "panes" => run_pane(arg),
         "shortcuts" | "keys" => run_shortcuts(),
+        "clip" | "clipboard" => run_clip(arg),
         "ktrace" | "logs" => toggle_ktrace(),
         "close" => close_action(),
-        "skills" => print_skills(),
+        "skills" => run_skills_cmd(arg),
+        // Human/e2e surface over the same store as the agent `memory_*` tools.
+        "memory" => run_memory_cmd(arg),
         "disks" => disk_list(),
-        "ls" => disk_ls(arg),
+        "ls" => fs_ls(arg),
         "mount" => disk_mount(arg),
         "umount" => disk_umount(arg),
         "mounts" => disk_mounts(),
-        "cat" => disk_cat(arg),
+        "cat" => fs_cat(arg),
+        "grep" => fs_grep(arg),
+        "glob" => fs_glob(arg),
+        "mkdir" => fs_mkdir(arg),
+        "cp" => fs_cp(arg),
+        "mv" => fs_mv(arg),
+        "rm" => fs_rm(arg),
+        "touch" => fs_touch(arg),
+        "pwd" => serial_println!("pwd> /"),
+        "channel" | "channels" => run_channel(arg),
         "install" => disk_install(arg),
         "mkext4" => disk_mkext4(arg),
         "ext4read" => disk_ext4read(),
@@ -317,6 +411,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "wifi" => wifi_cmd(arg),
         "think" => run_think(arg),
         "mode" => run_mode(arg),
+        "permissions" | "perms" => run_permissions(arg),
         "voice" => run_voice(arg),
         "onnx" => run_onnx(arg),
         "lspci" => {
@@ -524,53 +619,166 @@ fn print_skills() {
     if metas.is_empty() {
         serial_println!("(no skills installed)");
     } else {
-        serial_println!("installed skills (L0 metadata):");
+        serial_println!("installed skills (L0 — invoke with skill tool or /skills load <name>):");
         for m in &metas {
             serial_println!("  {} [{:?}] — {}", m.name, m.kind, m.description);
         }
     }
 }
 
-fn print_help() {
+/// `/skills load <name> [asset]` — human surface for progressive skill invoke.
+fn run_skills_cmd(arg: &str) {
+    let arg = arg.trim();
+    if arg.is_empty() || arg == "list" {
+        print_skills();
+        return;
+    }
+    let (sub, rest) = match arg.split_once(char::is_whitespace) {
+        Some((s, r)) => (s, r.trim()),
+        None => (arg, ""),
+    };
+    match sub {
+        "load" | "invoke" => {
+            let (name, asset) = match rest.split_once(char::is_whitespace) {
+                Some((n, a)) => (n.trim(), Some(a.trim())),
+                None => (rest, None),
+            };
+            if name.is_empty() {
+                serial_println!("usage: /skills load <name> [asset]");
+                return;
+            }
+            // Use a throwaway session slice so we don't mutate orch.session from
+            // a bare command path — still exercises the same loader.
+            let m = crate::agent::manifest::orchestrator_manifest();
+            let mut session = crate::agent::types::Session::new(&m, 0, alloc::vec::Vec::new(), 0);
+            match crate::skills::loader::invoke(&mut session, name, asset, crate::agent::orchestrator::now()) {
+                Ok(text) => {
+                    // Print a short preview (full body can be long).
+                    let preview: alloc::string::String = text.chars().take(600).collect();
+                    serial_println!("skills> {}", preview);
+                    if text.len() > 600 {
+                        serial_println!("skills> … ({} more bytes in agent context when loaded via chat)", text.len() - 600);
+                    }
+                }
+                Err(e) => serial_println!("skills> {}", e),
+            }
+        }
+        _ => {
+            // Treat bare `/skills <name>` as load.
+            if !sub.is_empty() && rest.is_empty() && sub != "list" {
+                run_skills_cmd(&alloc::format!("load {sub}"));
+            } else {
+                print_skills();
+            }
+        }
+    }
+}
+
+/// `/memory [list|get <key>|add <key> <value>]` — human/e2e surface over the
+/// active agent's durable store (`/agent/<id>/memory/`). Agents use the
+/// `memory_add` / `memory_get` / `memory_list` tools; this command is the
+/// keyboard equivalent (and the path the e2e harness drives).
+fn run_memory_cmd(arg: &str) {
+    let id = active_agent_id();
+    let arg = arg.trim();
+    let (sub, rest) = match arg.split_once(char::is_whitespace) {
+        Some((s, r)) => (s, r.trim()),
+        None => (arg, ""),
+    };
+    match sub {
+        "" | "list" | "ls" => {
+            let out = crate::agent::home::run_memory_tool("memory_list", id, "");
+            if out.starts_with('(') {
+                serial_println!("memory> {out}");
+            } else {
+                serial_println!("memory> keys for agent {id}:");
+                for line in out.lines() {
+                    serial_println!("  {line}");
+                }
+            }
+        }
+        "get" | "recall" => {
+            if rest.is_empty() {
+                serial_println!("memory> usage: /memory get <key>");
+                return;
+            }
+            let out = crate::agent::home::run_memory_tool("memory_get", id, rest);
+            serial_println!("memory> {out}");
+        }
+        "add" | "set" | "remember" => {
+            let Some((key, value)) = rest.split_once(char::is_whitespace) else {
+                serial_println!("memory> usage: /memory add <key> <value>");
+                return;
+            };
+            let value = value.trim_start();
+            // Flat form the tool helper already understands (`key value…`).
+            let flat = alloc::format!("{key} {value}");
+            let out = crate::agent::home::run_memory_tool("memory_add", id, &flat);
+            serial_println!("memory> {out}");
+        }
+        _ => {
+            // Bare `/memory <key>` is a get, when it isn't a known subcommand.
+            if !sub.is_empty() && rest.is_empty() {
+                let out = crate::agent::home::run_memory_tool("memory_get", id, sub);
+                serial_println!("memory> {out}");
+            } else {
+                serial_println!("memory> usage: /memory [list | get <key> | add <key> <value>]");
+            }
+        }
+    }
+}
+
+/// Prefill for the next composer prompt (set by the Commands browser on
+/// Enter-select). Inserted into the input box — not executed, not printed as a
+/// chat response — so the user can add args and send.
+static PENDING_INPUT: Locked<Option<String>> = Locked::new(None);
+
+fn set_pending_input(s: String) {
+    PENDING_INPUT.with(|p| *p = Some(s));
+}
+
+fn take_pending_input() -> Option<String> {
+    PENDING_INPUT.with(|p| p.take())
+}
+
+/// `/help` — open the searchable Commands browser on the framebuffer, or print
+/// the flat list. `/help text` (or `list`) always prints the serial catalogue
+/// (used by e2e / scripting so the shell is not blocked on a modal).
+///
+/// Selecting a command **fills the composer** with `/name ` (trailing space so
+/// args are easy to type). It does **not** run the command or dump it into the
+/// chat response stream.
+fn print_help(arg: &str) {
+    let force_text = matches!(arg.trim(), "text" | "list" | "--text" | "-t");
+    #[cfg(not(test))]
+    {
+        if !force_text && crate::framebuffer::composer_available() {
+            match crate::modal::browse_commands() {
+                Some(name) => {
+                    // Prefill composer: `/ping ` not `help> /ping` in the log.
+                    if name == "help" {
+                        // Re-open would recurse; leave empty.
+                        return;
+                    }
+                    set_pending_input(alloc::format!("/{name} "));
+                }
+                None => {} // Esc / dismiss — stay at empty prompt
+            }
+            return;
+        }
+    }
+    let _ = force_text;
+    print_help_text();
+}
+
+/// Flat serial help (also used when no framebuffer is available).
+fn print_help_text() {
     serial_println!("Chitti commands:");
     serial_println!("  <message>        chat with the agent — it calls /commands as tools (Ctrl+C to stop)");
-    serial_println!("  /agents [..]     agent process list; /agents switch <id> | kill <id>");
-    serial_println!("  /session         show the current session; /session save | /session resume <id>");
-    serial_println!("  /compact         compact the chat context (model-written summary, fresh KV)");
-    serial_println!("  /model [..]      chat backend: local (embedded) | remote <http://host:port> [name]");
-    serial_println!("  /http [..] <url> curl-like: -X, -H, -d, -v, --stream (http:// + https://)");
-    serial_println!("  /ws <url> [msg]  WebSocket (ws:// or wss://): connect, send, stream frames");
-    serial_println!("  /skills          list installed skills (L0 metadata)");
-    serial_println!("  /clear           reset the chat context + clear the pane (incl. scrollback)");
-    serial_println!("  /infer           reference inference (fixed prompt, parity check)");
-    serial_println!("  /bench           matvec kernel throughput");
-    serial_println!("  /perf            end-to-end prefill/decode tok/s");
-    serial_println!("  /info            CPU / memory / model / context / OS info");
-    serial_println!("  /top             live CPU + memory monitor in the action pane (htop-style)");
-    serial_println!("  /network [..]    net status; /network dhcp | static <ip/prefix> [gw] | dns <ip>");
-    serial_println!("  /ping <host>     ICMP echo a host or IP (resolves names via DNS)");
-    serial_println!("  /wifi [..]       /wifi scan | connect <ssid> (password modal) | info");
-    serial_println!("  /think [on|off]  toggle model thinking (<think> reasoning, streamed dim; default on)");
-    serial_println!("  /mode [m]        agent-tool approvals: manual (all) | auto (destructive only) | bypass");
-    serial_println!("  /voice [..]      test = tone+mic; models; stt <file.wav>; say <text> (TTS)");
-    serial_println!("  /onnx info|run <path>  inspect or run any ONNX model from a mounted volume");
-    serial_println!("  /lspci           list every PCI device (bus:dev.func vendor:device class)");
-    serial_println!("  /datetime [..]   show/set the clock: /datetime 2026-07-04 13:45 | /datetime tz +5:30");
-    serial_println!("  /ui [config|reload|reset]  view/edit the UI config (/configs/core/ui.json)");
-    serial_println!("  /shortcuts       list keyboard shortcuts (/configs/core/shortcuts.json)");
-    serial_println!("  /ktrace          toggle the ktrace log stream in the action (right) pane");
-    serial_println!("  /open <path>     edit a file in the vim-like editor (right pane): hjkl/i/Esc/:w/:q");
-    serial_println!("  /close           close the action pane (chat full-width); also Ctrl+W");
-    serial_println!("  /disks           list every block device + detected filesystems (read-only)");
-    serial_println!("  /ls [n | /path]  list a volume's root: n on disk 0, or a mount path (/mnt)");
-    serial_println!("  /mount <d> [v] [/p]  mount disk d's volume v at /p (default /mnt)");
-    serial_println!("  /umount </path>  unmount   /mounts   list mounts");
-    serial_println!("  /cat </path/file>  print a file from a mounted volume (FAT/ext4)");
-    serial_println!("  /mkext4          format the disk with ext4 (destructive; writes test files)");
-    serial_println!("  /install [<disk>]  install/UPDATE Chitti on a disk (modal-confirmed; update keeps data)");
-    serial_println!("                   tokens: 'format' = full erase, 'yes' = skip the modal (scripted)");
-    serial_println!("  /help            this list");
-    serial_println!("  /exit            power off (or Ctrl+D on an empty line)");
+    serial_println!("  /help            Commands browser (search + scroll); /help text = this list");
+    for e in catalog::ENTRIES {
+        serial_println!("  /{:<14} {}", e.name, e.title);
+    }
 }
 
 /// `/info`: a system status panel — OS/build, arch + cores + SIMD, uptime,
@@ -601,16 +809,9 @@ fn print_info(orch: &crate::agent::orchestrator::Orchestrator, chat: Option<&Cha
         mib((m.ram_reserved - m.heap_total) as usize)
     );
 
-    // Model (parse the GGUF container header — cheap, zero-copy).
-    let model_name = if cfg!(feature = "model-9b") {
-        "Qwen3.5-9B"
-    } else if cfg!(feature = "model-4b") {
-        "Qwen3.5-4B"
-    } else if cfg!(feature = "model-2b") {
-        "Qwen3.5-2B"
-    } else {
-        "Qwen3.5-0.8B"
-    };
+    // Model name from the GGUF header itself (`general.name`) — any model
+    // file can be booted, so nothing per-model is compiled in.
+    let model_name = crate::cortex::model_name().unwrap_or_else(|| alloc::string::String::from("(no model)"));
     match crate::cortex::model_module() {
         Some(bytes) => match crate::cortex::gguf::Gguf::parse(bytes) {
             Ok(g) => serial_println!(
@@ -649,7 +850,7 @@ fn print_info(orch: &crate::agent::orchestrator::Orchestrator, chat: Option<&Cha
     );
 }
 
-/// A Claude-Code-style in-place progress spinner, drawn on the current console
+/// An in-place progress spinner, drawn on the current console
 /// line via a carriage return so it works on both the serial console and the
 /// framebuffer. Colored with ANSI SGR (rendered by the framebuffer parser and by
 /// a real terminal alike). `tick()` advances one frame; `clear()` erases it.
@@ -685,6 +886,44 @@ impl Spinner {
     }
 }
 
+/// A shared "thinking" spinner advanced by [`upkeep`]. The local inference loops
+/// own their `Spinner` and `tick()` it per token, but the **remote model** call
+/// blocks inside `net::http` (one HTTP round-trip, no token stream), so there is
+/// nothing on this side to tick. Instead `begin_thinking` starts a spinner that
+/// `upkeep` — which the net poll loop calls while waiting — advances, and
+/// `end_thinking` erases it. Rate-limited so it spins smoothly, not frantically.
+static THINKING: crate::mm::Locked<Option<Spinner>> = crate::mm::Locked::new(None);
+static THINKING_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Start the shared thinking spinner (replaces any prior one).
+pub(crate) fn begin_thinking(label: &'static str) {
+    THINKING.with(|t| *t = Some(Spinner::new(label)));
+    THINKING_LAST_MS.store(0, Ordering::Relaxed);
+}
+
+/// Stop and erase the shared thinking spinner.
+pub(crate) fn end_thinking() {
+    THINKING.with(|t| {
+        if let Some(s) = t.take() {
+            s.clear();
+        }
+    });
+}
+
+/// Advance the shared thinking spinner (~10 fps), called from [`upkeep`].
+fn thinking_tick() {
+    let now = crate::arch::now_ms();
+    if now.saturating_sub(THINKING_LAST_MS.load(Ordering::Relaxed)) < 100 {
+        return;
+    }
+    THINKING_LAST_MS.store(now, Ordering::Relaxed);
+    THINKING.with(|t| {
+        if let Some(s) = t.as_mut() {
+            s.tick();
+        }
+    });
+}
+
 /// Global thinking toggle (Qwen3.5 `<think>` reasoning before the answer).
 /// Default **off**: the small on-device models (0.8B/2B) ramble indefinitely
 /// in a primed `<think>` block instead of answering (a big context of tool
@@ -696,10 +935,27 @@ fn think_enabled() -> bool {
     THINK_ON.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Non-blocking cancel check for inference loops: Ctrl+C, or a bare Esc key
-/// (an Esc that begins an ANSI CSI sequence — an arrow key — is swallowed
-/// without cancelling).
-fn poll_cancel() -> bool {
+/// Non-blocking **interrupt** check for a running command (`/http`, `/ping`,
+/// DNS, TLS): true only on Ctrl+C. Unlike [`poll_cancel`], any other byte read
+/// is pushed back (`console::unread`) so a long command's polling doesn't eat the
+/// *next* command's keystrokes — it only steals a Ctrl+C. This is what lets
+/// Ctrl+C interrupt a stuck/streaming command without disturbing typed input.
+pub(crate) fn poll_interrupt() -> bool {
+    match crate::console::read_byte() {
+        Some(3) => true,
+        Some(b) => {
+            crate::console::unread(b);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Non-blocking cancel check: Ctrl+C, or a bare Esc key (an Esc that begins an
+/// ANSI CSI sequence — an arrow key — is swallowed without cancelling). Used by
+/// the inference loops (a decode turn owns the console, so consuming input is
+/// fine there).
+pub(crate) fn poll_cancel() -> bool {
     match crate::console::read_byte() {
         Some(3) => true,
         Some(0x1b) => {
@@ -725,23 +981,35 @@ fn poll_cancel() -> bool {
 /// the single source of tool names/descriptions/schemas, nothing hardcoded.
 fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
     use crate::tools::registry::ToolBinding;
-    // Only advertise tools the chat dispatcher can actually execute (shell
-    // commands + sub-agent delegation): listing unexecutable builtins both
-    // wastes prompt tokens (CPU prefill is the latency budget) and invites the
-    // model to call tools that would only error.
+    // Advertise tools the chat Router can actually execute: Synapse FS tools,
+    // shell commands, memory, todos, store queries, sub-agents, MCP.
     let defs: alloc::vec::Vec<_> = crate::tools::registry::for_agent(toolset)
         .into_iter()
-        .filter(|d| matches!(d.binding, ToolBinding::Shell { .. } | ToolBinding::SpawnSubagent))
+        .filter(|d| {
+            matches!(
+                d.binding,
+                ToolBinding::Shell { .. }
+                    | ToolBinding::SpawnSubagent
+                    | ToolBinding::AgentMemory
+                    | ToolBinding::Synapse { .. }
+                    | ToolBinding::SessionTodo
+                    | ToolBinding::StoreQuery { .. }
+                    | ToolBinding::Mcp { .. }
+                    | ToolBinding::LoadSkill
+                    | ToolBinding::McpResources { .. }
+            )
+        })
         .collect();
     let mut s = String::from(persona);
     // Compact one-line-per-tool listing rather than full JSON `<tools>` schemas:
     // on a CPU-bound prefill the schema boilerplate was ~1400 tokens (~3 min to
     // first token). Only a small CORE set is advertised inline; everything else
-    // is discoverable on demand via `search_tools` (Claude-Code-style tool
-    // search) — the full registry listing both bloated the prefill and tempted
-    // small models into calling the first listed tool on a bare "hello".
+    // is discoverable on demand via `search_tools` — the full registry listing
+    // both bloated the prefill and tempted small models into calling the first
+    // listed tool on a bare "hello".
     s.push_str("\n\nTools you can call. To use one, reply with ONE line and nothing else:\n");
-    s.push_str("<tool_call>{\"name\": \"<name>\", \"arguments\": {\"args\": \"<args>\"}}</tool_call>\n");
+    s.push_str("<tool_call>{\"name\": \"<name>\", \"arguments\": {…}}</tool_call>\n");
+    s.push_str("FS tools use path/content/old/new; memory uses key/value; shell tools may use {\"args\":\"…\"}.\n");
     for d in defs.iter().filter(|d| CORE_TOOLS.contains(&d.name.as_str())) {
         s.push_str("- ");
         s.push_str(&d.name);
@@ -751,7 +1019,7 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
         s.push_str(short);
         s.push('\n');
     }
-    s.push_str("- search_tools \u{2014} Find more tools by keyword (e.g. wifi, install, voice); call this when no listed tool fits.\n");
+    s.push_str("- search_tools \u{2014} Find more tools by keyword (e.g. wifi, install, mcp); call this when no listed tool fits.\n");
     s.push_str("After a tool runs you get its output in <tool_response>...; then answer, or call another tool.");
     s
 }
@@ -759,33 +1027,111 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
 /// The tools advertised inline in the system prompt; the rest of the registry
 /// is reachable through `search_tools`. Keep this list short — prefill on a
 /// CPU is the latency budget for every chat turn.
-const CORE_TOOLS: &[&str] = &["ls", "cat", "disks", "network", "datetime", "spawn_subagent"];
+///
+/// CORE tools advertised inline: coding FS tools + todos + memory + probes.
+pub(crate) const CORE_TOOLS: &[&str] = &[
+    "read",
+    "write",
+    "edit",
+    "list",
+    "glob",
+    "grep",
+    "todo_write",
+    "memory_add",
+    "memory_get",
+    "memory_list",
+    "memory_search",
+    "skill",
+    "spawn_subagent",
+    "enter_plan_mode",
+    "datetime",
+    "disks",
+    "network",
+];
 
-/// `search_tools` — the chat-level tool-discovery tool. Case-insensitive
-/// keyword match over the executable registry entries' names + descriptions;
-/// returns the same "name — description" lines the prompt uses.
+/// `search_tools` — deferred tool discovery (keyword match + `select:<name>`).
+///
+/// * bare keywords → short name + description matches (MCP tools marked deferred)
+/// * `select:<name>` → full schema for that tool (or MCP tool)
 fn search_tools(query: &str) -> String {
     use crate::tools::registry::ToolBinding;
-    let manifest = crate::agent::manifest::orchestrator_manifest();
-    let q = query.trim().to_lowercase();
+    // Active agent toolset (narrowed after `/agents switch`) + live MCP tools.
+    let mut toolset = chat_toolset();
+    let q = {
+        // Accept either a bare query string or `{"query":"..."}` / `{"args":"..."}`.
+        let t = query.trim();
+        if t.starts_with('{') {
+            crate::session::todo::json_str(t, "query")
+                .or_else(|| crate::session::todo::json_str(t, "args"))
+                .unwrap_or_default()
+        } else {
+            t.to_string()
+        }
+    };
+    let q_trim = q.trim();
+    // Direct selection: `select:tool_name` returns the full schema (deferred load).
+    if let Some(name) = q_trim.strip_prefix("select:").or_else(|| q_trim.strip_prefix("SELECT:")) {
+        let name = name.trim();
+        if name.is_empty() {
+            return String::from("usage: search_tools with query \"select:<tool_name>\"");
+        }
+        if let Some(def) = crate::tools::registry::get(name) {
+            return alloc::format!(
+                "selected: {}\n{}\nschema: {}\n",
+                def.name, def.description, def.input_schema
+            );
+        }
+        // MCP namespaced tool not yet in agent toolset intersection.
+        if let Some((srv, tool)) = name.strip_prefix("mcp__").and_then(|rest| rest.split_once("__")) {
+            if let Some((desc, schema)) = crate::mcp::server_tool_schema(srv, tool) {
+                return alloc::format!(
+                    "selected: {}\n[mcp deferred] {}\nschema: {}\n",
+                    name, desc, schema
+                );
+            }
+        }
+        return alloc::format!("no tool named '{name}' (try /mcp tools or /skills)");
+    }
+
+    let q = q_trim.to_lowercase();
     let words: alloc::vec::Vec<&str> = q.split_whitespace().collect();
     let mut out = String::new();
     let mut n = 0;
-    for d in crate::tools::registry::for_agent(&manifest.toolset) {
-        if !matches!(d.binding, ToolBinding::Shell { .. } | ToolBinding::SpawnSubagent) {
+    for (srv, _, _) in crate::mcp::servers() {
+        for (t, _) in crate::mcp::server_tools(&srv) {
+            toolset.push(crate::mcp::tool_registry_name(&srv, &t));
+        }
+    }
+    // Also surface MCP resource tools.
+    toolset.push(String::from("mcp_resources"));
+    toolset.push(String::from("mcp_read_resource"));
+    toolset.push(String::from("skill"));
+    toolset.push(String::from("load_skill"));
+
+    for d in crate::tools::registry::for_agent(&toolset) {
+        // Advertise every binding the Router can actually dispatch for this agent.
+        if matches!(d.binding, ToolBinding::RunIntent) {
             continue;
         }
         let hay = alloc::format!("{} {}", d.name, d.description).to_lowercase();
         if words.is_empty() || words.iter().any(|w| hay.contains(w)) {
-            out.push_str(&alloc::format!("- {} \u{2014} {}\n", d.name, d.description));
+            let deferred = d.name.starts_with("mcp__") || matches!(d.binding, ToolBinding::Mcp { .. });
+            if deferred {
+                out.push_str(&alloc::format!(
+                    "- {} \u{2014} {} [deferred; select:{} for schema]\n",
+                    d.name, d.description, d.name
+                ));
+            } else {
+                out.push_str(&alloc::format!("- {} \u{2014} {}\n", d.name, d.description));
+            }
             n += 1;
-            if n >= 12 {
+            if n >= 16 {
                 break;
             }
         }
     }
     if out.is_empty() {
-        out.push_str("no tools matched; try a broader keyword or call with no args to list all");
+        out.push_str("no tools matched; try a broader keyword, select:<name>, or call with no args to list all");
     }
     out
 }
@@ -798,11 +1144,154 @@ fn active_agent_id() -> u64 {
     ACTIVE_AGENT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Live chat tool authority: which task's cap table + which toolset gate
+/// interactive (and remote) tool calls. Re-bound by `/agents switch`.
+struct ChatToolCtx {
+    caller: crate::sched::TaskId,
+    /// A switch-spawned task we own (killed on next switch / revert).
+    owned_task: Option<crate::sched::TaskId>,
+    toolset: alloc::vec::Vec<String>,
+    agent_id: u64,
+}
+
+static CHAT_TOOL_CTX: crate::mm::Locked<Option<ChatToolCtx>> = crate::mm::Locked::new(None);
+
+/// Point chat tools at the shell orchestrator's root task + full toolset.
+fn bind_chat_tools_to_orchestrator(orch: &crate::agent::orchestrator::Orchestrator) {
+    let m = crate::agent::manifest::orchestrator_manifest();
+    CHAT_TOOL_CTX.with(|slot| {
+        if let Some(prev) = slot.as_ref().and_then(|c| c.owned_task) {
+            let _ = crate::sched::kill(prev);
+        }
+        *slot = Some(ChatToolCtx {
+            caller: orch.caller,
+            owned_task: None,
+            toolset: m.toolset.clone(),
+            agent_id: m.id.0,
+        });
+    });
+    ACTIVE_AGENT.store(m.id.0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Resolve caps + toolset for chatting as agent `id`.
+fn resolve_chat_agent(id: u64) -> (alloc::vec::Vec<crate::agent::types::CapabilityRequest>, alloc::vec::Vec<String>, crate::agent::types::AgentRef) {
+    use crate::agent::types::*;
+    if id == crate::agent::manifest::ORCHESTRATOR_ID.0 {
+        let m = crate::agent::manifest::orchestrator_manifest();
+        return (
+            m.capabilities.clone(),
+            m.toolset.clone(),
+            AgentRef { manifest_id: m.id, version: m.version.clone() },
+        );
+    }
+    if let Some(m) = crate::skills::agent_skill::by_id(AgentId(id)) {
+        let grant = crate::skills::agent_skill::install_grant(AgentId(id)).unwrap_or_else(|| m.capabilities.clone());
+        let bounded = intersect_caps(&m.capabilities, &grant);
+        let caps = crate::skills::install::with_home_sandbox(&bounded, AgentId(id), m.kind);
+        return (
+            caps,
+            m.toolset.clone(),
+            AgentRef { manifest_id: m.id, version: m.version.clone() },
+        );
+    }
+    // Unknown / system-home agent: confined to `/agent/<id>/**` + coding/memory tools.
+    let caps = crate::skills::install::with_home_sandbox(&[], AgentId(id), AgentKind::Subagent);
+    let toolset = alloc::vec![
+        String::from("memory_add"),
+        String::from("memory_get"),
+        String::from("memory_list"),
+        String::from("memory_search"),
+        String::from("search_tools"),
+        String::from("read"),
+        String::from("write"),
+        String::from("edit"),
+        String::from("list"),
+        String::from("glob"),
+        String::from("grep"),
+        String::from("search"),
+        String::from("todo_write"),
+    ];
+    (
+        caps,
+        toolset,
+        AgentRef { manifest_id: AgentId(id), version: String::from("0.0.0") },
+    )
+}
+
+/// Re-bind chat tool authority to agent `id` (persona + caps + toolset).
+fn rebind_chat_agent(id: u64, orch: &mut crate::agent::orchestrator::Orchestrator) {
+    use crate::agent::types::*;
+    let (caps, toolset, agent_ref) = resolve_chat_agent(id);
+    orch.session.agent = agent_ref;
+    ACTIVE_AGENT.store(id, core::sync::atomic::Ordering::Relaxed);
+    crate::agent::home::ensure(id, if id == crate::agent::manifest::ORCHESTRATOR_ID.0 { "chitti" } else { "agent" });
+
+    CHAT_TOOL_CTX.with(|slot| {
+        if let Some(prev) = slot.as_ref().and_then(|c| c.owned_task) {
+            let _ = crate::sched::kill(prev);
+        }
+        if id == crate::agent::manifest::ORCHESTRATOR_ID.0 {
+            // Root: re-grant full orchestrator caps on the long-lived task
+            // (a prior switch may have left session.capabilities narrowed).
+            let live = crate::agent::manifest::grant_to_task(orch.caller, &caps);
+            orch.session.capabilities = live;
+            *slot = Some(ChatToolCtx {
+                caller: orch.caller,
+                owned_task: None,
+                toolset,
+                agent_id: id,
+            });
+        } else {
+            let task = crate::sched::spawn_parked("chat-agent");
+            let live = crate::agent::manifest::grant_to_task(task, &caps);
+            orch.session.capabilities = live;
+            *slot = Some(ChatToolCtx {
+                caller: task,
+                owned_task: Some(task),
+                toolset,
+                agent_id: id,
+            });
+            crate::ktrace::log_fmt(format_args!(
+                "chat.tools: switched to agent {} on task {} ({} caps, {} tools)",
+                id,
+                task,
+                orch.session.capabilities.len(),
+                slot.as_ref().map(|c| c.toolset.len()).unwrap_or(0)
+            ));
+        }
+    });
+}
+
+fn chat_tool_caller() -> crate::sched::TaskId {
+    CHAT_TOOL_CTX.with(|s| s.as_ref().map(|c| c.caller).unwrap_or(0))
+}
+
+fn chat_toolset() -> alloc::vec::Vec<String> {
+    CHAT_TOOL_CTX.with(|s| {
+        s.as_ref()
+            .map(|c| c.toolset.clone())
+            .unwrap_or_else(|| crate::agent::manifest::orchestrator_manifest().toolset)
+    })
+}
+
+fn tool_in_chat_toolset(name: &str) -> bool {
+    if name == "search_tools" || name == "enter_plan_mode" || name == "exit_plan_mode" {
+        return true;
+    }
+    // MCP tools are registered at runtime and always discoverable once connected.
+    if name.starts_with("mcp__") {
+        return true;
+    }
+    chat_toolset().iter().any(|t| t == name)
+}
+
 /// The shell agent's persona + dynamically generated toolset. The persona
 /// starts from the active agent's own `/agent/<id>/SOUL.md` (created on first
-/// boot, user-editable), followed by the operating rules.
+/// boot, user-editable), optional MEMORY.md hierarchy, then operating rules.
 fn agent_system_prompt() -> String {
-    let manifest = crate::agent::manifest::orchestrator_manifest();
+    // Prefer the live chat toolset (narrowed after `/agents switch`); fall
+    // back to the orchestrator manifest when the shell is still booting.
+    let toolset = chat_toolset();
     let id = active_agent_id();
     crate::agent::home::ensure(id, if id == crate::agent::manifest::ORCHESTRATOR_ID.0 { "chitti" } else { "agent" });
     let mut persona = String::new();
@@ -810,15 +1299,42 @@ fn agent_system_prompt() -> String {
         persona.push_str(&soul);
         persona.push_str("\n\n");
     }
+    if let Some(mem) = crate::agent::home::memory_md(id) {
+        persona.push_str("## Agent memory (MEMORY.md)\n");
+        persona.push_str(&mem);
+        persona.push_str("\n\n");
+    }
+    // KV facts (memory_add) — inject so they survive /compact even when the
+    // model forgets the exact key (e.g. stored user.name, later asks "name").
+    if let Some(kv) = crate::agent::home::memory_kv_digest(id) {
+        persona.push_str("## Stored facts\n");
+        persona.push_str(&kv);
+        persona.push('\n');
+    }
+    // L0 skill index only — full bodies load via `skill` / `load_skill`.
+    let skills = crate::skills::index::metadata();
+    if !skills.is_empty() {
+        persona.push_str("## Installed skills (L0 — invoke with skill {\"name\":\"…\"})\n");
+        for m in skills.iter().take(12) {
+            persona.push_str("- ");
+            persona.push_str(&m.name);
+            persona.push_str(" \u{2014} ");
+            persona.push_str(&m.description);
+            persona.push('\n');
+        }
+        persona.push('\n');
+    }
     persona.push_str(
         "You are Chitti, an agentic OS shell agent on bare metal. For greetings and small \
          talk, just reply in prose — do NOT call a tool. Call a tool only when the task needs \
          machine state or an action, and never invent data a tool can read (current time, \
-         network status, files, disks). Delegate a self-contained task with spawn_subagent. \
-         When you have the answer, reply in short plain prose (ANSI SGR escape codes for \
-         emphasis if needed, never markdown).",
+         network status, files, disks). Use read/write/edit/glob/grep for files, memory_* for \
+         durable notes (prefer the exact keys listed under Stored facts; if unsure call \
+         memory_list or memory_search before guessing a key), skill to load a procedure, \
+         todo_write for multi-step work, spawn_subagent to delegate. When you have the answer, \
+         reply in short plain prose (ANSI SGR escape codes for emphasis if needed, never markdown).",
     );
-    tools_system_prompt(&persona, &manifest.toolset)
+    tools_system_prompt(&persona, &toolset)
 }
 
 /// A delegated worker sub-agent's persona + its (attenuated) toolset.
@@ -866,12 +1382,25 @@ fn json_str(obj: &str, key: &str) -> Option<String> {
 /// Flatten a tool call's `"arguments"` into the single argument line our
 /// dispatchers take: a bare-string arguments value is used as-is; an object is
 /// probed for the conventional keys the builtin schemas use.
+///
+/// Memory tools encode multi-field args as `key\\x1fvalue` (unit separator) so
+/// both key and value survive the flatten step into `execute_chat_tool`.
 fn json_args(body: &str) -> String {
     if let Some(i) = body.find("\"arguments\"") {
         let rest = &body[i..];
         // `"arguments": "..."` (string form).
         if let Some(v) = json_str(rest, "arguments") {
             return v;
+        }
+        // memory_add / memory_get: preserve key (+ value) as a structured line.
+        if let Some(k) = json_str(rest, "key") {
+            if let Some(v) = json_str(rest, "value") {
+                let mut s = k;
+                s.push('\u{1f}');
+                s.push_str(&v);
+                return s;
+            }
+            return k;
         }
         // `"arguments": {...}` (object form): first conventional key present.
         for key in ["args", "task", "path", "host", "query", "text", "intent", "name"] {
@@ -885,11 +1414,185 @@ fn json_args(body: &str) -> String {
     String::new()
 }
 
+/// Extract the `arguments` value from a tool-call body as a JSON object string
+/// suitable for the Synapse Router. Object form is preserved; a bare string
+/// form becomes `{"args":"…"}` so shell tools still work.
+fn extract_arguments_json(body: &str) -> String {
+    let Some(i) = body.find("\"arguments\"") else {
+        return String::from("{}");
+    };
+    let after_key = &body[i + "\"arguments\"".len()..];
+    let Some(colon) = after_key.find(':') else {
+        return String::from("{}");
+    };
+    let rest = after_key[colon + 1..].trim_start();
+    if rest.starts_with('"') {
+        // `"arguments": "flattened line"`
+        if let Some(v) = json_str(&body[i..], "arguments") {
+            return wrap_args_json(&v);
+        }
+        return String::from("{}");
+    }
+    if rest.starts_with('{') {
+        return extract_balanced_json_object(rest).unwrap_or_else(|| String::from("{}"));
+    }
+    String::from("{}")
+}
+
+/// Slice a balanced `{…}` JSON object from the start of `s` (string-aware).
+fn extract_balanced_json_object(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(s[..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn wrap_args_json(args_line: &str) -> String {
+    let mut out = String::from("{\"args\":\"");
+    for c in args_line.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push_str("\"}");
+    out
+}
+
+/// Normalize a chat-layer arg payload into Router JSON. Accepts a full object,
+/// a flattened shell line, or memory `key\\x1fvalue`.
+fn normalize_tool_args_json(name: &str, args: &str) -> String {
+    let t = args.trim();
+    if t.is_empty() {
+        return String::from("{}");
+    }
+    if t.starts_with('{') {
+        return t.to_string();
+    }
+    // Memory: structured unit-separator form from the older flattener.
+    if matches!(name, "memory_add" | "memory_get" | "memory_list" | "remember" | "recall") {
+        if name == "memory_list" {
+            return String::from("{}");
+        }
+        if let Some((k, v)) = t.split_once('\u{1f}') {
+            let mut o = String::from("{\"key\":\"");
+            json_escape_into(&mut o, k);
+            o.push_str("\",\"value\":\"");
+            json_escape_into(&mut o, v);
+            o.push_str("\"}");
+            return o;
+        }
+        let mut o = String::from("{\"key\":\"");
+        json_escape_into(&mut o, t);
+        o.push_str("\"}");
+        return o;
+    }
+    // Single-arg synapse conveniences (small models often flatten).
+    match name {
+        "read" | "delete" => {
+            let mut o = String::from("{\"path\":\"");
+            json_escape_into(&mut o, t);
+            o.push_str("\"}");
+            o
+        }
+        "search" | "grep" | "memory_search" | "search_tools" => {
+            let mut o = String::from("{\"query\":\"");
+            json_escape_into(&mut o, t);
+            o.push_str("\"}");
+            o
+        }
+        "skill" | "load_skill" => {
+            // name [asset]
+            if let Some((n, a)) = t.split_once(char::is_whitespace) {
+                let mut o = String::from("{\"name\":\"");
+                json_escape_into(&mut o, n.trim());
+                o.push_str("\",\"asset\":\"");
+                json_escape_into(&mut o, a.trim());
+                o.push_str("\"}");
+                return o;
+            }
+            let mut o = String::from("{\"name\":\"");
+            json_escape_into(&mut o, t);
+            o.push_str("\"}");
+            o
+        }
+        "glob" => {
+            let mut o = String::from("{\"pattern\":\"");
+            json_escape_into(&mut o, t);
+            o.push_str("\"}");
+            o
+        }
+        "console" => {
+            let mut o = String::from("{\"text\":\"");
+            json_escape_into(&mut o, t);
+            o.push_str("\"}");
+            o
+        }
+        "list" | "todo_write" => {
+            if name == "todo_write" && !t.is_empty() {
+                // Accept a bare todos array or object as the full args payload.
+                if t.starts_with('{') || t.starts_with('[') {
+                    if t.starts_with('[') {
+                        return alloc::format!(r#"{{"todos":{t}}}"#);
+                    }
+                    return t.to_string();
+                }
+            }
+            String::from("{}")
+        }
+        _ => wrap_args_json(t),
+    }
+}
+
+fn json_escape_into(out: &mut String, v: &str) {
+    for c in v.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+}
+
 /// Detect a tool call in a model reply. Primary: the Qwen3.5 template —
 /// `<tool_call>{"name": .., "arguments": ..}</tool_call>`. Fallback: a
-/// `TOOL: /<cmd> [args]` line (small-model drift from older prompts). Returns
-/// the tool name and its flattened argument line.
-fn parse_tool_call(text: &str) -> Option<(alloc::string::String, alloc::string::String)> {
+/// `TOOL: /<cmd> [args]` line (small-model drift from older prompts).
+///
+/// Returns `(tool_name, args_json)` where `args_json` is a JSON object the
+/// Synapse Router can shape-validate (not a flattened shell line).
+pub(crate) fn parse_tool_call(text: &str) -> Option<(alloc::string::String, alloc::string::String)> {
     use alloc::string::ToString;
     // Qwen template.
     if let Some(start) = text.find("<tool_call>") {
@@ -898,11 +1601,11 @@ fn parse_tool_call(text: &str) -> Option<(alloc::string::String, alloc::string::
         if let Some(name) = json_str(body, "name") {
             let name = name.trim().trim_start_matches('/').to_string();
             if !name.is_empty() {
-                return Some((name, json_args(body)));
+                return Some((name, extract_arguments_json(body)));
             }
         }
     }
-    // Legacy fallback.
+    // Legacy fallback → wrap the free-form line as shell `args`.
     for line in text.lines() {
         let l = line.trim();
         let rest = ["TOOL:", "TOOLS:", "Tool:", "tool:", "TOOL "]
@@ -917,16 +1620,17 @@ fn parse_tool_call(text: &str) -> Option<(alloc::string::String, alloc::string::
             let cmd = parts.next().unwrap_or("").to_string();
             let args = parts.next().unwrap_or("").trim().to_string();
             if !cmd.is_empty() {
-                return Some((cmd, args));
+                let json = normalize_tool_args_json(&cmd, &args);
+                return Some((cmd, json));
             }
         }
     }
     None
 }
 
-/// Shell approval mode (Claude-Code-style): how much an **agent's** tool calls
-/// need human confirmation. Human-typed `/commands` are never gated — the human
-/// *is* the approver.
+/// Shell approval mode: how much an **agent's** tool calls need human
+/// confirmation. Human-typed `/commands` are never gated — the human *is* the
+/// approver.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalMode {
     /// Every agent tool call requires modal approval.
@@ -935,6 +1639,8 @@ pub enum ApprovalMode {
     Auto,
     /// No approvals.
     Bypass,
+    /// Plan mode: only read-only tools + todos/skills; side effects refused.
+    Plan,
 }
 
 static MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1); // Auto
@@ -943,8 +1649,23 @@ fn approval_mode() -> ApprovalMode {
     match MODE.load(core::sync::atomic::Ordering::Relaxed) {
         0 => ApprovalMode::Manual,
         2 => ApprovalMode::Bypass,
+        3 => ApprovalMode::Plan,
         _ => ApprovalMode::Auto,
     }
+}
+
+/// Enter / exit plan mode (also exposed as tools for the agent).
+pub fn set_plan_mode(on: bool) {
+    use core::sync::atomic::Ordering;
+    if on {
+        MODE.store(3, Ordering::Relaxed);
+    } else {
+        MODE.store(1, Ordering::Relaxed); // back to auto
+    }
+}
+
+pub fn is_plan_mode() -> bool {
+    matches!(approval_mode(), ApprovalMode::Plan)
 }
 
 /// `/voice [test]` — the voice session (mic waveform modal + level-gated
@@ -1300,7 +2021,7 @@ fn voice_test() {
 /// ends after ~800 ms of silence). Esc / q / Ctrl+C or the Stop button end the
 /// session. STT/TTS attach here as their models land; until then each captured
 /// utterance is reported with its length.
-fn voice_talk(chat: &mut Option<ChatSession>) {
+fn voice_talk(chat: &mut Option<ChatSession>, session: &mut crate::agent::types::Session) {
     if !crate::sound::is_up() {
         serial_println!("voice> no sound device found");
         return;
@@ -1322,6 +2043,11 @@ fn voice_talk(chat: &mut Option<ChatSession>) {
         let mut spin = Spinner::new("loading model");
         *chat = ChatSession::load(&mut spin);
         spin.clear();
+        if let Some(sess) = chat.as_mut() {
+            if session.messages.len() > 1 {
+                sess.hydrate_from_session(session);
+            }
+        }
     }
     serial_println!("voice> listening \u{2014} Esc (or the Stop button) ends the session");
     if let Err(e) = crate::sound::capture_start(16000) {
@@ -1385,7 +2111,7 @@ fn voice_talk(chat: &mut Option<ChatSession>) {
                             // capture share the device, so stop capture first, run
                             // the turn, then resume listening (VAD reset).
                             crate::sound::capture_stop();
-                            voice_converse_turn(chat, &clip, have_stt, have_tts, &mut levels);
+                            voice_converse_turn(chat, session, &clip, have_stt, have_tts, &mut levels);
                             crate::sound::vad::reset();
                             vadbuf.clear();
                             let _ = crate::sound::capture_start(16000);
@@ -1412,6 +2138,7 @@ fn voice_talk(chat: &mut Option<ChatSession>) {
 #[cfg(not(test))]
 fn voice_converse_turn(
     chat: &mut Option<ChatSession>,
+    session: &mut crate::agent::types::Session,
     clip: &[i16],
     have_stt: bool,
     have_tts: bool,
@@ -1436,7 +2163,7 @@ fn voice_converse_turn(
     let reply = match chat.as_mut() {
         Some(sess) => {
             crate::framebuffer::draw_voice(levels, "thinking\u{2026}");
-            sess.turn(heard)
+            sess.turn(heard, session)
         }
         None => {
             serial_println!("voice> (no LLM loaded \u{2014} cannot reply)");
@@ -1463,7 +2190,7 @@ fn voice_converse_turn(
     }
 }
 
-/// `/mode manual|auto|bypass` — set (or show) the approval mode.
+/// `/mode manual|auto|bypass|plan` — set (or show) the approval mode.
 fn run_mode(arg: &str) {
     use core::sync::atomic::Ordering;
     match arg.trim() {
@@ -1479,64 +2206,260 @@ fn run_mode(arg: &str) {
             MODE.store(2, Ordering::Relaxed);
             serial_println!("mode> \x1b[1mbypass\x1b[0m — no approvals (be careful)");
         }
+        "plan" => {
+            MODE.store(3, Ordering::Relaxed);
+            serial_println!(
+                "mode> \x1b[1mplan\x1b[0m — read-only + todos/skills only; write/delete/install refused until /mode auto"
+            );
+        }
         "" => {
             let m = match approval_mode() {
                 ApprovalMode::Manual => "manual",
                 ApprovalMode::Auto => "auto",
                 ApprovalMode::Bypass => "bypass",
+                ApprovalMode::Plan => "plan",
             };
-            serial_println!("mode> {} — usage: /mode manual|auto|bypass", m);
+            serial_println!("mode> {} — usage: /mode manual|auto|bypass|plan", m);
         }
-        other => serial_println!("mode> unknown '{}' — usage: /mode manual|auto|bypass", other),
+        other => serial_println!("mode> unknown '{}' — usage: /mode manual|auto|bypass|plan", other),
     }
 }
 
-/// Execute one chat-protocol tool call by registry lookup: `Shell`-bound tools
-/// run through `run_tool_command` (the human `/command` surface), **gated by the
-/// approval mode** (manual = all, auto = destructive only, bypass = none) via
-/// the keyboard/mouse modal; everything else is reported unavailable in chat
-/// mode (the full Router path is the `/agent` loop). The caller handles
-/// `spawn_subagent` before this.
-fn execute_chat_tool(name: &str, args: &str) -> alloc::string::String {
+/// `/todos [open|list]` — show session todos; open a live action-pane view.
+fn run_todos(arg: &str, session: &crate::agent::types::Session) {
+    match arg.trim() {
+        "open" | "show" | "" => {
+            #[cfg(not(test))]
+            {
+                crate::framebuffer::open_todos();
+                refresh_todos(session);
+                serial_println!("todos> live checklist in the action pane ({} item(s))", session.todos.len());
+            }
+            #[cfg(test)]
+            {
+                serial_println!("todos> {} item(s)", session.todos.len());
+                for t in &session.todos {
+                    serial_println!("  [{}] {}: {}", todo_status_str(t.status), t.id, t.text);
+                }
+            }
+        }
+        "list" => {
+            if session.todos.is_empty() {
+                serial_println!("todos> (empty)");
+            } else {
+                for t in &session.todos {
+                    serial_println!("todos> [{}] {}: {}", todo_status_str(t.status), t.id, t.text);
+                }
+            }
+        }
+        other => serial_println!("todos> unknown '{}' — usage: /todos [open|list]", other),
+    }
+}
+
+fn todo_status_str(s: crate::agent::types::TodoStatus) -> &'static str {
+    use crate::agent::types::TodoStatus;
+    match s {
+        TodoStatus::Pending => " ",
+        TodoStatus::InProgress => ">",
+        TodoStatus::Done => "x",
+        TodoStatus::Cancelled => "-",
+    }
+}
+
+/// Repaint the todos action pane from a session snapshot.
+#[cfg(not(test))]
+fn refresh_todos(session: &crate::agent::types::Session) {
+    use crate::agent::types::TodoStatus;
+    use crate::framebuffer::TodoViewItem;
+    let mut items: alloc::vec::Vec<TodoViewItem<'_>> = alloc::vec::Vec::new();
+    // TodoViewItem borrows status str - use static labels
+    for t in &session.todos {
+        let status = match t.status {
+            TodoStatus::Pending => "pending",
+            TodoStatus::InProgress => "in_progress",
+            TodoStatus::Done => "done",
+            TodoStatus::Cancelled => "cancelled",
+        };
+        items.push(TodoViewItem {
+            id: t.id,
+            text: t.text.as_str(),
+            status,
+        });
+    }
+    let title = alloc::format!("Todos ({})", session.todos.len());
+    crate::framebuffer::draw_todos(&items, &title);
+}
+
+#[cfg(test)]
+fn refresh_todos(_session: &crate::agent::types::Session) {}
+
+/// `/permissions [reload|show]` — optional allow/ask/deny patterns from
+/// `/configs/core/permissions.json`.
+fn run_permissions(arg: &str) {
+    match arg.trim() {
+        "reload" | "load" => {
+            crate::tools::permissions::ensure_default();
+            crate::tools::permissions::load();
+            serial_println!("permissions> {}", crate::tools::permissions::summary());
+        }
+        "init" | "default" => {
+            crate::tools::permissions::ensure_default();
+            crate::tools::permissions::load();
+            serial_println!("permissions> wrote default rules to /configs/core/permissions.json");
+            serial_println!("permissions> {}", crate::tools::permissions::summary());
+        }
+        "" | "show" | "status" => {
+            if !crate::tools::permissions::is_active() {
+                crate::tools::permissions::load();
+            }
+            serial_println!("permissions> {}", crate::tools::permissions::summary());
+            serial_println!("permissions> /permissions reload | init   (path: /configs/core/permissions.json)");
+        }
+        other => serial_println!("permissions> unknown '{}' — usage: /permissions [show|reload|init]", other),
+    }
+}
+
+/// Execute one chat-protocol tool call through the **Synapse Router** under the
+/// active chat agent's capability table ([`CHAT_TOOL_CTX`]), with the same
+/// human approval modal as before (manual / auto / bypass).
+///
+/// `args` may be a JSON object (preferred — from [`parse_tool_call`]) or a
+/// flattened line (normalized for the Router). `session` is the live
+/// orchestrator session (taint provenance + memory agent id + todos).
+///
+/// `spawn_subagent` is handled by the caller before this.
+fn execute_chat_tool(
+    name: &str,
+    args: &str,
+    session: &mut crate::agent::types::Session,
+) -> alloc::string::String {
+    use crate::agent::agent_loop::{format_tool_result, ToolDispatch};
+    use crate::agent::types::ToolCall;
     use crate::tools::registry::{self, ToolBinding};
-    // Tool discovery is chat-level, side-effect-free, and never needs approval.
+    use crate::tools::Router;
+
+    // Tool discovery is side-effect-free and never needs approval / caps.
     if name == "search_tools" {
         return search_tools(args);
     }
-    let (command, destructive) = match registry::get(name) {
-        Some(def) => match def.binding {
-            ToolBinding::Shell { command, destructive } => (command, destructive),
-            _ => {
-                return alloc::format!("tool '{}' is not available in chat mode (use /agent for the full loop)", name);
+    // Plan mode enter/exit — human or agent can toggle without Router.
+    if name == "enter_plan_mode" {
+        set_plan_mode(true);
+        return String::from("ok: plan mode on — only read-only tools + todos/skills until exit_plan_mode or /mode auto");
+    }
+    if name == "exit_plan_mode" {
+        // Require human confirm to leave plan (prevents model self-escalating).
+        let ok = crate::modal::confirm(
+            "Exit plan mode?",
+            "The agent wants to leave plan mode and re-enable write/delete tools (mode: auto).",
+        );
+        if !ok {
+            return String::from("Denied: stayed in plan mode.");
+        }
+        set_plan_mode(false);
+        return String::from("ok: plan mode off (auto approvals)");
+    }
+    if !tool_in_chat_toolset(name) {
+        return alloc::format!(
+            "error: tool '{}' is not in this agent's toolset (agent {})",
+            name,
+            active_agent_id()
+        );
+    }
+
+    let args_json = normalize_tool_args_json(name, args);
+    let def = registry::get(name);
+    let (label, destructive, is_mcp) = match def.as_ref().map(|d| &d.binding) {
+        Some(ToolBinding::Shell { command, destructive }) => {
+            (alloc::format!("/{command}"), *destructive, false)
+        }
+        Some(ToolBinding::Mcp { server, tool }) => {
+            (alloc::format!("mcp:{server}/{tool}"), true, true)
+        }
+        Some(ToolBinding::Synapse { .. }) if name == "delete" => {
+            (alloc::format!("{name}"), true, false)
+        }
+        Some(_) => (alloc::format!("{name}"), false, false),
+        None => (alloc::format!("{name}"), false, false),
+    };
+
+    // Plan mode: refuse non-readonly tools.
+    if matches!(approval_mode(), ApprovalMode::Plan) && !crate::tools::permissions::is_readonly_tool(name) {
+        serial_println!("\x1b[33m[plan mode: refused '{}']\x1b[0m", name);
+        return alloc::format!(
+            "error: plan mode — '{name}' is not read-only. Use read/glob/grep/todo_write/skill, or /mode auto to exit plan."
+        );
+    }
+
+    // Optional permissions.json patterns (deny > allow > ask > fallthrough).
+    let rule = crate::tools::permissions::check(name);
+    if matches!(rule, Some(crate::tools::permissions::Decision::Deny)) {
+        serial_println!("\x1b[33m[permissions: denied '{}']\x1b[0m", name);
+        return alloc::format!("error: denied by permissions.json rule for '{name}'");
+    }
+    let rule_allow = matches!(rule, Some(crate::tools::permissions::Decision::Allow));
+    let rule_ask = matches!(rule, Some(crate::tools::permissions::Decision::Ask));
+
+    let needs_approval = if rule_allow {
+        false // still cap-gated at Router
+    } else {
+        rule_ask
+            || match approval_mode() {
+                ApprovalMode::Manual => true,
+                ApprovalMode::Auto => destructive || is_mcp,
+                ApprovalMode::Bypass | ApprovalMode::Plan => false,
             }
-        },
-        // Not in the registry: try the command dispatcher directly (aliases).
-        // Treated as non-destructive; unknown names just print usage help.
-        None => (String::from(name), false),
     };
-    let needs_approval = match approval_mode() {
-        ApprovalMode::Manual => true,
-        ApprovalMode::Auto => destructive,
-        ApprovalMode::Bypass => false,
-    };
-    if needs_approval {
+    let human_confirmed = if needs_approval {
         let ok = crate::modal::confirm(
             "Agent tool call \u{2014} approve?",
-            &alloc::format!("The agent wants to run: /{} {}\n(mode: {})", command, args, if destructive { "destructive" } else { "manual approval" }),
+            &alloc::format!(
+                "The agent wants to run: {} {}\n(mode: {})",
+                label,
+                args_json,
+                if destructive { "destructive" } else { "manual approval" }
+            ),
         );
         if !ok {
             serial_println!("\x1b[33m[denied by user]\x1b[0m");
-            return String::from("Denied: the user rejected this tool call. Do not retry it; continue without it or explain what you needed.");
+            return String::from(
+                "Denied: the user rejected this tool call. Do not retry it; continue without it or explain what you needed.",
+            );
+        }
+        true
+    } else {
+        false
+    };
+
+    let caller = chat_tool_caller();
+    let mut router = Router::taint_aware();
+    router.human_confirmed = human_confirmed;
+    // Session-scoped agent hooks (spawn/load) — chat handles spawn itself;
+    // load_skill still goes through the orchestrator hook when present.
+    // A bare Router is enough for Synapse / Shell / Memory / MCP / Todo.
+    let call = ToolCall {
+        call_id: 0,
+        tool: String::from(name),
+        args: args_json,
+    };
+    let outcome = router.call(session, caller, &call);
+    // Live todo pane tracks the session checklist.
+    if name == "todo_write" && !outcome.is_error {
+        #[cfg(not(test))]
+        if crate::framebuffer::is_todos() {
+            refresh_todos(session);
         }
     }
-    run_tool_command(&command, args)
+    // Auto-compact after tool use (same threshold as agent_loop).
+    let _ = crate::agent::context::maybe_compact(session, crate::agent::orchestrator::now());
+    format_tool_result(outcome.is_error, outcome.result)
 }
 
 /// A live chat: the model, its BPE tokenizer, and a persistent KV/recurrent
 /// cache so context carries across turns (`/clear` drops it).
 struct ChatSession {
     model: crate::cortex::model::Model<'static>,
-    tok: crate::cortex::tokenizer::Tokenizer,
+    tok: crate::cortex::tokenizer::Tokenizer<'static>,
     kv: crate::cortex::model::Cache,
     state: crate::cortex::model::State,
     pos: usize,
@@ -1546,6 +2469,16 @@ struct ChatSession {
     /// Set when the user cancels (Ctrl+C / Esc) mid-prefill or mid-decode;
     /// `turn` checks it after every phase and ends the turn.
     cancelled: bool,
+    /// Greedy (argmax) decoding instead of temperature sampling — used for a
+    /// service agent's planning turn, where a deterministic decision (e.g. a
+    /// routing lookup) is wanted, not creative chat.
+    greedy: bool,
+    /// Committed (header, body) turns that match the KV. Used to rebuild the
+    /// cache after a mid-prefill / mid-decode cancel, which would otherwise
+    /// leave a truncated turn in the KV and corrupt the next message.
+    history: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>,
+    /// Monotonic tool-call ids for recording into the orchestrator session.
+    next_call_id: u64,
 }
 
 impl ChatSession {
@@ -1566,7 +2499,89 @@ impl ChatSession {
         spin.tick();
         // Seed the sampler from the boot clock so sessions vary.
         let rng = sampler::Rng::new(crate::arch::now_ms().wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-        Some(Self { model: m, tok, kv, state, pos: 0, rng, gen: alloc::vec::Vec::new(), cancelled: false })
+        Some(Self {
+            model: m,
+            tok,
+            kv,
+            state,
+            pos: 0,
+            rng,
+            gen: alloc::vec::Vec::new(),
+            cancelled: false,
+            greedy: false,
+            history: alloc::vec::Vec::new(),
+            next_call_id: 1,
+        })
+    }
+
+    /// Rebuild KV + history from a resumed orchestrator session so chat and
+    /// `/session` share one transcript. Skips empty assistant tool-call shells.
+    fn hydrate_from_session(&mut self, session: &crate::agent::types::Session) {
+        use crate::agent::types::Role;
+        self.history.clear();
+        for m in &session.messages {
+            match m.role {
+                Role::System => {
+                    if !m.content.is_empty() {
+                        self.history.push((alloc::string::String::from("system\n"), m.content.clone()));
+                    }
+                }
+                Role::User => {
+                    self.history.push((alloc::string::String::from("user\n"), m.content.clone()));
+                }
+                Role::Assistant => {
+                    if !m.content.is_empty() {
+                        self.history.push((alloc::string::String::from("assistant\n"), m.content.clone()));
+                    }
+                }
+                Role::Tool => {
+                    let body = alloc::format!("<tool_response>\n{}\n</tool_response>", m.content);
+                    self.history.push((alloc::string::String::from("user\n"), body));
+                }
+            }
+            for c in &m.tool_calls {
+                if c.call_id >= self.next_call_id {
+                    self.next_call_id = c.call_id + 1;
+                }
+            }
+            if let Some(cid) = m.tool_call_id {
+                if cid >= self.next_call_id {
+                    self.next_call_id = cid + 1;
+                }
+            }
+        }
+        self.rebuild_kv_from_history();
+        crate::ktrace::log_fmt(format_args!(
+            "chat.hydrate: session {} -> {} history turns, pos={}",
+            session.id.0,
+            self.history.len(),
+            self.pos
+        ));
+    }
+
+    /// Drop the KV and re-prefill every committed history turn (no assistant
+    /// priming). Used after cancel so a truncated prefill/decode never sticks.
+    /// Uses [`Self::prefill_turn`] directly (not `prefill_committed`) to avoid
+    /// recursive rebuild if the user holds Ctrl+C through the rebuild itself.
+    fn rebuild_kv_from_history(&mut self) {
+        let turns: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> = self.history.clone();
+        self.kv = self.model.new_cache();
+        self.state = self.model.new_state();
+        self.pos = 0;
+        self.gen.clear();
+        self.cancelled = false;
+        for (header, body) in &turns {
+            self.prefill_turn(header, body, false);
+            if self.cancelled {
+                // User held cancel through rebuild: keep the full logical
+                // history; KV may be short. Clear the flag so the outer turn
+                // still ends, and leave history intact for a later rebuild.
+                self.history = turns;
+                return;
+            }
+        }
+        // History was already correct; leave it as the cloned turns.
+        self.history = turns;
     }
 
     /// One chat turn as an **agentic ReAct loop** over the Qwen3.5 tool
@@ -1574,17 +2589,37 @@ impl ChatSession {
     /// emit a `<tool_call>` (executed; its output returned in a
     /// `<tool_response>` block) or a final answer. Bounded by `MAX_TOOL_ITERS`
     /// so a confused small model can't loop forever.
+    ///
+    /// Records the turn into `session` (user / tool / assistant) and write-
+    /// through saves so `/session save|resume` reflects interactive chat.
     /// Returns the final assistant answer (post-`<think>`) — used by the voice
-    /// loop to speak the reply; the interactive shell caller ignores it.
-    fn turn(&mut self, msg: &str) -> alloc::string::String {
-        const MAX_TOOL_ITERS: usize = 4;
+    /// loop to speak the reply.
+    ///
+    /// Budgets match the agent layer: `session.budget.limits.max_turns` and
+    /// `max_tool_calls` (with a small interactive ceiling so a runaway model
+    /// can't burn the whole session budget on one user message).
+    fn turn(&mut self, msg: &str, session: &mut crate::agent::types::Session) -> alloc::string::String {
+        use crate::agent::orchestrator::now;
+        use crate::agent::types::{Provenance, Role, ToolCall};
+        // Per-turn tool-call ceiling (interactive); never exceed the session budget.
+        const MAX_TOOLS_PER_TURN: u32 = 8;
         self.cancelled = false;
-        if self.pos == 0 {
-            self.prefill_turn("system\n", &agent_system_prompt(), false);
+
+        let limits = session.budget.limits;
+        if session.budget.turns_used >= limits.max_turns {
+            serial_println!("\x1b[33m[stopped: turn budget exhausted]\x1b[0m");
+            return alloc::string::String::from("stopped: turn budget exhausted");
         }
-        self.prefill_turn("user\n", msg, true);
+        session.push_message(Role::User, msg.into(), Provenance::UserTyped, now());
+        session.budget.turns_used = session.budget.turns_used.saturating_add(1);
+
+        if self.history.is_empty() {
+            self.prefill_committed("system\n", &agent_system_prompt(), false);
+        }
+        self.prefill_committed("user\n", msg, true);
         if self.cancelled {
             serial_println!("\x1b[33m[cancelled]\x1b[0m");
+            let _ = crate::session::save(session);
             return alloc::string::String::new();
         }
         // Repeat guard (same rationale as the sub-agent loop): a small model
@@ -1592,19 +2627,34 @@ impl ChatSession {
         // gets one "answer now" nudge; a repeat after that ends the turn.
         let mut last_call: Option<(alloc::string::String, alloc::string::String)> = None;
         let mut nudged = false;
-        for _ in 0..MAX_TOOL_ITERS {
+        let mut tools_this_turn = 0u32;
+        let remaining = limits.max_tool_calls.saturating_sub(session.budget.tool_calls_used);
+        if remaining == 0 {
+            serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
+            return alloc::string::String::from("stopped: tool-call budget exhausted");
+        }
+        let max_this_turn = MAX_TOOLS_PER_TURN.min(remaining);
+        loop {
+            if tools_this_turn >= max_this_turn || session.budget.tool_calls_used >= limits.max_tool_calls {
+                serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
+                let _ = crate::session::save(session);
+                return alloc::string::String::from("stopped: tool-call budget exhausted");
+            }
             let text = self.generate_assistant("\x1b[1;36mchitti:\x1b[0m ");
             if self.cancelled {
-                return text; // user cancelled: no tool parsing, turn over
+                // Partial decode is not in history; KV already rebuilt.
+                let _ = crate::session::save(session);
+                return text;
             }
             if let Some(pair) = parse_tool_call(&text) {
                 if last_call.as_ref() == Some(&pair) {
                     if nudged {
                         serial_println!("\x1b[33m[tool loop stopped: repeated call]\x1b[0m");
+                        let _ = crate::session::save(session);
                         return alloc::string::String::new();
                     }
                     nudged = true;
-                    self.prefill_turn(
+                    self.prefill_committed(
                         "user\n",
                         "<tool_response>\nYou already ran that tool and have its output above. Do not call any more tools; give your final answer in prose now.\n</tool_response>",
                         true,
@@ -1615,12 +2665,28 @@ impl ChatSession {
             }
             match parse_tool_call(&text) {
                 Some((cmd, args)) if cmd == "spawn_subagent" || cmd == "subagent" => {
-                    // Delegate to an isolated, tool-using sub-agent; only its
-                    // summary comes back as the observation.
-                    serial_println!("\x1b[33m\u{2192} dispatching subagent:\x1b[0m {}", args);
-                    let summary = self.run_subagent(&args);
+                    // Args are Router JSON; task under "task"/"args", role under "role".
+                    let task = crate::session::todo::json_str(&args, "task")
+                        .or_else(|| crate::session::todo::json_str(&args, "args"))
+                        .unwrap_or_else(|| args.clone());
+                    let role = crate::session::todo::json_str(&args, "role").unwrap_or_else(|| "worker".into());
+                    serial_println!("\x1b[33m\u{2192} dispatching subagent[{}]:\x1b[0m {}", role, task);
+                    // Keep assistant tool-call text in history so a later rebuild
+                    // preserves the Qwen tool-call → tool_response shape.
+                    self.history.push((alloc::string::String::from("assistant\n"), text.clone()));
+                    let call_id = self.next_call_id;
+                    self.next_call_id += 1;
+                    session.push_assistant_tool_calls(
+                        String::new(),
+                        alloc::vec![ToolCall { call_id, tool: cmd.clone(), args: args.clone() }],
+                        now(),
+                    );
+                    session.budget.tool_calls_used = session.budget.tool_calls_used.saturating_add(1);
+                    tools_this_turn = tools_this_turn.saturating_add(1);
+                    let summary = self.run_subagent_role(&role, &task);
+                    session.push_tool_result(call_id, summary.clone(), Provenance::SystemTrusted, now());
                     let fb = alloc::format!("<tool_response>\nSubagent report:\n{}\n</tool_response>", summary);
-                    self.prefill_turn("user\n", &fb, true);
+                    self.prefill_committed("user\n", &fb, true);
                 }
                 Some((cmd, args)) => {
                     serial_println!(
@@ -1629,17 +2695,45 @@ impl ChatSession {
                         if args.is_empty() { "" } else { " " },
                         args
                     );
-                    // `execute_chat_tool` streams the command's output live
-                    // *and* returns a copy; feed it back per the Qwen template.
-                    let obs = execute_chat_tool(&cmd, &args);
+                    self.history.push((alloc::string::String::from("assistant\n"), text.clone()));
+                    let call_id = self.next_call_id;
+                    self.next_call_id += 1;
+                    session.push_assistant_tool_calls(
+                        String::new(),
+                        alloc::vec![ToolCall { call_id, tool: cmd.clone(), args: args.clone() }],
+                        now(),
+                    );
+                    session.budget.tool_calls_used = session.budget.tool_calls_used.saturating_add(1);
+                    tools_this_turn = tools_this_turn.saturating_add(1);
+                    let obs = execute_chat_tool(&cmd, &args, session);
+                    let prov = if obs.starts_with("error:")
+                        || obs.starts_with("Denied:")
+                        || obs.starts_with("denied:")
+                        || obs.starts_with("refused:")
+                    {
+                        Provenance::SystemTrusted
+                    } else {
+                        Provenance::UntrustedIngested
+                    };
+                    session.push_tool_result(call_id, obs.clone(), prov, now());
                     let fb = alloc::format!("<tool_response>\n{}\n</tool_response>", obs);
-                    self.prefill_turn("user\n", &fb, true);
+                    self.prefill_committed("user\n", &fb, true);
                 }
-                None => return text, // final answer already streamed
+                None => {
+                    // Final answer: commit assistant text to history + session.
+                    if !text.is_empty() {
+                        self.history.push((alloc::string::String::from("assistant\n"), text.clone()));
+                    }
+                    session.push_message(Role::Assistant, text.clone(), Provenance::SystemTrusted, now());
+                    let _ = crate::session::save(session);
+                    return text;
+                }
+            }
+            if self.cancelled {
+                let _ = crate::session::save(session);
+                return alloc::string::String::new();
             }
         }
-        serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
-        alloc::string::String::new()
     }
 
     /// `/compact` — shrink the live context: the model itself summarizes the
@@ -1658,44 +2752,90 @@ impl ChatSession {
             true,
         );
         if self.cancelled {
+            // Drop the partial summarize prompt; restore committed history.
+            if !self.history.is_empty() {
+                self.rebuild_kv_from_history();
+            }
             serial_println!("\x1b[33m[cancelled]\x1b[0m");
             return;
         }
         let summary = self.generate_assistant("\x1b[1;36msummary:\x1b[0m ");
+        if self.cancelled {
+            serial_println!("\x1b[33m[cancelled]\x1b[0m");
+            return;
+        }
         let before = self.pos;
+        let s = summary.trim();
+        self.history.clear();
         self.kv = self.model.new_cache();
         self.state = self.model.new_state();
         self.pos = 0;
         self.gen.clear();
-        self.prefill_turn("system\n", &agent_system_prompt(), false);
-        let s = summary.trim();
+        self.prefill_committed("system\n", &agent_system_prompt(), false);
         if !s.is_empty() && !self.cancelled {
-            self.prefill_turn("system\n", &alloc::format!("Conversation so far (compacted): {}", s), false);
+            self.prefill_committed("system\n", &alloc::format!("Conversation so far (compacted): {}", s), false);
         }
         crate::ktrace::log_fmt(format_args!("chat.compact: {} -> {} tokens", before, self.pos));
         serial_println!("(compacted: context {} -> {} tokens)", before, self.pos);
     }
 
-    /// Encode `<|im_start|>{header}{body}<|im_end|>\n` into the running context
-    /// and prefill it through the model. When `prime`, also append an
-    /// `<|im_start|>assistant\n` opener (with an empty `<think></think>` so this
-    /// thinking model answers directly) and leave the KV positioned to decode.
+    /// Prefill `header`+`body` and, on success, append them to [`Self::history`].
+    /// On cancel mid-prefill, rebuilds the KV from committed history so a
+    /// truncated turn never poisons the next message.
+    fn prefill_committed(&mut self, header: &str, body: &str, prime: bool) {
+        self.prefill_turn(header, body, prime);
+        if self.cancelled {
+            self.rebuild_kv_from_history();
+            return;
+        }
+        self.history.push((alloc::string::String::from(header), alloc::string::String::from(body)));
+    }
+
+    /// Encode one chat turn into the running context and prefill it through
+    /// the model, in the loaded model's chat format:
+    /// - **ChatML** (qwen): `<|im_start|>{header}{body}<|im_end|>\n`, priming
+    ///   with `<|im_start|>assistant\n` (+ `<think>` handling).
+    /// - **Gemma turns**: `<start_of_turn>{header}{body}<end_of_turn>\n`,
+    ///   priming with `<start_of_turn>model\n` (BOS prepended once at context
+    ///   start per `add_bos`; gemma has no think tokens, so that path is
+    ///   naturally skipped).
+    /// The format is picked by which delimiter tokens the vocab carries — the
+    /// same dispatch the tokenizer itself used.
+    ///
+    /// Does **not** touch [`Self::history`] — callers that own the interactive
+    /// transcript use [`Self::prefill_committed`]; isolated loops (serve /
+    /// sub-agent) call this directly.
     fn prefill_turn(&mut self, header: &str, body: &str, prime: bool) {
+        let gemma = self.tok.kind == crate::cortex::tokenizer::Kind::Gemma;
+        let (open, close) = if gemma {
+            (self.tok.turn_open as usize, self.tok.turn_close as usize)
+        } else {
+            (self.tok.im_start as usize, self.tok.im_end as usize)
+        };
+        // Gemma prompts role "model", ChatML "assistant"; user/system headers
+        // pass through unchanged (gemma-4 has a native system role).
+        let assistant_header = if gemma { "model\n" } else { "assistant\n" };
         let mut ids: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-        ids.push(self.tok.im_start as usize);
+        // BOS once at the very start of the context, when the model asks.
+        if self.pos == 0 && self.model.config.add_bos {
+            if let Some(b) = self.model.config.bos_token_id {
+                ids.push(b as usize);
+            }
+        }
+        ids.push(open);
         for t in self.tok.encode(header) {
             ids.push(t as usize);
         }
         for t in self.tok.encode(body) {
             ids.push(t as usize);
         }
-        ids.push(self.tok.im_end as usize);
+        ids.push(close);
         for t in self.tok.encode("\n") {
             ids.push(t as usize);
         }
         if prime {
-            ids.push(self.tok.im_start as usize);
-            for t in self.tok.encode("assistant\n") {
+            ids.push(open);
+            for t in self.tok.encode(assistant_header) {
                 ids.push(t as usize);
             }
             if self.tok.think_open != u32::MAX && self.tok.think_close != u32::MAX {
@@ -1724,28 +2864,61 @@ impl ChatSession {
         let last = ids.len();
         // ktrace every inference call (project convention): one line per prefill.
         crate::ktrace::log_fmt(format_args!("chat.prefill: {} tokens at pos {}", last, self.pos));
-        let mut spin = Spinner::new("thinking");
+        if last > 200 {
+            // First local turn prefills the whole system prompt (~800 tok). On
+            // QEMU+HVF that's seconds; on VirtualBox it can be many minutes —
+            // say so up front so it is not mistaken for a hang.
+            serial_println!(
+                "model> prefilling {} tokens (first local reply is slow under VirtualBox; \
+                 use `/model remote http://HOST:1234 name` for LM Studio)",
+                last
+            );
+        }
+        let mut spin = Spinner::new("prefill");
         let mut fed = 0usize;
+        let t0 = crate::arch::now_ms();
+        // Rate-limit UI/spinner/cancel to ~10 Hz. Per-token FB/serial mirror on
+        // a 2560×1440 VBox GOP dominates wall time and looks like a hang.
+        let mut last_ui = t0;
+        let mut last_log = 0usize;
         for (i, &tok) in ids.iter().enumerate() {
             // Only the final token needs logits, and only when we're about to
             // decode (`prime`); otherwise this is pure context prefill.
             let want = prime && i + 1 == last;
             self.model.forward(tok, self.pos + i, &mut self.kv, &mut self.state, want);
             fed = i + 1;
-            spin.tick();
-            // Cooperative scheduler: pump the UI + net stack between forwards or
-            // the screen freezes while we think (see CLAUDE.md UI notes).
-            ui_tick();
-            crate::net::poll();
-            // The user can cancel a long prefill too (Ctrl+C / Esc). The KV
-            // holds a truncated turn; `turn` ends immediately, and the next
-            // message simply continues from here.
-            if poll_cancel() {
-                self.cancelled = true;
-                break;
+            let now = crate::arch::now_ms();
+            if now.saturating_sub(last_ui) >= 100 || fed == last || fed == 1 {
+                last_ui = now;
+                spin.tick();
+                ui_tick();
+                crate::net::poll();
+                if poll_cancel() {
+                    self.cancelled = true;
+                    break;
+                }
+            }
+            // Dense early progress (1, 16, 32…) so a slow host shows life quickly.
+            let step = if fed <= 64 { 16 } else { 64 };
+            if fed == 1 || fed - last_log >= step || fed == last {
+                last_log = fed;
+                let dt = now.saturating_sub(t0).max(1);
+                let rate = (fed as u64).saturating_mul(1000) / dt;
+                crate::ktrace::log_fmt(format_args!(
+                    "chat.prefill: {}/{} ({} tok/s)",
+                    fed, last, rate
+                ));
             }
         }
         spin.clear();
+        let dt = crate::arch::now_ms().saturating_sub(t0).max(1);
+        crate::ktrace::log_fmt(format_args!(
+            "chat.prefill: done {} tokens in {} ms ({} tok/s){}",
+            fed,
+            dt,
+            (fed as u64).saturating_mul(1000) / dt,
+            if self.cancelled { " [cancelled]" } else { "" }
+        ));
         self.pos += fed;
     }
 
@@ -1772,6 +2945,9 @@ impl ChatSession {
             serial_print!("\x1b[2m"); // dim the streamed reasoning
         }
         let mut out = alloc::string::String::new();
+        // Markdown-aware colouring of the streamed answer: headings + fenced
+        // code blocks (lexed per language tag) — prose streams through raw.
+        let mut md = crate::highlight::StreamMd::new();
         let mut n = 0usize;
         let mut n_think = 0usize;
         // Anti-degeneration guard: a thinking model that slips into a loop can
@@ -1824,11 +3000,12 @@ impl ChatSession {
                 break;
             }
             let piece = stream.push(&self.tok, self.model.token_str(next));
-            serial_print!("{}", piece);
             if in_think {
+                serial_print!("{}", piece); // thinking stays dim + uncoloured
                 n_think += 1;
             } else {
-                out.push_str(&piece);
+                md.feed(&piece, &mut |s| serial_print!("{}", s));
+                out.push_str(&piece); // the returned text stays raw (tool parsing)
             }
             self.gen.push(next);
             self.model.forward(next, self.pos, &mut self.kv, &mut self.state, true);
@@ -1844,7 +3021,16 @@ impl ChatSession {
             // Ended (EOS/stop) while still thinking: restore normal video.
             serial_print!("\x1b[0m");
         }
+        md.finish(&mut |s| serial_print!("{}", s)); // flush a held partial line
         serial_println!("");
+        if self.cancelled {
+            // Partial assistant tokens must not stick in the KV — rebuild from
+            // committed history (interactive chat) so the next turn is clean.
+            if !self.history.is_empty() {
+                self.rebuild_kv_from_history();
+            }
+            return out;
+        }
         // Close the assistant turn in the cache so the next turn continues cleanly.
         self.model.forward(im_end, self.pos, &mut self.kv, &mut self.state, false);
         self.pos += 1;
@@ -1874,7 +3060,81 @@ impl ChatSession {
             let l = logits[t];
             logits[t] = if l > 0.0 { l / PENALTY } else { l * PENALTY };
         }
-        sampler::sample_topk_topp(logits, TEMPERATURE, TOP_K, TOP_P, &mut self.rng, None)
+        // A planning turn decodes greedily (temperature 0 → argmax) for a stable
+        // decision; chat uses Qwen's recommended temperature sampling.
+        let temp = if self.greedy { 0.0 } else { TEMPERATURE };
+        sampler::sample_topk_topp(logits, temp, TOP_K, TOP_P, &mut self.rng, None)
+    }
+
+    /// One **content-agent turn** for a service (web) agent: a bounded ReAct loop
+    /// with the agent's SOUL as the whole system prompt (plus a short response
+    /// protocol) and exactly one tool — `mem_fs_read`, executed through the
+    /// capability- and scope-gated, `assets/`-confined reader
+    /// (`service::server::read_asset_arg`). So the *agent itself* reads the file
+    /// it decides to serve, then emits its final answer: a JSON response object
+    /// (`{status, content_type/headers, body}`) the server parses and frames.
+    ///
+    /// Returns `(final_answer, last_read)` where `last_read` is the
+    /// `(path, bytes)` of the last asset the agent read — the server uses it as
+    /// the body when the JSON omits one, so a small model never has to echo a
+    /// whole file. Fresh context per request (routing must not accrete KV);
+    /// thinking off + greedy for a fast, deterministic decision.
+    fn serve_loop(&mut self, soul: &str, user: &str, home: &str) -> (alloc::string::String, Option<(alloc::string::String, alloc::vec::Vec<u8>)>) {
+        use core::sync::atomic::Ordering;
+        const MAX_ITERS: usize = 4;
+        let prev_think = THINK_ON.swap(false, Ordering::Relaxed);
+        self.greedy = true;
+        self.kv = self.model.new_cache();
+        self.state = self.model.new_state();
+        self.pos = 0;
+        self.gen.clear();
+        self.cancelled = false;
+        let sys = alloc::format!("{soul}\n\n{}", serve_protocol());
+        self.prefill_turn("system\n", &sys, false);
+        self.prefill_turn("user\n", user, true);
+        let mut last_read: Option<(alloc::string::String, alloc::vec::Vec<u8>)> = None;
+        let mut last_arg: Option<alloc::string::String> = None;
+        let mut result = alloc::string::String::new();
+        for _ in 0..MAX_ITERS {
+            let text = self.generate_assistant("\x1b[2mserver-agent:\x1b[0m ");
+            if self.cancelled {
+                break;
+            }
+            match parse_tool_call(&text) {
+                Some((cmd, arg)) if cmd == "mem_fs_read" => {
+                    // Repeat guard: if it re-reads the same file, it already has
+                    // the bytes — nudge it to answer with the JSON now.
+                    if last_arg.as_deref() == Some(arg.as_str()) {
+                        self.prefill_turn("user\n", "<tool_response>\nYou already read that file. Reply now with ONLY the JSON response object.\n</tool_response>", true);
+                        last_arg = None;
+                        continue;
+                    }
+                    last_arg = Some(arg.clone());
+                    let obs = match crate::service::server::read_asset_arg(home, &arg) {
+                        Some(bytes) => {
+                            let body = alloc::string::String::from_utf8_lossy(&bytes).into_owned();
+                            last_read = Some((arg.clone(), bytes));
+                            body
+                        }
+                        None => alloc::format!("error: no such file in assets/ ({arg})"),
+                    };
+                    serial_println!("\x1b[33m\u{2192} server-agent read\x1b[0m {}", arg);
+                    let fb = alloc::format!("<tool_response>\n{}\n</tool_response>", obs);
+                    self.prefill_turn("user\n", &fb, true);
+                }
+                Some(_) => {
+                    // Only mem_fs_read is available to a content agent.
+                    self.prefill_turn("user\n", "<tool_response>\nOnly mem_fs_read is available. Read the asset for the request, then reply with ONLY the JSON response object.\n</tool_response>", true);
+                }
+                None => {
+                    result = text; // final answer (the JSON response object)
+                    break;
+                }
+            }
+        }
+        self.greedy = false;
+        THINK_ON.store(prev_think, Ordering::Relaxed);
+        (result, last_read)
     }
 
     /// Dispatch an isolated, **model-driven** sub-agent for `task` and return
@@ -1883,7 +3143,13 @@ impl ChatSession {
     /// context out and back), its capabilities are attenuated from the
     /// orchestrator's, the depth cap applies, and only the condensed summary
     /// crosses back to the parent.
+    /// Dispatch an isolated sub-agent. `role` is a preset name (`explore` /
+    /// `plan` / `worker` / `reader`); empty defaults to worker.
     fn run_subagent(&mut self, task: &str) -> alloc::string::String {
+        self.run_subagent_role("worker", task)
+    }
+
+    fn run_subagent_role(&mut self, role_name: &str, task: &str) -> alloc::string::String {
         use crate::agent::{manifest, subagent};
         // Isolation: hand the sub-agent a fresh model context; the parent chat's
         // KV/position are restored afterwards untouched.
@@ -1893,9 +3159,19 @@ impl ChatSession {
         let saved_gen = core::mem::take(&mut self.gen);
 
         let parent = manifest::orchestrator_manifest();
-        let role = manifest::worker_subagent_manifest();
+        let role = match manifest::subagent_role(role_name) {
+            Some(r) => r,
+            None => {
+                self.kv = saved_kv;
+                self.state = saved_state;
+                self.pos = saved_pos;
+                self.gen = saved_gen;
+                return alloc::format!("unknown sub-agent role '{role_name}' (try: explore|plan|worker|reader)");
+            }
+        };
         // Each dispatched sub-agent gets its own home (SOUL.md, skills/, memory/).
         crate::agent::home::ensure(role.id.0, &role.name);
+        let role_label = role.name.clone();
         self.prefill_turn("system\n", &subagent_system_prompt(&role.toolset), false);
         let result = {
             let mut steps = ModelSteps { chat: self, seen: 0, call_id: 0, last_call: None };
@@ -1909,10 +3185,53 @@ impl ChatSession {
         self.gen = saved_gen;
 
         match result {
-            Ok(outcome) => outcome.record.summary.unwrap_or_default(),
+            Ok(outcome) => {
+                let summary = outcome.record.summary.unwrap_or_default();
+                alloc::format!("[{role_label}] {summary}")
+            }
             Err(e) => alloc::format!("subagent dispatch refused: {:?}", e),
         }
     }
+}
+
+/// A dedicated planner model context for service agents (e.g. the Doc agent),
+/// separate from the interactive chat. Lazily loaded on first use; shares the
+/// model weights (a `Model<'static>` borrowing the static GGUF) with the chat —
+/// only the KV/state are per-context.
+static DOC_PLANNER: crate::mm::Locked<Option<ChatSession>> = crate::mm::Locked::new(None);
+
+/// The response protocol appended to a content agent's SOUL: the one tool it may
+/// call and the JSON shape of its final answer. Kept terse so a small model
+/// follows it. `serve_loop` executes the `mem_fs_read` calls (gated + confined to
+/// the agent's `assets/`) and `service::server` parses the JSON.
+fn serve_protocol() -> alloc::string::String {
+    alloc::string::String::from(
+        "You serve one HTTP request. Reply with ONLY a JSON object describing the response — no prose, no code fence:\n\
+         {\"status\": 200, \"content_type\": \"text/html; charset=utf-8\", \"file\": \"<asset filename>\"}\n\
+         The server reads that file from your assets/ and sends it as the body — you need not repeat it. \
+         Use {\"status\": 404} with no file when nothing matches. If you need a file's contents to decide, you \
+         may first read it with a <tool_call>{\"name\": \"mem_fs_read\", \"arguments\": {\"path\": \"<filename>\"}}</tool_call>.",
+    )
+}
+
+/// Run one **content-agent turn** for a service (web) agent over its dedicated
+/// planner context: the agent (driven by its SOUL) reads the file it serves via a
+/// gated `mem_fs_read` tool call and returns a JSON response object. Returns the
+/// final answer plus the last `(path, bytes)` it read (the server frames one or
+/// the other). `None` if no model is loaded. The context is taken out of the lock
+/// during inference so a multi-second forward pass never holds the lock.
+pub(crate) fn serve_reply(soul: &str, user: &str, home: &str) -> Option<(alloc::string::String, Option<(alloc::string::String, alloc::vec::Vec<u8>)>)> {
+    let taken: Option<ChatSession> = DOC_PLANNER.with(|p| {
+        if p.is_none() {
+            let mut spin = Spinner::new("doc-planner");
+            *p = ChatSession::load(&mut spin);
+        }
+        p.take()
+    });
+    let mut sess = taken?;
+    let out = sess.serve_loop(soul, user, home);
+    DOC_PLANNER.with(|p| *p = Some(sess));
+    Some(out)
 }
 
 /// [`StepSource`] backed by the live Cortex model: each `next()` prefills any
@@ -1982,15 +3301,23 @@ struct CommandTools;
 impl crate::agent::agent_loop::ToolDispatch for CommandTools {
     fn call(
         &mut self,
-        _session: &mut crate::agent::types::Session,
-        _caller: crate::sched::TaskId,
+        session: &mut crate::agent::types::Session,
+        caller: crate::sched::TaskId,
         call: &crate::agent::types::ToolCall,
     ) -> crate::agent::agent_loop::ToolOutcome {
-        use crate::agent::agent_loop::ToolOutcome;
-        use crate::agent::types::Provenance;
+        use crate::agent::agent_loop::{format_tool_result, ToolDispatch, ToolOutcome};
+        use crate::tools::Router;
+        // Sub-agents run under *their* cap table (`caller`), not the chat
+        // switch context — go straight through the taint-aware Router.
         serial_println!("\x1b[33m\u{2192} subagent running\x1b[0m /{} {}", call.tool, call.args);
-        let out = execute_chat_tool(&call.tool, &call.args);
-        ToolOutcome::ok(out, Provenance::UntrustedIngested)
+        let mut router = Router::taint_aware();
+        let outcome = router.call(session, caller, call);
+        let text = format_tool_result(outcome.is_error, outcome.result);
+        if outcome.is_error || text.starts_with("error:") || text.starts_with("denied:") || text.starts_with("refused:") {
+            ToolOutcome::error(text)
+        } else {
+            ToolOutcome::ok(text, outcome.provenance)
+        }
     }
 }
 
@@ -2005,11 +3332,13 @@ fn run_model(
     remote_on: &mut bool,
     remote_cfg: &mut Option<remote::RemoteConfig>,
     remote_chat: &mut Option<remote::RemoteChat>,
+    chat: &mut Option<ChatSession>,
 ) {
     let toks: alloc::vec::Vec<&str> = arg.split_whitespace().collect();
     match toks.first().copied().unwrap_or("") {
         "" => {
-            let local_name = crate::cortex::model_module().map(|_| "embedded GGUF").unwrap_or("none bundled");
+            let local_name = crate::cortex::model_name()
+                .unwrap_or_else(|| alloc::string::String::from("none bundled"));
             serial_println!("model> active: {}", if *remote_on { "remote" } else { "local" });
             serial_println!("model>   local:  {}", local_name);
             match remote_cfg {
@@ -2021,8 +3350,30 @@ fn run_model(
                 ),
                 None => serial_println!("model>   remote: not configured"),
             }
-            serial_println!("model> usage: /model local | /model remote <http://host:port> [name] [key <k>]");
+            serial_println!("model> usage: /model local | /model load <file.gguf> | /model remote <http://host:port> [name] [key <k>]");
             serial_println!("model>        (voice + /infer//perf always use the local model)");
+        }
+        // /model load <file.gguf> — load a GGUF off any mounted disk volume
+        // (FAT / ext4 root) and make it the active local model. Any supported
+        // family/quant works: the kernel discovers the architecture from the
+        // file itself. The current chat session restarts on the new model.
+        "load" => {
+            let Some(path) = toks.get(1).copied() else {
+                serial_println!("model> usage: /model load <file.gguf>  (a file on any disk volume, e.g. /data/gemma4.gguf)");
+                return;
+            };
+            serial_println!("model> loading {} from disk (multi-GB files take a moment)...", path);
+            match crate::cortex::load_model_from_disk(path) {
+                Ok(name) => {
+                    // Restart chat on the new model; remote mode stays as-is.
+                    *chat = None;
+                    serial_println!(
+                        "model> loaded '{}' -- chat restarted on it (/model to inspect)",
+                        name.unwrap_or_else(|| alloc::string::String::from(path))
+                    );
+                }
+                Err(e) => serial_println!("model> load failed: {}", e),
+            }
         }
         "local" => {
             *remote_on = false;
@@ -2134,13 +3485,17 @@ struct HttpArgs {
     body: String,
     verbose: bool,
     stream: bool,
+    /// `-O`: save the body to a file named after the URL's basename.
+    save_auto: bool,
+    /// `-o <file>`: save the body to this file (relative → `/downloads/`).
+    save_path: Option<String>,
     err: Option<String>,
 }
 
 /// Parse curl-like flags: `-X <method>`, `-H "K: V"` (repeatable), `-d <body>`
-/// / `--data <body>`, `-v`/`--verbose`, `-N`/`--stream`. First bare token is
-/// the URL. Method defaults to GET, or POST when a body is given. Pure +
-/// unit-tested.
+/// / `--data <body>`, `-v`/`--verbose`, `-N`/`--stream`, `-O` / `-o <file>`
+/// (download to the store). First bare token is the URL. Method defaults to
+/// GET, or POST when a body is given. Pure + unit-tested.
 fn parse_http_args(tokens: &[String]) -> HttpArgs {
     let mut a = HttpArgs {
         method: String::new(),
@@ -2149,6 +3504,8 @@ fn parse_http_args(tokens: &[String]) -> HttpArgs {
         body: String::new(),
         verbose: false,
         stream: false,
+        save_auto: false,
+        save_path: None,
         err: None,
     };
     // Fetch the value token after a flag at index `i`; records an error and
@@ -2189,6 +3546,12 @@ fn parse_http_args(tokens: &[String]) -> HttpArgs {
             "-v" | "--verbose" => a.verbose = true,
             "-N" | "--stream" => a.stream = true,
             "-I" | "--head" => a.method = "HEAD".to_string(),
+            "-O" | "--remote-name" => a.save_auto = true,
+            "-o" | "--output" => {
+                if let Some(p) = value(tokens, &mut i, "-o", &mut a.err) {
+                    a.save_path = Some(p);
+                }
+            }
             t if t.starts_with('-') => a.err = Some(alloc::format!("unknown flag '{t}'")),
             t if a.url.is_empty() => a.url = t.to_string(),
             _ => {} // extra positional args ignored
@@ -2201,16 +3564,30 @@ fn parse_http_args(tokens: &[String]) -> HttpArgs {
     a
 }
 
+/// The filename part of a URL's path, query/fragment stripped — what
+/// `curl -O` names a download. `None` when the URL has no path component or
+/// it ends in `/`. Pure + unit-tested.
+fn url_basename(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let path = after_scheme.split(['?', '#']).next().unwrap_or("");
+    if !path.contains('/') {
+        return None; // host only — no path to take a name from
+    }
+    let base = path.rsplit('/').next().unwrap_or("");
+    (!base.is_empty()).then_some(base)
+}
+
 /// `/http` — a curl-like HTTP client (also the agent's `http` tool): any
 /// method, custom headers, a request body, verbose head dump, and live
 /// streaming of chunked/SSE responses. http:// and https:// (TLS 1.3).
 fn run_http(arg: &str) {
     let tokens = tokenize_args(arg);
     if tokens.is_empty() {
-        serial_println!("usage: /http [-X METHOD] [-H \"K: V\"]... [-d BODY] [-v] [--stream] <url>");
+        serial_println!("usage: /http [-X METHOD] [-H \"K: V\"]... [-d BODY] [-v] [--stream] [-O | -o FILE] <url>");
         serial_println!("  e.g. /http https://host/v1/models");
         serial_println!("       /http -X POST -H \"Content-Type: application/json\" -d '{{\"n\":1}}' http://host/api");
         serial_println!("       /http --stream -H \"Accept: text/event-stream\" http://host/sse   (live)");
+        serial_println!("       /http -O https://host/pic.png     download to /downloads/pic.png (then /open it)");
         serial_println!("  needs /network up; https uses in-kernel TLS (server certs are NOT verified)");
         return;
     }
@@ -2222,6 +3599,32 @@ fn run_http(arg: &str) {
     if a.url.is_empty() {
         serial_println!("http> no URL given");
         return;
+    }
+    // Download destination (`-O` / `-o`): a Synapse-store path — durable on an
+    // ext4 data partition, in-memory otherwise — readable back via /open (text
+    // in the editor, images in the viewer, wav/mp3 in the player). This is the
+    // interactive shell (human-typed); agents get HTTP through the Synapse net
+    // primitives, never this writer.
+    let save_dest: Option<String> = if let Some(p) = a.save_path.clone() {
+        Some(if p.starts_with('/') { p } else { alloc::format!("/downloads/{}", p) })
+    } else if a.save_auto {
+        match url_basename(&a.url) {
+            Some(b) => Some(alloc::format!("/downloads/{}", b)),
+            None => {
+                serial_println!("http> -O: the URL has no filename to use — pass -o <name>");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(dest) = &save_dest {
+        if crate::synapse::fs::exists(dest)
+            && !crate::modal::confirm("Overwrite file?", &alloc::format!("{} already exists in the store.\nReplace it with this download?", dest))
+        {
+            serial_println!("http> download cancelled ({} kept)", dest);
+            return;
+        }
     }
     let hdrs: alloc::vec::Vec<(&str, &str)> = a.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     // Verbose: print the request line + headers before sending.
@@ -2240,22 +3643,45 @@ fn run_http(arg: &str) {
             }
         }
     };
-    // Streaming: print body bytes live as UTF-8. Buffered: collect + cap.
+    // Streaming: print body bytes live as UTF-8. Downloading: collect it all
+    // (progress once a second). Buffered: collect + cap for terminal print.
     const CAP: usize = 8192;
+    const DL_MAX: usize = 128 << 20; // download heap guard
     let mut collected: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    let stream = a.stream;
+    let stream = a.stream && save_dest.is_none();
+    let saving = save_dest.is_some();
+    let mut dl_last_ms = 0u64;
     let mut on_body = |chunk: &[u8]| {
         if stream {
             serial_print!("{}", core::str::from_utf8(chunk).unwrap_or("<binary>"));
+        } else if saving {
+            if collected.len() < DL_MAX {
+                collected.extend_from_slice(chunk);
+            }
+            let now = crate::arch::now_ms();
+            if now.saturating_sub(dl_last_ms) >= 1000 {
+                dl_last_ms = now;
+                emit(&alloc::format!("\r  {} KiB\u{2026} ", collected.len() / 1024));
+            }
         } else if collected.len() < CAP {
             collected.extend_from_slice(chunk);
         }
     };
-    // A streamed response (SSE) can run long; give it a generous budget.
-    let timeout = if a.stream { 300_000 } else { 60_000 };
+    // A streamed response (SSE) or a big download can run long.
+    let timeout = if a.stream || saving { 300_000 } else { 60_000 };
     match crate::net::http::perform(&a.method, &a.url, &hdrs, a.body.as_bytes(), timeout, &mut on_head, &mut on_body) {
         Ok(head) => {
-            if a.stream {
+            if let Some(dest) = save_dest {
+                if !(200..300).contains(&head.status) {
+                    serial_println!("\rhttp> {} — not saved (non-2xx response)", head.status);
+                } else if collected.len() >= DL_MAX {
+                    serial_println!("\rhttp> body exceeds the {} MiB download cap — not saved", DL_MAX >> 20);
+                } else {
+                    crate::synapse::fs::write(&dest, &collected);
+                    serial_println!("\rhttp> saved {} bytes to {} ({})", collected.len(), dest, head.status);
+                    serial_println!("http>   read it back with /open {} (editor / image viewer / audio player)", dest);
+                }
+            } else if a.stream {
                 serial_println!("");
                 serial_println!("http> {} (streamed)", head.status);
             } else {
@@ -2276,6 +3702,131 @@ fn run_http(arg: &str) {
 
 /// `/ws` — connect to a `ws://` WebSocket, optionally send a message, then
 /// stream incoming frames live until the peer closes, Ctrl+C, or Esc.
+/// `/mcp` — Model Context Protocol client. Subcommands:
+///   /mcp | status             list servers (tools + resources + session)
+///   /mcp connect <name> <url> [bearer <token>]
+///   /mcp reconnect <name>     refresh tools/resources for an existing server
+///   /mcp tools <name>
+///   /mcp resources [name]     list MCP resources
+///   /mcp read <name> <uri>    read one resource
+///   /mcp call <name> <tool> [json-args]
+///   /mcp disconnect <name>
+fn run_mcp(arg: &str) {
+    let toks = tokenize_args(arg);
+    let sub = toks.first().map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "" | "list" | "status" => {
+            let lines = crate::mcp::status_lines();
+            if lines.is_empty() {
+                serial_println!("mcp> no servers connected. Connect one:");
+                serial_println!("mcp>   /mcp connect <name> <http://host:port/mcp> [bearer <token>]");
+                return;
+            }
+            serial_println!("mcp> status:");
+            for line in lines {
+                serial_println!("  {}", line);
+            }
+            serial_println!("mcp> tools: search_tools select:mcp__<server>__<tool> | /mcp call …");
+            serial_println!("mcp> resources: /mcp resources [server] | /mcp read <server> <uri>");
+        }
+        "connect" => {
+            let name = toks.get(1).map(|s| s.as_str()).unwrap_or("");
+            let url = toks.get(2).map(|s| s.as_str()).unwrap_or("");
+            if name.is_empty() || url.is_empty() {
+                serial_println!("usage: /mcp connect <name> <url> [bearer <token>]");
+                serial_println!("  e.g. /mcp connect weather http://10.0.2.2:9000/mcp");
+                return;
+            }
+            let bearer = if toks.get(3).map(|s| s.as_str()) == Some("bearer") { toks.get(4).map(|s| s.as_str()) } else { None };
+            serial_println!("mcp> connecting to {} \u{2026}", url);
+            match crate::mcp::connect(name, url, bearer) {
+                Ok(count) => {
+                    serial_println!("mcp> connected '{}' \u{2014} registered {} tool(s):", name, count);
+                    for (t, desc) in crate::mcp::server_tools(name) {
+                        serial_println!("  mcp__{}__{}  \u{2014} {}", name, t, desc);
+                    }
+                    let res = crate::mcp::list_resources(Some(name));
+                    if !res.contains("no resources") && !res.contains("not connected") {
+                        serial_println!("mcp> resources:");
+                        for line in res.lines().take(8) {
+                            serial_println!("  {}", line);
+                        }
+                    }
+                    serial_println!("mcp> agent: search_tools / mcp call / mcp_resources");
+                }
+                Err(e) => serial_println!("mcp> connect failed: {}", e),
+            }
+        }
+        "reconnect" => {
+            let name = toks.get(1).map(|s| s.as_str()).unwrap_or("");
+            if name.is_empty() {
+                serial_println!("usage: /mcp reconnect <name>");
+                return;
+            }
+            serial_println!("mcp> reconnecting '{}' \u{2026}", name);
+            match crate::mcp::reconnect(name) {
+                Ok(count) => serial_println!("mcp> reconnected '{}' \u{2014} {} tool(s)", name, count),
+                Err(e) => serial_println!("mcp> reconnect failed: {}", e),
+            }
+        }
+        "tools" => {
+            let name = toks.get(1).map(|s| s.as_str()).unwrap_or("");
+            let tools = crate::mcp::server_tools(name);
+            if tools.is_empty() {
+                serial_println!("mcp> no tools (server '{}' not connected?)", name);
+            } else {
+                for (t, desc) in tools {
+                    serial_println!("  {} \u{2014} {}", t, desc);
+                }
+            }
+        }
+        "resources" => {
+            let name = toks.get(1).map(|s| s.as_str());
+            let text = crate::mcp::list_resources(name);
+            for line in text.lines() {
+                serial_println!("mcp> {}", line);
+            }
+        }
+        "read" => {
+            let name = toks.get(1).map(|s| s.as_str()).unwrap_or("");
+            let uri = toks.get(2).map(|s| s.as_str()).unwrap_or("");
+            if name.is_empty() || uri.is_empty() {
+                serial_println!("usage: /mcp read <server> <uri>");
+                return;
+            }
+            match crate::mcp::read_resource(name, uri) {
+                Ok(text) => serial_println!("mcp> {}", text),
+                Err(e) => serial_println!("mcp> {}", e),
+            }
+        }
+        "call" => {
+            let name = toks.get(1).map(|s| s.as_str()).unwrap_or("");
+            let tool = toks.get(2).map(|s| s.as_str()).unwrap_or("");
+            if name.is_empty() || tool.is_empty() {
+                serial_println!("usage: /mcp call <server> <tool> [json-args]");
+                return;
+            }
+            // Everything after the tool name is the JSON arguments (may contain spaces).
+            let args = arg.splitn(4, char::is_whitespace).nth(3).unwrap_or("").trim();
+            match crate::mcp::call(name, tool, args) {
+                Ok(text) => serial_println!("mcp> {}", text),
+                Err(e) => serial_println!("mcp> {}", e),
+            }
+        }
+        "disconnect" | "remove" => {
+            let name = toks.get(1).map(|s| s.as_str()).unwrap_or("");
+            match crate::mcp::disconnect(name) {
+                Some(n) => serial_println!("mcp> disconnected '{}' ({} tool(s) removed)", name, n),
+                None => serial_println!("mcp> no server '{}'", name),
+            }
+        }
+        other => serial_println!(
+            "mcp> unknown '{}' (status|connect|reconnect|tools|resources|read|call|disconnect)",
+            other
+        ),
+    }
+}
+
 fn run_ws(arg: &str) {
     let tokens = tokenize_args(arg);
     if tokens.is_empty() {
@@ -2329,7 +3880,56 @@ fn run_ws(arg: &str) {
 /// tasks that carry agent identity (the shell agent, parked orchestrator /
 /// sub-agent capability holders), switch the shell chat to another agent's
 /// home (SOUL.md persona), or kill one.
-fn run_agents(arg: &str, chat: &mut Option<ChatSession>) {
+/// `/surface [demo]` — a UI-surface capability demo: grant this task UI
+/// authority, then drive `ui_surface_request` + `ui_draw` through Synapse (so
+/// the whole gated, grammar-validated path runs) to paint a checkerboard into
+/// the action pane. Prints a deterministic checksum of the rasterized buffer so
+/// the render is verifiable on serial (the pixels themselves aren't).
+fn run_surface(_arg: &str) {
+    use crate::agent::types::{CapDomain, CapabilityRequest, Rights, Scope};
+    let me = crate::sched::current_task_id();
+    crate::agent::manifest::grant_to_task(
+        me,
+        &alloc::vec![CapabilityRequest::new(CapDomain::Ui, Rights::EXEC | Rights::WRITE | Rights::DELETE, Scope::Any)],
+    );
+    // Request a surface (board kind).
+    let req = crate::synapse::execute(me, r#"{"name":"ui_surface_request","arguments":{"kind":"board"}}"#);
+    let sid = match req {
+        crate::synapse::Invocation::Executed { result, .. } => {
+            result.strip_prefix("ok:surface=").and_then(|s| s.trim().parse::<u32>().ok())
+        }
+        _ => None,
+    };
+    let Some(sid) = sid else {
+        serial_println!("surface> could not create a surface");
+        return;
+    };
+    // Paint an 8x8 checkerboard of 24px cells, then draw a diagonal.
+    let mut ops = alloc::string::String::from("clear 202020;");
+    for r in 0..8 {
+        for c in 0..8 {
+            if (r + c) % 2 == 0 {
+                let (x, y) = (c * 24, r * 24);
+                ops.push_str(&alloc::format!(" rect {} {} 24 24 e0e0e0;", x, y));
+            }
+        }
+    }
+    ops.push_str(" line 0 0 191 191 cc785c");
+    let call = alloc::format!(r#"{{"name":"ui_draw","arguments":{{"surface":{sid},"ops":"{ops}"}}}}"#);
+    let drew = match crate::synapse::execute(me, &call) {
+        crate::synapse::Invocation::Executed { result, .. } => result,
+        other => alloc::format!("{other:?}"),
+    };
+    let sum = crate::synapse::ui::checksum(sid).unwrap_or(0);
+    serial_println!("surface> rendered surface {} ({}), checksum=0x{:016x}", sid, drew, sum);
+    serial_println!("surface> painted into the action pane (/close to hide)");
+}
+
+fn run_agents(
+    arg: &str,
+    chat: &mut Option<ChatSession>,
+    orch: &mut crate::agent::orchestrator::Orchestrator,
+) {
     let (sub, sarg) = match arg.split_once(' ') {
         Some((s, a)) => (s, a.trim()),
         None => (arg.trim(), ""),
@@ -2342,25 +3942,305 @@ fn run_agents(arg: &str, chat: &mut Option<ChatSession>) {
                 let marker = if id == active { " *chat" } else { "" };
                 serial_println!("agents> {:<4} {:<17} {:<9}{}", id, name, state, marker);
             }
+            serial_println!("agents> system agents (installed in /agent/, start with /agents start <name>):");
+            for (name, agent_id) in crate::agent::system::list() {
+                serial_println!("agents>   {:<10} /agent/{}/SOUL.md", name, agent_id);
+            }
             serial_println!("agents> /agents switch <id> — chat as that agent; /agents kill <id> — terminate");
         }
         "switch" => match sarg.parse::<u64>() {
             Ok(id) => {
-                ACTIVE_AGENT.store(id, core::sync::atomic::Ordering::Relaxed);
-                *chat = None; // next message rebuilds the session with the new persona
-                crate::agent::home::ensure(id, "agent");
-                serial_println!("agents> chat now runs as agent {} (SOUL: /agent/{}/SOUL.md)", id, id);
+                // Re-bind caps + toolset to this agent; drop live chat KV so
+                // the next turn loads the new SOUL under the new authority.
+                rebind_chat_agent(id, orch);
+                *chat = None;
+                serial_println!(
+                    "agents> chat now runs as agent {} (SOUL: /agent/{}/SOUL.md, {} caps, tools gated)",
+                    id,
+                    id,
+                    orch.session.capabilities.len()
+                );
             }
             Err(_) => serial_println!("usage: /agents switch <id>"),
         },
         "kill" => match sarg.parse::<u64>() {
-            Ok(id) => match crate::sched::kill(id) {
-                Ok(()) => serial_println!("agents> task {} killed (capabilities revoked)", id),
-                Err(e) => serial_println!("agents> cannot kill {}: {}", id, e),
-            },
+            Ok(id) => {
+                if id == active_agent_id() {
+                    // Don't leave the chat pointing at a dead agent — revert
+                    // tool authority to the shell orchestrator.
+                    rebind_chat_agent(crate::agent::manifest::ORCHESTRATOR_ID.0, orch);
+                    *chat = None;
+                    serial_println!("agents> was the active chat agent — chat reverts to shell agent (1)");
+                }
+                match crate::sched::kill(id) {
+                    Ok(()) => serial_println!("agents> task {} killed (capabilities revoked)", id),
+                    Err(e) => serial_println!("agents> cannot kill {}: {}", id, e),
+                }
+            }
             Err(_) => serial_println!("usage: /agents kill <id>"),
         },
-        other => serial_println!("agents> unknown '{}' — usage: /agents [list|switch <id>|kill <id>]", other),
+        "services" => {
+            let svcs = crate::service::list();
+            if svcs.is_empty() {
+                serial_println!("agents> no service agents running");
+            } else {
+                serial_println!("agents> service           task   state");
+                for (name, task, alive) in svcs {
+                    serial_println!("agents> {:<17} {:<6} {}", name, task, if alive { "running" } else { "dead" });
+                }
+            }
+        }
+        "search" => run_agent_search(sarg),
+        "install" => run_agent_install(sarg, chat),
+        "uninstall" => run_agent_uninstall(sarg),
+        "start" => run_agent_start(sarg),
+        // Back-compat aliases for the two originally-named service starters.
+        "start-net" => run_agent_start(&alloc::format!("network {}", sarg)),
+        "start-http" => run_agent_start(&alloc::format!("http {}", sarg)),
+        other => serial_println!(
+            "agents> unknown '{}' — usage: /agents [list|switch <id>|kill <id>|services|start <name> [port]|search <url> [q]|install <name> [--yes] [--registry <url>]|uninstall <name>]",
+            other
+        ),
+    }
+}
+
+/// The available installable agent packages (Phase 2 ships built-in signed
+/// samples; the public registry lands in a later phase). Returns a freshly-minted,
+/// signed package for `name`, or `None`.
+fn built_in_package(name: &str) -> Option<crate::skills::package::SkillPackage> {
+    use crate::agent::types::{next_agent_id, next_skill_id};
+    let mut pkg = match name {
+        "report-writer" => crate::skills::package::sample_report_agent(next_skill_id(), next_agent_id()),
+        "note-summarizer" => crate::skills::package::sample_note_summarizer(next_skill_id()),
+        // A skill-agent that declares an MCP server in its manifest — the
+        // install consent screen shows it and connects it on approval. The URL
+        // is the e2e harness gateway (inert off-test; retryable via /mcp).
+        "mcp-agent" => {
+            let mut p = crate::skills::package::sample_report_agent(next_skill_id(), next_agent_id());
+            p.manifest.name = "mcp-agent".into();
+            if let Some(a) = p.manifest.agent.as_mut() {
+                a.name = "mcp-agent".into();
+                a.mcp_servers.push(crate::agent::types::McpServerSpec {
+                    name: "harness".into(),
+                    url: "http://10.0.2.2:8100/mcp".into(),
+                    bearer: None,
+                });
+            }
+            p
+        }
+        _ => return None,
+    };
+    pkg.sign(); // sign with the registry key so verify() passes (covers mcp_servers)
+    Some(pkg)
+}
+
+/// `/agents start <name> [port]` — launch a system agent. `network`/`http`/`doc`
+/// bring up the web pipeline (Network→HTTP→Doc serving the docs site); `ssh`
+/// starts the SSH transport service. Uses port 8080 (web) / 2222 (ssh) if none
+/// is given.
+fn run_agent_start(arg: &str) {
+    let (name, port_str) = match arg.split_once(' ') {
+        Some((n, p)) => (n.trim(), p.trim()),
+        None => (arg.trim(), ""),
+    };
+    let port = port_str.parse::<u16>().ok().filter(|p| *p != 0);
+    match name {
+        "ssh" => {
+            if let Some(p) = port {
+                crate::service::ssh::set_port(p);
+            }
+            let task = crate::service::start(&crate::service::ssh::SSH_SERVICE);
+            serial_println!("agents> started 'ssh' service (task {})", task);
+        }
+        _ => {
+            // Serve a content agent over the web pipeline (network + http + the
+            // generic server stage). `web`/`network`/`http` default to the docs
+            // site; any installed content agent (its SOUL + assets) can be served
+            // by name — no per-agent code.
+            let port = port.unwrap_or(8080);
+            let content = if matches!(name, "web" | "network" | "http" | "") { "doc" } else { name };
+            let home = match crate::agent::system::home_for(content) {
+                Some(h) => h,
+                None => {
+                    serial_println!("agents> unknown agent '{}' (try: doc, ssh, or an installed server agent)", name);
+                    return;
+                }
+            };
+            crate::service::pipeline::start(port, &home);
+            serial_println!(
+                "agents> serving '{}' over the web pipeline network->http->server on TCP :{} (GET / to fetch)",
+                content,
+                port
+            );
+        }
+    }
+}
+
+/// `/agents search <index-url> [query]` — fetch a public registry index over
+/// HTTP(S) and list the installable agents it advertises (discovery over the
+/// network); install with `/agents install <name> --registry <index-url>`.
+fn run_agent_search(arg: &str) {
+    let (url, query) = match arg.split_once(' ') {
+        Some((u, q)) => (u.trim(), q.trim()),
+        None => (arg.trim(), ""),
+    };
+    if url.is_empty() {
+        serial_println!("usage: /agents search <index-url> [query]");
+        return;
+    }
+    match crate::skills::registry_client::search(url, query) {
+        Ok(entries) if entries.is_empty() => serial_println!("search> no matching agents in the registry"),
+        Ok(entries) => {
+            serial_println!("search> {} agent(s) in the registry:", entries.len());
+            for e in entries {
+                serial_println!("search>   {} {} — {} [publisher {}]", e.name, e.version, e.description, e.key_id);
+            }
+        }
+        Err(e) => serial_println!("search> {}", e),
+    }
+}
+
+/// `/agents install <name> [--yes] [--registry <index-url>]` — the consent
+/// install flow: (optionally confirm the name is listed in a registry index),
+/// verify the package signature, ask the human per requested capability
+/// (`modal::confirm`), then install granting only the approved subset. `--yes`
+/// approves every requested capability without prompting (scripting/e2e).
+fn run_agent_install(arg: &str, chat: &mut Option<ChatSession>) {
+    // Parse: first token is the name; flags may follow (--yes, --registry <url>).
+    let mut toks = arg.split_whitespace();
+    let name = toks.next().unwrap_or("").trim();
+    let mut auto_yes = false;
+    let mut registry: Option<&str> = None;
+    let rest: alloc::vec::Vec<&str> = toks.collect();
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i] {
+            "--yes" => auto_yes = true,
+            "--registry" => {
+                registry = rest.get(i + 1).copied();
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if name.is_empty() {
+        serial_println!("usage: /agents install <name> [--yes] [--registry <index-url>]   (built-in: report-writer, note-summarizer)");
+        return;
+    }
+    // If a registry index was given, confirm the agent is advertised there
+    // (network discovery) before resolving its payload.
+    if let Some(url) = registry {
+        match crate::skills::registry_client::resolve(url, name) {
+            Ok(Some(entry)) => serial_println!(
+                "install> '{}' {} found in registry (publisher {})",
+                entry.name,
+                entry.version,
+                entry.key_id
+            ),
+            Ok(None) => {
+                serial_println!("install> '{}' is not listed in the registry index", name);
+                return;
+            }
+            Err(e) => {
+                serial_println!("install> registry lookup failed: {}", e);
+                return;
+            }
+        }
+    }
+    let pkg = match built_in_package(name) {
+        Some(p) => p,
+        None => {
+            serial_println!("install> no such package '{}' (built-in: report-writer, note-summarizer)", name);
+            return;
+        }
+    };
+    if !pkg.verify() {
+        serial_println!("install> refused: package signature/hash did not verify");
+        return;
+    }
+    let reqs = pkg.manifest.requested_capabilities.clone();
+    let lines = crate::skills::install::consent_prompt(&pkg);
+    serial_println!("install> '{}' requests {} capabilit(ies):", pkg.manifest.name, reqs.len());
+    serial_println!("install>   (its own folder /agent/{}/ is always granted; anything below is extra)", pkg.manifest.agent.as_ref().map(|a| a.id.0).unwrap_or(0));
+    let mut approved = alloc::vec::Vec::new();
+    for (line, cap) in lines.iter().zip(reqs.iter()) {
+        // Flag a filesystem grant that reaches beyond the agent's own home —
+        // "full filesystem access" is the thing a human most needs to see.
+        let broad_fs = cap.domain == crate::agent::types::CapDomain::Fs
+            && !matches!(&cap.scope, crate::agent::types::Scope::Path(p) if p.starts_with("/agent/") || p.contains("$HOME"));
+        let line = if broad_fs { alloc::format!("{} -- WARNING: FULL filesystem access, beyond its own folder", line) } else { line.clone() };
+        let ok = if auto_yes {
+            serial_println!("install>   [--yes] grant: {}", line);
+            true
+        } else {
+            let msg = alloc::format!("Grant to '{}':\n{}", pkg.manifest.name, line);
+            crate::modal::confirm("Install agent — permission", &msg)
+        };
+        if ok {
+            approved.push(cap.clone());
+        } else {
+            serial_println!("install>   denied: {}", line);
+        }
+    }
+    // MCP servers the agent declares: shown on the consent screen and, if
+    // approved, connected now so the agent's tools are live (their tools become
+    // callable as mcp__<name>__<tool>).
+    let mcp_servers = pkg.manifest.agent.as_ref().map(|a| a.mcp_servers.clone()).unwrap_or_default();
+    let mut approved_mcp = alloc::vec::Vec::new();
+    for s in &mcp_servers {
+        let line = alloc::format!("MCP server '{}' at {}", s.name, s.url);
+        let ok = if auto_yes {
+            serial_println!("install>   [--yes] connect: {}", line);
+            true
+        } else {
+            crate::modal::confirm("Install agent — MCP server", &alloc::format!("'{}' wants to connect an {}", pkg.manifest.name, line))
+        };
+        if ok {
+            approved_mcp.push(s.clone());
+        } else {
+            serial_println!("install>   declined: {}", line);
+        }
+    }
+    let source = if registry.is_some() {
+        crate::agent::types::InstallSource::Registry { name: name.into(), version: pkg.manifest.version.clone() }
+    } else {
+        crate::agent::types::InstallSource::BootModule { name: name.into() }
+    };
+    match crate::skills::install::install(&pkg, &approved, "user", source, crate::arch::now_ms()) {
+        Ok(rec) => {
+            serial_println!(
+                "install> '{}' installed; granted {}/{} requested caps",
+                pkg.manifest.name,
+                rec.granted_capabilities.len(),
+                reqs.len()
+            );
+            // A freshly installed agent may have a new home/persona; drop the
+            // cached chat so the next turn can pick it up if switched to.
+            let _ = chat;
+            // Connect the approved MCP servers now (needs the network up). A
+            // failed connect is a warning, not an install failure — the grant
+            // stands and the server can be reconnected with `/mcp connect`.
+            for s in &approved_mcp {
+                match crate::mcp::connect(&s.name, &s.url, s.bearer.as_deref()) {
+                    Ok(n) => serial_println!("install>   MCP '{}' connected ({} tool(s) registered)", s.name, n),
+                    Err(e) => serial_println!("install>   MCP '{}' not reachable now: {} (retry: /mcp connect {} {})", s.name, e, s.name, s.url),
+                }
+            }
+        }
+        Err(e) => serial_println!("install> failed: {:?}", e),
+    }
+}
+
+fn run_agent_uninstall(arg: &str) {
+    let name = arg.trim();
+    // Map the installed skill by name via its L0 index entry.
+    match crate::skills::index::by_name(name) {
+        Some(meta) => {
+            crate::skills::install::uninstall(meta.id);
+            serial_println!("uninstall> '{}' removed (capabilities revoked)", name);
+        }
+        None => serial_println!("uninstall> '{}' is not installed", name),
     }
 }
 
@@ -2387,7 +4267,11 @@ fn run_infer() {
                 r.n_decoded,
                 r.decode_ms,
                 decode_tps,
-                r.matched_reference
+                match r.matched_reference {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "SKIP (no fixture)",
+                }
             );
         }
         None => serial_println!("=> no model module present; boot with the model bundled to use `infer`"),
@@ -2400,6 +4284,8 @@ fn run_infer() {
 fn run_bench() {
     #[cfg(target_arch = "aarch64")]
     serial_println!("bench> Q4_0 SDOT vs exact rel_rms_err = {}", crate::cortex::check_q4_0_sdot());
+    #[cfg(target_arch = "aarch64")]
+    serial_println!("bench> Q4_K SDOT vs exact rel_rms_err = {}", crate::cortex::check_q4_k_sdot());
     let r = crate::cortex::bench_matvec();
     // MMAC/s = macs / (ms * 1000); guard against a zero interval.
     let mmacs = if r.ms > 0 { r.macs / (r.ms * 1000) } else { 0 };
@@ -2461,13 +4347,8 @@ fn run_perf() {
 /// [`read_line`]. Consecutive duplicates are not stored.
 static HISTORY: Locked<alloc::vec::Vec<String>> = Locked::new(alloc::vec::Vec::new());
 
-/// Top-level `/command` names, for Tab completion (canonical names only, not
-/// aliases). Keep in sync with `dispatch_system` + the interactive arms.
-const COMMANDS: &[&str] = &[
-    "agents", "bench", "cat", "clear", "close", "compact", "datetime", "disks", "exit", "help", "http", "infer", "info", "model", "top", "ws",
-    "install", "ktrace", "ls", "mkext4", "mode", "mount", "mounts", "network", "open", "perf",
-    "lspci", "onnx", "ping", "session", "shortcuts", "skills", "think", "ui", "umount", "voice", "wifi",
-];
+/// Tab completion draws names from [`catalog::ENTRIES`] + [`catalog::COMMAND_ALIASES`].
+/// Add new commands to the catalogue (not a third list here).
 
 /// `/think on|off` — toggle Qwen thinking mode (default on; streamed dim).
 fn run_think(arg: &str) {
@@ -2497,14 +4378,24 @@ fn erase_chars(n: usize) {
 }
 
 /// Echo a string to both consoles byte-by-byte.
+/// Echo `s` for the line editor. When the Grok-style composer owns the FB
+/// prompt, only the UART is written (the chat grid is not the input surface —
+/// `composer_sync` paints the box). Otherwise mirror to serial + chat grid via
+/// `console::put_byte` (classic terminal path).
 fn emit(s: &str) {
+    if composer_mode() {
+        for b in s.bytes() {
+            crate::serial::put_byte(b);
+        }
+        return;
+    }
     for b in s.bytes() {
         crate::console::put_byte(b);
     }
 }
 
 /// Move the on-screen cursor `n` cells left/right with `ESC[nD`/`ESC[nC`
-/// (understood by both the framebuffer pane parser and serial terminals).
+/// (serial terminals always; FB grid only when not in composer mode).
 fn cursor_shift(n: usize, right: bool) {
     if n > 0 {
         emit(&alloc::format!("\x1b[{}{}", n, if right { 'C' } else { 'D' }));
@@ -2520,6 +4411,7 @@ fn replace_line(buf: &mut String, cur: &mut usize, new: &str) {
     buf.push_str(new);
     *cur = buf.len();
     emit(new);
+    composer_sync(buf, *cur);
 }
 
 /// After ESC, wait briefly for the rest of an ANSI sequence (the bytes of a
@@ -2535,26 +4427,187 @@ fn next_seq_byte() -> Option<u8> {
     None
 }
 
-/// Tab-complete a `/command` prefix: unique match completes in place; multiple
-/// matches are listed and the prompt+line re-echoed.
-fn tab_complete(buf: &mut String) {
-    use crate::console;
-    // Only complete a lone leading /command (no arguments yet).
+/// Read a bracketed-paste body: everything after `ESC[200~` up to the closing
+/// `ESC[201~`, which is consumed. Content bytes (including newlines) are
+/// returned verbatim; a stray CSI inside the paste is skipped. Bounded in total
+/// length so a malformed stream can't spin forever.
+fn read_bracketed_paste() -> String {
+    let mut out = String::new();
+    const CAP: usize = 256 * 1024;
+    while out.len() < CAP {
+        let b = match next_seq_byte() {
+            Some(b) => b,
+            None => break, // paced-out: treat what we have as the paste
+        };
+        if b == 0x1b {
+            // Possible end marker `ESC [ 201 ~`. Decode the CSI.
+            if next_seq_byte() != Some(b'[') {
+                continue; // stray ESC in content; drop it
+            }
+            let mut param: u64 = 0;
+            let fin = loop {
+                match next_seq_byte() {
+                    Some(f @ 0x40..=0x7e) => break Some(f),
+                    Some(d @ b'0'..=b'9') => param = param.saturating_mul(10) + (d - b'0') as u64,
+                    Some(_) => {}
+                    None => break None,
+                }
+            };
+            if fin == Some(b'~') && param == 201 {
+                break; // end of paste
+            }
+            // Any other CSI inside a paste is ignored (very unusual).
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
+}
+
+/// Paint the suggestion popup for an already-built item list (↑/↓ selection).
+fn suggest_paint(items: &[suggest::Item], sel: usize) {
+    #[cfg(not(test))]
+    {
+        let rows: alloc::vec::Vec<(String, String)> = items
+            .iter()
+            .map(|i| (i.label.clone(), i.detail.clone()))
+            .collect();
+        crate::framebuffer::suggest_set(&rows, sel);
+    }
+    #[cfg(test)]
+    let _ = (items, sel);
+}
+
+/// True when the buffer *might* need a slash or @file menu — cheap gate so
+/// normal prose typing does zero catalogue / FS / framebuffer popup work.
+fn suggest_maybe_active(buf: &str, cur: usize) -> bool {
+    let cur = cur.min(buf.len());
+    let before = &buf[..cur];
+    // Slash command at line start (optional leading spaces).
+    let t = before.trim_start();
+    if t.starts_with('/') && !t.contains(' ') {
+        return true;
+    }
+    // @mention token.
+    if let Some(i) = before.rfind('@') {
+        if (i == 0 || before.as_bytes().get(i.wrapping_sub(1)) == Some(&b' '))
+            && !before[i + 1..].contains(' ')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Refresh the slash-command / @file suggestion menu for `buf` at `cur`.
+///
+/// Fast paths: no `/` or `@` token → skip all work (and only dismiss the popup
+/// if it was open). Avoids catalogue + full-pane redraw on every prose key.
+fn suggest_refresh(
+    buf: &str,
+    cur: usize,
+    sel: &mut usize,
+    items: &mut alloc::vec::Vec<suggest::Item>,
+) {
+    if !suggest_maybe_active(buf, cur) {
+        if !items.is_empty() {
+            items.clear();
+            *sel = 0;
+            #[cfg(not(test))]
+            crate::framebuffer::suggest_clear();
+        } else {
+            // Menu already closed — do not touch the framebuffer.
+            *sel = 0;
+        }
+        return;
+    }
+    let Some(ctx) = suggest::context(buf, cur) else {
+        if !items.is_empty() {
+            items.clear();
+            *sel = 0;
+            #[cfg(not(test))]
+            crate::framebuffer::suggest_clear();
+        }
+        return;
+    };
+    let paths = if ctx.kind == suggest::Kind::File {
+        crate::synapse::fs::list()
+    } else {
+        alloc::vec::Vec::new()
+    };
+    let next = suggest::items_for(&ctx, &paths);
+    if next.is_empty() {
+        if !items.is_empty() {
+            items.clear();
+            *sel = 0;
+            #[cfg(not(test))]
+            crate::framebuffer::suggest_clear();
+        }
+        return;
+    }
+    // Skip framebuffer work if the list + selection are unchanged.
+    let same = items.len() == next.len()
+        && items.iter().zip(next.iter()).all(|(a, b)| a.label == b.label && a.detail == b.detail);
+    if same && *sel < items.len() {
+        // List unchanged — nothing to paint (selection only changes on ↑/↓,
+        // which calls suggest_paint directly).
+        return;
+    }
+    *items = next;
+    if *sel >= items.len() {
+        *sel = items.len() - 1;
+    }
+    suggest_paint(items, *sel);
+}
+
+/// Accept the selected suggestion into `buf`, re-echo, refresh menu.
+fn suggest_accept(
+    buf: &mut String,
+    cur: &mut usize,
+    sel: usize,
+    items: &[suggest::Item],
+    next_items: &mut alloc::vec::Vec<suggest::Item>,
+    next_sel: &mut usize,
+) -> bool {
+    if items.is_empty() {
+        return false;
+    }
+    let item = items[sel.min(items.len() - 1)].clone();
+    let Some(ctx) = suggest::context(buf, *cur) else {
+        return false;
+    };
+    let start = ctx.token_start.min(*cur);
+    // Rebuild the whole line on serial (same approach as replace_line).
+    cursor_shift(buf.len().saturating_sub(*cur), true);
+    erase_chars(buf.chars().count());
+    *cur = suggest::apply(buf, *cur, start, &item);
+    emit(buf);
+    // apply leaves the caret at the end of the inserted token; walk back if
+    // the mention sat mid-line (tail still follows).
+    if *cur < buf.len() {
+        cursor_shift(buf.len() - *cur, false);
+    }
+    composer_sync(buf, *cur);
+    suggest_refresh(buf, *cur, next_sel, next_items);
+    true
+}
+
+/// Serial-only fallback: list matching /commands (no FB popup).
+fn tab_complete_serial(buf: &mut String) {
     if !buf.starts_with('/') || buf.contains(' ') {
         return;
     }
     let prefix = &buf[1..];
-    let matches: alloc::vec::Vec<&&str> = COMMANDS.iter().filter(|c| c.starts_with(prefix)).collect();
+    let matches = catalog::complete_names(prefix);
     match matches.len() {
         0 => {}
         1 => {
             let rest = &matches[0][prefix.len()..];
-            for b in rest.bytes() {
-                console::put_byte(b);
-            }
             buf.push_str(rest);
             buf.push(' ');
-            console::put_byte(b' ');
+            emit(rest);
+            emit(" ");
+            composer_sync(buf, buf.len());
         }
         _ => {
             serial_println!("");
@@ -2566,8 +4619,13 @@ fn tab_complete(buf: &mut String) {
                 line.push(' ');
             }
             serial_println!("{}", line.trim_end());
-            // Re-echo the prompt + partial line.
-            serial_print!("> {}", buf);
+            if composer_mode() {
+                crate::serial::write_str_raw("> ");
+                crate::serial::write_str_raw(buf);
+                composer_sync(buf, buf.len());
+            } else {
+                serial_print!("> {}", buf);
+            }
         }
     }
 }
@@ -2598,17 +4656,227 @@ fn fb_focus_is_action() -> bool {
     #[cfg(test)]
     false
 }
+#[allow(dead_code)] // retained for a future explicit focus-toggle binding
 fn fb_focus_toggle() {
     #[cfg(not(test))]
     crate::framebuffer::focus_toggle();
 }
+/// True when the active action tab is the editor (so input routes to it).
+fn fb_editor_active() -> bool {
+    #[cfg(not(test))]
+    return crate::framebuffer::right_mode() == crate::framebuffer::RightMode::Editor;
+    #[cfg(test)]
+    false
+}
+/// The focused action tab if it's a media viewer/player (image or audio) —
+/// keys route to its controls only while the action pane is focused, so typing
+/// in the chat line is never intercepted.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn media_focused() -> Option<crate::framebuffer::RightMode> {
+    if !crate::framebuffer::focus_is_action() {
+        return None;
+    }
+    match crate::framebuffer::right_mode() {
+        m @ (crate::framebuffer::RightMode::Audio | crate::framebuffer::RightMode::Surface(_)) => Some(m),
+        _ => None,
+    }
+}
 
-/// Insert `c` into `buf` at the cursor, re-echoing the shifted tail.
+/// Handle a printable control key for the focused media tab. Returns true if it
+/// was consumed (so `read_line` shouldn't treat it as chat input).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn media_key(c: u8) -> bool {
+    match media_focused() {
+        // A stopped/unloaded video must not eat keystrokes (the tab may still
+        // be focused after Ctrl+C — typed commands would lose ' 0.m' chars).
+        Some(crate::framebuffer::RightMode::Surface(id)) if id == VIDEO_SURFACE && video_loaded() => match c {
+            b' ' => {
+                video_toggle_pause();
+                true
+            }
+            b'0' => {
+                video_restart();
+                true
+            }
+            b',' => {
+                video_seek(-1);
+                true
+            }
+            b'.' => {
+                video_seek(1);
+                true
+            }
+            b'm' | b'M' => {
+                media_toggle_mute();
+                true
+            }
+            _ => false,
+        },
+        Some(crate::framebuffer::RightMode::Surface(id)) if id != VIDEO_SURFACE => match c {
+            b'+' | b'=' | b'-' | b'_' | b'r' | b'R' | b'l' | b'L' | b'0' => {
+                image_cmd(c);
+                true
+            }
+            _ => false,
+        },
+        Some(crate::framebuffer::RightMode::Audio) => match c {
+            b' ' => {
+                audio_toggle_pause();
+                true
+            }
+            b'0' => {
+                audio_restart();
+                true
+            }
+            b',' => {
+                audio_seek(-5000);
+                true
+            }
+            b'.' => {
+                audio_seek(5000);
+                true
+            }
+            b'm' | b'M' => {
+                media_toggle_mute();
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn media_key(_c: u8) -> bool {
+    false
+}
+
+/// Handle an arrow/Home nav key (`A`/`B`/`C`/`D`/`H`) for the focused media tab.
+/// `steps` is the held-key amplifier from [`keyrepeat::Accel`] (≥1): a long
+/// press of ←/→ seeks progressively farther per typematic tick (1→2→4→8× the
+/// base step). Volume ↑/↓ ignore `steps` (one notch per event is enough).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn media_nav(fin: u8, steps: usize) -> bool {
+    let steps = steps.max(1) as i64;
+    match media_focused() {
+        Some(crate::framebuffer::RightMode::Surface(id)) if id == VIDEO_SURFACE && video_loaded() => match fin {
+            // ←/→ seek frames; long-hold multiplies by Accel (1/2/4/8).
+            b'C' => {
+                video_seek(steps);
+                true
+            }
+            b'D' => {
+                video_seek(-steps);
+                true
+            }
+            // ↑/↓ = volume.
+            b'A' => {
+                media_volume_adjust(5);
+                true
+            }
+            b'B' => {
+                media_volume_adjust(-5);
+                true
+            }
+            b'H' => {
+                video_restart();
+                true
+            }
+            _ => false,
+        },
+        Some(crate::framebuffer::RightMode::Surface(id)) if id != VIDEO_SURFACE => match fin {
+            b'A' | b'B' | b'C' | b'D' => {
+                image_cmd(fin);
+                true
+            }
+            _ => false,
+        },
+        Some(crate::framebuffer::RightMode::Audio) => match fin {
+            // ←/→ seek 5 s × steps (5→10→20→40 s per tick while held).
+            b'C' => {
+                audio_seek(5000 * steps);
+                true
+            }
+            b'D' => {
+                audio_seek(-5000 * steps);
+                true
+            }
+            // ↑/↓ = volume.
+            b'A' => {
+                media_volume_adjust(5);
+                true
+            }
+            b'B' => {
+                media_volume_adjust(-5);
+                true
+            }
+            b'H' => {
+                audio_restart();
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn media_nav(_fin: u8, _steps: usize) -> bool {
+    false
+}
+
+/// Switch to the next/previous action tab, focus the pane, repaint it.
+fn tab_switch(forward: bool) {
+    #[cfg(not(test))]
+    {
+        crate::framebuffer::cycle_tab(forward);
+        crate::framebuffer::focus_set(true);
+        repaint_active_tab();
+    }
+    #[cfg(test)]
+    let _ = forward;
+}
+/// Feed one byte to the editor tab (test build: no-op).
+fn editor_feed(b: u8) {
+    #[cfg(not(test))]
+    crate::editor::feed(b);
+    #[cfg(test)]
+    let _ = b;
+}
+/// Route a decoded nav sequence to the editor tab (test build: no-op).
+fn editor_nav(fin: u8, param: u64) {
+    #[cfg(not(test))]
+    crate::editor::nav_seq(fin, param);
+    #[cfg(test)]
+    let _ = (fin, param);
+}
+
+/// Whether the Grok-style framebuffer composer is the live prompt (so the FB
+/// grid is not used for keystroke echo). Serial still gets a full readline
+/// echo either way — see [`emit`].
+#[cfg(not(test))]
+fn composer_mode() -> bool {
+    crate::framebuffer::composer_is_active()
+}
+#[cfg(test)]
+fn composer_mode() -> bool {
+    false
+}
+
+/// Push the current line into the composer (no-op when the composer is idle).
+fn composer_sync(buf: &str, cur: usize) {
+    #[cfg(not(test))]
+    if composer_mode() {
+        crate::framebuffer::composer_set(buf, cur);
+    }
+}
+
+/// Insert `c` into `buf` at the cursor, re-echoing the shifted tail on serial
+/// (and refreshing the FB composer when it is the live prompt).
 fn insert_at(buf: &mut String, cur: &mut usize, c: char) {
     buf.insert(*cur, c);
-    emit(&buf[*cur..]);
+    emit(&buf[*cur..]); // new char + rest of line (serial; FB grid gated by emit)
     *cur += 1;
     cursor_shift(buf.len() - *cur, false);
+    composer_sync(buf, *cur);
 }
 
 /// Delete the character at `cur` (the "Delete" key), re-echoing the tail.
@@ -2618,23 +4886,98 @@ fn delete_at(buf: &mut String, cur: &mut usize) {
         emit(&buf[*cur..]);
         emit(" ");
         cursor_shift(buf.len() - *cur + 1, false);
+        composer_sync(buf, *cur);
     }
 }
 
-fn read_line(buf: &mut String) {
+/// Why [`read_line`] returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadOutcome {
+    /// User pressed Enter (line is in `buf`).
+    Submitted,
+    /// Inbound messaging-channel work is waiting — leave `buf` as the draft
+    /// and let the main loop drain the agent queue.
+    ChannelWake,
+}
+
+fn read_line(buf: &mut String) -> ReadOutcome {
     use crate::console;
     // History navigation state: index into HISTORY while browsing, plus the
     // draft line that was being typed when Up was first pressed. `cur` is the
     // cursor offset within `buf` (Left/Right/Ctrl+A/Ctrl+E move it).
     let mut hist_idx: Option<usize> = None;
     let mut draft = String::new();
-    let mut cur: usize = 0;
+    let mut cur: usize = buf.len();
+    // Suggestion menu (slash commands + @file mentions).
+    let mut sug_items: alloc::vec::Vec<suggest::Item> = alloc::vec::Vec::new();
+    let mut sug_sel: usize = 0;
+    // Prefill (e.g. from the Commands browser): echo into serial + composer so
+    // the user sees `/ping ` ready to edit / send.
+    if !buf.is_empty() {
+        emit(buf);
+        composer_sync(buf, cur);
+        suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
+    }
+    // Streak amplifier for held erase/nav keys: a fast repeat stream (hardware
+    // typematic or the drivers' software one) buys 2/4/8 steps per event, so a
+    // long-held Backspace/arrow erases or moves progressively faster.
+    let mut accel = crate::keyrepeat::Accel::new();
+    // Open the menu immediately when the line is empty so `/` is discoverable
+    // once the user types it; no popup until a trigger char appears.
     loop {
         match console::read_byte() {
+            // Ctrl+C at the prompt stops the background audio/video player.
+            Some(0x03) => {
+                #[cfg(not(feature = "server"))]
+                if audio_loaded() {
+                    stop_audio();
+                }
+                #[cfg(not(feature = "server"))]
+                if video_loaded() {
+                    stop_video();
+                }
+            }
+            // The editor tab owns input while it's the active action tab: every
+            // byte except ESC (nav, handled below) and the reserved globals
+            // Ctrl+C / Ctrl+W goes to the editor. Enter/Tab/Backspace all edit.
+            Some(b) if fb_editor_active() && b != 0x1b && b != 0x03 && b != 0x17 => {
+                editor_feed(b);
+            }
             Some(b'\r') | Some(b'\n') => {
+                // Enter accepts the highlighted suggestion when the menu is open.
+                if !sug_items.is_empty() {
+                    let accepted = suggest_accept(
+                        buf,
+                        &mut cur,
+                        sug_sel,
+                        &sug_items.clone(),
+                        &mut sug_items,
+                        &mut sug_sel,
+                    );
+                    if accepted {
+                        hist_idx = None;
+                        continue;
+                    }
+                }
                 fb_scroll_live(false);
+                #[cfg(not(test))]
+                crate::framebuffer::suggest_clear();
+                sug_items.clear();
                 cursor_shift(buf.len() - cur, true);
-                serial_println!("");
+                if composer_mode() {
+                    // Chars already echoed on the UART while typing; finish the
+                    // serial line, then land a dim copy into chat scrollback
+                    // (FB grid was skipped during composer typing).
+                    crate::serial::put_byte(b'\n');
+                    #[cfg(not(test))]
+                    if !buf.is_empty() {
+                        let dim = alloc::format!("\x1b[2m{}\x1b[0m\n", buf.as_str());
+                        crate::framebuffer::console_print(&dim);
+                    }
+                } else {
+                    // Classic dual-console: newline mirrors to serial + FB grid.
+                    serial_println!("");
+                }
                 let line = buf.trim();
                 if !line.is_empty() {
                     HISTORY.with(|h| {
@@ -2643,13 +4986,24 @@ fn read_line(buf: &mut String) {
                         }
                     });
                 }
-                return;
+                return ReadOutcome::Submitted;
             }
             // ESC: decode an ANSI CSI sequence (arrow/nav keys from serial
             // terminals and all keyboard drivers): params, then a final byte.
             Some(0x1b) => {
                 if next_seq_byte() != Some(b'[') {
-                    continue; // bare ESC or unknown sequence: ignore
+                    // Bare Esc: dismiss suggestion menu first; else editor Normal.
+                    if !sug_items.is_empty() {
+                        sug_items.clear();
+                        sug_sel = 0;
+                        #[cfg(not(test))]
+                        crate::framebuffer::suggest_clear();
+                        continue;
+                    }
+                    if fb_editor_active() {
+                        editor_feed(0x1b);
+                    }
+                    continue;
                 }
                 let mut param: u64 = 0;
                 let fin = loop {
@@ -2660,10 +5014,85 @@ fn read_line(buf: &mut String) {
                         None => break None,
                     }
                 };
+                // Bracketed paste from the host terminal: `ESC[200~ … ESC[201~`.
+                // Capture the whole paste into the clipboard (host->guest sync)
+                // and insert it — into the editor tab literally (newlines split
+                // lines), else into the chat line with newlines flattened.
+                if fin == Some(b'~') && param == 200 {
+                    let pasted = read_bracketed_paste();
+                    crate::clipboard::set_from_host(pasted.clone());
+                    if fb_editor_active() {
+                        for b in pasted.bytes() {
+                            editor_feed(b);
+                        }
+                    } else {
+                        fb_scroll_live(false);
+                        for ch in pasted.chars() {
+                            let c = if ch == '\n' || ch == '\r' || ch == '\t' { ' ' } else { ch };
+                            if (' '..='~').contains(&c) {
+                                insert_at(buf, &mut cur, c);
+                            }
+                        }
+                        suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
+                    }
+                    continue;
+                }
+                // Ctrl+Tab / Shift+Tab: cycle action-pane tabs (tmux-style), a
+                // global chord that works even while the editor tab is focused.
+                if matches!(fin, Some(b'T')) {
+                    tab_switch(true);
+                    continue;
+                }
+                if matches!(fin, Some(b'Z')) {
+                    tab_switch(false);
+                    continue;
+                }
+                // Editor tab active: forward arrow/nav sequences to the editor.
+                if fb_editor_active() {
+                    if let Some(f) = fin {
+                        editor_nav(f, param);
+                    }
+                    continue;
+                }
+                // Held arrows accelerate (multi-step) like held Backspace —
+                // computed first so media seek (←/→) can use the same streak.
+                let steps = match fin {
+                    Some(f @ (b'A' | b'B' | b'C' | b'D')) => accel.steps(f, crate::arch::now_ms()),
+                    _ => 1,
+                };
+                // Focused media tab: arrows pan the image / seek / volume.
+                if let Some(f) = fin {
+                    if media_nav(f, steps) {
+                        continue;
+                    }
+                }
                 let action = fb_focus_is_action();
+                // Suggestion menu owns ↑/↓ when open (before history / scroll).
+                if !sug_items.is_empty() && !action {
+                    match fin {
+                        Some(b'A') => {
+                            // Up in menu (wrap).
+                            let n = sug_items.len();
+                            sug_sel = if sug_sel == 0 {
+                                n - 1
+                            } else {
+                                sug_sel.saturating_sub(steps.min(sug_sel))
+                            };
+                            suggest_paint(&sug_items, sug_sel);
+                            continue;
+                        }
+                        Some(b'B') => {
+                            let n = sug_items.len();
+                            sug_sel = (sug_sel + steps) % n;
+                            suggest_paint(&sug_items, sug_sel);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 match fin {
-                    Some(b'A') if action => fb_scroll_view(true, 1),
-                    Some(b'B') if action => fb_scroll_view(true, -1),
+                    Some(b'A') if action => fb_scroll_view(true, steps as i64),
+                    Some(b'B') if action => fb_scroll_view(true, -(steps as i64)),
                     Some(b'A') => {
                         // Up: step back through history.
                         let n = HISTORY.with(|h| h.len());
@@ -2675,62 +5104,77 @@ fn read_line(buf: &mut String) {
                                 draft = buf.clone();
                                 n - 1
                             }
-                            Some(0) => 0,
-                            Some(i) => i - 1,
+                            Some(i) => i.saturating_sub(steps),
                         };
                         hist_idx = Some(idx);
                         let entry = HISTORY.with(|h| h[idx].clone());
                         replace_line(buf, &mut cur, &entry);
+                        suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
                     }
                     Some(b'B') => {
                         // Down: step forward; past the end restores the draft.
                         if let Some(i) = hist_idx {
                             let n = HISTORY.with(|h| h.len());
-                            if i + 1 < n {
-                                hist_idx = Some(i + 1);
-                                let entry = HISTORY.with(|h| h[i + 1].clone());
+                            if i + steps < n {
+                                hist_idx = Some(i + steps);
+                                let entry = HISTORY.with(|h| h[i + steps].clone());
                                 replace_line(buf, &mut cur, &entry);
                             } else {
                                 hist_idx = None;
                                 let d = draft.clone();
                                 replace_line(buf, &mut cur, &d);
                             }
+                            suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
                         }
                     }
                     Some(b'C') if !action => {
-                        if cur < buf.len() {
-                            cur += 1;
-                            cursor_shift(1, true);
+                        let n = steps.min(buf.len() - cur);
+                        if n > 0 {
+                            cur += n;
+                            cursor_shift(n, true);
+                            composer_sync(buf, cur);
+                            suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
                         }
                     }
                     Some(b'D') if !action => {
-                        if cur > 0 {
-                            cur -= 1;
-                            cursor_shift(1, false);
+                        let n = steps.min(cur);
+                        if n > 0 {
+                            cur -= n;
+                            cursor_shift(n, false);
+                            composer_sync(buf, cur);
+                            suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
                         }
                     }
                     Some(b'H') => {
                         cursor_shift(cur, false);
                         cur = 0;
+                        composer_sync(buf, cur);
+                        suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
                     }
                     Some(b'F') => {
                         cursor_shift(buf.len() - cur, true);
                         cur = buf.len();
+                        composer_sync(buf, cur);
+                        suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
                     }
-                    // Ctrl+Tab (driver-encoded) / Shift+Tab: toggle pane focus.
-                    Some(b'T') | Some(b'Z') => {
-                        fb_focus_toggle();
-                    }
+                    // (Ctrl+Tab / Shift+Tab handled above as tab switching.)
                     Some(b'~') => match param {
                         1 | 7 => {
                             cursor_shift(cur, false);
                             cur = 0;
+                            composer_sync(buf, cur);
+                            suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
                         }
                         4 | 8 => {
                             cursor_shift(buf.len() - cur, true);
                             cur = buf.len();
+                            composer_sync(buf, cur);
+                            suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
                         }
-                        3 => delete_at(buf, &mut cur),
+                        3 => {
+                            delete_at(buf, &mut cur);
+                            suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
+                        }
                         5 => fb_scroll_page(action, true),
                         6 => fb_scroll_page(action, false),
                         _ => {}
@@ -2738,21 +5182,36 @@ fn read_line(buf: &mut String) {
                     _ => {}
                 }
             }
-            // Tab: complete a /command prefix (only with the cursor at the end).
+            // Tab: accept suggestion, else complete a /command prefix.
             Some(b'\t') => {
-                if cur == buf.len() {
-                    tab_complete(buf);
+                if !sug_items.is_empty() {
+                    let _ = suggest_accept(
+                        buf,
+                        &mut cur,
+                        sug_sel,
+                        &sug_items.clone(),
+                        &mut sug_items,
+                        &mut sug_sel,
+                    );
+                    hist_idx = None;
+                } else if cur == buf.len() {
+                    tab_complete_serial(buf);
                     cur = buf.len();
+                    suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
                 }
             }
             // Ctrl+A / Ctrl+E: jump to line start / end (readline-style).
             Some(0x01) => {
                 cursor_shift(cur, false);
                 cur = 0;
+                composer_sync(buf, cur);
+                suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
             }
             Some(0x05) => {
                 cursor_shift(buf.len() - cur, true);
                 cur = buf.len();
+                composer_sync(buf, cur);
+                suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
             }
             // Ctrl+D (EOT): EOF-on-empty-line — power off, like typing /exit.
             // On a non-empty line it's ignored (standard shell behaviour), so an
@@ -2765,7 +5224,9 @@ fn read_line(buf: &mut String) {
                 }
             }
             // Ctrl+W: close the action (right) pane — a keyboard shortcut for /close.
-            Some(0x17) => close_action(),
+            Some(0x17) => close_active_tab(),
+            // Ctrl+F: toggle fullscreen for the focused pane.
+            Some(0x06) => fb_toggle_fullscreen(),
             // Ctrl+V: paste the clipboard into the input line (newlines → spaces).
             Some(0x16) => {
                 if let Some((text, _)) = crate::clipboard::get() {
@@ -2775,28 +5236,54 @@ fn read_line(buf: &mut String) {
                             insert_at(buf, &mut cur, c);
                         }
                     }
+                    suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
                 }
             }
             Some(0x7f) | Some(0x08) => {
-                if cur > 0 {
-                    buf.remove(cur - 1);
-                    cur -= 1;
-                    // Back up, re-echo the shifted tail, blank the freed cell,
-                    // and walk the cursor back into place.
-                    console::put_byte(0x08);
+                // A held Backspace streak erases 2/4/8 chars per repeat.
+                let n = accel.steps(0x08, crate::arch::now_ms()).min(cur);
+                if n > 0 {
+                    buf.drain(cur - n..cur);
+                    cur -= n;
+                    // Back up, re-echo the shifted tail, blank the freed
+                    // cells, and walk the cursor back into place (serial CSI
+                    // when in composer mode; dual-console otherwise).
+                    cursor_shift(n, false);
                     emit(&buf[cur..]);
-                    emit(" ");
-                    cursor_shift(buf.len() - cur + 1, false);
+                    for _ in 0..n {
+                        emit(" ");
+                    }
+                    cursor_shift(buf.len() - cur + n, false);
+                    composer_sync(buf, cur);
+                    suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
                 }
             }
             Some(c @ 0x20..=0x7e) => {
+                // A focused image/audio tab consumes its control keys first.
+                if media_key(c) {
+                    continue;
+                }
                 fb_scroll_live(false);
                 insert_at(buf, &mut cur, c as char);
+                hist_idx = None;
+                // Opening `/` or `@` (or filtering further) refreshes the menu.
+                suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
             }
             Some(_) => {} // ignore other control bytes
             None => {
-                ui_tick();
-                crate::net::poll(); // pump the net stack (DHCP/ARP) while idle
+                // Full upkeep (not just ui_tick): pumps net, service supervisor,
+                // **and messaging channels** (`msgchan::tick`). Without this,
+                // Telegram getUpdates never ran while the prompt was idle —
+                // offset stayed 0 and DMs were invisible.
+                upkeep();
+                // Wake the main loop so it can run the agent on queued DMs
+                // (drain only happens outside read_line — never block forever).
+                if crate::msgchan::inbound_len() > 0 {
+                    #[cfg(not(test))]
+                    crate::framebuffer::suggest_clear();
+                    // Leave `buf` as the in-progress draft for the next prompt.
+                    return ReadOutcome::ChannelWake;
+                }
                 crate::sched::yield_now();
             }
         }
@@ -2870,10 +5357,46 @@ fn ui_tick() {
             crate::framebuffer::cursor_move(t.x, t.y);
         }
         if t.pressed {
-            if crate::framebuffer::hit_close(t.x, t.y) {
-                crate::framebuffer::close_action();
+            if crate::framebuffer::divider_hit(t.x, t.y).is_some() {
+                // Grab the pane divider to resize the split.
+                DIVIDER_DRAG.store(true, Ordering::Relaxed);
+            } else if crate::framebuffer::hit_close(t.x, t.y) {
+                close_active_tab();
+            } else if let Some(i) = crate::framebuffer::tab_hit(t.x, t.y) {
+                // Click a tab label: select it, focus the action pane, repaint.
+                crate::framebuffer::select_tab(i);
+                crate::framebuffer::focus_set(true);
+                repaint_active_tab();
+                crate::framebuffer::chat_sel_clear();
             } else if let Some(action) = crate::framebuffer::pane_hit(t.x, t.y) {
                 crate::framebuffer::focus_set(action);
+                if action {
+                    crate::framebuffer::chat_sel_clear();
+                } else {
+                    // Press in the chat pane anchors a mouse text selection.
+                    crate::framebuffer::chat_sel_begin(t.x, t.y);
+                }
+            } else {
+                crate::framebuffer::chat_sel_clear();
+            }
+        }
+        // Drag: resize the split if the divider was grabbed, else extend the
+        // chat selection (release copies it; paste back with Ctrl+V).
+        if t.left && t.moved {
+            if DIVIDER_DRAG.load(Ordering::Relaxed) {
+                crate::framebuffer::set_divider_x(t.x);
+                // Live-resize: re-letterbox video/image into the new action pane.
+                repaint_active_tab();
+            } else {
+                crate::framebuffer::chat_sel_drag(t.x, t.y);
+            }
+        }
+        if t.released {
+            if DIVIDER_DRAG.swap(false, Ordering::Relaxed) {
+                save_panes_config();
+                repaint_active_tab();
+            } else if let Some(text) = crate::framebuffer::chat_sel_end() {
+                crate::clipboard::set(text, false);
             }
         }
         if t.wheel != 0 {
@@ -2881,13 +5404,88 @@ fn ui_tick() {
             let action = crate::framebuffer::pane_hit(t.x, t.y).unwrap_or(false);
             crate::framebuffer::scroll_view(action, t.wheel as i64 * 3);
         }
-        // Live `/top` dashboard: refresh ~1 Hz while its pane is open.
-        if crate::framebuffer::is_top() && now.saturating_sub(LAST_TOP_MS.load(Ordering::Relaxed)) >= 1000 {
-            LAST_TOP_MS.store(now, Ordering::Relaxed);
-            refresh_top();
+        // Background audio: feed the sound device chunk-by-chunk regardless of
+        // which tab is shown, so playback continues across tab switches.
+        pump_audio();
+        // Background video: advance frames by presentation time (presents only
+        // when the video tab is the active surface).
+        pump_video();
+        // Editor closed (`:q`) since last tick → re-apply an edited UI config.
+        if let Some((path, saved)) = crate::editor::take_closed() {
+            serial_println!("editor> closed {}", path);
+            if saved && path == crate::ui_config::ui_path() {
+                crate::ui_config::reload_and_apply();
+                update_status();
+                serial_println!("ui> re-applied edited config");
+            }
+        }
+        // Per-active-tab idle repaint: /top ~1 Hz, audio ~4 Hz, editor mouse.
+        match crate::framebuffer::right_mode() {
+            crate::framebuffer::RightMode::Top => {
+                if now.saturating_sub(LAST_TOP_MS.load(Ordering::Relaxed)) >= 1000 {
+                    LAST_TOP_MS.store(now, Ordering::Relaxed);
+                    refresh_top();
+                }
+            }
+            crate::framebuffer::RightMode::Todos => {
+                // Todos are session-owned; repaint when the shell has a live orch
+                // is done from tool paths. Idle tick is a no-op (static snapshot).
+            }
+            crate::framebuffer::RightMode::Audio => {
+                if now.saturating_sub(LAST_AUDIO_MS.load(Ordering::Relaxed)) >= 250 {
+                    LAST_AUDIO_MS.store(now, Ordering::Relaxed);
+                    repaint_audio();
+                }
+            }
+            crate::framebuffer::RightMode::Editor => crate::editor::mouse_tick(),
+            _ => {}
         }
     }
 }
+
+static LAST_AUDIO_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Repaint the active action tab's interior (after a tab switch): /top, audio,
+/// image, and the editor own their pixels and must be re-drawn on switch;
+/// ktrace repaints from its grid during the switch's `redraw`.
+#[cfg(not(test))]
+fn repaint_active_tab() {
+    match crate::framebuffer::right_mode() {
+        crate::framebuffer::RightMode::Top => refresh_top(),
+        crate::framebuffer::RightMode::Todos => {}
+        crate::framebuffer::RightMode::Audio => repaint_audio(),
+        crate::framebuffer::RightMode::Surface(id) if id == crate::framebuffer::VIDEO_SURFACE => present_video_frame(),
+        crate::framebuffer::RightMode::Surface(_) => repaint_image(),
+        crate::framebuffer::RightMode::Editor => crate::editor::repaint(),
+        _ => {}
+    }
+}
+#[cfg(test)]
+fn repaint_active_tab() {}
+
+/// Close the active action tab, tearing down its background process: stop audio
+/// if the audio tab, drop the editor if the editor tab.
+#[cfg(not(test))]
+fn close_active_tab() {
+    match crate::framebuffer::right_mode() {
+        crate::framebuffer::RightMode::Audio => {
+            stop_audio();
+            crate::framebuffer::close_action();
+        }
+        crate::framebuffer::RightMode::Surface(id) if id == crate::framebuffer::VIDEO_SURFACE => {
+            stop_video();
+            crate::framebuffer::close_action();
+        }
+        crate::framebuffer::RightMode::Editor => {
+            crate::editor::force_close();
+            crate::framebuffer::close_action();
+        }
+        _ => crate::framebuffer::close_action(),
+    }
+    repaint_active_tab();
+}
+#[cfg(test)]
+fn close_active_tab() {}
 
 static LAST_TOP_MS: AtomicU64 = AtomicU64::new(0);
 /// `/top` per-core utilisation is measured across refreshes: the previous
@@ -2916,9 +5514,18 @@ fn refresh_top() {
         let busy = crate::arch::core_busy_cycles(c);
         let prev = TOP_PREV_BUSY[c].swap(busy, Ordering::Relaxed);
         let delta = busy.wrapping_sub(prev);
-        let pct = if window > 0 { (delta.saturating_mul(100) / window).min(100) } else { 0 };
+        let pct = if window > 0 {
+            (delta.saturating_mul(100) / window).min(100)
+        } else {
+            0
+        };
         cores.push(pct);
     }
+    let load_pct = if cores.is_empty() {
+        0
+    } else {
+        cores.iter().sum::<u64>() / cores.len() as u64
+    };
     let secs = crate::arch::now_ms() / 1000;
     let uptime = alloc::format!("{}:{:02}:{:02}", secs / 3600, secs % 3600 / 60, secs % 60);
     let dt = crate::clock::format_datetime();
@@ -2926,6 +5533,37 @@ fn refresh_top() {
     let arch = "x86_64";
     #[cfg(target_arch = "aarch64")]
     let arch = "aarch64";
+
+    // Process table: scheduler tasks, running first (htop-style). Tree prefix
+    // marks service agents under a visual root.
+    let listed = crate::sched::list();
+    let mut sorted = listed;
+    sorted.sort_by(|a, b| {
+        let rank = |s: &str| match s {
+            "running" => 0,
+            "ready" => 1,
+            "parked" => 2,
+            _ => 3,
+        };
+        rank(a.2).cmp(&rank(b.2)).then(a.0.cmp(&b.0))
+    });
+    let tasks_total = sorted.len() as u64;
+    let tasks_running = sorted.iter().filter(|t| t.2 == "running").count() as u64;
+    // Build TopTask views; services get a tree branch prefix.
+    let services = crate::service::list();
+    let mut tasks: alloc::vec::Vec<crate::framebuffer::TopTask> = alloc::vec::Vec::new();
+    for (id, name, state) in &sorted {
+        let is_svc = services.iter().any(|(_, tid, _)| *tid == *id);
+        let tree = if is_svc { "|- " } else { "" };
+        tasks.push(crate::framebuffer::TopTask {
+            id: *id as u64,
+            name,
+            state,
+            tree,
+        });
+    }
+    let model_name_owned = crate::cortex::model_name().unwrap_or_else(|| String::from("none"));
+
     let view = crate::framebuffer::TopView {
         cores: &cores,
         cores_online: crate::arch::cpu_count(),
@@ -2938,6 +5576,12 @@ fn refresh_top() {
         arch,
         allocs: crate::mm::heap::alloc_stats().0,
         datetime: &dt,
+        tasks: &tasks,
+        tasks_total,
+        tasks_running,
+        load_pct,
+        net_up: crate::net::is_up(),
+        model_name: model_name_owned.as_str(),
     };
     crate::framebuffer::draw_top(&view);
 }
@@ -2949,6 +5593,10 @@ fn refresh_top() {
 pub fn upkeep() {
     ui_tick();
     crate::net::poll();
+    crate::service::supervise_tick();
+    // External messaging channels (Telegram, …) — short non-blocking poll.
+    crate::msgchan::tick();
+    thinking_tick();
 }
 
 /// Lighter upkeep for loops that consume their own mouse events (modals, the
@@ -2976,6 +5624,26 @@ fn update_status() {
         crate::framebuffer::set_status(&left, &right);
     }
 }
+
+/// Right half of the Grok-style composer hint bar: backend + approval mode.
+#[cfg(not(test))]
+fn update_composer_hint(remote_on: bool, remote_cfg: Option<&remote::RemoteConfig>) {
+    let mode = match approval_mode() {
+        ApprovalMode::Manual => "manual",
+        ApprovalMode::Auto => "auto",
+        ApprovalMode::Bypass => "bypass",
+        ApprovalMode::Plan => "plan",
+    };
+    let backend = if remote_on {
+        remote_cfg.map(|c| c.model.as_str()).unwrap_or("remote")
+    } else {
+        "local"
+    };
+    let s = alloc::format!("{backend} · {mode}");
+    crate::framebuffer::composer_set_hint_right(&s);
+}
+#[cfg(test)]
+fn update_composer_hint(_remote_on: bool, _remote_cfg: Option<&remote::RemoteConfig>) {}
 
 /// `/datetime` — show or set the wall clock and timezone.
 fn run_datetime(arg: &str) {
@@ -3052,22 +5720,25 @@ fn toggle_ktrace() {
     #[cfg(not(test))]
     {
         use crate::framebuffer::{self, RightMode};
-        if framebuffer::right_mode() == RightMode::Ktrace {
-            framebuffer::close_action();
-            serial_println!("ktrace> hidden (action pane closed)");
+        if framebuffer::has_tab(RightMode::Ktrace) {
+            framebuffer::close_tab_mode(RightMode::Ktrace);
+            repaint_active_tab();
+            serial_println!("ktrace> tab closed");
         } else {
             framebuffer::open_ktrace();
-            serial_println!("ktrace> showing in the action pane (/close or Ctrl+W to hide)");
+            serial_println!("ktrace> showing as an action tab (Ctrl+Tab switches tabs, /close closes it)");
         }
     }
 }
 
-/// `/close` (also Ctrl+W) — close the action pane; chat becomes full-width.
+/// `/close` (also Ctrl+W) — close the **active** action tab; the pane collapses
+/// once the last tab closes. Tears down that tab's process (stops audio,
+/// drops the editor buffer).
 fn close_action() {
     #[cfg(not(test))]
     {
-        crate::framebuffer::close_action();
-        serial_println!("(action pane closed)");
+        close_active_tab();
+        serial_println!("(closed the active tab)");
     }
 }
 
@@ -3089,20 +5760,938 @@ fn run_open_inner(arg: &str) {
     if arg.is_empty() {
         serial_println!("usage: /open <path>   e.g. /open {}", crate::ui_config::ui_path());
         serial_println!("  editor: hjkl move, i insert, Esc normal, :w write, :q quit, :wq save+quit");
+        serial_println!("  images: /open photo.png|.jpg previews in the action pane (/close to hide)");
+        serial_println!("  audio:  /open song.wav|.mp3|.aac plays through the sound device (Ctrl+C stops)");
+        serial_println!("  video:  /open clip.mp4|.mov plays H.264 baseline keyframes (Ctrl+Tab focus: space/seek/0; Ctrl+C stops)");
+        return;
+    }
+    // A .png/.jpg path is an image preview, a .wav/.mp3/.aac an audio playback —
+    // not a text buffer.
+    let lower = arg.to_ascii_lowercase();
+    if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        view_image(arg);
+        return;
+    }
+    if lower.ends_with(".wav") || lower.ends_with(".mp3") || lower.ends_with(".aac") {
+        play_audio(arg);
+        return;
+    }
+    if lower.ends_with(".mp4") || lower.ends_with(".mov") || lower.ends_with(".mkv") || lower.ends_with(".webm") {
+        play_video(arg);
         return;
     }
     #[cfg(not(test))]
     {
-        let saved = crate::editor::open(arg);
-        serial_println!("editor> closed {}", arg);
-        if saved && arg == crate::ui_config::ui_path() {
-            crate::ui_config::reload_and_apply();
-            update_status();
-            serial_println!("ui> re-applied edited config");
-        }
+        // Non-blocking: opens an editor tab and focuses it; input is routed
+        // from the shell loop, so audio/ktrace tabs keep running. The tab
+        // stays alive across switches; `:q` closes it (the ui.json re-apply
+        // happens then, via `editor::take_closed()` polled in `ui_tick`).
+        crate::editor::open(arg);
+        crate::framebuffer::focus_set(true);
+        serial_println!("editor> {} open in a tab — i insert, Esc normal, :w write, :q quit; Ctrl+Tab switches tabs", arg);
     }
     #[cfg(test)]
     let _ = arg;
+}
+
+/// True while the pane divider is being dragged with the mouse (resize).
+static DIVIDER_DRAG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Persistent pane layout config.
+#[cfg(not(feature = "server"))]
+const PANES_PATH: &str = "/configs/core/panes.json";
+
+/// Toggle fullscreen on the focused pane (Ctrl+F / `/pane full`).
+fn fb_toggle_fullscreen() {
+    #[cfg(not(test))]
+    {
+        let st = crate::framebuffer::toggle_fullscreen();
+        // Geometry changed — re-present the active tab (video must re-letterbox
+        // into the new pane size; without this the last small frame stays put).
+        repaint_active_tab();
+        serial_println!(
+            "pane> {}",
+            match st {
+                1 => "chat fullscreen (Ctrl+F to restore)",
+                2 => "action pane fullscreen (Ctrl+F to restore)",
+                _ => "split restored",
+            }
+        );
+    }
+}
+
+/// Persist the current split ratio to `panes.json` (called after a resize drag).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn save_panes_config() {
+    let pct = crate::framebuffer::split_pct();
+    let text = alloc::format!(
+        "{{\n  \"chat_pct\": {},\n  \"num_action_panes\": 1\n}}\n",
+        pct
+    );
+    crate::synapse::fs::write(PANES_PATH, text.as_bytes());
+}
+#[cfg(any(feature = "server", test))]
+fn save_panes_config() {}
+
+/// Load `panes.json` at boot and apply the split ratio. `num_action_panes` is
+/// read + clamped to 1..6; a value >1 is noted (the N-pane split is a scoped
+/// follow-up, so 1 is used for now).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn load_panes_config() {
+    let Some(bytes) = crate::synapse::fs::read(PANES_PATH) else { return };
+    let Some(text) = core::str::from_utf8(&bytes).ok() else { return };
+    let Some(j) = crate::json::Json::parse(text) else { return };
+    if let Some(p) = j.get("chat_pct").and_then(|v| v.as_i64()) {
+        crate::framebuffer::set_split_pct(p.clamp(10, 90) as u64);
+    }
+    if let Some(n) = j.get("num_action_panes").and_then(|v| v.as_i64()) {
+        if n.clamp(1, 6) > 1 {
+            serial_println!("panes> num_action_panes={} configured — multi-pane split lands in a follow-up; using 1", n);
+        }
+    }
+}
+
+/// `/pane` — inspect/adjust the pane layout. Subcommands: `full` (toggle
+/// fullscreen), `split <10-90>` (set the chat width %), `swap`, `reset`.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn run_pane(arg: &str) {
+    let mut it = arg.split_whitespace();
+    match it.next() {
+        None | Some("status") => {
+            serial_println!("pane> split chat={}%  (F=fullscreen; /pane split <10-90>, /pane swap)", crate::framebuffer::split_pct());
+        }
+        Some("full") | Some("fullscreen") => fb_toggle_fullscreen(),
+        Some("split") => {
+            if let Some(p) = it.next().and_then(|s| s.parse::<u64>().ok()) {
+                crate::framebuffer::set_split_pct(p);
+                save_panes_config();
+                repaint_active_tab();
+                serial_println!("pane> chat width {}%", crate::framebuffer::split_pct());
+            } else {
+                serial_println!("usage: /pane split <10-90>");
+            }
+        }
+        Some("reset") => {
+            crate::framebuffer::set_split_pct(crate::framebuffer::default_chat_pct());
+            save_panes_config();
+            repaint_active_tab();
+            serial_println!("pane> reset");
+        }
+        Some(other) => serial_println!("pane> unknown '{}' (full | split <pct> | reset)", other),
+    }
+}
+#[cfg(any(feature = "server", test))]
+fn run_pane(_arg: &str) {}
+
+/// Surface id the video player presents frames on (== framebuffer::VIDEO_SURFACE).
+#[cfg(not(feature = "server"))]
+const VIDEO_SURFACE: u32 = u32::MAX - 1;
+
+/// A background video player: decoded keyframes plus a playback clock. Frames
+/// are advanced by presentation timestamp from `ui_tick` (`pump_video`), so it
+/// keeps playing/advancing across tab switches like the audio player. Baseline
+/// H.264 decodes every frame (I keyframes + P inter frames), so playback is
+/// full-motion, not keyframe-only.
+#[cfg(not(feature = "server"))]
+struct VideoPlayer {
+    dec: crate::video::StreamDecoder,
+    frame_count: usize,
+    idx: usize,
+    playing: bool,
+    base_ms: u64,     // wall-clock at which pts 0 plays
+    paused_at: u64,   // playback-time when paused
+    total_ms: u64,
+    name: String,
+    finished_announced: bool,
+    muted: bool,
+    has_audio: bool,
+    /// Decoded mono S16 PCM for the video's audio track (option B: owned by
+    /// the video player so closing the tab stops audio without touching the
+    /// standalone audio tab).
+    audio_pcm: Option<alloc::vec::Vec<i16>>,
+    audio_rate: u32,
+    /// Next PCM sample index to queue (advanced by `pump_video` audio path).
+    audio_at: usize,
+    /// FPS meter: frames presented in the current 1 s window + EMA display value.
+    fps_window_start_ms: u64,
+    fps_window_frames: u32,
+    fps_display: u32,
+    /// Wall-clock of last successful present (for instant ms/frame → fps).
+    last_present_ms: u64,
+}
+#[cfg(not(feature = "server"))]
+static VIDEO: crate::mm::Locked<Option<VideoPlayer>> = crate::mm::Locked::new(None);
+
+/// `/open <path>.mp4|.mov` — demux + decode H.264 keyframes and play them in a
+/// "video" action-pane tab. Non-blocking: `pump_video` advances frames from the
+/// idle tick. `/close` or Ctrl+C stops it.
+#[cfg(not(feature = "server"))]
+fn play_video(path: &str) {
+    let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
+        serial_println!("open> {} not found under any mount or in the store (see /mounts)", path);
+        return;
+    };
+    let t0 = crate::arch::now_ms();
+    // Probe first so we can report clearly and handle unsupported streams.
+    match crate::video::probe(&bytes) {
+        Ok(info) => {
+            serial_println!("open> {} — {} {}x{} {} frames {}:{:02}", path, info.codec, info.width, info.height, info.frame_count, info.duration_ms / 60000, info.duration_ms % 60000 / 1000);
+            if !info.decodable {
+                serial_println!("open>   cannot decode yet: {}", if info.cabac { "CABAC entropy coding (baseline/CAVLC only)" } else { "unsupported profile" });
+                return;
+            }
+        }
+        Err(e) => {
+            serial_println!("open> cannot open {}: {}", path, e);
+            return;
+        }
+    }
+    // Demux/describe audio; if AAC-LC, decode PCM now so pump_video can sync it.
+    let (has_audio, audio_pcm, audio_rate) = match crate::video::audio_info(&bytes) {
+        Some(a) if a.decodable => {
+            serial_println!(
+                "open>   audio: {} {} Hz {}ch — decoding…",
+                a.codec,
+                a.sample_rate,
+                a.channels
+            );
+            match crate::video::decode_audio(&bytes) {
+                Ok(audio) => {
+                    serial_println!(
+                        "open>   audio ready: {}:{:02} mono @ {} Hz ({} KiB PCM)",
+                        audio.duration_ms() / 60000,
+                        (audio.duration_ms() % 60000) / 1000,
+                        audio.rate,
+                        audio.pcm.len() * 2 / 1024
+                    );
+                    (true, Some(audio.pcm), audio.rate)
+                }
+                Err(e) => {
+                    serial_println!("open>   audio decode failed ({}) — video plays silently", e);
+                    (true, None, 0)
+                }
+            }
+        }
+        Some(a) => {
+            serial_println!(
+                "open>   audio: {} {} Hz {}ch (unsupported profile — video plays silently)",
+                a.codec,
+                a.sample_rate,
+                a.channels
+            );
+            (true, None, 0)
+        }
+        None => (false, None, 0),
+    };
+    match crate::video::StreamDecoder::open(bytes) {
+        Ok(mut dec) => {
+            let frame_count = dec.frame_count();
+            let total_ms = dec.duration_ms;
+            // Stream like VLC: demux + first frame only — no full-clip RGB cache.
+            dec.seek_decode(0);
+            serial_println!(
+                "open>   {}x{}  {} frame(s)  decoder={}  ready in {} ms (streaming) — Ctrl+Tab focus, space=pause",
+                dec.src_w,
+                dec.src_h,
+                frame_count,
+                dec.backend,
+                crate::arch::now_ms().saturating_sub(t0)
+            );
+            let name = path.rsplit('/').next().unwrap_or(path).to_string();
+            let now = crate::arch::now_ms();
+            VIDEO.with(|v| {
+                *v = Some(VideoPlayer {
+                    dec,
+                    frame_count,
+                    idx: 0,
+                    playing: true,
+                    base_ms: now,
+                    paused_at: 0,
+                    total_ms,
+                    name,
+                    finished_announced: false,
+                    muted: false,
+                    has_audio,
+                    audio_pcm,
+                    audio_rate,
+                    audio_at: 0,
+                    fps_window_start_ms: now,
+                    fps_window_frames: 0,
+                    fps_display: 0,
+                    last_present_ms: 0,
+                })
+            });
+            #[cfg(not(test))]
+            {
+                crate::framebuffer::set_right(crate::framebuffer::RightMode::Surface(VIDEO_SURFACE));
+                present_video_frame();
+            }
+        }
+        Err(e) => serial_println!("open> decode failed: {}", e),
+    }
+}
+
+/// Present the current video frame into the video tab (no-op if not active).
+/// Updates the rolling FPS meter (frames presented per wall-clock second).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn present_video_frame() {
+    let now = crate::arch::now_ms();
+    VIDEO.with(|v| {
+        if let Some(p) = v.as_mut() {
+            if let Some(f) = p.dec.cur_frame() {
+                // Reserve the bottom strip for the HUD so the per-frame blit
+                // never repaints under it (no flicker); the HUD lives there.
+                let hud = crate::framebuffer::video_hud_height();
+                crate::framebuffer::present_surface_reserve(VIDEO_SURFACE, f.w, f.h, &f.pixels, hud);
+                // FPS: count presents in 1 s windows; show last completed window.
+                p.fps_window_frames = p.fps_window_frames.saturating_add(1);
+                p.last_present_ms = now;
+                let elapsed = now.saturating_sub(p.fps_window_start_ms);
+                if elapsed >= 1000 {
+                    // frames in this window → fps (scale if window > 1 s)
+                    let fps = if elapsed > 0 {
+                        (p.fps_window_frames as u64 * 1000 / elapsed) as u32
+                    } else {
+                        0
+                    };
+                    p.fps_display = fps;
+                    p.fps_window_start_ms = now;
+                    p.fps_window_frames = 0;
+                }
+            }
+        }
+    });
+    present_video_status();
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn present_video_frame() {}
+
+/// Whether a video is loaded.
+#[cfg(not(feature = "server"))]
+fn video_loaded() -> bool {
+    VIDEO.with(|v| v.is_some())
+}
+
+/// Stop + unload the video (Ctrl+C / closing the video tab).
+#[cfg(not(feature = "server"))]
+fn stop_video() {
+    if VIDEO.with(|v| v.take().is_some()) {
+        serial_println!("\ropen> video stopped");
+    }
+}
+#[cfg(feature = "server")]
+fn stop_video() {}
+
+/// Re-entrancy guard: `upkeep` → `pump_video` must never nest (VIDEO lock).
+#[cfg(all(not(feature = "server"), not(test)))]
+static PUMPING_VIDEO: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Advance the video by presentation time; the idle-tick heartbeat.
+/// Also queues ~200 ms audio chunks from the video's own PCM (when present),
+/// gated on play state and device drain — never steals the standalone audio tab.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn pump_video() {
+    use core::sync::atomic::Ordering;
+    // Bail if already pumping (e.g. a nested upkeep from a mistaken yield
+    // inside decode). Nested VIDEO.with would spin forever.
+    if PUMPING_VIDEO.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let result = pump_video_inner();
+    PUMPING_VIDEO.store(false, Ordering::Release);
+    let _ = result;
+}
+
+#[cfg(all(not(feature = "server"), not(test)))]
+fn pump_video_inner() {
+    let now = crate::arch::now_ms();
+    // Audio chunk (copied out so VIDEO lock isn't held across sound::play).
+    let audio_chunk = VIDEO.with(|v| {
+        let p = v.as_mut()?;
+        if !p.playing {
+            return None;
+        }
+        let pcm = p.audio_pcm.as_ref()?;
+        if p.audio_rate == 0 || p.audio_at >= pcm.len() {
+            return None;
+        }
+        if crate::sound::playing() {
+            return None; // still draining previous chunk
+        }
+        // Snap cursor to the current video pts so seek/pause recover cleanly.
+        let t = now.saturating_sub(p.base_ms);
+        let want = ((t as u128) * p.audio_rate as u128 / 1000) as usize;
+        // Only jump forward/back if we drifted > ~50 ms (avoid tiny jitter).
+        let slop = (p.audio_rate as usize / 20).max(1);
+        if want > p.audio_at + slop || p.audio_at > want + slop {
+            p.audio_at = want.min(pcm.len());
+        }
+        if p.audio_at >= pcm.len() {
+            return None;
+        }
+        let chunk = (p.audio_rate as usize / 5).max(256); // ~200 ms
+        let end = (p.audio_at + chunk).min(pcm.len());
+        let slice = pcm[p.audio_at..end].to_vec();
+        p.audio_at = end;
+        Some((slice, p.audio_rate))
+    });
+    if let Some((slice, rate)) = audio_chunk {
+        let _ = crate::sound::play(&slice, rate);
+    }
+
+    let present = VIDEO.with(|v| {
+        let Some(p) = v.as_mut() else { return false };
+        if !p.playing || p.frame_count == 0 {
+            return false;
+        }
+        let t = now.saturating_sub(p.base_ms);
+        // Desired display frame from the sample table (no decode).
+        let mut target = p.idx;
+        while target + 1 < p.frame_count && p.dec.pts_ms(target + 1) <= t {
+            target += 1;
+        }
+        // End of clip: stop on the last frame.
+        if t >= p.total_ms && target + 1 >= p.frame_count {
+            p.playing = false;
+            if !p.finished_announced {
+                p.finished_announced = true;
+                p.idx = target;
+                p.dec.seek_decode(target);
+                return true;
+            }
+            return false;
+        }
+        if target == p.idx {
+            return false;
+        }
+        // Advance **forward only** (never jump back to an old keyframe — that
+        // looped the first few frames when lag re-anchored to IDR #0).
+        // Cap steps per tick so a slow CABAC frame doesn't freeze the shell;
+        // if still behind after decode, re-anchor so play stays smooth at
+        // whatever rate we can sustain (not perfect realtime, but no rewind).
+        const MAX_DECODE_PER_TICK: usize = 2;
+        let goal = (p.idx + MAX_DECODE_PER_TICK).min(target).max(p.idx + 1);
+        let goal = goal.min(p.frame_count.saturating_sub(1));
+        if goal <= p.idx {
+            return false;
+        }
+        p.idx = goal;
+        let changed = p.dec.seek_decode(p.idx);
+        let pts = p.dec.pts_ms(p.idx);
+        if t > pts.saturating_add(100) {
+            // Behind the wall clock — snap media time forward (drop backlog),
+            // never snap backward to a previous keyframe.
+            p.base_ms = now.saturating_sub(pts);
+        }
+        changed
+    });
+    if present {
+        present_video_frame();
+    }
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn pump_video() {}
+
+/// Toggle play/pause on the video (space on the video tab).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn video_toggle_pause() {
+    let now = crate::arch::now_ms();
+    VIDEO.with(|v| {
+        if let Some(p) = v.as_mut() {
+            if p.playing {
+                p.paused_at = now.saturating_sub(p.base_ms);
+                p.playing = false;
+            } else {
+                p.base_ms = now.saturating_sub(p.paused_at);
+                p.playing = true;
+                p.finished_announced = false;
+            }
+        }
+    });
+    present_video_status();
+}
+
+/// Shared mute for audio + video tabs (`m`). Uses the global software mute so
+/// the next PCM chunk is silence; also mirrors into `VideoPlayer.muted` for the
+/// HUD when a video is loaded.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn media_toggle_mute() {
+    let m = crate::sound::toggle_mute();
+    VIDEO.with(|v| {
+        if let Some(p) = v.as_mut() {
+            p.muted = m;
+        }
+    });
+    present_video_status();
+    repaint_audio();
+}
+
+/// Shared volume adjust for audio + video tabs (↑/↓). Steps are percent points.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn media_volume_adjust(delta: i32) {
+    let v = crate::sound::volume_adjust(delta);
+    // Keep video HUD mute flag in sync if volume-up unmuted.
+    VIDEO.with(|vp| {
+        if let Some(p) = vp.as_mut() {
+            p.muted = crate::sound::muted();
+        }
+    });
+    let _ = v;
+    present_video_status();
+    repaint_audio();
+}
+
+/// Draw the video player's status bar into the surface tab: playback state,
+/// position/duration, mute, and the key-shortcut hints (mirrors the audio
+/// player's footer). No-op when the video tab isn't the focused surface.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn present_video_status() {
+    VIDEO.with(|v| {
+        if let Some(p) = v.as_ref() {
+            let pos = p.dec.pts_ms(p.idx);
+            // Prefer completed 1 s window; if still filling, show instant
+            // estimate from last inter-present gap.
+            let fps = if p.fps_display > 0 {
+                p.fps_display
+            } else if p.fps_window_frames > 0 {
+                let elapsed = crate::arch::now_ms().saturating_sub(p.fps_window_start_ms).max(1);
+                (p.fps_window_frames as u64 * 1000 / elapsed) as u32
+            } else {
+                0
+            };
+            crate::framebuffer::draw_video_status(
+                &p.name,
+                p.playing,
+                crate::sound::muted() || p.muted,
+                p.has_audio,
+                p.idx + 1,
+                p.frame_count,
+                pos,
+                p.total_ms,
+                crate::sound::volume(),
+                fps,
+            );
+        }
+    });
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn present_video_status() {}
+
+/// Seek the video by whole frames (arrows on the video tab).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn video_seek(delta: i64) {
+    let now = crate::arch::now_ms();
+    VIDEO.with(|v| {
+        if let Some(p) = v.as_mut() {
+            let n = p.frame_count as i64;
+            let ni = (p.idx as i64 + delta).clamp(0, n - 1) as usize;
+            p.idx = ni;
+            // Re-anchor the clock to the sought frame's pts.
+            let pts = p.dec.pts_ms(ni);
+            p.base_ms = now.saturating_sub(pts);
+            p.paused_at = pts;
+            p.finished_announced = false;
+            p.dec.seek_decode(ni);
+            // Keep audio cursor in lockstep with video pts.
+            if p.audio_rate > 0 {
+                p.audio_at = ((pts as u128) * p.audio_rate as u128 / 1000) as usize;
+                if let Some(pcm) = p.audio_pcm.as_ref() {
+                    p.audio_at = p.audio_at.min(pcm.len());
+                }
+            }
+        }
+    });
+    present_video_frame();
+}
+
+/// Restart the video from the first frame (0 / Home).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn video_restart() {
+    let now = crate::arch::now_ms();
+    VIDEO.with(|v| {
+        if let Some(p) = v.as_mut() {
+            p.idx = 0;
+            p.base_ms = now;
+            p.paused_at = 0;
+            p.playing = true;
+            p.finished_announced = false;
+            p.dec.seek_decode(0);
+            p.audio_at = 0;
+        }
+    });
+    present_video_frame();
+}
+
+/// Surface id the `/open` image viewer presents on (labelled "image" in the
+/// tab bar; distinct from any agent-allocated `synapse::ui` surface).
+#[cfg(not(feature = "server"))]
+const VIEWER_SURFACE: u32 = u32::MAX; // == framebuffer::IMAGE_SURFACE (labelled "image")
+
+/// The retained source image plus interactive view state (zoom / rotation /
+/// pan), so the image tab can be zoomed, rotated, and panned and repaints when
+/// you switch back to it (surfaces aren't otherwise backed). The source is
+/// capped to `IMAGE_MAX_PX` at load so a huge photo can't exhaust the heap
+/// while still holding enough detail for a few zoom steps.
+#[cfg(not(feature = "server"))]
+struct ImageTab {
+    src: crate::image::Image,
+    zoom: u32, // percent of fit-to-pane; 100 = fit
+    rot: u32,  // 90° quadrants clockwise
+    pan_x: i64,
+    pan_y: i64,
+}
+#[cfg(not(feature = "server"))]
+static IMAGE: crate::mm::Locked<Option<ImageTab>> = crate::mm::Locked::new(None);
+/// Cap the retained source image (≈16 MiB of u32) — bounds heap use for a huge
+/// photo; box-downscaled once at load, aspect preserved by halving.
+#[cfg(not(feature = "server"))]
+const IMAGE_MAX_PX: usize = 4_000_000;
+
+/// `/open <path>.png|.jpg` — decode and show an image in an action-pane tab.
+/// Reads from a mounted volume (`/mnt/...`) or the Synapse store; the decoded
+/// image is box-downscaled to the pane, then integer-upscaled/letterboxed by
+/// the compositor, and retained so switching back to the tab repaints it.
+#[cfg(not(feature = "server"))]
+fn view_image(path: &str) {
+    let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
+        serial_println!("open> {} not found under any mount or in the store (see /mounts)", path);
+        return;
+    };
+    let t0 = crate::arch::now_ms();
+    match crate::image::decode(&bytes) {
+        Ok(img) => {
+            let (iw, ih) = (img.w, img.h);
+            #[cfg(not(test))]
+            {
+                // Cap the retained source (halving preserves aspect) so a huge
+                // photo can't exhaust the heap.
+                let mut src = img;
+                let (mut nw, mut nh) = (src.w, src.h);
+                while nw * nh > IMAGE_MAX_PX {
+                    nw = nw.div_ceil(2);
+                    nh = nh.div_ceil(2);
+                }
+                if (nw, nh) != (src.w, src.h) {
+                    src = crate::image::resize(&src, nw, nh);
+                }
+                IMAGE.with(|s| *s = Some(ImageTab { src, zoom: 100, rot: 0, pan_x: 0, pan_y: 0 }));
+                // Open the tab and render the fitted view. Controls activate
+                // once the action pane is focused (Ctrl+Tab / click) — the same
+                // gating as pane scroll, so typing at the prompt is never eaten.
+                crate::framebuffer::set_right(crate::framebuffer::RightMode::Surface(VIEWER_SURFACE));
+                render_image();
+            }
+            #[cfg(test)]
+            drop(img);
+            serial_println!(
+                "open> {} — {}x{} px, {} KiB, decoded in {} ms  (Ctrl+Tab to focus, then +/- zoom, r/l rotate, arrows pan, 0 reset; /close hides)",
+                path,
+                iw,
+                ih,
+                bytes.len() / 1024,
+                crate::arch::now_ms().saturating_sub(t0)
+            );
+        }
+        Err(e) => serial_println!("open> cannot decode {}: {}", path, e),
+    }
+}
+
+/// Render the retained image at its current zoom/rotation/pan into the tab.
+/// Also the repaint-on-switch path (surfaces aren't otherwise backed).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn render_image() {
+    let (pw, ph) = crate::framebuffer::action_dims_px().unwrap_or((640, 480));
+    let bg = crate::framebuffer::pane_bg().unwrap_or(0);
+    IMAGE.with(|s| {
+        if let Some(t) = s.as_ref() {
+            let v = crate::image::render_view(&t.src, pw as usize, ph as usize, t.zoom, t.rot, t.pan_x, t.pan_y, bg);
+            crate::framebuffer::present_surface(VIEWER_SURFACE, v.w, v.h, &v.pixels);
+        }
+    });
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn render_image() {}
+#[cfg(not(test))]
+fn repaint_image() {
+    render_image();
+}
+
+/// Apply an interactive image-viewer command (zoom/rotate/pan/reset) and
+/// re-render the tab. No-op unless the image tab is loaded.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn image_cmd(c: u8) {
+    let (pw, ph) = crate::framebuffer::action_dims_px().unwrap_or((640, 480));
+    let (pw, ph) = (pw as i64, ph as i64);
+    IMAGE.with(|s| {
+        let Some(t) = s.as_mut() else { return };
+        // Pan step scales with the pane so it feels the same at any resolution.
+        let step = (pw / 6).max(16);
+        match c {
+            b'+' | b'=' => t.zoom = (t.zoom + 25).min(800),
+            b'-' | b'_' => t.zoom = t.zoom.saturating_sub(25).max(10),
+            b'r' | b'R' => {
+                t.rot = (t.rot + 1) % 4;
+                t.pan_x = 0;
+                t.pan_y = 0;
+            }
+            b'l' | b'L' => {
+                t.rot = (t.rot + 3) % 4;
+                t.pan_x = 0;
+                t.pan_y = 0;
+            }
+            b'0' => {
+                t.zoom = 100;
+                t.rot = 0;
+                t.pan_x = 0;
+                t.pan_y = 0;
+            }
+            // Arrow bytes forwarded as A/B/C/D: pan the image (only meaningful
+            // once zoomed past the pane).
+            b'A' => t.pan_y += step,
+            b'B' => t.pan_y -= step,
+            b'C' => t.pan_x += step,
+            b'D' => t.pan_x -= step,
+            _ => return,
+        }
+        // Clamp pan so the image can't be dragged entirely off the pane.
+        let (ow, oh) = if t.rot % 2 == 1 { (t.src.h, t.src.w) } else { (t.src.w, t.src.h) };
+        let (fw, fh) = crate::image::fit(ow, oh, pw as usize, ph as usize);
+        let dw = (fw as i64 * t.zoom as i64 / 100).max(1);
+        let dh = (fh as i64 * t.zoom as i64 / 100).max(1);
+        let maxx = (dw - pw).max(0) / 2 + pw / 4;
+        let maxy = (dh - ph).max(0) / 2 + ph / 4;
+        t.pan_x = t.pan_x.clamp(-maxx, maxx);
+        t.pan_y = t.pan_y.clamp(-maxy, maxy);
+    });
+    render_image();
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+#[allow(dead_code)]
+fn image_cmd(_c: u8) {}
+
+/// A background audio player: the decoded PCM plus a cursor. Lives in a static
+/// so playback continues while you switch tabs or run other commands — it is
+/// pumped one chunk at a time from `ui_tick` (`pump_audio`), like `/top`
+/// refreshes. `done` latches at end-of-track.
+#[cfg(not(feature = "server"))]
+struct AudioPlayer {
+    pcm: alloc::vec::Vec<i16>,
+    rate: u32,
+    at: usize,
+    name: String,
+    total_ms: u64,
+    done: bool,
+    paused: bool,
+    finished_announced: bool,
+    /// Peak envelope for the wave visualizer (`audio::waveform_peaks`).
+    peaks: alloc::vec::Vec<u8>,
+}
+#[cfg(not(feature = "server"))]
+static AUDIO: crate::mm::Locked<Option<AudioPlayer>> = crate::mm::Locked::new(None);
+
+/// `/open <path>.wav|.mp3|.aac` — decode (RIFF/WAVE, MPEG Layer III, or ADTS
+/// AAC) and play in the background at the file's own sample rate, in an
+/// "audio" action-pane tab.
+/// Non-blocking: it starts playback and returns; `pump_audio` (idle tick) feeds
+/// the device chunk by chunk, so switching tabs, editing, or running other
+/// commands never interrupts the track. `/close` (or Ctrl+C at the prompt)
+/// stops it.
+#[cfg(not(feature = "server"))]
+fn play_audio(path: &str) {
+    let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
+        serial_println!("open> {} not found under any mount or in the store (see /mounts)", path);
+        return;
+    };
+    let t0 = crate::arch::now_ms();
+    let audio = match crate::audio::decode(&bytes) {
+        Ok(a) => a,
+        Err(e) => {
+            serial_println!("open> cannot decode {}: {}", path, e);
+            return;
+        }
+    };
+    let total_ms = audio.duration_ms();
+    serial_println!(
+        "open> playing {} — {}:{:02} at {} Hz ({} KiB, decoded in {} ms)",
+        path,
+        total_ms / 60000,
+        total_ms % 60000 / 1000,
+        audio.rate,
+        bytes.len() / 1024,
+        crate::arch::now_ms().saturating_sub(t0)
+    );
+    if !crate::sound::is_up() {
+        serial_println!("open> no sound device — decoded OK but cannot play");
+        return;
+    }
+    serial_println!("open>   switch tabs freely, it keeps playing; Ctrl+Tab to focus then space=pause <-/->=seek up/dn=volume 0=restart m=mute; Ctrl+C or /close stops");
+    let name = path.rsplit('/').next().unwrap_or(path).to_string();
+    let peaks = crate::audio::waveform_peaks(&audio.pcm, crate::audio::WAVEFORM_BINS);
+    AUDIO.with(|a| {
+        *a = Some(AudioPlayer {
+            pcm: audio.pcm,
+            rate: audio.rate,
+            at: 0,
+            name,
+            total_ms,
+            done: false,
+            paused: false,
+            finished_announced: false,
+            peaks,
+        })
+    });
+    #[cfg(not(test))]
+    {
+        crate::framebuffer::set_right(crate::framebuffer::RightMode::Audio);
+        repaint_audio();
+    }
+}
+
+/// Whether a track is loaded (playing or paused at end).
+#[cfg(not(feature = "server"))]
+fn audio_loaded() -> bool {
+    AUDIO.with(|a| a.is_some())
+}
+
+/// Stop + unload the background track (Ctrl+C / closing the audio tab).
+#[cfg(not(feature = "server"))]
+fn stop_audio() {
+    let was = AUDIO.with(|a| a.take().is_some());
+    if was {
+        serial_println!("\ropen> audio stopped");
+    }
+}
+/// Headless build has no `/open` media player; the tab-close path still calls
+/// this generically, so provide a no-op.
+#[cfg(feature = "server")]
+fn stop_audio() {}
+
+/// Toggle play/pause on the background track (space key on the audio tab).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn audio_toggle_pause() {
+    AUDIO.with(|a| {
+        if let Some(p) = a.as_mut() {
+            p.paused = !p.paused;
+        }
+    });
+    repaint_audio();
+}
+
+/// Seek the background track by `delta_ms` (negative = rewind), clamped to the
+/// track. Takes effect after the device drains its already-queued ~200 ms.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn audio_seek(delta_ms: i64) {
+    AUDIO.with(|a| {
+        if let Some(p) = a.as_mut() {
+            let samples = delta_ms * p.rate as i64 / 1000;
+            let n = (p.at as i64 + samples).clamp(0, p.pcm.len() as i64) as usize;
+            p.at = n;
+            if p.at < p.pcm.len() {
+                p.done = false;
+                p.finished_announced = false;
+            }
+        }
+    });
+    repaint_audio();
+}
+
+/// Restart the background track from the beginning (0 / Home on the audio tab).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn audio_restart() {
+    AUDIO.with(|a| {
+        if let Some(p) = a.as_mut() {
+            p.at = 0;
+            p.done = false;
+            p.finished_announced = false;
+        }
+    });
+    repaint_audio();
+}
+
+/// Feed the next chunk to the sound device when it has drained the previous
+/// one — the background-player heartbeat, called every idle tick. Copies the
+/// chunk out before playing so the `AUDIO` lock isn't held across the device
+/// enqueue. No-op when nothing is loaded or the device is still draining.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn pump_audio() {
+    if crate::sound::playing() {
+        return; // still draining the last chunk
+    }
+    let next = AUDIO.with(|a| {
+        let p = a.as_mut()?;
+        if p.paused {
+            return None; // hold position; the device drains its last chunk to silence
+        }
+        if p.done || p.at >= p.pcm.len() {
+            p.done = true;
+            return None;
+        }
+        let chunk = (p.rate as usize / 5).max(256); // ~200 ms
+        let end = (p.at + chunk).min(p.pcm.len());
+        let slice = p.pcm[p.at..end].to_vec();
+        p.at = end;
+        Some((slice, p.rate))
+    });
+    if let Some((slice, rate)) = next {
+        let _ = crate::sound::play(&slice, rate);
+    }
+    // Announce end-of-track once.
+    let finished = AUDIO.with(|a| a.as_mut().map(|p| p.done && !p.finished_announced && !crate::sound::playing()).unwrap_or(false));
+    if finished {
+        AUDIO.with(|a| {
+            if let Some(p) = a.as_mut() {
+                p.finished_announced = true;
+            }
+        });
+        serial_println!("\ropen> audio finished");
+    }
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn pump_audio() {}
+
+/// Repaint the audio tab (progress). Called on switch + ~4 Hz while active.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn repaint_audio() {
+    AUDIO.with(|a| {
+        if let Some(p) = a.as_ref() {
+            let pos_ms = p.at as u64 * 1000 / p.rate.max(1) as u64;
+            crate::framebuffer::draw_audio(&crate::framebuffer::AudioView {
+                name: &p.name,
+                pos_ms: pos_ms.min(p.total_ms),
+                total_ms: p.total_ms,
+                rate: p.rate,
+                playing: !p.done && !p.paused,
+                paused: p.paused,
+                peaks: &p.peaks,
+                volume: crate::sound::volume(),
+                muted: crate::sound::muted(),
+            });
+        }
+    });
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn repaint_audio() {}
+
+/// `/clip [text]` — the shared clipboard. With no argument it prints the
+/// current contents; with text it sets the clipboard, which also pushes to the
+/// host clipboard via OSC 52 (`clipboard::set`). Copy in the editor/chat and it
+/// lands on the host; paste on the host and bracketed paste lands it here.
+fn run_clip(arg: &str) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        match crate::clipboard::get() {
+            Some((text, _)) => {
+                serial_println!("clip> {} byte(s):", text.len());
+                serial_println!("{}", text);
+                serial_println!("clip> (copy in the editor/chat syncs to the host; host paste syncs here)");
+            }
+            None => serial_println!("clip> empty (copy something, or paste from the host)"),
+        }
+    } else {
+        crate::clipboard::set(String::from(arg), false);
+        serial_println!("clip> set {} byte(s) + pushed to the host clipboard", arg.len());
+    }
 }
 
 /// `/shortcuts` — list the configured keyboard shortcuts (`shortcuts.json`).
@@ -3299,9 +6888,17 @@ fn disk_mounts() {
     });
 }
 
-/// List the root directory of a mounted volume (`/ls /mnt`). Shared FAT/ext4/
-/// FAT/ext4 readers over a partition view at the mount's LBA range.
+/// List the root directory of a mounted volume (`/ls /mnt`). Shared FAT/ext4
+/// readers over a partition view at the mount's LBA range.
+///
+/// When the mount is `/` (the auto-mounted data partition), prefer the live
+/// Synapse store tree — on-disk keys are flat percent-encoded names and are
+/// not a useful directory listing.
 fn ls_mount(mt: &Mount) {
+    if mt.path == "/" {
+        fs_ls("/");
+        return;
+    }
     use crate::fs::detect::FsType;
     let Some(mut dev) = crate::block::probe_disk_nth(mt.disk) else {
         serial_println!("ls> disk {} gone", mt.disk);
@@ -3330,13 +6927,20 @@ fn ls_mount(mt: &Mount) {
             match crate::block::ext4_read::Ext4Reader::open(&mut part) {
                 Some(mut r) => {
                     let entries = r.list_root();
-                    serial_println!("ls> {} ({}) root ({} entries):", mt.path, mt.fs.name(), entries.len());
-                    for (name, ino, is_dir) in entries {
-                        // Store files are written with `/` percent-encoded
-                        // (ext4 dir-entry names cannot contain `/`); show the
-                        // decoded key, not the raw %2F form.
+                    serial_println!(
+                        "ls> {} ({}) root ({} on-disk entries; hierarchical store: /ls /):",
+                        mt.path,
+                        mt.fs.name(),
+                        entries.len()
+                    );
+                    for (name, _ino, is_dir) in entries.into_iter().take(64) {
                         let shown = crate::block::ext4_store::key_decode(&name);
-                        serial_println!("  {}{}  (inode {})", shown, if is_dir { "/" } else { "" }, ino);
+                        let base = crate::synapse::vpath::basename(&shown);
+                        if is_dir {
+                            serial_println!("  {}/", base);
+                        } else {
+                            serial_println!("  {}", base);
+                        }
                     }
                 }
                 None => serial_println!("ls> {} unreadable", mt.path),
@@ -3346,8 +6950,564 @@ fn ls_mount(mt: &Mount) {
     }
 }
 
-/// `/cat <path>` — print a file from a mounted volume, e.g. `/cat /mnt/notes`.
-/// FAT + ext4 root files (one directory level, matching the mount model).
+// --- store filesystem commands (Linux-like over synapse::fs) -------------
+
+/// Parse flags from a shell arg line. Returns `(flags, positionals)`.
+fn fs_split_flags(arg: &str) -> (alloc::vec::Vec<char>, alloc::vec::Vec<alloc::string::String>) {
+    let mut flags = alloc::vec::Vec::new();
+    let mut pos = alloc::vec::Vec::new();
+    for tok in arg.split_whitespace() {
+        if tok == "--" {
+            continue;
+        }
+        if let Some(rest) = tok.strip_prefix('-') {
+            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphabetic()) {
+                for c in rest.chars() {
+                    flags.push(c);
+                }
+                continue;
+            }
+        }
+        pos.push(alloc::string::String::from(tok));
+    }
+    (flags, pos)
+}
+
+/// `/ls [path] [-l]` — hierarchical listing of the store (default `/`).
+/// Also: `/ls <n>` lists volume *n* on disk 0; `/ls /mnt` lists a non-store mount.
+fn fs_ls(arg: &str) {
+    let (flags, pos) = fs_split_flags(arg);
+    let long = flags.contains(&'l') || flags.contains(&'1');
+    let target = pos.first().map(|s| s.as_str()).unwrap_or("/");
+
+    // Numeric → legacy disk volume root listing.
+    if let Ok(n) = target.parse::<usize>() {
+        disk_ls_volume(n);
+        return;
+    }
+
+    let path = crate::synapse::vpath::normalize(target);
+
+    // A non-root disk mount (e.g. /mnt) still lists the volume's on-disk root.
+    // The auto-mounted data partition at `/` is the Synapse store — list that
+    // hierarchically so we never dump every percent-encoded key as a "file".
+    if path != "/" {
+        if let Some(mt) = mount_lookup(&path) {
+            ls_mount(&mt);
+            return;
+        }
+    }
+
+    // Store hierarchical listing.
+    use crate::synapse::fs as store;
+    use crate::synapse::vpath::{self, EntryClass};
+
+    match store::classify(&path) {
+        None => {
+            // Fall back: maybe a path under a disk mount (FAT/ext4 volume).
+            if read_mounted(&path).is_some() {
+                serial_println!("ls> {}: is a file (use /cat)", path);
+            } else {
+                serial_println!("ls> {}: no such file or directory", path);
+            }
+        }
+        Some(EntryClass::File) => {
+            let sz = store::size_of(&path).unwrap_or(0);
+            serial_println!("ls> {}  ({} bytes)", path, sz);
+        }
+        Some(EntryClass::Dir) => {
+            let entries = store::list_dir(&path);
+            serial_println!("ls> {}  ({} entries)", path, entries.len());
+            if entries.is_empty() {
+                return;
+            }
+            for e in &entries {
+                if long {
+                    serial_println!("  {}", vpath::format_long(e));
+                } else {
+                    serial_println!("  {}", vpath::format_short(e));
+                }
+            }
+        }
+    }
+}
+
+/// `/cat <path>` — print a store file (preferred) or a mounted-volume file.
+fn fs_cat(arg: &str) {
+    let full = crate::synapse::vpath::normalize(arg.trim());
+    if full.is_empty() || arg.trim().is_empty() {
+        serial_println!("cat> usage: /cat <path>");
+        return;
+    }
+    if crate::synapse::fs::is_dir(&full) {
+        serial_println!("cat> {}: is a directory", full);
+        return;
+    }
+    // Prefer the live store (agent homes, configs, downloads); then mounts.
+    let data = crate::synapse::fs::read(&full).or_else(|| read_mounted(&full));
+    match data {
+        Some(bytes) => {
+            serial_println!("cat> {} ({} bytes):", full, bytes.len());
+            match core::str::from_utf8(&bytes) {
+                Ok(s) => match crate::highlight::lang_for_path(&full) {
+                    Some(lang) => {
+                        let mut st = crate::highlight::State::default();
+                        for line in s.lines() {
+                            serial_println!("{}", crate::highlight::ansi_line(lang, line, &mut st));
+                        }
+                    }
+                    None => serial_println!("{}", s),
+                },
+                Err(_) => serial_println!("(binary; {} bytes)", bytes.len()),
+            }
+        }
+        None => serial_println!("cat> {} not found (store or mounts; see /ls, /mounts)", full),
+    }
+}
+
+/// `/grep <query> [path_glob]` — content search over the store.
+fn fs_grep(arg: &str) {
+    let mut parts = arg.split_whitespace();
+    let Some(query) = parts.next() else {
+        serial_println!("grep> usage: /grep <query> [path_glob]");
+        return;
+    };
+    let path_glob = parts.next().unwrap_or("");
+    let mut paths = crate::synapse::fs::list();
+    if !path_glob.is_empty() {
+        paths = crate::tools::pathutil::glob_filter(path_glob, &paths);
+    }
+    let mut files: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> = alloc::vec::Vec::new();
+    for p in paths {
+        if let Some(bytes) = crate::synapse::fs::read(&p) {
+            files.push((p, alloc::string::String::from_utf8_lossy(&bytes).into_owned()));
+        }
+    }
+    let hits = crate::tools::pathutil::grep_files(query, &files, 50);
+    if hits.is_empty() {
+        serial_println!("grep> no matches for {:?}", query);
+        return;
+    }
+    serial_println!("grep> {} hit(s) for {:?}:", hits.len(), query);
+    for h in hits {
+        serial_println!("  {}:{}:{}", h.path, h.line, h.text);
+    }
+}
+
+/// `/glob <pattern>` — path glob over the store.
+fn fs_glob(arg: &str) {
+    let pattern = arg.trim();
+    if pattern.is_empty() {
+        serial_println!("glob> usage: /glob <pattern>   e.g. /glob **/*.md");
+        return;
+    }
+    let paths = crate::synapse::fs::list();
+    let hits = crate::tools::pathutil::glob_filter(pattern, &paths);
+    serial_println!("glob> {} match(es) for {:?}:", hits.len(), pattern);
+    for p in hits {
+        serial_println!("  {}", p);
+    }
+}
+
+/// `/mkdir [-p] <path>` — create a store directory (`.keep` marker).
+fn fs_mkdir(arg: &str) {
+    let (flags, pos) = fs_split_flags(arg);
+    let parents = flags.contains(&'p');
+    let Some(path) = pos.first() else {
+        serial_println!("mkdir> usage: /mkdir [-p] <path>");
+        return;
+    };
+    match crate::synapse::fs::mkdir(path, parents) {
+        Ok(()) => serial_println!("mkdir> {}", crate::synapse::vpath::normalize(path)),
+        Err(e) => serial_println!("mkdir> {}: {}", path, e),
+    }
+}
+
+/// `/cp [-r] <src> <dst>` — copy file or tree in the store.
+fn fs_cp(arg: &str) {
+    let (flags, pos) = fs_split_flags(arg);
+    let recursive = flags.contains(&'r') || flags.contains(&'R');
+    if pos.len() < 2 {
+        serial_println!("cp> usage: /cp [-r] <src> <dst>");
+        return;
+    }
+    let src = &pos[0];
+    let dst = &pos[1];
+    match crate::synapse::fs::copy(src, dst, recursive) {
+        Ok(n) => serial_println!("cp> {} → {} ({} file(s))", src, dst, n),
+        Err(e) => serial_println!("cp> {}: {}", src, e),
+    }
+}
+
+/// `/mv <src> <dst>` — rename/move in the store.
+fn fs_mv(arg: &str) {
+    let (_flags, pos) = fs_split_flags(arg);
+    if pos.len() < 2 {
+        serial_println!("mv> usage: /mv <src> <dst>");
+        return;
+    }
+    let src = &pos[0];
+    let dst = &pos[1];
+    match crate::synapse::fs::rename(src, dst) {
+        Ok(n) => serial_println!("mv> {} → {} ({} file(s))", src, dst, n),
+        Err(e) => serial_println!("mv> {}: {}", src, e),
+    }
+}
+
+/// `/rm [-r] <path>` — remove a store file or tree.
+fn fs_rm(arg: &str) {
+    let (flags, pos) = fs_split_flags(arg);
+    let recursive = flags.contains(&'r') || flags.contains(&'R');
+    let Some(path) = pos.first() else {
+        serial_println!("rm> usage: /rm [-r] <path>");
+        return;
+    };
+    match crate::synapse::fs::remove(path, recursive) {
+        Ok(n) => serial_println!("rm> {} ({} file(s))", path, n),
+        Err(e) => serial_println!("rm> {}: {}", path, e),
+    }
+}
+
+/// `/touch <path>` — create empty file or refresh existing.
+fn fs_touch(arg: &str) {
+    let path = arg.trim();
+    if path.is_empty() {
+        serial_println!("touch> usage: /touch <path>");
+        return;
+    }
+    match crate::synapse::fs::touch(path) {
+        Ok(()) => serial_println!("touch> {}", crate::synapse::vpath::normalize(path)),
+        Err(e) => serial_println!("touch> {}: {}", path, e),
+    }
+}
+
+/// `/channel` — manage external messaging channels (Telegram first; generic
+/// backends). OpenClaw-style: add a bot, start polling, pair/allow senders,
+/// send/reply. Inbound text with `auto_agent` is answered by the shell agent.
+fn run_channel(arg: &str) {
+    use crate::msgchan::{self, DmPolicy, Kind};
+    let mut parts = arg.split_whitespace();
+    let sub = parts.next().unwrap_or("");
+    match sub {
+        "" | "list" | "ls" => {
+            let all = msgchan::list();
+            if all.is_empty() {
+                serial_println!("channel> (none) — /channel add telegram <name> <bot_token>");
+                serial_println!("channel> types: {}", msgchan::types().join(", "));
+                return;
+            }
+            serial_println!("channel> {} instance(s):", all.len());
+            for i in all {
+                let st = if i.running { "running" } else { "stopped" };
+                let err = i
+                    .last_error
+                    .as_deref()
+                    .map(|e| alloc::format!(" err={e}"))
+                    .unwrap_or_default();
+                serial_println!(
+                    "  {:<12} {:<10} {:<8} policy={} allow={} auto_agent={}{err}",
+                    i.name,
+                    i.kind.as_str(),
+                    st,
+                    i.policy.as_str(),
+                    i.allow_from.len(),
+                    i.auto_agent
+                );
+            }
+        }
+        "types" => {
+            serial_println!("channel> backends: {}", msgchan::types().join(", "));
+            serial_println!("channel> add more kinds in msgchan::Kind without changing this command");
+        }
+        "add" => {
+            // /channel add telegram <name> <token> [pairing|allowlist|open]
+            let kind_s = parts.next().unwrap_or("");
+            let name = parts.next().unwrap_or("");
+            let token = parts.next().unwrap_or("");
+            let pol_s = parts.next().unwrap_or("pairing");
+            let Some(kind) = Kind::parse(kind_s) else {
+                serial_println!("channel> usage: /channel add <type> <name> <token> [pairing|allowlist|open]");
+                serial_println!("channel> types: {}", msgchan::types().join(", "));
+                return;
+            };
+            let policy = DmPolicy::parse(pol_s).unwrap_or(DmPolicy::Pairing);
+            match msgchan::add(name, kind, token, policy) {
+                Ok(()) => serial_println!(
+                    "channel> added '{}' ({}, policy={}) — /channel start {name}",
+                    name,
+                    kind.as_str(),
+                    policy.as_str()
+                ),
+                Err(e) => serial_println!("channel> add failed: {e}"),
+            }
+        }
+        "remove" | "rm" => {
+            let name = parts.next().unwrap_or("");
+            if name.is_empty() {
+                serial_println!("channel> usage: /channel remove <name>");
+                return;
+            }
+            match msgchan::remove(name) {
+                Ok(()) => serial_println!("channel> removed '{name}'"),
+                Err(e) => serial_println!("channel> {e}"),
+            }
+        }
+        "start" => {
+            let name = parts.next().unwrap_or("");
+            if name.is_empty() {
+                serial_println!("channel> usage: /channel start <name>");
+                return;
+            }
+            serial_println!("channel> starting '{name}' (HTTPS to api.telegram.org; Ctrl+C cancels)…");
+            match msgchan::start(name) {
+                Ok(()) => {
+                    serial_println!(
+                        "channel> '{name}' started — polling every ~2.5s in the background"
+                    );
+                    serial_println!(
+                        "channel> DM the bot, then /channel pair {name} <CODE> (or /channel status)"
+                    );
+                }
+                Err(e) => serial_println!("channel> start failed: {e}"),
+            }
+        }
+        "stop" => {
+            let name = parts.next().unwrap_or("");
+            if name.is_empty() {
+                serial_println!("channel> usage: /channel stop <name>");
+                return;
+            }
+            match msgchan::stop(name) {
+                Ok(()) => serial_println!("channel> '{name}' stopped"),
+                Err(e) => serial_println!("channel> {e}"),
+            }
+        }
+        "status" => {
+            let name = parts.next();
+            let mut any = false;
+            for i in msgchan::list() {
+                if name.is_some_and(|n| n != i.name) {
+                    continue;
+                }
+                any = true;
+                serial_println!(
+                    "channel> {}  kind={}  {}  policy={}  offset={}  allow_from={:?}",
+                    i.name,
+                    i.kind.as_str(),
+                    if i.running { "running" } else { "stopped" },
+                    i.policy.as_str(),
+                    i.offset,
+                    i.allow_from
+                );
+                if let Some(p) = &i.last_peer {
+                    serial_println!("  last_peer={p}");
+                }
+                if let Some((code, uid, disp)) = &i.pending_pair {
+                    serial_println!(
+                        "  pending_pair: code={code}  from={disp} ({uid})  →  /channel pair {} {code}",
+                        i.name
+                    );
+                }
+                if let Some(e) = &i.last_error {
+                    serial_println!("  last_error={e}");
+                }
+            }
+            if !any {
+                serial_println!("channel> (no matching instance)");
+            }
+            let q = msgchan::inbound_len();
+            if q > 0 {
+                serial_println!("channel> {} inbound message(s) queued for the agent", q);
+            }
+            if name.is_none() || any {
+                serial_println!(
+                    "channel> polls every ~2.5s while the prompt is idle; /channel poll [name] forces one now"
+                );
+            }
+        }
+        "allow" => {
+            let name = parts.next().unwrap_or("");
+            let uid = parts.next().unwrap_or("");
+            if name.is_empty() || uid.is_empty() {
+                serial_println!("channel> usage: /channel allow <name> <user_id|*>");
+                return;
+            }
+            match msgchan::allow(name, uid) {
+                Ok(()) => {
+                    serial_println!("channel> '{name}' allows {uid}");
+                    // Catch up on DMs that arrived before allow (offset may
+                    // still be 0 — Telegram buffers recent updates).
+                    serial_println!("channel> fetching pending updates…");
+                    msgchan::poll_now(Some(name));
+                }
+                Err(e) => serial_println!("channel> {e}"),
+            }
+        }
+        "pair" => {
+            // /channel pair <name> <code>  — CODE is the 4 hex digits the bot
+            // sends (e.g. AB12), NOT your Telegram user id.
+            let name = parts.next().unwrap_or("");
+            let code = parts.next().unwrap_or("");
+            if name.is_empty() || code.is_empty() {
+                serial_println!("channel> usage: /channel pair <name> <CODE>");
+                serial_println!(
+                    "channel> CODE = 4 hex digits from the bot DM (e.g. AB12), not your user id"
+                );
+                serial_println!(
+                    "channel> if there is no code yet: DM the bot, wait a few seconds, /channel status"
+                );
+                return;
+            }
+            match msgchan::pair_approve(name, code) {
+                Ok(uid) => serial_println!("channel> paired {uid} on '{name}'"),
+                Err(e) => {
+                    serial_println!("channel> pair failed: {e}");
+                    if e == "no pending pair" {
+                        serial_println!(
+                            "channel> tip: use /channel allow {name} <user_id> if you already know your Telegram id"
+                        );
+                        serial_println!(
+                            "channel> pairing only appears after a DM is *received* (polling must be running)"
+                        );
+                    }
+                }
+            }
+        }
+        "poll" => {
+            // Force an immediate getUpdates round (debug / catch-up).
+            let name = parts.next();
+            serial_println!("channel> polling…");
+            msgchan::poll_now(name);
+            serial_println!("channel> poll done — /channel status");
+        }
+        "send" => {
+            // /channel send <name> <peer> <text…>
+            let name = parts.next().unwrap_or("");
+            let peer = parts.next().unwrap_or("");
+            let text: alloc::string::String = parts.collect::<alloc::vec::Vec<_>>().join(" ");
+            if name.is_empty() || peer.is_empty() || text.is_empty() {
+                serial_println!("channel> usage: /channel send <name> <peer_id> <text>");
+                return;
+            }
+            match msgchan::send(name, peer, &text) {
+                Ok(()) => serial_println!("channel> sent to {peer} via '{name}'"),
+                Err(e) => serial_println!("channel> send failed: {e}"),
+            }
+        }
+        "reply" => {
+            let name = parts.next().unwrap_or("");
+            let text: alloc::string::String = parts.collect::<alloc::vec::Vec<_>>().join(" ");
+            if name.is_empty() || text.is_empty() {
+                serial_println!("channel> usage: /channel reply <name> <text>");
+                return;
+            }
+            match msgchan::reply(name, &text) {
+                Ok(()) => serial_println!("channel> replied on '{name}'"),
+                Err(e) => serial_println!("channel> reply failed: {e}"),
+            }
+        }
+        "help" | _ => {
+            serial_println!("channel> messaging channels (generic; Telegram first):");
+            serial_println!("  /channel [list]                     list instances");
+            serial_println!("  /channel types                      available backends");
+            serial_println!("  /channel add telegram <name> <tok>  [pairing|allowlist|open]");
+            serial_println!("  /channel start|stop|remove <name>");
+            serial_println!("  /channel status [name]");
+            serial_println!("  /channel allow <name> <user_id|*>");
+            serial_println!("  /channel pair <name> <CODE>         approve a DM pairing");
+            serial_println!("  /channel send <name> <peer> <text>");
+            serial_println!("  /channel reply <name> <text>        reply to last inbound");
+            serial_println!("  /channel poll [name]                force getUpdates now");
+            serial_println!("  config: {}", msgchan::CONFIG_PATH);
+        }
+    }
+}
+
+/// Strip light markdown so Telegram gets plain text (the model often emits
+/// `**bold**` despite the system prompt).
+fn strip_md_light(s: &str) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        // **bold** or *italic* or `code`
+        if b[i] == b'*' || b[i] == b'`' || b[i] == b'_' {
+            // skip run of the same marker
+            let m = b[i];
+            while i < b.len() && b[i] == m {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Drain inbound messaging-channel queue: each message becomes a shell-agent
+/// turn; the reply is sent back on the same channel. Called from the interactive
+/// loop (not from upkeep — inference is too heavy for the poll tick).
+fn drain_channel_inbound(
+    chat: &mut Option<ChatSession>,
+    session: &mut crate::agent::types::Session,
+) {
+    // Process a bounded number per loop so the prompt stays responsive.
+    for _ in 0..3 {
+        let Some(msg) = crate::msgchan::take_inbound() else {
+            break;
+        };
+        serial_println!(
+            "channel[{}] → agent: {} says: {}",
+            msg.channel,
+            msg.from_name,
+            msg.text
+        );
+        // Ensure a chat session exists.
+        if chat.is_none() {
+            let mut spin = Spinner::new("channel");
+            *chat = ChatSession::load(&mut spin);
+            if let Some(c) = chat.as_mut() {
+                c.hydrate_from_session(session);
+            }
+        }
+        let Some(sess) = chat.as_mut() else {
+            let _ = crate::msgchan::send(
+                &msg.channel,
+                &msg.peer_id,
+                "Chitti: no local model loaded — cannot auto-reply. Use /channel reply from the console, or /model load.",
+            );
+            continue;
+        };
+        // Frame the turn so a small model stays on *this* message (not the
+        // previous one) and uses tools for OS facts instead of inventing them.
+        let user = alloc::format!(
+            "Message from Telegram user {} (channel {}).\n\
+             Answer ONLY the latest user message below. Do not continue an earlier topic.\n\
+             If the question needs machine state (disks, files, network, time), call the right tool first; never invent those facts.\n\
+             For simple math or greetings, answer directly in one short plain-text reply (no markdown).\n\
+             \n\
+             User message:\n{}",
+            msg.from_name, msg.channel, msg.text
+        );
+        let reply = sess.turn(&user, session);
+        let reply = strip_md_light(reply.trim());
+        let reply = reply.trim();
+        if reply.is_empty() {
+            let _ = crate::msgchan::send(
+                &msg.channel,
+                &msg.peer_id,
+                "(no reply — try again or check /think /model on the console)",
+            );
+            continue;
+        }
+        serial_println!("channel[{}] ← agent: {}", msg.channel, reply);
+        if let Err(e) = crate::msgchan::send(&msg.channel, &msg.peer_id, reply) {
+            serial_println!("channel> delivery failed: {e}");
+        }
+    }
+}
+
 /// Scan every disk + volume for the first readable root file named one of
 /// `names` (FAT or ext4). Independent of `/mount`, so it finds a bundled voice
 /// model on the FAT ESP (aarch64) or the ext4 data partition regardless of what
@@ -3411,27 +7571,6 @@ fn read_mounted(full: &str) -> Option<alloc::vec::Vec<u8>> {
     }
 }
 
-fn disk_cat(arg: &str) {
-    let full = arg.trim();
-    if let Some(mt) = MOUNTS.with(|m| m.iter().find(|mt| full == mt.path).cloned()) {
-        let _ = mt;
-        serial_println!("cat> {} is a mount point, not a file", full);
-        return;
-    }
-    let data = read_mounted(full);
-    match data {
-        Some(bytes) => {
-            serial_println!("cat> {} ({} bytes):", full, bytes.len());
-            // Print as UTF-8 text if it is, else note it's binary.
-            match core::str::from_utf8(&bytes) {
-                Ok(s) => serial_println!("{}", s),
-                Err(_) => serial_println!("(binary; {} bytes)", bytes.len()),
-            }
-        }
-        None => serial_println!("cat> {} not found under any mount (see /mounts)", full),
-    }
-}
-
 fn disk_list() {
     use crate::block::BlockDevice;
     // Enumerate every block device, not just the boot disk: a machine can have
@@ -3469,18 +7608,9 @@ fn disk_list() {
     serial_println!("  ({} disk(s); /ls <n> reads a volume on disk 0; foreign filesystems are read-only)", found);
 }
 
-fn disk_ls(arg: &str) {
+/// List volume `n` on disk 0 (on-disk root; for debugging real FAT/ext4 layouts).
+fn disk_ls_volume(n: usize) {
     use crate::fs::detect::FsType;
-    // A path argument (e.g. `/ls /mnt`) lists a mounted volume's root.
-    let a = arg.trim();
-    if a.starts_with('/') {
-        match mount_lookup(a) {
-            Some(mt) => ls_mount(&mt),
-            None => serial_println!("ls> {} not mounted (see /mounts, or /mount <disk>)", a),
-        }
-        return;
-    }
-    let n: usize = a.parse().unwrap_or(0);
     let Some(mut dev) = crate::block::probe_disk() else {
         serial_println!("ls> no block device");
         return;
@@ -3513,25 +7643,31 @@ fn disk_ls(arg: &str) {
             match crate::block::ext4_read::Ext4Reader::open(&mut part) {
                 Some(mut r) => {
                     let entries = r.list_root();
-                    serial_println!("ls> {} volume {} root ({} entries):", v.fs.name(), n, entries.len());
-                    for (name, ino, is_dir) in entries {
-                        // Show store keys decoded (the ext4 store percent-
-                        // encodes `/` in dir-entry names), not the raw %2F.
+                    // Data-partition keys are percent-encoded flat names; show
+                    // a hierarchical store view when this volume is the live store.
+                    serial_println!(
+                        "ls> {} volume {} root ({} on-disk entries; use /ls / for the store tree):",
+                        v.fs.name(),
+                        n,
+                        entries.len()
+                    );
+                    for (name, ino, is_dir) in entries.into_iter().take(32) {
                         let shown = crate::block::ext4_store::key_decode(&name);
-                        if is_dir {
-                            serial_println!("  {}/  (inode {})", shown, ino);
-                        } else {
-                            serial_println!("  {}  (inode {})", shown, ino);
-                        }
+                        let base = crate::synapse::vpath::basename(&shown);
+                        serial_println!(
+                            "  {}{}  (inode {})",
+                            base,
+                            if is_dir { "/" } else { "" },
+                            ino
+                        );
                     }
                 }
                 None => serial_println!("ls> ext volume unreadable"),
             }
         }
         other => serial_println!(
-            "ls> volume {} is {} -- detected read-only; directory listing not implemented for {}",
+            "ls> volume {} is {} -- directory listing not implemented",
             n,
-            other.name(),
             other.name()
         ),
     }
@@ -3942,30 +8078,75 @@ fn disk_ext4read() {
 mod agent_flow_tests {
     use super::*;
 
-    /// The agent chat flow parses the Qwen `<tool_call>` JSON: name + flattened
-    /// `args`. A leading `/` on the name is stripped (models drift into `/ls`).
+    /// The agent chat flow parses the Qwen `<tool_call>` JSON into a Router-ready
+    /// args object (not a flattened shell line). A leading `/` on the name is
+    /// stripped (models drift into `/ls`).
     #[test_case]
     fn parse_tool_call_qwen_json() {
         let (name, args) = parse_tool_call("<tool_call>{\"name\": \"ls\", \"arguments\": {\"args\": \"/mnt\"}}</tool_call>").unwrap();
         assert_eq!(name, "ls");
-        assert_eq!(args, "/mnt");
-        // A bare-string arguments value is used as-is; a leading slash is dropped.
+        assert!(args.contains("\"args\""), "got {args}");
+        assert!(args.contains("/mnt"), "got {args}");
+        // Bare-string arguments → wrapped as {"args":"…"}.
         let (name, args) = parse_tool_call("thinking...\n<tool_call>{\"name\": \"/ping\", \"arguments\": \"1.1.1.1\"}</tool_call>").unwrap();
         assert_eq!(name, "ping");
-        assert_eq!(args, "1.1.1.1");
-        // spawn_subagent (delegation) with a task string.
+        assert!(args.contains("1.1.1.1"), "got {args}");
+        // spawn_subagent keeps the object (task field).
         let (name, args) = parse_tool_call("<tool_call>{\"name\":\"spawn_subagent\",\"arguments\":{\"task\":\"read notes\"}}</tool_call>").unwrap();
         assert_eq!(name, "spawn_subagent");
-        assert_eq!(args, "read notes");
+        assert!(args.contains("\"task\""), "got {args}");
+        assert!(args.contains("read notes"), "got {args}");
+        // memory_add keeps key + value as a JSON object for the Router.
+        let (name, args) = parse_tool_call(
+            "<tool_call>{\"name\":\"memory_add\",\"arguments\":{\"key\":\"colour\",\"value\":\"teal\"}}</tool_call>",
+        )
+        .unwrap();
+        assert_eq!(name, "memory_add");
+        assert!(args.contains("\"key\""), "got {args}");
+        assert!(args.contains("colour"), "got {args}");
+        assert!(args.contains("teal"), "got {args}");
+        let (name, args) =
+            parse_tool_call("<tool_call>{\"name\":\"memory_get\",\"arguments\":{\"key\":\"colour\"}}</tool_call>").unwrap();
+        assert_eq!(name, "memory_get");
+        assert!(args.contains("colour"), "got {args}");
     }
 
     #[test_case]
     fn parse_tool_call_legacy_and_none() {
-        // Legacy `TOOL:` fallback (older prompt drift).
+        // Legacy `TOOL:` fallback (older prompt drift) → JSON-wrapped args.
         let (name, args) = parse_tool_call("TOOL: /disks").unwrap();
-        assert_eq!((name.as_str(), args.as_str()), ("disks", ""));
+        assert_eq!(name, "disks");
+        assert!(args == "{}" || args.contains("args"), "got {args}");
         // Plain prose (a normal answer / greeting) → no tool call.
         assert!(parse_tool_call("Hello! How can I help you today?").is_none());
+    }
+
+    /// normalize_tool_args_json recovers multi-key memory payloads and wraps
+    /// bare shell lines for the Router.
+    #[test_case]
+    fn normalize_tool_args_for_router() {
+        assert_eq!(normalize_tool_args_json("list", ""), "{}");
+        assert!(normalize_tool_args_json("datetime", "tz +5:30").contains("tz +5:30"));
+        let mem = normalize_tool_args_json("memory_add", "colour\u{1f}teal");
+        assert!(mem.contains("\"key\""), "{mem}");
+        assert!(mem.contains("teal"), "{mem}");
+        // Already-JSON is passed through.
+        assert_eq!(normalize_tool_args_json("read", r#"{"path":"x"}"#), r#"{"path":"x"}"#);
+    }
+
+    /// `poll_interrupt` (the cancel-poll for running commands like `/http`)
+    /// interrupts on Ctrl+C only, and pushes any other byte back so it isn't
+    /// stolen from the input stream — the fix that keeps a streaming command from
+    /// eating the next command's keystrokes.
+    #[test_case]
+    fn poll_interrupt_ctrl_c_only_and_pushes_back() {
+        // Ctrl+C (0x03) → interrupt.
+        crate::console::unread(0x03);
+        assert!(poll_interrupt());
+        // A non-Ctrl+C byte → no interrupt, and it survives for the next read.
+        crate::console::unread(b'x');
+        assert!(!poll_interrupt());
+        assert_eq!(crate::console::read_byte(), Some(b'x'));
     }
 
     /// The system prompt advertises only the small CORE set + search_tools —
@@ -4000,13 +8181,91 @@ mod agent_flow_tests {
     }
 
     #[test_case]
+    fn http_args_download_flags() {
+        let a = parse_http_args(&tokenize_args("-O http://h/dir/pic.png"));
+        assert!(a.save_auto && a.save_path.is_none() && a.err.is_none());
+        let a = parse_http_args(&tokenize_args("-o out.bin http://h/x"));
+        assert_eq!(a.save_path.as_deref(), Some("out.bin"));
+        assert!(!a.save_auto);
+        assert!(parse_http_args(&tokenize_args("http://h/x -o")).err.is_some(), "-o needs a value");
+    }
+
+    #[test_case]
+    fn url_basename_extraction() {
+        assert_eq!(url_basename("http://h:8080/a/b/pic.png?x=1#f"), Some("pic.png"));
+        assert_eq!(url_basename("https://h/file.tar.gz"), Some("file.tar.gz"));
+        assert_eq!(url_basename("http://host"), None, "no path at all");
+        assert_eq!(url_basename("http://host/"), None, "trailing slash");
+        assert_eq!(url_basename("http://host/a/"), None);
+        assert_eq!(url_basename("host/plain.txt"), Some("plain.txt"), "schemeless");
+    }
+
+    #[test_case]
     fn system_prompt_is_compact_with_search_tools() {
-        let toolset: alloc::vec::Vec<String> = alloc::vec!["ls".into(), "cat".into(), "help".into(), "wifi".into()];
+        let toolset: alloc::vec::Vec<String> =
+            alloc::vec!["read".into(), "write".into(), "help".into(), "wifi".into(), "datetime".into()];
         let p = tools_system_prompt("You are Chitti.", &toolset);
         assert!(p.contains("search_tools"), "must advertise the discovery tool");
-        assert!(p.contains("- ls "), "core tools are listed");
+        assert!(p.contains("- read "), "core FS tools are listed");
+        assert!(p.contains("- write "), "core FS tools are listed");
+        assert!(p.contains("- datetime "), "core probe tools are listed");
         // `help`/`wifi` are NOT core, so they stay out of the inline prompt.
         assert!(!p.contains("- help "), "non-core tools are found via search_tools, not listed");
         assert!(!p.contains("- wifi "));
+    }
+
+    /// Memory tools are CORE (listed inline) when the agent toolset includes them.
+    #[test_case]
+    fn system_prompt_lists_memory_tools() {
+        let toolset: alloc::vec::Vec<String> = alloc::vec![
+            "read".into(),
+            "memory_add".into(),
+            "memory_get".into(),
+            "memory_list".into(),
+            "memory_search".into(),
+            "todo_write".into(),
+            "glob".into(),
+            "grep".into(),
+        ];
+        let p = tools_system_prompt("You are Chitti.", &toolset);
+        assert!(p.contains("- memory_add "), "memory_add is core");
+        assert!(p.contains("- memory_get "), "memory_get is core");
+        assert!(p.contains("- memory_list "), "memory_list is core");
+        assert!(p.contains("- memory_search "), "memory_search is core");
+        assert!(p.contains("- todo_write "), "todo_write is core");
+        assert!(p.contains("- glob "), "glob is core");
+        assert!(p.contains("- grep "), "grep is core");
+        assert!(
+            p.contains("key/value") || p.contains("path/content"),
+            "prompt documents tool arg shapes"
+        );
+    }
+
+    /// `/memory` shell surface + the chat-flattened tool path share one store.
+    #[test_case]
+    fn memory_shell_cmd_roundtrips_via_dispatch() {
+        // Empty list on a fresh agent id path still prints the memory> prefix.
+        let out = run_tool_command("memory", "list");
+        assert!(out.contains("memory>"), "list output: {out}");
+        let out = run_tool_command("memory", "add e2e_unit teal-42");
+        assert!(out.contains("ok:"), "add output: {out}");
+        let out = run_tool_command("memory", "get e2e_unit");
+        assert!(out.contains("teal-42"), "get output: {out}");
+        let out = run_tool_command("memory", "list");
+        assert!(out.contains("e2e_unit"), "list after add: {out}");
+        let out = run_tool_command("memory", "get missing_zzz");
+        assert!(out.contains("no memory"), "miss output: {out}");
+        // Bad key is rejected, not written.
+        let out = run_tool_command("memory", "add ../x secret");
+        assert!(out.contains("error:"), "traversal: {out}");
+    }
+
+    /// `search_tools` discovers the memory tools by keyword.
+    #[test_case]
+    fn search_tools_finds_memory() {
+        let out = search_tools("memory");
+        assert!(out.contains("memory_add"), "search: {out}");
+        assert!(out.contains("memory_get"), "search: {out}");
+        assert!(out.contains("memory_list"), "search: {out}");
     }
 }

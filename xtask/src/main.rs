@@ -25,6 +25,11 @@ enum Model {
     Qwen2B,
     Qwen4B,
     Qwen9B,
+    /// Any GGUF by path (`-model path/to/file.gguf`): the kernel derives the
+    /// architecture/config from the file itself, so xtask only needs the path
+    /// and a derived guest-RAM size (leaked `'static` strs — xtask is a
+    /// short-lived host process).
+    Custom { path: &'static str, mem: &'static str },
 }
 
 impl Model {
@@ -35,6 +40,9 @@ impl Model {
             Model::Qwen2B => &["model-2b"],
             Model::Qwen4B => &["model-4b"],
             Model::Qwen9B => &["model-9b"],
+            // The default tier (1 GiB heap) fits every model: guest RAM is
+            // derived from the file size, and the heap sits at the top of it.
+            Model::Custom { .. } => &[],
         }
     }
     /// The GGUF file bundled for this model (relative to the repo root).
@@ -44,6 +52,7 @@ impl Model {
             Model::Qwen2B => "assets/model-2b.gguf",
             Model::Qwen4B => "assets/model-4b.gguf",
             Model::Qwen9B => "assets/model-9b.gguf",
+            Model::Custom { path, .. } => path,
         }
     }
     /// aarch64 guest-physical load address — one address for every model
@@ -54,7 +63,8 @@ impl Model {
     }
     /// QEMU `-m` size: must hold the model (loaded at 0x80000000 = 2 GiB) plus
     /// the heap the kernel places at the top of RAM. The kernel errors clearly if
-    /// a model won't fit, so these are simply comfortable sizes per model.
+    /// a model won't fit, so these are simply comfortable sizes per model
+    /// (custom paths derive theirs from the file size at parse time).
     fn qemu_mem(self) -> &'static str {
         match self {
             // 0.8B (~785 MiB) at 2 GiB + a 512 MiB heap at the top: 3 GiB is ample.
@@ -64,6 +74,7 @@ impl Model {
             // ~2.58 GiB model at 2 GiB + a 512 MiB heap at the top of RAM.
             Model::Qwen4B => "6G",
             Model::Qwen9B => "10G",
+            Model::Custom { mem, .. } => mem,
         }
     }
     fn label(self) -> &'static str {
@@ -72,12 +83,127 @@ impl Model {
             Model::Qwen2B => "qwen3.5-2b",
             Model::Qwen4B => "qwen3.5-4b",
             Model::Qwen9B => "qwen3.5-9b",
+            Model::Custom { path, .. } => path,
         }
     }
 }
 
 /// Convert a QEMU `-m` size string (`"3G"`, `"512M"`, or a raw byte count) to
 /// bytes, for the `opt/chitti/ramsize` fw_cfg the kernel reads.
+/// Build the slirp user-net `-netdev` value for `id`. If `CHITTI_HOSTFWD=<port>`
+/// is set, add a host-forward `tcp:127.0.0.1:<port>-:<port>` so a host process
+/// can reach a guest TCP listener (used by the e2e Network-service scenario).
+/// Opt-in, so normal `run` invocations keep plain user-mode networking.
+fn user_netdev(id: &str) -> String {
+    let mut s = format!("user,id={id}");
+    if let Ok(ports) = std::env::var("CHITTI_HOSTFWD") {
+        for p in ports.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            s.push_str(&format!(",hostfwd=tcp:127.0.0.1:{p}-:{p}"));
+        }
+    }
+    s
+}
+
+/// Guest NIC backend for interactive / e2e `run`.
+///
+/// * `CHITTI_NET_BRIDGE=<ifname>` (e.g. `en0`) — L2 bridge onto that host
+///   interface so the guest gets a LAN address via the real DHCP server.
+///   macOS uses QEMU's `vmnet-bridged` (Apple vmnet; needs root or the
+///   `com.apple.vm.networking` entitlement); other hosts use the classic
+///   `bridge` helper (`br=<ifname>`).
+/// * otherwise — slirp user-net via [`user_netdev`] (incl. optional
+///   `CHITTI_HOSTFWD`). Hostfwd is ignored when bridging.
+fn guest_netdev(id: &str) -> String {
+    if let Ok(ifname) = env::var("CHITTI_NET_BRIDGE") {
+        let ifname = ifname.trim();
+        if !ifname.is_empty() {
+            if env::var("CHITTI_HOSTFWD").is_ok() {
+                eprintln!(
+                    "xtask: note: CHITTI_HOSTFWD is ignored with CHITTI_NET_BRIDGE \
+                     (guest is on the LAN; reach it at its DHCP address)"
+                );
+            }
+            #[cfg(target_os = "macos")]
+            {
+                eprintln!(
+                    "  net: vmnet-bridged ifname={ifname} \
+                     (may need `sudo` / com.apple.vm.networking)"
+                );
+                return format!("vmnet-bridged,id={id},ifname={ifname}");
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                eprintln!("  net: bridge br={ifname}");
+                return format!("bridge,id={id},br={ifname}");
+            }
+        }
+    }
+    user_netdev(id)
+}
+
+/// Boot-time `/model remote` seed for the guest.
+///
+/// When `CHITTI_REMOTE_URL` is set (optionally `CHITTI_REMOTE_MODEL`,
+/// `CHITTI_REMOTE_KEY`), write a small JSON file and hand it to QEMU as
+/// `-fw_cfg name=opt/chitti/model,file=…`. The kernel reads it at shell
+/// start and activates the hosted backend (same shape as
+/// `/configs/core/model.json`). Used by `make run` for LM Studio / Ollama
+/// without typing `/model remote` by hand.
+///
+/// Under slirp user-net the host is `10.0.2.2` (not the host's LAN IP).
+fn remote_model_fw_cfg() -> Result<Vec<String>, String> {
+    let Ok(url) = env::var("CHITTI_REMOTE_URL") else {
+        return Ok(Vec::new());
+    };
+    let url = url.trim().trim_end_matches('/').to_string();
+    if url.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!(
+            "CHITTI_REMOTE_URL must be http(s)://… (got {url:?})"
+        ));
+    }
+    let model = env::var("CHITTI_REMOTE_MODEL")
+        .unwrap_or_else(|_| "default".into())
+        .trim()
+        .to_string();
+    let key = env::var("CHITTI_REMOTE_KEY").unwrap_or_default();
+    let key = key.trim();
+    // Minimal JSON (no commas in values expected). Written to a file so QEMU's
+    // comma-separated -fw_cfg parser never splits the body.
+    let json = format!(
+        "{{\"mode\":\"remote\",\"url\":\"{}\",\"model\":\"{}\",\"key\":\"{}\"}}",
+        json_escape_str(&url),
+        json_escape_str(&model),
+        json_escape_str(key),
+    );
+    let path = repo_root().join("target/chitti-fwcfg-model.json");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    fs::write(&path, json.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))?;
+    eprintln!("  model remote seed: {url} ({model})");
+    Ok(vec![
+        "-fw_cfg".into(),
+        format!("name=opt/chitti/model,file={}", path.display()),
+    ])
+}
+
+/// Escape a string for embedding in a JSON string value (quotes + backslashes).
+fn json_escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn mem_bytes(m: &str) -> u64 {
     let m = m.trim();
     let (num, mult) = match m.chars().last() {
@@ -106,7 +232,21 @@ fn parse_model(rest: &[String]) -> Result<Model, String> {
                 "qwen3.5-2b" | "qwen3.5-2B" | "2b" | "2B" | "qwen2b" => Ok(Model::Qwen2B),
                 "qwen3.5-4b" | "qwen3.5-4B" | "4b" | "4B" | "qwen4b" => Ok(Model::Qwen4B),
                 "qwen3.5-9b" | "qwen3.5-9B" | "9b" | "9B" | "qwen9b" => Ok(Model::Qwen9B),
-                other => Err(format!("unknown -model '{other}' (expected qwen3.5-0.8b, qwen3.5-2b, qwen3.5-4b, or qwen3.5-9b)")),
+                // Any other value is a GGUF path: the kernel discovers the
+                // architecture from the file, so any family/quant works here.
+                other if other.ends_with(".gguf") => {
+                    let size = fs::metadata(other).map_err(|e| format!("-model {other}: {e}"))?.len();
+                    // Model at 2 GiB + heap at the top of RAM: file size plus
+                    // ~40% working headroom plus the 2 GiB base offset.
+                    let gib = (size as f64 / (1u64 << 30) as f64 * 1.4 + 2.0).ceil() as u64;
+                    Ok(Model::Custom {
+                        path: Box::leak(v.clone().into_boxed_str()),
+                        mem: Box::leak(format!("{}G", gib.max(3)).into_boxed_str()),
+                    })
+                }
+                other => Err(format!(
+                    "unknown -model '{other}' (expected qwen3.5-0.8b|2b|4b|9b, or a path to a .gguf)"
+                )),
             };
         }
     }
@@ -189,7 +329,7 @@ fn main() {
         "voice-assets" => cmd_voice_assets(),
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
         // boot the real model, run the acceptance checks, exit pass/fail.
-        "ref-check" => cmd_ref_check(),
+        "ref-check" => cmd_ref_check(arch, model),
         // Hidden subcommand: installed as `[target.x86_64-chitti] runner` in
         // kernel/.cargo/config.toml so `cargo test` can boot each compiled
         // test binary in QEMU and translate isa-debug-exit into a real exit
@@ -426,7 +566,9 @@ fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> 
             (kernel.to_path_buf(), "::/chitti-kernel".into()),
         ];
         if let Some(m) = model {
-            copies.push((m.to_path_buf(), "::/model.gguf.000".into()));
+            for (src, name) in esp_model_parts(m)? {
+                copies.push((src, format!("::/{name}")));
+            }
         }
         for (n, pth) in &voice {
             copies.push((pth.clone(), format!("::/{n}")));
@@ -436,6 +578,14 @@ fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> 
         return Ok(img);
     }
     // macOS: attach raw, format FAT32, mount, copy, detach — via /bin/sh.
+    let model_cp = match model {
+        Some(m) => esp_model_parts(m)?
+            .into_iter()
+            .map(|(src, name)| format!("cp \"{}\" \"$MNT/{}\"", src.display(), name))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => String::new(),
+    };
     let script = format!(
         r#"set -e
 DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "{img}" | head -1 | awk '{{print $1}}')
@@ -453,7 +603,7 @@ hdiutil detach "$DEV" > /dev/null
         img = img.display(),
         stub = stub.display(),
         kernel = kernel.display(),
-        model_cp = model.map(|m| format!("cp \"{}\" \"$MNT/model.gguf.000\"", m.display())).unwrap_or_default(),
+        model_cp = model_cp,
         // Voice models at the ESP root, so the kernel's root-file readers find them.
         voice_cp = voice.iter().map(|(n, p)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), n)).collect::<Vec<_>>().join("\n"),
     );
@@ -468,8 +618,13 @@ hdiutil detach "$DEV" > /dev/null
 /// Build a small FAT "voice disk" holding the voice models (`kitten.onnx`,
 /// `parakeet.onnx`) so `cargo xtask run` can attach them as an extra virtio-blk
 /// disk — the kernel's `find_on_disks` scans it and auto-loads them. Returns
-/// `None` if no voice assets are present. Cached; rebuilt when the models change.
+/// `None` if no voice assets are present, or if `CHITTI_VOICE_DISK=off`
+/// (QEMU write-locks the image, so a second concurrent guest — an e2e
+/// scenario booting its own — must skip it or fail to launch).
 fn build_voice_disk() -> Option<PathBuf> {
+    if env::var("CHITTI_VOICE_DISK").map(|v| v.trim() == "off").unwrap_or(false) {
+        return None;
+    }
     let voice: Vec<(String, PathBuf)> = voice_model_assets().into_iter().filter(|(_, p)| p.exists()).map(|(n, p)| (n.to_string(), p)).collect();
     if voice.is_empty() {
         return None;
@@ -516,6 +671,80 @@ hdiutil detach "$DEV" > /dev/null
     Some(img)
 }
 
+/// Build a small FAT "model disk" holding the given files — a `.gguf` source
+/// lands as `chat.gguf` (the `/model load` runtime-loading path; the e2e
+/// model_load scenario), any other file keeps its own name (the e2e `/open`
+/// image/audio scenario ships media this way). Opt-in via
+/// `CHITTI_MODEL_DISK=<path>[:<path>...]`. Cached; rebuilt when the sources
+/// change. FAT32 caps a file at 4 GiB — larger models must be loaded from an
+/// ext4 data disk instead.
+fn build_model_disk(files: &[PathBuf]) -> Result<PathBuf, String> {
+    let mut total = 0u64;
+    let mut copies: Vec<(PathBuf, String)> = Vec::new();
+    for f in files {
+        let size = fs::metadata(f).map_err(|e| format!("CHITTI_MODEL_DISK {}: {e}", f.display()))?.len();
+        if size >= 4 * (1u64 << 30) {
+            return Err("CHITTI_MODEL_DISK: FAT32 caps a file at 4 GiB; use an ext4 data disk for larger models".into());
+        }
+        total += size;
+        let is_gguf = f.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("gguf")).unwrap_or(false);
+        let dest = if is_gguf {
+            "chat.gguf".to_string()
+        } else {
+            f.file_name().and_then(|n| n.to_str()).unwrap_or("file.bin").to_string()
+        };
+        copies.push((f.clone(), dest));
+    }
+    let img = repo_root().join("target/chitti-model-disk.img");
+    let want = copies.iter().map(|(p, d)| format!("{}>{d}", p.display())).collect::<Vec<_>>().join(":") + &format!(":{total}");
+    let meta = repo_root().join("target/chitti-model-disk.meta");
+    if img.exists() && fs::read_to_string(&meta).map(|s| s.trim() == want).unwrap_or(false) {
+        return Ok(img);
+    }
+    let size_mb = 64 + total / (1024 * 1024) + 32;
+    let f = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&img).map_err(|e| e.to_string())?;
+    f.set_len(size_mb * 1024 * 1024).map_err(|e| e.to_string())?;
+    drop(f);
+    if cfg!(target_os = "linux") {
+        let cps: Vec<(PathBuf, String)> = copies.iter().map(|(p, d)| (p.clone(), format!("::/{d}"))).collect();
+        populate_fat_linux(&img, "MODEL", &[], &cps)?;
+    } else {
+        let cps = copies.iter().map(|(p, d)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), d)).collect::<Vec<_>>().join("\n");
+        let script = format!(
+            r#"set -e
+DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "{img}" | head -1 | awk '{{print $1}}')
+newfs_msdos -F 32 -v MODEL "$DEV" > /dev/null
+diskutil mount "$DEV" > /dev/null
+MNT=$(diskutil info "$DEV" | awk -F': *' '/Mount Point/{{print $2}}')
+{cps}
+diskutil unmount "$DEV" > /dev/null
+hdiutil detach "$DEV" > /dev/null
+"#,
+            img = img.display(),
+        );
+        let ok = Command::new("/bin/sh").arg("-c").arg(&script).status().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            return Err("model disk build failed (hdiutil/newfs_msdos)".into());
+        }
+    }
+    let _ = fs::write(&meta, &want);
+    let names = copies.iter().map(|(_, d)| d.as_str()).collect::<Vec<_>>().join(", ");
+    eprintln!("  model disk: {} ({} MiB, {names})", img.display(), size_mb);
+    Ok(img)
+}
+
+/// The `CHITTI_MODEL_DISK` FAT disk, if requested via the environment
+/// (colon-separated paths land on one disk).
+fn model_disk_from_env() -> Result<Option<PathBuf>, String> {
+    match env::var("CHITTI_MODEL_DISK") {
+        Ok(p) if !p.trim().is_empty() => {
+            let files: Vec<PathBuf> = p.split(':').map(|s| PathBuf::from(s.trim())).filter(|s| s.as_os_str().len() > 0).collect();
+            Ok(Some(build_model_disk(&files)?))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Boot aarch64 via UEFI firmware (AAVMF) — the Chitti stub loads the normal
 /// identity kernel (+ model) off a real FAT ESP and hands off MMU-off through
 /// an identity-RAM trampoline, so the kernel boots exactly as under `-kernel`.
@@ -557,7 +786,7 @@ fn cmd_run_aarch64_uefi(model: Model, disk: Option<PathBuf>, disk_only: bool, no
     run(&mut qemu)
 }
 
-fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_only: bool) -> Result<(), String> {
+fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_only: bool, no_model: bool) -> Result<(), String> {
     // Native inference on aarch64 is only worthwhile optimized: debug NEON is
     // ~30x slower (no inlining of intrinsics, bounds/overflow checks in the hot
     // matvec loop). So this path defaults to a release build regardless of the
@@ -599,9 +828,15 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
     // On the `-kernel` HVF path QEMU passes no DTB (x0=0), so this fw_cfg file is
     // how the kernel learns how much RAM it has (see `mmu::detect`).
     qemu.arg("-fw_cfg").arg(format!("name=opt/chitti/ramsize,string={}", mem_bytes(model.qemu_mem())));
-    // A virtio-net NIC on user-mode networking (built-in DHCP 10.0.2.15 / gw
-    // 10.0.2.2 / dns 10.0.2.3) so /network, /ping and /wifi work out of the box.
-    qemu.args(["-netdev", "user,id=chittinet", "-device", "virtio-net-device,netdev=chittinet"]);
+    // Optional boot seed for /model remote (CHITTI_REMOTE_URL / _MODEL / _KEY).
+    for a in remote_model_fw_cfg()? {
+        qemu.arg(a);
+    }
+    // A virtio-net NIC: slirp user-net by default (DHCP 10.0.2.15 / gw 10.0.2.2),
+    // or L2-bridged onto a host iface when CHITTI_NET_BRIDGE=<ifname> is set.
+    // CHITTI_HOSTFWD only applies to user-net. Host services (LM Studio, …)
+    // are reached at 10.0.2.2 under user-net.
+    qemu.args(["-netdev", &guest_netdev("chittinet"), "-device", "virtio-net-device,netdev=chittinet"]);
     // virtio-snd on the host's audio backend (mic + speaker) for /voice.
     qemu.args(audio_args("virtio-sound-device"));
     // Attach a virtio-blk disk on the virtio-mmio bus (the aarch64 block driver
@@ -617,11 +852,21 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
         qemu.arg("-drive").arg(format!("file={},if=none,id=voicedisk,format=raw", vd.display()));
         qemu.args(["-device", "virtio-blk-device,drive=voicedisk"]);
     }
+    // Opt-in FAT disk carrying a GGUF as `chat.gguf` for the runtime `/model
+    // load` path (CHITTI_MODEL_DISK=<path>; the e2e model_load scenario).
+    if let Some(md) = model_disk_from_env()? {
+        qemu.arg("-drive").arg(format!("file={},if=none,id=modeldisk,format=raw", md.display()));
+        qemu.args(["-device", "virtio-blk-device,drive=modeldisk"]);
+        eprintln!("  model disk attached (chat.gguf; load with /model load chat.gguf)");
+    }
     // Place the GGUF in guest RAM at the model's load address (where the aarch64
     // `cortex::model_module` looks) -- the equivalent of the x86 Limine boot
-    // module, so `infer` works natively.
+    // module, so `infer` works natively. `--no-model` skips it (e.g. to prove
+    // the runtime `/model load` path starts from nothing).
     let gguf = repo_root().join(model.gguf_rel());
-    if gguf.exists() {
+    if no_model {
+        eprintln!("--no-model: booting without a model in RAM (`/model load` can add one at runtime)");
+    } else if gguf.exists() {
         let base = u64::from_str_radix(model.aarch64_addr().trim_start_matches("0x"), 16)
             .map_err(|e| format!("bad model addr {}: {e}", model.aarch64_addr()))?;
         for arg in model_loader_args(&gguf, base)? {
@@ -770,7 +1015,10 @@ fn accel_args(target_arch: &str) -> Vec<String> {
     if cfg!(target_os = "macos") && std::env::consts::ARCH == target_arch {
         return vec!["-accel".into(), "hvf".into(), "-cpu".into(), "host".into()];
     }
-    if cfg!(target_os = "linux") && std::env::consts::ARCH == target_arch {
+    // Same-arch Linux host: KVM only if it's actually available (a CI runner
+    // may not expose /dev/kvm) — otherwise `-accel kvm` hard-fails, so fall
+    // back to TCG (`-cpu max`) rather than refusing to boot.
+    if cfg!(target_os = "linux") && std::env::consts::ARCH == target_arch && std::path::Path::new("/dev/kvm").exists() {
         return vec!["-accel".into(), "kvm".into(), "-cpu".into(), "host".into()];
     }
     vec!["-cpu".into(), "max".into()]
@@ -860,6 +1108,22 @@ fn split_model_into_parts(model: &Path, dir: &Path, part_size: u64) -> Result<Ve
         }
     }
     Ok(names)
+}
+
+/// Split a bundled model into FAT32-safe parts under `target/esp-model-parts`
+/// and return `(part_path, "model.gguf.NNN")` pairs to copy onto the ESP. FAT32
+/// caps a single file at 4 GiB, so a large model (the 9B) cannot be copied whole
+/// — it is split, and the UEFI stub concatenates the sorted parts back (as every
+/// other loader path already does). A model under one part size still becomes a
+/// single `model.gguf.000`, so the copy/reassembly path is uniform for all tiers.
+fn esp_model_parts(model: &Path) -> Result<Vec<(PathBuf, String)>, String> {
+    // 1 GiB: well under FAT32's 4 GiB file cap, and bounds the stub's per-part
+    // read buffer (it reads one part at a time into a transient allocation).
+    const ESP_PART: u64 = 1 << 30;
+    let dir = repo_root().join("target/esp-model-parts");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let names = split_model_into_parts(model, &dir, ESP_PART)?;
+    Ok(names.into_iter().map(|n| (dir.join(&n), n)).collect())
 }
 
 /// The voice models to bundle into images, as `(bundled-name, repo-relative
@@ -1066,7 +1330,9 @@ fn image_aarch64(model: Model) -> Result<(), String> {
             (elf.clone(), "::/chitti-kernel".into()),
         ];
         if let Some(m) = &model_path {
-            copies.push((m.clone(), "::/model.gguf.000".into()));
+            for (src, name) in esp_model_parts(m)? {
+                copies.push((src, format!("::/{name}")));
+            }
         }
         for (n, pth) in &voice {
             copies.push((pth.clone(), format!("::/{n}")));
@@ -1091,6 +1357,14 @@ fn image_aarch64(model: Model) -> Result<(), String> {
     // is parsed on attach, exposing slice devices s1/s2 owned by the user).
     let mke2fs = brew_prefix("e2fsprogs").map(|p| p.join("sbin/mke2fs")).ok().filter(|p| p.exists())
         .ok_or("mke2fs not found -- brew install e2fsprogs (needed to format the data partition)")?;
+    let model_cp = match &model_path {
+        Some(m) => esp_model_parts(m)?
+            .into_iter()
+            .map(|(src, name)| format!("cp \"{}\" \"$MNT/{}\"", src.display(), name))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => String::new(),
+    };
     let script = format!(
         r#"set -e
 DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "{img}" | head -1 | awk '{{print $1}}')
@@ -1110,7 +1384,7 @@ hdiutil detach "$DEV" > /dev/null
         stub = stub.display(),
         kernel = elf.display(),
         mke2fs = mke2fs.display(),
-        model_cp = model_path.as_ref().map(|m| format!("cp \"{}\" \"$MNT/model.gguf.000\"", m.display())).unwrap_or_default(),
+        model_cp = model_cp,
         voice_cp = voice.iter().map(|(n, p)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), n)).collect::<Vec<_>>().join("\n"),
     );
     let status = Command::new("/bin/sh").arg("-c").arg(&script).status().map_err(|e| format!("populating image: {e}"))?;
@@ -1233,6 +1507,27 @@ fn qemu_base_cmd(iso: &Path) -> Command {
     cmd
 }
 
+/// Extra x86 `run` args for headless / CI use:
+/// - `-display none` when `CHITTI_DISPLAY=none` (the e2e harness + CI set this;
+///   otherwise QEMU opens a window that has nowhere to go on a CI runner).
+/// - `-accel kvm` when `CHITTI_ACCEL=kvm`, or automatically when `/dev/kvm`
+///   exists on a Linux host (GitHub's Linux runners expose it) — TCG otherwise.
+fn x86_run_extra_args() -> Vec<String> {
+    let mut v = Vec::new();
+    if env::var("CHITTI_DISPLAY").as_deref() == Ok("none") {
+        v.push("-display".into());
+        v.push("none".into());
+    }
+    let accel = env::var("CHITTI_ACCEL").ok();
+    let use_kvm = accel.as_deref() == Some("kvm")
+        || (accel.is_none() && cfg!(target_os = "linux") && std::path::Path::new("/dev/kvm").exists());
+    if use_kvm {
+        v.push("-accel".into());
+        v.push("kvm".into());
+    }
+    v
+}
+
 /// `cargo xtask run [-arch ...]`: boot the unified kernel. On aarch64 it runs
 /// natively via QEMU + HVF; on x86 it boots the Limine image under
 /// qemu-system-x86_64 (TCG on this host).
@@ -1252,7 +1547,7 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         if uefi || disk_only {
             return cmd_run_aarch64_uefi(model, disk, disk_only, no_model);
         }
-        return cmd_run_aarch64(release, model, disk, disk_only);
+        return cmd_run_aarch64(release, model, disk, disk_only, no_model);
     }
     // Disk size: default 4 MiB for a plain run (the SimpleFS boot-counter demo),
     // but an install needs room for the ESP + model + data partitions — pass e.g.
@@ -1278,8 +1573,8 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         cmd.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", disk.display()));
         cmd.args(["-device", "virtio-blk-pci,drive=chittidisk,disable-modern=on"]);
         cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
-        // Intel e1000 NIC on user-mode networking (DHCP 10.0.2.15 / gw 10.0.2.2).
-        cmd.args(["-netdev", "user,id=chittinet", "-device", "e1000,netdev=chittinet"]);
+        // Intel e1000 NIC (user-net or CHITTI_NET_BRIDGE — see guest_netdev).
+        cmd.args(["-netdev", &guest_netdev("chittinet"), "-device", "e1000,netdev=chittinet"]);
         eprintln!("booting FROM DISK ONLY via UEFI (OVMF) -- no ISO; the installed Chitti boots itself");
         eprintln!("  disk: {}", disk.display());
         let status = cmd.status().map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
@@ -1303,13 +1598,24 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         eprintln!("booting via UEFI (OVMF) -- the same GOP framebuffer path real hardware uses");
     }
     cmd.args(["-serial", "stdio"]);
+    cmd.args(x86_run_extra_args()); // headless (-display none) + KVM on CI
+    for a in remote_model_fw_cfg()? {
+        cmd.arg(a);
+    }
     cmd.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", disk.display()));
     cmd.args(["-device", "virtio-blk-pci,drive=chittidisk,disable-modern=on"]);
+    // Opt-in FAT disk carrying a GGUF as `chat.gguf` for the runtime `/model
+    // load` path (CHITTI_MODEL_DISK=<path>; the e2e model_load scenario).
+    if let Some(md) = model_disk_from_env()? {
+        cmd.arg("-drive").arg(format!("file={},if=none,id=modeldisk,format=raw", md.display()));
+        cmd.args(["-device", "virtio-blk-pci,drive=modeldisk,disable-modern=on"]);
+        eprintln!("  model disk attached (chat.gguf; load with /model load chat.gguf)");
+    }
     // A USB keyboard on an xHCI controller, so the xhci/HID driver drives the
     // shell (as a real USB keyboard would); PS/2 also still works.
     cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
-    // Intel e1000 NIC on user-mode networking (DHCP 10.0.2.15 / gw 10.0.2.2).
-    cmd.args(["-netdev", "user,id=chittinet", "-device", "e1000,netdev=chittinet"]);
+    // Intel e1000 NIC (user-net or CHITTI_NET_BRIDGE — see guest_netdev).
+    cmd.args(["-netdev", &guest_netdev("chittinet"), "-device", "e1000,netdev=chittinet"]);
     // virtio-snd on the host's audio backend (mic + speaker) for /voice.
     cmd.args(audio_args("virtio-sound-pci"));
     if disk_size.is_some() {
@@ -1492,32 +1798,81 @@ fn cmd_runner(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// `cargo xtask ref-check`: the Phase 3 reference-parity gate. Builds the
-/// kernel in release with the `refcheck` feature, boots it with the real
-/// model and extra RAM, and lets the in-kernel acceptance routine
-/// (`cortex::run_acceptance`) exit QEMU with success (33) or failure. Serial
-/// goes to stdio so the `REFCHECK:` lines are visible while it runs.
-fn cmd_ref_check() -> Result<(), String> {
-    let model = repo_root().join("assets/model.gguf");
-    if !model.exists() {
-        return Err("assets/model.gguf not present -- run xtask/fetch-model.sh first".to_string());
+/// `cargo xtask ref-check [-arch …] [-model …]`: the reference-parity gate,
+/// for whichever model `-model` selects (parity is keyed on the GGUF's
+/// `general.name` against `cortex::refcheck::FIXTURES`; unknown models SKIP
+/// parity but still gate the self-consistency checks).
+///
+/// - x86 (default): boots the ISO under TCG; the kernel exits via
+///   isa-debug-exit with success (33) or failure (35). Slow but hosts-anything.
+/// - aarch64: boots `-kernel` under HVF (native speed — the recommended gate
+///   for the larger models); the kernel powers off via PSCI and the serial
+///   output is checked for `REFCHECK: ALL PASS`.
+fn cmd_ref_check(arch: Arch, model: Model) -> Result<(), String> {
+    let gguf = repo_root().join(model.gguf_rel());
+    if !gguf.exists() {
+        return Err(format!("{} not present -- run xtask/fetch-model.sh first", model.gguf_rel()));
     }
-    let bin = build_kernel_with(true, &["refcheck"])?;
-    let iso = assemble_image(&bin)?;
+    // The model's heap-tier feature must match the model (the 4B needs its
+    // tier), plus the refcheck entry gate.
+    let mut feats: Vec<&str> = model.features().to_vec();
+    feats.push("refcheck");
+
+    if matches!(arch, Arch::Aarch64) {
+        let elf = build_kernel_aarch64(true, &feats)?;
+        let mut cmd = Command::new("qemu-system-aarch64");
+        cmd.args(["-M", "virt", "-smp", "4", "-m", model.qemu_mem()]);
+        cmd.args(accel_args("aarch64"));
+        cmd.args(["-display", "none", "-monitor", "none", "-serial", "stdio", "-no-reboot"]);
+        cmd.arg("-kernel").arg(&elf);
+        cmd.arg("-fw_cfg").arg(format!("name=opt/chitti/ramsize,string={}", mem_bytes(model.qemu_mem())));
+        let base = u64::from_str_radix(model.aarch64_addr().trim_start_matches("0x"), 16)
+            .map_err(|e| format!("bad model addr {}: {e}", model.aarch64_addr()))?;
+        for arg in model_loader_args(&gguf, base)? {
+            cmd.arg("-device").arg(arg);
+        }
+        eprintln!("ref-check: running the acceptance gate natively under HVF ({})...", model.label());
+        // Stream serial live while capturing it — the kernel powers off via
+        // PSCI (exit code carries nothing), so PASS/FAIL comes from the log.
+        use std::io::BufRead as _;
+        let mut child = cmd
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("failed to spawn qemu-system-aarch64: {e}"))?;
+        let mut all = String::new();
+        if let Some(out) = child.stdout.take() {
+            for line in std::io::BufReader::new(out).lines() {
+                let line = line.unwrap_or_default();
+                println!("{line}");
+                all.push_str(&line);
+                all.push('\n');
+            }
+        }
+        let _ = child.wait();
+        return if all.contains("REFCHECK: ALL PASS") {
+            println!("ref-check: PASS (all acceptance checks green)");
+            Ok(())
+        } else {
+            Err("ref-check: FAIL (serial log has no 'REFCHECK: ALL PASS')".to_string())
+        };
+    }
+
+    let bin = build_kernel_with(true, &feats)?;
+    let iso = assemble_image_with(&bin, model.gguf_rel())?;
     // CPU inference under QEMU/TCG takes minutes; the model module needs
-    // headroom beyond 2 GiB.
+    // headroom beyond the file size.
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args([
-        "-M", "q35", "-cpu", "max", "-smp", "4", "-m", "4G", "-device",
+        "-M", "q35", "-cpu", "max", "-smp", "4", "-m", model.qemu_mem(), "-device",
         "isa-debug-exit,iobase=0xf4,iosize=0x04", "-no-reboot",
     ]);
     cmd.arg("-cdrom").arg(&iso);
     cmd.args(["-serial", "stdio", "-display", "none"]);
-    eprintln!("ref-check: running in-kernel acceptance gate under QEMU (this takes a few minutes)...");
+    eprintln!("ref-check: running in-kernel acceptance gate under QEMU/TCG ({}, this takes a few minutes)...", model.label());
     let status = cmd.status().map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
     match status.code() {
         Some(33) => {
-            println!("ref-check: PASS (all Phase 3 acceptance checks green)");
+            println!("ref-check: PASS (all acceptance checks green)");
             Ok(())
         }
         Some(35) => Err("ref-check: FAIL (QemuExitCode::Failed -- an acceptance check did not match)".to_string()),

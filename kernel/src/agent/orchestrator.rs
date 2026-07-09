@@ -111,9 +111,20 @@ impl Orchestrator {
 
     /// Handle one user intent: record it (as `UserTyped`), run the loop to a
     /// stop condition, persist the session, and return the loop result.
+    ///
+    /// Polls [`crate::shell::poll_cancel`] between steps so Ctrl+C / Esc aborts
+    /// a long tool-use loop (same contract as interactive chat). Unit tests
+    /// that never touch the console see `cancel == false`.
     pub fn handle(&mut self, intent: &str, steps: &mut dyn StepSource, tools: &mut dyn ToolDispatch) -> LoopResult {
         self.session.push_message(Role::User, intent.to_string(), Provenance::UserTyped, now());
-        let result = agent_loop::run(&mut self.session, steps, tools, self.caller, now);
+        let result = agent_loop::run_with_cancel(
+            &mut self.session,
+            steps,
+            tools,
+            self.caller,
+            now,
+            crate::shell::poll_cancel,
+        );
         let _ = session::save(&self.session);
         result
     }
@@ -176,9 +187,13 @@ impl Orchestrator {
             use crate::session::todo::json_str;
             let role_name = json_str(&call.args, "role").unwrap_or_default();
             let task = json_str(&call.args, "task").unwrap_or_default();
-            let role = match role_name.as_str() {
-                "reader" => manifest::reader_subagent_manifest(),
-                other => return ToolOutcome::error(alloc::format!("unknown sub-agent role: {other}")),
+            let role = match manifest::subagent_role(&role_name) {
+                Some(r) => r,
+                None => {
+                    return ToolOutcome::error(alloc::format!(
+                        "unknown sub-agent role '{role_name}' (try: explore|plan|worker|reader)"
+                    ))
+                }
             };
             let mut sub_router = crate::tools::Router::new(); // sub-agents can't sub-delegate here
             let mut steps = rule_steps::for_intent(&task);
@@ -196,14 +211,17 @@ impl Orchestrator {
         r.load_skill_hook = Some(alloc::boxed::Box::new(|session, _caller, call| {
             use crate::agent::agent_loop::ToolOutcome;
             use crate::session::todo::json_str;
-            use crate::skills::{index, loader};
+            use crate::skills::loader;
             let name = json_str(&call.args, "name").unwrap_or_default();
-            match index::by_name(&name) {
-                Some(meta) => match loader::load_body(session, meta.id, now()) {
-                    Some(_) => ToolOutcome::ok(alloc::format!("loaded skill '{name}' (L1 body now in context)"), Provenance::SkillInstalled(meta.id)),
-                    None => ToolOutcome::error(alloc::format!("skill '{name}' has no body")),
-                },
-                None => ToolOutcome::error(alloc::format!("no installed skill named '{name}'")),
+            let asset = json_str(&call.args, "asset");
+            match loader::invoke(session, &name, asset.as_deref().filter(|s| !s.is_empty()), now()) {
+                Ok(text) => {
+                    let sid = crate::skills::index::by_name(&name)
+                        .map(|m| m.id)
+                        .unwrap_or(crate::agent::types::SkillId(0));
+                    ToolOutcome::ok(text, Provenance::SkillInstalled(sid))
+                }
+                Err(e) => ToolOutcome::error(e),
             }
         }));
         r

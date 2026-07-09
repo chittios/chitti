@@ -35,21 +35,60 @@ pub struct RemoteConfig {
     pub key: Option<String>,
 }
 
-/// Load the persisted config: `(remote_active, Option<RemoteConfig>)`.
-pub fn load() -> (bool, Option<RemoteConfig>) {
-    let Some(bytes) = crate::synapse::fs::read(MODEL_CFG_PATH) else {
-        return (false, None);
-    };
-    let Some(j) = core::str::from_utf8(&bytes).ok().and_then(Json::parse) else {
-        return (false, None);
-    };
+/// Parse a `model.json`-shaped body into `(remote_active, Option<RemoteConfig>)`.
+/// Pure — unit-tested so the boot seed and on-disk shapes stay in lockstep.
+pub fn parse_config_json(bytes: &[u8]) -> Option<(bool, Option<RemoteConfig>)> {
+    let j = core::str::from_utf8(bytes).ok().and_then(Json::parse)?;
     let remote = j.get("mode").and_then(|v| v.as_str()) == Some("remote");
     let cfg = j.get("url").and_then(|v| v.as_str()).map(|url| RemoteConfig {
         url: url.trim_end_matches('/').to_string(),
         model: j.get("model").and_then(|v| v.as_str()).unwrap_or("default").to_string(),
         key: j.get("key").and_then(|v| v.as_str()).filter(|k| !k.is_empty()).map(|k| k.to_string()),
     });
-    (remote && cfg.is_some(), cfg)
+    Some((remote && cfg.is_some(), cfg))
+}
+
+/// Launcher boot seed (`opt/chitti/model` fw_cfg), if the host published one.
+///
+/// **Only on the QEMU `-kernel` path** (`boot_x1() == 0`). UEFI/stub boots
+/// (VirtualBox, real hardware) have a boot-info block and **no** fw_cfg — we
+/// must not probe it at all. A prior infinite DMA spin on missing fw_cfg wedged
+/// the shell before the input loop (host `VERR_PDM_NO_QUEUE_ITEMS`). Even with
+/// a spin bound, probing on every VBox boot is useless work.
+fn boot_seed() -> Option<(bool, Option<RemoteConfig>)> {
+    #[cfg(all(target_arch = "aarch64", not(test)))]
+    {
+        // boot-info present ⇒ UEFI/stub (VBox / real HW), not QEMU -kernel.
+        if crate::arch::aarch64::boot::boot_x1() != 0 {
+            return None;
+        }
+        let bytes = crate::arch::aarch64::ramfb::read_opt_file(b"opt/chitti/model")?;
+        return parse_config_json(&bytes);
+    }
+    #[cfg(not(all(target_arch = "aarch64", not(test))))]
+    {
+        None
+    }
+}
+
+/// Load the backend config: `(remote_active, Option<RemoteConfig>)`.
+///
+/// Order: launcher fw_cfg seed (interactive `make run` → LM Studio / Ollama)
+/// wins over the on-disk `/configs/core/model.json`, so a one-shot env pin is
+/// never overridden by a stale saved "local" mode. When a seed is used it is
+/// also written through so `/model` and the next boot without a seed still see it.
+pub fn load() -> (bool, Option<RemoteConfig>) {
+    if let Some((on, cfg)) = boot_seed() {
+        if on {
+            save(true, cfg.as_ref());
+            crate::ktrace::log("model", "remote seed from fw_cfg applied");
+        }
+        return (on, cfg);
+    }
+    let Some(bytes) = crate::synapse::fs::read(MODEL_CFG_PATH) else {
+        return (false, None);
+    };
+    parse_config_json(&bytes).unwrap_or((false, None))
 }
 
 /// Persist the backend choice (+ config, when remote is configured).
@@ -126,21 +165,83 @@ impl RemoteChat {
         RemoteChat { cfg, messages: Vec::new() }
     }
 
-    /// One chat turn: the same bounded ReAct loop as the local
-    /// `ChatSession::turn`, with generation done by the hosted model. Returns
-    /// the final assistant answer (the voice loop speaks it).
-    pub fn turn(&mut self, msg: &str) -> String {
-        const MAX_TOOL_ITERS: usize = 4;
+    /// True when no messages have been exchanged yet (used to seed from a
+    /// resumed orchestrator session).
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// Seed the remote message list from a resumed orchestrator session so
+    /// `/session resume` continues the conversation on the hosted backend too.
+    pub fn hydrate_from_session(&mut self, session: &crate::agent::types::Session) {
+        use crate::agent::types::Role;
+        self.messages.clear();
+        for m in &session.messages {
+            match m.role {
+                Role::System if !m.content.is_empty() => {
+                    self.messages.push(("system".to_string(), m.content.clone()));
+                }
+                Role::User => self.messages.push(("user".to_string(), m.content.clone())),
+                Role::Assistant if !m.content.is_empty() => {
+                    self.messages.push(("assistant".to_string(), m.content.clone()));
+                }
+                Role::Tool => {
+                    self.messages.push((
+                        "user".to_string(),
+                        format!("<tool_response>\n{}\n</tool_response>", m.content),
+                    ));
+                }
+                _ => {}
+            }
+        }
         if self.messages.is_empty() {
             self.messages.push(("system".to_string(), super::agent_system_prompt()));
         }
+    }
+
+    /// Keep the leading system message current (SOUL, tool list, **memory
+    /// digest**). Remote history is re-sent whole each turn, so refreshing
+    /// here makes `memory_add` facts visible without requiring `/compact`.
+    fn refresh_system(&mut self) {
+        let prompt = super::agent_system_prompt();
+        match self.messages.first_mut() {
+            Some((role, body)) if role == "system" && !body.starts_with("Conversation so far") => {
+                *body = prompt;
+            }
+            _ => self.messages.insert(0, ("system".to_string(), prompt)),
+        }
+    }
+
+    /// One chat turn: the same bounded ReAct loop as the local
+    /// `ChatSession::turn`, with generation done by the hosted model. Records
+    /// into `session` so `/session save|resume` works for remote chat too.
+    /// Returns the final assistant answer (the voice loop speaks it).
+    pub fn turn(&mut self, msg: &str, session: &mut crate::agent::types::Session) -> String {
+        use crate::agent::orchestrator::now;
+        use crate::agent::types::{Provenance, Role, ToolCall};
+        const MAX_TOOL_ITERS: usize = 4;
+        self.refresh_system();
         self.messages.push(("user".to_string(), msg.to_string()));
+        session.push_message(Role::User, msg.to_string(), Provenance::UserTyped, now());
+        session.budget.turns_used = session.budget.turns_used.saturating_add(1);
         let mut last_call: Option<(String, String)> = None;
+        let mut call_id = 1u64;
         for _ in 0..MAX_TOOL_ITERS {
-            let reply = match chat_completion(&self.cfg, &self.messages) {
+            // The remote round-trip blocks in `net::http`; show a thinking spinner
+            // (driven by `upkeep`, which the HTTP poll loop calls) while we wait.
+            crate::shell::begin_thinking("thinking");
+            let result = chat_completion(&self.cfg, &self.messages);
+            crate::shell::end_thinking();
+            let reply = match result {
                 Ok(r) => r,
+                Err(e) if e == "cancelled" => {
+                    crate::serial_println!("\x1b[33m[stopped]\x1b[0m");
+                    let _ = crate::session::save(session);
+                    return String::new();
+                }
                 Err(e) => {
                     crate::serial_println!("\x1b[31mremote model error:\x1b[0m {} (see /model)", e);
+                    let _ = crate::session::save(session);
                     return String::new();
                 }
             };
@@ -149,23 +250,42 @@ impl RemoteChat {
             match super::parse_tool_call(&reply) {
                 Some(pair) if last_call.as_ref() == Some(&pair) => {
                     crate::serial_println!("\x1b[33m[tool loop stopped: repeated call]\x1b[0m");
+                    let _ = crate::session::save(session);
                     return String::new();
                 }
                 Some((cmd, args)) => {
                     last_call = Some((cmd.clone(), args.clone()));
                     crate::serial_println!("\x1b[33m\u{2192} running\x1b[0m /{} {}", cmd, args);
+                    session.push_assistant_tool_calls(
+                        String::new(),
+                        alloc::vec![ToolCall { call_id, tool: cmd.clone(), args: args.clone() }],
+                        now(),
+                    );
+                    session.budget.tool_calls_used = session.budget.tool_calls_used.saturating_add(1);
                     let obs = if cmd == "spawn_subagent" || cmd == "subagent" {
                         // Sub-agents stay on the local model; without one, say so.
                         "spawn_subagent is unavailable on the remote backend; do the task yourself with tools".to_string()
                     } else {
-                        super::execute_chat_tool(&cmd, &args)
+                        super::execute_chat_tool(&cmd, &args, session)
                     };
+                    let prov = if obs.starts_with("error:") || obs.starts_with("Denied:") {
+                        Provenance::SystemTrusted
+                    } else {
+                        Provenance::UntrustedIngested
+                    };
+                    session.push_tool_result(call_id, obs.clone(), prov, now());
+                    call_id += 1;
                     self.messages.push(("user".to_string(), format!("<tool_response>\n{}\n</tool_response>", obs)));
                 }
-                None => return reply,
+                None => {
+                    session.push_message(Role::Assistant, reply.clone(), Provenance::SystemTrusted, now());
+                    let _ = crate::session::save(session);
+                    return reply;
+                }
             }
         }
         crate::serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
+        let _ = crate::session::save(session);
         String::new()
     }
 
@@ -238,5 +358,25 @@ mod tests {
         let j = crate::json::Json::parse(json).unwrap();
         assert_eq!(j.get("mode").and_then(|v| v.as_str()), Some("remote"));
         assert_eq!(j.get("url").and_then(|v| v.as_str()), Some("http://192.168.1.20:8080"));
+    }
+
+    /// Boot seed + on-disk shape: remote mode needs a url; model defaults;
+    /// empty key is treated as absent.
+    #[test_case]
+    fn parse_config_json_remote_seed() {
+        let json = b"{\"mode\":\"remote\",\"url\":\"http://10.0.2.2:1234\",\"model\":\"ornith-1.0-9b\",\"key\":\"\"}";
+        let (on, cfg) = parse_config_json(json).expect("parse");
+        assert!(on);
+        let c = cfg.expect("cfg");
+        assert_eq!(c.url, "http://10.0.2.2:1234");
+        assert_eq!(c.model, "ornith-1.0-9b");
+        assert!(c.key.is_none());
+        // Trailing slash stripped; local mode is not "active remote".
+        let local = b"{\"mode\":\"local\",\"url\":\"http://x\",\"model\":\"m\"}";
+        let (on, _) = parse_config_json(local).expect("parse local");
+        assert!(!on);
+        let slash = b"{\"mode\":\"remote\",\"url\":\"http://10.0.2.2:1234/\",\"model\":\"m\"}";
+        let (_, cfg) = parse_config_json(slash).expect("parse slash");
+        assert_eq!(cfg.unwrap().url, "http://10.0.2.2:1234");
     }
 }

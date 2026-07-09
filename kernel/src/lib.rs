@@ -21,8 +21,10 @@ pub const BUILD_TIME: &str = env!("CHITTI_BUILD_TIME");
 pub mod acpi;
 pub mod agent;
 pub mod arch;
+pub mod audio;
 pub mod block;
 pub mod cap;
+pub mod channel;
 pub mod clipboard;
 pub mod clock;
 #[cfg(target_arch = "aarch64")]
@@ -31,12 +33,17 @@ pub mod console;
 pub mod cortex;
 pub mod fs;
 pub mod ipc;
+pub mod highlight;
+pub mod image;
 pub mod json;
+pub mod keyrepeat;
 pub mod ktrace;
 pub mod limine_protocol;
+pub mod mcp;
 pub mod mm;
 pub mod modal;
 pub mod mouse;
+pub mod msgchan;
 pub mod net;
 pub mod onnx;
 pub mod persona;
@@ -45,6 +52,7 @@ pub mod qemu;
 pub mod sched;
 pub mod security;
 pub mod serial;
+pub mod service;
 pub mod session;
 pub mod shell;
 pub mod skills;
@@ -54,6 +62,8 @@ pub mod ui_config;
 #[cfg(target_arch = "x86_64")]
 pub mod smp;
 pub mod synapse;
+pub mod textsel;
+pub mod video;
 pub mod xhci;
 
 // The framebuffer compositor and its Geist Mono glyph atlas are not built into
@@ -844,6 +854,275 @@ fn phase5_two_agents_coordinate_via_ipc() {
         Some(&b"42"[..]),
         "consumer did not persist the producer's value via IPC + Synapse"
     );
+}
+
+/// Two agents exchange RAW BYTES over a cap-gated channel (Phase 1). A client
+/// writes "ping" into one channel; an echo agent reads it and writes it into a
+/// second channel; the client reads it back. This exercises every new Phase-1
+/// mechanism: `channel::create`, both `Right::Channel{Read,Write}` directions,
+/// the two-gate check (`InvokePrimitive(CHANNEL_*)` *and* per-call cap-slot
+/// resolution against the caller's own table), and the cooperative blocking
+/// read — with a spin bound guarding against a hang. Unlike `ipc` (a single
+/// u64), this proves a byte stream crosses between two real scheduled tasks.
+#[test_case]
+fn channels_two_agents_echo_bytes() {
+    use channel::ChannelKind;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static OK: AtomicBool = AtomicBool::new(false);
+
+    fn data_of(inv: synapse::Invocation) -> alloc::string::String {
+        match inv {
+            synapse::Invocation::Executed { result, .. } => {
+                result.strip_prefix("ok:data=").map(alloc::string::ToString::to_string).unwrap_or(result)
+            }
+            other => alloc::format!("{other:?}"),
+        }
+    }
+
+    // Echo agent: read one message from its read end (slot 0), write it back on
+    // its write end (slot 1), then exit — so it leaves no lingering task.
+    extern "C" fn echoer(_arg: u64) {
+        let got = data_of(synapse::execute(
+            sched::current_task_id(),
+            r#"{"name":"channel_read","arguments":{"chan":0,"max":64}}"#,
+        ));
+        let call = alloc::format!(r#"{{"name":"channel_write","arguments":{{"chan":1,"text":"{got}"}}}}"#);
+        synapse::execute(sched::current_task_id(), &call);
+    }
+    // Client: write "ping" (write end slot 0), read the echo back (read end
+    // slot 1), assert it matches.
+    extern "C" fn client(_arg: u64) {
+        synapse::execute(
+            sched::current_task_id(),
+            r#"{"name":"channel_write","arguments":{"chan":0,"text":"ping"}}"#,
+        );
+        let echoed = data_of(synapse::execute(
+            sched::current_task_id(),
+            r#"{"name":"channel_read","arguments":{"chan":1,"max":64}}"#,
+        ));
+        OK.store(echoed == "ping", Ordering::SeqCst);
+        DONE.store(true, Ordering::SeqCst);
+    }
+
+    let c2s = channel::create(ChannelKind::Stream, 4096); // client -> echo
+    let s2c = channel::create(ChannelKind::Stream, 4096); // echo -> client
+    // Spawn + grant under interrupts-off (the cap-slot convention needs the
+    // table populated before the task first runs — same guard as the IPC test).
+    arch::interrupts::without_interrupts(|| {
+        let echo = sched::spawn("echo-agent", echoer, 0);
+        cap::grant(echo, cap::Right::ChannelRead(c2s)); // echo slot 0
+        cap::grant(echo, cap::Right::ChannelWrite(s2c)); // echo slot 1
+        cap::grant(echo, cap::Right::InvokePrimitive(synapse::registry::CHANNEL_READ));
+        cap::grant(echo, cap::Right::InvokePrimitive(synapse::registry::CHANNEL_WRITE));
+
+        let cli = sched::spawn("client-agent", client, 0);
+        cap::grant(cli, cap::Right::ChannelWrite(c2s)); // client slot 0
+        cap::grant(cli, cap::Right::ChannelRead(s2c)); // client slot 1
+        cap::grant(cli, cap::Right::InvokePrimitive(synapse::registry::CHANNEL_WRITE));
+        cap::grant(cli, cap::Right::InvokePrimitive(synapse::registry::CHANNEL_READ));
+    });
+
+    let mut spins = 0u64;
+    while !DONE.load(Ordering::SeqCst) {
+        sched::yield_now();
+        spins += 1;
+        assert!(spins < 100_000_000, "the two agents never completed the byte echo");
+    }
+    assert!(OK.load(Ordering::SeqCst), "client did not read back the bytes it sent");
+}
+
+/// A channel handle is unforgeable: a task holding only `InvokePrimitive`
+/// authority (but no `ChannelRead/Write` end) cannot read or write a channel by
+/// naming a slot — the executor's per-call cap-slot resolution denies it. This
+/// is the "no ambient authority over channels" invariant.
+#[test_case]
+fn channel_handle_without_end_is_denied() {
+    use channel::ChannelKind;
+
+    let ch = channel::create(ChannelKind::Stream, 64);
+    let me = sched::current_task_id();
+    // Grant the coarse ABI right but NOT an end naming `ch`.
+    cap::grant(me, cap::Right::InvokePrimitive(synapse::registry::CHANNEL_WRITE));
+    // Slot 0 in this (bootstrap) table does not resolve to ChannelWrite(ch);
+    // the write must be denied at the handle-resolution gate, not executed.
+    let inv = synapse::execute(me, r#"{"name":"channel_write","arguments":{"chan":999,"text":"x"}}"#);
+    match inv {
+        synapse::Invocation::Executed { result, .. } => {
+            assert!(result.starts_with("error:denied_channel_handle"), "unexpected: {result}");
+        }
+        other => panic!("expected an executed-with-denial result, got {other:?}"),
+    }
+    // The channel never received the bytes.
+    assert_eq!(channel::readable_len(ch), 0, "bytes leaked into a channel the caller holds no end to");
+    channel::close_end(ch);
+    channel::close_end(ch);
+}
+
+/// Installing a skill-agent package places its packaged SOUL.md into the agent's
+/// home and grants only the approved capability subset (Phase 2). Proves the
+/// "markdown-programmed installable agent" + "bounded by its install grant"
+/// path: the package requests Fs READ|WRITE, but the human approves READ only.
+#[test_case]
+fn agent_install_places_soul_and_grants_read_only_subset() {
+    use agent::types::{next_agent_id, next_skill_id, CapDomain, CapabilityRequest, InstallSource, Rights, Scope};
+
+    let skill = next_skill_id();
+    let agent_id = next_agent_id();
+    let mut pkg = skills::package::sample_report_agent(skill, agent_id);
+    pkg.sign();
+    assert!(pkg.verify(), "freshly signed sample must verify");
+
+    // Human approves READ only (the package requested READ|WRITE).
+    let approved = alloc::vec![CapabilityRequest::new(CapDomain::Fs, Rights::READ, Scope::Any)];
+    let rec = skills::install::install(&pkg, &approved, "tester", InstallSource::BootModule { name: "report-writer".into() }, 100)
+        .expect("install should succeed for a signed package + subset approval");
+
+    // The packaged SOUL.md landed in the agent's home (not the default persona).
+    let soul = synapse::fs::read(&alloc::format!("/agent/{}/SOUL.md", agent_id.0)).expect("SOUL.md placed");
+    assert!(
+        alloc::string::String::from_utf8_lossy(&soul).contains("report-writer agent"),
+        "packaged persona should be placed, got {:?}",
+        alloc::string::String::from_utf8_lossy(&soul)
+    );
+    // The grant is the intersection: READ survives, WRITE was never approved.
+    assert_eq!(rec.granted_capabilities.len(), 1);
+    assert!(rec.granted_capabilities[0].rights.contains(Rights::READ));
+    assert!(!rec.granted_capabilities[0].rights.contains(Rights::WRITE), "WRITE must not be granted — bounded by consent");
+    skills::install::uninstall(skill);
+}
+
+/// `channel_grant` moves a channel end to another agent (Phase 2): a holder of a
+/// write end hands it to a target task, which then genuinely holds
+/// `ChannelWrite`. Proves capability delegation across agents (the Network→SSH
+/// handoff primitive) — attenuation-only, since the caller can only grant an end
+/// it holds.
+#[test_case]
+fn channel_grant_hands_an_end_to_another_agent() {
+    use channel::ChannelKind;
+
+    let c = channel::create(ChannelKind::Stream, 64);
+    let me = sched::current_task_id();
+    cap::grant(me, cap::Right::InvokePrimitive(synapse::registry::CHANNEL_GRANT));
+    let write_slot = cap::grant(me, cap::Right::ChannelWrite(c)).0;
+    let target = sched::spawn_parked("grant-target");
+    assert!(!cap::holds(target, cap::Right::ChannelWrite(c)), "target starts with no end");
+
+    let call = alloc::format!(
+        r#"{{"name":"channel_grant","arguments":{{"chan":{write_slot},"to_agent":"{target}"}}}}"#
+    );
+    match synapse::execute(me, &call) {
+        synapse::Invocation::Executed { result, .. } => {
+            assert!(result.starts_with("ok:granted"), "unexpected grant result: {result}");
+        }
+        other => panic!("channel_grant did not execute: {other:?}"),
+    }
+    assert!(cap::holds(target, cap::Right::ChannelWrite(c)), "target must now hold the granted write end");
+    // Grant to a non-existent agent is refused cleanly.
+    let bad = alloc::format!(r#"{{"name":"channel_grant","arguments":{{"chan":{write_slot},"to_agent":"no-such-svc"}}}}"#);
+    match synapse::execute(me, &bad) {
+        synapse::Invocation::Executed { result, .. } => assert!(result.starts_with("error:no_such_agent")),
+        other => panic!("expected a clean no-such-agent result, got {other:?}"),
+    }
+    channel::close_end(c);
+    channel::close_end(c);
+}
+
+/// The executor's scope gate (Gate 2.5) enforces a granted *path* scope, not
+/// just primitive-granularity authority (Phase 3/7). A task granted Fs WRITE
+/// scoped to `/work/**` may write under it but is denied outside it — even
+/// though it holds the same `InvokePrimitive(mem_fs_write)` either way. A task
+/// with no scope ledger entry is unconstrained (back-compat).
+#[test_case]
+fn scope_gate_enforces_fs_path_scope() {
+    use agent::types::{CapabilityRequest, CapDomain, Rights, Scope};
+
+    let task = sched::spawn_parked("scoped-writer");
+    // Grant WRITE, but only within /work/**. grant_to_task records the scope.
+    let caps = alloc::vec![CapabilityRequest::new(CapDomain::Fs, Rights::WRITE, Scope::Path("/work/**".into()))];
+    agent::manifest::grant_to_task(task, &caps);
+
+    // In-scope write: allowed and executed.
+    let ok = synapse::execute(task, r#"{"name":"mem_fs_write","arguments":{"path":"/work/out.txt","text":"hi"}}"#);
+    assert!(matches!(ok, synapse::Invocation::Executed { .. }), "in-scope write should execute: {ok:?}");
+    assert_eq!(synapse::fs::read("/work/out.txt").as_deref(), Some(&b"hi"[..]));
+
+    // Out-of-scope write: denied by the scope gate, and the file is not created.
+    let denied = synapse::execute(task, r#"{"name":"mem_fs_write","arguments":{"path":"/etc/passwd","text":"x"}}"#);
+    assert!(matches!(denied, synapse::Invocation::DeniedScope { .. }), "out-of-scope write should be denied: {denied:?}");
+    assert!(!synapse::fs::exists("/etc/passwd"), "out-of-scope write must not have happened");
+
+    let _ = sched::kill(task);
+}
+
+/// A home-sandboxed agent (the default for every non-orchestrator agent) may
+/// read/write inside its own `/agent/<id>/` folder but is denied everywhere
+/// else, and `list`/`search` are scope-filtered so they cannot enumerate the
+/// store outside the sandbox — the per-agent filesystem confinement.
+#[test_case]
+fn agent_home_sandbox_confines_fs_and_list() {
+    use agent::types::{AgentId, AgentKind, CapabilityRequest, CapDomain, Rights, Scope};
+
+    // Two files the agent must NOT see: one outside, one is another agent's.
+    synapse::fs::write("/etc/other", b"secret");
+    synapse::fs::write("/agent/9999/note", b"neighbour");
+
+    // The baseline sandbox an installed (non-orchestrator) agent gets.
+    let id = AgentId(4242);
+    let base = alloc::vec::Vec::new();
+    let caps = skills::install::with_home_sandbox(&base, id, AgentKind::SkillAgent);
+    assert!(caps.iter().any(|c| c.domain == CapDomain::Fs), "home Fs cap injected");
+
+    let task = sched::spawn_parked("sandboxed");
+    agent::manifest::grant_to_task(task, &caps);
+
+    // In-home write + read: allowed.
+    let w = synapse::execute(task, r#"{"name":"mem_fs_write","arguments":{"path":"/agent/4242/memory/x","text":"mine"}}"#);
+    assert!(matches!(w, synapse::Invocation::Executed { .. }), "in-home write: {w:?}");
+    let r = synapse::execute(task, r#"{"name":"mem_fs_read","arguments":{"path":"/agent/4242/memory/x"}}"#);
+    assert!(matches!(r, synapse::Invocation::Executed { .. }), "in-home read: {r:?}");
+
+    // Out-of-home read + write: denied by the scope gate.
+    let ro = synapse::execute(task, r#"{"name":"mem_fs_read","arguments":{"path":"/etc/other"}}"#);
+    assert!(matches!(ro, synapse::Invocation::DeniedScope { .. }), "out-of-home read denied: {ro:?}");
+    let wo = synapse::execute(task, r#"{"name":"mem_fs_write","arguments":{"path":"/agent/9999/steal","text":"x"}}"#);
+    assert!(matches!(wo, synapse::Invocation::DeniedScope { .. }), "cross-agent write denied: {wo:?}");
+    assert!(!synapse::fs::exists("/agent/9999/steal"));
+
+    // list + search: only the agent's own file, never /etc/other or 9999's.
+    if let synapse::Invocation::Executed { result, .. } = synapse::execute(task, r#"{"name":"list","arguments":{}}"#) {
+        assert!(result.contains("/agent/4242/memory/x"), "own file listed: {result}");
+        assert!(!result.contains("/etc/other") && !result.contains("/agent/9999/"), "list leaked outside home: {result}");
+    }
+    let s = synapse::execute(task, r#"{"name":"mem_fs_search","arguments":{"query":"secret"}}"#);
+    if let synapse::Invocation::Executed { result, .. } = s {
+        assert!(!result.contains("/etc/other"), "search leaked outside home: {result}");
+    }
+
+    // The orchestrator (root) is never sandboxed: with_home_sandbox is a no-op.
+    let root = skills::install::with_home_sandbox(&base, AgentId(1), AgentKind::Orchestrator);
+    assert!(root.is_empty(), "orchestrator keeps its own (full) caps, no home injection");
+
+    let _ = sched::kill(task);
+}
+
+/// `Scope::Net` coverage (host glob + port range) — the pure attenuation math
+/// the Net scope gate relies on. Narrows, never widens.
+#[test_case]
+fn net_scope_covers_host_and_port_range() {
+    use agent::types::Scope;
+    let grant = Scope::Net { host: "*.example.com".into(), port_lo: 80, port_hi: 443 };
+    // In range + matching host suffix.
+    assert!(grant.covers(&Scope::Net { host: "api.example.com".into(), port_lo: 443, port_hi: 443 }));
+    assert!(grant.covers(&Scope::Net { host: "example.com".into(), port_lo: 80, port_hi: 80 }));
+    // Port out of range -> not covered.
+    assert!(!grant.covers(&Scope::Net { host: "api.example.com".into(), port_lo: 8080, port_hi: 8080 }));
+    // Different host -> not covered.
+    assert!(!grant.covers(&Scope::Net { host: "evil.com".into(), port_lo: 443, port_hi: 443 }));
+    // A "*" host grant covers anything (in range).
+    let any_host = Scope::Net { host: "*".into(), port_lo: 1, port_hi: 65535 };
+    assert!(any_host.covers(&Scope::Net { host: "anything.net".into(), port_lo: 22, port_hi: 22 }));
 }
 
 // --- Phase 6 acceptance tests (taint gate + compiled intents) -----------

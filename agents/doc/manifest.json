@@ -1,0 +1,31 @@
+{
+  "name": "doc",
+  "version": "1.0.0",
+  "kind": "service",
+  "description": "Serves the Chitti OS documentation: maps a request path to a file it reads from its own install folder.",
+  "toolset": [
+    "channel_read",
+    "channel_write",
+    "mem_fs_read"
+  ],
+  "capabilities": [
+    {
+      "domain": "channel",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": [
+        "read"
+      ],
+      "scope": "home"
+    }
+  ],
+  "service": "doc",
+  "autostart": false,
+  "default_port": 8080
+}

@@ -225,6 +225,7 @@ impl Agent {
                     Invocation::Denied { primitive } => alloc::format!("denied:{primitive}"),
                     Invocation::Rejected(err) => alloc::format!("rejected:{err:?}"),
                     Invocation::RefusedTainted { primitive } => alloc::format!("refused:tainted:{primitive}"),
+                    Invocation::DeniedScope { primitive } => alloc::format!("denied:scope:{primitive}"),
                 }
             }
             Action::Remember(key, value) => {

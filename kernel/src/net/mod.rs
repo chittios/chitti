@@ -8,13 +8,17 @@
 //! One NIC at a time (the first discovered: virtio-net, else e1000). Static or
 //! DHCP addressing, DNS resolution, and ICMP echo (ping) are supported.
 
+use crate::cap::ListenerId;
 use crate::mm::Locked;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::{dhcpv4, dns, icmp};
+use smoltcp::phy::{Loopback, Medium};
+use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
@@ -39,6 +43,11 @@ pub trait NetDevice {
 }
 
 const MTU: usize = 1514;
+
+/// How many times to poll the loopback interface per `poll()` call before
+/// yielding. A TCP handshake plus a small reply completes in ~6 rounds; the
+/// bound stops a busy loopback transfer from starving the rest of the poll.
+const LOOPBACK_POLL_ROUNDS: usize = 32;
 
 // --- smoltcp phy adapter -------------------------------------------------
 
@@ -97,6 +106,17 @@ impl smoltcp::phy::Device for ChittiPhy {
 
 struct NetState {
     iface: Interface,
+    /// The **loopback interface** — an Ethernet-medium interface over an
+    /// in-memory `Loopback` device, addressed `127.0.0.1/8`. It is polled against
+    /// its *own* `lo_sockets` set (never the NIC's `sockets`), so its egress can't
+    /// interfere with NIC sockets and vice-versa. A client connecting to
+    /// `127.0.0.1`/`localhost` opens its socket in `lo_sockets` with this
+    /// interface's context (source `127.0.0.1`); its segments loop through the
+    /// device queue back to a loopback listen socket in the same set — never
+    /// touching the NIC. This is what makes in-OS `localhost` connections work.
+    lo_iface: Interface,
+    lo_phy: Loopback,
+    lo_sockets: SocketSet<'static>,
     sockets: SocketSet<'static>,
     phy: ChittiPhy,
     dhcp: SocketHandle,
@@ -108,9 +128,48 @@ struct NetState {
     dns_servers: Vec<Ipv4Address>,
     /// A friendly name for the interface (e.g. "wlan0" once `/wifi` "connects").
     ifname: String,
+    /// Active TCP listeners (a Network service agent's `net_listen`), keyed by id.
+    listeners: BTreeMap<ListenerId, Listener>,
 }
 
+/// A TCP listener: a pool of sockets in `Listen` state on `port`. Accepting one
+/// hands out an established socket and refills the pool with a fresh listener, so
+/// the backlog stays open (the classic accept pattern). It keeps *two* pools —
+/// one in the NIC socket set (external/hostfwd clients arrive at the NIC address)
+/// and one in the loopback set (`127.0.0.1` clients arrive via the lo interface)
+/// — so a single `listen(port)` serves both without either interface touching
+/// the other's sockets.
+struct Listener {
+    port: u16,
+    backlog: Vec<SocketHandle>,
+    lo_backlog: Vec<SocketHandle>,
+}
+
+/// A TCP socket handle tagged with which interface's socket set it lives in, so
+/// the raw `tcp_*` helpers (and a `Tcp`-backed channel) operate on the right set.
+/// Loopback and NIC handles are distinct principals even if the underlying
+/// `SocketHandle` index collides across the two sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpHandle {
+    pub(crate) handle: SocketHandle,
+    pub(crate) loopback: bool,
+}
+
+static NEXT_LISTENER: AtomicU64 = AtomicU64::new(0);
+
 static NET: Locked<Option<NetState>> = Locked::new(None);
+
+impl NetState {
+    /// The socket set a [`TcpHandle`] belongs to: the loopback set for a loopback
+    /// handle, the NIC set otherwise.
+    fn tcp_set(&mut self, h: TcpHandle) -> &mut SocketSet<'static> {
+        if h.loopback {
+            &mut self.lo_sockets
+        } else {
+            &mut self.sockets
+        }
+    }
+}
 
 fn now() -> Instant {
     Instant::from_millis(crate::arch::now_ms() as i64)
@@ -123,8 +182,24 @@ pub fn init(dev: Box<dyn NetDevice>, ifname: &str) {
     let mut phy = ChittiPhy { dev };
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     // Seed smoltcp's PRNG (TCP ISN / DHCP xid) from the boot clock.
-    config.random_seed = crate::arch::now_ms().wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let seed = crate::arch::now_ms().wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    config.random_seed = seed;
     let iface = Interface::new(config, &mut phy, now());
+    // The loopback interface: an Ethernet-medium interface over an in-memory
+    // queue, addressed 127.0.0.1/8, no routes (loopback is always on-link). It is
+    // polled against its own `lo_sockets` set (below), never the NIC's. Ethernet
+    // (not Ip) medium so it doesn't have to special-case socket types; loopback
+    // ARP self-resolves because the device loops the request back to this
+    // interface, which owns 127.0.0.1 and answers it. Its MAC is locally
+    // administered (02:…) and irrelevant — frames never leave the queue.
+    let mut lo_phy = Loopback::new(Medium::Ethernet);
+    let mut lo_config = Config::new(HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])));
+    lo_config.random_seed = seed ^ 0x5151_5151_5151_5151;
+    let mut lo_iface = Interface::new(lo_config, &mut lo_phy, now());
+    lo_iface.update_ip_addrs(|a| {
+        let _ = a.push(IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8)));
+    });
+    let lo_sockets = SocketSet::new(Vec::new());
     let mut sockets = SocketSet::new(Vec::new());
     let dhcp = sockets.add(dhcpv4::Socket::new());
     // DNS socket: no servers until configured; four concurrent query slots.
@@ -133,6 +208,9 @@ pub fn init(dev: Box<dyn NetDevice>, ifname: &str) {
     NET.with(|n| {
         *n = Some(NetState {
             iface,
+            lo_iface,
+            lo_phy,
+            lo_sockets,
             sockets,
             phy,
             dhcp,
@@ -143,6 +221,7 @@ pub fn init(dev: Box<dyn NetDevice>, ifname: &str) {
             gateway: None,
             dns_servers: Vec::new(),
             ifname: String::from(ifname),
+            listeners: BTreeMap::new(),
         });
     });
     crate::ktrace::log_fmt(format_args!("net: {ifname} up, MAC {}", fmt_mac(&mac)));
@@ -192,6 +271,16 @@ pub fn poll() {
         let Some(s) = n.as_mut() else { return };
         let t = now();
         s.iface.poll(t, &mut s.phy, &mut s.sockets);
+        // Pump the loopback interface against its own socket set. Each poll drains
+        // its queue and emits queued segments; a handshake or a small transfer
+        // takes a handful of rounds, so loop until it makes no further progress
+        // (bounded — a large transfer just continues on the next call).
+        use smoltcp::iface::PollResult;
+        for _ in 0..LOOPBACK_POLL_ROUNDS {
+            if let PollResult::None = s.lo_iface.poll(t, &mut s.lo_phy, &mut s.lo_sockets) {
+                break;
+            }
+        }
         if s.dhcp_on {
             // The DHCP `Event` borrows the socket (hence s.sockets), so copy the
             // lease out to owned values before touching `s` again.
@@ -350,6 +439,9 @@ pub fn resolve(name: &str, timeout_ms: u64) -> Result<Ipv4Address, &'static str>
         if crate::arch::now_ms() >= deadline {
             return Err("DNS timeout");
         }
+        if crate::shell::poll_interrupt() {
+            return Err("cancelled");
+        }
         crate::sched::yield_now();
     }
 }
@@ -407,6 +499,9 @@ pub fn ping(addr: Ipv4Address, timeout_ms: u64) -> Result<u64, &'static str> {
         if crate::arch::now_ms() >= deadline {
             break Err("ping timeout");
         }
+        if crate::shell::poll_interrupt() {
+            break Err("cancelled");
+        }
         crate::sched::yield_now();
     };
     // Drop the temporary ICMP socket.
@@ -416,4 +511,178 @@ pub fn ping(addr: Ipv4Address, timeout_ms: u64) -> Result<u64, &'static str> {
         }
     });
     result
+}
+
+// --- TCP listeners + raw socket I/O (inter-agent stream handoff) ------------
+//
+// A Network service agent uses these: `listen` opens a backlog of Listen-state
+// sockets on a port; `try_accept` hands out an established one (a live inbound
+// connection) as a bare `SocketHandle`, which `channel::adopt_tcp` wraps as a
+// Tcp-backed channel it can then `channel_grant` to another agent. The raw
+// `tcp_*` helpers are how the channel's Tcp backend moves bytes.
+
+/// Per-listener backlog depth: how many sockets sit in `Listen` on the port so
+/// several inbound connections can queue before the serve loop accepts them.
+const LISTEN_BACKLOG: usize = 4;
+
+fn new_listen_socket(port: u16) -> tcp::Socket<'static> {
+    let mut sock = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+        tcp::SocketBuffer::new(vec![0u8; 16 * 1024]),
+    );
+    // Not fatal if it fails; the socket just won't accept (checked at accept).
+    let _ = sock.listen(port);
+    sock
+}
+
+/// Open a TCP listener on `port` (a pool of Listen-state sockets). Returns a
+/// `ListenerId` the caller resolves via a `NetListen` capability. Requires the
+/// interface to be up.
+pub fn listen(port: u16) -> Result<ListenerId, &'static str> {
+    NET.with(|n| {
+        let s = n.as_mut().ok_or("no network interface (try /network dhcp)")?;
+        // A pool in the NIC set (external/hostfwd clients) and a pool in the
+        // loopback set (127.0.0.1 clients), so the one listener serves both.
+        let mut backlog = Vec::with_capacity(LISTEN_BACKLOG);
+        let mut lo_backlog = Vec::with_capacity(LISTEN_BACKLOG);
+        for _ in 0..LISTEN_BACKLOG {
+            backlog.push(s.sockets.add(new_listen_socket(port)));
+            lo_backlog.push(s.lo_sockets.add(new_listen_socket(port)));
+        }
+        let id = NEXT_LISTENER.fetch_add(1, Ordering::SeqCst);
+        s.listeners.insert(id, Listener { port, backlog, lo_backlog });
+        crate::ktrace::log_fmt(format_args!("net: listening on TCP :{port} (listener {id}, NIC + loopback)"));
+        Ok(id)
+    })
+}
+
+/// Non-blocking accept: if any backlog socket has left `Listen` state (an
+/// inbound connection arrived), hand it out as a `SocketHandle` and refill the
+/// backlog slot with a fresh listener so the port keeps accepting. `net::poll()`
+/// (pumped from `shell::upkeep`) drives the Listen→Established transition.
+pub fn try_accept(id: ListenerId) -> Option<TcpHandle> {
+    NET.with(|n| {
+        let s = n.as_mut()?;
+        let port = s.listeners.get(&id)?.port;
+        // Find a backlog slot whose socket is fully established, in either pool.
+        // Requiring Established (not merely "left Listen") avoids handing out a
+        // half-open SynReceived socket whose `may_recv` is transiently false —
+        // which an echo loop would misread as an immediate EOF. The NIC pool is
+        // checked first, then the loopback pool.
+        let nic_idx = {
+            let lis = s.listeners.get(&id)?;
+            lis.backlog.iter().position(|&h| s.sockets.get::<tcp::Socket>(h).state() == tcp::State::Established)
+        };
+        if let Some(idx) = nic_idx {
+            let established = s.listeners.get(&id)?.backlog[idx];
+            let fresh = s.sockets.add(new_listen_socket(port));
+            if let Some(lis) = s.listeners.get_mut(&id) {
+                lis.backlog[idx] = fresh;
+            }
+            return Some(TcpHandle { handle: established, loopback: false });
+        }
+        let lo_idx = {
+            let lis = s.listeners.get(&id)?;
+            lis.lo_backlog.iter().position(|&h| s.lo_sockets.get::<tcp::Socket>(h).state() == tcp::State::Established)?
+        };
+        let established = s.listeners.get(&id)?.lo_backlog[lo_idx];
+        let fresh = s.lo_sockets.add(new_listen_socket(port));
+        if let Some(lis) = s.listeners.get_mut(&id) {
+            lis.lo_backlog[lo_idx] = fresh;
+        }
+        Some(TcpHandle { handle: established, loopback: true })
+    })
+}
+
+/// Close a listener: drop its backlog sockets (both pools) and forget it.
+pub fn close_listener(id: ListenerId) {
+    NET.with(|n| {
+        if let Some(s) = n.as_mut() {
+            if let Some(lis) = s.listeners.remove(&id) {
+                for h in lis.backlog {
+                    s.sockets.remove(h);
+                }
+                for h in lis.lo_backlog {
+                    s.lo_sockets.remove(h);
+                }
+            }
+        }
+    });
+}
+
+/// Non-blocking read from a connected TCP socket into `buf`. `Some(0)` = no data
+/// buffered right now; `None` = the socket is gone or can no longer receive.
+/// Used by `channel`'s Tcp backend.
+pub fn tcp_recv(handle: TcpHandle, buf: &mut [u8]) -> Option<usize> {
+    poll();
+    NET.with(|n| {
+        let s = n.as_mut()?;
+        let sock = s.tcp_set(handle).get_mut::<tcp::Socket>(handle.handle);
+        if sock.can_recv() {
+            sock.recv_slice(buf).ok()
+        } else if sock.may_recv() {
+            Some(0) // still open, just nothing buffered
+        } else {
+            None // peer closed / socket done
+        }
+    })
+}
+
+/// Non-blocking write of `data` to a connected TCP socket. Returns bytes queued
+/// (may be fewer than `data.len()`), or `None` if the socket can't send.
+pub fn tcp_send(handle: TcpHandle, data: &[u8]) -> Option<usize> {
+    let r = NET.with(|n| {
+        let s = n.as_mut()?;
+        let sock = s.tcp_set(handle).get_mut::<tcp::Socket>(handle.handle);
+        if sock.can_send() {
+            sock.send_slice(data).ok()
+        } else if sock.may_send() {
+            Some(0)
+        } else {
+            None
+        }
+    });
+    poll(); // push the queued segment out
+    r
+}
+
+/// Whether the socket may still deliver more received data (open for reading).
+pub fn tcp_may_recv(handle: TcpHandle) -> bool {
+    NET.with(|n| n.as_mut().map(|s| s.tcp_set(handle).get_mut::<tcp::Socket>(handle.handle).may_recv()).unwrap_or(false))
+}
+
+/// Bytes still queued in the socket's transmit buffer (not yet sent *and* acked
+/// by the peer — smoltcp keeps them buffered until acknowledged).
+pub fn tcp_send_queue(handle: TcpHandle) -> usize {
+    NET.with(|n| n.as_mut().map(|s| s.tcp_set(handle).get_mut::<tcp::Socket>(handle.handle).send_queue()).unwrap_or(0))
+}
+
+/// Gracefully close (and remove) a TCP socket adopted by a channel. Crucially,
+/// this first **drains the transmit buffer** — a `tcp_send`/`try_write` only
+/// queues bytes into the socket's TX buffer; removing the socket before smoltcp
+/// has actually transmitted (and had acked) those bytes would truncate the
+/// response and give an HTTP client a Content-Length mismatch. So: initiate the
+/// close (queues a FIN after the pending data), poll until the TX buffer drains
+/// or a deadline, then remove.
+pub fn tcp_close(handle: TcpHandle) {
+    NET.with(|n| {
+        if let Some(s) = n.as_mut() {
+            s.tcp_set(handle).get_mut::<tcp::Socket>(handle.handle).close();
+        }
+    });
+    let deadline = crate::arch::now_ms() + 5_000;
+    loop {
+        poll();
+        if tcp_send_queue(handle) == 0 || crate::arch::now_ms() >= deadline {
+            break;
+        }
+        crate::shell::upkeep();
+        crate::sched::yield_now();
+    }
+    NET.with(|n| {
+        if let Some(s) = n.as_mut() {
+            s.tcp_set(handle).remove(handle.handle);
+        }
+    });
+    poll();
 }

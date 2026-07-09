@@ -57,7 +57,8 @@ A [`Makefile`](Makefile) wraps the common flows (`make help` lists them);
 | `make build` / `make build-all` | `cargo xtask build -arch <arch> …` (build-all does both arches) |
 | `make run` / `make run-uefi` | `cargo xtask run -arch <arch> …` (run-uefi adds `--uefi`) |
 | `make image` | `cargo xtask image -arch <arch> …` |
-| `make test` | `cargo xtask test` |
+| `make test` | `cargo xtask test` (in-kernel unit suite) |
+| `make e2e` / `make e2e-full` | boot the real kernel + drive the shell over serial (`--slow` adds model/voice) |
 | `make verify` | x86 build + `test` + aarch64 build (the standing-rule gate) |
 | `make vbox` | rebuild the aarch64 image and reload it into a VirtualBox VM |
 | `make model` / `make fmt` / `make clean` | fetch the GGUF / format / clean |
@@ -69,7 +70,7 @@ The underlying `cargo xtask` commands:
 | `cargo xtask build -arch <arch> [--release] [-model <m>]` | Cross-compile the kernel. |
 | `cargo xtask run   -arch <arch> [--release] [-model <m>]` | Build the image and boot it in QEMU (serial to stdio + a graphical window). |
 | `cargo xtask image -arch <arch> [-model <m>]` | Assemble a bootable image (x86: hybrid BIOS/UEFI ISO; aarch64: a GPT disk image that boots standalone via UEFI). |
-| `cargo xtask test` | Run the in-kernel `custom_test_frameworks` suite under `qemu-system-x86_64`, headless, asserting via serial + `isa-debug-exit`. **Must stay 104/104.** |
+| `cargo xtask test` | Run the in-kernel `custom_test_frameworks` suite under `qemu-system-x86_64`, headless, asserting via serial + `isa-debug-exit`. **Keep it green** (currently ~167 cases). |
 
 `-model qwen3.5-2b` (the default), `-model qwen3.5-0.8b`, `-model qwen3.5-4b`, or
 `-model qwen3.5-9b` selects the bundled model and its heap-size tier. The memory
@@ -99,9 +100,10 @@ the chat/inference demo; numerics are validated against `tools/ref_qwen35.py`
 1. **Dual-arch parity.** A change must build and work on **both** arches.
    After any change run **all** of:
    ```sh
-   cargo xtask build -arch x86_64 && cargo xtask test      # 104/104
+   cargo xtask build -arch x86_64 && cargo xtask test      # keep it green
    cargo xtask build -arch aarch64
    cargo xtask run   -arch aarch64                         # if the change is boot-visible
+   make e2e                                                # if the change is boot-visible or networked
    ```
 2. **Real hardware, nothing emulator-specific.** Drivers discover hardware the
    way firmware does (ACPI/PCIe ECAM, UEFI GOP, fw_cfg, HID report descriptors,
@@ -119,7 +121,34 @@ cargo xtask test
 
 Cross-compiles the `--test` kernel and boots each test binary in QEMU headlessly,
 translating `isa-debug-exit` into a pass/fail exit code. Deterministic (fixed
-seeds, temperature 0). This is the gate — keep it green.
+seeds, temperature 0). This is the gate — keep it green. It covers the **pure
+logic** (parsers, codecs, capability/scope math, the channel ring, the UI
+draw-op rasterizer, HTTP request parsing, P-256 verification, …); it never loads
+the model or touches hardware.
+
+### End-to-end tests
+
+```sh
+make e2e                 # os + agents + net groups (~3 min)
+make e2e-full            # + local inference (--slow) and voice; needs assets
+```
+
+`tests/e2e/` (stdlib-only Python) boots the **real kernel** under QEMU and drives
+its shell over the serial console, asserting on real output. It covers what only
+exists on the running OS:
+
+- **os** — every `/`-command prints its marker.
+- **agents** — install-with-consent + capability subsetting, service lifecycle
+  (`/agents services`, `start-net`, `start-http`), the **network** and
+  **HTTP/Doc** service agents (the host reaches guest listeners over an opt-in
+  slirp host-forward — `CHITTI_HOSTFWD=<ports>`, wired automatically by the
+  harness), **registry** search + install, and **UI surfaces**.
+- **net** — DHCP, ping, `/http` GET/POST/stream, `ws`/`wss`, hosted-model chat.
+
+TLS scenarios need a TLS-1.3 Python (Homebrew's, not macOS system LibreSSL) and
+auto-skip otherwise; `--slow` model/voice scenarios auto-skip when their assets
+are absent. **Adding a shell command or a networked/service/UI feature means
+adding an e2e scenario** — see `tests/e2e/README.md`.
 
 ### Booting interactively
 
@@ -204,16 +233,19 @@ chitti/
 ├── targets/              # custom bare-metal target JSONs (x86_64-chitti, aarch64-chitti)
 ├── xtask/                # build orchestration: image assembly + QEMU + tests
 ├── stub/                 # aarch64 UEFI bootloader (BOOTAA64.EFI): GOP + boot-info handoff
+├── agents/               # built-in system agents as markdown SOUL + JSON manifest (network, http, doc, ssh)
 ├── assets/               # Geist Mono font (+ generator); model fetched here, not committed
 ├── tools/                # NumPy inference reference, font atlas generator, mkext4 reference
+├── tests/e2e/            # end-to-end harness: boots the kernel, drives the shell over serial
 └── kernel/               # the OS — a standalone crate (own workspace, own Cargo.lock)
     └── src/
         ├── main.rs, lib.rs        # boot entries (x86 + aarch64), init sequence, test harness
         ├── arch/{x86_64,aarch64}/ # per-arch drivers behind the arch facade (arch/mod.rs)
-        ├── mm/ sched/ cap/ ipc/ smp.rs   # microkernel: memory, tasks, capabilities, IPC, SMP
+        ├── mm/ sched/ cap/ ipc/ channel/ smp.rs  # microkernel: memory, tasks, caps, IPC, channels, SMP
         ├── cortex/                 # CPU inference: gguf, tensor kernels, model, sampler, batch
-        ├── synapse/                # capability ABI: registry, grammar, executor, audit, fs, taint
-        ├── agent/ session/ tools/ skills/  # the agent layer, sessions, tools, skills
+        ├── synapse/                # capability ABI: registry, grammar, executor, audit, fs, taint, ui
+        ├── agent/ session/ tools/ skills/  # the agent layer, sessions, tools, skills (+ registry_client)
+        ├── service/                # long-running native service agents (network, http/doc) + supervisor
         ├── block/ fs/              # block devices (virtio/nvme/ahci) + FAT/ext4
         ├── framebuffer.rs font_geist.rs editor.rs mouse.rs clock.rs ui_config.rs json.rs
         ├── console.rs serial.rs ktrace.rs   # I/O + deterministic logging

@@ -214,7 +214,7 @@ enum Transport {
 /// watch the keyboard; for `wss://` the TLS session's read deadline is a
 /// rolling atomic (`roll`) bumped before each read.
 pub struct WebSocket {
-    handle: smoltcp::iface::SocketHandle,
+    handle: super::TcpHandle,
     transport: Transport,
     /// Rolling read deadline for the TLS transport (unused for plaintext).
     roll: Option<&'static core::sync::atomic::AtomicU64>,
@@ -269,7 +269,7 @@ impl WebSocket {
                 Err(e) => {
                     NET.with(|n| {
                         if let Some(s) = n.as_mut() {
-                            s.sockets.remove(handle);
+                            s.tcp_set(handle).remove(handle.handle);
                         }
                     });
                     return Err(e);
@@ -413,7 +413,7 @@ impl WebSocket {
                     super::poll();
                     let n = NET.with(|n| {
                         let s = n.as_mut()?;
-                        let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
+                        let sock = s.tcp_set(self.handle).get_mut::<tcp::Socket>(self.handle.handle);
                         if sock.can_send() {
                             sock.send_slice(&data[sent..]).ok()
                         } else {
@@ -443,11 +443,11 @@ impl WebSocket {
         let mut mark_closed = false;
         let out = match &mut self.transport {
             Transport::Secure { tls, more } => {
-                let has_tcp = NET.with(|n| n.as_mut().map(|s| s.sockets.get_mut::<tcp::Socket>(handle).can_recv()).unwrap_or(false));
+                let has_tcp = NET.with(|n| n.as_mut().map(|s| s.tcp_set(handle).get_mut::<tcp::Socket>(handle.handle).can_recv()).unwrap_or(false));
                 if !has_tcp && !*more {
                     // Idle: detect a peer close so recv() can report it.
                     let closed = NET.with(|n| {
-                        n.as_mut().map(|s| matches!(s.sockets.get_mut::<tcp::Socket>(handle).state(), tcp::State::CloseWait | tcp::State::Closed | tcp::State::TimeWait)).unwrap_or(true)
+                        n.as_mut().map(|s| matches!(s.tcp_set(handle).get_mut::<tcp::Socket>(handle.handle).state(), tcp::State::CloseWait | tcp::State::Closed | tcp::State::TimeWait)).unwrap_or(true)
                     });
                     mark_closed = closed;
                     Ok(Vec::new())
@@ -466,7 +466,7 @@ impl WebSocket {
             }
             Transport::Plain => NET.with(|n| {
                 let s = n.as_mut().ok_or("network down")?;
-                let sock = s.sockets.get_mut::<tcp::Socket>(handle);
+                let sock = s.tcp_set(handle).get_mut::<tcp::Socket>(handle.handle);
                 let mut out = Vec::new();
                 let mut buf = [0u8; 2048];
                 while sock.can_recv() {
@@ -491,8 +491,8 @@ impl WebSocket {
     fn abort(&mut self) {
         NET.with(|n| {
             if let Some(s) = n.as_mut() {
-                s.sockets.get_mut::<tcp::Socket>(self.handle).abort();
-                s.sockets.remove(self.handle);
+                s.tcp_set(self.handle).get_mut::<tcp::Socket>(self.handle.handle).abort();
+                s.tcp_set(self.handle).remove(self.handle.handle);
             }
         });
     }

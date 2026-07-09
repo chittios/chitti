@@ -1012,6 +1012,18 @@ impl InterfaceInner {
     }
 
     fn route(&self, addr: &IpAddress, timestamp: Instant) -> Option<IpAddress> {
+        // RFC 1122: a datagram to a loopback address must never leave the host.
+        // Only an interface that actually holds that loopback subnet (a dedicated
+        // loopback interface with 127.0.0.0/8 or ::1) may route it — the check
+        // below via `in_same_network`. On any other interface we return `None`
+        // rather than fall through to the default route, so loopback traffic is
+        // never emitted to a gateway on the wire. This lets a loopback interface
+        // share a SocketSet with an Ethernet interface without the latter
+        // stealing (and leaking) 127.0.0.1 segments.
+        if addr.is_loopback() && !self.in_same_network(addr) {
+            return None;
+        }
+
         // Send directly.
         // note: no need to use `self.is_broadcast()` to check for subnet-local broadcast addrs
         //       here because `in_same_network` will already return true.

@@ -62,6 +62,31 @@ pub const EMIT_RESULT: PrimitiveId = 6;
 pub const MEM_FS_DELETE: PrimitiveId = 7;
 pub const MEM_FS_EDIT: PrimitiveId = 8;
 pub const MEM_FS_SEARCH: PrimitiveId = 9;
+// Inter-agent channels (Phase 1). Handle args (`chan`) are the caller's own
+// `Cap` slot index, resolved by the executor — never a global id.
+pub const CHANNEL_CREATE: PrimitiveId = 10;
+pub const CHANNEL_WRITE: PrimitiveId = 11;
+pub const CHANNEL_READ: PrimitiveId = 12;
+pub const CHANNEL_CLOSE: PrimitiveId = 13;
+// Hand (a copy of) a channel end to another agent (Phase 2). Destructive: it
+// moves authority to another principal, so injected content can't silently
+// exfiltrate a stream to an attacker-controlled agent without a human confirm.
+pub const CHANNEL_GRANT: PrimitiveId = 14;
+// Network capability (Phase 3). `net_listen` binds a port (destructive: an
+// externally-visible effect). `net_accept` hands out an inbound connection as a
+// channel. `net_http_get`/`net_http_post` are scope-gated egress; POST is
+// destructive (an exfiltration vector under prompt injection).
+pub const NET_LISTEN: PrimitiveId = 15;
+pub const NET_ACCEPT: PrimitiveId = 16;
+pub const NET_HTTP_GET: PrimitiveId = 17;
+pub const NET_HTTP_POST: PrimitiveId = 18;
+// UI surfaces (Phase 4): a Chess/Image/Video/Browser/Doc agent owns a surface
+// and paints it with a bounded draw-op DSL. Gated by surface ownership, not just
+// the primitive right. None are destructive (drawing is reversible).
+pub const UI_SURFACE_REQUEST: PrimitiveId = 19;
+pub const UI_DRAW: PrimitiveId = 20;
+pub const UI_EVENT_POLL: PrimitiveId = 21;
+pub const UI_SURFACE_CLOSE: PrimitiveId = 22;
 
 const STR: ArgType = ArgType::Str;
 const UINT: ArgType = ArgType::Uint;
@@ -139,6 +164,97 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
         description: "List the paths of files whose contents contain `query`.",
         destructive: false,
     },
+    PrimitiveSpec {
+        id: CHANNEL_CREATE,
+        name: "channel_create",
+        params: &[Param { key: "kind", ty: STR }],
+        description: "Create an inter-agent channel (kind: \"stream\" or \"datagram\"). Returns the read and write end cap slots granted to the caller.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: CHANNEL_WRITE,
+        name: "channel_write",
+        params: &[Param { key: "chan", ty: UINT }, Param { key: "text", ty: STR }],
+        description: "Write text bytes to a channel. `chan` is the caller's write-end cap slot. Returns bytes written or blocked.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: CHANNEL_READ,
+        name: "channel_read",
+        params: &[Param { key: "chan", ty: UINT }, Param { key: "max", ty: UINT }],
+        description: "Read up to `max` bytes from a channel. `chan` is the caller's read-end cap slot. Cooperatively blocks briefly; returns data or eof.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: CHANNEL_CLOSE,
+        name: "channel_close",
+        params: &[Param { key: "chan", ty: UINT }],
+        description: "Close the caller's channel end named by cap slot `chan`.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: CHANNEL_GRANT,
+        name: "channel_grant",
+        params: &[Param { key: "chan", ty: UINT }, Param { key: "to_agent", ty: STR }],
+        description: "Hand the channel end at cap slot `chan` to another agent (by service name or task id). Destructive: moves authority to another principal.",
+        destructive: true,
+    },
+    PrimitiveSpec {
+        id: NET_LISTEN,
+        name: "net_listen",
+        params: &[Param { key: "port", ty: UINT }, Param { key: "proto", ty: STR }],
+        description: "Listen for inbound TCP connections on a port. Returns a listener cap slot. Destructive: binds an externally-visible port.",
+        destructive: true,
+    },
+    PrimitiveSpec {
+        id: NET_ACCEPT,
+        name: "net_accept",
+        params: &[Param { key: "listener", ty: UINT }],
+        description: "Accept one inbound connection on a listener (cap slot). Returns the connection's read/write channel end cap slots. Blocks briefly.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: NET_HTTP_GET,
+        name: "net_http_get",
+        params: &[Param { key: "url", ty: STR }],
+        description: "HTTP GET a URL (scope-gated by host/port). Returns the response body.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: NET_HTTP_POST,
+        name: "net_http_post",
+        params: &[Param { key: "url", ty: STR }, Param { key: "body", ty: STR }],
+        description: "HTTP POST a body to a URL (scope-gated). Destructive: network egress that can exfiltrate.",
+        destructive: true,
+    },
+    PrimitiveSpec {
+        id: UI_SURFACE_REQUEST,
+        name: "ui_surface_request",
+        params: &[Param { key: "kind", ty: STR }],
+        description: "Request a drawing surface (kind: canvas|board|image|video|html). Returns its surface id.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: UI_DRAW,
+        name: "ui_draw",
+        params: &[Param { key: "surface", ty: UINT }, Param { key: "ops", ty: STR }],
+        description: "Paint a surface you own with draw ops: 'clear <hex>; rect x y w h <hex>; line x0 y0 x1 y1 <hex>; pixel x y <hex>'.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: UI_EVENT_POLL,
+        name: "ui_event_poll",
+        params: &[Param { key: "surface", ty: UINT }],
+        description: "Poll one input event (click/key) for a surface you own. Returns the event or none.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: UI_SURFACE_CLOSE,
+        name: "ui_surface_close",
+        params: &[Param { key: "surface", ty: UINT }],
+        description: "Close a surface you own.",
+        destructive: false,
+    },
 ];
 
 /// Look up a primitive by its wire name. `None` for any name not in the
@@ -184,10 +300,12 @@ mod tests {
     }
 
     #[test_case]
-    fn only_mem_fs_delete_is_destructive() {
-        // Exactly one destructive primitive today; the taint gate keys off
-        // this flag, so guard against a careless future addition.
+    fn destructive_primitives_are_exactly_the_known_set() {
+        // The taint gate keys off this flag, so guard against a careless future
+        // addition: any new destructive primitive must be a deliberate edit here.
+        // `mem_fs_delete` (irreversible), `channel_grant` (moves authority to
+        // another principal — an exfiltration vector under prompt injection).
         let destructive: alloc::vec::Vec<_> = REGISTRY.iter().filter(|p| p.destructive).map(|p| p.name).collect();
-        assert_eq!(destructive, alloc::vec!["mem_fs_delete"]);
+        assert_eq!(destructive, alloc::vec!["mem_fs_delete", "channel_grant", "net_listen", "net_http_post"]);
     }
 }

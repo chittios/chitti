@@ -11,6 +11,19 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// activity indicator.
 static INPUT_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
 
+/// A one-byte pushback slot (`0x100` = empty), so a byte read speculatively —
+/// e.g. by the cancel-poll in a running command, checking for Ctrl+C — can be
+/// returned to the input stream if it isn't the one we wanted. Keeps a long
+/// command's cancel-poll from swallowing the *next* command's keystrokes.
+static PENDING: AtomicU64 = AtomicU64::new(EMPTY);
+const EMPTY: u64 = 0x100;
+
+/// Push a byte back so the next [`read_byte`] returns it. Only one byte is held;
+/// a second push overwrites the first (the poll loops only ever hold one).
+pub fn unread(byte: u8) {
+    PENDING.store(byte as u64, Ordering::Relaxed);
+}
+
 /// When keyboard input was last seen (`arch::now_ms` timebase; 0 = never).
 pub fn input_activity_ms() -> u64 {
     INPUT_ACTIVITY_MS.load(Ordering::Relaxed)
@@ -20,6 +33,11 @@ pub fn input_activity_ms() -> u64 {
 /// USB (xHCI/HID) → serial; aarch64: USB (xHCI/HID) → PL050 PS/2 → virtio-keyboard
 /// → PL011 serial -- or `None` if none is available.
 pub fn read_byte() -> Option<u8> {
+    // A pushed-back byte (see `unread`) takes priority over a fresh read.
+    let pending = PENDING.swap(EMPTY, Ordering::Relaxed);
+    if pending != EMPTY {
+        return Some(pending as u8);
+    }
     let b = read_byte_raw();
     if b.is_some() {
         INPUT_ACTIVITY_MS.store(crate::arch::now_ms(), Ordering::Relaxed);
@@ -60,4 +78,21 @@ pub fn put_byte(byte: u8) {
     crate::serial::put_byte(byte);
     #[cfg(not(test))]
     crate::framebuffer::console_put_byte(byte);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pushed-back byte is returned by the very next `read_byte`, ahead of any
+    /// hardware input — this is what lets a running command's cancel-poll peek for
+    /// Ctrl+C without swallowing the next command's keystrokes.
+    #[test_case]
+    fn pushback_is_returned_before_hardware() {
+        unread(b'Z');
+        assert_eq!(read_byte(), Some(b'Z'));
+        // The slot is one-deep and now empty; a second push round-trips too.
+        unread(0x03);
+        assert_eq!(read_byte(), Some(0x03));
+    }
 }
