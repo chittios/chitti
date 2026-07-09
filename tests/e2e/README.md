@@ -1,4 +1,4 @@
-# Chitti OS — end-to-end tests
+# ChittiOS — end-to-end tests
 
 These boot the real kernel under QEMU and drive its shell over the serial
 console, exercising the **networked core flows** against local host servers:

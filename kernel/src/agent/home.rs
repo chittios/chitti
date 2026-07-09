@@ -29,7 +29,7 @@ pub fn ensure(id: u64, name: &str) {
         // A concise *persona* the model adopts — not documentation about the
         // file (a chatty meta description gets parroted back as an answer).
         let default = format!(
-            "You are {name}, the shell agent of Chitti OS. You are concise, direct, and \
+            "You are {name}, the shell agent of ChittiOS. You are concise, direct, and \
              practical. You operate the machine through tools and answer in plain prose."
         );
         fs::write(&soul, default.as_bytes());

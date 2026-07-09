@@ -40,7 +40,7 @@ use alloc::vec;
 pub fn default_manifest(name: &str) -> Manifest {
     Manifest::new(
         name,
-        "You are a Chitti OS agent. Plan an intent as a short sequence of capability calls and report the result.",
+        "You are a ChittiOS agent. Plan an intent as a short sequence of capability calls and report the result.",
         vec![
             registry::CONSOLE_WRITE,
             registry::MEM_FS_READ,

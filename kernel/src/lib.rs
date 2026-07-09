@@ -1,4 +1,4 @@
-//! Chitti OS kernel library: shared code between the real boot binary
+//! ChittiOS kernel library: shared code between the real boot binary
 //! (`src/main.rs`) and the in-kernel test harness (`cargo test --lib`,
 //! compiled via `custom_test_frameworks`). Everything below the
 //! determinism boundary starts here — see `CHITTI_OS_HANDOFF.md` Part 2.
@@ -12,7 +12,7 @@
 #![cfg_attr(target_arch = "x86_64", reexport_test_harness_main = "test_main")]
 extern crate alloc;
 
-/// Chitti OS version, shown in the status bar and `/info`.
+/// ChittiOS version, shown in the status bar and `/info`.
 pub const VERSION: &str = env!("CHITTI_VERSION");
 /// Build timestamp (release workflows inject the real one; local = "dev").
 pub const BUILD_TIME: &str = env!("CHITTI_BUILD_TIME");

@@ -1,4 +1,4 @@
-//! Build orchestration for Chitti OS: assembles a bootable Limine image
+//! Build orchestration for ChittiOS: assembles a bootable Limine image
 //! from the kernel and drives QEMU. All project commands go through
 //! `cargo xtask <cmd>` (see CHITTI_OS_HANDOFF.md Part 7).
 

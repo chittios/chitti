@@ -1,4 +1,4 @@
-# Chitti OS — guide for agents & humans working in this repo
+# ChittiOS — guide for agents & humans working in this repo
 
 **Chitti is an agentic operating system: the agent is the driver.** The
 fundamental unit of execution is an AI agent, not a compiled binary. There is no

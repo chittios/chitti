@@ -792,7 +792,7 @@ fn print_help_text() {
 /// session + chat KV).
 fn print_info(orch: &crate::agent::orchestrator::Orchestrator, chat: Option<&ChatSession>) {
     let mib = |b: usize| b / (1024 * 1024);
-    serial_println!("Chitti OS — agentic re-architecture (Phases A-G)  v{} (built {})", crate::VERSION, crate::BUILD_TIME);
+    serial_println!("ChittiOS — agentic re-architecture (Phases A-G)  v{} (built {})", crate::VERSION, crate::BUILD_TIME);
 
     // Arch + cores + SIMD.
     #[cfg(target_arch = "x86_64")]
@@ -4149,7 +4149,7 @@ fn run_ws(arg: &str) {
     }
 }
 
-/// `/agents` — agents are processes in Chitti OS. List the live scheduler
+/// `/agents` — agents are processes in ChittiOS. List the live scheduler
 /// tasks that carry agent identity (the shell agent, parked orchestrator /
 /// sub-agent capability holders), switch the shell chat to another agent's
 /// home (SOUL.md persona), or kill one.
@@ -8812,7 +8812,7 @@ fn confirm_install(pre_confirmed: bool, update: bool, disk: usize) -> bool {
     }
     let (title, msg) = if update {
         (
-            "Update Chitti OS \u{2014} confirm?",
+            "Update ChittiOS \u{2014} confirm?",
             alloc::format!(
                 "Disk {} already has Chitti installed. The system partitions (boot loader, kernel, model) will be REWRITTEN; the data partition (agent state) is preserved. Add 'format' to erase everything instead. Proceed?",
                 disk
@@ -8820,7 +8820,7 @@ fn confirm_install(pre_confirmed: bool, update: bool, disk: usize) -> bool {
         )
     } else {
         (
-            "Install Chitti OS \u{2014} confirm?",
+            "Install ChittiOS \u{2014} confirm?",
             alloc::format!("This ERASES EVERYTHING on disk {} and repartitions it (GPT: ESP + ext4). Proceed?", disk),
         )
     };
@@ -8855,7 +8855,7 @@ fn disk_install(arg: &str) {
             return None;
         }
         let find = |n: &str| parts.iter().find(|p| p.name == n).map(|p| (p.first_lba, p.last_lba));
-        match (find("EFI System"), find("Chitti OS")) {
+        match (find("EFI System"), find("ChittiOS")) {
             (Some(e), Some(o)) => Some((e, o)),
             _ => None,
         }
@@ -8890,7 +8890,7 @@ fn disk_install(arg: &str) {
     // 2. FAT ESP: the Limine loader at /EFI/BOOT/BOOTX64.EFI, plus limine.conf
     //    + the kernel at the root, so the disk boots from FAT alone (UEFI
     //    firmware requires FAT; Limine reads its config from the boot volume).
-    let esp_conf = b"timeout: 0\n\n/Chitti OS\n    protocol: limine\n    resolution: 1920x1080\n    path: boot():/chitti-kernel\n";
+    let esp_conf = b"timeout: 0\n\n/ChittiOS\n    protocol: limine\n    resolution: 1920x1080\n    path: boot():/chitti-kernel\n";
     {
         let mut esp = Partition::new(&mut dev, esp_range.0, esp_range.1 - esp_range.0 + 1);
         let r = FatWriter::format(&mut esp).and_then(|mut fw| {
@@ -8908,7 +8908,7 @@ fn disk_install(arg: &str) {
 
     // 3. ext4 OS partition: limine.conf + kernel + model parts.
     let parts = crate::cortex::model_parts();
-    let mut conf = String::from("timeout: 3\n\n/Chitti OS\n    protocol: limine\n    resolution: 1920x1080\n    path: boot():/chitti-kernel\n");
+    let mut conf = String::from("timeout: 3\n\n/ChittiOS\n    protocol: limine\n    resolution: 1920x1080\n    path: boot():/chitti-kernel\n");
     for (name, _) in &parts {
         conf.push_str("    module_path: boot():/");
         conf.push_str(name);

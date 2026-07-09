@@ -5,7 +5,7 @@ use alloc::string::String;
 static mut IDX: usize = 0;
 
 const SLIDES: &[(&str, &str, &str)] = &[
-    ("Chitti OS", "Agentic operating system", "cc785c"),
+    ("ChittiOS", "Agentic operating system", "cc785c"),
     ("Agents", "notes paint slides games synth", "6688cc"),
     ("WASM", "Logic in tools.wasm — not the kernel", "5a8f5a"),
     ("Thanks", "slides_next / slides_prev", "8a6a4a"),

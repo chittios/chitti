@@ -1,6 +1,6 @@
 # Development guide
 
-How to build, run, and test Chitti OS locally on both architectures. Everything
+How to build, run, and test ChittiOS locally on both architectures. Everything
 goes through `cargo xtask`; the target arch is always explicit
 (`-arch x86_64|aarch64`), never host-detected.
 

@@ -1,4 +1,4 @@
-# Chitti OS
+# ChittiOS
 
 **An agentic operating system, built from scratch, where the agent is the driver.**
 
@@ -225,7 +225,7 @@ honour (dual-arch parity and real-hardware drivers). Security issues: please rea
 
 ## License
 
-Chitti OS is licensed under the **GNU General Public License v3.0** — see
+ChittiOS is licensed under the **GNU General Public License v3.0** — see
 [LICENSE](LICENSE).
 
 The bundled font is **Geist Mono** (© Vercel), used under the SIL Open Font

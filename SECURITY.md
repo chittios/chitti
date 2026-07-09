@@ -2,7 +2,7 @@
 
 ## Status
 
-Chitti OS is an experimental research operating system under **active
+ChittiOS is an experimental research operating system under **active
 development**. It is **not stable and not intended for production or for
 handling sensitive data.** Run it in a virtual machine. It is provided "as is",
 with no warranty; the authors are not responsible for any damage or data loss.

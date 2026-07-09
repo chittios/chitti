@@ -2,7 +2,7 @@
   "name": "doc",
   "version": "1.0.0",
   "kind": "service",
-  "description": "Serves the Chitti OS documentation via assets/tools.wasm (route_request); model SOUL is fallback only.",
+  "description": "Serves the ChittiOS documentation via assets/tools.wasm (route_request); model SOUL is fallback only.",
   "toolset": [
     "channel_read",
     "channel_write",

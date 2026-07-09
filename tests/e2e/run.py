@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end tests for Chitti OS: boot the kernel under QEMU, drive its shell
+"""End-to-end tests for ChittiOS: boot the kernel under QEMU, drive its shell
 over the serial console, and check that every command / flow actually works on
 the real thing.
 

@@ -1,6 +1,6 @@
 # Third-party licenses
 
-Chitti OS is licensed under the GNU General Public License v3.0 (see
+ChittiOS is licensed under the GNU General Public License v3.0 (see
 [LICENSE](LICENSE)). It bundles the following third-party source in-tree; each
 retains its own license, reproduced below.
 

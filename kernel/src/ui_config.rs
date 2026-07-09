@@ -70,7 +70,7 @@ impl Default for UiConfig {
             swap_panes: false,
             chat_title: "Shell Agent".to_string(),
             logs_title: "ktrace".to_string(),
-            status_left: "Chitti OS v${version}".to_string(),
+            status_left: "ChittiOS v${version}".to_string(),
             status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${datetime} ${tz}".to_string(),
             tz_offset: 0,
             splash: true,
@@ -270,7 +270,7 @@ fn resolve_template(t: &str) -> String {
 
 fn resolve_var(var: &str) -> String {
     match var {
-        "brand" => "Chitti OS".to_string(),
+        "brand" => "ChittiOS".to_string(),
         "version" => crate::VERSION.to_string(),
         "build" => crate::BUILD_TIME.to_string(),
         "date" => crate::clock::format_date(),

@@ -804,7 +804,7 @@ impl Screen {
         // fullscreen parking becomes a 1-col reflow of the whole history.
         let chat = Pane::new(chat_x, box_y, chat_bw, box_h, cw, ch, th.chat_fg, th.chat_bg, cfg.chat_title.clone(), true);
         let logs = Pane::new(logs_x, box_y, logs_bw, box_h, cw, ch, th.logs_fg, th.logs_bg, cfg.logs_title.clone(), false);
-        let mut status_left = String::from("Chitti OS v");
+        let mut status_left = String::from("ChittiOS v");
         status_left.push_str(crate::VERSION);
         Screen {
             addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift, scale, chat, logs,
@@ -1963,7 +1963,7 @@ impl Screen {
         self.fill_disc(cx, cy, nr, node_c);
     }
 
-    /// Paint the boot splash: the brand mark, "Chitti OS", and a tagline, centred
+    /// Paint the boot splash: the brand mark, "ChittiOS", and a tagline, centred
     /// on the canvas. Shown briefly at boot (see [`show_splash`]).
     fn draw_splash(&self) {
         self.fill_rect(0, 0, self.width, self.height, self.theme.screen_bg);
@@ -1971,7 +1971,7 @@ impl Screen {
         let cy = self.height * 2 / 5;
         // Ring in terracotta (accent), node in cream (chat_fg) — see the SVG.
         self.draw_logo(self.width / 2, cy, r, self.theme.accent, self.theme.chat_fg);
-        let name = "Chitti OS";
+        let name = "ChittiOS";
         let nx = self.width / 2 - (name.len() as u64 * self.cw()) / 2;
         self.draw_str(nx, cy + r + r / 2, name, self.theme.accent, self.theme.screen_bg);
         let tag = "an agentic operating system";

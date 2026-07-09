@@ -1,6 +1,6 @@
-# Chitti OS — design & brand
+# ChittiOS — design & brand
 
-The visual identity of Chitti OS: the mark, the palette, the type, and how the
+The visual identity of ChittiOS: the mark, the palette, the type, and how the
 console renders them. Everything here is driven by the framebuffer compositor
 ([`kernel/src/framebuffer.rs`](kernel/src/framebuffer.rs)) and is
 **configurable at runtime** from `/configs/core/ui.json` (edit via `/ui` or the
@@ -20,7 +20,7 @@ rotated 35°, centre node `r 5.5`; stroke width ≈ `6/17·r` and node ≈ `0.32
 drive the integer form):
 
 ```svg
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Chitti OS">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="ChittiOS">
   <rect width="64" height="64" rx="14" fill="#1c1917"/>
   <!-- Synapse-C mark: an open ring (capability) with a node (the agent) -->
   <circle cx="32" cy="32" r="17" fill="none" stroke="#cc785c" stroke-width="6" stroke-linecap="round" stroke-dasharray="80 27" transform="rotate(35 32 32)"/>
@@ -34,7 +34,7 @@ surface (the SVG's `#1c1917` tile).
 
 Where it appears:
 
-- **Boot splash** — the mark, `Chitti OS`, and the tagline *an agentic operating
+- **Boot splash** — the mark, `ChittiOS`, and the tagline *an agentic operating
   system*, centred on the canvas, held ~1.3 s before the shell (`draw_splash`).
 - **Status bar** — a small mark at the bottom-left, before the brand text.
 - **Input composer** — a Grok-style bordered box at the bottom of the chat pane
@@ -101,7 +101,7 @@ omit any key to keep the brand default.
   "swap_panes": false,
   "chat_title": "chat",
   "logs_title": "ktrace",
-  "status_left": "Chitti OS v${version}",
+  "status_left": "ChittiOS v${version}",
   "status_right": "${datetime}  ${tz}",
   "tz_offset": 0,
   "splash": true,

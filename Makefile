@@ -1,4 +1,4 @@
-# Chitti OS — local dev convenience wrapper around `cargo xtask`.
+# ChittiOS — local dev convenience wrapper around `cargo xtask`.
 # Everything still works via `cargo xtask <cmd>` directly; this is just shorthand.
 # See DEVELOPMENT.md for the full setup.
 
@@ -34,7 +34,7 @@ FLAGS   := -arch $(ARCH) -model $(MODEL) $(REL)
 ## help: list targets
 .PHONY: help
 help:
-	@echo "Chitti OS — make targets (ARCH=$(ARCH) MODEL=$(MODEL) RELEASE=$(RELEASE))"
+	@echo "ChittiOS — make targets (ARCH=$(ARCH) MODEL=$(MODEL) RELEASE=$(RELEASE))"
 	@echo "  BRIDGE=$(BRIDGE)  REMOTE_URL=$(REMOTE_URL)  REMOTE_MODEL=$(REMOTE_MODEL)"
 	@echo
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /'

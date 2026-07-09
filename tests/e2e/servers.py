@@ -1,4 +1,4 @@
-"""Host-side test servers for the Chitti OS end-to-end tests.
+"""Host-side test servers for the ChittiOS end-to-end tests.
 
 One raw-socket protocol handler serves everything the guest exercises — a few
 HTTP routes, chunked SSE streaming, a WebSocket echo, and an OpenAI-compatible

@@ -1,6 +1,6 @@
 name: release-images
 
-# On a published GitHub Release, build bootable Chitti OS images for the full
+# On a published GitHub Release, build bootable ChittiOS images for the full
 # matrix of {x86_64, aarch64} ×
 # {no-model, qwen3.5-4b, qwen3.5-9b, gemma-4-e4b, server} and attach them as
 # release assets. Also runnable manually (workflow_dispatch), in which case
@@ -126,7 +126,7 @@ jobs:
           case "${{ matrix.model }}" in
             server)
               cat > "dist/${NAME}.RUN.md" <<EOF
-          # Chitti OS - ${{ matrix.arch }} / server (headless) (${CHITTI_VERSION})
+          # ChittiOS - ${{ matrix.arch }} / server (headless) (${CHITTI_VERSION})
 
           Bootable image: \`${IMG}\`.
           Built with \`-server\` (serial console only; no framebuffer / GUI tools)
@@ -149,7 +149,7 @@ jobs:
               ;;
             no-model)
               cat > "dist/${NAME}.RUN.md" <<EOF
-          # Chitti OS - ${{ matrix.arch }} (desktop, no model) (${CHITTI_VERSION})
+          # ChittiOS - ${{ matrix.arch }} (desktop, no model) (${CHITTI_VERSION})
 
           Bootable image: \`${IMG}\` (\`chitti-${{ matrix.arch }}\`).
           Desktop (framebuffer) build with **no GGUF bundled**. Use a hosted
@@ -178,7 +178,7 @@ jobs:
               ;;
             *)
               cat > "dist/${NAME}.RUN.md" <<EOF
-          # Chitti OS - ${{ matrix.arch }} / ${{ matrix.model }} (${CHITTI_VERSION})
+          # ChittiOS - ${{ matrix.arch }} / ${{ matrix.model }} (${CHITTI_VERSION})
 
           Bootable image: \`${IMG}\`. The model is NOT bundled (too large for a
           release asset); fetch it first:

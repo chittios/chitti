@@ -588,7 +588,7 @@ fn handle_inbound(inst: &mut Instance, msg: telegram::TgMessage) {
     // Built-in remote commands (no agent).
     let t = text.trim();
     if t.eq_ignore_ascii_case("/ping") || t.eq_ignore_ascii_case("ping") {
-        let _ = telegram::send_message(&inst.token, &peer, "pong — Chitti OS channel is live");
+        let _ = telegram::send_message(&inst.token, &peer, "pong — ChittiOS channel is live");
         return;
     }
     if t.eq_ignore_ascii_case("/whoami") {

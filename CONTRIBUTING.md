@@ -1,4 +1,4 @@
-# Contributing to Chitti OS
+# Contributing to ChittiOS
 
 Thanks for your interest! Chitti is an experimental, agent-native operating
 system. It moves fast and is not stable — but contributions, bug reports, and

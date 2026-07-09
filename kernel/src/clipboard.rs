@@ -99,7 +99,7 @@ mod tests {
         // "hi" -> base64 "aGk=" wrapped in the OSC-52 set-clipboard escape.
         assert_eq!(osc52_sequence("hi"), "\x1b]52;c;aGk=\x07");
         // Round-trips through the shared base64 encoder for arbitrary text.
-        let seq = osc52_sequence("Chitti OS");
+        let seq = osc52_sequence("ChittiOS");
         assert!(seq.starts_with("\x1b]52;c;") && seq.ends_with('\x07'));
     }
 

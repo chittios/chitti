@@ -1,4 +1,4 @@
-"""Drive a Chitti OS guest booted under QEMU over its serial console.
+"""Drive a ChittiOS guest booted under QEMU over its serial console.
 
 Spawns `cargo xtask run` (which sets up QEMU with user-mode networking and a
 serial `mon:stdio` console), reads the serial output on a background thread,

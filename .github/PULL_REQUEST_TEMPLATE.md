@@ -1,4 +1,4 @@
-<!-- Thanks for contributing to Chitti OS! Please read CONTRIBUTING.md first. -->
+<!-- Thanks for contributing to ChittiOS! Please read CONTRIBUTING.md first. -->
 
 ## What & why
 

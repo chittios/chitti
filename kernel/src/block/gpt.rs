@@ -244,7 +244,7 @@ pub fn esp_data_parts(total_sectors: u64, esp_bytes: u64) -> Option<[PartitionSp
 pub fn standard_parts(layout: &Layout) -> [PartitionSpec; 3] {
     [
         PartitionSpec { type_guid: ESP_GUID, first_lba: layout.esp_first, last_lba: layout.esp_last, name: "EFI System" },
-        PartitionSpec { type_guid: LINUX_GUID, first_lba: layout.os_first, last_lba: layout.os_last, name: "Chitti OS" },
+        PartitionSpec { type_guid: LINUX_GUID, first_lba: layout.os_first, last_lba: layout.os_last, name: "ChittiOS" },
         PartitionSpec { type_guid: LINUX_GUID, first_lba: layout.data_first, last_lba: layout.data_last, name: "Chitti Data" },
     ]
 }
