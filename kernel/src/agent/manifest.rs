@@ -88,6 +88,14 @@ pub fn orchestrator_manifest() -> AgentManifest {
             "video_player".into(),
             "video_control".into(),
             "media_status".into(),
+            "download".into(),
+            "http".into(),
+            // Autostart package tools (notes agent WASM) — also merged at
+            // chat-bind from system::autostart_toolset for any future packages.
+            "notes_list".into(),
+            "notes_get".into(),
+            "notes_set".into(),
+            "notes_remove".into(),
         ],
         capabilities: vec![
             CapabilityRequest::new(CapDomain::Fs, Rights::READ | Rights::WRITE | Rights::LIST | Rights::DELETE, Scope::Any),
@@ -96,6 +104,7 @@ pub fn orchestrator_manifest() -> AgentManifest {
             CapabilityRequest::new(CapDomain::Todo, Rights::READ | Rights::WRITE, Scope::Any),
             CapabilityRequest::new(CapDomain::Inference, Rights::EXEC, Scope::Any),
             CapabilityRequest::new(CapDomain::Ui, Rights::EXEC | Rights::WRITE | Rights::DELETE, Scope::Any),
+            CapabilityRequest::new(CapDomain::Net, Rights::READ | Rights::WRITE, Scope::Any),
         ],
         skills: Vec::new(),
         sampling: Sampling { temperature: 0.2, top_p: 0.9, seed: 42, max_output_tokens: 1024 },

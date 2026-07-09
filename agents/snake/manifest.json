@@ -1,0 +1,14 @@
+{
+  "name": "snake",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Snake UI game (tools.wasm + host tick).",
+  "toolset": ["snake_start", "snake_dir", "snake_tick", "snake_status"],
+  "capabilities": [
+    {"domain": "ui", "rights": ["exec", "write", "delete"], "scope": "any"},
+    {"domain": "fs", "rights": ["read", "write", "list"], "scope": "home"},
+    {"domain": "todo", "rights": ["read", "write"], "scope": "any"}
+  ],
+  "wasm": {"module": "assets/tools.wasm", "fuel": 2000000},
+  "autostart": false
+}

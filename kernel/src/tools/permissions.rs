@@ -210,6 +210,41 @@ pub fn is_readonly_tool(name: &str) -> bool {
                     | "media_status"
             )
         }
+        // Package WASM tools: gated by agent toolset; treat as auto when read-ish.
+        Some(ToolBinding::Download) => name == "download",
+        Some(ToolBinding::AgentWasm) => {
+            matches!(
+                name,
+                "notes_list"
+                    | "notes_get"
+                    | "notes_set"
+                    | "notes_remove"
+                    | "paint_start"
+                    | "paint_clear"
+                    | "paint_rect"
+                    | "paint_line"
+                    | "paint_pixel"
+                    | "paint_draw"
+                    | "paint_status"
+                    | "slides_start"
+                    | "slides_next"
+                    | "slides_prev"
+                    | "slides_goto"
+                    | "slides_status"
+                    | "mines_start"
+                    | "mines_click"
+                    | "mines_flag"
+                    | "mines_status"
+                    | "snake_start"
+                    | "snake_dir"
+                    | "snake_tick"
+                    | "snake_status"
+                    | "synth_tone"
+                    | "synth_beep"
+                    | "synth_stop"
+                    | "synth_status"
+            )
+        }
         Some(ToolBinding::SessionTodo) | Some(ToolBinding::LoadSkill) => true,
         Some(ToolBinding::McpResources { kind: McpResourceKind::List }) => true,
         Some(ToolBinding::McpResources { kind: McpResourceKind::Read }) => true,

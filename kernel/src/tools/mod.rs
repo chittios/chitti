@@ -261,13 +261,41 @@ mod tests {
     /// CORE toolset used by the shell prompt includes coding + memory tools.
     #[test_case]
     fn core_tools_include_coding_and_memory() {
-        for name in ["read", "write", "edit", "glob", "grep", "todo_write", "memory_search", "skill"] {
+        for name in [
+            "read",
+            "write",
+            "edit",
+            "glob",
+            "grep",
+            "todo_write",
+            "memory_search",
+            "skill",
+            "download",
+            "notes_list",
+        ] {
             assert!(
                 crate::shell::CORE_TOOLS.contains(&name),
                 "CORE_TOOLS missing {name}"
             );
             assert!(registry::get(name).is_some(), "registry missing {name}");
         }
+    }
+
+    /// Autostart packages (download/notes/todo) appear in the orchestrator toolset.
+    #[test_case]
+    fn orchestrator_sees_autostart_package_tools() {
+        let seen = registry::for_agent(&manifest::orchestrator_manifest().toolset);
+        for name in ["download", "todo_write", "notes_list", "notes_set"] {
+            assert!(
+                seen.iter().any(|t| t.name == name),
+                "orchestrator should see autostart tool {name}"
+            );
+        }
+        assert!(
+            crate::agent::system::autostart_names()
+                .iter()
+                .any(|n| *n == "download")
+        );
     }
 
     /// Plan mode + permissions patterns gate tools before the Router.

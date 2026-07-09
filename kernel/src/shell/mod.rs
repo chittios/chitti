@@ -999,6 +999,8 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
                     | ToolBinding::AgentMemory
                     | ToolBinding::AgentStorage
                     | ToolBinding::Media
+                    | ToolBinding::AgentWasm
+                    | ToolBinding::Download
                     | ToolBinding::Synapse { .. }
                     | ToolBinding::SessionTodo
                     | ToolBinding::StoreQuery { .. }
@@ -1058,6 +1060,12 @@ pub(crate) const CORE_TOOLS: &[&str] = &[
     "draw_image",
     "audio_player",
     "video_player",
+    "download",
+    // Autostart notes agent (tools.wasm) — available without `/agents start notes`.
+    "notes_list",
+    "notes_get",
+    "notes_set",
+    "notes_remove",
 ];
 
 /// `search_tools` — deferred tool discovery (keyword match + `select:<name>`).
@@ -1167,9 +1175,21 @@ struct ChatToolCtx {
 
 static CHAT_TOOL_CTX: crate::mm::Locked<Option<ChatToolCtx>> = crate::mm::Locked::new(None);
 
+/// Merge autostart package tools into a toolset (dedupe). Shell chat keeps the
+/// orchestrator as the active persona while download/notes/todo tools stay usable.
+fn with_autostart_tools(mut toolset: alloc::vec::Vec<String>) -> alloc::vec::Vec<String> {
+    for t in crate::agent::system::autostart_toolset() {
+        if !toolset.iter().any(|x| x == &t) {
+            toolset.push(t);
+        }
+    }
+    toolset
+}
+
 /// Point chat tools at the shell orchestrator's root task + full toolset.
 fn bind_chat_tools_to_orchestrator(orch: &crate::agent::orchestrator::Orchestrator) {
     let m = crate::agent::manifest::orchestrator_manifest();
+    let toolset = with_autostart_tools(m.toolset.clone());
     CHAT_TOOL_CTX.with(|slot| {
         if let Some(prev) = slot.as_ref().and_then(|c| c.owned_task) {
             let _ = crate::sched::kill(prev);
@@ -1177,7 +1197,7 @@ fn bind_chat_tools_to_orchestrator(orch: &crate::agent::orchestrator::Orchestrat
         *slot = Some(ChatToolCtx {
             caller: orch.caller,
             owned_task: None,
-            toolset: m.toolset.clone(),
+            toolset,
             agent_id: m.id.0,
         });
     });
@@ -1191,7 +1211,7 @@ fn resolve_chat_agent(id: u64) -> (alloc::vec::Vec<crate::agent::types::Capabili
         let m = crate::agent::manifest::orchestrator_manifest();
         return (
             m.capabilities.clone(),
-            m.toolset.clone(),
+            with_autostart_tools(m.toolset.clone()),
             AgentRef { manifest_id: m.id, version: m.version.clone() },
         );
     }
@@ -1341,9 +1361,11 @@ fn agent_system_prompt() -> String {
          machine state or an action, and never invent data a tool can read (current time, \
          network status, files, disks). Use read/write/edit/glob/grep for files, memory_* for \
          durable notes (prefer the exact keys listed under Stored facts; if unsure call \
-         memory_list or memory_search before guessing a key), skill to load a procedure, \
-         todo_write for multi-step work, spawn_subagent to delegate. When you have the answer, \
-         reply in short plain prose (ANSI SGR escape codes for emphasis if needed, never markdown).",
+         memory_list or memory_search before guessing a key), notes_list/notes_get/notes_set for \
+         markdown notes, download to fetch HTTP(S) files into /downloads/, skill to load a \
+         procedure, todo_write for multi-step work, spawn_subagent to delegate. When you have \
+         the answer, reply in short plain prose (ANSI SGR escape codes for emphasis if needed, \
+         never markdown).",
     );
     tools_system_prompt(&persona, &toolset)
 }
@@ -4194,16 +4216,23 @@ fn run_agents(
                 serial_println!("agents> {:<4} {:<17} {:<9}{}", id, name, state, marker);
             }
             serial_println!("agents> system agents (installed in /agent/, start with /agents start <name>):");
+            let autostart = crate::agent::system::autostart_names();
             for (name, agent_id) in crate::agent::system::list() {
                 let hooks = crate::agent::system::command_hook_summary(name);
+                let auto = if autostart.iter().any(|n| *n == name) {
+                    "  [autostart]"
+                } else {
+                    ""
+                };
                 if hooks.is_empty() {
-                    serial_println!("agents>   {:<10} /agent/{}/SOUL.md", name, agent_id);
+                    serial_println!("agents>   {:<10} /agent/{}/SOUL.md{}", name, agent_id, auto);
                 } else {
                     serial_println!(
-                        "agents>   {:<10} /agent/{}/SOUL.md  [command hook: {}]",
+                        "agents>   {:<10} /agent/{}/SOUL.md  [command hook: {}]{}",
                         name,
                         agent_id,
-                        hooks
+                        hooks,
+                        auto
                     );
                 }
             }
@@ -4254,10 +4283,10 @@ fn run_agents(
         "search" => run_agent_search(sarg),
         "install" => run_agent_install(sarg, chat),
         "uninstall" => run_agent_uninstall(sarg),
-        "start" => run_agent_start(sarg),
+        "start" => run_agent_start(sarg, chat, orch),
         // Back-compat aliases for the two originally-named service starters.
-        "start-net" => run_agent_start(&alloc::format!("network {}", sarg)),
-        "start-http" => run_agent_start(&alloc::format!("http {}", sarg)),
+        "start-net" => run_agent_start(&alloc::format!("network {}", sarg), chat, orch),
+        "start-http" => run_agent_start(&alloc::format!("http {}", sarg), chat, orch),
         other => serial_println!(
             "agents> unknown '{}' — usage: /agents [list|switch <id>|kill <id>|services|start <name> [port]|search <url> [q]|install <name> [--yes] [--registry <url>]|uninstall <name>]",
             other
@@ -4299,7 +4328,11 @@ fn built_in_package(name: &str) -> Option<crate::skills::package::SkillPackage> 
 /// bring up the web pipeline (Network→HTTP→Doc serving the docs site); `ssh`
 /// starts the SSH transport service. Uses port 8080 (web) / 2222 (ssh) if none
 /// is given.
-fn run_agent_start(arg: &str) {
+fn run_agent_start(
+    arg: &str,
+    chat: &mut Option<ChatSession>,
+    orch: &mut crate::agent::orchestrator::Orchestrator,
+) {
     let (name, port_str) = match arg.split_once(' ') {
         Some((n, p)) => (n.trim(), p.trim()),
         None => (arg.trim(), ""),
@@ -4329,6 +4362,52 @@ fn run_agent_start(arg: &str) {
             crate::service::ui_agent::stop();
             serial_println!("agents> chess UI agent stopped");
         }
+        // Package UI apps (logic in tools.wasm only — package_ui is generic).
+        "paint" | "slides" | "minesweeper" | "mines" | "snake" => {
+            let pkg = if name == "mines" { "minesweeper" } else { name };
+            crate::service::ui_agent::stop();
+            match crate::service::package_ui::start(pkg) {
+                Ok(sid) => {
+                    #[cfg(not(test))]
+                    crate::framebuffer::focus_set(true);
+                    // Rebind chat tools to this package agent so tool calls hit its wasm.
+                    if let Some(id) = crate::agent::system::list()
+                        .into_iter()
+                        .find(|(n, _)| *n == pkg)
+                        .map(|(_, id)| id)
+                    {
+                        rebind_chat_agent(id, orch);
+                        *chat = None;
+                    }
+                    serial_println!(
+                        "agents> started package UI '{pkg}' (surface {sid}) — tools from assets/tools.wasm"
+                    );
+                }
+                Err(e) => serial_println!("agents> {pkg} start failed: {e}"),
+            }
+        }
+        "stop-paint" | "stop-slides" | "stop-minesweeper" | "stop-snake" | "stop-package" => {
+            crate::service::package_ui::stop();
+            serial_println!("agents> package UI stopped");
+        }
+        "notes" | "synth" | "download" | "todo" => {
+            // Chat-only package agents (no surface): switch chat to their SOUL/tools.
+            // download/notes/todo also autostart into the shell toolset without this.
+            if let Some(id) = crate::agent::system::list()
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, id)| id)
+            {
+                rebind_chat_agent(id, orch);
+                *chat = None;
+                serial_println!(
+                    "agents> chat → '{name}' agent {} (SOUL + tools); /agents switch 1 for shell",
+                    id
+                );
+            } else {
+                serial_println!("agents> '{name}' not installed");
+            }
+        }
         _ => {
             // Serve a content agent over the web pipeline (network + http + the
             // generic server stage). `web`/`network`/`http` default to the docs
@@ -4340,7 +4419,7 @@ fn run_agent_start(arg: &str) {
                 Some(h) => h,
                 None => {
                     serial_println!(
-                        "agents> unknown agent '{}' (try: doc, ssh, chess, media, or an installed server agent)",
+                        "agents> unknown agent '{}' (try: doc, ssh, chess, media, pdf, download, notes, todo, paint, slides, minesweeper, snake, synth)",
                         name
                     );
                     return;
@@ -5987,6 +6066,7 @@ pub fn upkeep() {
     ui_tick();
     // UI agents (Chess…): drain surface events → board tools.
     crate::service::ui_agent::tick();
+    crate::service::package_ui::tick();
     crate::net::poll();
     crate::service::supervise_tick();
     // External messaging channels (Telegram, …) — short non-blocking poll.
@@ -6137,9 +6217,184 @@ fn close_action() {
     }
 }
 
+/// Host entry for the **download** tool: HTTP(S) GET + save body to the store.
+/// Used by the download agent (and any agent with `download` in its toolset).
+/// Agents pass `overwrite=true` to replace an existing path (no modal).
+pub(crate) fn run_download_tool(args_json: &str) -> alloc::string::String {
+    use crate::session::todo::json_str;
+    let url = json_str(args_json, "url").unwrap_or_default();
+    if url.is_empty() {
+        return alloc::string::String::from("error: missing url");
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return alloc::string::String::from("error: url must be http:// or https://");
+    }
+    let overwrite = json_str(args_json, "overwrite")
+        .map(|v| v == "true" || v == "1" || v == "yes")
+        .unwrap_or(false);
+    let dest = match json_str(args_json, "path") {
+        Some(p) if !p.is_empty() => {
+            if p.starts_with('/') {
+                p
+            } else {
+                alloc::format!("/downloads/{p}")
+            }
+        }
+        _ => match url_basename(&url) {
+            Some(b) => alloc::format!("/downloads/{b}"),
+            None => alloc::format!(
+                "/downloads/download-{}",
+                crate::arch::now_ms() % 1_000_000
+            ),
+        },
+    };
+    if dest.contains("..") {
+        return alloc::string::String::from("error: path must not contain ..");
+    }
+    if crate::synapse::fs::exists(&dest) && !overwrite {
+        return alloc::format!(
+            "error: {dest} already exists (pass overwrite=true to replace)"
+        );
+    }
+    const DL_MAX: usize = 128 << 20;
+    let mut collected: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut on_head = |_h: &crate::net::http::Head| {};
+    let mut on_body = |chunk: &[u8]| {
+        if collected.len() < DL_MAX {
+            let room = DL_MAX - collected.len();
+            collected.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        }
+        upkeep();
+    };
+    let timeout = 300_000u64;
+    match crate::net::http::perform("GET", &url, &[], b"", timeout, &mut on_head, &mut on_body) {
+        Ok(head) => {
+            if !(200..300).contains(&head.status) {
+                return alloc::format!(
+                    "error: HTTP {} (not saved; {} bytes received)",
+                    head.status,
+                    collected.len()
+                );
+            }
+            if collected.len() >= DL_MAX {
+                return alloc::format!(
+                    "error: body exceeds {} MiB download cap",
+                    DL_MAX >> 20
+                );
+            }
+            if dest.starts_with("/downloads/") && !crate::synapse::fs::exists("/downloads/.keep") {
+                crate::synapse::fs::write("/downloads/.keep", b"");
+            }
+            crate::synapse::fs::write(&dest, &collected);
+            crate::ktrace::log_fmt(format_args!(
+                "download: {} → {} ({} bytes, {})",
+                url,
+                dest,
+                collected.len(),
+                head.status
+            ));
+            alloc::format!(
+                "ok:path={dest} bytes={} status={}",
+                collected.len(),
+                head.status
+            )
+        }
+        Err(e) => alloc::format!("error:{e}"),
+    }
+}
+
 /// Host entry for media tools (`ToolBinding::Media`): image / audio / video
 /// players in the action pane. Paths may be store keys, `/downloads/…`, or
 /// mount paths. Shared by the **media** agent, shell chat, and `/open`.
+/// `/open x.pdf` (via the pdf agent's command hook): read the file, digest it
+/// through the agent's **wasm** (`pdf_digest` — deterministic parsing below
+/// the boundary), write the extracted text to `/preview/<name>.txt` in the
+/// store, and open that in an editor tab. Returns the summary line.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn pdf_preview(path: &str) -> alloc::string::String {
+    const MAX_PDF: usize = 4 << 20; // b64 + parse arena bounds
+    let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
+        return alloc::format!("error: {path} not found under any mount or in the store");
+    };
+    if bytes.len() > MAX_PDF {
+        return alloc::format!("error: {path} is {} KiB — preview caps at {} KiB", bytes.len() / 1024, MAX_PDF / 1024);
+    }
+    // The pdf agent's wasm module, from its install home.
+    let Some(home) = crate::agent::system::home_for("pdf") else {
+        return alloc::string::String::from("error: pdf agent not installed");
+    };
+    let Some(module) = crate::synapse::fs::read(&alloc::format!("{home}/assets/tools.wasm")) else {
+        return alloc::string::String::from("error: pdf agent wasm missing");
+    };
+    let b64 = crate::net::ws::base64_encode(&bytes);
+    let args = alloc::format!(r#"{{"b64":"{b64}","max_pages":24}}"#);
+    let t0 = crate::arch::now_ms();
+    let digest = match crate::agent::wasm_abi::call_wasm_export(
+        &module,
+        "pdf_digest",
+        &args,
+        400_000_000,
+        crate::agent::wasm_rt::HostBindings::default(),
+    ) {
+        Ok(d) => d,
+        Err(e) => return alloc::format!("error: pdf wasm: {e}"),
+    };
+    if let Some(e) = digest.strip_prefix("error:") {
+        return alloc::format!("error: pdf: {e}");
+    }
+    let (summary, text) = format_pdf_preview(path, &digest);
+    let name = path.rsplit('/').next().unwrap_or("doc");
+    let stem = name.strip_suffix(".pdf").unwrap_or(name);
+    let preview_path = alloc::format!("/preview/{stem}.txt");
+    crate::synapse::fs::write(&preview_path, text.as_bytes());
+    #[cfg(all(not(feature = "server"), not(test)))]
+    {
+        crate::editor::open(&preview_path);
+        crate::framebuffer::focus_set(true);
+    }
+    alloc::format!("{summary} — text at {preview_path} (editor tab) in {} ms", crate::arch::now_ms().saturating_sub(t0))
+}
+
+/// Pure digest-JSON → (summary line, preview text). Unit-tested: the wasm's
+/// output contract is `{"pages","title","author","truncated","page_texts":
+/// [{"n","text"}...]}` with `\n`-escaped text.
+pub(crate) fn format_pdf_preview(path: &str, digest: &str) -> (alloc::string::String, alloc::string::String) {
+    use crate::session::todo::json_str;
+    let pages = digest
+        .split("\"pages\":")
+        .nth(1)
+        .and_then(|s| s[..s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len())].parse::<usize>().ok())
+        .unwrap_or(0);
+    let title = json_str(digest, "title").unwrap_or_default();
+    let author = json_str(digest, "author").unwrap_or_default();
+    let truncated = digest.contains("\"truncated\":true");
+    let mut text = alloc::string::String::new();
+    text.push_str(&alloc::format!("PDF preview: {path}\n"));
+    if !title.is_empty() {
+        text.push_str(&alloc::format!("Title:  {title}\n"));
+    }
+    if !author.is_empty() {
+        text.push_str(&alloc::format!("Author: {author}\n"));
+    }
+    text.push_str(&alloc::format!("Pages:  {pages}{}\n", if truncated { " (preview truncated)" } else { "" }));
+    // Walk page_texts: repeated `{"n":N,"text":"..."}` objects.
+    let mut rest = digest.split("\"page_texts\":").nth(1).unwrap_or("");
+    while let Some(npos) = rest.find("\"n\":") {
+        rest = &rest[npos + 4..];
+        let n: usize = rest[..rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(0)].parse().unwrap_or(0);
+        let Some(body) = json_str(rest, "text") else { break };
+        text.push_str(&alloc::format!("\n──── page {n} ────\n"));
+        text.push_str(&body); // json_str already unescapes \n / \" / \\
+        text.push('\n');
+    }
+    let summary = alloc::format!(
+        "ok: pdf {pages} page(s){}{}",
+        if title.is_empty() { alloc::string::String::new() } else { alloc::format!(" \"{title}\"") },
+        if truncated { " [truncated]" } else { "" }
+    );
+    (summary, text)
+}
+
 pub(crate) fn run_media_tool(name: &str, args_json: &str) -> alloc::string::String {
     use crate::session::todo::json_str;
     #[cfg(any(feature = "server", test))]
@@ -6151,7 +6406,7 @@ pub(crate) fn run_media_tool(name: &str, args_json: &str) -> alloc::string::Stri
             .unwrap_or_default();
         return match name {
             "draw_image" | "image_open" | "audio_player" | "audio_open" | "video_player"
-            | "video_open" => {
+            | "video_open" | "pdf_preview" => {
                 if path.is_empty() {
                     alloc::string::String::from("error: missing path")
                 } else {
@@ -6202,6 +6457,12 @@ pub(crate) fn run_media_tool(name: &str, args_json: &str) -> alloc::string::Stri
                 };
                 image_cmd(c);
                 alloc::format!("ok:image {cmd}")
+            }
+            "pdf_preview" => {
+                if path.is_empty() {
+                    return alloc::string::String::from("error: missing path");
+                }
+                pdf_preview(&path)
             }
             "audio_player" | "audio_open" => {
                 if path.is_empty() {
@@ -8919,6 +9180,46 @@ fn disk_ext4read() {
     }
 }
 
+
+#[cfg(test)]
+mod pdf_preview_tests {
+    use super::*;
+
+    /// `format_pdf_preview` renders the wasm digest contract into the editor
+    /// text: header (title/author/pages), one marker per page, unescaped body.
+    #[test_case]
+    fn digest_formats_to_preview() {
+        let digest = r#"{"pages":2,"title":"Test Doc","author":"Chitti","truncated":false,"page_texts":[{"n":1,"text":"Hello PDF world\nSecond line"},{"n":2,"text":"Frag mented"}]}"#;
+        let (summary, text) = format_pdf_preview("/downloads/t.pdf", digest);
+        assert!(summary.contains("2 page(s)"), "{summary}");
+        assert!(summary.contains("Test Doc"), "{summary}");
+        assert!(text.contains("Title:  Test Doc"), "{text}");
+        assert!(text.contains("Author: Chitti"), "{text}");
+        assert!(text.contains("page 1"), "{text}");
+        assert!(text.contains("Hello PDF world\nSecond line"), "{text}");
+        assert!(text.contains("page 2"), "{text}");
+        assert!(text.contains("Frag mented"), "{text}");
+    }
+
+    /// Truncated digests say so; empty metadata renders without blank lines.
+    #[test_case]
+    fn digest_truncated_and_bare() {
+        let digest = r#"{"pages":99,"title":"","author":"","truncated":true,"page_texts":[{"n":1,"text":"x"}]}"#;
+        let (summary, text) = format_pdf_preview("a.pdf", digest);
+        assert!(summary.contains("[truncated]"), "{summary}");
+        assert!(text.contains("(preview truncated)"), "{text}");
+        assert!(!text.contains("Title:"), "{text}");
+    }
+
+    /// The media-tool arm validates the path in headless builds.
+    #[test_case]
+    fn pdf_preview_tool_requires_path() {
+        let out = run_media_tool("pdf_preview", "{}");
+        assert!(out.starts_with("error"), "{out}");
+        let ok = run_media_tool("pdf_preview", r#"{"path":"/downloads/x.pdf"}"#);
+        assert!(ok.starts_with("ok:"), "{ok}");
+    }
+}
 
 #[cfg(test)]
 mod agent_flow_tests {

@@ -1,0 +1,14 @@
+{
+  "name": "paint",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Canvas paint agent (tools.wasm).",
+  "toolset": ["paint_start", "paint_clear", "paint_rect", "paint_line", "paint_pixel", "paint_draw", "paint_status"],
+  "capabilities": [
+    {"domain": "ui", "rights": ["exec", "write", "delete"], "scope": "any"},
+    {"domain": "fs", "rights": ["read", "write", "list"], "scope": "home"},
+    {"domain": "todo", "rights": ["read", "write"], "scope": "any"}
+  ],
+  "wasm": {"module": "assets/tools.wasm", "fuel": 2000000},
+  "autostart": false
+}

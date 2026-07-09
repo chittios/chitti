@@ -1,0 +1,27 @@
+{
+  "name": "todo",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Session todo list for multi-step planning (todo_write + plan mode).",
+  "toolset": [
+    "todo_write",
+    "enter_plan_mode",
+    "exit_plan_mode",
+    "memory_add",
+    "memory_get",
+    "memory_list"
+  ],
+  "capabilities": [
+    {
+      "domain": "todo",
+      "rights": ["read", "write"],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": ["read", "write", "list"],
+      "scope": "home"
+    }
+  ],
+  "autostart": true
+}

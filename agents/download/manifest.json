@@ -1,0 +1,40 @@
+{
+  "name": "download",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Fetch HTTP(S) URLs and save files (download tool + http + full FS write). Prefer download for saves.",
+  "toolset": [
+    "download",
+    "http",
+    "list",
+    "glob",
+    "grep",
+    "read",
+    "write",
+    "ls",
+    "mounts",
+    "network",
+    "ping",
+    "memory_add",
+    "memory_get",
+    "memory_list"
+  ],
+  "capabilities": [
+    {
+      "domain": "net",
+      "rights": ["read", "write"],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": ["read", "write", "list", "delete"],
+      "scope": "any"
+    },
+    {
+      "domain": "todo",
+      "rights": ["read", "write"],
+      "scope": "any"
+    }
+  ],
+  "autostart": true
+}

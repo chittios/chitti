@@ -576,6 +576,27 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
         )
         .map_err(|_| "define host_log")?;
 
+    // host_sound_play(hz, ms) -> i32  — tone via the sound device (synth agents).
+    linker
+        .func_wrap(
+            "chitti",
+            "host_sound_play",
+            |_caller: Caller<'_, HostState>, hz: i32, ms: i32| -> i32 {
+                if !crate::sound::is_up() {
+                    return -1;
+                }
+                let hz = (hz as u32).clamp(20, 4000);
+                let ms = (ms as u32).clamp(20, 5000);
+                let rate = 16_000u32;
+                let pcm = crate::sound::test_tone(hz, ms, rate);
+                match crate::sound::play(&pcm, rate) {
+                    Ok(()) => 0,
+                    Err(_) => -2,
+                }
+            },
+        )
+        .map_err(|_| "define host_sound_play")?;
+
     Ok(())
 }
 

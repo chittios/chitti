@@ -1,0 +1,13 @@
+{
+  "name": "notes",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Markdown notes in durable storage (tools.wasm).",
+  "toolset": ["notes_list", "notes_get", "notes_set", "notes_remove", "memory_add", "memory_get", "memory_list"],
+  "capabilities": [
+    {"domain": "fs", "rights": ["read", "write", "list"], "scope": "home"},
+    {"domain": "todo", "rights": ["read", "write"], "scope": "any"}
+  ],
+  "wasm": {"module": "assets/tools.wasm", "fuel": 1000000},
+  "autostart": true
+}

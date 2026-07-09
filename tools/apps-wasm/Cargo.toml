@@ -1,0 +1,19 @@
+[package]
+name = "chitti-apps-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Shared tools.wasm for notes/paint/slides/minesweeper/snake/synth agents"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

@@ -1,0 +1,41 @@
+{
+  "name": "pdf",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "PDF reader: previews and answers questions about PDF documents; parsing is deterministic (assets/tools.wasm pdf_digest). Requests FULL filesystem read access so it can open PDFs on any mount.",
+  "toolset": [
+    "pdf_digest",
+    "pdf_preview",
+    "mem_fs_read",
+    "memory_add",
+    "memory_get",
+    "memory_list"
+  ],
+  "command_hooks": [
+    {
+      "command": "/open",
+      "description": "Shell /open routes .pdf through this agent: deterministic wasm digest, preview in an editor tab.",
+      "match": { "extensions": [".pdf"] },
+      "dispatch": {
+        ".pdf": { "tool": "pdf_preview", "path_arg": "path" }
+      }
+    }
+  ],
+  "capabilities": [
+    {
+      "domain": "fs",
+      "rights": [
+        "read"
+      ],
+      "scope": "any"
+    }
+  ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "exports": {
+      "pdf_digest": { "func": "pdf_digest" }
+    },
+    "memory_pages": 512,
+    "fuel": 400000000
+  }
+}

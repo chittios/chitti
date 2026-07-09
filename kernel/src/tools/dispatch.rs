@@ -240,6 +240,30 @@ impl ToolDispatch for Router {
                     ToolOutcome::ok(out, Provenance::SystemTrusted)
                 }
             }
+            ToolBinding::AgentWasm => {
+                // Prefer the package that declares this export (autostart notes/
+                // paint/… tools work while chat is still the shell agent).
+                let agent_id = crate::agent::system::owner_agent_for_tool(&call.tool)
+                    .unwrap_or(session.agent.manifest_id.0);
+                match crate::service::package_ui::call_agent_export(
+                    agent_id,
+                    &call.tool,
+                    &call.args,
+                ) {
+                    Ok(out) if out.starts_with("error:") => ToolOutcome::error(out),
+                    Ok(out) => ToolOutcome::ok(out, Provenance::SystemTrusted),
+                    Err(e) => ToolOutcome::error(alloc::format!("wasm:{e}")),
+                }
+            }
+            ToolBinding::Download => {
+                let out = crate::shell::run_download_tool(&call.args);
+                if out.starts_with("error:") {
+                    ToolOutcome::error(out)
+                } else {
+                    // Download body is external content; path metadata is system.
+                    ToolOutcome::ok(out, Provenance::UntrustedIngested)
+                }
+            }
         }
     }
 }

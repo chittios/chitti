@@ -623,8 +623,34 @@ def s_open_media(_g):
     n = 4800  # 0.3 s
     w.writeframes(b"".join(struct.pack("<h", int(8000 * ((i // 20) % 2 * 2 - 1))) for i in range(n)))
     w.close()
+    # A minimal single-page PDF (classic xref, uncompressed content): the pdf
+    # agent's command hook must digest it through the wasm and report pages.
+    def build_pdf():
+        content = b"BT /F1 12 Tf 72 700 Td (Chitti e2e pdf text) Tj ET"
+        bodies = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /MediaBox [0 0 612 792] >>",
+            b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+            b"<< /Title (E2E Doc) >>",
+        ]
+        out = bytearray(b"%PDF-1.4\n")
+        offs = []
+        for i, b in enumerate(bodies):
+            offs.append(len(out))
+            out += f"{i+1} 0 obj\n".encode() + b + b"\nendobj\n"
+        xref = len(out)
+        out += f"xref\n0 {len(bodies)+1}\n".encode() + b"0000000000 65535 f \n"
+        for o in offs:
+            out += f"{o:010} 00000 n \n".encode()
+        out += (f"trailer\n<< /Size {len(bodies)+1} /Root 1 0 R /Info 5 0 R >>\n"
+                f"startxref\n{xref}\n%%EOF\n").encode()
+        return bytes(out)
+    pdf_path = os.path.join(tempfile.gettempdir(), "chitti-e2e.pdf")
+    with open(pdf_path, "wb") as f:
+        f.write(build_pdf())
     g2 = Guest(arch=RUN_ARCH, verbose=RUN_VERBOSE, no_model=True, audio="none",
-               model_disk=f"{png_path}:{wav_path}")
+               model_disk=f"{png_path}:{wav_path}:{pdf_path}")
     try:
         if not g2.wait_for("net: configured", 180):
             return False, "media guest never booted"
@@ -656,7 +682,16 @@ def s_open_media(_g):
             m2 = g2.mark()
             g2.send_raw(b"\x03")     # Ctrl+C at the prompt: stop playback
             ok = g2.wait_for("audio stopped", 10, m2)
-            return ok, "PNG previewed + WAV played + media-tab controls (focus/pause/seek/stop) responsive" if ok else "media controls / Ctrl+C did not stop playback"
+            if not ok:
+                return False, "media controls / Ctrl+C did not stop playback"
+            # The pdf agent's /open hook: wasm digest → page count + editor tab.
+            m3 = g2.mark()
+            g2.send(f"/open /img{d}/chitti-e2e.pdf")
+            if not g2.wait_for("pdf 1 page(s)", 20, m3):
+                return False, "pdf preview did not report pages"
+            if not g2.wait_for("/preview/chitti-e2e.txt", 5, m3):
+                return False, "pdf preview did not open the text tab"
+            return True, "PNG previewed + WAV played + media controls + PDF digested via wasm"
         return False, "no '3x2 px' decode report from /open on any mount"
     finally:
         g2.close()

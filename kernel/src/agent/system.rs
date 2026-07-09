@@ -1,17 +1,17 @@
-//! **System agents** — the built-in Network / HTTP / SSH agents, defined in the
-//! same installable format as any other agent (a markdown `SOUL.md` persona + a
-//! JSON manifest declaring the toolset and capabilities), living under the
-//! repo's `agents/` folder. Their definitions are compiled into the kernel image
-//! via `include_str!`, and at boot [`install_all`] signs each into a
-//! `SkillPackage` and installs it through the normal permissioned flow — so
-//! their SOUL lands in `/agent/<id>/SOUL.md`, their capability grant is recorded,
-//! and their dispatchable role is registered, exactly like a package fetched
-//! from the registry (but pre-trusted, since they ship with the OS).
+//! **System agents** — built-in packages (doc, ssh, chess, media, pdf, notes,
+//! paint, slides, minesweeper, snake, synth, download, todo), each a markdown
+//! `SOUL.md` + JSON manifest under the repo's `agents/` folder. Definitions are
+//! compiled in via `include_str!`/`include_bytes!`; at boot [`install_all`] signs
+//! each into a `SkillPackage` and installs it through the normal permissioned
+//! flow — SOUL lands in `/agent/<id>/SOUL.md`, grants are recorded, roles
+//! registered (pre-trusted, same shape as a registry package).
 //!
-//! Each service agent is wired to its native serve loop (`service::{network,
-//! http, ssh}`); `/agents start <name> <port>` brings one up. The protocol logic
-//! is native code below the determinism boundary — the markdown supplies the
-//! persona, capability grant, and policy, never the wire handling.
+//! Packages with `"autostart": true` (download, notes, todo) are activated by
+//! [`autostart_agents`]: homes are ensured and their toolsets merge into the
+//! shell orchestrator so chat can use them without `/agents start`. UI packages
+//! still need `/agents start <name>` for a surface; web content uses the
+//! generic pipeline. Protocol / codec logic stays native code below the
+//! determinism boundary — markdown is persona + policy only.
 
 use crate::agent::types::*;
 use crate::json::Json;
@@ -93,6 +93,114 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
         manifest_json: include_str!("../../../agents/media/manifest.json"),
         skill_id: SkillId(SYSTEM_SKILL_BASE + 4),
         agent_id: AgentId(SYSTEM_AGENT_BASE + 4),
+        assets: &[],
+        binary_assets: &[],
+    },
+    // PDF agent: previews/answers over PDF documents; the parsing (xref,
+    // FlateDecode, page tree, text extraction) is deterministic wasm
+    // (tools/pdf-wasm). Full filesystem READ so any mounted PDF opens.
+    SystemAgentDef {
+        name: "pdf",
+        soul: include_str!("../../../agents/pdf/SOUL.md"),
+        manifest_json: include_str!("../../../agents/pdf/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 5),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 5),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/pdf/assets/tools.wasm"),
+        )],
+    },
+    // App packages: logic only in assets/tools.wasm + SOUL.md (tools/apps-wasm).
+    SystemAgentDef {
+        name: "notes",
+        soul: include_str!("../../../agents/notes/SOUL.md"),
+        manifest_json: include_str!("../../../agents/notes/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 6),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 6),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/notes/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "paint",
+        soul: include_str!("../../../agents/paint/SOUL.md"),
+        manifest_json: include_str!("../../../agents/paint/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 7),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 7),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/paint/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "slides",
+        soul: include_str!("../../../agents/slides/SOUL.md"),
+        manifest_json: include_str!("../../../agents/slides/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 8),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 8),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/slides/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "minesweeper",
+        soul: include_str!("../../../agents/minesweeper/SOUL.md"),
+        manifest_json: include_str!("../../../agents/minesweeper/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 9),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 9),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/minesweeper/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "snake",
+        soul: include_str!("../../../agents/snake/SOUL.md"),
+        manifest_json: include_str!("../../../agents/snake/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 10),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 10),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/snake/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "synth",
+        soul: include_str!("../../../agents/synth/SOUL.md"),
+        manifest_json: include_str!("../../../agents/synth/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 11),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 11),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/synth/assets/tools.wasm"),
+        )],
+    },
+    // Download agent: HTTP(S) fetch + save via host `download` tool + http/fs.
+    SystemAgentDef {
+        name: "download",
+        soul: include_str!("../../../agents/download/SOUL.md"),
+        manifest_json: include_str!("../../../agents/download/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 12),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 12),
+        assets: &[],
+        binary_assets: &[],
+    },
+    // Todo agent: session planning (host todo_write / plan-mode tools).
+    SystemAgentDef {
+        name: "todo",
+        soul: include_str!("../../../agents/todo/SOUL.md"),
+        manifest_json: include_str!("../../../agents/todo/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 13),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 13),
         assets: &[],
         binary_assets: &[],
     },
@@ -515,6 +623,7 @@ fn build_package(def: &SystemAgentDef, m: &ParsedManifest, caps: &[CapabilityReq
 /// and install it granting its full declared (home-resolved) capability set
 /// (system agents are pre-trusted), landing its SOUL + assets in `/agent/<id>/`
 /// and registering its role. Called once from `run_os` after the FS + net are up.
+/// Agents with `autostart: true` are then activated via [`autostart_agents`].
 pub fn install_all(now: Ticks) {
     for def in SYSTEM_AGENTS {
         let Some(m) = parse_manifest(def.manifest_json) else {
@@ -534,7 +643,97 @@ pub fn install_all(now: Ticks) {
             Err(e) => crate::ktrace::log_fmt(format_args!("system-agent: install '{}' failed: {:?}", def.name, e)),
         }
     }
-    crate::serial_println!("Chitti: system agents installed (doc, ssh, chess, media) in /agent/");
+    crate::serial_println!(
+        "Chitti: system agents installed (doc, ssh, chess, media, pdf, notes, paint, slides, minesweeper, snake, synth, download, todo) in /agent/"
+    );
+    autostart_agents();
+}
+
+/// Names of system packages whose manifest sets `"autostart": true`.
+pub fn autostart_names() -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for def in SYSTEM_AGENTS {
+        if let Some(m) = parse_manifest(def.manifest_json) {
+            if m.autostart {
+                out.push(def.name);
+            }
+        }
+    }
+    out
+}
+
+/// Union of toolset entries from every autostart package (deduped, stable order).
+/// Merged into the shell orchestrator toolset so chat can use download / notes /
+/// todos without `/agents start`.
+pub fn autostart_toolset() -> Vec<String> {
+    let mut out = Vec::new();
+    for def in SYSTEM_AGENTS {
+        let Some(m) = parse_manifest(def.manifest_json) else {
+            continue;
+        };
+        if !m.autostart {
+            continue;
+        }
+        for t in m.toolset {
+            if !out.iter().any(|x| x == &t) {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// Resolve which system package owns a tool name (for WASM export dispatch).
+/// Prefers agents that ship `tools.wasm` so notes/paint/… tools hit the right
+/// home even when the chat session is still the shell orchestrator.
+pub fn owner_agent_for_tool(tool: &str) -> Option<u64> {
+    let mut fallback = None;
+    for def in SYSTEM_AGENTS {
+        let Some(m) = parse_manifest(def.manifest_json) else {
+            continue;
+        };
+        if !m.toolset.iter().any(|t| t == tool) {
+            continue;
+        }
+        let has_wasm = def.binary_assets.iter().any(|(n, _)| *n == "tools.wasm");
+        if has_wasm {
+            return Some(def.agent_id.0);
+        }
+        if fallback.is_none() {
+            fallback = Some(def.agent_id.0);
+        }
+    }
+    fallback
+}
+
+/// Activate packages with `autostart: true` after install: ensure homes exist
+/// and log the set. Tools are merged into the shell via [`autostart_toolset`]
+/// when the chat binds to the orchestrator — no service loop is spawned
+/// (skill agents are request/response, not daemons).
+pub fn autostart_agents() {
+    let names = autostart_names();
+    if names.is_empty() {
+        return;
+    }
+    for def in SYSTEM_AGENTS {
+        let Some(m) = parse_manifest(def.manifest_json) else {
+            continue;
+        };
+        if !m.autostart {
+            continue;
+        }
+        crate::agent::home::ensure(def.agent_id.0, def.name);
+        crate::ktrace::log_fmt(format_args!(
+            "system-agent: autostart '{}' (id {}, {} tools)",
+            def.name,
+            def.agent_id.0,
+            m.toolset.len()
+        ));
+    }
+    crate::serial_println!(
+        "Chitti: autostart agents ready: {} (tools merged into shell)",
+        names.join(", ")
+    );
 }
 
 /// The installed system agents, for `/agents list`/display: (name, agent_id).
@@ -589,12 +788,40 @@ mod tests {
             assert_eq!(m.name, def.name);
             assert!(!m.capabilities.is_empty(), "{} declares capabilities", def.name);
         }
-        // SOUL-backed system agents: doc + ssh + chess + media. network/http are
-        // pure service-layer plumbing, not installed agents.
-        assert_eq!(SYSTEM_AGENTS.len(), 4);
+        // SOUL + package agents (no network/http plumbing as agents).
+        assert_eq!(SYSTEM_AGENTS.len(), 13);
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "chess"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "media"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "notes"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "snake"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "todo"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "download"));
         assert!(!SYSTEM_AGENTS.iter().any(|d| d.name == "network" || d.name == "http"));
+    }
+
+    #[test_case]
+    fn download_notes_todo_autostart() {
+        for name in ["download", "notes", "todo"] {
+            let def = SYSTEM_AGENTS.iter().find(|d| d.name == name).expect(name);
+            let m = parse_manifest(def.manifest_json).expect("manifest");
+            assert!(m.autostart, "{name} must autostart");
+        }
+        let names = autostart_names();
+        assert!(names.contains(&"download"));
+        assert!(names.contains(&"notes"));
+        assert!(names.contains(&"todo"));
+        let tools = autostart_toolset();
+        assert!(tools.iter().any(|t| t == "download"));
+        assert!(tools.iter().any(|t| t == "notes_list"));
+        assert!(tools.iter().any(|t| t == "todo_write"));
+    }
+
+    #[test_case]
+    fn owner_agent_for_notes_tools_is_notes_package() {
+        let notes = SYSTEM_AGENTS.iter().find(|d| d.name == "notes").unwrap();
+        assert_eq!(owner_agent_for_tool("notes_list"), Some(notes.agent_id.0));
+        assert_eq!(owner_agent_for_tool("notes_set"), Some(notes.agent_id.0));
+        assert!(owner_agent_for_tool("no_such_tool_xyz").is_none());
     }
 
     #[test_case]

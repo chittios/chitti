@@ -1,0 +1,14 @@
+{
+  "name": "minesweeper",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Minesweeper UI game (logic in tools.wasm).",
+  "toolset": ["mines_start", "mines_click", "mines_flag", "mines_status"],
+  "capabilities": [
+    {"domain": "ui", "rights": ["exec", "write", "delete"], "scope": "any"},
+    {"domain": "fs", "rights": ["read", "write", "list"], "scope": "home"},
+    {"domain": "todo", "rights": ["read", "write"], "scope": "any"}
+  ],
+  "wasm": {"module": "assets/tools.wasm", "fuel": 2000000},
+  "autostart": false
+}

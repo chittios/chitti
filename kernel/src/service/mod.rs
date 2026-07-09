@@ -14,6 +14,7 @@
 pub mod chess_rules;
 pub mod http;
 pub mod network;
+pub mod package_ui;
 pub mod pipeline;
 pub mod server;
 pub mod ssh;
