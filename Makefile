@@ -80,6 +80,9 @@ image:
 	$(XTASK) image $(FLAGS)
 
 ## vbox: rebuild the aarch64 image and (re)load it into VirtualBox VM VBOX_VM
+##       forces USB keyboard + USB tablet + xHCI (aarch64 has no PS/2 input path)
+##       NB: do not put Make `#` comments inside the shell recipe — they break `\`
+##       line continuation and re-run later lines in a fresh shell with VM empty.
 .PHONY: vbox
 vbox:
 	$(XTASK) image -arch aarch64 -model $(MODEL)
@@ -87,15 +90,22 @@ vbox:
 	@set -e; \
 	VM='$(VBOX_VM)'; CTL='$(VBOX_CTL)'; PORT='$(VBOX_PORT)'; \
 	IMG=target/chitti-aa64.img; VDI=target/chitti-aa64.vdi; \
+	test -f "$$IMG" || { echo "vbox: missing $$IMG — image step failed?"; exit 1; }; \
+	VBoxManage showvminfo "$$VM" >/dev/null 2>&1 || { \
+	  echo "vbox: VM '$$VM' not found — create an ARM64 EFI VM named $$VM first"; exit 1; }; \
 	UUID=$$(VBoxManage showvminfo "$$VM" --machinereadable 2>/dev/null | sed -n "s/^\"$$CTL-ImageUUID-$$PORT-0\"=//p" | tr -d '"'); \
 	echo "vbox: reloading VM '$$VM' (ctl=$$CTL port=$$PORT), preserving disk UUID $${UUID:-<new>}"; \
 	VBoxManage controlvm "$$VM" poweroff 2>/dev/null || true; sleep 1; \
+	echo "vbox: ensuring USB keyboard + USB tablet + xHCI controller"; \
+	VBoxManage modifyvm "$$VM" --keyboard usb --mouse usbtablet --usb-xhci on; \
 	VBoxManage closemedium disk "$$VDI" 2>/dev/null || true; rm -f "$$VDI"; \
 	VBoxManage convertfromraw "$$IMG" "$$VDI" --format VDI; \
 	if [ -n "$$UUID" ]; then VBoxManage internalcommands sethduuid "$$VDI" "$$UUID"; fi; \
 	VBoxManage storageattach "$$VM" --storagectl "$$CTL" --port "$$PORT" --device 0 --type hdd --medium "$$(pwd)/$$VDI"; \
-	VBoxManage showvminfo "$$VM" --machinereadable | grep -iE "hidpointing|hidkeyboard" || true; \
-	echo "vbox: done — start '$$VM' (pointing device = USB Tablet, keyboard = USB)"
+	VBoxManage showvminfo "$$VM" | grep -iE 'Pointing Device|Keyboard Device|xHCI USB|OHCI USB|EHCI USB' || true; \
+	echo "vbox: done — start '$$VM'"; \
+	echo "vbox: tip: click the VM window, then Host+C (often left ⌘) to capture keyboard"; \
+	echo "vbox: boot line should show  usb-kbd=READY  usb-mse=READY"
 
 ## ref-check: boot the real model and verify inference parity/determinism
 .PHONY: ref-check

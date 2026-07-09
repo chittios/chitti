@@ -325,8 +325,8 @@ fn builtins() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "memory_get".to_string(),
-            description: "Retrieve a previously stored fact from this agent's durable memory by key.".to_string(),
-            input_schema: r#"{"type":"object","properties":{"key":{"type":"string","description":"fact name to look up"}},"required":["key"]}"#.to_string(),
+            description: "Retrieve a previously stored fact by key (exact or short suffix, e.g. name → user.name). On miss, lists closest keys — or use memory_list / memory_search.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"key":{"type":"string","description":"fact name to look up (prefer exact key from memory_list)"}},"required":["key"]}"#.to_string(),
             required: alloc::vec!["key".to_string()],
             binding: ToolBinding::AgentMemory,
         },

@@ -73,15 +73,16 @@ pub extern "C" fn _start() -> ! {
         "Chitti: SMP: {} core(s) online (see ktrace 'smp:' lines for the spinlock self-test)",
         chitti_kernel::smp::cpu_count()
     );
-    // Bring up a USB keyboard (xHCI + HID) if present, so a real USB keyboard
-    // drives the shell alongside PS/2. No-op without an xHCI controller.
-    let usb_kbd = chitti_kernel::arch::x86_64::xhci::init_global();
+    // Bring up USB HID keyboard + pointer (xHCI) if present, so a real USB
+    // keyboard/tablet drives the shell alongside PS/2. No-op without xHCI.
+    let _usb = chitti_kernel::arch::x86_64::xhci::init_global();
     // INPUT summary (parity with aarch64): PS/2 (i8042) is always present on a
-    // PC; USB is READY only if a HID keyboard enumerated on the xHCI.
+    // PC; USB is READY only if a HID device enumerated on the xHCI.
     serial_println!(
-        "Chitti: INPUT  ps2={}  usb-kbd={}  (serial always works)",
+        "Chitti: INPUT  ps2={}  usb-kbd={}  usb-mse={}  (serial always works)",
         "yes",
-        if usb_kbd { "READY" } else { "no" }
+        if chitti_kernel::arch::x86_64::xhci::has_keyboard() { "READY" } else { "no" },
+        if chitti_kernel::arch::x86_64::xhci::has_mouse() { "READY" } else { "no" }
     );
 
     match chitti_kernel::cortex::model_module() {
@@ -253,14 +254,17 @@ pub extern "C" fn aarch64_start() -> ! {
     }
     if let Some((w, h)) = fb {
         serial_println!("Chitti: framebuffer TUI up ({}x{}) -- console mirrored to the window", w, h);
-        // Bring up a USB keyboard (xHCI + HID) if present — the real-hardware
-        // input path; needs the PCIe bus from aarch64_pcie_init.
-        let usb_kbd = chitti_kernel::arch::aarch64::xhci::init_global();
+        // Bring up USB HID keyboard + tablet (xHCI) — the VirtualBox / real-
+        // hardware input path; needs the PCIe bus from aarch64_pcie_init.
+        let _usb = chitti_kernel::arch::aarch64::xhci::init_global();
+        let usb_kbd = chitti_kernel::arch::aarch64::xhci::has_keyboard();
+        let usb_mse = chitti_kernel::arch::aarch64::xhci::has_mouse();
         // A PL050 PS/2 keyboard (ARM dev boards / some hypervisors) — the ARM
         // analogue of the x86 i8042. No-op where absent (e.g. QEMU `virt`).
         let pl050 = chitti_kernel::arch::aarch64::pl050::init();
         // A PL050 PS/2 mouse (a second KMI) — the ARM PS/2 pointing device, as
-        // VirtualBox-ARM presents (hidpointing=ps2mouse). No-op where absent.
+        // VirtualBox-ARM presents when hidpointing=ps2mouse (we force usbtablet
+        // via `make vbox`). No-op where absent.
         let _pl050_mouse = chitti_kernel::arch::aarch64::pl050_mouse::init();
         // Also wire the virtio-keyboard (QEMU `virt` window). Absent without one.
         let virtio_kbd = chitti_kernel::arch::aarch64::virtio_input::init();
@@ -269,12 +273,14 @@ pub extern "C" fn aarch64_start() -> ! {
         // A single, non-scrolling INPUT summary right before the shell so the
         // discovered input path is visible on the framebuffer (the only console
         // that survives a platform whose serial/UART we don't reach). This is the
-        // ground truth for "why isn't my keyboard working".
+        // ground truth for "why isn't my keyboard/mouse working".
+        // On VirtualBox-ARM expect: usb-kbd=READY usb-mse=READY (virtio/ps2 no).
         let ecam = chitti_kernel::pci::ecam_base();
         serial_println!(
-            "Chitti: INPUT  pcie-ecam={:#x}  usb-kbd={}  pl050-kbd={}  virtio-kbd={}  mouse[virtio={} ps2={}]  (serial always works)",
+            "Chitti: INPUT  pcie-ecam={:#x}  usb-kbd={}  usb-mse={}  pl050-kbd={}  virtio-kbd={}  mouse[virtio={} ps2={}]  (serial always works)",
             ecam,
             if usb_kbd { "READY" } else { "no" },
+            if usb_mse { "READY" } else { "no" },
             if pl050 { "yes" } else { "no" },
             if virtio_kbd { "yes" } else { "no" },
             if _mouse { "yes" } else { "no" },
