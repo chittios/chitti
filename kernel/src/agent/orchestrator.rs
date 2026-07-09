@@ -111,9 +111,20 @@ impl Orchestrator {
 
     /// Handle one user intent: record it (as `UserTyped`), run the loop to a
     /// stop condition, persist the session, and return the loop result.
+    ///
+    /// Polls [`crate::shell::poll_cancel`] between steps so Ctrl+C / Esc aborts
+    /// a long tool-use loop (same contract as interactive chat). Unit tests
+    /// that never touch the console see `cancel == false`.
     pub fn handle(&mut self, intent: &str, steps: &mut dyn StepSource, tools: &mut dyn ToolDispatch) -> LoopResult {
         self.session.push_message(Role::User, intent.to_string(), Provenance::UserTyped, now());
-        let result = agent_loop::run(&mut self.session, steps, tools, self.caller, now);
+        let result = agent_loop::run_with_cancel(
+            &mut self.session,
+            steps,
+            tools,
+            self.caller,
+            now,
+            crate::shell::poll_cancel,
+        );
         let _ = session::save(&self.session);
         result
     }

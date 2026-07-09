@@ -119,6 +119,8 @@ pub fn run() -> ! {
     // `/session`, `/info`), reused across the session so its Session persists.
     use crate::agent::{manifest as amanifest, orchestrator};
     let mut orch = orchestrator::Orchestrator::spawn(amanifest::orchestrator_manifest(), 42);
+    // Chat tools run through the Synapse Router under this task's caps.
+    bind_chat_tools_to_orchestrator(&orch);
     // Chat session (model + tokenizer + KV cache), loaded lazily on first chat.
     // Boot-time model-region probe: FNV-1a of the first 4 MiB + how long the
     // read took. One line of serial diagnoses both a corrupt load (hash
@@ -195,6 +197,10 @@ pub fn run() -> ! {
                 "clear" => {
                     chat = None;
                     remote_chat = None;
+                    // Keep session id/caps; drop the transcript so `/session`
+                    // matches the empty chat (not a hollow "N messages" ghost).
+                    orch.session.clear_transcript(orchestrator::now());
+                    let _ = crate::session::save(&orch.session);
                     #[cfg(not(test))]
                     crate::framebuffer::clear_chat();
                     serial_println!("(chat context + screen cleared)");
@@ -202,7 +208,7 @@ pub fn run() -> ! {
                 "open" | "edit" => run_open(arg),
                 "surface" => run_surface(arg),
                 // --- agents-as-processes ------------------------------------
-                "agents" => run_agents(arg, &mut chat),
+                "agents" => run_agents(arg, &mut chat, &mut orch),
                 "top" =>
                 {
                     #[cfg(not(test))]
@@ -244,6 +250,10 @@ pub fn run() -> ! {
                                 Some(s) => {
                                     let n = s.messages.len();
                                     orch = orchestrator::Orchestrator::from_session(amanifest::orchestrator_manifest(), s);
+                                    // Drop live model context — next chat turn
+                                    // rehydrates the KV from the resumed transcript.
+                                    chat = None;
+                                    remote_chat = None;
                                     serial_println!("=> resumed session {} ({} messages reconstructed)", id, n);
                                 }
                                 None => serial_println!("=> no saved session {}", id),
@@ -269,7 +279,7 @@ pub fn run() -> ! {
                 // `/voice` with no (or an unknown) subcommand is the interactive
                 // hear->think->speak conversation loop, which needs the live
                 // ChatSession; subcommands stay on the stateless system path.
-                "voice" if !voice_is_subcommand(arg) => voice_talk(&mut chat),
+                "voice" if !voice_is_subcommand(arg) => voice_talk(&mut chat, &mut orch.session),
                 // Everything else is a stateless system command, shared with the
                 // agent tool layer (see `dispatch_system` / `run_tool_command`).
                 _ => {
@@ -286,7 +296,11 @@ pub fn run() -> ! {
             match &remote_cfg {
                 Some(cfg) => {
                     let rc = remote_chat.get_or_insert_with(|| remote::RemoteChat::new(cfg.clone()));
-                    rc.turn(msg);
+                    // Seed remote history from a resumed orch.session once.
+                    if rc.is_empty() && orch.session.messages.len() > 1 {
+                        rc.hydrate_from_session(&orch.session);
+                    }
+                    rc.turn(msg, &mut orch.session);
                 }
                 None => serial_println!("model> remote mode but no endpoint — /model remote http://host:port [name]"),
             }
@@ -298,10 +312,17 @@ pub fn run() -> ! {
             let mut spin = Spinner::new("loading model");
             chat = ChatSession::load(&mut spin);
             spin.clear();
+            // After `/session resume`, rebuild the KV from the persisted transcript
+            // so the next turn continues the conversation coherently.
+            if let Some(sess) = chat.as_mut() {
+                if orch.session.messages.len() > 1 {
+                    sess.hydrate_from_session(&orch.session);
+                }
+            }
         }
         match chat.as_mut() {
             Some(sess) => {
-                sess.turn(msg);
+                sess.turn(msg, &mut orch.session);
             }
             None => serial_println!("no model bundled -- chat unavailable (try /infer, /bench, or /model remote)"),
         }
@@ -923,27 +944,32 @@ const CORE_TOOLS: &[&str] =
 /// returns the same "name — description" lines the prompt uses.
 fn search_tools(query: &str) -> String {
     use crate::tools::registry::ToolBinding;
-    let manifest = crate::agent::manifest::orchestrator_manifest();
-    let q = query.trim().to_lowercase();
+    // Active agent toolset (narrowed after `/agents switch`) + live MCP tools.
+    let mut toolset = chat_toolset();
+    let q = {
+        // Accept either a bare query string or `{"query":"..."}` / `{"args":"..."}`.
+        let t = query.trim();
+        if t.starts_with('{') {
+            crate::session::todo::json_str(t, "query")
+                .or_else(|| crate::session::todo::json_str(t, "args"))
+                .unwrap_or_default()
+        } else {
+            t.to_string()
+        }
+    };
+    let q = q.to_lowercase();
     let words: alloc::vec::Vec<&str> = q.split_whitespace().collect();
     let mut out = String::new();
     let mut n = 0;
-    // The shell agent's discoverable set = its manifest toolset + every tool a
-    // connected MCP server registered (added at runtime by `/mcp connect`).
-    let mut toolset = manifest.toolset.clone();
     for (srv, _, _) in crate::mcp::servers() {
         for (t, _) in crate::mcp::server_tools(&srv) {
             toolset.push(crate::mcp::tool_registry_name(&srv, &t));
         }
     }
     for d in crate::tools::registry::for_agent(&toolset) {
-        if !matches!(
-            d.binding,
-            ToolBinding::Shell { .. }
-                | ToolBinding::SpawnSubagent
-                | ToolBinding::Mcp { .. }
-                | ToolBinding::AgentMemory
-        ) {
+        // Advertise every binding the Router can actually dispatch for this agent
+        // (Synapse FS tools, shell, memory, MCP, spawn).
+        if matches!(d.binding, ToolBinding::RunIntent | ToolBinding::LoadSkill) {
             continue;
         }
         let hay = alloc::format!("{} {}", d.name, d.description).to_lowercase();
@@ -967,6 +993,142 @@ static ACTIVE_AGENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 
 fn active_agent_id() -> u64 {
     ACTIVE_AGENT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Live chat tool authority: which task's cap table + which toolset gate
+/// interactive (and remote) tool calls. Re-bound by `/agents switch`.
+struct ChatToolCtx {
+    caller: crate::sched::TaskId,
+    /// A switch-spawned task we own (killed on next switch / revert).
+    owned_task: Option<crate::sched::TaskId>,
+    toolset: alloc::vec::Vec<String>,
+    agent_id: u64,
+}
+
+static CHAT_TOOL_CTX: crate::mm::Locked<Option<ChatToolCtx>> = crate::mm::Locked::new(None);
+
+/// Point chat tools at the shell orchestrator's root task + full toolset.
+fn bind_chat_tools_to_orchestrator(orch: &crate::agent::orchestrator::Orchestrator) {
+    let m = crate::agent::manifest::orchestrator_manifest();
+    CHAT_TOOL_CTX.with(|slot| {
+        if let Some(prev) = slot.as_ref().and_then(|c| c.owned_task) {
+            let _ = crate::sched::kill(prev);
+        }
+        *slot = Some(ChatToolCtx {
+            caller: orch.caller,
+            owned_task: None,
+            toolset: m.toolset.clone(),
+            agent_id: m.id.0,
+        });
+    });
+    ACTIVE_AGENT.store(m.id.0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Resolve caps + toolset for chatting as agent `id`.
+fn resolve_chat_agent(id: u64) -> (alloc::vec::Vec<crate::agent::types::CapabilityRequest>, alloc::vec::Vec<String>, crate::agent::types::AgentRef) {
+    use crate::agent::types::*;
+    if id == crate::agent::manifest::ORCHESTRATOR_ID.0 {
+        let m = crate::agent::manifest::orchestrator_manifest();
+        return (
+            m.capabilities.clone(),
+            m.toolset.clone(),
+            AgentRef { manifest_id: m.id, version: m.version.clone() },
+        );
+    }
+    if let Some(m) = crate::skills::agent_skill::by_id(AgentId(id)) {
+        let grant = crate::skills::agent_skill::install_grant(AgentId(id)).unwrap_or_else(|| m.capabilities.clone());
+        let bounded = intersect_caps(&m.capabilities, &grant);
+        let caps = crate::skills::install::with_home_sandbox(&bounded, AgentId(id), m.kind);
+        return (
+            caps,
+            m.toolset.clone(),
+            AgentRef { manifest_id: m.id, version: m.version.clone() },
+        );
+    }
+    // Unknown / system-home agent: confined to `/agent/<id>/**` + memory tools.
+    let caps = crate::skills::install::with_home_sandbox(&[], AgentId(id), AgentKind::Subagent);
+    let toolset = alloc::vec![
+        String::from("memory_add"),
+        String::from("memory_get"),
+        String::from("memory_list"),
+        String::from("search_tools"),
+        String::from("read"),
+        String::from("list"),
+        String::from("write"),
+        String::from("search"),
+    ];
+    (
+        caps,
+        toolset,
+        AgentRef { manifest_id: AgentId(id), version: String::from("0.0.0") },
+    )
+}
+
+/// Re-bind chat tool authority to agent `id` (persona + caps + toolset).
+fn rebind_chat_agent(id: u64, orch: &mut crate::agent::orchestrator::Orchestrator) {
+    use crate::agent::types::*;
+    let (caps, toolset, agent_ref) = resolve_chat_agent(id);
+    orch.session.agent = agent_ref;
+    ACTIVE_AGENT.store(id, core::sync::atomic::Ordering::Relaxed);
+    crate::agent::home::ensure(id, if id == crate::agent::manifest::ORCHESTRATOR_ID.0 { "chitti" } else { "agent" });
+
+    CHAT_TOOL_CTX.with(|slot| {
+        if let Some(prev) = slot.as_ref().and_then(|c| c.owned_task) {
+            let _ = crate::sched::kill(prev);
+        }
+        if id == crate::agent::manifest::ORCHESTRATOR_ID.0 {
+            // Root: re-grant full orchestrator caps on the long-lived task
+            // (a prior switch may have left session.capabilities narrowed).
+            let live = crate::agent::manifest::grant_to_task(orch.caller, &caps);
+            orch.session.capabilities = live;
+            *slot = Some(ChatToolCtx {
+                caller: orch.caller,
+                owned_task: None,
+                toolset,
+                agent_id: id,
+            });
+        } else {
+            let task = crate::sched::spawn_parked("chat-agent");
+            let live = crate::agent::manifest::grant_to_task(task, &caps);
+            orch.session.capabilities = live;
+            *slot = Some(ChatToolCtx {
+                caller: task,
+                owned_task: Some(task),
+                toolset,
+                agent_id: id,
+            });
+            crate::ktrace::log_fmt(format_args!(
+                "chat.tools: switched to agent {} on task {} ({} caps, {} tools)",
+                id,
+                task,
+                orch.session.capabilities.len(),
+                slot.as_ref().map(|c| c.toolset.len()).unwrap_or(0)
+            ));
+        }
+    });
+}
+
+fn chat_tool_caller() -> crate::sched::TaskId {
+    CHAT_TOOL_CTX.with(|s| s.as_ref().map(|c| c.caller).unwrap_or(0))
+}
+
+fn chat_toolset() -> alloc::vec::Vec<String> {
+    CHAT_TOOL_CTX.with(|s| {
+        s.as_ref()
+            .map(|c| c.toolset.clone())
+            .unwrap_or_else(|| crate::agent::manifest::orchestrator_manifest().toolset)
+    })
+}
+
+fn tool_in_chat_toolset(name: &str) -> bool {
+    if name == "search_tools" {
+        return true;
+    }
+    // MCP tools are registered at runtime and always discoverable once connected.
+    if name.starts_with("mcp__") {
+        return true;
+    }
+    chat_toolset().iter().any(|t| t == name)
 }
 
 /// The shell agent's persona + dynamically generated toolset. The persona
@@ -1069,10 +1231,152 @@ fn json_args(body: &str) -> String {
     String::new()
 }
 
+/// Extract the `arguments` value from a tool-call body as a JSON object string
+/// suitable for the Synapse Router. Object form is preserved; a bare string
+/// form becomes `{"args":"…"}` so shell tools still work.
+fn extract_arguments_json(body: &str) -> String {
+    let Some(i) = body.find("\"arguments\"") else {
+        return String::from("{}");
+    };
+    let after_key = &body[i + "\"arguments\"".len()..];
+    let Some(colon) = after_key.find(':') else {
+        return String::from("{}");
+    };
+    let rest = after_key[colon + 1..].trim_start();
+    if rest.starts_with('"') {
+        // `"arguments": "flattened line"`
+        if let Some(v) = json_str(&body[i..], "arguments") {
+            return wrap_args_json(&v);
+        }
+        return String::from("{}");
+    }
+    if rest.starts_with('{') {
+        return extract_balanced_json_object(rest).unwrap_or_else(|| String::from("{}"));
+    }
+    String::from("{}")
+}
+
+/// Slice a balanced `{…}` JSON object from the start of `s` (string-aware).
+fn extract_balanced_json_object(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(s[..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn wrap_args_json(args_line: &str) -> String {
+    let mut out = String::from("{\"args\":\"");
+    for c in args_line.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push_str("\"}");
+    out
+}
+
+/// Normalize a chat-layer arg payload into Router JSON. Accepts a full object,
+/// a flattened shell line, or memory `key\\x1fvalue`.
+fn normalize_tool_args_json(name: &str, args: &str) -> String {
+    let t = args.trim();
+    if t.is_empty() {
+        return String::from("{}");
+    }
+    if t.starts_with('{') {
+        return t.to_string();
+    }
+    // Memory: structured unit-separator form from the older flattener.
+    if matches!(name, "memory_add" | "memory_get" | "memory_list" | "remember" | "recall") {
+        if name == "memory_list" {
+            return String::from("{}");
+        }
+        if let Some((k, v)) = t.split_once('\u{1f}') {
+            let mut o = String::from("{\"key\":\"");
+            json_escape_into(&mut o, k);
+            o.push_str("\",\"value\":\"");
+            json_escape_into(&mut o, v);
+            o.push_str("\"}");
+            return o;
+        }
+        let mut o = String::from("{\"key\":\"");
+        json_escape_into(&mut o, t);
+        o.push_str("\"}");
+        return o;
+    }
+    // Single-arg synapse conveniences (small models often flatten).
+    match name {
+        "read" | "delete" | "edit" => {
+            let mut o = String::from("{\"path\":\"");
+            json_escape_into(&mut o, t);
+            o.push_str("\"}");
+            o
+        }
+        "search" => {
+            let mut o = String::from("{\"query\":\"");
+            json_escape_into(&mut o, t);
+            o.push_str("\"}");
+            o
+        }
+        "console" => {
+            let mut o = String::from("{\"text\":\"");
+            json_escape_into(&mut o, t);
+            o.push_str("\"}");
+            o
+        }
+        "list" => String::from("{}"),
+        _ => wrap_args_json(t),
+    }
+}
+
+fn json_escape_into(out: &mut String, v: &str) {
+    for c in v.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+}
+
 /// Detect a tool call in a model reply. Primary: the Qwen3.5 template —
 /// `<tool_call>{"name": .., "arguments": ..}</tool_call>`. Fallback: a
-/// `TOOL: /<cmd> [args]` line (small-model drift from older prompts). Returns
-/// the tool name and its flattened argument line.
+/// `TOOL: /<cmd> [args]` line (small-model drift from older prompts).
+///
+/// Returns `(tool_name, args_json)` where `args_json` is a JSON object the
+/// Synapse Router can shape-validate (not a flattened shell line).
 pub(crate) fn parse_tool_call(text: &str) -> Option<(alloc::string::String, alloc::string::String)> {
     use alloc::string::ToString;
     // Qwen template.
@@ -1082,11 +1386,11 @@ pub(crate) fn parse_tool_call(text: &str) -> Option<(alloc::string::String, allo
         if let Some(name) = json_str(body, "name") {
             let name = name.trim().trim_start_matches('/').to_string();
             if !name.is_empty() {
-                return Some((name, json_args(body)));
+                return Some((name, extract_arguments_json(body)));
             }
         }
     }
-    // Legacy fallback.
+    // Legacy fallback → wrap the free-form line as shell `args`.
     for line in text.lines() {
         let l = line.trim();
         let rest = ["TOOL:", "TOOLS:", "Tool:", "tool:", "TOOL "]
@@ -1101,7 +1405,8 @@ pub(crate) fn parse_tool_call(text: &str) -> Option<(alloc::string::String, allo
             let cmd = parts.next().unwrap_or("").to_string();
             let args = parts.next().unwrap_or("").trim().to_string();
             if !cmd.is_empty() {
-                return Some((cmd, args));
+                let json = normalize_tool_args_json(&cmd, &args);
+                return Some((cmd, json));
             }
         }
     }
@@ -1484,7 +1789,7 @@ fn voice_test() {
 /// ends after ~800 ms of silence). Esc / q / Ctrl+C or the Stop button end the
 /// session. STT/TTS attach here as their models land; until then each captured
 /// utterance is reported with its length.
-fn voice_talk(chat: &mut Option<ChatSession>) {
+fn voice_talk(chat: &mut Option<ChatSession>, session: &mut crate::agent::types::Session) {
     if !crate::sound::is_up() {
         serial_println!("voice> no sound device found");
         return;
@@ -1506,6 +1811,11 @@ fn voice_talk(chat: &mut Option<ChatSession>) {
         let mut spin = Spinner::new("loading model");
         *chat = ChatSession::load(&mut spin);
         spin.clear();
+        if let Some(sess) = chat.as_mut() {
+            if session.messages.len() > 1 {
+                sess.hydrate_from_session(session);
+            }
+        }
     }
     serial_println!("voice> listening \u{2014} Esc (or the Stop button) ends the session");
     if let Err(e) = crate::sound::capture_start(16000) {
@@ -1569,7 +1879,7 @@ fn voice_talk(chat: &mut Option<ChatSession>) {
                             // capture share the device, so stop capture first, run
                             // the turn, then resume listening (VAD reset).
                             crate::sound::capture_stop();
-                            voice_converse_turn(chat, &clip, have_stt, have_tts, &mut levels);
+                            voice_converse_turn(chat, session, &clip, have_stt, have_tts, &mut levels);
                             crate::sound::vad::reset();
                             vadbuf.clear();
                             let _ = crate::sound::capture_start(16000);
@@ -1596,6 +1906,7 @@ fn voice_talk(chat: &mut Option<ChatSession>) {
 #[cfg(not(test))]
 fn voice_converse_turn(
     chat: &mut Option<ChatSession>,
+    session: &mut crate::agent::types::Session,
     clip: &[i16],
     have_stt: bool,
     have_tts: bool,
@@ -1620,7 +1931,7 @@ fn voice_converse_turn(
     let reply = match chat.as_mut() {
         Some(sess) => {
             crate::framebuffer::draw_voice(levels, "thinking\u{2026}");
-            sess.turn(heard)
+            sess.turn(heard, session)
         }
         None => {
             serial_println!("voice> (no LLM loaded \u{2014} cannot reply)");
@@ -1675,71 +1986,92 @@ fn run_mode(arg: &str) {
     }
 }
 
-/// Execute one chat-protocol tool call by registry lookup: `Shell`-bound tools
-/// run through `run_tool_command` (the human `/command` surface), **gated by the
-/// approval mode** (manual = all, auto = destructive only, bypass = none) via
-/// the keyboard/mouse modal; everything else is reported unavailable in chat
-/// mode (the full Router path is the `/agent` loop). The caller handles
-/// `spawn_subagent` before this.
-fn execute_chat_tool(name: &str, args: &str) -> alloc::string::String {
+/// Execute one chat-protocol tool call through the **Synapse Router** under the
+/// active chat agent's capability table ([`CHAT_TOOL_CTX`]), with the same
+/// human approval modal as before (manual / auto / bypass).
+///
+/// `args` may be a JSON object (preferred — from [`parse_tool_call`]) or a
+/// flattened line (normalized for the Router). `session` is the live
+/// orchestrator session (taint provenance + memory agent id + todos).
+///
+/// `spawn_subagent` is handled by the caller before this.
+fn execute_chat_tool(
+    name: &str,
+    args: &str,
+    session: &mut crate::agent::types::Session,
+) -> alloc::string::String {
+    use crate::agent::agent_loop::{format_tool_result, ToolDispatch};
+    use crate::agent::types::ToolCall;
     use crate::tools::registry::{self, ToolBinding};
-    // Tool discovery is chat-level, side-effect-free, and never needs approval.
+    use crate::tools::Router;
+
+    // Tool discovery is side-effect-free and never needs approval / caps.
     if name == "search_tools" {
         return search_tools(args);
     }
-    // Durable agent memory — always scoped to the active chat agent; never
-    // needs approval (write stays inside `/agent/<id>/memory/`).
-    if matches!(name, "memory_add" | "memory_get" | "memory_list")
-        || registry::get(name).is_some_and(|d| matches!(d.binding, ToolBinding::AgentMemory))
-    {
-        return crate::agent::home::run_memory_tool(name, active_agent_id(), args);
+    if !tool_in_chat_toolset(name) {
+        return alloc::format!(
+            "error: tool '{}' is not in this agent's toolset (agent {})",
+            name,
+            active_agent_id()
+        );
     }
-    // MCP tools (registered by `/mcp connect`) are called over the network,
-    // not through the shell dispatcher. They go through the same approval gate.
-    if let Some(ToolBinding::Mcp { server, tool }) = registry::get(name).map(|d| d.binding) {
-        let needs_approval = !matches!(approval_mode(), ApprovalMode::Bypass);
-        if needs_approval {
-            let ok = crate::modal::confirm(
-                "Agent MCP tool call \u{2014} approve?",
-                &alloc::format!("The agent wants to call MCP tool '{tool}' on server '{server}':\n{args}"),
-            );
-            if !ok {
-                serial_println!("\x1b[33m[denied by user]\x1b[0m");
-                return String::from("Denied: the user rejected this MCP tool call. Continue without it or explain what you needed.");
-            }
+
+    let args_json = normalize_tool_args_json(name, args);
+    let def = registry::get(name);
+    let (label, destructive, is_mcp) = match def.as_ref().map(|d| &d.binding) {
+        Some(ToolBinding::Shell { command, destructive }) => {
+            (alloc::format!("/{command}"), *destructive, false)
         }
-        return match crate::mcp::call(&server, &tool, args) {
-            Ok(text) => text,
-            Err(e) => alloc::format!("MCP call failed: {e}"),
-        };
-    }
-    let (command, destructive) = match registry::get(name) {
-        Some(def) => match def.binding {
-            ToolBinding::Shell { command, destructive } => (command, destructive),
-            _ => {
-                return alloc::format!("tool '{}' is not available in chat mode (use /agent for the full loop)", name);
-            }
-        },
-        // Not in the registry: try the command dispatcher directly (aliases).
-        // Treated as non-destructive; unknown names just print usage help.
-        None => (String::from(name), false),
+        Some(ToolBinding::Mcp { server, tool }) => {
+            (alloc::format!("mcp:{server}/{tool}"), true, true)
+        }
+        Some(ToolBinding::Synapse { .. }) if name == "delete" => {
+            (alloc::format!("{name}"), true, false)
+        }
+        Some(_) => (alloc::format!("{name}"), false, false),
+        None => (alloc::format!("{name}"), false, false),
     };
+
     let needs_approval = match approval_mode() {
         ApprovalMode::Manual => true,
-        ApprovalMode::Auto => destructive,
+        ApprovalMode::Auto => destructive || is_mcp,
         ApprovalMode::Bypass => false,
     };
-    if needs_approval {
+    let human_confirmed = if needs_approval {
         let ok = crate::modal::confirm(
             "Agent tool call \u{2014} approve?",
-            &alloc::format!("The agent wants to run: /{} {}\n(mode: {})", command, args, if destructive { "destructive" } else { "manual approval" }),
+            &alloc::format!(
+                "The agent wants to run: {} {}\n(mode: {})",
+                label,
+                args_json,
+                if destructive { "destructive" } else { "manual approval" }
+            ),
         );
         if !ok {
             serial_println!("\x1b[33m[denied by user]\x1b[0m");
-            return String::from("Denied: the user rejected this tool call. Do not retry it; continue without it or explain what you needed.");
+            return String::from(
+                "Denied: the user rejected this tool call. Do not retry it; continue without it or explain what you needed.",
+            );
         }
-    }
-    run_tool_command(&command, args)
+        true
+    } else {
+        false
+    };
+
+    let caller = chat_tool_caller();
+    let mut router = Router::taint_aware();
+    router.human_confirmed = human_confirmed;
+    // Session-scoped agent hooks (spawn/load) — chat handles spawn itself;
+    // load_skill still goes through the orchestrator hook when present.
+    // A bare Router is enough for Synapse / Shell / Memory / MCP / Todo.
+    let call = ToolCall {
+        call_id: 0,
+        tool: String::from(name),
+        args: args_json,
+    };
+    let outcome = router.call(session, caller, &call);
+    format_tool_result(outcome.is_error, outcome.result)
 }
 
 /// A live chat: the model, its BPE tokenizer, and a persistent KV/recurrent
@@ -1760,6 +2092,12 @@ struct ChatSession {
     /// service agent's planning turn, where a deterministic decision (e.g. a
     /// routing lookup) is wanted, not creative chat.
     greedy: bool,
+    /// Committed (header, body) turns that match the KV. Used to rebuild the
+    /// cache after a mid-prefill / mid-decode cancel, which would otherwise
+    /// leave a truncated turn in the KV and corrupt the next message.
+    history: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>,
+    /// Monotonic tool-call ids for recording into the orchestrator session.
+    next_call_id: u64,
 }
 
 impl ChatSession {
@@ -1780,7 +2118,89 @@ impl ChatSession {
         spin.tick();
         // Seed the sampler from the boot clock so sessions vary.
         let rng = sampler::Rng::new(crate::arch::now_ms().wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-        Some(Self { model: m, tok, kv, state, pos: 0, rng, gen: alloc::vec::Vec::new(), cancelled: false, greedy: false })
+        Some(Self {
+            model: m,
+            tok,
+            kv,
+            state,
+            pos: 0,
+            rng,
+            gen: alloc::vec::Vec::new(),
+            cancelled: false,
+            greedy: false,
+            history: alloc::vec::Vec::new(),
+            next_call_id: 1,
+        })
+    }
+
+    /// Rebuild KV + history from a resumed orchestrator session so chat and
+    /// `/session` share one transcript. Skips empty assistant tool-call shells.
+    fn hydrate_from_session(&mut self, session: &crate::agent::types::Session) {
+        use crate::agent::types::Role;
+        self.history.clear();
+        for m in &session.messages {
+            match m.role {
+                Role::System => {
+                    if !m.content.is_empty() {
+                        self.history.push((alloc::string::String::from("system\n"), m.content.clone()));
+                    }
+                }
+                Role::User => {
+                    self.history.push((alloc::string::String::from("user\n"), m.content.clone()));
+                }
+                Role::Assistant => {
+                    if !m.content.is_empty() {
+                        self.history.push((alloc::string::String::from("assistant\n"), m.content.clone()));
+                    }
+                }
+                Role::Tool => {
+                    let body = alloc::format!("<tool_response>\n{}\n</tool_response>", m.content);
+                    self.history.push((alloc::string::String::from("user\n"), body));
+                }
+            }
+            for c in &m.tool_calls {
+                if c.call_id >= self.next_call_id {
+                    self.next_call_id = c.call_id + 1;
+                }
+            }
+            if let Some(cid) = m.tool_call_id {
+                if cid >= self.next_call_id {
+                    self.next_call_id = cid + 1;
+                }
+            }
+        }
+        self.rebuild_kv_from_history();
+        crate::ktrace::log_fmt(format_args!(
+            "chat.hydrate: session {} -> {} history turns, pos={}",
+            session.id.0,
+            self.history.len(),
+            self.pos
+        ));
+    }
+
+    /// Drop the KV and re-prefill every committed history turn (no assistant
+    /// priming). Used after cancel so a truncated prefill/decode never sticks.
+    /// Uses [`Self::prefill_turn`] directly (not `prefill_committed`) to avoid
+    /// recursive rebuild if the user holds Ctrl+C through the rebuild itself.
+    fn rebuild_kv_from_history(&mut self) {
+        let turns: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> = self.history.clone();
+        self.kv = self.model.new_cache();
+        self.state = self.model.new_state();
+        self.pos = 0;
+        self.gen.clear();
+        self.cancelled = false;
+        for (header, body) in &turns {
+            self.prefill_turn(header, body, false);
+            if self.cancelled {
+                // User held cancel through rebuild: keep the full logical
+                // history; KV may be short. Clear the flag so the outer turn
+                // still ends, and leave history intact for a later rebuild.
+                self.history = turns;
+                return;
+            }
+        }
+        // History was already correct; leave it as the cloned turns.
+        self.history = turns;
     }
 
     /// One chat turn as an **agentic ReAct loop** over the Qwen3.5 tool
@@ -1788,17 +2208,26 @@ impl ChatSession {
     /// emit a `<tool_call>` (executed; its output returned in a
     /// `<tool_response>` block) or a final answer. Bounded by `MAX_TOOL_ITERS`
     /// so a confused small model can't loop forever.
+    ///
+    /// Records the turn into `session` (user / tool / assistant) and write-
+    /// through saves so `/session save|resume` reflects interactive chat.
     /// Returns the final assistant answer (post-`<think>`) — used by the voice
-    /// loop to speak the reply; the interactive shell caller ignores it.
-    fn turn(&mut self, msg: &str) -> alloc::string::String {
+    /// loop to speak the reply.
+    fn turn(&mut self, msg: &str, session: &mut crate::agent::types::Session) -> alloc::string::String {
+        use crate::agent::orchestrator::now;
+        use crate::agent::types::{Provenance, Role, ToolCall};
         const MAX_TOOL_ITERS: usize = 4;
         self.cancelled = false;
-        if self.pos == 0 {
-            self.prefill_turn("system\n", &agent_system_prompt(), false);
+        session.push_message(Role::User, msg.into(), Provenance::UserTyped, now());
+        session.budget.turns_used = session.budget.turns_used.saturating_add(1);
+
+        if self.history.is_empty() {
+            self.prefill_committed("system\n", &agent_system_prompt(), false);
         }
-        self.prefill_turn("user\n", msg, true);
+        self.prefill_committed("user\n", msg, true);
         if self.cancelled {
             serial_println!("\x1b[33m[cancelled]\x1b[0m");
+            let _ = crate::session::save(session);
             return alloc::string::String::new();
         }
         // Repeat guard (same rationale as the sub-agent loop): a small model
@@ -1809,16 +2238,19 @@ impl ChatSession {
         for _ in 0..MAX_TOOL_ITERS {
             let text = self.generate_assistant("\x1b[1;36mchitti:\x1b[0m ");
             if self.cancelled {
-                return text; // user cancelled: no tool parsing, turn over
+                // Partial decode is not in history; KV already rebuilt.
+                let _ = crate::session::save(session);
+                return text;
             }
             if let Some(pair) = parse_tool_call(&text) {
                 if last_call.as_ref() == Some(&pair) {
                     if nudged {
                         serial_println!("\x1b[33m[tool loop stopped: repeated call]\x1b[0m");
+                        let _ = crate::session::save(session);
                         return alloc::string::String::new();
                     }
                     nudged = true;
-                    self.prefill_turn(
+                    self.prefill_committed(
                         "user\n",
                         "<tool_response>\nYou already ran that tool and have its output above. Do not call any more tools; give your final answer in prose now.\n</tool_response>",
                         true,
@@ -1829,12 +2261,26 @@ impl ChatSession {
             }
             match parse_tool_call(&text) {
                 Some((cmd, args)) if cmd == "spawn_subagent" || cmd == "subagent" => {
-                    // Delegate to an isolated, tool-using sub-agent; only its
-                    // summary comes back as the observation.
-                    serial_println!("\x1b[33m\u{2192} dispatching subagent:\x1b[0m {}", args);
-                    let summary = self.run_subagent(&args);
+                    // Args are Router JSON; the task string lives under "task" (or "args").
+                    let task = crate::session::todo::json_str(&args, "task")
+                        .or_else(|| crate::session::todo::json_str(&args, "args"))
+                        .unwrap_or_else(|| args.clone());
+                    serial_println!("\x1b[33m\u{2192} dispatching subagent:\x1b[0m {}", task);
+                    // Keep assistant tool-call text in history so a later rebuild
+                    // preserves the Qwen tool-call → tool_response shape.
+                    self.history.push((alloc::string::String::from("assistant\n"), text.clone()));
+                    let call_id = self.next_call_id;
+                    self.next_call_id += 1;
+                    session.push_assistant_tool_calls(
+                        String::new(),
+                        alloc::vec![ToolCall { call_id, tool: cmd.clone(), args: args.clone() }],
+                        now(),
+                    );
+                    session.budget.tool_calls_used = session.budget.tool_calls_used.saturating_add(1);
+                    let summary = self.run_subagent(&task);
+                    session.push_tool_result(call_id, summary.clone(), Provenance::SystemTrusted, now());
                     let fb = alloc::format!("<tool_response>\nSubagent report:\n{}\n</tool_response>", summary);
-                    self.prefill_turn("user\n", &fb, true);
+                    self.prefill_committed("user\n", &fb, true);
                 }
                 Some((cmd, args)) => {
                     serial_println!(
@@ -1843,16 +2289,46 @@ impl ChatSession {
                         if args.is_empty() { "" } else { " " },
                         args
                     );
-                    // `execute_chat_tool` streams the command's output live
-                    // *and* returns a copy; feed it back per the Qwen template.
-                    let obs = execute_chat_tool(&cmd, &args);
+                    self.history.push((alloc::string::String::from("assistant\n"), text.clone()));
+                    let call_id = self.next_call_id;
+                    self.next_call_id += 1;
+                    session.push_assistant_tool_calls(
+                        String::new(),
+                        alloc::vec![ToolCall { call_id, tool: cmd.clone(), args: args.clone() }],
+                        now(),
+                    );
+                    session.budget.tool_calls_used = session.budget.tool_calls_used.saturating_add(1);
+                    let obs = execute_chat_tool(&cmd, &args, session);
+                    let prov = if obs.starts_with("error:")
+                        || obs.starts_with("Denied:")
+                        || obs.starts_with("denied:")
+                        || obs.starts_with("refused:")
+                    {
+                        Provenance::SystemTrusted
+                    } else {
+                        Provenance::UntrustedIngested
+                    };
+                    session.push_tool_result(call_id, obs.clone(), prov, now());
                     let fb = alloc::format!("<tool_response>\n{}\n</tool_response>", obs);
-                    self.prefill_turn("user\n", &fb, true);
+                    self.prefill_committed("user\n", &fb, true);
                 }
-                None => return text, // final answer already streamed
+                None => {
+                    // Final answer: commit assistant text to history + session.
+                    if !text.is_empty() {
+                        self.history.push((alloc::string::String::from("assistant\n"), text.clone()));
+                    }
+                    session.push_message(Role::Assistant, text.clone(), Provenance::SystemTrusted, now());
+                    let _ = crate::session::save(session);
+                    return text;
+                }
+            }
+            if self.cancelled {
+                let _ = crate::session::save(session);
+                return alloc::string::String::new();
             }
         }
         serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
+        let _ = crate::session::save(session);
         alloc::string::String::new()
     }
 
@@ -1872,22 +2348,43 @@ impl ChatSession {
             true,
         );
         if self.cancelled {
+            // Drop the partial summarize prompt; restore committed history.
+            if !self.history.is_empty() {
+                self.rebuild_kv_from_history();
+            }
             serial_println!("\x1b[33m[cancelled]\x1b[0m");
             return;
         }
         let summary = self.generate_assistant("\x1b[1;36msummary:\x1b[0m ");
+        if self.cancelled {
+            serial_println!("\x1b[33m[cancelled]\x1b[0m");
+            return;
+        }
         let before = self.pos;
+        let s = summary.trim();
+        self.history.clear();
         self.kv = self.model.new_cache();
         self.state = self.model.new_state();
         self.pos = 0;
         self.gen.clear();
-        self.prefill_turn("system\n", &agent_system_prompt(), false);
-        let s = summary.trim();
+        self.prefill_committed("system\n", &agent_system_prompt(), false);
         if !s.is_empty() && !self.cancelled {
-            self.prefill_turn("system\n", &alloc::format!("Conversation so far (compacted): {}", s), false);
+            self.prefill_committed("system\n", &alloc::format!("Conversation so far (compacted): {}", s), false);
         }
         crate::ktrace::log_fmt(format_args!("chat.compact: {} -> {} tokens", before, self.pos));
         serial_println!("(compacted: context {} -> {} tokens)", before, self.pos);
+    }
+
+    /// Prefill `header`+`body` and, on success, append them to [`Self::history`].
+    /// On cancel mid-prefill, rebuilds the KV from committed history so a
+    /// truncated turn never poisons the next message.
+    fn prefill_committed(&mut self, header: &str, body: &str, prime: bool) {
+        self.prefill_turn(header, body, prime);
+        if self.cancelled {
+            self.rebuild_kv_from_history();
+            return;
+        }
+        self.history.push((alloc::string::String::from(header), alloc::string::String::from(body)));
     }
 
     /// Encode one chat turn into the running context and prefill it through
@@ -1900,6 +2397,10 @@ impl ChatSession {
     ///   naturally skipped).
     /// The format is picked by which delimiter tokens the vocab carries — the
     /// same dispatch the tokenizer itself used.
+    ///
+    /// Does **not** touch [`Self::history`] — callers that own the interactive
+    /// transcript use [`Self::prefill_committed`]; isolated loops (serve /
+    /// sub-agent) call this directly.
     fn prefill_turn(&mut self, header: &str, body: &str, prime: bool) {
         let gemma = self.tok.kind == crate::cortex::tokenizer::Kind::Gemma;
         let (open, close) = if gemma {
@@ -1972,9 +2473,9 @@ impl ChatSession {
             // the screen freezes while we think (see CLAUDE.md UI notes).
             ui_tick();
             crate::net::poll();
-            // The user can cancel a long prefill too (Ctrl+C / Esc). The KV
-            // holds a truncated turn; `turn` ends immediately, and the next
-            // message simply continues from here.
+            // Cancel mid-prefill: stop feeding. Caller (`prefill_committed` or
+            // `turn`) rebuilds from committed history so the KV is never left
+            // half-way through a turn.
             if poll_cancel() {
                 self.cancelled = true;
                 break;
@@ -2085,6 +2586,14 @@ impl ChatSession {
         }
         md.finish(&mut |s| serial_print!("{}", s)); // flush a held partial line
         serial_println!("");
+        if self.cancelled {
+            // Partial assistant tokens must not stick in the KV — rebuild from
+            // committed history (interactive chat) so the next turn is clean.
+            if !self.history.is_empty() {
+                self.rebuild_kv_from_history();
+            }
+            return out;
+        }
         // Close the assistant turn in the cache so the next turn continues cleanly.
         self.model.forward(im_end, self.pos, &mut self.kv, &mut self.state, false);
         self.pos += 1;
@@ -2336,15 +2845,23 @@ struct CommandTools;
 impl crate::agent::agent_loop::ToolDispatch for CommandTools {
     fn call(
         &mut self,
-        _session: &mut crate::agent::types::Session,
-        _caller: crate::sched::TaskId,
+        session: &mut crate::agent::types::Session,
+        caller: crate::sched::TaskId,
         call: &crate::agent::types::ToolCall,
     ) -> crate::agent::agent_loop::ToolOutcome {
-        use crate::agent::agent_loop::ToolOutcome;
-        use crate::agent::types::Provenance;
+        use crate::agent::agent_loop::{format_tool_result, ToolDispatch, ToolOutcome};
+        use crate::tools::Router;
+        // Sub-agents run under *their* cap table (`caller`), not the chat
+        // switch context — go straight through the taint-aware Router.
         serial_println!("\x1b[33m\u{2192} subagent running\x1b[0m /{} {}", call.tool, call.args);
-        let out = execute_chat_tool(&call.tool, &call.args);
-        ToolOutcome::ok(out, Provenance::UntrustedIngested)
+        let mut router = Router::taint_aware();
+        let outcome = router.call(session, caller, call);
+        let text = format_tool_result(outcome.is_error, outcome.result);
+        if outcome.is_error || text.starts_with("error:") || text.starts_with("denied:") || text.starts_with("refused:") {
+            ToolOutcome::error(text)
+        } else {
+            ToolOutcome::ok(text, outcome.provenance)
+        }
     }
 }
 
@@ -2908,7 +3425,11 @@ fn run_surface(_arg: &str) {
     serial_println!("surface> painted into the action pane (/close to hide)");
 }
 
-fn run_agents(arg: &str, chat: &mut Option<ChatSession>) {
+fn run_agents(
+    arg: &str,
+    chat: &mut Option<ChatSession>,
+    orch: &mut crate::agent::orchestrator::Orchestrator,
+) {
     let (sub, sarg) = match arg.split_once(' ') {
         Some((s, a)) => (s, a.trim()),
         None => (arg.trim(), ""),
@@ -2929,18 +3450,33 @@ fn run_agents(arg: &str, chat: &mut Option<ChatSession>) {
         }
         "switch" => match sarg.parse::<u64>() {
             Ok(id) => {
-                ACTIVE_AGENT.store(id, core::sync::atomic::Ordering::Relaxed);
-                *chat = None; // next message rebuilds the session with the new persona
-                crate::agent::home::ensure(id, "agent");
-                serial_println!("agents> chat now runs as agent {} (SOUL: /agent/{}/SOUL.md)", id, id);
+                // Re-bind caps + toolset to this agent; drop live chat KV so
+                // the next turn loads the new SOUL under the new authority.
+                rebind_chat_agent(id, orch);
+                *chat = None;
+                serial_println!(
+                    "agents> chat now runs as agent {} (SOUL: /agent/{}/SOUL.md, {} caps, tools gated)",
+                    id,
+                    id,
+                    orch.session.capabilities.len()
+                );
             }
             Err(_) => serial_println!("usage: /agents switch <id>"),
         },
         "kill" => match sarg.parse::<u64>() {
-            Ok(id) => match crate::sched::kill(id) {
-                Ok(()) => serial_println!("agents> task {} killed (capabilities revoked)", id),
-                Err(e) => serial_println!("agents> cannot kill {}: {}", id, e),
-            },
+            Ok(id) => {
+                if id == active_agent_id() {
+                    // Don't leave the chat pointing at a dead agent — revert
+                    // tool authority to the shell orchestrator.
+                    rebind_chat_agent(crate::agent::manifest::ORCHESTRATOR_ID.0, orch);
+                    *chat = None;
+                    serial_println!("agents> was the active chat agent — chat reverts to shell agent (1)");
+                }
+                match crate::sched::kill(id) {
+                    Ok(()) => serial_println!("agents> task {} killed (capabilities revoked)", id),
+                    Err(e) => serial_println!("agents> cannot kill {}: {}", id, e),
+                }
+            }
             Err(_) => serial_println!("usage: /agents kill <id>"),
         },
         "services" => {
@@ -6221,41 +6757,60 @@ fn disk_ext4read() {
 mod agent_flow_tests {
     use super::*;
 
-    /// The agent chat flow parses the Qwen `<tool_call>` JSON: name + flattened
-    /// `args`. A leading `/` on the name is stripped (models drift into `/ls`).
+    /// The agent chat flow parses the Qwen `<tool_call>` JSON into a Router-ready
+    /// args object (not a flattened shell line). A leading `/` on the name is
+    /// stripped (models drift into `/ls`).
     #[test_case]
     fn parse_tool_call_qwen_json() {
         let (name, args) = parse_tool_call("<tool_call>{\"name\": \"ls\", \"arguments\": {\"args\": \"/mnt\"}}</tool_call>").unwrap();
         assert_eq!(name, "ls");
-        assert_eq!(args, "/mnt");
-        // A bare-string arguments value is used as-is; a leading slash is dropped.
+        assert!(args.contains("\"args\""), "got {args}");
+        assert!(args.contains("/mnt"), "got {args}");
+        // Bare-string arguments → wrapped as {"args":"…"}.
         let (name, args) = parse_tool_call("thinking...\n<tool_call>{\"name\": \"/ping\", \"arguments\": \"1.1.1.1\"}</tool_call>").unwrap();
         assert_eq!(name, "ping");
-        assert_eq!(args, "1.1.1.1");
-        // spawn_subagent (delegation) with a task string.
+        assert!(args.contains("1.1.1.1"), "got {args}");
+        // spawn_subagent keeps the object (task field).
         let (name, args) = parse_tool_call("<tool_call>{\"name\":\"spawn_subagent\",\"arguments\":{\"task\":\"read notes\"}}</tool_call>").unwrap();
         assert_eq!(name, "spawn_subagent");
-        assert_eq!(args, "read notes");
-        // memory_add keeps key + value across the flatten step (unit separator).
+        assert!(args.contains("\"task\""), "got {args}");
+        assert!(args.contains("read notes"), "got {args}");
+        // memory_add keeps key + value as a JSON object for the Router.
         let (name, args) = parse_tool_call(
             "<tool_call>{\"name\":\"memory_add\",\"arguments\":{\"key\":\"colour\",\"value\":\"teal\"}}</tool_call>",
         )
         .unwrap();
         assert_eq!(name, "memory_add");
-        assert_eq!(args, "colour\u{1f}teal");
+        assert!(args.contains("\"key\""), "got {args}");
+        assert!(args.contains("colour"), "got {args}");
+        assert!(args.contains("teal"), "got {args}");
         let (name, args) =
             parse_tool_call("<tool_call>{\"name\":\"memory_get\",\"arguments\":{\"key\":\"colour\"}}</tool_call>").unwrap();
         assert_eq!(name, "memory_get");
-        assert_eq!(args, "colour");
+        assert!(args.contains("colour"), "got {args}");
     }
 
     #[test_case]
     fn parse_tool_call_legacy_and_none() {
-        // Legacy `TOOL:` fallback (older prompt drift).
+        // Legacy `TOOL:` fallback (older prompt drift) → JSON-wrapped args.
         let (name, args) = parse_tool_call("TOOL: /disks").unwrap();
-        assert_eq!((name.as_str(), args.as_str()), ("disks", ""));
+        assert_eq!(name, "disks");
+        assert!(args == "{}" || args.contains("args"), "got {args}");
         // Plain prose (a normal answer / greeting) → no tool call.
         assert!(parse_tool_call("Hello! How can I help you today?").is_none());
+    }
+
+    /// normalize_tool_args_json recovers multi-key memory payloads and wraps
+    /// bare shell lines for the Router.
+    #[test_case]
+    fn normalize_tool_args_for_router() {
+        assert_eq!(normalize_tool_args_json("list", ""), "{}");
+        assert!(normalize_tool_args_json("datetime", "tz +5:30").contains("tz +5:30"));
+        let mem = normalize_tool_args_json("memory_add", "colour\u{1f}teal");
+        assert!(mem.contains("\"key\""), "{mem}");
+        assert!(mem.contains("teal"), "{mem}");
+        // Already-JSON is passed through.
+        assert_eq!(normalize_tool_args_json("read", r#"{"path":"x"}"#), r#"{"path":"x"}"#);
     }
 
     /// `poll_interrupt` (the cancel-poll for running commands like `/http`)

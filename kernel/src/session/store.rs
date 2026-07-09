@@ -27,10 +27,15 @@ pub fn save(session: &Session) -> Result<(), postcard::Error> {
 
 /// Reconstruct a session previously [`save`]d. Returns `None` if absent, or the
 /// postcard error if the stored bytes are corrupt.
+///
+/// Also advances the process-global id minters past any ids already present in
+/// the snapshot, so a later `Session::new` / `push_message` cannot collide with
+/// a resumed id (counters otherwise restart at 1 each boot).
 pub fn resume(id: SessionId) -> Option<Session> {
     let bytes = crate::synapse::fs::read(&key_for(id))?;
     match postcard::from_bytes::<Session>(&bytes) {
         Ok(s) => {
+            notice_ids(&s);
             crate::ktrace::log_fmt(format_args!(
                 "session.resume: id={} messages={} (KV recomputed from seed {})",
                 s.id.0,
@@ -40,6 +45,22 @@ pub fn resume(id: SessionId) -> Option<Session> {
             Some(s)
         }
         Err(_) => None,
+    }
+}
+
+/// Bump id minters so they sit past every id already living in `session`.
+fn notice_ids(session: &Session) {
+    notice_session_id(session.id);
+    for m in &session.messages {
+        notice_msg_id(m.id);
+        for c in &m.tool_calls {
+            // call_ids are a separate sequence in practice; still advance the
+            // msg minter past them so ids stay unique across kinds in display.
+            notice_msg_id(MsgId(c.call_id));
+        }
+        if let Some(cid) = m.tool_call_id {
+            notice_msg_id(MsgId(cid));
+        }
     }
 }
 

@@ -126,4 +126,28 @@ impl Session {
     pub fn transcript(&self) -> Vec<(Role, &str)> {
         self.messages.iter().filter(|m| m.resident).map(|m| (m.role, m.content.as_str())).collect()
     }
+
+    /// Drop the conversation while keeping the same session id, agent ref,
+    /// seed, and live capabilities. Keeps the system prompt (message 0) so a
+    /// subsequent turn still has the orchestrator persona. Used by `/clear`
+    /// so the shell chat and the persisted session stay in lock-step.
+    pub fn clear_transcript(&mut self, now: Ticks) {
+        let system = self.messages.first().filter(|m| m.role == Role::System).cloned();
+        self.messages.clear();
+        self.context.live_tokens = 0;
+        self.context.compactions.clear();
+        self.context.recall_index = None;
+        self.todos.clear();
+        self.subagents.clear();
+        self.budget.turns_used = 0;
+        self.budget.tool_calls_used = 0;
+        self.budget.subagents_used = 0;
+        self.budget.tokens_used = 0;
+        self.budget.wall_ticks_used = 0;
+        if let Some(sys) = system {
+            self.context.live_tokens = sys.tokens;
+            self.messages.push(sys);
+        }
+        self.updated_ticks = now;
+    }
 }
