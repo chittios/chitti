@@ -1,0 +1,45 @@
+{
+  "name": "chess",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Chess UI agent: paints an 8×8 board in the action pane via board_set/board_mark; rules in assets/tools.wasm.",
+  "toolset": [
+    "ui_surface_request",
+    "ui_draw",
+    "ui_event_poll",
+    "ui_surface_close",
+    "board_set",
+    "board_mark",
+    "chess_legal",
+    "chess_try_move",
+    "storage_get",
+    "storage_set",
+    "storage_list",
+    "storage_remove",
+    "memory_add",
+    "memory_get",
+    "memory_list"
+  ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "exports": {
+      "chess_legal": { "func": "chess_legal" },
+      "chess_try_move": { "func": "chess_try_move" }
+    },
+    "memory_pages": 32,
+    "fuel": 2000000
+  },
+  "capabilities": [
+    {
+      "domain": "ui",
+      "rights": ["exec", "write", "delete"],
+      "scope": "any"
+    },
+    {
+      "domain": "todo",
+      "rights": ["read", "write"],
+      "scope": "any"
+    }
+  ],
+  "autostart": false
+}

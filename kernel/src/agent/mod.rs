@@ -23,9 +23,12 @@ pub mod home;
 pub mod manifest;
 pub mod orchestrator;
 pub mod rule_steps;
+pub mod storage;
 pub mod subagent;
 pub mod system;
 pub mod types;
+pub mod wasm_abi;
+pub mod wasm_rt;
 
 pub use types::*;
 

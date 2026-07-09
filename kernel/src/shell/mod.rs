@@ -300,7 +300,13 @@ pub fn run() -> ! {
                 // `/voice` with no (or an unknown) subcommand is the interactive
                 // hear->think->speak conversation loop, which needs the live
                 // ChatSession; subcommands stay on the stateless system path.
-                "voice" if !voice_is_subcommand(arg) => voice_talk(&mut chat, &mut orch.session),
+                "voice" if !voice_is_subcommand(arg) => voice_talk(
+                    &mut chat,
+                    &mut orch.session,
+                    remote_on,
+                    &remote_cfg,
+                    &mut remote_chat,
+                ),
                 // Everything else is a stateless system command, shared with the
                 // agent tool layer (see `dispatch_system` / `run_tool_command`).
                 _ => {
@@ -2019,9 +2025,15 @@ fn voice_test() {
 /// The interactive voice session: live waveform modal driven by mic RMS, with
 /// level-based endpointing (speech starts above the threshold, an utterance
 /// ends after ~800 ms of silence). Esc / q / Ctrl+C or the Stop button end the
-/// session. STT/TTS attach here as their models land; until then each captured
-/// utterance is reported with its length.
-fn voice_talk(chat: &mut Option<ChatSession>, session: &mut crate::agent::types::Session) {
+/// session. The LLM backend matches shell chat: **remote** when `/model remote`
+/// is active, otherwise the local GGUF.
+fn voice_talk(
+    chat: &mut Option<ChatSession>,
+    session: &mut crate::agent::types::Session,
+    remote_on: bool,
+    remote_cfg: &Option<remote::RemoteConfig>,
+    remote_chat: &mut Option<remote::RemoteChat>,
+) {
     if !crate::sound::is_up() {
         serial_println!("voice> no sound device found");
         return;
@@ -2037,9 +2049,19 @@ fn voice_talk(chat: &mut Option<ChatSession>, session: &mut crate::agent::types:
     if !have_tts {
         serial_println!("voice> no kitten (TTS) model — replies will be printed, not spoken");
     }
-    // The LLM is what turns a transcript into a reply; load it now (same model
-    // the text chat uses) so a captured utterance can drive a turn.
-    if chat.is_none() {
+    // LLM: same backend as shell chat.
+    if remote_on {
+        if let Some(cfg) = remote_cfg {
+            let rc = remote_chat.get_or_insert_with(|| remote::RemoteChat::new(cfg.clone()));
+            if rc.is_empty() && session.messages.len() > 1 {
+                rc.hydrate_from_session(session);
+            }
+            serial_println!("voice> LLM backend: remote ({})", cfg.model);
+        } else {
+            serial_println!("voice> remote mode but no endpoint — /model remote <url>");
+            return;
+        }
+    } else if chat.is_none() {
         let mut spin = Spinner::new("loading model");
         *chat = ChatSession::load(&mut spin);
         spin.clear();
@@ -2047,6 +2069,10 @@ fn voice_talk(chat: &mut Option<ChatSession>, session: &mut crate::agent::types:
             if session.messages.len() > 1 {
                 sess.hydrate_from_session(session);
             }
+        }
+        if chat.is_none() {
+            serial_println!("voice> no local model — try /model remote or bundle a GGUF");
+            return;
         }
     }
     serial_println!("voice> listening \u{2014} Esc (or the Stop button) ends the session");
@@ -2111,7 +2137,17 @@ fn voice_talk(chat: &mut Option<ChatSession>, session: &mut crate::agent::types:
                             // capture share the device, so stop capture first, run
                             // the turn, then resume listening (VAD reset).
                             crate::sound::capture_stop();
-                            voice_converse_turn(chat, session, &clip, have_stt, have_tts, &mut levels);
+                            voice_converse_turn(
+                                chat,
+                                session,
+                                remote_on,
+                                remote_cfg,
+                                remote_chat,
+                                &clip,
+                                have_stt,
+                                have_tts,
+                                &mut levels,
+                            );
                             crate::sound::vad::reset();
                             vadbuf.clear();
                             let _ = crate::sound::capture_start(16000);
@@ -2132,13 +2168,15 @@ fn voice_talk(chat: &mut Option<ChatSession>, session: &mut crate::agent::types:
 }
 
 /// One voice-conversation turn: transcribe the captured `clip` (STT), feed the
-/// transcript to the LLM (`ChatSession::turn`), then speak the reply (TTS). Each
-/// stage degrades independently — no STT model → the clip is only reported; no
-/// LLM → nothing to say; no TTS → the reply is printed but not synthesised.
+/// transcript to the LLM (remote or local, same as shell chat), then speak the
+/// reply (TTS). Each stage degrades independently.
 #[cfg(not(test))]
 fn voice_converse_turn(
     chat: &mut Option<ChatSession>,
     session: &mut crate::agent::types::Session,
+    remote_on: bool,
+    remote_cfg: &Option<remote::RemoteConfig>,
+    remote_chat: &mut Option<remote::RemoteChat>,
     clip: &[i16],
     have_stt: bool,
     have_tts: bool,
@@ -2159,15 +2197,35 @@ fn voice_converse_turn(
         serial_println!("voice> (nothing to transcribe \u{2014} continuing to listen)");
         return;
     }
-    // 2. Think.
-    let reply = match chat.as_mut() {
-        Some(sess) => {
-            crate::framebuffer::draw_voice(levels, "thinking\u{2026}");
-            sess.turn(heard, session)
+    // 2. Think — same backend as shell chat.
+    crate::framebuffer::draw_voice(levels, "thinking\u{2026}");
+    let reply = if remote_on {
+        match (remote_cfg, remote_chat.as_mut()) {
+            (Some(cfg), Some(rc)) => {
+                let _ = cfg;
+                rc.turn(heard, session)
+            }
+            (Some(cfg), None) => {
+                let mut rc = remote::RemoteChat::new(cfg.clone());
+                if session.messages.len() > 1 {
+                    rc.hydrate_from_session(session);
+                }
+                let out = rc.turn(heard, session);
+                *remote_chat = Some(rc);
+                out
+            }
+            _ => {
+                serial_println!("voice> (remote mode misconfigured \u{2014} cannot reply)");
+                return;
+            }
         }
-        None => {
-            serial_println!("voice> (no LLM loaded \u{2014} cannot reply)");
-            return;
+    } else {
+        match chat.as_mut() {
+            Some(sess) => sess.turn(heard, session),
+            None => {
+                serial_println!("voice> (no LLM loaded \u{2014} cannot reply)");
+                return;
+            }
         }
     };
     let reply = reply.trim();
@@ -3084,6 +3142,92 @@ impl ChatSession {
         sampler::sample_topk_topp(logits, temp, TOP_K, TOP_P, &mut self.rng, None)
     }
 
+    /// One **UI-agent ReAct turn** (Chess etc.): SOUL + event, tools via `on_tool`
+    /// (`board_set` / `board_mark` / `chess_legal`). Greedy, thinking off,
+    /// Ctrl+C/Esc cancels. Fresh KV per event so game state does not bloat the
+    /// planner context (FEN is in the user message + agent memory).
+    fn ui_agent_loop(
+        &mut self,
+        soul: &str,
+        user: &str,
+        surface: u32,
+        on_tool: &mut dyn FnMut(&str, &str) -> alloc::string::String,
+    ) -> alloc::string::String {
+        use core::sync::atomic::Ordering;
+        const MAX_ITERS: usize = 6;
+        let prev_think = THINK_ON.swap(false, Ordering::Relaxed);
+        self.greedy = true;
+        self.kv = self.model.new_cache();
+        self.state = self.model.new_state();
+        self.pos = 0;
+        self.gen.clear();
+        self.cancelled = false;
+        let sys = alloc::format!("{soul}\n\n{}", ui_agent_protocol(surface));
+        self.prefill_turn("system\n", &sys, false);
+        self.prefill_turn("user\n", user, true);
+        let mut last_call: Option<(alloc::string::String, alloc::string::String)> = None;
+        let mut result = alloc::string::String::new();
+        for _ in 0..MAX_ITERS {
+            // Keep the UI live while the model thinks (clock/mouse).
+            ui_tick();
+            let text = self.generate_assistant("\x1b[2mui-agent:\x1b[0m ");
+            if self.cancelled {
+                serial_println!("\x1b[33m[ui-agent cancelled]\x1b[0m");
+                break;
+            }
+            match parse_tool_call(&text) {
+                Some((cmd, args))
+                    if matches!(
+                        cmd.as_str(),
+                        "board_set"
+                            | "board_mark"
+                            | "chess_legal"
+                            | "chess_try_move"
+                            | "storage_get"
+                            | "storage_set"
+                            | "storage_list"
+                            | "storage_remove"
+                            | "memory_add"
+                            | "memory_get"
+                            | "memory_list"
+                            | "ui_draw"
+                    ) =>
+                {
+                    if last_call.as_ref() == Some(&(cmd.clone(), args.clone())) {
+                        self.prefill_turn(
+                            "user\n",
+                            "<tool_response>\nYou already ran that tool. Give a short status line now — no more tools.\n</tool_response>",
+                            true,
+                        );
+                        last_call = None;
+                        continue;
+                    }
+                    last_call = Some((cmd.clone(), args.clone()));
+                    serial_println!("\x1b[33m\u{2192} ui-agent\x1b[0m {} {}", cmd, args);
+                    let obs = on_tool(&cmd, &args);
+                    let fb = alloc::format!("<tool_response>\n{obs}\n</tool_response>");
+                    self.prefill_turn("user\n", &fb, true);
+                }
+                Some((cmd, _)) => {
+                    self.prefill_turn(
+                        "user\n",
+                        &alloc::format!(
+                            "<tool_response>\nunknown tool '{cmd}'. Use board_set, board_mark, or chess_legal only.\n</tool_response>"
+                        ),
+                        true,
+                    );
+                }
+                None => {
+                    result = text;
+                    break;
+                }
+            }
+        }
+        self.greedy = false;
+        THINK_ON.store(prev_think, Ordering::Relaxed);
+        result
+    }
+
     /// One **content-agent turn** for a service (web) agent: a bounded ReAct loop
     /// with the agent's SOUL as the whole system prompt (plus a short response
     /// protocol) and exactly one tool — `mem_fs_read`, executed through the
@@ -3232,13 +3376,54 @@ fn serve_protocol() -> alloc::string::String {
     )
 }
 
-/// Run one **content-agent turn** for a service (web) agent over its dedicated
-/// planner context: the agent (driven by its SOUL) reads the file it serves via a
-/// gated `mem_fs_read` tool call and returns a JSON response object. Returns the
-/// final answer plus the last `(path, bytes)` it read (the server frames one or
-/// the other). `None` if no model is loaded. The context is taken out of the lock
-/// during inference so a multi-second forward pass never holds the lock.
+/// True when any agent planner can run: hosted `/model remote` **or** a local GGUF.
+/// Same policy as the shell chat — UI agents, voice, and content serve use this.
+pub fn planner_available() -> bool {
+    if remote::is_remote_active() {
+        return true;
+    }
+    crate::cortex::model_module().is_some()
+}
+
+/// Run one **content-agent turn** for a service (web) agent: remote if configured,
+/// else local GGUF. Returns the final answer plus the last `(path, bytes)` the
+/// agent read (for framing). `None` if neither backend is available.
 pub(crate) fn serve_reply(soul: &str, user: &str, home: &str) -> Option<(alloc::string::String, Option<(alloc::string::String, alloc::vec::Vec<u8>)>)> {
+    // Hosted model: same JSON+tool contract as local, no GGUF required.
+    if let Some(cfg) = remote::active_config() {
+        let sys = alloc::format!("{soul}\n\n{}", serve_protocol());
+        let mut last_read: Option<(alloc::string::String, alloc::vec::Vec<u8>)> = None;
+        let mut last_arg: Option<alloc::string::String> = None;
+        let home = home.to_string();
+        let reply = remote::oneshot_tools(
+            &cfg,
+            &sys,
+            user,
+            &mut |cmd, arg| {
+                if cmd != "mem_fs_read" {
+                    return alloc::format!("error:unknown tool {cmd}");
+                }
+                if last_arg.as_deref() == Some(arg) {
+                    return alloc::string::String::from(
+                        "You already read that file. Reply now with ONLY the JSON response object.",
+                    );
+                }
+                last_arg = Some(arg.to_string());
+                match crate::service::server::read_asset_arg(&home, arg) {
+                    Some(bytes) => {
+                        let body = alloc::string::String::from_utf8_lossy(&bytes).into_owned();
+                        last_read = Some((arg.to_string(), bytes));
+                        body
+                    }
+                    None => alloc::format!("error: no such file in assets/ ({arg})"),
+                }
+            },
+            4,
+            "server-agent",
+        );
+        return Some((reply, last_read));
+    }
+
     let taken: Option<ChatSession> = DOC_PLANNER.with(|p| {
         if p.is_none() {
             let mut spin = Spinner::new("doc-planner");
@@ -3249,6 +3434,49 @@ pub(crate) fn serve_reply(soul: &str, user: &str, home: &str) -> Option<(alloc::
     let mut sess = taken?;
     let out = sess.serve_loop(soul, user, home);
     DOC_PLANNER.with(|p| *p = Some(sess));
+    Some(out)
+}
+
+/// Shared planner context for UI agents (Chess…). Separate from doc so a
+/// long chess turn doesn't clobber the HTTP planner KV.
+static UI_PLANNER: crate::mm::Locked<Option<ChatSession>> = crate::mm::Locked::new(None);
+
+/// Protocol appended to a UI-agent SOUL: which tools exist and the event shape.
+fn ui_agent_protocol(surface: u32) -> alloc::string::String {
+    alloc::format!(
+        "You control surface {surface} in the action pane. Tools (ONE tool call or a short status line):\n\
+         board_set / board_mark / chess_legal / chess_try_move / storage_get|set|list (scope session|durable).\n\
+         Prefer chess_legal before moving; chess_try_move from/to validates + paints.\n\
+         storage_set key=fen for durable position. When done, prose status only."
+    )
+}
+
+/// One **UI-agent ReAct turn**: SOUL + event text, tools executed by `on_tool`.
+/// Uses **remote** when `/model remote` is active (same as shell chat), else the
+/// local GGUF. Returns the final prose answer (or empty on cancel). `None` if
+/// neither backend is available.
+pub(crate) fn ui_agent_reply(
+    soul: &str,
+    user: &str,
+    surface: u32,
+    mut on_tool: impl FnMut(&str, &str) -> alloc::string::String,
+) -> Option<alloc::string::String> {
+    let sys = alloc::format!("{soul}\n\n{}", ui_agent_protocol(surface));
+    if let Some(cfg) = remote::active_config() {
+        let out = remote::oneshot_tools(&cfg, &sys, user, &mut on_tool, 6, "ui-agent");
+        return Some(out);
+    }
+
+    let taken: Option<ChatSession> = UI_PLANNER.with(|p| {
+        if p.is_none() {
+            let mut spin = Spinner::new("ui-planner");
+            *p = ChatSession::load(&mut spin);
+        }
+        p.take()
+    });
+    let mut sess = taken?;
+    let out = sess.ui_agent_loop(soul, user, surface, &mut on_tool);
+    UI_PLANNER.with(|p| *p = Some(sess));
     Some(out)
 }
 
@@ -4070,6 +4298,22 @@ fn run_agent_start(arg: &str) {
             let task = crate::service::start(&crate::service::ssh::SSH_SERVICE);
             serial_println!("agents> started 'ssh' service (task {})", task);
         }
+        // UI agents: SOUL + board tools → action pane (no TCP port).
+        "chess" | "ui-chess" => match crate::service::ui_agent::start("chess") {
+            Ok(sid) => {
+                // Focus the board so arrows / Enter work without an extra click.
+                #[cfg(not(test))]
+                crate::framebuffer::focus_set(true);
+                serial_println!(
+                    "agents> started 'chess' UI agent (surface {sid}) — arrows move cursor, Enter selects (click also works)"
+                );
+            }
+            Err(e) => serial_println!("agents> chess start failed: {e}"),
+        },
+        "stop-chess" | "chess-stop" => {
+            crate::service::ui_agent::stop();
+            serial_println!("agents> chess UI agent stopped");
+        }
         _ => {
             // Serve a content agent over the web pipeline (network + http + the
             // generic server stage). `web`/`network`/`http` default to the docs
@@ -4080,7 +4324,10 @@ fn run_agent_start(arg: &str) {
             let home = match crate::agent::system::home_for(content) {
                 Some(h) => h,
                 None => {
-                    serial_println!("agents> unknown agent '{}' (try: doc, ssh, or an installed server agent)", name);
+                    serial_println!(
+                        "agents> unknown agent '{}' (try: doc, ssh, chess, or an installed server agent)",
+                        name
+                    );
                     return;
                 }
             };
@@ -4700,10 +4947,91 @@ fn media_focused() -> Option<crate::framebuffer::RightMode> {
     }
 }
 
+/// True when the focused action tab is the running UI agent board (chess…).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn ui_agent_focused() -> bool {
+    if !crate::framebuffer::focus_is_action() {
+        return false;
+    }
+    // While the agent is thinking, still "focused" but keys are no-ops (busy).
+    match crate::framebuffer::right_mode() {
+        crate::framebuffer::RightMode::Surface(id) => crate::service::ui_agent::owns_surface(id),
+        _ => false,
+    }
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn ui_agent_focused() -> bool {
+    false
+}
+
+/// Enter / Esc while the UI agent board is focused: activate or clear selection.
+/// Consumes keys even when busy so they do not leak into the chat line.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn ui_agent_key(c: u8) -> bool {
+    if !ui_agent_focused() {
+        return false;
+    }
+    if crate::service::ui_agent::is_busy() {
+        return matches!(c, b'\r' | b'\n');
+    }
+    match c {
+        b'\r' | b'\n' => {
+            crate::service::ui_agent::activate_cursor();
+            true
+        }
+        // Esc is handled via CSI bare-escape path; this covers rare drivers.
+        _ => false,
+    }
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn ui_agent_key(_c: u8) -> bool {
+    false
+}
+
+/// Arrow keys while the UI agent board is focused: move the board cursor.
+/// CSI finals: A=↑ B=↓ C=→ D=← (rank increases upward on a standard diagram).
+/// While busy, arrows are swallowed (do not scroll the action pane / chat).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn ui_agent_nav(fin: u8) -> bool {
+    if !ui_agent_focused() {
+        return false;
+    }
+    if crate::service::ui_agent::is_busy() {
+        return matches!(fin, b'A' | b'B' | b'C' | b'D');
+    }
+    match fin {
+        b'A' => {
+            crate::service::ui_agent::nudge_cursor(0, 1);
+            true
+        }
+        b'B' => {
+            crate::service::ui_agent::nudge_cursor(0, -1);
+            true
+        }
+        b'C' => {
+            crate::service::ui_agent::nudge_cursor(1, 0);
+            true
+        }
+        b'D' => {
+            crate::service::ui_agent::nudge_cursor(-1, 0);
+            true
+        }
+        _ => false,
+    }
+}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+fn ui_agent_nav(_fin: u8) -> bool {
+    false
+}
+
 /// Handle a printable control key for the focused media tab. Returns true if it
 /// was consumed (so `read_line` shouldn't treat it as chat input).
 #[cfg(all(not(feature = "server"), not(test)))]
 fn media_key(c: u8) -> bool {
+    // UI agent board owns keys before image-viewer heuristics (same Surface tab).
+    if ui_agent_key(c) {
+        return true;
+    }
     match media_focused() {
         // A stopped/unloaded video must not eat keystrokes (the tab may still
         // be focused after Ctrl+C — typed commands would lose ' 0.m' chars).
@@ -4730,13 +5058,17 @@ fn media_key(c: u8) -> bool {
             }
             _ => false,
         },
-        Some(crate::framebuffer::RightMode::Surface(id)) if id != VIDEO_SURFACE => match c {
-            b'+' | b'=' | b'-' | b'_' | b'r' | b'R' | b'l' | b'L' | b'0' => {
-                image_cmd(c);
-                true
+        Some(crate::framebuffer::RightMode::Surface(id))
+            if id != VIDEO_SURFACE && !crate::service::ui_agent::owns_surface(id) =>
+        {
+            match c {
+                b'+' | b'=' | b'-' | b'_' | b'r' | b'R' | b'l' | b'L' | b'0' => {
+                    image_cmd(c);
+                    true
+                }
+                _ => false,
             }
-            _ => false,
-        },
+        }
         Some(crate::framebuffer::RightMode::Audio) => match c {
             b' ' => {
                 audio_toggle_pause();
@@ -4775,6 +5107,10 @@ fn media_key(_c: u8) -> bool {
 #[cfg(all(not(feature = "server"), not(test)))]
 fn media_nav(fin: u8, steps: usize) -> bool {
     let steps = steps.max(1) as i64;
+    // Chess / UI agent board: arrows move the selection cursor (not image pan).
+    if ui_agent_nav(fin) {
+        return true;
+    }
     match media_focused() {
         Some(crate::framebuffer::RightMode::Surface(id)) if id == VIDEO_SURFACE && video_loaded() => match fin {
             // ←/→ seek frames; long-hold multiplies by Accel (1/2/4/8).
@@ -4801,13 +5137,17 @@ fn media_nav(fin: u8, steps: usize) -> bool {
             }
             _ => false,
         },
-        Some(crate::framebuffer::RightMode::Surface(id)) if id != VIDEO_SURFACE => match fin {
-            b'A' | b'B' | b'C' | b'D' => {
-                image_cmd(fin);
-                true
+        Some(crate::framebuffer::RightMode::Surface(id))
+            if id != VIDEO_SURFACE && !crate::service::ui_agent::owns_surface(id) =>
+        {
+            match fin {
+                b'A' | b'B' | b'C' | b'D' => {
+                    image_cmd(fin);
+                    true
+                }
+                _ => false,
             }
-            _ => false,
-        },
+        }
         Some(crate::framebuffer::RightMode::Audio) => match fin {
             // ←/→ seek 5 s × steps (5→10→20→40 s per tick while held).
             b'C' => {
@@ -4962,6 +5302,11 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                 editor_feed(b);
             }
             Some(b'\r') | Some(b'\n') => {
+                // Focused UI agent board: Enter activates the cursor square
+                // (select / move) instead of submitting the chat line.
+                if ui_agent_key(b'\r') {
+                    continue;
+                }
                 // Enter accepts the highlighted suggestion when the menu is open.
                 if !sug_items.is_empty() {
                     let accepted = suggest_accept(
@@ -5010,12 +5355,17 @@ fn read_line(buf: &mut String) -> ReadOutcome {
             // terminals and all keyboard drivers): params, then a final byte.
             Some(0x1b) => {
                 if next_seq_byte() != Some(b'[') {
-                    // Bare Esc: dismiss suggestion menu first; else editor Normal.
+                    // Bare Esc: dismiss suggestion menu first; UI agent clears
+                    // selection; else editor Normal.
                     if !sug_items.is_empty() {
                         sug_items.clear();
                         sug_sel = 0;
                         #[cfg(not(test))]
                         crate::framebuffer::suggest_clear();
+                        continue;
+                    }
+                    if ui_agent_focused() {
+                        crate::service::ui_agent::clear_selection();
                         continue;
                     }
                     if fb_editor_active() {
@@ -5390,6 +5740,16 @@ fn ui_tick() {
                 crate::framebuffer::focus_set(action);
                 if action {
                     crate::framebuffer::chat_sel_clear();
+                    // UI agent (Chess etc.): map the click into surface coords
+                    // and queue it for the agent's next tick.
+                    if let Some((sid, sx, sy)) = crate::framebuffer::surface_hit(t.x, t.y) {
+                        if crate::service::ui_agent::active_surface() == Some(sid) {
+                            crate::synapse::ui::push_event(
+                                sid,
+                                crate::synapse::ui::UiEvent::Click { x: sx, y: sy },
+                            );
+                        }
+                    }
                 } else {
                     // Press in the chat pane anchors a mouse text selection.
                     crate::framebuffer::chat_sel_begin(t.x, t.y);
@@ -5610,6 +5970,8 @@ fn refresh_top() {
 /// can run longer than ~50 ms — the standing UI rule.
 pub fn upkeep() {
     ui_tick();
+    // UI agents (Chess…): drain surface events → board tools.
+    crate::service::ui_agent::tick();
     crate::net::poll();
     crate::service::supervise_tick();
     // External messaging channels (Telegram, …) — short non-blocking poll.
@@ -5936,6 +6298,13 @@ struct VideoPlayer {
     fps_display: u32,
     /// Wall-clock of last successful present (for instant ms/frame → fps).
     last_present_ms: u64,
+    /// A decode-ahead job is running on an SMP worker: `dec` is on loan to
+    /// that core and MUST NOT be touched until [`video_job_collect`] returns
+    /// it (reading the immutable sample table — `pts_ms`/`frame_count` — is
+    /// fine). See the SAFETY notes at `vjob`.
+    pending_job: bool,
+    /// A frame decoded ahead of its pts, held until due (`dec.cur` is it).
+    ahead: Option<usize>,
 }
 #[cfg(not(feature = "server"))]
 static VIDEO: crate::mm::Locked<Option<VideoPlayer>> = crate::mm::Locked::new(None);
@@ -6037,6 +6406,8 @@ fn play_video(path: &str) {
                     fps_window_frames: 0,
                     fps_display: 0,
                     last_present_ms: 0,
+                    pending_job: false,
+                    ahead: None,
                 })
             });
             #[cfg(not(test))]
@@ -6056,6 +6427,11 @@ fn present_video_frame() {
     let now = crate::arch::now_ms();
     VIDEO.with(|v| {
         if let Some(p) = v.as_mut() {
+            if p.pending_job {
+                // `dec` (including `cur`) is on loan to the decode worker;
+                // the pump presents this frame when it collects the job.
+                return;
+            }
             if let Some(f) = p.dec.cur_frame() {
                 // Reserve the bottom strip for the HUD so the per-frame blit
                 // never repaints under it (no flicker); the HUD lives there.
@@ -6093,7 +6469,15 @@ fn video_loaded() -> bool {
 /// Stop + unload the video (Ctrl+C / closing the video tab).
 #[cfg(not(feature = "server"))]
 fn stop_video() {
-    if VIDEO.with(|v| v.take().is_some()) {
+    let stopped = VIDEO.with(|v| {
+        // Reclaim `dec` from any decode-ahead worker before dropping it.
+        #[cfg(not(test))]
+        if let Some(p) = v.as_mut() {
+            video_job_join(p);
+        }
+        v.take().is_some()
+    });
+    if stopped {
         serial_println!("\ropen> video stopped");
     }
 }
@@ -6123,6 +6507,7 @@ fn pump_video() {
 
 #[cfg(all(not(feature = "server"), not(test)))]
 fn pump_video_inner() {
+    use core::sync::atomic::Ordering;
     let now = crate::arch::now_ms();
     // Audio chunk (copied out so VIDEO lock isn't held across sound::play).
     let audio_chunk = VIDEO.with(|v| {
@@ -6158,13 +6543,93 @@ fn pump_video_inner() {
         let _ = crate::sound::play(&slice, rate);
     }
 
+    // Phase A: collect a finished decode-ahead job and decide whether the
+    // held frame is due. NO job submission here — the blit below reads
+    // `dec.cur`, so `dec` must not go back on loan until after it runs
+    // (submitting first made `present_video_frame`'s loan-guard skip every
+    // blit: audio + counters advanced, the picture froze on frame one).
     let present = VIDEO.with(|v| {
         let Some(p) = v.as_mut() else { return false };
+        // Collect a finished decode-ahead job. The decoded frame is *held*
+        // (`ahead`) until its pts is due — never shown early.
+        if p.pending_job {
+            match video_job_collect(p) {
+                Some((goal, changed)) => {
+                    if changed {
+                        p.ahead = Some(goal);
+                    } else {
+                        p.idx = goal; // decode failed/no-op: skip past, don't loop
+                    }
+                }
+                None => {} // still decoding on the worker
+            }
+        }
         if !p.playing || p.frame_count == 0 {
             return false;
         }
         let t = now.saturating_sub(p.base_ms);
-        // Desired display frame from the sample table (no decode).
+        // Present the held frame the moment it is due (already decoded —
+        // this is the cheap path that keeps presentation at clip rate).
+        let mut presented = false;
+        if let Some(a) = p.ahead {
+            if a <= p.idx {
+                p.ahead = None; // stale (a seek moved us past it)
+            } else if p.dec.pts_ms(a) <= t {
+                p.ahead = None;
+                p.idx = a;
+                presented = true;
+                let pts = p.dec.pts_ms(a);
+                if t > pts.saturating_add(100) {
+                    // Behind the wall clock — snap media time forward (drop
+                    // backlog), never snap backward to a previous keyframe.
+                    p.base_ms = now.saturating_sub(pts);
+                }
+                // Content signature for the perf line: proves the *picture*
+                // advances, not just the counters (a present-ordering bug once
+                // froze the image while every metric kept ticking).
+                if let Some(f) = p.dec.cur_frame() {
+                    let mut sig = 0u32;
+                    let step = (f.pixels.len() / 16).max(1);
+                    for px in f.pixels.iter().step_by(step) {
+                        sig = sig.wrapping_mul(31).wrapping_add(*px);
+                    }
+                    VIDEO_SIG.store(((p.idx as u64) << 32) | sig as u64, Ordering::Relaxed);
+                }
+            }
+        }
+        presented
+    });
+    if present {
+        let t0 = crate::arch::now_ms();
+        present_video_frame();
+        VIDEO_PRESENT_MS.fetch_add(crate::arch::now_ms().saturating_sub(t0), Ordering::Relaxed);
+        let n = VIDEO_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 32 == 0 {
+            let d = VIDEO_DECODE_MS.swap(0, Ordering::Relaxed);
+            let pr = VIDEO_PRESENT_MS.swap(0, Ordering::Relaxed);
+            let sig = VIDEO_SIG.load(Ordering::Relaxed);
+            crate::ktrace::log_fmt(format_args!(
+                "video: perf: last 32 frames: decode {} ms ({}/frame), present {} ms ({}/frame), at frame {} sig {:08x}",
+                d,
+                d / 32,
+                pr,
+                pr / 32,
+                sig >> 32,
+                sig as u32
+            ));
+        }
+    }
+
+    // Phase B: with the blit done, keep the decode pipeline fed — pick the
+    // next goal and put `dec` back on loan. Decoding runs one frame AHEAD of
+    // its due time, so the ~30 ms 1080p decode overlaps the current frame's
+    // display.
+    let finished = VIDEO.with(|v| {
+        let Some(p) = v.as_mut() else { return false };
+        if p.pending_job || p.ahead.is_some() || !p.playing || p.frame_count == 0 {
+            return false;
+        }
+        let t = now.saturating_sub(p.base_ms);
         let mut target = p.idx;
         while target + 1 < p.frame_count && p.dec.pts_ms(target + 1) <= t {
             target += 1;
@@ -6180,33 +6645,163 @@ fn pump_video_inner() {
             }
             return false;
         }
-        if target == p.idx {
-            return false;
-        }
-        // Advance **forward only** (never jump back to an old keyframe — that
-        // looped the first few frames when lag re-anchored to IDR #0).
-        // Cap steps per tick so a slow CABAC frame doesn't freeze the shell;
-        // if still behind after decode, re-anchor so play stays smooth at
-        // whatever rate we can sustain (not perfect realtime, but no rewind).
-        const MAX_DECODE_PER_TICK: usize = 2;
-        let goal = (p.idx + MAX_DECODE_PER_TICK).min(target).max(p.idx + 1);
+        // Forward only; when behind, catch up in SMALL steps (the hurry
+        // flag frame-drops non-reference backlog, and the clock re-anchor
+        // absorbs the rest). Small jobs = frequent presents: one giant
+        // jump would decode every backlog reference in one job and starve
+        // presentation (4K went from ~8 to ~3 fps that way).
+        let goal = if target > p.idx { target.min(p.idx + 2) } else { p.idx + 1 };
         let goal = goal.min(p.frame_count.saturating_sub(1));
-        if goal <= p.idx {
-            return false;
+        if goal > p.idx {
+            let hurry = t > p.dec.pts_ms(goal).saturating_add(100);
+            // Prefer an SMP worker (BSP keeps pumping UI/audio); fall back
+            // to synchronous decode-and-hold when none is available.
+            if video_job_submit(&mut p.dec, goal, hurry) {
+                p.pending_job = true;
+            } else {
+                let t0 = crate::arch::now_ms();
+                let changed = p.dec.seek_decode_hurry(goal, hurry);
+                VIDEO_DECODE_MS.fetch_add(crate::arch::now_ms().saturating_sub(t0), Ordering::Relaxed);
+                if changed {
+                    p.ahead = Some(goal);
+                } else {
+                    p.idx = goal;
+                }
+            }
         }
-        p.idx = goal;
-        let changed = p.dec.seek_decode(p.idx);
-        let pts = p.dec.pts_ms(p.idx);
-        if t > pts.saturating_add(100) {
-            // Behind the wall clock — snap media time forward (drop backlog),
-            // never snap backward to a previous keyframe.
-            p.base_ms = now.saturating_sub(pts);
-        }
-        changed
+        false
     });
-    if present {
+    if finished {
+        let t0 = crate::arch::now_ms();
         present_video_frame();
+        VIDEO_PRESENT_MS.fetch_add(crate::arch::now_ms().saturating_sub(t0), Ordering::Relaxed);
+        // Stage accounting, one ktrace line per 32 presented frames: where the
+        // per-frame budget goes (decode vs present), per the measure-first rule.
+        let n = VIDEO_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 32 == 0 {
+            let d = VIDEO_DECODE_MS.swap(0, Ordering::Relaxed);
+            let pr = VIDEO_PRESENT_MS.swap(0, Ordering::Relaxed);
+            crate::ktrace::log_fmt(format_args!(
+                "video: perf: last 32 frames: decode {} ms ({}/frame), present {} ms ({}/frame)",
+                d,
+                d / 32,
+                pr,
+                pr / 32
+            ));
+        }
     }
+}
+
+/// Per-stage wall-time accumulators for the `video: perf:` ktrace (32-frame
+/// windows; see `pump_video_inner`).
+#[cfg(all(not(feature = "server"), not(test)))]
+static VIDEO_DECODE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(not(feature = "server"), not(test)))]
+static VIDEO_PRESENT_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(not(feature = "server"), not(test)))]
+static VIDEO_FRAMES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// `(presented frame idx << 32) | pixel signature` — the perf line's proof
+/// that the displayed content is advancing.
+#[cfg(all(not(feature = "server"), not(test)))]
+static VIDEO_SIG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Decode-ahead job plumbing: the pump loans `dec` to an SMP worker
+/// (`smp::async_submit`) so the ~30 ms 1080p decode overlaps UI/audio work on
+/// the BSP instead of blocking it. Exclusive access is handed over whole: the
+/// BSP sets `pending_job` and must not touch `dec` (beyond the immutable
+/// sample table) until the job completes; every other `dec` toucher goes
+/// through [`video_job_join`] first.
+#[cfg(all(target_arch = "aarch64", not(feature = "server"), not(test)))]
+mod vjob {
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    pub static DEC: AtomicUsize = AtomicUsize::new(0);
+    pub static GOAL: AtomicUsize = AtomicUsize::new(0);
+    pub static HURRY: AtomicBool = AtomicBool::new(false);
+    pub static CHANGED: AtomicBool = AtomicBool::new(false);
+    /// Worker-measured decode wall time (ms) for the stage accounting.
+    pub static MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// Worker-side entry: decode to `GOAL` on the loaned decoder.
+    ///
+    /// # Safety
+    /// Called only via `smp::async_submit`; the BSP published DEC/GOAL/HURRY
+    /// before submitting (release) and reads CHANGED only after observing
+    /// completion (acquire), so this core has exclusive access to the decoder
+    /// for the whole run. `Rc` inside the decoder is safe under whole-object
+    /// single-core handoff.
+    pub unsafe fn run(_ctx: *mut u8) {
+        let dec = DEC.load(Ordering::Acquire) as *mut crate::video::StreamDecoder;
+        if dec.is_null() {
+            return;
+        }
+        let goal = GOAL.load(Ordering::Relaxed);
+        let hurry = HURRY.load(Ordering::Relaxed);
+        let t0 = crate::arch::now_ms();
+        // SAFETY: exclusive loan per above.
+        let changed = unsafe { (*dec).seek_decode_hurry(goal, hurry) };
+        MS.store(crate::arch::now_ms().saturating_sub(t0), Ordering::Relaxed);
+        CHANGED.store(changed, Ordering::Release);
+    }
+}
+
+/// Try to start a decode-ahead job for `goal`. `false` → caller decodes
+/// synchronously (x86, no workers, degraded fleet, or a job already active).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn video_job_submit(dec: &mut crate::video::StreamDecoder, goal: usize, hurry: bool) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        vjob::DEC.store(dec as *mut _ as usize, core::sync::atomic::Ordering::Release);
+        vjob::GOAL.store(goal, core::sync::atomic::Ordering::Relaxed);
+        vjob::HURRY.store(hurry, core::sync::atomic::Ordering::Relaxed);
+        vjob::CHANGED.store(false, core::sync::atomic::Ordering::Relaxed);
+        // SAFETY: dec stays in the VIDEO player (stable address) and the BSP
+        // honours the loan via `pending_job` until async_take_done.
+        unsafe { crate::arch::aarch64::smp::async_submit(vjob::run, core::ptr::null_mut()) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (dec, goal, hurry);
+        false
+    }
+}
+
+/// Poll a pending decode-ahead job; on completion return `Some((goal,
+/// changed))` and return ownership of the decoder to the BSP. The caller
+/// decides whether the frame is held (`ahead`) or skipped.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn video_job_collect(p: &mut VideoPlayer) -> Option<(usize, bool)> {
+    if !p.pending_job {
+        return None;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::sync::atomic::Ordering;
+        if crate::arch::aarch64::smp::async_take_done() {
+            p.pending_job = false;
+            VIDEO_DECODE_MS.fetch_add(vjob::MS.load(Ordering::Relaxed), Ordering::Relaxed);
+            return Some((vjob::GOAL.load(Ordering::Relaxed), vjob::CHANGED.load(Ordering::Acquire)));
+        }
+        None
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        p.pending_job = false;
+        Some((p.idx, false))
+    }
+}
+
+/// Block (bounded by one frame's decode) until no job is on loan — required
+/// before any mutable `dec` access outside the pump (seek, restart, close).
+#[cfg(all(not(feature = "server"), not(test)))]
+fn video_job_join(p: &mut VideoPlayer) {
+    while p.pending_job {
+        if video_job_collect(p).is_some() {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    // Whatever the join was for (seek/restart/close) invalidates a held frame.
+    p.ahead = None;
 }
 #[cfg(not(all(not(feature = "server"), not(test))))]
 fn pump_video() {}
@@ -6302,6 +6897,7 @@ fn video_seek(delta: i64) {
     let now = crate::arch::now_ms();
     VIDEO.with(|v| {
         if let Some(p) = v.as_mut() {
+            video_job_join(p); // reclaim `dec` from any decode-ahead worker
             let n = p.frame_count as i64;
             let ni = (p.idx as i64 + delta).clamp(0, n - 1) as usize;
             p.idx = ni;
@@ -6329,6 +6925,7 @@ fn video_restart() {
     let now = crate::arch::now_ms();
     VIDEO.with(|v| {
         if let Some(p) = v.as_mut() {
+            video_job_join(p); // reclaim `dec` from any decode-ahead worker
             p.idx = 0;
             p.base_ms = now;
             p.paused_at = 0;

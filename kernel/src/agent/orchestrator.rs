@@ -36,7 +36,9 @@ pub fn to_taint(p: Provenance) -> taint::Provenance {
 }
 
 /// Build a canonical Synapse tool-call JSON: `{"name":..,"arguments":{..}}`,
-/// with string values escaped for the grammar.
+/// with string values escaped for the grammar. All values are emitted as
+/// JSON strings — fine for STR params; prefer [`synapse_call_for`] when the
+/// primitive has UINT fields (surface ids, etc.).
 pub fn synapse_call(name: &str, args: &[(&str, &str)]) -> String {
     let mut s = String::from("{\"name\":\"");
     s.push_str(name);
@@ -50,6 +52,41 @@ pub fn synapse_call(name: &str, args: &[(&str, &str)]) -> String {
         s.push_str("\":\"");
         json_escape_into(&mut s, v);
         s.push('"');
+    }
+    s.push_str("}}");
+    s
+}
+
+/// Like [`synapse_call`], but looks up the primitive's param types so UINT
+/// arguments are bare digits (required by the Synapse grammar for
+/// `ui_draw` / `board_set` / …).
+pub fn synapse_call_for(name: &str, args: &[(&str, &str)]) -> String {
+    use crate::synapse::registry::{self, ArgType};
+    let spec = registry::by_name(name);
+    let mut s = String::from("{\"name\":\"");
+    s.push_str(name);
+    s.push_str("\",\"arguments\":{");
+    for (i, (k, v)) in args.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('"');
+        s.push_str(k);
+        s.push_str("\":");
+        let as_uint = spec
+            .and_then(|p| p.params.iter().find(|p| p.key == *k))
+            .map(|p| p.ty == ArgType::Uint)
+            .unwrap_or(false);
+        if as_uint {
+            // Bare digits only; non-numeric falls back to 0 so the call still
+            // parses (the executor then reports not-owner / bad surface).
+            let n: u64 = v.parse().unwrap_or(0);
+            s.push_str(&alloc::format!("{n}"));
+        } else {
+            s.push('"');
+            json_escape_into(&mut s, v);
+            s.push('"');
+        }
     }
     s.push_str("}}");
     s

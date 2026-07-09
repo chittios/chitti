@@ -59,6 +59,71 @@ fn fir6_i32(s0: i32, s1: i32, s2: i32, s3: i32, s4: i32, s5: i32) -> i32 {
     s0 - 5 * s1 + 20 * s2 + 20 * s3 - 5 * s4 + s5
 }
 
+// --- strict-align-safe NEON memory access -----------------------------------
+//
+// The kernel builds aarch64 with `+strict-align`, under which LLVM lowers the
+// `vld1*` intrinsics (and auto-vectorized loads) into ~25-instruction byte
+// assembly. All NEON in this module therefore loads/stores through inline asm
+// (`ldr d/q`, `str d/q`) — correct at runtime on Normal cacheable RAM with
+// `SCTLR_EL1.A=0`, and immune to the codegen trap (see CLAUDE.md perf rule 1).
+
+/// Unaligned 8-byte vector load via inline asm.
+///
+/// # Safety
+/// `p` must be readable for 8 bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ld8(p: *const u8) -> uint8x8_t {
+    let v: uint8x8_t;
+    // SAFETY: caller guarantees 8 readable bytes; `ldr d` tolerates any
+    // alignment on Normal memory with SCTLR.A=0.
+    unsafe {
+        core::arch::asm!("ldr {v:d}, [{p}]", v = out(vreg) v, p = in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    v
+}
+
+/// Unaligned 8-byte vector store via inline asm.
+///
+/// # Safety
+/// `p` must be writable for 8 bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn st8(p: *mut u8, v: uint8x8_t) {
+    // SAFETY: caller guarantees 8 writable bytes.
+    unsafe {
+        core::arch::asm!("str {v:d}, [{p}]", v = in(vreg) v, p = in(reg) p, options(nostack, preserves_flags));
+    }
+}
+
+/// Unaligned 16-byte i16x8 load via inline asm.
+///
+/// # Safety
+/// `p` must be readable for 16 bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ld16i(p: *const i16) -> int16x8_t {
+    let v: int16x8_t;
+    // SAFETY: caller guarantees 16 readable bytes.
+    unsafe {
+        core::arch::asm!("ldr {v:q}, [{p}]", v = out(vreg) v, p = in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    v
+}
+
+/// Unaligned 16-byte i16x8 store via inline asm.
+///
+/// # Safety
+/// `p` must be writable for 16 bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn st16i(p: *mut i16, v: int16x8_t) {
+    // SAFETY: caller guarantees 16 writable bytes.
+    unsafe {
+        core::arch::asm!("str {v:q}, [{p}]", v = in(vreg) v, p = in(reg) p, options(nostack, preserves_flags));
+    }
+}
+
 /// 6-tap horizontal half-pel filter at integer position (x, y).
 /// Returns clipped u8 result. Used only for boundary blocks.
 fn half_pel_h(pic: &DecodedPicture, x: i32, y: i32) -> u8 {
@@ -117,12 +182,12 @@ fn neon_row_half_pel_h(src: &[u8], out: &mut [u8], w: usize) {
     while i + 8 <= w {
         unsafe {
             let p = src.as_ptr().add(i);
-            let s0 = vld1_u8(p);
-            let s1 = vld1_u8(p.add(1));
-            let s2 = vld1_u8(p.add(2));
-            let s3 = vld1_u8(p.add(3));
-            let s4 = vld1_u8(p.add(4));
-            let s5 = vld1_u8(p.add(5));
+            let s0 = ld8(p);
+            let s1 = ld8(p.add(1));
+            let s2 = ld8(p.add(2));
+            let s3 = ld8(p.add(3));
+            let s4 = ld8(p.add(4));
+            let s5 = ld8(p.add(5));
             let sum_pos1 = vaddl_u8(s0, s5);
             let sum_20 = vaddl_u8(s2, s3);
             let sum_neg5 = vaddl_u8(s1, s4);
@@ -131,7 +196,7 @@ fn neon_row_half_pel_h(src: &[u8], out: &mut [u8], w: usize) {
             acc = vmlsq_n_s16(acc, vreinterpretq_s16_u16(sum_neg5), 5);
             acc = vaddq_s16(acc, vdupq_n_s16(16));
             let clamped = vqmovun_s16(vshrq_n_s16(acc, 5));
-            vst1_u8(out.as_mut_ptr().add(i), clamped);
+            st8(out.as_mut_ptr().add(i), clamped);
         }
         i += 8;
     }
@@ -166,12 +231,12 @@ fn neon_row_half_pel_v(rows: [&[u8]; 6], out: &mut [u8], w: usize) {
     let mut i = 0;
     while i + 8 <= w {
         unsafe {
-            let s0 = vld1_u8(rows[0].as_ptr().add(i));
-            let s1 = vld1_u8(rows[1].as_ptr().add(i));
-            let s2 = vld1_u8(rows[2].as_ptr().add(i));
-            let s3 = vld1_u8(rows[3].as_ptr().add(i));
-            let s4 = vld1_u8(rows[4].as_ptr().add(i));
-            let s5 = vld1_u8(rows[5].as_ptr().add(i));
+            let s0 = ld8(rows[0].as_ptr().add(i));
+            let s1 = ld8(rows[1].as_ptr().add(i));
+            let s2 = ld8(rows[2].as_ptr().add(i));
+            let s3 = ld8(rows[3].as_ptr().add(i));
+            let s4 = ld8(rows[4].as_ptr().add(i));
+            let s5 = ld8(rows[5].as_ptr().add(i));
             let sum_pos1 = vaddl_u8(s0, s5);
             let sum_20 = vaddl_u8(s2, s3);
             let sum_neg5 = vaddl_u8(s1, s4);
@@ -180,7 +245,7 @@ fn neon_row_half_pel_v(rows: [&[u8]; 6], out: &mut [u8], w: usize) {
             acc = vmlsq_n_s16(acc, vreinterpretq_s16_u16(sum_neg5), 5);
             acc = vaddq_s16(acc, vdupq_n_s16(16));
             let clamped = vqmovun_s16(vshrq_n_s16(acc, 5));
-            vst1_u8(out.as_mut_ptr().add(i), clamped);
+            st8(out.as_mut_ptr().add(i), clamped);
         }
         i += 8;
     }
@@ -200,12 +265,12 @@ fn neon_row_half_pel_v(rows: [&[u8]; 6], out: &mut [u8], w: usize) {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn neon_vfir6_8(rows: &[&[u8]; 6], i: usize) -> uint8x8_t {
-    let s0 = vld1_u8(rows[0].as_ptr().add(i));
-    let s1 = vld1_u8(rows[1].as_ptr().add(i));
-    let s2 = vld1_u8(rows[2].as_ptr().add(i));
-    let s3 = vld1_u8(rows[3].as_ptr().add(i));
-    let s4 = vld1_u8(rows[4].as_ptr().add(i));
-    let s5 = vld1_u8(rows[5].as_ptr().add(i));
+    let s0 = ld8(rows[0].as_ptr().add(i));
+    let s1 = ld8(rows[1].as_ptr().add(i));
+    let s2 = ld8(rows[2].as_ptr().add(i));
+    let s3 = ld8(rows[3].as_ptr().add(i));
+    let s4 = ld8(rows[4].as_ptr().add(i));
+    let s5 = ld8(rows[5].as_ptr().add(i));
     let sum_pos1 = vaddl_u8(s0, s5);
     let sum_20 = vaddl_u8(s2, s3);
     let sum_neg5 = vaddl_u8(s1, s4);
@@ -223,10 +288,10 @@ fn neon_row_avg_int_v(int_row: &[u8], rows: [&[u8]; 6], out: &mut [u8], w: usize
     let mut i = 0;
     while i + 8 <= w {
         unsafe {
-            let int_val = vld1_u8(int_row.as_ptr().add(i));
+            let int_val = ld8(int_row.as_ptr().add(i));
             let hp = neon_vfir6_8(&rows, i);
             let result = vrhadd_u8(int_val, hp);
-            vst1_u8(out.as_mut_ptr().add(i), result);
+            st8(out.as_mut_ptr().add(i), result);
         }
         i += 8;
     }
@@ -251,12 +316,12 @@ fn neon_row_avg_h_v(src_h: &[u8], rows_v: [&[u8]; 6], out: &mut [u8], w: usize) 
         unsafe {
             // Horizontal FIR
             let p = src_h.as_ptr().add(i);
-            let h0 = vld1_u8(p);
-            let h1 = vld1_u8(p.add(1));
-            let h2 = vld1_u8(p.add(2));
-            let h3 = vld1_u8(p.add(3));
-            let h4 = vld1_u8(p.add(4));
-            let h5 = vld1_u8(p.add(5));
+            let h0 = ld8(p);
+            let h1 = ld8(p.add(1));
+            let h2 = ld8(p.add(2));
+            let h3 = ld8(p.add(3));
+            let h4 = ld8(p.add(4));
+            let h5 = ld8(p.add(5));
             let hsum_pos1 = vaddl_u8(h0, h5);
             let hsum_20 = vaddl_u8(h2, h3);
             let hsum_neg5 = vaddl_u8(h1, h4);
@@ -270,7 +335,7 @@ fn neon_row_avg_h_v(src_h: &[u8], rows_v: [&[u8]; 6], out: &mut [u8], w: usize) 
             let v_val = neon_vfir6_8(&rows_v, i);
 
             let result = vrhadd_u8(h_val, v_val);
-            vst1_u8(out.as_mut_ptr().add(i), result);
+            st8(out.as_mut_ptr().add(i), result);
         }
         i += 8;
     }
@@ -327,6 +392,143 @@ fn row_half_pel_hv(rows: [&[u8]; 6], out: &mut [u8], w: usize) {
         let h5 = fir6(rows[5], i);
         let val = fir6_i32(h0, h1, h2, h3, h4, h5);
         out[i] = clip_u8((val + 512) >> 10);
+    }
+}
+
+// --- per-block hv fast path ---------------------------------------------------
+//
+// Every quarter-pel position that involves the diagonal (hv) filter used to
+// recompute six horizontal FIRs *per output pixel*. Instead: run the
+// horizontal 6-tap once per source row into an i16 block buffer, then do the
+// vertical pass (and any avg) row-wise with NEON. Exact same integer math —
+// bit-identical output — at ~1/6 the FIR work even before SIMD.
+
+/// h-FIR intermediate buffer: (16 + 5) rows × 16 cols of i16 (max luma block).
+const HBUF_LEN: usize = 21 * 16;
+
+/// Unrounded horizontal 6-tap FIR of `src` into `out[0..w]` (i16 fits: the
+/// FIR of u8 inputs spans −2550..=10710). `src` needs `w + 5` bytes.
+#[inline(always)]
+fn hfir_row_i16(src: &[u8], out: &mut [i16], w: usize) {
+    let mut i = 0;
+    #[cfg(target_arch = "aarch64")]
+    while i + 8 <= w {
+        // SAFETY: src has w+5 readable bytes; out has w writable i16.
+        unsafe {
+            let p = src.as_ptr().add(i);
+            let s0 = ld8(p);
+            let s1 = ld8(p.add(1));
+            let s2 = ld8(p.add(2));
+            let s3 = ld8(p.add(3));
+            let s4 = ld8(p.add(4));
+            let s5 = ld8(p.add(5));
+            let mut acc = vreinterpretq_s16_u16(vaddl_u8(s0, s5));
+            acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vaddl_u8(s2, s3)), 20);
+            acc = vmlsq_n_s16(acc, vreinterpretq_s16_u16(vaddl_u8(s1, s4)), 5);
+            st16i(out.as_mut_ptr().add(i), acc);
+        }
+        i += 8;
+    }
+    while i < w {
+        out[i] = fir6(src, i) as i16;
+        i += 1;
+    }
+}
+
+/// hv second pass: `out[i] = clip((vFIR6(hrows) + 512) >> 10)` over six
+/// consecutive i16 h-FIR rows starting at `hrows` (row stride `w`).
+#[inline(always)]
+fn vfir_hv_row(hrows: &[i16], w: usize, out: &mut [u8]) {
+    let mut i = 0;
+    #[cfg(target_arch = "aarch64")]
+    while i + 8 <= w {
+        // SAFETY: hrows has 6*w readable i16 (rows r..r+5); out has w bytes.
+        unsafe {
+            let r = |k: usize| ld16i(hrows.as_ptr().add(k * w + i));
+            let (r0, r1, r2, r3, r4, r5) = (r(0), r(1), r(2), r(3), r(4), r(5));
+            // Widen to i32 — the vertical FIR of i16 intermediates overflows i16.
+            let lo = |v: int16x8_t| vmovl_s16(vget_low_s16(v));
+            let hi = |v: int16x8_t| vmovl_s16(vget_high_s16(v));
+            let comb = |a: int32x4_t, b: int32x4_t, c: int32x4_t| {
+                // a = r0+r5, b = r2+r3, c = r1+r4 → a + 20b − 5c + 512
+                let mut s = vmlaq_n_s32(a, b, 20);
+                s = vmlsq_n_s32(s, c, 5);
+                vshrq_n_s32(vaddq_s32(s, vdupq_n_s32(512)), 10)
+            };
+            let lo32 = comb(vaddq_s32(lo(r0), lo(r5)), vaddq_s32(lo(r2), lo(r3)), vaddq_s32(lo(r1), lo(r4)));
+            let hi32 = comb(vaddq_s32(hi(r0), hi(r5)), vaddq_s32(hi(r2), hi(r3)), vaddq_s32(hi(r1), hi(r4)));
+            let n16 = vcombine_s16(vqmovn_s32(lo32), vqmovn_s32(hi32));
+            st8(out.as_mut_ptr().add(i), vqmovun_s16(n16));
+        }
+        i += 8;
+    }
+    while i < w {
+        let v = fir6_i32(
+            hrows[i] as i32,
+            hrows[w + i] as i32,
+            hrows[2 * w + i] as i32,
+            hrows[3 * w + i] as i32,
+            hrows[4 * w + i] as i32,
+            hrows[5 * w + i] as i32,
+        );
+        out[i] = clip_u8((v + 512) >> 10);
+        i += 1;
+    }
+}
+
+/// Half-pel h from a precomputed i16 h-FIR row: `clip((h + 16) >> 5)`.
+#[inline(always)]
+fn hrow_to_u8(hrow: &[i16], out: &mut [u8], w: usize) {
+    let mut i = 0;
+    #[cfg(target_arch = "aarch64")]
+    while i + 8 <= w {
+        // SAFETY: hrow has w readable i16; out has w writable bytes.
+        unsafe {
+            let v = vaddq_s16(ld16i(hrow.as_ptr().add(i)), vdupq_n_s16(16));
+            st8(out.as_mut_ptr().add(i), vqmovun_s16(vshrq_n_s16(v, 5)));
+        }
+        i += 8;
+    }
+    while i < w {
+        out[i] = clip_u8((hrow[i] as i32 + 16) >> 5);
+        i += 1;
+    }
+}
+
+/// `out[i] = (a[i] + b[i] + 1) >> 1` (the spec quarter-pel average).
+#[inline(always)]
+fn avg_rows(a: &[u8], b: &[u8], out: &mut [u8], w: usize) {
+    let mut i = 0;
+    #[cfg(target_arch = "aarch64")]
+    while i + 8 <= w {
+        // SAFETY: all three have w accessible bytes.
+        unsafe {
+            st8(out.as_mut_ptr().add(i), vrhadd_u8(ld8(a.as_ptr().add(i)), ld8(b.as_ptr().add(i))));
+        }
+        i += 8;
+    }
+    while i < w {
+        out[i] = avg(a[i], b[i]);
+        i += 1;
+    }
+}
+
+/// Fill the (h+5)-row i16 h-FIR block buffer for an hv-involved case: row `rr`
+/// holds the horizontal FIR of source row `y + rr − 2` at columns `x−2..`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn fill_hbuf(
+    ref_y: &[u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    hbuf: &mut [i16; HBUF_LEN],
+) {
+    for rr in 0..h + 5 {
+        let off = (y + rr - 2) * stride + (x - 2);
+        hfir_row_i16(&ref_y[off..off + w + 5], &mut hbuf[rr * w..(rr + 1) * w], w);
     }
 }
 
@@ -551,32 +753,24 @@ fn luma_mc_inner(
             }
         }
         (2, 2) => {
-            // Half-pel diagonal
+            // Half-pel diagonal: h-FIR once per source row, then the vertical
+            // pass row-wise (was: six h-FIRs per output pixel).
+            let mut hbuf = [0i16; HBUF_LEN];
+            fill_hbuf(ref_y, stride, x, y, w, h, &mut hbuf);
             for r in 0..h {
-                let rows = vrows(-2, r as isize, w + 5);
-                row_half_pel_hv(rows, &mut output[r * w..], w);
+                vfir_hv_row(&hbuf[r * w..(r + 6) * w], w, &mut output[r * w..][..w]);
             }
         }
-        (1, 0) => {
-            // Quarter-pel: avg(integer, half_h)
+        (1, 0) | (3, 0) => {
+            // Quarter-pel: avg(half_h, integer at dx = 0 or +1). avg is
+            // symmetric, so both orders share one path.
+            let dx = if frac_x == 1 { 0 } else { 1 };
+            let mut hp = [0u8; 16];
             for r in 0..h {
-                let int_row = row(r as isize, 0, w);
+                let int_row = row(r as isize, dx, w);
                 let src_h = row(r as isize, -2, w + 5);
-                for i in 0..w {
-                    let hp = clip_u8((fir6(src_h, i) + 16) >> 5);
-                    output[r * w + i] = avg(int_row[i], hp);
-                }
-            }
-        }
-        (3, 0) => {
-            // Quarter-pel: avg(half_h, integer+1)
-            for r in 0..h {
-                let int_row = row(r as isize, 1, w);
-                let src_h = row(r as isize, -2, w + 5);
-                for i in 0..w {
-                    let hp = clip_u8((fir6(src_h, i) + 16) >> 5);
-                    output[r * w + i] = avg(hp, int_row[i]);
-                }
+                row_half_pel_h(src_h, &mut hp, w);
+                avg_rows(int_row, &hp, &mut output[r * w..][..w], w);
             }
         }
         (0, 1) => {
@@ -621,104 +815,34 @@ fn luma_mc_inner(
                 }
             }
         }
-        (2, 1) => {
-            // avg(half_h, half_hv)
+        (2, 1) | (2, 3) => {
+            // avg(half_h at dy = r or r+1, half_hv). The h row is the rounded
+            // form of the same h-FIR intermediates the hv pass needs — one
+            // shared block buffer serves both (hbuf row r+2 is dy = r).
+            let hrow_off = if frac_y == 1 { 2 } else { 3 };
+            let mut hbuf = [0i16; HBUF_LEN];
+            fill_hbuf(ref_y, stride, x, y, w, h, &mut hbuf);
+            let mut hp = [0u8; 16];
+            let mut hv = [0u8; 16];
             for r in 0..h {
-                let src_h = row(r as isize, -2, w + 5);
-                let rows_hv = vrows(-2, r as isize, w + 5);
-                for i in 0..w {
-                    let h_val = clip_u8((fir6(src_h, i) + 16) >> 5);
-                    let h0 = fir6(rows_hv[0], i);
-                    let h1 = fir6(rows_hv[1], i);
-                    let h2 = fir6(rows_hv[2], i);
-                    let h3 = fir6(rows_hv[3], i);
-                    let h4 = fir6(rows_hv[4], i);
-                    let h5 = fir6(rows_hv[5], i);
-                    let hv_val = clip_u8((fir6_i32(h0, h1, h2, h3, h4, h5) + 512) >> 10);
-                    output[r * w + i] = avg(h_val, hv_val);
-                }
+                hrow_to_u8(&hbuf[(r + hrow_off) * w..], &mut hp, w);
+                vfir_hv_row(&hbuf[r * w..(r + 6) * w], w, &mut hv);
+                avg_rows(&hp, &hv, &mut output[r * w..][..w], w);
             }
         }
-        (2, 3) => {
-            // avg(half_hv, half_h_below)
+        (1, 2) | (3, 2) => {
+            // avg(half_v at dx = 0 or +1, half_hv) — v from raw pixels, hv
+            // from the shared h-FIR block buffer; avg is symmetric.
+            let dx = if frac_x == 1 { 0 } else { 1 };
+            let mut hbuf = [0i16; HBUF_LEN];
+            fill_hbuf(ref_y, stride, x, y, w, h, &mut hbuf);
+            let mut vp = [0u8; 16];
+            let mut hv = [0u8; 16];
             for r in 0..h {
-                let src_h = row(r as isize + 1, -2, w + 5);
-                let rows_hv = vrows(-2, r as isize, w + 5);
-                for i in 0..w {
-                    let hv_val = clip_u8(
-                        (fir6_i32(
-                            fir6(rows_hv[0], i),
-                            fir6(rows_hv[1], i),
-                            fir6(rows_hv[2], i),
-                            fir6(rows_hv[3], i),
-                            fir6(rows_hv[4], i),
-                            fir6(rows_hv[5], i),
-                        ) + 512)
-                            >> 10,
-                    );
-                    let h_val = clip_u8((fir6(src_h, i) + 16) >> 5);
-                    output[r * w + i] = avg(hv_val, h_val);
-                }
-            }
-        }
-        (1, 2) => {
-            // avg(half_v, half_hv)
-            for r in 0..h {
-                let rows_v = vrows(0, r as isize, w);
-                let rows_hv = vrows(-2, r as isize, w + 5);
-                for i in 0..w {
-                    let v_val = clip_u8(
-                        (rows_v[0][i] as i32 - 5 * rows_v[1][i] as i32
-                            + 20 * rows_v[2][i] as i32
-                            + 20 * rows_v[3][i] as i32
-                            - 5 * rows_v[4][i] as i32
-                            + rows_v[5][i] as i32
-                            + 16)
-                            >> 5,
-                    );
-                    let hv_val = clip_u8(
-                        (fir6_i32(
-                            fir6(rows_hv[0], i),
-                            fir6(rows_hv[1], i),
-                            fir6(rows_hv[2], i),
-                            fir6(rows_hv[3], i),
-                            fir6(rows_hv[4], i),
-                            fir6(rows_hv[5], i),
-                        ) + 512)
-                            >> 10,
-                    );
-                    output[r * w + i] = avg(v_val, hv_val);
-                }
-            }
-        }
-        (3, 2) => {
-            // avg(half_hv, half_v_right)
-            for r in 0..h {
-                let rows_v = vrows(1, r as isize, w);
-                let rows_hv = vrows(-2, r as isize, w + 5);
-                for i in 0..w {
-                    let hv_val = clip_u8(
-                        (fir6_i32(
-                            fir6(rows_hv[0], i),
-                            fir6(rows_hv[1], i),
-                            fir6(rows_hv[2], i),
-                            fir6(rows_hv[3], i),
-                            fir6(rows_hv[4], i),
-                            fir6(rows_hv[5], i),
-                        ) + 512)
-                            >> 10,
-                    );
-                    let v_val = clip_u8(
-                        (rows_v[0][i] as i32 - 5 * rows_v[1][i] as i32
-                            + 20 * rows_v[2][i] as i32
-                            + 20 * rows_v[3][i] as i32
-                            - 5 * rows_v[4][i] as i32
-                            + rows_v[5][i] as i32
-                            + 16)
-                            >> 5,
-                    );
-                    output[r * w + i] = avg(hv_val, v_val);
-                }
+                let rows_v = vrows(dx, r as isize, w);
+                row_half_pel_v(rows_v, &mut vp, w);
+                vfir_hv_row(&hbuf[r * w..(r + 6) * w], w, &mut hv);
+                avg_rows(&vp, &hv, &mut output[r * w..][..w], w);
             }
         }
         (1, 1) => {
@@ -858,17 +982,17 @@ fn neon_chroma_bilinear_block(
 
             let mut i = 0;
             while i + 8 <= block_w {
-                let a = vld1_u8(top_p.add(i));
-                let b = vld1_u8(top_p.add(i + 1));
-                let c = vld1_u8(bot_p.add(i));
-                let d = vld1_u8(bot_p.add(i + 1));
+                let a = ld8(top_p.add(i));
+                let b = ld8(top_p.add(i + 1));
+                let c = ld8(bot_p.add(i));
+                let d = ld8(bot_p.add(i + 1));
 
                 let mut acc = vmull_u8(a, v00);
                 acc = vmlal_u8(acc, b, v01);
                 acc = vmlal_u8(acc, c, v10);
                 acc = vmlal_u8(acc, d, v11);
                 let res = vrshrn_n_u16(acc, 6);
-                vst1_u8(out_p.add(i), res);
+                st8(out_p.add(i), res);
                 i += 8;
             }
             // Scalar tail

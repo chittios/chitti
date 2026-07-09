@@ -318,6 +318,86 @@ impl RemoteChat {
     }
 }
 
+/// True when `/model remote` is active with a usable endpoint (same source as
+/// the shell chat: fw_cfg seed or `/configs/core/model.json`).
+pub fn is_remote_active() -> bool {
+    let (on, cfg) = load();
+    on && cfg.is_some()
+}
+
+/// Hosted backend config when remote mode is on.
+pub fn active_config() -> Option<RemoteConfig> {
+    let (on, cfg) = load();
+    if on {
+        cfg
+    } else {
+        None
+    }
+}
+
+/// Bounded ReAct over a **fresh** message list (no shell history): custom system
+/// prompt + one user message, tools via `on_tool`. Used by UI agents and the
+/// content server so they share the shell's remote/local policy without
+/// polluting the human chat transcript.
+///
+/// Returns the final assistant text (empty on cancel/error).
+pub fn oneshot_tools(
+    cfg: &RemoteConfig,
+    system: &str,
+    user: &str,
+    on_tool: &mut dyn FnMut(&str, &str) -> String,
+    max_iters: usize,
+    log_label: &'static str,
+) -> String {
+    let mut messages = vec![
+        ("system".to_string(), system.to_string()),
+        ("user".to_string(), user.to_string()),
+    ];
+    let mut last_call: Option<(String, String)> = None;
+    for _ in 0..max_iters.max(1) {
+        crate::shell::begin_thinking(log_label);
+        let result = chat_completion(cfg, &messages);
+        crate::shell::end_thinking();
+        let reply = match result {
+            Ok(r) => r,
+            Err(e) if e == "cancelled" => {
+                crate::serial_println!("\x1b[33m[{log_label} cancelled]\x1b[0m");
+                return String::new();
+            }
+            Err(e) => {
+                crate::serial_println!("\x1b[31m{log_label} remote error:\x1b[0m {e}");
+                return String::new();
+            }
+        };
+        let trimmed = reply.trim();
+        if !trimmed.is_empty() {
+            crate::serial_println!("\x1b[2m{log_label}:\x1b[0m {trimmed}");
+        }
+        messages.push(("assistant".to_string(), reply.clone()));
+        match super::parse_tool_call(&reply) {
+            Some(pair) if last_call.as_ref() == Some(&pair) => {
+                messages.push((
+                    "user".to_string(),
+                    "<tool_response>\nYou already ran that tool. Finish with a short status / JSON only — no more tools.\n</tool_response>"
+                        .to_string(),
+                ));
+                last_call = None;
+            }
+            Some((cmd, args)) => {
+                last_call = Some((cmd.clone(), args.clone()));
+                crate::serial_println!("\x1b[33m\u{2192} {log_label}\x1b[0m {cmd} {args}");
+                let obs = on_tool(&cmd, &args);
+                messages.push((
+                    "user".to_string(),
+                    format!("<tool_response>\n{obs}\n</tool_response>"),
+                ));
+            }
+            None => return reply,
+        }
+    }
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

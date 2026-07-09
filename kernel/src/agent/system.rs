@@ -30,8 +30,10 @@ struct SystemAgentDef {
     skill_id: SkillId,
     agent_id: AgentId,
     /// `(filename, contents)` written to `/agent/<id>/assets/` on install (e.g.
-    /// the Doc agent's HTML + logo). All text, compiled in via `include_str!`.
+    /// the Doc agent's HTML + logo). Text, compiled in via `include_str!`.
     assets: &'static [(&'static str, &'static str)],
+    /// Binary assets (e.g. `tools.wasm`), via `include_bytes!`.
+    binary_assets: &'static [(&'static str, &'static [u8])],
 }
 
 // Stable ids so `/agent/<id>/` is consistent across boots and doesn't collide
@@ -42,7 +44,8 @@ const SYSTEM_AGENT_BASE: u64 = 9000;
 // Only agents that actually reason from a SOUL are installed agents. The
 // `network` and `http` stages are pure mechanical plumbing (relay bytes, parse a
 // protocol) — no judgment, no SOUL — so they live entirely in `crate::service`,
-// not here. `doc` routes from its SOUL; `ssh` carries a login/tunnel persona.
+// not here. `doc` routes via `assets/tools.wasm` (deterministic); SOUL remains
+// for model fallback. `ssh` carries a login/tunnel persona.
 static SYSTEM_AGENTS: &[SystemAgentDef] = &[
     SystemAgentDef {
         name: "doc",
@@ -55,6 +58,10 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
             ("docs.html", include_str!("../../../agents/doc/assets/docs.html")),
             ("logo.svg", include_str!("../../../agents/doc/assets/logo.svg")),
         ],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/doc/assets/tools.wasm"),
+        )],
     },
     SystemAgentDef {
         name: "ssh",
@@ -63,6 +70,21 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
         skill_id: SkillId(SYSTEM_SKILL_BASE + 2),
         agent_id: AgentId(SYSTEM_AGENT_BASE + 2),
         assets: &[],
+        binary_assets: &[],
+    },
+    // UI agent: paints a chess board via board_set/board_mark; rules live in
+    // assets/tools.wasm (built by tools/chess-wasm/).
+    SystemAgentDef {
+        name: "chess",
+        soul: include_str!("../../../agents/chess/SOUL.md"),
+        manifest_json: include_str!("../../../agents/chess/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 3),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 3),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/chess/assets/tools.wasm"),
+        )],
     },
 ];
 
@@ -240,7 +262,7 @@ fn build_package(def: &SystemAgentDef, m: &ParsedManifest, caps: &[CapabilityReq
     };
     // Bundled assets → manifest.assets (declared) + package payload (placed into
     // the agent's install folder by `place_agent_home`).
-    let asset_meta: Vec<Asset> = def
+    let mut asset_meta: Vec<Asset> = def
         .assets
         .iter()
         .map(|(name, content)| Asset {
@@ -249,8 +271,21 @@ fn build_package(def: &SystemAgentDef, m: &ParsedManifest, caps: &[CapabilityReq
             bytes: content.len() as u32,
         })
         .collect();
-    let asset_payload: Vec<(String, Vec<u8>)> =
-        def.assets.iter().map(|(name, content)| ((*name).to_string(), content.as_bytes().to_vec())).collect();
+    for (name, content) in def.binary_assets {
+        asset_meta.push(Asset {
+            name: (*name).to_string(),
+            store_ref: StoreKey(alloc::format!("/agent/{}/assets/{name}", def.agent_id.0)),
+            bytes: content.len() as u32,
+        });
+    }
+    let mut asset_payload: Vec<(String, Vec<u8>)> = def
+        .assets
+        .iter()
+        .map(|(name, content)| ((*name).to_string(), content.as_bytes().to_vec()))
+        .collect();
+    for (name, content) in def.binary_assets {
+        asset_payload.push(((*name).to_string(), content.to_vec()));
+    }
     let manifest = SkillManifest {
         schema_version: 2,
         id: def.skill_id,
@@ -301,12 +336,12 @@ pub fn install_all(now: Ticks) {
                 def.name,
                 def.agent_id.0,
                 rec.granted_capabilities.len(),
-                def.assets.len()
+                def.assets.len() + def.binary_assets.len()
             )),
             Err(e) => crate::ktrace::log_fmt(format_args!("system-agent: install '{}' failed: {:?}", def.name, e)),
         }
     }
-    crate::serial_println!("Chitti: system agents installed (doc, ssh) in /agent/");
+    crate::serial_println!("Chitti: system agents installed (doc, ssh, chess) in /agent/");
 }
 
 /// The installed system agents, for `/agents list`/display: (name, agent_id).
@@ -335,9 +370,10 @@ mod tests {
             assert_eq!(m.name, def.name);
             assert!(!m.capabilities.is_empty(), "{} declares capabilities", def.name);
         }
-        // Only agents that reason from a SOUL are installed: doc + ssh. The
-        // network/http stages are pure service-layer plumbing, not agents.
-        assert_eq!(SYSTEM_AGENTS.len(), 2);
+        // SOUL-backed system agents: doc + ssh + chess (UI). network/http are
+        // pure service-layer plumbing, not installed agents.
+        assert_eq!(SYSTEM_AGENTS.len(), 3);
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "chess"));
         assert!(!SYSTEM_AGENTS.iter().any(|d| d.name == "network" || d.name == "http"));
     }
 

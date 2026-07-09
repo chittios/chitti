@@ -261,6 +261,192 @@ fn present(id: u32) {
     }
 }
 
+// --- Board helpers (chess / grid UI agents) ---------------------------------
+//
+// Pure presentation: FEN / square marks → draw-op programs. Game rules live in
+// the agent's SOUL (or optional later native validators), not here.
+
+/// Square size for an 8×8 board letterboxed into the surface.
+pub const BOARD_SQ: i32 = 24;
+/// Origin of the board (left/top) so 8*24=192 fits in SURF_H with margin.
+pub const BOARD_OX: i32 = 32;
+pub const BOARD_OY: i32 = 0;
+
+/// Map a surface-local click to a chess square `"a1"`…`"h8"`, or `None` if
+/// outside the board. Pure — unit-tested.
+pub fn click_to_square(x: u16, y: u16) -> Option<alloc::string::String> {
+    let x = x as i32 - BOARD_OX;
+    let y = y as i32 - BOARD_OY;
+    if x < 0 || y < 0 || x >= 8 * BOARD_SQ || y >= 8 * BOARD_SQ {
+        return None;
+    }
+    let file = (x / BOARD_SQ) as u8;
+    let rank_from_top = (y / BOARD_SQ) as u8;
+    // Board is drawn with rank 8 at the top (standard diagram).
+    let rank = 7 - rank_from_top;
+    let mut s = alloc::string::String::new();
+    s.push((b'a' + file) as char);
+    s.push((b'1' + rank) as char);
+    Some(s)
+}
+
+/// Parse square `"e4"` → (file 0..7, rank 0..7) with rank 0 = white's first rank.
+pub fn parse_square(sq: &str) -> Option<(u8, u8)> {
+    let b = sq.as_bytes();
+    if b.len() != 2 {
+        return None;
+    }
+    let file = b[0].wrapping_sub(b'a');
+    let rank = b[1].wrapping_sub(b'1');
+    if file < 8 && rank < 8 {
+        Some((file, rank))
+    } else {
+        None
+    }
+}
+
+/// Build a draw-op program for an 8×8 board from a FEN placement field (or a
+/// full FEN — only the first field is used). Empty / invalid → empty board.
+/// Pure: returns the ops string; the caller paints via [`draw`].
+pub fn board_ops_from_fen(fen: &str) -> alloc::string::String {
+    use alloc::format;
+    let placement = fen.split_whitespace().next().unwrap_or(fen);
+    let mut grid = [[' '; 8]; 8];
+    let mut r: usize = 0;
+    let mut f: usize = 0;
+    for c in placement.chars() {
+        if r >= 8 {
+            break;
+        }
+        match c {
+            '/' => {
+                r += 1;
+                f = 0;
+            }
+            '1'..='8' => {
+                let n = (c as u8 - b'0') as usize;
+                f = (f + n).min(8);
+            }
+            p if p.is_ascii_alphabetic() => {
+                if f < 8 {
+                    grid[r][f] = p;
+                    f += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    // FEN ranks are top-down (black's side first); grid[0] = rank 8.
+    let light = 0xee_ee_d2u32;
+    let dark = 0x76_96_56u32;
+    let mut ops = format!("clear 1a1a2e; ");
+    for rank_top in 0..8i32 {
+        for file in 0..8i32 {
+            let x = BOARD_OX + file * BOARD_SQ;
+            let y = BOARD_OY + rank_top * BOARD_SQ;
+            let color = if (file + rank_top) % 2 == 0 { light } else { dark };
+            ops.push_str(&format!("rect {x} {y} {BOARD_SQ} {BOARD_SQ} {color:06x}; "));
+            let piece = grid[rank_top as usize][file as usize];
+            if piece != ' ' {
+                let (glyph_color, filled) = piece_style(piece);
+                paint_piece_ops(&mut ops, x, y, piece, glyph_color, filled);
+            }
+        }
+    }
+    ops
+}
+
+fn piece_style(p: char) -> (u32, bool) {
+    // White pieces: light fill; black: dark fill.
+    if p.is_ascii_uppercase() {
+        (0xf0_f0_f0, true)
+    } else {
+        (0x22_22_22, true)
+    }
+}
+
+/// Very small geometric stand-ins for pieces (no font dependency).
+fn paint_piece_ops(ops: &mut alloc::string::String, x: i32, y: i32, piece: char, color: u32, _filled: bool) {
+    use alloc::format;
+    let cx = x + BOARD_SQ / 2;
+    let cy = y + BOARD_SQ / 2;
+    let c = color & 0xff_ffff;
+    // Outline box so empty-ish shapes stay visible on both square colours.
+    match piece.to_ascii_lowercase() {
+        'p' => {
+            // Pawn: small body + head.
+            ops.push_str(&format!("rect {} {} 6 8 {c:06x}; ", cx - 3, cy - 1));
+            ops.push_str(&format!("rect {} {} 4 4 {c:06x}; ", cx - 2, cy - 6));
+        }
+        'r' => {
+            ops.push_str(&format!("rect {} {} 10 12 {c:06x}; ", cx - 5, cy - 5));
+            ops.push_str(&format!("rect {} {} 12 3 {c:06x}; ", cx - 6, cy - 8));
+        }
+        'n' => {
+            ops.push_str(&format!("rect {} {} 8 12 {c:06x}; ", cx - 3, cy - 5));
+            ops.push_str(&format!("rect {} {} 6 4 {c:06x}; ", cx - 1, cy - 8));
+        }
+        'b' => {
+            ops.push_str(&format!("rect {} {} 6 14 {c:06x}; ", cx - 3, cy - 7));
+            ops.push_str(&format!("rect {} {} 10 4 {c:06x}; ", cx - 5, cy - 8));
+        }
+        'q' => {
+            ops.push_str(&format!("rect {} {} 12 10 {c:06x}; ", cx - 6, cy - 3));
+            ops.push_str(&format!("rect {} {} 4 4 {c:06x}; ", cx - 6, cy - 8));
+            ops.push_str(&format!("rect {} {} 4 4 {c:06x}; ", cx + 2, cy - 8));
+            ops.push_str(&format!("rect {} {} 4 4 {c:06x}; ", cx - 2, cy - 10));
+        }
+        'k' => {
+            ops.push_str(&format!("rect {} {} 10 10 {c:06x}; ", cx - 5, cy - 3));
+            ops.push_str(&format!("rect {} {} 4 8 {c:06x}; ", cx - 2, cy - 9));
+            ops.push_str(&format!("rect {} {} 10 3 {c:06x}; ", cx - 5, cy - 6));
+        }
+        _ => {
+            ops.push_str(&format!("rect {} {} 8 8 {c:06x}; ", cx - 4, cy - 4));
+        }
+    }
+}
+
+/// Highlight squares (e.g. `"e2,e4"`) with a translucent-ish overlay colour.
+pub fn board_mark_ops(squares: &str, color_hex: &str) -> alloc::string::String {
+    use alloc::format;
+    let color = u32::from_str_radix(color_hex.trim().trim_start_matches('#'), 16).unwrap_or(0xcc_78_5c) & 0xff_ffff;
+    let mut ops = alloc::string::String::new();
+    for tok in squares.split(|c: char| c == ',' || c.is_whitespace()) {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        if let Some((file, rank)) = parse_square(tok) {
+            let x = BOARD_OX + file as i32 * BOARD_SQ;
+            // rank 0 at bottom → top y = (7-rank)*sq
+            let y = BOARD_OY + (7 - rank as i32) * BOARD_SQ;
+            // Inset border so the mark is visible without wiping the piece.
+            ops.push_str(&format!(
+                "rect {x} {y} {BOARD_SQ} 2 {color:06x}; rect {x} {} {BOARD_SQ} 2 {color:06x}; rect {x} {y} 2 {BOARD_SQ} {color:06x}; rect {} {y} 2 {BOARD_SQ} {color:06x}; ",
+                y + BOARD_SQ - 2,
+                x + BOARD_SQ - 2
+            ));
+        }
+    }
+    ops
+}
+
+/// Paint a FEN onto a surface the caller owns (high-level board tool).
+pub fn board_set(task: TaskId, id: u32, fen: &str) -> Result<usize, DrawErr> {
+    let ops = board_ops_from_fen(fen);
+    draw(task, id, &ops)
+}
+
+/// Overlay square marks on a surface the caller owns.
+pub fn board_mark(task: TaskId, id: u32, squares: &str, color: &str) -> Result<usize, DrawErr> {
+    let ops = board_mark_ops(squares, color);
+    if ops.is_empty() {
+        return Ok(0);
+    }
+    draw(task, id, &ops)
+}
+
 #[cfg(test)]
 pub fn reset() {
     SURFACES.with(|m| m.clear());
@@ -324,6 +510,37 @@ mod tests {
         let id = request(owner, SurfaceKind::Canvas);
         assert!(matches!(draw(owner, id, "rect 1 2 3"), Err(DrawErr::BadOp(_)))); // wrong arity
         assert!(matches!(draw(owner, id, "explode 1 2"), Err(DrawErr::BadOp(_)))); // unknown op
+        close(owner, id).unwrap();
+    }
+
+    #[test_case]
+    fn click_to_square_maps_board_and_rejects_margin() {
+        // Top-left pixel of a1's file / rank 8 visually is file a, rank 8.
+        assert_eq!(click_to_square(BOARD_OX as u16, BOARD_OY as u16).as_deref(), Some("a8"));
+        // Bottom-left of board → a1.
+        let y = (BOARD_OY + 7 * BOARD_SQ + 1) as u16;
+        assert_eq!(click_to_square(BOARD_OX as u16 + 1, y).as_deref(), Some("a1"));
+        // Outside the board margin.
+        assert!(click_to_square(0, 0).is_none());
+        assert_eq!(parse_square("e4"), Some((4, 3)));
+        assert!(parse_square("z9").is_none());
+    }
+
+    #[test_case]
+    fn board_set_from_start_fen_is_deterministic() {
+        reset();
+        let owner = crate::sched::current_task_id();
+        let id = request(owner, SurfaceKind::Board);
+        let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+        let n = board_set(owner, id, fen).unwrap();
+        assert!(n > 10, "start position should emit many ops, got {n}");
+        let h1 = checksum(id).unwrap();
+        // Second paint of the same FEN must match (presentation is pure).
+        board_set(owner, id, fen).unwrap();
+        assert_eq!(checksum(id).unwrap(), h1);
+        // Empty board differs.
+        board_set(owner, id, "8/8/8/8/8/8/8/8").unwrap();
+        assert_ne!(checksum(id).unwrap(), h1);
         close(owner, id).unwrap();
     }
 }

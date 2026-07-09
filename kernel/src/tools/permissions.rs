@@ -194,6 +194,9 @@ pub fn is_readonly_tool(name: &str) -> bool {
         Some(ToolBinding::AgentMemory) => {
             matches!(name, "memory_get" | "memory_list" | "memory_search")
         }
+        Some(ToolBinding::AgentStorage) => {
+            matches!(name, "storage_get" | "storage_list")
+        }
         Some(ToolBinding::SessionTodo) | Some(ToolBinding::LoadSkill) => true,
         Some(ToolBinding::McpResources { kind: McpResourceKind::List }) => true,
         Some(ToolBinding::McpResources { kind: McpResourceKind::Read }) => true,

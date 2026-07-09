@@ -1,23 +1,23 @@
 //! The **generic content-server runtime**: the third stage of the web pipeline,
-//! and the whole point of "write a server with just a SOUL.md + assets". It is
+//! and the whole point of "write a server with just a package + assets". It is
 //! NOT specific to any one agent — it serves *whichever* content agent the
 //! pipeline was started for (its install folder, set by `pipeline::start`).
 //!
-//! For each request it runs that agent's *model* as a bounded ReAct loop
-//! (prompted with the agent's own `SOUL.md`, where the author wrote the routing
-//! policy). The agent **reads the file it decides to serve itself**, via a
-//! capability- and scope-gated `mem_fs_read` tool call confined to the agent's
-//! own `assets/`, and then returns a **JSON response object**
-//! (`{status, content_type/headers, body}`). This runtime parses that JSON and
-//! builds the reply frame for the HTTP stage — the whole HTTP response is decided
-//! by the SOUL agent, not any compiled-in table.
+//! For each request, in order:
 //!
-//! So a new web server is just `agents/<name>/{SOUL.md, manifest.json, assets/…}`:
-//! the SOUL carries the routing/behaviour, the assets carry the content, and this
-//! runtime (plus the generic Network + HTTP agents) does the rest — no per-server
-//! Rust. Determinism boundary: the model *decides* and *reads* (through the gated
-//! tool call); native code only parses its JSON and frames bytes — the model
-//! never touches the socket or the raw capability.
+//! 1. **Package WASM** (`assets/tools.wasm` export `route_request`) if present —
+//!    deterministic guest code (agent-authored routing, e.g. Doc). Same JSON
+//!    response contract as the model path.
+//! 2. Else the agent's **model** as a bounded ReAct loop over its `SOUL.md`.
+//! 3. Else a well-formed **503** (no router available).
+//!
+//! The agent (WASM or model) returns a **JSON response object**
+//! (`{status, content_type/headers, file/body}`). This runtime parses that JSON,
+//! reads named assets through the capability/scope gate, and frames the reply
+//! for the HTTP stage — **no per-agent match arms in this file**.
+//!
+//! Determinism boundary: guest/model *decides*; native code only parses JSON,
+//! gates asset reads, and frames bytes.
 
 use crate::cap::Right;
 use crate::service::{pipeline, ServiceSpec};
@@ -237,40 +237,107 @@ fn default_body(status: &str) -> Vec<u8> {
     alloc::format!("<!doctype html><title>{status}</title><h1>{status}</h1>").into_bytes()
 }
 
-/// Serve one request for the agent installed at `home`: run its model as a ReAct
-/// loop (prompted with the agent's SOUL) in which the agent reads the file it
-/// serves through the scoped `mem_fs_read` tool and returns a JSON response
-/// object; parse that JSON and frame the response. The model *decides and reads*
-/// (a judgment from the SOUL, through the gated tool); native code only parses +
-/// frames. The body is the agent's inline `body` if present, otherwise the file
-/// it read (so a small model need not echo a whole page).
+/// Serve one request for the agent installed at `home`.
+///
+/// Prefer package WASM (`assets/tools.wasm` → `route_request`) when present so
+/// agent-specific routing stays out of this file and works without a model.
+/// Fall back to the model SOUL ReAct loop, then 503.
 pub fn serve(home: &str, method: &str, path: &str) -> Vec<u8> {
+    // 1) Deterministic package tools (Doc and any future content agent).
+    if let Some(reply) = try_wasm_route(home, method, path) {
+        crate::ktrace::log_fmt(format_args!(
+            "service.server: wasm route {method} {path}"
+        ));
+        return frame_agent_reply(home, &reply, None);
+    }
+
+    // 2) Model planner (optional).
     let persona = soul(home);
     let user = alloc::format!("Serve the HTTP request:\n{method} {path}");
     let (reply, last_read) = match crate::shell::serve_reply(&persona, &user, home) {
         Some(r) => r,
         None => {
-            crate::ktrace::log("service.server", "serve: no model loaded to run the agent");
+            crate::ktrace::log(
+                "service.server",
+                "serve: no tools.wasm route_request and no model loaded",
+            );
             return build_frame(
                 "503 Service Unavailable",
-                &[(String::from("Content-Type"), String::from("text/html; charset=utf-8"))],
-                b"<!doctype html><title>503</title><h1>Server agent: no model loaded</h1>",
+                &[(
+                    String::from("Content-Type"),
+                    String::from("text/html; charset=utf-8"),
+                )],
+                b"<!doctype html><title>503</title><h1>Server agent: no router (tools.wasm or model)</h1>",
             );
         }
     };
-    match parse_response(&reply) {
+    frame_agent_reply(home, &reply, last_read)
+}
+
+/// Call `assets/tools.wasm` export `route_request` if the package shipped one.
+/// Returns the guest's JSON response string, or `None` if missing/invalid.
+fn try_wasm_route(home: &str, method: &str, path: &str) -> Option<String> {
+    let wasm_path = alloc::format!("{home}/assets/tools.wasm");
+    // Binary-safe read (mem_fs_read is UTF-8 lossy). Path is confined to the
+    // agent home the pipeline already granted this task.
+    if wasm_path.contains("..") || !wasm_path.starts_with(home) {
+        return None;
+    }
+    let wasm = crate::synapse::fs::read(&wasm_path)?;
+    if wasm.is_empty() {
+        return None;
+    }
+    // Escape method/path for a tiny JSON args object.
+    let method_esc = method.replace('\\', "\\\\").replace('"', "\\\"");
+    let path_esc = path.replace('\\', "\\\\").replace('"', "\\\"");
+    let args = alloc::format!(r#"{{"method":"{method_esc}","path":"{path_esc}"}}"#);
+    let agent_id = home
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let bind = crate::agent::wasm_rt::HostBindings {
+        agent_id,
+        task: crate::sched::current_task_id(),
+        surface: 0,
+    };
+    match crate::agent::wasm_rt::call_string_bound(
+        &wasm,
+        "route_request",
+        &args,
+        crate::agent::wasm_rt::Limits::default().with_fuel(500_000),
+        bind,
+    ) {
+        Ok(s) if !s.is_empty() => Some(s),
+        Ok(_) => None,
+        Err(e) => {
+            crate::ktrace::log_fmt(format_args!("service.server: wasm route failed: {e}"));
+            None
+        }
+    }
+}
+
+/// Parse agent JSON (WASM or model) and build the content→HTTP frame.
+fn frame_agent_reply(
+    home: &str,
+    reply: &str,
+    last_read: Option<(String, Vec<u8>)>,
+) -> Vec<u8> {
+    match parse_response(reply) {
         Some(mut r) => {
-            // Resolve the body, in order: the agent's inline `body`; the file it
-            // read via the tool; the asset it named in `file` (read now, gated);
-            // else a default page. `ct_path` remembers which asset supplied the
-            // body so the content-type can be inferred if the agent omitted one.
+            // Resolve the body, in order: inline `body`; tool-read bytes; named
+            // `file` (gated asset read); else a default page.
             let mut ct_path: Option<String> = last_read.as_ref().map(|(p, _)| p.clone());
             let body = match r.body.take() {
                 Some(b) if !b.is_empty() => b,
                 _ => {
                     if let Some((_, b)) = last_read {
                         b
-                    } else if let Some(file) = r.file.as_deref().and_then(|f| read_asset_arg(home, f).map(|b| (f, b))) {
+                    } else if let Some(file) = r
+                        .file
+                        .as_deref()
+                        .and_then(|f| read_asset_arg(home, f).map(|b| (f, b)))
+                    {
                         ct_path = Some(file.0.to_string());
                         file.1
                     } else {
@@ -279,27 +346,42 @@ pub fn serve(home: &str, method: &str, path: &str) -> Vec<u8> {
                 }
             };
             ensure_content_type(&mut r.headers, ct_path.as_deref());
-            crate::ktrace::log_fmt(format_args!("service.server: agent replied {} ({} bytes)", r.status, body.len()));
+            crate::ktrace::log_fmt(format_args!(
+                "service.server: agent replied {} ({} bytes)",
+                r.status,
+                body.len()
+            ));
             build_frame(&r.status, &r.headers, &body)
         }
-        None => {
-            // No parseable JSON: if the agent nevertheless read a file, serve it
-            // (its routing decision still lands); otherwise 404.
-            match last_read {
-                Some((p, bytes)) => {
-                    crate::ktrace::log_fmt(format_args!("service.server: no JSON reply; serving read asset {p}"));
-                    build_frame("200 OK", &[(String::from("Content-Type"), ctype_for(&p).to_string())], &bytes)
-                }
-                None => {
-                    crate::ktrace::log("service.server", "agent returned no JSON and read nothing (404)");
-                    build_frame(
-                        "404 Not Found",
-                        &[(String::from("Content-Type"), String::from("text/html; charset=utf-8"))],
-                        b"<!doctype html><title>404</title><h1>Not found</h1>",
-                    )
-                }
+        None => match last_read {
+            Some((p, bytes)) => {
+                crate::ktrace::log_fmt(format_args!(
+                    "service.server: no JSON reply; serving read asset {p}"
+                ));
+                build_frame(
+                    "200 OK",
+                    &[(
+                        String::from("Content-Type"),
+                        ctype_for(&p).to_string(),
+                    )],
+                    &bytes,
+                )
             }
-        }
+            None => {
+                crate::ktrace::log(
+                    "service.server",
+                    "agent returned no JSON and read nothing (404)",
+                );
+                build_frame(
+                    "404 Not Found",
+                    &[(
+                        String::from("Content-Type"),
+                        String::from("text/html; charset=utf-8"),
+                    )],
+                    b"<!doctype html><title>404</title><h1>Not found</h1>",
+                )
+            }
+        },
     }
 }
 
@@ -328,8 +410,8 @@ extern "C" fn server_serve(_arg: u64) {
 
 /// The generic content-server stage. Holds `InvokePrimitive(mem_fs_read)`; the
 /// served agent's read scope (its own install folder) is granted by
-/// `pipeline::start`. Serves any content agent — the response is planned and read
-/// by that agent's model from its SOUL, never a compiled-in table.
+/// `pipeline::start`. Serves any content agent — routing comes from package
+/// WASM and/or the model SOUL, never a per-agent table in this file.
 pub static SERVER_STAGE: ServiceSpec =
     ServiceSpec { name: "server", entry: server_serve, autostart: false, caps: &[Right::InvokePrimitive(registry::MEM_FS_READ)] };
 
@@ -396,5 +478,66 @@ mod tests {
         assert_eq!(ctype_for("/x/a.html"), "text/html; charset=utf-8");
         assert_eq!(ctype_for("/x/a.svg"), "image/svg+xml");
         assert_eq!(ctype_for("/x/a.json"), "application/json");
+    }
+
+    #[test_case]
+    fn doc_tools_wasm_routes_without_model() {
+        // Real package module (tools/doc-wasm → agents/doc/assets/tools.wasm).
+        let wasm = include_bytes!("../../../agents/doc/assets/tools.wasm");
+        assert!(crate::agent::wasm_rt::validate_module(wasm).is_ok());
+        let out = crate::agent::wasm_rt::call_string_bound(
+            wasm,
+            "route_request",
+            r#"{"method":"GET","path":"/"}"#,
+            crate::agent::wasm_rt::Limits::default().with_fuel(100_000),
+            crate::agent::wasm_rt::HostBindings::default(),
+        )
+        .expect("route_request /");
+        assert!(out.contains("index.html"), "got {out}");
+        let out = crate::agent::wasm_rt::call_string_bound(
+            wasm,
+            "route_request",
+            r#"{"method":"GET","path":"/docs"}"#,
+            crate::agent::wasm_rt::Limits::default().with_fuel(100_000),
+            crate::agent::wasm_rt::HostBindings::default(),
+        )
+        .expect("route_request /docs");
+        assert!(out.contains("docs.html"), "got {out}");
+        let out = crate::agent::wasm_rt::call_string_bound(
+            wasm,
+            "route_request",
+            r#"{"method":"GET","path":"/nope"}"#,
+            crate::agent::wasm_rt::Limits::default().with_fuel(100_000),
+            crate::agent::wasm_rt::HostBindings::default(),
+        )
+        .expect("route_request 404");
+        assert!(out.contains("404"), "got {out}");
+    }
+
+    #[test_case]
+    fn frame_agent_reply_serves_named_file_from_assets() {
+        use crate::agent::types::{CapDomain, CapabilityRequest, Rights, Scope};
+        let me = crate::sched::current_task_id();
+        crate::cap::grant(me, Right::InvokePrimitive(registry::MEM_FS_READ));
+        crate::cap::grant_scopes(
+            me,
+            &[CapabilityRequest::new(
+                CapDomain::Fs,
+                Rights::READ,
+                Scope::Path("/agent/docwasm/**".into()),
+            )],
+        );
+        crate::synapse::fs::write(
+            "/agent/docwasm/assets/index.html",
+            b"<html>Chitti home</html>",
+        );
+        let frame = frame_agent_reply(
+            "/agent/docwasm",
+            r#"{"status":200,"content_type":"text/html; charset=utf-8","file":"index.html"}"#,
+            None,
+        );
+        let s = core::str::from_utf8(&frame).unwrap_or("");
+        assert!(s.starts_with("200 OK\n"), "got {s}");
+        assert!(s.contains("Chitti home"), "got {s}");
     }
 }

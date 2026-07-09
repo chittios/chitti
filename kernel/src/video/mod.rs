@@ -216,6 +216,11 @@ pub struct StreamDecoder {
     /// display index → decode sample index (identity for baseline; B-frame
     /// streams are sorted by composition timestamp).
     display: Vec<usize>,
+    /// Inverse of `display`: decode sample index → display position.
+    disp_of: Vec<usize>,
+    /// Hurry mode (set for one [`seek_decode_hurry`] call): skip decoding
+    /// non-reference samples that display before this index.
+    hurry_before: Option<usize>,
     /// Display index of the single current RGB frame.
     cur_idx: Option<usize>,
     /// The one RGB frame currently shown (also stored in `ring` when present).
@@ -254,6 +259,39 @@ enum Engine {
         dec: h264::decoder_cabac::H264Dec,
         pending: alloc::collections::BTreeMap<usize, alloc::rc::Rc<h264::decoder_cabac::Pic>>,
     },
+}
+
+/// Pure frame-drop test over one AVCC sample (length-prefixed NALs): true iff
+/// it contains at least one slice and **every** slice is non-reference
+/// (`nal_ref_idc == 0` — an H.264 "disposable" picture; nothing predicts from
+/// it, so skipping its decode entirely is always safe). Conservative `false`
+/// on any malformed framing.
+fn sample_is_nonref(data: &[u8], length_size: usize) -> bool {
+    if length_size == 0 || length_size > 4 {
+        return false;
+    }
+    let mut off = 0usize;
+    let mut saw_slice = false;
+    while off + length_size < data.len() {
+        let mut len = 0usize;
+        for &b in &data[off..off + length_size] {
+            len = (len << 8) | b as usize;
+        }
+        off += length_size;
+        if len == 0 || off + len > data.len() {
+            return false;
+        }
+        let hdr = data[off];
+        let ty = hdr & 0x1f;
+        if ty == 1 || ty == 5 {
+            saw_slice = true;
+            if (hdr & 0x60) != 0 {
+                return false; // a reference slice — later frames need it
+            }
+        }
+        off += len;
+    }
+    saw_slice
 }
 
 fn rust_h264_from_avcc(sps_nals: &[alloc::vec::Vec<u8>], pps_nals: &[alloc::vec::Vec<u8>]) -> Result<rust_h264::decoder::Decoder, &'static str> {
@@ -310,6 +348,10 @@ impl StreamDecoder {
         // cts == dts and this is the identity.
         let mut display: Vec<usize> = (0..d.samples.len()).collect();
         display.sort_by_key(|&i| (d.samples[i].cts, i));
+        let mut disp_of = alloc::vec![0usize; display.len()];
+        for (pos, &si) in display.iter().enumerate() {
+            disp_of[si] = pos;
+        }
         let src_w = sps.width();
         let src_h = sps.height();
         Ok(StreamDecoder {
@@ -323,6 +365,8 @@ impl StreamDecoder {
             next: 0,
             engine,
             display,
+            disp_of,
+            hurry_before: None,
             cur_idx: None,
             cur: None,
             ring: alloc::collections::BTreeMap::new(),
@@ -517,6 +561,28 @@ impl StreamDecoder {
         }
     }
 
+    /// True if decode sample `si` can be skipped entirely without corrupting
+    /// later pictures: every slice NAL in it is **non-reference**
+    /// (`nal_ref_idc == 0`) — nothing else predicts from it.
+    fn sample_droppable(&self, si: usize) -> bool {
+        let s = &self.samples[si];
+        if s.is_sync || s.offset + s.size > self.bytes.len() {
+            return false;
+        }
+        sample_is_nonref(&self.bytes[s.offset..s.offset + s.size], self.length_size as usize)
+    }
+
+    /// As [`seek_decode`], but when `hurry` is set (playback is behind the
+    /// clock) **skip decoding** backlog frames that are non-reference and
+    /// display before `idx` — the H.264 form of frame-dropping: the picture
+    /// was never going to be shown and nothing predicts from it.
+    pub fn seek_decode_hurry(&mut self, idx: usize, hurry: bool) -> bool {
+        self.hurry_before = if hurry { Some(idx.min(self.display.len().saturating_sub(1))) } else { None };
+        let r = self.seek_decode(idx);
+        self.hurry_before = None;
+        r
+    }
+
     /// Ensure the current RGB frame is display index `idx`, decoding forward as
     /// needed. A backward seek rewinds to the latest sync (IDR) sample ≤ the
     /// target in *decode* order and re-decodes forward (P/B frames can't be
@@ -577,6 +643,16 @@ impl StreamDecoder {
             self.ring.clear();
         }
         while self.next <= target {
+            // Frame-drop: behind the clock, a backlog picture nothing predicts
+            // from (all slices nal_ref_idc == 0) that would display before the
+            // hurry point is never fed to the decoder at all.
+            if let Some(hb) = self.hurry_before {
+                let si = self.next;
+                if si != target && self.disp_of[si] < hb && self.sample_droppable(si) {
+                    self.next += 1;
+                    continue;
+                }
+            }
             if self.decode_one().is_err() {
                 // Primary path failed — switch to native backup and retry once.
                 if matches!(self.engine, Engine::RustH264 { .. }) {
@@ -765,6 +841,48 @@ mod tests {
     #[test_case]
     fn probe_rejects_unknown_container() {
         assert!(probe(b"random bytes here").is_err());
+    }
+}
+
+#[cfg(test)]
+mod framedrop_test {
+    //! The pure frame-drop test (`sample_is_nonref`): only an all-non-ref
+    //! sample may be skipped; anything malformed is conservatively kept.
+    use super::sample_is_nonref;
+
+    fn sample(nals: &[&[u8]]) -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::new();
+        for n in nals {
+            v.extend_from_slice(&(n.len() as u32).to_be_bytes());
+            v.extend_from_slice(n);
+        }
+        v
+    }
+
+    #[test_case]
+    fn nonref_slice_is_droppable() {
+        // nal_ref_idc = 0, type 1 (non-IDR slice) → header 0x01.
+        assert!(sample_is_nonref(&sample(&[&[0x01, 0xaa, 0xbb]]), 4));
+        // SEI (type 6) alongside doesn't block the drop.
+        assert!(sample_is_nonref(&sample(&[&[0x06, 0x05], &[0x01, 0xaa]]), 4));
+    }
+
+    #[test_case]
+    fn reference_and_idr_are_kept() {
+        // ref_idc 2 (0x41): reference P/B slice.
+        assert!(!sample_is_nonref(&sample(&[&[0x41, 0xaa]]), 4));
+        // IDR (type 5, ref_idc 3): 0x65.
+        assert!(!sample_is_nonref(&sample(&[&[0x65, 0xaa]]), 4));
+        // Mixed: one non-ref + one ref slice → keep.
+        assert!(!sample_is_nonref(&sample(&[&[0x01, 0xaa], &[0x41, 0xbb]]), 4));
+    }
+
+    #[test_case]
+    fn malformed_is_kept() {
+        assert!(!sample_is_nonref(&[], 4));
+        assert!(!sample_is_nonref(&[0, 0, 0, 9, 0x01], 4)); // length overruns
+        assert!(!sample_is_nonref(&sample(&[&[0x06, 0x05]]), 4)); // no slice at all
+        assert!(!sample_is_nonref(&sample(&[&[0x01, 0xaa]]), 0)); // bad length size
     }
 }
 

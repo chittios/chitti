@@ -103,3 +103,9 @@ sha2 = { version = "0.10", default-features = false }
 # Pure-Rust H.264 Main/High (+ CABAC) decoder — vendored and no_std-patched.
 # Primary video path; our hand-rolled CAVLC/CABAC remains as fallback.
 rust_h264 = { path = "../third_party/rust_h264", default-features = false }
+
+# WebAssembly interpreter for agent-authored tools (`assets/tools.wasm`).
+# no_std + alloc; fuel metering + ResourceLimiter keep guests bounded.
+# Effects only via host imports (W2+); guest is below the determinism boundary.
+# MIT/Apache-2.0 — see THIRDPARTY-LICENSES.md.
+wasmi = { version = "0.40", default-features = false }

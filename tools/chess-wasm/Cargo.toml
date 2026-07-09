@@ -1,0 +1,23 @@
+[package]
+name = "chitti-chess-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Chess tool module for Chitti agents (assets/tools.wasm)"
+
+# Stand-alone crate (not part of the root workspace / host xtask).
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[dependencies]
+# none — pure no_std + bump alloc

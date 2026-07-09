@@ -87,6 +87,11 @@ pub const UI_SURFACE_REQUEST: PrimitiveId = 19;
 pub const UI_DRAW: PrimitiveId = 20;
 pub const UI_EVENT_POLL: PrimitiveId = 21;
 pub const UI_SURFACE_CLOSE: PrimitiveId = 22;
+// High-level board presentation for UI agents (Chess etc.): one structured
+// call paints a FEN or square marks — models emit these instead of dozens of
+// raw rects. Still ownership-gated like ui_draw.
+pub const BOARD_SET: PrimitiveId = 23;
+pub const BOARD_MARK: PrimitiveId = 24;
 
 const STR: ArgType = ArgType::Str;
 const UINT: ArgType = ArgType::Uint;
@@ -253,6 +258,20 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
         name: "ui_surface_close",
         params: &[Param { key: "surface", ty: UINT }],
         description: "Close a surface you own.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: BOARD_SET,
+        name: "board_set",
+        params: &[Param { key: "surface", ty: UINT }, Param { key: "fen", ty: STR }],
+        description: "Paint an 8x8 chess board from a FEN string onto a surface you own.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: BOARD_MARK,
+        name: "board_mark",
+        params: &[Param { key: "surface", ty: UINT }, Param { key: "squares", ty: STR }, Param { key: "color", ty: STR }],
+        description: "Highlight squares (e.g. 'e2,e4') on a board surface you own.",
         destructive: false,
     },
 ];

@@ -43,6 +43,9 @@ pub enum ToolBinding {
     /// store is the agent's own home (already sandboxed for non-orchestrator
     /// agents).
     AgentMemory,
+    /// Agent session/durable storage (`storage_*`) — localStorage-shaped host
+    /// API for UI/WASM agents ([`crate::agent::storage`]).
+    AgentStorage,
     /// Path/content query over the capability-scoped store listing (`glob` /
     /// `grep`). Pure matching after a scope-filtered `list`/`read` — no new
     /// Synapse primitive (Gate 2.5 applied per path).
@@ -253,6 +256,84 @@ fn builtins() -> Vec<ToolDef> {
             "emit_result",
             &[("text", "text")],
         ),
+        // UI surfaces — Chess / board agents (ownership-gated at the executor).
+        ToolDef::synapse(
+            "ui_surface_request",
+            "Request a drawing surface in the action pane. kind: canvas|board|image|video|html.",
+            r#"{"type":"object","properties":{"kind":{"type":"string"}},"required":["kind"]}"#,
+            &["kind"],
+            "ui_surface_request",
+            &[("kind", "kind")],
+        ),
+        ToolDef::synapse(
+            "ui_draw",
+            "Paint a surface you own. ops: 'clear <hex>; rect x y w h <hex>; line …; pixel …'.",
+            r#"{"type":"object","properties":{"surface":{"type":"integer"},"ops":{"type":"string"}},"required":["surface","ops"]}"#,
+            &["surface", "ops"],
+            "ui_draw",
+            &[("surface", "surface"), ("ops", "ops")],
+        ),
+        ToolDef::synapse(
+            "ui_event_poll",
+            "Poll one click/key event for a surface you own.",
+            r#"{"type":"object","properties":{"surface":{"type":"integer"}},"required":["surface"]}"#,
+            &["surface"],
+            "ui_event_poll",
+            &[("surface", "surface")],
+        ),
+        ToolDef::synapse(
+            "ui_surface_close",
+            "Close a surface you own.",
+            r#"{"type":"object","properties":{"surface":{"type":"integer"}},"required":["surface"]}"#,
+            &["surface"],
+            "ui_surface_close",
+            &[("surface", "surface")],
+        ),
+        ToolDef::synapse(
+            "board_set",
+            "Paint an 8×8 chess board from a FEN string onto a surface you own (prefer this over raw ui_draw for chess).",
+            r#"{"type":"object","properties":{"surface":{"type":"integer"},"fen":{"type":"string"}},"required":["surface","fen"]}"#,
+            &["surface", "fen"],
+            "board_set",
+            &[("surface", "surface"), ("fen", "fen")],
+        ),
+        ToolDef::synapse(
+            "board_mark",
+            "Highlight squares on a board surface (e.g. squares='e2,e4', color='cc785c').",
+            r#"{"type":"object","properties":{"surface":{"type":"integer"},"squares":{"type":"string"},"color":{"type":"string"}},"required":["surface","squares"]}"#,
+            &["surface", "squares"],
+            "board_mark",
+            &[("surface", "surface"), ("squares", "squares"), ("color", "color")],
+        ),
+        // Agent storage (localStorage-shaped; host side of the WASM import ABI).
+        ToolDef {
+            name: "storage_get".to_string(),
+            description: "Read agent storage. args: key, optional scope=session|durable.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"key":{"type":"string"},"scope":{"type":"string"}},"required":["key"]}"#.to_string(),
+            required: alloc::vec!["key".to_string()],
+            binding: ToolBinding::AgentStorage,
+        },
+        ToolDef {
+            name: "storage_set".to_string(),
+            description: "Write agent storage. args: key, value, optional scope=session|durable.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"scope":{"type":"string"}},"required":["key","value"]}"#.to_string(),
+            required: alloc::vec!["key".to_string(), "value".to_string()],
+            binding: ToolBinding::AgentStorage,
+        },
+        ToolDef {
+            name: "storage_list".to_string(),
+            description: "List agent storage keys. optional scope=session|durable.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"scope":{"type":"string"}}}"#.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::AgentStorage,
+        },
+        ToolDef {
+            name: "storage_remove".to_string(),
+            description: "Remove an agent storage key. optional scope=session|durable.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"key":{"type":"string"},"scope":{"type":"string"}},"required":["key"]}"#.to_string(),
+            required: alloc::vec!["key".to_string()],
+            binding: ToolBinding::AgentStorage,
+        },
         ToolDef {
             name: "todo_write".to_string(),
             description: "Replace the session todo list from a structured payload.".to_string(),

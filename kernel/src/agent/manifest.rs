@@ -359,6 +359,8 @@ pub fn primitives_for(caps: &[CapabilityRequest]) -> Vec<PrimitiveId> {
                 }
                 if c.rights.contains(Rights::WRITE) {
                     prims.push(registry::UI_DRAW);
+                    prims.push(registry::BOARD_SET);
+                    prims.push(registry::BOARD_MARK);
                 }
                 if c.rights.contains(Rights::DELETE) {
                     prims.push(registry::UI_SURFACE_CLOSE);

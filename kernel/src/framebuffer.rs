@@ -4378,6 +4378,46 @@ pub fn focus_set(action: bool) {
 
 /// Which pane a click at `(x, y)` landed in: `Some(true)` = action pane,
 /// `Some(false)` = chat pane, `None` = neither (status bar / margins).
+/// Map a screen click into the active surface's logical coordinates
+/// (`synapse::ui` SURF_W×SURF_H), accounting for letterboxing. `None` if the
+/// action pane is not showing a surface or the click is outside the painted
+/// frame.
+pub fn surface_hit(mx: u64, my: u64) -> Option<(u32, u16, u16)> {
+    SCREEN.with(|slot| {
+        let sc = slot.as_ref()?;
+        let id = match sc.right {
+            RightMode::Surface(id) => id,
+            _ => return None,
+        };
+        let (px, py) = (sc.logs.ix, sc.logs.iy);
+        let (pw, ph) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
+        if pw == 0 || ph == 0 || mx < px || my < py || mx >= px + pw || my >= py + ph {
+            return None;
+        }
+        // Same aspect-fit as present_surface (sw=256, sh=192).
+        let (sw, sh) = (256u64, 192u64);
+        let (dw, dh) = {
+            let fit_w = pw;
+            let fit_h = sh.saturating_mul(pw).saturating_div(sw).max(1);
+            if fit_h <= ph {
+                (fit_w, fit_h)
+            } else {
+                let fit_h = ph;
+                let fit_w = sw.saturating_mul(ph).saturating_div(sh).max(1);
+                (fit_w.min(pw), fit_h)
+            }
+        };
+        let ox = px + (pw.saturating_sub(dw)) / 2;
+        let oy = py + (ph.saturating_sub(dh)) / 2;
+        if mx < ox || my < oy || mx >= ox + dw || my >= oy + dh {
+            return None;
+        }
+        let sx = ((mx - ox) * sw / dw) as u16;
+        let sy = ((my - oy) * sh / dh) as u16;
+        Some((id, sx, sy))
+    })
+}
+
 pub fn pane_hit(x: u64, y: u64) -> Option<bool> {
     SCREEN.with(|slot| {
         slot.as_ref().and_then(|sc| {

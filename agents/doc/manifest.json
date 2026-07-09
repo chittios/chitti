@@ -2,7 +2,7 @@
   "name": "doc",
   "version": "1.0.0",
   "kind": "service",
-  "description": "Serves the Chitti OS documentation: maps a request path to a file it reads from its own install folder.",
+  "description": "Serves the Chitti OS documentation via assets/tools.wasm (route_request); model SOUL is fallback only.",
   "toolset": [
     "channel_read",
     "channel_write",
@@ -25,6 +25,14 @@
       "scope": "home"
     }
   ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "exports": {
+      "route_request": { "func": "route_request" }
+    },
+    "memory_pages": 16,
+    "fuel": 500000
+  },
   "service": "doc",
   "autostart": false,
   "default_port": 8080

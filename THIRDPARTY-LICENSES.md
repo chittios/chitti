@@ -55,6 +55,22 @@ Full license texts ship in each crate's source under
 
 ---
 
+## wasmi — crates.io (WebAssembly interpreter)
+
+Agent-authored tools (`assets/tools.wasm`) run on
+[wasmi](https://github.com/wasmi-labs/wasmi) 0.40 — a pure-Rust, `no_std` +
+alloc WebAssembly **interpreter** (not a JIT). Fuel metering and
+`ResourceLimiter` bound instruction count and linear memory; guests may only
+touch the world through capability-gated host imports registered by
+`kernel/src/agent/wasm_rt.rs`. wasmi and its crates (`wasmi_core`,
+`wasmi_ir`, `wasmi_collections`, `wasmparser`, `libm`, `spin`, …) resolve from
+crates.io.
+
+Licensed under **MIT OR Apache-2.0**. Full license texts ship in each crate's
+source under `~/.cargo/registry/` and upstream.
+
+---
+
 ## minimp3 (Rust port) — `kernel/src/audio/mp3.rs`
 
 The `/open <file>.mp3` player's MPEG Layer III decoder is a hand-written

@@ -498,11 +498,29 @@ the next command still runs) and a unit test on the pure poll logic
   splitting + SPS/PPS parse → geometry/profile/entropy mode). `video::probe`
   reports a stream (container, codec, `W×H`, frame count, CAVLC/CABAC) without
   decoding pixels; `/open clip.mp4` shows it. Scope: **H.264 baseline** (I/P
-  slices, CAVLC, 4:2:0) **plus Main/High CABAC** (see above). **Remaining:**
-  the **AAC-LC audio decoder** + playback sync (demux done; in progress in a
-  parallel effort), HLS/TS demux, 720p CABAC decode speed (bit-serial engine
-  ≈ 50 ms/frame host-native; SIMD/multicore is the designated perf step), and
-  the multi-pane split + tab drag-drop. NB: the e2e stdlib muxer writes no
+  slices, CAVLC, 4:2:0) **plus Main/High CABAC** (see above).
+  **Playback performance (all profiled first — `sample` on the host harness,
+  `video: perf:` ktrace in-kernel):** in-kernel 1080p went 12 → **~30 fps**,
+  4K ~8–10 fps, via three stacked levers: (1) **NEON luma MC** in
+  `third_party/rust_h264/inter_pred.rs` — the 6-tap interpolator was 40% of
+  decode; all vector loads/stores are inline-asm `ldr/str d/q` (`ld8/st8/
+  ld16i/st16i` — the `+strict-align` rule; the asm loads beat the `vld1`
+  intrinsics even host-side), and every hv quarter-pel case runs h-FIR once
+  per row into an i16 block buffer instead of six FIRs per pixel (bit-exact:
+  full-clip A/B byte-identity + PyAV); (2) **decode-ahead** — the pump loans
+  the `StreamDecoder` to an SMP worker (`smp::async_submit`, the reserved
+  last slot; dispatchers exclude it via `fleet_workers` + zero its ranges) and
+  holds the finished frame until its pts (`VideoPlayer::ahead`); every other
+  `dec` toucher joins first (`video_job_join`) — beware pipeline bubbles: the
+  worker must be resubmitted on the same tick it's collected; (3)
+  **frame-drop** (`sample_is_nonref`, pure + unit-tested): behind the clock,
+  non-reference backlog samples are never fed to the decoder at all — but
+  catch up in ≤2-frame steps; one giant hurry-jump decodes every backlog
+  reference in one job and starves presentation (4K: 8 → 3 fps).
+  **Remaining:** the **AAC-LC audio decoder** + playback sync (demux done; in
+  progress in a parallel effort), HLS/TS demux, 4K ≥ 15 fps (needs parallel
+  reconstruction — slice-parallel + independent non-ref B's; CABAC parse is
+  the serial floor), and the multi-pane split + tab drag-drop. NB: the e2e stdlib muxer writes no
   `ctts`, so its B-frame clips carry no display-reorder info — e2e CABAC clips
   use `--bframes 0`; the in-kernel fixture decodes an I/P/B clip in decode
   order and a media-key rule: a focused-but-stopped video tab must not eat

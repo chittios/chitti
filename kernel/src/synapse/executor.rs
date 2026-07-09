@@ -486,6 +486,31 @@ fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> Str
                 Err(e) => format!("error:{e:?}"),
             }
         }
+        registry::BOARD_SET => {
+            let surface = arg_uint(args, 0) as u32;
+            let fen = arg_str(args, 1);
+            match super::ui::board_set(caller, surface, fen) {
+                Ok(n) => format!("ok:drew={n}"),
+                Err(super::ui::DrawErr::NotOwner) => {
+                    cap::record_denial(caller, "board_set (not surface owner)");
+                    "error:not_surface_owner".to_string()
+                }
+                Err(e) => format!("error:{e:?}"),
+            }
+        }
+        registry::BOARD_MARK => {
+            let surface = arg_uint(args, 0) as u32;
+            let squares = arg_str(args, 1);
+            let color = arg_str(args, 2);
+            match super::ui::board_mark(caller, surface, squares, color) {
+                Ok(n) => format!("ok:drew={n}"),
+                Err(super::ui::DrawErr::NotOwner) => {
+                    cap::record_denial(caller, "board_mark (not surface owner)");
+                    "error:not_surface_owner".to_string()
+                }
+                Err(e) => format!("error:{e:?}"),
+            }
+        }
         other => format!("error:unimplemented primitive id {other}"),
     }
 }

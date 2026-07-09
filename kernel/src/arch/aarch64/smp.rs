@@ -297,6 +297,81 @@ fn enable_wfe_event_stream() {
     }
 }
 
+// --- fire-and-forget async job (one slot) ------------------------------------
+//
+// A long-running task (tens of ms — video decode-ahead) must not ride the
+// matvec barrier: it would stall inference for its whole duration. Instead the
+// **last** worker slot can be temporarily reserved for one async job; the
+// dispatchers exclude it from the fleet while the job is active. Submission
+// and matvec dispatch both happen on the BSP, so there is no submit/dispatch
+// race by construction.
+
+const ASYNC_IDLE: usize = 0;
+const ASYNC_SUBMITTED: usize = 1;
+const ASYNC_DONE: usize = 2;
+static ASYNC_STATE: AtomicUsize = AtomicUsize::new(ASYNC_IDLE);
+static ASYNC_FN: AtomicUsize = AtomicUsize::new(0);
+static ASYNC_CTX: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static ASYNC_SLOT: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Submit `f(ctx)` to run once on the reserved worker. `false` (caller runs it
+/// synchronously instead) when there are no usable workers or a job is already
+/// active. BSP-only.
+///
+/// # Safety
+/// `ctx` must stay valid and untouched by the caller until [`async_take_done`]
+/// returns true; `f` must be safe to run on another core with that contract.
+pub unsafe fn async_submit(f: unsafe fn(*mut u8), ctx: *mut u8) -> bool {
+    let workers = fleet_workers();
+    if workers == 0 || ASYNC_STATE.load(Ordering::Acquire) != ASYNC_IDLE {
+        return false;
+    }
+    ASYNC_FN.store(f as usize, Ordering::Relaxed);
+    ASYNC_CTX.store(ctx, Ordering::Relaxed);
+    ASYNC_SLOT.store(workers - 1, Ordering::Relaxed);
+    ASYNC_STATE.store(ASYNC_SUBMITTED, Ordering::Release);
+    signal_workers();
+    true
+}
+
+/// Poll for completion; consumes the done state (job slot returns to the
+/// fleet). BSP-only.
+pub fn async_take_done() -> bool {
+    if ASYNC_STATE.load(Ordering::Acquire) == ASYNC_DONE {
+        ASYNC_STATE.store(ASYNC_IDLE, Ordering::Release);
+        return true;
+    }
+    false
+}
+
+/// True while an async job is submitted or running (its slot is reserved).
+pub fn async_active() -> bool {
+    ASYNC_STATE.load(Ordering::Acquire) != ASYNC_IDLE
+}
+
+/// Workers available to the barrier fleet: the async slot (always the last)
+/// drops out while a job is active. Dispatchers must also zero the excluded
+/// slot's row range so a late generation-claim by that worker no-ops.
+fn fleet_workers() -> usize {
+    let w = active_workers();
+    if w > 0 && async_active() {
+        w - 1
+    } else {
+        w
+    }
+}
+
+/// Retract row ranges of slots the current dispatch does not use, so a worker
+/// that joins late (e.g. finishing an async job mid-generation) computes
+/// nothing instead of stale ranges against fresh operands.
+fn clear_unused_slots(used: usize) {
+    let total = N_WORKERS.load(Ordering::Relaxed).min(MAX_CPUS);
+    for s in used..total {
+        JOB.row_start[s].store(0, Ordering::Relaxed);
+        JOB.row_end[s].store(0, Ordering::Relaxed);
+    }
+}
+
 /// How long the barrier waits for all workers before treating a slot as a
 /// straggler. Generations complete in µs–ms; 500 ms of silence means the wake
 /// never happened (or the host scheduler is pathologically starved).
@@ -380,6 +455,25 @@ fn worker_loop(slot: usize) -> ! {
     enable_wfe_event_stream();
     let mut last = 0u64;
     loop {
+        // Long-running fire-and-forget job addressed to this slot (video
+        // decode-ahead). Runs outside the barrier fleet: while it is active
+        // the dispatchers exclude this slot (see `async_reserved`).
+        if ASYNC_STATE.load(Ordering::Acquire) == ASYNC_SUBMITTED && ASYNC_SLOT.load(Ordering::Relaxed) == slot {
+            let f = ASYNC_FN.load(Ordering::Relaxed);
+            let ctx = ASYNC_CTX.load(Ordering::Relaxed);
+            if f != 0 {
+                let t0 = super::cycle_count();
+                // SAFETY: the submitter published fn/ctx before the state
+                // (release) and won't touch ctx again until it observes DONE.
+                unsafe {
+                    let f: unsafe fn(*mut u8) = core::mem::transmute(f);
+                    f(ctx);
+                }
+                add_busy(slot + 1, super::cycle_count().wrapping_sub(t0));
+            }
+            ASYNC_STATE.store(ASYNC_DONE, Ordering::Release);
+            continue;
+        }
         let g = JOB.go.load(Ordering::Acquire);
         if g == last {
             // SAFETY: `wfe` just parks until an event/IRQ; spurious wakes are
@@ -448,7 +542,7 @@ pub unsafe fn matmul_sdot(
     n_rows: usize,
     n_cols: usize,
 ) {
-    let workers = active_workers();
+    let workers = fleet_workers();
     if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
         // SAFETY: caller's contract; whole range on this core.
         unsafe { tensor::matmul_q8_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, n_rows, n_cols) };
@@ -471,6 +565,7 @@ pub unsafe fn matmul_sdot(
         JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
     }
     // Release the job: bump the generation (BSP is the only writer of `go`).
+    clear_unused_slots(workers);
     let g = JOB.go.load(Ordering::Relaxed) + 1;
     JOB.go.store(g, Ordering::Release);
     signal_workers(); // wake WFE-parked workers
@@ -495,7 +590,7 @@ pub unsafe fn matmul_sdot(
 /// # Safety
 /// Same contract as `tensor::matvec_quant_rows` over `[0, n_rows)`.
 pub unsafe fn matvec_quant(qt: u32, w: *const u8, x: *const f32, y: *mut f32, n_rows: usize, n_cols: usize) {
-    let workers = active_workers();
+    let workers = fleet_workers();
     if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
         // SAFETY: caller's contract; whole range on this core.
         unsafe { tensor::matvec_quant_rows(qt, w, x, y, 0, n_rows, n_cols) };
@@ -514,6 +609,7 @@ pub unsafe fn matvec_quant(qt: u32, w: *const u8, x: *const f32, y: *mut f32, n_
         JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
         JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
     }
+    clear_unused_slots(workers);
     let g = JOB.go.load(Ordering::Relaxed) + 1;
     JOB.go.store(g, Ordering::Release);
     signal_workers(); // wake WFE-parked workers
@@ -533,7 +629,7 @@ pub unsafe fn matvec_quant(qt: u32, w: *const u8, x: *const f32, y: *mut f32, n_
 /// # Safety
 /// Same contract as `tensor::matvec_q4_0_sdot_rows` over `[0, n_rows)`.
 pub unsafe fn matvec_q4_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, n_rows: usize, n_cols: usize) {
-    let workers = active_workers();
+    let workers = fleet_workers();
     if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
         // SAFETY: caller's contract; whole range on this core.
         unsafe { tensor::matvec_q4_0_sdot_rows(w, xq, xs, y, 0, n_rows, n_cols) };
@@ -551,6 +647,7 @@ pub unsafe fn matvec_q4_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
         JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
         JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
     }
+    clear_unused_slots(workers);
     let g = JOB.go.load(Ordering::Relaxed) + 1;
     JOB.go.store(g, Ordering::Release);
     signal_workers(); // wake WFE-parked workers
@@ -576,7 +673,7 @@ pub unsafe fn parallel_for(
     f: unsafe fn(usize, usize, *mut u8),
     ctx: *mut u8,
 ) {
-    let workers = active_workers();
+    let workers = fleet_workers();
     if workers == 0 || n < min_chunk.saturating_mul(2).max(16) {
         f(0, n, ctx);
         return;
@@ -590,6 +687,7 @@ pub unsafe fn parallel_for(
         JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
         JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
     }
+    clear_unused_slots(workers);
     let g = JOB.go.load(Ordering::Relaxed) + 1;
     JOB.go.store(g, Ordering::Release);
     signal_workers();
@@ -608,7 +706,7 @@ pub unsafe fn parallel_for(
 /// # Safety
 /// Same contract as `tensor::matvec_q4_k_sdot_rows` over `[0, n_rows)`.
 pub unsafe fn matvec_q4_k_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, n_rows: usize, n_cols: usize) {
-    let workers = active_workers();
+    let workers = fleet_workers();
     if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
         // SAFETY: caller's contract; whole range on this core.
         unsafe { tensor::matvec_q4_k_sdot_rows(w, xq, xs, y, 0, n_rows, n_cols) };
@@ -626,6 +724,7 @@ pub unsafe fn matvec_q4_k_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
         JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
         JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
     }
+    clear_unused_slots(workers);
     let g = JOB.go.load(Ordering::Relaxed) + 1;
     JOB.go.store(g, Ordering::Release);
     signal_workers(); // wake WFE-parked workers

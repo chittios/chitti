@@ -1069,10 +1069,9 @@ def _content_length_ok(resp):
 def s_doc_pipeline(g):
     # Prove the full multi-agent path round-trips a valid HTTP response: the
     # Network agent relays the socket bytes, the HTTP agent parses + formats, and
-    # the Doc agent responds. WITHOUT a model the Doc agent can't plan a route and
-    # returns a well-formed 503 (still exercising all three agents); WITH a model
-    # it serves the page (see the --slow doc_website scenario). Either way the
-    # response must be a well-formed HTTP/1.1 message with a matching Content-Length.
+    # the Doc agent responds via assets/tools.wasm (route_request) — no model
+    # required. Response must be well-formed HTTP/1.1 with matching Content-Length.
+    # (doc_website --slow still checks model fallback when present.)
     #
     # Also proves loopback: the SAME server is reached from the OS *itself* over
     # 127.0.0.1 and by the name `localhost` — the guest `/http` client connects
@@ -1106,9 +1105,9 @@ def s_doc_pipeline(g):
 
 
 def s_doc_website(g):
-    # --slow (needs the model): with the model loaded, the Doc agent's model
-    # PLANS the route from its SOUL — GET / → it chooses index.html, GET /docs →
-    # docs.html — and the read runs through the scope-gated file tool call.
+    # Doc agent ships tools.wasm: GET / → index.html, GET /docs → docs.html
+    # without a model (deterministic route_request). Scope-gated asset read still
+    # applies. Works on the fast path; --slow group may still run this.
     g.send(f"/agents start doc {SVC_HTTP_PORT}")
     g.wait_for("web pipeline network->http->server", 15)
     time.sleep(0.6)
@@ -1125,7 +1124,7 @@ def s_doc_website(g):
         and b"Documentation" in docs
         and _content_length_ok(docs)
     )
-    return ok, "model-planned routing served index.html + docs.html" if ok else f"model did not serve the pages (home={home[:60]!r})"
+    return ok, "wasm route_request served index.html + docs.html" if ok else f"did not serve the pages (home={home[:60]!r})"
 
 
 def s_agents_search(g):

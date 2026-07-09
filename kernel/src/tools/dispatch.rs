@@ -11,7 +11,7 @@
 //! wired yet" error rather than doing anything unsafe.
 
 use crate::agent::agent_loop::{ToolDispatch, ToolOutcome};
-use crate::agent::orchestrator::{synapse_call, to_taint};
+use crate::agent::orchestrator::{synapse_call, synapse_call_for, to_taint};
 use crate::agent::types::{CapDomain, Provenance, Rights, Scope, Session, ToolCall};
 use crate::cap;
 use crate::security::taint::Justification;
@@ -131,7 +131,8 @@ impl ToolDispatch for Router {
                     pairs.push((prim_key.as_str(), v));
                 }
                 let borrowed: alloc::vec::Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
-                self.run_synapse(session, caller, &synapse_call(primitive, &borrowed))
+                // UINT surface ids etc. must be bare digits in the wire JSON.
+                self.run_synapse(session, caller, &synapse_call_for(primitive, &borrowed))
             }
             ToolBinding::StoreQuery { kind } => self.call_store_query(session, caller, call, *kind),
             ToolBinding::SessionTodo => {
@@ -218,6 +219,15 @@ impl ToolDispatch for Router {
                     // Recalled facts are durable agent state the human installed
                     // into the agent's home — treat as system-trusted content
                     // (same as a skill body), not untrusted web ingest.
+                    ToolOutcome::ok(out, Provenance::SystemTrusted)
+                }
+            }
+            ToolBinding::AgentStorage => {
+                let agent_id = session.agent.manifest_id.0;
+                let out = crate::agent::storage::run_tool(agent_id, &call.tool, &call.args);
+                if out.starts_with("error:") {
+                    ToolOutcome::error(out)
+                } else {
                     ToolOutcome::ok(out, Provenance::SystemTrusted)
                 }
             }
