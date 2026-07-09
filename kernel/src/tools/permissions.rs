@@ -197,6 +197,19 @@ pub fn is_readonly_tool(name: &str) -> bool {
         Some(ToolBinding::AgentStorage) => {
             matches!(name, "storage_get" | "storage_list")
         }
+        // Media open/control is local UI (not network); auto-allow like list.
+        Some(ToolBinding::Media) => {
+            matches!(
+                name,
+                "draw_image"
+                    | "image_control"
+                    | "audio_player"
+                    | "audio_control"
+                    | "video_player"
+                    | "video_control"
+                    | "media_status"
+            )
+        }
         Some(ToolBinding::SessionTodo) | Some(ToolBinding::LoadSkill) => true,
         Some(ToolBinding::McpResources { kind: McpResourceKind::List }) => true,
         Some(ToolBinding::McpResources { kind: McpResourceKind::Read }) => true,

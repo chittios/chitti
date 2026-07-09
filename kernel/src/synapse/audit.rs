@@ -52,17 +52,40 @@ pub struct Entry {
 
 static LOG: Locked<Vec<Entry>> = Locked::new(Vec::new());
 
+/// ktrace-mirror coalescing state: how many consecutive entries identical to
+/// the last-printed one (all fields but `seq`) have been suppressed. The
+/// **log itself records every entry** — only the serial/ring mirror collapses
+/// runs, so a polling loop can't drown the human-facing trace (a UI event
+/// pump once emitted ~1000 identical lines/second; see `service::ui_agent`).
+static REPEATS: Locked<(Option<Entry>, u64)> = Locked::new((None, 0));
+
 /// Append one record and return its sequence number. The *only* way to
 /// modify the log -- there is no edit or delete path.
 pub fn record(caller: crate::sched::TaskId, primitive: &'static str, args_hash: u64, outcome: Outcome, result_hash: u64) -> u64 {
-    LOG.with(|log| {
+    let seq = LOG.with(|log| {
         let seq = log.len() as u64;
         log.push(Entry { seq, caller, primitive, args_hash, outcome, result_hash });
+        seq
+    });
+    let e = Entry { seq, caller, primitive, args_hash, outcome, result_hash };
+    REPEATS.with(|(last, n)| {
+        let same = last.map(|l| {
+            l.caller == e.caller && l.primitive == e.primitive && l.args_hash == e.args_hash && l.outcome == e.outcome && l.result_hash == e.result_hash
+        }).unwrap_or(false);
+        if same && *n < 4096 {
+            *n += 1;
+            return; // suppressed; summarised when the run breaks
+        }
+        if *n > 0 {
+            crate::ktrace::log_fmt(format_args!("synapse.audit: (previous entry repeated {n} more times, through #{})", seq - 1));
+        }
+        *last = Some(e);
+        *n = 0;
         crate::ktrace::log_fmt(format_args!(
             "synapse.audit #{seq}: caller={caller} primitive={primitive} args={args_hash:#018x} outcome={outcome:?} result={result_hash:#018x}"
         ));
-        seq
-    })
+    });
+    seq
 }
 
 /// Number of entries recorded so far.
@@ -106,5 +129,21 @@ mod tests {
         assert_eq!(&after[..before.len()], &before[..], "existing entries changed after append");
         assert_eq!(after[before.len()].primitive, "console_write");
         assert_eq!(after[before.len() + 1].outcome, Outcome::Executed);
+    }
+
+    #[test_case]
+    fn repeated_entries_all_recorded_despite_ktrace_coalescing() {
+        // The ktrace mirror collapses identical runs, but the log itself must
+        // record every entry — a polling loop's audit trail stays complete.
+        let before = len();
+        for _ in 0..10 {
+            record(9, "ui_event_poll", 0xaa, Outcome::Executed, 0xbb);
+        }
+        assert_eq!(len(), before + 10, "every repeat must append to the log");
+        let snap = snapshot();
+        for (i, e) in snap[before..].iter().enumerate() {
+            assert_eq!(e.seq, (before + i) as u64);
+            assert_eq!(e.primitive, "ui_event_poll");
+        }
     }
 }

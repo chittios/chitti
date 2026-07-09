@@ -153,6 +153,15 @@ pub fn checksum(id: u32) -> Option<u64> {
     })
 }
 
+/// True if surface `id` has queued input events. **Upkeep pacing only** — it
+/// grants nothing: events are still consumed exclusively through the
+/// capability-gated `ui_event_poll` primitive (audited per drain). Without
+/// this peek the pump had to no-op poll through the capability layer at
+/// upkeep rate, flooding the audit log with ~1000 identical entries/second.
+pub fn has_events(id: u32) -> bool {
+    SURFACES.with(|m| m.get(&id).map(|s| !s.events.is_empty()).unwrap_or(false))
+}
+
 /// Feed an input event to a surface (called by the compositor on a click/key
 /// over the surface's pane). No-op if the surface is gone.
 pub fn push_event(id: u32, ev: UiEvent) {

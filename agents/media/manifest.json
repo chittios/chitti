@@ -1,0 +1,72 @@
+{
+  "name": "media",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Image, audio, and video players in the action pane. Command hook for /open on media extensions; full filesystem access.",
+  "toolset": [
+    "draw_image",
+    "image_control",
+    "audio_player",
+    "audio_control",
+    "video_player",
+    "video_control",
+    "media_status",
+    "read",
+    "list",
+    "glob",
+    "grep",
+    "cat",
+    "ls",
+    "mounts",
+    "memory_add",
+    "memory_get",
+    "memory_list",
+    "ui_surface_request",
+    "ui_draw",
+    "ui_event_poll",
+    "ui_surface_close"
+  ],
+  "capabilities": [
+    {
+      "domain": "fs",
+      "rights": ["read", "write", "list", "delete"],
+      "scope": "any"
+    },
+    {
+      "domain": "ui",
+      "rights": ["exec", "write", "delete"],
+      "scope": "any"
+    },
+    {
+      "domain": "todo",
+      "rights": ["read", "write"],
+      "scope": "any"
+    }
+  ],
+  "command_hooks": [
+    {
+      "command": "/open",
+      "description": "Shell /open routes media paths through this agent (switches chat here and runs the tool below) instead of the bare host player.",
+      "match": {
+        "extensions": [
+          ".png", ".jpg", ".jpeg",
+          ".wav", ".mp3", ".aac",
+          ".mp4", ".mov", ".mkv", ".webm"
+        ]
+      },
+      "dispatch": {
+        ".png": { "tool": "draw_image", "path_arg": "path" },
+        ".jpg": { "tool": "draw_image", "path_arg": "path" },
+        ".jpeg": { "tool": "draw_image", "path_arg": "path" },
+        ".wav": { "tool": "audio_player", "path_arg": "path" },
+        ".mp3": { "tool": "audio_player", "path_arg": "path" },
+        ".aac": { "tool": "audio_player", "path_arg": "path" },
+        ".mp4": { "tool": "video_player", "path_arg": "path" },
+        ".mov": { "tool": "video_player", "path_arg": "path" },
+        ".mkv": { "tool": "video_player", "path_arg": "path" },
+        ".webm": { "tool": "video_player", "path_arg": "path" }
+      }
+    }
+  ],
+  "autostart": false
+}

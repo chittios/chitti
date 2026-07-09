@@ -231,6 +231,15 @@ impl ToolDispatch for Router {
                     ToolOutcome::ok(out, Provenance::SystemTrusted)
                 }
             }
+            ToolBinding::Media => {
+                let out = crate::shell::run_media_tool(&call.tool, &call.args);
+                if out.starts_with("error:") {
+                    ToolOutcome::error(out)
+                } else {
+                    // Paths + playback status are host-side facts (system-trusted).
+                    ToolOutcome::ok(out, Provenance::SystemTrusted)
+                }
+            }
         }
     }
 }

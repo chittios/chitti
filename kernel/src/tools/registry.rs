@@ -46,6 +46,9 @@ pub enum ToolBinding {
     /// Agent session/durable storage (`storage_*`) — localStorage-shaped host
     /// API for UI/WASM agents ([`crate::agent::storage`]).
     AgentStorage,
+    /// Image / audio / video player tools (`draw_image`, `audio_player`,
+    /// `video_player`, …) — host media runtime in the shell action pane.
+    Media,
     /// Path/content query over the capability-scoped store listing (`glob` /
     /// `grep`). Pure matching after a scope-filtered `list`/`read` — no new
     /// Synapse primitive (Gate 2.5 applied per path).
@@ -333,6 +336,57 @@ fn builtins() -> Vec<ToolDef> {
             input_schema: r#"{"type":"object","properties":{"key":{"type":"string"},"scope":{"type":"string"}},"required":["key"]}"#.to_string(),
             required: alloc::vec!["key".to_string()],
             binding: ToolBinding::AgentStorage,
+        },
+        // Media players (action pane) — image / audio / video. Paths may be
+        // store keys, /downloads/…, or mount paths (/mnt/…).
+        ToolDef {
+            name: "draw_image".to_string(),
+            description: "Open an image (.png/.jpg) in the action pane viewer. args: path.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#.to_string(),
+            required: alloc::vec!["path".to_string()],
+            binding: ToolBinding::Media,
+        },
+        ToolDef {
+            name: "image_control".to_string(),
+            description: "Control the image viewer: cmd=zoom_in|zoom_out|rotate_cw|rotate_ccw|reset|pan_up|pan_down|pan_left|pan_right.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}"#.to_string(),
+            required: alloc::vec!["cmd".to_string()],
+            binding: ToolBinding::Media,
+        },
+        ToolDef {
+            name: "audio_player".to_string(),
+            description: "Play audio (.wav/.mp3/.aac) in the action pane. args: path.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#.to_string(),
+            required: alloc::vec!["path".to_string()],
+            binding: ToolBinding::Media,
+        },
+        ToolDef {
+            name: "audio_control".to_string(),
+            description: "Control audio playback: cmd=pause|seek|restart|stop; optional ms for seek (e.g. 5000 or -5000).".to_string(),
+            input_schema: r#"{"type":"object","properties":{"cmd":{"type":"string"},"ms":{"type":"integer"}},"required":["cmd"]}"#.to_string(),
+            required: alloc::vec!["cmd".to_string()],
+            binding: ToolBinding::Media,
+        },
+        ToolDef {
+            name: "video_player".to_string(),
+            description: "Play video (.mp4/.mov/.mkv/.webm H.264) in the action pane. args: path.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#.to_string(),
+            required: alloc::vec!["path".to_string()],
+            binding: ToolBinding::Media,
+        },
+        ToolDef {
+            name: "video_control".to_string(),
+            description: "Control video: cmd=pause|seek|restart|mute|volume; frames for seek; delta for volume (±).".to_string(),
+            input_schema: r#"{"type":"object","properties":{"cmd":{"type":"string"},"frames":{"type":"integer"},"delta":{"type":"integer"}},"required":["cmd"]}"#.to_string(),
+            required: alloc::vec!["cmd".to_string()],
+            binding: ToolBinding::Media,
+        },
+        ToolDef {
+            name: "media_status".to_string(),
+            description: "Report which media (image/audio/video) is loaded in the action pane.".to_string(),
+            input_schema: r#"{"type":"object","properties":{}}"#.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::Media,
         },
         ToolDef {
             name: "todo_write".to_string(),

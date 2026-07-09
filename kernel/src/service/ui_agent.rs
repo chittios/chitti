@@ -57,6 +57,9 @@ const SELECT_COLOR: &str = "cc785c";
 
 static AGENT: Locked<Option<UiAgentState>> = Locked::new(None);
 static RUNNING: AtomicBool = AtomicBool::new(false);
+/// Last busy-loader repaint (ms) — caps the loader redraw (an audited
+/// `ui_draw`) to its animation period instead of every upkeep tick.
+static LAST_LOADER_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static ACTIVE_SURFACE: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_TASK: AtomicU64 = AtomicU64::new(0);
 
@@ -325,21 +328,37 @@ pub fn status_line() -> Option<String> {
 }
 
 /// Pump events from the surface queue (called from shell upkeep).
+///
+/// Pacing matters here: upkeep runs at ~kHz, and every `ui_event_poll` through
+/// the capability layer is a Synapse round-trip **plus an audit entry** — the
+/// unpaced version flooded the audit log with a thousand identical no-op polls
+/// per second. The pump now peeks the queue natively (`synapse::ui::has_events`,
+/// grants nothing) and only drains through the audited primitive when events
+/// actually exist; the busy-loader repaint is capped to its animation period.
 pub fn tick() {
     if !RUNNING.load(Ordering::Relaxed) {
-        return;
-    }
-    // While a model turn is in flight: animate the loader and **drop** all
-    // input so clicks/keys cannot nest turns.
-    if AGENT.with(|a| a.as_ref().map(|s| s.busy).unwrap_or(false)) {
-        paint_loader_overlay();
-        drain_events_discard();
         return;
     }
     let (task, surface) = match AGENT.with(|a| a.as_ref().map(|s| (s.task, s.surface))) {
         Some(x) => x,
         None => return,
     };
+    // While a model turn is in flight: animate the loader and **drop** all
+    // input so clicks/keys cannot nest turns.
+    if AGENT.with(|a| a.as_ref().map(|s| s.busy).unwrap_or(false)) {
+        let now = crate::arch::now_ms();
+        if now.saturating_sub(LAST_LOADER_MS.load(Ordering::Relaxed)) >= 100 {
+            LAST_LOADER_MS.store(now, Ordering::Relaxed);
+            paint_loader_overlay();
+        }
+        if crate::synapse::ui::has_events(surface) {
+            drain_events_discard();
+        }
+        return;
+    }
+    if !crate::synapse::ui::has_events(surface) {
+        return;
+    }
     for _ in 0..4 {
         let raw = format!(r#"{{"name":"ui_event_poll","arguments":{{"surface":{surface}}}}}"#);
         let out = syn_exec(task, &raw);
@@ -376,21 +395,56 @@ fn drain_events_discard() {
     }
 }
 
-/// Animated bottom strip while the agent model turn runs (loader tool chrome).
+/// Full-surface grayed scrim + circular spinner while a model turn runs.
+///
+/// Draw DSL has no alpha, so the "disabled" look is a solid dim overlay that
+/// covers the whole surface (board still restored when `busy` clears via
+/// [`repaint_board_chrome`]). The spinner is 12 dots on a ring; one terracotta
+/// arc advances with time.
 fn paint_loader_overlay() {
     let (task, surface) = match AGENT.with(|a| a.as_ref().map(|s| (s.task, s.surface))) {
         Some(x) => x,
         None => return,
     };
-    let phase = ((crate::arch::now_ms() / 120) % 5) as i32;
-    // Board is 192px tall (8×24); use the right margin strip under the board
-    // for a simple indeterminate progress bar (no text draw op).
-    let y = 192 - 20;
-    let mut ops = format!("rect 0 {y} 256 20 1a1816; ");
-    let bx = 24 + phase * 44;
-    ops.push_str(&format!("rect {bx} {} 36 10 cc785c; ", y + 5));
-    // Subtle track
-    ops.push_str(&format!("rect 20 {} 216 2 3a3632; ", y + 9));
+    // Keep the board underneath the scrim when we first enter busy (each tick
+    // only needs the overlay; start-of-turn already board_set's the position).
+    // Full dim overlay — entire surface disabled.
+    let mut ops = alloc::string::String::from("rect 0 0 256 192 2c2926; ");
+
+    // 12 positions around a circle (r≈20), integer offsets from center (128, 96).
+    // order = clockwise from top so phase walks the ring.
+    const RING: [(i32, i32); 12] = [
+        (0, -20),
+        (10, -17),
+        (17, -10),
+        (20, 0),
+        (17, 10),
+        (10, 17),
+        (0, 20),
+        (-10, 17),
+        (-17, 10),
+        (-20, 0),
+        (-17, -10),
+        (-10, -17),
+    ];
+    let phase = ((crate::arch::now_ms() / 90) % 12) as usize;
+    let (cx, cy) = (128i32, 96i32);
+    // Soft track ring (dim dots).
+    for (i, (dx, dy)) in RING.iter().enumerate() {
+        let x = cx + dx - 2;
+        let y = cy + dy - 2;
+        // Head + trailing arc: head terracotta, near-head warm, rest muted.
+        let dist = (i + 12 - phase) % 12;
+        let color = match dist {
+            0 => "cc785c", // brand head
+            1 => "a86850",
+            2 => "7a5040",
+            _ => "4a4540",
+        };
+        ops.push_str(&alloc::format!("rect {x} {y} 5 5 {color}; "));
+    }
+    // Inner hub (subtle, marks center).
+    ops.push_str("rect 124 92 8 8 3a3632; ");
     call_ui_draw(task, surface, &ops);
 }
 

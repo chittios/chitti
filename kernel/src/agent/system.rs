@@ -86,11 +86,53 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
             include_bytes!("../../../agents/chess/assets/tools.wasm"),
         )],
     },
+    // Media agent: image / audio / video tools with full filesystem access.
+    SystemAgentDef {
+        name: "media",
+        soul: include_str!("../../../agents/media/SOUL.md"),
+        manifest_json: include_str!("../../../agents/media/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 4),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 4),
+        assets: &[],
+        binary_assets: &[],
+    },
 ];
 
 /// The install-folder path (`/agent/<id>`) of a system agent by name.
 pub fn home_for(name: &str) -> Option<String> {
     SYSTEM_AGENTS.iter().find(|d| d.name == name).map(|d| crate::agent::home::path(d.agent_id.0))
+}
+
+/// One extension → tool mapping under a [`CommandHook`].
+#[derive(Clone, Debug)]
+pub struct HookDispatch {
+    /// Tool name to invoke (e.g. `audio_player`).
+    pub tool: String,
+    /// JSON arg key for the path (default `path`).
+    pub path_arg: String,
+}
+
+/// A shell command interception declared by a package (e.g. media owns `/open`
+/// for media extensions). Parsed from manifest `command_hooks`.
+#[derive(Clone, Debug)]
+pub struct CommandHook {
+    /// Slash command, e.g. `"/open"`.
+    pub command: String,
+    pub description: String,
+    /// File extensions this hook matches (lowercase, with leading `.`).
+    pub extensions: Vec<String>,
+    /// Per-extension tool dispatch (key = extension).
+    pub dispatch: alloc::collections::BTreeMap<String, HookDispatch>,
+}
+
+/// Result of resolving a path against installed agents' command hooks.
+#[derive(Clone, Debug)]
+pub struct OpenHookMatch {
+    pub agent_name: &'static str,
+    pub agent_id: u64,
+    pub tool: String,
+    pub path_arg: String,
+    pub extension: String,
 }
 
 /// The parsed, portable part of a system agent's `manifest.json`.
@@ -104,6 +146,8 @@ pub struct ParsedManifest {
     pub default_port: u16,
     pub autostart: bool,
     pub mcp_servers: Vec<crate::agent::types::McpServerSpec>,
+    /// Shell command hooks (`/open`, …) this package claims.
+    pub command_hooks: Vec<CommandHook>,
 }
 
 fn parse_domain(s: &str) -> Option<CapDomain> {
@@ -203,6 +247,7 @@ pub fn parse_manifest(json: &str) -> Option<ParsedManifest> {
             }
         }
     }
+    let command_hooks = parse_command_hooks(&j);
     Some(ParsedManifest {
         name: j.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         version: j.get("version").and_then(|v| v.as_str()).unwrap_or("0.0.0").to_string(),
@@ -213,7 +258,155 @@ pub fn parse_manifest(json: &str) -> Option<ParsedManifest> {
         default_port: j.get("default_port").and_then(|v| v.as_i64()).unwrap_or(0) as u16,
         autostart: j.get("autostart").and_then(|v| v.as_bool()).unwrap_or(false),
         mcp_servers,
+        command_hooks,
     })
+}
+
+/// Parse `command_hooks` from a package root JSON object.
+fn parse_command_hooks(j: &Json) -> Vec<CommandHook> {
+    let Some(arr) = j.get("command_hooks").and_then(|c| c.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for h in arr {
+        let command = h
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if command.is_empty() {
+            continue;
+        }
+        let description = h
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut extensions = Vec::new();
+        if let Some(exts) = h
+            .get("match")
+            .and_then(|m| m.get("extensions"))
+            .and_then(|e| e.as_array())
+        {
+            for e in exts {
+                if let Some(s) = e.as_str() {
+                    let mut ext = s.to_ascii_lowercase();
+                    if !ext.starts_with('.') {
+                        ext.insert(0, '.');
+                    }
+                    extensions.push(ext);
+                }
+            }
+        }
+        let mut dispatch = alloc::collections::BTreeMap::new();
+        if let Some(Json::Obj(pairs)) = h.get("dispatch") {
+            for (ext_key, rule) in pairs {
+                let mut ext = ext_key.to_ascii_lowercase();
+                if !ext.starts_with('.') {
+                    ext.insert(0, '.');
+                }
+                let tool = rule
+                    .get("tool")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if tool.is_empty() {
+                    continue;
+                }
+                let path_arg = rule
+                    .get("path_arg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("path")
+                    .to_string();
+                dispatch.insert(ext, HookDispatch { tool, path_arg });
+            }
+        }
+        // Fill dispatch from extensions if a single default tool is missing keys.
+        out.push(CommandHook {
+            command,
+            description,
+            extensions,
+            dispatch,
+        });
+    }
+    out
+}
+
+/// File extension of `path` (lowercase, with `.`), or empty if none.
+pub fn path_extension(path: &str) -> String {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    if let Some(dot) = base.rfind('.') {
+        if dot > 0 {
+            return base[dot..].to_ascii_lowercase();
+        }
+    }
+    String::new()
+}
+
+/// Resolve a shell `/open <path>` against system agents' `command_hooks`.
+/// Returns the owning agent + tool when an extension matches a hook for
+/// `command` (normalized to start with `/`).
+pub fn resolve_open_hook(path: &str) -> Option<OpenHookMatch> {
+    resolve_command_hook("/open", path)
+}
+
+/// Generic: resolve `command` + path against all system package hooks.
+pub fn resolve_command_hook(command: &str, path: &str) -> Option<OpenHookMatch> {
+    let cmd = if command.starts_with('/') {
+        command.to_string()
+    } else {
+        alloc::format!("/{command}")
+    };
+    let ext = path_extension(path);
+    if ext.is_empty() {
+        return None;
+    }
+    for def in SYSTEM_AGENTS {
+        let Some(m) = parse_manifest(def.manifest_json) else {
+            continue;
+        };
+        for hook in &m.command_hooks {
+            if hook.command != cmd {
+                continue;
+            }
+            let matches_ext = hook.extensions.iter().any(|e| e == &ext)
+                || hook.dispatch.contains_key(&ext);
+            if !matches_ext {
+                continue;
+            }
+            let disp = hook.dispatch.get(&ext)?;
+            return Some(OpenHookMatch {
+                agent_name: def.name,
+                agent_id: def.agent_id.0,
+                tool: disp.tool.clone(),
+                path_arg: disp.path_arg.clone(),
+                extension: ext,
+            });
+        }
+    }
+    None
+}
+
+/// All `/open` extensions claimed by any system agent (for help text).
+pub fn open_hook_extensions() -> Vec<String> {
+    let mut exts = Vec::new();
+    for def in SYSTEM_AGENTS {
+        let Some(m) = parse_manifest(def.manifest_json) else {
+            continue;
+        };
+        for hook in &m.command_hooks {
+            if hook.command != "/open" {
+                continue;
+            }
+            for e in &hook.extensions {
+                if !exts.iter().any(|x| x == e) {
+                    exts.push(e.clone());
+                }
+            }
+        }
+    }
+    exts.sort();
+    exts
 }
 
 /// The agent's declared capabilities with the `$HOME` sentinel resolved to its
@@ -341,12 +534,38 @@ pub fn install_all(now: Ticks) {
             Err(e) => crate::ktrace::log_fmt(format_args!("system-agent: install '{}' failed: {:?}", def.name, e)),
         }
     }
-    crate::serial_println!("Chitti: system agents installed (doc, ssh, chess) in /agent/");
+    crate::serial_println!("Chitti: system agents installed (doc, ssh, chess, media) in /agent/");
 }
 
 /// The installed system agents, for `/agents list`/display: (name, agent_id).
 pub fn list() -> Vec<(&'static str, u64)> {
     SYSTEM_AGENTS.iter().map(|d| (d.name, d.agent_id.0)).collect()
+}
+
+/// Human-readable command-hook summary for agent `name` (e.g. `"/open media"`),
+/// or empty if the package declares none.
+pub fn command_hook_summary(name: &str) -> String {
+    let Some(def) = SYSTEM_AGENTS.iter().find(|d| d.name == name) else {
+        return String::new();
+    };
+    let Some(m) = parse_manifest(def.manifest_json) else {
+        return String::new();
+    };
+    if m.command_hooks.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = m
+        .command_hooks
+        .iter()
+        .map(|h| {
+            if h.command == "/open" {
+                alloc::format!("{} media", h.command)
+            } else {
+                h.command.clone()
+            }
+        })
+        .collect();
+    parts.join(", ")
 }
 
 #[cfg(test)]
@@ -370,11 +589,62 @@ mod tests {
             assert_eq!(m.name, def.name);
             assert!(!m.capabilities.is_empty(), "{} declares capabilities", def.name);
         }
-        // SOUL-backed system agents: doc + ssh + chess (UI). network/http are
+        // SOUL-backed system agents: doc + ssh + chess + media. network/http are
         // pure service-layer plumbing, not installed agents.
-        assert_eq!(SYSTEM_AGENTS.len(), 3);
+        assert_eq!(SYSTEM_AGENTS.len(), 4);
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "chess"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "media"));
         assert!(!SYSTEM_AGENTS.iter().any(|d| d.name == "network" || d.name == "http"));
+    }
+
+    #[test_case]
+    fn media_manifest_declares_open_command_hook() {
+        let media = SYSTEM_AGENTS.iter().find(|d| d.name == "media").expect("media");
+        let m = parse_manifest(media.manifest_json).expect("media manifest");
+        assert!(
+            !m.command_hooks.is_empty(),
+            "media package must declare command_hooks"
+        );
+        let open = m
+            .command_hooks
+            .iter()
+            .find(|h| h.command == "/open")
+            .expect("/open hook");
+        assert!(open.extensions.iter().any(|e| e == ".mp3"));
+        assert_eq!(
+            open.dispatch.get(".mp3").map(|d| d.tool.as_str()),
+            Some("audio_player")
+        );
+        assert_eq!(
+            open.dispatch.get(".png").map(|d| d.tool.as_str()),
+            Some("draw_image")
+        );
+        assert_eq!(
+            open.dispatch.get(".mp4").map(|d| d.tool.as_str()),
+            Some("video_player")
+        );
+    }
+
+    #[test_case]
+    fn resolve_open_hook_routes_media_extensions() {
+        let h = resolve_open_hook("/downloads/sample.mp3").expect("mp3");
+        assert_eq!(h.agent_name, "media");
+        assert_eq!(h.tool, "audio_player");
+        assert_eq!(h.path_arg, "path");
+        let h = resolve_open_hook("photo.JPEG").expect("jpeg");
+        assert_eq!(h.tool, "draw_image");
+        let h = resolve_open_hook("clip.webm").expect("webm");
+        assert_eq!(h.tool, "video_player");
+        assert!(resolve_open_hook("notes.txt").is_none());
+        assert!(resolve_open_hook("noext").is_none());
+    }
+
+    #[test_case]
+    fn path_extension_extracts_last_suffix() {
+        assert_eq!(path_extension("/a/b/c.mp3"), ".mp3");
+        assert_eq!(path_extension("Foo.PNG"), ".png");
+        assert_eq!(path_extension("nope"), "");
+        assert_eq!(path_extension(".hidden"), "");
     }
 
     #[test_case]

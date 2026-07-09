@@ -225,7 +225,7 @@ pub fn run() -> ! {
                     crate::framebuffer::clear_chat();
                     serial_println!("(chat context + screen cleared)");
                 }
-                "open" | "edit" => run_open(arg),
+                "open" | "edit" => run_open(arg, &mut chat, &mut orch),
                 "surface" => run_surface(arg),
                 // --- agents-as-processes ------------------------------------
                 "agents" => run_agents(arg, &mut chat, &mut orch),
@@ -997,6 +997,8 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
                 ToolBinding::Shell { .. }
                     | ToolBinding::SpawnSubagent
                     | ToolBinding::AgentMemory
+                    | ToolBinding::AgentStorage
+                    | ToolBinding::Media
                     | ToolBinding::Synapse { .. }
                     | ToolBinding::SessionTodo
                     | ToolBinding::StoreQuery { .. }
@@ -1053,6 +1055,9 @@ pub(crate) const CORE_TOOLS: &[&str] = &[
     "datetime",
     "disks",
     "network",
+    "draw_image",
+    "audio_player",
+    "video_player",
 ];
 
 /// `search_tools` — deferred tool discovery (keyword match + `select:<name>`).
@@ -4190,7 +4195,17 @@ fn run_agents(
             }
             serial_println!("agents> system agents (installed in /agent/, start with /agents start <name>):");
             for (name, agent_id) in crate::agent::system::list() {
-                serial_println!("agents>   {:<10} /agent/{}/SOUL.md", name, agent_id);
+                let hooks = crate::agent::system::command_hook_summary(name);
+                if hooks.is_empty() {
+                    serial_println!("agents>   {:<10} /agent/{}/SOUL.md", name, agent_id);
+                } else {
+                    serial_println!(
+                        "agents>   {:<10} /agent/{}/SOUL.md  [command hook: {}]",
+                        name,
+                        agent_id,
+                        hooks
+                    );
+                }
             }
             serial_println!("agents> /agents switch <id> — chat as that agent; /agents kill <id> — terminate");
         }
@@ -4325,7 +4340,7 @@ fn run_agent_start(arg: &str) {
                 Some(h) => h,
                 None => {
                     serial_println!(
-                        "agents> unknown agent '{}' (try: doc, ssh, chess, or an installed server agent)",
+                        "agents> unknown agent '{}' (try: doc, ssh, chess, media, or an installed server agent)",
                         name
                     );
                     return;
@@ -6122,56 +6137,272 @@ fn close_action() {
     }
 }
 
-/// `/open <path>` — edit a store file in the vim-like editor (right pane). If a
-/// config file was written, re-apply it so changes take effect immediately.
-fn run_open(arg: &str) {
+/// Host entry for media tools (`ToolBinding::Media`): image / audio / video
+/// players in the action pane. Paths may be store keys, `/downloads/…`, or
+/// mount paths. Shared by the **media** agent, shell chat, and `/open`.
+pub(crate) fn run_media_tool(name: &str, args_json: &str) -> alloc::string::String {
+    use crate::session::todo::json_str;
+    #[cfg(any(feature = "server", test))]
+    {
+        // Headless / unit-test: validate shapes without real framebuffer/sound.
+        let path = json_str(args_json, "path").unwrap_or_default();
+        let cmd = json_str(args_json, "cmd")
+            .or_else(|| json_str(args_json, "action"))
+            .unwrap_or_default();
+        return match name {
+            "draw_image" | "image_open" | "audio_player" | "audio_open" | "video_player"
+            | "video_open" => {
+                if path.is_empty() {
+                    alloc::string::String::from("error: missing path")
+                } else {
+                    alloc::format!("ok:{name} {path} (stub)")
+                }
+            }
+            "image_control" | "audio_control" | "video_control" => {
+                if cmd.is_empty() {
+                    alloc::string::String::from("error: missing cmd")
+                } else {
+                    alloc::format!("ok:{name} {cmd} (stub)")
+                }
+            }
+            "media_status" => alloc::string::String::from("ok:image=none audio=none video=none"),
+            other => alloc::format!("error:unknown media tool {other}"),
+        };
+    }
+    #[cfg(all(not(feature = "server"), not(test)))]
+    {
+        let path = json_str(args_json, "path").unwrap_or_default();
+        let cmd = json_str(args_json, "cmd")
+            .or_else(|| json_str(args_json, "action"))
+            .unwrap_or_default();
+        match name {
+            "draw_image" | "image_open" => {
+                if path.is_empty() {
+                    return alloc::string::String::from("error: missing path");
+                }
+                view_image(&path);
+                alloc::format!("ok:image opened {path}")
+            }
+            "image_control" => {
+                let c = match cmd.as_str() {
+                    "zoom_in" | "+" | "in" => b'+',
+                    "zoom_out" | "-" | "out" => b'-',
+                    "rotate_cw" | "r" | "cw" => b'r',
+                    "rotate_ccw" | "l" | "ccw" => b'l',
+                    "reset" | "0" => b'0',
+                    "pan_up" | "up" => b'A',
+                    "pan_down" | "down" => b'B',
+                    "pan_right" | "right" => b'C',
+                    "pan_left" | "left" => b'D',
+                    other => {
+                        return alloc::format!(
+                            "error:unknown image cmd '{other}' (zoom_in|zoom_out|rotate_cw|rotate_ccw|reset|pan_*)"
+                        );
+                    }
+                };
+                image_cmd(c);
+                alloc::format!("ok:image {cmd}")
+            }
+            "audio_player" | "audio_open" => {
+                if path.is_empty() {
+                    return alloc::string::String::from("error: missing path");
+                }
+                play_audio(&path);
+                alloc::format!("ok:audio playing {path}")
+            }
+            "audio_control" => {
+                let ms = json_str(args_json, "ms")
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
+                match cmd.as_str() {
+                    "pause" | "play" | "toggle" | "space" => {
+                        audio_toggle_pause();
+                        alloc::string::String::from("ok:audio pause toggled")
+                    }
+                    "seek" => {
+                        let d = if ms != 0 { ms } else { 5000 };
+                        audio_seek(d);
+                        alloc::format!("ok:audio seek {d} ms")
+                    }
+                    "restart" | "0" | "home" => {
+                        audio_restart();
+                        alloc::string::String::from("ok:audio restart")
+                    }
+                    "stop" | "close" => {
+                        stop_audio();
+                        alloc::string::String::from("ok:audio stopped")
+                    }
+                    "mute" | "m" => {
+                        media_toggle_mute();
+                        alloc::string::String::from("ok:mute toggled")
+                    }
+                    "volume" | "vol" => {
+                        let d = json_str(args_json, "delta")
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .unwrap_or(5);
+                        media_volume_adjust(d);
+                        alloc::format!("ok:volume delta {d}")
+                    }
+                    other => alloc::format!(
+                        "error:unknown audio cmd '{other}' (pause|seek|restart|stop|mute|volume)"
+                    ),
+                }
+            }
+            "video_player" | "video_open" => {
+                if path.is_empty() {
+                    return alloc::string::String::from("error: missing path");
+                }
+                play_video(&path);
+                alloc::format!("ok:video playing {path}")
+            }
+            "video_control" => {
+                let frames = json_str(args_json, "frames")
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
+                match cmd.as_str() {
+                    "pause" | "play" | "toggle" | "space" => {
+                        video_toggle_pause();
+                        alloc::string::String::from("ok:video pause toggled")
+                    }
+                    "seek" => {
+                        let d = if frames != 0 { frames } else { 1 };
+                        video_seek(d);
+                        alloc::format!("ok:video seek {d} frames")
+                    }
+                    "restart" | "0" | "home" => {
+                        video_restart();
+                        alloc::string::String::from("ok:video restart")
+                    }
+                    "mute" | "m" => {
+                        media_toggle_mute();
+                        alloc::string::String::from("ok:mute toggled")
+                    }
+                    "volume" | "vol" => {
+                        let d = json_str(args_json, "delta")
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .unwrap_or(5);
+                        media_volume_adjust(d);
+                        alloc::format!("ok:volume delta {d}")
+                    }
+                    other => alloc::format!(
+                        "error:unknown video cmd '{other}' (pause|seek|restart|mute|volume)"
+                    ),
+                }
+            }
+            "media_status" => {
+                let img = IMAGE.with(|s| s.is_some());
+                let aud = audio_loaded();
+                let vid = video_loaded();
+                alloc::format!(
+                    "ok:image={} audio={} video={}",
+                    if img { "loaded" } else { "none" },
+                    if aud { "loaded" } else { "none" },
+                    if vid { "loaded" } else { "none" }
+                )
+            }
+            other => alloc::format!("error:unknown media tool {other}"),
+        }
+    }
+}
+
+/// `/open <path>` — if a system package declares a `command_hooks` entry for
+/// `/open` matching the path's extension, switch to that agent and run its
+/// tool. Otherwise open as text in the editor.
+fn run_open(
+    arg: &str,
+    chat: &mut Option<ChatSession>,
+    orch: &mut crate::agent::orchestrator::Orchestrator,
+) {
     #[cfg(feature = "server")]
     {
-        let _ = arg;
+        let _ = (arg, chat, orch);
         serial_println!("open> unavailable in the server build (no GUI); edit files off-box");
         return;
     }
     #[cfg(not(feature = "server"))]
-    run_open_inner(arg);
+    run_open_inner(arg, chat, orch);
+}
+
+/// Dispatch `/open` via a package command hook: rebind chat to the owning
+/// agent and run the declared tool under its toolset/caps.
+fn open_via_command_hook(
+    path: &str,
+    hook: &crate::agent::system::OpenHookMatch,
+    chat: &mut Option<ChatSession>,
+    orch: &mut crate::agent::orchestrator::Orchestrator,
+) {
+    let path_esc = path.replace('\\', "\\\\").replace('"', "\\\"");
+    let args = alloc::format!(
+        r#"{{"{}":"{path_esc}"}}"#,
+        hook.path_arg
+    );
+
+    if active_agent_id() != hook.agent_id {
+        rebind_chat_agent(hook.agent_id, orch);
+        *chat = None;
+        serial_println!(
+            "open> command hook → agent '{}' ({})  SOUL /agent/{}/SOUL.md  (/agents switch 1 for shell)",
+            hook.agent_name,
+            hook.agent_id,
+            hook.agent_id
+        );
+    }
+
+    let out = execute_chat_tool(&hook.tool, &args, &mut orch.session);
+    if out.starts_with("error:") {
+        // Toolset/cap miss: fall back to host media runtime so /open still works.
+        if matches!(
+            hook.tool.as_str(),
+            "draw_image" | "audio_player" | "video_player" | "image_open" | "audio_open" | "video_open"
+        ) {
+            let host = run_media_tool(&hook.tool, &args);
+            serial_println!("open> agent tool failed ({out}); host: {host}");
+        } else {
+            serial_println!("open> agent '{}': {out}", hook.agent_name);
+        }
+    } else {
+        serial_println!(
+            "open> agent '{}' → {}{}: {out}",
+            hook.agent_name,
+            hook.tool,
+            hook.extension
+        );
+    }
 }
 
 #[cfg(not(feature = "server"))]
-fn run_open_inner(arg: &str) {
+fn run_open_inner(
+    arg: &str,
+    chat: &mut Option<ChatSession>,
+    orch: &mut crate::agent::orchestrator::Orchestrator,
+) {
     if arg.is_empty() {
         serial_println!("usage: /open <path>   e.g. /open {}", crate::ui_config::ui_path());
         serial_println!("  editor: hjkl move, i insert, Esc normal, :w write, :q quit, :wq save+quit");
-        serial_println!("  images: /open photo.png|.jpg previews in the action pane (/close to hide)");
-        serial_println!("  audio:  /open song.wav|.mp3|.aac plays through the sound device (Ctrl+C stops)");
-        serial_println!("  video:  /open clip.mp4|.mov plays H.264 baseline keyframes (Ctrl+Tab focus: space/seek/0; Ctrl+C stops)");
+        let exts = crate::agent::system::open_hook_extensions();
+        if !exts.is_empty() {
+            serial_println!(
+                "  media:  /open <file> for {}  → package command_hooks (media agent)",
+                exts.join(" ")
+            );
+            serial_println!("          switches chat to the hook agent; /agents switch 1 back to shell");
+        }
         return;
     }
-    // A .png/.jpg path is an image preview, a .wav/.mp3/.aac an audio playback —
-    // not a text buffer.
-    let lower = arg.to_ascii_lowercase();
-    if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        view_image(arg);
-        return;
-    }
-    if lower.ends_with(".wav") || lower.ends_with(".mp3") || lower.ends_with(".aac") {
-        play_audio(arg);
-        return;
-    }
-    if lower.ends_with(".mp4") || lower.ends_with(".mov") || lower.ends_with(".mkv") || lower.ends_with(".webm") {
-        play_video(arg);
+    // Package command_hooks for /open (e.g. media agent owns .mp3/.png/.mp4…).
+    if let Some(hook) = crate::agent::system::resolve_open_hook(arg) {
+        open_via_command_hook(arg, &hook, chat, orch);
         return;
     }
     #[cfg(not(test))]
     {
-        // Non-blocking: opens an editor tab and focuses it; input is routed
-        // from the shell loop, so audio/ktrace tabs keep running. The tab
-        // stays alive across switches; `:q` closes it (the ui.json re-apply
-        // happens then, via `editor::take_closed()` polled in `ui_tick`).
+        // No hook: text editor tab.
         crate::editor::open(arg);
         crate::framebuffer::focus_set(true);
         serial_println!("editor> {} open in a tab — i insert, Esc normal, :w write, :q quit; Ctrl+Tab switches tabs", arg);
     }
     #[cfg(test)]
-    let _ = arg;
+    let _ = (arg, chat, orch);
 }
 
 /// True while the pane divider is being dragged with the mouse (resize).
