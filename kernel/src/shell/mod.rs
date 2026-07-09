@@ -148,11 +148,32 @@ pub fn run() -> ! {
         }
     }
     let mut line = String::new();
+    // Right-side composer hint: model / approval mode (Grok shell layout).
+    #[cfg(not(test))]
+    update_composer_hint(remote_on, remote_cfg.as_ref());
 
     loop {
+        // Grok-style bordered input box on the framebuffer; **serial always**
+        // gets a classic `>` prompt + character echo so `make run` / mon:stdio
+        // still works as a full line editor (composer must not swallow that).
+        #[cfg(not(test))]
+        if crate::framebuffer::composer_available() {
+            crate::framebuffer::composer_begin();
+            update_composer_hint(remote_on, remote_cfg.as_ref());
+            // UART-only prompt — `serial_print!` would also paint into the chat
+            // grid, which is not the input surface when the composer is up.
+            crate::serial::write_str_raw("> ");
+        } else {
+            serial_print!("> ");
+        }
+        #[cfg(test)]
         serial_print!("> ");
         line.clear();
         read_line(&mut line);
+        #[cfg(not(test))]
+        if crate::framebuffer::composer_available() {
+            crate::framebuffer::composer_end();
+        }
         let msg = line.trim();
         if msg.is_empty() {
             continue;
@@ -269,6 +290,8 @@ pub fn run() -> ! {
                 }
                 None => serial_println!("model> remote mode but no endpoint — /model remote http://host:port [name]"),
             }
+            #[cfg(not(test))]
+            crate::framebuffer::clear_chat_caret();
             continue;
         }
         if chat.is_none() {
@@ -282,6 +305,10 @@ pub fn run() -> ! {
             }
             None => serial_println!("no model bundled -- chat unavailable (try /infer, /bench, or /model remote)"),
         }
+        // Drop any residual scrollback caret left at the end of the reply so
+        // only the Grok-style composer shows a cursor.
+        #[cfg(not(test))]
+        crate::framebuffer::clear_chat_caret();
     }
 }
 
@@ -633,7 +660,7 @@ fn print_help() {
     serial_println!("  /clip [text]     shared clipboard; syncs with the host (OSC52 out / bracketed paste in)");
     serial_println!("  /ktrace          toggle the ktrace log stream in the action (right) pane");
     serial_println!("  /open <path>     edit a file in the vim-like editor (right pane): hjkl/i/Esc/:w/:q");
-    serial_println!("                   .png/.jpg preview in the action pane; .wav/.mp3 play (Ctrl+C stops)");
+    serial_println!("                   .png/.jpg preview; .wav/.mp3/.aac play (Ctrl+C stops)");
     serial_println!("  /close           close the action pane (chat full-width); also Ctrl+W");
     serial_println!("  /disks           list every block device + detected filesystems (read-only)");
     serial_println!("  /ls [n | /path]  list a volume's root: n on disk 0, or a mount path (/mnt)");
@@ -3320,14 +3347,24 @@ fn erase_chars(n: usize) {
 }
 
 /// Echo a string to both consoles byte-by-byte.
+/// Echo `s` for the line editor. When the Grok-style composer owns the FB
+/// prompt, only the UART is written (the chat grid is not the input surface —
+/// `composer_sync` paints the box). Otherwise mirror to serial + chat grid via
+/// `console::put_byte` (classic terminal path).
 fn emit(s: &str) {
+    if composer_mode() {
+        for b in s.bytes() {
+            crate::serial::put_byte(b);
+        }
+        return;
+    }
     for b in s.bytes() {
         crate::console::put_byte(b);
     }
 }
 
 /// Move the on-screen cursor `n` cells left/right with `ESC[nD`/`ESC[nC`
-/// (understood by both the framebuffer pane parser and serial terminals).
+/// (serial terminals always; FB grid only when not in composer mode).
 fn cursor_shift(n: usize, right: bool) {
     if n > 0 {
         emit(&alloc::format!("\x1b[{}{}", n, if right { 'C' } else { 'D' }));
@@ -3343,6 +3380,7 @@ fn replace_line(buf: &mut String, cur: &mut usize, new: &str) {
     buf.push_str(new);
     *cur = buf.len();
     emit(new);
+    composer_sync(buf, *cur);
 }
 
 /// After ESC, wait briefly for the rest of an ANSI sequence (the bytes of a
@@ -3398,7 +3436,6 @@ fn read_bracketed_paste() -> String {
 /// Tab-complete a `/command` prefix: unique match completes in place; multiple
 /// matches are listed and the prompt+line re-echoed.
 fn tab_complete(buf: &mut String) {
-    use crate::console;
     // Only complete a lone leading /command (no arguments yet).
     if !buf.starts_with('/') || buf.contains(' ') {
         return;
@@ -3409,14 +3446,14 @@ fn tab_complete(buf: &mut String) {
         0 => {}
         1 => {
             let rest = &matches[0][prefix.len()..];
-            for b in rest.bytes() {
-                console::put_byte(b);
-            }
             buf.push_str(rest);
             buf.push(' ');
-            console::put_byte(b' ');
+            emit(rest);
+            emit(" ");
+            composer_sync(buf, buf.len());
         }
         _ => {
+            // List matches on serial (+ FB scrollback via serial_println).
             serial_println!("");
             let mut line = String::new();
             for m in &matches {
@@ -3426,8 +3463,14 @@ fn tab_complete(buf: &mut String) {
                 line.push(' ');
             }
             serial_println!("{}", line.trim_end());
-            // Re-echo the prompt + partial line.
-            serial_print!("> {}", buf);
+            // Re-echo the prompt + partial line on serial; refresh FB composer.
+            if composer_mode() {
+                crate::serial::write_str_raw("> ");
+                crate::serial::write_str_raw(buf);
+                composer_sync(buf, buf.len());
+            } else {
+                serial_print!("> {}", buf);
+            }
         }
     }
 }
@@ -3489,7 +3532,9 @@ fn media_focused() -> Option<crate::framebuffer::RightMode> {
 #[cfg(all(not(feature = "server"), not(test)))]
 fn media_key(c: u8) -> bool {
     match media_focused() {
-        Some(crate::framebuffer::RightMode::Surface(id)) if id == VIDEO_SURFACE => match c {
+        // A stopped/unloaded video must not eat keystrokes (the tab may still
+        // be focused after Ctrl+C — typed commands would lose ' 0.m' chars).
+        Some(crate::framebuffer::RightMode::Surface(id)) if id == VIDEO_SURFACE && video_loaded() => match c {
             b' ' => {
                 video_toggle_pause();
                 true
@@ -3507,12 +3552,12 @@ fn media_key(c: u8) -> bool {
                 true
             }
             b'm' | b'M' => {
-                video_toggle_mute();
+                media_toggle_mute();
                 true
             }
             _ => false,
         },
-        Some(crate::framebuffer::RightMode::Surface(_)) => match c {
+        Some(crate::framebuffer::RightMode::Surface(id)) if id != VIDEO_SURFACE => match c {
             b'+' | b'=' | b'-' | b'_' | b'r' | b'R' | b'l' | b'L' | b'0' => {
                 image_cmd(c);
                 true
@@ -3536,6 +3581,10 @@ fn media_key(c: u8) -> bool {
                 audio_seek(5000);
                 true
             }
+            b'm' | b'M' => {
+                media_toggle_mute();
+                true
+            }
             _ => false,
         },
         _ => false,
@@ -3546,26 +3595,31 @@ fn media_key(_c: u8) -> bool {
     false
 }
 
-/// Handle an arrow/Home nav key (`A`/`B`/`C`/`D`/`H`) for the focused media tab:
-/// pan the image, or seek the audio. Returns true if consumed.
+/// Handle an arrow/Home nav key (`A`/`B`/`C`/`D`/`H`) for the focused media tab.
+/// `steps` is the held-key amplifier from [`keyrepeat::Accel`] (≥1): a long
+/// press of ←/→ seeks progressively farther per typematic tick (1→2→4→8× the
+/// base step). Volume ↑/↓ ignore `steps` (one notch per event is enough).
 #[cfg(all(not(feature = "server"), not(test)))]
-fn media_nav(fin: u8) -> bool {
+fn media_nav(fin: u8, steps: usize) -> bool {
+    let steps = steps.max(1) as i64;
     match media_focused() {
-        Some(crate::framebuffer::RightMode::Surface(id)) if id == VIDEO_SURFACE => match fin {
+        Some(crate::framebuffer::RightMode::Surface(id)) if id == VIDEO_SURFACE && video_loaded() => match fin {
+            // ←/→ seek frames; long-hold multiplies by Accel (1/2/4/8).
             b'C' => {
-                video_seek(1);
+                video_seek(steps);
                 true
             }
             b'D' => {
-                video_seek(-1);
+                video_seek(-steps);
                 true
             }
+            // ↑/↓ = volume.
             b'A' => {
-                video_seek(10);
+                media_volume_adjust(5);
                 true
             }
             b'B' => {
-                video_seek(-10);
+                media_volume_adjust(-5);
                 true
             }
             b'H' => {
@@ -3574,7 +3628,7 @@ fn media_nav(fin: u8) -> bool {
             }
             _ => false,
         },
-        Some(crate::framebuffer::RightMode::Surface(_)) => match fin {
+        Some(crate::framebuffer::RightMode::Surface(id)) if id != VIDEO_SURFACE => match fin {
             b'A' | b'B' | b'C' | b'D' => {
                 image_cmd(fin);
                 true
@@ -3582,20 +3636,22 @@ fn media_nav(fin: u8) -> bool {
             _ => false,
         },
         Some(crate::framebuffer::RightMode::Audio) => match fin {
+            // ←/→ seek 5 s × steps (5→10→20→40 s per tick while held).
             b'C' => {
-                audio_seek(5000);
+                audio_seek(5000 * steps);
                 true
             }
             b'D' => {
-                audio_seek(-5000);
+                audio_seek(-5000 * steps);
                 true
             }
+            // ↑/↓ = volume.
             b'A' => {
-                audio_seek(30000);
+                media_volume_adjust(5);
                 true
             }
             b'B' => {
-                audio_seek(-30000);
+                media_volume_adjust(-5);
                 true
             }
             b'H' => {
@@ -3608,7 +3664,7 @@ fn media_nav(fin: u8) -> bool {
     }
 }
 #[cfg(not(all(not(feature = "server"), not(test))))]
-fn media_nav(_fin: u8) -> bool {
+fn media_nav(_fin: u8, _steps: usize) -> bool {
     false
 }
 
@@ -3638,12 +3694,34 @@ fn editor_nav(fin: u8, param: u64) {
     let _ = (fin, param);
 }
 
-/// Insert `c` into `buf` at the cursor, re-echoing the shifted tail.
+/// Whether the Grok-style framebuffer composer is the live prompt (so the FB
+/// grid is not used for keystroke echo). Serial still gets a full readline
+/// echo either way — see [`emit`].
+#[cfg(not(test))]
+fn composer_mode() -> bool {
+    crate::framebuffer::composer_is_active()
+}
+#[cfg(test)]
+fn composer_mode() -> bool {
+    false
+}
+
+/// Push the current line into the composer (no-op when the composer is idle).
+fn composer_sync(buf: &str, cur: usize) {
+    #[cfg(not(test))]
+    if composer_mode() {
+        crate::framebuffer::composer_set(buf, cur);
+    }
+}
+
+/// Insert `c` into `buf` at the cursor, re-echoing the shifted tail on serial
+/// (and refreshing the FB composer when it is the live prompt).
 fn insert_at(buf: &mut String, cur: &mut usize, c: char) {
     buf.insert(*cur, c);
-    emit(&buf[*cur..]);
+    emit(&buf[*cur..]); // new char + rest of line (serial; FB grid gated by emit)
     *cur += 1;
     cursor_shift(buf.len() - *cur, false);
+    composer_sync(buf, *cur);
 }
 
 /// Delete the character at `cur` (the "Delete" key), re-echoing the tail.
@@ -3653,6 +3731,7 @@ fn delete_at(buf: &mut String, cur: &mut usize) {
         emit(&buf[*cur..]);
         emit(" ");
         cursor_shift(buf.len() - *cur + 1, false);
+        composer_sync(buf, *cur);
     }
 }
 
@@ -3690,7 +3769,20 @@ fn read_line(buf: &mut String) {
             Some(b'\r') | Some(b'\n') => {
                 fb_scroll_live(false);
                 cursor_shift(buf.len() - cur, true);
-                serial_println!("");
+                if composer_mode() {
+                    // Chars already echoed on the UART while typing; finish the
+                    // serial line, then land a dim copy into chat scrollback
+                    // (FB grid was skipped during composer typing).
+                    crate::serial::put_byte(b'\n');
+                    #[cfg(not(test))]
+                    if !buf.is_empty() {
+                        let dim = alloc::format!("\x1b[2m{}\x1b[0m\n", buf.as_str());
+                        crate::framebuffer::console_print(&dim);
+                    }
+                } else {
+                    // Classic dual-console: newline mirrors to serial + FB grid.
+                    serial_println!("");
+                }
                 let line = buf.trim();
                 if !line.is_empty() {
                     HISTORY.with(|h| {
@@ -3760,18 +3852,19 @@ fn read_line(buf: &mut String) {
                     }
                     continue;
                 }
-                // Focused media tab: arrows pan the image / seek the audio.
-                if let Some(f) = fin {
-                    if media_nav(f) {
-                        continue;
-                    }
-                }
-                let action = fb_focus_is_action();
-                // Held arrows accelerate (multi-step) like held Backspace.
+                // Held arrows accelerate (multi-step) like held Backspace —
+                // computed first so media seek (←/→) can use the same streak.
                 let steps = match fin {
                     Some(f @ (b'A' | b'B' | b'C' | b'D')) => accel.steps(f, crate::arch::now_ms()),
                     _ => 1,
                 };
+                // Focused media tab: arrows pan the image / seek / volume.
+                if let Some(f) = fin {
+                    if media_nav(f, steps) {
+                        continue;
+                    }
+                }
+                let action = fb_focus_is_action();
                 match fin {
                     Some(b'A') if action => fb_scroll_view(true, steps as i64),
                     Some(b'B') if action => fb_scroll_view(true, -(steps as i64)),
@@ -3812,6 +3905,7 @@ fn read_line(buf: &mut String) {
                         if n > 0 {
                             cur += n;
                             cursor_shift(n, true);
+                            composer_sync(buf, cur);
                         }
                     }
                     Some(b'D') if !action => {
@@ -3819,25 +3913,30 @@ fn read_line(buf: &mut String) {
                         if n > 0 {
                             cur -= n;
                             cursor_shift(n, false);
+                            composer_sync(buf, cur);
                         }
                     }
                     Some(b'H') => {
                         cursor_shift(cur, false);
                         cur = 0;
+                        composer_sync(buf, cur);
                     }
                     Some(b'F') => {
                         cursor_shift(buf.len() - cur, true);
                         cur = buf.len();
+                        composer_sync(buf, cur);
                     }
                     // (Ctrl+Tab / Shift+Tab handled above as tab switching.)
                     Some(b'~') => match param {
                         1 | 7 => {
                             cursor_shift(cur, false);
                             cur = 0;
+                            composer_sync(buf, cur);
                         }
                         4 | 8 => {
                             cursor_shift(buf.len() - cur, true);
                             cur = buf.len();
+                            composer_sync(buf, cur);
                         }
                         3 => delete_at(buf, &mut cur),
                         5 => fb_scroll_page(action, true),
@@ -3858,10 +3957,12 @@ fn read_line(buf: &mut String) {
             Some(0x01) => {
                 cursor_shift(cur, false);
                 cur = 0;
+                composer_sync(buf, cur);
             }
             Some(0x05) => {
                 cursor_shift(buf.len() - cur, true);
                 cur = buf.len();
+                composer_sync(buf, cur);
             }
             // Ctrl+D (EOT): EOF-on-empty-line — power off, like typing /exit.
             // On a non-empty line it's ignored (standard shell behaviour), so an
@@ -3895,13 +3996,15 @@ fn read_line(buf: &mut String) {
                     buf.drain(cur - n..cur);
                     cur -= n;
                     // Back up, re-echo the shifted tail, blank the freed
-                    // cells, and walk the cursor back into place.
+                    // cells, and walk the cursor back into place (serial CSI
+                    // when in composer mode; dual-console otherwise).
                     cursor_shift(n, false);
                     emit(&buf[cur..]);
                     for _ in 0..n {
                         emit(" ");
                     }
                     cursor_shift(buf.len() - cur + n, false);
+                    composer_sync(buf, cur);
                 }
             }
             Some(c @ 0x20..=0x7e) => {
@@ -4201,6 +4304,25 @@ fn update_status() {
     }
 }
 
+/// Right half of the Grok-style composer hint bar: backend + approval mode.
+#[cfg(not(test))]
+fn update_composer_hint(remote_on: bool, remote_cfg: Option<&remote::RemoteConfig>) {
+    let mode = match approval_mode() {
+        ApprovalMode::Manual => "manual",
+        ApprovalMode::Auto => "auto",
+        ApprovalMode::Bypass => "bypass",
+    };
+    let backend = if remote_on {
+        remote_cfg.map(|c| c.model.as_str()).unwrap_or("remote")
+    } else {
+        "local"
+    };
+    let s = alloc::format!("{backend} · {mode}");
+    crate::framebuffer::composer_set_hint_right(&s);
+}
+#[cfg(test)]
+fn update_composer_hint(_remote_on: bool, _remote_cfg: Option<&remote::RemoteConfig>) {}
+
 /// `/datetime` — show or set the wall clock and timezone.
 fn run_datetime(arg: &str) {
     use crate::clock;
@@ -4317,18 +4439,18 @@ fn run_open_inner(arg: &str) {
         serial_println!("usage: /open <path>   e.g. /open {}", crate::ui_config::ui_path());
         serial_println!("  editor: hjkl move, i insert, Esc normal, :w write, :q quit, :wq save+quit");
         serial_println!("  images: /open photo.png|.jpg previews in the action pane (/close to hide)");
-        serial_println!("  audio:  /open song.wav|.mp3 plays through the sound device (Ctrl+C stops)");
+        serial_println!("  audio:  /open song.wav|.mp3|.aac plays through the sound device (Ctrl+C stops)");
         serial_println!("  video:  /open clip.mp4|.mov plays H.264 baseline keyframes (Ctrl+Tab focus: space/seek/0; Ctrl+C stops)");
         return;
     }
-    // A .png/.jpg path is an image preview, a .wav/.mp3 an audio playback —
+    // A .png/.jpg path is an image preview, a .wav/.mp3/.aac an audio playback —
     // not a text buffer.
     let lower = arg.to_ascii_lowercase();
     if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
         view_image(arg);
         return;
     }
-    if lower.ends_with(".wav") || lower.ends_with(".mp3") {
+    if lower.ends_with(".wav") || lower.ends_with(".mp3") || lower.ends_with(".aac") {
         play_audio(arg);
         return;
     }
@@ -4456,6 +4578,19 @@ struct VideoPlayer {
     finished_announced: bool,
     muted: bool,
     has_audio: bool,
+    /// Decoded mono S16 PCM for the video's audio track (option B: owned by
+    /// the video player so closing the tab stops audio without touching the
+    /// standalone audio tab).
+    audio_pcm: Option<alloc::vec::Vec<i16>>,
+    audio_rate: u32,
+    /// Next PCM sample index to queue (advanced by `pump_video` audio path).
+    audio_at: usize,
+    /// FPS meter: frames presented in the current 1 s window + EMA display value.
+    fps_window_start_ms: u64,
+    fps_window_frames: u32,
+    fps_display: u32,
+    /// Wall-clock of last successful present (for instant ms/frame → fps).
+    last_present_ms: u64,
 }
 #[cfg(not(feature = "server"))]
 static VIDEO: crate::mm::Locked<Option<VideoPlayer>> = crate::mm::Locked::new(None);
@@ -4484,22 +4619,55 @@ fn play_video(path: &str) {
             return;
         }
     }
-    // Report the audio track if present (decode/playback is a later stage).
-    let has_audio = match crate::video::audio_info(&bytes) {
-        Some(a) => {
-            serial_println!("open>   audio: {} {} Hz {}ch (decode pending — video plays silently)", a.codec, a.sample_rate, a.channels);
-            true
+    // Demux/describe audio; if AAC-LC, decode PCM now so pump_video can sync it.
+    let (has_audio, audio_pcm, audio_rate) = match crate::video::audio_info(&bytes) {
+        Some(a) if a.decodable => {
+            serial_println!(
+                "open>   audio: {} {} Hz {}ch — decoding…",
+                a.codec,
+                a.sample_rate,
+                a.channels
+            );
+            match crate::video::decode_audio(&bytes) {
+                Ok(audio) => {
+                    serial_println!(
+                        "open>   audio ready: {}:{:02} mono @ {} Hz ({} KiB PCM)",
+                        audio.duration_ms() / 60000,
+                        (audio.duration_ms() % 60000) / 1000,
+                        audio.rate,
+                        audio.pcm.len() * 2 / 1024
+                    );
+                    (true, Some(audio.pcm), audio.rate)
+                }
+                Err(e) => {
+                    serial_println!("open>   audio decode failed ({}) — video plays silently", e);
+                    (true, None, 0)
+                }
+            }
         }
-        None => false,
+        Some(a) => {
+            serial_println!(
+                "open>   audio: {} {} Hz {}ch (unsupported profile — video plays silently)",
+                a.codec,
+                a.sample_rate,
+                a.channels
+            );
+            (true, None, 0)
+        }
+        None => (false, None, 0),
     };
     match crate::video::StreamDecoder::open(bytes) {
         Ok(mut dec) => {
             let frame_count = dec.frame_count();
             let total_ms = dec.duration_ms;
-            dec.seek_decode(0); // decode + present the first frame now
+            // Stream like VLC: demux + first frame only — no full-clip RGB cache.
+            dec.seek_decode(0);
             serial_println!(
-                "open>   {} frame(s), ready in {} ms — Ctrl+Tab to focus, space=pause <-/->=seek 0=restart m=mute; Ctrl+C/close stops",
+                "open>   {}x{}  {} frame(s)  decoder={}  ready in {} ms (streaming) — Ctrl+Tab focus, space=pause; Ctrl+C/close stops",
+                dec.src_w,
+                dec.src_h,
                 frame_count,
+                dec.backend,
                 crate::arch::now_ms().saturating_sub(t0)
             );
             let name = path.rsplit('/').next().unwrap_or(path).to_string();
@@ -4517,6 +4685,13 @@ fn play_video(path: &str) {
                     finished_announced: false,
                     muted: false,
                     has_audio,
+                    audio_pcm,
+                    audio_rate,
+                    audio_at: 0,
+                    fps_window_start_ms: now,
+                    fps_window_frames: 0,
+                    fps_display: 0,
+                    last_present_ms: 0,
                 })
             });
             #[cfg(not(test))]
@@ -4530,12 +4705,32 @@ fn play_video(path: &str) {
 }
 
 /// Present the current video frame into the video tab (no-op if not active).
+/// Updates the rolling FPS meter (frames presented per wall-clock second).
 #[cfg(all(not(feature = "server"), not(test)))]
 fn present_video_frame() {
+    let now = crate::arch::now_ms();
     VIDEO.with(|v| {
-        if let Some(p) = v.as_ref() {
+        if let Some(p) = v.as_mut() {
             if let Some(f) = p.dec.cur_frame() {
-                crate::framebuffer::present_surface(VIDEO_SURFACE, f.w, f.h, &f.pixels);
+                // Reserve the bottom strip for the HUD so the per-frame blit
+                // never repaints under it (no flicker); the HUD lives there.
+                let hud = crate::framebuffer::video_hud_height();
+                crate::framebuffer::present_surface_reserve(VIDEO_SURFACE, f.w, f.h, &f.pixels, hud);
+                // FPS: count presents in 1 s windows; show last completed window.
+                p.fps_window_frames = p.fps_window_frames.saturating_add(1);
+                p.last_present_ms = now;
+                let elapsed = now.saturating_sub(p.fps_window_start_ms);
+                if elapsed >= 1000 {
+                    // frames in this window → fps (scale if window > 1 s)
+                    let fps = if elapsed > 0 {
+                        (p.fps_window_frames as u64 * 1000 / elapsed) as u32
+                    } else {
+                        0
+                    };
+                    p.fps_display = fps;
+                    p.fps_window_start_ms = now;
+                    p.fps_window_frames = 0;
+                }
             }
         }
     });
@@ -4560,18 +4755,71 @@ fn stop_video() {
 #[cfg(feature = "server")]
 fn stop_video() {}
 
+/// Re-entrancy guard: `upkeep` → `pump_video` must never nest (VIDEO lock).
+#[cfg(all(not(feature = "server"), not(test)))]
+static PUMPING_VIDEO: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Advance the video by presentation time; the idle-tick heartbeat.
+/// Also queues ~200 ms audio chunks from the video's own PCM (when present),
+/// gated on play state and device drain — never steals the standalone audio tab.
 #[cfg(all(not(feature = "server"), not(test)))]
 fn pump_video() {
+    use core::sync::atomic::Ordering;
+    // Bail if already pumping (e.g. a nested upkeep from a mistaken yield
+    // inside decode). Nested VIDEO.with would spin forever.
+    if PUMPING_VIDEO.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let result = pump_video_inner();
+    PUMPING_VIDEO.store(false, Ordering::Release);
+    let _ = result;
+}
+
+#[cfg(all(not(feature = "server"), not(test)))]
+fn pump_video_inner() {
     let now = crate::arch::now_ms();
+    // Audio chunk (copied out so VIDEO lock isn't held across sound::play).
+    let audio_chunk = VIDEO.with(|v| {
+        let p = v.as_mut()?;
+        if !p.playing {
+            return None;
+        }
+        let pcm = p.audio_pcm.as_ref()?;
+        if p.audio_rate == 0 || p.audio_at >= pcm.len() {
+            return None;
+        }
+        if crate::sound::playing() {
+            return None; // still draining previous chunk
+        }
+        // Snap cursor to the current video pts so seek/pause recover cleanly.
+        let t = now.saturating_sub(p.base_ms);
+        let want = ((t as u128) * p.audio_rate as u128 / 1000) as usize;
+        // Only jump forward/back if we drifted > ~50 ms (avoid tiny jitter).
+        let slop = (p.audio_rate as usize / 20).max(1);
+        if want > p.audio_at + slop || p.audio_at > want + slop {
+            p.audio_at = want.min(pcm.len());
+        }
+        if p.audio_at >= pcm.len() {
+            return None;
+        }
+        let chunk = (p.audio_rate as usize / 5).max(256); // ~200 ms
+        let end = (p.audio_at + chunk).min(pcm.len());
+        let slice = pcm[p.audio_at..end].to_vec();
+        p.audio_at = end;
+        Some((slice, p.audio_rate))
+    });
+    if let Some((slice, rate)) = audio_chunk {
+        let _ = crate::sound::play(&slice, rate);
+    }
+
     let present = VIDEO.with(|v| {
         let Some(p) = v.as_mut() else { return false };
         if !p.playing || p.frame_count == 0 {
             return false;
         }
         let t = now.saturating_sub(p.base_ms);
-        // Find the last frame whose pts <= t (pts read from the sample table,
-        // no decode needed).
+        // Desired display frame from the sample table (no decode).
         let mut target = p.idx;
         while target + 1 < p.frame_count && p.dec.pts_ms(target + 1) <= t {
             target += 1;
@@ -4583,16 +4831,33 @@ fn pump_video() {
                 p.finished_announced = true;
                 p.idx = target;
                 p.dec.seek_decode(target);
-                return true; // present final frame once
+                return true;
             }
             return false;
         }
-        if target != p.idx {
-            p.idx = target;
-            p.dec.seek_decode(target);
-            return true;
+        if target == p.idx {
+            return false;
         }
-        false
+        // Advance **forward only** (never jump back to an old keyframe — that
+        // looped the first few frames when lag re-anchored to IDR #0).
+        // Cap steps per tick so a slow CABAC frame doesn't freeze the shell;
+        // if still behind after decode, re-anchor so play stays smooth at
+        // whatever rate we can sustain (not perfect realtime, but no rewind).
+        const MAX_DECODE_PER_TICK: usize = 2;
+        let goal = (p.idx + MAX_DECODE_PER_TICK).min(target).max(p.idx + 1);
+        let goal = goal.min(p.frame_count.saturating_sub(1));
+        if goal <= p.idx {
+            return false;
+        }
+        p.idx = goal;
+        let changed = p.dec.seek_decode(p.idx);
+        let pts = p.dec.pts_ms(p.idx);
+        if t > pts.saturating_add(100) {
+            // Behind the wall clock — snap media time forward (drop backlog),
+            // never snap backward to a previous keyframe.
+            p.base_ms = now.saturating_sub(pts);
+        }
+        changed
     });
     if present {
         present_video_frame();
@@ -4620,15 +4885,34 @@ fn video_toggle_pause() {
     present_video_status();
 }
 
-/// Toggle mute on the video's audio track (`m` on the video tab).
+/// Shared mute for audio + video tabs (`m`). Uses the global software mute so
+/// the next PCM chunk is silence; also mirrors into `VideoPlayer.muted` for the
+/// HUD when a video is loaded.
 #[cfg(all(not(feature = "server"), not(test)))]
-fn video_toggle_mute() {
+fn media_toggle_mute() {
+    let m = crate::sound::toggle_mute();
     VIDEO.with(|v| {
         if let Some(p) = v.as_mut() {
-            p.muted = !p.muted;
+            p.muted = m;
         }
     });
     present_video_status();
+    repaint_audio();
+}
+
+/// Shared volume adjust for audio + video tabs (↑/↓). Steps are percent points.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn media_volume_adjust(delta: i32) {
+    let v = crate::sound::volume_adjust(delta);
+    // Keep video HUD mute flag in sync if volume-up unmuted.
+    VIDEO.with(|vp| {
+        if let Some(p) = vp.as_mut() {
+            p.muted = crate::sound::muted();
+        }
+    });
+    let _ = v;
+    present_video_status();
+    repaint_audio();
 }
 
 /// Draw the video player's status bar into the surface tab: playback state,
@@ -4639,15 +4923,27 @@ fn present_video_status() {
     VIDEO.with(|v| {
         if let Some(p) = v.as_ref() {
             let pos = p.dec.pts_ms(p.idx);
+            // Prefer completed 1 s window; if still filling, show instant
+            // estimate from last inter-present gap.
+            let fps = if p.fps_display > 0 {
+                p.fps_display
+            } else if p.fps_window_frames > 0 {
+                let elapsed = crate::arch::now_ms().saturating_sub(p.fps_window_start_ms).max(1);
+                (p.fps_window_frames as u64 * 1000 / elapsed) as u32
+            } else {
+                0
+            };
             crate::framebuffer::draw_video_status(
                 &p.name,
                 p.playing,
-                p.muted,
+                crate::sound::muted() || p.muted,
                 p.has_audio,
                 p.idx + 1,
                 p.frame_count,
                 pos,
                 p.total_ms,
+                crate::sound::volume(),
+                fps,
             );
         }
     });
@@ -4670,6 +4966,13 @@ fn video_seek(delta: i64) {
             p.paused_at = pts;
             p.finished_announced = false;
             p.dec.seek_decode(ni);
+            // Keep audio cursor in lockstep with video pts.
+            if p.audio_rate > 0 {
+                p.audio_at = ((pts as u128) * p.audio_rate as u128 / 1000) as usize;
+                if let Some(pcm) = p.audio_pcm.as_ref() {
+                    p.audio_at = p.audio_at.min(pcm.len());
+                }
+            }
         }
     });
     present_video_frame();
@@ -4687,6 +4990,7 @@ fn video_restart() {
             p.playing = true;
             p.finished_announced = false;
             p.dec.seek_decode(0);
+            p.audio_at = 0;
         }
     });
     present_video_frame();
@@ -4853,12 +5157,15 @@ struct AudioPlayer {
     done: bool,
     paused: bool,
     finished_announced: bool,
+    /// Peak envelope for the wave visualizer (`audio::waveform_peaks`).
+    peaks: alloc::vec::Vec<u8>,
 }
 #[cfg(not(feature = "server"))]
 static AUDIO: crate::mm::Locked<Option<AudioPlayer>> = crate::mm::Locked::new(None);
 
-/// `/open <path>.wav|.mp3` — decode (RIFF/WAVE or MPEG Layer III) and play in
-/// the background at the file's own sample rate, in an "audio" action-pane tab.
+/// `/open <path>.wav|.mp3|.aac` — decode (RIFF/WAVE, MPEG Layer III, or ADTS
+/// AAC) and play in the background at the file's own sample rate, in an
+/// "audio" action-pane tab.
 /// Non-blocking: it starts playback and returns; `pump_audio` (idle tick) feeds
 /// the device chunk by chunk, so switching tabs, editing, or running other
 /// commands never interrupts the track. `/close` (or Ctrl+C at the prompt)
@@ -4891,8 +5198,9 @@ fn play_audio(path: &str) {
         serial_println!("open> no sound device — decoded OK but cannot play");
         return;
     }
-    serial_println!("open>   switch tabs freely, it keeps playing; Ctrl+Tab to focus then space=pause <-/->=seek 0=restart; Ctrl+C or /close stops");
+    serial_println!("open>   switch tabs freely, it keeps playing; Ctrl+Tab to focus then space=pause <-/->=seek up/dn=volume 0=restart m=mute; Ctrl+C or /close stops");
     let name = path.rsplit('/').next().unwrap_or(path).to_string();
+    let peaks = crate::audio::waveform_peaks(&audio.pcm, crate::audio::WAVEFORM_BINS);
     AUDIO.with(|a| {
         *a = Some(AudioPlayer {
             pcm: audio.pcm,
@@ -4903,6 +5211,7 @@ fn play_audio(path: &str) {
             done: false,
             paused: false,
             finished_announced: false,
+            peaks,
         })
     });
     #[cfg(not(test))]
@@ -5027,6 +5336,9 @@ fn repaint_audio() {
                 rate: p.rate,
                 playing: !p.done && !p.paused,
                 paused: p.paused,
+                peaks: &p.peaks,
+                volume: crate::sound::volume(),
+                muted: crate::sound::muted(),
             });
         }
     });

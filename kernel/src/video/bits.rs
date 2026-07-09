@@ -62,6 +62,12 @@ impl<'a> BitReader<'a> {
         self.total_bits().saturating_sub(self.pos)
     }
 
+    /// Absolute bit position from the start of the data (for handing off to a
+    /// byte-aligned consumer, e.g. the CABAC engine after the slice header).
+    pub fn bit_pos(&self) -> usize {
+        self.pos
+    }
+
     /// Read a single bit (0/1). `Err` past the end.
     pub fn bit(&mut self) -> Result<u32, &'static str> {
         if self.pos >= self.total_bits() {

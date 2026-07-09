@@ -64,6 +64,12 @@ pub struct Theme {
     pub editor_fg: Rgb,
     pub editor_lineno: Rgb,
     pub editor_sel: Rgb,
+    /// Grok-style input composer fill (slightly elevated over chat_bg).
+    pub composer_bg: Rgb,
+    /// Composer border when idle / focused (focused uses `accent`).
+    pub composer_border: Rgb,
+    /// Hint-bar text under the composer.
+    pub composer_hint: Rgb,
 }
 
 impl Theme {
@@ -86,6 +92,9 @@ impl Theme {
         editor_fg: (250, 249, 245),    // cream
         editor_lineno: (108, 106, 100),
         editor_sel: (90, 58, 46),      // terracotta-tinted selection
+        composer_bg: (37, 35, 32),     // elevated like status_bg
+        composer_border: (58, 55, 51), // matches border_dim when unfocused
+        composer_hint: (108, 106, 100), // muted
     };
 }
 
@@ -131,6 +140,9 @@ pub fn theme_from_pairs(pairs: &[(alloc::string::String, alloc::string::String)]
             "editor_fg" => &mut t.editor_fg,
             "editor_lineno" => &mut t.editor_lineno,
             "editor_sel" => &mut t.editor_sel,
+            "composer_bg" => &mut t.composer_bg,
+            "composer_border" => &mut t.composer_border,
+            "composer_hint" => &mut t.composer_hint,
             _ => continue,
         };
         *slot = parse_hex(hex, *slot);
@@ -144,6 +156,12 @@ const GAP: u64 = 10; // between the two panes
 const BORDER: u64 = 2; // pane border thickness
 const PAD: u64 = 10; // interior padding inside a pane
 const CHAT_PCT: u64 = 56; // chat pane width as a % of the content region
+/// Vertical padding inside the Grok-style input composer box (px, unscaled).
+const COMPOSER_VPAD: u64 = 6;
+/// Gap between the composer box and the hint row under it (px, unscaled).
+const COMPOSER_HINT_GAP: u64 = 4;
+/// Margin between chat scrollback and the composer box (px, unscaled).
+const COMPOSER_TOP_GAP: u64 = 8;
 
 /// Pick an integer font scale from the panel height so glyphs stay a legible
 /// physical size across resolutions: 1x up to ~1600 tall, 2x for 4K-class
@@ -198,6 +216,9 @@ struct Pane {
     /// **absolute** coordinates over `hist` + grid (see `crate::textsel`), so
     /// it stays glued to its text while the pane scrolls. `None` = no selection.
     sel: Option<((usize, usize), (usize, usize))>,
+    /// When true, the pane reserves its bottom for a Grok-style input composer
+    /// (bordered box + hint row); the scrollback grid sits above it.
+    has_composer: bool,
 }
 
 /// Minimal ANSI escape-sequence parser state for a pane's byte stream: we
@@ -222,7 +243,15 @@ impl Pane {
         let ix = x + BORDER + PAD;
         let iy = y + header_h;
         let iw = w.saturating_sub(2 * (BORDER + PAD)).max(cw);
-        let ih = (y + h).saturating_sub(iy + BORDER + PAD).max(ch);
+        // Grok-style composer: box (vpad + 1 line + vpad + 2px border) + gap + hint line.
+        // Reserve it so scrollback never paints under the input chrome.
+        let has_composer = show_caret;
+        let composer_block = if has_composer {
+            COMPOSER_TOP_GAP + (COMPOSER_VPAD + ch + COMPOSER_VPAD + 2) + COMPOSER_HINT_GAP + ch
+        } else {
+            0
+        };
+        let ih = (y + h).saturating_sub(iy + BORDER + PAD + composer_block).max(ch);
         let cols = (iw / cw).max(1);
         let rows = (ih / ch).max(1);
         Pane {
@@ -251,6 +280,7 @@ impl Pane {
             hist: VecDeque::new(),
             view: 0,
             sel: None,
+            has_composer,
         }
     }
 
@@ -275,36 +305,140 @@ impl Pane {
         v
     }
 
+    /// Clone text state (scrollback + grid + cursor + colour) from `old` without
+    /// reflowing. Used when this pane is **parked** off-screen during fullscreen
+    /// (`w == 0`): reflowing a multi-thousand-line history into the 1-column ghost
+    /// grid `Pane::new` builds for a zero-width box would allocate/hang the OS
+    /// (Ctrl+F hang). The parked pane keeps its native `cols`/`rows` so a later
+    /// unpark can reflow correctly into the restored geometry.
+    fn take_content(&mut self, old: &Pane) {
+        self.hist = old.hist.clone();
+        self.grid = old.grid.clone();
+        self.cols = old.cols;
+        self.rows = old.rows;
+        self.col = old.col.min(old.cols.saturating_sub(1));
+        self.row = old.row.min(old.rows.saturating_sub(1));
+        self.view = old.view.min(self.hist.len());
+        self.sel = None;
+        self.fg = old.fg;
+        self.default_fg = old.default_fg;
+        self.bold = old.bold;
+        self.esc = old.esc;
+        self.csi = old.csi;
+        self.csi_len = old.csi_len;
+    }
+
     /// Carry another pane's text (scrollback + grid + cursor + colour state)
-    /// into this freshly-built pane, re-wrapping to the new geometry. Used when
-    /// the layout is rebuilt (action pane toggled, `/ui` relayout) so pane
-    /// content is never lost by a split change.
+    /// into this freshly-built pane, **reflowing** soft-wrapped lines to the
+    /// new column count. Used when the layout is rebuilt (divider drag, action
+    /// pane toggle, `/pane split`) so expanding the chat pane fills the extra
+    /// width instead of leaving short lines stranded on the left.
+    ///
+    /// Parked destinations (`self.w == 0`, fullscreen) skip reflow entirely —
+    /// see [`Self::take_content`].
     fn adopt(&mut self, old: &Pane) {
-        if old.grid.is_empty() || self.grid.is_empty() {
+        if old.grid.is_empty() && old.hist.is_empty() {
+            return;
+        }
+        // Fullscreen parks a pane at outer width 0 (off-screen). Never reflow
+        // into the 1-col placeholder grid — that turns ~2000×N cells into
+        // millions of 1-cell rows and freezes the cooperative kernel.
+        if self.w == 0 {
+            self.take_content(old);
+            return;
+        }
+        if self.grid.is_empty() {
             return;
         }
         let ocols = old.cols as usize;
-        let mut lines: VecDeque<Vec<Cell>> = old.hist.clone();
-        // Grid rows up to and including the cursor row are content.
+        let cols = self.cols as usize;
+        let rows = self.rows as usize;
+        // Same width: transplant without soft-reflow (row count may still change).
+        if ocols == cols && !old.grid.is_empty() {
+            let empty: Cell = (0, self.default_fg);
+            let mut abs: alloc::vec::Vec<alloc::vec::Vec<Cell>> = old.hist.iter().cloned().collect();
+            let used = ((old.row + 1).min(old.rows)) as usize;
+            for r in 0..used {
+                let start = r * ocols;
+                let end = (start + ocols).min(old.grid.len());
+                if start < end {
+                    abs.push(old.grid[start..end].to_vec());
+                }
+            }
+            let total = abs.len();
+            let keep = total.min(rows);
+            let start = total - keep;
+            for c in self.grid.iter_mut() {
+                *c = empty;
+            }
+            for (r, line) in abs.iter().skip(start).enumerate() {
+                let n = line.len().min(cols);
+                for c in 0..n {
+                    self.grid[r * cols + c] = line[c];
+                }
+            }
+            self.hist = abs.into_iter().take(start).collect();
+            while self.hist.len() > HIST_MAX {
+                self.hist.pop_front();
+            }
+            let old_line = old.hist.len() + old.row.min(old.rows.saturating_sub(1)) as usize;
+            self.row = if old_line >= start {
+                (old_line - start).min(rows.saturating_sub(1)) as u64
+            } else {
+                0
+            };
+            self.col = old.col.min(self.cols.saturating_sub(1));
+            self.view = 0;
+            self.sel = None;
+            self.fg = old.fg;
+            self.default_fg = old.default_fg;
+            self.bold = old.bold;
+            return;
+        }
+        // Absolute lines: scrollback then live grid rows that hold content.
+        let mut abs: alloc::vec::Vec<alloc::vec::Vec<Cell>> = old.hist.iter().cloned().collect();
         let used = ((old.row + 1).min(old.rows)) as usize;
         for r in 0..used {
-            lines.push_back(old.grid[r * ocols..(r + 1) * ocols].to_vec());
+            let start = r * ocols;
+            let end = (start + ocols).min(old.grid.len());
+            if start < end {
+                abs.push(old.grid[start..end].to_vec());
+            }
         }
-        let cur_gi = lines.len() - used + old.row.min(old.rows - 1) as usize;
-        let (rows, cols) = (self.rows as usize, self.cols as usize);
-        let keep = lines.len().min(rows);
-        let start = lines.len() - keep;
-        for (r, line) in lines.iter().skip(start).enumerate() {
-            for c in 0..cols.min(line.len()) {
+        let old_line = old.hist.len() + old.row.min(old.rows.saturating_sub(1)) as usize;
+        let empty: Cell = (0, self.default_fg);
+        // Same layout as textsel::Cell — Rgb is (u8,u8,u8).
+        let as_ts: alloc::vec::Vec<alloc::vec::Vec<crate::textsel::Cell>> =
+            abs.iter().map(|l| l.iter().map(|&(b, c)| (b, c)).collect()).collect();
+        let reflowed = crate::textsel::reflow_lines(&as_ts, ocols, cols, (0, self.default_fg));
+        let (new_line, new_col) =
+            crate::textsel::reflow_cursor(&as_ts, ocols, cols, old_line, old.col as usize);
+        // Place the tail of the reflow into the live grid; the rest is hist.
+        let total = reflowed.len();
+        let keep = total.min(rows);
+        let start = total - keep;
+        // Clear grid first so expanded columns aren't stale.
+        for c in self.grid.iter_mut() {
+            *c = empty;
+        }
+        for (r, line) in reflowed.iter().skip(start).enumerate() {
+            let n = line.len().min(cols);
+            for c in 0..n {
                 self.grid[r * cols + c] = line[c];
             }
         }
-        self.hist = lines.iter().take(start).cloned().collect();
+        self.hist = reflowed.into_iter().take(start).collect();
         while self.hist.len() > HIST_MAX {
             self.hist.pop_front();
         }
-        self.row = if cur_gi >= start { (cur_gi - start) as u64 } else { 0 };
-        self.col = old.col.min(self.cols - 1);
+        self.row = if new_line >= start {
+            (new_line - start).min(rows.saturating_sub(1)) as u64
+        } else {
+            0
+        };
+        self.col = (new_col as u64).min(self.cols.saturating_sub(1));
+        self.view = 0;
+        self.sel = None; // absolute coords are invalid after reflow
         self.fg = old.fg;
         self.default_fg = old.default_fg;
         self.bold = old.bold;
@@ -446,9 +580,17 @@ pub struct Screen {
     /// the UI-config templates + clock, so it stays configurable.
     status_left: String,
     status_right: String,
-    /// Blinking-caret state for the chat pane.
+    /// Blinking-caret state for the chat pane / composer.
     caret_on: bool,
     caret_last_ms: u64,
+    /// Grok-style input composer (bottom of chat pane): when `composer_active`
+    /// the caret lives in the bordered box, not the scrollback grid.
+    composer_active: bool,
+    composer_line: String,
+    composer_cur: usize,
+    /// Hint bar under the composer (left / right halves).
+    composer_hint_l: String,
+    composer_hint_r: String,
     /// Fallback blink cadence when the monotonic clock is frozen (some VBox
     /// configs): the last `now_ms` seen, and a call counter. `clock_alive`
     /// latches once `now_ms` is ever seen advancing — after that the fallback
@@ -628,10 +770,12 @@ impl Screen {
         let pct = cfg.chat_pct.clamp(10, 90);
         let full_w = width.saturating_sub(2 * OUTER);
         let (chat_x, chat_bw, logs_x, logs_bw) = if cfg.fullscreen == 2 && split {
-            // Action pane fills the screen; chat parked offscreen.
+            // Action pane fills the screen; chat parked offscreen (w=0).
+            // Parked panes keep w==0 so `Pane::adopt` clones content without a
+            // catastrophic 1-column reflow of the full scrollback.
             (width, 0, OUTER, full_w)
         } else if cfg.fullscreen == 1 || !split {
-            // Chat fills the screen; action parked offscreen.
+            // Chat fills the screen; action parked offscreen (w=0).
             (OUTER, full_w, width, 0)
         } else {
             let avail_w = width.saturating_sub(2 * OUTER + GAP);
@@ -645,8 +789,10 @@ impl Screen {
             }
         };
         let th = cfg.theme;
+        // Allow w==0 for parked panes — do not `.max(cw)` the outer box or
+        // fullscreen parking becomes a 1-col reflow of the whole history.
         let chat = Pane::new(chat_x, box_y, chat_bw, box_h, cw, ch, th.chat_fg, th.chat_bg, cfg.chat_title.clone(), true);
-        let logs = Pane::new(logs_x, box_y, logs_bw.max(cw), box_h, cw, ch, th.logs_fg, th.logs_bg, cfg.logs_title.clone(), false);
+        let logs = Pane::new(logs_x, box_y, logs_bw, box_h, cw, ch, th.logs_fg, th.logs_bg, cfg.logs_title.clone(), false);
         let mut status_left = String::from("Chitti OS v");
         status_left.push_str(crate::VERSION);
         Screen {
@@ -655,6 +801,11 @@ impl Screen {
             status_right: String::new(),
             caret_on: true,
             caret_last_ms: 0,
+            composer_active: false,
+            composer_line: String::new(),
+            composer_cur: 0,
+            composer_hint_l: String::from("Ctrl+C cancel · Ctrl+W close · Ctrl+F full · /help"),
+            composer_hint_r: String::new(),
             blink_seen_ms: u64::MAX,
             blink_calls: 0,
             clock_alive: false,
@@ -693,8 +844,70 @@ impl Screen {
         // framebuffer is a valid, kernel-owned MMIO region.
         unsafe {
             let ptr = (self.addr as *mut u8).add(offset as usize);
-            for i in 0..self.bpp_bytes {
-                ptr.add(i as usize).write_volatile((value >> (i * 8)) as u8);
+            // Fast path: 32-bit linear FB (virtio / GOP / ramfb all are).
+            if self.bpp_bytes == 4 {
+                (ptr as *mut u32).write_volatile(value);
+            } else {
+                for i in 0..self.bpp_bytes {
+                    ptr.add(i as usize).write_volatile((value >> (i * 8)) as u8);
+                }
+            }
+        }
+    }
+
+    /// Pack an RGB triple into a framebuffer native pixel word.
+    #[inline]
+    fn pack_rgb(&self, c: Rgb) -> u32 {
+        ((c.0 as u32) << self.r_shift) | ((c.1 as u32) << self.g_shift) | ((c.2 as u32) << self.b_shift)
+    }
+
+    /// Blit a row of packed `0x00RRGGBB` pixels into the FB at `(x,y)`.
+    /// Much faster than per-pixel put for video frames (one bounds check +
+    /// sequential stores).
+    fn blit_rgb32_row(&self, x: u64, y: u64, row: &[u32]) {
+        if y >= self.height || x >= self.width || row.is_empty() {
+            return;
+        }
+        let n = row.len().min((self.width - x) as usize);
+        let offset = y * self.pitch + x * self.bpp_bytes;
+        // SAFETY: n is clipped to the scanline; FB is kernel-owned MMIO.
+        unsafe {
+            let mut ptr = (self.addr as *mut u8).add(offset as usize);
+            if self.bpp_bytes == 4
+                && self.r_shift == 16
+                && self.g_shift == 8
+                && self.b_shift == 0
+            {
+                // Native XRGB8888 — store as-is (our RGB packs match).
+                let dst = ptr as *mut u32;
+                for i in 0..n {
+                    dst.add(i).write_volatile(row[i]);
+                }
+            } else if self.bpp_bytes == 4 {
+                let dst = ptr as *mut u32;
+                for i in 0..n {
+                    let c = row[i];
+                    let rgb = (
+                        ((c >> 16) & 0xff) as u8,
+                        ((c >> 8) & 0xff) as u8,
+                        (c & 0xff) as u8,
+                    );
+                    dst.add(i).write_volatile(self.pack_rgb(rgb));
+                }
+            } else {
+                for i in 0..n {
+                    let c = row[i];
+                    let rgb = (
+                        ((c >> 16) & 0xff) as u8,
+                        ((c >> 8) & 0xff) as u8,
+                        (c & 0xff) as u8,
+                    );
+                    let value = self.pack_rgb(rgb);
+                    for b in 0..self.bpp_bytes {
+                        ptr.add(b as usize).write_volatile((value >> (b * 8)) as u8);
+                    }
+                    ptr = ptr.add(self.bpp_bytes as usize);
+                }
             }
         }
     }
@@ -1030,15 +1243,37 @@ impl Screen {
         }
     }
 
-    fn caret_erase(&self, p: &Pane) {
-        if p.show_caret {
-            self.fill_rect(p.cell_x(), p.cell_y(), 2 * self.scale, p.ch, p.bg);
+    /// Repaint the cell under the pane cursor from the grid (clears a leftover
+    /// caret bar without blanking a real glyph that might share the cell).
+    fn repaint_cursor_cell(&self, p: &Pane) {
+        let cols = p.cols as usize;
+        let idx = (p.row as usize).saturating_mul(cols).saturating_add(p.col as usize);
+        let (b, fg) = p.grid.get(idx).copied().unwrap_or((0, p.default_fg));
+        let x = p.cell_x();
+        let y = p.cell_y();
+        self.fill_rect(x, y, p.cw, p.ch, p.bg);
+        if (0x21..=0x7e).contains(&b) {
+            self.blit_glyph(x, y, b, fg, p.bg);
         }
     }
-    fn caret_draw(&self, p: &Pane) {
-        if p.show_caret {
-            self.fill_rect(p.cell_x(), p.cell_y(), 2 * self.scale, p.ch, self.theme.accent);
+
+    fn caret_erase(&self, p: &Pane) {
+        if !p.show_caret {
+            return;
         }
+        // Always restore the underlying cell — a plain bg bar erase leaves a
+        // hole if a glyph shared the cell, and a leftover accent bar if the
+        // next write never covers this position (composer panes).
+        self.repaint_cursor_cell(p);
+    }
+
+    fn caret_draw(&self, p: &Pane) {
+        // Chat pane with a Grok-style composer: caret lives only in the input
+        // box — never in the scrollback/response area.
+        if !p.show_caret || p.has_composer {
+            return;
+        }
+        self.fill_rect(p.cell_x(), p.cell_y(), 2 * self.scale, p.ch, self.theme.accent);
     }
 
     fn newline(p: &mut Pane, s: &Screen) {
@@ -1086,7 +1321,7 @@ impl Screen {
                             }
                             if live {
                                 s.fill_rect(p.cell_x(), p.cell_y(), (p.cols - p.col) * p.cw, p.ch, p.bg);
-                                s.caret_draw(p);
+                                s.caret_draw(p); // no-op when p.has_composer
                             }
                         }
                         b'C' | b'D' => {
@@ -1096,7 +1331,7 @@ impl Screen {
                             }
                             p.col = if byte == b'C' { (p.col + n).min(p.cols - 1) } else { p.col.saturating_sub(n) };
                             if live {
-                                s.caret_draw(p);
+                                s.caret_draw(p); // no-op when p.has_composer
                             }
                         }
                         _ => {}
@@ -1160,6 +1395,8 @@ impl Screen {
             }
             _ => {}
         }
+        // Grid caret only when the pane has no composer (`caret_draw` is a
+        // no-op for `has_composer` panes so scrollback never keeps a bar).
         if p.view == 0 {
             s.caret_draw(p);
         }
@@ -1177,11 +1414,15 @@ impl Screen {
         let border = if active { self.theme.accent } else { self.theme.border_dim };
         let title_c = if active { self.theme.title_active } else { self.theme.title_dim };
         self.rect_outline(p.x, p.y, p.w, p.h, BORDER, border);
-        // Title, just inside the top border.
+        // Title, just inside the top border — ellipsize so a long path never
+        // paints into the close button / pane edge.
         let ty = p.y + BORDER + 4;
         let tx = p.x + BORDER + PAD;
-        let end = self.draw_str(tx, ty, title, title_c, p.bg);
-        if active {
+        let max_w = p.w.saturating_sub(2 * (BORDER + PAD) + self.cw() * 4); // room for " *" / [x]
+        let max_cols = (max_w / self.cw()).max(1) as usize;
+        let title = crate::textsel::ellipsize(title, max_cols);
+        let end = self.draw_str(tx, ty, &title, title_c, p.bg);
+        if active && end + 2 * self.cw() <= p.x + p.w - BORDER - PAD {
             self.draw_str(end, ty, " *", self.theme.accent, p.bg);
         }
         // Separator under the title.
@@ -1194,24 +1435,193 @@ impl Screen {
         let sy_top = self.height - bar_h;
         self.fill_rect(0, sy_top, self.width, bar_h, self.theme.status_bg);
         let ty = sy_top + 4;
+        let cw = self.cw();
         // Left = the brand mark then the brand text (accent). The glyph radius is
         // sized so the ring (extent ≈ 7/6·r) fits within the bar height.
         let lr = (((bar_h / 2).saturating_sub(2)) * 6 / 7).max(5);
         let lhalf = ((lr / 3).max(3)) / 2;
         let lcx = OUTER + lr + lhalf;
         self.draw_logo(lcx, sy_top + bar_h / 2, lr, self.theme.accent, self.theme.chat_fg);
-        let text_x = lcx + lr + lhalf + self.cw() / 2;
-        self.draw_str(text_x, ty, &self.status_left, self.theme.accent, self.theme.status_bg);
-        // Right = datetime (muted), right-aligned. Both strings come from the UI
-        // config templates via `set_status`.
-        let rlen = self.status_right.len() as u64;
-        let rx = self.width.saturating_sub(rlen * self.cw() + OUTER);
-        self.draw_str(rx, ty, &self.status_right, self.theme.status_fg, self.theme.status_bg);
+        let text_x = lcx + lr + lhalf + cw / 2;
+        // Split the bar: left brand, right system info. Never overlap — each
+        // side is ellipsized into its half (with a 2-cell gap in the middle).
+        let gap = 2 * cw;
+        let usable = self.width.saturating_sub(text_x + OUTER + gap);
+        let left_budget = (usable / 2 / cw).max(4) as usize;
+        let right_budget = (usable.saturating_sub(left_budget as u64 * cw) / cw).max(4) as usize;
+        let left = crate::textsel::ellipsize(&self.status_left, left_budget);
+        let right = crate::textsel::ellipsize(&self.status_right, right_budget);
+        self.draw_str(text_x, ty, &left, self.theme.accent, self.theme.status_bg);
+        let rlen = right.chars().count() as u64;
+        let rx = self.width.saturating_sub(rlen * cw + OUTER);
+        // Guard: right edge of left text must stay left of right text.
+        let left_end = text_x + left.chars().count() as u64 * cw + gap;
+        let rx = rx.max(left_end).min(self.width.saturating_sub(OUTER));
+        // Re-ellipsize right if the guard ate columns.
+        let right_cols = ((self.width.saturating_sub(rx + OUTER)) / cw) as usize;
+        let right = crate::textsel::ellipsize(&self.status_right, right_cols);
+        self.draw_str(rx, ty, &right, self.theme.status_fg, self.theme.status_bg);
     }
 
-    /// Paint the chat caret in its current blink state (accent bar, or the pane
-    /// background to erase it).
+    /// Draw `s` within `[x, x+max_w)`, ellipsizing when it would overflow.
+    /// Returns the x just past the last painted glyph.
+    fn draw_str_fit(&self, x: u64, y: u64, s: &str, fg: Rgb, bg: Rgb, max_w: u64) -> u64 {
+        let cols = (max_w / self.cw()) as usize;
+        let t = crate::textsel::ellipsize(s, cols);
+        self.draw_str(x, y, &t, fg, bg)
+    }
+
+    /// Geometry of the Grok-style input composer inside the chat pane:
+    /// `(box_x, box_y, box_w, box_h, text_x, text_y, hint_y)`.
+    fn composer_geom(&self) -> (u64, u64, u64, u64, u64, u64, u64) {
+        let p = &self.chat;
+        let vpad = COMPOSER_VPAD;
+        let hint_gap = COMPOSER_HINT_GAP;
+        // Pane interior bottom (above outer border + pad).
+        let bottom = p.y + p.h - BORDER - PAD;
+        let hint_y = bottom.saturating_sub(p.ch);
+        let box_h = vpad + p.ch + vpad + 2; // 1px border each side
+        let box_y = hint_y.saturating_sub(hint_gap + box_h);
+        let box_x = p.x + BORDER + PAD;
+        let box_w = p.w.saturating_sub(2 * (BORDER + PAD));
+        let text_x = box_x + 8;
+        let text_y = box_y + 1 + vpad;
+        (box_x, box_y, box_w, box_h, text_x, text_y, hint_y)
+    }
+
+    /// Draw a soft-rounded rectangle outline (Grok-style input chrome).
+    fn rounded_outline(&self, x: u64, y: u64, w: u64, h: u64, r: u64, c: Rgb) {
+        if w < 2 * r || h < 2 * r {
+            self.rect_outline(x, y, w, h, 1, c);
+            return;
+        }
+        // Straight edges.
+        self.fill_rect(x + r, y, w - 2 * r, 1, c);
+        self.fill_rect(x + r, y + h - 1, w - 2 * r, 1, c);
+        self.fill_rect(x, y + r, 1, h - 2 * r, c);
+        self.fill_rect(x + w - 1, y + r, 1, h - 2 * r, c);
+        // Quarter-circle corners (1px arc).
+        let r = r as i64;
+        for &(cx, cy, sx, sy) in &[
+            (x + r as u64, y + r as u64, -1i64, -1i64),
+            (x + w - 1 - r as u64, y + r as u64, 1i64, -1i64),
+            (x + r as u64, y + h - 1 - r as u64, -1i64, 1i64),
+            (x + w - 1 - r as u64, y + h - 1 - r as u64, 1i64, 1i64),
+        ] {
+            for dy in 0..=r {
+                for dx in 0..=r {
+                    let d2 = dx * dx + dy * dy;
+                    // Outer rim only (~1 px thick).
+                    if d2 <= r * r && d2 >= (r - 1) * (r - 1) {
+                        self.put_pixel((cx as i64 + sx * dx) as u64, (cy as i64 + sy * dy) as u64, c);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Visible slice of the composer line and the column of the caret within it
+    /// (for long lines that scroll inside the box).
+    fn composer_visible(&self, max_cols: usize) -> (usize, &str, usize) {
+        let line = self.composer_line.as_str();
+        let cur = self.composer_cur.min(line.len());
+        if line.len() <= max_cols {
+            return (0, line, cur);
+        }
+        let start = cur.saturating_sub(max_cols.saturating_sub(1)).min(line.len().saturating_sub(max_cols));
+        let vis = &line[start..start + max_cols.min(line.len() - start)];
+        (start, vis, cur.saturating_sub(start))
+    }
+
+    /// Pixel x of the caret bar inside the composer box.
+    fn composer_caret_x(&self) -> Option<u64> {
+        if !self.composer_active || self.action_focused() || !self.chat.has_composer {
+            return None;
+        }
+        let (bx, _by, bw, _bh, tx, _ty, _hy) = self.composer_geom();
+        let max_cols = ((bw.saturating_sub(16)) / self.chat.cw).saturating_sub(2) as usize;
+        let (_start, _vis, caret_col) = self.composer_visible(max_cols);
+        let prompt_cols = 2u64; // "> "
+        Some(tx + (prompt_cols + caret_col as u64) * self.chat.cw)
+    }
+
+    /// Paint **only** the composer caret bar (blink path). Never blanks the box —
+    /// a full `draw_composer` on every blink (and every streamed token) was the
+    /// flicker during response rendering.
+    fn paint_composer_caret(&self) {
+        let Some(cx) = self.composer_caret_x() else { return };
+        let (_bx, _by, _bw, _bh, _tx, ty, _hy) = self.composer_geom();
+        let color = if self.caret_on { self.theme.accent } else { self.theme.composer_bg };
+        self.fill_rect(cx, ty, 2 * self.scale.max(1), self.chat.ch, color);
+    }
+
+    /// Paint the Grok-style composer box + hint bar at the bottom of the chat pane.
+    ///
+    /// Paints **in place** (no strip-wide clear). The chat grid is already sized
+    /// above this region, so scrollback never lands here; blanking the whole
+    /// reserved strip on every call is what made streaming replies flash the box.
+    fn draw_composer(&self) {
+        if !self.chat.has_composer || self.chat.w == 0 {
+            return; // parked (action-fullscreen) — no visible chat chrome
+        }
+        let (bx, by, bw, bh, tx, ty, hy) = self.composer_geom();
+        // Elevated fill + rounded border (accent when the prompt owns focus).
+        self.fill_rect(bx + 1, by + 1, bw.saturating_sub(2), bh.saturating_sub(2), self.theme.composer_bg);
+        let border = if self.composer_active && !self.action_focused() {
+            self.theme.accent
+        } else {
+            self.theme.composer_border
+        };
+        let radius = (4 * self.scale).max(4);
+        self.rounded_outline(bx, by, bw, bh, radius, border);
+        // Prompt glyph + input text.
+        let prompt = "> ";
+        let max_cols = ((bw.saturating_sub(16)) / self.chat.cw).saturating_sub(2) as usize;
+        let (_vis_start, vis, caret_col) = self.composer_visible(max_cols);
+        let mut x = self.draw_str(tx, ty, prompt, self.theme.accent, self.theme.composer_bg);
+        x = self.draw_str(x, ty, vis, self.theme.chat_fg, self.theme.composer_bg);
+        // Clear leftover glyphs to the right of the text (shrinking line).
+        let rest = (bx + bw).saturating_sub(x + 4);
+        if rest > 0 {
+            self.fill_rect(x, ty, rest, self.chat.ch, self.theme.composer_bg);
+        }
+        // Caret inside the box (only while the composer is the live prompt).
+        if self.composer_active && !self.action_focused() {
+            let cx = tx + (prompt.len() as u64 + caret_col as u64) * self.chat.cw;
+            let color = if self.caret_on { self.theme.accent } else { self.theme.composer_bg };
+            self.fill_rect(cx, ty, 2 * self.scale.max(1), self.chat.ch, color);
+        }
+        // Hint bar: shortcuts left, model/mode right — each side ellipsized so
+        // a narrow chat pane never paints past the composer box (or overlaps).
+        let hx = bx;
+        let hw = bw;
+        let cw = self.chat.cw;
+        self.fill_rect(hx, hy, hw, self.chat.ch, self.chat.bg);
+        let total_cols = (hw / cw).max(1) as usize;
+        let gap = 2usize;
+        let right_raw = self.composer_hint_r.chars().count();
+        let right_cols = right_raw.min(total_cols / 3).min(total_cols.saturating_sub(gap + 4));
+        let left_cols = total_cols.saturating_sub(right_cols + if right_cols > 0 { gap } else { 0 });
+        let left = crate::textsel::ellipsize(&self.composer_hint_l, left_cols);
+        let right = crate::textsel::ellipsize(&self.composer_hint_r, right_cols);
+        self.draw_str(hx, hy, &left, self.theme.composer_hint, self.chat.bg);
+        if !right.is_empty() {
+            let rlen = right.chars().count() as u64 * cw;
+            self.draw_str(hx + hw.saturating_sub(rlen), hy, &right, self.theme.composer_hint, self.chat.bg);
+        }
+    }
+
+    /// Paint the caret in its current blink state. When the chat pane has a
+    /// Grok-style composer, the caret only blinks inside the box while the
+    /// prompt is active — never during streamed reply output (that was a full
+    /// box redraw and looked like the whole composer flickering).
     fn paint_caret(&self) {
+        if self.chat.has_composer {
+            if self.composer_active {
+                self.paint_composer_caret();
+            }
+            return;
+        }
         if !self.chat.show_caret || self.chat.view != 0 {
             return;
         }
@@ -1302,6 +1712,9 @@ impl Screen {
 
     /// Full repaint: background, chat pane (content re-rendered from its grid),
     /// the action (right) pane if open, caret, status bar.
+    ///
+    /// Parked panes (`w == 0`, fullscreen) are skipped entirely — their content
+    /// is preserved in memory via [`Pane::take_content`] and restored on unpark.
     fn redraw(&self) {
         // Paint only the background *gutters* (margins + the gap between panes),
         // never a full-screen clear — the panes are painted over their own areas
@@ -1309,14 +1722,15 @@ impl Screen {
         // makes opening/closing the action pane not flicker the whole screen.
         self.paint_gutters();
         // Drop shadows sit in the gutters (right/bottom bands of each pane).
-        self.drop_shadow(self.chat.x, self.chat.y, self.chat.w, self.chat.h);
-        if self.right != RightMode::Closed {
-            self.drop_shadow(self.logs.x, self.logs.y, self.logs.w, self.logs.h);
+        if self.chat.w > 0 {
+            self.drop_shadow(self.chat.x, self.chat.y, self.chat.w, self.chat.h);
+            self.fill_rect(self.chat.x, self.chat.y, self.chat.w, self.chat.h, self.chat.bg);
+            self.draw_frame(&self.chat, !self.action_focused());
+            self.render_view(&self.chat);
+            self.draw_composer();
         }
-        self.fill_rect(self.chat.x, self.chat.y, self.chat.w, self.chat.h, self.chat.bg);
-        self.draw_frame(&self.chat, !self.action_focused());
-        self.render_view(&self.chat);
-        if self.right != RightMode::Closed {
+        if self.right != RightMode::Closed && self.logs.w > 0 {
+            self.drop_shadow(self.logs.x, self.logs.y, self.logs.w, self.logs.h);
             self.fill_rect(self.logs.x, self.logs.y, self.logs.w, self.logs.h, self.logs.bg);
             // The header is a tmux-style tab bar (drawn by draw_tab_bar), so the
             // frame is drawn with an empty title.
@@ -1329,7 +1743,9 @@ impl Screen {
                 self.render_view(&self.logs);
             }
         }
-        if self.chat.view == 0 {
+        // Grid caret only when there is no composer; otherwise the caret is in
+        // the input box (or absent while a reply streams).
+        if self.chat.w > 0 && self.chat.view == 0 {
             self.caret_draw(&self.chat);
         }
         self.draw_status();
@@ -1467,17 +1883,11 @@ impl Screen {
         if inner > fill {
             self.fill_rect(bx + 1 + fill, y + 1, inner - fill, bh.saturating_sub(2), self.theme.chat_bg);
         }
-        // Detail (e.g. "512M/6.0G") after the bar. Clamp it to the space left
-        // before the pane's right edge (x + w): truncate if somehow longer, and
-        // pad to that width so a shrinking value leaves no residue AND the text
-        // can never overflow the pane border.
+        // Detail (e.g. "512M/6.0G") after the bar — ellipsize + pad so it never
+        // overflows the pane and shrinking values leave no residue.
         let detail_x = bx + bw + cw;
         let avail = ((x + w).saturating_sub(detail_x) / cw) as usize;
-        let mut d = alloc::string::String::from(detail);
-        d.truncate(avail);
-        while d.len() < avail {
-            d.push(' ');
-        }
+        let d = crate::textsel::fit_width(detail, avail);
         self.draw_str(detail_x, y, &d, self.theme.title_dim, bg);
         y + ch + ch / 3
     }
@@ -1557,8 +1967,9 @@ pub fn draw_top(v: &TopView) {
         let heap_pct = if v.heap_total > 0 { v.heap_used * 100 / v.heap_total } else { 0 };
         y = sc.usage_bar_bg(x, y, iw, "heap   ", heap_pct, &alloc::format!("{}/{}", fmt(v.heap_used), fmt(v.heap_total)), bg);
         y += ch / 2;
-        // Footer stats — each padded to a fixed width so a value that shrinks
-        // between refreshes (uptime, alloc count) leaves no stale trailing text.
+        // Footer stats — fit to pane width (ellipsis + pad) so a narrow action
+        // pane never overflows, and shrinking values leave no residue.
+        let footer_cols = (iw / sc.cw()).max(1) as usize;
         for s in [
             alloc::format!("cores online : {}  ({})", v.cores_online, v.arch),
             alloc::format!("model loaded : {}", fmt(v.model_bytes)),
@@ -1569,7 +1980,7 @@ pub fn draw_top(v: &TopView) {
             if y + ch > iy + sc.logs.rows * sc.logs.ch {
                 break;
             }
-            sc.draw_str_bg(x, y, &alloc::format!("{:<40}", s), sc.theme.logs_fg, bg);
+            sc.draw_str_bg(x, y, &crate::textsel::fit_width(&s, footer_cols), sc.theme.logs_fg, bg);
             y += ch;
         }
         sc.cursor_overlay();
@@ -1584,12 +1995,17 @@ pub struct AudioView<'a> {
     pub rate: u32,
     pub playing: bool,
     pub paused: bool,
+    /// Peak envelope `0..=255` for the wave visualizer (see `audio::waveform_peaks`).
+    pub peaks: &'a [u8],
+    /// Software volume percent (`0..=100`) and mute (from `sound::volume`/`muted`).
+    pub volume: u32,
+    pub muted: bool,
 }
 
-/// Paint the audio-player tab: the track name, a scrubber bar at the current
-/// position, and mm:ss / mm:ss. No-op unless the audio tab is active. Called
-/// from the shell's idle tick while the player runs (the audio keeps playing
-/// regardless of which tab is shown — this only draws when it's on top).
+/// Paint the audio-player tab in the **same HUD layout as the video player**:
+/// a centre **wave visualizer** (played = accent, remaining = dim) plus a
+/// bottom control strip (status line, scrubber, shortcut hints). No-op unless
+/// the audio tab is active. Called ~4 Hz from the shell while the tab is on top.
 pub fn draw_audio(v: &AudioView) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
@@ -1599,35 +2015,131 @@ pub fn draw_audio(v: &AudioView) {
         sc.cursor_restore();
         sc.cur_vis = false;
         let ch = sc.ch();
-        let (px, iy, iw) = (sc.logs.ix, sc.logs.iy, sc.logs.cols * sc.logs.cw);
-        let _ = iw;
-        // Repaint in place (no full clear — the pane was cleared once when the
-        // tab opened); the only moving parts are the progress bar (self-filling)
-        // and the padded time detail, so the ~4 Hz refresh never blanks.
+        let cw = sc.cw();
+        let (px, py) = (sc.logs.ix, sc.logs.iy);
+        let (pw, ph) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
         let bg = sc.logs.bg;
-        let mut y = iy + ch;
-        let state = if v.paused {
-            "|| paused "
-        } else if v.playing {
-            "> playing "
+        // Same HUD height as the video player so the two tabs feel identical.
+        let barh = ch * 4 + ch / 2;
+        let by = py + ph.saturating_sub(barh);
+
+        // --- centre: waveform visualizer ---------------------------------
+        // Compact band (about 1/3 of the content height, capped) centred in
+        // the area above the HUD — not full-pane tall.
+        let content_h = by.saturating_sub(py);
+        let wave_h = (content_h / 3).clamp(ch * 2, ch * 5);
+        let wave_top = py + content_h.saturating_sub(wave_h) / 2;
+        let wave_x = px + cw * 2;
+        let wave_w = pw.saturating_sub(4 * cw).max(1);
+        // Clear the full content band once so a taller previous paint (or
+        // leftover glyphs) never sticks around when the wave shrinks.
+        sc.fill_rect(px, py, pw, content_h.saturating_sub(1), bg);
+        let mid = wave_top + wave_h / 2;
+        let n_peaks = v.peaks.len().max(1);
+        let play_x = if v.total_ms > 0 {
+            (wave_w * v.pos_ms.min(v.total_ms) / v.total_ms).min(wave_w.saturating_sub(1))
         } else {
-            "= ended   "
+            0
         };
-        sc.draw_str_bg(px, y, state, sc.theme.accent, bg);
-        y += ch + ch / 2;
-        sc.draw_str_bg(px, y, v.name, sc.theme.logs_fg, bg);
-        y += ch + ch / 2;
-        let pct = if v.total_ms > 0 { (v.pos_ms * 100 / v.total_ms).min(100) } else { 0 };
+        for col in 0..wave_w {
+            let pi = ((col as usize) * n_peaks) / (wave_w as usize).max(1);
+            let peak = v.peaks.get(pi).copied().unwrap_or(0) as u64;
+            // Half-height bar (mirrored above/below centre); min 1px when energy.
+            let half = if peak == 0 {
+                0
+            } else {
+                ((wave_h / 2 - 1) * peak / 255).max(1)
+            };
+            let color = if col <= play_x { sc.theme.accent } else { sc.theme.title_dim };
+            // Clear the column then draw the bar.
+            sc.fill_rect(wave_x + col, wave_top, 1, wave_h, bg);
+            if half > 0 {
+                sc.fill_rect(wave_x + col, mid.saturating_sub(half), 1, half * 2, color);
+            } else {
+                // Quiet: a 1px centre tick so the track silhouette stays visible.
+                sc.fill_rect(wave_x + col, mid, 1, 1, sc.theme.sep_dim);
+            }
+        }
+        // Playhead: thin bright line at the current position.
+        sc.fill_rect(wave_x + play_x, wave_top, 2.max(sc.scale), wave_h, sc.theme.chat_fg);
+
+        // --- bottom HUD (mirrors `draw_video_status`) --------------------
+        sc.fill_rect(px, by, pw, 1, sc.theme.accent); // top hairline
+        let cols = (pw / cw).saturating_sub(2).max(4) as usize;
+        let fit = |s: &str| crate::textsel::fit_width(s, cols);
         let mmss = |ms: u64| alloc::format!("{}:{:02}", ms / 60000, ms % 60000 / 1000);
-        let detail = alloc::format!("{} / {}", mmss(v.pos_ms), mmss(v.total_ms));
-        sc.usage_bar_bg(px, y, iw, "", pct, &detail, bg);
-        y += ch * 2;
-        sc.draw_str_bg(px, y, &alloc::format!("{} Hz mono", v.rate), sc.theme.title_dim, bg);
-        y += ch + ch / 2;
-        // Key controls (only when the action pane is focused; switch tabs freely).
-        for line in ["space play/pause  0 restart", "<- ->  seek 5s   up/dn  30s", "Ctrl+C stops"] {
-            sc.draw_str_bg(px, y, line, sc.theme.title_dim, bg);
-            y += ch;
+        let state = if v.paused {
+            "||"
+        } else if v.playing {
+            ">"
+        } else {
+            "="
+        };
+        let time = alloc::format!("{} / {}", mmss(v.pos_ms), mmss(v.total_ms));
+        let vol = if v.muted {
+            String::from("muted")
+        } else {
+            alloc::format!("vol {}%", v.volume.min(100))
+        };
+        // Drop less-critical fields as the pane narrows so the line always fits.
+        let candidates = [
+            alloc::format!("{} {}  {}  {}", state, v.name, time, vol),
+            alloc::format!("{} {}  {}", state, v.name, time),
+            alloc::format!("{} {}", state, v.name),
+            alloc::format!("{} {}", state, crate::textsel::ellipsize(v.name, cols.saturating_sub(3).max(1))),
+        ];
+        let line1 = candidates
+            .into_iter()
+            .find(|s| s.chars().count() <= cols)
+            .unwrap_or_else(|| crate::textsel::ellipsize(&alloc::format!("{} {}", state, v.name), cols));
+        let mut y = by + ch / 3;
+        sc.draw_str_bg(px + cw, y, &fit(&line1), sc.theme.accent, bg);
+        y += ch + ch / 4;
+        // Scrubber in the control strip (video-style), not the main area.
+        let track_x = px + cw;
+        let track_w = pw.saturating_sub(2 * cw);
+        let filled = if v.total_ms > 0 {
+            (track_w * v.pos_ms.min(v.total_ms) / v.total_ms).min(track_w)
+        } else {
+            0
+        };
+        sc.fill_rect(track_x, y + ch / 3, track_w, ch / 4, sc.theme.title_dim);
+        sc.fill_rect(track_x, y + ch / 3, filled, ch / 4, sc.theme.accent);
+        y += ch + ch / 4;
+        // Shortcut hints: wrap; drop tokens that can't fit even alone.
+        let hints = [
+            "space play/pause",
+            "<-/-> seek",
+            "up/dn volume",
+            "0 restart",
+            "m mute",
+            "Ctrl+C stop",
+        ];
+        let sep = "   ";
+        let mut linebuf = String::new();
+        let hud_bottom = py + ph;
+        for h in hints {
+            if h.chars().count() > cols {
+                continue; // too wide even alone — hide
+            }
+            let cand = if linebuf.is_empty() {
+                String::from(h)
+            } else {
+                alloc::format!("{}{}{}", linebuf, sep, h)
+            };
+            if cand.chars().count() > cols && !linebuf.is_empty() {
+                if y + ch > hud_bottom {
+                    break; // no room for another hint row
+                }
+                sc.draw_str_bg(px + cw, y, &fit(&linebuf), sc.theme.logs_fg, bg);
+                y += ch;
+                linebuf = String::from(h);
+            } else {
+                linebuf = cand;
+            }
+        }
+        if !linebuf.is_empty() && y + ch <= hud_bottom + ch {
+            sc.draw_str_bg(px + cw, y, &fit(&linebuf), sc.theme.logs_fg, bg);
         }
         sc.cursor_overlay();
     });
@@ -1638,8 +2150,21 @@ pub fn draw_audio(v: &AudioView) {
 /// and the key-shortcut hints. Drawn *after* the frame blit (present_surface
 /// clears the pane each present), so it sits on top like a real player's HUD.
 /// No-op unless the video surface tab is active.
+///
+/// `fps` is the instantaneous / smoothed decode+present FPS (0 = unknown / paused).
 #[allow(clippy::too_many_arguments)]
-pub fn draw_video_status(name: &str, playing: bool, muted: bool, has_audio: bool, frame: usize, frames: usize, pos_ms: u64, total_ms: u64) {
+pub fn draw_video_status(
+    name: &str,
+    playing: bool,
+    muted: bool,
+    has_audio: bool,
+    frame: usize,
+    frames: usize,
+    pos_ms: u64,
+    total_ms: u64,
+    volume: u32,
+    fps: u32,
+) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
         if sc.right != RightMode::Surface(VIDEO_SURFACE) {
@@ -1651,29 +2176,81 @@ pub fn draw_video_status(name: &str, playing: bool, muted: bool, has_audio: bool
         let cw = sc.cw();
         let (px, py) = (sc.logs.ix, sc.logs.iy);
         let (pw, ph) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
-        let bg = sc.theme.status_bg;
-        // A three-line control bar hugging the pane bottom (status + scrubber +
-        // shortcuts), overpainting the lower strip of the frame.
-        let barh = ch * 3 + ch;
+        // Draw on the pane background (the reserved strip is left clean by
+        // `present_surface_reserve`), repainting text *in place* padded to the
+        // full width — never a per-frame full-strip clear, so no flicker on the
+        // single-buffered framebuffer (same discipline as `draw_audio`).
+        let bg = sc.logs.bg;
+        let barh = ch * 4 + ch / 2;
         let by = py + ph.saturating_sub(barh);
-        sc.fill_rect(px, by, pw, barh, bg);
-        sc.fill_rect(px, by, pw, 1, sc.theme.accent); // top hairline
+        sc.fill_rect(px, by, pw, 1, sc.theme.accent); // top hairline (1px, no flicker)
+        // Usable text width in whole glyph cells, with a one-cell left margin.
+        let cols = (pw / cw).saturating_sub(2).max(4) as usize;
+        let fit = |s: &str| crate::textsel::fit_width(s, cols);
         let mmss = |ms: u64| alloc::format!("{}:{:02}", ms / 60000, ms % 60000 / 1000);
-        let state = if playing { ">  playing" } else { "|| paused " };
-        let vol = if !has_audio { "[no audio]" } else if muted { "[muted]" } else { "[vol]" };
-        let mut y = by + ch / 2;
-        let line1 = alloc::format!("{}   {}   {} / {}   frame {}/{}   {}", state, name, mmss(pos_ms), mmss(total_ms), frame, frames, vol);
-        sc.draw_str_bg(px + cw, y, &line1, sc.theme.accent, bg);
-        y += ch + ch / 3;
-        // Scrubber: a full-width track with a filled portion for progress.
+        let state = if playing { ">" } else { "||" };
+        let vol = if !has_audio {
+            String::from("no audio")
+        } else if muted {
+            String::from("muted")
+        } else {
+            alloc::format!("vol {}%", volume.min(100))
+        };
+        let fps_s = if fps > 0 {
+            alloc::format!("{} fps", fps)
+        } else {
+            String::from("-- fps")
+        };
+        // Drop fields as the pane narrows so the status line never overflows.
+        let time = alloc::format!("{} / {}", mmss(pos_ms), mmss(total_ms));
+        let fr = alloc::format!("{}/{}", frame, frames);
+        let candidates = [
+            alloc::format!("{} {}  {}  {}  {}  {}", state, name, time, fr, fps_s, vol),
+            alloc::format!("{} {}  {}  {}  {}", state, name, time, fps_s, vol),
+            alloc::format!("{} {}  {}  {}", state, name, time, fps_s),
+            alloc::format!("{} {}  {}", state, name, time),
+            alloc::format!("{} {}", state, name),
+            alloc::format!("{} {}", state, crate::textsel::ellipsize(name, cols.saturating_sub(3).max(1))),
+        ];
+        let line1 = candidates
+            .into_iter()
+            .find(|s| s.chars().count() <= cols)
+            .unwrap_or_else(|| crate::textsel::ellipsize(&alloc::format!("{} {}", state, name), cols));
+        let mut y = by + ch / 3;
+        sc.draw_str_bg(px + cw, y, &fit(&line1), sc.theme.accent, bg);
+        y += ch + ch / 4;
+        // Scrubber: a full-width track with a filled portion for progress
+        // (self-filling — the whole track is overwritten each refresh).
         let track_x = px + cw;
         let track_w = pw.saturating_sub(2 * cw);
         let filled = if total_ms > 0 { (track_w * pos_ms.min(total_ms) / total_ms).min(track_w) } else { 0 };
         sc.fill_rect(track_x, y + ch / 3, track_w, ch / 4, sc.theme.title_dim);
         sc.fill_rect(track_x, y + ch / 3, filled, ch / 4, sc.theme.accent);
-        y += ch + ch / 3;
-        let hints = "space play/pause   <-/-> seek 1f   up/dn 10f   0 restart   m mute   Ctrl+C stop";
-        sc.draw_str_bg(px + cw, y, hints, sc.theme.title_dim, bg);
+        y += ch + ch / 4;
+        // Shortcuts: wrap; hide tokens that don't fit; stop when HUD is full.
+        let hints = ["space play/pause", "<-/-> seek", "up/dn volume", "0 restart", "m mute", "Ctrl+C stop"];
+        let sep = "   ";
+        let mut linebuf = String::new();
+        let hud_bottom = py + ph;
+        for h in hints {
+            if h.chars().count() > cols {
+                continue;
+            }
+            let cand = if linebuf.is_empty() { String::from(h) } else { alloc::format!("{}{}{}", linebuf, sep, h) };
+            if cand.chars().count() > cols && !linebuf.is_empty() {
+                if y + ch > hud_bottom {
+                    break;
+                }
+                sc.draw_str_bg(px + cw, y, &fit(&linebuf), sc.theme.logs_fg, bg);
+                y += ch;
+                linebuf = String::from(h);
+            } else {
+                linebuf = cand;
+            }
+        }
+        if !linebuf.is_empty() && y + ch <= hud_bottom + ch {
+            sc.draw_str_bg(px + cw, y, &fit(&linebuf), sc.theme.logs_fg, bg);
+        }
         sc.cursor_overlay();
     });
 }
@@ -1988,15 +2565,24 @@ pub fn console_print(s: &str) {
             }
             sc.chat = chat;
             sc.caret_on = true; // keep the caret lit right after output
+            // Do **not** redraw the composer here. The chat grid is already
+            // sized above the reserved strip, so streaming tokens never touch
+            // the box — and redrawing (with a strip clear) every chunk is what
+            // made the whole composer flash while a response rendered.
             sc.cursor_overlay();
         }
     });
 }
 
 /// Render one byte into the chat pane (the shell's keystroke echo / backspace).
+/// When the Grok-style composer is active, keystroke echo is handled by
+/// [`composer_set`] — this path is for legacy serial-style editing only.
 pub fn console_put_byte(byte: u8) {
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
+            if sc.composer_active {
+                return; // composer owns the input line
+            }
             sc.cursor_restore();
             sc.cur_vis = false;
             let mut chat = core::mem::replace(&mut sc.chat, dummy_pane());
@@ -2004,6 +2590,105 @@ pub fn console_put_byte(byte: u8) {
             sc.chat = chat;
             sc.caret_on = true;
             sc.cursor_overlay();
+        }
+    });
+}
+
+/// Whether the chat pane has a Grok-style input composer (always true once the
+/// framebuffer console is up with a chat pane).
+pub fn composer_available() -> bool {
+    SCREEN.with(|slot| slot.as_ref().is_some_and(|sc| sc.chat.has_composer))
+}
+
+/// Whether the composer is the live prompt (between [`composer_begin`] and
+/// [`composer_end`]). Serial line-editing still runs in parallel.
+pub fn composer_is_active() -> bool {
+    SCREEN.with(|slot| slot.as_ref().is_some_and(|sc| sc.composer_active))
+}
+
+/// Activate the input composer (call at the start of a prompt `read_line`).
+pub fn composer_begin() {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.cursor_restore();
+            sc.cur_vis = false;
+            // Wipe any residual scrollback caret left after a streamed reply
+            // (accent bar at the end of the last response line).
+            if sc.chat.view == 0 {
+                sc.repaint_cursor_cell(&sc.chat);
+            }
+            sc.composer_active = true;
+            sc.composer_line.clear();
+            sc.composer_cur = 0;
+            sc.caret_on = true;
+            sc.draw_composer();
+            sc.cursor_overlay();
+        }
+    });
+}
+
+/// Update the composer line + caret column (0..=len). Redraws the box in place.
+pub fn composer_set(line: &str, cursor: usize) {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.cursor_restore();
+            sc.cur_vis = false;
+            sc.composer_line.clear();
+            sc.composer_line.push_str(line);
+            sc.composer_cur = cursor.min(line.len());
+            sc.caret_on = true;
+            sc.draw_composer();
+            sc.cursor_overlay();
+        }
+    });
+}
+
+/// Set the right half of the composer hint bar (e.g. model name / approval mode).
+pub fn composer_set_hint_right(s: &str) {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.composer_hint_r.clear();
+            sc.composer_hint_r.push_str(s);
+            if sc.chat.has_composer {
+                sc.cursor_restore();
+                sc.cur_vis = false;
+                sc.draw_composer();
+                sc.cursor_overlay();
+            }
+        }
+    });
+}
+
+/// Deactivate the composer (call when a line is submitted or the prompt ends).
+pub fn composer_end() {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.cursor_restore();
+            sc.cur_vis = false;
+            sc.composer_active = false;
+            sc.composer_line.clear();
+            sc.composer_cur = 0;
+            sc.draw_composer(); // empty idle box
+            // Ensure the chat grid never shows a caret while a reply streams.
+            if sc.chat.view == 0 {
+                sc.repaint_cursor_cell(&sc.chat);
+            }
+            sc.cursor_overlay();
+        }
+    });
+}
+
+/// Erase any leftover grid caret in the chat response area (call after a
+/// streamed reply finishes, before the next prompt). Safe no-op without FB.
+pub fn clear_chat_caret() {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            if sc.chat.has_composer && sc.chat.view == 0 {
+                sc.cursor_restore();
+                sc.cur_vis = false;
+                sc.repaint_cursor_cell(&sc.chat);
+                sc.cursor_overlay();
+            }
         }
     });
 }
@@ -2156,7 +2841,7 @@ fn dummy_pane() -> Pane {
         fg: (0, 0, 0), default_fg: (0, 0, 0), bg: (0, 0, 0),
         esc: EscState::Ground, csi: [0; 32], csi_len: 0, bold: false,
         title: String::new(), show_caret: false,
-        grid: Vec::new(), hist: VecDeque::new(), view: 0, sel: None,
+        grid: Vec::new(), hist: VecDeque::new(), view: 0, sel: None, has_composer: false,
     }
 }
 
@@ -2173,8 +2858,25 @@ pub fn editor_dims() -> Option<(usize, usize)> {
     })
 }
 
+/// Copy interactive UI state that `Screen::build` always zeroes (composer mid-
+/// prompt, keyboard focus, caret blink). Without this, Ctrl+F / tab open /
+/// divider drag mid-`read_line` would kill the composer until the next prompt.
+fn preserve_interactive(ns: &mut Screen, old: &Screen) {
+    ns.composer_active = old.composer_active;
+    ns.composer_line = old.composer_line.clone();
+    ns.composer_cur = old.composer_cur;
+    ns.composer_hint_l = old.composer_hint_l.clone();
+    ns.composer_hint_r = old.composer_hint_r.clone();
+    ns.focus_action = old.focus_action;
+    ns.caret_on = old.caret_on;
+    ns.caret_last_ms = old.caret_last_ms;
+    ns.clock_alive = old.clock_alive;
+    ns.blink_seen_ms = old.blink_seen_ms;
+}
+
 /// Rebuild the screen for a new split/right-mode, preserving geometry, layout
-/// config, status text, and — via [`Pane::adopt`] — the pane text content.
+/// config, status text, interactive state, and — via [`Pane::adopt`] — the pane
+/// text content.
 fn rebuilt(old: &Screen, split: bool, right: RightMode) -> Screen {
     let mut ns = Screen::build(
         old.addr, old.width, old.height, old.pitch, old.bpp_bytes, old.r_shift, old.g_shift, old.b_shift, &old.layout, split,
@@ -2185,7 +2887,11 @@ fn rebuilt(old: &Screen, split: bool, right: RightMode) -> Screen {
     ns.tabs = old.tabs.clone();
     ns.active = old.active;
     ns.right_before_editor = old.right_before_editor;
-    ns.clock_alive = old.clock_alive;
+    preserve_interactive(&mut ns, old);
+    // No action pane → keyboard focus is always the chat/composer.
+    if right == RightMode::Closed {
+        ns.focus_action = false;
+    }
     ns.chat.adopt(&old.chat);
     ns.logs.adopt(&old.logs);
     ns
@@ -2337,6 +3043,15 @@ pub fn open_ktrace() {
 /// pixels reach the screen (the determinism boundary stays intact — the agent
 /// emitted grammar-validated draw ops, never raw pixels here).
 pub fn present_surface(id: u32, sw: usize, sh: usize, buf: &[u32]) {
+    present_surface_reserve(id, sw, sh, buf, 0);
+}
+
+/// Like [`present_surface`], but leaves `reserve_bottom` px at the bottom of the
+/// pane untouched — the frame is scaled/letterboxed into the region *above* the
+/// reserve and the reserved strip is never cleared. The video player uses this
+/// to keep its control HUD in a fixed strip that the per-frame blit doesn't
+/// repaint (so the HUD updates in place instead of flickering under it).
+pub fn present_surface_reserve(id: u32, sw: usize, sh: usize, buf: &[u32], reserve_bottom: u64) {
     SCREEN.with(|slot| {
         // Open (or focus) this surface's tab, then paint over its cleared
         // interior. Idempotent: re-presenting the active surface tab is cheap.
@@ -2351,33 +3066,52 @@ pub fn present_surface(id: u32, sw: usize, sh: usize, buf: &[u32]) {
         sc.cursor_restore();
         sc.cur_vis = false;
         let (px, py) = (sc.logs.ix, sc.logs.iy);
-        let (pw, ph) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
-        // Integer scale-to-fit (letterboxed), so the surface keeps its aspect.
-        let scale = core::cmp::max(1, core::cmp::min(pw / sw as u64, ph / sh as u64));
-        let dw = sw as u64 * scale;
-        let dh = sh as u64 * scale;
+        let (pw, ph_full) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
+        // Usable frame height excludes the reserved HUD strip at the bottom.
+        let ph = ph_full.saturating_sub(reserve_bottom);
+        if pw == 0 || ph == 0 || buf.len() < sw * sh {
+            sc.cursor_overlay();
+            return;
+        }
+        sc.fill_rect(px, py, pw, ph, sc.logs.bg);
+        // Letterbox the source into the pane (upscale or downscale).
+        let src_a = sw as u64 * ph;
+        let dst_a = sh as u64 * pw;
+        let (dw, dh) = if sw as u64 <= pw && sh as u64 <= ph {
+            // Integer upscale when the source fits.
+            let scale = core::cmp::max(1, core::cmp::min(pw / sw as u64, ph / sh as u64));
+            (sw as u64 * scale, sh as u64 * scale)
+        } else if src_a > dst_a {
+            let dw = pw;
+            let dh = (sh as u64 * pw / sw as u64).max(1).min(ph);
+            (dw, dh)
+        } else {
+            let dh = ph;
+            let dw = (sw as u64 * ph / sh as u64).max(1).min(pw);
+            (dw, dh)
+        };
         let ox = px + (pw.saturating_sub(dw)) / 2;
         let oy = py + (ph.saturating_sub(dh)) / 2;
-        sc.fill_rect(px, py, pw, ph, sc.logs.bg); // clear the pane interior
-        // Clamp to the interior: a buffer wider than the pane at scale 1 must
-        // clip at the pane edge, never paint over the neighbouring pane.
-        let sw_vis = (sw as u64).min(pw / scale);
-        let sh_vis = (sh as u64).min(ph / scale);
-        for sy in 0..sh_vis {
-            for sx in 0..sw_vis {
-                let c = buf[(sy * sw as u64 + sx) as usize];
-                let rgb = (((c >> 16) & 0xff) as u8, ((c >> 8) & 0xff) as u8, (c & 0xff) as u8);
-                let bx = ox + sx * scale;
-                let by = oy + sy * scale;
-                for j in 0..scale {
-                    for i in 0..scale {
-                        sc.put_pixel(bx + i, by + j, rgb);
-                    }
-                }
+        // Build one destination row at a time and blit — sequential stores beat
+        // hundreds of thousands of put_pixel calls for video.
+        let mut row = alloc::vec![0u32; dw as usize];
+        for dy in 0..dh {
+            let sy = (dy * sh as u64 / dh) as usize;
+            let srow = sy * sw;
+            for dx in 0..dw as usize {
+                let sx = (dx as u64 * sw as u64 / dw) as usize;
+                row[dx] = buf[srow + sx];
             }
+            sc.blit_rgb32_row(ox, oy + dy, &row);
         }
         sc.cursor_overlay();
     });
+}
+
+/// Height in px the video HUD reserves at the bottom of the action pane — the
+/// player blits its frame above this, and [`draw_video_status`] fills it.
+pub fn video_hud_height() -> u64 {
+    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.ch() * 4 + sc.ch() / 2).unwrap_or(0))
 }
 
 /// The action pane's interior size in pixels, if the split is open — the
@@ -2518,26 +3252,26 @@ pub fn editor_render(
                 sc.blit_glyph(x, y, byte, sc.theme.editor_bg, sc.theme.accent); // fg/bg swapped = block cursor
             }
         }
-        // Mode line across the bottom interior row.
+        // Mode line across the bottom interior row — ellipsize so a long path
+        // never paints past the pane edge.
         let sy = iy + text_rows * ch;
         sc.fill_rect(px + BORDER, sy, pw - 2 * BORDER, ch, sc.theme.status_bg);
+        let ml = crate::textsel::ellipsize(modeline, cols as usize);
         let mut x = ix;
-        let mut c = 0u64;
-        for b in modeline.bytes() {
-            if c >= cols {
-                break;
-            }
+        for b in ml.bytes() {
             sc.blit_glyph(x, sy, b, sc.theme.title_active, sc.theme.status_bg);
             x += cw;
-            c += 1;
         }
         sc.cursor_overlay();
     });
 }
 
 /// Rebuild the panes from a new [`LayoutCfg`] (split ratio, font scale, pane
-/// swap, titles) on the live framebuffer and repaint. Used by `/ui` when the
-/// config changes. No-op if the console isn't up.
+/// swap, titles, fullscreen) on the live framebuffer and repaint. Used by
+/// `/ui`, Ctrl+F, and divider drag. No-op if the console isn't up.
+///
+/// Preserves the live composer + focus so a mid-prompt fullscreen toggle does
+/// not strand the shell with a dead input box.
 pub fn relayout(cfg: &LayoutCfg) {
     SCREEN.with(|slot| {
         if let Some(old) = slot {
@@ -2553,9 +3287,14 @@ pub fn relayout(cfg: &LayoutCfg) {
             ns.tabs = old.tabs.clone();
             ns.active = old.active;
             ns.right_before_editor = old.right_before_editor;
-            ns.clock_alive = old.clock_alive;
+            preserve_interactive(&mut ns, old);
             ns.chat.adopt(&old.chat);
             ns.logs.adopt(&old.logs);
+            // Fullscreen can park the chat (action-full): keep focus on action.
+            // Chat-full parks the action pane — snap keyboard back to the composer.
+            if cfg.fullscreen == 1 || mode == RightMode::Closed {
+                ns.focus_action = false;
+            }
             ns.redraw();
             *slot = Some(ns);
         }
@@ -2678,7 +3417,7 @@ pub fn scroll_view(action: bool, delta: i64) {
                 let p = if action { &sc.logs } else { &sc.chat };
                 sc.render_view(p);
                 if !action && v == 0 {
-                    sc.caret_draw(&sc.chat);
+                    sc.caret_draw(&sc.chat); // no-op when chat has_composer
                 }
             }
             sc.cursor_overlay();
@@ -2699,9 +3438,13 @@ pub fn scroll_live(action: bool) {
     scroll_view(action, i64::MIN / 2);
 }
 
-/// Toggle keyboard focus between the chat pane and an open ktrace action pane.
+/// Toggle keyboard focus between the chat pane and an open action pane.
 /// Returns true if the action pane now holds focus. No-op (false) when the
 /// action pane is closed or owned by the editor.
+///
+/// When focus returns to the chat pane, the Grok-style composer is repainted
+/// immediately (accent border + caret) so the shell is ready for input without
+/// waiting for a keystroke to re-sync.
 pub fn focus_toggle() -> bool {
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
@@ -2716,6 +3459,15 @@ pub fn focus_toggle() -> bool {
             sc.draw_frame_titled(&sc.logs, sc.action_focused(), "");
             sc.draw_tab_bar();
             sc.draw_close_btn();
+            // Composer chrome reflects focus (accent border + caret only when
+            // the chat holds keyboard focus). Force caret on so it is visible
+            // the instant focus returns — no need to type first.
+            if sc.chat.has_composer {
+                if !sc.action_focused() {
+                    sc.caret_on = true;
+                }
+                sc.draw_composer();
+            }
             sc.cursor_overlay();
             sc.focus_action
         } else {
@@ -2731,14 +3483,37 @@ pub fn focus_is_action() -> bool {
 
 /// Give keyboard focus to the action pane (true) or the chat pane (false),
 /// e.g. from a mouse click. Same constraints as [`focus_toggle`].
+///
+/// Always refreshes the composer when focusing the chat, even if focus was
+/// already on chat — so a click on the shell agent immediately arms the input.
 pub fn focus_set(action: bool) {
-    let flips = SCREEN.with(|slot| {
+    let (flips, need_composer) = SCREEN.with(|slot| {
         slot.as_ref()
-            .map(|sc| !matches!(sc.right, RightMode::Closed | RightMode::Editor) && sc.focus_action != action)
-            .unwrap_or(false)
+            .map(|sc| {
+                let editor = sc.right == RightMode::Editor;
+                let closed = sc.right == RightMode::Closed;
+                let flips = !closed && !editor && sc.focus_action != action;
+                // Focusing chat: repaint composer even when already focused so
+                // the caret/border activate without a first keystroke.
+                let need_composer = !action && sc.chat.has_composer && !editor;
+                (flips, need_composer)
+            })
+            .unwrap_or((false, false))
     });
     if flips {
         focus_toggle();
+    } else if need_composer {
+        SCREEN.with(|slot| {
+            if let Some(sc) = slot {
+                sc.cursor_restore();
+                sc.cur_vis = false;
+                sc.focus_action = false;
+                sc.caret_on = true;
+                sc.draw_frame(&sc.chat, true);
+                sc.draw_composer();
+                sc.cursor_overlay();
+            }
+        });
     }
 }
 
@@ -2795,7 +3570,11 @@ fn chat_sel_with_cursor(sc: &mut Screen, paint: impl FnOnce(&mut Screen)) {
     sc.cur_vis = false;
     paint(sc);
     if sc.chat.view == 0 {
-        sc.caret_draw(&sc.chat);
+        if sc.composer_active {
+            sc.paint_composer_caret();
+        } else {
+            sc.caret_draw(&sc.chat); // no-op when has_composer
+        }
     }
     sc.cursor_overlay();
 }
@@ -2883,7 +3662,11 @@ pub fn clear_chat() {
             sc.cur_vis = false;
             sc.chat.clear_content();
             sc.fill_rect(sc.chat.ix, sc.chat.iy, sc.chat.cols * sc.chat.cw, sc.chat.rows * sc.chat.ch, sc.chat.bg);
-            sc.caret_draw(&sc.chat);
+            if sc.chat.has_composer {
+                sc.draw_composer();
+            } else {
+                sc.caret_draw(&sc.chat);
+            }
             sc.cursor_overlay();
         }
     });

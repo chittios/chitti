@@ -4,8 +4,15 @@
 //! `line` is an **absolute** index over a pane's scrollback + live grid
 //! (0 = oldest scrollback line) and `col` is a cell column; both endpoints
 //! are inclusive, like the editor's Visual selection.
+//!
+//! Also owns **pane reflow** ([`reflow_lines`]): when the chat|action split is
+//! resized, soft-wrapped lines must re-wrap to the new column count so expanding
+//! a pane fills the extra width (shrink already looked fine because long lines
+//! were truncated).
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 /// One character cell as the compositor stores it: `(byte, fg colour)`.
 pub type Cell = (u8, (u8, u8, u8));
@@ -53,6 +60,143 @@ where
         out.push_str(trimmed);
     }
     out
+}
+
+/// Right-trim trailing empty cells (byte 0) from a stored line.
+fn trim_cells(line: &[Cell]) -> &[Cell] {
+    let mut end = line.len();
+    while end > 0 && line[end - 1].0 == 0 {
+        end -= 1;
+    }
+    &line[..end]
+}
+
+/// Reflow pane lines from `old_cols` to `new_cols`.
+///
+/// Soft-wraps (a row that filled `old_cols` completely) are joined into one
+/// logical line and re-chunked at `new_cols`, so **expanding** a pane reclaims
+/// the unused right margin. Hard newlines (short rows) stay as line breaks.
+/// Empty pad cell is `empty` (typically `(0, default_fg)`).
+///
+/// Returns the full reflowed line list (oldest first), each padded to exactly
+/// `new_cols` cells.
+pub fn reflow_lines(lines: &[Vec<Cell>], old_cols: usize, new_cols: usize, empty: Cell) -> VecDeque<Vec<Cell>> {
+    let new_cols = new_cols.max(1);
+    let old_cols = old_cols.max(1);
+    // 1. Soft-join full-width rows into logical lines.
+    let mut logical: Vec<Vec<Cell>> = Vec::new();
+    let mut cur: Vec<Cell> = Vec::new();
+    for line in lines {
+        let content = trim_cells(line);
+        // A stored row is "full" (soft-wrap candidate) when its non-pad length
+        // equals the old width — i.e. the writer filled the whole row and
+        // advanced to the next without a hard newline.
+        let was_full = content.len() >= old_cols;
+        cur.extend_from_slice(content);
+        if !was_full {
+            logical.push(core::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        logical.push(cur);
+    }
+    // 2. Re-wrap each logical line into `new_cols` chunks.
+    let mut out: VecDeque<Vec<Cell>> = VecDeque::new();
+    for log in logical {
+        if log.is_empty() {
+            out.push_back(alloc::vec![empty; new_cols]);
+            continue;
+        }
+        let mut i = 0;
+        while i < log.len() {
+            let end = (i + new_cols).min(log.len());
+            let mut row = log[i..end].to_vec();
+            row.resize(new_cols, empty);
+            out.push_back(row);
+            i = end;
+        }
+    }
+    out
+}
+
+/// Fit `s` into at most `max` columns, appending `..` when truncated.
+/// `max == 0` yields an empty string. Pure / unit-tested — used by the status
+/// bar, composer hints, and media HUDs so controls never paint past their box.
+pub fn ellipsize(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let n = s.chars().count();
+    if n <= max {
+        return String::from(s);
+    }
+    if max <= 2 {
+        return s.chars().take(max).collect();
+    }
+    let mut t: String = s.chars().take(max - 2).collect();
+    t.push_str("..");
+    t
+}
+
+/// Pad `s` with trailing spaces to exactly `cols` columns, or ellipsize when
+/// longer — so a redraw never leaves residue and never overflows.
+pub fn fit_width(s: &str, cols: usize) -> String {
+    if cols == 0 {
+        return String::new();
+    }
+    let mut t = ellipsize(s, cols);
+    let n = t.chars().count();
+    if n < cols {
+        t.extend(core::iter::repeat(' ').take(cols - n));
+    }
+    t
+}
+
+/// Map an absolute cursor `(line_index, col)` under the old geometry into the
+/// reflowed line list. Best-effort: walks cells in order and counts.
+pub fn reflow_cursor(
+    lines: &[Vec<Cell>],
+    old_cols: usize,
+    new_cols: usize,
+    old_line: usize,
+    old_col: usize,
+) -> (usize, usize) {
+    let new_cols = new_cols.max(1);
+    let old_cols = old_cols.max(1);
+    // Count cells (ignoring pads) before the cursor, treating soft wraps as
+    // continuous and hard wraps as +1 "newline" that doesn't add a cell.
+    let mut cells_before: usize = 0;
+    for (li, line) in lines.iter().enumerate() {
+        let content = trim_cells(line);
+        if li < old_line {
+            cells_before += content.len();
+            // Hard newline: no extra cell, just starts a new logical line for reflow.
+            // Soft wrap: content continues — already counted as cells only.
+            let _was_full = content.len() >= old_cols;
+            // When counting cells for reflow position we only count printable
+            // cells; soft-join means hard-break positions are re-derived from
+            // reflow chunking, so we only need the cell offset within the
+            // soft-joined stream for lines before cursor.
+            continue;
+        }
+        if li == old_line {
+            cells_before += old_col.min(content.len());
+            break;
+        }
+    }
+    // Walk the reflowed stream and find (line, col).
+    let empty: Cell = (0, (0, 0, 0));
+    let reflowed = reflow_lines(lines, old_cols, new_cols, empty);
+    let mut remaining = cells_before;
+    for (ri, row) in reflowed.iter().enumerate() {
+        let content = trim_cells(row);
+        if remaining <= content.len() {
+            return (ri, remaining.min(new_cols.saturating_sub(1)));
+        }
+        remaining -= content.len();
+    }
+    let last = reflowed.len().saturating_sub(1);
+    (last, 0)
 }
 
 #[cfg(test)]
@@ -124,6 +268,60 @@ mod tests {
         assert!(contains(old, 0, 3) && contains(new, 0, 3));
         assert!(!contains(old, 0, 4) && contains(new, 0, 4));
         assert!(!contains(old, 0, 5) && contains(new, 0, 5));
+    }
+
+    fn cells(s: &str) -> Vec<Cell> {
+        s.bytes().map(|b| (b, FG)).collect()
+    }
+
+    #[test_case]
+    fn reflow_expands_soft_wrapped_lines() {
+        // Two full 8-col soft-wraps that form "hello world!!!!" (16 cells).
+        // Expanding to 16 cols must join them into one row.
+        let a = cells("hello wo"); // 8
+        let b = cells("rld!!!!!"); // 8
+        assert_eq!(a.len(), 8);
+        assert_eq!(b.len(), 8);
+        let lines = [a, b];
+        let out = reflow_lines(&lines, 8, 16, (0, FG));
+        assert_eq!(out.len(), 1, "soft wraps join into one line: {out:?}");
+        let text: String = out[0].iter().map(|&(b, _)| if b == 0 { ' ' } else { b as char }).collect();
+        assert!(text.starts_with("hello world!!!!!"), "got {text:?}");
+    }
+
+    #[test_case]
+    fn reflow_shrinks_long_logical_line() {
+        let line = cells("abcdefghij"); // 10 cells, hard short for cols=10? full width
+        // Treat as one full-width line of 10, reflow to 4 → 3 rows.
+        let out = reflow_lines(&[line], 10, 4, (0, FG));
+        assert_eq!(out.len(), 3);
+        let t0: String = out[0].iter().take(4).map(|&(b, _)| b as char).collect();
+        let t1: String = out[1].iter().take(4).map(|&(b, _)| b as char).collect();
+        let t2: String = trim_cells(&out[2]).iter().map(|&(b, _)| b as char).collect();
+        assert_eq!(t0, "abcd");
+        assert_eq!(t1, "efgh");
+        assert_eq!(t2, "ij");
+    }
+
+    #[test_case]
+    fn reflow_preserves_hard_newlines() {
+        // Two short lines → stay two lines even when expanding.
+        let lines = [cells("hi"), cells("yo")];
+        let out = reflow_lines(&lines, 40, 80, (0, FG));
+        assert_eq!(out.len(), 2);
+        assert_eq!(trim_cells(&out[0]).iter().map(|&(b, _)| b as char).collect::<String>(), "hi");
+        assert_eq!(trim_cells(&out[1]).iter().map(|&(b, _)| b as char).collect::<String>(), "yo");
+    }
+
+    #[test_case]
+    fn ellipsize_and_fit_width() {
+        assert_eq!(ellipsize("hello", 10), "hello");
+        assert_eq!(ellipsize("hello world", 8), "hello ..");
+        assert_eq!(ellipsize("ab", 1), "a");
+        assert_eq!(ellipsize("ab", 0), "");
+        assert_eq!(fit_width("hi", 5), "hi   ");
+        assert_eq!(fit_width("hello world", 6).chars().count(), 6);
+        assert!(fit_width("hello world", 6).ends_with(".."));
     }
 
     /// Multi-line selection: middle rows are fully selected; endpoints clamp.

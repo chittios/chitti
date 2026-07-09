@@ -5,6 +5,8 @@
 //! Operates on the reconstructed i32 planes in place, using per-4x4-block
 //! metadata (intra flag, nnz, MV, ref) to derive boundary strength.
 
+
+
 pub const ALPHA: [i32; 52] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 17, 20, 22, 25, 28, 32, 36, 40, 45, 50, 56, 63, 71, 80, 90, 101, 113, 127, 144, 162, 182, 203, 226, 255, 255];
 pub const BETA: [i32; 52] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15, 16, 16, 17, 17, 18, 18];
 pub const TC0: [[i32; 4]; 52] = [
@@ -260,6 +262,182 @@ pub fn deblock(y: &mut [i32], cb: &mut [i32], cr: &mut [i32], w: usize, h: usize
                             };
                             filt_chroma(cb, off, step, b_s, alpha, beta, tc0);
                             filt_chroma(cr, off, step, b_s, alpha, beta, tc0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --- two-list (B/multi-ref/8x8-transform) variant ---------------------------
+
+/// Per-4×4 metadata for the CABAC/High path: motion + resolved reference POCs
+/// for both lists, 8x8-transform flags, and per-plane chroma QP offsets.
+pub struct Meta2<'a> {
+    pub mbw: usize,
+    pub ny4: usize,
+    pub mbqp: &'a [i32],
+    pub mbintra: &'a [bool],
+    pub mbt8: &'a [bool],
+    pub nnz_y: &'a [i32],
+    pub mv0: &'a [[i16; 2]],
+    pub mv1: &'a [[i16; 2]],
+    pub rp0: &'a [i32],
+    pub rp1: &'a [i32],
+    pub aoff: i32,
+    pub boff: i32,
+    pub cqpoff: [i32; 2],
+}
+
+/// Boundary strength for an inter/inter pair with up to two references each
+/// (§8.7.2.1): different reference sets → 1; same set → per-matched-pair mv
+/// distance ≥ 4 (quarter-pel) in any component → 1 (crosswise when the pair
+/// is matched crosswise; both orderings tried when both lists use one picture).
+#[allow(clippy::too_many_arguments)]
+fn bs_inter2(
+    pmv0: [i16; 2], pmv1: [i16; 2], ppoc0: i32, ppoc1: i32,
+    qmv0: [i16; 2], qmv1: [i16; 2], qpoc0: i32, qpoc1: i32,
+) -> i32 {
+    let far = |a: [i16; 2], b: [i16; 2]| (a[0] - b[0]).abs() >= 4 || (a[1] - b[1]).abs() >= 4;
+    let pn = (ppoc0 != i32::MIN) as usize + (ppoc1 != i32::MIN) as usize;
+    let qn = (qpoc0 != i32::MIN) as usize + (qpoc1 != i32::MIN) as usize;
+    if pn != qn {
+        return 1;
+    }
+    if pn == 1 {
+        let (pm, pp) = if ppoc0 != i32::MIN { (pmv0, ppoc0) } else { (pmv1, ppoc1) };
+        let (qm, qp) = if qpoc0 != i32::MIN { (qmv0, qpoc0) } else { (qmv1, qpoc1) };
+        if pp != qp || far(pm, qm) {
+            return 1;
+        }
+        return 0;
+    }
+    // Bi-predicted both sides: reference multisets must match.
+    let same_set = (ppoc0 == qpoc0 && ppoc1 == qpoc1) || (ppoc0 == qpoc1 && ppoc1 == qpoc0);
+    if !same_set {
+        return 1;
+    }
+    if ppoc0 == ppoc1 {
+        // Both lists use one picture: strong only if BOTH orderings are far.
+        let straight = !far(pmv0, qmv0) && !far(pmv1, qmv1);
+        let cross = !far(pmv0, qmv1) && !far(pmv1, qmv0);
+        return if straight || cross { 0 } else { 1 };
+    }
+    if ppoc0 == qpoc0 {
+        if far(pmv0, qmv0) || far(pmv1, qmv1) {
+            return 1;
+        }
+    } else if far(pmv0, qmv1) || far(pmv1, qmv0) {
+        return 1;
+    }
+    0
+}
+
+/// Deblock a frame decoded by the CABAC/High path.
+#[allow(clippy::too_many_arguments)]
+pub fn deblock2(y: &mut [i32], cb: &mut [i32], cr: &mut [i32], w: usize, cw: usize, mbw: usize, mbh: usize, m: &Meta2) {
+    let blk = |px4: usize, py4: usize| py4 * m.ny4 + px4;
+    for mb_y in 0..mbh {
+        for mb_x in 0..mbw {
+            let mb = mb_y * mbw + mb_x;
+            for &(vert, edges) in &[(true, [0usize, 4, 8, 12]), (false, [0, 4, 8, 12])] {
+                for &e in &edges {
+                    if e == 0 && ((vert && mb_x == 0) || (!vert && mb_y == 0)) {
+                        continue;
+                    }
+                    // 8x8-transform MBs: internal luma edges 4 and 12 are not
+                    // filtered (§8.7: transform block edges only).
+                    let luma_skip = (e == 4 || e == 12) && m.mbt8[mb];
+                    if !luma_skip {
+                        for seg in 0..4 {
+                            let (px4, py4, qx4, qy4, nb_mb) = if vert {
+                                let qx4 = mb_x * 4 + e / 4;
+                                let qy4 = mb_y * 4 + seg;
+                                (qx4 - 1, qy4, qx4, qy4, if e == 0 { mb - 1 } else { mb })
+                            } else {
+                                let qx4 = mb_x * 4 + seg;
+                                let qy4 = mb_y * 4 + e / 4;
+                                (qx4, qy4 - 1, qx4, qy4, if e == 0 { (mb_y - 1) * mbw + mb_x } else { mb })
+                            };
+                            let (pb, qb) = (blk(px4, py4), blk(qx4, qy4));
+                            let b_s = if m.mbintra[nb_mb] || m.mbintra[mb] {
+                                if e == 0 { 4 } else { 3 }
+                            } else if m.nnz_y[pb] > 0 || m.nnz_y[qb] > 0 {
+                                2
+                            } else {
+                                bs_inter2(
+                                    m.mv0[pb], m.mv1[pb], m.rp0[pb], m.rp1[pb],
+                                    m.mv0[qb], m.mv1[qb], m.rp0[qb], m.rp1[qb],
+                                )
+                            };
+                            if b_s == 0 {
+                                continue;
+                            }
+                            let qpav = (m.mbqp[nb_mb] + m.mbqp[mb] + 1) >> 1;
+                            let ia = clampi(qpav + m.aoff, 0, 51) as usize;
+                            let ib = clampi(qpav + m.boff, 0, 51) as usize;
+                            let (alpha, beta) = (ALPHA[ia], BETA[ib]);
+                            if alpha == 0 || beta == 0 {
+                                continue;
+                            }
+                            let tc0 = if b_s < 4 { TC0[ia][b_s as usize] } else { 0 };
+                            for k in 0..4 {
+                                let (off, step) = if vert {
+                                    ((mb_y * 16 + seg * 4 + k) * w + mb_x * 16 + e, 1isize)
+                                } else {
+                                    ((mb_y * 16 + e) * w + mb_x * 16 + seg * 4 + k, w as isize)
+                                };
+                                filt_luma(y, off, step, b_s, alpha, beta, tc0);
+                            }
+                        }
+                    }
+                    if e != 0 && e != 8 {
+                        continue;
+                    }
+                    let ce = e / 2;
+                    for seg in 0..4 {
+                        let (px4, py4, qx4, qy4, nb_mb) = if vert {
+                            let qx4 = mb_x * 4 + e / 4;
+                            let qy4 = mb_y * 4 + seg;
+                            (qx4 - 1, qy4, qx4, qy4, if e == 0 { mb - 1 } else { mb })
+                        } else {
+                            let qx4 = mb_x * 4 + seg;
+                            let qy4 = mb_y * 4 + e / 4;
+                            (qx4, qy4 - 1, qx4, qy4, if e == 0 { (mb_y - 1) * mbw + mb_x } else { mb })
+                        };
+                        let (pb, qb) = (blk(px4, py4), blk(qx4, qy4));
+                        let b_s = if m.mbintra[nb_mb] || m.mbintra[mb] {
+                            if e == 0 { 4 } else { 3 }
+                        } else if m.nnz_y[pb] > 0 || m.nnz_y[qb] > 0 {
+                            2
+                        } else {
+                            bs_inter2(
+                                m.mv0[pb], m.mv1[pb], m.rp0[pb], m.rp1[pb],
+                                m.mv0[qb], m.mv1[qb], m.rp0[qb], m.rp1[qb],
+                            )
+                        };
+                        if b_s == 0 {
+                            continue;
+                        }
+                        for (pl, plane) in [(0usize, &mut *cb), (1, &mut *cr)] {
+                            let off_c = m.cqpoff[pl];
+                            let cqp = (qpc(clampi(m.mbqp[nb_mb] + off_c, 0, 51)) + qpc(clampi(m.mbqp[mb] + off_c, 0, 51)) + 1) >> 1;
+                            let ia = clampi(cqp + m.aoff, 0, 51) as usize;
+                            let ib = clampi(cqp + m.boff, 0, 51) as usize;
+                            let (alpha, beta) = (ALPHA[ia], BETA[ib]);
+                            if alpha == 0 || beta == 0 {
+                                continue;
+                            }
+                            let tc0 = if b_s < 4 { TC0[ia][b_s as usize] } else { 0 };
+                            for k in 0..2 {
+                                let (off, step) = if vert {
+                                    ((mb_y * 8 + seg * 2 + k) * cw + mb_x * 8 + ce, 1isize)
+                                } else {
+                                    ((mb_y * 8 + ce) * cw + mb_x * 8 + seg * 2 + k, cw as isize)
+                                };
+                                filt_chroma(plane, off, step, b_s, alpha, beta, tc0);
+                            }
                         }
                     }
                 }

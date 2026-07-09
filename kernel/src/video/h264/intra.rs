@@ -396,3 +396,201 @@ mod tests {
         assert_eq!(intra_chroma(0, &top, &left, 0, true, true)[0], 4);
     }
 }
+
+/// Intra_8x8 luma prediction (§8.3.2, High profile), ported from FFmpeg's
+/// `pred8x8l_*` (h264pred_template.c). Reference samples are filtered first
+/// (§8.3.2.2.1); `top[0..8]` = `p[0..7,-1]`, `top[8..16]` = top-right
+/// `p[8..15,-1]` (pass anything when `avail_tr` is false — it is replicated
+/// from `p[7,-1]`), `left[0..8]` = `p[-1,0..7]`, `corner` = `p[-1,-1]`.
+/// Modes: 0=V 1=H 2=DC 3=DDL 4=DDR 5=VR 6=HD 7=VL 8=HU (as Intra_4x4).
+#[allow(clippy::too_many_arguments)]
+pub fn intra8x8(
+    mode: u8,
+    top: &[i32; 16],
+    left: &[i32; 8],
+    corner: i32,
+    avail_top: bool,
+    avail_left: bool,
+    avail_tl: bool,
+    avail_tr: bool,
+) -> [i32; 64] {
+    // Filtered references (PREDICT_8x8_LOAD_{TOP,TOPRIGHT,LEFT,TOPLEFT}).
+    let mut t = [0i32; 16];
+    if avail_top {
+        t[0] = ((if avail_tl { corner } else { top[0] }) + 2 * top[0] + top[1] + 2) >> 2;
+        for x in 1..7 {
+            t[x] = (top[x - 1] + 2 * top[x] + top[x + 1] + 2) >> 2;
+        }
+        t[7] = ((if avail_tr { top[8] } else { top[7] }) + 2 * top[7] + top[6] + 2) >> 2;
+        if avail_tr {
+            for x in 8..15 {
+                t[x] = (top[x - 1] + 2 * top[x] + top[x + 1] + 2) >> 2;
+            }
+            t[15] = (top[14] + 3 * top[15] + 2) >> 2;
+        } else {
+            for x in 8..16 {
+                t[x] = top[7];
+            }
+        }
+    }
+    let mut l = [0i32; 8];
+    if avail_left {
+        l[0] = ((if avail_tl { corner } else { left[0] }) + 2 * left[0] + left[1] + 2) >> 2;
+        for y in 1..7 {
+            l[y] = (left[y - 1] + 2 * left[y] + left[y + 1] + 2) >> 2;
+        }
+        l[7] = (left[6] + 3 * left[7] + 2) >> 2;
+    }
+    let lt = if avail_tl && avail_top && avail_left { (left[0] + 2 * corner + top[0] + 2) >> 2 } else { 0 };
+
+    let mut out = [0i32; 64];
+    let mut set = |x: usize, y: usize, v: i32| out[y * 8 + x] = v;
+    match mode {
+        0 => {
+            // Vertical.
+            for y in 0..8 {
+                for x in 0..8 {
+                    set(x, y, t[x]);
+                }
+            }
+        }
+        1 => {
+            // Horizontal.
+            for y in 0..8 {
+                for x in 0..8 {
+                    set(x, y, l[y]);
+                }
+            }
+        }
+        2 => {
+            // DC with availability fallback.
+            let dc = if avail_top && avail_left {
+                (t.iter().take(8).sum::<i32>() + l.iter().sum::<i32>() + 8) >> 4
+            } else if avail_top {
+                (t.iter().take(8).sum::<i32>() + 4) >> 3
+            } else if avail_left {
+                (l.iter().sum::<i32>() + 4) >> 3
+            } else {
+                128
+            };
+            for i in 0..64 {
+                out[i] = dc;
+            }
+        }
+        3 => {
+            // Diagonal down-left.
+            for y in 0..8usize {
+                for x in 0..8usize {
+                    let i = x + y;
+                    set(x, y, if i == 14 && x == 7 && y == 7 {
+                        (t[14] + 3 * t[15] + 2) >> 2
+                    } else {
+                        (t[i] + 2 * t[i + 1] + t[i + 2] + 2) >> 2
+                    });
+                }
+            }
+        }
+        4 => {
+            // Diagonal down-right.
+            for y in 0..8i32 {
+                for x in 0..8i32 {
+                    let d = x - y;
+                    let v = if d > 0 {
+                        let k = (d - 1) as usize;
+                        if k == 0 { (lt + 2 * t[0] + t[1] + 2) >> 2 } else { (t[k - 1] + 2 * t[k] + t[k + 1] + 2) >> 2 }
+                    } else if d < 0 {
+                        let k = (-d - 1) as usize;
+                        if k == 0 { (lt + 2 * l[0] + l[1] + 2) >> 2 } else { (l[k - 1] + 2 * l[k] + l[k + 1] + 2) >> 2 }
+                    } else {
+                        (l[0] + 2 * lt + t[0] + 2) >> 2
+                    };
+                    set(x as usize, y as usize, v);
+                }
+            }
+        }
+        5 => {
+            // Vertical-right (ported cell assignments).
+            let zvr = |x: i32, y: i32| 2 * x - y;
+            for y in 0..8i32 {
+                for x in 0..8i32 {
+                    let z = zvr(x, y);
+                    let v = if z >= 0 {
+                        let k = (x - (y >> 1)) as usize;
+                        if z & 1 == 0 {
+                            if k == 0 { (lt + t[0] + 1) >> 1 } else { (t[k - 1] + t[k] + 1) >> 1 }
+                        } else if k == 0 {
+                            (l[0] + 2 * lt + t[0] + 2) >> 2
+                        } else if k == 1 {
+                            (lt + 2 * t[0] + t[1] + 2) >> 2
+                        } else {
+                            (t[k - 2] + 2 * t[k - 1] + t[k] + 2) >> 2
+                        }
+                    } else if z == -1 {
+                        (l[0] + 2 * lt + t[0] + 2) >> 2
+                    } else {
+                        // z <= -2 -> k >= 1: (l[k] + 2*l[k-1] + {lt | l[k-2]}).
+                        let k = (y - 2 * x - 1) as usize;
+                        if k == 1 { (l[1] + 2 * l[0] + lt + 2) >> 2 } else { (l[k] + 2 * l[k - 1] + l[k - 2] + 2) >> 2 }
+                    };
+                    set(x as usize, y as usize, v);
+                }
+            }
+        }
+        6 => {
+            // Horizontal-down.
+            let zhd = |x: i32, y: i32| 2 * y - x;
+            for y in 0..8i32 {
+                for x in 0..8i32 {
+                    let z = zhd(x, y);
+                    let v = if z >= 0 {
+                        let k = (y - (x >> 1)) as usize;
+                        if z & 1 == 0 {
+                            if k == 0 { (lt + l[0] + 1) >> 1 } else { (l[k - 1] + l[k] + 1) >> 1 }
+                        } else if k == 0 {
+                            (t[0] + 2 * lt + l[0] + 2) >> 2
+                        } else if k == 1 {
+                            (lt + 2 * l[0] + l[1] + 2) >> 2
+                        } else {
+                            (l[k - 2] + 2 * l[k - 1] + l[k] + 2) >> 2
+                        }
+                    } else if z == -1 {
+                        (t[0] + 2 * lt + l[0] + 2) >> 2
+                    } else {
+                        // z <= -2 -> k >= 1: (t[k] + 2*t[k-1] + {lt | t[k-2]}).
+                        let k = (x - 2 * y - 1) as usize;
+                        if k == 1 { (t[1] + 2 * t[0] + lt + 2) >> 2 } else { (t[k] + 2 * t[k - 1] + t[k - 2] + 2) >> 2 }
+                    };
+                    set(x as usize, y as usize, v);
+                }
+            }
+        }
+        7 => {
+            // Vertical-left.
+            for y in 0..8usize {
+                for x in 0..8usize {
+                    let k = x + (y >> 1);
+                    let v = if y & 1 == 0 { (t[k] + t[k + 1] + 1) >> 1 } else { (t[k] + 2 * t[k + 1] + t[k + 2] + 2) >> 2 };
+                    set(x, y, v);
+                }
+            }
+        }
+        _ => {
+            // Horizontal-up (mode 8).
+            for y in 0..8usize {
+                for x in 0..8usize {
+                    let zhu = x + 2 * y;
+                    let v = if zhu > 13 {
+                        l[7]
+                    } else if zhu == 13 {
+                        (l[6] + 3 * l[7] + 2) >> 2
+                    } else {
+                        let k = y + (x >> 1);
+                        if x & 1 == 0 { (l[k] + l[k + 1] + 1) >> 1 } else { (l[k] + 2 * l[k + 1] + l[k + 2] + 2) >> 2 }
+                    };
+                    set(x, y, v);
+                }
+            }
+        }
+    }
+    out
+}

@@ -107,6 +107,71 @@ pub trait SndDevice {
 
 static SND: Locked<Option<Box<dyn SndDevice>>> = Locked::new(None);
 
+/// Software output volume in percent (`0..=100`). Applied in [`play`] so every
+/// backend (virtio-snd, HDA, AC'97, SB16) gets the same gain without per-driver
+/// wiring. Adjusted by the media players' ↑/↓ keys.
+static VOLUME: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(100);
+/// Global mute — when set, [`play`] queues silence. Toggled by `m` on the
+/// audio/video tabs (shared so muting one surface mutes the device).
+static MUTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Current software volume percent (`0..=100`).
+pub fn volume() -> u32 {
+    VOLUME.load(core::sync::atomic::Ordering::Relaxed).min(100)
+}
+
+/// Set software volume percent, clamped to `0..=100`.
+pub fn set_volume(v: u32) {
+    VOLUME.store(v.min(100), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Adjust volume by `delta` percent points (e.g. `+5` / `-5`). Returns the new
+/// level. Unmutes when raising volume from a muted state so ↑ is useful after
+/// `m`.
+pub fn volume_adjust(delta: i32) -> u32 {
+    let cur = volume() as i32;
+    let next = (cur + delta).clamp(0, 100) as u32;
+    set_volume(next);
+    if delta > 0 && muted() {
+        set_muted(false);
+    }
+    next
+}
+
+/// Whether global software mute is on.
+pub fn muted() -> bool {
+    MUTED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set global software mute.
+pub fn set_muted(m: bool) {
+    MUTED.store(m, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Toggle global mute; returns the new muted state.
+pub fn toggle_mute() -> bool {
+    let n = !muted();
+    set_muted(n);
+    n
+}
+
+/// Apply [`volume`]/[`muted`] to an S16 mono buffer (in place, clamped).
+pub fn apply_output_gain(pcm: &mut [i16]) {
+    if muted() || volume() == 0 {
+        for s in pcm.iter_mut() {
+            *s = 0;
+        }
+        return;
+    }
+    let g = volume() as i32;
+    if g >= 100 {
+        return;
+    }
+    for s in pcm.iter_mut() {
+        *s = ((*s as i32) * g / 100) as i16;
+    }
+}
+
 /// Bring the sound subsystem up on `dev`.
 pub fn init(dev: Box<dyn SndDevice>) {
     SND.with(|s| *s = Some(dev));
@@ -161,10 +226,20 @@ pub fn autodetect() {
     crate::arch::x86_64::pci::log_class(0x04);
 }
 
-/// Queue `pcm` (S16 mono at `hz`) for playback.
+/// Queue `pcm` (S16 mono at `hz`) for playback. Applies the global software
+/// volume/mute (see [`volume`] / [`muted`]) so media-player ↑/↓/`m` take effect
+/// on every device backend.
 pub fn play(pcm: &[i16], hz: u32) -> Result<(), &'static str> {
     SND.with(|s| match s.as_mut() {
-        Some(d) => d.play(pcm, hz),
+        Some(d) => {
+            if muted() || volume() < 100 {
+                let mut buf = pcm.to_vec();
+                apply_output_gain(&mut buf);
+                d.play(&buf, hz)
+            } else {
+                d.play(pcm, hz)
+            }
+        }
         None => Err("no sound device"),
     })
 }
@@ -267,6 +342,35 @@ mod tests {
         assert_eq!(resample(&[0; 6], 48_000, 16_000).len(), 2);
         // hz == 0 is a no-op guard (never divide by zero).
         assert_eq!(resample(&[9], 0, 48_000), alloc::vec![9]);
+    }
+
+    #[test_case]
+    fn volume_adjust_clamps_and_unmutes() {
+        set_volume(100);
+        set_muted(false);
+        assert_eq!(volume_adjust(50), 100, "cannot exceed 100");
+        assert_eq!(volume_adjust(-30), 70);
+        assert_eq!(volume_adjust(-1000), 0);
+        set_muted(true);
+        assert!(muted());
+        assert_eq!(volume_adjust(10), 10);
+        assert!(!muted(), "raising volume unmutes");
+        set_volume(100);
+        set_muted(false);
+    }
+
+    #[test_case]
+    fn apply_output_gain_scales_and_mutes() {
+        set_volume(50);
+        set_muted(false);
+        let mut pcm = [1000i16, -2000, 0];
+        apply_output_gain(&mut pcm);
+        assert_eq!(pcm, [500, -1000, 0]);
+        set_muted(true);
+        apply_output_gain(&mut pcm);
+        assert_eq!(pcm, [0, 0, 0]);
+        set_volume(100);
+        set_muted(false);
     }
 
     #[test_case]
