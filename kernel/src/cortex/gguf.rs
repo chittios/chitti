@@ -429,10 +429,18 @@ impl<'a> Gguf<'a> {
                 }
                 // Per-layer kv heads must reduce to one value per layer kind
                 // (sliding vs global) — the two-geometry scheme.
-                let kv = kv_heads_per_layer.ok_or(GgufError::MissingKey("attention.head_count_kv"))?;
-                if kv.len() != block_count {
-                    return Err(GgufError::BadValue("head_count_kv length != block_count"));
-                }
+                // Accept either a per-layer I32 array *or* a scalar U32 (Gemma 4
+                // E4B ships the scalar form: one n_kv for every layer).
+                let kv: Vec<i32> = if let Some(v) = kv_heads_per_layer {
+                    if v.len() != block_count {
+                        return Err(GgufError::BadValue("head_count_kv length != block_count"));
+                    }
+                    v
+                } else if let Some(n) = get_u32.get(ak("attention.head_count_kv").as_str()) {
+                    alloc::vec![*n as i32; block_count]
+                } else {
+                    return Err(GgufError::MissingKey("attention.head_count_kv"));
+                };
                 let (mut kv_swa, mut kv_global) = (None, None);
                 for (l, &n) in kv.iter().enumerate() {
                     let slot = if (pattern >> l) & 1 == 1 { &mut kv_swa } else { &mut kv_global };
@@ -443,7 +451,9 @@ impl<'a> Gguf<'a> {
                     }
                 }
                 let kv_swa = kv_swa.ok_or(GgufError::BadValue("no sliding layers in pattern"))?;
-                let kv_global = kv_global.ok_or(GgufError::BadValue("no global layers in pattern"))?;
+                // Global layers may share the same scalar n_kv as sliding (E4B);
+                // if the pattern has no global bit, fall back to the sliding value.
+                let kv_global = kv_global.unwrap_or(kv_swa);
                 let head_dim_global = u32_of("attention.key_length")? as usize;
                 let head_dim_swa = u32_of("attention.key_length_swa")? as usize;
                 let rope_dim_global = u32_of("rope.dimension_count").map(|v| v as usize).unwrap_or(head_dim_global);
@@ -791,5 +801,38 @@ mod tests {
         b.kv_u32("tokenizer.ggml.eos_token_id", 106);
         let bytes = b.finish();
         assert!(matches!(Gguf::parse(&bytes), Err(GgufError::BadValue(_))));
+    }
+
+    /// Gemma 4 E4B (unsloth Q4_K_M) ships `attention.head_count_kv` as a
+    /// *scalar* U32 (same n_kv for every layer), not a per-layer I32 array.
+    /// Parse must accept that form — the silent failure mode for
+    /// `make run-uefi MODEL=e4b` before this landed.
+    #[test_case]
+    fn parses_gemma_scalar_head_count_kv() {
+        let mut b = B::new();
+        b.kv_str("general.architecture", "gemma4");
+        base_keys(&mut b, "gemma4");
+        b.kv_u32("gemma4.attention.sliding_window", 512);
+        b.kv_bool_array("gemma4.attention.sliding_window_pattern", &[true, true, true, false]);
+        // Scalar, not array — the E4B shape.
+        b.kv_u32("gemma4.attention.head_count_kv", 2);
+        b.kv_u32("gemma4.attention.key_length", 512);
+        b.kv_u32("gemma4.attention.key_length_swa", 256);
+        b.kv_u32("gemma4.rope.dimension_count", 512);
+        b.kv_u32("gemma4.rope.dimension_count_swa", 256);
+        b.kv_f32("gemma4.rope.freq_base", 1_000_000.0);
+        b.kv_f32("gemma4.rope.freq_base_swa", 10_000.0);
+        b.kv_f32("gemma4.final_logit_softcapping", 30.0);
+        b.kv_u32("tokenizer.ggml.eos_token_id", 1);
+        b.kv_str("tokenizer.ggml.model", "gemma4");
+        let bytes = b.finish();
+        let g = Gguf::parse(&bytes).expect("scalar head_count_kv must parse");
+        assert_eq!(g.config.family, Family::Gemma4);
+        assert_eq!(g.config.head_count_kv, 2); // sliding-layer base
+        let swa = g.config.swa.unwrap();
+        assert_eq!(swa.head_count_kv_global, 2); // same scalar for global
+        assert_eq!(swa.head_dim_global, 512);
+        assert_eq!(g.config.head_dim, 256); // swa key_length
+        assert!(g.config.is_sliding(0) && !g.config.is_sliding(3));
     }
 }

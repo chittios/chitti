@@ -133,13 +133,17 @@ onnxruntime) — use it for any voice-model numeric or perf work before touching
 QEMU.
 
 Current figures (aarch64 HVF, 0.8B Q8): prefill 53 tok/s, decode 19 tok/s,
-`/voice stt` ~2 s, `/voice say` ~14 s for 3.5 s of audio. Decode is
-compute-bound on the **single-core** SDOT matvec; llama.cpp's remaining edge
-on the same silicon is threading. The row-range kernels
-(`matvec_q8_0_sdot_rows`) are ready to split across cores — the missing piece
-is aarch64 AP bring-up (PSCI `CPU_ON`) + a work-distribution primitive; x86
-APs already boot and park (`smp.rs`). That is the designated next perf step;
-prefer it over further single-core micro-tuning.
+`/voice stt` ~2 s, `/voice say` ~14 s for 3.5 s of audio. **aarch64 SMP
+row-split is live** (`arch/aarch64/smp.rs`): PSCI `CPU_ON` bring-up, `WFE`-parked
+workers, a static-partition job barrier splitting the SDOT matvecs + generic
+`parallel_for` (video YUV→RGB) across all online cores; x86 APs boot and park
+(`smp.rs`). **The barrier is bounded, never trust a worker wake**: workers
+enable the counter event stream (`CNTKCTL_EL1`) so `WFE` self-wakes, a
+claim/done protocol recomputes a straggler's range on the BSP, and a boot-time
+wake self-test (`smp: wake self-test ok|FAILED` ktrace) degrades to single-core
+up front on hypervisors that park a trapped `WFE` until an interrupt —
+VirtualBox-ARM does exactly that and used to hang the first prefill matvec
+forever. Slow beats stuck; any new cross-core wait needs the same bound.
 
 ## STANDING RULE — real hardware, nothing hardcoded to an emulator
 
@@ -477,10 +481,16 @@ the next command still runs) and a unit test on the pure poll logic
   fixture tests hash an embedded I-only and an I+P clip against PyAV, and
   `stream_decoder_seek_matches_sequential` proves random/backward seeks match a
   sequential decode frame-for-frame.
-  **Deblock gotchas (both bit us):** a chroma edge's QP is `avg(qpc(QPp),
+  **Deblock gotchas (all three bit us):** a chroma edge's QP is `avg(qpc(QPp),
   qpc(QPq))` not `qpc(avg(QPp,QPq))` (differs only across slices with differing
-  QP); and the luma normal filter's `tc = tc0 + (ap<β) + (aq<β)` can be nonzero
-  even when `tc0==0` (don't force-skip). **Stage 1 (done):** `video/bits.rs`
+  QP); the luma normal filter's `tc = tc0 + (ap<β) + (aq<β)` can be nonzero
+  even when `tc0==0` (don't force-skip); and the recycled `Fx` workspace must
+  not leak the previous frame's motion into deblock — `bs_inter2` infers "list
+  used" from `refpoc != MIN`, and a P slice never writes L1, so
+  `mark_mb_decoded` clears `refpoc` (not just refidx/mv) for unwritten cells.
+  Bisect any deblock-vs-PyAV divergence with `H264Dec::no_deblock` against
+  PyAV `skip_loop_filter='ALL'`, and read FFmpeg's per-block list usage via
+  `flags2=+export_mvs`. **Stage 1 (done):** `video/bits.rs`
   (RBSP emulation-prevention unescape + a big-endian `BitReader` with H.264
   Exp-Golomb `ue`/`se`/`te`), `video/mp4.rs` (ISO-BMFF box-tree demuxer →
   `avcC` SPS/PPS + the `stsz`/`stsc`/`stco`/`stts`/`stss` sample table assembled

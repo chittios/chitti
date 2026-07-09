@@ -16,7 +16,7 @@ labels: bug
 
 - **Architecture:** x86_64 / aarch64
 - **Boot path:** `cargo xtask run -arch …` / UEFI (`--uefi`) / VirtualBox / real hardware
-- **Model:** qwen3.5-0.8b / qwen3.5-9b / N/A
+- **Model:** qwen3.5-4b / qwen3.5-9b / gemma-4-e4b / N/A
 - **Host:** (e.g. macOS on Apple Silicon, QEMU version)
 - **Commit:** `git rev-parse --short HEAD`
 

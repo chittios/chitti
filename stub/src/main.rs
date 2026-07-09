@@ -209,6 +209,39 @@ fn total_ram_bytes() -> u64 {
     }
 }
 
+/// The machine's actual RAM extents from the UEFI memory map: every DRAM-backed
+/// descriptor (everything except the two MMIO types and firmware-reserved),
+/// sorted and merged into `(base, size)` clumps. Real machines and
+/// VirtualBox-ARM interleave RAM and MMIO inside the same GiB, so the kernel
+/// needs the true extents — not just a total — to type its identity map
+/// (Normal over MMIO breaks the framebuffer/ECAM; Device over RAM
+/// alignment-faults NEON loads). Must run before `exit_boot_services`.
+fn ram_regions() -> alloc::vec::Vec<(u64, u64)> {
+    use uefi::boot::MemoryType;
+    use uefi::mem::memory_map::MemoryMap;
+    let Ok(map) = boot::memory_map(MemoryType::LOADER_DATA) else {
+        return alloc::vec::Vec::new();
+    };
+    let mut ext: alloc::vec::Vec<(u64, u64)> = map
+        .entries()
+        .filter(|d| !matches!(d.ty, MemoryType::MMIO | MemoryType::MMIO_PORT_SPACE | MemoryType::RESERVED))
+        .map(|d| (d.phys_start, d.page_count * 4096))
+        .filter(|&(_, s)| s > 0)
+        .collect();
+    ext.sort_unstable();
+    let mut merged: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    for (b, s) in ext {
+        match merged.last_mut() {
+            Some((mb, ms)) if b <= *mb + *ms => {
+                let end = (b + s).max(*mb + *ms);
+                *ms = end - *mb;
+            }
+            _ => merged.push((b, s)),
+        }
+    }
+    merged
+}
+
 fn acpi_rsdp() -> u64 {
     use uefi::table::cfg::{ACPI2_GUID, ACPI_GUID};
     uefi::system::with_config_table(|entries| {
@@ -397,7 +430,20 @@ fn main() -> Status {
         // heap. 0 if the map can't be read.
         let ram = total_ram_bytes();
         page[92..100].copy_from_slice(&ram.to_le_bytes());
-        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x}, heap {hb:#x}, model {mb:#x}, RAM {} MiB -> boot-info {addr:#x}", ram >> 20);
+        // RAM extents at 104.. : count@104, then up to 16 (base@0, size@8)
+        // pairs from 112 — the kernel types its identity map from these (RAM
+        // and MMIO interleave inside GiB blocks on VirtualBox/real hardware).
+        let regions = ram_regions();
+        let n = regions.len().min(16);
+        if regions.len() > 16 {
+            log::info!("chitti-stub: {} RAM extents; passing first 16", regions.len());
+        }
+        page[104..112].copy_from_slice(&(n as u64).to_le_bytes());
+        for (i, &(rb, rsz)) in regions.iter().take(n).enumerate() {
+            page[112 + i * 16..120 + i * 16].copy_from_slice(&rb.to_le_bytes());
+            page[120 + i * 16..128 + i * 16].copy_from_slice(&rsz.to_le_bytes());
+        }
+        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x}, heap {hb:#x}, model {mb:#x}, RAM {} MiB in {n} extent(s) -> boot-info {addr:#x}", ram >> 20);
         Some(addr)
     })();
 

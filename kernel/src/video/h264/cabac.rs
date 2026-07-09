@@ -208,14 +208,18 @@ mod tests {
 
     #[test_case]
     fn bypass_reads_bits_in_order() {
-        // offset accumulates raw bits; on a stream of 0xFF the first bypasses
-        // after init must decode 1s (offset grows faster than range halves).
-        let data = [0xffu8; 16];
+        // First 9 bits = 0b111111101 = 509, the largest *valid* init offset
+        // (510/511 are forbidden — an all-0xFF stream must be rejected). With
+        // every following bit 1, each bypass computes 509*2+1 = 1019 ≥ 510 →
+        // decodes 1 and returns the offset to 509, so the 1s repeat forever.
+        assert!(Cabac::new(&[0xffu8; 16], 26, None).is_err(), "offset 511 must be rejected");
+        let mut data = [0xffu8; 16];
+        data[0] = 0xfe;
         let mut c = Cabac::new(&data, 26, None).unwrap();
         let mut all = 0;
         for _ in 0..8 {
             all += c.bypass();
         }
-        assert!(all >= 7, "bypass on an all-ones stream is all ones");
+        assert_eq!(all, 8, "bypass on an all-ones stream is all ones");
     }
 }

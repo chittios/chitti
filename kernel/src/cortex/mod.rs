@@ -752,29 +752,41 @@ pub fn model_parts() -> alloc::vec::Vec<(&'static str, &'static [u8])> {
 #[cfg(all(not(target_arch = "x86_64"), not(feature = "boot-limine")))]
 pub const MODEL_LOAD_ADDR: usize = 0x8000_0000;
 
-/// aarch64: the model is placed in RAM by QEMU's `-device loader` (or the UEFI
-/// stub) at [`MODEL_LOAD_ADDR`]. We expose it as a slice spanning the region
-/// between the model base and the heap (which the heap allocator placed at the
-/// top of RAM), and only if the GGUF magic is present (so `infer` cleanly
-/// reports "no model" when none was loaded). The GGUF parser reads only within
-/// the actual file; the window just needs to cover it.
+/// aarch64: the model is placed in RAM by QEMU's `-device loader` and/or the
+/// UEFI stub. Preference order:
+/// 1. Stub-reported `(base, size)` when the ESP path loaded the GGUF.
+/// 2. Fixed [`MODEL_LOAD_ADDR`] when QEMU's loader (or a fixed-address place)
+///    left a GGUF there — the window runs to the end of discovered RAM on the
+///    UEFI path (heap is a *separate* firmware allocation, not "above" the
+///    model), or up to the heap on the `-kernel` path.
+///
+/// Only if the GGUF magic is present (so `infer` cleanly reports "no model"
+/// when none was loaded). The GGUF parser reads only within the real file; the
+/// window just needs to cover it.
 #[cfg(all(not(target_arch = "x86_64"), not(feature = "boot-limine")))]
 pub fn model_module() -> Option<&'static [u8]> {
     // A runtime `/model load` override wins over the boot-time module.
     if let Some(b) = MODEL_OVERRIDE.with(|m| *m) {
         return Some(b);
     }
-    // On UEFI the stub loaded the model at a firmware-chosen address and reported
-    // (base, size); use that exact span. On `-kernel` the model is at the fixed
-    // MODEL_LOAD_ADDR and the window runs up to the heap (top of RAM).
     let (addr, window) = match crate::arch::aarch64::mmu::uefi_model() {
         Some((base, size)) => (base, size),
         None => {
             let heap_base = crate::mm::heap_base();
-            let window = heap_base.saturating_sub(MODEL_LOAD_ADDR);
+            let ram_end = crate::arch::aarch64::mmu::ram_end() as usize;
+            // UEFI: heap is AnyPages elsewhere; a multi-GiB GGUF often cannot
+            // be reassembled by the stub (contiguous LOADER_DATA) and is instead
+            // QEMU-loader-injected at MODEL_LOAD_ADDR. Size the window from
+            // there to the top of discovered RAM so the full file is visible.
+            // `-kernel`: heap sits at the top of RAM, so the classic gap works.
+            let window = if crate::arch::aarch64::mmu::uefi_heap_base() != 0 {
+                ram_end.saturating_sub(MODEL_LOAD_ADDR)
+            } else {
+                heap_base.saturating_sub(MODEL_LOAD_ADDR)
+            };
             if window == 0 {
                 crate::ktrace::log_fmt(format_args!(
-                    "cortex: model present at {MODEL_LOAD_ADDR:#x} but no room below the heap at {heap_base:#x} -- not enough RAM"
+                    "cortex: no model window at {MODEL_LOAD_ADDR:#x} (heap={heap_base:#x} ram_end={ram_end:#x})"
                 ));
                 return None;
             }

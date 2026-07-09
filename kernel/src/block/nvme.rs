@@ -4,14 +4,19 @@
 //! PRP lists; presented behind the shared [`BlockDevice`] API.
 //!
 //! A controller can expose several **namespaces** (VirtualBox presents each
-//! attached disk as NSID 1, 2, …). The controller is brought up **once** into a
-//! global ([`CONTROLLER`]); each namespace is a lightweight [`NvmeNamespace`]
-//! handle that routes its I/O through the shared controller under a lock, so
-//! multiple namespaces coexist and are usable simultaneously (no per-disk
-//! controller re-reset). Device discovery is per-arch (each arch finds the NVMe
-//! function on its PCI bus, maps BAR0, and hands the mapped MMIO base + a
-//! [`DmaAlloc`] to [`probe_namespace`]) — the same one-driver-both-arches shape
-//! as the `xhci` core.
+//! attached disk as NSID 1, 2, …). NSIDs are **not necessarily contiguous**:
+//! VirtualBox maps controller *port* → NSID, so a disk on port 1 with port 0
+//! empty is NSID 2 with NSID 1 inactive (exactly what a VM whose install
+//! medium was detached looks like). Enumeration therefore uses the spec's
+//! IDENTIFY CNS=2 **Active Namespace ID List** (mandatory since NVMe 1.1),
+//! not "probe NSID 1, 2, … until the first empty one". The controller is
+//! brought up **once** into a global ([`CONTROLLER`]); each namespace is a
+//! lightweight [`NvmeNamespace`] handle that routes its I/O through the shared
+//! controller under a lock, so multiple namespaces coexist and are usable
+//! simultaneously (no per-disk controller re-reset). Device discovery is
+//! per-arch (each arch finds the NVMe function on its PCI bus, maps BAR0, and
+//! hands the mapped MMIO base + a [`DmaAlloc`] to [`probe_namespace`]) — the
+//! same one-driver-both-arches shape as the `xhci` core.
 
 use crate::block::{BlockDevice, BlockError, Dma, DmaAlloc, BLOCK_SIZE};
 use crate::mm::Locked;
@@ -81,6 +86,10 @@ pub struct NvmeController {
     cid: u16,
     prp_list: Dma, // one page for PRP lists on multi-page transfers
     data_buf: Dma, // 64 KiB bounce buffer (also used for Identify)
+    /// Active NSIDs from IDENTIFY CNS=2 (sparse-safe enumeration; see module
+    /// doc). Empty only if the controller rejected the identify — then
+    /// [`probe_namespace`] falls back to the legacy contiguous NSID walk.
+    active: alloc::vec::Vec<u32>,
 }
 
 impl NvmeController {
@@ -135,6 +144,7 @@ impl NvmeController {
                 cid: 0,
                 prp_list: alloc(4096)?,
                 data_buf: alloc(DATA_MAX)?,
+                active: alloc::vec::Vec::new(),
             };
 
             // Create the I/O completion + submission queues (qid 1).
@@ -147,6 +157,27 @@ impl NvmeController {
                 return None;
             }
             crate::ktrace::log("nvme", "controller up (admin + 1 I/O queue)");
+
+            // Active Namespace ID List (IDENTIFY CNS=2, NSID=0 → the 4 KiB
+            // page lists ascending active NSIDs, zero-terminated). NSIDs can
+            // be sparse (VirtualBox: port → NSID, empty port 0 = inactive
+            // NSID 1), so this — not a walk from NSID 1 — is the enumeration.
+            if ctrl.admin(0x06, 0, ctrl.data_buf.phys, 0, 2, 0) {
+                let mut page = [0u8; 4096];
+                core::ptr::copy_nonoverlapping(ctrl.data_buf.virt as *const u8, page.as_mut_ptr(), 4096);
+                ctrl.active = parse_ns_list(&page);
+                crate::ktrace::log_fmt(format_args!(
+                    "nvme: {} active namespace(s){}",
+                    ctrl.active.len(),
+                    match ctrl.active.first() {
+                        Some(first) => alloc::format!(" (first NSID {first})"),
+                        None => alloc::string::String::new(),
+                    }
+                ));
+            } else {
+                // Pre-1.1 controller: fall back to the contiguous walk.
+                crate::ktrace::log("nvme", "active-ns-list identify unsupported; assuming contiguous NSIDs");
+            }
             Some(ctrl)
         }
     }
@@ -160,11 +191,12 @@ impl NvmeController {
         unsafe {
             let buf = self.data_buf;
             if !self.admin(0x06, nsid, buf.phys, 0, 0, 0) {
+                crate::ktrace::log_fmt(format_args!("nvme: identify nsid {nsid} failed"));
                 return None;
             }
             let nsze = read_volatile(buf.virt as *const u64);
             if nsze == 0 {
-                return None; // namespace doesn't exist (enumeration terminator)
+                return None; // namespace inactive (legacy-walk terminator)
             }
             let flbas = read_volatile((buf.virt + 26) as *const u8) & 0xf;
             let lbaf = read_volatile((buf.virt + 128 + flbas as u64 * 4) as *const u32);
@@ -275,8 +307,24 @@ impl NvmeController {
     }
 }
 
-/// Bring up the controller (once) and attach to the `n`-th namespace (NSID
-/// `n+1`). `None` once namespaces run out. Called by the per-arch `probe_nth`.
+/// Parse an IDENTIFY CNS=2 Active Namespace ID List page: ascending non-zero
+/// little-endian u32 NSIDs, zero-terminated (or full). Pure — unit-tested.
+pub fn parse_ns_list(page: &[u8]) -> alloc::vec::Vec<u32> {
+    let mut out = alloc::vec::Vec::new();
+    for w in page.chunks_exact(4) {
+        let nsid = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        if nsid == 0 {
+            break;
+        }
+        out.push(nsid);
+    }
+    out
+}
+
+/// Bring up the controller (once) and attach to the `n`-th **active**
+/// namespace (per the IDENTIFY CNS=2 list — NSIDs may be sparse; legacy
+/// fallback is NSID `n+1`). `None` once namespaces run out. Called by the
+/// per-arch `probe_nth`.
 ///
 /// # Safety
 /// `regs` must be a valid mapped NVMe BAR0; `alloc` real DMA memory.
@@ -287,7 +335,11 @@ pub unsafe fn probe_namespace(regs: u64, alloc: DmaAlloc, n: usize) -> Option<Nv
             *slot = unsafe { NvmeController::bringup(regs, alloc) };
         }
         let ctrl = slot.as_mut()?;
-        let nsid = (n + 1) as u32;
+        let nsid = match ctrl.active.get(n) {
+            Some(&id) => id,
+            None if ctrl.active.is_empty() => (n + 1) as u32, // legacy fallback
+            None => return None, // past the last active namespace
+        };
         let (capacity, lba_bytes) = ctrl.identify_namespace(nsid)?;
         Some(NvmeNamespace { nsid, capacity, lba_bytes })
     })
@@ -360,5 +412,38 @@ impl BlockDevice for NvmeNamespace {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ns_list;
+
+    fn page(ids: &[u32]) -> alloc::vec::Vec<u8> {
+        let mut p = alloc::vec![0u8; 4096];
+        for (i, id) in ids.iter().enumerate() {
+            p[i * 4..i * 4 + 4].copy_from_slice(&id.to_le_bytes());
+        }
+        p
+    }
+
+    #[test_case]
+    fn ns_list_contiguous() {
+        assert_eq!(parse_ns_list(&page(&[1, 2])), alloc::vec![1, 2]);
+    }
+
+    #[test_case]
+    fn ns_list_sparse_vbox_port1_only() {
+        // VirtualBox with an empty port 0: the only disk is NSID 2 — the exact
+        // shape the legacy "walk from NSID 1" enumeration missed.
+        assert_eq!(parse_ns_list(&page(&[2])), alloc::vec![2]);
+    }
+
+    #[test_case]
+    fn ns_list_empty_and_full() {
+        assert!(parse_ns_list(&page(&[])).is_empty());
+        // A full page with no zero terminator yields all 1024 entries.
+        let all: alloc::vec::Vec<u32> = (1..=1024).collect();
+        assert_eq!(parse_ns_list(&page(&all)).len(), 1024);
     }
 }

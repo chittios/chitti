@@ -16,10 +16,17 @@
 //! every worker to report that generation done (acquire). Weights/activation
 //! are read-only during the pass and each core writes a disjoint slice of `y`,
 //! so it is race-free without per-element locking.
+//!
+//! The wait is **bounded** (see [`barrier`]): a worker that never wakes — a
+//! hypervisor that parks a trapped `WFE` until an interrupt, as VirtualBox-ARM
+//! does — has its range recomputed on the BSP and the fleet degrades to
+//! single-core for the session. Workers also enable the counter **event
+//! stream** so `WFE` self-wakes even without `SEV`, and a boot-time self-test
+//! in [`init`] detects a broken wake path before the first real job.
 
 use crate::cortex::tensor;
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 /// Max cores we size the static tables for (QEMU `-smp` is 4 here; the M2 has
 /// 8). Only cores actually brought online are used.
@@ -38,6 +45,27 @@ static mut AP_STACKS: [ApStack; MAX_CPUS] = [const { ApStack([0; AP_STACK_SIZE])
 
 /// Number of secondaries that have come online and claimed a worker slot.
 static N_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Set when a worker missed a barrier deadline: its wake mechanism (SEV /
+/// counter event stream) evidently doesn't reach a `WFE`-parked vCPU on this
+/// hypervisor (observed on VirtualBox-ARM, which blocks a trapped `WFE` until
+/// an *interrupt* — and no interrupts are routed to the secondaries). Once
+/// set, every dispatcher runs single-core forever: slow beats a silent hang.
+static DEGRADED: AtomicBool = AtomicBool::new(false);
+
+/// Workers the dispatchers may use: 0 once [`DEGRADED`] (single-core fallback).
+fn active_workers() -> usize {
+    if DEGRADED.load(Ordering::Relaxed) { 0 } else { N_WORKERS.load(Ordering::Relaxed) }
+}
+
+/// Disable multi-core dispatch permanently and say why (once).
+fn degrade(reason: &str, slot: usize) {
+    if !DEGRADED.swap(true, Ordering::AcqRel) {
+        crate::ktrace::log_fmt(format_args!(
+            "smp: worker {slot} {reason} -- disabling multi-core dispatch (single-core fallback; hypervisor WFE wake broken?)"
+        ));
+    }
+}
 
 /// The single matvec job descriptor all workers watch. Shared operands plus a
 /// per-worker-slot row range; `go` is the generation counter / release point.
@@ -85,6 +113,11 @@ static JOB: Job = Job {
 };
 /// Per-worker-slot "generation last completed", so the BSP can barrier on it.
 static DONE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Per-worker-slot "generation picked up": a worker stamps this the moment it
+/// wakes for a generation, *before* reading its row range. Lets the barrier
+/// tell "never woke" (safe to retract the range and recompute on the BSP)
+/// apart from "in flight" (give it more time).
+static CLAIM: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// Cumulative cycles (CNTVCT_EL0) each core has spent *computing* a matmul
 /// chunk — the numerator for `/top`'s per-core utilisation. Index = core id
@@ -193,6 +226,22 @@ pub fn init() {
     }
     let online = N_WORKERS.load(Ordering::Acquire) + 1;
     crate::ktrace::log_fmt(format_args!("smp: {online} cores online (BSP + {} workers, discovered via PSCI)", online - 1));
+
+    // Wake self-test: push one trivial generation through the real job/barrier
+    // machinery. A hypervisor that never wakes a `WFE`-parked vCPU (VirtualBox-
+    // ARM blocks it until an interrupt, and secondaries get none) degrades to
+    // single-core HERE, with one clear line — instead of hanging the first
+    // inference matvec mid-prefill.
+    if online > 1 {
+        unsafe fn nop_rows(_s: usize, _e: usize, _ctx: *mut u8) {}
+        // SAFETY: `nop_rows` touches no memory; ctx is unused (null).
+        unsafe { parallel_for(4096, 1, nop_rows, core::ptr::null_mut()) };
+        if DEGRADED.load(Ordering::Relaxed) {
+            crate::ktrace::log_fmt(format_args!("smp: wake self-test FAILED -- workers online but unwakeable; running single-core"));
+        } else {
+            crate::ktrace::log_fmt(format_args!("smp: wake self-test ok ({} workers)", online - 1));
+        }
+    }
 }
 
 /// Number of cores currently participating (BSP + registered workers).
@@ -232,6 +281,93 @@ fn signal_workers() {
     unsafe { core::arch::asm!("dsb ishst", "sev", options(nomem, nostack, preserves_flags)) };
 }
 
+/// Enable the virtual-counter **event stream** on this core (CNTKCTL_EL1:
+/// EVNTEN, EVNTI = bit 12), so a `WFE` self-wakes every 2^13 counter ticks
+/// (~340 µs at 24 MHz) even if a cross-core `SEV` never arrives — the standard
+/// hypervisor-/hardware-proof bound on `WFE` parking (Linux does the same).
+/// Read-modify-write so the EL0 counter-access bits are preserved.
+fn enable_wfe_event_stream() {
+    let mut v: u64;
+    // SAFETY: CNTKCTL_EL1 is EL1-writable; setting EVNTEN/EVNTI only starts
+    // event generation for WFE, with no memory effects.
+    unsafe {
+        core::arch::asm!("mrs {}, cntkctl_el1", out(reg) v, options(nomem, nostack, preserves_flags));
+        v = (v & !(0xf << 4) & !(1 << 3)) | (1 << 2) | (12 << 4); // EVNTEN=1, EVNTDIR=0, EVNTI=12
+        core::arch::asm!("msr cntkctl_el1, {}", in(reg) v, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// How long the barrier waits for all workers before treating a slot as a
+/// straggler. Generations complete in µs–ms; 500 ms of silence means the wake
+/// never happened (or the host scheduler is pathologically starved).
+const BARRIER_WAIT_MS: u64 = 500;
+/// Extra time granted to a worker that *claimed* the generation (it woke and
+/// may be mid-compute) before the BSP gives up and recomputes its range.
+const BARRIER_GRACE_MS: u64 = 1500;
+
+/// Wait for every worker to finish generation `g` — **bounded**. A slot that
+/// misses the deadline is handled per its [`CLAIM`] stamp:
+///
+/// - never claimed: the worker never woke (hypervisor `WFE` wake broken). Its
+///   range is retracted (a late wake then no-ops) and recomputed on the BSP.
+/// - claimed but not done: it woke and is computing; wait a further grace
+///   window, then recompute anyway.
+///
+/// Either way the fleet is [`degrade`]d so no future job depends on broken
+/// wakes. If a straggler turns out to be merely late and computes its original
+/// range concurrently with the BSP's recompute, both write the *same values*
+/// to the same disjoint `y` rows (same operands, deterministic kernel), so the
+/// overlap is benign. Deadlines are absolute from barrier entry, so the total
+/// bound is ~WAIT+GRACE regardless of worker count.
+fn barrier(workers: usize, g: u64, recompute: &dyn Fn(usize, usize)) {
+    let t0 = crate::arch::now_ms();
+    let mut spins = 0u32;
+    for s in 0..workers {
+        loop {
+            if DONE[s].load(Ordering::Acquire) == g {
+                break;
+            }
+            if crate::arch::now_ms().saturating_sub(t0) > BARRIER_WAIT_MS {
+                handle_straggler(s, g, t0, recompute);
+                break;
+            }
+            // Re-issue SEV occasionally: heals a hypervisor that loses rare
+            // wake events without pegging the interconnect.
+            spins = spins.wrapping_add(1);
+            if spins % 8192 == 0 {
+                signal_workers();
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Deadline-miss path of [`barrier`] — see there for the protocol.
+#[cold]
+fn handle_straggler(s: usize, g: u64, t0: u64, recompute: &dyn Fn(usize, usize)) {
+    let rs = JOB.row_start[s].load(Ordering::Relaxed);
+    let re = JOB.row_end[s].load(Ordering::Relaxed);
+    if CLAIM[s].load(Ordering::Acquire) != g {
+        // Never woke. Retract the range first so a late wake no-ops, then do
+        // its work here. (A wake racing this retraction computes the original
+        // range — identical values, see the barrier doc.)
+        JOB.row_start[s].store(0, Ordering::Relaxed);
+        JOB.row_end[s].store(0, Ordering::Relaxed);
+        degrade("never woke for a job", s);
+        recompute(rs, re);
+        return;
+    }
+    // Claimed: it's computing. Give it the grace window before stepping in.
+    while DONE[s].load(Ordering::Acquire) != g {
+        if crate::arch::now_ms().saturating_sub(t0) > BARRIER_WAIT_MS + BARRIER_GRACE_MS {
+            degrade("wedged mid-job", s);
+            recompute(rs, re);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// A worker core: **park on `WFE`** until the BSP publishes a new job
 /// generation, run this slot's row range through the SDOT matvec, mark the
 /// generation done, repeat. `WFE` (not a busy `spin_loop`) is essential on
@@ -241,6 +377,7 @@ fn signal_workers() {
 /// out, leaving no keyboard and (with the timer IRQ also cooperative) a frozen
 /// console. Parked workers cost nothing until the BSP `signal_workers()`.
 fn worker_loop(slot: usize) -> ! {
+    enable_wfe_event_stream();
     let mut last = 0u64;
     loop {
         let g = JOB.go.load(Ordering::Acquire);
@@ -251,6 +388,7 @@ fn worker_loop(slot: usize) -> ! {
             continue;
         }
         last = g;
+        CLAIM[slot].store(g, Ordering::Release);
         let rs = JOB.row_start[slot].load(Ordering::Relaxed);
         let re = JOB.row_end[slot].load(Ordering::Relaxed);
         if re > rs {
@@ -310,7 +448,7 @@ pub unsafe fn matmul_sdot(
     n_rows: usize,
     n_cols: usize,
 ) {
-    let workers = N_WORKERS.load(Ordering::Relaxed);
+    let workers = active_workers();
     if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
         // SAFETY: caller's contract; whole range on this core.
         unsafe { tensor::matmul_q8_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, n_rows, n_cols) };
@@ -343,12 +481,9 @@ pub unsafe fn matmul_sdot(
     unsafe { tensor::matmul_q8_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, boundary(1), n_cols) };
     add_busy(0, super::cycle_count().wrapping_sub(t0));
 
-    // Barrier: wait for every worker to finish this generation.
-    for s in 0..workers {
-        while DONE[s].load(Ordering::Acquire) != g {
-            core::hint::spin_loop();
-        }
-    }
+    // Bounded barrier; a straggler's range is recomputed here (see `barrier`).
+    // SAFETY: same contract as the chunk above, over the straggler's range.
+    barrier(workers, g, &|rs, re| unsafe { tensor::matmul_q8_0_sdot_rows(w, xq, xs, y, m_count, n_rows, rs, re, n_cols) });
 }
 
 /// Run a generic (non-Q8_0) `Q*`-quant matvec `y = W · x` (f32 activation `x`)
@@ -360,7 +495,7 @@ pub unsafe fn matmul_sdot(
 /// # Safety
 /// Same contract as `tensor::matvec_quant_rows` over `[0, n_rows)`.
 pub unsafe fn matvec_quant(qt: u32, w: *const u8, x: *const f32, y: *mut f32, n_rows: usize, n_cols: usize) {
-    let workers = N_WORKERS.load(Ordering::Relaxed);
+    let workers = active_workers();
     if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
         // SAFETY: caller's contract; whole range on this core.
         unsafe { tensor::matvec_quant_rows(qt, w, x, y, 0, n_rows, n_cols) };
@@ -386,11 +521,8 @@ pub unsafe fn matvec_quant(qt: u32, w: *const u8, x: *const f32, y: *mut f32, n_
     let t0 = super::cycle_count();
     unsafe { tensor::matvec_quant_rows(qt, w, x, y, 0, boundary(1), n_cols) };
     add_busy(0, super::cycle_count().wrapping_sub(t0));
-    for s in 0..workers {
-        while DONE[s].load(Ordering::Acquire) != g {
-            core::hint::spin_loop();
-        }
-    }
+    // SAFETY: same contract as the chunk above, over the straggler's range.
+    barrier(workers, g, &|rs, re| unsafe { tensor::matvec_quant_rows(qt, w, x, y, rs, re, n_cols) });
 }
 
 /// Run a `Q4_0` SDOT matvec (int8-quantized activation `xq`/`xs`) across all
@@ -401,7 +533,7 @@ pub unsafe fn matvec_quant(qt: u32, w: *const u8, x: *const f32, y: *mut f32, n_
 /// # Safety
 /// Same contract as `tensor::matvec_q4_0_sdot_rows` over `[0, n_rows)`.
 pub unsafe fn matvec_q4_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, n_rows: usize, n_cols: usize) {
-    let workers = N_WORKERS.load(Ordering::Relaxed);
+    let workers = active_workers();
     if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
         // SAFETY: caller's contract; whole range on this core.
         unsafe { tensor::matvec_q4_0_sdot_rows(w, xq, xs, y, 0, n_rows, n_cols) };
@@ -426,11 +558,8 @@ pub unsafe fn matvec_q4_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
     let t0 = super::cycle_count();
     unsafe { tensor::matvec_q4_0_sdot_rows(w, xq, xs, y, 0, boundary(1), n_cols) };
     add_busy(0, super::cycle_count().wrapping_sub(t0));
-    for s in 0..workers {
-        while DONE[s].load(Ordering::Acquire) != g {
-            core::hint::spin_loop();
-        }
-    }
+    // SAFETY: same contract as the chunk above, over the straggler's range.
+    barrier(workers, g, &|rs, re| unsafe { tensor::matvec_q4_0_sdot_rows(w, xq, xs, y, rs, re, n_cols) });
 }
 
 /// Run a generic data-parallel job over `[0, n)` split across online cores.
@@ -447,7 +576,7 @@ pub unsafe fn parallel_for(
     f: unsafe fn(usize, usize, *mut u8),
     ctx: *mut u8,
 ) {
-    let workers = N_WORKERS.load(Ordering::Relaxed);
+    let workers = active_workers();
     if workers == 0 || n < min_chunk.saturating_mul(2).max(16) {
         f(0, n, ctx);
         return;
@@ -467,11 +596,8 @@ pub unsafe fn parallel_for(
     let t0 = super::cycle_count();
     f(0, boundary(1), ctx);
     add_busy(0, super::cycle_count().wrapping_sub(t0));
-    for s in 0..workers {
-        while DONE[s].load(Ordering::Acquire) != g {
-            core::hint::spin_loop();
-        }
-    }
+    // SAFETY: same contract as the chunk above, over the straggler's range.
+    barrier(workers, g, &|rs, re| unsafe { f(rs, re, ctx) });
 }
 
 /// Run a `Q4_K` SDOT matvec (int8-quantized activation `xq`/`xs`) across all
@@ -482,7 +608,7 @@ pub unsafe fn parallel_for(
 /// # Safety
 /// Same contract as `tensor::matvec_q4_k_sdot_rows` over `[0, n_rows)`.
 pub unsafe fn matvec_q4_k_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, n_rows: usize, n_cols: usize) {
-    let workers = N_WORKERS.load(Ordering::Relaxed);
+    let workers = active_workers();
     if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
         // SAFETY: caller's contract; whole range on this core.
         unsafe { tensor::matvec_q4_k_sdot_rows(w, xq, xs, y, 0, n_rows, n_cols) };
@@ -507,9 +633,6 @@ pub unsafe fn matvec_q4_k_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
     let t0 = super::cycle_count();
     unsafe { tensor::matvec_q4_k_sdot_rows(w, xq, xs, y, 0, boundary(1), n_cols) };
     add_busy(0, super::cycle_count().wrapping_sub(t0));
-    for s in 0..workers {
-        while DONE[s].load(Ordering::Acquire) != g {
-            core::hint::spin_loop();
-        }
-    }
+    // SAFETY: same contract as the chunk above, over the straggler's range.
+    barrier(workers, g, &|rs, re| unsafe { tensor::matvec_q4_k_sdot_rows(w, xq, xs, y, rs, re, n_cols) });
 }

@@ -2483,14 +2483,33 @@ struct ChatSession {
 
 impl ChatSession {
     /// Load the bundled model + build the tokenizer. `None` if no model. Ticks
-    /// `spin` between load steps so the caller's spinner animates.
+    /// `spin` between load steps so the caller's spinner animates. Failures are
+    /// logged (parse/load used to fail silently as "no model bundled").
     fn load(spin: &mut Spinner) -> Option<Self> {
         use crate::cortex::{gguf, model, model_module, sampler};
-        let bytes = model_module()?;
+        let bytes = match model_module() {
+            Some(b) => b,
+            None => {
+                serial_println!("model> no GGUF in RAM (boot module / UEFI loader / /model load)");
+                return None;
+            }
+        };
         spin.tick();
-        let g = gguf::Gguf::parse(bytes).ok()?;
+        let g = match gguf::Gguf::parse(bytes) {
+            Ok(g) => g,
+            Err(e) => {
+                serial_println!("model> GGUF parse failed: {:?} ({} MiB window)", e, bytes.len() >> 20);
+                return None;
+            }
+        };
         spin.tick();
-        let m = model::Model::load(g).ok()?;
+        let m = match model::Model::load(g) {
+            Ok(m) => m,
+            Err(e) => {
+                serial_println!("model> weight load failed: {:?}", e);
+                return None;
+            }
+        };
         spin.tick();
         let tok = m.tokenizer();
         spin.tick();
@@ -2869,8 +2888,7 @@ impl ChatSession {
             // QEMU+HVF that's seconds; on VirtualBox it can be many minutes —
             // say so up front so it is not mistaken for a hang.
             serial_println!(
-                "model> prefilling {} tokens (first local reply is slow under VirtualBox; \
-                 use `/model remote http://HOST:1234 name` for LM Studio)",
+                "model> prefilling {} tokens",
                 last
             );
         }

@@ -1,0 +1,5 @@
+# UEFI stub only — ordinary `aarch64-unknown-uefi` with prebuilt std.
+# Does NOT need nightly / -Z build-std (that is exclusive to the kernel OS).
+[toolchain]
+channel = "stable"
+targets = ["aarch64-unknown-uefi"]

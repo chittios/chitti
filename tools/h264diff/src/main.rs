@@ -208,6 +208,7 @@ fn main() {
         // YUV in display (cts) order for the PyAV frame-by-frame diff.
         let mut dec = h264::decoder_cabac::H264Dec::new(sps.clone(), pps.clone()).expect("cabac init");
         dec.trace = std::env::var("H264_TRACE").is_ok();
+        dec.no_deblock = std::env::var("H264_NO_DEBLOCK").is_ok();
         let mut decoded: Vec<(u64, std::rc::Rc<h264::decoder_cabac::Pic>)> = Vec::new();
         for (i, s) in samples.iter().enumerate() {
             let data = &bytes[s.offset..s.offset + s.size];

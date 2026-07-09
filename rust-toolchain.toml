@@ -1,3 +1,8 @@
+# Host / workspace toolchain (xtask + anything else under the repo root).
+# The kernel is the only crate that *requires* nightly: its custom targets
+# use `-Z build-std` (see kernel/.cargo/config.toml). The aarch64 UEFI stub
+# (`stub/`) is ordinary no_std UEFI and pins its own *stable* toolchain —
+# see stub/rust-toolchain.toml — so nightly is not used to compile BOOTAA64.EFI.
 [toolchain]
 channel = "nightly"
 components = ["rust-src", "llvm-tools-preview"]

@@ -25,6 +25,10 @@ enum Model {
     Qwen2B,
     Qwen4B,
     Qwen9B,
+    /// Google Gemma 4 E4B instruct (unsloth Q4_K_M GGUF, ~4.6 GiB). Cortex
+    /// already speaks the `Gemma4` family; this selects the large heap tier
+    /// (same as 9B) and the assets path.
+    Gemma4E4B,
     /// Any GGUF by path (`-model path/to/file.gguf`): the kernel derives the
     /// architecture/config from the file itself, so xtask only needs the path
     /// and a derived guest-RAM size (leaked `'static` strs — xtask is a
@@ -39,7 +43,8 @@ impl Model {
             Model::Qwen08B => &[],
             Model::Qwen2B => &["model-2b"],
             Model::Qwen4B => &["model-4b"],
-            Model::Qwen9B => &["model-9b"],
+            // ~4.6–5 GiB weights → 1 GiB heap (same tier as 9B).
+            Model::Qwen9B | Model::Gemma4E4B => &["model-9b"],
             // The default tier (1 GiB heap) fits every model: guest RAM is
             // derived from the file size, and the heap sits at the top of it.
             Model::Custom { .. } => &[],
@@ -52,6 +57,7 @@ impl Model {
             Model::Qwen2B => "assets/model-2b.gguf",
             Model::Qwen4B => "assets/model-4b.gguf",
             Model::Qwen9B => "assets/model-9b.gguf",
+            Model::Gemma4E4B => "assets/model-gemma4-e4b.gguf",
             Model::Custom { path, .. } => path,
         }
     }
@@ -73,7 +79,8 @@ impl Model {
             Model::Qwen2B => "4G",
             // ~2.58 GiB model at 2 GiB + a 512 MiB heap at the top of RAM.
             Model::Qwen4B => "6G",
-            Model::Qwen9B => "10G",
+            // ~5 GiB Qwen 9B / ~4.6 GiB Gemma 4 E4B Q4_K_M + 1 GiB heap.
+            Model::Qwen9B | Model::Gemma4E4B => "10G",
             Model::Custom { mem, .. } => mem,
         }
     }
@@ -83,6 +90,7 @@ impl Model {
             Model::Qwen2B => "qwen3.5-2b",
             Model::Qwen4B => "qwen3.5-4b",
             Model::Qwen9B => "qwen3.5-9b",
+            Model::Gemma4E4B => "gemma-4-e4b",
             Model::Custom { path, .. } => path,
         }
     }
@@ -232,6 +240,15 @@ fn parse_model(rest: &[String]) -> Result<Model, String> {
                 "qwen3.5-2b" | "qwen3.5-2B" | "2b" | "2B" | "qwen2b" => Ok(Model::Qwen2B),
                 "qwen3.5-4b" | "qwen3.5-4B" | "4b" | "4B" | "qwen4b" => Ok(Model::Qwen4B),
                 "qwen3.5-9b" | "qwen3.5-9B" | "9b" | "9B" | "qwen9b" => Ok(Model::Qwen9B),
+                // Gemma 4 E4B instruct (unsloth Q4_K_M). Aliases cover the HF
+                // repo slug style and a short form.
+                "gemma-4-e4b"
+                | "gemma-4-E4B"
+                | "gemma4-e4b"
+                | "gemma4-E4B"
+                | "gemma-4-E4B-it"
+                | "e4b"
+                | "E4B" => Ok(Model::Gemma4E4B),
                 // Any other value is a GGUF path: the kernel discovers the
                 // architecture from the file, so any family/quant works here.
                 other if other.ends_with(".gguf") => {
@@ -245,7 +262,7 @@ fn parse_model(rest: &[String]) -> Result<Model, String> {
                     })
                 }
                 other => Err(format!(
-                    "unknown -model '{other}' (expected qwen3.5-0.8b|2b|4b|9b, or a path to a .gguf)"
+                    "unknown -model '{other}' (expected qwen3.5-0.8b|2b|4b|9b, gemma-4-e4b, or a path to a .gguf)"
                 )),
             };
         }
@@ -320,9 +337,11 @@ fn main() {
         // x86: the classic hybrid BIOS/UEFI ISO. aarch64: a raw GPT disk image
         // (the ARM-world convention — dd/Etcher it to a USB drive, or attach it
         // in UTM/QEMU/VirtualBox-ARM; it boots standalone via the UEFI stub).
+        // `--no-model` / `-server` images ship kernel-only (no GGUF module);
+        // server also flips the kernel `server` feature via CHITTI_SERVER.
         "image" => match arch {
-            Arch::Aarch64 => image_aarch64(model),
-            Arch::X86_64 => image(release, model),
+            Arch::Aarch64 => image_aarch64(model, no_model),
+            Arch::X86_64 => image(release, model, no_model),
         },
         "run" => cmd_run(release, arch, model, uefi, disk_only, fresh_disk, disk_size, no_model),
         "test" => cmd_test(),
@@ -346,10 +365,11 @@ fn main() {
 
 fn usage() -> String {
     "usage: cargo xtask <build|image|run|test|ref-check> [-arch x86_64|aarch64] \
-     [-model qwen3.5-0.8b|qwen3.5-2b|qwen3.5-4b|qwen3.5-9b] [--release] [--uefi]\n\
+     [-model qwen3.5-0.8b|2b|4b|9b|gemma-4-e4b] [--release] [--uefi] [-server]\n\
      run flags (x86_64): --disk <2G|1500M> size the virtio-blk disk for /install; \
      --disk-only boot the installed disk via UEFI with no ISO; --fresh-disk wipe it first; \
-     --no-model install without the model (fast, skips the ~800 MiB write).\n\
+     --no-model build/boot without a model module (also works with `image`).\n\
+     -server: headless kernel (serial only; no framebuffer/GUI tools).\n\
      install+boot test:  cargo xtask run --uefi --disk 2G [--no-model]  (type `/install yes`, then quit)\n\
                          cargo xtask run --disk-only                    (boots Chitti from the disk alone)"
         .to_string()
@@ -401,8 +421,25 @@ fn build_kernel_aarch64(release: bool, features: &[&str]) -> Result<PathBuf, Str
 /// (`-kernel`) Chitti ELF + model off the ESP and hands off MMU-off via an
 /// identity-RAM trampoline, so the kernel boots exactly as under `-kernel`.
 fn build_stub_aarch64() -> Result<PathBuf, String> {
+    // The stub pins *stable* via `stub/rust-toolchain.toml` (nightly is only
+    // for the kernel's `-Z build-std`). Building with `current_dir = stub/`
+    // makes rustup pick that file over the repo-root nightly. Ensure the
+    // tier-2 UEFI target is installed on stable (idempotent).
+    let status = Command::new("rustup")
+        .args(["target", "add", "aarch64-unknown-uefi", "--toolchain", "stable"])
+        .status()
+        .map_err(|e| format!("rustup target add aarch64-unknown-uefi (stable): {e}"))?;
+    if !status.success() {
+        eprintln!(
+            "xtask: warning: rustup target add aarch64-unknown-uefi --toolchain stable \
+             failed ({status}); stub build will surface the real error if missing"
+        );
+    }
     let sdir = repo_root().join("stub");
     let mut cmd = Command::new("cargo");
+    // Do not pass `+stable` explicitly: the directory's rust-toolchain.toml
+    // selects it. Forcing `+nightly` here would reintroduce the old "nightly
+    // without the UEFI target" failure mode.
     cmd.current_dir(&sdir).args(["build", "--release", "--target", "aarch64-unknown-uefi"]);
     run(&mut cmd)?;
     let efi = sdir.join("target/aarch64-unknown-uefi/release/chitti-stub.efi");
@@ -745,11 +782,42 @@ fn model_disk_from_env() -> Result<Option<PathBuf>, String> {
     }
 }
 
+/// Resolve the GGUF for a `run` (not `image`): require the file unless the
+/// caller passed `--no-model`. Silent model-less boots after `-model e4b` are
+/// how users end up with "no model bundled -- chat unavailable".
+fn require_gguf_for_run(model: Model, no_model: bool) -> Result<Option<PathBuf>, String> {
+    if no_model {
+        eprintln!("--no-model: booting without a model (`/model load` or `/model remote` can add one)");
+        return Ok(None);
+    }
+    let gguf = repo_root().join(model.gguf_rel());
+    if gguf.exists() {
+        return Ok(Some(gguf));
+    }
+    Err(format!(
+        "{} is not present — cannot boot chat/infer for `-model {}`.\n\
+         \n\
+           ./xtask/fetch-model.sh {}\n\
+           # or: make model MODEL={}\n\
+         \n\
+         Then re-run. To intentionally boot without a model, pass --no-model.",
+        model.gguf_rel(),
+        model.label(),
+        model.label(),
+        model.label(),
+    ))
+}
+
 /// Boot aarch64 via UEFI firmware (AAVMF) — the Chitti stub loads the normal
-/// identity kernel (+ model) off a real FAT ESP and hands off MMU-off through
-/// an identity-RAM trampoline, so the kernel boots exactly as under `-kernel`.
-/// The data disk is attached first so the in-kernel `probe_disk` (first
-/// virtio-mmio slot) targets it for /install + persistence, not the ESP.
+/// identity kernel off a real FAT ESP and hands off via an identity-RAM
+/// trampoline. **Models are injected with QEMU `-device loader`** at
+/// [`Model::aarch64_addr`] (same as the `-kernel` path), not reassembled by
+/// the stub from the ESP: multi-GiB GGUFs (e4b / 9b) need a multi-GiB
+/// contiguous UEFI `LOADER_DATA` allocation that AAVMF often cannot provide,
+/// which used to boot a model-less kernel even when the GGUF was on disk.
+///
+/// The distributable `image -arch aarch64` still puts the model on the ESP for
+/// real hardware; this `run --uefi` path optimises for QEMU correctness.
 fn cmd_run_aarch64_uefi(model: Model, disk: Option<PathBuf>, disk_only: bool, no_model: bool) -> Result<(), String> {
     let elf = build_kernel_aarch64(true, model.features())?;
     assert_identity_kernel(&elf)?;
@@ -771,12 +839,26 @@ fn cmd_run_aarch64_uefi(model: Model, disk: Option<PathBuf>, disk_only: bool, no
         eprintln!("booting aarch64 FROM DISK ONLY via UEFI (no ESP medium)");
         eprintln!("  note: requires an /install that wrote the aarch64 ESP payload to the disk");
     } else {
-        let gguf = repo_root().join(model.gguf_rel());
-        let model_path = (!no_model && gguf.exists()).then_some(gguf);
-        let esp = build_esp_image_aarch64(&stub, &elf, model_path.as_deref())?;
+        // Kernel + stub only on the ESP (fast rebuild). Model comes via loader.
+        let esp = build_esp_image_aarch64(&stub, &elf, None)?;
         qemu.arg("-drive").arg(format!("file={},if=none,id=esp,format=raw", esp.display()));
         qemu.args(["-device", "virtio-blk-device,drive=esp"]);
         eprintln!("booting aarch64 via the Chitti UEFI stub (AAVMF) -- firmware loads BOOTAA64.EFI from the ESP");
+    }
+    // Same QEMU-loader placement as `-kernel`: guest phys MODEL_LOAD_ADDR.
+    // Large models are chunked on Darwin (see `model_loader_args`).
+    if let Some(gguf) = require_gguf_for_run(model, no_model)? {
+        let base = u64::from_str_radix(model.aarch64_addr().trim_start_matches("0x"), 16)
+            .map_err(|e| format!("bad model addr {}: {e}", model.aarch64_addr()))?;
+        for arg in model_loader_args(&gguf, base)? {
+            qemu.arg("-device").arg(arg);
+        }
+        eprintln!(
+            "  model via QEMU loader: {} at guest phys {} ({} — not via ESP/stub reassembly)",
+            model.label(),
+            model.aarch64_addr(),
+            gguf.display()
+        );
     }
     if let Some(d) = &disk {
         qemu.arg("-drive").arg(format!("file={},if=none,id=data,format=raw", d.display()));
@@ -863,18 +945,13 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
     // `cortex::model_module` looks) -- the equivalent of the x86 Limine boot
     // module, so `infer` works natively. `--no-model` skips it (e.g. to prove
     // the runtime `/model load` path starts from nothing).
-    let gguf = repo_root().join(model.gguf_rel());
-    if no_model {
-        eprintln!("--no-model: booting without a model in RAM (`/model load` can add one at runtime)");
-    } else if gguf.exists() {
+    if let Some(gguf) = require_gguf_for_run(model, no_model)? {
         let base = u64::from_str_radix(model.aarch64_addr().trim_start_matches("0x"), 16)
             .map_err(|e| format!("bad model addr {}: {e}", model.aarch64_addr()))?;
         for arg in model_loader_args(&gguf, base)? {
             qemu.arg("-device").arg(arg);
         }
         eprintln!("attaching {} at guest phys {}", model.gguf_rel(), model.aarch64_addr());
-    } else {
-        eprintln!("note: {} absent -- `infer` will report no model", model.gguf_rel());
     }
     eprintln!("booting aarch64 Chitti ({}) natively via HVF (Ctrl-A X to quit qemu)...", model.label());
     run(&mut qemu)
@@ -1122,6 +1199,17 @@ fn esp_model_parts(model: &Path) -> Result<Vec<(PathBuf, String)>, String> {
     const ESP_PART: u64 = 1 << 30;
     let dir = repo_root().join("target/esp-model-parts");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // Drop leftover higher-index parts from a previous larger model so a later
+    // boot that scanned the host dir (or a stale ESP) cannot stitch a hybrid.
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let n = e.file_name();
+            let s = n.to_string_lossy();
+            if s.starts_with("model.gguf.") {
+                let _ = fs::remove_file(e.path());
+            }
+        }
+    }
     let names = split_model_into_parts(model, &dir, ESP_PART)?;
     Ok(names.into_iter().map(|n| (dir.join(&n), n)).collect())
 }
@@ -1286,15 +1374,21 @@ fn assemble_image_opt(kernel_bin: &Path, model_rel: Option<&str>) -> Result<Path
 /// x86 ISO: end users write it to a USB drive (dd / balenaEtcher) and boot any
 /// UEFI aarch64 machine, or attach it as the disk of a UTM/QEMU/VirtualBox-ARM
 /// VM. It boots standalone — it IS the installed disk.
-fn image_aarch64(model: Model) -> Result<(), String> {
+fn image_aarch64(model: Model, no_model: bool) -> Result<(), String> {
     let elf = build_kernel_aarch64(true, model.features())?;
     assert_identity_kernel(&elf)?;
     let stub = build_stub_aarch64()?;
     let gguf = repo_root().join(model.gguf_rel());
-    let model_path = gguf.exists().then_some(gguf);
-    if model_path.is_none() {
-        eprintln!("note: {} absent -- building a model-less image", model.gguf_rel());
-    }
+    let model_path = if no_model {
+        eprintln!("--no-model: building a model-less aarch64 image");
+        None
+    } else {
+        let p = gguf.exists().then_some(gguf);
+        if p.is_none() {
+            eprintln!("note: {} absent -- building a model-less image", model.gguf_rel());
+        }
+        p
+    };
 
     // Voice models bundled on the ESP too, so the kernel's `find_on_disks`
     // auto-loads them (VirtualBox/real-hardware path). Present-only.
@@ -1468,11 +1562,18 @@ fn write_gpt_host(f: &fs::File, total: u64, parts: &[([u8; 16], u64, u64, &str)]
     Ok(())
 }
 
-fn image(release: bool, model: Model) -> Result<(), String> {
+fn image(release: bool, model: Model, no_model: bool) -> Result<(), String> {
     let bin = build_kernel_with(release, model.features())?;
     // Bundle the selected model if present; otherwise a kernel-only bootable
     // ISO (what CI ships -- the model is fetched separately, being large).
-    let iso = assemble_image_with(&bin, model.gguf_rel())?;
+    // `--no-model` forces kernel-only even when a local GGUF exists (server
+    // release profile, install-smoke ISOs).
+    let iso = if no_model {
+        eprintln!("--no-model: ISO has no model module");
+        assemble_image_opt(&bin, None)?
+    } else {
+        assemble_image_with(&bin, model.gguf_rel())?
+    };
     println!("image: {}", iso.display());
     Ok(())
 }
@@ -1584,11 +1685,10 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
 
     // --- Boot the ISO (optionally under UEFI); run `/install` from here ----
     let bin = build_kernel_with(release, model.features())?;
-    let iso = if no_model {
-        eprintln!("--no-model: ISO has no model module -- `/install` writes kernel + config + an empty data partition (fast)");
-        assemble_image_opt(&bin, None)?
-    } else {
-        assemble_image_with(&bin, model.gguf_rel())?
+    let model_path = require_gguf_for_run(model, no_model)?;
+    let iso = match model_path {
+        None => assemble_image_opt(&bin, None)?,
+        Some(_) => assemble_image_with(&bin, model.gguf_rel())?,
     };
     let mut cmd = qemu_base_cmd(&iso);
     if uefi {

@@ -5,6 +5,7 @@
 # --- knobs (override on the command line: `make run ARCH=x86_64 MODEL=qwen3.5-9b RELEASE=1`) ---
 # ARCH:         aarch64 (native HVF on Apple Silicon) | x86_64
 # MODEL:        qwen3.5-0.8b (default) | qwen3.5-2b | qwen3.5-4b | qwen3.5-9b
+#               | gemma-4-e4b (aliases: e4b, gemma4-e4b)
 # RELEASE:      set to 1 for an optimized build
 # BRIDGE:       host NIC to L2-bridge (empty = QEMU user-net / slirp). macOS
 #               vmnet-bridged needs sudo — leave empty for host services via 10.0.2.2
@@ -40,6 +41,7 @@ help:
 	@echo
 	@echo "Override knobs, e.g.:"
 	@echo "  make run ARCH=x86_64 MODEL=qwen3.5-9b RELEASE=1"
+	@echo "  make model MODEL=e4b && make run-uefi MODEL=e4b"
 	@echo "  make run REMOTE_URL=http://10.0.2.2:1234 REMOTE_MODEL=ornith-1.0-9b"
 	@echo "  make run REMOTE_URL=          # no auto /model remote"
 	@echo "  make run BRIDGE=en0           # L2 bridge (often needs sudo on macOS)"
@@ -69,7 +71,13 @@ run:
 	CHITTI_REMOTE_MODEL='$(REMOTE_MODEL)' \
 	$(XTASK) run $(FLAGS)
 
+## model: fetch the GGUF for MODEL into assets/ (required before run / run-uefi)
+.PHONY: model
+model:
+	./xtask/fetch-model.sh $(MODEL)
+
 ## run-uefi: boot aarch64 via the UEFI stub under AAVMF (not -kernel)
+##          needs assets GGUF for MODEL — `make model MODEL=e4b` first
 .PHONY: run-uefi
 run-uefi:
 	$(XTASK) run -arch aarch64 -model $(MODEL) $(REL) --uefi

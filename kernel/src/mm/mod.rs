@@ -5,6 +5,7 @@
 #[cfg(target_arch = "x86_64")]
 pub mod frame;
 pub mod heap;
+pub mod ramlayout;
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};

@@ -10,6 +10,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[repr(align(4096))]
 struct Table(#[allow(dead_code)] [u64; 512]);
 static mut L1: Table = Table([0; 512]);
+/// L2 tables for **mixed** 1 GiB blocks (RAM and MMIO interleaved — real
+/// firmware and VirtualBox-ARM do this; see [`crate::mm::ramlayout`]). Each
+/// maps its GiB at 2 MiB granularity. Statically sized: a machine has only a
+/// handful of RAM-clump boundary blocks.
+const MAX_L2: usize = 8;
+static mut L2S: [Table; MAX_L2] = [const { Table([0; 512]) }; MAX_L2];
 
 /// Top of the RAM/heap region the kernel may use, discovered at boot: on
 /// `-kernel` the top of DTB `/memory`; on UEFI `heap_base + heap_size` reported
@@ -35,12 +41,34 @@ static UEFI_MODEL_SIZE: AtomicU64 = AtomicU64::new(0);
 /// than faulting on an unbacked heap.
 const FALLBACK_RAM_END: u64 = 0x4000_0000 + (4 << 30);
 
-/// What [`detect`] found: the usable top address, and (UEFI only) the stub's
-/// pre-allocated heap and model regions.
+/// Max RAM regions carried in boot-info (matches the stub's table size).
+const MAX_REGIONS: usize = 16;
+
+/// What [`detect`] found: the usable top address, (UEFI only) the stub's
+/// pre-allocated heap and model regions, and the machine's actual RAM extents
+/// (`(base, size)` pairs; `n_regions == 0` when the boot path can't provide
+/// them — the map then falls back to Normal-to-`ram_end` blocks).
 struct RamInfo {
     ram_end: u64,
     uefi_heap_base: u64,
     uefi_model: (u64, u64),
+    regions: [(u64, u64); MAX_REGIONS],
+    n_regions: usize,
+}
+
+impl RamInfo {
+    fn with_regions(mut self, regs: &[(u64, u64)]) -> RamInfo {
+        for &r in regs.iter().take(MAX_REGIONS) {
+            self.regions[self.n_regions] = r;
+            self.n_regions += 1;
+            // RAM above a hole can end past any size-derived estimate.
+            self.ram_end = self.ram_end.max(r.0.saturating_add(r.1));
+        }
+        self
+    }
+    fn bare(ram_end: u64, uefi_heap_base: u64, uefi_model: (u64, u64)) -> RamInfo {
+        RamInfo { ram_end, uefi_heap_base, uefi_model, regions: [(0, 0); MAX_REGIONS], n_regions: 0 }
+    }
 }
 
 /// Discover RAM at boot. Runs with the MMU **off** (before the map is built), so
@@ -49,29 +77,58 @@ fn detect() -> RamInfo {
     // `-kernel`: QEMU passes the DTB in x0; parse its `/memory` node.
     // SAFETY: `boot_x0()` is the DTB pointer (or non-FDT, rejected by magic).
     if let Some((b, s)) = unsafe { super::dtb::memory_region(super::boot::boot_x0()) } {
-        return RamInfo { ram_end: b.saturating_add(s), uefi_heap_base: 0, uefi_model: (0, 0) };
+        return RamInfo::bare(b.saturating_add(s), 0, (0, 0)).with_regions(&[(b, s)]);
     }
     // UEFI/stub: the boot-info page carries the heap and model regions the stub
-    // allocated (AnyPages). The map must cover both.
-    if let Some((hb, hs, mb, ms)) = bootinfo_regions(super::boot::boot_x1()) {
-        let ram_end = hb.saturating_add(hs).max(mb.saturating_add(ms));
-        return RamInfo { ram_end, uefi_heap_base: hb, uefi_model: (mb, ms) };
+    // allocated (AnyPages), plus total installed RAM. The map must cover the
+    // full machine — not just the stub's two LOADER_DATA regions — so a
+    // QEMU-loader-placed model at MODEL_LOAD_ADDR (2 GiB) is identity-mapped
+    // even when the stub failed to load a multi-GiB GGUF from the ESP.
+    if let Some((hb, hs, mb, ms, total_ram)) = bootinfo_regions(super::boot::boot_x1()) {
+        // QEMU `virt` (and the stub's handoff) place system RAM at 0x4000_0000.
+        let from_total = if total_ram > 0 { 0x4000_0000u64.saturating_add(total_ram) } else { 0 };
+        let ram_end = hb
+            .saturating_add(hs)
+            .max(mb.saturating_add(ms))
+            .max(from_total);
+        // The stub also writes the machine's actual RAM extents (count@104,
+        // (base,size) pairs@112) — RAM and MMIO interleave inside GiB blocks
+        // on VirtualBox/real hardware, and only the true extents let the map
+        // type them correctly. Absent on an older stub → n_regions 0 → the
+        // legacy Normal-to-ram_end map.
+        let mut info = RamInfo::bare(ram_end, hb, (mb, ms));
+        let bi = super::boot::boot_x1() as *const u8;
+        // SAFETY: same validated CHITTIBI page bootinfo_regions just read.
+        let rd = |off: usize| -> u64 {
+            let b = unsafe { core::slice::from_raw_parts(bi.add(off), 8) };
+            u64::from_le_bytes(b.try_into().unwrap())
+        };
+        let n = rd(104) as usize;
+        if n > 0 && n <= MAX_REGIONS {
+            let mut regs = [(0u64, 0u64); MAX_REGIONS];
+            for (i, r) in regs.iter_mut().enumerate().take(n) {
+                *r = (rd(112 + i * 16), rd(112 + i * 16 + 8));
+            }
+            info = info.with_regions(&regs[..n]);
+        }
+        return info;
     }
     // QEMU `-kernel`: no DTB in x0 under HVF and no stub, so read the RAM size the
     // launcher (`xtask`) published via fw_cfg (`opt/chitti/ramsize`). RAM on the
     // `virt` machine starts at 0x40000000.
     // SAFETY: single-core early boot; fw_cfg MMIO + stack buffers only.
     if let Some(bytes) = unsafe { super::ramfb::read_ram_bytes() } {
-        return RamInfo { ram_end: 0x4000_0000 + bytes, uefi_heap_base: 0, uefi_model: (0, 0) };
+        return RamInfo::bare(0x4000_0000 + bytes, 0, (0, 0)).with_regions(&[(0x4000_0000, bytes)]);
     }
-    RamInfo { ram_end: FALLBACK_RAM_END, uefi_heap_base: 0, uefi_model: (0, 0) }
+    RamInfo::bare(FALLBACK_RAM_END, 0, (0, 0))
 }
 
-/// Read `(heap_base, heap_size, model_base, model_size)` from the UEFI stub's
-/// boot-info page, if present. Layout: magic "CHITTIBI"@0, heap_base@60,
-/// heap_size@68, model_base@76, model_size@84 (little-endian; see `stub`). Pure
-/// reads (MMU may be off). Returns None unless the heap region is present.
-fn bootinfo_regions(bi: u64) -> Option<(u64, u64, u64, u64)> {
+/// Read `(heap_base, heap_size, model_base, model_size, total_ram)` from the
+/// UEFI stub's boot-info page, if present. Layout: magic "CHITTIBI"@0,
+/// heap_base@60, heap_size@68, model_base@76, model_size@84, total_ram@92
+/// (little-endian; see `stub`). Pure reads (MMU may be off). Returns None
+/// unless the heap region is present.
+fn bootinfo_regions(bi: u64) -> Option<(u64, u64, u64, u64, u64)> {
     if bi == 0 {
         return None;
     }
@@ -90,7 +147,7 @@ fn bootinfo_regions(bi: u64) -> Option<(u64, u64, u64, u64)> {
     if hb == 0 || hs == 0 {
         return None;
     }
-    Some((hb, hs, rd(76), rd(84)))
+    Some((hb, hs, rd(76), rd(84), rd(92)))
 }
 
 /// Set up the identity map and enable the MMU + caches. Idempotent-ish; call
@@ -106,15 +163,50 @@ pub fn init() {
     // Map exactly enough 1-GiB blocks to cover RAM (>=2: base is at 1 GiB), capped
     // at the single L1 table's 512 GiB.
     let map_gib = info.ram_end.div_ceil(1 << 30).clamp(2, 512);
+    let regions = &info.regions[..info.n_regions];
+    let mut l2_used = 0usize;
+    let mut l2_overflow = false;
     // SAFETY: single-core boot; builds a valid identity map and programs the
     // standard EL1 translation registers. VA==PA, so stack/code/UART stay valid.
     unsafe {
         let l1 = core::ptr::addr_of_mut!(L1) as *mut u64;
         for i in 0..map_gib {
             let pa = i << 30; // 1 GiB blocks
-            let attr_idx = if i == 0 { 1u64 } else { 0u64 }; // 0: Device MMIO, else Normal
-            let sh = if i == 0 { 0u64 } else { 0b11u64 }; // inner-shareable for Normal
-            let desc = pa | (attr_idx << 2) | (sh << 8) | (1 << 10) | 0b01; // AF=1, block, valid
+            // Block 0 (below the 0x4000_0000 RAM base) is the UART/GIC MMIO.
+            let kind = if i == 0 || regions.is_empty() {
+                // Legacy shape (no extents known): block 0 Device, rest Normal
+                // up to ram_end — correct only when RAM is one contiguous clump.
+                if i == 0 { crate::mm::ramlayout::BlockKind::Device } else { crate::mm::ramlayout::BlockKind::Normal }
+            } else {
+                crate::mm::ramlayout::classify_gib(pa, regions)
+            };
+            let desc = match kind {
+                crate::mm::ramlayout::BlockKind::Normal => normal_block(pa),
+                crate::mm::ramlayout::BlockKind::Device => device_block(pa),
+                crate::mm::ramlayout::BlockKind::Mixed => {
+                    // RAM and MMIO share this GiB (VirtualBox: the model tail,
+                    // GOP framebuffer and ECAM all in the 0xC000_0000 block) —
+                    // split it into 2 MiB chunks typed from the real extents.
+                    if l2_used < MAX_L2 {
+                        let l2 = core::ptr::addr_of_mut!(L2S[l2_used]) as *mut u64;
+                        l2_used += 1;
+                        for c in 0..512u64 {
+                            let cpa = pa + (c << 21);
+                            *l2.add(c as usize) = if crate::mm::ramlayout::chunk_is_normal(cpa, regions) {
+                                normal_l2_block(cpa)
+                            } else {
+                                device_l2_block(cpa)
+                            };
+                        }
+                        (l2 as u64) | 0b11 // table descriptor
+                    } else {
+                        // Out of static L2 tables: degrade to the legacy Normal
+                        // block (never silently unmapped) and say so below.
+                        l2_overflow = true;
+                        normal_block(pa)
+                    }
+                }
+            };
             *l1.add(i as usize) = desc;
         }
         enable_mmu(l1);
@@ -125,6 +217,26 @@ pub fn init() {
     UEFI_MODEL_BASE.store(info.uefi_model.0, Ordering::Relaxed);
     UEFI_MODEL_SIZE.store(info.uefi_model.1, Ordering::Relaxed);
     MAPPED_BYTES.store(map_gib << 30, Ordering::Relaxed);
+    if l2_overflow {
+        crate::ktrace::log("mmu", "too many mixed RAM/MMIO GiB blocks; some mapped Normal (raise MAX_L2)");
+    }
+}
+
+/// 1 GiB **Normal** (write-back cacheable, inner-shareable) L1 block at `pa`.
+fn normal_block(pa: u64) -> u64 {
+    pa | (0b11 << 8) | (1 << 10) | 0b01 // attr_idx 0, SH=inner, AF=1, block
+}
+/// 1 GiB **Device** L1 block at `pa`.
+fn device_block(pa: u64) -> u64 {
+    pa | (1 << 2) | (1 << 10) | 0b01 // attr_idx 1 (Device), AF=1, block
+}
+/// 2 MiB **Normal** L2 block at `pa` (same encoding, level-2 granularity).
+fn normal_l2_block(pa: u64) -> u64 {
+    pa | (0b11 << 8) | (1 << 10) | 0b01
+}
+/// 2 MiB **Device** L2 block at `pa`.
+fn device_l2_block(pa: u64) -> u64 {
+    pa | (1 << 2) | (1 << 10) | 0b01
 }
 
 /// Top usable RAM address discovered at boot. On `-kernel` the heap is placed
@@ -170,6 +282,15 @@ pub fn map_device_gib(pa: u64) {
     // invalidate publishes the new Device mapping. Device attr_idx=1, non-shareable.
     unsafe {
         let l1 = core::ptr::addr_of_mut!(L1) as *mut u64;
+        let cur = *l1.add(idx);
+        if cur & 0b11 == 0b11 {
+            // A **mixed** block already split into 2 MiB chunks from the real
+            // RAM extents: its non-RAM chunks are Device by construction, so
+            // the MMIO here is reachable as-is. Never collapse the table back
+            // to a Device block — that's exactly the bug that Device-typed the
+            // model tail sharing the ECAM's GiB on VirtualBox.
+            return;
+        }
         let desc = ((idx as u64) << 30) | (1u64 << 2) | (1 << 10) | 0b01; // AF=1, Device, block, valid
         *l1.add(idx) = desc;
         asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb", options(nostack));

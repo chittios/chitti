@@ -35,7 +35,8 @@ refcheck = []
 # from discovered RAM (DTB on `-kernel`, the UEFI stub on real hardware). These
 # features now only pick the heap *size* tier (mm::heap::HEAP_SIZE) and the model
 # name string. Default (both off) = the 0.8B model (256 MiB heap).
-# `cargo xtask build|run -model qwen3.5-9b`: the ~5 GiB Qwen3.5-9B (1 GiB heap).
+# Large-heap tier (1 GiB): Qwen3.5-9B (~5 GiB) and Gemma 4 E4B Q4_K_M (~4.6 GiB).
+# Selected by `-model qwen3.5-9b` or `-model gemma-4-e4b`.
 model-9b = []
 # `cargo xtask build|run -model qwen3.5-4b`: the ~2.6 GiB Qwen3.5-4B (512 MiB heap).
 model-4b = []

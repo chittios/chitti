@@ -63,6 +63,10 @@ pub struct H264Dec {
     /// when `trace` is set (host harness use).
     pub trace: bool,
     pub trace_log: Vec<alloc::string::String>,
+    /// Diagnostics: skip the in-loop deblock entirely (host harness A/B vs a
+    /// reference decoder's `skip_loop_filter`, to bisect a divergence into
+    /// pre-deblock reconstruction vs the filter itself).
+    pub no_deblock: bool,
 }
 
 // --- slice header ----------------------------------------------------------
@@ -894,6 +898,7 @@ impl H264Dec {
             work: None,
             trace: false,
             trace_log: Vec::new(),
+            no_deblock: false,
         })
     }
 
@@ -967,7 +972,7 @@ impl H264Dec {
         // softens slightly; realtime on a single cooperative core wins.
         // dbf_idc==1 means "off" already; we also force-skip above ~720p.
         let big = fx.w * fx.h > 1280 * 720;
-        if dbf.0 != 1 && !big {
+        if dbf.0 != 1 && !big && !self.no_deblock {
             deblock_frame(&mut fx, dbf.1, dbf.2, &self.pps);
         }
         // Planes are already u8 reconstructed samples — move them into the DPB
@@ -1595,11 +1600,17 @@ fn mark_mb_decoded(fx: &mut Fx, mb_x: usize, mb_y: usize) {
                 fx.mvok[0][i] = g;
                 fx.refidx[0][i] = -1;
                 fx.mv[0][i] = [0, 0];
+                fx.refpoc[0][i] = i32::MIN;
             }
             if fx.mvok[1][i] != g {
                 fx.mvok[1][i] = g;
                 fx.refidx[1][i] = -1;
                 fx.mv[1][i] = [0, 0];
+                // refpoc must clear too: the deblock bS (`bs_inter2`) infers
+                // "list used" from refpoc != MIN, and the recycled workspace
+                // still holds the previous frame's value (a P slice never
+                // writes list 1 — its stale refpoc made bS see two mvs).
+                fx.refpoc[1][i] = i32::MIN;
             }
             fx.decy[i] = g;
         }

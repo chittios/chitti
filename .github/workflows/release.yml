@@ -1,13 +1,18 @@
 name: release-images
 
 # On a published GitHub Release, build bootable Chitti OS images for the full
-# matrix of {x86_64, aarch64} x {qwen3.5-0.8b, qwen3.5-9b} and attach them as
-# release assets. Also runnable manually (workflow_dispatch), in which case the
-# images are only uploaded as workflow artifacts.
+# matrix of {x86_64, aarch64} ×
+# {no-model, qwen3.5-4b, qwen3.5-9b, gemma-4-e4b, server} and attach them as
+# release assets. Also runnable manually (workflow_dispatch), in which case
+# the images are only uploaded as workflow artifacts.
 #
-# Images are shipped WITHOUT the model baked in (the GGUFs are 0.8-5.4 GB, over
-# GitHub's per-asset limit). Each asset includes a RUN.md explaining how to
-# fetch the matching model (xtask/fetch-model.sh) and boot.
+# GGUFs are never baked in (too large for GitHub assets). Named model variants
+# only select the kernel heap-size tier so a fetched GGUF of that size fits;
+# `no-model` is the default-heap desktop image meant for `/model remote` or
+# `/model load` (or fetch any GGUF later). Each asset includes a RUN.md.
+#
+# The `server` variant is a headless kernel (`-server` feature: serial only, no
+# framebuffer/GUI tools) and is always model-less (`--no-model`).
 #
 # The kernel embeds the release tag + build time via CHITTI_VERSION /
 # CHITTI_BUILD_TIME (kernel/build.rs); local builds fall back to the crate
@@ -30,14 +35,26 @@ jobs:
       fail-fast: false
       matrix:
         arch: [x86_64, aarch64]
-        model: [qwen3.5-0.8b, qwen3.5-9b]
+        # `no-model` = desktop, default heap, no GGUF tier.
+        # `server`   = headless + no GGUF.
+        # Named models = desktop + heap tier for that GGUF (still not bundled).
+        model: [no-model, qwen3.5-4b, qwen3.5-9b, gemma-4-e4b, server]
     steps:
       - uses: actions/checkout@v4
 
-      # rust-toolchain.toml pins nightly + rust-src + llvm-tools-preview; this
-      # forces the install before the build (needed for -Z build-std).
-      - name: Set up Rust (from rust-toolchain.toml)
-        run: rustup show && rustc --version
+      # Root rust-toolchain.toml = nightly + rust-src + llvm-tools (kernel only:
+      # custom targets + `-Z build-std`). The aarch64 UEFI stub pins *stable*
+      # via stub/rust-toolchain.toml and is not built with nightly.
+      - name: Set up Rust (nightly for OS; stable UEFI target for stub)
+        run: |
+          rustup show
+          rustc --version
+          # Stub toolchain (stable + aarch64-unknown-uefi). rustup installs it
+          # on first stub build too; do it up front so aarch64 image jobs fail
+          # fast with a clear error if the target is unavailable.
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-unknown-uefi --toolchain stable
+          rustup target list --toolchain stable --installed
 
       - name: Embed version + build time
         run: |
@@ -68,13 +85,35 @@ jobs:
         run: |
           set -eux
           mkdir -p dist
-          NAME="chitti-${{ matrix.arch }}-${{ matrix.model }}"
+          # Desktop no-model assets are just `chitti-<arch>` (no suffix).
+          if [ "${{ matrix.model }}" = "no-model" ]; then
+            NAME="chitti-${{ matrix.arch }}"
+          else
+            NAME="chitti-${{ matrix.arch }}-${{ matrix.model }}"
+          fi
+          case "${{ matrix.model }}" in
+            server)
+              # Headless: kernel `server` feature, no GGUF. Default heap tier.
+              EXTRA=(-server --no-model)
+              MODEL_FLAG=(-model qwen3.5-0.8b)
+              ;;
+            no-model)
+              # Desktop, no GGUF, default heap — load at runtime or remote.
+              EXTRA=(--no-model)
+              MODEL_FLAG=(-model qwen3.5-0.8b)
+              ;;
+            *)
+              # Desktop heap tier for this model name (GGUF still not bundled).
+              EXTRA=()
+              MODEL_FLAG=(-model "${{ matrix.model }}")
+              ;;
+          esac
           if [ "${{ matrix.arch }}" = "x86_64" ]; then
-            cargo xtask image -model "${{ matrix.model }}" --release
+            cargo xtask image "${MODEL_FLAG[@]}" "${EXTRA[@]}" --release
             cp target/chitti.iso "dist/$NAME.iso"
             IMG="$NAME.iso"
           else
-            cargo xtask image -arch aarch64 -model "${{ matrix.model }}" --release
+            cargo xtask image -arch aarch64 "${MODEL_FLAG[@]}" "${EXTRA[@]}" --release
             cp target/chitti-aa64.img "dist/$NAME.img"
             IMG="$NAME.img"
           fi
@@ -84,7 +123,61 @@ jobs:
       - name: Package with RUN.md
         run: |
           set -eux
-          cat > "dist/${NAME}.RUN.md" <<EOF
+          case "${{ matrix.model }}" in
+            server)
+              cat > "dist/${NAME}.RUN.md" <<EOF
+          # Chitti OS - ${{ matrix.arch }} / server (headless) (${CHITTI_VERSION})
+
+          Bootable image: \`${IMG}\`.
+          Built with \`-server\` (serial console only; no framebuffer / GUI tools)
+          and \`--no-model\` (no GGUF baked in). Point it at a hosted model or
+          load one at runtime:
+
+              /model remote http://host:port [name]
+              /model load /path/to/file.gguf   # after mounting a disk that has it
+
+          ## Run
+
+          x86_64 (Limine ISO, BIOS or UEFI):
+              qemu-system-x86_64 -M q35 -cpu max -m 2G -cdrom ${NAME}.iso -serial stdio -display none
+
+          aarch64 (raw GPT disk image; boots standalone via UEFI):
+              dd it to a USB drive (or balenaEtcher), attach it as a VM disk
+              (UTM / VirtualBox-ARM / QEMU + AAVMF), or:
+              cargo xtask run -arch aarch64 -server --no-model --uefi
+          EOF
+              ;;
+            no-model)
+              cat > "dist/${NAME}.RUN.md" <<EOF
+          # Chitti OS - ${{ matrix.arch }} (desktop, no model) (${CHITTI_VERSION})
+
+          Bootable image: \`${IMG}\` (\`chitti-${{ matrix.arch }}\`).
+          Desktop (framebuffer) build with **no GGUF bundled**. Use a hosted
+          model or load one from disk after boot:
+
+              /model remote http://host:port [name]
+              /model load /path/to/file.gguf
+
+          Optional local GGUFs (fetch then rebuild/run with \`-model …\`):
+
+              ./xtask/fetch-model.sh qwen3.5-0.8b   # ~812 MB
+              ./xtask/fetch-model.sh qwen3.5-4b     # ~2.6 GB
+              ./xtask/fetch-model.sh qwen3.5-9b     # ~5.0 GB
+              ./xtask/fetch-model.sh gemma-4-e4b    # ~4.6 GB Q4_K_M
+
+          ## Run
+
+          x86_64 (Limine ISO, BIOS or UEFI):
+              qemu-system-x86_64 -M q35 -cpu max -m 2G -cdrom ${NAME}.iso -serial stdio
+
+          aarch64 (raw GPT disk image; boots standalone via UEFI):
+              dd it to a USB drive (or balenaEtcher), attach it as a VM disk
+              (UTM / VirtualBox-ARM / QEMU + AAVMF), or:
+              cargo xtask run -arch aarch64 --no-model --uefi
+          EOF
+              ;;
+            *)
+              cat > "dist/${NAME}.RUN.md" <<EOF
           # Chitti OS - ${{ matrix.arch }} / ${{ matrix.model }} (${CHITTI_VERSION})
 
           Bootable image: \`${IMG}\`. The model is NOT bundled (too large for a
@@ -102,12 +195,20 @@ jobs:
               (UTM / VirtualBox-ARM / QEMU + AAVMF), or:
               cargo xtask run -arch aarch64 -model ${{ matrix.model }} --uefi
 
-          NOTE: qwen3.5-9b runs but is slow (~0.5 tok/s decode on an M2; mixed
-          Q4_0/Q4_1/Q8_0/Q5_K/Q6_K via the generic dequant path) and needs a
-          16 GB+ host for -m 12G. The 5.4 GB model is delivered by splitting it
-          into <4 GiB chunks for QEMU's loader (automatic in \`cargo xtask run\`).
-          qwen3.5-0.8b runs fully at ~14 tok/s.
+          ## Model notes
+
+          - qwen3.5-4b — ~2.6 GB Q4_0; use \`-m 6G\` (or larger) on QEMU.
+          - qwen3.5-9b — ~5.0 GB Q4_0; needs a 16 GB+ host for \`-m 12G\`.
+            Large GGUFs are split into <4 GiB chunks for the loader
+            (automatic in \`cargo xtask run\`).
+          - gemma-4-e4b — Gemma 4 E4B instruct, unsloth Q4_K_M (~4.6 GB).
+            Fetch: \`./xtask/fetch-model.sh gemma-4-e4b\`. Same large-heap
+            tier as 9B (\`-m 10G\`). Cortex uses the Gemma4 chat format.
+          - Prefer the plain \`chitti-${{ matrix.arch }}\` desktop asset if you
+            only need remote/load (no GGUF tier).
           EOF
+              ;;
+          esac
           tar -czf "dist/${NAME}.tar.gz" -C dist "${IMG}" "${NAME}.RUN.md"
           ls -la dist
 
