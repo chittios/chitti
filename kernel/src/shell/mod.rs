@@ -151,12 +151,18 @@ pub fn run() -> ! {
             serial_println!("model> remote backend active: {} ({})  — /model local to switch back", c.url, c.model);
         }
     }
+    // Draft preserved across channel-wake interruptions of read_line.
     let mut line = String::new();
     // Right-side composer hint: model / approval mode (Grok shell layout).
     #[cfg(not(test))]
     update_composer_hint(remote_on, remote_cfg.as_ref());
 
     loop {
+        // External channel inbox → agent turn → reply. Must run whenever
+        // messages are queued — including right after a channel-wake from
+        // idle read_line (otherwise Telegram DMs sit unprocessed forever).
+        drain_channel_inbound(&mut chat, &mut orch.session);
+
         // Grok-style bordered input box on the framebuffer; **serial always**
         // gets a classic `>` prompt + character echo so `make run` / mon:stdio
         // still works as a full line editor (composer must not swallow that).
@@ -172,21 +178,28 @@ pub fn run() -> ! {
         }
         #[cfg(test)]
         serial_print!("> ");
-        line.clear();
-        // Commands browser (and similar) may leave a prefill for the composer
-        // (`/ping `) so the user can complete args — not a chat response.
+        // Prefer an explicit prefill (help browser); otherwise keep draft from
+        // a previous channel-wake so we don't wipe half-typed input.
         if let Some(pre) = take_pending_input() {
             line = pre;
         }
-        read_line(&mut line);
+        let outcome = read_line(&mut line);
         #[cfg(not(test))]
         if crate::framebuffer::composer_available() {
             crate::framebuffer::composer_end();
         }
-        let msg = line.trim();
-        if msg.is_empty() {
+        // Inbound channel work interrupted the prompt — do not treat `line` as
+        // a submitted command; loop to drain, then re-open the prompt with the
+        // same draft still in `line`.
+        if matches!(outcome, ReadOutcome::ChannelWake) {
             continue;
         }
+        let submitted = alloc::string::String::from(line.trim());
+        line.clear();
+        if submitted.is_empty() {
+            continue;
+        }
+        let msg = submitted.as_str();
         if let Some(cmd) = msg.strip_prefix('/') {
             let (name, arg) = match cmd.split_once(' ') {
                 Some((n, a)) => (n, a.trim()),
@@ -389,6 +402,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "rm" => fs_rm(arg),
         "touch" => fs_touch(arg),
         "pwd" => serial_println!("pwd> /"),
+        "channel" | "channels" => run_channel(arg),
         "install" => disk_install(arg),
         "mkext4" => disk_mkext4(arg),
         "ext4read" => disk_ext4read(),
@@ -4292,15 +4306,8 @@ fn run_perf() {
 /// [`read_line`]. Consecutive duplicates are not stored.
 static HISTORY: Locked<alloc::vec::Vec<String>> = Locked::new(alloc::vec::Vec::new());
 
-/// Top-level `/command` names, for Tab completion (canonical names only, not
-/// aliases). Keep in sync with `dispatch_system` + the interactive arms.
-const COMMANDS: &[&str] = &[
-    "agents", "bench", "cat", "clear", "clip", "close", "compact", "cp", "datetime", "disks", "exit",
-    "glob", "grep", "help", "http", "infer", "info", "install", "ktrace", "ls", "lspci", "mcp",
-    "mkdir", "mkext4", "mode", "model", "mount", "mounts", "mv", "network", "onnx", "open", "perf",
-    "ping", "pwd", "rm", "session", "shortcuts", "skills", "think", "top", "touch", "ui", "umount",
-    "voice", "wifi", "ws",
-];
+/// Tab completion draws names from [`catalog::ENTRIES`] + [`catalog::COMMAND_ALIASES`].
+/// Add new commands to the catalogue (not a third list here).
 
 /// `/think on|off` — toggle Qwen thinking mode (default on; streamed dim).
 fn run_think(arg: &str) {
@@ -4430,18 +4437,56 @@ fn suggest_paint(items: &[suggest::Item], sel: usize) {
     let _ = (items, sel);
 }
 
+/// True when the buffer *might* need a slash or @file menu — cheap gate so
+/// normal prose typing does zero catalogue / FS / framebuffer popup work.
+fn suggest_maybe_active(buf: &str, cur: usize) -> bool {
+    let cur = cur.min(buf.len());
+    let before = &buf[..cur];
+    // Slash command at line start (optional leading spaces).
+    let t = before.trim_start();
+    if t.starts_with('/') && !t.contains(' ') {
+        return true;
+    }
+    // @mention token.
+    if let Some(i) = before.rfind('@') {
+        if (i == 0 || before.as_bytes().get(i.wrapping_sub(1)) == Some(&b' '))
+            && !before[i + 1..].contains(' ')
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Refresh the slash-command / @file suggestion menu for `buf` at `cur`.
+///
+/// Fast paths: no `/` or `@` token → skip all work (and only dismiss the popup
+/// if it was open). Avoids catalogue + full-pane redraw on every prose key.
 fn suggest_refresh(
     buf: &str,
     cur: usize,
     sel: &mut usize,
     items: &mut alloc::vec::Vec<suggest::Item>,
 ) {
-    items.clear();
+    if !suggest_maybe_active(buf, cur) {
+        if !items.is_empty() {
+            items.clear();
+            *sel = 0;
+            #[cfg(not(test))]
+            crate::framebuffer::suggest_clear();
+        } else {
+            // Menu already closed — do not touch the framebuffer.
+            *sel = 0;
+        }
+        return;
+    }
     let Some(ctx) = suggest::context(buf, cur) else {
-        *sel = 0;
-        #[cfg(not(test))]
-        crate::framebuffer::suggest_clear();
+        if !items.is_empty() {
+            items.clear();
+            *sel = 0;
+            #[cfg(not(test))]
+            crate::framebuffer::suggest_clear();
+        }
         return;
     };
     let paths = if ctx.kind == suggest::Kind::File {
@@ -4449,13 +4494,25 @@ fn suggest_refresh(
     } else {
         alloc::vec::Vec::new()
     };
-    *items = suggest::items_for(&ctx, &paths);
-    if items.is_empty() {
-        *sel = 0;
-        #[cfg(not(test))]
-        crate::framebuffer::suggest_clear();
+    let next = suggest::items_for(&ctx, &paths);
+    if next.is_empty() {
+        if !items.is_empty() {
+            items.clear();
+            *sel = 0;
+            #[cfg(not(test))]
+            crate::framebuffer::suggest_clear();
+        }
         return;
     }
+    // Skip framebuffer work if the list + selection are unchanged.
+    let same = items.len() == next.len()
+        && items.iter().zip(next.iter()).all(|(a, b)| a.label == b.label && a.detail == b.detail);
+    if same && *sel < items.len() {
+        // List unchanged — nothing to paint (selection only changes on ↑/↓,
+        // which calls suggest_paint directly).
+        return;
+    }
+    *items = next;
     if *sel >= items.len() {
         *sel = items.len() - 1;
     }
@@ -4500,7 +4557,7 @@ fn tab_complete_serial(buf: &mut String) {
         return;
     }
     let prefix = &buf[1..];
-    let matches: alloc::vec::Vec<&&str> = COMMANDS.iter().filter(|c| c.starts_with(prefix)).collect();
+    let matches = catalog::complete_names(prefix);
     match matches.len() {
         0 => {}
         1 => {
@@ -4792,7 +4849,17 @@ fn delete_at(buf: &mut String, cur: &mut usize) {
     }
 }
 
-fn read_line(buf: &mut String) {
+/// Why [`read_line`] returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadOutcome {
+    /// User pressed Enter (line is in `buf`).
+    Submitted,
+    /// Inbound messaging-channel work is waiting — leave `buf` as the draft
+    /// and let the main loop drain the agent queue.
+    ChannelWake,
+}
+
+fn read_line(buf: &mut String) -> ReadOutcome {
     use crate::console;
     // History navigation state: index into HISTORY while browsing, plus the
     // draft line that was being typed when Up was first pressed. `cur` is the
@@ -4878,7 +4945,7 @@ fn read_line(buf: &mut String) {
                         }
                     });
                 }
-                return;
+                return ReadOutcome::Submitted;
             }
             // ESC: decode an ANSI CSI sequence (arrow/nav keys from serial
             // terminals and all keyboard drivers): params, then a final byte.
@@ -5163,8 +5230,19 @@ fn read_line(buf: &mut String) {
             }
             Some(_) => {} // ignore other control bytes
             None => {
-                ui_tick();
-                crate::net::poll(); // pump the net stack (DHCP/ARP) while idle
+                // Full upkeep (not just ui_tick): pumps net, service supervisor,
+                // **and messaging channels** (`msgchan::tick`). Without this,
+                // Telegram getUpdates never ran while the prompt was idle —
+                // offset stayed 0 and DMs were invisible.
+                upkeep();
+                // Wake the main loop so it can run the agent on queued DMs
+                // (drain only happens outside read_line — never block forever).
+                if crate::msgchan::inbound_len() > 0 {
+                    #[cfg(not(test))]
+                    crate::framebuffer::suggest_clear();
+                    // Leave `buf` as the in-progress draft for the next prompt.
+                    return ReadOutcome::ChannelWake;
+                }
                 crate::sched::yield_now();
             }
         }
@@ -5475,6 +5553,8 @@ pub fn upkeep() {
     ui_tick();
     crate::net::poll();
     crate::service::supervise_tick();
+    // External messaging channels (Telegram, …) — short non-blocking poll.
+    crate::msgchan::tick();
     thinking_tick();
 }
 
@@ -7057,6 +7137,333 @@ fn fs_touch(arg: &str) {
     match crate::synapse::fs::touch(path) {
         Ok(()) => serial_println!("touch> {}", crate::synapse::vpath::normalize(path)),
         Err(e) => serial_println!("touch> {}: {}", path, e),
+    }
+}
+
+/// `/channel` — manage external messaging channels (Telegram first; generic
+/// backends). OpenClaw-style: add a bot, start polling, pair/allow senders,
+/// send/reply. Inbound text with `auto_agent` is answered by the shell agent.
+fn run_channel(arg: &str) {
+    use crate::msgchan::{self, DmPolicy, Kind};
+    let mut parts = arg.split_whitespace();
+    let sub = parts.next().unwrap_or("");
+    match sub {
+        "" | "list" | "ls" => {
+            let all = msgchan::list();
+            if all.is_empty() {
+                serial_println!("channel> (none) — /channel add telegram <name> <bot_token>");
+                serial_println!("channel> types: {}", msgchan::types().join(", "));
+                return;
+            }
+            serial_println!("channel> {} instance(s):", all.len());
+            for i in all {
+                let st = if i.running { "running" } else { "stopped" };
+                let err = i
+                    .last_error
+                    .as_deref()
+                    .map(|e| alloc::format!(" err={e}"))
+                    .unwrap_or_default();
+                serial_println!(
+                    "  {:<12} {:<10} {:<8} policy={} allow={} auto_agent={}{err}",
+                    i.name,
+                    i.kind.as_str(),
+                    st,
+                    i.policy.as_str(),
+                    i.allow_from.len(),
+                    i.auto_agent
+                );
+            }
+        }
+        "types" => {
+            serial_println!("channel> backends: {}", msgchan::types().join(", "));
+            serial_println!("channel> add more kinds in msgchan::Kind without changing this command");
+        }
+        "add" => {
+            // /channel add telegram <name> <token> [pairing|allowlist|open]
+            let kind_s = parts.next().unwrap_or("");
+            let name = parts.next().unwrap_or("");
+            let token = parts.next().unwrap_or("");
+            let pol_s = parts.next().unwrap_or("pairing");
+            let Some(kind) = Kind::parse(kind_s) else {
+                serial_println!("channel> usage: /channel add <type> <name> <token> [pairing|allowlist|open]");
+                serial_println!("channel> types: {}", msgchan::types().join(", "));
+                return;
+            };
+            let policy = DmPolicy::parse(pol_s).unwrap_or(DmPolicy::Pairing);
+            match msgchan::add(name, kind, token, policy) {
+                Ok(()) => serial_println!(
+                    "channel> added '{}' ({}, policy={}) — /channel start {name}",
+                    name,
+                    kind.as_str(),
+                    policy.as_str()
+                ),
+                Err(e) => serial_println!("channel> add failed: {e}"),
+            }
+        }
+        "remove" | "rm" => {
+            let name = parts.next().unwrap_or("");
+            if name.is_empty() {
+                serial_println!("channel> usage: /channel remove <name>");
+                return;
+            }
+            match msgchan::remove(name) {
+                Ok(()) => serial_println!("channel> removed '{name}'"),
+                Err(e) => serial_println!("channel> {e}"),
+            }
+        }
+        "start" => {
+            let name = parts.next().unwrap_or("");
+            if name.is_empty() {
+                serial_println!("channel> usage: /channel start <name>");
+                return;
+            }
+            serial_println!("channel> starting '{name}' (HTTPS to api.telegram.org; Ctrl+C cancels)…");
+            match msgchan::start(name) {
+                Ok(()) => {
+                    serial_println!(
+                        "channel> '{name}' started — polling every ~2.5s in the background"
+                    );
+                    serial_println!(
+                        "channel> DM the bot, then /channel pair {name} <CODE> (or /channel status)"
+                    );
+                }
+                Err(e) => serial_println!("channel> start failed: {e}"),
+            }
+        }
+        "stop" => {
+            let name = parts.next().unwrap_or("");
+            if name.is_empty() {
+                serial_println!("channel> usage: /channel stop <name>");
+                return;
+            }
+            match msgchan::stop(name) {
+                Ok(()) => serial_println!("channel> '{name}' stopped"),
+                Err(e) => serial_println!("channel> {e}"),
+            }
+        }
+        "status" => {
+            let name = parts.next();
+            let mut any = false;
+            for i in msgchan::list() {
+                if name.is_some_and(|n| n != i.name) {
+                    continue;
+                }
+                any = true;
+                serial_println!(
+                    "channel> {}  kind={}  {}  policy={}  offset={}  allow_from={:?}",
+                    i.name,
+                    i.kind.as_str(),
+                    if i.running { "running" } else { "stopped" },
+                    i.policy.as_str(),
+                    i.offset,
+                    i.allow_from
+                );
+                if let Some(p) = &i.last_peer {
+                    serial_println!("  last_peer={p}");
+                }
+                if let Some((code, uid, disp)) = &i.pending_pair {
+                    serial_println!(
+                        "  pending_pair: code={code}  from={disp} ({uid})  →  /channel pair {} {code}",
+                        i.name
+                    );
+                }
+                if let Some(e) = &i.last_error {
+                    serial_println!("  last_error={e}");
+                }
+            }
+            if !any {
+                serial_println!("channel> (no matching instance)");
+            }
+            let q = msgchan::inbound_len();
+            if q > 0 {
+                serial_println!("channel> {} inbound message(s) queued for the agent", q);
+            }
+            if name.is_none() || any {
+                serial_println!(
+                    "channel> polls every ~2.5s while the prompt is idle; /channel poll [name] forces one now"
+                );
+            }
+        }
+        "allow" => {
+            let name = parts.next().unwrap_or("");
+            let uid = parts.next().unwrap_or("");
+            if name.is_empty() || uid.is_empty() {
+                serial_println!("channel> usage: /channel allow <name> <user_id|*>");
+                return;
+            }
+            match msgchan::allow(name, uid) {
+                Ok(()) => {
+                    serial_println!("channel> '{name}' allows {uid}");
+                    // Catch up on DMs that arrived before allow (offset may
+                    // still be 0 — Telegram buffers recent updates).
+                    serial_println!("channel> fetching pending updates…");
+                    msgchan::poll_now(Some(name));
+                }
+                Err(e) => serial_println!("channel> {e}"),
+            }
+        }
+        "pair" => {
+            // /channel pair <name> <code>  — CODE is the 4 hex digits the bot
+            // sends (e.g. AB12), NOT your Telegram user id.
+            let name = parts.next().unwrap_or("");
+            let code = parts.next().unwrap_or("");
+            if name.is_empty() || code.is_empty() {
+                serial_println!("channel> usage: /channel pair <name> <CODE>");
+                serial_println!(
+                    "channel> CODE = 4 hex digits from the bot DM (e.g. AB12), not your user id"
+                );
+                serial_println!(
+                    "channel> if there is no code yet: DM the bot, wait a few seconds, /channel status"
+                );
+                return;
+            }
+            match msgchan::pair_approve(name, code) {
+                Ok(uid) => serial_println!("channel> paired {uid} on '{name}'"),
+                Err(e) => {
+                    serial_println!("channel> pair failed: {e}");
+                    if e == "no pending pair" {
+                        serial_println!(
+                            "channel> tip: use /channel allow {name} <user_id> if you already know your Telegram id"
+                        );
+                        serial_println!(
+                            "channel> pairing only appears after a DM is *received* (polling must be running)"
+                        );
+                    }
+                }
+            }
+        }
+        "poll" => {
+            // Force an immediate getUpdates round (debug / catch-up).
+            let name = parts.next();
+            serial_println!("channel> polling…");
+            msgchan::poll_now(name);
+            serial_println!("channel> poll done — /channel status");
+        }
+        "send" => {
+            // /channel send <name> <peer> <text…>
+            let name = parts.next().unwrap_or("");
+            let peer = parts.next().unwrap_or("");
+            let text: alloc::string::String = parts.collect::<alloc::vec::Vec<_>>().join(" ");
+            if name.is_empty() || peer.is_empty() || text.is_empty() {
+                serial_println!("channel> usage: /channel send <name> <peer_id> <text>");
+                return;
+            }
+            match msgchan::send(name, peer, &text) {
+                Ok(()) => serial_println!("channel> sent to {peer} via '{name}'"),
+                Err(e) => serial_println!("channel> send failed: {e}"),
+            }
+        }
+        "reply" => {
+            let name = parts.next().unwrap_or("");
+            let text: alloc::string::String = parts.collect::<alloc::vec::Vec<_>>().join(" ");
+            if name.is_empty() || text.is_empty() {
+                serial_println!("channel> usage: /channel reply <name> <text>");
+                return;
+            }
+            match msgchan::reply(name, &text) {
+                Ok(()) => serial_println!("channel> replied on '{name}'"),
+                Err(e) => serial_println!("channel> reply failed: {e}"),
+            }
+        }
+        "help" | _ => {
+            serial_println!("channel> messaging channels (generic; Telegram first):");
+            serial_println!("  /channel [list]                     list instances");
+            serial_println!("  /channel types                      available backends");
+            serial_println!("  /channel add telegram <name> <tok>  [pairing|allowlist|open]");
+            serial_println!("  /channel start|stop|remove <name>");
+            serial_println!("  /channel status [name]");
+            serial_println!("  /channel allow <name> <user_id|*>");
+            serial_println!("  /channel pair <name> <CODE>         approve a DM pairing");
+            serial_println!("  /channel send <name> <peer> <text>");
+            serial_println!("  /channel reply <name> <text>        reply to last inbound");
+            serial_println!("  /channel poll [name]                force getUpdates now");
+            serial_println!("  config: {}", msgchan::CONFIG_PATH);
+        }
+    }
+}
+
+/// Strip light markdown so Telegram gets plain text (the model often emits
+/// `**bold**` despite the system prompt).
+fn strip_md_light(s: &str) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        // **bold** or *italic* or `code`
+        if b[i] == b'*' || b[i] == b'`' || b[i] == b'_' {
+            // skip run of the same marker
+            let m = b[i];
+            while i < b.len() && b[i] == m {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Drain inbound messaging-channel queue: each message becomes a shell-agent
+/// turn; the reply is sent back on the same channel. Called from the interactive
+/// loop (not from upkeep — inference is too heavy for the poll tick).
+fn drain_channel_inbound(
+    chat: &mut Option<ChatSession>,
+    session: &mut crate::agent::types::Session,
+) {
+    // Process a bounded number per loop so the prompt stays responsive.
+    for _ in 0..3 {
+        let Some(msg) = crate::msgchan::take_inbound() else {
+            break;
+        };
+        serial_println!(
+            "channel[{}] → agent: {} says: {}",
+            msg.channel,
+            msg.from_name,
+            msg.text
+        );
+        // Ensure a chat session exists.
+        if chat.is_none() {
+            let mut spin = Spinner::new("channel");
+            *chat = ChatSession::load(&mut spin);
+            if let Some(c) = chat.as_mut() {
+                c.hydrate_from_session(session);
+            }
+        }
+        let Some(sess) = chat.as_mut() else {
+            let _ = crate::msgchan::send(
+                &msg.channel,
+                &msg.peer_id,
+                "Chitti: no local model loaded — cannot auto-reply. Use /channel reply from the console, or /model load.",
+            );
+            continue;
+        };
+        // Frame the turn so a small model stays on *this* message (not the
+        // previous one) and uses tools for OS facts instead of inventing them.
+        let user = alloc::format!(
+            "Message from Telegram user {} (channel {}).\n\
+             Answer ONLY the latest user message below. Do not continue an earlier topic.\n\
+             If the question needs machine state (disks, files, network, time), call the right tool first; never invent those facts.\n\
+             For simple math or greetings, answer directly in one short plain-text reply (no markdown).\n\
+             \n\
+             User message:\n{}",
+            msg.from_name, msg.channel, msg.text
+        );
+        let reply = sess.turn(&user, session);
+        let reply = strip_md_light(reply.trim());
+        let reply = reply.trim();
+        if reply.is_empty() {
+            let _ = crate::msgchan::send(
+                &msg.channel,
+                &msg.peer_id,
+                "(no reply — try again or check /think /model on the console)",
+            );
+            continue;
+        }
+        serial_println!("channel[{}] ← agent: {}", msg.channel, reply);
+        if let Err(e) = crate::msgchan::send(&msg.channel, &msg.peer_id, reply) {
+            serial_println!("channel> delivery failed: {e}");
+        }
     }
 }
 

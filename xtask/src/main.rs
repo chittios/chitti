@@ -104,6 +104,106 @@ fn user_netdev(id: &str) -> String {
     s
 }
 
+/// Guest NIC backend for interactive / e2e `run`.
+///
+/// * `CHITTI_NET_BRIDGE=<ifname>` (e.g. `en0`) — L2 bridge onto that host
+///   interface so the guest gets a LAN address via the real DHCP server.
+///   macOS uses QEMU's `vmnet-bridged` (Apple vmnet; needs root or the
+///   `com.apple.vm.networking` entitlement); other hosts use the classic
+///   `bridge` helper (`br=<ifname>`).
+/// * otherwise — slirp user-net via [`user_netdev`] (incl. optional
+///   `CHITTI_HOSTFWD`). Hostfwd is ignored when bridging.
+fn guest_netdev(id: &str) -> String {
+    if let Ok(ifname) = env::var("CHITTI_NET_BRIDGE") {
+        let ifname = ifname.trim();
+        if !ifname.is_empty() {
+            if env::var("CHITTI_HOSTFWD").is_ok() {
+                eprintln!(
+                    "xtask: note: CHITTI_HOSTFWD is ignored with CHITTI_NET_BRIDGE \
+                     (guest is on the LAN; reach it at its DHCP address)"
+                );
+            }
+            #[cfg(target_os = "macos")]
+            {
+                eprintln!(
+                    "  net: vmnet-bridged ifname={ifname} \
+                     (may need `sudo` / com.apple.vm.networking)"
+                );
+                return format!("vmnet-bridged,id={id},ifname={ifname}");
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                eprintln!("  net: bridge br={ifname}");
+                return format!("bridge,id={id},br={ifname}");
+            }
+        }
+    }
+    user_netdev(id)
+}
+
+/// Boot-time `/model remote` seed for the guest.
+///
+/// When `CHITTI_REMOTE_URL` is set (optionally `CHITTI_REMOTE_MODEL`,
+/// `CHITTI_REMOTE_KEY`), write a small JSON file and hand it to QEMU as
+/// `-fw_cfg name=opt/chitti/model,file=…`. The kernel reads it at shell
+/// start and activates the hosted backend (same shape as
+/// `/configs/core/model.json`). Used by `make run` for LM Studio / Ollama
+/// without typing `/model remote` by hand.
+///
+/// Under slirp user-net the host is `10.0.2.2` (not the host's LAN IP).
+fn remote_model_fw_cfg() -> Result<Vec<String>, String> {
+    let Ok(url) = env::var("CHITTI_REMOTE_URL") else {
+        return Ok(Vec::new());
+    };
+    let url = url.trim().trim_end_matches('/').to_string();
+    if url.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!(
+            "CHITTI_REMOTE_URL must be http(s)://… (got {url:?})"
+        ));
+    }
+    let model = env::var("CHITTI_REMOTE_MODEL")
+        .unwrap_or_else(|_| "default".into())
+        .trim()
+        .to_string();
+    let key = env::var("CHITTI_REMOTE_KEY").unwrap_or_default();
+    let key = key.trim();
+    // Minimal JSON (no commas in values expected). Written to a file so QEMU's
+    // comma-separated -fw_cfg parser never splits the body.
+    let json = format!(
+        "{{\"mode\":\"remote\",\"url\":\"{}\",\"model\":\"{}\",\"key\":\"{}\"}}",
+        json_escape_str(&url),
+        json_escape_str(&model),
+        json_escape_str(key),
+    );
+    let path = repo_root().join("target/chitti-fwcfg-model.json");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    fs::write(&path, json.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))?;
+    eprintln!("  model remote seed: {url} ({model})");
+    Ok(vec![
+        "-fw_cfg".into(),
+        format!("name=opt/chitti/model,file={}", path.display()),
+    ])
+}
+
+/// Escape a string for embedding in a JSON string value (quotes + backslashes).
+fn json_escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn mem_bytes(m: &str) -> u64 {
     let m = m.trim();
     let (num, mult) = match m.chars().last() {
@@ -728,12 +828,15 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
     // On the `-kernel` HVF path QEMU passes no DTB (x0=0), so this fw_cfg file is
     // how the kernel learns how much RAM it has (see `mmu::detect`).
     qemu.arg("-fw_cfg").arg(format!("name=opt/chitti/ramsize,string={}", mem_bytes(model.qemu_mem())));
-    // A virtio-net NIC on user-mode networking (built-in DHCP 10.0.2.15 / gw
-    // 10.0.2.2 / dns 10.0.2.3) so /network, /ping and /wifi work out of the box.
-    // CHITTI_HOSTFWD=<port> adds a slirp host-forward so a host process can reach
-    // a guest listener (used by the e2e Network-service-agent scenario). Opt-in
-    // so normal runs keep the plain user-net.
-    qemu.args(["-netdev", &user_netdev("chittinet"), "-device", "virtio-net-device,netdev=chittinet"]);
+    // Optional boot seed for /model remote (CHITTI_REMOTE_URL / _MODEL / _KEY).
+    for a in remote_model_fw_cfg()? {
+        qemu.arg(a);
+    }
+    // A virtio-net NIC: slirp user-net by default (DHCP 10.0.2.15 / gw 10.0.2.2),
+    // or L2-bridged onto a host iface when CHITTI_NET_BRIDGE=<ifname> is set.
+    // CHITTI_HOSTFWD only applies to user-net. Host services (LM Studio, …)
+    // are reached at 10.0.2.2 under user-net.
+    qemu.args(["-netdev", &guest_netdev("chittinet"), "-device", "virtio-net-device,netdev=chittinet"]);
     // virtio-snd on the host's audio backend (mic + speaker) for /voice.
     qemu.args(audio_args("virtio-sound-device"));
     // Attach a virtio-blk disk on the virtio-mmio bus (the aarch64 block driver
@@ -1470,8 +1573,8 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         cmd.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", disk.display()));
         cmd.args(["-device", "virtio-blk-pci,drive=chittidisk,disable-modern=on"]);
         cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
-        // Intel e1000 NIC on user-mode networking (DHCP 10.0.2.15 / gw 10.0.2.2).
-        cmd.args(["-netdev", &user_netdev("chittinet"), "-device", "e1000,netdev=chittinet"]);
+        // Intel e1000 NIC (user-net or CHITTI_NET_BRIDGE — see guest_netdev).
+        cmd.args(["-netdev", &guest_netdev("chittinet"), "-device", "e1000,netdev=chittinet"]);
         eprintln!("booting FROM DISK ONLY via UEFI (OVMF) -- no ISO; the installed Chitti boots itself");
         eprintln!("  disk: {}", disk.display());
         let status = cmd.status().map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
@@ -1496,6 +1599,9 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
     }
     cmd.args(["-serial", "stdio"]);
     cmd.args(x86_run_extra_args()); // headless (-display none) + KVM on CI
+    for a in remote_model_fw_cfg()? {
+        cmd.arg(a);
+    }
     cmd.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", disk.display()));
     cmd.args(["-device", "virtio-blk-pci,drive=chittidisk,disable-modern=on"]);
     // Opt-in FAT disk carrying a GGUF as `chat.gguf` for the runtime `/model
@@ -1508,8 +1614,8 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
     // A USB keyboard on an xHCI controller, so the xhci/HID driver drives the
     // shell (as a real USB keyboard would); PS/2 also still works.
     cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
-    // Intel e1000 NIC on user-mode networking (DHCP 10.0.2.15 / gw 10.0.2.2).
-    cmd.args(["-netdev", &user_netdev("chittinet"), "-device", "e1000,netdev=chittinet"]);
+    // Intel e1000 NIC (user-net or CHITTI_NET_BRIDGE — see guest_netdev).
+    cmd.args(["-netdev", &guest_netdev("chittinet"), "-device", "e1000,netdev=chittinet"]);
     // virtio-snd on the host's audio backend (mic + speaker) for /voice.
     cmd.args(audio_args("virtio-sound-pci"));
     if disk_size.is_some() {

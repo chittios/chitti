@@ -102,6 +102,7 @@ OS_CMDS = [
     ("top", "/top", "top>"),
     ("clear", "/clear", "cleared"),
     ("wifi", "/wifi info", "wifi>"),
+    ("channel", "/channel list", "channel>"),
     # /memory and /restart are covered by dedicated scenarios below (round-trip
     # + help listing / reboot-exit); listed here only for discoverability.
 ]

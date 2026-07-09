@@ -35,21 +35,50 @@ pub struct RemoteConfig {
     pub key: Option<String>,
 }
 
-/// Load the persisted config: `(remote_active, Option<RemoteConfig>)`.
-pub fn load() -> (bool, Option<RemoteConfig>) {
-    let Some(bytes) = crate::synapse::fs::read(MODEL_CFG_PATH) else {
-        return (false, None);
-    };
-    let Some(j) = core::str::from_utf8(&bytes).ok().and_then(Json::parse) else {
-        return (false, None);
-    };
+/// Parse a `model.json`-shaped body into `(remote_active, Option<RemoteConfig>)`.
+/// Pure — unit-tested so the boot seed and on-disk shapes stay in lockstep.
+pub fn parse_config_json(bytes: &[u8]) -> Option<(bool, Option<RemoteConfig>)> {
+    let j = core::str::from_utf8(bytes).ok().and_then(Json::parse)?;
     let remote = j.get("mode").and_then(|v| v.as_str()) == Some("remote");
     let cfg = j.get("url").and_then(|v| v.as_str()).map(|url| RemoteConfig {
         url: url.trim_end_matches('/').to_string(),
         model: j.get("model").and_then(|v| v.as_str()).unwrap_or("default").to_string(),
         key: j.get("key").and_then(|v| v.as_str()).filter(|k| !k.is_empty()).map(|k| k.to_string()),
     });
-    (remote && cfg.is_some(), cfg)
+    Some((remote && cfg.is_some(), cfg))
+}
+
+/// Launcher boot seed (`opt/chitti/model` fw_cfg), if the host published one.
+/// Present on aarch64 QEMU when `CHITTI_REMOTE_URL` is set (`make run`).
+fn boot_seed() -> Option<(bool, Option<RemoteConfig>)> {
+    #[cfg(all(target_arch = "aarch64", not(test)))]
+    {
+        let bytes = crate::arch::aarch64::ramfb::read_opt_file(b"opt/chitti/model")?;
+        return parse_config_json(&bytes);
+    }
+    #[cfg(not(all(target_arch = "aarch64", not(test))))]
+    {
+        None
+    }
+}
+
+/// Load the backend config: `(remote_active, Option<RemoteConfig>)`.
+///
+/// Order: launcher fw_cfg seed (interactive `make run` → LM Studio / Ollama)
+/// wins over the on-disk `/configs/core/model.json`, so a one-shot env pin is
+/// never overridden by a stale saved "local" mode. When a seed is used it is
+/// also written through so `/model` and the next boot without a seed still see it.
+pub fn load() -> (bool, Option<RemoteConfig>) {
+    if let Some((on, cfg)) = boot_seed() {
+        if on {
+            save(true, cfg.as_ref());
+        }
+        return (on, cfg);
+    }
+    let Some(bytes) = crate::synapse::fs::read(MODEL_CFG_PATH) else {
+        return (false, None);
+    };
+    parse_config_json(&bytes).unwrap_or((false, None))
 }
 
 /// Persist the backend choice (+ config, when remote is configured).
@@ -308,5 +337,25 @@ mod tests {
         let j = crate::json::Json::parse(json).unwrap();
         assert_eq!(j.get("mode").and_then(|v| v.as_str()), Some("remote"));
         assert_eq!(j.get("url").and_then(|v| v.as_str()), Some("http://192.168.1.20:8080"));
+    }
+
+    /// Boot seed + on-disk shape: remote mode needs a url; model defaults;
+    /// empty key is treated as absent.
+    #[test_case]
+    fn parse_config_json_remote_seed() {
+        let json = b"{\"mode\":\"remote\",\"url\":\"http://10.0.2.2:1234\",\"model\":\"ornith-1.0-9b\",\"key\":\"\"}";
+        let (on, cfg) = parse_config_json(json).expect("parse");
+        assert!(on);
+        let c = cfg.expect("cfg");
+        assert_eq!(c.url, "http://10.0.2.2:1234");
+        assert_eq!(c.model, "ornith-1.0-9b");
+        assert!(c.key.is_none());
+        // Trailing slash stripped; local mode is not "active remote".
+        let local = b"{\"mode\":\"local\",\"url\":\"http://x\",\"model\":\"m\"}";
+        let (on, _) = parse_config_json(local).expect("parse local");
+        assert!(!on);
+        let slash = b"{\"mode\":\"remote\",\"url\":\"http://10.0.2.2:1234/\",\"model\":\"m\"}";
+        let (_, cfg) = parse_config_json(slash).expect("parse slash");
+        assert_eq!(cfg.unwrap().url, "http://10.0.2.2:1234");
     }
 }

@@ -1,10 +1,14 @@
 //! Slash-command and `@file` mention suggestions for the shell composer.
 //!
 //! Pure filtering + ranking (no framebuffer). The line editor drives this on
-//! every edit; the compositor paints the popup. Matches the Grok-style
-//! command menu: a filtered list of `/command` + description, and `@/path`
-//! file mentions from the Synapse store.
+//! every edit; the compositor paints the popup.
+//!
+//! **Single source of truth for slash commands:** [`crate::shell::catalog::ENTRIES`].
+//! When you add or rename a `/command`, update that catalogue (title =
+//! suggestion detail). Do **not** maintain a parallel list here — unit tests
+//! fail if a catalogue entry is missing from suggestions.
 
+use crate::shell::catalog;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -40,58 +44,6 @@ pub struct Context {
     pub token_start: usize,
 }
 
-/// Slash commands with short descriptions (canonical names only).
-/// Keep in sync with `COMMANDS` in `shell/mod.rs`.
-const COMMAND_HELP: &[(&str, &str)] = &[
-    ("agents", "List / switch / kill agent processes"),
-    ("bench", "Matvec kernel throughput"),
-    ("cat", "Print a store or mounted file"),
-    ("clear", "Reset chat context + clear the pane"),
-    ("clip", "Show or set the shared clipboard"),
-    ("close", "Close the action pane (or Ctrl+W)"),
-    ("compact", "Compact chat context (model summary)"),
-    ("cp", "Copy a store file or tree (-r)"),
-    ("datetime", "Show or set the wall clock"),
-    ("disks", "List block devices + filesystems"),
-    ("exit", "Power off the machine"),
-    ("glob", "List store paths matching a pattern"),
-    ("grep", "Search store file contents"),
-    ("help", "Browse commands and usage"),
-    ("http", "curl-like HTTP client"),
-    ("infer", "Reference inference parity check"),
-    ("info", "CPU / memory / model / OS status"),
-    ("install", "Install or update Chitti on a disk"),
-    ("ktrace", "Toggle the ktrace log stream"),
-    ("ls", "List a store directory (Linux-like)"),
-    ("lspci", "List PCI devices"),
-    ("mcp", "Model Context Protocol client"),
-    ("mkdir", "Create a store directory (-p)"),
-    ("mkext4", "Format a disk with ext4 (destructive)"),
-    ("mode", "Agent tool approvals: manual|auto|bypass|plan"),
-    ("model", "Local or remote chat backend"),
-    ("mount", "Mount a disk volume at a path"),
-    ("mounts", "List mounted volumes"),
-    ("mv", "Rename or move a store path"),
-    ("network", "Net status / dhcp / static / dns"),
-    ("onnx", "Inspect or run an ONNX model"),
-    ("open", "Edit / preview / play a file"),
-    ("perf", "Prefill/decode tokens per second"),
-    ("ping", "ICMP echo a host or IP"),
-    ("pwd", "Print working directory"),
-    ("rm", "Remove a store file or tree (-r)"),
-    ("session", "Show / save / resume a session"),
-    ("shortcuts", "List keyboard shortcuts"),
-    ("skills", "List installed skills"),
-    ("think", "Toggle model thinking (on|off)"),
-    ("top", "Live CPU + memory monitor"),
-    ("touch", "Create an empty store file"),
-    ("ui", "View or reload the UI config"),
-    ("umount", "Unmount a path"),
-    ("voice", "Voice: test, stt, say, conversation"),
-    ("wifi", "Wi-Fi scan / connect / info"),
-    ("ws", "WebSocket client"),
-];
-
 /// Detect a slash-command or `@file` token ending at the caret.
 pub fn context(buf: &str, cur: usize) -> Option<Context> {
     let cur = cur.min(buf.len());
@@ -126,16 +78,20 @@ pub fn context(buf: &str, cur: usize) -> Option<Context> {
 }
 
 /// Ranked command suggestions for `prefix` (without the leading `/`).
+/// Sourced from [`catalog::ENTRIES`] so `/channel` and every other shell
+/// command stay in the popup when the catalogue is updated.
 pub fn command_items(prefix: &str, max: usize) -> Vec<Item> {
     let p = prefix.to_ascii_lowercase();
     let mut starts: Vec<Item> = Vec::new();
     let mut contains: Vec<Item> = Vec::new();
-    for &(name, detail) in COMMAND_HELP {
-        let nlow = name.to_ascii_lowercase();
+    for e in catalog::ENTRIES {
+        let nlow = e.name.to_ascii_lowercase();
+        let title_low = e.title.to_ascii_lowercase();
+        let cat_low = e.category.to_ascii_lowercase();
         if p.is_empty() || nlow.starts_with(&p) {
-            starts.push(cmd_item(name, detail));
-        } else if nlow.contains(&p) || detail.to_ascii_lowercase().contains(&p) {
-            contains.push(cmd_item(name, detail));
+            starts.push(cmd_item(e.name, e.title));
+        } else if nlow.contains(&p) || title_low.contains(&p) || cat_low.contains(&p) {
+            contains.push(cmd_item(e.name, e.title));
         }
     }
     starts.extend(contains);
@@ -247,6 +203,34 @@ mod tests {
         let cur = apply(&mut buf, 3, 0, &items.iter().find(|i| i.label == "/help").unwrap());
         assert_eq!(buf, "/help ");
         assert_eq!(cur, buf.len());
+    }
+
+    /// Every catalogue command must surface in slash suggestions (catches
+    /// forgetting to wire a new `/command` into the composer popup).
+    #[test_case]
+    fn catalog_commands_are_all_suggestable() {
+        for e in catalog::ENTRIES {
+            let items = command_items(e.name, 64);
+            assert!(
+                items.iter().any(|i| i.label == alloc::format!("/{}", e.name)),
+                "catalogue command /{} missing from suggestions — update catalog::ENTRIES only (suggest reads it)",
+                e.name
+            );
+            // Exact-name filter should put this command first or alone.
+            assert!(
+                items.iter().any(|i| i.detail == e.title),
+                "/{} should show title {:?} as detail",
+                e.name,
+                e.title
+            );
+        }
+        // Regression: messaging channels must appear when typing /chan…
+        let ch = command_items("chan", 8);
+        assert!(
+            ch.iter().any(|i| i.label == "/channel"),
+            "/channel must appear for prefix 'chan': {:?}",
+            ch.iter().map(|i| i.label.as_str()).collect::<alloc::vec::Vec<_>>()
+        );
     }
 
     #[test_case]

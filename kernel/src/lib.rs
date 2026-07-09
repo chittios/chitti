@@ -43,6 +43,7 @@ pub mod mcp;
 pub mod mm;
 pub mod modal;
 pub mod mouse;
+pub mod msgchan;
 pub mod net;
 pub mod onnx;
 pub mod persona;
