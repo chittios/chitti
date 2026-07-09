@@ -68,7 +68,28 @@ pub fn convert_display_rows(
 fn convert_row_full(y: &[u8], cb: &[u8], cr: &[u8], _scw: usize, out: &mut [u32]) {
     let n = out.len().min(y.len());
     let mut x = 0;
-    // Process 8 pixels at a time (4 chroma samples for 4:2:0).
+    // Process 16 pixels at a time (two NEON/scalar octets).
+    while x + 16 <= n {
+        let mut y0 = [0u8; 8];
+        let mut y1 = [0u8; 8];
+        let mut u0 = [0u8; 8];
+        let mut u1 = [0u8; 8];
+        let mut v0 = [0u8; 8];
+        let mut v1 = [0u8; 8];
+        y0.copy_from_slice(&y[x..x + 8]);
+        y1.copy_from_slice(&y[x + 8..x + 16]);
+        for i in 0..8 {
+            let c0 = (x + i) / 2;
+            let c1 = (x + 8 + i) / 2;
+            u0[i] = cb.get(c0).copied().unwrap_or(128);
+            v0[i] = cr.get(c0).copied().unwrap_or(128);
+            u1[i] = cb.get(c1).copied().unwrap_or(128);
+            v1[i] = cr.get(c1).copied().unwrap_or(128);
+        }
+        convert8(&y0, &u0, &v0, &mut out[x..x + 8]);
+        convert8(&y1, &u1, &v1, &mut out[x + 8..x + 16]);
+        x += 16;
+    }
     while x + 8 <= n {
         let mut yy = [0u8; 8];
         let mut uu = [0u8; 8];
