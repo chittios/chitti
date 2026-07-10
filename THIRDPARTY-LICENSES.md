@@ -174,3 +174,44 @@ an automatic fallback if rust_h264 rejects a stream.
 
 Licensed under **MIT OR Apache-2.0** — see `third_party/rust_h264/LICENSE-MIT`
 and `LICENSE-APACHE`. Upstream: https://github.com/roticv/rust_h264
+
+---
+
+## fontdue — crates.io (TTF/OTF runtime rasterizer)
+
+Browser text (and optional UI faces) use
+[`fontdue`](https://crates.io/crates/fontdue) 0.9 — pure-Rust, **`no_std` +
+`alloc`** TrueType/OpenType parser + rasterizer (`default-features = false`,
+`hashbrown`). The default face is the in-tree
+[`assets/GeistMono-Regular.ttf`](assets/GeistMono-Regular.ttf) (SIL OFL; see
+`assets/GeistMono-OFL.txt`), loaded via `include_bytes!` in
+`kernel/src/font_ttf.rs`. Additional `.ttf`/`.otf` files can be loaded at runtime
+with `font_ttf::load_bytes`.
+
+Licensed under **MIT OR Apache-2.0 OR Zlib**. Upstream:
+https://github.com/mooman219/fontdue. Depends on **ttf-parser** (Apache-2.0 /
+MIT) and **hashbrown**.
+
+---
+
+## htmlparser — crates.io (browser HTML tokenizer)
+
+The browser agent (`kernel/src/browser/`) uses
+[`htmlparser`](https://crates.io/crates/htmlparser) 0.2 as a pull-based,
+zero-allocation **tokenizer** (`default-features = false` → `no_std`). The DOM
+tree, layout, and paint pipeline are first-party code; only token boundaries
+come from the crate. Zero transitive dependencies.
+
+Licensed under **MIT OR Apache-2.0**. Upstream:
+https://github.com/jdrouet/htmlparser
+
+### Ladybird / LibWeb (architecture reference, not vendored)
+
+The browser pipeline stages (HTML → style → layout → paint, plus a sandboxed
+JS interpreter) follow the split used by
+[Ladybird](https://github.com/SerenityOS/serenity/tree/master/Ladybird) /
+LibWeb + LibJS. **No Ladybird or Serenity C++ sources are compiled into
+Chitti** — they are `std`/GUI multi-process engines unsuitable for this
+`no_std` kernel. Ideas are reimplemented in pure Rust under
+`kernel/src/browser/`. Serenity/Ladybird code is typically BSD-2-Clause;
+we do not copy their sources.

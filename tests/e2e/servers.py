@@ -103,6 +103,21 @@ def _handle(conn):
         elif path == "/json":
             body = b'{"ok":true,"who":"e2e"}'
             conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+        elif path == "/page.html":
+            # Minimal HTML for the browser agent (`/browse`) — CSS + JS subset.
+            body = (
+                b"<!DOCTYPE html><html><head><title>E2E Browser</title>"
+                b"<style>body{background:#f5f0e8}h1{color:#cc785c}</style>"
+                b"<script>document.title='E2E Browser';console.log('e2e-js');</script>"
+                b"</head><body><h1>Hello Chitti</h1>"
+                b"<p>Who: e2e-browser</p>"
+                b'<p><a href="/json">JSON link</a></p>'
+                b"</body></html>"
+            )
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+                b"Content-Length: %d\r\n\r\n%s" % (len(body), body)
+            )
         elif path == "/mcp":
             # A minimal MCP server (JSON-RPC 2.0 over Streamable HTTP): supports
             # initialize / notifications/initialized / tools/list / tools/call,

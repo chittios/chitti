@@ -5,8 +5,12 @@ use crate::TlsError;
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct CertificateVerify<'a> {
-    pub(crate) signature_scheme: SignatureScheme,
-    pub(crate) signature: &'a [u8],
+    // ChittiOS: exposed (was pub(crate)) so an out-of-crate `TlsVerifier`
+    // implementation can read the scheme + signature to run its own
+    // certificate-chain verification (net::x509). Upstream keeps these private
+    // because its only verifier lives in-crate (webpki, ring-backed).
+    pub signature_scheme: SignatureScheme,
+    pub signature: &'a [u8],
 }
 
 impl<'a> CertificateVerify<'a> {

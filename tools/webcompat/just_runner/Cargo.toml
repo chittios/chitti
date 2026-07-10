@@ -1,0 +1,15 @@
+[package]
+name = "chitti-just-runner"
+version = "0.1.0"
+edition = "2021"
+description = "Host test262 runner powered by the vendored just-engine (applegrew/just)"
+
+[workspace]
+members = []
+
+[dependencies]
+just-engine = { path = "../../../third_party/just-ref" }
+
+[[bin]]
+name = "chitti-just-runner"
+path = "src/main.rs"

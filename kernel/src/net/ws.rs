@@ -47,6 +47,36 @@ pub fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+/// Standard base64 decode; ignores ASCII whitespace, tolerates missing
+/// padding. `None` on any non-alphabet byte. Used to unwrap providers that
+/// return audio as base64 in a JSON field (Inworld/Sarvam TTS).
+pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a' + 26) as u32,
+            b'0'..=b'9' => (c - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 3);
+    let (mut acc, mut nbits) = (0u32, 0u32);
+    for &c in s.as_bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        acc = (acc << 6) | val(c)?;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+        }
+    }
+    Some(out)
+}
+
 // --- SHA-1 (for Sec-WebSocket-Accept) -----------------------------------
 
 /// SHA-1 digest of `msg` (RFC 3174). Small and only used for the WebSocket
@@ -509,6 +539,18 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test_case]
+    fn base64_decode_roundtrip_and_lenient() {
+        for s in [b"" as &[u8], b"f", b"fo", b"foo", b"foobar", &[0u8, 255, 1, 254, 128]] {
+            assert_eq!(base64_decode(&base64_encode(s)).unwrap(), s, "roundtrip {s:?}");
+        }
+        // Whitespace ignored; missing padding tolerated.
+        assert_eq!(base64_decode("Zm9v\nYmFy").unwrap(), b"foobar");
+        assert_eq!(base64_decode("Zg").unwrap(), b"f");
+        // Non-alphabet byte rejected.
+        assert!(base64_decode("Zg*=").is_none());
     }
 
     #[test_case]

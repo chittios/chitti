@@ -204,7 +204,9 @@ real UEFI hardware.
   `shell::upkeep`, bounded restarts). Their protocol/codec logic is native,
   deterministic code **below** the determinism boundary — the LLM never
   implements a protocol. Only agents that actually reason from a SOUL are
-  **installed agents**: the built-in ones are `doc` and `ssh`, each a markdown
+  **installed agents** — the built-in roster is `doc`, `ssh`, `chess`, `media`,
+  `pdf`, `download`, `todo`, plus the app packages `notes`, `paint`, `slides`,
+  `minesweeper`, `snake`, `synth` — each a markdown
   SOUL plus a JSON manifest under the repo's [`agents/`](agents/) folder, compiled into
   the image via `include_str!`, signed and installed into `/agent/<id>/` at boot
   by `agent::system::install_all` (same permissioned flow as any package,
@@ -234,6 +236,39 @@ real UEFI hardware.
   follow the same native-protocol shape. To add a built-in server agent: drop
   `agents/<name>/{SOUL.md,manifest.json,assets/…}` and register it in
   `agent/system.rs` (one line) — or publish it to the registry.
+- **Apps — wasm-tool agent packages.** An "app" is an installed agent whose
+  deterministic logic ships as **`assets/tools.wasm`** (string ABI:
+  `export(args_ptr, args_len) -> i64 = (ptr<<32)|len`, `chitti_alloc` for host
+  writes; run by `agent/wasm_rt.rs` under **fuel + memory limits** from the
+  manifest — no host imports unless bound). The SOUL carries judgment; the wasm
+  carries rules — chess (`chess_legal`/`chess_try_move` from
+  `tools/chess-wasm`), doc's HTTP router (`route_request`, `tools/doc-wasm`),
+  pdf's document digest (`pdf_digest`, `tools/pdf-wasm` — xref tables+streams,
+  ObjStm, FlateDecode reusing the kernel's `image/inflate.rs`, text
+  extraction), and the app suite `notes/paint/slides/minesweeper/snake/synth`
+  (one shared module from `tools/apps-wasm`). **Every wasm call is a fresh
+  instance** — design tools digest-once (one call returns everything as JSON;
+  the kernel caches) and pass binary inputs as base64. UI apps paint 256×192
+  `synapse::ui` surfaces via the draw-op DSL (`board_set`/`board_mark` for
+  boards) with per-agent `storage_*` (localStorage-shaped) state; the runtime
+  pump (`service/ui_agent.rs`) peeks the event queue natively and only drains
+  through the audited `ui_event_poll` when events exist (an unpaced poll once
+  flooded the audit log at ~1 kHz). Manifests can claim **`command_hooks`** —
+  `/open` routes by extension to the owning agent's tool (media owns
+  images/audio/video, pdf owns `.pdf`) and rebinds chat to that agent. Build a
+  module with `cargo build --release --target wasm32-unknown-unknown` in its
+  `tools/<name>-wasm/` crate and copy to `agents/<name>/assets/tools.wasm`
+  (checked in; `include_bytes!` at boot). See the wasm-agent recipe gotchas:
+  kernel `json_str` unescapes `\n`; `image/inflate.rs` is raw RFC 1951 (strip
+  the zlib header) and its `#[test_case]` tests need a shim under host
+  `cargo test`.
+- **Messaging channels** (`msgchan/`) — external inbox adapters (Telegram
+  live; Discord/Slack/webhooks follow the same shape): a named instance +
+  backend + access policy delivering inbound DMs into the shell agent and
+  replies back out. Each channel turn runs on a **fresh model context**
+  (`channel_turn` swaps KV/history out and back) so DMs can't stick to a
+  console topic and console chat isn't polluted; transcripts still land in the
+  session for audit. Distinct from `channel/` (cap-gated inter-agent pipes).
 - **Cortex** (`cortex/`) — CPU transformer inference, **architecture-dynamic
   like the ONNX interpreter**: `general.architecture` in the GGUF names the
   hyperparameter key prefix and resolves to a `Family` — `QwenHybrid`
@@ -272,9 +307,13 @@ real UEFI hardware.
   deny-only-when-recorded, so `Scope::Any` grants and un-scoped tasks are
   unaffected. `CapDomain` gained `Channel`/`Net`/`Ui`; `synapse::ui` owns the
   surface registry + bounded draw-op DSL (ownership-gated: an agent can only
-  draw to its own surface). NB: sessions that use net egress or UI input aren't
-  replayable from a seed alone (the I/O is external) — the audit log records the
-  effects; treat such a session as non-deterministic to replay.
+  draw to its own surface). The audit **log** records every entry
+  (append-only, structurally enforced + tested); its **ktrace mirror**
+  coalesces identical consecutive entries into one line + a repeat count, so a
+  polling loop can't drown the human-facing trace. NB: sessions that use net
+  egress or UI input aren't replayable from a seed alone (the I/O is external)
+  — the audit log records the effects; treat such a session as
+  non-deterministic to replay.
 - **Microkernel** — tasks + context switch, cooperative + timer-preemptive
   scheduler, unforgeable capabilities, IPC, SMP, frame allocator + heap, MMU.
 - **UI** — a tmux-style split-pane framebuffer compositor in Geist Mono. The
@@ -332,31 +371,21 @@ real UEFI hardware.
   running. The chat pane keeps a 2000-line scrollback (PgUp/PgDn; /clear
   wipes it); Shift+Tab / Ctrl+Tab / clicking switches pane focus.
 
-## STANDING RULE — Ctrl+C interrupts every command and process
-
-**Any new command or long-running process must respond to Ctrl+C.** A blocking
-loop already has to pump `shell::upkeep()` (above); in the *same* loop it must
-also poll for interrupt and bail when it fires — otherwise a stuck/streaming
-command can only be escaped by killing the VM, which is not acceptable.
-
-- **A shell command / networked loop** (`/http`, `/ping`, DNS, TLS, a `/ws`-style
-  stream, any future protocol client) calls `shell::poll_interrupt()` — true only
-  on Ctrl+C (`0x03`), and it **pushes any other byte back** (`console::unread`) so
-  it never swallows the *next* command's keystrokes. Return an `Err("cancelled")`
-  / break the loop on true.
-- **An inference / decode loop** calls `shell::poll_cancel()` (Ctrl+C **or** bare
-  Esc; a decode turn owns the console, so consuming input there is fine).
-
-Both are cheap — call them once per loop iteration next to `upkeep()`. A command
-that can block without an interrupt check is a bug; cover it with an e2e `cancel`
-scenario (drive raw `b"\x03"` via `guest.send_raw`, assert it aborts fast **and**
-the next command still runs) and a unit test on the pure poll logic
-(`poll_interrupt_ctrl_c_only_and_pushes_back`, `console::pushback_*`).
 - **Storage** — virtio/NVMe/AHCI block devices, GPT/MBR/FAT/ext4 detection,
   ext4 (the default filesystem) + FAT, `/install` (self-hosting install to a
   disk; detects an existing Chitti GPT and **updates in place**, preserving the
   data partition — destructive actions confirm via the permission modal),
-  durable agent state on ext4.
+  durable agent state on ext4. NVMe enumerates namespaces via the **IDENTIFY
+  CNS=2 active list**, never "walk NSIDs until empty" — NSIDs are sparse on
+  VirtualBox (port→NSID; an empty port 0 = inactive NSID 1, exactly what a VM
+  looks like after its install medium is detached); the `nvme: N active
+  namespace(s)` ktrace is the first check for "controller up but no disks".
+  Relatedly, the aarch64 identity map types **mixed RAM/MMIO GiB blocks** at
+  2 MiB L2 granularity from the **real RAM extents the stub passes in
+  boot-info** (`mm/ramlayout.rs`, pure + tested): VBox puts the model tail,
+  GOP framebuffer and PCIe ECAM in one GiB block, and a whole-block Device
+  retype alignment-faults NEON loads (scalar reads still work — "boots fine,
+  dies in the matvec" is the signature).
 - **Networking** (`net/`) — a full TCP/IP stack on [smoltcp](third_party/smoltcp)
   (vendored in-tree, 0BSD — see [THIRDPARTY-LICENSES.md](THIRDPARTY-LICENSES.md)):
   DHCPv4, static IP, DNS, ICMP (`/ping`), TCP/UDP, plus **loopback**
@@ -379,7 +408,8 @@ the next command still runs) and a unit test on the pure poll logic
   agent adopts as a channel), `/http` (a curl-like
   HTTP/1.1 client in `net/http.rs` — `-X`/`-H`/`-d`/`-v`/`--stream`, all
   methods, live chunked/SSE streaming; `http://` **and** `https://` via
-  `net/tls.rs`/embedded-tls; also the agent's `http` tool; **`-O`/`-o <file>`
+  `net/tls.rs`/embedded-tls with **real certificate verification** (see the
+  TLS-trust bullet); also the agent's `http` tool; **`-O`/`-o <file>`
   download the body to the Synapse store** (`/downloads/<name>`, overwrite
   confirms via the modal, human-typed only) where `/open` reads it back —
   editor, image viewer, or audio player), `/ws` (a
@@ -399,15 +429,39 @@ the next command still runs) and a unit test on the pure poll logic
   tool). The stack is polled cooperatively from the shell idle loop. NB: aarch64 MMIO register access must be a single
   `ldr`/`str` (inline asm) — LLVM otherwise coalesces adjacent volatile accesses
   into a paired load HVF can't decode (`hvf: isv`).
+- **TLS certificate trust** (`net/x509.rs`, `net/rsa.rs`, `net/hashes.rs`,
+  `net/ca_roots.rs`) — HTTPS server certs are **verified by default** against an
+  embedded **Mozilla root store** (121 roots, `tools/gen_ca_roots.py` →
+  `ca_roots.der` + spans; regenerate from `cacert.pem`). `ring` **cannot build
+  bare-metal** (C + asm; that's why `NoVerify` shipped originally), so the
+  validator is pure RustCrypto: `x509-cert` parses DER, `p256`/`p384` verify
+  ECDSA, and [`net::rsa`] does **RSA PKCS#1 v1.5 + PSS** on `crypto-bigint`
+  (a fixed `U4096` modexp — no `rsa`/`num-bigint-dig`/`ring`). `x509::verify`
+  builds a chain leaf→intermediates→trusted root (each link's signature checked
+  with the issuer key), checks each cert's validity window against the wall
+  clock (refuses if the clock is unset — set `/datetime`), CA basic-constraints
+  on issuers, and the leaf's SANs vs. the hostname (wildcards). The TLS 1.3
+  `CertificateVerify` (RSA-**PSS** mandatory there — the bug that first failed
+  css.tobyase.de) runs through the same code via `x509::verify_data`. A
+  `ChittiVerifier` (`net/tls.rs`) implements embedded-tls's `TlsVerifier`
+  (vendored crate given the few needed `pub` re-exports); `/tls insecure on` is
+  the `curl -k` escape hatch (human-only) for a self-signed/self-hosted box.
+  **Out of scope (documented, not silently skipped):** CRL/OCSP revocation.
+  Validated by KATs (`rsa_testvec.rs`, `gen_rsa_testvec.sh`) + a real embedded
+  chain (`ca_testvec.rs`, `gen_ca_testvec.sh`: verifies, and tampered/expired/
+  wrong-host fail closed) + live `/http https://…` to real providers.
 - **Sound & voice** (`sound/`, `onnx/`) — virtio-snd PCM in/out (S16 mono,
   poll-driven, descriptor chains) over virtio-mmio (aarch64) and virtio-PCI
   (x86 QEMU), **Intel HDA** for VirtualBox (x86+ARM) and real hardware, plus **AC'97** and **Sound Blaster 16** (x86 legacy; SB16 needs a <16 MiB ISA-DMA buffer, not yet reserved at boot); `/voice` (waveform modal, level-gated utterances) and `/voice test`
   (tone + mic check). **`audio/`** is the pure media-decoder layer behind the
-  `/open <file>.wav|.mp3` **player**: a full RIFF/WAVE parser (PCM
-  8/16/24/32-bit + float32, any channel count downmixed) and an MPEG Layer III
+  `/open <file>.wav|.mp3|.aac` **player**: a full RIFF/WAVE parser (PCM
+  8/16/24/32-bit + float32, any channel count downmixed), an MPEG Layer III
   decoder — a no_std Rust **port of minimp3** (CC0; tables generated verbatim
   by `tools/gen_mp3_tables.py`), validated ±1 LSB against minimp3's own scalar
-  decode (stereo MS/short-blocks, MPEG-2 LSF, bit reservoir). Playback feeds
+  decode (stereo MS/short-blocks, MPEG-2 LSF, bit reservoir) — and an **AAC
+  decoder** (`audio/aac/`, a Symphonia-path port under MPL-2.0: LC + Main/LTP
+  ICS, ADTS demux, HE-AAC SBR/PS) that also supplies the video player's audio
+  track. Playback feeds
   the device in ~50 ms chunks — queue backpressure paces it — pumping
   `upkeep()` and answering Ctrl+C between chunks. `onnx/` is a zero-copy no_std ONNX (protobuf) reader +
   **op interpreter** that runs the real voice models end-to-end: silero-vad v5
@@ -415,9 +469,34 @@ the next command still runs) and a unit test on the pure poll logic
   KittenTTS (TTS — `/voice say <text>` speaks); bare `/voice` is the full
   mic → VAD → STT → LLM → TTS conversation loop. Models load lazily from any
   disk volume (bundled in the images; `cargo xtask voice-assets` downloads
-  them into `assets/voice/`, gitignored). For any numeric or perf work on this
+  them into `assets/voice/`, gitignored). **The ONNX ops parallelize across the
+  SMP fleet** (`onnx::exec::par_range` → `smp::parallel_for`: conv1d tiles,
+  conv_transpose gather+dot, matmul rows/cols, strided broadcast, `par_map`
+  unary) and `/voice say` is **chunked** — `split_speech` synthesizes clause by
+  clause into the `speech_pump` queue (fed from `ui_tick` via the non-blocking
+  `SndDevice::out_free_bytes`), so audio starts in ~3 s and streams while the
+  next clause synthesizes. For any numeric or perf work on this
   path, use `tools/onnxdiff/` (host-side layer-by-layer diff of the kernel's
-  own interpreter against onnxruntime) — not QEMU round trips.
+  own interpreter against onnxruntime) — not QEMU round trips. NB: kitten's
+  DynamicQuantizeLinear means outputs are only comparable by *equidistance
+  from onnxruntime*, never bit-exact; any float reassociation flips int8
+  rounding.
+- **Remote voice** (`shell/voice_remote.rs`) — hosted TTS/STT providers as an
+  alternative to the local ONNX models, same posture as `/model remote`:
+  human-configured key (`/voice remote tts|stt <provider> <key> [voice]
+  [model]`), persisted at `/configs/core/voice.json`, never an agent tool.
+  Providers: **ElevenLabs, Cartesia, Inworld, Sarvam**, and any
+  **OpenAI-compatible** `/v1/audio/{speech,transcriptions}` (base via
+  `url@model`). Each is a pure request-builder + response-decoder (unit-tested
+  wire shapes); TTS audio comes back as WAV/MP3 bytes (`audio::decode`) or
+  base64-in-JSON (Inworld/Sarvam), resampled to the device rate and fed into
+  the **same chunked `speech_pump`** — so remote synthesis streams per clause
+  too. STT uploads the utterance as `multipart/form-data` WAV. `voice_say` /
+  `voice_stt_file` prefer a configured remote endpoint, else fall back to the
+  local model. **TLS caveat:** all providers are HTTPS and the in-kernel TLS
+  client (`net/tls.rs`, embedded-tls TLS 1.3, no cert verification) doesn't
+  interop with every server yet (RSA cert chains fail) — a provider that won't
+  handshake reports a TLS error, not a wrong result.
 - **Video** (`video/`) — H.264/AVC **baseline + Main/High-profile decoder +
   player** for `/open .mp4|.mov|.mkv|.webm` (hls/ts pending), built **in
   stages, each pure + unit-tested off-hardware** and **validated bit-exact
@@ -471,11 +550,11 @@ the next command still runs) and a unit test on the pure poll logic
   (`decoder.rs` MB loop). Lesson: **render + eyeball vs PyAV, don't trust a
   single green-fraction metric** (the first scan's threshold missed it).
   **Audio:** `mp4::parse_audio` demuxes the AAC (`mp4a`/`esds`
-  → AudioSpecificConfig) track and `video::audio_info` reports it, but the
-  **AAC-LC decoder is not yet built** (a full codec on the scale of the H.264
-  one — spectral Huffman/iquant/M-S/TNS/**PNS**/intensity + IMDCT filterbank;
-  note PNS's seeded noise makes bit-exact-vs-PyAV validation impossible, unlike
-  H.264), so video plays silently and the HUD shows `[no audio]`. **Validated
+  → AudioSpecificConfig) track, and the **AAC decoder in `audio/aac/`**
+  (a Symphonia-path port, MPL-2.0 — see THIRDPARTY-LICENSES.md — plus ADTS
+  demux and HE-AAC SBR/PS reconstruction) turns it into mono S16 PCM at open
+  (`open> audio ready: …`); playback keeps the PCM cursor pts-locked to the
+  video clock (`pump_video` snaps drift > ~50 ms), and `m` mutes. **Validated
   bit-exact against PyAV/ffmpeg** — synthetic x264 clips (I/P, multi-slice,
   deblocked) and hundreds of consecutive frames of real-world mp4/mkv. In-kernel
   fixture tests hash an embedded I-only and an I+P clip against PyAV, and
@@ -517,8 +596,7 @@ the next command still runs) and a unit test on the pure poll logic
   non-reference backlog samples are never fed to the decoder at all — but
   catch up in ≤2-frame steps; one giant hurry-jump decodes every backlog
   reference in one job and starves presentation (4K: 8 → 3 fps).
-  **Remaining:** the **AAC-LC audio decoder** + playback sync (demux done; in
-  progress in a parallel effort), HLS/TS demux, 4K ≥ 15 fps (needs parallel
+  **Remaining:** HLS/TS demux, 4K ≥ 15 fps (needs parallel
   reconstruction — slice-parallel + independent non-ref B's; CABAC parse is
   the serial floor), and the multi-pane split + tab drag-drop. NB: the e2e stdlib muxer writes no
   `ctts`, so its B-frame clips carry no display-reorder info — e2e CABAC clips
@@ -545,6 +623,26 @@ the next command still runs) and a unit test on the pure poll logic
   `/agent/<id>/{SOUL.md,skills/,memory/}`; SOUL.md is prepended to its system
   prompt. The shell agent is the only default agent (boot demos removed).
 
+## STANDING RULE — Ctrl+C interrupts every command and process
+
+**Any new command or long-running process must respond to Ctrl+C.** A blocking
+loop already has to pump `shell::upkeep()` (above); in the *same* loop it must
+also poll for interrupt and bail when it fires — otherwise a stuck/streaming
+command can only be escaped by killing the VM, which is not acceptable.
+
+- **A shell command / networked loop** (`/http`, `/ping`, DNS, TLS, a `/ws`-style
+  stream, any future protocol client) calls `shell::poll_interrupt()` — true only
+  on Ctrl+C (`0x03`), and it **pushes any other byte back** (`console::unread`) so
+  it never swallows the *next* command's keystrokes. Return an `Err("cancelled")`
+  / break the loop on true.
+- **An inference / decode loop** calls `shell::poll_cancel()` (Ctrl+C **or** bare
+  Esc; a decode turn owns the console, so consuming input there is fine).
+
+Both are cheap — call them once per loop iteration next to `upkeep()`. A command
+that can block without an interrupt check is a bug; cover it with an e2e `cancel`
+scenario (drive raw `b"\x03"` via `guest.send_raw`, assert it aborts fast **and**
+the next command still runs) and a unit test on the pure poll logic
+(`poll_interrupt_ctrl_c_only_and_pushes_back`, `console::pushback_*`).
 ## Build / run / test
 
 Everything goes through `cargo xtask`. Arch is chosen explicitly, never

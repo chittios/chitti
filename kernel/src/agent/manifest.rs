@@ -96,6 +96,15 @@ pub fn orchestrator_manifest() -> AgentManifest {
             "notes_get".into(),
             "notes_set".into(),
             "notes_remove".into(),
+            // Browser (on demand — not autostart).
+            "browser_open".into(),
+            "browser_status".into(),
+            "browser_text".into(),
+            "browser_links".into(),
+            "browser_scroll".into(),
+            "browser_navigate".into(),
+            "browser_back".into(),
+            "browser_click".into(),
         ],
         capabilities: vec![
             CapabilityRequest::new(CapDomain::Fs, Rights::READ | Rights::WRITE | Rights::LIST | Rights::DELETE, Scope::Any),

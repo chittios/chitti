@@ -204,6 +204,16 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
         assets: &[],
         binary_assets: &[],
     },
+    // Browser agent: fetch + subset HTML layout/paint in the action pane.
+    SystemAgentDef {
+        name: "browser",
+        soul: include_str!("../../../agents/browser/SOUL.md"),
+        manifest_json: include_str!("../../../agents/browser/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 14),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 14),
+        assets: &[],
+        binary_assets: &[],
+    },
 ];
 
 /// The install-folder path (`/agent/<id>`) of a system agent by name.
@@ -644,7 +654,7 @@ pub fn install_all(now: Ticks) {
         }
     }
     crate::serial_println!(
-        "Chitti: system agents installed (doc, ssh, chess, media, pdf, notes, paint, slides, minesweeper, snake, synth, download, todo) in /agent/"
+        "Chitti: system agents installed (doc, ssh, chess, media, pdf, notes, paint, slides, minesweeper, snake, synth, download, todo, browser) in /agent/"
     );
     autostart_agents();
 }
@@ -789,7 +799,8 @@ mod tests {
             assert!(!m.capabilities.is_empty(), "{} declares capabilities", def.name);
         }
         // SOUL + package agents (no network/http plumbing as agents).
-        assert_eq!(SYSTEM_AGENTS.len(), 13);
+        assert_eq!(SYSTEM_AGENTS.len(), 14);
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "browser"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "chess"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "media"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "notes"));

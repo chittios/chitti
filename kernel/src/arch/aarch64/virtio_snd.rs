@@ -406,6 +406,11 @@ impl SndDevice for VirtioSndMmio {
         Ok(())
     }
 
+    fn out_free_bytes(&mut self) -> usize {
+        self.tx_reclaim();
+        self.tx_inflight.iter().filter(|&&b| !b).count() * PERIOD
+    }
+
     fn playing(&mut self) -> bool {
         self.tx_reclaim();
         self.tx_inflight.iter().any(|&b| b)

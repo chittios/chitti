@@ -88,6 +88,28 @@ integer factor with the panel resolution so type stays legible from 1080p to 4K.
 Agent replies are formatted with **ANSI SGR** escape codes (colour + emphasis),
 not markdown — the console parses `\x1b[…m` (see `Screen::apply_sgr`).
 
+## App surfaces (chess, paint, games, …)
+
+Installed app agents paint **256×192 logical surfaces** (`synapse::ui`,
+scaled/letterboxed into the action pane) through the bounded draw-op DSL —
+`clear` / `rect` / `line` / `pixel`, colours as `RRGGBB` hex. Apps must stay
+on-brand; the conventions the built-ins use:
+
+| Colour | Hex | Use |
+|---|---|---|
+| selection / legal-move highlight | `cc785c` | the terracotta accent |
+| keyboard cursor outline | `6688cc` | cool blue — distinct from selection |
+| error / illegal | `aa3333` | rejected action flash |
+| busy loader bar | `cc785c` on `1a1816` track | indeterminate progress strip |
+
+Board apps go through `board_set` (full position) + `board_mark` (highlights)
+rather than raw pixels, so the runtime can validate state. While a model turn
+is in flight the runtime paints the loader strip and drops input — an app
+never queues clicks into a stale turn. Text on surfaces is limited (no text
+draw op; the atlas cell is 10×22 px against a 256-px-wide surface), which is
+why document-shaped apps (pdf) preview in an **editor tab** instead and keep
+the surface for pictures.
+
 ## Configuring it — `/configs/core/ui.json`
 
 Every colour and the splash toggle live in the UI config, applied live on `/ui

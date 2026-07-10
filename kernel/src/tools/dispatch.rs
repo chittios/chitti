@@ -264,6 +264,15 @@ impl ToolDispatch for Router {
                     ToolOutcome::ok(out, Provenance::UntrustedIngested)
                 }
             }
+            ToolBinding::Browser => {
+                let out = crate::shell::run_browser_tool(&call.tool, &call.args);
+                if out.starts_with("error:") {
+                    ToolOutcome::error(out)
+                } else {
+                    // Page content is external / untrusted-ingested.
+                    ToolOutcome::ok(out, Provenance::UntrustedIngested)
+                }
+            }
         }
     }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "chitti-js-runner"
+version = "0.1.0"
+edition = "2021"
+
+# Host harness for the kernel's js_bc VM (pure bytecode path). Standalone.
+
+[workspace]
+
+[dependencies]
+# none — pure
+
+[[bin]]
+name = "chitti-js-runner"
+path = "src/main.rs"

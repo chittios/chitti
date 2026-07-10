@@ -1,0 +1,44 @@
+{
+  "name": "browser",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Fetch and render websites in the action pane (subset HTML layout + paint).",
+  "toolset": [
+    "browser_open",
+    "browser_navigate",
+    "browser_back",
+    "browser_scroll",
+    "browser_click",
+    "browser_status",
+    "browser_links",
+    "browser_text",
+    "http",
+    "download",
+    "memory_add",
+    "memory_get",
+    "memory_list"
+  ],
+  "capabilities": [
+    {
+      "domain": "net",
+      "rights": ["read", "write"],
+      "scope": "any"
+    },
+    {
+      "domain": "ui",
+      "rights": ["exec", "write", "delete"],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": ["read", "write", "list"],
+      "scope": "home"
+    },
+    {
+      "domain": "todo",
+      "rights": ["read", "write"],
+      "scope": "any"
+    }
+  ],
+  "autostart": false
+}

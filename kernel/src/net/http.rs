@@ -31,6 +31,103 @@ impl Response {
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
+
+    /// Case-insensitive header lookup.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Max hops when following 3xx `Location` (browsers typically allow ~20; keep tight).
+pub const MAX_REDIRECTS: u32 = 10;
+
+/// True for redirect statuses we follow on GET (RFC 9110).
+pub fn is_redirect(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+/// Resolve a `Location` header against the request URL that produced it.
+/// Handles absolute `http(s)://…`, protocol-relative `//host/…`, root- and
+/// path-relative targets. Pure — unit-tested.
+pub fn resolve_redirect(base_url: &str, location: &str) -> Result<String, String> {
+    let loc = location.trim();
+    if loc.is_empty() {
+        return Err("empty Location".into());
+    }
+    // Strip fragment on redirects (browsers re-apply client-side).
+    let loc = loc.split('#').next().unwrap_or(loc);
+    if loc.starts_with("https://") || loc.starts_with("http://") {
+        return Ok(loc.to_string());
+    }
+    let (tls, host, port, path) = parse_url(base_url)?;
+    let scheme = if tls { "https" } else { "http" };
+    let authority = if (tls && port == 443) || (!tls && port == 80) {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
+    if let Some(rest) = loc.strip_prefix("//") {
+        return Ok(format!("{scheme}://{rest}"));
+    }
+    if loc.starts_with('/') {
+        return Ok(format!("{scheme}://{authority}{loc}"));
+    }
+    // Path-relative.
+    let dir = match path.rfind('/') {
+        Some(i) => &path[..=i],
+        None => "/",
+    };
+    Ok(format!("{scheme}://{authority}{dir}{loc}"))
+}
+
+/// Result of [`get_follow`]: final response after redirect hops + the URL that
+/// produced it (for relative link resolution in the browser).
+pub struct FollowedGet {
+    pub response: Response,
+    pub final_url: String,
+    /// Number of 3xx hops taken (0 = no redirect).
+    pub redirects: u32,
+}
+
+/// GET with automatic redirect following (301/302/303/307/308).
+/// Each hop is a fresh TCP/TLS connection (HTTP/1.1 Connection: close).
+pub fn get_follow(url: &str, timeout_ms: u64) -> Result<FollowedGet, String> {
+    let mut current = url.trim().to_string();
+    let mut redirects = 0u32;
+    loop {
+        let resp = request("GET", &current, &[], &[], timeout_ms)?;
+        if !is_redirect(resp.status) {
+            return Ok(FollowedGet {
+                response: resp,
+                final_url: current,
+                redirects,
+            });
+        }
+        if redirects >= MAX_REDIRECTS {
+            return Err(format!(
+                "too many redirects ({} hops, last {} {})",
+                MAX_REDIRECTS, resp.status, current
+            ));
+        }
+        let loc = resp
+            .get("location")
+            .ok_or_else(|| format!("HTTP {} without Location header", resp.status))?;
+        let next = resolve_redirect(&current, loc)?;
+        crate::ktrace::log_fmt(format_args!(
+            "http: redirect {} {} → {}",
+            resp.status, current, next
+        ));
+        current = next;
+        redirects += 1;
+        // Cooperative: long redirect chains (and TLS handshakes) must not freeze UI.
+        crate::shell::upkeep();
+        if crate::shell::poll_interrupt() {
+            return Err("cancelled".into());
+        }
+    }
 }
 
 /// Split `http[s]://host[:port]/path` into `(tls, host, port, path)`. `https`
@@ -407,7 +504,8 @@ fn dechunk_partial(mut b: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Convenience: GET `url`, returning the response.
+/// Convenience: GET `url`, returning the response (**no** redirect follow).
+/// Prefer [`get_follow`] for browser / human navigation.
 pub fn get(url: &str, timeout_ms: u64) -> Result<Response, String> {
     request("GET", url, &[], &[], timeout_ms)
 }
@@ -527,5 +625,54 @@ mod tests {
         assert_eq!(h.get("x-foo"), Some("bar")); // case-insensitive lookup
         assert_eq!(h.get("content-length"), Some("0"));
         assert_eq!(h.get("missing"), None);
+    }
+
+    #[test_case]
+    fn is_redirect_statuses() {
+        assert!(is_redirect(301));
+        assert!(is_redirect(302));
+        assert!(is_redirect(303));
+        assert!(is_redirect(307));
+        assert!(is_redirect(308));
+        assert!(!is_redirect(200));
+        assert!(!is_redirect(304));
+        assert!(!is_redirect(404));
+    }
+
+    #[test_case]
+    fn resolve_redirect_absolute_and_relative() {
+        assert_eq!(
+            resolve_redirect("https://ex.com/a/b", "https://other/x").unwrap(),
+            "https://other/x"
+        );
+        assert_eq!(
+            resolve_redirect("https://ex.com/a/b", "/root").unwrap(),
+            "https://ex.com/root"
+        );
+        assert_eq!(
+            resolve_redirect("https://ex.com/a/b", "c").unwrap(),
+            "https://ex.com/a/c"
+        );
+        assert_eq!(
+            resolve_redirect("http://ex.com/", "//cdn.ex/p").unwrap(),
+            "http://cdn.ex/p"
+        );
+        // google.com style: https → www
+        assert_eq!(
+            resolve_redirect("https://google.com/", "https://www.google.com/").unwrap(),
+            "https://www.google.com/"
+        );
+        assert!(resolve_redirect("https://ex.com/", "").is_err());
+    }
+
+    #[test_case]
+    fn response_get_location_case_insensitive() {
+        let r = Response {
+            status: 301,
+            headers: alloc::vec![("Location".into(), "https://www.example.com/".into())],
+            body: Vec::new(),
+        };
+        assert_eq!(r.get("location"), Some("https://www.example.com/"));
+        assert_eq!(r.get("LOCATION"), Some("https://www.example.com/"));
     }
 }

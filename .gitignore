@@ -8,3 +8,6 @@ assets/voice/
 __pycache__/
 # e2e test-generated TLS certs
 tests/e2e/certs/
+
+# Cloned JS engine reference (applegrew/just)
+third_party/just-ref/

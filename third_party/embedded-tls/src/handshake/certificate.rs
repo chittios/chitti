@@ -10,7 +10,9 @@ pub struct CertificateRef<'a> {
     raw_entries: &'a [u8],
     request_context: &'a [u8],
 
-    pub(crate) entries: Vec<CertificateEntryRef<'a>, 16>,
+    // ChittiOS: exposed (was pub(crate)) so an out-of-crate `TlsVerifier` can
+    // walk the presented chain (leaf + intermediates) for path validation.
+    pub entries: Vec<CertificateEntryRef<'a>, 16>,
 }
 
 impl<'a> CertificateRef<'a> {

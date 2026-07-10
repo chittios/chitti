@@ -54,6 +54,8 @@ pub enum ToolBinding {
     AgentWasm,
     /// HTTP(S) fetch + save body to the store (`download` tool).
     Download,
+    /// Browser agent tools (`browser_open`, scroll, click, …) — host HTML engine.
+    Browser,
     /// Path/content query over the capability-scoped store listing (`glob` /
     /// `grep`). Pure matching after a scope-filtered `list`/`read` — no new
     /// Synapse primitive (Gate 2.5 applied per path).
@@ -173,6 +175,62 @@ fn shell_commands() -> Vec<ToolDef> {
             input_schema: r#"{"type":"object","properties":{"url":{"type":"string"},"path":{"type":"string"}},"required":["url"]}"#.to_string(),
             required: alloc::vec!["url".to_string()],
             binding: ToolBinding::Download,
+        },
+        ToolDef {
+            name: "browser_open".to_string(),
+            description: "Open/render a web page in the action pane. args: url (http/https).".to_string(),
+            input_schema: r#"{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}"#.to_string(),
+            required: alloc::vec!["url".to_string()],
+            binding: ToolBinding::Browser,
+        },
+        ToolDef {
+            name: "browser_navigate".to_string(),
+            description: "Navigate the browser tab to a URL (pushes history). args: url.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}"#.to_string(),
+            required: alloc::vec!["url".to_string()],
+            binding: ToolBinding::Browser,
+        },
+        ToolDef {
+            name: "browser_back".to_string(),
+            description: "Go back in browser history.".to_string(),
+            input_schema: r#"{"type":"object","properties":{}}"#.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::Browser,
+        },
+        ToolDef {
+            name: "browser_scroll".to_string(),
+            description: "Scroll the browser page. args: dy (pixels) or page (+1/-1 page).".to_string(),
+            input_schema: r#"{"type":"object","properties":{"dy":{"type":"integer"},"page":{"type":"integer"}}}"#.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::Browser,
+        },
+        ToolDef {
+            name: "browser_click".to_string(),
+            description: "Click at surface coords (hits links). args: x, y.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"}},"required":["x","y"]}"#.to_string(),
+            required: alloc::vec!["x".to_string(), "y".to_string()],
+            binding: ToolBinding::Browser,
+        },
+        ToolDef {
+            name: "browser_status".to_string(),
+            description: "Current browser URL, title, scroll, size.".to_string(),
+            input_schema: r#"{"type":"object","properties":{}}"#.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::Browser,
+        },
+        ToolDef {
+            name: "browser_links".to_string(),
+            description: "List links on the current page (href + text).".to_string(),
+            input_schema: r#"{"type":"object","properties":{}}"#.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::Browser,
+        },
+        ToolDef {
+            name: "browser_text".to_string(),
+            description: "Plain-text extract of the current page (for answering questions). optional max chars.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"max":{"type":"integer"}}}"#.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::Browser,
         },
         ToolDef::shell("datetime", "Show or set the wall clock. args: empty=show, 'YYYY-MM-DD HH:MM'=set, 'tz +5:30'=zone.", false),
         #[cfg(not(feature = "server"))] // GUI tool: absent from server builds

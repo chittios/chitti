@@ -116,6 +116,12 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "Network", title: "Ping Host", name: "ping", shortcut: "" },
     Entry { category: "Network", title: "Wi-Fi", name: "wifi", shortcut: "" },
     Entry { category: "Network", title: "HTTP Client", name: "http", shortcut: "" },
+    Entry {
+        category: "Network",
+        title: "Browse URL (render HTML)",
+        name: "browse",
+        shortcut: "",
+    },
     Entry { category: "Network", title: "WebSocket", name: "ws", shortcut: "" },
     Entry { category: "Network", title: "MCP Client", name: "mcp", shortcut: "" },
     Entry {

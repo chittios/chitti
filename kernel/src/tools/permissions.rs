@@ -212,6 +212,12 @@ pub fn is_readonly_tool(name: &str) -> bool {
         }
         // Package WASM tools: gated by agent toolset; treat as auto when read-ish.
         Some(ToolBinding::Download) => name == "download",
+        Some(ToolBinding::Browser) => {
+            matches!(
+                name,
+                "browser_status" | "browser_links" | "browser_text" | "browser_scroll"
+            )
+        }
         Some(ToolBinding::AgentWasm) => {
             matches!(
                 name,

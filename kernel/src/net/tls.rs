@@ -4,20 +4,38 @@
 //! mode over an [`embedded_io`] adapter around our cooperative smoltcp TCP
 //! socket ([`TcpStream`]).
 //!
-//! **Security posture — read this.** Server certificates are **not verified**
-//! (`NoVerify`): there is no in-kernel trust store, clock-backed validity
-//! check, or hostname binding yet, so this protects against passive
-//! eavesdropping but **not** an active man-in-the-middle. It is the moral
-//! equivalent of `curl -k`. That is acceptable for the intended use — reaching
-//! a *self-hosted* model server over a trusted LAN where the alternative was
-//! plaintext — but do not send secrets to an untrusted public endpoint over
-//! it. The CSPRNG ([`seed_rng`]) is ChaCha20 seeded from `RDRAND`/`RNDR` when
-//! present and cycle-counter jitter otherwise; adequate for ephemeral
-//! handshake keys on a research OS, not audited crypto entropy.
+//! **Security posture.** Server certificates **are verified by default**
+//! against an embedded Mozilla root store ([`super::ca_roots`]) via the
+//! pure-Rust chain validator [`super::x509`] (`ChittiVerifier` below): a chain
+//! to a trusted root, validity window against the wall clock, and hostname vs.
+//! the leaf SANs. `ring` can't build bare-metal, so the standard webpki path
+//! is unavailable — this validator is built from `x509-cert` + RustCrypto
+//! (`p256`/`p384`/`crypto-bigint`) instead. A `curl -k` escape hatch
+//! ([`set_insecure`], `/tls insecure`) falls back to `NoVerify` for a
+//! self-hosted box with a self-signed cert. **Not** covered: CRL/OCSP
+//! revocation. The CSPRNG ([`seed_rng`]) is ChaCha20 seeded from `RDRAND`/
+//! `RNDR` when present and cycle-counter jitter otherwise; adequate for
+//! ephemeral handshake keys on a research OS, not audited crypto entropy.
 
 use super::NET;
 use alloc::string::String;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use embedded_io::{ErrorType, Read as IoRead, Write as IoWrite};
+
+/// `curl -k` mode: skip certificate verification (self-signed / self-hosted).
+/// Off by default — verification is the default posture. Human-set only
+/// (`/tls insecure on|off`), like the remote-model backend switch.
+static TLS_INSECURE: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable certificate verification skipping (`curl -k`).
+pub fn set_insecure(on: bool) {
+    TLS_INSECURE.store(on, Ordering::Relaxed);
+}
+/// Whether certificate verification is currently skipped.
+pub fn insecure() -> bool {
+    TLS_INSECURE.load(Ordering::Relaxed)
+}
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use smoltcp::socket::tcp;
@@ -208,8 +226,74 @@ impl TlsSession {
     }
 }
 
+/// Certificate-chain verifier: on `verify_certificate` it runs the pure-Rust
+/// [`super::x509`] path validator against the embedded root store + hostname;
+/// on `verify_signature` it checks the TLS 1.3 `CertificateVerify` with the
+/// saved leaf key. Generic over the negotiated cipher suite so the handshake
+/// transcript hash type is threaded through.
+struct ChittiVerifier<'a, CipherSuite>
+where
+    CipherSuite: embedded_tls::blocking::TlsCipherSuite,
+{
+    host: Option<&'a str>,
+    transcript: Option<CipherSuite::Hash>,
+    leaf_spki: Option<Vec<u8>>,
+}
+
+impl<'a, CipherSuite> embedded_tls::blocking::TlsVerifier<'a, CipherSuite> for ChittiVerifier<'a, CipherSuite>
+where
+    CipherSuite: embedded_tls::blocking::TlsCipherSuite,
+{
+    fn new(host: Option<&'a str>) -> Self {
+        ChittiVerifier { host, transcript: None, leaf_spki: None }
+    }
+
+    fn verify_certificate(
+        &mut self,
+        transcript: &CipherSuite::Hash,
+        _ca: &Option<embedded_tls::blocking::Certificate>,
+        cert: embedded_tls::CertificateRef,
+    ) -> Result<(), embedded_tls::TlsError> {
+        use embedded_tls::CertificateEntryRef;
+        // Presented chain, leaf first.
+        let chain: Vec<&[u8]> = cert
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                CertificateEntryRef::X509(der) => Some(*der),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            })
+            .collect();
+        let host = self.host.unwrap_or("");
+        let spki = super::x509::verify(&chain, host).map_err(|e| {
+            crate::ktrace::log_fmt(format_args!("tls: {e}"));
+            embedded_tls::TlsError::InvalidCertificate
+        })?;
+        self.leaf_spki = Some(spki);
+        self.transcript = Some(transcript.clone());
+        Ok(())
+    }
+
+    fn verify_signature(&mut self, verify: embedded_tls::CertificateVerify) -> Result<(), embedded_tls::TlsError> {
+        use sha2::Digest;
+        let transcript = self.transcript.take().ok_or(embedded_tls::TlsError::InvalidSignature)?;
+        let spki = self.leaf_spki.as_ref().ok_or(embedded_tls::TlsError::InvalidSignature)?;
+        // RFC 8446 §4.4.3: 64 spaces + context string + NUL + transcript hash.
+        let mut msg: Vec<u8> = alloc::vec![0x20u8; 64];
+        msg.extend_from_slice(b"TLS 1.3, server CertificateVerify\x00");
+        msg.extend_from_slice(&transcript.finalize());
+        let scheme = verify.signature_scheme as u16;
+        match super::x509::verify_data(spki, scheme, &msg, verify.signature) {
+            Ok(true) => Ok(()),
+            _ => Err(embedded_tls::TlsError::InvalidSignature),
+        }
+    }
+}
+
 /// Perform the TLS 1.3 handshake over an already-connected [`TcpStream`],
 /// binding SNI to `server_name`. On success returns an open [`TlsSession`].
+/// Verifies the server certificate chain unless [`insecure`] is set.
 pub fn handshake(stream: TcpStream, server_name: &str) -> Result<TlsSession, String> {
     use embedded_tls::blocking::{Aes128GcmSha256, NoVerify, TlsConfig, TlsConnection, TlsContext};
 
@@ -229,10 +313,25 @@ pub fn handshake(stream: TcpStream, server_name: &str) -> Result<TlsSession, Str
 
     let config: &'static TlsConfig<'static, Aes128GcmSha256> =
         alloc::boxed::Box::leak(alloc::boxed::Box::new(TlsConfig::new().with_server_name(name)));
-    let mut rng = seed_rng();
+    // Leak RNG so both open monomorphizations can borrow it for the static
+    // verifier path without fighting stack lifetimes.
+    let rng: &'static mut ChaCha20Rng =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(seed_rng()));
 
     let mut tls = TlsConnection::new(stream, rd, wr);
-    tls.open::<ChaCha20Rng, NoVerify>(TlsContext::new(config, &mut rng))
-        .map_err(|e| alloc::format!("TLS handshake failed: {:?} (in-kernel client is TLS 1.3, AES-128-GCM, no cert verification)", e))?;
+    // Verifier type is a compile-time parameter, so the two postures are two
+    // monomorphized `open` calls selected by the runtime `insecure` flag.
+    let r = if insecure() {
+        tls.open::<ChaCha20Rng, NoVerify>(TlsContext::new(config, rng))
+    } else {
+        tls.open::<ChaCha20Rng, ChittiVerifier<'static, Aes128GcmSha256>>(TlsContext::new(config, rng))
+    };
+    r.map_err(|e| {
+        if insecure() {
+            alloc::format!("TLS handshake failed: {:?} (TLS 1.3, AES-128-GCM, cert verification OFF)", e)
+        } else {
+            alloc::format!("TLS handshake failed: {:?} (cert verification on; /tls insecure on for self-signed hosts)", e)
+        }
+    })?;
     Ok(TlsSession { tls })
 }

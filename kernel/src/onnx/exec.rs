@@ -349,22 +349,86 @@ fn matmul(a: &Val, b: &Val, azp: f32, bzp: f32) -> Val {
             }
             last_bo = bo;
         }
-        let alen = a.f.len();
-        for i in 0..m {
-            if azp != 0.0 {
-                for kk in 0..k {
-                    arow[kk] = a.f[(ao + i * k + kk).min(alen - 1)] - azp;
+        // Parallel over A rows (each worker builds its own zp-folded row and
+        // writes its own out rows); a single-row matvec parallelizes over the
+        // output columns instead. Per-index deterministic either way.
+        struct Job {
+            a: *const f32,
+            alen: usize,
+            bt: *const f32,
+            out: *mut f32,
+            ao: usize,
+            obase: usize,
+            m: usize,
+            k: usize,
+            n: usize,
+            azp: f32,
+        }
+        unsafe fn rows(i_lo: usize, i_hi: usize, ctx: *mut u8) {
+            // SAFETY: ctx is the caller's Job; disjoint out rows per range.
+            let j = unsafe { &*(ctx as *const Job) };
+            let mut arow = vec![0f32; j.k];
+            // SAFETY: bt is n*k floats, alive for the call.
+            let bt = unsafe { core::slice::from_raw_parts(j.bt, j.n * j.k) };
+            let a = unsafe { core::slice::from_raw_parts(j.a, j.alen) };
+            for i in i_lo..i_hi {
+                if j.azp != 0.0 {
+                    for kk in 0..j.k {
+                        arow[kk] = a[(j.ao + i * j.k + kk).min(j.alen - 1)] - j.azp;
+                    }
+                } else if j.ao + i * j.k + j.k <= j.alen {
+                    arow.copy_from_slice(&a[j.ao + i * j.k..j.ao + i * j.k + j.k]);
+                } else {
+                    for kk in 0..j.k {
+                        arow[kk] = a[(j.ao + i * j.k + kk).min(j.alen - 1)];
+                    }
                 }
-            } else if ao + i * k + k <= alen {
-                arow.copy_from_slice(&a.f[ao + i * k..ao + i * k + k]);
-            } else {
-                for kk in 0..k {
-                    arow[kk] = a.f[(ao + i * k + kk).min(alen - 1)];
+                let orow = j.obase + i * j.n;
+                for jj in 0..j.n {
+                    let v = crate::cortex::tensor::dot_f32(&arow, &bt[jj * j.k..jj * j.k + j.k]);
+                    // SAFETY: this range's own out row.
+                    unsafe { *j.out.add(orow + jj) = v };
                 }
             }
-            let orow = (bi * m + i) * n;
-            for j in 0..n {
-                out[orow + j] = crate::cortex::tensor::dot_f32(&arow, &bt[j * k..j * k + k]);
+        }
+        unsafe fn cols(j_lo: usize, j_hi: usize, ctx: *mut u8) {
+            // SAFETY: as `rows`, but the single A row is shared read-only and
+            // each range writes its own out columns.
+            let j = unsafe { &*(ctx as *const Job) };
+            let arow = unsafe { core::slice::from_raw_parts(j.a, j.k) };
+            let bt = unsafe { core::slice::from_raw_parts(j.bt, j.n * j.k) };
+            for jj in j_lo..j_hi {
+                let v = crate::cortex::tensor::dot_f32(arow, &bt[jj * j.k..jj * j.k + j.k]);
+                // SAFETY: this range's own out column.
+                unsafe { *j.out.add(j.obase + jj) = v };
+            }
+        }
+        let alen = a.f.len();
+        if m >= 4 {
+            let job = Job { a: a.f.as_ptr(), alen, bt: bt.as_ptr(), out: out.as_mut_ptr(), ao, obase: bi * m * n, m, k, n, azp };
+            par_range(m, 1, rows, &job as *const Job as *mut u8);
+        } else {
+            for i in 0..m {
+                if azp != 0.0 {
+                    for kk in 0..k {
+                        arow[kk] = a.f[(ao + i * k + kk).min(alen - 1)] - azp;
+                    }
+                } else if ao + i * k + k <= alen {
+                    arow.copy_from_slice(&a.f[ao + i * k..ao + i * k + k]);
+                } else {
+                    for kk in 0..k {
+                        arow[kk] = a.f[(ao + i * k + kk).min(alen - 1)];
+                    }
+                }
+                let orow = (bi * m + i) * n;
+                if n >= 512 {
+                    let job = Job { a: arow.as_ptr(), alen: k, bt: bt.as_ptr(), out: out.as_mut_ptr(), ao: 0, obase: orow, m: 1, k, n, azp: 0.0 };
+                    par_range(n, 64, cols, &job as *const Job as *mut u8);
+                } else {
+                    for j in 0..n {
+                        out[orow + j] = crate::cortex::tensor::dot_f32(&arow, &bt[j * k..j * k + k]);
+                    }
+                }
             }
         }
     }
@@ -481,6 +545,56 @@ fn reduce(v: &Val, axes: &[i64], keep: bool, op: &str) -> Val {
 /// exactly 0, so the inner loops need no bounds checks), weights are zp-folded
 /// once, and each tile of output positions is gathered into contiguous
 /// `[ccg*k]` columns dotted against each output channel's contiguous weight
+/// Split `f(start, end, ctx)` over `[0, n)` across the SMP worker fleet when
+/// one exists (aarch64 kernel), else run it whole on this core. The contract
+/// mirrors `smp::parallel_for`: `f` must be safe on disjoint ranges sharing
+/// `ctx`, and every output element must depend only on its own index — so the
+/// result is **identical for any split** (no cross-range reassociation).
+/// This is what makes the ONNX hot ops (conv/matmul/elementwise) use all
+/// cores like the cortex matvecs do.
+fn par_range(n: usize, min_chunk: usize, f: unsafe fn(usize, usize, *mut u8), ctx: *mut u8) {
+    if n == 0 {
+        return;
+    }
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    // SAFETY: forwarded contract (disjoint ranges, ctx outlives the call).
+    unsafe {
+        crate::arch::aarch64::smp::parallel_for(n, min_chunk, f, ctx);
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
+    {
+        let _ = min_chunk;
+        // SAFETY: the whole range on this core; same contract.
+        unsafe { f(0, n, ctx) };
+    }
+}
+
+/// Apply `f` to every element, splitting large tensors across the SMP fleet
+/// (the vocoder's Sin/Cos/Exp run over ~100 k elements per node). Per-index
+/// pure, so any split yields the identical result.
+fn par_map(v: &mut [f32], f: fn(f32) -> f32) {
+    struct Job {
+        p: *mut f32,
+        f: fn(f32) -> f32,
+    }
+    unsafe fn chunk(lo: usize, hi: usize, ctx: *mut u8) {
+        // SAFETY: ctx is the caller's Job; each range touches only [lo, hi).
+        let j = unsafe { &*(ctx as *const Job) };
+        for i in lo..hi {
+            // SAFETY: within the slice the caller owns.
+            unsafe { *j.p.add(i) = (j.f)(*j.p.add(i)) };
+        }
+    }
+    if v.len() < 16_384 {
+        for x in v.iter_mut() {
+            *x = f(*x);
+        }
+        return;
+    }
+    let job = Job { p: v.as_mut_ptr(), f };
+    par_range(v.len(), 4096, chunk, &job as *const Job as *mut u8);
+}
+
 /// row via `tensor::dot_f32` (NEON/AVX2/SSE2). This is the vocoder's hot loop —
 /// the naive quadruple scalar loop it replaces was ~90 % of `/voice say`.
 fn conv1d(x: &Val, w: &Val, bias: Option<&Val>, node: &super::Node<'_>, xzp: f32, wzp: f32) -> Val {
@@ -507,9 +621,72 @@ fn conv1d(x: &Val, w: &Val, bias: Option<&Val>, node: &super::Node<'_>, xzp: f32
     let iwp = p0 + iw + p1;
     let mut out = vec![0f32; nb * m * ow];
     let mut xp = vec![0f32; c * iwp];
-    // One gathered tile of output positions (bounded scratch, reused).
+    // Bias pre-folded per output channel (zeros when absent).
+    let bias_v: Vec<f32> = match bias {
+        Some(bb) => bb.f.clone(),
+        None => vec![0f32; m],
+    };
+    /// Everything a worker needs; raw pointers because the ranges are disjoint
+    /// (each output position is written by exactly one range).
+    struct Job {
+        xp: *const f32,
+        wp: *const f32,
+        bias: *const f32,
+        out: *mut f32,
+        iwp: usize,
+        ccg: usize,
+        cpg: usize,
+        mpg: usize,
+        cgk: usize, // cg * k (weight row stride)
+        k: usize,
+        ow: usize,
+        s: usize,
+        d: usize,
+        g: usize,
+        out_base: usize, // (n*m + g*mpg) * ow
+    }
     const TILE: usize = 32;
-    let mut col = vec![0f32; TILE * ccg * k];
+    /// One worker: gather + dot for output positions `[o_lo, o_hi)` of one
+    /// (batch, group). Own `col` scratch; writes only its own out columns.
+    unsafe fn tiles(o_lo: usize, o_hi: usize, ctx: *mut u8) {
+        // SAFETY: ctx is the caller's Job, alive for the whole parallel call;
+        // all reads are shared/immutable, all writes target [o_lo, o_hi).
+        let j = unsafe { &*(ctx as *const Job) };
+        let mut col = vec![0f32; TILE * j.ccg * j.k];
+        let mut o0 = o_lo;
+        while o0 < o_hi {
+            let tn = TILE.min(o_hi - o0);
+            // Gather: col[t][ic*k + kk] = xp[g*cpg+ic][(o0+t)*s + kk*d].
+            for t in 0..tn {
+                let base = (o0 + t) * j.s;
+                for ic in 0..j.ccg {
+                    // SAFETY: xp is c*iwp long; base+ (k-1)*d < iwp by ow's def.
+                    let xrow = unsafe { core::slice::from_raw_parts(j.xp.add((j.g * j.cpg + ic) * j.iwp), j.iwp) };
+                    let dst = &mut col[t * j.ccg * j.k + ic * j.k..t * j.ccg * j.k + ic * j.k + j.k];
+                    if j.d == 1 {
+                        dst.copy_from_slice(&xrow[base..base + j.k]);
+                    } else {
+                        for (kk, dv) in dst.iter_mut().enumerate() {
+                            *dv = xrow[base + kk * j.d];
+                        }
+                    }
+                }
+            }
+            for mm in 0..j.mpg {
+                let om = j.g * j.mpg + mm;
+                // SAFETY: wp rows are cgk apart; bias has m entries.
+                let wrow = unsafe { core::slice::from_raw_parts(j.wp.add(om * j.cgk), j.ccg * j.k) };
+                let b = unsafe { *j.bias.add(om) };
+                let orow = j.out_base + mm * j.ow + o0;
+                for t in 0..tn {
+                    let v = b + crate::cortex::tensor::dot_f32(wrow, &col[t * j.ccg * j.k..(t + 1) * j.ccg * j.k]);
+                    // SAFETY: orow + t indexes this range's own out columns.
+                    unsafe { *j.out.add(orow + t) = v };
+                }
+            }
+            o0 += tn;
+        }
+    }
     for n in 0..nb {
         for ch in 0..c {
             let src = &x.f[(n * c + ch) * iw..(n * c + ch) * iw + iw];
@@ -522,53 +699,28 @@ fn conv1d(x: &Val, w: &Val, bias: Option<&Val>, node: &super::Node<'_>, xzp: f32
                 }
             }
         }
-        #[cfg(target_os = "none")]
-        let (mut gather_ms, mut dot_ms) = (0u64, 0u64);
         for g in 0..groups {
-            for o0 in (0..ow).step_by(TILE) {
-                let tn = TILE.min(ow - o0);
-                #[cfg(target_os = "none")]
-                let tg = crate::arch::now_ms();
-                // Gather: col[t][ic*k + kk] = xp[g*cpg+ic][(o0+t)*s + kk*d].
-                for t in 0..tn {
-                    let base = (o0 + t) * s;
-                    let crow = &mut col[t * ccg * k..(t + 1) * ccg * k];
-                    for ic in 0..ccg {
-                        let xrow = &xp[(g * cpg + ic) * iwp..(g * cpg + ic + 1) * iwp];
-                        let dst = &mut crow[ic * k..ic * k + k];
-                        if d == 1 {
-                            dst.copy_from_slice(&xrow[base..base + k]);
-                        } else {
-                            for (kk, dv) in dst.iter_mut().enumerate() {
-                                *dv = xrow[base + kk * d];
-                            }
-                        }
-                    }
-                }
-                #[cfg(target_os = "none")]
-                let td = crate::arch::now_ms();
-                #[cfg(target_os = "none")]
-                {
-                    gather_ms += td.saturating_sub(tg);
-                }
-                for mm in 0..mpg {
-                    let om = g * mpg + mm;
-                    let b = bias.map(|bb| bb.f[om]).unwrap_or(0.0);
-                    let wrow = &wp[om * cg * k..om * cg * k + ccg * k];
-                    let orow = (n * m + om) * ow + o0;
-                    for t in 0..tn {
-                        out[orow + t] = b + crate::cortex::tensor::dot_f32(wrow, &col[t * ccg * k..(t + 1) * ccg * k]);
-                    }
-                }
-                #[cfg(target_os = "none")]
-                {
-                    dot_ms += crate::arch::now_ms().saturating_sub(td);
-                }
-            }
-        }
-        #[cfg(target_os = "none")]
-        if gather_ms + dot_ms > 500 {
-            crate::ktrace::log_fmt(format_args!("conv1d [{m},{cg},{k}]x{ow} d={d}: gather {gather_ms} ms, dot {dot_ms} ms"));
+            let job = Job {
+                xp: xp.as_ptr(),
+                wp: wp.as_ptr(),
+                bias: bias_v.as_ptr(),
+                out: out.as_mut_ptr(),
+                iwp,
+                ccg,
+                cpg,
+                mpg,
+                cgk: cg * k,
+                k,
+                ow,
+                s,
+                d,
+                g,
+                out_base: (n * m + g * mpg) * ow,
+            };
+            // Parallel over output positions: each range gathers its own col
+            // tile and dots every output channel for it — all cores, per-index
+            // deterministic (identical result for any split).
+            par_range(ow, TILE, tiles, &job as *const Job as *mut u8);
         }
     }
     Val::new(vec![nb, m, ow], out)
@@ -643,31 +795,100 @@ fn conv_transpose1d(x: &Val, w: &Val, bias: Option<&Val>, node: &super::Node<'_>
     let (p0, p1) = (pads[0] as usize, pads[1] as usize);
     let ow = (iw - 1) * s + k - p0 - p1;
     let mut out = vec![0f32; nb * m * ow];
-    for n in 0..nb {
-        for om in 0..m {
-            let b = bias.map(|bb| bb.f[om]).unwrap_or(0.0);
-            for o in 0..ow {
-                out[(n * m + om) * ow + o] = b;
+    // Gather form (was a naive scalar scatter — the vocoder's 512-channel
+    // upsampling layers made it ~30 % of `/voice say`): each output position
+    // `o` sums, over the taps `kk` with `(o + p0 - kk) % s == 0`, an
+    // inner product across the group's input channels. Two one-time
+    // transposes make both streams contiguous so the inner product is the
+    // NEON `dot_f32`, and outputs parallelize per position across cores.
+    //
+    // xt[i][ic]  (per batch, per group): input transposed to channel-minor.
+    // wt[mm][kk][ic]: weights transposed to channel-minor per (out, tap).
+    let cpg = c_per_g.max(1);
+    let bias_v: Vec<f32> = match bias {
+        Some(bb) => bb.f.clone(),
+        None => vec![0f32; m],
+    };
+    struct Job {
+        xt: *const f32,   // [iw][cpg]
+        wt: *const f32,   // [m_per_g][k][cpg]
+        bias: *const f32, // [m]
+        out: *mut f32,
+        iw: usize,
+        cpg: usize,
+        k: usize,
+        ow: usize,
+        s: usize,
+        p0: usize,
+        g: usize,
+        m_per_g: usize,
+        out_base: usize, // (n*m + g*m_per_g) * ow
+    }
+    unsafe fn cols(o_lo: usize, o_hi: usize, ctx: *mut u8) {
+        // SAFETY: ctx is the caller's Job; reads are shared, writes hit only
+        // this range's output columns.
+        let j = unsafe { &*(ctx as *const Job) };
+        for o in o_lo..o_hi {
+            for mm in 0..j.m_per_g {
+                let om = j.g * j.m_per_g + mm;
+                // SAFETY: bias has m entries.
+                let mut acc = unsafe { *j.bias.add(om) };
+                // Taps contributing to o: i*s + kk == o + p0.
+                let target = o + j.p0;
+                let kk0 = if target >= (j.iw - 1) * j.s { target - (j.iw - 1) * j.s } else { 0 };
+                let mut kk = kk0 + (j.s + (target - kk0) % j.s) % j.s; // align (target-kk) to stride
+                while kk < j.k && kk <= target {
+                    let i = (target - kk) / j.s;
+                    if i < j.iw {
+                        // SAFETY: xt row i and wt row (mm,kk) are cpg long.
+                        let xrow = unsafe { core::slice::from_raw_parts(j.xt.add(i * j.cpg), j.cpg) };
+                        let wrow = unsafe { core::slice::from_raw_parts(j.wt.add((mm * j.k + kk) * j.cpg), j.cpg) };
+                        acc += crate::cortex::tensor::dot_f32(xrow, wrow);
+                    }
+                    kk += j.s;
+                }
+                // SAFETY: this range's own column.
+                unsafe { *j.out.add(j.out_base + mm * j.ow + o) = acc };
             }
         }
     }
+    let mut xt = vec![0f32; iw * cpg];
+    let mut wt = vec![0f32; m_per_g * k * cpg];
     for n in 0..nb {
-        for ic in 0..c {
-            let g = ic / c_per_g.max(1);
-            for i in 0..iw {
+        for g in 0..groups {
+            for ic in 0..cpg {
+                let src = &x.f[(n * c + g * cpg + ic) * iw..(n * c + g * cpg + ic + 1) * iw];
+                for i in 0..iw {
+                    xt[i * cpg + ic] = src[i];
+                }
+            }
+            for ic in 0..cpg {
                 for mm in 0..m_per_g {
-                    let om = g * m_per_g + mm;
+                    let wrow = &w.f[((g * cpg + ic) * m_per_g + mm) * k..((g * cpg + ic) * m_per_g + mm + 1) * k];
                     for kk in 0..k {
-                        let pos = i * s + kk;
-                        if pos < p0 || pos - p0 >= ow {
-                            continue;
-                        }
-                        out[(n * m + om) * ow + (pos - p0)] += x.f[(n * c + ic) * iw + i] * w.f[(ic * m_per_g + mm) * k + kk];
+                        wt[(mm * k + kk) * cpg + ic] = wrow[kk];
                     }
                 }
             }
+            let job = Job {
+                xt: xt.as_ptr(),
+                wt: wt.as_ptr(),
+                bias: bias_v.as_ptr(),
+                out: out.as_mut_ptr(),
+                iw,
+                cpg,
+                k,
+                ow,
+                s,
+                p0,
+                g,
+                m_per_g,
+                out_base: (n * m + g * m_per_g) * ow,
+            };
+            par_range(ow, 64, cols, &job as *const Job as *mut u8);
         }
     }
+    let _ = p1;
     Val::new(vec![nb, m, ow], out)
 }
 
@@ -897,40 +1118,164 @@ fn bcast_get(v: &Val, od: &[usize], idx: &[usize]) -> f32 {
     v.f[off]
 }
 
-fn elementwise2(a: &Val, b: &Val, f: impl Fn(f32, f32) -> f32) -> Val {
+fn elementwise2(a: &Val, b: &Val, f: fn(f32, f32) -> f32) -> Val {
     let od = broadcast_dims(&a.dims, &b.dims);
     let n: usize = od.iter().product::<usize>().max(1);
     // Fast paths for the overwhelmingly common cases — same shape, or one side
     // scalar — skip the per-element multi-index/stride machinery entirely
     // (dequant applies a scalar scale to multi-megabyte tensors; the generic
-    // path made that one of the hottest "ops" in TTS).
-    if a.f.len() == n && b.f.len() == n {
-        let out = a.f.iter().zip(&b.f).map(|(&x, &y)| f(x, y)).collect();
-        return Val::new(od, out);
+    // path made that one of the hottest "ops" in TTS). Large tensors split
+    // across the SMP fleet (per-index pure → identical for any split); the
+    // vocoder's Mul/Add over multi-100k-element tensors were the top two ops
+    // once the convs went parallel.
+    struct Job {
+        a: *const f32,
+        b: *const f32,
+        out: *mut f32,
+        /// 0 = zip a[i],b[i]; 1 = a[i] op scalar b; 2 = scalar a op b[i].
+        mode: u8,
+        f: fn(f32, f32) -> f32,
     }
-    if b.f.len() == 1 {
-        let y = b.f[0];
-        let out = a.f.iter().map(|&x| f(x, y)).collect();
-        return Val::new(od, out);
-    }
-    if a.f.len() == 1 {
-        let x = a.f[0];
-        let out = b.f.iter().map(|&y| f(x, y)).collect();
-        return Val::new(od, out);
-    }
-    let mut out = Vec::with_capacity(n);
-    let mut idx = vec![0usize; od.len()];
-    for _ in 0..n {
-        out.push(f(bcast_get(a, &od, &idx), bcast_get(b, &od, &idx)));
-        // increment multi-index
-        for k in (0..od.len()).rev() {
-            idx[k] += 1;
-            if idx[k] < od[k] {
-                break;
+    unsafe fn chunk(lo: usize, hi: usize, ctx: *mut u8) {
+        // SAFETY: ctx is the caller's Job; each range writes only [lo, hi).
+        let j = unsafe { &*(ctx as *const Job) };
+        for i in lo..hi {
+            // SAFETY: pointers cover n elements (scalars read index 0).
+            unsafe {
+                let v = match j.mode {
+                    0 => (j.f)(*j.a.add(i), *j.b.add(i)),
+                    1 => (j.f)(*j.a.add(i), *j.b),
+                    _ => (j.f)(*j.a, *j.b.add(i)),
+                };
+                *j.out.add(i) = v;
             }
-            idx[k] = 0;
         }
     }
+    const PAR_MIN: usize = 16_384;
+    let mode = if a.f.len() == n && b.f.len() == n {
+        Some(0u8)
+    } else if b.f.len() == 1 && a.f.len() == n {
+        Some(1)
+    } else if a.f.len() == 1 && b.f.len() == n {
+        Some(2)
+    } else {
+        None
+    };
+    if let Some(mode) = mode {
+        if n >= PAR_MIN {
+            let mut out = vec![0f32; n];
+            let job = Job { a: a.f.as_ptr(), b: b.f.as_ptr(), out: out.as_mut_ptr(), mode, f };
+            par_range(n, 4096, chunk, &job as *const Job as *mut u8);
+            return Val::new(od, out);
+        }
+        let out = match mode {
+            0 => a.f.iter().zip(&b.f).map(|(&x, &y)| f(x, y)).collect(),
+            1 => {
+                let y = b.f[0];
+                a.f.iter().map(|&x| f(x, y)).collect()
+            }
+            _ => {
+                let x = a.f[0];
+                b.f.iter().map(|&y| f(x, y)).collect()
+            }
+        };
+        return Val::new(od, out);
+    }
+    // General broadcast (e.g. the vocoder's channel-wise [1,C,T] ∘ [1,C,1]
+    // scales — the hottest Mul/Add shape in TTS): per-operand strides with 0 on
+    // broadcast dims, walked with carry increments instead of re-deriving the
+    // multi-index offset per element, and split across the SMP fleet.
+    let r = od.len();
+    let mut astr = vec![0usize; r];
+    let mut bstr = vec![0usize; r];
+    let mut clean = a.f.len() == a.dims.iter().product::<usize>().max(1) && b.f.len() == b.dims.iter().product::<usize>().max(1);
+    {
+        // Right-align each operand's dims against od; stride 0 where dim == 1.
+        // `clean` = every dim is a well-formed broadcast (1 or od[k]) — the
+        // strided walker has no clamp, so anything else takes the safe
+        // `bcast_get` path below (it clamps upstream shape mismatches).
+        let mut sa = 1usize;
+        let mut sb = 1usize;
+        for k in (0..r).rev() {
+            let ad = if a.dims.len() + k >= r { a.dims[a.dims.len() + k - r] } else { 1 };
+            let bd = if b.dims.len() + k >= r { b.dims[b.dims.len() + k - r] } else { 1 };
+            clean &= (ad == 1 || ad == od[k]) && (bd == 1 || bd == od[k]);
+            astr[k] = if ad == 1 { 0 } else { sa };
+            bstr[k] = if bd == 1 { 0 } else { sb };
+            sa *= ad;
+            sb *= bd;
+        }
+    }
+    if !clean {
+        let mut out = Vec::with_capacity(n);
+        let mut idx = vec![0usize; r];
+        for _ in 0..n {
+            out.push(f(bcast_get(a, &od, &idx), bcast_get(b, &od, &idx)));
+            for k in (0..r).rev() {
+                idx[k] += 1;
+                if idx[k] < od[k] {
+                    break;
+                }
+                idx[k] = 0;
+            }
+        }
+        return Val::new(od, out);
+    }
+    struct GJob {
+        a: *const f32,
+        b: *const f32,
+        out: *mut f32,
+        od: *const usize,
+        astr: *const usize,
+        bstr: *const usize,
+        r: usize,
+        f: fn(f32, f32) -> f32,
+    }
+    unsafe fn gchunk(lo: usize, hi: usize, ctx: *mut u8) {
+        // SAFETY: ctx is the caller's GJob; each range writes only [lo, hi).
+        let j = unsafe { &*(ctx as *const GJob) };
+        let od = unsafe { core::slice::from_raw_parts(j.od, j.r) };
+        let astr = unsafe { core::slice::from_raw_parts(j.astr, j.r) };
+        let bstr = unsafe { core::slice::from_raw_parts(j.bstr, j.r) };
+        // Seed the multi-index + operand offsets from the flat start.
+        let mut idx = vec![0usize; j.r];
+        let (mut ao, mut bo) = (0usize, 0usize);
+        let mut rem = lo;
+        for k in (0..j.r).rev() {
+            idx[k] = rem % od[k];
+            rem /= od[k];
+            ao += idx[k] * astr[k];
+            bo += idx[k] * bstr[k];
+        }
+        for i in lo..hi {
+            // SAFETY: offsets stay within each operand by stride construction.
+            unsafe { *j.out.add(i) = (j.f)(*j.a.add(ao), *j.b.add(bo)) };
+            // Carry-increment: adjust offsets incrementally, no re-derivation.
+            for k in (0..j.r).rev() {
+                idx[k] += 1;
+                ao += astr[k];
+                bo += bstr[k];
+                if idx[k] < od[k] {
+                    break;
+                }
+                ao -= astr[k] * od[k];
+                bo -= bstr[k] * od[k];
+                idx[k] = 0;
+            }
+        }
+    }
+    let mut out = vec![0f32; n];
+    let job = GJob {
+        a: a.f.as_ptr(),
+        b: b.f.as_ptr(),
+        out: out.as_mut_ptr(),
+        od: od.as_ptr(),
+        astr: astr.as_ptr(),
+        bstr: bstr.as_ptr(),
+        r,
+        f,
+    };
+    par_range(n, 4096, gchunk, &job as *const GJob as *mut u8);
     Val::new(od, out)
 }
 
@@ -1437,25 +1782,19 @@ fn exec_graph<'t>(g: &'t Graph<'t>, env: &mut BTreeMap<String, Val>, outer_inits
             }
             "Exp" => {
                 let mut v = get(env, 0)?;
-                for x in &mut v.f {
-                    *x = expf(*x);
-                }
+                par_map(&mut v.f, expf);
                 v.i = None;
                 vec![v]
             }
             "Sin" => {
                 let mut v = get(env, 0)?;
-                for x in &mut v.f {
-                    *x = sinf(*x);
-                }
+                par_map(&mut v.f, sinf);
                 v.i = None;
                 vec![v]
             }
             "Cos" => {
                 let mut v = get(env, 0)?;
-                for x in &mut v.f {
-                    *x = cosf(*x);
-                }
+                par_map(&mut v.f, cosf);
                 v.i = None;
                 vec![v]
             }
@@ -1914,7 +2253,7 @@ fn exec_graph<'t>(g: &'t Graph<'t>, env: &mut BTreeMap<String, Val>, outer_inits
                 for i in 1..node.inputs.len() {
                     let b = get(env, i)?;
                     acc = elementwise2(&acc, &b, match node.op {
-                        "Min" => |a: f32, c: f32| a.min(c),
+                        "Min" => (|a: f32, c: f32| a.min(c)) as fn(f32, f32) -> f32,
                         "Max" => |a: f32, c: f32| a.max(c),
                         _ => |a: f32, c: f32| a + c,
                     });

@@ -12,6 +12,7 @@
 pub mod catalog;
 pub mod remote;
 pub mod suggest;
+pub mod voice_remote;
 
 use crate::mm::Locked;
 use crate::persona::{self, Agent, Planner, RulePlanner};
@@ -226,6 +227,10 @@ pub fn run() -> ! {
                     serial_println!("(chat context + screen cleared)");
                 }
                 "open" | "edit" => run_open(arg, &mut chat, &mut orch),
+                "browse" => {
+                    let out = run_browser_tool("browser_open", &alloc::format!(r#"{{"url":"{}"}}"#, arg.replace('"', "")));
+                    serial_println!("browse> {}", out);
+                }
                 "surface" => run_surface(arg),
                 // --- agents-as-processes ------------------------------------
                 "agents" => run_agents(arg, &mut chat, &mut orch),
@@ -415,6 +420,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "network" | "net" => net_cmd(arg),
         "ping" => net_ping(arg),
         "wifi" => wifi_cmd(arg),
+        "tls" => tls_cmd(arg),
         "think" => run_think(arg),
         "mode" => run_mode(arg),
         "permissions" | "perms" => run_permissions(arg),
@@ -563,6 +569,31 @@ fn net_ping(arg: &str) {
 /// `/wifi [scan|connect <ssid>|info]` — a facade over the wired NIC (QEMU/VBox
 /// expose no 802.11 hardware): "connect" takes a password via the approval modal,
 /// then brings the link up with DHCP and presents it as `wlan0`.
+/// `/tls` — show or set the HTTPS certificate-verification posture. Verified
+/// against the embedded Mozilla root store by default; `insecure on` is the
+/// `curl -k` escape hatch for a self-signed / self-hosted server (human-only,
+/// like switching the model backend).
+fn tls_cmd(arg: &str) {
+    let arg = arg.trim();
+    match arg {
+        "" | "status" => {
+            let mode = if crate::net::tls::insecure() { "INSECURE (cert verification off — curl -k)" } else { "verify (Mozilla root store; hostname + validity checked)" };
+            serial_println!("tls> {mode}");
+            serial_println!("tls>   {} embedded CA roots", crate::net::ca_roots::CA_ROOT_SPANS.len());
+            serial_println!("tls>   /tls insecure on|off");
+        }
+        "insecure on" | "insecure" => {
+            crate::net::tls::set_insecure(true);
+            serial_println!("tls> certificate verification OFF (curl -k). Do not send secrets to untrusted hosts.");
+        }
+        "insecure off" | "verify" | "secure" => {
+            crate::net::tls::set_insecure(false);
+            serial_println!("tls> certificate verification ON (Mozilla root store).");
+        }
+        _ => serial_println!("tls> usage: /tls [status] | /tls insecure on|off"),
+    }
+}
+
 fn wifi_cmd(arg: &str) {
     let (sub, rest) = match arg.trim().split_once(' ') {
         Some((s, r)) => (s, r.trim()),
@@ -1001,6 +1032,7 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
                     | ToolBinding::Media
                     | ToolBinding::AgentWasm
                     | ToolBinding::Download
+                    | ToolBinding::Browser
                     | ToolBinding::Synapse { .. }
                     | ToolBinding::SessionTodo
                     | ToolBinding::StoreQuery { .. }
@@ -1066,6 +1098,8 @@ pub(crate) const CORE_TOOLS: &[&str] = &[
     "notes_get",
     "notes_set",
     "notes_remove",
+    "browser_open",
+    "browser_text",
 ];
 
 /// `search_tools` — deferred tool discovery (keyword match + `select:<name>`).
@@ -1732,6 +1766,8 @@ fn run_voice(arg: &str) {
             }
             None => serial_println!("voice> usage: /voice models load parakeet|kitten [path]"),
         }
+    } else if arg == "remote" || arg.starts_with("remote ") {
+        voice_remote_cmd(arg.strip_prefix("remote").unwrap_or("").trim());
     } else if let Some(path) = arg.strip_prefix("stt ") {
         voice_stt_file(path.trim());
     } else if let Some(text) = arg.strip_prefix("say ") {
@@ -1745,29 +1781,191 @@ fn run_voice(arg: &str) {
     }
 }
 
-/// `/voice say <text>` — text-to-speech via KittenTTS (G2P → model → playback).
+/// `/voice remote …` — configure a hosted TTS/STT provider (human-only, like
+/// `/model remote`). Subcommands: `tts <provider> <key> [voice] [model]`,
+/// `stt <provider> <key> [model]`, `off [tts|stt]`, or bare = show.
+fn voice_remote_cmd(rest: &str) {
+    use voice_remote::{Endpoint, Provider};
+    let mut cfg = voice_remote::load();
+    let show = |cfg: &voice_remote::VoiceConfig| {
+        let dir = |e: &Option<Endpoint>| match e {
+            Some(x) => alloc::format!("{} (voice='{}' model='{}')", x.provider.name(), x.voice, x.model),
+            None => "local".into(),
+        };
+        serial_println!("voice> remote tts: {}", dir(&cfg.tts));
+        serial_println!("voice> remote stt: {}", dir(&cfg.stt));
+        serial_println!("voice>   providers: elevenlabs cartesia inworld sarvam openai");
+        serial_println!("voice>   set: /voice remote tts <provider> <key> [voice] [model]");
+        serial_println!("voice>        /voice remote stt <provider> <key> [model]   |   /voice remote off [tts|stt]");
+    };
+    if rest.is_empty() {
+        show(&cfg);
+        return;
+    }
+    let mut it = rest.split_whitespace();
+    match it.next() {
+        Some("off") => {
+            match it.next() {
+                Some("tts") => cfg.tts = None,
+                Some("stt") => cfg.stt = None,
+                _ => {
+                    cfg.tts = None;
+                    cfg.stt = None;
+                }
+            }
+            voice_remote::save(&cfg);
+            serial_println!("voice> remote voice off (using local ONNX models)");
+        }
+        Some(dir @ ("tts" | "stt")) => {
+            let (Some(prov), Some(key)) = (it.next(), it.next()) else {
+                serial_println!("voice> usage: /voice remote {dir} <provider> <key> [voice] [model]");
+                return;
+            };
+            let Some(provider) = Provider::parse(prov) else {
+                serial_println!("voice> unknown provider '{prov}' (elevenlabs|cartesia|inworld|sarvam|openai)");
+                return;
+            };
+            // TTS: [voice] [model];  STT: [model].
+            let (voice, model) = if dir == "tts" {
+                (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string())
+            } else {
+                (String::new(), it.next().unwrap_or("").to_string())
+            };
+            let ep = Endpoint { provider, key: key.to_string(), voice, model };
+            if dir == "tts" {
+                cfg.tts = Some(ep);
+            } else {
+                cfg.stt = Some(ep);
+            }
+            voice_remote::save(&cfg);
+            serial_println!("voice> remote {dir} → {} (key hidden). `/voice {}` now goes through it.", provider.name(), if dir == "tts" { "say" } else { "stt" });
+            serial_println!("voice>   NB: HTTPS via the in-kernel TLS client; a provider that won't handshake reports a TLS error, not a wrong result.");
+        }
+        _ => show(&cfg),
+    }
+}
+
+/// Pending synthesized speech: PCM waiting for device slots. Fed by
+/// [`speech_pump`] from `ui_tick` (non-blocking — sized to the device's free
+/// periods), so playback continues while the next chunk synthesizes on the
+/// SMP fleet. Bounded: `voice_say` only enqueues one utterance.
+static SPEECH_Q: crate::mm::Locked<alloc::collections::VecDeque<i16>> = crate::mm::Locked::new(alloc::collections::VecDeque::new());
+
+/// Feed queued speech into free device periods (never blocks). Called from
+/// `ui_tick`, which the ONNX per-node loop pumps — that's what makes chunked
+/// TTS gapless: synthesis of chunk k+1 keeps chunk k's audio flowing.
+pub(crate) fn speech_pump() {
+    let free = crate::sound::out_free_bytes() / 2; // bytes → i16 samples
+    if free == 0 {
+        return;
+    }
+    let slice: alloc::vec::Vec<i16> = SPEECH_Q.with(|q| {
+        if q.is_empty() {
+            return alloc::vec::Vec::new();
+        }
+        let n = free.min(q.len());
+        q.drain(..n).collect()
+    });
+    if !slice.is_empty() {
+        let _ = crate::sound::play(&slice, crate::sound::tts::RATE);
+    }
+}
+
+/// Split text into speakable chunks at sentence/clause boundaries, so
+/// synthesis can pipeline with playback: the first clause plays while the
+/// rest is still synthesizing. Pure — unit-tested. Chunks shorter than
+/// `MIN` merge forward (tiny fragments sound choppy and waste per-run cost).
+pub(crate) fn split_speech(text: &str) -> alloc::vec::Vec<alloc::string::String> {
+    // A sentence ender always splits (first audio = first sentence's synth
+    // time); long comma clauses split too so no chunk grows unbounded. Only
+    // near-empty fragments merge (they sound choppy and waste a graph run).
+    const MIN: usize = 8;
+    let mut out: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let mut cur = alloc::string::String::new();
+    for ch in text.chars() {
+        cur.push(ch);
+        let boundary = matches!(ch, '.' | '!' | '?' | ';' | ':') || (ch == ',' && cur.len() >= 48);
+        if boundary && cur.trim().len() >= MIN {
+            out.push(core::mem::take(&mut cur).trim().into());
+        }
+    }
+    let tail = cur.trim();
+    if !tail.is_empty() {
+        match out.last_mut() {
+            Some(last) if tail.len() < MIN => {
+                last.push(' ');
+                last.push_str(tail);
+            }
+            _ => out.push(tail.into()),
+        }
+    }
+    out
+}
+
+/// `/voice say <text>` — text-to-speech via KittenTTS (G2P → model → playback),
+/// **chunked**: each clause plays as soon as it is synthesized while the next
+/// one runs on the SMP fleet, so speech starts in ~a second instead of after
+/// the whole utterance. Ctrl+C stops between chunks and drains the queue.
 fn voice_say(text: &str) {
     if !crate::sound::is_up() {
         serial_println!("voice> no sound device");
         return;
     }
-    if !ensure_voice_model("kitten") {
-        serial_println!("voice> no kitten model found (bundle it in the image, or /voice models load kitten <path>)");
+    // Remote TTS (human-configured) wins over the local model — but reuses the
+    // exact same chunked queue, so playback still streams per clause.
+    let remote_tts = voice_remote::load().tts;
+    if remote_tts.is_none() && !ensure_voice_model("kitten") {
+        serial_println!("voice> no kitten model found (bundle it in the image, /voice models load kitten <path>, or /voice remote tts …)");
         return;
     }
-    serial_println!("voice> synthesizing \u{201c}{}\u{201d}\u{2026}", text);
-    match crate::sound::tts::synth(text) {
-        Ok(pcm) => {
-            serial_println!("voice> {} samples; playing", pcm.len());
-            let _ = crate::sound::play(&pcm, crate::sound::tts::RATE);
-            while crate::sound::playing() {
-                ui_tick();
-                crate::sched::yield_now();
-            }
-            serial_println!("voice> done");
-        }
-        Err(e) => serial_println!("voice> {}", e),
+    match &remote_tts {
+        Some(e) => serial_println!("voice> synthesizing via {} \u{201c}{}\u{201d}\u{2026}", e.provider.name(), text),
+        None => serial_println!("voice> synthesizing \u{201c}{}\u{201d}\u{2026}", text),
     }
+    let chunks = split_speech(text);
+    let t0 = crate::arch::now_ms();
+    let mut total = 0usize;
+    let mut cancelled = false;
+    for (i, chunk) in chunks.iter().enumerate() {
+        let synth = match &remote_tts {
+            Some(e) => voice_remote::synth(e, chunk),
+            None => crate::sound::tts::synth(chunk),
+        };
+        match synth {
+            Ok(pcm) => {
+                total += pcm.len();
+                if i == 0 {
+                    serial_println!(
+                        "voice> speaking ({} chunk(s); first in {} ms)\u{2026}",
+                        chunks.len(),
+                        crate::arch::now_ms().saturating_sub(t0)
+                    );
+                }
+                SPEECH_Q.with(|q| q.extend(pcm.iter().copied()));
+                speech_pump();
+            }
+            Err(e) => {
+                serial_println!("voice> {}", e);
+                break;
+            }
+        }
+        if poll_cancel() {
+            cancelled = true;
+            break;
+        }
+    }
+    // Drain: keep feeding until the queue and device empty (or Ctrl+C).
+    while SPEECH_Q.with(|q| !q.is_empty()) || crate::sound::playing() {
+        speech_pump();
+        ui_tick();
+        crate::sched::yield_now();
+        if poll_cancel() {
+            cancelled = true;
+            SPEECH_Q.with(|q| q.clear());
+            break;
+        }
+    }
+    serial_println!("voice> {} samples; {}", total, if cancelled { "cancelled" } else { "done" });
 }
 
 /// `/onnx info|run <path>` — the generic ONNX runtime surface: inspect or
@@ -1946,8 +2144,9 @@ fn voice_models() {
 /// volume through the STT front-end. Mic-independent, so the mel + CTC path is
 /// exercisable without microphone hardware/permission.
 fn voice_stt_file(path: &str) {
-    if !ensure_voice_model("parakeet") {
-        serial_println!("voice> no parakeet model found (bundle it in the image, or /voice models load parakeet <path>)");
+    let remote_stt = voice_remote::load().stt;
+    if remote_stt.is_none() && !ensure_voice_model("parakeet") {
+        serial_println!("voice> no parakeet model found (bundle it in the image, /voice models load parakeet <path>, or /voice remote stt …)");
         return;
     }
     let bytes = match read_mounted(path) {
@@ -1964,9 +2163,23 @@ fn voice_stt_file(path: &str) {
             return;
         }
     };
-    serial_println!("voice> {}: {} samples; transcribing\u{2026}", path, pcm.len());
-    let text = crate::sound::stt::transcribe(&pcm);
-    serial_println!("voice> stt> {}", text);
+    // STT WAVs are 16 kHz mono (the parakeet front-end + the mic path both use
+    // it); `wav_to_pcm16` downmixes to mono but keeps the source rate, so pass
+    // 16000 as the upload rate — providers resample server-side.
+    match &remote_stt {
+        Some(e) => {
+            serial_println!("voice> {}: {} samples; transcribing via {}\u{2026}", path, pcm.len(), e.provider.name());
+            match voice_remote::transcribe(e, &pcm, 16_000) {
+                Ok(text) => serial_println!("voice> stt> {}", text),
+                Err(err) => serial_println!("voice> {}", err),
+            }
+        }
+        None => {
+            serial_println!("voice> {}: {} samples; transcribing\u{2026}", path, pcm.len());
+            let text = crate::sound::stt::transcribe(&pcm);
+            serial_println!("voice> stt> {}", text);
+        }
+    }
 }
 
 /// Minimal RIFF/WAVE parser: returns mono S16LE samples (averaging stereo).
@@ -4390,9 +4603,8 @@ fn run_agent_start(
             crate::service::package_ui::stop();
             serial_println!("agents> package UI stopped");
         }
-        "notes" | "synth" | "download" | "todo" => {
-            // Chat-only package agents (no surface): switch chat to their SOUL/tools.
-            // download/notes/todo also autostart into the shell toolset without this.
+        "notes" | "synth" | "download" | "todo" | "browser" => {
+            // Chat-only package agents (browser paints via host tools, not package_ui).
             if let Some(id) = crate::agent::system::list()
                 .into_iter()
                 .find(|(n, _)| *n == name)
@@ -4419,7 +4631,7 @@ fn run_agent_start(
                 Some(h) => h,
                 None => {
                     serial_println!(
-                        "agents> unknown agent '{}' (try: doc, ssh, chess, media, pdf, download, notes, todo, paint, slides, minesweeper, snake, synth)",
+                        "agents> unknown agent '{}' (try: doc, ssh, chess, media, pdf, download, notes, todo, browser, paint, slides, minesweeper, snake, synth)",
                         name
                     );
                     return;
@@ -5127,6 +5339,12 @@ fn media_key(c: u8) -> bool {
         return true;
     }
     match media_focused() {
+        // Browser tab: j/k scroll, space page, b back, r reload.
+        Some(crate::framebuffer::RightMode::Surface(id))
+            if id == BROWSER_SURFACE && browser_loaded() =>
+        {
+            browser_key(c)
+        }
         // A stopped/unloaded video must not eat keystrokes (the tab may still
         // be focused after Ctrl+C — typed commands would lose ' 0.m' chars).
         Some(crate::framebuffer::RightMode::Surface(id)) if id == VIDEO_SURFACE && video_loaded() => match c {
@@ -5784,6 +6002,9 @@ fn icon_state(now: u64) -> u64 {
 /// Per-idle UI upkeep: blink the caret and refresh the status-bar datetime
 /// (throttled to once a second). No-op in the test build (no framebuffer).
 fn ui_tick() {
+    // Chunked-TTS speech keeps flowing while compute (the next chunk's
+    // synthesis, inference) holds the shell — the ONNX/token loops pump here.
+    speech_pump();
     #[cfg(not(test))]
     {
         let now = crate::arch::now_ms();
@@ -5817,6 +6038,16 @@ fn ui_tick() {
         let t = crate::mouse::tick();
         if t.moved {
             crate::framebuffer::cursor_move(t.x, t.y);
+            // Browser hover: hand on links, I-beam on inputs.
+            if browser_loaded() {
+                if let Some((sid, sx, sy)) = crate::framebuffer::surface_hit(t.x, t.y) {
+                    if sid == BROWSER_SURFACE || sid == crate::framebuffer::BROWSER_SURFACE {
+                        browser_hover(sx as i32, sy as i32);
+                    } else {
+                        crate::framebuffer::set_cursor_shape(crate::framebuffer::CursorShape::Arrow);
+                    }
+                }
+            }
         }
         if t.pressed {
             if crate::framebuffer::divider_hit(t.x, t.y).is_some() {
@@ -5834,10 +6065,27 @@ fn ui_tick() {
                 crate::framebuffer::focus_set(action);
                 if action {
                     crate::framebuffer::chat_sel_clear();
-                    // UI agent (Chess etc.): map the click into surface coords
-                    // and queue it for the agent's next tick.
+                    // Map click into surface coords (letterbox-aware, uses last
+                    // present size — 640×400 browser, 256×192 chess, …).
                     if let Some((sid, sx, sy)) = crate::framebuffer::surface_hit(t.x, t.y) {
-                        if crate::service::ui_agent::active_surface() == Some(sid) {
+                        if sid == BROWSER_SURFACE || sid == crate::framebuffer::BROWSER_SURFACE {
+                            if browser_loaded() {
+                                crate::browser::events::EVENT_LOOP.with(|el| {
+                                    el.queue_ui_click(
+                                        crate::browser::events::TARGET_DOCUMENT,
+                                        sx as i32,
+                                        sy as i32,
+                                    );
+                                    el.drain(16);
+                                });
+                                let out = browser_click(sx as i32, sy as i32);
+                                if out.starts_with("ok:") && out.contains("http") {
+                                    serial_println!("browser> followed link → {}", out);
+                                } else if !out.starts_with("ok:no link") {
+                                    serial_println!("browser> {}", out);
+                                }
+                            }
+                        } else if crate::service::ui_agent::active_surface() == Some(sid) {
                             crate::synapse::ui::push_event(
                                 sid,
                                 crate::synapse::ui::UiEvent::Click { x: sx, y: sy },
@@ -5872,9 +6120,23 @@ fn ui_tick() {
             }
         }
         if t.wheel != 0 {
-            // + wheel = up = back in history; scroll the pane under the pointer.
-            let action = crate::framebuffer::pane_hit(t.x, t.y).unwrap_or(false);
-            crate::framebuffer::scroll_view(action, t.wheel as i64 * 3);
+            // Browser surface: wheel scrolls the page (not the chat scrollback).
+            let mut handled = false;
+            if browser_loaded() {
+                if let Some((sid, _sx, _sy)) = crate::framebuffer::surface_hit(t.x, t.y) {
+                    if sid == BROWSER_SURFACE || sid == crate::framebuffer::BROWSER_SURFACE {
+                        // wheel > 0 = up / away → scroll content up (negative dy).
+                        let dy = -(t.wheel as i32) * 48;
+                        let _ = browser_scroll(dy);
+                        handled = true;
+                    }
+                }
+            }
+            if !handled {
+                // + wheel = up = back in history; scroll the pane under the pointer.
+                let action = crate::framebuffer::pane_hit(t.x, t.y).unwrap_or(false);
+                crate::framebuffer::scroll_view(action, t.wheel as i64 * 3);
+            }
         }
         // Background audio: feed the sound device chunk-by-chunk regardless of
         // which tab is shown, so playback continues across tab switches.
@@ -5926,7 +6188,14 @@ fn repaint_active_tab() {
         crate::framebuffer::RightMode::Top => refresh_top(),
         crate::framebuffer::RightMode::Todos => {}
         crate::framebuffer::RightMode::Audio => repaint_audio(),
-        crate::framebuffer::RightMode::Surface(id) if id == crate::framebuffer::VIDEO_SURFACE => present_video_frame(),
+        crate::framebuffer::RightMode::Surface(id) if id == crate::framebuffer::VIDEO_SURFACE => {
+            present_video_frame()
+        }
+        // Browser must re-present its own buffer — fallthrough to image was
+        // wiping Google/etc. to a blank dark pane after every tab/status tick.
+        crate::framebuffer::RightMode::Surface(id) if id == BROWSER_SURFACE || id == crate::framebuffer::BROWSER_SURFACE => {
+            let _ = browser_repaint();
+        }
         crate::framebuffer::RightMode::Surface(_) => repaint_image(),
         crate::framebuffer::RightMode::Editor => crate::editor::repaint(),
         _ => {}
@@ -6300,6 +6569,860 @@ pub(crate) fn run_download_tool(args_json: &str) -> alloc::string::String {
             )
         }
         Err(e) => alloc::format!("error:{e}"),
+    }
+}
+
+// --- Browser agent (host HTML engine) --------------------------------------
+
+// Mirror `framebuffer::BROWSER_SURFACE` (module is cfg(not(test))).
+const BROWSER_SURFACE: u32 = u32::MAX - 2;
+const BROWSER_VW: i32 = 640;
+const BROWSER_VH: i32 = 400;
+const BROWSER_BODY_MAX: usize = 1 << 20; // 1 MiB
+
+struct BrowserSession {
+    url: alloc::string::String,
+    title: alloc::string::String,
+    html: alloc::string::String,
+    scroll_y: i32,
+    history: alloc::vec::Vec<alloc::string::String>,
+    content_height: i32,
+    /// Focused form control index (layout.controls).
+    focused: Option<usize>,
+    /// Live control values (index → value), survives re-layout for typing.
+    control_values: alloc::collections::BTreeMap<usize, alloc::string::String>,
+    control_checked: alloc::collections::BTreeMap<usize, bool>,
+}
+
+static BROWSER: crate::mm::Locked<Option<BrowserSession>> = crate::mm::Locked::new(None);
+
+/// Last painted layout (for hover hit-test without re-parse on every mouse move).
+static BROWSER_LAYOUT: crate::mm::Locked<Option<crate::browser::layout::Layout>> =
+    crate::mm::Locked::new(None);
+
+/// Loading progress 0..=100 for the browser chrome bar; 255 = hidden.
+static BROWSER_PROGRESS: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(255);
+
+/// Host entry for browser tools (`ToolBinding::Browser`).
+pub(crate) fn run_browser_tool(name: &str, args_json: &str) -> alloc::string::String {
+    use crate::session::todo::json_str;
+    match name {
+        "browser_open" | "browser_navigate" => {
+            let url = json_str(args_json, "url").unwrap_or_default();
+            browser_load(&url, name == "browser_navigate" || name == "browser_open")
+        }
+        "browser_back" => browser_back(),
+        "browser_scroll" => {
+            let dy = json_str(args_json, "dy")
+                .and_then(|s| s.parse::<i32>().ok())
+                .or_else(|| {
+                    json_str(args_json, "page")
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .map(|p| p * (BROWSER_VH - 40))
+                })
+                .unwrap_or(BROWSER_VH / 2);
+            browser_scroll(dy)
+        }
+        "browser_click" => {
+            let x = json_str(args_json, "x")
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0);
+            let y = json_str(args_json, "y")
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0);
+            browser_click(x, y)
+        }
+        "browser_status" => browser_status(),
+        "browser_links" => browser_links(),
+        "browser_text" => {
+            let max = json_str(args_json, "max")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(4000);
+            browser_text(max)
+        }
+        _ => alloc::format!("error: unknown browser tool '{name}'"),
+    }
+}
+
+fn browser_set_progress(pct: u8) {
+    BROWSER_PROGRESS.store(pct.min(100), core::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
+    {
+        crate::framebuffer::set_cursor_shape(crate::framebuffer::CursorShape::Wait);
+    }
+}
+
+fn browser_clear_progress() {
+    BROWSER_PROGRESS.store(255, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
+    {
+        crate::framebuffer::set_cursor_shape(crate::framebuffer::CursorShape::Arrow);
+    }
+}
+
+fn browser_progress_opt() -> Option<u8> {
+    let p = BROWSER_PROGRESS.load(core::sync::atomic::Ordering::Relaxed);
+    if p > 100 {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+fn browser_load(url: &str, push_hist: bool) -> alloc::string::String {
+    browser_load_method(url, "GET", &[], push_hist)
+}
+
+fn browser_load_method(
+    url: &str,
+    method: &str,
+    body: &[u8],
+    push_hist: bool,
+) -> alloc::string::String {
+    let url = url.trim();
+    if url.is_empty() {
+        return alloc::string::String::from("error: missing url");
+    }
+    if !crate::browser::url::is_http_url(url) {
+        return alloc::string::String::from("error: url must be http:// or https://");
+    }
+    crate::browser::worker::reset_global();
+    // New navigation: clear sessionStorage + session cookies (Web Storage model).
+    crate::browser::storage::STORAGE.with(|s| s.end_session());
+    crate::browser::storage::load_active();
+    crate::browser::events::EVENT_LOOP.with(|el| {
+        el.tasks.clear();
+        el.microtasks.clear();
+        el.queue_load();
+    });
+    browser_set_progress(5);
+
+    let doc_res = if method.eq_ignore_ascii_case("POST") {
+        match crate::net::http::request(
+            "POST",
+            url,
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            body,
+            60_000,
+        ) {
+            Ok(r) => crate::browser::loader::LoadedResource {
+                url: url.to_string(),
+                status: r.status,
+                content_type: r
+                    .get("content-type")
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+                headers: r.headers,
+                body: r.body,
+                from_cache: false,
+                redirects: 0,
+                destination: crate::browser::loader::Destination::Document,
+                cors_opaque: false,
+            },
+            Err(e) => {
+                browser_clear_progress();
+                return alloc::format!("error:{e}");
+            }
+        }
+    } else {
+        match crate::browser::loader::load_document(url, false) {
+            Ok(r) => r,
+            Err(e) => {
+                browser_clear_progress();
+                return alloc::format!("error:{e}");
+            }
+        }
+    };
+    browser_set_progress(25);
+    if doc_res.status >= 400 {
+        browser_clear_progress();
+        return alloc::format!(
+            "error: HTTP {} at {} (after {} redirect(s))",
+            doc_res.status,
+            doc_res.url,
+            doc_res.redirects
+        );
+    }
+    let final_url = doc_res.url.clone();
+    let redirects = doc_res.redirects;
+    let status = doc_res.status;
+    let from_cache = doc_res.from_cache;
+    let mut body_bytes = doc_res.body;
+    if body_bytes.len() > BROWSER_BODY_MAX {
+        body_bytes.truncate(BROWSER_BODY_MAX);
+    }
+    let body_html = alloc::string::String::from_utf8_lossy(&body_bytes).into_owned();
+
+    let (doc, mut lay, effects) =
+        crate::browser::layout_html_ex(&body_html, BROWSER_VW, BROWSER_VH, &final_url);
+    browser_set_progress(40);
+
+    // Script-requested navigation (location.href = …).
+    if let Some(nav) = effects.navigate.clone() {
+        if crate::browser::url::is_http_url(&nav) && nav != final_url {
+            browser_clear_progress();
+            return browser_load(&nav, push_hist);
+        }
+        if let Some(abs) = crate::browser::url::resolve(&final_url, &nav) {
+            if abs != final_url {
+                browser_clear_progress();
+                return browser_load(&abs, push_hist);
+            }
+        }
+    }
+
+    // Subresource images via cooperative worker pool.
+    let mut img_urls = alloc::vec::Vec::new();
+    for im in lay.images.iter() {
+        if im.src.is_empty() {
+            continue;
+        }
+        let abs =
+            crate::browser::url::resolve(&final_url, &im.src).unwrap_or_else(|| im.src.clone());
+        if abs.starts_with("http://") || abs.starts_with("https://") {
+            img_urls.push(abs);
+        }
+    }
+    let n_total = img_urls.len().max(1);
+    let (loaded_imgs, page_assets) =
+        crate::browser::worker::fetch_images_cooperative(&img_urls);
+    browser_set_progress(40 + (50 * loaded_imgs.len() / n_total) as u8);
+    let n_imgs = loaded_imgs.len();
+    let mut by_url: alloc::collections::BTreeMap<
+        alloc::string::String,
+        alloc::vec::Vec<u8>,
+    > = alloc::collections::BTreeMap::new();
+    for res in &loaded_imgs {
+        by_url.insert(res.url.clone(), res.body.clone());
+    }
+    for u in page_assets.urls() {
+        if let Some((_, body)) = page_assets.get(&u) {
+            by_url.entry(u).or_insert_with(|| body.to_vec());
+        }
+    }
+    for im in lay.images.iter_mut() {
+        if im.src.is_empty() {
+            continue;
+        }
+        let abs =
+            crate::browser::url::resolve(&final_url, &im.src).unwrap_or_else(|| im.src.clone());
+        if let Some(body) = by_url.get(&abs).or_else(|| by_url.get(&im.src)) {
+            crate::browser::fill_image_slot(im, body);
+        }
+    }
+
+    // Nested iframes / <video> first frames / canvas already has pixels.
+    let n_frames = lay.frames.len();
+    for fr in lay.frames.iter_mut() {
+        crate::shell::upkeep();
+        if crate::shell::poll_interrupt() {
+            break;
+        }
+        use crate::browser::layout::EmbedKind;
+        match fr.kind {
+            EmbedKind::Canvas => {
+                // pixels already allocated at layout; JS may redraw later
+                continue;
+            }
+            EmbedKind::Iframe | EmbedKind::Other => {
+                if !fr.srcdoc.is_empty() {
+                    crate::browser::fill_frame_slot(fr, &fr.srcdoc.clone(), &final_url);
+                    continue;
+                }
+                if fr.src.is_empty() {
+                    continue;
+                }
+                let abs = crate::browser::url::resolve(&final_url, &fr.src)
+                    .unwrap_or_else(|| fr.src.clone());
+                if !(abs.starts_with("http://") || abs.starts_with("https://")) {
+                    continue;
+                }
+                let req =
+                    crate::browser::loader::LoadRequest::iframe(&abs).with_source(&final_url);
+                match crate::browser::loader::load(&req) {
+                    Ok(res) if res.status < 400 => {
+                        let nested =
+                            alloc::string::String::from_utf8_lossy(&res.body).into_owned();
+                        crate::browser::fill_frame_slot(fr, &nested, &res.url);
+                    }
+                    Ok(res) => {
+                        crate::ktrace::log_fmt(format_args!(
+                            "browser:iframe HTTP {} {}",
+                            res.status, abs
+                        ));
+                    }
+                    Err(e) => {
+                        crate::ktrace::log_fmt(format_args!("browser:iframe error {abs}: {e}"));
+                    }
+                }
+            }
+            EmbedKind::Video => {
+                if fr.src.is_empty() {
+                    continue;
+                }
+                let abs = crate::browser::url::resolve(&final_url, &fr.src)
+                    .unwrap_or_else(|| fr.src.clone());
+                // http(s) via loader, or store/mount path via existing readers
+                let bytes = if abs.starts_with("http://") || abs.starts_with("https://") {
+                    let req = crate::browser::loader::LoadRequest::get(&abs)
+                        .with_source(&final_url)
+                        .with_timeout(60_000);
+                    match crate::browser::loader::load(&req) {
+                        Ok(res) if res.status < 400 => res.body,
+                        _ => continue,
+                    }
+                } else {
+                    match read_mounted(&abs).or_else(|| crate::synapse::fs::read(&abs)) {
+                        Some(b) => b,
+                        None => continue,
+                    }
+                };
+                crate::browser::fill_video_slot(fr, bytes);
+            }
+            EmbedKind::Audio => {
+                // HUD-only for now (no waveform in-page).
+            }
+        }
+    }
+    let _ = n_frames;
+
+    if let Some(last) = lay.images.last() {
+        lay.content_height = lay.content_height.max(last.y + last.h + 16);
+    }
+    for c in &lay.controls {
+        lay.content_height = lay.content_height.max(c.y + c.h + 16);
+    }
+    for f in &lay.frames {
+        lay.content_height = lay.content_height.max(f.y + f.h + 16);
+    }
+
+    let mut scroll0 = 0i32;
+    if let Some(sy) = effects.scroll_y {
+        scroll0 = sy.clamp(0, (lay.content_height - BROWSER_VH).max(0));
+    }
+
+    let mut control_values = alloc::collections::BTreeMap::new();
+    let mut control_checked = alloc::collections::BTreeMap::new();
+    for c in &lay.controls {
+        control_values.insert(c.index, c.value.clone());
+        control_checked.insert(c.index, c.checked);
+    }
+
+    browser_set_progress(95);
+    let (pixels, content_h) =
+        crate::browser::paint_layout_chrome(&lay, BROWSER_VH, scroll0, Some(100));
+    let title = doc.title;
+    BROWSER.with(|slot| {
+        let mut hist = slot
+            .as_ref()
+            .map(|s| s.history.clone())
+            .unwrap_or_default();
+        if push_hist {
+            if let Some(prev) = slot.as_ref().map(|s| s.url.clone()) {
+                if !prev.is_empty() && prev != final_url {
+                    hist.push(prev);
+                    if hist.len() > 32 {
+                        hist.remove(0);
+                    }
+                }
+            }
+        }
+        *slot = Some(BrowserSession {
+            url: final_url.clone(),
+            title: title.clone(),
+            html: body_html,
+            scroll_y: scroll0,
+            history: hist,
+            content_height: content_h,
+            focused: None,
+            control_values,
+            control_checked,
+        });
+    });
+    browser_clear_progress();
+    crate::browser::events::EVENT_LOOP.with(|el| {
+        el.drain(32);
+    });
+    crate::browser::storage::persist_active();
+    BROWSER_LAYOUT.with(|s| *s = Some(lay.clone()));
+    browser_present(&pixels, &title, &final_url, scroll0, content_h);
+    let chk = crate::browser::paint::checksum(&pixels);
+    let (cache_n, cache_b, hits, misses) = crate::browser::loader::cache_stats();
+    alloc::format!(
+        "ok:title={} url={} redirects={redirects} status={status} cache={} imgs={n_imgs} forms={} iframes={} mem={cache_n}/{cache_b}b hits={hits} misses={misses} checksum={chk:016x} size={}x{}",
+        title,
+        final_url,
+        if from_cache { "hit" } else { "miss" },
+        lay.controls.len(),
+        lay.frames.len(),
+        BROWSER_VW,
+        BROWSER_VH
+    )
+}
+
+/// Rebuild layout from session HTML, re-apply control state, paint.
+fn browser_layout_session() -> Option<(
+    crate::browser::layout::Layout,
+    alloc::string::String,
+    alloc::string::String,
+    i32,
+    Option<usize>,
+)> {
+    let (html, scroll, url, title, focused, values, checked) = BROWSER.with(|s| {
+        s.as_ref().map(|b| {
+            (
+                b.html.clone(),
+                b.scroll_y,
+                b.url.clone(),
+                b.title.clone(),
+                b.focused,
+                b.control_values.clone(),
+                b.control_checked.clone(),
+            )
+        })
+    })?;
+    let (_doc, mut lay, _fx) =
+        crate::browser::layout_html_ex(&html, BROWSER_VW, BROWSER_VH, &url);
+    for c in &mut lay.controls {
+        if let Some(v) = values.get(&c.index) {
+            c.value = v.clone();
+        }
+        if let Some(&k) = checked.get(&c.index) {
+            c.checked = k;
+        }
+        c.focused = focused == Some(c.index);
+    }
+    if let Some(last) = lay.controls.last() {
+        lay.content_height = lay.content_height.max(last.y + last.h + 16);
+    }
+    Some((lay, url, title, scroll, focused))
+}
+
+fn browser_present(pixels: &[u32], title: &str, url: &str, scroll_y: i32, content_h: i32) {
+    #[cfg(not(test))]
+    {
+        // present_surface_reserve already opens/focuses the Surface tab and blits.
+        // Do **not** call set_right afterward: that runs repaint_action() and was
+        // clearing the just-drawn page (blank black pane).
+        // Reserve a video-style HUD strip for title + scroll scrubber + shortcuts.
+        let hud = crate::framebuffer::browser_hud_height().max(1);
+        crate::framebuffer::present_surface_reserve(
+            BROWSER_SURFACE,
+            BROWSER_VW as usize,
+            BROWSER_VH as usize,
+            pixels,
+            hud,
+        );
+        let focused = BROWSER.with(|s| s.as_ref().and_then(|b| b.focused).is_some());
+        crate::framebuffer::draw_browser_status(
+            title,
+            url,
+            scroll_y,
+            content_h,
+            BROWSER_VH,
+            focused,
+        );
+        crate::serial_println!(
+            "browser> {} — {}  scroll {}/{}  runs_px={}",
+            title,
+            url,
+            scroll_y,
+            (content_h - BROWSER_VH).max(0),
+            pixels.iter().filter(|&&p| p != 0 && p != 0xf5f0e8).count()
+        );
+    }
+    #[cfg(test)]
+    {
+        let _ = (pixels, title, url, scroll_y, content_h);
+    }
+}
+
+fn browser_repaint() -> alloc::string::String {
+    let Some((lay, url, title, scroll, _focused)) = browser_layout_session() else {
+        return alloc::string::String::from("error: no page open (browser_open first)");
+    };
+    let progress = browser_progress_opt();
+    let (pixels, content_h) =
+        crate::browser::paint_layout_chrome(&lay, BROWSER_VH, scroll, progress);
+    BROWSER.with(|s| {
+        if let Some(b) = s.as_mut() {
+            b.content_height = content_h;
+        }
+    });
+    BROWSER_LAYOUT.with(|s| *s = Some(lay));
+    browser_present(&pixels, &title, &url, scroll, content_h);
+    alloc::format!("ok:scroll={scroll} title={title}")
+}
+
+fn browser_scroll(dy: i32) -> alloc::string::String {
+    let max = BROWSER.with(|s| {
+        s.as_ref()
+            .map(|b| (b.content_height - BROWSER_VH).max(0))
+            .unwrap_or(0)
+    });
+    BROWSER.with(|s| {
+        if let Some(b) = s.as_mut() {
+            b.scroll_y = (b.scroll_y + dy).clamp(0, max);
+        }
+    });
+    browser_repaint()
+}
+
+fn browser_back() -> alloc::string::String {
+    let prev = BROWSER.with(|s| s.as_mut().and_then(|b| b.history.pop()));
+    match prev {
+        Some(u) => browser_load(&u, false),
+        None => alloc::string::String::from("error: no history"),
+    }
+}
+
+fn browser_click(x: i32, y: i32) -> alloc::string::String {
+    let Some((lay, base, _title, scroll, _foc)) = browser_layout_session() else {
+        return alloc::string::String::from("error: no page open");
+    };
+    let content_y = y + scroll;
+    match crate::browser::layout::hit_test_ex(&lay, x, content_y) {
+        crate::browser::layout::Hit::Link(href) => {
+            let url = crate::browser::url::resolve(&base, &href).unwrap_or(href);
+            browser_load(&url, true)
+        }
+        crate::browser::layout::Hit::Control(idx) => {
+            if let Some(c) = lay.controls.get(idx).cloned() {
+                use crate::browser::layout::ControlKind;
+                match c.kind {
+                    ControlKind::Submit => browser_submit_control(&lay, &c),
+                    ControlKind::Button => {
+                        BROWSER.with(|s| {
+                            if let Some(b) = s.as_mut() {
+                                b.focused = Some(idx);
+                            }
+                        });
+                        browser_repaint();
+                        alloc::string::String::from("ok:button")
+                    }
+                    ControlKind::Checkbox => {
+                        BROWSER.with(|s| {
+                            if let Some(b) = s.as_mut() {
+                                b.focused = Some(idx);
+                                let cur = b.control_checked.get(&idx).copied().unwrap_or(false);
+                                b.control_checked.insert(idx, !cur);
+                            }
+                        });
+                        browser_repaint();
+                        alloc::string::String::from("ok:checkbox toggled")
+                    }
+                    ControlKind::Text | ControlKind::Password | ControlKind::TextArea => {
+                        BROWSER.with(|s| {
+                            if let Some(b) = s.as_mut() {
+                                b.focused = Some(idx);
+                            }
+                        });
+                        browser_repaint();
+                        alloc::format!("ok:focus input {}", c.name)
+                    }
+                    ControlKind::Hidden => alloc::string::String::from("ok:hidden"),
+                }
+            } else {
+                alloc::string::String::from("ok:no control")
+            }
+        }
+        crate::browser::layout::Hit::Embed(idx) => {
+            if let Some(fr) = lay.frames.get(idx).cloned() {
+                use crate::browser::layout::EmbedKind;
+                match fr.kind {
+                    EmbedKind::Video => {
+                        if fr.src.is_empty() {
+                            return alloc::string::String::from("ok:video (no src)");
+                        }
+                        let abs = crate::browser::url::resolve(&base, &fr.src)
+                            .unwrap_or_else(|| fr.src.clone());
+                        browser_play_video_url(&abs, &base)
+                    }
+                    EmbedKind::Iframe if !fr.src.is_empty() => {
+                        let abs = crate::browser::url::resolve(&base, &fr.src)
+                            .unwrap_or_else(|| fr.src.clone());
+                        browser_load(&abs, true)
+                    }
+                    EmbedKind::Canvas => {
+                        alloc::string::String::from("ok:canvas")
+                    }
+                    EmbedKind::Audio => {
+                        alloc::string::String::from("ok:audio (click play not wired)")
+                    }
+                    _ => alloc::string::String::from("ok:embed"),
+                }
+            } else {
+                alloc::string::String::from("ok:no embed")
+            }
+        }
+        crate::browser::layout::Hit::Page => {
+            BROWSER.with(|s| {
+                if let Some(b) = s.as_mut() {
+                    b.focused = None;
+                }
+            });
+            browser_repaint();
+            alloc::string::String::from("ok:no link at point")
+        }
+    }
+}
+
+/// Fetch (or open local path) video and start the full video player tab.
+#[cfg(not(feature = "server"))]
+fn browser_play_video_url(abs: &str, page_url: &str) -> alloc::string::String {
+    let bytes = if abs.starts_with("http://") || abs.starts_with("https://") {
+        let req = crate::browser::loader::LoadRequest::get(abs)
+            .with_source(page_url)
+            .with_timeout(120_000);
+        match crate::browser::loader::load(&req) {
+            Ok(res) if res.status < 400 => res.body,
+            Ok(res) => {
+                return alloc::format!("error: video HTTP {}", res.status);
+            }
+            Err(e) => {
+                return alloc::format!("error: video load: {e}");
+            }
+        }
+    } else {
+        // Guest path / store
+        match read_mounted(abs).or_else(|| crate::synapse::fs::read(abs)) {
+            Some(b) => b,
+            None => {
+                return alloc::format!("error: video not found: {abs}");
+            }
+        }
+    };
+    play_video_bytes(abs, bytes);
+    alloc::format!("ok:playing video {abs}")
+}
+
+#[cfg(feature = "server")]
+fn browser_play_video_url(_abs: &str, _page_url: &str) -> alloc::string::String {
+    alloc::string::String::from("error: video player unavailable in server build")
+}
+
+fn browser_submit_control(
+    lay: &crate::browser::layout::Layout,
+    c: &crate::browser::layout::FormControl,
+) -> alloc::string::String {
+    let form_id = c.form_id;
+    // Merge live values from session into a temporary layout clone.
+    let mut lay = lay.clone();
+    BROWSER.with(|s| {
+        if let Some(b) = s.as_ref() {
+            for ctl in &mut lay.controls {
+                if let Some(v) = b.control_values.get(&ctl.index) {
+                    ctl.value = v.clone();
+                }
+                if let Some(&k) = b.control_checked.get(&ctl.index) {
+                    ctl.checked = k;
+                }
+            }
+        }
+    });
+    let fields = crate::browser::layout::form_fields(&lay, form_id);
+    // Include submitter name/value if named.
+    let mut fields = fields;
+    if !c.name.is_empty() {
+        fields.push(crate::browser::form::FormField {
+            name: c.name.clone(),
+            value: if c.value.is_empty() {
+                alloc::string::String::from("Submit")
+            } else {
+                c.value.clone()
+            },
+        });
+    }
+    let base = BROWSER.with(|s| s.as_ref().map(|b| b.url.clone()).unwrap_or_default());
+    let sub = crate::browser::form::build_submit(&base, &c.form_action, &c.form_method, &fields);
+    if sub.method == "POST" {
+        browser_load_method(&sub.url, "POST", sub.body.as_bytes(), true)
+    } else {
+        browser_load(&sub.url, true)
+    }
+}
+
+/// Update cursor shape when hovering the browser surface.
+fn browser_hover(sx: i32, sy: i32) {
+    let scroll = BROWSER.with(|s| s.as_ref().map(|b| b.scroll_y).unwrap_or(0));
+    let kind = BROWSER_LAYOUT.with(|slot| {
+        slot.as_ref()
+            .map(|lay| crate::browser::layout::cursor_at(lay, sx, sy + scroll))
+            .unwrap_or(crate::browser::layout::CursorKind::Default)
+    });
+    #[cfg(not(test))]
+    {
+        use crate::framebuffer::CursorShape;
+        let shape = match kind {
+            crate::browser::layout::CursorKind::Pointer => CursorShape::Hand,
+            crate::browser::layout::CursorKind::Text => CursorShape::IBeam,
+            crate::browser::layout::CursorKind::Default => CursorShape::Arrow,
+        };
+        crate::framebuffer::set_cursor_shape(shape);
+    }
+    let _ = (kind, sx, sy);
+}
+
+fn browser_status() -> alloc::string::String {
+    BROWSER.with(|s| match s.as_ref() {
+        Some(b) => alloc::format!(
+            "ok:url={} title={} scroll={} content_h={} size={}x{}",
+            b.url,
+            b.title,
+            b.scroll_y,
+            b.content_height,
+            BROWSER_VW,
+            BROWSER_VH
+        ),
+        None => alloc::string::String::from("ok:empty"),
+    })
+}
+
+fn browser_links() -> alloc::string::String {
+    let html = match BROWSER.with(|s| s.as_ref().map(|b| b.html.clone())) {
+        Some(h) => h,
+        None => return alloc::string::String::from("error: no page open"),
+    };
+    let links = crate::browser::page_links(&html);
+    if links.is_empty() {
+        return alloc::string::String::from("(no links)");
+    }
+    let mut out = alloc::string::String::new();
+    for (i, (h, t)) in links.iter().enumerate().take(64) {
+        out.push_str(&alloc::format!("{}. {} — {}\n", i + 1, t, h));
+    }
+    out
+}
+
+fn browser_text(max: usize) -> alloc::string::String {
+    let html = match BROWSER.with(|s| s.as_ref().map(|b| b.html.clone())) {
+        Some(h) => h,
+        None => return alloc::string::String::from("error: no page open"),
+    };
+    let mut t = crate::browser::page_text(&html);
+    if t.len() > max {
+        t.truncate(max);
+        t.push_str("…");
+    }
+    t
+}
+
+/// Whether the browser tab is showing (for key routing).
+pub fn browser_loaded() -> bool {
+    BROWSER.with(|s| s.is_some())
+}
+
+/// Handle a key while the browser surface is focused. Returns true if consumed.
+#[cfg(not(test))]
+fn browser_key(byte: u8) -> bool {
+    if !browser_loaded() {
+        return false;
+    }
+    // Text entry into focused form control.
+    let focused = BROWSER.with(|s| s.as_ref().and_then(|b| b.focused));
+    if let Some(idx) = focused {
+        match byte {
+            0x1b => {
+                // Esc clears focus.
+                BROWSER.with(|s| {
+                    if let Some(b) = s.as_mut() {
+                        b.focused = None;
+                    }
+                });
+                let _ = browser_repaint();
+                return true;
+            }
+            0x09 => {
+                // Tab → next text control.
+                if let Some((lay, ..)) = browser_layout_session() {
+                    let next = lay
+                        .controls
+                        .iter()
+                        .filter(|c| c.kind.is_text_entry())
+                        .map(|c| c.index)
+                        .cycle()
+                        .skip_while(|&i| i != idx)
+                        .nth(1);
+                    BROWSER.with(|s| {
+                        if let Some(b) = s.as_mut() {
+                            b.focused = next.or(Some(idx));
+                        }
+                    });
+                    let _ = browser_repaint();
+                }
+                return true;
+            }
+            0x0d | 0x0a => {
+                // Enter → submit owning form if any.
+                if let Some((lay, ..)) = browser_layout_session() {
+                    if let Some(c) = lay.controls.get(idx) {
+                        if let Some(sub) = lay
+                            .controls
+                            .iter()
+                            .find(|x| x.form_id == c.form_id && x.kind.is_submit())
+                            .cloned()
+                        {
+                            let _ = browser_submit_control(&lay, &sub);
+                            return true;
+                        }
+                        // Orphan text field: no-op submit.
+                    }
+                }
+                return true;
+            }
+            0x08 | 0x7f => {
+                BROWSER.with(|s| {
+                    if let Some(b) = s.as_mut() {
+                        if let Some(v) = b.control_values.get_mut(&idx) {
+                            v.pop();
+                        }
+                    }
+                });
+                let _ = browser_repaint();
+                return true;
+            }
+            b if b >= 0x20 && b < 0x7f => {
+                BROWSER.with(|s| {
+                    if let Some(sess) = s.as_mut() {
+                        let e = sess.control_values.entry(idx).or_default();
+                        if e.len() < 512 {
+                            e.push(b as char);
+                        }
+                    }
+                });
+                let _ = browser_repaint();
+                return true;
+            }
+            _ => {}
+        }
+    }
+    match byte {
+        b'j' | b'J' => {
+            let _ = browser_scroll(BROWSER_VH / 3);
+            true
+        }
+        b'k' | b'K' => {
+            let _ = browser_scroll(-(BROWSER_VH / 3));
+            true
+        }
+        b' ' if focused.is_none() => {
+            let _ = browser_scroll(BROWSER_VH - 40);
+            true
+        }
+        b'b' | b'B' if focused.is_none() => {
+            let _ = browser_back();
+            true
+        }
+        b'r' | b'R' if focused.is_none() => {
+            let url = BROWSER.with(|s| s.as_ref().map(|b| b.url.clone()));
+            if let Some(u) = url {
+                let _ = browser_load(&u, false);
+            }
+            true
+        }
+        // PageUp / we only get plain bytes here; Pg keys come as CSI elsewhere.
+        _ => false,
     }
 }
 
@@ -6810,18 +7933,24 @@ fn play_video(path: &str) {
         serial_println!("open> {} not found under any mount or in the store (see /mounts)", path);
         return;
     };
+    play_video_bytes(path, bytes);
+}
+
+/// Start the video player from already-loaded bytes (browser `<video>` click).
+#[cfg(not(feature = "server"))]
+fn play_video_bytes(name: &str, bytes: alloc::vec::Vec<u8>) {
     let t0 = crate::arch::now_ms();
     // Probe first so we can report clearly and handle unsupported streams.
     match crate::video::probe(&bytes) {
         Ok(info) => {
-            serial_println!("open> {} — {} {}x{} {} frames {}:{:02}", path, info.codec, info.width, info.height, info.frame_count, info.duration_ms / 60000, info.duration_ms % 60000 / 1000);
+            serial_println!("open> {} — {} {}x{} {} frames {}:{:02}", name, info.codec, info.width, info.height, info.frame_count, info.duration_ms / 60000, info.duration_ms % 60000 / 1000);
             if !info.decodable {
                 serial_println!("open>   cannot decode yet: {}", if info.cabac { "CABAC entropy coding (baseline/CAVLC only)" } else { "unsupported profile" });
                 return;
             }
         }
         Err(e) => {
-            serial_println!("open> cannot open {}: {}", path, e);
+            serial_println!("open> cannot open {}: {}", name, e);
             return;
         }
     }
@@ -6876,7 +8005,7 @@ fn play_video(path: &str) {
                 dec.backend,
                 crate::arch::now_ms().saturating_sub(t0)
             );
-            let name = path.rsplit('/').next().unwrap_or(path).to_string();
+            let name = name.rsplit('/').next().unwrap_or(name).to_string();
             let now = crate::arch::now_ms();
             VIDEO.with(|v| {
                 *v = Some(VideoPlayer {
@@ -9180,6 +10309,34 @@ fn disk_ext4read() {
     }
 }
 
+
+#[cfg(test)]
+mod speech_split_tests {
+    use super::split_speech;
+
+    #[test_case]
+    fn splits_at_sentences_and_merges_fragments() {
+        let c = split_speech("Hello there my friend. This is the second sentence, which is quite a bit longer. Bye.");
+        assert!(c.len() >= 2, "{c:?}");
+        assert!(c[0].starts_with("Hello"), "{c:?}");
+        // The tiny trailing "Bye." merges into the previous chunk.
+        assert!(c.last().unwrap().contains("Bye."), "{c:?}");
+        // Nothing lost: every word appears across the chunks.
+        let joined = c.join(" ");
+        for w in ["Hello", "second", "longer", "Bye."] {
+            assert!(joined.contains(w), "{joined}");
+        }
+    }
+
+    #[test_case]
+    fn short_text_is_one_chunk_and_empty_is_none() {
+        assert_eq!(split_speech("hi there").len(), 1);
+        assert!(split_speech("   ").is_empty());
+        // Long comma-separated clause splits (48-char comma rule).
+        let c = split_speech("one two three four five six seven eight nine ten eleven, and then some more words here to finish");
+        assert!(c.len() >= 2, "{c:?}");
+    }
+}
 
 #[cfg(test)]
 mod pdf_preview_tests {

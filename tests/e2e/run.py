@@ -396,6 +396,17 @@ def s_http_get(g):
     return ok, "GET 200 + body" if ok else "no 200/body"
 
 
+def s_browse(g):
+    """Browser agent: fetch harness HTML, parse/layout/paint, report title."""
+    m = g.mark()
+    g.send(f"/browse http://{HOST}:{PLAIN_PORT}/page.html")
+    # Host prints `browser> <title> — <url> …` and tool returns `ok:title=…`.
+    ok = g.wait_for("E2E Browser", 30, m) and (
+        g.wait_for("ok:title=", 5, m) or g.wait_for("browser>", 5, m)
+    )
+    return ok, "rendered harness HTML (title E2E Browser)" if ok else "browse did not report title"
+
+
 def s_http_post(g):
     m = g.mark()
     g.send(f'/http -X POST -H "X-Test: yes" -d payload-9182 http://{HOST}:{PLAIN_PORT}/echo')
@@ -1236,7 +1247,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("clipboard", s_clipboard),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("mcp_manifest", s_mcp_manifest)]
-NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
+NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("browse", s_browse), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 # Runs after every other group: kills the guest (QEMU -no-reboot → exit).
 FINAL = [("restart", s_restart)]
 

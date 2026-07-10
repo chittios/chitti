@@ -638,12 +638,39 @@ pub struct Screen {
     cur_saved: [Rgb; (CUR_W * CUR_H) as usize],
 }
 
-// Mouse cursor arrow (macOS-style: black fill, white outline so it reads on
-// both dark and light content): 0 = transparent, 1 = fill, 2 = outline.
+// Mouse cursor sprites: 0 = transparent, 1 = fill, 2 = outline.
+// Shapes: Arrow (default), Hand (link pointer), IBeam (text input).
 const CUR_W: u64 = 12;
 const CUR_H: u64 = 19;
+
+/// OS cursor shape (CSS `cursor` subset — Ladybird pointer/text/default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CursorShape {
+    Arrow = 0,
+    Hand = 1,
+    IBeam = 2,
+    Wait = 3,
+}
+
+static CURSOR_SHAPE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Set the mouse cursor glyph (restored on next move/draw).
+pub fn set_cursor_shape(shape: CursorShape) {
+    CURSOR_SHAPE.store(shape as u8, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn cursor_shape() -> CursorShape {
+    match CURSOR_SHAPE.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => CursorShape::Hand,
+        2 => CursorShape::IBeam,
+        3 => CursorShape::Wait,
+        _ => CursorShape::Arrow,
+    }
+}
+
 #[rustfmt::skip]
-const CURSOR: [u8; (CUR_W * CUR_H) as usize] = [
+const CURSOR_ARROW: [u8; (CUR_W * CUR_H) as usize] = [
     2,0,0,0,0,0,0,0,0,0,0,0,
     2,2,0,0,0,0,0,0,0,0,0,0,
     2,1,2,0,0,0,0,0,0,0,0,0,
@@ -664,6 +691,87 @@ const CURSOR: [u8; (CUR_W * CUR_H) as usize] = [
     0,0,0,0,0,2,1,1,2,0,0,0,
     0,0,0,0,0,0,2,2,0,0,0,0,
 ];
+
+// Pointing hand (hotspot near tip of index finger, top-leftish).
+#[rustfmt::skip]
+const CURSOR_HAND: [u8; (CUR_W * CUR_H) as usize] = [
+    0,0,0,2,2,0,0,0,0,0,0,0,
+    0,0,2,1,1,2,0,0,0,0,0,0,
+    0,0,2,1,1,2,0,0,0,0,0,0,
+    0,0,2,1,1,2,2,2,0,0,0,0,
+    0,0,2,1,1,2,1,1,2,0,0,0,
+    2,2,2,1,1,2,1,1,2,2,0,0,
+    2,1,1,1,1,1,1,1,1,1,2,0,
+    2,1,1,1,1,1,1,1,1,1,2,0,
+    2,1,1,1,1,1,1,1,1,1,2,0,
+    0,2,1,1,1,1,1,1,1,2,0,0,
+    0,2,1,1,1,1,1,1,1,2,0,0,
+    0,0,2,1,1,1,1,1,2,0,0,0,
+    0,0,2,1,1,1,1,1,2,0,0,0,
+    0,0,0,2,1,1,1,2,0,0,0,0,
+    0,0,0,2,1,1,1,2,0,0,0,0,
+    0,0,0,0,2,1,2,0,0,0,0,0,
+    0,0,0,0,2,1,2,0,0,0,0,0,
+    0,0,0,0,0,2,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,
+];
+
+// I-beam for text fields.
+#[rustfmt::skip]
+const CURSOR_IBEAM: [u8; (CUR_W * CUR_H) as usize] = [
+    2,2,2,0,0,2,2,2,0,0,0,0,
+    0,0,0,2,2,0,0,0,0,0,0,0,
+    0,0,0,0,2,0,0,0,0,0,0,0,
+    0,0,0,0,2,0,0,0,0,0,0,0,
+    0,0,0,0,2,0,0,0,0,0,0,0,
+    0,0,0,0,2,0,0,0,0,0,0,0,
+    0,0,0,0,2,0,0,0,0,0,0,0,
+    0,0,0,0,2,0,0,0,0,0,0,0,
+    0,0,0,0,2,0,0,0,0,0,0,0,
+    0,0,0,0,2,0,0,0,0,0,0,0,
+    0,0,0,0,2,0,0,0,0,0,0,0,
+    0,0,0,0,2,0,0,0,0,0,0,0,
+    0,0,0,0,2,0,0,0,0,0,0,0,
+    0,0,0,0,2,0,0,0,0,0,0,0,
+    0,0,0,0,2,0,0,0,0,0,0,0,
+    0,0,0,0,2,0,0,0,0,0,0,0,
+    0,0,0,2,2,2,0,0,0,0,0,0,
+    2,2,2,0,0,2,2,2,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,
+];
+
+// Hourglass-ish wait (loading).
+#[rustfmt::skip]
+const CURSOR_WAIT: [u8; (CUR_W * CUR_H) as usize] = [
+    2,2,2,2,2,2,2,2,0,0,0,0,
+    2,1,1,1,1,1,1,2,0,0,0,0,
+    0,2,1,1,1,1,2,0,0,0,0,0,
+    0,0,2,1,1,2,0,0,0,0,0,0,
+    0,0,0,2,2,0,0,0,0,0,0,0,
+    0,0,0,2,2,0,0,0,0,0,0,0,
+    0,0,2,1,1,2,0,0,0,0,0,0,
+    0,2,1,1,1,1,2,0,0,0,0,0,
+    2,1,1,1,1,1,1,2,0,0,0,0,
+    2,2,2,2,2,2,2,2,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,
+];
+
+fn cursor_sprite() -> &'static [u8; (CUR_W * CUR_H) as usize] {
+    match cursor_shape() {
+        CursorShape::Hand => &CURSOR_HAND,
+        CursorShape::IBeam => &CURSOR_IBEAM,
+        CursorShape::Wait => &CURSOR_WAIT,
+        CursorShape::Arrow => &CURSOR_ARROW,
+    }
+}
 
 /// What the right ("action") pane shows.
 #[derive(Clone, Copy, PartialEq)]
@@ -689,6 +797,8 @@ pub enum RightMode {
 pub const IMAGE_SURFACE: u32 = u32::MAX;
 /// Surface id the `/open` video player presents frames on (labelled "video").
 pub const VIDEO_SURFACE: u32 = u32::MAX - 1;
+/// Surface id the browser agent paints pages on (labelled "browser").
+pub const BROWSER_SURFACE: u32 = u32::MAX - 2;
 
 /// The short tab-bar label for a view.
 fn tab_label(m: RightMode) -> &'static str {
@@ -701,6 +811,7 @@ fn tab_label(m: RightMode) -> &'static str {
         RightMode::Audio => "audio",
         RightMode::Surface(IMAGE_SURFACE) => "image",
         RightMode::Surface(VIDEO_SURFACE) => "video",
+        RightMode::Surface(BROWSER_SURFACE) => "browser",
         RightMode::Surface(_) => "surface",
     }
 }
@@ -984,8 +1095,9 @@ impl Screen {
         }
     }
 
-    /// Save the framebuffer under the cursor and draw the arrow sprite.
+    /// Save the framebuffer under the cursor and draw the active shape sprite.
     fn cursor_draw(&mut self) {
+        let sprite = cursor_sprite();
         for dy in 0..CUR_H {
             for dx in 0..CUR_W {
                 self.cur_saved[(dy * CUR_W + dx) as usize] = self.get_pixel(self.cur_x + dx, self.cur_y + dy);
@@ -993,7 +1105,7 @@ impl Screen {
         }
         for dy in 0..CUR_H {
             for dx in 0..CUR_W {
-                match CURSOR[(dy * CUR_W + dx) as usize] {
+                match sprite[(dy * CUR_W + dx) as usize] {
                     1 => self.put_pixel(self.cur_x + dx, self.cur_y + dy, (15, 15, 17)),
                     2 => self.put_pixel(self.cur_x + dx, self.cur_y + dy, (245, 245, 248)),
                     _ => {}
@@ -2664,6 +2776,137 @@ pub fn draw_audio(v: &AudioView) {
     });
 }
 
+/// Overlay the **browser** control/status bar (same layout family as the video
+/// player HUD): title + URL, a scroll scrubber, and keyboard shortcut hints.
+/// Call *after* [`present_surface_reserve`] so the strip sits on the reserved
+/// bottom region. No-op unless the browser surface tab is active.
+pub fn draw_browser_status(
+    title: &str,
+    url: &str,
+    scroll_y: i32,
+    content_h: i32,
+    view_h: i32,
+    focused_input: bool,
+) {
+    SCREEN.with(|slot| {
+        let Some(sc) = slot else { return };
+        if sc.right != RightMode::Surface(BROWSER_SURFACE) {
+            return;
+        }
+        sc.cursor_restore();
+        sc.cur_vis = false;
+        let ch = sc.ch();
+        let cw = sc.cw();
+        let (px, py) = (sc.logs.ix, sc.logs.iy);
+        let (pw, ph) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
+        let bg = sc.logs.bg;
+        let barh = ch * 4 + ch / 2;
+        let by = py + ph.saturating_sub(barh);
+        sc.fill_rect(px, by, pw, barh, bg);
+        sc.fill_rect(px, by, pw, 1, sc.theme.accent); // top hairline
+        let cols = (pw / cw).saturating_sub(2).max(4) as usize;
+        let fit = |s: &str| crate::textsel::fit_width(s, cols);
+
+        let max_scroll = (content_h - view_h).max(0);
+        let scroll_pct = if max_scroll > 0 {
+            ((scroll_y as i64 * 100) / max_scroll as i64).clamp(0, 100) as u32
+        } else {
+            0
+        };
+        let mode = if focused_input { "input" } else { "nav" };
+        // Drop fields as the pane narrows (video HUD pattern).
+        let scroll_s = if max_scroll > 0 {
+            alloc::format!("scroll {}%  {}/{}", scroll_pct, scroll_y, max_scroll)
+        } else {
+            String::from("top")
+        };
+        let candidates = [
+            alloc::format!("{}  {}  {}  [{}]", title, url, scroll_s, mode),
+            alloc::format!("{}  {}  [{}]", title, scroll_s, mode),
+            alloc::format!("{}  {}", title, scroll_s),
+            alloc::format!(
+                "{}  {}",
+                crate::textsel::ellipsize(title, cols.saturating_sub(12).max(4)),
+                scroll_s
+            ),
+            crate::textsel::ellipsize(title, cols),
+        ];
+        let line1 = candidates
+            .into_iter()
+            .find(|s| s.chars().count() <= cols)
+            .unwrap_or_else(|| crate::textsel::ellipsize(title, cols));
+        let mut y = by + ch / 3;
+        sc.draw_str_bg(px + cw, y, &fit(&line1), sc.theme.accent, bg);
+        y += ch + ch / 4;
+
+        // Scroll scrubber (full-width track, filled = position).
+        let track_x = px + cw;
+        let track_w = pw.saturating_sub(2 * cw);
+        let filled = if max_scroll > 0 {
+            (track_w * scroll_y as u64 / max_scroll as u64).min(track_w)
+        } else {
+            0
+        };
+        sc.fill_rect(track_x, y + ch / 3, track_w, ch / 4, sc.theme.title_dim);
+        sc.fill_rect(track_x, y + ch / 3, filled, ch / 4, sc.theme.accent);
+        y += ch + ch / 4;
+
+        // Shortcut hints — wrap like the video player.
+        let hints = if focused_input {
+            [
+                "type text",
+                "Bksp erase",
+                "Tab next",
+                "Enter submit",
+                "Esc unfocus",
+                "wheel scroll",
+            ]
+        } else {
+            [
+                "j/k scroll",
+                "space page",
+                "wheel scroll",
+                "b back",
+                "r reload",
+                "click link/form",
+            ]
+        };
+        let sep = "   ";
+        let mut linebuf = String::new();
+        let hud_bottom = py + ph;
+        for h in hints {
+            if h.chars().count() > cols {
+                continue;
+            }
+            let cand = if linebuf.is_empty() {
+                String::from(h)
+            } else {
+                alloc::format!("{}{}{}", linebuf, sep, h)
+            };
+            if cand.chars().count() > cols && !linebuf.is_empty() {
+                if y + ch > hud_bottom {
+                    break;
+                }
+                sc.draw_str_bg(px + cw, y, &fit(&linebuf), sc.theme.logs_fg, bg);
+                y += ch;
+                linebuf = String::from(h);
+            } else {
+                linebuf = cand;
+            }
+        }
+        if !linebuf.is_empty() && y + ch <= hud_bottom + ch {
+            sc.draw_str_bg(px + cw, y, &fit(&linebuf), sc.theme.logs_fg, bg);
+        }
+        let _ = url; // included in line1 when the pane is wide enough
+        sc.cursor_overlay();
+    });
+}
+
+/// Height in px the browser HUD reserves (same formula as the video player).
+pub fn browser_hud_height() -> u64 {
+    video_hud_height()
+}
+
 /// Overlay the video player's control/status bar along the bottom of the video
 /// surface pane: playback state, mm:ss / mm:ss, frame counter, mute, a scrubber,
 /// and the key-shortcut hints. Drawn *after* the frame blit (present_surface
@@ -3815,6 +4058,8 @@ pub fn present_surface(id: u32, sw: usize, sh: usize, buf: &[u32]) {
 /// to keep its control HUD in a fixed strip that the per-frame blit doesn't
 /// repaint (so the HUD updates in place instead of flickering under it).
 pub fn present_surface_reserve(id: u32, sw: usize, sh: usize, buf: &[u32], reserve_bottom: u64) {
+    remember_surf_dim(id, sw, sh);
+    remember_surf_reserve(id, reserve_bottom);
     SCREEN.with(|slot| {
         // Open (or focus) this surface's tab, then paint over its cleared
         // interior. Idempotent: re-presenting the active surface tab is cheap.
@@ -4378,10 +4623,32 @@ pub fn focus_set(action: bool) {
 
 /// Which pane a click at `(x, y)` landed in: `Some(true)` = action pane,
 /// `Some(false)` = chat pane, `None` = neither (status bar / margins).
-/// Map a screen click into the active surface's logical coordinates
-/// (`synapse::ui` SURF_W×SURF_H), accounting for letterboxing. `None` if the
-/// action pane is not showing a surface or the click is outside the painted
-/// frame.
+/// Last presented surface dimensions (logical sw×sh) so hit-testing matches
+/// the aspect-fit used by [`present_surface_reserve`] (browser is 640×400,
+/// chess/ui is 256×192, etc.).
+static LAST_SURF_DIM: crate::mm::Locked<alloc::collections::BTreeMap<u32, (usize, usize)>> =
+    crate::mm::Locked::new(alloc::collections::BTreeMap::new());
+
+/// Bottom HUD reserve (px) last used with [`present_surface_reserve`] per surface.
+static LAST_SURF_RESERVE: crate::mm::Locked<alloc::collections::BTreeMap<u32, u64>> =
+    crate::mm::Locked::new(alloc::collections::BTreeMap::new());
+
+fn remember_surf_dim(id: u32, sw: usize, sh: usize) {
+    LAST_SURF_DIM.with(|m| {
+        m.insert(id, (sw, sh));
+    });
+}
+
+fn remember_surf_reserve(id: u32, reserve_bottom: u64) {
+    LAST_SURF_RESERVE.with(|m| {
+        m.insert(id, reserve_bottom);
+    });
+}
+
+/// Map a screen click into the active surface's logical coordinates,
+/// accounting for letterboxing. Uses the last presented size for that surface
+/// id (defaults to 256×192 for Synapse UI boards). `None` if the action pane
+/// is not showing a surface or the click is outside the painted frame.
 pub fn surface_hit(mx: u64, my: u64) -> Option<(u32, u16, u16)> {
     SCREEN.with(|slot| {
         let sc = slot.as_ref()?;
@@ -4390,12 +4657,24 @@ pub fn surface_hit(mx: u64, my: u64) -> Option<(u32, u16, u16)> {
             _ => return None,
         };
         let (px, py) = (sc.logs.ix, sc.logs.iy);
-        let (pw, ph) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
+        let (pw, ph_full) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
+        // Exclude the HUD strip (video / browser) so clicks there are not mapped
+        // into content coordinates — same usable height as present_surface_reserve.
+        let reserve = LAST_SURF_RESERVE.with(|m| m.get(&id).copied().unwrap_or(0));
+        let ph = ph_full.saturating_sub(reserve);
         if pw == 0 || ph == 0 || mx < px || my < py || mx >= px + pw || my >= py + ph {
             return None;
         }
-        // Same aspect-fit as present_surface (sw=256, sh=192).
-        let (sw, sh) = (256u64, 192u64);
+        let (sw, sh) = LAST_SURF_DIM.with(|m| {
+            m.get(&id)
+                .copied()
+                .unwrap_or((256, 192))
+        });
+        let (sw, sh) = (sw as u64, sh as u64);
+        if sw == 0 || sh == 0 {
+            return None;
+        }
+        // Same aspect-fit as present_surface_reserve.
         let (dw, dh) = {
             let fit_w = pw;
             let fit_h = sh.saturating_mul(pw).saturating_div(sw).max(1);

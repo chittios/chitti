@@ -63,6 +63,13 @@ pub mod webpki;
 mod asynch;
 pub use asynch::*;
 
+// ChittiOS: re-export the types an out-of-crate `TlsVerifier` needs to run its
+// own certificate-chain validation (the kernel's `net::x509`, built on
+// RustCrypto — no ring). Upstream keeps its only verifier in-crate.
+pub use extensions::extension_data::signature_algorithms::SignatureScheme;
+pub use handshake::certificate::{CertificateEntryRef, CertificateRef};
+pub use handshake::certificate_verify::CertificateVerify;
+
 #[derive(Debug, Copy, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum TlsError {

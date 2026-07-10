@@ -99,6 +99,16 @@ rand_chacha = { version = "0.3", default-features = false }
 # path only (no RNG needed), same curve family the TLS client already uses.
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "alloc"] }
 sha2 = { version = "0.10", default-features = false }
+# X.509 certificate-chain validation for the TLS trust store (net::x509 +
+# net::ca_roots). All pure-Rust no_std RustCrypto — same der/spki 0.7 +
+# elliptic-curve 0.13 generation as p256, so no version split, and NO ring
+# (which can't build bare-metal — the reason NoVerify shipped). RSA signature
+# verification is done on `crypto-bigint` (already pulled by p256) rather than
+# the heavier `rsa`/`num-bigint-dig` stack.
+p384 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+x509-cert = { version = "0.2", default-features = false }
+const-oid = { version = "0.9", default-features = false }
+crypto-bigint = { version = "0.5", default-features = false, features = ["alloc"] }
 
 # Pure-Rust H.264 Main/High (+ CABAC) decoder — vendored and no_std-patched.
 # Primary video path; our hand-rolled CAVLC/CABAC remains as fallback.
@@ -109,3 +119,13 @@ rust_h264 = { path = "../third_party/rust_h264", default-features = false }
 # Effects only via host imports (W2+); guest is below the determinism boundary.
 # MIT/Apache-2.0 — see THIRDPARTY-LICENSES.md.
 wasmi = { version = "0.40", default-features = false }
+
+# Pull-based HTML/XML tokenizer for the browser agent (`browser::html`).
+# Pure Rust, zero deps, no_std via default-features = false. MIT OR Apache-2.0.
+# We build the DOM / layout ourselves; this only yields tokens.
+htmlparser = { version = "0.2", default-features = false }
+
+# TrueType/OpenType runtime rasterizer for the browser (and future UI).
+# no_std + alloc via hashbrown (not std HashMap). Ships Geist Mono bytes via
+# include_bytes! from assets/GeistMono-Regular.ttf. MIT OR Apache-2.0 OR Zlib.
+fontdue = { version = "0.9", default-features = false, features = ["hashbrown"] }

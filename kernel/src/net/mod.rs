@@ -54,9 +54,13 @@ const LOOPBACK_POLL_ROUNDS: usize = 32;
 /// Adapts a [`NetDevice`] to smoltcp's `phy::Device`. `receive` copies the frame
 /// into an owned token (so the returned TX token can borrow the device);
 /// `transmit` fills a scratch buffer the closure writes, then hands it to the NIC.
+pub mod ca_roots;
+pub mod hashes;
 pub mod http;
+pub mod rsa;
 pub mod tls;
 pub mod ws;
+pub mod x509;
 
 pub struct ChittiPhy {
     dev: Box<dyn NetDevice>,

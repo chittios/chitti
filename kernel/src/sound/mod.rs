@@ -95,6 +95,13 @@ pub trait SndDevice {
     /// [`resample`] to the device's fixed rate. Callers pass 16 kHz (mic/test
     /// tones) *and* 24 kHz (KittenTTS).
     fn play(&mut self, pcm: &[i16], hz: u32) -> Result<(), &'static str>;
+    /// How many PCM **bytes** [`Self::play`] can currently enqueue without
+    /// blocking (free device periods). 0 = unknown/none — callers that need a
+    /// non-blocking feed (the chunked-TTS speech pump) then only refill when
+    /// the queue has fully drained. Default keeps legacy drivers working.
+    fn out_free_bytes(&mut self) -> usize {
+        0
+    }
     /// True while queued playback is still draining.
     fn playing(&mut self) -> bool;
     /// Start the capture stream at `hz` (idempotent).
@@ -247,6 +254,13 @@ pub fn play(pcm: &[i16], hz: u32) -> Result<(), &'static str> {
 /// True while playback is draining. Poll this (with `sched::yield_now`) to wait.
 pub fn playing() -> bool {
     SND.with(|s| s.as_mut().map(|d| d.playing()).unwrap_or(false))
+}
+
+/// PCM bytes [`play`] can enqueue right now without blocking (0 when unknown —
+/// see [`SndDevice::out_free_bytes`]). The chunked-TTS speech pump uses this to
+/// keep the device fed from `ui_tick` while synthesis runs on the SMP fleet.
+pub fn out_free_bytes() -> usize {
+    SND.with(|s| s.as_mut().map(|d| d.out_free_bytes()).unwrap_or(0))
 }
 
 /// Start capturing at `hz`.

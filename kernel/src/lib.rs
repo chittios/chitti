@@ -23,6 +23,7 @@ pub mod agent;
 pub mod arch;
 pub mod audio;
 pub mod block;
+pub mod browser;
 pub mod cap;
 pub mod channel;
 pub mod clipboard;
@@ -80,6 +81,9 @@ pub mod editor;
 // The Geist Mono glyph atlas the framebuffer console renders with (data-only).
 #[cfg(not(test))]
 pub mod font_geist;
+// Runtime TTF/OTF (fontdue) — browser paint + optional UI faces. Available
+// under test so browser unit tests exercise real glyph rasterization.
+pub mod font_ttf;
 
 // --- Limine requests (x86_64 boot only) ------------------------------
 //
