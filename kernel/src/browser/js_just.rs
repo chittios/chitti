@@ -43,6 +43,7 @@ pub fn eval_program(src: &str) -> Result<JsEval, String> {
 
     let mut ctx = EvalContext::new();
     ctx.install_core_builtins(BuiltInRegistry::with_core());
+    just_engine::runner::eval::statement::hoist_var_declarations(&ast.body, &mut ctx);
 
     let mut last = JsValue::Undefined;
     for stmt in &ast.body {
@@ -1069,6 +1070,7 @@ pub fn run_scripts_via_just(dom: &mut JsDom, scripts: &[String]) -> bool {
     ctx.add_resolver(alloc::boxed::Box::new(DomResolver::new(shared.clone())));
 
     for ast in &asts {
+        just_engine::runner::eval::statement::hoist_var_declarations(&ast.body, &mut ctx);
         for stmt in &ast.body {
             if execute_statement(stmt, &mut ctx).is_err() {
                 break;

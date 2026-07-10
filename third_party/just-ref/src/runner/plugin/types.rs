@@ -354,7 +354,15 @@ impl EvalContext {
 
         if !self.strict {
             let env = self.var_env.clone();
-            self.set_binding_in_env(&env, &name_string, value)?;
+            let exists = env.borrow().inner.as_env_record().has_binding(&name_string);
+            if exists {
+                self.set_binding_in_env(&env, &name_string, value)?;
+            } else {
+                let mut b = env.borrow_mut();
+                let rec = b.inner.as_env_record_mut();
+                rec.create_mutable_binding(name_string.clone(), true)?;
+                rec.initialize_binding(&mut self.ctx_stack, name_string.clone(), value)?;
+            }
             return Ok(env);
         }
 
@@ -384,9 +392,19 @@ impl EvalContext {
             current_env = env.borrow().outer.clone();
         }
 
-        // If not found and not strict, create in global (var behavior)
+        // If not found and not strict, create an implicit global (sloppy-mode
+        // `y = 1` at global scope creates a global property). The binding does
+        // not yet exist, so create + initialize it rather than
+        // `set_mutable_binding` (which requires an existing binding).
         if !self.strict {
-            return self.set_binding_in_env(&self.var_env.clone(), name, value);
+            let env = self.var_env.clone();
+            {
+                let mut b = env.borrow_mut();
+                let rec = b.inner.as_env_record_mut();
+                rec.create_mutable_binding(name.clone(), true)?;
+                rec.initialize_binding(&mut self.ctx_stack, name.clone(), value)?;
+            }
+            return Ok(());
         }
 
         Err(JErrorType::ReferenceError(format!("{} is not defined", name)))

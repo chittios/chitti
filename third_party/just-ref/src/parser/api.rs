@@ -468,7 +468,10 @@ fn build_ast_from_generator_declaration_or_generator_expression(
     let mut pair_iter = pair.into_inner();
     let first_pair = pair_iter.next().unwrap();
     let (f_name, mut s, formal_parameters_pair) =
-        if first_pair.as_rule() == Rule::binding_identifier {
+        if matches!(
+            first_pair.as_rule(),
+            Rule::binding_identifier | Rule::binding_identifier__yield
+        ) {
             let (bi, mut bi_s) = get_binding_identifier_data(first_pair, script)?;
             if !is_generator_declaration {
                 // In case of generator_expression we ignore the binding_identifier
@@ -665,7 +668,21 @@ fn build_ast_from_function_body(
     script: &Rc<String>,
 ) -> Result<(FunctionBodyData, Semantics), JsRuleError> {
     let meta = get_meta(&pair, script);
-    let statement_list_pair = pair.into_inner().next().unwrap();
+    // An empty function body (`function f(){}`) produces no `statement_list`
+    // pair (the grammar's `statement_list?` is absent), so `next()` is `None`.
+    // Return an empty body rather than panicking.
+    let statement_list_pair = match pair.into_inner().next() {
+        Some(p) => p,
+        None => {
+            return Ok((
+                FunctionBodyData {
+                    meta,
+                    body: Vec::new(),
+                },
+                Semantics::new_empty(),
+            ));
+        }
+    };
     let statement_list_meta = get_meta(&statement_list_pair, script);
     let (statements, statements_s) = build_ast_from_statement_list(statement_list_pair, script)?;
     if statements_s.contains_unpaired_continue.is_true() {
@@ -721,7 +738,13 @@ fn build_ast_from_statement(
         Rule::with_statement
         | Rule::with_statement__yield
         | Rule::with_statement__return
-        | Rule::with_statement__yield_return => unimplemented!(),
+        | Rule::with_statement__yield_return => {
+            return Err(get_validation_error_with_meta(
+                "'with' statement is not supported".to_string(),
+                AstBuilderValidationErrorType::SyntaxError,
+                meta,
+            ));
+        }
         Rule::try_statement
         | Rule::try_statement__yield
         | Rule::try_statement__return
@@ -1851,7 +1874,12 @@ fn build_ast_from_single_name_binding(
     let (b, s) = get_binding_identifier_data(inner_iter.next().unwrap(), script)?;
     let id = Box::new(ExpressionPatternType::Identifier(b).convert_to_pattern());
     Ok(if let Some(initializer) = inner_iter.next() {
-        let (a, _a_s) = build_ast_from_assignment_expression(initializer, script)?;
+        // `initializer` is the `= AssignmentExpression` rule; descend to the
+        // inner assignment_expression (as the sibling binding builders do).
+        let (a, _a_s) = build_ast_from_assignment_expression(
+            initializer.into_inner().next().unwrap(),
+            script,
+        )?;
         // s.merge(a_s); bound_names from s is only used
         (
             VariableDeclaratorData {
@@ -3097,6 +3125,17 @@ fn build_ast_from_primary_expression(
                 Some(i) => (inner[..i].to_string(), inner[i + 1..].to_string()),
                 None => (inner.to_string(), String::new()),
             };
+            // Parse-phase syntax validation for named group specifiers
+            // `(?<name>…)` and named backreferences `\k<name>` (a `SyntaxError`
+            // in the spec). Gated to patterns that actually use these
+            // constructs, so ordinary regexes are never rejected.
+            if let Err(msg) = validate_regexp_named_groups(&pattern, &flags) {
+                return Err(get_validation_error_with_meta(
+                    msg,
+                    AstBuilderValidationErrorType::SyntaxError,
+                    meta,
+                ));
+            }
             (
                 ExpressionType::Literal(LiteralData {
                     meta,
@@ -3124,6 +3163,219 @@ fn build_ast_from_primary_expression(
             ))
         }
     })
+}
+
+/// Validate the named-group syntax of a regular-expression pattern at parse
+/// time. Returns `Err` for the `SyntaxError` cases the spec mandates for
+/// `GroupSpecifier` `(?<name>…)` and named backreferences `\k<name>`:
+/// empty/duplicate/ill-formed group names, unterminated `(?<…`, and — when the
+/// pattern uses named groups or the `u` flag — a `\k` that is not a well-formed
+/// reference to a declared name. Patterns without these constructs always pass,
+/// so ordinary regexes are unaffected.
+fn validate_regexp_named_groups(pattern: &str, flags: &str) -> Result<(), String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let unicode = flags.contains('u') || flags.contains('v');
+
+    // A valid group-name start / continue code point. `\u`-escapes are accepted
+    // optimistically (a stricter check would decode them).
+    fn is_name_start(c: char) -> bool {
+        c == '$' || c == '_' || c.is_alphabetic()
+    }
+    fn is_name_continue(c: char) -> bool {
+        c == '$' || c == '_' || c == '\u{200C}' || c == '\u{200D}' || c.is_alphanumeric()
+    }
+
+    // Decode a unicode escape whose leading `\u` has already been consumed;
+    // `*i` points at `{` or the first of four hex digits. Handles `\u{HHHH}`
+    // (with range check) and `\uHHHH`, combining a high+low surrogate pair into
+    // its astral code point. Advances `*i` past the escape.
+    fn read_unicode_escape(chars: &[char], i: &mut usize) -> Result<u32, String> {
+        fn hex4(chars: &[char], i: &mut usize) -> Result<u32, String> {
+            let mut v = 0u32;
+            for _ in 0..4 {
+                let d = chars
+                    .get(*i)
+                    .and_then(|c| c.to_digit(16))
+                    .ok_or_else(|| "Invalid unicode escape".to_string())?;
+                v = v * 16 + d;
+                *i += 1;
+            }
+            Ok(v)
+        }
+        if chars.get(*i) == Some(&'{') {
+            *i += 1;
+            let mut v = 0u32;
+            let mut any = false;
+            while let Some(&c) = chars.get(*i) {
+                if c == '}' {
+                    break;
+                }
+                let d = c.to_digit(16).ok_or_else(|| "Invalid unicode escape".to_string())?;
+                v = v * 16 + d;
+                any = true;
+                if v > 0x10_FFFF {
+                    return Err("Code point out of range".to_string());
+                }
+                *i += 1;
+            }
+            if !any || chars.get(*i) != Some(&'}') {
+                return Err("Invalid unicode escape".to_string());
+            }
+            *i += 1;
+            return Ok(v);
+        }
+        let hi = hex4(chars, i)?;
+        // Combine a surrogate pair `\uD800-DBFF \uDC00-DFFF`.
+        if (0xD800..=0xDBFF).contains(&hi)
+            && chars.get(*i) == Some(&'\\')
+            && chars.get(*i + 1) == Some(&'u')
+        {
+            let save = *i;
+            *i += 2;
+            let lo = hex4(chars, i)?;
+            if (0xDC00..=0xDFFF).contains(&lo) {
+                return Ok(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
+            }
+            *i = save; // not a valid low surrogate; leave the lone (invalid) hi
+        }
+        Ok(hi)
+    }
+
+    // Read a `(?<name>` specifier starting just after `(?<`. Returns the name.
+    // `i` points at the first char of the name; on success it is advanced past
+    // the closing `>`.
+    fn read_group_name(chars: &[char], i: &mut usize) -> Result<String, String> {
+        let mut name = String::new();
+        let mut first = true;
+        loop {
+            match chars.get(*i) {
+                None => return Err("Unterminated named group".to_string()),
+                Some('>') => {
+                    *i += 1;
+                    break;
+                }
+                Some('\\') => {
+                    // Only `\u` escapes are legal within a group name, and the
+                    // decoded code point must itself be a valid identifier
+                    // start/continue char.
+                    if chars.get(*i + 1) != Some(&'u') {
+                        return Err("Invalid escape in group name".to_string());
+                    }
+                    *i += 2;
+                    let cp = read_unicode_escape(chars, i)?;
+                    let c = char::from_u32(cp).ok_or_else(|| "Invalid code point".to_string())?;
+                    if first {
+                        if !is_name_start(c) {
+                            return Err("Invalid group name start".to_string());
+                        }
+                        first = false;
+                    } else if !is_name_continue(c) {
+                        return Err("Invalid group name character".to_string());
+                    }
+                    name.push(c);
+                    continue;
+                }
+                Some(&c) => {
+                    if first {
+                        if !is_name_start(c) {
+                            return Err("Invalid group name start".to_string());
+                        }
+                        first = false;
+                    } else if !is_name_continue(c) {
+                        return Err("Invalid group name character".to_string());
+                    }
+                    name.push(c);
+                    *i += 1;
+                }
+            }
+        }
+        if name.is_empty() {
+            return Err("Empty group name".to_string());
+        }
+        Ok(name)
+    }
+
+    // Pass 1: collect + validate declared group names.
+    let mut declared: Vec<String> = Vec::new();
+    let mut in_class = false;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            i += 2; // skip escaped char
+            continue;
+        }
+        if in_class {
+            if c == ']' {
+                in_class = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '[' {
+            in_class = true;
+            i += 1;
+            continue;
+        }
+        // `(?<` group specifier — but not lookbehind `(?<=` / `(?<!`.
+        if c == '('
+            && chars.get(i + 1) == Some(&'?')
+            && chars.get(i + 2) == Some(&'<')
+            && !matches!(chars.get(i + 3), Some('=') | Some('!'))
+        {
+            i += 3;
+            let name = read_group_name(&chars, &mut i)?;
+            if declared.contains(&name) {
+                return Err(format!("Duplicate regexp group name '{}'", name));
+            }
+            declared.push(name);
+            continue;
+        }
+        i += 1;
+    }
+
+    let has_named = !declared.is_empty();
+
+    // Pass 2: validate `\k<name>` backreferences. In a pattern with named
+    // groups (or under the `u` flag) `\k` MUST be a reference to a declared
+    // name; otherwise it is a legacy identity escape and is left alone.
+    if has_named || unicode {
+        let mut in_class = false;
+        let mut i = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\\' {
+                if chars.get(i + 1) == Some(&'k') {
+                    let mut j = i + 2;
+                    if chars.get(j) != Some(&'<') {
+                        return Err("\\k not followed by <name>".to_string());
+                    }
+                    j += 1;
+                    let name = read_group_name(&chars, &mut j)?;
+                    if !declared.contains(&name) {
+                        return Err(format!("Reference to undeclared group name '{}'", name));
+                    }
+                    i = j;
+                    continue;
+                }
+                i += 2;
+                continue;
+            }
+            if in_class {
+                if c == ']' {
+                    in_class = false;
+                }
+                i += 1;
+                continue;
+            }
+            if c == '[' {
+                in_class = true;
+            }
+            i += 1;
+        }
+    }
+
+    Ok(())
 }
 
 fn build_ast_from_cover_parenthesized_expression_and_arrow_parameter_list(
@@ -3429,28 +3681,49 @@ fn build_ast_str_unsigned_decimal_literal(
 }
 
 fn get_ast_for_binary_integer_literal(pair: Pair<Rule>) -> NumberLiteralType {
-    NumberLiteralType::IntegerLiteral(isize::from_str_radix(&pair.as_str()[2..], 2).unwrap() as i64)
+    let s = pair.as_str()[2..].replace('_', "");
+    NumberLiteralType::IntegerLiteral(i64::from_str_radix(&s, 2).unwrap_or(i64::MAX))
 }
 
 fn get_ast_for_octal_integer_literal(pair: Pair<Rule>) -> NumberLiteralType {
-    NumberLiteralType::IntegerLiteral(isize::from_str_radix(&pair.as_str()[2..], 8).unwrap() as i64)
+    let s = pair.as_str()[2..].replace('_', "");
+    NumberLiteralType::IntegerLiteral(i64::from_str_radix(&s, 8).unwrap_or(i64::MAX))
 }
 
 fn get_ast_for_hex_integer_literal(pair: Pair<Rule>) -> NumberLiteralType {
-    NumberLiteralType::IntegerLiteral(isize::from_str_radix(&pair.as_str()[2..], 16).unwrap() as i64)
+    let s = pair.as_str()[2..].replace('_', "");
+    NumberLiteralType::IntegerLiteral(i64::from_str_radix(&s, 16).unwrap_or(i64::MAX))
 }
 
 fn parse_decimal_integer_literal(decimal_pair: Pair<Rule>) -> f64 {
-    isize::from_str_radix(decimal_pair.as_str(), 10).unwrap() as f64
+    // Strip `_` numeric separators before parsing.
+    let s = decimal_pair.as_str().replace('_', "");
+    // Literals larger than `isize` (e.g. 1e21 written out, or long digit runs)
+    // must not overflow — fall back to lossy `f64` parsing, matching JS number
+    // semantics where all numbers are doubles anyway.
+    match isize::from_str_radix(&s, 10) {
+        Ok(v) => v as f64,
+        Err(_) => s.parse::<f64>().unwrap_or(f64::INFINITY),
+    }
 }
 
 fn parse_decimal_digits(decimal_pair: Pair<Rule>) -> f64 {
-    let d = decimal_pair.as_str();
-    isize::from_str_radix(d, 10).unwrap() as f64 / 10_f64.powf(d.len() as f64)
+    let d = decimal_pair.as_str().replace('_', "");
+    // Long fractional digit runs overflow `isize`; parse as f64 directly.
+    let mantissa = match isize::from_str_radix(&d, 10) {
+        Ok(v) => v as f64,
+        Err(_) => d.parse::<f64>().unwrap_or(0.0),
+    };
+    mantissa / 10_f64.powf(d.len() as f64)
 }
 
 fn parse_exponent_part(decimal_pair: Pair<Rule>) -> f64 {
-    10_f64.powf(isize::from_str_radix(&decimal_pair.as_str()[1..], 10).unwrap() as f64)
+    let e = decimal_pair.as_str()[1..].replace('_', "");
+    let exp = match isize::from_str_radix(&e, 10) {
+        Ok(v) => v as f64,
+        Err(_) => e.parse::<f64>().unwrap_or(0.0),
+    };
+    10_f64.powf(exp)
 }
 
 fn build_ast_decimal_literal(pair: Pair<Rule>) -> Result<NumberLiteralType, JsRuleError> {

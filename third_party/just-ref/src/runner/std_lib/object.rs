@@ -224,12 +224,12 @@ fn object_get_own_property_descriptor(
         Some(other) => crate::runner::eval::expression::value_to_property_key(other),
         None => return Ok(JsValue::Undefined),
     };
-    match crate::runner::eval::expression::get_own_prop_value(&target, &key) {
-        Some(v) => Ok(make_object(alloc::vec![
+    match crate::runner::eval::expression::get_own_prop_descriptor(&target, &key) {
+        Some((v, writable, enumerable, configurable)) => Ok(make_object(alloc::vec![
             ("value".to_string(), v),
-            ("writable".to_string(), JsValue::Boolean(true)),
-            ("enumerable".to_string(), JsValue::Boolean(true)),
-            ("configurable".to_string(), JsValue::Boolean(true)),
+            ("writable".to_string(), JsValue::Boolean(writable)),
+            ("enumerable".to_string(), JsValue::Boolean(enumerable)),
+            ("configurable".to_string(), JsValue::Boolean(configurable)),
         ])),
         None => Ok(JsValue::Undefined),
     }

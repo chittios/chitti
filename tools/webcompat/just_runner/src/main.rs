@@ -28,15 +28,38 @@ fn main() -> ExitCode {
     }
     files.sort();
     // Quiet per-file panics so one malformed/unsupported input can't abort the
-    // whole run; we isolate and count them below.
-    std::panic::set_hook(Box::new(|_| {}));
+    // whole run; we isolate and count them below. Capture the panic message
+    // into a thread-local so the outcome can report it (JUST_VERBOSE=1).
+    use std::cell::RefCell;
+    thread_local! { static LAST_PANIC: RefCell<String> = RefCell::new(String::new()); }
+    let verbose = std::env::var("JUST_VERBOSE").is_ok();
+    std::panic::set_hook(Box::new(|info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "?".into());
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        LAST_PANIC.with(|c| *c.borrow_mut() = format!("{loc} {msg}"));
+    }));
     let mut pass = 0usize;
     let mut fail = 0usize;
     let mut skip = 0usize;
     let mut panics = 0usize;
     for f in &files {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_one(f)))
-            .unwrap_or_else(|_| Outcome::Fail("panic".into()));
+            .unwrap_or_else(|_| {
+                let m = if verbose {
+                    LAST_PANIC.with(|c| c.borrow().clone())
+                } else {
+                    String::new()
+                };
+                Outcome::Fail(if m.is_empty() { "panic".into() } else { format!("panic @ {m}") })
+            });
         match outcome {
             Outcome::Pass => {
                 pass += 1;
@@ -44,7 +67,7 @@ fn main() -> ExitCode {
             }
             Outcome::Fail(msg) => {
                 fail += 1;
-                if msg == "panic" {
+                if msg == "panic" || msg.starts_with("panic @") {
                     panics += 1;
                 }
                 println!("FAIL {} — {msg}", f.display());
@@ -94,6 +117,8 @@ struct Meta {
     module: bool,
     raw: bool,
     needs_async_harness: bool,
+    only_strict: bool,
+    no_strict: bool,
 }
 
 fn parse_meta(src: &str) -> Meta {
@@ -107,6 +132,8 @@ fn parse_meta(src: &str) -> Meta {
                 m.module = line.contains("module");
                 m.raw = line.contains("raw");
                 m.needs_async_harness = line.contains("async");
+                m.only_strict = line.contains("onlyStrict");
+                m.no_strict = line.contains("noStrict") || line.contains("raw");
             }
         }
     }
@@ -140,12 +167,12 @@ var assert = function (cond, msg) {
   if (!cond) { throw new Test262Error(msg || "assert failed"); }
 };
 assert.sameValue = function (actual, expected, msg) {
-  if (actual !== expected) {
+  if (!assert._isSameValue(actual, expected)) {
     throw new Test262Error((msg || "") + " expected " + expected + " got " + actual);
   }
 };
 assert.notSameValue = function (actual, unexpected, msg) {
-  if (actual === unexpected) {
+  if (assert._isSameValue(actual, unexpected)) {
     throw new Test262Error((msg || "") + " got unexpected " + unexpected);
   }
 };
@@ -158,10 +185,110 @@ assert._isSameValue = function (a, b) {
   if (a === b) { return a !== 0 || 1 / a === 1 / b; }
   return a !== a && b !== b;
 };
+
+// --- test262 harness includes (propertyHelper.js / compareArray.js / sta.js /
+// testTypedArray-free subset) that many tests declare via `includes:` ---
+var $MAX_ITERATIONS = 100000;
+var $262 = {
+  global: this,
+  evalScript: function (src) { return eval(src); },
+  detachArrayBuffer: function () {},
+  createRealm: function () { return $262; },
+  agent: {}
+};
+function compareArray(a, b) {
+  if (a === null || b === null) { return a === b; }
+  if (a.length !== b.length) { return false; }
+  for (var i = 0; i < a.length; i++) {
+    if (!assert._isSameValue(a[i], b[i])) { return false; }
+  }
+  return true;
+}
+compareArray.isSameValue = assert._isSameValue;
+assert.compareArray = function (actual, expected, msg) {
+  assert(compareArray(actual, expected),
+    (msg || "") + " arrays differ: expected " + expected + " got " + actual);
+};
+function verifyProperty(obj, name, desc, options) {
+  var d = Object.getOwnPropertyDescriptor(obj, name);
+  if (d === undefined) {
+    throw new Test262Error("property " + String(name) + " does not exist");
+  }
+  if (desc === undefined) { return true; }
+  if ("value" in desc) {
+    assert.sameValue(d.value, desc.value, "value of " + String(name));
+  }
+  if ("writable" in desc) {
+    assert.sameValue(d.writable, desc.writable, "writable of " + String(name));
+  }
+  if ("enumerable" in desc) {
+    assert.sameValue(d.enumerable, desc.enumerable, "enumerable of " + String(name));
+  }
+  if ("configurable" in desc) {
+    assert.sameValue(d.configurable, desc.configurable, "configurable of " + String(name));
+  }
+  return true;
+}
+// Older-style aliases still used by some tests.
+function verifyEqualTo(obj, name, value) {
+  assert.sameValue(obj[name], value, "value of " + String(name));
+}
+function verifyWritable(obj, name) {
+  var d = Object.getOwnPropertyDescriptor(obj, name);
+  assert(d && d.writable, String(name) + " should be writable");
+}
+function verifyNotWritable(obj, name) {
+  var d = Object.getOwnPropertyDescriptor(obj, name);
+  assert(d && !d.writable, String(name) + " should be non-writable");
+}
+function verifyEnumerable(obj, name) {
+  var d = Object.getOwnPropertyDescriptor(obj, name);
+  assert(d && d.enumerable, String(name) + " should be enumerable");
+}
+function verifyNotEnumerable(obj, name) {
+  var d = Object.getOwnPropertyDescriptor(obj, name);
+  assert(d && !d.enumerable, String(name) + " should be non-enumerable");
+}
+function verifyConfigurable(obj, name) {
+  var d = Object.getOwnPropertyDescriptor(obj, name);
+  assert(d && d.configurable, String(name) + " should be configurable");
+}
+function verifyNotConfigurable(obj, name) {
+  var d = Object.getOwnPropertyDescriptor(obj, name);
+  assert(d && !d.configurable, String(name) + " should be non-configurable");
+}
 "#;
 
     // Prefer harness-style tests that use assert; leave throw Test262Error as-is.
     Ok(format!("{preamble}\n{s}\n"))
+}
+
+/// Render a thrown error into a readable one-liner, extracting `.name`/
+/// `.message` from thrown Error-like objects so assertion failures are legible.
+fn describe_error(e: &just_engine::runner::ds::error::JErrorType) -> String {
+    use just_engine::runner::ds::error::JErrorType;
+    use just_engine::runner::eval::expression::get_own_prop_value;
+    match e {
+        JErrorType::ReferenceError(m) => format!("ReferenceError({m:?})"),
+        JErrorType::TypeError(m) => format!("TypeError({m:?})"),
+        JErrorType::RangeError(m) => format!("RangeError({m:?})"),
+        JErrorType::SyntaxError(m) => format!("SyntaxError({m:?})"),
+        JErrorType::YieldValue(_) => "YieldValue".to_string(),
+        JErrorType::Thrown(v) => {
+            let name = match get_own_prop_value(v, "name") {
+                Some(JsValue::String(s)) => s,
+                _ => "Thrown".to_string(),
+            };
+            let msg = match get_own_prop_value(v, "message") {
+                Some(JsValue::String(s)) => s,
+                _ => match v {
+                    JsValue::String(s) => s.clone(),
+                    _ => String::new(),
+                },
+            };
+            format!("Thrown[{name}]: {msg}")
+        }
+    }
 }
 
 fn run_one(path: &Path) -> Outcome {
@@ -212,11 +339,19 @@ fn run_one(path: &Path) -> Outcome {
 
     let mut ctx = EvalContext::new();
     ctx.install_core_builtins(BuiltInRegistry::with_core());
+    // `onlyStrict` tests (and files opening with a "use strict" directive) run
+    // in strict mode: assignment to an undeclared reference throws, etc.
+    if meta.only_strict || (!meta.no_strict && src.contains("\"use strict\"")) {
+        ctx.strict = true;
+    }
 
-    let mut threw = false;
+    // Hoist top-level `var` declarations (global scope) before running.
+    just_engine::runner::eval::statement::hoist_var_declarations(&ast.body, &mut ctx);
+
+    let mut threw: Option<String> = None;
     for stmt in &ast.body {
-        if execute_statement(stmt, &mut ctx).is_err() {
-            threw = true;
+        if let Err(e) = execute_statement(stmt, &mut ctx) {
+            threw = Some(describe_error(&e));
             break;
         }
     }
@@ -224,10 +359,14 @@ fn run_one(path: &Path) -> Outcome {
 
     match (meta.negative, threw) {
         // Negative test: throwing (parse or runtime) is the expected outcome.
-        (true, true) => Outcome::Pass,
-        (true, false) => Outcome::Fail("negative test did not throw".into()),
+        (true, Some(_)) => Outcome::Pass,
+        (true, None) => Outcome::Fail("negative test did not throw".into()),
         // Positive test: any throw is a failure; completing is a pass.
-        (false, true) => Outcome::Fail("runtime threw".into()),
-        (false, false) => Outcome::Pass,
+        (false, Some(msg)) => {
+            let msg = msg.replace('\n', " ");
+            let msg: String = msg.chars().take(220).collect();
+            Outcome::Fail(format!("runtime threw: {msg}"))
+        }
+        (false, None) => Outcome::Pass,
     }
 }

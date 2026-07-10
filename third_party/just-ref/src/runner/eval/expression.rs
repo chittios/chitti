@@ -1283,38 +1283,55 @@ fn call_function_with_body(
         }
     }
 
-    // Execute each statement in the function body
+    // Hoist `var` declarations to the top of the function scope.
+    super::statement::hoist_var_declarations(&body.body, ctx);
+
+    // Execute each statement in the function body. On ANY exit path — a normal
+    // return, an `Ok(Throw)` completion, or an `Err(..)` propagating up from a
+    // nested call — the function's environment must be restored, otherwise the
+    // caller keeps running against the callee's (popped) scope and later
+    // variable lookups fail spuriously (e.g. a `catch` block can't see the
+    // enclosing function's `var`). We compute the outcome, always restore, then
+    // return.
     let mut result_completion = super::types::Completion::normal();
+    let mut pending_err: Option<JErrorType> = None;
 
     for stmt in body.body.iter() {
-        let completion = execute_statement(stmt, ctx)?;
-
-        match completion.completion_type {
-            CompletionType::Return => {
-                result_completion = completion;
+        match execute_statement(stmt, ctx) {
+            Err(e) => {
+                pending_err = Some(e);
                 break;
             }
-            CompletionType::Throw => {
-                // Restore environment before returning error
-                ctx.lex_env = saved_lex_env;
-                ctx.var_env = saved_var_env;
-                ctx.global_this = saved_this;
-                return Err(JErrorType::Thrown(completion.value.clone().unwrap_or(JsValue::Undefined)));
-            }
-            CompletionType::Break | CompletionType::Continue | CompletionType::Yield => {
-                result_completion = completion;
-                break;
-            }
-            CompletionType::Normal => {
-                result_completion = completion;
-            }
+            Ok(completion) => match completion.completion_type {
+                CompletionType::Return => {
+                    result_completion = completion;
+                    break;
+                }
+                CompletionType::Throw => {
+                    pending_err = Some(JErrorType::Thrown(
+                        completion.value.clone().unwrap_or(JsValue::Undefined),
+                    ));
+                    break;
+                }
+                CompletionType::Break | CompletionType::Continue | CompletionType::Yield => {
+                    result_completion = completion;
+                    break;
+                }
+                CompletionType::Normal => {
+                    result_completion = completion;
+                }
+            },
         }
     }
 
-    // Restore the previous environment
+    // Restore the previous environment on every path.
     ctx.lex_env = saved_lex_env;
     ctx.var_env = saved_var_env;
     ctx.global_this = saved_this;
+
+    if let Some(e) = pending_err {
+        return Err(e);
+    }
 
     // Return the result
     match result_completion.completion_type {
@@ -1416,6 +1433,11 @@ fn evaluate_assignment_expression(
             bitwise_xor(&current, &rhs_value)?
         }
     };
+
+    // Anonymous-function name inference for `f = function(){}` / `f = () => {}`.
+    if matches!(operator, AssignmentOperator::Equals) && is_anonymous_function_expr(right) {
+        infer_function_name(&final_value, &name);
+    }
 
     // Set the binding and return the value
     ctx.set_binding(&name, final_value.clone())?;
@@ -1974,11 +1996,30 @@ fn evaluate_update_expression(
     prefix: bool,
     ctx: &mut EvalContext,
 ) -> ValueResult {
-    // Get the variable name from the argument
-    let name = get_expression_name(argument)?;
+    // The update target is either a plain identifier or a member expression
+    // (`obj.x++`, `arr[i]--`). Read the current value from whichever it is.
+    let member_target: Option<(JsValue, String)> = match argument {
+        ExpressionType::MemberExpression(member) => Some(match member {
+            MemberExpressionType::SimpleMemberExpression { object, property, .. } => {
+                let obj = evaluate_expression_or_super(object, ctx)?;
+                (obj, property.name.clone())
+            }
+            MemberExpressionType::ComputedMemberExpression { object, property, .. } => {
+                let obj = evaluate_expression_or_super(object, ctx)?;
+                let prop_val = evaluate_expression(property.as_ref(), ctx)?;
+                (obj, to_property_key(&prop_val))
+            }
+        }),
+        _ => None,
+    };
 
-    // Get the current value
-    let current_value = ctx.get_binding(&name)?;
+    let current_value = match &member_target {
+        Some((obj, prop)) => get_property_with_ctx(obj, prop, ctx)?,
+        None => {
+            let name = get_expression_name(argument)?;
+            ctx.get_binding(&name)?
+        }
+    };
 
     // Convert to number
     let old_number = to_number(&current_value)?;
@@ -2000,10 +2041,16 @@ fn evaluate_update_expression(
         JsValue::Number(JsNumberType::Float(new_f64))
     };
 
-    // Store the new value
-    ctx.set_binding(&name, new_value.clone())?;
+    // Store the new value back into the target.
+    match &member_target {
+        Some((obj, prop)) => set_property_with_ctx(obj, prop, new_value.clone(), ctx)?,
+        None => {
+            let name = get_expression_name(argument)?;
+            ctx.set_binding(&name, new_value.clone())?;
+        }
+    }
 
-    // Return old value for postfix, new value for prefix
+    // Return old value (coerced to number) for postfix, new value for prefix
     if prefix {
         Ok(new_value)
     } else {
@@ -2113,6 +2160,13 @@ fn to_u32(value: &JsValue) -> Result<u32, JErrorType> {
 // ============================================================================
 
 fn add_values(left: &JsValue, right: &JsValue) -> ValueResult {
+    // A Symbol operand always throws: after ToPrimitive it stays a Symbol, then
+    // either ToString (string concat) or ToNumber (numeric add) rejects it.
+    if matches!(left, JsValue::Symbol(_)) || matches!(right, JsValue::Symbol(_)) {
+        return Err(JErrorType::TypeError(
+            "Cannot convert a Symbol value".to_string(),
+        ));
+    }
     if matches!(left, JsValue::String(_)) || matches!(right, JsValue::String(_)) {
         let left_str = to_string(left);
         let right_str = to_string(right);
@@ -2452,38 +2506,60 @@ impl SimpleFunctionObject {
 
         let body = unsafe { &*self.body_ptr };
 
-        // Execute each statement in the function body
+        // Hoist `var` declarations to the top of the function scope.
+        super::statement::hoist_var_declarations(&body.body, ctx);
+
+        // Execute each statement in the function body. As in
+        // `call_function_with_body`, the environment must be restored on EVERY
+        // exit path — including an `Err(..)` propagating from a nested call —
+        // so the caller never continues against the callee's popped scope.
         let mut result_completion = super::types::Completion::normal();
+        let mut pending_err: Option<JErrorType> = None;
 
         for stmt in body.body.iter() {
-            let completion = execute_statement(stmt, ctx)?;
-
-            match completion.completion_type {
-                CompletionType::Return => {
-                    result_completion = completion;
+            match execute_statement(stmt, ctx) {
+                Err(e) => {
+                    pending_err = Some(e);
                     break;
                 }
-                CompletionType::Throw => {
-                    // Restore environment before returning error
-                    ctx.lex_env = saved_lex_env;
-                    ctx.var_env = saved_var_env;
-                    ctx.global_this = saved_this;
-                    return Err(JErrorType::Thrown(completion.value.clone().unwrap_or(JsValue::Undefined)));
-                }
-                CompletionType::Break | CompletionType::Continue | CompletionType::Yield => {
-                    result_completion = completion;
-                    break;
-                }
-                CompletionType::Normal => {
-                    result_completion = completion;
-                }
+                Ok(completion) => match completion.completion_type {
+                    CompletionType::Return => {
+                        result_completion = completion;
+                        break;
+                    }
+                    CompletionType::Throw => {
+                        pending_err = Some(JErrorType::Thrown(
+                            completion.value.clone().unwrap_or(JsValue::Undefined),
+                        ));
+                        break;
+                    }
+                    CompletionType::Break | CompletionType::Continue | CompletionType::Yield => {
+                        result_completion = completion;
+                        break;
+                    }
+                    CompletionType::Normal => {
+                        result_completion = completion;
+                    }
+                },
             }
         }
 
-        // Restore the previous environment
+        // Restore the previous environment on every path.
         ctx.lex_env = saved_lex_env;
         ctx.var_env = saved_var_env;
         ctx.global_this = saved_this;
+
+        if let Some(e) = pending_err {
+            // An `async function` turns a thrown error into a rejected Promise.
+            if self.is_async {
+                let v = match &e {
+                    JErrorType::Thrown(v) => v.clone(),
+                    other => JsValue::String(other.to_string()),
+                };
+                return Ok(crate::runner::std_lib::promise::reject_value(v));
+            }
+            return Err(e);
+        }
 
         // Return the result. An `async function` resolves to a Promise of the
         // returned value (ChittiOS synchronous-settlement model).
@@ -2673,6 +2749,26 @@ pub fn get_own_prop_value(v: &JsValue, name: &str) -> Option<JsValue> {
     None
 }
 
+/// Read an own **data** property's full descriptor as
+/// `(value, writable, enumerable, configurable)`. `None` if absent, an
+/// accessor, or `v` isn't an object. Used by `Object.getOwnPropertyDescriptor`
+/// so it reports real attributes instead of assuming everything is
+/// writable/enumerable/configurable.
+pub fn get_own_prop_descriptor(v: &JsValue, name: &str) -> Option<(JsValue, bool, bool, bool)> {
+    if let JsValue::Object(o) = v {
+        let b = o.borrow();
+        if let Some(PropertyDescriptor::Data(d)) = b
+            .as_js_object()
+            .get_object_base()
+            .properties
+            .get(&PropertyKey::Str(name.to_string()))
+        {
+            return Some((d.value.clone(), d.writable, d.enumerable, d.configurable));
+        }
+    }
+    None
+}
+
 pub fn has_own_prop(v: &JsValue, name: &str) -> bool {
     if let JsValue::Object(o) = v {
         return o
@@ -2743,8 +2839,92 @@ pub fn create_arrow_function_object(
             configurable: false,
         }),
     );
+    // Arrows start with the empty name (may be inferred at a binding site) and
+    // a `length` of their leading simple parameters.
+    func_obj.base.properties.insert(
+        PropertyKey::Str("name".to_string()),
+        PropertyDescriptor::Data(PropertyDescriptorData {
+            value: JsValue::String(String::new()),
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        }),
+    );
+    func_obj.base.properties.insert(
+        PropertyKey::Str("length".to_string()),
+        PropertyDescriptor::Data(PropertyDescriptorData {
+            value: JsValue::Number(JsNumberType::Integer(function_length(params))),
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        }),
+    );
     let obj_ref: JsObjectType = Rc::new(RefCell::new(ObjectType::Ordinary(Box::new(func_obj))));
     Ok(JsValue::Object(obj_ref))
+}
+
+/// The `length` of a function: the number of leading formal parameters that are
+/// plain identifiers, stopping at the first one with a default, a rest element,
+/// or a destructuring pattern (per the spec's ExpectedArgumentCount).
+fn function_length(params: &[PatternType]) -> i64 {
+    let mut n = 0i64;
+    for p in params {
+        match p {
+            PatternType::PatternWhichCanBeExpression(ExpressionPatternType::Identifier(_)) => {
+                n += 1
+            }
+            _ => break,
+        }
+    }
+    n
+}
+
+/// True when `expr` is a syntactically anonymous function definition (an
+/// unnamed function/generator expression, any arrow, or an unnamed class
+/// expression) — the only RHS forms that trigger name inference.
+pub fn is_anonymous_function_expr(expr: &ExpressionType) -> bool {
+    match expr {
+        ExpressionType::FunctionOrGeneratorExpression(d) => d.id.is_none(),
+        ExpressionType::ArrowFunctionExpression { .. } => true,
+        ExpressionType::ClassExpression(c) => c.id.is_none(),
+        _ => false,
+    }
+}
+
+/// If `value` is a function whose `name` is still the empty string, set it to
+/// `name` (anonymous-function name inference for `var f = function(){}`,
+/// `f = () => {}`, `[f = function(){}] = []`, etc.).
+pub fn infer_function_name(value: &JsValue, name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    if let JsValue::Object(o) = value {
+        let mut b = o.borrow_mut();
+        let base = b.as_js_object_mut().get_object_base_mut();
+        // Only for callables that carry the simple-function marker.
+        let is_fn = matches!(
+            base.properties.get(&PropertyKey::Str("__simple_function__".to_string())),
+            Some(PropertyDescriptor::Data(_))
+        );
+        if !is_fn {
+            return;
+        }
+        let empty = matches!(
+            base.properties.get(&PropertyKey::Str("name".to_string())),
+            Some(PropertyDescriptor::Data(d)) if matches!(&d.value, JsValue::String(s) if s.is_empty())
+        );
+        if empty {
+            base.properties.insert(
+                PropertyKey::Str("name".to_string()),
+                PropertyDescriptor::Data(PropertyDescriptorData {
+                    value: JsValue::String(name.to_string()),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                }),
+            );
+        }
+    }
 }
 
 pub fn create_function_object(func_data: &FunctionData, ctx: &EvalContext) -> ValueResult {
@@ -2778,6 +2958,29 @@ pub fn create_function_object(func_data: &FunctionData, ctx: &EvalContext) -> Va
             writable: false,
             enumerable: false,
             configurable: false,
+        }),
+    );
+
+    // `name` (the declared identifier, else empty) and `length` (count of
+    // leading simple parameters, i.e. before the first default/rest/pattern) —
+    // both non-enumerable, configurable, per spec.
+    let name = func_data.id.as_ref().map(|i| i.name.clone()).unwrap_or_default();
+    func_obj.base.properties.insert(
+        PropertyKey::Str("name".to_string()),
+        PropertyDescriptor::Data(PropertyDescriptorData {
+            value: JsValue::String(name),
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        }),
+    );
+    func_obj.base.properties.insert(
+        PropertyKey::Str("length".to_string()),
+        PropertyDescriptor::Data(PropertyDescriptorData {
+            value: JsValue::Number(JsNumberType::Integer(function_length(&func_data.params.list))),
+            writable: false,
+            enumerable: false,
+            configurable: true,
         }),
     );
 

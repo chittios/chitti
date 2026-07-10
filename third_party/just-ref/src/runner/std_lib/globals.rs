@@ -21,7 +21,39 @@ use crate::runner::plugin::types::EvalContext;
 pub struct GlobalsResolver;
 
 fn is_global_fn(name: &str) -> bool {
-    matches!(name, "isNaN" | "isFinite" | "parseInt" | "parseFloat" | "Boolean" | "Symbol")
+    matches!(
+        name,
+        "isNaN" | "isFinite" | "parseInt" | "parseFloat" | "Boolean" | "Symbol" | "eval"
+            | "Function"
+    )
+}
+
+/// Stringify a value for `Function` param/body assembly and `eval` non-string
+/// pass-through.
+fn as_source_str(v: &JsValue) -> String {
+    match v {
+        JsValue::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Parse `src` and execute it in the CURRENT context (direct-eval-like scope:
+/// declarations land in the caller's environment, lookups see it). Returns the
+/// completion value of the last statement — an expression statement yields its
+/// value, so `eval("1+1")` is `2` and `eval("(function(){})")` is the function.
+fn eval_source(src: &str, ctx: &mut EvalContext) -> Result<JsValue, JErrorType> {
+    use crate::parser::JsParser;
+    use crate::runner::eval::statement::execute_statement;
+    let ast = JsParser::parse_to_ast_from_str(src)
+        .map_err(|e| JErrorType::SyntaxError(alloc::format!("{:?}", e)))?;
+    let mut last = JsValue::Undefined;
+    for stmt in &ast.body {
+        let c = execute_statement(stmt, ctx)?;
+        if let Some(v) = c.value.clone() {
+            last = v;
+        }
+    }
+    Ok(last)
 }
 
 /// Coerce a value to an f64 (JS `Number(x)` semantics, loosely).
@@ -191,13 +223,39 @@ impl PluginResolver for GlobalsResolver {
     fn call_constructor(
         &self,
         object_name: &str,
-        _ctx: &mut EvalContext,
+        ctx: &mut EvalContext,
         args: Vec<JsValue>,
     ) -> Option<Result<JsValue, JErrorType>> {
         if !is_global_fn(object_name) {
             return None;
         }
         let a0 = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        // `eval` / `Function` need the parser + interpreter, and return early.
+        match object_name {
+            "eval" => {
+                return Some(match &a0 {
+                    // eval of a non-string returns it unchanged (per spec).
+                    JsValue::String(s) => eval_source(s, ctx),
+                    other => Ok(other.clone()),
+                });
+            }
+            "Function" => {
+                let (params, body) = if args.is_empty() {
+                    (String::new(), String::new())
+                } else {
+                    let body = as_source_str(args.last().unwrap());
+                    let params = args[..args.len() - 1]
+                        .iter()
+                        .map(as_source_str)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    (params, body)
+                };
+                let src = alloc::format!("(function anonymous({}){{{}}})", params, body);
+                return Some(eval_source(&src, ctx));
+            }
+            _ => {}
+        }
         let res = match object_name {
             "isNaN" => JsValue::Boolean(to_f64(&a0).is_nan()),
             "isFinite" => {

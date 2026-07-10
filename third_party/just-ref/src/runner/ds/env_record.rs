@@ -64,6 +64,14 @@ impl EnvironmentRecordType {
             EnvironmentRecordType::Global(d) => d,
         }
     }
+    pub fn as_env_record_mut(&mut self) -> &mut dyn EnvironmentRecord {
+        match self {
+            EnvironmentRecordType::Declarative(d) => d,
+            EnvironmentRecordType::Object(d) => d,
+            EnvironmentRecordType::Function(d) => d,
+            EnvironmentRecordType::Global(d) => d,
+        }
+    }
 }
 
 #[derive(PartialEq)]

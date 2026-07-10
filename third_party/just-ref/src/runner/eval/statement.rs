@@ -176,11 +176,133 @@ fn execute_variable_declaration(
             JsValue::Undefined
         };
 
+        // Anonymous-function name inference: `var f = function(){}` names the
+        // function `f`.
+        if let (
+            Some(init),
+            PatternType::PatternWhichCanBeExpression(ExpressionPatternType::Identifier(id)),
+        ) = (&declarator.init, &*declarator.id)
+        {
+            if crate::runner::eval::expression::is_anonymous_function_expr(init) {
+                crate::runner::eval::expression::infer_function_name(&value, &id.name);
+            }
+        }
+
         // Bind the pattern to the value
         bind_pattern(&declarator.id, value, ctx, is_const, is_var)?;
     }
 
     Ok(Completion::normal())
+}
+
+/// JS var hoisting: pre-create every `var` binding reachable in `body`
+/// (initialized to `undefined`) without descending into nested functions, so a
+/// name is `undefined` rather than a `ReferenceError` before its `var`
+/// statement runs. Called at the top of every function body and the program.
+pub fn hoist_var_declarations(body: &[StatementType], ctx: &mut EvalContext) {
+    for stmt in body {
+        hoist_stmt(stmt, ctx);
+    }
+}
+
+fn declare_hoisted_var(name: &str, ctx: &mut EvalContext) {
+    if !ctx.has_var_binding(name) {
+        let _ = ctx.create_var_binding(name);
+        let _ = ctx.initialize_var_binding(name, JsValue::Undefined);
+    }
+}
+
+fn collect_pattern_names(pattern: &PatternType, out: &mut Vec<String>) {
+    match pattern {
+        PatternType::PatternWhichCanBeExpression(ExpressionPatternType::Identifier(id)) => {
+            out.push(id.name.clone());
+        }
+        PatternType::ObjectPattern { properties, .. } => {
+            for prop in properties {
+                collect_pattern_names(&prop.0.value, out);
+            }
+        }
+        PatternType::ArrayPattern { elements, .. } => {
+            for element in elements.iter().flatten() {
+                collect_pattern_names(element, out);
+            }
+        }
+        PatternType::AssignmentPattern { left, .. } => collect_pattern_names(left, out),
+        PatternType::RestElement { argument, .. } => collect_pattern_names(argument, out),
+        _ => {}
+    }
+}
+
+fn hoist_stmt(stmt: &StatementType, ctx: &mut EvalContext) {
+    match stmt {
+        StatementType::DeclarationStatement(DeclarationType::VariableDeclaration(var_decl)) => {
+            if matches!(var_decl.kind, VariableDeclarationKind::Var) {
+                let mut names = Vec::new();
+                for d in &var_decl.declarations {
+                    collect_pattern_names(&d.id, &mut names);
+                }
+                for n in names {
+                    declare_hoisted_var(&n, ctx);
+                }
+            }
+        }
+        StatementType::BlockStatement(b) => hoist_var_declarations(&b.body, ctx),
+        StatementType::IfStatement { consequent, alternate, .. } => {
+            hoist_stmt(consequent, ctx);
+            if let Some(a) = alternate {
+                hoist_stmt(a, ctx);
+            }
+        }
+        StatementType::WhileStatement { body, .. }
+        | StatementType::DoWhileStatement { body, .. } => hoist_stmt(body, ctx),
+        StatementType::ForStatement { init, body, .. } => {
+            if let Some(crate::parser::ast::VariableDeclarationOrExpression::VariableDeclaration(
+                var_decl,
+            )) = init
+            {
+                if matches!(var_decl.kind, VariableDeclarationKind::Var) {
+                    let mut names = Vec::new();
+                    for d in &var_decl.declarations {
+                        collect_pattern_names(&d.id, &mut names);
+                    }
+                    for n in names {
+                        declare_hoisted_var(&n, ctx);
+                    }
+                }
+            }
+            hoist_stmt(body, ctx);
+        }
+        StatementType::ForInStatement(data) | StatementType::ForOfStatement(data) => {
+            if let VariableDeclarationOrPattern::VariableDeclaration(var_decl) = &data.left {
+                if matches!(var_decl.kind, VariableDeclarationKind::Var) {
+                    let mut names = Vec::new();
+                    for d in &var_decl.declarations {
+                        collect_pattern_names(&d.id, &mut names);
+                    }
+                    for n in names {
+                        declare_hoisted_var(&n, ctx);
+                    }
+                }
+            }
+            hoist_stmt(&data.body, ctx);
+        }
+        StatementType::SwitchStatement { cases, .. } => {
+            for case in cases {
+                hoist_var_declarations(&case.consequent, ctx);
+            }
+        }
+        StatementType::TryStatement { block, handler, finalizer, .. } => {
+            hoist_var_declarations(&block.body, ctx);
+            if let Some(h) = handler {
+                hoist_var_declarations(&h.body.body, ctx);
+            }
+            if let Some(f) = finalizer {
+                hoist_var_declarations(&f.body, ctx);
+            }
+        }
+        // Nested functions establish their own var scope — do not descend.
+        _ => {}
+    }
 }
 
 /// Bind a pattern to a value, creating bindings for all identifiers in the pattern.
@@ -210,6 +332,15 @@ fn bind_pattern(
         }
 
         PatternType::ObjectPattern { properties, .. } => {
+            // Destructuring `null`/`undefined` is a TypeError (there is no object
+            // to read properties from).
+            if matches!(value, JsValue::Null | JsValue::Undefined) {
+                return Err(JErrorType::TypeError(format!(
+                    "Cannot destructure '{}' as it is {}.",
+                    "value",
+                    if matches!(value, JsValue::Null) { "null" } else { "undefined" }
+                )));
+            }
             // Object destructuring: { x, y } = obj or { x: renamed } = obj
             for prop in properties {
                 let prop_data = &prop.0;
@@ -229,6 +360,12 @@ fn bind_pattern(
         }
 
         PatternType::ArrayPattern { elements, .. } => {
+            // Array destructuring requires an iterable; `null`/`undefined` throw.
+            if matches!(value, JsValue::Null | JsValue::Undefined) {
+                return Err(JErrorType::TypeError(
+                    "value is not iterable".to_string(),
+                ));
+            }
             // Array destructuring: [a, b] = arr
             for (index, element) in elements.iter().enumerate() {
                 if let Some(elem_pattern) = element {
@@ -251,11 +388,24 @@ fn bind_pattern(
         PatternType::AssignmentPattern { left, right, .. } => {
             // Default value pattern: x = default or { x = default } = obj
             // Use default if value is undefined
-            let actual_value = if matches!(value, JsValue::Undefined) {
+            let used_default = matches!(value, JsValue::Undefined);
+            let actual_value = if used_default {
                 evaluate_expression(right, ctx)?
             } else {
                 value
             };
+            // Infer an anonymous default's name from a simple identifier target
+            // (`[fn = function(){}] = []` names the function `fn`).
+            if used_default {
+                if let PatternType::PatternWhichCanBeExpression(
+                    ExpressionPatternType::Identifier(id),
+                ) = &**left
+                {
+                    if crate::runner::eval::expression::is_anonymous_function_expr(right) {
+                        crate::runner::eval::expression::infer_function_name(&actual_value, &id.name);
+                    }
+                }
+            }
             bind_pattern(left, actual_value, ctx, is_const, is_var)
         }
 

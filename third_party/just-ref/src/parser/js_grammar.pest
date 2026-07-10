@@ -34,7 +34,9 @@ str_unsigned_decimal_literal = ${
     | decimal_digits_integer_part ~ exponent_part?
 }
 decimal_digits_integer_part = @{ decimal_digits }
-decimal_digits = @{ decimal_digit+ }
+// A `_` numeric separator may appear between two digits (never leading,
+// trailing, or doubled — enforced by requiring a digit on both sides).
+decimal_digits = @{ decimal_digit ~ ("_"? ~ decimal_digit)* }
 decimal_digit = _{ ASCII_DIGIT }
 exponent_part = ${ ("e" | "E") ~ signed_integer }
 signed_integer = { ("+" | "-")? ~ decimal_digits }
@@ -72,12 +74,15 @@ decimal_literal = ${
     | "." ~ decimal_digits ~ exponent_part?
     | decimal_integer_literal ~ exponent_part?
 }
-decimal_integer_literal = @{ "0" | non_zero_digit ~ decimal_digits? }
+decimal_integer_literal = @{ "0" | non_zero_digit ~ ("_"? ~ decimal_digit)* }
 non_zero_digit = { ASCII_NONZERO_DIGIT }
-binary_integer_literal = @{ ("0b" | "0B") ~ ASCII_BIN_DIGIT+ }
-octal_integer_literal = @{ ("0o" | "0O") ~ ASCII_OCT_DIGIT+ }
+binary_integer_literal = @{ ("0b" | "0B") ~ ASCII_BIN_DIGIT ~ ("_"? ~ ASCII_BIN_DIGIT)* }
+octal_integer_literal = @{ ("0o" | "0O") ~ ASCII_OCT_DIGIT ~ ("_"? ~ ASCII_OCT_DIGIT)* }
 hex_digits = { ASCII_HEX_DIGIT+ }
-hex_integer_literal = @{ ("0x" | "0X") ~ hex_digits }
+// Separator-aware hex digits — used only by hex integer literals, NOT by
+// `\u{…}` unicode escapes (which reuse the strict `hex_digits`).
+hex_digits_sep = { ASCII_HEX_DIGIT ~ ("_"? ~ ASCII_HEX_DIGIT)* }
+hex_integer_literal = @{ ("0x" | "0X") ~ hex_digits_sep }
 string_literal = @{ "\"" ~ double_string_chars? ~ "\"" | "'" ~ single_string_chars? ~ "'" }
 double_string_chars = @{ double_string_char+ }
 double_string_char = @{
