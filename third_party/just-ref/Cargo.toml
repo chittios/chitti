@@ -1,0 +1,78 @@
+# Isolated from the Chitti root workspace.
+#
+# ChittiOS: this crate serves TWO consumers from one source tree:
+#   * the host webcompat harness (tools/webcompat/just_runner) — default
+#     features `std` + `jit` (Cranelift), unchanged behaviour;
+#   * the bare-metal kernel (kernel/src/browser) — `default-features = false`,
+#     `no_std` + `alloc`, no Cranelift/uuid/std::time. The kernel's
+#     `[patch.crates-io]` repoints pest/pest_consume to the vendored no_std
+#     copies under third_party/. See THIRDPARTY-LICENSES.md.
+[workspace]
+members = []
+
+[package]
+name = "just-engine"
+version = "0.1.0"
+authors = ["Nirupam Biswas <applegrew+cratesio@gmail.com>"]
+edition = "2018"
+description = "A ground-up ES6 JavaScript engine (tree-walking interpreter), no_std-capable"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/applegrew/just"
+homepage = "https://github.com/applegrew/just"
+readme = "README.md"
+keywords = ["javascript", "js", "interpreter", "jit", "compiler"]
+categories = ["compilers", "parser-implementations"]
+
+[features]
+default = ["std", "jit"]
+# Host build: pulls std-only conveniences (uuid RNG for anonymous symbols,
+# std::time for Math.random seeding + parser timing).
+std = ["dep:uuid"]
+# Cranelift native JIT (host x86_64 only). Requires std.
+jit = ["std", "dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
+
+[dependencies]
+pest = { version = "2.1.3", default-features = false }
+pest_derive = "2.1.0"
+pest_consume = "1.0.6"
+pest_consume_macros = "1.0.6"
+# no_std-friendly interior-mutable statics (spin::Once) — works on host too.
+lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+# std HashMap replacement; hashbrown is no_std-first with the same API.
+hashbrown = { version = "0.14", default-features = false, features = ["ahash", "inline-more"] }
+# f64/f32 transcendentals under no_std (libm); host uses inherent std methods.
+num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+# lock-free-ish global console sink (no_std); host also prints to std streams.
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
+uuid = { version = "0.8", features = ["v4"], optional = true }
+cranelift = { version = "0.104", optional = true }
+cranelift-jit = { version = "0.104", optional = true }
+cranelift-module = { version = "0.104", optional = true }
+cranelift-native = { version = "0.104", optional = true }
+
+[[bin]]
+name = "just"
+path = "src/bin/just.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"
+required-features = ["std"]
+
+[[bench]]
+name = "benchmark_runner"
+path = "benches/benchmark_runner.rs"
+harness = false
+required-features = ["std"]
+
+# ChittiOS: repoint the pest stack to the vendored no_std copies. Honoured only
+# when just-ref is a build root (standalone / the no_std probe); ignored when
+# it is a dependency (the kernel and the host just_runner apply their own).
+[patch.crates-io]
+pest = { path = "../pest" }
+pest_derive = { path = "../pest_derive" }
+pest_generator = { path = "../pest_generator" }
+pest_meta = { path = "../pest_meta" }
+pest_consume = { path = "../pest_consume" }
+pest_consume_macros = { path = "../pest_consume_macros" }

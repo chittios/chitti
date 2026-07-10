@@ -355,7 +355,7 @@ fn collect_elems(n: &Node, out: &mut Vec<ElemRef>) {
     }
 }
 
-fn empty_elem(tag: &str) -> ElemRef {
+pub(crate) fn empty_elem(tag: &str) -> ElemRef {
     let tag_l = tag.to_ascii_lowercase();
     ElemRef {
         tag: tag_l.clone(),
@@ -391,6 +391,15 @@ pub fn run_scripts(dom: &mut JsDom, scripts: &[String]) -> Vec<String> {
         .last()
         .map(|m| (Some(m.data.clone()), Some(m.origin.clone())))
         .unwrap_or((None, None));
+
+    // NB: DOM scripts still run on the legacy `js.rs` engine below — its DOM is
+    // more complete than the `just` `DomResolver` (which covers document/
+    // getElementById/querySelector/createElement/title/innerText/className/
+    // setAttribute/appendChild but not classList/childElementCount/live queries).
+    // The `just` DOM tier (`super::js_just::run_scripts_via_just`) is implemented
+    // + tested and can become primary once the rest of the DOM surface is
+    // ported; auto-routing it now would regress complete-DOM pages.
+
     for s in scripts {
         // A script that touches DOM / storage / fetch / postMessage / canvas
         // needs the host engine (which owns the DOM bindings). Everything else

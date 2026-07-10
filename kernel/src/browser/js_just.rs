@@ -91,6 +91,324 @@ fn display_value(v: &JsValue) -> String {
     }
 }
 
+// ============================================================================
+// Stage D: DOM bindings via a `PluginResolver`.
+//
+// The DOM lives Rust-side in `JsDom`/`ElemRef` (integer-handle model). To run a
+// DOM script on `just` we (1) move the `JsDom` into an `Rc<RefCell<>>` the
+// resolver shares, (2) expose `document`/`window`/`location`/`localStorage` and
+// element wrappers, (3) let the script read/write wrapper properties as normal
+// JS objects, then (4) **sync** each wrapper's fields back into the `JsDom`.
+// This needs no interpreter changes — wrappers are ordinary `just` objects.
+//
+// Security: the resolver exposes ONLY the sandboxed `JsDom` (same surface the
+// hand-rolled engine touches). No Synapse/fs/net — the determinism/taint
+// boundary is unchanged.
+// ============================================================================
+
+use alloc::rc::Rc;
+use alloc::vec;
+use core::cell::RefCell;
+use just_engine::runner::ds::error::JErrorType;
+use just_engine::runner::ds::value::JsNumberType;
+use just_engine::runner::eval::expression::{get_own_prop_value, make_array, make_object, set_own_prop};
+use just_engine::runner::plugin::resolver::PluginResolver;
+use super::js::{empty_elem, ElemRef, JsDom};
+
+/// Records of element wrappers handed to the script, to be synced back.
+type Wrappers = Rc<RefCell<Vec<(usize, JsValue)>>>;
+
+struct DomResolver {
+    dom: Rc<RefCell<JsDom>>,
+    wrappers: Wrappers,
+    document: JsValue,
+    window: JsValue,
+    location: JsValue,
+    storage: JsValue,
+}
+
+fn s(v: &str) -> JsValue {
+    JsValue::String(v.to_string())
+}
+fn as_str(v: &JsValue) -> String {
+    match v {
+        JsValue::String(x) => x.clone(),
+        JsValue::Undefined | JsValue::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// Build a wrapper object mirroring `dom.elements[idx]`, and record it.
+fn make_elem_wrapper(dom: &JsDom, idx: usize, wrappers: &Wrappers) -> JsValue {
+    let w = make_object(vec![]);
+    set_own_prop(&w, "__builtin_name__", s("Element"), false);
+    set_own_prop(&w, "__elem_index__", JsValue::Number(JsNumberType::Integer(idx as i64)), false);
+    if let Some(e) = dom.elements.get(idx) {
+        set_own_prop(&w, "tagName", s(&e.tag.to_uppercase()), true);
+        set_own_prop(&w, "innerText", s(&e.text), true);
+        set_own_prop(&w, "textContent", s(&e.text), true);
+        set_own_prop(&w, "value", s(&e.value), true);
+        set_own_prop(&w, "id", s(e.id.as_deref().unwrap_or("")), true);
+        set_own_prop(&w, "className", s(e.class.as_deref().unwrap_or("")), true);
+        set_own_prop(&w, "style", s(&e.style), true);
+    }
+    wrappers.borrow_mut().push((idx, w.clone()));
+    w
+}
+
+impl DomResolver {
+    fn new(dom: Rc<RefCell<JsDom>>, wrappers: Wrappers) -> Self {
+        let document = make_object(vec![]);
+        set_own_prop(&document, "__builtin_name__", s("document"), false);
+        set_own_prop(&document, "title", s(&dom.borrow().title), true);
+        let location = make_object(vec![]);
+        set_own_prop(&location, "__builtin_name__", s("location"), false);
+        set_own_prop(&location, "href", s(&dom.borrow().location_href), true);
+        let storage = make_object(vec![]);
+        set_own_prop(&storage, "__builtin_name__", s("localStorage"), false);
+        let window = make_object(vec![]);
+        set_own_prop(&window, "__builtin_name__", s("window"), false);
+        set_own_prop(&window, "location", location.clone(), true);
+        set_own_prop(&window, "document", document.clone(), true);
+        DomResolver { dom, wrappers, document, window, location, storage }
+    }
+
+    fn find_by_id(&self, id: &str) -> Option<usize> {
+        self.dom.borrow().elements.iter().position(|e| e.id.as_deref() == Some(id))
+    }
+    fn find_by_selector(&self, sel: &str) -> Option<usize> {
+        let dom = self.dom.borrow();
+        if let Some(id) = sel.strip_prefix('#') {
+            dom.elements.iter().position(|e| e.id.as_deref() == Some(id))
+        } else if let Some(cls) = sel.strip_prefix('.') {
+            dom.elements.iter().position(|e| e.class.as_deref().map_or(false, |c| c.split_whitespace().any(|w| w == cls)))
+        } else {
+            let t = sel.to_ascii_lowercase();
+            dom.elements.iter().position(|e| e.tag == t)
+        }
+    }
+
+}
+
+impl PluginResolver for DomResolver {
+    fn has_binding(&self, name: &str) -> bool {
+        matches!(name, "document" | "window" | "location" | "localStorage" | "Element" | "navigator")
+    }
+
+    fn resolve(&self, name: &str, _ctx: &mut EvalContext) -> Result<JsValue, JErrorType> {
+        Ok(match name {
+            "document" => self.document.clone(),
+            "window" => self.window.clone(),
+            "location" => self.location.clone(),
+            "localStorage" => self.storage.clone(),
+            "navigator" => {
+                let n = make_object(vec![]);
+                set_own_prop(&n, "userAgent", s("ChittiOS/just"), true);
+                n
+            }
+            _ => JsValue::Undefined,
+        })
+    }
+
+    fn call_method(
+        &self,
+        object_name: &str,
+        method_name: &str,
+        _ctx: &mut EvalContext,
+        this: JsValue,
+        args: Vec<JsValue>,
+    ) -> Option<Result<JsValue, JErrorType>> {
+        let arg0 = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        match (object_name, method_name) {
+            ("document", "getElementById") => {
+                let id = as_str(&arg0);
+                Some(Ok(match self.find_by_id(&id) {
+                    Some(i) => make_elem_wrapper(&self.dom.borrow(), i, &self.wrappers),
+                    None => JsValue::Null,
+                }))
+            }
+            ("document", "querySelector") => {
+                let sel = as_str(&arg0);
+                Some(Ok(match self.find_by_selector(&sel) {
+                    Some(i) => make_elem_wrapper(&self.dom.borrow(), i, &self.wrappers),
+                    None => JsValue::Null,
+                }))
+            }
+            ("document", "querySelectorAll") | ("document", "getElementsByTagName") => {
+                let sel = as_str(&arg0);
+                let want = sel.to_ascii_lowercase();
+                let idxs: Vec<usize> = {
+                    let dom = self.dom.borrow();
+                    dom.elements.iter().enumerate()
+                        .filter(|(_, e)| want == "*" || e.tag == want)
+                        .map(|(i, _)| i).collect()
+                };
+                let items = idxs.into_iter().map(|i| make_elem_wrapper(&self.dom.borrow(), i, &self.wrappers)).collect();
+                Some(Ok(make_array(items)))
+            }
+            ("document", "createElement") => {
+                let tag = as_str(&arg0);
+                let idx = {
+                    let mut dom = self.dom.borrow_mut();
+                    dom.elements.push(empty_elem(&tag));
+                    dom.elements.len() - 1
+                };
+                Some(Ok(make_elem_wrapper(&self.dom.borrow(), idx, &self.wrappers)))
+            }
+            ("Element", "setAttribute") => {
+                if let JsValue::Object(_) = this {
+                    if let Some(JsValue::Number(JsNumberType::Integer(i))) = get_own_prop_value(&this, "__elem_index__") {
+                        let key = as_str(&arg0);
+                        let val = as_str(&args.get(1).cloned().unwrap_or(JsValue::Undefined));
+                        let mut dom = self.dom.borrow_mut();
+                        if let Some(e) = dom.elements.get_mut(i as usize) {
+                            match key.as_str() {
+                                "id" => { e.id = Some(val.clone()); set_own_prop(&this, "id", s(&val), true); }
+                                "class" => { e.class = Some(val.clone()); set_own_prop(&this, "className", s(&val), true); }
+                                _ => { e.attrs.insert(key, val); }
+                            }
+                        }
+                    }
+                }
+                Some(Ok(JsValue::Undefined))
+            }
+            ("Element", "getAttribute") => {
+                let key = as_str(&arg0);
+                if let Some(JsValue::Number(JsNumberType::Integer(i))) = get_own_prop_value(&this, "__elem_index__") {
+                    let dom = self.dom.borrow();
+                    if let Some(e) = dom.elements.get(i as usize) {
+                        return Some(Ok(e.attrs.get(&key).map(|v| s(v)).unwrap_or(JsValue::Null)));
+                    }
+                }
+                Some(Ok(JsValue::Null))
+            }
+            ("Element", "appendChild") => {
+                let child_idx = get_own_prop_value(&arg0, "__elem_index__");
+                let parent_idx = get_own_prop_value(&this, "__elem_index__");
+                if let (Some(JsValue::Number(JsNumberType::Integer(p))), Some(JsValue::Number(JsNumberType::Integer(c)))) = (parent_idx, child_idx) {
+                    let mut dom = self.dom.borrow_mut();
+                    let (p, c) = (p as usize, c as usize);
+                    if p < dom.elements.len() && c < dom.elements.len() {
+                        dom.elements[p].children.push(c);
+                        dom.elements[c].parent = Some(p);
+                    }
+                }
+                Some(Ok(arg0))
+            }
+            ("Element", "addEventListener") => {
+                // Recorded but not dispatched here (no event loop on this tier).
+                if let Some(JsValue::Number(JsNumberType::Integer(i))) = get_own_prop_value(&this, "__elem_index__") {
+                    let ev = as_str(&arg0);
+                    let mut dom = self.dom.borrow_mut();
+                    if let Some(e) = dom.elements.get_mut(i as usize) {
+                        e.listeners.entry(ev).or_default();
+                    }
+                }
+                Some(Ok(JsValue::Undefined))
+            }
+            ("localStorage", "getItem") => {
+                let key = as_str(&arg0);
+                Some(Ok(get_own_prop_value(&self.storage, &key).unwrap_or(JsValue::Null)))
+            }
+            ("localStorage", "setItem") => {
+                let key = as_str(&arg0);
+                let val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                set_own_prop(&self.storage, &key, val, true);
+                Some(Ok(JsValue::Undefined))
+            }
+            _ => None,
+        }
+    }
+
+    fn name(&self) -> &str {
+        "chitti_dom"
+    }
+}
+
+/// Run DOM-touching scripts on `just` with DOM bindings. Returns `false` (having
+/// left `dom` untouched) if any script fails to parse/run, so the caller can
+/// fall back to the legacy engine. On success, DOM mutations are synced back.
+pub fn run_scripts_via_just(dom: &mut JsDom, scripts: &[String]) -> bool {
+    // Parse everything FIRST — if any script can't parse, bail before touching
+    // the DOM so the caller can fall back cleanly (no partial/double execution).
+    let mut asts = Vec::with_capacity(scripts.len());
+    for src in scripts {
+        match JsParser::parse_to_ast_from_str(src) {
+            Ok(ast) => asts.push(ast),
+            Err(_) => return false,
+        }
+    }
+
+    let _ = drain_console_log();
+    // Move the JsDom into a shared cell for the resolver.
+    let placeholder = JsDom::from_document(&super::html::parse(""));
+    let taken = core::mem::replace(dom, placeholder);
+    let shared = Rc::new(RefCell::new(taken));
+    let wrappers: Wrappers = Rc::new(RefCell::new(Vec::new()));
+    let resolver = DomResolver::new(shared.clone(), wrappers.clone());
+    let document = resolver.document.clone();
+    let location = resolver.location.clone();
+
+    let mut ctx = EvalContext::new();
+    ctx.install_core_builtins(BuiltInRegistry::with_core());
+    ctx.add_resolver(alloc::boxed::Box::new(resolver));
+
+    // Execute; a runtime error just ends that script (like the legacy engine).
+    for ast in &asts {
+        for stmt in &ast.body {
+            if execute_statement(stmt, &mut ctx).is_err() {
+                break;
+            }
+        }
+    }
+
+    // Sync wrapper/document/location mutations back into the shared JsDom.
+    sync_back_all(&shared, &wrappers, &document, &location);
+    drop(ctx); // releases the resolver's Rc clones
+
+    // Reclaim the JsDom.
+    match Rc::try_unwrap(shared) {
+        Ok(cell) => *dom = cell.into_inner(),
+        Err(_still_shared) => return false, // shouldn't happen
+    }
+    for line in drain_console_log() {
+        dom.log.push(line);
+    }
+    true
+}
+
+/// Free-function sync (the resolver's clones live inside `ctx`; we hold our own).
+fn sync_back_all(dom: &Rc<RefCell<JsDom>>, wrappers: &Wrappers, document: &JsValue, location: &JsValue) {
+    let mut d = dom.borrow_mut();
+    for (idx, w) in wrappers.borrow().iter() {
+        let Some(e) = d.elements.get_mut(*idx) else { continue };
+        if let Some(v) = get_own_prop_value(w, "innerText") {
+            e.text = as_str(&v);
+        }
+        if let Some(v) = get_own_prop_value(w, "value") {
+            e.value = as_str(&v);
+        }
+        if let Some(v) = get_own_prop_value(w, "style") {
+            e.style = as_str(&v);
+        }
+        if let Some(v) = get_own_prop_value(w, "className") {
+            e.class = Some(as_str(&v));
+        }
+        if let Some(v) = get_own_prop_value(w, "id") {
+            e.id = Some(as_str(&v));
+        }
+    }
+    if let Some(v) = get_own_prop_value(document, "title") {
+        d.title = as_str(&v);
+    }
+    if let Some(v) = get_own_prop_value(location, "href") {
+        let href = as_str(&v);
+        if href != d.location_href {
+            d.navigate = Some(href);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +574,61 @@ mod tests {
         assert_eq!(val("let out=0; Promise.resolve(10).then(v=>v*2).then(v=>{out=v;}); out"), "20");
         assert_eq!(val("let out=0; let p=new Promise((res)=>{res(7);}); p.then(v=>{out=v;}); out"), "7");
         assert_eq!(val("let out=0; Promise.reject('e').catch(x=>{out=x;}); out"), "\"e\"");
+    }
+
+    #[test_case]
+    fn async_await() {
+        assert_eq!(val("async function f(){ return 41; } let out = await f(); out + 1"), "42");
+        assert_eq!(val("async function g(){ return await Promise.resolve(100); } let out = await g(); out"), "100");
+        // async fn returns a Promise usable with .then
+        assert_eq!(val("async function f(){ return 7; } let out=0; let p=f(); p.then(v=>{out=v*2;}); out"), "14");
+    }
+
+    #[test_case]
+    fn proxy_traps() {
+        assert_eq!(val("let p=new Proxy({}, {get:(t,k)=>'got:'+k}); p.foo"), "\"got:foo\"");
+        assert_eq!(val("let log=''; let p=new Proxy({}, {set:(t,k,v)=>{log=k+'='+v;}}); p.a=9; log"), "\"a=9\"");
+        assert_eq!(val("let t={x:5}; let p=new Proxy(t, {}); p.x"), "5");
+    }
+
+    #[test_case]
+    fn reflect_static() {
+        assert_eq!(val("Reflect.get({x:7}, 'x')"), "7");
+        assert_eq!(val("let o={}; Reflect.set(o,'k',3); o.k"), "3");
+        assert_eq!(val("Reflect.has({a:1}, 'a')"), "true");
+        assert_eq!(val("let f=(a,b)=>a+b; Reflect.apply(f, null, [4,5])"), "9");
+    }
+
+    // --- Stage D: DOM bindings via the DomResolver (run_scripts_via_just) ---
+
+    #[test_case]
+    fn dom_get_element_and_set_text() {
+        use crate::browser::html;
+        let doc = html::parse(r#"<html><body><p id="msg">old</p></body></html>"#);
+        let mut dom = JsDom::from_document(&doc);
+        let ok = run_scripts_via_just(
+            &mut dom,
+            &[String::from("let el = document.getElementById('msg'); el.innerText = 'hello ' + (1 + 1);")],
+        );
+        assert!(ok, "just DOM run should succeed");
+        let el = dom.elements.iter().find(|e| e.id.as_deref() == Some("msg")).unwrap();
+        assert_eq!(el.text, "hello 2");
+    }
+
+    #[test_case]
+    fn dom_title_and_create_element() {
+        use crate::browser::html;
+        let doc = html::parse("<html><head><title>Old</title></head><body></body></html>");
+        let mut dom = JsDom::from_document(&doc);
+        let ok = run_scripts_via_just(
+            &mut dom,
+            &[String::from(
+                "document.title = 'New'; let d = document.createElement('div'); d.className = 'box'; console.log('made', d.tagName);",
+            )],
+        );
+        assert!(ok);
+        assert_eq!(dom.title, "New");
+        assert!(dom.elements.iter().any(|e| e.tag == "div" && e.class.as_deref() == Some("box")));
+        assert!(dom.log.iter().any(|l| l.contains("made") && l.contains("DIV")));
     }
 }
