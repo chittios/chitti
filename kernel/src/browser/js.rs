@@ -392,9 +392,13 @@ pub fn run_scripts(dom: &mut JsDom, scripts: &[String]) -> Vec<String> {
         .map(|m| (Some(m.data.clone()), Some(m.origin.clone())))
         .unwrap_or((None, None));
     for s in scripts {
-        // Bytecode fast path only for pure arithmetic/console scripts (LibJS-style).
-        // DOM / storage / fetch / postMessage need the full host engine.
-        let needs_host = s.contains("document")
+        // A script that touches DOM / storage / fetch / postMessage / canvas
+        // needs the host engine (which owns the DOM bindings). Everything else
+        // is DOM-free computation and can run on the richer `just` ES6 tier.
+        // NB: unlike the old heuristic, plain `function`/`class`/`for`/`try`
+        // do NOT force the host engine — those are exactly what `just` handles
+        // better than the bytecode VM.
+        let needs_dom = s.contains("document")
             || s.contains("localStorage")
             || s.contains("sessionStorage")
             || s.contains("fetch")
@@ -407,21 +411,21 @@ pub fn run_scripts(dom: &mut JsDom, scripts: &[String]) -> Vec<String> {
             || s.contains("getContext")
             || s.contains("canvas")
             || s.contains("fillRect")
-            || s.contains("strokeRect")
-            || s.contains("function")
-            || s.contains("class ")
-            || s.contains("try ")
-            || s.contains("try{")
-            || s.contains("new ")
-            || s.contains("BigInt")
-            || s.contains("RegExp")
-            || s.contains("=>")
-            || s.contains("for (")
-            || s.contains("for(")
-            || s.contains("throw ")
-            || s.contains("return ")
-            || s.contains('{') && s.contains(':'); // object literal heuristic
-        if !needs_host {
+            || s.contains("strokeRect");
+        if !needs_dom {
+            // Tier 1: the `just` ES6 interpreter — closures, single classes,
+            // try/catch, destructuring, ternary, for/while loops. Its only
+            // observable effect for a DOM-free script is `console.*`, captured
+            // into `dom.log`. Any parse/runtime error or unsupported ES feature
+            // falls through to the bytecode VM and then the full tree-walker, so
+            // this can never regress a script that used to run.
+            if let Ok(out) = super::js_just::eval_program(s) {
+                for line in out.log {
+                    dom.log.push(line);
+                }
+                continue;
+            }
+            // Tier 2: the bytecode VM fast path (pure arithmetic/console).
             if let Ok(chunk) = super::js_bc::compile(s) {
                 let mut host = super::js_bc::MapHost::default();
                 if super::js_bc::run(&chunk, &mut host).is_ok() {
@@ -3565,6 +3569,23 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
     use crate::browser::html;
+
+    #[test_case]
+    fn dom_free_script_runs_on_just_tier() {
+        // A closure-based script (which the bytecode VM can't compile) is
+        // DOM-free, so `run_scripts` routes it to the `just` ES6 tier; its
+        // console output must land in dom.log.
+        let doc = html::parse("<html><body></body></html>");
+        let mut dom = JsDom::from_document(&doc);
+        let logs = run_scripts(
+            &mut dom,
+            &[String::from(
+                "function adder(n){ return function(x){ return x + n; }; } \
+                 let add10 = adder(10); console.log(add10(5));",
+            )],
+        );
+        assert!(logs.iter().any(|l| l.contains("15")), "{logs:?}");
+    }
 
     #[test_case]
     fn console_log_and_title() {

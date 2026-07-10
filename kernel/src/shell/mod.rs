@@ -421,6 +421,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "ping" => net_ping(arg),
         "wifi" => wifi_cmd(arg),
         "tls" => tls_cmd(arg),
+        "js" => run_js(arg),
         "think" => run_think(arg),
         "mode" => run_mode(arg),
         "permissions" | "perms" => run_permissions(arg),
@@ -591,6 +592,27 @@ fn tls_cmd(arg: &str) {
             serial_println!("tls> certificate verification ON (Mozilla root store).");
         }
         _ => serial_println!("tls> usage: /tls [status] | /tls insecure on|off"),
+    }
+}
+
+/// `/js <expression-or-program>` — evaluate JavaScript on the in-kernel `just`
+/// ES6 engine and print the result + any `console.*` output. Proves the ported
+/// engine end-to-end (parser + tree-walking interpreter + builtins) without the
+/// browser render path.
+fn run_js(arg: &str) {
+    let src = arg.trim();
+    if src.is_empty() {
+        serial_println!("js> usage: /js <expression>   e.g. /js 'class A{{f(){{return 42;}}}} new A().f()'");
+        return;
+    }
+    match crate::browser::js_just::eval_program(src) {
+        Ok(out) => {
+            for line in &out.log {
+                serial_println!("js> {line}");
+            }
+            serial_println!("js= {}", out.value);
+        }
+        Err(e) => serial_println!("js! {e}"),
     }
 }
 

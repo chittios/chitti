@@ -56,6 +56,7 @@ pub mod html;
 pub mod httpdate;
 pub mod js;
 pub mod js_bc;
+pub mod js_just;
 pub mod layout;
 pub mod loader;
 pub mod paint;

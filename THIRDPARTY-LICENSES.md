@@ -215,3 +215,43 @@ Chitti** — they are `std`/GUI multi-process engines unsuitable for this
 `no_std` kernel. Ideas are reimplemented in pure Rust under
 `kernel/src/browser/`. Serenity/Ladybird code is typically BSD-2-Clause;
 we do not copy their sources.
+
+### just-engine (applegrew/just) — ES6 JavaScript engine, vendored + no_std'd
+
+The browser's ES6 JavaScript tier is the [`just`](https://github.com/applegrew/just)
+engine (crate `just-engine`), **vendored in-tree at `third_party/just-ref`** and
+adapted to `no_std` + `alloc` for the kernel (see `kernel/src/browser/js_just.rs`).
+Only the **parser + tree-walking interpreter + standard-library built-ins** are
+compiled into the kernel; the Cranelift JIT and the two bytecode VMs
+(`src/runner/jit/`) are host-only and feature-gated off (`jit`). One source tree
+serves both the kernel (`default-features = false`, no_std) and the host
+webcompat harness (`tools/webcompat/just_runner`, default `std` + `jit`).
+Kernel-side substitutions: `std::collections::HashMap` → `hashbrown`, `uuid` →
+an atomic counter for anonymous symbols, `std::time`-seeded `Math.random` → an
+atomic LCG, `lazy_static` → its `spin_no_std` feature, `console.*` → a drainable
+global sink, `f64`/`f32` transcendentals → `num-traits`/`libm`.
+
+Licensed under **MIT OR Apache-2.0**. Upstream: https://github.com/applegrew/just
+
+### pest parser stack — vendored + no_std'd (for just-engine)
+
+`just`'s parser uses [pest](https://github.com/pest-parser/pest) (a PEG parser)
+via [`pest_consume`](https://github.com/Nadrieril/pest_consume). Neither
+supports `no_std` at the pinned versions (pest 2.1.3, pest_consume 1.0.6), so the
+stack is **vendored under `third_party/{pest,pest_consume,pest_generator,`
+`pest_consume_macros,pest_derive,pest_meta}`** and patched:
+
+* runtime `pest` + `pest_consume`: `#![no_std]` + `extern crate alloc`, the
+  `std::` → `core::`/`alloc::` module moves, `std::error::Error` impl dropped,
+  `prec_climber`'s `HashMap` → `BTreeMap`;
+* the code-generators (`pest_generator`, `pest_consume_macros` — proc-macro
+  crates that stay `std` on the host build) emit `::core::`/`::alloc::` paths and
+  a fully-qualified `::alloc::boxed::Box` instead of `::std::…`/bare `Box`;
+* `proc-macro-hack` (unmaintained) removed — `match_nodes!` is now a plain
+  `#[proc_macro]` (function-like proc-macros work in expression position on
+  modern Rust).
+
+The kernel's `[patch.crates-io]` in `kernel/Cargo.toml` repoints these crates to
+the vendored copies for its build only; the host `just_runner` keeps the
+crates.io versions. All are **MIT OR Apache-2.0** (pest: MIT/Apache-2.0).
+Transitive: `ucd-trie` (no_std), `hashbrown`, `num-traits`+`libm`, `spin`.

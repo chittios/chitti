@@ -129,3 +129,23 @@ htmlparser = { version = "0.2", default-features = false }
 # no_std + alloc via hashbrown (not std HashMap). Ships Geist Mono bytes via
 # include_bytes! from assets/GeistMono-Regular.ttf. MIT OR Apache-2.0 OR Zlib.
 fontdue = { version = "0.9", default-features = false, features = ["hashbrown"] }
+
+# The `just` ES6 JavaScript engine (applegrew/just), vendored + no_std'd, as the
+# browser's higher-tier JS runtime (classes, prototypes, closures, generators,
+# instanceof — the ES surface the hand-rolled js.rs/js_bc engines lack). Only its
+# parser + tree-walking interpreter + builtins compile in; the Cranelift JIT is
+# host-only and feature-gated off. See kernel/src/browser/js_just.rs and
+# THIRDPARTY-LICENSES.md. hashbrown is already pulled by fontdue.
+just-engine = { path = "../third_party/just-ref", default-features = false }
+
+# `just`'s Pest parser (pest / pest_consume 2.1) predates no_std support, so the
+# whole pest stack is vendored + patched under third_party/ and repointed here
+# for the kernel build only. The host webcompat harness keeps the crates.io
+# versions (see THIRDPARTY-LICENSES.md).
+[patch.crates-io]
+pest = { path = "../third_party/pest" }
+pest_derive = { path = "../third_party/pest_derive" }
+pest_generator = { path = "../third_party/pest_generator" }
+pest_meta = { path = "../third_party/pest_meta" }
+pest_consume = { path = "../third_party/pest_consume" }
+pest_consume_macros = { path = "../third_party/pest_consume_macros" }
