@@ -154,6 +154,15 @@ pub enum ExpressionType {
     ThisExpression {
         meta: Meta,
     },
+    /// ChittiOS: ES2020 dynamic `import(specifier)` — evaluates to a Promise.
+    ImportCall {
+        meta: Meta,
+        argument: Box<ExpressionType>,
+    },
+    /// ChittiOS: ES2020 `import.meta` meta-property.
+    ImportMeta {
+        meta: Meta,
+    },
     ArrayExpression {
         meta: Meta,
         elements: Vec<Option<ExpressionOrSpreadElement>>,
@@ -255,6 +264,8 @@ impl HasMeta for ExpressionType {
         match self {
             ExpressionType::Literal(data) => &data.meta,
             ExpressionType::ThisExpression { meta } => &meta,
+            ExpressionType::ImportCall { meta, .. } => &meta,
+            ExpressionType::ImportMeta { meta } => &meta,
             ExpressionType::ArrayExpression { meta, .. } => &meta,
             ExpressionType::ObjectExpression { meta, .. } => &meta,
             ExpressionType::FunctionOrGeneratorExpression(data) => &data.meta,
@@ -287,6 +298,17 @@ impl HasMeta for ExpressionType {
             ),
             ExpressionType::ThisExpression { meta } => {
                 format_struct("ExpressionType::ThisExpression")
+                    .add_fields("meta", meta.to_formatted_string(script))
+                    .to_string()
+            }
+            ExpressionType::ImportCall { meta, argument } => {
+                format_struct("ExpressionType::ImportCall")
+                    .add_fields("meta", meta.to_formatted_string(script))
+                    .add_fields("argument", argument.to_formatted_string(script))
+                    .to_string()
+            }
+            ExpressionType::ImportMeta { meta } => {
+                format_struct("ExpressionType::ImportMeta")
                     .add_fields("meta", meta.to_formatted_string(script))
                     .to_string()
             }
@@ -1737,6 +1759,13 @@ impl HasMeta for ClassData {
 pub struct ClassBodyData {
     pub meta: Meta,
     pub body: Vec<MethodDefinitionData>,
+    /// ChittiOS: ES2022 class fields (instance + static). Instance fields are
+    /// applied to `this` at construction; static fields to the constructor at
+    /// class-definition time.
+    pub fields: Vec<ClassFieldData>,
+    /// ChittiOS: ES2022 `static { … }` initialization blocks, run (in source
+    /// order) at class-definition time with `this` bound to the constructor.
+    pub static_blocks: Vec<StaticBlockData>,
 }
 impl HasMeta for ClassBodyData {
     fn get_meta(&self) -> &Meta {
@@ -1749,6 +1778,68 @@ impl HasMeta for ClassBodyData {
             .add_fields(
                 "body",
                 format_vec(&self.body, |p| p.to_formatted_string(script)),
+            )
+            .add_fields(
+                "fields",
+                format_vec(&self.fields, |p| p.to_formatted_string(script)),
+            )
+            .add_fields(
+                "static_blocks",
+                format_vec(&self.static_blocks, |p| p.to_formatted_string(script)),
+            )
+            .to_string()
+    }
+}
+
+/// ChittiOS: a single class field declaration (`x = 1`, `static y`, `#p = 2`).
+#[derive(Debug)]
+pub struct ClassFieldData {
+    pub meta: Meta,
+    /// The field key expression (an identifier / string / number literal, or a
+    /// computed `[expr]`). Private names are carried as an identifier `#name`.
+    pub key: Box<ExpressionType>,
+    pub computed: bool,
+    pub is_static: bool,
+    /// The initializer, if any (`= expr`). Absent → field initialized to
+    /// `undefined`.
+    pub value: Option<Box<ExpressionType>>,
+}
+impl HasMeta for ClassFieldData {
+    fn get_meta(&self) -> &Meta {
+        &self.meta
+    }
+
+    fn to_formatted_string(&self, script: &str) -> String {
+        format_struct("ClassFieldData")
+            .add_fields("meta", self.meta.to_formatted_string(script))
+            .add_fields("key", self.key.to_formatted_string(script))
+            .add_fields("computed", self.computed.to_string())
+            .add_fields("is_static", self.is_static.to_string())
+            .add_fields(
+                "value",
+                format_option(&self.value, |o| o.to_formatted_string(script)),
+            )
+            .to_string()
+    }
+}
+
+/// ChittiOS: a `static { … }` class initialization block.
+#[derive(Debug)]
+pub struct StaticBlockData {
+    pub meta: Meta,
+    pub body: Vec<StatementType>,
+}
+impl HasMeta for StaticBlockData {
+    fn get_meta(&self) -> &Meta {
+        &self.meta
+    }
+
+    fn to_formatted_string(&self, script: &str) -> String {
+        format_struct("StaticBlockData")
+            .add_fields("meta", self.meta.to_formatted_string(script))
+            .add_fields(
+                "body",
+                format_vec(&self.body, |s| s.to_formatted_string(script)),
             )
             .to_string()
     }

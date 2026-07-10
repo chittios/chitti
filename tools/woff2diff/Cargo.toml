@@ -1,0 +1,18 @@
+[package]
+name = "woff2diff"
+version = "0.1.0"
+edition = "2021"
+
+# Host-side validation harness for the kernel's WOFF2 decoder
+# (kernel/src/font_woff2.rs, mounted via #[path]). Decodes a fonttools-produced
+# WOFF2 fixture and diffs rasterized glyphs against the fonttools-decompressed
+# reference TTF. The onnxdiff/h264diff pattern — no QEMU.
+
+[workspace]
+
+[profile.release]
+debug = true
+
+[dependencies]
+brotli-decompressor = { version = "4", default-features = false }
+fontdue = "0.9"

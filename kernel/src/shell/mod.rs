@@ -6796,8 +6796,9 @@ fn browser_dispatch_nav(base: &str) -> Option<alloc::string::String> {
 }
 
 /// Fetch + register `@font-face` web fonts named in `css` (URLs resolved
-/// against `base_url`). WOFF is unwrapped to SFNT ([`crate::font_woff`]);
-/// WOFF2 (brotli) is logged as unsupported. Failures log, never abort a load.
+/// against `base_url`). WOFF is unwrapped to SFNT ([`crate::font_woff`]) and
+/// WOFF2 is Brotli-decompressed + glyf/loca-reconstructed
+/// ([`crate::font_woff2`]). Failures log, never abort a load.
 fn browser_load_fonts(css: &str, base_url: &str) {
     let faces = crate::browser::css::scan_font_faces(css);
     if faces.is_empty() {
@@ -6835,11 +6836,11 @@ fn browser_load_fonts(css: &str, base_url: &str) {
             crate::serial_println!("browser> font: '{}' not fetched ({})", family, abs);
             continue;
         };
-        if crate::font_woff::is_woff2(bytes) {
-            crate::serial_println!("browser> font: woff2 unsupported (brotli) {}", abs);
-            continue;
-        }
-        let res = if crate::font_woff::is_woff(bytes) {
+        let res = if crate::font_woff::is_woff2(bytes) {
+            // WOFF2: Brotli-decompress + reconstruct the transformed glyf/loca.
+            crate::font_woff2::woff2_to_sfnt(bytes)
+                .and_then(|sfnt| crate::font_ttf::load_family(&family, &sfnt))
+        } else if crate::font_woff::is_woff(bytes) {
             crate::font_woff::woff_to_sfnt(bytes)
                 .and_then(|sfnt| crate::font_ttf::load_family(&family, &sfnt))
         } else {

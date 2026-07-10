@@ -154,6 +154,9 @@ label_identifier = @{ identifier }
 label_identifier__yield = @{ "yield" | identifier }
 // The second production is for cases where the identifier is like 'thisIsMe'
 identifier = @{ !reserved_keyword ~ identifier_name | reserved_keyword ~ identifier_part+ }
+// ChittiOS: ES2022 private class element name (`#x`). Treated pragmatically as a
+// non-enumerable string property key `"#x"` — no per-instance brand check.
+private_name = @{ "#" ~ identifier_name }
 primary_expression = {
     // ChittiOS: keyword-led forms tried before identifier_reference so an
     // `async function(){}` expression isn't mis-read as the identifier `async`.
@@ -161,6 +164,8 @@ primary_expression = {
     generator_expression
     | function_expression
     | class_expression
+    | import_meta
+    | import_call
     | identifier_reference
     | literal
     | this_exp
@@ -174,6 +179,8 @@ primary_expression__yield = {
     generator_expression
     | function_expression
     | class_expression__yield
+    | import_meta
+    | import_call__yield
     | identifier_reference__yield
     | literal
     | this_exp
@@ -183,6 +190,12 @@ primary_expression__yield = {
     | template_literal__yield
     | cover_parenthesized_expression_and_arrow_parameter_list__yield
 }
+// ChittiOS: ES2020 dynamic `import(spec)` (returns a Promise) and the
+// `import.meta` meta-property. Reserved-word `import` means these only appear
+// here, so `import` alone never parses as an identifier.
+import_call = { "import" ~s~ "(" ~s~ assignment_expression__in ~s~ ")" }
+import_call__yield = { "import" ~s~ "(" ~s~ assignment_expression__in_yield ~s~ ")" }
+import_meta = { "import" ~s~ "." ~s~ "meta" }
 this_exp = { "this" }
 cover_parenthesized_expression_and_arrow_parameter_list = {
     "(" ~s~ expression__in ~s~ ")"
@@ -260,6 +273,7 @@ property_name = { literal_property_name | computed_property_name }
 property_name__yield = { literal_property_name | computed_property_name__yield }
 literal_property_name = {
     identifier_name
+    | private_name
     | string_literal
     | numeric_literal
 }
@@ -271,11 +285,17 @@ initializer = { "=" ~s~ assignment_expression }
 initializer__in = { "=" ~s~ assignment_expression__in }
 initializer__yield = { "=" ~s~ assignment_expression__yield }
 initializer__in_yield = { "=" ~s~ assignment_expression__in_yield }
-template_literal = ${
+// ChittiOS: `template_literal` is a *normal* (non-atomic) rule so implicit
+// whitespace applies inside the substitution — `${ 1 }`, `${a + b}`, and nested
+// templates `` `a${ `b` }c` `` all parse. The literal *text* stays exact because
+// `template_head`/`_middle`/`_tail` are themselves atomic (`${}`) rules; only
+// the expression between them is whitespace-tolerant. (`s` alone matches just
+// line terminators, so a compound-atomic template dropped every space.)
+template_literal = {
     no_substitution_template
     | template_head ~ expression__in ~ template_spans
 }
-template_literal__yield = ${
+template_literal__yield = {
     no_substitution_template
     | template_head ~ expression__in_yield ~ template_spans__yield
 }
@@ -292,11 +312,11 @@ optional_call = { "?." ~s~ arguments }
 optional_call__yield = { "?." ~s~ arguments__yield }
 member_expression = {
     (super_property | meta_property | ("new" ~s~ new_member_expression ~s~ arguments) | primary_expression)
-    ~ (s~ "[" ~s~ expression__in ~s~ "]" | optional_index | "." ~s~ identifier_name | optional_member | template_literal)*
+    ~ (s~ "[" ~s~ expression__in ~s~ "]" | optional_index | "." ~s~ identifier_name | "." ~s~ private_name | optional_member | template_literal)*
 }
 member_expression__yield = {
     (super_property__yield | meta_property | ("new" ~s~ new_member_expression__yield ~s~ arguments__yield) | primary_expression__yield)
-    ~ (s~ "[" ~s~ expression__in_yield ~s~ "]" | optional_index__yield | "." ~s~ identifier_name | optional_member | template_literal__yield)*
+    ~ (s~ "[" ~s~ expression__in_yield ~s~ "]" | optional_index__yield | "." ~s~ identifier_name | "." ~s~ private_name | optional_member | template_literal__yield)*
 }
 new_member_expression = { member_expression }
 new_member_expression__yield = { member_expression__yield }
@@ -345,11 +365,11 @@ rest_assignment_expression__in_yield = { assignment_expression__in_yield }
 // consumes the next `arguments` suffix, innermost first — spec semantics).
 left_hand_side_expression = {
     (new_op ~s)* ~ (super_call | member_expression)
-    ~ (s~ arguments | "[" ~s~ expression__in ~s~ "]" | optional_index | optional_call | "." ~s~ identifier_name | optional_member | template_literal)*
+    ~ (s~ arguments | "[" ~s~ expression__in ~s~ "]" | optional_index | optional_call | "." ~s~ identifier_name | "." ~s~ private_name | optional_member | template_literal)*
 }
 left_hand_side_expression__yield = {
     (new_op ~s)* ~ (super_call__yield | member_expression__yield)
-    ~ (s~ arguments__yield | "[" ~s~ expression__in_yield ~s~ "]" | optional_index__yield | optional_call__yield | "." ~s~ identifier_name | optional_member | template_literal__yield)*
+    ~ (s~ arguments__yield | "[" ~s~ expression__in_yield ~s~ "]" | optional_index__yield | optional_call__yield | "." ~s~ identifier_name | "." ~s~ private_name | optional_member | template_literal__yield)*
 }
 postfix_expression = {
     left_hand_side_expression ~ (!line_terminator ~ postfix_operator)?
@@ -743,8 +763,10 @@ binding_element = { single_name_binding | binding_pattern ~ initializer__in? }
 binding_element__yield = { single_name_binding__yield | binding_pattern__yield ~ initializer__in_yield? }
 single_name_binding = { binding_identifier ~ initializer__in? }
 single_name_binding__yield = { binding_identifier__yield ~ initializer__in_yield? }
-binding_rest_element = { "..." ~ binding_identifier }
-binding_rest_element__yield = { "..." ~ binding_identifier__yield }
+// ChittiOS: a rest element may bind an array/object pattern (`...[a,b]`,
+// `...{x}`), not just an identifier (ES2015 BindingRestElement).
+binding_rest_element = { "..." ~ (binding_pattern | binding_identifier) }
+binding_rest_element__yield = { "..." ~ (binding_pattern__yield | binding_identifier__yield) }
 empty_statement = { ";" | line_terminator }
 expression_statement = { !("{" | "function" | "class" | "let"  ~ "[") ~ expression__in ~ smart_semicolon }
 expression_statement__yield = { !("{" | "function" | "class" | "let"  ~ "[") ~ expression__in_yield ~ smart_semicolon }
@@ -779,9 +801,9 @@ iteration_statement = {
     | "for" ~s~ "(" ~s~ !("let" ~ "[") ~ left_hand_side_expression ~ "in" ~s~ expression__in ~ ")" ~s~ statement
     | "for" ~s~ "(" ~s~ "var" ~s~ for_binding ~s~ "in" ~s~ expression__in ~s~ ")" ~s~ statement
     | "for" ~s~ "(" ~s~ for_declaration ~s~ "in" ~s~ expression__in ~s~ ")" ~s~ statement
-    | "for" ~s~ "(" ~s~ !"let" ~ left_hand_side_expression ~s~ "of" ~s~ assignment_expression__in ~s~ ")" ~s~ statement
-    | "for" ~s~ "(" ~s~ "var" ~s~ for_binding ~s~ "of" ~s~ assignment_expression__in ~s~ ")" ~s~ statement
-    | "for" ~s~ "(" ~s~ for_declaration ~s~ "of" ~s~ assignment_expression__in ~s~ ")" ~s~ statement
+    | "for" ~s~ ("await" ~ !identifier_part ~ s)? ~ "(" ~s~ !"let" ~ left_hand_side_expression ~s~ "of" ~s~ assignment_expression__in ~s~ ")" ~s~ statement
+    | "for" ~s~ ("await" ~ !identifier_part ~ s)? ~ "(" ~s~ "var" ~s~ for_binding ~s~ "of" ~s~ assignment_expression__in ~s~ ")" ~s~ statement
+    | "for" ~s~ ("await" ~ !identifier_part ~ s)? ~ "(" ~s~ for_declaration ~s~ "of" ~s~ assignment_expression__in ~s~ ")" ~s~ statement
 }
 iteration_statement__yield = {
     "do" ~s~ statement__yield ~s~ "while" ~s~ "(" ~s~ expression__in_yield ~s~ ")" ~ (s~ ";")?
@@ -792,9 +814,9 @@ iteration_statement__yield = {
     | "for" ~s~ "(" ~s~ !("let" ~ "[") ~ left_hand_side_expression__yield ~s~ "in" ~s~ expression__in_yield ~s~ ")" ~s~ statement__yield
     | "for" ~s~ "(" ~s~ "var" ~s~ for_binding__yield ~s~ "in" ~s~ expression__in_yield ~s~ ")" ~s~ statement__yield
     | "for" ~s~ "(" ~s~ for_declaration__yield ~s~ "in" ~s~ expression__in_yield ~s~ ")" ~s~ statement__yield
-    | "for" ~s~ "(" ~s~ !"let" ~ left_hand_side_expression__yield ~s~ "of" ~s~ assignment_expression__in_yield ~s~ ")" ~s~ statement__yield
-    | "for" ~s~ "(" ~s~ "var" ~s~ for_binding__yield ~s~ "of" ~s~ assignment_expression__in_yield ~s~ ")" ~s~ statement__yield
-    | "for" ~s~ "(" ~s~ for_declaration__yield ~s~ "of" ~s~ assignment_expression__in_yield ~s~ ")" ~s~ statement__yield
+    | "for" ~s~ ("await" ~ !identifier_part ~ s)? ~ "(" ~s~ !"let" ~ left_hand_side_expression__yield ~s~ "of" ~s~ assignment_expression__in_yield ~s~ ")" ~s~ statement__yield
+    | "for" ~s~ ("await" ~ !identifier_part ~ s)? ~ "(" ~s~ "var" ~s~ for_binding__yield ~s~ "of" ~s~ assignment_expression__in_yield ~s~ ")" ~s~ statement__yield
+    | "for" ~s~ ("await" ~ !identifier_part ~ s)? ~ "(" ~s~ for_declaration__yield ~s~ "of" ~s~ assignment_expression__in_yield ~s~ ")" ~s~ statement__yield
 }
 iteration_statement__return = {
     "do" ~s~ statement__return ~s~ "while" ~s~ "(" ~s~ expression__in ~s~ ")" ~ (s~ ";")?
@@ -805,9 +827,9 @@ iteration_statement__return = {
     | "for" ~s~ "(" ~s~ !("let" ~ "[") ~ left_hand_side_expression ~s~ "in" ~s~ expression__in ~s~ ")" ~s~ statement__return
     | "for" ~s~ "(" ~s~ "var" ~s~ for_binding ~s~ "in" ~s~ expression__in ~s~ ")" ~s~ statement__return
     | "for" ~s~ "(" ~s~ for_declaration ~s~ "in" ~s~ expression__in ~s~ ")" ~s~ statement__return
-    | "for" ~s~ "(" ~s~ !"let" ~ left_hand_side_expression ~s~ "of" ~s~ assignment_expression__in ~s~ ")" ~s~ statement__return
-    | "for" ~s~ "(" ~s~ "var" ~s~ for_binding ~s~ "of" ~s~ assignment_expression__in ~s~ ")" ~s~ statement__return
-    | "for" ~s~ "(" ~s~ for_declaration ~s~ "of" ~s~ assignment_expression__in ~s~ ")" ~s~ statement__return
+    | "for" ~s~ ("await" ~ !identifier_part ~ s)? ~ "(" ~s~ !"let" ~ left_hand_side_expression ~s~ "of" ~s~ assignment_expression__in ~s~ ")" ~s~ statement__return
+    | "for" ~s~ ("await" ~ !identifier_part ~ s)? ~ "(" ~s~ "var" ~s~ for_binding ~s~ "of" ~s~ assignment_expression__in ~s~ ")" ~s~ statement__return
+    | "for" ~s~ ("await" ~ !identifier_part ~ s)? ~ "(" ~s~ for_declaration ~s~ "of" ~s~ assignment_expression__in ~s~ ")" ~s~ statement__return
 }
 iteration_statement__yield_return = {
     "do" ~s~ statement__yield_return ~s~ "while" ~s~ "(" ~s~ expression__in_yield ~s~ ")" ~ (s~ ";")?
@@ -818,9 +840,9 @@ iteration_statement__yield_return = {
     | "for" ~s~ "(" ~s~ !("let" ~ "[") ~ left_hand_side_expression__yield ~s~ "in" ~s~ expression__in_yield ~ ")" ~s~ statement__yield_return
     | "for" ~s~ "(" ~s~ "var" ~s~ for_binding__yield ~s~ "in" ~s~ expression__in_yield ~s~ ")" ~s~ statement__yield_return
     | "for" ~s~ "(" ~s~ for_declaration__yield ~s~ "in" ~s~ expression__in_yield ~s~ ")" ~s~ statement__yield_return
-    | "for" ~s~ "(" ~s~ !"let" ~ left_hand_side_expression__yield ~s~ "of" ~s~ assignment_expression__in_yield ~s~ ")" ~s~ statement__yield_return
-    | "for" ~s~ "(" ~s~ "var" ~s~ for_binding__yield ~ "of" ~s~ assignment_expression__in_yield ~s~ ")" ~s~ statement__yield_return
-    | "for" ~s~ "(" ~s~ for_declaration__yield ~s~ "of" ~s~ assignment_expression__in_yield ~s~ ")" ~s~ statement__yield_return
+    | "for" ~s~ ("await" ~ !identifier_part ~ s)? ~ "(" ~s~ !"let" ~ left_hand_side_expression__yield ~s~ "of" ~s~ assignment_expression__in_yield ~s~ ")" ~s~ statement__yield_return
+    | "for" ~s~ ("await" ~ !identifier_part ~ s)? ~ "(" ~s~ "var" ~s~ for_binding__yield ~ "of" ~s~ assignment_expression__in_yield ~s~ ")" ~s~ statement__yield_return
+    | "for" ~s~ ("await" ~ !identifier_part ~ s)? ~ "(" ~s~ for_declaration__yield ~s~ "of" ~s~ assignment_expression__in_yield ~s~ ")" ~s~ statement__yield_return
 }
 for_declaration = { let_or_const ~ for_binding }
 for_declaration__yield = { let_or_const ~ for_binding__yield }
@@ -1008,15 +1030,31 @@ getter = @{ "get" ~ !identifier_part }
 setter = @{ "set" ~ !identifier_part }
 method_definition = {
     generator_method
+    | async_generator_method
+    | async_method
     | getter ~s~ property_name ~s~ "(" ~s~ ")" ~s~ "{" ~s~ function_body ~s~ "}"
     | setter ~s~ property_name ~s~ "(" ~s~ property_set_parameter_list ~s~ ")" ~s~ "{" ~s~ function_body ~s~ "}"
     | property_name ~s~ "(" ~s~ strict_formal_parameters ~s~ ")" ~s~ "{" ~s~ function_body ~s~ "}"
 }
 method_definition__yield = {
     generator_method__yield
+    | async_generator_method
+    | async_method
     | getter ~s~ property_name__yield ~s~ "(" ~s~ ")" ~s~ "{" ~s~ function_body ~s~ "}"
     | setter ~s~ property_name__yield ~s~ "(" ~s~ property_set_parameter_list ~s~ ")" ~s~ "{" ~s~ function_body ~s~ "}"
     | property_name__yield ~s~ "(" ~s~ strict_formal_parameters ~s~ ")" ~s~ "{" ~s~ function_body ~s~ "}"
+}
+// ChittiOS: ES2017 async method / ES2018 async generator method (also reached
+// from object literals via `property_definition`). `async_kw` is atomic so the
+// `!identifier_part` boundary is checked before any implicit whitespace — this
+// keeps `asyncFoo(){}` a plain method named `asyncFoo`, and a method literally
+// named `async` falls through when no method-name follows.
+async_kw = @{ "async" ~ !identifier_part }
+async_method = {
+    async_kw ~s~ property_name ~s~ "(" ~s~ strict_formal_parameters ~s~ ")" ~s~ "{" ~s~ function_body ~s~ "}"
+}
+async_generator_method = {
+    async_kw ~s~ "*" ~s~ property_name ~s~ "(" ~s~ strict_formal_parameters__yield ~s~ ")" ~s~ "{" ~s~ generator_body ~s~ "}"
 }
 property_set_parameter_list = _{ formal_parameter }
 generator_method = {
@@ -1091,16 +1129,31 @@ class_body = { class_element_list }
 class_body__yield = { class_element_list__yield }
 class_element_list =  _{ (class_element ~s)+ }
 class_element_list__yield =  _{ (class_element__yield ~s)+ }
-// "static" must be a named rule so it generates a Pair for the parser to detect
-class_static = { "static" }
+// "static" must be a named rule so it generates a Pair for the parser to detect.
+// `!identifier_part` so `staticField = 1` is a field named `staticField`, not
+// the static modifier followed by `Field`.
+class_static = { "static" ~ !identifier_part }
+// ChittiOS: ES2022 class elements — instance/static fields, static init blocks,
+// and private (`#x`) names, in addition to methods. Methods are tried before
+// fields (a field with the same leading name — `x(){}` vs `x=1` — only differs
+// after the name), and the static block before a static method/field.
+class_static_block = { "{" ~s~ statement_list? ~s~ "}" }
+class_element_name = { property_name | private_name }
+field_definition = { class_element_name ~s~ initializer__in? }
 class_element = {
-    method_definition
+    class_static ~s~ class_static_block
     | class_static ~s~ method_definition
+    | class_static ~s~ field_definition ~s~ ";"?
+    | method_definition
+    | field_definition ~s~ ";"?
     | ";"
 }
 class_element__yield = {
-    method_definition__yield
+    class_static ~s~ class_static_block
     | class_static ~s~ method_definition__yield
+    | class_static ~s~ field_definition ~s~ ";"?
+    | method_definition__yield
+    | field_definition ~s~ ";"?
     | ";"
 }
 script_body = _{ statement_list }

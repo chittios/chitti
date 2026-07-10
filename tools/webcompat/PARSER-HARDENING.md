@@ -121,13 +121,48 @@ next; fully-parsing chunks went **4 → 25 / 41** (96% of runnable), test262
 Host-only JIT compilers got best-effort/fallback arms for every new node
 (the tree-walking interpreter is authoritative; the kernel never uses the JIT).
 
+## Fix 7 — ES2022 class fields/private/static-blocks, async methods, template eval, `for await`, rest patterns
+
+Closed the entire remaining vercel.com parse gap — **all 41 chunks now parse
+(skip=0)**; test262 **906 → 909**, zero regressions.
+
+- **Class fields** (instance + static) — grammar `field_definition`,
+  `class_element_name`, `class_static_block`; AST `ClassFieldData` /
+  `StaticBlockData` on `ClassBodyData`. Instance-field initializers are carried
+  on the constructor `SimpleFunctionObject` (`instance_fields`) and applied to
+  `this` at the top of the constructor call (a synthesized field-only default
+  constructor has a null body + `__has_field_init__` so `call_function_object`
+  routes it through `call_with_this` while `invoke_constructor` still performs
+  the implicit `super(...)`). Static fields/blocks run at class-definition time
+  with `this` = constructor. **Caveat:** for a *derived* class with an explicit
+  constructor, fields init before the body's `super(...)` (this engine creates
+  `this` up front) — a parent ctor could overwrite a same-named field; rare,
+  documented.
+- **Private names** `#x` — a pragmatic non-enumerable string key `"#x"`
+  (`private_name` grammar; reachable via `literal_property_name` for methods and
+  `class_element_name` for fields; `.#x` member access). No per-instance brand.
+- **Static init blocks** `static { … }` — run in source order at definition.
+- **Async / async-generator methods** `async m(){}`, `async *g(){}` (class and
+  object literals) — atomic `async_kw` keeps `asyncFoo(){}` a plain method;
+  `is_async`/`generator` flow to `FunctionData` (Promise-wrapped return).
+- **Template-literal substitution eval** was a runtime stub — now interleaves
+  cooked quasis with string-coerced expression values. Also made
+  `template_literal` a *normal* (non-atomic) rule so `${ 1 }`, `${a + b}`, and
+  nested templates `` `a${ `b` }c` `` parse (`s` alone matches only line
+  terminators, so the old compound-atomic form dropped every space).
+- **`for await (x of y)`** — optional `await` on every for-of variant (maps to a
+  normal for-of; ChittiOS async is synchronous-settlement).
+- **Rest-element binding patterns** `(...[a,b])` / `(...{x})` — `binding_rest_element`
+  accepts a `binding_pattern` (the AST `RestElement.argument` was already a
+  pattern; the interpreter already recurses via `bind_pattern`).
+- **`globalThis` in the browser** now aliases the stable `window`
+  (`js_just.rs`) — the engine default returns a fresh empty object, breaking the
+  `globalThis.X = globalThis.X || []` turbopack pattern.
+
 ## Final state
 
-files=1104 **pass=906** skip=70 panics=0 (of runnable ≈ 87.6%). jQuery 3.7.1
-slim + lodash-core parse+run; **25/41 vercel.com chunks fully parse.** Remaining
-vercel gaps (documented, not silently skipped): **class fields + private names
-`#x`** (9 chunks — the biggest remaining feature: needs private-name lexing +
-field-init semantics) and a few edge cases (a `unary_expression`/
-`method_definition`/`lexical_binding` form each). Residual `--raw` `TypeError`s
-are the bare harness lacking `window`/`document`/global (present in the browser
-tier).
+files=1104 **pass=909** skip=64 panics=0. jQuery 3.7.1 slim + lodash-core
+parse+run; **41/41 vercel.com chunks parse (skip=0).** The only two `--raw`
+runtime errors left are bare-harness environment gaps (`self is not defined`,
+webpack module-registry `.call`) — both chunks parse and run in the browser tier
+(which provides `window`/`self`/`globalThis`/`document`).

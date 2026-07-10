@@ -352,39 +352,87 @@ fn json_stringify(
         return Ok(JsValue::Undefined);
     }
 
-    let value = &args[0];
-    stringify_value(value)
-}
-
-/// Stringify a JavaScript value to JSON.
-fn stringify_value(value: &JsValue) -> Result<JsValue, JErrorType> {
-    let result = match value {
-        JsValue::Null => "null".to_string(),
-        JsValue::Boolean(true) => "true".to_string(),
-        JsValue::Boolean(false) => "false".to_string(),
-        JsValue::Number(JsNumberType::Integer(i)) => i.to_string(),
-        JsValue::Number(JsNumberType::Float(f)) => {
-            if f.is_finite() {
-                f.to_string()
-            } else {
-                "null".to_string()
-            }
+    // The optional `space` argument: a number (clamped to 10 spaces) or a string
+    // (first 10 chars) → pretty-print indentation.
+    let indent = match args.get(2) {
+        Some(JsValue::Number(JsNumberType::Integer(n))) => {
+            " ".repeat((*n).clamp(0, 10) as usize)
         }
-        JsValue::Number(JsNumberType::NaN) => "null".to_string(),
-        JsValue::Number(JsNumberType::PositiveInfinity) => "null".to_string(),
-        JsValue::Number(JsNumberType::NegativeInfinity) => "null".to_string(),
-        JsValue::String(s) => stringify_string(s),
-        JsValue::Undefined => return Ok(JsValue::Undefined),
-        JsValue::Symbol(_) => return Ok(JsValue::Undefined),
-        JsValue::Object(_) => {
-            // TODO: Implement object/array stringification when those are available
-            return Err(JErrorType::TypeError(
-                "JSON.stringify for objects not yet implemented".to_string(),
-            ));
+        Some(JsValue::Number(JsNumberType::Float(f))) => {
+            " ".repeat((*f as i64).clamp(0, 10) as usize)
         }
+        Some(JsValue::String(s)) => s.chars().take(10).collect(),
+        _ => String::new(),
     };
 
-    Ok(JsValue::String(result))
+    match stringify_inner(&args[0], &indent, "") {
+        Some(s) => Ok(JsValue::String(s)),
+        None => Ok(JsValue::Undefined),
+    }
+}
+
+/// Stringify a value to JSON, honoring the `indent` unit and `cur` (the current
+/// accumulated indentation). Returns `None` for values JSON omits (undefined,
+/// functions, symbols) so a containing object can skip the property.
+fn stringify_inner(value: &JsValue, indent: &str, cur: &str) -> Option<String> {
+    use crate::runner::eval::expression::{
+        array_elements, get_own_prop_value, is_array, own_string_keys, value_is_callable,
+    };
+    match value {
+        JsValue::Null => Some("null".to_string()),
+        JsValue::Boolean(true) => Some("true".to_string()),
+        JsValue::Boolean(false) => Some("false".to_string()),
+        JsValue::Number(JsNumberType::Integer(i)) => Some(i.to_string()),
+        JsValue::Number(JsNumberType::Float(f)) => {
+            Some(if f.is_finite() { f.to_string() } else { "null".to_string() })
+        }
+        JsValue::Number(_) => Some("null".to_string()), // NaN / ±Infinity
+        JsValue::String(s) => Some(stringify_string(s)),
+        JsValue::Undefined | JsValue::Symbol(_) => None,
+        JsValue::Object(_) => {
+            // Functions serialize to nothing (omitted), like undefined.
+            if value_is_callable(value) {
+                return None;
+            }
+            let nl = if indent.is_empty() { "" } else { "\n" };
+            let inner_indent = alloc::format!("{cur}{indent}");
+            let sep = if indent.is_empty() { "," } else { ",\n" };
+            let colon = if indent.is_empty() { ":" } else { ": " };
+            if is_array(value) {
+                let elems = array_elements(value);
+                if elems.is_empty() {
+                    return Some("[]".to_string());
+                }
+                let mut parts: Vec<String> = Vec::with_capacity(elems.len());
+                for e in &elems {
+                    // Omitted values become `null` inside an array.
+                    let s = stringify_inner(e, indent, &inner_indent)
+                        .unwrap_or_else(|| "null".to_string());
+                    parts.push(alloc::format!("{inner_indent}{s}"));
+                }
+                Some(alloc::format!(
+                    "[{nl}{}{nl}{cur}]",
+                    parts.join(sep)
+                ))
+            } else {
+                let keys = own_string_keys(value);
+                let mut parts: Vec<String> = Vec::new();
+                for k in &keys {
+                    let Some(v) = get_own_prop_value(value, k) else { continue };
+                    if let Some(vs) = stringify_inner(&v, indent, &inner_indent) {
+                        parts.push(alloc::format!(
+                            "{inner_indent}{}{colon}{vs}",
+                            stringify_string(k)
+                        ));
+                    }
+                }
+                if parts.is_empty() {
+                    return Some("{}".to_string());
+                }
+                Some(alloc::format!("{{{nl}{}{nl}{cur}}}", parts.join(sep)))
+            }
+        }
+    }
 }
 
 /// Stringify a string with proper escaping.

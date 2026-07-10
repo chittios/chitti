@@ -663,14 +663,17 @@ impl PluginResolver for DomResolver {
                 "document" | "window" | "location" | "localStorage" | "sessionStorage"
                     | "navigator" | "parent" | "self" | "top" | "fetch" | "WebAssembly"
                     | "postMessage" | "Element" | "ClassList" | "Style" | "Canvas2d" | "Response"
-                    | "Event"
+                    | "Event" | "globalThis"
             )
     }
 
     fn resolve(&self, name: &str, _ctx: &mut EvalContext) -> Result<JsValue, JErrorType> {
         Ok(match name {
             "document" => self.document.clone(),
-            "window" | "self" => self.window.clone(),
+            // `globalThis === window === self` in a browser — all resolve to the
+            // one stable window object (so `globalThis.X = …` persists; the
+            // engine's default `globalThis` hands back a fresh empty object).
+            "window" | "self" | "globalThis" => self.window.clone(),
             "top" | "parent" => self.parent.clone(),
             "location" => self.location.clone(),
             "localStorage" => self.storage.clone(),

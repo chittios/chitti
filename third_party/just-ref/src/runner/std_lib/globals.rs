@@ -25,7 +25,53 @@ fn is_global_fn(name: &str) -> bool {
         name,
         "isNaN" | "isFinite" | "parseInt" | "parseFloat" | "Boolean" | "Symbol" | "eval"
             | "Function"
+            | "encodeURIComponent" | "decodeURIComponent" | "encodeURI" | "decodeURI"
     )
+}
+
+/// Percent-encode `s` (UTF-8), leaving the unreserved set — plus any byte in
+/// `extra` — unescaped. Backs `encodeURI`/`encodeURIComponent`.
+fn uri_encode(s: &str, extra: &[u8]) -> String {
+    let mut out = String::new();
+    for &b in s.as_bytes() {
+        let unreserved = b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')');
+        if unreserved || extra.contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+            out.push(char::from_digit((b & 0xF) as u32, 16).unwrap().to_ascii_uppercase());
+        }
+    }
+    out
+}
+
+/// Decode `%XX` escapes in `s` (UTF-8). Backs `decodeURI`/`decodeURIComponent`.
+fn uri_decode(s: &str) -> Result<String, JErrorType> {
+    let bytes = s.as_bytes();
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err(JErrorType::TypeError("URI malformed".to_string()));
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            match (hi, lo) {
+                (Some(h), Some(l)) => {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                }
+                _ => return Err(JErrorType::TypeError("URI malformed".to_string())),
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// Stringify a value for `Function` param/body assembly and `eval` non-string
@@ -264,6 +310,17 @@ impl PluginResolver for GlobalsResolver {
             }
             "parseInt" => parse_int(&a0, args.get(1).unwrap_or(&JsValue::Undefined)),
             "parseFloat" => parse_float(&a0),
+            "encodeURIComponent" => JsValue::String(uri_encode(&as_source_str(&a0), b"")),
+            // encodeURI also preserves the reserved + mark characters.
+            "encodeURI" => {
+                JsValue::String(uri_encode(&as_source_str(&a0), b";,/?:@&=+$#"))
+            }
+            "decodeURIComponent" | "decodeURI" => {
+                match uri_decode(&as_source_str(&a0)) {
+                    Ok(s) => JsValue::String(s),
+                    Err(e) => return Some(Err(e)),
+                }
+            }
             "Boolean" => JsValue::Boolean(truthy(&a0)),
             "Symbol" => {
                 let desc = match &a0 {

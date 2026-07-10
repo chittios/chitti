@@ -84,7 +84,18 @@ pub struct EvalContext {
     /// `LabelledStatement`. A loop takes these at entry so `break label` /
     /// `continue label` target it; a labelled non-loop consumes them itself.
     pub pending_labels: alloc::vec::Vec<alloc::string::String>,
+    /// ChittiOS: current JS call-stack depth. Guards against unbounded native
+    /// recursion (the interpreter recurses on the *host* stack, so a runaway or
+    /// non-tail-recursive script would overflow the kernel stack and crash the
+    /// OS). Past [`MAX_CALL_DEPTH`] a `RangeError("Maximum call stack size
+    /// exceeded")` is thrown, exactly as a real engine does.
+    pub call_depth: u32,
 }
+
+/// Maximum JS call-stack depth before a `RangeError` is thrown. The interpreter
+/// uses the host (kernel) stack per frame, which is small, so this is
+/// conservative — deep-but-finite recursion throws cleanly rather than faulting.
+pub const MAX_CALL_DEPTH: u32 = 480;
 
 /// ChittiOS: property backing for host-native objects (e.g. a live DOM view).
 /// An object with an `__native_node__` integer has its property reads/writes
@@ -131,6 +142,7 @@ impl EvalContext {
             current_super: None,
             native_props: None,
             pending_labels: alloc::vec::Vec::new(),
+            call_depth: 0,
         }
     }
 
@@ -168,6 +180,7 @@ impl EvalContext {
             current_super: None,
             native_props: None,
             pending_labels: alloc::vec::Vec::new(),
+            call_depth: 0,
         }
     }
 

@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use crate::parser::ast::StatementType::BreakStatement;
 use crate::parser::ast::{
     AssignmentOperator, AssignmentPropertyData, AstBuilderValidationErrorType, BinaryOperator,
-    BlockStatementData, CatchClauseData, ClassBodyData, ClassData, DeclarationType,
+    BlockStatementData, CatchClauseData, ClassBodyData, ClassData, ClassFieldData, StaticBlockData, DeclarationType,
     ExpressionOrSpreadElement, ExpressionOrSuper, ExpressionPatternType, ExpressionType,
     ExtendedNumberLiteralType, FormalParameters, ForIteratorData, FunctionBodyData,
     FunctionBodyOrExpression, FunctionData, HasMeta, IdentifierData, JsError, JsErrorType,
@@ -601,15 +601,12 @@ fn build_ast_from_formal_parameters(
         args.push(match param.as_rule() {
             Rule::function_rest_parameter | Rule::function_rest_parameter__yield => {
                 let binding_rest_element = param.into_inner().next().unwrap();
-                let binding_identifier_item = binding_rest_element.into_inner().next().unwrap();
-                let (binding_identifier, binding_identifier_s) =
-                    get_binding_identifier_data(binding_identifier_item, script)?;
-                s.merge(binding_identifier_s);
+                let (argument, arg_s) =
+                    build_ast_from_binding_rest_argument(binding_rest_element, script)?;
+                s.merge(arg_s);
                 PatternType::RestElement {
                     meta,
-                    argument: Box::new(
-                        ExpressionPatternType::Identifier(binding_identifier).convert_to_pattern(),
-                    ),
+                    argument: Box::new(argument),
                 }
             }
             Rule::formal_parameter | Rule::formal_parameter__yield => {
@@ -1267,6 +1264,28 @@ fn build_ast_for_breakable_statement_for(
     })
 }
 
+/// ChittiOS: build the argument pattern of a `binding_rest_element`
+/// (`...id`, `...[a,b]`, `...{x}`). The inner is either a `binding_identifier`
+/// or a `binding_pattern`.
+fn build_ast_from_binding_rest_argument(
+    binding_rest_element: Pair<Rule>,
+    script: &Rc<String>,
+) -> Result<(PatternType, Semantics), JsRuleError> {
+    let inner = binding_rest_element.into_inner().next().unwrap();
+    match inner.as_rule() {
+        Rule::binding_pattern | Rule::binding_pattern__yield => {
+            build_ast_from_binding_pattern(inner, script)
+        }
+        _ => {
+            let (id, id_s) = get_binding_identifier_data(inner, script)?;
+            Ok((
+                ExpressionPatternType::Identifier(id).convert_to_pattern(),
+                id_s,
+            ))
+        }
+    }
+}
+
 fn build_ast_from_binding_pattern(
     pair: Pair<Rule>,
     script: &Rc<String>,
@@ -1324,20 +1343,12 @@ fn build_ast_from_binding_pattern(
                     }
                     Rule::binding_rest_element | Rule::binding_rest_element__yield => {
                         let rest_meta = get_meta(&item_pair, script);
-                        let binding_id_pair = item_pair.into_inner().next().ok_or_else(|| {
-                            get_validation_error_with_meta(
-                                "Expected binding identifier in rest element".to_string(),
-                                AstBuilderValidationErrorType::SyntaxError,
-                                rest_meta.clone(),
-                            )
-                        })?;
-                        let (id, id_s) = get_binding_identifier_data(binding_id_pair, script)?;
-                        s.merge(id_s);
+                        let (argument, arg_s) =
+                            build_ast_from_binding_rest_argument(item_pair, script)?;
+                        s.merge(arg_s);
                         elements.push(Some(Box::new(PatternType::RestElement {
                             meta: rest_meta,
-                            argument: Box::new(
-                                ExpressionPatternType::Identifier(id).convert_to_pattern(),
-                            ),
+                            argument: Box::new(argument),
                         })));
                     }
                     _ => {
@@ -1504,7 +1515,9 @@ fn build_ast_from_property_name(
         let pn_pair = inner_pair.into_inner().next().unwrap();
         let s = Semantics::new_empty();
         (
-            if pn_pair.as_rule() == Rule::identifier_name {
+            if pn_pair.as_rule() == Rule::identifier_name || pn_pair.as_rule() == Rule::private_name {
+                // A private name (`#x`) is carried as an identifier whose name
+                // includes the leading `#`; it resolves to the string key "#x".
                 let id = get_identifier_data(pn_pair, script);
                 ExpressionPatternType::Identifier(id).convert_to_expression()
             } else if pn_pair.as_rule() == Rule::string_literal {
@@ -2197,6 +2210,8 @@ fn convert_lhs_expression_to_pattern_for_assignment_operation(
         | ExpressionType::TemplateLiteral(TemplateLiteralData { meta, .. })
         | ExpressionType::TaggedTemplateExpression { meta, .. }
         | ExpressionType::ClassExpression(ClassData { meta, .. })
+        | ExpressionType::ImportCall { meta, .. }
+        | ExpressionType::ImportMeta { meta }
         | ExpressionType::MetaProperty { meta, .. } => {
             if s.is_some() && s.unwrap().is_valid_simple_assignment_target.is_true() {
                 Err(JsRuleError{ kind: JsErrorType::Unexpected("Unexpected error reached in convert_lhs_expression_to_pattern"), message: "Did not expect a simple assignment target here. It then needs to be converted to pattern".to_string() })
@@ -2370,7 +2385,7 @@ fn build_ast_from_left_hand_side_expression(
                     },
                 )
             }
-            Rule::identifier_name => ExpressionType::MemberExpression(
+            Rule::identifier_name | Rule::private_name => ExpressionType::MemberExpression(
                 MemberExpressionType::SimpleMemberExpression {
                     meta,
                     object: ExpressionOrSuper::Expression(Box::new(obj)),
@@ -3170,7 +3185,7 @@ fn build_ast_from_member_expression(
                             },
                         )
                     }
-                    Rule::identifier_name => ExpressionType::MemberExpression(
+                    Rule::identifier_name | Rule::private_name => ExpressionType::MemberExpression(
                         MemberExpressionType::SimpleMemberExpression {
                             meta,
                             object: ExpressionOrSuper::Expression(Box::new(obj)),
@@ -3244,6 +3259,27 @@ fn build_ast_from_primary_expression(
             ExpressionType::ThisExpression { meta },
             Semantics::new_empty(),
         ),
+        Rule::import_meta => (
+            ExpressionType::ImportMeta { meta },
+            Semantics::new_empty(),
+        ),
+        Rule::import_call | Rule::import_call__yield => {
+            let arg_pair = inner_pair.into_inner().next().ok_or_else(|| {
+                get_validation_error_with_meta(
+                    "import() requires a specifier".to_string(),
+                    AstBuilderValidationErrorType::SyntaxError,
+                    meta.clone(),
+                )
+            })?;
+            let (a, a_s) = build_ast_from_assignment_expression(arg_pair, script)?;
+            (
+                ExpressionType::ImportCall {
+                    meta,
+                    argument: Box::new(a),
+                },
+                a_s,
+            )
+        }
         Rule::array_literal | Rule::array_literal__yield => {
             let (a, a_s) = build_ast_from_array_literal(inner_pair, script)?;
             (a, a_s)
@@ -4181,6 +4217,64 @@ fn build_ast_from_method_definition(
                 false,
             )
         }
+        Rule::async_method => {
+            // async_kw ~ property_name ~ "(" params ")" "{" body "}"
+            let mut inner_inner_iter = inner_pair.into_inner().filter(|p| p.as_rule() != Rule::async_kw);
+            let (p, p_s) = build_ast_from_property_name(inner_inner_iter.next().unwrap(), script)?;
+            let (fp, fp_s) =
+                build_ast_from_formal_parameters(inner_inner_iter.next().unwrap(), script)?;
+            let (fb, fb_s) =
+                build_ast_from_function_body(inner_inner_iter.next().unwrap(), script)?;
+            validate_bound_names_have_no_duplicates_and_also_not_present_in_var_declared_names_or_lexically_declared_names(&fp_s.bound_names,&vec![],&fb_s.lexically_declared_names)?;
+            s.merge(p_s).merge(fp_s).merge(fb_s);
+            let meta2 = meta.clone();
+            PropertyData::new_with_any_expression_key(
+                meta,
+                p,
+                Box::new(ExpressionType::FunctionOrGeneratorExpression(
+                    FunctionData {
+                        meta: meta2,
+                        id: None,
+                        params: FormalParameters::new(fp),
+                        body: Box::new(fb),
+                        generator: false,
+                        is_async: true,
+                    },
+                )),
+                PropertyKind::Init,
+                true,
+                false,
+            )
+        }
+        Rule::async_generator_method => {
+            // async_kw ~ "*" ~ property_name ~ "(" params ")" "{" gen_body "}"
+            let mut inner_inner_iter = inner_pair.into_inner().filter(|p| p.as_rule() != Rule::async_kw);
+            let (p, p_s) = build_ast_from_property_name(inner_inner_iter.next().unwrap(), script)?;
+            let (fp, fp_s) =
+                build_ast_from_formal_parameters(inner_inner_iter.next().unwrap(), script)?;
+            let (fb, fb_s) =
+                build_ast_from_generator_body(inner_inner_iter.next().unwrap(), script)?;
+            validate_bound_names_have_no_duplicates_and_also_not_present_in_var_declared_names_or_lexically_declared_names(&fp_s.bound_names,&vec![],&fb_s.lexically_declared_names)?;
+            s.merge(p_s).merge(fp_s).merge(fb_s);
+            let meta2 = meta.clone();
+            PropertyData::new_with_any_expression_key(
+                meta,
+                p,
+                Box::new(ExpressionType::FunctionOrGeneratorExpression(
+                    FunctionData {
+                        meta: meta2,
+                        id: None,
+                        params: FormalParameters::new(fp),
+                        body: Box::new(fb),
+                        generator: true,
+                        is_async: true,
+                    },
+                )),
+                PropertyKind::Init,
+                true,
+                false,
+            )
+        }
         Rule::getter => {
             let (p, p_s) = build_ast_from_property_name(inner_iter.next().unwrap(), script)?;
             let (fb, fb_s) = build_ast_from_function_body(inner_iter.next().unwrap(), script)?;
@@ -4366,6 +4460,8 @@ fn build_ast_from_class_tail(
     let mut s = Semantics::new_empty();
     let mut super_class = None;
     let mut methods: Vec<MethodDefinitionData> = vec![];
+    let mut fields: Vec<ClassFieldData> = vec![];
+    let mut static_blocks: Vec<StaticBlockData> = vec![];
 
     for inner_pair in pair.into_inner() {
         match inner_pair.as_rule() {
@@ -4385,10 +4481,11 @@ fn build_ast_from_class_tail(
             Rule::class_body | Rule::class_body__yield => {
                 // class_body = class_element_list
                 for element_pair in inner_pair.into_inner() {
-                    if let Some(method) =
-                        build_ast_from_class_element(element_pair, script, &mut s)?
-                    {
-                        methods.push(method);
+                    match build_ast_from_class_element(element_pair, script, &mut s)? {
+                        Some(ClassElement::Method(m)) => methods.push(m),
+                        Some(ClassElement::Field(f)) => fields.push(f),
+                        Some(ClassElement::StaticBlock(b)) => static_blocks.push(b),
+                        None => {}
                     }
                 }
             }
@@ -4400,18 +4497,31 @@ fn build_ast_from_class_tail(
 
     Ok((
         super_class,
-        ClassBodyData { meta, body: methods },
+        ClassBodyData {
+            meta,
+            body: methods,
+            fields,
+            static_blocks,
+        },
         s,
     ))
 }
 
+/// ChittiOS: a parsed class element — a method, a field, or a static block.
+enum ClassElement {
+    Method(MethodDefinitionData),
+    Field(ClassFieldData),
+    StaticBlock(StaticBlockData),
+}
+
 /// Builds AST from a class_element.
-/// Grammar: method_definition | "static" ~ method_definition | ";"
+/// Grammar: `static`-prefixed or plain method_definition / field_definition /
+/// static block, or a lone `;`.
 fn build_ast_from_class_element(
     pair: Pair<Rule>,
     script: &Rc<String>,
     s: &mut Semantics,
-) -> Result<Option<MethodDefinitionData>, JsRuleError> {
+) -> Result<Option<ClassElement>, JsRuleError> {
     let meta = get_meta(&pair, script);
     let mut inner_iter = pair.into_inner();
 
@@ -4421,10 +4531,10 @@ fn build_ast_from_class_element(
         None => return Ok(None), // Empty class element (;)
     };
 
-    let (is_static, method_pair) = if first_pair.as_rule() == Rule::class_static {
+    let (is_static, member_pair) = if first_pair.as_rule() == Rule::class_static {
         let mp = inner_iter.next().ok_or_else(|| {
             get_validation_error_with_meta(
-                "Expected method definition after 'static'".to_string(),
+                "Expected member after 'static'".to_string(),
                 AstBuilderValidationErrorType::SyntaxError,
                 meta.clone(),
             )
@@ -4433,6 +4543,70 @@ fn build_ast_from_class_element(
     } else {
         (false, first_pair)
     };
+
+    // A `static { … }` initialization block.
+    if member_pair.as_rule() == Rule::class_static_block {
+        let mut body = vec![];
+        for sp in member_pair.into_inner() {
+            if sp.as_rule() == Rule::statement_list {
+                let (stmts, st_s) = build_ast_from_statement_list(sp, script)?;
+                s.merge(st_s);
+                body = stmts;
+            }
+        }
+        return Ok(Some(ClassElement::StaticBlock(StaticBlockData { meta, body })));
+    }
+
+    // A field definition: `name`, `name = init`, `#priv = init`, `[computed] = …`.
+    if member_pair.as_rule() == Rule::field_definition {
+        let mut fi = member_pair.into_inner();
+        let name_pair = fi.next().unwrap();
+        // class_element_name = property_name | private_name
+        let name_inner = name_pair.into_inner().next().unwrap();
+        let (key, computed) = match name_inner.as_rule() {
+            Rule::property_name | Rule::property_name__yield => {
+                let (k, k_s) = build_ast_from_property_name(name_inner.clone(), script)?;
+                s.merge(k_s);
+                // computed when it was a `[expr]` form
+                let computed = name_inner
+                    .into_inner()
+                    .next()
+                    .map(|p| {
+                        p.as_rule() == Rule::computed_property_name
+                            || p.as_rule() == Rule::computed_property_name__yield
+                    })
+                    .unwrap_or(false);
+                (Box::new(k), computed)
+            }
+            Rule::private_name => {
+                let id = get_identifier_data(name_inner, script);
+                (
+                    Box::new(ExpressionPatternType::Identifier(id).convert_to_expression()),
+                    false,
+                )
+            }
+            _ => return Err(get_unexpected_error("build_ast_from_class_element:field", &name_inner)),
+        };
+        let value = match fi.next() {
+            Some(init_pair) => {
+                // initializer__in = "=" ~ assignment_expression__in
+                let expr_pair = init_pair.into_inner().next().unwrap();
+                let (e, e_s) = build_ast_from_assignment_expression(expr_pair, script)?;
+                s.merge(e_s);
+                Some(Box::new(e))
+            }
+            None => None,
+        };
+        return Ok(Some(ClassElement::Field(ClassFieldData {
+            meta,
+            key,
+            computed,
+            is_static,
+            value,
+        })));
+    }
+
+    let method_pair = member_pair;
 
     // Parse the method definition
     let (prop_data, method_s) = build_ast_from_method_definition(method_pair, script)?;
@@ -4484,12 +4658,12 @@ fn build_ast_from_class_element(
         PropertyKind::Spread => MethodDefinitionKind::Method,
     };
 
-    Ok(Some(MethodDefinitionData {
+    Ok(Some(ClassElement::Method(MethodDefinitionData {
         meta: prop_meta,
         key,
         value: func_data,
         kind: method_kind,
         computed,
         static_flag: is_static,
-    }))
+    })))
 }

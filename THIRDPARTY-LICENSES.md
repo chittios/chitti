@@ -71,6 +71,22 @@ source under `~/.cargo/registry/` and upstream.
 
 ---
 
+## brotli-decompressor — crates.io (WOFF2 web fonts)
+
+WOFF2 web fonts are Brotli-compressed. `kernel/src/font_woff2.rs` decompresses
+the payload with [brotli-decompressor](https://github.com/dropbox/rust-brotli-decompressor)
+4.x — a pure-Rust, `no_std` + `alloc` Brotli decoder (default features off; the
+crate is written to avoid the Rust stdlib). It is driven with a small
+`alloc`-backed `Allocator` so decompression uses the kernel heap, never the
+large stack buffers the crate's bundled no_std wrapper would allocate. The
+`glyf`/`loca` transform-reversal in `font_woff2.rs` is a faithful port of
+fontTools' WOFF2 reconstruction (fontTools: **MIT**).
+
+Licensed under **BSD-3-Clause OR MIT** (`alloc-no-stdlib` likewise). Full
+license texts ship in the crate source under `~/.cargo/registry/`.
+
+---
+
 ## minimp3 (Rust port) — `kernel/src/audio/mp3.rs`
 
 The `/open <file>.mp3` player's MPEG Layer III decoder is a hand-written

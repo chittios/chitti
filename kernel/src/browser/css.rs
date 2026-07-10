@@ -2354,6 +2354,94 @@ fn starts_kw(t: &str, kw: &str) -> bool {
 ///   still collected).
 ///
 /// Non-module code passes through unchanged.
+/// Parse an `import` clause (the text between `import` and `from`) into the
+/// `var` binding statements needed under the flat-global module model, plus a
+/// flag when a namespace import (`* as N`) — which needs a real module record —
+/// was seen. `import {a, b as c}` → `["var c = b;"]`; `import D` →
+/// `["var D = __default;"]`; `import D, {x as y}` → both.
+fn import_binding_stmts(clause: &str) -> (Vec<alloc::string::String>, bool) {
+    let mut binds = Vec::new();
+    let mut ns_unsupported = false;
+    // Split top-level parts on commas outside the `{ … }` group.
+    let mut default_part = clause.trim();
+    let mut named_part: Option<&str> = None;
+    if let Some(bstart) = clause.find('{') {
+        let bend = clause.find('}').unwrap_or(clause.len());
+        named_part = Some(clause[bstart + 1..bend.min(clause.len())].trim_end_matches('}'));
+        default_part = clause[..bstart].trim().trim_end_matches(',').trim();
+    }
+    for piece in default_part.split(',') {
+        let p = piece.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if p.starts_with('*') {
+            // `* as N` — no flat-global expression.
+            ns_unsupported = true;
+        } else if is_ident(p) {
+            // Bare default import binds to the module's default export.
+            binds.push(alloc::format!("var {p} = __default;"));
+        }
+    }
+    if let Some(named) = named_part {
+        for spec in named.split(',') {
+            let s = spec.trim();
+            if s.is_empty() {
+                continue;
+            }
+            // `orig as local` → alias; plain `name` is already a global.
+            if let Some((orig, local)) = split_as(s) {
+                binds.push(alloc::format!("var {local} = {orig};"));
+            }
+        }
+    }
+    (binds, ns_unsupported)
+}
+
+/// Parse an `export { local as public, … }` clause into `var public = local;`
+/// aliasing statements (a plain `export { name }` needs none — `name` is
+/// already a global).
+fn export_alias_stmts(after_export: &str) -> Vec<alloc::string::String> {
+    let mut out = Vec::new();
+    let inner = after_export
+        .trim_start_matches('{')
+        .split('}')
+        .next()
+        .unwrap_or("");
+    for spec in inner.split(',') {
+        let s = spec.trim();
+        if s.is_empty() {
+            continue;
+        }
+        if let Some((local, public)) = split_as(s) {
+            out.push(alloc::format!("var {public} = {local};"));
+        }
+    }
+    out
+}
+
+/// Split `"a as b"` → `Some(("a", "b"))`; a bare identifier → `None`.
+fn split_as(spec: &str) -> Option<(&str, &str)> {
+    let bytes = spec.as_bytes();
+    let idx = spec.find(" as ")?;
+    let a = spec[..idx].trim();
+    let b = spec[idx + 4..].trim();
+    let _ = bytes;
+    if is_ident(a) && is_ident(b) {
+        Some((a, b))
+    } else {
+        None
+    }
+}
+
+/// True if `s` is a plausible JS identifier (used to guard synthesized `var`s).
+fn is_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().enumerate().all(|(i, c)| {
+            c == '_' || c == '$' || (if i == 0 { c.is_alphabetic() } else { c.is_alphanumeric() })
+        })
+}
+
 pub fn strip_module_syntax(src: &str) -> (String, Vec<String>) {
     let mut imports = Vec::new();
     let mut out: Vec<String> = Vec::new();
@@ -2363,14 +2451,25 @@ pub fn strip_module_syntax(src: &str) -> (String, Vec<String>) {
         if starts_kw(t, "import") {
             if let Some(spec) = quoted_spec(t) {
                 imports.push(spec);
-                if t["import".len()..].trim_start().starts_with('*') {
-                    // Namespace imports need a real module record — flag it.
+                // Emit binding statements for the import clause so a default
+                // import and any `{ orig as local }` rename resolve to the
+                // exporting module's globals (which ran first — the graph is
+                // topologically ordered). `import { x }` needs nothing (x is
+                // already a shared global); `import * as N` can't be expressed
+                // in the flat-global model and stays flagged.
+                let clause = &t["import".len()..];
+                let clause = clause.split(" from ").next().unwrap_or(clause).trim();
+                let (binds, ns_unsupported) = import_binding_stmts(clause);
+                for b in binds {
+                    out.push(format!("{indent}{b}"));
+                }
+                if ns_unsupported {
                     out.push(format!(
                         "{indent}// unsupported module form: {}",
                         t.trim_end()
                     ));
                 }
-                continue; // supported forms: line removed
+                continue; // supported forms: line removed / rewritten
             }
             out.push(line.to_string()); // no specifier — leave untouched
         } else if starts_kw(t, "export") {
@@ -2381,8 +2480,14 @@ pub fn strip_module_syntax(src: &str) -> (String, Vec<String>) {
             } else if after.starts_with('{') {
                 if let Some(spec) = quoted_spec(t) {
                     imports.push(spec); // `export {x} from "u"` re-export
+                } else {
+                    // `export { local as public };` — alias each renamed export
+                    // to a global under its public name so importers find it.
+                    for stmt in export_alias_stmts(after) {
+                        out.push(format!("{indent}{stmt}"));
+                    }
                 }
-                // `export {a, b};` — bindings already exist as globals.
+                // plain `export {a, b};` — bindings already exist as globals.
             } else if ["const", "let", "var", "function", "class", "async"]
                 .iter()
                 .any(|kw| starts_kw(after, kw))
@@ -2769,7 +2874,33 @@ mod tests {
             imports,
             alloc::vec!["a.js".to_string(), "b.js".to_string(), "c.js".to_string()]
         );
-        assert_eq!(out, "console.log(X);");
+        // A default import now binds to the module's `__default`; plain named
+        // imports (`{a, b}`) and side-effect imports emit nothing.
+        assert_eq!(out, "var X = __default;\nconsole.log(X);");
+    }
+
+    #[test_case]
+    fn strip_module_renamed_import_and_default_combo() {
+        let src = concat!(
+            "import Def, { orig as local, plain } from \"m.js\";\n",
+            "use(Def, local, plain);",
+        );
+        let (out, imports) = strip_module_syntax(src);
+        assert_eq!(imports, alloc::vec!["m.js".to_string()]);
+        assert!(out.contains("var Def = __default;"), "{out}");
+        assert!(out.contains("var local = orig;"), "{out}");
+        // `plain` is already a shared global — no synthesized binding.
+        assert!(!out.contains("var plain"), "{out}");
+        assert!(out.contains("use(Def, local, plain);"));
+    }
+
+    #[test_case]
+    fn strip_module_export_rename_aliases() {
+        let (out, imports) = strip_module_syntax("export { localA as pubA, keep };");
+        assert!(imports.is_empty());
+        assert!(out.contains("var pubA = localA;"), "{out}");
+        assert!(!out.contains("var keep"), "{out}");
+        assert!(!out.contains("export"), "{out}");
     }
 
     #[test_case]

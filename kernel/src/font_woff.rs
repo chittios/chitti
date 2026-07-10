@@ -53,7 +53,9 @@ pub fn is_woff2(data: &[u8]) -> bool {
 /// malformed input returns `Err`.
 pub fn woff_to_sfnt(woff: &[u8]) -> Result<Vec<u8>, &'static str> {
     if is_woff2(woff) {
-        return Err("woff2 unsupported (brotli)");
+        // WOFF2 is Brotli-compressed with a transformed glyf/loca — handled by
+        // the dedicated decoder.
+        return crate::font_woff2::woff2_to_sfnt(woff);
     }
     if !is_woff(woff) {
         return Err("woff: bad signature");
@@ -299,6 +301,8 @@ mod tests {
         assert!(!is_woff(b"wO"));
         assert!(is_woff2(b"wOF2aaaa"));
         assert!(!is_woff2(b"wOFF\x00\x01\x00\x00"));
-        assert_eq!(woff_to_sfnt(b"wOF2aaaa").unwrap_err(), "woff2 unsupported (brotli)");
+        // WOFF2 now dispatches to the dedicated decoder; a truncated stub still
+        // errors cleanly (rather than the old "unsupported" sentinel).
+        assert!(woff_to_sfnt(b"wOF2aaaa").is_err());
     }
 }

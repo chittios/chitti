@@ -43,6 +43,25 @@ pub fn evaluate_expression(
             Ok(ctx.global_this.clone().unwrap_or(JsValue::Undefined))
         }
 
+        // ChittiOS: `import(spec)` — the interpreter has no module loader, so we
+        // evaluate the specifier (for its side effects/validity) and resolve to
+        // an empty namespace object. A page's `import(x).then(m => …)` then runs
+        // with `m = {}` rather than crashing. (The browser tier statically
+        // pre-fetches + flattens module graphs; true dynamic loading is bounded.)
+        ExpressionType::ImportCall { argument, .. } => {
+            let _ = evaluate_expression(argument, ctx)?;
+            Ok(crate::runner::std_lib::promise::resolve_value(make_object(alloc::vec![])))
+        }
+
+        // ChittiOS: `import.meta` — a stub meta-object (`{ url: "" }`); the
+        // engine doesn't track the module URL.
+        ExpressionType::ImportMeta { .. } => {
+            Ok(make_object(alloc::vec![(
+                "url".to_string(),
+                JsValue::String(String::new()),
+            )]))
+        }
+
         ExpressionType::ArrayExpression { elements, .. } => {
             evaluate_array_expression(elements, ctx)
         }
@@ -52,7 +71,24 @@ pub fn evaluate_expression(
         }
 
         ExpressionType::FunctionOrGeneratorExpression(func_data) => {
-            create_function_object(func_data, ctx)
+            // A *named* function expression binds its own name (immutably) in a
+            // fresh scope visible only inside its body, so it can recurse even
+            // when the outer binding is reassigned — `var f = function fact(n){
+            // … fact(n-1) … }`. (Function *declarations* bind their name in the
+            // enclosing scope via hoisting and take the plain path below.)
+            if let Some(id) = &func_data.id {
+                use crate::runner::ds::env_record::new_declarative_environment;
+                let self_scope = new_declarative_environment(Some(ctx.lex_env.clone()));
+                let saved = core::mem::replace(&mut ctx.lex_env, self_scope);
+                let f = create_function_object(func_data, ctx)?;
+                // Bind the name in the self-scope (now `ctx.lex_env`) to the fn.
+                let _ = ctx.create_binding(&id.name, true);
+                let _ = ctx.initialize_binding(&id.name, f.clone());
+                ctx.lex_env = saved;
+                Ok(f)
+            } else {
+                create_function_object(func_data, ctx)
+            }
         }
 
         ExpressionType::UnaryExpression { operator, argument, .. } => {
@@ -91,8 +127,18 @@ pub fn evaluate_expression(
             evaluate_sequence_expression(expressions, ctx)
         }
 
-        ExpressionType::TemplateLiteral(_) => {
-            Err(JErrorType::TypeError("Template literal not yet implemented".to_string()))
+        ExpressionType::TemplateLiteral(data) => {
+            // Interleave cooked quasis with the string-coerced substitution
+            // values: quasi[0] expr[0] quasi[1] expr[1] … quasi[n].
+            let mut out = String::new();
+            for (i, quasi) in data.quasis.iter().enumerate() {
+                out.push_str(&quasi.cooked_value);
+                if let Some(expr) = data.expressions.get(i) {
+                    let v = evaluate_expression(expr, ctx)?;
+                    out.push_str(&to_string(&v));
+                }
+            }
+            Ok(JsValue::String(out))
         }
 
         ExpressionType::TaggedTemplateExpression { .. } => {
@@ -1036,6 +1082,26 @@ pub fn call_function_object(
     args: Vec<JsValue>,
     ctx: &mut EvalContext,
 ) -> ValueResult {
+    // Call-depth guard: the interpreter recurses on the host (kernel) stack, so
+    // unbounded or non-tail JS recursion would fault the kernel. Throw a
+    // spec-shaped RangeError past the limit and always restore the counter.
+    if ctx.call_depth >= crate::runner::plugin::types::MAX_CALL_DEPTH {
+        return Err(JErrorType::RangeError(
+            "Maximum call stack size exceeded".to_string(),
+        ));
+    }
+    ctx.call_depth += 1;
+    let result = call_function_object_inner(func, this_value, args, ctx);
+    ctx.call_depth -= 1;
+    result
+}
+
+fn call_function_object_inner(
+    func: &crate::runner::ds::object::JsObjectType,
+    this_value: JsValue,
+    args: Vec<JsValue>,
+    ctx: &mut EvalContext,
+) -> ValueResult {
     // A bound function (`fn.bind(this, …)`): fix `this`, prepend the partial
     // args, and invoke the original target.
     {
@@ -1152,7 +1218,10 @@ pub fn call_function_object(
                 return Ok(JsValue::Undefined);
             }
 
-            if obj.get_object_base().properties.contains_key(&default_ctor_marker) {
+            let field_ctor_marker = PropertyKey::Str("__has_field_init__".to_string());
+            if obj.get_object_base().properties.contains_key(&default_ctor_marker)
+                && !obj.get_object_base().properties.contains_key(&field_ctor_marker)
+            {
                 // It's a default constructor (no-op) - just return undefined
                 drop(func_ref);
                 Ok(JsValue::Undefined)
@@ -2590,6 +2659,13 @@ pub struct SimpleFunctionObject {
     /// ChittiOS: true for `async function` — the return value is wrapped in a
     /// resolved Promise.
     is_async: bool,
+    /// ChittiOS: ES2022 instance-field initializers for a class constructor —
+    /// `(resolved-key, init-expr-ptr)` pairs applied to the freshly-created
+    /// `this` at the start of the constructor call. A null pointer means the
+    /// field has no initializer (→ `undefined`). Empty for every non-constructor
+    /// function. The pointers target initializer expressions inside the class's
+    /// AST, which outlives the object exactly as `body_ptr` does.
+    instance_fields: Vec<(String, *const crate::parser::ast::ExpressionType)>,
 }
 
 // Safety: SimpleFunctionObject is only used within a single thread
@@ -2610,6 +2686,7 @@ impl SimpleFunctionObject {
             environment,
             is_arrow: false,
             is_async: false,
+            instance_fields: Vec::new(),
         }
     }
 
@@ -2629,6 +2706,7 @@ impl SimpleFunctionObject {
             environment,
             is_arrow: true,
             is_async: false,
+            instance_fields: Vec::new(),
         }
     }
 
@@ -2645,7 +2723,17 @@ impl SimpleFunctionObject {
         use super::types::CompletionType;
 
         // Params always valid; body may be a statement block or (arrow) an expr.
-        let params = unsafe { &*self.params_ptr };
+        // A synthesized field-only default constructor has a null params_ptr and
+        // null body_ptr (no source function) — treat both as empty.
+        let params: &[PatternType] = if self.params_ptr.is_null() {
+            &[]
+        } else {
+            unsafe { &*self.params_ptr }
+        };
+
+        // ChittiOS: keep a handle to `this` for applying instance-field
+        // initializers (the original is moved into `ctx.global_this` below).
+        let this_for_fields = this_value.clone();
 
         // Save current environment
         let saved_lex_env = ctx.lex_env.clone();
@@ -2671,6 +2759,49 @@ impl SimpleFunctionObject {
                 ctx.create_binding(&id.name, false)?;
                 ctx.initialize_binding(&id.name, arg_value)?;
             }
+        }
+
+        // ChittiOS: ES2022 instance-field initializers run at the top of the
+        // constructor, against the freshly-created `this`, before the body.
+        // (Non-constructor functions and arrows carry none.) NB: for a *derived*
+        // class with an explicit constructor these run before the body's
+        // `super(...)` rather than strictly after it — `this` already exists in
+        // this engine, so it works, but a parent constructor could overwrite a
+        // same-named field. Rare in practice; documented.
+        if !self.instance_fields.is_empty() {
+            for (key, init_ptr) in &self.instance_fields {
+                let v = if init_ptr.is_null() {
+                    JsValue::Undefined
+                } else {
+                    // SAFETY: the pointer targets an initializer expression in
+                    // the class AST, alive for the object's lifetime (as body_ptr).
+                    match evaluate_expression(unsafe { &**init_ptr }, ctx) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            ctx.lex_env = saved_lex_env;
+                            ctx.var_env = saved_var_env;
+                            ctx.global_this = saved_this;
+                            return Err(e);
+                        }
+                    }
+                };
+                // Private fields (`#x`) are non-enumerable; public fields are
+                // enumerable own data properties.
+                set_own_prop(&this_for_fields, key, v, !key.starts_with('#'));
+            }
+        }
+
+        // A field-only default constructor has no body — done after fields.
+        // (A concise arrow has a null body_ptr but a non-null expr_body_ptr.)
+        if self.body_ptr.is_null() && self.expr_body_ptr.is_null() {
+            ctx.lex_env = saved_lex_env;
+            ctx.var_env = saved_var_env;
+            ctx.global_this = saved_this;
+            return Ok(if self.is_async {
+                crate::runner::std_lib::promise::resolve_value(JsValue::Undefined)
+            } else {
+                JsValue::Undefined
+            });
         }
 
         // ChittiOS: concise arrow body `x => expr` — evaluate and return the expr
@@ -3538,13 +3669,30 @@ pub fn evaluate_class(class_data: &ClassData, ctx: &mut EvalContext) -> ValueRes
     let constructor_method = class_data.body.body.iter()
         .find(|m| matches!(m.kind, MethodDefinitionKind::Constructor));
 
+    // 2b. Resolve instance-field initializers (ES2022 class fields). Computed
+    // keys are evaluated once, now, at class-definition time (per spec); the
+    // initializer expression pointer is applied to each `this` at construction.
+    let mut instance_fields: Vec<(String, *const ExpressionType)> = Vec::new();
+    for field in &class_data.body.fields {
+        if field.is_static {
+            continue;
+        }
+        let key = get_object_property_key(&field.key, field.computed, ctx)?;
+        let init_ptr = field
+            .value
+            .as_deref()
+            .map(|e| e as *const ExpressionType)
+            .unwrap_or(core::ptr::null());
+        instance_fields.push((key, init_ptr));
+    }
+
     // 3. Create the constructor function
     let constructor_obj = if let Some(ctor_method) = constructor_method {
         // Use the defined constructor
-        create_class_constructor(&ctor_method.value, parent_proto.as_ref().map(|(p, _)| p.clone()), ctx)?
+        create_class_constructor(&ctor_method.value, parent_proto.as_ref().map(|(p, _)| p.clone()), instance_fields, ctx)?
     } else {
         // Create a default constructor
-        create_default_constructor(parent_proto.as_ref().map(|(p, _)| p.clone()), ctx)?
+        create_default_constructor(parent_proto.as_ref().map(|(p, _)| p.clone()), instance_fields, ctx)?
     };
 
     // 4. Create the prototype object
@@ -3672,6 +3820,63 @@ pub fn evaluate_class(class_data: &ClassData, ctx: &mut EvalContext) -> ValueRes
         );
     }
 
+    // 7. Static fields and static initialization blocks run at class-definition
+    // time, in source order, with `this` bound to the constructor. (Static
+    // fields are interleaved with blocks in the source; we run all fields then
+    // blocks — a minor ordering simplification that real code rarely observes.)
+    if !class_data.body.fields.iter().all(|f| !f.is_static)
+        || !class_data.body.static_blocks.is_empty()
+    {
+        let saved_this = ctx.global_this.take();
+        ctx.global_this = Some(constructor_obj.clone());
+        let mut static_result: Result<(), JErrorType> = Ok(());
+        'statics: for field in &class_data.body.fields {
+            if !field.is_static {
+                continue;
+            }
+            let key = match get_object_property_key(&field.key, field.computed, ctx) {
+                Ok(k) => k,
+                Err(e) => {
+                    static_result = Err(e);
+                    break 'statics;
+                }
+            };
+            let value = match &field.value {
+                Some(e) => match evaluate_expression(e, ctx) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        static_result = Err(e);
+                        break 'statics;
+                    }
+                },
+                None => JsValue::Undefined,
+            };
+            set_own_prop(&constructor_obj, &key, value, !key.starts_with('#'));
+        }
+        if static_result.is_ok() {
+            'blocks: for block in &class_data.body.static_blocks {
+                for stmt in &block.body {
+                    match super::statement::execute_statement(stmt, ctx) {
+                        Ok(completion) => {
+                            if let super::types::CompletionType::Throw = completion.completion_type {
+                                static_result = Err(JErrorType::Thrown(
+                                    completion.value.clone().unwrap_or(JsValue::Undefined),
+                                ));
+                                break 'blocks;
+                            }
+                        }
+                        Err(e) => {
+                            static_result = Err(e);
+                            break 'blocks;
+                        }
+                    }
+                }
+            }
+        }
+        ctx.global_this = saved_this;
+        static_result?;
+    }
+
     Ok(constructor_obj)
 }
 
@@ -3679,6 +3884,7 @@ pub fn evaluate_class(class_data: &ClassData, ctx: &mut EvalContext) -> ValueRes
 fn create_class_constructor(
     func_data: &FunctionData,
     parent_ctor: Option<JsObjectType>,
+    instance_fields: Vec<(String, *const ExpressionType)>,
     ctx: &EvalContext,
 ) -> ValueResult {
     let body_ptr = func_data.body.as_ref() as *const _;
@@ -3686,6 +3892,7 @@ fn create_class_constructor(
     let environment = ctx.lex_env.clone();
 
     let mut func_obj = SimpleFunctionObject::new(body_ptr, params_ptr, environment);
+    func_obj.instance_fields = instance_fields;
 
     // Add marker property to identify this as a SimpleFunctionObject (callable)
     func_obj.base.properties.insert(
@@ -3730,8 +3937,55 @@ fn create_class_constructor(
 /// Create a default constructor for a class.
 fn create_default_constructor(
     parent_ctor: Option<JsObjectType>,
-    _ctx: &EvalContext,
+    instance_fields: Vec<(String, *const ExpressionType)>,
+    ctx: &EvalContext,
 ) -> ValueResult {
+    // ChittiOS: when the class declares instance fields, the (otherwise no-op)
+    // default constructor must still initialize them. Build a real
+    // `SimpleFunctionObject` with a null body carrying the field inits; it keeps
+    // the `__default_constructor__` marker so `invoke_constructor` still performs
+    // the implicit `super(...args)` for a derived class *before* `call_with_this`
+    // applies the fields, and a `__has_field_init__` marker so `call_function_object`
+    // routes it through `call_with_this` instead of the no-op short-circuit.
+    if !instance_fields.is_empty() {
+        let mut func_obj = SimpleFunctionObject::new(
+            core::ptr::null(),
+            core::ptr::null(),
+            ctx.lex_env.clone(),
+        );
+        func_obj.instance_fields = instance_fields;
+        for marker in [
+            "__simple_function__",
+            "__class_constructor__",
+            "__default_constructor__",
+            "__has_field_init__",
+        ] {
+            func_obj.base.properties.insert(
+                PropertyKey::Str(marker.to_string()),
+                PropertyDescriptor::Data(PropertyDescriptorData {
+                    value: JsValue::Boolean(true),
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                }),
+            );
+        }
+        if let Some(parent) = parent_ctor {
+            func_obj.base.properties.insert(
+                PropertyKey::Str("__parent_constructor__".to_string()),
+                PropertyDescriptor::Data(PropertyDescriptorData {
+                    value: JsValue::Object(parent),
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                }),
+            );
+        }
+        let obj_ref: JsObjectType =
+            Rc::new(RefCell::new(ObjectType::Ordinary(Box::new(func_obj))));
+        return Ok(JsValue::Object(obj_ref));
+    }
+    let _ = ctx;
     // A no-op body; for a derived class, `invoke_constructor` calls the parent
     // constructor with the same args (implicit `super(...args)`).
     let mut func_obj = SimpleObject::new();

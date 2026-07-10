@@ -86,6 +86,8 @@ pub mod font_geist;
 pub mod font_ttf;
 // WOFF1 → SFNT web-font container converter (WOFF2 detected, unsupported).
 pub mod font_woff;
+// WOFF2 → SFNT converter (Brotli payload + transformed glyf/loca).
+pub mod font_woff2;
 
 // --- Limine requests (x86_64 boot only) ------------------------------
 //

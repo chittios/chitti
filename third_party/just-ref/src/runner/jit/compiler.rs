@@ -660,6 +660,11 @@ impl Compiler {
             ExpressionType::OptionalChain { .. } => {
                 self.chunk.emit_op(OpCode::Undefined);
             }
+            // `import(...)` / `import.meta` are host-JIT-unsupported (the
+            // interpreter is authoritative; the kernel never uses the JIT).
+            ExpressionType::ImportCall { .. } | ExpressionType::ImportMeta { .. } => {
+                self.chunk.emit_op(OpCode::Undefined);
+            }
         }
     }
 

@@ -130,6 +130,12 @@ htmlparser = { version = "0.2", default-features = false }
 # include_bytes! from assets/GeistMono-Regular.ttf. MIT OR Apache-2.0 OR Zlib.
 fontdue = { version = "0.9", default-features = false, features = ["hashbrown"] }
 
+# Brotli decompressor for WOFF2 web fonts (the WOFF2 payload is Brotli-compressed
+# with a transformed glyf/loca). no_std (core + alloc) with default features off —
+# the crate is explicitly written to avoid the Rust stdlib. See font_woff.rs.
+# BSD-3-Clause / MIT — recorded in THIRDPARTY-LICENSES.md.
+brotli-decompressor = { version = "4", default-features = false }
+
 # The `just` ES6 JavaScript engine (applegrew/just), vendored + no_std'd, as the
 # browser's higher-tier JS runtime (classes, prototypes, closures, generators,
 # instanceof — the ES surface the hand-rolled js.rs/js_bc engines lack). Only its

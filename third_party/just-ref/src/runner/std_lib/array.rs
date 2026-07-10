@@ -18,8 +18,8 @@ use crate::runner::ds::value::{JsValue, JsNumberType};
 use crate::runner::plugin::registry::BuiltInRegistry;
 use crate::runner::plugin::types::{BuiltInObject, EvalContext};
 use crate::runner::eval::expression::{
-    array_elements, array_set_elements, call_value, is_array as value_is_array, make_array,
-    value_is_callable,
+    array_elements, array_set_elements, call_value, get_own_prop_value, is_array as value_is_array,
+    make_array, value_is_callable,
 };
 
 /// Register the Array built-in with the registry.
@@ -45,9 +45,170 @@ pub fn register(registry: &mut BuiltInRegistry) {
         .add_method("concat", array_concat)
         .add_method("reverse", array_reverse)
         .add_method("sort", array_sort)
-        .add_method("isArray", is_array);
+        .add_method("findIndex", array_find_index)
+        .add_method("fill", array_fill)
+        .add_method("flat", array_flat)
+        .add_method("flatMap", array_flat_map)
+        .add_method("isArray", is_array)
+        .add_method("from", array_from)
+        .add_method("of", array_of);
 
     registry.register_object(array);
+}
+
+/// `Array.from(items, mapFn?)` (static) — build an array from a string, an
+/// array, or an array-like (an object with a numeric `length` and indexed
+/// properties, e.g. a NodeList or `arguments`), optionally mapping each element.
+fn array_from(
+    ctx: &mut EvalContext,
+    _this: JsValue,
+    args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    let src = arg(&args, 0);
+    let map_fn = args.get(1).filter(|v| value_is_callable(v)).cloned();
+    let mut items: Vec<JsValue> = match &src {
+        JsValue::String(s) => s.chars().map(|c| JsValue::String(c.to_string())).collect(),
+        JsValue::Object(_) if value_is_array(&src) => array_elements(&src),
+        JsValue::Object(_) => {
+            // Array-like: read `length`, then indices 0..length.
+            let len = match get_own_prop_value(&src, "length") {
+                Some(JsValue::Number(JsNumberType::Integer(n))) if n >= 0 => n as usize,
+                Some(JsValue::Number(JsNumberType::Float(f))) if f >= 0.0 => f as usize,
+                _ => 0,
+            };
+            (0..len)
+                .map(|i| get_own_prop_value(&src, &i.to_string()).unwrap_or(JsValue::Undefined))
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    if let Some(f) = map_fn {
+        for (i, it) in items.iter_mut().enumerate() {
+            *it = call_value(
+                &f,
+                JsValue::Undefined,
+                vec![it.clone(), JsValue::Number(JsNumberType::Integer(i as i64))],
+                ctx,
+            )?;
+        }
+    }
+    Ok(make_array(items))
+}
+
+/// `Array.of(...items)` (static) — an array of the given arguments.
+fn array_of(
+    _ctx: &mut EvalContext,
+    _this: JsValue,
+    args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    Ok(make_array(args))
+}
+
+/// `arr.findIndex(cb)` — index of the first element satisfying `cb`, else -1.
+fn array_find_index(
+    ctx: &mut EvalContext,
+    this: JsValue,
+    args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    let cb = require_callback(&arg(&args, 0))?;
+    let elems = array_elements(&this);
+    for (i, e) in elems.into_iter().enumerate() {
+        let hit = call_value(
+            &cb,
+            JsValue::Undefined,
+            vec![e, JsValue::Number(JsNumberType::Integer(i as i64)), this.clone()],
+            ctx,
+        )?;
+        if truthy(&hit) {
+            return Ok(JsValue::Number(JsNumberType::Integer(i as i64)));
+        }
+    }
+    Ok(JsValue::Number(JsNumberType::Integer(-1)))
+}
+
+/// `arr.fill(value, start?, end?)` — fill (a range of) the array in place.
+fn array_fill(
+    _ctx: &mut EvalContext,
+    this: JsValue,
+    args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    let value = arg(&args, 0);
+    let mut elems = array_elements(&this);
+    let len = elems.len() as i64;
+    let norm = |v: &JsValue, dflt: i64| -> i64 {
+        match v {
+            JsValue::Number(JsNumberType::Integer(n)) => {
+                if *n < 0 { (len + n).max(0) } else { (*n).min(len) }
+            }
+            JsValue::Number(JsNumberType::Float(f)) => {
+                let n = *f as i64;
+                if n < 0 { (len + n).max(0) } else { n.min(len) }
+            }
+            _ => dflt,
+        }
+    };
+    let start = norm(&arg(&args, 1), 0);
+    let end = if args.len() > 2 { norm(&arg(&args, 2), len) } else { len };
+    let mut i = start;
+    while i < end {
+        elems[i as usize] = value.clone();
+        i += 1;
+    }
+    array_set_elements(&this, &elems);
+    Ok(this)
+}
+
+/// Flatten `elems` up to `depth` levels into `out`.
+fn flatten_into(elems: Vec<JsValue>, depth: i64, out: &mut Vec<JsValue>) {
+    for e in elems {
+        if depth > 0 && value_is_array(&e) {
+            flatten_into(array_elements(&e), depth - 1, out);
+        } else {
+            out.push(e);
+        }
+    }
+}
+
+/// `arr.flat(depth = 1)` — a new array with sub-arrays flattened `depth` deep.
+fn array_flat(
+    _ctx: &mut EvalContext,
+    this: JsValue,
+    args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    let depth = match arg(&args, 0) {
+        JsValue::Number(JsNumberType::Integer(n)) => n,
+        JsValue::Number(JsNumberType::Float(f)) => f as i64,
+        JsValue::Undefined => 1,
+        _ => 1,
+    };
+    let mut out = Vec::new();
+    flatten_into(array_elements(&this), depth, &mut out);
+    Ok(make_array(out))
+}
+
+/// `arr.flatMap(cb)` — map then flatten one level.
+fn array_flat_map(
+    ctx: &mut EvalContext,
+    this: JsValue,
+    args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    let cb = require_callback(&arg(&args, 0))?;
+    let elems = array_elements(&this);
+    let mut out = Vec::new();
+    for (i, e) in elems.into_iter().enumerate() {
+        let mapped = call_value(
+            &cb,
+            JsValue::Undefined,
+            vec![e, JsValue::Number(JsNumberType::Integer(i as i64)), this.clone()],
+            ctx,
+        )?;
+        if value_is_array(&mapped) {
+            out.extend(array_elements(&mapped));
+        } else {
+            out.push(mapped);
+        }
+    }
+    Ok(make_array(out))
 }
 
 // ---- shared helpers ---------------------------------------------------------
