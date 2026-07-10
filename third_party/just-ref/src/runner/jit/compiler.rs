@@ -153,6 +153,10 @@ impl Compiler {
                 self.compile_switch(discriminant, cases);
             }
 
+            StatementType::LabelledStatement { body, .. } => {
+                // Labels are a no-op in the (host-only) JIT: compile the body.
+                self.compile_statement(body);
+            }
             StatementType::BreakStatement { .. } => {
                 self.compile_break();
             }
@@ -652,6 +656,10 @@ impl Compiler {
             ExpressionType::MetaProperty { .. } => {
                 self.chunk.emit_op(OpCode::Undefined);
             }
+            // Optional chaining is host-JIT-unsupported (interpreter authoritative).
+            ExpressionType::OptionalChain { .. } => {
+                self.chunk.emit_op(OpCode::Undefined);
+            }
         }
     }
 
@@ -718,6 +726,7 @@ impl Compiler {
             BinaryOperator::LessThanEqual => self.chunk.emit_op(OpCode::LessEqual),
             BinaryOperator::GreaterThan => self.chunk.emit_op(OpCode::GreaterThan),
             BinaryOperator::GreaterThanEqual => self.chunk.emit_op(OpCode::GreaterEqual),
+            BinaryOperator::Exponent => self.chunk.emit_op(OpCode::Mul), // host-JIT best-effort
             BinaryOperator::BitwiseAnd => self.chunk.emit_op(OpCode::BitAnd),
             BinaryOperator::BitwiseOr => self.chunk.emit_op(OpCode::BitOr),
             BinaryOperator::BitwiseXor => self.chunk.emit_op(OpCode::BitXor),
@@ -762,6 +771,14 @@ impl Compiler {
             }
             LogicalOperator::Or => {
                 // Short-circuit: if left is truthy, skip right
+                self.chunk.emit_op(OpCode::Dup);
+                let jump = self.chunk.emit_with(OpCode::JumpIfTrue, 0);
+                self.chunk.emit_op(OpCode::Pop);
+                self.compile_expression(right);
+                self.chunk.patch_jump(jump);
+            }
+            // `??` — host-JIT best-effort: evaluate right (interpreter authoritative).
+            LogicalOperator::Coalesce => {
                 self.chunk.emit_op(OpCode::Dup);
                 let jump = self.chunk.emit_with(OpCode::JumpIfTrue, 0);
                 self.chunk.emit_op(OpCode::Pop);
@@ -994,6 +1011,9 @@ impl Compiler {
             AssignmentOperator::BitwiseRightShiftEquals => { self.chunk.emit_op(OpCode::ShiftRight); }
             AssignmentOperator::BitwiseUnsignedRightShiftEquals => { self.chunk.emit_op(OpCode::UShiftRight); }
             AssignmentOperator::Equals => {}
+            // Host-only JIT: newer compound ops (**=, &&=, ||=, ??=) fall
+            // through here (the tree-walking interpreter is authoritative).
+            _ => {}
         };
     }
 

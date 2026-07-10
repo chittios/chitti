@@ -204,6 +204,15 @@ pub enum ExpressionType {
         callee: ExpressionOrSuper,
         arguments: Vec<ExpressionOrSpreadElement>,
     },
+    /// Optional-chaining access `obj?.prop` / `obj?.[expr]` / `obj?.(args)`.
+    /// Evaluates `object`; if it is `null`/`undefined` the whole access yields
+    /// `undefined` (a per-step guard — the common `a?.b?.c` form works), else
+    /// it performs the member read / computed read / call.
+    OptionalChain {
+        meta: Meta,
+        object: Box<ExpressionType>,
+        access: OptionalAccess,
+    },
     NewExpression {
         meta: Meta,
         callee: Box<ExpressionType>,
@@ -256,6 +265,7 @@ impl HasMeta for ExpressionType {
             ExpressionType::LogicalExpression { meta, .. } => &meta,
             ExpressionType::ConditionalExpression { meta, .. } => &meta,
             ExpressionType::CallExpression { meta, .. } => &meta,
+            ExpressionType::OptionalChain { meta, .. } => &meta,
             ExpressionType::NewExpression { meta, .. } => &meta,
             ExpressionType::SequenceExpression { meta, .. } => &meta,
             ExpressionType::ArrowFunctionExpression { meta, .. } => &meta,
@@ -378,6 +388,18 @@ impl HasMeta for ExpressionType {
                     format_vec(arguments, |p| p.to_formatted_string(script)),
                 )
                 .to_string(),
+            ExpressionType::OptionalChain { meta, object, access } => {
+                let acc = match access {
+                    OptionalAccess::Member(n) => format!("?.{}", n),
+                    OptionalAccess::Computed(_) => String::from("?.[…]"),
+                    OptionalAccess::Call(_) => String::from("?.(…)"),
+                };
+                format_struct("ExpressionType::OptionalChain")
+                    .add_fields("meta", meta.to_formatted_string(script))
+                    .add_fields("object", object.to_formatted_string(script))
+                    .add_fields("access", acc)
+                    .to_string()
+            }
             ExpressionType::NewExpression {
                 meta,
                 callee,
@@ -463,6 +485,9 @@ pub enum PatternType {
     ObjectPattern {
         meta: Meta,
         properties: Vec<AssignmentPropertyData>,
+        /// `...rest` binding collecting the remaining own enumerable props
+        /// (`{a, ...rest} = o`); `None` when there is no rest element.
+        rest: Option<Box<PatternType>>,
     },
     ArrayPattern {
         meta: Meta,
@@ -491,12 +516,18 @@ impl HasMeta for PatternType {
 
     fn to_formatted_string(&self, script: &str) -> String {
         match self {
-            PatternType::ObjectPattern { meta, properties } => {
+            PatternType::ObjectPattern { meta, properties, rest } => {
                 format_struct("PatternType::ObjectPattern")
                     .add_fields("meta", meta.to_formatted_string(script))
                     .add_fields(
                         "properties",
                         format_vec(properties, |p| p.to_formatted_string(script)),
+                    )
+                    .add_fields(
+                        "rest",
+                        rest.as_ref()
+                            .map(|r| r.to_formatted_string(script))
+                            .unwrap_or_else(|| String::from("None")),
                     )
                     .to_string()
             }
@@ -635,6 +666,17 @@ impl HasMeta for ExpressionOrSuper {
     }
 }
 
+/// The access performed by an [`ExpressionType::OptionalChain`].
+#[derive(Debug)]
+pub enum OptionalAccess {
+    /// `?.name`
+    Member(String),
+    /// `?.[expr]`
+    Computed(Box<ExpressionType>),
+    /// `?.(args)`
+    Call(Vec<ExpressionOrSpreadElement>),
+}
+
 #[derive(Debug)]
 pub enum MemberExpressionType {
     SimpleMemberExpression {
@@ -753,6 +795,13 @@ pub enum AssignmentOperator {
     BitwiseOrEquals,
     BitwiseAndEquals,
     BitwiseXorEquals,
+    ExponentEquals,
+    /// `&&=` — assign only if the current value is truthy.
+    LogicalAndEquals,
+    /// `||=` — assign only if the current value is falsy.
+    LogicalOrEquals,
+    /// `??=` — assign only if the current value is null/undefined.
+    NullishEquals,
 }
 
 #[derive(Debug)]
@@ -796,6 +845,7 @@ pub enum BinaryOperator {
     BitwiseOr,
     BitwiseAnd,
     BitwiseXor,
+    Exponent,
     In,
     InstanceOf,
 }
@@ -804,6 +854,8 @@ pub enum BinaryOperator {
 pub enum LogicalOperator {
     Or,
     And,
+    /// `??` nullish coalescing.
+    Coalesce,
 }
 
 #[derive(Debug)]
@@ -937,12 +989,22 @@ pub enum StatementType {
         meta: Meta,
         argument: Option<Box<ExpressionType>>,
     },
-    //Label Statement not supported, hence break & continue with labels not supported
     BreakStatement {
         meta: Meta,
+        /// Target label for `break label;` (`None` = break the innermost loop/switch).
+        label: Option<String>,
     },
     ContinueStatement {
         meta: Meta,
+        /// Target label for `continue label;` (`None` = continue the innermost loop).
+        label: Option<String>,
+    },
+    /// `label: stmt` — a labelled statement. `break label`/`continue label`
+    /// inside `body` target this label.
+    LabelledStatement {
+        meta: Meta,
+        label: String,
+        body: Box<StatementType>,
     },
     IfStatement {
         meta: Meta,
@@ -998,6 +1060,7 @@ impl HasMeta for StatementType {
             StatementType::ReturnStatement { meta, .. } => &meta,
             StatementType::BreakStatement { meta, .. } => &meta,
             StatementType::ContinueStatement { meta, .. } => &meta,
+            StatementType::LabelledStatement { meta, .. } => &meta,
             StatementType::IfStatement { meta, .. } => &meta,
             StatementType::SwitchStatement { meta, .. } => &meta,
             StatementType::ThrowStatement { meta, .. } => &meta,
@@ -1046,14 +1109,23 @@ impl HasMeta for StatementType {
                     )
                     .to_string()
             }
-            StatementType::BreakStatement { meta } => {
+            StatementType::BreakStatement { meta, label } => {
                 format_struct("StatementType::BreakStatement")
                     .add_fields("meta", meta.to_formatted_string(script))
+                    .add_fields("label", format!("{:?}", label))
                     .to_string()
             }
-            StatementType::ContinueStatement { meta } => {
+            StatementType::ContinueStatement { meta, label } => {
                 format_struct("StatementType::ContinueStatement")
                     .add_fields("meta", meta.to_formatted_string(script))
+                    .add_fields("label", format!("{:?}", label))
+                    .to_string()
+            }
+            StatementType::LabelledStatement { meta, label, body } => {
+                format_struct("StatementType::LabelledStatement")
+                    .add_fields("meta", meta.to_formatted_string(script))
+                    .add_fields("label", label.clone())
+                    .add_fields("body", body.to_formatted_string(script))
                     .to_string()
             }
             StatementType::IfStatement {
@@ -1410,7 +1482,8 @@ impl HasMeta for FunctionData {
 #[derive(Debug)]
 pub struct CatchClauseData {
     pub meta: Meta,
-    pub param: Box<PatternType>,
+    /// `None` for the optional catch binding `catch { … }` (ES2019).
+    pub param: Option<Box<PatternType>>,
     pub body: BlockStatementData,
 }
 
@@ -1422,7 +1495,13 @@ impl HasMeta for CatchClauseData {
     fn to_formatted_string(&self, script: &str) -> String {
         format_struct("CatchClauseData")
             .add_fields("meta", self.meta.to_formatted_string(script))
-            .add_fields("param", self.param.to_formatted_string(script))
+            .add_fields(
+                "param",
+                self.param
+                    .as_ref()
+                    .map(|p| p.to_formatted_string(script))
+                    .unwrap_or_else(|| String::from("None")),
+            )
             .add_fields("body", self.body.to_formatted_string(script))
             .to_string()
     }
@@ -1624,6 +1703,9 @@ pub enum PropertyKind {
     Init,
     Get,
     Set,
+    /// `...expr` spread inside an object literal (the `value` is the spread
+    /// expression; `key` is unused).
+    Spread,
 }
 
 #[derive(Debug)]

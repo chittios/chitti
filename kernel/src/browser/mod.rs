@@ -321,8 +321,54 @@ pub fn fill_video_slot(fr: &mut layout::FrameBox, bytes: alloc::vec::Vec<u8>) {
 }
 
 /// Decode image bytes into a layout image slot (uses `crate::image`).
+/// Decode image bytes to RGB, transparently rasterizing **SVG** (via [`svg`])
+/// in addition to the raster formats [`crate::image::decode`] handles
+/// (PNG/JPEG/…). `hint_w`/`hint_h` size an SVG with no intrinsic dimensions.
+pub fn decode_image_or_svg(
+    bytes: &[u8],
+    hint_w: usize,
+    hint_h: usize,
+) -> Option<crate::image::Image> {
+    let head = &bytes[..bytes.len().min(512)];
+    let is_svg = core::str::from_utf8(head)
+        .map(|h| {
+            let t = h.trim_start();
+            t.starts_with("<?xml") || t.starts_with("<svg") || h.contains("<svg")
+        })
+        .unwrap_or(false);
+    if is_svg {
+        let text = core::str::from_utf8(bytes).ok()?;
+        let doc = html::parse(text);
+        let node = find_svg_node(&doc.root)?;
+        let vw = if hint_w > 0 { hint_w as f32 } else { 64.0 };
+        let vh = if hint_h > 0 { hint_h as f32 } else { 64.0 };
+        let sbox = svg::collect_svg(node, vw, vh);
+        let (w, h) = (sbox.w.max(1) as usize, sbox.h.max(1) as usize);
+        if w.saturating_mul(h) > 4_000_000 {
+            return None;
+        }
+        return Some(crate::image::Image { w, h, pixels: svg::raster(&sbox) });
+    }
+    crate::image::decode(bytes).ok()
+}
+
+fn find_svg_node(n: &html::Node) -> Option<&html::Node> {
+    if let html::NodeKind::Element { tag, .. } = &n.kind {
+        if tag.eq_ignore_ascii_case("svg") {
+            return Some(n);
+        }
+    }
+    for c in &n.children {
+        if let Some(found) = find_svg_node(c) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 pub fn fill_image_slot(im: &mut layout::ImageBox, bytes: &[u8]) {
-    let Ok(decoded) = crate::image::decode(bytes) else {
+    let Some(decoded) = decode_image_or_svg(bytes, im.w.max(1) as usize, im.h.max(1) as usize)
+    else {
         return;
     };
     let max_w = im.w.max(1) as usize;

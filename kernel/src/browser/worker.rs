@@ -445,7 +445,10 @@ pub fn fetch_images_cooperative(urls: &[String]) -> (Vec<LoadedResource>, AssetS
 }
 
 /// Most subresource URLs fetched per [`fetch_subresources_cooperative`] call.
-const MAX_SUBRESOURCE_URLS: usize = 16;
+/// Modern SPAs split code into dozens of chunks; 16 dropped most of them, so
+/// this is sized for a heavy page's script/style set (each is still a bounded,
+/// cooperatively-drained, Ctrl+C-interruptible round trip).
+const MAX_SUBRESOURCE_URLS: usize = 64;
 
 /// Fetch a batch of same-kind subresources (scripts / styles / fonts) on a
 /// **stack-local** pool and drain cooperatively (upkeep + Ctrl+C between
@@ -623,10 +626,10 @@ mod tests {
     }
 
     #[test_case]
-    fn fetch_subresources_truncates_to_sixteen() {
+    fn fetch_subresources_truncates_to_cap() {
         let mut pool = WorkerPool::new();
         let mut urls = Vec::new();
-        for i in 0..20 {
+        for i in 0..(MAX_SUBRESOURCE_URLS + 8) {
             let u = format!("https://ex.com/{i}.js");
             pool.assets_mut()
                 .put(&u, "text/javascript", alloc::vec![b'a']);

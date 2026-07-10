@@ -80,6 +80,10 @@ pub struct EvalContext {
     /// host state (a live DOM element view). An object carrying an
     /// `__native_node__` integer routes its property get/set through this.
     pub native_props: Option<Rc<dyn NativeProps>>,
+    /// ChittiOS: labels applied to the immediately-following statement by a
+    /// `LabelledStatement`. A loop takes these at entry so `break label` /
+    /// `continue label` target it; a labelled non-loop consumes them itself.
+    pub pending_labels: alloc::vec::Vec<alloc::string::String>,
 }
 
 /// ChittiOS: property backing for host-native objects (e.g. a live DOM view).
@@ -126,6 +130,7 @@ impl EvalContext {
             super_global: Rc::new(RefCell::new(SuperGlobalEnvironment::new())),
             current_super: None,
             native_props: None,
+            pending_labels: alloc::vec::Vec::new(),
         }
     }
 
@@ -162,6 +167,7 @@ impl EvalContext {
             super_global: Rc::new(RefCell::new(SuperGlobalEnvironment::new())),
             current_super: None,
             native_props: None,
+            pending_labels: alloc::vec::Vec::new(),
         }
     }
 

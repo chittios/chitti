@@ -6881,7 +6881,8 @@ fn browser_fetch_bg_images(
             .map(|r| r.body.clone())
             .or_else(|| assets.get(u).map(|(_, b)| b.to_vec()));
         let Some(bytes) = body else { continue };
-        let Ok(img) = crate::image::decode(&bytes) else {
+        // SVG-aware decode (iana.org's icons are SVG); 0 hints → intrinsic size.
+        let Some(img) = crate::browser::decode_image_or_svg(&bytes, 0, 0) else {
             crate::serial_println!("browser> bg: decode failed {}", u);
             continue;
         };

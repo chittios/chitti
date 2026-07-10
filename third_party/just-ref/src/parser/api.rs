@@ -725,7 +725,28 @@ fn build_ast_from_statement(
             (c, Semantics::new_empty())
         }
         Rule::break_statement | Rule::break_statement__yield => {
-            (BreakStatement { meta }, Semantics::new_empty())
+            // Optional `label_identifier` child = `break label;`.
+            let label = inner_pair
+                .into_inner()
+                .next()
+                .map(|p| p.as_str().trim().to_string());
+            (BreakStatement { meta, label }, Semantics::new_empty())
+        }
+        Rule::labelled_statement
+        | Rule::labelled_statement__yield
+        | Rule::labelled_statement__return
+        | Rule::labelled_statement__yield_return => {
+            let mut it = inner_pair.into_inner();
+            let label = it.next().unwrap().as_str().trim().to_string();
+            let (body, body_s) = build_ast_from_statement(it.next().unwrap(), script)?;
+            (
+                StatementType::LabelledStatement {
+                    meta,
+                    label,
+                    body: Box::new(body),
+                },
+                body_s,
+            )
         }
         Rule::throw_statement | Rule::throw_statement__yield => {
             let (t, _) = build_ast_from_throw_statement(inner_pair, script)?;
@@ -846,12 +867,12 @@ fn build_ast_from_continue_statement(
 ) -> Result<(StatementType, Semantics), JsRuleError> {
     let mut s = Semantics::new_empty();
     s.contains_unpaired_continue.make_true();
-    Ok((
-        StatementType::ContinueStatement {
-            meta: get_meta(&pair, script),
-        },
-        s,
-    ))
+    let meta = get_meta(&pair, script);
+    let label = pair
+        .into_inner()
+        .next()
+        .map(|p| p.as_str().trim().to_string());
+    Ok((StatementType::ContinueStatement { meta, label }, s))
 }
 
 fn build_ast_from_statement_list(
@@ -1257,15 +1278,30 @@ fn build_ast_from_binding_pattern(
     Ok(match inner_pair.as_rule() {
         Rule::object_binding_pattern | Rule::object_binding_pattern__yield => {
             let binding_pattern_inner_iter = inner_pair.into_inner();
+            let mut rest: Option<Box<PatternType>> = None;
             for binding_property_pair in binding_pattern_inner_iter {
-                let (b, b_s) = build_ast_from_binding_property(binding_property_pair, script)?;
-                s.merge(b_s);
-                binding_properties.push(b);
+                match binding_property_pair.as_rule() {
+                    Rule::binding_rest_property | Rule::binding_rest_property__yield => {
+                        let id_pair = binding_property_pair.into_inner().next().unwrap();
+                        let (id, id_s) = get_binding_identifier_data(id_pair, script)?;
+                        s.merge(id_s);
+                        rest = Some(Box::new(
+                            ExpressionPatternType::Identifier(id).convert_to_pattern(),
+                        ));
+                    }
+                    _ => {
+                        let (b, b_s) =
+                            build_ast_from_binding_property(binding_property_pair, script)?;
+                        s.merge(b_s);
+                        binding_properties.push(b);
+                    }
+                }
             }
             (
                 PatternType::ObjectPattern {
                     meta,
                     properties: binding_properties,
+                    rest,
                 },
                 s,
             )
@@ -1694,28 +1730,35 @@ fn build_ast_from_try_statement(
         Rule::catch | Rule::catch__yield | Rule::catch__return | Rule::catch__yield_return => {
             let meta = get_meta(&next_pair, script);
             let mut catch_inner_iter = next_pair.into_inner();
-            let catch_parameter_pair = catch_inner_iter.next().unwrap();
-            let catch_parameter_inner_pair = catch_parameter_pair.into_inner().next().unwrap();
-            let (catch_param, catch_param_s) = match catch_parameter_inner_pair.as_rule() {
-                Rule::binding_identifier | Rule::binding_identifier__yield => {
-                    let (bi, bi_s) =
-                        get_binding_identifier_data(catch_parameter_inner_pair, script)?;
-                    (
-                        ExpressionPatternType::Identifier(bi).convert_to_pattern(),
-                        bi_s,
-                    )
-                }
-                Rule::binding_pattern | Rule::binding_pattern__yield => {
-                    build_ast_from_binding_pattern(catch_parameter_inner_pair, script)?
-                }
-                _ => {
-                    return Err(get_unexpected_error(
-                        "build_ast_from_try_statement",
-                        &catch_parameter_inner_pair,
-                    ))
-                }
+            // Optional catch binding: the first child is either a
+            // `catch_parameter` (then the block) or the block itself.
+            let first = catch_inner_iter.next().unwrap();
+            let (catch_param, catch_param_s, block_pair) = if matches!(
+                first.as_rule(),
+                Rule::catch_parameter | Rule::catch_parameter__yield
+            ) {
+                let catch_parameter_inner_pair = first.into_inner().next().unwrap();
+                let (p, ps) = match catch_parameter_inner_pair.as_rule() {
+                    Rule::binding_identifier | Rule::binding_identifier__yield => {
+                        let (bi, bi_s) =
+                            get_binding_identifier_data(catch_parameter_inner_pair, script)?;
+                        (ExpressionPatternType::Identifier(bi).convert_to_pattern(), bi_s)
+                    }
+                    Rule::binding_pattern | Rule::binding_pattern__yield => {
+                        build_ast_from_binding_pattern(catch_parameter_inner_pair, script)?
+                    }
+                    _ => {
+                        return Err(get_unexpected_error(
+                            "build_ast_from_try_statement",
+                            &catch_parameter_inner_pair,
+                        ))
+                    }
+                };
+                (Some(p), ps, catch_inner_iter.next().unwrap())
+            } else {
+                // `catch { … }` — no binding; `first` is the block.
+                (None, Semantics::new_empty(), first)
             };
-            let block_pair = catch_inner_iter.next().unwrap();
             let (block, block_s) = build_ast_from_block(block_pair, script)?;
             validate_bound_names_have_no_duplicates_and_also_not_present_in_var_declared_names_or_lexically_declared_names(&catch_param_s.bound_names, &block_s.var_declared_names,&block_s.lexically_declared_names)?;
             let mut s = Semantics::new_empty();
@@ -1723,7 +1766,7 @@ fn build_ast_from_try_statement(
             (
                 Some(CatchClauseData {
                     meta,
-                    param: Box::new(catch_param),
+                    param: catch_param.map(Box::new),
                     body: block,
                 }),
                 s,
@@ -1966,6 +2009,10 @@ fn build_ast_from_assignment_expression(
                         "&=" => AssignmentOperator::BitwiseAndEquals,
                         "^=" => AssignmentOperator::BitwiseXorEquals,
                         "|=" => AssignmentOperator::BitwiseOrEquals,
+                        "**=" => AssignmentOperator::ExponentEquals,
+                        "&&=" => AssignmentOperator::LogicalAndEquals,
+                        "||=" => AssignmentOperator::LogicalOrEquals,
+                        "??=" => AssignmentOperator::NullishEquals,
                         _ => {
                             return Err(get_unexpected_error(
                                 "build_ast_from_assignment_expression:1",
@@ -2130,7 +2177,7 @@ fn convert_lhs_expression_to_pattern_for_assignment_operation(
                     ));
                 }
             }
-            Ok(PatternType::ObjectPattern { meta, properties })
+            Ok(PatternType::ObjectPattern { meta, properties, rest: None })
         }
         ExpressionType::Literal(LiteralData { meta, .. })
         | ExpressionType::ThisExpression { meta }
@@ -2142,6 +2189,7 @@ fn convert_lhs_expression_to_pattern_for_assignment_operation(
         | ExpressionType::LogicalExpression { meta, .. }
         | ExpressionType::ConditionalExpression { meta, .. }
         | ExpressionType::CallExpression { meta, .. }
+        | ExpressionType::OptionalChain { meta, .. }
         | ExpressionType::NewExpression { meta, .. }
         | ExpressionType::SequenceExpression { meta, .. }
         | ExpressionType::ArrowFunctionExpression { meta, .. }
@@ -2329,6 +2377,33 @@ fn build_ast_from_left_hand_side_expression(
                     property: get_identifier_data(suffix_pair, script),
                 },
             ),
+            Rule::optional_member => ExpressionType::OptionalChain {
+                meta,
+                object: Box::new(obj),
+                access: crate::parser::ast::OptionalAccess::Member(
+                    suffix_pair.into_inner().next().unwrap().as_str().trim().to_string(),
+                ),
+            },
+            Rule::optional_index | Rule::optional_index__yield => {
+                let (e, e_s) =
+                    build_ast_from_expression(suffix_pair.into_inner().next().unwrap(), script)?;
+                s.merge(e_s);
+                ExpressionType::OptionalChain {
+                    meta,
+                    object: Box::new(obj),
+                    access: crate::parser::ast::OptionalAccess::Computed(Box::new(e)),
+                }
+            }
+            Rule::optional_call | Rule::optional_call__yield => {
+                let (a, a_s) =
+                    build_ast_from_arguments(suffix_pair.into_inner().next().unwrap(), script)?;
+                s.merge(a_s);
+                ExpressionType::OptionalChain {
+                    meta,
+                    object: Box::new(obj),
+                    access: crate::parser::ast::OptionalAccess::Call(a),
+                }
+            }
             Rule::template_literal | Rule::template_literal__yield => {
                 let (template, t_s) = build_ast_from_template_literal(suffix_pair, script)?;
                 s.merge(t_s);
@@ -2374,7 +2449,7 @@ fn build_ast_from_conditional_expression(
     let meta = get_meta(&pair, script);
     let mut pair_iter = pair.into_inner();
     let logical_or_pair = pair_iter.next().unwrap();
-    let (or_node, mut s) = build_ast_from_logical_or_expression(logical_or_pair, script)?;
+    let (or_node, mut s) = build_ast_from_coalesce_expression(logical_or_pair, script)?;
     if let Some(inner_pair) = pair_iter.next() {
         let (truthy, truthy_s) = build_ast_from_assignment_expression(inner_pair, script)?;
         let (falsy, falsy_s) =
@@ -2436,6 +2511,25 @@ fn get_ast_for_binary_expression(
     } else {
         right
     }
+}
+
+fn build_ast_from_coalesce_expression(
+    pair: Pair<Rule>,
+    script: &Rc<String>,
+) -> Result<(ExpressionType, Semantics), JsRuleError> {
+    let mut left = None;
+    let mut s = Semantics::new_empty();
+    for inner_pair in pair.into_inner() {
+        let (right, right_s) = build_ast_from_logical_or_expression(inner_pair, script)?;
+        s.merge(right_s);
+        left = Some(get_ast_for_logical_expression(
+            left,
+            right,
+            LogicalOperator::Coalesce,
+            script,
+        ));
+    }
+    Ok((left.unwrap(), s))
 }
 
 fn build_ast_from_logical_or_expression(
@@ -2732,7 +2826,7 @@ fn build_ast_from_multiplicative_expression(
                 });
                 inner_pair = pair_iter.next().unwrap();
             }
-            let (right, right_s) = build_ast_from_unary_expression(inner_pair, script)?;
+            let (right, right_s) = build_ast_from_exponentiation_expression(inner_pair, script)?;
             s.merge(right_s);
             left = Some(get_ast_for_binary_expression(left, right, operator, script));
         } else {
@@ -2740,6 +2834,27 @@ fn build_ast_from_multiplicative_expression(
         }
     }
     Ok((left.unwrap(), s))
+}
+
+/// `a ** b ** c` — right-associative exponentiation (binds tighter than `*`).
+fn build_ast_from_exponentiation_expression(
+    pair: Pair<Rule>,
+    script: &Rc<String>,
+) -> Result<(ExpressionType, Semantics), JsRuleError> {
+    let mut pair_iter = pair.into_inner();
+    let base_pair = pair_iter.next().unwrap();
+    let (base, mut s) = build_ast_from_unary_expression(base_pair, script)?;
+    if let Some(exp_pair) = pair_iter.next() {
+        // Right operand is itself an exponentiation_expression (right-assoc).
+        let (rhs, rhs_s) = build_ast_from_exponentiation_expression(exp_pair, script)?;
+        s.merge(rhs_s);
+        Ok((
+            get_ast_for_binary_expression(Some(base), rhs, Some(BinaryOperator::Exponent), script),
+            s,
+        ))
+    } else {
+        Ok((base, s))
+    }
 }
 
 fn build_ast_from_unary_expression(
@@ -3062,6 +3177,23 @@ fn build_ast_from_member_expression(
                             property: get_identifier_data(pair, script),
                         },
                     ),
+                    Rule::optional_member => ExpressionType::OptionalChain {
+                        meta,
+                        object: Box::new(obj),
+                        access: crate::parser::ast::OptionalAccess::Member(
+                            pair.into_inner().next().unwrap().as_str().trim().to_string(),
+                        ),
+                    },
+                    Rule::optional_index | Rule::optional_index__yield => {
+                        let (e, e_s) =
+                            build_ast_from_expression(pair.into_inner().next().unwrap(), script)?;
+                        s.merge(e_s);
+                        ExpressionType::OptionalChain {
+                            meta,
+                            object: Box::new(obj),
+                            access: crate::parser::ast::OptionalAccess::Computed(Box::new(e)),
+                        }
+                    }
                     Rule::template_literal | Rule::template_literal__yield => {
                         let (template, t_s) = build_ast_from_template_literal(pair, script)?;
                         s.merge(t_s);
@@ -3907,6 +4039,21 @@ fn build_ast_from_property_definition(
     let mut inner_pair_iter = pair.into_inner();
     let inner_pair = inner_pair_iter.next().unwrap();
     let p = match inner_pair.as_rule() {
+        Rule::spread_property | Rule::spread_property__yield => {
+            // `{ ...expr }` — store the spread expr as the value of a
+            // Spread-kind property (the key is an unused placeholder).
+            let expr_pair = inner_pair.into_inner().next().unwrap();
+            let (a, a_s) = build_ast_from_assignment_expression(expr_pair, script)?;
+            s.merge(a_s);
+            PropertyData::new_with_any_expression_key(
+                meta.clone(),
+                ExpressionType::ThisExpression { meta },
+                Box::new(a),
+                PropertyKind::Spread,
+                false,
+                false,
+            )
+        }
         Rule::property_name | Rule::property_name__yield => {
             let (p, p_s) = build_ast_from_property_name(inner_pair, script)?;
             let (a, a_s) =
@@ -4333,6 +4480,8 @@ fn build_ast_from_class_element(
         }
         PropertyKind::Get => MethodDefinitionKind::Get,
         PropertyKind::Set => MethodDefinitionKind::Set,
+        // A method definition is never spread; treat defensively as a method.
+        PropertyKind::Spread => MethodDefinitionKind::Method,
     };
 
     Ok(Some(MethodDefinitionData {

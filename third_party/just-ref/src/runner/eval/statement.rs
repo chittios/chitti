@@ -73,12 +73,16 @@ pub fn execute_statement(
             execute_switch_statement(discriminant, cases, ctx)
         }
 
-        StatementType::BreakStatement { .. } => {
-            Ok(Completion::break_completion(None))
+        StatementType::BreakStatement { label, .. } => {
+            Ok(Completion::break_completion(label.clone()))
         }
 
-        StatementType::ContinueStatement { .. } => {
-            Ok(Completion::continue_completion(None))
+        StatementType::ContinueStatement { label, .. } => {
+            Ok(Completion::continue_completion(label.clone()))
+        }
+
+        StatementType::LabelledStatement { label, body, .. } => {
+            execute_labelled_statement(label, body, ctx)
         }
 
         StatementType::ReturnStatement { argument, .. } => {
@@ -217,9 +221,12 @@ fn collect_pattern_names(pattern: &PatternType, out: &mut Vec<String>) {
         PatternType::PatternWhichCanBeExpression(ExpressionPatternType::Identifier(id)) => {
             out.push(id.name.clone());
         }
-        PatternType::ObjectPattern { properties, .. } => {
+        PatternType::ObjectPattern { properties, rest, .. } => {
             for prop in properties {
                 collect_pattern_names(&prop.0.value, out);
+            }
+            if let Some(r) = rest {
+                collect_pattern_names(r, out);
             }
         }
         PatternType::ArrayPattern { elements, .. } => {
@@ -331,7 +338,7 @@ fn bind_pattern(
             Ok(())
         }
 
-        PatternType::ObjectPattern { properties, .. } => {
+        PatternType::ObjectPattern { properties, rest, .. } => {
             // Destructuring `null`/`undefined` is a TypeError (there is no object
             // to read properties from).
             if matches!(value, JsValue::Null | JsValue::Undefined) {
@@ -342,11 +349,13 @@ fn bind_pattern(
                 )));
             }
             // Object destructuring: { x, y } = obj or { x: renamed } = obj
+            let mut consumed: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
             for prop in properties {
                 let prop_data = &prop.0;
 
                 // Get the property key name
                 let key_name = get_property_key_name(&prop_data.key)?;
+                consumed.push(key_name.clone());
 
                 // Get the value from the object
                 let prop_value = get_property_value(&value, &key_name)?;
@@ -355,6 +364,21 @@ fn bind_pattern(
                 // For shorthand like { x }, value is the same pattern as key
                 // For renamed like { x: renamed }, value is the renamed pattern
                 bind_pattern(&prop_data.value, prop_value, ctx, is_const, is_var)?;
+            }
+            // `...rest` = a fresh object with the own enumerable props NOT already
+            // destructured above.
+            if let Some(rest_pat) = rest {
+                let rest_obj = crate::runner::eval::expression::make_object(alloc::vec::Vec::new());
+                for key in crate::runner::eval::expression::own_string_keys(&value) {
+                    if !consumed.contains(&key) {
+                        if let Some(v) =
+                            crate::runner::eval::expression::get_own_prop_value(&value, &key)
+                        {
+                            crate::runner::eval::expression::set_own_prop(&rest_obj, &key, v, true);
+                        }
+                    }
+                }
+                bind_pattern(rest_pat, rest_obj, ctx, is_const, is_var)?;
             }
             Ok(())
         }
@@ -629,12 +653,53 @@ fn execute_if_statement(
     }
 }
 
+/// Execute `label: body`. Loops take the label at entry (via
+/// `ctx.pending_labels`) so `break label`/`continue label` target them; a
+/// labelled non-loop (e.g. a block `n:{…}`) handles `break label` here by
+/// converting the escaping Break completion to Normal.
+fn execute_labelled_statement(
+    label: &str,
+    body: &StatementType,
+    ctx: &mut EvalContext,
+) -> EvalResult {
+    ctx.pending_labels.push(label.to_string());
+    let result = execute_statement(body, ctx);
+    // A loop drains the labels at entry; for a non-loop body they linger — drop
+    // ours so it can't leak onto a sibling statement.
+    ctx.pending_labels.retain(|l| l != label);
+    let completion = result?;
+    match completion.completion_type {
+        // `break label` that reached here (labelled block, or a loop that
+        // propagated it) completes the labelled statement normally.
+        CompletionType::Break if completion.target.as_deref() == Some(label) => {
+            Ok(Completion::normal_with_value(completion.get_value()))
+        }
+        _ => Ok(completion),
+    }
+}
+
+/// A loop takes the labels applied to it, and decides how to treat a
+/// break/continue completion: `matched` = no target (innermost) or a target in
+/// this loop's label set (it's ours); otherwise the completion belongs to an
+/// enclosing labelled statement and must propagate out.
+fn loop_labels(ctx: &mut EvalContext) -> alloc::vec::Vec<alloc::string::String> {
+    core::mem::take(&mut ctx.pending_labels)
+}
+
+fn targets_this_loop(target: &Option<alloc::string::String>, labels: &[alloc::string::String]) -> bool {
+    match target {
+        None => true,
+        Some(t) => labels.iter().any(|l| l == t),
+    }
+}
+
 /// Execute a while statement.
 fn execute_while_statement(
     test: &ExpressionType,
     body: &StatementType,
     ctx: &mut EvalContext,
 ) -> EvalResult {
+    let labels = loop_labels(ctx);
     let mut completion = Completion::normal();
 
     loop {
@@ -648,10 +713,16 @@ fn execute_while_statement(
 
         match completion.completion_type {
             CompletionType::Break => {
-                return Ok(Completion::normal_with_value(completion.get_value()));
+                if targets_this_loop(&completion.target, &labels) {
+                    return Ok(Completion::normal_with_value(completion.get_value()));
+                }
+                return Ok(completion); // labelled break for an outer statement
             }
             CompletionType::Continue => {
-                continue;
+                if targets_this_loop(&completion.target, &labels) {
+                    continue;
+                }
+                return Ok(completion);
             }
             CompletionType::Return | CompletionType::Throw | CompletionType::Yield => {
                 return Ok(completion);
@@ -669,14 +740,22 @@ fn execute_do_while_statement(
     test: &ExpressionType,
     ctx: &mut EvalContext,
 ) -> EvalResult {
+    let labels = loop_labels(ctx);
     loop {
         let completion = execute_statement(body, ctx)?;
 
         match completion.completion_type {
             CompletionType::Break => {
-                return Ok(Completion::normal_with_value(completion.get_value()));
+                if targets_this_loop(&completion.target, &labels) {
+                    return Ok(Completion::normal_with_value(completion.get_value()));
+                }
+                return Ok(completion);
             }
-            CompletionType::Continue => {}
+            CompletionType::Continue => {
+                if !targets_this_loop(&completion.target, &labels) {
+                    return Ok(completion);
+                }
+            }
             CompletionType::Return | CompletionType::Throw | CompletionType::Yield => {
                 return Ok(completion);
             }
@@ -713,6 +792,7 @@ fn execute_for_statement(
         }
     }
 
+    let labels = loop_labels(ctx);
     let mut completion = Completion::normal();
 
     loop {
@@ -727,9 +807,16 @@ fn execute_for_statement(
 
         match completion.completion_type {
             CompletionType::Break => {
-                return Ok(Completion::normal_with_value(completion.get_value()));
+                if targets_this_loop(&completion.target, &labels) {
+                    return Ok(Completion::normal_with_value(completion.get_value()));
+                }
+                return Ok(completion);
             }
-            CompletionType::Continue => {}
+            CompletionType::Continue => {
+                if !targets_this_loop(&completion.target, &labels) {
+                    return Ok(completion);
+                }
+            }
             CompletionType::Return | CompletionType::Throw | CompletionType::Yield => {
                 return Ok(completion);
             }
@@ -818,8 +905,13 @@ fn execute_switch_statement(
 
                 match completion.completion_type {
                     CompletionType::Break => {
-                        // Break exits the switch
-                        return Ok(Completion::normal_with_value(completion.get_value()));
+                        // An unlabelled `break` exits the switch; a labelled
+                        // `break L` belongs to an enclosing statement L and
+                        // must propagate out of the switch unchanged.
+                        if completion.target.is_none() {
+                            return Ok(Completion::normal_with_value(completion.get_value()));
+                        }
+                        return Ok(completion);
                     }
                     CompletionType::Return | CompletionType::Throw | CompletionType::Continue | CompletionType::Yield => {
                         // These propagate up
@@ -895,12 +987,14 @@ fn handle_catch(
     // Create a new block scope for the catch clause
     ctx.push_block_scope();
 
-    // Bind the error to the catch parameter
-    let param_name = get_binding_name(&catch_clause.param)?;
-    let error_value = thrown.value.unwrap_or(JsValue::Undefined);
-
-    ctx.create_binding(&param_name, false)?;
-    ctx.initialize_binding(&param_name, error_value)?;
+    // Bind the error to the catch parameter — unless this is the optional
+    // catch binding `catch { … }` (ES2019), which introduces no binding.
+    if let Some(param) = &catch_clause.param {
+        let param_name = get_binding_name(param)?;
+        let error_value = thrown.value.unwrap_or(JsValue::Undefined);
+        ctx.create_binding(&param_name, false)?;
+        ctx.initialize_binding(&param_name, error_value)?;
+    }
 
     // Execute the catch block
     let result = execute_block_statement(&catch_clause.body, ctx);
@@ -956,6 +1050,7 @@ fn execute_for_in_statement(
     };
 
     // Execute the loop body for each key
+    let labels = loop_labels(ctx);
     let mut completion = Completion::normal();
 
     for key in keys {
@@ -967,10 +1062,16 @@ fn execute_for_in_statement(
 
         match completion.completion_type {
             CompletionType::Break => {
-                return Ok(Completion::normal_with_value(completion.get_value()));
+                if targets_this_loop(&completion.target, &labels) {
+                    return Ok(Completion::normal_with_value(completion.get_value()));
+                }
+                return Ok(completion);
             }
             CompletionType::Continue => {
-                continue;
+                if targets_this_loop(&completion.target, &labels) {
+                    continue;
+                }
+                return Ok(completion);
             }
             CompletionType::Return | CompletionType::Throw | CompletionType::Yield => {
                 return Ok(completion);
@@ -1064,6 +1165,7 @@ fn execute_for_of_with_values(
     values: Vec<JsValue>,
     ctx: &mut EvalContext,
 ) -> EvalResult {
+    let labels = loop_labels(ctx);
     let mut completion = Completion::normal();
 
     for value in values {
@@ -1075,10 +1177,16 @@ fn execute_for_of_with_values(
 
         match completion.completion_type {
             CompletionType::Break => {
-                return Ok(Completion::normal_with_value(completion.get_value()));
+                if targets_this_loop(&completion.target, &labels) {
+                    return Ok(Completion::normal_with_value(completion.get_value()));
+                }
+                return Ok(completion);
             }
             CompletionType::Continue => {
-                continue;
+                if targets_this_loop(&completion.target, &labels) {
+                    continue;
+                }
+                return Ok(completion);
             }
             CompletionType::Return | CompletionType::Throw | CompletionType::Yield => {
                 return Ok(completion);

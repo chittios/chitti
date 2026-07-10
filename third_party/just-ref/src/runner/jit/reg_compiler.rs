@@ -151,6 +151,10 @@ impl RegCompiler {
             StatementType::SwitchStatement { discriminant, cases, .. } => {
                 self.compile_switch(discriminant, cases);
             }
+            StatementType::LabelledStatement { body, .. } => {
+                // Labels are a no-op in the (host-only) JIT: compile the body.
+                self.compile_statement(body);
+            }
             StatementType::BreakStatement { .. } => {
                 self.compile_break();
             }
@@ -599,6 +603,8 @@ impl RegCompiler {
         let jump_to_else = match operator {
             LogicalOperator::And => self.emit_jump(RegOpCode::JumpIfFalse, left_reg, 0),
             LogicalOperator::Or => self.emit_jump(RegOpCode::JumpIfTrue, left_reg, 0),
+            // `??` host-JIT best-effort (interpreter authoritative).
+            LogicalOperator::Coalesce => self.emit_jump(RegOpCode::JumpIfTrue, left_reg, 0),
         };
 
         let right_reg = self.compile_expression(right);
@@ -811,6 +817,8 @@ impl RegCompiler {
             AssignmentOperator::BitwiseRightShiftEquals => RegOpCode::ShiftRight,
             AssignmentOperator::BitwiseUnsignedRightShiftEquals => RegOpCode::UShiftRight,
             AssignmentOperator::Equals => RegOpCode::Move,
+            // Host-only JIT: **=, &&=, ||=, ??= (interpreter authoritative).
+            _ => RegOpCode::Move,
         }
     }
 

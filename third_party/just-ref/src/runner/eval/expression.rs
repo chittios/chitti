@@ -129,6 +129,10 @@ pub fn evaluate_expression(
         ExpressionType::MemberExpression(member_expr) => {
             evaluate_member_expression(member_expr, ctx)
         }
+
+        ExpressionType::OptionalChain { object, access, .. } => {
+            evaluate_optional_chain(object, access, ctx)
+        }
     }
 }
 
@@ -444,6 +448,45 @@ fn evaluate_object_expression(
     let mut accessors: HashMap<String, (Option<JsObjectType>, Option<JsObjectType>)> = HashMap::new();
 
     for prop in properties {
+        // `{ ...expr }` — merge the spread source's own enumerable props first
+        // (before any key evaluation; the Spread key is a placeholder).
+        if matches!(prop.kind, PropertyKind::Spread) {
+            let src = evaluate_expression(&prop.value, ctx)?;
+            match &src {
+                JsValue::Null | JsValue::Undefined => {}
+                JsValue::String(sv) => {
+                    // Spreading a string yields index→char entries.
+                    for (i, ch) in sv.chars().enumerate() {
+                        obj.get_object_base_mut().properties.insert(
+                            PropertyKey::Str(i.to_string()),
+                            PropertyDescriptor::Data(PropertyDescriptorData {
+                                value: JsValue::String(ch.to_string()),
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            }),
+                        );
+                    }
+                }
+                _ => {
+                    for k in own_string_keys(&src) {
+                        if let Some(v) = get_own_prop_value(&src, &k) {
+                            obj.get_object_base_mut().properties.insert(
+                                PropertyKey::Str(k),
+                                PropertyDescriptor::Data(PropertyDescriptorData {
+                                    value: v,
+                                    writable: true,
+                                    enumerable: true,
+                                    configurable: true,
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
         // Get the property key
         let key = get_object_property_key(&prop.key, prop.computed, ctx)?;
 
@@ -487,6 +530,8 @@ fn evaluate_object_expression(
                     return Err(JErrorType::TypeError("Setter must be a function".to_string()));
                 }
             }
+            // Handled by the early `continue` above.
+            PropertyKind::Spread => unreachable!("spread handled before key eval"),
         }
     }
 
@@ -549,6 +594,36 @@ fn evaluate_expression_pattern(
         ExpressionPatternType::Identifier(id) => {
             // Look up the identifier in the environment chain
             ctx.get_binding(&id.name)
+        }
+    }
+}
+
+/// Evaluate an optional-chaining access `obj?.x` / `obj?.[e]` / `obj?.(args)`.
+/// If `obj` is `null`/`undefined` the access short-circuits to `undefined`
+/// (per-step guard — the common `a?.b?.c` form is fully covered).
+fn evaluate_optional_chain(
+    object: &ExpressionType,
+    access: &crate::parser::ast::OptionalAccess,
+    ctx: &mut EvalContext,
+) -> ValueResult {
+    use crate::parser::ast::OptionalAccess;
+    let base = evaluate_expression(object, ctx)?;
+    if matches!(base, JsValue::Null | JsValue::Undefined) {
+        return Ok(JsValue::Undefined);
+    }
+    match access {
+        OptionalAccess::Member(name) => get_property_with_ctx(&base, name, ctx),
+        OptionalAccess::Computed(expr) => {
+            let key = evaluate_expression(expr, ctx)?;
+            get_property_with_ctx(&base, &to_property_key(&key), ctx)
+        }
+        OptionalAccess::Call(args) => {
+            let argv = evaluate_arguments(args, ctx)?;
+            // `f?.(args)` — call `base` with `this = undefined` (a plain call).
+            if !value_is_callable(&base) {
+                return Err(JErrorType::TypeError("optional callee is not a function".to_string()));
+            }
+            call_value(&base, JsValue::Undefined, argv, ctx)
         }
     }
 }
@@ -640,6 +715,42 @@ fn evaluate_call_expression(
                     if let Ok(prop) = get_property_with_receiver(&receiver, &receiver, &method_name, ctx) {
                         if value_is_callable(&prop) {
                             return call_value(&prop, receiver, args, ctx);
+                        }
+                    }
+
+                    // (1b) `Function.prototype.{call,apply,bind}` on any
+                    //      callable receiver — foundational for real libraries
+                    //      (jQuery/lodash) that invoke helpers via `fn.call`.
+                    if value_is_callable(&receiver) {
+                        match method_name.as_str() {
+                            "call" => {
+                                let mut it = args.into_iter();
+                                let this_arg = it.next().unwrap_or(JsValue::Undefined);
+                                return call_value(&receiver, this_arg, it.collect(), ctx);
+                            }
+                            "apply" => {
+                                let mut it = args.into_iter();
+                                let this_arg = it.next().unwrap_or(JsValue::Undefined);
+                                let arr = it.next().unwrap_or(JsValue::Undefined);
+                                let call_args = match &arr {
+                                    JsValue::Null | JsValue::Undefined => Vec::new(),
+                                    _ => array_elements(&arr),
+                                };
+                                return call_value(&receiver, this_arg, call_args, ctx);
+                            }
+                            "bind" => {
+                                // Best-effort: a bound function that fixes `this`
+                                // and prepends partial args (a native closure).
+                                let mut it = args.into_iter();
+                                let bound_this = it.next().unwrap_or(JsValue::Undefined);
+                                let bound_args: Vec<JsValue> = it.collect();
+                                return Ok(make_bound_function(
+                                    receiver.clone(),
+                                    bound_this,
+                                    bound_args,
+                                ));
+                            }
+                            _ => {}
                         }
                     }
 
@@ -925,6 +1036,20 @@ pub fn call_function_object(
     args: Vec<JsValue>,
     ctx: &mut EvalContext,
 ) -> ValueResult {
+    // A bound function (`fn.bind(this, …)`): fix `this`, prepend the partial
+    // args, and invoke the original target.
+    {
+        let fv = JsValue::Object(func.clone());
+        if let Some(target) = get_own_prop_value(&fv, "__bound_target__") {
+            let bound_this = get_own_prop_value(&fv, "__bound_this__").unwrap_or(JsValue::Undefined);
+            let mut call_args = get_own_prop_value(&fv, "__bound_args__")
+                .map(|a| array_elements(&a))
+                .unwrap_or_default();
+            call_args.extend(args);
+            return call_value(&target, bound_this, call_args, ctx);
+        }
+    }
+
     let func_ref = func.borrow();
 
     match &*func_ref {
@@ -1434,6 +1559,23 @@ fn evaluate_assignment_expression(
             let current = ctx.get_binding(&name)?;
             bitwise_xor(&current, &rhs_value)?
         }
+        AssignmentOperator::ExponentEquals => {
+            let current = ctx.get_binding(&name)?;
+            exponent_values(&current, &rhs_value)?
+        }
+        // Logical assignment: keep the current value unless the guard passes.
+        AssignmentOperator::LogicalAndEquals => {
+            let current = ctx.get_binding(&name)?;
+            if to_boolean(&current) { rhs_value } else { current }
+        }
+        AssignmentOperator::LogicalOrEquals => {
+            let current = ctx.get_binding(&name)?;
+            if to_boolean(&current) { current } else { rhs_value }
+        }
+        AssignmentOperator::NullishEquals => {
+            let current = ctx.get_binding(&name)?;
+            if matches!(current, JsValue::Null | JsValue::Undefined) { rhs_value } else { current }
+        }
     };
 
     // Anonymous-function name inference for `f = function(){}` / `f = () => {}`.
@@ -1658,6 +1800,16 @@ fn evaluate_member_assignment(
             AssignmentOperator::BitwiseOrEquals => bitwise_or(&current, &rhs_value)?,
             AssignmentOperator::BitwiseAndEquals => bitwise_and(&current, &rhs_value)?,
             AssignmentOperator::BitwiseXorEquals => bitwise_xor(&current, &rhs_value)?,
+            AssignmentOperator::ExponentEquals => exponent_values(&current, &rhs_value)?,
+            AssignmentOperator::LogicalAndEquals => {
+                if to_boolean(&current) { rhs_value } else { current }
+            }
+            AssignmentOperator::LogicalOrEquals => {
+                if to_boolean(&current) { current } else { rhs_value }
+            }
+            AssignmentOperator::NullishEquals => {
+                if matches!(current, JsValue::Null | JsValue::Undefined) { rhs_value } else { current }
+            }
         }
     };
 
@@ -1850,6 +2002,7 @@ fn evaluate_binary_expression(
         BinaryOperator::Multiply => multiply_values(&left_val, &right_val),
         BinaryOperator::Divide => divide_values(&left_val, &right_val),
         BinaryOperator::Modulo => modulo_values(&left_val, &right_val),
+        BinaryOperator::Exponent => exponent_values(&left_val, &right_val),
 
         // Comparison
         BinaryOperator::LessThan => compare_values(&left_val, &right_val, |a, b| a < b),
@@ -1960,7 +2113,35 @@ fn evaluate_logical_expression(
                 evaluate_expression(right, ctx)
             }
         }
+        // `a ?? b` — right side only when `a` is null/undefined.
+        LogicalOperator::Coalesce => {
+            if matches!(left_val, JsValue::Null | JsValue::Undefined) {
+                evaluate_expression(right, ctx)
+            } else {
+                Ok(left_val)
+            }
+        }
     }
+}
+
+/// `a ** b` — exponentiation over JS numbers (via f64 `powf`). Integer bases/
+/// exponents fold back to an integer when the result is exact.
+fn exponent_values(left: &JsValue, right: &JsValue) -> ValueResult {
+    use num_traits::Float;
+    let a = to_number(left)?;
+    let b = to_number(right)?;
+    apply_numeric_op(
+        &a,
+        &b,
+        |x, y| {
+            if y >= 0 {
+                (x as f64).powf(y as f64) as i64
+            } else {
+                0
+            }
+        },
+        |x, y| x.powf(y),
+    )
 }
 
 /// Evaluate a conditional (ternary) expression.
@@ -2863,6 +3044,19 @@ pub fn create_arrow_function_object(
     );
     let obj_ref: JsObjectType = Rc::new(RefCell::new(ObjectType::Ordinary(Box::new(func_obj))));
     Ok(JsValue::Object(obj_ref))
+}
+
+/// Build a bound function (`fn.bind(thisArg, …partial)`): a callable object
+/// carrying the target, bound `this`, and partial args. `call_function_object`
+/// detects the `__bound_target__` marker and forwards the call.
+pub fn make_bound_function(target: JsValue, this: JsValue, partial: Vec<JsValue>) -> JsValue {
+    let f = make_object(vec![]);
+    // `__simple_function__` makes `is_callable()` / `value_is_callable()` true.
+    set_own_prop(&f, "__simple_function__", JsValue::Boolean(true), false);
+    set_own_prop(&f, "__bound_target__", target, false);
+    set_own_prop(&f, "__bound_this__", this, false);
+    set_own_prop(&f, "__bound_args__", make_array(partial), false);
+    f
 }
 
 /// The `length` of a function: the number of leading formal parameters that are
