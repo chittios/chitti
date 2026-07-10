@@ -84,6 +84,8 @@ pub mod font_geist;
 // Runtime TTF/OTF (fontdue) — browser paint + optional UI faces. Available
 // under test so browser unit tests exercise real glyph rasterization.
 pub mod font_ttf;
+// WOFF1 → SFNT web-font container converter (WOFF2 detected, unsupported).
+pub mod font_woff;
 
 // --- Limine requests (x86_64 boot only) ------------------------------
 //

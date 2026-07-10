@@ -20,6 +20,43 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+/// Line style for a border/outline edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BorderStyle {
+    None,
+    #[default]
+    Solid,
+    Dashed,
+    Dotted,
+    Double,
+}
+
+impl BorderStyle {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "hidden" => BorderStyle::None,
+            "dashed" => BorderStyle::Dashed,
+            "dotted" => BorderStyle::Dotted,
+            "double" => BorderStyle::Double,
+            // solid, groove, ridge, inset, outset → render as solid
+            _ => BorderStyle::Solid,
+        }
+    }
+    pub fn is_visible(self) -> bool {
+        !matches!(self, BorderStyle::None)
+    }
+}
+
+/// `clear` — which float sides a block must clear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ClearMode {
+    #[default]
+    None,
+    Left,
+    Right,
+    Both,
+}
+
 /// Resolved style used by layout/paint.
 #[derive(Clone, Debug)]
 pub struct ComputedStyle {
@@ -135,6 +172,29 @@ pub struct ComputedStyle {
     pub webkit_box_pack: Justify,
     pub unicode_range: String,
     pub inset_shorthand: bool,
+    // ── decoration properties now applied to rendering ──
+    pub outline_color: Option<u32>,
+    pub outline_width: i32,
+    pub outline_style: BorderStyle,
+    pub border_top_style: BorderStyle,
+    pub border_bottom_style: BorderStyle,
+    pub border_left_style: BorderStyle,
+    pub border_right_style: BorderStyle,
+    /// `background-image` value verbatim (`url(...)` or `linear-gradient(...)`).
+    pub background_image: String,
+    pub background_repeat: String,
+    pub background_position: String,
+    pub background_size: String,
+    pub background_clip: String,
+    /// `filter` / `backdrop-filter` function lists (e.g. `blur(2px) grayscale(1)`).
+    pub filter: String,
+    pub backdrop_filter: String,
+    pub mask: String,
+    pub object_position: String,
+    pub table_layout: String,
+    pub clear: ClearMode,
+    /// `content` string for generated content (quotes stripped).
+    pub content: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -452,6 +512,25 @@ impl Default for ComputedStyle {
             webkit_box_pack: Justify::Start,
             unicode_range: String::new(),
             inset_shorthand: false,
+            outline_color: None,
+            outline_width: 0,
+            outline_style: BorderStyle::None,
+            border_top_style: BorderStyle::None,
+            border_bottom_style: BorderStyle::None,
+            border_left_style: BorderStyle::None,
+            border_right_style: BorderStyle::None,
+            background_image: String::new(),
+            background_repeat: String::new(),
+            background_position: String::new(),
+            background_size: String::new(),
+            background_clip: String::new(),
+            filter: String::new(),
+            backdrop_filter: String::new(),
+            mask: String::new(),
+            object_position: String::new(),
+            table_layout: String::new(),
+            clear: ClearMode::None,
+            content: String::new(),
         }
     }
 }
@@ -950,6 +1029,44 @@ pub fn parse_color(s: &str) -> Option<u32> {
     None
 }
 
+/// First color stop of a `linear-gradient(...)` / `radial-gradient(...)`, used
+/// as a paintable fallback and gradient start color. `None` for `url(...)` or
+/// unparseable values.
+pub fn gradient_first_color(v: &str) -> Option<u32> {
+    let lower = v.to_ascii_lowercase();
+    let idx = lower.find("gradient(")?;
+    let inner = &v[idx + "gradient(".len()..];
+    let inner = inner.strip_suffix(')').unwrap_or(inner);
+    for part in inner.split(',') {
+        // Skip the direction token (`to right`, `45deg`, `circle`, …).
+        for tok in part.split_whitespace() {
+            if let Some(c) = parse_color(tok) {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// All color stops of a gradient, in order (for a simple linear raster).
+pub fn gradient_stops(v: &str) -> Vec<u32> {
+    let lower = v.to_ascii_lowercase();
+    let mut out = Vec::new();
+    if let Some(idx) = lower.find("gradient(") {
+        let inner = &v[idx + "gradient(".len()..];
+        let inner = inner.strip_suffix(')').unwrap_or(inner);
+        for part in inner.split(',') {
+            for tok in part.split_whitespace() {
+                if let Some(c) = parse_color(tok) {
+                    out.push(c);
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn parse_px(s: &str) -> Option<i32> {
     let s = s.trim().to_ascii_lowercase();
     if let Some(n) = s.strip_suffix("px") {
@@ -1003,6 +1120,18 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
                 if tok == "transparent" {
                     st.background = None;
                     break;
+                }
+            }
+            // The shorthand can also carry an image / gradient.
+            if name == "background" {
+                let v = value.trim();
+                if v.contains("url(") || v.contains("gradient(") {
+                    st.background_image = v.to_string();
+                    if let Some(c) = gradient_first_color(v) {
+                        if st.background.is_none() {
+                            st.background = Some(c);
+                        }
+                    }
                 }
             }
         }
@@ -1187,10 +1316,22 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
                 st.opacity = (f.clamp(0.0, 1.0) * 255.0) as u8;
             }
         }
-        "border" | "border-color" | "outline-color" => {
+        "border-color" => {
             for tok in value.split_whitespace() {
                 if let Some(c) = parse_color(tok) {
                     st.border_color = Some(c);
+                    st.border_top_color = Some(c);
+                    st.border_bottom_color = Some(c);
+                    st.border_left_color = Some(c);
+                    st.border_right_color = Some(c);
+                    break;
+                }
+            }
+        }
+        "outline-color" => {
+            for tok in value.split_whitespace() {
+                if let Some(c) = parse_color(tok) {
+                    st.outline_color = Some(c);
                     break;
                 }
             }
@@ -1260,7 +1401,12 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
             };
         }
         "clear" => {
-            // Accept and ignore (layout does not clear floats yet).
+            st.clear = match value.trim().to_ascii_lowercase().as_str() {
+                "left" => ClearMode::Left,
+                "right" => ClearMode::Right,
+                "both" => ClearMode::Both,
+                _ => ClearMode::None,
+            };
         }
         "white-space" => {
             st.white_space = match value.trim().to_ascii_lowercase().as_str() {
@@ -1341,11 +1487,10 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
             }
         }
         "outline-width" => {
-            if let Some(px) = parse_px(value) {
-                st.outline_offset = st.outline_offset; // keep
-                let _ = px;
+            st.outline_width = parse_px(value).unwrap_or(0).max(0);
+            if st.outline_style == BorderStyle::None {
+                st.outline_style = BorderStyle::Solid;
             }
-            let _ = value;
         }
         "border-spacing" => {
             let _ = parse_px(value);
@@ -1353,9 +1498,12 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
         "font-stretch" | "font-variant" | "font-feature-settings" | "font-variation-settings" => {
             let _ = value;
         }
+        "object-position" => st.object_position = value.trim().to_string(),
+        "mask" => st.mask = value.trim().to_string(),
+        "mask-image" => st.mask = value.trim().to_string(),
+        "table-layout" => st.table_layout = value.trim().to_ascii_lowercase(),
         "zoom" | "contain" | "color-scheme" | "scroll-behavior" | "backface-visibility"
-        | "object-position" | "mask" | "mask-image" | "text-wrap" | "forced-color-adjust"
-        | "table-layout" | "container-type" | "overscroll-behavior" => {
+        | "text-wrap" | "forced-color-adjust" | "container-type" | "overscroll-behavior" => {
             let _ = value;
         }
         "stroke-dasharray" | "stroke-dashoffset" => {
@@ -1381,7 +1529,15 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
         }
         "border-bottom-style" | "border-top-style" | "border-left-style" | "border-right-style"
         | "outline-style" => {
-            let _ = value;
+            let bs = BorderStyle::parse(value);
+            match name.as_str() {
+                "border-top-style" => st.border_top_style = bs,
+                "border-bottom-style" => st.border_bottom_style = bs,
+                "border-left-style" => st.border_left_style = bs,
+                "border-right-style" => st.border_right_style = bs,
+                "outline-style" => st.outline_style = bs,
+                _ => {}
+            }
         }
         "webkit-box-align" | "webkit-box-flex" | "webkit-box-direction" => {
             if name == "webkit-box-align" {
@@ -1416,9 +1572,34 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
         "animation-duration" => st.animation_duration = value.trim().to_string(),
         "animation-delay" => st.animation_delay = value.trim().to_string(),
         "animation-timing-function" => st.animation_timing = value.trim().to_string(),
-        "filter" | "backdrop-filter" | "content" | "outline" | "outline-width"
-        | "outline-style" => {
-            let _ = value;
+        "filter" => st.filter = value.trim().to_string(),
+        "backdrop-filter" => st.backdrop_filter = value.trim().to_string(),
+        "content" => {
+            // Strip surrounding quotes; `none`/`normal` → empty (no generated box).
+            let v = value.trim();
+            st.content = if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("normal") {
+                String::new()
+            } else {
+                v.trim_matches('"').trim_matches('\'').to_string()
+            };
+        }
+        "outline" => {
+            // `outline: <width> <style> <color>` shorthand (any order).
+            for tok in value.split_whitespace() {
+                if let Some(px) = parse_px(tok) {
+                    st.outline_width = px.max(0);
+                } else if let Some(c) = parse_color(tok) {
+                    st.outline_color = Some(c);
+                } else {
+                    let bs = BorderStyle::parse(tok);
+                    if tok.eq_ignore_ascii_case("none") || bs != BorderStyle::Solid || tok.eq_ignore_ascii_case("solid") {
+                        st.outline_style = bs;
+                    }
+                }
+            }
+            if st.outline_width == 0 && st.outline_style.is_visible() {
+                st.outline_width = 1;
+            }
         }
         "box-shadow" | "webkit-box-shadow" => {
             st.box_shadow = value.trim().to_string();
@@ -1458,29 +1639,72 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
                 st.border_bottom_width = px;
                 st.border_left_width = px;
                 st.border_right_width = px;
+                if px > 0 {
+                    for s in [
+                        &mut st.border_top_style,
+                        &mut st.border_bottom_style,
+                        &mut st.border_left_style,
+                        &mut st.border_right_style,
+                    ] {
+                        if *s == BorderStyle::None {
+                            *s = BorderStyle::Solid;
+                        }
+                    }
+                }
             }
         }
-        "border-top" | "border-bottom" | "border-left" | "border-right" | "border-style" => {
+        "border" | "border-top" | "border-bottom" | "border-left" | "border-right"
+        | "border-style" => {
+            // `<width> <style> <color>` in any order (shorthand). A side with a
+            // visible style but no explicit width gets a 1px medium default.
+            let mut w: Option<i32> = None;
+            let mut c: Option<u32> = None;
+            let mut style: Option<BorderStyle> = None;
+            let mut had_style_kw = false;
             for tok in value.split_whitespace() {
-                if let Some(c) = parse_color(tok) {
-                    st.border_color = Some(c);
-                    match name.as_str() {
-                        "border-top" => st.border_top_color = Some(c),
-                        "border-bottom" => st.border_bottom_color = Some(c),
-                        "border-left" => st.border_left_color = Some(c),
-                        "border-right" => st.border_right_color = Some(c),
-                        _ => {}
-                    }
-                }
+                let low = tok.to_ascii_lowercase();
                 if let Some(px) = parse_px(tok) {
-                    match name.as_str() {
-                        "border-top" => st.border_top_width = px,
-                        "border-bottom" => st.border_bottom_width = px,
-                        "border-left" => st.border_left_width = px,
-                        "border-right" => st.border_right_width = px,
-                        _ => {}
-                    }
+                    w = Some(px);
+                } else if matches!(
+                    low.as_str(),
+                    "none" | "hidden" | "solid" | "dashed" | "dotted" | "double" | "groove"
+                        | "ridge" | "inset" | "outset"
+                ) {
+                    style = Some(BorderStyle::parse(&low));
+                    had_style_kw = true;
+                } else if let Some(col) = parse_color(tok) {
+                    c = Some(col);
                 }
+            }
+            // A bare `border-style: solid` shouldn't zero the width; only default
+            // width when a style keyword was present and no width given.
+            let eff_w = w.or(if had_style_kw && name != "border-style" {
+                Some(1)
+            } else {
+                None
+            });
+            let set_top = matches!(name.as_str(), "border" | "border-top" | "border-style");
+            let set_bottom = matches!(name.as_str(), "border" | "border-bottom" | "border-style");
+            let set_left = matches!(name.as_str(), "border" | "border-left" | "border-style");
+            let set_right = matches!(name.as_str(), "border" | "border-right" | "border-style");
+            if let Some(col) = c {
+                st.border_color = Some(col);
+                if set_top { st.border_top_color = Some(col); }
+                if set_bottom { st.border_bottom_color = Some(col); }
+                if set_left { st.border_left_color = Some(col); }
+                if set_right { st.border_right_color = Some(col); }
+            }
+            if let Some(px) = eff_w {
+                if set_top { st.border_top_width = px; }
+                if set_bottom { st.border_bottom_width = px; }
+                if set_left { st.border_left_width = px; }
+                if set_right { st.border_right_width = px; }
+            }
+            if let Some(s) = style {
+                if set_top { st.border_top_style = s; }
+                if set_bottom { st.border_bottom_style = s; }
+                if set_left { st.border_left_style = s; }
+                if set_right { st.border_right_style = s; }
             }
         }
         "border-top-color" => {
@@ -1533,10 +1757,25 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
                 st.border_radius = st.border_radius.max(px.max(0));
             }
         }
-        "background-image" | "background-size" | "background-position" | "background-repeat"
-        | "background-clip" | "background-origin" => {
-            let _ = value;
+        "background-image" | "background-origin" => {
+            let v = value.trim();
+            st.background_image = if v.eq_ignore_ascii_case("none") {
+                String::new()
+            } else {
+                v.to_string()
+            };
+            // A gradient's first color seeds `background` so the box paints even
+            // before the gradient raster (and as a solid fallback).
+            if let Some(c) = gradient_first_color(v) {
+                if st.background.is_none() {
+                    st.background = Some(c);
+                }
+            }
         }
+        "background-size" => st.background_size = value.trim().to_ascii_lowercase(),
+        "background-position" => st.background_position = value.trim().to_ascii_lowercase(),
+        "background-repeat" => st.background_repeat = value.trim().to_ascii_lowercase(),
+        "background-clip" => st.background_clip = value.trim().to_ascii_lowercase(),
         "font-style" => {
             st.font_style = match value.trim().to_ascii_lowercase().as_str() {
                 "italic" => FontStyle::Italic,
@@ -1829,7 +2068,334 @@ pub fn compute(
         }
     }
     apply_decls(&mut st, &decls);
+    // `filter` is approximated as a colour transform over the element's own
+    // colours (grayscale/invert/brightness/opacity) — blur is not rasterized.
+    if !st.filter.is_empty() {
+        apply_filter_colors(&mut st);
+    }
     st
+}
+
+/// Apply the colour-affecting parts of `filter` (grayscale/invert/brightness/
+/// sepia/opacity) to an element's own colours. A cheap, plumbing-free
+/// approximation that makes `filter` visibly change rendering for the common
+/// solid-colour cases.
+fn apply_filter_colors(st: &mut ComputedStyle) {
+    let f = st.filter.to_ascii_lowercase();
+    let amount = |name: &str, default: f32| -> Option<f32> {
+        let i = f.find(name)?;
+        let rest = &f[i + name.len()..];
+        let open = rest.find('(')?;
+        let close = rest[open..].find(')')? + open;
+        let arg = rest[open + 1..close].trim();
+        if arg.is_empty() {
+            return Some(default);
+        }
+        if let Some(p) = arg.strip_suffix('%') {
+            return p.trim().parse::<f32>().ok().map(|v| v / 100.0);
+        }
+        arg.parse::<f32>().ok()
+    };
+    let xform = |c: u32| -> u32 {
+        let (mut r, mut g, mut b) = (
+            ((c >> 16) & 0xff) as f32,
+            ((c >> 8) & 0xff) as f32,
+            (c & 0xff) as f32,
+        );
+        if let Some(a) = amount("grayscale", 1.0) {
+            let l = 0.299 * r + 0.587 * g + 0.114 * b;
+            r += (l - r) * a;
+            g += (l - g) * a;
+            b += (l - b) * a;
+        }
+        if let Some(a) = amount("sepia", 1.0) {
+            let (nr, ng, nb) = (
+                0.393 * r + 0.769 * g + 0.189 * b,
+                0.349 * r + 0.686 * g + 0.168 * b,
+                0.272 * r + 0.534 * g + 0.131 * b,
+            );
+            r += (nr - r) * a;
+            g += (ng - g) * a;
+            b += (nb - b) * a;
+        }
+        if let Some(a) = amount("invert", 1.0) {
+            r += (255.0 - r - r) * a;
+            g += (255.0 - g - g) * a;
+            b += (255.0 - b - b) * a;
+        }
+        if let Some(a) = amount("brightness", 1.0) {
+            r *= a;
+            g *= a;
+            b *= a;
+        }
+        let cl = |v: f32| v.clamp(0.0, 255.0) as u32;
+        (cl(r) << 16) | (cl(g) << 8) | cl(b)
+    };
+    st.color = xform(st.color);
+    st.background = st.background.map(xform);
+    st.border_color = st.border_color.map(xform);
+    if let Some(a) = amount("opacity", 1.0) {
+        st.opacity = (st.opacity as f32 * a.clamp(0.0, 1.0)) as u8;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure stylesheet scanners (subresource discovery + module preprocessing).
+// ---------------------------------------------------------------------------
+
+/// One `@font-face` source: family name, resource URL, and format hint
+/// (`woff2` / `woff` / `truetype` / vendor string).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontFace {
+    pub family: String,
+    pub url: String,
+    pub format: String,
+}
+
+/// Strip surrounding `"…"` / `'…'` quotes and whitespace from a CSS token.
+fn unquote(s: &str) -> &str {
+    s.trim().trim_matches(|c| c == '"' || c == '\'').trim()
+}
+
+/// Split `s` on `sep`, but only at paren depth 0 (so `url(data:a;b,c)` stays
+/// whole). Empty pieces are dropped.
+fn split_paren_aware(s: &str, sep: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in s.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth = (depth - 1).max(0);
+                cur.push(c);
+            }
+            c if c == sep && depth == 0 => {
+                if !cur.trim().is_empty() {
+                    out.push(cur.clone());
+                }
+                cur.clear();
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Scan a stylesheet for `@import` targets, in order. Handles
+/// `@import url("x");`, `@import url(x);`, `@import "x";`, and
+/// `@import 'x' screen;` (trailing media list ignored).
+pub fn scan_imports(css: &str) -> Vec<String> {
+    let lower = css.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(i) = lower[pos..].find("@import") {
+        let start = pos + i + "@import".len();
+        pos = start; // progress even on a malformed rule
+        let rest = css[start..].trim_start();
+        if rest.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("url(")) {
+            if let Some(end) = rest.find(')') {
+                let u = unquote(&rest[4..end]);
+                if !u.is_empty() {
+                    out.push(u.to_string());
+                }
+            }
+        } else if let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
+            if let Some(end) = rest[1..].find(q) {
+                out.push(rest[1..1 + end].to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Collect `url(...)` references from `background` / `background-image`
+/// declarations only (fonts are [`scan_font_faces`]'s job). Deduped, in
+/// document order; `data:` URIs are skipped (gradients carry no `url(...)`
+/// and thus never match).
+pub fn scan_css_urls(css: &str) -> Vec<String> {
+    let lower = css.to_ascii_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    let mut pos = 0;
+    while let Some(i) = lower[pos..].find("url(") {
+        let at = pos + i;
+        pos = at + 4;
+        // Walk back to the start of this declaration, then read its property.
+        let seg_start = lower[..at]
+            .rfind(['{', ';', '}'])
+            .map(|j| j + 1)
+            .unwrap_or(0);
+        let seg = &lower[seg_start..at];
+        let Some(colon) = seg.find(':') else { continue };
+        let prop = seg[..colon].trim();
+        if prop != "background" && prop != "background-image" {
+            continue;
+        }
+        let Some(end) = css[at + 4..].find(')') else { continue };
+        let url = unquote(&css[at + 4..at + 4 + end]);
+        if url.is_empty() || url.starts_with("data:") {
+            continue;
+        }
+        if !out.iter().any(|u| u == url) {
+            out.push(url.to_string());
+        }
+    }
+    out
+}
+
+/// Parse `@font-face` blocks: family (quotes stripped), the first
+/// non-`data:` `src` URL, and its format — explicit `format("…")` if
+/// present, else inferred from the extension (`.woff2` → `woff2`,
+/// `.woff` → `woff`, `.ttf`/`.otf` → `truetype`).
+pub fn scan_font_faces(css: &str) -> Vec<FontFace> {
+    let lower = css.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(i) = lower[pos..].find("@font-face") {
+        let at = pos + i;
+        let Some(ob) = css[at..].find('{').map(|j| at + j) else {
+            break;
+        };
+        let Some(cb) = css[ob + 1..].find('}').map(|j| ob + 1 + j) else {
+            break;
+        };
+        let block = &css[ob + 1..cb];
+        pos = cb + 1;
+        let mut family = String::new();
+        let mut url = String::new();
+        let mut format = String::new();
+        // Paren-aware ';' split: a data: URI inside url() contains ';'.
+        for decl in split_paren_aware(block, ';') {
+            let Some(colon) = decl.find(':') else { continue };
+            let name = decl[..colon].trim().to_ascii_lowercase();
+            let value = decl[colon + 1..].trim();
+            if name == "font-family" {
+                family = unquote(value).to_string();
+            } else if name == "src" && url.is_empty() {
+                // First candidate carrying a usable (non-data:) url().
+                for cand in split_paren_aware(value, ',') {
+                    let cl = cand.to_ascii_lowercase();
+                    let Some(u) = cl.find("url(") else { continue };
+                    let Some(e) = cand[u + 4..].find(')') else { continue };
+                    let raw = unquote(&cand[u + 4..u + 4 + e]);
+                    if raw.is_empty() || raw.starts_with("data:") {
+                        continue;
+                    }
+                    url = raw.to_string();
+                    format = if let Some(f) = cl.find("format(") {
+                        cand[f + 7..]
+                            .find(')')
+                            .map(|fe| unquote(&cand[f + 7..f + 7 + fe]).to_string())
+                            .unwrap_or_default()
+                    } else {
+                        let rl = raw.to_ascii_lowercase();
+                        if rl.ends_with(".woff2") {
+                            String::from("woff2")
+                        } else if rl.ends_with(".woff") {
+                            String::from("woff")
+                        } else if rl.ends_with(".ttf") || rl.ends_with(".otf") {
+                            String::from("truetype")
+                        } else {
+                            String::new()
+                        }
+                    };
+                    break;
+                }
+            }
+        }
+        if !family.is_empty() && !url.is_empty() {
+            out.push(FontFace {
+                family,
+                url,
+                format,
+            });
+        }
+    }
+    out
+}
+
+/// Return the first quoted string on a line (`"u"` or `'u'`), if any.
+fn quoted_spec(line: &str) -> Option<String> {
+    let qpos = line.find(['"', '\''])?;
+    let q = line.as_bytes()[qpos] as char;
+    let rest = &line[qpos + 1..];
+    let end = rest.find(q)?;
+    Some(rest[..end].to_string())
+}
+
+/// `kw` starts the trimmed line as a whole word (next byte is not an
+/// identifier character).
+fn starts_kw(t: &str, kw: &str) -> bool {
+    t.starts_with(kw)
+        && t.as_bytes()
+            .get(kw.len())
+            .map(|b| !b.is_ascii_alphanumeric() && *b != b'_' && *b != b'$')
+            .unwrap_or(true)
+}
+
+/// Strip ES-module syntax from `src`, line-oriented and tolerant. Returns the
+/// transformed source plus the static import specifiers, in order.
+///
+/// - `import X from "u"` / `import {a,b} from "u"` / `import "u"` — the line
+///   is removed and the specifier collected (bindings become globals defined
+///   by the imported module's own stripped source).
+/// - `import * as N from "u"` — **unsupported**: the specifier is still
+///   collected, and the line is kept as a `// unsupported …` comment marker.
+/// - Top-level `export default expr;` → `var __default = expr;`.
+/// - `export ` prefix before `const`/`let`/`var`/`function`/`class`/`async`
+///   is removed.
+/// - `export {a, b};` lines are removed (a `from "u"` re-export specifier is
+///   still collected).
+///
+/// Non-module code passes through unchanged.
+pub fn strip_module_syntax(src: &str) -> (String, Vec<String>) {
+    let mut imports = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    for line in src.split('\n') {
+        let t = line.trim_start();
+        let indent = &line[..line.len() - t.len()];
+        if starts_kw(t, "import") {
+            if let Some(spec) = quoted_spec(t) {
+                imports.push(spec);
+                if t["import".len()..].trim_start().starts_with('*') {
+                    // Namespace imports need a real module record — flag it.
+                    out.push(format!(
+                        "{indent}// unsupported module form: {}",
+                        t.trim_end()
+                    ));
+                }
+                continue; // supported forms: line removed
+            }
+            out.push(line.to_string()); // no specifier — leave untouched
+        } else if starts_kw(t, "export") {
+            let after = t["export".len()..].trim_start();
+            if starts_kw(after, "default") {
+                let expr = after["default".len()..].trim_start();
+                out.push(format!("{indent}var __default = {expr}"));
+            } else if after.starts_with('{') {
+                if let Some(spec) = quoted_spec(t) {
+                    imports.push(spec); // `export {x} from "u"` re-export
+                }
+                // `export {a, b};` — bindings already exist as globals.
+            } else if ["const", "let", "var", "function", "class", "async"]
+                .iter()
+                .any(|kw| starts_kw(after, kw))
+            {
+                out.push(format!("{indent}{after}"));
+            } else {
+                out.push(line.to_string()); // unknown export form — keep
+            }
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    (out.join("\n"), imports)
 }
 
 #[cfg(test)]
@@ -1871,6 +2437,82 @@ mod tests {
         assert!(st.font_family.contains("Geist"));
         assert_eq!(st.min_width, Some(100));
         assert_eq!(st.object_fit, ObjectFit::Cover);
+    }
+
+    #[test_case]
+    fn border_shorthand_sets_all_sides() {
+        let mut st = ComputedStyle::default();
+        apply_one(&mut st, "border", "2px solid #ff0000");
+        assert_eq!(st.border_top_width, 2);
+        assert_eq!(st.border_right_width, 2);
+        assert_eq!(st.border_top_style, BorderStyle::Solid);
+        assert_eq!(st.border_left_style, BorderStyle::Solid);
+        assert_eq!(st.border_top_color, Some(0xff0000));
+        // A dashed style + no width defaults to 1px.
+        let mut d = ComputedStyle::default();
+        apply_one(&mut d, "border-bottom", "dashed blue");
+        assert_eq!(d.border_bottom_style, BorderStyle::Dashed);
+        assert_eq!(d.border_bottom_width, 1);
+        assert_eq!(d.border_bottom_color, Some(0x0000ff));
+    }
+
+    #[test_case]
+    fn outline_shorthand_and_style() {
+        let mut st = ComputedStyle::default();
+        apply_one(&mut st, "outline", "3px solid green");
+        assert_eq!(st.outline_width, 3);
+        assert_eq!(st.outline_style, BorderStyle::Solid);
+        assert_eq!(st.outline_color, Some(0x008000));
+        let mut n = ComputedStyle::default();
+        apply_one(&mut n, "outline-style", "none");
+        assert_eq!(n.outline_style, BorderStyle::None);
+    }
+
+    #[test_case]
+    fn background_gradient_first_color_and_image() {
+        let mut st = ComputedStyle::default();
+        apply_one(&mut st, "background", "linear-gradient(to right, #ff0000, #0000ff)");
+        // Gradient renders as its first stop (paintable fallback).
+        assert_eq!(st.background, Some(0xff0000));
+        assert!(st.background_image.contains("gradient"));
+        assert_eq!(gradient_stops("linear-gradient(90deg, red, lime, blue)").len(), 3);
+    }
+
+    #[test_case]
+    fn filter_grayscale_and_invert() {
+        // grayscale(1) collapses a pure colour toward its luma.
+        let mut st = ComputedStyle::default();
+        st.color = 0xff0000;
+        st.filter = "grayscale(1)".into();
+        apply_filter_colors(&mut st);
+        let (r, g, b) = ((st.color >> 16) & 0xff, (st.color >> 8) & 0xff, st.color & 0xff);
+        assert_eq!(r, g);
+        assert_eq!(g, b);
+        // invert(1) flips white to black.
+        let mut w = ComputedStyle::default();
+        w.color = 0xffffff;
+        w.filter = "invert(1)".into();
+        apply_filter_colors(&mut w);
+        assert_eq!(w.color, 0x000000);
+        // opacity() multiplies the alpha.
+        let mut o = ComputedStyle::default();
+        o.opacity = 200;
+        o.filter = "opacity(0.5)".into();
+        apply_filter_colors(&mut o);
+        assert_eq!(o.opacity, 100);
+    }
+
+    #[test_case]
+    fn clear_and_stored_props() {
+        let mut st = ComputedStyle::default();
+        apply_one(&mut st, "clear", "both");
+        apply_one(&mut st, "content", "\"hi\"");
+        apply_one(&mut st, "object-position", "center top");
+        apply_one(&mut st, "table-layout", "fixed");
+        assert_eq!(st.clear, ClearMode::Both);
+        assert_eq!(st.content, "hi");
+        assert_eq!(st.object_position, "center top");
+        assert_eq!(st.table_layout, "fixed");
     }
 
     #[test_case]
@@ -2046,5 +2688,122 @@ mod tests {
         let sheet2 = Stylesheet::parse("body { background-color: #112233; }");
         let st2 = compute(&sheet2, "body", None, None, None, &ComputedStyle::default());
         assert_eq!(st2.background, Some(0x112233));
+    }
+
+    #[test_case]
+    fn scan_imports_forms() {
+        let css = concat!(
+            "@import url(\"a.css\");\n",
+            "@import url(b.css);\n",
+            "@import \"c.css\";\n",
+            "@import 'd.css' screen;\n",
+            "p { color: red; }\n",
+        );
+        assert_eq!(
+            scan_imports(css),
+            alloc::vec![
+                "a.css".to_string(),
+                "b.css".to_string(),
+                "c.css".to_string(),
+                "d.css".to_string(),
+            ]
+        );
+        assert!(scan_imports("p { color: red }").is_empty());
+    }
+
+    #[test_case]
+    fn scan_css_urls_background_only() {
+        let css = concat!(
+            "body { background: url(\"bg.png\") no-repeat; }\n",
+            ".a { background-image: url(tile.jpg); }\n",
+            ".b { background-image: url(tile.jpg); }\n", // dupe
+            ".c { background: url(data:image/png;base64,AAAA); }\n",
+            ".d { background: linear-gradient(#fff, #000); }\n",
+            "@font-face { src: url(font.woff2); }\n", // not a background
+            ".e { list-style-image: url(dot.png); }\n", // not a background
+        );
+        assert_eq!(
+            scan_css_urls(css),
+            alloc::vec!["bg.png".to_string(), "tile.jpg".to_string()]
+        );
+    }
+
+    #[test_case]
+    fn scan_font_faces_formats() {
+        let css = concat!(
+            "@font-face { font-family: \"Geist Mono\"; ",
+            "src: url(gm.woff2) format(\"woff2\"); }\n",
+            "@font-face { font-family: Inter; src: url('inter.woff'); }\n",
+            "@font-face { font-family: Mono; ",
+            "src: url(data:font/woff2;base64,AAAA), url(mono.ttf); }\n",
+            "@font-face { src: url(nofamily.woff); }\n", // no family: skipped
+        );
+        let faces = scan_font_faces(css);
+        assert_eq!(faces.len(), 3, "{faces:?}");
+        assert_eq!(
+            faces[0],
+            FontFace {
+                family: "Geist Mono".to_string(),
+                url: "gm.woff2".to_string(),
+                format: "woff2".to_string(),
+            }
+        );
+        assert_eq!(faces[1].family, "Inter");
+        assert_eq!(faces[1].url, "inter.woff");
+        assert_eq!(faces[1].format, "woff");
+        // data: candidate skipped; .ttf infers truetype.
+        assert_eq!(faces[2].url, "mono.ttf");
+        assert_eq!(faces[2].format, "truetype");
+    }
+
+    #[test_case]
+    fn strip_module_import_forms() {
+        let src = concat!(
+            "import X from \"a.js\"\n",
+            "import {a, b} from 'b.js';\n",
+            "import \"c.js\";\n",
+            "console.log(X);",
+        );
+        let (out, imports) = strip_module_syntax(src);
+        assert_eq!(
+            imports,
+            alloc::vec!["a.js".to_string(), "b.js".to_string(), "c.js".to_string()]
+        );
+        assert_eq!(out, "console.log(X);");
+    }
+
+    #[test_case]
+    fn strip_module_star_unsupported() {
+        let (out, imports) = strip_module_syntax("import * as N from \"n.js\";\nN.go();");
+        assert_eq!(imports, alloc::vec!["n.js".to_string()]);
+        assert!(out.contains("// unsupported module form:"), "{out}");
+        assert!(out.contains("N.go();"));
+    }
+
+    #[test_case]
+    fn strip_module_exports() {
+        let src = concat!(
+            "export default foo(1);\n",
+            "export const a = 1;\n",
+            "export function f() { return a; }\n",
+            "export class C {}\n",
+            "export {a, f};\n",
+            "export {x} from \"re.js\";",
+        );
+        let (out, imports) = strip_module_syntax(src);
+        assert!(out.contains("var __default = foo(1);"), "{out}");
+        assert!(out.contains("const a = 1;"));
+        assert!(out.contains("function f() { return a; }"));
+        assert!(out.contains("class C {}"));
+        assert!(!out.contains("export"), "{out}");
+        assert_eq!(imports, alloc::vec!["re.js".to_string()]);
+    }
+
+    #[test_case]
+    fn strip_module_passthrough_unchanged() {
+        let src = "var importantThing = 1;\nfunction exporter() {}\n  exporter();\n";
+        let (out, imports) = strip_module_syntax(src);
+        assert_eq!(out, src);
+        assert!(imports.is_empty());
     }
 }

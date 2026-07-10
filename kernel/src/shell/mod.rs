@@ -5641,6 +5641,10 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                 if ui_agent_key(b'\r') {
                     continue;
                 }
+                // Focused browser form input: Enter submits its form, not chat.
+                if media_key(b'\r') {
+                    continue;
+                }
                 // Enter accepts the highlighted suggestion when the menu is open.
                 if !sug_items.is_empty() {
                     let accepted = suggest_accept(
@@ -5689,13 +5693,17 @@ fn read_line(buf: &mut String) -> ReadOutcome {
             // terminals and all keyboard drivers): params, then a final byte.
             Some(0x1b) => {
                 if next_seq_byte() != Some(b'[') {
-                    // Bare Esc: dismiss suggestion menu first; UI agent clears
-                    // selection; else editor Normal.
+                    // Bare Esc: dismiss suggestion menu first; a focused browser
+                    // input unfocuses; UI agent clears selection; else editor
+                    // Normal.
                     if !sug_items.is_empty() {
                         sug_items.clear();
                         sug_sel = 0;
                         #[cfg(not(test))]
                         crate::framebuffer::suggest_clear();
+                        continue;
+                    }
+                    if media_key(0x1b) {
                         continue;
                     }
                     if ui_agent_focused() {
@@ -5886,6 +5894,10 @@ fn read_line(buf: &mut String) -> ReadOutcome {
             }
             // Tab: accept suggestion, else complete a /command prefix.
             Some(b'\t') => {
+                // A focused browser input consumes Tab (next form field).
+                if media_key(0x09) {
+                    continue;
+                }
                 if !sug_items.is_empty() {
                     let _ = suggest_accept(
                         buf,
@@ -5942,6 +5954,11 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                 }
             }
             Some(0x7f) | Some(0x08) => {
+                // A focused browser form input erases ITS text, not the chat
+                // line (media_key gates on the action pane holding focus).
+                if media_key(0x08) {
+                    continue;
+                }
                 // A held Backspace streak erases 2/4/8 chars per repeat.
                 let n = accel.steps(0x08, crate::arch::now_ms()).min(cur);
                 if n > 0 {
@@ -6241,6 +6258,15 @@ fn close_active_tab() {
         }
         crate::framebuffer::RightMode::Editor => {
             crate::editor::force_close();
+            crate::framebuffer::close_action();
+        }
+        crate::framebuffer::RightMode::Surface(id)
+            if id == BROWSER_SURFACE || id == crate::framebuffer::BROWSER_SURFACE =>
+        {
+            // Tear down the browser session + its persistent page JS context.
+            crate::browser::js_just::page_close();
+            BROWSER.with(|s| *s = None);
+            BROWSER_LAYOUT.with(|s| *s = None);
             crate::framebuffer::close_action();
         }
         _ => crate::framebuffer::close_action(),
@@ -6598,9 +6624,41 @@ pub(crate) fn run_download_tool(args_json: &str) -> alloc::string::String {
 
 // Mirror `framebuffer::BROWSER_SURFACE` (module is cfg(not(test))).
 const BROWSER_SURFACE: u32 = u32::MAX - 2;
-const BROWSER_VW: i32 = 640;
-const BROWSER_VH: i32 = 400;
 const BROWSER_BODY_MAX: usize = 1 << 20; // 1 MiB
+
+/// Browser layout/paint viewport width — the action pane's actual pixel width
+/// so the page is rendered 1:1 into the pane (no upscaling → crisp text).
+/// Falls back to a sane default before the pane exists.
+fn browser_vw() -> i32 {
+    #[cfg(not(test))]
+    {
+        crate::framebuffer::action_dims_px()
+            .map(|(w, _)| w as i32)
+            .unwrap_or(960)
+            .clamp(320, 4096)
+    }
+    #[cfg(test)]
+    {
+        640
+    }
+}
+
+/// Browser viewport height — the action pane's pixel height minus the reserved
+/// HUD strip, so layout/scroll/paint all agree and present at 1:1.
+fn browser_vh() -> i32 {
+    #[cfg(not(test))]
+    {
+        let hud = crate::framebuffer::browser_hud_height() as i32;
+        crate::framebuffer::action_dims_px()
+            .map(|(_, h)| (h as i32 - hud).max(200))
+            .unwrap_or(700)
+            .clamp(200, 4096)
+    }
+    #[cfg(test)]
+    {
+        400
+    }
+}
 
 struct BrowserSession {
     url: alloc::string::String,
@@ -6614,6 +6672,17 @@ struct BrowserSession {
     /// Live control values (index → value), survives re-layout for typing.
     control_values: alloc::collections::BTreeMap<usize, alloc::string::String>,
     control_checked: alloc::collections::BTreeMap<usize, bool>,
+    /// Fetched external `<script src>` bodies (absolute URL → source).
+    script_bodies: alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>,
+    /// Fetched external stylesheet bodies (absolute URL → CSS, with one level
+    /// of `@import` prepended) — repaints re-merge these without refetching.
+    css_bodies: alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>,
+    /// Decoded CSS background images (absolute URL → (pixels, w, h)).
+    bg_pixels:
+        alloc::collections::BTreeMap<alloc::string::String, (alloc::vec::Vec<u32>, usize, usize)>,
+    /// The script list actually booted into the page JS context (debugging).
+    #[allow(dead_code)]
+    resolved_scripts: alloc::vec::Vec<alloc::string::String>,
 }
 
 static BROWSER: crate::mm::Locked<Option<BrowserSession>> = crate::mm::Locked::new(None);
@@ -6641,9 +6710,9 @@ pub(crate) fn run_browser_tool(name: &str, args_json: &str) -> alloc::string::St
                 .or_else(|| {
                     json_str(args_json, "page")
                         .and_then(|s| s.parse::<i32>().ok())
-                        .map(|p| p * (BROWSER_VH - 40))
+                        .map(|p| p * (browser_vh() - 40))
                 })
-                .unwrap_or(BROWSER_VH / 2);
+                .unwrap_or(browser_vh() / 2);
             browser_scroll(dy)
         }
         "browser_click" => {
@@ -6694,6 +6763,221 @@ fn browser_progress_opt() -> Option<u8> {
 
 fn browser_load(url: &str, push_hist: bool) -> alloc::string::String {
     browser_load_method(url, "GET", &[], push_hist)
+}
+
+/// Mirror page-JS console lines to the serial console (capped at 50).
+fn browser_mirror_js_lines(lines: &[alloc::string::String]) {
+    for (i, line) in lines.iter().enumerate() {
+        if i >= 50 {
+            crate::serial_println!("browser> js: … {} more lines", lines.len() - 50);
+            break;
+        }
+        crate::serial_println!("browser> js: {}", line);
+    }
+}
+
+/// Drain the live page's console log (console.log + uncaught errors) and
+/// mirror it to serial — the web-devtools view of what page scripts did.
+fn browser_mirror_js_log() {
+    let lines = crate::browser::js_just::page_with_dom(|d| core::mem::take(&mut d.log))
+        .unwrap_or_default();
+    browser_mirror_js_lines(&lines);
+}
+
+/// After delivering events into page JS: follow a handler-requested
+/// navigation (`location.href = …`). Returns `Some(result)` when navigated.
+fn browser_dispatch_nav(base: &str) -> Option<alloc::string::String> {
+    let nav = crate::browser::js_just::page_with_dom(|d| d.navigate.take()).flatten()?;
+    let abs = crate::browser::url::resolve(base, &nav).unwrap_or(nav);
+    if !crate::browser::url::is_http_url(&abs) {
+        return None;
+    }
+    Some(browser_load(&abs, true))
+}
+
+/// Fetch + register `@font-face` web fonts named in `css` (URLs resolved
+/// against `base_url`). WOFF is unwrapped to SFNT ([`crate::font_woff`]);
+/// WOFF2 (brotli) is logged as unsupported. Failures log, never abort a load.
+fn browser_load_fonts(css: &str, base_url: &str) {
+    let faces = crate::browser::css::scan_font_faces(css);
+    if faces.is_empty() {
+        return;
+    }
+    let mut urls: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let mut wanted: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> =
+        alloc::vec::Vec::new();
+    for f in &faces {
+        if f.family.is_empty() || crate::font_ttf::family_loaded(&f.family) {
+            continue;
+        }
+        if wanted.iter().any(|(fam, _)| fam == &f.family) {
+            continue; // first src per family wins
+        }
+        let abs = crate::browser::url::resolve(base_url, &f.url).unwrap_or_else(|| f.url.clone());
+        if !(abs.starts_with("http://") || abs.starts_with("https://")) {
+            continue;
+        }
+        if !urls.contains(&abs) {
+            urls.push(abs.clone());
+        }
+        wanted.push((f.family.clone(), abs));
+    }
+    if urls.is_empty() {
+        return;
+    }
+    let fetched = crate::browser::worker::fetch_subresources_cooperative(
+        &urls,
+        crate::browser::loader::Destination::Font,
+        1 << 20,
+    );
+    for (family, abs) in wanted {
+        let Some(bytes) = fetched.get(&abs) else {
+            crate::serial_println!("browser> font: '{}' not fetched ({})", family, abs);
+            continue;
+        };
+        if crate::font_woff::is_woff2(bytes) {
+            crate::serial_println!("browser> font: woff2 unsupported (brotli) {}", abs);
+            continue;
+        }
+        let res = if crate::font_woff::is_woff(bytes) {
+            crate::font_woff::woff_to_sfnt(bytes)
+                .and_then(|sfnt| crate::font_ttf::load_family(&family, &sfnt))
+        } else {
+            crate::font_ttf::load_family(&family, bytes)
+        };
+        match res {
+            Ok(()) => {
+                crate::serial_println!("browser> font: loaded '{}' ({} B)", family, bytes.len())
+            }
+            Err(e) => crate::serial_println!("browser> font: '{}' failed: {}", family, e),
+        }
+    }
+}
+
+/// Fetch + decode CSS `background-image: url(…)` targets named in `css`,
+/// keyed by absolute URL (resolved against `base_url`). Decodes through the
+/// same in-kernel decoders as `fill_image_slot`, kept unscaled (the painter
+/// tiles/scales per `background-size`).
+fn browser_fetch_bg_images(
+    css: &str,
+    base_url: &str,
+) -> alloc::collections::BTreeMap<alloc::string::String, (alloc::vec::Vec<u32>, usize, usize)> {
+    let mut out = alloc::collections::BTreeMap::new();
+    let mut urls: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    for u in crate::browser::css::scan_css_urls(css) {
+        let abs = crate::browser::url::resolve(base_url, &u).unwrap_or(u);
+        if (abs.starts_with("http://") || abs.starts_with("https://")) && !urls.contains(&abs) {
+            urls.push(abs);
+        }
+    }
+    if urls.is_empty() {
+        return out;
+    }
+    let (loaded, assets) = crate::browser::worker::fetch_images_cooperative(&urls);
+    for u in &urls {
+        let body: Option<alloc::vec::Vec<u8>> = loaded
+            .iter()
+            .find(|r| &r.url == u)
+            .map(|r| r.body.clone())
+            .or_else(|| assets.get(u).map(|(_, b)| b.to_vec()));
+        let Some(bytes) = body else { continue };
+        let Ok(img) = crate::image::decode(&bytes) else {
+            crate::serial_println!("browser> bg: decode failed {}", u);
+            continue;
+        };
+        if img.w.saturating_mul(img.h) > 4_000_000 {
+            crate::serial_println!("browser> bg: too large ({}x{}) {}", img.w, img.h, u);
+            continue;
+        }
+        out.insert(u.clone(), (img.pixels, img.w, img.h));
+    }
+    out
+}
+
+/// Build the page-boot script list from parsed `<script>` tags, in document
+/// order: inline bodies verbatim, external `src` bodies from `script_bodies`
+/// (a missing fetch logs `skipped … (not fetched)` and is dropped), module
+/// scripts stripped of import/export syntax with their import graph inlined
+/// (depth ≤ 3, cycle-safe, post-order so imports run before importers), and
+/// `async` tags appended at the very end. Returns `(list, skipped_count)`.
+fn browser_script_list(
+    doc: &crate::browser::html::Document,
+    base_url: &str,
+    script_bodies: &alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>,
+) -> (alloc::vec::Vec<alloc::string::String>, usize) {
+    let mut main: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let mut tail: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let mut skipped = 0usize;
+    let mut visited: alloc::collections::BTreeSet<alloc::string::String> =
+        alloc::collections::BTreeSet::new();
+    for t in &doc.script_tags {
+        let (body, base) = if let Some(src) = &t.src {
+            let abs =
+                crate::browser::url::resolve(base_url, src).unwrap_or_else(|| src.clone());
+            match script_bodies.get(&abs) {
+                Some(b) => (b.clone(), abs),
+                None => {
+                    crate::serial_println!("browser> js: skipped {} (not fetched)", abs);
+                    skipped += 1;
+                    continue;
+                }
+            }
+        } else {
+            if t.body.trim().is_empty() {
+                continue;
+            }
+            (t.body.clone(), alloc::string::String::from(base_url))
+        };
+        let out = if t.async_ { &mut tail } else { &mut main };
+        if t.module {
+            visited.insert(base.clone()); // self-import cycle guard
+            let (stripped, imports) = crate::browser::css::strip_module_syntax(&body);
+            browser_module_graph(stripped, imports, &base, 3, &mut visited, out);
+        } else {
+            out.push(body);
+        }
+    }
+    main.extend(tail);
+    (main, skipped)
+}
+
+/// Post-order DFS over an ES-module import graph: fetch each import
+/// (depth-limited, cycle-safe), strip its module syntax, recurse into its
+/// own imports, then push — so imports execute before their importer.
+fn browser_module_graph(
+    stripped: alloc::string::String,
+    imports: alloc::vec::Vec<alloc::string::String>,
+    base_url: &str,
+    depth: u32,
+    visited: &mut alloc::collections::BTreeSet<alloc::string::String>,
+    out: &mut alloc::vec::Vec<alloc::string::String>,
+) {
+    for spec in imports {
+        let abs = crate::browser::url::resolve(base_url, &spec).unwrap_or(spec);
+        if !(abs.starts_with("http://") || abs.starts_with("https://"))
+            || visited.contains(&abs)
+        {
+            continue;
+        }
+        visited.insert(abs.clone());
+        if depth == 0 {
+            crate::serial_println!("browser> js: skipped {} (import depth cap)", abs);
+            continue;
+        }
+        let fetched = crate::browser::worker::fetch_subresources_cooperative(
+            core::slice::from_ref(&abs),
+            crate::browser::loader::Destination::Script,
+            512 * 1024,
+        );
+        let Some(bytes) = fetched.get(&abs) else {
+            crate::serial_println!("browser> js: skipped {} (not fetched)", abs);
+            continue;
+        };
+        let src = alloc::string::String::from_utf8_lossy(bytes).into_owned();
+        let (sub_stripped, sub_imports) = crate::browser::css::strip_module_syntax(&src);
+        browser_module_graph(sub_stripped, sub_imports, &abs, depth - 1, visited, out);
+    }
+    out.push(stripped);
 }
 
 fn browser_load_method(
@@ -6776,12 +7060,131 @@ fn browser_load_method(
     }
     let body_html = alloc::string::String::from_utf8_lossy(&body_bytes).into_owned();
 
-    let (doc, mut lay, effects) =
-        crate::browser::layout_html_ex(&body_html, BROWSER_VW, BROWSER_VH, &final_url);
+    // --- Subresource discovery: parse once to enumerate external scripts /
+    // stylesheets / fonts / background images (the layout parse comes later,
+    // via the session path).
+    let pre = crate::browser::html::parse(&body_html);
+    let is_http = |u: &str| u.starts_with("http://") || u.starts_with("https://");
+
+    // (a) External scripts.
+    let mut script_urls: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    for t in &pre.script_tags {
+        if let Some(src) = &t.src {
+            let abs =
+                crate::browser::url::resolve(&final_url, src).unwrap_or_else(|| src.clone());
+            if is_http(&abs) && !script_urls.contains(&abs) {
+                script_urls.push(abs);
+            }
+        }
+    }
+    let mut script_bodies: alloc::collections::BTreeMap<
+        alloc::string::String,
+        alloc::string::String,
+    > = alloc::collections::BTreeMap::new();
+    for (u, body) in crate::browser::worker::fetch_subresources_cooperative(
+        &script_urls,
+        crate::browser::loader::Destination::Script,
+        512 * 1024,
+    ) {
+        script_bodies.insert(u, alloc::string::String::from_utf8_lossy(&body).into_owned());
+    }
+    browser_set_progress(32);
+
+    // (b) External stylesheets (document order), plus one level of @import —
+    // imports resolve against the *sheet's* URL and prepend to its body.
+    let mut css_urls: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    for s in &pre.styles_ordered {
+        if let crate::browser::html::StyleSrc::External(href) = s {
+            let abs =
+                crate::browser::url::resolve(&final_url, href).unwrap_or_else(|| href.clone());
+            if is_http(&abs) && !css_urls.contains(&abs) {
+                css_urls.push(abs);
+            }
+        }
+    }
+    let mut css_bodies: alloc::collections::BTreeMap<
+        alloc::string::String,
+        alloc::string::String,
+    > = alloc::collections::BTreeMap::new();
+    for (u, body) in crate::browser::worker::fetch_subresources_cooperative(
+        &css_urls,
+        crate::browser::loader::Destination::Style,
+        256 * 1024,
+    ) {
+        css_bodies.insert(u, alloc::string::String::from_utf8_lossy(&body).into_owned());
+    }
+    let mut import_wants: alloc::vec::Vec<(
+        alloc::string::String,
+        alloc::vec::Vec<alloc::string::String>,
+    )> = alloc::vec::Vec::new();
+    let mut import_urls: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    for (sheet_url, body) in &css_bodies {
+        let imps: alloc::vec::Vec<alloc::string::String> =
+            crate::browser::css::scan_imports(body)
+                .iter()
+                .filter_map(|i| crate::browser::url::resolve(sheet_url, i))
+                .filter(|u| is_http(u))
+                .collect();
+        for u in &imps {
+            if !import_urls.contains(u) && !css_bodies.contains_key(u) {
+                import_urls.push(u.clone());
+            }
+        }
+        if !imps.is_empty() {
+            import_wants.push((sheet_url.clone(), imps));
+        }
+    }
+    if !import_urls.is_empty() {
+        let fetched_imports = crate::browser::worker::fetch_subresources_cooperative(
+            &import_urls,
+            crate::browser::loader::Destination::Style,
+            256 * 1024,
+        );
+        for (sheet_url, imps) in import_wants {
+            let mut prefix = alloc::string::String::new();
+            for u in &imps {
+                if let Some(b) = fetched_imports.get(u) {
+                    prefix.push_str(&alloc::string::String::from_utf8_lossy(b));
+                    prefix.push('\n');
+                }
+            }
+            if !prefix.is_empty() {
+                if let Some(body) = css_bodies.get_mut(&sheet_url) {
+                    prefix.push_str(body);
+                    *body = prefix;
+                }
+            }
+        }
+    }
     browser_set_progress(40);
 
+    // (c) Web fonts + (d) CSS background images, from inline + external CSS.
+    let mut all_css = pre.stylesheets.clone();
+    for body in css_bodies.values() {
+        all_css.push('\n');
+        all_css.push_str(body);
+    }
+    browser_load_fonts(&all_css, &final_url);
+    let bg_pixels = browser_fetch_bg_images(&all_css, &final_url);
+    browser_set_progress(50);
+
+    // --- Boot the persistent page JS context (scripts run ONCE per
+    // navigation; repaints re-read the DOM instead of re-running them).
+    let (exec_list, _skipped) = browser_script_list(&pre, &final_url, &script_bodies);
+    let _parsed = crate::browser::js_just::page_boot(
+        &pre,
+        &final_url,
+        browser_vw(),
+        browser_vh(),
+        &exec_list,
+    );
+    browser_mirror_js_log();
+    browser_set_progress(55);
+
     // Script-requested navigation (location.href = …).
-    if let Some(nav) = effects.navigate.clone() {
+    if let Some(nav) =
+        crate::browser::js_just::page_with_dom(|d| d.navigate.take()).flatten()
+    {
         if crate::browser::url::is_http_url(&nav) && nav != final_url {
             browser_clear_progress();
             return browser_load(&nav, push_hist);
@@ -6793,6 +7196,16 @@ fn browser_load_method(
             }
         }
     }
+
+    // --- Layout via the session path: live page DOM + merged CSS + bg pixels.
+    let (doc, mut lay, js_lines) = {
+        let assets = crate::browser::SessionAssets {
+            css_external: &css_bodies,
+            bg_pixels: &bg_pixels,
+        };
+        crate::browser::layout_session(&body_html, browser_vw(), browser_vh(), &final_url, &assets)
+    };
+    browser_mirror_js_lines(&js_lines);
 
     // Subresource images via cooperative worker pool.
     let mut img_urls = alloc::vec::Vec::new();
@@ -6920,8 +7333,8 @@ fn browser_load_method(
     }
 
     let mut scroll0 = 0i32;
-    if let Some(sy) = effects.scroll_y {
-        scroll0 = sy.clamp(0, (lay.content_height - BROWSER_VH).max(0));
+    if let Some(sy) = crate::browser::js_just::page_with_dom(|d| d.scroll_to.take()).flatten() {
+        scroll0 = sy.clamp(0, (lay.content_height - browser_vh()).max(0));
     }
 
     let mut control_values = alloc::collections::BTreeMap::new();
@@ -6933,7 +7346,7 @@ fn browser_load_method(
 
     browser_set_progress(95);
     let (pixels, content_h) =
-        crate::browser::paint_layout_chrome(&lay, BROWSER_VH, scroll0, Some(100));
+        crate::browser::paint_layout_chrome(&lay, browser_vh(), scroll0, Some(100));
     let title = doc.title;
     BROWSER.with(|slot| {
         let mut hist = slot
@@ -6960,6 +7373,10 @@ fn browser_load_method(
             focused: None,
             control_values,
             control_checked,
+            script_bodies,
+            css_bodies,
+            bg_pixels,
+            resolved_scripts: exec_list,
         });
     });
     browser_clear_progress();
@@ -6978,8 +7395,8 @@ fn browser_load_method(
         if from_cache { "hit" } else { "miss" },
         lay.controls.len(),
         lay.frames.len(),
-        BROWSER_VW,
-        BROWSER_VH
+        browser_vw(),
+        browser_vh()
     )
 }
 
@@ -6991,21 +7408,40 @@ fn browser_layout_session() -> Option<(
     i32,
     Option<usize>,
 )> {
-    let (html, scroll, url, title, focused, values, checked) = BROWSER.with(|s| {
-        s.as_ref().map(|b| {
-            (
-                b.html.clone(),
-                b.scroll_y,
-                b.url.clone(),
-                b.title.clone(),
-                b.focused,
-                b.control_values.clone(),
-                b.control_checked.clone(),
-            )
-        })
-    })?;
-    let (_doc, mut lay, _fx) =
-        crate::browser::layout_html_ex(&html, BROWSER_VW, BROWSER_VH, &url);
+    let (html, scroll, url, title, focused, values, checked, css_bodies, bg_pixels) = BROWSER
+        .with(|s| {
+            s.as_ref().map(|b| {
+                (
+                    b.html.clone(),
+                    b.scroll_y,
+                    b.url.clone(),
+                    b.title.clone(),
+                    b.focused,
+                    b.control_values.clone(),
+                    b.control_checked.clone(),
+                    b.css_bodies.clone(),
+                    b.bg_pixels.clone(),
+                )
+            })
+        })?;
+    // Session path: re-layout from the LIVE page DOM (no script re-run) with
+    // the stored external CSS + background pixels.
+    let (doc, mut lay, js_lines) = {
+        let assets = crate::browser::SessionAssets {
+            css_external: &css_bodies,
+            bg_pixels: &bg_pixels,
+        };
+        crate::browser::layout_session(&html, browser_vw(), browser_vh(), &url, &assets)
+    };
+    // Handlers may log between repaints — mirror fresh lines to serial.
+    browser_mirror_js_lines(&js_lines);
+    // The live DOM may have retitled the page (document.title in a handler).
+    let title = if doc.title.is_empty() { title } else { doc.title.clone() };
+    BROWSER.with(|s| {
+        if let Some(b) = s.as_mut() {
+            b.title = title.clone();
+        }
+    });
     for c in &mut lay.controls {
         if let Some(v) = values.get(&c.index) {
             c.value = v.clone();
@@ -7018,6 +7454,39 @@ fn browser_layout_session() -> Option<(
     if let Some(last) = lay.controls.last() {
         lay.content_height = lay.content_height.max(last.y + last.h + 16);
     }
+    // Re-layout rebuilds image/iframe boxes WITHOUT pixels (subresources are
+    // only fetched in `browser_load`) — carry the previously decoded pixels
+    // over by `src`, otherwise every click/scroll blanked the page's images.
+    BROWSER_LAYOUT.with(|prev| {
+        if let Some(p) = prev.as_ref() {
+            for im in lay.images.iter_mut() {
+                if im.pixels.is_none() {
+                    if let Some(pim) = p
+                        .images
+                        .iter()
+                        .find(|pi| pi.pixels.is_some() && pi.src == im.src)
+                    {
+                        im.pixels = pim.pixels.clone();
+                        im.w = pim.w;
+                        im.h = pim.h;
+                        im.src_w = pim.src_w;
+                        im.src_h = pim.src_h;
+                    }
+                }
+            }
+            for fr in lay.frames.iter_mut() {
+                if fr.pixels.is_none() {
+                    if let Some(pfr) = p.frames.iter().find(|pf| {
+                        pf.pixels.is_some() && pf.src == fr.src && pf.srcdoc == fr.srcdoc
+                    }) {
+                        fr.pixels = pfr.pixels.clone();
+                        fr.src_w = pfr.src_w;
+                        fr.src_h = pfr.src_h;
+                    }
+                }
+            }
+        }
+    });
     Some((lay, url, title, scroll, focused))
 }
 
@@ -7031,8 +7500,8 @@ fn browser_present(pixels: &[u32], title: &str, url: &str, scroll_y: i32, conten
         let hud = crate::framebuffer::browser_hud_height().max(1);
         crate::framebuffer::present_surface_reserve(
             BROWSER_SURFACE,
-            BROWSER_VW as usize,
-            BROWSER_VH as usize,
+            browser_vw() as usize,
+            browser_vh() as usize,
             pixels,
             hud,
         );
@@ -7042,7 +7511,7 @@ fn browser_present(pixels: &[u32], title: &str, url: &str, scroll_y: i32, conten
             url,
             scroll_y,
             content_h,
-            BROWSER_VH,
+            browser_vh(),
             focused,
         );
         crate::serial_println!(
@@ -7050,7 +7519,7 @@ fn browser_present(pixels: &[u32], title: &str, url: &str, scroll_y: i32, conten
             title,
             url,
             scroll_y,
-            (content_h - BROWSER_VH).max(0),
+            (content_h - browser_vh()).max(0),
             pixels.iter().filter(|&&p| p != 0 && p != 0xf5f0e8).count()
         );
     }
@@ -7066,7 +7535,7 @@ fn browser_repaint() -> alloc::string::String {
     };
     let progress = browser_progress_opt();
     let (pixels, content_h) =
-        crate::browser::paint_layout_chrome(&lay, BROWSER_VH, scroll, progress);
+        crate::browser::paint_layout_chrome(&lay, browser_vh(), scroll, progress);
     BROWSER.with(|s| {
         if let Some(b) = s.as_mut() {
             b.content_height = content_h;
@@ -7080,7 +7549,7 @@ fn browser_repaint() -> alloc::string::String {
 fn browser_scroll(dy: i32) -> alloc::string::String {
     let max = BROWSER.with(|s| {
         s.as_ref()
-            .map(|b| (b.content_height - BROWSER_VH).max(0))
+            .map(|b| (b.content_height - browser_vh()).max(0))
             .unwrap_or(0)
     });
     BROWSER.with(|s| {
@@ -7106,23 +7575,66 @@ fn browser_click(x: i32, y: i32) -> alloc::string::String {
     let content_y = y + scroll;
     match crate::browser::layout::hit_test_ex(&lay, x, content_y) {
         crate::browser::layout::Hit::Link(href) => {
+            // A covering interactive element gets the click FIRST — its
+            // handler may preventDefault() and suppress the navigation.
+            if crate::browser::js_just::page_active() {
+                let covering = lay
+                    .elem_boxes
+                    .iter()
+                    .rev()
+                    .find(|e| {
+                        x >= e.x && x < e.x + e.w && content_y >= e.y && content_y < e.y + e.h
+                    })
+                    .map(|e| e.elem_idx);
+                if let Some(ei) = covering {
+                    let prevented = crate::browser::js_just::page_dispatch(&[
+                        crate::browser::js_just::PageEvent {
+                            target: ei,
+                            type_: alloc::string::String::from("click"),
+                            x,
+                            y: content_y,
+                        },
+                    ]);
+                    crate::serial_println!("browser> dispatched click → elem {}", ei);
+                    if let Some(out) = browser_dispatch_nav(&base) {
+                        return out;
+                    }
+                    if prevented.first().copied().unwrap_or(false) {
+                        browser_repaint();
+                        return alloc::string::String::from("ok:click handled (default prevented)");
+                    }
+                }
+            }
             let url = crate::browser::url::resolve(&base, &href).unwrap_or(href);
             browser_load(&url, true)
+        }
+        crate::browser::layout::Hit::Elem(ei) => {
+            // JS-interactive element: deliver the click into page JS, then
+            // follow any handler navigation, else repaint the mutated DOM.
+            let _prevented = crate::browser::js_just::page_dispatch(&[
+                crate::browser::js_just::PageEvent {
+                    target: ei,
+                    type_: alloc::string::String::from("click"),
+                    x,
+                    y: content_y,
+                },
+            ]);
+            crate::serial_println!("browser> dispatched click → elem {}", ei);
+            if let Some(out) = browser_dispatch_nav(&base) {
+                return out;
+            }
+            browser_repaint();
+            alloc::format!("ok:clicked elem {}", ei)
         }
         crate::browser::layout::Hit::Control(idx) => {
             if let Some(c) = lay.controls.get(idx).cloned() {
                 use crate::browser::layout::ControlKind;
+                // Native focus / check handling first.
                 match c.kind {
-                    ControlKind::Submit => browser_submit_control(&lay, &c),
-                    ControlKind::Button => {
-                        BROWSER.with(|s| {
-                            if let Some(b) = s.as_mut() {
-                                b.focused = Some(idx);
-                            }
-                        });
-                        browser_repaint();
-                        alloc::string::String::from("ok:button")
+                    ControlKind::Hidden => {
+                        return alloc::string::String::from("ok:hidden");
                     }
+                    ControlKind::Submit => {}
                     ControlKind::Checkbox => {
                         BROWSER.with(|s| {
                             if let Some(b) = s.as_mut() {
@@ -7131,15 +7643,51 @@ fn browser_click(x: i32, y: i32) -> alloc::string::String {
                                 b.control_checked.insert(idx, !cur);
                             }
                         });
-                        browser_repaint();
-                        alloc::string::String::from("ok:checkbox toggled")
                     }
-                    ControlKind::Text | ControlKind::Password | ControlKind::TextArea => {
+                    _ => {
                         BROWSER.with(|s| {
                             if let Some(b) = s.as_mut() {
                                 b.focused = Some(idx);
                             }
                         });
+                    }
+                }
+                // Then deliver the click into page JS (bubbles to the form).
+                let mut prevented = false;
+                if crate::browser::js_just::page_active() {
+                    if let Some(ei) = c.elem_idx {
+                        prevented = crate::browser::js_just::page_dispatch(&[
+                            crate::browser::js_just::PageEvent {
+                                target: ei,
+                                type_: alloc::string::String::from("click"),
+                                x,
+                                y: content_y,
+                            },
+                        ])
+                        .first()
+                        .copied()
+                        .unwrap_or(false);
+                        crate::serial_println!("browser> dispatched click → elem {}", ei);
+                        if let Some(out) = browser_dispatch_nav(&base) {
+                            return out;
+                        }
+                    }
+                }
+                match c.kind {
+                    ControlKind::Submit if !prevented => browser_submit_control(&lay, &c),
+                    ControlKind::Submit => {
+                        browser_repaint();
+                        alloc::string::String::from("ok:submit (default prevented)")
+                    }
+                    ControlKind::Button => {
+                        browser_repaint();
+                        alloc::string::String::from("ok:button")
+                    }
+                    ControlKind::Checkbox => {
+                        browser_repaint();
+                        alloc::string::String::from("ok:checkbox toggled")
+                    }
+                    ControlKind::Text | ControlKind::Password | ControlKind::TextArea => {
                         browser_repaint();
                         alloc::format!("ok:focus input {}", c.name)
                     }
@@ -7294,8 +7842,8 @@ fn browser_status() -> alloc::string::String {
             b.title,
             b.scroll_y,
             b.content_height,
-            BROWSER_VW,
-            BROWSER_VH
+            browser_vw(),
+            browser_vh()
         ),
         None => alloc::string::String::from("ok:empty"),
     })
@@ -7335,6 +7883,54 @@ pub fn browser_loaded() -> bool {
     BROWSER.with(|s| s.is_some())
 }
 
+/// Key-path variant of [`browser_dispatch_nav`]: base = current session URL.
+#[cfg(not(test))]
+fn browser_dispatch_nav_key() -> Option<alloc::string::String> {
+    let base = BROWSER.with(|s| s.as_ref().map(|b| b.url.clone()))?;
+    browser_dispatch_nav(&base)
+}
+
+/// Deliver `types` events to the page-JS element behind form control `idx`
+/// (when the persistent page is live and the control carries a stamped
+/// element index). Syncs the control's live value into the JS DOM first so
+/// `input`/`change` handlers read what the user typed. Returns true when any
+/// handler called `preventDefault()`.
+#[cfg(not(test))]
+fn browser_control_event(idx: usize, types: &[&str]) -> bool {
+    if !crate::browser::js_just::page_active() {
+        return false;
+    }
+    let ei = BROWSER_LAYOUT.with(|s| {
+        s.as_ref().and_then(|l| {
+            l.controls
+                .iter()
+                .find(|c| c.index == idx)
+                .and_then(|c| c.elem_idx)
+        })
+    });
+    let Some(ei) = ei else { return false };
+    let val = BROWSER
+        .with(|s| s.as_ref().and_then(|b| b.control_values.get(&idx).cloned()))
+        .unwrap_or_default();
+    crate::browser::js_just::page_with_dom(|d| {
+        if let Some(e) = d.elements.get_mut(ei) {
+            e.value = val.clone();
+        }
+    });
+    let evs: alloc::vec::Vec<crate::browser::js_just::PageEvent> = types
+        .iter()
+        .map(|t| crate::browser::js_just::PageEvent {
+            target: ei,
+            type_: alloc::string::String::from(*t),
+            x: 0,
+            y: 0,
+        })
+        .collect();
+    crate::browser::js_just::page_dispatch(&evs)
+        .iter()
+        .any(|&p| p)
+}
+
 /// Handle a key while the browser surface is focused. Returns true if consumed.
 #[cfg(not(test))]
 fn browser_key(byte: u8) -> bool {
@@ -7356,16 +7952,28 @@ fn browser_key(byte: u8) -> bool {
                 return true;
             }
             0x09 => {
-                // Tab → next text control.
+                // Tab → next text control. Guard: `cycle()` + `skip_while` only
+                // terminates if the focused index is IN the text-entry list.
                 if let Some((lay, ..)) = browser_layout_session() {
-                    let next = lay
+                    let in_list = lay
                         .controls
                         .iter()
-                        .filter(|c| c.kind.is_text_entry())
-                        .map(|c| c.index)
-                        .cycle()
-                        .skip_while(|&i| i != idx)
-                        .nth(1);
+                        .any(|c| c.index == idx && c.kind.is_text_entry());
+                    let next = if !in_list {
+                        lay.controls
+                            .iter()
+                            .filter(|c| c.kind.is_text_entry())
+                            .map(|c| c.index)
+                            .next()
+                    } else {
+                        lay.controls
+                            .iter()
+                            .filter(|c| c.kind.is_text_entry())
+                            .map(|c| c.index)
+                            .cycle()
+                            .skip_while(|&i| i != idx)
+                            .nth(1)
+                    };
                     BROWSER.with(|s| {
                         if let Some(b) = s.as_mut() {
                             b.focused = next.or(Some(idx));
@@ -7376,7 +7984,17 @@ fn browser_key(byte: u8) -> bool {
                 return true;
             }
             0x0d | 0x0a => {
-                // Enter → submit owning form if any.
+                // Enter → change + submit into page JS, then submit the
+                // owning form (unless a handler preventDefault()ed).
+                let prevented = browser_control_event(idx, &["change", "submit"]);
+                if let Some(out) = browser_dispatch_nav_key() {
+                    let _ = out;
+                    return true;
+                }
+                if prevented {
+                    let _ = browser_repaint();
+                    return true;
+                }
                 if let Some((lay, ..)) = browser_layout_session() {
                     if let Some(c) = lay.controls.get(idx) {
                         if let Some(sub) = lay
@@ -7401,6 +8019,7 @@ fn browser_key(byte: u8) -> bool {
                         }
                     }
                 });
+                let _ = browser_control_event(idx, &["input"]);
                 let _ = browser_repaint();
                 return true;
             }
@@ -7413,6 +8032,7 @@ fn browser_key(byte: u8) -> bool {
                         }
                     }
                 });
+                let _ = browser_control_event(idx, &["input"]);
                 let _ = browser_repaint();
                 return true;
             }
@@ -7421,15 +8041,15 @@ fn browser_key(byte: u8) -> bool {
     }
     match byte {
         b'j' | b'J' => {
-            let _ = browser_scroll(BROWSER_VH / 3);
+            let _ = browser_scroll(browser_vh() / 3);
             true
         }
         b'k' | b'K' => {
-            let _ = browser_scroll(-(BROWSER_VH / 3));
+            let _ = browser_scroll(-(browser_vh() / 3));
             true
         }
         b' ' if focused.is_none() => {
-            let _ = browser_scroll(BROWSER_VH - 40);
+            let _ = browser_scroll(browser_vh() - 40);
             true
         }
         b'b' | b'B' if focused.is_none() => {

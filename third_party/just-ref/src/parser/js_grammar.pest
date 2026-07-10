@@ -8,17 +8,20 @@ WHITESPACE = _{ " " | "\t" }
 COMMENT = _{ comment }
 s = _{ line_terminator* }
 comment = { multi_line_comment | single_line_comment }
-multi_line_comment = @{ "/*" ~ multi_line_comment_chars? ~ "*/" }
-multi_line_comment_chars = { multi_line_not_asterisk_char ~ multi_line_comment_chars? | "*" ~ post_asterisk_comment_chars? }
-post_asterisk_comment_chars = { multi_line_not_forward_slash_or_asterisk_char ~ multi_line_comment_chars? | "*" ~ post_asterisk_comment_chars? }
-multi_line_not_asterisk_char = { !"*" ~ source_character }
-multi_line_not_forward_slash_or_asterisk_char = { !("/" | "*") ~ source_character }
+// ChittiOS: the spec's recursive multi_line_comment_chars grammar is a CFG,
+// not a PEG — the `"*" ~ post_asterisk_comment_chars?` branch greedily eats
+// the final `*` (the `?` matches empty and PEG never backtracks a committed
+// option), so the closing "*/" could never match and NO /* */ comment parsed.
+// Use the standard PEG comment idiom instead.
+multi_line_comment = @{ "/*" ~ (!"*/" ~ source_character)* ~ "*/" }
 single_line_comment = @{ "//" ~ single_line_comment_chars? }
 single_line_comment_chars = { single_line_comment_char ~ single_line_comment_chars? }
 single_line_comment_char = { !line_terminator ~ source_character }
 whitespace = _{ WHITESPACE }
-line_terminator = _{ "\n" | "\r" }
-line_terminator_sequence = { "\n" | "\r\n" | "\r" }
+// ChittiOS: LineTerminator per spec includes U+2028 LINE SEPARATOR and
+// U+2029 PARAGRAPH SEPARATOR (they terminate regex literals + line comments).
+line_terminator = _{ "\n" | "\r" | "\u{2028}" | "\u{2029}" }
+line_terminator_sequence = { "\n" | "\r\n" | "\r" | "\u{2028}" | "\u{2029}" }
 //Used by parseInt(string)
 string_numeric_literal = _{ str_white_space? ~ str_numeric_literal ~ str_white_space? | str_white_space? }
 str_white_space = _{ str_white_space_char+ }
@@ -295,16 +298,11 @@ super_property__yield = {
 }
 meta_property = { new_target }
 new_target = { "new" ~s~ "." ~s~ "target" }
-new_expression = { member_expression | "new" ~s~ new_expression }
-new_expression__yield = { member_expression__yield | "new" ~ new_expression__yield }
-call_expression = {
-    (member_expression ~s~ arguments | super_call)
-    ~ (s~ arguments | "[" ~s~ expression__in ~s~ "]" | "." ~s~ identifier_name | template_literal)*
-}
-call_expression__yield = {
-    (member_expression__yield ~s~ arguments__yield | super_call__yield)
-    ~ (s~ arguments__yield | "[" ~s~ expression__in_yield ~s~ "]" | "." ~s~ identifier_name | template_literal__yield)*
-}
+// ChittiOS: `new_op` is a bare-`new` prefix consumed by
+// left_hand_side_expression. The `!(whitespace* ~ ".")` guard keeps it off
+// `new.target` (meta_property, matched inside member_expression) and
+// `!identifier_part` off identifiers like `newx`.
+new_op = @{ "new" ~ !identifier_part ~ !(WHITESPACE* ~ ".") }
 super_call = { "super" ~s~ arguments }
 super_call__yield = { "super" ~s~ arguments__yield }
 arguments = {
@@ -325,8 +323,22 @@ argument_list__yield = {
 }
 rest_assignment_expression__in = { assignment_expression__in }
 rest_assignment_expression__in_yield = { assignment_expression__in_yield }
-left_hand_side_expression = { call_expression | new_expression }
-left_hand_side_expression__yield = { call_expression__yield | new_expression__yield }
+// ChittiOS: rewritten from `call_expression | new_expression` — that ordered
+// choice re-parsed the whole member chain (once for call, again for new, and
+// again on the conditional-expression retry), giving exponential backtracking
+// on nested expressions (minified jQuery never finished parsing). Now the
+// member base is parsed exactly once, followed by zero-or-more call/index/
+// member/template suffixes; bare-`new` prefixes are counted by `new_op` and
+// re-associated with their argument lists in the AST builder (each `new`
+// consumes the next `arguments` suffix, innermost first — spec semantics).
+left_hand_side_expression = {
+    (new_op ~s)* ~ (super_call | member_expression)
+    ~ (s~ arguments | "[" ~s~ expression__in ~s~ "]" | "." ~s~ identifier_name | template_literal)*
+}
+left_hand_side_expression__yield = {
+    (new_op ~s)* ~ (super_call__yield | member_expression__yield)
+    ~ (s~ arguments__yield | "[" ~s~ expression__in_yield ~s~ "]" | "." ~s~ identifier_name | template_literal__yield)*
+}
 postfix_expression = {
     left_hand_side_expression ~ (!line_terminator ~ postfix_operator)?
 }
@@ -459,27 +471,30 @@ conditional_expression__yield = {
 conditional_expression__in_yield = {
     logical_or_expression__in_yield ~ (s~ "?" ~s~ assignment_expression__in_yield ~s~ ":" ~s~ assignment_expression__in_yield)?
 }
+// ChittiOS: rewritten from `arrow | LHS ~ op ~ rhs | conditional` — the
+// failed LHS-assignment attempt re-parsed every non-assignment expression a
+// second time via the conditional fallback, compounding exponentially with
+// nesting (the other half of the minified-jQuery parse blowup). Now the
+// conditional is parsed once and an optional trailing assignment operator
+// promotes it to an assignment; the AST builder validates the left side is a
+// valid assignment target (identifier / member / destructuring literal).
 assignment_expression = {
     arrow_function
-    | left_hand_side_expression ~s~ ("=" | assignment_operator) ~s~ assignment_expression
-    | conditional_expression
+    | conditional_expression ~ (s~ ("=" | assignment_operator) ~s~ assignment_expression)?
 }
 assignment_expression__in = {
     arrow_function__in
-    | left_hand_side_expression ~s~ ("=" | assignment_operator) ~s~ assignment_expression__in
-    | conditional_expression__in
+    | conditional_expression__in ~ (s~ ("=" | assignment_operator) ~s~ assignment_expression__in)?
 }
 assignment_expression__yield = {
     arrow_function__yield
-    | left_hand_side_expression__yield ~s~ ("=" | assignment_operator) ~s~ assignment_expression__yield
     | yield_expression
-    | conditional_expression__yield
+    | conditional_expression__yield ~ (s~ ("=" | assignment_operator) ~s~ assignment_expression__yield)?
 }
 assignment_expression__in_yield = {
     arrow_function__in_yield
-    | left_hand_side_expression__yield ~s~ ("=" | assignment_operator) ~s~ assignment_expression__in_yield
     | yield_expression__in
-    | conditional_expression__in_yield
+    | conditional_expression__in_yield ~ (s~ ("=" | assignment_operator) ~s~ assignment_expression__in_yield)?
 }
 assignment_operator = {
     "*=" | "/=" | "%=" | "+=" | "-=" | "<<=" | ">>=" | ">>>=" | "&=" | "^=" | "|="

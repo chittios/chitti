@@ -113,7 +113,8 @@ use core::cell::RefCell;
 use just_engine::runner::ds::error::JErrorType;
 use just_engine::runner::ds::value::JsNumberType;
 use just_engine::runner::eval::expression::{
-    call_value, get_own_prop_value, make_array, make_object, set_own_prop, value_is_callable,
+    call_value, get_own_prop_value, make_array, make_object, set_own_prop, to_boolean,
+    value_is_callable,
 };
 use just_engine::runner::plugin::resolver::PluginResolver;
 use just_engine::runner::plugin::types::NativeProps;
@@ -505,8 +506,31 @@ impl NativeProps for DomProps {
 // DomResolver: globals + methods (PluginResolver).
 // ============================================================================
 
+/// A page-JS event listener: target (element index, or the `DOC_NODE`/
+/// `WIN_NODE` sentinels), event type, callback function value, capture flag.
+pub(crate) struct PageListener {
+    target: i64,
+    type_: String,
+    cb: JsValue,
+    capture: bool,
+}
+
+/// Listener registry shared between the resolver (which registers) and the
+/// page dispatcher. Lives inside [`JsPage`] for the page lifetime.
+type ListenerReg = Rc<RefCell<Vec<PageListener>>>;
+
+/// True when `a` and `b` are the same function object (Rc identity).
+fn same_fn(a: &JsValue, b: &JsValue) -> bool {
+    match (a, b) {
+        (JsValue::Object(x), JsValue::Object(y)) => Rc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
 struct DomResolver {
     dom: Rc<RefCell<JsDom>>,
+    /// addEventListener registrations (shared with the JsPage dispatcher).
+    listeners: ListenerReg,
     document: JsValue,
     window: JsValue,
     location: JsValue,
@@ -526,6 +550,12 @@ fn global_wrapper(name: &str, node: i64) -> JsValue {
 
 impl DomResolver {
     fn new(dom: Rc<RefCell<JsDom>>) -> Self {
+        Self::with_listeners(dom, Rc::new(RefCell::new(Vec::new())))
+    }
+
+    /// Build a resolver sharing an externally-owned listener registry (the
+    /// persistent-page path, so the dispatcher can invoke stored callbacks).
+    fn with_listeners(dom: Rc<RefCell<JsDom>>, listeners: ListenerReg) -> Self {
         let document = global_wrapper("document", DOC_NODE);
         let window = global_wrapper("window", WIN_NODE);
         let location = global_wrapper("location", LOC_NODE);
@@ -549,7 +579,41 @@ impl DomResolver {
         set_own_prop(&window, "top", parent.clone(), true);
         set_own_prop(&window, "localStorage", storage.clone(), true);
         set_own_prop(&window, "sessionStorage", session.clone(), true);
-        DomResolver { dom, document, window, location, storage, session, parent, web_assembly, fetch_fn }
+        DomResolver { dom, listeners, document, window, location, storage, session, parent, web_assembly, fetch_fn }
+    }
+
+    /// Register an event listener: `target` is an element index or the
+    /// `DOC_NODE`/`WIN_NODE` sentinel; `args` = (type, callback, capture?).
+    fn register_listener(&self, target: i64, args: &[JsValue]) {
+        let type_ = as_str(args.get(0).unwrap_or(&JsValue::Undefined));
+        let cb = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+        if type_.is_empty() || !value_is_callable(&cb) {
+            return;
+        }
+        // Third arg: bool `useCapture` or an options object `{capture: true}`.
+        let capture = match args.get(2) {
+            Some(JsValue::Boolean(b)) => *b,
+            Some(o @ JsValue::Object(_)) => get_own_prop_value(o, "capture")
+                .map(|v| to_boolean(&v))
+                .unwrap_or(false),
+            _ => false,
+        };
+        self.listeners.borrow_mut().push(PageListener { target, type_, cb, capture });
+    }
+
+    /// Remove listeners matching (target, type[, same callback object]).
+    fn unregister_listener(&self, target: i64, args: &[JsValue]) {
+        let type_ = as_str(args.get(0).unwrap_or(&JsValue::Undefined));
+        let cb = args.get(1).cloned();
+        self.listeners.borrow_mut().retain(|l| {
+            if l.target != target || l.type_ != type_ {
+                return true;
+            }
+            match &cb {
+                Some(f) if value_is_callable(f) => !same_fn(&l.cb, f),
+                _ => false, // no callback given: drop all of this type
+            }
+        });
     }
 
     /// Parse a `fetch(url, opts)` call: (method, absolute url, body).
@@ -599,6 +663,7 @@ impl PluginResolver for DomResolver {
                 "document" | "window" | "location" | "localStorage" | "sessionStorage"
                     | "navigator" | "parent" | "self" | "top" | "fetch" | "WebAssembly"
                     | "postMessage" | "Element" | "ClassList" | "Style" | "Canvas2d" | "Response"
+                    | "Event"
             )
     }
 
@@ -840,14 +905,39 @@ impl PluginResolver for DomResolver {
                 }
                 JsValue::Undefined
             }
-            ("Element", "addEventListener") | ("Element", "removeEventListener") => {
+            ("Element", "addEventListener") => {
                 if let Some(i) = self.node_of(&this) {
+                    // Store the CALLBACK for real dispatch (JsPage), and keep
+                    // the name-key marker used by the interactive-element set.
+                    self.register_listener(i as i64, &args);
                     let ev = as_str(&a0);
                     let mut dom = self.dom.borrow_mut();
                     if let Some(e) = dom.elements.get_mut(i) {
                         e.listeners.entry(ev).or_default();
                     }
                 }
+                JsValue::Undefined
+            }
+            ("Element", "removeEventListener") => {
+                if let Some(i) = self.node_of(&this) {
+                    self.unregister_listener(i as i64, &args);
+                }
+                JsValue::Undefined
+            }
+            ("Event", "preventDefault") => {
+                set_own_prop(&this, "__default_prevented__", JsValue::Boolean(true), false);
+                JsValue::Undefined
+            }
+            ("Event", "stopPropagation") | ("Event", "stopImmediatePropagation") => {
+                set_own_prop(&this, "__stopped__", JsValue::Boolean(true), false);
+                JsValue::Undefined
+            }
+            ("document", "addEventListener") => {
+                self.register_listener(DOC_NODE, &args);
+                JsValue::Undefined
+            }
+            ("document", "removeEventListener") => {
+                self.unregister_listener(DOC_NODE, &args);
                 JsValue::Undefined
             }
             ("Element", "cloneNode") => {
@@ -944,8 +1034,15 @@ impl PluginResolver for DomResolver {
                 }
                 JsValue::Undefined
             }
-            ("window", "addEventListener") | ("window", "removeEventListener")
-            | ("window", "scrollTo") | ("window", "requestAnimationFrame") => JsValue::Undefined,
+            ("window", "addEventListener") => {
+                self.register_listener(WIN_NODE, &args);
+                JsValue::Undefined
+            }
+            ("window", "removeEventListener") => {
+                self.unregister_listener(WIN_NODE, &args);
+                JsValue::Undefined
+            }
+            ("window", "scrollTo") | ("window", "requestAnimationFrame") => JsValue::Undefined,
             ("window", "alert") => {
                 self.dom.borrow_mut().log.push(as_str(&a0));
                 JsValue::Undefined
@@ -1069,10 +1166,14 @@ pub fn run_scripts_via_just(dom: &mut JsDom, scripts: &[String]) -> bool {
     ctx.native_props = Some(Rc::new(DomProps { dom: shared.clone() }));
     ctx.add_resolver(alloc::boxed::Box::new(DomResolver::new(shared.clone())));
 
+    let mut errors: alloc::vec::Vec<String> = alloc::vec::Vec::new();
     for ast in &asts {
         just_engine::runner::eval::statement::hoist_var_declarations(&ast.body, &mut ctx);
         for stmt in &ast.body {
-            if execute_statement(stmt, &mut ctx).is_err() {
+            if let Err(e) = execute_statement(stmt, &mut ctx) {
+                // Surface the runtime error (it lands in dom.log → serial) —
+                // silently swallowing it made page-script failures invisible.
+                errors.push(alloc::format!("Uncaught {}", e.to_string()));
                 break;
             }
         }
@@ -1086,9 +1187,339 @@ pub fn run_scripts_via_just(dom: &mut JsDom, scripts: &[String]) -> bool {
     for line in drain_console_log() {
         dom.log.push(line);
     }
+    dom.log.append(&mut errors);
     true
 }
 
+// ============================================================================
+// Persistent page context — JsPage
+//
+// The one-shot `run_scripts_via_just` re-executes every page script on every
+// re-layout and cannot keep closures alive (they hold `*const` pointers into
+// the run-local ASTs). `JsPage` keeps the whole JS world — the parsed ASTs,
+// the `EvalContext` (every closure + captured environment), the listener
+// registry, and the shared `JsDom` — alive for the page lifetime, so:
+//   • scripts run ONCE per navigation (repaints just re-read the DOM),
+//   • `addEventListener` callbacks can be invoked on real UI events,
+//   • DOM state (counters, toggles, created elements) persists across clicks.
+// ============================================================================
+
+/// The persistent page JS context. **Field order is load-bearing**: Rust drops
+/// fields in declaration order, and `ctx` (which transitively owns every
+/// closure) must drop before `asts`/`attr_asts` — `SimpleFunctionObject`s hold
+/// `*const` pointers into the AST heap those vectors own.
+///
+/// SAFETY (pointer validity): the pointers target heap allocations *inside*
+/// `ProgramData` (statement `Vec` buffers and `Box`ed bodies), which do not
+/// move when the owning `ProgramData` values are moved (e.g. by a `Vec` push
+/// realloc). The ASTs are never mutated after parse.
+pub struct JsPage {
+    ctx: EvalContext,
+    listeners: ListenerReg,
+    shared: Rc<RefCell<JsDom>>,
+    asts: Vec<just_engine::parser::ast::ProgramData>,
+    /// Mini-ASTs parsed at dispatch time for inline `on*` attribute source —
+    /// kept for the page lifetime (handlers may create closures into them).
+    attr_asts: Vec<just_engine::parser::ast::ProgramData>,
+}
+
+/// The live page. SAFETY (`Sync`): `mm::Locked` is unconditionally `Sync`; the
+/// page is only ever created/dispatched/dropped from the shell task (the
+/// single-threaded UI loop), and `.with()` serializes access.
+static JS_PAGE: crate::mm::Locked<Option<JsPage>> = crate::mm::Locked::new(None);
+
+/// A UI event to deliver into page JS.
+pub struct PageEvent {
+    /// Element index in `JsDom.elements` (the click target).
+    pub target: usize,
+    /// Event type ("click", "input", "keydown", "change", "submit").
+    pub type_: String,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// Boot the persistent page context: build the DOM from `doc`, run `scripts`
+/// (per-script parse tolerance — a script that fails to parse logs `Uncaught
+/// SyntaxError` and is skipped, it cannot take the rest of the page down), and
+/// keep everything alive for later [`page_dispatch`] calls. Replaces any
+/// previous page. Returns the number of scripts that parsed.
+pub fn page_boot(
+    doc: &super::html::Document,
+    location_href: &str,
+    inner_w: i32,
+    inner_h: i32,
+    scripts: &[String],
+) -> usize {
+    page_close();
+    let mut dom = JsDom::from_document(doc);
+    if !location_href.is_empty() {
+        dom.location_href = location_href.to_string();
+    }
+    dom.inner_width = inner_w;
+    dom.inner_height = inner_h;
+
+    let _ = drain_console_log();
+    let shared = Rc::new(RefCell::new(dom));
+    let listeners: ListenerReg = Rc::new(RefCell::new(Vec::new()));
+
+    let mut ctx = EvalContext::new();
+    ctx.install_core_builtins(BuiltInRegistry::with_core());
+    ctx.native_props = Some(Rc::new(DomProps { dom: shared.clone() }));
+    ctx.add_resolver(alloc::boxed::Box::new(DomResolver::with_listeners(
+        shared.clone(),
+        listeners.clone(),
+    )));
+
+    let mut asts = Vec::with_capacity(scripts.len());
+    for src in scripts {
+        match JsParser::parse_to_ast_from_str(src) {
+            Ok(ast) => asts.push(ast),
+            Err(e) => {
+                let msg = alloc::format!("{:?}", e);
+                let msg: String = msg.chars().take(160).collect();
+                shared
+                    .borrow_mut()
+                    .log
+                    .push(alloc::format!("Uncaught SyntaxError: {}", msg));
+            }
+        }
+    }
+    let parsed = asts.len();
+
+    for ast in &asts {
+        just_engine::runner::eval::statement::hoist_var_declarations(&ast.body, &mut ctx);
+        for stmt in &ast.body {
+            if let Err(e) = execute_statement(stmt, &mut ctx) {
+                shared
+                    .borrow_mut()
+                    .log
+                    .push(alloc::format!("Uncaught {}", e.to_string()));
+                break;
+            }
+        }
+    }
+    for line in drain_console_log() {
+        shared.borrow_mut().log.push(line);
+    }
+
+    JS_PAGE.with(|slot| {
+        *slot = Some(JsPage { ctx, listeners, shared, asts, attr_asts: Vec::new() })
+    });
+    parsed
+}
+
+/// True when a persistent page context is live.
+pub fn page_active() -> bool {
+    JS_PAGE.with(|slot| slot.is_some())
+}
+
+/// Drop the page context (navigation / reload / tab close). Field order in
+/// [`JsPage`] guarantees closures die before the ASTs they point into.
+pub fn page_close() {
+    JS_PAGE.with(|slot| *slot = None);
+}
+
+/// Run `f` against the live page DOM (commit/layout/effects reads and writes).
+/// Returns `None` when no page is active.
+pub fn page_with_dom<R>(f: impl FnOnce(&mut JsDom) -> R) -> Option<R> {
+    JS_PAGE.with(|slot| slot.as_mut().map(|p| f(&mut *p.shared.borrow_mut())))
+}
+
+/// Element indices that should be hit-testable: everything with a registered
+/// listener or an inline `on*` attribute.
+pub fn page_interactive_elems() -> alloc::vec::Vec<usize> {
+    JS_PAGE.with(|slot| {
+        let Some(p) = slot.as_mut() else { return Vec::new() };
+        let mut out: Vec<usize> = p
+            .listeners
+            .borrow()
+            .iter()
+            .filter(|l| l.target >= 0)
+            .map(|l| l.target as usize)
+            .collect();
+        let dom = p.shared.borrow();
+        for (i, e) in dom.elements.iter().enumerate() {
+            if !e.listeners.is_empty() || e.attrs.keys().any(|k| k.starts_with("on")) {
+                out.push(i);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    })
+}
+
+/// Dispatch UI events into page JS: capture (window → document → ancestors)
+/// → target (inline `on*` attr first, then listeners) → bubble (ancestors →
+/// document → window). Returns one `default_prevented` flag per event.
+pub fn page_dispatch(events: &[PageEvent]) -> alloc::vec::Vec<bool> {
+    let _ = drain_console_log();
+    let out = JS_PAGE.with(|slot| {
+        let Some(page) = slot.as_mut() else {
+            return events.iter().map(|_| false).collect::<alloc::vec::Vec<bool>>();
+        };
+        let mut prevented = alloc::vec::Vec::with_capacity(events.len());
+        for ev in events {
+            prevented.push(dispatch_one(page, ev));
+        }
+        prevented
+    });
+    // Console output produced by handlers lands in the page log.
+    let lines = drain_console_log();
+    if !lines.is_empty() {
+        JS_PAGE.with(|slot| {
+            if let Some(p) = slot.as_mut() {
+                p.shared.borrow_mut().log.extend(lines);
+            }
+        });
+    }
+    out
+}
+
+fn dispatch_one(page: &mut JsPage, ev: &PageEvent) -> bool {
+    // Event object: preventDefault/stopPropagation route through the
+    // DomResolver's ("Event", …) method arms and set marker props.
+    let eobj = make_object(vec![]);
+    set_own_prop(&eobj, "__builtin_name__", s("Event"), false);
+    set_own_prop(&eobj, "type", s(&ev.type_), true);
+    set_own_prop(&eobj, "clientX", num(ev.x as i64), true);
+    set_own_prop(&eobj, "clientY", num(ev.y as i64), true);
+    let target_w = elem_wrapper(ev.target);
+    set_own_prop(&eobj, "target", target_w.clone(), true);
+    set_own_prop(&eobj, "currentTarget", target_w.clone(), true);
+
+    // Propagation path root→target: window, document, ancestors, target.
+    // Snapshot it (and everything else we need) BEFORE running JS — handler
+    // code re-enters the resolver, which borrows the same RefCell<JsDom>.
+    let mut chain: Vec<i64> = vec![WIN_NODE, DOC_NODE];
+    {
+        let dom = page.shared.borrow();
+        let mut anc: Vec<i64> = Vec::new();
+        let mut cur = dom.elements.get(ev.target).and_then(|e| e.parent);
+        while let Some(p) = cur {
+            anc.push(p as i64);
+            if anc.len() > 64 {
+                break; // cycle guard
+            }
+            cur = dom.elements.get(p).and_then(|e| e.parent);
+        }
+        anc.reverse();
+        chain.extend(anc);
+    }
+
+    let stopped = |eobj: &JsValue| {
+        get_own_prop_value(eobj, "__stopped__")
+            .map(|v| to_boolean(&v))
+            .unwrap_or(false)
+    };
+
+    // Capture phase: root → target's parent, capture listeners only.
+    for &t in &chain {
+        if stopped(&eobj) {
+            break;
+        }
+        invoke_listeners(page, t, &ev.type_, &eobj, true);
+    }
+
+    // Target phase: inline `on<type>` attribute source first, then listeners
+    // (both capture and bubble registrations fire at the target).
+    if !stopped(&eobj) {
+        run_on_attr(page, ev.target, &ev.type_, &eobj);
+        invoke_listeners(page, ev.target as i64, &ev.type_, &eobj, true);
+        invoke_listeners(page, ev.target as i64, &ev.type_, &eobj, false);
+    }
+
+    // Bubble phase: target's parent → root, bubble listeners only.
+    for &t in chain.iter().rev() {
+        if stopped(&eobj) {
+            break;
+        }
+        invoke_listeners(page, t, &ev.type_, &eobj, false);
+    }
+
+    get_own_prop_value(&eobj, "__default_prevented__")
+        .map(|v| to_boolean(&v))
+        .unwrap_or(false)
+}
+
+/// Invoke registered listeners for (target, type, phase). Snapshots matching
+/// callbacks first — a handler may add/remove listeners while running.
+fn invoke_listeners(page: &mut JsPage, target: i64, type_: &str, eobj: &JsValue, capture: bool) {
+    let cbs: Vec<JsValue> = page
+        .listeners
+        .borrow()
+        .iter()
+        .filter(|l| l.target == target && l.type_ == type_ && l.capture == capture)
+        .map(|l| l.cb.clone())
+        .collect();
+    if cbs.is_empty() {
+        return;
+    }
+    let this = if target >= 0 {
+        elem_wrapper(target as usize)
+    } else {
+        global_wrapper(if target == DOC_NODE { "document" } else { "window" }, target)
+    };
+    set_own_prop(eobj, "currentTarget", this.clone(), true);
+    for cb in cbs {
+        if get_own_prop_value(eobj, "__stopped__").map(|v| to_boolean(&v)).unwrap_or(false) {
+            break;
+        }
+        if let Err(e) = call_value(&cb, this.clone(), vec![eobj.clone()], &mut page.ctx) {
+            page.shared
+                .borrow_mut()
+                .log
+                .push(alloc::format!("Uncaught {}", e.to_string()));
+        }
+    }
+}
+
+/// Run an element's inline `on<type>` attribute source (e.g.
+/// `onclick="count++; render()"`) with `this` bound to the element and
+/// `event` in scope. The parsed mini-AST is kept alive on the page (handlers
+/// may create closures into it).
+fn run_on_attr(page: &mut JsPage, target: usize, type_: &str, eobj: &JsValue) {
+    let src = {
+        let dom = page.shared.borrow();
+        let key = alloc::format!("on{}", type_);
+        dom.elements.get(target).and_then(|e| e.attrs.get(&key).cloned())
+    };
+    let Some(src) = src else { return };
+    let ast = match JsParser::parse_to_ast_from_str(&src) {
+        Ok(a) => a,
+        Err(e) => {
+            let msg = alloc::format!("{:?}", e);
+            let msg: String = msg.chars().take(120).collect();
+            page.shared
+                .borrow_mut()
+                .log
+                .push(alloc::format!("Uncaught SyntaxError (on{}): {}", type_, msg));
+            return;
+        }
+    };
+    page.attr_asts.push(ast);
+    // Re-borrow the freshly pushed AST for execution (kept alive on the page).
+    let n_attr = page.attr_asts.len() - 1;
+
+    // `this` = the element; `event` bound in a fresh block scope.
+    let saved_this = page.ctx.global_this.clone();
+    page.ctx.global_this = Some(elem_wrapper(target));
+    page.ctx.push_block_scope();
+    let _ = page.ctx.create_binding("event", false);
+    let _ = page.ctx.initialize_binding("event", eobj.clone());
+    let body: Vec<_> = page.attr_asts[n_attr].body.iter().collect();
+    for stmt in body {
+        if let Err(e) = execute_statement(stmt, &mut page.ctx) {
+            page.shared
+                .borrow_mut()
+                .log
+                .push(alloc::format!("Uncaught {}", e.to_string()));
+            break;
+        }
+    }
+    page.ctx.pop_block_scope();
+    page.ctx.global_this = saved_this;
+}
 
 #[cfg(test)]
 mod tests {
@@ -1439,5 +1870,166 @@ mod tests {
         assert_eq!(dom.title, "New");
         assert!(dom.elements.iter().any(|e| e.tag == "div" && e.class.as_deref() == Some("box")));
         assert!(dom.log.iter().any(|l| l.contains("made") && l.contains("DIV")));
+    }
+
+    // ── Persistent page context (JsPage) ────────────────────────────────
+
+    fn idx_of(id: &str) -> usize {
+        page_with_dom(|dom| {
+            dom.elements
+                .iter()
+                .position(|e| e.id.as_deref() == Some(id))
+                .expect("element present")
+        })
+        .expect("page active")
+    }
+
+    fn click(target: usize) -> bool {
+        page_dispatch(&[PageEvent { target, type_: String::from("click"), x: 1, y: 1 }])
+            .first()
+            .copied()
+            .unwrap_or(false)
+    }
+
+    #[test_case]
+    fn page_onclick_attr_runs_at_target() {
+        use crate::browser::html;
+        let doc = html::parse(
+            r#"<html><body><button id="b" onclick="document.getElementById('out').innerText = 'clicked'">go</button><div id="out">x</div></body></html>"#,
+        );
+        page_boot(&doc, "https://t.example/", 640, 400, &[]);
+        let b = idx_of("b");
+        click(b);
+        let out = page_with_dom(|dom| {
+            dom.elements
+                .iter()
+                .find(|e| e.id.as_deref() == Some("out"))
+                .map(|e| e.text.clone())
+                .unwrap_or_default()
+        })
+        .unwrap();
+        assert_eq!(out, "clicked");
+        page_close();
+    }
+
+    #[test_case]
+    fn page_listener_state_persists_across_clicks() {
+        // The flagship persistent-context property: a closure's captured
+        // counter survives between dispatches (impossible with the old
+        // stateless re-run model).
+        use crate::browser::html;
+        let doc = html::parse(
+            r#"<html><body><button id="b">go</button><div id="out">0</div></body></html>"#,
+        );
+        page_boot(
+            &doc,
+            "https://t.example/",
+            640,
+            400,
+            &[String::from(
+                "var n = 0; document.getElementById('b').addEventListener('click', function (e) { n = n + 1; document.getElementById('out').innerText = 'n=' + n; });",
+            )],
+        );
+        let b = idx_of("b");
+        click(b);
+        click(b);
+        let out = page_with_dom(|dom| {
+            dom.elements
+                .iter()
+                .find(|e| e.id.as_deref() == Some("out"))
+                .map(|e| e.text.clone())
+                .unwrap_or_default()
+        })
+        .unwrap();
+        assert_eq!(out, "n=2");
+        page_close();
+    }
+
+    #[test_case]
+    fn page_prevent_default_and_bubble() {
+        use crate::browser::html;
+        let doc = html::parse(
+            r#"<html><body><div id="outer"><a id="lnk" href="/x">l</a></div></body></html>"#,
+        );
+        page_boot(
+            &doc,
+            "https://t.example/",
+            640,
+            400,
+            &[String::from(
+                "document.getElementById('lnk').addEventListener('click', function (e) { e.preventDefault(); });\
+                 document.getElementById('outer').addEventListener('click', function (e) { document.getElementById('outer').innerText = 'bubbled'; });",
+            )],
+        );
+        let lnk = idx_of("lnk");
+        // preventDefault reported to the host (suppresses native link follow)…
+        assert!(click(lnk), "default should be prevented");
+        // …and the event bubbled to the parent listener via the parent links.
+        let outer = page_with_dom(|dom| {
+            dom.elements
+                .iter()
+                .find(|e| e.id.as_deref() == Some("outer"))
+                .map(|e| e.text.clone())
+                .unwrap_or_default()
+        })
+        .unwrap();
+        assert_eq!(outer, "bubbled");
+        page_close();
+    }
+
+    #[test_case]
+    fn page_boot_tolerates_bad_script() {
+        // A script that fails to parse logs a SyntaxError and is skipped;
+        // the good script still runs (external minified libs must not take
+        // down inline page scripts).
+        use crate::browser::html;
+        let doc = html::parse(r#"<html><body><p id="m">x</p></body></html>"#);
+        let parsed = page_boot(
+            &doc,
+            "https://t.example/",
+            640,
+            400,
+            &[
+                String::from("this is not (((( javascript"),
+                String::from("document.getElementById('m').innerText = 'ran';"),
+            ],
+        );
+        assert_eq!(parsed, 1, "one of two scripts parses");
+        let (text, has_err) = page_with_dom(|dom| {
+            let t = dom
+                .elements
+                .iter()
+                .find(|e| e.id.as_deref() == Some("m"))
+                .map(|e| e.text.clone())
+                .unwrap_or_default();
+            let e = dom.log.iter().any(|l| l.contains("SyntaxError"));
+            (t, e)
+        })
+        .unwrap();
+        assert_eq!(text, "ran");
+        assert!(has_err, "the bad script's SyntaxError is logged");
+        page_close();
+    }
+
+    #[test_case]
+    fn stamp_matches_collect_elems_indices() {
+        use crate::browser::{html, js};
+        let mut doc = html::parse(
+            r#"<html><head><style>p{}</style></head><body><div id="a"><p id="b">t</p></div><span id="c">s</span></body></html>"#,
+        );
+        let dom = JsDom::from_document(&doc);
+        js::stamp_elem_indices(&mut doc.root);
+        // Every stamped node's ordinal must agree with collect_elems' index
+        // (checked via the id attribute both sides carry).
+        fn walk(n: &crate::browser::html::Node, dom: &JsDom) {
+            if let crate::browser::html::NodeKind::Element { id: Some(id), .. } = &n.kind {
+                let i = n.elem_idx.expect("stamped");
+                assert_eq!(dom.elements[i].id.as_deref(), Some(id.as_str()), "idx {i}");
+            }
+            for c in &n.children {
+                walk(c, dom);
+            }
+        }
+        walk(&doc.root, &dom);
     }
 }

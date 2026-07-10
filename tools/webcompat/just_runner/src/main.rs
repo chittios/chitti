@@ -4,7 +4,11 @@
 //! `third_party/just-ref` (applegrew/just). Kernel `browser::js` remains the
 //! no_std DOM-facing engine; this binary is for webcompat reporting.
 //!
-//! Usage: chitti-just-runner <test.js|dir>…
+//! Usage: chitti-just-runner [--raw] <test.js|dir>…
+//!
+//! `--raw` skips the test262 preamble/metadata handling and runs each file
+//! verbatim (for real-world library fixtures — parse-error positions then map
+//! directly to the file).
 
 use just_engine::parser::JsParser;
 use just_engine::runner::ds::value::JsValue;
@@ -17,9 +21,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    let raw = args.iter().any(|a| a == "--raw");
+    args.retain(|a| a != "--raw");
     if args.is_empty() {
-        eprintln!("usage: chitti-just-runner <test.js|dir>…");
+        eprintln!("usage: chitti-just-runner [--raw] <test.js|dir>…");
         return ExitCode::from(2);
     }
     let mut files = Vec::new();
@@ -51,7 +57,7 @@ fn main() -> ExitCode {
     let mut skip = 0usize;
     let mut panics = 0usize;
     for f in &files {
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_one(f)))
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_one(f, raw)))
             .unwrap_or_else(|_| {
                 let m = if verbose {
                     LAST_PANIC.with(|c| c.borrow().clone())
@@ -94,6 +100,25 @@ enum Outcome {
     Pass,
     Fail(String),
     Skip(String),
+}
+
+/// Run a file verbatim (no test262 preamble/metadata): parse-error positions
+/// map directly to the file; completing without a throw is a PASS.
+fn run_raw(src: &str) -> Outcome {
+    let ast = match JsParser::parse_to_ast_from_str(src) {
+        Ok(a) => a,
+        Err(e) => return Outcome::Skip(format!("parse: {e:?}")),
+    };
+    let mut ctx = EvalContext::new();
+    ctx.install_core_builtins(BuiltInRegistry::with_core());
+    just_engine::runner::eval::statement::hoist_var_declarations(&ast.body, &mut ctx);
+    for stmt in &ast.body {
+        if let Err(e) = execute_statement(stmt, &mut ctx) {
+            let msg: String = describe_error(&e).replace('\n', " ").chars().take(220).collect();
+            return Outcome::Fail(format!("runtime threw: {msg}"));
+        }
+    }
+    Outcome::Pass
 }
 
 fn collect_js(p: &Path, out: &mut Vec<PathBuf>) {
@@ -291,11 +316,14 @@ fn describe_error(e: &just_engine::runner::ds::error::JErrorType) -> String {
     }
 }
 
-fn run_one(path: &Path) -> Outcome {
+fn run_one(path: &Path, raw: bool) -> Outcome {
     let src = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => return Outcome::Fail(format!("read: {e}")),
     };
+    if raw {
+        return run_raw(&src);
+    }
     let meta = parse_meta(&src);
     // Module tests + async tests needing the $DONE harness aren't supported.
     if meta.module {

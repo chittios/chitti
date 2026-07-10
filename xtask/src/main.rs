@@ -471,8 +471,12 @@ fn parse_wxh(s: &str) -> Option<(u32, u32)> {
 }
 
 /// Best-effort host main-display resolution on macOS via `system_profiler`.
-/// Retina reports are physical pixels, so halve them to a logical size that
-/// makes a window roughly filling the screen; leave headroom for chrome.
+/// Returns **physical pixels** — the same thing VirtualBox's GOP hands the
+/// stub (native panel mode). The QEMU window runs `zoom-to-fit=on`, so a
+/// full-resolution guest FB scales down cleanly when windowed and is 1:1 in
+/// fullscreen — identical rendering across VBox / QEMU / laptop / monitor
+/// (halving Retina + subtracting chrome made QEMU pick a different, smaller
+/// mode than VBox on the same display, so fonts/layout looked different).
 fn detect_host_res() -> Option<(u32, u32)> {
     if !cfg!(target_os = "macos") {
         return None; // Linux hosts: use the default (or CHITTI_FBRES)
@@ -484,12 +488,8 @@ fn detect_host_res() -> Option<(u32, u32)> {
         // e.g. "3456 x 2234 Retina" or "2560 x 1440"
         let parts: Vec<&str> = rest.split_whitespace().collect();
         if parts.len() >= 3 && parts[1] == "x" {
-            if let (Ok(mut w), Ok(mut h)) = (parts[0].parse::<u32>(), parts[2].parse::<u32>()) {
-                if rest.contains("Retina") {
-                    w /= 2;
-                    h /= 2;
-                }
-                return Some((w.max(1024), h.saturating_sub(80).max(720)));
+            if let (Ok(w), Ok(h)) = (parts[0].parse::<u32>(), parts[2].parse::<u32>()) {
+                return Some((w.clamp(1024, 3840), h.clamp(720, 2160)));
             }
         }
     }
@@ -830,6 +830,11 @@ fn cmd_run_aarch64_uefi(model: Model, disk: Option<PathBuf>, disk_only: bool, no
     }
     qemu.args(["-device", "ramfb", "-device", "virtio-keyboard-device", "-device", "virtio-tablet-device"]);
     qemu.args(display_args());
+    // Same host-derived framebuffer resolution as the `-kernel` path, so the
+    // UEFI ramfb fallback matches VBox GOP / QEMU direct (was 1920x1080 fixed).
+    for a in ramfb_res_fw_cfg() {
+        qemu.arg(a);
+    }
     qemu.args(["-serial", "mon:stdio"]);
     // ESP first, data disk LAST: QEMU assigns later virtio-mmio devices to
     // LOWER slots, and the kernel's probe_disk takes the first (lowest) match —

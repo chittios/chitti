@@ -497,11 +497,9 @@ fn test_template_string3() {
                                                                     unary_expression(25, 31, [
                                                                         postfix_expression(25, 31, [
                                                                             left_hand_side_expression(25, 31, [
-                                                                                new_expression(25, 31, [
-                                                                                    member_expression(25, 31, [
-                                                                                        primary_expression(25, 31, [
-                                                                                            identifier_reference(25, 31)
-                                                                                        ])
+                                                                                member_expression(25, 31, [
+                                                                                    primary_expression(25, 31, [
+                                                                                        identifier_reference(25, 31)
                                                                                     ])
                                                                                 ])
                                                                             ])
@@ -539,36 +537,32 @@ fn test_template_string3() {
                                                                     unary_expression(43, 51, [
                                                                         postfix_expression(43, 51, [
                                                                             left_hand_side_expression(43, 51, [
-                                                                                new_expression(43, 51, [
-                                                                                    member_expression(43, 51, [
-                                                                                        primary_expression(43, 48, [
-                                                                                            identifier_reference(43, 48)
-                                                                                        ]),
-                                                                                        expression__in(49, 50, [
-                                                                                            assignment_expression__in(49, 50, [
-                                                                                                conditional_expression__in(49, 50, [
-                                                                                                    logical_or_expression__in(49, 50, [
-                                                                                                        logical_and_expression__in(49, 50, [
-                                                                                                            bitwise_or_expression__in(49, 50, [
-                                                                                                                bitwise_xor_expression__in(49, 50, [
-                                                                                                                    bitwise_and_expression__in(49, 50, [
-                                                                                                                        equality_expression__in(49, 50, [
-                                                                                                                            relational_expression__in(49, 50, [
-                                                                                                                                shift_expression(49, 50, [
-                                                                                                                                    additive_expression(49, 50, [
-                                                                                                                                        multiplicative_expression(49, 50, [
-                                                                                                                                            unary_expression(49, 50, [
-                                                                                                                                                postfix_expression(49, 50, [
-                                                                                                                                                    left_hand_side_expression(49, 50, [
-                                                                                                                                                        new_expression(49, 50, [
-                                                                                                                                                            member_expression(49, 50, [
-                                                                                                                                                                primary_expression(49, 50, [
-                                                                                                                                                                    literal(49, 50, [
-                                                                                                                                                                        numeric_literal(49, 50, [
-                                                                                                                                                                            decimal_literal(49, 50, [
-                                                                                                                                                                                decimal_integer_literal(49, 50)
-                                                                                                                                                                            ])
-                                                                                                                                                                        ])
+                                                                                member_expression(43, 51, [
+                                                                                    primary_expression(43, 48, [
+                                                                                        identifier_reference(43, 48)
+                                                                                    ]),
+                                                                                    expression__in(49, 50, [
+                                                                                        assignment_expression__in(49, 50, [
+                                                                                            conditional_expression__in(49, 50, [
+                                                                                                logical_or_expression__in(49, 50, [
+                                                                                                    logical_and_expression__in(49, 50, [
+                                                                                                        bitwise_or_expression__in(49, 50, [
+                                                                                                            bitwise_xor_expression__in(49, 50, [
+                                                                                                                bitwise_and_expression__in(49, 50, [
+                                                                                                                    equality_expression__in(49, 50, [
+                                                                                                                        relational_expression__in(49, 50, [
+                                                                                                                            shift_expression(49, 50, [
+                                                                                                                                additive_expression(49, 50, [
+                                                                                                                                    multiplicative_expression(49, 50, [
+                                                                                                                                        unary_expression(49, 50, [
+                                                                                                                                            postfix_expression(49, 50, [
+                                                                                                                                                left_hand_side_expression(49, 50, [
+                                                                                                                                                    member_expression(49, 50, [
+                                                                                                                                                        primary_expression(49, 50, [
+                                                                                                                                                            literal(49, 50, [
+                                                                                                                                                                numeric_literal(49, 50, [
+                                                                                                                                                                    decimal_literal(49, 50, [
+                                                                                                                                                                        decimal_integer_literal(49, 50)
                                                                                                                                                                     ])
                                                                                                                                                                 ])
                                                                                                                                                             ])
@@ -642,14 +636,12 @@ fn test_template_string4() {
                                                                     unary_expression(25, 29, [
                                                                         postfix_expression(25, 29, [
                                                                             left_hand_side_expression(25, 29, [
-                                                                                call_expression(25, 29, [
-                                                                                    member_expression(25, 27, [
-                                                                                        primary_expression(25, 27, [
-                                                                                            identifier_reference(25, 27)
-                                                                                        ])
-                                                                                    ]),
-                                                                                    arguments(27, 29)
-                                                                                ])
+                                                                                member_expression(25, 27, [
+                                                                                    primary_expression(25, 27, [
+                                                                                        identifier_reference(25, 27)
+                                                                                    ])
+                                                                                ]),
+                                                                                arguments(27, 29)
                                                                             ])
                                                                         ])
                                                                     ])
@@ -721,14 +713,12 @@ fn test_array1() {
                                                                 unary_expression(1, 2, [
                                                                     postfix_expression(1, 2, [
                                                                         left_hand_side_expression(1, 2, [
-                                                                            new_expression(1, 2, [
-                                                                                member_expression(1, 2, [
-                                                                                    primary_expression(1, 2, [
-                                                                                        literal(1, 2, [
-                                                                                            numeric_literal(1, 2, [
-                                                                                                decimal_literal(1, 2, [
-                                                                                                    decimal_integer_literal(1, 2)
-                                                                                                ])
+                                                                            member_expression(1, 2, [
+                                                                                primary_expression(1, 2, [
+                                                                                    literal(1, 2, [
+                                                                                        numeric_literal(1, 2, [
+                                                                                            decimal_literal(1, 2, [
+                                                                                                decimal_integer_literal(1, 2)
                                                                                             ])
                                                                                         ])
                                                                                     ])
@@ -764,14 +754,12 @@ fn test_array1() {
                                                                 unary_expression(4, 6, [
                                                                     postfix_expression(4, 6, [
                                                                         left_hand_side_expression(4, 6, [
-                                                                            new_expression(4, 6, [
-                                                                                member_expression(4, 6, [
-                                                                                    primary_expression(4, 6, [
-                                                                                        literal(4, 6, [
-                                                                                            numeric_literal(4, 6, [
-                                                                                                decimal_literal(4, 6, [
-                                                                                                    decimal_integer_literal(4, 6)
-                                                                                                ])
+                                                                            member_expression(4, 6, [
+                                                                                primary_expression(4, 6, [
+                                                                                    literal(4, 6, [
+                                                                                        numeric_literal(4, 6, [
+                                                                                            decimal_literal(4, 6, [
+                                                                                                decimal_integer_literal(4, 6)
                                                                                             ])
                                                                                         ])
                                                                                     ])
@@ -807,14 +795,12 @@ fn test_array1() {
                                                                 unary_expression(7, 8, [
                                                                     postfix_expression(7, 8, [
                                                                         left_hand_side_expression(7, 8, [
-                                                                            new_expression(7, 8, [
-                                                                                member_expression(7, 8, [
-                                                                                    primary_expression(7, 8, [
-                                                                                        literal(7, 8, [
-                                                                                            numeric_literal(7, 8, [
-                                                                                                decimal_literal(7, 8, [
-                                                                                                    decimal_integer_literal(7, 8)
-                                                                                                ])
+                                                                            member_expression(7, 8, [
+                                                                                primary_expression(7, 8, [
+                                                                                    literal(7, 8, [
+                                                                                        numeric_literal(7, 8, [
+                                                                                            decimal_literal(7, 8, [
+                                                                                                decimal_integer_literal(7, 8)
                                                                                             ])
                                                                                         ])
                                                                                     ])
@@ -897,11 +883,9 @@ fn test_var1() {
                                                                             unary_expression(12, 14, [
                                                                                 postfix_expression(12, 14, [
                                                                                     left_hand_side_expression(12, 14, [
-                                                                                        new_expression(12, 14, [
-                                                                                            member_expression(12, 14, [
-                                                                                                primary_expression(12, 14, [
-                                                                                                    array_literal(12, 14)
-                                                                                                ])
+                                                                                        member_expression(12, 14, [
+                                                                                            primary_expression(12, 14, [
+                                                                                                array_literal(12, 14)
                                                                                             ])
                                                                                         ])
                                                                                     ])
@@ -939,11 +923,9 @@ fn test_var1() {
                                                                             unary_expression(25, 27, [
                                                                                 postfix_expression(25, 27, [
                                                                                     left_hand_side_expression(25, 27, [
-                                                                                        new_expression(25, 27, [
-                                                                                            member_expression(25, 27, [
-                                                                                                primary_expression(25, 27, [
-                                                                                                    array_literal(25, 27)
-                                                                                                ])
+                                                                                        member_expression(25, 27, [
+                                                                                            primary_expression(25, 27, [
+                                                                                                array_literal(25, 27)
                                                                                             ])
                                                                                         ])
                                                                                     ])
@@ -1006,13 +988,11 @@ fn test_expression_statement1() {
                                                                     unary_expression(0, 9, [
                                                                         postfix_expression(0, 9, [
                                                                             left_hand_side_expression(0, 9, [
-                                                                                new_expression(0, 9, [
-                                                                                    member_expression(0, 9, [
-                                                                                        primary_expression(0, 4, [
-                                                                                            identifier_reference(0, 4)
-                                                                                        ]),
-                                                                                        identifier_name(5, 9)
-                                                                                    ])
+                                                                                member_expression(0, 9, [
+                                                                                    primary_expression(0, 4, [
+                                                                                        identifier_reference(0, 4)
+                                                                                    ]),
+                                                                                    identifier_name(5, 9)
                                                                                 ])
                                                                             ])
                                                                         ])
@@ -1060,16 +1040,14 @@ fn test_expression_statement2() {
                                                                     unary_expression(0, 20, [
                                                                         postfix_expression(0, 20, [
                                                                             left_hand_side_expression(0, 20, [
-                                                                                call_expression(0, 20, [
-                                                                                    member_expression(0, 16, [
-                                                                                        primary_expression(0, 11, [
-                                                                                            identifier_reference(0, 11)
-                                                                                        ]),
-                                                                                        identifier_name(12, 16)
+                                                                                member_expression(0, 16, [
+                                                                                    primary_expression(0, 11, [
+                                                                                        identifier_reference(0, 11)
                                                                                     ]),
-                                                                                    arguments(16, 18),
-                                                                                    arguments(18, 20)
-                                                                                ])
+                                                                                    identifier_name(12, 16)
+                                                                                ]),
+                                                                                arguments(16, 18),
+                                                                                arguments(18, 20)
                                                                             ])
                                                                         ])
                                                                     ])
@@ -1161,4 +1139,89 @@ fn test_perf1() {
             assert!(false, "There was an error {}", e);
         }
     }
+}
+
+// --- ChittiOS parser-hardening regression tests (tools/webcompat/PARSER-HARDENING.md) ---
+
+/// Fix 1: `/* */` comments must parse everywhere. The spec's CFG for
+/// MultiLineCommentChars was transcribed into PEG verbatim, where the
+/// `"*" ~ post_asterisk_comment_chars?` branch greedily ate the final `*`
+/// so the closing `*/` never matched — no block comment ever parsed.
+#[test]
+fn test_multi_line_comment_leading_trailing_and_mid() {
+    for src in [
+        "/* hello */ var x = 1;",
+        "/*! jQuery-style banner | with/slashes | and (c) marks */\nvar x = 1;",
+        "var x = 1; /* tail */",
+        "var x = /* mid */ 1;",
+        "/* multi\n line \n comment */ var x = 1;",
+        "/* stars ** inside * and at end **/ var x = 1;",
+    ] {
+        assert!(
+            JsParser::parse_to_ast_from_str(src).is_ok(),
+            "should parse: {}",
+            src
+        );
+    }
+}
+
+/// Fix 1 guard: an unterminated block comment must still be an error.
+#[test]
+fn test_multi_line_comment_unterminated_is_error() {
+    assert!(JsParser::parse_to_ast_from_str("var x = 1; /* never closed").is_err());
+}
+
+/// Fix 2: ES2025 regexp-modifiers early errors — invalid/duplicate/overlapping
+/// modifier flags in `(?ims-ims:…)` are parse-time SyntaxErrors.
+#[test]
+fn test_regexp_modifiers_early_errors() {
+    for src in [
+        "/(?i-i:a)/;",  // flag in both lists
+        "/(?ii:a)/;",   // duplicate in add list
+        "/(?-ii:a)/;",  // duplicate in remove list
+        "/(?-Q:a)/;",   // invalid flag
+        "/(?-1:a)/;",   // invalid flag (digit)
+        "/(?-:a)/;",    // dash form, both lists empty
+        "/(?-s :a)/;",  // invalid flag (space)
+        "/(?g-:a)/;",   // g is a regex flag but not a valid modifier
+    ] {
+        assert!(
+            JsParser::parse_to_ast_from_str(src).is_err(),
+            "should reject: {}",
+            src
+        );
+    }
+}
+
+/// Fix 2 guard: valid modifier groups and ordinary `(?…` groups still parse.
+#[test]
+fn test_regexp_modifiers_valid_forms() {
+    for src in [
+        "/(?i:a)/;",
+        "/(?ims:a)/;",
+        "/(?i-m:a)/;",
+        "/(?-i:a)/;",
+        "/(?i-:a)/;",
+        "/(?:a)/;",      // non-capturing
+        "/(?=a)/;",      // lookahead
+        "/(?!a)/;",      // negative lookahead
+        "/(?<name>a)/;", // named group
+        "/(?<=a)b/;",    // lookbehind
+        "/[(?x]/;",      // '(?x' inside a class is plain text
+    ] {
+        assert!(
+            JsParser::parse_to_ast_from_str(src).is_ok(),
+            "should parse: {}",
+            src
+        );
+    }
+}
+
+/// Fix 3: U+2028/U+2029 are LineTerminators — they may not appear inside a
+/// regular-expression literal (test262 regexp-*-no-{line,paragraph}-separator).
+#[test]
+fn test_line_and_paragraph_separator_terminate_regex() {
+    assert!(JsParser::parse_to_ast_from_str("/\u{2028}/;").is_err());
+    assert!(JsParser::parse_to_ast_from_str("/\u{2029}/;").is_err());
+    assert!(JsParser::parse_to_ast_from_str("/a\u{2028}b/;").is_err());
 }

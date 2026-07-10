@@ -1906,19 +1906,43 @@ fn build_ast_from_assignment_expression(
     script: &Rc<String>,
 ) -> Result<(ExpressionType, Semantics), JsRuleError> {
     let meta = get_meta(&pair, script);
-    let mut inner_pair_iter = pair.into_inner();
+    let mut inner_pair_iter = pair.into_inner().peekable();
     let inner_pair = inner_pair_iter.next().unwrap();
     Ok(match inner_pair.as_rule() {
         Rule::arrow_function
         | Rule::arrow_function__in
         | Rule::arrow_function__yield
         | Rule::arrow_function__in_yield => build_ast_from_arrow_function(inner_pair, script)?,
-        Rule::left_hand_side_expression | Rule::left_hand_side_expression__yield => {
+        // ChittiOS: the grammar now parses `cond (op rhs)?` instead of
+        // re-parsing the LHS separately (exponential backtracking on minified
+        // code); when an operator follows, the conditional result must be a
+        // valid assignment target, validated structurally here.
+        Rule::conditional_expression
+        | Rule::conditional_expression__in
+        | Rule::conditional_expression__yield
+        | Rule::conditional_expression__in_yield
+            if inner_pair_iter.peek().is_some() =>
+        {
             let lhs_pair = inner_pair;
             let lhs_meta = get_meta(&lhs_pair, script);
-            let (lhs, mut s) = build_ast_from_left_hand_side_expression(lhs_pair, script)?;
+            let (lhs, mut s) = build_ast_from_conditional_expression(lhs_pair, script)?;
             let mut next_pair = inner_pair_iter.next().unwrap();
             let (left, operator) = if next_pair.as_rule() == Rule::assignment_operator {
+                // A compound assignment target must be a simple reference —
+                // an identifier or a member expression.
+                if !matches!(
+                    &lhs,
+                    ExpressionType::MemberExpression(_)
+                        | ExpressionType::ExpressionWhichCanBePattern(
+                            ExpressionPatternType::Identifier(_)
+                        )
+                ) {
+                    return Err(get_validation_error_with_meta(
+                        "L.H.S. needs to be a simple expression".to_string(),
+                        AstBuilderValidationErrorType::ReferenceError,
+                        lhs_meta,
+                    ));
+                }
                 if s.is_valid_simple_assignment_target.is_false() {
                     return Err(get_validation_error_with_meta(
                         "L.H.S. needs to be a simple expression".to_string(),
@@ -2206,50 +2230,141 @@ fn build_ast_from_arrow_function(
     }
 }
 
+/// ChittiOS: unified LHS builder for the restructured grammar
+/// `new_op* ~ (super_call | member_expression) ~ suffix*`. The member base is
+/// parsed once; each `arguments` suffix is consumed by a pending bare `new`
+/// (innermost first — spec `new MemberExpression Arguments` semantics) or
+/// becomes a call; leftover `new`s wrap the result with empty arguments.
 fn build_ast_from_left_hand_side_expression(
     pair: Pair<Rule>,
     script: &Rc<String>,
 ) -> Result<(ExpressionType, Semantics), JsRuleError> {
-    let inner_pair: Pair<Rule> = pair.into_inner().next().unwrap();
-    Ok(match inner_pair.as_rule() {
-        Rule::call_expression | Rule::call_expression__yield => {
-            build_ast_from_call_expression(inner_pair, script)?
+    let mut pair_iter = pair.into_inner().peekable();
+    let mut new_count = 0usize;
+    while pair_iter
+        .peek()
+        .map(|p| p.as_rule() == Rule::new_op)
+        .unwrap_or(false)
+    {
+        pair_iter.next();
+        new_count += 1;
+    }
+    let base_pair = pair_iter.next().ok_or_else(|| {
+        get_unexpected_error_with_rule(
+            "build_ast_from_left_hand_side_expression:empty",
+            &Rule::left_hand_side_expression,
+        )
+    })?;
+    let base_meta = get_meta(&base_pair, script);
+    let mut s = Semantics::new_empty();
+    let mut obj = match base_pair.as_rule() {
+        Rule::super_call | Rule::super_call__yield => {
+            let arguments_pair = base_pair.into_inner().next().ok_or_else(|| {
+                get_unexpected_error_with_rule(
+                    "build_ast_from_left_hand_side_expression:super",
+                    &Rule::super_call,
+                )
+            })?;
+            let (a, a_s) = build_ast_from_arguments(arguments_pair, script)?;
+            s.merge(a_s);
+            ExpressionType::CallExpression {
+                meta: base_meta,
+                callee: ExpressionOrSuper::Super,
+                arguments: a,
+            }
         }
-        Rule::new_expression | Rule::new_expression__yield => {
-            build_ast_from_new_expression(inner_pair, script)?
+        Rule::member_expression | Rule::member_expression__yield => {
+            let (m, m_s) = build_ast_from_member_expression(base_pair, script)?;
+            s.merge(m_s);
+            m
         }
         _ => {
             return Err(get_unexpected_error(
                 "build_ast_from_left_hand_side_expression",
-                &inner_pair,
+                &base_pair,
             ))
         }
-    })
-}
-
-fn build_ast_from_new_expression(
-    pair: Pair<Rule>,
-    script: &Rc<String>,
-) -> Result<(ExpressionType, Semantics), JsRuleError> {
-    let inner_pair = pair.into_inner().next().unwrap();
-    Ok(
-        if inner_pair.as_rule() == Rule::member_expression
-            || inner_pair.as_rule() == Rule::member_expression__yield
-        {
-            build_ast_from_member_expression(inner_pair, script)?
-        } else {
-            let ne_meta = get_meta(&inner_pair, script);
-            let (n, n_s) = build_ast_from_new_expression(inner_pair, script)?;
-            (
-                ExpressionType::NewExpression {
-                    meta: ne_meta,
-                    callee: Box::new(n),
-                    arguments: vec![],
+    };
+    for suffix_pair in pair_iter {
+        let second_meta = get_meta(&suffix_pair, script);
+        let meta = Meta {
+            start_index: obj.get_meta().start_index,
+            end_index: second_meta.end_index,
+            script: script.clone(),
+        };
+        obj = match suffix_pair.as_rule() {
+            Rule::arguments | Rule::arguments__yield => {
+                let (a, a_s) = build_ast_from_arguments(suffix_pair, script)?;
+                s.merge(a_s);
+                if new_count > 0 {
+                    new_count -= 1;
+                    ExpressionType::NewExpression {
+                        meta,
+                        callee: Box::new(obj),
+                        arguments: a,
+                    }
+                } else {
+                    ExpressionType::CallExpression {
+                        meta,
+                        callee: ExpressionOrSuper::Expression(Box::new(obj)),
+                        arguments: a,
+                    }
+                }
+            }
+            Rule::expression__in | Rule::expression__in_yield => {
+                let (e, e_s) = build_ast_from_expression(suffix_pair, script)?;
+                s.merge(e_s);
+                ExpressionType::MemberExpression(
+                    MemberExpressionType::ComputedMemberExpression {
+                        meta,
+                        object: ExpressionOrSuper::Expression(Box::new(obj)),
+                        property: Box::new(e),
+                    },
+                )
+            }
+            Rule::identifier_name => ExpressionType::MemberExpression(
+                MemberExpressionType::SimpleMemberExpression {
+                    meta,
+                    object: ExpressionOrSuper::Expression(Box::new(obj)),
+                    property: get_identifier_data(suffix_pair, script),
                 },
-                n_s,
-            )
-        },
-    )
+            ),
+            Rule::template_literal | Rule::template_literal__yield => {
+                let (template, t_s) = build_ast_from_template_literal(suffix_pair, script)?;
+                s.merge(t_s);
+                let quasi = if let ExpressionType::TemplateLiteral(data) = template {
+                    data
+                } else {
+                    return Err(get_validation_error_with_meta(
+                        "Expected template literal".to_string(),
+                        AstBuilderValidationErrorType::SyntaxError,
+                        meta.clone(),
+                    ));
+                };
+                ExpressionType::TaggedTemplateExpression {
+                    meta,
+                    tag: Box::new(obj),
+                    quasi,
+                }
+            }
+            _ => {
+                return Err(get_unexpected_error(
+                    "build_ast_from_left_hand_side_expression:suffix",
+                    &suffix_pair,
+                ))
+            }
+        };
+    }
+    // Bare `new`s with no argument list (`new X`, `new new X`).
+    while new_count > 0 {
+        new_count -= 1;
+        obj = ExpressionType::NewExpression {
+            meta: obj.get_meta().clone(),
+            callee: Box::new(obj),
+            arguments: vec![],
+        };
+    }
+    Ok((obj, s))
 }
 
 fn build_ast_from_conditional_expression(
@@ -2757,103 +2872,6 @@ fn build_ast_from_postfix_expression(
     }
 }
 
-fn build_ast_from_call_expression(
-    pair: Pair<Rule>,
-    script: &Rc<String>,
-) -> Result<(ExpressionType, Semantics), JsRuleError> {
-    let mut pair_iter = pair.into_inner();
-    let pair = pair_iter.next().unwrap();
-    let meta = get_meta(&pair, script);
-    let (mut obj, mut s) =
-        if pair.as_rule() == Rule::super_call || pair.as_rule() == Rule::super_call__yield {
-            let (a, a_s) = build_ast_from_arguments(pair.into_inner().next().unwrap(), script)?;
-            (
-                ExpressionType::CallExpression {
-                    meta,
-                    callee: ExpressionOrSuper::Super,
-                    arguments: a,
-                },
-                a_s,
-            )
-        } else {
-            let arguments_pair = pair_iter.next().unwrap();
-            let (m, mut s) = build_ast_from_member_expression(pair, script)?;
-            let (a, a_s) = build_ast_from_arguments(arguments_pair, script)?;
-            s.merge(a_s);
-            (
-                ExpressionType::CallExpression {
-                    meta,
-                    callee: ExpressionOrSuper::Expression(Box::new(m)),
-                    arguments: a,
-                },
-                s,
-            )
-        };
-    for pair in pair_iter {
-        let second_meta = get_meta(&pair, script);
-        let meta = Meta {
-            start_index: obj.get_meta().start_index,
-            end_index: second_meta.end_index,
-            script: script.clone(),
-        };
-        obj = match pair.as_rule() {
-            Rule::expression__in_yield | Rule::expression__in => {
-                let (e, e_s) = build_ast_from_expression(pair, script)?;
-                s.merge(e_s);
-                ExpressionType::MemberExpression(
-                    MemberExpressionType::ComputedMemberExpression {
-                        meta,
-                        object: ExpressionOrSuper::Expression(Box::new(obj)),
-                        property: Box::new(e),
-                    },
-                )
-            }
-            Rule::identifier_name => ExpressionType::MemberExpression(
-                MemberExpressionType::SimpleMemberExpression {
-                    meta,
-                    object: ExpressionOrSuper::Expression(Box::new(obj)),
-                    property: get_identifier_data(pair, script),
-                },
-            ),
-            //Tagged template literal
-            Rule::template_literal | Rule::template_literal__yield => {
-                let (template, t_s) = build_ast_from_template_literal(pair, script)?;
-                s.merge(t_s);
-                let quasi = if let ExpressionType::TemplateLiteral(data) = template {
-                    data
-                } else {
-                    return Err(get_validation_error_with_meta(
-                        "Expected template literal".to_string(),
-                        AstBuilderValidationErrorType::SyntaxError,
-                        meta.clone(),
-                    ));
-                };
-                ExpressionType::TaggedTemplateExpression {
-                    meta,
-                    tag: Box::new(obj),
-                    quasi,
-                }
-            }
-            Rule::arguments | Rule::arguments__yield => {
-                let (a, a_s) = build_ast_from_arguments(pair, script)?;
-                s.merge(a_s);
-                ExpressionType::CallExpression {
-                    meta,
-                    callee: ExpressionOrSuper::Expression(Box::new(obj)),
-                    arguments: a,
-                }
-            }
-            _ => {
-                return Err(get_unexpected_error(
-                    "build_ast_from_call_expression",
-                    &pair,
-                ))
-            }
-        };
-    }
-    Ok((obj, s))
-}
-
 fn get_binding_identifier_data(
     pair: Pair<Rule>,
     script: &Rc<String>,
@@ -3331,6 +3349,19 @@ fn validate_regexp_named_groups(pattern: &str, flags: &str) -> Result<(), String
             declared.push(name);
             continue;
         }
+        // `(?…` that is not `(?:` / `(?=` / `(?!` / `(?<…` must be a
+        // regexp-modifiers group `(?ims-ims:…)` (ES2025). Validate its
+        // early-error rules; anything else after `(?` is a SyntaxError.
+        // Ordinary group forms above are skipped, so real-world regexes
+        // that never use modifiers are unaffected.
+        if c == '('
+            && chars.get(i + 1) == Some(&'?')
+            && !matches!(chars.get(i + 2), Some(':') | Some('=') | Some('!') | Some('<') | None)
+        {
+            i += 2;
+            validate_regexp_modifiers(&chars, &mut i)?;
+            continue;
+        }
         i += 1;
     }
 
@@ -3375,6 +3406,48 @@ fn validate_regexp_named_groups(pattern: &str, flags: &str) -> Result<(), String
         }
     }
 
+    Ok(())
+}
+
+/// Validate an ES2025 regexp-modifiers group `(?ims-ims:…)`. `*i` points just
+/// past `(?`; on success it is advanced past the `:`. Early errors (spec
+/// `Atom :: ( ? RegularExpressionFlags [- RegularExpressionFlags] : … )`):
+/// a flag other than `i`/`m`/`s`, a duplicate flag within either list, a flag
+/// present in both lists, and the dash form with both lists empty.
+fn validate_regexp_modifiers(chars: &[char], i: &mut usize) -> Result<(), String> {
+    let mut add: Vec<char> = Vec::new();
+    let mut remove: Vec<char> = Vec::new();
+    let mut has_dash = false;
+    loop {
+        match chars.get(*i) {
+            None => return Err("Unterminated regexp modifiers group".to_string()),
+            Some(':') => {
+                *i += 1;
+                break;
+            }
+            Some('-') if !has_dash => {
+                has_dash = true;
+                *i += 1;
+            }
+            Some(&c) => {
+                if !matches!(c, 'i' | 'm' | 's') {
+                    return Err(format!("Invalid regexp modifier '{}'", c));
+                }
+                let list = if has_dash { &mut remove } else { &mut add };
+                if list.contains(&c) {
+                    return Err(format!("Duplicate regexp modifier '{}'", c));
+                }
+                list.push(c);
+                *i += 1;
+            }
+        }
+    }
+    if has_dash && add.is_empty() && remove.is_empty() {
+        return Err("Regexp modifiers group with both lists empty".to_string());
+    }
+    if add.iter().any(|c| remove.contains(c)) {
+        return Err("Regexp modifier present in both add and remove lists".to_string());
+    }
     Ok(())
 }
 

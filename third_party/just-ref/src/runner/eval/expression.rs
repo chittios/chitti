@@ -1194,12 +1194,14 @@ fn get_property_with_receiver(
                 Ok(JsValue::Undefined)
             }
         }
-        JsValue::Undefined => {
-            Err(JErrorType::TypeError("Cannot read property of undefined".to_string()))
-        }
-        JsValue::Null => {
-            Err(JErrorType::TypeError("Cannot read property of null".to_string()))
-        }
+        JsValue::Undefined => Err(JErrorType::TypeError(format!(
+            "Cannot read property '{}' of undefined",
+            prop_name
+        ))),
+        JsValue::Null => Err(JErrorType::TypeError(format!(
+            "Cannot read property '{}' of null",
+            prop_name
+        ))),
         _ => {
             // Primitive types - return undefined for now
             Ok(JsValue::Undefined)

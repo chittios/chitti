@@ -67,6 +67,7 @@ pub mod url;
 pub mod wasm_page;
 pub mod worker;
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -127,6 +128,14 @@ pub fn layout_html_ex(
     let mut lay = layout::layout_document(&doc.root, &sheet, vw, vh);
     // Apply canvas 2d pixels drawn during script execution.
     js::apply_canvases_to_layout(&dom, &mut lay);
+    finish_layout(&doc, &mut lay, vw, vh);
+    (doc, lay, effects)
+}
+
+/// Shared post-layout fixups: reader-mode fallback for pages whose DOM/CSS
+/// path produced no visible geometry, and the dark-page ink fixup (a dark
+/// `bg` with mostly-dark ink becomes warm paper + dark ink).
+fn finish_layout(doc: &html::Document, lay: &mut layout::Layout, vw: i32, vh: i32) {
     if lay.runs.is_empty()
         && lay.images.is_empty()
         && lay.controls.is_empty()
@@ -134,7 +143,7 @@ pub fn layout_html_ex(
     {
         let plain = html::collect_text(&doc.root);
         if !plain.is_empty() || !doc.title.is_empty() {
-            lay = layout::layout_reader(&doc.title, &plain, vw, vh);
+            *lay = layout::layout_reader(&doc.title, &plain, vw, vh);
         }
     }
     if is_dark(lay.bg) && !lay.runs.is_empty() {
@@ -148,7 +157,98 @@ pub fn layout_html_ex(
             }
         }
     }
-    (doc, lay, effects)
+}
+
+/// Session-scoped subresources for the persistent-page render path
+/// ([`layout_session`]): fetched external stylesheet bodies and decoded CSS
+/// background images, both keyed by **absolute URL** (resolved against the
+/// document URL, matching how the host stored them).
+pub struct SessionAssets<'a> {
+    /// `<link rel=stylesheet>` (+`@import`-expanded) bodies by absolute URL.
+    pub css_external: &'a BTreeMap<String, String>,
+    /// Decoded `background-image` pixels by absolute URL:
+    /// `(0x00RRGGBB row-major, width, height)`.
+    pub bg_pixels: &'a BTreeMap<String, (Vec<u32>, usize, usize)>,
+}
+
+/// Session render for the **persistent JS page** path: parse, merge inline +
+/// external stylesheets in exact document order, commit the live page DOM
+/// (if [`js_just::page_active`]) instead of re-running scripts, lay out with
+/// the page's interactive element set, fill background-image pixels from
+/// `assets`, and apply script-drawn canvases. Returns the doc, the layout,
+/// and any **fresh** JS console lines (drained from the page log).
+///
+/// One-shot callers (iframes, workers, tests, the doc agent) keep using
+/// [`layout_html_ex`] — this function never boots or runs scripts itself.
+pub fn layout_session(
+    html_src: &str,
+    vw: i32,
+    vh: i32,
+    url: &str,
+    assets: &SessionAssets<'_>,
+) -> (html::Document, layout::Layout, Vec<String>) {
+    let mut doc = html::parse(html_src);
+
+    // Merge stylesheets in exact document order (inline bodies verbatim,
+    // external hrefs resolved against the document URL and looked up in the
+    // fetched set; missing sheets are skipped).
+    let mut css_all = String::new();
+    for s in &doc.styles_ordered {
+        match s {
+            html::StyleSrc::Inline(body) => {
+                css_all.push_str(body);
+                css_all.push('\n');
+            }
+            html::StyleSrc::External(href) => {
+                let abs = url::resolve(url, href).unwrap_or_else(|| href.clone());
+                if let Some(body) = assets
+                    .css_external
+                    .get(&abs)
+                    .or_else(|| assets.css_external.get(href))
+                {
+                    css_all.push_str(body);
+                    css_all.push('\n');
+                }
+            }
+        }
+    }
+
+    // Live page DOM → tree (title, mutations, JS-created elements), plus the
+    // interactive element set for ElemBox hit-testing. No page → stamp only.
+    let mut js_log: Vec<String> = Vec::new();
+    let mut interactive: Vec<usize> = Vec::new();
+    if js_just::page_active() {
+        js_just::page_with_dom(|dom| {
+            doc.title = dom.title.clone();
+            js::commit_full(&mut doc.root, dom);
+            js_log = core::mem::take(&mut dom.log);
+        });
+        interactive = js_just::page_interactive_elems();
+    } else {
+        js::stamp_elem_indices(&mut doc.root);
+    }
+
+    let sheet = css::Stylesheet::parse(&css_all);
+    let mut lay = layout::layout_document_ex(&doc.root, &sheet, vw, vh, &interactive);
+
+    // Fill background-image pixels by absolute URL (raw src as fallback).
+    for bb in lay.bg_boxes.iter_mut() {
+        let abs = url::resolve(url, &bb.src).unwrap_or_else(|| bb.src.clone());
+        if let Some((px, w, h)) = assets
+            .bg_pixels
+            .get(&abs)
+            .or_else(|| assets.bg_pixels.get(&bb.src))
+        {
+            bb.pixels = Some(px.clone());
+            bb.src_w = *w;
+            bb.src_h = *h;
+        }
+    }
+
+    // Canvas 2d pixels drawn by page scripts / handlers.
+    js_just::page_with_dom(|dom| js::apply_canvases_to_layout(dom, &mut lay));
+    finish_layout(&doc, &mut lay, vw, vh);
+    (doc, lay, js_log)
 }
 
 /// Paint nested HTML into an iframe/frame slot (pure for `srcdoc`; host loads
@@ -370,6 +470,65 @@ mod tests {
             "runs: {:?}",
             f.layout.runs
         );
+    }
+
+    #[test_case]
+    fn layout_session_merges_external_css_in_order() {
+        js_just::page_close(); // isolate from any page another test booted
+        let html = r##"<html><head>
+            <style>p { color: #00ff00; }</style>
+            <link rel="stylesheet" href="/site.css">
+            </head><body><p>Styled</p></body></html>"##;
+        let mut css_ext = BTreeMap::new();
+        css_ext.insert(
+            String::from("https://ex.com/site.css"),
+            String::from("p { color: #ff0000; }"),
+        );
+        let bg = BTreeMap::new();
+        let assets = SessionAssets {
+            css_external: &css_ext,
+            bg_pixels: &bg,
+        };
+        let (_doc, lay, _log) = layout_session(html, 320, 200, "https://ex.com/page", &assets);
+        // The later external sheet overrides the earlier inline one
+        // (document-order cascade).
+        assert!(
+            lay.runs.iter().any(|r| r.color == 0xff0000),
+            "runs: {:?}",
+            lay.runs
+        );
+        // A missing external sheet is skipped, not fatal: inline still applies.
+        let empty = BTreeMap::new();
+        let assets2 = SessionAssets {
+            css_external: &empty,
+            bg_pixels: &bg,
+        };
+        let (_d2, lay2, _l2) = layout_session(html, 320, 200, "https://ex.com/page", &assets2);
+        assert!(lay2.runs.iter().any(|r| r.color == 0x00ff00));
+    }
+
+    #[test_case]
+    fn layout_session_fills_bg_pixels() {
+        js_just::page_close();
+        let html = r##"<html><head><style>
+            #h { background-image: url("bg.png"); }
+            </style></head><body><div id="h">X</div></body></html>"##;
+        let css_ext = BTreeMap::new();
+        let mut bg = BTreeMap::new();
+        bg.insert(
+            String::from("https://ex.com/a/bg.png"),
+            (alloc::vec![0xff0000u32; 4], 2usize, 2usize),
+        );
+        let assets = SessionAssets {
+            css_external: &css_ext,
+            bg_pixels: &bg,
+        };
+        let (_doc, lay, _log) =
+            layout_session(html, 320, 200, "https://ex.com/a/page.html", &assets);
+        let bb = lay.bg_boxes.first().expect("bg box");
+        assert_eq!(bb.src, "bg.png");
+        assert!(bb.pixels.is_some(), "bg pixels filled from assets");
+        assert_eq!((bb.src_w, bb.src_h), (2, 2));
     }
 
     #[test_case]

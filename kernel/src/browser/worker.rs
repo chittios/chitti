@@ -444,6 +444,69 @@ pub fn fetch_images_cooperative(urls: &[String]) -> (Vec<LoadedResource>, AssetS
     (loaded, assets)
 }
 
+/// Most subresource URLs fetched per [`fetch_subresources_cooperative`] call.
+const MAX_SUBRESOURCE_URLS: usize = 16;
+
+/// Fetch a batch of same-kind subresources (scripts / styles / fonts) on a
+/// **stack-local** pool and drain cooperatively (upkeep + Ctrl+C between
+/// jobs, same as [`fetch_images_cooperative`]). Returns requested-URL → body
+/// for responses with status < 400 whose body is at most `per_item_cap`
+/// bytes; failed or oversized fetches record nothing. At most 16 URLs are
+/// fetched (extras ignored).
+pub fn fetch_subresources_cooperative(
+    urls: &[String],
+    dest: Destination,
+    per_item_cap: usize,
+) -> BTreeMap<String, Vec<u8>> {
+    let mut pool = WorkerPool::new();
+    fetch_subresources_into(&mut pool, urls, dest, per_item_cap)
+}
+
+/// Body of [`fetch_subresources_cooperative`] on a caller-owned pool
+/// (testable with a pre-seeded asset store, no network).
+fn fetch_subresources_into(
+    pool: &mut WorkerPool,
+    urls: &[String],
+    dest: Destination,
+    per_item_cap: usize,
+) -> BTreeMap<String, Vec<u8>> {
+    // Per-kind timeouts: styles block layout (shorter), scripts/fonts get 30 s.
+    let timeout_ms = match dest {
+        Destination::Style => 20_000,
+        _ => 30_000,
+    };
+    let mut ids: BTreeMap<JobId, String> = BTreeMap::new();
+    for url in urls
+        .iter()
+        .filter(|u| !u.is_empty())
+        .take(MAX_SUBRESOURCE_URLS)
+    {
+        let id = pool.spawn_fetch(url, dest, CacheMode::Default, timeout_ms);
+        ids.insert(id, url.clone());
+    }
+    pool.drain_while(|| {
+        #[cfg(not(test))]
+        {
+            crate::shell::poll_interrupt()
+        }
+        #[cfg(test)]
+        {
+            false
+        }
+    });
+    let mut out: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for r in pool.take_results() {
+        if let JobResult::FetchOk { id, resource } = r {
+            if resource.status < 400 && resource.body.len() <= per_item_cap {
+                if let Some(url) = ids.get(&id) {
+                    out.insert(url.clone(), resource.body);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Clear global worker registry (new top-level navigation).
 pub fn reset_global() {
     POOL.with(|p| p.reset());
@@ -533,6 +596,44 @@ mod tests {
     #[test_case]
     fn escape_js_string_basic() {
         assert_eq!(escape_js_string("a\"b\\c\n"), "a\\\"b\\\\c\\n");
+    }
+
+    #[test_case]
+    fn fetch_subresources_collects_and_caps() {
+        let mut pool = WorkerPool::new();
+        pool.assets_mut()
+            .put("https://ex.com/a.css", "text/css", b"p{color:red}".to_vec());
+        pool.assets_mut().put(
+            "https://ex.com/big.css",
+            "text/css",
+            alloc::vec![b'x'; 64],
+        );
+        let urls = alloc::vec![
+            String::from("https://ex.com/a.css"),
+            String::new(),
+            String::from("https://ex.com/big.css"),
+        ];
+        let out = fetch_subresources_into(&mut pool, &urls, Destination::Style, 32);
+        assert_eq!(out.len(), 1, "oversized + empty skipped: {out:?}");
+        assert_eq!(
+            out.get("https://ex.com/a.css").map(|b| b.as_slice()),
+            Some(b"p{color:red}".as_slice())
+        );
+        assert!(!out.contains_key("https://ex.com/big.css"));
+    }
+
+    #[test_case]
+    fn fetch_subresources_truncates_to_sixteen() {
+        let mut pool = WorkerPool::new();
+        let mut urls = Vec::new();
+        for i in 0..20 {
+            let u = format!("https://ex.com/{i}.js");
+            pool.assets_mut()
+                .put(&u, "text/javascript", alloc::vec![b'a']);
+            urls.push(u);
+        }
+        let out = fetch_subresources_into(&mut pool, &urls, Destination::Script, 1024);
+        assert_eq!(out.len(), MAX_SUBRESOURCE_URLS);
     }
 
     #[test_case]

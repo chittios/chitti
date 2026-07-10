@@ -29,6 +29,9 @@ pub struct TextRun {
     pub link_href: Option<String>,
     pub font_size: i32,
     pub bold: bool,
+    /// CSS font-family (first name, lowercase); `""` = the default face.
+    /// Generic names (`sans-serif`/`serif`/`monospace`) map to `""`.
+    pub font_family: String,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +50,81 @@ pub struct RectBox {
     pub w: i32,
     pub h: i32,
     pub color: u32,
+}
+
+/// Hit box of a JS-interactive element (has listeners / `on*` attrs), so a
+/// click anywhere on its box can be dispatched into page JS ([`Hit::Elem`]).
+/// `elem_idx` is the stamped `Node.elem_idx` = `JsDom.elements` index.
+#[derive(Clone, Debug)]
+pub struct ElemBox {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub elem_idx: usize,
+}
+
+/// A CSS `background-image: url(…)` paint box. `src` is the inner url as
+/// written (unresolved); the host fills `pixels` (decoded `0x00RRGGBB`,
+/// `src_w`×`src_h`) like it does for [`ImageBox`]. `repeat`/`size`/`pos` carry
+/// the raw CSS values (parsed at paint by `paint::parse_bg_*`).
+#[derive(Clone, Debug)]
+pub struct BgBox {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub src: String,
+    pub repeat: String,
+    pub size: String,
+    pub pos: String,
+    pub pixels: Option<alloc::vec::Vec<u32>>,
+    pub src_w: usize,
+    pub src_h: usize,
+}
+
+/// Emit border edges for a box as solid `RectBox` line segments (dashed/dotted
+/// styles are approximated as solid). Each visible edge needs a style, a
+/// positive width, and a resolved colour (falling back to the shorthand
+/// `border_color`, then the text colour). This is why bordered boxes/tables/
+/// cards finally render an outline — previously borders were computed but never
+/// painted.
+fn push_box_borders(rects: &mut Vec<RectBox>, x: i32, y: i32, w: i32, h: i32, st: &ComputedStyle) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let fallback = st.border_color.unwrap_or(st.color);
+    let edge = |style: css::BorderStyle, width: i32, color: Option<u32>| -> Option<(i32, u32)> {
+        if style.is_visible() && width > 0 {
+            Some((width.min(w).min(h), color.unwrap_or(fallback)))
+        } else {
+            None
+        }
+    };
+    if let Some((bw, c)) = edge(st.border_top_style, st.border_top_width, st.border_top_color) {
+        rects.push(RectBox { x, y, w, h: bw, color: c });
+    }
+    if let Some((bw, c)) = edge(st.border_bottom_style, st.border_bottom_width, st.border_bottom_color) {
+        rects.push(RectBox { x, y: y + h - bw, w, h: bw, color: c });
+    }
+    if let Some((bw, c)) = edge(st.border_left_style, st.border_left_width, st.border_left_color) {
+        rects.push(RectBox { x, y, w: bw, h, color: c });
+    }
+    if let Some((bw, c)) = edge(st.border_right_style, st.border_right_width, st.border_right_color) {
+        rects.push(RectBox { x: x + w - bw, y, w: bw, h, color: c });
+    }
+    // Outline — drawn just outside the border box by `outline-offset`.
+    if st.outline_style.is_visible() && st.outline_width > 0 {
+        let ow = st.outline_width;
+        let off = st.outline_offset.max(0);
+        let (ox, oy) = (x - off - ow, y - off - ow);
+        let (ow_box, oh_box) = (w + 2 * (off + ow), h + 2 * (off + ow));
+        let c = st.outline_color.unwrap_or(fallback);
+        rects.push(RectBox { x: ox, y: oy, w: ow_box, h: ow, color: c });
+        rects.push(RectBox { x: ox, y: oy + oh_box - ow, w: ow_box, h: ow, color: c });
+        rects.push(RectBox { x: ox, y: oy, w: ow, h: oh_box, color: c });
+        rects.push(RectBox { x: ox + ow_box - ow, y: oy, w: ow, h: oh_box, color: c });
+    }
 }
 
 /// A laid-out image (decoded later or placeholder).
@@ -155,6 +233,9 @@ pub struct FormControl {
     pub h: i32,
     pub focused: bool,
     pub checked: bool,
+    /// Stamped `Node.elem_idx` (JS DOM element index) when the tree was
+    /// stamped before layout — lets input/click events reach page JS.
+    pub elem_idx: Option<usize>,
 }
 
 /// Hit-test result in content coordinates (y includes scroll offset).
@@ -162,6 +243,8 @@ pub struct FormControl {
 pub enum Hit {
     Link(String),
     Control(usize),
+    /// A JS-interactive element ([`ElemBox`]) by stamped element index.
+    Elem(usize),
     /// Embedded frame (iframe / video / canvas / …) by layout index.
     Embed(usize),
     /// Empty page area (still over document).
@@ -179,7 +262,63 @@ pub struct Layout {
     pub images: alloc::vec::Vec<ImageBox>,
     pub controls: Vec<FormControl>,
     pub frames: Vec<FrameBox>,
+    /// Hit boxes of JS-interactive elements (see [`ElemBox`]).
+    pub elem_boxes: Vec<ElemBox>,
+    /// CSS `background-image: url(…)` boxes (see [`BgBox`]).
+    pub bg_boxes: Vec<BgBox>,
     pub bg: u32,
+}
+
+/// Extra outputs threaded through the walk: interactive element hit boxes and
+/// background-image boxes, plus the set of element indices (stamped
+/// `Node.elem_idx` values) that should get an [`ElemBox`].
+struct Aux<'a> {
+    elem_boxes: Vec<ElemBox>,
+    bg_boxes: Vec<BgBox>,
+    interactive: &'a [usize],
+}
+
+impl Aux<'_> {
+    /// Record a hit box when the node is stamped AND in the interactive set.
+    fn push_elem_box(&mut self, elem_idx: Option<usize>, x: i32, y: i32, w: i32, h: i32) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        if let Some(i) = elem_idx {
+            if self.interactive.contains(&i) {
+                self.elem_boxes.push(ElemBox { x, y, w, h, elem_idx: i });
+            }
+        }
+    }
+
+    /// Record a background-image box when the style carries `url(…)`.
+    fn push_bg_box(&mut self, st: &ComputedStyle, x: i32, y: i32, w: i32, h: i32) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let v = st.background_image.trim();
+        if v.len() < 5 || !v[..4].eq_ignore_ascii_case("url(") {
+            return;
+        }
+        let Some(end) = v.find(')') else { return };
+        let src = v[4..end].trim().trim_matches(|c| c == '"' || c == '\'').trim();
+        if src.is_empty() || src.starts_with("data:") {
+            return;
+        }
+        self.bg_boxes.push(BgBox {
+            x,
+            y,
+            w,
+            h,
+            src: src.to_string(),
+            repeat: st.background_repeat.clone(),
+            size: st.background_size.clone(),
+            pos: st.background_position.clone(),
+            pixels: None,
+            src_w: 0,
+            src_h: 0,
+        });
+    }
 }
 
 struct Cursor {
@@ -200,6 +339,19 @@ struct FormCtx {
 
 /// Layout `root` with stylesheet into a page of size `vw`×`vh`.
 pub fn layout_document(root: &Node, sheet: &Stylesheet, vw: i32, vh: i32) -> Layout {
+    layout_document_ex(root, sheet, vw, vh, &[])
+}
+
+/// Like [`layout_document`], with a set of JS-interactive element indices
+/// (stamped `Node.elem_idx` values): matching block/flex boxes are recorded as
+/// [`ElemBox`]es so clicks on them can be dispatched into page JS.
+pub fn layout_document_ex(
+    root: &Node,
+    sheet: &Stylesheet,
+    vw: i32,
+    vh: i32,
+    interactive: &[usize],
+) -> Layout {
     let mut runs = Vec::new();
     let mut links = Vec::new();
     let mut rects = Vec::new();
@@ -230,6 +382,11 @@ pub fn layout_document(root: &Node, sheet: &Stylesheet, vw: i32, vh: i32) -> Lay
         }
     }
     let mut next_form_id = 1u32;
+    let mut aux = Aux {
+        elem_boxes: Vec::new(),
+        bg_boxes: Vec::new(),
+        interactive,
+    };
     walk(
         root,
         sheet,
@@ -241,6 +398,7 @@ pub fn layout_document(root: &Node, sheet: &Stylesheet, vw: i32, vh: i32) -> Lay
         &mut images,
         &mut controls,
         &mut frames,
+        &mut aux,
         None,
         None,
         &mut next_form_id,
@@ -259,6 +417,8 @@ pub fn layout_document(root: &Node, sheet: &Stylesheet, vw: i32, vh: i32) -> Lay
         images,
         controls,
         frames,
+        elem_boxes: aux.elem_boxes,
+        bg_boxes: aux.bg_boxes,
         bg: page_bg,
     }
 }
@@ -367,6 +527,8 @@ pub fn layout_reader(title: &str, plain: &str, vw: i32, vh: i32) -> Layout {
         images: Vec::new(),
         controls: Vec::new(),
         frames: Vec::new(),
+        elem_boxes: Vec::new(),
+        bg_boxes: Vec::new(),
         bg: 0xf5f0e8,
     }
 }
@@ -382,6 +544,7 @@ fn walk(
     images: &mut Vec<ImageBox>,
     controls: &mut Vec<FormControl>,
     frames: &mut Vec<FrameBox>,
+    aux: &mut Aux,
     link: Option<&str>,
     form: Option<&FormCtx>,
     next_form_id: &mut u32,
@@ -393,7 +556,7 @@ fn walk(
         NodeKind::Document => {
             for c in &n.children {
                 walk(
-                    c, sheet, parent_st, cur, runs, links, rects, images, controls, frames, link,
+                    c, sheet, parent_st, cur, runs, links, rects, images, controls, frames, aux, link,
                     form, next_form_id, page_bg, vw, in_head,
                 );
             }
@@ -423,6 +586,9 @@ fn walk(
             sandbox,
             width_attr,
             height_attr,
+            srcset,
+            // rel/on_attrs and future attrs are read where needed.
+            ..
         } => {
             let tag = tag.as_str();
             let dkind = elements::classify(tag);
@@ -474,6 +640,7 @@ fn walk(
                     images,
                     controls,
                     frames,
+                    aux,
                     link,
                     form,
                     next_form_id,
@@ -513,7 +680,12 @@ fn walk(
                         .unwrap_or(120)
                         .clamp(16, cur.max_w);
                     let ih = height_attr.unwrap_or((iw * 3 / 4).clamp(16, 240));
-                    let src_s = src.clone().unwrap_or_default();
+                    // Responsive images: prefer a srcset candidate for this viewport.
+                    let src_s = srcset
+                        .as_deref()
+                        .and_then(|ss| super::html::pick_srcset_candidate(ss, vw))
+                        .or_else(|| src.clone())
+                        .unwrap_or_default();
                     let alt_s = alt.clone().unwrap_or_else(|| String::from("[img]"));
                     images.push(ImageBox {
                         x: cur.margin_x + st.margin_left,
@@ -633,7 +805,7 @@ fn walk(
                     *next_form_id = next_form_id.saturating_add(1);
                     for c in &n.children {
                         walk(
-                            c, sheet, &st, cur, runs, links, rects, images, controls, frames, link,
+                            c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
                             Some(&ctx), next_form_id, page_bg, vw, in_head,
                         );
                     }
@@ -658,7 +830,7 @@ fn walk(
                     block_before(cur, st.margin_top.max(4));
                     for c in &n.children {
                         walk(
-                            c, sheet, &st, cur, runs, links, rects, images, controls, frames, link,
+                            c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
                             form, next_form_id, page_bg, vw, in_head,
                         );
                     }
@@ -668,7 +840,7 @@ fn walk(
                     block_before(cur, 0);
                     for c in &n.children {
                         walk(
-                            c, sheet, &st, cur, runs, links, rects, images, controls, frames, link,
+                            c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
                             form, next_form_id, page_bg, vw, in_head,
                         );
                     }
@@ -682,7 +854,7 @@ fn walk(
                     cur.max_w = (old_max / 2).max(40);
                     for c in &n.children {
                         walk(
-                            c, sheet, &st, cur, runs, links, rects, images, controls, frames, link,
+                            c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
                             form, next_form_id, page_bg, vw, in_head,
                         );
                     }
@@ -712,7 +884,7 @@ fn walk(
                     }
                     for c in &n.children {
                         walk(
-                            c, sheet, &st, cur, runs, links, rects, images, controls, frames, link,
+                            c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
                             form, next_form_id, page_bg, vw, in_head,
                         );
                     }
@@ -720,16 +892,20 @@ fn walk(
                         new_line(cur);
                     }
                     cur.y += st.padding_bottom;
+                    let block_h = (cur.y - block_y0).max(line_h);
+                    let block_w = cur.max_w.max(1);
                     if let Some(bg) = st.background {
-                        let h = (cur.y - block_y0).max(line_h);
                         rects.push(RectBox {
                             x: block_x0,
                             y: block_y0,
-                            w: cur.max_w.max(1),
-                            h,
+                            w: block_w,
+                            h: block_h,
                             color: bg,
                         });
                     }
+                    aux.push_bg_box(&st, block_x0, block_y0, block_w, block_h);
+                    push_box_borders(rects, block_x0, block_y0, block_w, block_h, &st);
+                    aux.push_elem_box(n.elem_idx, block_x0, block_y0, block_w, block_h);
                     let _ = (st.text_align, Align::Left, content_start_x, vw);
                     cur.max_w = old_max;
                     block_after(cur, st.margin_bottom);
@@ -743,7 +919,7 @@ fn walk(
                     for c in &n.children {
                         walk(
                             c, sheet, &st_a, cur, runs, links, rects, images, controls, frames,
-                            href_s.or(link), form, next_form_id, page_bg, vw, in_head,
+                            aux, href_s.or(link), form, next_form_id, page_bg, vw, in_head,
                         );
                     }
                 }
@@ -759,7 +935,7 @@ fn walk(
                     for c in &n.children {
                         walk(
                             c, sheet, &st_i, cur, runs, links, rects, images, controls, frames,
-                            link, form, next_form_id, page_bg, vw, in_head,
+                            aux, link, form, next_form_id, page_bg, vw, in_head,
                         );
                     }
                 }
@@ -767,7 +943,7 @@ fn walk(
                     cur.line_h = line_h;
                     for c in &n.children {
                         walk(
-                            c, sheet, &st, cur, runs, links, rects, images, controls, frames, link,
+                            c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
                             form, next_form_id, page_bg, vw, in_head,
                         );
                     }
@@ -780,7 +956,7 @@ fn walk(
                             for c in &n.children {
                                 walk(
                                     c, sheet, &st, cur, runs, links, rects, images, controls,
-                                    frames, link, form, next_form_id, page_bg, vw, in_head,
+                                    frames, aux, link, form, next_form_id, page_bg, vw, in_head,
                                 );
                             }
                         }
@@ -790,7 +966,7 @@ fn walk(
                             for c in &n.children {
                                 walk(
                                     c, sheet, &st, cur, runs, links, rects, images, controls,
-                                    frames, link, form, next_form_id, page_bg, vw, in_head,
+                                    frames, aux, link, form, next_form_id, page_bg, vw, in_head,
                                 );
                             }
                             block_after(cur, st.margin_bottom);
@@ -800,7 +976,7 @@ fn walk(
                             for c in &n.children {
                                 walk(
                                     c, sheet, &st, cur, runs, links, rects, images, controls,
-                                    frames, link, form, next_form_id, page_bg, vw, in_head,
+                                    frames, aux, link, form, next_form_id, page_bg, vw, in_head,
                                 );
                             }
                             if cur.x > cur.margin_x {
@@ -824,6 +1000,8 @@ struct FragMark {
     images: usize,
     controls: usize,
     frames: usize,
+    elem_boxes: usize,
+    bg_boxes: usize,
 }
 
 fn mark_frag(
@@ -833,6 +1011,7 @@ fn mark_frag(
     images: &[ImageBox],
     controls: &[FormControl],
     frames: &[FrameBox],
+    aux: &Aux,
 ) -> FragMark {
     FragMark {
         runs: runs.len(),
@@ -841,6 +1020,8 @@ fn mark_frag(
         images: images.len(),
         controls: controls.len(),
         frames: frames.len(),
+        elem_boxes: aux.elem_boxes.len(),
+        bg_boxes: aux.bg_boxes.len(),
     }
 }
 
@@ -853,6 +1034,7 @@ fn frag_bbox(
     images: &[ImageBox],
     controls: &[FormControl],
     frames: &[FrameBox],
+    aux: &Aux,
 ) -> (i32, i32, i32, i32) {
     let mut x0 = i32::MAX;
     let mut y0 = i32::MAX;
@@ -888,6 +1070,12 @@ fn frag_bbox(
     for f in &frames[start.frames..] {
         expand(f.x, f.y, f.w.max(1), f.h.max(1));
     }
+    for e in &aux.elem_boxes[start.elem_boxes..] {
+        expand(e.x, e.y, e.w.max(1), e.h.max(1));
+    }
+    for b in &aux.bg_boxes[start.bg_boxes..] {
+        expand(b.x, b.y, b.w.max(1), b.h.max(1));
+    }
     if !any {
         return (0, 0, 1, 1);
     }
@@ -904,6 +1092,7 @@ fn translate_frag(
     images: &mut [ImageBox],
     controls: &mut [FormControl],
     frames: &mut [FrameBox],
+    aux: &mut Aux,
 ) {
     if dx == 0 && dy == 0 {
         return;
@@ -932,6 +1121,14 @@ fn translate_frag(
         f.x += dx;
         f.y += dy;
     }
+    for e in &mut aux.elem_boxes[start.elem_boxes..] {
+        e.x += dx;
+        e.y += dy;
+    }
+    for b in &mut aux.bg_boxes[start.bg_boxes..] {
+        b.x += dx;
+        b.y += dy;
+    }
 }
 
 /// Layout children of a flex/grid container: measure each element child as an
@@ -947,6 +1144,7 @@ fn layout_flex_grid_container(
     images: &mut Vec<ImageBox>,
     controls: &mut Vec<FormControl>,
     frames: &mut Vec<FrameBox>,
+    aux: &mut Aux,
     link: Option<&str>,
     form: Option<&FormCtx>,
     next_form_id: &mut u32,
@@ -1037,7 +1235,7 @@ fn layout_flex_grid_container(
             .unwrap_or(default_item_w)
             .clamp(16, container_w);
 
-        let mark = mark_frag(runs, links, rects, images, controls, frames);
+        let mark = mark_frag(runs, links, rects, images, controls, frames, aux);
         // Isolated cursor at origin so fragment coords start near (0,0).
         // Auto-size: use natural max_w; for row flex wrap prefer content width.
         let measure_w = if st.display == DisplayMode::Flex
@@ -1068,6 +1266,7 @@ fn layout_flex_grid_container(
             images,
             controls,
             frames,
+            aux,
             link,
             form,
             next_form_id,
@@ -1076,7 +1275,7 @@ fn layout_flex_grid_container(
             in_head,
         );
         let (x0, y0, x1, y1) =
-            frag_bbox(mark, runs, links, rects, images, controls, frames);
+            frag_bbox(mark, runs, links, rects, images, controls, frames, aux);
         let mut w = (x1 - x0).max(1);
         let mut h = (y1 - y0).max(1);
         if let Some(eh) = cst.height {
@@ -1140,7 +1339,7 @@ fn layout_flex_grid_container(
                 if let Some(it) = items.get(p.index) {
                     let dx = box_x + p.x - it.x0;
                     let dy = box_y + p.y - it.y0;
-                    translate_frag(it.mark, dx, dy, runs, links, rects, images, controls, frames);
+                    translate_frag(it.mark, dx, dy, runs, links, rects, images, controls, frames, aux);
                     max_x = max_x.max(p.x + p.w);
                     max_y = max_y.max(p.y + p.h);
                 }
@@ -1171,7 +1370,7 @@ fn layout_flex_grid_container(
                         let dx = box_x + p.x + ix - it.x0;
                         let dy = box_y + p.y + iy - it.y0;
                         translate_frag(
-                            it.mark, dx, dy, runs, links, rects, images, controls, frames,
+                            it.mark, dx, dy, runs, links, rects, images, controls, frames, aux,
                         );
                         max_y = max_y.max(p.y + p.h);
                     }
@@ -1184,7 +1383,7 @@ fn layout_flex_grid_container(
                     let iy = flex::flex_cross_offset(it.h.min(cell_h), cell_h, st.align_items);
                     let dx = box_x + gx + ix - it.x0;
                     let dy = box_y + gy + iy - it.y0;
-                    translate_frag(it.mark, dx, dy, runs, links, rects, images, controls, frames);
+                    translate_frag(it.mark, dx, dy, runs, links, rects, images, controls, frames, aux);
                 }
                 let rows = (items.len() + cols as usize - 1) / cols as usize;
                 content_h = if rows == 0 {
@@ -1201,10 +1400,15 @@ fn layout_flex_grid_container(
     if let Some(h) = st.height {
         content_h = content_h.max(h);
     }
+    let box_w = content_w.max(container_w);
+    let box_h = content_h.max(1);
     if let Some(i) = bg_idx {
-        rects[i].w = content_w.max(container_w);
-        rects[i].h = content_h.max(1);
+        rects[i].w = box_w;
+        rects[i].h = box_h;
     }
+    push_box_borders(rects, box_x, box_y, box_w, box_h, st);
+    aux.push_bg_box(st, box_x, box_y, box_w, box_h);
+    aux.push_elem_box(n.elem_idx, box_x, box_y, box_w, box_h);
 
     cur.y = box_y + content_h + st.padding_bottom;
     cur.x = cur.margin_x;
@@ -1245,6 +1449,7 @@ fn push_control(
             h: 0,
             focused: false,
             checked: false,
+            elem_idx: node.elem_idx,
         });
         return;
     }
@@ -1301,6 +1506,7 @@ fn push_control(
         h,
         focused: false,
         checked: false,
+        elem_idx: node.elem_idx,
     });
     cur.y += h + 6;
     cur.x = cur.margin_x;
@@ -1326,6 +1532,22 @@ fn new_line(cur: &mut Cursor) {
     cur.content_bottom = cur.content_bottom.max(cur.y);
 }
 
+/// First usable font-family name for a run: generic names (and the empty
+/// string) map to `""` = the default face; anything else is lowercased.
+fn run_family(st: &ComputedStyle) -> String {
+    let f = st.font_family.trim();
+    if f.is_empty()
+        || f.eq_ignore_ascii_case("sans-serif")
+        || f.eq_ignore_ascii_case("serif")
+        || f.eq_ignore_ascii_case("monospace")
+        || f.eq_ignore_ascii_case("system-ui")
+    {
+        String::new()
+    } else {
+        f.to_ascii_lowercase()
+    }
+}
+
 fn emit_text(
     text: &str,
     cur: &mut Cursor,
@@ -1334,6 +1556,7 @@ fn emit_text(
     link: Option<&str>,
     st: &ComputedStyle,
 ) {
+    let family = run_family(st);
     let px = st.font_size.max(8) as f32;
     let line_h = (crate::font_ttf::line_height(px) + 0.5) as i32;
     cur.line_h = cur.line_h.max(line_h.max(10));
@@ -1376,6 +1599,7 @@ fn emit_text(
             link_href: link.map(|s| s.to_string()),
             font_size: st.font_size,
             bold: st.bold,
+            font_family: family.clone(),
         });
         if let Some(href) = link {
             links.push(LinkBox {
@@ -1414,6 +1638,12 @@ pub fn hit_test_ex(layout: &Layout, x: i32, y: i32) -> Hit {
             return Hit::Link(lb.href.clone());
         }
     }
+    // JS-interactive elements: topmost = last pushed wins among overlaps.
+    for eb in layout.elem_boxes.iter().rev() {
+        if x >= eb.x && x < eb.x + eb.w && y >= eb.y && y < eb.y + eb.h {
+            return Hit::Elem(eb.elem_idx);
+        }
+    }
     for f in layout.frames.iter().rev() {
         if x >= f.x && x < f.x + f.w && y >= f.y && y < f.y + f.h {
             return Hit::Embed(f.index);
@@ -1443,6 +1673,7 @@ pub enum CursorKind {
 pub fn cursor_at(layout: &Layout, x: i32, y: i32) -> CursorKind {
     match hit_test_ex(layout, x, y) {
         Hit::Link(_) => CursorKind::Pointer,
+        Hit::Elem(_) => CursorKind::Pointer,
         Hit::Embed(i) => {
             if let Some(f) = layout.frames.get(i) {
                 if f.kind == EmbedKind::Video || f.kind == EmbedKind::Iframe {
@@ -1666,6 +1897,68 @@ mod tests {
         let top = lay.runs.iter().find(|r| r.text.contains("Top")).unwrap();
         let bot = lay.runs.iter().find(|r| r.text.contains("Bot")).unwrap();
         assert!(bot.y > top.y, "column flex: Bot.y={} Top.y={}", bot.y, top.y);
+    }
+
+    #[test_case]
+    fn elem_box_recorded_and_hit() {
+        // A stamped interactive div gets an ElemBox and Hit::Elem at its point.
+        let mut doc = html::parse(
+            r#"<html><body><div id="btn" onclick="go()">Click me</div></body></html>"#,
+        );
+        crate::browser::js::stamp_elem_indices(&mut doc.root);
+        // Find the stamped index of the div.
+        fn find_idx(n: &html::Node) -> Option<usize> {
+            if n.tag_name() == Some("div") {
+                return n.elem_idx;
+            }
+            n.children.iter().find_map(find_idx)
+        }
+        let di = find_idx(&doc.root).expect("div stamped");
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let interactive = [di];
+        let lay = layout_document_ex(&doc.root, &sheet, 320, 200, &interactive);
+        assert!(
+            lay.elem_boxes.iter().any(|e| e.elem_idx == di),
+            "elem_boxes: {:?}",
+            lay.elem_boxes
+        );
+        let eb = lay.elem_boxes.iter().find(|e| e.elem_idx == di).unwrap();
+        assert_eq!(
+            hit_test_ex(&lay, eb.x + 1, eb.y + 1),
+            Hit::Elem(di),
+            "hit at ({},{})",
+            eb.x + 1,
+            eb.y + 1
+        );
+        assert_eq!(cursor_at(&lay, eb.x + 1, eb.y + 1), CursorKind::Pointer);
+        // Non-interactive layout of the same DOM records no elem boxes.
+        let lay2 = layout_document(&doc.root, &sheet, 320, 200);
+        assert!(lay2.elem_boxes.is_empty());
+    }
+
+    #[test_case]
+    fn bg_box_and_srcset_recorded() {
+        let doc = html::parse(
+            r#"<html><head><style>
+              #hero { background-image: url("bg.png"); background-repeat: no-repeat; }
+            </style></head><body>
+            <div id="hero">Hero</div>
+            <img srcset="a.png 480w, b.png 800w" src="fallback.png">
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, 640, 400);
+        assert!(
+            lay.bg_boxes.iter().any(|b| b.src == "bg.png" && b.repeat == "no-repeat"),
+            "bg_boxes: {:?}",
+            lay.bg_boxes
+        );
+        // 640px viewport picks the 800w candidate.
+        assert!(
+            lay.images.iter().any(|im| im.src == "b.png"),
+            "images: {:?}",
+            lay.images.iter().map(|i| i.src.clone()).collect::<Vec<_>>()
+        );
     }
 
     #[test_case]

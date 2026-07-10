@@ -48,6 +48,13 @@ pub enum NodeKind {
         /// `width=` / `height=` presentational hints (px).
         width_attr: Option<i32>,
         height_attr: Option<i32>,
+        /// `rel=` on `<link>` / `<a>` (stylesheet, icon, …).
+        rel: Option<String>,
+        /// `srcset=` on `<img>` / `<source>` (responsive candidates).
+        srcset: Option<String>,
+        /// Event-handler attributes: any `on*` name (lowercased) with its
+        /// value, e.g. `("onclick", "doThing()")`.
+        on_attrs: Vec<(String, String)>,
     },
     Text(String),
 }
@@ -56,6 +63,9 @@ pub enum NodeKind {
 pub struct Node {
     pub kind: NodeKind,
     pub children: Vec<Node>,
+    /// Slot for a stable element index assigned by later passes (JS DOM
+    /// binding); the parser always leaves it `None`.
+    pub elem_idx: Option<usize>,
 }
 
 impl Node {
@@ -80,8 +90,12 @@ impl Node {
                 sandbox: None,
                 width_attr: None,
                 height_attr: None,
+                rel: None,
+                srcset: None,
+                on_attrs: Vec::new(),
             },
             children: Vec::new(),
+            elem_idx: None,
         }
     }
 
@@ -89,6 +103,7 @@ impl Node {
         Node {
             kind: NodeKind::Text(s.into()),
             children: Vec::new(),
+            elem_idx: None,
         }
     }
 
@@ -100,6 +115,30 @@ impl Node {
     }
 }
 
+/// A `<script>` element captured with its open-tag attributes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptTag {
+    /// `src=` (external script) — `None` for inline bodies.
+    pub src: Option<String>,
+    /// Inline body text (empty for most `src=` scripts).
+    pub body: String,
+    /// Bare `async` attribute present.
+    pub async_: bool,
+    /// Bare `defer` attribute present.
+    pub defer: bool,
+    /// `type="module"`.
+    pub module: bool,
+}
+
+/// One stylesheet source in document order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StyleSrc {
+    /// A `<style>` block body.
+    Inline(String),
+    /// A `<link rel="stylesheet" href=…>` URL (as written, unresolved).
+    External(String),
+}
+
 #[derive(Clone, Debug)]
 pub struct Document {
     pub title: String,
@@ -107,27 +146,65 @@ pub struct Document {
     pub node_count: usize,
     /// Concatenated CSS from `<style>` blocks.
     pub stylesheets: String,
-    /// Each `<script>` body (no src= external yet).
+    /// Each inline `<script>` body (no src=) — legacy shape.
     pub scripts: Vec<String>,
+    /// Every `<script>` tag (inline + external) with attributes, in order.
+    pub script_tags: Vec<ScriptTag>,
+    /// Stylesheet sources — `<style>` and `<link rel=stylesheet>` — in
+    /// exact document order (by byte offset in the source HTML).
+    pub styles_ordered: Vec<StyleSrc>,
 }
 
 /// Extract `<style>` / `<script>` / `<noscript>` contents; return cleaned HTML.
+/// Legacy shape (concatenated styles, all script bodies); rich callers use
+/// [`extract_assets_rich`].
 pub fn extract_assets(html: &str) -> (String, String, Vec<String>) {
+    let (cleaned, styles, tags, _ordered) = extract_assets_rich(html);
+    let scripts = tags
+        .into_iter()
+        .filter(|t| t.src.is_none())
+        .map(|t| t.body)
+        .collect();
+    (cleaned, styles, scripts)
+}
+
+/// Rich extraction: cleaned HTML, concatenated inline CSS, all `<script>`
+/// tags with parsed attributes, and every stylesheet source (inline
+/// `<style>` + `<link rel=stylesheet>`) in exact document order.
+pub fn extract_assets_rich(html: &str) -> (String, String, Vec<ScriptTag>, Vec<StyleSrc>) {
     let mut styles = String::new();
-    let mut scripts = Vec::new();
-    let mut s = html.to_string();
-    s = take_blocks(&s, "style", &mut |body| {
+    let mut ordered: Vec<(usize, StyleSrc)> = Vec::new();
+    let mut tags: Vec<ScriptTag> = Vec::new();
+    // Style pass runs on the original text, so recorded offsets line up with
+    // the link scan below.
+    let s = take_blocks_attrs(html, "style", &mut |off, _attrs, body| {
         styles.push_str(body);
         styles.push('\n');
+        ordered.push((off, StyleSrc::Inline(body.to_string())));
     });
-    s = take_blocks(&s, "script", &mut |body| {
-        scripts.push(body.to_string());
+    let s = take_blocks_attrs(&s, "script", &mut |_off, attrs, body| {
+        tags.push(parse_script_tag(attrs, body));
     });
-    s = take_blocks(&s, "noscript", &mut |_| {});
-    (s, styles, scripts)
+    let cleaned = take_blocks(&s, "noscript", &mut |_| {});
+    for (off, href) in scan_link_stylesheets(html) {
+        ordered.push((off, StyleSrc::External(href)));
+    }
+    ordered.sort_by_key(|(off, _)| *off); // stable: offsets are unique anyway
+    let styles_ordered = ordered.into_iter().map(|(_, s)| s).collect();
+    (cleaned, styles, tags, styles_ordered)
 }
 
 fn take_blocks(html: &str, tag: &str, on_body: &mut dyn FnMut(&str)) -> String {
+    take_blocks_attrs(html, tag, &mut |_off, _attrs, body| on_body(body))
+}
+
+/// Like [`take_blocks`], but hands the callback the byte offset of the open
+/// tag in `html` and the raw open-tag attribute text alongside the body.
+fn take_blocks_attrs(
+    html: &str,
+    tag: &str,
+    on_block: &mut dyn FnMut(usize, &str, &str),
+) -> String {
     let lower = html.to_ascii_lowercase();
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
@@ -141,10 +218,12 @@ fn take_blocks(html: &str, tag: &str, on_body: &mut dyn FnMut(&str)) -> String {
             let after_l = &rest_l[i..];
             // Find end of open tag `>`
             let gt = after.find('>').unwrap_or(0);
+            let attrs = if gt > open.len() { &after[open.len()..gt] } else { "" };
             let after_open = &after[gt + 1..];
             let after_open_l = &after_l[gt + 1..];
             if let Some(j) = after_open_l.find(&close) {
-                on_body(&after_open[..j]);
+                let off = html.len() - rest.len() + i;
+                on_block(off, attrs, &after_open[..j]);
                 let next = gt + 1 + j + close.len();
                 rest = &after[next..];
                 rest_l = &after_l[next..];
@@ -159,6 +238,189 @@ fn take_blocks(html: &str, tag: &str, on_body: &mut dyn FnMut(&str)) -> String {
     out
 }
 
+/// Parse open-tag attribute text into (lowercased name, value) pairs.
+/// Bare attributes (`async`) get an empty value; values may be `"…"`,
+/// `'…'`, or bare-until-whitespace.
+fn parse_tag_attrs(s: &str) -> Vec<(String, String)> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+            i += 1;
+        }
+        let ns = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'/'
+        {
+            i += 1;
+        }
+        if i == ns {
+            // Stray `=` or end — skip a byte to guarantee progress.
+            i += 1;
+            continue;
+        }
+        let name = s[ns..i].to_ascii_lowercase();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut value = String::new();
+        if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let q = bytes[i];
+                i += 1;
+                let vs = i;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+                value = s[vs..i].to_string();
+                if i < bytes.len() {
+                    i += 1;
+                }
+            } else {
+                let vs = i;
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                value = s[vs..i].to_string();
+            }
+        }
+        out.push((name, value));
+    }
+    out
+}
+
+/// Build a [`ScriptTag`] from open-tag attribute text + body.
+fn parse_script_tag(attrs: &str, body: &str) -> ScriptTag {
+    let mut src = None;
+    let mut async_ = false;
+    let mut defer = false;
+    let mut module = false;
+    for (k, v) in parse_tag_attrs(attrs) {
+        match k.as_str() {
+            "src" if !v.is_empty() => src = Some(v),
+            "async" => async_ = true,
+            "defer" => defer = true,
+            "type" => module = v.trim().eq_ignore_ascii_case("module"),
+            _ => {}
+        }
+    }
+    ScriptTag {
+        src,
+        body: body.to_string(),
+        async_,
+        defer,
+        module,
+    }
+}
+
+/// Scan `html` for `<link rel~="stylesheet" href=…>` tags; return
+/// `(byte offset, href)` per hit. The `rel` match is a case-insensitive
+/// whitespace-separated word match.
+fn scan_link_stylesheets(html: &str) -> Vec<(usize, String)> {
+    let lower = html.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(i) = lower[pos..].find("<link") {
+        let off = pos + i;
+        let after = &html[off + 5..];
+        // Tag-name boundary: `<linkage>` must not match.
+        let boundary_ok = after
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_whitespace() || c == '>' || c == '/')
+            .unwrap_or(false);
+        let gt = after
+            .find('>')
+            .map(|g| off + 5 + g)
+            .unwrap_or(html.len());
+        if boundary_ok {
+            let pairs = parse_tag_attrs(&html[off + 5..gt]);
+            let rel_ok = pairs.iter().any(|(k, v)| {
+                k == "rel"
+                    && v.split_ascii_whitespace()
+                        .any(|w| w.eq_ignore_ascii_case("stylesheet"))
+            });
+            if rel_ok {
+                if let Some((_, href)) = pairs.iter().find(|(k, v)| k == "href" && !v.is_empty()) {
+                    out.push((off, href.clone()));
+                }
+            }
+        }
+        pos = if gt > off + 5 { gt } else { off + 5 };
+    }
+    out
+}
+
+/// Pick a candidate URL from an `srcset` attribute value for viewport width
+/// `vw` (px). Width descriptors (`480w`): smallest width ≥ `vw`, else the
+/// largest available. Density descriptors (`2x`, none = `1x`): prefer `1x`,
+/// else the first candidate.
+pub fn pick_srcset_candidate(srcset: &str, vw: i32) -> Option<String> {
+    struct Cand {
+        url: String,
+        w: Option<i32>,
+        x: f32,
+    }
+    let mut cands: Vec<Cand> = Vec::new();
+    for part in srcset.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let mut it = part.split_ascii_whitespace();
+        let Some(url) = it.next() else { continue };
+        let desc = it.next().unwrap_or("");
+        let mut w = None;
+        let mut x = 1.0f32; // no descriptor = 1x per the HTML spec
+        if let Some(num) = desc.strip_suffix(['w', 'W']) {
+            w = num.parse::<i32>().ok();
+        } else if let Some(num) = desc.strip_suffix(['x', 'X']) {
+            x = num.parse::<f32>().unwrap_or(1.0);
+        }
+        cands.push(Cand {
+            url: url.to_string(),
+            w,
+            x,
+        });
+    }
+    if cands.is_empty() {
+        return None;
+    }
+    if cands.iter().any(|c| c.w.is_some()) {
+        // Smallest width descriptor that still covers the viewport.
+        let mut best: Option<&Cand> = None;
+        for c in cands.iter().filter(|c| c.w.is_some()) {
+            let cw = c.w.unwrap();
+            match best {
+                Some(b) if b.w.unwrap() >= vw => {
+                    if cw >= vw && cw < b.w.unwrap() {
+                        best = Some(c);
+                    }
+                }
+                Some(b) => {
+                    if cw >= vw || cw > b.w.unwrap() {
+                        best = Some(c);
+                    }
+                }
+                None => best = Some(c),
+            }
+        }
+        return best.map(|c| c.url.clone());
+    }
+    // Density-only list: prefer an exact 1x, else the first candidate.
+    if let Some(c) = cands.iter().find(|c| c.x == 1.0) {
+        return Some(c.url.clone());
+    }
+    cands.first().map(|c| c.url.clone())
+}
+
 /// Parse HTML into a [`Document`] (styles/scripts extracted, not in the tree).
 pub fn parse(html: &str) -> Document {
     let slice = if html.len() > MAX_HTML_BYTES {
@@ -166,11 +428,17 @@ pub fn parse(html: &str) -> Document {
     } else {
         html
     };
-    let (cleaned, stylesheets, scripts) = extract_assets(slice);
+    let (cleaned, stylesheets, script_tags, styles_ordered) = extract_assets_rich(slice);
+    let scripts: Vec<String> = script_tags
+        .iter()
+        .filter(|t| t.src.is_none())
+        .map(|t| t.body.clone())
+        .collect();
     let prep = preprocess(&cleaned);
     let mut root = Node {
         kind: NodeKind::Document,
         children: Vec::new(),
+        elem_idx: None,
     };
     let mut stack: Vec<*mut Node> = alloc::vec![&mut root as *mut Node];
     let mut node_count = 1usize;
@@ -223,6 +491,9 @@ pub fn parse(html: &str) -> Document {
                         sandbox,
                         width_attr,
                         height_attr,
+                        rel,
+                        srcset,
+                        on_attrs,
                         tag,
                         ..
                     } = &mut n.kind
@@ -265,6 +536,11 @@ pub fn parse(html: &str) -> Document {
                             "sandbox" => *sandbox = Some(val),
                             "width" => *width_attr = val.parse().ok(),
                             "height" => *height_attr = val.parse().ok(),
+                            "rel" => *rel = Some(val),
+                            "srcset" => *srcset = Some(val),
+                            k if k.starts_with("on") => {
+                                on_attrs.push((k.to_string(), val))
+                            }
                             _ => {}
                         }
                     }
@@ -344,6 +620,8 @@ pub fn parse(html: &str) -> Document {
         node_count,
         stylesheets,
         scripts,
+        script_tags,
+        styles_ordered,
     }
 }
 
@@ -676,5 +954,156 @@ mod tests {
     fn decode_entities_basic() {
         assert_eq!(decode_entities("a&amp;b&lt;c&gt;"), "a&b<c>");
         assert_eq!(decode_entities("&#65;"), "A");
+    }
+
+    #[test_case]
+    fn script_tags_attr_mix() {
+        let doc = parse(concat!(
+            r#"<html><head>"#,
+            r#"<script>inline1()</script>"#,
+            r#"<script src="a.js" async></script>"#,
+            r#"<script src='b.js' defer></script>"#,
+            r#"<script type="module">mod()</script>"#,
+            r#"</head><body></body></html>"#,
+        ));
+        assert_eq!(doc.script_tags.len(), 4);
+        let t = &doc.script_tags[0];
+        assert_eq!(t.src, None);
+        assert_eq!(t.body, "inline1()");
+        assert!(!t.async_ && !t.defer && !t.module);
+        let t = &doc.script_tags[1];
+        assert_eq!(t.src.as_deref(), Some("a.js"));
+        assert!(t.async_ && !t.defer);
+        let t = &doc.script_tags[2];
+        assert_eq!(t.src.as_deref(), Some("b.js"));
+        assert!(t.defer && !t.async_);
+        let t = &doc.script_tags[3];
+        assert_eq!(t.src, None);
+        assert!(t.module);
+        assert_eq!(t.body, "mod()");
+        // Legacy view: inline bodies only.
+        assert_eq!(doc.scripts, alloc::vec!["inline1()".to_string(), "mod()".to_string()]);
+    }
+
+    #[test_case]
+    fn styles_ordered_interleaving() {
+        let doc = parse(concat!(
+            r#"<html><head>"#,
+            r#"<style>p{color:red}</style>"#,
+            r#"<LINK REL="Stylesheet icon" href="x.css">"#,
+            r#"<style>q{color:blue}</style>"#,
+            r#"</head><body></body></html>"#,
+        ));
+        assert_eq!(doc.styles_ordered.len(), 3);
+        assert_eq!(
+            doc.styles_ordered[0],
+            StyleSrc::Inline("p{color:red}".to_string())
+        );
+        assert_eq!(doc.styles_ordered[1], StyleSrc::External("x.css".to_string()));
+        assert_eq!(
+            doc.styles_ordered[2],
+            StyleSrc::Inline("q{color:blue}".to_string())
+        );
+        // Legacy concatenation unchanged.
+        assert!(doc.stylesheets.contains("color:red"));
+        assert!(doc.stylesheets.contains("color:blue"));
+        // Non-stylesheet links don't register.
+        let d2 = parse(r#"<html><head><link rel="icon" href="f.ico"></head><body></body></html>"#);
+        assert!(d2.styles_ordered.is_empty());
+    }
+
+    #[test_case]
+    fn on_attrs_and_rel_srcset_captured() {
+        let doc = parse(concat!(
+            r#"<html><body>"#,
+            r#"<button onclick="doThing()" onmouseover='hover()'>Go</button>"#,
+            r#"<img srcset="a.png 480w, b.png 800w" src="a.png">"#,
+            r#"<link rel="stylesheet" href="s.css">"#,
+            r#"</body></html>"#,
+        ));
+        fn find<'a>(n: &'a Node, want: &str) -> Option<&'a Node> {
+            if n.tag_name() == Some(want) {
+                return Some(n);
+            }
+            for c in &n.children {
+                if let Some(m) = find(c, want) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        let b = find(&doc.root, "button").expect("button");
+        match &b.kind {
+            NodeKind::Element { on_attrs, .. } => {
+                assert_eq!(
+                    on_attrs.as_slice(),
+                    &[
+                        ("onclick".to_string(), "doThing()".to_string()),
+                        ("onmouseover".to_string(), "hover()".to_string()),
+                    ]
+                );
+            }
+            _ => panic!(),
+        }
+        let img = find(&doc.root, "img").expect("img");
+        match &img.kind {
+            NodeKind::Element { srcset, .. } => {
+                assert_eq!(srcset.as_deref(), Some("a.png 480w, b.png 800w"));
+            }
+            _ => panic!(),
+        }
+        let link = find(&doc.root, "link").expect("link");
+        match &link.kind {
+            NodeKind::Element { rel, href, .. } => {
+                assert_eq!(rel.as_deref(), Some("stylesheet"));
+                assert_eq!(href.as_deref(), Some("s.css"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test_case]
+    fn srcset_picker_cases() {
+        // Width descriptors: smallest >= vw.
+        assert_eq!(
+            pick_srcset_candidate("a.png 480w, b.png 800w, c.png 1200w", 600),
+            Some("b.png".to_string())
+        );
+        // Nothing covers vw: largest available.
+        assert_eq!(
+            pick_srcset_candidate("a.png 480w, b.png 800w", 2000),
+            Some("b.png".to_string())
+        );
+        // Exact match counts.
+        assert_eq!(
+            pick_srcset_candidate("a.png 480w, b.png 800w", 480),
+            Some("a.png".to_string())
+        );
+        // Density: prefer 1x (bare candidate counts as 1x).
+        assert_eq!(
+            pick_srcset_candidate("hi.png 2x, lo.png 1x", 999),
+            Some("lo.png".to_string())
+        );
+        assert_eq!(
+            pick_srcset_candidate("base.png, hi.png 2x", 0),
+            Some("base.png".to_string())
+        );
+        // No 1x: first candidate.
+        assert_eq!(
+            pick_srcset_candidate("hi.png 2x, hi3.png 3x", 0),
+            Some("hi.png".to_string())
+        );
+        assert_eq!(pick_srcset_candidate("  ", 100), None);
+    }
+
+    #[test_case]
+    fn elem_idx_defaults_none() {
+        assert_eq!(Node::element("div").elem_idx, None);
+        assert_eq!(Node::text("hi").elem_idx, None);
+        let doc = parse("<html><body><p>Hi</p></body></html>");
+        fn all_none(n: &Node) -> bool {
+            n.elem_idx.is_none() && n.children.iter().all(all_none)
+        }
+        assert!(all_none(&doc.root));
     }
 }

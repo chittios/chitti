@@ -234,6 +234,10 @@ impl JsDom {
     pub fn from_document(doc: &super::html::Document) -> Self {
         let mut elements = Vec::new();
         collect_elems(&doc.root, &mut elements);
+        // Parent/child links (same pre-order walk as collect_elems) so event
+        // dispatch can bubble target → ancestors → document → window.
+        let mut next = 0usize;
+        link_parents_walk(&doc.root, None, &mut next, &mut elements);
         JsDom {
             title: doc.title.clone(),
             log: Vec::new(),
@@ -286,6 +290,64 @@ impl JsDom {
     }
 }
 
+/// Stamp each tree node with its `collect_elems` ordinal (`Node.elem_idx`), so
+/// layout can associate boxes with `JsDom.elements` indices without a fragile
+/// synced counter — identity travels with the node. Pre-order, the exact
+/// `collect_elems` visit rule. Nodes that already carry an index (inserted for
+/// JS-created elements by [`commit_to_tree`]) keep it, and still consume their
+/// ordinal slot so following siblings stay aligned.
+pub fn stamp_elem_indices(root: &mut Node) {
+    let mut next = 0usize;
+    stamp_walk(root, &mut next);
+}
+
+fn stamp_walk(n: &mut Node, next: &mut usize) {
+    if let NodeKind::Element { tag, .. } = &n.kind {
+        if !matches!(tag.as_str(), "script" | "style" | "noscript") {
+            // Only PARSED nodes consume ordinals — nodes pre-stamped by the
+            // created-element insertion pass sit outside the parse order, and
+            // counting them would shift every parsed element after them.
+            if n.elem_idx.is_none() {
+                n.elem_idx = Some(*next);
+                *next += 1;
+            }
+        }
+    }
+    for c in &mut n.children {
+        stamp_walk(c, next);
+    }
+}
+
+/// Populate `ElemRef.parent`/`children` links by walking the tree with the
+/// exact `collect_elems` visit rule (pre-order, skipping script/style/
+/// noscript), assigning the same indices `collect_elems` produced.
+fn link_parents_walk(
+    n: &Node,
+    parent: Option<usize>,
+    next: &mut usize,
+    elements: &mut [ElemRef],
+) {
+    let mut my_idx = parent;
+    if let NodeKind::Element { tag, .. } = &n.kind {
+        if !matches!(tag.as_str(), "script" | "style" | "noscript") {
+            let i = *next;
+            *next += 1;
+            if let Some(e) = elements.get_mut(i) {
+                e.parent = parent;
+            }
+            if let Some(p) = parent {
+                if let Some(pe) = elements.get_mut(p) {
+                    pe.children.push(i);
+                }
+            }
+            my_idx = Some(i);
+        }
+    }
+    for c in &n.children {
+        link_parents_walk(c, my_idx, next, elements);
+    }
+}
+
 fn collect_elems(n: &Node, out: &mut Vec<ElemRef>) {
     if let NodeKind::Element {
         tag,
@@ -295,6 +357,7 @@ fn collect_elems(n: &Node, out: &mut Vec<ElemRef>) {
         value,
         width_attr,
         height_attr,
+        on_attrs,
         ..
     } = &n.kind
     {
@@ -316,6 +379,11 @@ fn collect_elems(n: &Node, out: &mut Vec<ElemRef>) {
             }
             if let Some(s) = style_attr {
                 attrs.insert(String::from("style"), s.clone());
+            }
+            // Inline event-handler attributes (`onclick="…"`) — dispatch runs
+            // these at the target phase.
+            for (k, v) in on_attrs {
+                attrs.insert(k.clone(), v.clone());
             }
             out.push(ElemRef {
                 tag: tag.clone(),
@@ -527,6 +595,89 @@ pub fn apply_canvases_to_layout(dom: &JsDom, lay: &mut super::layout::Layout) {
 /// Apply JS DOM mutations back onto the live tree (text + style_attr).
 /// Matches elements by `id` first (stable), then by pre-order index — same
 /// spirit as LibWeb binding a JS wrapper to a DOM node identity.
+/// Full DOM→tree commit for the persistent-page path: stamp parse-order
+/// element indices, apply element state (text/style), then INSERT nodes for
+/// JS-created elements (`createElement` + `appendChild`) so they lay out,
+/// paint, and hit-test like parsed ones.
+pub fn commit_full(root: &mut Node, dom: &JsDom) {
+    stamp_elem_indices(root);
+    commit_to_tree(root, dom);
+    insert_created_elems(root, dom);
+}
+
+/// Append tree nodes for elements that exist in `dom.elements` but have no
+/// stamped node in the parsed tree (JS-created). Parents may themselves be
+/// created, so iterate until stable (bounded).
+fn insert_created_elems(root: &mut Node, dom: &JsDom) {
+    for _round in 0..4 {
+        let mut inserted = false;
+        for (i, er) in dom.elements.iter().enumerate() {
+            let Some(p) = er.parent else { continue };
+            if find_mut_by_elem_idx(root, i).is_some() {
+                continue; // already in the tree (parsed or previously inserted)
+            }
+            let Some(parent_node) = find_mut_by_elem_idx(root, p) else { continue };
+            let mut n = Node {
+                kind: NodeKind::Element {
+                    tag: er.tag.clone(),
+                    href: (!er.href.is_empty()).then(|| er.href.clone()),
+                    alt: None,
+                    src: (!er.src.is_empty()).then(|| er.src.clone()),
+                    id: er.id.clone(),
+                    class: er.class.clone(),
+                    style_attr: (!er.style.is_empty()).then(|| er.style.clone()),
+                    name: None,
+                    value: (!er.value.is_empty()).then(|| er.value.clone()),
+                    input_type: (!er.type_attr.is_empty()).then(|| er.type_attr.clone()),
+                    action: None,
+                    method: None,
+                    placeholder: None,
+                    srcdoc: None,
+                    target: None,
+                    sandbox: None,
+                    width_attr: None,
+                    height_attr: None,
+                    rel: None,
+                    srcset: None,
+                    on_attrs: er
+                        .attrs
+                        .iter()
+                        .filter(|(k, _)| k.starts_with("on"))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                },
+                children: Vec::new(),
+                elem_idx: Some(i),
+            };
+            if !er.text.is_empty() {
+                n.children.push(Node::text(er.text.clone()));
+            }
+            parent_node.children.push(n);
+            inserted = true;
+        }
+        if !inserted {
+            break;
+        }
+    }
+}
+
+/// Locate the tree node stamped with element index `i`.
+fn find_mut_by_elem_idx(n: &mut Node, i: usize) -> Option<&mut Node> {
+    if n.elem_idx == Some(i) {
+        return Some(n);
+    }
+    let n_ptr = n as *mut Node;
+    // SAFETY: single-threaded tree walk; at most one exclusive ref returned
+    // (same pattern as `find_mut_by_id` above).
+    let n = unsafe { &mut *n_ptr };
+    for c in n.children.iter_mut() {
+        if let Some(hit) = find_mut_by_elem_idx(c, i) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
 pub fn commit_to_tree(root: &mut Node, dom: &JsDom) {
     for er in &dom.elements {
         if let Some(id) = er.id.as_deref() {

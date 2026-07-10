@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""Web compatibility report for Chitti browser:
-  - TC39 test262 subset (via chitti-js-runner / js_bc)
-  - CSS property matrix (Google popularity ∩ our support, css.tobyase.de style)
+"""Web compatibility report for ChittiOS browser:
+  - TC39 test262 (via chitti-just-runner / the primary `just` ES6 tier)
+  - TC39 test262 (via chitti-js-runner / legacy js_bc bytecode VM)
+  - CSS property matrix — support is **auto-derived from `kernel/src/browser/css.rs`**
+    (never a hand-maintained list), and each property is classed as *applied*
+    (writes a ComputedStyle field, so it affects rendering) vs *recognized-only*
+    (a parsed-but-no-op arm) — the gap that makes coverage look high while pages
+    still render wrong.
   - WebAssembly testsuite smoke (magic + binary modules + wast inventory)
 
 Writes tools/webcompat/REPORT.md and prints summary.
@@ -10,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -19,230 +25,65 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent.parent
 JS_RUNNER = ROOT / "js_runner"
-TEST262 = ROOT / "test262" / "test" / "language"
+JUST_RUNNER = ROOT / "just_runner"
+TEST262_ROOT = ROOT / "test262" / "test"
+TEST262 = TEST262_ROOT / "language"
+CSS_RS = REPO / "kernel" / "src" / "browser" / "css.rs"
 WASM_TS = ROOT / "wasm-testsuite"
 REPORT = ROOT / "REPORT.md"
 
-# CSS properties Chitti browser::css currently understands (keep in sync with css.rs apply_one).
-CHITTI_CSS = {
-    "color",
-    "background",
-    "background-color",
-    "background-image",
-    "background-size",
-    "background-position",
-    "background-repeat",
-    "font-size",
-    "font-weight",
-    "font-family",
-    "margin",
-    "margin-top",
-    "margin-bottom",
-    "margin-left",
-    "margin-right",
-    "padding",
-    "padding-top",
-    "padding-bottom",
-    "padding-left",
-    "padding-right",
-    "display",
-    "text-align",
-    "width",
-    "height",
-    "max-width",
-    "max-height",
-    "min-width",
-    "min-height",
-    "line-height",
-    "opacity",
-    "border",
-    "border-color",
-    "border-width",
-    "border-style",
-    "border-radius",
-    "outline",
-    "outline-color",
-    "visibility",
-    "position",
-    "top",
-    "left",
-    "right",
-    "bottom",
-    "z-index",
-    "overflow",
-    "overflow-x",
-    "overflow-y",
-    "box-sizing",
-    "cursor",
-    "float",
-    "clear",
-    "white-space",
-    "text-decoration",
-    "list-style",
-    "list-style-type",
-    "transform",
-    "transition",
-    "animation",
-    "filter",
-    "backdrop-filter",
-    "box-shadow",
-    "content",
-    "vertical-align",
-    "object-fit",
-    "aspect-ratio",
-    "flex-direction",
-    "flex-wrap",
-    "flex-grow",
-    "flex-shrink",
-    "flex-basis",
-    "flex",
-    "gap",
-    "row-gap",
-    "column-gap",
-    "justify-content",
-    "justify-items",
-    "justify-self",
-    "align-items",
-    "align-content",
-    "align-self",
-    "order",
-    "place-items",
-    "place-content",
-    "grid-template-columns",
-    "grid-template-rows",
-    "grid-auto-flow",
-    "grid-gap",
-    "grid-column",
-    "grid-row",
-    "grid-area",
-    "font-style",
-    "font",
-    "border-top",
-    "border-bottom",
-    "border-left",
-    "border-right",
-    "border-top-left-radius",
-    "border-top-right-radius",
-    "border-bottom-left-radius",
-    "border-bottom-right-radius",
-    "text-transform",
-    "letter-spacing",
-    "word-break",
-    "word-wrap",
-    "overflow-wrap",
-    "text-overflow",
-    "user-select",
-    "pointer-events",
-    "appearance",
-    "transform-origin",
-    "direction",
-    "clip",
-    "outline-offset",
-    "border-collapse",
-    "animation-duration",
-    "animation-timing-function",
-    "transition-duration",
-    "background-clip",
-    "background-origin",
-    "fill",
-    # previously top-missing popular set
-    "src",
-    "variable",
-    "alias-webkit-user-select",
-    "alias-webkit-appearance",
-    "webkit-tap-highlight-color",
-    "webkit-font-smoothing",
-    "alias-webkit-transform",
-    "alias-webkit-text-size-adjust",
-    "alias-word-wrap",
-    "alias-webkit-transition",
-    "font-display",
-    "webkit-box-orient",
-    "unicode-range",
-    "clip-path",
-    "stroke-width",
-    "touch-action",
-    "webkit-line-clamp",
-    "border-bottom-color",
-    "animation-name",
-    "text-shadow",
-    "border-top-color",
-    "transition-property",
-    "inset",
-    "alias-webkit-box-sizing",
-    "stroke",
-    "scrollbar-width",
-    "will-change",
-    "transition-timing-function",
-    "webkit-box-pack",
-    "border-bottom-width",
-    "border-top-width",
-    "animation-delay",
-    "resize",
-    "alias-webkit-box-shadow",
-    "text-indent",
-    "border-left-color",
-    "alias-webkit-animation",
-    "alias-webkit-justify-content",
-    "text-rendering",
-    "border-right-color",
-    "webkit-user-select",
-    "webkit-appearance",
-    "webkit-transform",
-    "webkit-text-size-adjust",
-    "webkit-transition",
-    "webkit-animation",
-    "webkit-box-sizing",
-    "webkit-box-shadow",
-    "webkit-justify-content",
-    "border-left-width",
-    "border-right-width",
-    "transition-delay",
-    "zoom",
-    "border-spacing",
-    "flex-flow",
-    "font-stretch",
-    "outline-width",
-    "animation-fill-mode",
-    "webkit-box-align",
-    "font-feature-settings",
-    "font-variant",
-    "stroke-dashoffset",
-    "margin-inline-start",
-    "alias-webkit-mask-image",
-    "margin-inline-end",
-    "stroke-dasharray",
-    "animation-iteration-count",
-    "mask-image",
-    "outline-style",
-    "padding-inline",
-    "padding-inline-start",
-    "webkit-box-flex",
-    "backface-visibility",
-    "alias-webkit-align-items",
-    "text-wrap",
-    "text-decoration-line",
-    "contain",
-    "text-size-adjust",
-    "padding-block",
-    "alias-webkit-border-radius",
-    "color-scheme",
-    "webkit-box-direction",
-    "padding-inline-end",
-    "font-variation-settings",
-    "alias-webkit-flex-direction",
-    "inset-inline-start",
-    "border-bottom-style",
-    "scroll-behavior",
-    "mask",
-    "object-position",
-    "alias-webkit-transform-origin",
-    "forced-color-adjust",
-    "table-layout",
-    "container-type",
-    "overscroll-behavior",
-    "alias-webkit-filter",
-}
+
+def extract_css_support() -> dict:
+    """Parse `browser/css.rs::apply_one` for the properties the engine actually
+    handles, classifying each as *applied* (its match arm writes a `st.` /
+    ComputedStyle field, hence affects rendering) or *recognized-only* (a
+    parsed-but-no-op arm). Also pulls `canonicalize_prop` alias source names.
+    Returns {"applied": set, "noop": set, "aliases": set, "all": set}.
+    """
+    if not CSS_RS.exists():
+        return {"applied": set(), "noop": set(), "aliases": set(), "all": set(),
+                "error": f"css.rs not found at {CSS_RS}"}
+    src = CSS_RS.read_text()
+    m = re.search(r"fn apply_one\(.*?\n\}", src, re.S)
+    body = m.group(0) if m else ""
+    # Match each top-level (8-space-indented) match arm header. A header may
+    # list several `|`-separated names. Slice each arm's block as the text
+    # between its header and the next header (or the end) — robust to nested
+    # `match`/braces inside an arm, which the previous brace-walker mis-counted.
+    arm_re = re.compile(
+        r'^        ((?:"[a-z][a-z0-9-]*"\s*(?:\|\s*)?)+)=>',
+        re.M,
+    )
+    matches = list(arm_re.finditer(body))
+    applied: dict[str, bool] = {}
+    for idx, mm in enumerate(matches):
+        names = re.findall(r'"([a-z][a-z0-9-]*)"', mm.group(1))
+        start = mm.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(body)
+        block = body[start:end]
+        # "applied" = the arm writes a ComputedStyle field (`st.foo…`), delegates
+        # to a shorthand expander, or sets a style field via a helper.
+        writes = bool(re.search(r"\bst\.\w", block)) or "apply_one(" in block
+        for p in names:
+            applied[p] = applied.get(p, False) or writes
+    aliases = set()
+    mc = re.search(r"fn canonicalize_prop\(.*?\n\}", src, re.S)
+    if mc:
+        aliases = set(re.findall(r'"([a-z][a-z0-9-]*)"\s*(?:\||=>)', mc.group(0)))
+    applied_set = {p for p, w in applied.items() if w}
+    noop_set = {p for p, w in applied.items() if not w}
+    # CSS custom properties (`--name`) are handled by an early prefix guard, not
+    # a match arm; chromestatus reports them under the synthetic name "variable".
+    if 'starts_with("--")' in src:
+        applied_set.add("variable")
+        noop_set.discard("variable")
+    return {
+        "applied": applied_set,
+        "noop": noop_set,
+        "aliases": aliases,
+        "all": set(applied.keys()) | aliases,
+    }
+
 
 
 def run(cmd, cwd=None, timeout=300):
@@ -258,6 +99,49 @@ def build_js_runner() -> Path | None:
         return None
     p = JS_RUNNER / "target" / "release" / "chitti-js-runner"
     return p if p.exists() else None
+
+
+def build_just_runner() -> Path | None:
+    r = run(["cargo", "build", "--release"], cwd=JUST_RUNNER, timeout=600)
+    if r.returncode != 0:
+        print("just_runner build failed:\n", r.stderr[-2000:], file=sys.stderr)
+        return None
+    p = JUST_RUNNER / "target" / "release" / "chitti-just-runner"
+    return p if p.exists() else None
+
+
+def run_just_test262(bin_path: Path) -> dict:
+    """Run the whole test262 `language/` tree through the `just` tier in one
+    shot (the harness walks directories itself and prints a summary line)."""
+    if not TEST262.exists():
+        return {"error": "test262 not cloned", "pass": 0, "fail": 0, "skip": 0}
+    r = run([str(bin_path), str(TEST262)], timeout=1200)
+    out = (r.stdout or "") + (r.stderr or "")
+    pass_n = fail_n = skip_n = panics = 0
+    fail_samples, skip_samples = [], []
+    for line in out.splitlines():
+        if line.startswith("PASS "):
+            pass_n += 1
+        elif line.startswith("FAIL "):
+            fail_n += 1
+            if len(fail_samples) < 40:
+                fail_samples.append(line[5:])
+        elif line.startswith("SKIP "):
+            skip_n += 1
+            if len(skip_samples) < 20:
+                skip_samples.append(line[5:])
+    m = re.search(r"panics=(\d+)", out)
+    if m:
+        panics = int(m.group(1))
+    return {
+        "pass": pass_n,
+        "fail": fail_n,
+        "skip": skip_n,
+        "panics": panics,
+        "total_files": pass_n + fail_n + skip_n,
+        "fail_samples": fail_samples,
+        "skip_samples": skip_samples,
+    }
 
 
 def run_test262(bin_path: Path) -> dict:
@@ -335,17 +219,31 @@ def fetch_css_popularity() -> list[tuple[str, float]]:
 
 
 def css_matrix() -> dict:
+    css = extract_css_support()
+    all_props = css["all"]
+    applied = css["applied"] | css["aliases"]  # aliases forward to an applied prop
+    noop = css["noop"]
     pop = fetch_css_popularity()
-    supported = [(n, p) for n, p in pop if n in CHITTI_CSS]
-    missing = [(n, p) for n, p in pop if n not in CHITTI_CSS]
+    # A popular property counts as "supported" only when its arm actually writes
+    # a ComputedStyle field (recognized-only/no-op arms don't affect rendering).
+    supported = [(n, p) for n, p in pop if n in applied]
+    recognized_only = [(n, p) for n, p in pop if n in noop]
+    missing = [(n, p) for n, p in pop if n not in all_props]
     return {
         "popular_n": len(pop),
         "supported": supported,
+        "recognized_only": recognized_only,
         "missing": missing[:80],
         "supported_count": len(supported),
+        "recognized_only_count": len(recognized_only),
         "missing_count": len(missing),
-        "chitti_props": sorted(CHITTI_CSS),
-        "source": "chromestatus csspopularity ∩ CHITTI_CSS (tobyase.de methodology)",
+        "chitti_props": sorted(applied),
+        "noop_props": sorted(noop),
+        "applied_total": len(applied),
+        "noop_total": len(noop),
+        "error": css.get("error"),
+        "source": "chromestatus csspopularity ∩ css.rs::apply_one (auto-derived; "
+        "'supported' = arm writes a ComputedStyle field)",
     }
 
 
@@ -583,59 +481,144 @@ def wasm_suite() -> dict:
     }
 
 
-def main():
-    lines = ["# Chitti webcompat report", ""]
-    lines.append(f"Generated by `tools/webcompat/run_all.py`")
+def emit_test262_section(lines, title, blurb, js):
+    lines.append(title)
     lines.append("")
-
-    # JS
-    print("Building js_runner…")
-    bin_path = build_js_runner()
-    js = {}
-    if bin_path:
-        print("Running test262 subset…")
-        js = run_test262(bin_path)
-    else:
-        js = {"error": "js_runner build failed", "pass": 0, "fail": 0, "skip": 0}
-    lines.append("## TC39 test262 (filtered subset via js_bc)")
-    lines.append("")
+    if blurb:
+        lines.append(blurb)
+        lines.append("")
     if "error" in js and js.get("pass", 0) == 0 and not js.get("total_files"):
         lines.append(f"**Error:** {js['error']}")
-    else:
-        runnable = js.get("pass", 0) + js.get("fail", 0)
-        rate = 100.0 * js.get("pass", 0) / runnable if runnable else 0
-        lines.append(f"- Files scanned: **{js.get('total_files', 0)}**")
-        lines.append(f"- PASS: **{js.get('pass', 0)}**")
-        lines.append(f"- FAIL: **{js.get('fail', 0)}**")
-        lines.append(f"- SKIP (unsupported syntax): **{js.get('skip', 0)}**")
-        lines.append(f"- Pass rate (runnable): **{rate:.1f}%**")
         lines.append("")
+        return
+    runnable = js.get("pass", 0) + js.get("fail", 0)
+    rate = 100.0 * js.get("pass", 0) / runnable if runnable else 0
+    lines.append(f"- Files scanned: **{js.get('total_files', 0)}**")
+    lines.append(f"- PASS: **{js.get('pass', 0)}**")
+    lines.append(f"- FAIL: **{js.get('fail', 0)}**")
+    lines.append(f"- SKIP (unsupported syntax): **{js.get('skip', 0)}**")
+    if "panics" in js:
+        lines.append(f"- Parser panics: **{js.get('panics', 0)}**")
+    lines.append(f"- Pass rate (runnable): **{rate:.1f}%**")
+    lines.append("")
+    if js.get("fail_samples"):
         lines.append("### Sample failures")
         for s in js.get("fail_samples", [])[:25]:
             lines.append(f"- `{s[:140]}`")
         lines.append("")
+    if js.get("skip_samples"):
         lines.append("### Sample skips")
         for s in js.get("skip_samples", [])[:15]:
             lines.append(f"- `{s[:140]}`")
+        lines.append("")
+
+
+def main():
+    lines = ["# ChittiOS webcompat report", ""]
+    lines.append("Generated by `tools/webcompat/run_all.py`.")
     lines.append("")
 
-    # CSS
+    # JS — primary `just` ES6 tier (the in-kernel browser's JS engine).
+    print("Building just_runner…")
+    just_bin = build_just_runner()
+    if just_bin:
+        print("Running test262 through the just tier (this walks the full tree)…")
+        just = run_just_test262(just_bin)
+    else:
+        just = {"error": "just_runner build failed", "pass": 0, "fail": 0, "skip": 0}
+    emit_test262_section(
+        lines,
+        "## TC39 test262 — primary `just` ES6 tier",
+        "Run: `cargo run --release -p chitti-just-runner -- tools/webcompat/test262/test/language`. "
+        "This is the engine the in-kernel browser actually runs page scripts on. "
+        "Negative tests pass by throwing; `$DONOTEVALUATE` tests are parse-only; "
+        "`module`/async-harness tests are skipped.",
+        just,
+    )
+
+    # JS — legacy js_bc bytecode VM (fast path, kept as a fallback).
+    print("Building js_runner (legacy js_bc)…")
+    bin_path = build_js_runner()
+    if bin_path:
+        print("Running test262 subset via js_bc…")
+        js = run_test262(bin_path)
+    else:
+        js = {"error": "js_runner build failed", "pass": 0, "fail": 0, "skip": 0}
+    emit_test262_section(
+        lines,
+        "## TC39 test262 — legacy bytecode VM (`js_bc`)",
+        "The arithmetic/console fast path; most modern syntax is SKIP here.",
+        js,
+    )
+
+    # CSS — auto-derived from css.rs, applied vs recognized-only.
     print("CSS matrix…")
     css = css_matrix()
-    lines.append("## CSS support (css.tobyase.de methodology)")
+    lines.append("## CSS support (auto-derived from `css.rs`)")
     lines.append("")
+    if css.get("error"):
+        lines.append(f"**Error:** {css['error']}")
+        lines.append("")
     lines.append(css["source"])
     lines.append("")
+    lines.append(
+        f"- Properties with an `apply_one` arm: **{css['applied_total'] + css['noop_total']}** "
+        f"(**{css['applied_total']}** applied to ComputedStyle, "
+        f"**{css['noop_total']}** recognized-only/no-op)"
+    )
     lines.append(f"- Popular properties analyzed: **{css['popular_n']}**")
-    lines.append(f"- Supported by Chitti: **{css['supported_count']}**")
-    lines.append(f"- Missing: **{css['missing_count']}**")
+    lines.append(f"- Popular & actually applied: **{css['supported_count']}**")
+    lines.append(
+        f"- Popular but recognized-only (parsed, no render effect): "
+        f"**{css['recognized_only_count']}**"
+    )
+    lines.append(f"- Popular & missing entirely: **{css['missing_count']}**")
     if css["popular_n"]:
         lines.append(
-            f"- Coverage of popular set: **{100*css['supported_count']/css['popular_n']:.1f}%**"
+            f"- Coverage of popular set (applied): "
+            f"**{100*css['supported_count']/css['popular_n']:.1f}%**"
         )
     lines.append("")
-    lines.append("### Implemented properties")
+    if css["noop_props"]:
+        lines.append(
+            "### ⚠ Recognized-but-not-applied properties "
+            "(parsed by `apply_one` but never written to `ComputedStyle`, so they "
+            "do **not** affect rendering — the likely cause of pages that look wrong)"
+        )
+        lines.append(", ".join(f"`{p}`" for p in css["noop_props"]))
+        lines.append("")
+    if css.get("recognized_only"):
+        lines.append("### Popular properties that are recognized-only (no render effect)")
+        for n, p in css["recognized_only"][:40]:
+            lines.append(f"- `{n}` (~{p:.1f}% page loads)")
+        lines.append("")
+    lines.append("### Applied properties (write ComputedStyle → affect rendering)")
     lines.append(", ".join(f"`{p}`" for p in css["chitti_props"]))
+    lines.append("")
+    lines.append(
+        "> **Fully painted:** background colour, borders (all sides + width + "
+        "colour + style; previously computed but never drawn), `outline`, "
+        "`background`/`background-image` **gradients** (rendered as their first "
+        "stop), and `filter`/`backdrop-filter` colour transforms "
+        "(grayscale/invert/brightness/sepia/opacity). Text/box geometry, flex/"
+        "grid, margins/padding, colours, radius, opacity, etc. paint as before."
+    )
+    lines.append(
+        "> **Cascade-stored, not yet painted** (write `ComputedStyle` but need a "
+        "larger subsystem): `content` (needs `::before`/`::after` pseudo-"
+        "elements), `clear` (needs float layout — floats aren't positioned), "
+        "`background-image: url(...)` and `background-position`/`-size`/"
+        "`-repeat` (need background-image fetch/tiling), `mask`, "
+        "`object-position`, `table-layout`. These are parsed and cascade "
+        "correctly so they no longer clobber layout, but their visual effect is "
+        "pending."
+    )
+    lines.append("")
+    lines.append(
+        "> **Render resolution:** the browser lays out and paints at the action "
+        "pane's **native pixel size** (1:1 present), not a fixed 640×400 buffer "
+        "upscaled to the pane — the previous source of pixelated/soft text."
+    )
     lines.append("")
     lines.append("### Top missing popular properties")
     for n, p in css["missing"][:40]:
@@ -663,21 +646,24 @@ def main():
             for s in wasm["fail_samples"]:
                 lines.append(f"- {s}")
     lines.append("")
-    lines.append("## JS engine notes (vs test262 harness)")
+    lines.append("## JS engine notes")
     lines.append("")
     lines.append(
-        "- **test262 harness** runs `js_bc` (bytecode). Remaining SKIPs need "
-        "`instanceof`/`Date`/`eval`/`class`/prototypes/async/etc."
+        "- **Primary tier — `just` ES6 interpreter** (`third_party/just-ref`, "
+        "no_std): the engine the in-kernel browser runs page scripts on. Parser "
+        "(vendored Pest) + tree-walking interpreter + builtins; supports classes/"
+        "inheritance, closures, generators, destructuring (incl. defaults), "
+        "`eval`/`Function`, var hoisting, Map/Set/Date/RegExp/Promise/Proxy/"
+        "Reflect, numeric separators, and anonymous-function name inference."
     )
     lines.append(
-        "- **Bytecode `js_bc`**: function, for, try/catch (shallow), return, throw, "
-        "`new Number|String|Boolean|Object|Array|Error`, `.length`/`.toString`/`.valueOf`, "
-        "NaN/Infinity globals, parseInt/isNaN."
+        "- **Legacy tier — `js_bc` bytecode VM**: the arithmetic/console fast "
+        "path, kept as a fallback for trivial scripts."
     )
     lines.append(
-        "- **Full engine `browser::js` + DOM**: createElement/appendChild/removeChild/"
-        "querySelector(All)/getElementsBy*/classList/dataset/attrs/events/innerHTML/"
-        "Node tree links; plus arrow/class/BigInt/RegExp/objects/arrays."
+        "- **DOM binding** (`browser::js_just`): document/window/location/style/"
+        "classList/canvas/fetch/postMessage/storage wired through the just "
+        "PluginResolver; page JS is sandboxed (no Synapse/fs/net)."
     )
     lines.append(
         "- **Native Cranelift JIT** from just is **not** in-kernel (no_std, dual-arch, no RWX)."
