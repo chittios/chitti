@@ -147,27 +147,30 @@ label_identifier__yield = @{ "yield" | identifier }
 // The second production is for cases where the identifier is like 'thisIsMe'
 identifier = @{ !reserved_keyword ~ identifier_name | reserved_keyword ~ identifier_part+ }
 primary_expression = {
-    identifier_reference
+    // ChittiOS: keyword-led forms tried before identifier_reference so an
+    // `async function(){}` expression isn't mis-read as the identifier `async`.
+    // (These rules fail fast on a plain identifier — no `function`/`class` kw.)
+    generator_expression
+    | function_expression
+    | class_expression
+    | identifier_reference
     | literal
     | this_exp
     | array_literal
     | object_literal
-    | generator_expression
-    | function_expression
-    | class_expression
     | regular_expression_literal
     | template_literal
     | cover_parenthesized_expression_and_arrow_parameter_list
 }
 primary_expression__yield = {
-    identifier_reference__yield
+    generator_expression
+    | function_expression
+    | class_expression__yield
+    | identifier_reference__yield
     | literal
     | this_exp
     | array_literal__yield
     | object_literal__yield
-    | generator_expression
-    | function_expression
-    | class_expression__yield
     | regular_expression_literal
     | template_literal__yield
     | cover_parenthesized_expression_and_arrow_parameter_list__yield
@@ -268,18 +271,12 @@ template_spans__yield = _{ template_middle_list__yield ~ template_tail | templat
 template_middle_list = _{ (template_middle ~ expression__in)+ }
 template_middle_list__yield = _{ (template_middle ~ expression__in_yield)+ }
 member_expression = {
-    (
-    (super_property | meta_property | primary_expression)
+    (super_property | meta_property | ("new" ~s~ new_member_expression ~s~ arguments) | primary_expression)
     ~ (s~ "[" ~s~ expression__in ~s~ "]" | "." ~s~ identifier_name | template_literal)*
-    )
-    | "new" ~s~ new_member_expression ~s~ arguments
 }
 member_expression__yield = {
-    (
-    (super_property__yield | meta_property | primary_expression__yield)
+    (super_property__yield | meta_property | ("new" ~s~ new_member_expression__yield ~s~ arguments__yield) | primary_expression__yield)
     ~ (s~ "[" ~s~ expression__in_yield ~s~ "]" | "." ~s~ identifier_name | template_literal__yield)*
-    )
-    | "new" ~s~ new_member_expression__yield ~s~ arguments__yield
 }
 new_member_expression = { member_expression }
 new_member_expression__yield = { member_expression__yield }
@@ -917,16 +914,16 @@ function_body__yield = { function_statement_list__yield }
 function_statement_list = _{ statement_list__return? }
 function_statement_list__yield = _{ statement_list__yield_return? }
 arrow_function = {
-    arrow_parameters ~ !line_terminator ~ "=>" ~s~ concise_body
+    ("async" ~ s)? ~ arrow_parameters ~ !line_terminator ~ "=>" ~s~ concise_body
 }
 arrow_function__in = {
-    arrow_parameters ~ !line_terminator ~ "=>" ~s~ concise_body__in
+    ("async" ~ s)? ~ arrow_parameters ~ !line_terminator ~ "=>" ~s~ concise_body__in
 }
 arrow_function__yield = {
-    arrow_parameters__yield ~ !line_terminator ~ "=>" ~s~ concise_body
+    ("async" ~ s)? ~ arrow_parameters__yield ~ !line_terminator ~ "=>" ~s~ concise_body
 }
 arrow_function__in_yield = {
-    arrow_parameters__yield ~ !line_terminator ~ "=>" ~s~ concise_body__in
+    ("async" ~ s)? ~ arrow_parameters__yield ~ !line_terminator ~ "=>" ~s~ concise_body__in
 }
 arrow_parameters = {
     binding_identifier

@@ -218,6 +218,8 @@ pub enum ExpressionType {
         meta: Meta,
         params: Vec<PatternType>,
         body: Box<FunctionBodyOrExpression>,
+        /// ChittiOS: `async () => …` — the call wraps its result in a Promise.
+        is_async: bool,
     },
     YieldExpression {
         meta: Meta,
@@ -397,7 +399,7 @@ impl HasMeta for ExpressionType {
                     )
                     .to_string()
             }
-            ExpressionType::ArrowFunctionExpression { meta, params, body } => {
+            ExpressionType::ArrowFunctionExpression { meta, params, body, .. } => {
                 format_struct("ExpressionType::ArrowFunctionExpression")
                     .add_fields("meta", meta.to_formatted_string(script))
                     .add_fields(

@@ -253,7 +253,7 @@ impl JsDom {
     }
 
     /// Ensure a canvas 2d buffer exists for element `i` (default 300×150).
-    fn ensure_canvas(&mut self, i: usize) -> &mut super::canvas::Canvas2d {
+    pub(crate) fn ensure_canvas(&mut self, i: usize) -> &mut super::canvas::Canvas2d {
         if !self.canvases.contains_key(&i) {
             let (w, h) = self
                 .elements
@@ -392,13 +392,31 @@ pub fn run_scripts(dom: &mut JsDom, scripts: &[String]) -> Vec<String> {
         .map(|m| (Some(m.data.clone()), Some(m.origin.clone())))
         .unwrap_or((None, None));
 
-    // NB: DOM scripts still run on the legacy `js.rs` engine below — its DOM is
-    // more complete than the `just` `DomResolver` (which covers document/
-    // getElementById/querySelector/createElement/title/innerText/className/
-    // setAttribute/appendChild but not classList/childElementCount/live queries).
-    // The `just` DOM tier (`super::js_just::run_scripts_via_just`) is implemented
-    // + tested and can become primary once the rest of the DOM surface is
-    // ported; auto-routing it now would regress complete-DOM pages.
+    // Primary DOM tier: run the whole batch on `just` with LIVE DOM bindings —
+    // now including canvas 2D (getContext/fillRect/…), fetch (→ fetch_log +
+    // Promise<Response>), window/parent postMessage, and a WebAssembly stub, in
+    // addition to element/document/window/location/style/classList. It parses
+    // everything first, so a parse failure returns false with the DOM untouched
+    // → clean fallback to the legacy engine below.
+    let uses_dom = scripts.iter().any(|s| {
+        s.contains("document")
+            || s.contains("localStorage")
+            || s.contains("sessionStorage")
+            || s.contains("window")
+            || s.contains("location")
+            || s.contains("fetch")
+            || s.contains("postMessage")
+            || s.contains("parent")
+            || s.contains("getContext")
+            || s.contains("canvas")
+            || s.contains("WebAssembly")
+    });
+    if uses_dom && super::js_just::run_scripts_via_just(dom, scripts) {
+        super::events::EVENT_LOOP.with(|el| {
+            el.drain(16);
+        });
+        return dom.log.clone();
+    }
 
     for s in scripts {
         // A script that touches DOM / storage / fetch / postMessage / canvas
@@ -3337,7 +3355,7 @@ fn json_parse_simple(s: &str) -> Val {
 }
 
 /// Network for `fetch` — real loader outside unit tests; stub inside.
-fn host_fetch(method: &str, url: &str, body: &str) -> String {
+pub(crate) fn host_fetch(method: &str, url: &str, body: &str) -> String {
     #[cfg(test)]
     {
         let _ = (method, body);

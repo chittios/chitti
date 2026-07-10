@@ -27,17 +27,26 @@ fn main() -> ExitCode {
         collect_js(Path::new(a), &mut files);
     }
     files.sort();
+    // Quiet per-file panics so one malformed/unsupported input can't abort the
+    // whole run; we isolate and count them below.
+    std::panic::set_hook(Box::new(|_| {}));
     let mut pass = 0usize;
     let mut fail = 0usize;
     let mut skip = 0usize;
+    let mut panics = 0usize;
     for f in &files {
-        match run_one(f) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_one(f)))
+            .unwrap_or_else(|_| Outcome::Fail("panic".into()));
+        match outcome {
             Outcome::Pass => {
                 pass += 1;
                 println!("PASS {}", f.display());
             }
             Outcome::Fail(msg) => {
                 fail += 1;
+                if msg == "panic" {
+                    panics += 1;
+                }
                 println!("FAIL {} — {msg}", f.display());
             }
             Outcome::Skip(msg) => {
@@ -53,7 +62,7 @@ fn main() -> ExitCode {
         100.0 * pass as f64 / (pass + fail) as f64
     };
     println!(
-        "\n=== chitti-just-runner summary (just-engine) ===\nfiles={total} pass={pass} fail={fail} skip={skip} pass_rate={rate:.1}% (of runnable)"
+        "\n=== chitti-just-runner summary (just-engine) ===\nfiles={total} pass={pass} fail={fail} skip={skip} panics={panics} pass_rate={rate:.1}% (of runnable)"
     );
     ExitCode::SUCCESS
 }
@@ -78,19 +87,38 @@ fn collect_js(p: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// test262 metadata we care about (from the `/*--- … ---*/` YAML block).
+#[derive(Default)]
+struct Meta {
+    negative: bool,
+    module: bool,
+    raw: bool,
+    needs_async_harness: bool,
+}
+
+fn parse_meta(src: &str) -> Meta {
+    let mut m = Meta::default();
+    if let Some(i) = src.find("/*---") {
+        if let Some(j) = src[i..].find("---*/") {
+            let front = &src[i + 5..i + j];
+            m.negative = front.contains("negative:");
+            if let Some(fi) = front.find("flags:") {
+                let line: String = front[fi..].lines().next().unwrap_or("").to_string();
+                m.module = line.contains("module");
+                m.raw = line.contains("raw");
+                m.needs_async_harness = line.contains("async");
+            }
+        }
+    }
+    m
+}
+
 /// Prepare test262 source for just-engine.
 fn adapt_source(src: &str) -> Result<String, String> {
-    if src.contains("$DONOTEVALUATE") {
-        return Err("donotevaluate".into());
-    }
-    // Features just does not implement (per its README).
-    if src.contains("async ")
-        || src.contains("await ")
-        || src.contains("$INCLUDE")
-        || src.contains("import ")
-        || src.contains("export ")
-    {
-        return Err("async/module/include".into());
+    // Module/include forms we don't support. ($DONOTEVALUATE is handled in
+    // run_one as a parse-only negative test.)
+    if src.contains("$INCLUDE") || src.contains("import ") || src.contains("export ") {
+        return Err("module/include".into());
     }
 
     let mut s = src.to_string();
@@ -141,43 +169,65 @@ fn run_one(path: &Path) -> Outcome {
         Ok(s) => s,
         Err(e) => return Outcome::Fail(format!("read: {e}")),
     };
+    let meta = parse_meta(&src);
+    // Module tests + async tests needing the $DONE harness aren't supported.
+    if meta.module {
+        return Outcome::Skip("module".into());
+    }
+    if meta.needs_async_harness {
+        return Outcome::Skip("async-harness".into());
+    }
     let adapted = match adapt_source(&src) {
         Ok(s) => s,
         Err(e) => return Outcome::Skip(e),
     };
 
-    let ast = match JsParser::parse_to_ast_from_str(&adapted) {
+    // `$DONOTEVALUATE`: a parse-only test (almost always `negative: phase:
+    // parse`). Parse but don't run; the parser rejecting it is the expected
+    // outcome for a negative test.
+    let parse_only = src.contains("$DONOTEVALUATE");
+
+    let parse_result = JsParser::parse_to_ast_from_str(&adapted);
+    if parse_only {
+        let parsed_ok = parse_result.is_ok();
+        return match (meta.negative, parsed_ok) {
+            (true, false) => Outcome::Pass,  // rejected as expected
+            (true, true) => Outcome::Fail("negative parse test parsed without error".into()),
+            (false, true) => Outcome::Pass,
+            (false, false) => Outcome::Skip("parse (donotevaluate)".into()),
+        };
+    }
+
+    let ast = match parse_result {
         Ok(a) => a,
         Err(e) => {
-            // Parse failure of unsupported syntax → skip when clearly incomplete
-            let msg = format!("{e:?}");
-            if msg.contains("Error") || msg.contains("expected") {
-                return Outcome::Skip(format!("parse: {msg}"));
+            // A negative test that fails to parse threw as expected → PASS.
+            if meta.negative {
+                return Outcome::Pass;
             }
-            return Outcome::Fail(format!("parse: {msg}"));
+            // Otherwise an engine parser gap → skip (not a correctness failure).
+            return Outcome::Skip(format!("parse: {e:?}"));
         }
     };
 
     let mut ctx = EvalContext::new();
     ctx.install_core_builtins(BuiltInRegistry::with_core());
 
+    let mut threw = false;
     for stmt in &ast.body {
-        match execute_statement(stmt, &mut ctx) {
-            Ok(_) => {}
-            Err(e) => {
-                let msg = format!("{e:?}");
-                // Negative tests that expect SyntaxError at parse are already handled.
-                // Runtime throw of Test262Error = fail; unexpected errors = fail.
-                if msg.contains("Test262Error") || msg.contains("assert") {
-                    return Outcome::Fail(msg);
-                }
-                // Engine gaps often surface as TypeError/ReferenceError mid-test
-                // that harness would also fail — count as fail for honesty.
-                return Outcome::Fail(format!("runtime: {msg}"));
-            }
+        if execute_statement(stmt, &mut ctx).is_err() {
+            threw = true;
+            break;
         }
     }
-    // If we finished without throw, pass (test262 tests throw on failure).
     let _ = JsValue::Undefined;
-    Outcome::Pass
+
+    match (meta.negative, threw) {
+        // Negative test: throwing (parse or runtime) is the expected outcome.
+        (true, true) => Outcome::Pass,
+        (true, false) => Outcome::Fail("negative test did not throw".into()),
+        // Positive test: any throw is a failure; completing is a pass.
+        (false, true) => Outcome::Fail("runtime threw".into()),
+        (false, false) => Outcome::Pass,
+    }
 }

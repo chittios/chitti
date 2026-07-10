@@ -122,8 +122,8 @@ pub fn evaluate_expression(
             Err(JErrorType::TypeError("Meta property not yet implemented".to_string()))
         }
 
-        ExpressionType::ArrowFunctionExpression { params, body, .. } => {
-            create_arrow_function_object(params, body, ctx)
+        ExpressionType::ArrowFunctionExpression { params, body, is_async, .. } => {
+            create_arrow_function_object(params, body, *is_async, ctx)
         }
 
         ExpressionType::MemberExpression(member_expr) => {
@@ -975,10 +975,7 @@ pub fn call_function_object(
                         // Restore environment before returning error
                         ctx.lex_env = saved_lex_env;
                         ctx.var_env = saved_var_env;
-                        return Err(JErrorType::TypeError(format!(
-                            "Uncaught exception: {:?}",
-                            completion.value
-                        )));
+                        return Err(JErrorType::Thrown(completion.value.clone().unwrap_or(JsValue::Undefined)));
                     }
                     CompletionType::Break | CompletionType::Continue | CompletionType::Yield => {
                         // These shouldn't escape function body
@@ -1115,6 +1112,14 @@ fn get_property_with_receiver(
     prop_name: &str,
     ctx: &mut EvalContext,
 ) -> ValueResult {
+    // ChittiOS: native-backed property (live DOM element view).
+    if let Some(node) = native_node(lookup_target) {
+        if let Some(np) = ctx.native_props.clone() {
+            if let Some(val) = np.get(node, prop_name) {
+                return Ok(val);
+            }
+        }
+    }
     // ChittiOS: Proxy `get` trap.
     if let Some((target, handler)) = proxy_parts(lookup_target) {
         let trap = get_own_prop_value(&handler, "get");
@@ -1294,10 +1299,7 @@ fn call_function_with_body(
                 ctx.lex_env = saved_lex_env;
                 ctx.var_env = saved_var_env;
                 ctx.global_this = saved_this;
-                return Err(JErrorType::TypeError(format!(
-                    "Uncaught exception: {:?}",
-                    completion.value
-                )));
+                return Err(JErrorType::Thrown(completion.value.clone().unwrap_or(JsValue::Undefined)));
             }
             CompletionType::Break | CompletionType::Continue | CompletionType::Yield => {
                 result_completion = completion;
@@ -1647,6 +1649,14 @@ fn set_property_with_ctx(
     new_value: JsValue,
     ctx: &mut EvalContext,
 ) -> Result<(), JErrorType> {
+    // ChittiOS: native-backed property (live DOM element view).
+    if let Some(node) = native_node(value) {
+        if let Some(np) = ctx.native_props.clone() {
+            if np.set(node, prop_name, new_value.clone()) {
+                return Ok(());
+            }
+        }
+    }
     // ChittiOS: Proxy `set` trap.
     if let Some((target, handler)) = proxy_parts(value) {
         let trap = get_own_prop_value(&handler, "set");
@@ -2426,14 +2436,18 @@ impl SimpleFunctionObject {
             }
         }
 
-        // ChittiOS: concise arrow body `x => expr` — evaluate and return the expr.
+        // ChittiOS: concise arrow body `x => expr` — evaluate and return the expr
+        // (an `async` concise arrow wraps the result in a resolved Promise).
         if !self.expr_body_ptr.is_null() {
             let expr = unsafe { &*self.expr_body_ptr };
             let out = evaluate_expression(expr, ctx);
             ctx.lex_env = saved_lex_env;
             ctx.var_env = saved_var_env;
             ctx.global_this = saved_this;
-            return out;
+            return match out {
+                Ok(v) if self.is_async => Ok(crate::runner::std_lib::promise::resolve_value(v)),
+                other => other,
+            };
         }
 
         let body = unsafe { &*self.body_ptr };
@@ -2454,10 +2468,7 @@ impl SimpleFunctionObject {
                     ctx.lex_env = saved_lex_env;
                     ctx.var_env = saved_var_env;
                     ctx.global_this = saved_this;
-                    return Err(JErrorType::TypeError(format!(
-                        "Uncaught exception: {:?}",
-                        completion.value
-                    )));
+                    return Err(JErrorType::Thrown(completion.value.clone().unwrap_or(JsValue::Undefined)));
                 }
                 CompletionType::Break | CompletionType::Continue | CompletionType::Yield => {
                     result_completion = completion;
@@ -2568,6 +2579,16 @@ pub fn builtin_type_name(v: &JsValue) -> String {
             }
         }
         _ => "Object".to_string(),
+    }
+}
+
+/// If `v` carries an `__native_node__` integer (a host-backed object such as a
+/// live DOM element view), return the node id.
+pub fn native_node(v: &JsValue) -> Option<i64> {
+    match get_own_prop_value(v, "__native_node__") {
+        Some(JsValue::Number(JsNumberType::Integer(n))) => Some(n),
+        Some(JsValue::Number(JsNumberType::Float(f))) => Some(f as i64),
+        _ => None,
     }
 }
 
@@ -2697,6 +2718,7 @@ pub fn invoke_constructor(
 pub fn create_arrow_function_object(
     params: &Vec<PatternType>,
     body: &crate::parser::ast::FunctionBodyOrExpression,
+    is_async: bool,
     ctx: &EvalContext,
 ) -> ValueResult {
     use crate::parser::ast::FunctionBodyOrExpression;
@@ -2708,9 +2730,9 @@ pub fn create_arrow_function_object(
         FunctionBodyOrExpression::FunctionBody(fbd) => (fbd as *const _, core::ptr::null()),
         FunctionBodyOrExpression::Expression(expr) => (core::ptr::null(), expr as *const _),
     };
-    let func_obj =
+    let mut func_obj =
         SimpleFunctionObject::new_arrow(body_ptr, expr_ptr, params_ptr, ctx.lex_env.clone());
-    let mut func_obj = func_obj;
+    func_obj.is_async = is_async;
     // Callable marker (same as ordinary functions).
     func_obj.base.properties.insert(
         PropertyKey::Str("__simple_function__".to_string()),
@@ -2899,10 +2921,7 @@ impl GeneratorObject {
                             ctx.lex_env = saved_lex_env;
                             ctx.var_env = saved_var_env;
                             self.state = GeneratorState::Completed;
-                            return Err(JErrorType::TypeError(format!(
-                                "Uncaught exception: {:?}",
-                                completion.value
-                            )));
+                            return Err(JErrorType::Thrown(completion.value.clone().unwrap_or(JsValue::Undefined)));
                         }
                         _ => {
                             result_value = completion.get_value();

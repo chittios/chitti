@@ -769,6 +769,8 @@ fn error_to_js_value(err: &JErrorType) -> JsValue {
         JErrorType::SyntaxError(msg) => JsValue::String(format!("SyntaxError: {}", msg)),
         JErrorType::RangeError(msg) => JsValue::String(format!("RangeError: {}", msg)),
         JErrorType::YieldValue(v) => v.clone(),
+        // A user `throw <value>` — hand the ORIGINAL value to `catch (e)`.
+        JErrorType::Thrown(v) => v.clone(),
     }
 }
 

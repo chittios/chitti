@@ -92,18 +92,18 @@ fn display_value(v: &JsValue) -> String {
 }
 
 // ============================================================================
-// Stage D: DOM bindings via a `PluginResolver`.
+// Stage D: LIVE DOM bindings — the `just` DOM tier is primary for DOM scripts.
 //
-// The DOM lives Rust-side in `JsDom`/`ElemRef` (integer-handle model). To run a
-// DOM script on `just` we (1) move the `JsDom` into an `Rc<RefCell<>>` the
-// resolver shares, (2) expose `document`/`window`/`location`/`localStorage` and
-// element wrappers, (3) let the script read/write wrapper properties as normal
-// JS objects, then (4) **sync** each wrapper's fields back into the `JsDom`.
-// This needs no interpreter changes — wrappers are ordinary `just` objects.
+// `DomProps` (a `NativeProps`) backs element / document / window / location /
+// style property get/set directly against a shared `Rc<RefCell<JsDom>>`, so
+// reads and writes are LIVE (a `querySelector` after `el.className='x'` sees
+// it, `childElementCount` reflects `appendChild` immediately). Methods route
+// through `DomResolver` (`PluginResolver`) keyed by `__builtin_name__`. Element
+// wrappers carry `__native_node__` = element index + `__builtin_name__`. There
+// is NO end-of-run sync — every mutation hits the JsDom immediately.
 //
-// Security: the resolver exposes ONLY the sandboxed `JsDom` (same surface the
-// hand-rolled engine touches). No Synapse/fs/net — the determinism/taint
-// boundary is unchanged.
+// Security: only the sandboxed JsDom is exposed — no Synapse / fs / net. The
+// determinism/taint boundary is unchanged.
 // ============================================================================
 
 use alloc::rc::Rc;
@@ -111,24 +111,25 @@ use alloc::vec;
 use core::cell::RefCell;
 use just_engine::runner::ds::error::JErrorType;
 use just_engine::runner::ds::value::JsNumberType;
-use just_engine::runner::eval::expression::{get_own_prop_value, make_array, make_object, set_own_prop};
+use just_engine::runner::eval::expression::{
+    call_value, get_own_prop_value, make_array, make_object, set_own_prop, value_is_callable,
+};
 use just_engine::runner::plugin::resolver::PluginResolver;
-use super::js::{empty_elem, ElemRef, JsDom};
+use just_engine::runner::plugin::types::NativeProps;
+use just_engine::runner::std_lib::promise;
+use super::js::{empty_elem, JsDom};
 
-/// Records of element wrappers handed to the script, to be synced back.
-type Wrappers = Rc<RefCell<Vec<(usize, JsValue)>>>;
-
-struct DomResolver {
-    dom: Rc<RefCell<JsDom>>,
-    wrappers: Wrappers,
-    document: JsValue,
-    window: JsValue,
-    location: JsValue,
-    storage: JsValue,
-}
+const STYLE_OFFSET: i64 = 1_000_000;
+const CANVAS_OFFSET: i64 = 2_000_000;
+const DOC_NODE: i64 = -1;
+const WIN_NODE: i64 = -2;
+const LOC_NODE: i64 = -3;
 
 fn s(v: &str) -> JsValue {
     JsValue::String(v.to_string())
+}
+fn num(n: i64) -> JsValue {
+    JsValue::Number(JsNumberType::Integer(n))
 }
 fn as_str(v: &JsValue) -> String {
     match v {
@@ -137,77 +138,561 @@ fn as_str(v: &JsValue) -> String {
         other => other.to_string(),
     }
 }
+fn truthy(v: &JsValue) -> bool {
+    match v {
+        JsValue::Undefined | JsValue::Null => false,
+        JsValue::Boolean(b) => *b,
+        JsValue::Number(JsNumberType::Integer(0)) => false,
+        JsValue::String(x) => !x.is_empty(),
+        _ => true,
+    }
+}
 
-/// Build a wrapper object mirroring `dom.elements[idx]`, and record it.
-fn make_elem_wrapper(dom: &JsDom, idx: usize, wrappers: &Wrappers) -> JsValue {
+fn elem_wrapper(i: usize) -> JsValue {
     let w = make_object(vec![]);
     set_own_prop(&w, "__builtin_name__", s("Element"), false);
-    set_own_prop(&w, "__elem_index__", JsValue::Number(JsNumberType::Integer(idx as i64)), false);
-    if let Some(e) = dom.elements.get(idx) {
-        set_own_prop(&w, "tagName", s(&e.tag.to_uppercase()), true);
-        set_own_prop(&w, "innerText", s(&e.text), true);
-        set_own_prop(&w, "textContent", s(&e.text), true);
-        set_own_prop(&w, "value", s(&e.value), true);
-        set_own_prop(&w, "id", s(e.id.as_deref().unwrap_or("")), true);
-        set_own_prop(&w, "className", s(e.class.as_deref().unwrap_or("")), true);
-        set_own_prop(&w, "style", s(&e.style), true);
+    set_own_prop(&w, "__native_node__", num(i as i64), false);
+    w
+}
+fn style_wrapper(i: usize) -> JsValue {
+    let w = make_object(vec![]);
+    set_own_prop(&w, "__builtin_name__", s("Style"), false);
+    set_own_prop(&w, "__native_node__", num(STYLE_OFFSET + i as i64), false);
+    set_own_prop(&w, "__style_elem__", num(i as i64), false);
+    w
+}
+fn classlist_wrapper(i: usize) -> JsValue {
+    let w = make_object(vec![]);
+    set_own_prop(&w, "__builtin_name__", s("ClassList"), false);
+    set_own_prop(&w, "__cl_node__", num(i as i64), false);
+    w
+}
+fn canvas_ctx_wrapper(i: usize) -> JsValue {
+    let w = make_object(vec![]);
+    set_own_prop(&w, "__builtin_name__", s("Canvas2d"), false);
+    set_own_prop(&w, "__native_node__", num(CANVAS_OFFSET + i as i64), false);
+    set_own_prop(&w, "__canvas_elem__", num(i as i64), false);
+    w
+}
+fn response_wrapper(body: &str) -> JsValue {
+    let r = make_object(vec![]);
+    set_own_prop(&r, "__builtin_name__", s("Response"), false);
+    set_own_prop(&r, "__body__", s(body), false);
+    set_own_prop(&r, "ok", JsValue::Boolean(true), true);
+    set_own_prop(&r, "status", num(200), true);
+    set_own_prop(&r, "statusText", s("OK"), true);
+    r
+}
+/// Bare window global functions (called as `foo(...)`, not `window.foo(...)`).
+fn is_bare_global(name: &str) -> bool {
+    matches!(
+        name,
+        "scrollTo" | "scrollBy" | "scroll" | "alert" | "confirm" | "prompt"
+            | "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval"
+            | "requestAnimationFrame" | "cancelAnimationFrame" | "queueMicrotask"
+            | "encodeURIComponent" | "decodeURIComponent" | "encodeURI" | "decodeURI"
+    )
+}
+
+fn percent_encode(input: &str, keep: &str) -> String {
+    let mut out = String::new();
+    for b in input.bytes() {
+        let c = b as char;
+        if c.is_ascii_alphanumeric() || keep.contains(c) {
+            out.push(c);
+        } else {
+            out.push('%');
+            out.push_str(&alloc::format!("{:02X}", b));
+        }
     }
-    wrappers.borrow_mut().push((idx, w.clone()));
+    out
+}
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = core::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn num_arg(v: &JsValue) -> i32 {
+    match v {
+        JsValue::Number(JsNumberType::Integer(n)) => *n as i32,
+        JsValue::Number(JsNumberType::Float(f)) => *f as i32,
+        JsValue::String(x) => x.trim().parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+fn fnum_arg(v: &JsValue) -> f32 {
+    match v {
+        JsValue::Number(JsNumberType::Integer(n)) => *n as f32,
+        JsValue::Number(JsNumberType::Float(f)) => *f as f32,
+        JsValue::String(x) => x.trim().parse().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+// --- CSS inline-style string helpers ("a: b; c: d") --------------------------
+
+fn camel_to_kebab(p: &str) -> String {
+    let mut out = String::new();
+    for c in p.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('-');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+fn style_get(decl: &str, prop: &str) -> String {
+    for part in decl.split(';') {
+        if let Some((k, v)) = part.split_once(':') {
+            if k.trim() == prop {
+                return v.trim().to_string();
+            }
+        }
+    }
+    String::new()
+}
+fn style_set(decl: &str, prop: &str, val: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut found = false;
+    for part in decl.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((k, _)) = part.split_once(':') {
+            if k.trim() == prop {
+                found = true;
+                if !val.is_empty() {
+                    out.push(format!("{}: {}", prop, val));
+                }
+                continue;
+            }
+        }
+        out.push(part.to_string());
+    }
+    if !found && !val.is_empty() {
+        out.push(format!("{}: {}", prop, val));
+    }
+    out.join("; ")
+}
+
+// --- selector matching -------------------------------------------------------
+
+fn matches_selector(e: &super::js::ElemRef, sel: &str) -> bool {
+    if let Some(id) = sel.strip_prefix('#') {
+        e.id.as_deref() == Some(id)
+    } else if let Some(cls) = sel.strip_prefix('.') {
+        e.class.as_deref().map_or(false, |c| c.split_whitespace().any(|w| w == cls))
+    } else {
+        e.tag == sel.to_ascii_lowercase()
+    }
+}
+
+// ============================================================================
+// DomProps: live property backing (NativeProps).
+// ============================================================================
+
+struct DomProps {
+    dom: Rc<RefCell<JsDom>>,
+}
+
+impl DomProps {
+    fn elem_get(&self, i: usize, prop: &str) -> Option<JsValue> {
+        let dom = self.dom.borrow();
+        let e = dom.elements.get(i)?;
+        Some(match prop {
+            "innerText" | "textContent" | "innerHTML" | "outerHTML" => s(&e.text),
+            "value" => s(&e.value),
+            "id" => s(e.id.as_deref().unwrap_or("")),
+            "className" => s(e.class.as_deref().unwrap_or("")),
+            "tagName" | "nodeName" => s(&e.tag.to_uppercase()),
+            "childElementCount" => num(e.children.len() as i64),
+            "nodeType" => num(1),
+            "checked" => JsValue::Boolean(e.checked),
+            "disabled" => JsValue::Boolean(e.disabled),
+            "hidden" => JsValue::Boolean(e.hidden),
+            "href" => s(&e.href),
+            "src" => s(&e.src),
+            "type" => s(&e.type_attr),
+            "name" => s(&e.name_attr),
+            "placeholder" => s(&e.placeholder),
+            "clientWidth" | "clientHeight" | "offsetWidth" | "offsetHeight" | "scrollTop"
+            | "scrollHeight" => num(0),
+            "style" => style_wrapper(i),
+            "classList" => classlist_wrapper(i),
+            "children" => {
+                let ws: Vec<JsValue> = e.children.iter().map(|&c| elem_wrapper(c)).collect();
+                make_array(ws)
+            }
+            "firstChild" | "firstElementChild" => {
+                e.children.first().map(|&c| elem_wrapper(c)).unwrap_or(JsValue::Null)
+            }
+            "lastChild" | "lastElementChild" => {
+                e.children.last().map(|&c| elem_wrapper(c)).unwrap_or(JsValue::Null)
+            }
+            "parentNode" | "parentElement" => {
+                e.parent.map(elem_wrapper).unwrap_or(JsValue::Null)
+            }
+            _ => return None, // not a property → let the call path route methods
+        })
+    }
+
+    fn elem_set(&self, i: usize, prop: &str, value: JsValue) -> bool {
+        let mut dom = self.dom.borrow_mut();
+        let Some(e) = dom.elements.get_mut(i) else { return false };
+        match prop {
+            "innerText" | "textContent" | "innerHTML" => e.text = as_str(&value),
+            "value" => e.value = as_str(&value),
+            "id" => e.id = Some(as_str(&value)),
+            "className" => e.class = Some(as_str(&value)),
+            "checked" => e.checked = truthy(&value),
+            "disabled" => e.disabled = truthy(&value),
+            "hidden" => e.hidden = truthy(&value),
+            "href" => e.href = as_str(&value),
+            "src" => e.src = as_str(&value),
+            _ => return false,
+        }
+        true
+    }
+
+    fn style_get(&self, i: usize, prop: &str) -> Option<JsValue> {
+        if matches!(prop, "setProperty" | "getPropertyValue" | "removeProperty") {
+            return None; // methods
+        }
+        let dom = self.dom.borrow();
+        let e = dom.elements.get(i)?;
+        if prop == "cssText" {
+            return Some(s(&e.style));
+        }
+        Some(s(&style_get(&e.style, &camel_to_kebab(prop))))
+    }
+
+    fn style_set(&self, i: usize, prop: &str, value: JsValue) -> bool {
+        let mut dom = self.dom.borrow_mut();
+        let Some(e) = dom.elements.get_mut(i) else { return false };
+        if prop == "cssText" {
+            e.style = as_str(&value);
+        } else {
+            e.style = style_set(&e.style, &camel_to_kebab(prop), &as_str(&value));
+        }
+        true
+    }
+
+    fn doc_get(&self, prop: &str) -> Option<JsValue> {
+        let dom = self.dom.borrow();
+        Some(match prop {
+            "title" => s(&dom.title),
+            "cookie" => s(""),
+            "readyState" => s("complete"),
+            "body" => dom.elements.iter().position(|e| e.tag == "body").map(elem_wrapper).unwrap_or(JsValue::Null),
+            "head" => dom.elements.iter().position(|e| e.tag == "head").map(elem_wrapper).unwrap_or(JsValue::Null),
+            "documentElement" => dom.elements.iter().position(|e| e.tag == "html").map(elem_wrapper).unwrap_or(JsValue::Null),
+            _ => return None,
+        })
+    }
+}
+
+impl DomProps {
+    fn canvas_get(&self, i: usize, prop: &str) -> Option<JsValue> {
+        match prop {
+            "lineWidth" => {
+                let dom = self.dom.borrow();
+                Some(num(dom.canvases.get(&i).map(|c| c.line_width as i64).unwrap_or(1)))
+            }
+            // fillStyle/strokeStyle/font aren't read back; methods fall through.
+            _ => None,
+        }
+    }
+    fn canvas_set(&self, i: usize, prop: &str, value: JsValue) -> bool {
+        let mut dom = self.dom.borrow_mut();
+        let c = dom.ensure_canvas(i);
+        match prop {
+            "fillStyle" => c.set_fill_style_css(&as_str(&value)),
+            "strokeStyle" => c.set_stroke_style_css(&as_str(&value)),
+            "lineWidth" => c.line_width = num_arg(&value),
+            "font" => {
+                let n: i32 = as_str(&value)
+                    .split(|ch: char| !ch.is_ascii_digit())
+                    .find(|t| !t.is_empty())
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or(14);
+                c.font_size = n as f32;
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
+impl NativeProps for DomProps {
+    fn get(&self, node: i64, prop: &str) -> Option<JsValue> {
+        if node >= CANVAS_OFFSET {
+            return self.canvas_get((node - CANVAS_OFFSET) as usize, prop);
+        }
+        if node >= STYLE_OFFSET {
+            return self.style_get((node - STYLE_OFFSET) as usize, prop);
+        }
+        match node {
+            DOC_NODE => self.doc_get(prop),
+            WIN_NODE => match prop {
+                "innerWidth" => Some(num(self.dom.borrow().inner_width as i64)),
+                "innerHeight" => Some(num(self.dom.borrow().inner_height as i64)),
+                "name" => Some(s("")),
+                _ => None,
+            },
+            LOC_NODE => match prop {
+                "href" => Some(s(&self.dom.borrow().location_href)),
+                "pathname" | "search" | "hash" | "host" | "hostname" | "protocol" => Some(s("")),
+                _ => None,
+            },
+            n if n >= 0 => self.elem_get(n as usize, prop),
+            _ => None,
+        }
+    }
+
+    fn set(&self, node: i64, prop: &str, value: JsValue) -> bool {
+        if node >= CANVAS_OFFSET {
+            return self.canvas_set((node - CANVAS_OFFSET) as usize, prop, value);
+        }
+        if node >= STYLE_OFFSET {
+            return self.style_set((node - STYLE_OFFSET) as usize, prop, value);
+        }
+        match node {
+            DOC_NODE => {
+                if prop == "title" {
+                    self.dom.borrow_mut().title = as_str(&value);
+                    true
+                } else {
+                    prop == "cookie" // swallow cookie writes
+                }
+            }
+            LOC_NODE => {
+                if prop == "href" {
+                    let href = as_str(&value);
+                    let mut dom = self.dom.borrow_mut();
+                    if href != dom.location_href {
+                        dom.navigate = Some(href);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            n if n >= 0 => self.elem_set(n as usize, prop, value),
+            _ => false,
+        }
+    }
+}
+
+// ============================================================================
+// DomResolver: globals + methods (PluginResolver).
+// ============================================================================
+
+struct DomResolver {
+    dom: Rc<RefCell<JsDom>>,
+    document: JsValue,
+    window: JsValue,
+    location: JsValue,
+    storage: JsValue,
+    session: JsValue,
+    parent: JsValue,
+    web_assembly: JsValue,
+    fetch_fn: JsValue,
+}
+
+fn global_wrapper(name: &str, node: i64) -> JsValue {
+    let w = make_object(vec![]);
+    set_own_prop(&w, "__builtin_name__", s(name), false);
+    set_own_prop(&w, "__native_node__", num(node), false);
     w
 }
 
 impl DomResolver {
-    fn new(dom: Rc<RefCell<JsDom>>, wrappers: Wrappers) -> Self {
-        let document = make_object(vec![]);
-        set_own_prop(&document, "__builtin_name__", s("document"), false);
-        set_own_prop(&document, "title", s(&dom.borrow().title), true);
-        let location = make_object(vec![]);
-        set_own_prop(&location, "__builtin_name__", s("location"), false);
-        set_own_prop(&location, "href", s(&dom.borrow().location_href), true);
+    fn new(dom: Rc<RefCell<JsDom>>) -> Self {
+        let document = global_wrapper("document", DOC_NODE);
+        let window = global_wrapper("window", WIN_NODE);
+        let location = global_wrapper("location", LOC_NODE);
         let storage = make_object(vec![]);
         set_own_prop(&storage, "__builtin_name__", s("localStorage"), false);
-        let window = make_object(vec![]);
-        set_own_prop(&window, "__builtin_name__", s("window"), false);
-        set_own_prop(&window, "location", location.clone(), true);
+        let session = make_object(vec![]);
+        set_own_prop(&session, "__builtin_name__", s("sessionStorage"), false);
+        // `parent`/`self`/`top`/`window` all reference a window-like object that
+        // routes postMessage to the parent frame.
+        let parent = make_object(vec![]);
+        set_own_prop(&parent, "__builtin_name__", s("parent"), false);
+        set_own_prop(&parent, "postMessage", JsValue::Undefined, false); // marker so member-call routes
+        let web_assembly = make_object(vec![]);
+        set_own_prop(&web_assembly, "__builtin_name__", s("WebAssembly"), false);
+        let fetch_fn = make_object(vec![]);
+        set_own_prop(&fetch_fn, "__builtin_name__", s("fetch"), false);
         set_own_prop(&window, "document", document.clone(), true);
-        DomResolver { dom, wrappers, document, window, location, storage }
+        set_own_prop(&window, "location", location.clone(), true);
+        set_own_prop(&window, "parent", parent.clone(), true);
+        set_own_prop(&window, "self", window.clone(), true);
+        set_own_prop(&window, "top", parent.clone(), true);
+        set_own_prop(&window, "localStorage", storage.clone(), true);
+        set_own_prop(&window, "sessionStorage", session.clone(), true);
+        DomResolver { dom, document, window, location, storage, session, parent, web_assembly, fetch_fn }
     }
 
-    fn find_by_id(&self, id: &str) -> Option<usize> {
-        self.dom.borrow().elements.iter().position(|e| e.id.as_deref() == Some(id))
-    }
-    fn find_by_selector(&self, sel: &str) -> Option<usize> {
-        let dom = self.dom.borrow();
-        if let Some(id) = sel.strip_prefix('#') {
-            dom.elements.iter().position(|e| e.id.as_deref() == Some(id))
-        } else if let Some(cls) = sel.strip_prefix('.') {
-            dom.elements.iter().position(|e| e.class.as_deref().map_or(false, |c| c.split_whitespace().any(|w| w == cls)))
+    /// Parse a `fetch(url, opts)` call: (method, absolute url, body).
+    fn fetch_args(&self, args: &[JsValue]) -> (String, String, String) {
+        let url = as_str(args.get(0).unwrap_or(&JsValue::Undefined));
+        let mut method = String::from("GET");
+        let mut body = String::new();
+        if let Some(opts) = args.get(1) {
+            if let Some(m) = get_own_prop_value(opts, "method") {
+                let m = as_str(&m);
+                if !m.is_empty() {
+                    method = m.to_uppercase();
+                }
+            }
+            if let Some(b) = get_own_prop_value(opts, "body") {
+                body = as_str(&b);
+            }
+        }
+        let base = self.dom.borrow().location_href.clone();
+        let abs = if super::url::is_http_url(&url) {
+            url.clone()
         } else {
-            let t = sel.to_ascii_lowercase();
-            dom.elements.iter().position(|e| e.tag == t)
+            super::url::resolve(&base, &url).unwrap_or(url)
+        };
+        (method, abs, body)
+    }
+
+    fn node_of(&self, this: &JsValue) -> Option<usize> {
+        // Prefer the "real element index" markers (classList/style/canvas
+        // wrappers) over `__native_node__` (which is offset for style/canvas).
+        let raw = get_own_prop_value(this, "__cl_node__")
+            .or_else(|| get_own_prop_value(this, "__style_elem__"))
+            .or_else(|| get_own_prop_value(this, "__canvas_elem__"))
+            .or_else(|| get_own_prop_value(this, "__native_node__"));
+        match raw {
+            Some(JsValue::Number(JsNumberType::Integer(n))) if n >= 0 && n < STYLE_OFFSET => Some(n as usize),
+            _ => None,
         }
     }
-
 }
 
 impl PluginResolver for DomResolver {
     fn has_binding(&self, name: &str) -> bool {
-        matches!(name, "document" | "window" | "location" | "localStorage" | "Element" | "navigator")
+        is_bare_global(name)
+            || matches!(
+                name,
+                "document" | "window" | "location" | "localStorage" | "sessionStorage"
+                    | "navigator" | "parent" | "self" | "top" | "fetch" | "WebAssembly"
+                    | "postMessage" | "Element" | "ClassList" | "Style" | "Canvas2d" | "Response"
+            )
     }
 
     fn resolve(&self, name: &str, _ctx: &mut EvalContext) -> Result<JsValue, JErrorType> {
         Ok(match name {
             "document" => self.document.clone(),
-            "window" => self.window.clone(),
+            "window" | "self" => self.window.clone(),
+            "top" | "parent" => self.parent.clone(),
             "location" => self.location.clone(),
             "localStorage" => self.storage.clone(),
+            "sessionStorage" => self.session.clone(),
+            "fetch" => self.fetch_fn.clone(),
+            "WebAssembly" => self.web_assembly.clone(),
+            "postMessage" => {
+                let f = make_object(vec![]);
+                set_own_prop(&f, "__builtin_name__", s("postMessage"), false);
+                f
+            }
             "navigator" => {
                 let n = make_object(vec![]);
                 set_own_prop(&n, "userAgent", s("ChittiOS/just"), true);
                 n
             }
+            n if is_bare_global(n) => {
+                let f = make_object(vec![]);
+                set_own_prop(&f, "__builtin_name__", s(n), false);
+                f
+            }
             _ => JsValue::Undefined,
         })
+    }
+
+    fn call_constructor(
+        &self,
+        object_name: &str,
+        ctx: &mut EvalContext,
+        args: Vec<JsValue>,
+    ) -> Option<Result<JsValue, JErrorType>> {
+        // Bare window globals invoked as functions.
+        if is_bare_global(object_name) {
+            let a0 = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+            let a1 = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let res = match object_name {
+                "scrollTo" | "scroll" => {
+                    self.dom.borrow_mut().scroll_to = Some(num_arg(&a1));
+                    JsValue::Undefined
+                }
+                "scrollBy" => {
+                    let mut dom = self.dom.borrow_mut();
+                    let cur = dom.scroll_to.unwrap_or(0);
+                    dom.scroll_to = Some(cur + num_arg(&a1));
+                    JsValue::Undefined
+                }
+                "alert" => {
+                    self.dom.borrow_mut().log.push(as_str(&a0));
+                    JsValue::Undefined
+                }
+                "confirm" => JsValue::Boolean(true),
+                "prompt" => JsValue::Null,
+                // No event loop: run the callback synchronously (best effort).
+                "setTimeout" | "setInterval" | "requestAnimationFrame" | "queueMicrotask" => {
+                    if value_is_callable(&a0) {
+                        let _ = call_value(&a0, JsValue::Undefined, vec![], ctx);
+                    }
+                    num(0)
+                }
+                "clearTimeout" | "clearInterval" | "cancelAnimationFrame" => JsValue::Undefined,
+                "encodeURIComponent" => s(&percent_encode(&as_str(&a0), "-_.!~*'()")),
+                "encodeURI" => s(&percent_encode(&as_str(&a0), "-_.!~*'();,/?:@&=+$#")),
+                "decodeURIComponent" | "decodeURI" => s(&percent_decode(&as_str(&a0))),
+                _ => JsValue::Undefined,
+            };
+            return Some(Ok(res));
+        }
+        // `fetch(url, opts)` called as a bare function → record + fetch + Promise.
+        if object_name == "fetch" {
+            let (method, url, body) = self.fetch_args(&args);
+            self.dom.borrow_mut().fetch_log.push((method.clone(), url.clone(), body.clone()));
+            let text = super::js::host_fetch(&method, &url, &body);
+            return Some(Ok(promise::resolve_value(response_wrapper(&text))));
+        }
+        // Bare `postMessage(data, targetOrigin)` == `window.postMessage` (self).
+        if object_name == "postMessage" {
+            let data = as_str(args.get(0).unwrap_or(&JsValue::Undefined));
+            let target_origin = as_str(args.get(1).unwrap_or(&JsValue::Undefined));
+            let origin = self.dom.borrow().location_href.clone();
+            self.dom.borrow_mut().outbound_messages.push(super::js::Message {
+                data,
+                origin,
+                target_origin,
+                target: "self".to_string(),
+            });
+            return Some(Ok(JsValue::Undefined));
+        }
+        None
     }
 
     fn call_method(
@@ -218,106 +703,342 @@ impl PluginResolver for DomResolver {
         this: JsValue,
         args: Vec<JsValue>,
     ) -> Option<Result<JsValue, JErrorType>> {
-        let arg0 = args.get(0).cloned().unwrap_or(JsValue::Undefined);
-        match (object_name, method_name) {
+        let a0 = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+        let a1 = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+        let res = match (object_name, method_name) {
             ("document", "getElementById") => {
-                let id = as_str(&arg0);
-                Some(Ok(match self.find_by_id(&id) {
-                    Some(i) => make_elem_wrapper(&self.dom.borrow(), i, &self.wrappers),
+                let id = as_str(&a0);
+                match self.dom.borrow().elements.iter().position(|e| e.id.as_deref() == Some(id.as_str())) {
+                    Some(i) => elem_wrapper(i),
                     None => JsValue::Null,
-                }))
+                }
             }
             ("document", "querySelector") => {
-                let sel = as_str(&arg0);
-                Some(Ok(match self.find_by_selector(&sel) {
-                    Some(i) => make_elem_wrapper(&self.dom.borrow(), i, &self.wrappers),
+                let sel = as_str(&a0);
+                match self.dom.borrow().elements.iter().position(|e| matches_selector(e, &sel)) {
+                    Some(i) => elem_wrapper(i),
                     None => JsValue::Null,
-                }))
+                }
             }
-            ("document", "querySelectorAll") | ("document", "getElementsByTagName") => {
-                let sel = as_str(&arg0);
-                let want = sel.to_ascii_lowercase();
+            ("document", "querySelectorAll")
+            | ("document", "getElementsByTagName")
+            | ("document", "getElementsByClassName") => {
+                let sel = as_str(&a0);
+                let sel = if method_name == "getElementsByClassName" {
+                    format!(".{}", sel)
+                } else if method_name == "getElementsByTagName" {
+                    sel.to_ascii_lowercase()
+                } else {
+                    sel
+                };
                 let idxs: Vec<usize> = {
                     let dom = self.dom.borrow();
                     dom.elements.iter().enumerate()
-                        .filter(|(_, e)| want == "*" || e.tag == want)
+                        .filter(|(_, e)| sel == "*" || matches_selector(e, &sel))
                         .map(|(i, _)| i).collect()
                 };
-                let items = idxs.into_iter().map(|i| make_elem_wrapper(&self.dom.borrow(), i, &self.wrappers)).collect();
-                Some(Ok(make_array(items)))
+                make_array(idxs.into_iter().map(elem_wrapper).collect())
             }
             ("document", "createElement") => {
-                let tag = as_str(&arg0);
-                let idx = {
+                let tag = as_str(&a0);
+                let mut dom = self.dom.borrow_mut();
+                dom.elements.push(empty_elem(&tag));
+                elem_wrapper(dom.elements.len() - 1)
+            }
+            ("document", "createTextNode") => {
+                let mut dom = self.dom.borrow_mut();
+                let mut e = empty_elem("#text");
+                e.text = as_str(&a0);
+                dom.elements.push(e);
+                elem_wrapper(dom.elements.len() - 1)
+            }
+            ("Element", "appendChild") | ("Element", "insertBefore") => {
+                if let (Some(p), Some(c)) = (self.node_of(&this), self.node_of(&a0)) {
                     let mut dom = self.dom.borrow_mut();
-                    dom.elements.push(empty_elem(&tag));
-                    dom.elements.len() - 1
-                };
-                Some(Ok(make_elem_wrapper(&self.dom.borrow(), idx, &self.wrappers)))
-            }
-            ("Element", "setAttribute") => {
-                if let JsValue::Object(_) = this {
-                    if let Some(JsValue::Number(JsNumberType::Integer(i))) = get_own_prop_value(&this, "__elem_index__") {
-                        let key = as_str(&arg0);
-                        let val = as_str(&args.get(1).cloned().unwrap_or(JsValue::Undefined));
-                        let mut dom = self.dom.borrow_mut();
-                        if let Some(e) = dom.elements.get_mut(i as usize) {
-                            match key.as_str() {
-                                "id" => { e.id = Some(val.clone()); set_own_prop(&this, "id", s(&val), true); }
-                                "class" => { e.class = Some(val.clone()); set_own_prop(&this, "className", s(&val), true); }
-                                _ => { e.attrs.insert(key, val); }
-                            }
-                        }
-                    }
-                }
-                Some(Ok(JsValue::Undefined))
-            }
-            ("Element", "getAttribute") => {
-                let key = as_str(&arg0);
-                if let Some(JsValue::Number(JsNumberType::Integer(i))) = get_own_prop_value(&this, "__elem_index__") {
-                    let dom = self.dom.borrow();
-                    if let Some(e) = dom.elements.get(i as usize) {
-                        return Some(Ok(e.attrs.get(&key).map(|v| s(v)).unwrap_or(JsValue::Null)));
-                    }
-                }
-                Some(Ok(JsValue::Null))
-            }
-            ("Element", "appendChild") => {
-                let child_idx = get_own_prop_value(&arg0, "__elem_index__");
-                let parent_idx = get_own_prop_value(&this, "__elem_index__");
-                if let (Some(JsValue::Number(JsNumberType::Integer(p))), Some(JsValue::Number(JsNumberType::Integer(c)))) = (parent_idx, child_idx) {
-                    let mut dom = self.dom.borrow_mut();
-                    let (p, c) = (p as usize, c as usize);
-                    if p < dom.elements.len() && c < dom.elements.len() {
+                    if p < dom.elements.len() && c < dom.elements.len() && p != c {
+                        dom.elements[p].children.retain(|&x| x != c);
                         dom.elements[p].children.push(c);
                         dom.elements[c].parent = Some(p);
                     }
                 }
-                Some(Ok(arg0))
+                a0
             }
-            ("Element", "addEventListener") => {
-                // Recorded but not dispatched here (no event loop on this tier).
-                if let Some(JsValue::Number(JsNumberType::Integer(i))) = get_own_prop_value(&this, "__elem_index__") {
-                    let ev = as_str(&arg0);
+            ("Element", "removeChild") => {
+                if let (Some(p), Some(c)) = (self.node_of(&this), self.node_of(&a0)) {
                     let mut dom = self.dom.borrow_mut();
-                    if let Some(e) = dom.elements.get_mut(i as usize) {
+                    if p < dom.elements.len() {
+                        dom.elements[p].children.retain(|&x| x != c);
+                    }
+                    if c < dom.elements.len() {
+                        dom.elements[c].parent = None;
+                    }
+                }
+                a0
+            }
+            ("Element", "remove") => {
+                if let Some(c) = self.node_of(&this) {
+                    let mut dom = self.dom.borrow_mut();
+                    if let Some(p) = dom.elements.get(c).and_then(|e| e.parent) {
+                        dom.elements[p].children.retain(|&x| x != c);
+                    }
+                    if let Some(e) = dom.elements.get_mut(c) {
+                        e.parent = None;
+                    }
+                }
+                JsValue::Undefined
+            }
+            ("Element", "setAttribute") => {
+                if let Some(i) = self.node_of(&this) {
+                    let (k, v) = (as_str(&a0), as_str(&a1));
+                    let mut dom = self.dom.borrow_mut();
+                    if let Some(e) = dom.elements.get_mut(i) {
+                        match k.as_str() {
+                            "id" => e.id = Some(v),
+                            "class" => e.class = Some(v),
+                            "href" => e.href = v,
+                            "src" => e.src = v,
+                            _ => { e.attrs.insert(k, v); }
+                        }
+                    }
+                }
+                JsValue::Undefined
+            }
+            ("Element", "getAttribute") => {
+                let k = as_str(&a0);
+                if let Some(i) = self.node_of(&this) {
+                    let dom = self.dom.borrow();
+                    if let Some(e) = dom.elements.get(i) {
+                        return Some(Ok(match k.as_str() {
+                            "id" => e.id.as_deref().map(s).unwrap_or(JsValue::Null),
+                            "class" => e.class.as_deref().map(s).unwrap_or(JsValue::Null),
+                            _ => e.attrs.get(&k).map(|v| s(v)).unwrap_or(JsValue::Null),
+                        }));
+                    }
+                }
+                JsValue::Null
+            }
+            ("Element", "hasAttribute") => {
+                let k = as_str(&a0);
+                let has = self.node_of(&this).map_or(false, |i| {
+                    let dom = self.dom.borrow();
+                    dom.elements.get(i).map_or(false, |e| match k.as_str() {
+                        "id" => e.id.is_some(),
+                        "class" => e.class.is_some(),
+                        _ => e.attrs.contains_key(&k),
+                    })
+                });
+                JsValue::Boolean(has)
+            }
+            ("Element", "removeAttribute") => {
+                if let Some(i) = self.node_of(&this) {
+                    let k = as_str(&a0);
+                    let mut dom = self.dom.borrow_mut();
+                    if let Some(e) = dom.elements.get_mut(i) {
+                        e.attrs.remove(&k);
+                    }
+                }
+                JsValue::Undefined
+            }
+            ("Element", "addEventListener") | ("Element", "removeEventListener") => {
+                if let Some(i) = self.node_of(&this) {
+                    let ev = as_str(&a0);
+                    let mut dom = self.dom.borrow_mut();
+                    if let Some(e) = dom.elements.get_mut(i) {
                         e.listeners.entry(ev).or_default();
                     }
                 }
-                Some(Ok(JsValue::Undefined))
+                JsValue::Undefined
             }
-            ("localStorage", "getItem") => {
-                let key = as_str(&arg0);
-                Some(Ok(get_own_prop_value(&self.storage, &key).unwrap_or(JsValue::Null)))
+            ("Element", "cloneNode") => {
+                if let Some(i) = self.node_of(&this) {
+                    let mut dom = self.dom.borrow_mut();
+                    if let Some(e) = dom.elements.get(i).cloned() {
+                        dom.elements.push(e);
+                        return Some(Ok(elem_wrapper(dom.elements.len() - 1)));
+                    }
+                }
+                JsValue::Null
             }
-            ("localStorage", "setItem") => {
-                let key = as_str(&arg0);
-                let val = args.get(1).cloned().unwrap_or(JsValue::Undefined);
-                set_own_prop(&self.storage, &key, val, true);
-                Some(Ok(JsValue::Undefined))
+            ("Element", "contains") => {
+                let target = self.node_of(&a0);
+                let root = self.node_of(&this);
+                let mut found = false;
+                if let (Some(r), Some(t)) = (root, target) {
+                    let dom = self.dom.borrow();
+                    // walk up from target to root
+                    let mut cur = Some(t);
+                    while let Some(c) = cur {
+                        if c == r {
+                            found = true;
+                            break;
+                        }
+                        cur = dom.elements.get(c).and_then(|e| e.parent);
+                    }
+                }
+                JsValue::Boolean(found)
             }
-            _ => None,
-        }
+            ("Element", "focus") | ("Element", "blur") | ("Element", "click")
+            | ("Element", "scrollIntoView") => JsValue::Undefined,
+            ("Element", "getContext") => {
+                match self.node_of(&this) {
+                    Some(i) => {
+                        self.dom.borrow_mut().ensure_canvas(i);
+                        canvas_ctx_wrapper(i)
+                    }
+                    None => JsValue::Null,
+                }
+            }
+            ("ClassList", "contains") => {
+                let cls = as_str(&a0);
+                let has = self.node_of(&this).map_or(false, |i| {
+                    let dom = self.dom.borrow();
+                    dom.elements.get(i).map_or(false, |e| {
+                        e.class.as_deref().map_or(false, |c| c.split_whitespace().any(|w| w == cls))
+                    })
+                });
+                JsValue::Boolean(has)
+            }
+            ("ClassList", "add") | ("ClassList", "remove") | ("ClassList", "toggle") => {
+                if let Some(i) = self.node_of(&this) {
+                    let cls = as_str(&a0);
+                    let mut dom = self.dom.borrow_mut();
+                    if let Some(e) = dom.elements.get_mut(i) {
+                        let mut set: Vec<String> = e.class.as_deref().unwrap_or("").split_whitespace().map(|x| x.to_string()).collect();
+                        let present = set.iter().any(|x| x == &cls);
+                        match method_name {
+                            "add" => { if !present { set.push(cls); } }
+                            "remove" => set.retain(|x| x != &cls),
+                            _ => { if present { set.retain(|x| x != &cls); } else { set.push(cls); } }
+                        }
+                        e.class = Some(set.join(" "));
+                    }
+                }
+                JsValue::Undefined
+            }
+            ("Style", "setProperty") => {
+                if let Some(i) = self.node_of(&this) {
+                    let (k, v) = (as_str(&a0), as_str(&a1));
+                    let mut dom = self.dom.borrow_mut();
+                    if let Some(e) = dom.elements.get_mut(i) {
+                        e.style = style_set(&e.style, &k, &v);
+                    }
+                }
+                JsValue::Undefined
+            }
+            ("Style", "getPropertyValue") => {
+                let k = as_str(&a0);
+                let v = self.node_of(&this).map(|i| {
+                    let dom = self.dom.borrow();
+                    dom.elements.get(i).map(|e| style_get(&e.style, &k)).unwrap_or_default()
+                }).unwrap_or_default();
+                s(&v)
+            }
+            ("Style", "removeProperty") => {
+                if let Some(i) = self.node_of(&this) {
+                    let k = as_str(&a0);
+                    let mut dom = self.dom.borrow_mut();
+                    if let Some(e) = dom.elements.get_mut(i) {
+                        e.style = style_set(&e.style, &k, "");
+                    }
+                }
+                JsValue::Undefined
+            }
+            ("window", "addEventListener") | ("window", "removeEventListener")
+            | ("window", "scrollTo") | ("window", "requestAnimationFrame") => JsValue::Undefined,
+            ("window", "alert") => {
+                self.dom.borrow_mut().log.push(as_str(&a0));
+                JsValue::Undefined
+            }
+            ("window", "getComputedStyle") => {
+                match self.node_of(&a0) {
+                    Some(i) => style_wrapper(i),
+                    None => make_object(vec![]),
+                }
+            }
+            ("localStorage" | "sessionStorage", "getItem") => {
+                let store = if object_name == "sessionStorage" { &self.session } else { &self.storage };
+                get_own_prop_value(store, &as_str(&a0)).unwrap_or(JsValue::Null)
+            }
+            ("localStorage" | "sessionStorage", "setItem") => {
+                let store = if object_name == "sessionStorage" { &self.session } else { &self.storage };
+                set_own_prop(store, &as_str(&a0), a1, true);
+                JsValue::Undefined
+            }
+            ("localStorage" | "sessionStorage", "removeItem") => {
+                let store = if object_name == "sessionStorage" { &self.session } else { &self.storage };
+                set_own_prop(store, &as_str(&a0), JsValue::Null, true);
+                JsValue::Undefined
+            }
+
+            // --- Canvas 2D context ---
+            ("Canvas2d", m) => {
+                if let Some(i) = self.node_of(&this) {
+                    let mut dom = self.dom.borrow_mut();
+                    let c = dom.ensure_canvas(i);
+                    match m {
+                        "fillRect" => c.fill_rect(num_arg(&a0), num_arg(&a1), num_arg(args.get(2).unwrap_or(&JsValue::Undefined)), num_arg(args.get(3).unwrap_or(&JsValue::Undefined))),
+                        "strokeRect" => c.stroke_rect(num_arg(&a0), num_arg(&a1), num_arg(args.get(2).unwrap_or(&JsValue::Undefined)), num_arg(args.get(3).unwrap_or(&JsValue::Undefined))),
+                        "clearRect" => c.clear_rect(num_arg(&a0), num_arg(&a1), num_arg(args.get(2).unwrap_or(&JsValue::Undefined)), num_arg(args.get(3).unwrap_or(&JsValue::Undefined))),
+                        "fillText" | "strokeText" => c.fill_text(&as_str(&a0), num_arg(&a1), num_arg(args.get(2).unwrap_or(&JsValue::Undefined))),
+                        "beginPath" => c.begin_path(),
+                        "closePath" => c.close_path(),
+                        "moveTo" => c.move_to(fnum_arg(&a0), fnum_arg(&a1)),
+                        "lineTo" => c.line_to(fnum_arg(&a0), fnum_arg(&a1)),
+                        "stroke" => c.stroke(),
+                        "fill" => c.fill(),
+                        "arc" => c.arc(fnum_arg(&a0), fnum_arg(&a1), fnum_arg(args.get(2).unwrap_or(&JsValue::Undefined)), fnum_arg(args.get(3).unwrap_or(&JsValue::Undefined)), fnum_arg(args.get(4).unwrap_or(&JsValue::Undefined))),
+                        "save" | "restore" | "translate" | "rotate" | "scale" | "setTransform" | "rect" => {}
+                        _ => {}
+                    }
+                }
+                JsValue::Undefined
+            }
+
+            // --- fetch Response ---
+            ("Response", "text") => {
+                let body = get_own_prop_value(&this, "__body__").map(|v| as_str(&v)).unwrap_or_default();
+                promise::resolve_value(s(&body))
+            }
+            ("Response", "json") => {
+                let body = get_own_prop_value(&this, "__body__").map(|v| as_str(&v)).unwrap_or_default();
+                match just_engine::runner::std_lib::json::parse_str(&body) {
+                    Ok(v) => promise::resolve_value(v),
+                    Err(e) => promise::reject_value(s(&alloc::format!("{:?}", e))),
+                }
+            }
+
+            // --- postMessage (window/self/parent/top) ---
+            ("window" | "parent" | "self" | "top", "postMessage") => {
+                let target = if object_name == "parent" || object_name == "top" { "parent" } else { "self" };
+                let data = as_str(&a0);
+                let target_origin = as_str(&a1);
+                let origin = self.dom.borrow().location_href.clone();
+                self.dom.borrow_mut().outbound_messages.push(super::js::Message {
+                    data,
+                    origin,
+                    target_origin,
+                    target: target.to_string(),
+                });
+                JsValue::Undefined
+            }
+
+            // --- WebAssembly (stub: compiles/instantiates to empty exports) ---
+            ("WebAssembly", "instantiate") | ("WebAssembly", "instantiateStreaming") => {
+                let instance = make_object(vec![]);
+                set_own_prop(&instance, "exports", make_object(vec![]), true);
+                let result = make_object(vec![]);
+                set_own_prop(&result, "instance", instance, true);
+                set_own_prop(&result, "module", make_object(vec![]), true);
+                promise::resolve_value(result)
+            }
+            ("WebAssembly", "compile") | ("WebAssembly", "compileStreaming") => {
+                promise::resolve_value(make_object(vec![]))
+            }
+            ("WebAssembly", "validate") => JsValue::Boolean(true),
+
+            _ => return None,
+        };
+        Some(Ok(res))
     }
 
     fn name(&self) -> &str {
@@ -325,12 +1046,10 @@ impl PluginResolver for DomResolver {
     }
 }
 
-/// Run DOM-touching scripts on `just` with DOM bindings. Returns `false` (having
-/// left `dom` untouched) if any script fails to parse/run, so the caller can
-/// fall back to the legacy engine. On success, DOM mutations are synced back.
+/// Run DOM-touching scripts on `just` with LIVE DOM bindings. Returns `false`
+/// (DOM untouched) if any script fails to parse, so the caller can fall back to
+/// the legacy engine; parse happens before any mutation.
 pub fn run_scripts_via_just(dom: &mut JsDom, scripts: &[String]) -> bool {
-    // Parse everything FIRST — if any script can't parse, bail before touching
-    // the DOM so the caller can fall back cleanly (no partial/double execution).
     let mut asts = Vec::with_capacity(scripts.len());
     for src in scripts {
         match JsParser::parse_to_ast_from_str(src) {
@@ -338,22 +1057,17 @@ pub fn run_scripts_via_just(dom: &mut JsDom, scripts: &[String]) -> bool {
             Err(_) => return false,
         }
     }
-
     let _ = drain_console_log();
-    // Move the JsDom into a shared cell for the resolver.
+
     let placeholder = JsDom::from_document(&super::html::parse(""));
     let taken = core::mem::replace(dom, placeholder);
     let shared = Rc::new(RefCell::new(taken));
-    let wrappers: Wrappers = Rc::new(RefCell::new(Vec::new()));
-    let resolver = DomResolver::new(shared.clone(), wrappers.clone());
-    let document = resolver.document.clone();
-    let location = resolver.location.clone();
 
     let mut ctx = EvalContext::new();
     ctx.install_core_builtins(BuiltInRegistry::with_core());
-    ctx.add_resolver(alloc::boxed::Box::new(resolver));
+    ctx.native_props = Some(Rc::new(DomProps { dom: shared.clone() }));
+    ctx.add_resolver(alloc::boxed::Box::new(DomResolver::new(shared.clone())));
 
-    // Execute; a runtime error just ends that script (like the legacy engine).
     for ast in &asts {
         for stmt in &ast.body {
             if execute_statement(stmt, &mut ctx).is_err() {
@@ -361,15 +1075,11 @@ pub fn run_scripts_via_just(dom: &mut JsDom, scripts: &[String]) -> bool {
             }
         }
     }
+    drop(ctx); // releases the resolver + native_props Rc clones of `shared`
 
-    // Sync wrapper/document/location mutations back into the shared JsDom.
-    sync_back_all(&shared, &wrappers, &document, &location);
-    drop(ctx); // releases the resolver's Rc clones
-
-    // Reclaim the JsDom.
     match Rc::try_unwrap(shared) {
         Ok(cell) => *dom = cell.into_inner(),
-        Err(_still_shared) => return false, // shouldn't happen
+        Err(_) => return false,
     }
     for line in drain_console_log() {
         dom.log.push(line);
@@ -377,37 +1087,6 @@ pub fn run_scripts_via_just(dom: &mut JsDom, scripts: &[String]) -> bool {
     true
 }
 
-/// Free-function sync (the resolver's clones live inside `ctx`; we hold our own).
-fn sync_back_all(dom: &Rc<RefCell<JsDom>>, wrappers: &Wrappers, document: &JsValue, location: &JsValue) {
-    let mut d = dom.borrow_mut();
-    for (idx, w) in wrappers.borrow().iter() {
-        let Some(e) = d.elements.get_mut(*idx) else { continue };
-        if let Some(v) = get_own_prop_value(w, "innerText") {
-            e.text = as_str(&v);
-        }
-        if let Some(v) = get_own_prop_value(w, "value") {
-            e.value = as_str(&v);
-        }
-        if let Some(v) = get_own_prop_value(w, "style") {
-            e.style = as_str(&v);
-        }
-        if let Some(v) = get_own_prop_value(w, "className") {
-            e.class = Some(as_str(&v));
-        }
-        if let Some(v) = get_own_prop_value(w, "id") {
-            e.id = Some(as_str(&v));
-        }
-    }
-    if let Some(v) = get_own_prop_value(document, "title") {
-        d.title = as_str(&v);
-    }
-    if let Some(v) = get_own_prop_value(location, "href") {
-        let href = as_str(&v);
-        if href != d.location_href {
-            d.navigate = Some(href);
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -577,6 +1256,45 @@ mod tests {
     }
 
     #[test_case]
+    fn new_expression_method_chaining() {
+        // `new X(args).m()` — member/call directly on a `new` expression.
+        assert_eq!(
+            val("class A { constructor(x){ this.x = x; } g(){ return this.x * 2; } } new A(21).g()"),
+            "42"
+        );
+        assert_eq!(val("class P { constructor(){ this.v = 7; } } new P().v"), "7");
+    }
+
+    #[test_case]
+    fn async_expressions_and_arrows() {
+        // async function expression returns a Promise usable with await + .then
+        assert_eq!(val("let f = async function(){ return 9; }; await f()"), "9");
+        assert_eq!(val("let f = async function(){ return 3; }; let o=0; f().then(v=>{o=v*2;}); o"), "6");
+        // async arrow (concise + block body) — await and .then both work
+        assert_eq!(val("let f = async () => 41; await f() + 1"), "42");
+        assert_eq!(val("let f = async () => 5; let o=0; f().then(v=>{o=v*2;}); o"), "10");
+        assert_eq!(val("let g = async (a,b) => { return a+b; }; await g(4,5)"), "9");
+        // `async` still usable as an identifier / function name (no regression)
+        assert_eq!(val("let async = 7; async + 1"), "8");
+    }
+
+    #[test_case]
+    fn response_json_parses() {
+        // `Response.json()` really parses the body (host_fetch returns
+        // {"ok":true,"url":"…"} under cfg(test)).
+        use crate::browser::{html, js};
+        let doc = html::parse("<html><body></body></html>");
+        let mut dom = js::JsDom::from_document(&doc);
+        let _ = js::run_scripts(
+            &mut dom,
+            &[String::from(
+                "var out=''; fetch('https://ex.com/api').then(function(r){ return r.json(); }).then(function(j){ out = j.ok; }); console.log(out);",
+            )],
+        );
+        assert!(dom.log.iter().any(|l| l == "true"), "json().ok should be true: {:?}", dom.log);
+    }
+
+    #[test_case]
     fn async_await() {
         assert_eq!(val("async function f(){ return 41; } let out = await f(); out + 1"), "42");
         assert_eq!(val("async function g(){ return await Promise.resolve(100); } let out = await g(); out"), "100");
@@ -613,6 +1331,95 @@ mod tests {
         assert!(ok, "just DOM run should succeed");
         let el = dom.elements.iter().find(|e| e.id.as_deref() == Some("msg")).unwrap();
         assert_eq!(el.text, "hello 2");
+    }
+
+    #[test_case]
+    fn dom_primary_tier_rich_surface() {
+        // Drives the PRIMARY path (`js::run_scripts` routes DOM scripts to the
+        // just DOM tier): style get/set, classList, querySelectorAll on parsed
+        // elements. (childElementCount/children are only tracked for JS-built
+        // trees via appendChild — see `js::tests::dom_create_append_query`.)
+        use crate::browser::{html, js};
+        let doc = html::parse(
+            r#"<html><body><div id="box" class="a"></div><span class="x">1</span><span class="x">2</span></body></html>"#,
+        );
+        let mut dom = js::JsDom::from_document(&doc);
+        let logs = js::run_scripts(
+            &mut dom,
+            &[String::from(
+                r##"
+                var box = document.getElementById("box");
+                box.style.color = "red";
+                box.classList.add("active");
+                console.log(box.style.color);
+                console.log(box.className);
+                console.log(document.querySelectorAll(".x").length);
+                "##,
+            )],
+        );
+        assert!(logs.iter().any(|l| l == "red"), "style.color: {logs:?}");
+        assert!(logs.iter().any(|l| l.contains("active") && l.contains("a")), "classList.add: {logs:?}");
+        assert!(logs.iter().any(|l| l == "2"), "querySelectorAll: {logs:?}");
+        // Live: writes reflected in the JsDom immediately.
+        let b = dom.elements.iter().find(|e| e.id.as_deref() == Some("box")).unwrap();
+        assert!(b.style.contains("color") && b.style.contains("red"), "{}", b.style);
+        assert!(b.class.as_deref().unwrap_or("").contains("active"), "{:?}", b.class);
+    }
+
+    #[test_case]
+    fn dom_canvas_2d() {
+        use crate::browser::{html, js};
+        let doc = html::parse(r#"<html><body><canvas id="c"></canvas></body></html>"#);
+        let mut dom = js::JsDom::from_document(&doc);
+        let ok = js::run_scripts(
+            &mut dom,
+            &[String::from(
+                "var c = document.getElementById('c'); var ctx = c.getContext('2d'); ctx.fillStyle = 'red'; ctx.fillRect(0, 0, 10, 10); ctx.beginPath();",
+            )],
+        );
+        let _ = ok;
+        assert!(!dom.canvases.is_empty(), "getContext should create a canvas");
+    }
+
+    #[test_case]
+    fn dom_fetch_logs_and_resolves() {
+        use crate::browser::{html, js};
+        let doc = html::parse("<html><body></body></html>");
+        let mut dom = js::JsDom::from_document(&doc);
+        let _ = js::run_scripts(
+            &mut dom,
+            &[String::from(
+                "var out=''; fetch('https://ex.com/api').then(function(r){ return r.text(); }).then(function(t){ out = t; }); console.log(out);",
+            )],
+        );
+        assert!(!dom.fetch_log.is_empty(), "fetch should record");
+        assert_eq!(dom.fetch_log[0].1, "https://ex.com/api");
+        // synchronous settlement: the .then chain ran, so `out` was logged non-empty
+        assert!(dom.log.iter().any(|l| l.contains("ok")), "{:?}", dom.log);
+    }
+
+    #[test_case]
+    fn dom_post_message() {
+        use crate::browser::{html, js};
+        let doc = html::parse("<html><body></body></html>");
+        let mut dom = js::JsDom::from_document(&doc);
+        let _ = js::run_scripts(&mut dom, &[String::from("window.postMessage('hi', '*');")]);
+        assert_eq!(dom.outbound_messages.len(), 1);
+        assert_eq!(dom.outbound_messages[0].data, "hi");
+    }
+
+    #[test_case]
+    fn dom_webassembly_stub() {
+        use crate::browser::{html, js};
+        let doc = html::parse("<html><body></body></html>");
+        let mut dom = js::JsDom::from_document(&doc);
+        let logs = js::run_scripts(
+            &mut dom,
+            &[String::from(
+                "var ok = 0; WebAssembly.instantiate('bytes').then(function(m){ ok = m.instance ? 1 : 0; }); console.log(ok);",
+            )],
+        );
+        assert!(logs.iter().any(|l| l == "1"), "WebAssembly.instantiate should resolve: {logs:?}");
     }
 
     #[test_case]

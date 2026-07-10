@@ -52,6 +52,16 @@ fn json_parse(
     parse_value(&mut chars)
 }
 
+/// ChittiOS: parse a JSON string into a `JsValue` (used by `Response.json()`).
+pub fn parse_str(s: &str) -> Result<JsValue, JErrorType> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(JErrorType::SyntaxError("Unexpected end of JSON input".to_string()));
+    }
+    let mut chars = s.chars().peekable();
+    parse_value(&mut chars)
+}
+
 /// Parse a JSON value.
 fn parse_value(chars: &mut core::iter::Peekable<core::str::Chars>) -> Result<JsValue, JErrorType> {
     skip_whitespace(chars);

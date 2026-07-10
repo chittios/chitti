@@ -17,5 +17,6 @@ pub mod date;
 pub mod regexp;
 pub mod promise;
 pub mod proxy;
+pub mod globals;
 
 pub use core::register_core_builtins;

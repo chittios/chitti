@@ -2112,6 +2112,8 @@ fn build_ast_from_arrow_function(
     script: &Rc<String>,
 ) -> Result<(ExpressionType, Semantics), JsRuleError> {
     let meta = get_meta(&pair, script);
+    // ChittiOS: optional `async` prefix (grammar allows `async () => …`).
+    let is_async = pair.as_str().trim_start().starts_with("async");
     let mut inner_iter = pair.into_inner();
     let arrow_parameters_pair = inner_iter.next().unwrap();
     let inner_arrow_parameters_pair = arrow_parameters_pair.into_inner().next().unwrap();
@@ -2170,7 +2172,7 @@ fn build_ast_from_arrow_function(
         // s.merge(params_s).merge(body_s);
         // params_s produces bound_names and body_s produces var_declared_names & lexically_declared_names
         Ok((
-            ExpressionType::ArrowFunctionExpression { meta, params, body },
+            ExpressionType::ArrowFunctionExpression { meta, params, body, is_async },
             Semantics::new_empty(),
         ))
     }
@@ -2909,25 +2911,26 @@ fn build_ast_from_member_expression(
     let mut pair_iter = pair.into_inner();
     let pair_1 = pair_iter.next().unwrap();
     Ok(
-        if pair_1.as_rule() == Rule::new_member_expression
-            || pair_1.as_rule() == Rule::new_member_expression__yield
         {
-            let member_expression_pair = pair_1.into_inner().next().unwrap();
-            let arguments_pair = pair_iter.next().unwrap();
-            let (m, mut s) = build_ast_from_member_expression(member_expression_pair, script)?;
-            let (a, a_s) = build_ast_from_arguments(arguments_pair, script)?;
-            s.merge(a_s);
-            (
-                ExpressionType::NewExpression {
-                    meta,
-                    callee: Box::new(m),
-                    arguments: a,
-                },
-                s,
-            )
-        } else {
             let mut s = Semantics::new_empty();
+            // ChittiOS: `new X(args)` is now a base that the trailing
+            // `.member`/`[expr]`/tagged-template chain can extend (so
+            // `new A(5).g()` parses); build the NewExpression base first, then
+            // fall through to the shared chain loop below.
             let mut obj: ExpressionType = match pair_1.as_rule() {
+                Rule::new_member_expression | Rule::new_member_expression__yield => {
+                    let member_expression_pair = pair_1.into_inner().next().unwrap();
+                    let arguments_pair = pair_iter.next().unwrap();
+                    let (m, m_s) = build_ast_from_member_expression(member_expression_pair, script)?;
+                    let (a, a_s) = build_ast_from_arguments(arguments_pair, script)?;
+                    s.merge(m_s);
+                    s.merge(a_s);
+                    ExpressionType::NewExpression {
+                        meta: meta.clone(),
+                        callee: Box::new(m),
+                        arguments: a,
+                    }
+                }
                 Rule::super_property | Rule::super_property__yield => {
                     let super_pair = pair_1.into_inner().next().unwrap();
                     if super_pair.as_rule() == Rule::identifier_name {

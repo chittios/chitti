@@ -10,5 +10,5 @@ pub mod object_property;
 pub mod operations;
 pub mod realm;
 mod scope;
-mod symbol;
+pub mod symbol;
 pub mod value;

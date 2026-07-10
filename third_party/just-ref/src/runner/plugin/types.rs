@@ -76,6 +76,20 @@ pub struct EvalContext {
     /// currently running, so `super(...)` can invoke it. `None` outside a
     /// derived-class constructor.
     pub current_super: Option<JsValue>,
+    /// ChittiOS: generic hook for objects whose properties are backed by native
+    /// host state (a live DOM element view). An object carrying an
+    /// `__native_node__` integer routes its property get/set through this.
+    pub native_props: Option<Rc<dyn NativeProps>>,
+}
+
+/// ChittiOS: property backing for host-native objects (e.g. a live DOM view).
+/// An object with an `__native_node__` integer has its property reads/writes
+/// dispatched here instead of to the JS heap. Generic — not DOM-specific.
+pub trait NativeProps {
+    /// Read `node.prop`; `None` means "not handled — fall back to the JS object".
+    fn get(&self, node: i64, prop: &str) -> Option<JsValue>;
+    /// Write `node.prop = value`; return `true` if handled.
+    fn set(&self, node: i64, prop: &str, value: JsValue) -> bool;
 }
 
 impl EvalContext {
@@ -111,6 +125,7 @@ impl EvalContext {
             lex_env_version: 0,
             super_global: Rc::new(RefCell::new(SuperGlobalEnvironment::new())),
             current_super: None,
+            native_props: None,
         }
     }
 
@@ -146,6 +161,7 @@ impl EvalContext {
             lex_env_version: 0,
             super_global: Rc::new(RefCell::new(SuperGlobalEnvironment::new())),
             current_super: None,
+            native_props: None,
         }
     }
 
@@ -211,6 +227,9 @@ impl EvalContext {
     /// ```
     pub fn install_core_builtins(&mut self, registry: super::registry::BuiltInRegistry) {
         self.add_resolver(Box::new(super::core_resolver::CorePluginResolver::new(registry)));
+        // ChittiOS: global values (undefined/NaN/Infinity/globalThis) + callable
+        // globals (isNaN/isFinite/parseInt/parseFloat/Boolean/Symbol).
+        self.add_resolver(Box::new(crate::runner::std_lib::globals::GlobalsResolver));
     }
 
     /// Track a heap allocation.

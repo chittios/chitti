@@ -59,6 +59,14 @@ pub fn resolve_value(v: JsValue) -> JsValue {
     p
 }
 
+/// Wrap a value in an already-rejected Promise.
+pub fn reject_value(v: JsValue) -> JsValue {
+    let p = make_promise();
+    set_own_prop(&p, "__state__", JsValue::String("rejected".to_string()), false);
+    set_own_prop(&p, "__value__", v, false);
+    p
+}
+
 /// `await v`: synchronously extract a settled promise's value (or return a
 /// non-promise unchanged). A rejection becomes a thrown error.
 pub fn await_value(v: JsValue) -> Result<JsValue, JErrorType> {

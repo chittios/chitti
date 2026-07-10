@@ -55,7 +55,19 @@ pub fn register(registry: &mut BuiltInRegistry) {
         .add_method("keys", object_keys)
         .add_method("values", object_values)
         .add_method("entries", object_entries)
-        .add_method("assign", object_assign);
+        .add_method("assign", object_assign)
+        .add_method("defineProperty", object_define_property)
+        .add_method("defineProperties", object_define_properties)
+        .add_method("getOwnPropertyDescriptor", object_get_own_property_descriptor)
+        .add_method("getOwnPropertyNames", object_get_own_property_names)
+        .add_method("freeze", object_identity_arg0)
+        .add_method("seal", object_identity_arg0)
+        .add_method("preventExtensions", object_identity_arg0)
+        .add_method("isFrozen", object_false_arg0)
+        .add_method("isSealed", object_false_arg0)
+        .add_method("isExtensible", object_true_arg0)
+        .add_method("create", object_create)
+        .add_method("getPrototypeOf", object_get_prototype_of);
 
     registry.register_object(object);
 }
@@ -160,6 +172,126 @@ fn object_entries(
         .map(|(k, v)| make_array(alloc::vec![JsValue::String(k), v]))
         .collect();
     Ok(make_array(entries))
+}
+
+/// Object.defineProperty(obj, key, descriptor) — define a data/accessor prop.
+fn object_define_property(
+    _ctx: &mut EvalContext,
+    _this: JsValue,
+    args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    let target = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+    let key = match args.get(1) {
+        Some(JsValue::String(s)) => s.clone(),
+        Some(other) => crate::runner::eval::expression::value_to_property_key(other),
+        None => return Ok(target),
+    };
+    let desc = args.get(2).cloned().unwrap_or(JsValue::Undefined);
+    let value = crate::runner::eval::expression::get_own_prop_value(&desc, "value")
+        .unwrap_or(JsValue::Undefined);
+    let enumerable = matches!(
+        crate::runner::eval::expression::get_own_prop_value(&desc, "enumerable"),
+        Some(JsValue::Boolean(true))
+    );
+    crate::runner::eval::expression::set_own_prop(&target, &key, value, enumerable);
+    Ok(target)
+}
+
+/// Object.defineProperties(obj, descriptors).
+fn object_define_properties(
+    ctx: &mut EvalContext,
+    this: JsValue,
+    args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    let target = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+    let descs = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+    for (k, d) in enum_own_pairs(&descs) {
+        object_define_property(ctx, this.clone(), alloc::vec![target.clone(), JsValue::String(k), d])?;
+    }
+    Ok(target)
+}
+
+/// Object.getOwnPropertyDescriptor(obj, key) — `{value, writable, enumerable,
+/// configurable}` or undefined.
+fn object_get_own_property_descriptor(
+    _ctx: &mut EvalContext,
+    _this: JsValue,
+    args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    let target = args.get(0).cloned().unwrap_or(JsValue::Undefined);
+    let key = match args.get(1) {
+        Some(JsValue::String(s)) => s.clone(),
+        Some(other) => crate::runner::eval::expression::value_to_property_key(other),
+        None => return Ok(JsValue::Undefined),
+    };
+    match crate::runner::eval::expression::get_own_prop_value(&target, &key) {
+        Some(v) => Ok(make_object(alloc::vec![
+            ("value".to_string(), v),
+            ("writable".to_string(), JsValue::Boolean(true)),
+            ("enumerable".to_string(), JsValue::Boolean(true)),
+            ("configurable".to_string(), JsValue::Boolean(true)),
+        ])),
+        None => Ok(JsValue::Undefined),
+    }
+}
+
+/// Object.getOwnPropertyNames(obj) — all own string keys (enumerable or not).
+fn object_get_own_property_names(
+    _ctx: &mut EvalContext,
+    _this: JsValue,
+    args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    let target = args.into_iter().next().unwrap_or(JsValue::Undefined);
+    let keys = crate::runner::eval::expression::own_string_keys(&target)
+        .into_iter()
+        .map(JsValue::String)
+        .collect();
+    Ok(make_array(keys))
+}
+
+/// Object.create(proto[, props]) — a new object (proto chain best-effort).
+fn object_create(
+    ctx: &mut EvalContext,
+    this: JsValue,
+    args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    let obj = make_object(Vec::new());
+    if let Some(descs) = args.get(1) {
+        if matches!(descs, JsValue::Object(_)) {
+            object_define_properties(ctx, this, alloc::vec![obj.clone(), descs.clone()])?;
+        }
+    }
+    Ok(obj)
+}
+
+fn object_get_prototype_of(
+    _ctx: &mut EvalContext,
+    _this: JsValue,
+    _args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    Ok(JsValue::Null)
+}
+
+fn object_identity_arg0(
+    _ctx: &mut EvalContext,
+    _this: JsValue,
+    args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    Ok(args.into_iter().next().unwrap_or(JsValue::Undefined))
+}
+fn object_false_arg0(
+    _ctx: &mut EvalContext,
+    _this: JsValue,
+    _args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    Ok(JsValue::Boolean(false))
+}
+fn object_true_arg0(
+    _ctx: &mut EvalContext,
+    _this: JsValue,
+    _args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    Ok(JsValue::Boolean(true))
 }
 
 /// Object.assign(target, ...sources) — copy enumerable own props into target.
