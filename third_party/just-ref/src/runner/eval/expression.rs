@@ -1082,6 +1082,11 @@ pub fn call_function_object(
     args: Vec<JsValue>,
     ctx: &mut EvalContext,
 ) -> ValueResult {
+    // Cooperative yield: pump the host UI / honor Ctrl+C between calls so a
+    // heavy script can't freeze the (cooperatively-scheduled) kernel thread.
+    if crate::runner::host::host_tick() {
+        return Err(crate::runner::host::interrupt_error());
+    }
     // Call-depth guard: the interpreter recurses on the host (kernel) stack, so
     // unbounded or non-tail JS recursion would fault the kernel. Throw a
     // spec-shaped RangeError past the limit and always restore the counter.

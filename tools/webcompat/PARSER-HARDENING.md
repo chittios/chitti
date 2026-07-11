@@ -159,10 +159,52 @@ Closed the entire remaining vercel.com parse gap — **all 41 chunks now parse
   (`js_just.rs`) — the engine default returns a fresh empty object, breaking the
   `globalThis.X = globalThis.X || []` turbopack pattern.
 
+## Fix 8 — real semantic bugs + missing builtins + ESM + engine robustness
+
+Surfaced from the test262 language suite and real-page probing; each is a
+genuine bug or gap that also affects real pages (not conformance-only):
+
+- **Named function expression self-reference** — `var f = function fact(n){ …
+  fact(n-1) … }` left `fact` unbound in its own body. Now a named function
+  *expression* binds its own name (immutably) in a fresh enclosing scope
+  (`evaluate_expression`, `FunctionOrGeneratorExpression`). Fixes recursive
+  library helpers / IIFEs.
+- **Call-depth guard** — the tree-walker recurses on the kernel stack, so a
+  runaway/non-tail-recursive script would fault the OS. A depth counter
+  (`EvalContext.call_depth`, `MAX_CALL_DEPTH`) throws
+  `RangeError("Maximum call stack size exceeded")` — spec-shaped and, more
+  importantly, a kernel-robustness fix (catchable, no crash).
+- **`var` hoisting through labelled statements** — `foo: while(…){ var x }`
+  didn't hoist `x` (the `LabelledStatement` arm was missing from `hoist_stmt`).
+- **Missing builtins**: `JSON.stringify` for objects/arrays (+ nested, skip
+  `undefined`/functions, `space` pretty-print); `Array.from` (string /
+  array-like / mapFn) / `Array.of` / `findIndex` / `fill` / `flat` / `flatMap`;
+  `encodeURIComponent` / `decodeURIComponent` / `encodeURI` / `decodeURI`.
+- **ES modules**: default-import + `{ orig as local }` rename bindings and
+  `export { local as public }` aliasing now emit real `var` bindings
+  (`strip_module_syntax`); dynamic **`import(spec)`** and **`import.meta`** now
+  parse (new AST nodes) and evaluate to a resolved empty namespace / `{url:""}`
+  stub instead of killing the whole script.
+- **Cooperative host tick** (`runner::host`) — the interpreter calls a
+  kernel-installed hook from its hot loops (function calls + while/for/do-while)
+  every ~2048 ops; the kernel pumps the UI and honours Ctrl+C, so a heavy
+  page's scripts no longer freeze the shell thread. The interrupt is
+  **uncatchable** (a script `try/catch` can't swallow it).
+
 ## Final state
 
-files=1104 **pass=909** skip=64 panics=0. jQuery 3.7.1 slim + lodash-core
-parse+run; **41/41 vercel.com chunks parse (skip=0).** The only two `--raw`
-runtime errors left are bare-harness environment gaps (`self is not defined`,
-webpack module-registry `.call`) — both chunks parse and run in the browser tier
-(which provides `window`/`self`/`globalThis`/`document`).
+files=1104 **pass=912** skip=64 panics=0. jQuery 3.7.1 slim + lodash-core
+parse+run; **41/41 vercel.com chunks parse (skip=0)**; the two `--raw` runtime
+errors left are bare-harness environment gaps (`self is not defined`, webpack
+module-registry `.call`) — both chunks parse and run in the browser tier.
+
+**Remaining test262 failures are deep-conformance features, not real-page
+blockers** (the common case of each already works, verified by probing): the
+regexp early-error + `u`-flag/named-group/sticky semantics (~43), iterator-
+protocol array-destructuring edge cases — generator side-effect ordering,
+iterator-close-on-error (~29), `eval` completion-value (`UpdateEmpty`)
+semantics (~20), BigInt arbitrary-precision (~parse-skips), `Symbol.toPrimitive`
+coercion ordering, strict-mode early errors, and the module/async harness
+skips. Each needs substantial machinery (a regex-engine rewrite, a full
+iterator protocol, arbitrary-precision integers) for negligible page-render
+gain, so they are documented rather than half-implemented.

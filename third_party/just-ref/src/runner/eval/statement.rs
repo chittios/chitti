@@ -307,6 +307,9 @@ fn hoist_stmt(stmt: &StatementType, ctx: &mut EvalContext) {
                 hoist_var_declarations(&f.body, ctx);
             }
         }
+        // A labelled statement is transparent to var hoisting — descend into
+        // its body (`foo: while (…) { var x }` must still hoist `x`).
+        StatementType::LabelledStatement { body, .. } => hoist_stmt(body, ctx),
         // Nested functions establish their own var scope — do not descend.
         _ => {}
     }
@@ -703,6 +706,9 @@ fn execute_while_statement(
     let mut completion = Completion::normal();
 
     loop {
+        if crate::runner::host::host_tick() {
+            return Err(crate::runner::host::interrupt_error());
+        }
         let test_value = evaluate_expression(test, ctx)?;
 
         if !to_boolean(&test_value) {
@@ -742,6 +748,9 @@ fn execute_do_while_statement(
 ) -> EvalResult {
     let labels = loop_labels(ctx);
     loop {
+        if crate::runner::host::host_tick() {
+            return Err(crate::runner::host::interrupt_error());
+        }
         let completion = execute_statement(body, ctx)?;
 
         match completion.completion_type {
@@ -796,6 +805,9 @@ fn execute_for_statement(
     let mut completion = Completion::normal();
 
     loop {
+        if crate::runner::host::host_tick() {
+            return Err(crate::runner::host::interrupt_error());
+        }
         if let Some(test) = test {
             let test_value = evaluate_expression(test, ctx)?;
             if !to_boolean(&test_value) {
@@ -951,6 +963,11 @@ fn execute_try_statement(
             }
         }
         Err(err) => {
+            // A host interrupt (Ctrl+C) is uncatchable — propagate past `catch`
+            // so a script's `try/catch` can't swallow the cancellation.
+            if crate::runner::host::is_interrupt(&err) {
+                return Err(err);
+            }
             // Runtime error - treat as throw
             if let Some(catch_clause) = handler {
                 let throw_completion = Completion {

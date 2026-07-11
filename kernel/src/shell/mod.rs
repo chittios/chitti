@@ -6982,6 +6982,15 @@ fn browser_module_graph(
     out.push(stripped);
 }
 
+/// Host tick hook for the `just` JS engine: pump the UI (clock/mouse/net) and
+/// report a Ctrl+C so a heavy page's scripts can't freeze the cooperatively-
+/// scheduled shell thread. Installed lazily on the first browse; the engine
+/// calls it from its hot loops (see `just_engine::runner::host`).
+fn browser_js_tick() -> bool {
+    upkeep();
+    poll_interrupt()
+}
+
 fn browser_load_method(
     url: &str,
     method: &str,
@@ -6995,6 +7004,8 @@ fn browser_load_method(
     if !crate::browser::url::is_http_url(url) {
         return alloc::string::String::from("error: url must be http:// or https://");
     }
+    // Keep the UI alive + Ctrl+C responsive while page scripts run.
+    just_engine::runner::host::set_tick_hook(Some(browser_js_tick));
     crate::browser::worker::reset_global();
     // New navigation: clear sessionStorage + session cookies (Web Storage model).
     crate::browser::storage::STORAGE.with(|s| s.end_session());
