@@ -3324,6 +3324,16 @@ fn build_ast_from_primary_expression(
                     meta,
                 ));
             }
+            // Structural early-error validation (bad/duplicate flags, quantifier
+            // with no atom, invalid class ranges, `u`-mode escape strictness,
+            // quantified lookbehind/lookahead, …) → a parse-time `SyntaxError`.
+            if let Err(msg) = crate::runner::std_lib::regexp::validate(&pattern, &flags) {
+                return Err(get_validation_error_with_meta(
+                    msg,
+                    AstBuilderValidationErrorType::SyntaxError,
+                    meta,
+                ));
+            }
             (
                 ExpressionType::Literal(LiteralData {
                     meta,
@@ -3676,8 +3686,137 @@ fn build_ast_from_string_literal(
     let s = pair.as_str();
     Ok(LiteralData {
         meta,
-        value: LiteralType::StringLiteral(String::from(&s[1..s.len() - 1])),
+        value: LiteralType::StringLiteral(cook_string_literal(&s[1..s.len() - 1])),
     })
+}
+
+/// Decode the escape sequences in a `'…'`/`"…"` string-literal body (the
+/// surrounding quotes already stripped) into their runtime code points:
+/// `\n \r \t \b \f \v \0`, `\xHH`, `\uHHHH` / `\u{…}` (combining a
+/// `\uD800-DBFF \uDC00-DFFF` pair into its astral code point), line
+/// continuations (`\` + line terminator → nothing), and identity escapes
+/// (`\' \" \\ \/ …` → the character). Mirrors `process_template_escapes` for
+/// ordinary strings, which the grammar otherwise stored verbatim.
+fn cook_string_literal(body: &str) -> String {
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c != '\\' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        i += 1; // consume backslash
+        let e = match chars.get(i) {
+            Some(&e) => e,
+            None => {
+                out.push('\\');
+                break;
+            }
+        };
+        i += 1;
+        match e {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            'b' => out.push('\u{0008}'),
+            'f' => out.push('\u{000C}'),
+            'v' => out.push('\u{000B}'),
+            '\\' => out.push('\\'),
+            '\'' => out.push('\''),
+            '"' => out.push('"'),
+            '`' => out.push('`'),
+            '$' => out.push('$'),
+            '0' if !chars.get(i).map_or(false, |d| d.is_ascii_digit()) => out.push('\0'),
+            'x' => {
+                let mut v = 0u32;
+                let mut n = 0;
+                while n < 2 {
+                    if let Some(d) = chars.get(i).and_then(|c| c.to_digit(16)) {
+                        v = v * 16 + d;
+                        i += 1;
+                        n += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if n == 2 {
+                    if let Some(ch) = core::char::from_u32(v) {
+                        out.push(ch);
+                    }
+                }
+            }
+            'u' => {
+                if let Some(ch) = read_string_unicode_escape(&chars, &mut i) {
+                    out.push(ch);
+                }
+            }
+            // Line continuation: `\` followed by a line terminator yields nothing.
+            '\n' | '\u{2028}' | '\u{2029}' => {}
+            '\r' => {
+                if chars.get(i) == Some(&'\n') {
+                    i += 1;
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Read a `\u…` escape (the leading `\u` already consumed, `*i` at the char
+/// after `u`): `\u{HHHH}` or `\uHHHH`, combining a surrogate pair into its
+/// astral code point. A lone surrogate degrades to U+FFFD (Rust `String`
+/// cannot hold one). Advances `*i` past the escape.
+fn read_string_unicode_escape(chars: &[char], i: &mut usize) -> Option<char> {
+    if chars.get(*i) == Some(&'{') {
+        *i += 1;
+        let mut v = 0u32;
+        while let Some(d) = chars.get(*i).and_then(|c| c.to_digit(16)) {
+            v = v.saturating_mul(16).saturating_add(d);
+            *i += 1;
+        }
+        if chars.get(*i) == Some(&'}') {
+            *i += 1;
+        }
+        return core::char::from_u32(v);
+    }
+    let mut v = 0u32;
+    for _ in 0..4 {
+        if let Some(d) = chars.get(*i).and_then(|c| c.to_digit(16)) {
+            v = v * 16 + d;
+            *i += 1;
+        } else {
+            return None;
+        }
+    }
+    if (0xD800..=0xDBFF).contains(&v) {
+        // Try to combine with a following `\uXXXX` low surrogate.
+        if chars.get(*i) == Some(&'\\') && chars.get(*i + 1) == Some(&'u') {
+            let save = *i;
+            *i += 2;
+            let mut lo = 0u32;
+            let mut ok = true;
+            for _ in 0..4 {
+                if let Some(d) = chars.get(*i).and_then(|c| c.to_digit(16)) {
+                    lo = lo * 16 + d;
+                    *i += 1;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok && (0xDC00..=0xDFFF).contains(&lo) {
+                let cp = 0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00);
+                return core::char::from_u32(cp);
+            }
+            *i = save;
+        }
+        return Some('\u{FFFD}');
+    }
+    core::char::from_u32(v).or(Some('\u{FFFD}'))
 }
 
 /// Builds AST from a template literal.

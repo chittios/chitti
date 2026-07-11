@@ -360,25 +360,27 @@ fn bind_pattern(
                 let key_name = get_property_key_name(&prop_data.key)?;
                 consumed.push(key_name.clone());
 
-                // Get the value from the object
-                let prop_value = get_property_value(&value, &key_name)?;
+                // Get the value from the object (getter-aware, so a poisoned
+                // accessor propagates its throw and side effects run once).
+                let prop_value =
+                    crate::runner::eval::expression::get_property_with_ctx(&value, &key_name, ctx)?;
 
                 // Bind the value to the pattern
                 // For shorthand like { x }, value is the same pattern as key
                 // For renamed like { x: renamed }, value is the renamed pattern
                 bind_pattern(&prop_data.value, prop_value, ctx, is_const, is_var)?;
             }
-            // `...rest` = a fresh object with the own enumerable props NOT already
-            // destructured above.
+            // `...rest` = a fresh object with the own **enumerable** props NOT
+            // already destructured above; getters are invoked (their value is
+            // copied as a plain data property).
             if let Some(rest_pat) = rest {
                 let rest_obj = crate::runner::eval::expression::make_object(alloc::vec::Vec::new());
-                for key in crate::runner::eval::expression::own_string_keys(&value) {
+                for key in crate::runner::eval::expression::own_enumerable_string_keys(&value) {
                     if !consumed.contains(&key) {
-                        if let Some(v) =
-                            crate::runner::eval::expression::get_own_prop_value(&value, &key)
-                        {
-                            crate::runner::eval::expression::set_own_prop(&rest_obj, &key, v, true);
-                        }
+                        let v = crate::runner::eval::expression::get_property_with_ctx(
+                            &value, &key, ctx,
+                        )?;
+                        crate::runner::eval::expression::set_own_prop(&rest_obj, &key, v, true);
                     }
                 }
                 bind_pattern(rest_pat, rest_obj, ctx, is_const, is_var)?;
@@ -387,29 +389,38 @@ fn bind_pattern(
         }
 
         PatternType::ArrayPattern { elements, .. } => {
+            use crate::runner::eval::expression::{
+                drive_array_pattern, get_iterator, has_custom_iterator, is_array,
+            };
             // Array destructuring requires an iterable; `null`/`undefined` throw.
             if matches!(value, JsValue::Null | JsValue::Undefined) {
                 return Err(JErrorType::TypeError(
                     "value is not iterable".to_string(),
                 ));
             }
-            // Array destructuring: [a, b] = arr
-            for (index, element) in elements.iter().enumerate() {
-                if let Some(elem_pattern) = element {
-                    // Check if it's a rest element
-                    if let PatternType::RestElement { argument, .. } = elem_pattern.as_ref() {
-                        // Rest element collects remaining elements into an array
-                        let rest_value = get_rest_elements(&value, index)?;
-                        bind_pattern(argument, rest_value, ctx, is_const, is_var)?;
-                    } else {
-                        // Regular element
-                        let elem_value = get_array_element(&value, index)?;
-                        bind_pattern(elem_pattern, elem_value, ctx, is_const, is_var)?;
+            // Fast path: a genuine array using the default iteration protocol —
+            // index-based, no iterator object (keeps the common case cheap).
+            if is_array(&value) && !has_custom_iterator(&value, ctx) {
+                for (index, element) in elements.iter().enumerate() {
+                    if let Some(elem_pattern) = element {
+                        if let PatternType::RestElement { argument, .. } = elem_pattern.as_ref() {
+                            let rest_value = get_rest_elements(&value, index)?;
+                            bind_pattern(argument, rest_value, ctx, is_const, is_var)?;
+                        } else {
+                            let elem_value = get_array_element(&value, index)?;
+                            bind_pattern(elem_pattern, elem_value, ctx, is_const, is_var)?;
+                        }
                     }
+                    // None means hole/skip - do nothing
                 }
-                // None means hole/skip - do nothing
+                return Ok(());
             }
-            Ok(())
+            // General path: drive the iterator protocol (generators, custom
+            // iterables, strings, arrays with an overridden Symbol.iterator).
+            let iter = get_iterator(&value, ctx)?;
+            drive_array_pattern(&iter, elements, ctx, |pat, v, ctx| {
+                bind_pattern(pat, v, ctx, is_const, is_var)
+            })
         }
 
         PatternType::AssignmentPattern { left, right, .. } => {
@@ -466,26 +477,6 @@ fn get_property_key_name(key_expr: &ExpressionType) -> Result<String, JErrorType
     }
 }
 
-/// Get a property value from an object (for destructuring).
-fn get_property_value(obj: &JsValue, key: &str) -> Result<JsValue, JErrorType> {
-    use crate::runner::ds::object_property::{PropertyDescriptor, PropertyKey};
-
-    match obj {
-        JsValue::Object(obj_ref) => {
-            let borrowed = obj_ref.borrow();
-            let base = borrowed.as_js_object().get_object_base();
-            let prop_key = PropertyKey::Str(key.to_string());
-
-            if let Some(PropertyDescriptor::Data(data)) = base.properties.get(&prop_key) {
-                Ok(data.value.clone())
-            } else {
-                Ok(JsValue::Undefined)
-            }
-        }
-        _ => Err(JErrorType::TypeError("Cannot destructure non-object".to_string())),
-    }
-}
-
 /// Get an element from an array by index (for destructuring).
 fn get_array_element(arr: &JsValue, index: usize) -> Result<JsValue, JErrorType> {
     use crate::runner::ds::object_property::{PropertyDescriptor, PropertyKey};
@@ -507,65 +498,21 @@ fn get_array_element(arr: &JsValue, index: usize) -> Result<JsValue, JErrorType>
 }
 
 /// Get remaining elements from an array starting at index (for rest patterns).
+/// Returns a genuine JS Array (carrying the `__array__` marker) so that
+/// `Array.isArray(rest)` holds and a nested `[...[...x]]` rest keeps working.
 fn get_rest_elements(arr: &JsValue, start_index: usize) -> Result<JsValue, JErrorType> {
-    use crate::runner::ds::object::{JsObject, JsObjectType, ObjectType};
-    use crate::runner::ds::object_property::{PropertyDescriptor, PropertyDescriptorData, PropertyKey};
-    use crate::runner::ds::value::JsNumberType;
-    use crate::runner::plugin::types::SimpleObject;
-    use core::cell::RefCell;
-    use alloc::rc::Rc;
-
     match arr {
-        JsValue::Object(obj_ref) => {
-            let borrowed = obj_ref.borrow();
-            let base = borrowed.as_js_object().get_object_base();
-
-            // Get original array length
-            let length = if let Some(PropertyDescriptor::Data(data)) =
-                base.properties.get(&PropertyKey::Str("length".to_string()))
-            {
-                match &data.value {
-                    JsValue::Number(JsNumberType::Integer(n)) => *n as usize,
-                    JsValue::Number(JsNumberType::Float(n)) => *n as usize,
-                    _ => 0,
-                }
-            } else {
-                0
-            };
-
-            // Create a new array with remaining elements
-            let mut rest_obj = SimpleObject::new();
-            let mut rest_index = 0;
-
-            for i in start_index..length {
-                let prop_key = PropertyKey::Str(i.to_string());
-                if let Some(PropertyDescriptor::Data(data)) = base.properties.get(&prop_key) {
-                    rest_obj.get_object_base_mut().properties.insert(
-                        PropertyKey::Str(rest_index.to_string()),
-                        PropertyDescriptor::Data(PropertyDescriptorData {
-                            value: data.value.clone(),
-                            writable: true,
-                            enumerable: true,
-                            configurable: true,
-                        }),
-                    );
-                    rest_index += 1;
+        JsValue::Object(_) => {
+            let len = crate::runner::eval::expression::array_len(arr);
+            let mut rest: Vec<JsValue> = Vec::new();
+            for i in start_index..len {
+                if let Some(v) = crate::runner::eval::expression::get_own_prop_value(arr, &i.to_string()) {
+                    rest.push(v);
+                } else {
+                    rest.push(JsValue::Undefined);
                 }
             }
-
-            // Set length
-            rest_obj.get_object_base_mut().properties.insert(
-                PropertyKey::Str("length".to_string()),
-                PropertyDescriptor::Data(PropertyDescriptorData {
-                    value: JsValue::Number(JsNumberType::Integer(rest_index as i64)),
-                    writable: true,
-                    enumerable: false,
-                    configurable: false,
-                }),
-            );
-
-            let obj: JsObjectType = Rc::new(RefCell::new(ObjectType::Ordinary(Box::new(rest_obj))));
-            Ok(JsValue::Object(obj))
+            Ok(crate::runner::eval::expression::make_array(rest))
         }
         _ => Err(JErrorType::TypeError("Cannot use rest with non-array".to_string())),
     }

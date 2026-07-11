@@ -1311,7 +1311,7 @@ fn call_function_object_inner(
 
 
 /// Get a property from a value, calling getters if necessary.
-fn get_property_with_ctx(value: &JsValue, prop_name: &str, ctx: &mut EvalContext) -> ValueResult {
+pub fn get_property_with_ctx(value: &JsValue, prop_name: &str, ctx: &mut EvalContext) -> ValueResult {
     // Use the receiver version with value as both receiver and lookup target
     get_property_with_receiver(value, value, prop_name, ctx)
 }
@@ -1358,6 +1358,31 @@ fn get_property_with_receiver(
                 // Return a special "next" method that calls the generator's next
                 // We create a wrapper function that holds a reference to the generator
                 return create_generator_next_method(obj.clone());
+            }
+
+            // Well-known symbols are exposed as static members of the `Symbol`
+            // builtin (`Symbol.iterator`, `Symbol.toPrimitive`, …) so that
+            // `obj[Symbol.iterator]` resolves to the canonical symbol value.
+            {
+                let is_symbol_builtin = {
+                    let obj_ref = obj.borrow();
+                    match obj_ref
+                        .as_js_object()
+                        .get_object_base()
+                        .properties
+                        .get(&PropertyKey::Str("__builtin_name__".to_string()))
+                    {
+                        Some(PropertyDescriptor::Data(d)) => {
+                            matches!(&d.value, JsValue::String(s) if s == "Symbol")
+                        }
+                        _ => false,
+                    }
+                };
+                if is_symbol_builtin {
+                    if let Some(sym) = well_known_symbol(prop_name) {
+                        return Ok(sym);
+                    }
+                }
             }
 
             let prop_key = PropertyKey::Str(prop_name.to_string());
@@ -1556,7 +1581,14 @@ fn call_function_with_body(
 
 /// Convert a value to a property key string.
 fn to_property_key(value: &JsValue) -> String {
-    to_string(value)
+    match value {
+        // Symbols must key distinctly (by their canonical `Symbol(desc)` form)
+        // rather than collapsing to one `[Symbol]` string, so that e.g.
+        // `obj[Symbol.iterator]` and `obj[Symbol.toPrimitive]` are separate
+        // properties. Matches `value_to_property_key` (used by call dispatch).
+        JsValue::Symbol(_) => value_to_property_key(value),
+        _ => to_string(value),
+    }
 }
 
 /// Evaluate an assignment expression.
@@ -1696,18 +1728,30 @@ fn assign_pattern(
             Ok(())
         }
         PatternType::ArrayPattern { elements, .. } => {
-            for (index, element) in elements.iter().enumerate() {
-                if let Some(elem_pattern) = element {
-                    if let PatternType::RestElement { argument, .. } = elem_pattern.as_ref() {
-                        let rest_value = get_rest_elements_for_assignment(&value, index, ctx)?;
-                        assign_pattern(argument, rest_value, ctx)?;
-                    } else {
-                        let elem_value = get_array_element_for_assignment(&value, index, ctx)?;
-                        assign_pattern(elem_pattern, elem_value, ctx)?;
+            // Array destructuring requires an iterable; `null`/`undefined` throw.
+            if matches!(value, JsValue::Null | JsValue::Undefined) {
+                return Err(JErrorType::TypeError("value is not iterable".to_string()));
+            }
+            // Fast path: a genuine array using the default iteration protocol.
+            if is_array(&value) && !has_custom_iterator(&value, ctx) {
+                for (index, element) in elements.iter().enumerate() {
+                    if let Some(elem_pattern) = element {
+                        if let PatternType::RestElement { argument, .. } = elem_pattern.as_ref() {
+                            let rest_value = get_rest_elements_for_assignment(&value, index, ctx)?;
+                            assign_pattern(argument, rest_value, ctx)?;
+                        } else {
+                            let elem_value = get_array_element_for_assignment(&value, index, ctx)?;
+                            assign_pattern(elem_pattern, elem_value, ctx)?;
+                        }
                     }
                 }
+                return Ok(());
             }
-            Ok(())
+            // General path: drive the iterator protocol.
+            let iter = get_iterator(&value, ctx)?;
+            drive_array_pattern(&iter, elements, ctx, |pat, v, ctx| {
+                assign_pattern(pat, v, ctx)
+            })
         }
         PatternType::AssignmentPattern { left, right, .. } => {
             let actual_value = if matches!(value, JsValue::Undefined) {
@@ -1788,11 +1832,6 @@ fn get_rest_elements_for_assignment(
     start_index: usize,
     ctx: &mut EvalContext,
 ) -> Result<JsValue, JErrorType> {
-    use crate::runner::ds::object::{JsObject, JsObjectType, ObjectType};
-    use crate::runner::ds::object_property::{PropertyDescriptor, PropertyDescriptorData, PropertyKey};
-    use core::cell::RefCell;
-    use alloc::rc::Rc;
-
     let length = match arr {
         JsValue::Object(_) => {
             let length_value = get_property_with_ctx(arr, "length", ctx)?;
@@ -1815,36 +1854,13 @@ fn get_rest_elements_for_assignment(
         }
     };
 
-    let mut rest_obj = ctx.new_tracked_object()?;
-    let mut rest_index = 0;
-
+    // Produce a genuine JS Array (with the `__array__` marker) so
+    // `Array.isArray(rest)` holds and nested rest patterns keep iterating.
+    let mut rest: Vec<JsValue> = Vec::with_capacity(length.saturating_sub(start_index));
     for i in start_index..length {
-        let key = i.to_string();
-        let value = get_property_with_ctx(arr, &key, ctx)?;
-        rest_obj.get_object_base_mut().properties.insert(
-            PropertyKey::Str(rest_index.to_string()),
-            PropertyDescriptor::Data(PropertyDescriptorData {
-                value,
-                writable: true,
-                enumerable: true,
-                configurable: true,
-            }),
-        );
-        rest_index += 1;
+        rest.push(get_property_with_ctx(arr, &i.to_string(), ctx)?);
     }
-
-    rest_obj.get_object_base_mut().properties.insert(
-        PropertyKey::Str("length".to_string()),
-        PropertyDescriptor::Data(PropertyDescriptorData {
-            value: JsValue::Number(JsNumberType::Integer(rest_index as i64)),
-            writable: true,
-            enumerable: false,
-            configurable: false,
-        }),
-    );
-
-    let obj: JsObjectType = Rc::new(RefCell::new(ObjectType::Ordinary(Box::new(rest_obj))));
-    Ok(JsValue::Object(obj))
+    Ok(make_array(rest))
 }
 
 /// Evaluate assignment to a member expression (obj.prop = value or obj[prop] = value).
@@ -3297,6 +3313,31 @@ pub fn own_string_keys(v: &JsValue) -> Vec<alloc::string::String> {
     out
 }
 
+/// Own string keys whose property is enumerable (data **or** accessor),
+/// excluding internal `__…__` markers. Used by object-rest destructuring, which
+/// copies only enumerable own properties.
+pub fn own_enumerable_string_keys(v: &JsValue) -> Vec<alloc::string::String> {
+    let mut out = Vec::new();
+    if let JsValue::Object(o) = v {
+        let b = o.borrow();
+        for (k, desc) in b.as_js_object().get_object_base().properties.iter() {
+            if let PropertyKey::Str(name) = k {
+                if name.starts_with("__") && name.ends_with("__") {
+                    continue;
+                }
+                let enumerable = match desc {
+                    PropertyDescriptor::Data(d) => d.enumerable,
+                    PropertyDescriptor::Accessor(a) => a.enumerable,
+                };
+                if enumerable {
+                    out.push(name.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Set an own data property on an object value (no-op if `v` isn't an object).
 pub fn set_own_prop(v: &JsValue, name: &str, value: JsValue, enumerable: bool) {
     if let JsValue::Object(o) = v {
@@ -3480,6 +3521,14 @@ pub fn is_anonymous_function_expr(expr: &ExpressionType) -> bool {
         ExpressionType::FunctionOrGeneratorExpression(d) => d.id.is_none(),
         ExpressionType::ArrowFunctionExpression { .. } => true,
         ExpressionType::ClassExpression(c) => c.id.is_none(),
+        // A parenthesized anonymous function is still an anonymous function
+        // definition for name inference (`f = (function(){})`). The parser
+        // models `( expr )` as a single-element `SequenceExpression`; a multi-
+        // element sequence (`(0, function(){})`) is a comma expression and does
+        // NOT qualify.
+        ExpressionType::SequenceExpression { expressions, .. } => {
+            expressions.len() == 1 && is_anonymous_function_expr(&expressions[0])
+        }
         _ => false,
     }
 }
@@ -3494,18 +3543,28 @@ pub fn infer_function_name(value: &JsValue, name: &str) {
     if let JsValue::Object(o) = value {
         let mut b = o.borrow_mut();
         let base = b.as_js_object_mut().get_object_base_mut();
-        // Only for callables that carry the simple-function marker.
-        let is_fn = matches!(
-            base.properties.get(&PropertyKey::Str("__simple_function__".to_string())),
-            Some(PropertyDescriptor::Data(_))
-        );
+        // Only for callables: a simple function, or a class constructor (whether
+        // user-defined or the synthesized default constructor).
+        let is_fn = ["__simple_function__", "__class_constructor__", "__default_constructor__"]
+            .iter()
+            .any(|m| {
+                matches!(
+                    base.properties.get(&PropertyKey::Str(m.to_string())),
+                    Some(PropertyDescriptor::Data(_))
+                )
+            });
         if !is_fn {
             return;
         }
-        let empty = matches!(
-            base.properties.get(&PropertyKey::Str("name".to_string())),
-            Some(PropertyDescriptor::Data(d)) if matches!(&d.value, JsValue::String(s) if s.is_empty())
-        );
+        // Infer only when `name` is absent or still the empty string (a named
+        // function/class keeps its own name).
+        let empty = match base.properties.get(&PropertyKey::Str("name".to_string())) {
+            Some(PropertyDescriptor::Data(d)) => {
+                matches!(&d.value, JsValue::String(s) if s.is_empty())
+            }
+            None => true,
+            _ => false,
+        };
         if empty {
             base.properties.insert(
                 PropertyKey::Str("name".to_string()),
@@ -3820,6 +3879,296 @@ fn create_iterator_result(value: JsValue, done: bool) -> ValueResult {
     Ok(JsValue::Object(obj_ref))
 }
 
+/// Map a `Symbol.<name>` static-member name to its canonical well-known symbol
+/// value. Returns `None` for names that are not well-known symbols.
+pub fn well_known_symbol(name: &str) -> Option<JsValue> {
+    use crate::runner::ds::symbol::{
+        SYMBOL_HAS_INSTANCE, SYMBOL_IS_CONCAT_SPREADABLE, SYMBOL_ITERATOR, SYMBOL_MATCH,
+        SYMBOL_REPLACE, SYMBOL_SEARCH, SYMBOL_SPECIES, SYMBOL_SPLIT, SYMBOL_TO_PRIMITIVE,
+        SYMBOL_TO_STRING_TAG,
+    };
+    let sym = match name {
+        "iterator" => SYMBOL_ITERATOR.clone(),
+        "hasInstance" => SYMBOL_HAS_INSTANCE.clone(),
+        "isConcatSpreadable" => SYMBOL_IS_CONCAT_SPREADABLE.clone(),
+        "match" => SYMBOL_MATCH.clone(),
+        "replace" => SYMBOL_REPLACE.clone(),
+        "search" => SYMBOL_SEARCH.clone(),
+        "species" => SYMBOL_SPECIES.clone(),
+        "split" => SYMBOL_SPLIT.clone(),
+        "toPrimitive" => SYMBOL_TO_PRIMITIVE.clone(),
+        "toStringTag" => SYMBOL_TO_STRING_TAG.clone(),
+        _ => return None,
+    };
+    Some(JsValue::Symbol(sym))
+}
+
+/// The string property key under which a value's `Symbol.iterator` method is
+/// stored. The interpreter keys symbol-valued properties by their stringified
+/// form (`value_to_property_key`), so a lookup must use the same string.
+fn symbol_iterator_key() -> String {
+    value_to_property_key(&JsValue::Symbol(
+        crate::runner::ds::symbol::SYMBOL_ITERATOR.clone(),
+    ))
+}
+
+/// Does `value` carry a callable `[Symbol.iterator]` method (own or inherited)?
+/// Used by array destructuring to decide between the index-based fast path
+/// (plain arrays) and the generic iterator protocol.
+pub fn has_custom_iterator(value: &JsValue, ctx: &mut EvalContext) -> bool {
+    let key = symbol_iterator_key();
+    match get_property_with_receiver(value, value, &key, ctx) {
+        Ok(m) => value_is_callable(&m),
+        Err(_) => false,
+    }
+}
+
+/// Is `value` already an iterator — a generator object, or an object exposing a
+/// callable `next` method?
+fn is_iterator_like(value: &JsValue, ctx: &mut EvalContext) -> bool {
+    if let JsValue::Object(o) = value {
+        let marker = PropertyKey::Str("__generator_object__".to_string());
+        if o.borrow()
+            .as_js_object()
+            .get_object_base()
+            .properties
+            .contains_key(&marker)
+        {
+            return true;
+        }
+    }
+    match get_property_with_receiver(value, value, "next", ctx) {
+        Ok(m) => value_is_callable(&m),
+        Err(_) => false,
+    }
+}
+
+/// Build a native default iterator over a genuine array or a string primitive.
+/// Stepped directly by [`iterator_step`] (it carries no user-level `next`).
+fn make_native_iterator(target: JsValue) -> JsValue {
+    make_object(vec![
+        ("__native_iter__".to_string(), JsValue::Boolean(true)),
+        (
+            "__native_iter_index__".to_string(),
+            JsValue::Number(JsNumberType::Integer(0)),
+        ),
+        ("__native_iter_target__".to_string(), target),
+    ])
+}
+
+/// ES `GetIterator(obj)` (sync form). Returns the iterator object that
+/// [`iterator_step`]/[`iterator_close`] then drive.
+pub fn get_iterator(value: &JsValue, ctx: &mut EvalContext) -> ValueResult {
+    if matches!(value, JsValue::Null | JsValue::Undefined) {
+        return Err(JErrorType::TypeError("value is not iterable".to_string()));
+    }
+    // 1. An explicit `[Symbol.iterator]` method wins (user iterables and any
+    //    array/object that overrides the default).
+    let key = symbol_iterator_key();
+    let method = get_property_with_receiver(value, value, &key, ctx)?;
+    if value_is_callable(&method) {
+        let iter = call_value(&method, value.clone(), Vec::new(), ctx)?;
+        if !matches!(iter, JsValue::Object(_)) {
+            return Err(JErrorType::TypeError(
+                "Result of Symbol.iterator method is not an object".to_string(),
+            ));
+        }
+        return Ok(iter);
+    }
+    // 2. Genuine arrays and strings get the native default iterator.
+    if is_array(value) || matches!(value, JsValue::String(_)) {
+        return Ok(make_native_iterator(value.clone()));
+    }
+    // 3. A value that is already an iterator is its own iterator.
+    if is_iterator_like(value, ctx) {
+        return Ok(value.clone());
+    }
+    Err(JErrorType::TypeError("value is not iterable".to_string()))
+}
+
+/// ES `IteratorStep` + value read. `Ok(Some(v))` yields the next value,
+/// `Ok(None)` signals the iterator is exhausted (`done: true`).
+pub fn iterator_step(
+    iter: &JsValue,
+    ctx: &mut EvalContext,
+) -> Result<Option<JsValue>, JErrorType> {
+    // Native default iterator (array / string) — stepped directly.
+    if matches!(
+        get_own_prop_value(iter, "__native_iter__"),
+        Some(JsValue::Boolean(true))
+    ) {
+        let idx = match get_own_prop_value(iter, "__native_iter_index__") {
+            Some(JsValue::Number(JsNumberType::Integer(n))) => n.max(0) as usize,
+            _ => 0,
+        };
+        let target = get_own_prop_value(iter, "__native_iter_target__").unwrap_or(JsValue::Undefined);
+        let value = match &target {
+            JsValue::String(s) => {
+                let chars: Vec<char> = s.chars().collect();
+                if idx < chars.len() {
+                    Some(JsValue::String(chars[idx].to_string()))
+                } else {
+                    None
+                }
+            }
+            _ => {
+                if idx < array_len(&target) {
+                    Some(get_own_prop_value(&target, &idx.to_string()).unwrap_or(JsValue::Undefined))
+                } else {
+                    None
+                }
+            }
+        };
+        return match value {
+            Some(v) => {
+                set_own_prop(
+                    iter,
+                    "__native_iter_index__",
+                    JsValue::Number(JsNumberType::Integer((idx + 1) as i64)),
+                    false,
+                );
+                Ok(Some(v))
+            }
+            None => Ok(None),
+        };
+    }
+    // Generic path: call `iter.next()` and read `done`/`value` off the result.
+    let next_method = get_property_with_receiver(iter, iter, "next", ctx)?;
+    if !value_is_callable(&next_method) {
+        return Err(JErrorType::TypeError(
+            "iterator.next is not a function".to_string(),
+        ));
+    }
+    let result = call_value(&next_method, iter.clone(), Vec::new(), ctx)?;
+    if !matches!(result, JsValue::Object(_)) {
+        return Err(JErrorType::TypeError(
+            "iterator result is not an object".to_string(),
+        ));
+    }
+    let done = get_property_with_receiver(&result, &result, "done", ctx)?;
+    if to_boolean(&done) {
+        Ok(None)
+    } else {
+        let value = get_property_with_receiver(&result, &result, "value", ctx)?;
+        Ok(Some(value))
+    }
+}
+
+/// ES `IteratorClose` (best-effort). Calls `iter.return()` if present, ignoring
+/// its result/errors — used on an abrupt or early completion of destructuring.
+pub fn iterator_close(iter: &JsValue, ctx: &mut EvalContext) {
+    if matches!(
+        get_own_prop_value(iter, "__native_iter__"),
+        Some(JsValue::Boolean(true))
+    ) {
+        return;
+    }
+    if let Ok(ret) = get_property_with_receiver(iter, iter, "return", ctx) {
+        if value_is_callable(&ret) {
+            let _ = call_value(&ret, iter.clone(), Vec::new(), ctx);
+        }
+    }
+}
+
+/// Drive an iterator through an array binding/assignment pattern's elements,
+/// invoking `bind` for each obtained value. Shared by `let/var/const`
+/// destructuring (`bind_pattern`) and destructuring assignment
+/// (`assign_pattern`); `bind` receives `(element_pattern, value)` and does the
+/// actual binding. Handles elisions, a trailing rest element, and closing the
+/// iterator on early/abrupt completion per the spec.
+pub fn drive_array_pattern<F>(
+    iter: &JsValue,
+    elements: &[Option<Box<PatternType>>],
+    ctx: &mut EvalContext,
+    mut bind: F,
+) -> Result<(), JErrorType>
+where
+    F: FnMut(&PatternType, JsValue, &mut EvalContext) -> Result<(), JErrorType>,
+{
+    let mut done = false;
+    let mut outcome: Result<(), JErrorType> = Ok(());
+
+    'outer: for element in elements.iter() {
+        match element {
+            // Elision (`[, x]`) — consume one step, bind nothing.
+            None => {
+                if !done {
+                    match iterator_step(iter, ctx) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => done = true,
+                        Err(e) => {
+                            done = true;
+                            outcome = Err(e);
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            Some(elem_pattern) => {
+                if let PatternType::RestElement { argument, .. } = elem_pattern.as_ref() {
+                    // Rest element drains every remaining step into a new array.
+                    // Bounded so a misbehaving/endless iterator throws instead of
+                    // exhausting the kernel heap (same posture as the call-depth
+                    // guard) — no legitimate `[...rest]` reaches 2^24 elements.
+                    const REST_CAP: usize = 1 << 24;
+                    let mut rest: Vec<JsValue> = Vec::new();
+                    while !done {
+                        if rest.len() >= REST_CAP {
+                            done = true;
+                            outcome = Err(JErrorType::RangeError(
+                                "iterator produced too many values for a rest binding".to_string(),
+                            ));
+                            break 'outer;
+                        }
+                        match iterator_step(iter, ctx) {
+                            Ok(Some(v)) => rest.push(v),
+                            Ok(None) => done = true,
+                            Err(e) => {
+                                done = true;
+                                outcome = Err(e);
+                                break 'outer;
+                            }
+                        }
+                    }
+                    let rest_arr = make_array(rest);
+                    if let Err(e) = bind(argument, rest_arr, ctx) {
+                        outcome = Err(e);
+                        break 'outer;
+                    }
+                } else {
+                    let v = if done {
+                        JsValue::Undefined
+                    } else {
+                        match iterator_step(iter, ctx) {
+                            Ok(Some(v)) => v,
+                            Ok(None) => {
+                                done = true;
+                                JsValue::Undefined
+                            }
+                            Err(e) => {
+                                done = true;
+                                outcome = Err(e);
+                                break 'outer;
+                            }
+                        }
+                    };
+                    if let Err(e) = bind(elem_pattern, v, ctx) {
+                        outcome = Err(e);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+
+    // Close the iterator whenever it wasn't exhausted (both on normal early
+    // completion and on an abrupt completion that left `done` false).
+    if !done {
+        iterator_close(iter, ctx);
+    }
+    outcome
+}
+
 /// Create a generator object from a generator function.
 fn create_generator_object(
     body_ptr: *const crate::parser::ast::FunctionBodyData,
@@ -3960,6 +4309,33 @@ pub fn evaluate_class(class_data: &ClassData, ctx: &mut EvalContext) -> ValueRes
         // Create a default constructor
         create_default_constructor(parent_proto.as_ref().map(|(p, _)| p.clone()), instance_fields, ctx)?
     };
+
+    // 3b. A class's `name` is its binding identifier (`class X {}` → "X"), or the
+    // empty string for an anonymous class — which later name inference
+    // (`let C = class {}`, `[C = class {}] = []`) fills in. Stored non-enumerable
+    // like `Function.prototype.name`.
+    {
+        let class_name = class_data
+            .id
+            .as_ref()
+            .map(|id| id.name.clone())
+            .unwrap_or_default();
+        if let JsValue::Object(o) = &constructor_obj {
+            o.borrow_mut()
+                .as_js_object_mut()
+                .get_object_base_mut()
+                .properties
+                .insert(
+                    PropertyKey::Str("name".to_string()),
+                    PropertyDescriptor::Data(PropertyDescriptorData {
+                        value: JsValue::String(class_name),
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    }),
+                );
+        }
+    }
 
     // 4. Create the prototype object
     let prototype = if let Some((_, parent_proto)) = &parent_proto {

@@ -191,20 +191,55 @@ genuine bug or gap that also affects real pages (not conformance-only):
   page's scripts no longer freeze the shell thread. The interrupt is
   **uncatchable** (a script `try/catch` can't swallow it).
 
+## Fix 9 — the three big conformance subsystems: BigInt, regex engine, iterator protocol
+
+Built out (multi-agent, one subsystem per specialist on the shared tree) the
+three subsystems Fix 8 had documented as deferred. test262 **912 → 1015 (+103)**,
+0 panics, both arches build, vercel still 41/41 parse.
+
+- **BigInt** (`num-bigint`, no_std) — new `JsValue::BigInt`; `bigint_literal`
+  grammar (`123n`/`0x1Fn`/`0o7n`/`0b1n`, separators; `00n`/`08n`/`1e2n`/`1.0n`
+  stay rejected); every operator + coercion (mixed BigInt/Number → TypeError,
+  div/mod `0n` → RangeError, `**` neg → RangeError, `>>>`/unary-`+` → TypeError,
+  cross-type compare/`==`, `typeof`→"bigint"); `BigInt()` ToBigInt; `new BigInt`
+  → TypeError. **literals/bigint 39 → 59, arithmetic dirs cleared** (+34). 22
+  unit tests. (Deferred: `Object(2n)` boxing + `Symbol.toPrimitive` object
+  coercion — a separate `to_primitive` gap.)
+- **Regex engine** (`std_lib/regexp.rs`) — a strict `validate(pattern, flags)`
+  pass wired at parse time closes ~31 early-error negatives (unknown/dup flags,
+  `u`/`v` exclusivity, atom-less quantifier, invalid class ranges, `u`-mode
+  escape strictness, quantified assertions); `lastIndex` made
+  non-enumerable/non-configurable; flags **m/s/y** threaded through the matcher;
+  **`u`-mode** unicode escapes + astral code-point ranges + `iu` case-fold;
+  **named groups + backreferences** (`(?<n>)`, `\k<n>`, `\1`, `.groups`).
+  **literals/regexp 193 → 237** (+44). Bonus root-cause: **string-literal escape
+  cooking was broken** — `"\n"`/`"A"`/`"\x41"` were stored verbatim; added
+  `cook_string_literal` in `api.rs` (helped the wider corpus too). 10 unit tests.
+- **Iterator-protocol array destructuring** — generic `get_iterator` /
+  `iterator_step` / `iterator_close` + a real default Array iterator wired to a
+  well-known `Symbol.iterator`; `bind_pattern`/`assign_pattern` ArrayPattern arms
+  keep a fast index path for genuine arrays and drive the iterator otherwise
+  (elision consumes a step, rest drains, close-on-abrupt-completion). **dstr
+  66 → 88.** 21 unit tests. NB a **crash fix**: an unbounded rest-drain
+  (`[...x] = endlessIterable`) OOM-killed the host — now capped
+  (`REST_CAP = 1<<24` → RangeError), same posture as the call-depth guard.
+
+The 7 `parses_to!` golden token-tree unit tests that Fixes 6–9 invalidated
+(added `coalesce`/`exponentiation` layers, non-atomic templates, cooked strings)
+were regenerated to the new correct parse output; the just-ref lib suite is
+85/85 green.
+
 ## Final state
 
-files=1104 **pass=912** skip=64 panics=0. jQuery 3.7.1 slim + lodash-core
-parse+run; **41/41 vercel.com chunks parse (skip=0)**; the two `--raw` runtime
-errors left are bare-harness environment gaps (`self is not defined`, webpack
-module-registry `.call`) — both chunks parse and run in the browser tier.
+files=1104 **pass=1015** skip=22 panics=0 (**93.8%** of runnable). jQuery 3.7.1
+slim + lodash-core parse+run; **41/41 vercel.com chunks parse (skip=0)**; the two
+`--raw` runtime errors left are bare-harness environment gaps (`self is not
+defined`, webpack module-registry `.call`) — both chunks run in the browser tier.
+just-ref host tests: lib 85/85, BigInt 22/22, iterator-dstr 21/21.
 
-**Remaining test262 failures are deep-conformance features, not real-page
-blockers** (the common case of each already works, verified by probing): the
-regexp early-error + `u`-flag/named-group/sticky semantics (~43), iterator-
-protocol array-destructuring edge cases — generator side-effect ordering,
-iterator-close-on-error (~29), `eval` completion-value (`UpdateEmpty`)
-semantics (~20), BigInt arbitrary-precision (~parse-skips), `Symbol.toPrimitive`
-coercion ordering, strict-mode early errors, and the module/async harness
-skips. Each needs substantial machinery (a regex-engine rewrite, a full
-iterator protocol, arbitrary-precision integers) for negligible page-render
-gain, so they are documented rather than half-implemented.
+**Remaining ~67 test262 fails** are narrower conformance edges: `eval`
+completion-value (`UpdateEmpty`) semantics (~20), `Symbol.toPrimitive`/`Object(2n)`
+object-coercion (needs the `to_primitive` object path), a few strict-mode early
+errors, class-static-method persistence, a real `Array.prototype`/accessor
+`defineProperty`, and legacy Annex-B octal/escape forms. Each is a self-contained
+follow-up; none blocks real page rendering.
