@@ -487,6 +487,8 @@ fn net_cmd(arg: &str) {
                     serial_println!("  dns    {d}");
                 }
             }
+            let (dc_n, dc_hits, dc_miss) = crate::net::dns_cache_stats();
+            serial_println!("  dns$   {dc_n} cached, {dc_hits} hits, {dc_miss} misses");
         }
         "dhcp" => match crate::net::dhcp_start() {
             Ok(()) => {
@@ -6991,6 +6993,44 @@ fn browser_js_tick() -> bool {
     poll_interrupt()
 }
 
+/// The `host[:port]` of an `http(s)://` URL, or `None`.
+fn http_host_of(url: &str) -> Option<alloc::string::String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host = rest.split(['/', ':', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// **DNS prefetch**: warm the resolver cache for the distinct *cross-origin*
+/// hosts among `hrefs` (resolved against `base`), so their subresource fetches
+/// skip the DNS round trip. The page's own host is already resolved (document
+/// fetch), so only foreign hosts (CDNs) are prefetched — a small, bounded set.
+fn browser_prefetch_dns<'a>(hrefs: impl Iterator<Item = &'a str>, base: &str) {
+    let same = http_host_of(base);
+    let mut seen: alloc::collections::BTreeSet<alloc::string::String> =
+        alloc::collections::BTreeSet::new();
+    for href in hrefs {
+        let abs = crate::browser::url::resolve(base, href).unwrap_or_else(|| href.to_string());
+        if let Some(host) = http_host_of(&abs) {
+            if Some(&host) == same.as_ref() {
+                continue; // same origin — already resolved
+            }
+            if seen.insert(host.clone()) {
+                crate::net::prefetch_dns(&host);
+                upkeep();
+                if poll_interrupt() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn browser_load_method(
     url: &str,
     method: &str,
@@ -7108,6 +7148,19 @@ fn browser_load_method(
     // via the session path).
     let pre = crate::browser::html::parse(&body_html);
     let is_http = |u: &str| u.starts_with("http://") || u.starts_with("https://");
+
+    // DNS prefetch: resolve the cross-origin hosts of this page's scripts +
+    // stylesheets up front so their fetches (below) skip the DNS round trip.
+    browser_prefetch_dns(
+        pre.script_tags
+            .iter()
+            .filter_map(|t| t.src.as_deref())
+            .chain(pre.styles_ordered.iter().filter_map(|s| match s {
+                crate::browser::html::StyleSrc::External(href) => Some(href.as_str()),
+                _ => None,
+            })),
+        &final_url,
+    );
 
     // (a) External scripts.
     let mut script_urls: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
@@ -7461,8 +7514,9 @@ fn browser_load_method(
     browser_present(&pixels, &title, &final_url, scroll0, content_h);
     let chk = crate::browser::paint::checksum(&pixels);
     let (cache_n, cache_b, hits, misses) = crate::browser::loader::cache_stats();
+    let (dns_n, dns_hits, dns_miss) = crate::net::dns_cache_stats();
     alloc::format!(
-        "ok:title={} url={} redirects={redirects} status={status} cache={} imgs={n_imgs} forms={} iframes={} mem={cache_n}/{cache_b}b hits={hits} misses={misses} checksum={chk:016x} size={}x{}",
+        "ok:title={} url={} redirects={redirects} status={status} cache={} imgs={n_imgs} forms={} iframes={} mem={cache_n}/{cache_b}b hits={hits} misses={misses} dns={dns_n}/{dns_hits}h/{dns_miss}m checksum={chk:016x} size={}x{}",
         title,
         final_url,
         if from_cache { "hit" } else { "miss" },

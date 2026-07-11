@@ -400,11 +400,84 @@ pub fn fmt_mac(m: &[u8; 6]) -> String {
     alloc::format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5])
 }
 
-// --- DNS resolution ------------------------------------------------------
+// --- DNS resolution + cache ---------------------------------------------
+
+/// Resolved-host cache: `name` → `(addr, expiry_ms)`. Avoids re-querying DNS for
+/// every subresource fetch to the same host (a page pulls dozens of assets off a
+/// handful of CDN hosts — without this each one paid a full DNS round trip).
+/// Bounded; entries expire after [`DNS_TTL_MS`].
+static DNS_CACHE: Locked<BTreeMap<String, (Ipv4Address, u64)>> = Locked::new(BTreeMap::new());
+static DNS_HITS: AtomicU64 = AtomicU64::new(0);
+static DNS_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// How long a cached resolution stays fresh (smoltcp doesn't surface the record
+/// TTL, so use a conservative fixed lifetime).
+const DNS_TTL_MS: u64 = 300_000; // 5 min
+/// Cap on cached hosts (LRU-ish: cleared wholesale when exceeded — tiny + rare).
+const DNS_CACHE_CAP: usize = 128;
+
+/// Look up `name` in the DNS cache if still fresh.
+fn dns_cache_get(name: &str, now: u64) -> Option<Ipv4Address> {
+    DNS_CACHE.with(|c| {
+        c.get(name)
+            .and_then(|(a, exp)| if *exp > now { Some(*a) } else { None })
+    })
+}
+
+/// Insert `name → addr` with a fresh expiry.
+fn dns_cache_put(name: &str, addr: Ipv4Address, now: u64) {
+    DNS_CACHE.with(|c| {
+        if c.len() >= DNS_CACHE_CAP && !c.contains_key(name) {
+            c.clear();
+        }
+        c.insert(String::from(name), (addr, now + DNS_TTL_MS));
+    });
+}
+
+/// `(cached_entries, hits, misses)` — for `/network` / diagnostics.
+pub fn dns_cache_stats() -> (usize, u64, u64) {
+    (
+        DNS_CACHE.with(|c| c.len()),
+        DNS_HITS.load(Ordering::Relaxed),
+        DNS_MISSES.load(Ordering::Relaxed),
+    )
+}
+
+/// Best-effort **DNS prefetch**: warm the cache for `host` (e.g. a page's
+/// subresource domains / `<link rel="dns-prefetch">`) so the real fetch skips
+/// the DNS round trip. No-op for empties/literals/`localhost`/already-cached;
+/// a short timeout keeps a dead host from stalling the caller.
+pub fn prefetch_dns(host: &str) {
+    if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+        return;
+    }
+    // Skip dotted-quad IPv4 literals (no DNS needed).
+    if host.split('.').count() == 4 && host.split('.').all(|p| p.parse::<u8>().is_ok()) {
+        return;
+    }
+    if dns_cache_get(host, crate::arch::now_ms()).is_some() {
+        return;
+    }
+    let _ = resolve(host, 2_000);
+}
 
 /// Resolve `name` to an IPv4 address, pumping the stack until the query
-/// completes or times out (~`timeout_ms`).
+/// completes or times out (~`timeout_ms`). Results are cached (see
+/// [`DNS_CACHE`]); a fresh cache hit returns immediately with no round trip.
 pub fn resolve(name: &str, timeout_ms: u64) -> Result<Ipv4Address, &'static str> {
+    let now = crate::arch::now_ms();
+    if let Some(addr) = dns_cache_get(name, now) {
+        DNS_HITS.fetch_add(1, Ordering::Relaxed);
+        return Ok(addr);
+    }
+    DNS_MISSES.fetch_add(1, Ordering::Relaxed);
+    let addr = resolve_uncached(name, timeout_ms)?;
+    dns_cache_put(name, addr, now);
+    Ok(addr)
+}
+
+/// The actual DNS query (uncached). Wrapped by [`resolve`].
+fn resolve_uncached(name: &str, timeout_ms: u64) -> Result<Ipv4Address, &'static str> {
     let query = NET.with(|n| {
         let s = n.as_mut().ok_or("no network interface")?;
         if s.dns_servers.is_empty() {
@@ -689,4 +762,36 @@ pub fn tcp_close(handle: TcpHandle) {
         }
     });
     poll();
+}
+
+#[cfg(test)]
+mod dns_tests {
+    use super::*;
+
+    #[test_case]
+    fn dns_cache_freshness_and_expiry() {
+        let a = Ipv4Address::new(93, 184, 216, 34);
+        DNS_CACHE.with(|c| c.clear());
+        dns_cache_put("example.com", a, 1_000);
+        // Fresh within the TTL window.
+        assert_eq!(dns_cache_get("example.com", 1_000), Some(a));
+        assert_eq!(dns_cache_get("example.com", 1_000 + DNS_TTL_MS - 1), Some(a));
+        // Expired at/after the deadline.
+        assert_eq!(dns_cache_get("example.com", 1_000 + DNS_TTL_MS), None);
+        assert_eq!(dns_cache_get("example.com", 1_000 + DNS_TTL_MS + 1), None);
+        // Unknown host misses.
+        assert_eq!(dns_cache_get("other.com", 1_000), None);
+        DNS_CACHE.with(|c| c.clear());
+    }
+
+    #[test_case]
+    fn dns_cache_cap_evicts() {
+        DNS_CACHE.with(|c| c.clear());
+        for i in 0..(DNS_CACHE_CAP + 5) {
+            dns_cache_put(&alloc::format!("h{i}.example"), Ipv4Address::new(10, 0, 0, 1), 0);
+        }
+        // Wholesale clear on overflow keeps the map bounded.
+        assert!(DNS_CACHE.with(|c| c.len()) <= DNS_CACHE_CAP);
+        DNS_CACHE.with(|c| c.clear());
+    }
 }
