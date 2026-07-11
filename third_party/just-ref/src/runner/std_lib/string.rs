@@ -53,6 +53,7 @@ fn to_string(value: &JsValue) -> String {
         JsValue::Null => "null".to_string(),
         JsValue::Boolean(b) => b.to_string(),
         JsValue::Number(n) => n.to_string(),
+        JsValue::BigInt(b) => b.to_string(),
         JsValue::Symbol(s) => s.to_string(),
         JsValue::Object(_) => "[object Object]".to_string(),
     }

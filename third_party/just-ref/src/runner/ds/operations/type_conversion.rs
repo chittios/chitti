@@ -23,6 +23,7 @@ pub const TYPE_STR_BOOLEAN_FALSE: &str = "false";
 pub const TYPE_STR_STRING: &str = "string";
 pub const TYPE_STR_SYMBOL: &str = "symbol";
 pub const TYPE_STR_NUMBER: &str = "number";
+pub const TYPE_STR_BIGINT: &str = "bigint";
 pub const TYPE_STR_OBJECT: &str = "object";
 pub const TYPE_STR_FUNCTION: &str = "function";
 pub const TYPE_STR_NUMBER_NAN: &str = "NaN";
@@ -36,6 +37,7 @@ pub fn get_type(a: &JsValue) -> &'static str {
         JsValue::String(_) => TYPE_STR_STRING,
         JsValue::Symbol(_) => TYPE_STR_SYMBOL,
         JsValue::Number(_) => TYPE_STR_NUMBER,
+        JsValue::BigInt(_) => TYPE_STR_BIGINT,
         JsValue::Object(o) => match *(**o).borrow() {
             ObjectType::Ordinary(_) => TYPE_STR_OBJECT,
             ObjectType::Function(_) => TYPE_STR_FUNCTION,
@@ -59,6 +61,7 @@ pub fn to_primitive(
         JsValue::String(_) => Ok(v.clone()),
         JsValue::Symbol(_) => Ok(v.clone()),
         JsValue::Number(_) => Ok(v.clone()),
+        JsValue::BigInt(_) => Ok(v.clone()),
         JsValue::Object(_) => {
             let _m = get_method(ctx_stack, v, &PropertyKey::Sym(SYMBOL_TO_PRIMITIVE.clone()));
             todo!()
@@ -80,6 +83,7 @@ pub fn to_object(v: &JsValue) -> Result<JsValue, JErrorType> {
         JsValue::String(_) => todo!(),
         JsValue::Symbol(_) => todo!(),
         JsValue::Number(_) => todo!(),
+        JsValue::BigInt(_) => todo!(),
         JsValue::Object(_) => Ok(v.clone()),
     }
 }
@@ -127,6 +131,7 @@ pub fn to_string(ctx_stack: &mut ExecutionContextStack, v: &JsValue) -> Result<S
             TYPE_STR_BOOLEAN_FALSE.to_string()
         }),
         JsValue::String(s) => Ok(s.to_string()),
+        JsValue::BigInt(b) => Ok(b.to_string()),
         JsValue::Symbol(s) => Err(JErrorType::TypeError(format!("'{}' is a symbol", s))),
         JsValue::Number(n) => Ok(match n {
             JsNumberType::Integer(i) => to_string_int(*i),

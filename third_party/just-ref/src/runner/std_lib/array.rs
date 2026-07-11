@@ -266,6 +266,7 @@ fn to_str(v: &JsValue) -> String {
             parts.join(",")
         }
         JsValue::Object(_) => "[object Object]".to_string(),
+        JsValue::BigInt(b) => b.to_string(),
         JsValue::Symbol(_) => "Symbol()".to_string(),
     }
 }

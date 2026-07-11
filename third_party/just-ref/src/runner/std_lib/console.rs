@@ -66,6 +66,7 @@ fn format_value(value: &JsValue) -> String {
             JsNumberType::NegativeInfinity => "-Infinity".to_string(),
         },
         JsValue::String(s) => s.clone(),
+        JsValue::BigInt(b) => format!("{}n", b),
         JsValue::Symbol(s) => s.to_string(),
         JsValue::Object(_) => "[object Object]".to_string(),
     }

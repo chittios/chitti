@@ -42,6 +42,9 @@ lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
 hashbrown = { version = "0.14", default-features = false, features = ["ahash", "inline-more"] }
 # f64/f32 transcendentals under no_std (libm); host uses inherent std methods.
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+# BigInt (ES2020) — arbitrary-precision integers, pure-Rust alloc-only backend
+# (no_std with default-features off), used for `JsValue::BigInt`.
+num-bigint = { version = "0.4", default-features = false }
 # lock-free-ish global console sink (no_std); host also prints to std streams.
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
 uuid = { version = "0.8", features = ["v4"], optional = true }

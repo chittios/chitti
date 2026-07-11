@@ -542,6 +542,13 @@ impl RegCompiler {
                 let idx = self.chunk.add_constant(value);
                 self.chunk.emit(RegInstruction::with_dst_imm(RegOpCode::LoadConst, reg, idx));
             }
+            LiteralType::BigIntLiteral(s) => {
+                let value = JsValue::BigInt(
+                    s.parse().unwrap_or_else(|_| num_bigint::BigInt::from(0)),
+                );
+                let idx = self.chunk.add_constant(value);
+                self.chunk.emit(RegInstruction::with_dst_imm(RegOpCode::LoadConst, reg, idx));
+            }
             LiteralType::RegExpLiteral(_) => {
                 self.chunk.emit(RegInstruction::with_dst(RegOpCode::LoadUndefined, reg));
             }

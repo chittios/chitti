@@ -96,6 +96,7 @@ fn object_to_string(
         JsValue::Boolean(_) => "Boolean",
         JsValue::Number(_) => "Number",
         JsValue::String(_) => "String",
+        JsValue::BigInt(_) => "BigInt",
         JsValue::Symbol(_) => "Symbol",
         JsValue::Object(_) => "Object",
     };

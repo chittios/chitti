@@ -253,6 +253,7 @@ impl<'a> Vm<'a> {
                         JsValue::Boolean(_) => "boolean",
                         JsValue::Number(_) => "number",
                         JsValue::String(_) => "string",
+                        JsValue::BigInt(_) => "bigint",
                         JsValue::Symbol(_) => "symbol",
                         JsValue::Object(_) => "object",
                     };

@@ -905,6 +905,9 @@ pub enum LiteralType {
     BooleanLiteral(bool),
     NullLiteral,
     NumberLiteral(NumberLiteralType),
+    /// A BigInt literal, stored as the decimal string of its value (radix and
+    /// numeric separators already resolved at build time).
+    BigIntLiteral(String),
     RegExpLiteral(RegExpLiteralData),
 }
 

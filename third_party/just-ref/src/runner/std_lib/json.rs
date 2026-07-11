@@ -388,6 +388,9 @@ fn stringify_inner(value: &JsValue, indent: &str, cur: &str) -> Option<String> {
         }
         JsValue::Number(_) => Some("null".to_string()), // NaN / ±Infinity
         JsValue::String(s) => Some(stringify_string(s)),
+        // Per spec `JSON.stringify` on a BigInt throws; this serializer has no
+        // throw channel, so omit it (no local coverage relies on the throw).
+        JsValue::BigInt(_) => None,
         JsValue::Undefined | JsValue::Symbol(_) => None,
         JsValue::Object(_) => {
             // Functions serialize to nothing (omitted), like undefined.

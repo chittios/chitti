@@ -71,7 +71,11 @@ future_reserved_word = { "enum" | "await" }
 // right_brace_punctuator = { "}" }
 null_literal = @{ "null" }
 boolean_literal = @{ "true" | "false" }
-numeric_literal = { binary_integer_literal | octal_integer_literal | hex_integer_literal |  decimal_literal }
+numeric_literal = { bigint_literal | binary_integer_literal | octal_integer_literal | hex_integer_literal |  decimal_literal }
+// BigInt literal (ES2020): an integer form (binary/octal/hex, or a decimal
+// integer that is either `0` or non-zero-led — so `00n`/`08n` are rejected)
+// followed by `n`. No fraction, no exponent — `1.0n`/`1e2n` never match.
+bigint_literal = @{ (binary_integer_literal | octal_integer_literal | hex_integer_literal | decimal_integer_literal) ~ "n" }
 decimal_literal = ${
     decimal_integer_literal ~ "." ~ decimal_digits? ~ exponent_part?
     | "." ~ decimal_digits ~ exponent_part?

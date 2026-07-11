@@ -194,6 +194,7 @@ impl<'a> RegVm<'a> {
                         JsValue::Boolean(_) => "boolean",
                         JsValue::Number(_) => "number",
                         JsValue::String(_) => "string",
+                        JsValue::BigInt(_) => "bigint",
                         JsValue::Symbol(_) => "symbol",
                         JsValue::Object(_) => "object",
                     };
@@ -494,6 +495,7 @@ impl<'a> RegVm<'a> {
                 JsNumberType::NegativeInfinity => true,
             },
             JsValue::String(s) => !s.is_empty(),
+            JsValue::BigInt(b) => !num_traits::Zero::is_zero(b),
             JsValue::Symbol(_) => true,
             JsValue::Object(_) => true,
         }
@@ -506,6 +508,7 @@ impl<'a> RegVm<'a> {
             JsValue::Boolean(b) => if *b { 1.0 } else { 0.0 },
             JsValue::Number(n) => self.num_to_f64(n),
             JsValue::String(s) => s.parse::<f64>().unwrap_or(f64::NAN),
+            JsValue::BigInt(b) => num_traits::ToPrimitive::to_f64(b).unwrap_or(f64::NAN),
             JsValue::Symbol(_) => f64::NAN,
             JsValue::Object(_) => f64::NAN,
         }
@@ -727,6 +730,7 @@ impl<'a> RegVm<'a> {
                 JsNumberType::NegativeInfinity => "-Infinity".to_string(),
             },
             JsValue::String(s) => s.clone(),
+            JsValue::BigInt(b) => b.to_string(),
             JsValue::Symbol(_) => "symbol".to_string(),
             JsValue::Object(_) => "[object]".to_string(),
         }

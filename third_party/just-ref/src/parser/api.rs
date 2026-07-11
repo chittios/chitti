@@ -1525,11 +1525,13 @@ fn build_ast_from_property_name(
                 ExpressionType::Literal(d)
             } else if pn_pair.as_rule() == Rule::numeric_literal {
                 let meta = get_meta(&pn_pair, script);
-                let d = build_ast_from_numeric_literal(pn_pair)?;
-                ExpressionType::Literal(LiteralData {
-                    meta,
-                    value: LiteralType::NumberLiteral(d),
-                })
+                let n_pair = pn_pair.into_inner().next().unwrap();
+                let value = if n_pair.as_rule() == Rule::bigint_literal {
+                    build_ast_from_bigint_literal(n_pair)?
+                } else {
+                    LiteralType::NumberLiteral(build_ast_from_numeric_literal_inner(n_pair)?)
+                };
+                ExpressionType::Literal(LiteralData { meta, value })
             } else {
                 return Err(get_unexpected_error(
                     "build_ast_from_property_name:1",
@@ -3638,10 +3640,22 @@ fn build_ast_from_literal(
             meta,
             value: LiteralType::NullLiteral,
         },
-        Rule::numeric_literal => LiteralData {
-            meta,
-            value: LiteralType::NumberLiteral(build_ast_from_numeric_literal(inner_pair)?),
-        },
+        Rule::numeric_literal => {
+            // Peek the inner rule: a `bigint_literal` (…`n`) yields a BigInt
+            // literal; anything else is an ordinary Number literal.
+            let n_pair = inner_pair.into_inner().next().unwrap();
+            if n_pair.as_rule() == Rule::bigint_literal {
+                LiteralData {
+                    meta,
+                    value: build_ast_from_bigint_literal(n_pair)?,
+                }
+            } else {
+                LiteralData {
+                    meta,
+                    value: LiteralType::NumberLiteral(build_ast_from_numeric_literal_inner(n_pair)?),
+                }
+            }
+        }
         Rule::string_literal => build_ast_from_string_literal(inner_pair, script)?,
         Rule::boolean_literal => {
             let bool = inner_pair.as_str();
@@ -3993,8 +4007,17 @@ fn build_ast_decimal_literal(pair: Pair<Rule>) -> Result<NumberLiteralType, JsRu
     })
 }
 
+#[allow(dead_code)]
 fn build_ast_from_numeric_literal(pair: Pair<Rule>) -> Result<NumberLiteralType, JsRuleError> {
     let inner_pair = pair.into_inner().next().unwrap();
+    build_ast_from_numeric_literal_inner(inner_pair)
+}
+
+/// Build a Number literal from the already-unwrapped inner pair (one of the
+/// integer forms or `decimal_literal`). `bigint_literal` is handled separately.
+fn build_ast_from_numeric_literal_inner(
+    inner_pair: Pair<Rule>,
+) -> Result<NumberLiteralType, JsRuleError> {
     Ok(match inner_pair.as_rule() {
         Rule::binary_integer_literal => get_ast_for_binary_integer_literal(inner_pair),
         Rule::octal_integer_literal => get_ast_for_octal_integer_literal(inner_pair),
@@ -4007,6 +4030,33 @@ fn build_ast_from_numeric_literal(pair: Pair<Rule>) -> Result<NumberLiteralType,
             ))
         }
     })
+}
+
+/// Parse a `bigint_literal` pair (e.g. `255n`, `0xFFn`, `0b101n`, `1_000n`) into
+/// a `LiteralType::BigIntLiteral` holding the value's decimal string. Numeric
+/// separators (`_`) and the trailing `n` are stripped; the radix prefix selects
+/// the base.
+fn build_ast_from_bigint_literal(pair: Pair<Rule>) -> Result<LiteralType, JsRuleError> {
+    use num_bigint::BigInt;
+    // `bigint_literal` is atomic (`@`), so it has no inner tokens — parse its
+    // text. Strip the trailing `n`, then select radix by prefix.
+    let raw = pair.as_str();
+    let body = raw.strip_suffix('n').unwrap_or(raw);
+    let (radix, digits): (u32, &str) = if let Some(rest) =
+        body.strip_prefix("0b").or_else(|| body.strip_prefix("0B"))
+    {
+        (2, rest)
+    } else if let Some(rest) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+        (8, rest)
+    } else if let Some(rest) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        (16, rest)
+    } else {
+        (10, body)
+    };
+    let cleaned = digits.replace('_', "");
+    let value = BigInt::parse_bytes(cleaned.as_bytes(), radix)
+        .ok_or_else(|| get_unexpected_error("build_ast_from_bigint_literal", &pair))?;
+    Ok(LiteralType::BigIntLiteral(value.to_string()))
 }
 
 fn build_ast_from_array_literal(

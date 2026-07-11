@@ -195,6 +195,10 @@ fn evaluate_literal(lit: &LiteralData) -> ValueResult {
                 NumberLiteralType::FloatLiteral(f) => JsValue::Number(JsNumberType::Float(*f)),
             }
         }
+        LiteralType::BigIntLiteral(s) => {
+            // Stored as the canonical decimal string at parse time.
+            JsValue::BigInt(s.parse().unwrap_or_else(|_| num_bigint::BigInt::from(0)))
+        }
         LiteralType::RegExpLiteral(data) => {
             crate::runner::std_lib::regexp::make_regexp(&data.pattern, &data.flags)
         }
@@ -624,6 +628,7 @@ fn get_object_property_key(
                         NumberLiteralType::FloatLiteral(f) => Ok(f.to_string()),
                     }
                 }
+                LiteralType::BigIntLiteral(s) => Ok(s.clone()),
                 _ => Err(JErrorType::TypeError("Invalid property key".to_string())),
             },
             _ => Err(JErrorType::TypeError("Invalid property key".to_string())),
@@ -851,7 +856,15 @@ fn evaluate_new_expression(
         ExpressionPatternType::Identifier(id)
     ) = callee {
         let ctor_name = &id.name;
-        
+
+        // `BigInt` and `Symbol` are callable but NOT constructors — `new` throws.
+        if ctor_name == "BigInt" || ctor_name == "Symbol" {
+            return Err(JErrorType::TypeError(format!(
+                "{} is not a constructor",
+                ctor_name
+            )));
+        }
+
         // Evaluate arguments first
         let args = evaluate_arguments(arguments, ctx)?;
         
@@ -1729,6 +1742,7 @@ fn get_assignment_property_key(
                         NumberLiteralType::FloatLiteral(n) => Ok(n.to_string()),
                     }
                 }
+                LiteralType::BigIntLiteral(s) => Ok(s.clone()),
                 _ => Err(JErrorType::TypeError(
                     "Invalid property key in destructuring assignment".to_string(),
                 )),
@@ -2013,6 +2027,12 @@ fn evaluate_unary_expression(
         }
         UnaryOperator::Plus => {
             let value = evaluate_expression(argument, ctx)?;
+            // Unary `+` explicitly rejects BigInt (would require ToNumber).
+            if matches!(value, JsValue::BigInt(_)) {
+                return Err(JErrorType::TypeError(
+                    "Cannot convert a BigInt to a number".to_string(),
+                ));
+            }
             to_number(&value)
         }
         UnaryOperator::BitwiseNot => {
@@ -2202,6 +2222,21 @@ fn evaluate_logical_expression(
 /// exponents fold back to an integer when the result is exact.
 fn exponent_values(left: &JsValue, right: &JsValue) -> ValueResult {
     use num_traits::Float;
+    if let Some(r) = bigint_binary_op(left, right, |base, exp| {
+        use num_traits::Signed;
+        if exp.is_negative() {
+            return Err(JErrorType::RangeError(
+                "Exponent must be non-negative".to_string(),
+            ));
+        }
+        // BigInt exponent fits a u32 for any realistic test; guard the range.
+        match num_traits::ToPrimitive::to_u32(exp) {
+            Some(e) => Ok(JsValue::BigInt(base.pow(e))),
+            None => Err(JErrorType::RangeError("Exponent too large".to_string())),
+        }
+    }) {
+        return r;
+    }
     let a = to_number(left)?;
     let b = to_number(right)?;
     apply_numeric_op(
@@ -2278,6 +2313,25 @@ fn evaluate_update_expression(
         }
     };
 
+    // BigInt `++`/`--` stays a BigInt (no ToNumber, ±1n).
+    if let JsValue::BigInt(b) = &current_value {
+        let one = num_bigint::BigInt::from(1);
+        let new_big = match operator {
+            UpdateOperator::PlusPlus => b + &one,
+            UpdateOperator::MinusMinus => b - &one,
+        };
+        let old_value = JsValue::BigInt(b.clone());
+        let new_value = JsValue::BigInt(new_big);
+        match &member_target {
+            Some((obj, prop)) => set_property_with_ctx(obj, prop, new_value.clone(), ctx)?,
+            None => {
+                let name = get_expression_name(argument)?;
+                ctx.set_binding(&name, new_value.clone())?;
+            }
+        }
+        return Ok(if prefix { new_value } else { old_value });
+    }
+
     // Convert to number
     let old_number = to_number(&current_value)?;
     let old_f64 = match &old_number {
@@ -2332,6 +2386,8 @@ pub fn to_boolean(value: &JsValue) -> bool {
             _ => true,
         },
         JsValue::String(s) => !s.is_empty(),
+        // A BigInt is falsy only when it is `0n`.
+        JsValue::BigInt(b) => !num_traits::Zero::is_zero(b),
         JsValue::Symbol(_) => true,
         JsValue::Object(_) => true,
     }
@@ -2345,6 +2401,7 @@ fn get_typeof_string(value: &JsValue) -> String {
         JsValue::Boolean(_) => "boolean".to_string(),
         JsValue::Number(_) => "number".to_string(),
         JsValue::String(_) => "string".to_string(),
+        JsValue::BigInt(_) => "bigint".to_string(),
         JsValue::Symbol(_) => "symbol".to_string(),
         JsValue::Object(_) => "object".to_string(),
     }
@@ -2372,12 +2429,18 @@ fn to_number(value: &JsValue) -> ValueResult {
         JsValue::Symbol(_) => {
             return Err(JErrorType::TypeError("Cannot convert Symbol to number".to_string()));
         }
+        JsValue::BigInt(_) => {
+            return Err(JErrorType::TypeError("Cannot convert a BigInt to a number".to_string()));
+        }
         JsValue::Object(_) => JsValue::Number(JsNumberType::NaN),
     })
 }
 
 /// Negate a number value.
 fn negate_number(value: &JsValue) -> ValueResult {
+    if let JsValue::BigInt(b) = value {
+        return Ok(JsValue::BigInt(-b));
+    }
     let num_value = to_number(value)?;
     Ok(match num_value {
         JsValue::Number(JsNumberType::Integer(i)) => JsValue::Number(JsNumberType::Integer(-i)),
@@ -2391,6 +2454,10 @@ fn negate_number(value: &JsValue) -> ValueResult {
 
 /// Bitwise NOT operation.
 fn bitwise_not(value: &JsValue) -> ValueResult {
+    if let JsValue::BigInt(b) = value {
+        // ~b == -(b + 1) for arbitrary-precision two's-complement semantics.
+        return Ok(JsValue::BigInt(-(b + num_bigint::BigInt::from(1))));
+    }
     let num = to_i32(value)?;
     Ok(JsValue::Number(JsNumberType::Integer(!num as i64)))
 }
@@ -2416,6 +2483,25 @@ fn to_u32(value: &JsValue) -> Result<u32, JErrorType> {
 // Arithmetic operations
 // ============================================================================
 
+/// Error thrown when a BigInt is mixed with a Number in an arithmetic/bitwise op.
+fn bigint_number_mix_err() -> JErrorType {
+    JErrorType::TypeError("Cannot mix BigInt and other types, use explicit conversions".to_string())
+}
+
+/// If either operand is a BigInt, apply `op` when BOTH are BigInt, else throw
+/// the mixed-type TypeError. Returns `None` when neither operand is a BigInt so
+/// the caller falls through to its numeric path.
+fn bigint_binary_op<F>(left: &JsValue, right: &JsValue, op: F) -> Option<ValueResult>
+where
+    F: Fn(&num_bigint::BigInt, &num_bigint::BigInt) -> ValueResult,
+{
+    match (left, right) {
+        (JsValue::BigInt(a), JsValue::BigInt(b)) => Some(op(a, b)),
+        (JsValue::BigInt(_), _) | (_, JsValue::BigInt(_)) => Some(Err(bigint_number_mix_err())),
+        _ => None,
+    }
+}
+
 fn add_values(left: &JsValue, right: &JsValue) -> ValueResult {
     // A Symbol operand always throws: after ToPrimitive it stays a Symbol, then
     // either ToString (string concat) or ToNumber (numeric add) rejects it.
@@ -2424,10 +2510,14 @@ fn add_values(left: &JsValue, right: &JsValue) -> ValueResult {
             "Cannot convert a Symbol value".to_string(),
         ));
     }
+    // String concatenation takes precedence (BigInt + String is a string).
     if matches!(left, JsValue::String(_)) || matches!(right, JsValue::String(_)) {
         let left_str = to_string(left);
         let right_str = to_string(right);
         return Ok(JsValue::String(format!("{}{}", left_str, right_str)));
+    }
+    if let Some(r) = bigint_binary_op(left, right, |a, b| Ok(JsValue::BigInt(a + b))) {
+        return r;
     }
 
     let left_num = to_number(left)?;
@@ -2436,18 +2526,33 @@ fn add_values(left: &JsValue, right: &JsValue) -> ValueResult {
 }
 
 fn subtract_values(left: &JsValue, right: &JsValue) -> ValueResult {
+    if let Some(r) = bigint_binary_op(left, right, |a, b| Ok(JsValue::BigInt(a - b))) {
+        return r;
+    }
     let left_num = to_number(left)?;
     let right_num = to_number(right)?;
     apply_numeric_op(&left_num, &right_num, |a, b| a - b, |a, b| a - b)
 }
 
 fn multiply_values(left: &JsValue, right: &JsValue) -> ValueResult {
+    if let Some(r) = bigint_binary_op(left, right, |a, b| Ok(JsValue::BigInt(a * b))) {
+        return r;
+    }
     let left_num = to_number(left)?;
     let right_num = to_number(right)?;
     apply_numeric_op(&left_num, &right_num, |a, b| a * b, |a, b| a * b)
 }
 
 fn divide_values(left: &JsValue, right: &JsValue) -> ValueResult {
+    if let Some(r) = bigint_binary_op(left, right, |a, b| {
+        if num_traits::Zero::is_zero(b) {
+            Err(JErrorType::RangeError("Division by zero".to_string()))
+        } else {
+            Ok(JsValue::BigInt(a / b))
+        }
+    }) {
+        return r;
+    }
     let left_num = to_number(left)?;
     let right_num = to_number(right)?;
 
@@ -2471,6 +2576,15 @@ fn divide_values(left: &JsValue, right: &JsValue) -> ValueResult {
 }
 
 fn modulo_values(left: &JsValue, right: &JsValue) -> ValueResult {
+    if let Some(r) = bigint_binary_op(left, right, |a, b| {
+        if num_traits::Zero::is_zero(b) {
+            Err(JErrorType::RangeError("Division by zero".to_string()))
+        } else {
+            Ok(JsValue::BigInt(a % b))
+        }
+    }) {
+        return r;
+    }
     let left_num = to_number(left)?;
     let right_num = to_number(right)?;
     apply_numeric_op(&left_num, &right_num, |a, b| a % b, |a, b| a % b)
@@ -2511,10 +2625,63 @@ fn number_to_f64(n: &JsNumberType) -> f64 {
 // Comparison operations
 // ============================================================================
 
+/// Best-effort numeric value of `v` for a relational comparison, `None` when it
+/// is NaN / not comparable. BigInt and String participate cross-type.
+fn compare_operand_f64(v: &JsValue) -> Option<f64> {
+    match v {
+        JsValue::BigInt(b) => num_traits::ToPrimitive::to_f64(b),
+        JsValue::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                Some(0.0)
+            } else {
+                t.parse::<f64>().ok()
+            }
+        }
+        JsValue::Number(n) => {
+            let f = number_to_f64(n);
+            if f.is_nan() {
+                None
+            } else {
+                Some(f)
+            }
+        }
+        JsValue::Boolean(true) => Some(1.0),
+        JsValue::Boolean(false) | JsValue::Null => Some(0.0),
+        JsValue::Undefined => None,
+        _ => None,
+    }
+}
+
 fn compare_values<F>(left: &JsValue, right: &JsValue, cmp: F) -> ValueResult
 where
     F: Fn(f64, f64) -> bool,
 {
+    // A BigInt operand compares mathematically against the other side (Number,
+    // String, or BigInt) without the ToNumber TypeError.
+    if matches!(left, JsValue::BigInt(_)) || matches!(right, JsValue::BigInt(_)) {
+        // Exact BigInt-vs-BigInt comparison avoids f64 rounding.
+        if let (JsValue::BigInt(a), JsValue::BigInt(b)) = (left, right) {
+            let af = num_traits::ToPrimitive::to_f64(a).unwrap_or(f64::NAN);
+            let bf = num_traits::ToPrimitive::to_f64(b).unwrap_or(f64::NAN);
+            // For exactness when magnitudes exceed f64, fall back to Ord.
+            if a == b {
+                return Ok(JsValue::Boolean(cmp(0.0, 0.0)));
+            }
+            let result = match a.cmp(b) {
+                core::cmp::Ordering::Less => cmp(-1.0, 0.0),
+                core::cmp::Ordering::Greater => cmp(1.0, 0.0),
+                core::cmp::Ordering::Equal => cmp(af, bf),
+            };
+            return Ok(JsValue::Boolean(result));
+        }
+        let result = match (compare_operand_f64(left), compare_operand_f64(right)) {
+            (Some(a), Some(b)) => cmp(a, b),
+            _ => false,
+        };
+        return Ok(JsValue::Boolean(result));
+    }
+
     let left_num = to_number(left)?;
     let right_num = to_number(right)?;
 
@@ -2539,14 +2706,70 @@ pub fn strict_equality(left: &JsValue, right: &JsValue) -> bool {
         (JsValue::Number(a), JsValue::Number(b)) => {
             number_to_f64(a) == number_to_f64(b)
         }
+        // BigInt === BigInt by mathematical value; BigInt === Number is always
+        // false (handled by the fall-through `_ => false`).
+        (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
         (JsValue::Object(a), JsValue::Object(b)) => alloc::rc::Rc::ptr_eq(a, b),
         _ => false,
     }
 }
 
+/// Mathematical equality between a BigInt and a Number/String (the `==` operator
+/// crossing BigInt and non-BigInt). Compares exact integer values.
+fn bigint_loose_eq_number(b: &num_bigint::BigInt, n: f64) -> bool {
+    if n.is_nan() || n.is_infinite() || n.fract() != 0.0 {
+        return false;
+    }
+    match <num_bigint::BigInt as num_traits::FromPrimitive>::from_f64(n) {
+        Some(bn) => *b == bn,
+        None => false,
+    }
+}
+
+/// Parse a decimal/hex/octal/binary integer string into a BigInt (used by `==`
+/// with a String operand). Returns `None` on any non-integer string.
+fn bigint_from_str(s: &str) -> Option<num_bigint::BigInt> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Some(num_bigint::BigInt::from(0));
+    }
+    let (neg, rest) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (radix, digits): (u32, &str) = if let Some(r) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+        (16, r)
+    } else if let Some(r) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
+        (8, r)
+    } else if let Some(r) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
+        (2, r)
+    } else {
+        (10, rest)
+    };
+    let v = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix)?;
+    Some(if neg { -v } else { v })
+}
+
 fn loose_equality(left: &JsValue, right: &JsValue) -> bool {
     if core::mem::discriminant(left) == core::mem::discriminant(right) {
         return strict_equality(left, right);
+    }
+
+    // BigInt == Number / String compares by mathematical value.
+    match (left, right) {
+        (JsValue::BigInt(a), JsValue::Number(n)) | (JsValue::Number(n), JsValue::BigInt(a)) => {
+            return bigint_loose_eq_number(a, number_to_f64(n));
+        }
+        (JsValue::BigInt(a), JsValue::String(s)) | (JsValue::String(s), JsValue::BigInt(a)) => {
+            return match bigint_from_str(s) {
+                Some(b) => *a == b,
+                None => false,
+            };
+        }
+        (JsValue::BigInt(a), JsValue::Boolean(b)) | (JsValue::Boolean(b), JsValue::BigInt(a)) => {
+            return bigint_loose_eq_number(a, if *b { 1.0 } else { 0.0 });
+        }
+        _ => {}
     }
 
     match (left, right) {
@@ -2588,36 +2811,73 @@ fn loose_equality(left: &JsValue, right: &JsValue) -> bool {
 // ============================================================================
 
 fn bitwise_and(left: &JsValue, right: &JsValue) -> ValueResult {
+    if let Some(r) = bigint_binary_op(left, right, |a, b| Ok(JsValue::BigInt(a & b))) {
+        return r;
+    }
     let l = to_i32(left)?;
     let r = to_i32(right)?;
     Ok(JsValue::Number(JsNumberType::Integer((l & r) as i64)))
 }
 
 fn bitwise_or(left: &JsValue, right: &JsValue) -> ValueResult {
+    if let Some(r) = bigint_binary_op(left, right, |a, b| Ok(JsValue::BigInt(a | b))) {
+        return r;
+    }
     let l = to_i32(left)?;
     let r = to_i32(right)?;
     Ok(JsValue::Number(JsNumberType::Integer((l | r) as i64)))
 }
 
 fn bitwise_xor(left: &JsValue, right: &JsValue) -> ValueResult {
+    if let Some(r) = bigint_binary_op(left, right, |a, b| Ok(JsValue::BigInt(a ^ b))) {
+        return r;
+    }
     let l = to_i32(left)?;
     let r = to_i32(right)?;
     Ok(JsValue::Number(JsNumberType::Integer((l ^ r) as i64)))
 }
 
+/// BigInt shift by a (possibly negative) BigInt amount: a negative left-shift is
+/// a right-shift and vice versa.
+fn bigint_shift(a: &num_bigint::BigInt, amount: &num_bigint::BigInt, left: bool) -> ValueResult {
+    use num_traits::ToPrimitive;
+    let amt_i64 = amount.to_i64().ok_or_else(|| {
+        JErrorType::RangeError("BigInt shift amount out of range".to_string())
+    })?;
+    let effective = if left { amt_i64 } else { -amt_i64 };
+    let out = if effective >= 0 {
+        a << (effective as usize)
+    } else {
+        a >> ((-effective) as usize)
+    };
+    Ok(JsValue::BigInt(out))
+}
+
 fn left_shift(left: &JsValue, right: &JsValue) -> ValueResult {
+    if let Some(r) = bigint_binary_op(left, right, |a, b| bigint_shift(a, b, true)) {
+        return r;
+    }
     let l = to_i32(left)?;
     let r = to_u32(right)? & 0x1f;
     Ok(JsValue::Number(JsNumberType::Integer((l << r) as i64)))
 }
 
 fn right_shift(left: &JsValue, right: &JsValue) -> ValueResult {
+    if let Some(r) = bigint_binary_op(left, right, |a, b| bigint_shift(a, b, false)) {
+        return r;
+    }
     let l = to_i32(left)?;
     let r = to_u32(right)? & 0x1f;
     Ok(JsValue::Number(JsNumberType::Integer((l >> r) as i64)))
 }
 
 fn unsigned_right_shift(left: &JsValue, right: &JsValue) -> ValueResult {
+    // `>>>` is not defined for BigInt — always a TypeError if either is BigInt.
+    if matches!(left, JsValue::BigInt(_)) || matches!(right, JsValue::BigInt(_)) {
+        return Err(JErrorType::TypeError(
+            "BigInts have no unsigned right shift, use >> instead".to_string(),
+        ));
+    }
     let l = to_u32(left)?;
     let r = to_u32(right)? & 0x1f;
     Ok(JsValue::Number(JsNumberType::Integer((l >> r) as i64)))
@@ -2635,6 +2895,7 @@ fn to_string(value: &JsValue) -> String {
         JsValue::Boolean(false) => "false".to_string(),
         JsValue::Number(n) => n.to_string(),
         JsValue::String(s) => s.clone(),
+        JsValue::BigInt(b) => b.to_string(),
         JsValue::Symbol(_) => "[Symbol]".to_string(),
         JsValue::Object(_) => "[object Object]".to_string(),
     }

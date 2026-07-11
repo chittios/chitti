@@ -695,6 +695,13 @@ impl Compiler {
                 let idx = self.chunk.add_constant(value);
                 self.chunk.emit_with(OpCode::Constant, idx);
             }
+            LiteralType::BigIntLiteral(s) => {
+                let value = JsValue::BigInt(
+                    s.parse().unwrap_or_else(|_| num_bigint::BigInt::from(0)),
+                );
+                let idx = self.chunk.add_constant(value);
+                self.chunk.emit_with(OpCode::Constant, idx);
+            }
             LiteralType::RegExpLiteral(_) => {
                 self.chunk.emit_op(OpCode::Undefined);
             }

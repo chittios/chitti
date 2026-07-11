@@ -42,6 +42,8 @@ pub enum JsValue {
     Symbol(SymbolData),
     /// A numeric value (integer or float).
     Number(JsNumberType),
+    /// A BigInt value (arbitrary-precision integer, ES2020).
+    BigInt(num_bigint::BigInt),
     /// An object value (including arrays, functions, etc.).
     Object(JsObjectType),
 }
@@ -53,6 +55,7 @@ impl Clone for JsValue {
             JsValue::Boolean(d) => JsValue::Boolean(*d),
             JsValue::Null => JsValue::Null,
             JsValue::Number(d) => JsValue::Number(d.clone()),
+            JsValue::BigInt(d) => JsValue::BigInt(d.clone()),
             JsValue::Object(o) => JsValue::Object(o.clone()),
             JsValue::Symbol(d) => JsValue::Symbol(d.clone()),
         }
@@ -70,6 +73,7 @@ impl Display for JsValue {
                 JsValue::String(s) => format!("\"{}\"", s),
                 JsValue::Symbol(s) => s.to_string(),
                 JsValue::Number(n) => n.to_string(),
+                JsValue::BigInt(b) => b.to_string(),
                 JsValue::Object(o) => (**o).borrow().as_js_object().to_string(),
             }
         )
@@ -85,6 +89,7 @@ impl fmt::Debug for JsValue {
             JsValue::String(s) => write!(f, "JsValue::String({:?})", s),
             JsValue::Symbol(s) => write!(f, "JsValue::Symbol({})", s),
             JsValue::Number(n) => write!(f, "JsValue::Number({:?})", n),
+            JsValue::BigInt(b) => write!(f, "JsValue::BigInt({})", b),
             JsValue::Object(_) => write!(f, "JsValue::Object(...)"),
         }
     }
@@ -98,6 +103,7 @@ impl PartialEq for JsValue {
             (JsValue::Boolean(a), JsValue::Boolean(b)) => a == b,
             (JsValue::String(a), JsValue::String(b)) => a == b,
             (JsValue::Number(a), JsValue::Number(b)) => a == b,
+            (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
             (JsValue::Object(a), JsValue::Object(b)) => Rc::ptr_eq(a, b),
             (JsValue::Symbol(a), JsValue::Symbol(b)) => a == b,
             _ => false,

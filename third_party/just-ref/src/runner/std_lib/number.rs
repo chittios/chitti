@@ -389,6 +389,9 @@ fn to_number(value: &JsValue) -> Result<JsValue, JErrorType> {
         JsValue::Symbol(_) => {
             return Err(JErrorType::TypeError("Cannot convert Symbol to number".to_string()))
         }
+        JsValue::BigInt(_) => {
+            return Err(JErrorType::TypeError("Cannot convert a BigInt to a number".to_string()))
+        }
         JsValue::Object(_) => JsValue::Number(JsNumberType::NaN),
     })
 }

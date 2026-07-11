@@ -23,7 +23,8 @@ pub struct GlobalsResolver;
 fn is_global_fn(name: &str) -> bool {
     matches!(
         name,
-        "isNaN" | "isFinite" | "parseInt" | "parseFloat" | "Boolean" | "Symbol" | "eval"
+        "isNaN" | "isFinite" | "parseInt" | "parseFloat" | "Boolean" | "Symbol" | "BigInt"
+            | "eval"
             | "Function"
             | "encodeURIComponent" | "decodeURIComponent" | "encodeURI" | "decodeURI"
     )
@@ -124,6 +125,85 @@ fn to_f64(v: &JsValue) -> f64 {
         }
         _ => f64::NAN,
     }
+}
+
+/// `BigInt(value)` — the ToBigInt abstract operation.
+///
+/// Number → must be an integer value (else RangeError); String → parse
+/// (empty ⇒ `0n`, invalid ⇒ SyntaxError); Boolean → `0n`/`1n`; BigInt → itself;
+/// undefined/null/Symbol/Object → TypeError.
+fn to_bigint(v: &JsValue) -> Result<JsValue, JErrorType> {
+    use num_bigint::BigInt;
+    Ok(match v {
+        JsValue::BigInt(b) => JsValue::BigInt(b.clone()),
+        JsValue::Boolean(b) => JsValue::BigInt(BigInt::from(if *b { 1 } else { 0 })),
+        JsValue::Number(n) => {
+            let f = match n {
+                JsNumberType::Integer(i) => {
+                    return Ok(JsValue::BigInt(BigInt::from(*i)));
+                }
+                JsNumberType::Float(f) => *f,
+                _ => f64::NAN,
+            };
+            if !f.is_finite() || f.fract() != 0.0 {
+                return Err(JErrorType::RangeError(
+                    "The number is not a safe integer".to_string(),
+                ));
+            }
+            match <BigInt as num_traits::FromPrimitive>::from_f64(f) {
+                Some(b) => JsValue::BigInt(b),
+                None => {
+                    return Err(JErrorType::RangeError(
+                        "The number is not a safe integer".to_string(),
+                    ))
+                }
+            }
+        }
+        JsValue::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(JsValue::BigInt(BigInt::from(0)));
+            }
+            let (neg, rest) = match t.strip_prefix('-') {
+                Some(r) => (true, r),
+                None => (false, t.strip_prefix('+').unwrap_or(t)),
+            };
+            let (radix, digits): (u32, &str) = if let Some(r) =
+                rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X"))
+            {
+                (16, r)
+            } else if let Some(r) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
+                (8, r)
+            } else if let Some(r) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
+                (2, r)
+            } else {
+                (10, rest)
+            };
+            match BigInt::parse_bytes(digits.as_bytes(), radix) {
+                Some(b) => JsValue::BigInt(if neg { -b } else { b }),
+                None => {
+                    return Err(JErrorType::SyntaxError(
+                        "Cannot convert string to a BigInt".to_string(),
+                    ))
+                }
+            }
+        }
+        JsValue::Undefined | JsValue::Null => {
+            return Err(JErrorType::TypeError(
+                "Cannot convert undefined or null to a BigInt".to_string(),
+            ))
+        }
+        JsValue::Symbol(_) => {
+            return Err(JErrorType::TypeError(
+                "Cannot convert a Symbol to a BigInt".to_string(),
+            ))
+        }
+        JsValue::Object(_) => {
+            return Err(JErrorType::TypeError(
+                "Cannot convert an object to a BigInt".to_string(),
+            ))
+        }
+    })
 }
 
 fn truthy(v: &JsValue) -> bool {
@@ -322,6 +402,9 @@ impl PluginResolver for GlobalsResolver {
                 }
             }
             "Boolean" => JsValue::Boolean(truthy(&a0)),
+            "BigInt" => {
+                return Some(to_bigint(&a0));
+            }
             "Symbol" => {
                 let desc = match &a0 {
                     JsValue::Undefined => String::new(),
