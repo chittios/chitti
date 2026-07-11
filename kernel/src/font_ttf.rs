@@ -94,10 +94,22 @@ pub fn ui_font_name() -> Option<String> {
 }
 
 /// Build the sparse placed coverage for `ch` in a `cw × ch_px` monospace cell:
-/// rasterize at a px that fills the cell, centre on the baseline, and clip to
-/// the cell. Returns `(x, y, alpha)` for each ink pixel.
+/// size the glyph so its advance fills the cell **width** (sizing by the cell
+/// height over-sizes the glyph and clips its right edge), centre the
+/// ascent/descent box vertically, place on the baseline, and clip to the cell.
+/// Returns `(x, y, alpha)` for each ink pixel.
 fn build_ui_glyph(font: &Font, ch: char, cw: usize, ch_px: usize) -> Vec<(u16, u16, u8)> {
-    let px = ch_px as f32;
+    // Monospace advance per px (all glyphs share it) → the px at which one glyph
+    // advance exactly fills the cell width.
+    let adv_per_px = {
+        let m = font.metrics('0', 64.0);
+        if m.advance_width > 0.5 {
+            m.advance_width / 64.0
+        } else {
+            0.6
+        }
+    };
+    let px = (cw as f32 / adv_per_px).max(1.0);
     let (m, cov) = font.rasterize(ch, px);
     let (asc, desc) = font
         .horizontal_line_metrics(px)
@@ -107,9 +119,8 @@ fn build_ui_glyph(font: &Font, ch: char, cw: usize, ch_px: usize) -> Vec<(u16, u
     let box_h = asc - desc;
     let top_pad = ((ch_px as f32 - box_h) / 2.0).max(0.0);
     let baseline = top_pad + asc;
-    // Horizontally centre the glyph advance in the cell.
-    let x_off = ((cw as f32 - m.advance_width) / 2.0).max(0.0);
-    let gx0 = (x_off + m.xmin as f32) as i32;
+    // Advance now equals the cell width; place at the glyph's own left bearing.
+    let gx0 = m.xmin;
     let gy0 = (baseline - m.height as f32 - m.ymin as f32) as i32;
     let mut out = Vec::new();
     if m.width > 0 && m.height > 0 && cov.len() >= m.width * m.height {

@@ -665,6 +665,10 @@ impl PluginResolver for DomResolver {
                     | "postMessage" | "Element" | "ClassList" | "Style" | "Canvas2d" | "Response"
                     | "Event" | "globalThis"
             )
+            // `window` IS the global object: after `window.google = {}` a bare
+            // `google` must resolve to that window property (real sites — google,
+            // gbar, etc. — assign to `window.X` then read `X` bare).
+            || get_own_prop_value(&self.window, name).is_some()
     }
 
     fn resolve(&self, name: &str, _ctx: &mut EvalContext) -> Result<JsValue, JErrorType> {
@@ -695,7 +699,10 @@ impl PluginResolver for DomResolver {
                 set_own_prop(&f, "__builtin_name__", s(n), false);
                 f
             }
-            _ => JsValue::Undefined,
+            // Bare global read → the matching `window` property (window is the
+            // global object). `has_binding` only routes here when the property
+            // exists, so a truly-unknown name still falls through to Undefined.
+            n => get_own_prop_value(&self.window, n).unwrap_or(JsValue::Undefined),
         })
     }
 
