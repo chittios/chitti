@@ -1177,21 +1177,42 @@ impl Screen {
         self.fill_rect(x + w - t, y, t, h, c); // right
     }
 
-    /// Alpha-blend one printable glyph at `(px,py)`, each atlas pixel expanded to
-    /// a `scale`x`scale` block. Non-printable bytes render as a blank cell.
+    /// Alpha-blend one printable glyph into its cell at `(px,py)`. Renders via
+    /// the **TTF UI face** (fontdue, crisp at the display resolution — see
+    /// `font_ttf::blit_ui_cell`, face chosen from `ui.json`), falling back to the
+    /// scaled bitmap atlas ([`GLYPHS`]) if no TTF face is available. Non-printable
+    /// bytes render as a blank cell.
     fn blit_glyph(&self, px: u64, py: u64, byte: u8, fg: Rgb, bg: Rgb) {
+        let s = self.scale;
+        let cell_w = CW as u64 * s;
+        let cell_h = CH as u64 * s;
+        // Background fill first (both paths blend ink over it).
+        for gy in 0..cell_h {
+            for gx in 0..cell_w {
+                self.put_pixel(px + gx, py + gy, bg);
+            }
+        }
+        let mix = |b: u8, f: u8, a: u32| (((b as u32) * (255 - a) + (f as u32) * a) / 255) as u8;
+        // TTF path: rasterize the glyph into the cell (cached per char/size).
+        let ch = if (FIRST..=LAST).contains(&byte) { byte as char } else { ' ' };
+        let ttf_ok = crate::font_ttf::blit_ui_cell(ch, cell_w as usize, cell_h as usize, |gx, gy, a| {
+            let a = a as u32;
+            let color = (mix(bg.0, fg.0, a), mix(bg.1, fg.1, a), mix(bg.2, fg.2, a));
+            self.put_pixel(px + gx as u64, py + gy as u64, color);
+        });
+        if ttf_ok {
+            return;
+        }
+        // Bitmap fallback: the 10×22 atlas, each pixel expanded to s×s.
         let idx = if (FIRST..=LAST).contains(&byte) { (byte - FIRST) as usize } else { 0 };
         let g = &GLYPHS[idx];
-        let s = self.scale;
         for gy in 0..CH {
             for gx in 0..CW {
                 let a = g[gy * CW + gx] as u32;
-                let color = if a == 0 {
-                    bg
-                } else {
-                    let mix = |b: u8, f: u8| (((b as u32) * (255 - a) + (f as u32) * a) / 255) as u8;
-                    (mix(bg.0, fg.0), mix(bg.1, fg.1), mix(bg.2, fg.2))
-                };
+                if a == 0 {
+                    continue; // background already filled
+                }
+                let color = (mix(bg.0, fg.0, a), mix(bg.1, fg.1, a), mix(bg.2, fg.2, a));
                 let bx = px + gx as u64 * s;
                 let by = py + gy as u64 * s;
                 for sy in 0..s {

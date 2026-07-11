@@ -50,6 +50,9 @@ const THEME_DEFAULTS: &[(&str, &str)] = &[
 pub struct UiConfig {
     pub chat_pct: u64,
     pub font_scale: u64, // 0 = auto
+    /// UI/console typeface — a bundled monospace face name
+    /// (`"Geist Mono"` | `"Ubuntu Mono"`), rendered as TTF by the compositor.
+    pub font: String,
     pub swap_panes: bool,
     pub chat_title: String,
     pub logs_title: String,
@@ -67,6 +70,7 @@ impl Default for UiConfig {
         UiConfig {
             chat_pct: 56,
             font_scale: 0,
+            font: "Geist Mono".to_string(),
             swap_panes: false,
             chat_title: "Shell Agent".to_string(),
             logs_title: "ktrace".to_string(),
@@ -85,6 +89,7 @@ impl UiConfig {
         Json::Obj(alloc::vec![
             ("chat_pct".to_string(), Json::Num(self.chat_pct as f64)),
             ("font_scale".to_string(), Json::Num(self.font_scale as f64)),
+            ("font".to_string(), Json::Str(self.font.clone())),
             ("swap_panes".to_string(), Json::Bool(self.swap_panes)),
             ("chat_title".to_string(), Json::Str(self.chat_title.clone())),
             ("logs_title".to_string(), Json::Str(self.logs_title.clone())),
@@ -125,6 +130,7 @@ impl UiConfig {
         UiConfig {
             chat_pct: j.get("chat_pct").and_then(|v| v.as_i64()).map(|n| n as u64).unwrap_or(d.chat_pct),
             font_scale: j.get("font_scale").and_then(|v| v.as_i64()).map(|n| n as u64).unwrap_or(d.font_scale),
+            font: s("font", &d.font),
             swap_panes: j.get("swap_panes").and_then(|v| v.as_bool()).unwrap_or(d.swap_panes),
             chat_title,
             logs_title: s("logs_title", &d.logs_title),
@@ -200,14 +206,20 @@ pub fn load_and_apply() {
     load();
     ensure_shortcuts();
     #[cfg(not(test))]
-    crate::framebuffer::relayout(&current().layout_cfg());
+    {
+        crate::font_ttf::set_ui_font(&current().font);
+        crate::framebuffer::relayout(&current().layout_cfg());
+    }
 }
 
 /// Re-read the config from disk and re-apply the layout (`/ui reload`).
 pub fn reload_and_apply() {
     load();
     #[cfg(not(test))]
-    crate::framebuffer::relayout(&current().layout_cfg());
+    {
+        crate::font_ttf::set_ui_font(&current().font);
+        crate::framebuffer::relayout(&current().layout_cfg());
+    }
 }
 
 /// Reset the config to defaults, persist, and re-apply (`/ui reset`).
@@ -217,7 +229,10 @@ pub fn reset() {
     crate::clock::set_tz(d.tz_offset);
     store(d);
     #[cfg(not(test))]
-    crate::framebuffer::relayout(&current().layout_cfg());
+    {
+        crate::font_ttf::set_ui_font(&current().font);
+        crate::framebuffer::relayout(&current().layout_cfg());
+    }
 }
 
 /// The current `ui.json` text (pretty-printed) for `/ui`.

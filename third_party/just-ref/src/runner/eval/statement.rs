@@ -74,11 +74,11 @@ pub fn execute_statement(
         }
 
         StatementType::BreakStatement { label, .. } => {
-            Ok(Completion::break_completion(label.clone()))
+            Ok(Completion::break_completion(sanitize_label(label.clone())))
         }
 
         StatementType::ContinueStatement { label, .. } => {
-            Ok(Completion::continue_completion(label.clone()))
+            Ok(Completion::continue_completion(sanitize_label(label.clone())))
         }
 
         StatementType::LabelledStatement { label, body, .. } => {
@@ -118,7 +118,56 @@ pub fn execute_statement(
     }
 }
 
+/// Normalize a `break`/`continue` target label.
+///
+/// A JS label is always an *Identifier*. The vendored parser, however, builds a
+/// break/continue statement's label from the rule's first child unconditionally
+/// (`api.rs`), so a bare `break;` / `continue;` captures its terminating `;` as
+/// the label — yielding a bogus target `Some(";")` that makes a loop fail to
+/// recognise (and consume) its own unlabelled break/continue, corrupting the
+/// completion value. Since a captured token that does not begin like an
+/// identifier can never be a real label, treat it as "no label" here, at the
+/// point the label is consumed.
+fn sanitize_label(label: Option<String>) -> Option<String> {
+    label.filter(|l| {
+        l.chars()
+            .next()
+            .map_or(false, |c| c.is_alphabetic() || c == '_' || c == '$')
+    })
+}
+
+/// The spec's `UpdateEmpty(completionRecord, value)` (ECMA-262 §6.2.4.4): if the
+/// completion carries no value (an *empty* completion), fill it with `value` —
+/// preserving the completion's type and target — otherwise leave it unchanged.
+///
+/// This is how statement lists, `if`, and loops thread completion values so that
+/// an empty trailing statement, an empty block, or an empty branch does not
+/// clobber the running value, while `if`/loops still surface `undefined` when a
+/// taken branch produced no value (`UpdateEmpty(stmt, undefined)`). These values
+/// are observable through `eval`.
+fn update_empty(mut completion: Completion, value: Option<JsValue>) -> Completion {
+    if completion.value.is_none() {
+        completion.value = value;
+    }
+    completion
+}
+
+/// Build a normal completion carrying an optional (possibly *empty*) value.
+fn normal_with_optional(value: Option<JsValue>) -> Completion {
+    Completion {
+        completion_type: CompletionType::Normal,
+        value,
+        target: None,
+    }
+}
+
 /// Execute a block statement.
+///
+/// Statement-list evaluation threads completion values with `UpdateEmpty`: the
+/// block's value is the value of the last *value-producing* statement, and an
+/// empty statement/declaration/nested-empty-block does not overwrite it. An
+/// abrupt completion inherits the running value too (so `{ 3; break; }` breaks
+/// with value `3`).
 fn execute_block_statement(
     block: &BlockStatementData,
     ctx: &mut EvalContext,
@@ -126,21 +175,23 @@ fn execute_block_statement(
     // Create a new block scope for let/const bindings
     ctx.push_block_scope();
 
-    let mut completion = Completion::normal();
+    let mut running: Option<JsValue> = None;
 
     for stmt in block.body.iter() {
-        completion = execute_statement(stmt, ctx)?;
+        let completion = update_empty(execute_statement(stmt, ctx)?, running.clone());
 
         if completion.is_abrupt() {
             ctx.pop_block_scope();
             return Ok(completion);
         }
+
+        running = completion.value;
     }
 
     // Pop the block scope
     ctx.pop_block_scope();
 
-    Ok(completion)
+    Ok(normal_with_optional(running))
 }
 
 /// Execute a declaration.
@@ -594,13 +645,18 @@ fn execute_if_statement(
 ) -> EvalResult {
     let test_value = evaluate_expression(test, ctx)?;
 
-    if to_boolean(&test_value) {
-        execute_statement(consequent, ctx)
+    // Per spec, an `if` whose taken branch produced an *empty* completion still
+    // yields `undefined` (`UpdateEmpty(stmtCompletion, undefined)`), and an `if`
+    // with no `else` whose test is false yields `NormalCompletion(undefined)`.
+    let completion = if to_boolean(&test_value) {
+        execute_statement(consequent, ctx)?
     } else if let Some(alt) = alternate {
-        execute_statement(alt, ctx)
+        execute_statement(alt, ctx)?
     } else {
-        Ok(Completion::normal())
-    }
+        return Ok(Completion::normal_with_value(JsValue::Undefined));
+    };
+
+    Ok(update_empty(completion, Some(JsValue::Undefined)))
 }
 
 /// Execute `label: body`. Loops take the label at entry (via
@@ -650,7 +706,9 @@ fn execute_while_statement(
     ctx: &mut EvalContext,
 ) -> EvalResult {
     let labels = loop_labels(ctx);
-    let mut completion = Completion::normal();
+    // `V` in the spec: the last non-empty iteration value, threaded with
+    // UpdateEmpty. `None` = the *empty* accumulator (surfaces as `undefined`).
+    let mut v: Option<JsValue> = None;
 
     loop {
         if crate::runner::host::host_tick() {
@@ -662,29 +720,39 @@ fn execute_while_statement(
             break;
         }
 
-        completion = execute_statement(body, ctx)?;
+        let completion = execute_statement(body, ctx)?;
 
         match completion.completion_type {
             CompletionType::Break => {
                 if targets_this_loop(&completion.target, &labels) {
-                    return Ok(Completion::normal_with_value(completion.get_value()));
+                    return Ok(Completion::normal_with_value(
+                        update_empty(completion, v).get_value(),
+                    ));
                 }
-                return Ok(completion); // labelled break for an outer statement
+                // labelled break for an outer statement
+                return Ok(update_empty(completion, v));
             }
             CompletionType::Continue => {
                 if targets_this_loop(&completion.target, &labels) {
+                    if completion.value.is_some() {
+                        v = completion.value;
+                    }
                     continue;
                 }
-                return Ok(completion);
+                return Ok(update_empty(completion, v));
             }
             CompletionType::Return | CompletionType::Throw | CompletionType::Yield => {
-                return Ok(completion);
+                return Ok(update_empty(completion, v));
             }
-            CompletionType::Normal => {}
+            CompletionType::Normal => {
+                if completion.value.is_some() {
+                    v = completion.value;
+                }
+            }
         }
     }
 
-    Ok(completion)
+    Ok(Completion::normal_with_value(v.unwrap_or(JsValue::Undefined)))
 }
 
 /// Execute a do-while statement.
@@ -694,6 +762,7 @@ fn execute_do_while_statement(
     ctx: &mut EvalContext,
 ) -> EvalResult {
     let labels = loop_labels(ctx);
+    let mut v: Option<JsValue> = None;
     loop {
         if crate::runner::host::host_tick() {
             return Err(crate::runner::host::interrupt_error());
@@ -703,19 +772,28 @@ fn execute_do_while_statement(
         match completion.completion_type {
             CompletionType::Break => {
                 if targets_this_loop(&completion.target, &labels) {
-                    return Ok(Completion::normal_with_value(completion.get_value()));
+                    return Ok(Completion::normal_with_value(
+                        update_empty(completion, v).get_value(),
+                    ));
                 }
-                return Ok(completion);
+                return Ok(update_empty(completion, v));
             }
             CompletionType::Continue => {
                 if !targets_this_loop(&completion.target, &labels) {
-                    return Ok(completion);
+                    return Ok(update_empty(completion, v));
+                }
+                if completion.value.is_some() {
+                    v = completion.value;
                 }
             }
             CompletionType::Return | CompletionType::Throw | CompletionType::Yield => {
-                return Ok(completion);
+                return Ok(update_empty(completion, v));
             }
-            CompletionType::Normal => {}
+            CompletionType::Normal => {
+                if completion.value.is_some() {
+                    v = completion.value;
+                }
+            }
         }
 
         let test_value = evaluate_expression(test, ctx)?;
@@ -724,7 +802,7 @@ fn execute_do_while_statement(
         }
     }
 
-    Ok(Completion::normal())
+    Ok(Completion::normal_with_value(v.unwrap_or(JsValue::Undefined)))
 }
 
 /// Execute a for statement.
@@ -749,7 +827,7 @@ fn execute_for_statement(
     }
 
     let labels = loop_labels(ctx);
-    let mut completion = Completion::normal();
+    let mut v: Option<JsValue> = None;
 
     loop {
         if crate::runner::host::host_tick() {
@@ -762,24 +840,33 @@ fn execute_for_statement(
             }
         }
 
-        completion = execute_statement(body, ctx)?;
+        let completion = execute_statement(body, ctx)?;
 
         match completion.completion_type {
             CompletionType::Break => {
                 if targets_this_loop(&completion.target, &labels) {
-                    return Ok(Completion::normal_with_value(completion.get_value()));
+                    return Ok(Completion::normal_with_value(
+                        update_empty(completion, v).get_value(),
+                    ));
                 }
-                return Ok(completion);
+                return Ok(update_empty(completion, v));
             }
             CompletionType::Continue => {
                 if !targets_this_loop(&completion.target, &labels) {
-                    return Ok(completion);
+                    return Ok(update_empty(completion, v));
+                }
+                if completion.value.is_some() {
+                    v = completion.value;
                 }
             }
             CompletionType::Return | CompletionType::Throw | CompletionType::Yield => {
-                return Ok(completion);
+                return Ok(update_empty(completion, v));
             }
-            CompletionType::Normal => {}
+            CompletionType::Normal => {
+                if completion.value.is_some() {
+                    v = completion.value;
+                }
+            }
         }
 
         if let Some(update) = update {
@@ -787,7 +874,7 @@ fn execute_for_statement(
         }
     }
 
-    Ok(completion)
+    Ok(Completion::normal_with_value(v.unwrap_or(JsValue::Undefined)))
 }
 
 /// Execute a function body.
@@ -1015,36 +1102,45 @@ fn execute_for_in_statement(
 
     // Execute the loop body for each key
     let labels = loop_labels(ctx);
-    let mut completion = Completion::normal();
+    let mut v: Option<JsValue> = None;
 
     for key in keys {
         // Bind the key to the loop variable
         bind_for_iterator_variable(&data.left, JsValue::String(key), ctx)?;
 
         // Execute the body
-        completion = execute_statement(&data.body, ctx)?;
+        let completion = execute_statement(&data.body, ctx)?;
 
         match completion.completion_type {
             CompletionType::Break => {
                 if targets_this_loop(&completion.target, &labels) {
-                    return Ok(Completion::normal_with_value(completion.get_value()));
+                    return Ok(Completion::normal_with_value(
+                        update_empty(completion, v).get_value(),
+                    ));
                 }
-                return Ok(completion);
+                return Ok(update_empty(completion, v));
             }
             CompletionType::Continue => {
                 if targets_this_loop(&completion.target, &labels) {
+                    if completion.value.is_some() {
+                        v = completion.value;
+                    }
                     continue;
                 }
-                return Ok(completion);
+                return Ok(update_empty(completion, v));
             }
             CompletionType::Return | CompletionType::Throw | CompletionType::Yield => {
-                return Ok(completion);
+                return Ok(update_empty(completion, v));
             }
-            CompletionType::Normal => {}
+            CompletionType::Normal => {
+                if completion.value.is_some() {
+                    v = completion.value;
+                }
+            }
         }
     }
 
-    Ok(completion)
+    Ok(Completion::normal_with_value(v.unwrap_or(JsValue::Undefined)))
 }
 
 /// Execute a for-of statement (iterate over iterable values).
@@ -1130,36 +1226,45 @@ fn execute_for_of_with_values(
     ctx: &mut EvalContext,
 ) -> EvalResult {
     let labels = loop_labels(ctx);
-    let mut completion = Completion::normal();
+    let mut v: Option<JsValue> = None;
 
     for value in values {
         // Bind the value to the loop variable
         bind_for_iterator_variable(&data.left, value, ctx)?;
 
         // Execute the body
-        completion = execute_statement(&data.body, ctx)?;
+        let completion = execute_statement(&data.body, ctx)?;
 
         match completion.completion_type {
             CompletionType::Break => {
                 if targets_this_loop(&completion.target, &labels) {
-                    return Ok(Completion::normal_with_value(completion.get_value()));
+                    return Ok(Completion::normal_with_value(
+                        update_empty(completion, v).get_value(),
+                    ));
                 }
-                return Ok(completion);
+                return Ok(update_empty(completion, v));
             }
             CompletionType::Continue => {
                 if targets_this_loop(&completion.target, &labels) {
+                    if completion.value.is_some() {
+                        v = completion.value;
+                    }
                     continue;
                 }
-                return Ok(completion);
+                return Ok(update_empty(completion, v));
             }
             CompletionType::Return | CompletionType::Throw | CompletionType::Yield => {
-                return Ok(completion);
+                return Ok(update_empty(completion, v));
             }
-            CompletionType::Normal => {}
+            CompletionType::Normal => {
+                if completion.value.is_some() {
+                    v = completion.value;
+                }
+            }
         }
     }
 
-    Ok(completion)
+    Ok(Completion::normal_with_value(v.unwrap_or(JsValue::Undefined)))
 }
 
 /// Bind a value to a for-in/for-of loop variable.
@@ -1199,4 +1304,186 @@ fn bind_for_iterator_variable(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod completion_tests {
+    //! Tests for ES statement **completion values** (the `UpdateEmpty`
+    //! semantics). `eval()` returns the completion value of the last
+    //! value-producing statement; statements thread completion values with
+    //! `UpdateEmpty` so an empty block/statement/declaration is an *empty*
+    //! completion that does not clobber the running value, while an `if`/loop
+    //! whose taken branch is empty surfaces `undefined`
+    //! (`UpdateEmpty(stmt, undefined)`).
+    use super::*;
+    use crate::parser::JsParser;
+    use crate::runner::ds::value::JsNumberType;
+    use crate::runner::plugin::registry::BuiltInRegistry;
+    use crate::runner::plugin::types::EvalContext;
+
+    /// Evaluate a program and return its completion value — the same threading
+    /// `eval` performs (keep the last *non-empty* completion value), in the same
+    /// environment (core built-ins installed, `var` hoisting).
+    fn completion_value(code: &str) -> JsValue {
+        let ast = JsParser::parse_to_ast_from_str(code)
+            .unwrap_or_else(|e| panic!("parse error for {:?}: {:?}", code, e));
+        let mut ctx = EvalContext::new();
+        ctx.install_core_builtins(BuiltInRegistry::with_core());
+        hoist_var_declarations(&ast.body, &mut ctx);
+        let mut last = JsValue::Undefined;
+        for stmt in &ast.body {
+            let c = execute_statement(stmt, &mut ctx)
+                .unwrap_or_else(|e| panic!("runtime error for {:?}: {:?}", code, e));
+            if let Some(v) = c.value.clone() {
+                last = v;
+            }
+        }
+        last
+    }
+
+    fn int(n: i64) -> JsValue {
+        JsValue::Number(JsNumberType::Integer(n))
+    }
+
+    // --- `if` (UpdateEmpty(stmt, undefined)) ---
+
+    #[test]
+    fn if_taken_empty_branch_is_undefined() {
+        assert_eq!(completion_value("1; if (false) { } else { }"), JsValue::Undefined);
+        assert_eq!(completion_value("1; if (true) { } else { }"), JsValue::Undefined);
+        // Empty statement body: `if (1) ;`
+        assert_eq!(completion_value("if (1) ;"), JsValue::Undefined);
+    }
+
+    #[test]
+    fn if_nonempty_branch_keeps_value() {
+        assert_eq!(completion_value("2; if (false) { } else { 3; }"), int(3));
+        assert_eq!(completion_value("2; if (true) { 3; } else { }"), int(3));
+        assert_eq!(completion_value("6; if (false) { 7; } else { 8; }"), int(8));
+        assert_eq!(completion_value("6; if (true) { 7; } else { 8; }"), int(7));
+    }
+
+    #[test]
+    fn if_no_else_false_is_undefined() {
+        assert_eq!(completion_value("1; if (false) { }"), JsValue::Undefined);
+        assert_eq!(completion_value("2; if (false) { 3; }"), JsValue::Undefined);
+    }
+
+    #[test]
+    fn if_no_else_true_updates_empty() {
+        assert_eq!(completion_value("1; if (true) { }"), JsValue::Undefined);
+        assert_eq!(completion_value("2; if (true) { 3; }"), int(3));
+    }
+
+    // --- block / statement-list threading ---
+
+    #[test]
+    fn empty_block_preserves_prior_value() {
+        assert_eq!(completion_value("1; { }"), int(1));
+    }
+
+    #[test]
+    fn block_threads_last_nonempty_value() {
+        assert_eq!(completion_value("{ 1; 2; }"), int(2));
+        // A trailing declaration is empty and preserves the prior value.
+        assert_eq!(completion_value("{ 1; var x = 2; }"), int(1));
+        // A trailing empty nested block preserves it too.
+        assert_eq!(completion_value("{ 5; { } }"), int(5));
+    }
+
+    #[test]
+    fn abrupt_block_inherits_running_value() {
+        // `{ 3; break; }` breaks carrying the running value 3.
+        assert_eq!(
+            completion_value("do { 2; if (true) { 3; break; } 4; } while (false)"),
+            int(3),
+        );
+    }
+
+    // --- while / do-while ---
+
+    #[test]
+    fn while_no_iteration_is_undefined() {
+        assert_eq!(completion_value("1; while (false) { }"), JsValue::Undefined);
+        assert_eq!(completion_value("2; while (false) { 3; }"), JsValue::Undefined);
+    }
+
+    #[test]
+    fn while_iterates_threads_value() {
+        assert_eq!(completion_value("var c = 2; 1; while (c -= 1) { }"), JsValue::Undefined);
+        assert_eq!(completion_value("var c = 2; 2; while (c -= 1) { 3; }"), int(3));
+    }
+
+    #[test]
+    fn while_break_is_update_empty() {
+        assert_eq!(completion_value("1; while (true) { break; }"), JsValue::Undefined);
+        assert_eq!(completion_value("2; while (true) { 3; break; }"), int(3));
+    }
+
+    #[test]
+    fn do_while_if_empty_branch_break() {
+        assert_eq!(
+            completion_value("1; do { if (false) { } else { break; } } while (false)"),
+            JsValue::Undefined,
+        );
+        assert_eq!(
+            completion_value("6; do { 7; if (false) { 8; } else { break; } } while (false)"),
+            JsValue::Undefined,
+        );
+    }
+
+    #[test]
+    fn do_while_continue_threads_value() {
+        assert_eq!(
+            completion_value("8; do { 9; if (true) { 10; continue; } 11; } while (false)"),
+            int(10),
+        );
+        assert_eq!(
+            completion_value("12; do { 13; if (true) { continue; } 14; } while (false)"),
+            JsValue::Undefined,
+        );
+    }
+
+    // --- for / for-of ---
+
+    #[test]
+    fn for_completion_values() {
+        assert_eq!(completion_value("1; for (var i = 0; i < 0; i++) { }"), JsValue::Undefined);
+        assert_eq!(completion_value("for (var i = 0; i < 3; i++) { i; }"), int(2));
+        assert_eq!(completion_value("9; for (var i = 0; i < 2; i++) { }"), JsValue::Undefined);
+    }
+
+    #[test]
+    fn for_of_empty_body_is_undefined() {
+        // An empty-body for-of yields undefined (via the loop's final
+        // `UpdateEmpty`), not the prior value — regardless of iteration count.
+        // (Body-value threading is covered by `for_completion_values`; for-of's
+        // value extraction has unrelated pre-existing quirks.)
+        assert_eq!(completion_value("7; for (var x of [1, 2]) { }"), JsValue::Undefined);
+        assert_eq!(completion_value("8; for (var x of []) { }"), JsValue::Undefined);
+    }
+
+    // --- break/continue label normalization (defends against the parser
+    //     capturing a bare `break;`/`continue;` terminator as a label) ---
+
+    #[test]
+    fn sanitize_label_rejects_non_identifier() {
+        assert_eq!(sanitize_label(Some(";".to_string())), None);
+        assert_eq!(sanitize_label(Some(String::new())), None);
+        assert_eq!(sanitize_label(None), None);
+        assert_eq!(sanitize_label(Some("outer".to_string())), Some("outer".to_string()));
+        assert_eq!(sanitize_label(Some("_x".to_string())), Some("_x".to_string()));
+        assert_eq!(sanitize_label(Some("$y".to_string())), Some("$y".to_string()));
+    }
+
+    #[test]
+    fn labelled_break_and_continue_still_work() {
+        // `break outer` exits both loops; the labelled construct completes normally.
+        assert_eq!(
+            completion_value("2; outer: while (true) { while (true) { break outer; } }"),
+            JsValue::Undefined,
+        );
+        // A labelled block whose `break L` carries the running value.
+        assert_eq!(completion_value("5; L: { 6; break L; 7; }"), int(6));
+    }
 }

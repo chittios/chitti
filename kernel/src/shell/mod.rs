@@ -7017,6 +7017,15 @@ fn browser_load_method(
     });
     browser_set_progress(5);
 
+    // Progressive render (stage 1/5): paint a loading screen immediately so the
+    // browser tab opens right away instead of a blank pane while the document +
+    // subresources fetch.
+    {
+        let loading =
+            crate::browser::layout::layout_reader("Loading\u{2026}", url, browser_vw(), browser_vh());
+        browser_paint_stage(&loading, "Loading\u{2026}", url, 8);
+    }
+
     let doc_res = if method.eq_ignore_ascii_case("POST") {
         match crate::net::http::request(
             "POST",
@@ -7072,6 +7081,27 @@ fn browser_load_method(
         body_bytes.truncate(BROWSER_BODY_MAX);
     }
     let body_html = alloc::string::String::from_utf8_lossy(&body_bytes).into_owned();
+
+    // Progressive render (stage 2/5): DOM paint — lay out the raw HTML with
+    // inline CSS only (no external CSS, no scripts) so page structure appears
+    // fast, before the heavy script phase.
+    {
+        let empty: alloc::collections::BTreeMap<alloc::string::String, alloc::string::String> =
+            alloc::collections::BTreeMap::new();
+        let (dom_doc, dom_lay) = crate::browser::layout_static(
+            &body_html,
+            browser_vw(),
+            browser_vh(),
+            &final_url,
+            &empty,
+        );
+        let t = if dom_doc.title.is_empty() {
+            final_url.clone()
+        } else {
+            dom_doc.title.clone()
+        };
+        browser_paint_stage(&dom_lay, &t, &final_url, 20);
+    }
 
     // --- Subresource discovery: parse once to enumerate external scripts /
     // stylesheets / fonts / background images (the layout parse comes later,
@@ -7181,6 +7211,25 @@ fn browser_load_method(
     let bg_pixels = browser_fetch_bg_images(&all_css, &final_url);
     browser_set_progress(50);
 
+    // Progressive render (stage 3/5): CSS paint — re-lay out with the fetched
+    // external stylesheets applied (still no scripts), so the page is styled
+    // before the (potentially heavy) script phase runs.
+    {
+        let (css_doc, css_lay) = crate::browser::layout_static(
+            &body_html,
+            browser_vw(),
+            browser_vh(),
+            &final_url,
+            &css_bodies,
+        );
+        let t = if css_doc.title.is_empty() {
+            final_url.clone()
+        } else {
+            css_doc.title.clone()
+        };
+        browser_paint_stage(&css_lay, &t, &final_url, 52);
+    }
+
     // --- Boot the persistent page JS context (scripts run ONCE per
     // navigation; repaints re-read the DOM instead of re-running them).
     let (exec_list, _skipped) = browser_script_list(&pre, &final_url, &script_bodies);
@@ -7219,6 +7268,17 @@ fn browser_load_method(
         crate::browser::layout_session(&body_html, browser_vw(), browser_vh(), &final_url, &assets)
     };
     browser_mirror_js_lines(&js_lines);
+
+    // Progressive render (stage 4/5): scripts paint — the live page DOM after
+    // scripts ran, before images fill in.
+    {
+        let t = if doc.title.is_empty() {
+            final_url.clone()
+        } else {
+            doc.title.clone()
+        };
+        browser_paint_stage(&lay, &t, &final_url, 90);
+    }
 
     // Subresource images via cooperative worker pool.
     let mut img_urls = alloc::vec::Vec::new();
@@ -7502,6 +7562,31 @@ fn browser_layout_session() -> Option<(
     });
     Some((lay, url, title, scroll, focused))
 }
+
+/// Progressive-render stage paint: render `lay` and blit it to the browser
+/// Surface tab immediately, so the page appears in stages (loading → DOM → CSS
+/// → scripts → images) instead of a blank pane until the whole pipeline
+/// finishes. Pumps `upkeep()` so the clock/mouse stay live between stages.
+#[cfg(not(test))]
+fn browser_paint_stage(
+    lay: &crate::browser::layout::Layout,
+    title: &str,
+    url: &str,
+    progress: u8,
+) {
+    let (pixels, content_h) =
+        crate::browser::paint_layout_chrome(lay, browser_vh(), 0, Some(progress));
+    BROWSER.with(|s| {
+        if let Some(b) = s.as_mut() {
+            b.content_height = content_h;
+        }
+    });
+    browser_present(&pixels, title, url, 0, content_h);
+    crate::shell::upkeep();
+}
+
+#[cfg(test)]
+fn browser_paint_stage(_lay: &crate::browser::layout::Layout, _t: &str, _u: &str, _p: u8) {}
 
 fn browser_present(pixels: &[u32], title: &str, url: &str, scroll_y: i32, content_h: i32) {
     #[cfg(not(test))]

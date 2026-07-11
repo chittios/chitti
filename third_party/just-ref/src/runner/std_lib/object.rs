@@ -12,7 +12,9 @@ use alloc::vec::Vec;
 use crate::runner::ds::error::JErrorType;
 use crate::runner::ds::value::JsValue;
 use crate::runner::ds::object::JsObject;
-use crate::runner::ds::object_property::{PropertyDescriptor, PropertyDescriptorData, PropertyKey};
+use crate::runner::ds::object_property::{
+    PropertyDescriptor, PropertyDescriptorAccessor, PropertyDescriptorData, PropertyKey,
+};
 use crate::runner::plugin::registry::BuiltInRegistry;
 use crate::runner::plugin::types::{BuiltInObject, EvalContext};
 use crate::runner::eval::expression::{make_array, make_object};
@@ -73,14 +75,25 @@ pub fn register(registry: &mut BuiltInRegistry) {
 }
 
 /// Object constructor.
+///
+/// `Object()` / `Object(null|undefined)` make a fresh object; an object argument
+/// is returned unchanged; a **primitive** argument is boxed into a wrapper object
+/// carrying its value under `__primitive_value__` (non-enumerable). The wrapper's
+/// `ToPrimitive` (see `expression::to_primitive`) unwraps it, so `Object(2n) + 1n`
+/// evaluates to `3n`.
 fn object_constructor(
     _ctx: &mut EvalContext,
     _this: JsValue,
     args: Vec<JsValue>,
 ) -> Result<JsValue, JErrorType> {
-    match args.first() {
+    match args.into_iter().next() {
         None | Some(JsValue::Null) | Some(JsValue::Undefined) => Ok(make_object(Vec::new())),
-        Some(v) => Ok(v.clone()),
+        Some(v @ JsValue::Object(_)) => Ok(v),
+        Some(prim) => {
+            let obj = make_object(Vec::new());
+            crate::runner::eval::expression::set_own_prop(&obj, "__primitive_value__", prim, false);
+            Ok(obj)
+        }
     }
 }
 
@@ -188,13 +201,48 @@ fn object_define_property(
         None => return Ok(target),
     };
     let desc = args.get(2).cloned().unwrap_or(JsValue::Undefined);
-    let value = crate::runner::eval::expression::get_own_prop_value(&desc, "value")
-        .unwrap_or(JsValue::Undefined);
+    use crate::runner::eval::expression as ex;
     let enumerable = matches!(
-        crate::runner::eval::expression::get_own_prop_value(&desc, "enumerable"),
+        ex::get_own_prop_value(&desc, "enumerable"),
         Some(JsValue::Boolean(true))
     );
-    crate::runner::eval::expression::set_own_prop(&target, &key, value, enumerable);
+
+    // Accessor descriptor: the descriptor object mentions `get` and/or `set`.
+    // (A present-but-`undefined` `get`/`set` still makes it an accessor.)
+    if ex::has_own_prop(&desc, "get") || ex::has_own_prop(&desc, "set") {
+        let configurable = matches!(
+            ex::get_own_prop_value(&desc, "configurable"),
+            Some(JsValue::Boolean(true))
+        );
+        let to_fn = |v: Option<JsValue>| -> Option<crate::runner::ds::object::JsObjectType> {
+            match v {
+                Some(JsValue::Object(o)) => Some(o),
+                _ => None,
+            }
+        };
+        let get = to_fn(ex::get_own_prop_value(&desc, "get"));
+        let set = to_fn(ex::get_own_prop_value(&desc, "set"));
+        if let JsValue::Object(o) = &target {
+            o.borrow_mut()
+                .as_js_object_mut()
+                .get_object_base_mut()
+                .properties
+                .insert(
+                    PropertyKey::Str(key),
+                    PropertyDescriptor::Accessor(PropertyDescriptorAccessor {
+                        get,
+                        set,
+                        enumerable,
+                        configurable,
+                    }),
+                );
+        }
+        return Ok(target);
+    }
+
+    // Data descriptor (unchanged: writable/configurable default to true here).
+    let value = ex::get_own_prop_value(&desc, "value").unwrap_or(JsValue::Undefined);
+    ex::set_own_prop(&target, &key, value, enumerable);
     Ok(target)
 }
 
@@ -225,15 +273,37 @@ fn object_get_own_property_descriptor(
         Some(other) => crate::runner::eval::expression::value_to_property_key(other),
         None => return Ok(JsValue::Undefined),
     };
-    match crate::runner::eval::expression::get_own_prop_descriptor(&target, &key) {
-        Some((v, writable, enumerable, configurable)) => Ok(make_object(alloc::vec![
-            ("value".to_string(), v),
-            ("writable".to_string(), JsValue::Boolean(writable)),
-            ("enumerable".to_string(), JsValue::Boolean(enumerable)),
-            ("configurable".to_string(), JsValue::Boolean(configurable)),
-        ])),
-        None => Ok(JsValue::Undefined),
+    if let JsValue::Object(o) = &target {
+        let b = o.borrow();
+        if let Some(desc) = b
+            .as_js_object()
+            .get_object_base()
+            .properties
+            .get(&PropertyKey::Str(key.clone()))
+        {
+            return Ok(match desc {
+                PropertyDescriptor::Data(d) => make_object(alloc::vec![
+                    ("value".to_string(), d.value.clone()),
+                    ("writable".to_string(), JsValue::Boolean(d.writable)),
+                    ("enumerable".to_string(), JsValue::Boolean(d.enumerable)),
+                    ("configurable".to_string(), JsValue::Boolean(d.configurable)),
+                ]),
+                PropertyDescriptor::Accessor(a) => {
+                    let getset = |f: &Option<crate::runner::ds::object::JsObjectType>| match f {
+                        Some(fun) => JsValue::Object(fun.clone()),
+                        None => JsValue::Undefined,
+                    };
+                    make_object(alloc::vec![
+                        ("get".to_string(), getset(&a.get)),
+                        ("set".to_string(), getset(&a.set)),
+                        ("enumerable".to_string(), JsValue::Boolean(a.enumerable)),
+                        ("configurable".to_string(), JsValue::Boolean(a.configurable)),
+                    ])
+                }
+            });
+        }
     }
+    Ok(JsValue::Undefined)
 }
 
 /// Object.getOwnPropertyNames(obj) — all own string keys (enumerable or not).
@@ -320,4 +390,94 @@ fn object_assign(
         }
     }
     Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runner::eval::expression::{get_own_prop_value, has_own_prop, make_object};
+    use crate::runner::plugin::types::EvalContext;
+
+    /// `Object(primitive)` boxes into a wrapper carrying `__primitive_value__`.
+    #[test]
+    fn object_constructor_boxes_bigint() {
+        let mut ctx = EvalContext::new();
+        let arg = JsValue::BigInt(num_bigint::BigInt::from(2));
+        let r = object_constructor(&mut ctx, JsValue::Undefined, alloc::vec![arg]).unwrap();
+        assert!(matches!(r, JsValue::Object(_)));
+        match get_own_prop_value(&r, "__primitive_value__") {
+            Some(JsValue::BigInt(b)) => assert_eq!(b, num_bigint::BigInt::from(2)),
+            other => panic!("expected boxed 2n, got {:?}", other),
+        }
+    }
+
+    /// An object argument is returned unchanged (not re-boxed).
+    #[test]
+    fn object_constructor_object_arg_unchanged() {
+        let mut ctx = EvalContext::new();
+        let obj = make_object(alloc::vec![("a".to_string(), JsValue::Boolean(true))]);
+        let r =
+            object_constructor(&mut ctx, JsValue::Undefined, alloc::vec![obj]).unwrap();
+        assert!(!has_own_prop(&r, "__primitive_value__"));
+        assert_eq!(get_own_prop_value(&r, "a"), Some(JsValue::Boolean(true)));
+    }
+
+    /// `Object()` / `Object(undefined)` makes a fresh plain object.
+    #[test]
+    fn object_constructor_empty_makes_object() {
+        let mut ctx = EvalContext::new();
+        let r = object_constructor(&mut ctx, JsValue::Undefined, alloc::vec![]).unwrap();
+        assert!(matches!(r, JsValue::Object(_)));
+        assert!(!has_own_prop(&r, "__primitive_value__"));
+    }
+
+    /// `defineProperty` with a `get` builds an accessor; `getOwnPropertyDescriptor`
+    /// round-trips it (`get` present, no `value`).
+    #[test]
+    fn define_property_accessor_roundtrips() {
+        let mut ctx = EvalContext::new();
+        let target = make_object(alloc::vec![]);
+        let getter = make_object(alloc::vec![]); // stand-in for a function object
+        let desc = make_object(alloc::vec![("get".to_string(), getter)]);
+        object_define_property(
+            &mut ctx,
+            JsValue::Undefined,
+            alloc::vec![target.clone(), JsValue::String("x".to_string()), desc],
+        )
+        .unwrap();
+        let out = object_get_own_property_descriptor(
+            &mut ctx,
+            JsValue::Undefined,
+            alloc::vec![target, JsValue::String("x".to_string())],
+        )
+        .unwrap();
+        assert!(has_own_prop(&out, "get"));
+        assert!(has_own_prop(&out, "set"));
+        assert!(!has_own_prop(&out, "value"));
+    }
+
+    /// A data-descriptor `defineProperty` still round-trips as a data descriptor.
+    #[test]
+    fn define_property_data_roundtrips() {
+        let mut ctx = EvalContext::new();
+        let target = make_object(alloc::vec![]);
+        let desc = make_object(alloc::vec![
+            ("value".to_string(), JsValue::Number(crate::runner::ds::value::JsNumberType::Integer(7))),
+            ("enumerable".to_string(), JsValue::Boolean(true)),
+        ]);
+        object_define_property(
+            &mut ctx,
+            JsValue::Undefined,
+            alloc::vec![target.clone(), JsValue::String("y".to_string()), desc],
+        )
+        .unwrap();
+        let out = object_get_own_property_descriptor(
+            &mut ctx,
+            JsValue::Undefined,
+            alloc::vec![target, JsValue::String("y".to_string())],
+        )
+        .unwrap();
+        assert!(has_own_prop(&out, "value"));
+        assert!(!has_own_prop(&out, "get"));
+    }
 }

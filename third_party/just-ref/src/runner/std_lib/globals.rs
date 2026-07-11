@@ -91,7 +91,10 @@ fn as_source_str(v: &JsValue) -> String {
 fn eval_source(src: &str, ctx: &mut EvalContext) -> Result<JsValue, JErrorType> {
     use crate::parser::JsParser;
     use crate::runner::eval::statement::execute_statement;
-    let ast = JsParser::parse_to_ast_from_str(src)
+    // Direct eval inherits the caller's strictness — an octal literal or legacy
+    // escape in `eval("… 01 …")` is a SyntaxError when the surrounding code is
+    // strict (Annex-B), so thread `ctx.strict` into the parser.
+    let ast = JsParser::parse_to_ast_from_str_strict(src, ctx.strict)
         .map_err(|e| JErrorType::SyntaxError(alloc::format!("{:?}", e)))?;
     let mut last = JsValue::Undefined;
     for stmt in &ast.body {

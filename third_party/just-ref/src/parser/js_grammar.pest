@@ -71,7 +71,7 @@ future_reserved_word = { "enum" | "await" }
 // right_brace_punctuator = { "}" }
 null_literal = @{ "null" }
 boolean_literal = @{ "true" | "false" }
-numeric_literal = { bigint_literal | binary_integer_literal | octal_integer_literal | hex_integer_literal |  decimal_literal }
+numeric_literal = { bigint_literal | binary_integer_literal | octal_integer_literal | hex_integer_literal | legacy_octal_like_integer_literal |  decimal_literal }
 // BigInt literal (ES2020): an integer form (binary/octal/hex, or a decimal
 // integer that is either `0` or non-zero-led — so `00n`/`08n` are rejected)
 // followed by `n`. No fraction, no exponent — `1.0n`/`1e2n` never match.
@@ -83,6 +83,16 @@ decimal_literal = ${
 }
 decimal_integer_literal = @{ "0" | non_zero_digit ~ ("_"? ~ decimal_digit)* }
 non_zero_digit = { ASCII_NONZERO_DIGIT }
+// ChittiOS: Annex-B B.1.1 (non-strict only) legacy leading-zero integers, as a
+// single token — a leading `0` followed by one or more decimal digits. Whether
+// it is a LegacyOctalIntegerLiteral (all octal digits → base-8: `010` = 8) or a
+// NonOctalDecimalIntegerLiteral (contains an `8`/`9` → base-10: `018` = 18,
+// `08` = 8) is decided by value in the AST builder — a single greedy rule
+// avoids the PEG gotcha that a possessive `ASCII_DIGIT*` would eat the trailing
+// `8` and then fail the required-`8` split. Both forms are Syntax Errors in
+// strict-mode code, enforced post-parse by `check_strict_legacy_octal` in
+// api.rs (this grammar is mode-free).
+legacy_octal_like_integer_literal = @{ "0" ~ ASCII_DIGIT+ }
 binary_integer_literal = @{ ("0b" | "0B") ~ ASCII_BIN_DIGIT ~ ("_"? ~ ASCII_BIN_DIGIT)* }
 octal_integer_literal = @{ ("0o" | "0O") ~ ASCII_OCT_DIGIT ~ ("_"? ~ ASCII_OCT_DIGIT)* }
 hex_digits = { ASCII_HEX_DIGIT+ }
@@ -94,17 +104,26 @@ string_literal = @{ "\"" ~ double_string_chars? ~ "\"" | "'" ~ single_string_cha
 double_string_chars = @{ double_string_char+ }
 double_string_char = @{
     !(line_terminator | "\"" | "\\") ~ source_character
-    | "\\" ~ escape_sequence
+    | "\\" ~ string_escape_sequence
     | line_continuation
 }
 single_string_chars = @{ single_string_char+ }
 single_string_char = @{
    !(line_terminator | "'" | "\\") ~ source_character
-   | "\\" ~ escape_sequence
+   | "\\" ~ string_escape_sequence
    | line_continuation
 }
 line_continuation = @{ "\\" ~ line_terminator_sequence }
 escape_sequence = { character_escape_sequence | "0" ~ !decimal_digit | hex_escape_sequence | unicode_escape_sequence }
+// ChittiOS: Annex-B B.1.2 string escapes (non-strict only). String literals
+// additionally accept a LegacyOctalEscapeSequence (`\1`..`\377`, 1–3 octal
+// digits) and a NonOctalDecimalEscapeSequence (`\8`/`\9` → the chars "8"/"9").
+// Template literals deliberately keep the strict `escape_sequence` (legacy
+// octal is ALWAYS a Syntax Error in a template). The actual value is computed in
+// `cook_string_literal`; strict-mode rejection is post-parse in api.rs.
+string_escape_sequence = { escape_sequence | legacy_octal_escape_sequence | non_octal_decimal_escape_sequence }
+legacy_octal_escape_sequence = @{ ASCII_OCT_DIGIT }
+non_octal_decimal_escape_sequence = @{ "8" | "9" }
 character_escape_sequence = { single_escape_character | non_escape_character }
 single_escape_character = { "'" | "\"" | "\\" | "b" | "f" | "n" | "r" | "t" | "v" }
 non_escape_character = { !(escape_character | line_terminator) ~ source_character }

@@ -251,6 +251,44 @@ pub fn layout_session(
     (doc, lay, js_log)
 }
 
+/// **Static** layout for progressive rendering — parse + lay out the raw HTML
+/// with (optionally) the fetched external stylesheets, WITHOUT running or
+/// consulting page scripts. Used for the early "DOM" and "CSS" paints in the
+/// browse pipeline (loading → DOM → CSS → scripts → images), so the user sees
+/// structure/styling before the heavy script phase, like a real browser. Pass
+/// an empty `css_external` for the DOM-only stage. Never touches the persistent
+/// JS page (always stamps element indices).
+pub fn layout_static(
+    html_src: &str,
+    vw: i32,
+    vh: i32,
+    url: &str,
+    css_external: &BTreeMap<String, String>,
+) -> (html::Document, layout::Layout) {
+    let mut doc = html::parse(html_src);
+    let mut css_all = String::new();
+    for s in &doc.styles_ordered {
+        match s {
+            html::StyleSrc::Inline(body) => {
+                css_all.push_str(body);
+                css_all.push('\n');
+            }
+            html::StyleSrc::External(href) => {
+                let abs = url::resolve(url, href).unwrap_or_else(|| href.clone());
+                if let Some(body) = css_external.get(&abs).or_else(|| css_external.get(href)) {
+                    css_all.push_str(body);
+                    css_all.push('\n');
+                }
+            }
+        }
+    }
+    js::stamp_elem_indices(&mut doc.root);
+    let sheet = css::Stylesheet::parse(&css_all);
+    let mut lay = layout::layout_document(&doc.root, &sheet, vw, vh);
+    finish_layout(&doc, &mut lay, vw, vh);
+    (doc, lay)
+}
+
 /// Paint nested HTML into an iframe/frame slot (pure for `srcdoc`; host loads
 /// remote `src` then calls this). Depth is capped to avoid recursive iframe bombs.
 pub fn fill_frame_slot(fr: &mut layout::FrameBox, html_src: &str, base_url: &str) {

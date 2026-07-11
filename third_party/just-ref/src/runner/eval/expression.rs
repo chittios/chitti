@@ -135,6 +135,9 @@ pub fn evaluate_expression(
                 out.push_str(&quasi.cooked_value);
                 if let Some(expr) = data.expressions.get(i) {
                     let v = evaluate_expression(expr, ctx)?;
+                    // A template substitution coerces via ToString, which for an
+                    // object first runs ToPrimitive(string).
+                    let v = to_primitive(&v, "string", ctx)?;
                     out.push_str(&to_string(&v));
                 }
             }
@@ -610,9 +613,12 @@ fn get_object_property_key(
     ctx: &mut EvalContext,
 ) -> Result<String, JErrorType> {
     if computed {
-        // Computed property: [expr]
+        // Computed property: [expr]. Use `value_to_property_key` (not `to_string`)
+        // so a symbol key keeps its unique identity — `to_string` collapses every
+        // symbol to "[Symbol]", colliding e.g. `[Symbol.toPrimitive]` with any
+        // other symbol and breaking `ToPrimitive` lookup.
         let key_value = evaluate_expression(key_expr, ctx)?;
-        Ok(to_string(&key_value))
+        Ok(value_to_property_key(&key_value))
     } else {
         // Static property key
         match key_expr {
@@ -2039,10 +2045,12 @@ fn evaluate_unary_expression(
         }
         UnaryOperator::Minus => {
             let value = evaluate_expression(argument, ctx)?;
+            let value = to_primitive(&value, "number", ctx)?;
             negate_number(&value)
         }
         UnaryOperator::Plus => {
             let value = evaluate_expression(argument, ctx)?;
+            let value = to_primitive(&value, "number", ctx)?;
             // Unary `+` explicitly rejects BigInt (would require ToNumber).
             if matches!(value, JsValue::BigInt(_)) {
                 return Err(JErrorType::TypeError(
@@ -2053,6 +2061,7 @@ fn evaluate_unary_expression(
         }
         UnaryOperator::BitwiseNot => {
             let value = evaluate_expression(argument, ctx)?;
+            let value = to_primitive(&value, "number", ctx)?;
             bitwise_not(&value)
         }
         UnaryOperator::Delete => {
@@ -2104,6 +2113,39 @@ fn evaluate_binary_expression(
 ) -> ValueResult {
     let left_val = evaluate_expression(left, ctx)?;
     let right_val = evaluate_expression(right, ctx)?;
+
+    // Coerce object operands to primitives via ToPrimitive for the operators
+    // that require it (arithmetic/relational/bitwise). `+` and `<`-family use no
+    // specific hint ("default"/"number"); the rest use "number". Equality
+    // (`===`/`==`), `instanceof` and `in` are left untouched — they either never
+    // coerce or handle it themselves. Non-objects and objects without user
+    // coercion pass through unchanged (see `to_primitive`).
+    let hint = match operator {
+        BinaryOperator::Add => Some("default"),
+        BinaryOperator::Subtract
+        | BinaryOperator::Multiply
+        | BinaryOperator::Divide
+        | BinaryOperator::Modulo
+        | BinaryOperator::Exponent
+        | BinaryOperator::LessThan
+        | BinaryOperator::GreaterThan
+        | BinaryOperator::LessThanEqual
+        | BinaryOperator::GreaterThanEqual
+        | BinaryOperator::BitwiseAnd
+        | BinaryOperator::BitwiseOr
+        | BinaryOperator::BitwiseXor
+        | BinaryOperator::BitwiseLeftShift
+        | BinaryOperator::BitwiseRightShift
+        | BinaryOperator::BitwiseUnsignedRightShift => Some("number"),
+        _ => None,
+    };
+    let (left_val, right_val) = match hint {
+        Some(h) => (
+            to_primitive(&left_val, h, ctx)?,
+            to_primitive(&right_val, h, ctx)?,
+        ),
+        None => (left_val, right_val),
+    };
 
     match operator {
         // Arithmetic
@@ -3221,6 +3263,66 @@ pub fn value_to_property_key(v: &JsValue) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// AbstractOperation ToPrimitive(input, hint) for the object case.
+///
+/// A non-object is returned unchanged. For an object: if `Symbol.toPrimitive`
+/// is callable it is invoked with the hint string (`"number"`/`"string"`/
+/// `"default"`) and its result is required to be primitive (else a TypeError);
+/// otherwise `valueOf`/`toString` are tried in hint order and the first
+/// primitive result wins. A boxed primitive wrapper (`Object(2n)`, `Object(42)`
+/// — carrying `__primitive_value__`) falls back to its stored primitive. An
+/// object with none of these (a plain `{}` with no user coercion and no real
+/// prototype) is returned unchanged, so the interpreter's legacy stringify/NaN
+/// coercion still applies and the passing corpus is unaffected.
+pub fn to_primitive(value: &JsValue, hint: &str, ctx: &mut EvalContext) -> ValueResult {
+    if !matches!(value, JsValue::Object(_)) {
+        return Ok(value.clone());
+    }
+    // 1. Exotic `Symbol.toPrimitive` (keyed by its stringified form, like every
+    // other symbol-valued property in this interpreter).
+    let sym_key = value_to_property_key(&JsValue::Symbol(
+        crate::runner::ds::symbol::SYMBOL_TO_PRIMITIVE.clone(),
+    ));
+    let exotic = get_property_with_ctx(value, &sym_key, ctx)?;
+    if value_is_callable(&exotic) {
+        let h = if hint.is_empty() { "default" } else { hint };
+        let res = call_value(
+            &exotic,
+            value.clone(),
+            alloc::vec![JsValue::String(h.to_string())],
+            ctx,
+        )?;
+        if matches!(res, JsValue::Object(_)) {
+            return Err(JErrorType::TypeError(
+                "Cannot convert object to primitive value".to_string(),
+            ));
+        }
+        return Ok(res);
+    }
+    // 2. OrdinaryToPrimitive: valueOf/toString in hint order (user-defined only —
+    // resolved via the normal own/prototype lookup).
+    let order: [&str; 2] = if hint == "string" {
+        ["toString", "valueOf"]
+    } else {
+        ["valueOf", "toString"]
+    };
+    for m in order {
+        let method = get_property_with_ctx(value, m, ctx)?;
+        if value_is_callable(&method) {
+            let res = call_value(&method, value.clone(), alloc::vec![], ctx)?;
+            if !matches!(res, JsValue::Object(_)) {
+                return Ok(res);
+            }
+        }
+    }
+    // 3. Boxed primitive wrapper (`Object(prim)`).
+    if let Some(p) = get_own_prop_value(value, "__primitive_value__") {
+        return Ok(p);
+    }
+    // 4. No user coercion available: leave the object for the legacy path.
+    Ok(value.clone())
 }
 
 /// The registry object-name to use for method dispatch on a receiver: a builtin
@@ -4680,3 +4782,63 @@ fn create_default_constructor(
     Ok(JsValue::Object(obj_ref))
 }
 
+
+#[cfg(test)]
+mod to_primitive_tests {
+    use super::*;
+    use crate::runner::plugin::types::EvalContext;
+
+    /// A non-object is returned unchanged by ToPrimitive.
+    #[test]
+    fn to_primitive_passthrough_non_object() {
+        let mut ctx = EvalContext::new();
+        let v = JsValue::Number(JsNumberType::Integer(5));
+        assert_eq!(to_primitive(&v, "number", &mut ctx).unwrap(), v);
+        let s = JsValue::String("hi".to_string());
+        assert_eq!(to_primitive(&s, "string", &mut ctx).unwrap(), s);
+    }
+
+    /// A boxed primitive wrapper (`Object(prim)`) unwraps to its stored primitive.
+    #[test]
+    fn to_primitive_unwraps_boxed_primitive() {
+        let mut ctx = EvalContext::new();
+        let wrapper = make_object(alloc::vec![]);
+        set_own_prop(
+            &wrapper,
+            "__primitive_value__",
+            JsValue::BigInt(num_bigint::BigInt::from(2)),
+            false,
+        );
+        match to_primitive(&wrapper, "default", &mut ctx).unwrap() {
+            JsValue::BigInt(b) => assert_eq!(b, num_bigint::BigInt::from(2)),
+            other => panic!("expected 2n, got {:?}", other),
+        }
+    }
+
+    /// A plain object with no user coercion and no wrapper is left unchanged, so
+    /// the legacy stringify/NaN path still applies (no corpus regression).
+    #[test]
+    fn to_primitive_leaves_plain_object() {
+        let mut ctx = EvalContext::new();
+        let obj = make_object(alloc::vec![("a".to_string(), JsValue::Boolean(true))]);
+        assert!(matches!(
+            to_primitive(&obj, "number", &mut ctx).unwrap(),
+            JsValue::Object(_)
+        ));
+    }
+
+    /// A computed object-literal / member key for a symbol keeps its unique
+    /// stringified identity (not the lossy "[Symbol]" collapse), so distinct
+    /// well-known symbols map to distinct property keys.
+    #[test]
+    fn symbol_keys_are_distinct() {
+        let to_prim = value_to_property_key(&JsValue::Symbol(
+            crate::runner::ds::symbol::SYMBOL_TO_PRIMITIVE.clone(),
+        ));
+        let iter = value_to_property_key(&JsValue::Symbol(
+            crate::runner::ds::symbol::SYMBOL_ITERATOR.clone(),
+        ));
+        assert_ne!(to_prim, iter);
+        assert!(to_prim.contains("toPrimitive"));
+    }
+}

@@ -125,9 +125,24 @@ impl JsParser {
     /// assert_eq!(ast.body.len(), 1);
     /// ```
     pub fn parse_to_ast(script: Rc<String>) -> Result<ProgramData, JsRuleError> {
+        Self::parse_to_ast_mode(script, false)
+    }
+
+    /// Parse JavaScript source into an AST, treating the top-level program as
+    /// strict-mode code when `strict` is set (as if a `"use strict"` directive
+    /// prologue were present). Nested `"use strict"` directives in function
+    /// bodies are honoured regardless. Strict mode makes Annex-B legacy octal
+    /// integer/escape literals a Syntax Error (see `check_strict_legacy_octal`).
+    pub fn parse_to_ast_mode(
+        script: Rc<String>,
+        strict: bool,
+    ) -> Result<ProgramData, JsRuleError> {
         let result = Self::parse(Rule::script, &script);
         match result {
-            Ok(pairs) => build_ast_from_script(pairs, &script),
+            Ok(pairs) => {
+                check_strict_legacy_octal(pairs.clone(), strict, &script)?;
+                build_ast_from_script(pairs, &script)
+            }
             Err(err) => {
                 return Err(JsRuleError {
                     kind: JsErrorType::ParserValidation(err.clone()),
@@ -153,6 +168,17 @@ impl JsParser {
     /// ```
     pub fn parse_to_ast_from_str(script: &str) -> Result<ProgramData, JsRuleError> {
         Self::parse_to_ast(Rc::new(script.to_string()))
+    }
+
+    /// Like [`parse_to_ast_from_str`], but forces top-level strict mode when
+    /// `strict` is set — used by hosts (e.g. the test262 runner) that know a
+    /// script is strict from out-of-band metadata (`onlyStrict`) rather than an
+    /// in-source `"use strict"` directive.
+    pub fn parse_to_ast_from_str_strict(
+        script: &str,
+        strict: bool,
+    ) -> Result<ProgramData, JsRuleError> {
+        Self::parse_to_ast_mode(Rc::new(script.to_string()), strict)
     }
 
     /// Parse JavaScript and return a formatted AST string.
@@ -3678,6 +3704,167 @@ fn build_ast_from_literal(
     })
 }
 
+/// Post-parse Annex-B strict-mode gate. In strict-mode code a
+/// LegacyOctalIntegerLiteral / NonOctalDecimalIntegerLiteral (`010`, `08`) and a
+/// LegacyOctal / NonOctalDecimal string escape (`\1`, `\052`, `\8`) are Syntax
+/// Errors, even though the (mode-free) PEG grammar accepts them. Strict mode is
+/// propagated inward: the top-level program is strict when `initial_strict` (the
+/// host said so) or its directive prologue holds `"use strict"`, and any
+/// function whose own directive prologue holds `"use strict"` is strict for its
+/// entire body (which includes that prologue — so an octal-bearing directive
+/// preceding the `"use strict"` is rejected too, per B.1.2).
+fn check_strict_legacy_octal(
+    pairs: Pairs<Rule>,
+    initial_strict: bool,
+    script: &Rc<String>,
+) -> Result<(), JsRuleError> {
+    // The top-level program body is a `statement_list`; its leading string
+    // directives form the program's directive prologue.
+    let mut program_strict = initial_strict;
+    for pair in pairs.clone() {
+        if pair.as_rule() == Rule::statement_list && statement_list_is_strict(pair) {
+            program_strict = true;
+        }
+    }
+    for pair in pairs {
+        check_pair_strict_legacy_octal(pair, program_strict, script)?;
+    }
+    Ok(())
+}
+
+/// Recursive worker for [`check_strict_legacy_octal`]. `strict` is the effective
+/// strictness of the scope enclosing `pair`.
+fn check_pair_strict_legacy_octal(
+    pair: Pair<Rule>,
+    strict: bool,
+    script: &Rc<String>,
+) -> Result<(), JsRuleError> {
+    match pair.as_rule() {
+        Rule::legacy_octal_like_integer_literal => {
+            if strict {
+                return Err(get_validation_error_with_meta(
+                    "Legacy octal / non-octal-decimal integer literals are not allowed in strict mode".to_string(),
+                    AstBuilderValidationErrorType::SyntaxError,
+                    get_meta(&pair, script),
+                ));
+            }
+        }
+        Rule::string_literal => {
+            // `string_literal` is atomic (no sub-tokens); inspect its raw text.
+            if strict && string_has_strict_forbidden_escape(pair.as_str()) {
+                return Err(get_validation_error_with_meta(
+                    "Legacy octal / non-octal-decimal string escapes are not allowed in strict mode".to_string(),
+                    AstBuilderValidationErrorType::SyntaxError,
+                    get_meta(&pair, script),
+                ));
+            }
+        }
+        Rule::function_body | Rule::function_body__yield => {
+            let inner_strict = strict || function_body_is_strict(pair.clone());
+            for child in pair.into_inner() {
+                check_pair_strict_legacy_octal(child, inner_strict, script)?;
+            }
+        }
+        _ => {
+            for child in pair.into_inner() {
+                check_pair_strict_legacy_octal(child, strict, script)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True for any of the four grammar `statement_list` variants (plain / return /
+/// yield / yield-return).
+fn is_statement_list_rule(rule: Rule) -> bool {
+    matches!(
+        rule,
+        Rule::statement_list
+            | Rule::statement_list__return
+            | Rule::statement_list__yield
+            | Rule::statement_list__yield_return
+    )
+}
+
+/// True if a `function_body` opens a strict scope via a `"use strict"` directive
+/// in its own directive prologue. The body wraps a `statement_list__return`
+/// (or the yield variant), reached through the silent `function_statement_list`.
+fn function_body_is_strict(function_body: Pair<Rule>) -> bool {
+    for inner in function_body.into_inner() {
+        if is_statement_list_rule(inner.as_rule()) {
+            return statement_list_is_strict(inner);
+        }
+    }
+    false
+}
+
+/// Scan the directive prologue of a `statement_list` (its leading string-literal
+/// expression statements) for an exact `use strict` directive.
+fn statement_list_is_strict(statement_list: Pair<Rule>) -> bool {
+    for stmt in statement_list.into_inner() {
+        let text = stmt.as_str().trim();
+        match directive_string_value(text) {
+            Some(directive) => {
+                if directive == "use strict" {
+                    return true;
+                }
+                // Another leading string directive — keep scanning the prologue.
+            }
+            // First non-string-directive statement ends the prologue.
+            None => return false,
+        }
+    }
+    false
+}
+
+/// If `text` is a lone string-literal expression statement (a directive), return
+/// its raw inner text (between the quotes, escapes NOT decoded — a `"use strict"`
+/// directive must be spelled literally). Otherwise `None`.
+fn directive_string_value(text: &str) -> Option<&str> {
+    // Drop an optional trailing `;` and surrounding whitespace.
+    let t = text.trim().strip_suffix(';').unwrap_or(text).trim();
+    let bytes = t.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let quote = bytes[0];
+    if (quote != b'"' && quote != b'\'') || bytes[bytes.len() - 1] != quote {
+        return None;
+    }
+    let inner = &t[1..t.len() - 1];
+    // A genuine single-string directive has no unescaped closing quote inside.
+    if inner.contains(quote as char) {
+        return None;
+    }
+    Some(inner)
+}
+
+/// True if a string-literal's raw text (quotes included) contains an escape that
+/// is a Syntax Error in strict mode: any `\1`..`\9`, or `\0` immediately
+/// followed by a decimal digit (`\00`, `\08`). A bare `\0` is still allowed.
+fn string_has_strict_forbidden_escape(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '\\' {
+            i += 1;
+            continue;
+        }
+        match chars.get(i + 1) {
+            Some('0') => {
+                if chars.get(i + 2).map_or(false, |c| c.is_ascii_digit()) {
+                    return true;
+                }
+                i += 2; // `\0` alone: allowed, skip both chars.
+            }
+            Some(c) if ('1'..='9').contains(c) => return true,
+            Some(_) => i += 2, // any other escape (incl. `\\`) — skip the pair.
+            None => i += 1,
+        }
+    }
+    false
+}
+
 fn build_ast_from_string_literal(
     pair: Pair<Rule>,
     script: &Rc<String>,
@@ -3729,7 +3916,28 @@ fn cook_string_literal(body: &str) -> String {
             '"' => out.push('"'),
             '`' => out.push('`'),
             '$' => out.push('$'),
-            '0' if !chars.get(i).map_or(false, |d| d.is_ascii_digit()) => out.push('\0'),
+            // Annex-B LegacyOctalEscapeSequence: 1–3 octal digits. `\0` not
+            // followed by an octal digit is the plain NUL escape. A leading
+            // digit of 0–3 admits up to two more octal digits (max `\377`);
+            // 4–7 admits only one more (max `\77`).
+            '0'..='7' => {
+                let mut v = e as u32 - '0' as u32;
+                let max_more = if e <= '3' { 2 } else { 1 };
+                let mut more = 0;
+                while more < max_more {
+                    match chars.get(i) {
+                        Some(&d @ '0'..='7') => {
+                            v = v * 8 + (d as u32 - '0' as u32);
+                            i += 1;
+                            more += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(core::char::from_u32(v).unwrap_or('\u{FFFD}'));
+            }
+            // Annex-B NonOctalDecimalEscapeSequence: `\8`/`\9` → the chars "8"/"9".
+            '8' | '9' => out.push(e),
             'x' => {
                 let mut v = 0u32;
                 let mut n = 0;
@@ -4089,6 +4297,35 @@ fn get_ast_for_hex_integer_literal(pair: Pair<Rule>) -> NumberLiteralType {
     NumberLiteralType::IntegerLiteral(i64::from_str_radix(&s, 16).unwrap_or(i64::MAX))
 }
 
+/// Annex-B B.1.1 legacy leading-zero integer (`0` + digits). If every digit
+/// after the leading `0` is octal it is a LegacyOctalIntegerLiteral parsed
+/// base-8 (`010` → 8, `077` → 63); if any digit is `8`/`9` it is a
+/// NonOctalDecimalIntegerLiteral parsed base-10 (`08` → 8, `018` → 18). Long
+/// runs that overflow `i64` fall back to lossy `f64`, matching JS double
+/// semantics as elsewhere in this module.
+fn get_ast_for_legacy_octal_like_integer_literal(pair: Pair<Rule>) -> NumberLiteralType {
+    let s = pair.as_str();
+    let digits = &s[1..]; // strip the leading `0`
+    let (value, radix) = if digits.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        (digits, 8u32)
+    } else {
+        (s, 10u32)
+    };
+    let v = match i64::from_str_radix(value, radix) {
+        Ok(v) => v,
+        Err(_) => {
+            // Base-10 overflow → parse as f64; base-8 overflow is astronomically
+            // unlikely for a source literal but saturate defensively.
+            if radix == 10 {
+                value.parse::<f64>().unwrap_or(f64::INFINITY) as i64
+            } else {
+                i64::MAX
+            }
+        }
+    };
+    NumberLiteralType::IntegerLiteral(v)
+}
+
 fn parse_decimal_integer_literal(decimal_pair: Pair<Rule>) -> f64 {
     // Strip `_` numeric separators before parsing.
     let s = decimal_pair.as_str().replace('_', "");
@@ -4161,6 +4398,9 @@ fn build_ast_from_numeric_literal_inner(
         Rule::binary_integer_literal => get_ast_for_binary_integer_literal(inner_pair),
         Rule::octal_integer_literal => get_ast_for_octal_integer_literal(inner_pair),
         Rule::hex_integer_literal => get_ast_for_hex_integer_literal(inner_pair),
+        Rule::legacy_octal_like_integer_literal => {
+            get_ast_for_legacy_octal_like_integer_literal(inner_pair)
+        }
         Rule::decimal_literal => build_ast_decimal_literal(inner_pair)?,
         _ => {
             return Err(get_unexpected_error(
@@ -4855,4 +5095,146 @@ fn build_ast_from_class_element(
         computed,
         static_flag: is_static,
     })))
+}
+
+#[cfg(test)]
+mod annex_b_legacy_octal_tests {
+    use super::*;
+
+    /// Parse an expression `expr` as `var _x = <expr>;` and return the integer
+    /// value of the resulting numeric literal (panics if it is not one).
+    fn int_value(expr: &str) -> i64 {
+        let src = format!("var _x = {};", expr);
+        let prog = JsParser::parse_to_ast_from_str(&src)
+            .unwrap_or_else(|e| panic!("parse `{}` failed: {:?}", expr, e));
+        // Walk to the initializer literal via the formatted-string is fragile;
+        // instead re-parse just the literal through the numeric builder path.
+        let _ = prog; // parsing succeeded — value checked via cook/int helpers below
+        // Directly exercise the numeric literal builder through the grammar.
+        let mut pairs = JsParser::parse(Rule::numeric_literal, expr).expect("numeric parse");
+        let pair = pairs.next().unwrap();
+        match build_ast_from_numeric_literal_inner(pair.into_inner().next().unwrap()).unwrap() {
+            NumberLiteralType::IntegerLiteral(v) => v,
+            other => panic!("expected integer, got {:?} for {}", other, expr),
+        }
+    }
+
+    #[test]
+    fn legacy_octal_integer_values() {
+        assert_eq!(int_value("00"), 0);
+        assert_eq!(int_value("07"), 7);
+        assert_eq!(int_value("010"), 8);
+        assert_eq!(int_value("077"), 63);
+        assert_eq!(int_value("0123"), 83);
+    }
+
+    #[test]
+    fn non_octal_decimal_integer_values() {
+        assert_eq!(int_value("08"), 8);
+        assert_eq!(int_value("09"), 9);
+        assert_eq!(int_value("018"), 18);
+        assert_eq!(int_value("019"), 19);
+        assert_eq!(int_value("0789"), 789);
+        assert_eq!(int_value("088"), 88);
+    }
+
+    #[test]
+    fn plain_numbers_unchanged() {
+        assert_eq!(int_value("0"), 0);
+        assert_eq!(int_value("42"), 42);
+        assert_eq!(int_value("0x1f"), 31);
+        assert_eq!(int_value("0o17"), 15);
+        assert_eq!(int_value("0b11"), 3);
+    }
+
+    #[test]
+    fn legacy_octal_string_escapes() {
+        // LegacyOctalEscapeSequence: 1–3 octal digits.
+        assert_eq!(cook_string_literal("\\1"), "\u{01}");
+        assert_eq!(cook_string_literal("\\7"), "\u{07}");
+        assert_eq!(cook_string_literal("\\40"), " "); // 0x20
+        assert_eq!(cook_string_literal("\\101"), "A"); // 0x41
+        assert_eq!(cook_string_literal("\\377"), "\u{ff}");
+        assert_eq!(cook_string_literal("\\251"), "\u{a9}");
+        // ZeroToThree admits up to two more; FourToSeven admits only one.
+        assert_eq!(cook_string_literal("\\400"), "\u{20}0"); // \40 then '0'
+        assert_eq!(cook_string_literal("\\00"), "\u{00}");
+    }
+
+    #[test]
+    fn non_octal_decimal_and_nul_escapes() {
+        // NonOctalDecimalEscapeSequence \8 \9 -> the chars "8"/"9".
+        assert_eq!(cook_string_literal("\\8"), "8");
+        assert_eq!(cook_string_literal("\\9"), "9");
+        // \0 not followed by an octal digit is NUL; \08 is NUL then '8'.
+        assert_eq!(cook_string_literal("\\0"), "\u{00}");
+        assert_eq!(cook_string_literal("\\08"), "\u{00}8");
+        assert_eq!(cook_string_literal("\\18"), "\u{01}8");
+    }
+
+    #[test]
+    fn strict_forbidden_escape_detection() {
+        assert!(string_has_strict_forbidden_escape("'\\1'"));
+        assert!(string_has_strict_forbidden_escape("'\\052'"));
+        assert!(string_has_strict_forbidden_escape("'\\8'"));
+        assert!(string_has_strict_forbidden_escape("'\\08'"));
+        // A bare \0, escaped backslash, or ordinary escapes are allowed.
+        assert!(!string_has_strict_forbidden_escape("'\\0'"));
+        assert!(!string_has_strict_forbidden_escape("'\\\\1'"));
+        assert!(!string_has_strict_forbidden_escape("'\\n\\t\\x41'"));
+        assert!(!string_has_strict_forbidden_escape("'plain'"));
+    }
+
+    #[test]
+    fn directive_value_extraction() {
+        assert_eq!(directive_string_value("\"use strict\";"), Some("use strict"));
+        assert_eq!(directive_string_value("'use strict'"), Some("use strict"));
+        assert_eq!(directive_string_value("  \"use strict\" ; "), Some("use strict"));
+        assert_eq!(directive_string_value("\"other\";"), Some("other"));
+        assert_eq!(directive_string_value("var x = 1;"), None);
+        assert_eq!(directive_string_value("1 + 2;"), None);
+    }
+
+    #[test]
+    fn non_strict_accepts_legacy_octal() {
+        assert!(JsParser::parse_to_ast_from_str("var x = 010;").is_ok());
+        assert!(JsParser::parse_to_ast_from_str("var x = 08;").is_ok());
+        assert!(JsParser::parse_to_ast_from_str("var s = '\\1';").is_ok());
+        assert!(JsParser::parse_to_ast_from_str("var s = '\\8';").is_ok());
+    }
+
+    #[test]
+    fn strict_rejects_legacy_octal() {
+        // Forced top-level strict (as onlyStrict).
+        assert!(JsParser::parse_to_ast_from_str_strict("010;", true).is_err());
+        assert!(JsParser::parse_to_ast_from_str_strict("08;", true).is_err());
+        assert!(JsParser::parse_to_ast_from_str_strict("var s = '\\1';", true).is_err());
+        assert!(JsParser::parse_to_ast_from_str_strict("var s = '\\8';", true).is_err());
+        // A bare \0 and ordinary numbers are still fine under strict.
+        assert!(JsParser::parse_to_ast_from_str_strict("var s = '\\0';", true).is_ok());
+        assert!(JsParser::parse_to_ast_from_str_strict("var n = 42;", true).is_ok());
+    }
+
+    #[test]
+    fn strict_via_directive_prologue() {
+        // A program-level "use strict" prologue makes legacy octal an error.
+        assert!(JsParser::parse_to_ast_from_str("\"use strict\"; 010;").is_err());
+        // "use strict" inside a function only makes THAT function strict.
+        assert!(
+            JsParser::parse_to_ast_from_str("function f(){ \"use strict\"; return '\\1'; }")
+                .is_err()
+        );
+        // Octal in a sloppy function is fine even if another function is strict.
+        assert!(JsParser::parse_to_ast_from_str(
+            "function g(){ return 010; } function f(){ \"use strict\"; return 1; }"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn template_legacy_octal_always_rejected() {
+        // Legacy octal escapes are a SyntaxError in templates, even sloppy.
+        assert!(JsParser::parse_to_ast_from_str("var t = `\\1`;").is_err());
+        assert!(JsParser::parse_to_ast_from_str("var t = `\\8`;").is_err());
+    }
 }

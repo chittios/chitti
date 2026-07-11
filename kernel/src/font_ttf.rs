@@ -2,17 +2,164 @@
 //! pen on a **baseline**, glyph bitmap offset by `xmin` / `ymin`, advance by
 //! `advance_width`. Screen space is Y-down (like HTML/CSS).
 //!
-//! Default face: embedded `assets/GeistMono-Regular.ttf` (SIL OFL). Swap with
-//! [`load_bytes`] for other `.ttf`/`.otf` files, or register additional
+//! Default face: embedded `assets/fonts/GeistMono-Regular.ttf` (SIL OFL). Swap
+//! with [`load_bytes`] for other `.ttf`/`.otf` files, or register additional
 //! **families** with [`load_family`] and render via [`measure_family`] /
 //! [`blit_run_family`] (per-glyph fallback to the global face).
+//!
+//! **Bundled UI faces** live under `assets/fonts/` ([`BUNDLED_FONTS`]): Geist
+//! Mono + Ubuntu Mono. The compositor renders the console/UI through this
+//! rasterizer (see `framebuffer`), with the face chosen from `ui.json`.
 
 use crate::mm::Locked;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use fontdue::{Font, FontSettings};
 
-static GEIST_TTF: &[u8] = include_bytes!("../../assets/GeistMono-Regular.ttf");
+static GEIST_TTF: &[u8] = include_bytes!("../../assets/fonts/GeistMono-Regular.ttf");
+static UBUNTU_MONO_TTF: &[u8] = include_bytes!("../../assets/fonts/UbuntuMono-Regular.ttf");
+
+/// Monospace faces bundled for the UI, selectable by name from `ui.json`
+/// (`font`). The first entry is the default. Names are matched
+/// case-insensitively and also by a lowercased no-space alias
+/// (e.g. `"geist mono"` / `"geist-mono"` / `"geistmono"`).
+pub static BUNDLED_FONTS: &[(&str, &[u8])] =
+    &[("Geist Mono", GEIST_TTF), ("Ubuntu Mono", UBUNTU_MONO_TTF)];
+
+/// Return the bundled font bytes whose name matches `want` (case/space
+/// insensitive), or `None`. Used by the UI-font selector.
+pub fn bundled_font_bytes(want: &str) -> Option<&'static [u8]> {
+    let w = norm_font_name(want);
+    BUNDLED_FONTS
+        .iter()
+        .find(|(name, _)| norm_font_name(name) == w)
+        .map(|(_, b)| *b)
+}
+
+fn norm_font_name(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+// ---- UI (console/compositor) font: TTF rendering into a fixed monospace cell ----
+
+/// The face the compositor renders the UI/console with (chosen from `ui.json`'s
+/// `font`; default = first [`BUNDLED_FONTS`] entry, Geist Mono).
+static UI_FONT: Locked<Option<Font>> = Locked::new(None);
+/// The selected UI face name (canonical bundled name).
+static UI_FONT_NAME: Locked<Option<String>> = Locked::new(None);
+/// Placed-glyph cache: `(char, cell_w, cell_h)` → sparse non-zero coverage
+/// `(x, y, alpha)` already positioned on the cell baseline. Sparse so a blit
+/// touches only the ~ink pixels (no per-cell allocation churn — trap #3).
+/// Lock order: `UI_CACHE` is taken **inside** `UI_FONT`, never the reverse.
+static UI_CACHE: Locked<BTreeMap<(char, u16, u16), Vec<(u16, u16, u8)>>> =
+    Locked::new(BTreeMap::new());
+
+fn ensure_ui_font() {
+    UI_FONT.with(|slot| {
+        if slot.is_none() {
+            if let Ok(font) = Font::from_bytes(BUNDLED_FONTS[0].1, FontSettings::default()) {
+                *slot = Some(font);
+                UI_FONT_NAME.with(|n| *n = Some(String::from(BUNDLED_FONTS[0].0)));
+            }
+        }
+    });
+}
+
+/// Select the UI/console font by name (a [`BUNDLED_FONTS`] entry, case/space
+/// insensitive — `"Ubuntu Mono"`, `"ubuntu-mono"`, …). No-op if unknown or
+/// unchanged; clears the placed-glyph cache on change. Driven by `ui.json`.
+pub fn set_ui_font(name: &str) {
+    let canon = norm_font_name(name);
+    if UI_FONT_NAME.with(|n| n.as_deref().map(norm_font_name) == Some(canon.clone())) {
+        return; // unchanged
+    }
+    let Some(bytes) = bundled_font_bytes(name) else {
+        return;
+    };
+    if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+        UI_FONT.with(|slot| *slot = Some(font));
+        UI_FONT_NAME.with(|n| *n = Some(String::from(name)));
+        UI_CACHE.with(|c| c.clear());
+    }
+}
+
+/// The active UI face name (for `/ui`).
+pub fn ui_font_name() -> Option<String> {
+    ensure_ui_font();
+    UI_FONT_NAME.with(|n| n.clone())
+}
+
+/// Build the sparse placed coverage for `ch` in a `cw × ch_px` monospace cell:
+/// rasterize at a px that fills the cell, centre on the baseline, and clip to
+/// the cell. Returns `(x, y, alpha)` for each ink pixel.
+fn build_ui_glyph(font: &Font, ch: char, cw: usize, ch_px: usize) -> Vec<(u16, u16, u8)> {
+    let px = ch_px as f32;
+    let (m, cov) = font.rasterize(ch, px);
+    let (asc, desc) = font
+        .horizontal_line_metrics(px)
+        .map(|l| (l.ascent, l.descent))
+        .unwrap_or((px * 0.8, -px * 0.2));
+    // Vertically centre the (ascent−descent) box in the cell, place on baseline.
+    let box_h = asc - desc;
+    let top_pad = ((ch_px as f32 - box_h) / 2.0).max(0.0);
+    let baseline = top_pad + asc;
+    // Horizontally centre the glyph advance in the cell.
+    let x_off = ((cw as f32 - m.advance_width) / 2.0).max(0.0);
+    let gx0 = (x_off + m.xmin as f32) as i32;
+    let gy0 = (baseline - m.height as f32 - m.ymin as f32) as i32;
+    let mut out = Vec::new();
+    if m.width > 0 && m.height > 0 && cov.len() >= m.width * m.height {
+        for row in 0..m.height {
+            for col in 0..m.width {
+                let a = cov[row * m.width + col];
+                if a == 0 {
+                    continue;
+                }
+                let x = gx0 + col as i32;
+                let y = gy0 + row as i32;
+                if x >= 0 && (x as usize) < cw && y >= 0 && (y as usize) < ch_px {
+                    out.push((x as u16, y as u16, a));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Blit `ch` into a `cw × ch_px` UI cell via the selected TTF face: `plot(x, y,
+/// alpha)` is called for each ink pixel (cell-local coords), so the caller
+/// alpha-blends into its framebuffer. Cached per `(ch, cw, ch_px)`. Returns
+/// `false` if no UI font is available (caller falls back to the bitmap atlas).
+pub fn blit_ui_cell<F: FnMut(usize, usize, u8)>(
+    ch: char,
+    cw: usize,
+    ch_px: usize,
+    mut plot: F,
+) -> bool {
+    ensure_ui_font();
+    if cw == 0 || ch_px == 0 || cw > u16::MAX as usize || ch_px > u16::MAX as usize {
+        return false;
+    }
+    let key = (ch, cw as u16, ch_px as u16);
+    UI_FONT.with(|slot| {
+        let Some(font) = slot.as_ref() else {
+            return false;
+        };
+        UI_CACHE.with(|cache| {
+            let glyph = cache
+                .entry(key)
+                .or_insert_with(|| build_ui_glyph(font, ch, cw, ch_px));
+            for &(x, y, a) in glyph.iter() {
+                plot(x as usize, y as usize, a);
+            }
+        });
+        true
+    })
+}
 
 struct Face {
     font: Font,

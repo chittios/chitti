@@ -342,7 +342,11 @@ fn run_one(path: &Path, raw: bool) -> Outcome {
     // outcome for a negative test.
     let parse_only = src.contains("$DONOTEVALUATE");
 
-    let parse_result = JsParser::parse_to_ast_from_str(&adapted);
+    // `onlyStrict` tests are strict-mode code even though the file carries no
+    // in-source `"use strict"` directive (the standard harness would prepend
+    // one). Signal that to the parser so Annex-B legacy octal literals/escapes
+    // are rejected as Syntax Errors, matching the negative parse expectation.
+    let parse_result = JsParser::parse_to_ast_from_str_strict(&adapted, meta.only_strict);
     if parse_only {
         let parsed_ok = parse_result.is_ok();
         return match (meta.negative, parsed_ok) {
