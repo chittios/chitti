@@ -1268,15 +1268,19 @@ MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_ch
 VOICE = [("voice_models", s_voice_models), ("voice_say", s_voice_say)]
 
 
-def boot_guest(arch, model, verbose, audio, fwd, attempts=3):
+def boot_guest(arch, model, verbose, audio, fwd, no_model=False, attempts=3):
     """Launch the guest and wait for it to reach networking, retrying if it dies
     early. aarch64 SMP bring-up (PSCI CPU_ON) very occasionally takes a data
     abort right after `smp: N cores online` — a rare hypervisor bring-up race,
     not a scenario failure — so rather than fail the whole run we detect the
     boot-time FATAL (or an early exit / 120 s with no networking), kill the VM,
-    and relaunch. Returns a booted Guest, or None if every attempt failed."""
+    and relaunch. `no_model` boots the desktop default-heap kernel (no GGUF, no
+    large model-heap reservation) — used for the non-slow groups, which never
+    run inference, so the guest fits a CI runner's RAM instead of OOMing while
+    mapping an oversized heap. Returns a booted Guest, or None if every attempt
+    failed."""
     for attempt in range(1, attempts + 1):
-        g = Guest(arch=arch, model=model, verbose=verbose, audio=audio, hostfwd=fwd)
+        g = Guest(arch=arch, model=model, verbose=verbose, audio=audio, hostfwd=fwd, no_model=no_model)
         deadline = time.time() + 120
         outcome = "timeout"
         while time.time() < deadline:
@@ -1348,7 +1352,11 @@ def main():
     audio = "none" if (slow and have_voice) else "off"
     fwd = f"{SVC_PORT},{SVC_HTTP_PORT},{SVC_SSH_PORT}"
     print(f"e2e: booting guest (cargo xtask run, audio={audio}, hostfwd={fwd})…")
-    g = boot_guest(arch, model, verbose, audio, fwd)
+    # Non-slow groups (os/net/agents) never run inference, so boot the main
+    # guest model-less: it uses the small desktop heap and fits a CI runner
+    # instead of OOMing while mapping the model-sized heap. The slow group
+    # keeps the model loaded for the inference/chat scenarios.
+    g = boot_guest(arch, model, verbose, audio, fwd, no_model=not slow)
     if g is None:
         print("e2e: FAILED — guest never booted (networking not configured after retries)")
         return 1

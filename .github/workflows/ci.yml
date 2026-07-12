@@ -94,9 +94,10 @@ jobs:
   # extra deps.
   #
   # The --slow local-inference and voice groups are NOT run here (CPU LLM
-  # inference is impractical in CI); use `make e2e-full` locally for those. The
-  # 0.8B GGUF is still fetched because the main guest boots with `-model` — it's
-  # loaded into RAM but never driven for inference in the non-slow groups.
+  # inference is impractical in CI); use `make e2e-full` locally for those. No
+  # GGUF is fetched — the non-slow groups never run inference, so run.py boots
+  # the guest `--no-model` (small desktop heap that fits the runner; booting
+  # with a model reserved a heap too big for the VM's RAM and OOM-panicked).
   #
   # Fork-PR-safe: public Limine + HuggingFace fetches over HTTPS, no secrets,
   # GitHub-hosted runner only, read-only token.
@@ -140,9 +141,6 @@ jobs:
       # build). Pre-building here means the guest boots immediately under KVM.
       - name: Pre-build the kernel (x86_64) to warm the cache
         run: cargo xtask build -arch x86_64
-
-      - name: Fetch the model (Qwen3.5-0.8B GGUF, ~812 MB, public HuggingFace)
-        run: make model
 
       - name: End-to-end tests (os + net + agents, x86_64 under QEMU/KVM)
         run: make e2e ARCH=x86_64
