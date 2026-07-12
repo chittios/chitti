@@ -79,35 +79,56 @@ jobs:
         run: cargo xtask test
 
   # End-to-end: boot the real kernel under QEMU and drive the shell over serial,
-  # exercising every OS command + the http/https/ws/wss/ping/hosted-model flows
-  # against local host servers, PLUS the --slow local-inference group (the model
-  # is fetched below) — /infer, /perf, chat, /compact, and the model-driven Doc
-  # web server (tests/e2e/). Runs on an aarch64 runner so it is the same path
-  # validated in dev (KVM when the runner exposes /dev/kvm, TCG otherwise — xtask
-  # picks automatically). Ubuntu's system python3 is OpenSSL 3, so the https/wss
-  # scenarios run (no extra deps). The voice bundle isn't fetched, so the --slow
-  # voice group auto-skips.
+  # exercising the os + net + agents groups — every OS command, the
+  # http/https/ws/wss/ping flows against local host servers, agent
+  # install/consent + service lifecycle, registry, and UI surfaces (tests/e2e/).
   #
-  # The model GGUF is fetched over HTTPS from a public HuggingFace repo
-  # (`make model` -> `xtask/fetch-model.sh`, ~812 MB) — a public URL, no secrets,
-  # so this stays fork-PR-safe. It's downloaded fresh each run (no cache action to
-  # pin); add `actions/cache` on `assets/model.gguf` later if bandwidth matters.
+  # Runs on x86_64 `ubuntu-latest`, which exposes /dev/kvm, so xtask boots the
+  # kernel with `-accel kvm` (near-native) instead of TCG software emulation.
+  # This replaced an aarch64 runner: GitHub's arm64 hosted runners don't expose
+  # KVM, so the guest ran under TCG and was too slow to boot in time / crashed.
+  # The x86 kernel is wrapped in a Limine boot ISO (needs Limine + xorriso +
+  # mtools — the same path the unit job uses). Boot is headless: the harness
+  # sets CHITTI_DISPLAY=none (guest.py), so QEMU runs serial-only (no display on
+  # a hosted runner). Ubuntu's system python3 (OpenSSL 3) runs https/wss with no
+  # extra deps.
   #
-  # If aarch64 runners aren't available for this repo, change `runs-on` to
-  # `ubuntu-latest` and add `-arch x86_64` to the make invocations.
+  # The --slow local-inference and voice groups are NOT run here (CPU LLM
+  # inference is impractical in CI); use `make e2e-full` locally for those. The
+  # 0.8B GGUF is still fetched because the main guest boots with `-model` — it's
+  # loaded into RAM but never driven for inference in the non-slow groups.
+  #
+  # Fork-PR-safe: public Limine + HuggingFace fetches over HTTPS, no secrets,
+  # GitHub-hosted runner only, read-only token.
   e2e:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout (no persisted credentials)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
 
-      - name: Install QEMU (aarch64) + openssl + curl
+      - name: Enable /dev/kvm access (for -accel kvm)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm || echo "WARN: no /dev/kvm — xtask will fall back to TCG"
+
+      - name: Install QEMU (x86_64) + ISO tools + openssl/curl
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-arm openssl curl ca-certificates
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 xorriso mtools openssl curl ca-certificates
+
+      - name: Install Limine (pinned binary release for the x86 boot ISO)
+        run: |
+          git clone --depth 1 --branch v8.x-binary https://github.com/limine-bootloader/limine.git "$RUNNER_TEMP/limine"
+          make -C "$RUNNER_TEMP/limine"
+          echo "CHITTI_LIMINE_SHARE=$RUNNER_TEMP/limine" >> "$GITHUB_ENV"
+          echo "CHITTI_LIMINE_BIN=$RUNNER_TEMP/limine/limine" >> "$GITHUB_ENV"
 
       - name: Rust toolchain (from rust-toolchain.toml)
         run: rustup show && rustc --version
@@ -115,5 +136,5 @@ jobs:
       - name: Fetch the model (Qwen3.5-0.8B GGUF, ~812 MB, public HuggingFace)
         run: make model
 
-      - name: End-to-end tests (os + net + agents, and --slow model group)
-        run: make e2e-full ARCH=aarch64
+      - name: End-to-end tests (os + net + agents, x86_64 under QEMU/KVM)
+        run: make e2e ARCH=x86_64

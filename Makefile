@@ -120,11 +120,6 @@ vbox:
 ref-check:
 	$(XTASK) ref-check
 
-## model: fetch the Qwen3.5-0.8B GGUF into assets/ (not committed)
-.PHONY: model
-model:
-	xtask/fetch-model.sh
-
 ## fmt: format all crates (kernel, xtask, stub)
 .PHONY: fmt
 fmt:
