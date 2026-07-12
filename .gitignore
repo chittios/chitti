@@ -14,3 +14,10 @@ tests/e2e/certs/
 # bundled instead; the full face is too big to parse in-kernel). Ignored so a
 # stray download of it is never committed.
 assets/fonts/NotoSansCJKsc-Regular.otf
+
+# External conformance suites for the webcompat/JS tooling — cloned locally on
+# demand, never vendored. They were once committed as bare submodule gitlinks
+# with no .gitmodules, which broke `actions/checkout` (no url for submodule
+# path). Keep them ignored so they can't be re-added.
+tools/webcompat/test262/
+tools/webcompat/wasm-testsuite/
