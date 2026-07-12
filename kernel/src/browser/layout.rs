@@ -6,7 +6,7 @@
 //! child out as a fragment, then repositions boxes via [`super::flex`]
 //! (Ladybird `FlexFormattingContext` / `GridFormattingContext` spirit).
 
-use super::css::{self, Align, ComputedStyle, DisplayMode, FlexDirection, Stylesheet};
+use super::css::{self, Align, ComputedStyle, DisplayMode, FlexDirection, Position, Stylesheet};
 use super::elements::{self, DisplayKind};
 use super::flex;
 use super::html::{Node, NodeKind};
@@ -32,6 +32,9 @@ pub struct TextRun {
     /// CSS font-family (first name, lowercase); `""` = the default face.
     /// Generic names (`sans-serif`/`serif`/`monospace`) map to `""`.
     pub font_family: String,
+    /// `text-decoration: underline` (or a link with the default UA underline) —
+    /// the painter draws a 1px rule under the run.
+    pub underline: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -652,6 +655,99 @@ fn walk(
                 return;
             }
 
+            // CSS `position` (parsed but never applied before — headers,
+            // overlays and badges just flowed inline). `relative` shifts the box
+            // by its offsets while keeping its flow space; `absolute`/`fixed` are
+            // taken out of flow and placed at their offsets within the
+            // containing block (approximated as the viewport-width box). The
+            // subtree is laid out as an isolated fragment, then translated.
+            if matches!(
+                st.position,
+                Position::Relative | Position::Absolute | Position::Fixed
+            ) && (st.top.is_some()
+                || st.left.is_some()
+                || st.right.is_some()
+                || st.bottom.is_some())
+            {
+                let out_of_flow = !matches!(st.position, Position::Relative);
+                let mark = mark_frag(runs, links, rects, images, controls, frames, aux);
+                let box_w = st.width.unwrap_or(cur.max_w).clamp(1, cur.max_w.max(1));
+                let mut child_cur = Cursor {
+                    x: 0,
+                    y: 0,
+                    max_w: box_w,
+                    margin_x: 0,
+                    line_h,
+                    content_bottom: 0,
+                };
+                for c in &n.children {
+                    walk(
+                        c, sheet, &st, &mut child_cur, runs, links, rects, images,
+                        controls, frames, aux, link, form, next_form_id, page_bg, vw, in_head,
+                    );
+                }
+                let (x0, y0, x1, y1) =
+                    frag_bbox(mark, runs, links, rects, images, controls, frames, aux);
+                let fw = st.width.unwrap_or((x1 - x0).max(1));
+                let fh = st.height.unwrap_or((y1 - y0).max(child_cur.content_bottom).max(1));
+                // Origin of the containing block: the in-flow spot for
+                // `relative`, else the viewport box.
+                let (base_x, base_y) = if out_of_flow {
+                    (cur.margin_x, if matches!(st.position, Position::Fixed) { 0 } else { 0 })
+                } else {
+                    (cur.x, cur.y)
+                };
+                let avail_w = cur.max_w.max(1);
+                let tx = if let Some(l) = st.left {
+                    base_x + l
+                } else if let Some(r) = st.right {
+                    base_x + avail_w - r - fw
+                } else {
+                    base_x
+                };
+                let ty = match st.top {
+                    Some(t) => base_y + t,
+                    // `bottom` needs the container height, which isn't tracked
+                    // reliably here; keep the element near the container top
+                    // rather than misplacing it far down the page.
+                    None => base_y,
+                };
+                let _ = st.bottom;
+                translate_frag(
+                    mark, tx - x0, ty - y0, runs, links, rects, images, controls, frames, aux,
+                );
+                if out_of_flow {
+                    cur.content_bottom = cur.content_bottom.max(ty + fh);
+                } else {
+                    // `relative` reserves its flow space (approx: advance by height).
+                    cur.y += fh;
+                    cur.content_bottom = cur.content_bottom.max(cur.y);
+                }
+                return;
+            }
+
+            // An explicit CSS `display: inline` / `inline-block` makes an
+            // otherwise block element flow inline — real headers/nav bars style
+            // `<div>`/`<li>`/`<nav>` items this way to sit side by side. Since
+            // `DisplayMode` defaults to `Block`, `Inline` here means the author
+            // set it. Replaced controls/embeds keep their own layout.
+            if st.display == DisplayMode::Inline
+                && !matches!(
+                    tag,
+                    "img" | "input" | "br" | "hr" | "iframe" | "canvas" | "video"
+                        | "audio" | "button" | "textarea" | "select"
+                )
+            {
+                cur.line_h = line_h.max(cur.line_h);
+                for c in &n.children {
+                    walk(
+                        c, sheet, &st, cur, runs, links, rects, images, controls,
+                        frames, aux, link, form, next_form_id, page_bg, vw, in_head,
+                    );
+                }
+                return;
+            }
+
             match tag {
                 "br" | "wbr" => {
                     cur.line_h = line_h;
@@ -678,7 +774,7 @@ fn walk(
                     let iw = width_attr
                         .or(st.width)
                         .unwrap_or(120)
-                        .clamp(16, cur.max_w);
+                        .clamp(16, cur.max_w.max(16));
                     let ih = height_attr.unwrap_or((iw * 3 / 4).clamp(16, 240));
                     // Responsive images: prefer a srcset candidate for this viewport.
                     let src_s = srcset
@@ -732,7 +828,7 @@ fn walk(
                     let fw = width_attr
                         .or(st.width)
                         .unwrap_or(default_w)
-                        .clamp(40, cur.max_w);
+                        .clamp(40, cur.max_w.max(40));
                     let fh = height_attr
                         .or(st.height)
                         .unwrap_or(default_h)
@@ -869,19 +965,52 @@ fn walk(
                     block_before(cur, st.margin_top);
                     cur.line_h = line_h;
                     let block_y0 = cur.y;
-                    let block_x0 = cur.margin_x + st.margin_left;
+                    let old_max = cur.max_w;
+                    let old_margin_x = cur.margin_x;
+                    // Box-model insets: border + padding on each side.
+                    let (bl, br) = (st.border_left_width.max(0), st.border_right_width.max(0));
+                    let (bt, bb) = (st.border_top_width.max(0), st.border_bottom_width.max(0));
+                    let (pl, pr) = (st.padding_left.max(0), st.padding_right.max(0));
+                    let (pt, pb) = (st.padding_top.max(0), st.padding_bottom.max(0));
+                    let h_extra = bl + br + pl + pr;
+                    // Width of the block's margin box, then content width per
+                    // `box-sizing` (content-box: `width` is the content;
+                    // border-box: `width` includes padding+border).
+                    let avail = (old_max - st.margin_left - st.margin_right).max(1);
+                    let (content_w, box_w) = match st.width {
+                        Some(w) => match st.box_sizing {
+                            css::BoxSizing::BorderBox => {
+                                ((w - h_extra).max(1), w.min(avail).max(1))
+                            }
+                            _ => (w.max(1), (w + h_extra).min(avail).max(1)),
+                        },
+                        None => ((avail - h_extra).max(1), avail),
+                    };
+                    // `margin: 0 auto` centers a fixed-width block in `avail`.
+                    let auto_indent = if st.margin_left_auto
+                        && st.margin_right_auto
+                        && box_w < avail
+                    {
+                        (avail - box_w) / 2
+                    } else {
+                        0
+                    };
+                    let block_x0 = cur.margin_x + st.margin_left + auto_indent;
+                    // Content is inset by the left border + padding; children lay
+                    // out from there (so wrapped lines and a centered block's
+                    // content track the block's content edge, not the outer margin).
+                    let content_x = block_x0 + bl + pl;
+                    cur.margin_x = content_x;
                     if tag == "li" {
                         emit_text("• ", cur, runs, links, link, &st);
                     }
-                    cur.x = (cur.margin_x + st.margin_left + st.padding_top.min(0)).max(cur.margin_x);
-                    cur.y += st.padding_top;
+                    cur.x = content_x;
+                    cur.y += bt + pt;
                     let content_start_x = cur.x;
-                    let old_max = cur.max_w;
-                    if let Some(w) = st.width {
-                        cur.max_w = w.min(old_max);
-                    } else {
-                        cur.max_w = old_max - st.margin_left - st.margin_right;
-                    }
+                    cur.max_w = content_w;
+                    // Mark where this block's inline content begins, so a
+                    // non-`Left` `text-align` can be applied to just these items.
+                    let (r0, l0, i0, c0) = (runs.len(), links.len(), images.len(), controls.len());
                     for c in &n.children {
                         walk(
                             c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
@@ -891,23 +1020,46 @@ fn walk(
                     if cur.x > content_start_x {
                         new_line(cur);
                     }
-                    cur.y += st.padding_bottom;
-                    let block_h = (cur.y - block_y0).max(line_h);
-                    let block_w = cur.max_w.max(1);
+                    cur.y += pb + bb;
+                    // Box height spans content + padding + border; honor an
+                    // explicit `height` (content-box adds padding/border to it).
+                    let mut block_h = (cur.y - block_y0).max(bt + bb + pt + pb).max(1);
+                    if let Some(hh) = st.height {
+                        let want = match st.box_sizing {
+                            css::BoxSizing::BorderBox => hh,
+                            _ => hh + bt + bb + pt + pb,
+                        };
+                        block_h = block_h.max(want);
+                        cur.y = block_y0 + block_h;
+                    }
                     if let Some(bg) = st.background {
                         rects.push(RectBox {
                             x: block_x0,
                             y: block_y0,
-                            w: block_w,
+                            w: box_w,
                             h: block_h,
-                            color: bg,
+                            color: fade(bg, st.opacity),
                         });
                     }
-                    aux.push_bg_box(&st, block_x0, block_y0, block_w, block_h);
-                    push_box_borders(rects, block_x0, block_y0, block_w, block_h, &st);
-                    aux.push_elem_box(n.elem_idx, block_x0, block_y0, block_w, block_h);
-                    let _ = (st.text_align, Align::Left, content_start_x, vw);
+                    aux.push_bg_box(&st, block_x0, block_y0, box_w, block_h);
+                    push_box_borders(rects, block_x0, block_y0, box_w, block_h, &st);
+                    aux.push_elem_box(n.elem_idx, block_x0, block_y0, box_w, block_h);
+                    // Honor `text-align` for this block's own inline content.
+                    // Gated on the alignment differing from the parent's, so a
+                    // uniform-`center` subtree is shifted once (at the `<center>`
+                    // / rule that introduces it), never re-shifted by inheriting
+                    // descendants.
+                    if st.text_align != parent_st.text_align
+                        && !matches!(st.text_align, Align::Left)
+                    {
+                        align_inline(
+                            st.text_align, content_start_x, cur.max_w,
+                            &mut runs[r0..], &mut links[l0..], &mut images[i0..],
+                            &mut controls[c0..],
+                        );
+                    }
                     cur.max_w = old_max;
+                    cur.margin_x = old_margin_x;
                     block_after(cur, st.margin_bottom);
                 }
                 "a" => {
@@ -1233,7 +1385,10 @@ fn layout_flex_grid_container(
             .width
             .or(cst.max_width)
             .unwrap_or(default_item_w)
-            .clamp(16, container_w);
+            // `container_w` can be below the 16px floor for a deeply-nested or
+            // zero-width flex item (google.com's modern layout hits this) —
+            // guard the upper bound so `clamp` never sees min > max (panic).
+            .clamp(16, container_w.max(16));
 
         let mark = mark_frag(runs, links, rects, images, controls, frames, aux);
         // Isolated cursor at origin so fragment coords start near (0,0).
@@ -1284,7 +1439,7 @@ fn layout_flex_grid_container(
             h = h.max(child_cur.content_bottom.max(1));
         }
         if let Some(ew) = cst.width {
-            w = ew.clamp(1, container_w);
+            w = ew.clamp(1, container_w.max(1));
         } else if st.display == DisplayMode::Flex
             && st.flex_direction == FlexDirection::Row
             && st.flex_wrap != flex::FlexWrap::NoWrap
@@ -1453,10 +1608,6 @@ fn push_control(
         });
         return;
     }
-    if cur.x > cur.margin_x + 4 {
-        new_line(cur);
-    }
-    cur.y += 4;
     let (w, h) = match kind {
         ControlKind::Text | ControlKind::Password => (cur.max_w.min(280).max(120), line_h + 10),
         ControlKind::TextArea => (cur.max_w.min(320).max(160), line_h * 4 + 12),
@@ -1470,7 +1621,7 @@ fn push_control(
                 }))
                 .unwrap();
             let tw = (crate::font_ttf::measure(label, 13.0) as i32) + 24;
-            (tw.clamp(64, cur.max_w), line_h + 12)
+            (tw.clamp(64, cur.max_w.max(64)), line_h + 12)
         }
         ControlKind::Checkbox => (18, 18),
         ControlKind::Hidden => (0, 0),
@@ -1488,6 +1639,17 @@ fn push_control(
     if kind == ControlKind::Submit && val.is_empty() {
         val = String::from("Submit");
     }
+    // Inline-block flow: a form control is `inline-block` by default, so keep it
+    // on the current line when it fits — sibling controls (e.g. Google's two
+    // search buttons) then sit side by side and an enclosing `text-align`
+    // centers the whole line. Wrap to a new line only when out of room.
+    const CTRL_GAP: i32 = 8;
+    if cur.x > cur.margin_x && cur.x + w > cur.margin_x + cur.max_w.max(w) {
+        new_line(cur);
+    }
+    let ctrl_x = cur.x.max(cur.margin_x);
+    let ctrl_y = cur.y + 4;
+    cur.line_h = cur.line_h.max(h + 8);
     let idx = controls.len();
     controls.push(FormControl {
         index: idx,
@@ -1500,17 +1662,16 @@ fn push_control(
             .map(|f| f.method.clone())
             .unwrap_or_else(|| String::from("get")),
         form_id: form.map(|f| f.id).unwrap_or(0),
-        x: cur.margin_x,
-        y: cur.y,
+        x: ctrl_x,
+        y: ctrl_y,
         w,
         h,
         focused: false,
         checked: false,
         elem_idx: node.elem_idx,
     });
-    cur.y += h + 6;
-    cur.x = cur.margin_x;
-    cur.content_bottom = cur.content_bottom.max(cur.y);
+    cur.x = ctrl_x + w + CTRL_GAP;
+    cur.content_bottom = cur.content_bottom.max(ctrl_y + h);
 }
 
 fn block_before(cur: &mut Cursor, gap: i32) {
@@ -1532,6 +1693,89 @@ fn new_line(cur: &mut Cursor) {
     cur.content_bottom = cur.content_bottom.max(cur.y);
 }
 
+/// Apply `text-align: center|right` to the inline content a block emitted.
+///
+/// The flow layout places every run/image/control left-to-right, discarding
+/// `text-align`. This is the post-pass that honors it: the runs/links/images/
+/// controls appended while walking this block (the `*_start` slices) are grouped
+/// by their line (`y`), and each line is shifted so its content is centered or
+/// right-aligned within `[x0, x0 + avail_w]`. `Left` is a no-op.
+///
+/// Called once per block whose `text-align` *differs from its parent's*, so a
+/// uniform-`center` subtree (e.g. everything inside google.com's `<center>`) is
+/// aligned exactly once — no double-shift from nested inheriting blocks.
+fn align_inline(
+    align: Align,
+    x0: i32,
+    avail_w: i32,
+    runs: &mut [TextRun],
+    links: &mut [LinkBox],
+    images: &mut [ImageBox],
+    controls: &mut [FormControl],
+) {
+    if matches!(align, Align::Left) || avail_w <= 0 {
+        return;
+    }
+    let run_w = |r: &TextRun| (crate::font_ttf::measure(&r.text, r.font_size.max(8) as f32) + 0.5) as i32;
+    // Distinct line-y values across ALL emitted items — a line may hold only an
+    // image (the logo) or only controls (buttons), with no text run, and those
+    // lines must be aligned too.
+    let mut ys: Vec<i32> = Vec::new();
+    ys.extend(runs.iter().map(|r| r.y));
+    ys.extend(links.iter().map(|b| b.y));
+    ys.extend(images.iter().map(|im| im.y));
+    ys.extend(controls.iter().map(|c| c.y));
+    ys.sort_unstable();
+    ys.dedup();
+    for y in ys {
+        // Line extent across every item on this line.
+        let mut min_x = i32::MAX;
+        let mut max_r = i32::MIN;
+        for r in runs.iter().filter(|r| r.y == y) {
+            min_x = min_x.min(r.x);
+            max_r = max_r.max(r.x + run_w(r));
+        }
+        for b in links.iter().filter(|b| b.y == y) {
+            min_x = min_x.min(b.x);
+            max_r = max_r.max(b.x + b.w);
+        }
+        for im in images.iter().filter(|im| im.y == y) {
+            min_x = min_x.min(im.x);
+            max_r = max_r.max(im.x + im.w);
+        }
+        for c in controls.iter().filter(|c| c.y == y) {
+            min_x = min_x.min(c.x);
+            max_r = max_r.max(c.x + c.w);
+        }
+        if min_x == i32::MAX {
+            continue;
+        }
+        let line_w = max_r - min_x;
+        let target_left = match align {
+            Align::Center => x0 + (avail_w - line_w) / 2,
+            Align::Right => x0 + avail_w - line_w,
+            _ => x0,
+        };
+        // Never push content left of the content box.
+        let shift = (target_left - min_x).max(x0 - min_x);
+        if shift == 0 {
+            continue;
+        }
+        for r in runs.iter_mut().filter(|r| r.y == y) {
+            r.x += shift;
+        }
+        for b in links.iter_mut().filter(|b| b.y == y) {
+            b.x += shift;
+        }
+        for im in images.iter_mut().filter(|im| im.y == y) {
+            im.x += shift;
+        }
+        for c in controls.iter_mut().filter(|c| c.y == y) {
+            c.x += shift;
+        }
+    }
+}
+
 /// First usable font-family name for a run: generic names (and the empty
 /// string) map to `""` = the default face; anything else is lowercased.
 fn run_family(st: &ComputedStyle) -> String {
@@ -1548,6 +1792,40 @@ fn run_family(st: &ComputedStyle) -> String {
     }
 }
 
+/// Fade `color` toward a light page background by `opacity` (0–255) — a cheap
+/// approximation of CSS `opacity` for solid colours (no real alpha compositing).
+/// `opacity == 255` returns the colour unchanged.
+fn fade(color: u32, opacity: u8) -> u32 {
+    if opacity >= 255 {
+        return color;
+    }
+    let a = opacity as u32;
+    let bg = 0xffu32; // assume a light background per channel
+    let ch = |shift: u32| {
+        let c = (color >> shift) & 0xff;
+        ((c * a + bg * (255 - a)) / 255) & 0xff
+    };
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+/// `text-transform: capitalize` — uppercase the first letter of each word.
+fn capitalize_words(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut at_word_start = true;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            at_word_start = true;
+            out.push(ch);
+        } else if at_word_start {
+            at_word_start = false;
+            out.extend(ch.to_uppercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 fn emit_text(
     text: &str,
     cur: &mut Cursor,
@@ -1558,8 +1836,32 @@ fn emit_text(
 ) {
     let family = run_family(st);
     let px = st.font_size.max(8) as f32;
-    let line_h = (crate::font_ttf::line_height(px) + 0.5) as i32;
+    // CSS `line-height` (parsed but never honored) overrides the font metric.
+    let line_h = st
+        .line_height
+        .filter(|&h| h > 0)
+        .unwrap_or((crate::font_ttf::line_height(px) + 0.5) as i32);
     cur.line_h = cur.line_h.max(line_h.max(10));
+    // `text-transform` — applied to the rendered text (parsed but never honored
+    // before; google.com's buttons/labels use `uppercase`).
+    let transformed: String;
+    let text: &str = match st.text_transform {
+        css::TextTransform::Uppercase => {
+            transformed = text.to_uppercase();
+            &transformed
+        }
+        css::TextTransform::Lowercase => {
+            transformed = text.to_lowercase();
+            &transformed
+        }
+        css::TextTransform::Capitalize => {
+            transformed = capitalize_words(text);
+            &transformed
+        }
+        css::TextTransform::None => text,
+    };
+    // `white-space: nowrap|pre` suppresses automatic line breaking.
+    let no_wrap = matches!(st.white_space, css::WhiteSpace::Nowrap | css::WhiteSpace::Pre);
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
     while i < chars.len() {
@@ -1583,7 +1885,7 @@ fn emit_text(
         // Proportional advance from the active TTF face.
         let w = (crate::font_ttf::measure(&word, px) + 0.5) as i32;
         let w = w.max(1);
-        if cur.x > cur.margin_x && cur.x + w > cur.margin_x + cur.max_w {
+        if !no_wrap && cur.x > cur.margin_x && cur.x + w > cur.margin_x + cur.max_w {
             new_line(cur);
             if word == " " {
                 continue;
@@ -1595,11 +1897,12 @@ fn emit_text(
             text: word.clone(),
             x: run_x,
             y: run_y,
-            color: st.color,
+            color: fade(st.color, st.opacity),
             link_href: link.map(|s| s.to_string()),
             font_size: st.font_size,
             bold: st.bold,
             font_family: family.clone(),
+            underline: matches!(st.text_decoration, css::TextDecoration::Underline),
         });
         if let Some(href) = link {
             links.push(LinkBox {
@@ -1740,6 +2043,166 @@ pub fn form_fields(layout: &Layout, form_id: u32) -> alloc::vec::Vec<super::form
 mod tests {
     use super::*;
     use crate::browser::{css, html};
+
+    #[test_case]
+    fn align_inline_centers_and_right_aligns() {
+        // Use LinkBoxes (explicit width) so the test needs no font face.
+        let mk = |x: i32, y: i32, w: i32| LinkBox { href: String::new(), x, y, w, h: 20 };
+        // Center a 100-wide line within [0,300] → left = (300-100)/2 = 100.
+        let mut links = alloc::vec![mk(0, 10, 100)];
+        align_inline(Align::Center, 0, 300, &mut [], &mut links, &mut [], &mut []);
+        assert_eq!(links[0].x, 100);
+        // Right-align the same line → left = 300-100 = 200.
+        let mut links = alloc::vec![mk(0, 10, 100)];
+        align_inline(Align::Right, 0, 300, &mut [], &mut links, &mut [], &mut []);
+        assert_eq!(links[0].x, 200);
+        // Two boxes on one line move together; a wider line than the box is
+        // never pushed left of x0 (clamp).
+        let mut links = alloc::vec![mk(0, 5, 200), mk(210, 5, 200)];
+        align_inline(Align::Center, 0, 100, &mut [], &mut links, &mut [], &mut []);
+        assert_eq!(links[0].x, 0, "over-wide line clamped to the content left");
+        // Left is a no-op.
+        let mut links = alloc::vec![mk(7, 1, 50)];
+        align_inline(Align::Left, 0, 300, &mut [], &mut links, &mut [], &mut []);
+        assert_eq!(links[0].x, 7);
+    }
+
+    #[test_case]
+    fn adjacent_controls_flow_inline() {
+        // Two submit buttons in one form must sit side by side (inline-block),
+        // not stack — same line (y), the second to the right of the first.
+        let doc = html::parse(
+            r#"<html><body><form><input type="submit" value="Google Search"><input type="submit" value="I'm Feeling Lucky"></form></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        assert_eq!(lay.controls.len(), 2, "two submit controls");
+        let (a, b) = (&lay.controls[0], &lay.controls[1]);
+        assert_eq!(a.y, b.y, "adjacent controls share a line");
+        assert!(b.x >= a.x + a.w, "second control is to the right of the first");
+    }
+
+    #[test_case]
+    fn padding_insets_content_and_box() {
+        // Horizontal padding must inset the content (was ignored) and the box
+        // background must span content + padding.
+        let doc = html::parse(
+            r#"<html><body><div style="padding:20px;background:#eee"><p>pad</p></div><p>edge</p></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let pad = lay.runs.iter().find(|r| r.text == "pad").expect("pad");
+        let edge = lay.runs.iter().find(|r| r.text == "edge").expect("edge");
+        assert!(pad.x >= edge.x + 15, "content inset by left padding (pad.x={}, edge.x={})", pad.x, edge.x);
+        assert!(pad.y >= 20, "content inset by top padding (y={})", pad.y);
+    }
+
+    #[test_case]
+    fn line_height_overrides_font_metric() {
+        // CSS `line-height` (parsed, never honored) sets the line box height.
+        let doc = html::parse(
+            r#"<html><body><p style="line-height:60px">A</p><p>B</p></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let a = lay.runs.iter().find(|r| r.text == "A").expect("A");
+        let b = lay.runs.iter().find(|r| r.text == "B").expect("B");
+        assert!(b.y - a.y >= 60, "60px line-height spaces the next line (got {})", b.y - a.y);
+    }
+
+    #[test_case]
+    fn text_decoration_underline_flag_set() {
+        let doc = html::parse(
+            r#"<html><body><span style="text-decoration:underline">u</span> <span>plain</span></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        assert!(lay.runs.iter().find(|r| r.text == "u").expect("u").underline);
+        assert!(!lay.runs.iter().find(|r| r.text == "plain").expect("plain").underline);
+    }
+
+    #[test_case]
+    fn position_absolute_places_at_offset() {
+        // An absolutely-positioned badge is taken out of flow and placed at its
+        // top/left, not stacked in the normal flow.
+        let doc = html::parse(
+            r#"<html><body><div style="position:absolute;top:200px;left:300px">badge</div><p>flow</p></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let badge = lay.runs.iter().find(|r| r.text == "badge").expect("badge");
+        let flow = lay.runs.iter().find(|r| r.text == "flow").expect("flow");
+        assert!(badge.x >= 300 && badge.y >= 200, "badge at its offset ({},{})", badge.x, badge.y);
+        // Out of flow: the following paragraph starts at the top, not below the badge.
+        assert!(flow.y < 100, "flow content not pushed down by the abs element (y={})", flow.y);
+    }
+
+    #[test_case]
+    fn text_transform_uppercase_applied() {
+        // `text-transform` was parsed but never applied to the rendered text.
+        let doc = html::parse(
+            r#"<html><body><p style="text-transform:uppercase">Search</p><p style="text-transform:capitalize">i'm feeling lucky</p></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        assert!(lay.runs.iter().any(|r| r.text == "SEARCH"), "uppercase applied");
+        // Capitalize: each word's first letter upper.
+        assert!(
+            lay.runs.iter().any(|r| r.text == "I'm") && lay.runs.iter().any(|r| r.text == "Feeling"),
+            "capitalize applied per word"
+        );
+    }
+
+    #[test_case]
+    fn css_display_inline_block_flows_horizontally() {
+        // `display:inline-block` on block elements (a nav bar of `<div>`s) makes
+        // them share a line instead of stacking.
+        let doc = html::parse(
+            r#"<html><body><div style="display:inline-block">One</div><div style="display:inline-block">Two</div></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let one = lay.runs.iter().find(|r| r.text.contains("One")).expect("One");
+        let two = lay.runs.iter().find(|r| r.text.contains("Two")).expect("Two");
+        assert_eq!(one.y, two.y, "inline-block divs share a line");
+        assert!(two.x > one.x, "second is to the right of the first");
+    }
+
+    #[test_case]
+    fn margin_auto_centers_block() {
+        // `margin: 0 auto` on a fixed-width block centers it — the content
+        // inside starts well right of the page's left margin.
+        let doc = html::parse(
+            r#"<html><body><div style="width:200px;margin:0 auto"><p>boxed</p></div><p>edge</p></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let boxed = lay.runs.iter().find(|r| r.text.contains("boxed")).expect("boxed run");
+        let edge = lay.runs.iter().find(|r| r.text.contains("edge")).expect("edge run");
+        assert!(
+            boxed.x > edge.x + 40,
+            "margin:auto block content x={} should be indented past the page edge x={}",
+            boxed.x, edge.x
+        );
+    }
+
+    #[test_case]
+    fn center_element_centers_content() {
+        // `<center>` (and `text-align:center`) must actually shift inline
+        // content — google.com wraps its logo/search block in one `<center>`.
+        let doc = html::parse(
+            r#"<html><body><center><p>hi</p></center><p>left</p></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let centered = lay.runs.iter().find(|r| r.text.contains("hi")).expect("hi run");
+        let left = lay.runs.iter().find(|r| r.text.contains("left")).expect("left run");
+        assert!(
+            centered.x > left.x + 20,
+            "centered run x={} should be well right of the left-aligned run x={}",
+            centered.x, left.x
+        );
+    }
 
     #[test_case]
     fn layout_has_text_and_link_boxes() {

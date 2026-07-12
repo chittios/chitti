@@ -1049,6 +1049,24 @@ pub fn call_value(
     args: Vec<JsValue>,
     ctx: &mut EvalContext,
 ) -> ValueResult {
+    // A native-method value (`[].slice`, `Object.prototype.toString.call`, a
+    // builtin method pulled off as a value): dispatch to the registry with the
+    // caller-supplied `this` (from `.call`/`.apply` or the member receiver),
+    // falling back to the method's default receiver when called bare.
+    if let Some((objname, method)) = native_method_parts(callee) {
+        let this = if matches!(this_value, JsValue::Undefined) {
+            get_own_prop_value(callee, "__method_this__").unwrap_or(JsValue::Undefined)
+        } else {
+            this_value
+        };
+        let sg = ctx.super_global.clone();
+        return sg
+            .borrow()
+            .call_method(&objname, &method, ctx, this, args)
+            .unwrap_or_else(|| {
+                Err(JErrorType::TypeError(format!("{method} is not a function")))
+            });
+    }
     match callee {
         JsValue::Object(obj) => {
             let obj_ref = obj.borrow();
@@ -1412,10 +1430,38 @@ fn get_property_with_receiver(
                     }
                 }
             } else {
+                // `Constructor.prototype` (Object/Array/String/…): a synthetic
+                // carrier whose method reads dispatch to the constructor's
+                // registry methods — so `Object.prototype.toString.call(x)` and
+                // `Array.prototype.slice.call(args)` resolve to real callables.
+                if prop_name == "prototype" {
+                    if let Some(PropertyDescriptor::Data(d)) = obj
+                        .borrow()
+                        .as_js_object()
+                        .get_object_base()
+                        .properties
+                        .get(&PropertyKey::Str("__builtin_name__".to_string()))
+                    {
+                        if let JsValue::String(name) = &d.value {
+                            let carrier = make_object(Vec::new());
+                            set_own_prop(
+                                &carrier,
+                                "__proto_of__",
+                                JsValue::String(name.clone()),
+                                false,
+                            );
+                            return Ok(carrier);
+                        }
+                    }
+                }
                 // Check prototype chain - receiver stays the same
                 let proto = obj.borrow().as_js_object().get_prototype_of();
                 if let Some(proto) = proto {
                     get_property_with_receiver(receiver, &JsValue::Object(proto), prop_name, ctx)
+                } else if let Some(m) = materialize_builtin_method(receiver, prop_name, ctx) {
+                    // A builtin prototype method pulled off as a value
+                    // (`obj.hasOwnProperty`, `[].slice`, `Object.prototype.toString`).
+                    Ok(m)
                 } else {
                     Ok(JsValue::Undefined)
                 }
@@ -1432,8 +1478,10 @@ fn get_property_with_receiver(
                 } else {
                     Ok(JsValue::Undefined)
                 }
+            } else if let Some(m) = materialize_builtin_method(receiver, prop_name, ctx) {
+                // String prototype method as a value (`"s".slice`, `.charAt`).
+                Ok(m)
             } else {
-                // Other string methods not yet supported
                 Ok(JsValue::Undefined)
             }
         }
@@ -1446,8 +1494,13 @@ fn get_property_with_receiver(
             prop_name
         ))),
         _ => {
-            // Primitive types - return undefined for now
-            Ok(JsValue::Undefined)
+            // Number/Boolean/BigInt primitive: expose a prototype method pulled
+            // off as a value (`(5).toFixed`, `n.toString`) as a callable.
+            if let Some(m) = materialize_builtin_method(receiver, prop_name, ctx) {
+                Ok(m)
+            } else {
+                Ok(JsValue::Undefined)
+            }
         }
     }
 }
@@ -2461,7 +2514,15 @@ fn get_typeof_string(value: &JsValue) -> String {
         JsValue::String(_) => "string".to_string(),
         JsValue::BigInt(_) => "bigint".to_string(),
         JsValue::Symbol(_) => "symbol".to_string(),
-        JsValue::Object(_) => "object".to_string(),
+        // A callable object (user function, bound function, or a native-method
+        // value like `[].slice`) is `"function"`; everything else is `"object"`.
+        JsValue::Object(_) => {
+            if value_is_callable(value) {
+                "function".to_string()
+            } else {
+                "object".to_string()
+            }
+        }
     }
 }
 
@@ -3085,6 +3146,26 @@ impl SimpleFunctionObject {
             }
         }
 
+        // ChittiOS: the `arguments` object — an array-like of the actual call
+        // arguments, exposed in every *non-arrow* function (arrows inherit it
+        // lexically). Ubiquitous in pre-ES6 code (`arguments.length`,
+        // `fn.apply(this, arguments)`, `Array.from(arguments)`). A same-named
+        // parameter (`function f(arguments)`) wins — checked against the param
+        // list, NOT `has_binding` (which would find an *enclosing* function's
+        // `arguments` and wrongly skip a nested function's own). Modeled as a
+        // real array — array-like enough for `.length`/indexing/`.apply`/`Array.from`.
+        if !self.is_arrow {
+            let param_named_arguments = params.iter().any(|p| {
+                matches!(p, PatternType::PatternWhichCanBeExpression(
+                    ExpressionPatternType::Identifier(id)) if id.name == "arguments")
+            });
+            if !param_named_arguments {
+                let arguments_obj = make_array(args.clone());
+                ctx.create_binding("arguments", false)?;
+                ctx.initialize_binding("arguments", arguments_obj)?;
+            }
+        }
+
         // ChittiOS: ES2022 instance-field initializers run at the top of the
         // constructor, against the freshly-created `this`, before the body.
         // (Non-constructor functions and arrows carry none.) NB: for a *derived*
@@ -3244,7 +3325,14 @@ pub fn is_simple_function_object(obj: &dyn JsObject) -> bool {
 /// Is this value callable (a function object / builtin)?
 pub fn value_is_callable(v: &JsValue) -> bool {
     match v {
-        JsValue::Object(o) => o.borrow().is_callable(),
+        JsValue::Object(o) => {
+            if o.borrow().is_callable() {
+                return true;
+            }
+            // A native-method value (`[].slice`, `Object.prototype.toString`) is
+            // an ordinary object tagged callable — dispatched by `call_value`.
+            get_own_prop_value(v, "__native_method__").is_some()
+        }
         _ => false,
     }
 }
@@ -3301,8 +3389,20 @@ pub fn to_primitive(value: &JsValue, hint: &str, ctx: &mut EvalContext) -> Value
         }
         return Ok(res);
     }
-    // 2. OrdinaryToPrimitive: valueOf/toString in hint order (user-defined only —
-    // resolved via the normal own/prototype lookup).
+    // 2. Boxed primitive wrapper (`Object(prim)`, `Object(2n)`): unwrap to the
+    // stored primitive. This must precede the valueOf/toString loop — the
+    // wrapper's spec `valueOf` returns the primitive, but this engine's generic
+    // `Object.prototype.valueOf` returns the wrapper itself (and `toString`
+    // returns "[object Object]"), which would otherwise mask the primitive now
+    // that builtin prototype methods are first-class values.
+    if let Some(p) = get_own_prop_value(value, "__primitive_value__") {
+        return Ok(p);
+    }
+    // 3. OrdinaryToPrimitive: valueOf/toString in hint order. Only *user-defined*
+    // overrides should short-circuit here — the generic native `valueOf`
+    // (returns `this`) and `toString` (returns "[object Object]") must fall
+    // through to the legacy path, else every plain object would stringify to
+    // "[object Object]" via the now-materialized native `toString`.
     let order: [&str; 2] = if hint == "string" {
         ["toString", "valueOf"]
     } else {
@@ -3310,16 +3410,14 @@ pub fn to_primitive(value: &JsValue, hint: &str, ctx: &mut EvalContext) -> Value
     };
     for m in order {
         let method = get_property_with_ctx(value, m, ctx)?;
-        if value_is_callable(&method) {
+        // Skip the materialized native-method values — only honor real
+        // user-defined `valueOf`/`toString` (own or on a user prototype).
+        if value_is_callable(&method) && native_method_parts(&method).is_none() {
             let res = call_value(&method, value.clone(), alloc::vec![], ctx)?;
             if !matches!(res, JsValue::Object(_)) {
                 return Ok(res);
             }
         }
-    }
-    // 3. Boxed primitive wrapper (`Object(prim)`).
-    if let Some(p) = get_own_prop_value(value, "__primitive_value__") {
-        return Ok(p);
     }
     // 4. No user coercion available: leave the object for the legacy path.
     Ok(value.clone())
@@ -3336,6 +3434,17 @@ pub fn builtin_type_name(v: &JsValue) -> String {
         JsValue::Object(o) => {
             let b = o.borrow();
             let base = b.as_js_object().get_object_base();
+            // A synthetic `X.prototype` carrier dispatches methods to X's
+            // registry (so `Object.prototype.toString`, `Array.prototype.slice`
+            // resolve to real callables). Checked before `__builtin_name__` so
+            // the prototype object isn't mistaken for its constructor sentinel.
+            if let Some(PropertyDescriptor::Data(d)) =
+                base.properties.get(&PropertyKey::Str("__proto_of__".to_string()))
+            {
+                if let JsValue::String(name) = &d.value {
+                    return name.clone();
+                }
+            }
             if let Some(PropertyDescriptor::Data(d)) =
                 base.properties.get(&PropertyKey::Str("__builtin_name__".to_string()))
             {
@@ -3354,6 +3463,91 @@ pub fn builtin_type_name(v: &JsValue) -> String {
         }
         _ => "Object".to_string(),
     }
+}
+
+/// Build a first-class callable value for a builtin prototype method
+/// (`[].slice`, `Object.prototype.toString`, `"s".charAt`). It carries the
+/// registry coordinates `__native_method__ = "ObjName:method"` and a
+/// `__method_this__` default receiver (used when the value is later called
+/// without an explicit `this`, e.g. `var f = [].slice; f()`); `.call`/`.apply`
+/// override that. `call_value` dispatches it to the registry. This is what makes
+/// the `Array.prototype.slice.call(arguments)` / `fn.bind` idioms work.
+pub fn make_native_method(objname: &str, method: &str, default_this: JsValue) -> JsValue {
+    let obj = make_object(Vec::new());
+    set_own_prop(
+        &obj,
+        "__native_method__",
+        JsValue::String(format!("{objname}:{method}")),
+        false,
+    );
+    set_own_prop(&obj, "__method_this__", default_this, false);
+    set_own_prop(&obj, "name", JsValue::String(method.to_string()), false);
+    // Mark callable so `value_is_callable` / `typeof` report a function.
+    set_own_prop(&obj, "__callable__", JsValue::Boolean(true), false);
+    obj
+}
+
+/// If `receiver`'s builtin type provides `prop_name` as a registry method,
+/// return a first-class callable bound (by default) to `receiver`. Used as the
+/// fallback when a property isn't found as a real own/prototype property, so a
+/// builtin prototype method read (`[].map`, `obj.hasOwnProperty`) yields a
+/// function value instead of `undefined`.
+pub fn materialize_builtin_method(
+    receiver: &JsValue,
+    prop_name: &str,
+    ctx: &EvalContext,
+) -> Option<JsValue> {
+    let type_name = builtin_type_name(receiver);
+    // The registry stores constructor *statics* (`Object.keys`, `Array.from`)
+    // in the same table as prototype methods. Statics live on the constructor,
+    // never on instances/prototypes — exposing them here would make
+    // `({}).keys` a function (a spec violation and a test262 regression), so
+    // exclude them. `Object.keys(x)` still works via the static-dispatch path.
+    if is_static_method(&type_name, prop_name) {
+        return None;
+    }
+    if ctx.super_global.borrow().has_method(&type_name, prop_name) {
+        Some(make_native_method(&type_name, prop_name, receiver.clone()))
+    } else {
+        None
+    }
+}
+
+/// True if `method` on builtin `type_name` is a constructor *static* (belongs on
+/// the constructor, not on instances/prototype). Used to keep statics off the
+/// prototype-method materialization path.
+fn is_static_method(type_name: &str, method: &str) -> bool {
+    match type_name {
+        "Object" => matches!(
+            method,
+            "keys" | "values" | "entries" | "assign" | "defineProperty"
+                | "defineProperties" | "getOwnPropertyDescriptor"
+                | "getOwnPropertyDescriptors" | "getOwnPropertyNames"
+                | "getOwnPropertySymbols" | "create" | "freeze" | "seal"
+                | "preventExtensions" | "isFrozen" | "isSealed" | "isExtensible"
+                | "getPrototypeOf" | "setPrototypeOf" | "is" | "fromEntries"
+        ),
+        "Array" => matches!(method, "from" | "isArray" | "of"),
+        "String" => matches!(method, "fromCharCode" | "fromCodePoint" | "raw"),
+        "Number" => matches!(
+            method,
+            "isInteger" | "isFinite" | "isNaN" | "isSafeInteger"
+                | "parseFloat" | "parseInt"
+        ),
+        _ => false,
+    }
+}
+
+/// The `"ObjName:method"` registry coordinates of a native-method value, if `v`
+/// is one (see [`make_native_method`]).
+fn native_method_parts(v: &JsValue) -> Option<(String, String)> {
+    if let Some(JsValue::String(s)) = get_own_prop_value(v, "__native_method__") {
+        let mut it = s.splitn(2, ':');
+        let obj = it.next()?.to_string();
+        let m = it.next()?.to_string();
+        return Some((obj, m));
+    }
+    None
 }
 
 /// If `v` carries an `__native_node__` integer (a host-backed object such as a

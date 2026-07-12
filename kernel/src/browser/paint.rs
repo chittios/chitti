@@ -153,7 +153,7 @@ pub fn paint_chrome(layout: &Layout, scroll_y: i32, chrome: Chrome) -> Vec<u32> 
         if run.bold {
             let _ = blit_text(&mut buf, w, h, run.x + 1, y, &run.text, px, run.color, &run.font_family);
         }
-        if run.link_href.is_some() {
+        if run.link_href.is_some() || run.underline {
             let uy = y + line_h - 2;
             if uy >= 0 && uy < layout.height {
                 for x in run.x..end_x.max(run.x + 1) {

@@ -49,6 +49,15 @@ pub trait PluginResolver {
         args: Vec<JsValue>,
     ) -> Option<Result<JsValue, JErrorType>>;
 
+    /// Does this resolver provide `method_name` on `object_name`? A cheap check
+    /// (no allocation / materialization) used to decide whether a builtin
+    /// prototype method should be exposed as a first-class value on a receiver
+    /// (`[].slice`, `Object.prototype.toString`) — see
+    /// `expression::materialize_builtin_method`. Defaults to `false`.
+    fn has_method(&self, _object_name: &str, _method_name: &str) -> bool {
+        false
+    }
+
     /// Get a constructor for the given object name, if available.
     ///
     /// Returns `None` if this resolver doesn't provide a constructor for the name.

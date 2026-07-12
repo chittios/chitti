@@ -767,6 +767,66 @@ fn collapse_ws(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// Map a named HTML entity (without `&`/`;`) to its character. Covers the
+/// common symbol/punctuation set and the Latin-1 supplement letters — the
+/// entities real pages actually emit. Not the full HTML5 named-character table
+/// (~2200 names); an unlisted name is decoded verbatim by the caller.
+fn named_entity(name: &str) -> Option<char> {
+    Some(match name {
+        // Symbols & punctuation
+        "copy" => '\u{00A9}', "reg" => '\u{00AE}', "trade" => '\u{2122}',
+        "hellip" => '\u{2026}', "mdash" => '\u{2014}', "ndash" => '\u{2013}',
+        "lsquo" => '\u{2018}', "rsquo" => '\u{2019}', "ldquo" => '\u{201C}',
+        "rdquo" => '\u{201D}', "sbquo" => '\u{201A}', "bdquo" => '\u{201E}',
+        "laquo" => '\u{00AB}', "raquo" => '\u{00BB}', "lsaquo" => '\u{2039}',
+        "rsaquo" => '\u{203A}', "bull" => '\u{2022}', "middot" => '\u{00B7}',
+        "dagger" => '\u{2020}', "Dagger" => '\u{2021}', "prime" => '\u{2032}',
+        "Prime" => '\u{2033}', "permil" => '\u{2030}', "para" => '\u{00B6}',
+        "sect" => '\u{00A7}', "deg" => '\u{00B0}', "plusmn" => '\u{00B1}',
+        "times" => '\u{00D7}', "divide" => '\u{00F7}', "minus" => '\u{2212}',
+        "frac12" => '\u{00BD}', "frac14" => '\u{00BC}', "frac34" => '\u{00BE}',
+        "sup1" => '\u{00B9}', "sup2" => '\u{00B2}', "sup3" => '\u{00B3}',
+        "micro" => '\u{00B5}', "cent" => '\u{00A2}', "pound" => '\u{00A3}',
+        "yen" => '\u{00A5}', "euro" => '\u{20AC}', "curren" => '\u{00A4}',
+        "iexcl" => '\u{00A1}', "iquest" => '\u{00BF}', "brvbar" => '\u{00A6}',
+        "not" => '\u{00AC}', "shy" => '\u{00AD}', "macr" => '\u{00AF}',
+        "acute" => '\u{00B4}', "cedil" => '\u{00B8}', "uml" => '\u{00A8}',
+        "ordf" => '\u{00AA}', "ordm" => '\u{00BA}', "szlig" => '\u{00DF}',
+        // Arrows & math
+        "larr" => '\u{2190}', "uarr" => '\u{2191}', "rarr" => '\u{2192}',
+        "darr" => '\u{2193}', "harr" => '\u{2194}', "infin" => '\u{221E}',
+        "ne" => '\u{2260}', "le" => '\u{2264}', "ge" => '\u{2265}',
+        "asymp" => '\u{2248}', "sum" => '\u{2211}', "radic" => '\u{221A}',
+        "hearts" => '\u{2665}', "diams" => '\u{2666}', "clubs" => '\u{2663}',
+        "spades" => '\u{2660}', "star" => '\u{2606}', "check" => '\u{2713}',
+        "cross" => '\u{2717}', "ensp" => '\u{2002}', "emsp" => '\u{2003}',
+        "thinsp" => '\u{2009}', "zwnj" => '\u{200C}', "zwj" => '\u{200D}',
+        // Latin-1 accented letters (upper)
+        "Agrave" => '\u{00C0}', "Aacute" => '\u{00C1}', "Acirc" => '\u{00C2}',
+        "Atilde" => '\u{00C3}', "Auml" => '\u{00C4}', "Aring" => '\u{00C5}',
+        "AElig" => '\u{00C6}', "Ccedil" => '\u{00C7}', "Egrave" => '\u{00C8}',
+        "Eacute" => '\u{00C9}', "Ecirc" => '\u{00CA}', "Euml" => '\u{00CB}',
+        "Igrave" => '\u{00CC}', "Iacute" => '\u{00CD}', "Icirc" => '\u{00CE}',
+        "Iuml" => '\u{00CF}', "Ntilde" => '\u{00D1}', "Ograve" => '\u{00D2}',
+        "Oacute" => '\u{00D3}', "Ocirc" => '\u{00D4}', "Otilde" => '\u{00D5}',
+        "Ouml" => '\u{00D6}', "Oslash" => '\u{00D8}', "Ugrave" => '\u{00D9}',
+        "Uacute" => '\u{00DA}', "Ucirc" => '\u{00DB}', "Uuml" => '\u{00DC}',
+        "Yacute" => '\u{00DD}',
+        // Latin-1 accented letters (lower)
+        "agrave" => '\u{00E0}', "aacute" => '\u{00E1}', "acirc" => '\u{00E2}',
+        "atilde" => '\u{00E3}', "auml" => '\u{00E4}', "aring" => '\u{00E5}',
+        "aelig" => '\u{00E6}', "ccedil" => '\u{00E7}', "egrave" => '\u{00E8}',
+        "eacute" => '\u{00E9}', "ecirc" => '\u{00EA}', "euml" => '\u{00EB}',
+        "igrave" => '\u{00EC}', "iacute" => '\u{00ED}', "icirc" => '\u{00EE}',
+        "iuml" => '\u{00EF}', "ntilde" => '\u{00F1}', "ograve" => '\u{00F2}',
+        "oacute" => '\u{00F3}', "ocirc" => '\u{00F4}', "otilde" => '\u{00F5}',
+        "ouml" => '\u{00F6}', "oslash" => '\u{00F8}', "ugrave" => '\u{00F9}',
+        "uacute" => '\u{00FA}', "ucirc" => '\u{00FB}', "uuml" => '\u{00FC}',
+        "yacute" => '\u{00FD}', "yuml" => '\u{00FF}',
+        _ => return None,
+    })
+}
+
 pub fn decode_entities(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -792,7 +852,7 @@ pub fn decode_entities(s: &str) -> String {
             "gt" => out.push('>'),
             "quot" => out.push('"'),
             "apos" => out.push('\''),
-            "nbsp" => out.push(' '),
+            "nbsp" => out.push('\u{00A0}'),
             _ if ent.starts_with('#') => {
                 let hex = ent.as_bytes().get(1) == Some(&b'x') || ent.as_bytes().get(1) == Some(&b'X');
                 let num = ent[1..].trim_start_matches(['x', 'X']);
@@ -808,10 +868,17 @@ pub fn decode_entities(s: &str) -> String {
                     out.push_str(&ent);
                 }
             }
-            _ => {
-                out.push('&');
-                out.push_str(&ent);
-            }
+            // Named entities beyond the basic five: the common symbols/
+            // punctuation and the Latin-1 letter set real pages use (`&copy;`,
+            // `&mdash;`, `&eacute;`, …). An unknown name is left verbatim
+            // (`&` + name), matching the pre-existing fallthrough.
+            _ => match named_entity(&ent) {
+                Some(ch) => out.push(ch),
+                None => {
+                    out.push('&');
+                    out.push_str(&ent);
+                }
+            },
         }
     }
     out
@@ -954,6 +1021,21 @@ mod tests {
     fn decode_entities_basic() {
         assert_eq!(decode_entities("a&amp;b&lt;c&gt;"), "a&b<c>");
         assert_eq!(decode_entities("&#65;"), "A");
+    }
+
+    #[test_case]
+    fn decode_entities_named() {
+        // Common symbols real pages emit (google.com's footer uses `&copy;`).
+        assert_eq!(decode_entities("&copy; 2026"), "\u{00A9} 2026");
+        assert_eq!(decode_entities("a&mdash;b"), "a\u{2014}b");
+        assert_eq!(decode_entities("caf&eacute;"), "caf\u{00E9}");
+        assert_eq!(decode_entities("&laquo;x&raquo;"), "\u{00AB}x\u{00BB}");
+        assert_eq!(decode_entities("&rarr;&hearts;&euro;"), "\u{2192}\u{2665}\u{20AC}");
+        // NBSP decodes to U+00A0 (not a plain space).
+        assert_eq!(decode_entities("a&nbsp;b"), "a\u{00A0}b");
+        // An unknown name is left verbatim (google's stray `&z;`).
+        assert_eq!(decode_entities("&z;"), "&z");
+        assert_eq!(decode_entities("&notareal;"), "&notareal");
     }
 
     #[test_case]

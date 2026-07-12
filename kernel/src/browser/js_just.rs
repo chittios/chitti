@@ -193,6 +193,8 @@ fn is_bare_global(name: &str) -> bool {
             | "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval"
             | "requestAnimationFrame" | "cancelAnimationFrame" | "queueMicrotask"
             | "encodeURIComponent" | "decodeURIComponent" | "encodeURI" | "decodeURI"
+            // Bare event-target methods at global scope == `window.X(…)`.
+            | "addEventListener" | "removeEventListener" | "dispatchEvent"
     )
 }
 
@@ -579,6 +581,30 @@ impl DomResolver {
         set_own_prop(&window, "top", parent.clone(), true);
         set_own_prop(&window, "localStorage", storage.clone(), true);
         set_own_prop(&window, "sessionStorage", session.clone(), true);
+        // DOM interface constructors (HTMLElement/Node/EventTarget/…). Real
+        // sites and libraries (bliss, jQuery) read `X.prototype` and hijack it,
+        // or test `"method" in X.prototype`. Provide each as an object carrying
+        // an own empty `prototype` object so those reads and
+        // `Object.defineProperty(Node.prototype, …)` calls don't throw a
+        // ReferenceError (which used to abort the whole page script). Left on
+        // `window`, so `has_binding`/`resolve`'s window fallback serves them and
+        // they stay stable across accesses. The prototypes are deliberately
+        // empty — `"addEventListener" in EventTarget.prototype` is then false,
+        // so bliss skips its addEventListener hijack rather than crashing in it.
+        for iface in [
+            "EventTarget", "Node", "Element", "HTMLElement", "HTMLDocument",
+            "Document", "Window", "CharacterData", "Text", "Comment",
+            "DocumentFragment", "Event", "CustomEvent", "UIEvent", "MouseEvent",
+            "KeyboardEvent", "MutationObserver", "HTMLCollection", "NodeList",
+            "DOMTokenList", "CSSStyleDeclaration", "ShadowRoot", "DOMParser",
+            "XMLHttpRequest", "HTMLInputElement", "HTMLDivElement",
+            "HTMLSpanElement", "HTMLAnchorElement", "HTMLStyleElement",
+        ] {
+            let ctor = make_object(vec![]);
+            set_own_prop(&ctor, "prototype", make_object(vec![]), false);
+            set_own_prop(&ctor, "name", s(iface), false);
+            set_own_prop(&window, iface, ctor, true);
+        }
         DomResolver { dom, listeners, document, window, location, storage, session, parent, web_assembly, fetch_fn }
     }
 
@@ -663,7 +689,7 @@ impl PluginResolver for DomResolver {
                 "document" | "window" | "location" | "localStorage" | "sessionStorage"
                     | "navigator" | "parent" | "self" | "top" | "fetch" | "WebAssembly"
                     | "postMessage" | "Element" | "ClassList" | "Style" | "Canvas2d" | "Response"
-                    | "Event" | "globalThis"
+                    | "Event" | "globalThis" | "performance"
             )
             // `window` IS the global object: after `window.google = {}` a bare
             // `google` must resolve to that window property (real sites — google,
@@ -691,8 +717,29 @@ impl PluginResolver for DomResolver {
             }
             "navigator" => {
                 let n = make_object(vec![]);
-                set_own_prop(&n, "userAgent", s("ChittiOS/just"), true);
+                // Match the HTTP `User-Agent` the loader sends, so UA-sniffing
+                // page scripts agree with the server's content negotiation.
+                set_own_prop(&n, "userAgent", s(super::loader::BROWSER_USER_AGENT), true);
+                // Firefox-consistent (Gecko): empty vendor, Linux platform.
+                set_own_prop(&n, "platform", s("Linux x86_64"), true);
+                set_own_prop(&n, "vendor", s(""), true);
+                set_own_prop(&n, "language", s("en-US"), true);
+                set_own_prop(&n, "appName", s("Netscape"), true);
+                set_own_prop(&n, "product", s("Gecko"), true);
+                set_own_prop(&n, "onLine", JsValue::Boolean(true), true);
                 n
+            }
+            "performance" => {
+                // `performance.now()` is dispatched via call_method; `timing`/
+                // `navigation`/`timeOrigin` are read as plain properties. Real
+                // sites gate feature code on `performance` existing, so defining
+                // it (with a working clock) clears a very common ReferenceError.
+                let p = make_object(vec![]);
+                set_own_prop(&p, "__builtin_name__", s("performance"), false);
+                set_own_prop(&p, "timing", make_object(vec![]), true);
+                set_own_prop(&p, "navigation", make_object(vec![]), true);
+                set_own_prop(&p, "timeOrigin", num(0), true);
+                p
             }
             n if is_bare_global(n) => {
                 let f = make_object(vec![]);
@@ -1053,6 +1100,15 @@ impl PluginResolver for DomResolver {
                 JsValue::Undefined
             }
             ("window", "scrollTo") | ("window", "requestAnimationFrame") => JsValue::Undefined,
+            // High-resolution time: the monotonic kernel clock in ms.
+            ("performance", "now") => num(crate::arch::now_ms() as i64),
+            ("performance", "getEntriesByType") | ("performance", "getEntries")
+            | ("performance", "getEntriesByName") => make_array(vec![]),
+            ("performance", "mark") | ("performance", "measure")
+            | ("performance", "clearMarks") | ("performance", "clearMeasures")
+            | ("performance", "clearResourceTimings") | ("performance", "setResourceTimingBufferSize") => {
+                JsValue::Undefined
+            }
             ("window", "alert") => {
                 self.dom.borrow_mut().log.push(as_str(&a0));
                 JsValue::Undefined

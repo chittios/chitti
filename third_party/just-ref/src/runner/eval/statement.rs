@@ -1281,11 +1281,18 @@ fn bind_for_iterator_variable(
                 let is_var = matches!(var_decl.kind, VariableDeclarationKind::Var);
 
                 if is_var {
-                    // Check if already exists
+                    // A `var` loop variable is hoisted and pre-initialized to
+                    // `undefined`, so `initialize_var_binding` (TDZ-style, a
+                    // no-op once initialized) would leave it `undefined` every
+                    // iteration — `for (var k in obj)` then binds nothing. Create
+                    // + initialize only if genuinely absent; otherwise *assign*
+                    // the key like the `let`/pattern paths do.
                     if !ctx.has_binding(&name) {
                         ctx.create_var_binding(&name)?;
+                        ctx.initialize_var_binding(&name, value.clone())?;
+                    } else {
+                        ctx.set_binding(&name, value.clone())?;
                     }
-                    ctx.initialize_var_binding(&name, value.clone())?;
                 } else {
                     // let/const - create new binding each iteration
                     if !ctx.has_binding(&name) {
@@ -1485,5 +1492,116 @@ mod completion_tests {
         );
         // A labelled block whose `break L` carries the running value.
         assert_eq!(completion_value("5; L: { 6; break L; 7; }"), int(6));
+    }
+}
+
+/// Runtime-behavior tests for the real-world-JS engine fixes (found via the
+/// browser-sim reproducing css3test.com's bliss.js hang): `for (var k in obj)`
+/// binding, the `arguments` object, and builtin prototype methods as
+/// first-class values (`Object.prototype.toString.call`, `[].slice.call`).
+#[cfg(test)]
+mod realworld_engine_tests {
+    use crate::parser::JsParser;
+    use crate::runner::ds::value::JsValue;
+    use crate::runner::eval::statement::{execute_statement, hoist_var_declarations};
+    use crate::runner::plugin::registry::BuiltInRegistry;
+    use crate::runner::plugin::types::EvalContext;
+
+    /// Run `code`, return the last statement's completion value as a display
+    /// string (mirrors how a script's result surfaces).
+    fn run(code: &str) -> String {
+        let ast = JsParser::parse_to_ast_from_str(code)
+            .unwrap_or_else(|e| panic!("parse error for {:?}: {:?}", code, e));
+        let mut ctx = EvalContext::new();
+        ctx.install_core_builtins(BuiltInRegistry::with_core());
+        hoist_var_declarations(&ast.body, &mut ctx);
+        let mut last = JsValue::Undefined;
+        for stmt in &ast.body {
+            let c = execute_statement(stmt, &mut ctx)
+                .unwrap_or_else(|e| panic!("runtime error for {:?}: {:?}", code, e));
+            if let Some(v) = c.value {
+                last = v;
+            }
+        }
+        match last {
+            JsValue::String(s) => s,
+            JsValue::Boolean(b) => b.to_string(),
+            JsValue::BigInt(b) => b.to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    /// Sort the chars of a string — for order-independent key-set assertions
+    /// (property enumeration order is unspecified in this engine).
+    fn sorted(s: &str) -> alloc::string::String {
+        let mut v: alloc::vec::Vec<char> = s.chars().collect();
+        v.sort_unstable();
+        v.into_iter().collect()
+    }
+
+    #[test]
+    fn for_in_var_binds_keys() {
+        // The bliss hang: `for (var k in obj)` left `k` at its hoisted
+        // `undefined` (an `extend`-style property copy then infinite-recursed).
+        // Enumeration order is unspecified, so compare the key *set*.
+        assert_eq!(sorted(&run("var s=''; for (var k in {a:1,b:2,c:3}) s+=k; s;")), "abc");
+        // Passing the loop var into a call must carry the key, not undefined.
+        assert_eq!(
+            sorted(&run("var out=[]; function note(x){out.push(x);} for (var p in {x:1,y:2}) note(p); out.join('');")),
+            "xy"
+        );
+        // A nested `for (var k in …)` gets its own key sequence (not undefined).
+        assert_eq!(
+            sorted(&run("var r=''; for (var i in {a:1}) { for (var j in {b:2,c:3}) r+=i+j; } r;")),
+            "aabc"
+        );
+    }
+
+    #[test]
+    fn arguments_object() {
+        assert_eq!(run("(function(){ return arguments.length; })(1,2,3);"), "3");
+        assert_eq!(run("(function(){ return arguments[1]; })('a','b','c');"), "b");
+        // `apply` forwards the arguments object.
+        assert_eq!(
+            run("function inner(){return arguments.length;} function f(){return inner.apply(null, arguments);} f(1,2,3,4);"),
+            "4"
+        );
+        // A nested (non-arrow) function has its OWN arguments, not the outer's.
+        assert_eq!(
+            run("function outer(){ return (function(){ return arguments.length; })(9,8); }; outer(1);"),
+            "2"
+        );
+        // An arrow inherits the enclosing function's arguments.
+        assert_eq!(
+            run("function f(){ var g = () => arguments.length; return g(); } f(1,2,3);"),
+            "3"
+        );
+    }
+
+    #[test]
+    fn builtin_methods_are_first_class_values() {
+        // The `Object.prototype.toString.call(x)` type-detection idiom.
+        assert_eq!(run("Object.prototype.toString.call({});"), "[object Object]");
+        assert_eq!(run("Object.prototype.toString.call([]);"), "[object Array]");
+        assert_eq!(run("Object.prototype.toString.call(function(){});"), "[object Function]");
+        assert_eq!(run("Object.prototype.toString.call(/x/);"), "[object RegExp]");
+        // `Array.prototype.slice.call(arguments)` / `[].slice.call(...)`.
+        assert_eq!(run("JSON.stringify(Array.prototype.slice.call([1,2,3,4], 1, 3));"), "[2,3]");
+        assert_eq!(run("JSON.stringify([].slice.call([9,8,7], 1));"), "[8,7]");
+        // A builtin method pulled off as a value is a function; `.call` works.
+        assert_eq!(run("typeof [].push;"), "function");
+        assert_eq!(run("typeof function(){};"), "function");
+        assert_eq!(run("Object.prototype.hasOwnProperty.call({a:1}, 'a');"), "true");
+        assert_eq!(run("'hello'.charAt.call('world', 0);"), "w");
+    }
+
+    #[test]
+    fn boxed_primitive_still_unwraps() {
+        // Regression guard: making builtin `valueOf`/`toString` first-class must
+        // not mask a boxed primitive's ToPrimitive (`Object(2n) + 1n === 3n`).
+        assert_eq!(run("Object(2n) + 1n;"), "3");
+        assert_eq!(run("Object(2n) + 1n === 3n;"), "true");
+        // A plain object still stringifies via the legacy path.
+        assert_eq!(run("'' + {};"), "[object Object]");
     }
 }

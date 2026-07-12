@@ -95,10 +95,20 @@ pub struct FollowedGet {
 /// GET with automatic redirect following (301/302/303/307/308).
 /// Each hop is a fresh TCP/TLS connection (HTTP/1.1 Connection: close).
 pub fn get_follow(url: &str, timeout_ms: u64) -> Result<FollowedGet, String> {
+    get_follow_headers(url, &[], timeout_ms)
+}
+
+/// [`get_follow`] with caller-supplied request headers (e.g. a browser
+/// `User-Agent` + `Cookie`) sent on every redirect hop.
+pub fn get_follow_headers(
+    url: &str,
+    headers: &[(&str, &str)],
+    timeout_ms: u64,
+) -> Result<FollowedGet, String> {
     let mut current = url.trim().to_string();
     let mut redirects = 0u32;
     loop {
-        let resp = request("GET", &current, &[], &[], timeout_ms)?;
+        let resp = request("GET", &current, headers, &[], timeout_ms)?;
         if !is_redirect(resp.status) {
             return Ok(FollowedGet {
                 response: resp,

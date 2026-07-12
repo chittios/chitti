@@ -20,6 +20,17 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, Ordering};
 
+/// The `User-Agent` the browser presents. A **Firefox (Gecko)** string, chosen
+/// deliberately: UA-sniffing sites serve full styled markup to a real browser
+/// UA, but the *latest* Chrome/Firefox UAs make google.com (and similar) return
+/// a heavy JavaScript single-page app whose DOM is built at runtime by a
+/// framework this engine can't fully execute — so it renders as a half-built
+/// skeleton. An older Firefox UA gets the **classic static** document instead
+/// (real CSS: `<center>`, a search form, buttons), which this engine renders
+/// well. `browser::js_just` mirrors this into `navigator.userAgent`.
+pub const BROWSER_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:78.0) Gecko/20100101 Firefox/78.0";
+
 /// What the load is for (Fetch `destination` / Ladybird LoadRequest destination).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Destination {
@@ -349,19 +360,16 @@ fn load_inner(req: &LoadRequest) -> Result<LoadedResource, String> {
         })
     };
 
+    // Present as a mainstream browser. Many sites (google.com most visibly)
+    // content-negotiate on User-Agent and serve a stripped, unstyled page to an
+    // unknown UA — so send a current Chrome/macOS UA to get the full markup +
+    // CSS. `navigator.userAgent` (browser::js_just) is kept consistent with this.
+    let mut headers: Vec<(&str, &str)> = alloc::vec![("User-Agent", BROWSER_USER_AGENT)];
+    if !cookie_hdr.is_empty() {
+        headers.push(("Cookie", cookie_hdr.as_str()));
+    }
     let t0 = now_ms();
-    let got = if cookie_hdr.is_empty() {
-        crate::net::http::get_follow(&req.url, req.timeout_ms)?
-    } else {
-        // One-shot GET with Cookie (no multi-hop cookie update mid-redirect for now).
-        let headers = [("Cookie", cookie_hdr.as_str())];
-        let resp = crate::net::http::request("GET", &req.url, &headers, &[], req.timeout_ms)?;
-        crate::net::http::FollowedGet {
-            response: resp,
-            final_url: req.url.clone(),
-            redirects: 0,
-        }
-    };
+    let got = crate::net::http::get_follow_headers(&req.url, &headers, req.timeout_ms)?;
     let t1 = now_ms();
 
     let status = got.response.status;

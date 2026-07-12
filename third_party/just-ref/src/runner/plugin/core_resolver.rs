@@ -105,6 +105,10 @@ impl PluginResolver for CorePluginResolver {
             .map(|builtin_fn| builtin_fn.call(ctx, this, args))
     }
 
+    fn has_method(&self, object_name: &str, method_name: &str) -> bool {
+        self.registry.has_method(object_name, method_name)
+    }
+
     fn call_constructor(
         &self,
         object_name: &str,

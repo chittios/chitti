@@ -67,6 +67,10 @@ pub struct ComputedStyle {
     pub margin_bottom: i32,
     pub margin_left: i32,
     pub margin_right: i32,
+    /// `margin-left: auto` / `margin-right: auto` — both set on a fixed-width
+    /// block centers it in its container (the classic `margin: 0 auto` idiom).
+    pub margin_left_auto: bool,
+    pub margin_right_auto: bool,
     pub padding_top: i32,
     pub padding_bottom: i32,
     pub padding_left: i32,
@@ -415,6 +419,8 @@ impl Default for ComputedStyle {
             margin_bottom: 0,
             margin_left: 0,
             margin_right: 0,
+            margin_left_auto: false,
+            margin_right_auto: false,
             padding_top: 0,
             padding_bottom: 0,
             padding_left: 0,
@@ -1141,12 +1147,23 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
             }
         }
         "margin" => {
-            if let Some(px) = parse_px(value.split_whitespace().next().unwrap_or(value)) {
-                st.margin_top = px;
-                st.margin_bottom = px;
-                st.margin_left = px;
-                st.margin_right = px;
-            }
+            // 1–4 values (CSS shorthand order: top right bottom left), each a
+            // length or `auto`. `auto` on the horizontal sides marks the block
+            // for centering; a length sets that margin.
+            let toks: Vec<&str> = value.split_whitespace().collect();
+            let (t, r, b, l): (&str, &str, &str, &str) = match toks.len() {
+                1 => (toks[0], toks[0], toks[0], toks[0]),
+                2 => (toks[0], toks[1], toks[0], toks[1]),
+                3 => (toks[0], toks[1], toks[2], toks[1]),
+                _ if toks.len() >= 4 => (toks[0], toks[1], toks[2], toks[3]),
+                _ => (value, value, value, value),
+            };
+            if let Some(px) = parse_px(t) { st.margin_top = px; }
+            if let Some(px) = parse_px(b) { st.margin_bottom = px; }
+            st.margin_left_auto = l.eq_ignore_ascii_case("auto");
+            st.margin_right_auto = r.eq_ignore_ascii_case("auto");
+            if let Some(px) = parse_px(l) { st.margin_left = px; }
+            if let Some(px) = parse_px(r) { st.margin_right = px; }
         }
         "margin-top" => {
             if let Some(px) = parse_px(value) {
@@ -1159,11 +1176,13 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
             }
         }
         "margin-left" => {
+            st.margin_left_auto = value.trim().eq_ignore_ascii_case("auto");
             if let Some(px) = parse_px(value) {
                 st.margin_left = px;
             }
         }
         "margin-right" => {
+            st.margin_right_auto = value.trim().eq_ignore_ascii_case("auto");
             if let Some(px) = parse_px(value) {
                 st.margin_right = px;
             }
@@ -2050,12 +2069,25 @@ pub fn compute(
         }
         "a" => {
             st.color = 0xcc785c;
+            st.text_decoration = TextDecoration::Underline;
         }
         "strong" | "b" => {
             st.bold = true;
         }
         "code" | "pre" => {
             st.font_size = parent.font_size.saturating_sub(1).max(10);
+        }
+        // The presentational `<center>` element centers its inline/block
+        // descendants (UA rule: `center { text-align: center }`). Real pages
+        // still lean on it — google.com wraps its whole logo/search/buttons
+        // block in one `<center>`, which is why the page looked left-aligned.
+        "center" => {
+            st.text_align = Align::Center;
+        }
+        // `<th>` and `<caption>` default to centered text per the UA sheet.
+        "th" | "caption" => {
+            st.text_align = Align::Center;
+            st.bold = st.bold || tag == "th";
         }
         _ => {}
     }

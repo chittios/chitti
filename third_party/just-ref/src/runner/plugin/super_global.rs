@@ -172,6 +172,21 @@ impl SuperGlobalEnvironment {
         self.resolvers[idx].call_method(object_name, method_name, ctx, this, args)
     }
 
+    /// Does any resolver provide `method_name` on `object_name`? Cheap check
+    /// (no materialization) — used to decide whether to expose a builtin
+    /// prototype method as a first-class value on a receiver.
+    pub fn has_method(&self, object_name: &str, method_name: &str) -> bool {
+        let idx = if let Some(&idx) = self.resolver_map.borrow().get(object_name) {
+            idx
+        } else {
+            match self.find_resolver_index(object_name) {
+                Some(i) => i,
+                None => return false,
+            }
+        };
+        self.resolvers[idx].has_method(object_name, method_name)
+    }
+
     /// Call a constructor on a super-global object.
     pub fn call_constructor(
         &self,

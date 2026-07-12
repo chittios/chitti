@@ -23,10 +23,17 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let mut args: Vec<String> = env::args().skip(1).collect();
     let raw = args.iter().any(|a| a == "--raw");
-    args.retain(|a| a != "--raw");
+    let browser = args.iter().any(|a| a == "--browser");
+    args.retain(|a| a != "--raw" && a != "--browser");
     if args.is_empty() {
-        eprintln!("usage: chitti-just-runner [--raw] <test.js|dir>…");
+        eprintln!("usage: chitti-just-runner [--raw|--browser] <test.js|dir>…");
         return ExitCode::from(2);
+    }
+    if browser {
+        // Browser-sim: run the given files IN ORDER as one page (flat-global
+        // module model), under a mocked window/DOM, with a wall-clock tick
+        // budget so a runaway loop is *reported* rather than hanging forever.
+        return run_browser(&args);
     }
     let mut files = Vec::new();
     for a in &args {
@@ -119,6 +126,247 @@ fn run_raw(src: &str) -> Outcome {
         }
     }
     Outcome::Pass
+}
+
+// ---------------------------------------------------------------------------
+// Browser-sim mode: reproduce the kernel's page-script execution on the host.
+//
+// The kernel runs a page's scripts through this same `just` interpreter with a
+// live DOM and a cooperative host-tick hook (`runner::host`). This mode mirrors
+// that: it mocks window/DOM in JS, strips ES-module syntax the way the kernel's
+// `browser::css::strip_module_syntax` does (flat-global model), concatenates the
+// files in load order, and runs them as one program — then installs a
+// **wall-clock tick budget** as the host hook. If a script runs away, the
+// interpreter's `host_tick` fires the budget and the run aborts *cleanly*
+// (proving the loop is interruptible — Ctrl+C works in-kernel too). If instead
+// the process has to be killed by an external `timeout`, the hang is on a code
+// path the interpreter never tick-checks — the real bug.
+use std::sync::Mutex;
+use std::time::Instant;
+
+static BROWSER_DEADLINE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Host tick hook (wall-clock budget). The interpreter calls this every ~2048
+/// loop/call iterations; returning `true` aborts with the uncatchable interrupt.
+fn browser_budget_tick() -> bool {
+    if let Ok(g) = BROWSER_DEADLINE.lock() {
+        if let Some(dl) = *g {
+            return Instant::now() >= dl;
+        }
+    }
+    false
+}
+
+/// Line-based ES-module strip mirroring `browser::css::strip_module_syntax`:
+/// `export default X` → `var __default = X`; a default `import D from "u"` →
+/// `var D = __default`; drop the `export ` keyword off decls; other import/export
+/// forms are dropped (the flat-global model shares named bindings as globals).
+fn strip_module(src: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in src.split('\n') {
+        let t = line.trim_start();
+        if let Some(rest) = strip_kw(t, "import") {
+            // `import D from "u"` / `import D, {a} from "u"` → bind default.
+            let clause = rest.split(" from ").next().unwrap_or(rest).trim();
+            let default_name = clause
+                .split(&['{', ',', '*'][..])
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !default_name.is_empty() && default_name != "{" {
+                out.push(format!("var {default_name} = __default;"));
+            }
+            // named/`* as` bindings share globals — nothing to emit.
+        } else if let Some(rest) = strip_kw(t, "export") {
+            let after = rest.trim_start();
+            if let Some(dflt) = strip_kw(after, "default") {
+                out.push(format!("var __default = {}", dflt.trim_start()));
+            } else if ["const", "let", "var", "function", "class", "async"]
+                .iter()
+                .any(|kw| strip_kw(after, kw).is_some())
+            {
+                out.push(after.to_string()); // drop the `export ` prefix
+            }
+            // `export { … }` — bindings already global; drop the line.
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    out.join("\n")
+}
+
+/// `Some(rest)` if `t` starts with keyword `kw` followed by a non-identifier
+/// boundary (space / `{` / `*` / EOL); else `None`.
+fn strip_kw<'a>(t: &'a str, kw: &str) -> Option<&'a str> {
+    let rest = t.strip_prefix(kw)?;
+    match rest.chars().next() {
+        None => Some(rest),
+        Some(c) if c.is_alphanumeric() || c == '_' || c == '$' => None,
+        Some(_) => Some(rest),
+    }
+}
+
+/// A JS mock of the browser environment — enough surface that css3test's
+/// `supports.js`/`csstest.js` run to completion (feature checks report
+/// unsupported since there's no real CSS engine, but nothing throws-then-hangs).
+const DOM_MOCK: &str = r#"
+var __noop = function () {};
+function __el() {
+  var e = {
+    style: { setProperty: __noop, removeProperty: __noop, getPropertyValue: function(){return "";}, cssText: "", length: 0 },
+    sheet: { cssRules: [], insertRule: function(){return 0;}, deleteRule: __noop },
+    classList: { add: __noop, remove: __noop, toggle: __noop, contains: function(){return false;} },
+    attributes: [], childNodes: [], children: [],
+    textContent: "", innerHTML: "", innerText: "", className: "", id: "",
+    offsetWidth: 0, offsetHeight: 0, clientWidth: 0, clientHeight: 0,
+    appendChild: function(c){return c;}, removeChild: function(c){return c;},
+    insertBefore: function(c){return c;}, setAttribute: __noop, getAttribute: function(){return null;},
+    removeAttribute: __noop, hasAttribute: function(){return false;},
+    addEventListener: __noop, removeEventListener: __noop, dispatchEvent: function(){return true;},
+    cloneNode: function(){return __el();}, remove: __noop, contains: function(){return false;},
+    querySelector: function(){return null;}, querySelectorAll: function(){return [];},
+    getBoundingClientRect: function(){return {top:0,left:0,right:0,bottom:0,width:0,height:0};},
+    focus: __noop, blur: __noop, click: __noop
+  };
+  return e;
+}
+var document = {
+  createElement: function(){return __el();},
+  createElementNS: function(){return __el();},
+  createTextNode: function(t){return {nodeType:3,textContent:t};},
+  createDocumentFragment: function(){return __el();},
+  getElementById: function(){return null;},
+  querySelector: function(){return null;},
+  querySelectorAll: function(){return [];},
+  getElementsByTagName: function(){return [];},
+  getElementsByClassName: function(){return [];},
+  addEventListener: __noop, removeEventListener: __noop,
+  documentElement: __el(), body: __el(), head: __el(),
+  adoptedStyleSheets: [], styleSheets: [], cookie: "", title: "", readyState: "complete"
+};
+var CSS = {
+  supports: function(){return false;},
+  escape: function(s){return String(s);},
+  registerProperty: __noop
+};
+var navigator = { userAgent: "ChittiOS", language: "en", languages: ["en"], platform: "ChittiOS", vendor: "" };
+var __store = function(){ var m={}; return { getItem:function(k){return (k in m)?m[k]:null;}, setItem:function(k,v){m[k]=String(v);}, removeItem:function(k){delete m[k];}, clear:function(){m={};}, key:function(){return null;}, length:0 }; };
+var localStorage = __store();
+var sessionStorage = __store();
+var location = { href: "https://css3test.com/", search: "", hash: "", pathname: "/", host: "css3test.com", hostname: "css3test.com", protocol: "https:", origin: "https://css3test.com", reload: __noop, assign: __noop, replace: __noop };
+var history = { pushState: __noop, replaceState: __noop, back: __noop, forward: __noop, go: __noop };
+function getComputedStyle(){ return { getPropertyValue: function(){return "";}, length: 0 }; }
+function requestAnimationFrame(cb){ return 0; }
+function cancelAnimationFrame(){}
+function setTimeout(){ return 0; }
+function clearTimeout(){}
+function setInterval(){ return 0; }
+function clearInterval(){}
+function matchMedia(){ return { matches:false, media:"", addListener:__noop, removeListener:__noop, addEventListener:__noop, removeEventListener:__noop }; }
+function URLSearchParams(q){ this.get=function(){return null;}; this.has=function(){return false;}; this.getAll=function(){return [];}; this.toString=function(){return "";}; }
+function fetch(){ return { then:function(){return this;}, catch:function(){return this;} }; }
+// DOM interface constructors (bliss/jQuery hijack these prototypes).
+var EventTarget = function(){}; EventTarget.prototype = { addEventListener: __noop, removeEventListener: __noop, dispatchEvent: function(){return true;} };
+var Node = function(){}; Node.prototype = Object.create(EventTarget.prototype);
+var Element = function(){}; Element.prototype = Object.create(Node.prototype);
+var HTMLElement = function(){}; HTMLElement.prototype = Object.create(Element.prototype);
+var HTMLDocument = function(){}; var Document = function(){}; var Window = function(){};
+var CustomEvent = function(){}; var Event = function(){};
+var MutationObserver = function(){ this.observe=__noop; this.disconnect=__noop; };
+var window = this;
+window.EventTarget = EventTarget; window.Node = Node; window.Element = Element;
+window.HTMLElement = HTMLElement; window.Document = Document; window.Window = Window;
+window.CustomEvent = CustomEvent; window.Event = Event; window.MutationObserver = MutationObserver;
+window.document = document; window.location = location; window.navigator = navigator;
+window.localStorage = localStorage; window.sessionStorage = sessionStorage;
+window.CSS = CSS; window.history = history; window.getComputedStyle = getComputedStyle;
+window.requestAnimationFrame = requestAnimationFrame; window.matchMedia = matchMedia;
+window.setTimeout = setTimeout; window.setInterval = setInterval; window.fetch = fetch;
+window.addEventListener = __noop; window.removeEventListener = __noop;
+window.self = window; window.top = window; window.parent = window; window.globalThis = window;
+window.innerWidth = 1280; window.innerHeight = 800; window.devicePixelRatio = 1;
+window.URLSearchParams = URLSearchParams;
+"#;
+
+/// Run a list of page-script files as one flat-global browser page.
+fn run_browser(files: &[String]) -> ExitCode {
+    let budget_secs: u64 = std::env::var("BROWSER_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+
+    // Assemble the page: DOM mock, then each file module-stripped in order.
+    let mut program = String::from(DOM_MOCK);
+    program.push('\n');
+    let mut markers: Vec<(String, usize)> = Vec::new(); // (file, char offset)
+    for f in files {
+        let src = match fs::read_to_string(f) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skip {f}: {e}");
+                continue;
+            }
+        };
+        markers.push((f.clone(), program.len()));
+        program.push_str(&format!("\n/* ==== {f} ==== */\n"));
+        program.push_str(&strip_module(&src));
+        program.push('\n');
+    }
+    println!(
+        "browser-sim: {} file(s), {} bytes, budget {}s",
+        files.len(),
+        program.len(),
+        budget_secs
+    );
+
+    // Parse.
+    let t_parse = Instant::now();
+    let ast = match JsParser::parse_to_ast_from_str(&program) {
+        Ok(a) => a,
+        Err(e) => {
+            println!("PARSE-FAIL: {e:?}");
+            return ExitCode::from(1);
+        }
+    };
+    println!("parse ok in {:?}", t_parse.elapsed());
+
+    // Install the wall-clock budget as the interpreter's host tick.
+    *BROWSER_DEADLINE.lock().unwrap() =
+        Some(Instant::now() + std::time::Duration::from_secs(budget_secs));
+    just_engine::runner::host::set_tick_hook(Some(browser_budget_tick));
+
+    let mut ctx = EvalContext::new();
+    ctx.install_core_builtins(BuiltInRegistry::with_core());
+    just_engine::runner::eval::statement::hoist_var_declarations(&ast.body, &mut ctx);
+
+    let t_exec = Instant::now();
+    let mut ran = 0usize;
+    for stmt in &ast.body {
+        if let Err(e) = execute_statement(stmt, &mut ctx) {
+            let elapsed = t_exec.elapsed();
+            if just_engine::runner::host::is_interrupt(&e) {
+                println!(
+                    "ABORTED by budget after {elapsed:?} at top-stmt #{ran} — \
+                     a script ran past the {budget_secs}s budget. host_tick DID \
+                     fire, so the loop is interruptible (Ctrl+C works in-kernel). \
+                     Likely a very long/infinite loop; bisect the files."
+                );
+            } else {
+                let msg: String =
+                    describe_error(&e).replace('\n', " ").chars().take(400).collect();
+                // Which file did we get into? (last marker <= no easy stmt span;
+                // report the completed-statement count instead.)
+                println!("THREW after {elapsed:?} at top-stmt #{ran}: {msg}");
+            }
+            return ExitCode::from(1);
+        }
+        ran += 1;
+    }
+    println!(
+        "COMPLETED all {ran} top-level statements in {:?} (no hang, no throw)",
+        t_exec.elapsed()
+    );
+    ExitCode::SUCCESS
 }
 
 fn collect_js(p: &Path, out: &mut Vec<PathBuf>) {

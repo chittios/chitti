@@ -335,11 +335,11 @@ optional_call = { "?." ~s~ arguments }
 optional_call__yield = { "?." ~s~ arguments__yield }
 member_expression = {
     (super_property | meta_property | ("new" ~s~ new_member_expression ~s~ arguments) | primary_expression)
-    ~ (s~ "[" ~s~ expression__in ~s~ "]" | optional_index | "." ~s~ identifier_name | "." ~s~ private_name | optional_member | template_literal)*
+    ~ (s~ ("[" ~s~ expression__in ~s~ "]" | optional_index | "." ~s~ identifier_name | "." ~s~ private_name | optional_member | template_literal))*
 }
 member_expression__yield = {
     (super_property__yield | meta_property | ("new" ~s~ new_member_expression__yield ~s~ arguments__yield) | primary_expression__yield)
-    ~ (s~ "[" ~s~ expression__in_yield ~s~ "]" | optional_index__yield | "." ~s~ identifier_name | "." ~s~ private_name | optional_member | template_literal__yield)*
+    ~ (s~ ("[" ~s~ expression__in_yield ~s~ "]" | optional_index__yield | "." ~s~ identifier_name | "." ~s~ private_name | optional_member | template_literal__yield))*
 }
 new_member_expression = { member_expression }
 new_member_expression__yield = { member_expression__yield }
@@ -360,13 +360,15 @@ new_target = { "new" ~s~ "." ~s~ "target" }
 new_op = @{ "new" ~ !identifier_part ~ !(WHITESPACE* ~ ".") }
 super_call = { "super" ~s~ arguments }
 super_call__yield = { "super" ~s~ arguments__yield }
+// ChittiOS: ES2017 allows a single trailing comma after the argument list
+// (`f(a, b,)`), so `~s~ ","? ~s~` before the `)`.
 arguments = {
     "(" ~s~ ")"
-    | "(" ~s~ argument_list ~s~ ")"
+    | "(" ~s~ argument_list ~s~ ","? ~s~ ")"
 }
 arguments__yield = {
     "(" ~s~ ")"
-    | "(" ~s~ argument_list__yield ~s~ ")"
+    | "(" ~s~ argument_list__yield ~s~ ","? ~s~ ")"
 }
 argument_list = {
     (assignment_expression__in | "..." ~ rest_assignment_expression__in)
@@ -388,11 +390,11 @@ rest_assignment_expression__in_yield = { assignment_expression__in_yield }
 // consumes the next `arguments` suffix, innermost first — spec semantics).
 left_hand_side_expression = {
     (new_op ~s)* ~ (super_call | member_expression)
-    ~ (s~ arguments | "[" ~s~ expression__in ~s~ "]" | optional_index | optional_call | "." ~s~ identifier_name | "." ~s~ private_name | optional_member | template_literal)*
+    ~ (s~ (arguments | "[" ~s~ expression__in ~s~ "]" | optional_index | optional_call | "." ~s~ identifier_name | "." ~s~ private_name | optional_member | template_literal))*
 }
 left_hand_side_expression__yield = {
     (new_op ~s)* ~ (super_call__yield | member_expression__yield)
-    ~ (s~ arguments__yield | "[" ~s~ expression__in_yield ~s~ "]" | optional_index__yield | optional_call__yield | "." ~s~ identifier_name | "." ~s~ private_name | optional_member | template_literal__yield)*
+    ~ (s~ (arguments__yield | "[" ~s~ expression__in_yield ~s~ "]" | optional_index__yield | optional_call__yield | "." ~s~ identifier_name | "." ~s~ private_name | optional_member | template_literal__yield))*
 }
 postfix_expression = {
     left_hand_side_expression ~ (!line_terminator ~ postfix_operator)?
@@ -990,8 +992,10 @@ function_expression = {
 }
 strict_formal_parameters = _{ formal_parameters }
 strict_formal_parameters__yield = _{ formal_parameters__yield }
-formal_parameters = { formal_parameter_list? }
-formal_parameters__yield = { formal_parameter_list__yield? }
+// ChittiOS: a trailing comma after the parameter list (`function f(a, b,) {}`,
+// ES2017) is tolerated.
+formal_parameters = { formal_parameter_list? ~s~ ","? }
+formal_parameters__yield = { formal_parameter_list__yield? ~s~ ","? }
 formal_parameter_list = _{
     function_rest_parameter
     | formals_list ~s~ "," ~s~ function_rest_parameter

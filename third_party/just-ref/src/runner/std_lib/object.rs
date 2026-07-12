@@ -103,6 +103,10 @@ fn object_to_string(
     this: JsValue,
     _args: Vec<JsValue>,
 ) -> Result<JsValue, JErrorType> {
+    // The [[Class]]-style tag. For objects, distinguish the common exotic
+    // kinds the `Object.prototype.toString.call(x)` type-detection idiom relies
+    // on (Array/Function/RegExp/Error/…) — bliss's `type()`, jQuery's `$.type`
+    // and lodash all key off these.
     let tag = match &this {
         JsValue::Undefined => "Undefined",
         JsValue::Null => "Null",
@@ -111,7 +115,31 @@ fn object_to_string(
         JsValue::String(_) => "String",
         JsValue::BigInt(_) => "BigInt",
         JsValue::Symbol(_) => "Symbol",
-        JsValue::Object(_) => "Object",
+        JsValue::Object(_) => {
+            use crate::runner::eval::expression::{get_own_prop_value, value_is_callable};
+            // Arrays carry `__array__`; RegExp/Error/etc. carry a
+            // `__builtin_name__`; a callable (with none of those) is a Function.
+            if get_own_prop_value(&this, "__array__").is_some() {
+                "Array"
+            } else if let Some(JsValue::String(name)) =
+                get_own_prop_value(&this, "__builtin_name__")
+            {
+                // "RegExp" → "[object RegExp]"; any "*Error" → "[object Error]".
+                if name.ends_with("Error") {
+                    "Error"
+                } else if name == "RegExp" {
+                    "RegExp"
+                } else if value_is_callable(&this) {
+                    "Function"
+                } else {
+                    "Object"
+                }
+            } else if value_is_callable(&this) {
+                "Function"
+            } else {
+                "Object"
+            }
+        }
     };
     Ok(JsValue::String(format!("[object {}]", tag)))
 }

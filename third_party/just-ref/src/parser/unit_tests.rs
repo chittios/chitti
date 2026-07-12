@@ -1270,3 +1270,28 @@ fn test_line_and_paragraph_separator_terminate_regex() {
     assert!(JsParser::parse_to_ast_from_str("/\u{2029}/;").is_err());
     assert!(JsParser::parse_to_ast_from_str("/a\u{2028}b/;").is_err());
 }
+
+/// ChittiOS: a member/call/index suffix may follow a line terminator — the
+/// fluent multi-line method chain (`foo\n.bar()\n.baz()`) is ubiquitous in real
+/// code (this failed css3test.com's `supports.js` `camelCase`). The chain-suffix
+/// alternation previously only consumed line terminators before `[`, so a `.`
+/// (or `(`, tagged template) after a newline was rejected. Regex-vs-division
+/// disambiguation surfaced it as `positives: [decimal_digits]`.
+#[test]
+fn test_method_chain_across_newlines() {
+    for src in [
+        // the exact css3test camelCase shape: `.replace(regex, fn).replace(str)`
+        "function c(s){\n  return s\n    .replace(/-([a-z])/g, function ($0, $1) {\n      return $1.toUpperCase();\n    })\n    .replace('-', '');\n}\n",
+        "var r = a\n.b\n.c();",          // member across newlines
+        "var r = a()\n['k'];",           // index across newlines
+        "var r = a\n(1, 2);",            // call across newlines (no ASI before `(`)
+        "var r = tag\n`x`;",             // tagged template across newlines
+        "var r = a\n?.b\n?.c;",          // optional chain across newlines
+    ] {
+        assert!(
+            JsParser::parse_to_ast_from_str(src).is_ok(),
+            "should parse a chain suffix after a newline: {:?}",
+            src
+        );
+    }
+}
