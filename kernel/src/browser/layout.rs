@@ -58,6 +58,9 @@ pub struct RectBox {
     /// `border-radius` in px (0 = square). The painter rounds the corners of
     /// filled background rects; border/outline edge rects keep 0.
     pub radius: i32,
+    /// `box-shadow` blur radius in px (0 = a crisp fill). When > 0 the painter
+    /// renders this rect as a box-blurred shadow instead of a solid fill.
+    pub blur: i32,
 }
 
 /// Hit box of a JS-interactive element (has listeners / `on*` attrs), so a
@@ -110,16 +113,16 @@ fn push_box_borders(rects: &mut Vec<RectBox>, x: i32, y: i32, w: i32, h: i32, st
         }
     };
     if let Some((bw, c)) = edge(st.border_top_style, st.border_top_width, st.border_top_color) {
-        rects.push(RectBox { x, y, w, h: bw, color: c, radius: 0 });
+        rects.push(RectBox { x, y, w, h: bw, color: c, radius: 0, blur: 0 });
     }
     if let Some((bw, c)) = edge(st.border_bottom_style, st.border_bottom_width, st.border_bottom_color) {
-        rects.push(RectBox { x, y: y + h - bw, w, h: bw, color: c, radius: 0 });
+        rects.push(RectBox { x, y: y + h - bw, w, h: bw, color: c, radius: 0, blur: 0 });
     }
     if let Some((bw, c)) = edge(st.border_left_style, st.border_left_width, st.border_left_color) {
-        rects.push(RectBox { x, y, w: bw, h, color: c, radius: 0 });
+        rects.push(RectBox { x, y, w: bw, h, color: c, radius: 0, blur: 0 });
     }
     if let Some((bw, c)) = edge(st.border_right_style, st.border_right_width, st.border_right_color) {
-        rects.push(RectBox { x: x + w - bw, y, w: bw, h, color: c, radius: 0 });
+        rects.push(RectBox { x: x + w - bw, y, w: bw, h, color: c, radius: 0, blur: 0 });
     }
     // Outline — drawn just outside the border box by `outline-offset`.
     if st.outline_style.is_visible() && st.outline_width > 0 {
@@ -128,10 +131,10 @@ fn push_box_borders(rects: &mut Vec<RectBox>, x: i32, y: i32, w: i32, h: i32, st
         let (ox, oy) = (x - off - ow, y - off - ow);
         let (ow_box, oh_box) = (w + 2 * (off + ow), h + 2 * (off + ow));
         let c = st.outline_color.unwrap_or(fallback);
-        rects.push(RectBox { x: ox, y: oy, w: ow_box, h: ow, color: c, radius: 0 });
-        rects.push(RectBox { x: ox, y: oy + oh_box - ow, w: ow_box, h: ow, color: c, radius: 0 });
-        rects.push(RectBox { x: ox, y: oy, w: ow, h: oh_box, color: c, radius: 0 });
-        rects.push(RectBox { x: ox + ow_box - ow, y: oy, w: ow, h: oh_box, color: c, radius: 0 });
+        rects.push(RectBox { x: ox, y: oy, w: ow_box, h: ow, color: c, radius: 0, blur: 0 });
+        rects.push(RectBox { x: ox, y: oy + oh_box - ow, w: ow_box, h: ow, color: c, radius: 0, blur: 0 });
+        rects.push(RectBox { x: ox, y: oy, w: ow, h: oh_box, color: c, radius: 0, blur: 0 });
+        rects.push(RectBox { x: ox + ow_box - ow, y: oy, w: ow, h: oh_box, color: c, radius: 0, blur: 0 });
     }
 }
 
@@ -278,15 +281,32 @@ pub struct Layout {
     pub elem_boxes: Vec<ElemBox>,
     /// CSS `background-image: url(…)` boxes (see [`BgBox`]).
     pub bg_boxes: Vec<BgBox>,
+    /// `transform: rotate(...)` regions for the paint bitmap-rotation pass.
+    pub rotates: Vec<RotateOp>,
     pub bg: u32,
 }
 
 /// Extra outputs threaded through the walk: interactive element hit boxes and
 /// background-image boxes, plus the set of element indices (stamped
 /// `Node.elem_idx` values) that should get an [`ElemBox`].
+/// A `transform: rotate(...)` region for the paint-time bitmap rotation pass:
+/// the element is rendered axis-aligned, then its box is rotated about
+/// `(cx, cy)` by `angle_deg`.
+#[derive(Clone, Copy, Debug)]
+pub struct RotateOp {
+    pub cx: i32,
+    pub cy: i32,
+    pub angle_deg: f32,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
 struct Aux<'a> {
     elem_boxes: Vec<ElemBox>,
     bg_boxes: Vec<BgBox>,
+    rotates: Vec<RotateOp>,
     interactive: &'a [usize],
 }
 
@@ -340,6 +360,13 @@ struct Cursor {
     margin_x: i32,
     line_h: i32,
     content_bottom: i32,
+    /// Active `float:left` exclusion: content on lines above `float_l_bottom` is
+    /// pushed right by `float_l_w`. Cleared once `y` passes the bottom.
+    float_l_w: i32,
+    float_l_bottom: i32,
+    /// Active `float:right` exclusion: shrinks the usable width by `float_r_w`.
+    float_r_w: i32,
+    float_r_bottom: i32,
 }
 
 /// Active form context while walking (Ladybird form owner association).
@@ -378,6 +405,10 @@ pub fn layout_document_ex(
         margin_x: margin,
         line_h: CELL_H_BASE,
         content_bottom: margin,
+        float_l_w: 0,
+        float_l_bottom: 0,
+        float_r_w: 0,
+        float_r_bottom: 0,
     };
     let root_style = ComputedStyle::default();
     // Page background: stylesheet rules for html/body first (LibWeb StyleComputer
@@ -397,6 +428,7 @@ pub fn layout_document_ex(
     let mut aux = Aux {
         elem_boxes: Vec::new(),
         bg_boxes: Vec::new(),
+        rotates: Vec::new(),
         interactive,
     };
     walk(
@@ -431,6 +463,7 @@ pub fn layout_document_ex(
         frames,
         elem_boxes: aux.elem_boxes,
         bg_boxes: aux.bg_boxes,
+        rotates: aux.rotates,
         bg: page_bg,
     }
 }
@@ -491,6 +524,10 @@ pub fn layout_reader(title: &str, plain: &str, vw: i32, vh: i32) -> Layout {
         margin_x: 8,
         line_h: CELL_H_BASE + 4,
         content_bottom: 8,
+        float_l_w: 0,
+        float_l_bottom: 0,
+        float_r_w: 0,
+        float_r_bottom: 0,
     };
     let title_st = ComputedStyle {
         color: 0x1a1816,
@@ -541,6 +578,7 @@ pub fn layout_reader(title: &str, plain: &str, vw: i32, vh: i32) -> Layout {
         frames: Vec::new(),
         elem_boxes: Vec::new(),
         bg_boxes: Vec::new(),
+        rotates: Vec::new(),
         bg: 0xf5f0e8,
     }
 }
@@ -681,6 +719,10 @@ fn walk(
                     margin_x: 0,
                     line_h,
                     content_bottom: 0,
+                    float_l_w: 0,
+                    float_l_bottom: 0,
+                    float_r_w: 0,
+                    float_r_bottom: 0,
                 };
                 for c in &n.children {
                     walk(
@@ -691,14 +733,27 @@ fn walk(
                 let (x0, y0, x1, y1) = frag_bbox(mark, runs, links, rects, images, controls, frames, aux);
                 let fw = st.width.unwrap_or((x1 - x0).max(1));
                 let fh = (y1 - y0).max(fcur.content_bottom).max(1);
-                let (fx, fy) = match st.float_mode {
-                    css::FloatMode::Right => (cur.margin_x + cur.max_w - fw, cur.y),
-                    _ => (cur.x.max(cur.margin_x), cur.y),
+                let fy = cur.y;
+                let gap6 = 8;
+                let fx = match st.float_mode {
+                    css::FloatMode::Right => {
+                        // Placed inside the right edge, past any existing right float.
+                        let x = cur.margin_x + cur.max_w - cur.float_r_w - fw;
+                        cur.float_r_w += fw + gap6;
+                        cur.float_r_bottom = cur.float_r_bottom.max(fy + fh);
+                        x
+                    }
+                    _ => {
+                        // Placed at the left edge, past any existing left float;
+                        // following content wraps to its right for `fh` px.
+                        let x = cur.margin_x + cur.float_l_w;
+                        cur.float_l_w += fw + gap6;
+                        cur.float_l_bottom = cur.float_l_bottom.max(fy + fh);
+                        cur.x = cur.margin_x + cur.float_l_w;
+                        x
+                    }
                 };
                 translate_frag(mark, fx - x0, fy - y0, runs, links, rects, images, controls, frames, aux);
-                if matches!(st.float_mode, css::FloatMode::Left) {
-                    cur.x = fx + fw + 6; // following content flows to the right
-                }
                 cur.line_h = cur.line_h.max(fh);
                 cur.content_bottom = cur.content_bottom.max(fy + fh);
                 return;
@@ -728,6 +783,10 @@ fn walk(
                     margin_x: 0,
                     line_h,
                     content_bottom: 0,
+                    float_l_w: 0,
+                    float_l_bottom: 0,
+                    float_r_w: 0,
+                    float_r_bottom: 0,
                 };
                 for c in &n.children {
                     walk(
@@ -832,6 +891,7 @@ fn walk(
                         h: 1,
                         color: st.color,
                         radius: 0,
+                        blur: 0,
                     });
                     cur.y += 4 + st.margin_bottom;
                     cur.content_bottom = cur.content_bottom.max(cur.y);
@@ -1103,10 +1163,13 @@ fn walk(
                     // Mark where this block's inline content begins, so a
                     // non-`Left` `text-align` can be applied to just these items.
                     let (r0, l0, i0, c0) = (runs.len(), links.len(), images.len(), controls.len());
-                    // Full fragment mark for `transform: translate(...)`, which
-                    // shifts the whole box (content + background) after layout.
-                    let xform = parse_transform_translate(&st.transform);
-                    let tmark = if xform != (0, 0) {
+                    // Full fragment mark for any `transform` (translate/scale/
+                    // rotate), applied to the whole box after layout.
+                    let has_xform = {
+                        let t = st.transform.trim();
+                        !t.is_empty() && !t.eq_ignore_ascii_case("none")
+                    };
+                    let tmark = if has_xform {
                         Some(mark_frag(runs, links, rects, images, controls, frames, aux))
                     } else {
                         None
@@ -1145,15 +1208,17 @@ fn walk(
                     // (single hard rect, colour faded toward the page by blur —
                     // no real gaussian blur). Drawn before the background.
                     if let Some((sdx, sdy, blur, scol)) = parse_box_shadow(&st.box_shadow) {
-                        let grow = (blur / 2).clamp(0, 24);
-                        let fade_amt = (200 - blur.clamp(0, 40) * 3).clamp(60, 200) as u8;
+                        // The painter box-blurs this rect when `blur > 0` (real
+                        // gaussian-ish falloff); the solid box is the shadow's
+                        // spread footprint at the shadow offset.
                         rects.push(RectBox {
-                            x: block_x0 + sdx - grow,
-                            y: block_y0 + sdy - grow,
-                            w: (box_w + grow * 2).max(1),
-                            h: (block_h + grow * 2).max(1),
-                            color: fade(scol, fade_amt),
-                            radius: (st.border_radius.max(0) + grow).max(0),
+                            x: block_x0 + sdx,
+                            y: block_y0 + sdy,
+                            w: box_w.max(1),
+                            h: block_h.max(1),
+                            color: scol,
+                            radius: st.border_radius.max(0),
+                            blur: blur.clamp(0, 40),
                         });
                     }
                     if let Some(bg) = st.background {
@@ -1164,6 +1229,7 @@ fn walk(
                             h: block_h,
                             color: fade(bg, st.opacity),
                             radius: st.border_radius.max(0),
+                            blur: 0,
                         });
                     }
                     aux.push_bg_box(&st, block_x0, block_y0, box_w, block_h);
@@ -1183,12 +1249,31 @@ fn walk(
                             &mut controls[c0..],
                         );
                     }
-                    // Apply `transform: translate(...)` to the whole box.
+                    // Apply `transform` (scale about the box origin, then
+                    // translate; rotate is recorded for a paint-time bitmap pass).
                     if let Some(tm) = tmark {
-                        translate_frag(
-                            tm, xform.0, xform.1, runs, links, rects, images, controls,
-                            frames, aux,
-                        );
+                        let (sx, sy) = parse_transform_scale(&st.transform);
+                        if (sx, sy) != (1.0, 1.0) {
+                            scale_frag(tm, block_x0, block_y0, sx, sy, runs, links, rects, images, controls);
+                        }
+                        let (tx, ty) = parse_transform_translate(&st.transform);
+                        if (tx, ty) != (0, 0) {
+                            translate_frag(tm, tx, ty, runs, links, rects, images, controls, frames, aux);
+                        }
+                        let rot = parse_transform_rotate(&st.transform);
+                        if rot.abs() > 0.01 {
+                            let (bx, by, bw2, bh2) =
+                                frag_bbox(tm, runs, links, rects, images, controls, frames, aux);
+                            aux.rotates.push(RotateOp {
+                                cx: (bx + bw2) / 2,
+                                cy: (by + bh2) / 2,
+                                angle_deg: rot,
+                                x: bx,
+                                y: by,
+                                w: (bw2 - bx).max(1),
+                                h: (bh2 - by).max(1),
+                            });
+                        }
                     }
                     cur.max_w = old_max;
                     cur.margin_x = old_margin_x;
@@ -1485,6 +1570,7 @@ fn layout_flex_grid_container(
             h: 1,
             color: bg,
             radius: 0,
+            blur: 0,
         });
         i
     });
@@ -1496,6 +1582,7 @@ fn layout_flex_grid_container(
         w: i32,
         h: i32,
         grow: u32,
+        order: i32,
     }
     let mut items: Vec<Item> = Vec::with_capacity(children.len());
 
@@ -1517,8 +1604,11 @@ fn layout_flex_grid_container(
             _ => continue,
         };
         let cst = css::compute(sheet, ctag, cid, cclass, cstyle, st);
+        // `flex-basis` is the item's initial main size (overrides `width`).
         let item_w = cst
-            .width
+            .flex_basis
+            .filter(|&b| b > 0)
+            .or(cst.width)
             .or(cst.max_width)
             .unwrap_or(default_item_w)
             // `container_w` can be below the 16px floor for a deeply-nested or
@@ -1545,6 +1635,10 @@ fn layout_flex_grid_container(
             margin_x: 0,
             line_h,
             content_bottom: 0,
+            float_l_w: 0,
+            float_l_bottom: 0,
+            float_r_w: 0,
+            float_r_bottom: 0,
         };
         walk(
             child,
@@ -1599,17 +1693,23 @@ fn layout_flex_grid_container(
             w,
             h,
             grow,
+            order: cst.order,
         });
     }
+    // `order` reorders flex/grid items visually (stable within equal order).
+    let mut visual: Vec<usize> = (0..items.len()).collect();
+    visual.sort_by_key(|&i| (items[i].order, i));
 
     let mut content_h = line_h;
     let mut content_w = container_w;
 
     match st.display {
         DisplayMode::Flex => {
-            let widths: Vec<i32> = items.iter().map(|it| it.w).collect();
-            let heights: Vec<i32> = items.iter().map(|it| it.h).collect();
-            let grows: Vec<u32> = items.iter().map(|it| it.grow).collect();
+            // Arrays in visual (`order`-sorted) sequence; a placement's index
+            // maps back through `visual` to the real item's fragment.
+            let widths: Vec<i32> = visual.iter().map(|&i| items[i].w).collect();
+            let heights: Vec<i32> = visual.iter().map(|&i| items[i].h).collect();
+            let grows: Vec<u32> = visual.iter().map(|&i| items[i].grow).collect();
             let container_h = st.height.unwrap_or(10_000).max(1);
             let placed = flex::flex_place(
                 &widths,
@@ -1627,7 +1727,7 @@ fn layout_flex_grid_container(
             let mut max_x = container_w;
             let mut max_y = line_h;
             for p in &placed {
-                if let Some(it) = items.get(p.index) {
+                if let Some(it) = visual.get(p.index).and_then(|&i| items.get(i)) {
                     let dx = box_x + p.x - it.x0;
                     let dy = box_y + p.y - it.y0;
                     translate_frag(it.mark, dx, dy, runs, links, rects, images, controls, frames, aux);
@@ -1668,15 +1768,31 @@ fn layout_flex_grid_container(
                 }
                 content_h = max_y;
             } else {
-                for (i, it) in items.iter().enumerate() {
-                    let (gx, gy) = flex::grid_cell(i, cols, cell_w, cell_h, gap);
-                    let ix = flex::flex_cross_offset(it.w.min(cell_w), cell_w, st.align_items);
+                // Real track sizing (`fr`/px/auto) + per-column x offsets, and
+                // `order`-sorted placement.
+                let track_w =
+                    flex::grid_track_widths(&st.grid_template, container_w, gap, cols as usize);
+                let ncols = track_w.len().max(1);
+                let mut col_x = Vec::with_capacity(ncols);
+                let mut acc = 0;
+                for tw in &track_w {
+                    col_x.push(acc);
+                    acc += tw + gap;
+                }
+                for (slot, &vi) in visual.iter().enumerate() {
+                    let it = &items[vi];
+                    let col = slot % ncols;
+                    let row = slot / ncols;
+                    let cw = track_w[col];
+                    let gx = col_x[col];
+                    let gy = row as i32 * (cell_h + gap);
+                    let ix = flex::flex_cross_offset(it.w.min(cw), cw, st.align_items);
                     let iy = flex::flex_cross_offset(it.h.min(cell_h), cell_h, st.align_items);
                     let dx = box_x + gx + ix - it.x0;
                     let dy = box_y + gy + iy - it.y0;
                     translate_frag(it.mark, dx, dy, runs, links, rects, images, controls, frames, aux);
                 }
-                let rows = (items.len() + cols as usize - 1) / cols as usize;
+                let rows = (items.len() + ncols - 1) / ncols;
                 content_h = if rows == 0 {
                     line_h
                 } else {
@@ -1827,8 +1943,16 @@ fn block_after(cur: &mut Cursor, gap: i32) {
 }
 
 fn new_line(cur: &mut Cursor) {
-    cur.x = cur.margin_x;
     cur.y += cur.line_h;
+    // Retire floats whose exclusion ends above the new line.
+    if cur.y >= cur.float_l_bottom {
+        cur.float_l_w = 0;
+    }
+    if cur.y >= cur.float_r_bottom {
+        cur.float_r_w = 0;
+    }
+    // Following lines flow beside an active left float (wrap-around).
+    cur.x = cur.margin_x + cur.float_l_w;
     cur.content_bottom = cur.content_bottom.max(cur.y);
 }
 
@@ -1954,6 +2078,101 @@ fn parse_transform_translate(s: &str) -> (i32, i32) {
         ty = css::parse_px(a).unwrap_or(ty);
     }
     (tx, ty)
+}
+
+/// `(scale_x, scale_y)` from a `transform` (`scale(s)`, `scale(sx,sy)`,
+/// `scaleX/scaleY`). Defaults to `(1.0, 1.0)`.
+fn parse_transform_scale(s: &str) -> (f32, f32) {
+    let low = s.to_ascii_lowercase();
+    let arg = |key: &str| -> Option<&str> {
+        let start = low.find(key)? + key.len();
+        let end = low[start..].find(')')? + start;
+        Some(low[start..end].trim())
+    };
+    let (mut sx, mut sy) = (1.0f32, 1.0f32);
+    if let Some(a) = arg("scale(") {
+        let mut it = a.split(',');
+        sx = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(1.0);
+        sy = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(sx);
+    }
+    if let Some(a) = arg("scalex(") {
+        sx = a.parse().unwrap_or(sx);
+    }
+    if let Some(a) = arg("scaley(") {
+        sy = a.parse().unwrap_or(sy);
+    }
+    (sx.clamp(0.05, 20.0), sy.clamp(0.05, 20.0))
+}
+
+/// Rotation in degrees from a `transform: rotate(<deg>)` (`deg`/`rad`/`turn`).
+fn parse_transform_rotate(s: &str) -> f32 {
+    let low = s.to_ascii_lowercase();
+    let start = match low.find("rotate(") {
+        Some(i) => i + 7,
+        None => return 0.0,
+    };
+    let end = match low[start..].find(')') {
+        Some(i) => i + start,
+        None => return 0.0,
+    };
+    let a = low[start..end].trim();
+    if let Some(v) = a.strip_suffix("deg") {
+        v.trim().parse().unwrap_or(0.0)
+    } else if let Some(v) = a.strip_suffix("turn") {
+        v.trim().parse::<f32>().unwrap_or(0.0) * 360.0
+    } else if let Some(v) = a.strip_suffix("rad") {
+        v.trim().parse::<f32>().unwrap_or(0.0) * 180.0 / core::f32::consts::PI
+    } else {
+        a.parse().unwrap_or(0.0)
+    }
+}
+
+/// Scale a fragment's primitives about `(ox, oy)` by `(sx, sy)` (text size and
+/// positions/box dimensions). Mirrors `translate_frag`'s slice handling.
+fn scale_frag(
+    start: FragMark,
+    ox: i32,
+    oy: i32,
+    sx: f32,
+    sy: f32,
+    runs: &mut [TextRun],
+    links: &mut [LinkBox],
+    rects: &mut [RectBox],
+    images: &mut [ImageBox],
+    controls: &mut [FormControl],
+) {
+    let px = |v: i32, o: i32, s: f32| o + ((v - o) as f32 * s) as i32;
+    let sz = |v: i32, s: f32| ((v as f32 * s) as i32).max(1);
+    for r in &mut runs[start.runs..] {
+        r.x = px(r.x, ox, sx);
+        r.y = px(r.y, oy, sy);
+        r.font_size = sz(r.font_size, sy);
+    }
+    for b in &mut links[start.links..] {
+        b.x = px(b.x, ox, sx);
+        b.y = px(b.y, oy, sy);
+        b.w = sz(b.w, sx);
+        b.h = sz(b.h, sy);
+    }
+    for rc in &mut rects[start.rects..] {
+        rc.x = px(rc.x, ox, sx);
+        rc.y = px(rc.y, oy, sy);
+        rc.w = sz(rc.w, sx);
+        rc.h = sz(rc.h, sy);
+        rc.radius = sz(rc.radius, (sx + sy) / 2.0);
+    }
+    for im in &mut images[start.images..] {
+        im.x = px(im.x, ox, sx);
+        im.y = px(im.y, oy, sy);
+        im.w = sz(im.w, sx);
+        im.h = sz(im.h, sy);
+    }
+    for c in &mut controls[start.controls..] {
+        c.x = px(c.x, ox, sx);
+        c.y = px(c.y, oy, sy);
+        c.w = sz(c.w, sx);
+        c.h = sz(c.h, sy);
+    }
 }
 
 /// Parse the first shadow of a `box-shadow` value into `(dx, dy, blur, color)`.
@@ -2120,7 +2339,11 @@ fn emit_text(
         let w = (crate::font_ttf::measure(&word, px) + 0.5) as i32
             + ls * (word.chars().count() as i32);
         let w = w.max(1);
-        if !no_wrap && cur.x > cur.margin_x && cur.x + w > cur.margin_x + cur.max_w {
+        // Right boundary shrinks by an active `float:right` exclusion; the line
+        // start includes an active `float:left` push.
+        let line_start = cur.margin_x + cur.float_l_w;
+        let line_right = cur.margin_x + cur.max_w - cur.float_r_w;
+        if !no_wrap && cur.x > line_start && cur.x + w > line_right {
             new_line(cur);
             if word == " " {
                 continue;
@@ -2316,6 +2539,58 @@ mod tests {
         let (a, b) = (&lay.controls[0], &lay.controls[1]);
         assert_eq!(a.y, b.y, "adjacent controls share a line");
         assert!(b.x >= a.x + a.w, "second control is to the right of the first");
+    }
+
+    #[test_case]
+    fn parse_transform_scale_and_rotate() {
+        assert_eq!(parse_transform_scale("scale(2)"), (2.0, 2.0));
+        assert_eq!(parse_transform_scale("scale(1.5, 0.5)"), (1.5, 0.5));
+        assert_eq!(parse_transform_scale("scaleX(3)"), (3.0, 1.0));
+        assert_eq!(parse_transform_scale("translate(5px)"), (1.0, 1.0));
+        assert!((parse_transform_rotate("rotate(90deg)") - 90.0).abs() < 0.01);
+        assert!((parse_transform_rotate("rotate(0.5turn)") - 180.0).abs() < 0.01);
+        assert_eq!(parse_transform_rotate("scale(2)"), 0.0);
+    }
+
+    #[test_case]
+    fn transform_scale_grows_font_and_offsets() {
+        let doc = html::parse(
+            r#"<html><body><div style="transform:scale(2)"><p>big</p></div></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let base = css::compute(&sheet, "p", None, None, None, &css::ComputedStyle::default()).font_size;
+        let big = lay.runs.iter().find(|r| r.text == "big").expect("big");
+        assert!(big.font_size > base, "scaled font {} > base {}", big.font_size, base);
+    }
+
+    #[test_case]
+    fn flex_order_reorders_items() {
+        // The second child has order:-1 so it lays out first (leftmost).
+        let doc = html::parse(
+            r#"<html><body><div style="display:flex"><div>A</div><div style="order:-1">B</div></div></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let a = lay.runs.iter().find(|r| r.text == "A").expect("A");
+        let b = lay.runs.iter().find(|r| r.text == "B").expect("B");
+        assert!(b.x < a.x, "order:-1 item B (x={}) is left of A (x={})", b.x, a.x);
+    }
+
+    #[test_case]
+    fn grid_tracks_parse_and_size() {
+        use css::GridTrack;
+        assert_eq!(
+            css::parse_grid_tracks("1fr 2fr 100px"),
+            alloc::vec![GridTrack::Fr(1.0), GridTrack::Fr(2.0), GridTrack::Px(100)]
+        );
+        assert_eq!(css::parse_grid_tracks("repeat(3, 1fr)").len(), 3);
+        // 100px fixed + (1fr,2fr) share the rest of 400 (gap 0): 100, 100, 200.
+        let ws = flex::grid_track_widths(
+            &[GridTrack::Px(100), GridTrack::Fr(1.0), GridTrack::Fr(2.0)],
+            400, 0, 3,
+        );
+        assert_eq!(ws, alloc::vec![100, 100, 200]);
     }
 
     #[test_case]

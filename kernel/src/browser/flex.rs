@@ -7,8 +7,43 @@
 //! flex-grow distribution, **dense grid** packing, line fragmentation (height
 //! budget clip — last line dropped when over max height).
 
-use super::css::{AlignItems, FlexDirection, Justify};
+use super::css::{AlignItems, FlexDirection, GridTrack, Justify};
 use alloc::vec::Vec;
+
+/// Resolve `grid-template-columns` tracks to pixel widths within `container`.
+/// Fixed `px` tracks take their length; the remaining free space is shared
+/// among `fr` tracks by weight, with `auto` tracks counted as `1fr`. Empty
+/// `tracks` falls back to `cols` equal columns.
+pub fn grid_track_widths(tracks: &[GridTrack], container: i32, gap: i32, cols: usize) -> Vec<i32> {
+    if tracks.is_empty() {
+        let w = grid_col_width(container, cols.max(1) as u8, gap);
+        return alloc::vec![w; cols.max(1)];
+    }
+    let n = tracks.len();
+    let total_gap = gap * (n as i32 - 1).max(0);
+    let mut fixed = 0i32;
+    let mut fr_total = 0.0f32;
+    for t in tracks {
+        match t {
+            GridTrack::Px(p) => fixed += (*p).max(0),
+            GridTrack::Fr(f) => fr_total += f.max(0.0),
+            GridTrack::Auto => fr_total += 1.0,
+        }
+    }
+    let free = (container - total_gap - fixed).max(0) as f32;
+    tracks
+        .iter()
+        .map(|t| {
+            let w = match t {
+                GridTrack::Px(p) => (*p).max(0) as f32,
+                GridTrack::Fr(f) if fr_total > 0.0 => free * f.max(0.0) / fr_total,
+                GridTrack::Auto if fr_total > 0.0 => free / fr_total,
+                _ => 0.0,
+            };
+            (w as i32).max(1)
+        })
+        .collect()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FlexWrap {

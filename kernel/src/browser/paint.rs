@@ -29,9 +29,11 @@ pub fn paint_chrome(layout: &Layout, scroll_y: i32, chrome: Chrome) -> Vec<u32> 
     let h = layout.height.max(1) as usize;
     let mut buf = vec![layout.bg; w * h];
 
-    // Background rects under content (rounded when `border-radius` is set).
+    // Background rects under content (blurred shadow / rounded / square).
     for r in &layout.rects {
-        if r.radius > 0 {
+        if r.blur > 0 {
+            paint_blur_shadow(&mut buf, w, h, r, scroll_y);
+        } else if r.radius > 0 {
             fill_round_rect(&mut buf, w, h, r.x, r.y - scroll_y, r.w, r.h, r.color, r.radius);
         } else {
             fill_rect(&mut buf, w, h, r.x, r.y - scroll_y, r.w, r.h, r.color);
@@ -177,6 +179,11 @@ pub fn paint_chrome(layout: &Layout, scroll_y: i32, chrome: Chrome) -> Vec<u32> 
                 }
             }
         }
+    }
+
+    // `transform: rotate(...)` — rotate each element's rendered box in place.
+    for op in &layout.rotates {
+        rotate_region(&mut buf, w, h, op, layout.bg, scroll_y);
     }
 
     if chrome.scrollbar {
@@ -339,6 +346,204 @@ fn blit_image(
             let sx = (col as usize * sw) / dw as usize;
             let p = src[sy * sw + sx];
             put(buf, bw, bh, dx + col, dy + row, p);
+        }
+    }
+}
+
+/// Is local point `(lx, ly)` inside the rounded rect `[0,rw)×[0,rh)` with corner
+/// `radius`? Used to build a box-shadow coverage mask.
+fn inside_round_rect(lx: i32, ly: i32, rw: i32, rh: i32, radius: i32) -> bool {
+    if lx < 0 || ly < 0 || lx >= rw || ly >= rh {
+        return false;
+    }
+    let r = radius.min(rw / 2).min(rh / 2).max(0);
+    if r == 0 {
+        return true;
+    }
+    let cx = if lx < r {
+        r
+    } else if lx >= rw - r {
+        rw - r
+    } else {
+        return true;
+    };
+    let cy = if ly < r {
+        r
+    } else if ly >= rh - r {
+        rh - r
+    } else {
+        return true;
+    };
+    let (dx, dy) = ((lx - cx) as i64, (ly - cy) as i64);
+    dx * dx + dy * dy <= (r * r) as i64
+}
+
+/// Separable box blur of an 8-bit coverage mask (one horizontal + one vertical
+/// running-sum pass). Three passes approximate a Gaussian.
+fn box_blur(mask: &mut [u8], w: i32, h: i32, rad: i32) {
+    if rad < 1 || w <= 0 || h <= 0 {
+        return;
+    }
+    let win = (2 * rad + 1) as i32;
+    let mut tmp = alloc::vec![0u8; mask.len()];
+    // Horizontal.
+    for y in 0..h {
+        let row = (y * w) as usize;
+        let mut sum: i32 = 0;
+        for x in -rad..=rad {
+            if x >= 0 && x < w {
+                sum += mask[row + x as usize] as i32;
+            }
+        }
+        for x in 0..w {
+            tmp[row + x as usize] = (sum / win) as u8;
+            let add = x + rad + 1;
+            let sub = x - rad;
+            if add < w {
+                sum += mask[row + add as usize] as i32;
+            }
+            if sub >= 0 {
+                sum -= mask[row + sub as usize] as i32;
+            }
+        }
+    }
+    // Vertical.
+    for x in 0..w {
+        let mut sum: i32 = 0;
+        for y in -rad..=rad {
+            if y >= 0 && y < h {
+                sum += tmp[(y * w + x) as usize] as i32;
+            }
+        }
+        for y in 0..h {
+            mask[(y * w + x) as usize] = (sum / win) as u8;
+            let add = y + rad + 1;
+            let sub = y - rad;
+            if add < h {
+                sum += tmp[(add * w + x) as usize] as i32;
+            }
+            if sub >= 0 {
+                sum -= tmp[(sub * w + x) as usize] as i32;
+            }
+        }
+    }
+}
+
+/// Alpha-blend `color` over the pixel at `(x,y)` by `alpha` (0–255).
+fn blend_over(buf: &mut [u32], w: usize, h: usize, x: i32, y: i32, color: u32, alpha: u8) {
+    if x < 0 || y < 0 || x as usize >= w || y as usize >= h || alpha == 0 {
+        return;
+    }
+    let i = y as usize * w + x as usize;
+    let dst = buf[i];
+    let a = alpha as u32;
+    let ia = 255 - a;
+    let ch = |sh: u32| {
+        (((color >> sh) & 0xff) * a + ((dst >> sh) & 0xff) * ia) / 255 & 0xff
+    };
+    buf[i] = (ch(16) << 16) | (ch(8) << 8) | ch(0);
+}
+
+/// Render a `box-shadow` rect as a real box-blurred shadow: build a coverage
+/// mask for the (rounded) box expanded by the blur radius, blur it three times,
+/// and composite the shadow colour with the resulting alpha.
+fn paint_blur_shadow(buf: &mut [u32], w: usize, h: usize, r: &super::layout::RectBox, scroll_y: i32) {
+    let blur = r.blur.clamp(1, 40);
+    let pad = blur;
+    let (bw, bh) = (r.w + 2 * pad, r.h + 2 * pad);
+    if bw <= 0 || bh <= 0 || bw > 4096 || bh > 4096 {
+        return;
+    }
+    let (bx, by) = (r.x - pad, r.y - scroll_y - pad);
+    let mut mask = alloc::vec![0u8; (bw * bh) as usize];
+    for yy in 0..bh {
+        for xx in 0..bw {
+            if inside_round_rect(xx - pad, yy - pad, r.w, r.h, r.radius) {
+                mask[(yy * bw + xx) as usize] = 255;
+            }
+        }
+    }
+    let rad = (blur / 2).max(1);
+    for _ in 0..3 {
+        box_blur(&mut mask, bw, bh, rad);
+    }
+    for yy in 0..bh {
+        for xx in 0..bw {
+            let a = mask[(yy * bw + xx) as usize];
+            if a > 0 {
+                // Shadows are semi-opaque; scale the coverage down.
+                blend_over(buf, w, h, bx + xx, by + yy, r.color, (a as u32 * 160 / 255) as u8);
+            }
+        }
+    }
+}
+
+/// `sin(x)` (radians) — Taylor series with range reduction to `[-π, π]`; the
+/// kernel is no_std without libm trig, and rotation only needs ~1e-3 accuracy.
+fn sin_approx(x: f32) -> f32 {
+    use core::f32::consts::PI;
+    let tau = 2.0 * PI;
+    let n = (x / tau) as i32;
+    let mut r = x - n as f32 * tau;
+    if r > PI {
+        r -= tau;
+    } else if r < -PI {
+        r += tau;
+    }
+    let x2 = r * r;
+    // x - x^3/6 + x^5/120 - x^7/5040 (Horner).
+    r * (1.0 - x2 / 6.0 * (1.0 - x2 / 20.0 * (1.0 - x2 / 42.0)))
+}
+fn cos_approx(x: f32) -> f32 {
+    sin_approx(x + core::f32::consts::PI / 2.0)
+}
+
+/// Paint-time bitmap rotation for `transform: rotate(...)`: snapshot the box
+/// region (rendered axis-aligned), clear it, and re-draw it rotated about the
+/// element centre by inverse-mapping each destination pixel (nearest-neighbour).
+/// Pixels equal to the page background are treated as transparent.
+fn rotate_region(buf: &mut [u32], w: usize, h: usize, op: &super::layout::RotateOp, bg: u32, scroll_y: i32) {
+    let (x0, y0, bwi, bhi) = (op.x, op.y - scroll_y, op.w.max(1), op.h.max(1));
+    if bwi > 4096 || bhi > 4096 {
+        return;
+    }
+    // Snapshot the source box.
+    let mut src = alloc::vec![bg; (bwi * bhi) as usize];
+    for yy in 0..bhi {
+        for xx in 0..bwi {
+            let (px, py) = (x0 + xx, y0 + yy);
+            if px >= 0 && (px as usize) < w && py >= 0 && (py as usize) < h {
+                src[(yy * bwi + xx) as usize] = buf[py as usize * w + px as usize];
+            }
+        }
+    }
+    // Clear the original box (so the un-rotated copy doesn't remain).
+    for yy in 0..bhi {
+        for xx in 0..bwi {
+            put(buf, w, h, x0 + xx, y0 + yy, bg);
+        }
+    }
+    let ang = op.angle_deg * core::f32::consts::PI / 180.0;
+    let (s, c) = (sin_approx(ang), cos_approx(ang));
+    let (cxf, cyf) = (op.cx as f32, (op.cy - scroll_y) as f32);
+    // Destination bounding radius covers the rotated box. `(w+h)/2` is a safe
+    // over-estimate of the half-diagonal (√(w²+h²) ≤ w+h).
+    let diag = (bwi + bhi) / 2 + 2;
+    for dy in (op.cy - scroll_y - diag)..(op.cy - scroll_y + diag) {
+        for dx in (op.cx - diag)..(op.cx + diag) {
+            let vx = dx as f32 - cxf;
+            let vy = dy as f32 - cyf;
+            // source = centre + R(-angle)·v
+            let sx = cxf + c * vx + s * vy;
+            let sy = cyf - s * vx + c * vy;
+            let lx = sx as i32 - x0;
+            let ly = sy as i32 - y0;
+            if lx >= 0 && lx < bwi && ly >= 0 && ly < bhi {
+                let p = src[(ly * bwi + lx) as usize];
+                if p != bg {
+                    put(buf, w, h, dx, dy, p);
+                }
+            }
         }
     }
 }

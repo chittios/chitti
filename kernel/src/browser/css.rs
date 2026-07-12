@@ -95,9 +95,19 @@ pub struct ComputedStyle {
     pub align_items: AlignItems,
     /// Grid: number of equal columns when `display:grid` (from template).
     pub grid_columns: u8,
+    /// `grid-template-columns` track list (`fr`/px/auto) — richer than the
+    /// count in `grid_columns`; empty falls back to `grid_columns` equal tracks.
+    pub grid_template: Vec<GridTrack>,
     pub grid_gap: i32,
     pub flex_wrap: super::flex::FlexWrap,
     pub flex_grow: u32,
+    /// `flex-grow`'s counterpart — how much an item may shrink past its basis.
+    pub flex_shrink: u32,
+    /// `flex-basis`: the item's initial main size before grow/shrink (`None` =
+    /// `auto`, i.e. use `width`/content).
+    pub flex_basis: Option<i32>,
+    /// `order`: flex/grid item ordering (lower first; default 0).
+    pub order: i32,
     /// Dense grid packing when true.
     pub grid_dense: bool,
     /// Max content height for flex fragmentation (clip extra lines).
@@ -367,6 +377,17 @@ pub enum ObjectFit {
     ScaleDown,
 }
 
+/// A single `grid-template-columns` / `-rows` track sizing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GridTrack {
+    /// Flexible `fr` unit (share of the free space).
+    Fr(f32),
+    /// Fixed pixel length.
+    Px(i32),
+    /// `auto` / `min-content` / `max-content` — sized to remaining share.
+    Auto,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DisplayMode {
     #[default]
@@ -442,9 +463,13 @@ impl Default for ComputedStyle {
             justify_content: Justify::Start,
             align_items: AlignItems::Stretch,
             grid_columns: 1,
+            grid_template: Vec::new(),
             grid_gap: 0,
             flex_wrap: super::flex::FlexWrap::NoWrap,
             flex_grow: 0,
+            flex_shrink: 1,
+            flex_basis: None,
+            order: 0,
             grid_dense: false,
             max_height: None,
             position: Position::Static,
@@ -1073,6 +1098,59 @@ pub fn gradient_stops(v: &str) -> Vec<u32> {
     out
 }
 
+/// Parse a `grid-template-columns` value into a track list, expanding
+/// `repeat(n, …)`. Recognizes `<n>fr`, pixel lengths, and `auto`/`minmax(…)`/
+/// `min-content`/`max-content` (all treated as `Auto`).
+pub fn parse_grid_tracks(value: &str) -> Vec<GridTrack> {
+    let v = value.trim();
+    let low = v.to_ascii_lowercase();
+    let expanded: String;
+    let src: &str = if low.starts_with("repeat(") {
+        if let Some(close) = v.find(')') {
+            let inner = &v[7..close];
+            let mut it = inner.splitn(2, ',');
+            let count: usize = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(1);
+            let tmpl = it.next().unwrap_or("1fr").trim();
+            let mut s = String::new();
+            for _ in 0..count.min(48) {
+                s.push_str(tmpl);
+                s.push(' ');
+            }
+            expanded = s;
+            &expanded
+        } else {
+            v
+        }
+    } else {
+        v
+    };
+    let mut out = Vec::new();
+    for tok in src.split_whitespace() {
+        let low = tok.to_ascii_lowercase();
+        if let Some(fr) = low.strip_suffix("fr") {
+            out.push(GridTrack::Fr(fr.trim().parse().unwrap_or(1.0)));
+        } else if low == "auto"
+            || low.contains("min-content")
+            || low.contains("max-content")
+            || low.starts_with("minmax")
+            || low.starts_with("fit-content")
+        {
+            out.push(GridTrack::Auto);
+        } else if let Some(px) = parse_px(tok) {
+            out.push(GridTrack::Px(px));
+        } else {
+            out.push(GridTrack::Auto);
+        }
+        if out.len() >= 24 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        out.push(GridTrack::Fr(1.0));
+    }
+    out
+}
+
 pub fn parse_px(s: &str) -> Option<i32> {
     let s = s.trim().to_ascii_lowercase();
     if let Some(n) = s.strip_suffix("px") {
@@ -1247,19 +1325,12 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
             };
         }
         "grid-template-columns" => {
-            // Count columns: `1fr 1fr 1fr` or `repeat(3, 1fr)` or `100px 100px`
-            let v = value.trim().to_ascii_lowercase();
-            if let Some(rest) = v.strip_prefix("repeat(") {
-                let n: u8 = rest
-                    .split(',')
-                    .next()
-                    .and_then(|s| s.trim().parse().ok())
-                    .unwrap_or(1);
-                st.grid_columns = n.clamp(1, 12);
-            } else {
-                let n = v.split_whitespace().filter(|t| !t.is_empty()).count();
-                st.grid_columns = (n as u8).clamp(1, 12);
-            }
+            // Build the real track list (`1fr 2fr 100px auto`, `repeat(3, 1fr)`)
+            // so tracks can be `fr`-sized; `grid_columns` keeps the count for the
+            // fallback equal-column path.
+            let tracks = parse_grid_tracks(value);
+            st.grid_columns = (tracks.len() as u8).clamp(1, 24);
+            st.grid_template = tracks;
             st.display = DisplayMode::Grid;
         }
         "flex-wrap" => {
@@ -2008,7 +2079,49 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
             // No-op marker; real custom props use `--*`.
             let _ = value;
         }
-        "flex-shrink" | "flex-basis" | "align-content" | "align-self" | "order"
+        "order" => {
+            st.order = value.trim().parse().unwrap_or(0);
+        }
+        "flex-shrink" => {
+            st.flex_shrink = value.trim().parse().unwrap_or(1);
+        }
+        "flex-basis" => {
+            let v = value.trim();
+            st.flex_basis = if v.eq_ignore_ascii_case("auto") || v.eq_ignore_ascii_case("content") {
+                None
+            } else {
+                parse_px(v)
+            };
+        }
+        "flex" => {
+            // Shorthand `flex: grow [shrink] [basis]`.
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            match parts.as_slice() {
+                ["none"] => {
+                    st.flex_grow = 0;
+                    st.flex_shrink = 0;
+                }
+                ["auto"] => {
+                    st.flex_grow = 1;
+                    st.flex_shrink = 1;
+                }
+                _ => {
+                    if let Some(g) = parts.first().and_then(|s| s.parse().ok()) {
+                        st.flex_grow = g;
+                    }
+                    if let Some(s) = parts.get(1).and_then(|s| s.parse().ok()) {
+                        st.flex_shrink = s;
+                    }
+                    if let Some(b) = parts.get(2).and_then(|s| parse_px(s)) {
+                        st.flex_basis = Some(b);
+                    } else if parts.len() == 1 {
+                        // `flex: <number>` sets basis 0 (grow from nothing).
+                        st.flex_basis = Some(0);
+                    }
+                }
+            }
+        }
+        "align-content" | "align-self"
         | "justify-items" | "justify-self" | "place-items" | "place-content" | "grid-gap"
         | "grid-template-rows" | "grid-column" | "grid-row" | "grid-area" => {
             if name == "grid-gap" {
