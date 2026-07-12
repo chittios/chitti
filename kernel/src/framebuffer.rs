@@ -415,9 +415,12 @@ impl Pane {
             self.col = old.col.min(self.cols.saturating_sub(1));
             self.view = 0;
             self.sel = None;
-            self.fg = old.fg;
-            self.default_fg = old.default_fg;
+            // Keep the *new* theme's default_fg (set by Pane::new); only carry
+            // an explicit non-default ANSI colour across, and recolour history.
+            let old_fg = old.default_fg;
+            self.fg = if old.fg == old_fg { self.default_fg } else { old.fg };
             self.bold = old.bold;
+            self.recolor_default_fg(old_fg, self.default_fg);
             return;
         }
         // Absolute lines: scrollback then live grid rows that hold content.
@@ -464,9 +467,33 @@ impl Pane {
         self.col = (new_col as u64).min(self.cols.saturating_sub(1));
         self.view = 0;
         self.sel = None; // absolute coords are invalid after reflow
-        self.fg = old.fg;
-        self.default_fg = old.default_fg;
+        let old_fg = old.default_fg;
+        self.fg = if old.fg == old_fg { self.default_fg } else { old.fg };
         self.bold = old.bold;
+        self.recolor_default_fg(old_fg, self.default_fg);
+    }
+
+    /// Recolour adopted content after a theme switch: cells drawn in the old
+    /// theme's default foreground (plain shell/agent text — the bulk of the
+    /// scrollback) are remapped to the new theme's foreground, so switching
+    /// e.g. dark→light doesn't leave the existing history invisible (light-on-
+    /// light). Explicitly ANSI/syntax-coloured cells keep their colour.
+    fn recolor_default_fg(&mut self, old_fg: Rgb, new_fg: Rgb) {
+        if old_fg == new_fg {
+            return;
+        }
+        for c in self.grid.iter_mut() {
+            if c.1 == old_fg {
+                c.1 = new_fg;
+            }
+        }
+        for line in self.hist.iter_mut() {
+            for c in line.iter_mut() {
+                if c.1 == old_fg {
+                    c.1 = new_fg;
+                }
+            }
+        }
     }
 
     /// Drop all text content (grid + scrollback) — the `/clear` reset.
@@ -1235,10 +1262,11 @@ impl Screen {
             self.wallpaper = Some(buf);
             return;
         }
-        // Image path: read from the store, decode, stretch to fill the screen.
+        // Image path: read from the store, decode, cover-scale to fill the
+        // screen (preserve aspect, centre-crop — no stretch/distortion).
         self.wallpaper = crate::synapse::fs::read(spec)
             .and_then(|bytes| crate::image::decode(&bytes).ok())
-            .map(|img| crate::image::resize(&img, w, h))
+            .map(|img| crate::image::cover(&img, w, h))
             .map(|img| img.pixels);
     }
 
@@ -1303,6 +1331,28 @@ impl Screen {
                 row[dx as usize] = (r << 16) | (g << 8) | b;
             }
             self.blit_rgb32_row(x, sy, &row);
+        }
+    }
+
+    /// Fill a small region's background honouring a translucent wallpaper — the
+    /// cell-level analog of [`Self::paint_surface`], but with no per-call heap
+    /// allocation (cells are tiny). Text-grid cells use this so the see-through
+    /// desktop shows behind **every** cell, not only behind painted glyphs
+    /// (`blit_glyph` already blends via [`Self::bg_at`]); an opaque wallpaper /
+    /// no-wallpaper falls back to the solid [`Self::fill_rect`] fast path.
+    fn fill_cell_bg(&self, x: u64, y: u64, w: u64, h: u64, bg: Rgb) {
+        if self.wallpaper.is_none() || self.opacity >= 255 {
+            self.fill_rect(x, y, w, h, bg);
+            return;
+        }
+        for dy in 0..h {
+            let sy = y + dy;
+            if sy >= self.height {
+                break;
+            }
+            for dx in 0..w {
+                self.put_pixel(x + dx, sy, self.bg_at(x + dx, sy, bg));
+            }
         }
     }
 
@@ -1572,6 +1622,14 @@ impl Screen {
                 return; // pixels are frozen on the scrolled view
             }
         }
+        // A translucent wallpaper is a fixed backdrop — a pixel-memmove scroll
+        // would drag it up with the text. Repaint the interior from the grid
+        // over a fresh wallpaper background instead.
+        if self.wallpaper.is_some() && self.opacity < 255 {
+            self.paint_surface(p.ix, p.iy, p.cols * p.cw, p.rows * p.ch, p.bg);
+            self.render_view(p);
+            return;
+        }
         let x0 = p.ix;
         let w = p.cols * p.cw;
         let top = p.iy;
@@ -1625,7 +1683,7 @@ impl Screen {
                 let bg = if selected { self.theme.editor_sel } else { p.bg };
                 // Always fill the cell first so deselected / empty cells leave
                 // no residue (selection highlight, partial glyphs).
-                self.fill_rect(x, y, p.cw, p.ch, bg);
+                self.fill_cell_bg(x, y, p.cw, p.ch, bg);
                 if (0x21..=0x7e).contains(&b) {
                     self.blit_glyph(x, y, b, fg, bg);
                 }
@@ -1665,7 +1723,7 @@ impl Screen {
         let x = p.ix + c as u64 * p.cw;
         let y = p.iy + r as u64 * p.ch;
         let bg = if selected { self.theme.editor_sel } else { p.bg };
-        self.fill_rect(x, y, p.cw, p.ch, bg);
+        self.fill_cell_bg(x, y, p.cw, p.ch, bg);
         if (0x21..=0x7e).contains(&b) {
             self.blit_glyph(x, y, b, fg, bg);
         }
@@ -1717,7 +1775,7 @@ impl Screen {
         let (b, fg) = p.grid.get(idx).copied().unwrap_or((0, p.default_fg));
         let x = p.cell_x();
         let y = p.cell_y();
-        self.fill_rect(x, y, p.cw, p.ch, p.bg);
+        self.fill_cell_bg(x, y, p.cw, p.ch, p.bg);
         if (0x21..=0x7e).contains(&b) {
             self.blit_glyph(x, y, b, fg, p.bg);
         }
@@ -1786,7 +1844,7 @@ impl Screen {
                                 }
                             }
                             if live {
-                                s.fill_rect(p.cell_x(), p.cell_y(), (p.cols - p.col) * p.cw, p.ch, p.bg);
+                                s.fill_cell_bg(p.cell_x(), p.cell_y(), (p.cols - p.col) * p.cw, p.ch, p.bg);
                                 s.caret_draw(p); // no-op when p.has_composer
                             }
                         }
@@ -2062,7 +2120,7 @@ impl Screen {
         let hx = bx;
         let hw = bw;
         let cw = self.chat.cw;
-        self.fill_rect(hx, hy, hw, self.chat.ch, self.chat.bg);
+        self.fill_cell_bg(hx, hy, hw, self.chat.ch, self.chat.bg);
         let total_cols = (hw / cw).max(1) as usize;
         let gap = 2usize;
         let right_raw = self.composer_hint_r.chars().count();
@@ -2125,7 +2183,7 @@ impl Screen {
         let rw = right.saturating_sub(left);
         let rh = bottom.saturating_sub(top);
         if rw > 0 && rh > 0 {
-            self.fill_rect(left, top, rw, rh, self.chat.bg);
+            self.paint_surface(left, top, rw, rh, self.chat.bg);
         }
         // Restore only grid rows overlapping the erased band (not the whole pane).
         self.render_view_rows_intersecting(top, bottom);
@@ -2184,7 +2242,7 @@ impl Screen {
                 let y = p.iy + r as u64 * p.ch;
                 let selected = sel.is_some_and(|s| crate::textsel::contains(s, gi, c));
                 let bg = if selected { self.theme.editor_sel } else { p.bg };
-                self.fill_rect(x, y, p.cw, p.ch, bg);
+                self.fill_cell_bg(x, y, p.cw, p.ch, bg);
                 if (0x21..=0x7e).contains(&b) {
                     self.blit_glyph(x, y, b, fg, bg);
                 }
@@ -2223,7 +2281,7 @@ impl Screen {
         let hx = bx;
         let hw = bw;
         let cw = self.chat.cw;
-        self.fill_rect(hx, hy, hw, self.chat.ch, self.chat.bg);
+        self.fill_cell_bg(hx, hy, hw, self.chat.ch, self.chat.bg);
         let total_cols = (hw / cw).max(1) as usize;
         let gap = 2usize;
         let right_raw = self.composer_hint_r.chars().count();
@@ -2528,7 +2586,7 @@ impl Screen {
         // Update the chat frame's active state (border colour) without touching
         // its content — cheap, no blank.
         self.draw_frame(&self.chat, !self.action_focused());
-        self.fill_rect(self.logs.ix, self.logs.iy, self.logs.cols * self.logs.cw, self.logs.rows * self.logs.ch, self.logs.bg);
+        self.paint_surface(self.logs.ix, self.logs.iy, self.logs.cols * self.logs.cw, self.logs.rows * self.logs.ch, self.logs.bg);
         self.draw_frame_titled(&self.logs, self.action_focused(), "");
         self.draw_tab_bar();
         self.draw_close_btn();
@@ -3000,8 +3058,9 @@ pub fn draw_audio(v: &AudioView) {
         let wave_x = px + cw * 2;
         let wave_w = pw.saturating_sub(4 * cw).max(1);
         // Clear the full content band once so a taller previous paint (or
-        // leftover glyphs) never sticks around when the wave shrinks.
-        sc.fill_rect(px, py, pw, content_h.saturating_sub(1), bg);
+        // leftover glyphs) never sticks around when the wave shrinks —
+        // wallpaper-aware so the translucent desktop shows behind it.
+        sc.paint_surface(px, py, pw, content_h.saturating_sub(1), bg);
         let mid = wave_top + wave_h / 2;
         let n_peaks = v.peaks.len().max(1);
         let play_x = if v.total_ms > 0 {
@@ -4628,8 +4687,10 @@ pub fn editor_render(
             (sc.logs.x, sc.logs.w, sc.logs.cw, sc.logs.ch, sc.logs.cols, sc.logs.rows);
         let (ix, iy) = (sc.logs.ix, sc.logs.iy);
         sc.draw_frame_titled(&sc.logs, true, title);
-        // Clear the interior to the editor background.
-        sc.fill_rect(ix, iy, cols * cw, rows * ch, sc.theme.editor_bg);
+        // Clear the interior to the editor background — wallpaper-aware so the
+        // translucent desktop shows behind the editor too (glyphs blend via
+        // `blit_glyph`/`bg_at`).
+        sc.paint_surface(ix, iy, cols * cw, rows * ch, sc.theme.editor_bg);
         let text_rows = rows.saturating_sub(1);
         // Is text (row, col) inside the inclusive selection range?
         let in_sel = |row: usize, col: usize| -> bool {
@@ -4696,7 +4757,7 @@ pub fn editor_render(
         // Mode line across the bottom interior row — ellipsize so a long path
         // never paints past the pane edge.
         let sy = iy + text_rows * ch;
-        sc.fill_rect(px + BORDER, sy, pw - 2 * BORDER, ch, sc.theme.status_bg);
+        sc.paint_surface(px + BORDER, sy, pw - 2 * BORDER, ch, sc.theme.status_bg);
         let ml = crate::textsel::ellipsize(modeline, cols as usize);
         let mut x = ix;
         for b in ml.bytes() {
@@ -5185,6 +5246,39 @@ pub fn clear_chat() {
             sc.cursor_overlay();
         }
     });
+}
+
+#[cfg(test)]
+mod theme_switch_tests {
+    use super::dummy_pane;
+
+    #[test_case]
+    fn recolor_remaps_only_old_default_fg() {
+        let old_fg = (250, 249, 245); // dark theme's cream text
+        let new_fg = (38, 35, 31); // light theme's near-black text
+        let accent = (204, 120, 92); // an explicit ANSI/syntax colour
+        let mut p = dummy_pane();
+        // A scrollback line: plain text in old default + one accent-coloured cell.
+        p.hist.push_back(alloc::vec![(b'a', old_fg), (b'b', accent), (0, old_fg)]);
+        p.grid = alloc::vec![(b'c', old_fg)];
+        p.default_fg = new_fg; // as Pane::new set it for the new theme
+        p.recolor_default_fg(old_fg, new_fg);
+        // Default-coloured cells (incl. the empty one) move to the new fg…
+        assert_eq!(p.hist[0][0].1, new_fg);
+        assert_eq!(p.hist[0][2].1, new_fg);
+        assert_eq!(p.grid[0].1, new_fg);
+        // …the explicit accent colour is preserved.
+        assert_eq!(p.hist[0][1].1, accent);
+    }
+
+    #[test_case]
+    fn recolor_is_a_noop_when_fg_unchanged() {
+        let fg = (10, 20, 30);
+        let mut p = dummy_pane();
+        p.hist.push_back(alloc::vec![(b'x', fg)]);
+        p.recolor_default_fg(fg, fg);
+        assert_eq!(p.hist[0][0].1, fg);
+    }
 }
 
 #[cfg(test)]

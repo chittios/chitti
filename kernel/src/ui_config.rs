@@ -22,7 +22,7 @@ const ARCH: &str = "?";
 
 /// The Chitti brand colour palette (see DESIGN.md). Written into `ui.json`'s
 /// `theme` object so every colour is discoverable + overridable; the framebuffer
-/// applies them over its brand-dark default via `theme_from_pairs`.
+/// applies them over its dark default via `theme_from_pairs`.
 const THEME_DEFAULTS: &[(&str, &str)] = &[
     ("accent", "#cc785c"),       // primary — active border, caret, brand, logo
     ("screen_bg", "#181715"),    // surface-dark
@@ -105,7 +105,7 @@ impl Default for UiConfig {
             tz_offset: 0,
             splash: true,
             theme: THEME_DEFAULTS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-            theme_name: "brand-dark".to_string(),
+            theme_name: "dark".to_string(),
             syntax: SYNTAX_DEFAULTS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             cursor_fill: "#0f0f11".to_string(),
             cursor_outline: "#f5f5f8".to_string(),
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(back.opacity, 255); // clamped to a byte
         let d = UiConfig::default();
         assert_eq!(d.opacity, 255);
-        assert_eq!(d.theme_name, "brand-dark");
+        assert_eq!(d.theme_name, "dark");
         assert_eq!(d.syntax.len(), SYNTAX_DEFAULTS.len());
     }
 }

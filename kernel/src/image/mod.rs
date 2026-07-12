@@ -47,6 +47,56 @@ pub fn resize(img: &Image, nw: usize, nh: usize) -> Image {
     Image { w: nw, h: nh, pixels }
 }
 
+/// Scale `img` to **exactly** `nw`×`nh` while **covering** the target: the
+/// aspect ratio is preserved and the overflowing axis is centre-cropped
+/// (CSS `background-size: cover`) — the desktop-wallpaper fill, so a photo of a
+/// different aspect fills the screen without being stretched/distorted. Box-
+/// averages the cropped source region into each destination pixel (like
+/// [`resize`], just over a centred sub-rectangle).
+pub fn cover(img: &Image, nw: usize, nh: usize) -> Image {
+    let (nw, nh) = (nw.max(1), nh.max(1));
+    let (iw, ih) = (img.w.max(1), img.h.max(1));
+    // Largest centred source crop whose aspect matches the target.
+    let sw = core::cmp::min(iw, ih * nw / nh).max(1);
+    let sh = core::cmp::min(ih, iw * nh / nw).max(1);
+    let (ox, oy) = ((iw - sw) / 2, (ih - sh) / 2);
+    let mut pixels = Vec::with_capacity(nw * nh);
+    for y in 0..nh {
+        let sy0 = oy + y * sh / nh;
+        let sy1 = (oy + ((y + 1) * sh).div_ceil(nh)).clamp(sy0 + 1, oy + sh);
+        for x in 0..nw {
+            let sx0 = ox + x * sw / nw;
+            let sx1 = (ox + ((x + 1) * sw).div_ceil(nw)).clamp(sx0 + 1, ox + sw);
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            for sy in sy0..sy1 {
+                for sx in sx0..sx1 {
+                    let p = img.pixels[sy * iw + sx];
+                    r += (p >> 16) & 255;
+                    g += (p >> 8) & 255;
+                    b += p & 255;
+                    n += 1;
+                }
+            }
+            pixels.push(((r / n) << 16) | ((g / n) << 8) | (b / n));
+        }
+    }
+    Image { w: nw, h: nh, pixels }
+}
+
+/// Mean luma (0..=255, Rec.601) of the image — a cheap "is this too dark to see
+/// as a translucent backdrop?" probe used by the wallpaper setter.
+pub fn mean_luma(img: &Image) -> u32 {
+    if img.pixels.is_empty() {
+        return 0;
+    }
+    let mut sum = 0u64;
+    for &p in &img.pixels {
+        let (r, g, b) = ((p >> 16) & 255, (p >> 8) & 255, p & 255);
+        sum += (77 * r + 150 * g + 29 * b) as u64 >> 8;
+    }
+    (sum / img.pixels.len() as u64) as u32
+}
+
 /// The largest `(w, h)` that fits inside `(maxw, maxh)` preserving aspect
 /// ratio, never exceeding the source size (small images stay 1:1 — the
 /// compositor integer-upscales them).
@@ -155,6 +205,31 @@ mod tests {
         assert!((w as i64 * 3 - h as i64 * 4).abs() <= 4, "{}x{}", w, h);
         let (w, h) = fit(10_000, 10, 100, 100);
         assert!(w <= 100 && h == 1, "extreme aspect clamps to at least 1: {}x{}", w, h);
+    }
+
+    #[test_case]
+    fn cover_fills_target_without_distortion() {
+        // A wide 4x2 image cover-scaled into a 2x2 square must centre-crop the
+        // sides (never squash), so the output is exactly 2x2 and samples the
+        // middle columns, not the edges.
+        //   row0: 10 20 30 40    row1: 50 60 70 80
+        let img = Image { w: 4, h: 2, pixels: alloc::vec![10, 20, 30, 40, 50, 60, 70, 80] };
+        let c = cover(&img, 2, 2);
+        assert_eq!((c.w, c.h), (2, 2), "output is exactly target-sized");
+        // Aspect-matched crop of a 4x2 into a 2x2 (aspect 1:1) keeps the centre
+        // 2 columns (cols 1,2) → values {20,30,60,70}; edges 10,40,50,80 dropped.
+        for p in &c.pixels {
+            assert!(![10, 40, 50, 80].contains(p), "edge column leaked: {p}");
+        }
+    }
+
+    #[test_case]
+    fn mean_luma_black_and_white() {
+        let black = Image { w: 2, h: 2, pixels: alloc::vec![0, 0, 0, 0] };
+        assert_eq!(mean_luma(&black), 0);
+        let white = Image { w: 2, h: 2, pixels: alloc::vec![0xffffff; 4] };
+        assert!(mean_luma(&white) >= 254, "white ≈ 255: {}", mean_luma(&white));
+        assert_eq!(mean_luma(&Image { w: 0, h: 0, pixels: alloc::vec![] }), 0);
     }
 
     #[test_case]

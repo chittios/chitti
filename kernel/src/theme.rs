@@ -21,8 +21,8 @@ const THEMES_DIR: &str = "/configs/themes";
 /// Themes compiled into the image (`assets/themes/<name>.json`). Installed
 /// themes with the same name (in the store) override these.
 pub static BUNDLED_THEMES: &[(&str, &str)] = &[
-    ("brand-dark", include_str!("../../assets/themes/brand-dark.json")),
-    ("brand-light", include_str!("../../assets/themes/brand-light.json")),
+    ("dark", include_str!("../../assets/themes/dark.json")),
+    ("light", include_str!("../../assets/themes/light.json")),
     ("solarized-dark", include_str!("../../assets/themes/solarized-dark.json")),
     ("nord", include_str!("../../assets/themes/nord.json")),
     ("dracula", include_str!("../../assets/themes/dracula.json")),

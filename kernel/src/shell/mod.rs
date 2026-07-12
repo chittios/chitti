@@ -6648,8 +6648,26 @@ fn set_wallpaper_cmd(rest: &str) {
     let now = crate::ui_config::current().wallpaper;
     if now.is_empty() {
         serial_println!("theme> wallpaper cleared (solid background)");
-    } else {
-        serial_println!("theme> wallpaper set: {}", now);
+        return;
+    }
+    serial_println!("theme> wallpaper set: {}", now);
+    // A translucent backdrop only reads if the image is bright enough. Probe an
+    // image wallpaper's mean luma and nudge the user when it'll be near-black —
+    // otherwise "I set a wallpaper and nothing changed" looks like a bug.
+    let op = crate::ui_config::current().opacity;
+    if !now.starts_with("gradient:") {
+        if let Some(luma) = crate::synapse::fs::read(&now)
+            .and_then(|b| crate::image::decode(&b).ok())
+            .map(|img| crate::image::mean_luma(&img))
+        {
+            if luma < 40 {
+                serial_println!(
+                    "theme> note: this image is very dark (mean brightness {}/255) — blended at opacity {} \
+                     it will look near-black. Try a brighter image, or a lower opacity to let more of it through.",
+                    luma, op
+                );
+            }
+        }
     }
 }
 
