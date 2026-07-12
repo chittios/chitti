@@ -1695,14 +1695,28 @@ fn json_escape_into(out: &mut String, v: &str) {
 /// Synapse Router can shape-validate (not a flattened shell line).
 pub(crate) fn parse_tool_call(text: &str) -> Option<(alloc::string::String, alloc::string::String)> {
     use alloc::string::ToString;
-    // Qwen template.
+    // Qwen template. Parse only the FIRST tool call and only its own JSON
+    // object: a model can emit several `<tool_call>` blocks in one turn (some
+    // finetunes concatenate them, sometimes without closing the first), and the
+    // old code took `name` from the first object but scanned the whole span for
+    // `"arguments"` — so a later block's args leaked in (`/read {"name":"pdf"}`).
     if let Some(start) = text.find("<tool_call>") {
-        let body = &text[start + "<tool_call>".len()..];
-        let body = body.split("</tool_call>").next().unwrap_or(body);
-        if let Some(name) = json_str(body, "name") {
+        let after = &text[start + "<tool_call>".len()..];
+        // Bound the block at whichever comes first: the close tag, or a second
+        // (concatenated) open tag — never merge two calls into one.
+        let close = after.find("</tool_call>").unwrap_or(after.len());
+        let next_open = after.find("<tool_call>").unwrap_or(after.len());
+        let block = &after[..close.min(next_open)];
+        // Isolate the first balanced `{…}` so trailing garbage / a second
+        // object can't contribute a `name` or `arguments` to this call.
+        let obj = block
+            .find('{')
+            .and_then(|b| extract_balanced_json_object(&block[b..]))
+            .unwrap_or_else(|| block.to_string());
+        if let Some(name) = json_str(&obj, "name") {
             let name = name.trim().trim_start_matches('/').to_string();
             if !name.is_empty() {
-                return Some((name, extract_arguments_json(body)));
+                return Some((name, extract_arguments_json(&obj)));
             }
         }
     }
@@ -2952,15 +2966,19 @@ impl ChatSession {
     fn turn(&mut self, msg: &str, session: &mut crate::agent::types::Session) -> alloc::string::String {
         use crate::agent::orchestrator::now;
         use crate::agent::types::{Provenance, Role, ToolCall};
-        // Per-turn tool-call ceiling (interactive); never exceed the session budget.
-        const MAX_TOOLS_PER_TURN: u32 = 8;
+        // Per-message tool-call ceiling. The shell is a human-driven REPL, not a
+        // bounded autonomous agent, so the session's *cumulative* max_turns /
+        // max_tool_calls (meant for sub-agents) must NOT gate it — otherwise
+        // tool_calls_used/turns_used accrue across messages (and reboots) until
+        // every basic task dies with "budget reached". Reset the per-message
+        // counters here so this ceiling is the real bound; the human (Ctrl+C)
+        // owns everything above it.
+        const MAX_TOOLS_PER_TURN: u32 = 16;
         self.cancelled = false;
 
         let limits = session.budget.limits;
-        if session.budget.turns_used >= limits.max_turns {
-            serial_println!("\x1b[33m[stopped: turn budget exhausted]\x1b[0m");
-            return alloc::string::String::from("stopped: turn budget exhausted");
-        }
+        session.budget.tool_calls_used = 0;
+        session.budget.turns_used = 0;
         session.push_message(Role::User, msg.into(), Provenance::UserTyped, now());
         session.budget.turns_used = session.budget.turns_used.saturating_add(1);
 
@@ -11445,6 +11463,39 @@ mod agent_flow_tests {
             parse_tool_call("<tool_call>{\"name\":\"memory_get\",\"arguments\":{\"key\":\"colour\"}}</tool_call>").unwrap();
         assert_eq!(name, "memory_get");
         assert!(args.contains("colour"), "got {args}");
+    }
+
+    /// A model that emits several tool calls in one turn (some finetunes
+    /// concatenate them, sometimes without closing the first `<tool_call>`)
+    /// must yield only the FIRST call, with only its own arguments — never
+    /// `name` from block 1 merged with `arguments` from block 2.
+    #[test_case]
+    fn parse_tool_call_first_call_only_no_arg_bleed() {
+        // Two concatenated calls; the first has no arguments. Must be
+        // ("read", "{}") — NOT ("read", {"name":"pdf"}) from the skill call.
+        let (name, args) = parse_tool_call(
+            "<tool_call>\n{\"name\": \"read\"}<tool_call>{\"name\": \"skill\", \"arguments\": {\"name\":\"pdf\"}}</tool_call>",
+        )
+        .unwrap();
+        assert_eq!(name, "read");
+        assert_eq!(args, "{}", "second call's args must not leak in: got {args}");
+        assert!(!args.contains("pdf"), "leaked skill args: {args}");
+
+        // Both blocks well-formed and closed → still only the first call's args.
+        let (name, args) = parse_tool_call(
+            "<tool_call>{\"name\":\"memory_search\"}</tool_call><tool_call>{\"name\":\"grep\",\"arguments\":{\"args\":\"pdf\"}}</tool_call>",
+        )
+        .unwrap();
+        assert_eq!(name, "memory_search");
+        assert_eq!(args, "{}", "got {args}");
+
+        // A single well-formed call still parses its own args (no regression).
+        let (name, args) = parse_tool_call(
+            "<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"/agent/doc.pdf\"}}</tool_call>",
+        )
+        .unwrap();
+        assert_eq!(name, "read");
+        assert!(args.contains("/agent/doc.pdf"), "got {args}");
     }
 
     #[test_case]
