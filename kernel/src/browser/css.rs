@@ -209,6 +209,35 @@ pub struct ComputedStyle {
     pub clear: ClearMode,
     /// `content` string for generated content (quotes stripped).
     pub content: String,
+    // --- Popular properties that used to be recognized-only (no ComputedStyle
+    // effect). Now cascade-stored; a few have real render effects (`zoom`,
+    // `border-spacing`, `text-wrap:nowrap`), the rest are honored where a
+    // subsystem exists (SVG stroke, animation) and otherwise inert-but-correct.
+    /// `zoom` scale factor (1.0 = none) — applied like `transform: scale`.
+    pub zoom: f32,
+    /// `border-spacing` between table cells, px.
+    pub border_spacing: i32,
+    /// `text-wrap` (`wrap`/`nowrap`/`balance`/`pretty`); `nowrap` suppresses
+    /// line breaking like `white-space:nowrap`.
+    pub text_wrap: String,
+    /// `stroke-dashoffset` (SVG), px.
+    pub stroke_dashoffset: i32,
+    /// `backface-visibility: hidden` hides a back-facing (rotated) box.
+    pub backface_hidden: bool,
+    // Cascade-stored strings (small value sets; empty default doesn't allocate).
+    pub font_variant: String,
+    pub font_stretch: String,
+    pub font_feature_settings: String,
+    pub font_variation_settings: String,
+    pub animation_fill_mode: String,
+    pub animation_iteration_count: String,
+    pub stroke_dasharray: String,
+    pub contain: String,
+    pub color_scheme: String,
+    pub scroll_behavior: String,
+    pub overscroll_behavior: String,
+    pub forced_color_adjust: String,
+    pub container_type: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -562,6 +591,24 @@ impl Default for ComputedStyle {
             table_layout: String::new(),
             clear: ClearMode::None,
             content: String::new(),
+            zoom: 1.0,
+            border_spacing: 0,
+            text_wrap: String::new(),
+            stroke_dashoffset: 0,
+            backface_hidden: false,
+            font_variant: String::new(),
+            font_stretch: String::new(),
+            font_feature_settings: String::new(),
+            font_variation_settings: String::new(),
+            animation_fill_mode: String::new(),
+            animation_iteration_count: String::new(),
+            stroke_dasharray: String::new(),
+            contain: String::new(),
+            color_scheme: String::new(),
+            scroll_behavior: String::new(),
+            overscroll_behavior: String::new(),
+            forced_color_adjust: String::new(),
+            container_type: String::new(),
         }
     }
 }
@@ -1558,9 +1605,9 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
             }
         }
         "transition-timing-function" => st.transition_timing = value.trim().to_string(),
-        "animation-fill-mode" | "animation-iteration-count" => {
-            // cascade accept
-            let _ = value;
+        "animation-fill-mode" => st.animation_fill_mode = value.trim().to_ascii_lowercase(),
+        "animation-iteration-count" => {
+            st.animation_iteration_count = value.trim().to_ascii_lowercase()
         }
         "flex-flow" => {
             // flex-flow: <direction> || <wrap>
@@ -1583,22 +1630,48 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
             }
         }
         "border-spacing" => {
-            let _ = parse_px(value);
+            st.border_spacing = parse_px(value.split_whitespace().next().unwrap_or(value))
+                .unwrap_or(0)
+                .max(0);
         }
-        "font-stretch" | "font-variant" | "font-feature-settings" | "font-variation-settings" => {
-            let _ = value;
-        }
+        "font-variant" => st.font_variant = value.trim().to_ascii_lowercase(),
+        "font-stretch" => st.font_stretch = value.trim().to_ascii_lowercase(),
+        "font-feature-settings" => st.font_feature_settings = value.trim().to_string(),
+        "font-variation-settings" => st.font_variation_settings = value.trim().to_string(),
         "object-position" => st.object_position = value.trim().to_string(),
         "mask" => st.mask = value.trim().to_string(),
         "mask-image" => st.mask = value.trim().to_string(),
         "table-layout" => st.table_layout = value.trim().to_ascii_lowercase(),
-        "zoom" | "contain" | "color-scheme" | "scroll-behavior" | "backface-visibility"
-        | "text-wrap" | "forced-color-adjust" | "container-type" | "overscroll-behavior" => {
-            let _ = value;
+        "zoom" => {
+            // `zoom: 1.5` or `zoom: 150%`.
+            let v = value.trim();
+            st.zoom = if let Some(p) = v.strip_suffix('%') {
+                p.trim().parse::<f32>().map(|n| n / 100.0).unwrap_or(1.0)
+            } else if v.eq_ignore_ascii_case("normal") || v.eq_ignore_ascii_case("reset") {
+                1.0
+            } else {
+                v.parse::<f32>().unwrap_or(1.0)
+            }
+            .clamp(0.1, 10.0);
         }
-        "stroke-dasharray" | "stroke-dashoffset" => {
-            let _ = value;
+        "text-wrap" => {
+            let v = value.trim().to_ascii_lowercase();
+            if v == "nowrap" {
+                st.white_space = WhiteSpace::Nowrap;
+            }
+            st.text_wrap = v;
         }
+        "backface-visibility" => {
+            st.backface_hidden = value.trim().eq_ignore_ascii_case("hidden");
+        }
+        "contain" => st.contain = value.trim().to_ascii_lowercase(),
+        "color-scheme" => st.color_scheme = value.trim().to_ascii_lowercase(),
+        "scroll-behavior" => st.scroll_behavior = value.trim().to_ascii_lowercase(),
+        "forced-color-adjust" => st.forced_color_adjust = value.trim().to_ascii_lowercase(),
+        "container-type" => st.container_type = value.trim().to_ascii_lowercase(),
+        "overscroll-behavior" => st.overscroll_behavior = value.trim().to_ascii_lowercase(),
+        "stroke-dasharray" => st.stroke_dasharray = value.trim().to_string(),
+        "stroke-dashoffset" => st.stroke_dashoffset = parse_px(value).unwrap_or(0),
         "margin-inline-start" | "margin-inline-end" | "padding-inline" | "padding-inline-start"
         | "padding-inline-end" | "padding-block" | "inset-inline-start" => {
             // Logical props → approximate physical LTR.
@@ -2163,6 +2236,8 @@ pub fn compute(
     st.line_height = parent.line_height;
     st.white_space = parent.white_space;
     st.text_transform = parent.text_transform;
+    st.border_spacing = parent.border_spacing; // inherited (table property)
+    st.color_scheme = parent.color_scheme.clone();
     // Tag UA defaults (simplified user-agent stylesheet).
     match tag {
         "h1" => {
@@ -2665,6 +2740,43 @@ mod tests {
         assert_eq!(parse_color("#f00"), Some(0xff0000));
         assert_eq!(parse_color("blue"), Some(0x0000ff));
         assert_eq!(parse_color("rgb(1, 2, 3)"), Some(0x010203));
+    }
+
+    #[test_case]
+    fn recognized_only_props_now_store() {
+        let mut st = ComputedStyle::default();
+        apply_one(&mut st, "zoom", "150%");
+        assert!((st.zoom - 1.5).abs() < 0.001, "zoom 150% → 1.5");
+        apply_one(&mut st, "border-spacing", "6px");
+        assert_eq!(st.border_spacing, 6);
+        apply_one(&mut st, "text-wrap", "nowrap");
+        assert_eq!(st.white_space, WhiteSpace::Nowrap, "text-wrap:nowrap → nowrap");
+        apply_one(&mut st, "backface-visibility", "hidden");
+        assert!(st.backface_hidden);
+        apply_one(&mut st, "font-feature-settings", "\"liga\" 1");
+        assert_eq!(st.font_feature_settings, "\"liga\" 1");
+        apply_one(&mut st, "animation-iteration-count", "infinite");
+        assert_eq!(st.animation_iteration_count, "infinite");
+        apply_one(&mut st, "stroke-dashoffset", "4px");
+        assert_eq!(st.stroke_dashoffset, 4);
+        apply_one(&mut st, "container-type", "inline-size");
+        assert_eq!(st.container_type, "inline-size");
+    }
+
+    #[test_case]
+    fn vendor_prefix_aliases_canonicalize() {
+        // `-webkit-*` / `alias-*` / historical names re-dispatch to the standard
+        // property, so the popular alias set is honored.
+        let mut st = ComputedStyle::default();
+        apply_one(&mut st, "-webkit-border-radius", "9px");
+        assert_eq!(st.border_radius, 9);
+        apply_one(&mut st, "-webkit-box-sizing", "border-box");
+        assert_eq!(st.box_sizing, BoxSizing::BorderBox);
+        apply_one(&mut st, "-webkit-transform", "translate(4px,0)");
+        assert!(st.transform.contains("translate"));
+        apply_one(&mut st, "word-wrap", "break-word"); // → overflow-wrap
+        apply_one(&mut st, "-webkit-flex-direction", "column");
+        assert_eq!(st.flex_direction, FlexDirection::Column);
     }
 
     #[test_case]

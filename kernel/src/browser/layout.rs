@@ -1087,7 +1087,13 @@ fn walk(
                         );
                     }
                     cur.max_w = old_max;
-                    emit_text("  ", cur, runs, links, None, &st);
+                    // Inter-cell gap: `border-spacing` (inherited from the table)
+                    // when set, else the default two-space gutter.
+                    if st.border_spacing > 0 {
+                        cur.x += st.border_spacing;
+                    } else {
+                        emit_text("  ", cur, runs, links, None, &st);
+                    }
                 }
                 "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "p" | "div" | "blockquote"
                 | "section" | "article" | "li" | "header" | "footer" | "main" | "nav"
@@ -1167,7 +1173,8 @@ fn walk(
                     // rotate), applied to the whole box after layout.
                     let has_xform = {
                         let t = st.transform.trim();
-                        !t.is_empty() && !t.eq_ignore_ascii_case("none")
+                        (!t.is_empty() && !t.eq_ignore_ascii_case("none"))
+                            || (st.zoom - 1.0).abs() > 0.001
                     };
                     let tmark = if has_xform {
                         Some(mark_frag(runs, links, rects, images, controls, frames, aux))
@@ -1252,7 +1259,10 @@ fn walk(
                     // Apply `transform` (scale about the box origin, then
                     // translate; rotate is recorded for a paint-time bitmap pass).
                     if let Some(tm) = tmark {
+                        // `zoom` scales the box like an extra uniform scale.
+                        let z = st.zoom;
                         let (sx, sy) = parse_transform_scale(&st.transform);
+                        let (sx, sy) = (sx * z, sy * z);
                         if (sx, sy) != (1.0, 1.0) {
                             scale_frag(tm, block_x0, block_y0, sx, sy, runs, links, rects, images, controls);
                         }
