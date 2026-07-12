@@ -91,7 +91,21 @@ model from ever directly touching hardware.
 - **Windowed console.** Tmux-style resizable chat | action split, tabbed action
   pane (ktrace, **htop-style `/top`**, todos, editor, image / audio / video),
   mouse + keyboard, selection, syntax highlighting, live clock, Geist Mono,
-  themable brand ([DESIGN.md](DESIGN.md)).
+  fully themable ([DESIGN.md](DESIGN.md); see **Themes** below).
+- **Themes.** `/theme set <name>` switches bundled presets (`dark`, `light`,
+  `solarized-dark`, `nord`, `dracula`, `ubuntu`) — or ones you `/theme save` /
+  `/theme install <url>`. A theme is pure-data JSON: the chrome palette, code
+  **syntax colours** (VSCode-style), **cursor** colour + optional custom sprite
+  bitmaps, **font** + size, and a **wallpaper**
+  (`/theme wallpaper <none|gradient:#a,#b|/path|https://url>` — fetches + cover-
+  scales an image) with adjustable **opacity / transparency** (`/theme opacity`).
+  Chat, editor, and every TUI surface blend over the wallpaper.
+- **Web browser.** `/browse <url>` opens a real in-kernel browser agent in the
+  action pane: HTML + CSS (flow / flexbox) layout, paint, forms, SVG, images, a
+  JS engine, cookies / localStorage, CORS, and history
+  (`browser_open`/`navigate`/`back`/`scroll`/`click`/`links`/`text`). Renders
+  with the full in-kernel font stack (Latin + Indic + CJK + colour-emoji
+  fallback).
 - **Service agents & web pipeline.** Native **network / http / server** stages;
   content agents (e.g. **doc**) are data + SOUL, not per-site Rust.
   `/agents start <name> [port]`; **ssh** agent for version exchange (transport

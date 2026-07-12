@@ -360,7 +360,25 @@ real UEFI hardware.
   breaking token streaming), ANSI-coloured agent output, a `/`-command shell,
   and an on-disk UI config (`/configs/core/ui.json`, `shortcuts.json`). The brand — logo, the terracotta `#cc785c` / warm-ink /
   cream palette (fully re-themable from `ui.json`), and typography — is specified
-  in [DESIGN.md](DESIGN.md); honour it for any UI change. NB: the scheduler is
+  in [DESIGN.md](DESIGN.md); honour it for any UI change. **Themes**
+  (`theme.rs`, `/theme`) are presets layered over `ui.json` (still the single
+  source of truth for the live look): bundled JSON in `assets/themes/*.json`
+  (`dark`/`light`/`solarized-dark`/`nord`/`dracula`/`ubuntu`), installable to
+  `/configs/themes/`, each carrying the chrome palette, `highlight` **syntax**
+  colours, **cursor** fill/outline + optional sprite bitmaps, `font`+scale, a
+  **wallpaper** (`""` ∣ `gradient:#a,#b` ∣ a store-image path, cover-scaled by
+  `image::cover`, `/theme wallpaper` fetches a URL) and **opacity** (0–255).
+  **NEW UI SURFACES MUST RESPECT THE THEME BACKGROUND:** with a translucent
+  wallpaper (opacity < 255) the desktop must show behind *every* surface, so
+  paint pane/region backgrounds through `Screen::paint_surface` and text-cell
+  backgrounds through `fill_cell_bg` — **never a raw `fill_rect` of the bg
+  colour** — and let glyphs blend via `blit_glyph`→`bg_at`. Both fast-path to
+  `fill_rect` when there is no wallpaper / opacity == 255, so the default look
+  is byte-identical (no regression). A theme switch recolours existing
+  scrollback to the new `default_fg` (`Pane::recolor_default_fg`, called from
+  `adopt`). The **only** exception is self-contained app content blitted as its
+  own RGB buffer via `present_surface` — the browser, wasm-UI apps/games, the
+  image/video viewers — which stays opaque. NB: the scheduler is
   cooperative, so **any long or blocking operation must pump the UI itself** —
   call `shell::upkeep()` (blink + status + mouse + `net::poll`) inside its
   loop, exactly as the per-token inference loops, the ONNX per-node loop, and
