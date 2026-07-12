@@ -81,6 +81,8 @@ pub mod editor;
 // The Geist Mono glyph atlas the framebuffer console renders with (data-only).
 #[cfg(not(test))]
 pub mod font_geist;
+// Minimal Indic text shaping (pre-base matra reordering) for the fontdue path.
+pub mod font_shape;
 // Runtime TTF/OTF (fontdue) — browser paint + optional UI faces. Available
 // under test so browser unit tests exercise real glyph rasterization.
 pub mod font_ttf;

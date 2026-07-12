@@ -109,7 +109,14 @@ pub fn run() -> ! {
     // status bar once so the datetime is right immediately.
     crate::clock::init();
     crate::ui_config::load_and_apply();
+    // Register the bundled Noto script fonts as the system fallback chain so
+    // Indic/emoji web text renders real glyphs instead of tofu.
+    crate::font_ttf::register_bundled_fallbacks();
     auto_mount_root();
+    // CJK is ~16 MB — too large to bake into the kernel binary, so it rides on
+    // a disk volume (placed there by `cargo xtask`, like the voice models) and
+    // registers as a fallback here. Graceful no-op when absent.
+    load_disk_fallback_fonts();
     #[cfg(all(not(feature = "server"), not(test)))]
     load_panes_config();
     update_status();
@@ -7968,11 +7975,26 @@ fn browser_submit_control(
 /// Update cursor shape when hovering the browser surface.
 fn browser_hover(sx: i32, sy: i32) {
     let scroll = BROWSER.with(|s| s.as_ref().map(|b| b.scroll_y).unwrap_or(0));
-    let kind = BROWSER_LAYOUT.with(|slot| {
-        slot.as_ref()
-            .map(|lay| crate::browser::layout::cursor_at(lay, sx, sy + scroll))
-            .unwrap_or(crate::browser::layout::CursorKind::Default)
+    let content_y = sy + scroll;
+    let (kind, link_rect) = BROWSER_LAYOUT.with(|slot| match slot.as_ref() {
+        Some(lay) => {
+            let kind = crate::browser::layout::cursor_at(lay, sx, content_y);
+            // Content-space rect of the link under the cursor, for hover
+            // underline (topmost match).
+            let rect = lay
+                .links
+                .iter()
+                .rev()
+                .find(|b| sx >= b.x && sx < b.x + b.w && content_y >= b.y && content_y < b.y + b.h)
+                .map(|b| (b.x, b.y, b.w, b.h));
+            (kind, rect)
+        }
+        None => (crate::browser::layout::CursorKind::Default, None),
     });
+    // Underline the hovered link (repaint only when the hovered link changes).
+    if crate::browser::set_hover_link(link_rect) {
+        browser_repaint();
+    }
     #[cfg(not(test))]
     {
         use crate::framebuffer::CursorShape;
@@ -10542,6 +10564,32 @@ fn drain_channel_inbound(
 /// `names` (FAT or ext4). Independent of `/mount`, so it finds a bundled voice
 /// model on the FAT ESP (aarch64) or the ext4 data partition regardless of what
 /// is mounted where.
+/// Load large fallback fonts (CJK) from any disk volume and register them into
+/// the font fallback chain. Kept off the kernel binary because of their size;
+/// placed on the fonts/voice disk by `cargo xtask`. A graceful no-op when the
+/// files are absent (Indic + emoji are always bundled in the binary).
+fn load_disk_fallback_fonts() {
+    const DISK_FALLBACKS: &[(&str, &[&str])] = &[(
+        "Noto Sans CJK",
+        &["NotoSansCJKsc-Regular.otf", "NotoSansCJK.otf", "cjk.otf"],
+    )];
+    for (name, files) in DISK_FALLBACKS {
+        if crate::font_ttf::fallback_loaded(name) {
+            continue;
+        }
+        if let Some(bytes) = find_on_disks(files) {
+            match crate::font_ttf::register_fallback(name, &bytes) {
+                Ok(()) => crate::ktrace::log_fmt(format_args!(
+                    "font: registered {} fallback ({} bytes, disk)",
+                    name,
+                    bytes.len()
+                )),
+                Err(e) => serial_println!("font: {} load failed: {}", name, e),
+            }
+        }
+    }
+}
+
 fn find_on_disks(names: &[&str]) -> Option<alloc::vec::Vec<u8>> {
     use crate::fs::detect::FsType;
     for disk in 0..4usize {

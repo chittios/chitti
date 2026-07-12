@@ -346,6 +346,7 @@ fn main() {
         "run" => cmd_run(release, arch, model, uefi, disk_only, fresh_disk, disk_size, no_model),
         "test" => cmd_test(),
         "voice-assets" => cmd_voice_assets(),
+        "font-assets" => cmd_font_assets(),
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
         // boot the real model, run the acceptance checks, exit pass/fail.
         "ref-check" => cmd_ref_check(arch, model),
@@ -662,7 +663,16 @@ fn build_voice_disk() -> Option<PathBuf> {
     if env::var("CHITTI_VOICE_DISK").map(|v| v.trim() == "off").unwrap_or(false) {
         return None;
     }
-    let voice: Vec<(String, PathBuf)> = voice_model_assets().into_iter().filter(|(_, p)| p.exists()).map(|(n, p)| (n.to_string(), p)).collect();
+    let mut voice: Vec<(String, PathBuf)> = voice_model_assets().into_iter().filter(|(_, p)| p.exists()).map(|(n, p)| (n.to_string(), p)).collect();
+    // Also carry large fallback fonts (CJK, ~16 MB) that are too big to bake
+    // into the kernel binary — the kernel's `load_disk_fallback_fonts` finds
+    // them here at boot. Kept out of git (see .gitignore); fetch with
+    // `cargo xtask font-assets`.
+    for (name, path) in disk_font_assets() {
+        if path.exists() {
+            voice.push((name.to_string(), path));
+        }
+    }
     if voice.is_empty() {
         return None;
     }
@@ -1230,6 +1240,17 @@ fn voice_model_assets() -> [(&'static str, PathBuf); 2] {
         ("kitten.onnx", root.join("assets/voice/kitten_tts_mini.onnx")),
         ("parakeet.onnx", root.join("assets/voice/parakeet_ctc_int8.onnx")),
     ]
+}
+
+/// Large fallback fonts placed on the fonts/voice disk (too big for the kernel
+/// binary). The on-disk name matches the kernel's `load_disk_fallback_fonts`
+/// candidates. Gitignored; fetch with `cargo xtask font-assets`.
+fn disk_font_assets() -> [(&'static str, PathBuf); 1] {
+    let root = repo_root();
+    [(
+        "NotoSansCJKsc-Regular.otf",
+        root.join("assets/fonts/NotoSansCJKsc-Regular.otf"),
+    )]
 }
 
 fn assemble_image(kernel_bin: &Path) -> Result<PathBuf, String> {
@@ -1812,6 +1833,33 @@ fn ensure_disk_image(want_bytes: u64, fresh: bool) -> Result<PathBuf, String> {
 /// `assets/voice/` (cached — skips files already present): silero-vad v5
 /// (VAD), NeMo parakeet-tdt-ctc-110m int8 (STT, from the sherpa-onnx release
 /// bundle, plus its tokens.txt) and KittenTTS mini (TTS).
+/// Download the large CJK fallback font (kept out of git for size — the Indic
+/// and emoji Noto faces are committed and baked into the kernel binary). Placed
+/// in `assets/fonts/`, from where `build_voice_disk` copies it onto the fonts
+/// disk and the kernel's `load_disk_fallback_fonts` registers it at boot.
+fn cmd_font_assets() -> Result<(), String> {
+    let dir = repo_root().join("assets/fonts");
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let dst = dir.join("NotoSansCJKsc-Regular.otf");
+    if dst.exists() {
+        eprintln!("font-assets: NotoSansCJKsc-Regular.otf already present");
+        return Ok(());
+    }
+    eprintln!("font-assets: downloading Noto Sans CJK SC (~16 MB)…");
+    let url = "https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf";
+    let st = Command::new("curl")
+        .args(["-sL", "-o"])
+        .arg(&dst)
+        .arg(url)
+        .status()
+        .map_err(|e| format!("curl: {e}"))?;
+    if !st.success() {
+        return Err("download failed for Noto Sans CJK SC".into());
+    }
+    eprintln!("font-assets: done → {}", dst.display());
+    Ok(())
+}
+
 fn cmd_voice_assets() -> Result<(), String> {
     let dir = repo_root().join("assets/voice");
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;

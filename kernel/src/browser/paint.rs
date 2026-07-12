@@ -16,6 +16,9 @@ pub struct Chrome {
     pub progress_bottom: bool,
     /// Draw vertical scrollbar when content overflows.
     pub scrollbar: bool,
+    /// Content-space `(x, y, w, h)` of the link currently under the cursor —
+    /// its runs get a hover underline (CSS `a:hover { text-decoration: underline }`).
+    pub hover_link: Option<(i32, i32, i32, i32)>,
 }
 
 /// Paint `layout` into a `width * height` RGB buffer, scrolled by `scroll_y`.
@@ -171,7 +174,13 @@ pub fn paint_chrome(layout: &Layout, scroll_y: i32, chrome: Chrome) -> Vec<u32> 
         if run.bold {
             let _ = blit_text(&mut buf, w, h, run.x + 1, y, &run.text, px, run.color, &run.font_family);
         }
-        if run.link_href.is_some() || run.underline {
+        // Underline: an explicit `text-decoration:underline`, or a link that the
+        // cursor is hovering (CSS `a:hover { text-decoration: underline }`).
+        let hovered = run.link_href.is_some()
+            && chrome.hover_link.is_some_and(|(hx, hy, hw, hh)| {
+                run.x < hx + hw && end_x > hx && run.y >= hy - 2 && run.y < hy + hh + 2
+            });
+        if run.underline || hovered {
             let uy = y + line_h - 2;
             if uy >= 0 && uy < layout.height {
                 for x in run.x..end_x.max(run.x + 1) {
@@ -212,9 +221,11 @@ fn paint_control(
     }
     match c.kind {
         ControlKind::Text | ControlKind::Password | ControlKind::TextArea => {
-            let bg = if c.focused { 0xffffff } else { 0xfafafa };
+            // White field with the control's own CSS background/radius (a text
+            // input's UA default box is a sharp rectangle, not rounded).
+            let bg = c.bg.unwrap_or(if c.focused { 0xffffff } else { 0xfafafa });
             let border = if c.focused { 0x1a73e8 } else { 0x888888 };
-            fill_round_rect(buf, bw, bh, c.x, y0, c.w, c.h, bg, c.radius.max(4));
+            fill_round_rect(buf, bw, bh, c.x, y0, c.w, c.h, bg, c.radius);
             // border
             for dx in 0..c.w {
                 put(buf, bw, bh, c.x + dx, y0, border);
@@ -248,10 +259,24 @@ fn paint_control(
             }
         }
         ControlKind::Submit | ControlKind::Button => {
-            let bg = if c.focused { 0x1557b0 } else { 0x1a73e8 };
-            // Buttons get a small default rounding (like real UAs) unless the
-            // page asks for more via `border-radius`.
-            fill_round_rect(buf, bw, bh, c.x, y0, c.w, c.h, bg, c.radius.max(4));
+            // Honor the control's own CSS background colour; else the **UA
+            // default button** — a light system-grey box with a 1px border (the
+            // genuine cross-browser default for `<button>`/submit; the previous
+            // blue was wrong). An image/gradient-only background we can't render
+            // (`.transparent`) also falls back to the UA button.
+            let rad = c.radius; // native buttons aren't rounded unless CSS says so
+            let styled = c.bg.filter(|_| !c.transparent);
+            let bg = match styled {
+                Some(col) if c.focused => darken(col),
+                Some(col) => col,
+                None if c.focused => 0xe0e0e6,
+                None => 0xf0f0f2,
+            };
+            fill_round_rect(buf, bw, bh, c.x, y0, c.w, c.h, bg, rad);
+            // Border only for the native (unstyled) button.
+            if styled.is_none() {
+                draw_rect_border(buf, bw, bh, c.x, y0, c.w, c.h, 0xbfbfc4);
+            }
             let label = if c.value.is_empty() {
                 if c.kind == ControlKind::Submit {
                     "Submit"
@@ -263,7 +288,13 @@ fn paint_control(
             };
             let tw = font_ttf::measure(label, 13.0) as i32;
             let tx = c.x + ((c.w - tw) / 2).max(4);
-            let _ = blit_text(buf, bw, bh, tx, y0 + 5, label, 13.0, 0xffffff, "");
+            // Label colour: the control's `color`; else dark on the light UA
+            // button, or white on a dark author background.
+            let fg = c.fg.unwrap_or(match styled {
+                Some(col) if col_luma(col) < 140 => 0xffffff,
+                _ => 0x202124,
+            });
+            let _ = blit_text(buf, bw, bh, tx, y0 + 5, label, 13.0, fg, "");
         }
         ControlKind::Checkbox => {
             fill_rect(buf, bw, bh, c.x, y0, c.w, c.h, 0xffffff);
@@ -348,6 +379,30 @@ fn blit_image(
             put(buf, bw, bh, dx + col, dy + row, p);
         }
     }
+}
+
+/// Perceptual brightness (0–255) of an `0x00RRGGBB` colour.
+fn col_luma(c: u32) -> u32 {
+    let (r, g, b) = ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+    (r * 30 + g * 59 + b * 11) / 100
+}
+
+/// Draw a 1px square border around a box.
+fn draw_rect_border(buf: &mut [u32], w: usize, h: usize, x: i32, y: i32, rw: i32, rh: i32, color: u32) {
+    for dx in 0..rw {
+        put(buf, w, h, x + dx, y, color);
+        put(buf, w, h, x + dx, y + rh - 1, color);
+    }
+    for dy in 0..rh {
+        put(buf, w, h, x, y + dy, color);
+        put(buf, w, h, x + rw - 1, y + dy, color);
+    }
+}
+
+/// Darken a colour ~12% (for a control's focused/pressed state).
+fn darken(c: u32) -> u32 {
+    let ch = |sh: u32| (((c >> sh) & 0xff) * 88 / 100) & 0xff;
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
 /// Is local point `(lx, ly)` inside the rounded rect `[0,rw)×[0,rh)` with corner
@@ -1088,6 +1143,7 @@ mod tests {
             progress: Some(40),
             progress_bottom: false,
             scrollbar: true,
+            hover_link: None,
         };
         let buf = paint_chrome(&lay, 0, chrome);
         assert_eq!(buf.len(), 320 * 200);

@@ -208,6 +208,27 @@ Licensed under **MIT OR Apache-2.0 OR Zlib**. Upstream:
 https://github.com/mooman219/fontdue. Depends on **ttf-parser** (Apache-2.0 /
 MIT) and **hashbrown**.
 
+## Noto fonts — script fallback chain (Indic / emoji / CJK)
+
+Non-Latin web text is covered by Google's **Noto** family (the same faces Linux
+ships in `fonts-noto`), registered as a per-glyph fallback chain in
+`kernel/src/font_ttf.rs` (see `NOTO_FALLBACKS` / `register_bundled_fallbacks`).
+The Indic and emoji faces are baked into the kernel via `include_bytes!`; the
+large CJK face is loaded from a disk volume at boot (`load_disk_fallback_fonts`,
+placed there by `cargo xtask` — fetch with `cargo xtask font-assets`).
+
+- **Noto Sans Devanagari/Bengali/Gurmukhi/Gujarati/Tamil/Telugu/Kannada/Malayalam**
+  — `assets/fonts/Noto-*.ttf`, from https://github.com/notofonts/notofonts.github.io
+- **Noto Emoji** (monochrome; fontdue has no colour-table support) —
+  `assets/fonts/Noto-Emoji.ttf`, from https://github.com/google/fonts
+- **Noto Sans CJK SC** — `assets/fonts/NotoSansCJKsc-Regular.otf` (gitignored,
+  downloaded on demand), from https://github.com/notofonts/noto-cjk
+
+All are licensed under the **SIL Open Font License 1.1**. Indic pre-base matra
+reordering (`kernel/src/font_shape.rs`) is an original minimal shaper, not a
+port; full OpenType shaping (GSUB conjuncts, GPOS mark positioning) is a
+documented follow-up.
+
 ---
 
 ## htmlparser — crates.io (browser HTML tokenizer)

@@ -20,6 +20,33 @@ use fontdue::{Font, FontSettings};
 static GEIST_TTF: &[u8] = include_bytes!("../../assets/fonts/GeistMono-Regular.ttf");
 static UBUNTU_MONO_TTF: &[u8] = include_bytes!("../../assets/fonts/UbuntuMono-Regular.ttf");
 
+/// Bundled **Noto Sans** script fonts (SIL Open Font License — see
+/// THIRDPARTY-LICENSES.md) forming the system fallback chain, so Indic web
+/// text renders real glyphs instead of tofu. These are the same faces Linux
+/// ships in `fonts-noto`. Registered at boot via [`register_bundled_fallbacks`].
+pub static NOTO_FALLBACKS: &[(&str, &[u8])] = &[
+    ("Noto Sans Devanagari", include_bytes!("../../assets/fonts/Noto-Devanagari.ttf")),
+    ("Noto Sans Bengali", include_bytes!("../../assets/fonts/Noto-Bengali.ttf")),
+    ("Noto Sans Gurmukhi", include_bytes!("../../assets/fonts/Noto-Gurmukhi.ttf")),
+    ("Noto Sans Gujarati", include_bytes!("../../assets/fonts/Noto-Gujarati.ttf")),
+    ("Noto Sans Tamil", include_bytes!("../../assets/fonts/Noto-Tamil.ttf")),
+    ("Noto Sans Telugu", include_bytes!("../../assets/fonts/Noto-Telugu.ttf")),
+    ("Noto Sans Kannada", include_bytes!("../../assets/fonts/Noto-Kannada.ttf")),
+    ("Noto Sans Malayalam", include_bytes!("../../assets/fonts/Noto-Malayalam.ttf")),
+    // Monochrome emoji last: Latin/Indic are matched by earlier faces first, so
+    // this is only reached for emoji/symbol codepoints. (fontdue has no colour
+    // table support, so these render as single-colour glyphs.)
+    ("Noto Emoji", include_bytes!("../../assets/fonts/Noto-Emoji.ttf")),
+];
+
+/// Register every bundled Noto fallback face (idempotent). Call once at boot,
+/// before the browser/UI render any non-Latin text.
+pub fn register_bundled_fallbacks() {
+    for (name, bytes) in NOTO_FALLBACKS {
+        let _ = register_fallback(name, bytes);
+    }
+}
+
 /// Monospace faces bundled for the UI, selectable by name from `ui.json`
 /// (`font`). The first entry is the default. Names are matched
 /// case-insensitively and also by a lowercased no-space alias
@@ -188,6 +215,44 @@ static FAMILIES: Locked<Vec<(String, Font)>> = Locked::new(Vec::new());
 /// Maximum number of registered font families (see [`FAMILIES`]).
 const FAMILY_CAP: usize = 8;
 
+/// System **fallback chain** — script/emoji/CJK faces consulted per-glyph
+/// (in registration order) when neither the primary family nor the global face
+/// covers a character. This is how Indic / CJK / emoji text stops rendering as
+/// tofu: the global face (Geist Mono) covers Latin, and each fallback covers a
+/// script it was registered for (Noto Sans Devanagari, …). Lock order is always
+/// `FAMILIES → FACE → FALLBACKS`; never the reverse.
+static FALLBACKS: Locked<Vec<(String, Font)>> = Locked::new(Vec::new());
+
+/// Register a system fallback face (a Noto script/emoji/CJK font). Idempotent
+/// by name. Unlike [`load_family`] there is no cap — the chain is a small,
+/// boot-time-fixed set of script coverage fonts.
+pub fn register_fallback(name: &str, data: &[u8]) -> Result<(), &'static str> {
+    let name = norm_family(name);
+    if name.is_empty() {
+        return Err("empty fallback name");
+    }
+    let font = Font::from_bytes(data, FontSettings::default()).map_err(|_| "font parse failed")?;
+    FALLBACKS.with(move |fb| {
+        if let Some(i) = fb.iter().position(|(n, _)| *n == name) {
+            fb[i].1 = font;
+        } else {
+            fb.push((name, font));
+        }
+    });
+    Ok(())
+}
+
+/// True if a fallback face named `name` (case-insensitive) is registered.
+pub fn fallback_loaded(name: &str) -> bool {
+    let name = norm_family(name);
+    FALLBACKS.with(|fb| fb.iter().any(|(n, _)| *n == name))
+}
+
+/// Number of registered fallback faces.
+pub fn fallback_count() -> usize {
+    FALLBACKS.with(|fb| fb.len())
+}
+
 fn ensure_default() {
     FACE.with(|slot| {
         if slot.is_none() {
@@ -257,11 +322,23 @@ pub fn advance(ch: char, px: f32) -> f32 {
 }
 
 pub fn measure(text: &str, px: f32) -> f32 {
-    let mut w = 0.0f32;
-    for ch in text.chars() {
-        w += advance(ch, px);
-    }
-    w
+    ensure_default();
+    // Width is order-independent, so shaping (reordering) is unnecessary here —
+    // but the fallback chain is: an Indic/CJK/emoji glyph's advance comes from
+    // whichever face actually covers it, not the Latin face's notdef.
+    FACE.with(|s| {
+        let global = s.as_ref().map(|f| &f.font);
+        FALLBACKS.with(|chain| {
+            let mut w = 0.0f32;
+            for ch in text.chars() {
+                w += match pick_font(None, global, chain, ch) {
+                    Some(f) => f.metrics(ch, px).advance_width,
+                    None => px * 0.55,
+                };
+            }
+            w
+        })
+    })
 }
 
 /// Draw `text` with pen origin at **(x, baseline_y)** in Y-down pixel space.
@@ -277,15 +354,20 @@ pub fn blit_run_baseline(
     color: u32,
 ) -> i32 {
     ensure_default();
+    let shaped = crate::font_shape::shape(text);
     FACE.with(|s| {
-        let font = s.as_ref().map(|f| &f.font);
-        for ch in text.chars() {
-            pen_x += match font {
-                Some(f) => blit_glyph(buf, stride, height, pen_x, baseline_y, ch, px, color, f),
-                None => blit_box(buf, stride, height, pen_x as i32, baseline_y as i32, px, color),
-            };
-        }
-        f32_round(pen_x) as i32
+        let global = s.as_ref().map(|f| &f.font);
+        FALLBACKS.with(|chain| {
+            for ch in shaped.chars() {
+                pen_x += match pick_font(None, global, chain, ch) {
+                    Some(f) => blit_glyph(buf, stride, height, pen_x, baseline_y, ch, px, color, f),
+                    None => {
+                        blit_box(buf, stride, height, pen_x as i32, baseline_y as i32, px, color)
+                    }
+                };
+            }
+            f32_round(pen_x) as i32
+        })
     })
 }
 
@@ -403,20 +485,32 @@ pub fn family_loaded(family: &str) -> bool {
     FAMILIES.with(|fams| fams.iter().any(|(n, _)| *n == name))
 }
 
-/// Per-glyph face selection: the family face if it covers `ch`, else the
-/// global fallback; if neither covers it, the fallback's notdef.
-fn pick_font<'a>(primary: Option<&'a Font>, fallback: Option<&'a Font>, ch: char) -> Option<&'a Font> {
+/// Per-glyph face selection, in priority order: the named family (if any) →
+/// the global face → each registered fallback (script/emoji/CJK) → the global
+/// face's notdef. This is what routes an Indic/CJK/emoji codepoint the Latin
+/// face can't draw to the Noto face that can.
+fn pick_font<'a>(
+    primary: Option<&'a Font>,
+    global: Option<&'a Font>,
+    chain: &'a [(String, Font)],
+    ch: char,
+) -> Option<&'a Font> {
     if let Some(p) = primary {
         if p.lookup_glyph_index(ch) != 0 {
             return Some(p);
         }
     }
-    if let Some(f) = fallback {
+    if let Some(g) = global {
+        if g.lookup_glyph_index(ch) != 0 {
+            return Some(g);
+        }
+    }
+    for (_, f) in chain {
         if f.lookup_glyph_index(ch) != 0 {
             return Some(f);
         }
     }
-    fallback.or(primary)
+    global.or(primary)
 }
 
 /// [`measure`] against a named family, with per-glyph fallback to the global
@@ -427,15 +521,17 @@ pub fn measure_family(family: &str, text: &str, px: f32) -> f32 {
     FAMILIES.with(|fams| {
         let primary = fams.iter().find(|(n, _)| *n == name).map(|(_, f)| f);
         FACE.with(|face| {
-            let fallback = face.as_ref().map(|f| &f.font);
-            let mut w = 0.0f32;
-            for ch in text.chars() {
-                w += match pick_font(primary, fallback, ch) {
-                    Some(f) => f.metrics(ch, px).advance_width,
-                    None => px * 0.55,
-                };
-            }
-            w
+            let global = face.as_ref().map(|f| &f.font);
+            FALLBACKS.with(|chain| {
+                let mut w = 0.0f32;
+                for ch in text.chars() {
+                    w += match pick_font(primary, global, chain, ch) {
+                        Some(f) => f.metrics(ch, px).advance_width,
+                        None => px * 0.55,
+                    };
+                }
+                w
+            })
         })
     })
 }
@@ -457,26 +553,31 @@ pub fn blit_run_family(
 ) -> i32 {
     ensure_default();
     let name = norm_family(family);
+    let shaped = crate::font_shape::shape(text);
     FAMILIES.with(|fams| {
         let primary = fams.iter().find(|(n, _)| *n == name).map(|(_, f)| f);
         FACE.with(|face| {
-            let fallback = face.as_ref().map(|f| &f.font);
-            let asc = primary
-                .or(fallback)
-                .and_then(|f| f.horizontal_line_metrics(px))
-                .map(|lm| lm.ascent)
-                .unwrap_or(px * 0.8);
-            let baseline = y_top as f32 + asc;
-            let mut pen_x = x as f32;
-            for ch in text.chars() {
-                pen_x += match pick_font(primary, fallback, ch) {
-                    Some(f) => blit_glyph(buf, stride, height, pen_x, baseline, ch, px, color, f),
-                    None => {
-                        blit_box(buf, stride, height, pen_x as i32, baseline as i32, px, color)
-                    }
-                };
-            }
-            f32_round(pen_x) as i32
+            let global = face.as_ref().map(|f| &f.font);
+            FALLBACKS.with(|chain| {
+                let asc = primary
+                    .or(global)
+                    .and_then(|f| f.horizontal_line_metrics(px))
+                    .map(|lm| lm.ascent)
+                    .unwrap_or(px * 0.8);
+                let baseline = y_top as f32 + asc;
+                let mut pen_x = x as f32;
+                for ch in shaped.chars() {
+                    pen_x += match pick_font(primary, global, chain, ch) {
+                        Some(f) => {
+                            blit_glyph(buf, stride, height, pen_x, baseline, ch, px, color, f)
+                        }
+                        None => {
+                            blit_box(buf, stride, height, pen_x as i32, baseline as i32, px, color)
+                        }
+                    };
+                }
+                f32_round(pen_x) as i32
+            })
         })
     })
 }

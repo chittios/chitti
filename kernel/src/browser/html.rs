@@ -676,8 +676,17 @@ fn preprocess(html: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'<' {
-            out.push(bytes[i] as char);
-            i += 1;
+            // Copy the whole text run as UTF-8 — pushing bytes individually as
+            // `char` is Latin-1 decoding and mangles multi-byte sequences (e.g.
+            // the Indic language names in google.com's "Google offered in:").
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'<' {
+                i += 1;
+            }
+            match core::str::from_utf8(&bytes[start..i]) {
+                Ok(s) => out.push_str(s),
+                Err(_) => out.push_str(&alloc::string::String::from_utf8_lossy(&bytes[start..i])),
+            }
             continue;
         }
         let start = i;
@@ -1021,6 +1030,16 @@ mod tests {
     fn decode_entities_basic() {
         assert_eq!(decode_entities("a&amp;b&lt;c&gt;"), "a&b<c>");
         assert_eq!(decode_entities("&#65;"), "A");
+    }
+
+    #[test_case]
+    fn preprocess_preserves_utf8_text() {
+        // Multi-byte UTF-8 (Devanagari) in text must survive — the old
+        // byte-as-char path turned "हिन्दी" into Latin-1 mojibake (google.com's
+        // "Google offered in:" language list).
+        let out = preprocess("<p>हिन्दी 中文</p>");
+        assert!(out.contains("हिन्दी"), "devanagari preserved: {:?}", out);
+        assert!(out.contains("中文"), "cjk preserved");
     }
 
     #[test_case]

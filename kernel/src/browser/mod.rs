@@ -424,6 +424,25 @@ pub fn fill_image_slot(im: &mut layout::ImageBox, bytes: &[u8]) {
     im.pixels = Some(scaled.pixels);
 }
 
+/// Content-space `(x, y, w, h)` of the link currently under the cursor (set by
+/// the shell's hover handler; read into `Chrome::hover_link` at paint time so
+/// the hovered link gets an underline — CSS `a:hover`).
+pub static HOVER_LINK: crate::mm::Locked<Option<(i32, i32, i32, i32)>> =
+    crate::mm::Locked::new(None);
+
+/// Set the hovered-link rect; returns `true` if it changed (caller repaints).
+pub fn set_hover_link(rect: Option<(i32, i32, i32, i32)>) -> bool {
+    HOVER_LINK.with(|h| {
+        let changed = *h != rect;
+        *h = rect;
+        changed
+    })
+}
+
+fn hover_link() -> Option<(i32, i32, i32, i32)> {
+    HOVER_LINK.with(|h| *h)
+}
+
 /// Parse + JS + CSS + layout + paint with `scroll_y`. Pure (no net; images empty).
 pub fn render_html(html_src: &str, vw: i32, vh: i32, scroll_y: i32) -> Frame {
     let (doc, lay, effects) = layout_html_ex(html_src, vw, vh, "");
@@ -433,6 +452,7 @@ pub fn render_html(html_src: &str, vw: i32, vh: i32, scroll_y: i32) -> Frame {
         progress: None,
         progress_bottom: false,
         scrollbar: lay.content_height > vh,
+        hover_link: hover_link(),
     };
     let pixels = paint::paint_chrome(&lay, sy, chrome);
     Frame {
@@ -464,6 +484,7 @@ pub fn paint_layout_chrome(
         progress,
         progress_bottom: false,
         scrollbar: lay.content_height > vh,
+        hover_link: hover_link(),
     };
     (paint::paint_chrome(lay, sy, chrome), lay.content_height)
 }

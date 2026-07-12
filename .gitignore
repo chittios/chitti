@@ -10,3 +10,5 @@ __pycache__/
 tests/e2e/certs/
 
 .idea/
+# Large CJK fallback font (16MB) — fetched via `cargo xtask font-assets`, placed on the fonts disk
+assets/fonts/*.otf

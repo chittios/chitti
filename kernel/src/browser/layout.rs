@@ -251,6 +251,14 @@ pub struct FormControl {
     pub elem_idx: Option<usize>,
     /// `border-radius` in px for the control's box (0 = square).
     pub radius: i32,
+    /// CSS `background`/`color` for the control (else the UA default palette).
+    pub bg: Option<u32>,
+    pub fg: Option<u32>,
+    /// The control's background is an image/gradient/transparent (no solid
+    /// colour we render) — so the painter leaves it unfilled and the parent's
+    /// background shows through (e.g. google.com's `.lsb` button over its grey
+    /// `.lsbb` wrapper), instead of painting an opaque UA default over it.
+    pub transparent: bool,
 }
 
 /// Hit-test result in content coordinates (y includes scroll offset).
@@ -449,6 +457,7 @@ pub fn layout_document_ex(
         &mut page_bg,
         vw,
         false, // in_head
+        &[],   // ancestor chain (root)
     );
     cur.content_bottom = cur.content_bottom.max(cur.y + cur.line_h);
     Layout {
@@ -583,8 +592,23 @@ pub fn layout_reader(title: &str, plain: &str, vw: i32, vh: i32) -> Layout {
     }
 }
 
-fn walk(
-    n: &Node,
+/// Build the ancestor chain for the children of an element: the element's own
+/// chain plus itself, appended (outermost→innermost). Borrows from `chain` and
+/// the element's own strings, both of which outlive the child walk.
+fn push_chain<'a>(
+    chain: &[css::ElemRef<'a>],
+    tag: &'a str,
+    id: Option<&'a str>,
+    class: Option<&'a str>,
+) -> Vec<css::ElemRef<'a>> {
+    let mut v = Vec::with_capacity(chain.len() + 1);
+    v.extend_from_slice(chain);
+    v.push((tag, id, class));
+    v
+}
+
+fn walk<'a>(
+    n: &'a Node,
     sheet: &Stylesheet,
     parent_st: &ComputedStyle,
     cur: &mut Cursor,
@@ -601,13 +625,14 @@ fn walk(
     page_bg: &mut u32,
     vw: i32,
     in_head: bool,
+    chain: &[css::ElemRef<'a>],
 ) {
     match &n.kind {
         NodeKind::Document => {
             for c in &n.children {
                 walk(
                     c, sheet, parent_st, cur, runs, links, rects, images, controls, frames, aux, link,
-                    form, next_form_id, page_bg, vw, in_head,
+                    form, next_form_id, page_bg, vw, in_head, chain,
                 );
             }
         }
@@ -649,17 +674,21 @@ fn walk(
             if in_head {
                 return;
             }
-            let st = css::compute(
+            let st = css::compute_ex(
                 sheet,
                 tag,
                 id.as_deref(),
                 class.as_deref(),
                 style_attr.as_deref(),
                 parent_st,
+                chain,
             );
             if st.display_none || st.display == DisplayMode::None {
                 return;
             }
+            // Ancestor chain for this element's children (self appended).
+            let child_chain = push_chain(chain, tag, id.as_deref(), class.as_deref());
+            let child_chain = child_chain.as_slice();
             if tag == "body" {
                 if let Some(bg) = st.background {
                     *page_bg = bg;
@@ -698,6 +727,7 @@ fn walk(
                     vw,
                     in_head,
                     line_h,
+                    chain,
                 );
                 return;
             }
@@ -727,7 +757,7 @@ fn walk(
                 for c in &n.children {
                     walk(
                         c, sheet, &st, &mut fcur, runs, links, rects, images, controls,
-                        frames, aux, link, form, next_form_id, page_bg, vw, in_head,
+                        frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
                     );
                 }
                 let (x0, y0, x1, y1) = frag_bbox(mark, runs, links, rects, images, controls, frames, aux);
@@ -791,7 +821,7 @@ fn walk(
                 for c in &n.children {
                     walk(
                         c, sheet, &st, &mut child_cur, runs, links, rects, images,
-                        controls, frames, aux, link, form, next_form_id, page_bg, vw, in_head,
+                        controls, frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
                     );
                 }
                 let (x0, y0, x1, y1) =
@@ -846,9 +876,35 @@ fn walk(
                         | "audio" | "button" | "textarea" | "select"
                 )
             {
+                let mut st_i = st;
+                // An inline / inline-block `<a>` still links its content and —
+                // when styled as a button (`background` + padding, e.g.
+                // google.com's "Sign in" `.gb_1a{display:inline-block}`) — paints
+                // a background pill, exactly like a block-flowed `<a>`. Without
+                // this it fell through here losing both its `href` (→ not
+                // clickable) and its background (→ not blue).
+                let link_here = if tag == "a" {
+                    if st_i.color == parent_st.color {
+                        st_i.color = 0x1a73e8;
+                    }
+                    href.as_deref().or(link)
+                } else {
+                    link
+                };
                 cur.line_h = line_h.max(cur.line_h);
+                // Horizontal margins space inline-block siblings (footer nav).
+                cur.x += st_i.margin_left.max(0);
+                // Inline background box (inline-block buttons / badges), inset by
+                // the element's own padding.
+                let box_left = cur.x;
+                let box_top = cur.y;
+                let inline_bg = st_i.background;
+                if inline_bg.is_some() {
+                    cur.x += st_i.padding_left.max(0);
+                }
+                let br0 = runs.len();
                 // `vertical-align` shifts this inline box within the line box.
-                let va = st.vertical_align;
+                let va = st_i.vertical_align;
                 let vmark = if !matches!(va, css::VerticalAlign::Baseline) {
                     Some(mark_frag(runs, links, rects, images, controls, frames, aux))
                 } else {
@@ -856,9 +912,28 @@ fn walk(
                 };
                 for c in &n.children {
                     walk(
-                        c, sheet, &st, cur, runs, links, rects, images, controls,
-                        frames, aux, link, form, next_form_id, page_bg, vw, in_head,
+                        c, sheet, &st_i, cur, runs, links, rects, images, controls,
+                        frames, aux, link_here, form, next_form_id, page_bg, vw, in_head, child_chain,
                     );
+                }
+                if let Some(bg) = inline_bg {
+                    cur.x += st_i.padding_right.max(0);
+                    let (pt, pb) = (st_i.padding_top.max(0), st_i.padding_bottom.max(0));
+                    let mut y1 = box_top;
+                    for r in &runs[br0..] {
+                        y1 = y1.max(r.y + cur.line_h);
+                    }
+                    let h = (y1 - box_top).max(cur.line_h) + pt + pb;
+                    // Under the text (rects paint before runs).
+                    rects.push(RectBox {
+                        x: box_left,
+                        y: box_top - pt / 2,
+                        w: (cur.x - box_left).max(1),
+                        h,
+                        color: fade(bg, st_i.opacity),
+                        radius: st_i.border_radius.max(0),
+                        blur: 0,
+                    });
                 }
                 if let Some(m) = vmark {
                     let (_, y0, _, y1) =
@@ -873,13 +948,18 @@ fn walk(
                         translate_frag(m, 0, dy, runs, links, rects, images, controls, frames, aux);
                     }
                 }
+                cur.x += st_i.margin_right.max(0);
                 return;
             }
 
             match tag {
                 "br" | "wbr" => {
-                    cur.line_h = line_h;
+                    // Break AFTER the current line's accumulated height (which
+                    // may include a tall inline-block like a search box), then
+                    // reset to the default for the next line. Resetting *before*
+                    // the break made the next line overlap tall inline content.
                     new_line(cur);
+                    cur.line_h = line_h;
                 }
                 "hr" => {
                     new_line(cur);
@@ -1033,7 +1113,7 @@ fn walk(
                     for c in &n.children {
                         walk(
                             c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
-                            Some(&ctx), next_form_id, page_bg, vw, in_head,
+                            Some(&ctx), next_form_id, page_bg, vw, in_head, child_chain,
                         );
                     }
                     block_after(cur, st.margin_bottom.max(6));
@@ -1051,15 +1131,36 @@ fn walk(
                         n,
                         line_h,
                         st.border_radius.max(0),
+                        st.background,
+                        if st.color != parent_st.color { Some(st.color) } else { None },
+                        st.background.is_none() && !st.background_image.is_empty(),
                     );
                 }
-                "table" | "thead" | "tbody" | "tfoot" => {
-                    // Simplified table: block container (Ladybird table layout is far larger).
+                "table" => {
+                    let mut trows: Vec<Vec<&Node>> = Vec::new();
+                    collect_table_rows(n, &mut trows);
+                    if trows.iter().any(|r| !r.is_empty()) {
+                        layout_table(
+                            n, sheet, &st, cur, runs, links, rects, images, controls, frames, aux,
+                            link, form, next_form_id, page_bg, vw, in_head, chain,
+                        );
+                    } else {
+                        block_before(cur, st.margin_top.max(4));
+                        for c in &n.children {
+                            walk(
+                                c, sheet, &st, cur, runs, links, rects, images, controls, frames,
+                                aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
+                            );
+                        }
+                        block_after(cur, st.margin_bottom.max(4));
+                    }
+                }
+                "thead" | "tbody" | "tfoot" => {
                     block_before(cur, st.margin_top.max(4));
                     for c in &n.children {
                         walk(
                             c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
-                            form, next_form_id, page_bg, vw, in_head,
+                            form, next_form_id, page_bg, vw, in_head, child_chain,
                         );
                     }
                     block_after(cur, st.margin_bottom.max(4));
@@ -1069,7 +1170,7 @@ fn walk(
                     for c in &n.children {
                         walk(
                             c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
-                            form, next_form_id, page_bg, vw, in_head,
+                            form, next_form_id, page_bg, vw, in_head, child_chain,
                         );
                     }
                     if cur.x > cur.margin_x {
@@ -1083,7 +1184,7 @@ fn walk(
                     for c in &n.children {
                         walk(
                             c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
-                            form, next_form_id, page_bg, vw, in_head,
+                            form, next_form_id, page_bg, vw, in_head, child_chain,
                         );
                     }
                     cur.max_w = old_max;
@@ -1184,7 +1285,7 @@ fn walk(
                     for c in &n.children {
                         walk(
                             c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
-                            form, next_form_id, page_bg, vw, in_head,
+                            form, next_form_id, page_bg, vw, in_head, child_chain,
                         );
                     }
                     if cur.x > content_start_x {
@@ -1295,12 +1396,46 @@ fn walk(
                     if st_a.color == parent_st.color {
                         st_a.color = 0x1a73e8;
                     }
+                    // Horizontal margins on an inline/inline-block link add
+                    // spacing between siblings (e.g. footer nav links with
+                    // `margin:0 12px` — otherwise `</a><a>` runs together).
+                    cur.x += st_a.margin_left.max(0);
+                    // A link styled as a button (`background` + padding + radius,
+                    // e.g. google.com's "Sign in" `.gb_1a`) paints an inline
+                    // background box behind its text, inset by its padding.
+                    let box_left = cur.x;
+                    let box_top = cur.y;
+                    let inline_bg = st_a.background;
+                    if inline_bg.is_some() {
+                        cur.x += st_a.padding_left.max(0);
+                    }
+                    let br0 = runs.len();
                     for c in &n.children {
                         walk(
                             c, sheet, &st_a, cur, runs, links, rects, images, controls, frames,
-                            aux, href_s.or(link), form, next_form_id, page_bg, vw, in_head,
+                            aux, href_s.or(link), form, next_form_id, page_bg, vw, in_head, child_chain,
                         );
                     }
+                    if let Some(bg) = inline_bg {
+                        cur.x += st_a.padding_right.max(0);
+                        let (pt, pb) = (st_a.padding_top.max(0), st_a.padding_bottom.max(0));
+                        let mut y1 = box_top;
+                        for r in &runs[br0..] {
+                            y1 = y1.max(r.y + cur.line_h);
+                        }
+                        let h = (y1 - box_top).max(cur.line_h) + pt + pb;
+                        // Under the text (rects paint before runs).
+                        rects.push(RectBox {
+                            x: box_left,
+                            y: box_top - pt / 2,
+                            w: (cur.x - box_left).max(1),
+                            h,
+                            color: fade(bg, st_a.opacity),
+                            radius: st_a.border_radius.max(0),
+                            blur: 0,
+                        });
+                    }
+                    cur.x += st_a.margin_right.max(0);
                 }
                 "span" | "strong" | "b" | "em" | "i" | "code" | "label" | "small" | "u" | "s"
                 | "sub" | "sup" | "mark" | "abbr" | "cite" | "q" | "time" | "var" | "kbd"
@@ -1314,7 +1449,7 @@ fn walk(
                     for c in &n.children {
                         walk(
                             c, sheet, &st_i, cur, runs, links, rects, images, controls, frames,
-                            aux, link, form, next_form_id, page_bg, vw, in_head,
+                            aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
                         );
                     }
                 }
@@ -1323,7 +1458,7 @@ fn walk(
                     for c in &n.children {
                         walk(
                             c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
-                            form, next_form_id, page_bg, vw, in_head,
+                            form, next_form_id, page_bg, vw, in_head, child_chain,
                         );
                     }
                 }
@@ -1335,7 +1470,7 @@ fn walk(
                             for c in &n.children {
                                 walk(
                                     c, sheet, &st, cur, runs, links, rects, images, controls,
-                                    frames, aux, link, form, next_form_id, page_bg, vw, in_head,
+                                    frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
                                 );
                             }
                         }
@@ -1348,7 +1483,7 @@ fn walk(
                             for c in &n.children {
                                 walk(
                                     c, sheet, &st, cur, runs, links, rects, images, controls,
-                                    frames, aux, link, form, next_form_id, page_bg, vw, in_head,
+                                    frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
                                 );
                             }
                             block_after(cur, st.margin_bottom);
@@ -1358,7 +1493,7 @@ fn walk(
                             for c in &n.children {
                                 walk(
                                     c, sheet, &st, cur, runs, links, rects, images, controls,
-                                    frames, aux, link, form, next_form_id, page_bg, vw, in_head,
+                                    frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
                                 );
                             }
                             if cur.x > cur.margin_x {
@@ -1464,6 +1599,61 @@ fn frag_bbox(
     (x0, y0, x1, y1)
 }
 
+/// Translate only the geometry in `[start, end)` — used when several sibling
+/// fragments coexist in the buffers (table cells) and each must move
+/// independently. `translate_frag` (open-ended) would move every later sibling
+/// too, accumulating shifts.
+#[allow(clippy::too_many_arguments)]
+fn translate_frag_range(
+    start: FragMark,
+    end: FragMark,
+    dx: i32,
+    dy: i32,
+    runs: &mut [TextRun],
+    links: &mut [LinkBox],
+    rects: &mut [RectBox],
+    images: &mut [ImageBox],
+    controls: &mut [FormControl],
+    frames: &mut [FrameBox],
+    aux: &mut Aux,
+) {
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    for r in &mut runs[start.runs..end.runs] {
+        r.x += dx;
+        r.y += dy;
+    }
+    for l in &mut links[start.links..end.links] {
+        l.x += dx;
+        l.y += dy;
+    }
+    for rc in &mut rects[start.rects..end.rects] {
+        rc.x += dx;
+        rc.y += dy;
+    }
+    for im in &mut images[start.images..end.images] {
+        im.x += dx;
+        im.y += dy;
+    }
+    for c in &mut controls[start.controls..end.controls] {
+        c.x += dx;
+        c.y += dy;
+    }
+    for f in &mut frames[start.frames..end.frames] {
+        f.x += dx;
+        f.y += dy;
+    }
+    for e in &mut aux.elem_boxes[start.elem_boxes..end.elem_boxes] {
+        e.x += dx;
+        e.y += dy;
+    }
+    for b in &mut aux.bg_boxes[start.bg_boxes..end.bg_boxes] {
+        b.x += dx;
+        b.y += dy;
+    }
+}
+
 fn translate_frag(
     start: FragMark,
     dx: i32,
@@ -1513,10 +1703,283 @@ fn translate_frag(
     }
 }
 
+/// Discard everything appended since `start` — used to throw away a trial
+/// (measurement) layout of a table cell.
+fn rewind_frag(
+    start: FragMark,
+    runs: &mut Vec<TextRun>,
+    links: &mut Vec<LinkBox>,
+    rects: &mut Vec<RectBox>,
+    images: &mut Vec<ImageBox>,
+    controls: &mut Vec<FormControl>,
+    frames: &mut Vec<FrameBox>,
+    aux: &mut Aux,
+) {
+    runs.truncate(start.runs);
+    links.truncate(start.links);
+    rects.truncate(start.rects);
+    images.truncate(start.images);
+    controls.truncate(start.controls);
+    frames.truncate(start.frames);
+    aux.elem_boxes.truncate(start.elem_boxes);
+    aux.bg_boxes.truncate(start.bg_boxes);
+}
+
+/// `(tag, id, class, style)` of an element node (empty tag for non-elements).
+fn elem_parts(n: &Node) -> (&str, Option<&str>, Option<&str>, Option<&str>) {
+    match &n.kind {
+        NodeKind::Element { tag, id, class, style_attr, .. } => (
+            tag.as_str(),
+            id.as_deref(),
+            class.as_deref(),
+            style_attr.as_deref(),
+        ),
+        _ => ("", None, None, None),
+    }
+}
+
+/// Gather a table's rows as lists of cell nodes (`<td>`/`<th>`), descending
+/// through `<thead>`/`<tbody>`/`<tfoot>`. Rowspan is not modeled.
+fn collect_table_rows<'a>(n: &'a Node, rows: &mut Vec<Vec<&'a Node>>) {
+    for child in &n.children {
+        if let NodeKind::Element { tag, .. } = &child.kind {
+            match tag.as_str() {
+                "tr" => {
+                    let cells: Vec<&Node> = child
+                        .children
+                        .iter()
+                        .filter(|c| {
+                            matches!(&c.kind, NodeKind::Element { tag, .. }
+                                if tag == "td" || tag == "th")
+                        })
+                        .collect();
+                    rows.push(cells);
+                }
+                "thead" | "tbody" | "tfoot" => collect_table_rows(child, rows),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Lay a table cell out as an isolated fragment at the origin within `width`,
+/// insetting its content by the cell's padding. Returns `(mark, box_w, box_h)`
+/// (border-box dimensions). The caller either rewinds (trial measure) or
+/// translates the fragment into place.
+#[allow(clippy::too_many_arguments)]
+fn layout_cell_isolated<'a>(
+    cell: &'a Node,
+    sheet: &Stylesheet,
+    parent_st: &ComputedStyle,
+    width: i32,
+    line_h: i32,
+    runs: &mut Vec<TextRun>,
+    links: &mut Vec<LinkBox>,
+    rects: &mut Vec<RectBox>,
+    images: &mut Vec<ImageBox>,
+    controls: &mut Vec<FormControl>,
+    frames: &mut Vec<FrameBox>,
+    aux: &mut Aux,
+    link: Option<&str>,
+    form: Option<&FormCtx>,
+    next_form_id: &mut u32,
+    page_bg: &mut u32,
+    vw: i32,
+    in_head: bool,
+    chain: &[css::ElemRef<'a>],
+) -> (FragMark, i32, i32, ComputedStyle) {
+    let (ct, cid, cc, cs) = elem_parts(cell);
+    let cst = css::compute_ex(sheet, ct, cid, cc, cs, parent_st, chain);
+    let child_chain = push_chain(chain, ct, cid, cc);
+    let child_chain = child_chain.as_slice();
+    let (pl, pr) = (cst.padding_left.max(0), cst.padding_right.max(0));
+    let (pt, pb) = (cst.padding_top.max(0), cst.padding_bottom.max(0));
+    let mark = mark_frag(runs, links, rects, images, controls, frames, aux);
+    let mut ccur = Cursor {
+        x: pl,
+        y: pt,
+        max_w: (width - pl - pr).max(1),
+        margin_x: pl,
+        line_h,
+        content_bottom: pt,
+        float_l_w: 0,
+        float_l_bottom: 0,
+        float_r_w: 0,
+        float_r_bottom: 0,
+    };
+    for c in &cell.children {
+        walk(
+            c, sheet, &cst, &mut ccur, runs, links, rects, images, controls, frames, aux, link,
+            form, next_form_id, page_bg, vw, in_head, child_chain,
+        );
+    }
+    let (x0, _y0, x1, y1) = frag_bbox(mark, runs, links, rects, images, controls, frames, aux);
+    let content_w = if x1 >= x0 { x1 - pl } else { 0 };
+    let box_w = content_w.max(0) + pl + pr;
+    let box_h = (y1 - pt).max(ccur.content_bottom - pt).max(line_h) + pt + pb;
+    (mark, box_w.max(1), box_h.max(1), cst)
+}
+
+/// **Genuine auto table layout.** Measures each cell's min/max-content width,
+/// distributes the container width across columns (fixed `width` honored,
+/// remaining space shared between min and max per the CSS auto algorithm), then
+/// places each cell into its column x / row y with the row's max height.
+/// `border-spacing` gutters cells. Simplified: no rowspan, colspan treated as 1.
+#[allow(clippy::too_many_arguments)]
+fn layout_table<'a>(
+    n: &'a Node,
+    sheet: &Stylesheet,
+    table_st: &ComputedStyle,
+    cur: &mut Cursor,
+    runs: &mut Vec<TextRun>,
+    links: &mut Vec<LinkBox>,
+    rects: &mut Vec<RectBox>,
+    images: &mut Vec<ImageBox>,
+    controls: &mut Vec<FormControl>,
+    frames: &mut Vec<FrameBox>,
+    aux: &mut Aux,
+    link: Option<&str>,
+    form: Option<&FormCtx>,
+    next_form_id: &mut u32,
+    page_bg: &mut u32,
+    vw: i32,
+    in_head: bool,
+    chain: &[css::ElemRef<'a>],
+) {
+    let px = table_st.font_size.max(8) as f32;
+    let line_h = (crate::font_ttf::line_height(px) + 0.5) as i32;
+    // Cells see the table as their nearest matched ancestor (tr/tbody are
+    // flattened by collect_table_rows — an approximation for `tr td` selectors).
+    let (tt, tid, tc, _) = elem_parts(n);
+    let cell_chain = push_chain(chain, tt, tid, tc);
+    let cell_chain = cell_chain.as_slice();
+    let mut rows: Vec<Vec<&Node>> = Vec::new();
+    collect_table_rows(n, &mut rows);
+    if rows.is_empty() {
+        return;
+    }
+    let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+    block_before(cur, table_st.margin_top.max(2));
+    let box_x = cur.margin_x + table_st.margin_left.max(0);
+    let container_w =
+        (cur.max_w - table_st.margin_left.max(0) - table_st.margin_right.max(0)).max(1);
+    let spacing = table_st.border_spacing.max(0);
+
+    // 1. Per-column min/max-content widths (honoring an explicit cell `width`).
+    let mut col_min = alloc::vec![0i32; ncols];
+    let mut col_max = alloc::vec![0i32; ncols];
+    for row in &rows {
+        for (ci, &cell) in row.iter().enumerate() {
+            if ci >= ncols {
+                break;
+            }
+            let (m1, maxw, _, cst) = layout_cell_isolated(
+                cell, sheet, table_st, container_w, line_h, runs, links, rects, images,
+                controls, frames, aux, link, form, next_form_id, page_bg, vw, in_head, cell_chain,
+            );
+            rewind_frag(m1, runs, links, rects, images, controls, frames, aux);
+            let (m2, minw, _, _) = layout_cell_isolated(
+                cell, sheet, table_st, 8, line_h, runs, links, rects, images, controls,
+                frames, aux, link, form, next_form_id, page_bg, vw, in_head, cell_chain,
+            );
+            rewind_frag(m2, runs, links, rects, images, controls, frames, aux);
+            let fixed = cst.width;
+            col_max[ci] = col_max[ci].max(fixed.unwrap_or(maxw));
+            col_min[ci] = col_min[ci].max(fixed.unwrap_or(minw).min(fixed.unwrap_or(maxw)));
+        }
+    }
+
+    // 2. Distribute the available width across columns.
+    let gutters = spacing * (ncols as i32 + 1);
+    let avail = (container_w - gutters).max(1);
+    let total_min: i32 = col_min.iter().sum();
+    let total_max: i32 = col_max.iter().sum();
+    let col_w: Vec<i32> = if total_max <= avail {
+        col_max.clone()
+    } else if total_min >= avail {
+        col_min.clone()
+    } else {
+        let extra = avail - total_min;
+        let span = (total_max - total_min).max(1);
+        col_min
+            .iter()
+            .zip(&col_max)
+            .map(|(&mn, &mx)| mn + (mx - mn) * extra / span)
+            .collect()
+    };
+    let mut col_x = Vec::with_capacity(ncols);
+    let mut acc = box_x + spacing;
+    for w in &col_w {
+        col_x.push(acc);
+        acc += w + spacing;
+    }
+    let table_w = (acc - box_x).max(1);
+
+    // 3. Place each row's cells; row height = tallest cell.
+    let table_y0 = cur.y;
+    let mut row_y = cur.y + spacing;
+    for row in &rows {
+        let mut placed: Vec<(FragMark, FragMark, usize, ComputedStyle)> = Vec::new();
+        let mut row_h = line_h;
+        for (ci, &cell) in row.iter().enumerate() {
+            if ci >= ncols {
+                break;
+            }
+            let (mark, _w, h, cst) = layout_cell_isolated(
+                cell, sheet, table_st, col_w[ci], line_h, runs, links, rects, images,
+                controls, frames, aux, link, form, next_form_id, page_bg, vw, in_head, cell_chain,
+            );
+            let end = mark_frag(runs, links, rects, images, controls, frames, aux);
+            row_h = row_h.max(h);
+            placed.push((mark, end, ci, cst));
+        }
+        // Now that the row height is known, position each cell fragment (only
+        // its own `[mark, end)` range — a bounded translate) + its box.
+        for (mark, end, ci, cst) in &placed {
+            translate_frag_range(
+                *mark, *end, col_x[*ci], row_y, runs, links, rects, images, controls, frames, aux,
+            );
+            // Cell background/border box spans the full column × row cell.
+            if let Some(bg) = cst.background {
+                rects.push(RectBox {
+                    x: col_x[*ci],
+                    y: row_y,
+                    w: col_w[*ci],
+                    h: row_h,
+                    color: fade(bg, cst.opacity),
+                    radius: cst.border_radius.max(0),
+                    blur: 0,
+                });
+            }
+            push_box_borders(rects, col_x[*ci], row_y, col_w[*ci], row_h, cst);
+        }
+        row_y += row_h + spacing;
+    }
+
+    // 4. The table box itself (background/border) + advance the flow.
+    let table_h = (row_y - table_y0).max(1);
+    if let Some(bg) = table_st.background {
+        rects.push(RectBox {
+            x: box_x,
+            y: table_y0,
+            w: table_w,
+            h: table_h,
+            color: fade(bg, table_st.opacity),
+            radius: table_st.border_radius.max(0),
+            blur: 0,
+        });
+    }
+    push_box_borders(rects, box_x, table_y0, table_w, table_h, table_st);
+    aux.push_elem_box(n.elem_idx, box_x, table_y0, table_w, table_h);
+    cur.y = row_y;
+    cur.content_bottom = cur.content_bottom.max(cur.y);
+    block_after(cur, table_st.margin_bottom.max(2));
+}
+
 /// Layout children of a flex/grid container: measure each element child as an
 /// independent fragment, then place with [`flex`] geometry.
-fn layout_flex_grid_container(
-    n: &Node,
+fn layout_flex_grid_container<'a>(
+    n: &'a Node,
     sheet: &Stylesheet,
     st: &ComputedStyle,
     cur: &mut Cursor,
@@ -1534,7 +1997,12 @@ fn layout_flex_grid_container(
     vw: i32,
     in_head: bool,
     line_h: i32,
+    chain: &[css::ElemRef<'a>],
 ) {
+    // Flex/grid items are children of `n`; their ancestor chain is n's plus n.
+    let (nt, nid, nc, _) = elem_parts(n);
+    let item_chain = push_chain(chain, nt, nid, nc);
+    let item_chain = item_chain.as_slice();
     block_before(cur, st.margin_top.max(0));
     cur.y += st.padding_top;
     let box_x = cur.margin_x + st.margin_left;
@@ -1587,6 +2055,7 @@ fn layout_flex_grid_container(
 
     struct Item {
         mark: FragMark,
+        end: FragMark,
         x0: i32,
         y0: i32,
         w: i32,
@@ -1613,7 +2082,7 @@ fn layout_flex_grid_container(
             ),
             _ => continue,
         };
-        let cst = css::compute(sheet, ctag, cid, cclass, cstyle, st);
+        let cst = css::compute_ex(sheet, ctag, cid, cclass, cstyle, st, item_chain);
         // `flex-basis` is the item's initial main size (overrides `width`).
         let item_w = cst
             .flex_basis
@@ -1668,6 +2137,7 @@ fn layout_flex_grid_container(
             page_bg,
             vw,
             in_head,
+            item_chain,
         );
         let (x0, y0, x1, y1) =
             frag_bbox(mark, runs, links, rects, images, controls, frames, aux);
@@ -1696,8 +2166,12 @@ fn layout_flex_grid_container(
         } else {
             st.flex_grow
         };
+        // End of this item's geometry (its fragment is `[mark, end)`), so each
+        // item can be translated independently without shifting later siblings.
+        let end = mark_frag(runs, links, rects, images, controls, frames, aux);
         items.push(Item {
             mark,
+            end,
             x0,
             y0,
             w,
@@ -1740,7 +2214,7 @@ fn layout_flex_grid_container(
                 if let Some(it) = visual.get(p.index).and_then(|&i| items.get(i)) {
                     let dx = box_x + p.x - it.x0;
                     let dy = box_y + p.y - it.y0;
-                    translate_frag(it.mark, dx, dy, runs, links, rects, images, controls, frames, aux);
+                    translate_frag_range(it.mark, it.end, dx, dy, runs, links, rects, images, controls, frames, aux);
                     max_x = max_x.max(p.x + p.w);
                     max_y = max_y.max(p.y + p.h);
                 }
@@ -1770,8 +2244,8 @@ fn layout_flex_grid_container(
                             flex::flex_cross_offset(it.h.min(cell_h), cell_h, st.align_items);
                         let dx = box_x + p.x + ix - it.x0;
                         let dy = box_y + p.y + iy - it.y0;
-                        translate_frag(
-                            it.mark, dx, dy, runs, links, rects, images, controls, frames, aux,
+                        translate_frag_range(
+                            it.mark, it.end, dx, dy, runs, links, rects, images, controls, frames, aux,
                         );
                         max_y = max_y.max(p.y + p.h);
                     }
@@ -1800,7 +2274,7 @@ fn layout_flex_grid_container(
                     let iy = flex::flex_cross_offset(it.h.min(cell_h), cell_h, st.align_items);
                     let dx = box_x + gx + ix - it.x0;
                     let dy = box_y + gy + iy - it.y0;
-                    translate_frag(it.mark, dx, dy, runs, links, rects, images, controls, frames, aux);
+                    translate_frag_range(it.mark, it.end, dx, dy, runs, links, rects, images, controls, frames, aux);
                 }
                 let rows = (items.len() + ncols - 1) / ncols;
                 content_h = if rows == 0 {
@@ -1845,6 +2319,9 @@ fn push_control(
     node: &Node,
     line_h: i32,
     radius: i32,
+    bg: Option<u32>,
+    fg: Option<u32>,
+    transparent: bool,
 ) {
     let kind = ControlKind::from_input_type(input_type, tag);
     if kind == ControlKind::Hidden {
@@ -1869,6 +2346,9 @@ fn push_control(
             checked: false,
             elem_idx: node.elem_idx,
             radius: 0,
+            bg: None,
+            fg: None,
+            transparent: false,
         });
         return;
     }
@@ -1934,6 +2414,9 @@ fn push_control(
         checked: false,
         elem_idx: node.elem_idx,
         radius,
+        bg,
+        fg,
+        transparent,
     });
     cur.x = ctrl_x + w + CTRL_GAP;
     cur.content_bottom = cur.content_bottom.max(ctrl_y + h);
@@ -2549,6 +3032,128 @@ mod tests {
         let (a, b) = (&lay.controls[0], &lay.controls[1]);
         assert_eq!(a.y, b.y, "adjacent controls share a line");
         assert!(b.x >= a.x + a.w, "second control is to the right of the first");
+    }
+
+    #[test_case]
+    fn table_columns_place_cells_in_grid() {
+        // Genuine table layout: cells in a row sit side by side (same y,
+        // increasing x); the second row is below the first.
+        let doc = html::parse(
+            r#"<html><body><table>
+                 <tr><td>A1</td><td>B1</td></tr>
+                 <tr><td>A2</td><td>B2</td></tr>
+               </table></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let r = |t: &str| *lay.runs.iter().find(|r| r.text == t).unwrap_or_else(|| panic!("{t}"));
+        let (a1, b1, a2, b2) = (r("A1"), r("B1"), r("A2"), r("B2"));
+        assert_eq!(a1.y, b1.y, "row 1 cells share a line");
+        assert!(b1.x > a1.x, "col B is right of col A");
+        assert_eq!(a2.y, b2.y, "row 2 cells share a line");
+        assert!(a2.y > a1.y, "row 2 is below row 1");
+        // Columns align across rows.
+        assert_eq!(a1.x, a2.x, "column A x aligns across rows");
+        assert_eq!(b1.x, b2.x, "column B x aligns across rows");
+    }
+
+    #[test_case]
+    fn table_column_width_follows_content() {
+        // A wide first-column cell makes column A wider, pushing column B right.
+        let doc = html::parse(
+            r#"<html><body><table><tr>
+                 <td>a very long first cell with lots of words here</td><td>B</td>
+               </tr></table></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let a = lay.runs.iter().find(|r| r.text == "very").expect("A content");
+        let b = lay.runs.iter().find(|r| r.text == "B").expect("B");
+        assert!(b.x > a.x + 100, "wide column A pushes B well to the right (b.x={})", b.x);
+    }
+
+    #[test_case]
+    fn link_styled_as_button_paints_background() {
+        // An `<a>` with a background (a link-button like google.com's "Sign in")
+        // paints an inline background box behind its text.
+        let doc = html::parse(
+            r#"<html><body><a style="background:#c2e7ff;padding:10px;border-radius:20px" href="/s">Sign in</a></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let sign = lay.runs.iter().find(|r| r.text == "Sign").expect("Sign run");
+        // A background rect of the button colour covers the link's text.
+        assert!(
+            lay.rects.iter().any(|rc| rc.color == 0xc2e7ff
+                && rc.x <= sign.x
+                && rc.x + rc.w >= sign.x),
+            "expected an inline background box behind the link-button"
+        );
+    }
+
+    #[test_case]
+    fn inline_block_link_keeps_href_and_background() {
+        // google.com's "Sign in" is `<a class=gb_1a>` with
+        // `display:inline-block; background:#0b57d0`. The inline-block path used
+        // to drop BOTH the href (→ not clickable) and the background (→ not
+        // blue). Both must survive now.
+        let doc = html::parse(
+            r#"<html><body><div class="gb_Na"><a class="gb_1a" href="/login" style="display:inline-block;background:#0b57d0;color:#fff;padding:10px 24px;border-radius:100px">Sign in</a></div></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let sign = lay.runs.iter().find(|r| r.text == "Sign").expect("Sign run");
+        // Clickable: a LinkBox covers the "Sign" run.
+        assert!(
+            lay.links.iter().any(|lb| lb.href == "/login"
+                && lb.x <= sign.x
+                && lb.x + lb.w >= sign.x),
+            "inline-block <a> must still emit a LinkBox for its href"
+        );
+        // Blue: a background pill of the button colour sits behind the text.
+        assert!(
+            lay.rects.iter().any(|rc| rc.color == 0x0b57d0 && rc.radius == 100),
+            "inline-block <a> button must paint its background pill"
+        );
+        // And a hit test at the text lands on the link.
+        assert!(matches!(
+            hit_test_ex(&lay, sign.x + 1, sign.y + 1),
+            Hit::Link(_)
+        ));
+    }
+
+    #[test_case]
+    fn inline_link_horizontal_margin_spaces_siblings() {
+        // Adjacent footer links `</a><a>` with `margin:0 12px` must not run
+        // together — the horizontal margin adds a gap (google.com #WqQANb).
+        let doc = html::parse(
+            r#"<html><body><a style="margin:0 12px" href="/1">One</a><a style="margin:0 12px" href="/2">Two</a></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let one = lay.runs.iter().find(|r| r.text == "One").expect("One");
+        let two = lay.runs.iter().find(|r| r.text == "Two").expect("Two");
+        // "Two" starts well past One's end (One width + right+left margins ~24px).
+        let one_end = one.x + (crate::font_ttf::measure("One", one.font_size as f32) as i32);
+        assert!(two.x >= one_end + 18, "gap between links (two.x={}, one_end={})", two.x, one_end);
+    }
+
+    #[test_case]
+    fn br_after_tall_content_no_overlap() {
+        // A `<br>` after a tall inline-block (a search box) must break past its
+        // height, not overlap the next line onto it (google.com search buttons).
+        let doc = html::parse(
+            r#"<html><body><input type="text"><br><input type="submit" value="Go"></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        assert_eq!(lay.controls.len(), 2);
+        let (text, btn) = (&lay.controls[0], &lay.controls[1]);
+        assert!(
+            btn.y >= text.y + text.h,
+            "submit (y={}) must sit below the text box bottom (y+h={})",
+            btn.y, text.y + text.h
+        );
     }
 
     #[test_case]

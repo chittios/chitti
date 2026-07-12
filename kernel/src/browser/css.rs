@@ -673,19 +673,61 @@ struct Decl {
     important: bool,
 }
 
-#[derive(Clone, Debug)]
-enum Sel {
-    Universal,
-    Tag(String),
-    Class(String),
-    Id(String),
-    TagClass(String, String),
-    TagId(String, String),
+/// A **compound selector** — one sequence of simple selectors with no
+/// combinator (`a.gb_1a`, `.gb_9a.gb_K`, `div#x`, `*`, `p`). `tag == None`
+/// means "any tag" for this position; all `classes` must be present.
+#[derive(Clone, Debug, Default)]
+struct Compound {
+    tag: Option<String>,
+    id: Option<String>,
+    classes: Vec<String>,
 }
+
+impl Compound {
+    fn matches(&self, tag: &str, id: Option<&str>, class: Option<&str>) -> bool {
+        if let Some(t) = &self.tag {
+            if !t.eq_ignore_ascii_case(tag) {
+                return false;
+            }
+        }
+        if let Some(i) = &self.id {
+            if id != Some(i.as_str()) {
+                return false;
+            }
+        }
+        if !self.classes.is_empty() {
+            let cs = class.unwrap_or("");
+            for c in &self.classes {
+                if !cs.split_whitespace().any(|x| x == c) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    /// (id, class, type) specificity contribution of this compound.
+    fn spec(&self) -> (u32, u32, u32) {
+        (
+            self.id.is_some() as u32,
+            self.classes.len() as u32,
+            self.tag.is_some() as u32,
+        )
+    }
+}
+
+/// One (tag, id, class) triple in an element's ancestor chain, ordered
+/// **outermost → innermost** (root first, parent last) — used for
+/// descendant-combinator matching.
+pub type ElemRef<'a> = (&'a str, Option<&'a str>, Option<&'a str>);
 
 #[derive(Clone, Debug)]
 struct Rule {
-    sel: Sel,
+    /// Rightmost compound — must match the element itself.
+    key: Compound,
+    /// Ancestor compounds (left of the key), outermost → innermost. Each must
+    /// match some ancestor, preserving order (descendant combinator; `>`/`+`/`~`
+    /// are approximated as descendant).
+    ancestors: Vec<Compound>,
     decls: Vec<Decl>,
     /// Specificity: (id, class, type)
     spec: (u8, u8, u8),
@@ -905,11 +947,12 @@ impl Stylesheet {
                 continue;
             }
             for sel_str in sel_part.split(',') {
-                if let Some(sel) = parse_selector(sel_str.trim()) {
-                    let spec = specificity(&sel);
+                if let Some((key, ancestors)) = parse_complex(sel_str.trim()) {
+                    let spec = specificity(&key, &ancestors);
                     let order = self.rules.len() as u32;
                     self.rules.push(Rule {
-                        sel,
+                        key,
+                        ancestors,
                         decls: decls.clone(),
                         spec,
                         order,
@@ -920,18 +963,33 @@ impl Stylesheet {
         }
     }
 
-    /// Match rules for an element; return merged decls sorted by cascade.
-    /// Order: layer (unlayered last / highest) → specificity → source order.
+    /// Match rules for an element (no ancestor context — descendant selectors
+    /// with an ancestor part are treated as never-matching unless their key
+    /// alone matches with no ancestor requirement). Prefer [`matching_decls_ex`].
     pub fn matching_decls(
         &self,
         tag: &str,
         id: Option<&str>,
         class: Option<&str>,
     ) -> Vec<(String, String, bool)> {
+        self.matching_decls_ex(tag, id, class, &[])
+    }
+
+    /// Match rules for an element given its ancestor chain (outermost→innermost),
+    /// so descendant selectors (`.gb_Na a.gb_1a`) match only when the ancestor
+    /// compounds are actually present. Return merged decls sorted by cascade:
+    /// layer (unlayered last / highest) → specificity → source order.
+    pub fn matching_decls_ex(
+        &self,
+        tag: &str,
+        id: Option<&str>,
+        class: Option<&str>,
+        chain: &[ElemRef],
+    ) -> Vec<(String, String, bool)> {
         let mut matched: Vec<&Rule> = self
             .rules
             .iter()
-            .filter(|r| matches_sel(&r.sel, tag, id, class))
+            .filter(|r| r.key.matches(tag, id, class) && ancestors_match(&r.ancestors, chain))
             .collect();
         matched.sort_by(|a, b| {
             // Unlayered (None) sorts after layered → higher priority.
@@ -951,72 +1009,99 @@ impl Stylesheet {
     }
 }
 
-fn specificity(sel: &Sel) -> (u8, u8, u8) {
-    match sel {
-        Sel::Universal => (0, 0, 0),
-        Sel::Tag(_) => (0, 0, 1),
-        Sel::Class(_) => (0, 1, 0),
-        Sel::Id(_) => (1, 0, 0),
-        Sel::TagClass(_, _) => (0, 1, 1),
-        Sel::TagId(_, _) => (1, 0, 1),
+/// Specificity of a complex selector = sum over the key + ancestor compounds
+/// of (ids, classes, types), saturated into `(u8, u8, u8)`.
+fn specificity(key: &Compound, ancestors: &[Compound]) -> (u8, u8, u8) {
+    let (mut a, mut b, mut c) = key.spec();
+    for anc in ancestors {
+        let (x, y, z) = anc.spec();
+        a += x;
+        b += y;
+        c += z;
     }
+    (a.min(255) as u8, b.min(255) as u8, c.min(255) as u8)
 }
 
-fn parse_selector(s: &str) -> Option<Sel> {
+/// Parse one compound selector (`a.gb_1a`, `.gb_9a.gb_K`, `div#x`, `*`, `p`).
+/// A pseudo-class/element (`:hover`, `::before`) makes the whole selector
+/// unsupported (returns `None`) — matching today's behaviour of dropping such
+/// rules rather than applying them unconditionally.
+fn parse_compound(s: &str) -> Option<Compound> {
     let s = s.trim();
-    if s.is_empty() || s.contains(' ') || s.contains('>') || s.contains('+') || s.contains('~') {
-        // Combinators unsupported in v1.
-        if s.contains(' ') || s.contains('>') {
-            // Take the last simple part (descendant: use rightmost).
-            let last = s.split(|c: char| c == ' ' || c == '>').last()?.trim();
-            return parse_selector(last);
-        }
+    if s.is_empty() || s.contains(':') || s.contains('[') {
+        return None;
     }
     if s == "*" {
-        return Some(Sel::Universal);
+        return Some(Compound::default());
     }
-    if let Some(rest) = s.strip_prefix('#') {
-        if !rest.is_empty() {
-            return Some(Sel::Id(rest.to_string()));
+    let mut c = Compound::default();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    // Leading type (tag) selector, if any.
+    while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'#' {
+        i += 1;
+    }
+    if i > 0 {
+        let t = &s[..i];
+        if !t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return None;
+        }
+        c.tag = Some(t.to_ascii_lowercase());
+    }
+    // `.class` / `#id` tokens.
+    while i < bytes.len() {
+        let marker = bytes[i];
+        i += 1;
+        let start = i;
+        while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'#' {
+            i += 1;
+        }
+        let name = &s[start..i];
+        if name.is_empty() {
+            return None;
+        }
+        match marker {
+            b'.' => c.classes.push(name.to_string()),
+            b'#' => c.id = Some(name.to_string()),
+            _ => return None,
         }
     }
-    if let Some(rest) = s.strip_prefix('.') {
-        if !rest.is_empty() {
-            return Some(Sel::Class(rest.to_string()));
-        }
-    }
-    // tag, tag.class, tag#id
-    if let Some(i) = s.find('.') {
-        let (t, c) = s.split_at(i);
-        let c = &c[1..];
-        if !t.is_empty() && !c.is_empty() {
-            return Some(Sel::TagClass(t.to_ascii_lowercase(), c.to_string()));
-        }
-    }
-    if let Some(i) = s.find('#') {
-        let (t, id) = s.split_at(i);
-        let id = &id[1..];
-        if !t.is_empty() && !id.is_empty() {
-            return Some(Sel::TagId(t.to_ascii_lowercase(), id.to_string()));
-        }
-    }
-    if s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
-        return Some(Sel::Tag(s.to_ascii_lowercase()));
-    }
-    None
+    Some(c)
 }
 
-fn matches_sel(sel: &Sel, tag: &str, id: Option<&str>, class: Option<&str>) -> bool {
-    let classes = class.unwrap_or("");
-    let has_class = |c: &str| classes.split_whitespace().any(|x| x == c);
-    match sel {
-        Sel::Universal => true,
-        Sel::Tag(t) => t.eq_ignore_ascii_case(tag),
-        Sel::Class(c) => has_class(c),
-        Sel::Id(i) => id.map(|x| x == i.as_str()).unwrap_or(false),
-        Sel::TagClass(t, c) => t.eq_ignore_ascii_case(tag) && has_class(c),
-        Sel::TagId(t, i) => t.eq_ignore_ascii_case(tag) && id.map(|x| x == i.as_str()).unwrap_or(false),
+/// Parse a complex selector into (key compound, ancestor compounds
+/// outermost→innermost). Combinators `>`/`+`/`~` are approximated as
+/// descendant. Returns `None` if any compound is unsupported.
+fn parse_complex(s: &str) -> Option<(Compound, Vec<Compound>)> {
+    // Split on descendant/child/sibling combinators (whitespace or > + ~).
+    let mut parts: Vec<Compound> = Vec::new();
+    for tok in s.split(|c: char| c == ' ' || c == '>' || c == '+' || c == '~') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        parts.push(parse_compound(tok)?);
     }
+    let key = parts.pop()?;
+    Some((key, parts))
+}
+
+/// True if `ancestors` (the selector's ancestor compounds, outermost→innermost)
+/// match a subsequence of `chain` (the element's ancestor chain, same order).
+fn ancestors_match(ancestors: &[Compound], chain: &[ElemRef]) -> bool {
+    if ancestors.is_empty() {
+        return true;
+    }
+    let mut ai = 0;
+    for &(tag, id, class) in chain {
+        if ancestors[ai].matches(tag, id, class) {
+            ai += 1;
+            if ai == ancestors.len() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn parse_decls(block: &str) -> Vec<Decl> {
@@ -1097,12 +1182,40 @@ pub fn parse_color(s: &str) -> Option<u32> {
             return u32::from_str_radix(&hex[0..6], 16).ok();
         }
     }
-    if let Some(inner) = s.strip_prefix("rgb(").and_then(|x| x.strip_suffix(')')) {
-        let mut parts = inner.split(',');
-        let r: u32 = parts.next()?.trim().parse().ok()?;
-        let g: u32 = parts.next()?.trim().parse().ok()?;
-        let b: u32 = parts.next()?.trim().parse().ok()?;
-        return Some(((r.min(255)) << 16) | ((g.min(255)) << 8) | b.min(255));
+    // `rgb(r,g,b)` and `rgba(r,g,b,a)` (also space/slash-separated). Alpha is
+    // approximated by blending toward white (light-theme assumption), so a
+    // subtle `rgba(0,0,0,.08)` border renders light instead of solid black.
+    let rgb_inner = s
+        .strip_prefix("rgba(")
+        .or_else(|| s.strip_prefix("rgb("))
+        .and_then(|x| x.strip_suffix(')'));
+    if let Some(inner) = rgb_inner {
+        // Split on commas or whitespace / slash (CSS4 syntax).
+        let norm = inner.replace('/', " ").replace(',', " ");
+        let mut parts = norm.split_whitespace();
+        let comp = |t: &str| -> Option<u32> {
+            if let Some(p) = t.strip_suffix('%') {
+                p.trim().parse::<f32>().ok().map(|v| (v * 255.0 / 100.0) as u32)
+            } else {
+                t.trim().parse::<f32>().ok().map(|v| v as u32)
+            }
+        };
+        let r = comp(parts.next()?)?.min(255);
+        let g = comp(parts.next()?)?.min(255);
+        let b = comp(parts.next()?)?.min(255);
+        let a: f32 = match parts.next() {
+            Some(t) => {
+                if let Some(p) = t.strip_suffix('%') {
+                    p.trim().parse::<f32>().map(|v| v / 100.0).unwrap_or(1.0)
+                } else {
+                    t.trim().parse::<f32>().unwrap_or(1.0)
+                }
+            }
+            None => 1.0,
+        }
+        .clamp(0.0, 1.0);
+        let mix = |c: u32| -> u32 { ((c as f32 * a + 255.0 * (1.0 - a)) as u32).min(255) };
+        return Some((mix(r) << 16) | (mix(g) << 8) | mix(b));
     }
     None
 }
@@ -1505,7 +1618,13 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
             };
         }
         "border-radius" => {
-            if let Some(px) = parse_px(value.split_whitespace().next().unwrap_or(value)) {
+            let first = value.split_whitespace().next().unwrap_or(value).trim();
+            if first.ends_with('%') {
+                // A percentage radius is relative to the box; the painter clamps
+                // radius to half the shorter side, so a large sentinel yields a
+                // circle/pill (the ubiquitous `border-radius:50%` case).
+                st.border_radius = 100_000;
+            } else if let Some(px) = parse_px(first) {
                 st.border_radius = px.max(0);
             }
         }
@@ -2219,6 +2338,20 @@ pub fn compute(
     inline: Option<&str>,
     parent: &ComputedStyle,
 ) -> ComputedStyle {
+    compute_ex(sheet, tag, id, class, inline, parent, &[])
+}
+
+/// Like [`compute`] but with the element's ancestor chain (outermost→innermost)
+/// so descendant selectors resolve correctly.
+pub fn compute_ex(
+    sheet: &Stylesheet,
+    tag: &str,
+    id: Option<&str>,
+    class: Option<&str>,
+    inline: Option<&str>,
+    parent: &ComputedStyle,
+    chain: &[ElemRef],
+) -> ComputedStyle {
     let mut st = ComputedStyle::default();
     // Inherited properties from parent.
     st.color = parent.color;
@@ -2286,7 +2419,7 @@ pub fn compute(
         }
         _ => {}
     }
-    let mut decls = sheet.matching_decls(tag, id, class);
+    let mut decls = sheet.matching_decls_ex(tag, id, class, chain);
     if let Some(inl) = inline {
         for d in parse_decls(inl) {
             // Inline style ≈ specificity (1,0,0,0) — applied after author rules
@@ -2743,6 +2876,23 @@ mod tests {
     }
 
     #[test_case]
+    fn rgba_and_percent_radius() {
+        // rgba() now parses (Google uses it for borders/shadows); alpha blends
+        // toward white so a subtle border isn't rendered solid black.
+        assert_eq!(parse_color("rgba(0,0,0,1)"), Some(0x000000));
+        assert_eq!(parse_color("rgba(255,255,255,1)"), Some(0xffffff));
+        let subtle = parse_color("rgba(0,0,0,0.08)").unwrap();
+        assert!(subtle > 0xe0e0e0, "low-alpha black blends to near-white: {:06x}", subtle);
+        assert_eq!(parse_color("rgb(1, 2, 3)"), Some(0x010203));
+        // `border-radius:50%` → large sentinel (paint clamps to half → circle).
+        let mut st = ComputedStyle::default();
+        apply_one(&mut st, "border-radius", "50%");
+        assert!(st.border_radius >= 10_000, "percent radius is a large sentinel");
+        apply_one(&mut st, "border-radius", "8px");
+        assert_eq!(st.border_radius, 8);
+    }
+
+    #[test_case]
     fn recognized_only_props_now_store() {
         let mut st = ComputedStyle::default();
         apply_one(&mut st, "zoom", "150%");
@@ -2990,6 +3140,50 @@ mod tests {
         let mut st2 = ComputedStyle::default();
         apply_decls(&mut st2, &sheet2.matching_decls("div", Some("x"), None));
         assert_eq!(st2.color, 0x00ff00, "later layer wins");
+    }
+
+    #[test_case]
+    fn descendant_selector_needs_ancestor() {
+        // google.com's Sign-in: `.gb_Na a.gb_1a` (bright blue) vs
+        // `.gb_9a.gb_K a.gb_1a` (pale). Only the rule whose ancestor classes are
+        // actually present must apply — a rightmost-only matcher wrongly let the
+        // pale rule win.
+        let css = r#"
+            .gb_Na a.gb_1a { background: #0b57d0; color: #fff; border-radius: 100px; }
+            .gb_9a.gb_K a.gb_1a { background: #c2e7ff; color: #001d35; }
+        "#;
+        let sheet = Stylesheet::parse(css);
+        let parent = ComputedStyle::default();
+
+        // No ancestor context → neither descendant rule applies.
+        let bare = compute(&sheet, "a", None, Some("gb_1a"), None, &parent);
+        assert_eq!(bare.background, None, "no ancestor → no descendant match");
+
+        // Ancestor <div class="gb_Na gb_9a"> present (has gb_Na, lacks gb_K):
+        // only the bright-blue rule matches.
+        let chain: &[ElemRef] = &[("body", None, None), ("div", None, Some("gb_Na gb_9a"))];
+        let signin = compute_ex(&sheet, "a", None, Some("gb_1a"), None, &parent, chain);
+        assert_eq!(signin.background, Some(0x0b57d0), "gb_Na ancestor → bright blue");
+        assert_eq!(signin.color, 0xffffff);
+        assert_eq!(signin.border_radius, 100);
+
+        // With gb_K present too, the pale rule (later, equal-ish specificity) wins.
+        let chain2: &[ElemRef] = &[("div", None, Some("gb_9a gb_K"))];
+        let pale = compute_ex(&sheet, "a", None, Some("gb_1a"), None, &parent, chain2);
+        assert_eq!(pale.background, Some(0xc2e7ff), "gb_9a.gb_K ancestor → pale");
+    }
+
+    #[test_case]
+    fn compound_and_ancestor_specificity() {
+        // A multi-class compound counts each class; descendant compounds add up.
+        assert!(parse_compound(".a.b.c").is_some());
+        let (key, anc) = parse_complex("div.card a.link").unwrap();
+        assert!(key.matches("a", None, Some("link")));
+        assert!(!key.matches("a", None, Some("other")));
+        assert_eq!(anc.len(), 1);
+        assert!(anc[0].matches("div", None, Some("card foo")));
+        // Pseudo-classes drop the rule (unsupported), not applied unconditionally.
+        assert!(parse_complex("a:hover").is_none());
     }
 
     #[test_case]
