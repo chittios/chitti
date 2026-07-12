@@ -1,0 +1,39 @@
+{
+  "name": "ubuntu",
+  "font": "Ubuntu Mono",
+  "font_scale": 0,
+  "wallpaper": "gradient:#2c001e,#77216f",
+  "opacity": 234,
+  "cursor": { "fill": "#300a24", "outline": "#e95420" },
+  "palette": {
+    "accent": "#e95420",
+    "screen_bg": "#2c001e",
+    "chat_bg": "#300a24",
+    "logs_bg": "#250019",
+    "chat_fg": "#f2f1f0",
+    "logs_fg": "#d0cfcc",
+    "border_dim": "#5e2750",
+    "title_active": "#e95420",
+    "title_dim": "#a89aa2",
+    "sep_dim": "#44213a",
+    "status_bg": "#3b0b2e",
+    "status_fg": "#d0cfcc",
+    "editor_bg": "#300a24",
+    "editor_fg": "#f2f1f0",
+    "editor_lineno": "#a89aa2",
+    "editor_sel": "#77216f",
+    "composer_bg": "#3b0b2e",
+    "composer_border": "#5e2750",
+    "composer_hint": "#a89aa2"
+  },
+  "syntax": {
+    "text": "#f2f1f0",
+    "keyword": "#e95420",
+    "string": "#26a269",
+    "number": "#f9c74f",
+    "comment": "#a89aa2",
+    "punct": "#d0cfcc",
+    "heading": "#e95420",
+    "code": "#2aa198"
+  }
+}

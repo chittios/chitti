@@ -6546,8 +6546,20 @@ fn run_theme_inner(arg: &str) {
                 serial_println!("  {}{}", n, if n == cur { "  *" } else { "" });
             }
             serial_println!("/theme set <name> · current · save <name> · install <url>");
+            serial_println!("/theme wallpaper <none|gradient:#a,#b|/path|https://url> · opacity <0-255>");
         }
         "current" => serial_println!("theme> current: {}", crate::ui_config::current().theme_name),
+        "wallpaper" | "bg" | "wp" => set_wallpaper_cmd(rest),
+        "opacity" => match rest.parse::<u64>() {
+            Ok(n) => {
+                let op = n.min(255);
+                let mut cfg = crate::ui_config::current();
+                cfg.opacity = op;
+                crate::ui_config::set_config(cfg);
+                serial_println!("theme> opacity {} (255 = opaque; lower = more see-through)", op);
+            }
+            Err(_) => serial_println!("usage: /theme opacity <0-255>"),
+        },
         "set" => {
             if rest.is_empty() {
                 serial_println!("usage: /theme set <name>");
@@ -6581,8 +6593,71 @@ fn run_theme_inner(arg: &str) {
                 Err(e) => serial_println!("theme> error: {}", e),
             }
         }
-        _ => serial_println!("usage: /theme [list | set <name> | current | save <name> | install <url>]"),
+        _ => serial_println!("usage: /theme [list | set <name> | current | save <name> | install <url> | wallpaper <spec> | opacity <n>]"),
     }
+}
+
+/// `/theme wallpaper <spec>` — set the desktop backdrop. `spec` is one of:
+/// `none` (solid theme bg), `gradient:#aabbcc,#112233` (two-stop vertical
+/// gradient), a store path to a PNG/JPEG (`/downloads/pic.png`), or an
+/// `http(s)://` URL — which is downloaded into the store, sniffed, then mapped.
+/// The image is decoded once and cover-scaled to the screen by the compositor.
+#[cfg(not(feature = "server"))]
+fn set_wallpaper_cmd(rest: &str) {
+    use alloc::string::{String, ToString};
+    if rest.is_empty() {
+        serial_println!("usage: /theme wallpaper <none | gradient:#aabbcc,#112233 | /path/img | https://url>");
+        serial_println!("  tip: request a screen-sized image (e.g. Unsplash '?w=2560') — large photos decode slowly in-kernel");
+        return;
+    }
+    let spec = if rest.eq_ignore_ascii_case("none") {
+        String::new()
+    } else if rest.starts_with("http://") || rest.starts_with("https://") {
+        serial_println!("theme> downloading wallpaper (large images decode slowly)…");
+        // Fixed store name — the decoder sniffs PNG/JPEG magic, so the
+        // extension is irrelevant; overwrite so repeated sets don't pile up.
+        let args = alloc::format!(
+            r#"{{"url":"{}","path":"wallpaper","overwrite":"true"}}"#,
+            rest
+        );
+        let r = run_download_tool(&args);
+        match r.strip_prefix("ok:path=").and_then(|s| s.split(' ').next()) {
+            Some(p) => {
+                let looks_ok = crate::synapse::fs::read(p)
+                    .map(|b| is_image_bytes(&b))
+                    .unwrap_or(false);
+                if !looks_ok {
+                    serial_println!("theme> downloaded but it isn't a PNG/JPEG image ({}); not applied", p);
+                    return;
+                }
+                serial_println!("theme> saved {}", p);
+                p.to_string()
+            }
+            None => {
+                serial_println!("theme> download failed: {}", r);
+                return;
+            }
+        }
+    } else {
+        // A store path (image) or a `gradient:` / `""` spec — pass through.
+        rest.to_string()
+    };
+    let mut cfg = crate::ui_config::current();
+    cfg.wallpaper = spec;
+    crate::ui_config::set_config(cfg);
+    let now = crate::ui_config::current().wallpaper;
+    if now.is_empty() {
+        serial_println!("theme> wallpaper cleared (solid background)");
+    } else {
+        serial_println!("theme> wallpaper set: {}", now);
+    }
+}
+
+/// Cheap magic-byte sniff so a 404/HTML error page isn't mapped as a backdrop.
+#[cfg(not(feature = "server"))]
+fn is_image_bytes(b: &[u8]) -> bool {
+    b.starts_with(&[0x89, b'P', b'N', b'G']) // PNG
+        || b.starts_with(&[0xff, 0xd8, 0xff]) // JPEG
 }
 
 /// `/ktrace` — toggle the ktrace log stream in the action (right) pane.
@@ -11510,5 +11585,17 @@ mod agent_flow_tests {
         assert!(out.contains("memory_add"), "search: {out}");
         assert!(out.contains("memory_get"), "search: {out}");
         assert!(out.contains("memory_list"), "search: {out}");
+    }
+
+    /// `/theme wallpaper <url>` only maps a fetched body that is really an image
+    /// — a 404/HTML error page must be rejected by the magic-byte sniff so it is
+    /// never mapped as a backdrop.
+    #[test_case]
+    fn wallpaper_image_sniff_accepts_png_jpeg_only() {
+        assert!(is_image_bytes(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a]));
+        assert!(is_image_bytes(&[0xff, 0xd8, 0xff, 0xe0]));
+        assert!(!is_image_bytes(b"<!DOCTYPE html>"));
+        assert!(!is_image_bytes(b"404 Not Found"));
+        assert!(!is_image_bytes(&[]));
     }
 }

@@ -26,6 +26,7 @@ pub static BUNDLED_THEMES: &[(&str, &str)] = &[
     ("solarized-dark", include_str!("../../assets/themes/solarized-dark.json")),
     ("nord", include_str!("../../assets/themes/nord.json")),
     ("dracula", include_str!("../../assets/themes/dracula.json")),
+    ("ubuntu", include_str!("../../assets/themes/ubuntu.json")),
 ];
 
 /// All available theme names: bundled + installed (in the store), de-duplicated.
