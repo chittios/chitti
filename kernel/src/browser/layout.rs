@@ -1134,6 +1134,8 @@ fn walk<'a>(
                         st.background,
                         if st.color != parent_st.color { Some(st.color) } else { None },
                         st.background.is_none() && !st.background_image.is_empty(),
+                        st.width,
+                        st.height,
                     );
                 }
                 "table" => {
@@ -2322,6 +2324,8 @@ fn push_control(
     bg: Option<u32>,
     fg: Option<u32>,
     transparent: bool,
+    css_w: Option<i32>,
+    css_h: Option<i32>,
 ) {
     let kind = ControlKind::from_input_type(input_type, tag);
     if kind == ControlKind::Hidden {
@@ -2353,8 +2357,18 @@ fn push_control(
         return;
     }
     let (w, h) = match kind {
-        ControlKind::Text | ControlKind::Password => (cur.max_w.min(280).max(120), line_h + 10),
-        ControlKind::TextArea => (cur.max_w.min(320).max(160), line_h * 4 + 12),
+        ControlKind::Text | ControlKind::Password => (
+            css_w
+                .map(|w| w.clamp(24, cur.max_w.max(24)))
+                .unwrap_or_else(|| cur.max_w.min(280).max(120)),
+            css_h.map(|h| h.max(line_h)).unwrap_or(line_h + 10),
+        ),
+        ControlKind::TextArea => (
+            css_w
+                .map(|w| w.clamp(24, cur.max_w.max(24)))
+                .unwrap_or_else(|| cur.max_w.min(320).max(160)),
+            css_h.map(|h| h.max(line_h)).unwrap_or(line_h * 4 + 12),
+        ),
         ControlKind::Submit | ControlKind::Button => {
             let label = value
                 .filter(|s| !s.is_empty())

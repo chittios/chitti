@@ -1,0 +1,39 @@
+{
+  "name": "dracula",
+  "font": "Geist Mono",
+  "font_scale": 0,
+  "wallpaper": "gradient:#282a36,#21222c",
+  "opacity": 234,
+  "cursor": { "fill": "#282a36", "outline": "#f8f8f2" },
+  "palette": {
+    "accent": "#bd93f9",
+    "screen_bg": "#282a36",
+    "chat_bg": "#343746",
+    "logs_bg": "#21222c",
+    "chat_fg": "#f8f8f2",
+    "logs_fg": "#c8c8d0",
+    "border_dim": "#44475a",
+    "title_active": "#bd93f9",
+    "title_dim": "#6272a4",
+    "sep_dim": "#343746",
+    "status_bg": "#343746",
+    "status_fg": "#c8c8d0",
+    "editor_bg": "#343746",
+    "editor_fg": "#f8f8f2",
+    "editor_lineno": "#6272a4",
+    "editor_sel": "#44475a",
+    "composer_bg": "#343746",
+    "composer_border": "#44475a",
+    "composer_hint": "#6272a4"
+  },
+  "syntax": {
+    "text": "#f8f8f2",
+    "keyword": "#ff79c6",
+    "string": "#f1fa8c",
+    "number": "#bd93f9",
+    "comment": "#6272a4",
+    "punct": "#8be9fd",
+    "heading": "#ff79c6",
+    "code": "#50fa7b"
+  }
+}

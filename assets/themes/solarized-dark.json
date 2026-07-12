@@ -1,0 +1,39 @@
+{
+  "name": "solarized-dark",
+  "font": "Geist Mono",
+  "font_scale": 0,
+  "wallpaper": "gradient:#002b36,#00212b",
+  "opacity": 236,
+  "cursor": { "fill": "#002b36", "outline": "#93a1a1" },
+  "palette": {
+    "accent": "#268bd2",
+    "screen_bg": "#002b36",
+    "chat_bg": "#073642",
+    "logs_bg": "#00212b",
+    "chat_fg": "#93a1a1",
+    "logs_fg": "#657b83",
+    "border_dim": "#0a4b5a",
+    "title_active": "#268bd2",
+    "title_dim": "#586e75",
+    "sep_dim": "#073642",
+    "status_bg": "#073642",
+    "status_fg": "#839496",
+    "editor_bg": "#073642",
+    "editor_fg": "#93a1a1",
+    "editor_lineno": "#586e75",
+    "editor_sel": "#0a4b5a",
+    "composer_bg": "#073642",
+    "composer_border": "#0a4b5a",
+    "composer_hint": "#586e75"
+  },
+  "syntax": {
+    "text": "#93a1a1",
+    "keyword": "#859900",
+    "string": "#2aa198",
+    "number": "#d33682",
+    "comment": "#586e75",
+    "punct": "#657b83",
+    "heading": "#b58900",
+    "code": "#2aa198"
+  }
+}

@@ -60,6 +60,9 @@ pub mod skills;
 pub mod sound;
 pub mod tools;
 pub mod ui_config;
+// Installable themes (colours, syntax, cursor, wallpaper, opacity) — presets
+// over ui_config; bundled + store-installed.
+pub mod theme;
 #[cfg(target_arch = "x86_64")]
 pub mod smp;
 pub mod synapse;

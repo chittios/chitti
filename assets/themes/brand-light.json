@@ -1,0 +1,39 @@
+{
+  "name": "brand-light",
+  "font": "Geist Mono",
+  "font_scale": 0,
+  "wallpaper": "gradient:#efe9dd,#e3dccb",
+  "opacity": 245,
+  "cursor": { "fill": "#2a2825", "outline": "#faf7f0" },
+  "palette": {
+    "accent": "#c15f3c",
+    "screen_bg": "#efe9dd",
+    "chat_bg": "#faf7f0",
+    "logs_bg": "#f2ede2",
+    "chat_fg": "#26231f",
+    "logs_fg": "#5a564e",
+    "border_dim": "#d6cfbf",
+    "title_active": "#c15f3c",
+    "title_dim": "#8a857a",
+    "sep_dim": "#ddd6c6",
+    "status_bg": "#e6dfd0",
+    "status_fg": "#5a564e",
+    "editor_bg": "#faf7f0",
+    "editor_fg": "#26231f",
+    "editor_lineno": "#a8a294",
+    "editor_sel": "#f0d3c4",
+    "composer_bg": "#e6dfd0",
+    "composer_border": "#d6cfbf",
+    "composer_hint": "#8a857a"
+  },
+  "syntax": {
+    "text": "#26231f",
+    "keyword": "#c15f3c",
+    "string": "#2f8f7e",
+    "number": "#b5701f",
+    "comment": "#8a857a",
+    "punct": "#6f6a5f",
+    "heading": "#c15f3c",
+    "code": "#2f8f7e"
+  }
+}

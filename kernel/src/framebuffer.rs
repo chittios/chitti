@@ -660,7 +660,19 @@ pub struct Screen {
     /// True once the mouse has moved, so content redraws keep re-drawing the
     /// cursor on top instead of leaving it erased.
     cur_active: bool,
-    cur_saved: [Rgb; (CUR_W * CUR_H) as usize],
+    /// Background patch saved beneath the cursor sprite; sized to the last-drawn
+    /// sprite (`cur_sw`×`cur_sh`) so a theme's custom (variable-size) cursor can
+    /// be restored with the exact dims it was drawn at.
+    cur_saved: Vec<Rgb>,
+    cur_sw: u64,
+    cur_sh: u64,
+    /// Decoded wallpaper scaled to the full screen (`0x00RRGGBB`, width×height),
+    /// or `None` for the solid-colour desktop. Windows blend over it at
+    /// [`Self::opacity`]; the gutters show it directly.
+    wallpaper: Option<Vec<u32>>,
+    /// Window opacity over the wallpaper (255 = opaque; only used when
+    /// `wallpaper` is `Some`).
+    opacity: u8,
 }
 
 // Mouse cursor sprites: 0 = transparent, 1 = fill, 2 = outline.
@@ -789,13 +801,99 @@ const CURSOR_WAIT: [u8; (CUR_W * CUR_H) as usize] = [
     0,0,0,0,0,0,0,0,0,0,0,0,
 ];
 
-fn cursor_sprite() -> &'static [u8; (CUR_W * CUR_H) as usize] {
-    match cursor_shape() {
+/// Built-in fixed 12×19 sprite for a shape (index bitmap: 0/1/2).
+fn cursor_builtin(shape: CursorShape) -> &'static [u8; (CUR_W * CUR_H) as usize] {
+    match shape {
         CursorShape::Hand => &CURSOR_HAND,
         CursorShape::IBeam => &CURSOR_IBEAM,
         CursorShape::Wait => &CURSOR_WAIT,
         CursorShape::Arrow => &CURSOR_ARROW,
     }
+}
+
+/// A theme-supplied cursor bitmap: `w`×`h` index values (0 transparent / 1 fill
+/// / 2 outline), same encoding as the built-ins. Dimensions are capped at
+/// [`CUR_MAX`] per side so the save buffer stays bounded.
+#[derive(Clone, Default)]
+pub struct CursorSprite {
+    pub w: usize,
+    pub h: usize,
+    pub data: Vec<u8>,
+}
+
+/// Max cursor sprite dimension per side (bounds the RMW save patch).
+pub const CUR_MAX: usize = 32;
+
+/// Live cursor theme: fill/outline colours + optional per-shape custom sprites
+/// (order Arrow, Hand, IBeam, Wait). `None` ⇒ brand defaults + built-in sprites.
+struct CursorTheme {
+    fill: Rgb,
+    outline: Rgb,
+    sprites: Option<[CursorSprite; 4]>,
+}
+
+/// Default cursor colours (brand): near-black fill, cream outline.
+const CURSOR_FILL_DEFAULT: Rgb = (15, 15, 17);
+const CURSOR_OUTLINE_DEFAULT: Rgb = (245, 245, 248);
+
+static CURSOR_THEME: Locked<CursorTheme> = Locked::new(CursorTheme {
+    fill: CURSOR_FILL_DEFAULT,
+    outline: CURSOR_OUTLINE_DEFAULT,
+    sprites: None,
+});
+
+/// Set the cursor fill/outline colours (from `ui.json`), preserving any custom
+/// sprites already installed by a theme.
+pub fn set_cursor_colors(fill: Rgb, outline: Rgb) {
+    CURSOR_THEME.with(|t| {
+        t.fill = fill;
+        t.outline = outline;
+    });
+}
+
+/// Install (or clear, with `None`) the per-shape custom cursor sprites (from a
+/// theme file), preserving the current colours. A sprite with zero dims falls
+/// back to the built-in bitmap for that shape.
+pub fn set_cursor_sprites(sprites: Option<[CursorSprite; 4]>) {
+    CURSOR_THEME.with(|t| t.sprites = sprites);
+}
+
+/// Reset the cursor to brand colours + built-in sprites.
+pub fn reset_cursor_theme() {
+    CURSOR_THEME.with(|t| {
+        t.fill = CURSOR_FILL_DEFAULT;
+        t.outline = CURSOR_OUTLINE_DEFAULT;
+        t.sprites = None;
+    });
+}
+
+/// Resolve the active cursor for the current shape: `(w, h, index-data,
+/// fill, outline)`. Uses a theme's custom sprite when present + non-empty,
+/// else the built-in bitmap; colours come from the theme or the defaults.
+fn cursor_active() -> (u64, u64, alloc::borrow::Cow<'static, [u8]>, Rgb, Rgb) {
+    let shape = cursor_shape();
+    CURSOR_THEME.with(|t| {
+        let (fill, outline) = (t.fill, t.outline);
+        if let Some(sprites) = &t.sprites {
+            let sp = &sprites[shape as usize];
+            if sp.w > 0 && sp.h > 0 && sp.data.len() >= sp.w * sp.h {
+                return (
+                    sp.w as u64,
+                    sp.h as u64,
+                    alloc::borrow::Cow::Owned(sp.data.clone()),
+                    fill,
+                    outline,
+                );
+            }
+        }
+        (
+            CUR_W,
+            CUR_H,
+            alloc::borrow::Cow::Borrowed(&cursor_builtin(shape)[..]),
+            fill,
+            outline,
+        )
+    })
 }
 
 /// What the right ("action") pane shows.
@@ -859,6 +957,12 @@ pub struct LayoutCfg {
     /// Fullscreen state: 0 = normal split, 1 = chat fills the screen, 2 = the
     /// action pane fills the screen. Toggled at runtime (F11 / `/fullscreen`).
     pub fullscreen: u8,
+    /// Wallpaper spec: `""` = solid `screen_bg`; `"gradient:#rrggbb,#rrggbb"` =
+    /// generated vertical gradient; otherwise a path to an image in the store.
+    pub wallpaper: String,
+    /// Window opacity over the wallpaper (0..=255; 255 = opaque, the default —
+    /// identical to the no-wallpaper look). Only meaningful with a wallpaper.
+    pub opacity: u8,
 }
 
 impl Default for LayoutCfg {
@@ -872,6 +976,8 @@ impl Default for LayoutCfg {
             theme: Theme::default(),
             splash: true,
             fullscreen: 0,
+            wallpaper: String::new(),
+            opacity: 255,
         }
     }
 }
@@ -942,7 +1048,7 @@ impl Screen {
         let logs = Pane::new(logs_x, box_y, logs_bw, box_h, cw, ch, th.logs_fg, th.logs_bg, cfg.logs_title.clone(), false);
         let mut status_left = String::from("ChittiOS v");
         status_left.push_str(crate::VERSION);
-        Screen {
+        let mut scr = Screen {
             addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift, scale, chat, logs,
             status_left,
             status_right: String::new(),
@@ -971,8 +1077,16 @@ impl Screen {
             cur_y: height / 2,
             cur_vis: false,
             cur_active: false,
-            cur_saved: [(0, 0, 0); (CUR_W * CUR_H) as usize],
-        }
+            cur_saved: Vec::new(),
+            cur_sw: CUR_W,
+            cur_sh: CUR_H,
+            wallpaper: None,
+            opacity: 255,
+        };
+        // Decode/generate the wallpaper once for this layout (windows blend over
+        // it at `opacity`); recomputed on relayout.
+        scr.set_wallpaper(&cfg.wallpaper, cfg.opacity);
+        scr
     }
 
     fn cw(&self) -> u64 {
@@ -1086,6 +1200,112 @@ impl Screen {
         }
     }
 
+    /// Build [`Self::wallpaper`] (scaled to the full screen) from a spec:
+    /// `""` → none (solid desktop); `"gradient:#aabbcc,#112233"` → a generated
+    /// vertical gradient; otherwise a path to an image in the synapse store,
+    /// decoded and stretched to fill. Also sets [`Self::opacity`]. Called from
+    /// `build`/`relayout` so it's recomputed once per layout change, not per
+    /// redraw.
+    fn set_wallpaper(&mut self, spec: &str, opacity: u8) {
+        self.opacity = opacity;
+        let (w, h) = (self.width as usize, self.height as usize);
+        if w == 0 || h == 0 {
+            self.wallpaper = None;
+            return;
+        }
+        if spec.is_empty() {
+            self.wallpaper = None;
+            return;
+        }
+        if let Some(rest) = spec.strip_prefix("gradient:") {
+            // Two `#rrggbb` stops, top → bottom.
+            let mut it = rest.split(',');
+            let a = parse_hex(it.next().unwrap_or("").trim(), self.theme.screen_bg);
+            let b = parse_hex(it.next().unwrap_or("").trim(), a);
+            let mut buf = alloc::vec![0u32; w * h];
+            for y in 0..h {
+                // t in 0..=255 down the screen.
+                let t = if h > 1 { (y * 255 / (h - 1)) as u32 } else { 0 };
+                let mix = |ca: u8, cb: u8| ((ca as u32 * (255 - t) + cb as u32 * t) / 255) & 0xff;
+                let px = (mix(a.0, b.0) << 16) | (mix(a.1, b.1) << 8) | mix(a.2, b.2);
+                for x in 0..w {
+                    buf[y * w + x] = px;
+                }
+            }
+            self.wallpaper = Some(buf);
+            return;
+        }
+        // Image path: read from the store, decode, stretch to fill the screen.
+        self.wallpaper = crate::synapse::fs::read(spec)
+            .and_then(|bytes| crate::image::decode(&bytes).ok())
+            .map(|img| crate::image::resize(&img, w, h))
+            .map(|img| img.pixels);
+    }
+
+    /// Paint a **desktop/gutter** region: the wallpaper (if any) shown directly,
+    /// else a solid `fallback` fill.
+    fn paint_wallpaper(&self, x: u64, y: u64, w: u64, h: u64, fallback: Rgb) {
+        let Some(wp) = &self.wallpaper else {
+            self.fill_rect(x, y, w, h, fallback);
+            return;
+        };
+        if w == 0 || h == 0 {
+            return;
+        }
+        for dy in 0..h {
+            let sy = y + dy;
+            if sy >= self.height {
+                break;
+            }
+            let base = (sy * self.width + x) as usize;
+            let n = w.min(self.width.saturating_sub(x)) as usize;
+            if x < self.width && base + n <= wp.len() {
+                self.blit_rgb32_row(x, sy, &wp[base..base + n]);
+            }
+        }
+    }
+
+    /// Paint a **window surface** region: `color` blended over the wallpaper at
+    /// [`Self::opacity`] (255 = opaque = plain `color`), else a solid `color`
+    /// fill when there's no wallpaper. One blended row is built and blitted per
+    /// scanline (no per-pixel readback).
+    fn paint_surface(&self, x: u64, y: u64, w: u64, h: u64, color: Rgb) {
+        let Some(wp) = &self.wallpaper else {
+            self.fill_rect(x, y, w, h, color);
+            return;
+        };
+        if w == 0 || h == 0 {
+            return;
+        }
+        let op = self.opacity as u32;
+        if op >= 255 {
+            self.fill_rect(x, y, w, h, color);
+            return;
+        }
+        let inv = 255 - op;
+        let (cr, cg, cb) = (color.0 as u32, color.1 as u32, color.2 as u32);
+        let mut row = alloc::vec![0u32; w as usize];
+        for dy in 0..h {
+            let sy = y + dy;
+            if sy >= self.height {
+                break;
+            }
+            for dx in 0..w {
+                let sx = x + dx;
+                let wpix = if sx < self.width {
+                    wp[(sy * self.width + sx) as usize]
+                } else {
+                    0
+                };
+                let r = ((((wpix >> 16) & 0xff) * inv + cr * op) / 255) & 0xff;
+                let g = ((((wpix >> 8) & 0xff) * inv + cg * op) / 255) & 0xff;
+                let b = (((wpix & 0xff) * inv + cb * op) / 255) & 0xff;
+                row[dx as usize] = (r << 16) | (g << 8) | b;
+            }
+            self.blit_rgb32_row(x, sy, &row);
+        }
+    }
+
     /// Read a framebuffer pixel back as `Rgb` (inverse of `put_pixel`), for
     /// saving the background under the mouse cursor.
     fn get_pixel(&self, x: u64, y: u64) -> Rgb {
@@ -1126,31 +1346,43 @@ impl Screen {
         self.put_pixel(x, y, (mix(bg.0, c.0), mix(bg.1, c.1), mix(bg.2, c.2)));
     }
 
-    /// Restore the patch saved beneath the cursor (erasing the sprite).
+    /// Restore the patch saved beneath the cursor (erasing the sprite). Uses the
+    /// dims the patch was *saved* at (`cur_sw`×`cur_sh`), which may differ from
+    /// the current shape's sprite after a theme/shape change.
     fn cursor_restore(&self) {
         if !self.cur_vis {
             return;
         }
-        for dy in 0..CUR_H {
-            for dx in 0..CUR_W {
-                self.put_pixel(self.cur_x + dx, self.cur_y + dy, self.cur_saved[(dy * CUR_W + dx) as usize]);
+        let (w, h) = (self.cur_sw, self.cur_sh);
+        for dy in 0..h {
+            for dx in 0..w {
+                let i = (dy * w + dx) as usize;
+                if i < self.cur_saved.len() {
+                    self.put_pixel(self.cur_x + dx, self.cur_y + dy, self.cur_saved[i]);
+                }
             }
         }
     }
 
-    /// Save the framebuffer under the cursor and draw the active shape sprite.
+    /// Save the framebuffer under the cursor and draw the active shape sprite
+    /// (theme-driven colours + optional custom, variable-size bitmap).
     fn cursor_draw(&mut self) {
-        let sprite = cursor_sprite();
-        for dy in 0..CUR_H {
-            for dx in 0..CUR_W {
-                self.cur_saved[(dy * CUR_W + dx) as usize] = self.get_pixel(self.cur_x + dx, self.cur_y + dy);
+        let (w, h, data, fill, outline) = cursor_active();
+        let n = (w * h) as usize;
+        self.cur_saved.clear();
+        self.cur_saved.reserve(n);
+        for dy in 0..h {
+            for dx in 0..w {
+                self.cur_saved.push(self.get_pixel(self.cur_x + dx, self.cur_y + dy));
             }
         }
-        for dy in 0..CUR_H {
-            for dx in 0..CUR_W {
-                match sprite[(dy * CUR_W + dx) as usize] {
-                    1 => self.put_pixel(self.cur_x + dx, self.cur_y + dy, (15, 15, 17)),
-                    2 => self.put_pixel(self.cur_x + dx, self.cur_y + dy, (245, 245, 248)),
+        self.cur_sw = w;
+        self.cur_sh = h;
+        for dy in 0..h {
+            for dx in 0..w {
+                match data[(dy * w + dx) as usize] {
+                    1 => self.put_pixel(self.cur_x + dx, self.cur_y + dy, fill),
+                    2 => self.put_pixel(self.cur_x + dx, self.cur_y + dy, outline),
                     _ => {}
                 }
             }
@@ -1225,23 +1457,51 @@ impl Screen {
     /// `font_ttf::blit_ui_cell`, face chosen from `ui.json`), falling back to the
     /// scaled bitmap atlas ([`GLYPHS`]) if no TTF face is available. Non-printable
     /// bytes render as a blank cell.
+    /// Effective background colour at pixel `(x,y)`: with a translucent
+    /// wallpaper, `base` blended over the wallpaper at [`Self::opacity`]; else
+    /// `base` unchanged (the fast common case — no wallpaper or opaque).
+    #[inline]
+    fn bg_at(&self, x: u64, y: u64, base: Rgb) -> Rgb {
+        match &self.wallpaper {
+            Some(wp) if self.opacity < 255 && x < self.width && y < self.height => {
+                let wpix = wp[(y * self.width + x) as usize];
+                let op = self.opacity as u32;
+                let inv = 255 - op;
+                let bl = |w: u32, c: u8| (((w * inv + c as u32 * op) / 255) & 0xff) as u8;
+                (
+                    bl((wpix >> 16) & 0xff, base.0),
+                    bl((wpix >> 8) & 0xff, base.1),
+                    bl(wpix & 0xff, base.2),
+                )
+            }
+            _ => base,
+        }
+    }
+
     fn blit_glyph(&self, px: u64, py: u64, byte: u8, fg: Rgb, bg: Rgb) {
         let s = self.scale;
         let cell_w = CW as u64 * s;
         let cell_h = CH as u64 * s;
-        // Background fill first (both paths blend ink over it).
+        // Background fill first (both paths blend ink over it). With a
+        // translucent wallpaper the cell bg is the wallpaper tinted by `bg` at
+        // `opacity`, per pixel — so text sits over the see-through desktop too.
+        let tinted = self.wallpaper.is_some() && self.opacity < 255;
         for gy in 0..cell_h {
             for gx in 0..cell_w {
-                self.put_pixel(px + gx, py + gy, bg);
+                let cbg = self.bg_at(px + gx, py + gy, bg);
+                self.put_pixel(px + gx, py + gy, cbg);
             }
         }
         let mix = |b: u8, f: u8, a: u32| (((b as u32) * (255 - a) + (f as u32) * a) / 255) as u8;
+        let ink = |s: &Self, x: u64, y: u64, a: u32| {
+            let b = if tinted { s.bg_at(x, y, bg) } else { bg };
+            (mix(b.0, fg.0, a), mix(b.1, fg.1, a), mix(b.2, fg.2, a))
+        };
         // TTF path: rasterize the glyph into the cell (cached per char/size).
         let ch = if (FIRST..=LAST).contains(&byte) { byte as char } else { ' ' };
         let ttf_ok = crate::font_ttf::blit_ui_cell(ch, cell_w as usize, cell_h as usize, |gx, gy, a| {
-            let a = a as u32;
-            let color = (mix(bg.0, fg.0, a), mix(bg.1, fg.1, a), mix(bg.2, fg.2, a));
-            self.put_pixel(px + gx as u64, py + gy as u64, color);
+            let (x, y) = (px + gx as u64, py + gy as u64);
+            self.put_pixel(x, y, ink(self, x, y, a as u32));
         });
         if ttf_ok {
             return;
@@ -1255,12 +1515,12 @@ impl Screen {
                 if a == 0 {
                     continue; // background already filled
                 }
-                let color = (mix(bg.0, fg.0, a), mix(bg.1, fg.1, a), mix(bg.2, fg.2, a));
                 let bx = px + gx as u64 * s;
                 let by = py + gy as u64 * s;
                 for sy in 0..s {
                     for sx in 0..s {
-                        self.put_pixel(bx + sx, by + sy, color);
+                        let (x, y) = (bx + sx, by + sy);
+                        self.put_pixel(x, y, ink(self, x, y, a));
                     }
                 }
             }
@@ -1639,7 +1899,7 @@ impl Screen {
     fn draw_status(&self) {
         let bar_h = self.ch() + 8;
         let sy_top = self.height - bar_h;
-        self.fill_rect(0, sy_top, self.width, bar_h, self.theme.status_bg);
+        self.paint_surface(0, sy_top, self.width, bar_h, self.theme.status_bg);
         let ty = sy_top + 4;
         let cw = self.cw();
         // Left = the brand mark then the brand text (accent). The glyph radius is
@@ -1772,7 +2032,7 @@ impl Screen {
         }
         let (bx, by, bw, bh, tx, ty, hy) = self.composer_geom();
         // Elevated fill + rounded border (accent when the prompt owns focus).
-        self.fill_rect(bx + 1, by + 1, bw.saturating_sub(2), bh.saturating_sub(2), self.theme.composer_bg);
+        self.paint_surface(bx + 1, by + 1, bw.saturating_sub(2), bh.saturating_sub(2), self.theme.composer_bg);
         let border = if self.composer_active && !self.action_focused() {
             self.theme.accent
         } else {
@@ -1789,7 +2049,7 @@ impl Screen {
         // Clear leftover glyphs to the right of the text (shrinking line).
         let rest = (bx + bw).saturating_sub(x + 4);
         if rest > 0 {
-            self.fill_rect(x, ty, rest, self.chat.ch, self.theme.composer_bg);
+            self.paint_surface(x, ty, rest, self.chat.ch, self.theme.composer_bg);
         }
         // Caret inside the box (only while the composer is the live prompt).
         if self.composer_active && !self.action_focused() {
@@ -1938,7 +2198,7 @@ impl Screen {
             return;
         }
         let (bx, by, bw, bh, tx, ty, hy) = self.composer_geom();
-        self.fill_rect(bx + 1, by + 1, bw.saturating_sub(2), bh.saturating_sub(2), self.theme.composer_bg);
+        self.paint_surface(bx + 1, by + 1, bw.saturating_sub(2), bh.saturating_sub(2), self.theme.composer_bg);
         let border = if self.composer_active && !self.action_focused() {
             self.theme.accent
         } else {
@@ -1953,7 +2213,7 @@ impl Screen {
         x = self.draw_str(x, ty, vis, self.theme.chat_fg, self.theme.composer_bg);
         let rest = (bx + bw).saturating_sub(x + 4);
         if rest > 0 {
-            self.fill_rect(x, ty, rest, self.chat.ch, self.theme.composer_bg);
+            self.paint_surface(x, ty, rest, self.chat.ch, self.theme.composer_bg);
         }
         if self.composer_active && !self.action_focused() {
             let cx = tx + (prompt.len() as u64 + caret_col as u64) * self.chat.cw;
@@ -2155,7 +2415,7 @@ impl Screen {
     /// Paint the boot splash: the brand mark, "ChittiOS", and a tagline, centred
     /// on the canvas. Shown briefly at boot (see [`show_splash`]).
     fn draw_splash(&self) {
-        self.fill_rect(0, 0, self.width, self.height, self.theme.screen_bg);
+        self.paint_wallpaper(0, 0, self.width, self.height, self.theme.screen_bg);
         let r = (self.height / 7).max(24);
         let cy = self.height * 2 / 5;
         // Ring in terracotta (accent), node in cream (chat_fg) — see the SVG.
@@ -2196,14 +2456,14 @@ impl Screen {
         // Drop shadows sit in the gutters (right/bottom bands of each pane).
         if self.chat.w > 0 {
             self.drop_shadow(self.chat.x, self.chat.y, self.chat.w, self.chat.h);
-            self.fill_rect(self.chat.x, self.chat.y, self.chat.w, self.chat.h, self.chat.bg);
+            self.paint_surface(self.chat.x, self.chat.y, self.chat.w, self.chat.h, self.chat.bg);
             self.draw_frame(&self.chat, !self.action_focused());
             self.render_view(&self.chat);
             self.draw_composer(); // includes suggest popup when open
         }
         if self.right != RightMode::Closed && self.logs.w > 0 {
             self.drop_shadow(self.logs.x, self.logs.y, self.logs.w, self.logs.h);
-            self.fill_rect(self.logs.x, self.logs.y, self.logs.w, self.logs.h, self.logs.bg);
+            self.paint_surface(self.logs.x, self.logs.y, self.logs.w, self.logs.h, self.logs.bg);
             // The header is a tmux-style tab bar (drawn by draw_tab_bar), so the
             // frame is drawn with an empty title.
             self.draw_frame_titled(&self.logs, self.action_focused(), "");
@@ -2231,10 +2491,10 @@ impl Screen {
         let bg = self.theme.screen_bg;
         let (by, bh) = (self.chat.y, self.chat.h);
         // Top strip (above the pane band) + bottom strip (down to the status bar).
-        self.fill_rect(0, 0, self.width, by, bg);
+        self.paint_wallpaper(0, 0, self.width, by, bg);
         let below = by + bh;
         let status_top = self.height.saturating_sub(self.ch() + 8);
-        self.fill_rect(0, below, self.width, status_top.saturating_sub(below), bg);
+        self.paint_wallpaper(0, below, self.width, status_top.saturating_sub(below), bg);
         // Horizontal gutters within the pane band. Order the two panes by x
         // (the layout may put chat on the right when swapped).
         let (mut a, mut b) = ((self.chat.x, self.chat.x + self.chat.w), (0u64, 0u64));
@@ -2245,12 +2505,12 @@ impl Screen {
                 core::mem::swap(&mut a, &mut b);
             }
         }
-        self.fill_rect(0, by, a.0, bh, bg); // left margin
+        self.paint_wallpaper(0, by, a.0, bh, bg); // left margin
         if two {
-            self.fill_rect(a.1, by, b.0.saturating_sub(a.1), bh, bg); // gap between panes
-            self.fill_rect(b.1, by, self.width.saturating_sub(b.1), bh, bg); // right margin
+            self.paint_wallpaper(a.1, by, b.0.saturating_sub(a.1), bh, bg); // gap between panes
+            self.paint_wallpaper(b.1, by, self.width.saturating_sub(b.1), bh, bg); // right margin
         } else {
-            self.fill_rect(a.1, by, self.width.saturating_sub(a.1), bh, bg); // right margin
+            self.paint_wallpaper(a.1, by, self.width.saturating_sub(a.1), bh, bg); // right margin
         }
     }
 
@@ -4916,7 +5176,7 @@ pub fn clear_chat() {
             sc.cursor_restore();
             sc.cur_vis = false;
             sc.chat.clear_content();
-            sc.fill_rect(sc.chat.ix, sc.chat.iy, sc.chat.cols * sc.chat.cw, sc.chat.rows * sc.chat.ch, sc.chat.bg);
+            sc.paint_surface(sc.chat.ix, sc.chat.iy, sc.chat.cols * sc.chat.cw, sc.chat.rows * sc.chat.ch, sc.chat.bg);
             if sc.chat.has_composer {
                 sc.draw_composer();
             } else {

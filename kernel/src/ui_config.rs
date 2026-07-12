@@ -45,6 +45,20 @@ const THEME_DEFAULTS: &[(&str, &str)] = &[
     ("composer_hint", "#6c6a64"),
 ];
 
+/// Code/syntax colours (VSCode-theme style), written into `ui.json`'s `syntax`
+/// object and applied via `highlight::set_syntax_colors`. Defaults mirror
+/// `highlight::DEFAULT_SYNTAX` (the brand palette).
+const SYNTAX_DEFAULTS: &[(&str, &str)] = &[
+    ("text", "#faf9f5"),
+    ("keyword", "#cc785c"),
+    ("string", "#5db8a6"),
+    ("number", "#e8a55a"),
+    ("comment", "#6c6a64"),
+    ("punct", "#8e8b82"),
+    ("heading", "#cc785c"),
+    ("code", "#5db8a6"),
+];
+
 /// The persisted UI configuration.
 #[derive(Clone)]
 pub struct UiConfig {
@@ -63,6 +77,18 @@ pub struct UiConfig {
     /// Colour palette as `(name, "#rrggbb")` pairs (kept as strings so the config
     /// layer stays independent of the framebuffer, which is absent in test builds).
     pub theme: Vec<(String, String)>,
+    /// Active theme preset name (`/theme current`; re-applied on boot to reload
+    /// its cursor sprites). Empty = none / hand-edited.
+    pub theme_name: String,
+    /// Code/syntax colours as `(name, "#rrggbb")` pairs (see `SYNTAX_DEFAULTS`).
+    pub syntax: Vec<(String, String)>,
+    /// Mouse cursor fill / outline colours (`#rrggbb`).
+    pub cursor_fill: String,
+    pub cursor_outline: String,
+    /// Wallpaper spec: `""` (solid) | `"gradient:#rrggbb,#rrggbb"` | image path.
+    pub wallpaper: String,
+    /// Window opacity over the wallpaper (0..=255; 255 = opaque default).
+    pub opacity: u64,
 }
 
 impl Default for UiConfig {
@@ -79,6 +105,12 @@ impl Default for UiConfig {
             tz_offset: 0,
             splash: true,
             theme: THEME_DEFAULTS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            theme_name: "brand-dark".to_string(),
+            syntax: SYNTAX_DEFAULTS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            cursor_fill: "#0f0f11".to_string(),
+            cursor_outline: "#f5f5f8".to_string(),
+            wallpaper: String::new(),
+            opacity: 255,
         }
     }
 }
@@ -86,6 +118,7 @@ impl Default for UiConfig {
 impl UiConfig {
     fn to_json(&self) -> Json {
         let theme = Json::Obj(self.theme.iter().map(|(k, v)| (k.clone(), Json::Str(v.clone()))).collect());
+        let syntax = Json::Obj(self.syntax.iter().map(|(k, v)| (k.clone(), Json::Str(v.clone()))).collect());
         Json::Obj(alloc::vec![
             ("chat_pct".to_string(), Json::Num(self.chat_pct as f64)),
             ("font_scale".to_string(), Json::Num(self.font_scale as f64)),
@@ -97,7 +130,13 @@ impl UiConfig {
             ("status_right".to_string(), Json::Str(self.status_right.clone())),
             ("tz_offset".to_string(), Json::Num(self.tz_offset as f64)),
             ("splash".to_string(), Json::Bool(self.splash)),
+            ("theme_name".to_string(), Json::Str(self.theme_name.clone())),
+            ("wallpaper".to_string(), Json::Str(self.wallpaper.clone())),
+            ("opacity".to_string(), Json::Num(self.opacity as f64)),
+            ("cursor_fill".to_string(), Json::Str(self.cursor_fill.clone())),
+            ("cursor_outline".to_string(), Json::Str(self.cursor_outline.clone())),
             ("theme".to_string(), theme),
+            ("syntax".to_string(), syntax),
         ])
     }
 
@@ -109,6 +148,15 @@ impl UiConfig {
         let mut theme = d.theme.clone();
         if let Some(obj) = j.get("theme") {
             for (name, hex) in theme.iter_mut() {
+                if let Some(v) = obj.get(name).and_then(|v| v.as_str()) {
+                    *hex = v.to_string();
+                }
+            }
+        }
+        // Syntax colours: same override-the-defaults pattern.
+        let mut syntax = d.syntax.clone();
+        if let Some(obj) = j.get("syntax") {
+            for (name, hex) in syntax.iter_mut() {
                 if let Some(v) = obj.get(name).and_then(|v| v.as_str()) {
                     *hex = v.to_string();
                 }
@@ -139,6 +187,12 @@ impl UiConfig {
             tz_offset: j.get("tz_offset").and_then(|v| v.as_i64()).map(|n| n as i32).unwrap_or(d.tz_offset),
             splash: j.get("splash").and_then(|v| v.as_bool()).unwrap_or(d.splash),
             theme,
+            theme_name: s("theme_name", &d.theme_name),
+            syntax,
+            cursor_fill: s("cursor_fill", &d.cursor_fill),
+            cursor_outline: s("cursor_outline", &d.cursor_outline),
+            wallpaper: s("wallpaper", &d.wallpaper),
+            opacity: j.get("opacity").and_then(|v| v.as_i64()).map(|n| n.clamp(0, 255) as u64).unwrap_or(d.opacity),
         }
     }
 
@@ -154,6 +208,8 @@ impl UiConfig {
             theme: crate::framebuffer::theme_from_pairs(&self.theme),
             splash: self.splash,
             fullscreen: 0,
+            wallpaper: self.wallpaper.clone(),
+            opacity: self.opacity.min(255) as u8,
         }
     }
 }
@@ -174,6 +230,16 @@ pub fn boot_layout() -> crate::framebuffer::LayoutCfg {
 
 fn store(cfg: UiConfig) {
     CONFIG.with(|c| *c = Some(cfg));
+}
+
+/// Replace the live config, persist it to `ui.json`, and re-apply the full
+/// appearance. Used by the theme system (`/theme set`) to install a preset.
+pub fn set_config(cfg: UiConfig) {
+    write_ui(&cfg);
+    crate::clock::set_tz(cfg.tz_offset);
+    store(cfg);
+    #[cfg(not(test))]
+    apply_appearance();
 }
 
 /// Read `ui.json` from the store into the live config, writing defaults first if
@@ -200,26 +266,49 @@ fn write_ui(cfg: &UiConfig) {
     crate::synapse::fs::write(UI_PATH, text.as_bytes());
 }
 
+/// Apply the full live appearance to the compositor: UI font, code/syntax
+/// colours ([`crate::highlight`]), cursor colours, and the framebuffer layout
+/// (theme palette + wallpaper + opacity). Cursor *sprites* are loaded separately
+/// by [`crate::theme`] (they live in the theme file, not `ui.json`).
+#[cfg(not(test))]
+fn apply_appearance() {
+    let cfg = current();
+    crate::font_ttf::set_ui_font(&cfg.font);
+    // Code/syntax colours → highlight (editor + /cat + chat).
+    let syn: alloc::vec::Vec<(&str, (u8, u8, u8))> = cfg
+        .syntax
+        .iter()
+        .map(|(k, v)| (k.as_str(), crate::framebuffer::parse_hex(v, (250, 249, 245))))
+        .collect();
+    crate::highlight::set_syntax_colors(&syn);
+    // Cursor colours (sprites preserved).
+    crate::framebuffer::set_cursor_colors(
+        crate::framebuffer::parse_hex(&cfg.cursor_fill, (15, 15, 17)),
+        crate::framebuffer::parse_hex(&cfg.cursor_outline, (245, 245, 248)),
+    );
+    // Restore the active theme's custom cursor sprites (kept in the theme file,
+    // not ui.json) so they survive a reboot.
+    if !cfg.theme_name.is_empty() {
+        crate::theme::apply_cursor_sprites(&cfg.theme_name);
+    }
+    // Palette + wallpaper + opacity via the layout.
+    crate::framebuffer::relayout(&cfg.layout_cfg());
+}
+
 /// Load `ui.json`, apply it to the framebuffer layout, and ensure the shortcuts
 /// file exists. Called once at shell start.
 pub fn load_and_apply() {
     load();
     ensure_shortcuts();
     #[cfg(not(test))]
-    {
-        crate::font_ttf::set_ui_font(&current().font);
-        crate::framebuffer::relayout(&current().layout_cfg());
-    }
+    apply_appearance();
 }
 
 /// Re-read the config from disk and re-apply the layout (`/ui reload`).
 pub fn reload_and_apply() {
     load();
     #[cfg(not(test))]
-    {
-        crate::font_ttf::set_ui_font(&current().font);
-        crate::framebuffer::relayout(&current().layout_cfg());
-    }
+    apply_appearance();
 }
 
 /// Reset the config to defaults, persist, and re-apply (`/ui reset`).
@@ -230,8 +319,9 @@ pub fn reset() {
     store(d);
     #[cfg(not(test))]
     {
-        crate::font_ttf::set_ui_font(&current().font);
-        crate::framebuffer::relayout(&current().layout_cfg());
+        crate::highlight::reset_syntax_colors();
+        crate::framebuffer::reset_cursor_theme();
+        apply_appearance();
     }
 }
 
@@ -385,5 +475,40 @@ pub fn shortcuts() -> Vec<(String, String)> {
             })
             .collect(),
         None => DEFAULT_SHORTCUTS.iter().map(|(k, _, d)| (k.to_string(), d.to_string())).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn roundtrip_preserves_theme_fields() {
+        let mut c = UiConfig::default();
+        c.theme_name = "nord".to_string();
+        c.wallpaper = "gradient:#111111,#222222".to_string();
+        c.opacity = 220;
+        c.cursor_fill = "#abcdef".to_string();
+        c.syntax[1].1 = "#ff00ff".to_string(); // keyword
+        let text = c.to_json().to_pretty();
+        let j = Json::parse(&text).expect("parse round-trip");
+        let back = UiConfig::from_json(&j);
+        assert_eq!(back.theme_name, "nord");
+        assert_eq!(back.wallpaper, "gradient:#111111,#222222");
+        assert_eq!(back.opacity, 220);
+        assert_eq!(back.cursor_fill, "#abcdef");
+        assert_eq!(back.syntax[1].1, "#ff00ff");
+        // Untouched syntax + palette keys keep their defaults.
+        assert_eq!(back.syntax[4].1, SYNTAX_DEFAULTS[4].1);
+    }
+
+    #[test_case]
+    fn opacity_clamped_and_defaults() {
+        let back = UiConfig::from_json(&Json::parse(r#"{"opacity": 999}"#).unwrap());
+        assert_eq!(back.opacity, 255); // clamped to a byte
+        let d = UiConfig::default();
+        assert_eq!(d.opacity, 255);
+        assert_eq!(d.theme_name, "brand-dark");
+        assert_eq!(d.syntax.len(), SYNTAX_DEFAULTS.len());
     }
 }

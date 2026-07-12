@@ -400,6 +400,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         }
         "datetime" | "date" => run_datetime(arg),
         "ui" => run_ui(arg),
+        "theme" | "themes" => run_theme(arg),
         "pane" | "panes" => run_pane(arg),
         "shortcuts" | "keys" => run_shortcuts(),
         "clip" | "clipboard" => run_clip(arg),
@@ -6515,6 +6516,72 @@ fn run_ui_inner(arg: &str) {
             serial_println!("ui> reset to defaults and re-applied");
         }
         _ => serial_println!("usage: /ui [config|reload|reset]   (edit {} via /open)", ui_config::ui_path()),
+    }
+}
+
+/// `/theme` — list / set / save / install UI themes (colours, syntax, cursor,
+/// wallpaper, opacity). A theme is a preset that populates `ui.json`; see
+/// [`crate::theme`].
+fn run_theme(arg: &str) {
+    #[cfg(feature = "server")]
+    {
+        let _ = arg;
+        serial_println!("theme> unavailable in the server build (no GUI)");
+    }
+    #[cfg(not(feature = "server"))]
+    run_theme_inner(arg);
+}
+
+#[cfg(not(feature = "server"))]
+fn run_theme_inner(arg: &str) {
+    let (sub, rest) = match arg.split_once(' ') {
+        Some((a, b)) => (a, b.trim()),
+        None => (arg, ""),
+    };
+    match sub {
+        "" | "list" => {
+            let cur = crate::ui_config::current().theme_name;
+            serial_println!("themes (bundled + installed; * = current):");
+            for n in crate::theme::list() {
+                serial_println!("  {}{}", n, if n == cur { "  *" } else { "" });
+            }
+            serial_println!("/theme set <name> · current · save <name> · install <url>");
+        }
+        "current" => serial_println!("theme> current: {}", crate::ui_config::current().theme_name),
+        "set" => {
+            if rest.is_empty() {
+                serial_println!("usage: /theme set <name>");
+                return;
+            }
+            match crate::theme::apply(rest) {
+                Ok(()) => {
+                    update_status();
+                    serial_println!("theme> set: {}", rest);
+                }
+                Err(e) => serial_println!("theme> error: {}", e),
+            }
+        }
+        "save" => {
+            if rest.is_empty() {
+                serial_println!("usage: /theme save <name>");
+                return;
+            }
+            match crate::theme::save(rest) {
+                Ok(p) => serial_println!("theme> saved current appearance -> {}", p),
+                Err(e) => serial_println!("theme> error: {}", e),
+            }
+        }
+        "install" => {
+            if rest.is_empty() {
+                serial_println!("usage: /theme install <url>");
+                return;
+            }
+            match crate::theme::install(rest) {
+                Ok(n) => serial_println!("theme> installed '{}' — /theme set {}", n, n),
+                Err(e) => serial_println!("theme> error: {}", e),
+            }
+        }
+        _ => serial_println!("usage: /theme [list | set <name> | current | save <name> | install <url>]"),
     }
 }
 

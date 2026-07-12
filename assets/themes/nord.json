@@ -1,0 +1,39 @@
+{
+  "name": "nord",
+  "font": "Geist Mono",
+  "font_scale": 0,
+  "wallpaper": "gradient:#2e3440,#272c36",
+  "opacity": 232,
+  "cursor": { "fill": "#2e3440", "outline": "#eceff4" },
+  "palette": {
+    "accent": "#88c0d0",
+    "screen_bg": "#2e3440",
+    "chat_bg": "#3b4252",
+    "logs_bg": "#272c36",
+    "chat_fg": "#eceff4",
+    "logs_fg": "#d8dee9",
+    "border_dim": "#434c5e",
+    "title_active": "#88c0d0",
+    "title_dim": "#7b8494",
+    "sep_dim": "#3b4252",
+    "status_bg": "#3b4252",
+    "status_fg": "#d8dee9",
+    "editor_bg": "#3b4252",
+    "editor_fg": "#eceff4",
+    "editor_lineno": "#4c566a",
+    "editor_sel": "#434c5e",
+    "composer_bg": "#3b4252",
+    "composer_border": "#434c5e",
+    "composer_hint": "#7b8494"
+  },
+  "syntax": {
+    "text": "#eceff4",
+    "keyword": "#81a1c1",
+    "string": "#a3be8c",
+    "number": "#b48ead",
+    "comment": "#616e88",
+    "punct": "#88c0d0",
+    "heading": "#8fbcbb",
+    "code": "#a3be8c"
+  }
+}

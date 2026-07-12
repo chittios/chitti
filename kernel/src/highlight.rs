@@ -48,19 +48,79 @@ pub enum Class {
     Code,
 }
 
-/// Default colour per class, from the brand palette (DESIGN.md): terracotta
-/// keywords, teal strings/code, amber numbers, muted comments.
-pub fn rgb(c: Class) -> (u8, u8, u8) {
+/// Index of a class in the [`SYNTAX_COLORS`] palette table.
+#[inline]
+fn class_index(c: Class) -> usize {
     match c {
-        Class::Text => (250, 249, 245),    // cream (chat_fg default)
-        Class::Keyword => (204, 120, 92),  // primary terracotta #cc785c
-        Class::Str => (93, 184, 166),      // accent-teal #5db8a6
-        Class::Number => (232, 165, 90),   // accent-amber #e8a55a
-        Class::Comment => (108, 106, 100), // muted #6c6a64
-        Class::Punct => (142, 139, 130),   // muted-soft #8e8b82
-        Class::Heading => (204, 120, 92),  // terracotta
-        Class::Code => (93, 184, 166),     // teal
+        Class::Text => 0,
+        Class::Keyword => 1,
+        Class::Str => 2,
+        Class::Number => 3,
+        Class::Comment => 4,
+        Class::Punct => 5,
+        Class::Heading => 6,
+        Class::Code => 7,
     }
+}
+
+/// Default syntax palette, from the brand palette (DESIGN.md): terracotta
+/// keywords, teal strings/code, amber numbers, muted comments. Order matches
+/// [`class_index`]: text, keyword, string, number, comment, punct, heading, code.
+pub const DEFAULT_SYNTAX: [(u8, u8, u8); 8] = [
+    (250, 249, 245), // Text — cream (chat_fg default)
+    (204, 120, 92),  // Keyword — primary terracotta #cc785c
+    (93, 184, 166),  // Str — accent-teal #5db8a6
+    (232, 165, 90),  // Number — accent-amber #e8a55a
+    (108, 106, 100), // Comment — muted #6c6a64
+    (142, 139, 130), // Punct — muted-soft #8e8b82
+    (204, 120, 92),  // Heading — terracotta
+    (93, 184, 166),  // Code — teal
+];
+
+/// The live syntax palette, seeded with [`DEFAULT_SYNTAX`] and overridable by a
+/// theme via [`set_syntax_colors`]. All three highlight surfaces read it through
+/// [`rgb`], so one call reaches the editor, `/cat`, and the chat stream.
+static SYNTAX_COLORS: crate::mm::Locked<[(u8, u8, u8); 8]> =
+    crate::mm::Locked::new(DEFAULT_SYNTAX);
+
+/// The colour for a token class (theme-driven — see [`set_syntax_colors`]).
+pub fn rgb(c: Class) -> (u8, u8, u8) {
+    let i = class_index(c);
+    SYNTAX_COLORS.with(|p| p[i])
+}
+
+/// Map a theme syntax-key (`"keyword"`, `"string"`, `"comment"`, `"number"`,
+/// `"text"`, `"punct"`, `"heading"`, `"code"`) to its palette index.
+fn syntax_index(name: &str) -> Option<usize> {
+    Some(match name {
+        "text" => 0,
+        "keyword" => 1,
+        "string" | "str" => 2,
+        "number" | "num" => 3,
+        "comment" => 4,
+        "punct" | "punctuation" => 5,
+        "heading" => 6,
+        "code" => 7,
+        _ => return None,
+    })
+}
+
+/// Override the live syntax palette from a theme's `(key, rgb)` pairs. Unknown
+/// keys are ignored; unlisted classes keep the default. Pass an empty slice to
+/// reset (callers should first copy [`DEFAULT_SYNTAX`]).
+pub fn set_syntax_colors(pairs: &[(&str, (u8, u8, u8))]) {
+    SYNTAX_COLORS.with(|p| {
+        for (name, rgb) in pairs {
+            if let Some(i) = syntax_index(name) {
+                p[i] = *rgb;
+            }
+        }
+    });
+}
+
+/// Reset the syntax palette to the brand defaults.
+pub fn reset_syntax_colors() {
+    SYNTAX_COLORS.with(|p| *p = DEFAULT_SYNTAX);
 }
 
 /// Cross-line lexer state: C-family block comments and Markdown fences.
@@ -414,6 +474,20 @@ mod tests {
 
     fn cls(lang: Lang, line: &str) -> Vec<Class> {
         classes(lang, line, &mut State::default())
+    }
+
+    #[test_case]
+    fn syntax_palette_is_themeable() {
+        // Default matches the brand palette.
+        assert_eq!(rgb(Class::Keyword), DEFAULT_SYNTAX[1]);
+        // A theme override changes the live colour; unlisted keys keep default.
+        set_syntax_colors(&[("keyword", (1, 2, 3)), ("string", (4, 5, 6))]);
+        assert_eq!(rgb(Class::Keyword), (1, 2, 3));
+        assert_eq!(rgb(Class::Str), (4, 5, 6));
+        assert_eq!(rgb(Class::Comment), DEFAULT_SYNTAX[4]); // untouched
+        // Reset restores the brand defaults (so other tests see a clean palette).
+        reset_syntax_colors();
+        assert_eq!(rgb(Class::Keyword), DEFAULT_SYNTAX[1]);
     }
 
     #[test_case]
