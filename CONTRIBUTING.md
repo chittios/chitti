@@ -91,4 +91,5 @@ output — especially the boot `INPUT` line for input/clock issues.
 ## License
 
 By contributing, you agree that your contributions are licensed under the
-project's [GNU General Public License v3.0](LICENSE).
+project's [Apache License 2.0](LICENSE) (as in the Apache-2.0 §5 inbound=outbound
+terms — no separate CLA).

@@ -2,6 +2,7 @@
 name = "chitti-kernel"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 # Stand-alone crate: do NOT let cargo pull this into the repo-root workspace
 # (which builds xtask for the host). This crate has its own target/build-std

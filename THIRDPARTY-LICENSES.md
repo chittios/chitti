@@ -1,7 +1,7 @@
 # Third-party licenses
 
-ChittiOS is licensed under the GNU General Public License v3.0 (see
-[LICENSE](LICENSE)). It bundles the following third-party source in-tree; each
+ChittiOS is licensed under the Apache License 2.0 (see [LICENSE](LICENSE) and
+[NOTICE](NOTICE)). It bundles the following third-party source in-tree; each
 retains its own license, reproduced below.
 
 ---

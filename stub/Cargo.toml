@@ -2,6 +2,7 @@
 name = "chitti-stub"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 # Standalone crate (do NOT join the repo-root workspace, which builds xtask for
 # the host). Built for aarch64-unknown-uefi by xtask.
