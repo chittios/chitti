@@ -210,19 +210,23 @@ MIT) and **hashbrown**.
 
 ## Noto fonts — script fallback chain (Indic / emoji / CJK)
 
-Non-Latin web text is covered by Google's **Noto** family (the same faces Linux
-ships in `fonts-noto`), registered as a per-glyph fallback chain in
-`kernel/src/font_ttf.rs` (see `NOTO_FALLBACKS` / `register_bundled_fallbacks`).
-The Indic and emoji faces are baked into the kernel via `include_bytes!`; the
-large CJK face is loaded from a disk volume at boot (`load_disk_fallback_fonts`,
-placed there by `cargo xtask` — fetch with `cargo xtask font-assets`).
+Non-Latin text (browser **and** console/UI) is covered by Google's **Noto**
+family (the same faces Linux ships in `fonts-noto`), registered as a per-glyph
+fallback chain in `kernel/src/font_ttf.rs` (see `NOTO_FALLBACKS` /
+`register_bundled_fallbacks`) and consulted by both the browser paint path and
+the UI-cell rasterizer. All faces are baked into the kernel via `include_bytes!`.
 
 - **Noto Sans Devanagari/Bengali/Gurmukhi/Gujarati/Tamil/Telugu/Kannada/Malayalam**
   — `assets/fonts/Noto-*.ttf`, from https://github.com/notofonts/notofonts.github.io
 - **Noto Emoji** (monochrome; fontdue has no colour-table support) —
   `assets/fonts/Noto-Emoji.ttf`, from https://github.com/google/fonts
-- **Noto Sans CJK SC** — `assets/fonts/NotoSansCJKsc-Regular.otf` (gitignored,
-  downloaded on demand), from https://github.com/notofonts/noto-cjk
+- **Noto Sans CJK** — `assets/fonts/Noto-CJK.otf`, a **subset** of Noto Sans CJK
+  SC (Latin + kana + CJK punctuation + ~3.5k common Han, ~8k glyphs / ~1.7 MB)
+  produced with `fonttools pyftsubset`, from https://github.com/notofonts/noto-cjk.
+  The full 65k-glyph face is *not* used: fontdue's per-glyph allocation churns
+  the kernel's first-fit allocator ~O(glyphs²), so the full face parses for
+  minutes; the subset parses in ~1-2 s. Covers Chinese + Japanese; Hangul
+  (Korean) is omitted to keep the glyph count parse-able.
 
 All are licensed under the **SIL Open Font License 1.1**. Indic pre-base matra
 reordering (`kernel/src/font_shape.rs`) is an original minimal shaper, not a

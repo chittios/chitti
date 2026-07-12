@@ -3046,15 +3046,18 @@ mod tests {
         );
         let sheet = Stylesheet::parse(&doc.stylesheets);
         let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
-        let r = |t: &str| *lay.runs.iter().find(|r| r.text == t).unwrap_or_else(|| panic!("{t}"));
+        let r = |t: &str| {
+            let g = lay.runs.iter().find(|r| r.text == t).unwrap_or_else(|| panic!("{t}"));
+            (g.x, g.y)
+        };
         let (a1, b1, a2, b2) = (r("A1"), r("B1"), r("A2"), r("B2"));
-        assert_eq!(a1.y, b1.y, "row 1 cells share a line");
-        assert!(b1.x > a1.x, "col B is right of col A");
-        assert_eq!(a2.y, b2.y, "row 2 cells share a line");
-        assert!(a2.y > a1.y, "row 2 is below row 1");
+        assert_eq!(a1.1, b1.1, "row 1 cells share a line");
+        assert!(b1.0 > a1.0, "col B is right of col A");
+        assert_eq!(a2.1, b2.1, "row 2 cells share a line");
+        assert!(a2.1 > a1.1, "row 2 is below row 1");
         // Columns align across rows.
-        assert_eq!(a1.x, a2.x, "column A x aligns across rows");
-        assert_eq!(b1.x, b2.x, "column B x aligns across rows");
+        assert_eq!(a1.0, a2.0, "column A x aligns across rows");
+        assert_eq!(b1.0, b2.0, "column B x aligns across rows");
     }
 
     #[test_case]

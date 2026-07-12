@@ -113,10 +113,12 @@ pub fn run() -> ! {
     // Indic/emoji web text renders real glyphs instead of tofu.
     crate::font_ttf::register_bundled_fallbacks();
     auto_mount_root();
-    // CJK is ~16 MB — too large to bake into the kernel binary, so it rides on
-    // a disk volume (placed there by `cargo xtask`, like the voice models) and
-    // registers as a fallback here. Graceful no-op when absent.
-    load_disk_fallback_fonts();
+    // NB: the large CJK fallback font is loaded **lazily** (first browser use),
+    // never at boot — reading it is fine now (idempotent probe + bounded FAT
+    // walk), but *parsing* a 16 MB CFF font through fontdue churns the first-fit
+    // allocator for many seconds, which would stall boot before the input loop.
+    // Once loaded it joins the system fallback chain and is available OS-wide
+    // (console/UI + browser), alongside the always-bundled Indic + emoji faces.
     #[cfg(all(not(feature = "server"), not(test)))]
     load_panes_config();
     update_status();
@@ -6771,6 +6773,9 @@ fn browser_progress_opt() -> Option<u8> {
 }
 
 fn browser_load(url: &str, push_hist: bool) -> alloc::string::String {
+    // Lazily load the CJK fallback font (off the boot path). Safe to scan disks
+    // now — the block probe is idempotent and the FAT directory walk is bounded.
+    ensure_disk_fallback_fonts();
     browser_load_method(url, "GET", &[], push_hist)
 }
 
@@ -10560,15 +10565,19 @@ fn drain_channel_inbound(
     }
 }
 
-/// Scan every disk + volume for the first readable root file named one of
-/// `names` (FAT or ext4). Independent of `/mount`, so it finds a bundled voice
-/// model on the FAT ESP (aarch64) or the ext4 data partition regardless of what
-/// is mounted where.
 /// Load large fallback fonts (CJK) from any disk volume and register them into
-/// the font fallback chain. Kept off the kernel binary because of their size;
-/// placed on the fonts/voice disk by `cargo xtask`. A graceful no-op when the
-/// files are absent (Indic + emoji are always bundled in the binary).
-fn load_disk_fallback_fonts() {
+/// the system font fallback chain — OS-wide, so the console/UI and the browser
+/// all render CJK. Runs at most once. Kept off the kernel binary because of the
+/// font's size (~16 MB); placed on the fonts/voice disk by `cargo xtask`
+/// (fetch with `cargo xtask font-assets`). A graceful no-op when absent (the
+/// Indic + emoji faces are always bundled in the binary). Safe to call at boot
+/// now that the block probe is idempotent.
+fn ensure_disk_fallback_fonts() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static TRIED: AtomicBool = AtomicBool::new(false);
+    if TRIED.swap(true, Ordering::Relaxed) {
+        return;
+    }
     const DISK_FALLBACKS: &[(&str, &[&str])] = &[(
         "Noto Sans CJK",
         &["NotoSansCJKsc-Regular.otf", "NotoSansCJK.otf", "cjk.otf"],
@@ -10578,6 +10587,23 @@ fn load_disk_fallback_fonts() {
             continue;
         }
         if let Some(bytes) = find_on_disks(files) {
+            // Parsing a font through fontdue churns the first-fit allocator in
+            // proportion to its glyph count; a full ~16 MB CJK CFF face stalls
+            // the (cooperative) kernel for minutes and freezes the shell. Cap
+            // the size so an oversized font is skipped rather than hanging —
+            // use a **subset** CJK face (a few thousand common glyphs, ≤ a few
+            // MB) if you want CJK coverage.
+            const MAX_FALLBACK_BYTES: usize = 6 * 1024 * 1024;
+            if bytes.len() > MAX_FALLBACK_BYTES {
+                serial_println!(
+                    "font: {} is {} MiB — too large to parse in-kernel, skipped (use a subset ≤ {} MiB)",
+                    name,
+                    bytes.len() / (1024 * 1024),
+                    MAX_FALLBACK_BYTES / (1024 * 1024)
+                );
+                continue;
+            }
+            serial_println!("font: loading {} ({} KiB)\u{2026}", name, bytes.len() / 1024);
             match crate::font_ttf::register_fallback(name, &bytes) {
                 Ok(()) => crate::ktrace::log_fmt(format_args!(
                     "font: registered {} fallback ({} bytes, disk)",
@@ -10590,6 +10616,10 @@ fn load_disk_fallback_fonts() {
     }
 }
 
+/// Scan every disk + volume for the first readable root file named one of
+/// `names` (FAT or ext4). Independent of `/mount`, so it finds a bundled voice
+/// model on the FAT ESP (aarch64) or the ext4 data partition regardless of what
+/// is mounted where.
 fn find_on_disks(names: &[&str]) -> Option<alloc::vec::Vec<u8>> {
     use crate::fs::detect::FsType;
     for disk in 0..4usize {

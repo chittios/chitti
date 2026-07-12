@@ -106,6 +106,11 @@ impl<'d, D: BlockDevice> FatReader<'d, D> {
             return out;
         }
         let mut clus = if first_clus == 0 { self.root_clus } else { first_clus };
+        // Cycle guard: a valid directory chain visits each cluster once. A
+        // corrupt or mis-read FAT (which would otherwise loop forever and hang
+        // the whole cooperative kernel — this froze boot when `find_on_disks`
+        // scanned the ESP) is detected by a revisit and bailed immediately.
+        let mut visited: Vec<u32> = Vec::new();
         loop {
             for s in 0..self.spc {
                 if self.dev.read_block(self.cluster_lba(clus) + s, &mut sec).is_err() {
@@ -113,9 +118,10 @@ impl<'d, D: BlockDevice> FatReader<'d, D> {
                 }
                 out.extend_from_slice(&sec);
             }
+            visited.push(clus);
             match self.next_cluster(clus) {
-                Some(n) => clus = n,
-                None => return out,
+                Some(n) if !visited.contains(&n) => clus = n,
+                _ => return out, // EOC, invalid, or a cycle → stop
             }
         }
     }

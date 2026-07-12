@@ -33,6 +33,12 @@ pub static NOTO_FALLBACKS: &[(&str, &[u8])] = &[
     ("Noto Sans Telugu", include_bytes!("../../assets/fonts/Noto-Telugu.ttf")),
     ("Noto Sans Kannada", include_bytes!("../../assets/fonts/Noto-Kannada.ttf")),
     ("Noto Sans Malayalam", include_bytes!("../../assets/fonts/Noto-Malayalam.ttf")),
+    // CJK — a **subset** (Latin + kana + CJK punctuation + ~3.5k common Han),
+    // ~1.7 MB / ~8k glyphs. The full 65k-glyph face (~16 MB) parses for minutes
+    // under the kernel's first-fit allocator (fontdue alloc churn is ~O(glyphs²)),
+    // so it can't be bundled; this subset parses in ~1-2 s. Covers Chinese +
+    // Japanese; Hangul (Korean) is omitted to keep the glyph count parse-able.
+    ("Noto Sans CJK", include_bytes!("../../assets/fonts/Noto-CJK.otf")),
     // Monochrome emoji last: Latin/Indic are matched by earlier faces first, so
     // this is only reached for emoji/symbol codepoints. (fontdue has no colour
     // table support, so these render as single-colour glyphs.)
@@ -184,15 +190,31 @@ pub fn blit_ui_cell<F: FnMut(usize, usize, u8)>(
     }
     let key = (ch, cw as u16, ch_px as u16);
     UI_FONT.with(|slot| {
-        let Some(font) = slot.as_ref() else {
+        let Some(uifont) = slot.as_ref() else {
             return false;
         };
+        // If the UI monospace face doesn't cover this char (Indic/CJK/emoji),
+        // fall back to a system fallback face that does — so the console/UI
+        // renders non-Latin text OS-wide, not just the browser.
+        let use_fallback = ch != ' ' && uifont.lookup_glyph_index(ch) == 0;
         UI_CACHE.with(|cache| {
-            let glyph = cache
-                .entry(key)
-                .or_insert_with(|| build_ui_glyph(font, ch, cw, ch_px));
-            for &(x, y, a) in glyph.iter() {
-                plot(x as usize, y as usize, a);
+            if !cache.contains_key(&key) {
+                let glyph = if use_fallback {
+                    FALLBACKS.with(|chain| {
+                        match chain.iter().find(|(_, f)| f.lookup_glyph_index(ch) != 0) {
+                            Some((_, f)) => build_ui_glyph(f, ch, cw, ch_px),
+                            None => build_ui_glyph(uifont, ch, cw, ch_px),
+                        }
+                    })
+                } else {
+                    build_ui_glyph(uifont, ch, cw, ch_px)
+                };
+                cache.insert(key, glyph);
+            }
+            if let Some(glyph) = cache.get(&key) {
+                for &(x, y, a) in glyph.iter() {
+                    plot(x as usize, y as usize, a);
+                }
             }
         });
         true

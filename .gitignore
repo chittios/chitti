@@ -10,5 +10,7 @@ __pycache__/
 tests/e2e/certs/
 
 .idea/
-# Large CJK fallback font (16MB) — fetched via `cargo xtask font-assets`, placed on the fonts disk
-assets/fonts/*.otf
+# Full 16 MB Noto Sans CJK — NOT used (a ~1.7 MB subset, Noto-CJK.otf, is
+# bundled instead; the full face is too big to parse in-kernel). Ignored so a
+# stray download of it is never committed.
+assets/fonts/NotoSansCJKsc-Regular.otf

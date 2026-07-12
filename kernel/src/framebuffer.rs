@@ -151,6 +151,31 @@ pub fn theme_from_pairs(pairs: &[(alloc::string::String, alloc::string::String)]
 }
 
 // Layout metrics, in pixels (independent of font scale).
+/// Anti-aliasing sub-sample rate per axis (`AA_SS`×`AA_SS` samples per pixel →
+/// `AA_SS²`+1 coverage levels). 4 gives 16 levels — smooth curves at negligible
+/// cost, since only edge pixels of a shape actually vary.
+const AA_SS: i64 = 4;
+
+/// Sub-sampled coverage of a pixel at integer offset `(dx, dy)` from a shape's
+/// origin, for anti-aliasing. `inside(fx, fy)` tests a sub-pixel point given in
+/// a **2·SS-scaled** coordinate grid (so sub-sample centres land on odd
+/// integers, exactly between grid lines — no rounding bias). Returns an alpha
+/// 0..=255 = fraction of the `AA_SS²` sub-samples inside the shape. Integer-only
+/// (no `sqrt`/float), so it works below the FPU-less boot window too.
+fn aa_coverage<F: Fn(i64, i64) -> bool>(dx: i64, dy: i64, inside: F) -> u32 {
+    let mut cov = 0u32;
+    for sj in 0..AA_SS {
+        let fy = 2 * AA_SS * dy + (2 * sj + 1 - AA_SS);
+        for si in 0..AA_SS {
+            let fx = 2 * AA_SS * dx + (2 * si + 1 - AA_SS);
+            if inside(fx, fy) {
+                cov += 1;
+            }
+        }
+    }
+    cov * 255 / (AA_SS * AA_SS) as u32
+}
+
 const OUTER: u64 = 8; // margin around the whole content region
 const GAP: u64 = 10; // between the two panes
 const BORDER: u64 = 2; // pane border thickness
@@ -1081,6 +1106,24 @@ impl Screen {
             ((val >> self.g_shift) & 0xff) as u8,
             ((val >> self.b_shift) & 0xff) as u8,
         )
+    }
+
+    /// Alpha-blend `c` over the existing framebuffer pixel at `(x,y)` with
+    /// coverage `a` (0 = transparent … 255 = opaque). A read-modify-write, so
+    /// only worth it for the fractional-coverage *edge* pixels of a shape — the
+    /// interior should use the plain [`put_pixel`] fast path. This is the
+    /// primitive behind anti-aliased curves (discs, the logo arc).
+    fn blend_pixel(&self, x: u64, y: u64, c: Rgb, a: u32) {
+        if a == 0 || x >= self.width || y >= self.height {
+            return;
+        }
+        if a >= 255 {
+            self.put_pixel(x, y, c);
+            return;
+        }
+        let bg = self.get_pixel(x, y);
+        let mix = |b: u8, f: u8| (((b as u32) * (255 - a) + (f as u32) * a) / 255) as u8;
+        self.put_pixel(x, y, (mix(bg.0, c.0), mix(bg.1, c.1), mix(bg.2, c.2)));
     }
 
     /// Restore the patch saved beneath the cursor (erasing the sprite).
@@ -2044,14 +2087,24 @@ impl Screen {
     }
 
     /// Fill an integer-centred disc of radius `r` with `c` (round dots/caps).
+    /// **Anti-aliased** filled disc: edge pixels get fractional coverage from
+    /// [`AA_SS`]×[`AA_SS`] sub-sampling (integer-only, no `sqrt`), blended over
+    /// the background so the rim is smooth rather than stair-stepped. Interior
+    /// pixels take the opaque [`put_pixel`] fast path.
     fn fill_disc(&self, cx: i64, cy: i64, r: i64, c: Rgb) {
-        let r2 = r * r;
-        for dy in -r..=r {
-            for dx in -r..=r {
-                if dx * dx + dy * dy <= r2 {
-                    // Negative coords wrap to a huge u64 and are dropped by put_pixel's bounds check.
-                    self.put_pixel((cx + dx) as u64, (cy + dy) as u64, c);
-                }
+        if r <= 0 {
+            return;
+        }
+        // Radius in the 2·SS sub-pixel grid `aa_coverage` samples on.
+        let rr = 2 * AA_SS * r;
+        let r2 = rr * rr;
+        let span = r + 1;
+        for dy in -span..=span {
+            for dx in -span..=span {
+                let a = aa_coverage(dx, dy, |fx, fy| fx * fx + fy * fy <= r2);
+                // Negative coords wrap to a huge u64 and are dropped by the
+                // bounds checks in put_pixel / blend_pixel.
+                self.blend_pixel((cx + dx) as u64, (cy + dy) as u64, c, a);
             }
         }
     }
@@ -2068,22 +2121,25 @@ impl Screen {
         let (cx, cy, r) = (cx as i64, cy as i64, r as i64);
         let t = (r / 3).max(3); // stroke width, min 3 so a small mark still reads
         let half = t / 2;
-        let (inner, outer) = ((r - half) * (r - half), (r + half) * (r + half));
+        // Ring radii in the 2·SS sub-pixel grid (squared) for anti-aliasing.
+        let inner = (2 * AA_SS * (r - half)).pow(2);
+        let outer = (2 * AA_SS * (r + half)).pow(2);
         let span = r + half + 1;
         for dy in -span..=span {
             for dx in -span..=span {
-                let d2 = dx * dx + dy * dy;
-                if d2 < inner || d2 > outer {
-                    continue;
-                }
-                // Skip the opening: a pixel is inside the gap when its direction is
-                // within ~45.4° of the gap centre (984,-180) ≈ (cos-10.4°,
-                // sin-10.4°); cos45.4° ≈ 0.701. `n` is the dot product ×1000.
-                let n = dx * 984 - dy * 180;
-                if n > 0 && n * n > 701 * 701 * d2 {
-                    continue;
-                }
-                self.put_pixel((cx + dx) as u64, (cy + dy) as u64, arc_c);
+                // Sub-sampled coverage of the open ring: inside the stroke band
+                // and outside the ~91° opening. The gap test compares a pixel's
+                // direction against the gap centre (984,-180) ≈ (cos-10.4°,
+                // sin-10.4°): within ~45.4° (cos ≈ 0.701) is inside the gap.
+                let a = aa_coverage(dx, dy, |fx, fy| {
+                    let d2 = fx * fx + fy * fy;
+                    if d2 < inner || d2 > outer {
+                        return false;
+                    }
+                    let n = fx * 984 - fy * 180;
+                    !(n > 0 && n * n > 701 * 701 * d2)
+                });
+                self.blend_pixel((cx + dx) as u64, (cy + dy) as u64, arc_c, a);
             }
         }
         // Round line-caps at the two arc ends (35° and 304.6° in screen coords),
@@ -4869,4 +4925,37 @@ pub fn clear_chat() {
             sc.cursor_overlay();
         }
     });
+}
+
+#[cfg(test)]
+mod aa_tests {
+    use super::{aa_coverage, AA_SS};
+
+    #[test_case]
+    fn disc_coverage_is_full_inside_zero_outside_partial_at_edge() {
+        let r = 10i64;
+        let r2 = (2 * AA_SS * r).pow(2);
+        let inside = |fx: i64, fy: i64| fx * fx + fy * fy <= r2;
+        // Dead centre: every sub-sample inside → fully opaque.
+        assert_eq!(aa_coverage(0, 0, inside), 255);
+        // Well outside the disc → nothing covered.
+        assert_eq!(aa_coverage(r + 5, 0, inside), 0);
+        // Right on the radius → a fractional coverage (this is the AA).
+        let edge = aa_coverage(r, 0, inside);
+        assert!(edge > 0 && edge < 255, "edge coverage should be partial, got {edge}");
+    }
+
+    #[test_case]
+    fn coverage_is_monotonic_across_the_boundary() {
+        let r = 20i64;
+        let r2 = (2 * AA_SS * r).pow(2);
+        let inside = |fx: i64, fy: i64| fx * fx + fy * fy <= r2;
+        let a_in = aa_coverage(r - 2, 0, inside);
+        let a_edge = aa_coverage(r, 0, inside);
+        let a_out = aa_coverage(r + 2, 0, inside);
+        assert!(
+            a_in >= a_edge && a_edge >= a_out,
+            "coverage must not rise moving outward: {a_in} {a_edge} {a_out}"
+        );
+    }
 }

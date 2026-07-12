@@ -15,9 +15,10 @@
 
 use crate::arch::aarch64::dma_to_phys as dma;
 use crate::block::{BlockDevice, BlockError, BLOCK_SIZE};
+use crate::mm::Locked;
 use alloc::alloc::{alloc_zeroed, Layout};
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, AtomicU16, Ordering};
 
 // virtio-mmio register offsets (shared with virtio_input).
 const MAGIC: usize = 0x000;
@@ -108,7 +109,36 @@ unsafe fn rd16(a: u64) -> u16 {
 /// `/install`) take seconds instead of minutes.
 const DATA_MAX: usize = 64 * 1024;
 
-/// A polled virtio-mmio block device.
+/// The queue + DMA buffers of a brought-up device, cached per MMIO slot so the
+/// device is initialised **exactly once**. Re-probing (e.g. `find_on_disks`
+/// scanning disks 0..N) must NOT reset a live device — a reset tears down the
+/// virtqueue and the next poll (`used_idx != avail_idx`) never completes, which
+/// hung the shell before its input loop. `Copy` so a fresh handle is cheap.
+#[derive(Clone, Copy)]
+struct BlkShared {
+    base: usize,
+    capacity: u64,
+    qsize: u16,
+    q_desc: u64,
+    q_avail: u64,
+    q_used: u64,
+    req: u64,
+    data_buf: u64,
+}
+
+/// Per-slot cache of brought-up devices (idempotent probe). Lock is only taken
+/// during probe, never during I/O.
+static BLK_CACHE: Locked<[Option<BlkShared>; MMIO_SLOTS]> = Locked::new([None; MMIO_SLOTS]);
+/// Per-slot driver avail-ring index, **shared** across every handle for a slot
+/// so a re-probe continues the ring rather than restarting at 0 (which the
+/// device would see as a stale index → hang). Only one request is in flight at
+/// a time (cooperative I/O), so a plain atomic counter is sufficient.
+#[allow(clippy::declare_interior_mutable_const)]
+static AVAIL_IDX: [AtomicU16; MMIO_SLOTS] = [const { AtomicU16::new(0) }; MMIO_SLOTS];
+
+/// A polled virtio-mmio block device. A lightweight handle over the cached
+/// [`BlkShared`] queue; the `avail` counter lives in [`AVAIL_IDX`] so all
+/// handles for a slot share one ring position.
 pub struct VirtioBlkMmio {
     base: usize,
     capacity: u64, // 512-byte sectors
@@ -118,7 +148,23 @@ pub struct VirtioBlkMmio {
     q_used: u64,
     req: u64,      // request header/status scratch page
     data_buf: u64, // DATA_MAX-byte bounce buffer for multi-sector IO
-    avail_idx: u16,
+    avail: &'static AtomicU16,
+}
+
+impl VirtioBlkMmio {
+    fn from_shared(sh: BlkShared, slot: usize) -> VirtioBlkMmio {
+        VirtioBlkMmio {
+            base: sh.base,
+            capacity: sh.capacity,
+            qsize: sh.qsize,
+            q_desc: sh.q_desc,
+            q_avail: sh.q_avail,
+            q_used: sh.q_used,
+            req: sh.req,
+            data_buf: sh.data_buf,
+            avail: &AVAIL_IDX[slot],
+        }
+    }
 }
 
 impl VirtioBlkMmio {
@@ -147,6 +193,15 @@ impl VirtioBlkMmio {
     }
 
     fn init(base: usize, version: u32) -> Option<VirtioBlkMmio> {
+        let slot = base.wrapping_sub(MMIO_BASE) / MMIO_STRIDE;
+        if slot >= MMIO_SLOTS {
+            return None;
+        }
+        // Already brought up? Hand back a fresh handle over the SAME queue —
+        // no device reset, no re-alloc — so repeated probes are safe.
+        if let Some(sh) = BLK_CACHE.with(|c| c[slot]) {
+            return Some(VirtioBlkMmio::from_shared(sh, slot));
+        }
         let req = alloc_ident(4096);
         let data_buf = alloc_ident(DATA_MAX);
         // SAFETY: `base` is a confirmed virtio-blk MMIO block; single-core boot.
@@ -207,7 +262,19 @@ impl VirtioBlkMmio {
                 "virtio-blk-mmio: up at {base:#x} (v{version}), {capacity} sectors ({} MiB), q{qsize}",
                 capacity * 512 / (1024 * 1024)
             ));
-            Some(VirtioBlkMmio { base, capacity, qsize, q_desc: desc, q_avail: avail, q_used: used, req, data_buf, avail_idx: 0 })
+            let shared = BlkShared {
+                base,
+                capacity,
+                qsize,
+                q_desc: desc,
+                q_avail: avail,
+                q_used: used,
+                req,
+                data_buf,
+            };
+            AVAIL_IDX[slot].store(0, Ordering::Relaxed);
+            BLK_CACHE.with(|c| c[slot] = Some(shared));
+            Some(VirtioBlkMmio::from_shared(shared, slot))
         }
     }
 
@@ -243,16 +310,18 @@ impl VirtioBlkMmio {
             wr16(d(2) + 12, VIRTQ_DESC_F_WRITE);
             wr16(d(2) + 14, 0);
 
-            let slot = self.avail_idx % self.qsize;
-            wr16(self.q_avail + 4 + slot as u64 * 2, 0);
+            let cur = self.avail.load(Ordering::Relaxed);
+            let ring = cur % self.qsize;
+            wr16(self.q_avail + 4 + ring as u64 * 2, 0);
             fence(Ordering::SeqCst);
-            self.avail_idx = self.avail_idx.wrapping_add(1);
-            wr16(self.q_avail + 2, self.avail_idx);
+            let next = cur.wrapping_add(1);
+            self.avail.store(next, Ordering::Relaxed);
+            wr16(self.q_avail + 2, next);
             dsb();
             reg_write(self.base, QUEUE_NOTIFY, 0);
 
             let mut spins: u64 = 0;
-            while rd16(self.q_used + 2) != self.avail_idx {
+            while rd16(self.q_used + 2) != next {
                 core::hint::spin_loop();
                 spins += 1;
                 if spins > 2_000_000_000 {
