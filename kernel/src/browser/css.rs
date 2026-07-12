@@ -1073,7 +1073,7 @@ pub fn gradient_stops(v: &str) -> Vec<u32> {
     out
 }
 
-fn parse_px(s: &str) -> Option<i32> {
+pub fn parse_px(s: &str) -> Option<i32> {
     let s = s.trim().to_ascii_lowercase();
     if let Some(n) = s.strip_suffix("px") {
         return n.trim().parse().ok();
@@ -2043,6 +2043,13 @@ pub fn compute(
     st.font_style = parent.font_style;
     st.direction = parent.direction;
     st.text_align = parent.text_align;
+    // These CSS properties inherit too (so `<ul style="list-style:none">`
+    // suppresses its `<li>` markers, and inherited spacing propagates).
+    st.list_style = parent.list_style;
+    st.letter_spacing = parent.letter_spacing;
+    st.line_height = parent.line_height;
+    st.white_space = parent.white_space;
+    st.text_transform = parent.text_transform;
     // Tag UA defaults (simplified user-agent stylesheet).
     match tag {
         "h1" => {

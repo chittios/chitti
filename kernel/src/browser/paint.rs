@@ -29,9 +29,13 @@ pub fn paint_chrome(layout: &Layout, scroll_y: i32, chrome: Chrome) -> Vec<u32> 
     let h = layout.height.max(1) as usize;
     let mut buf = vec![layout.bg; w * h];
 
-    // Background rects under content.
+    // Background rects under content (rounded when `border-radius` is set).
     for r in &layout.rects {
-        fill_rect(&mut buf, w, h, r.x, r.y - scroll_y, r.w, r.h, r.color);
+        if r.radius > 0 {
+            fill_round_rect(&mut buf, w, h, r.x, r.y - scroll_y, r.w, r.h, r.color, r.radius);
+        } else {
+            fill_rect(&mut buf, w, h, r.x, r.y - scroll_y, r.w, r.h, r.color);
+        }
     }
 
     // CSS background images (host-decoded), over colour rects, under content.
@@ -66,7 +70,7 @@ pub fn paint_chrome(layout: &Layout, scroll_y: i32, chrome: Chrome) -> Vec<u32> 
             continue;
         }
         if let Some(ref px) = im.pixels {
-            blit_image(&mut buf, w, h, im.x, y0, im.w, im.h, px, im.src_w, im.src_h);
+            blit_image_fit(&mut buf, w, h, im.x, y0, im.w, im.h, px, im.src_w, im.src_h, im.object_fit);
         } else {
             fill_rect(&mut buf, w, h, im.x, y0, im.w, im.h, 0xe0e0e0);
             for dx in 0..im.w {
@@ -149,7 +153,19 @@ pub fn paint_chrome(layout: &Layout, scroll_y: i32, chrome: Chrome) -> Vec<u32> 
         if y + line_h < 0 || y >= layout.height {
             continue;
         }
-        let end_x = blit_text(&mut buf, w, h, run.x, y, &run.text, px, run.color, &run.font_family);
+        let end_x = if run.letter_spacing != 0 {
+            // `letter-spacing`: advance each glyph by its width + the spacing.
+            let mut pen = run.x;
+            for ch in run.text.chars() {
+                let mut b = [0u8; 4];
+                let s = ch.encode_utf8(&mut b);
+                let nx = blit_text(&mut buf, w, h, pen, y, s, px, run.color, &run.font_family);
+                pen = nx + run.letter_spacing;
+            }
+            pen
+        } else {
+            blit_text(&mut buf, w, h, run.x, y, &run.text, px, run.color, &run.font_family)
+        };
         if run.bold {
             let _ = blit_text(&mut buf, w, h, run.x + 1, y, &run.text, px, run.color, &run.font_family);
         }
@@ -191,7 +207,7 @@ fn paint_control(
         ControlKind::Text | ControlKind::Password | ControlKind::TextArea => {
             let bg = if c.focused { 0xffffff } else { 0xfafafa };
             let border = if c.focused { 0x1a73e8 } else { 0x888888 };
-            fill_rect(buf, bw, bh, c.x, y0, c.w, c.h, bg);
+            fill_round_rect(buf, bw, bh, c.x, y0, c.w, c.h, bg, c.radius.max(4));
             // border
             for dx in 0..c.w {
                 put(buf, bw, bh, c.x + dx, y0, border);
@@ -226,7 +242,9 @@ fn paint_control(
         }
         ControlKind::Submit | ControlKind::Button => {
             let bg = if c.focused { 0x1557b0 } else { 0x1a73e8 };
-            fill_rect(buf, bw, bh, c.x, y0, c.w, c.h, bg);
+            // Buttons get a small default rounding (like real UAs) unless the
+            // page asks for more via `border-radius`.
+            fill_round_rect(buf, bw, bh, c.x, y0, c.w, c.h, bg, c.radius.max(4));
             let label = if c.value.is_empty() {
                 if c.kind == ControlKind::Submit {
                     "Submit"
@@ -325,9 +343,129 @@ fn blit_image(
     }
 }
 
+/// Blit a cropped source region `[sx0,sx0+scw)×[sy0,sy0+sch)` into the dest box.
+#[allow(clippy::too_many_arguments)]
+fn blit_image_crop(
+    buf: &mut [u32], bw: usize, bh: usize, dx: i32, dy: i32, dw: i32, dh: i32,
+    src: &[u32], sw: usize, sh: usize, sx0: usize, sy0: usize, scw: usize, sch: usize,
+) {
+    if scw == 0 || sch == 0 || dw <= 0 || dh <= 0 {
+        return;
+    }
+    for row in 0..dh {
+        let sy = (sy0 + (row as usize * sch) / dh as usize).min(sh - 1);
+        for col in 0..dw {
+            let sx = (sx0 + (col as usize * scw) / dw as usize).min(sw - 1);
+            put(buf, bw, bh, dx + col, dy + row, src[sy * sw + sx]);
+        }
+    }
+}
+
+/// Blit an image into a `box_w`×`box_h` box honoring `object-fit`
+/// (fill/contain/cover/none/scale-down) — integer math, centered.
+#[allow(clippy::too_many_arguments)]
+fn blit_image_fit(
+    buf: &mut [u32], bw: usize, bh: usize, bx: i32, by: i32, box_w: i32, box_h: i32,
+    src: &[u32], sw: usize, sh: usize, fit: super::css::ObjectFit,
+) {
+    use super::css::ObjectFit::*;
+    if sw == 0 || sh == 0 || box_w <= 0 || box_h <= 0 {
+        return;
+    }
+    let (siw, sih) = (sw as i64, sh as i64);
+    let (bwi, bhi) = (box_w as i64, box_h as i64);
+    match fit {
+        Fill => blit_image(buf, bw, bh, bx, by, box_w, box_h, src, sw, sh),
+        Contain | ScaleDown => {
+            // Fit inside, preserving aspect; scale-down never upscales.
+            let (mut dw, mut dh) = if siw * bhi <= sih * bwi {
+                ((siw * bhi / sih) as i32, box_h)
+            } else {
+                (box_w, (sih * bwi / siw) as i32)
+            };
+            if matches!(fit, ScaleDown) && (dw > sw as i32 || dh > sh as i32) {
+                dw = sw as i32;
+                dh = sh as i32;
+            }
+            let ox = bx + (box_w - dw) / 2;
+            let oy = by + (box_h - dh) / 2;
+            blit_image(buf, bw, bh, ox, oy, dw.max(1), dh.max(1), src, sw, sh);
+        }
+        Cover => {
+            // Fill the box, cropping the overflow (centered).
+            let (cw, ch, sx0, sy0) = if siw * bhi > sih * bwi {
+                let cw = (sih * bwi / bhi) as usize;
+                (cw.min(sw), sh, (sw - cw.min(sw)) / 2, 0)
+            } else {
+                let ch = (siw * bhi / bwi) as usize;
+                (sw, ch.min(sh), 0, (sh - ch.min(sh)) / 2)
+            };
+            blit_image_crop(buf, bw, bh, bx, by, box_w, box_h, src, sw, sh, sx0, sy0, cw, ch);
+        }
+        None => {
+            // Natural size, centered, cropped to the box.
+            let dw = (sw as i32).min(box_w);
+            let dh = (sh as i32).min(box_h);
+            let sx0 = (sw.saturating_sub(dw as usize)) / 2;
+            let sy0 = (sh.saturating_sub(dh as usize)) / 2;
+            let ox = bx + (box_w - dw) / 2;
+            let oy = by + (box_h - dh) / 2;
+            blit_image_crop(buf, bw, bh, ox, oy, dw, dh, src, sw, sh, sx0, sy0, dw as usize, dh as usize);
+        }
+    }
+}
+
 fn fill_rect(buf: &mut [u32], w: usize, h: usize, x: i32, y: i32, rw: i32, rh: i32, color: u32) {
     for dy in 0..rh {
         for dx in 0..rw {
+            put(buf, w, h, x + dx, y + dy, color);
+        }
+    }
+}
+
+/// Fill a rectangle with rounded corners (`border-radius`). A pixel inside one
+/// of the four corner quadrants is drawn only if it falls within the corner
+/// circle of radius `radius` (clamped to half the shorter side).
+fn fill_round_rect(
+    buf: &mut [u32],
+    w: usize,
+    h: usize,
+    x: i32,
+    y: i32,
+    rw: i32,
+    rh: i32,
+    color: u32,
+    radius: i32,
+) {
+    let r = radius.min(rw / 2).min(rh / 2).max(0);
+    if r == 0 {
+        fill_rect(buf, w, h, x, y, rw, rh, color);
+        return;
+    }
+    let r2 = (r * r) as i64;
+    for dy in 0..rh {
+        for dx in 0..rw {
+            // Corner-circle centre for whichever quadrant this pixel is in.
+            let cx = if dx < r {
+                r
+            } else if dx >= rw - r {
+                rw - r
+            } else {
+                dx // straight edge — always inside
+            };
+            let cy = if dy < r {
+                r
+            } else if dy >= rh - r {
+                rh - r
+            } else {
+                dy
+            };
+            if cx != dx && cy != dy {
+                let (ddx, ddy) = ((dx - cx) as i64, (dy - cy) as i64);
+                if ddx * ddx + ddy * ddy > r2 {
+                    continue;
+                }
+            }
             put(buf, w, h, x + dx, y + dy, color);
         }
     }

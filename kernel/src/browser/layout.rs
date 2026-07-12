@@ -35,6 +35,8 @@ pub struct TextRun {
     /// `text-decoration: underline` (or a link with the default UA underline) —
     /// the painter draws a 1px rule under the run.
     pub underline: bool,
+    /// `letter-spacing` in px added between glyphs (0 = normal).
+    pub letter_spacing: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +55,9 @@ pub struct RectBox {
     pub w: i32,
     pub h: i32,
     pub color: u32,
+    /// `border-radius` in px (0 = square). The painter rounds the corners of
+    /// filled background rects; border/outline edge rects keep 0.
+    pub radius: i32,
 }
 
 /// Hit box of a JS-interactive element (has listeners / `on*` attrs), so a
@@ -105,16 +110,16 @@ fn push_box_borders(rects: &mut Vec<RectBox>, x: i32, y: i32, w: i32, h: i32, st
         }
     };
     if let Some((bw, c)) = edge(st.border_top_style, st.border_top_width, st.border_top_color) {
-        rects.push(RectBox { x, y, w, h: bw, color: c });
+        rects.push(RectBox { x, y, w, h: bw, color: c, radius: 0 });
     }
     if let Some((bw, c)) = edge(st.border_bottom_style, st.border_bottom_width, st.border_bottom_color) {
-        rects.push(RectBox { x, y: y + h - bw, w, h: bw, color: c });
+        rects.push(RectBox { x, y: y + h - bw, w, h: bw, color: c, radius: 0 });
     }
     if let Some((bw, c)) = edge(st.border_left_style, st.border_left_width, st.border_left_color) {
-        rects.push(RectBox { x, y, w: bw, h, color: c });
+        rects.push(RectBox { x, y, w: bw, h, color: c, radius: 0 });
     }
     if let Some((bw, c)) = edge(st.border_right_style, st.border_right_width, st.border_right_color) {
-        rects.push(RectBox { x: x + w - bw, y, w: bw, h, color: c });
+        rects.push(RectBox { x: x + w - bw, y, w: bw, h, color: c, radius: 0 });
     }
     // Outline — drawn just outside the border box by `outline-offset`.
     if st.outline_style.is_visible() && st.outline_width > 0 {
@@ -123,10 +128,10 @@ fn push_box_borders(rects: &mut Vec<RectBox>, x: i32, y: i32, w: i32, h: i32, st
         let (ox, oy) = (x - off - ow, y - off - ow);
         let (ow_box, oh_box) = (w + 2 * (off + ow), h + 2 * (off + ow));
         let c = st.outline_color.unwrap_or(fallback);
-        rects.push(RectBox { x: ox, y: oy, w: ow_box, h: ow, color: c });
-        rects.push(RectBox { x: ox, y: oy + oh_box - ow, w: ow_box, h: ow, color: c });
-        rects.push(RectBox { x: ox, y: oy, w: ow, h: oh_box, color: c });
-        rects.push(RectBox { x: ox + ow_box - ow, y: oy, w: ow, h: oh_box, color: c });
+        rects.push(RectBox { x: ox, y: oy, w: ow_box, h: ow, color: c, radius: 0 });
+        rects.push(RectBox { x: ox, y: oy + oh_box - ow, w: ow_box, h: ow, color: c, radius: 0 });
+        rects.push(RectBox { x: ox, y: oy, w: ow, h: oh_box, color: c, radius: 0 });
+        rects.push(RectBox { x: ox + ow_box - ow, y: oy, w: ow, h: oh_box, color: c, radius: 0 });
     }
 }
 
@@ -143,6 +148,8 @@ pub struct ImageBox {
     pub pixels: Option<alloc::vec::Vec<u32>>,
     pub src_w: usize,
     pub src_h: usize,
+    /// `object-fit` for scaling the source into the `w`×`h` box.
+    pub object_fit: css::ObjectFit,
 }
 
 /// Form control kind (Ladybird `HTMLInputElement` type subset).
@@ -239,6 +246,8 @@ pub struct FormControl {
     /// Stamped `Node.elem_idx` (JS DOM element index) when the tree was
     /// stamped before layout — lets input/click events reach page JS.
     pub elem_idx: Option<usize>,
+    /// `border-radius` in px for the control's box (0 = square).
+    pub radius: i32,
 }
 
 /// Hit-test result in content coordinates (y includes scroll offset).
@@ -655,6 +664,46 @@ fn walk(
                 return;
             }
 
+            // CSS `float: left|right` (parsed but never applied). The floated
+            // box is laid out as an isolated fragment and placed at the left or
+            // right edge; a left float lets following inline content flow to its
+            // right. A single-pass approximation — no multi-line wrap-around or
+            // `clear` — but handles image/callout floats and simple sidebars.
+            if matches!(st.float_mode, css::FloatMode::Left | css::FloatMode::Right)
+                && !matches!(tag, "br" | "hr")
+            {
+                let mark = mark_frag(runs, links, rects, images, controls, frames, aux);
+                let box_w = st.width.unwrap_or((cur.max_w / 3).max(40)).clamp(1, cur.max_w.max(1));
+                let mut fcur = Cursor {
+                    x: 0,
+                    y: 0,
+                    max_w: box_w,
+                    margin_x: 0,
+                    line_h,
+                    content_bottom: 0,
+                };
+                for c in &n.children {
+                    walk(
+                        c, sheet, &st, &mut fcur, runs, links, rects, images, controls,
+                        frames, aux, link, form, next_form_id, page_bg, vw, in_head,
+                    );
+                }
+                let (x0, y0, x1, y1) = frag_bbox(mark, runs, links, rects, images, controls, frames, aux);
+                let fw = st.width.unwrap_or((x1 - x0).max(1));
+                let fh = (y1 - y0).max(fcur.content_bottom).max(1);
+                let (fx, fy) = match st.float_mode {
+                    css::FloatMode::Right => (cur.margin_x + cur.max_w - fw, cur.y),
+                    _ => (cur.x.max(cur.margin_x), cur.y),
+                };
+                translate_frag(mark, fx - x0, fy - y0, runs, links, rects, images, controls, frames, aux);
+                if matches!(st.float_mode, css::FloatMode::Left) {
+                    cur.x = fx + fw + 6; // following content flows to the right
+                }
+                cur.line_h = cur.line_h.max(fh);
+                cur.content_bottom = cur.content_bottom.max(fy + fh);
+                return;
+            }
+
             // CSS `position` (parsed but never applied before — headers,
             // overlays and badges just flowed inline). `relative` shifts the box
             // by its offsets while keeping its flow space; `absolute`/`fixed` are
@@ -739,11 +788,31 @@ fn walk(
                 )
             {
                 cur.line_h = line_h.max(cur.line_h);
+                // `vertical-align` shifts this inline box within the line box.
+                let va = st.vertical_align;
+                let vmark = if !matches!(va, css::VerticalAlign::Baseline) {
+                    Some(mark_frag(runs, links, rects, images, controls, frames, aux))
+                } else {
+                    None
+                };
                 for c in &n.children {
                     walk(
                         c, sheet, &st, cur, runs, links, rects, images, controls,
                         frames, aux, link, form, next_form_id, page_bg, vw, in_head,
                     );
+                }
+                if let Some(m) = vmark {
+                    let (_, y0, _, y1) =
+                        frag_bbox(m, runs, links, rects, images, controls, frames, aux);
+                    let fh = (y1 - y0).max(1);
+                    let dy = match va {
+                        css::VerticalAlign::Middle => (cur.line_h - fh) / 2,
+                        css::VerticalAlign::Bottom => cur.line_h - fh,
+                        _ => 0, // Top / Baseline: keep at the line top
+                    };
+                    if dy != 0 {
+                        translate_frag(m, 0, dy, runs, links, rects, images, controls, frames, aux);
+                    }
                 }
                 return;
             }
@@ -762,6 +831,7 @@ fn walk(
                         w: cur.max_w,
                         h: 1,
                         color: st.color,
+                        radius: 0,
                     });
                     cur.y += 4 + st.margin_bottom;
                     cur.content_bottom = cur.content_bottom.max(cur.y);
@@ -793,6 +863,7 @@ fn walk(
                         pixels: None,
                         src_w: 0,
                         src_h: 0,
+                        object_fit: st.object_fit,
                     });
                     cur.y += ih + st.margin_bottom.max(0);
                     cur.x = cur.margin_x;
@@ -919,6 +990,7 @@ fn walk(
                         form,
                         n,
                         line_h,
+                        st.border_radius.max(0),
                     );
                 }
                 "table" | "thead" | "tbody" | "tfoot" => {
@@ -977,7 +1049,7 @@ fn walk(
                     // `box-sizing` (content-box: `width` is the content;
                     // border-box: `width` includes padding+border).
                     let avail = (old_max - st.margin_left - st.margin_right).max(1);
-                    let (content_w, box_w) = match st.width {
+                    let (mut content_w, mut box_w) = match st.width {
                         Some(w) => match st.box_sizing {
                             css::BoxSizing::BorderBox => {
                                 ((w - h_extra).max(1), w.min(avail).max(1))
@@ -986,6 +1058,19 @@ fn walk(
                         },
                         None => ((avail - h_extra).max(1), avail),
                     };
+                    // `min-width` / `max-width` clamp the content box (both given
+                    // as content-box lengths); the border box follows.
+                    if let Some(mw) = st.max_width {
+                        if content_w > mw {
+                            content_w = mw.max(1);
+                        }
+                    }
+                    if let Some(mnw) = st.min_width {
+                        if content_w < mnw {
+                            content_w = mnw;
+                        }
+                    }
+                    box_w = (content_w + h_extra).min(avail).max(1);
                     // `margin: 0 auto` centers a fixed-width block in `avail`.
                     let auto_indent = if st.margin_left_auto
                         && st.margin_right_auto
@@ -1002,15 +1087,30 @@ fn walk(
                     let content_x = block_x0 + bl + pl;
                     cur.margin_x = content_x;
                     if tag == "li" {
-                        emit_text("• ", cur, runs, links, link, &st);
+                        {
+                        let marker = list_marker(&st);
+                        if !marker.is_empty() { emit_text(marker, cur, runs, links, link, &st); }
+                    }
                     }
                     cur.x = content_x;
                     cur.y += bt + pt;
                     let content_start_x = cur.x;
                     cur.max_w = content_w;
+                    // `text-indent` indents the first line of the block.
+                    if st.text_indent > 0 {
+                        cur.x += st.text_indent.min(content_w.saturating_sub(1));
+                    }
                     // Mark where this block's inline content begins, so a
                     // non-`Left` `text-align` can be applied to just these items.
                     let (r0, l0, i0, c0) = (runs.len(), links.len(), images.len(), controls.len());
+                    // Full fragment mark for `transform: translate(...)`, which
+                    // shifts the whole box (content + background) after layout.
+                    let xform = parse_transform_translate(&st.transform);
+                    let tmark = if xform != (0, 0) {
+                        Some(mark_frag(runs, links, rects, images, controls, frames, aux))
+                    } else {
+                        None
+                    };
                     for c in &n.children {
                         walk(
                             c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
@@ -1024,13 +1124,37 @@ fn walk(
                     // Box height spans content + padding + border; honor an
                     // explicit `height` (content-box adds padding/border to it).
                     let mut block_h = (cur.y - block_y0).max(bt + bb + pt + pb).max(1);
+                    // `height` / `min-height` / `max-height` (content-box adds
+                    // padding+border to the given length).
+                    let box_extra_v = bt + bb + pt + pb;
+                    let to_box_h = |len: i32| match st.box_sizing {
+                        css::BoxSizing::BorderBox => len,
+                        _ => len + box_extra_v,
+                    };
                     if let Some(hh) = st.height {
-                        let want = match st.box_sizing {
-                            css::BoxSizing::BorderBox => hh,
-                            _ => hh + bt + bb + pt + pb,
-                        };
-                        block_h = block_h.max(want);
-                        cur.y = block_y0 + block_h;
+                        block_h = block_h.max(to_box_h(hh));
+                    }
+                    if let Some(mnh) = st.min_height {
+                        block_h = block_h.max(to_box_h(mnh));
+                    }
+                    if let Some(mxh) = st.max_height {
+                        block_h = block_h.min(to_box_h(mxh)).max(1);
+                    }
+                    cur.y = block_y0 + block_h;
+                    // `box-shadow`: a soft offset rectangle behind the box
+                    // (single hard rect, colour faded toward the page by blur —
+                    // no real gaussian blur). Drawn before the background.
+                    if let Some((sdx, sdy, blur, scol)) = parse_box_shadow(&st.box_shadow) {
+                        let grow = (blur / 2).clamp(0, 24);
+                        let fade_amt = (200 - blur.clamp(0, 40) * 3).clamp(60, 200) as u8;
+                        rects.push(RectBox {
+                            x: block_x0 + sdx - grow,
+                            y: block_y0 + sdy - grow,
+                            w: (box_w + grow * 2).max(1),
+                            h: (block_h + grow * 2).max(1),
+                            color: fade(scol, fade_amt),
+                            radius: (st.border_radius.max(0) + grow).max(0),
+                        });
                     }
                     if let Some(bg) = st.background {
                         rects.push(RectBox {
@@ -1039,6 +1163,7 @@ fn walk(
                             w: box_w,
                             h: block_h,
                             color: fade(bg, st.opacity),
+                            radius: st.border_radius.max(0),
                         });
                     }
                     aux.push_bg_box(&st, block_x0, block_y0, box_w, block_h);
@@ -1056,6 +1181,13 @@ fn walk(
                             st.text_align, content_start_x, cur.max_w,
                             &mut runs[r0..], &mut links[l0..], &mut images[i0..],
                             &mut controls[c0..],
+                        );
+                    }
+                    // Apply `transform: translate(...)` to the whole box.
+                    if let Some(tm) = tmark {
+                        translate_frag(
+                            tm, xform.0, xform.1, runs, links, rects, images, controls,
+                            frames, aux,
                         );
                     }
                     cur.max_w = old_max;
@@ -1114,7 +1246,10 @@ fn walk(
                         }
                         DisplayKind::ListItem => {
                             block_before(cur, st.margin_top);
-                            emit_text("• ", cur, runs, links, link, &st);
+                            {
+                        let marker = list_marker(&st);
+                        if !marker.is_empty() { emit_text(marker, cur, runs, links, link, &st); }
+                    }
                             for c in &n.children {
                                 walk(
                                     c, sheet, &st, cur, runs, links, rects, images, controls,
@@ -1349,6 +1484,7 @@ fn layout_flex_grid_container(
             w: container_w,
             h: 1,
             color: bg,
+            radius: 0,
         });
         i
     });
@@ -1582,6 +1718,7 @@ fn push_control(
     form: Option<&FormCtx>,
     node: &Node,
     line_h: i32,
+    radius: i32,
 ) {
     let kind = ControlKind::from_input_type(input_type, tag);
     if kind == ControlKind::Hidden {
@@ -1605,6 +1742,7 @@ fn push_control(
             focused: false,
             checked: false,
             elem_idx: node.elem_idx,
+            radius: 0,
         });
         return;
     }
@@ -1669,6 +1807,7 @@ fn push_control(
         focused: false,
         checked: false,
         elem_idx: node.elem_idx,
+        radius,
     });
     cur.x = ctrl_x + w + CTRL_GAP;
     cur.content_bottom = cur.content_bottom.max(ctrl_y + h);
@@ -1792,6 +1931,99 @@ fn run_family(st: &ComputedStyle) -> String {
     }
 }
 
+/// Extract the `(tx, ty)` translation from a CSS `transform` value
+/// (`translate(x,y)`, `translateX(x)`, `translateY(y)`). Scale/rotate/skew are
+/// not applied (they need re-rasterisation); only the offset is honored.
+fn parse_transform_translate(s: &str) -> (i32, i32) {
+    let low = s.to_ascii_lowercase();
+    let arg = |key: &str| -> Option<&str> {
+        let start = low.find(key)? + key.len();
+        let end = low[start..].find(')')? + start;
+        Some(s[start..end].trim())
+    };
+    let (mut tx, mut ty) = (0, 0);
+    if let Some(a) = arg("translate(") {
+        let mut it = a.split(',');
+        tx = it.next().and_then(|v| css::parse_px(v.trim())).unwrap_or(0);
+        ty = it.next().and_then(|v| css::parse_px(v.trim())).unwrap_or(0);
+    }
+    if let Some(a) = arg("translatex(") {
+        tx = css::parse_px(a).unwrap_or(tx);
+    }
+    if let Some(a) = arg("translatey(") {
+        ty = css::parse_px(a).unwrap_or(ty);
+    }
+    (tx, ty)
+}
+
+/// Parse the first shadow of a `box-shadow` value into `(dx, dy, blur, color)`.
+/// Returns `None` for `none`/empty. Handles a parenthesised colour
+/// (`rgba(…)`), stops at the second (comma-separated) shadow, and ignores
+/// `inset`.
+fn parse_box_shadow(s: &str) -> Option<(i32, i32, i32, u32)> {
+    let s = s.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    // Whitespace tokens, keeping `(...)` groups intact; stop at a top-level comma.
+    let mut toks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    for ch in s.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if depth == 0 => break,
+            c if c.is_whitespace() && depth == 0 => {
+                if !cur.is_empty() {
+                    toks.push(core::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        toks.push(cur);
+    }
+    let mut lens: Vec<i32> = Vec::new();
+    let mut color = None;
+    for t in &toks {
+        if t.eq_ignore_ascii_case("inset") {
+            continue;
+        }
+        if let Some(px) = css::parse_px(t) {
+            lens.push(px);
+        } else if let Some(c) = css::parse_color(t) {
+            color = Some(c);
+        }
+    }
+    Some((
+        lens.first().copied().unwrap_or(0),
+        lens.get(1).copied().unwrap_or(0),
+        lens.get(2).copied().unwrap_or(0).max(0),
+        color.unwrap_or(0x000000),
+    ))
+}
+
+/// The `<li>` marker string for a computed `list-style` — empty for `none`
+/// (nav menus set `list-style:none`, which used to still show a bullet).
+fn list_marker(st: &ComputedStyle) -> &'static str {
+    match st.list_style {
+        css::ListStyle::None => "",
+        css::ListStyle::Circle => "◦ ",
+        css::ListStyle::Square => "▪ ",
+        // Decimal needs an ordered-list counter we don't thread here; fall back
+        // to a disc so the item still reads as a list item.
+        css::ListStyle::Disc | css::ListStyle::Decimal => "• ",
+    }
+}
+
 /// Fade `color` toward a light page background by `opacity` (0–255) — a cheap
 /// approximation of CSS `opacity` for solid colours (no real alpha compositing).
 /// `opacity == 255` returns the colour unchanged.
@@ -1882,8 +2114,11 @@ fn emit_text(
             }
         }
         let word: String = chars[start..i].iter().collect();
-        // Proportional advance from the active TTF face.
-        let w = (crate::font_ttf::measure(&word, px) + 0.5) as i32;
+        // Proportional advance from the active TTF face, plus `letter-spacing`
+        // between the word's glyphs.
+        let ls = st.letter_spacing.unwrap_or(0);
+        let w = (crate::font_ttf::measure(&word, px) + 0.5) as i32
+            + ls * (word.chars().count() as i32);
         let w = w.max(1);
         if !no_wrap && cur.x > cur.margin_x && cur.x + w > cur.margin_x + cur.max_w {
             new_line(cur);
@@ -1903,6 +2138,7 @@ fn emit_text(
             bold: st.bold,
             font_family: family.clone(),
             underline: matches!(st.text_decoration, css::TextDecoration::Underline),
+            letter_spacing: ls,
         });
         if let Some(href) = link {
             links.push(LinkBox {
@@ -2080,6 +2316,88 @@ mod tests {
         let (a, b) = (&lay.controls[0], &lay.controls[1]);
         assert_eq!(a.y, b.y, "adjacent controls share a line");
         assert!(b.x >= a.x + a.w, "second control is to the right of the first");
+    }
+
+    #[test_case]
+    fn parse_box_shadow_extracts_offsets_and_color() {
+        assert_eq!(parse_box_shadow("none"), None);
+        assert_eq!(parse_box_shadow(""), None);
+        assert_eq!(parse_box_shadow("2px 4px 8px #808080"), Some((2, 4, 8, 0x808080)));
+        // rgba colour (parens kept intact); second shadow ignored.
+        let (dx, dy, blur, _c) = parse_box_shadow("0 1px 3px rgba(0,0,0,0.3), 0 0 0 red").unwrap();
+        assert_eq!((dx, dy, blur), (0, 1, 3));
+        // inset is ignored; still parses the offsets.
+        assert_eq!(parse_box_shadow("inset 5px 6px #000").map(|s| (s.0, s.1)), Some((5, 6)));
+    }
+
+    #[test_case]
+    fn parse_transform_translate_offsets() {
+        assert_eq!(parse_transform_translate("translate(10px, 20px)"), (10, 20));
+        assert_eq!(parse_transform_translate("translateX(15px)"), (15, 0));
+        assert_eq!(parse_transform_translate("translateY(-8px)"), (0, -8));
+        assert_eq!(parse_transform_translate("scale(2)"), (0, 0)); // scale not applied
+    }
+
+    #[test_case]
+    fn transform_translate_shifts_box() {
+        let doc = html::parse(
+            r#"<html><body><div style="transform:translate(50px,30px)"><p>moved</p></div></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let m = lay.runs.iter().find(|r| r.text == "moved").expect("moved");
+        assert!(m.x >= 50 && m.y >= 30, "translated to ({},{})", m.x, m.y);
+    }
+
+    #[test_case]
+    fn float_right_places_at_right_edge() {
+        let doc = html::parse(
+            r#"<html><body><div style="float:right;width:100px">side</div><p>body text</p></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let side = lay.runs.iter().find(|r| r.text == "side").expect("side");
+        // Right-floated content sits in the right half of the viewport.
+        assert!(side.x > DEFAULT_W / 2, "float:right at x={} (vw={})", side.x, DEFAULT_W);
+    }
+
+    #[test_case]
+    fn letter_spacing_widens_run() {
+        let doc = html::parse(
+            r#"<html><body><span style="letter-spacing:5px">AB</span></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        assert_eq!(lay.runs.iter().find(|r| r.text == "AB").expect("AB").letter_spacing, 5);
+    }
+
+    #[test_case]
+    fn list_style_none_suppresses_bullet() {
+        // A nav `<ul style="list-style:none">` must not prepend bullets (they
+        // inherit to the `<li>`s).
+        let doc = html::parse(
+            r#"<html><body><ul style="list-style:none"><li>Home</li></ul><ul><li>Item</li></ul></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        // No bullet run anywhere in the list-style:none list; the default list keeps one.
+        assert!(lay.runs.iter().any(|r| r.text.contains('•')), "default <ul> still bulleted");
+        let home = lay.runs.iter().find(|r| r.text == "Home").expect("Home");
+        // "Home" should sit at/near the left content edge (no bullet indent before it on its line).
+        let bullet_before_home = lay.runs.iter().any(|r| r.text.contains('•') && r.y == home.y);
+        assert!(!bullet_before_home, "list-style:none suppresses the bullet");
+    }
+
+    #[test_case]
+    fn min_max_width_clamp_block() {
+        let doc = html::parse(
+            r#"<html><body><div style="max-width:100px;background:#eee"><p>x</p></div></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        // The background rect for the max-width div is capped near 100px.
+        let boxed = lay.rects.iter().find(|r| r.color == 0xeeeeee).expect("bg rect");
+        assert!(boxed.w <= 110, "max-width clamps the box (w={})", boxed.w);
     }
 
     #[test_case]
