@@ -133,6 +133,14 @@ jobs:
       - name: Rust toolchain (from rust-toolchain.toml)
         run: rustup show && rustc --version
 
+      # Warm the cargo cache BEFORE the e2e boot loop. `cargo xtask run` (spawned
+      # per boot attempt) otherwise does a cold nightly + build-std kernel build
+      # *inside* run.py's 120 s boot-marker deadline — the build alone exceeds
+      # 120 s, so every attempt times out mid-compile (and the retry kills the
+      # build). Pre-building here means the guest boots immediately under KVM.
+      - name: Pre-build the kernel (x86_64) to warm the cache
+        run: cargo xtask build -arch x86_64
+
       - name: Fetch the model (Qwen3.5-0.8B GGUF, ~812 MB, public HuggingFace)
         run: make model
 

@@ -1296,8 +1296,11 @@ def boot_guest(arch, model, verbose, audio, fwd, attempts=3):
                 print(f"e2e: guest booted on attempt {attempt}/{attempts}")
             return g
         print(f"e2e: boot attempt {attempt}/{attempts} failed ({outcome}); relaunching…")
-        if verbose:
-            print("    " + g.tail(800).replace("\n", "\n    "))
+        # Always surface the serial tail on a boot failure (not just under -v) —
+        # a headless CI run has no other window into why the guest didn't reach
+        # `net: configured`.
+        print("    --- guest serial tail ---")
+        print("    " + g.tail(1200).replace("\n", "\n    "))
         g.close()
     return None
 
