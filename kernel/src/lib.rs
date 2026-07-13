@@ -32,6 +32,7 @@ pub mod clock;
 pub mod pci;
 pub mod console;
 pub mod cortex;
+pub mod fdt;
 pub mod fs;
 pub mod ipc;
 pub mod highlight;
