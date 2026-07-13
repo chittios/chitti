@@ -1743,6 +1743,86 @@ pub(crate) fn parse_tool_call(text: &str) -> Option<(alloc::string::String, allo
     None
 }
 
+/// A friendly verb + primary argument for an agent tool call, for the styled
+/// chat header (`◆ Edit  src/api/checkout.ts`). Unknown tools title-case their
+/// own name and show a compact arg summary.
+fn tool_header(cmd: &str, args: &str) -> (alloc::string::String, alloc::string::String) {
+    use crate::session::todo::json_str;
+    let pick = |keys: &[&str]| -> alloc::string::String {
+        keys.iter().find_map(|k| json_str(args, k)).unwrap_or_default()
+    };
+    let (verb, arg): (&str, alloc::string::String) = match cmd {
+        "read" | "cat" | "open" => ("Read", pick(&["path", "file", "args"])),
+        "write" | "edit" => ("Edit", pick(&["path", "file"])),
+        "list" | "ls" => ("List", {
+            let a = pick(&["path", "dir", "args"]);
+            if a.is_empty() { "/".into() } else { a }
+        }),
+        "glob" | "grep" | "search" => ("Search", pick(&["pattern", "query", "args"])),
+        "search_tools" => ("Search tools", pick(&["query", "args"])),
+        "http" => ("Fetch", pick(&["url", "args"])),
+        "download" => ("Download", pick(&["url", "args"])),
+        "mkdir" => ("Make dir", pick(&["path", "args"])),
+        "touch" => ("Create", pick(&["path", "args"])),
+        "rm" | "delete" => ("Delete", pick(&["path", "args"])),
+        "cp" => ("Copy", pick(&["args"])),
+        "mv" => ("Move", pick(&["args"])),
+        "memory_add" => ("Remember", pick(&["key", "args"])),
+        "memory_get" | "memory_search" | "memory_list" => ("Recall", pick(&["key", "query", "args"])),
+        "skill" => ("Skill", pick(&["name", "args"])),
+        "spawn_subagent" | "subagent" => ("Delegate", pick(&["task", "args"])),
+        _ => return (cap_first(cmd), compact_args(args)),
+    };
+    (alloc::string::String::from(verb), arg)
+}
+
+/// Title-case a tool name for the chat header ("browse" → "Browse").
+fn cap_first(s: &str) -> alloc::string::String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<alloc::string::String>() + c.as_str(),
+        None => alloc::string::String::new(),
+    }
+}
+
+/// A compact one-line argument summary for a tool header; empty `{}` → "".
+fn compact_args(args: &str) -> alloc::string::String {
+    let a = args.trim();
+    if a.is_empty() || a == "{}" {
+        return alloc::string::String::new();
+    }
+    let inner = a.trim_start_matches('{').trim_end_matches('}').trim();
+    inner.chars().take(56).collect()
+}
+
+/// Print a styled tool-call header — `  ◆ Verb  arg` (accent diamond, bold verb,
+/// green argument), matching the agent-turn look.
+fn print_tool_header(cmd: &str, args: &str) {
+    let (verb, arg) = tool_header(cmd, args);
+    if arg.is_empty() {
+        serial_println!("  \x1b[35m\u{25c6}\x1b[0m \x1b[1m{}\x1b[0m", verb);
+    } else {
+        serial_println!("  \x1b[35m\u{25c6}\x1b[0m \x1b[1m{}\x1b[0m  \x1b[32m{}\x1b[0m", verb, arg);
+    }
+}
+
+/// Print a tool's result under its header: indented + dim, truncated so a large
+/// read/list can't flood the pane (a later fold makes the rest expandable).
+fn print_tool_output(obs: &str) {
+    const MAX_LINES: usize = 10;
+    let mut shown = 0usize;
+    let total = obs.lines().count();
+    for line in obs.lines().take(MAX_LINES) {
+        // Clip very long lines so one giant line can't wrap the whole pane.
+        let clipped: alloc::string::String = line.chars().take(120).collect();
+        serial_println!("  \x1b[2m{}\x1b[0m", clipped);
+        shown += 1;
+    }
+    if total > shown {
+        serial_println!("  \x1b[2m… {} more line(s)\x1b[0m", total - shown);
+    }
+}
+
 /// Shell approval mode: how much an **agent's** tool calls need human
 /// confirmation. Human-typed `/commands` are never gated — the human *is* the
 /// approver.
@@ -3058,12 +3138,7 @@ impl ChatSession {
                     self.prefill_committed("user\n", &fb, true);
                 }
                 Some((cmd, args)) => {
-                    serial_println!(
-                        "\x1b[33m\u{2192} running\x1b[0m /{}{}{}",
-                        cmd,
-                        if args.is_empty() { "" } else { " " },
-                        args
-                    );
+                    print_tool_header(&cmd, &args);
                     self.history.push((alloc::string::String::from("assistant\n"), text.clone()));
                     let call_id = self.next_call_id;
                     self.next_call_id += 1;
@@ -3085,6 +3160,7 @@ impl ChatSession {
                         Provenance::UntrustedIngested
                     };
                     session.push_tool_result(call_id, obs.clone(), prov, now());
+                    print_tool_output(&obs);
                     let fb = alloc::format!("<tool_response>\n{}\n</tool_response>", obs);
                     self.prefill_committed("user\n", &fb, true);
                 }
@@ -3305,12 +3381,13 @@ impl ChatSession {
         self.gen.clear();
         let mut next = self.pick();
         let mut stream = tokenizer::Stream::new();
-        // Bold speaker label (ANSI), then the streamed reply.
-        serial_print!("{}", label);
-        // In-think until the model emits </think> (we primed <think> open).
+        // Collapsed thinking: the model's <think> reasoning is timed, not
+        // streamed — on close we print "◆ Thought for Xs", then the answer with
+        // its speaker label. A non-thinking turn prints the label immediately.
         let mut in_think = think_enabled() && self.tok.think_open != u32::MAX;
-        if in_think {
-            serial_print!("\x1b[2m"); // dim the streamed reasoning
+        let think_start = if in_think { crate::arch::now_ms() } else { 0 };
+        if !in_think {
+            serial_print!("{}", label);
         }
         let mut out = alloc::string::String::new();
         // Markdown-aware colouring of the streamed answer: headings + fenced
@@ -3331,7 +3408,9 @@ impl ChatSession {
             // End of the think block: switch from dim reasoning to the answer.
             if in_think && (next == think_close || n_think >= MAX_THINK) {
                 in_think = false;
-                serial_print!("\x1b[0m\n");
+                let secs = crate::arch::now_ms().saturating_sub(think_start) as f32 / 1000.0;
+                serial_println!("\x1b[35m\u{25c6}\x1b[0m \x1b[2mThought for {:.1}s\x1b[0m", secs);
+                serial_print!("{}", label);
                 // Feed </think> (the model's own, or forced at the cap).
                 self.model.forward(think_close, self.pos, &mut self.kv, &mut self.state, true);
                 self.pos += 1;
@@ -3369,8 +3448,7 @@ impl ChatSession {
             }
             let piece = stream.push(&self.tok, self.model.token_str(next));
             if in_think {
-                serial_print!("{}", piece); // thinking stays dim + uncoloured
-                n_think += 1;
+                n_think += 1; // collapsed: reasoning is timed, not streamed
             } else {
                 md.feed(&piece, &mut |s| serial_print!("{}", s));
                 out.push_str(&piece); // the returned text stays raw (tool parsing)
@@ -3386,8 +3464,9 @@ impl ChatSession {
             next = self.pick();
         }
         if in_think {
-            // Ended (EOS/stop) while still thinking: restore normal video.
-            serial_print!("\x1b[0m");
+            // Ended (EOS/stop) while still thinking: still show the timing.
+            let secs = crate::arch::now_ms().saturating_sub(think_start) as f32 / 1000.0;
+            serial_println!("\x1b[35m\u{25c6}\x1b[0m \x1b[2mThought for {:.1}s\x1b[0m", secs);
         }
         md.finish(&mut |s| serial_print!("{}", s)); // flush a held partial line
         serial_println!("");
@@ -11496,6 +11575,29 @@ mod agent_flow_tests {
         .unwrap();
         assert_eq!(name, "read");
         assert!(args.contains("/agent/doc.pdf"), "got {args}");
+    }
+
+    /// The styled chat header maps tools to a friendly verb + primary argument;
+    /// unknown tools title-case their own name.
+    #[test_case]
+    fn tool_header_verbs_and_args() {
+        let (v, a) = tool_header("read", "{\"path\":\"/agent/doc.pdf\"}");
+        assert_eq!(v, "Read");
+        assert_eq!(a, "/agent/doc.pdf");
+        let (v, a) = tool_header("write", "{\"file\":\"src/x.ts\"}");
+        assert_eq!(v, "Edit");
+        assert_eq!(a, "src/x.ts");
+        let (v, a) = tool_header("list", "{}");
+        assert_eq!(v, "List");
+        assert_eq!(a, "/"); // empty path defaults to root
+        let (v, a) = tool_header("http", "{\"url\":\"https://example.com\"}");
+        assert_eq!(v, "Fetch");
+        assert_eq!(a, "https://example.com");
+        // Unknown tool → title-cased name, compact args.
+        let (v, _) = tool_header("browse", "{\"url\":\"x\"}");
+        assert_eq!(v, "Browse");
+        assert_eq!(cap_first("skill"), "Skill");
+        assert_eq!(compact_args("{}"), "");
     }
 
     #[test_case]
