@@ -4,7 +4,7 @@
 //! typed content blocks (`text` / `tool_use{id,name,input}` /
 //! `tool_result{tool_use_id,content}`).
 //!
-//! This is a **presentation** artifact written at `sess/<id>.jsonl` alongside
+//! This is a **presentation** artifact written at `/sessions/<id>.jsonl` alongside
 //! the authoritative postcard snapshot (which drives deterministic resume). A
 //! human — or an external tool — reads the JSONL to follow a session, exactly
 //! as Claude Code's `~/.claude/projects/*/*.jsonl` transcripts do. It is
@@ -19,7 +19,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 fn key_for(id: u64) -> String {
-    format!("sess/{}.jsonl", id)
+    format!("/sessions/{}.jsonl", id)
 }
 
 /// A stable per-message thread key, `<session>-<msgid>`.
@@ -99,7 +99,7 @@ fn record(session: &Session, m: &Message, parent: Option<u64>, ts: &str) -> Stri
 }
 
 /// Serialize the whole session to its Claude-Code-style JSONL transcript and
-/// write it to `sess/<id>.jsonl` in the store.
+/// write it to `/sessions/<id>.jsonl` in the store.
 pub fn write_transcript(session: &Session) {
     let ts = crate::clock::now_iso8601();
     let mut out = String::new();

@@ -313,7 +313,7 @@ pub fn run() -> ! {
                                 orch.session.seed
                             );
                             let saved: alloc::vec::Vec<String> =
-                                crate::synapse::fs::list().into_iter().filter(|p| p.starts_with("sess/")).collect();
+                                crate::synapse::fs::list().into_iter().filter(|p| p.starts_with("/sessions/")).collect();
                             serial_println!("saved in store: [{}]  (/session save | /session resume <id>)", saved.join(", "));
                         }
                     }
@@ -1856,6 +1856,18 @@ pub(crate) fn print_thought_for(secs: f32) {
     serial_println!("  {}\u{25c6}\x1b[0m \x1b[2mThought for {:.1}s\x1b[0m", acc, secs);
 }
 
+/// True when a tool prints its own output to the console (a Shell-bound command
+/// like `/datetime` or `/ls`). For those the agent loop must NOT also print the
+/// captured result, or it shows twice; return-only tools (Synapse / Memory /
+/// MCP) get the formatted preview since nothing else displays them.
+pub(crate) fn tool_self_prints(name: &str) -> bool {
+    use crate::tools::registry::{self, ToolBinding};
+    matches!(
+        registry::get(name).as_ref().map(|d| &d.binding),
+        Some(ToolBinding::Shell { .. })
+    )
+}
+
 /// Print a tool's result under its header: indented + dim, truncated so a large
 /// read/list can't flood the pane (a later fold makes the rest expandable).
 pub(crate) fn print_tool_output(obs: &str) {
@@ -3209,7 +3221,9 @@ impl ChatSession {
                         Provenance::UntrustedIngested
                     };
                     session.push_tool_result(call_id, obs.clone(), prov, now());
-                    print_tool_output(&obs);
+                    if !tool_self_prints(&cmd) {
+                        print_tool_output(&obs);
+                    }
                     let fb = alloc::format!("<tool_response>\n{}\n</tool_response>", obs);
                     self.prefill_committed("user\n", &fb, true);
                 }

@@ -276,7 +276,9 @@ impl RemoteChat {
                         Provenance::UntrustedIngested
                     };
                     session.push_tool_result(call_id, obs.clone(), prov, now());
-                    super::print_tool_output(&obs);
+                    if !super::tool_self_prints(&cmd) {
+                        super::print_tool_output(&obs);
+                    }
                     call_id += 1;
                     self.messages.push(("user".to_string(), format!("<tool_response>\n{}\n</tool_response>", obs)));
                 }

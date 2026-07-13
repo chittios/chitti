@@ -1,5 +1,5 @@
 //! Session persistence over the memory store (`synapse::fs`, the "disk").
-//! A session serializes with `postcard` to `sess/<id>` and resumes
+//! A session serializes with `postcard` to `/sessions/<id>` and resumes
 //! deterministically: same seed + same messages ⇒ identical continuation (the
 //! KV cache is recomputed, never stored). `fork` branches a session under a new
 //! id so an exploration can diverge without mutating the original (Phase D).
@@ -8,7 +8,7 @@ use crate::agent::types::*;
 use alloc::format;
 
 fn key_for(id: SessionId) -> alloc::string::String {
-    format!("sess/{}", id.0)
+    format!("/sessions/{}", id.0)
 }
 
 /// Persist `session` to the memory store. Overwrites any prior snapshot at the
