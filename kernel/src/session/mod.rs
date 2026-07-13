@@ -13,6 +13,7 @@
 //! * [`todo`] — the todo list + `todo_write` semantics.
 
 pub mod session;
+pub mod jsonl;
 pub mod store;
 pub mod todo;
 

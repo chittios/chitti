@@ -152,6 +152,13 @@ pub fn format_datetime() -> String {
     format!("{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}", WEEKDAYS[wd as usize], y, mo, d, h, mi, s)
 }
 
+/// The current UTC time as an ISO-8601 instant, `"2026-07-13T02:36:19Z"` —
+/// for session-transcript records (a stable, parseable, timezone-explicit form).
+pub fn now_iso8601() -> String {
+    let (y, mo, d, h, mi, s, _) = civil_from_unix(now_unix());
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
+}
+
 /// The current local date, `"2026-07-04"`.
 pub fn format_date() -> String {
     let (y, mo, d, ..) = civil_from_unix(now_unix() + tz_offset() as i64);

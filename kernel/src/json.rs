@@ -76,6 +76,52 @@ impl Json {
         out
     }
 
+    /// Compact single-line serialization (no whitespace) — for JSONL, where
+    /// each record is one line.
+    pub fn to_compact(&self) -> String {
+        let mut out = String::new();
+        self.write_compact(&mut out);
+        out
+    }
+
+    fn write_compact(&self, out: &mut String) {
+        match self {
+            Json::Null => out.push_str("null"),
+            Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Json::Num(n) => {
+                let as_int = *n as i64;
+                if as_int as f64 == *n {
+                    let _ = write!(out, "{}", as_int);
+                } else {
+                    let _ = write!(out, "{}", n);
+                }
+            }
+            Json::Str(s) => write_json_str(out, s),
+            Json::Arr(a) => {
+                out.push('[');
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    v.write_compact(out);
+                }
+                out.push(']');
+            }
+            Json::Obj(pairs) => {
+                out.push('{');
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write_json_str(out, k);
+                    out.push(':');
+                    v.write_compact(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
     fn write_pretty(&self, out: &mut String, depth: usize) {
         match self {
             Json::Null => out.push_str("null"),
