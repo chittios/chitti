@@ -105,7 +105,7 @@ fn relative_rest<'a>(dir: &str, path: &'a str) -> Option<&'a str> {
         if path.starts_with('/') {
             return Some(path.trim_start_matches('/'));
         }
-        // Bare store keys (`sess/5/...`) count as root children.
+        // Bare store keys (`skills/1/...`) count as root children.
         return Some(path);
     }
     if path == dir {
@@ -369,9 +369,9 @@ mod tests {
 
     #[test_case]
     fn bare_keys_appear_at_root() {
-        let ents = entries(&["sess/1/cmp/2", "/agent/1/x"]);
+        let ents = entries(&["skills/1/body.md", "/agent/1/x"]);
         let root = list_dir("/", &ents, true);
-        assert!(root.iter().any(|e| e.name == "sess" && e.is_dir));
+        assert!(root.iter().any(|e| e.name == "skills" && e.is_dir));
         assert!(root.iter().any(|e| e.name == "agent" && e.is_dir));
     }
 }

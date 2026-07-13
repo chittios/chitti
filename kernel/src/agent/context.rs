@@ -55,7 +55,7 @@ pub fn maybe_compact(session: &mut Session, now: Ticks) -> bool {
             (m.id, snip)
         };
         // Persist the full text to the store, keyed by session + message id.
-        let key = StoreKey(format!("sess/{}/cmp/{}", session.id.0, mid.0));
+        let key = StoreKey(format!("/sessions/{}/cmp/{}", session.id.0, mid.0));
         crate::synapse::fs::write(&key.0, session.messages[i].content.as_bytes());
         session.messages[i].resident = false;
         session.messages[i].store_ref = Some(key);
@@ -71,7 +71,7 @@ pub fn maybe_compact(session: &mut Session, now: Ticks) -> bool {
         return false; // nothing was compacted
     };
     let summary = format!("[compacted {}..{}: {}]", first.0, last.0, parts.join(" | "));
-    let summary_ref = StoreKey(format!("sess/{}/cmpsum/{}", session.id.0, session.context.compactions.len()));
+    let summary_ref = StoreKey(format!("/sessions/{}/cmpsum/{}", session.id.0, session.context.compactions.len()));
     crate::synapse::fs::write(&summary_ref.0, summary.as_bytes());
     let tokens = est_tokens(&summary);
     session.context.compactions.push(CompactionRecord {

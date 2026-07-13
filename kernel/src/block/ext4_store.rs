@@ -21,7 +21,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 /// synapse::fs keys are flat strings that routinely contain `/`
-/// (e.g. `sess/5/cmp/26`, `skills/1/body.md`), but `/` is the path separator
+/// (e.g. `/sessions/5/cmp/26`, `skills/1/body.md`), but `/` is the path separator
 /// and is illegal inside an ext4 directory-entry name. Percent-encode `/` (and
 /// `%` itself, so the mapping is reversible) into a legal single-component
 /// filename; [`key_decode`] inverts it on mount.
