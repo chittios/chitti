@@ -87,6 +87,16 @@ run-uefi:
 image:
 	$(XTASK) image $(FLAGS)
 
+## m1n1: package the aarch64 kernel as a gzip'd arm64 Image and boot it on a
+##       tethered Apple Silicon Mac over the m1n1 USB proxy. Configure via env:
+##       CHITTI_M1N1 (m1n1 checkout), CHITTI_DTB (machine dtb), optional
+##       CHITTI_INITRD (model gguf), CHITTI_BOOTARGS, M1N1DEVICE (proxy tty).
+##       Use RELEASE=1 for hardware. Without CHITTI_M1N1/CHITTI_DTB it just
+##       builds the Image and prints the manual linux.py command.
+.PHONY: m1n1
+m1n1:
+	$(XTASK) m1n1 $(REL)
+
 ## vbox: rebuild the aarch64 image and (re)load it into VirtualBox VM VBOX_VM
 ##       forces USB keyboard + USB tablet + xHCI (aarch64 has no PS/2 input path)
 ##       NB: do not put Make `#` comments inside the shell recipe — they break `\`

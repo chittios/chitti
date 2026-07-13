@@ -344,6 +344,10 @@ fn main() {
             Arch::X86_64 => image(release, model, no_model),
         },
         "run" => cmd_run(release, arch, model, uefi, disk_only, fresh_disk, disk_size, no_model),
+        // Package the aarch64 kernel as a gzip'd arm64 `Image` and (if the m1n1
+        // proxy + machine DTB are configured via env) boot it on a tethered
+        // Apple Silicon Mac. See `cmd_m1n1`.
+        "m1n1" => cmd_m1n1(release),
         "test" => cmd_test(),
         "voice-assets" => cmd_voice_assets(),
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
@@ -364,8 +368,11 @@ fn main() {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <build|image|run|test|ref-check> [-arch x86_64|aarch64] \
+    "usage: cargo xtask <build|image|run|m1n1|test|ref-check> [-arch x86_64|aarch64] \
      [-model qwen3.5-0.8b|2b|4b|9b|gemma-4-e4b] [--release] [--uefi] [-server]\n\
+     m1n1 (aarch64): package the kernel as a gzip'd arm64 Image and boot it on a \
+     tethered Apple Silicon Mac over the m1n1 USB proxy; configure via env \
+     CHITTI_M1N1/CHITTI_DTB[/CHITTI_INITRD/CHITTI_BOOTARGS/M1N1DEVICE].\n\
      run flags (x86_64): --disk <2G|1500M> size the virtio-blk disk for /install; \
      --disk-only boot the installed disk via UEFI with no ISO; --fresh-disk wipe it first; \
      --no-model build/boot without a model module (also works with `image`).\n\
@@ -409,6 +416,137 @@ fn build_kernel_aarch64(release: bool, features: &[&str]) -> Result<PathBuf, Str
         return Err(format!("aarch64 kernel not found at {}", elf.display()));
     }
     Ok(elf)
+}
+
+/// Locate an `objcopy` that can emit a flat binary from an aarch64 ELF. Prefers
+/// `llvm-objcopy` / `rust-objcopy` (arch-neutral, usually already present with
+/// the Rust toolchain), then GNU cross binutils. Returns the program name.
+fn find_objcopy() -> Result<String, String> {
+    let candidates = [
+        "llvm-objcopy",
+        "rust-objcopy",
+        "aarch64-linux-gnu-objcopy",
+        "aarch64-elf-objcopy",
+        "gobjcopy",
+        "objcopy",
+    ];
+    for c in candidates {
+        if Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+            return Ok(c.to_string());
+        }
+    }
+    // The `llvm-tools` rustup component ships `llvm-objcopy` inside the toolchain
+    // sysroot rather than on PATH — search there before giving up.
+    if let Ok(out) = Command::new("rustc").args(["--print", "sysroot"]).output() {
+        if out.status.success() {
+            let sysroot = String::from_utf8_lossy(&out.stdout);
+            let root = Path::new(sysroot.trim());
+            if let Ok(rd) = std::fs::read_dir(root.join("lib/rustlib")) {
+                for e in rd.flatten() {
+                    let cand = e.path().join("bin/llvm-objcopy");
+                    if cand.exists() {
+                        return Ok(cand.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+    }
+    Err("no objcopy found (install llvm-tools: `rustup component add llvm-tools` \
+         then use llvm-objcopy, or a GNU aarch64 binutils)"
+        .to_string())
+}
+
+/// Sanity-check that a flattened image begins with a valid arm64 `Image` header:
+/// the "ARM\x64" magic (little-endian 0x644d5241) at offset 0x38, and a nonzero
+/// `code0` (the branch past the header). Guards against a silent objcopy layout
+/// change that would make m1n1 reject the payload.
+fn verify_image_header(img: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(img).map_err(|e| format!("read {}: {e}", img.display()))?;
+    if bytes.len() < 64 {
+        return Err(format!("{} is only {} bytes — not an arm64 Image", img.display(), bytes.len()));
+    }
+    let magic = u32::from_le_bytes([bytes[0x38], bytes[0x39], bytes[0x3a], bytes[0x3b]]);
+    if magic != 0x644d_5241 {
+        return Err(format!("{}: bad arm64 Image magic {:#010x} at 0x38 (expected 0x644d5241)", img.display(), magic));
+    }
+    if bytes[..4] == [0, 0, 0, 0] {
+        return Err(format!("{}: code0 is zero — the header branch is missing", img.display()));
+    }
+    Ok(())
+}
+
+/// `cargo xtask m1n1`: build the aarch64 kernel, flatten it to an arm64 `Image`
+/// (the boot header lives at offset 0), gzip it, and — if the m1n1 proxy and a
+/// machine device tree are configured — boot it on a tethered Apple Silicon Mac
+/// over the m1n1 USB proxy (the ~7 s dev loop). Everything is driven by env so
+/// the custom arg parser stays untouched:
+///
+///   CHITTI_M1N1     path to your m1n1 checkout (uses proxyclient/tools/linux.py)
+///   CHITTI_DTB      machine device tree (e.g. apple/t8112-j473.dtb) — required to boot
+///   CHITTI_INITRD   optional initramfs / model blob (Stage 1: the GGUF)
+///   CHITTI_BOOTARGS optional kernel bootargs (e.g. "chitti.epoch=1752345600")
+///   M1N1DEVICE      proxy TTY (read by linux.py itself; e.g. /dev/tty.usbmodemXXX)
+///
+/// Without CHITTI_M1N1 + CHITTI_DTB it just builds the Image and prints the exact
+/// command to run, so the artifact is always produced.
+fn cmd_m1n1(release: bool) -> Result<(), String> {
+    let elf = build_kernel_aarch64(release, &[])?;
+    let img = elf.with_extension("Image");
+    let objcopy = find_objcopy()?;
+    run(Command::new(&objcopy).args(["-O", "binary", "--strip-all"]).arg(&elf).arg(&img))?;
+    verify_image_header(&img)?;
+    let img_len = std::fs::metadata(&img).map(|m| m.len()).unwrap_or(0);
+
+    // gzip (m1n1 auto-detects; convention is a compressed payload). Fall back to
+    // the raw Image if `gzip` is unavailable.
+    let gz = elf.with_extension("Image.gz");
+    let payload = if Command::new("gzip").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+        let out = Command::new("gzip")
+            .args(["-n", "-9", "-c"])
+            .arg(&img)
+            .output()
+            .map_err(|e| format!("gzip: {e}"))?;
+        if !out.status.success() {
+            return Err("gzip failed".to_string());
+        }
+        std::fs::write(&gz, &out.stdout).map_err(|e| format!("write {}: {e}", gz.display()))?;
+        gz.clone()
+    } else {
+        eprintln!("xtask: gzip not found; using the uncompressed Image (linux.py handles it)");
+        img.clone()
+    };
+    println!("m1n1: arm64 Image {} ({img_len} bytes); payload {}", img.display(), payload.display());
+
+    let m1n1 = env::var("CHITTI_M1N1").ok();
+    let dtb = env::var("CHITTI_DTB").ok();
+    match (m1n1, dtb) {
+        (Some(m1n1), Some(dtb)) => {
+            let linuxpy = Path::new(&m1n1).join("proxyclient/tools/linux.py");
+            if !linuxpy.exists() {
+                return Err(format!("CHITTI_M1N1 set but {} not found", linuxpy.display()));
+            }
+            let mut c = Command::new("python3");
+            c.arg(&linuxpy).arg(&payload).arg(&dtb);
+            if let Ok(initrd) = env::var("CHITTI_INITRD") {
+                c.arg(initrd);
+            }
+            if let Ok(bootargs) = env::var("CHITTI_BOOTARGS") {
+                c.args(["-b", &bootargs]);
+            }
+            println!("m1n1: booting over the proxy ({:?})…", c);
+            run(&mut c)
+        }
+        _ => {
+            println!(
+                "m1n1: to boot on hardware, set CHITTI_M1N1 (+ CHITTI_DTB, optional \
+                 CHITTI_INITRD/CHITTI_BOOTARGS, M1N1DEVICE), or run manually:\n  \
+                 M1N1DEVICE=/dev/tty.usbmodemXXX python3 <m1n1>/proxyclient/tools/linux.py \
+                 {} <machine.dtb> [initramfs] -b \"chitti.epoch=<unix-secs>\"",
+                payload.display()
+            );
+            Ok(())
+        }
+    }
 }
 
 /// `cargo xtask arm64`: build the standalone aarch64 kernel and boot it on
