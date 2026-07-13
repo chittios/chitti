@@ -103,6 +103,27 @@ mod tests {
     }
 
     #[test_case]
+    fn apple_silicon_high_ram_base() {
+        // Apple Silicon (via m1n1) places system RAM at 0x8_0000_0000 (32 GiB),
+        // not QEMU's 0x4000_0000. The ~32 GiB of address space below it is
+        // unbacked / low MMIO and MUST type as Device — mapping it Normal would
+        // let the core speculatively touch an unbacked address and fault. The
+        // RAM blocks themselves stay Normal so code/heap/stack run cacheable.
+        let m2: [(u64, u64); 1] = [(0x8_0000_0000, 16u64 << 30)]; // 16 GiB Mac Mini
+        // Below the base: Device, never Normal.
+        assert_eq!(classify_gib(0x0000_0000, &m2), BlockKind::Device);
+        assert_eq!(classify_gib(0x4000_0000, &m2), BlockKind::Device); // QEMU's base — unbacked here
+        assert_eq!(classify_gib(0x2_0000_0000, &m2), BlockKind::Device);
+        assert_eq!(classify_gib(0x7_C000_0000, &m2), BlockKind::Device); // last GiB before RAM
+        // The RAM span [32 GiB, 48 GiB): all Normal.
+        assert_eq!(classify_gib(0x8_0000_0000, &m2), BlockKind::Normal);
+        assert_eq!(classify_gib(0xB_8000_0000, &m2), BlockKind::Normal);
+        assert_eq!(classify_gib(0xB_C000_0000, &m2), BlockKind::Normal); // last RAM GiB
+        // Past the top: Device again.
+        assert_eq!(classify_gib(0xC_0000_0000, &m2), BlockKind::Device);
+    }
+
+    #[test_case]
     fn contiguous_qemu_layout_stays_all_normal() {
         // QEMU virt: one contiguous clump — every covered block is Normal, so
         // the mixed path never engages (legacy behaviour preserved).
