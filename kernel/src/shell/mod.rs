@@ -193,10 +193,18 @@ pub fn run() -> ! {
         if let Some(pre) = take_pending_input() {
             line = pre;
         }
+        // Echo the user's input line in the theme accent, so a typed message /
+        // command reads visually distinct from the agent's output (which uses
+        // the default fg). Reset once the line is submitted.
+        #[cfg(not(test))]
+        serial_print!("{}", theme_sgr("accent", (204, 120, 92)));
         let outcome = read_line(&mut line);
         #[cfg(not(test))]
-        if crate::framebuffer::composer_available() {
-            crate::framebuffer::composer_end();
+        {
+            serial_print!("\x1b[0m");
+            if crate::framebuffer::composer_available() {
+                crate::framebuffer::composer_end();
+            }
         }
         // Inbound channel work interrupted the prompt — do not treat `line` as
         // a submitted command; loop to drain, then re-open the prompt with the
