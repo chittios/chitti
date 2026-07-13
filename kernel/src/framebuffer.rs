@@ -244,6 +244,10 @@ struct Pane {
     /// When true, the pane reserves its bottom for a Grok-style input composer
     /// (bordered box + hint row); the scrollback grid sits above it.
     has_composer: bool,
+    /// Expandable folds: `(gi, hidden)` where `gi` is the absolute line index
+    /// (same coords as `sel`) of a clickable "▸ N more…" line and `hidden` is
+    /// the collapsed text revealed on click. Evicted with the scrollback.
+    folds: Vec<(usize, String)>,
 }
 
 /// Minimal ANSI escape-sequence parser state for a pane's byte stream: we
@@ -306,6 +310,7 @@ impl Pane {
             view: 0,
             sel: None,
             has_composer,
+            folds: Vec::new(),
         }
     }
 
@@ -1608,6 +1613,16 @@ impl Screen {
                 // a selection that loses its first line is dropped.
                 p.sel = p.sel.and_then(|((r1, c1), (r2, c2))| {
                     (r1.min(r2) > 0).then(|| ((r1 - 1, c1), (r2 - 1, c2)))
+                });
+                // Fold anchors shift the same way; a fold whose "▸ more" line is
+                // evicted is dropped.
+                p.folds.retain_mut(|(gi, _)| {
+                    if *gi == 0 {
+                        false
+                    } else {
+                        *gi -= 1;
+                        true
+                    }
                 });
             }
             p.grid.copy_within(cols.., 0);
@@ -4240,6 +4255,7 @@ fn dummy_pane() -> Pane {
         esc: EscState::Ground, csi: [0; 32], csi_len: 0, bold: false,
         title: String::new(), show_caret: false,
         grid: Vec::new(), hist: VecDeque::new(), view: 0, sel: None, has_composer: false,
+        folds: Vec::new(),
     }
 }
 
@@ -5228,6 +5244,54 @@ pub fn chat_sel_clear() {
             }
         }
     });
+}
+
+// --- expandable folds ---------------------------------------------------
+// A tool result is printed truncated with a clickable "▸ N more…" line; the
+// hidden remainder is registered against that line's absolute index. A single
+// click on it reveals the rest. Additive over the scrollback (no render-loop
+// or scroll changes), so selection/scroll are unaffected.
+
+/// The absolute line index (`gi`, same coords as `sel`) the chat cursor is on —
+/// i.e. where the next printed line will land. Anchors a fold to its "▸ more…".
+pub fn chat_current_gi() -> usize {
+    SCREEN.with(|slot| {
+        slot.as_ref().map(|sc| sc.chat.hist.len() + sc.chat.row as usize).unwrap_or(0)
+    })
+}
+
+/// Register a fold: the line at `gi` reveals `hidden` (pre-styled text, may
+/// contain ANSI + newlines) when clicked. Bounded so it can't grow unbounded.
+pub fn chat_note_fold(gi: usize, hidden: &str) {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.chat.folds.push((gi, hidden.to_string()));
+            let n = sc.chat.folds.len();
+            if n > 64 {
+                sc.chat.folds.drain(0..n - 64);
+            }
+        }
+    });
+}
+
+/// The absolute line a single-cell click hit (anchor == head, i.e. not a drag),
+/// for matching a fold. Call **before** [`chat_sel_end`] (which clears sel).
+pub fn chat_click_gi() -> Option<usize> {
+    SCREEN.with(|slot| {
+        let sc = slot.as_ref()?;
+        let (a, b) = sc.chat.sel?;
+        (a == b).then_some(a.0)
+    })
+}
+
+/// Take the hidden text of the fold anchored at line `gi` (removing it), if any.
+/// The shell prints the returned text to reveal the collapsed output.
+pub fn chat_take_fold(gi: usize) -> Option<String> {
+    SCREEN.with(|slot| {
+        let sc = slot.as_mut()?;
+        let pos = sc.chat.folds.iter().position(|(g, _)| *g == gi)?;
+        Some(sc.chat.folds.remove(pos).1)
+    })
 }
 
 /// Wipe the chat pane's text (grid + scrollback) and repaint it — `/clear`.

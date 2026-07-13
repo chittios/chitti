@@ -1904,15 +1904,34 @@ pub(crate) fn tool_self_prints(name: &str) -> bool {
 /// read/list can't flood the pane (a later fold makes the rest expandable).
 pub(crate) fn print_tool_output(obs: &str) {
     const MAX_LINES: usize = 10;
-    let mut shown = 0usize;
-    let total = obs.lines().count();
-    for line in obs.lines().take(MAX_LINES) {
-        let clipped: alloc::string::String = line.chars().take(120).collect();
-        serial_println!("  \x1b[2m{}\x1b[0m", clipped);
-        shown += 1;
+    let lines: alloc::vec::Vec<&str> = obs.lines().collect();
+    let total = lines.len();
+    let shown = total.min(MAX_LINES);
+    let dim = |l: &str| -> alloc::string::String {
+        let clipped: alloc::string::String = l.chars().take(120).collect();
+        alloc::format!("  \x1b[2m{}\x1b[0m", clipped)
+    };
+    for l in &lines[..shown] {
+        serial_println!("{}", dim(l));
     }
     if total > shown {
-        serial_println!("  \x1b[2m… {} more line(s)\x1b[0m", total - shown);
+        // Collapsed remainder → a clickable "▸ N more…" fold. Capture the line
+        // index it lands on, print it, then register the hidden (dim) lines.
+        let hidden: alloc::string::String =
+            lines[shown..].iter().map(|l| dim(l)).collect::<alloc::vec::Vec<_>>().join("\n");
+        let acc = theme_sgr("accent", (204, 120, 92));
+        #[cfg(not(test))]
+        {
+            let gi = crate::framebuffer::chat_current_gi();
+            serial_println!(
+                "  {}\u{25b8}\x1b[0m \x1b[2m{} more line(s) — click to expand\x1b[0m",
+                acc,
+                total - shown
+            );
+            crate::framebuffer::chat_note_fold(gi, &hidden);
+        }
+        #[cfg(test)]
+        let _ = (acc, hidden);
     }
 }
 
@@ -6372,8 +6391,18 @@ fn ui_tick() {
             if DIVIDER_DRAG.swap(false, Ordering::Relaxed) {
                 save_panes_config();
                 repaint_active_tab();
-            } else if let Some(text) = crate::framebuffer::chat_sel_end() {
-                crate::clipboard::set(text, false);
+            } else {
+                // Capture the clicked line before chat_sel_end clears it.
+                let click_gi = crate::framebuffer::chat_click_gi();
+                match crate::framebuffer::chat_sel_end() {
+                    Some(text) => crate::clipboard::set(text, false),
+                    None => {
+                        // A plain click: if it landed on a "▸ more…" fold, reveal it.
+                        if let Some(hidden) = click_gi.and_then(crate::framebuffer::chat_take_fold) {
+                            serial_println!("{}", hidden);
+                        }
+                    }
+                }
             }
         }
         if t.wheel != 0 {
