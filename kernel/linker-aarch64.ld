@@ -10,6 +10,9 @@ ENTRY(_start)
 SECTIONS
 {
     . = 0x40080000;
+    /* Base of the loaded image — the arm64 `Image` header (in `.text.boot`)
+       sits here, so `_image_start` is offset 0 of a flat (objcopy'd) image. */
+    _image_start = .;
 
     .text : {
         KEEP(*(.text.boot))
@@ -32,6 +35,12 @@ SECTIONS
     . = ALIGN(16);
     . += 0x200000;
     __stack_top = .;
+
+    /* Effective image size for the arm64 `Image` header: the whole span the
+       kernel occupies in memory (text..bss..boot stack) so a loader (m1n1)
+       reserves enough. An ABSOLUTE symbol, so `.quad __image_size` in the
+       boot header emits the size *value*, not an address. */
+    __image_size = __stack_top - _image_start;
 
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }

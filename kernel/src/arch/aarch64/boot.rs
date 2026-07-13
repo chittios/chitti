@@ -57,15 +57,64 @@ pub fn boot_x0() -> u64 {
 global_asm!(
     r#"
 .section .text.boot
+// ---------------------------------------------------------------------------
+// arm64 Linux `Image` header (Documentation/arch/arm64/booting.rst). Lets a
+// bootloader that speaks the Linux boot protocol — **m1n1** on real Apple
+// Silicon — recognise and load this kernel. It sits at offset 0 of the flat
+// (objcopy'd) image; `code0` branches past the 64-byte header to `_start`.
+// QEMU `-kernel <elf>` ignores it and jumps straight to the ELF entry
+// (`_start`), so both boot paths converge there.
+// ---------------------------------------------------------------------------
+.global _image_start
+_image_start:
+    b    _start                 // code0: branch past the header
+    .long 0                     // code1 (reserved)
+    .quad 0                     // text_offset (loader places per flags)
+    .quad __image_size          // image_size (linker ABSOLUTE symbol)
+    .quad 0xa                   // flags: LE | 4KiB page (1<<1) | anywhere (1<<3)
+    .quad 0                     // res2
+    .quad 0                     // res3
+    .quad 0                     // res4
+    .long 0x644d5241            // magic "ARM\x64"
+    .long 0                     // res5 (PE/COFF header offset; unused)
+
 .global _start
 _start:
     // Preserve the entry registers in callee-saved regs across the .bss zero
     // (which clobbers x0/x1 and would wipe the statics if stored before):
     //   x1 = boot-info page (UEFI stub) -> BOOT_X1
-    //   x0 = DTB pointer (`-kernel`)     -> BOOT_X0
+    //   x0 = DTB / FDT pointer          -> BOOT_X0
     mov  x20, x1
     mov  x21, x0
 
+    // If we entered at EL2 (m1n1 / iBoot / QEMU `virtualization=on`), drop to
+    // EL1 — the whole kernel is written to the EL1 system registers. QEMU
+    // `-kernel` under HVF already enters at EL1, so this is a no-op there.
+    // (Apple's guarded exception levels / GXF are ignored; we run plain EL1.)
+    mrs  x9, CurrentEL
+    lsr  x9, x9, #2
+    cmp  x9, #2
+    b.ne 1f
+    mov  x9, #0x33ff            // CPTR_EL2: RES1 bits set, TFP=0 (don't trap EL1 FP)
+    msr  cptr_el2, x9
+    msr  hstr_el2, xzr          // don't trap EL1 CP15 accesses
+    mov  x9, #(1 << 31)         // HCR_EL2.RW = 1: EL1 executes in AArch64
+    msr  hcr_el2, x9
+    mrs  x9, cnthctl_el2        // let EL1 read the physical timer/counter
+    orr  x9, x9, #3             // EL1PCTEN | EL1PCEN
+    msr  cnthctl_el2, x9
+    msr  cntvoff_el2, xzr       // zero the virtual-counter offset
+    mrs  x9, sctlr_el1          // sane EL1 SCTLR: MMU/caches off, keep RES1 bits
+    bic  x9, x9, #(1 << 0)      // M = 0
+    bic  x9, x9, #(1 << 2)      // C = 0
+    bic  x9, x9, #(1 << 12)     // I = 0
+    msr  sctlr_el1, x9
+    mov  x9, #0x3c5             // SPSR_EL2: DAIF masked, mode EL1h
+    msr  spsr_el2, x9
+    adr  x9, 1f
+    msr  elr_el2, x9
+    eret
+1:
     adrp x0, __stack_top
     add  x0, x0, :lo12:__stack_top
     mov  sp, x0
@@ -81,18 +130,18 @@ _start:
     add  x0, x0, :lo12:__bss_start
     adrp x1, __bss_end
     add  x1, x1, :lo12:__bss_end
-1:  cmp  x0, x1
-    b.hs 2f
+2:  cmp  x0, x1
+    b.hs 3f
     str  xzr, [x0], #8
-    b    1b
-2:  adrp x0, BOOT_X1
+    b    2b
+3:  adrp x0, BOOT_X1
     add  x0, x0, :lo12:BOOT_X1
     str  x20, [x0]
     adrp x0, BOOT_X0
     add  x0, x0, :lo12:BOOT_X0
     str  x21, [x0]
     bl   aarch64_start
-3:  wfi
-    b    3b
+4:  wfi
+    b    4b
 "#
 );
