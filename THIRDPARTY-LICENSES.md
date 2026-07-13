@@ -296,3 +296,19 @@ The kernel's `[patch.crates-io]` in `kernel/Cargo.toml` repoints these crates to
 the vendored copies for its build only; the host `just_runner` keeps the
 crates.io versions. All are **MIT OR Apache-2.0** (pest: MIT/Apache-2.0).
 Transitive: `ucd-trie` (no_std), `hashbrown`, `num-traits`+`libm`, `spin`.
+
+---
+
+## m1n1 — `third_party/m1n1/` (git submodule, build-time only)
+
+The [m1n1](https://github.com/AsahiLinux/m1n1) bootloader is the Asahi Linux
+first stage for Apple Silicon. It is referenced as a **git submodule** (not
+copied source) and is a **build-/boot-time dev dependency only** — it is *not*
+linked into or distributed as part of the ChittiOS kernel image. It is used to
+package ChittiOS as an arm64 `Image` and boot it over the m1n1 USB proxy on a
+real Mac (`cargo xtask m1n1`). Its own build products (`build/m1n1.bin`,
+`build/m1n1.macho`) and its nested `artwork` submodule stay within the submodule
+tree.
+
+Licensed under the **MIT License** (Copyright The Asahi Linux Contributors;
+`third_party/m1n1/LICENSE`).
