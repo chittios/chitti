@@ -1903,7 +1903,9 @@ pub(crate) fn tool_self_prints(name: &str) -> bool {
 /// Print a tool's result under its header: indented + dim, truncated so a large
 /// read/list can't flood the pane (a later fold makes the rest expandable).
 pub(crate) fn print_tool_output(obs: &str) {
-    const MAX_LINES: usize = 10;
+    // Fold fairly eagerly so long results stay tidy and the "▸ more" affordance
+    // is actually seen (most tool output is short).
+    const MAX_LINES: usize = 6;
     let lines: alloc::vec::Vec<&str> = obs.lines().collect();
     let total = lines.len();
     let shown = total.min(MAX_LINES);
