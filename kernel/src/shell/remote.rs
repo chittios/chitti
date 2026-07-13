@@ -286,8 +286,8 @@ impl RemoteChat {
                     // Final prose answer: strip any <think> block, print with a
                     // theme-coloured speaker label.
                     let visible = super::strip_think(&reply);
-                    let namec = super::theme_sgr("title_active", (204, 120, 92));
-                    crate::serial_println!("{}Chitti[{}]:\x1b[0m {}", namec, self.cfg.model, visible.trim());
+                    let lbl = super::answer_label(&format!("Chitti[{}]:", self.cfg.model));
+                    crate::serial_println!("{}{}", lbl, visible.trim());
                     session.push_message(Role::Assistant, reply.clone(), Provenance::SystemTrusted, now());
                     let _ = crate::session::save(session);
                     return reply;

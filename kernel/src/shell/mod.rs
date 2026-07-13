@@ -1866,19 +1866,29 @@ pub(crate) fn strip_think(s: &str) -> alloc::string::String {
     }
 }
 
-/// Print a styled tool-call header — `  ◆ Verb  arg` — with the diamond +
-/// argument in the theme accent and a bold verb in the theme foreground.
+/// Local time `"HH:MM"` for a turn timestamp (Grok-style).
+fn hhmm() -> alloc::string::String {
+    // format_datetime() → "Wed 2026-07-04 13:45:02"; take the HH:MM.
+    let dt = crate::clock::format_datetime();
+    dt.rsplit(' ').next().and_then(|t| t.get(0..5)).unwrap_or("").to_string()
+}
+
+/// A speaker label with a dim timestamp: `HH:MM  name` (name in theme accent).
+pub(crate) fn answer_label(name: &str) -> alloc::string::String {
+    let a = theme_sgr("title_active", (204, 120, 92));
+    alloc::format!("\x1b[2m{}\x1b[0m {a}{name}\x1b[0m ", hhmm())
+}
+
+/// Print a styled tool-call header — `│ ◆ Verb  arg` — an accent left gutter +
+/// diamond, a bold theme-fg verb, and the argument in the accent (Grok style).
 pub(crate) fn print_tool_header(cmd: &str, args: &str) {
     let (verb, arg) = tool_header(cmd, args);
-    let acc = theme_sgr("accent", (204, 120, 92));
-    let fg = theme_sgr("chat_fg", (247, 244, 237));
+    let a = theme_sgr("accent", (204, 120, 92));
+    let f = theme_sgr("chat_fg", (247, 244, 237));
     if arg.is_empty() {
-        serial_println!("  {a}\u{25c6}\x1b[0m \x1b[1m{f}{v}\x1b[0m", a = acc, f = fg, v = verb);
+        serial_println!("{a}\u{2502} \u{25c6}\x1b[0m \x1b[1m{f}{verb}\x1b[0m");
     } else {
-        serial_println!(
-            "  {a}\u{25c6}\x1b[0m \x1b[1m{f}{v}\x1b[0m  {a}{arg}\x1b[0m",
-            a = acc, f = fg, v = verb, arg = arg
-        );
+        serial_println!("{a}\u{2502} \u{25c6}\x1b[0m \x1b[1m{f}{verb}\x1b[0m  {a}{arg}\x1b[0m");
     }
 }
 
@@ -1906,34 +1916,34 @@ pub(crate) fn print_tool_output(obs: &str) {
     // Fold fairly eagerly so long results stay tidy and the "▸ more" affordance
     // is actually seen (most tool output is short).
     const MAX_LINES: usize = 6;
+    let a = theme_sgr("accent", (204, 120, 92));
     let lines: alloc::vec::Vec<&str> = obs.lines().collect();
     let total = lines.len();
     let shown = total.min(MAX_LINES);
-    let dim = |l: &str| -> alloc::string::String {
+    // Each output line sits under the accent left gutter, dim.
+    let row = |l: &str| -> alloc::string::String {
         let clipped: alloc::string::String = l.chars().take(120).collect();
-        alloc::format!("  \x1b[2m{}\x1b[0m", clipped)
+        alloc::format!("{a}\u{2502}\x1b[0m   \x1b[2m{clipped}\x1b[0m")
     };
     for l in &lines[..shown] {
-        serial_println!("{}", dim(l));
+        serial_println!("{}", row(l));
     }
     if total > shown {
         // Collapsed remainder → a clickable "▸ N more…" fold. Capture the line
-        // index it lands on, print it, then register the hidden (dim) lines.
+        // index it lands on, print it, then register the hidden lines.
         let hidden: alloc::string::String =
-            lines[shown..].iter().map(|l| dim(l)).collect::<alloc::vec::Vec<_>>().join("\n");
-        let acc = theme_sgr("accent", (204, 120, 92));
+            lines[shown..].iter().map(|l| row(l)).collect::<alloc::vec::Vec<_>>().join("\n");
         #[cfg(not(test))]
         {
             let gi = crate::framebuffer::chat_current_gi();
             serial_println!(
-                "  {}\u{25b8}\x1b[0m \x1b[2m{} more line(s) — click to expand\x1b[0m",
-                acc,
+                "{a}\u{2502} \u{25b8}\x1b[0m \x1b[2m{} more line(s) — click to expand\x1b[0m",
                 total - shown
             );
             crate::framebuffer::chat_note_fold(gi, &hidden);
         }
         #[cfg(test)]
-        let _ = (acc, hidden);
+        let _ = hidden;
     }
 }
 
@@ -3203,7 +3213,8 @@ impl ChatSession {
                 let _ = crate::session::save(session);
                 return alloc::string::String::from("stopped: tool-call budget exhausted");
             }
-            let text = self.generate_assistant("\x1b[1;36mchitti:\x1b[0m ");
+            let lbl = answer_label("chitti:");
+            let text = self.generate_assistant(&lbl);
             if self.cancelled {
                 // Partial decode is not in history; KV already rebuilt.
                 let _ = crate::session::save(session);
