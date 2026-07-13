@@ -99,6 +99,23 @@ fn demo_phase6() {
 /// model emits EOS or the user presses Ctrl+C); `/`-prefixed lines are commands
 /// (`/help`, `/infer`, `/agents`, ...). Never returns -- it is the system's steady
 /// state.
+/// The highest-numbered saved session id in the store, for boot auto-resume.
+/// Only the snapshot keys (`/sessions/<id>`) count — not the `.jsonl`
+/// transcript or the `/sessions/<id>/cmp…` compaction children.
+fn latest_saved_session_id() -> Option<u64> {
+    let mut best: Option<u64> = None;
+    for k in crate::synapse::fs::list() {
+        if let Some(rest) = k.strip_prefix("/sessions/") {
+            if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(id) = rest.parse::<u64>() {
+                    best = Some(best.map_or(id, |b| b.max(id)));
+                }
+            }
+        }
+    }
+    best
+}
+
 pub fn run() -> ! {
     serial_println!("");
     serial_println!("Chitti chat. Type a message; the model replies (Ctrl+C to stop generating).");
@@ -130,7 +147,22 @@ pub fn run() -> ! {
     // The agent-layer orchestrator (session persistence for the shell agent —
     // `/session`, `/info`), reused across the session so its Session persists.
     use crate::agent::{manifest as amanifest, orchestrator};
-    let mut orch = orchestrator::Orchestrator::spawn(amanifest::orchestrator_manifest(), 42);
+    // Resume the most recent saved session on boot (like restoring your last
+    // terminal); fall back to a fresh session when none exists. NOTE: the store
+    // only survives a real reboot on an installed system with an ext4 data
+    // partition — on the in-memory dev boot there's nothing to resume, so this
+    // is a fresh spawn there. `/clear` starts fresh; `/session resume <id>`
+    // switches.
+    let mut orch = match latest_saved_session_id()
+        .and_then(|id| crate::session::resume(crate::agent::types::SessionId(id)))
+    {
+        Some(s) => {
+            let (id, n) = (s.id.0, s.messages.len());
+            serial_println!("session> resumed session {} ({} messages) from /sessions/", id, n);
+            orchestrator::Orchestrator::from_session(amanifest::orchestrator_manifest(), s)
+        }
+        None => orchestrator::Orchestrator::spawn(amanifest::orchestrator_manifest(), 42),
+    };
     // Chat tools run through the Synapse Router under this task's caps.
     bind_chat_tools_to_orchestrator(&orch);
     // Chat session (model + tokenizer + KV cache), loaded lazily on first chat.
