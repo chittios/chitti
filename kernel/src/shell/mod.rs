@@ -1795,25 +1795,66 @@ fn compact_args(args: &str) -> alloc::string::String {
     inner.chars().take(56).collect()
 }
 
-/// Print a styled tool-call header — `  ◆ Verb  arg` (accent diamond, bold verb,
-/// green argument), matching the agent-turn look.
-fn print_tool_header(cmd: &str, args: &str) {
-    let (verb, arg) = tool_header(cmd, args);
-    if arg.is_empty() {
-        serial_println!("  \x1b[35m\u{25c6}\x1b[0m \x1b[1m{}\x1b[0m", verb);
-    } else {
-        serial_println!("  \x1b[35m\u{25c6}\x1b[0m \x1b[1m{}\x1b[0m  \x1b[32m{}\x1b[0m", verb, arg);
+/// A truecolor SGR (`ESC[38;2;R;G;Bm`) for a theme palette key, so chat styling
+/// follows the active theme instead of fixed ANSI colours. `def` is the fallback
+/// when the key/theme is unavailable (the pane renders `38;2` truecolor).
+pub(crate) fn theme_sgr(key: &str, def: (u8, u8, u8)) -> alloc::string::String {
+    #[cfg(test)]
+    {
+        let _ = key;
+        return alloc::format!("\x1b[38;2;{};{};{}m", def.0, def.1, def.2);
     }
+    #[cfg(not(test))]
+    {
+        let cfg = crate::ui_config::current();
+        let hex = cfg.theme.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).unwrap_or_default();
+        let (r, g, b) = crate::framebuffer::parse_hex(&hex, def);
+        alloc::format!("\x1b[38;2;{};{};{}m", r, g, b)
+    }
+}
+
+/// Drop a `<think>…</think>` reasoning block from a (remote) model reply for
+/// display — the reasoning is summarized as a "Thought for Xs" line instead.
+pub(crate) fn strip_think(s: &str) -> alloc::string::String {
+    use alloc::string::ToString;
+    if let Some(end) = s.find("</think>") {
+        s[end + "</think>".len()..].trim_start().to_string()
+    } else if let Some(start) = s.find("<think>") {
+        s[..start].trim().to_string() // unterminated: keep the prefix
+    } else {
+        s.to_string()
+    }
+}
+
+/// Print a styled tool-call header — `  ◆ Verb  arg` — with the diamond +
+/// argument in the theme accent and a bold verb in the theme foreground.
+pub(crate) fn print_tool_header(cmd: &str, args: &str) {
+    let (verb, arg) = tool_header(cmd, args);
+    let acc = theme_sgr("accent", (204, 120, 92));
+    let fg = theme_sgr("chat_fg", (247, 244, 237));
+    if arg.is_empty() {
+        serial_println!("  {a}\u{25c6}\x1b[0m \x1b[1m{f}{v}\x1b[0m", a = acc, f = fg, v = verb);
+    } else {
+        serial_println!(
+            "  {a}\u{25c6}\x1b[0m \x1b[1m{f}{v}\x1b[0m  {a}{arg}\x1b[0m",
+            a = acc, f = fg, v = verb, arg = arg
+        );
+    }
+}
+
+/// Print a "◆ Thought for X.Xs" line in the theme accent + dim.
+pub(crate) fn print_thought_for(secs: f32) {
+    let acc = theme_sgr("accent", (204, 120, 92));
+    serial_println!("  {}\u{25c6}\x1b[0m \x1b[2mThought for {:.1}s\x1b[0m", acc, secs);
 }
 
 /// Print a tool's result under its header: indented + dim, truncated so a large
 /// read/list can't flood the pane (a later fold makes the rest expandable).
-fn print_tool_output(obs: &str) {
+pub(crate) fn print_tool_output(obs: &str) {
     const MAX_LINES: usize = 10;
     let mut shown = 0usize;
     let total = obs.lines().count();
     for line in obs.lines().take(MAX_LINES) {
-        // Clip very long lines so one giant line can't wrap the whole pane.
         let clipped: alloc::string::String = line.chars().take(120).collect();
         serial_println!("  \x1b[2m{}\x1b[0m", clipped);
         shown += 1;
@@ -3386,9 +3427,10 @@ impl ChatSession {
         // its speaker label. A non-thinking turn prints the label immediately.
         let mut in_think = think_enabled() && self.tok.think_open != u32::MAX;
         let think_start = if in_think { crate::arch::now_ms() } else { 0 };
-        if !in_think {
-            serial_print!("{}", label);
-        }
+        // The speaker label prints lazily on the first *answer* piece; a turn
+        // that is purely a tool call prints nothing here (the ◆ header follows).
+        let mut label_shown = false;
+        let mut suppress_tools = false;
         let mut out = alloc::string::String::new();
         // Markdown-aware colouring of the streamed answer: headings + fenced
         // code blocks (lexed per language tag) — prose streams through raw.
@@ -3409,8 +3451,7 @@ impl ChatSession {
             if in_think && (next == think_close || n_think >= MAX_THINK) {
                 in_think = false;
                 let secs = crate::arch::now_ms().saturating_sub(think_start) as f32 / 1000.0;
-                serial_println!("\x1b[35m\u{25c6}\x1b[0m \x1b[2mThought for {:.1}s\x1b[0m", secs);
-                serial_print!("{}", label);
+                print_thought_for(secs);
                 // Feed </think> (the model's own, or forced at the cap).
                 self.model.forward(think_close, self.pos, &mut self.kv, &mut self.state, true);
                 self.pos += 1;
@@ -3450,8 +3491,17 @@ impl ChatSession {
             if in_think {
                 n_think += 1; // collapsed: reasoning is timed, not streamed
             } else {
-                md.feed(&piece, &mut |s| serial_print!("{}", s));
                 out.push_str(&piece); // the returned text stays raw (tool parsing)
+                if out.contains("<tool_call>") {
+                    suppress_tools = true; // don't stream the raw tool-call markup
+                }
+                if !suppress_tools {
+                    if !label_shown {
+                        serial_print!("{}", label);
+                        label_shown = true;
+                    }
+                    md.feed(&piece, &mut |s| serial_print!("{}", s));
+                }
             }
             self.gen.push(next);
             self.model.forward(next, self.pos, &mut self.kv, &mut self.state, true);
@@ -3466,10 +3516,15 @@ impl ChatSession {
         if in_think {
             // Ended (EOS/stop) while still thinking: still show the timing.
             let secs = crate::arch::now_ms().saturating_sub(think_start) as f32 / 1000.0;
-            serial_println!("\x1b[35m\u{25c6}\x1b[0m \x1b[2mThought for {:.1}s\x1b[0m", secs);
+            print_thought_for(secs);
         }
-        md.finish(&mut |s| serial_print!("{}", s)); // flush a held partial line
-        serial_println!("");
+        // Flush a held partial line + newline only if an answer actually
+        // streamed (a pure tool-call turn printed nothing — the ◆ header comes
+        // from the caller after parsing).
+        if label_shown {
+            md.finish(&mut |s| serial_print!("{}", s));
+            serial_println!("");
+        }
         if self.cancelled {
             // Partial assistant tokens must not stick in the KV — rebuild from
             // committed history (interactive chat) so the next turn is clean.

@@ -230,7 +230,9 @@ impl RemoteChat {
             // The remote round-trip blocks in `net::http`; show a thinking spinner
             // (driven by `upkeep`, which the HTTP poll loop calls) while we wait.
             crate::shell::begin_thinking("thinking");
+            let t0 = crate::arch::now_ms();
             let result = chat_completion(&self.cfg, &self.messages);
+            let secs = crate::arch::now_ms().saturating_sub(t0) as f32 / 1000.0;
             crate::shell::end_thinking();
             let reply = match result {
                 Ok(r) => r,
@@ -245,8 +247,8 @@ impl RemoteChat {
                     return String::new();
                 }
             };
-            crate::serial_println!("\x1b[1;36mchitti[{}]:\x1b[0m {}", self.cfg.model, reply.trim());
             self.messages.push(("assistant".to_string(), reply.clone()));
+            super::print_thought_for(secs);
             match super::parse_tool_call(&reply) {
                 Some(pair) if last_call.as_ref() == Some(&pair) => {
                     crate::serial_println!("\x1b[33m[tool loop stopped: repeated call]\x1b[0m");
@@ -255,7 +257,7 @@ impl RemoteChat {
                 }
                 Some((cmd, args)) => {
                     last_call = Some((cmd.clone(), args.clone()));
-                    crate::serial_println!("\x1b[33m\u{2192} running\x1b[0m /{} {}", cmd, args);
+                    super::print_tool_header(&cmd, &args);
                     session.push_assistant_tool_calls(
                         String::new(),
                         alloc::vec![ToolCall { call_id, tool: cmd.clone(), args: args.clone() }],
@@ -274,10 +276,16 @@ impl RemoteChat {
                         Provenance::UntrustedIngested
                     };
                     session.push_tool_result(call_id, obs.clone(), prov, now());
+                    super::print_tool_output(&obs);
                     call_id += 1;
                     self.messages.push(("user".to_string(), format!("<tool_response>\n{}\n</tool_response>", obs)));
                 }
                 None => {
+                    // Final prose answer: strip any <think> block, print with a
+                    // theme-coloured speaker label.
+                    let visible = super::strip_think(&reply);
+                    let namec = super::theme_sgr("title_active", (204, 120, 92));
+                    crate::serial_println!("{}Chitti[{}]:\x1b[0m {}", namec, self.cfg.model, visible.trim());
                     session.push_message(Role::Assistant, reply.clone(), Provenance::SystemTrusted, now());
                     let _ = crate::session::save(session);
                     return reply;
