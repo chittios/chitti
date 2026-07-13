@@ -16,7 +16,7 @@ fn key_for(id: SessionId) -> alloc::string::String {
 pub fn save(session: &Session) -> Result<(), postcard::Error> {
     let bytes = postcard::to_allocvec(session)?;
     crate::synapse::fs::write(&key_for(session.id), &bytes);
-    // Also write the human-readable Claude-Code-style JSONL transcript
+    // Also write the human-readable JSONL transcript
     // (presentation only; postcard above is the source of truth for resume).
     super::jsonl::write_transcript(session);
     crate::ktrace::log_fmt(format_args!(

@@ -1,4 +1,4 @@
-//! Session transcript in the Claude-Code JSONL shape: one append-only JSON
+//! Session transcript in the JSONL shape: one append-only JSON
 //! record per message, each carrying a `uuid` / `parentUuid` thread link, an
 //! ISO-8601 timestamp, the `sessionId` + `cwd`, and a `message` with a role and
 //! typed content blocks (`text` / `tool_use{id,name,input}` /
@@ -6,8 +6,7 @@
 //!
 //! This is a **presentation** artifact written at `/sessions/<id>.jsonl` alongside
 //! the authoritative postcard snapshot (which drives deterministic resume). A
-//! human — or an external tool — reads the JSONL to follow a session, exactly
-//! as Claude Code's `~/.claude/projects/*/*.jsonl` transcripts do. It is
+//! human — or an external tool — reads the JSONL to follow a session. It is
 //! rewritten in full on each save (kernel sessions are small; append needs no
 //! separate store API).
 
@@ -28,7 +27,7 @@ fn uuid(session_id: u64, msg_id: u64) -> String {
 }
 
 /// The record `type` / message `role` string. A tool result is threaded as a
-/// `user` record (its block is a `tool_result`), matching the Claude shape.
+/// `user` record (its block is a `tool_result`).
 fn role_str(r: Role) -> &'static str {
     match r {
         Role::System => "system",
@@ -98,7 +97,7 @@ fn record(session: &Session, m: &Message, parent: Option<u64>, ts: &str) -> Stri
     .to_compact()
 }
 
-/// Serialize the whole session to its Claude-Code-style JSONL transcript and
+/// Serialize the whole session to its JSONL transcript and
 /// write it to `/sessions/<id>.jsonl` in the store.
 pub fn write_transcript(session: &Session) {
     let ts = crate::clock::now_iso8601();
