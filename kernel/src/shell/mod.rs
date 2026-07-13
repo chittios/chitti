@@ -1885,20 +1885,19 @@ pub(crate) fn print_tool_header(cmd: &str, args: &str) {
     let (verb, arg) = tool_header(cmd, args);
     let a = theme_sgr("accent", (204, 120, 92));
     let f = theme_sgr("chat_fg", (247, 244, 237));
-    // `*` bullet (ASCII — the pane can't render ◆); bold verb, accent argument.
+    // `●` bullet; bold verb, accent argument. (The chat pane now decodes UTF-8,
+    // so these multi-byte glyphs render.)
     if arg.is_empty() {
-        serial_println!("{a}*\x1b[0m \x1b[1m{f}{verb}\x1b[0m");
+        serial_println!("{a}●\x1b[0m \x1b[1m{f}{verb}\x1b[0m");
     } else {
-        serial_println!("{a}*\x1b[0m \x1b[1m{f}{verb}\x1b[0m  {a}{arg}\x1b[0m");
+        serial_println!("{a}●\x1b[0m \x1b[1m{f}{verb}\x1b[0m  {a}{arg}\x1b[0m");
     }
 }
 
-/// Print a "◆ Thought for X.Xs" line in the theme accent + dim.
+/// Print a "● Thought for X.Xs" line in the theme accent + dim.
 pub(crate) fn print_thought_for(secs: f32) {
-    // ASCII markers only: the chat pane is one byte per cell (no UTF-8), so a
-    // multi-byte glyph like ◆/│/▸ renders blank. `*` is the bullet.
     let acc = theme_sgr("accent", (204, 120, 92));
-    serial_println!("{}*\x1b[0m \x1b[2mThought for {:.1}s\x1b[0m", acc, secs);
+    serial_println!("{}●\x1b[0m \x1b[2mThought for {:.1}s\x1b[0m", acc, secs);
 }
 
 /// True when a tool prints its own output to the console (a Shell-bound command
@@ -1923,10 +1922,10 @@ pub(crate) fn print_tool_output(obs: &str) {
     let lines: alloc::vec::Vec<&str> = obs.lines().collect();
     let total = lines.len();
     let shown = total.min(MAX_LINES);
-    // Each output line sits under an accent `|` left gutter (ASCII), dim.
+    // Each output line sits under an accent `│` left gutter, dim.
     let row = |l: &str| -> alloc::string::String {
         let clipped: alloc::string::String = l.chars().take(120).collect();
-        alloc::format!("{a}|\x1b[0m   \x1b[2m{clipped}\x1b[0m")
+        alloc::format!("{a}│\x1b[0m   \x1b[2m{clipped}\x1b[0m")
     };
     for l in &lines[..shown] {
         serial_println!("{}", row(l));
@@ -1940,7 +1939,7 @@ pub(crate) fn print_tool_output(obs: &str) {
         {
             let gi = crate::framebuffer::chat_current_gi();
             serial_println!(
-                "{a}| +\x1b[0m \x1b[2m{} more line(s) - click to expand\x1b[0m",
+                "{a}│ ▶\x1b[0m \x1b[2m{} more line(s) — click to expand\x1b[0m",
                 total - shown
             );
             crate::framebuffer::chat_note_fold(gi, &hidden);

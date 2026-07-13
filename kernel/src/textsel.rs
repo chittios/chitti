@@ -14,8 +14,9 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// One character cell as the compositor stores it: `(byte, fg colour)`.
-pub type Cell = (u8, (u8, u8, u8));
+/// One character cell as the compositor stores it: `(char, fg colour)`.
+/// `'\0'` is the empty/unset cell.
+pub type Cell = (char, (u8, u8, u8));
 
 /// Order two selection endpoints so the earlier one comes first.
 pub fn normalize(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usize, usize)) {
@@ -50,8 +51,8 @@ where
         let lo = if r == r1 { c1.min(cells.len()) } else { 0 };
         let hi = if r == r2 { (c2 + 1).min(cells.len()) } else { cells.len() };
         let mut line = String::new();
-        for &(byte, _) in &cells[lo..hi] {
-            line.push(if (0x20..=0x7e).contains(&byte) { byte as char } else { ' ' });
+        for &(ch, _) in &cells[lo..hi] {
+            line.push(if ch == '\0' { ' ' } else { ch });
         }
         let trimmed = line.trim_end();
         if r > r1 {
@@ -62,10 +63,10 @@ where
     out
 }
 
-/// Right-trim trailing empty cells (byte 0) from a stored line.
+/// Right-trim trailing empty cells (`'\0'`) from a stored line.
 fn trim_cells(line: &[Cell]) -> &[Cell] {
     let mut end = line.len();
-    while end > 0 && line[end - 1].0 == 0 {
+    while end > 0 && line[end - 1].0 == '\0' {
         end -= 1;
     }
     &line[..end]
@@ -204,7 +205,7 @@ pub fn reflow_cursor(
         }
     }
     // Walk the reflowed stream and find (line, col).
-    let empty: Cell = (0, (0, 0, 0));
+    let empty: Cell = ('\0', (0, 0, 0));
     let reflowed = reflow_lines(lines, old_cols, new_cols, empty);
     let mut remaining = cells_before;
     for (ri, row) in reflowed.iter().enumerate() {
@@ -226,8 +227,8 @@ mod tests {
     const FG: (u8, u8, u8) = (250, 249, 245);
 
     fn row(s: &str, cols: usize) -> Vec<Cell> {
-        let mut v: Vec<Cell> = s.bytes().map(|b| (b, FG)).collect();
-        v.resize(cols, (0, FG)); // unset tail cells, like a real grid line
+        let mut v: Vec<Cell> = s.chars().map(|c| (c, FG)).collect();
+        v.resize(cols, ('\0', FG)); // unset tail cells, like a real grid line
         v
     }
 
@@ -290,7 +291,7 @@ mod tests {
     }
 
     fn cells(s: &str) -> Vec<Cell> {
-        s.bytes().map(|b| (b, FG)).collect()
+        s.chars().map(|c| (c, FG)).collect()
     }
 
     #[test_case]
@@ -302,9 +303,9 @@ mod tests {
         assert_eq!(a.len(), 8);
         assert_eq!(b.len(), 8);
         let lines = [a, b];
-        let out = reflow_lines(&lines, 8, 16, (0, FG));
+        let out = reflow_lines(&lines, 8, 16, ('\0', FG));
         assert_eq!(out.len(), 1, "soft wraps join into one line: {out:?}");
-        let text: String = out[0].iter().map(|&(b, _)| if b == 0 { ' ' } else { b as char }).collect();
+        let text: String = out[0].iter().map(|&(c, _)| if c == '\0' { ' ' } else { c }).collect();
         assert!(text.starts_with("hello world!!!!!"), "got {text:?}");
     }
 
@@ -312,11 +313,11 @@ mod tests {
     fn reflow_shrinks_long_logical_line() {
         let line = cells("abcdefghij"); // 10 cells, hard short for cols=10? full width
         // Treat as one full-width line of 10, reflow to 4 → 3 rows.
-        let out = reflow_lines(&[line], 10, 4, (0, FG));
+        let out = reflow_lines(&[line], 10, 4, ('\0', FG));
         assert_eq!(out.len(), 3);
-        let t0: String = out[0].iter().take(4).map(|&(b, _)| b as char).collect();
-        let t1: String = out[1].iter().take(4).map(|&(b, _)| b as char).collect();
-        let t2: String = trim_cells(&out[2]).iter().map(|&(b, _)| b as char).collect();
+        let t0: String = out[0].iter().take(4).map(|&(c, _)| c).collect();
+        let t1: String = out[1].iter().take(4).map(|&(c, _)| c).collect();
+        let t2: String = trim_cells(&out[2]).iter().map(|&(c, _)| c).collect();
         assert_eq!(t0, "abcd");
         assert_eq!(t1, "efgh");
         assert_eq!(t2, "ij");
@@ -326,10 +327,10 @@ mod tests {
     fn reflow_preserves_hard_newlines() {
         // Two short lines → stay two lines even when expanding.
         let lines = [cells("hi"), cells("yo")];
-        let out = reflow_lines(&lines, 40, 80, (0, FG));
+        let out = reflow_lines(&lines, 40, 80, ('\0', FG));
         assert_eq!(out.len(), 2);
-        assert_eq!(trim_cells(&out[0]).iter().map(|&(b, _)| b as char).collect::<String>(), "hi");
-        assert_eq!(trim_cells(&out[1]).iter().map(|&(b, _)| b as char).collect::<String>(), "yo");
+        assert_eq!(trim_cells(&out[0]).iter().map(|&(c, _)| c).collect::<String>(), "hi");
+        assert_eq!(trim_cells(&out[1]).iter().map(|&(c, _)| c).collect::<String>(), "yo");
     }
 
     #[test_case]

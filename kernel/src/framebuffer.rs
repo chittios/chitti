@@ -36,7 +36,7 @@ type Rgb = (u8, u8, u8);
 /// colour at draw time. The grid (plus the scrollback ring behind it) is the
 /// source of truth for a pane's text, so content survives redraws, relayouts,
 /// and modal dismissals, and can be scrolled back through.
-type Cell = (u8, Rgb);
+type Cell = (char, Rgb);
 
 /// Scrollback depth per pane, in lines. At 200 cols a full ring is ~3 MB —
 /// noise next to the model heap. Cleared only by `/clear`.
@@ -248,6 +248,10 @@ struct Pane {
     /// (same coords as `sel`) of a clickable "▸ N more…" line and `hidden` is
     /// the collapsed text revealed on click. Evicted with the scrollback.
     folds: Vec<(usize, String)>,
+    /// Incremental UTF-8 decode buffer: the incoming byte stream is decoded one
+    /// `char` at a time (a multi-byte glyph spans several `pane_putc` calls).
+    utf8: [u8; 4],
+    utf8_len: u8,
 }
 
 /// Minimal ANSI escape-sequence parser state for a pane's byte stream: we
@@ -305,20 +309,49 @@ impl Pane {
             bold: false,
             title,
             show_caret,
-            grid: alloc::vec![(0u8, fg); (cols * rows) as usize],
+            grid: alloc::vec![('\0', fg); (cols * rows) as usize],
             hist: VecDeque::new(),
             view: 0,
             sel: None,
             has_composer,
             folds: Vec::new(),
+            utf8: [0; 4],
+            utf8_len: 0,
         }
     }
 
     /// Write `byte` into the grid cell under the cursor (0 erases).
-    fn set_cell(&mut self, byte: u8) {
+    fn set_cell(&mut self, ch: char) {
         let idx = (self.row * self.cols + self.col) as usize;
         if let Some(c) = self.grid.get_mut(idx) {
-            *c = (byte, self.fg);
+            *c = (ch, self.fg);
+        }
+    }
+
+    /// Feed one incoming byte through the incremental UTF-8 decoder: returns the
+    /// decoded `char` once a full sequence lands, `None` while a multi-byte
+    /// sequence is still arriving, and `U+FFFD` for an invalid byte. Uses
+    /// `core::str::from_utf8` (its `error_len() == None` = "incomplete, need
+    /// more"; `Some(_)` = "invalid").
+    fn feed_utf8(&mut self, b: u8) -> Option<char> {
+        if self.utf8_len == 0 && b < 0x80 {
+            return Some(b as char); // ASCII fast path
+        }
+        if self.utf8_len as usize >= self.utf8.len() {
+            self.utf8_len = 0; // safety: never overflow the 4-byte buffer
+        }
+        self.utf8[self.utf8_len as usize] = b;
+        self.utf8_len += 1;
+        match core::str::from_utf8(&self.utf8[..self.utf8_len as usize]) {
+            Ok(s) => {
+                self.utf8_len = 0;
+                s.chars().next()
+            }
+            Err(e) if e.error_len().is_none() => None, // incomplete — await more
+            Err(_) => {
+                self.utf8_len = 0;
+                Some('\u{FFFD}') // invalid byte(s)
+            }
         }
     }
 
@@ -385,7 +418,7 @@ impl Pane {
         let rows = self.rows as usize;
         // Same width: transplant without soft-reflow (row count may still change).
         if ocols == cols && !old.grid.is_empty() {
-            let empty: Cell = (0, self.default_fg);
+            let empty: Cell = ('\0', self.default_fg);
             let mut abs: alloc::vec::Vec<alloc::vec::Vec<Cell>> = old.hist.iter().cloned().collect();
             let used = ((old.row + 1).min(old.rows)) as usize;
             for r in 0..used {
@@ -439,11 +472,11 @@ impl Pane {
             }
         }
         let old_line = old.hist.len() + old.row.min(old.rows.saturating_sub(1)) as usize;
-        let empty: Cell = (0, self.default_fg);
+        let empty: Cell = ('\0', self.default_fg);
         // Same layout as textsel::Cell — Rgb is (u8,u8,u8).
         let as_ts: alloc::vec::Vec<alloc::vec::Vec<crate::textsel::Cell>> =
             abs.iter().map(|l| l.iter().map(|&(b, c)| (b, c)).collect()).collect();
-        let reflowed = crate::textsel::reflow_lines(&as_ts, ocols, cols, (0, self.default_fg));
+        let reflowed = crate::textsel::reflow_lines(&as_ts, ocols, cols, ('\0', self.default_fg));
         let (new_line, new_col) =
             crate::textsel::reflow_cursor(&as_ts, ocols, cols, old_line, old.col as usize);
         // Place the tail of the reflow into the live grid; the rest is hist.
@@ -504,7 +537,7 @@ impl Pane {
     /// Drop all text content (grid + scrollback) — the `/clear` reset.
     fn clear_content(&mut self) {
         for c in self.grid.iter_mut() {
-            *c = (0, self.default_fg);
+            *c = ('\0', self.default_fg);
         }
         self.hist.clear();
         self.view = 0;
@@ -1533,7 +1566,7 @@ impl Screen {
         }
     }
 
-    fn blit_glyph(&self, px: u64, py: u64, byte: u8, fg: Rgb, bg: Rgb) {
+    fn blit_glyph(&self, px: u64, py: u64, ch: char, fg: Rgb, bg: Rgb) {
         let s = self.scale;
         let cell_w = CW as u64 * s;
         let cell_h = CH as u64 * s;
@@ -1547,13 +1580,17 @@ impl Screen {
                 self.put_pixel(px + gx, py + gy, cbg);
             }
         }
+        // Empty / space: the filled background is the whole cell.
+        if ch == '\0' || ch == ' ' {
+            return;
+        }
         let mix = |b: u8, f: u8, a: u32| (((b as u32) * (255 - a) + (f as u32) * a) / 255) as u8;
         let ink = |s: &Self, x: u64, y: u64, a: u32| {
             let b = if tinted { s.bg_at(x, y, bg) } else { bg };
             (mix(b.0, fg.0, a), mix(b.1, fg.1, a), mix(b.2, fg.2, a))
         };
-        // TTF path: rasterize the glyph into the cell (cached per char/size).
-        let ch = if (FIRST..=LAST).contains(&byte) { byte as char } else { ' ' };
+        // TTF path: rasterize the char (fontdue UI face + Noto fallback chain —
+        // renders arbitrary Unicode; box-drawing/bullets included).
         let ttf_ok = crate::font_ttf::blit_ui_cell(ch, cell_w as usize, cell_h as usize, |gx, gy, a| {
             let (x, y) = (px + gx as u64, py + gy as u64);
             self.put_pixel(x, y, ink(self, x, y, a as u32));
@@ -1561,8 +1598,13 @@ impl Screen {
         if ttf_ok {
             return;
         }
-        // Bitmap fallback: the 10×22 atlas, each pixel expanded to s×s.
-        let idx = if (FIRST..=LAST).contains(&byte) { (byte - FIRST) as usize } else { 0 };
+        // Bitmap fallback: the 10×22 ASCII atlas. Non-ASCII with no TTF face
+        // stays blank (bg already filled).
+        let cp = ch as u32;
+        if !(FIRST as u32..=LAST as u32).contains(&cp) {
+            return;
+        }
+        let idx = (cp as u8 - FIRST) as usize;
         let g = &GLYPHS[idx];
         for gy in 0..CH {
             for gx in 0..CW {
@@ -1582,16 +1624,16 @@ impl Screen {
         }
     }
 
-    /// Render `s` at pixel `(px,py)`, advancing one scaled cell per byte. Returns
+    /// Render `s` at pixel `(px,py)`, advancing one scaled cell per char. Returns
     /// the x past the last glyph. Clips at `self.width`. Titles + status bar.
     fn draw_str(&self, px: u64, py: u64, s: &str, fg: Rgb, bg: Rgb) -> u64 {
         let mut x = px;
         let cw = self.cw();
-        for &b in s.as_bytes() {
+        for ch in s.chars() {
             if x + cw > self.width {
                 break;
             }
-            self.blit_glyph(x, py, b, fg, bg);
+            self.blit_glyph(x, py, ch, fg, bg);
             x += cw;
         }
         x
@@ -1629,7 +1671,7 @@ impl Screen {
             let start = p.grid.len() - cols;
             let fg = p.fg;
             for c in &mut p.grid[start..] {
-                *c = (0, fg);
+                *c = ('\0', fg);
             }
             if p.view > 0 {
                 // Keep the scrolled view anchored on the same content.
@@ -1691,7 +1733,7 @@ impl Screen {
                 Some(&p.grid[gr * cols..(gr + 1) * cols])
             };
             for c in 0..cols {
-                let (b, fg) = line.and_then(|l| l.get(c).copied()).unwrap_or((0, p.default_fg));
+                let (b, fg) = line.and_then(|l| l.get(c).copied()).unwrap_or(('\0', p.default_fg));
                 let x = p.ix + c as u64 * p.cw;
                 let y = p.iy + r as u64 * p.ch;
                 let selected = sel.is_some_and(|s| crate::textsel::contains(s, gi, c));
@@ -1699,7 +1741,7 @@ impl Screen {
                 // Always fill the cell first so deselected / empty cells leave
                 // no residue (selection highlight, partial glyphs).
                 self.fill_cell_bg(x, y, p.cw, p.ch, bg);
-                if (0x21..=0x7e).contains(&b) {
+                if b != '\0' && b != ' ' {
                     self.blit_glyph(x, y, b, fg, bg);
                 }
             }
@@ -1727,19 +1769,19 @@ impl Screen {
         }
         let r = gi - first;
         let (b, fg) = if gi < p.hist.len() {
-            p.hist[gi].get(c).copied().unwrap_or((0, p.default_fg))
+            p.hist[gi].get(c).copied().unwrap_or(('\0', p.default_fg))
         } else {
             let gr = gi - p.hist.len();
             if gr >= p.rows as usize {
                 return;
             }
-            p.grid.get(gr * cols + c).copied().unwrap_or((0, p.default_fg))
+            p.grid.get(gr * cols + c).copied().unwrap_or(('\0', p.default_fg))
         };
         let x = p.ix + c as u64 * p.cw;
         let y = p.iy + r as u64 * p.ch;
         let bg = if selected { self.theme.editor_sel } else { p.bg };
         self.fill_cell_bg(x, y, p.cw, p.ch, bg);
-        if (0x21..=0x7e).contains(&b) {
+        if b != '\0' && b != ' ' {
             self.blit_glyph(x, y, b, fg, bg);
         }
     }
@@ -1787,11 +1829,11 @@ impl Screen {
     fn repaint_cursor_cell(&self, p: &Pane) {
         let cols = p.cols as usize;
         let idx = (p.row as usize).saturating_mul(cols).saturating_add(p.col as usize);
-        let (b, fg) = p.grid.get(idx).copied().unwrap_or((0, p.default_fg));
+        let (b, fg) = p.grid.get(idx).copied().unwrap_or(('\0', p.default_fg));
         let x = p.cell_x();
         let y = p.cell_y();
         self.fill_cell_bg(x, y, p.cw, p.ch, p.bg);
-        if (0x21..=0x7e).contains(&b) {
+        if b != '\0' && b != ' ' {
             self.blit_glyph(x, y, b, fg, p.bg);
         }
     }
@@ -1855,7 +1897,7 @@ impl Screen {
                             let (row, col) = (p.row as usize, p.col as usize);
                             for c in col..cols {
                                 if let Some(cell) = p.grid.get_mut(row * cols + c) {
-                                    *cell = (0, p.fg);
+                                    *cell = ('\0', p.fg);
                                 }
                             }
                             if live {
@@ -1900,9 +1942,9 @@ impl Screen {
             b'\t' => {
                 let next = (p.col / 4 + 1) * 4;
                 while p.col < next && p.col < p.cols {
-                    p.set_cell(b' ');
+                    p.set_cell(' ');
                     if live {
-                        s.blit_glyph(p.cell_x(), p.cell_y(), b' ', p.fg, p.bg);
+                        s.blit_glyph(p.cell_x(), p.cell_y(), ' ', p.fg, p.bg);
                     }
                     p.col += 1;
                 }
@@ -1917,22 +1959,27 @@ impl Screen {
                     p.row -= 1;
                     p.col = p.cols - 1;
                 }
-                p.set_cell(0);
+                p.set_cell('\0');
                 if live {
-                    s.blit_glyph(p.cell_x(), p.cell_y(), b' ', p.fg, p.bg);
+                    s.blit_glyph(p.cell_x(), p.cell_y(), ' ', p.fg, p.bg);
                 }
             }
-            0x20..=0x7e => {
-                p.set_cell(byte);
-                if live {
-                    s.blit_glyph(p.cell_x(), p.cell_y(), byte, p.fg, p.bg);
-                }
-                p.col += 1;
-                if p.col >= p.cols {
-                    Screen::newline(p, s);
+            // Other C0 control bytes: ignored (never part of a UTF-8 sequence).
+            b if b < 0x20 => {}
+            // Printable: ASCII (0x20–0x7e) or a UTF-8 lead/continuation byte
+            // (≥0x80). Decode incrementally — a multi-byte glyph spans calls.
+            _ => {
+                if let Some(ch) = p.feed_utf8(byte) {
+                    p.set_cell(ch);
+                    if live {
+                        s.blit_glyph(p.cell_x(), p.cell_y(), ch, p.fg, p.bg);
+                    }
+                    p.col += 1;
+                    if p.col >= p.cols {
+                        Screen::newline(p, s);
+                    }
                 }
             }
-            _ => {}
         }
         // Grid caret only when the pane has no composer (`caret_draw` is a
         // no-op for `has_composer` panes so scrollback never keeps a bar).
@@ -2252,13 +2299,13 @@ impl Screen {
                 Some(&p.grid[gr * cols..(gr + 1) * cols])
             };
             for c in 0..cols {
-                let (b, fg) = line.and_then(|l| l.get(c).copied()).unwrap_or((0, p.default_fg));
+                let (b, fg) = line.and_then(|l| l.get(c).copied()).unwrap_or(('\0', p.default_fg));
                 let x = p.ix + c as u64 * p.cw;
                 let y = p.iy + r as u64 * p.ch;
                 let selected = sel.is_some_and(|s| crate::textsel::contains(s, gi, c));
                 let bg = if selected { self.theme.editor_sel } else { p.bg };
                 self.fill_cell_bg(x, y, p.cw, p.ch, bg);
-                if (0x21..=0x7e).contains(&b) {
+                if b != '\0' && b != ' ' {
                     self.blit_glyph(x, y, b, fg, bg);
                 }
             }
@@ -4255,7 +4302,7 @@ fn dummy_pane() -> Pane {
         esc: EscState::Ground, csi: [0; 32], csi_len: 0, bold: false,
         title: String::new(), show_caret: false,
         grid: Vec::new(), hist: VecDeque::new(), view: 0, sel: None, has_composer: false,
-        folds: Vec::new(),
+        folds: Vec::new(), utf8: [0; 4], utf8_len: 0,
     }
 }
 
@@ -4737,14 +4784,16 @@ pub fn editor_render(
             // Gutter: right-aligned 1-based line number.
             let num = alloc::format!("{:>width$} ", li + 1, width = (gutter - 1) as usize);
             let mut x = ix;
-            for b in num.bytes() {
-                sc.blit_glyph(x, y, b, sc.theme.editor_lineno, sc.theme.editor_bg);
+            for chr in num.chars() {
+                sc.blit_glyph(x, y, chr, sc.theme.editor_lineno, sc.theme.editor_bg);
                 x += cw;
             }
             // Text, clipped to the pane width; selected cells get a highlight
-            // bg; syntax-highlighted bytes their class colour.
+            // bg; syntax-highlighted chars their class colour. (Column index is
+            // per-char; for ASCII — the common editor case — it equals the byte
+            // index the highlighter used.)
             let mut c = gutter;
-            for (col, &b) in lines[li].as_bytes().iter().enumerate() {
+            for (col, chr) in lines[li].chars().enumerate() {
                 if c >= cols {
                     break;
                 }
@@ -4753,7 +4802,7 @@ pub fn editor_render(
                     .and_then(|h| h.get(i as usize))
                     .and_then(|v| v.get(col).copied().flatten())
                     .unwrap_or(sc.theme.editor_fg);
-                sc.blit_glyph(x, y, b, fg, bg);
+                sc.blit_glyph(x, y, chr, fg, bg);
                 x += cw;
                 c += 1;
             }
@@ -4765,9 +4814,9 @@ pub fn editor_render(
             if col_on_screen < cols {
                 let y = iy + scr * ch;
                 let x = ix + col_on_screen * cw;
-                let byte = lines.get(cur_row).and_then(|l| l.as_bytes().get(cur_col)).copied().unwrap_or(b' ');
-                let byte = if (0x20..=0x7e).contains(&byte) { byte } else { b' ' };
-                sc.blit_glyph(x, y, byte, sc.theme.editor_bg, sc.theme.accent); // fg/bg swapped = block cursor
+                let chr = lines.get(cur_row).and_then(|l| l.chars().nth(cur_col)).unwrap_or(' ');
+                let chr = if chr.is_control() { ' ' } else { chr };
+                sc.blit_glyph(x, y, chr, sc.theme.editor_bg, sc.theme.accent); // fg/bg swapped = block cursor
             }
         }
         // Mode line across the bottom interior row — ellipsize so a long path
@@ -4776,8 +4825,8 @@ pub fn editor_render(
         sc.paint_surface(px + BORDER, sy, pw - 2 * BORDER, ch, sc.theme.status_bg);
         let ml = crate::textsel::ellipsize(modeline, cols as usize);
         let mut x = ix;
-        for b in ml.bytes() {
-            sc.blit_glyph(x, sy, b, sc.theme.title_active, sc.theme.status_bg);
+        for chr in ml.chars() {
+            sc.blit_glyph(x, sy, chr, sc.theme.title_active, sc.theme.status_bg);
             x += cw;
         }
         sc.cursor_overlay();

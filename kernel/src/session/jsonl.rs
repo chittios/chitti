@@ -21,9 +21,26 @@ fn key_for(id: u64) -> String {
     format!("/sessions/{}.jsonl", id)
 }
 
-/// A stable per-message thread key, `<session>-<msgid>`.
+/// A stable per-message thread key in the RFC-4122 UUID shape
+/// (`xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`, version 4 / variant 1), the way
+/// Claude Code names records. The 16 bytes are a **deterministic** SHA-256 of
+/// `(session_id, msg_id)` rather than random, so the transcript is reproducible
+/// and a child's `parentUuid` always re-derives to its parent's `uuid` — no RNG
+/// or stored id→uuid map needed.
 fn uuid(session_id: u64, msg_id: u64) -> String {
-    format!("{}-{}", session_id, msg_id)
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(session_id.to_le_bytes());
+    h.update(msg_id.to_le_bytes());
+    let d = h.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&d[..16]);
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant 1 (RFC 4122)
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    )
 }
 
 /// The record `type` / message `role` string. A tool result is threaded as a
@@ -155,11 +172,17 @@ mod tests {
             None,
         );
         let la = record(&s, &a, Some(1), "2026-07-13T00:00:01Z");
+        // uuid/parentUuid are deterministic UUIDs derived from (session id, msg id);
+        // re-derive the parent's to prove the child threads to it.
+        let sid = s.id.0;
         assert!(la.contains("\"type\":\"tool_use\""), "{la}");
         assert!(la.contains("\"id\":\"toolu_7\""), "{la}");
         assert!(la.contains("\"name\":\"read\""), "{la}");
         assert!(la.contains("\"input\":{\"path\":\"/x\"}"), "input embeds parsed args: {la}");
-        assert!(la.contains("\"parentUuid\":\"42-1\""), "threads to the parent: {la}");
+        assert!(la.contains(&alloc::format!("\"parentUuid\":\"{}\"", uuid(sid, 1))), "threads to the parent: {la}");
+        assert!(la.contains(&alloc::format!("\"uuid\":\"{}\"", uuid(sid, 2))), "own uuid is derived: {la}");
+        // Shape check: version-4 / variant-1 UUID, not the old `<sid>-<mid>`.
+        assert!(!la.contains(&alloc::format!("\"uuid\":\"{sid}-2\"")), "no int-id uuids: {la}");
         assert!(!la.contains("\"type\":\"text\""), "empty prose omits the text block: {la}");
 
         // The tool result → a user record with a tool_result block.
