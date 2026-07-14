@@ -332,6 +332,221 @@ pub unsafe fn reg_of_compatible(dtb_pa: u64, want: &[u8]) -> Option<(u64, u64)> 
     }
 }
 
+/// Like [`reg_of_compatible`] but returns the **`n`-th** `(base, size)` `reg`
+/// pair of the matched node. Apple nodes commonly list several (a PHY's
+/// `core`/`usb2phy`/`pipehandler` blocks, a DART's register windows), selected
+/// by `reg-names`; `n == 0` is exactly [`reg_of_compatible`].
+///
+/// # Safety
+/// `dtb_pa`, if a valid FDT, must point at a readable blob.
+pub unsafe fn reg_nth_of_compatible(dtb_pa: u64, want: &[u8], n: usize) -> Option<(u64, u64)> {
+    // SAFETY: delegated to `header`.
+    let (base, h) = unsafe { header(dtb_pa)? };
+    let mut acells = [2u32; MAX_DEPTH];
+    let mut scells = [2u32; MAX_DEPTH];
+    let mut matched = [false; MAX_DEPTH];
+    let mut reg_off = [0usize; MAX_DEPTH];
+    let mut depth: usize = 0;
+    let mut off = h.off_struct;
+    loop {
+        // SAFETY: bounded by `be32`.
+        let tok = unsafe { be32(base, off, h.total)? };
+        off += 4;
+        match tok {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                if depth >= MAX_DEPTH {
+                    return None;
+                }
+                acells[depth] = 2;
+                scells[depth] = 2;
+                matched[depth] = false;
+                reg_off[depth] = 0;
+                // SAFETY: bounded.
+                let len = unsafe { cstr_len(base, off, h.total)? };
+                off += (len + 1 + 3) & !3;
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    return None;
+                }
+                if matched[depth] && reg_off[depth] != 0 {
+                    let pa = acells[depth - 1];
+                    let ps = scells[depth - 1];
+                    let stride = (pa as usize + ps as usize) * 4;
+                    let o = reg_off[depth] + n * stride;
+                    // SAFETY: bounded.
+                    let b = unsafe { read_cells(base, o, pa, h.total)? };
+                    let s = unsafe { read_cells(base, o + pa as usize * 4, ps, h.total)? };
+                    return Some((b, s));
+                }
+                depth -= 1;
+            }
+            FDT_PROP => {
+                // SAFETY: bounded.
+                let len = unsafe { be32(base, off, h.total)? } as usize;
+                let name_off = unsafe { be32(base, off + 4, h.total)? } as usize;
+                let data_off = off + 8;
+                if depth < MAX_DEPTH {
+                    if unsafe { prop_name_is(base, h.off_strings, name_off, b"#address-cells", h.total) } {
+                        acells[depth] = unsafe { be32(base, data_off, h.total) }.unwrap_or(2);
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"#size-cells", h.total) } {
+                        scells[depth] = unsafe { be32(base, data_off, h.total) }.unwrap_or(2);
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"compatible", h.total) } {
+                        if unsafe { compat_has(base, data_off, len, want, h.total) } {
+                            matched[depth] = true;
+                        }
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"reg", h.total) } {
+                        reg_off[depth] = data_off;
+                    }
+                }
+                off += 8 + ((len + 3) & !3);
+            }
+            FDT_NOP => {}
+            FDT_END => return None,
+            _ => return None,
+        }
+    }
+}
+
+/// Read up to `out.len()` big-endian u32 cells of the named property of the
+/// first node whose `compatible` contains `want`, returning the count copied.
+/// FDT stores `iommus`/`phys`/`power-domains`/`interrupts` as cell lists; used
+/// to resolve a device's DART reference (`iommus = <&dart SID …>`).
+///
+/// # Safety
+/// `dtb_pa`, if a valid FDT, must point at a readable blob.
+pub unsafe fn prop_cells_of_compatible(dtb_pa: u64, want: &[u8], prop: &[u8], out: &mut [u32]) -> usize {
+    // SAFETY: delegated to `header`.
+    let Some((base, h)) = (unsafe { header(dtb_pa) }) else { return 0 };
+    let mut matched = [false; MAX_DEPTH];
+    let mut prop_off = [0usize; MAX_DEPTH]; // 0 = not seen
+    let mut prop_len = [0usize; MAX_DEPTH];
+    let mut depth: usize = 0;
+    let mut off = h.off_struct;
+    loop {
+        let Some(tok) = (unsafe { be32(base, off, h.total) }) else { return 0 };
+        off += 4;
+        match tok {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                if depth >= MAX_DEPTH {
+                    return 0;
+                }
+                matched[depth] = false;
+                prop_off[depth] = 0;
+                let Some(len) = (unsafe { cstr_len(base, off, h.total) }) else { return 0 };
+                off += (len + 1 + 3) & !3;
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    return 0;
+                }
+                if matched[depth] && prop_off[depth] != 0 {
+                    let ncells = (prop_len[depth] / 4).min(out.len());
+                    for (i, slot) in out.iter_mut().enumerate().take(ncells) {
+                        *slot = unsafe { be32(base, prop_off[depth] + i * 4, h.total) }.unwrap_or(0);
+                    }
+                    return ncells;
+                }
+                depth -= 1;
+            }
+            FDT_PROP => {
+                let Some(len) = (unsafe { be32(base, off, h.total) }) else { return 0 };
+                let len = len as usize;
+                let Some(name_off) = (unsafe { be32(base, off + 4, h.total) }) else { return 0 };
+                let data_off = off + 8;
+                if depth < MAX_DEPTH {
+                    if unsafe { prop_name_is(base, h.off_strings, name_off as usize, b"compatible", h.total) } {
+                        if unsafe { compat_has(base, data_off, len, want, h.total) } {
+                            matched[depth] = true;
+                        }
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off as usize, prop, h.total) } {
+                        prop_off[depth] = data_off;
+                        prop_len[depth] = len;
+                    }
+                }
+                off += 8 + ((len + 3) & !3);
+            }
+            FDT_NOP => {}
+            FDT_END => return 0,
+            _ => return 0,
+        }
+    }
+}
+
+/// The `reg[0]` `(base, size)` of the node whose `phandle` (a.k.a.
+/// `linux,phandle`) property equals `phandle`. Resolves an `iommus`/`phys`
+/// reference to the target device's registers (e.g. a DART pointed at by a USB
+/// controller). Returns `None` if no such node / no `reg`.
+///
+/// # Safety
+/// `dtb_pa`, if a valid FDT, must point at a readable blob.
+pub unsafe fn reg_by_phandle(dtb_pa: u64, phandle: u32) -> Option<(u64, u64)> {
+    // SAFETY: delegated to `header`.
+    let (base, h) = unsafe { header(dtb_pa)? };
+    let mut acells = [2u32; MAX_DEPTH];
+    let mut scells = [2u32; MAX_DEPTH];
+    let mut phv = [0u32; MAX_DEPTH]; // this node's phandle value (0 = none)
+    let mut reg_off = [0usize; MAX_DEPTH];
+    let mut depth: usize = 0;
+    let mut off = h.off_struct;
+    loop {
+        // SAFETY: bounded.
+        let tok = unsafe { be32(base, off, h.total)? };
+        off += 4;
+        match tok {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                if depth >= MAX_DEPTH {
+                    return None;
+                }
+                acells[depth] = 2;
+                scells[depth] = 2;
+                phv[depth] = 0;
+                reg_off[depth] = 0;
+                let len = unsafe { cstr_len(base, off, h.total)? };
+                off += (len + 1 + 3) & !3;
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    return None;
+                }
+                if phv[depth] == phandle && phandle != 0 && reg_off[depth] != 0 {
+                    let pa = acells[depth - 1];
+                    let ps = scells[depth - 1];
+                    let b = unsafe { read_cells(base, reg_off[depth], pa, h.total)? };
+                    let s = unsafe { read_cells(base, reg_off[depth] + pa as usize * 4, ps, h.total)? };
+                    return Some((b, s));
+                }
+                depth -= 1;
+            }
+            FDT_PROP => {
+                let len = unsafe { be32(base, off, h.total)? } as usize;
+                let name_off = unsafe { be32(base, off + 4, h.total)? } as usize;
+                let data_off = off + 8;
+                if depth < MAX_DEPTH {
+                    if unsafe { prop_name_is(base, h.off_strings, name_off, b"#address-cells", h.total) } {
+                        acells[depth] = unsafe { be32(base, data_off, h.total) }.unwrap_or(2);
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"#size-cells", h.total) } {
+                        scells[depth] = unsafe { be32(base, data_off, h.total) }.unwrap_or(2);
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"phandle", h.total) }
+                        || unsafe { prop_name_is(base, h.off_strings, name_off, b"linux,phandle", h.total) }
+                    {
+                        phv[depth] = unsafe { be32(base, data_off, h.total) }.unwrap_or(0);
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"reg", h.total) } {
+                        reg_off[depth] = data_off;
+                    }
+                }
+                off += 8 + ((len + 3) & !3);
+            }
+            FDT_NOP => {}
+            FDT_END => return None,
+            _ => return None,
+        }
+    }
+}
+
 /// True if any node in the FDT advertises `want` in its `compatible` list.
 /// Unlike [`reg_of_compatible`], the node need not have a `reg` (e.g. the
 /// `/psci` node has none), so this answers "does this platform advertise
@@ -741,6 +956,52 @@ mod tests {
         assert_eq!(got, Some((0x2_3520_0000, 0x1000)));
         // A compatible that isn't present returns None.
         assert_eq!(unsafe { reg_of_compatible(blob.as_ptr() as u64, b"apple,t8110-dart") }, None);
+    }
+
+    #[test_case]
+    fn reg_nth_iommus_and_phandle_resolution() {
+        // Mirrors the real Apple FDT: a dwc3 with two reg pairs
+        // (dwc3-core, dwc3-apple) + `iommus = <&dart0 0 &dartUSB 1>`, and the
+        // USB DART node it points to (phandle 0xad).
+        let mut f = FdtBuild::new();
+        f.begin("");
+        f.prop_u32("#address-cells", 2);
+        f.prop_u32("#size-cells", 2);
+        f.begin("iommu@382f80000");
+        f.prop_str("compatible", "apple,t8110-dart");
+        f.prop_pair64("reg", 0x3_82f8_0000, 0x4000);
+        f.prop_u32("phandle", 0xad);
+        f.end();
+        f.begin("usb@382280000");
+        f.prop_str("compatible", "apple,t8112-dwc3");
+        {
+            let mut v = Vec::new();
+            for x in [0x3_8228_0000u64, 0xcd00, 0x3_8228_cd00, 0x3200] {
+                v.extend_from_slice(&x.to_be_bytes());
+            }
+            f.prop("reg", &v);
+        }
+        {
+            let mut v = Vec::new();
+            for x in [0xacu32, 0, 0xad, 1] {
+                v.extend_from_slice(&x.to_be_bytes());
+            }
+            f.prop("iommus", &v);
+        }
+        f.end();
+        f.end();
+        let blob = f.build();
+        let p = blob.as_ptr() as u64;
+        // Both reg pairs of the dwc3.
+        assert_eq!(unsafe { reg_nth_of_compatible(p, b"apple,t8112-dwc3", 0) }, Some((0x3_8228_0000, 0xcd00)));
+        assert_eq!(unsafe { reg_nth_of_compatible(p, b"apple,t8112-dwc3", 1) }, Some((0x3_8228_cd00, 0x3200)));
+        // iommus cells → [dart0, sid0, dartUSB, sid1].
+        let mut c = [0u32; 4];
+        let n = unsafe { prop_cells_of_compatible(p, b"apple,t8112-dwc3", b"iommus", &mut c) };
+        assert_eq!(n, 4);
+        assert_eq!(c, [0xac, 0, 0xad, 1]);
+        // Resolve the USB DART phandle (0xad) → its register block.
+        assert_eq!(unsafe { reg_by_phandle(p, 0xad) }, Some((0x3_82f8_0000, 0x4000)));
     }
 
     #[test_case]

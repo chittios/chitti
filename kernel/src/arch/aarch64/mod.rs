@@ -6,7 +6,9 @@
 //! (`interrupts`, `hlt`) plus the aarch64-specific bring-up (boot stub, MMU,
 //! PL011 UART, generic timer) the shared upper layers build on.
 
+pub mod apple_usb;
 pub mod boot;
+pub mod dart;
 pub mod dtb;
 pub mod mmu;
 pub mod ahci;

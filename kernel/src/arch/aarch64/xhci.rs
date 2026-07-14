@@ -34,6 +34,27 @@ pub fn init_global() -> bool {
     false
 }
 
+/// Bring up an xHCI controller at an already-known register base (the Apple
+/// dwc3 xHCI window at DWC3_base+0x0, after `apple_usb` has powered the PHY,
+/// reset the core into HOST mode, and put the DART in bypass) and enumerate HID.
+/// Reuses the same `XHCI` static + `aa_alloc` (identity DMA, valid under DART
+/// bypass) so `poll_key`/`poll_mouse` work unchanged. Returns whether a keyboard
+/// or mouse came up.
+pub fn attach_at(base: usize) -> bool {
+    if let Some(mut x) = Xhci::bringup(base, aa_alloc) {
+        let ok = x.enumerate_keyboard();
+        crate::ktrace::log_fmt(format_args!(
+            "xhci(apple): enum kbd={} mouse={}",
+            if x.has_keyboard() { "yes" } else { "no" },
+            if x.has_mouse() { "yes" } else { "no" }
+        ));
+        XHCI.with(|s| *s = Some(x));
+        return ok;
+    }
+    crate::ktrace::log("xhci(apple)", "controller bringup failed at dwc3 xHCI window");
+    false
+}
+
 /// Whether a USB HID keyboard was enumerated (for the INPUT boot line).
 pub fn has_keyboard() -> bool {
     XHCI.with(|s| s.as_ref().map(|x| x.has_keyboard()).unwrap_or(false))

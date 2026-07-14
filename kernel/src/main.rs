@@ -283,9 +283,15 @@ pub extern "C" fn aarch64_start() -> ! {
     }
     if let Some((w, h)) = fb {
         serial_println!("Chitti: framebuffer TUI up ({}x{}) -- console mirrored to the window", w, h);
-        // Bring up USB HID keyboard + tablet (xHCI) — the VirtualBox / real-
-        // hardware input path; needs the PCIe bus from aarch64_pcie_init.
-        let _usb = chitti_kernel::arch::aarch64::xhci::init_global();
+        // Bring up USB HID keyboard + mouse (xHCI). On Apple Silicon the
+        // controller is the on-SoC dwc3 (DART + ATC-PHY, via `apple_usb`); on
+        // VirtualBox / real SBSA hardware it's an xHCI over PCIe. Both feed the
+        // shared xHCI core, so `has_keyboard`/`poll_key` work the same after.
+        if chitti_kernel::arch::aarch64::is_apple() {
+            chitti_kernel::arch::aarch64::apple_usb::init();
+        } else {
+            chitti_kernel::arch::aarch64::xhci::init_global();
+        }
         let usb_kbd = chitti_kernel::arch::aarch64::xhci::has_keyboard();
         let usb_mse = chitti_kernel::arch::aarch64::xhci::has_mouse();
         // The PL050 (PrimeCell KMI) and virtio-mmio (0x0a00_0000) input probes
