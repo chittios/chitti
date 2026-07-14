@@ -197,6 +197,23 @@ const PSCI_INVALID_PARAMETERS: i64 = -2;
 /// `smp::init`, which brings up whatever APs Limine's SMP response lists. The BSP
 /// then waits briefly for the launched cores to register worker slots.
 pub fn init() {
+    // PSCI is the ARM/SBSA (QEMU, VirtualBox, UEFI) way to start secondaries,
+    // over an `hvc`/`smc` conduit. Apple Silicon has **no PSCI** — its FDT has
+    // no `arm,psci-*` node and cores start via Apple's CPU-start MMIO (a
+    // follow-up). Issuing `hvc` there traps to EL2 (m1n1) and halts the guest,
+    // so gate the whole PSCI path on the device tree advertising PSCI; without
+    // it, run single-core rather than fault.
+    let fdt = super::boot::boot_x0();
+    // SAFETY: `boot_x0` is the FDT pointer (or non-FDT, rejected by the magic).
+    let has_psci = unsafe {
+        crate::fdt::has_compatible(fdt, b"arm,psci-1.0")
+            || crate::fdt::has_compatible(fdt, b"arm,psci-0.2")
+            || crate::fdt::has_compatible(fdt, b"arm,psci")
+    };
+    if !has_psci {
+        crate::ktrace::log("smp", "no PSCI in device tree (Apple Silicon?) -- single-core; Apple CPU-start is a follow-up");
+        return;
+    }
     let entry_fn: unsafe extern "C" fn() = smp_secondary_entry;
     let entry = entry_fn as usize as u64;
     let mut started = 0usize;

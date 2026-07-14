@@ -332,6 +332,46 @@ pub unsafe fn reg_of_compatible(dtb_pa: u64, want: &[u8]) -> Option<(u64, u64)> 
     }
 }
 
+/// True if any node in the FDT advertises `want` in its `compatible` list.
+/// Unlike [`reg_of_compatible`], the node need not have a `reg` (e.g. the
+/// `/psci` node has none), so this answers "does this platform advertise
+/// feature X?" — used to gate PSCI SMP bring-up (present on QEMU/SBSA, absent
+/// on Apple Silicon, which starts cores via its own CPU-start MMIO instead).
+///
+/// # Safety
+/// `dtb_pa`, if a valid FDT, must point at a readable blob.
+pub unsafe fn has_compatible(dtb_pa: u64, want: &[u8]) -> bool {
+    // SAFETY: delegated to `header`.
+    let Some((base, h)) = (unsafe { header(dtb_pa) }) else { return false };
+    let mut off = h.off_struct;
+    loop {
+        // SAFETY: every read is bounded against `h.total`.
+        let Some(tok) = (unsafe { be32(base, off, h.total) }) else { return false };
+        off += 4;
+        match tok {
+            FDT_BEGIN_NODE => {
+                let Some(len) = (unsafe { cstr_len(base, off, h.total) }) else { return false };
+                off += (len + 1 + 3) & !3;
+            }
+            FDT_END_NODE | FDT_NOP => {}
+            FDT_PROP => {
+                let Some(len) = (unsafe { be32(base, off, h.total) }) else { return false };
+                let len = len as usize;
+                let Some(name_off) = (unsafe { be32(base, off + 4, h.total) }) else { return false };
+                let data_off = off + 8;
+                if unsafe { prop_name_is(base, h.off_strings, name_off as usize, b"compatible", h.total) }
+                    && unsafe { compat_has(base, data_off, len, want, h.total) }
+                {
+                    return true;
+                }
+                off += 8 + ((len + 3) & !3);
+            }
+            FDT_END => return false,
+            _ => return false,
+        }
+    }
+}
+
 /// A simple linear framebuffer as described by a `simple-framebuffer` FDT node
 /// (iBoot sets it up; m1n1 leaves it lit and passes it through). All the console
 /// needs to light up on the real display.
@@ -701,6 +741,19 @@ mod tests {
         assert_eq!(got, Some((0x2_3520_0000, 0x1000)));
         // A compatible that isn't present returns None.
         assert_eq!(unsafe { reg_of_compatible(blob.as_ptr() as u64, b"apple,t8110-dart") }, None);
+    }
+
+    #[test_case]
+    fn has_compatible_matches_present_and_absent() {
+        let blob = sample();
+        let p = blob.as_ptr() as u64;
+        // Present (a node with reg, and one without reg would work too).
+        assert!(unsafe { has_compatible(p, b"apple,s5l-uart") });
+        assert!(unsafe { has_compatible(p, b"simple-framebuffer") });
+        // Absent — this is exactly the PSCI gate: the sample has no /psci node,
+        // like an Apple FDT, so SMP bring-up must skip PSCI.
+        assert!(!unsafe { has_compatible(p, b"arm,psci-1.0") });
+        assert!(!unsafe { has_compatible(p, b"arm,psci-0.2") });
     }
 
     #[test_case]
