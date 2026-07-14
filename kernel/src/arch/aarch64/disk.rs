@@ -28,6 +28,14 @@ impl Disk {
     /// (Passing `n` to each transport would let one transport's disks shadow
     /// another's — e.g. two NVMe namespaces hiding the virtio-mmio ESP.)
     pub fn probe_nth(n: usize) -> Option<Disk> {
+        // No block transports on Apple Silicon yet: virtio-mmio (0x0a00_0000)
+        // and the PCIe-based NVMe/AHCI/virtio-pci probes all read fixed
+        // QEMU/SBSA addresses that data-abort under m1n1's hv. Apple's ANS2
+        // storage is a follow-up; report no disks so every caller (model load,
+        // persistent store, /install) cleanly finds nothing instead of faulting.
+        if super::is_apple() {
+            return None;
+        }
         let mut idx = 0usize;
         macro_rules! scan {
             ($probe:path, $variant:path) => {{

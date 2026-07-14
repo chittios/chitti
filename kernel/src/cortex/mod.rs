@@ -769,6 +769,13 @@ pub fn model_module() -> Option<&'static [u8]> {
     if let Some(b) = MODEL_OVERRIDE.with(|m| *m) {
         return Some(b);
     }
+    // Apple Silicon (m1n1): no model is injected at the fixed MODEL_LOAD_ADDR
+    // (2 GiB — below Apple's 32 GiB RAM base, so unbacked; reading its magic
+    // faults under the hv) and there is no disk to scan. Boot model-less; the
+    // model arrives later via `/model load` (initrd). QEMU/UEFI are unaffected.
+    if crate::arch::aarch64::is_apple() && crate::arch::aarch64::mmu::uefi_model().is_none() {
+        return None;
+    }
     let (addr, window) = match crate::arch::aarch64::mmu::uefi_model() {
         Some((base, size)) => (base, size),
         None => {
