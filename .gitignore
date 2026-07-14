@@ -21,3 +21,10 @@ assets/fonts/NotoSansCJKsc-Regular.otf
 # path). Keep them ignored so they can't be re-added.
 tools/webcompat/test262/
 tools/webcompat/wasm-testsuite/
+
+# Apple-Silicon device tree blobs for booting via m1n1 — built on demand by
+# tools/build-apple-dtb.sh from the Asahi Linux dts (GPL-2.0). Not vendored:
+# the .dtb is a generated, GPL-derived artifact and the sparse-clone cache is
+# large. Point CHITTI_DTB at the built file.
+third_party/dtb/*.dtb
+third_party/dtb/.asahi-linux/
