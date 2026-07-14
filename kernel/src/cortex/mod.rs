@@ -769,11 +769,28 @@ pub fn model_module() -> Option<&'static [u8]> {
     if let Some(b) = MODEL_OVERRIDE.with(|m| *m) {
         return Some(b);
     }
-    // Apple Silicon (m1n1): no model is injected at the fixed MODEL_LOAD_ADDR
-    // (2 GiB — below Apple's 32 GiB RAM base, so unbacked; reading its magic
-    // faults under the hv) and there is no disk to scan. Boot model-less; the
-    // model arrives later via `/model load` (initrd). QEMU/UEFI are unaffected.
+    // Apple Silicon (m1n1): there is no model injected at the fixed
+    // MODEL_LOAD_ADDR (2 GiB — below Apple's 32 GiB RAM base, so unbacked;
+    // reading its magic faults) and no disk to scan. Instead m1n1 can load the
+    // GGUF as the **initramfs** (CHITTI_INITRD): the `/chosen` initrd region is
+    // a contiguous RAM span the mmu already maps Normal. Use it when it holds a
+    // GGUF; else boot model-less. QEMU/UEFI are unaffected.
     if crate::arch::aarch64::is_apple() && crate::arch::aarch64::mmu::uefi_model().is_none() {
+        // SAFETY: `boot_x0` is the FDT pointer (or non-FDT, rejected by the magic).
+        if let Some(c) = unsafe { crate::fdt::chosen(crate::arch::aarch64::boot::boot_x0()) } {
+            if c.initrd_start != 0 && c.initrd_end > c.initrd_start {
+                let addr = c.initrd_start as usize;
+                let len = (c.initrd_end - c.initrd_start) as usize;
+                // SAFETY: [addr, addr+len) is the initrd, in mmu-mapped Normal RAM.
+                let magic = unsafe { core::slice::from_raw_parts(addr as *const u8, 4.min(len)) };
+                if magic == b"GGUF" {
+                    crate::ktrace::log_fmt(format_args!("cortex: model from initrd at {addr:#x} ({len} bytes)"));
+                    // SAFETY: contiguous RAM holding the GGUF; the parser reads
+                    // only the real model within `len`.
+                    return Some(unsafe { core::slice::from_raw_parts(addr as *const u8, len) });
+                }
+            }
+        }
         return None;
     }
     let (addr, window) = match crate::arch::aarch64::mmu::uefi_model() {
