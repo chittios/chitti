@@ -118,6 +118,19 @@ fn timer_reload() {
 /// # Safety
 /// Runs at EL1 on the BSP; the GIC MMIO windows are Device-mapped.
 pub unsafe fn init_bsp() -> bool {
+    // The GICD/GICR MMIO windows below (0x0800_0000 / 0x080A_0000) are assumed
+    // present on QEMU/SBSA, but Apple Silicon has **no GIC** — it uses AIC at a
+    // wholly different base. Touching the phantom distributor there is a data
+    // abort the sysreg probe can't catch (it's MMIO, not an UNDEF). So gate the
+    // whole GICv3 path on the device tree advertising `arm,gic-v3`; without it,
+    // run cooperatively (no timer preemption) — Apple's AIC is a follow-up.
+    let fdt = super::boot::boot_x0();
+    // SAFETY: `boot_x0` is the FDT pointer (or non-FDT, rejected by the magic).
+    if !unsafe { crate::fdt::has_compatible(fdt, b"arm,gic-v3") } {
+        crate::ktrace::log("gic", "no GICv3 in device tree (Apple AIC?) -- cooperative scheduling; AIC is a follow-up");
+        PREEMPTIVE.store(false, Ordering::Release);
+        return false;
+    }
     unsafe {
         // --- Distributor: affinity routing + Group1 enable. ---
         let ctlr = mmio_r32(GICD_BASE, GICD_CTLR);

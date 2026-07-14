@@ -43,6 +43,12 @@ pub fn rtc_unix() -> Option<u64> {
 
 #[cfg(target_arch = "aarch64")]
 pub fn rtc_unix() -> Option<u64> {
+    // Apple Silicon has no PL031 at 0x0901_0000 — its RTC is behind the PMU/SMC.
+    // Reading the phantom PL031 there data-aborts under m1n1's hv, so skip it;
+    // the wall clock uses the `chitti.epoch=` bootarg / `/datetime` instead.
+    if aarch64::is_apple() {
+        return None;
+    }
     aarch64::rtc::read_unix()
 }
 

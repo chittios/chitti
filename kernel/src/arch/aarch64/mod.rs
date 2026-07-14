@@ -166,6 +166,19 @@ const S5L_URXH: usize = 0x24; // receive holding
 const S5L_UTRSTAT_RXD: u32 = 1 << 0; // RX data ready
 const S5L_UTRSTAT_TXBE: u32 = 1 << 1; // TX buffer empty
 
+/// True on Apple Silicon (the boot FDT's root is `apple,arm-platform`). Gates
+/// the QEMU-virt MMIO probes (fw_cfg/ramfb, PL031 RTC, virtio-mmio, PL050): on
+/// Apple those fixed low addresses are unbacked, and under m1n1's hypervisor a
+/// read there is a fatal "unmapped IPA" data abort — whereas QEMU/VBox merely
+/// return garbage a magic check rejects. Set by [`init_uart_apple`] (which runs
+/// before any device probe) and read across the aarch64 boot path.
+static IS_APPLE: AtomicBool = AtomicBool::new(false);
+
+/// Are we on Apple Silicon, per the boot device tree? See [`IS_APPLE`].
+pub fn is_apple() -> bool {
+    IS_APPLE.load(Ordering::Relaxed)
+}
+
 // Recoverable-probe flags for the PL011 MMIO scan (read by the sync handler in
 // `exceptions`), so probing an unbacked candidate address can't crash the boot.
 static UART_PROBING: AtomicBool = AtomicBool::new(false);
@@ -344,6 +357,7 @@ pub fn uart_getb() -> Option<u8> {
 pub fn init_uart_apple() {
     let fdt = boot::boot_x0();
     // SAFETY: `boot_x0` is the FDT pointer (or non-FDT, rejected by the magic).
+    IS_APPLE.store(unsafe { crate::fdt::has_compatible(fdt, b"apple,arm-platform") }, Ordering::Relaxed);
     if let Some((base, _size)) = unsafe { crate::fdt::reg_of_compatible(fdt, b"apple,s5l-uart") } {
         mmu::map_device_gib(base);
         UART_BASE.store(base as usize, Ordering::Relaxed);

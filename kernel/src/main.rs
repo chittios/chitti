@@ -241,6 +241,23 @@ pub extern "C" fn aarch64_start() -> ! {
     let fb = if let Some((addr, w, h, pitch, bpp, rs, gs, bs)) = bootinfo_framebuffer() {
         chitti_kernel::framebuffer::init_console_raw_fmt(addr, w, h, pitch, bpp, rs, gs, bs);
         Some((w, h))
+    } else if let Some(f) =
+        unsafe { chitti_kernel::fdt::find_framebuffer(chitti_kernel::arch::aarch64::boot::boot_x0()) }
+    {
+        // Apple/m1n1: the `simple-framebuffer` the bootloader set up (base is in
+        // RAM, already Normal-mapped by mmu::init). QEMU `-kernel` has no such
+        // FDT node, so this is skipped there and ramfb below is used instead.
+        chitti_kernel::framebuffer::init_console_raw_fmt(
+            f.base as usize,
+            f.width as u64,
+            f.height as u64,
+            f.stride as u64,
+            f.bpp as u64,
+            f.r_shift as u32,
+            f.g_shift as u32,
+            f.b_shift as u32,
+        );
+        Some((f.width as u64, f.height as u64))
     } else if let Some((addr, w, h, pitch)) = unsafe { chitti_kernel::arch::aarch64::ramfb::init() } {
         chitti_kernel::framebuffer::init_console_raw(addr, w, h, pitch);
         Some((w, h))
@@ -252,7 +269,15 @@ pub extern "C" fn aarch64_start() -> ! {
     // launcher published (`-kernel`), else the discovered RAM span.
     {
         let ram = bootinfo_ram_bytes()
-            .or_else(|| unsafe { chitti_kernel::arch::aarch64::ramfb::read_ram_bytes() })
+            .or_else(|| {
+                if chitti_kernel::arch::aarch64::is_apple() {
+                    // fw_cfg is absent on Apple (would data-abort); take the RAM
+                    // size straight from the FDT `/memory` node instead.
+                    unsafe { chitti_kernel::fdt::memory_region(chitti_kernel::arch::aarch64::boot::boot_x0()).map(|(_, s)| s) }
+                } else {
+                    unsafe { chitti_kernel::arch::aarch64::ramfb::read_ram_bytes() }
+                }
+            })
             .unwrap_or_else(|| chitti_kernel::arch::aarch64::mmu::ram_end().saturating_sub(0x4000_0000));
         chitti_kernel::mm::set_ram_total(ram);
     }
@@ -263,17 +288,24 @@ pub extern "C" fn aarch64_start() -> ! {
         let _usb = chitti_kernel::arch::aarch64::xhci::init_global();
         let usb_kbd = chitti_kernel::arch::aarch64::xhci::has_keyboard();
         let usb_mse = chitti_kernel::arch::aarch64::xhci::has_mouse();
-        // A PL050 PS/2 keyboard (ARM dev boards / some hypervisors) — the ARM
-        // analogue of the x86 i8042. No-op where absent (e.g. QEMU `virt`).
-        let pl050 = chitti_kernel::arch::aarch64::pl050::init();
-        // A PL050 PS/2 mouse (a second KMI) — the ARM PS/2 pointing device, as
-        // VirtualBox-ARM presents when hidpointing=ps2mouse (we force usbtablet
-        // via `make vbox`). No-op where absent.
-        let _pl050_mouse = chitti_kernel::arch::aarch64::pl050_mouse::init();
-        // Also wire the virtio-keyboard (QEMU `virt` window). Absent without one.
-        let virtio_kbd = chitti_kernel::arch::aarch64::virtio_input::init();
-        // A virtio pointer (tablet/mouse) for the window — the aarch64 mouse.
-        let _mouse = chitti_kernel::arch::aarch64::virtio_pointer::init();
+        // The PL050 (PrimeCell KMI) and virtio-mmio (0x0a00_0000) input probes
+        // read fixed QEMU/SBSA addresses that are unbacked on Apple Silicon —
+        // where, under m1n1's hv, the read is a fatal data abort rather than
+        // harmless garbage. Skip them there; native Apple USB HID is a follow-up.
+        let (pl050, _pl050_mouse, virtio_kbd, _mouse) = if chitti_kernel::arch::aarch64::is_apple() {
+            (false, false, false, false)
+        } else {
+            // A PL050 PS/2 keyboard (ARM dev boards / some hypervisors) — the ARM
+            // analogue of the x86 i8042. No-op where absent (e.g. QEMU `virt`).
+            let pl050 = chitti_kernel::arch::aarch64::pl050::init();
+            // A PL050 PS/2 mouse (a second KMI) — as VirtualBox-ARM presents with
+            // hidpointing=ps2mouse (we force usbtablet via `make vbox`).
+            let pl050_mouse = chitti_kernel::arch::aarch64::pl050_mouse::init();
+            // The virtio-keyboard + pointer (QEMU `virt` window).
+            let virtio_kbd = chitti_kernel::arch::aarch64::virtio_input::init();
+            let mouse = chitti_kernel::arch::aarch64::virtio_pointer::init();
+            (pl050, pl050_mouse, virtio_kbd, mouse)
+        };
         // A single, non-scrolling INPUT summary right before the shell so the
         // discovered input path is visible on the framebuffer (the only console
         // that survives a platform whose serial/UART we don't reach). This is the
@@ -291,10 +323,14 @@ pub extern "C" fn aarch64_start() -> ! {
             if _pl050_mouse { "yes" } else { "no" }
         );
     }
-    // Same storage bring-up as x86: point
-    // synapse::fs at an ext4 data partition for durable agent state. No-op
-    // without a `-drive`/virtio-blk-device.
-    mount_persistent_store();
+    // Same storage bring-up as x86: point synapse::fs at an ext4 data partition
+    // for durable agent state. No-op without a `-drive`/virtio-blk-device. The
+    // disk probe reads virtio-mmio at 0x0a00_0000 (and PCIe/NVMe/AHCI), all
+    // QEMU/SBSA addresses that fault on Apple; Apple's ANS2 storage is a
+    // follow-up, so agent state stays in-memory there.
+    if !chitti_kernel::arch::aarch64::is_apple() {
+        mount_persistent_store();
+    }
     // `ref-check` builds run the acceptance gate and power off via PSCI (the
     // aarch64 analogue of the x86 isa-debug-exit path above); the host side
     // (`cargo xtask ref-check -arch aarch64`) greps serial for `ALL PASS`.
@@ -305,12 +341,15 @@ pub extern "C" fn aarch64_start() -> ! {
         chitti_kernel::arch::aarch64::psci_system_off();
     }
     // Bring up networking (virtio-net over mmio, else a PCI NIC) so /network,
-    // /ping and /wifi work. No-op if no NIC is present.
+    // /ping and /wifi work. No-op if no NIC is present. Skipped on Apple: the
+    // virtio-mmio/PCI NIC probes read unbacked QEMU addresses that fault under
+    // the hv (Apple PCIe + its NIC are a follow-up).
     #[cfg(not(feature = "refcheck"))]
-    chitti_kernel::net::autodetect();
-    // Bring up audio (virtio-snd) for the /voice pipeline. No-op if absent.
-    #[cfg(not(feature = "refcheck"))]
-    chitti_kernel::sound::autodetect();
+    if !chitti_kernel::arch::aarch64::is_apple() {
+        chitti_kernel::net::autodetect();
+        // Bring up audio (virtio-snd) for the /voice pipeline. No-op if absent.
+        chitti_kernel::sound::autodetect();
+    }
     // Everything is up (framebuffer, USB/input, disk, persistent store) with IRQs
     // masked. NOW begin timer-preemptive scheduling: unmask IRQs so the generic
     // timer preempts the shell. Deferred to here (not inside init()) so device
