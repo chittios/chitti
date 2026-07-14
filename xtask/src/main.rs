@@ -544,6 +544,49 @@ fn cmd_m1n1(release: bool) -> Result<(), String> {
                         "python3".to_string()
                     }
                 });
+            // Hypervisor boot (CHITTI_M1N1_HV=1): a bare linux.py boot tears down
+            // the USB console at handoff (both the `_01` proxy and `_03` UART
+            // bridge go away), so nothing is visible. Instead do what
+            // run_guest_kernel.sh does — a *nested* m1n1: concatenate a fresh
+            // m1n1 + our dtb + Image.gz (+ optional initramfs) into one guest
+            // blob, chainload a fresh m1n1 as the resident **hypervisor** (which
+            // keeps the USB console alive and traps/forwards the guest UART),
+            // then run the combined blob as the guest. The inner m1n1 does the
+            // FDT prep and boots ChittiOS; the outer m1n1 lets us SEE it.
+            let hv = env::var("CHITTI_M1N1_HV").map(|v| v == "1" || v == "true").unwrap_or(false);
+            if hv {
+                let m1n1bin = Path::new(&m1n1).join("build/m1n1.bin");
+                let chainload = Path::new(&m1n1).join("proxyclient/tools/chainload.py");
+                let runguest = Path::new(&m1n1).join("proxyclient/tools/run_guest.py");
+                for p in [&m1n1bin, &chainload, &runguest] {
+                    if !p.exists() {
+                        return Err(format!("CHITTI_M1N1_HV set but {} missing (build m1n1 first)", p.display()));
+                    }
+                }
+                // Combined guest image: m1n1 + [bootargs line] + dtb + Image.gz [+ initramfs].
+                let mut buf = std::fs::read(&m1n1bin).map_err(|e| format!("read {}: {e}", m1n1bin.display()))?;
+                if let Ok(ba) = env::var("CHITTI_BOOTARGS") {
+                    if !ba.is_empty() {
+                        buf.extend_from_slice(format!("chosen.bootargs={ba}\n").as_bytes());
+                    }
+                }
+                buf.extend_from_slice(&std::fs::read(&dtb).map_err(|e| format!("read {dtb}: {e}"))?);
+                buf.extend_from_slice(&std::fs::read(&payload).map_err(|e| format!("read {}: {e}", payload.display()))?);
+                if let Ok(initrd) = env::var("CHITTI_INITRD") {
+                    let data = std::fs::read(&initrd).map_err(|e| format!("read {initrd}: {e}"))?;
+                    buf.extend_from_slice(b"m1n1_initramfs");
+                    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&data);
+                }
+                let combined = elf.with_extension("m1n1-guest.bin");
+                std::fs::write(&combined, &buf).map_err(|e| format!("write {}: {e}", combined.display()))?;
+                println!("m1n1(hv): combined guest image {} ({} bytes)", combined.display(), buf.len());
+                println!("m1n1(hv): chainloading a fresh m1n1 as the resident hypervisor…");
+                run(Command::new(&python).arg(&chainload).arg("-r").arg(&m1n1bin))?;
+                println!("m1n1(hv): starting the ChittiOS guest under the hypervisor (console stays live)…");
+                return run(Command::new(&python).arg(&runguest).arg("-r").arg(&combined));
+            }
+
             let mut c = Command::new(&python);
             c.arg(&linuxpy).arg(&payload).arg(&dtb);
             if let Ok(initrd) = env::var("CHITTI_INITRD") {
