@@ -16,9 +16,12 @@
 # on a bad name.
 #
 # NB: Asahi's dts uses floating-point cell values (GPU/CPU power PID gains) that
-# only Asahi's *patched* dtc accepts; mainline dtc rejects them. They are pure
-# DVFS tuning, unused for boot and unneeded by m1n1/ChittiOS, so we strip them
-# before compiling.
+# only Asahi's *patched* dtc accepts (it encodes them as IEEE-754 f32 bits in a
+# u32 cell); mainline dtc rejects the `<1.5>` syntax. We must KEEP these
+# properties — m1n1's device-tree prep writes the GPU tables into them and fails
+# ("Failed to set apple,core-leak-coef" -> "DT prepare failed") if they're
+# absent — so we pre-convert each float cell to its `<0xXXXXXXXX>` f32 encoding,
+# exactly what Asahi's dtc would emit, then compile with mainline dtc.
 set -euo pipefail
 
 BOARD="${1:-t8112-j473}"
@@ -54,8 +57,24 @@ echo "· preprocessing $BOARD.dts"
 # shellcheck disable=SC2086
 $CPP -nostdinc -I "$DTSDIR" -I "$CACHE/include" -undef -D__DTS__ \
   -x assembler-with-cpp "$DTS" -o "$PP"
-echo "· stripping float power-tuning props (mainline dtc can't parse them)"
-grep -vE '= <[^>]*[0-9]\.[0-9]' "$PP" > "$PPC"
+echo "· encoding float power-tuning cells as IEEE-754 f32 (mainline dtc has no float cells)"
+python3 - "$PP" "$PPC" <<'PY'
+import re, struct, sys
+src, dst = sys.argv[1], sys.argv[2]
+def conv(m):
+    toks = m.group(1).split()
+    out = []
+    for t in toks:
+        if re.fullmatch(r'-?[0-9]+\.[0-9]+', t):
+            out.append('0x%08x' % struct.unpack('<I', struct.pack('<f', float(t)))[0])
+        else:
+            out.append(t)
+    return '<' + ' '.join(out) + '>'
+text = open(src).read()
+# Rewrite only <...> groups that contain a decimal float; leave all else intact.
+text = re.sub(r'<([^<>]*[0-9]\.[0-9][^<>]*)>', conv, text)
+open(dst, 'w').write(text)
+PY
 echo "· compiling DTB"
 dtc -I dts -O dtb -o "$OUTDIR/$BOARD.dtb" "$PPC" 2>/dev/null
 

@@ -24,7 +24,10 @@ export CHITTI_DTB=third_party/dtb/t8112-j473.dtb
 make m1n1 RELEASE=1                 # (also needs CHITTI_M1N1, M1N1DEVICE — see `make help`)
 ```
 
-Requires `dtc` and `clang` (both standard on macOS with the Xcode CLT +
-`brew install dtc`). The script strips a handful of floating-point power-tuning
-properties the Asahi dts uses, since only Asahi's patched `dtc` accepts them and
-they are irrelevant to booting.
+Requires `dtc`, `clang`, and `python3` (all standard on macOS with the Xcode CLT
++ `brew install dtc`). The Asahi dts uses floating-point cell values (GPU/CPU
+power-tuning gains) that only Asahi's patched `dtc` accepts; the script
+pre-converts each to its IEEE-754 f32 hex encoding — exactly what Asahi's `dtc`
+emits — so mainline `dtc` compiles them and, crucially, m1n1's device-tree prep
+still finds the properties to write the GPU tables into (stripping them makes
+m1n1 fail with "DT prepare failed").
