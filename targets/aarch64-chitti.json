@@ -9,7 +9,7 @@
   "executables": true,
   "linker": "rust-lld",
   "linker-flavor": "gnu-lld",
-  "relocation-model": "static",
+  "relocation-model": "pic",
   "disable-redzone": true,
   "stack-probes": { "kind": "inline" },
   "features": "+v8a,+strict-align,+neon,+fp-armv8,+dotprod",

@@ -13,5 +13,19 @@ runner = "../xtask/run-test-in-qemu.sh"
 # aarch64 native port: its own linker script (direct `-M virt -kernel` boot).
 # Target-specific rustflags REPLACE `[build].rustflags` for this target, so it
 # gets `-Tlinker-aarch64.ld` instead of the x86 `-Tlinker.ld`.
+#
+# Linked as a **position-independent executable** (`-pie` + `relocation-model:
+# pic` in the target JSON) so the kernel can run wherever it is loaded — m1n1
+# loads it at Apple's ~32 GiB RAM base, not the 0x40080000 link address. The
+# linker emits `R_AARCH64_RELATIVE` records into `.rela.dyn`; `_start` applies
+# them (delta = runtime − link base) before any absolute-addressed code runs.
+# `--no-dynamic-linker` (no PT_INTERP — there is no loader) and `-z norelro`
+# (no RELRO segment) keep it a plain flat image. On QEMU `-kernel` the image
+# loads at its link address so delta = 0 and the relocation pass is a no-op.
 [target.aarch64-chitti]
-rustflags = ["-C", "link-arg=-Tlinker-aarch64.ld"]
+rustflags = [
+    "-C", "link-arg=-Tlinker-aarch64.ld",
+    "-C", "link-arg=-pie",
+    "-C", "link-arg=--no-dynamic-linker",
+    "-C", "link-arg=-znorelro",
+]

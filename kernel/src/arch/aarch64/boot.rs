@@ -119,6 +119,36 @@ _start:
     add  x0, x0, :lo12:__stack_top
     mov  sp, x0
 
+    // PIE self-relocation: apply the R_AARCH64_RELATIVE records the `-pie` link
+    // emitted, so every absolute address is correct at the *actual* load address
+    // (m1n1 loads us at Apple's ~32 GiB RAM base, not the 0x40080000 link base).
+    // delta = runtime(_image_start) - 0x40080000; for each entry patch
+    // *(r_offset + delta) = r_addend + delta. All PC-relative (adrp) here, so it
+    // works pre-relocation. On QEMU `-kernel` delta == 0 → a harmless no-op.
+    adrp x9, _image_start
+    add  x9, x9, :lo12:_image_start      // runtime image base
+    movz x10, #0x4008, lsl #16           // link base 0x40080000
+    sub  x11, x9, x10                     // x11 = delta
+    adrp x12, __rela_start
+    add  x12, x12, :lo12:__rela_start
+    adrp x13, __rela_end
+    add  x13, x13, :lo12:__rela_end
+5:  cmp  x12, x13
+    b.hs 7f
+    ldr  x14, [x12]                       // r_offset (link-space)
+    ldr  x15, [x12, #8]                   // r_info
+    ldr  x16, [x12, #16]                  // r_addend (link-space value)
+    and  x15, x15, #0xffffffff            // reloc type = r_info[31:0]
+    cmp  x15, #1027                       // R_AARCH64_RELATIVE
+    b.ne 6f
+    add  x14, x14, x11                    // place = r_offset + delta
+    add  x16, x16, x11                    // value = r_addend + delta
+    str  x16, [x14]
+6:  add  x12, x12, #24                    // sizeof(Elf64_Rela)
+    b    5b
+7:  dsb  sy
+    isb
+
     // Enable FP/SIMD access at EL1: CPACR_EL1.FPEN = 0b11 (bits [21:20]).
     mrs  x0, cpacr_el1
     orr  x0, x0, #(3 << 20)

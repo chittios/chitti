@@ -20,6 +20,20 @@ SECTIONS
     }
 
     .rodata : { *(.rodata .rodata.*) }
+
+    /* PIE self-relocation: the linker emits R_AARCH64_RELATIVE entries here for
+       every absolute address baked into the image (including GOT slots). The
+       boot stub (`arch/aarch64/boot.rs` `_start`) walks [__rela_start,
+       __rela_end) and applies each (place += delta, value += delta) so the
+       kernel runs correctly wherever m1n1 loads it. Keep 8-byte aligned. */
+    . = ALIGN(8);
+    __rela_start = .;
+    .rela.dyn : { *(.rela .rela.*) }
+    __rela_end = .;
+
+    .got  : { *(.got) }
+    .got.plt : { *(.got.plt) }
+
     .data   : { *(.data .data.*) }
 
     .bss : {
@@ -42,5 +56,12 @@ SECTIONS
        boot header emits the size *value*, not an address. */
     __image_size = __stack_top - _image_start;
 
-    /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
+    /* No runtime dynamic loader — we self-relocate from .rela.dyn only, so the
+       dynamic-linking metadata a `-pie` link would otherwise emit is dead
+       weight. Drop it (also .comment/.note/.eh_frame). */
+    /DISCARD/ : {
+        *(.comment) *(.note*) *(.eh_frame*)
+        *(.dynamic) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash)
+        *(.gnu.version) *(.gnu.version_d) *(.gnu.version_r) *(.interp)
+    }
 }
