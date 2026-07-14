@@ -525,7 +525,23 @@ fn cmd_m1n1(release: bool) -> Result<(), String> {
             if !linuxpy.exists() {
                 return Err(format!("CHITTI_M1N1 set but {} not found", linuxpy.display()));
             }
-            let mut c = Command::new("python3");
+            // The proxyclient needs `construct` + `pyserial`; the host `python3`
+            // is often a PEP-668 externally-managed (uv/Homebrew) interpreter
+            // where those aren't installed. Prefer a venv at
+            // `$CHITTI_M1N1/.venv/bin/python` (see the m1n1 setup steps), then
+            // `$CHITTI_M1N1_PYTHON`, else fall back to `python3`.
+            let venv_py = Path::new(&m1n1).join(".venv/bin/python");
+            let python = env::var("CHITTI_M1N1_PYTHON")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| {
+                    if venv_py.exists() {
+                        venv_py.to_string_lossy().into_owned()
+                    } else {
+                        "python3".to_string()
+                    }
+                });
+            let mut c = Command::new(&python);
             c.arg(&linuxpy).arg(&payload).arg(&dtb);
             if let Ok(initrd) = env::var("CHITTI_INITRD") {
                 c.arg(initrd);
@@ -540,8 +556,11 @@ fn cmd_m1n1(release: bool) -> Result<(), String> {
             println!(
                 "m1n1: to boot on hardware, set CHITTI_M1N1 (+ CHITTI_DTB, optional \
                  CHITTI_INITRD/CHITTI_BOOTARGS, M1N1DEVICE), or run manually:\n  \
-                 M1N1DEVICE=/dev/tty.usbmodemXXX python3 <m1n1>/proxyclient/tools/linux.py \
-                 {} <machine.dtb> [initramfs] -b \"chitti.epoch=<unix-secs>\"",
+                 M1N1DEVICE=/dev/cu.usbmodemXXX <m1n1>/.venv/bin/python \
+                 <m1n1>/proxyclient/tools/linux.py \
+                 {} <machine.dtb> [initramfs] -b \"chitti.epoch=<unix-secs>\"\n  \
+                 (create the venv once: `uv venv <m1n1>/.venv && uv pip install \
+                 --python <m1n1>/.venv/bin/python -r <m1n1>/requirements.txt`)",
                 payload.display()
             );
             Ok(())
