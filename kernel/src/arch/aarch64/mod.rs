@@ -145,12 +145,26 @@ pub mod interrupts {
 // the ACPI SPCR table (`init_uart`) so we hit the right MMIO on platforms with
 // a different map (e.g. VirtualBox's PL011 at 0xFFDDF000). DR is at base+0x00,
 // FR at base+0x18.
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 static UART_BASE: AtomicUsize = AtomicUsize::new(0x0900_0000);
 const UART_DR: usize = 0x00;
 const UART_FR: usize = 0x18;
 const UART_FR_RXFE: u32 = 1 << 4; // receive FIFO empty
 const UART_FR_TXFF: u32 = 1 << 5; // transmit FIFO full
+
+// The console UART flavour. QEMU `virt` / SBSA / VirtualBox use a PL011; Apple
+// Silicon (booted via m1n1) has no PL011 at all — it uses a Samsung `s5l` UART
+// whose base comes from the boot FDT (`apple,s5l-uart`). Selected by
+// `init_uart_apple` before the first print; defaults to PL011 everywhere else.
+const UART_KIND_PL011: u32 = 0;
+const UART_KIND_S5L: u32 = 1;
+static UART_KIND: AtomicU32 = AtomicU32::new(UART_KIND_PL011);
+// Samsung s5l register offsets + status bits (matches m1n1's `uart.c`).
+const S5L_UTRSTAT: usize = 0x10; // TX/RX status
+const S5L_UTXH: usize = 0x20; // transmit holding
+const S5L_URXH: usize = 0x24; // receive holding
+const S5L_UTRSTAT_RXD: u32 = 1 << 0; // RX data ready
+const S5L_UTRSTAT_TXBE: u32 = 1 << 1; // TX buffer empty
 
 // Recoverable-probe flags for the PL011 MMIO scan (read by the sync handler in
 // `exceptions`), so probing an unbacked candidate address can't crash the boot.
@@ -221,6 +235,12 @@ fn is_pl011(base: u64) -> bool {
 /// Must run AFTER the exception vectors are installed (the MMIO probe relies on
 /// the recoverable sync handler) and before the first output we want captured.
 pub fn init_uart() {
+    // Apple's s5l console was already selected from the FDT (init_uart_apple);
+    // the PL011 discovery below doesn't apply (Apple has no PL011) and its
+    // RX-probe would wrongly disable the working s5l RX.
+    if UART_KIND.load(Ordering::Relaxed) == UART_KIND_S5L {
+        return;
+    }
     let mut chosen: Option<u64> = None;
     // 1. ACPI SPCR, if the boot-info carries an RSDP.
     let bi = boot::boot_x1();
@@ -266,9 +286,18 @@ pub fn init_uart() {
     }
 }
 
-/// Write one byte to the console (blocks briefly if the TX FIFO is full).
+/// Write one byte to the console (blocks briefly until the TX path is ready).
 pub fn uart_putb(byte: u8) {
     let base = uart_base();
+    if UART_KIND.load(Ordering::Relaxed) == UART_KIND_S5L {
+        // Samsung s5l (Apple): spin until the TX buffer is empty, then write UTXH.
+        // SAFETY: `base` is the Device-mapped s5l register block.
+        unsafe {
+            while core::ptr::read_volatile((base + S5L_UTRSTAT) as *const u32) & S5L_UTRSTAT_TXBE == 0 {}
+            core::ptr::write_volatile((base + S5L_UTXH) as *mut u32, byte as u32);
+        }
+        return;
+    }
     // SAFETY: `base` is a Device-mapped PL011 register block; the flag register
     // gates the data write.
     unsafe {
@@ -277,14 +306,25 @@ pub fn uart_putb(byte: u8) {
     }
 }
 
-/// Read one byte from the console if the RX FIFO has one, else `None`.
+/// Read one byte from the console if one is waiting, else `None`.
 pub fn uart_getb() -> Option<u8> {
-    // No verified PL011 => never read RX (a phantom UART's flags/data are garbage
-    // and would flood the shell). See `UART_RX_OK`.
+    // No verified console RX => never read (a phantom UART's flags/data are
+    // garbage and would flood the shell). See `UART_RX_OK`.
     if !UART_RX_OK.load(Ordering::Relaxed) {
         return None;
     }
     let base = uart_base();
+    if UART_KIND.load(Ordering::Relaxed) == UART_KIND_S5L {
+        // Samsung s5l: read URXH only when UTRSTAT reports RX data ready.
+        // SAFETY: Device-mapped s5l register block.
+        unsafe {
+            return if core::ptr::read_volatile((base + S5L_UTRSTAT) as *const u32) & S5L_UTRSTAT_RXD != 0 {
+                Some((core::ptr::read_volatile((base + S5L_URXH) as *const u32) & 0xff) as u8)
+            } else {
+                None
+            };
+        }
+    }
     // SAFETY: PL011 MMIO; only reads DR once the "RX empty" flag is clear.
     unsafe {
         if core::ptr::read_volatile((base + UART_FR) as *const u32) & UART_FR_RXFE != 0 {
@@ -292,6 +332,24 @@ pub fn uart_getb() -> Option<u8> {
         } else {
             Some((core::ptr::read_volatile((base + UART_DR) as *const u32) & 0xff) as u8)
         }
+    }
+}
+
+/// Select the Apple Samsung `s5l` console UART from the boot device tree (m1n1
+/// hands the FDT in x0). Apple Silicon has no PL011, so without this the console
+/// writes into an unbacked QEMU address and nothing appears. Pure FDT walk — no
+/// MMIO probing — so it is safe to call *before* the exception vectors exist
+/// (unlike [`init_uart`]'s PL011 probe) and thus before the very first print.
+/// A no-op on QEMU/SBSA (no `apple,s5l-uart` node), leaving the PL011 path.
+pub fn init_uart_apple() {
+    let fdt = boot::boot_x0();
+    // SAFETY: `boot_x0` is the FDT pointer (or non-FDT, rejected by the magic).
+    if let Some((base, _size)) = unsafe { crate::fdt::reg_of_compatible(fdt, b"apple,s5l-uart") } {
+        mmu::map_device_gib(base);
+        UART_BASE.store(base as usize, Ordering::Relaxed);
+        UART_KIND.store(UART_KIND_S5L, Ordering::Relaxed);
+        UART_RX_OK.store(true, Ordering::Relaxed); // real UART; m1n1 hv forwards RX
+        crate::ktrace::log_fmt(format_args!("uart: Apple s5l console at {base:#x}"));
     }
 }
 

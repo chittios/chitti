@@ -481,11 +481,14 @@ fn verify_image_header(img: &Path) -> Result<(), String> {
 /// over the m1n1 USB proxy (the ~7 s dev loop). Everything is driven by env so
 /// the custom arg parser stays untouched:
 ///
-///   CHITTI_M1N1     path to your m1n1 checkout (uses proxyclient/tools/linux.py)
-///   CHITTI_DTB      machine device tree (e.g. apple/t8112-j473.dtb) — required to boot
-///   CHITTI_INITRD   optional initramfs / model blob (Stage 1: the GGUF)
-///   CHITTI_BOOTARGS optional kernel bootargs (e.g. "chitti.epoch=1752345600")
-///   M1N1DEVICE      proxy TTY (read by linux.py itself; e.g. /dev/tty.usbmodemXXX)
+///   CHITTI_M1N1      path to your m1n1 checkout (uses proxyclient/tools/linux.py)
+///   CHITTI_DTB       machine device tree (e.g. apple/t8112-j473.dtb) — required to boot
+///   CHITTI_INITRD    optional initramfs / model blob (Stage 1: the GGUF)
+///   CHITTI_BOOTARGS  optional kernel bootargs (e.g. "chitti.epoch=1752345600")
+///   CHITTI_M1N1_TTY  secondary UART tty for the payload's console after handoff
+///                    (the `_03` device, e.g. /dev/cu.usbmodemXXXXD3); without it
+///                    linux.py reads the dead proxy device and shows nothing.
+///   M1N1DEVICE       proxy control TTY (the `_01` device; read by linux.py itself)
 ///
 /// Without CHITTI_M1N1 + CHITTI_DTB it just builds the Image and prints the exact
 /// command to run, so the artifact is always produced.
@@ -548,6 +551,16 @@ fn cmd_m1n1(release: bool) -> Result<(), String> {
             }
             if let Ok(bootargs) = env::var("CHITTI_BOOTARGS") {
                 c.args(["-b", &bootargs]);
+            }
+            // After handoff m1n1 tears down the proxy (`_01`) interface, so the
+            // payload's console must be read on the secondary UART bridge
+            // (`_03`, e.g. /dev/cu.usbmodemXXXX**D3**). Pass it via CHITTI_M1N1_TTY
+            // so linux.py's post-boot `ttymode` reads there and we see ChittiOS's
+            // s5l output instead of a dead proxy device.
+            if let Ok(tty) = env::var("CHITTI_M1N1_TTY") {
+                if !tty.is_empty() {
+                    c.args(["-t", &tty]);
+                }
             }
             println!("m1n1: booting over the proxy ({:?})…", c);
             run(&mut c)

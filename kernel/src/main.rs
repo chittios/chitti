@@ -207,6 +207,10 @@ pub extern "C" fn aarch64_start() -> ! {
     // succeed (a spinlock would spin forever). `serial_println!` mirrors to a
     // `Locked` framebuffer console, so even the banner needs normal memory.
     chitti_kernel::arch::aarch64::mmu::init();
+    // Select the Apple Samsung s5l console from the boot FDT (m1n1) before the
+    // first print — Apple Silicon has no PL011, so otherwise the banner would
+    // write into an unbacked address and nothing would appear. No-op on QEMU.
+    chitti_kernel::arch::aarch64::init_uart_apple();
     chitti_kernel::serial::init();
     serial_println!("{} -- NATIVE aarch64 on Apple Silicon (QEMU + HVF)", BOOT_MSG);
     chitti_kernel::init();
