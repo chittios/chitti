@@ -62,6 +62,11 @@ fn boot_seed() -> Option<(bool, Option<RemoteConfig>)> {
         if crate::arch::aarch64::boot::boot_x1() != 0 {
             return None;
         }
+        // m1n1/Apple: x1==0 looks like QEMU `-kernel`, but there is no fw_cfg —
+        // reading it (0x0902_0010 DMA) data-aborts under the hv. Skip the seed.
+        if crate::arch::aarch64::is_apple() {
+            return None;
+        }
         let bytes = crate::arch::aarch64::ramfb::read_opt_file(b"opt/chitti/model")?;
         return parse_config_json(&bytes);
     }
