@@ -95,21 +95,34 @@ _start:
     lsr  x9, x9, #2
     cmp  x9, #2
     b.ne 1f
-    mov  x9, #0x33ff            // CPTR_EL2: RES1 bits set, TFP=0 (don't trap EL1 FP)
-    msr  cptr_el2, x9
-    msr  hstr_el2, xzr          // don't trap EL1 CP15 accesses
-    mov  x9, #(1 << 31)         // HCR_EL2.RW = 1: EL1 executes in AArch64
+    // Enter EL1 in AArch64. m1n1/iBoot may hand off with **VHE enabled**
+    // (HCR_EL2.E2H=1), where the EL1 system registers alias the EL2 ones — so we
+    // must first put HCR_EL2 into a plain non-VHE EL1 state (RW=1, E2H=0, TGE=0)
+    // and ISB, *before* touching any EL1 register, or SCTLR_EL1 would still be
+    // SCTLR_EL2. Missing this ISB / doing a read-modify-write of the aliased
+    // SCTLR_EL1 leaves the real EL1 SCTLR unknown → instant fault at EL1 on
+    // hardware (QEMU/HVF hid it by entering at EL1 directly).
+    mov  x9, #(1 << 31)         // HCR_EL2.RW = 1; E2H = TGE = 0
     msr  hcr_el2, x9
-    mrs  x9, cnthctl_el2        // let EL1 read the physical timer/counter
+    isb
+    // Sane EL1 SCTLR: MMU + caches off, with the architectural RES1 bits set
+    // (bits 11,20,22,23,28,29 = 0x30d00800). Written directly, NOT RMW: the
+    // reset/aliased value is not trustworthy.
+    movz x9, #0x30d0, lsl #16
+    movk x9, #0x0800
+    msr  sctlr_el1, x9
+    isb
+    // Now in the non-VHE CPTR_EL2 format: don't trap EL1 FP/SIMD or CP15.
+    mov  x9, #0x33ff            // RES1 bits set, TFP = 0
+    msr  cptr_el2, x9
+    msr  hstr_el2, xzr
+    // Let EL1 read the generic timer/counter; zero the virtual-counter offset.
+    mrs  x9, cnthctl_el2
     orr  x9, x9, #3             // EL1PCTEN | EL1PCEN
     msr  cnthctl_el2, x9
-    msr  cntvoff_el2, xzr       // zero the virtual-counter offset
-    mrs  x9, sctlr_el1          // sane EL1 SCTLR: MMU/caches off, keep RES1 bits
-    bic  x9, x9, #(1 << 0)      // M = 0
-    bic  x9, x9, #(1 << 2)      // C = 0
-    bic  x9, x9, #(1 << 12)     // I = 0
-    msr  sctlr_el1, x9
-    mov  x9, #0x3c5             // SPSR_EL2: DAIF masked, mode EL1h
+    msr  cntvoff_el2, xzr
+    // eret into EL1h with DAIF masked.
+    mov  x9, #0x3c5
     msr  spsr_el2, x9
     adr  x9, 1f
     msr  elr_el2, x9
