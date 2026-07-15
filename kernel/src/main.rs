@@ -239,6 +239,26 @@ pub extern "C" fn aarch64_start() -> ! {
     // aarch64_start's own prologue and any find_framebuffer hazard. REMOVE once
     // the bare boot is stable.
     unsafe { dbg_band(0) };
+    // TEMP bare-boot bisect: an explicit FP op faults in reg_of_compatible, so
+    // FP/SIMD is disabled at EL1 despite _start's CPACR/CPTR enable. Two things:
+    // (1) read CurrentEL and paint slot 4 RED if we are unexpectedly still at EL2
+    //     (the eret "drop" not having changed EL would rewrite the whole picture);
+    // (2) force-enable FP here in Rust (CPACR_EL1.FPEN=0b11) in case the _start
+    //     enable ran at the wrong EL / didn't stick. REMOVE once bare boot works.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let el: u64;
+        core::arch::asm!("mrs {el}, CurrentEL", el = out(reg) el);
+        if (el >> 2) == 2 {
+            chitti_kernel::arch::aarch64::dbg_paint(4, 0x3ff0_0000); // slot 4 red = running at EL2!
+        }
+        core::arch::asm!(
+            "mov x9, #0x300000",   // CPACR_EL1.FPEN = 0b11 (bits 21:20)
+            "msr cpacr_el1, x9",
+            "isb",
+            out("x9") _,
+        );
+    }
     // The boot stub (arch::aarch64::boot) already set the stack, enabled NEON,
     // and zeroed BSS. Enable the MMU *first* -- with it off, RAM is Device
     // memory where the LL/SC exclusives that back `Locked`/atomics never
