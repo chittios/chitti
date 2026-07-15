@@ -4,13 +4,107 @@
 //! allocator. The USB HID keyboard is the real-hardware input path (ARM has no
 //! PS/2); works on any platform that exposes xHCI over PCIe.
 
+use crate::arch::aarch64::dart::{self, Dart};
 use crate::arch::aarch64::dma_to_phys;
 use crate::mm::Locked;
 use crate::pci;
 use crate::xhci::Xhci;
 use alloc::alloc::{alloc_zeroed, Layout};
+use core::ptr::write_volatile;
 
 static XHCI: Locked<Option<Xhci>> = Locked::new(None);
+
+const DART_PAGE: usize = 0x4000; // 16 KiB DART page
+
+/// Apple USB DMA translation state: the DART + its single L2 table (covers IOVA
+/// 0..32 MiB, L1 index 0) + an IOVA bump allocator. The DWC3 emits low IOVAs the
+/// DART translates to the high physical DMA buffers — bypass, which makes the
+/// controller emit the high PA itself, faults the periodic interrupt transfer
+/// (Host System Error) even though enumeration's control transfers survive it.
+struct UsbDma {
+    dart_base: usize,
+    dart_sid: u32,
+    l2_va: usize,   // 2048-entry L2 table (16 KiB), maps IOVA 0..32 MiB
+    next_iova: u64, // bump, 16 KiB pages
+}
+static USB_DMA: Locked<Option<UsbDma>> = Locked::new(None);
+
+/// Clean a cache range to the Point of Coherency so the DART's (non-coherent)
+/// table walker reads the PTEs we just wrote.
+fn dcache_clean(va: usize, len: usize) {
+    // SAFETY: cache maintenance over a mapped Normal-memory page-table buffer.
+    unsafe {
+        let mut p = va & !63;
+        let end = va + len;
+        while p < end {
+            core::arch::asm!("dc cvac, {}", in(reg) p, options(nostack, preserves_flags));
+            p += 64;
+        }
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+/// Set up DART translation for the USB stream: allocate a 2-level page table
+/// (one L1 + one L2, covering IOVA 0..32 MiB), point the DART at it, and record
+/// state for [`aa_alloc_apple`]. Call before [`attach_at`]. Returns false on
+/// allocation failure or a locked DART.
+pub fn dma_translate_setup(dart_base: usize, dart_sid: u32) -> bool {
+    let Ok(layout) = Layout::from_size_align(DART_PAGE, DART_PAGE) else { return false };
+    // SAFETY: nonzero 16 KiB layout; leaked, used as DART page tables.
+    let l1 = unsafe { alloc_zeroed(layout) } as usize;
+    let l2 = unsafe { alloc_zeroed(layout) } as usize;
+    if l1 == 0 || l2 == 0 {
+        return false;
+    }
+    let l1_pa = dma_to_phys(l1 as u64);
+    let l2_pa = dma_to_phys(l2 as u64);
+    // L1[0] → L2 table (a PTE, same encoding as a leaf).
+    // SAFETY: l1 is a fresh 16 KiB table.
+    unsafe { write_volatile(l1 as *mut u64, dart::make_pte(l2_pa)) };
+    dcache_clean(l1, 8);
+    // SAFETY: dart_base is the Device-mapped DART; sid from the FDT.
+    let dart = unsafe { Dart::new(dart_base, dart_sid) };
+    if !dart.set_translate(l1_pa) {
+        return false;
+    }
+    USB_DMA.with(|s| *s = Some(UsbDma { dart_base, dart_sid, l2_va: l2, next_iova: DART_PAGE as u64 }));
+    crate::serial_println!("apple_usb: DART translate ready (l1={l1_pa:#x} l2={l2_pa:#x})");
+    true
+}
+
+/// DMA allocator for the Apple USB path: allocate a 16 KiB-aligned buffer, map
+/// its physical page(s) to fresh low IOVAs in the USB DART, and return
+/// `(IOVA, VA)`. The controller uses the IOVA (translated by the DART); the CPU
+/// uses VA (== PA on our identity map). `None` if translation isn't set up.
+fn aa_alloc_apple(bytes: usize) -> Option<(u64, usize)> {
+    USB_DMA.with(|s| {
+        let d = s.as_mut()?;
+        let sz = bytes.max(1);
+        let layout = Layout::from_size_align(sz, DART_PAGE).ok()?;
+        // SAFETY: nonzero layout; leaked, device-shared DMA.
+        let va = unsafe { alloc_zeroed(layout) } as usize;
+        if va == 0 {
+            return None;
+        }
+        let pa = dma_to_phys(va as u64);
+        let pages = sz.div_ceil(DART_PAGE);
+        let iova = d.next_iova;
+        for i in 0..pages {
+            let this = iova + (i * DART_PAGE) as u64;
+            let (l1, l2, _) = dart::iova_split(this);
+            if l1 != 0 {
+                return None; // our single L2 covers only L1==0 (0..32 MiB)
+            }
+            // SAFETY: l2_va is the live L2 table; entry l2 is in range [0,2048).
+            unsafe { write_volatile((d.l2_va + l2 * 8) as *mut u64, dart::make_pte(pa + (i * DART_PAGE) as u64)) };
+        }
+        dcache_clean(d.l2_va, DART_PAGE); // publish the PTEs to the DART walker
+        d.next_iova += (pages * DART_PAGE) as u64;
+        // SAFETY: base/sid recorded at setup; flush so the new IOVAs are live.
+        unsafe { Dart::new(d.dart_base, d.dart_sid) }.flush_tlb();
+        Some((iova, va))
+    })
+}
 
 /// Probe + bring up the xHCI controller and enumerate HID keyboard + pointer.
 /// No-op if there is no PCIe bus (virtio-mmio-only QEMU) or no xHCI controller.
@@ -41,7 +135,9 @@ pub fn init_global() -> bool {
 /// bypass) so `poll_key`/`poll_mouse` work unchanged. Returns whether a keyboard
 /// or mouse came up.
 pub fn attach_at(base: usize) -> bool {
-    if let Some(mut x) = Xhci::bringup(base, aa_alloc) {
+    // The Apple DWC3 DMAs through the DART with translated low IOVAs, so use the
+    // DART-mapping allocator (set up by apple_usb via dma_translate_setup).
+    if let Some(mut x) = Xhci::bringup(base, aa_alloc_apple) {
         // Visible on the chat pane (bare boot has no serial, ktrace pane closed).
         crate::serial_println!(
             "apple_usb: xHCI bringup OK ({} ports); enumerating…",

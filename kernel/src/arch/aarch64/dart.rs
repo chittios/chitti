@@ -147,6 +147,30 @@ impl Dart {
         crate::ktrace::log_fmt(format_args!("dart: {:#x} sid {} → bypass", self.base, self.sid));
         true
     }
+
+    /// Put the stream in **translation** mode against the L1 table at physical
+    /// `l1_pa`: program TTBR(sid,0) + TCR.TRANSLATE_ENABLE and flush. The device
+    /// then DMAs through low IOVAs the table maps — required for the Apple DWC3,
+    /// which m1n1/Linux drive with translated low IOVAs (bypass, forcing the
+    /// controller to emit the high physical address itself, faults the periodic
+    /// interrupt transfer → HSE). Returns false if the DART is locked.
+    pub fn set_translate(&self, l1_pa: u64) -> bool {
+        if self.is_locked() {
+            crate::ktrace::log_fmt(format_args!("dart: {:#x} sid {} locked; leaving as-is", self.base, self.sid));
+            return false;
+        }
+        self.enable_stream();
+        self.w(TTBR_OFF + 4 * self.sid as usize, make_ttbr(l1_pa));
+        self.w(TCR_OFF + 4 * self.sid as usize, TCR_TRANSLATE_ENABLE);
+        self.tlb_flush();
+        crate::ktrace::log_fmt(format_args!("dart: {:#x} sid {} → translate (l1={l1_pa:#x})", self.base, self.sid));
+        true
+    }
+
+    /// Flush this stream's TLB (public wrapper — call after remapping PTEs).
+    pub fn flush_tlb(&self) {
+        self.tlb_flush();
+    }
 }
 
 #[cfg(test)]

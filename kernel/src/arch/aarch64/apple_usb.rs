@@ -230,11 +230,15 @@ fn bringup_controller(idx: usize, hw: &UsbHw) -> bool {
     super::mmu::map_device_gib(hw.atc as u64);
     super::mmu::map_device_gib(hw.pipehandler as u64);
     super::mmu::map_device_gib(hw.dart_base as u64);
-    // DART stream in bypass: DMA uses physical addresses (we identity-map).
-    // SAFETY: `dart_base` is the Device-mapped DART; `dart_sid` from the FDT.
-    crate::serial_println!("apple_usb: [2] DART bypass");
-    let dart = unsafe { super::dart::Dart::new(hw.dart_base, hw.dart_sid) };
-    dart.set_bypass();
+    // DART in TRANSLATION mode with low IOVAs (m1n1/Linux do this): the DWC3
+    // can't reliably emit Apple's high physical DMA addresses itself (bypass
+    // faulted the periodic interrupt transfer → HSE), so the xHCI DMA allocator
+    // maps its buffers to low IOVAs the DART translates up to the physical pages.
+    crate::serial_println!("apple_usb: [2] DART translate setup");
+    if !super::xhci::dma_translate_setup(hw.dart_base, hw.dart_sid) {
+        crate::serial_println!("apple_usb: DART translate setup failed (locked?) on controller {idx}");
+        return false;
+    }
     crate::serial_println!("apple_usb: [3] ATC PHY bring-up");
     phy_bringup(hw);
     crate::serial_println!("apple_usb: [4] DWC3 host reset (GSNPSID)");
