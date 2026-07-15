@@ -305,7 +305,7 @@ pub unsafe fn reg_of_compatible(dtb_pa: u64, want: &[u8]) -> Option<(u64, u64)> 
                     return None;
                 }
                 if matched[depth] && reg_off[depth] != 0 {
-                    unsafe { fdt_probe(14, 0x3ff0_03ff) }; // slot 14: matched node END, about to read reg cells
+                    unsafe { fdt_probe(15, 0x3ff0_03ff) }; // slot 15: matched node END, about to read reg cells
                     let pa = acells[depth - 1];
                     let ps = scells[depth - 1];
                     // SAFETY: bounded.
@@ -332,6 +332,7 @@ pub unsafe fn reg_of_compatible(dtb_pa: u64, want: &[u8]) -> Option<(u64, u64)> 
                     } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"compatible", h.total) } {
                         if unsafe { compat_has(base, data_off, len, want, h.total) } {
                             matched[depth] = true;
+                            unsafe { fdt_probe(14, 0x0000_03ff) }; // slot 14: matched `want` compatible
                         }
                     } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"reg", h.total) } {
                         reg_off[depth] = data_off;
