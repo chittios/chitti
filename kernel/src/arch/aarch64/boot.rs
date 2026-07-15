@@ -161,6 +161,16 @@ _start:
     // Now in the non-VHE CPTR_EL2 format: don't trap EL1 FP/SIMD or CP15.
     mov  x9, #0x33ff            // RES1 bits set, TFP = 0
     msr  cptr_el2, x9
+    // TEMP: read CPTR_EL2 back and paint slot 21 — green if TFP(bit10) is clear
+    // (FP not trapped to EL2), red if it is still set. Isolates whether the write
+    // took (FP off despite CPACR_EL1.FPEN=0b11 at EL1 means TFP is the culprit).
+    mrs  x10, cptr_el2
+    tst  x10, #0x400           // TFP, bit 10
+    b.ne 30f
+    DBGBAND 21, 0xfc00, 0x000f // slot 21 green: TFP clear (FP should work)
+    b    31f
+30: DBGBAND 21, 0x0000, 0x3ff0 // slot 21 red: TFP still set (FP trapped to EL2)
+31:
     msr  hstr_el2, xzr
     // Let EL1 read the generic timer/counter; zero the virtual-counter offset.
     mrs  x9, cnthctl_el2
