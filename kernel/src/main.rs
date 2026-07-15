@@ -601,6 +601,19 @@ fn fmt_u32(mut n: u32, buf: &mut [u8; 12]) -> &str {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // TEMP bare-boot bisect: repaint the top asm ladder bands (slots 0/1/2, which
+    // otherwise show blue/cyan/green from _start) solid RED so a Rust panic is
+    // visually distinct from a raw CPU fault on the serial-less bare Apple boot.
+    // If the top of the ladder turns red, we panicked (a bounds/overflow check);
+    // if it resets with the top bands unchanged, it was a hardware exception.
+    // Painted BEFORE the serial write, which can itself fault this early (no UART
+    // base, no EL1 vectors). REMOVE with the rest of the bare-boot paints.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        chitti_kernel::arch::aarch64::dbg_paint(0, 0x3ff0_0000);
+        chitti_kernel::arch::aarch64::dbg_paint(1, 0x3ff0_0000);
+        chitti_kernel::arch::aarch64::dbg_paint(2, 0x3ff0_0000);
+    }
     serial_println!("KERNEL PANIC: {}", info);
     loop {
         chitti_kernel::arch::hlt();
