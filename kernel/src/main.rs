@@ -271,6 +271,10 @@ pub extern "C" fn aarch64_start() -> ! {
             "isb",
             out("x9") _,
         );
+        // Does FP work RIGHT HERE (before mmu::init)? slot 19 = FP ok post-enable.
+        let f = core::hint::black_box(1.0f32) + core::hint::black_box(2.0f32);
+        core::hint::black_box(f);
+        chitti_kernel::arch::aarch64::dbg_paint(19, 0x000f_fc00);
     }
     // The boot stub (arch::aarch64::boot) already set the stack, enabled NEON,
     // and zeroed BSS. Enable the MMU *first* -- with it off, RAM is Device
@@ -279,6 +283,13 @@ pub extern "C" fn aarch64_start() -> ! {
     // `Locked` framebuffer console, so even the banner needs normal memory.
     chitti_kernel::arch::aarch64::mmu::init();
     unsafe { dbg_band(1) }; // past mmu::init (MMU + identity map on)
+    // Does FP still work AFTER mmu::init? slot 20 = FP ok post-MMU-enable.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let f = core::hint::black_box(1.0f32) + core::hint::black_box(2.0f32);
+        core::hint::black_box(f);
+        chitti_kernel::arch::aarch64::dbg_paint(20, 0x3ff0_03ff);
+    }
     // The FDT (m1n1's DTB) can sit in m1n1's heap *above* the /memory-reported RAM
     // top that mmu::init mapped — readable with the MMU off (detect() did), but a
     // fault once the MMU is on. Map its GiB(s) as RAM (only if unmapped) before any
