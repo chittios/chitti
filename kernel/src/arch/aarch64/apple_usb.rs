@@ -22,9 +22,15 @@
 //! non-coherent DMA maintenance, commit `6838562`). We now bring up **both**
 //! dwc3 controllers and keep them live (a keyboard on one Type-C port + a mouse
 //! dongle on the other), and the xHCI core enumerates **composite** HID devices
-//! (a wireless dongle exposing keyboard+mouse on one slot) and devices behind a
-//! **USB hub** — the path to the Mac mini's **USB-A** ports, which hang off an
-//! internal hub downstream of one controller's root port.
+//! (a wireless dongle exposing keyboard+mouse on one slot, bit-granular 12-bit /
+//! report-ID report parsing) and devices behind a **USB hub** (generic driver:
+//! route strings + TT).
+//!
+//! **USB-A ports are NOT reachable here** (confirmed on j473): the DT has only
+//! these two Type-C dwc3 controllers, and a keyboard in a USB-A port shows no
+//! connect on any root port (no downstream hub appears). The mini's USB-A ports
+//! hang off the Thunderbolt/USB4 (or a PCIe hub) subsystem, which we don't have.
+//! **Use the two USB-C ports** (one device per controller) for keyboard + mouse.
 //!
 //! Still open: **Type-C orientation / Vbus** via the Apple `cd321x` PD
 //! controller (a USB-C device only works in the orientation that happens to
