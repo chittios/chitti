@@ -201,26 +201,41 @@ pub fn init() -> bool {
         return false;
     }
     let Some(hw) = discover() else {
-        crate::ktrace::log("apple_usb", "no apple,dwc3 in device tree; skipping");
+        crate::serial_println!("apple_usb: no apple,dwc3 in device tree; skipping");
         return false;
     };
-    crate::ktrace::log_fmt(format_args!(
+    // Step markers go to serial_println! (the chat pane, visible on a bare boot)
+    // rather than ktrace (the action/logs pane, closed at boot). Each prints
+    // BEFORE the MMIO group that follows, so if a group hangs (e.g. an ungated
+    // power domain — touching ungated Apple MMIO stalls the interconnect), the
+    // last visible line names the culprit.
+    crate::serial_println!(
         "apple_usb: dwc3={:#x} atc={:#x} pipe={:#x} dart={:#x} sid={}",
         hw.dwc3, hw.atc, hw.pipehandler, hw.dart_base, hw.dart_sid
-    ));
+    );
     // Ensure the USB MMIO windows + the DART are mapped (Device).
+    crate::serial_println!("apple_usb: [1] mapping MMIO windows");
     super::mmu::map_device_gib(hw.dwc3 as u64);
+    super::mmu::map_device_gib(hw.atc as u64);
+    super::mmu::map_device_gib(hw.pipehandler as u64);
     super::mmu::map_device_gib(hw.dart_base as u64);
     // Put the controller's DART stream in bypass so DMA uses physical addresses
     // (ChittiOS is identity-mapped, so buffer PA == VA).
     // SAFETY: `dart_base` is the Device-mapped DART; `dart_sid` from the FDT.
+    crate::serial_println!("apple_usb: [2] DART bypass (first DART MMIO)");
     let dart = unsafe { super::dart::Dart::new(hw.dart_base, hw.dart_sid) };
     dart.set_bypass();
     // PHY + controller.
+    crate::serial_println!("apple_usb: [3] ATC PHY bring-up (first ATC/pipehandler MMIO)");
     phy_bringup(&hw);
+    crate::serial_println!("apple_usb: [4] DWC3 host reset (first dwc3 MMIO: GSNPSID)");
     if !dwc3_reset_host(&hw) {
+        crate::serial_println!("apple_usb: DWC3 reset failed");
         return false;
     }
     // Drive the xHCI window (DWC3 base + 0x0) with the shared xHCI core.
-    super::xhci::attach_at(hw.dwc3)
+    crate::serial_println!("apple_usb: [5] xHCI attach at dwc3 window");
+    let ok = super::xhci::attach_at(hw.dwc3);
+    crate::serial_println!("apple_usb: [6] done (hid up: {ok})");
+    ok
 }
