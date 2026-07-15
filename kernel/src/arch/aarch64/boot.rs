@@ -150,6 +150,21 @@ _start:
     add  x0, x0, :lo12:__stack_top
     mov  sp, x0
 
+    // DEBUG(bare-boot bisect): green = EL2->EL1 drop reached EL1 OK.
+    movz x2, #0x8, lsl #32
+    cmp  x21, x2
+    b.lo 91f
+    movz x2, #0x4000
+    movk x2, #0xe52d, lsl #16
+    movk x2, #0x0009, lsl #32
+    movz w4, #0xfc00
+    movk w4, #0x000f, lsl #16          // 0x000ffc00 green
+    mov  x3, #0x100000
+90: str  w4, [x2], #4
+    subs x3, x3, #1
+    b.ne 90b
+91:
+
     // PIE self-relocation: apply the R_AARCH64_RELATIVE records the `-pie` link
     // emitted, so every absolute address is correct at the *actual* load address
     // (m1n1 loads us at Apple's ~32 GiB RAM base, not the 0x40080000 link base).
@@ -180,6 +195,20 @@ _start:
 7:  dsb  sy
     isb
 
+    // DEBUG(bare-boot bisect): red = PIE relocation loop completed OK.
+    movz x2, #0x8, lsl #32
+    cmp  x21, x2
+    b.lo 93f
+    movz x2, #0x4000
+    movk x2, #0xe52d, lsl #16
+    movk x2, #0x0009, lsl #32
+    movz w4, #0x3ff0, lsl #16           // 0x3ff00000 red
+    mov  x3, #0x100000
+92: str  w4, [x2], #4
+    subs x3, x3, #1
+    b.ne 92b
+93:
+
     // Enable FP/SIMD access at EL1: CPACR_EL1.FPEN = 0b11 (bits [21:20]).
     mrs  x0, cpacr_el1
     orr  x0, x0, #(3 << 20)
@@ -195,7 +224,22 @@ _start:
     b.hs 3f
     str  xzr, [x0], #8
     b    2b
-3:  adrp x0, BOOT_X1
+3:
+    // DEBUG(bare-boot bisect): white = .bss zeroed, about to enter Rust.
+    movz x2, #0x8, lsl #32
+    cmp  x21, x2
+    b.lo 95f
+    movz x2, #0x4000
+    movk x2, #0xe52d, lsl #16
+    movk x2, #0x0009, lsl #32
+    movz w4, #0xffff
+    movk w4, #0x3fff, lsl #16           // 0x3fffffff white
+    mov  x3, #0x100000
+94: str  w4, [x2], #4
+    subs x3, x3, #1
+    b.ne 94b
+95:
+    adrp x0, BOOT_X1
     add  x0, x0, :lo12:BOOT_X1
     str  x20, [x0]
     adrp x0, BOOT_X0
