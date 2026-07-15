@@ -1040,6 +1040,17 @@ impl Xhci {
             rep: crate::keyrepeat::Typematic::new(), rep_usage: 0,
         };
         unsafe { self.queue_interrupt(&mut kbd) };
+        // Bare-Apple debug: the interrupt buffers' physical addresses + USBSTS
+        // right after arming. If HSE (bit 2) sets here, the interrupt transfer's
+        // DMA (TRB fetch from int_ring_pa or report DMA to report_pa) is what the
+        // DART faults. Apple RAM is all >32 GiB, so watch for a high/truncated PA.
+        #[cfg(target_arch = "aarch64")]
+        crate::serial_println!(
+            "usb: kbd armed int_ring_pa={:#x} report_pa={:#x} usbsts={:#010x}",
+            kbd.int_ring_pa,
+            kbd.report_pa,
+            unsafe { r32(self.op + OP_USBSTS) }
+        );
         crate::ktrace::log_fmt(format_args!("xhci: HID keyboard ready (slot {}, ep {ep_addr:#x}, dci {int_dci})", c.slot));
         Some(kbd)
     }
