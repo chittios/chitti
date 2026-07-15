@@ -250,10 +250,13 @@ pub extern "C" fn aarch64_start() -> ! {
     // first print — Apple Silicon has no PL011, so otherwise the banner would
     // write into an unbacked address and nothing would appear. No-op on QEMU.
     chitti_kernel::arch::aarch64::init_uart_apple();
+    unsafe { dbg_band(2) }; // past init_uart_apple (s5l UART MMIO discovered/configured)
     chitti_kernel::serial::init();
+    unsafe { dbg_band(3) }; // past serial::init
     serial_println!("{} -- NATIVE aarch64 on Apple Silicon (QEMU + HVF)", BOOT_MSG);
+    unsafe { dbg_band(4) }; // past the first serial_println! (writes s5l UART + fb console)
     chitti_kernel::init();
-    unsafe { dbg_band(2) }; // past chitti_kernel::init (sched/smp/exceptions/gic)
+    unsafe { dbg_band(5) }; // past chitti_kernel::init (sched/smp/exceptions/gic)
     // Bring up the framebuffer TUI. Preferred source: the **boot-info page** the
     // UEFI stub publishes at 0x47F00000 (magic "CHITTIBI") carrying the GOP
     // framebuffer — works on ANY UEFI platform (VirtualBox-ARM, UTM, real
