@@ -215,9 +215,9 @@ unsafe fn dbg_band(n: usize) {
     }
     let base = 0x9_e52d_4000usize as *mut u32;
     let slot = 7 + n;
-    let start = slot * 0x80000 / 4; // slot byte offset -> u32 index
+    let start = slot * 0x20000 / 4; // slot byte offset (0x20000 B stride) -> u32 index
     let color = [0x3fff_ffffu32, 0x0000_03ff, 0x000f_fc00][n % 3];
-    for i in 0..0x10000usize {
+    for i in 0..0x6000usize {
         // SAFETY: fixed firmware-framebuffer PA; aligned u32 writes (legal on
         // Device memory before mmu::init, Normal after).
         unsafe { core::ptr::write_volatile(base.add(start + i), color) };

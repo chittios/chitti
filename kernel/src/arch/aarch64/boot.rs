@@ -79,8 +79,9 @@ _image_start:
     .long 0                     // res5 (PE/COFF header offset; unused)
 
 // TEMP bare-boot bisect: paint a thin band of colour (clo | chi<<16) into the
-// firmware framebuffer at vertical slot `slot` (each slot 0x80000 B ~ a few rows
-// further down a 1920-wide screen). Gated to a real Apple boot by the saved FDT
+// firmware framebuffer at vertical slot `slot` (each slot 0x20000 B ~ a few rows
+// further down a 1920-wide screen; small stride so even slot 15 fits any FB).
+// Gated to a real Apple boot by the saved FDT
 // pointer in x21 (> 32 GiB); QEMU's DTB is low so every band is skipped there.
 // Stacking one band per _start sub-step turns a single serial-less bare boot into
 // a full progress ladder — the lowest band present on the monitor at reset is the
@@ -95,13 +96,13 @@ _image_start:
     movk x2, #0xe52d, lsl #16
     movk x2, #0x0009, lsl #32
     .if \slot != 0
-    add  x2, x2, #(\slot * 0x80), lsl #12
+    add  x2, x2, #(\slot * 0x20), lsl #12   // slot * 0x20000 B (fits any FB)
     .endif
     movz w4, #\clo
     .if \chi != 0
     movk w4, #\chi, lsl #16
     .endif
-    movz x3, #0x1, lsl #16          // 0x10000 px ~ 34 rows at 1920w
+    movz x3, #0x6000                // 0x6000 px band, < 0x20000 B slot stride
 .Ldbg_loop\@:
     str  w4, [x2], #4
     subs x3, x3, #1

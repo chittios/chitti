@@ -368,8 +368,8 @@ pub unsafe fn dbg_paint(slot: usize, color: u32) {
         return;
     }
     let base = 0x9_e52d_4000usize as *mut u32;
-    let start = slot * 0x80000 / 4; // slot byte offset -> u32 index
-    for i in 0..0x10000usize {
+    let start = slot * 0x20000 / 4; // slot byte offset (0x20000 B stride) -> u32 index
+    for i in 0..0x6000usize {
         // SAFETY: fixed firmware-framebuffer PA; aligned u32 writes.
         unsafe { core::ptr::write_volatile(base.add(start + i), color) };
     }
