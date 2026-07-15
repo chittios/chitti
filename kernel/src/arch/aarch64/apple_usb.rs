@@ -83,6 +83,21 @@ fn mdelay(ms: u64) {
     }
 }
 
+/// True if `needle` appears in the FDT `/chosen` `bootargs` (the m1n1 `-b`
+/// kernel command line). Used to opt into USB (`chitti.usb`).
+fn bootarg_present(needle: &[u8]) -> bool {
+    let fdt = super::boot::boot_x0();
+    // SAFETY: boot_x0 is the FDT pointer (or non-FDT, rejected by the magic).
+    if let Some(c) = unsafe { crate::fdt::chosen(fdt) } {
+        if !c.bootargs_ptr.is_null() && c.bootargs_len >= needle.len() {
+            // SAFETY: `[bootargs_ptr, +len)` is a view into the still-mapped FDT.
+            let s = unsafe { core::slice::from_raw_parts(c.bootargs_ptr, c.bootargs_len) };
+            return s.windows(needle.len()).any(|w| w == needle);
+        }
+    }
+    false
+}
+
 /// Discover the USB hardware from the boot FDT. `None` if the machine doesn't
 /// describe a `apple,*-dwc3` (e.g. QEMU) — a clean skip.
 fn discover() -> Option<UsbHw> {
@@ -168,6 +183,16 @@ fn dwc3_reset_host(hw: &UsbHw) -> bool {
 /// enumeration may not yet succeed.
 pub fn init() -> bool {
     if !super::is_apple() {
+        return false;
+    }
+    // USB is OFF by default and must be opted into with the `chitti.usb` bootarg.
+    // Rationale (learned on hardware): the dwc3/DART/ATC MMIO we drive is the
+    // SAME USB controller the m1n1 **hypervisor** uses for the proxy console, so
+    // resetting it under the hv debug path (CHITTI_M1N1_HV=1) kills the console
+    // (proxy "Device not configured"). Enable it only on a **bare** boot for
+    // hardware testing: `make m1n1 CHITTI_BOOTARGS="chitti.usb"` (no hv).
+    if !bootarg_present(b"chitti.usb") {
+        crate::ktrace::log("apple_usb", "USB HID gated (add `chitti.usb` bootarg on a BARE boot to enable; never under the hv)");
         return false;
     }
     let Some(hw) = discover() else {
