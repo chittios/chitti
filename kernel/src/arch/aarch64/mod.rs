@@ -383,10 +383,15 @@ pub fn init_uart_apple() {
     unsafe { dbg_paint(9, 0x3fff_ffff) }; // slot 9 white: entered init_uart_apple
     // SAFETY: `boot_x0` is the FDT pointer (or non-FDT, rejected by the magic).
     let is_apple = unsafe { crate::fdt::has_compatible(fdt, b"apple,arm-platform") };
-    unsafe { dbg_paint(10, 0x0000_03ff) }; // slot 10 blue: past has_compatible
+    unsafe { dbg_paint(10, 0x0000_03ff) }; // slot 10 blue: past has_compatible(arm-platform, root)
     IS_APPLE.store(is_apple, Ordering::Relaxed);
+    // Discriminator: has_compatible walks to the s5l-uart node at the same depth
+    // as reg_of_compatible but WITHOUT the reg/cell decode. If this paints but the
+    // next doesn't, the fault is reg_of_compatible's reg logic, not the walk.
+    let _has_uart = unsafe { crate::fdt::has_compatible(fdt, b"apple,s5l-uart") };
+    unsafe { dbg_paint(11, 0x000f_fc00) }; // slot 11 green: past has_compatible(s5l-uart) walk
     let uart = unsafe { crate::fdt::reg_of_compatible(fdt, b"apple,s5l-uart") };
-    unsafe { dbg_paint(11, 0x000f_fc00) }; // slot 11 green: past reg_of_compatible
+    unsafe { dbg_paint(12, 0x3fff_ffff) }; // slot 12 white: past reg_of_compatible
     if let Some((base, _size)) = uart {
         mmu::map_device_gib(base);
         UART_BASE.store(base as usize, Ordering::Relaxed);

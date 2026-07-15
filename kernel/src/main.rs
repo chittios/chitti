@@ -261,13 +261,14 @@ pub extern "C" fn aarch64_start() -> ! {
     // write into an unbacked address and nothing would appear. No-op on QEMU.
     // init_uart_apple paints its own internal bands (slots 9/10/11) so a fault in
     // map_device_gib / ktrace is localized without reaching back into main.rs.
+    // init_uart_apple paints its own internal bands (slots 9/10/11/12).
     chitti_kernel::arch::aarch64::init_uart_apple();
     chitti_kernel::serial::init();
-    unsafe { dbg_band(5) }; // slot 12: past serial::init
+    unsafe { dbg_band(6) }; // slot 13: past serial::init
     serial_println!("{} -- NATIVE aarch64 on Apple Silicon (QEMU + HVF)", BOOT_MSG);
-    unsafe { dbg_band(6) }; // slot 13: past the first serial_println! (writes s5l UART + fb console)
+    unsafe { dbg_band(7) }; // slot 14: past the first serial_println! (writes s5l UART + fb console)
     chitti_kernel::init();
-    unsafe { dbg_band(7) }; // slot 14: past chitti_kernel::init (sched/smp/exceptions/gic)
+    unsafe { dbg_band(8) }; // slot 15: past chitti_kernel::init (sched/smp/exceptions/gic)
     // Bring up the framebuffer TUI. Preferred source: the **boot-info page** the
     // UEFI stub publishes at 0x47F00000 (magic "CHITTIBI") carrying the GOP
     // framebuffer — works on ANY UEFI platform (VirtualBox-ARM, UTM, real
