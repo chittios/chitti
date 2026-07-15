@@ -217,6 +217,31 @@ fn dma_barrier() {
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 
+/// Invalidate the CPU cache over `[va, va+len)` so a re-read of a buffer the
+/// controller DMA-wrote sees fresh data on a **non-coherent** DMA host (real
+/// Apple DWC3). Coherent hosts (QEMU, x86) already snoop, so this is just a
+/// forced reload there — harmless. Uses `dc civac` (clean+invalidate to PoC);
+/// we never dirty controller-written buffers, so nothing is lost. Call it
+/// *before* reading a same-address buffer the device rewrites in place (the HID
+/// report buffer, the event ring TRBs).
+#[inline]
+fn dma_invalidate(va: usize, len: usize) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: cache maintenance over a mapped Normal-memory DMA buffer.
+    unsafe {
+        const LINE: usize = 64; // Apple/ARM64 cache line
+        let mut p = va & !(LINE - 1);
+        let end = va + len;
+        while p < end {
+            core::arch::asm!("dc civac, {}", in(reg) p, options(nostack, preserves_flags));
+            p += LINE;
+        }
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = (va, len);
+}
+
 /// Crude busy-wait (~`iters` volatile reads); used for the USB reset-recovery
 /// settle where we have no timer in the arch-neutral core. Order of a few ms.
 fn spin_delay(iters: u64) {
@@ -435,6 +460,10 @@ impl Xhci {
     /// Consume the next event TRB if one is ready (cycle bit matches), updating
     /// the dequeue pointer + ERDP. Non-blocking.
     unsafe fn next_event(&mut self) -> Option<Trb> {
+        // Non-coherent DMA (real Apple): invalidate this TRB slot so we observe
+        // the controller's write rather than a stale cached line (the ring wraps,
+        // so a given slot is re-read across cycles).
+        dma_invalidate(self.evt_ring_va + self.evt_dequeue * 16, 16);
         let trb = unsafe { read_volatile((self.evt_ring_va + self.evt_dequeue * 16) as *const Trb) };
         if (trb.control & 1) != self.evt_cycle {
             return None;
@@ -1114,6 +1143,9 @@ impl Xhci {
                 let dci = ((ev.control >> 16) & 0x1f) as u8;
                 if let Some(k) = kbd.as_mut() {
                     if k.slot == slot && k.int_dci == dci {
+                        // Non-coherent DMA (real Apple): drop the stale cached
+                        // copy so we read the report the controller just wrote.
+                        dma_invalidate(k.report_va, 8);
                         let mut report = [0u8; 8];
                         for (i, b) in report.iter_mut().enumerate() {
                             *b = read_volatile((k.report_va + i) as *const u8);
@@ -1174,6 +1206,7 @@ impl Xhci {
                 if let Some(m) = mouse.as_mut() {
                     if m.slot == slot && m.int_dci == dci {
                         let n = (m.report_len as usize).min(16);
+                        dma_invalidate(m.report_va, n);
                         let mut rep = [0u8; 16];
                         for (i, b) in rep.iter_mut().enumerate().take(n) {
                             *b = read_volatile((m.report_va + i) as *const u8);
