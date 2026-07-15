@@ -133,6 +133,9 @@ struct Ptr {
     report_va: usize,
     report_len: u32,
     layout: PtrLayout,
+    /// Countdown: log the first N raw reports (+ decoded X/Y) so a mis-parsed
+    /// layout (byte-offset model can't express 12-bit fields) is diagnosable.
+    dbg: u8,
 }
 
 /// Where the fields sit in a pointer's input report, parsed from its HID report
@@ -1267,6 +1270,11 @@ impl Xhci {
             let got = unsafe {
                 self.control(c.slot, c.ep0_va, c.ep0_pa, &mut c.ep0_enq, &mut c.ep0_cycle, setup(0x81, 6, 0x2200, iface as u16, rdlen), c.buf_pa, (rdlen as u32).min(4096), true)
             };
+            // Dump the raw report descriptor so a mis-parsed pointer layout can be
+            // fixed exactly (and turned into a unit-test fixture).
+            if got {
+                unsafe { dump_hid_descriptor(c.buf_va, (rdlen as usize).min(256)) };
+            }
             (got.then(|| unsafe { parse_report_layout(c.buf_va, (rdlen as usize).min(4096)) }).flatten())
                 // Fallback: the common absolute tablet report [buttons, X:u16, Y:u16].
                 .unwrap_or(PtrLayout { btn_byte: 0, x_byte: 1, y_byte: 3, field_bytes: 2, relative: false, scale_max: 0x7fff, wheel_byte: None })
@@ -1278,6 +1286,7 @@ impl Xhci {
             int_enqueue: 0, int_cycle: 1, report_pa, report_va,
             report_len: ep_mps.clamp(4, 16),
             layout,
+            dbg: 24,
         };
         unsafe {
             self.arm_int(ptr.int_ring_va, ptr.int_ring_pa, &mut ptr.int_enqueue, &mut ptr.int_cycle, ptr.report_pa, ptr.report_len, ptr.slot, ptr.int_dci);
@@ -1486,6 +1495,13 @@ impl Xhci {
                             }
                         };
                         let (x, y) = (field(lo.x_byte), field(lo.y_byte));
+                        if m.dbg > 0 {
+                            m.dbg -= 1;
+                            crate::ktrace::log_fmt(format_args!(
+                                "xhci: ptr report [{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] xraw={x} yraw={y}",
+                                rep[0], rep[1], rep[2], rep[3], rep[4], rep[5], rep[6], rep[7]
+                            ));
+                        }
                         if lo.relative {
                             let sext = |v: u32| if lo.field_bytes >= 2 { v as u16 as i16 as i32 } else { v as u8 as i8 as i32 };
                             crate::mouse::move_rel(sext(x), sext(y));
@@ -1547,6 +1563,31 @@ impl Xhci {
     /// pointer). Shares the event drain with `poll_key`.
     pub fn poll_mouse(&mut self) {
         self.pump_events();
+    }
+}
+
+/// Hex-dump a HID report descriptor to the trace (16 bytes/line) so a
+/// mis-parsed pointer layout can be diagnosed + turned into a test fixture.
+///
+/// # Safety
+/// `buf` must be a readable buffer of at least `len` bytes.
+unsafe fn dump_hid_descriptor(buf: usize, len: usize) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    crate::ktrace::log_fmt(format_args!("xhci: HID report descriptor {len} bytes:"));
+    let mut i = 0;
+    while i < len {
+        let n = (len - i).min(16);
+        let mut s = [0u8; 48];
+        let mut p = 0;
+        for k in 0..n {
+            let b = unsafe { read_volatile((buf + i + k) as *const u8) };
+            s[p] = HEX[(b >> 4) as usize];
+            s[p + 1] = HEX[(b & 0xf) as usize];
+            s[p + 2] = b' ';
+            p += 3;
+        }
+        crate::ktrace::log_fmt(format_args!("  {}", core::str::from_utf8(&s[..p]).unwrap_or("?")));
+        i += n;
     }
 }
 

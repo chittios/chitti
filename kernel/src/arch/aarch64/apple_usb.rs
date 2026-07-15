@@ -248,6 +248,10 @@ pub fn init() -> bool {
         crate::ktrace::log("apple_usb", "USB HID gated (add `chitti.usb` bootarg on a BARE boot to enable; never under the hv)");
         return false;
     }
+    // Bare Apple boot has no serial and the ktrace/logs pane is closed (and needs
+    // the keyboard we're bringing up to open), so mirror every bring-up trace to
+    // the always-visible chat pane for this debug session.
+    crate::ktrace::set_console_echo(true);
     // Bring up EVERY controller and keep them all live — the Mac mini has two
     // dwc3 controllers (one per Type-C port) and a keyboard-on-one +
     // mouse-on-the-other must both work, so we must not stop at the first that

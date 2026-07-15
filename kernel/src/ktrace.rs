@@ -13,9 +13,22 @@
 //! analysis.
 
 use core::fmt::{Arguments, Write};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// When set, every trace line ALSO mirrors to the framebuffer **chat** pane (not
+/// just the logs pane). The logs pane is closed at boot and needs a keyboard to
+/// open, so on a bare Apple boot — where we are bringing up that very keyboard
+/// and have no serial — this is the only way to SEE driver diagnostics. Enabled
+/// by `apple_usb` when the `chitti.usb` debug bootarg is present; off everywhere
+/// else, so the normal tmux-style chat|logs split is unchanged.
+static CONSOLE_ECHO: AtomicBool = AtomicBool::new(false);
+
+/// Mirror trace to the chat pane too (see [`CONSOLE_ECHO`]).
+pub fn set_console_echo(on: bool) {
+    CONSOLE_ECHO.store(on, Ordering::Relaxed);
+}
 
 fn next_seq() -> u64 {
     SEQUENCE.fetch_add(1, Ordering::SeqCst)
@@ -52,7 +65,13 @@ impl Write for LogSink {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         crate::serial::write_str_raw(s);
         #[cfg(not(test))]
-        crate::framebuffer::log_print(s);
+        {
+            crate::framebuffer::log_print(s);
+            // Bare-Apple driver bring-up: also echo to the visible chat pane.
+            if CONSOLE_ECHO.load(Ordering::Relaxed) {
+                crate::framebuffer::console_print(s);
+            }
+        }
         Ok(())
     }
 }
