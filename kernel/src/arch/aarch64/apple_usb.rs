@@ -269,6 +269,23 @@ pub fn init() -> bool {
     // Drive the xHCI window (DWC3 base + 0x0) with the shared xHCI core.
     crate::serial_println!("apple_usb: [5] xHCI attach at dwc3 window");
     let ok = super::xhci::attach_at(hw.dwc3);
+    // Port status (visible): did either root port detect a device? CCS=connect,
+    // PP=port power, PLS=link state, speed. CCS=0 on both means no device reached
+    // this controller (wrong dwc3, or Type-C Vbus/orientation not enabled).
+    let caplen = (r32(hw.dwc3, 0) & 0xff) as usize;
+    let op = hw.dwc3 + caplen;
+    for p in 0..2usize {
+        let psc = r32(op, 0x400 + p * 0x10);
+        crate::serial_println!(
+            "apple_usb: port {} PORTSC={psc:#010x} CCS={} PED={} PP={} PLS={} speed={}",
+            p + 1,
+            psc & 1,
+            (psc >> 1) & 1,
+            (psc >> 9) & 1,
+            (psc >> 5) & 0xf,
+            (psc >> 10) & 0xf
+        );
+    }
     crate::serial_println!("apple_usb: [6] done (hid up: {ok})");
     ok
 }
