@@ -40,6 +40,7 @@ const GCTL_DISSCRAMBLE: u32 = 1 << 3;
 const GCTL_SCALEDOWN_MASK: u32 = 0b11 << 4;
 const GCTL_PRTCAPDIR_SHIFT: u32 = 12; // bits[13:12]
 const GCTL_PRTCAP_HOST: u32 = 1; // (DEVICE=2, OTG=3)
+const DWC3_GSTS: usize = 0xc118;
 const DWC3_GUSB2PHYCFG0: usize = 0xc200;
 const DWC3_GUSB3PIPECTL0: usize = 0xc2c0;
 const PHYCFG_PHYSOFTRST: u32 = 1 << 31;
@@ -182,6 +183,35 @@ fn dwc3_reset_host(hw: &UsbHw) -> bool {
     true
 }
 
+/// Dump the DWC3 global + xHCI capability/operational registers to the chat pane
+/// (visible on a bare boot). Read-only observation to understand why the xHCI
+/// controller won't reach ready. xHCI caps are at `dwc3 + 0`; the op regs at
+/// `dwc3 + CAPLENGTH`. GCTL bit[13:12] = PRTCAPDIR (1=host). GSTS[1:0] = current
+/// mode. xHCI HCSPARAMS1: slots[7:0], ports[31:24]. USBSTS bit11 = CNR.
+fn dump_state(hw: &UsbHw) {
+    let gsnpsid = r32(hw.dwc3, DWC3_GSNPSID);
+    let gctl = r32(hw.dwc3, DWC3_GCTL);
+    let gsts = r32(hw.dwc3, DWC3_GSTS);
+    let u2 = r32(hw.dwc3, DWC3_GUSB2PHYCFG0);
+    let u3 = r32(hw.dwc3, DWC3_GUSB3PIPECTL0);
+    crate::serial_println!(
+        "apple_usb: DWC3 id={gsnpsid:#x} gctl={gctl:#x} (prtcap={}) gsts={gsts:#x} u2phy={u2:#x} u3pipe={u3:#x}",
+        (gctl >> 12) & 0x3
+    );
+    let caplen = r32(hw.dwc3, 0) & 0xff;
+    let hcs1 = r32(hw.dwc3, 0x04);
+    let hcc1 = r32(hw.dwc3, 0x10);
+    let op = hw.dwc3 + caplen as usize;
+    let usbsts = r32(op, 0x04);
+    let usbcmd = r32(op, 0x00);
+    crate::serial_println!(
+        "apple_usb: xHCI caplen={caplen:#x} slots={} ports={} hcc1={hcc1:#x} usbcmd={usbcmd:#x} usbsts={usbsts:#x} (CNR={})",
+        hcs1 & 0xff,
+        (hcs1 >> 24) & 0xff,
+        (usbsts >> 11) & 1
+    );
+}
+
 /// Bring up USB HID (keyboard/mouse) on Apple Silicon. No-op (returns false) off
 /// Apple or when the FDT has no dwc3. Best-effort + graceful: any failure logs
 /// and returns false, never faults. See the module status note on why
@@ -233,6 +263,8 @@ pub fn init() -> bool {
         crate::serial_println!("apple_usb: DWC3 reset failed");
         return false;
     }
+    // Observe the controller state before handing off to the xHCI core.
+    dump_state(&hw);
     // Drive the xHCI window (DWC3 base + 0x0) with the shared xHCI core.
     crate::serial_println!("apple_usb: [5] xHCI attach at dwc3 window");
     let ok = super::xhci::attach_at(hw.dwc3);
