@@ -1178,14 +1178,13 @@ impl Xhci {
         {
             use core::sync::atomic::Ordering;
             usbdbg::PUMPS.fetch_add(1, Ordering::Relaxed);
-            let now = crate::arch::now_ms();
-            if now >= usbdbg::NEXT_HB.load(Ordering::Relaxed) {
-                usbdbg::NEXT_HB.store(now + 3000, Ordering::Relaxed);
-                crate::serial_println!(
-                    "usb: pump-hb pumps={} events={} (press keys → events should rise)",
-                    usbdbg::PUMPS.load(Ordering::Relaxed),
-                    usbdbg::EVENTS.load(Ordering::Relaxed)
-                );
+            // Quiet: only speak when the total event count CHANGES (e.g. a key
+            // press posts a transfer event), so the one-time enumeration lines
+            // stay on screen. NEXT_HB doubles as "last events value printed".
+            let ev = usbdbg::EVENTS.load(Ordering::Relaxed);
+            if ev != usbdbg::NEXT_HB.load(Ordering::Relaxed) {
+                usbdbg::NEXT_HB.store(ev, Ordering::Relaxed);
+                crate::serial_println!("usb: xhci events={ev}");
             }
         }
         let mut kbd = self.kbd.take();
