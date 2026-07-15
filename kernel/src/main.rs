@@ -271,16 +271,11 @@ pub extern "C" fn aarch64_start() -> ! {
             "isb",
             out("x9") _,
         );
-        // Read CPACR_EL1 back: slot 22 green if FPEN[21:20]==0b11, red otherwise.
-        let cpacr: u64;
-        core::arch::asm!("mrs {c}, cpacr_el1", c = out(reg) cpacr);
-        let fpen_ok = (cpacr & 0x30_0000) == 0x30_0000;
-        chitti_kernel::arch::aarch64::dbg_paint(22, if fpen_ok { 0x000f_fc00 } else { 0x3ff0_0000 });
-        // Does FP work RIGHT HERE (before mmu::init)? slot 19 = FP ok post-enable.
-        let f = core::hint::black_box(1.0f32) + core::hint::black_box(2.0f32);
-        core::hint::black_box(f);
-        chitti_kernel::arch::aarch64::dbg_paint(19, 0x000f_fc00);
     }
+    // NB: no FP/SIMD before mmu::init -- with the MMU off all memory is
+    // Device-typed, and Apple cores fault FP loads/stores (register spills) to
+    // Device memory even when FP itself is enabled. reg_of_compatible et al. run
+    // after mmu::init (Normal memory), so their NEON is fine.
     // The boot stub (arch::aarch64::boot) already set the stack, enabled NEON,
     // and zeroed BSS. Enable the MMU *first* -- with it off, RAM is Device
     // memory where the LL/SC exclusives that back `Locked`/atomics never
@@ -288,7 +283,7 @@ pub extern "C" fn aarch64_start() -> ! {
     // `Locked` framebuffer console, so even the banner needs normal memory.
     chitti_kernel::arch::aarch64::mmu::init();
     unsafe { dbg_band(1) }; // past mmu::init (MMU + identity map on)
-    // Does FP still work AFTER mmu::init? slot 20 = FP ok post-MMU-enable.
+    // FP works now (MMU on -> Normal memory). slot 20 confirms.
     #[cfg(target_arch = "aarch64")]
     unsafe {
         let f = core::hint::black_box(1.0f32) + core::hint::black_box(2.0f32);
