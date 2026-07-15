@@ -553,6 +553,11 @@ fn cmd_m1n1(release: bool) -> Result<(), String> {
             // keeps the USB console alive and traps/forwards the guest UART),
             // then run the combined blob as the guest. The inner m1n1 does the
             // FDT prep and boots ChittiOS; the outer m1n1 lets us SEE it.
+            // Optional host-side capture of the forwarded serial console to a
+            // logfile (CHITTI_SERIAL_LOG=<path>), so driver bring-up is readable
+            // after the fact without a human watching the framebuffer.
+            let serial_log = env::var("CHITTI_SERIAL_LOG").ok().filter(|p| !p.is_empty());
+            let serial_log = serial_log.as_deref().map(Path::new);
             let hv = env::var("CHITTI_M1N1_HV").map(|v| v == "1" || v == "true").unwrap_or(false);
             if hv {
                 let m1n1bin = Path::new(&m1n1).join("build/m1n1.bin");
@@ -584,7 +589,7 @@ fn cmd_m1n1(release: bool) -> Result<(), String> {
                 println!("m1n1(hv): chainloading a fresh m1n1 as the resident hypervisor…");
                 run(Command::new(&python).arg(&chainload).arg("-r").arg(&m1n1bin))?;
                 println!("m1n1(hv): starting the ChittiOS guest under the hypervisor (console stays live)…");
-                return run(Command::new(&python).arg(&runguest).arg("-r").arg(&combined));
+                return run_tee(Command::new(&python).arg(&runguest).arg("-r").arg(&combined), serial_log);
             }
 
             let mut c = Command::new(&python);
@@ -606,12 +611,13 @@ fn cmd_m1n1(release: bool) -> Result<(), String> {
                 }
             }
             println!("m1n1: booting over the proxy ({:?})…", c);
-            run(&mut c)
+            run_tee(&mut c, serial_log)
         }
         _ => {
             println!(
                 "m1n1: to boot on hardware, set CHITTI_M1N1 (+ CHITTI_DTB, optional \
-                 CHITTI_INITRD/CHITTI_BOOTARGS, M1N1DEVICE), or run manually:\n  \
+                 CHITTI_INITRD/CHITTI_BOOTARGS, M1N1DEVICE; CHITTI_SERIAL_LOG=<path> \
+                 tees the serial console to a logfile), or run manually:\n  \
                  M1N1DEVICE=/dev/cu.usbmodemXXX <m1n1>/.venv/bin/python \
                  <m1n1>/proxyclient/tools/linux.py \
                  {} <machine.dtb> [initramfs] -b \"chitti.epoch=<unix-secs>\"\n  \
@@ -1238,6 +1244,48 @@ fn run(cmd: &mut Command) -> Result<(), String> {
     let status = cmd
         .status()
         .map_err(|e| format!("failed to spawn {cmd:?}: {e}"))?;
+    if !status.success() {
+        return Err(format!("command failed ({status}): {cmd:?}"));
+    }
+    Ok(())
+}
+
+/// Spawn `cmd`, mirroring its stdout to BOTH this terminal and (when `log` is
+/// `Some`) an append-to-fresh logfile — so a Mac-mini boot's forwarded serial
+/// console is captured to a host file an agent can read afterwards. This is what
+/// makes bare-metal driver bring-up self-serve: add `ktrace`/`serial_println!`
+/// lines to a driver, boot once, and read the log instead of a human relaying
+/// the framebuffer. Works for both the m1n1-hypervisor path (m1n1 forwards the
+/// guest VUART to stdout) and the bare `linux.py -t <D3>` path (the payload's
+/// own s5l UART, bridged over the `_03` USB serial device). stdin/stderr are
+/// inherited, so serial input + Python errors still flow. `PYTHONUNBUFFERED`
+/// keeps linux.py from withholding lines once its stdout is a pipe, not a TTY.
+fn run_tee(cmd: &mut Command, log: Option<&Path>) -> Result<(), String> {
+    use std::process::Stdio;
+    let Some(path) = log else { return run(cmd) };
+    let mut file =
+        fs::File::create(path).map_err(|e| format!("create serial log {}: {e}", path.display()))?;
+    println!("xtask: capturing serial console -> {}", path.display());
+    cmd.env("PYTHONUNBUFFERED", "1").stdout(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn {cmd:?}: {e}"))?;
+    let mut out = child.stdout.take().ok_or("child produced no stdout pipe")?;
+    let stdout = std::io::stdout();
+    let mut buf = [0u8; 4096];
+    loop {
+        match out.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let mut lock = stdout.lock();
+                let _ = lock.write_all(&buf[..n]);
+                let _ = lock.flush();
+                // Persist immediately — a hang leaves the last line already on disk.
+                let _ = file.write_all(&buf[..n]);
+                let _ = file.flush();
+            }
+            Err(e) => return Err(format!("reading serial console: {e}")),
+        }
+    }
+    let status = child.wait().map_err(|e| format!("waiting for {cmd:?}: {e}"))?;
     if !status.success() {
         return Err(format!("command failed ({status}): {cmd:?}"));
     }

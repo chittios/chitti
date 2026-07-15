@@ -48,28 +48,44 @@ Practical implication: the two **USB-A** ports on the Mac mini may be simpler
 (no Type-C orientation), but they still sit behind the same dwc3/ATC path and
 need host-mode PHY. Start there for testing.
 
-## How to test on hardware (the catch-22)
+## How to test on hardware — with a host-captured serial log
 
-**The m1n1 *hypervisor* debug path removes USB from the guest** — the hv boot
-log shows `Removing ADT node /arm-io/dart-usb0`, `atc-phy0`, `usb-drd0`. So USB
-is *only* available on a **bare** `linux.py` boot (no hv), which has **no serial
-console** (m1n1 tears the USB proxy down at handoff). But on a bare boot the
-**framebuffer works** (the FDT simple-framebuffer), so:
+A **wired USB keyboard on a USB-C port works today** (dual-DART translation +
+non-coherent DMA maintenance, commit `6838562`). USB-A ports (internal hub) and
+Type-C orientation (cd321x PD controller) are still pending, so for now use a
+**USB-C** port.
 
-- **Debug over the display, not serial.** ChittiOS's `apple_usb`/`dart` steps
-  all `ktrace`, which also render in the framebuffer console. On a bare boot,
-  watch the Mac's monitor for the `apple_usb:` / `dart:` / `xhci(apple):` lines
-  and where it stops.
-- Bare boot (no `CHITTI_M1N1_HV`, no `-t`):
+**The m1n1 *hypervisor* path removes USB from the guest** (`Removing ADT node
+/arm-io/dart-usb0`, `atc-phy0`, `usb-drd0`), so USB work must run on a **bare**
+`linux.py` boot. A bare boot does still have serial: the payload writes its own
+**s5l UART**, bridged to the host over the `_03` USB serial device
+(`/dev/cu.usbmodem…D3`). Point `linux.py` at it with `-t` (`CHITTI_M1N1_TTY`)
+and tee it to a file with **`CHITTI_SERIAL_LOG`** — every `ktrace`/panic line
+lands in that file, so driver bring-up no longer needs a human reading the
+monitor.
+
+- Bare boot with a captured serial log:
   ```sh
   CHITTI_M1N1=third_party/m1n1 CHITTI_DTB=third_party/dtb/t8112-j473.dtb \
   M1N1DEVICE=/dev/cu.usbmodemXXXXD1 \
+  CHITTI_M1N1_TTY=/dev/cu.usbmodemXXXXD3 \
+  CHITTI_SERIAL_LOG=target/serial.log \
   make m1n1 RELEASE=1
   ```
-  Then read the Mac's screen. Plug a **USB-A keyboard** in before/at boot.
-- Iterating on the PHY/PD work will need this loop plus, ideally, a physical
-  UART cable to the Mac's debug UART for real serial logs (the s5l console is on
-  hardware pins; the hv VUART is unavailable on a bare boot).
+  Plug the USB keyboard into a **USB-C** port before/at boot, then read
+  `target/serial.log` for the `apple_usb:` / `dart:` / `xhci(apple):` /
+  `xhci: …` lines and where it stops. The log is flushed line-by-line, so even a
+  hang leaves its last line on disk.
+- **Under the hv** (for non-USB drivers — PCIe, storage, AIC, SMP), the same
+  `CHITTI_SERIAL_LOG` captures m1n1's forwarded guest VUART:
+
+  ```sh
+  CHITTI_M1N1_HV=1 CHITTI_SERIAL_LOG=target/serial.log make m1n1 RELEASE=1
+  ```
+
+- Since `ktrace` is synchronous (spins on TX-empty, no buffering), the last line
+  before a fault/hang is always the true failure point — add `ktrace::log_fmt`
+  liberally when bringing up a driver and read them back from the logfile.
 
 ## If DART bypass is wrong
 
