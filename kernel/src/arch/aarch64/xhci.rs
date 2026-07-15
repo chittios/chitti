@@ -22,9 +22,9 @@ const DART_PAGE: usize = 0x4000; // 16 KiB DART page
 /// controller emit the high PA itself, faults the periodic interrupt transfer
 /// (Host System Error) even though enumeration's control transfers survive it.
 struct UsbDma {
-    dart_base: usize,
-    dart_sid: u32,
-    l2_va: usize,   // 2048-entry L2 table (16 KiB), maps IOVA 0..32 MiB
+    darts: [(usize, u32); 2], // (base, sid) — all the controller's DARTs
+    ndarts: usize,
+    l2_va: usize,   // shared 2048-entry L2 table (16 KiB), maps IOVA 0..32 MiB
     next_iova: u64, // bump, 16 KiB pages
 }
 static USB_DMA: Locked<Option<UsbDma>> = Locked::new(None);
@@ -48,7 +48,10 @@ fn dcache_clean(va: usize, len: usize) {
 /// (one L1 + one L2, covering IOVA 0..32 MiB), point the DART at it, and record
 /// state for [`aa_alloc_apple`]. Call before [`attach_at`]. Returns false on
 /// allocation failure or a locked DART.
-pub fn dma_translate_setup(dart_base: usize, dart_sid: u32) -> bool {
+pub fn dma_translate_setup(darts: &[(usize, u32)]) -> bool {
+    if darts.is_empty() {
+        return false;
+    }
     let Ok(layout) = Layout::from_size_align(DART_PAGE, DART_PAGE) else { return false };
     // SAFETY: nonzero 16 KiB layout; leaked, used as DART page tables.
     let l1 = unsafe { alloc_zeroed(layout) } as usize;
@@ -62,13 +65,22 @@ pub fn dma_translate_setup(dart_base: usize, dart_sid: u32) -> bool {
     // SAFETY: l1 is a fresh 16 KiB table.
     unsafe { write_volatile(l1 as *mut u64, dart::make_pte(l2_pa)) };
     dcache_clean(l1, 8);
-    // SAFETY: dart_base is the Device-mapped DART; sid from the FDT.
-    let dart = unsafe { Dart::new(dart_base, dart_sid) };
-    if !dart.set_translate(l1_pa) {
-        return false;
+    // Point EVERY DART at the SAME L1 table (mirrored translation): the dwc3
+    // DMAs through all its DARTs, so any one left unconfigured faults.
+    let mut saved = [(0usize, 0u32); 2];
+    let mut n = 0;
+    for &(base, sid) in darts.iter().take(saved.len()) {
+        // SAFETY: base is the Device-mapped DART; sid from the FDT.
+        let dart = unsafe { Dart::new(base, sid) };
+        if !dart.set_translate(l1_pa) {
+            crate::serial_println!("apple_usb: DART {base:#x} sid {sid} set_translate failed");
+            return false;
+        }
+        saved[n] = (base, sid);
+        n += 1;
     }
-    USB_DMA.with(|s| *s = Some(UsbDma { dart_base, dart_sid, l2_va: l2, next_iova: DART_PAGE as u64 }));
-    crate::serial_println!("apple_usb: DART translate ready (l1={l1_pa:#x} l2={l2_pa:#x})");
+    USB_DMA.with(|s| *s = Some(UsbDma { darts: saved, ndarts: n, l2_va: l2, next_iova: DART_PAGE as u64 }));
+    crate::serial_println!("apple_usb: DART translate ready ({n} darts, l1={l1_pa:#x} l2={l2_pa:#x})");
     true
 }
 
@@ -100,8 +112,11 @@ fn aa_alloc_apple(bytes: usize) -> Option<(u64, usize)> {
         }
         dcache_clean(d.l2_va, DART_PAGE); // publish the PTEs to the DART walker
         d.next_iova += (pages * DART_PAGE) as u64;
-        // SAFETY: base/sid recorded at setup; flush so the new IOVAs are live.
-        unsafe { Dart::new(d.dart_base, d.dart_sid) }.flush_tlb();
+        // Flush every DART's TLB so the new IOVAs are live in all of them.
+        for &(base, sid) in &d.darts[..d.ndarts] {
+            // SAFETY: base/sid recorded at setup.
+            unsafe { Dart::new(base, sid) }.flush_tlb();
+        }
         Some((iova, va))
     })
 }

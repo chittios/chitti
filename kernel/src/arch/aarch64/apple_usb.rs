@@ -57,13 +57,15 @@ const PIPEHANDLER_AON_GEN_DWC3_RESET_N: u32 = 1 << 0;
 const PIPEHANDLER_NONSELECTED_OVERRIDE: usize = 0x20;
 const PIPEHANDLER_NONSELECTED_VALUE: u32 = 0x9332;
 
-/// Discovered USB register bases + the DART stream, from the FDT.
+/// Discovered USB register bases + the DART stream(s), from the FDT.
 struct UsbHw {
     dwc3: usize,        // DWC3 core (xHCI window at +0x0 in host mode)
     atc: usize,         // ATC PHY "core"
     pipehandler: usize, // ATC PHY "pipehandler"
-    dart_base: usize,   // the DART the controller DMAs through
-    dart_sid: u32,      // its stream id (from `iommus`)
+    // The dwc3 DMAs through *all* its `iommus` DARTs (Apple mirrors the same
+    // mapping across them); the Mac mini's dwc3 lists two. `(base, sid)` each.
+    darts: [(usize, u32); 2],
+    ndarts: usize,
 }
 
 #[inline]
@@ -115,22 +117,30 @@ fn discover(idx: usize) -> Option<UsbHw> {
         .or_else(|| unsafe { crate::fdt::reg_of_nth_node(fdt, b"apple,t8103-atcphy", idx, 0) })?;
     let (pipehandler, _) = unsafe { crate::fdt::reg_of_nth_node(fdt, b"apple,t8112-atcphy", idx, 4) }
         .or_else(|| unsafe { crate::fdt::reg_of_nth_node(fdt, b"apple,t8103-atcphy", idx, 4) })?;
-    // DART: the idx-th dwc3's `iommus = <&dart0 SID0 &dartUSB SID1>`; the USB DMA
-    // DART is the last pair.
+    // DART(s): the idx-th dwc3's `iommus = <&dart0 SID0>, <&dart1 SID1>` — pairs
+    // of (phandle, stream-id). The controller DMAs through ALL of them, so
+    // capture every pair (the Mac mini's dwc3 has two).
     let mut cells = [0u32; 8];
     let mut n = unsafe { crate::fdt::prop_cells_of_nth_node(fdt, b"apple,t8112-dwc3", idx, b"iommus", &mut cells) };
     if n == 0 {
         n = unsafe { crate::fdt::prop_cells_of_nth_node(fdt, b"apple,t8103-dwc3", idx, b"iommus", &mut cells) };
     }
-    let (dart_base, dart_sid) = if n >= 2 {
-        let phandle = cells[n - 2];
-        let sid = cells[n - 1];
-        let (base, _) = unsafe { crate::fdt::reg_by_phandle(fdt, phandle) }?;
-        (base as usize, sid)
-    } else {
+    let mut darts = [(0usize, 0u32); 2];
+    let mut ndarts = 0;
+    let mut i = 0;
+    while i + 1 < n && ndarts < darts.len() {
+        let phandle = cells[i];
+        let sid = cells[i + 1];
+        if let Some((base, _)) = unsafe { crate::fdt::reg_by_phandle(fdt, phandle) } {
+            darts[ndarts] = (base as usize, sid);
+            ndarts += 1;
+        }
+        i += 2;
+    }
+    if ndarts == 0 {
         return None;
-    };
-    Some(UsbHw { dwc3: dwc3 as usize, atc: atc as usize, pipehandler: pipehandler as usize, dart_base, dart_sid })
+    }
+    Some(UsbHw { dwc3: dwc3 as usize, atc: atc as usize, pipehandler: pipehandler as usize, darts, ndarts })
 }
 
 /// Replay m1n1's USB2 PHY + pipehandler bring-up (`usb.c:usb_phy_bringup`). The
@@ -221,21 +231,24 @@ fn dump_state(hw: &UsbHw) {
 /// the chat pane (visible on a bare boot; the ktrace pane is closed at boot).
 fn bringup_controller(idx: usize, hw: &UsbHw) -> bool {
     crate::serial_println!(
-        "apple_usb: === controller {idx}: dwc3={:#x} atc={:#x} pipe={:#x} dart={:#x} sid={} ===",
-        hw.dwc3, hw.atc, hw.pipehandler, hw.dart_base, hw.dart_sid
+        "apple_usb: === controller {idx}: dwc3={:#x} atc={:#x} pipe={:#x} ndarts={} dart0={:#x}/{} ===",
+        hw.dwc3, hw.atc, hw.pipehandler, hw.ndarts, hw.darts[0].0, hw.darts[0].1
     );
-    // Map the USB MMIO windows + the DART (Device).
+    // Map the USB MMIO windows + every DART (Device).
     crate::serial_println!("apple_usb: [1] mapping MMIO windows");
     super::mmu::map_device_gib(hw.dwc3 as u64);
     super::mmu::map_device_gib(hw.atc as u64);
     super::mmu::map_device_gib(hw.pipehandler as u64);
-    super::mmu::map_device_gib(hw.dart_base as u64);
-    // DART in TRANSLATION mode with low IOVAs (m1n1/Linux do this): the DWC3
-    // can't reliably emit Apple's high physical DMA addresses itself (bypass
-    // faulted the periodic interrupt transfer → HSE), so the xHCI DMA allocator
-    // maps its buffers to low IOVAs the DART translates up to the physical pages.
-    crate::serial_println!("apple_usb: [2] DART translate setup");
-    if !super::xhci::dma_translate_setup(hw.dart_base, hw.dart_sid) {
+    for &(base, _) in &hw.darts[..hw.ndarts] {
+        super::mmu::map_device_gib(base as u64);
+    }
+    // Put ALL the controller's DARTs in TRANSLATION mode sharing one page table
+    // (Apple mirrors the mapping across a device's DARTs; the Mac mini's dwc3 has
+    // two, and leaving one unconfigured faults whichever DMA routes through it —
+    // that was the interrupt-transfer HSE). The xHCI DMA allocator then maps its
+    // buffers to IOVAs the DART(s) translate to the physical pages.
+    crate::serial_println!("apple_usb: [2] DART translate setup ({} darts)", hw.ndarts);
+    if !super::xhci::dma_translate_setup(&hw.darts[..hw.ndarts]) {
         crate::serial_println!("apple_usb: DART translate setup failed (locked?) on controller {idx}");
         return false;
     }
