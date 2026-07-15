@@ -249,9 +249,22 @@ pub extern "C" fn aarch64_start() -> ! {
     unsafe {
         let el: u64;
         core::arch::asm!("mrs {el}, CurrentEL", el = out(reg) el);
-        if (el >> 2) == 2 {
-            chitti_kernel::arch::aarch64::dbg_paint(4, 0x3ff0_0000); // slot 4 red = running at EL2!
+        let el = (el >> 2) as usize;
+        // Unambiguous EL readout: one lone band well below the compact ladder —
+        // slot 16 = EL1, slot 17 = EL2, slot 18 = EL3. Nothing else paints there.
+        chitti_kernel::arch::aarch64::dbg_paint(15 + el, 0x3fff_ffff);
+        if el == 2 {
+            // Running at EL2: FP is governed by CPTR_EL2, not CPACR_EL1. Set FPEN
+            // (bits 21:20 = 0b11) for the VHE case; harmless (TTA) in non-VHE.
+            core::arch::asm!(
+                "mrs x9, cptr_el2",
+                "orr x9, x9, #0x300000",
+                "msr cptr_el2, x9",
+                "isb",
+                out("x9") _,
+            );
         }
+        // Also enable EL1 FP (needed if we are at EL1; harmless otherwise).
         core::arch::asm!(
             "mov x9, #0x300000",   // CPACR_EL1.FPEN = 0b11 (bits 21:20)
             "msr cpacr_el1, x9",
