@@ -242,6 +242,29 @@ fn dma_invalidate(va: usize, len: usize) {
     let _ = (va, len);
 }
 
+/// Clean (write back) the CPU cache over `[va, va+len)` to the Point of
+/// Coherency so a buffer WE wrote (a TRB the controller will DMA-read) is
+/// actually in RAM before we ring the doorbell — required on non-coherent DMA
+/// (real Apple DWC3). Coherent hosts (QEMU, x86) snoop, so this is a harmless
+/// no-op there. `dc cvac` + `dsb sy`.
+#[inline]
+fn dma_clean(va: usize, len: usize) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: cache maintenance over a mapped Normal-memory DMA buffer.
+    unsafe {
+        const LINE: usize = 64;
+        let mut p = va & !(LINE - 1);
+        let end = va + len;
+        while p < end {
+            core::arch::asm!("dc cvac, {}", in(reg) p, options(nostack, preserves_flags));
+            p += LINE;
+        }
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = (va, len);
+}
+
 /// TEMP (bare-Apple USB bring-up) counters: is the poll loop alive, and are any
 /// xHCI events arriving? Printed as a 3s heartbeat since a bare boot has no other
 /// input/output channel. REMOVE once typing works.
@@ -458,11 +481,16 @@ impl Xhci {
     /// ring's fields directly.
     unsafe fn ring_push(va: usize, pa: u64, enq: &mut usize, cycle: &mut u32, param: u64, status: u32, control: u32) {
         let control = (control & !1) | *cycle;
-        unsafe { write_volatile((va + *enq * 16) as *mut Trb, Trb { param, status, control }) };
+        let pos = *enq;
+        unsafe { write_volatile((va + pos * 16) as *mut Trb, Trb { param, status, control }) };
+        // Clean the written TRB to RAM so the controller's DMA read sees it on a
+        // non-coherent host (real Apple); no-op on coherent QEMU/x86.
+        dma_clean(va + pos * 16, 16);
         *enq += 1;
         if *enq == RING_TRBS - 1 {
             let link = (TRB_LINK << 10) | 0x2 | *cycle;
             unsafe { write_volatile((va + (RING_TRBS - 1) * 16) as *mut Trb, Trb { param: pa, status: 0, control: link }) };
+            dma_clean(va + (RING_TRBS - 1) * 16, 16);
             *enq = 0;
             *cycle ^= 1;
         }
@@ -980,16 +1008,18 @@ impl Xhci {
             // interrupt IN will never complete (VBox used to show READY with
             // a wiped Slot Context → port/speed 0 after Evaluate Context).
             let ep_ctx = c.dev_ctx_va + self.ctx_size * (int_dci as usize + 1);
+            // Output device context is controller-written — invalidate before read
+            // on non-coherent DMA (real Apple).
+            dma_invalidate(c.dev_ctx_va, self.ctx_size * (int_dci as usize + 2));
             let ep_state = read_volatile(ep_ctx as *const u32) & 0x7;
             let slot_d0 = read_volatile((c.dev_ctx_va) as *const u32);
             let slot_d1 = read_volatile((c.dev_ctx_va + 4) as *const u32);
-            crate::ktrace::log_fmt(format_args!(
-                "xhci: after configure dci={int_dci} ep_state={ep_state} slot_ctx0={slot_d0:#x} port={}",
+            // Visible on the chat pane (bare-Apple bring-up). ep_state 1=Running,
+            // 2=Halted, 3=Stopped, 4=Error; anything but 1 => no reports.
+            crate::serial_println!(
+                "usb: after configure dci={int_dci} ep_state={ep_state} slot_ctx0={slot_d0:#x} port={}",
                 (slot_d1 >> 16) & 0xff
-            ));
-            if ep_state != 1 {
-                crate::ktrace::log("xhci", "interrupt EP not Running — reports will not arrive");
-            }
+            );
         }
         Some((int_dci, int_va, int_pa, report_pa, report_va))
     }
