@@ -1150,6 +1150,15 @@ impl Xhci {
                         for (i, b) in report.iter_mut().enumerate() {
                             *b = read_volatile((k.report_va + i) as *const u8);
                         }
+                        // TEMP (bare Apple USB bring-up): one line per key report
+                        // — the only way to observe input when the USB keyboard
+                        // is the sole input device. REMOVE once typing works.
+                        #[cfg(target_arch = "aarch64")]
+                        crate::serial_println!(
+                            "usb: kbd report {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                            report[0], report[1], report[2], report[3],
+                            report[4], report[5], report[6], report[7]
+                        );
                         let shift = report[0] & 0x22 != 0;
                         let ctrl = report[0] & 0x11 != 0;
                         for &usage in &report[2..8] {

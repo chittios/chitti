@@ -118,7 +118,7 @@ fn latest_saved_session_id() -> Option<u64> {
 
 pub fn run() -> ! {
     serial_println!("");
-    serial_println!("Chitti chat. Type a message; the model replies (Ctrl+C to stop generating).");
+    serial_println!("Shell Agent. Type a message; the model replies (Ctrl+C to stop generating).");
     serial_println!("Commands start with '/': /help for the list.");
 
     // Seed the wall clock (RTC or fallback), load the UI config from
