@@ -118,6 +118,20 @@ _start:
     //   x0 = DTB / FDT pointer          -> BOOT_X0
     mov  x20, x1
     mov  x21, x0
+    // TEMP: clear the top ~3 MiB of the firmware framebuffer to black so each
+    // boot's ladder is fresh (stale bands from a prior boot persist in the live
+    // FB and muddy the reading). Apple-gated on the saved FDT pointer in x21.
+    movz x2, #0x8, lsl #32
+    cmp  x21, x2
+    b.lo 41f
+    movz x2, #0x4000
+    movk x2, #0xe52d, lsl #16
+    movk x2, #0x0009, lsl #32
+    movz x3, #0xc, lsl #16       // 0xc0000 words = 3 MiB
+40: str  wzr, [x2], #4
+    subs x3, x3, #1
+    b.ne 40b
+41:
     DBGBAND 0, 0x03ff, 0         // blue  : _start entered (m1n1 handed off)
 
     // If we entered at EL2 (m1n1 / iBoot / QEMU `virtualization=on`), drop to

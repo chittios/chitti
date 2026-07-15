@@ -271,6 +271,11 @@ pub extern "C" fn aarch64_start() -> ! {
             "isb",
             out("x9") _,
         );
+        // Read CPACR_EL1 back: slot 22 green if FPEN[21:20]==0b11, red otherwise.
+        let cpacr: u64;
+        core::arch::asm!("mrs {c}, cpacr_el1", c = out(reg) cpacr);
+        let fpen_ok = (cpacr & 0x30_0000) == 0x30_0000;
+        chitti_kernel::arch::aarch64::dbg_paint(22, if fpen_ok { 0x000f_fc00 } else { 0x3ff0_0000 });
         // Does FP work RIGHT HERE (before mmu::init)? slot 19 = FP ok post-enable.
         let f = core::hint::black_box(1.0f32) + core::hint::black_box(2.0f32);
         core::hint::black_box(f);
