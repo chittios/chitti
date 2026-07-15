@@ -292,8 +292,20 @@ pub fn map_device_gib(pa: u64) {
             return;
         }
         let desc = ((idx as u64) << 30) | (1u64 << 2) | (1 << 10) | 0b01; // AF=1, Device, block, valid
-        *l1.add(idx) = desc;
-        asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb", options(nostack));
+        if cur == desc {
+            return; // already the exact Device block — no live change, no BBM.
+        }
+        // Break-before-make: `mmu::init` already mapped this GiB (as a Normal or
+        // Device block), so this is a *live* valid->valid entry change. Real
+        // Apple cores fault such a change done in place (a TLB conflict abort) —
+        // the QEMU/hv paths are lenient (the hv's stage-2 masks the stage-1 TLB),
+        // which is why this only bit the bare Mac boot. Invalidate first, then
+        // write the new block. Safe because no code/stack/framebuffer lives in
+        // the MMIO GiB being remapped.
+        *l1.add(idx) = 0; // break: make the entry invalid
+        asm!("dsb ish", "tlbi vmalle1", "dsb ish", options(nostack));
+        *l1.add(idx) = desc; // make: publish the Device block
+        asm!("dsb ish", "isb", options(nostack));
     }
 }
 

@@ -356,16 +356,41 @@ pub fn uart_getb() -> Option<u8> {
 /// MMIO probing — so it is safe to call *before* the exception vectors exist
 /// (unlike [`init_uart`]'s PL011 probe) and thus before the very first print.
 /// A no-op on QEMU/SBSA (no `apple,s5l-uart` node), leaving the PL011 path.
+/// TEMP bare-boot bisect: paint ladder slot `slot` (continuation of the boot.rs
+/// `_start` / main.rs `dbg_band` ladder) at the hardcoded Mac-mini M2 firmware
+/// framebuffer PA, Apple-gated on the FDT pointer being in high RAM. Lets lib
+/// functions main.rs can't reach (e.g. `init_uart_apple`) place probes. REMOVE
+/// with the rest of the bare-boot paints once the boot is stable.
+#[inline(never)]
+pub unsafe fn dbg_paint(slot: usize, color: u32) {
+    let fdt = boot::boot_x0();
+    if fdt < 0x8_0000_0000 {
+        return;
+    }
+    let base = 0x9_e52d_4000usize as *mut u32;
+    let start = slot * 0x80000 / 4; // slot byte offset -> u32 index
+    for i in 0..0x10000usize {
+        // SAFETY: fixed firmware-framebuffer PA; aligned u32 writes.
+        unsafe { core::ptr::write_volatile(base.add(start + i), color) };
+    }
+    for _ in 0..400_000_000u64 {
+        core::hint::spin_loop();
+    }
+}
+
 pub fn init_uart_apple() {
     let fdt = boot::boot_x0();
     // SAFETY: `boot_x0` is the FDT pointer (or non-FDT, rejected by the magic).
     IS_APPLE.store(unsafe { crate::fdt::has_compatible(fdt, b"apple,arm-platform") }, Ordering::Relaxed);
     if let Some((base, _size)) = unsafe { crate::fdt::reg_of_compatible(fdt, b"apple,s5l-uart") } {
+        unsafe { dbg_paint(9, 0x3fff_ffff) }; // slot 9 white: s5l UART base found (FDT parse ok)
         mmu::map_device_gib(base);
+        unsafe { dbg_paint(10, 0x0000_03ff) }; // slot 10 blue: past map_device_gib (BBM remap)
         UART_BASE.store(base as usize, Ordering::Relaxed);
         UART_KIND.store(UART_KIND_S5L, Ordering::Relaxed);
         UART_RX_OK.store(true, Ordering::Relaxed); // real UART; m1n1 hv forwards RX
         crate::ktrace::log_fmt(format_args!("uart: Apple s5l console at {base:#x}"));
+        unsafe { dbg_paint(11, 0x000f_fc00) }; // slot 11 green: past stores + ktrace (returning)
     }
 }
 
