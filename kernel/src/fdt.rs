@@ -275,19 +275,22 @@ pub unsafe fn reg_of_compatible(dtb_pa: u64, want: &[u8]) -> Option<(u64, u64)> 
     // SAFETY: delegated to `header`.
     let (base, h) = unsafe { header(dtb_pa)? };
     unsafe { fdt_probe(13, 0x000f_fc00) }; // slot 13: reg_of_compatible header parsed
+    // TEMP FP-enable test (bare Apple): force an FP/NEON instruction (int->float
+    // + fadd). If FP/SIMD is not enabled at EL1 after the EL2->EL1 drop, this
+    // traps before slot 14 -- which would also explain the array-init fault
+    // (LLVM can lower [T; N] init to NEON stores). has_compatible's tiny scalar
+    // frame never emits an FP op, so it never hit this.
+    let ftest = core::hint::black_box(3.0f32) + core::hint::black_box(h.total as f32);
+    core::hint::black_box(ftest);
+    unsafe { fdt_probe(14, 0x0000_03ff) }; // slot 14: FP instruction executed (FP enabled)
     let mut acells = [2u32; MAX_DEPTH];
     let mut scells = [2u32; MAX_DEPTH];
     let mut matched = [false; MAX_DEPTH];
     let mut reg_off = [0usize; MAX_DEPTH]; // 0 = no reg seen for this node
     let mut depth: usize = 0;
     let mut off = h.off_struct;
-    unsafe { fdt_probe(14, 0x0000_03ff) }; // slot 14: stack arrays initialized, entering loop
-    let mut first = true;
+    unsafe { fdt_probe(15, 0x3ff0_03ff) }; // slot 15: stack arrays initialized, entering loop
     loop {
-        if first {
-            unsafe { fdt_probe(15, 0x3ff0_03ff) }; // slot 15: first loop iteration reached
-            first = false;
-        }
         // SAFETY: `off` is bounded by every `be32` against `h.total`.
         let tok = unsafe { be32(base, off, h.total)? };
         off += 4;
