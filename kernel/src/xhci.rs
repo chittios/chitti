@@ -110,6 +110,7 @@ struct Kbd {
     int_cycle: u32,
     report_pa: u64,    // 8-byte HID boot report buffer
     report_va: usize,
+    dev_ctx_va: usize, // Output Device Context (for post-fault EP-state debug)
     prev: [u8; 8],     // last report, to detect newly-pressed keys
     // USB HID boot keyboards report only press/release edges, so a held key
     // would never repeat; synthesize accelerating typematic in software.
@@ -1036,7 +1037,8 @@ impl Xhci {
             unsafe { self.finish_endpoint(c, iface, ep_addr, ep_mps, interval, true) }?;
         let mut kbd = Kbd {
             slot: c.slot, int_dci, int_ring_va: int_va, int_ring_pa: int_pa,
-            int_enqueue: 0, int_cycle: 1, report_pa, report_va, prev: [0; 8],
+            int_enqueue: 0, int_cycle: 1, report_pa, report_va, dev_ctx_va: c.dev_ctx_va,
+            prev: [0; 8],
             rep: crate::keyrepeat::Typematic::new(), rep_usage: 0,
         };
         unsafe { self.queue_interrupt(&mut kbd) };
@@ -1213,6 +1215,24 @@ impl Xhci {
                 let usbsts = unsafe { r32(self.op + OP_USBSTS) };
                 let (slot, dci) = self.kbd.as_ref().map(|k| (k.slot, k.int_dci)).unwrap_or((0, 0));
                 crate::serial_println!("usb: usbsts={usbsts:#010x} kbd_slot={slot} dci={dci} (re-doorbell)");
+                // On HSE, read the interrupt EP context: its state + TR Dequeue
+                // Pointer. If deq == int_ring_pa (unchanged) the controller never
+                // fetched the TRB (fault = TRB fetch / EP-context read); if it
+                // advanced, the fault is the report DMA. deq's DCS is bit 0.
+                if usbsts & 0x4 != 0 {
+                    if let Some(k) = self.kbd.as_ref() {
+                        let ep = k.dev_ctx_va + self.ctx_size * k.int_dci as usize;
+                        dma_invalidate(ep, self.ctx_size);
+                        let st = unsafe { read_volatile(ep as *const u32) } & 0x7;
+                        let deq = unsafe { read_volatile((ep + 8) as *const u64) };
+                        crate::serial_println!(
+                            "usb: HSE! ep_state={st} tr_deq={:#x} int_ring_pa={:#x} report_pa={:#x}",
+                            deq & !0xf,
+                            k.int_ring_pa,
+                            k.report_pa
+                        );
+                    }
+                }
                 if slot != 0 {
                     // SAFETY: ringing a doorbell for a configured EP is idempotent.
                     unsafe { self.doorbell(slot, dci as u32) };
