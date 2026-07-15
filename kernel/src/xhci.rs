@@ -577,6 +577,13 @@ impl Xhci {
         // Fast path out: nothing connected on any port -> no retries, no delays.
         let any_port = (1..=self.max_ports).any(|p| unsafe { r32(self.portsc(p)) } & PORTSC_CCS != 0);
         if !any_port {
+            // Dump each port's raw PORTSC so a bring-up boot distinguishes an
+            // unpowered/dead PHY (0 / all-ones) from a powered port awaiting a
+            // device (PP set, CCS clear).
+            for p in 1..=self.max_ports {
+                let psc = unsafe { r32(self.portsc(p)) };
+                crate::ktrace::log_fmt(format_args!("xhci: port {p} PORTSC={psc:#010x}"));
+            }
             crate::ktrace::log("xhci", "no USB device connected");
             return false;
         }

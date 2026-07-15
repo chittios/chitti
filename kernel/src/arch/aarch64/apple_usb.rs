@@ -48,7 +48,9 @@ const DCTL_CSFTRST: u32 = 1 << 30;
 
 // --- pipehandler glue (m1n1 usb.c PIPEHANDLER_*) -------------------------
 const PIPEHANDLER_MUX_CTRL: usize = 0x0c;
-const PIPEHANDLER_MUX_CTRL_DUMMY: u32 = 0x22; // gadget dummy PHY (see status note)
+#[allow(dead_code)]
+const PIPEHANDLER_MUX_CTRL_DUMMY: u32 = 0x22; // gadget dummy PHY (m1n1 proxy path)
+const PIPEHANDLER_MUX_CTRL_USB3: u32 = 0x08; // USB3 host mux (m1n1 usb.c) — for a downstream device
 const PIPEHANDLER_AON_GEN: usize = 0x1c;
 const PIPEHANDLER_AON_GEN_DWC3_RESET_N: u32 = 1 << 0;
 const PIPEHANDLER_NONSELECTED_OVERRIDE: usize = 0x20;
@@ -137,8 +139,11 @@ fn phy_bringup(hw: &UsbHw) {
     w32(hw.atc, 0x04, 0x00000000);
     w32(hw.atc, 0x1c, 0x008c0813);
     w32(hw.atc, 0x00, 0x00000002);
-    // Pipehandler: select the (dummy) PHY, release the DWC3 reset, set override.
-    w32(hw.pipehandler, PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_DUMMY);
+    // Pipehandler: select the USB3 **host** mux (m1n1 uses DUMMY for its gadget
+    // proxy; a downstream device needs the real path), release the DWC3 reset,
+    // set override. NB: full host enumeration also needs the ATC-PHY tunable
+    // power-on (Asahi atc.c) + cd321x PD orientation/Vbus — see the status note.
+    w32(hw.pipehandler, PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_USB3);
     w32(hw.pipehandler, PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
     w32(hw.pipehandler, PIPEHANDLER_NONSELECTED_OVERRIDE, PIPEHANDLER_NONSELECTED_VALUE);
     mdelay(10);
