@@ -55,37 +55,38 @@ non-coherent DMA maintenance, commit `6838562`). USB-A ports (internal hub) and
 Type-C orientation (cd321x PD controller) are still pending, so for now use a
 **USB-C** port.
 
-**The m1n1 *hypervisor* path removes USB from the guest** (`Removing ADT node
-/arm-io/dart-usb0`, `atc-phy0`, `usb-drd0`), so USB work must run on a **bare**
-`linux.py` boot. A bare boot does still have serial: the payload writes its own
-**s5l UART**, bridged to the host over the `_03` USB serial device
-(`/dev/cu.usbmodem…D3`). Point `linux.py` at it with `-t` (`CHITTI_M1N1_TTY`)
-and tee it to a file with **`CHITTI_SERIAL_LOG`** — every `ktrace`/panic line
-lands in that file, so driver bring-up no longer needs a human reading the
-monitor.
+**A bare `linux.py` boot has NO USB serial.** The USB serial device (both the
+`_01` proxy channel and the `_03` UART bridge) is *m1n1's own USB gadget* — it
+disappears the instant m1n1 hands off to our payload. The host log stops dead at
+`Preparing to run next stage … / --- Exit TTY mode ---`; ChittiOS's own
+`ktrace`/banner writes go to the physical s5l UART, which is not wired to any
+host-visible device. So there are exactly two ways to see ChittiOS's serial:
 
-- Bare boot with a captured serial log:
-  ```sh
-  CHITTI_M1N1=third_party/m1n1 CHITTI_DTB=third_party/dtb/t8112-j473.dtb \
-  M1N1DEVICE=/dev/cu.usbmodemXXXXD1 \
-  CHITTI_M1N1_TTY=/dev/cu.usbmodemXXXXD3 \
-  CHITTI_SERIAL_LOG=target/serial.log \
-  make m1n1 RELEASE=1
-  ```
-  Plug the USB keyboard into a **USB-C** port before/at boot, then read
-  `target/serial.log` for the `apple_usb:` / `dart:` / `xhci(apple):` /
-  `xhci: …` lines and where it stops. The log is flushed line-by-line, so even a
-  hang leaves its last line on disk.
-- **Under the hv** (for non-USB drivers — PCIe, storage, AIC, SMP), the same
-  `CHITTI_SERIAL_LOG` captures m1n1's forwarded guest VUART:
+- **The m1n1 hypervisor path — the one that works with no extra hardware.**
+  m1n1 stays *resident* as a hypervisor, traps the guest's s5l UART writes, and
+  forwards them over its still-live USB gadget. `CHITTI_SERIAL_LOG` then tees
+  that to a logfile — every `ktrace`/panic line lands there, self-serve:
 
   ```sh
   CHITTI_M1N1_HV=1 CHITTI_SERIAL_LOG=target/serial.log make m1n1 RELEASE=1
   ```
 
-- Since `ktrace` is synchronous (spins on TX-empty, no buffering), the last line
-  before a fault/hang is always the true failure point — add `ktrace::log_fmt`
-  liberally when bringing up a driver and read them back from the logfile.
+  The catch: **the hv strips USB from the guest** (`Removing ADT node
+  /arm-io/dart-usb0`, `atc-phy0`, `usb-drd0`), so this path serial-logs
+  *everything except* USB/Bluetooth bring-up. Use it for PCIe, storage, AIC,
+  SMP, MMU, model, etc.
+- **A physical UART cable** to the Mac's debug-UART pins (the s5l TX/RX exposed
+  on a specific USB-C port with the Apple-Silicon debug cable). This is the
+  *only* way to get serial on a **bare** boot, and thus the only way to
+  serial-log the **USB/Bluetooth** work (which the hv can't host). Then
+  `CHITTI_M1N1_TTY=/dev/cu.usbmodem…` + `CHITTI_SERIAL_LOG=target/serial.log`
+  capture it. (A software alternative — a ChittiOS DWC3 *device-mode* CDC-ACM
+  gadget so the OS re-creates the USB serial console after handoff — is a real
+  but bounded project reusing the host-mode DWC3 work.)
+
+`ktrace` is synchronous (spins on TX-empty, no buffering), so on whichever
+channel is live, the last line before a fault/hang is the true failure point —
+add `ktrace::log_fmt` liberally and read them back from the logfile.
 
 ## If DART bypass is wrong
 
