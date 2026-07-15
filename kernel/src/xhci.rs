@@ -274,6 +274,7 @@ mod usbdbg {
     pub static PUMPS: AtomicU64 = AtomicU64::new(0);
     pub static EVENTS: AtomicU64 = AtomicU64::new(0);
     pub static NEXT_HB: AtomicU64 = AtomicU64::new(0);
+    pub static NEXT_KICK: AtomicU64 = AtomicU64::new(0);
 }
 
 /// Crude busy-wait (~`iters` volatile reads); used for the USB reset-recovery
@@ -1189,6 +1190,22 @@ impl Xhci {
             if ev != usbdbg::NEXT_HB.load(Ordering::Relaxed) {
                 usbdbg::NEXT_HB.store(ev, Ordering::Relaxed);
                 crate::serial_println!("usb: xhci events={ev}");
+            }
+            // Every ~2s: dump USBSTS (HSE bit2 / HCE bit12 = controller error) and
+            // re-ring the keyboard interrupt-EP doorbell in case the initial kick
+            // was missed. Harmless re-kick; helps decide "controller errored" vs
+            // "doorbell not registered" vs "device sends no reports".
+            let now = crate::arch::now_ms();
+            if now >= usbdbg::NEXT_KICK.load(Ordering::Relaxed) {
+                usbdbg::NEXT_KICK.store(now + 2000, Ordering::Relaxed);
+                // SAFETY: self.op is the mapped xHCI operational base.
+                let usbsts = unsafe { r32(self.op + OP_USBSTS) };
+                let (slot, dci) = self.kbd.as_ref().map(|k| (k.slot, k.int_dci)).unwrap_or((0, 0));
+                crate::serial_println!("usb: usbsts={usbsts:#010x} kbd_slot={slot} dci={dci} (re-doorbell)");
+                if slot != 0 {
+                    // SAFETY: ringing a doorbell for a configured EP is idempotent.
+                    unsafe { self.doorbell(slot, dci as u32) };
+                }
             }
         }
         let mut kbd = self.kbd.take();
