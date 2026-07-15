@@ -409,6 +409,160 @@ pub unsafe fn reg_nth_of_compatible(dtb_pa: u64, want: &[u8], n: usize) -> Optio
     }
 }
 
+/// The `reg_n`-th `(base, size)` reg pair of the **`node_n`-th** (0-based) node
+/// whose `compatible` contains `want`. Distinguishes several identical
+/// controllers (e.g. the Mac mini's two `apple,*-dwc3`/`atcphy` blocks) so a
+/// driver can address the second one. `node_n == 0` is [`reg_nth_of_compatible`].
+///
+/// # Safety
+/// `dtb_pa`, if a valid FDT, must point at a readable blob.
+pub unsafe fn reg_of_nth_node(dtb_pa: u64, want: &[u8], node_n: usize, reg_n: usize) -> Option<(u64, u64)> {
+    // SAFETY: delegated to `header`.
+    let (base, h) = unsafe { header(dtb_pa)? };
+    let mut acells = [2u32; MAX_DEPTH];
+    let mut scells = [2u32; MAX_DEPTH];
+    let mut matched = [false; MAX_DEPTH];
+    let mut reg_off = [0usize; MAX_DEPTH];
+    let mut depth: usize = 0;
+    let mut seen = 0usize; // matched nodes whose END_NODE we've passed
+    let mut off = h.off_struct;
+    loop {
+        // SAFETY: bounded by `be32`.
+        let tok = unsafe { be32(base, off, h.total)? };
+        off += 4;
+        match tok {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                if depth >= MAX_DEPTH {
+                    return None;
+                }
+                acells[depth] = 2;
+                scells[depth] = 2;
+                matched[depth] = false;
+                reg_off[depth] = 0;
+                // SAFETY: bounded.
+                let len = unsafe { cstr_len(base, off, h.total)? };
+                off += (len + 1 + 3) & !3;
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    return None;
+                }
+                if matched[depth] {
+                    if seen == node_n {
+                        if reg_off[depth] == 0 {
+                            return None;
+                        }
+                        let pa = acells[depth - 1];
+                        let ps = scells[depth - 1];
+                        let stride = (pa as usize + ps as usize) * 4;
+                        let o = reg_off[depth] + reg_n * stride;
+                        // SAFETY: bounded.
+                        let b = unsafe { read_cells(base, o, pa, h.total)? };
+                        let s = unsafe { read_cells(base, o + pa as usize * 4, ps, h.total)? };
+                        return Some((b, s));
+                    }
+                    seen += 1;
+                }
+                depth -= 1;
+            }
+            FDT_PROP => {
+                // SAFETY: bounded.
+                let len = unsafe { be32(base, off, h.total)? } as usize;
+                let name_off = unsafe { be32(base, off + 4, h.total)? } as usize;
+                let data_off = off + 8;
+                if depth < MAX_DEPTH {
+                    if unsafe { prop_name_is(base, h.off_strings, name_off, b"#address-cells", h.total) } {
+                        acells[depth] = unsafe { be32(base, data_off, h.total) }.unwrap_or(2);
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"#size-cells", h.total) } {
+                        scells[depth] = unsafe { be32(base, data_off, h.total) }.unwrap_or(2);
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"compatible", h.total) } {
+                        if unsafe { compat_has(base, data_off, len, want, h.total) } {
+                            matched[depth] = true;
+                        }
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"reg", h.total) } {
+                        reg_off[depth] = data_off;
+                    }
+                }
+                off += 8 + ((len + 3) & !3);
+            }
+            FDT_NOP => {}
+            FDT_END => return None,
+            _ => return None,
+        }
+    }
+}
+
+/// Like [`prop_cells_of_compatible`] but for the **`node_n`-th** (0-based) node
+/// whose `compatible` contains `want` (e.g. the second dwc3's `iommus`).
+///
+/// # Safety
+/// `dtb_pa`, if a valid FDT, must point at a readable blob.
+pub unsafe fn prop_cells_of_nth_node(dtb_pa: u64, want: &[u8], node_n: usize, prop: &[u8], out: &mut [u32]) -> usize {
+    let Some((base, h)) = (unsafe { header(dtb_pa) }) else { return 0 };
+    let mut matched = [false; MAX_DEPTH];
+    let mut prop_off = [0usize; MAX_DEPTH];
+    let mut prop_len = [0usize; MAX_DEPTH];
+    let mut depth: usize = 0;
+    let mut seen = 0usize;
+    let mut off = h.off_struct;
+    loop {
+        let Some(tok) = (unsafe { be32(base, off, h.total) }) else { return 0 };
+        off += 4;
+        match tok {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                if depth >= MAX_DEPTH {
+                    return 0;
+                }
+                matched[depth] = false;
+                prop_off[depth] = 0;
+                let Some(len) = (unsafe { cstr_len(base, off, h.total) }) else { return 0 };
+                off += (len + 1 + 3) & !3;
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    return 0;
+                }
+                if matched[depth] {
+                    if seen == node_n {
+                        if prop_off[depth] == 0 {
+                            return 0;
+                        }
+                        let ncells = (prop_len[depth] / 4).min(out.len());
+                        for (i, slot) in out.iter_mut().enumerate().take(ncells) {
+                            *slot = unsafe { be32(base, prop_off[depth] + i * 4, h.total) }.unwrap_or(0);
+                        }
+                        return ncells;
+                    }
+                    seen += 1;
+                }
+                depth -= 1;
+            }
+            FDT_PROP => {
+                let Some(len) = (unsafe { be32(base, off, h.total) }) else { return 0 };
+                let len = len as usize;
+                let Some(name_off) = (unsafe { be32(base, off + 4, h.total) }) else { return 0 };
+                let data_off = off + 8;
+                if depth < MAX_DEPTH {
+                    if unsafe { prop_name_is(base, h.off_strings, name_off as usize, b"compatible", h.total) } {
+                        if unsafe { compat_has(base, data_off, len, want, h.total) } {
+                            matched[depth] = true;
+                        }
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off as usize, prop, h.total) } {
+                        prop_off[depth] = data_off;
+                        prop_len[depth] = len;
+                    }
+                }
+                off += 8 + ((len + 3) & !3);
+            }
+            FDT_NOP => {}
+            FDT_END => return 0,
+            _ => return 0,
+        }
+    }
+}
+
 /// Read up to `out.len()` big-endian u32 cells of the named property of the
 /// first node whose `compatible` contains `want`, returning the count copied.
 /// FDT stores `iommus`/`phys`/`power-domains`/`interrupts` as cell lists; used
@@ -1002,6 +1156,49 @@ mod tests {
         assert_eq!(c, [0xac, 0, 0xad, 1]);
         // Resolve the USB DART phandle (0xad) → its register block.
         assert_eq!(unsafe { reg_by_phandle(p, 0xad) }, Some((0x3_82f8_0000, 0x4000)));
+    }
+
+    #[test_case]
+    fn nth_node_distinguishes_two_identical_controllers() {
+        // Two `apple,t8112-dwc3` nodes (the Mac mini's two USB controllers), each
+        // with its own reg + iommus — reg_of_nth_node / prop_cells_of_nth_node
+        // must address the 0th vs 1st node distinctly.
+        let mut f = FdtBuild::new();
+        f.begin("");
+        f.prop_u32("#address-cells", 2);
+        f.prop_u32("#size-cells", 2);
+        f.begin("usb@382280000");
+        f.prop_str("compatible", "apple,t8112-dwc3");
+        f.prop_pair64("reg", 0x3_8228_0000, 0xcd00);
+        {
+            let mut v = alloc::vec::Vec::new();
+            for x in [0xa0u32, 0] {
+                v.extend_from_slice(&x.to_be_bytes());
+            }
+            f.prop("iommus", &v);
+        }
+        f.end();
+        f.begin("usb@502280000");
+        f.prop_str("compatible", "apple,t8112-dwc3");
+        f.prop_pair64("reg", 0x5_0228_0000, 0xcd00);
+        {
+            let mut v = alloc::vec::Vec::new();
+            for x in [0xb0u32, 1] {
+                v.extend_from_slice(&x.to_be_bytes());
+            }
+            f.prop("iommus", &v);
+        }
+        f.end();
+        f.end();
+        let blob = f.build();
+        let p = blob.as_ptr() as u64;
+        assert_eq!(unsafe { reg_of_nth_node(p, b"apple,t8112-dwc3", 0, 0) }, Some((0x3_8228_0000, 0xcd00)));
+        assert_eq!(unsafe { reg_of_nth_node(p, b"apple,t8112-dwc3", 1, 0) }, Some((0x5_0228_0000, 0xcd00)));
+        // node_n past the end → None.
+        assert_eq!(unsafe { reg_of_nth_node(p, b"apple,t8112-dwc3", 2, 0) }, None);
+        let mut c = [0u32; 2];
+        assert_eq!(unsafe { prop_cells_of_nth_node(p, b"apple,t8112-dwc3", 1, b"iommus", &mut c) }, 2);
+        assert_eq!(c, [0xb0, 1]);
     }
 
     #[test_case]

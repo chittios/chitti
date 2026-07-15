@@ -101,24 +101,27 @@ fn bootarg_present(needle: &[u8]) -> bool {
     false
 }
 
-/// Discover the USB hardware from the boot FDT. `None` if the machine doesn't
-/// describe a `apple,*-dwc3` (e.g. QEMU) — a clean skip.
-fn discover() -> Option<UsbHw> {
+/// Discover the `idx`-th USB controller from the boot FDT (the Mac mini has two:
+/// `usb@382280000`/`atcphy0` and `usb@502280000`/`atcphy1`). `None` when the
+/// machine has no such node (e.g. QEMU) or no `idx`-th one — a clean skip.
+fn discover(idx: usize) -> Option<UsbHw> {
     let fdt = super::boot::boot_x0();
-    // DWC3 core = reg[0] of the dwc3 node; ATC core = reg[0], pipehandler =
-    // reg[4] ("pipehandler") of the atcphy node.
+    // DWC3 core = reg[0]; ATC core = reg[0], pipehandler = reg[4] of the atcphy.
+    // Both the idx-th node of their kind, so controller 0 vs 1 are distinct.
     // SAFETY: boot_x0 is the FDT pointer (or non-FDT, rejected by the magic).
-    let (dwc3, _) = unsafe { crate::fdt::reg_of_compatible(fdt, b"apple,t8112-dwc3") }
-        .or_else(|| unsafe { crate::fdt::reg_of_compatible(fdt, b"apple,t8103-dwc3") })?;
-    let (atc, _) = unsafe { crate::fdt::reg_of_compatible(fdt, b"apple,t8112-atcphy") }
-        .or_else(|| unsafe { crate::fdt::reg_of_compatible(fdt, b"apple,t8103-atcphy") })?;
-    let (pipehandler, _) = unsafe { crate::fdt::reg_nth_of_compatible(fdt, b"apple,t8112-atcphy", 4) }
-        .or_else(|| unsafe { crate::fdt::reg_nth_of_compatible(fdt, b"apple,t8103-atcphy", 4) })?;
-    // DART: the dwc3's `iommus = <&dart0 SID0 &dartUSB SID1>`. m1n1 uses the
-    // second (the USB DMA DART at 0x…f80000); take the last pair.
+    let (dwc3, _) = unsafe { crate::fdt::reg_of_nth_node(fdt, b"apple,t8112-dwc3", idx, 0) }
+        .or_else(|| unsafe { crate::fdt::reg_of_nth_node(fdt, b"apple,t8103-dwc3", idx, 0) })?;
+    let (atc, _) = unsafe { crate::fdt::reg_of_nth_node(fdt, b"apple,t8112-atcphy", idx, 0) }
+        .or_else(|| unsafe { crate::fdt::reg_of_nth_node(fdt, b"apple,t8103-atcphy", idx, 0) })?;
+    let (pipehandler, _) = unsafe { crate::fdt::reg_of_nth_node(fdt, b"apple,t8112-atcphy", idx, 4) }
+        .or_else(|| unsafe { crate::fdt::reg_of_nth_node(fdt, b"apple,t8103-atcphy", idx, 4) })?;
+    // DART: the idx-th dwc3's `iommus = <&dart0 SID0 &dartUSB SID1>`; the USB DMA
+    // DART is the last pair.
     let mut cells = [0u32; 8];
-    let n = unsafe { crate::fdt::prop_cells_of_compatible(fdt, b"apple,t8112-dwc3", b"iommus", &mut cells) }
-        .max(unsafe { crate::fdt::prop_cells_of_compatible(fdt, b"apple,t8103-dwc3", b"iommus", &mut cells) });
+    let mut n = unsafe { crate::fdt::prop_cells_of_nth_node(fdt, b"apple,t8112-dwc3", idx, b"iommus", &mut cells) };
+    if n == 0 {
+        n = unsafe { crate::fdt::prop_cells_of_nth_node(fdt, b"apple,t8103-dwc3", idx, b"iommus", &mut cells) };
+    }
     let (dart_base, dart_sid) = if n >= 2 {
         let phandle = cells[n - 2];
         let sid = cells[n - 1];
@@ -213,10 +216,60 @@ fn dump_state(hw: &UsbHw) {
     );
 }
 
+/// Bring up one USB controller (DART bypass + PHY + DWC3 host + xHCI) and try to
+/// enumerate HID. Returns true iff a keyboard/mouse came up. Step markers go to
+/// the chat pane (visible on a bare boot; the ktrace pane is closed at boot).
+fn bringup_controller(idx: usize, hw: &UsbHw) -> bool {
+    crate::serial_println!(
+        "apple_usb: === controller {idx}: dwc3={:#x} atc={:#x} pipe={:#x} dart={:#x} sid={} ===",
+        hw.dwc3, hw.atc, hw.pipehandler, hw.dart_base, hw.dart_sid
+    );
+    // Map the USB MMIO windows + the DART (Device).
+    crate::serial_println!("apple_usb: [1] mapping MMIO windows");
+    super::mmu::map_device_gib(hw.dwc3 as u64);
+    super::mmu::map_device_gib(hw.atc as u64);
+    super::mmu::map_device_gib(hw.pipehandler as u64);
+    super::mmu::map_device_gib(hw.dart_base as u64);
+    // DART stream in bypass: DMA uses physical addresses (we identity-map).
+    // SAFETY: `dart_base` is the Device-mapped DART; `dart_sid` from the FDT.
+    crate::serial_println!("apple_usb: [2] DART bypass");
+    let dart = unsafe { super::dart::Dart::new(hw.dart_base, hw.dart_sid) };
+    dart.set_bypass();
+    crate::serial_println!("apple_usb: [3] ATC PHY bring-up");
+    phy_bringup(hw);
+    crate::serial_println!("apple_usb: [4] DWC3 host reset (GSNPSID)");
+    if !dwc3_reset_host(hw) {
+        crate::serial_println!("apple_usb: DWC3 reset failed on controller {idx}");
+        return false;
+    }
+    dump_state(hw);
+    crate::serial_println!("apple_usb: [5] xHCI attach");
+    let ok = super::xhci::attach_at(hw.dwc3);
+    // Port status: did a root port detect a device? CCS=connect, PP=power,
+    // PLS=link state, speed. CCS=0 on both means no device reached this dwc3.
+    let caplen = (r32(hw.dwc3, 0) & 0xff) as usize;
+    let op = hw.dwc3 + caplen;
+    for p in 0..2usize {
+        let psc = r32(op, 0x400 + p * 0x10);
+        crate::serial_println!(
+            "apple_usb: ctrl {idx} port {} PORTSC={psc:#010x} CCS={} PED={} PP={} PLS={} speed={}",
+            p + 1,
+            psc & 1,
+            (psc >> 1) & 1,
+            (psc >> 9) & 1,
+            (psc >> 5) & 0xf,
+            (psc >> 10) & 0xf
+        );
+    }
+    crate::serial_println!("apple_usb: controller {idx} done (hid up: {ok})");
+    ok
+}
+
 /// Bring up USB HID (keyboard/mouse) on Apple Silicon. No-op (returns false) off
 /// Apple or when the FDT has no dwc3. Best-effort + graceful: any failure logs
-/// and returns false, never faults. See the module status note on why
-/// enumeration may not yet succeed.
+/// and returns false, never faults. Tries each USB controller in turn (the Mac
+/// mini has two) and stops at the first that enumerates HID — the USB-A ports
+/// hang off one of them.
 pub fn init() -> bool {
     if !super::is_apple() {
         return false;
@@ -231,61 +284,20 @@ pub fn init() -> bool {
         crate::ktrace::log("apple_usb", "USB HID gated (add `chitti.usb` bootarg on a BARE boot to enable; never under the hv)");
         return false;
     }
-    let Some(hw) = discover() else {
+    let mut any = false;
+    for idx in 0..2 {
+        let Some(hw) = discover(idx) else {
+            continue; // no idx-th controller
+        };
+        any = true;
+        if bringup_controller(idx, &hw) {
+            return true; // HID up on this controller
+        }
+    }
+    if !any {
         crate::serial_println!("apple_usb: no apple,dwc3 in device tree; skipping");
-        return false;
-    };
-    // Step markers go to serial_println! (the chat pane, visible on a bare boot)
-    // rather than ktrace (the action/logs pane, closed at boot). Each prints
-    // BEFORE the MMIO group that follows, so if a group hangs (e.g. an ungated
-    // power domain — touching ungated Apple MMIO stalls the interconnect), the
-    // last visible line names the culprit.
-    crate::serial_println!(
-        "apple_usb: dwc3={:#x} atc={:#x} pipe={:#x} dart={:#x} sid={}",
-        hw.dwc3, hw.atc, hw.pipehandler, hw.dart_base, hw.dart_sid
-    );
-    // Ensure the USB MMIO windows + the DART are mapped (Device).
-    crate::serial_println!("apple_usb: [1] mapping MMIO windows");
-    super::mmu::map_device_gib(hw.dwc3 as u64);
-    super::mmu::map_device_gib(hw.atc as u64);
-    super::mmu::map_device_gib(hw.pipehandler as u64);
-    super::mmu::map_device_gib(hw.dart_base as u64);
-    // Put the controller's DART stream in bypass so DMA uses physical addresses
-    // (ChittiOS is identity-mapped, so buffer PA == VA).
-    // SAFETY: `dart_base` is the Device-mapped DART; `dart_sid` from the FDT.
-    crate::serial_println!("apple_usb: [2] DART bypass (first DART MMIO)");
-    let dart = unsafe { super::dart::Dart::new(hw.dart_base, hw.dart_sid) };
-    dart.set_bypass();
-    // PHY + controller.
-    crate::serial_println!("apple_usb: [3] ATC PHY bring-up (first ATC/pipehandler MMIO)");
-    phy_bringup(&hw);
-    crate::serial_println!("apple_usb: [4] DWC3 host reset (first dwc3 MMIO: GSNPSID)");
-    if !dwc3_reset_host(&hw) {
-        crate::serial_println!("apple_usb: DWC3 reset failed");
-        return false;
+    } else {
+        crate::serial_println!("apple_usb: no HID enumerated on any USB controller");
     }
-    // Observe the controller state before handing off to the xHCI core.
-    dump_state(&hw);
-    // Drive the xHCI window (DWC3 base + 0x0) with the shared xHCI core.
-    crate::serial_println!("apple_usb: [5] xHCI attach at dwc3 window");
-    let ok = super::xhci::attach_at(hw.dwc3);
-    // Port status (visible): did either root port detect a device? CCS=connect,
-    // PP=port power, PLS=link state, speed. CCS=0 on both means no device reached
-    // this controller (wrong dwc3, or Type-C Vbus/orientation not enabled).
-    let caplen = (r32(hw.dwc3, 0) & 0xff) as usize;
-    let op = hw.dwc3 + caplen;
-    for p in 0..2usize {
-        let psc = r32(op, 0x400 + p * 0x10);
-        crate::serial_println!(
-            "apple_usb: port {} PORTSC={psc:#010x} CCS={} PED={} PP={} PLS={} speed={}",
-            p + 1,
-            psc & 1,
-            (psc >> 1) & 1,
-            (psc >> 9) & 1,
-            (psc >> 5) & 0xf,
-            (psc >> 10) & 0xf
-        );
-    }
-    crate::serial_println!("apple_usb: [6] done (hid up: {ok})");
-    ok
+    false
 }
