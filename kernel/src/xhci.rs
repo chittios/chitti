@@ -1007,10 +1007,14 @@ impl Xhci {
             // EP state in Output Context: 1 = Running. Anything else means the
             // interrupt IN will never complete (VBox used to show READY with
             // a wiped Slot Context → port/speed 0 after Evaluate Context).
-            let ep_ctx = c.dev_ctx_va + self.ctx_size * (int_dci as usize + 1);
+            // OUTPUT device context: slot @ index 0, EP DCI d @ index d (no Input
+            // Control Context prefix — that +1 shift applies only to the INPUT
+            // context in build_input_configure). Reading (dci+1) here was off by
+            // one (an unused entry → always 0).
+            let ep_ctx = c.dev_ctx_va + self.ctx_size * int_dci as usize;
             // Output device context is controller-written — invalidate before read
             // on non-coherent DMA (real Apple).
-            dma_invalidate(c.dev_ctx_va, self.ctx_size * (int_dci as usize + 2));
+            dma_invalidate(c.dev_ctx_va, self.ctx_size * (int_dci as usize + 1));
             let ep_state = read_volatile(ep_ctx as *const u32) & 0x7;
             let slot_d0 = read_volatile((c.dev_ctx_va) as *const u32);
             let slot_d1 = read_volatile((c.dev_ctx_va + 4) as *const u32);
