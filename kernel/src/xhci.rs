@@ -157,6 +157,21 @@ impl PtrLayout {
         PtrLayout { btn_byte: 0, x_byte: 1, y_byte: 2, field_bytes: 1, relative: true, scale_max: 0, wheel_byte: Some(3) };
 }
 
+/// Where a device sits in the USB topology — a root-port device or one behind a
+/// hub. The slot context needs the route string, the root-hub port, and (for a
+/// LS/FS device behind a HS hub) the Transaction Translator parent, so the xHC
+/// can address and route to it. `ROOT` is the default (a direct root-port
+/// device, route 0, no TT).
+#[derive(Clone, Copy)]
+struct DevLoc {
+    root_port: u8,   // root-hub port the device (or its top-tier hub) hangs off
+    route: u32,      // xHCI route string (0 for a root-port device)
+    speed: u32,      // xHCI PSIV (1=FS,2=LS,3=HS,4=SS) of THIS device
+    parent_slot: u8, // TT hub's slot id (0 → no TT / on a root port)
+    parent_port: u8, // TT hub's downstream port number (1-based)
+    tt: bool,        // LS/FS device behind a HS hub → needs the parent's TT
+}
+
 /// Per-device handles produced by `enumerate_common` (an addressed device with
 /// its config descriptor read), consumed by `finish_keyboard`/`finish_pointer`.
 struct Common {
@@ -174,6 +189,13 @@ struct Common {
     buf_pa: u64,
     total: u32,
     cfg_val: u8,
+    /// bDeviceClass from the device descriptor (9 = USB hub → recurse).
+    dev_class: u8,
+    /// Topology location (root port / route / TT), for downstream re-enumeration.
+    loc: DevLoc,
+    /// SET_CONFIGURATION already issued on this slot (so a composite device's
+    /// second interface doesn't re-configure and reset the first endpoint).
+    configured: bool,
 }
 
 const RING_TRBS: usize = 64; // TRBs per ring (last is a Link on the command ring)
@@ -709,10 +731,10 @@ impl Xhci {
         self.max_ports
     }
 
-    /// Enumerate every connected port once, classifying each device as a boot
-    /// keyboard or a pointer and configuring whichever slot we still need. A
-    /// tablet on the first port no longer starves the keyboard (each port is
-    /// tried, not just the first).
+    /// Enumerate every connected root port once, classifying each device as a
+    /// keyboard, a pointer, or a **hub** (recurse into it — the Mac mini's USB-A
+    /// ports hang off an internal hub). A device on the first port no longer
+    /// starves the others (each port is tried, not just the first).
     unsafe fn scan_ports(&mut self) {
         for port in 1..=self.max_ports {
             if self.kbd.is_some() && self.mouse.is_some() {
@@ -725,35 +747,213 @@ impl Xhci {
             if port < 32 && self.done_ports & (1 << port) != 0 {
                 continue;
             }
-            if unsafe { r32(self.portsc(port)) } & PORTSC_CCS == 0 {
+            let psc = unsafe { r32(self.portsc(port)) };
+            if psc & PORTSC_CCS == 0 {
                 continue;
             }
+            crate::ktrace::log_fmt(format_args!("xhci: root port {port} device present (portsc={psc:#x})"));
             let Some(mut c) = (unsafe { self.enumerate_common(port) }) else { continue };
-            if self.kbd.is_none() {
-                if let Some((iface, ep, mps, ivl)) = unsafe { parse_hid_keyboard(c.buf_va, c.total as usize) } {
-                    if let Some(k) = unsafe { self.finish_keyboard(&mut c, iface, ep, mps, ivl) } {
-                        self.kbd = Some(k);
-                        if port < 32 { self.done_ports |= 1 << port; }
-                        continue;
-                    }
-                }
+            crate::ktrace::log_fmt(format_args!("xhci: root port {port} slot {} dev_class={}", c.slot, c.dev_class));
+            // A USB hub (bDeviceClass 9): recurse — the keyboard on a USB-A port
+            // lives behind the Mac mini's internal hub, not on a root port.
+            if c.dev_class == 9 {
+                unsafe { self.enumerate_hub(&mut c) };
+                if port < 32 { self.done_ports |= 1 << port; }
+                continue;
             }
-            if self.mouse.is_none() {
-                if let Some((iface, ep, mps, ivl, proto)) = unsafe { parse_hid_pointer(c.buf_va, c.total as usize) } {
-                    if let Some(p) = unsafe { self.finish_pointer(&mut c, iface, ep, mps, ivl, proto) } {
-                        self.mouse = Some(p);
-                        if port < 32 { self.done_ports |= 1 << port; }
-                        continue;
-                    }
-                }
+            let got = unsafe { self.classify_and_finish(&mut c) };
+            if got && port < 32 {
+                self.done_ports |= 1 << port;
             }
         }
     }
 
-    /// Steps 1–8 shared by keyboard + pointer enumeration: reset `port`, enable a
-    /// slot, address the device, learn EP0 max-packet, and read its full config
-    /// descriptor into a buffer. Returns the per-device handles; the caller then
-    /// classifies the config and finishes as a keyboard or pointer.
+    /// Classify an addressed device by its config descriptor and finish whatever
+    /// HID role(s) we still need — BOTH a keyboard and a pointer from the same
+    /// device when it is composite (a wireless dongle exposing both), sharing the
+    /// one slot. Returns whether anything was registered.
+    unsafe fn classify_and_finish(&mut self, c: &mut Common) -> bool {
+        let mut got = false;
+        if self.kbd.is_none() {
+            if let Some((iface, ep, mps, ivl)) = unsafe { parse_hid_keyboard(c.buf_va, c.total as usize) } {
+                if let Some(k) = unsafe { self.finish_keyboard(c, iface, ep, mps, ivl) } {
+                    self.kbd = Some(k);
+                    got = true;
+                }
+            }
+        }
+        if self.mouse.is_none() {
+            if let Some((iface, ep, mps, ivl, proto)) = unsafe { parse_hid_pointer(c.buf_va, c.total as usize) } {
+                if let Some(p) = unsafe { self.finish_pointer(c, iface, ep, mps, ivl, proto) } {
+                    self.mouse = Some(p);
+                    got = true;
+                }
+            }
+        }
+        got
+    }
+
+    /// Bring up a USB **hub** `c` (already addressed) and enumerate the devices
+    /// behind it — this is how a keyboard on the Mac mini's USB-A ports (which
+    /// hang off an internal hub) is reached. Configure the hub, mark its slot as
+    /// a hub in the xHC, power + reset each downstream port, and for every
+    /// connected one address the device with the right route string + TT and
+    /// classify it. One tier deep (the Mac mini's topology); nested hubs are
+    /// logged and skipped.
+    unsafe fn enumerate_hub(&mut self, c: &mut Common) {
+        // Standard-request byte for hub class requests (recipient = other/port
+        // uses bmRequestType 0x23 set / 0xA3 get).
+        const REQ_GET_STATUS: u8 = 0;
+        const REQ_CLEAR_FEATURE: u8 = 1;
+        const REQ_SET_FEATURE: u8 = 3;
+        const FEAT_PORT_RESET: u16 = 4;
+        const FEAT_PORT_POWER: u16 = 8;
+        const FEAT_C_PORT_RESET: u16 = 20;
+        // Port status bits (USB 2.0 hub wPortStatus).
+        const PS_CONNECTION: u16 = 1 << 0;
+        const PS_ENABLE: u16 = 1 << 1;
+        const PS_RESET: u16 = 1 << 4;
+        const PS_LOW_SPEED: u16 = 1 << 9;
+        const PS_HIGH_SPEED: u16 = 1 << 10;
+
+        // 1. Configure the hub (once), so it answers class requests.
+        if !c.configured {
+            if !unsafe {
+                self.control(c.slot, c.ep0_va, c.ep0_pa, &mut c.ep0_enq, &mut c.ep0_cycle, setup(0x00, 9, c.cfg_val as u16, 0, 0), 0, 0, false)
+            } {
+                crate::ktrace::log("xhci", "hub SET_CONFIGURATION failed");
+                return;
+            }
+            c.configured = true;
+        }
+        // 2. Read the hub descriptor (class GET_DESCRIPTOR, type 0x29).
+        if !unsafe {
+            self.control(c.slot, c.ep0_va, c.ep0_pa, &mut c.ep0_enq, &mut c.ep0_cycle, setup(0xA0, 6, 0x2900, 0, 15), c.buf_pa, 15, true)
+        } {
+            crate::ktrace::log("xhci", "hub GET_DESCRIPTOR failed");
+            return;
+        }
+        let nbr_ports = unsafe { read_volatile((c.buf_va + 2) as *const u8) };
+        let characteristics = unsafe { read_u16(c.buf_va + 3) };
+        let pwr_on_2_good = unsafe { read_volatile((c.buf_va + 5) as *const u8) } as u64; // 2ms units
+        let ttt = ((characteristics >> 5) & 0x3) as u32; // TT Think Time
+        crate::ktrace::log_fmt(format_args!(
+            "xhci: hub slot {} ports={nbr_ports} char={characteristics:#06x} ttt={ttt}",
+            c.slot
+        ));
+        // 3. Tell the xHC this slot is a hub (Hub=1, #ports, TT think time) so it
+        //    will schedule + route downstream transfers.
+        unsafe { self.mark_hub(c, nbr_ports, ttt) };
+        // 4. Power all ports, wait the descriptor's power-on-to-good, then reset
+        //    + enumerate each connected one.
+        for p in 1..=nbr_ports {
+            let _ = unsafe {
+                self.control(c.slot, c.ep0_va, c.ep0_pa, &mut c.ep0_enq, &mut c.ep0_cycle, setup(0x23, REQ_SET_FEATURE, FEAT_PORT_POWER, p as u16, 0), 0, 0, false)
+            };
+        }
+        spin_delay(2_000_000 + pwr_on_2_good * 400_000);
+        for p in 1..=nbr_ports {
+            if self.kbd.is_some() && self.mouse.is_some() {
+                break;
+            }
+            if !unsafe {
+                self.control(c.slot, c.ep0_va, c.ep0_pa, &mut c.ep0_enq, &mut c.ep0_cycle, setup(0xA3, REQ_GET_STATUS, 0, p as u16, 4), c.buf_pa, 4, true)
+            } {
+                continue;
+            }
+            let status = unsafe { read_u16(c.buf_va) };
+            crate::ktrace::log_fmt(format_args!("xhci: hub port {p} status={status:#06x}"));
+            if status & PS_CONNECTION == 0 {
+                continue; // nothing plugged into this downstream port
+            }
+            // Reset the downstream port, poll until enabled + reset-done.
+            let _ = unsafe {
+                self.control(c.slot, c.ep0_va, c.ep0_pa, &mut c.ep0_enq, &mut c.ep0_cycle, setup(0x23, REQ_SET_FEATURE, FEAT_PORT_RESET, p as u16, 0), 0, 0, false)
+            };
+            let mut reset_ok = false;
+            for _ in 0..50 {
+                spin_delay(1_000_000);
+                if !unsafe {
+                    self.control(c.slot, c.ep0_va, c.ep0_pa, &mut c.ep0_enq, &mut c.ep0_cycle, setup(0xA3, REQ_GET_STATUS, 0, p as u16, 4), c.buf_pa, 4, true)
+                } {
+                    continue;
+                }
+                let st = unsafe { read_u16(c.buf_va) };
+                if st & PS_ENABLE != 0 && st & PS_RESET == 0 {
+                    reset_ok = true;
+                    break;
+                }
+            }
+            if !reset_ok {
+                crate::ktrace::log_fmt(format_args!("xhci: hub port {p} reset never completed"));
+                continue;
+            }
+            // Clear the reset-change latch, then let the device settle.
+            let _ = unsafe {
+                self.control(c.slot, c.ep0_va, c.ep0_pa, &mut c.ep0_enq, &mut c.ep0_cycle, setup(0x23, REQ_CLEAR_FEATURE, FEAT_C_PORT_RESET, p as u16, 0), 0, 0, false)
+            };
+            spin_delay(4_000_000); // USB reset-recovery
+            let status = unsafe { read_u16(c.buf_va) };
+            let speed = if status & PS_LOW_SPEED != 0 {
+                2 // low speed (PSIV 2)
+            } else if status & PS_HIGH_SPEED != 0 {
+                3 // high speed (PSIV 3)
+            } else {
+                1 // full speed (PSIV 1)
+            };
+            let hub_hs = c.loc.speed >= 3;
+            let loc = DevLoc {
+                root_port: c.loc.root_port,
+                route: push_route(c.loc.route, p),
+                speed,
+                parent_slot: c.slot,
+                parent_port: p,
+                // A LS/FS device behind a HS hub uses the hub's transaction translator.
+                tt: (speed == 1 || speed == 2) && hub_hs,
+            };
+            crate::ktrace::log_fmt(format_args!(
+                "xhci: hub port {p} device speed={speed} route={:#x} tt={} — addressing",
+                loc.route, loc.tt
+            ));
+            let Some(mut dc) = (unsafe { self.address_and_config(loc) }) else {
+                crate::ktrace::log_fmt(format_args!("xhci: hub port {p} device enumeration failed"));
+                continue;
+            };
+            crate::ktrace::log_fmt(format_args!("xhci: hub port {p} slot {} dev_class={}", dc.slot, dc.dev_class));
+            if dc.dev_class == 9 {
+                crate::ktrace::log_fmt(format_args!("xhci: nested hub on hub port {p} not descended"));
+                continue;
+            }
+            unsafe { self.classify_and_finish(&mut dc) };
+        }
+    }
+
+    /// Update a hub's Slot Context in the xHC (Configure Endpoint, Add Slot
+    /// only): set the Hub flag, the port count, and the TT Think Time so the
+    /// controller will route to + schedule for the devices behind it.
+    unsafe fn mark_hub(&mut self, c: &Common, nbr_ports: u8, ttt: u32) {
+        unsafe {
+            let in_ctx_va = c.in_ctx_va;
+            w32(in_ctx_va, 0); // Drop none
+            w32(in_ctx_va + 4, 0b1); // Add A0 (slot) only
+            let in_slot = in_ctx_va + self.ctx_size;
+            core::ptr::copy_nonoverlapping(c.dev_ctx_va as *const u8, in_slot as *mut u8, self.ctx_size);
+            w32(in_slot, r32(in_slot) | (1 << 26)); // dword0 Hub=1
+            let d1 = (r32(in_slot + 4) & 0x00ff_ffff) | ((nbr_ports as u32) << 24); // #ports [31:24]
+            w32(in_slot + 4, d1);
+            let d2 = (r32(in_slot + 8) & !(0b11 << 16)) | ((ttt & 0x3) << 16); // TTT [17:16]
+            w32(in_slot + 8, d2);
+            match self.command(c.in_ctx_pa, (TRB_CONFIGURE_ENDPOINT << 10) | ((c.slot as u32) << 24)) {
+                Some((cc, _)) if cc == CC_SUCCESS => {}
+                other => crate::ktrace::log_fmt(format_args!("xhci: mark-hub configure endpoint failed ({other:?})")),
+            }
+        }
+    }
+
+    /// Enumerate a device on **root** port `port`: reset the port, read its
+    /// speed, then address + configure it at the root of the topology (route 0,
+    /// no TT). The location-independent work is in [`address_and_config`], which
+    /// the hub path reuses for downstream devices.
     unsafe fn enumerate_common(&mut self, port: u8) -> Option<Common> {
         let psc = self.portsc(port);
         unsafe {
@@ -781,12 +981,22 @@ impl Xhci {
             spin_delay(2_000_000);
         }
         let speed = (unsafe { r32(psc) } >> 10) & 0xf;
+        crate::ktrace::log_fmt(format_args!("xhci: port {port} connected, speed {speed}, resetting -> enabled"));
+        let loc = DevLoc { root_port: port, route: 0, speed, parent_slot: 0, parent_port: 0, tt: false };
+        unsafe { self.address_and_config(loc) }
+    }
+
+    /// Steps 2–8 shared by every device (root or behind a hub): enable a slot,
+    /// address the device at its [`DevLoc`] (route string + TT), learn EP0
+    /// max-packet, capture bDeviceClass, and read its full config descriptor.
+    /// The caller then classifies it (keyboard / pointer / hub).
+    unsafe fn address_and_config(&mut self, loc: DevLoc) -> Option<Common> {
+        let speed = loc.speed;
         let ep0_mps: u32 = match speed {
             3 => 64,      // high
             4 | 5 => 512, // super/super+
             _ => 8,       // full/low
         };
-        crate::ktrace::log_fmt(format_args!("xhci: port {port} connected, speed {speed}, resetting -> enabled"));
 
         // 2. Enable a slot.
         let (cc, slot) = unsafe { self.command(0, TRB_ENABLE_SLOT << 10) }?;
@@ -811,7 +1021,7 @@ impl Xhci {
         let (in_ctx_pa, in_ctx_va) = (self.alloc)(4096)?;
         let in_ctx_va = in_ctx_va as usize;
         unsafe {
-            self.build_input_slot_ep0(in_ctx_va, port, speed, ep0_mps, ep0_pa);
+            self.build_input_slot_ep0(in_ctx_va, loc, ep0_mps, ep0_pa);
             // 6. Address Device.
             let (cc, _) = self.command(in_ctx_pa, (TRB_ADDRESS_DEVICE << 10) | ((slot as u32) << 24))?;
             if cc != CC_SUCCESS {
@@ -846,6 +1056,7 @@ impl Xhci {
         // is always safe (8 ≤ any MPS), and byte 7 is bMaxPacketSize0.
         let (buf_pa, buf_va) = (self.alloc)(4096)?;
         let buf_va = buf_va as usize;
+        let mut dev_class = 0u8;
         let got_dev = unsafe {
             self.control(slot, ep0_va, ep0_pa, &mut ep0_enq, &mut ep0_cycle, setup(0x80, 6, 0x0100, 0, 8), buf_pa, 8, true)
         };
@@ -862,6 +1073,8 @@ impl Xhci {
             }
         }
         if got_dev {
+            // bDeviceClass@4: 9 = USB hub (the caller recurses into it).
+            dev_class = unsafe { read_volatile((buf_va + 4) as *const u8) };
             let b = unsafe { read_volatile((buf_va + 7) as *const u8) } as u32;
             // full/low (speed 1/2): bMaxPacketSize0 is the byte count (8/16/32/64).
             // super-speed (4): it's an exponent (9 => 512). high (3) is always 64.
@@ -907,6 +1120,9 @@ impl Xhci {
             buf_pa,
             total,
             cfg_val,
+            dev_class,
+            loc,
+            configured: false,
         })
     }
 
@@ -924,23 +1140,11 @@ impl Xhci {
         set_boot: bool,
     ) -> Option<(u8, usize, u64, u64, usize)> {
         unsafe {
-            // Set configuration (required before the device will answer interrupt IN).
-            if !self.control(
-                c.slot,
-                c.ep0_va,
-                c.ep0_pa,
-                &mut c.ep0_enq,
-                &mut c.ep0_cycle,
-                setup(0x00, 9, c.cfg_val as u16, 0, 0),
-                0,
-                0,
-                false,
-            ) {
-                crate::ktrace::log_fmt(format_args!(
-                    "xhci: SET_CONFIGURATION({}) failed — retrying once after EP0 recover",
-                    c.cfg_val
-                ));
-                // recover_ep0 already ran inside control(); try once more.
+            // Set configuration ONCE per device (required before it answers
+            // interrupt IN). A composite device (keyboard + mouse on one slot)
+            // finishes two interfaces; re-issuing SET_CONFIGURATION for the
+            // second would reset the first interface's endpoints, so guard it.
+            if !c.configured {
                 if !self.control(
                     c.slot,
                     c.ep0_va,
@@ -952,9 +1156,27 @@ impl Xhci {
                     0,
                     false,
                 ) {
-                    crate::ktrace::log("xhci", "SET_CONFIGURATION failed twice");
-                    return None;
+                    crate::ktrace::log_fmt(format_args!(
+                        "xhci: SET_CONFIGURATION({}) failed — retrying once after EP0 recover",
+                        c.cfg_val
+                    ));
+                    // recover_ep0 already ran inside control(); try once more.
+                    if !self.control(
+                        c.slot,
+                        c.ep0_va,
+                        c.ep0_pa,
+                        &mut c.ep0_enq,
+                        &mut c.ep0_cycle,
+                        setup(0x00, 9, c.cfg_val as u16, 0, 0),
+                        0,
+                        0,
+                        false,
+                    ) {
+                        crate::ktrace::log("xhci", "SET_CONFIGURATION failed twice");
+                        return None;
+                    }
                 }
+                c.configured = true;
             }
             if set_boot {
                 // SET_PROTOCOL(boot=0). VBox often stalls when already in boot
@@ -1077,16 +1299,24 @@ impl Xhci {
     }
 
     /// Build the input context for Address Device: add flags A0|A1, a slot
-    /// context (route 0, this root port, speed, 1 context entry) and the EP0
-    /// control endpoint context.
-    unsafe fn build_input_slot_ep0(&self, in_ctx_va: usize, port: u8, speed: u32, ep0_mps: u32, ep0_pa: u64) {
+    /// context (route string, root-hub port, speed, 1 context entry — plus the
+    /// TT parent for a LS/FS device behind a HS hub) and the EP0 control
+    /// endpoint context.
+    unsafe fn build_input_slot_ep0(&self, in_ctx_va: usize, loc: DevLoc, ep0_mps: u32, ep0_pa: u64) {
         unsafe {
             // zero the control + slot + ep0 area
             core::ptr::write_bytes(in_ctx_va as *mut u8, 0, self.ctx_size * 3);
             w32(in_ctx_va + 4, 0b11); // Add flags: A0 (slot) | A1 (EP0)
             let slot_ctx = in_ctx_va + self.ctx_size;
-            w32(slot_ctx, (1 << 27) | (speed << 20)); // ctx entries=1, speed, route=0
-            w32(slot_ctx + 4, (port as u32) << 16); // root hub port number
+            // dword0: Route String[19:0] | Speed[23:20] | Context Entries[31:27]=1.
+            w32(slot_ctx, (1 << 27) | (loc.speed << 20) | (loc.route & 0xf_ffff));
+            // dword1: Root Hub Port Number[23:16].
+            w32(slot_ctx + 4, (loc.root_port as u32) << 16);
+            // dword2: TT Hub Slot ID[7:0] | TT Port Number[15:8] for a LS/FS
+            // device behind a HS hub (the hub does the transaction translation).
+            if loc.tt {
+                w32(slot_ctx + 8, (loc.parent_slot as u32) | ((loc.parent_port as u32) << 8));
+            }
             let ep0 = in_ctx_va + self.ctx_size * 2;
             w32(ep0 + 4, (4 << 3) | (ep0_mps << 16) | (3 << 1)); // type=Control, MPS, CErr=3
             w64(ep0 + 8, ep0_pa | 1); // TR dequeue ptr | DCS
@@ -1119,11 +1349,16 @@ impl Xhci {
             // Control: Drop none; Add Slot (A0) + interrupt EP (A_dci).
             w32(in_ctx_va, 0);
             w32(in_ctx_va + 4, 0b1 | (1u32 << dci));
-            // Copy Output Slot Context → Input Slot Context, then set entries=dci.
+            // Copy Output Slot Context → Input Slot Context, then set Context
+            // Entries to max(current, dci): a composite device's second endpoint
+            // may have a LOWER DCI than the first, and shrinking the count would
+            // drop the already-installed endpoint from the slot.
             let in_slot = in_ctx_va + self.ctx_size;
             core::ptr::copy_nonoverlapping(c.dev_ctx_va as *const u8, in_slot as *mut u8, self.ctx_size);
+            let cur_entries = (r32(in_slot) >> 27) & 0x1f;
+            let entries = cur_entries.max(dci as u32);
             let d0 = r32(in_slot) & !(0x1f << 27);
-            w32(in_slot, d0 | ((dci as u32) << 27));
+            w32(in_slot, d0 | (entries << 27));
             // Interrupt IN endpoint context at index dci+1.
             let ep = in_ctx_va + self.ctx_size * (dci as usize + 1);
             core::ptr::write_bytes(ep as *mut u8, 0, self.ctx_size);
@@ -1313,6 +1548,20 @@ impl Xhci {
     pub fn poll_mouse(&mut self) {
         self.pump_events();
     }
+}
+
+/// Append downstream hub `port` to a route string at the first empty nibble.
+/// xHCI route strings pack one 4-bit hub-port number per tier below the root
+/// hub (`bits[3:0]` = the first-tier hub's downstream port, etc.), up to 5 tiers.
+/// A root-port device has route 0, so a device on `port` of a root-port hub gets
+/// `port` in the low nibble.
+fn push_route(hub_route: u32, port: u8) -> u32 {
+    for tier in 0..5 {
+        if (hub_route >> (4 * tier)) & 0xf == 0 {
+            return hub_route | (((port as u32) & 0xf) << (4 * tier));
+        }
+    }
+    hub_route
 }
 
 /// Pack a USB setup packet into the little-endian u64 a Setup Stage TRB expects.
@@ -1652,5 +1901,58 @@ mod tests {
         assert_eq!(hid_to_ascii(0x28, false, false), Some(b'\r')); // Enter
         assert_eq!(hid_to_ascii(0x2c, false, false), Some(b' ')); // Space
         assert_eq!(hid_to_ascii(0x00, false, false), None); // no key
+    }
+
+    /// Route strings pack one hub-port nibble per tier below the root hub: a
+    /// root-port device is route 0; a device on port P of a root-port hub is P
+    /// in the low nibble; a second tier fills the next nibble.
+    #[test_case]
+    fn route_string_packs_one_nibble_per_tier() {
+        assert_eq!(push_route(0, 3), 0x3); // tier-1 device on hub port 3
+        assert_eq!(push_route(0, 7), 0x7);
+        assert_eq!(push_route(0x3, 5), 0x53); // tier-2 device behind port 3 then 5
+        assert_eq!(push_route(0x53, 1), 0x153); // tier-3
+        // Port numbers are masked to a nibble (hubs have ≤15 ports on this path).
+        assert_eq!(push_route(0, 0xf), 0xf);
+    }
+
+    /// The Address-Device slot-context word-0 packing used by
+    /// `build_input_slot_ep0`: route string in [19:0], speed in [23:20],
+    /// context-entries in [31:27]; and word-2 carries the TT parent for a LS/FS
+    /// device behind a HS hub.
+    #[test_case]
+    fn slot_context_route_speed_and_tt_packing() {
+        let route = 0x53u32;
+        let speed = 2u32; // low speed
+        let d0 = (1 << 27) | (speed << 20) | (route & 0xf_ffff);
+        assert_eq!(d0 & 0xf_ffff, 0x53, "route string");
+        assert_eq!((d0 >> 20) & 0xf, 2, "speed");
+        assert_eq!((d0 >> 27) & 0x1f, 1, "context entries");
+        // Word-2 TT: hub slot id [7:0] | hub port [15:8].
+        let (parent_slot, parent_port) = (4u32, 3u32);
+        let d2 = parent_slot | (parent_port << 8);
+        assert_eq!(d2 & 0xff, 4);
+        assert_eq!((d2 >> 8) & 0xff, 3);
+    }
+
+    /// `mark_hub`'s slot-context bit math: Hub flag at bit 26, number of ports in
+    /// [31:24], TT think time in [17:16] — set without disturbing the copied
+    /// route/speed/port fields.
+    #[test_case]
+    fn hub_slot_context_bit_math() {
+        // Start from a slot context with speed=HS, root port 2, entries=1.
+        let d0_in = (1u32 << 27) | (3 << 20);
+        let d1_in = (2u32) << 16;
+        let d2_in = 0u32;
+        let nbr_ports = 4u32;
+        let ttt = 0b10u32;
+        let d0 = d0_in | (1 << 26);
+        let d1 = (d1_in & 0x00ff_ffff) | (nbr_ports << 24);
+        let d2 = (d2_in & !(0b11 << 16)) | ((ttt & 0x3) << 16);
+        assert_eq!((d0 >> 26) & 1, 1, "Hub flag");
+        assert_eq!((d0 >> 20) & 0xf, 3, "speed preserved");
+        assert_eq!((d1 >> 24) & 0xff, 4, "number of ports");
+        assert_eq!((d1 >> 16) & 0xff, 2, "root hub port preserved");
+        assert_eq!((d2 >> 16) & 0x3, 0b10, "TT think time");
     }
 }

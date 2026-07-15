@@ -10,20 +10,29 @@ use crate::mm::Locked;
 use crate::pci;
 use crate::xhci::Xhci;
 use alloc::alloc::{alloc_zeroed, Layout};
+use alloc::vec::Vec;
 use core::ptr::write_volatile;
 
-static XHCI: Locked<Option<Xhci>> = Locked::new(None);
+/// Every USB controller we brought up + enumerated (the Mac mini has two dwc3
+/// controllers, one per Type-C port; a keyboard on one and a mouse dongle on the
+/// other must both stay live). `poll_key`/`poll_mouse` fan out across all of
+/// them; a single-controller platform (QEMU) just has one entry.
+static XHCI: Locked<Vec<Xhci>> = Locked::new(Vec::new());
 
 const DART_PAGE: usize = 0x4000; // 16 KiB DART page
 
-/// Apple USB DMA translation state: the DART + its single L2 table (covers IOVA
-/// 0..32 MiB, L1 index 0) + an IOVA bump allocator. The DWC3 emits low IOVAs the
-/// DART translates to the high physical DMA buffers — bypass, which makes the
-/// controller emit the high PA itself, faults the periodic interrupt transfer
-/// (Host System Error) even though enumeration's control transfers survive it.
+/// Apple USB DMA translation state: ONE shared L1/L2 table (covers IOVA
+/// 0..32 MiB, L1 index 0) + an IOVA bump allocator, plus every DART that points
+/// at it. The DWC3 emits low IOVAs the DART translates to the high physical DMA
+/// buffers — bypass, which makes the controller emit the high PA itself, faults
+/// the periodic interrupt transfer (Host System Error) even though enumeration's
+/// control transfers survive it. All controllers share one table (each DART maps
+/// the same IOVA→PA; the bump allocator hands out non-overlapping IOVAs), so a
+/// second controller reuses the table rather than clobbering the first's.
 struct UsbDma {
-    darts: [(usize, u32); 2], // (base, sid) — all the controller's DARTs
+    darts: [(usize, u32); 4], // (base, sid) — every controller's DARTs (2 each)
     ndarts: usize,
+    l1_pa: u64,     // shared L1 table physical (all DARTs' TTBR point here)
     l2_va: usize,   // shared 2048-entry L2 table (16 KiB), maps IOVA 0..32 MiB
     next_iova: u64, // bump, 16 KiB pages
 }
@@ -52,36 +61,45 @@ pub fn dma_translate_setup(darts: &[(usize, u32)]) -> bool {
     if darts.is_empty() {
         return false;
     }
-    let Ok(layout) = Layout::from_size_align(DART_PAGE, DART_PAGE) else { return false };
-    // SAFETY: nonzero 16 KiB layout; leaked, used as DART page tables.
-    let l1 = unsafe { alloc_zeroed(layout) } as usize;
-    let l2 = unsafe { alloc_zeroed(layout) } as usize;
-    if l1 == 0 || l2 == 0 {
-        return false;
-    }
-    let l1_pa = dma_to_phys(l1 as u64);
-    let l2_pa = dma_to_phys(l2 as u64);
-    // L1[0] → L2 table (a PTE, same encoding as a leaf).
-    // SAFETY: l1 is a fresh 16 KiB table.
-    unsafe { write_volatile(l1 as *mut u64, dart::make_pte(l2_pa)) };
-    dcache_clean(l1, 8);
-    // Point EVERY DART at the SAME L1 table (mirrored translation): the dwc3
-    // DMAs through all its DARTs, so any one left unconfigured faults.
-    let mut saved = [(0usize, 0u32); 2];
-    let mut n = 0;
-    for &(base, sid) in darts.iter().take(saved.len()) {
-        // SAFETY: base is the Device-mapped DART; sid from the FDT.
-        let dart = unsafe { Dart::new(base, sid) };
-        if !dart.set_translate(l1_pa) {
-            crate::ktrace::log_fmt(format_args!("apple_usb: DART {base:#x} sid {sid} set_translate failed"));
-            return false;
+    USB_DMA.with(|s| {
+        // Create the shared L1/L2 table on the first controller; later
+        // controllers reuse it (one IOVA→PA map for the whole USB subsystem).
+        if s.is_none() {
+            let Ok(layout) = Layout::from_size_align(DART_PAGE, DART_PAGE) else { return false };
+            // SAFETY: nonzero 16 KiB layout; leaked, used as DART page tables.
+            let l1 = unsafe { alloc_zeroed(layout) } as usize;
+            let l2 = unsafe { alloc_zeroed(layout) } as usize;
+            if l1 == 0 || l2 == 0 {
+                return false;
+            }
+            let l1_pa = dma_to_phys(l1 as u64);
+            let l2_pa = dma_to_phys(l2 as u64);
+            // L1[0] → L2 table (a PTE, same encoding as a leaf).
+            // SAFETY: l1 is a fresh 16 KiB table.
+            unsafe { write_volatile(l1 as *mut u64, dart::make_pte(l2_pa)) };
+            dcache_clean(l1, 8);
+            *s = Some(UsbDma { darts: [(0, 0); 4], ndarts: 0, l1_pa, l2_va: l2, next_iova: DART_PAGE as u64 });
         }
-        saved[n] = (base, sid);
-        n += 1;
-    }
-    USB_DMA.with(|s| *s = Some(UsbDma { darts: saved, ndarts: n, l2_va: l2, next_iova: DART_PAGE as u64 }));
-    crate::ktrace::log_fmt(format_args!("apple_usb: DART translate ready ({n} darts)"));
-    true
+        let d = s.as_mut().unwrap();
+        // Point each of THIS controller's DARTs at the shared L1 table (mirrored
+        // translation): the dwc3 DMAs through all its DARTs, so any one left
+        // unconfigured faults. Record them so `aa_alloc_apple` flushes them all.
+        for &(base, sid) in darts {
+            if d.ndarts >= d.darts.len() {
+                break;
+            }
+            // SAFETY: base is the Device-mapped DART; sid from the FDT.
+            let dart = unsafe { Dart::new(base, sid) };
+            if !dart.set_translate(d.l1_pa) {
+                crate::ktrace::log_fmt(format_args!("apple_usb: DART {base:#x} sid {sid} set_translate failed"));
+                return false;
+            }
+            d.darts[d.ndarts] = (base, sid);
+            d.ndarts += 1;
+        }
+        crate::ktrace::log_fmt(format_args!("apple_usb: DART translate ready ({} darts total)", d.ndarts));
+        true
+    })
 }
 
 /// DMA allocator for the Apple USB path: allocate a 16 KiB-aligned buffer, map
@@ -136,7 +154,7 @@ pub fn init_global() -> bool {
                 if kbd { "yes" } else { "no" },
                 if mse { "yes" } else { "no" }
             ));
-            XHCI.with(|s| *s = Some(x));
+            XHCI.with(|s| s.push(x));
             return ok;
         }
     }
@@ -160,32 +178,41 @@ pub fn attach_at(base: usize) -> bool {
             if x.has_keyboard() { "yes" } else { "no" },
             if x.has_mouse() { "yes" } else { "no" }
         ));
-        XHCI.with(|s| *s = Some(x));
+        XHCI.with(|s| s.push(x));
         return ok;
     }
     crate::ktrace::log("xhci(apple)", "controller not ready (bringup timed out)");
     false
 }
 
-/// Whether a USB HID keyboard was enumerated (for the INPUT boot line).
+/// Whether a USB HID keyboard was enumerated on any controller (INPUT boot line).
 pub fn has_keyboard() -> bool {
-    XHCI.with(|s| s.as_ref().map(|x| x.has_keyboard()).unwrap_or(false))
+    XHCI.with(|s| s.iter().any(|x| x.has_keyboard()))
 }
 
-/// Whether a USB HID pointer/tablet was enumerated (for the INPUT boot line).
+/// Whether a USB HID pointer/tablet was enumerated on any controller.
 pub fn has_mouse() -> bool {
-    XHCI.with(|s| s.as_ref().map(|x| x.has_mouse()).unwrap_or(false))
+    XHCI.with(|s| s.iter().any(|x| x.has_mouse()))
 }
 
-/// The next byte from a USB keyboard, if any.
+/// The next byte from any USB keyboard, if one is ready (checks every
+/// controller — a keyboard may be on a different dwc3 than the mouse).
 pub fn poll_key() -> Option<u8> {
-    XHCI.with(|s| s.as_mut().and_then(|x| x.poll_key()))
+    XHCI.with(|s| {
+        for x in s.iter_mut() {
+            if let Some(b) = x.poll_key() {
+                return Some(b);
+            }
+        }
+        None
+    })
 }
 
-/// Drain USB HID mouse reports into `crate::mouse` (no-op if no USB mouse).
+/// Drain USB HID mouse reports into `crate::mouse` from every controller
+/// (no-op if none has a pointer).
 pub fn poll_mouse() {
     XHCI.with(|s| {
-        if let Some(x) = s.as_mut() {
+        for x in s.iter_mut() {
             x.poll_mouse();
         }
     });

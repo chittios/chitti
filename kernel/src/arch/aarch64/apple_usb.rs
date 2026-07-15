@@ -17,18 +17,21 @@
 //! PHY setup and re-init the controller from scratch — but as an **xHCI host**
 //! (`GCTL.PRTCAPDIR = HOST`), which m1n1 never does (it runs a device/gadget).
 //!
-//! ## Honest status (untested on hardware)
-//! m1n1's PHY sequence is the **USB2 *dummy* PHY** it uses as a gadget, where
-//! the *host cable* supplies Vbus/CC. As a **host** driving a *downstream*
-//! device, the real USB2/Type-C path likely needs (a) a host-mode PHY/mux
-//! setting instead of `PIPEHANDLER_MUX_CTRL_DUMMY`, and (b) Type-C orientation +
-//! port power via the **TPS6598x PD controller over I²C** — neither of which
-//! m1n1 does for the host role, so there is no source to port them from yet.
-//! This module therefore brings the stack up as far as m1n1's sources allow and
-//! attaches the xHCI core; first-boot enumeration of a plugged-in keyboard is
-//! **not** expected to work until the host-PHY + PD-controller pieces land. See
-//! the hardware-verification notes. Everything here is gated on `is_apple()` and
-//! degrades gracefully (logs + returns false), so it never regresses QEMU.
+//! ## Status
+//! A USB2 keyboard on a **USB-C** port works (dual-DART translation +
+//! non-coherent DMA maintenance, commit `6838562`). We now bring up **both**
+//! dwc3 controllers and keep them live (a keyboard on one Type-C port + a mouse
+//! dongle on the other), and the xHCI core enumerates **composite** HID devices
+//! (a wireless dongle exposing keyboard+mouse on one slot) and devices behind a
+//! **USB hub** — the path to the Mac mini's **USB-A** ports, which hang off an
+//! internal hub downstream of one controller's root port.
+//!
+//! Still open: **Type-C orientation / Vbus** via the Apple `cd321x` PD
+//! controller (a USB-C device only works in the orientation that happens to
+//! route USB2 to the live pins). The PHY sequence is still m1n1's USB2 *dummy*
+//! PHY (no host-mode ATC-PHY source — that's GPL in Asahi's `atc.c`).
+//! Everything here is gated on `is_apple()` and degrades gracefully (logs +
+//! returns false), so it never regresses QEMU.
 
 use core::ptr::{read_volatile, write_volatile};
 
@@ -245,20 +248,25 @@ pub fn init() -> bool {
         crate::ktrace::log("apple_usb", "USB HID gated (add `chitti.usb` bootarg on a BARE boot to enable; never under the hv)");
         return false;
     }
-    let mut any = false;
+    // Bring up EVERY controller and keep them all live — the Mac mini has two
+    // dwc3 controllers (one per Type-C port) and a keyboard-on-one +
+    // mouse-on-the-other must both work, so we must not stop at the first that
+    // yields HID (the old `return true` lost the second controller's devices).
+    let mut any_ctrl = false;
+    let mut any_hid = false;
     for idx in 0..2 {
         let Some(hw) = discover(idx) else {
             continue; // no idx-th controller
         };
-        any = true;
+        any_ctrl = true;
         if bringup_controller(idx, &hw) {
-            return true; // HID up on this controller
+            any_hid = true;
         }
     }
-    if !any {
+    if !any_ctrl {
         crate::ktrace::log("apple_usb", "no apple,dwc3 in device tree; skipping");
-    } else {
+    } else if !any_hid {
         crate::ktrace::log("apple_usb", "no HID enumerated on any USB controller");
     }
-    false
+    any_hid
 }
