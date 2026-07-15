@@ -140,24 +140,76 @@ struct Ptr {
 
 /// Where the fields sit in a pointer's input report, parsed from its HID report
 /// descriptor (so it works for any tablet/mouse layout, not a hardcoded guess).
-/// Byte offsets are absolute in the received report (they already include the
-/// leading report-ID byte when one is present).
+/// Offsets and sizes are in **bits**, absolute in the received report (already
+/// including the leading report-ID byte when one is present) — a byte model
+/// can't express the 12-bit packed X/Y many real mice use (a wireless dongle's
+/// `[id][buttons:8][X:12][Y:12][wheel:8]`).
 #[derive(Clone, Copy)]
 struct PtrLayout {
-    btn_byte: u8,
-    x_byte: u8,
-    y_byte: u8,
-    field_bytes: u8, // 1 or 2
+    report_id: u8, // report-ID prefix (0 = none); only decode reports with this id
+    btn_bit: u16,  // bit offset of button 1 (left)
+    x_bit: u16,
+    x_bits: u8,
+    y_bit: u16,
+    y_bits: u8,
+    wheel_bit: Option<u16>, // bit offset of the scroll-wheel field (Usage 0x38)
+    wheel_bits: u8,
     relative: bool,
-    scale_max: i32,         // logical max for absolute scaling
-    wheel_byte: Option<u8>, // byte offset of the scroll-wheel field (Usage 0x38), if present
+    scale_max: i32, // logical max for absolute scaling
 }
 
 impl PtrLayout {
-    /// The standard relative boot-mouse report: `[buttons, dx:i8, dy:i8]`
-    /// (plus a wheel byte at offset 3 on wheel mice).
-    const BOOT_MOUSE: PtrLayout =
-        PtrLayout { btn_byte: 0, x_byte: 1, y_byte: 2, field_bytes: 1, relative: true, scale_max: 0, wheel_byte: Some(3) };
+    /// The standard relative boot-mouse report: `[buttons, dx:i8, dy:i8, wheel:i8]`
+    /// (no report ID; all fields byte-aligned 8-bit).
+    const BOOT_MOUSE: PtrLayout = PtrLayout {
+        report_id: 0,
+        btn_bit: 0,
+        x_bit: 8,
+        x_bits: 8,
+        y_bit: 16,
+        y_bits: 8,
+        wheel_bit: Some(24),
+        wheel_bits: 8,
+        relative: true,
+        scale_max: 0,
+    };
+}
+
+/// Fallback when a pointer's report descriptor can't be parsed: the common
+/// absolute tablet report `[buttons:8, X:16, Y:16]` (QEMU/VBox usb-tablet).
+const TABLET_FALLBACK: PtrLayout = PtrLayout {
+    report_id: 0,
+    btn_bit: 0,
+    x_bit: 8,
+    x_bits: 16,
+    y_bit: 24,
+    y_bits: 16,
+    wheel_bit: None,
+    wheel_bits: 8,
+    relative: false,
+    scale_max: 0x7fff,
+};
+
+/// Extract `bits` starting at `bit_off` from a little-endian bit-packed report
+/// (bit 0 = byte 0's LSB, the HID convention). Bits past the buffer read as 0.
+fn extract_bits(rep: &[u8], bit_off: usize, bits: usize) -> u32 {
+    let mut v = 0u32;
+    for i in 0..bits.min(32) {
+        let b = bit_off + i;
+        if b / 8 < rep.len() && (rep[b / 8] >> (b % 8)) & 1 != 0 {
+            v |= 1 << i;
+        }
+    }
+    v
+}
+
+/// Sign-extend the low `bits` of `v` to a full `i32` (for relative deltas).
+fn sign_extend(v: u32, bits: usize) -> i32 {
+    if bits == 0 || bits >= 32 {
+        return v as i32;
+    }
+    let shift = 32 - bits;
+    ((v << shift) as i32) >> shift
 }
 
 /// Where a device sits in the USB topology — a root-port device or one behind a
@@ -1277,9 +1329,9 @@ impl Xhci {
             }
             (got.then(|| unsafe { parse_report_layout(c.buf_va, (rdlen as usize).min(4096)) }).flatten())
                 // Fallback: the common absolute tablet report [buttons, X:u16, Y:u16].
-                .unwrap_or(PtrLayout { btn_byte: 0, x_byte: 1, y_byte: 3, field_bytes: 2, relative: false, scale_max: 0x7fff, wheel_byte: None })
+                .unwrap_or(TABLET_FALLBACK)
         } else {
-            PtrLayout { btn_byte: 0, x_byte: 1, y_byte: 3, field_bytes: 2, relative: false, scale_max: 0x7fff, wheel_byte: None }
+            TABLET_FALLBACK
         };
         let mut ptr = Ptr {
             slot: c.slot, int_dci, int_ring_va: int_va, int_ring_pa: int_pa,
@@ -1292,10 +1344,11 @@ impl Xhci {
             self.arm_int(ptr.int_ring_va, ptr.int_ring_pa, &mut ptr.int_enqueue, &mut ptr.int_cycle, ptr.report_pa, ptr.report_len, ptr.slot, ptr.int_dci);
         }
         crate::ktrace::log_fmt(format_args!(
-            "xhci: HID pointer ready (slot {}, ep {ep_addr:#x}, dci {int_dci}, {}, x@{} y@{} {}B btn@{} max={})",
+            "xhci: HID pointer ready (slot {}, ep {ep_addr:#x}, dci {int_dci}, {}, id={} x@{}/{}b y@{}/{}b btn@{} wheel@{:?} max={})",
             c.slot,
             if layout.relative { "relative" } else { "absolute" },
-            layout.x_byte, layout.y_byte, layout.field_bytes, layout.btn_byte, layout.scale_max
+            layout.report_id, layout.x_bit, layout.x_bits, layout.y_bit, layout.y_bits,
+            layout.btn_bit, layout.wheel_bit, layout.scale_max
         ));
         Some(ptr)
     }
@@ -1486,35 +1539,29 @@ impl Xhci {
                             *b = read_volatile((m.report_va + i) as *const u8);
                         }
                         let lo = m.layout;
-                        let field = |off: u8| -> u32 {
-                            let o = off as usize;
-                            if lo.field_bytes >= 2 {
-                                (rep[o] as u32) | ((*rep.get(o + 1).unwrap_or(&0) as u32) << 8)
-                            } else {
-                                rep[o] as u32
-                            }
-                        };
-                        let (x, y) = (field(lo.x_byte), field(lo.y_byte));
+                        // A multi-report-ID interface (this dongle also carries a
+                        // vendor report) prefixes each report with its ID; only
+                        // decode the pointer's, else a vendor report is garbage.
+                        let id_ok = lo.report_id == 0 || rep.first().copied() == Some(lo.report_id);
+                        let xr = extract_bits(&rep[..n], lo.x_bit as usize, lo.x_bits as usize);
+                        let yr = extract_bits(&rep[..n], lo.y_bit as usize, lo.y_bits as usize);
                         if m.dbg > 0 {
                             m.dbg -= 1;
                             crate::ktrace::log_fmt(format_args!(
-                                "xhci: ptr report [{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] xraw={x} yraw={y}",
+                                "xhci: ptr report [{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] id_ok={id_ok} xraw={xr} yraw={yr}",
                                 rep[0], rep[1], rep[2], rep[3], rep[4], rep[5], rep[6], rep[7]
                             ));
                         }
-                        if lo.relative {
-                            let sext = |v: u32| if lo.field_bytes >= 2 { v as u16 as i16 as i32 } else { v as u8 as i8 as i32 };
-                            crate::mouse::move_rel(sext(x), sext(y));
-                        } else {
-                            crate::mouse::set_abs(x as i32, y as i32, lo.scale_max);
-                        }
-                        crate::mouse::set_left(rep[lo.btn_byte as usize] & 1 != 0);
-                        // Scroll wheel (HID Usage 0x38): a signed 8-bit delta,
-                        // +1 = wheel away from the user (scroll up). Feed it
-                        // straight through — mouse::add_wheel treats + as up.
-                        if let Some(wb) = lo.wheel_byte {
-                            if let Some(&z) = rep.get(wb as usize) {
-                                let dz = z as i8 as i32;
+                        if id_ok {
+                            if lo.relative {
+                                crate::mouse::move_rel(sign_extend(xr, lo.x_bits as usize), sign_extend(yr, lo.y_bits as usize));
+                            } else {
+                                crate::mouse::set_abs(xr as i32, yr as i32, lo.scale_max);
+                            }
+                            crate::mouse::set_left(extract_bits(&rep[..n], lo.btn_bit as usize, 1) != 0);
+                            // Scroll wheel (HID Usage 0x38): a signed delta, + = up.
+                            if let Some(wb) = lo.wheel_bit {
+                                let dz = sign_extend(extract_bits(&rep[..n], wb as usize, lo.wheel_bits as usize), lo.wheel_bits as usize);
                                 if dz != 0 {
                                     crate::mouse::add_wheel(dz);
                                 }
@@ -1730,8 +1777,10 @@ unsafe fn parse_report_layout(buf: usize, len: usize) -> Option<PtrLayout> {
     let mut usages = [0u16; 16];
     let mut nusg = 0usize;
     let mut bit = 0u32; // current bit offset within the input report
+    let mut report_id_cur = 0u8; // report ID currently in effect (0 = none)
+    let mut x_report_id = 0u8; // the report ID the X field lives under
     let (mut x, mut y, mut btn, mut rel): (Option<(u32, u32)>, Option<(u32, u32)>, Option<u32>, bool) = (None, None, None, false);
-    let mut wheel: Option<u32> = None; // bit offset of the Wheel field (Usage 0x38)
+    let mut wheel: Option<(u32, u32)> = None; // (bit offset, size) of the Wheel field (Usage 0x38)
     let mut i = 0usize;
     while i < len {
         let b = unsafe { read_volatile((buf + i) as *const u8) };
@@ -1753,7 +1802,12 @@ unsafe fn parse_report_layout(buf: usize, len: usize) -> Option<PtrLayout> {
             (1, 0x0) => usage_page = data as u16,
             (1, 0x7) => report_size = data,
             (1, 0x9) => report_count = data,
-            (1, 0x8) => bit = 8, // Report ID declared → reports carry a 1-byte ID prefix
+            (1, 0x8) => {
+                // Report ID declared → this report carries a 1-byte ID prefix, so
+                // field bit offsets restart after it.
+                report_id_cur = data as u8;
+                bit = 8;
+            }
             (1, 0x2) => logical_max = data as i32,
             (2, 0x0) => {
                 if nusg < usages.len() {
@@ -1773,14 +1827,15 @@ unsafe fn parse_report_layout(buf: usize, len: usize) -> Option<PtrLayout> {
                             0
                         };
                         let fb = bit + f * report_size;
-                        if usage_page == 0x01 && u == 0x30 {
+                        if usage_page == 0x01 && u == 0x30 && x.is_none() {
                             x = Some((fb, report_size));
                             rel = data & 4 != 0;
                             x_scale = logical_max; // capture the max in effect for X
-                        } else if usage_page == 0x01 && u == 0x31 {
+                            x_report_id = report_id_cur; // the pointer's report ID
+                        } else if usage_page == 0x01 && u == 0x31 && y.is_none() {
                             y = Some((fb, report_size));
                         } else if usage_page == 0x01 && u == 0x38 && wheel.is_none() {
-                            wheel = Some(fb); // Generic Desktop / Wheel
+                            wheel = Some((fb, report_size)); // Generic Desktop / Wheel
                         } else if usage_page == 0x09 && btn.is_none() {
                             btn = Some(fb);
                         }
@@ -1794,15 +1849,18 @@ unsafe fn parse_report_layout(buf: usize, len: usize) -> Option<PtrLayout> {
         }
     }
     let (xb, xs) = x?;
-    let (yb, _) = y?;
+    let (yb, ys) = y?;
     Some(PtrLayout {
-        btn_byte: btn.map(|b| (b / 8) as u8).unwrap_or(0),
-        x_byte: (xb / 8) as u8,
-        y_byte: (yb / 8) as u8,
-        field_bytes: (xs / 8).max(1) as u8,
+        report_id: x_report_id,
+        btn_bit: btn.unwrap_or(0) as u16,
+        x_bit: xb as u16,
+        x_bits: xs.max(1) as u8,
+        y_bit: yb as u16,
+        y_bits: ys.max(1) as u8,
+        wheel_bit: wheel.map(|(w, _)| w as u16),
+        wheel_bits: wheel.map(|(_, s)| s.max(1) as u8).unwrap_or(8),
         relative: rel,
         scale_max: if x_scale > 0 { x_scale } else { 0x7fff },
-        wheel_byte: wheel.map(|w| (w / 8) as u8),
     })
 }
 
@@ -1891,12 +1949,14 @@ mod tests {
             0xC0, 0xC0,
         ];
         let lo = unsafe { parse_report_layout(desc.as_ptr() as usize, desc.len()) }.expect("layout");
-        assert_eq!(lo.btn_byte, 0);
-        assert_eq!(lo.x_byte, 1);
-        assert_eq!(lo.y_byte, 2);
-        assert_eq!(lo.field_bytes, 1);
+        assert_eq!(lo.report_id, 0);
+        assert_eq!(lo.btn_bit, 0);
+        assert_eq!(lo.x_bit, 8);
+        assert_eq!(lo.x_bits, 8);
+        assert_eq!(lo.y_bit, 16);
+        assert_eq!(lo.y_bits, 8);
         assert!(lo.relative);
-        assert_eq!(lo.wheel_byte, Some(3), "the scroll wheel field must be located");
+        assert_eq!(lo.wheel_bit, Some(24), "the scroll wheel field must be located");
     }
 
     /// Endpoint Context dword 4 packing: Average TRB Length + Max ESIT Payload
@@ -1929,9 +1989,57 @@ mod tests {
         ];
         let lo = unsafe { parse_report_layout(desc.as_ptr() as usize, desc.len()) }.expect("layout");
         assert!(!lo.relative);
-        assert_eq!(lo.field_bytes, 2);
-        assert_eq!(lo.x_byte, 1); // byte 0 = buttons, X at byte 1
-        assert_eq!(lo.wheel_byte, None);
+        assert_eq!(lo.x_bits, 16);
+        assert_eq!(lo.x_bit, 8); // byte 0 = buttons, X at bit 8
+        assert_eq!(lo.y_bit, 24);
+        assert_eq!(lo.wheel_bit, None);
+    }
+
+    /// The real wireless-dongle mouse from the Mac mini: Report ID 2, 8 buttons,
+    /// then **12-bit** packed relative X/Y, then an 8-bit wheel. This is the
+    /// layout the byte-offset model got wrong ("left goes down"); the bit model
+    /// must place X at bit 16/12b and Y at bit 28/12b, past the report-ID byte.
+    #[test_case]
+    fn parses_dongle_mouse_12bit_with_report_id() {
+        #[rustfmt::skip]
+        let desc: &[u8] = &[
+            0x05,0x01, 0x09,0x02, 0xA1,0x01, 0x85,0x02, 0x09,0x01, 0xA1,0x00,
+            0x05,0x09, 0x19,0x01, 0x29,0x08, 0x15,0x00, 0x25,0x01, 0x95,0x08, 0x75,0x01, 0x81,0x02, // 8 buttons
+            0x05,0x01, 0x09,0x30, 0x09,0x31, 0x16,0x01,0xf8, 0x26,0xff,0x07, 0x75,0x0c, 0x95,0x02, 0x81,0x06, // X,Y 12-bit rel
+            0x09,0x38, 0x15,0x81, 0x25,0x7f, 0x75,0x08, 0x95,0x01, 0x81,0x06,  // wheel 8-bit rel
+            0xC0, 0xC0,
+        ];
+        let lo = unsafe { parse_report_layout(desc.as_ptr() as usize, desc.len()) }.expect("layout");
+        assert_eq!(lo.report_id, 2, "mouse reports are prefixed with ID 2");
+        assert!(lo.relative);
+        assert_eq!(lo.btn_bit, 8, "buttons after the report-ID byte");
+        assert_eq!(lo.x_bit, 16);
+        assert_eq!(lo.x_bits, 12, "12-bit packed X (the byte model truncated this)");
+        assert_eq!(lo.y_bit, 28, "Y packed right after X, not byte-aligned");
+        assert_eq!(lo.y_bits, 12);
+        assert_eq!(lo.wheel_bit, Some(40));
+        // Decode a report: id=2, no buttons, X=-1 (0xfff), Y=+1. Packed LE:
+        // byte0=0x02, byte1=0x00, then X[0..12]=0xfff, Y[12..24]=0x001 across
+        // bytes 2..4: 0xff, 0x1f, 0x00.
+        let rep = [0x02u8, 0x00, 0xff, 0x1f, 0x00, 0x00];
+        let xr = extract_bits(&rep, lo.x_bit as usize, lo.x_bits as usize);
+        let yr = extract_bits(&rep, lo.y_bit as usize, lo.y_bits as usize);
+        assert_eq!(sign_extend(xr, 12), -1, "X = -1");
+        assert_eq!(sign_extend(yr, 12), 1, "Y = +1 (not corrupted by X's bits)");
+    }
+
+    /// Bit-field extraction + sign-extension used by the pointer decode.
+    #[test_case]
+    fn bit_extract_and_sign_extend() {
+        let rep = [0b1010_1100u8, 0b0000_0001];
+        assert_eq!(extract_bits(&rep, 0, 4), 0b1100);
+        assert_eq!(extract_bits(&rep, 4, 4), 0b1010);
+        assert_eq!(extract_bits(&rep, 8, 1), 1);
+        assert_eq!(extract_bits(&rep, 2, 8), 0b0110_1011); // spans the byte boundary (bit8=1 → top)
+        assert_eq!(sign_extend(0xfff, 12), -1);
+        assert_eq!(sign_extend(0x7ff, 12), 2047);
+        assert_eq!(sign_extend(0x80, 8), -128);
+        assert_eq!(sign_extend(1, 12), 1);
     }
 
     #[test_case]
