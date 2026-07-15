@@ -242,6 +242,17 @@ fn dma_invalidate(va: usize, len: usize) {
     let _ = (va, len);
 }
 
+/// TEMP (bare-Apple USB bring-up) counters: is the poll loop alive, and are any
+/// xHCI events arriving? Printed as a 3s heartbeat since a bare boot has no other
+/// input/output channel. REMOVE once typing works.
+#[cfg(target_arch = "aarch64")]
+mod usbdbg {
+    use core::sync::atomic::AtomicU64;
+    pub static PUMPS: AtomicU64 = AtomicU64::new(0);
+    pub static EVENTS: AtomicU64 = AtomicU64::new(0);
+    pub static NEXT_HB: AtomicU64 = AtomicU64::new(0);
+}
+
 /// Crude busy-wait (~`iters` volatile reads); used for the USB reset-recovery
 /// settle where we have no timer in the arch-neutral core. Order of a few ms.
 fn spin_delay(iters: u64) {
@@ -468,6 +479,8 @@ impl Xhci {
         if (trb.control & 1) != self.evt_cycle {
             return None;
         }
+        #[cfg(target_arch = "aarch64")]
+        usbdbg::EVENTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         self.evt_dequeue += 1;
         if self.evt_dequeue == RING_TRBS {
             self.evt_dequeue = 0;
@@ -1131,6 +1144,20 @@ impl Xhci {
     /// `poll_mouse` call this; a single drainer avoids the two stealing each
     /// other's events off the one ring.
     fn pump_events(&mut self) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use core::sync::atomic::Ordering;
+            usbdbg::PUMPS.fetch_add(1, Ordering::Relaxed);
+            let now = crate::arch::now_ms();
+            if now >= usbdbg::NEXT_HB.load(Ordering::Relaxed) {
+                usbdbg::NEXT_HB.store(now + 3000, Ordering::Relaxed);
+                crate::serial_println!(
+                    "usb: pump-hb pumps={} events={} (press keys → events should rise)",
+                    usbdbg::PUMPS.load(Ordering::Relaxed),
+                    usbdbg::EVENTS.load(Ordering::Relaxed)
+                );
+            }
+        }
         let mut kbd = self.kbd.take();
         let mut mouse = self.mouse.take();
         // SAFETY: rings/buffers are live for the controller's lifetime.
