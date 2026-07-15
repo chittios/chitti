@@ -80,6 +80,24 @@ _image_start:
 
 .global _start
 _start:
+    // TEMP bare-boot probe: the instant we get control, paint the firmware
+    // framebuffer blue so a bare (serial-less) Apple boot proves m1n1 handed off
+    // to us at all. Gated to Apple by testing the FDT pointer (x0) is in high
+    // RAM (> 32 GiB) — QEMU's DTB is low, so this is skipped there. FB PA is
+    // hardcoded for the Mac mini M2 (0x9e52d4000, per m1n1's boot log); a wrong
+    // guess just writes mapped RAM harmlessly. REMOVE once bare boot is stable.
+    movz x2, #0x8, lsl #32       // 0x8_0000_0000 (Apple RAM base)
+    cmp  x0, x2
+    b.lo 8f                      // x0 below Apple RAM → QEMU → skip
+    movz x2, #0x4000
+    movk x2, #0xe52d, lsl #16
+    movk x2, #0x0009, lsl #32    // x2 = 0x9_e52d_4000 (firmware framebuffer)
+    movz w4, #0x03ff             // blue in 30bpp x2r10g10b10
+    mov  x3, #0x100000           // ~4 MiB → top ~half of a 1920-wide screen
+7:  str  w4, [x2], #4
+    subs x3, x3, #1
+    b.ne 7b
+8:
     // Preserve the entry registers in callee-saved regs across the .bss zero
     // (which clobbers x0/x1 and would wipe the statics if stored before):
     //   x1 = boot-info page (UEFI stub) -> BOOT_X1
