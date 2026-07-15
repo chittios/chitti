@@ -380,17 +380,19 @@ pub unsafe fn dbg_paint(slot: usize, color: u32) {
 
 pub fn init_uart_apple() {
     let fdt = boot::boot_x0();
+    unsafe { dbg_paint(9, 0x3fff_ffff) }; // slot 9 white: entered init_uart_apple
     // SAFETY: `boot_x0` is the FDT pointer (or non-FDT, rejected by the magic).
-    IS_APPLE.store(unsafe { crate::fdt::has_compatible(fdt, b"apple,arm-platform") }, Ordering::Relaxed);
-    if let Some((base, _size)) = unsafe { crate::fdt::reg_of_compatible(fdt, b"apple,s5l-uart") } {
-        unsafe { dbg_paint(9, 0x3fff_ffff) }; // slot 9 white: s5l UART base found (FDT parse ok)
+    let is_apple = unsafe { crate::fdt::has_compatible(fdt, b"apple,arm-platform") };
+    unsafe { dbg_paint(10, 0x0000_03ff) }; // slot 10 blue: past has_compatible
+    IS_APPLE.store(is_apple, Ordering::Relaxed);
+    let uart = unsafe { crate::fdt::reg_of_compatible(fdt, b"apple,s5l-uart") };
+    unsafe { dbg_paint(11, 0x000f_fc00) }; // slot 11 green: past reg_of_compatible
+    if let Some((base, _size)) = uart {
         mmu::map_device_gib(base);
-        unsafe { dbg_paint(10, 0x0000_03ff) }; // slot 10 blue: past map_device_gib (BBM remap)
         UART_BASE.store(base as usize, Ordering::Relaxed);
         UART_KIND.store(UART_KIND_S5L, Ordering::Relaxed);
         UART_RX_OK.store(true, Ordering::Relaxed); // real UART; m1n1 hv forwards RX
         crate::ktrace::log_fmt(format_args!("uart: Apple s5l console at {base:#x}"));
-        unsafe { dbg_paint(11, 0x000f_fc00) }; // slot 11 green: past stores + ktrace (returning)
     }
 }
 

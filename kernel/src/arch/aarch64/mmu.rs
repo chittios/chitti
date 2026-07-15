@@ -309,6 +309,31 @@ pub fn map_device_gib(pa: u64) {
     }
 }
 
+/// Identity-map the 1 GiB **Normal** RAM block containing `pa`, but only if that
+/// block is currently **unmapped** — never disturbing a live mapping (so it can't
+/// retype the running stack/heap/code). Used to reach RAM that lies above the
+/// `/memory`-reported top the initial map covered: m1n1 parks its DTB in its own
+/// heap, which can sit above the RAM top it hands the payload, so the FDT is
+/// readable with the MMU off (flat physical) yet faults once the MMU is on. This
+/// makes the FDT's GiB reachable for any MMU-on parse. Invalid->valid needs no
+/// break-before-make; a TLBI covers a possibly-cached faulting entry.
+pub fn map_ram_gib_if_unmapped(pa: u64) {
+    let idx = (pa >> 30) as usize;
+    if idx >= 512 {
+        return;
+    }
+    // SAFETY: L1 is the live TTBR0 table; we only write an entry that is
+    // currently invalid, so no live translation changes (no BBM needed).
+    unsafe {
+        let l1 = core::ptr::addr_of_mut!(L1) as *mut u64;
+        if *l1.add(idx) & 0b11 != 0 {
+            return; // already a valid block or table — leave it untouched
+        }
+        *l1.add(idx) = normal_block((idx as u64) << 30);
+        asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb", options(nostack));
+    }
+}
+
 /// Enable the MMU + caches on a secondary core, reusing the BSP's already-built
 /// identity map (`L1`). A secondary starts (via PSCI `CPU_ON`) with the MMU
 /// off, where RAM is Device-typed and atomics/`Locked` can't complete -- so

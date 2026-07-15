@@ -246,6 +246,16 @@ pub extern "C" fn aarch64_start() -> ! {
     // `Locked` framebuffer console, so even the banner needs normal memory.
     chitti_kernel::arch::aarch64::mmu::init();
     unsafe { dbg_band(1) }; // past mmu::init (MMU + identity map on)
+    // The FDT (m1n1's DTB) can sit in m1n1's heap *above* the /memory-reported RAM
+    // top that mmu::init mapped — readable with the MMU off (detect() did), but a
+    // fault once the MMU is on. Map its GiB(s) as RAM (only if unmapped) before any
+    // MMU-on parse (init_uart_apple's has_compatible/reg_of_compatible). No-op on
+    // QEMU/hv (FDT already within the mapped range).
+    {
+        let fdt = chitti_kernel::arch::aarch64::boot::boot_x0();
+        chitti_kernel::arch::aarch64::mmu::map_ram_gib_if_unmapped(fdt);
+        chitti_kernel::arch::aarch64::mmu::map_ram_gib_if_unmapped(fdt + (1 << 30)); // may straddle a GiB
+    }
     // Select the Apple Samsung s5l console from the boot FDT (m1n1) before the
     // first print — Apple Silicon has no PL011, so otherwise the banner would
     // write into an unbacked address and nothing would appear. No-op on QEMU.
