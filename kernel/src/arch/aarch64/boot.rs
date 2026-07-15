@@ -172,19 +172,22 @@ _start:
     msr  sctlr_el1, x9
     isb
     DBGBAND 2, 0xfc00, 0x000f   // green : SCTLR_EL1 written (real EL1 SCTLR)
-    // Now in the non-VHE CPTR_EL2 format: don't trap EL1 FP/SIMD or CP15.
-    mov  x9, #0x33ff            // RES1 bits set, TFP = 0
+    // Enable FP/SIMD at EL2 for the ACTUAL E2H state. Apple cores are VHE-only:
+    // HCR_EL2.E2H is RES1, so the clear above is ignored and we stay VHE. In VHE
+    // CPTR_EL2 is CPACR-format and FP is gated by FPEN[21:20], NOT the non-VHE
+    // TFP bit — writing the non-VHE 0x33ff leaves FPEN=0b00, which is exactly why
+    // FP stayed trapped at EL1. Branch on E2H and set the right value.
+    mrs  x10, hcr_el2
+    tst  x10, #(1 << 34)        // HCR_EL2.E2H
+    b.eq 32f
+    mov  x9, #0x300000          // VHE: CPTR_EL2.FPEN = 0b11 (do not trap FP)
     msr  cptr_el2, x9
-    // TEMP: read CPTR_EL2 back and paint slot 21 — green if TFP(bit10) is clear
-    // (FP not trapped to EL2), red if it is still set. Isolates whether the write
-    // took (FP off despite CPACR_EL1.FPEN=0b11 at EL1 means TFP is the culprit).
-    mrs  x10, cptr_el2
-    tst  x10, #0x400           // TFP, bit 10
-    b.ne 30f
-    DBGBAND 21, 0xfc00, 0x000f // slot 21 green: TFP clear (FP should work)
-    b    31f
-30: DBGBAND 21, 0x0000, 0x3ff0 // slot 21 red: TFP still set (FP trapped to EL2)
-31:
+    DBGBAND 21, 0x0000, 0x3ff0  // slot 21 red: E2H set (VHE) — expected on Apple
+    b    33f
+32: mov  x9, #0x33ff            // non-VHE: RES1 bits + TFP = 0
+    msr  cptr_el2, x9
+    DBGBAND 21, 0xfc00, 0x000f  // slot 21 green: E2H clear (non-VHE)
+33:
     msr  hstr_el2, xzr
     // Let EL1 read the generic timer/counter; zero the virtual-counter offset.
     mrs  x9, cnthctl_el2
