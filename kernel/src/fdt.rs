@@ -281,7 +281,13 @@ pub unsafe fn reg_of_compatible(dtb_pa: u64, want: &[u8]) -> Option<(u64, u64)> 
     let mut reg_off = [0usize; MAX_DEPTH]; // 0 = no reg seen for this node
     let mut depth: usize = 0;
     let mut off = h.off_struct;
+    unsafe { fdt_probe(14, 0x0000_03ff) }; // slot 14: stack arrays initialized, entering loop
+    let mut first = true;
     loop {
+        if first {
+            unsafe { fdt_probe(15, 0x3ff0_03ff) }; // slot 15: first loop iteration reached
+            first = false;
+        }
         // SAFETY: `off` is bounded by every `be32` against `h.total`.
         let tok = unsafe { be32(base, off, h.total)? };
         off += 4;
@@ -305,7 +311,6 @@ pub unsafe fn reg_of_compatible(dtb_pa: u64, want: &[u8]) -> Option<(u64, u64)> 
                     return None;
                 }
                 if matched[depth] && reg_off[depth] != 0 {
-                    unsafe { fdt_probe(15, 0x3ff0_03ff) }; // slot 15: matched node END, about to read reg cells
                     let pa = acells[depth - 1];
                     let ps = scells[depth - 1];
                     // SAFETY: bounded.
@@ -332,7 +337,6 @@ pub unsafe fn reg_of_compatible(dtb_pa: u64, want: &[u8]) -> Option<(u64, u64)> 
                     } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"compatible", h.total) } {
                         if unsafe { compat_has(base, data_off, len, want, h.total) } {
                             matched[depth] = true;
-                            unsafe { fdt_probe(14, 0x0000_03ff) }; // slot 14: matched `want` compatible
                         }
                     } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"reg", h.total) } {
                         reg_off[depth] = data_off;
