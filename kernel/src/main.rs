@@ -198,29 +198,29 @@ pub extern "C" fn limine_start() -> ! {
 
 // --- aarch64 boot (QEMU virt + HVF; entered from arch::aarch64::boot) ----
 
-/// TEMP bare-boot bisect: paint horizontal band `n` of the firmware
-/// framebuffer (m1n1 leaves it live at a fixed PA) a distinct colour, then hold
-/// ~0.4 s so it's actually visible before a fast fault/reset. Apple only; a
-/// no-op elsewhere. Band colours (30bpp x2r10g10b10): 0=white, 1=red, 2=green,
-/// 3=blue. The last band seen on the monitor localizes an early fault. REMOVE
-/// once the bare boot is stable.
+/// TEMP bare-boot bisect: paint Rust-milestone band `n` as slot `7 + n` in the
+/// SAME vertical framebuffer ladder the `_start` asm paints in slots 0..=6, so a
+/// band appearing *below* the asm "white" band (slot 6) proves Rust was entered
+/// and localizes how far it got. Deliberately independent of `find_framebuffer`
+/// (which must not sit on the diagnostic's own critical path): it writes the
+/// hardcoded Mac-mini-M2 framebuffer PA `0x9_e52d_4000` — identical geometry to
+/// the `DBGBAND` asm macro (each slot 0x80000 B, paints 0x10000 px). Apple only
+/// (gated on the FDT pointer being in high RAM); a no-op elsewhere. Colours
+/// (30bpp x2r10g10b10): n=0 white, 1 blue, 2 green. REMOVE once bare boot works.
 #[cfg(target_arch = "aarch64")]
 unsafe fn dbg_band(n: usize) {
     let fdt = chitti_kernel::arch::aarch64::boot::boot_x0();
-    // SAFETY: pure FDT reads; no atomics (safe before mmu::init).
-    if !unsafe { chitti_kernel::fdt::has_compatible(fdt, b"apple,arm-platform") } {
-        return;
+    if fdt < 0x8_0000_0000 {
+        return; // QEMU / hv (low DTB, or entered at EL1) — skip.
     }
-    if let Some(fb) = unsafe { chitti_kernel::fdt::find_framebuffer(fdt) } {
-        let ppr = (fb.stride / 4) as usize; // 32-bit pixels per row
-        let rows = 48usize;
-        let color = [0x3fff_ffffu32, 0x3ff0_0000, 0x000f_fc00, 0x0000_03ff][n % 4];
-        let p = fb.base as *mut u32;
-        let start = n * rows * ppr;
-        for i in 0..rows * ppr {
-            // SAFETY: within the firmware framebuffer (fixed PA in RAM).
-            unsafe { core::ptr::write_volatile(p.add(start + i), color) };
-        }
+    let base = 0x9_e52d_4000usize as *mut u32;
+    let slot = 7 + n;
+    let start = slot * 0x80000 / 4; // slot byte offset -> u32 index
+    let color = [0x3fff_ffffu32, 0x0000_03ff, 0x000f_fc00][n % 3];
+    for i in 0..0x10000usize {
+        // SAFETY: fixed firmware-framebuffer PA; aligned u32 writes (legal on
+        // Device memory before mmu::init, Normal after).
+        unsafe { core::ptr::write_volatile(base.add(start + i), color) };
     }
     // Hold so the band is scanned out (~0.4 s) even if the next step faults.
     for _ in 0..400_000_000u64 {
@@ -233,8 +233,10 @@ unsafe fn dbg_band(n: usize) {
 pub extern "C" fn aarch64_start() -> ! {
     // TEMP bare-boot bisect (Apple only): a bare m1n1 boot has no serial, so
     // paint a band into the firmware framebuffer (m1n1 leaves it live) at each
-    // milestone — the last band visible on the monitor localizes an early fault.
-    // Band 0 = reached Rust (past the EL2 drop + PIE reloc + bss). REMOVE once
+    // milestone — the lowest band on the monitor localizes the fault. These
+    // continue the `_start` asm ladder (slots 0..=6): slot 7 (dbg_band 0) = Rust
+    // entered — prologue + this fn ran, i.e. past the drop + reloc + bss AND past
+    // aarch64_start's own prologue and any find_framebuffer hazard. REMOVE once
     // the bare boot is stable.
     unsafe { dbg_band(0) };
     // The boot stub (arch::aarch64::boot) already set the stack, enabled NEON,
