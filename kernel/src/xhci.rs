@@ -110,7 +110,6 @@ struct Kbd {
     int_cycle: u32,
     report_pa: u64,    // 8-byte HID boot report buffer
     report_va: usize,
-    dev_ctx_va: usize, // Output Device Context (for post-fault EP-state debug)
     prev: [u8; 8],     // last report, to detect newly-pressed keys
     // USB HID boot keyboards report only press/release edges, so a held key
     // would never repeat; synthesize accelerating typematic in software.
@@ -264,18 +263,6 @@ fn dma_clean(va: usize, len: usize) {
     }
     #[cfg(not(target_arch = "aarch64"))]
     let _ = (va, len);
-}
-
-/// TEMP (bare-Apple USB bring-up) counters: is the poll loop alive, and are any
-/// xHCI events arriving? Printed as a 3s heartbeat since a bare boot has no other
-/// input/output channel. REMOVE once typing works.
-#[cfg(target_arch = "aarch64")]
-mod usbdbg {
-    use core::sync::atomic::AtomicU64;
-    pub static PUMPS: AtomicU64 = AtomicU64::new(0);
-    pub static EVENTS: AtomicU64 = AtomicU64::new(0);
-    pub static NEXT_HB: AtomicU64 = AtomicU64::new(0);
-    pub static NEXT_KICK: AtomicU64 = AtomicU64::new(0);
 }
 
 /// Crude busy-wait (~`iters` volatile reads); used for the USB reset-recovery
@@ -509,8 +496,6 @@ impl Xhci {
         if (trb.control & 1) != self.evt_cycle {
             return None;
         }
-        #[cfg(target_arch = "aarch64")]
-        usbdbg::EVENTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         self.evt_dequeue += 1;
         if self.evt_dequeue == RING_TRBS {
             self.evt_dequeue = 0;
@@ -1018,14 +1003,9 @@ impl Xhci {
             // on non-coherent DMA (real Apple).
             dma_invalidate(c.dev_ctx_va, self.ctx_size * (int_dci as usize + 1));
             let ep_state = read_volatile(ep_ctx as *const u32) & 0x7;
-            let slot_d0 = read_volatile((c.dev_ctx_va) as *const u32);
-            let slot_d1 = read_volatile((c.dev_ctx_va + 4) as *const u32);
-            // Visible on the chat pane (bare-Apple bring-up). ep_state 1=Running,
-            // 2=Halted, 3=Stopped, 4=Error; anything but 1 => no reports.
-            crate::serial_println!(
-                "usb: after configure dci={int_dci} ep_state={ep_state} slot_ctx0={slot_d0:#x} port={}",
-                (slot_d1 >> 16) & 0xff
-            );
+            if ep_state != 1 {
+                crate::ktrace::log_fmt(format_args!("xhci: interrupt EP dci={int_dci} not Running (state {ep_state})"));
+            }
         }
         Some((int_dci, int_va, int_pa, report_pa, report_va))
     }
@@ -1037,22 +1017,11 @@ impl Xhci {
             unsafe { self.finish_endpoint(c, iface, ep_addr, ep_mps, interval, true) }?;
         let mut kbd = Kbd {
             slot: c.slot, int_dci, int_ring_va: int_va, int_ring_pa: int_pa,
-            int_enqueue: 0, int_cycle: 1, report_pa, report_va, dev_ctx_va: c.dev_ctx_va,
+            int_enqueue: 0, int_cycle: 1, report_pa, report_va,
             prev: [0; 8],
             rep: crate::keyrepeat::Typematic::new(), rep_usage: 0,
         };
         unsafe { self.queue_interrupt(&mut kbd) };
-        // Bare-Apple debug: the interrupt buffers' physical addresses + USBSTS
-        // right after arming. If HSE (bit 2) sets here, the interrupt transfer's
-        // DMA (TRB fetch from int_ring_pa or report DMA to report_pa) is what the
-        // DART faults. Apple RAM is all >32 GiB, so watch for a high/truncated PA.
-        #[cfg(target_arch = "aarch64")]
-        crate::serial_println!(
-            "usb: kbd armed int_ring_pa={:#x} report_pa={:#x} usbsts={:#010x}",
-            kbd.int_ring_pa,
-            kbd.report_pa,
-            unsafe { r32(self.op + OP_USBSTS) }
-        );
         crate::ktrace::log_fmt(format_args!("xhci: HID keyboard ready (slot {}, ep {ep_addr:#x}, dci {int_dci})", c.slot));
         Some(kbd)
     }
@@ -1192,53 +1161,6 @@ impl Xhci {
     /// `poll_mouse` call this; a single drainer avoids the two stealing each
     /// other's events off the one ring.
     fn pump_events(&mut self) {
-        #[cfg(target_arch = "aarch64")]
-        {
-            use core::sync::atomic::Ordering;
-            usbdbg::PUMPS.fetch_add(1, Ordering::Relaxed);
-            // Quiet: only speak when the total event count CHANGES (e.g. a key
-            // press posts a transfer event), so the one-time enumeration lines
-            // stay on screen. NEXT_HB doubles as "last events value printed".
-            let ev = usbdbg::EVENTS.load(Ordering::Relaxed);
-            if ev != usbdbg::NEXT_HB.load(Ordering::Relaxed) {
-                usbdbg::NEXT_HB.store(ev, Ordering::Relaxed);
-                crate::serial_println!("usb: xhci events={ev}");
-            }
-            // Every ~2s: dump USBSTS (HSE bit2 / HCE bit12 = controller error) and
-            // re-ring the keyboard interrupt-EP doorbell in case the initial kick
-            // was missed. Harmless re-kick; helps decide "controller errored" vs
-            // "doorbell not registered" vs "device sends no reports".
-            let now = crate::arch::now_ms();
-            if now >= usbdbg::NEXT_KICK.load(Ordering::Relaxed) {
-                usbdbg::NEXT_KICK.store(now + 2000, Ordering::Relaxed);
-                // SAFETY: self.op is the mapped xHCI operational base.
-                let usbsts = unsafe { r32(self.op + OP_USBSTS) };
-                let (slot, dci) = self.kbd.as_ref().map(|k| (k.slot, k.int_dci)).unwrap_or((0, 0));
-                crate::serial_println!("usb: usbsts={usbsts:#010x} kbd_slot={slot} dci={dci} (re-doorbell)");
-                // On HSE, read the interrupt EP context: its state + TR Dequeue
-                // Pointer. If deq == int_ring_pa (unchanged) the controller never
-                // fetched the TRB (fault = TRB fetch / EP-context read); if it
-                // advanced, the fault is the report DMA. deq's DCS is bit 0.
-                if usbsts & 0x4 != 0 {
-                    if let Some(k) = self.kbd.as_ref() {
-                        let ep = k.dev_ctx_va + self.ctx_size * k.int_dci as usize;
-                        dma_invalidate(ep, self.ctx_size);
-                        let st = unsafe { read_volatile(ep as *const u32) } & 0x7;
-                        let deq = unsafe { read_volatile((ep + 8) as *const u64) };
-                        crate::serial_println!(
-                            "usb: HSE! ep_state={st} tr_deq={:#x} int_ring_pa={:#x} report_pa={:#x}",
-                            deq & !0xf,
-                            k.int_ring_pa,
-                            k.report_pa
-                        );
-                    }
-                }
-                if slot != 0 {
-                    // SAFETY: ringing a doorbell for a configured EP is idempotent.
-                    unsafe { self.doorbell(slot, dci as u32) };
-                }
-            }
-        }
         let mut kbd = self.kbd.take();
         let mut mouse = self.mouse.take();
         // SAFETY: rings/buffers are live for the controller's lifetime.
@@ -1258,15 +1180,6 @@ impl Xhci {
                         for (i, b) in report.iter_mut().enumerate() {
                             *b = read_volatile((k.report_va + i) as *const u8);
                         }
-                        // TEMP (bare Apple USB bring-up): one line per key report
-                        // — the only way to observe input when the USB keyboard
-                        // is the sole input device. REMOVE once typing works.
-                        #[cfg(target_arch = "aarch64")]
-                        crate::serial_println!(
-                            "usb: kbd report {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                            report[0], report[1], report[2], report[3],
-                            report[4], report[5], report[6], report[7]
-                        );
                         let shift = report[0] & 0x22 != 0;
                         let ctrl = report[0] & 0x11 != 0;
                         for &usage in &report[2..8] {

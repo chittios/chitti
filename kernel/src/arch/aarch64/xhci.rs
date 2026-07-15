@@ -73,14 +73,14 @@ pub fn dma_translate_setup(darts: &[(usize, u32)]) -> bool {
         // SAFETY: base is the Device-mapped DART; sid from the FDT.
         let dart = unsafe { Dart::new(base, sid) };
         if !dart.set_translate(l1_pa) {
-            crate::serial_println!("apple_usb: DART {base:#x} sid {sid} set_translate failed");
+            crate::ktrace::log_fmt(format_args!("apple_usb: DART {base:#x} sid {sid} set_translate failed"));
             return false;
         }
         saved[n] = (base, sid);
         n += 1;
     }
     USB_DMA.with(|s| *s = Some(UsbDma { darts: saved, ndarts: n, l2_va: l2, next_iova: DART_PAGE as u64 }));
-    crate::serial_println!("apple_usb: DART translate ready ({n} darts, l1={l1_pa:#x} l2={l2_pa:#x})");
+    crate::ktrace::log_fmt(format_args!("apple_usb: DART translate ready ({n} darts)"));
     true
 }
 
@@ -153,21 +153,17 @@ pub fn attach_at(base: usize) -> bool {
     // The Apple DWC3 DMAs through the DART with translated low IOVAs, so use the
     // DART-mapping allocator (set up by apple_usb via dma_translate_setup).
     if let Some(mut x) = Xhci::bringup(base, aa_alloc_apple) {
-        // Visible on the chat pane (bare boot has no serial, ktrace pane closed).
-        crate::serial_println!(
-            "apple_usb: xHCI bringup OK ({} ports); enumerating…",
-            x.port_count()
-        );
         let ok = x.enumerate_keyboard();
-        crate::serial_println!(
-            "apple_usb: xHCI enum kbd={} mouse={}",
+        crate::ktrace::log_fmt(format_args!(
+            "xhci(apple): {} ports, enum kbd={} mouse={}",
+            x.port_count(),
             if x.has_keyboard() { "yes" } else { "no" },
             if x.has_mouse() { "yes" } else { "no" }
-        );
+        ));
         XHCI.with(|s| *s = Some(x));
         return ok;
     }
-    crate::serial_println!("apple_usb: xHCI bringup FAILED (controller not ready) — see ktrace for the exact wait that timed out");
+    crate::ktrace::log("xhci(apple)", "controller not ready (bringup timed out)");
     false
 }
 

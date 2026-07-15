@@ -40,7 +40,6 @@ const GCTL_DISSCRAMBLE: u32 = 1 << 3;
 const GCTL_SCALEDOWN_MASK: u32 = 0b11 << 4;
 const GCTL_PRTCAPDIR_SHIFT: u32 = 12; // bits[13:12]
 const GCTL_PRTCAP_HOST: u32 = 1; // (DEVICE=2, OTG=3)
-const DWC3_GSTS: usize = 0xc118;
 const DWC3_GUSB2PHYCFG0: usize = 0xc200;
 const DWC3_GUSB3PIPECTL0: usize = 0xc2c0;
 const PHYCFG_PHYSOFTRST: u32 = 1 << 31;
@@ -197,45 +196,14 @@ fn dwc3_reset_host(hw: &UsbHw) -> bool {
     true
 }
 
-/// Dump the DWC3 global + xHCI capability/operational registers to the chat pane
-/// (visible on a bare boot). Read-only observation to understand why the xHCI
-/// controller won't reach ready. xHCI caps are at `dwc3 + 0`; the op regs at
-/// `dwc3 + CAPLENGTH`. GCTL bit[13:12] = PRTCAPDIR (1=host). GSTS[1:0] = current
-/// mode. xHCI HCSPARAMS1: slots[7:0], ports[31:24]. USBSTS bit11 = CNR.
-fn dump_state(hw: &UsbHw) {
-    let gsnpsid = r32(hw.dwc3, DWC3_GSNPSID);
-    let gctl = r32(hw.dwc3, DWC3_GCTL);
-    let gsts = r32(hw.dwc3, DWC3_GSTS);
-    let u2 = r32(hw.dwc3, DWC3_GUSB2PHYCFG0);
-    let u3 = r32(hw.dwc3, DWC3_GUSB3PIPECTL0);
-    crate::serial_println!(
-        "apple_usb: DWC3 id={gsnpsid:#x} gctl={gctl:#x} (prtcap={}) gsts={gsts:#x} u2phy={u2:#x} u3pipe={u3:#x}",
-        (gctl >> 12) & 0x3
-    );
-    let caplen = r32(hw.dwc3, 0) & 0xff;
-    let hcs1 = r32(hw.dwc3, 0x04);
-    let hcc1 = r32(hw.dwc3, 0x10);
-    let op = hw.dwc3 + caplen as usize;
-    let usbsts = r32(op, 0x04);
-    let usbcmd = r32(op, 0x00);
-    crate::serial_println!(
-        "apple_usb: xHCI caplen={caplen:#x} slots={} ports={} hcc1={hcc1:#x} usbcmd={usbcmd:#x} usbsts={usbsts:#x} (CNR={})",
-        hcs1 & 0xff,
-        (hcs1 >> 24) & 0xff,
-        (usbsts >> 11) & 1
-    );
-}
-
-/// Bring up one USB controller (DART bypass + PHY + DWC3 host + xHCI) and try to
-/// enumerate HID. Returns true iff a keyboard/mouse came up. Step markers go to
-/// the chat pane (visible on a bare boot; the ktrace pane is closed at boot).
+/// Bring up one USB controller (DART translate + PHY + DWC3 host + xHCI) and try
+/// to enumerate HID. Returns true iff a keyboard/mouse came up.
 fn bringup_controller(idx: usize, hw: &UsbHw) -> bool {
-    crate::serial_println!(
-        "apple_usb: === controller {idx}: dwc3={:#x} atc={:#x} pipe={:#x} ndarts={} dart0={:#x}/{} ===",
-        hw.dwc3, hw.atc, hw.pipehandler, hw.ndarts, hw.darts[0].0, hw.darts[0].1
-    );
+    crate::ktrace::log_fmt(format_args!(
+        "apple_usb: controller {idx} dwc3={:#x} atc={:#x} pipe={:#x} ndarts={}",
+        hw.dwc3, hw.atc, hw.pipehandler, hw.ndarts
+    ));
     // Map the USB MMIO windows + every DART (Device).
-    crate::serial_println!("apple_usb: [1] mapping MMIO windows");
     super::mmu::map_device_gib(hw.dwc3 as u64);
     super::mmu::map_device_gib(hw.atc as u64);
     super::mmu::map_device_gib(hw.pipehandler as u64);
@@ -244,42 +212,18 @@ fn bringup_controller(idx: usize, hw: &UsbHw) -> bool {
     }
     // Put ALL the controller's DARTs in TRANSLATION mode sharing one page table
     // (Apple mirrors the mapping across a device's DARTs; the Mac mini's dwc3 has
-    // two, and leaving one unconfigured faults whichever DMA routes through it —
-    // that was the interrupt-transfer HSE). The xHCI DMA allocator then maps its
-    // buffers to IOVAs the DART(s) translate to the physical pages.
-    crate::serial_println!("apple_usb: [2] DART translate setup ({} darts)", hw.ndarts);
+    // two, and leaving one unconfigured faults whichever DMA routes through it).
+    // The xHCI DMA allocator then maps its buffers to IOVAs the DART(s) translate.
     if !super::xhci::dma_translate_setup(&hw.darts[..hw.ndarts]) {
-        crate::serial_println!("apple_usb: DART translate setup failed (locked?) on controller {idx}");
+        crate::ktrace::log_fmt(format_args!("apple_usb: DART translate setup failed on controller {idx}"));
         return false;
     }
-    crate::serial_println!("apple_usb: [3] ATC PHY bring-up");
     phy_bringup(hw);
-    crate::serial_println!("apple_usb: [4] DWC3 host reset (GSNPSID)");
     if !dwc3_reset_host(hw) {
-        crate::serial_println!("apple_usb: DWC3 reset failed on controller {idx}");
+        crate::ktrace::log_fmt(format_args!("apple_usb: DWC3 reset failed on controller {idx}"));
         return false;
     }
-    dump_state(hw);
-    crate::serial_println!("apple_usb: [5] xHCI attach");
-    let ok = super::xhci::attach_at(hw.dwc3);
-    // Port status: did a root port detect a device? CCS=connect, PP=power,
-    // PLS=link state, speed. CCS=0 on both means no device reached this dwc3.
-    let caplen = (r32(hw.dwc3, 0) & 0xff) as usize;
-    let op = hw.dwc3 + caplen;
-    for p in 0..2usize {
-        let psc = r32(op, 0x400 + p * 0x10);
-        crate::serial_println!(
-            "apple_usb: ctrl {idx} port {} PORTSC={psc:#010x} CCS={} PED={} PP={} PLS={} speed={}",
-            p + 1,
-            psc & 1,
-            (psc >> 1) & 1,
-            (psc >> 9) & 1,
-            (psc >> 5) & 0xf,
-            (psc >> 10) & 0xf
-        );
-    }
-    crate::serial_println!("apple_usb: controller {idx} done (hid up: {ok})");
-    ok
+    super::xhci::attach_at(hw.dwc3)
 }
 
 /// Bring up USB HID (keyboard/mouse) on Apple Silicon. No-op (returns false) off
@@ -312,9 +256,9 @@ pub fn init() -> bool {
         }
     }
     if !any {
-        crate::serial_println!("apple_usb: no apple,dwc3 in device tree; skipping");
+        crate::ktrace::log("apple_usb", "no apple,dwc3 in device tree; skipping");
     } else {
-        crate::serial_println!("apple_usb: no HID enumerated on any USB controller");
+        crate::ktrace::log("apple_usb", "no HID enumerated on any USB controller");
     }
     false
 }
