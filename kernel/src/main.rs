@@ -198,98 +198,16 @@ pub extern "C" fn limine_start() -> ! {
 
 // --- aarch64 boot (QEMU virt + HVF; entered from arch::aarch64::boot) ----
 
-/// TEMP bare-boot bisect: paint Rust-milestone band `n` as slot `7 + n` in the
-/// SAME vertical framebuffer ladder the `_start` asm paints in slots 0..=6, so a
-/// band appearing *below* the asm "white" band (slot 6) proves Rust was entered
-/// and localizes how far it got. Deliberately independent of `find_framebuffer`
-/// (which must not sit on the diagnostic's own critical path): it writes the
-/// hardcoded Mac-mini-M2 framebuffer PA `0x9_e52d_4000` — identical geometry to
-/// the `DBGBAND` asm macro (each slot 0x80000 B, paints 0x10000 px). Apple only
-/// (gated on the FDT pointer being in high RAM); a no-op elsewhere. Colours
-/// (30bpp x2r10g10b10): n=0 white, 1 blue, 2 green. REMOVE once bare boot works.
-#[cfg(target_arch = "aarch64")]
-unsafe fn dbg_band(n: usize) {
-    let fdt = chitti_kernel::arch::aarch64::boot::boot_x0();
-    if fdt < 0x8_0000_0000 {
-        return; // QEMU / hv (low DTB, or entered at EL1) — skip.
-    }
-    let base = 0x9_e52d_4000usize as *mut u32;
-    let slot = 7 + n;
-    let start = slot * 0x20000 / 4; // slot byte offset (0x20000 B stride) -> u32 index
-    let color = [0x3fff_ffffu32, 0x0000_03ff, 0x000f_fc00][n % 3];
-    for i in 0..0x6000usize {
-        // SAFETY: fixed firmware-framebuffer PA; aligned u32 writes (legal on
-        // Device memory before mmu::init, Normal after).
-        unsafe { core::ptr::write_volatile(base.add(start + i), color) };
-    }
-    // Hold so the band is scanned out (~0.4 s) even if the next step faults.
-    for _ in 0..400_000_000u64 {
-        core::hint::spin_loop();
-    }
-}
-
 #[cfg(all(target_arch = "aarch64", not(feature = "boot-limine")))]
 #[unsafe(no_mangle)]
 pub extern "C" fn aarch64_start() -> ! {
-    // TEMP bare-boot bisect (Apple only): a bare m1n1 boot has no serial, so
-    // paint a band into the firmware framebuffer (m1n1 leaves it live) at each
-    // milestone — the lowest band on the monitor localizes the fault. These
-    // continue the `_start` asm ladder (slots 0..=6): slot 7 (dbg_band 0) = Rust
-    // entered — prologue + this fn ran, i.e. past the drop + reloc + bss AND past
-    // aarch64_start's own prologue and any find_framebuffer hazard. REMOVE once
-    // the bare boot is stable.
-    unsafe { dbg_band(0) };
-    // TEMP bare-boot bisect: an explicit FP op faults in reg_of_compatible, so
-    // FP/SIMD is disabled at EL1 despite _start's CPACR/CPTR enable. Two things:
-    // (1) read CurrentEL and paint slot 4 RED if we are unexpectedly still at EL2
-    //     (the eret "drop" not having changed EL would rewrite the whole picture);
-    // (2) force-enable FP here in Rust (CPACR_EL1.FPEN=0b11) in case the _start
-    //     enable ran at the wrong EL / didn't stick. REMOVE once bare boot works.
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let el: u64;
-        core::arch::asm!("mrs {el}, CurrentEL", el = out(reg) el);
-        let el = (el >> 2) as usize;
-        // Unambiguous EL readout: one lone band well below the compact ladder —
-        // slot 16 = EL1, slot 17 = EL2, slot 18 = EL3. Nothing else paints there.
-        chitti_kernel::arch::aarch64::dbg_paint(15 + el, 0x3fff_ffff);
-        if el == 2 {
-            // Running at EL2: FP is governed by CPTR_EL2, not CPACR_EL1. Set FPEN
-            // (bits 21:20 = 0b11) for the VHE case; harmless (TTA) in non-VHE.
-            core::arch::asm!(
-                "mrs x9, cptr_el2",
-                "orr x9, x9, #0x300000",
-                "msr cptr_el2, x9",
-                "isb",
-                out("x9") _,
-            );
-        }
-        // Also enable EL1 FP (needed if we are at EL1; harmless otherwise).
-        core::arch::asm!(
-            "mov x9, #0x300000",   // CPACR_EL1.FPEN = 0b11 (bits 21:20)
-            "msr cpacr_el1, x9",
-            "isb",
-            out("x9") _,
-        );
-    }
-    // NB: no FP/SIMD before mmu::init -- with the MMU off all memory is
-    // Device-typed, and Apple cores fault FP loads/stores (register spills) to
-    // Device memory even when FP itself is enabled. reg_of_compatible et al. run
-    // after mmu::init (Normal memory), so their NEON is fine.
-    // The boot stub (arch::aarch64::boot) already set the stack, enabled NEON,
-    // and zeroed BSS. Enable the MMU *first* -- with it off, RAM is Device
-    // memory where the LL/SC exclusives that back `Locked`/atomics never
-    // succeed (a spinlock would spin forever). `serial_println!` mirrors to a
-    // `Locked` framebuffer console, so even the banner needs normal memory.
+    // The boot stub (arch::aarch64::boot) already set the stack, enabled FP/SIMD
+    // (CPACR_EL1.FPEN + the VHE CPTR_EL2.FPEN Apple needs), and zeroed BSS. Enable
+    // the MMU *first* -- with it off, RAM is Device memory where the LL/SC
+    // exclusives that back `Locked`/atomics never succeed (a spinlock would spin
+    // forever). `serial_println!` mirrors to a `Locked` framebuffer console, so
+    // even the banner needs normal memory.
     chitti_kernel::arch::aarch64::mmu::init();
-    unsafe { dbg_band(1) }; // past mmu::init (MMU + identity map on)
-    // FP works now (MMU on -> Normal memory). slot 20 confirms.
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let f = core::hint::black_box(1.0f32) + core::hint::black_box(2.0f32);
-        core::hint::black_box(f);
-        chitti_kernel::arch::aarch64::dbg_paint(20, 0x3ff0_03ff);
-    }
     // The FDT (m1n1's DTB) can sit in m1n1's heap *above* the /memory-reported RAM
     // top that mmu::init mapped — readable with the MMU off (detect() did), but a
     // fault once the MMU is on. Map its GiB(s) as RAM (only if unmapped) before any
@@ -303,16 +221,10 @@ pub extern "C" fn aarch64_start() -> ! {
     // Select the Apple Samsung s5l console from the boot FDT (m1n1) before the
     // first print — Apple Silicon has no PL011, so otherwise the banner would
     // write into an unbacked address and nothing would appear. No-op on QEMU.
-    // init_uart_apple paints its own internal bands (slots 9/10/11) so a fault in
-    // map_device_gib / ktrace is localized without reaching back into main.rs.
-    // init_uart_apple paints its own internal bands (slots 9/10/11/12).
     chitti_kernel::arch::aarch64::init_uart_apple();
     chitti_kernel::serial::init();
-    unsafe { dbg_band(6) }; // slot 13: past serial::init
     serial_println!("{} -- NATIVE aarch64 on Apple Silicon (QEMU + HVF)", BOOT_MSG);
-    unsafe { dbg_band(7) }; // slot 14: past the first serial_println! (writes s5l UART + fb console)
     chitti_kernel::init();
-    unsafe { dbg_band(8) }; // slot 15: past chitti_kernel::init (sched/smp/exceptions/gic)
     // Bring up the framebuffer TUI. Preferred source: the **boot-info page** the
     // UEFI stub publishes at 0x47F00000 (magic "CHITTIBI") carrying the GOP
     // framebuffer — works on ANY UEFI platform (VirtualBox-ARM, UTM, real
@@ -645,19 +557,6 @@ fn fmt_u32(mut n: u32, buf: &mut [u8; 12]) -> &str {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // TEMP bare-boot bisect: repaint the top asm ladder bands (slots 0/1/2, which
-    // otherwise show blue/cyan/green from _start) solid RED so a Rust panic is
-    // visually distinct from a raw CPU fault on the serial-less bare Apple boot.
-    // If the top of the ladder turns red, we panicked (a bounds/overflow check);
-    // if it resets with the top bands unchanged, it was a hardware exception.
-    // Painted BEFORE the serial write, which can itself fault this early (no UART
-    // base, no EL1 vectors). REMOVE with the rest of the bare-boot paints.
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        chitti_kernel::arch::aarch64::dbg_paint(0, 0x3ff0_0000);
-        chitti_kernel::arch::aarch64::dbg_paint(1, 0x3ff0_0000);
-        chitti_kernel::arch::aarch64::dbg_paint(2, 0x3ff0_0000);
-    }
     serial_println!("KERNEL PANIC: {}", info);
     loop {
         chitti_kernel::arch::hlt();

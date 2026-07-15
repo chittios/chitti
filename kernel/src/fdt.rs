@@ -12,18 +12,6 @@
 //! pointer-only, it is exercised by the host unit suite (`cargo xtask test`)
 //! against blobs built in-memory.
 
-/// TEMP bare-boot bisect probe: paint a framebuffer ladder slot (delegates to
-/// `arch::aarch64::dbg_paint`, which is Apple-gated + a no-op elsewhere). Cfg'd
-/// out entirely on non-aarch64 so this stays arch-neutral. REMOVE with the rest
-/// of the bare-boot paints once the boot is stable.
-#[inline(always)]
-unsafe fn fdt_probe(_slot: usize, _color: u32) {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        crate::arch::aarch64::dbg_paint(_slot, _color);
-    }
-}
-
 const FDT_MAGIC: u32 = 0xd00d_feed;
 const FDT_BEGIN_NODE: u32 = 1;
 const FDT_END_NODE: u32 = 2;
@@ -274,14 +262,12 @@ unsafe fn compat_has(base: *const u8, data_off: usize, len: usize, want: &[u8], 
 pub unsafe fn reg_of_compatible(dtb_pa: u64, want: &[u8]) -> Option<(u64, u64)> {
     // SAFETY: delegated to `header`.
     let (base, h) = unsafe { header(dtb_pa)? };
-    unsafe { fdt_probe(13, 0x000f_fc00) }; // slot 13: reg_of_compatible header parsed
     let mut acells = [2u32; MAX_DEPTH];
     let mut scells = [2u32; MAX_DEPTH];
     let mut matched = [false; MAX_DEPTH];
     let mut reg_off = [0usize; MAX_DEPTH]; // 0 = no reg seen for this node
     let mut depth: usize = 0;
     let mut off = h.off_struct;
-    unsafe { fdt_probe(15, 0x3ff0_03ff) }; // slot 15: stack arrays initialized, entering loop
     loop {
         // SAFETY: `off` is bounded by every `be32` against `h.total`.
         let tok = unsafe { be32(base, off, h.total)? };

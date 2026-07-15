@@ -78,38 +78,6 @@ _image_start:
     .long 0x644d5241            // magic "ARM\x64"
     .long 0                     // res5 (PE/COFF header offset; unused)
 
-// TEMP bare-boot bisect: paint a thin band of colour (clo | chi<<16) into the
-// firmware framebuffer at vertical slot `slot` (each slot 0x20000 B ~ a few rows
-// further down a 1920-wide screen; small stride so even slot 15 fits any FB).
-// Gated to a real Apple boot by the saved FDT
-// pointer in x21 (> 32 GiB); QEMU's DTB is low so every band is skipped there.
-// Stacking one band per _start sub-step turns a single serial-less bare boot into
-// a full progress ladder — the lowest band present on the monitor at reset is the
-// last step reached, pinpointing the faulting instruction in one boot. FB PA
-// 0x9_e52d_4000 is the Mac mini M2 firmware framebuffer (m1n1 boot log). Clobbers
-// x2/x3/x4/w4 (dead at every call site). REMOVE once the bare boot is stable.
-.macro DBGBAND slot, clo, chi
-    movz x2, #0x8, lsl #32
-    cmp  x21, x2
-    b.lo .Ldbg_skip\@
-    movz x2, #0x4000
-    movk x2, #0xe52d, lsl #16
-    movk x2, #0x0009, lsl #32
-    .if \slot != 0
-    add  x2, x2, #(\slot * 0x20), lsl #12   // slot * 0x20000 B (fits any FB)
-    .endif
-    movz w4, #\clo
-    .if \chi != 0
-    movk w4, #\chi, lsl #16
-    .endif
-    movz x3, #0x6000                // 0x6000 px band, < 0x20000 B slot stride
-.Ldbg_loop\@:
-    str  w4, [x2], #4
-    subs x3, x3, #1
-    b.ne .Ldbg_loop\@
-.Ldbg_skip\@:
-.endm
-
 .global _start
 _start:
     // Preserve the entry registers in callee-saved regs across the .bss zero
@@ -118,21 +86,6 @@ _start:
     //   x0 = DTB / FDT pointer          -> BOOT_X0
     mov  x20, x1
     mov  x21, x0
-    // TEMP: clear the top ~3 MiB of the firmware framebuffer to black so each
-    // boot's ladder is fresh (stale bands from a prior boot persist in the live
-    // FB and muddy the reading). Apple-gated on the saved FDT pointer in x21.
-    movz x2, #0x8, lsl #32
-    cmp  x21, x2
-    b.lo 41f
-    movz x2, #0x4000
-    movk x2, #0xe52d, lsl #16
-    movk x2, #0x0009, lsl #32
-    movz x3, #0xc, lsl #16       // 0xc0000 words = 3 MiB
-40: str  wzr, [x2], #4
-    subs x3, x3, #1
-    b.ne 40b
-41:
-    DBGBAND 0, 0x03ff, 0         // blue  : _start entered (m1n1 handed off)
 
     // If we entered at EL2 (m1n1 / iBoot / QEMU `virtualization=on`), drop to
     // EL1 — the whole kernel is written to the EL1 system registers. QEMU
@@ -150,20 +103,14 @@ _start:
     // SCTLR_EL1 leaves the real EL1 SCTLR unknown → instant fault at EL1 on
     // hardware (QEMU/HVF hid it by entering at EL1 directly).
     // HCR_EL2 = API | APK | RW (0x0000_0300_8000_0000). RW=1 (AArch64 EL1),
-    // E2H=TGE=0 (leave m1n1's VHE). API|APK (bits 41,40) keep PAuth instructions/
-    // key registers from trapping to EL2 once we run at EL1 (Rust prologues may
-    // sign the return address), so a PAC trap can't masquerade as an earlier
-    // fault. NOT setting DC (bit 12): although the hv gives the guest Normal
-    // MMU-off memory via its stage-2 map, DC=1 on bare would *also* force
-    // SCTLR_EL1.M to read-as-0 (stage-1 MMU can never enable) and fake stage-2
-    // with no tables — and DC can't be cleared later from EL1. The MMU-off window
-    // (FDT parse + reloc + bss) uses only aligned accesses, which are legal on
-    // Device memory; mmu::init turns the real MMU on before any atomics.
+    // TGE=0. E2H is RES1 on Apple (VHE-only) so it stays 1 regardless — we run at
+    // EL1 under VHE. API|APK (bits 41,40) keep PAuth instructions/key registers
+    // from trapping to EL2 once we run at EL1 (Rust prologues may sign the return
+    // address). QEMU/HVF hide the drop by entering at EL1 directly.
     movz x9, #0x8000, lsl #16   // RW      (bit 31)
     movk x9, #0x0300, lsl #32   // APK|API (bits 40,41)
     msr  hcr_el2, x9
     isb
-    DBGBAND 1, 0xffff, 0x000f   // cyan  : HCR_EL2 written (RW|API|APK), ISB done
     // Sane EL1 SCTLR: MMU + caches off, with the architectural RES1 bits set
     // (bits 11,20,22,23,28,29 = 0x30d00800). Written directly, NOT RMW: the
     // reset/aliased value is not trustworthy.
@@ -171,22 +118,20 @@ _start:
     movk x9, #0x0800
     msr  sctlr_el1, x9
     isb
-    DBGBAND 2, 0xfc00, 0x000f   // green : SCTLR_EL1 written (real EL1 SCTLR)
     // Enable FP/SIMD at EL2 for the ACTUAL E2H state. Apple cores are VHE-only:
     // HCR_EL2.E2H is RES1, so the clear above is ignored and we stay VHE. In VHE
     // CPTR_EL2 is CPACR-format and FP is gated by FPEN[21:20], NOT the non-VHE
-    // TFP bit — writing the non-VHE 0x33ff leaves FPEN=0b00, which is exactly why
-    // FP stayed trapped at EL1. Branch on E2H and set the right value.
+    // TFP bit — writing the non-VHE 0x33ff leaves FPEN=0b00 and traps all FP/SIMD
+    // (NEON array inits, cortex, video) at EL1. Branch on E2H and set the right
+    // value: VHE -> FPEN=0b11; non-VHE (QEMU/SBSA) -> RES1 bits with TFP=0.
     mrs  x10, hcr_el2
     tst  x10, #(1 << 34)        // HCR_EL2.E2H
     b.eq 32f
     mov  x9, #0x300000          // VHE: CPTR_EL2.FPEN = 0b11 (do not trap FP)
     msr  cptr_el2, x9
-    DBGBAND 21, 0x0000, 0x3ff0  // slot 21 red: E2H set (VHE) — expected on Apple
     b    33f
 32: mov  x9, #0x33ff            // non-VHE: RES1 bits + TFP = 0
     msr  cptr_el2, x9
-    DBGBAND 21, 0xfc00, 0x000f  // slot 21 green: E2H clear (non-VHE)
 33:
     msr  hstr_el2, xzr
     // Let EL1 read the generic timer/counter; zero the virtual-counter offset.
@@ -194,7 +139,6 @@ _start:
     orr  x9, x9, #3             // EL1PCTEN | EL1PCEN
     msr  cnthctl_el2, x9
     msr  cntvoff_el2, xzr
-    DBGBAND 3, 0xfc00, 0x3fff   // yellow: CPTR/HSTR/CNTHCTL/CNTVOFF set, pre-eret
     // eret into EL1h with DAIF masked.
     mov  x9, #0x3c5
     msr  spsr_el2, x9
@@ -205,7 +149,6 @@ _start:
     adrp x0, __stack_top
     add  x0, x0, :lo12:__stack_top
     mov  sp, x0
-    DBGBAND 4, 0x0000, 0x3ff0   // red   : eret landed at EL1, SP set
 
     // PIE self-relocation: apply the R_AARCH64_RELATIVE records the `-pie` link
     // emitted, so every absolute address is correct at the *actual* load address
@@ -236,7 +179,6 @@ _start:
     b    5b
 7:  dsb  sy
     isb
-    DBGBAND 5, 0x03ff, 0x3ff0   // magenta: PIE relocation loop completed
 
     // Enable FP/SIMD access at EL1: CPACR_EL1.FPEN = 0b11 (bits [21:20]).
     mrs  x0, cpacr_el1
@@ -253,9 +195,7 @@ _start:
     b.hs 3f
     str  xzr, [x0], #8
     b    2b
-3:
-    DBGBAND 6, 0xffff, 0x3fff   // white : .bss zeroed, about to bl aarch64_start
-    adrp x0, BOOT_X1
+3:  adrp x0, BOOT_X1
     add  x0, x0, :lo12:BOOT_X1
     str  x20, [x0]
     adrp x0, BOOT_X0
