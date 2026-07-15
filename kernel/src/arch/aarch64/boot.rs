@@ -134,10 +134,21 @@ _start:
     // SCTLR_EL2. Missing this ISB / doing a read-modify-write of the aliased
     // SCTLR_EL1 leaves the real EL1 SCTLR unknown → instant fault at EL1 on
     // hardware (QEMU/HVF hid it by entering at EL1 directly).
-    mov  x9, #(1 << 31)         // HCR_EL2.RW = 1; E2H = TGE = 0
+    // HCR_EL2 = API | APK | RW (0x0000_0300_8000_0000). RW=1 (AArch64 EL1),
+    // E2H=TGE=0 (leave m1n1's VHE). API|APK (bits 41,40) keep PAuth instructions/
+    // key registers from trapping to EL2 once we run at EL1 (Rust prologues may
+    // sign the return address), so a PAC trap can't masquerade as an earlier
+    // fault. NOT setting DC (bit 12): although the hv gives the guest Normal
+    // MMU-off memory via its stage-2 map, DC=1 on bare would *also* force
+    // SCTLR_EL1.M to read-as-0 (stage-1 MMU can never enable) and fake stage-2
+    // with no tables — and DC can't be cleared later from EL1. The MMU-off window
+    // (FDT parse + reloc + bss) uses only aligned accesses, which are legal on
+    // Device memory; mmu::init turns the real MMU on before any atomics.
+    movz x9, #0x8000, lsl #16   // RW      (bit 31)
+    movk x9, #0x0300, lsl #32   // APK|API (bits 40,41)
     msr  hcr_el2, x9
     isb
-    DBGBAND 1, 0xffff, 0x000f   // cyan  : HCR_EL2 written, E2H cleared, ISB done
+    DBGBAND 1, 0xffff, 0x000f   // cyan  : HCR_EL2 written (RW|API|APK), ISB done
     // Sane EL1 SCTLR: MMU + caches off, with the architectural RES1 bits set
     // (bits 11,20,22,23,28,29 = 0x30d00800). Written directly, NOT RMW: the
     // reset/aliased value is not trustworthy.
