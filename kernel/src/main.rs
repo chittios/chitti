@@ -198,15 +198,52 @@ pub extern "C" fn limine_start() -> ! {
 
 // --- aarch64 boot (QEMU virt + HVF; entered from arch::aarch64::boot) ----
 
+/// TEMP bare-boot bisect: paint horizontal band `n` of the firmware
+/// framebuffer (m1n1 leaves it live at a fixed PA) a distinct colour, then hold
+/// ~0.4 s so it's actually visible before a fast fault/reset. Apple only; a
+/// no-op elsewhere. Band colours (30bpp x2r10g10b10): 0=white, 1=red, 2=green,
+/// 3=blue. The last band seen on the monitor localizes an early fault. REMOVE
+/// once the bare boot is stable.
+#[cfg(target_arch = "aarch64")]
+unsafe fn dbg_band(n: usize) {
+    let fdt = chitti_kernel::arch::aarch64::boot::boot_x0();
+    // SAFETY: pure FDT reads; no atomics (safe before mmu::init).
+    if !unsafe { chitti_kernel::fdt::has_compatible(fdt, b"apple,arm-platform") } {
+        return;
+    }
+    if let Some(fb) = unsafe { chitti_kernel::fdt::find_framebuffer(fdt) } {
+        let ppr = (fb.stride / 4) as usize; // 32-bit pixels per row
+        let rows = 48usize;
+        let color = [0x3fff_ffffu32, 0x3ff0_0000, 0x000f_fc00, 0x0000_03ff][n % 4];
+        let p = fb.base as *mut u32;
+        let start = n * rows * ppr;
+        for i in 0..rows * ppr {
+            // SAFETY: within the firmware framebuffer (fixed PA in RAM).
+            unsafe { core::ptr::write_volatile(p.add(start + i), color) };
+        }
+    }
+    // Hold so the band is scanned out (~0.4 s) even if the next step faults.
+    for _ in 0..400_000_000u64 {
+        core::hint::spin_loop();
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", not(feature = "boot-limine")))]
 #[unsafe(no_mangle)]
 pub extern "C" fn aarch64_start() -> ! {
+    // TEMP bare-boot bisect (Apple only): a bare m1n1 boot has no serial, so
+    // paint a band into the firmware framebuffer (m1n1 leaves it live) at each
+    // milestone — the last band visible on the monitor localizes an early fault.
+    // Band 0 = reached Rust (past the EL2 drop + PIE reloc + bss). REMOVE once
+    // the bare boot is stable.
+    unsafe { dbg_band(0) };
     // The boot stub (arch::aarch64::boot) already set the stack, enabled NEON,
     // and zeroed BSS. Enable the MMU *first* -- with it off, RAM is Device
     // memory where the LL/SC exclusives that back `Locked`/atomics never
     // succeed (a spinlock would spin forever). `serial_println!` mirrors to a
     // `Locked` framebuffer console, so even the banner needs normal memory.
     chitti_kernel::arch::aarch64::mmu::init();
+    unsafe { dbg_band(1) }; // past mmu::init (MMU + identity map on)
     // Select the Apple Samsung s5l console from the boot FDT (m1n1) before the
     // first print — Apple Silicon has no PL011, so otherwise the banner would
     // write into an unbacked address and nothing would appear. No-op on QEMU.
@@ -214,6 +251,7 @@ pub extern "C" fn aarch64_start() -> ! {
     chitti_kernel::serial::init();
     serial_println!("{} -- NATIVE aarch64 on Apple Silicon (QEMU + HVF)", BOOT_MSG);
     chitti_kernel::init();
+    unsafe { dbg_band(2) }; // past chitti_kernel::init (sched/smp/exceptions/gic)
     // Bring up the framebuffer TUI. Preferred source: the **boot-info page** the
     // UEFI stub publishes at 0x47F00000 (magic "CHITTIBI") carrying the GOP
     // framebuffer — works on ANY UEFI platform (VirtualBox-ARM, UTM, real
