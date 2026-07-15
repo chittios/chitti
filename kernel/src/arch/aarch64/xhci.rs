@@ -42,16 +42,21 @@ pub fn init_global() -> bool {
 /// or mouse came up.
 pub fn attach_at(base: usize) -> bool {
     if let Some(mut x) = Xhci::bringup(base, aa_alloc) {
+        // Visible on the chat pane (bare boot has no serial, ktrace pane closed).
+        crate::serial_println!(
+            "apple_usb: xHCI bringup OK ({} ports); enumerating…",
+            x.port_count()
+        );
         let ok = x.enumerate_keyboard();
-        crate::ktrace::log_fmt(format_args!(
-            "xhci(apple): enum kbd={} mouse={}",
+        crate::serial_println!(
+            "apple_usb: xHCI enum kbd={} mouse={}",
             if x.has_keyboard() { "yes" } else { "no" },
             if x.has_mouse() { "yes" } else { "no" }
-        ));
+        );
         XHCI.with(|s| *s = Some(x));
         return ok;
     }
-    crate::ktrace::log("xhci(apple)", "controller bringup failed at dwc3 xHCI window");
+    crate::serial_println!("apple_usb: xHCI bringup FAILED (controller not ready) — see ktrace for the exact wait that timed out");
     false
 }
 

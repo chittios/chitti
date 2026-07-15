@@ -281,11 +281,35 @@ impl Xhci {
             // Context size: 64 bytes if HCCPARAMS1.CSZ (bit 2), else 32.
             let ctx_size = if r32(mmio + 0x10) & (1 << 2) != 0 { 64 } else { 32 };
 
-            // Wait for CNR to clear, then reset.
-            while r32(op + OP_USBSTS) & USBSTS_CNR != 0 {}
+            // Wait for CNR to clear, then reset. All three waits are BOUNDED: on
+            // QEMU/VBox/PCIe they clear in microseconds, but a controller that
+            // never becomes ready (e.g. the Apple DWC3 xHCI when the ATC-PHY isn't
+            // fully host-ready) must fail cleanly, not hang the boot.
+            let mut s = 0u32;
+            while r32(op + OP_USBSTS) & USBSTS_CNR != 0 {
+                s += 1;
+                if s > 2_000_000 {
+                    crate::ktrace::log("xhci", "CNR never cleared before reset — controller not ready");
+                    return None;
+                }
+            }
             w32(op + OP_USBCMD, USBCMD_HCRST);
-            while r32(op + OP_USBCMD) & USBCMD_HCRST != 0 {}
-            while r32(op + OP_USBSTS) & USBSTS_CNR != 0 {}
+            let mut s = 0u32;
+            while r32(op + OP_USBCMD) & USBCMD_HCRST != 0 {
+                s += 1;
+                if s > 2_000_000 {
+                    crate::ktrace::log("xhci", "HCRST never cleared — reset stuck");
+                    return None;
+                }
+            }
+            let mut s = 0u32;
+            while r32(op + OP_USBSTS) & USBSTS_CNR != 0 {
+                s += 1;
+                if s > 2_000_000 {
+                    crate::ktrace::log("xhci", "CNR never cleared after reset — controller not ready");
+                    return None;
+                }
+            }
 
             // Program enabled device slots.
             w32(op + OP_CONFIG, max_slots as u32);
@@ -622,6 +646,10 @@ impl Xhci {
     }
     pub fn has_mouse(&self) -> bool {
         self.mouse.is_some()
+    }
+    /// Root-hub port count (HCSPARAMS1.MaxPorts) — a bring-up diagnostic.
+    pub fn port_count(&self) -> u8 {
+        self.max_ports
     }
 
     /// Enumerate every connected port once, classifying each device as a boot
