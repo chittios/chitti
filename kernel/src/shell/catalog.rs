@@ -71,7 +71,7 @@ pub enum Row {
     },
 }
 
-/// Full catalogue — grouped like the Grok-style Commands palette.
+/// Full catalogue — grouped like the bordered Commands palette.
 pub const ENTRIES: &[Entry] = &[
     // Session
     Entry { category: "Session", title: "Session Info", name: "session", shortcut: "" },
@@ -84,6 +84,8 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "Context", title: "Memory", name: "memory", shortcut: "" },
     Entry { category: "Context", title: "Todos", name: "todos", shortcut: "" },
     Entry { category: "Context", title: "Skills", name: "skills", shortcut: "" },
+    Entry { category: "Context", title: "Invoke Skill", name: "skill", shortcut: "" },
+    Entry { category: "Context", title: "Plan Mode", name: "plan", shortcut: "" },
     Entry { category: "Context", title: "Permissions", name: "permissions", shortcut: "" },
     // Model & agent
     Entry { category: "Model & Agent", title: "Switch Model", name: "model", shortcut: "" },

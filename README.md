@@ -80,7 +80,7 @@ model from ever directly touching hardware.
 - **Linux-like store FS.** Hierarchical `/ls` (not a flat dump of every key),
   `/cat`, `/mkdir`, `/cp`, `/mv`, `/rm`, `/touch`, `/glob`, `/grep`, `/pwd` over
   the Synapse path store (and mount-aware reads for media/models).
-- **Composer UX.** Grok-style input box; **slash-command** and **`@file`**
+- **Composer UX.** Bordered input box; **slash-command** and **`@file`**
   suggestion menus (↑↓ / Tab / Enter); **Commands** browser for `/help`
   (search + scroll + fill the composer on select).
 - **Host clipboard bridge.** OSC 52 copy-out and bracketed paste so the guest

@@ -29,6 +29,8 @@ pub enum Lang {
     Js,
     Toml,
     Sh,
+    /// Go (and similar C-family tooling syntax).
+    Go,
 }
 
 /// Token classes a byte can belong to; the colour mapping is [`rgb`].
@@ -151,6 +153,7 @@ pub fn lang_for_tag(tag: &str) -> Option<Lang> {
         _ if eq("js") || eq("javascript") || eq("ts") || eq("typescript") || eq("mjs") => Lang::Js,
         _ if eq("toml") || eq("ini") || eq("conf") => Lang::Toml,
         _ if eq("sh") || eq("bash") || eq("zsh") || eq("shell") => Lang::Sh,
+        _ if eq("go") || eq("golang") => Lang::Go,
         _ => return None,
     })
 }
@@ -185,12 +188,18 @@ fn keywords(lang: Lang) -> &'static [&'static str] {
             "case", "do", "done", "echo", "elif", "else", "esac", "export", "fi", "for", "function", "if", "in",
             "local", "return", "then", "while",
         ],
+        Lang::Go => &[
+            "break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough", "for", "func",
+            "go", "goto", "if", "import", "interface", "map", "package", "range", "return", "select", "struct",
+            "switch", "type", "var", "true", "false", "nil", "iota", "make", "new", "len", "cap", "append", "copy",
+            "delete", "close", "panic", "recover",
+        ],
     }
 }
 
 /// Does `lang` use `//` line + `/* */` block comments (C family)?
 fn c_comments(lang: Lang) -> bool {
-    matches!(lang, Lang::Rust | Lang::C | Lang::Js)
+    matches!(lang, Lang::Rust | Lang::C | Lang::Js | Lang::Go)
 }
 
 /// Does `lang` use `#` line comments?
@@ -401,71 +410,235 @@ pub fn ansi_line(lang: Lang, line: &str, st: &mut State) -> String {
 /// "line" without newlines must not buffer unboundedly).
 const HOLD_MAX: usize = 4096;
 
-/// Streaming Markdown colouriser for the chat reply. Feed it the model's
-/// streamed text; it calls `emit` with what should actually be printed:
+/// Emit ANSI for a coloured run of `text` as class `c`.
+fn sgr_paint(c: Class, text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    if c == Class::Text {
+        return text.into();
+    }
+    let (r, g, b) = rgb(c);
+    alloc::format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
+}
+
+/// Bold + colour for headings / emphasis (bordered rendered markdown).
+fn sgr_bold_paint(c: Class, text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let (r, g, b) = rgb(c);
+    alloc::format!("\x1b[1m\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
+}
+
+/// Dim accent gutter used for fenced code (left rail).
+fn code_gutter() -> String {
+    let (r, g, b) = rgb(Class::Comment);
+    alloc::format!("\x1b[38;2;{r};{g};{b}m│\x1b[0m ")
+}
+
+/// Render one finished source line of markdown (no trailing newline) to ANSI,
+/// updating fence state. bordered: **hides** ``` fence markers, strips
+/// heading `#` / bold `**` / inline `` ` `` markers, syntax-highlights code.
+fn render_md_line(line: &str, st: &mut State) -> String {
+    let b = line.as_bytes();
+    // Fence open/close — never print the triple-backtick line (hidden intentionally).
+    if let Some(tag_bytes) = fence_tag(b) {
+        match st.fence {
+            Some(_) => {
+                // Closing fence: optional blank visual break already via \n.
+                st.fence = None;
+                return String::new();
+            }
+            None => {
+                let tag = core::str::from_utf8(tag_bytes).unwrap_or("").trim();
+                // Drop optional language info after space (```go title).
+                let lang_tag = tag.split(|c: char| c.is_whitespace()).next().unwrap_or("");
+                let lang = lang_for_tag(lang_tag);
+                st.fence = Some(lang);
+                // Dim language label only (no backticks).
+                if lang_tag.is_empty() {
+                    return String::new();
+                }
+                let (r, g, b) = rgb(Class::Comment);
+                return alloc::format!(
+                    "\x1b[38;2;{r};{g};{b}m  {lang_tag}\x1b[0m"
+                );
+            }
+        }
+    }
+    // Inside a fence: gutter + language lex.
+    if let Some(fl) = st.fence {
+        let body = match fl {
+            Some(lang) => ansi_line(lang, line, st),
+            None => sgr_paint(Class::Code, line),
+        };
+        return alloc::format!("{}{body}", code_gutter());
+    }
+    // Headings: strip leading #, bold + heading colour (markers removed first
+    // so we don't nest SGR inside SGR).
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        let level = t.bytes().take_while(|&c| c == b'#').count();
+        if level > 0 && (t.as_bytes().get(level) == Some(&b' ') || t.len() == level) {
+            let title = t[level..].trim_start();
+            let plain = strip_inline_markers(title);
+            return sgr_bold_paint(Class::Heading, &plain);
+        }
+    }
+    // List bullets: colour the marker, render rest inline.
+    let trimmed = line.trim_start();
+    let indent = line.len() - trimmed.len();
+    if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+    {
+        let pad = " ".repeat(indent);
+        let bullet = sgr_paint(Class::Punct, "•");
+        let body = render_inline_md(rest);
+        return alloc::format!("{pad}{bullet} {body}");
+    }
+    // Numbered list `1. `.
+    if let Some(dot) = trimmed.find(". ") {
+        if trimmed[..dot].bytes().all(|c| c.is_ascii_digit()) && !trimmed[..dot].is_empty() {
+            let pad = " ".repeat(indent);
+            let num = sgr_paint(Class::Number, &trimmed[..=dot]);
+            let body = render_inline_md(&trimmed[dot + 2..]);
+            return alloc::format!("{pad}{num} {body}");
+        }
+    }
+    render_inline_md(line)
+}
+
+/// Remove common inline markdown markers, keep plain text only.
+fn strip_inline_markers(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'`' {
+            if let Some(rel) = b[i + 1..].iter().position(|&c| c == b'`') {
+                out.push_str(core::str::from_utf8(&b[i + 1..i + 1 + rel]).unwrap_or(""));
+                i += rel + 2;
+                continue;
+            }
+        }
+        if b[i] == b'*' && b.get(i + 1) == Some(&b'*') {
+            if let Some(e) = find(b, i + 2, b"**") {
+                out.push_str(core::str::from_utf8(&b[i + 2..e]).unwrap_or(""));
+                i = e + 2;
+                continue;
+            }
+        }
+        if b[i] == b'*' {
+            // skip unpaired emphasis markers
+            i += 1;
+            continue;
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Inline markdown: strip `**bold**`, `*italic*`, `` `code` `` markers and paint.
+fn render_inline_md(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut i = 0;
+    while i < b.len() {
+        // Inline code `…`
+        if b[i] == b'`' {
+            if let Some(rel) = b[i + 1..].iter().position(|&c| c == b'`') {
+                let content = core::str::from_utf8(&b[i + 1..i + 1 + rel]).unwrap_or("");
+                out.push_str(&sgr_paint(Class::Code, content));
+                i += rel + 2;
+                continue;
+            }
+        }
+        // **bold**
+        if b[i] == b'*' && b.get(i + 1) == Some(&b'*') {
+            if let Some(e) = find(b, i + 2, b"**") {
+                let content = core::str::from_utf8(&b[i + 2..e]).unwrap_or("");
+                out.push_str(&sgr_bold_paint(Class::Keyword, content));
+                i = e + 2;
+                continue;
+            }
+        }
+        // *italic* (single)
+        if b[i] == b'*' && b.get(i + 1) != Some(&b'*') {
+            if let Some(rel) = b[i + 1..].iter().position(|&c| c == b'*') {
+                // Don't treat `*` list-ish mid-word as italic if no close soon.
+                let content = core::str::from_utf8(&b[i + 1..i + 1 + rel]).unwrap_or("");
+                if !content.is_empty() && !content.contains('\n') {
+                    out.push_str(&sgr_paint(Class::Keyword, content));
+                    i += rel + 2;
+                    continue;
+                }
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Streaming Markdown renderer for chat (bordered).
 ///
-/// * prose flows through unchanged, token by token;
-/// * a line that *might* be a heading or fence marker (starts with `#` or
-///   `` ` `` at line start) — and every line inside a fence — is held until
-///   its newline, then emitted coloured (code blocks stream line-by-line);
-/// * fence interiors are lexed with the fence tag's language.
+/// Line-buffered: each complete line is fully rendered (markers stripped,
+/// fences hidden, code highlighted) before emit — same checkpoint idea as
+/// streaming markdown (stable per line).
 pub struct StreamMd {
     st: State,
     hold: String,
-    holding: bool,
-    line_start: bool,
 }
 
 impl StreamMd {
     pub fn new() -> StreamMd {
-        StreamMd { st: State::default(), hold: String::new(), holding: false, line_start: true }
-    }
-
-    /// Whether a line starting with `c` needs to be buffered for colouring.
-    fn hold_worthy(&self, c: char) -> bool {
-        self.st.fence.is_some() || c == '#' || c == '`'
+        StreamMd {
+            st: State::default(),
+            hold: String::new(),
+        }
     }
 
     pub fn feed(&mut self, s: &str, emit: &mut dyn FnMut(&str)) {
         for ch in s.chars() {
-            if self.line_start && !self.holding && self.hold_worthy(ch) {
-                self.holding = true;
-            }
-            if self.holding {
-                if ch == '\n' {
+            if ch == '\n' {
+                let line = core::mem::take(&mut self.hold);
+                let rendered = render_md_line(&line, &mut self.st);
+                // Skip completely empty fence-close lines without a blank gap
+                // double; still emit newline so block structure remains.
+                emit(&rendered);
+                emit("\n");
+            } else {
+                self.hold.push(ch);
+                if self.hold.len() >= HOLD_MAX {
                     let line = core::mem::take(&mut self.hold);
-                    emit(&ansi_line(Lang::Md, &line, &mut self.st));
-                    emit("\n");
-                    self.holding = false;
-                    self.line_start = true;
-                } else {
-                    self.hold.push(ch);
-                    if self.hold.len() >= HOLD_MAX {
-                        let line = core::mem::take(&mut self.hold);
-                        emit(&line);
-                        self.holding = false;
-                        self.line_start = false;
-                    }
+                    emit(&render_md_line(&line, &mut self.st));
                 }
-                continue;
             }
-            // Plain prose: pass through (headings/fences only matter at line
-            // start, which `line_start` tracks across feeds).
-            let mut buf = [0u8; 4];
-            emit(ch.encode_utf8(&mut buf));
-            self.line_start = ch == '\n';
         }
     }
 
     /// Flush anything still held (end of the reply mid-line).
     pub fn finish(&mut self, emit: &mut dyn FnMut(&str)) {
-        if self.holding && !self.hold.is_empty() {
+        if !self.hold.is_empty() {
             let line = core::mem::take(&mut self.hold);
-            emit(&ansi_line(Lang::Md, &line, &mut self.st));
+            emit(&render_md_line(&line, &mut self.st));
         }
-        self.holding = false;
-        self.line_start = true;
     }
+}
+
+/// Render a complete markdown document to ANSI (remote / batch path).
+/// Callers should run `shell::chrome::sanitize_chat_text` first when the
+/// source may contain fancy Unicode punctuation.
+pub fn render_md_document(text: &str) -> String {
+    let mut sm = StreamMd::new();
+    let mut out = String::new();
+    sm.feed(text, &mut |s| out.push_str(s));
+    sm.finish(&mut |s| out.push_str(s));
+    out
 }
 
 #[cfg(test)]
@@ -577,22 +750,10 @@ mod tests {
         assert_eq!(stripped, r#"{"k": 1}"#);
     }
 
-    #[test_case]
-    fn stream_md_prose_passes_through_and_fences_colour() {
-        let mut sm = StreamMd::new();
-        let mut out = String::new();
-        sm.feed("hello ", &mut |s| out.push_str(s));
-        // Prose streams through unbuffered.
-        assert_eq!(out, "hello ");
-        sm.feed("world\n```rust\nfn main() {}\n```\ndone", &mut |s| out.push_str(s));
-        sm.finish(&mut |s| out.push_str(s));
-        assert!(out.starts_with("hello world\n"));
-        assert!(out.contains("\x1b[38;2;"), "fence content coloured");
-        assert!(out.ends_with("done"), "trailing prose passes through");
-        // Strip escapes: the text itself is intact.
+    fn strip_ansi(s: &str) -> String {
         let mut stripped = String::new();
         let mut esc = false;
-        for c in out.chars() {
+        for c in s.chars() {
             match (esc, c) {
                 (false, '\x1b') => esc = true,
                 (false, _) => stripped.push(c),
@@ -600,6 +761,52 @@ mod tests {
                 (true, _) => {}
             }
         }
-        assert_eq!(stripped, "hello world\n```rust\nfn main() {}\n```\ndone");
+        stripped
+    }
+
+    #[test_case]
+    fn stream_md_hides_fences_and_colours_code() {
+        let mut sm = StreamMd::new();
+        let mut out = String::new();
+        // Line-buffered: incomplete line is held.
+        sm.feed("hello ", &mut |s| out.push_str(s));
+        assert!(out.is_empty(), "partial line held");
+        sm.feed(
+            "world\n```rust\nfn main() {}\n```\ndone",
+            &mut |s| out.push_str(s),
+        );
+        sm.finish(&mut |s| out.push_str(s));
+        assert!(out.contains("\x1b[38;2;"), "fence content coloured");
+        let stripped = strip_ansi(&out);
+        // Fence markers hidden (bordered); lang label + code remain.
+        assert!(!stripped.contains("```"), "backtick fences must be hidden: {stripped}");
+        assert!(stripped.contains("fn main()"), "code body present: {stripped}");
+        assert!(stripped.contains("done"), "trailing prose: {stripped}");
+        assert!(stripped.contains("rust") || stripped.contains("│"), "lang label or gutter");
+    }
+
+    #[test_case]
+    fn stream_md_go_fence_and_bold() {
+        let out = render_md_document("```go\npackage main\nfunc main() {}\n```\n**bold** tip");
+        let stripped = strip_ansi(&out);
+        assert!(!stripped.contains("```"));
+        assert!(stripped.contains("package main"));
+        assert!(stripped.contains("bold tip") || stripped.contains("bold"), "{stripped}");
+        assert!(!stripped.contains("**"), "bold markers stripped: {stripped}");
+        assert!(out.contains("\x1b[38;2;"), "coloured");
+        // Go keywords get keyword colour.
+        assert_eq!(lang_for_tag("go"), Some(Lang::Go));
+        let c = classes(Lang::Go, "func main()", &mut State::default());
+        assert_eq!(c[0], Class::Keyword, "func is a Go keyword");
+    }
+
+    #[test_case]
+    fn stream_md_heading_and_list() {
+        let out = render_md_document("## Title\n- item one\n1. second");
+        let stripped = strip_ansi(&out);
+        assert!(!stripped.starts_with("##"), "heading hashes stripped: {stripped}");
+        assert!(stripped.contains("Title"));
+        assert!(stripped.contains("item one"));
+        assert!(!stripped.contains("- item"), "dash bullet replaced: {stripped}");
     }
 }

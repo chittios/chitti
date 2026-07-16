@@ -40,7 +40,7 @@ const THEME_DEFAULTS: &[(&str, &str)] = &[
     ("editor_fg", "#faf9f5"),
     ("editor_lineno", "#6c6a64"),
     ("editor_sel", "#5a3a2e"),   // terracotta-tinted selection
-    ("composer_bg", "#252320"),  // elevated input box (Grok-style)
+    ("composer_bg", "#252320"),  // elevated input box (bordered)
     ("composer_border", "#3a3733"),
     ("composer_hint", "#6c6a64"),
 ];

@@ -10,6 +10,7 @@
 //! drives at `cargo xtask run`.
 
 pub mod catalog;
+pub mod chrome;
 pub mod remote;
 pub mod suggest;
 pub mod voice_remote;
@@ -195,7 +196,7 @@ pub fn run() -> ! {
     }
     // Draft preserved across channel-wake interruptions of read_line.
     let mut line = String::new();
-    // Right-side composer hint: model / approval mode (Grok shell layout).
+    // Right-side composer hint: model / approval mode (shell layout).
     #[cfg(not(test))]
     update_composer_hint(remote_on, remote_cfg.as_ref());
 
@@ -205,7 +206,7 @@ pub fn run() -> ! {
         // idle read_line (otherwise Telegram DMs sit unprocessed forever).
         drain_channel_inbound(&mut chat, &mut orch.session);
 
-        // Grok-style bordered input box on the framebuffer; **serial always**
+        // Bordered input box on the framebuffer; **serial always**
         // gets a classic `>` prompt + character echo so `make run` / mon:stdio
         // still works as a full line editor (composer must not swallow that).
         #[cfg(not(test))]
@@ -230,6 +231,12 @@ pub fn run() -> ! {
         // the default fg). Reset once the line is submitted.
         #[cfg(not(test))]
         serial_print!("{}", theme_sgr("accent", (204, 120, 92)));
+        // Capture before composer_end — used to avoid double-printing the user
+        // line (classic path already echoed chars into scrollback).
+        #[cfg(not(test))]
+        let used_composer = crate::framebuffer::composer_is_active();
+        #[cfg(test)]
+        let used_composer = false;
         let outcome = read_line(&mut line);
         #[cfg(not(test))]
         {
@@ -250,6 +257,12 @@ pub fn run() -> ! {
             continue;
         }
         let msg = submitted.as_str();
+        // user prompt: composer path never wrote the body into the
+        // chat grid (only the box), so land a single `> …` history row here.
+        // Classic dual-console already echoed the line — skip to avoid double.
+        if used_composer {
+            print_user_turn(msg);
+        }
         if let Some(cmd) = msg.strip_prefix('/') {
             let (name, arg) = match cmd.split_once(' ') {
                 Some((n, a)) => (n, a.trim()),
@@ -310,6 +323,43 @@ pub fn run() -> ! {
                 "ws" => run_ws(arg),
                 "mcp" => run_mcp(arg),
                 "todos" | "todo" => run_todos(arg, &orch.session),
+                "plan" => {
+                    set_plan_mode(true);
+                    let p = crate::agent::prompt::plan_file_path(orch.session.id.0);
+                    serial_println!(
+                        "plan> mode on — write the plan to {} then call exit_plan_mode",
+                        p
+                    );
+                }
+                "skill" => {
+                    // Zero-RTT skill expand (slash skill): inject body as
+                    // user turn with <skill_information>, no model load round-trip.
+                    let name = arg.split_whitespace().next().unwrap_or("").trim();
+                    if name.is_empty() {
+                        let _ = dispatch_system("skills", "");
+                    } else {
+                        let rest = arg[name.len()..].trim();
+                        match expand_skill_slash(name, rest, &mut orch.session) {
+                            Ok(msg) => {
+                                serial_println!("skill> expanded '{}' into chat", name);
+                                // Feed as a normal chat turn so tools remain available.
+                                if remote_on {
+                                    if let Some(cfg) = remote_cfg.as_ref() {
+                                        let rc = remote_chat
+                                            .get_or_insert_with(|| remote::RemoteChat::new(cfg.clone()));
+                                        let _ = rc.turn(&msg, &mut orch.session);
+                                    }
+                                } else if let Some(sess) = chat.as_mut() {
+                                    let _ = sess.turn(&msg, &mut orch.session);
+                                } else {
+                                    serial_println!("skill> no chat session — body printed only");
+                                    serial_println!("{}", msg);
+                                }
+                            }
+                            Err(e) => serial_println!("skill> {}", e),
+                        }
+                    }
+                }
                 "session" => {
                     let (sub, sarg) = match arg.split_once(' ') {
                         Some((s, a)) => (s, a.trim()),
@@ -335,6 +385,53 @@ pub fn run() -> ! {
                             },
                             Err(_) => serial_println!("usage: /session resume <id>"),
                         },
+                        "fork" => {
+                            let parent = orch.session.id.0;
+                            let f = crate::session::fork(
+                                &orch.session,
+                                crate::agent::orchestrator::now(),
+                            );
+                            let fid = f.id.0;
+                            match crate::session::save_fork(&f, parent) {
+                                Ok(()) => {
+                                    orch = orchestrator::Orchestrator::from_session(
+                                        amanifest::orchestrator_manifest(),
+                                        f,
+                                    );
+                                    chat = None;
+                                    remote_chat = None;
+                                    serial_println!(
+                                        "=> forked session {} -> {} (parent={})",
+                                        parent, fid, parent
+                                    );
+                                }
+                                Err(_) => serial_println!("=> fork save failed"),
+                            }
+                        }
+                        "list" => {
+                            let rows = crate::session::list_summaries();
+                            if rows.is_empty() {
+                                serial_println!("session> (none saved)");
+                            } else {
+                                for (id, title) in rows {
+                                    serial_println!("  {}  {}", id, title);
+                                }
+                            }
+                        }
+                        "search" => {
+                            if sarg.is_empty() {
+                                serial_println!("usage: /session search <query>");
+                            } else {
+                                let rows = crate::session::search_sessions(sarg);
+                                if rows.is_empty() {
+                                    serial_println!("session> no matches for '{}'", sarg);
+                                } else {
+                                    for (id, title) in rows {
+                                        serial_println!("  {}  {}", id, title);
+                                    }
+                                }
+                            }
+                        }
                         _ => {
                             serial_println!(
                                 "current session {} — {} messages, {} todos, {} subagents, seed {}",
@@ -344,9 +441,12 @@ pub fn run() -> ! {
                                 orch.session.subagents.len(),
                                 orch.session.seed
                             );
-                            let saved: alloc::vec::Vec<String> =
-                                crate::synapse::fs::list().into_iter().filter(|p| p.starts_with("/sessions/")).collect();
-                            serial_println!("saved in store: [{}]  (/session save | /session resume <id>)", saved.join(", "));
+                            serial_println!(
+                                "usage: /session [save|resume <id>|fork|list|search <q>]"
+                            );
+                            for (id, title) in crate::session::list_summaries().into_iter().take(8) {
+                                serial_println!("  {}  {}", id, title);
+                            }
                         }
                     }
                 }
@@ -382,6 +482,11 @@ pub fn run() -> ! {
                         rc.hydrate_from_session(&orch.session);
                     }
                     rc.turn(msg, &mut orch.session);
+                    // Drain queued follow-ups (prompt-queue).
+                    while let Some(q) = pop_prompt_queue() {
+                        serial_println!("\x1b[2m[queued]\x1b[0m {}", q);
+                        rc.turn(&q, &mut orch.session);
+                    }
                 }
                 None => serial_println!("model> remote mode but no endpoint — /model remote http://host:port [name]"),
             }
@@ -404,11 +509,15 @@ pub fn run() -> ! {
         match chat.as_mut() {
             Some(sess) => {
                 sess.turn(msg, &mut orch.session);
+                while let Some(q) = pop_prompt_queue() {
+                    serial_println!("\x1b[2m[queued]\x1b[0m {}", q);
+                    sess.turn(&q, &mut orch.session);
+                }
             }
             None => serial_println!("no model bundled -- chat unavailable (try /infer, /bench, or /model remote)"),
         }
         // Drop any residual scrollback caret left at the end of the reply so
-        // only the Grok-style composer shows a cursor.
+        // only the bordered composer shows a cursor.
         #[cfg(not(test))]
         crate::framebuffer::clear_chat_caret();
     }
@@ -474,6 +583,10 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "js" => run_js(arg),
         "think" => run_think(arg),
         "mode" => run_mode(arg),
+        "plan" => {
+            set_plan_mode(true);
+            serial_println!("plan> mode on (use /mode auto or exit_plan_mode to leave)");
+        }
         "permissions" | "perms" => run_permissions(arg),
         "voice" => run_voice(arg),
         "onnx" => run_onnx(arg),
@@ -961,21 +1074,40 @@ fn print_info(orch: &crate::agent::orchestrator::Orchestrator, chat: Option<&Cha
     );
 }
 
-/// An in-place progress spinner, drawn on the current console
-/// line via a carriage return so it works on both the serial console and the
-/// framebuffer. Colored with ANSI SGR (rendered by the framebuffer parser and by
-/// a real terminal alike). `tick()` advances one frame; `clear()` erases it.
+/// Progress spinner. Status-only mode animates the **composer hint bar only**
+/// (never `serial_print!` into chat scrollback — that mirrored "Waiting…" into
+/// the transcript as a duplicate top line).
 struct Spinner {
     frame: usize,
+    /// Static label for non-status (in-place) spinners.
     label: &'static str,
+    status_only: bool,
+    /// Wall-clock start for elapsed seconds on the status bar.
+    start_ms: u64,
 }
 
 impl Spinner {
-    // ASCII frames (the Geist Mono atlas has no braille): a smooth 4-phase spin.
+    // ASCII frames (Geist Mono has no braille).
     const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 
     fn new(label: &'static str) -> Self {
-        let s = Self { frame: 0, label };
+        let s = Self {
+            frame: 0,
+            label,
+            status_only: false,
+            start_ms: crate::arch::now_ms(),
+        };
+        s.draw();
+        s
+    }
+    /// Composer-bar "Thinking  1.2s  |" status (elapsed ticks up).
+    fn new_status() -> Self {
+        let s = Self {
+            frame: 0,
+            label: chrome::format_thinking_live(),
+            status_only: true,
+            start_ms: crate::arch::now_ms(),
+        };
         s.draw();
         s
     }
@@ -984,35 +1116,49 @@ impl Spinner {
         self.draw();
     }
     fn draw(&self) {
-        // `\r` back to col 0, then the (bold cyan) frame + label; no newline.
-        serial_print!("\r\x1b[1;36m{}\x1b[0m {}", Self::FRAMES[self.frame % Self::FRAMES.len()], self.label);
+        let frame = Self::FRAMES[self.frame % Self::FRAMES.len()];
+        if self.status_only {
+            let secs = crate::arch::now_ms().saturating_sub(self.start_ms) as f32 / 1000.0;
+            let msg = chrome::format_thinking_status(secs, frame);
+            #[cfg(not(test))]
+            crate::framebuffer::composer_set_hint_left(&msg);
+            // UART only — must not go through serial_print! (that also paints
+            // the chat pane via console_print).
+            crate::serial::write_str_raw("\r");
+            crate::serial::write_str_raw(&msg);
+            crate::serial::write_str_raw("\x1b[K");
+            return;
+        }
+        serial_print!("\r\x1b[2m{}\x1b[0m {}", frame, self.label);
     }
-    /// Erase the spinner line and return the cursor to column 0.
     fn clear(&self) {
+        if self.status_only {
+            #[cfg(not(test))]
+            crate::framebuffer::composer_set_hint_left(
+                "Tab select · menu · Enter send · /cmds · @files",
+            );
+            crate::serial::write_str_raw("\r\x1b[K");
+            return;
+        }
         serial_print!("\r");
-        for _ in 0..self.label.len() + 2 {
+        for _ in 0..self.label.len() + 4 {
             serial_print!(" ");
         }
         serial_print!("\r");
     }
 }
 
-/// A shared "thinking" spinner advanced by [`upkeep`]. The local inference loops
-/// own their `Spinner` and `tick()` it per token, but the **remote model** call
-/// blocks inside `net::http` (one HTTP round-trip, no token stream), so there is
-/// nothing on this side to tick. Instead `begin_thinking` starts a spinner that
-/// `upkeep` — which the net poll loop calls while waiting — advances, and
-/// `end_thinking` erases it. Rate-limited so it spins smoothly, not frantically.
+/// Shared wait status advanced by [`upkeep`].
 static THINKING: crate::mm::Locked<Option<Spinner>> = crate::mm::Locked::new(None);
 static THINKING_LAST_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Start the shared thinking spinner (replaces any prior one).
-pub(crate) fn begin_thinking(label: &'static str) {
-    THINKING.with(|t| *t = Some(Spinner::new(label)));
+/// Start wait animation on the composer bar (`Thinking  0.0s  |`).
+pub(crate) fn begin_thinking(_label: &'static str) {
+    THINKING.with(|t| *t = Some(Spinner::new_status()));
     THINKING_LAST_MS.store(0, Ordering::Relaxed);
 }
 
-/// Stop and erase the shared thinking spinner.
+/// Stop wait animation and restore the default composer hint.
 pub(crate) fn end_thinking() {
     THINKING.with(|t| {
         if let Some(s) = t.take() {
@@ -1123,7 +1269,7 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
     // is discoverable on demand via `search_tools` — the full registry listing
     // both bloated the prefill and tempted small models into calling the first
     // listed tool on a bare "hello".
-    s.push_str("\n\nTools you can call. To use one, reply with ONE line and nothing else:\n");
+    s.push_str("\n\nTools you can call. Emit one or more blocks (multiple OK for independent reads):\n");
     s.push_str("<tool_call>{\"name\": \"<name>\", \"arguments\": {…}}</tool_call>\n");
     s.push_str("FS tools use path/content/old/new; memory uses key/value; shell tools may use {\"args\":\"…\"}.\n");
     for d in defs.iter().filter(|d| CORE_TOOLS.contains(&d.name.as_str())) {
@@ -1136,7 +1282,8 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
         s.push('\n');
     }
     s.push_str("- search_tools \u{2014} Find more tools by keyword (e.g. wifi, install, mcp); call this when no listed tool fits.\n");
-    s.push_str("After a tool runs you get its output in <tool_response>...; then answer, or call another tool.");
+    s.push_str("- use_tool \u{2014} Call a deferred/MCP tool: {\"tool_name\":\"mcp__srv__t\",\"tool_input\":{…}} after search_tools.\n");
+    s.push_str("After tools run you get <tool_response>...; then answer, or call more tools.");
     s
 }
 
@@ -1160,6 +1307,8 @@ pub(crate) const CORE_TOOLS: &[&str] = &[
     "skill",
     "spawn_subagent",
     "enter_plan_mode",
+    "exit_plan_mode",
+    "use_tool",
     "datetime",
     "disks",
     "network",
@@ -1221,40 +1370,48 @@ fn search_tools(query: &str) -> String {
     }
 
     let q = q_trim.to_lowercase();
-    let words: alloc::vec::Vec<&str> = q.split_whitespace().collect();
     let mut out = String::new();
-    let mut n = 0;
     for (srv, _, _) in crate::mcp::servers() {
         for (t, _) in crate::mcp::server_tools(&srv) {
             toolset.push(crate::mcp::tool_registry_name(&srv, &t));
         }
     }
-    // Also surface MCP resource tools.
+    // Also surface MCP resource tools + meta-dispatch.
     toolset.push(String::from("mcp_resources"));
     toolset.push(String::from("mcp_read_resource"));
     toolset.push(String::from("skill"));
     toolset.push(String::from("load_skill"));
+    toolset.push(String::from("use_tool"));
 
+    // Score + rank (keyword rank): name hits beat description-only.
+    let mut ranked: alloc::vec::Vec<(u32, String, String, bool)> = alloc::vec::Vec::new();
     for d in crate::tools::registry::for_agent(&toolset) {
-        // Advertise every binding the Router can actually dispatch for this agent.
         if matches!(d.binding, ToolBinding::RunIntent) {
             continue;
         }
-        let hay = alloc::format!("{} {}", d.name, d.description).to_lowercase();
-        if words.is_empty() || words.iter().any(|w| hay.contains(w)) {
-            let deferred = d.name.starts_with("mcp__") || matches!(d.binding, ToolBinding::Mcp { .. });
-            if deferred {
-                out.push_str(&alloc::format!(
-                    "- {} \u{2014} {} [deferred; select:{} for schema]\n",
-                    d.name, d.description, d.name
-                ));
-            } else {
-                out.push_str(&alloc::format!("- {} \u{2014} {}\n", d.name, d.description));
-            }
-            n += 1;
-            if n >= 16 {
-                break;
-            }
+        let score = if q.is_empty() {
+            1
+        } else {
+            crate::agent::prompt::tool_search_score(&d.name, &d.description, &q)
+        };
+        if score == 0 {
+            continue;
+        }
+        let deferred = d.name.starts_with("mcp__") || matches!(d.binding, ToolBinding::Mcp { .. });
+        ranked.push((score, d.name.clone(), d.description.clone(), deferred));
+    }
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    for (i, (_score, name, desc, deferred)) in ranked.iter().enumerate() {
+        if i >= 16 {
+            break;
+        }
+        if *deferred {
+            out.push_str(&alloc::format!(
+                "- {} \u{2014} {} [deferred; select:{} for schema, or use_tool]\n",
+                name, desc, name
+            ));
+        } else {
+            out.push_str(&alloc::format!("- {} \u{2014} {}\n", name, desc));
         }
     }
     if out.is_empty() {
@@ -1414,7 +1571,11 @@ fn chat_toolset() -> alloc::vec::Vec<String> {
 }
 
 fn tool_in_chat_toolset(name: &str) -> bool {
-    if name == "search_tools" || name == "enter_plan_mode" || name == "exit_plan_mode" {
+    if name == "search_tools"
+        || name == "enter_plan_mode"
+        || name == "exit_plan_mode"
+        || name == "use_tool"
+    {
         return true;
     }
     // MCP tools are registered at runtime and always discoverable once connected.
@@ -1453,40 +1614,57 @@ fn agent_system_prompt() -> String {
     // L0 skill index only — full bodies load via `skill` / `load_skill`.
     let skills = crate::skills::index::metadata();
     if !skills.is_empty() {
-        persona.push_str("## Installed skills (L0 — invoke with skill {\"name\":\"…\"})\n");
-        for m in skills.iter().take(12) {
-            persona.push_str("- ");
-            persona.push_str(&m.name);
-            persona.push_str(" \u{2014} ");
-            persona.push_str(&m.description);
-            persona.push('\n');
-        }
+        let pairs: alloc::vec::Vec<_> = skills
+            .iter()
+            .map(|m| (m.name.clone(), m.description.clone()))
+            .collect();
+        persona.push_str(&crate::agent::prompt::format_skill_l0_listing(&pairs, 12));
+    }
+    let mode = match approval_mode() {
+        ApprovalMode::Manual => "manual",
+        ApprovalMode::Auto => "auto",
+        ApprovalMode::Bypass => "bypass",
+        ApprovalMode::Plan => "plan",
+    };
+    let model = crate::shell::remote::active_config()
+        .map(|c| c.model)
+        .unwrap_or_else(|| String::from("local"));
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    persona.push_str(&crate::agent::prompt::user_info_block(arch, id, mode, &model));
+    persona.push_str(crate::agent::prompt::operating_rules_block());
+    tools_system_prompt(&persona, &toolset)
+}
+
+/// Short system prompt after interactive `/compact` (post-compact shape).
+fn agent_system_prompt_compact() -> String {
+    let toolset = chat_toolset();
+    let id = active_agent_id();
+    let mut persona = String::from(crate::agent::prompt::COMPACT_SYSTEM_CORE);
+    persona.push('\n');
+    if let Some(kv) = crate::agent::home::memory_kv_digest(id) {
+        persona.push_str("\n## Stored facts\n");
+        persona.push_str(&kv);
         persona.push('\n');
     }
-    persona.push_str(
-        "You are Chitti, an agentic OS shell agent on bare metal. For greetings and small \
-         talk, just reply in prose — do NOT call a tool. Call a tool only when the task needs \
-         machine state or an action, and never invent data a tool can read (current time, \
-         network status, files, disks). Use read/write/edit/glob/grep for files, memory_* for \
-         durable notes (prefer the exact keys listed under Stored facts; if unsure call \
-         memory_list or memory_search before guessing a key), notes_list/notes_get/notes_set for \
-         markdown notes, download to fetch HTTP(S) files into /downloads/, skill to load a \
-         procedure, todo_write for multi-step work, spawn_subagent to delegate. When you have \
-         the answer, reply in short plain prose (ANSI SGR escape codes for emphasis if needed, \
-         never markdown).",
-    );
+    let skills = crate::skills::index::metadata();
+    if !skills.is_empty() {
+        let pairs: alloc::vec::Vec<_> = skills
+            .iter()
+            .map(|m| (m.name.clone(), m.description.clone()))
+            .collect();
+        persona.push_str(&crate::agent::prompt::format_skill_l0_listing(&pairs, 8));
+    }
+    persona.push_str(crate::agent::prompt::operating_rules_block());
     tools_system_prompt(&persona, &toolset)
 }
 
 /// A delegated worker sub-agent's persona + its (attenuated) toolset.
 fn subagent_system_prompt(toolset: &[String]) -> String {
-    tools_system_prompt(
-        "You are an isolated Chitti sub-agent completing one delegated task. Use tools to \
-         gather facts; never repeat a tool call you already ran, and never delegate further. \
-         When you have the facts, reply in plain prose with a concise factual report of \
-         EXACTLY what the tool output showed - never invent details.",
-        toolset,
-    )
+    tools_system_prompt(crate::agent::prompt::subagent_rules_block(), toolset)
 }
 
 /// Extract a string field's value from a small JSON object. Tolerant of
@@ -1727,28 +1905,21 @@ fn json_escape_into(out: &mut String, v: &str) {
     }
 }
 
-/// Detect a tool call in a model reply. Primary: the Qwen3.5 template —
-/// `<tool_call>{"name": .., "arguments": ..}</tool_call>`. Fallback: a
-/// `TOOL: /<cmd> [args]` line (small-model drift from older prompts).
-///
-/// Returns `(tool_name, args_json)` where `args_json` is a JSON object the
-/// Synapse Router can shape-validate (not a flattened shell line).
-pub(crate) fn parse_tool_call(text: &str) -> Option<(alloc::string::String, alloc::string::String)> {
+/// Detect **all** tool calls in a model reply (multi-tool turn). Primary:
+/// Qwen3.5 `<tool_call>{…}</tool_call>` blocks (each block's own JSON only —
+/// never merge name from block 1 with arguments from block 2). Fallback: a
+/// single legacy `TOOL: /cmd args` line when no XML blocks are present.
+pub(crate) fn parse_tool_calls(
+    text: &str,
+) -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)> {
     use alloc::string::ToString;
-    // Qwen template. Parse only the FIRST tool call and only its own JSON
-    // object: a model can emit several `<tool_call>` blocks in one turn (some
-    // finetunes concatenate them, sometimes without closing the first), and the
-    // old code took `name` from the first object but scanned the whole span for
-    // `"arguments"` — so a later block's args leaked in (`/read {"name":"pdf"}`).
-    if let Some(start) = text.find("<tool_call>") {
-        let after = &text[start + "<tool_call>".len()..];
-        // Bound the block at whichever comes first: the close tag, or a second
-        // (concatenated) open tag — never merge two calls into one.
+    let mut out = alloc::vec::Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<tool_call>") {
+        let after = &rest[start + "<tool_call>".len()..];
         let close = after.find("</tool_call>").unwrap_or(after.len());
         let next_open = after.find("<tool_call>").unwrap_or(after.len());
         let block = &after[..close.min(next_open)];
-        // Isolate the first balanced `{…}` so trailing garbage / a second
-        // object can't contribute a `name` or `arguments` to this call.
         let obj = block
             .find('{')
             .and_then(|b| extract_balanced_json_object(&block[b..]))
@@ -1756,9 +1927,22 @@ pub(crate) fn parse_tool_call(text: &str) -> Option<(alloc::string::String, allo
         if let Some(name) = json_str(&obj, "name") {
             let name = name.trim().trim_start_matches('/').to_string();
             if !name.is_empty() {
-                return Some((name, extract_arguments_json(&obj)));
+                out.push((name, extract_arguments_json(&obj)));
             }
         }
+        // Advance past this block (prefer explicit close when present).
+        let advance = if after.find("</tool_call>").map(|c| c < next_open).unwrap_or(false) {
+            "<tool_call>".len() + close + "</tool_call>".len()
+        } else {
+            "<tool_call>".len() + next_open.min(after.len())
+        };
+        if advance == 0 {
+            break;
+        }
+        rest = &rest[start + advance..];
+    }
+    if !out.is_empty() {
+        return out;
     }
     // Legacy fallback → wrap the free-form line as shell `args`.
     for line in text.lines() {
@@ -1776,11 +1960,17 @@ pub(crate) fn parse_tool_call(text: &str) -> Option<(alloc::string::String, allo
             let args = parts.next().unwrap_or("").trim().to_string();
             if !cmd.is_empty() {
                 let json = normalize_tool_args_json(&cmd, &args);
-                return Some((cmd, json));
+                out.push((cmd, json));
+                break;
             }
         }
     }
-    None
+    out
+}
+
+/// First tool call only — compatibility wrapper (tests + oneshot paths).
+pub(crate) fn parse_tool_call(text: &str) -> Option<(alloc::string::String, alloc::string::String)> {
+    parse_tool_calls(text).into_iter().next()
 }
 
 /// A friendly verb + primary argument for an agent tool call, for the styled
@@ -1866,7 +2056,7 @@ pub(crate) fn strip_think(s: &str) -> alloc::string::String {
     }
 }
 
-/// Local time `"HH:MM"` for a turn timestamp (Grok-style).
+/// Local time `"HH:MM"` for a turn timestamp (bordered).
 fn hhmm() -> alloc::string::String {
     // format_datetime() → "Wed 2026-07-04 13:45:02"; take the HH:MM.
     let dt = crate::clock::format_datetime();
@@ -1874,30 +2064,110 @@ fn hhmm() -> alloc::string::String {
 }
 
 /// A speaker label with a dim timestamp: `HH:MM  name` (name in theme accent).
+/// Prefer no stamp on agent body (agent message has none); kept for
+/// multi-agent switch / legacy callers.
 pub(crate) fn answer_label(name: &str) -> alloc::string::String {
     let a = theme_sgr("title_active", (204, 120, 92));
     alloc::format!("\x1b[2m{}\x1b[0m {a}{name}\x1b[0m ", hhmm())
 }
 
-/// Print a styled tool-call header — `│ ◆ Verb  arg` — an accent left gutter +
-/// diamond, a bold theme-fg verb, and the argument in the accent (Grok style).
+/// user prompt: blank line + elevated `> text` band.
+pub(crate) fn print_user_turn(text: &str) {
+    let clean = chrome::sanitize_chat_text(text.trim());
+    if clean.is_empty() {
+        return;
+    }
+    // One blank above separates from the previous turn footer; no blank below
+    // so the agent reply sits tight under the user band.
+    serial_println!("");
+    let a = theme_sgr("accent", (204, 120, 92));
+    let f = theme_sgr("chat_fg", (247, 244, 237));
+    let mut n_lines = 0usize;
+    let mut first = true;
+    for line in clean.lines() {
+        if first {
+            serial_println!("{a}{}\x1b[0m \x1b[1m{f}{}\x1b[0m", chrome::PROMPT_ARROW, line);
+            first = false;
+        } else {
+            serial_println!("  \x1b[1m{f}{}\x1b[0m", line);
+        }
+        n_lines += 1;
+    }
+    #[cfg(not(test))]
+    crate::framebuffer::chat_mark_user_band_rows(n_lines.max(1));
+}
+
+/// Final assistant answer with markdown paint (no speaker timestamp).
+pub(crate) fn print_assistant_markdown(_label: &str, body: &str) {
+    let visible = strip_think(body);
+    let text = chrome::sanitize_chat_text(visible.trim());
+    if text.is_empty() {
+        let raw = chrome::sanitize_chat_text(body.trim());
+        if raw.is_empty() {
+            serial_println!("\x1b[2m(empty reply)\x1b[0m");
+        } else {
+            serial_println!("{}", raw);
+        }
+        return;
+    }
+    // No leading blank — sits directly under the user band (tight turn gap).
+    let rendered = crate::highlight::render_md_document(&text);
+    if rendered.ends_with('\n') {
+        serial_print!("{}", rendered);
+    } else {
+        serial_println!("{}", rendered);
+    }
+}
+
+/// tool chrome: diamond + bold verb + muted path (`entry_renderer` prefix).
 pub(crate) fn print_tool_header(cmd: &str, args: &str) {
     let (verb, arg) = tool_header(cmd, args);
     let a = theme_sgr("accent", (204, 120, 92));
     let f = theme_sgr("chat_fg", (247, 244, 237));
-    // `●` bullet; bold verb, accent argument. (The chat pane now decodes UTF-8,
-    // so these multi-byte glyphs render.)
+    let m = theme_sgr("muted", (108, 106, 100));
+    serial_println!("");
     if arg.is_empty() {
-        serial_println!("{a}●\x1b[0m \x1b[1m{f}{verb}\x1b[0m");
+        serial_println!("{a}{}\x1b[0m \x1b[1m{f}{verb}\x1b[0m", chrome::DIAMOND);
     } else {
-        serial_println!("{a}●\x1b[0m \x1b[1m{f}{verb}\x1b[0m  {a}{arg}\x1b[0m");
+        serial_println!(
+            "{a}{}\x1b[0m \x1b[1m{f}{verb}\x1b[0m  {m}{arg}\x1b[0m",
+            chrome::DIAMOND
+        );
     }
 }
 
-/// Print a "● Thought for X.Xs" line in the theme accent + dim.
+/// Thought summary — only when a think block was enabled and timed.
 pub(crate) fn print_thought_for(secs: f32) {
-    let acc = theme_sgr("accent", (204, 120, 92));
-    serial_println!("{}●\x1b[0m \x1b[2mThought for {:.1}s\x1b[0m", acc, secs);
+    if secs <= 0.0 {
+        return;
+    }
+    let a = theme_sgr("accent", (204, 120, 92));
+    let m = theme_sgr("muted", (108, 106, 100));
+    serial_println!(
+        "{a}{}\x1b[0m {m}{}\x1b[0m",
+        chrome::DIAMOND,
+        chrome::format_thought_done(secs)
+    );
+}
+
+/// Worked-for line — total turn wall time after the answer body.
+pub(crate) fn print_worked_for(secs: f32) {
+    if secs < 0.05 {
+        return; // skip noise for instant cancels
+    }
+    let m = theme_sgr("muted", (108, 106, 100));
+    serial_println!("{m}{}\x1b[0m", chrome::format_worked_for(secs));
+}
+
+/// Turn footer: Thought for (if think parsed) then Worked for (wall time).
+pub(crate) fn print_turn_footer(thought_secs: f32, worked_secs: f32) {
+    if thought_secs <= 0.0 && worked_secs < 0.05 {
+        return;
+    }
+    serial_println!("");
+    // Thought only when we actually timed a think block (not total wait).
+    print_thought_for(thought_secs);
+    print_worked_for(worked_secs);
 }
 
 /// True when a tool prints its own output to the console (a Shell-bound command
@@ -1912,34 +2182,29 @@ pub(crate) fn tool_self_prints(name: &str) -> bool {
     )
 }
 
-/// Print a tool's result under its header: indented + dim, truncated so a large
-/// read/list can't flood the pane (a later fold makes the rest expandable).
+/// Tool body under accent bar: dim gutter lines, fold after N.
 pub(crate) fn print_tool_output(obs: &str) {
-    // Fold fairly eagerly so long results stay tidy and the "▸ more" affordance
-    // is actually seen (most tool output is short).
     const MAX_LINES: usize = 6;
     let a = theme_sgr("accent", (204, 120, 92));
-    let lines: alloc::vec::Vec<&str> = obs.lines().collect();
+    let clean = chrome::sanitize_chat_text(obs);
+    let lines: alloc::vec::Vec<&str> = clean.lines().collect();
     let total = lines.len();
     let shown = total.min(MAX_LINES);
-    // Each output line sits under an accent `│` left gutter, dim.
     let row = |l: &str| -> alloc::string::String {
         let clipped: alloc::string::String = l.chars().take(120).collect();
-        alloc::format!("{a}│\x1b[0m   \x1b[2m{clipped}\x1b[0m")
+        alloc::format!("{a}|\x1b[0m  \x1b[2m{clipped}\x1b[0m")
     };
     for l in &lines[..shown] {
         serial_println!("{}", row(l));
     }
     if total > shown {
-        // Collapsed remainder → a clickable "+ N more" fold. Capture the line
-        // index it lands on, print it, then register the hidden lines.
         let hidden: alloc::string::String =
             lines[shown..].iter().map(|l| row(l)).collect::<alloc::vec::Vec<_>>().join("\n");
         #[cfg(not(test))]
         {
             let gi = crate::framebuffer::chat_current_gi();
             serial_println!(
-                "{a}│ ▶\x1b[0m \x1b[2m{} more line(s) — click to expand\x1b[0m",
+                "{a}|\x1b[0m  \x1b[2m> {} more line(s) - click to expand\x1b[0m",
                 total - shown
             );
             crate::framebuffer::chat_note_fold(gi, &hidden);
@@ -2894,16 +3159,31 @@ fn execute_chat_tool(
     if name == "search_tools" {
         return search_tools(args);
     }
+    // bordered meta-dispatch for deferred/MCP tools (stable CORE list).
+    if name == "use_tool" {
+        return execute_use_tool(args, session);
+    }
     // Plan mode enter/exit — human or agent can toggle without Router.
     if name == "enter_plan_mode" {
         set_plan_mode(true);
-        return String::from("ok: plan mode on — only read-only tools + todos/skills until exit_plan_mode or /mode auto");
+        return String::from(
+            "ok: plan mode on — only read-only tools + todos/skills + the session plan file until exit_plan_mode",
+        );
     }
     if name == "exit_plan_mode" {
-        // Require human confirm to leave plan (prevents model self-escalating).
+        // Present plan file for human approval (plan-exit approval).
+        let plan_path = crate::agent::prompt::plan_file_path(session.id.0);
+        let plan_preview = crate::synapse::fs::read(&plan_path)
+            .map(|b| {
+                let t = alloc::string::String::from_utf8_lossy(&b);
+                t.chars().take(800).collect::<alloc::string::String>()
+            })
+            .unwrap_or_else(|| String::from("(no plan.md yet — agent may leave without a written plan)"));
         let ok = crate::modal::confirm(
             "Exit plan mode?",
-            "The agent wants to leave plan mode and re-enable write/delete tools (mode: auto).",
+            &alloc::format!(
+                "Approve plan and re-enable write/delete tools (mode: auto)?\n\n{plan_preview}"
+            ),
         );
         if !ok {
             return String::from("Denied: stayed in plan mode.");
@@ -2920,6 +3200,15 @@ fn execute_chat_tool(
     }
 
     let args_json = normalize_tool_args_json(name, args);
+
+    // Plan-mode host gate (independent of bypass): non-readonly FS writes only
+    // to the session plan file (plan-file-only rule).
+    if matches!(approval_mode(), ApprovalMode::Plan) {
+        if let Some(err) = plan_mode_write_gate(name, &args_json, session.id.0) {
+            serial_println!("\x1b[33m[plan mode: refused '{}']\x1b[0m", name);
+            return err;
+        }
+    }
     let def = registry::get(name);
     let (label, destructive, is_mcp) = match def.as_ref().map(|d| &d.binding) {
         Some(ToolBinding::Shell { command, destructive }) => {
@@ -2934,14 +3223,6 @@ fn execute_chat_tool(
         Some(_) => (alloc::format!("{name}"), false, false),
         None => (alloc::format!("{name}"), false, false),
     };
-
-    // Plan mode: refuse non-readonly tools.
-    if matches!(approval_mode(), ApprovalMode::Plan) && !crate::tools::permissions::is_readonly_tool(name) {
-        serial_println!("\x1b[33m[plan mode: refused '{}']\x1b[0m", name);
-        return alloc::format!(
-            "error: plan mode — '{name}' is not read-only. Use read/glob/grep/todo_write/skill, or /mode auto to exit plan."
-        );
-    }
 
     // Optional permissions.json patterns (deny > allow > ask > fallthrough).
     let rule = crate::tools::permissions::check(name);
@@ -3004,7 +3285,184 @@ fn execute_chat_tool(
     }
     // Auto-compact after tool use (same threshold as agent_loop).
     let _ = crate::agent::context::maybe_compact(session, crate::agent::orchestrator::now());
-    format_tool_result(outcome.is_error, outcome.result)
+    let text = format_tool_result(outcome.is_error, outcome.result);
+    // Spill key uses tool-call budget counter (unique per session turn).
+    bound_chat_tool_result(
+        session.id.0,
+        session.budget.tool_calls_used as u64,
+        &text,
+    )
+}
+
+/// Cap model-facing tool output; spill full body under the session store.
+fn bound_chat_tool_result(session_id: u64, call_id: u64, text: &str) -> String {
+    use crate::agent::prompt::{bound_tool_result, tool_spill_path, TOOL_RESULT_MAX_BYTES};
+    if text.len() <= TOOL_RESULT_MAX_BYTES {
+        return text.into();
+    }
+    let path = tool_spill_path(session_id, call_id);
+    crate::synapse::fs::write(&path, text.as_bytes());
+    bound_tool_result(text, Some(&path))
+}
+
+/// use_tool meta-dispatch: `{tool_name, tool_input}` → real tool.
+/// CORE/native tools must be called directly (corrective error).
+fn execute_use_tool(
+    args: &str,
+    session: &mut crate::agent::types::Session,
+) -> String {
+    let args_json = if args.trim().starts_with('{') {
+        args.to_string()
+    } else {
+        return String::from(
+            "error: use_tool needs {\"tool_name\":\"…\",\"tool_input\":{…}} (after search_tools)",
+        );
+    };
+    let tool_name = crate::session::todo::json_str(&args_json, "tool_name")
+        .or_else(|| crate::session::todo::json_str(&args_json, "name"))
+        .unwrap_or_default();
+    if tool_name.is_empty() {
+        return String::from("error: use_tool missing tool_name");
+    }
+    // Corrective: native CORE tools are called directly, not via use_tool.
+    if CORE_TOOLS.contains(&tool_name.as_str())
+        || tool_name == "search_tools"
+        || tool_name == "use_tool"
+    {
+        return alloc::format!(
+            "error: '{tool_name}' is a core tool — call it directly with \
+             <tool_call>{{\"name\":\"{tool_name}\",\"arguments\":{{…}}}}</tool_call>, not use_tool"
+        );
+    }
+    // tool_input may be an object or string; prefer embedded object slice.
+    let input = crate::session::todo::json_str(&args_json, "tool_input")
+        .or_else(|| crate::session::todo::json_str(&args_json, "arguments"))
+        .unwrap_or_else(|| {
+            // Slice "tool_input":{…} as object if present.
+            if let Some(i) = args_json.find("\"tool_input\"") {
+                let after = &args_json[i + "\"tool_input\"".len()..];
+                if let Some(colon) = after.find(':') {
+                    let rest = after[colon + 1..].trim_start();
+                    if rest.starts_with('{') {
+                        return extract_balanced_json_object(rest).unwrap_or_else(|| "{}".into());
+                    }
+                }
+            }
+            String::from("{}")
+        });
+    execute_chat_tool(&tool_name, &input, session)
+}
+
+/// Expand `/skill <name> [args…]` into a user message with the L1 body
+/// (zero-RTT slash skill). Loads via skills::loader.
+fn expand_skill_slash(
+    name: &str,
+    args: &str,
+    session: &mut crate::agent::types::Session,
+) -> Result<String, String> {
+    match crate::skills::loader::invoke(
+        session,
+        name,
+        None,
+        crate::agent::orchestrator::now(),
+    ) {
+        Ok(body) => {
+            let path = alloc::format!("/skills/{name}/SKILL.md");
+            let env = crate::agent::prompt::skill_information_envelope(name, &path, &body, args);
+            if args.is_empty() {
+                Ok(alloc::format!(
+                    "{env}\nApply this skill to the current conversation."
+                ))
+            } else {
+                Ok(alloc::format!("{env}\nUser args: {args}"))
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Soft TodoGate (structured): when the session has open todos and the model
+/// just tried to end without tools, nudge once. Default: on when any todo is
+/// not completed (no separate opt-in config yet — cheap on small models).
+fn todo_gate_should_nudge(session: &crate::agent::types::Session) -> bool {
+    use crate::agent::types::TodoStatus;
+    !session.todos.is_empty()
+        && session
+            .todos
+            .iter()
+            .any(|t| matches!(t.status, TodoStatus::Pending | TodoStatus::InProgress))
+}
+
+/// Pending host system-reminders (MCP connect, etc.) injected once into the
+/// next chat prefill — never as user-typed provenance.
+static PENDING_REMINDERS: crate::mm::Locked<alloc::vec::Vec<String>> =
+    crate::mm::Locked::new(alloc::vec::Vec::new());
+
+/// Prompt queue: messages submitted while a turn is busy (or staged for next).
+static PROMPT_QUEUE: crate::mm::Locked<alloc::vec::Vec<String>> =
+    crate::mm::Locked::new(alloc::vec::Vec::new());
+
+fn push_system_reminder(body: &str) {
+    PENDING_REMINDERS.with(|q| q.push(body.into()));
+}
+
+fn take_system_reminders() -> String {
+    PENDING_REMINDERS.with(|q| {
+        if q.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        for r in q.drain(..) {
+            out.push_str(&crate::agent::prompt::system_reminder(&r));
+            out.push('\n');
+        }
+        out
+    })
+}
+
+/// Queue a follow-up user message (drained after the current turn).
+pub fn queue_prompt(msg: &str) {
+    let t = msg.trim();
+    if !t.is_empty() {
+        PROMPT_QUEUE.with(|q| q.push(t.into()));
+    }
+}
+
+fn pop_prompt_queue() -> Option<String> {
+    PROMPT_QUEUE.with(|q| {
+        if q.is_empty() {
+            None
+        } else {
+            Some(q.remove(0))
+        }
+    })
+}
+
+/// Plan-mode write gate: refuse non-readonly tools unless the target path is
+/// the session plan file. Returns Some(error) when blocked.
+fn plan_mode_write_gate(name: &str, args_json: &str, session_id: u64) -> Option<String> {
+    if crate::tools::permissions::is_readonly_tool(name) {
+        return None;
+    }
+    // Allow write/edit only to plan.md for this session.
+    if matches!(name, "write" | "edit") {
+        let path = crate::session::todo::json_str(args_json, "path")
+            .or_else(|| crate::session::todo::json_str(args_json, "file"))
+            .unwrap_or_default();
+        let plan = crate::agent::prompt::plan_file_path(session_id);
+        if path == plan || path.ends_with("/plan.md") && path.contains(&alloc::format!("/sessions/{session_id}/")) {
+            return None;
+        }
+        return Some(alloc::format!(
+            "error: plan mode — only the plan file is writable ({plan}). \
+             Other writes are refused even in bypass; use exit_plan_mode after drafting."
+        ));
+    }
+    Some(alloc::format!(
+        "error: plan mode — '{name}' is not read-only. Use read/glob/grep/todo_write/skill, \
+         write the plan to {}, or exit_plan_mode.",
+        crate::agent::prompt::plan_file_path(session_id)
+    ))
 }
 
 /// A live chat: the model, its BPE tokenizer, and a persistent KV/recurrent
@@ -3031,6 +3489,8 @@ struct ChatSession {
     history: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>,
     /// Monotonic tool-call ids for recording into the orchestrator session.
     next_call_id: u64,
+    /// Last generate_assistant think duration (secs); printed at turn footer.
+    last_thought_secs: f32,
 }
 
 impl ChatSession {
@@ -3082,6 +3542,7 @@ impl ChatSession {
             greedy: false,
             history: alloc::vec::Vec::new(),
             next_call_id: 1,
+            last_thought_secs: 0.0,
         })
     }
 
@@ -3181,6 +3642,8 @@ impl ChatSession {
         // owns everything above it.
         const MAX_TOOLS_PER_TURN: u32 = 16;
         self.cancelled = false;
+        self.last_thought_secs = 0.0;
+        let turn_t0 = crate::arch::now_ms();
 
         let limits = session.budget.limits;
         session.budget.tool_calls_used = 0;
@@ -3191,16 +3654,25 @@ impl ChatSession {
         if self.history.is_empty() {
             self.prefill_committed("system\n", &agent_system_prompt(), false);
         }
-        self.prefill_committed("user\n", msg, true);
+        // Inject host system-reminders (MCP connect, etc.) as SystemTrusted user
+        // envelope so they don't look like human-typed facts.
+        let mut user_body = String::from(msg);
+        let rem = take_system_reminders();
+        if !rem.is_empty() {
+            user_body = alloc::format!("{rem}\n{msg}");
+        }
+        self.prefill_committed("user\n", &user_body, true);
         if self.cancelled {
             serial_println!("\x1b[33m[cancelled]\x1b[0m");
+            let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
+            print_turn_footer(self.last_thought_secs, worked);
             let _ = crate::session::save(session);
             return alloc::string::String::new();
         }
-        // Repeat guard (same rationale as the sub-agent loop): a small model
-        // that re-emits the identical call already has its output. First repeat
-        // gets one "answer now" nudge; a repeat after that ends the turn.
-        let mut last_call: Option<(alloc::string::String, alloc::string::String)> = None;
+        // Repeat guard: identical multi-tool batch already has its output.
+        // First repeat gets one "answer now" nudge; a second ends the turn.
+        let mut last_batch: Option<alloc::vec::Vec<(alloc::string::String, alloc::string::String)>> =
+            None;
         let mut nudged = false;
         let mut tools_this_turn = 0u32;
         let remaining = limits.max_tool_calls.saturating_sub(session.budget.tool_calls_used);
@@ -3212,98 +3684,142 @@ impl ChatSession {
         loop {
             if tools_this_turn >= max_this_turn || session.budget.tool_calls_used >= limits.max_tool_calls {
                 serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
+                let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
+                print_turn_footer(self.last_thought_secs, worked);
                 let _ = crate::session::save(session);
                 return alloc::string::String::from("stopped: tool-call budget exhausted");
             }
-            let lbl = answer_label("chitti:");
-            let text = self.generate_assistant(&lbl);
+            // No speaker stamp (agent message); MD streams without prefix.
+            let text = self.generate_assistant("");
             if self.cancelled {
-                // Partial decode is not in history; KV already rebuilt.
+                let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
+                print_turn_footer(self.last_thought_secs, worked);
                 let _ = crate::session::save(session);
                 return text;
             }
-            if let Some(pair) = parse_tool_call(&text) {
-                if last_call.as_ref() == Some(&pair) {
-                    if nudged {
-                        serial_println!("\x1b[33m[tool loop stopped: repeated call]\x1b[0m");
-                        let _ = crate::session::save(session);
-                        return alloc::string::String::new();
-                    }
+            let batch = parse_tool_calls(&text);
+            if batch.is_empty() {
+                // Final answer: commit assistant text to history + session.
+                // Optional TodoGate: nudge once if todos remain open (opt-in style, max 1 fire).
+                if !nudged && todo_gate_should_nudge(session) {
                     nudged = true;
+                    if !text.is_empty() {
+                        self.history.push((alloc::string::String::from("assistant\n"), text.clone()));
+                    }
                     self.prefill_committed(
                         "user\n",
-                        "<tool_response>\nYou already ran that tool and have its output above. Do not call any more tools; give your final answer in prose now.\n</tool_response>",
+                        &crate::agent::prompt::system_reminder(
+                            "Open todos remain. Update them with todo_write or finish the work, \
+                             then give your final answer. Do not ignore the checklist.",
+                        ),
                         true,
                     );
                     continue;
                 }
-                last_call = Some(pair);
+                if !text.is_empty() {
+                    self.history.push((alloc::string::String::from("assistant\n"), text.clone()));
+                }
+                session.push_message(Role::Assistant, text.clone(), Provenance::SystemTrusted, now());
+                let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
+                print_turn_footer(self.last_thought_secs, worked);
+                let _ = crate::session::save(session);
+                return text;
             }
-            match parse_tool_call(&text) {
-                Some((cmd, args)) if cmd == "spawn_subagent" || cmd == "subagent" => {
-                    // Args are Router JSON; task under "task"/"args", role under "role".
-                    let task = crate::session::todo::json_str(&args, "task")
-                        .or_else(|| crate::session::todo::json_str(&args, "args"))
+            if last_batch.as_ref() == Some(&batch) {
+                if nudged {
+                    serial_println!("\x1b[33m[tool loop stopped: repeated call]\x1b[0m");
+                    let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
+                    print_turn_footer(self.last_thought_secs, worked);
+                    let _ = crate::session::save(session);
+                    return alloc::string::String::new();
+                }
+                nudged = true;
+                self.prefill_committed(
+                    "user\n",
+                    "<tool_response>\nYou already ran that tool batch and have its output above. \
+                     Do not call any more tools; give your final answer in prose now.\n</tool_response>",
+                    true,
+                );
+                continue;
+            }
+            last_batch = Some(batch.clone());
+            self.history.push((alloc::string::String::from("assistant\n"), text.clone()));
+
+            // Record all tool calls on the session assistant turn.
+            let mut tcs: alloc::vec::Vec<ToolCall> = alloc::vec::Vec::new();
+            let mut call_ids: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+            for (cmd, args) in &batch {
+                let call_id = self.next_call_id;
+                self.next_call_id += 1;
+                call_ids.push(call_id);
+                tcs.push(ToolCall {
+                    call_id,
+                    tool: cmd.clone(),
+                    args: args.clone(),
+                });
+            }
+            session.push_assistant_tool_calls(String::new(), tcs, now());
+
+            let all_readonly = batch
+                .iter()
+                .all(|(c, _)| crate::tools::permissions::is_readonly_tool(c));
+            let mut results: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> =
+                alloc::vec::Vec::new();
+            for (i, (cmd, args)) in batch.iter().enumerate() {
+                if tools_this_turn >= max_this_turn {
+                    // Still write cancelled results so the model sees what was skipped.
+                    for (cmd2, _) in batch.iter().skip(i) {
+                        let cid = call_ids[results.len()];
+                        let msg = String::from("error: cancelled (tool-call budget)");
+                        session.push_tool_result(cid, msg.clone(), Provenance::SystemTrusted, now());
+                        results.push((cmd2.clone(), msg));
+                    }
+                    break;
+                }
+                if !all_readonly && self.cancelled {
+                    for (cmd2, _) in batch.iter().skip(i) {
+                        let cid = call_ids[results.len()];
+                        let msg = String::from("error: cancelled");
+                        session.push_tool_result(cid, msg.clone(), Provenance::SystemTrusted, now());
+                        results.push((cmd2.clone(), msg));
+                    }
+                    break;
+                }
+                session.budget.tool_calls_used = session.budget.tool_calls_used.saturating_add(1);
+                tools_this_turn = tools_this_turn.saturating_add(1);
+                let call_id = call_ids[i];
+                let obs = if cmd == "spawn_subagent" || cmd == "subagent" {
+                    let task = crate::session::todo::json_str(args, "task")
+                        .or_else(|| crate::session::todo::json_str(args, "args"))
                         .unwrap_or_else(|| args.clone());
-                    let role = crate::session::todo::json_str(&args, "role").unwrap_or_else(|| "worker".into());
+                    let role =
+                        crate::session::todo::json_str(args, "role").unwrap_or_else(|| "worker".into());
                     let a = theme_sgr("accent", (204, 120, 92));
                     serial_println!("{a}*\x1b[0m \x1b[1mDelegate\x1b[0m  \x1b[2m[{}] {}\x1b[0m", role, task);
-                    // Keep assistant tool-call text in history so a later rebuild
-                    // preserves the Qwen tool-call → tool_response shape.
-                    self.history.push((alloc::string::String::from("assistant\n"), text.clone()));
-                    let call_id = self.next_call_id;
-                    self.next_call_id += 1;
-                    session.push_assistant_tool_calls(
-                        String::new(),
-                        alloc::vec![ToolCall { call_id, tool: cmd.clone(), args: args.clone() }],
-                        now(),
-                    );
-                    session.budget.tool_calls_used = session.budget.tool_calls_used.saturating_add(1);
-                    tools_this_turn = tools_this_turn.saturating_add(1);
                     let summary = self.run_subagent_role(&role, &task);
-                    session.push_tool_result(call_id, summary.clone(), Provenance::SystemTrusted, now());
-                    let fb = alloc::format!("<tool_response>\nSubagent report:\n{}\n</tool_response>", summary);
-                    self.prefill_committed("user\n", &fb, true);
-                }
-                Some((cmd, args)) => {
-                    print_tool_header(&cmd, &args);
-                    self.history.push((alloc::string::String::from("assistant\n"), text.clone()));
-                    let call_id = self.next_call_id;
-                    self.next_call_id += 1;
-                    session.push_assistant_tool_calls(
-                        String::new(),
-                        alloc::vec![ToolCall { call_id, tool: cmd.clone(), args: args.clone() }],
-                        now(),
-                    );
-                    session.budget.tool_calls_used = session.budget.tool_calls_used.saturating_add(1);
-                    tools_this_turn = tools_this_turn.saturating_add(1);
-                    let obs = execute_chat_tool(&cmd, &args, session);
-                    let prov = if obs.starts_with("error:")
-                        || obs.starts_with("Denied:")
-                        || obs.starts_with("denied:")
-                        || obs.starts_with("refused:")
-                    {
-                        Provenance::SystemTrusted
-                    } else {
-                        Provenance::UntrustedIngested
-                    };
-                    session.push_tool_result(call_id, obs.clone(), prov, now());
-                    if !tool_self_prints(&cmd) {
-                        print_tool_output(&obs);
+                    alloc::format!("Subagent report:\n{summary}")
+                } else {
+                    print_tool_header(cmd, args);
+                    let o = execute_chat_tool(cmd, args, session);
+                    if !tool_self_prints(cmd) {
+                        print_tool_output(&o);
                     }
-                    let fb = alloc::format!("<tool_response>\n{}\n</tool_response>", obs);
-                    self.prefill_committed("user\n", &fb, true);
-                }
-                None => {
-                    // Final answer: commit assistant text to history + session.
-                    if !text.is_empty() {
-                        self.history.push((alloc::string::String::from("assistant\n"), text.clone()));
-                    }
-                    session.push_message(Role::Assistant, text.clone(), Provenance::SystemTrusted, now());
-                    let _ = crate::session::save(session);
-                    return text;
-                }
+                    o
+                };
+                let prov = if obs.starts_with("error:")
+                    || obs.starts_with("Denied:")
+                    || obs.starts_with("denied:")
+                    || obs.starts_with("refused:")
+                {
+                    Provenance::SystemTrusted
+                } else {
+                    Provenance::UntrustedIngested
+                };
+                session.push_tool_result(call_id, obs.clone(), prov, now());
+                results.push((cmd.clone(), obs));
             }
+            let fb = crate::agent::prompt::format_multi_tool_response(&results);
+            self.prefill_committed("user\n", &fb, true);
             if self.cancelled {
                 let _ = crate::session::save(session);
                 return alloc::string::String::new();
@@ -3323,7 +3839,7 @@ impl ChatSession {
         self.cancelled = false;
         self.prefill_turn(
             "user\n",
-            "Summarize this conversation so far in under 120 words: key facts, decisions, and open tasks. Reply with only the summary.",
+            crate::agent::prompt::compaction_user_prompt(),
             true,
         );
         if self.cancelled {
@@ -3346,9 +3862,13 @@ impl ChatSession {
         self.state = self.model.new_state();
         self.pos = 0;
         self.gen.clear();
-        self.prefill_committed("system\n", &agent_system_prompt(), false);
+        self.prefill_committed("system\n", &agent_system_prompt_compact(), false);
         if !s.is_empty() && !self.cancelled {
-            self.prefill_committed("system\n", &alloc::format!("Conversation so far (compacted): {}", s), false);
+            self.prefill_committed(
+                "system\n",
+                &alloc::format!("Conversation so far (compacted):\n{}", s),
+                false,
+            );
         }
         crate::ktrace::log_fmt(format_args!("chat.compact: {} -> {} tokens", before, self.pos));
         serial_println!("(compacted: context {} -> {} tokens)", before, self.pos);
@@ -3536,11 +4056,14 @@ impl ChatSession {
             if next == eos || next == im_end {
                 break;
             }
-            // End of the think block: switch from dim reasoning to the answer.
+            // End of the think block: switch to answer (Thought footer at turn end).
             if in_think && (next == think_close || n_think >= MAX_THINK) {
                 in_think = false;
-                let secs = crate::arch::now_ms().saturating_sub(think_start) as f32 / 1000.0;
-                print_thought_for(secs);
+                // Only count Thought for when think tokens were actually produced.
+                if n_think > 0 {
+                    let secs = crate::arch::now_ms().saturating_sub(think_start) as f32 / 1000.0;
+                    self.last_thought_secs = secs;
+                }
                 // Feed </think> (the model's own, or forced at the cap).
                 self.model.forward(think_close, self.pos, &mut self.kv, &mut self.state, true);
                 self.pos += 1;
@@ -3586,7 +4109,10 @@ impl ChatSession {
                 }
                 if !suppress_tools {
                     if !label_shown {
-                        serial_print!("{}", label);
+                        // Empty label = body-only stream (no HH:MM stamp).
+                        if !label.is_empty() {
+                            serial_print!("{}", label);
+                        }
                         label_shown = true;
                     }
                     md.feed(&piece, &mut |s| serial_print!("{}", s));
@@ -3602,10 +4128,9 @@ impl ChatSession {
             crate::net::poll();
             next = self.pick();
         }
-        if in_think {
-            // Ended (EOS/stop) while still thinking: still show the timing.
+        if in_think && n_think > 0 {
             let secs = crate::arch::now_ms().saturating_sub(think_start) as f32 / 1000.0;
-            print_thought_for(secs);
+            self.last_thought_secs = secs;
         }
         // Flush a held partial line + newline only if an answer actually
         // streamed (a pure tool-call turn printed nothing — the ◆ header comes
@@ -4502,6 +5027,12 @@ fn run_mcp(arg: &str) {
             serial_println!("mcp> connecting to {} \u{2026}", url);
             match crate::mcp::connect(name, url, bearer) {
                 Ok(count) => {
+                    // bordered MCP fingerprint: announce without dumping schemas
+                    // into the system prompt (discover via search_tools / use_tool).
+                    push_system_reminder(&alloc::format!(
+                        "MCP server '{name}' connected ({count} tools). Tools are deferred — \
+                         use search_tools then use_tool / select:<mcp__{name}__…> for schemas."
+                    ));
                     serial_println!("mcp> connected '{}' \u{2014} registered {} tool(s):", name, count);
                     for (t, desc) in crate::mcp::server_tools(name) {
                         serial_println!("  mcp__{}__{}  \u{2014} {}", name, t, desc);
@@ -5224,7 +5755,7 @@ fn erase_chars(n: usize) {
 }
 
 /// Echo a string to both consoles byte-by-byte.
-/// Echo `s` for the line editor. When the Grok-style composer owns the FB
+/// Echo `s` for the line editor. When the bordered composer owns the FB
 /// prompt, only the UART is written (the chat grid is not the input surface —
 /// `composer_sync` paints the box). Otherwise mirror to serial + chat grid via
 /// `console::put_byte` (classic terminal path).
@@ -5794,7 +6325,7 @@ fn editor_nav(fin: u8, param: u64) {
     let _ = (fin, param);
 }
 
-/// Whether the Grok-style framebuffer composer is the live prompt (so the FB
+/// Whether the bordered framebuffer composer is the live prompt (so the FB
 /// grid is not used for keystroke echo). Serial still gets a full readline
 /// echo either way — see [`emit`].
 #[cfg(not(test))]
@@ -5919,17 +6450,14 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                 sug_items.clear();
                 cursor_shift(buf.len() - cur, true);
                 if composer_mode() {
-                    // Chars already echoed on the UART while typing; finish the
-                    // serial line, then land a dim copy into chat scrollback
-                    // (FB grid was skipped during composer typing).
+                    // UART newline only. Do **not** mirror the typed line into
+                    // chat scrollback here — the main loop's `print_user_turn`
+                    // (user prompt: `> text`) is the single history
+                    // copy. A prior dim echo caused double-print ("hi" then "> hi").
                     crate::serial::put_byte(b'\n');
-                    #[cfg(not(test))]
-                    if !buf.is_empty() {
-                        let dim = alloc::format!("\x1b[2m{}\x1b[0m\n", buf.as_str());
-                        crate::framebuffer::console_print(&dim);
-                    }
                 } else {
                     // Classic dual-console: newline mirrors to serial + FB grid.
+                    // Line body already echoed char-by-char; only finish the row.
                     serial_println!("");
                 }
                 let line = buf.trim();
@@ -6680,7 +7208,7 @@ fn update_status() {
     }
 }
 
-/// Right half of the Grok-style composer hint bar: backend + approval mode.
+/// Right half of the bordered composer hint bar: backend + approval mode.
 #[cfg(not(test))]
 fn update_composer_hint(remote_on: bool, remote_cfg: Option<&remote::RemoteConfig>) {
     let mode = match approval_mode() {
@@ -11698,14 +12226,12 @@ mod agent_flow_tests {
         assert!(args.contains("colour"), "got {args}");
     }
 
-    /// A model that emits several tool calls in one turn (some finetunes
-    /// concatenate them, sometimes without closing the first `<tool_call>`)
-    /// must yield only the FIRST call, with only its own arguments — never
-    /// `name` from block 1 merged with `arguments` from block 2.
+    /// Multi-tool parse: each block keeps its own name/args (no cross-bleed),
+    /// and `parse_tool_calls` returns every block in order.
     #[test_case]
-    fn parse_tool_call_first_call_only_no_arg_bleed() {
-        // Two concatenated calls; the first has no arguments. Must be
-        // ("read", "{}") — NOT ("read", {"name":"pdf"}) from the skill call.
+    fn parse_tool_calls_multi_no_arg_bleed() {
+        // Two concatenated calls; first has no arguments — first call alone
+        // must not pick up skill args from the second block.
         let (name, args) = parse_tool_call(
             "<tool_call>\n{\"name\": \"read\"}<tool_call>{\"name\": \"skill\", \"arguments\": {\"name\":\"pdf\"}}</tool_call>",
         )
@@ -11714,13 +12240,14 @@ mod agent_flow_tests {
         assert_eq!(args, "{}", "second call's args must not leak in: got {args}");
         assert!(!args.contains("pdf"), "leaked skill args: {args}");
 
-        // Both blocks well-formed and closed → still only the first call's args.
-        let (name, args) = parse_tool_call(
+        let all = parse_tool_calls(
             "<tool_call>{\"name\":\"memory_search\"}</tool_call><tool_call>{\"name\":\"grep\",\"arguments\":{\"args\":\"pdf\"}}</tool_call>",
-        )
-        .unwrap();
-        assert_eq!(name, "memory_search");
-        assert_eq!(args, "{}", "got {args}");
+        );
+        assert_eq!(all.len(), 2, "both tool calls: {all:?}");
+        assert_eq!(all[0].0, "memory_search");
+        assert_eq!(all[0].1, "{}");
+        assert_eq!(all[1].0, "grep");
+        assert!(all[1].1.contains("pdf"), "got {}", all[1].1);
 
         // A single well-formed call still parses its own args (no regression).
         let (name, args) = parse_tool_call(
@@ -11729,6 +12256,30 @@ mod agent_flow_tests {
         .unwrap();
         assert_eq!(name, "read");
         assert!(args.contains("/agent/doc.pdf"), "got {args}");
+    }
+
+    #[test_case]
+    fn plan_mode_write_gate_allows_plan_file_only() {
+        let sid = 42u64;
+        let plan = crate::agent::prompt::plan_file_path(sid);
+        assert!(plan_mode_write_gate("read", "{}", sid).is_none());
+        assert!(plan_mode_write_gate(
+            "write",
+            &alloc::format!("{{\"path\":\"{plan}\",\"content\":\"# Plan\"}}"),
+            sid
+        )
+        .is_none());
+        let err = plan_mode_write_gate("write", "{\"path\":\"/etc/passwd\",\"content\":\"x\"}", sid);
+        assert!(err.is_some() && err.unwrap().contains("plan mode"));
+        let err = plan_mode_write_gate("delete", "{\"path\":\"/x\"}", sid);
+        assert!(err.is_some());
+    }
+
+    #[test_case]
+    fn operating_prompt_allows_markdown() {
+        let p = crate::agent::prompt::operating_rules_block();
+        assert!(p.contains("markdown"));
+        assert!(!p.contains("never markdown"));
     }
 
     /// The styled chat header maps tools to a friendly verb + primary argument;

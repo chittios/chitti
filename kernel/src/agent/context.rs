@@ -44,15 +44,20 @@ pub fn maybe_compact(session: &mut Session, now: Ticks) -> bool {
     let upper = n - KEEP_RECENT; // exclusive; keep [upper, n) resident
     let mut first: Option<MsgId> = None;
     let mut last: Option<MsgId> = None;
-    let mut parts: Vec<String> = Vec::new();
+    let mut role_parts: Vec<(String, String)> = Vec::new();
     for i in 1..upper {
         if !session.messages[i].resident {
             continue;
         }
-        let (mid, snippet) = {
+        let (mid, role_s, content) = {
             let m = &session.messages[i];
-            let snip: String = m.content.chars().take(24).collect();
-            (m.id, snip)
+            let role_s = match m.role {
+                Role::System => "system",
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::Tool => "tool",
+            };
+            (m.id, role_s, m.content.clone())
         };
         // Persist the full text to the store, keyed by session + message id.
         let key = StoreKey(format!("/sessions/{}/cmp/{}", session.id.0, mid.0));
@@ -63,14 +68,20 @@ pub fn maybe_compact(session: &mut Session, now: Ticks) -> bool {
             first = Some(mid);
         }
         last = Some(mid);
-        if !snippet.is_empty() {
-            parts.push(snippet);
+        if !content.is_empty() {
+            role_parts.push((role_s.into(), content));
         }
     }
     let (Some(first), Some(last)) = (first, last) else {
         return false; // nothing was compacted
     };
-    let summary = format!("[compacted {}..{}: {}]", first.0, last.0, parts.join(" | "));
+    // Structured condensation (bordered sections, no model required).
+    let refs: Vec<(&str, &str)> = role_parts
+        .iter()
+        .map(|(r, c)| (r.as_str(), c.as_str()))
+        .collect();
+    let body = crate::agent::prompt::deterministic_compact_summary(&refs);
+    let summary = format!("[compacted {}..{}]\n{}", first.0, last.0, body);
     let summary_ref = StoreKey(format!("/sessions/{}/cmpsum/{}", session.id.0, session.context.compactions.len()));
     crate::synapse::fs::write(&summary_ref.0, summary.as_bytes());
     let tokens = est_tokens(&summary);

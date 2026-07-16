@@ -89,36 +89,71 @@ pub fn memory_md_append(id: u64, line: &str) -> Result<(), &'static str> {
 }
 
 /// Search keys + values in durable KV memory for `query` (case-insensitive
-/// substring). Returns `key: snippet` lines.
+/// multi-term ranked match). Returns `key: snippet` lines, best first (max 16).
 pub fn memory_search(id: u64, query: &str) -> Vec<String> {
     let q = query.trim().to_ascii_lowercase();
     if q.is_empty() {
         return Vec::new();
     }
-    let mut hits = Vec::new();
+    let terms: Vec<&str> = q
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.')
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut ranked: Vec<(u32, String)> = Vec::new();
     for key in memory_list(id) {
         let val = memory_get(id, &key).unwrap_or_default();
         let hay_k = key.to_ascii_lowercase();
         let hay_v = val.to_ascii_lowercase();
+        let mut score = 0u32;
         if hay_k.contains(&q) || hay_v.contains(&q) {
-            let snip = if val.len() > 120 {
-                alloc::format!("{}…", &val[..120])
-            } else {
-                val
-            };
-            hits.push(format!("{key}: {snip}"));
+            score = score.saturating_add(50);
         }
+        for t in &terms {
+            if hay_k == *t {
+                score = score.saturating_add(80);
+            } else if hay_k.contains(t) {
+                score = score.saturating_add(30);
+            }
+            if hay_v.contains(t) {
+                score = score.saturating_add(10);
+            }
+        }
+        if score == 0 {
+            continue;
+        }
+        let snip = if val.len() > 120 {
+            // char-safe cut
+            let mut end = 120.min(val.len());
+            while end > 0 && !val.is_char_boundary(end) {
+                end -= 1;
+            }
+            alloc::format!("{}…", &val[..end])
+        } else {
+            val
+        };
+        ranked.push((score, format!("{key}: {snip}")));
     }
     // Also scan MEMORY.md lines.
     if let Some(md) = fs::read(&format!("{}/MEMORY.md", path(id))) {
         let text = String::from_utf8_lossy(&md);
         for (i, line) in text.lines().enumerate() {
-            if line.to_ascii_lowercase().contains(&q) {
-                hits.push(format!("MEMORY.md:{}: {line}", i + 1));
+            let hay = line.to_ascii_lowercase();
+            let mut score = 0u32;
+            if hay.contains(&q) {
+                score = score.saturating_add(40);
+            }
+            for t in &terms {
+                if hay.contains(t) {
+                    score = score.saturating_add(8);
+                }
+            }
+            if score > 0 {
+                ranked.push((score, format!("MEMORY.md:{}: {line}", i + 1)));
             }
         }
     }
-    hits
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    ranked.into_iter().take(16).map(|(_, s)| s).collect()
 }
 
 // --- durable agent memory (tool-call surface) -----------------------------

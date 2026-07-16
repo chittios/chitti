@@ -33,23 +33,28 @@ pub static NOTO_FALLBACKS: &[(&str, &[u8])] = &[
     ("Noto Sans Telugu", include_bytes!("../../assets/fonts/Noto-Telugu.ttf")),
     ("Noto Sans Kannada", include_bytes!("../../assets/fonts/Noto-Kannada.ttf")),
     ("Noto Sans Malayalam", include_bytes!("../../assets/fonts/Noto-Malayalam.ttf")),
+    // Monochrome emoji **before** CJK so symbol lookups hit a dedicated face
+    // first (CJK has no emoji cmap, but scanning a large CFF face is expensive).
+    // fontdue has no colour-table support — glyphs render single-colour.
+    // (Not "Nord" — the theme named nord is unrelated; emoji is Noto Emoji.)
+    ("Noto Emoji", include_bytes!("../../assets/fonts/Noto-Emoji.ttf")),
     // CJK — a **subset** (Latin + kana + CJK punctuation + ~3.5k common Han),
     // ~1.7 MB / ~8k glyphs. The full 65k-glyph face (~16 MB) parses for minutes
     // under the kernel's first-fit allocator (fontdue alloc churn is ~O(glyphs²)),
     // so it can't be bundled; this subset parses in ~1-2 s. Covers Chinese +
     // Japanese; Hangul (Korean) is omitted to keep the glyph count parse-able.
     ("Noto Sans CJK", include_bytes!("../../assets/fonts/Noto-CJK.otf")),
-    // Monochrome emoji last: Latin/Indic are matched by earlier faces first, so
-    // this is only reached for emoji/symbol codepoints. (fontdue has no colour
-    // table support, so these render as single-colour glyphs.)
-    ("Noto Emoji", include_bytes!("../../assets/fonts/Noto-Emoji.ttf")),
 ];
 
 /// Register every bundled Noto fallback face (idempotent). Call once at boot,
 /// before the browser/UI render any non-Latin text.
 pub fn register_bundled_fallbacks() {
     for (name, bytes) in NOTO_FALLBACKS {
-        let _ = register_fallback(name, bytes);
+        if let Err(e) = register_fallback(name, bytes) {
+            crate::ktrace::log_fmt(format_args!("font: fallback '{name}' failed: {e}"));
+        } else {
+            crate::ktrace::log_fmt(format_args!("font: fallback '{name}' ok ({} KiB)", bytes.len() / 1024));
+        }
     }
 }
 
@@ -132,17 +137,27 @@ pub fn ui_font_name() -> Option<String> {
 /// ascent/descent box vertically, place on the baseline, and clip to the cell.
 /// Returns `(x, y, alpha)` for each ink pixel.
 fn build_ui_glyph(font: &Font, ch: char, cw: usize, ch_px: usize) -> Vec<(u16, u16, u8)> {
-    // Monospace advance per px (all glyphs share it) → the px at which one glyph
-    // advance exactly fills the cell width.
+    // Size by the glyph's own advance when non-ASCII (emoji / CJK). Sizing emoji
+    // from the Latin '0' advance of Noto Emoji can over/under-scale and clip
+    // all ink out of the cell — looks like empty boxes.
+    let sample = if (ch as u32) > 0x7F { ch } else { '0' };
     let adv_per_px = {
-        let m = font.metrics('0', 64.0);
+        let m = font.metrics(sample, 64.0);
         if m.advance_width > 0.5 {
             m.advance_width / 64.0
         } else {
-            0.6
+            let m0 = font.metrics('M', 64.0);
+            if m0.advance_width > 0.5 {
+                m0.advance_width / 64.0
+            } else {
+                0.6
+            }
         }
     };
-    let px = (cw as f32 / adv_per_px).max(1.0);
+    // Fit both width and height so wide emoji stay inside the cell.
+    let px_w = (cw as f32 / adv_per_px).max(1.0);
+    let px_h = (ch_px as f32) * 0.92;
+    let px = if px_w < px_h { px_w } else { px_h }.max(1.0);
     let (m, cov) = font.rasterize(ch, px);
     let (asc, desc) = font
         .horizontal_line_metrics(px)
@@ -201,10 +216,18 @@ pub fn blit_ui_cell<F: FnMut(usize, usize, u8)>(
             if !cache.contains_key(&key) {
                 let glyph = if use_fallback {
                     FALLBACKS.with(|chain| {
-                        match chain.iter().find(|(_, f)| f.lookup_glyph_index(ch) != 0) {
-                            Some((_, f)) => build_ui_glyph(f, ch, cw, ch_px),
-                            None => build_ui_glyph(uifont, ch, cw, ch_px),
+                        // Prefer the first face that both covers the codepoint
+                        // and produces ink at cell size (skip empty .notdef).
+                        for (_, f) in chain.iter() {
+                            if f.lookup_glyph_index(ch) == 0 {
+                                continue;
+                            }
+                            let g = build_ui_glyph(f, ch, cw, ch_px);
+                            if !g.is_empty() {
+                                return g;
+                            }
                         }
+                        build_ui_glyph(uifont, ch, cw, ch_px)
                     })
                 } else {
                     build_ui_glyph(uifont, ch, cw, ch_px)
@@ -724,6 +747,29 @@ mod tests {
         let mut buf = alloc::vec![0u32; 96 * 32];
         let end = blit_run_family(&mut buf, 96, 32, 2, 2, text, 16.0, 0x00ff_ffff, "gfam");
         assert!(end > 2, "end_x={end}");
+    }
+
+    #[test_case]
+    fn noto_emoji_fallback_has_ink_in_ui_cell() {
+        register_bundled_fallbacks();
+        assert!(fallback_loaded("Noto Emoji"), "Noto Emoji must register");
+        // Typical chat-cell size (scaled 1× Geist metrics).
+        let mut ink = 0u32;
+        let ok = blit_ui_cell('😊', 10, 22, |_x, _y, a| {
+            if a > 10 {
+                ink += 1;
+            }
+        });
+        assert!(ok, "blit_ui_cell must succeed");
+        assert!(ink > 20, "emoji must produce ink, got {ink} pixels");
+        // Variation-selector base heart (❤) without VS16.
+        ink = 0;
+        let _ = blit_ui_cell('\u{2764}', 10, 22, |_x, _y, a| {
+            if a > 10 {
+                ink += 1;
+            }
+        });
+        assert!(ink > 10, "heart must produce ink, got {ink}");
     }
 
     #[test_case]

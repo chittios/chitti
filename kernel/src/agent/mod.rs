@@ -22,6 +22,7 @@ pub mod context;
 pub mod home;
 pub mod manifest;
 pub mod orchestrator;
+pub mod prompt;
 pub mod rule_steps;
 pub mod storage;
 pub mod subagent;

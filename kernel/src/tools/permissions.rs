@@ -148,6 +148,7 @@ pub fn is_readonly_tool(name: &str) -> bool {
     if matches!(
         name,
         "search_tools"
+            | "use_tool"
             | "list"
             | "read"
             | "glob"

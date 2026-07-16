@@ -22,11 +22,11 @@ fn key_for(id: u64) -> String {
 }
 
 /// A stable per-message thread key in the RFC-4122 UUID shape
-/// (`xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`, version 4 / variant 1), the way
-/// Claude Code names records. The 16 bytes are a **deterministic** SHA-256 of
-/// `(session_id, msg_id)` rather than random, so the transcript is reproducible
-/// and a child's `parentUuid` always re-derives to its parent's `uuid` — no RNG
-/// or stored id→uuid map needed.
+/// (`xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`, version 4 / variant 1).
+/// The 16 bytes are a **deterministic** SHA-256 of `(session_id, msg_id)`
+/// rather than random, so the transcript is reproducible and a child's
+/// `parentUuid` always re-derives to its parent's `uuid` — no RNG or stored
+/// id→uuid map needed.
 fn uuid(session_id: u64, msg_id: u64) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();

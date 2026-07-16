@@ -64,7 +64,7 @@ pub struct Theme {
     pub editor_fg: Rgb,
     pub editor_lineno: Rgb,
     pub editor_sel: Rgb,
-    /// Grok-style input composer fill (slightly elevated over chat_bg).
+    /// bordered input composer fill (slightly elevated over chat_bg).
     pub composer_bg: Rgb,
     /// Composer border when idle / focused (focused uses `accent`).
     pub composer_border: Rgb,
@@ -181,7 +181,7 @@ const GAP: u64 = 10; // between the two panes
 const BORDER: u64 = 2; // pane border thickness
 const PAD: u64 = 10; // interior padding inside a pane
 const CHAT_PCT: u64 = 56; // chat pane width as a % of the content region
-/// Vertical padding inside the Grok-style input composer box (px, unscaled).
+/// Vertical padding inside the bordered input composer box (px, unscaled).
 const COMPOSER_VPAD: u64 = 6;
 /// Gap between the composer box and the hint row under it (px, unscaled).
 const COMPOSER_HINT_GAP: u64 = 4;
@@ -241,13 +241,16 @@ struct Pane {
     /// **absolute** coordinates over `hist` + grid (see `crate::textsel`), so
     /// it stays glued to its text while the pane scrolls. `None` = no selection.
     sel: Option<((usize, usize), (usize, usize))>,
-    /// When true, the pane reserves its bottom for a Grok-style input composer
+    /// When true, the pane reserves its bottom for a bordered input composer
     /// (bordered box + hint row); the scrollback grid sits above it.
     has_composer: bool,
     /// Expandable folds: `(gi, hidden)` where `gi` is the absolute line index
     /// (same coords as `sel`) of a clickable "▸ N more…" line and `hidden` is
     /// the collapsed text revealed on click. Evicted with the scrollback.
     folds: Vec<(usize, String)>,
+    /// Absolute line indices (`hist`+grid, same as `sel`) painted with the
+    /// elevated user-prompt band background (`theme.composer_bg`).
+    user_band: Vec<usize>,
     /// Incremental UTF-8 decode buffer: the incoming byte stream is decoded one
     /// `char` at a time (a multi-byte glyph spans several `pane_putc` calls).
     utf8: [u8; 4],
@@ -276,7 +279,7 @@ impl Pane {
         let ix = x + BORDER + PAD;
         let iy = y + header_h;
         let iw = w.saturating_sub(2 * (BORDER + PAD)).max(cw);
-        // Grok-style composer: box (vpad + 1 line + vpad + 2px border) + gap + hint line.
+        // bordered composer: box (vpad + 1 line + vpad + 2px border) + gap + hint line.
         // Reserve it so scrollback never paints under the input chrome.
         let has_composer = show_caret;
         let composer_block = if has_composer {
@@ -315,9 +318,15 @@ impl Pane {
             sel: None,
             has_composer,
             folds: Vec::new(),
+            user_band: Vec::new(),
             utf8: [0; 4],
             utf8_len: 0,
         }
+    }
+
+    /// Elevated bg for a user-prompt band line, else `None` (use pane bg).
+    fn band_bg(&self, gi: usize) -> bool {
+        self.user_band.binary_search(&gi).is_ok()
     }
 
     /// Write `byte` into the grid cell under the cursor (0 erases).
@@ -542,6 +551,8 @@ impl Pane {
         self.hist.clear();
         self.view = 0;
         self.sel = None;
+        self.folds.clear();
+        self.user_band.clear();
         self.col = 0;
         self.row = 0;
         self.fg = self.default_fg;
@@ -673,7 +684,7 @@ pub struct Screen {
     /// Blinking-caret state for the chat pane / composer.
     caret_on: bool,
     caret_last_ms: u64,
-    /// Grok-style input composer (bottom of chat pane): when `composer_active`
+    /// bordered input composer (bottom of chat pane): when `composer_active`
     /// the caret lives in the bordered box, not the scrollback grid.
     composer_active: bool,
     composer_line: String,
@@ -1580,8 +1591,15 @@ impl Screen {
                 self.put_pixel(px + gx, py + gy, cbg);
             }
         }
-        // Empty / space: the filled background is the whole cell.
-        if ch == '\0' || ch == ' ' {
+        // Empty / space / zero-width formatters: fill bg only (VS16, ZWJ, etc.
+        // must not paint tofu boxes between emoji).
+        if ch == '\0'
+            || ch == ' '
+            || ch == '\u{FE0F}'
+            || ch == '\u{FE0E}'
+            || ch == '\u{200D}'
+            || ch == '\u{200C}'
+        {
             return;
         }
         let mix = |b: u8, f: u8, a: u32| (((b as u32) * (255 - a) + (f as u32) * a) / 255) as u8;
@@ -1666,6 +1684,15 @@ impl Screen {
                         true
                     }
                 });
+                // User-band line indices track absolute gi the same way.
+                p.user_band.retain_mut(|gi| {
+                    if *gi == 0 {
+                        false
+                    } else {
+                        *gi -= 1;
+                        true
+                    }
+                });
             }
             p.grid.copy_within(cols.., 0);
             let start = p.grid.len() - cols;
@@ -1737,7 +1764,13 @@ impl Screen {
                 let x = p.ix + c as u64 * p.cw;
                 let y = p.iy + r as u64 * p.ch;
                 let selected = sel.is_some_and(|s| crate::textsel::contains(s, gi, c));
-                let bg = if selected { self.theme.editor_sel } else { p.bg };
+                let bg = if selected {
+                    self.theme.editor_sel
+                } else if p.band_bg(gi) {
+                    self.theme.composer_bg
+                } else {
+                    p.bg
+                };
                 // Always fill the cell first so deselected / empty cells leave
                 // no residue (selection highlight, partial glyphs).
                 self.fill_cell_bg(x, y, p.cw, p.ch, bg);
@@ -1779,7 +1812,13 @@ impl Screen {
         };
         let x = p.ix + c as u64 * p.cw;
         let y = p.iy + r as u64 * p.ch;
-        let bg = if selected { self.theme.editor_sel } else { p.bg };
+        let bg = if selected {
+            self.theme.editor_sel
+        } else if p.band_bg(gi) {
+            self.theme.composer_bg
+        } else {
+            p.bg
+        };
         self.fill_cell_bg(x, y, p.cw, p.ch, bg);
         if b != '\0' && b != ' ' {
             self.blit_glyph(x, y, b, fg, bg);
@@ -1849,7 +1888,7 @@ impl Screen {
     }
 
     fn caret_draw(&self, p: &Pane) {
-        // Chat pane with a Grok-style composer: caret lives only in the input
+        // Chat pane with a bordered composer: caret lives only in the input
         // box — never in the scrollback/response area.
         if !p.show_caret || p.has_composer {
             return;
@@ -2057,7 +2096,7 @@ impl Screen {
         self.draw_str(x, y, &t, fg, bg)
     }
 
-    /// Geometry of the Grok-style input composer inside the chat pane:
+    /// Geometry of the bordered input composer inside the chat pane:
     /// `(box_x, box_y, box_w, box_h, text_x, text_y, hint_y)`.
     fn composer_geom(&self) -> (u64, u64, u64, u64, u64, u64, u64) {
         let p = &self.chat;
@@ -2075,7 +2114,7 @@ impl Screen {
         (box_x, box_y, box_w, box_h, text_x, text_y, hint_y)
     }
 
-    /// Draw a soft-rounded rectangle outline (Grok-style input chrome).
+    /// Draw a soft-rounded rectangle outline (bordered input chrome).
     fn rounded_outline(&self, x: u64, y: u64, w: u64, h: u64, r: u64, c: Rgb) {
         if w < 2 * r || h < 2 * r {
             self.rect_outline(x, y, w, h, 1, c);
@@ -2141,7 +2180,7 @@ impl Screen {
         self.fill_rect(cx, ty, 2 * self.scale.max(1), self.chat.ch, color);
     }
 
-    /// Paint the Grok-style composer box + hint bar at the bottom of the chat pane.
+    /// Paint the bordered composer box + hint bar at the bottom of the chat pane.
     ///
     /// Paints **in place** (no strip-wide clear). The chat grid is already sized
     /// above this region, so scrollback never lands here; blanking the whole
@@ -2303,7 +2342,13 @@ impl Screen {
                 let x = p.ix + c as u64 * p.cw;
                 let y = p.iy + r as u64 * p.ch;
                 let selected = sel.is_some_and(|s| crate::textsel::contains(s, gi, c));
-                let bg = if selected { self.theme.editor_sel } else { p.bg };
+                let bg = if selected {
+                    self.theme.editor_sel
+                } else if p.band_bg(gi) {
+                    self.theme.composer_bg
+                } else {
+                    p.bg
+                };
                 self.fill_cell_bg(x, y, p.cw, p.ch, bg);
                 if b != '\0' && b != ' ' {
                     self.blit_glyph(x, y, b, fg, bg);
@@ -2449,7 +2494,7 @@ impl Screen {
     }
 
     /// Paint the caret in its current blink state. When the chat pane has a
-    /// Grok-style composer, the caret only blinks inside the box while the
+    /// bordered composer, the caret only blinks inside the box while the
     /// prompt is active — never during streamed reply output (that was a full
     /// box redraw and looked like the whole composer flickering).
     fn paint_caret(&self) {
@@ -3957,7 +4002,7 @@ pub fn console_print(s: &str) {
 }
 
 /// Render one byte into the chat pane (the shell's keystroke echo / backspace).
-/// When the Grok-style composer is active, keystroke echo is handled by
+/// When the bordered composer is active, keystroke echo is handled by
 /// [`composer_set`] — this path is for legacy serial-style editing only.
 pub fn console_put_byte(byte: u8) {
     SCREEN.with(|slot| {
@@ -3976,7 +4021,7 @@ pub fn console_put_byte(byte: u8) {
     });
 }
 
-/// Whether the chat pane has a Grok-style input composer (always true once the
+/// Whether the chat pane has a bordered input composer (always true once the
 /// framebuffer console is up with a chat pane).
 pub fn composer_available() -> bool {
     SCREEN.with(|slot| slot.as_ref().is_some_and(|sc| sc.chat.has_composer))
@@ -4021,6 +4066,87 @@ pub fn composer_set(line: &str, cursor: usize) {
             sc.caret_on = true;
             sc.draw_composer();
             sc.cursor_overlay();
+        }
+    });
+}
+
+/// Set the left half of the composer hint bar (live status:
+/// "Waiting for response… |").
+///
+/// Always repaints the composer strip when the chat has a composer — including
+/// while a turn is running (`composer_active == false` after submit). The old
+/// gate only drew during typing, so wait animation never appeared.
+pub fn composer_set_hint_left(s: &str) {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.composer_hint_l.clear();
+            sc.composer_hint_l.push_str(s);
+            if sc.chat.has_composer {
+                sc.cursor_restore();
+                sc.cur_vis = false;
+                sc.draw_composer();
+                sc.cursor_overlay();
+            }
+        }
+    });
+}
+
+/// Mark the last `n` absolute chat lines as a user-prompt band (elevated
+/// `composer_bg`), pad them full-width, and repaint so the band is visible
+/// immediately (including empty cells to the right of the text).
+pub fn chat_mark_user_band_rows(n: usize) {
+    if n == 0 {
+        return;
+    }
+    SCREEN.with(|slot| {
+        let Some(sc) = slot.as_mut() else { return };
+        let p = &mut sc.chat;
+        let cols = p.cols as usize;
+        if cols == 0 {
+            return;
+        }
+        // Cursor sits on the line *after* the last printed content when the
+        // user turn ended with `\n`. The band covers the previous `n` lines.
+        let end = p.hist.len() + p.row as usize; // exclusive end (current empty row)
+        let start = end.saturating_sub(n);
+        for gi in start..end {
+            if let Err(i) = p.user_band.binary_search(&gi) {
+                p.user_band.insert(i, gi);
+            }
+            // Cap bookkeeping so a long session cannot grow unbounded.
+            if p.user_band.len() > 256 {
+                p.user_band.drain(0..p.user_band.len() - 256);
+            }
+            // Pad short rows so the elevated fill spans the full pane width.
+            if gi < p.hist.len() {
+                let line = &mut p.hist[gi];
+                if line.len() < cols {
+                    let fg = p.default_fg;
+                    line.resize(cols, ('\0', fg));
+                }
+            } else {
+                let gr = gi - p.hist.len();
+                if gr < p.rows as usize {
+                    // Live grid rows are already full-width.
+                }
+            }
+        }
+        // Repaint band rows that are on screen (drop mut borrow first).
+        let view = p.view;
+        let hist_len = p.hist.len();
+        let rows = p.rows as usize;
+        let paint: alloc::vec::Vec<usize> = if view == 0 {
+            let first = hist_len - view.min(hist_len);
+            (start..end)
+                .filter(|&gi| gi >= first && gi < first + rows)
+                .collect()
+        } else {
+            alloc::vec::Vec::new()
+        };
+        for gi in paint {
+            for c in 0..cols {
+                sc.paint_chat_cell(&sc.chat, gi, c, false);
+            }
         }
     });
 }
@@ -4302,7 +4428,7 @@ fn dummy_pane() -> Pane {
         esc: EscState::Ground, csi: [0; 32], csi_len: 0, bold: false,
         title: String::new(), show_caret: false,
         grid: Vec::new(), hist: VecDeque::new(), view: 0, sel: None, has_composer: false,
-        folds: Vec::new(), utf8: [0; 4], utf8_len: 0,
+        folds: Vec::new(), user_band: Vec::new(), utf8: [0; 4], utf8_len: 0,
     }
 }
 
@@ -5009,7 +5135,7 @@ pub fn scroll_live(action: bool) {
 /// Returns true if the action pane now holds focus. No-op (false) when the
 /// action pane is closed or owned by the editor.
 ///
-/// When focus returns to the chat pane, the Grok-style composer is repainted
+/// When focus returns to the chat pane, the bordered composer is repainted
 /// immediately (accent border + caret) so the shell is ready for input without
 /// waiting for a keystroke to re-sync.
 pub fn focus_toggle() -> bool {

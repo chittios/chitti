@@ -292,8 +292,13 @@ fn default_skill_invoke(session: &mut Session, call: &ToolCall) -> ToolOutcome {
         crate::agent::orchestrator::now(),
     ) {
         Ok(text) => {
-            let sid = crate::skills::index::by_name(&name).map(|m| m.id).unwrap_or(crate::agent::types::SkillId(0));
-            ToolOutcome::ok(text, Provenance::SkillInstalled(sid))
+            let sid = crate::skills::index::by_name(&name)
+                .map(|m| m.id)
+                .unwrap_or(crate::agent::types::SkillId(0));
+            // bordered `<skill name path>` envelope for model grounding.
+            let path = alloc::format!("/skills/{}/SKILL.md", name);
+            let wrapped = crate::agent::prompt::skill_result_envelope(&name, &path, &text);
+            ToolOutcome::ok(wrapped, Provenance::SkillInstalled(sid))
         }
         Err(e) => ToolOutcome::error(e),
     }

@@ -17,4 +17,4 @@ pub mod jsonl;
 pub mod store;
 pub mod todo;
 
-pub use store::{fork, resume, save};
+pub use store::{fork, list_summaries, resume, save, save_fork, search_sessions};

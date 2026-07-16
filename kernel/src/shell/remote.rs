@@ -229,77 +229,93 @@ impl RemoteChat {
         self.messages.push(("user".to_string(), msg.to_string()));
         session.push_message(Role::User, msg.to_string(), Provenance::UserTyped, now());
         session.budget.turns_used = session.budget.turns_used.saturating_add(1);
-        let mut last_call: Option<(String, String)> = None;
+        let turn_t0 = crate::arch::now_ms();
+        // Remote has no separate think clock — wall time → Worked for only.
+        // (Thought for is local, when a think block is parsed + timed.)
+        let mut last_batch: Option<alloc::vec::Vec<(String, String)>> = None;
         let mut call_id = 1u64;
         for _ in 0..MAX_TOOL_ITERS {
-            // The remote round-trip blocks in `net::http`; show a thinking spinner
-            // (driven by `upkeep`, which the HTTP poll loop calls) while we wait.
+            // Composer-bar "Thinking  Ns  |" only — never into chat scrollback.
             crate::shell::begin_thinking("thinking");
-            let t0 = crate::arch::now_ms();
             let result = chat_completion(&self.cfg, &self.messages);
-            let secs = crate::arch::now_ms().saturating_sub(t0) as f32 / 1000.0;
             crate::shell::end_thinking();
             let reply = match result {
                 Ok(r) => r,
                 Err(e) if e == "cancelled" => {
                     crate::serial_println!("\x1b[33m[stopped]\x1b[0m");
+                    let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
+                    super::print_turn_footer(0.0, worked);
                     let _ = crate::session::save(session);
                     return String::new();
                 }
                 Err(e) => {
                     crate::serial_println!("\x1b[31mremote model error:\x1b[0m {} (see /model)", e);
+                    let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
+                    super::print_turn_footer(0.0, worked);
                     let _ = crate::session::save(session);
                     return String::new();
                 }
             };
             self.messages.push(("assistant".to_string(), reply.clone()));
-            super::print_thought_for(secs);
-            match super::parse_tool_call(&reply) {
-                Some(pair) if last_call.as_ref() == Some(&pair) => {
-                    crate::serial_println!("\x1b[33m[tool loop stopped: repeated call]\x1b[0m");
-                    let _ = crate::session::save(session);
-                    return String::new();
-                }
-                Some((cmd, args)) => {
-                    last_call = Some((cmd.clone(), args.clone()));
-                    super::print_tool_header(&cmd, &args);
-                    session.push_assistant_tool_calls(
-                        String::new(),
-                        alloc::vec![ToolCall { call_id, tool: cmd.clone(), args: args.clone() }],
-                        now(),
-                    );
-                    session.budget.tool_calls_used = session.budget.tool_calls_used.saturating_add(1);
-                    let obs = if cmd == "spawn_subagent" || cmd == "subagent" {
-                        // Sub-agents stay on the local model; without one, say so.
-                        "spawn_subagent is unavailable on the remote backend; do the task yourself with tools".to_string()
-                    } else {
-                        super::execute_chat_tool(&cmd, &args, session)
-                    };
-                    let prov = if obs.starts_with("error:") || obs.starts_with("Denied:") {
-                        Provenance::SystemTrusted
-                    } else {
-                        Provenance::UntrustedIngested
-                    };
-                    session.push_tool_result(call_id, obs.clone(), prov, now());
-                    if !super::tool_self_prints(&cmd) {
-                        super::print_tool_output(&obs);
-                    }
-                    call_id += 1;
-                    self.messages.push(("user".to_string(), format!("<tool_response>\n{}\n</tool_response>", obs)));
-                }
-                None => {
-                    // Final prose answer: strip any <think> block, print with a
-                    // theme-coloured speaker label.
-                    let visible = super::strip_think(&reply);
-                    let lbl = super::answer_label(&format!("Chitti[{}]:", self.cfg.model));
-                    crate::serial_println!("{}{}", lbl, visible.trim());
-                    session.push_message(Role::Assistant, reply.clone(), Provenance::SystemTrusted, now());
-                    let _ = crate::session::save(session);
-                    return reply;
-                }
+            let batch = super::parse_tool_calls(&reply);
+            if batch.is_empty() {
+                super::print_assistant_markdown("", &reply);
+                session.push_message(Role::Assistant, reply.clone(), Provenance::SystemTrusted, now());
+                let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
+                super::print_turn_footer(0.0, worked);
+                let _ = crate::session::save(session);
+                return reply;
             }
+            if last_batch.as_ref() == Some(&batch) {
+                crate::serial_println!("\x1b[33m[tool loop stopped: repeated call]\x1b[0m");
+                let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
+                super::print_turn_footer(0.0, worked);
+                let _ = crate::session::save(session);
+                return String::new();
+            }
+            last_batch = Some(batch.clone());
+            let mut tcs = alloc::vec::Vec::new();
+            let mut ids = alloc::vec::Vec::new();
+            for (cmd, args) in &batch {
+                tcs.push(ToolCall {
+                    call_id,
+                    tool: cmd.clone(),
+                    args: args.clone(),
+                });
+                ids.push(call_id);
+                call_id += 1;
+            }
+            session.push_assistant_tool_calls(String::new(), tcs, now());
+            let mut results: alloc::vec::Vec<(String, String)> = alloc::vec::Vec::new();
+            for (i, (cmd, args)) in batch.iter().enumerate() {
+                session.budget.tool_calls_used = session.budget.tool_calls_used.saturating_add(1);
+                let obs = if cmd == "spawn_subagent" || cmd == "subagent" {
+                    "spawn_subagent is unavailable on the remote backend; do the task yourself with tools"
+                        .to_string()
+                } else {
+                    super::print_tool_header(cmd, args);
+                    let o = super::execute_chat_tool(cmd, args, session);
+                    if !super::tool_self_prints(cmd) {
+                        super::print_tool_output(&o);
+                    }
+                    o
+                };
+                let prov = if obs.starts_with("error:") || obs.starts_with("Denied:") {
+                    Provenance::SystemTrusted
+                } else {
+                    Provenance::UntrustedIngested
+                };
+                session.push_tool_result(ids[i], obs.clone(), prov, now());
+                results.push((cmd.clone(), obs));
+            }
+            self.messages.push((
+                "user".to_string(),
+                crate::agent::prompt::format_multi_tool_response(&results),
+            ));
         }
         crate::serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
+        let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
+        super::print_turn_footer(0.0, worked);
         let _ = crate::session::save(session);
         String::new()
     }
@@ -314,15 +330,23 @@ impl RemoteChat {
         let mut msgs = self.messages.clone();
         msgs.push((
             "user".to_string(),
-            "Summarize this conversation so far in under 120 words: key facts, decisions, and open tasks. Reply with only the summary.".to_string(),
+            crate::agent::prompt::compaction_user_prompt().to_string(),
         ));
         match chat_completion(&self.cfg, &msgs) {
             Ok(summary) => {
                 let before = self.messages.len();
                 self.messages.clear();
-                self.messages.push(("system".to_string(), super::agent_system_prompt()));
-                self.messages.push(("system".to_string(), format!("Conversation so far (compacted): {}", summary.trim())));
-                crate::serial_println!("(compacted: {} -> {} messages)", before, self.messages.len());
+                self.messages
+                    .push(("system".to_string(), super::agent_system_prompt()));
+                self.messages.push((
+                    "system".to_string(),
+                    format!("Conversation so far (compacted):\n{}", summary.trim()),
+                ));
+                crate::serial_println!(
+                    "(compacted: {} -> {} messages)",
+                    before,
+                    self.messages.len()
+                );
             }
             Err(e) => crate::serial_println!("compact> remote error: {}", e),
         }

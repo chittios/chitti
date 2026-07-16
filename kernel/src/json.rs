@@ -201,6 +201,17 @@ struct Parser<'a> {
 }
 
 impl Parser<'_> {
+    /// Read four hex digits as a u32 (JSON `\u` body).
+    fn hex4(&mut self) -> Option<u32> {
+        let mut cp: u32 = 0;
+        for _ in 0..4 {
+            let h = self.peek()?;
+            self.i += 1;
+            cp = cp * 16 + (h as char).to_digit(16)?;
+        }
+        Some(cp)
+    }
+
     fn ws(&mut self) {
         while self.i < self.b.len() && matches!(self.b[self.i], b' ' | b'\t' | b'\r' | b'\n') {
             self.i += 1;
@@ -299,39 +310,73 @@ impl Parser<'_> {
                         b'b' => s.push('\u{0008}'),
                         b'f' => s.push('\u{000C}'),
                         b'u' => {
-                            let mut cp: u32 = 0;
-                            for _ in 0..4 {
-                                let h = self.peek()?;
-                                self.i += 1;
-                                cp = cp * 16 + (h as char).to_digit(16)?;
+                            // JSON `\uXXXX` is UTF-16. Emoji and other non-BMP
+                            // scalars arrive as a high+low surrogate pair
+                            // (`\ud83d\ude0a` → 😊). Without pair assembly,
+                            // each half is not a valid scalar and became U+FFFD
+                            // (or garbage if callers mis-handled the stream).
+                            let hi = self.hex4()?;
+                            if (0xD800..=0xDBFF).contains(&hi) {
+                                // Expect `\u` low surrogate next.
+                                if self.peek() == Some(b'\\') {
+                                    self.i += 1;
+                                    if self.peek() == Some(b'u') {
+                                        self.i += 1;
+                                        let lo = self.hex4()?;
+                                        if (0xDC00..=0xDFFF).contains(&lo) {
+                                            let uni = 0x10000
+                                                + ((hi - 0xD800) << 10)
+                                                + (lo - 0xDC00);
+                                            s.push(
+                                                char::from_u32(uni).unwrap_or('\u{FFFD}'),
+                                            );
+                                        } else {
+                                            s.push('\u{FFFD}');
+                                        }
+                                    } else {
+                                        s.push('\u{FFFD}');
+                                    }
+                                } else {
+                                    s.push('\u{FFFD}');
+                                }
+                            } else if (0xDC00..=0xDFFF).contains(&hi) {
+                                s.push('\u{FFFD}'); // lone low surrogate
+                            } else {
+                                s.push(char::from_u32(hi).unwrap_or('\u{FFFD}'));
                             }
-                            s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
                         }
                         _ => return None,
                     }
                 }
-                // Multi-byte UTF-8: copy continuation bytes through as-is.
+                // Multi-byte UTF-8 (raw emoji / CJK inside the JSON string).
                 _ => {
-                    // Rebuild the char from the original bytes for correctness.
                     if c < 0x80 {
                         s.push(c as char);
                     } else {
-                        // Determine sequence length and copy.
                         let len = if c >= 0xF0 {
                             4
                         } else if c >= 0xE0 {
                             3
-                        } else {
+                        } else if c >= 0xC0 {
                             2
+                        } else {
+                            // Lone continuation byte — skip as replacement.
+                            s.push('\u{FFFD}');
+                            continue;
                         };
                         let start = self.i - 1;
-                        let end = (start + len).min(self.b.len());
-                        if let Ok(st) = core::str::from_utf8(&self.b[start..end]) {
-                            if let Some(ch) = st.chars().next() {
-                                s.push(ch);
-                                self.i = start + ch.len_utf8();
+                        let end = start + len;
+                        if end <= self.b.len() {
+                            if let Ok(st) = core::str::from_utf8(&self.b[start..end]) {
+                                if let Some(ch) = st.chars().next() {
+                                    s.push(ch);
+                                    self.i = start + ch.len_utf8();
+                                    continue;
+                                }
                             }
                         }
+                        // Truncated / invalid sequence: replace and resync.
+                        s.push('\u{FFFD}');
                     }
                 }
             }
@@ -366,5 +411,40 @@ impl Parser<'_> {
         }
         let s = core::str::from_utf8(&self.b[start..self.i]).ok()?;
         s.parse::<f64>().ok().map(Json::Num)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn raw_utf8_emoji_in_string() {
+        let j = Json::parse(r#"{"c":"hi 😊"}"#).expect("parse");
+        assert_eq!(j.get("c").and_then(|v| v.as_str()), Some("hi 😊"));
+    }
+
+    #[test_case]
+    fn escaped_surrogate_pair_emoji() {
+        // OpenAI-style ensure_ascii: 😊 = U+1F60A = \ud83d\ude0a
+        let j = Json::parse(r#"{"c":"hi \ud83d\ude0a"}"#).expect("parse");
+        let s = j.get("c").and_then(|v| v.as_str()).expect("str");
+        assert!(s.contains('😊'), "got {s:?}");
+        assert!(!s.contains('\u{FFFD}'), "must not be replacement char");
+    }
+
+    #[test_case]
+    fn content_field_like_chat_completion() {
+        let body = r#"{"choices":[{"message":{"content":"Here \ud83c\udf89"}}]}"#;
+        let j = Json::parse(body).expect("parse");
+        let s = j
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|s| s.as_str())
+            .expect("content");
+        assert!(s.contains('🎉'), "got {s:?}");
     }
 }
