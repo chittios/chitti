@@ -65,3 +65,22 @@ pub fn status(_: &str) -> String {
     let (t, b, _) = SLIDES[i.min(SLIDES.len() - 1)];
     format!("ok:slide {}/{} {t} — {b}", i + 1, SLIDES.len())
 }
+
+/// Click: left half of the surface goes back, right half advances.
+pub fn on_click(x: i32, _y: i32) -> String {
+    if x < 128 {
+        prev("")
+    } else {
+        next("")
+    }
+}
+
+/// Key: ←/→ navigate, space advances, `r` restarts from slide 1.
+pub fn on_key(key: &str) -> String {
+    match key {
+        "left" => prev(""),
+        "right" | "space" | "enter" => next(""),
+        "r" => start(""),
+        _ => String::from("ok"),
+    }
+}

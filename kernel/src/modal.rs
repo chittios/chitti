@@ -175,6 +175,77 @@ pub fn input(_title: &str, _prompt: &str, _masked: bool) -> String {
     String::new()
 }
 
+/// Multi-option question for agents (`ask_user_question`). Returns the chosen
+/// option index, or `None` if cancelled. Keyboard: arrows/Tab move, Enter
+/// selects, 1..9 jump, Esc cancels.
+#[cfg(not(test))]
+pub fn choose(title: &str, question: &str, options: &[&str]) -> Option<usize> {
+    use crate::framebuffer;
+    if options.is_empty() {
+        return None;
+    }
+    let mut focus = 0usize;
+    let n = options.len();
+    framebuffer::draw_choose(title, question, options, focus);
+    loop {
+        if let Some(b) = crate::console::read_byte() {
+            match b {
+                0x1b => match esc_seq() {
+                    Some(b'A') | Some(b'D') => {
+                        focus = focus.checked_sub(1).unwrap_or(n - 1);
+                        framebuffer::draw_choose(title, question, options, focus);
+                    }
+                    Some(b'B') | Some(b'C') => {
+                        focus = (focus + 1) % n;
+                        framebuffer::draw_choose(title, question, options, focus);
+                    }
+                    Some(_) => {}
+                    None => {
+                        framebuffer::modal_dismiss();
+                        return None;
+                    }
+                },
+                0x03 => {
+                    framebuffer::modal_dismiss();
+                    return None;
+                }
+                b'\t' => {
+                    focus = (focus + 1) % n;
+                    framebuffer::draw_choose(title, question, options, focus);
+                }
+                b'\r' | b'\n' => {
+                    framebuffer::modal_dismiss();
+                    return Some(focus);
+                }
+                b'1'..=b'9' => {
+                    let i = (b - b'1') as usize;
+                    if i < n {
+                        framebuffer::modal_dismiss();
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let t = crate::mouse::tick();
+        if t.moved {
+            framebuffer::cursor_move(t.x, t.y);
+        }
+        crate::shell::status_tick();
+        crate::sched::yield_now();
+    }
+}
+
+#[cfg(test)]
+pub fn choose(_title: &str, _question: &str, options: &[&str]) -> Option<usize> {
+    // Tests auto-pick the first option when present.
+    if options.is_empty() {
+        None
+    } else {
+        Some(0)
+    }
+}
+
 /// Open the searchable **Commands** browser (the `/help` modal). Returns the
 /// selected command **name** (without `/`) on Enter, or `None` if dismissed.
 /// Typing filters the list; ↑/↓ move the highlight (skipping category headers);

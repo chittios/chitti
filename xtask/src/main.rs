@@ -29,6 +29,15 @@ enum Model {
     /// already speaks the `Gemma4` family; this selects the large heap tier
     /// (same as 9B) and the assets path.
     Gemma4E4B,
+    /// PrismML Ternary-Bonsai-27B main weights (`Q2_0` ternary GGUF, ~7.17 GiB).
+    /// Bonsai is a Qwen3.6-27B hybrid whose GGUF declares `general.architecture
+    /// = qwen35` with full DeltaNet SSM keys, so cortex loads it via the existing
+    /// `QwenHybrid` family; the only bespoke piece is the `Q2_0` (GGML type 42)
+    /// ternary dequant (`cortex::tensor::dequant_q2_0_block`). The paired
+    /// `dspark` drafter is NOT a standalone model (it is conditioned on the
+    /// target's hidden-state taps), so the runnable Bonsai is this target.
+    /// Default model for `make run`; needs the large heap tier + a roomy VM.
+    Bonsai27B,
     /// Any GGUF by path (`-model path/to/file.gguf`): the kernel derives the
     /// architecture/config from the file itself, so xtask only needs the path
     /// and a derived guest-RAM size (leaked `'static` strs — xtask is a
@@ -45,6 +54,8 @@ impl Model {
             Model::Qwen4B => &["model-4b"],
             // ~4.6–5 GiB weights → 1 GiB heap (same tier as 9B).
             Model::Qwen9B | Model::Gemma4E4B => &["model-9b"],
+            // ~7.17 GiB Q2_0 ternary weights → 1 GiB heap (same tier as 9B).
+            Model::Bonsai27B => &["model-9b"],
             // The default tier (1 GiB heap) fits every model: guest RAM is
             // derived from the file size, and the heap sits at the top of it.
             Model::Custom { .. } => &[],
@@ -58,6 +69,7 @@ impl Model {
             Model::Qwen4B => "assets/model-4b.gguf",
             Model::Qwen9B => "assets/model-9b.gguf",
             Model::Gemma4E4B => "assets/model-gemma4-e4b.gguf",
+            Model::Bonsai27B => "assets/model-bonsai-27b.gguf",
             Model::Custom { path, .. } => path,
         }
     }
@@ -81,6 +93,8 @@ impl Model {
             Model::Qwen4B => "6G",
             // ~5 GiB Qwen 9B / ~4.6 GiB Gemma 4 E4B Q4_K_M + 1 GiB heap.
             Model::Qwen9B | Model::Gemma4E4B => "10G",
+            // ~7.17 GiB Q2_0 model at 2 GiB + a 1 GiB heap at the top of RAM.
+            Model::Bonsai27B => "12G",
             Model::Custom { mem, .. } => mem,
         }
     }
@@ -91,6 +105,7 @@ impl Model {
             Model::Qwen4B => "qwen3.5-4b",
             Model::Qwen9B => "qwen3.5-9b",
             Model::Gemma4E4B => "gemma-4-e4b",
+            Model::Bonsai27B => "bonsai-27b",
             Model::Custom { path, .. } => path,
         }
     }
@@ -249,6 +264,13 @@ fn parse_model(rest: &[String]) -> Result<Model, String> {
                 | "gemma-4-E4B-it"
                 | "e4b"
                 | "E4B" => Ok(Model::Gemma4E4B),
+                // PrismML Ternary-Bonsai-27B dspark drafter (Q4_1). Aliases
+                // cover the HF repo slug style and short forms.
+                "bonsai-27b"
+                | "bonsai27b"
+                | "bonsai"
+                | "ternary-bonsai-27b"
+                | "Ternary-Bonsai-27B" => Ok(Model::Bonsai27B),
                 // Any other value is a GGUF path: the kernel discovers the
                 // architecture from the file, so any family/quant works here.
                 other if other.ends_with(".gguf") => {
@@ -262,7 +284,7 @@ fn parse_model(rest: &[String]) -> Result<Model, String> {
                     })
                 }
                 other => Err(format!(
-                    "unknown -model '{other}' (expected qwen3.5-0.8b|2b|4b|9b, gemma-4-e4b, or a path to a .gguf)"
+                    "unknown -model '{other}' (expected qwen3.5-0.8b|2b|4b|9b, gemma-4-e4b, bonsai-27b, or a path to a .gguf)"
                 )),
             };
         }
@@ -369,7 +391,7 @@ fn main() {
 
 fn usage() -> String {
     "usage: cargo xtask <build|image|run|m1n1|test|ref-check> [-arch x86_64|aarch64] \
-     [-model qwen3.5-0.8b|2b|4b|9b|gemma-4-e4b] [--release] [--uefi] [-server]\n\
+     [-model qwen3.5-0.8b|2b|4b|9b|gemma-4-e4b|bonsai-27b] [--release] [--uefi] [-server]\n\
      m1n1 (aarch64): package the kernel as a gzip'd arm64 Image and boot it on a \
      tethered Apple Silicon Mac over the m1n1 USB proxy; configure via env \
      CHITTI_M1N1/CHITTI_DTB[/CHITTI_INITRD/CHITTI_BOOTARGS/M1N1DEVICE].\n\

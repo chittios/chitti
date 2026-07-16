@@ -1,0 +1,31 @@
+{
+  "name": "disk",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Disk utility (read-only inventory).",
+  "toolset": [
+    "disks",
+    "mounts",
+    "ls",
+    "emit_result"
+  ],
+  "capabilities": [
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "list"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "console",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    }
+  ],
+  "autostart": false
+}

@@ -11,6 +11,8 @@
 #   qwen3.5-9b    -> assets/model-9b.gguf         (Q4_0, ~5.0 GB)
 #   gemma-4-e4b   -> assets/model-gemma4-e4b.gguf (Q4_K_M, ~4.6 GB)
 #                    unsloth/gemma-4-E4B-it-GGUF (Cortex Gemma4 family)
+#   bonsai-27b    -> assets/model-bonsai-27b.gguf (Q2_0 ternary, ~7.17 GB) -- DEFAULT for `make run`
+#                    prism-ml/Ternary-Bonsai-27B-gguf main weights (arch qwen35 -> QwenHybrid)
 set -e
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MODEL="${1:-qwen3.5-0.8b}"
@@ -46,8 +48,19 @@ case "$MODEL" in
     URL="https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf"
     SIZE="~4.6 GB (Q4_K_M)"
     ;;
+  bonsai-27b|bonsai27b|bonsai|ternary-bonsai-27b|Ternary-Bonsai-27B)
+    DEST="$DIR/assets/model-bonsai-27b.gguf"
+    # Ternary-Bonsai-27B main weights (Q2_0 ternary, GGML type 42). The GGUF
+    # declares general.architecture=qwen35 with full DeltaNet SSM keys, so Cortex
+    # runs it on the existing QwenHybrid family; the Q2_0 dequant is in
+    # cortex::tensor::dequant_q2_0_block. (The paired *dspark* drafter is NOT a
+    # standalone model -- it is conditioned on the target's hidden-state taps --
+    # so the runnable Bonsai is this target.)
+    URL="https://huggingface.co/prism-ml/Ternary-Bonsai-27B-gguf/resolve/main/Ternary-Bonsai-27B-Q2_0.gguf"
+    SIZE="~7.17 GB (Q2_0 ternary)"
+    ;;
   *)
-    echo "unknown model '$MODEL' (expected qwen3.5-0.8b|2b|4b|9b, or gemma-4-e4b)" >&2
+    echo "unknown model '$MODEL' (expected qwen3.5-0.8b|2b|4b|9b, gemma-4-e4b, or bonsai-27b)" >&2
     exit 1
     ;;
 esac
@@ -57,6 +70,9 @@ if [ -f "$DEST" ]; then
   exit 0
 fi
 echo "fetching $MODEL $SIZE -> $DEST"
-curl -fL --retry 3 -o "$DEST.partial" "$URL"
+# `-C -` resumes a prior interrupted download (HF supports byte ranges), so a
+# killed `make model` (e.g. SIGTERM) can pick up the existing `.partial` instead
+# of re-pulling multi-GB weights from scratch. `--retry` covers transient drops.
+curl -fL -C - --retry 5 --retry-delay 2 -o "$DEST.partial" "$URL"
 mv "$DEST.partial" "$DEST"
 echo "done: $DEST"

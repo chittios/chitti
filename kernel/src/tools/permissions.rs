@@ -150,6 +150,7 @@ pub fn is_readonly_tool(name: &str) -> bool {
         "search_tools"
             | "use_tool"
             | "list"
+            | "list_dir"
             | "read"
             | "glob"
             | "grep"
@@ -175,6 +176,11 @@ pub fn is_readonly_tool(name: &str) -> bool {
             | "network"
             | "enter_plan_mode"
             | "exit_plan_mode"
+            | "task_output"
+            | "list_tasks"
+            | "ask_user_question"
+            | "web_search"
+            | "web_fetch"
     ) {
         return true;
     }
@@ -191,7 +197,11 @@ pub fn is_readonly_tool(name: &str) -> bool {
                 "datetime" | "disks" | "ls" | "mounts" | "help" | "skills" | "network" | "ping"
                     | "cat" | "grep" | "glob" | "pwd" | "shortcuts"
             ),
-        Some(ToolBinding::StoreQuery { kind: StoreQueryKind::Glob | StoreQueryKind::Grep }) => true,
+        Some(ToolBinding::StoreQuery {
+            kind: StoreQueryKind::Glob | StoreQueryKind::Grep | StoreQueryKind::ListDir,
+        }) => true,
+        Some(ToolBinding::BgTask) => matches!(name, "task_output" | "list_tasks"),
+        Some(ToolBinding::AskUser) | Some(ToolBinding::Web) => true,
         Some(ToolBinding::AgentMemory) => {
             matches!(name, "memory_get" | "memory_list" | "memory_search")
         }
@@ -220,37 +230,23 @@ pub fn is_readonly_tool(name: &str) -> bool {
             )
         }
         Some(ToolBinding::AgentWasm) => {
-            matches!(
-                name,
-                "notes_list"
-                    | "notes_get"
-                    | "notes_set"
-                    | "notes_remove"
-                    | "paint_start"
-                    | "paint_clear"
-                    | "paint_rect"
-                    | "paint_line"
-                    | "paint_pixel"
-                    | "paint_draw"
-                    | "paint_status"
-                    | "slides_start"
-                    | "slides_next"
-                    | "slides_prev"
-                    | "slides_goto"
-                    | "slides_status"
-                    | "mines_start"
-                    | "mines_click"
-                    | "mines_flag"
-                    | "mines_status"
-                    | "snake_start"
-                    | "snake_dir"
-                    | "snake_tick"
-                    | "snake_status"
-                    | "synth_tone"
-                    | "synth_beep"
-                    | "synth_stop"
-                    | "synth_status"
-            )
+            // Read-ish / status / list package tools auto-allow in auto mode;
+            // destructive/write tools still go through the normal gate.
+            name.ends_with("_status")
+                || name.ends_with("_list")
+                || name.ends_with("_get")
+                || name.ends_with("_lookup")
+                || name.ends_with("_dump")
+                || name.ends_with("_start")
+                || matches!(
+                    name,
+                    "notes_list"
+                        | "notes_get"
+                        | "chess_legal"
+                        | "calc_eval"
+                        | "hex_open"
+                        | "dict_lookup"
+                )
         }
         Some(ToolBinding::SessionTodo) | Some(ToolBinding::LoadSkill) => true,
         Some(ToolBinding::McpResources { kind: McpResourceKind::List }) => true,

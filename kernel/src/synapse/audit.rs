@@ -56,7 +56,7 @@ static LOG: Locked<Vec<Entry>> = Locked::new(Vec::new());
 /// the last-printed one (all fields but `seq`) have been suppressed. The
 /// **log itself records every entry** — only the serial/ring mirror collapses
 /// runs, so a polling loop can't drown the human-facing trace (a UI event
-/// pump once emitted ~1000 identical lines/second; see `service::ui_agent`).
+/// pump once emitted ~1000 identical lines/second; see `service::package_ui`).
 static REPEATS: Locked<(Option<Entry>, u64)> = Locked::new((None, 0));
 
 /// Append one record and return its sequence number. The *only* way to

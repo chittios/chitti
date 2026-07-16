@@ -1,0 +1,47 @@
+{
+  "name": "files",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Storage file browser (tools.wasm).",
+  "toolset": [
+    "files_start",
+    "files_list",
+    "files_get",
+    "files_set",
+    "files_remove",
+    "files_status"
+  ],
+  "capabilities": [
+    {
+      "domain": "ui",
+      "rights": [
+        "exec",
+        "write",
+        "delete"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list"
+      ],
+      "scope": "home"
+    },
+    {
+      "domain": "todo",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    }
+  ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "fuel": 2000000
+  },
+  "autostart": false
+}

@@ -2,7 +2,7 @@
   "name": "chess",
   "version": "1.0.0",
   "kind": "skill_agent",
-  "description": "Chess UI agent: paints an 8×8 board in the action pane via board_set/board_mark; rules in assets/tools.wasm.",
+  "description": "Chess: the full game (rules, board UI, input) in assets/tools.wasm; the agent plays Black via the runtime's model-ask protocol.",
   "toolset": [
     "ui_surface_request",
     "ui_draw",

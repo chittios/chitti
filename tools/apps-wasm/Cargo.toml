@@ -3,7 +3,7 @@ name = "chitti-apps-wasm"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Shared tools.wasm for notes/paint/slides/minesweeper/snake/synth agents"
+description = "Shared tools.wasm for notes/paint/slides/games + default-OS UI agents"
 
 [workspace]
 

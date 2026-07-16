@@ -15,11 +15,13 @@
 //! * [`provider`] — in-kernel tool-provider modules ("MCP servers") that
 //!   register additional toolsets (used by Phase F skill-bundled tools).
 
+pub mod bg;
 pub mod dispatch;
 pub mod pathutil;
 pub mod permissions;
 pub mod provider;
 pub mod registry;
+pub mod shell_cmd;
 
 pub use dispatch::Router;
 pub use permissions::{check as permission_check, Decision as PermissionDecision};

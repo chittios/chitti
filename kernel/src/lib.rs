@@ -83,6 +83,8 @@ pub mod framebuffer;
 #[cfg(not(test))]
 pub mod editor;
 // The Geist Mono glyph atlas the framebuffer console renders with (data-only).
+// (`synapse::ui`'s `text` draw op uses the runtime `font_ttf` rasterizer, not
+// this fixed-cell atlas — sizes below the cell smear when downscaled.)
 #[cfg(not(test))]
 pub mod font_geist;
 // Minimal Indic text shaping (pre-base matra reordering) for the fontdue path.

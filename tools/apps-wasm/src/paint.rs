@@ -3,6 +3,30 @@ use alloc::format;
 use alloc::string::{String, ToString};
 
 static mut COLOR: [u8; 8] = *b"cc785c\0\0";
+/// Brush square size in pixels (`+`/`-` adjust, 2..=16).
+static mut BRUSH: i32 = 6;
+
+/// Palette swatches: key `1`..`8` / click on the top strip. Slot 8 is the
+/// canvas background — an eraser.
+const PALETTE: [&str; 8] = [
+    "cc785c", "e8e4df", "6688cc", "5a8f5a", "c9a54a", "aa3333", "3a3632", "1a1816",
+];
+/// Height of the palette strip at the top of the canvas.
+const BAR: i32 = 12;
+
+/// Repaint the palette strip (selected swatch gets a bright underline).
+fn paint_bar() {
+    let mut ops = String::new();
+    let cur = color();
+    for (i, c) in PALETTE.iter().enumerate() {
+        let x = i as i32 * 32;
+        ops.push_str(&format!("rect {x} 0 31 {} {c}; ", BAR - 2));
+        if *c == cur {
+            ops.push_str(&format!("rect {x} {} 31 2 e8e4df; ", BAR - 2));
+        }
+    }
+    ui_draw(&ops);
+}
 
 fn color() -> String {
     unsafe {
@@ -22,7 +46,51 @@ fn set_color(c: &str) {
 
 pub fn start(_: &str) -> String {
     ui_draw("clear 1a1816");
-    String::from("ok:paint ready")
+    paint_bar();
+    String::from("ok:paint ready (click to draw, 1-8 colors, +/- brush, c clear)")
+}
+
+/// Surface click: on the palette strip → select that swatch; below → stamp a
+/// brush square in the current colour.
+pub fn on_click(x: i32, y: i32) -> String {
+    if y < BAR {
+        let i = (x / 32).clamp(0, 7) as usize;
+        set_color(PALETTE[i]);
+        paint_bar();
+        return format!("ok:color={}", PALETTE[i]);
+    }
+    let b = unsafe { BRUSH };
+    let half = b / 2;
+    let px = (x - half).max(0);
+    let py = (y - half).max(BAR);
+    ui_draw(&format!("rect {px} {py} {b} {b} {}", color()));
+    String::from("ok:dot")
+}
+
+/// Key: `1`..`8` palette, `c` clear canvas, `+`/`-` brush size.
+pub fn on_key(key: &str) -> String {
+    match key {
+        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" => {
+            let i = (key.as_bytes()[0] - b'1') as usize;
+            set_color(PALETTE[i]);
+            paint_bar();
+            format!("ok:color={}", PALETTE[i])
+        }
+        "c" => {
+            ui_draw("clear 1a1816");
+            paint_bar();
+            String::from("ok:clear")
+        }
+        "+" | "=" => {
+            unsafe { BRUSH = (BRUSH + 2).min(16) };
+            format!("ok:brush={}", unsafe { BRUSH })
+        }
+        "-" | "_" => {
+            unsafe { BRUSH = (BRUSH - 2).max(2) };
+            format!("ok:brush={}", unsafe { BRUSH })
+        }
+        _ => String::from("ok"),
+    }
 }
 
 pub fn clear(args: &str) -> String {

@@ -1,0 +1,47 @@
+{
+  "name": "contacts",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Address book (tools.wasm).",
+  "toolset": [
+    "contacts_start",
+    "contacts_list",
+    "contacts_get",
+    "contacts_set",
+    "contacts_remove",
+    "contacts_status"
+  ],
+  "capabilities": [
+    {
+      "domain": "ui",
+      "rights": [
+        "exec",
+        "write",
+        "delete"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list"
+      ],
+      "scope": "home"
+    },
+    {
+      "domain": "todo",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    }
+  ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "fuel": 2000000
+  },
+  "autostart": false
+}

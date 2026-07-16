@@ -1,0 +1,44 @@
+{
+  "name": "ops",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "System admin co-pilot (read-mostly shell tools).",
+  "toolset": [
+    "disks",
+    "mounts",
+    "network",
+    "ping",
+    "datetime",
+    "ls",
+    "cat",
+    "memory_list",
+    "emit_result"
+  ],
+  "capabilities": [
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "list"
+      ],
+      "scope": "home"
+    },
+    {
+      "domain": "console",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "net",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    }
+  ],
+  "autostart": false
+}

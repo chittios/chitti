@@ -3,6 +3,7 @@
 //! unit tests exercise the logic off-hardware, and the Router applies
 //! capability scope filters before calling in.
 
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -164,16 +165,37 @@ pub struct GrepHit {
     pub text: String,
 }
 
-/// Search `files` (path, utf-8 content) for lines containing `query` (substring,
-/// case-sensitive). Caps total hits at `max_hits`.
+/// Search `files` (path, utf-8 content) for lines containing `query` (substring).
+/// Caps total hits at `max_hits`. When `case_insensitive`, both sides are
+/// lowercased for the match (hit text stays original).
 pub fn grep_files(query: &str, files: &[(String, String)], max_hits: usize) -> Vec<GrepHit> {
+    grep_files_ex(query, files, max_hits, false)
+}
+
+/// Extended grep with case folding.
+pub fn grep_files_ex(
+    query: &str,
+    files: &[(String, String)],
+    max_hits: usize,
+    case_insensitive: bool,
+) -> Vec<GrepHit> {
     let mut out = Vec::new();
     if query.is_empty() || max_hits == 0 {
         return out;
     }
+    let q = if case_insensitive {
+        query.to_ascii_lowercase()
+    } else {
+        query.to_string()
+    };
     for (path, content) in files {
         for (i, line) in content.lines().enumerate() {
-            if line.contains(query) {
+            let hay = if case_insensitive {
+                line.to_ascii_lowercase()
+            } else {
+                line.to_string()
+            };
+            if hay.contains(&q) {
                 let text = if line.len() > 200 {
                     let mut t = line[..200].to_string();
                     t.push('…');
@@ -193,6 +215,53 @@ pub fn grep_files(query: &str, files: &[(String, String)], max_hits: usize) -> V
         }
     }
     out
+}
+
+/// Direct children of `dir` (store paths). `dir` may be `""` or `"/"` for root.
+/// Returns relative names for children (files + implied subdirs), sorted.
+pub fn list_dir_children(dir: &str, paths: &[String]) -> Vec<String> {
+    let prefix = normalize_dir_prefix(dir);
+    let mut kids: Vec<String> = Vec::new();
+    for p in paths {
+        let rest = if prefix.is_empty() {
+            p.trim_start_matches('/')
+        } else if let Some(r) = p.strip_prefix(&prefix) {
+            r.trim_start_matches('/')
+        } else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        let name = rest.split('/').next().unwrap_or(rest);
+        if name.is_empty() {
+            continue;
+        }
+        // Directory vs file: if more path remains, mark as dir with trailing /
+        let entry = if rest.contains('/') {
+            format!("{name}/")
+        } else {
+            name.to_string()
+        };
+        if !kids.iter().any(|k| k == &entry) {
+            kids.push(entry);
+        }
+    }
+    kids.sort();
+    kids
+}
+
+fn normalize_dir_prefix(dir: &str) -> String {
+    let d = dir.trim();
+    if d.is_empty() || d == "/" {
+        return String::new();
+    }
+    let d = d.trim_end_matches('/');
+    if d.starts_with('/') {
+        d.to_string()
+    } else {
+        format!("/{d}")
+    }
 }
 
 /// Slice `content` to lines `[start_line, end_line]` inclusive (1-based).

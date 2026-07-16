@@ -1,0 +1,45 @@
+{
+  "name": "console",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Log / ktrace-style console viewer (tools.wasm).",
+  "toolset": [
+    "console_start",
+    "console_log",
+    "console_list",
+    "console_status"
+  ],
+  "capabilities": [
+    {
+      "domain": "ui",
+      "rights": [
+        "exec",
+        "write",
+        "delete"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list"
+      ],
+      "scope": "home"
+    },
+    {
+      "domain": "todo",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    }
+  ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "fuel": 2000000
+  },
+  "autostart": false
+}

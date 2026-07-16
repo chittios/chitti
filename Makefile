@@ -4,8 +4,9 @@
 
 # --- knobs (override on the command line: `make run ARCH=x86_64 MODEL=qwen3.5-9b RELEASE=1`) ---
 # ARCH:         aarch64 (native HVF on Apple Silicon) | x86_64
-# MODEL:        qwen3.5-0.8b (default) | qwen3.5-2b | qwen3.5-4b | qwen3.5-9b
-#               | gemma-4-e4b (aliases: e4b, gemma4-e4b)
+# MODEL:        bonsai-27b (default) | qwen3.5-0.8b | qwen3.5-2b | qwen3.5-4b
+#               | qwen3.5-9b | gemma-4-e4b (aliases: e4b, gemma4-e4b)
+#               bonsai-27b = PrismML Ternary-Bonsai-27B main weights (Q2_0 ternary, ~7.17 GB)
 # RELEASE:      set to 1 for an optimized build
 # BRIDGE:       host NIC to L2-bridge (empty = QEMU user-net / slirp). macOS
 #               vmnet-bridged needs sudo — leave empty for host services via 10.0.2.2
@@ -13,7 +14,7 @@
 #               the host is always 10.0.2.2 (not the Mac's LAN IP).
 # REMOTE_MODEL: model name sent to the hosted server (LM Studio / Ollama / …)
 ARCH         ?= aarch64
-MODEL        ?= qwen3.5-0.8b
+MODEL        ?= bonsai-27b
 RELEASE      ?=
 BRIDGE       ?=
 REMOTE_URL   ?= http://10.0.2.2:1234

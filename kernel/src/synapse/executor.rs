@@ -511,6 +511,18 @@ fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> Str
                 Err(e) => format!("error:{e:?}"),
             }
         }
+        registry::UI_HUD => {
+            let surface = arg_uint(args, 0) as u32;
+            let text = arg_str(args, 1);
+            match super::ui::set_hud(caller, surface, text) {
+                Ok(()) => "ok:hud".to_string(),
+                Err(super::ui::DrawErr::NotOwner) => {
+                    cap::record_denial(caller, "ui_hud (not surface owner)");
+                    "error:not_surface_owner".to_string()
+                }
+                Err(e) => format!("error:{e:?}"),
+            }
+        }
         other => format!("error:unimplemented primitive id {other}"),
     }
 }

@@ -1,0 +1,25 @@
+{
+  "name": "recorder",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Voice memo coach (uses /voice when available).",
+  "toolset": [
+    "files_set",
+    "files_list",
+    "files_get",
+    "memory_add",
+    "emit_result"
+  ],
+  "capabilities": [
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list"
+      ],
+      "scope": "home"
+    }
+  ],
+  "autostart": false
+}

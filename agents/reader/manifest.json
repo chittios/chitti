@@ -1,0 +1,34 @@
+{
+  "name": "reader",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Feed / article reader (HTTP fetch + summarize).",
+  "toolset": [
+    "http",
+    "files_set",
+    "files_get",
+    "files_list",
+    "memory_add",
+    "emit_result"
+  ],
+  "capabilities": [
+    {
+      "domain": "net",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list"
+      ],
+      "scope": "home"
+    }
+  ],
+  "autostart": false
+}

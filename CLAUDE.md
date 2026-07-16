@@ -245,15 +245,26 @@ real UEFI hardware.
   `tools/chess-wasm`), doc's HTTP router (`route_request`, `tools/doc-wasm`),
   pdf's document digest (`pdf_digest`, `tools/pdf-wasm` — xref tables+streams,
   ObjStm, FlateDecode reusing the kernel's `image/inflate.rs`, text
-  extraction), and the app suite `notes/paint/slides/minesweeper/snake/synth`
-  (one shared module from `tools/apps-wasm`). **Every wasm call is a fresh
-  instance** — design tools digest-once (one call returns everything as JSON;
-  the kernel caches) and pass binary inputs as base64. UI apps paint 256×192
-  `synapse::ui` surfaces via the draw-op DSL (`board_set`/`board_mark` for
-  boards) with per-agent `storage_*` (localStorage-shaped) state; the runtime
-  pump (`service/ui_agent.rs`) peeks the event queue natively and only drains
+  extraction), the full **chess game** (`tools/chess-wasm` — rules, board UI,
+  and the agent-opponent flow; zero chess code in the kernel), and the app
+  suite `notes/paint/slides/minesweeper/snake/synth` (one shared module from
+  `tools/apps-wasm`). **Chat tool calls run on a fresh instance** — design
+  those digest-once (one call returns everything as JSON; the kernel caches)
+  and pass binary inputs as base64 — **but a running package-UI app keeps ONE
+  persistent instance** (`service/package_ui.rs`): guest statics ARE the game
+  state (snake body, mine field, FEN), the guest bump heap resets per call
+  cycle in `chitti_alloc`, and no guest static may hold a heap type. UI apps
+  paint 256×192 `synapse::ui` surfaces via the draw-op DSL
+  (`rect`/`line`/`pixel`/`text` + `board_set`/`board_mark` for boards) with
+  per-agent `storage_*` (localStorage-shaped) state; the runtime pump
+  (`service/package_ui.rs`) peeks the event queue natively and only drains
   through the audited `ui_event_poll` when events exist (an unpaced poll once
-  flooded the audit log at ~1 kHz). Manifests can claim **`command_hooks`** —
+  flooded the audit log at ~1 kHz), forwards clicks/keys to the guest
+  `on_click`/`on_key` exports (an app consumes only keys it handles), and
+  serves the **model-ask protocol**: any export may return `ask:<prompt>` →
+  one model turn over the agent's SOUL → the text back via `on_reply` — the
+  wasm builds the prompt and validates the reply, so the model only ever
+  chooses (chess enumerates legal moves natively and the agent picks one). Manifests can claim **`command_hooks`** —
   `/open` routes by extension to the owning agent's tool (media owns
   images/audio/video, pdf owns `.pdf`) and rebinds chat to that agent. Build a
   module with `cargo build --release --target wasm32-unknown-unknown` in its

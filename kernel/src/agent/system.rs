@@ -1,10 +1,12 @@
-//! **System agents** — built-in packages (doc, ssh, chess, media, pdf, notes,
-//! paint, slides, minesweeper, snake, synth, download, todo), each a markdown
-//! `SOUL.md` + JSON manifest under the repo's `agents/` folder. Definitions are
-//! compiled in via `include_str!`/`include_bytes!`; at boot [`install_all`] signs
-//! each into a `SkillPackage` and installs it through the normal permissioned
-//! flow — SOUL lands in `/agent/<id>/SOUL.md`, grants are recorded, roles
-//! registered (pre-trusted, same shape as a registry package).
+//! **System agents** — built-in packages under the repo's `agents/` folder:
+//! services (`doc`, `ssh`), media (`media`, `pdf`), package-UI apps (`chess`,
+//! `paint`, `slides`, games, plus default-OS UI like `calc`/`files`/`sheets`/…),
+//! and chat skill-agents (`download`, `todo`, `browser`, `librarian`, …).
+//! Each is a markdown `SOUL.md` + JSON manifest. Definitions are compiled in
+//! via `include_str!`/`include_bytes!`; at boot [`install_all`] signs each into
+//! a `SkillPackage` and installs it through the normal permissioned flow —
+//! SOUL lands in `/agent/<id>/SOUL.md`, grants are recorded, roles registered
+//! (pre-trusted, same shape as a registry package).
 //!
 //! Packages with `"autostart": true` (download, notes, todo) are activated by
 //! [`autostart_agents`]: homes are ensured and their toolsets merge into the
@@ -213,6 +215,360 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
         agent_id: AgentId(SYSTEM_AGENT_BASE + 14),
         assets: &[],
         binary_assets: &[],
+    },
+    SystemAgentDef {
+        name: "calc",
+        soul: include_str!("../../../agents/calc/SOUL.md"),
+        manifest_json: include_str!("../../../agents/calc/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 15),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 15),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/calc/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "clock",
+        soul: include_str!("../../../agents/clock/SOUL.md"),
+        manifest_json: include_str!("../../../agents/clock/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 16),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 16),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/clock/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "files",
+        soul: include_str!("../../../agents/files/SOUL.md"),
+        manifest_json: include_str!("../../../agents/files/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 17),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 17),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/files/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "gallery",
+        soul: include_str!("../../../agents/gallery/SOUL.md"),
+        manifest_json: include_str!("../../../agents/gallery/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 18),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 18),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/gallery/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "sheets",
+        soul: include_str!("../../../agents/sheets/SOUL.md"),
+        manifest_json: include_str!("../../../agents/sheets/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 19),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 19),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/sheets/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "calendar",
+        soul: include_str!("../../../agents/calendar/SOUL.md"),
+        manifest_json: include_str!("../../../agents/calendar/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 20),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 20),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/calendar/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "contacts",
+        soul: include_str!("../../../agents/contacts/SOUL.md"),
+        manifest_json: include_str!("../../../agents/contacts/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 21),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 21),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/contacts/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "writer",
+        soul: include_str!("../../../agents/writer/SOUL.md"),
+        manifest_json: include_str!("../../../agents/writer/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 22),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 22),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/writer/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "archive",
+        soul: include_str!("../../../agents/archive/SOUL.md"),
+        manifest_json: include_str!("../../../agents/archive/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 23),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 23),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/archive/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "hex",
+        soul: include_str!("../../../agents/hex/SOUL.md"),
+        manifest_json: include_str!("../../../agents/hex/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 24),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 24),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/hex/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "game2048",
+        soul: include_str!("../../../agents/game2048/SOUL.md"),
+        manifest_json: include_str!("../../../agents/game2048/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 25),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 25),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/game2048/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "activity",
+        soul: include_str!("../../../agents/activity/SOUL.md"),
+        manifest_json: include_str!("../../../agents/activity/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 26),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 26),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/activity/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "weather",
+        soul: include_str!("../../../agents/weather/SOUL.md"),
+        manifest_json: include_str!("../../../agents/weather/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 27),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 27),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/weather/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "settings",
+        soul: include_str!("../../../agents/settings/SOUL.md"),
+        manifest_json: include_str!("../../../agents/settings/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 28),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 28),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/settings/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "dict",
+        soul: include_str!("../../../agents/dict/SOUL.md"),
+        manifest_json: include_str!("../../../agents/dict/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 29),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 29),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/dict/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "diff",
+        soul: include_str!("../../../agents/diff/SOUL.md"),
+        manifest_json: include_str!("../../../agents/diff/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 30),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 30),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/diff/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "librarian",
+        soul: include_str!("../../../agents/librarian/SOUL.md"),
+        manifest_json: include_str!("../../../agents/librarian/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 31),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 31),
+        assets: &[],
+        binary_assets: &[],
+    },
+    SystemAgentDef {
+        name: "researcher",
+        soul: include_str!("../../../agents/researcher/SOUL.md"),
+        manifest_json: include_str!("../../../agents/researcher/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 32),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 32),
+        assets: &[],
+        binary_assets: &[],
+    },
+    SystemAgentDef {
+        name: "ops",
+        soul: include_str!("../../../agents/ops/SOUL.md"),
+        manifest_json: include_str!("../../../agents/ops/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 33),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 33),
+        assets: &[],
+        binary_assets: &[],
+    },
+    SystemAgentDef {
+        name: "onboard",
+        soul: include_str!("../../../agents/onboard/SOUL.md"),
+        manifest_json: include_str!("../../../agents/onboard/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 34),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 34),
+        assets: &[],
+        binary_assets: &[],
+    },
+    SystemAgentDef {
+        name: "store",
+        soul: include_str!("../../../agents/store/SOUL.md"),
+        manifest_json: include_str!("../../../agents/store/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 35),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 35),
+        assets: &[],
+        binary_assets: &[],
+    },
+    SystemAgentDef {
+        name: "mail",
+        soul: include_str!("../../../agents/mail/SOUL.md"),
+        manifest_json: include_str!("../../../agents/mail/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 36),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 36),
+        assets: &[],
+        binary_assets: &[],
+    },
+    SystemAgentDef {
+        name: "disk",
+        soul: include_str!("../../../agents/disk/SOUL.md"),
+        manifest_json: include_str!("../../../agents/disk/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 37),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 37),
+        assets: &[],
+        binary_assets: &[],
+    },
+    SystemAgentDef {
+        name: "pass",
+        soul: include_str!("../../../agents/pass/SOUL.md"),
+        manifest_json: include_str!("../../../agents/pass/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 38),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 38),
+        assets: &[],
+        binary_assets: &[],
+    },
+    SystemAgentDef {
+        name: "recorder",
+        soul: include_str!("../../../agents/recorder/SOUL.md"),
+        manifest_json: include_str!("../../../agents/recorder/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 39),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 39),
+        assets: &[],
+        binary_assets: &[],
+    },
+    SystemAgentDef {
+        name: "reader",
+        soul: include_str!("../../../agents/reader/SOUL.md"),
+        manifest_json: include_str!("../../../agents/reader/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 40),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 40),
+        assets: &[],
+        binary_assets: &[],
+    },
+    SystemAgentDef {
+        name: "breakout",
+        soul: include_str!("../../../agents/breakout/SOUL.md"),
+        manifest_json: include_str!("../../../agents/breakout/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 41),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 41),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/breakout/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "tetris",
+        soul: include_str!("../../../agents/tetris/SOUL.md"),
+        manifest_json: include_str!("../../../agents/tetris/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 42),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 42),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/tetris/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "console",
+        soul: include_str!("../../../agents/console/SOUL.md"),
+        manifest_json: include_str!("../../../agents/console/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 43),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 43),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/console/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "maps",
+        soul: include_str!("../../../agents/maps/SOUL.md"),
+        manifest_json: include_str!("../../../agents/maps/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 44),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 44),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/maps/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "radio",
+        soul: include_str!("../../../agents/radio/SOUL.md"),
+        manifest_json: include_str!("../../../agents/radio/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 45),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 45),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/radio/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
+        name: "sandbox-lab",
+        soul: include_str!("../../../agents/sandbox-lab/SOUL.md"),
+        manifest_json: include_str!("../../../agents/sandbox-lab/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 46),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 46),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/sandbox-lab/assets/tools.wasm"),
+        )],
     },
 ];
 
@@ -654,7 +1010,7 @@ pub fn install_all(now: Ticks) {
         }
     }
     crate::serial_println!(
-        "Chitti: system agents installed (doc, ssh, chess, media, pdf, notes, paint, slides, minesweeper, snake, synth, download, todo, browser) in /agent/"
+        "Chitti: system agents installed (builtin suite + UI apps + chat agents) in /agent/"
     );
     autostart_agents();
 }
@@ -799,7 +1155,8 @@ mod tests {
             assert!(!m.capabilities.is_empty(), "{} declares capabilities", def.name);
         }
         // SOUL + package agents (no network/http plumbing as agents).
-        assert_eq!(SYSTEM_AGENTS.len(), 14);
+        // 14 original + 16 UI + 10 chat + 6 more (breakout/tetris/console/maps/radio/sandbox-lab).
+        assert_eq!(SYSTEM_AGENTS.len(), 46);
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "browser"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "chess"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "media"));
@@ -807,6 +1164,19 @@ mod tests {
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "snake"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "todo"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "download"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "calc"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "files"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "game2048"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "librarian"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "settings"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "breakout"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "tetris"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "sandbox-lab"));
+        // UI apps ship tools.wasm; chat-only librarian does not.
+        let calc = SYSTEM_AGENTS.iter().find(|d| d.name == "calc").unwrap();
+        assert!(calc.binary_assets.iter().any(|(n, _)| *n == "tools.wasm"));
+        let lib = SYSTEM_AGENTS.iter().find(|d| d.name == "librarian").unwrap();
+        assert!(lib.binary_assets.is_empty());
         assert!(!SYSTEM_AGENTS.iter().any(|d| d.name == "network" || d.name == "http"));
     }
 

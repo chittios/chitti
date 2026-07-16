@@ -1,0 +1,35 @@
+{
+  "name": "mail",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Unified inbox persona (msgchan / local drafts).",
+  "toolset": [
+    "memory_add",
+    "memory_get",
+    "memory_list",
+    "files_set",
+    "files_get",
+    "files_list",
+    "emit_result"
+  ],
+  "capabilities": [
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list"
+      ],
+      "scope": "home"
+    },
+    {
+      "domain": "todo",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    }
+  ],
+  "autostart": false
+}

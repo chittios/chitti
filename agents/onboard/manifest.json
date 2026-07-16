@@ -1,0 +1,43 @@
+{
+  "name": "onboard",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "First-boot setup assistant.",
+  "toolset": [
+    "settings_get",
+    "settings_set",
+    "datetime",
+    "network",
+    "memory_add",
+    "emit_result"
+  ],
+  "capabilities": [
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list"
+      ],
+      "scope": "home"
+    },
+    {
+      "domain": "ui",
+      "rights": [
+        "exec",
+        "write",
+        "delete"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "todo",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    }
+  ],
+  "autostart": false
+}

@@ -583,9 +583,15 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "js" => run_js(arg),
         "think" => run_think(arg),
         "mode" => run_mode(arg),
+        "effort" => run_effort(arg),
+        "context" => run_context(arg),
+        "view-plan" | "show-plan" | "plan-view" => run_view_plan(arg),
+        "auto-compact" => run_auto_compact(arg),
         "plan" => {
             set_plan_mode(true);
-            serial_println!("plan> mode on (use /mode auto or exit_plan_mode to leave)");
+            serial_println!(
+                "plan> mode on — write plan to session plan.md; /view-plan preview; exit_plan_mode for approval"
+            );
         }
         "permissions" | "perms" => run_permissions(arg),
         "voice" => run_voice(arg),
@@ -1211,7 +1217,8 @@ pub(crate) fn poll_interrupt() -> bool {
 /// Non-blocking cancel check: Ctrl+C, or a bare Esc key (an Esc that begins an
 /// ANSI CSI sequence — an arrow key — is swallowed without cancelling). Used by
 /// the inference loops (a decode turn owns the console, so consuming input is
-/// fine there).
+/// fine there). Printable bytes during a turn are queued as a mid-turn follow-up
+/// (Grok-style interjection / `/btw` buffer).
 pub(crate) fn poll_cancel() -> bool {
     match crate::console::read_byte() {
         Some(3) => true,
@@ -1228,8 +1235,146 @@ pub(crate) fn poll_cancel() -> bool {
                 true
             }
         }
+        Some(b) if (0x20..=0x7e).contains(&b) || b == b'\r' || b == b'\n' || b == 0x7f || b == 0x08 => {
+            // Mid-turn typing → follow-up queue (not cancel).
+            followup_push_byte(b);
+            false
+        }
         _ => false,
     }
+}
+
+// --- Mid-turn follow-up (type while the agent is working) -------------------
+static FOLLOWUP: crate::mm::Locked<alloc::string::String> =
+    crate::mm::Locked::new(alloc::string::String::new());
+static CHAT_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Mark chat turn busy (for remote/local mid-turn key capture).
+pub(crate) fn set_chat_busy(on: bool) {
+    CHAT_BUSY.store(on, core::sync::atomic::Ordering::Relaxed);
+    if !on {
+        FOLLOWUP.with(|buf| {
+            if !buf.is_empty() {
+                let line = core::mem::take(buf);
+                let line = line.trim().to_string();
+                if !line.is_empty() {
+                    queue_prompt(&line);
+                }
+            }
+        });
+    }
+}
+
+fn followup_push_byte(b: u8) {
+    FOLLOWUP.with(|buf| {
+        match b {
+            b'\r' | b'\n' => {
+                let line = core::mem::take(buf);
+                let line = line.trim().to_string();
+                if !line.is_empty() {
+                    // Strip optional `/btw ` prefix (Grok-style aside).
+                    let msg = line
+                        .strip_prefix("/btw ")
+                        .or_else(|| line.strip_prefix("/btw"))
+                        .unwrap_or(&line)
+                        .trim();
+                    if !msg.is_empty() {
+                        queue_prompt(msg);
+                        serial_println!(
+                            "\x1b[2m[queued follow-up — runs after this turn]\x1b[0m {}",
+                            msg
+                        );
+                    }
+                }
+            }
+            0x7f | 0x08 => {
+                buf.pop();
+            }
+            c if (0x20..=0x7e).contains(&c) => {
+                if buf.len() < 500 {
+                    buf.push(c as char);
+                }
+            }
+            _ => {}
+        }
+    });
+}
+
+/// Drain keystrokes into the follow-up buffer only while a chat turn is busy
+/// (so the idle line editor keeps its keys).
+fn drain_followup_keys() {
+    if !CHAT_BUSY.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    while let Some(b) = crate::console::read_byte() {
+        if b == 3 || b == 0x1b {
+            crate::console::unread(b);
+            return;
+        }
+        followup_push_byte(b);
+    }
+}
+
+fn finish_chat_turn(chat: &mut ChatSession, session: &mut crate::agent::types::Session) {
+    CHAT_BUSY.store(false, core::sync::atomic::Ordering::Relaxed);
+    // Commit half-typed follow-up line if any.
+    FOLLOWUP.with(|buf| {
+        if !buf.is_empty() {
+            let line = core::mem::take(buf);
+            let line = line.trim().to_string();
+            if !line.is_empty() {
+                queue_prompt(&line);
+            }
+        }
+    });
+    // Auto-compact when context usage exceeds threshold.
+    let max_tok = session.budget.limits.max_context_tokens.max(1);
+    let used = chat.pos as u32;
+    let pct = auto_compact_pct();
+    let limit = (max_tok as u64).saturating_mul(pct as u64) / 100;
+    if used as u64 >= limit && used > 64 {
+        serial_println!(
+            "\x1b[2m[auto-compact: {} tokens ≥ {}% of {}]\x1b[0m",
+            used,
+            pct,
+            max_tok
+        );
+        chat.compact();
+    }
+}
+
+// --- Reasoning effort (remote) ---------------------------------------------
+static EFFORT: crate::mm::Locked<alloc::string::String> =
+    crate::mm::Locked::new(alloc::string::String::new());
+
+/// Current remote reasoning effort (`""` | low|medium|high|xhigh).
+pub fn reasoning_effort() -> alloc::string::String {
+    EFFORT.with(|e| e.clone())
+}
+
+fn set_reasoning_effort(level: &str) -> bool {
+    let l = level.trim().to_ascii_lowercase();
+    if matches!(l.as_str(), "" | "off" | "none") {
+        EFFORT.with(|e| e.clear());
+        return true;
+    }
+    if matches!(l.as_str(), "low" | "medium" | "high" | "xhigh") {
+        EFFORT.with(|e| *e = l);
+        return true;
+    }
+    false
+}
+
+// --- Auto-compact threshold (percent of max_context_tokens) -----------------
+static AUTO_COMPACT_PCT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(85);
+
+fn auto_compact_pct() -> u32 {
+    AUTO_COMPACT_PCT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+fn set_auto_compact_pct(p: u32) {
+    AUTO_COMPACT_PCT.store(p.clamp(50, 99), core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Assemble a Qwen3.5 tool-use system prompt: `persona` text followed by the
@@ -1296,9 +1441,18 @@ pub(crate) const CORE_TOOLS: &[&str] = &[
     "read",
     "write",
     "edit",
+    "search_replace",
     "list",
+    "list_dir",
     "glob",
     "grep",
+    "run_shell_command",
+    "task_output",
+    "kill_task",
+    "monitor",
+    "ask_user_question",
+    "web_search",
+    "web_fetch",
     "todo_write",
     "memory_add",
     "memory_get",
@@ -3007,6 +3161,101 @@ fn voice_converse_turn(
     }
 }
 
+fn run_effort(arg: &str) {
+    let a = arg.trim();
+    if a.is_empty() {
+        let e = reasoning_effort();
+        if e.is_empty() {
+            serial_println!("effort> default (unset) — usage: /effort low|medium|high|xhigh|off");
+        } else {
+            serial_println!("effort> {e}  (remote reasoning_effort; /effort off to clear)");
+        }
+        return;
+    }
+    if set_reasoning_effort(a) {
+        let e = reasoning_effort();
+        if e.is_empty() {
+            serial_println!("effort> cleared");
+        } else {
+            serial_println!("effort> set to {e}");
+        }
+    } else {
+        serial_println!("effort> unknown level — use low|medium|high|xhigh|off");
+    }
+}
+
+fn run_auto_compact(arg: &str) {
+    let a = arg.trim();
+    if a.is_empty() {
+        serial_println!(
+            "auto-compact> {}% of max_context_tokens (usage: /auto-compact <50-99>|off)",
+            auto_compact_pct()
+        );
+        return;
+    }
+    if a == "off" || a == "0" {
+        set_auto_compact_pct(100); // effectively never (only at 100%)
+        serial_println!("auto-compact> off (threshold 100%)");
+        return;
+    }
+    if let Ok(p) = a.parse::<u32>() {
+        set_auto_compact_pct(p);
+        serial_println!("auto-compact> {}%", auto_compact_pct());
+    } else {
+        serial_println!("auto-compact> usage: /auto-compact <50-99>|off");
+    }
+}
+
+fn run_context(arg: &str) {
+    let _ = arg;
+    let effort = reasoning_effort();
+    serial_println!("context> mode={}  effort={}  auto-compact={}%",
+        match approval_mode() {
+            ApprovalMode::Manual => "manual",
+            ApprovalMode::Auto => "auto",
+            ApprovalMode::Bypass => "bypass",
+            ApprovalMode::Plan => "plan",
+        },
+        if effort.is_empty() { "default" } else { effort.as_str() },
+        auto_compact_pct(),
+    );
+    serial_println!(
+        "context> tools: run_shell_command, search_replace, list_dir, grep, web_search/fetch, ask_user_question, monitor/task_output"
+    );
+    serial_println!("context> plan file: use /view-plan when in a session; enter_plan_mode seeds plan.md");
+    serial_println!("context> mid-turn: type a line + Enter while agent runs to queue a follow-up (/btw ok)");
+}
+
+fn run_view_plan(arg: &str) {
+    // Prefer live orchestrator session id if available via a soft path:
+    // plan files are `/sessions/<id>/plan.md` — list recent when arg empty.
+    let arg = arg.trim();
+    if !arg.is_empty() {
+        if let Ok(id) = arg.parse::<u64>() {
+            let path = crate::agent::prompt::plan_file_path(id);
+            match crate::synapse::fs::read(&path) {
+                Some(b) => {
+                    let t = alloc::string::String::from_utf8_lossy(&b);
+                    serial_println!("plan> {path}\n{t}");
+                }
+                None => serial_println!("plan> no plan at {path}"),
+            }
+            return;
+        }
+    }
+    // Fall back: show plan for session id 1 if present, else hint.
+    let path = crate::agent::prompt::plan_file_path(1);
+    match crate::synapse::fs::read(&path) {
+        Some(b) => {
+            let t = alloc::string::String::from_utf8_lossy(&b);
+            serial_println!("plan> {path} (session 1; pass /view-plan <id> for another)\n{t}");
+        }
+        None => serial_println!(
+            "plan> no plan.md yet — enter plan mode (/plan or enter_plan_mode) then write the plan"
+        ),
+    }
+}
+
 /// `/mode manual|auto|bypass|plan` — set (or show) the approval mode.
 fn run_mode(arg: &str) {
     use core::sync::atomic::Ordering;
@@ -3166,8 +3415,16 @@ fn execute_chat_tool(
     // Plan mode enter/exit — human or agent can toggle without Router.
     if name == "enter_plan_mode" {
         set_plan_mode(true);
-        return String::from(
-            "ok: plan mode on — only read-only tools + todos/skills + the session plan file until exit_plan_mode",
+        let plan_path = crate::agent::prompt::plan_file_path(session.id.0);
+        // Seed an empty plan template if missing.
+        if crate::synapse::fs::read(&plan_path).is_none() {
+            let seed = "# Plan\n\n## Goal\n\n## Steps\n1. \n\n## Risks\n\n";
+            let _ = crate::synapse::fs::write(&plan_path, seed.as_bytes());
+        }
+        return alloc::format!(
+            "ok: plan mode on — write the plan to {plan_path} (write/edit/search_replace allowed only there). \
+             Read-only tools + todos/skills elsewhere. Call exit_plan_mode when ready for human approval. \
+             Human: /view-plan to preview."
         );
     }
     if name == "exit_plan_mode" {
@@ -3214,6 +3471,21 @@ fn execute_chat_tool(
         Some(ToolBinding::Shell { command, destructive }) => {
             (alloc::format!("/{command}"), *destructive, false)
         }
+        Some(ToolBinding::RunShellCommand) => {
+            let cmd = crate::session::todo::json_str(&args_json, "command").unwrap_or_default();
+            let dest = crate::tools::shell_cmd::parse_command_line(&cmd)
+                .map(|(n, _)| {
+                    crate::tools::registry::get(&n)
+                        .map(|d| {
+                            matches!(d.binding, ToolBinding::Shell { destructive: true, .. })
+                        })
+                        .unwrap_or(false)
+                        || matches!(n.as_str(), "rm" | "mkext4" | "install")
+                })
+                .unwrap_or(false);
+            (alloc::format!("run_shell_command {cmd}"), dest, false)
+        }
+        Some(ToolBinding::SearchReplace) => (String::from("search_replace"), true, false),
         Some(ToolBinding::Mcp { server, tool }) => {
             (alloc::format!("mcp:{server}/{tool}"), true, true)
         }
@@ -3444,8 +3716,8 @@ fn plan_mode_write_gate(name: &str, args_json: &str, session_id: u64) -> Option<
     if crate::tools::permissions::is_readonly_tool(name) {
         return None;
     }
-    // Allow write/edit only to plan.md for this session.
-    if matches!(name, "write" | "edit") {
+    // Allow write/edit/search_replace only to plan.md for this session.
+    if matches!(name, "write" | "edit" | "search_replace") {
         let path = crate::session::todo::json_str(args_json, "path")
             .or_else(|| crate::session::todo::json_str(args_json, "file"))
             .unwrap_or_default();
@@ -3641,6 +3913,7 @@ impl ChatSession {
         // counters here so this ceiling is the real bound; the human (Ctrl+C)
         // owns everything above it.
         const MAX_TOOLS_PER_TURN: u32 = 16;
+        CHAT_BUSY.store(true, core::sync::atomic::Ordering::Relaxed);
         self.cancelled = false;
         self.last_thought_secs = 0.0;
         let turn_t0 = crate::arch::now_ms();
@@ -3667,6 +3940,7 @@ impl ChatSession {
             let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
             print_turn_footer(self.last_thought_secs, worked);
             let _ = crate::session::save(session);
+            finish_chat_turn(self, session);
             return alloc::string::String::new();
         }
         // Repeat guard: identical multi-tool batch already has its output.
@@ -3678,6 +3952,7 @@ impl ChatSession {
         let remaining = limits.max_tool_calls.saturating_sub(session.budget.tool_calls_used);
         if remaining == 0 {
             serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
+            finish_chat_turn(self, session);
             return alloc::string::String::from("stopped: tool-call budget exhausted");
         }
         let max_this_turn = MAX_TOOLS_PER_TURN.min(remaining);
@@ -3687,6 +3962,7 @@ impl ChatSession {
                 let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
                 print_turn_footer(self.last_thought_secs, worked);
                 let _ = crate::session::save(session);
+                finish_chat_turn(self, session);
                 return alloc::string::String::from("stopped: tool-call budget exhausted");
             }
             // No speaker stamp (agent message); MD streams without prefix.
@@ -3695,6 +3971,7 @@ impl ChatSession {
                 let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
                 print_turn_footer(self.last_thought_secs, worked);
                 let _ = crate::session::save(session);
+                finish_chat_turn(self, session);
                 return text;
             }
             let batch = parse_tool_calls(&text);
@@ -3723,6 +4000,7 @@ impl ChatSession {
                 let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
                 print_turn_footer(self.last_thought_secs, worked);
                 let _ = crate::session::save(session);
+                finish_chat_turn(self, session);
                 return text;
             }
             if last_batch.as_ref() == Some(&batch) {
@@ -3731,6 +4009,7 @@ impl ChatSession {
                     let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
                     print_turn_footer(self.last_thought_secs, worked);
                     let _ = crate::session::save(session);
+                    finish_chat_turn(self, session);
                     return alloc::string::String::new();
                 }
                 nudged = true;
@@ -3822,9 +4101,13 @@ impl ChatSession {
             self.prefill_committed("user\n", &fb, true);
             if self.cancelled {
                 let _ = crate::session::save(session);
+                finish_chat_turn(self, session);
                 return alloc::string::String::new();
             }
         }
+        // Unreachable: loop always returns; keep busy-flag clean if max tools fell through.
+        finish_chat_turn(self, session);
+        alloc::string::String::new()
     }
 
     /// `/compact` — shrink the live context: the model itself summarizes the
@@ -5365,26 +5648,20 @@ fn run_agent_start(
             let task = crate::service::start(&crate::service::ssh::SSH_SERVICE);
             serial_println!("agents> started 'ssh' service (task {})", task);
         }
-        // UI agents: SOUL + board tools → action pane (no TCP port).
-        "chess" | "ui-chess" => match crate::service::ui_agent::start("chess") {
-            Ok(sid) => {
-                // Focus the board so arrows / Enter work without an extra click.
-                #[cfg(not(test))]
-                crate::framebuffer::focus_set(true);
-                serial_println!(
-                    "agents> started 'chess' UI agent (surface {sid}) — arrows move cursor, Enter selects (click also works)"
-                );
-            }
-            Err(e) => serial_println!("agents> chess start failed: {e}"),
-        },
-        "stop-chess" | "chess-stop" => {
-            crate::service::ui_agent::stop();
-            serial_println!("agents> chess UI agent stopped");
-        }
-        // Package UI apps (logic in tools.wasm only — package_ui is generic).
-        "paint" | "slides" | "minesweeper" | "mines" | "snake" => {
-            let pkg = if name == "mines" { "minesweeper" } else { name };
-            crate::service::ui_agent::stop();
+        // Package UI apps (logic in tools.wasm only — package_ui is generic;
+        // chess is just another package: rules + board UI + agent-opponent ask
+        // all live in its tools.wasm).
+        "chess" | "ui-chess" | "paint" | "slides" | "minesweeper" | "mines" | "snake" | "synth"
+        | "calc" | "clock" | "files" | "gallery" | "sheets" | "calendar" | "contacts" | "writer"
+        | "archive" | "hex" | "game2048" | "activity" | "weather" | "settings" | "dict" | "diff"
+        | "breakout" | "tetris" | "console" | "maps" | "radio" | "sandbox-lab" | "sandbox" => {
+            // "sandbox" alias → sandbox-lab package
+            let pkg = match name {
+                "mines" => "minesweeper",
+                "ui-chess" => "chess",
+                "sandbox" => "sandbox-lab",
+                other => other,
+            };
             match crate::service::package_ui::start(pkg) {
                 Ok(sid) => {
                     #[cfg(not(test))]
@@ -5405,12 +5682,15 @@ fn run_agent_start(
                 Err(e) => serial_println!("agents> {pkg} start failed: {e}"),
             }
         }
-        "stop-paint" | "stop-slides" | "stop-minesweeper" | "stop-snake" | "stop-package" => {
+        "stop-chess" | "chess-stop" | "stop-paint" | "stop-slides" | "stop-minesweeper"
+        | "stop-snake" | "stop-synth" | "stop-package" | "stop-ui" => {
             crate::service::package_ui::stop();
             serial_println!("agents> package UI stopped");
         }
-        "notes" | "synth" | "download" | "todo" | "browser" => {
-            // Chat-only package agents (browser paints via host tools, not package_ui).
+        "notes" | "download" | "todo" | "browser" | "librarian" | "researcher" | "ops"
+        | "onboard" | "store" | "mail" | "disk" | "pass" | "recorder" | "reader" | "media"
+        | "pdf" => {
+            // Chat-only (or SOUL+tools) package agents — no package_ui surface.
             if let Some(id) = crate::agent::system::list()
                 .into_iter()
                 .find(|(n, _)| *n == name)
@@ -5437,7 +5717,7 @@ fn run_agent_start(
                 Some(h) => h,
                 None => {
                     serial_println!(
-                        "agents> unknown agent '{}' (try: doc, ssh, chess, media, pdf, download, notes, todo, browser, paint, slides, minesweeper, snake, synth)",
+                        "agents> unknown agent '{}' (try: /agents list; UI apps include calc files tetris breakout console maps radio sandbox-lab …)",
                         name
                     );
                     return;
@@ -6059,80 +6339,41 @@ fn media_focused() -> Option<crate::framebuffer::RightMode> {
     }
 }
 
-/// True when the focused action tab is the running UI agent board (chess…).
+/// True when the focused action tab is the running package-UI app's surface
+/// (minesweeper, snake, paint, slides, synth).
 #[cfg(all(not(feature = "server"), not(test)))]
-fn ui_agent_focused() -> bool {
+fn package_ui_focused() -> bool {
     if !crate::framebuffer::focus_is_action() {
         return false;
     }
-    // While the agent is thinking, still "focused" but keys are no-ops (busy).
     match crate::framebuffer::right_mode() {
-        crate::framebuffer::RightMode::Surface(id) => crate::service::ui_agent::owns_surface(id),
+        crate::framebuffer::RightMode::Surface(id) => crate::service::package_ui::owns_surface(id),
         _ => false,
     }
 }
 #[cfg(not(all(not(feature = "server"), not(test))))]
-fn ui_agent_focused() -> bool {
+fn package_ui_focused() -> bool {
     false
 }
 
-/// Enter / Esc while the UI agent board is focused: activate or clear selection.
-/// Consumes keys even when busy so they do not leak into the chat line.
+/// Printable / Enter keys while a package-UI app is focused: forward to the
+/// app's wasm `on_key` (snake steering, mines flag, paint palette, synth keys).
 #[cfg(all(not(feature = "server"), not(test)))]
-fn ui_agent_key(c: u8) -> bool {
-    if !ui_agent_focused() {
-        return false;
-    }
-    if crate::service::ui_agent::is_busy() {
-        return matches!(c, b'\r' | b'\n');
-    }
-    match c {
-        b'\r' | b'\n' => {
-            crate::service::ui_agent::activate_cursor();
-            true
-        }
-        // Esc is handled via CSI bare-escape path; this covers rare drivers.
-        _ => false,
-    }
+fn package_ui_key(c: u8) -> bool {
+    package_ui_focused() && crate::service::package_ui::key(c)
 }
 #[cfg(not(all(not(feature = "server"), not(test))))]
-fn ui_agent_key(_c: u8) -> bool {
+fn package_ui_key(_c: u8) -> bool {
     false
 }
 
-/// Arrow keys while the UI agent board is focused: move the board cursor.
-/// CSI finals: A=↑ B=↓ C=→ D=← (rank increases upward on a standard diagram).
-/// While busy, arrows are swallowed (do not scroll the action pane / chat).
+/// Arrow keys while a package-UI app is focused: forward to wasm `on_key`.
 #[cfg(all(not(feature = "server"), not(test)))]
-fn ui_agent_nav(fin: u8) -> bool {
-    if !ui_agent_focused() {
-        return false;
-    }
-    if crate::service::ui_agent::is_busy() {
-        return matches!(fin, b'A' | b'B' | b'C' | b'D');
-    }
-    match fin {
-        b'A' => {
-            crate::service::ui_agent::nudge_cursor(0, 1);
-            true
-        }
-        b'B' => {
-            crate::service::ui_agent::nudge_cursor(0, -1);
-            true
-        }
-        b'C' => {
-            crate::service::ui_agent::nudge_cursor(1, 0);
-            true
-        }
-        b'D' => {
-            crate::service::ui_agent::nudge_cursor(-1, 0);
-            true
-        }
-        _ => false,
-    }
+fn package_ui_nav(fin: u8) -> bool {
+    package_ui_focused() && crate::service::package_ui::nav(fin)
 }
 #[cfg(not(all(not(feature = "server"), not(test))))]
-fn ui_agent_nav(_fin: u8) -> bool {
+fn package_ui_nav(_fin: u8) -> bool {
     false
 }
 
@@ -6140,8 +6381,10 @@ fn ui_agent_nav(_fin: u8) -> bool {
 /// was consumed (so `read_line` shouldn't treat it as chat input).
 #[cfg(all(not(feature = "server"), not(test)))]
 fn media_key(c: u8) -> bool {
-    // UI agent board owns keys before image-viewer heuristics (same Surface tab).
-    if ui_agent_key(c) {
+    // Package-UI apps (chess/snake/mines/paint/synth…) own keys on their
+    // surface — the app's wasm decides what a key means and only consumes the
+    // ones it handles.
+    if package_ui_key(c) {
         return true;
     }
     match media_focused() {
@@ -6177,7 +6420,7 @@ fn media_key(c: u8) -> bool {
             _ => false,
         },
         Some(crate::framebuffer::RightMode::Surface(id))
-            if id != VIDEO_SURFACE && !crate::service::ui_agent::owns_surface(id) =>
+            if id != VIDEO_SURFACE && !crate::service::package_ui::owns_surface(id) =>
         {
             match c {
                 b'+' | b'=' | b'-' | b'_' | b'r' | b'R' | b'l' | b'L' | b'0' => {
@@ -6225,8 +6468,9 @@ fn media_key(_c: u8) -> bool {
 #[cfg(all(not(feature = "server"), not(test)))]
 fn media_nav(fin: u8, steps: usize) -> bool {
     let steps = steps.max(1) as i64;
-    // Chess / UI agent board: arrows move the selection cursor (not image pan).
-    if ui_agent_nav(fin) {
+    // Package-UI apps (chess/snake/mines…): arrows steer the app, not the
+    // image viewer; the wasm only consumes arrows it handles.
+    if package_ui_nav(fin) {
         return true;
     }
     match media_focused() {
@@ -6256,7 +6500,7 @@ fn media_nav(fin: u8, steps: usize) -> bool {
             _ => false,
         },
         Some(crate::framebuffer::RightMode::Surface(id))
-            if id != VIDEO_SURFACE && !crate::service::ui_agent::owns_surface(id) =>
+            if id != VIDEO_SURFACE && !crate::service::package_ui::owns_surface(id) =>
         {
             match fin {
                 b'A' | b'B' | b'C' | b'D' => {
@@ -6420,12 +6664,8 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                 editor_feed(b);
             }
             Some(b'\r') | Some(b'\n') => {
-                // Focused UI agent board: Enter activates the cursor square
-                // (select / move) instead of submitting the chat line.
-                if ui_agent_key(b'\r') {
-                    continue;
-                }
-                // Focused browser form input: Enter submits its form, not chat.
+                // Focused browser form input: Enter submits its form, not chat
+                // (also a focused package app: Enter activates, e.g. chess).
                 if media_key(b'\r') {
                     continue;
                 }
@@ -6485,10 +6725,6 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                         continue;
                     }
                     if media_key(0x1b) {
-                        continue;
-                    }
-                    if ui_agent_focused() {
-                        crate::service::ui_agent::clear_selection();
                         continue;
                     }
                     if fb_editor_active() {
@@ -6905,7 +7141,9 @@ fn ui_tick() {
                                     serial_println!("browser> {}", out);
                                 }
                             }
-                        } else if crate::service::ui_agent::active_surface() == Some(sid) {
+                        } else if crate::service::package_ui::owns_surface(sid) {
+                            // A package-UI app (chess/mines/paint/…): queue the
+                            // click; the runtime's tick drains it into the wasm.
                             crate::synapse::ui::push_event(
                                 sid,
                                 crate::synapse::ui::UiEvent::Click { x: sx, y: sy },
@@ -7025,6 +7263,12 @@ fn repaint_active_tab() {
         // wiping Google/etc. to a blank dark pane after every tab/status tick.
         crate::framebuffer::RightMode::Surface(id) if id == BROWSER_SURFACE || id == crate::framebuffer::BROWSER_SURFACE => {
             let _ = browser_repaint();
+        }
+        // A package-UI app (chess, games): re-present from its own backing
+        // buffer (a resize/tab-switch otherwise fell through to the image
+        // viewer and blanked the pane).
+        crate::framebuffer::RightMode::Surface(id) if crate::service::package_ui::owns_surface(id) => {
+            crate::synapse::ui::represent(id);
         }
         crate::framebuffer::RightMode::Surface(_) => repaint_image(),
         crate::framebuffer::RightMode::Editor => crate::editor::repaint(),
@@ -7172,14 +7416,17 @@ fn refresh_top() {
 /// can run longer than ~50 ms — the standing UI rule.
 pub fn upkeep() {
     ui_tick();
-    // UI agents (Chess…): drain surface events → board tools.
-    crate::service::ui_agent::tick();
+    // Package-UI apps (chess, games…): surface events + guest tick.
     crate::service::package_ui::tick();
     crate::net::poll();
     crate::service::supervise_tick();
     // External messaging channels (Telegram, …) — short non-blocking poll.
     crate::msgchan::tick();
+    // Background agent jobs (run_shell_command background + monitor).
+    crate::tools::bg::pump();
     thinking_tick();
+    // Mid-turn interjection: buffer non-cancel keystrokes into a follow-up queue.
+    drain_followup_keys();
 }
 
 /// Lighter upkeep for loops that consume their own mouse events (modals, the

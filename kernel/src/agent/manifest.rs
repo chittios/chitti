@@ -41,6 +41,16 @@ pub fn orchestrator_manifest() -> AgentManifest {
             "search".into(),
             "glob".into(),
             "grep".into(),
+            "list_dir".into(),
+            "search_replace".into(),
+            "run_shell_command".into(),
+            "task_output".into(),
+            "kill_task".into(),
+            "monitor".into(),
+            "list_tasks".into(),
+            "ask_user_question".into(),
+            "web_search".into(),
+            "web_fetch".into(),
             "run".into(),
             "spawn_subagent".into(),
             "todo_write".into(),
@@ -388,6 +398,7 @@ pub fn primitives_for(caps: &[CapabilityRequest]) -> Vec<PrimitiveId> {
                     prims.push(registry::UI_DRAW);
                     prims.push(registry::BOARD_SET);
                     prims.push(registry::BOARD_MARK);
+                    prims.push(registry::UI_HUD);
                 }
                 if c.rights.contains(Rights::DELETE) {
                     prims.push(registry::UI_SURFACE_CLOSE);

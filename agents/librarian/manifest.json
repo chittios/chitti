@@ -1,0 +1,39 @@
+{
+  "name": "librarian",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Personal knowledge base over notes/memory/pdf paths.",
+  "toolset": [
+    "memory_add",
+    "memory_get",
+    "memory_list",
+    "memory_search",
+    "notes_list",
+    "notes_get",
+    "notes_set",
+    "read",
+    "list",
+    "search",
+    "emit_result"
+  ],
+  "capabilities": [
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list"
+      ],
+      "scope": "home"
+    },
+    {
+      "domain": "todo",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    }
+  ],
+  "autostart": false
+}

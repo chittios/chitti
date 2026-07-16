@@ -1,0 +1,47 @@
+{
+  "name": "researcher",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Web research with attenuated net + browser tools.",
+  "toolset": [
+    "http",
+    "browser_open",
+    "browser_text",
+    "browser_links",
+    "browser_status",
+    "download",
+    "memory_add",
+    "memory_get",
+    "memory_list",
+    "emit_result"
+  ],
+  "capabilities": [
+    {
+      "domain": "net",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "ui",
+      "rights": [
+        "exec",
+        "write",
+        "delete"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list"
+      ],
+      "scope": "home"
+    }
+  ],
+  "autostart": false
+}

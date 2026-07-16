@@ -1,0 +1,58 @@
+{
+  "name": "sandbox-lab",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Capability attenuation demo lab (tools.wasm).",
+  "toolset": [
+    "sandbox_start",
+    "sandbox_home_write",
+    "sandbox_try_escape",
+    "sandbox_child",
+    "sandbox_list",
+    "sandbox_get",
+    "sandbox_status",
+    "spawn_subagent",
+    "memory_list",
+    "emit_result"
+  ],
+  "capabilities": [
+    {
+      "domain": "ui",
+      "rights": [
+        "exec",
+        "write",
+        "delete"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list"
+      ],
+      "scope": "home"
+    },
+    {
+      "domain": "spawn",
+      "rights": [
+        "exec"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "todo",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    }
+  ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "fuel": 2000000
+  },
+  "autostart": false
+}

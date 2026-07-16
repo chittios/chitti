@@ -1,0 +1,30 @@
+{
+  "name": "store",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Agent/app store helper (registry search guidance).",
+  "toolset": [
+    "http",
+    "memory_list",
+    "emit_result"
+  ],
+  "capabilities": [
+    {
+      "domain": "net",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "list"
+      ],
+      "scope": "home"
+    }
+  ],
+  "autostart": false
+}

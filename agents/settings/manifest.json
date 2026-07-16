@@ -1,0 +1,45 @@
+{
+  "name": "settings",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Settings panel (prefs in storage; tools.wasm).",
+  "toolset": [
+    "settings_start",
+    "settings_get",
+    "settings_set",
+    "settings_status"
+  ],
+  "capabilities": [
+    {
+      "domain": "ui",
+      "rights": [
+        "exec",
+        "write",
+        "delete"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list"
+      ],
+      "scope": "home"
+    },
+    {
+      "domain": "todo",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    }
+  ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "fuel": 2000000
+  },
+  "autostart": false
+}

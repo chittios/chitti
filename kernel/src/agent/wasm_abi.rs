@@ -2,10 +2,11 @@
 //!
 //! # Why
 //!
-//! Chess-specific `match` arms in `ui_agent` do not scale. Agents should ship
+//! App-specific `match` arms in kernel runtimes do not scale. Agents ship
 //! deterministic guest code (`assets/tools.wasm`) that implements tools like
 //! `chess_legal`, while **all effects** (draw, storage) go through capability-
-//! gated **host imports** — same determinism boundary as Synapse.
+//! gated **host imports** — same determinism boundary as Synapse. The generic
+//! runtime is `service::package_ui` (one persistent instance per running app).
 //!
 //! # Call graph
 //!
@@ -53,80 +54,6 @@
 
 use crate::agent::wasm_rt::{self, HostBindings, Limits};
 use alloc::string::String;
-use alloc::vec::Vec;
-
-/// How a named tool is implemented for a running UI / package agent.
-#[derive(Clone, Debug)]
-pub enum ToolBackend {
-    /// Built-in host tool (Synapse primitive or storage API).
-    Host {
-        /// Canonical tool name (`board_set`, `storage_get`, …).
-        name: String,
-    },
-    /// Guest export (W1+). `module_path` is under the agent home.
-    Wasm {
-        name: String,
-        /// e.g. `assets/tools.wasm`
-        module_path: String,
-        /// Export function name inside the module.
-        export: String,
-        /// Instruction fuel budget for one call (0 = engine default).
-        fuel: u64,
-    },
-}
-
-impl ToolBackend {
-    pub fn name(&self) -> &str {
-        match self {
-            ToolBackend::Host { name } | ToolBackend::Wasm { name, .. } => name,
-        }
-    }
-}
-
-/// Default host tool table for UI agents (generic surface + storage).
-pub fn default_ui_host_tools() -> Vec<ToolBackend> {
-    [
-        "ui_surface_request",
-        "ui_draw",
-        "ui_event_poll",
-        "ui_surface_close",
-        "board_set",
-        "board_mark",
-        "storage_get",
-        "storage_set",
-        "storage_list",
-        "storage_remove",
-        "memory_add",
-        "memory_get",
-        "memory_list",
-    ]
-    .into_iter()
-    .map(|n| ToolBackend::Host { name: n.into() })
-    .collect()
-}
-
-/// Chess package tool table: host UI/storage + WASM rule exports.
-pub fn chess_package_tools() -> Vec<ToolBackend> {
-    let mut t = default_ui_host_tools();
-    t.push(ToolBackend::Wasm {
-        name: "chess_legal".into(),
-        module_path: "assets/tools.wasm".into(),
-        export: "chess_legal".into(),
-        fuel: 2_000_000,
-    });
-    t.push(ToolBackend::Wasm {
-        name: "chess_try_move".into(),
-        module_path: "assets/tools.wasm".into(),
-        export: "chess_try_move".into(),
-        fuel: 2_000_000,
-    });
-    t
-}
-
-/// Resolve a tool name against a backend table.
-pub fn lookup<'a>(table: &'a [ToolBackend], name: &str) -> Option<&'a ToolBackend> {
-    table.iter().find(|b| b.name() == name)
-}
 
 /// Invoke a WASM tool export with the string ABI (`(i32,i32)->(i32,i32)`).
 ///

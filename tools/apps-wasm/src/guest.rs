@@ -47,13 +47,25 @@ extern "C" {
     pub fn host_storage_remove(scope: i32, k: i32, kl: i32) -> i32;
     pub fn host_storage_list(scope: i32, out: i32, cap: i32) -> i32;
     pub fn host_ui_draw(ops: i32, olen: i32) -> i32;
+    pub fn host_hud_set(text_ptr: i32, text_len: i32) -> i32;
     pub fn host_surface_id() -> i32;
     pub fn host_now_ms() -> i64;
     pub fn host_log(p: i32, l: i32);
     pub fn host_sound_play(hz: i32, ms: i32) -> i32;
 }
 
+/// Reset the bump allocator. Called at the start of every host→guest call
+/// cycle (the host invokes `chitti_alloc` exactly once, for the args buffer,
+/// before each export call): the previous call's result has already been copied
+/// out by then, and no app state lives on this heap (statics are plain
+/// arrays/ints), so recycling is safe. This is what lets one wasm instance
+/// stay alive for a whole app session without leaking its 96 KB heap.
+pub fn heap_reset() {
+    HEAP_OFF.store(0, Ordering::Relaxed);
+}
+
 pub fn chitti_alloc(size: i32) -> i32 {
+    heap_reset();
     if size <= 0 {
         return 0;
     }
@@ -175,6 +187,17 @@ pub fn storage_remove_durable(key: &str) -> i32 {
 
 pub fn sound_play(hz: i32, ms: i32) -> i32 {
     unsafe { host_sound_play(hz, ms) }
+}
+
+pub fn now_ms() -> i64 {
+    unsafe { host_now_ms() }
+}
+
+/// Optional HUD strip (status + shortcuts, '\\n'-separated). Available when the
+/// host binds `host_hud_set` (same as chess-wasm).
+pub fn hud_set(text: &str) -> i32 {
+    let b = text.as_bytes();
+    unsafe { host_hud_set(b.as_ptr() as i32, b.len() as i32) }
 }
 
 pub use result_string as export;

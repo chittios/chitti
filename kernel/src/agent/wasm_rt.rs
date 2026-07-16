@@ -549,6 +549,32 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
     linker
         .func_wrap(
             "chitti",
+            "host_hud_set",
+            |caller: Caller<'_, HostState>, text_ptr: i32, text_len: i32| -> i32 {
+                // Empty (len 0) clears the HUD; a null/oob ptr is an error.
+                let text = if text_len == 0 {
+                    String::new()
+                } else {
+                    match read_guest_str(&caller, text_ptr, text_len) {
+                        Some(t) => t,
+                        None => return -1,
+                    }
+                };
+                let bind = caller.data().bind;
+                if bind.task == 0 || bind.surface == 0 {
+                    return -2;
+                }
+                match syn_ui_hud(bind.task, bind.surface, &text) {
+                    true => 0,
+                    false => -1,
+                }
+            },
+        )
+        .map_err(|_| "define host_hud_set")?;
+
+    linker
+        .func_wrap(
+            "chitti",
             "host_surface_id",
             |caller: Caller<'_, HostState>| -> i32 { caller.data().bind.surface as i32 },
         )
@@ -669,6 +695,15 @@ fn syn_board_mark(task: TaskId, surface: u32, squares: &str, color: &str) -> boo
     let raw = format!(
         r#"{{"name":"board_mark","arguments":{{"surface":{surface},"squares":"{squares}","color":"{color}"}}}}"#
     );
+    matches!(
+        crate::synapse::execute(task, &raw),
+        crate::synapse::Invocation::Executed { result, .. } if result.starts_with("ok:")
+    )
+}
+
+fn syn_ui_hud(task: TaskId, surface: u32, text: &str) -> bool {
+    let esc = text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+    let raw = format!(r#"{{"name":"ui_hud","arguments":{{"surface":{surface},"text":"{esc}"}}}}"#);
     matches!(
         crate::synapse::execute(task, &raw),
         crate::synapse::Invocation::Executed { result, .. } if result.starts_with("ok:")
@@ -868,7 +903,7 @@ mod tests {
         assert!(validate_module(wasm).is_ok());
         let args = format!(
             r#"{{"fen":"{}","from":"e2"}}"#,
-            crate::service::chess_rules::START_FEN
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
         );
         let out = call_string_bound(
             wasm,

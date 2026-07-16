@@ -21,6 +21,12 @@ pub const Q4_1_BLOCK_BYTES: usize = 2 + 2 + QK / 2; // f16 d + f16 min + 16 nibb
 pub const Q5_0_BLOCK_BYTES: usize = 2 + 4 + QK / 2; // f16 d + qh[4] + 16 nibbles = 22
 pub const Q5_1_BLOCK_BYTES: usize = 2 + 2 + 4 + QK / 2; // f16 d + f16 m + qh[4] + 16 nibbles = 24
 
+// PrismML ternary block (GGML type 42, `Q2_0`): 128 elements, one f16 scale
+// + 128 2-bit codes (Ternary-Bonsai / Bonsai-27B `Q2_0` weights and the
+// drafter's `type42` embedding — both this exact layout).
+pub const QK2_0: usize = 128; // elements per Q2_0 block
+pub const Q2_0_BLOCK_BYTES: usize = 2 + QK2_0 / 4; // f16 scale + 128*2 bits = 34
+
 // k-quant super-block: 256 elements. Byte layouts verbatim from llama.cpp
 // (ggml-common.h). Mixed-quant GGUFs (Q4_K_M/Q5_K_M/UD-* files) tag these
 // per tensor.
@@ -142,6 +148,22 @@ pub fn dequant_q4_1_block(block: &[u8], out: &mut [f32]) {
         let byte = block[4 + j];
         out[j] = d * (byte & 0x0f) as f32 + m;
         out[j + QK / 2] = d * (byte >> 4) as f32 + m;
+    }
+}
+
+/// Dequantize one Q2_0 block (`Q2_0_BLOCK_BYTES`) into 128 `f32`s. PrismML's
+/// ternary pack (GGML type 42, shipped by `Ternary-Bonsai`/`Bonsai-27B`): one
+/// f16 scale `d` followed by 128 2-bit codes, four per byte, low bits first.
+/// Code `c` (0..3) dequantizes to `(c - 1) * d`, i.e. `00 → -1`, `01 → 0`,
+/// `10 → +1`, `11 → +2` scaled by `d` (matches llama.cpp `dequantize_row_q2_0`).
+pub fn dequant_q2_0_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), Q2_0_BLOCK_BYTES);
+    debug_assert_eq!(out.len(), QK2_0);
+    let d = read_f16_le(&block[0..2]);
+    for j in 0..QK2_0 {
+        let byte = block[2 + j / 4];
+        let code = ((byte >> ((j % 4) * 2)) & 0x03) as i32;
+        out[j] = d * (code - 1) as f32;
     }
 }
 
@@ -1633,6 +1655,8 @@ pub const QT_IQ3_S: u32 = 21;
 pub const QT_IQ2_S: u32 = 22;
 pub const QT_IQ4_XS: u32 = 23;
 pub const QT_BF16: u32 = 30;
+/// PrismML ternary pack (`Ternary-Bonsai`/`Bonsai-27B`); 128-elem 2-bit blocks.
+pub const QT_Q2_0: u32 = 42;
 
 /// Bytes per quantization block and elements per block for a quant type.
 pub fn block_layout(qt: u32) -> (usize, usize) {
@@ -1657,6 +1681,7 @@ pub fn block_layout(qt: u32) -> (usize, usize) {
         QT_IQ4_NL => (IQ4_NL_BLOCK_BYTES, QK),
         QT_IQ4_XS => (IQ4_XS_BLOCK_BYTES, QK_K),
         QT_BF16 => (BF16_BLOCK_BYTES, QK),
+        QT_Q2_0 => (Q2_0_BLOCK_BYTES, QK2_0),
         _ => (0, 0),
     }
 }
@@ -1685,6 +1710,7 @@ pub fn dequant_block(qt: u32, block: &[u8], out: &mut [f32]) {
         QT_IQ4_NL => dequant_iq4_nl_block(block, out),
         QT_IQ4_XS => dequant_iq4_xs_block(block, out),
         QT_BF16 => dequant_bf16_block(block, out),
+        QT_Q2_0 => dequant_q2_0_block(block, out),
         _ => {}
     }
 }
@@ -2102,6 +2128,32 @@ mod tests {
             assert!((out[j] - want_lo).abs() < 1e-6, "q4_0 lo idx {j}: got {} want {want_lo}", out[j]);
             assert!((out[16 + j] - want_hi).abs() < 1e-6, "q4_0 hi idx {j}: got {} want {want_hi}", out[16 + j]);
         }
+    }
+
+    /// A Q2_0 block is `[d: f16][qs: 32 bytes]`, four 2-bit codes per byte
+    /// (low bits first); code `c` dequantizes to `(c-1)*d`. With d=1.0 and the
+    /// codes cycling 0,1,2,3 the expected values are exactly -1,0,1,2 — pinning
+    /// both the code→value map and the little-endian bit-packing order (a
+    /// swapped order fails by whole integers, not epsilon).
+    #[test_case]
+    fn dequant_q2_0_codes_and_packing() {
+        let mut block = [0u8; Q2_0_BLOCK_BYTES];
+        block[..2].copy_from_slice(&F16_ONE);
+        for byte in block[2..].iter_mut() {
+            // codes for the four elements in this byte: 0,1,2,3 (low→high)
+            *byte = 0 | (1 << 2) | (2 << 4) | (3 << 6); // 0xE4
+        }
+        let mut out = [0.0f32; QK2_0];
+        dequant_q2_0_block(&block, &mut out);
+        for j in 0..QK2_0 {
+            let want = (j % 4) as f32 - 1.0; // 0,1,2,3 -> -1,0,1,2
+            assert!((out[j] - want).abs() < 1e-6, "q2_0 idx {j}: got {} want {want}", out[j]);
+        }
+        // block_layout / dequant_block dispatch must agree with the direct fn.
+        assert_eq!(block_layout(QT_Q2_0), (Q2_0_BLOCK_BYTES, QK2_0));
+        let mut out2 = [0.0f32; QK2_0];
+        dequant_block(QT_Q2_0, &block, &mut out2);
+        assert_eq!(out, out2);
     }
 
     /// Build `rows x cols` of random Q8_0 blocks + a random activation, and

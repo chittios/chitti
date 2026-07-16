@@ -11,14 +11,12 @@
 //! (accept a connection, copy bytes, parse a protocol) is native and audited at
 //! the Synapse boundary exactly like any other effect.
 
-pub mod chess_rules;
 pub mod http;
 pub mod network;
 pub mod package_ui;
 pub mod pipeline;
 pub mod server;
 pub mod ssh;
-pub mod ui_agent;
 
 use crate::cap::{self, Right};
 use crate::mm::Locked;

@@ -1,0 +1,45 @@
+{
+  "name": "sheets",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Tiny spreadsheet 4x6 (tools.wasm).",
+  "toolset": [
+    "sheets_start",
+    "sheets_get",
+    "sheets_set",
+    "sheets_status"
+  ],
+  "capabilities": [
+    {
+      "domain": "ui",
+      "rights": [
+        "exec",
+        "write",
+        "delete"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list"
+      ],
+      "scope": "home"
+    },
+    {
+      "domain": "todo",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    }
+  ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "fuel": 2000000
+  },
+  "autostart": false
+}

@@ -3621,6 +3621,43 @@ impl Screen {
     }
 }
 
+/// Draw a multi-option question modal. `focus` is the highlighted option index.
+/// Options are rendered as numbered rows; the footer shows Enter=select Esc=cancel.
+pub fn draw_choose(title: &str, msg: &str, options: &[&str], focus: usize) {
+    MODAL_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.cursor_restore();
+            sc.cur_vis = false;
+            MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
+            let mut body = alloc::string::String::new();
+            if !msg.is_empty() {
+                body.push_str(msg);
+                body.push('\n');
+            }
+            for (i, opt) in options.iter().enumerate() {
+                let mark = if i == focus { ">" } else { " " };
+                body.push_str(&alloc::format!("{mark} {}. {}\n", i + 1, opt));
+            }
+            body.push_str("Enter select  Esc cancel  arrows move");
+            let lines = wrap(&body, sc.modal_cols() as usize);
+            let (ix, iy, _cols) = sc.modal_box(title, lines.len() as u64);
+            let ch = sc.ch();
+            let mut y = iy;
+            for line in &lines {
+                let fg = if line.starts_with('>') {
+                    sc.theme.accent
+                } else {
+                    sc.theme.chat_fg
+                };
+                sc.draw_str(ix, y, line, fg, sc.theme.status_bg);
+                y += ch;
+            }
+            sc.cursor_overlay();
+        }
+    });
+}
+
 /// Draw an approval (yes/no) modal. `focus_yes` highlights the Yes button.
 pub fn draw_confirm(title: &str, msg: &str, focus_yes: bool) {
     MODAL_ON.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -4637,6 +4674,124 @@ pub fn present_surface(id: u32, sw: usize, sh: usize, buf: &[u32]) {
     present_surface_reserve(id, sw, sh, buf, 0);
 }
 
+/// Present a surface plus an optional **HUD** in a reserved pane-space strip.
+/// `hud` is newline-separated: line 0 = status (accent), the rest = hints
+/// (dim, word-wrapped to the pane). The strip is sized to the wrapped content
+/// and rendered with the native console font — crisp and wrapping at any pane
+/// size — instead of being baked into the (upscaled) surface buffer. Empty
+/// `hud` behaves exactly like [`present_surface`].
+pub fn present_surface_hud(id: u32, sw: usize, sh: usize, buf: &[u32], hud: &str) {
+    if hud.trim().is_empty() {
+        present_surface_reserve(id, sw, sh, buf, 0);
+        return;
+    }
+    let reserve = surface_hud_height(hud);
+    present_surface_reserve(id, sw, sh, buf, reserve);
+    draw_surface_hud(id, hud);
+}
+
+/// Height (px) a surface HUD needs: one status line + the wrapped hint lines,
+/// plus a top hairline and small padding — computed at the current pane width.
+fn surface_hud_height(hud: &str) -> u64 {
+    SCREEN.with(|slot| {
+        let Some(sc) = slot.as_ref() else { return 0 };
+        let ch = sc.ch();
+        let cw = sc.cw();
+        let cols = (sc.logs.cols.saturating_sub(2)).max(4) as usize;
+        let _ = cw;
+        let mut lines = 1u64; // status
+        lines += wrapped_hint_lines(hud, cols);
+        // top hairline + half-cell top/bottom padding.
+        (lines * ch) + ch / 2 + 2
+    })
+}
+
+/// Count how many display lines the HUD's hint text (everything after line 0)
+/// wraps to at `cols` columns. Pure-ish (reads only the passed args).
+fn wrapped_hint_lines(hud: &str, cols: usize) -> u64 {
+    let mut it = hud.split('\n');
+    let _status = it.next();
+    let hints: alloc::vec::Vec<&str> = it.collect();
+    if hints.is_empty() {
+        return 0;
+    }
+    // Wrap on word boundaries; a token longer than cols still takes a line.
+    let mut lines = 1u64;
+    let mut col = 0usize;
+    for hint in &hints {
+        for word in hint.split_whitespace() {
+            let wlen = word.chars().count();
+            let need = if col == 0 { wlen } else { col + 1 + wlen };
+            if need > cols && col > 0 {
+                lines += 1;
+                col = wlen;
+            } else {
+                col = need;
+            }
+        }
+        // Each explicit hint line after the first forces a new row.
+        lines += 1;
+        col = 0;
+    }
+    lines.saturating_sub(1).max(1)
+}
+
+/// Render a surface's HUD in the reserved bottom strip of its pane (native
+/// font, wrapping). No-op unless that surface tab is active.
+fn draw_surface_hud(id: u32, hud: &str) {
+    SCREEN.with(|slot| {
+        let Some(sc) = slot else { return };
+        if sc.right != RightMode::Surface(id) {
+            return;
+        }
+        sc.cursor_restore();
+        sc.cur_vis = false;
+        let ch = sc.ch();
+        let cw = sc.cw();
+        let (px, py) = (sc.logs.ix, sc.logs.iy);
+        let (pw, ph) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
+        let barh = surface_hud_height(hud);
+        let by = py + ph.saturating_sub(barh);
+        let bg = sc.logs.bg;
+        sc.fill_rect(px, by, pw, barh, bg);
+        sc.fill_rect(px, by, pw, 1, sc.theme.accent); // top hairline
+        let cols = (pw / cw).saturating_sub(2).max(4) as usize;
+        let fit = |s: &str| crate::textsel::fit_width(s, cols);
+        let mut lines = hud.split('\n');
+        let mut y = by + ch / 3;
+        // Status line (accent).
+        if let Some(status) = lines.next() {
+            sc.draw_str_bg(px + cw, y, &fit(status), sc.theme.accent, bg);
+            y += ch;
+        }
+        // Hint lines (dim), word-wrapped; stop when the strip is full.
+        let hud_bottom = py + ph;
+        let mut linebuf = String::new();
+        let flush = |sc: &mut Screen, y: &mut u64, s: &str| {
+            if *y + ch <= hud_bottom {
+                sc.draw_str_bg(px + cw, *y, &fit(s), sc.theme.logs_fg, bg);
+                *y += ch;
+            }
+        };
+        for hint in lines {
+            for word in hint.split_whitespace() {
+                let cand = if linebuf.is_empty() { String::from(word) } else { alloc::format!("{linebuf} {word}") };
+                if cand.chars().count() > cols && !linebuf.is_empty() {
+                    flush(sc, &mut y, &linebuf);
+                    linebuf = String::from(word);
+                } else {
+                    linebuf = cand;
+                }
+            }
+            if !linebuf.is_empty() {
+                flush(sc, &mut y, &linebuf);
+                linebuf.clear();
+            }
+        }
+        sc.cursor_overlay();
+    });
+}
+
 /// Like [`present_surface`], but leaves `reserve_bottom` px at the bottom of the
 /// pane untouched — the frame is scaled/letterboxed into the region *above* the
 /// reserve and the reserved strip is never cleared. The video player uses this
@@ -5517,6 +5672,25 @@ mod theme_switch_tests {
         p.hist.push_back(alloc::vec![(b'x', fg)]);
         p.recolor_default_fg(fg, fg);
         assert_eq!(p.hist[0][0].1, fg);
+    }
+}
+
+#[cfg(test)]
+mod hud_tests {
+    use super::wrapped_hint_lines;
+
+    #[test_case]
+    fn hud_hint_wrapping_counts_lines() {
+        // No hint text (status only) → zero hint rows.
+        assert_eq!(wrapped_hint_lines("just a status", 40), 0);
+        // One short hint fits on one row.
+        assert_eq!(wrapped_hint_lines("status\nn new", 40), 1);
+        // A long single hint wraps by words to fit narrow columns.
+        let hud = "status\narrows move  enter select  esc clear  n new game";
+        assert_eq!(wrapped_hint_lines(hud, 80), 1, "fits one row when wide");
+        assert!(wrapped_hint_lines(hud, 20) >= 3, "narrow pane wraps to several rows");
+        // Two explicit hint lines are at least two rows.
+        assert!(wrapped_hint_lines("s\nfirst line\nsecond line", 80) >= 2);
     }
 }
 

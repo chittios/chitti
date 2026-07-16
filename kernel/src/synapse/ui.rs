@@ -59,6 +59,11 @@ struct Surface {
     /// Input events the compositor routed to this surface (mouse/keys), drained
     /// by `ui_event_poll`. Empty headless.
     events: VecDeque<UiEvent>,
+    /// Optional HUD text (see [`set_hud`]). Rendered by the compositor in a
+    /// reserved **pane-space** strip below the scaled surface — native crisp
+    /// font, wrapped to the pane width — NOT baked into the scaled backing
+    /// buffer (which would balloon the text with the surface's upscale).
+    hud: alloc::string::String,
 }
 
 /// An input event delivered to a surface's owner.
@@ -83,7 +88,10 @@ pub enum DrawErr {
 pub fn request(owner: TaskId, kind: SurfaceKind) -> u32 {
     let id = NEXT_SURFACE.fetch_add(1, Ordering::SeqCst);
     SURFACES.with(|m| {
-        m.insert(id, Surface { owner, kind, back: vec![0u32; SURF_W * SURF_H], events: VecDeque::new() });
+        m.insert(
+            id,
+            Surface { owner, kind, back: vec![0u32; SURF_W * SURF_H], events: VecDeque::new(), hud: alloc::string::String::new() },
+        );
     });
     id
 }
@@ -174,16 +182,25 @@ pub fn push_event(id: u32, ev: UiEvent) {
 
 // --- the bounded draw-op DSL -------------------------------------------------
 
+/// Longest string a single `text` op may carry (bounded so `DrawOp` stays
+/// `Copy` and a hostile program can't allocate unboundedly).
+const TEXT_MAX: usize = 48;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DrawOp {
     Clear(u32),
     Rect { x: i32, y: i32, w: i32, h: i32, color: u32 },
     Line { x0: i32, y0: i32, x1: i32, y1: i32, color: u32 },
     Pixel { x: i32, y: i32, color: u32 },
+    /// `size` = glyph pixel height (8..=22, nearest-neighbour scaled from the
+    /// 10×22 Geist Mono cell). Bounded inline string keeps the op `Copy`.
+    Text { x: i32, y: i32, size: i32, color: u32, buf: [u8; TEXT_MAX], len: u8 },
 }
 
 /// Parse a `;`-separated draw program: `clear <hex>`, `rect x y w h <hex>`,
-/// `line x0 y0 x1 y1 <hex>`, `pixel x y <hex>`. Colours are RRGGBB hex.
+/// `line x0 y0 x1 y1 <hex>`, `pixel x y <hex>`, and
+/// `text x y size <hex> <string…>` (string = rest of the statement, so it may
+/// contain spaces but never `;`). Colours are RRGGBB hex.
 fn parse_ops(program: &str) -> Result<Vec<DrawOp>, DrawErr> {
     let mut out = Vec::new();
     for stmt in program.split(';') {
@@ -193,6 +210,28 @@ fn parse_ops(program: &str) -> Result<Vec<DrawOp>, DrawErr> {
         }
         let toks: Vec<&str> = stmt.split_whitespace().collect();
         let op = toks[0];
+        // `text` has its own shape (colour mid-statement, free string tail).
+        if op == "text" {
+            if toks.len() < 5 {
+                return Err(DrawErr::BadOp("text needs x y size colour string"));
+            }
+            let x: i32 = toks[1].parse().map_err(|_| DrawErr::BadOp("bad coord"))?;
+            let y: i32 = toks[2].parse().map_err(|_| DrawErr::BadOp("bad coord"))?;
+            let size: i32 = toks[3].parse().map_err(|_| DrawErr::BadOp("bad size"))?;
+            let color = u32::from_str_radix(toks[4], 16).map_err(|_| DrawErr::BadOp("bad colour"))? & 0x00ff_ffff;
+            // The string is the raw remainder after the colour token (keeps
+            // single spaces; a leading/trailing trim is fine for labels).
+            let after = stmt
+                .find(toks[4])
+                .map(|i| stmt[i + toks[4].len()..].trim_start())
+                .unwrap_or("");
+            let mut buf = [0u8; TEXT_MAX];
+            let bytes = after.as_bytes();
+            let len = bytes.len().min(TEXT_MAX);
+            buf[..len].copy_from_slice(&bytes[..len]);
+            out.push(DrawOp::Text { x, y, size: size.clamp(8, 22), color, buf, len: len as u8 });
+            continue;
+        }
         // Grammar: every op ends with an RRGGBB hex colour; the tokens between
         // the op name and the colour are decimal coordinates. Parsing the colour
         // positionally (last token) avoids the ambiguity of an all-digit hex
@@ -257,17 +296,59 @@ fn apply(back: &mut [u32], op: DrawOp) {
             }
         }
         DrawOp::Pixel { x, y, color } => put(back, x, y, color),
+        DrawOp::Text { x, y, size, color, buf, len } => {
+            if let Ok(s) = core::str::from_utf8(&buf[..len as usize]) {
+                draw_text(back, x, y, size, color, s);
+            }
+        }
     }
 }
 
+/// Rasterize `s` at `(x, y)` (top-left of the line box), `size` = px height,
+/// alpha-blending onto whatever the app already painted. Uses the runtime TTF
+/// rasterizer (`font_ttf`, fontdue on the bundled Geist Mono face) so glyphs
+/// are hinted/antialiased **at the requested size** — downscaling the console's
+/// fixed-cell coverage atlas smeared strokes at small sizes.
+fn draw_text(back: &mut [u32], x: i32, y: i32, size: i32, color: u32, s: &str) {
+    let _ = crate::font_ttf::blit_run(back, SURF_W, SURF_H, x, y, s, size as f32, color);
+}
+
 /// Present a surface's backing buffer into the compositor's action pane. A
-/// best-effort side effect; the backing buffer is the source of truth.
+/// best-effort side effect; the backing buffer is the source of truth. If the
+/// surface has HUD text, the compositor reserves a pane-space strip for it
+/// (crisp native font, wrapped) below the scaled surface.
 #[cfg(not(test))]
 fn present(id: u32) {
-    let snap = SURFACES.with(|m| m.get(&id).map(|s| s.back.clone()));
-    if let Some(buf) = snap {
-        crate::framebuffer::present_surface(id, SURF_W, SURF_H, &buf);
+    let snap = SURFACES.with(|m| m.get(&id).map(|s| (s.back.clone(), s.hud.clone())));
+    if let Some((buf, hud)) = snap {
+        crate::framebuffer::present_surface_hud(id, SURF_W, SURF_H, &buf, &hud);
     }
+}
+
+/// Re-present a surface (e.g. after a pane resize / tab switch), from its own
+/// backing buffer — the source of truth. No-op if the surface is gone.
+#[cfg(not(test))]
+pub fn represent(id: u32) {
+    present(id);
+}
+
+/// Set (or clear, with `""`) a surface's HUD text and re-present. Owner-gated.
+/// The text is newline-separated lines: line 0 is the **status** (accent),
+/// remaining lines are **hints** (dim, word-wrapped to the pane width). The
+/// compositor renders it in a reserved strip in pane space — see [`Surface::hud`].
+pub fn set_hud(task: TaskId, id: u32, text: &str) -> Result<(), DrawErr> {
+    SURFACES.with(|m| {
+        let s = m.get_mut(&id).ok_or(DrawErr::NoSuchSurface)?;
+        if s.owner != task {
+            return Err(DrawErr::NotOwner);
+        }
+        s.hud.clear();
+        s.hud.push_str(text);
+        Ok(())
+    })?;
+    #[cfg(not(test))]
+    present(id);
+    Ok(())
 }
 
 // --- Board helpers (chess / grid UI agents) ---------------------------------
@@ -275,9 +356,11 @@ fn present(id: u32) {
 // Pure presentation: FEN / square marks → draw-op programs. Game rules live in
 // the agent's SOUL (or optional later native validators), not here.
 
-/// Square size for an 8×8 board letterboxed into the surface.
+/// Square size for an 8×8 board letterboxed into the surface: 8*24 = 192 px
+/// fills the surface height, centred horizontally. The status/shortcut HUD is
+/// NOT in the surface — it's a reserved pane-space strip (crisp native text,
+/// see [`set_hud`]), so the whole surface is board.
 pub const BOARD_SQ: i32 = 24;
-/// Origin of the board (left/top) so 8*24=192 fits in SURF_H with margin.
 pub const BOARD_OX: i32 = 32;
 pub const BOARD_OY: i32 = 0;
 
@@ -357,63 +440,39 @@ pub fn board_ops_from_fen(fen: &str) -> alloc::string::String {
             ops.push_str(&format!("rect {x} {y} {BOARD_SQ} {BOARD_SQ} {color:06x}; "));
             let piece = grid[rank_top as usize][file as usize];
             if piece != ' ' {
-                let (glyph_color, filled) = piece_style(piece);
-                paint_piece_ops(&mut ops, x, y, piece, glyph_color, filled);
+                let (fill, letter) = piece_style(piece);
+                paint_piece_ops(&mut ops, x, y, piece, fill, letter);
             }
         }
     }
     ops
 }
 
-fn piece_style(p: char) -> (u32, bool) {
-    // White pieces: light fill; black: dark fill.
+/// (fill, letter) colours: white pieces are light chips with dark letters,
+/// black pieces dark chips with light letters — the letter always contrasts
+/// with its own chip, so it reads on both square colours.
+fn piece_style(p: char) -> (u32, u32) {
     if p.is_ascii_uppercase() {
-        (0xf0_f0_f0, true)
+        (0xf0_f0_f0, 0x1a_1a_1a)
     } else {
-        (0x22_22_22, true)
+        (0x22_22_22, 0xe8_e4_df)
     }
 }
 
-/// Very small geometric stand-ins for pieces (no font dependency).
-fn paint_piece_ops(ops: &mut alloc::string::String, x: i32, y: i32, piece: char, color: u32, _filled: bool) {
+/// A piece is a rounded-ish chip with its letter (K Q R B N P) on it — the
+/// letter says WHAT it is, the chip colour says WHOSE it is.
+fn paint_piece_ops(ops: &mut alloc::string::String, x: i32, y: i32, piece: char, fill: u32, letter_color: u32) {
     use alloc::format;
     let cx = x + BOARD_SQ / 2;
     let cy = y + BOARD_SQ / 2;
-    let c = color & 0xff_ffff;
-    // Outline box so empty-ish shapes stay visible on both square colours.
-    match piece.to_ascii_lowercase() {
-        'p' => {
-            // Pawn: small body + head.
-            ops.push_str(&format!("rect {} {} 6 8 {c:06x}; ", cx - 3, cy - 1));
-            ops.push_str(&format!("rect {} {} 4 4 {c:06x}; ", cx - 2, cy - 6));
-        }
-        'r' => {
-            ops.push_str(&format!("rect {} {} 10 12 {c:06x}; ", cx - 5, cy - 5));
-            ops.push_str(&format!("rect {} {} 12 3 {c:06x}; ", cx - 6, cy - 8));
-        }
-        'n' => {
-            ops.push_str(&format!("rect {} {} 8 12 {c:06x}; ", cx - 3, cy - 5));
-            ops.push_str(&format!("rect {} {} 6 4 {c:06x}; ", cx - 1, cy - 8));
-        }
-        'b' => {
-            ops.push_str(&format!("rect {} {} 6 14 {c:06x}; ", cx - 3, cy - 7));
-            ops.push_str(&format!("rect {} {} 10 4 {c:06x}; ", cx - 5, cy - 8));
-        }
-        'q' => {
-            ops.push_str(&format!("rect {} {} 12 10 {c:06x}; ", cx - 6, cy - 3));
-            ops.push_str(&format!("rect {} {} 4 4 {c:06x}; ", cx - 6, cy - 8));
-            ops.push_str(&format!("rect {} {} 4 4 {c:06x}; ", cx + 2, cy - 8));
-            ops.push_str(&format!("rect {} {} 4 4 {c:06x}; ", cx - 2, cy - 10));
-        }
-        'k' => {
-            ops.push_str(&format!("rect {} {} 10 10 {c:06x}; ", cx - 5, cy - 3));
-            ops.push_str(&format!("rect {} {} 4 8 {c:06x}; ", cx - 2, cy - 9));
-            ops.push_str(&format!("rect {} {} 10 3 {c:06x}; ", cx - 5, cy - 6));
-        }
-        _ => {
-            ops.push_str(&format!("rect {} {} 8 8 {c:06x}; ", cx - 4, cy - 4));
-        }
-    }
+    let f = fill & 0xff_ffff;
+    let lc = letter_color & 0xff_ffff;
+    // Chip: 14×16 body with 1-px corner cuts (cheap rounding).
+    ops.push_str(&format!("rect {} {} 14 16 {f:06x}; ", cx - 7, cy - 8));
+    ops.push_str(&format!("rect {} {} 16 14 {f:06x}; ", cx - 8, cy - 7));
+    // Letter, half-ish scale (12 px tall fits the 20-px square).
+    let ch = piece.to_ascii_uppercase();
+    ops.push_str(&format!("text {} {} 12 {lc:06x} {ch}; ", cx - 3, cy - 6));
 }
 
 /// Highlight squares (e.g. `"e2,e4"`) with a translucent-ish overlay colour.
@@ -509,6 +568,31 @@ mod tests {
         assert_eq!(close(intruder, id), Err(DrawErr::NotOwner));
         // The owner still can.
         assert!(draw(owner, id, "clear ffffff").is_ok());
+        close(owner, id).unwrap();
+    }
+
+    #[test_case]
+    fn text_op_rasterizes_and_is_bounded() {
+        reset();
+        let owner = crate::sched::current_task_id();
+        let id = request(owner, SurfaceKind::Canvas);
+        // Text blends onto the background; assert some pixel in the glyph box
+        // changed from the cleared colour and the program parses with spaces.
+        draw(owner, id, "clear 000000").unwrap();
+        let before = checksum(id).unwrap();
+        let n = draw(owner, id, "text 4 4 22 ffffff Hi there").unwrap();
+        assert_eq!(n, 1);
+        assert_ne!(checksum(id).unwrap(), before, "text must change pixels");
+        // Deterministic: same program → same checksum.
+        draw(owner, id, "clear 000000; text 4 4 22 ffffff Hi there").unwrap();
+        let h1 = checksum(id).unwrap();
+        draw(owner, id, "clear 000000; text 4 4 22 ffffff Hi there").unwrap();
+        assert_eq!(checksum(id).unwrap(), h1);
+        // Over-long strings are truncated (op still applies), bad shapes error.
+        let long = "text 0 40 22 ff0000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(draw(owner, id, long).is_ok());
+        assert!(matches!(draw(owner, id, "text 1 2 22 zz oops"), Err(DrawErr::BadOp(_))));
+        assert!(matches!(draw(owner, id, "text 1 2"), Err(DrawErr::BadOp(_))));
         close(owner, id).unwrap();
     }
 

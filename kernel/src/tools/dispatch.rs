@@ -20,7 +20,8 @@ use crate::synapse::{self, executor::Invocation, fs as store};
 use crate::tools::pathutil;
 use crate::tools::registry::{self, McpResourceKind, StoreQueryKind, ToolBinding};
 use alloc::boxed::Box;
-use alloc::string::String;
+use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 /// A hook the orchestrator installs to service an agent-layer tool. Takes the
@@ -273,7 +274,235 @@ impl ToolDispatch for Router {
                     ToolOutcome::ok(out, Provenance::UntrustedIngested)
                 }
             }
+            ToolBinding::RunShellCommand => {
+                let out = crate::tools::shell_cmd::run_from_tool_args(&call.args);
+                if out.starts_with("error:") {
+                    ToolOutcome::error(out)
+                } else {
+                    ToolOutcome::ok(out, Provenance::UntrustedIngested)
+                }
+            }
+            ToolBinding::BgTask => {
+                let out = dispatch_bg_tool(&call.tool, &call.args);
+                if out.starts_with("error:") {
+                    ToolOutcome::error(out)
+                } else {
+                    ToolOutcome::ok(out, Provenance::SystemTrusted)
+                }
+            }
+            ToolBinding::AskUser => {
+                let out = dispatch_ask_user(&call.args);
+                if out.starts_with("error:") {
+                    ToolOutcome::error(out)
+                } else {
+                    ToolOutcome::ok(out, Provenance::UserTyped)
+                }
+            }
+            ToolBinding::Web => {
+                let out = dispatch_web_tool(&call.tool, &call.args);
+                if out.starts_with("error:") {
+                    ToolOutcome::error(out)
+                } else {
+                    ToolOutcome::ok(out, Provenance::UntrustedIngested)
+                }
+            }
+            ToolBinding::SearchReplace => self.call_search_replace(session, caller, call),
         }
+    }
+}
+
+fn dispatch_bg_tool(name: &str, args: &str) -> String {
+    use crate::session::todo::{json_str, json_u32};
+    match name {
+        "task_output" => {
+            let id = json_u32(args, "task_id")
+                .or_else(|| json_str(args, "task_id").and_then(|s| s.parse().ok()))
+                .unwrap_or(0) as u64;
+            let wait = json_u32(args, "timeout_ms")
+                .or_else(|| json_str(args, "timeout_ms").and_then(|s| s.parse().ok()))
+                .unwrap_or(0) as u64;
+            crate::tools::bg::task_output(id, wait)
+        }
+        "kill_task" => {
+            let id = json_u32(args, "task_id")
+                .or_else(|| json_str(args, "task_id").and_then(|s| s.parse().ok()))
+                .unwrap_or(0) as u64;
+            crate::tools::bg::kill_task(id)
+        }
+        "list_tasks" => crate::tools::bg::list_tasks(),
+        "monitor" => {
+            let command = json_str(args, "command").unwrap_or_default();
+            if command.is_empty() {
+                return String::from("error: need command");
+            }
+            let interval = json_u32(args, "interval_ms")
+                .or_else(|| json_str(args, "interval_ms").and_then(|s| s.parse().ok()))
+                .unwrap_or(5000) as u64;
+            let (cmd, rest) = match crate::tools::shell_cmd::parse_command_line(&command) {
+                Ok(x) => x,
+                Err(e) => return format!("error:{e}"),
+            };
+            let id = crate::tools::bg::spawn_monitor(&cmd, &rest, interval);
+            format!("ok:monitor task_id={id} every {interval}ms /{cmd} {rest}")
+        }
+        _ => format!("error: unknown bg tool {name}"),
+    }
+}
+
+/// Parse a JSON array of strings from a tool arg: `["a","b"]` or newline list.
+fn parse_option_list(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let s = raw.trim();
+    if s.starts_with('[') {
+        // Extract quoted strings.
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'"' {
+                i += 1;
+                let mut t = String::new();
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        t.push(bytes[i + 1] as char);
+                        i += 2;
+                    } else {
+                        t.push(bytes[i] as char);
+                        i += 1;
+                    }
+                }
+                if !t.is_empty() {
+                    out.push(t);
+                }
+            }
+            i += 1;
+        }
+    } else {
+        for part in s.split(|c| c == '\n' || c == '|' || c == ',') {
+            let p = part.trim();
+            if !p.is_empty() {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn dispatch_ask_user(args: &str) -> String {
+    use crate::session::todo::json_str;
+    let question = json_str(args, "question")
+        .or_else(|| json_str(args, "prompt"))
+        .unwrap_or_default();
+    if question.is_empty() {
+        return String::from("error: need question");
+    }
+    let opt_raw = json_str(args, "options").unwrap_or_default();
+    let options = parse_option_list(&opt_raw);
+    if options.len() < 2 {
+        return String::from("error: need at least 2 options (JSON array or comma-separated)");
+    }
+    if options.len() > 8 {
+        return String::from("error: at most 8 options");
+    }
+    let refs: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
+    match crate::modal::choose("Agent question", &question, &refs) {
+        Some(i) => format!("ok:selected={} index={} label={}", i + 1, i, options[i]),
+        None => String::from("error: user cancelled the question"),
+    }
+}
+
+fn strip_html_rough(html: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in html.chars() {
+        if c == '<' {
+            in_tag = true;
+            continue;
+        }
+        if c == '>' {
+            in_tag = false;
+            out.push(' ');
+            continue;
+        }
+        if !in_tag {
+            out.push(c);
+            if out.len() >= max {
+                out.push_str("…");
+                break;
+            }
+        }
+    }
+    // Collapse whitespace.
+    let mut compact = String::new();
+    let mut sp = false;
+    for c in out.chars() {
+        if c.is_whitespace() {
+            if !sp {
+                compact.push(' ');
+                sp = true;
+            }
+        } else {
+            sp = false;
+            compact.push(c);
+        }
+    }
+    compact
+}
+
+fn dispatch_web_tool(name: &str, args: &str) -> String {
+    use crate::session::todo::{json_str, json_u32};
+    match name {
+        "web_search" => {
+            let q = json_str(args, "query").unwrap_or_default();
+            if q.is_empty() {
+                return String::from("error: need query");
+            }
+            // DuckDuckGo HTML (no API key). Results are untrusted.
+            let mut enc = String::new();
+            for b in q.bytes() {
+                match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                        enc.push(b as char)
+                    }
+                    b' ' => enc.push_str("%20"),
+                    _ => enc.push_str(&format!("%{b:02X}")),
+                }
+            }
+            let url = format!("https://html.duckduckgo.com/html/?q={enc}");
+            match crate::net::http::get(&url, 30_000) {
+                Ok(resp) => {
+                    let text = strip_html_rough(&resp.text(), 4000);
+                    format!("ok:web_search q={q}\n{text}")
+                }
+                Err(e) => format!("error:web_search: {e}"),
+            }
+        }
+        "web_fetch" => {
+            let url = json_str(args, "url").unwrap_or_default();
+            if url.is_empty() {
+                return String::from("error: need url");
+            }
+            let max = json_u32(args, "max_bytes")
+                .or_else(|| json_str(args, "max_bytes").and_then(|s| s.parse().ok()))
+                .unwrap_or(8000) as usize;
+            match crate::net::http::get(&url, 30_000) {
+                Ok(resp) => {
+                    let body = resp.text();
+                    let text = if body.contains('<') {
+                        strip_html_rough(&body, max)
+                    } else {
+                        let n = body.len().min(max);
+                        let mut t = body[..n].to_string();
+                        if body.len() > max {
+                            t.push_str("…");
+                        }
+                        t
+                    };
+                    format!("ok:web_fetch status={} url={url}\n{text}", resp.status)
+                }
+                Err(e) => format!("error:web_fetch: {e}"),
+            }
+        }
+        _ => format!("error: unknown web tool {name}"),
     }
 }
 
@@ -331,7 +560,9 @@ impl Router {
                 ToolOutcome::ok(alloc::format!("ok:[{}]", hits.join(",")), Provenance::UntrustedIngested)
             }
             StoreQueryKind::Grep => {
-                let query = todo::json_str(&call.args, "query").unwrap_or_default();
+                let query = todo::json_str(&call.args, "query")
+                    .or_else(|| todo::json_str(&call.args, "pattern"))
+                    .unwrap_or_default();
                 if query.is_empty() {
                     return ToolOutcome::error("malformed grep: missing required arg 'query'");
                 }
@@ -347,13 +578,39 @@ impl Router {
                         files.push((p, String::from_utf8_lossy(&bytes).into_owned()));
                     }
                 }
-                let hits = pathutil::grep_files(&query, &files, 50);
+                let head = todo::json_u32(&call.args, "head_limit")
+                    .or_else(|| todo::json_str(&call.args, "head_limit").and_then(|s| s.parse().ok()))
+                    .unwrap_or(50)
+                    .clamp(1, 200) as usize;
+                let ci = todo::json_str(&call.args, "case_insensitive")
+                    .map(|v| v == "true" || v == "1")
+                    .unwrap_or_else(|| {
+                        call.args.contains("\"case_insensitive\":true")
+                            || call.args.contains("\"case_insensitive\": true")
+                    });
+                let hits = pathutil::grep_files_ex(&query, &files, head, ci);
                 if hits.is_empty() {
                     return ToolOutcome::ok("ok:[]", Provenance::UntrustedIngested);
                 }
                 let mut out = String::from("ok:\n");
                 for h in hits {
                     out.push_str(&alloc::format!("{}:{}:{}\n", h.path, h.line, h.text));
+                }
+                ToolOutcome::ok(out, Provenance::UntrustedIngested)
+            }
+            StoreQueryKind::ListDir => {
+                let path = todo::json_str(&call.args, "path").unwrap_or_else(|| "/".into());
+                let kids = pathutil::list_dir_children(&path, &paths);
+                if kids.is_empty() {
+                    return ToolOutcome::ok(
+                        alloc::format!("ok:list_dir {path}\n(empty)"),
+                        Provenance::UntrustedIngested,
+                    );
+                }
+                let mut out = alloc::format!("ok:list_dir {path}\n");
+                for k in kids {
+                    out.push_str(&k);
+                    out.push('\n');
                 }
                 ToolOutcome::ok(out, Provenance::UntrustedIngested)
             }
@@ -404,6 +661,44 @@ impl Router {
             Err(e) => return ToolOutcome::error(alloc::format!("error:{e}:{path}")),
         };
         // Cap-gated write of the whole file.
+        self.run_synapse(
+            session,
+            caller,
+            &synapse_call("mem_fs_write", &[("path", path.as_str()), ("text", edited.as_str())]),
+        )
+    }
+
+    /// `search_replace` — same engine as `edit`, accepts old_string/new_string.
+    fn call_search_replace(
+        &self,
+        session: &Session,
+        caller: crate::sched::TaskId,
+        call: &ToolCall,
+    ) -> ToolOutcome {
+        let path = todo::json_str(&call.args, "path").unwrap_or_default();
+        let old = todo::json_str(&call.args, "old_string")
+            .or_else(|| todo::json_str(&call.args, "old"))
+            .unwrap_or_default();
+        let new = todo::json_str(&call.args, "new_string")
+            .or_else(|| todo::json_str(&call.args, "new"))
+            .unwrap_or_default();
+        if path.is_empty() || old.is_empty() {
+            return ToolOutcome::error("malformed search_replace: need path + old_string (+ new_string)");
+        }
+        let replace_all = todo::json_str(&call.args, "replace_all")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or_else(|| {
+                call.args.contains("\"replace_all\":true") || call.args.contains("\"replace_all\": true")
+            });
+        let read = self.run_synapse(session, caller, &synapse_call("mem_fs_read", &[("path", path.as_str())]));
+        if read.is_error {
+            return read;
+        }
+        let body = read.result.strip_prefix("ok:").unwrap_or(&read.result);
+        let edited = match pathutil::safe_edit(body, &old, &new, replace_all) {
+            Ok(s) => s,
+            Err(e) => return ToolOutcome::error(alloc::format!("error:{e}:{path}")),
+        };
         self.run_synapse(
             session,
             caller,

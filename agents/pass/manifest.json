@@ -1,0 +1,26 @@
+{
+  "name": "pass",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Secrets vault UI helper (human-only unlock posture).",
+  "toolset": [
+    "storage_get",
+    "storage_set",
+    "storage_list",
+    "storage_remove",
+    "memory_list",
+    "emit_result"
+  ],
+  "capabilities": [
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list"
+      ],
+      "scope": "home"
+    }
+  ],
+  "autostart": false
+}

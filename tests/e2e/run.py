@@ -1231,6 +1231,47 @@ def s_surface(g):
     return ok, "surface drawn (grammar-validated draw ops rasterized)" if ok else "no surface render"
 
 
+def s_package_apps(g):
+    """Package-UI apps (tools.wasm on a persistent instance): start chess,
+    minesweeper, snake, and synth in turn — each start instantiates the module,
+    resolves the app's start export, requests a surface, and paints. Starting
+    the next app stops the previous (observable), and stop-package closes the
+    last. Starting an app focuses the action pane (its keys go to the game), so
+    Shift+Tab (ESC[Z) returns focus to the chat line before the next command."""
+    m = g.mark()
+    g.send("/agents start chess")
+    # Model-less guest → hotseat mode (no agent opponent to wait on).
+    if not g.wait_for("package_ui> chess: ok:chess", 15, m):
+        return False, "chess did not start (wasm init failed?)"
+    g.send_raw(b"\x1b[Z")  # Shift+Tab: focus back to the chat line
+    m = g.mark()
+    g.send("/agents start minesweeper")
+    ok = g.wait_for("package_ui> stopped 'chess'", 15, m) and g.wait_for(
+        "package_ui> minesweeper: ok:mines 9x9", 10, m
+    )
+    if not ok:
+        return False, "minesweeper did not replace chess"
+    g.send_raw(b"\x1b[Z")
+    m = g.mark()
+    g.send("/agents start snake")
+    ok = g.wait_for("package_ui> stopped 'minesweeper'", 15, m) and g.wait_for(
+        "package_ui> snake: ok:snake", 10, m
+    )
+    if not ok:
+        return False, "snake did not replace minesweeper"
+    # Snake runs on the guest tick (persistent instance state) while we type.
+    g.send_raw(b"\x1b[Z")
+    m = g.mark()
+    g.send("/agents start synth")
+    if not g.wait_for("package_ui> synth: ok:synth piano", 15, m):
+        return False, "synth piano did not start"
+    g.send_raw(b"\x1b[Z")
+    m = g.mark()
+    g.send("/agents stop-package")
+    ok = g.wait_for("package_ui> stopped 'synth'", 15, m)
+    return ok, "chess/minesweeper/snake/synth start+stop over package_ui" if ok else "stop-package failed"
+
+
 OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("help_restart", s_help_restart),
     ("memory", s_memory),
@@ -1246,7 +1287,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("panes", s_panes),
     ("clipboard", s_clipboard),
 ]
-AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("mcp_manifest", s_mcp_manifest)]
+AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]
 NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("browse", s_browse), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 # Runs after every other group: kills the guest (QEMU -no-reboot → exit).
 FINAL = [("restart", s_restart)]

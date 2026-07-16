@@ -1,0 +1,45 @@
+{
+  "name": "calendar",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Month calendar + events (tools.wasm).",
+  "toolset": [
+    "calendar_start",
+    "calendar_add",
+    "calendar_list",
+    "calendar_status"
+  ],
+  "capabilities": [
+    {
+      "domain": "ui",
+      "rights": [
+        "exec",
+        "write",
+        "delete"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list"
+      ],
+      "scope": "home"
+    },
+    {
+      "domain": "todo",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    }
+  ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "fuel": 2000000
+  },
+  "autostart": false
+}

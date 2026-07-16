@@ -92,6 +92,9 @@ pub const UI_SURFACE_CLOSE: PrimitiveId = 22;
 // raw rects. Still ownership-gated like ui_draw.
 pub const BOARD_SET: PrimitiveId = 23;
 pub const BOARD_MARK: PrimitiveId = 24;
+/// Set a surface's HUD text (status + wrapped hints), rendered by the
+/// compositor in a reserved pane-space strip. Ownership-gated like ui_draw.
+pub const UI_HUD: PrimitiveId = 25;
 
 const STR: ArgType = ArgType::Str;
 const UINT: ArgType = ArgType::Uint;
@@ -272,6 +275,13 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
         name: "board_mark",
         params: &[Param { key: "surface", ty: UINT }, Param { key: "squares", ty: STR }, Param { key: "color", ty: STR }],
         description: "Highlight squares (e.g. 'e2,e4') on a board surface you own.",
+        destructive: false,
+    },
+    PrimitiveSpec {
+        id: UI_HUD,
+        name: "ui_hud",
+        params: &[Param { key: "surface", ty: UINT }, Param { key: "text", ty: STR }],
+        description: "Set a surface's HUD (status + wrapped hint lines, '\\n'-separated), shown in a reserved strip below the surface. Empty clears it.",
         destructive: false,
     },
 ];

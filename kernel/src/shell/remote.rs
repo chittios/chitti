@@ -116,16 +116,30 @@ fn jstr(s: &str) -> Json {
 /// `messages` (role/content pairs). Pure — unit-tested so the wire shape can't
 /// silently drift.
 pub fn build_chat_request(model: &str, messages: &[(String, String)]) -> String {
+    build_chat_request_with_effort(model, messages, "")
+}
+
+/// Like [`build_chat_request`] but optional OpenAI-style `reasoning_effort`
+/// (`low`|`medium`|`high`|`xhigh`) for hosted reasoning models.
+pub fn build_chat_request_with_effort(
+    model: &str,
+    messages: &[(String, String)],
+    effort: &str,
+) -> String {
     let msgs: Vec<Json> = messages
         .iter()
         .map(|(role, content)| Json::Obj(vec![("role".to_string(), jstr(role)), ("content".to_string(), jstr(content))]))
         .collect();
-    Json::Obj(vec![
+    let mut fields = vec![
         ("model".to_string(), jstr(model)),
         ("messages".to_string(), Json::Arr(msgs)),
         ("stream".to_string(), Json::Bool(false)),
-    ])
-    .to_pretty()
+    ];
+    let e = effort.trim();
+    if !e.is_empty() {
+        fields.push(("reasoning_effort".to_string(), jstr(e)));
+    }
+    Json::Obj(fields).to_pretty()
 }
 
 /// Extract `choices[0].message.content` from an OpenAI-style completion
@@ -145,9 +159,14 @@ pub fn parse_completion(body: &str) -> Option<String> {
 /// One OpenAI-style chat completion: POST the full message history, return
 /// the assistant text.
 pub fn chat_completion(cfg: &RemoteConfig, messages: &[(String, String)]) -> Result<String, String> {
-    let body = build_chat_request(&cfg.model, messages);
+    let effort = crate::shell::reasoning_effort();
+    let body = build_chat_request_with_effort(&cfg.model, messages, &effort);
     let url = format!("{}/v1/chat/completions", cfg.url);
-    crate::ktrace::log_fmt(format_args!("remote: POST {url} ({} messages)", messages.len()));
+    crate::ktrace::log_fmt(format_args!(
+        "remote: POST {url} ({} messages, effort={})",
+        messages.len(),
+        if effort.is_empty() { "default" } else { effort.as_str() }
+    ));
     let resp = crate::net::http::post_json(&url, &body, cfg.key.as_deref(), HTTP_TIMEOUT_MS)?;
     if resp.status != 200 {
         let text = resp.text();
@@ -225,6 +244,8 @@ impl RemoteChat {
         use crate::agent::orchestrator::now;
         use crate::agent::types::{Provenance, Role, ToolCall};
         const MAX_TOOL_ITERS: usize = 4;
+        // Mid-turn interjection queue while HTTP wait / tools run.
+        super::set_chat_busy(true);
         self.refresh_system();
         self.messages.push(("user".to_string(), msg.to_string()));
         session.push_message(Role::User, msg.to_string(), Provenance::UserTyped, now());
@@ -246,6 +267,7 @@ impl RemoteChat {
                     let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
                     super::print_turn_footer(0.0, worked);
                     let _ = crate::session::save(session);
+                    super::set_chat_busy(false);
                     return String::new();
                 }
                 Err(e) => {
@@ -253,6 +275,7 @@ impl RemoteChat {
                     let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
                     super::print_turn_footer(0.0, worked);
                     let _ = crate::session::save(session);
+                    super::set_chat_busy(false);
                     return String::new();
                 }
             };
@@ -264,6 +287,7 @@ impl RemoteChat {
                 let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
                 super::print_turn_footer(0.0, worked);
                 let _ = crate::session::save(session);
+                super::set_chat_busy(false);
                 return reply;
             }
             if last_batch.as_ref() == Some(&batch) {
@@ -271,6 +295,7 @@ impl RemoteChat {
                 let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
                 super::print_turn_footer(0.0, worked);
                 let _ = crate::session::save(session);
+                super::set_chat_busy(false);
                 return String::new();
             }
             last_batch = Some(batch.clone());
@@ -317,6 +342,7 @@ impl RemoteChat {
         let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
         super::print_turn_footer(0.0, worked);
         let _ = crate::session::save(session);
+        super::set_chat_busy(false);
         String::new()
     }
 

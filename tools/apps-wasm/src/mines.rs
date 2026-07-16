@@ -16,6 +16,8 @@ static mut DEAD: u8 = 0;
 static mut WON: u8 = 0;
 static mut SEEDED: u8 = 0;
 static mut RNG: u32 = 1;
+/// Keyboard cursor (row, col) — arrows move it, Enter opens, `f` flags.
+static mut CUR: (u8, u8) = (4, 4);
 
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
@@ -46,6 +48,16 @@ fn paint() {
                 ops.push_str(&format!("rect {x} {y} {} {} {color}; ", CELL - 1, CELL - 1));
             }
         }
+        // Keyboard cursor: a bright 2px frame around the current cell.
+        let (cr, cc) = CUR;
+        let x = OX + cc as i32 * CELL;
+        let y = OY + cr as i32 * CELL;
+        let s = CELL - 1;
+        ops.push_str(&format!(
+            "rect {x} {y} {s} 2 e8e4df; rect {x} {} {s} 2 e8e4df; rect {x} {y} 2 {s} e8e4df; rect {} {y} 2 {s} e8e4df; ",
+            y + s - 2,
+            x + s - 2
+        ));
         if WON != 0 {
             ops.push_str("rect 0 176 256 16 5a8f5a; ");
         } else if DEAD != 0 {
@@ -150,14 +162,15 @@ pub fn start(_: &str) -> String {
         WON = 0;
         SEEDED = 0;
         RNG = 1;
+        CUR = (4, 4);
     }
     paint();
     format!("ok:mines {W}x{H} n={MINES}")
 }
 
-pub fn click(args: &str) -> String {
-    let r = json_i32(args, "row", json_i32(args, "r", 99)) as usize;
-    let c = json_i32(args, "col", json_i32(args, "c", 99)) as usize;
+/// Open cell (r, c) — the shared core of a chat `mines_click`, a surface click,
+/// and Enter on the keyboard cursor.
+fn open_at(r: usize, c: usize) -> String {
     if r >= H || c >= W {
         return String::from("error:row/col 0..8");
     }
@@ -185,9 +198,7 @@ pub fn click(args: &str) -> String {
     }
 }
 
-pub fn flag(args: &str) -> String {
-    let r = json_i32(args, "row", json_i32(args, "r", 99)) as usize;
-    let c = json_i32(args, "col", json_i32(args, "c", 99)) as usize;
+fn flag_at(r: usize, c: usize) -> String {
     if r >= H || c >= W {
         return String::from("error:row/col 0..8");
     }
@@ -199,6 +210,56 @@ pub fn flag(args: &str) -> String {
         paint();
         format!("ok:flag {r} {c}")
     }
+}
+
+pub fn click(args: &str) -> String {
+    let r = json_i32(args, "row", json_i32(args, "r", 99)) as usize;
+    let c = json_i32(args, "col", json_i32(args, "c", 99)) as usize;
+    open_at(r, c)
+}
+
+pub fn flag(args: &str) -> String {
+    let r = json_i32(args, "row", json_i32(args, "r", 99)) as usize;
+    let c = json_i32(args, "col", json_i32(args, "c", 99)) as usize;
+    flag_at(r, c)
+}
+
+/// Surface click at pixel (x, y): map to a cell, move the cursor there, open.
+pub fn on_click(x: i32, y: i32) -> String {
+    let c = (x - OX) / CELL;
+    let r = (y - OY) / CELL;
+    if x < OX || y < OY || c < 0 || r < 0 || c as usize >= W || r as usize >= H {
+        return String::from("ok:off-board");
+    }
+    unsafe { CUR = (r as u8, c as u8) };
+    open_at(r as usize, c as usize)
+}
+
+/// Key: arrows move the cursor, Enter/space opens, `f` flags, `r` restarts.
+pub fn on_key(key: &str) -> String {
+    let (dr, dc): (i32, i32) = match key {
+        "up" => (-1, 0),
+        "down" => (1, 0),
+        "left" => (0, -1),
+        "right" => (0, 1),
+        "enter" | "space" => {
+            let (r, c) = unsafe { CUR };
+            return open_at(r as usize, c as usize);
+        }
+        "f" => {
+            let (r, c) = unsafe { CUR };
+            return flag_at(r as usize, c as usize);
+        }
+        "r" => return start(""),
+        _ => return String::from("ok"),
+    };
+    unsafe {
+        let r = (CUR.0 as i32 + dr).clamp(0, H as i32 - 1) as u8;
+        let c = (CUR.1 as i32 + dc).clamp(0, W as i32 - 1) as u8;
+        CUR = (r, c);
+    }
+    paint();
+    String::from("ok:cursor")
 }
 
 pub fn status(_: &str) -> String {

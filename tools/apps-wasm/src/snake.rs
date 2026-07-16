@@ -169,3 +169,22 @@ pub fn tick_once(_: &str) -> String {
 pub fn status(_: &str) -> String {
     unsafe { format!("ok:score={SCORE} dead={DEAD} len={LEN}") }
 }
+
+/// Key: arrows/wasd steer, `r` restarts (also revives after death).
+pub fn on_key(key: &str) -> String {
+    let d: i8 = match key {
+        "up" | "w" | "k" => 0,
+        "down" | "s" | "j" => 1,
+        "left" | "a" | "h" => 2,
+        "right" | "d" | "l" => 3,
+        "r" => return start(""),
+        _ => return String::from("ok"),
+    };
+    unsafe {
+        if DEAD != 0 {
+            return String::from("ok:dead (r restarts)");
+        }
+        PEND = d;
+    }
+    format!("ok:dir {key}")
+}
