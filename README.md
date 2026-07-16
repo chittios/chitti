@@ -128,6 +128,10 @@ model from ever directly touching hardware.
   `/install` update-in-place with modal confirm.
 - **Microkernel core.** Unforgeable capabilities, scheduler (cooperative +
   preemptive), SMP bring-up, MMU, heap.
+- **Bare-metal Apple Silicon (work in progress).** Boots on a real **Mac mini
+  M2** via the Asahi [m1n1](https://github.com/AsahiLinux/m1n1) bootloader —
+  shell UI on the display, model-via-initrd, and native USB keyboard + mouse on
+  the USB-C ports. See [DEVELOPMENT.md](DEVELOPMENT.md#real-mac-mini-apple-silicon-via-m1n1--work-in-progress).
 
 ## Messaging channels (short path)
 

@@ -223,6 +223,73 @@ VBoxManage convertfromraw target/chitti-aa64.img chitti.vdi --format VDI
 The boot log's `INPUT` line reports which keyboard/mouse/clock sources were found
 — the ground truth when input or the clock misbehaves on a given platform.
 
+### Real Mac mini (Apple Silicon, via m1n1) — work in progress
+
+ChittiOS boots on a **bare Mac mini M2 (`t8112` / j473)** through the Asahi
+[**m1n1**](https://github.com/AsahiLinux/m1n1) bootloader — no hypervisor. This
+is an active bring-up; see [`docs/apple-usb-hid.md`](docs/apple-usb-hid.md) and
+the plan in `~/.claude/plans/` for the current state. Working today: boot to the
+shell UI on the physical display, model-via-initrd, and native **USB keyboard +
+mouse on the two USB-C ports**. Not yet: the USB-A ports (they hang off the
+Thunderbolt/USB4 subsystem, not the two Type-C USB controllers) and Type-C
+orientation/Vbus (the Apple `cd321x` PD controller).
+
+**One-time setup.** Check out m1n1 and create its proxyclient venv, and grab the
+machine device tree:
+
+```sh
+git clone https://github.com/AsahiLinux/m1n1 third_party/m1n1
+uv venv third_party/m1n1/.venv
+uv pip install --python third_party/m1n1/.venv/bin/python -r third_party/m1n1/requirements.txt
+make -C third_party/m1n1                          # builds build/m1n1.bin (for the hv path)
+# the j473 device tree is checked in at third_party/dtb/t8112-j473.dtb
+```
+
+Put the Mac in **DFU / m1n1 proxy mode** (Asahi's install/`m1n1` step) and
+connect the USB-C cable; it appears as two serial devices, e.g.
+`/dev/cu.usbmodemXXXXD1` (proxy control) and `…D3`.
+
+**Dev loop** — `cargo xtask m1n1` (or `make m1n1`) builds the arm64 `Image`,
+gzips it, and boots it over the proxy. Configure via env:
+
+| env | purpose |
+| --- | --- |
+| `CHITTI_M1N1` | path to the m1n1 checkout (has `proxyclient/`) |
+| `CHITTI_DTB` | machine device tree (`third_party/dtb/t8112-j473.dtb`) |
+| `M1N1DEVICE` | the proxy control TTY (`…D1`) |
+| `CHITTI_BOOTARGS` | kernel bootargs (e.g. `chitti.usb` to enable USB, `chitti.epoch=<unix>`) |
+| `CHITTI_INITRD` | a GGUF to hand off as the model (`assets/model.gguf`) |
+| `CHITTI_M1N1_HV=1` | boot **under a resident m1n1 hypervisor** (keeps serial alive) |
+| `CHITTI_SERIAL_LOG=<path>` | tee the forwarded serial console to a logfile |
+
+```sh
+# Bare boot to the shell (USB enabled), for interactive use / USB HID testing:
+CHITTI_M1N1=third_party/m1n1 CHITTI_DTB=third_party/dtb/t8112-j473.dtb \
+M1N1DEVICE=/dev/cu.usbmodemXXXXD1 \
+make m1n1 RELEASE=1 CHITTI_BOOTARGS="chitti.usb"
+```
+
+**Seeing logs — important.** A **bare** boot has **no serial** after handoff
+(m1n1's USB gadget, both the `_01` proxy and `_03` UART bridge, tears down when
+it jumps to the payload — the host log dies at `Preparing to run next stage /
+Exit TTY mode`). Two ways to get diagnostics:
+
+- **On a bare boot**, driver traces are only visible on the **framebuffer**. The
+  ktrace/logs pane is closed at boot, so bring-up code that needs to be seen
+  (e.g. `apple_usb` under `chitti.usb`) calls `ktrace::set_console_echo(true)` to
+  mirror every trace line to the always-visible **chat** pane. Read the Mac's
+  monitor.
+- **Under the hypervisor** (`CHITTI_M1N1_HV=1`), m1n1 stays resident and forwards
+  the guest UART, so `CHITTI_SERIAL_LOG=target/serial.log` captures a real
+  logfile you can `tail -f`. This is the way to iterate on **non-USB** drivers
+  (PCIe, storage, AIC, SMP) autonomously — but the hv strips USB from the guest,
+  so it can't be used for USB/Bluetooth work.
+
+USB HID is **gated behind the `chitti.usb` bootarg** (and never runs under the
+hv): the dwc3/DART MMIO it drives is the same controller m1n1 uses for the proxy
+console, so resetting it under the hv kills the console. Plug keyboard + mouse
+into the **two USB-C ports** (one device per controller).
+
 ## Repository layout
 
 ```text
