@@ -460,12 +460,22 @@ pub struct InferBench {
 /// real model + forward pass, so it measures exactly what `infer` runs, just
 /// long enough (and without the per-token parity/text work) to be a stable
 /// prefill/decode throughput gauge. Returns `None` if no model is present.
-pub fn bench_inference(n_prompt: usize, n_decode: usize) -> Option<InferBench> {
+/// `pump` is called between phases and per decoded token — the shell passes a
+/// closure that ticks the UI/net upkeep and polls Ctrl+C (return `true` to
+/// cancel; the standing rule: no blocking command without an interrupt check).
+/// A 27B bench is minutes of wall time, so each phase also ktraces progress —
+/// a silent multi-minute `/perf` is indistinguishable from a hang.
+pub fn bench_inference(n_prompt: usize, n_decode: usize, pump: &mut dyn FnMut() -> bool) -> Option<InferBench> {
     let bytes = model_module()?;
     let gguf = gguf::Gguf::parse(bytes).ok()?;
+    crate::ktrace::log("cortex.bench", "gguf parsed");
     let m = model::Model::load(gguf).ok()?;
     let mut kv = m.new_cache();
     let mut state = m.new_state();
+    crate::ktrace::log("cortex.bench", "model + cache ready");
+    if pump() {
+        return None;
+    }
 
     // Synthetic prompt: fixed ids cycled to the requested length. A
     // throughput gauge needs valid token ids, not real text — building the
@@ -476,14 +486,24 @@ pub fn bench_inference(n_prompt: usize, n_decode: usize) -> Option<InferBench> {
     let t0 = crate::arch::now_ms();
     m.prefill(&prompt, 0, &mut kv, &mut state);
     let prefill_ms = crate::arch::now_ms().saturating_sub(t0);
+    crate::ktrace::log_fmt(format_args!("cortex.bench: prefill {n_prompt} done in {prefill_ms} ms"));
+    if pump() {
+        return None;
+    }
 
     let mut pos = n_prompt;
     let mut next = model::argmax(&state.logits);
     let t1 = crate::arch::now_ms();
-    for _ in 0..n_decode {
+    for i in 0..n_decode {
         m.forward(next, pos, &mut kv, &mut state, true);
         pos += 1;
         next = model::argmax(&state.logits);
+        if i % 8 == 7 {
+            crate::ktrace::log_fmt(format_args!("cortex.bench: decode {}/{n_decode}", i + 1));
+        }
+        if pump() {
+            return None;
+        }
     }
     let decode_ms = crate::arch::now_ms().saturating_sub(t1);
     core::hint::black_box(next);

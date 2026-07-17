@@ -5996,7 +5996,14 @@ fn run_bench() {
 fn run_perf() {
     const N_PROMPT: usize = 64;
     const N_DECODE: usize = 32;
-    match crate::cortex::bench_inference(N_PROMPT, N_DECODE) {
+    // Pump the UI/net between phases and per decoded token, and honor Ctrl+C —
+    // a 27B bench is minutes of blocking wall time otherwise (standing rule).
+    let mut pump = || {
+        ui_tick();
+        crate::net::poll();
+        poll_cancel()
+    };
+    match crate::cortex::bench_inference(N_PROMPT, N_DECODE, &mut pump) {
         Some(r) => {
             let pp = if r.prefill_ms > 0 { (r.n_prompt as u64 * 1000) / r.prefill_ms } else { 0 };
             let tg = if r.decode_ms > 0 { (r.n_decode as u64 * 1000) / r.decode_ms } else { 0 };
@@ -6010,7 +6017,7 @@ fn run_perf() {
                 tg,
             );
         }
-        None => serial_println!("perf> no model present"),
+        None => serial_println!("perf> no model present (or cancelled)"),
     }
 }
 
