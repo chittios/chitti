@@ -144,6 +144,15 @@ wake self-test (`smp: wake self-test ok|FAILED` ktrace) degrades to single-core
 up front on hypervisors that park a trapped `WFE` until an interrupt —
 VirtualBox-ARM does exactly that and used to hang the first prefill matvec
 forever. Slow beats stuck; any new cross-core wait needs the same bound.
+**The PSCI gate fails open**: bring-up skips PSCI only when a *valid* FDT
+explicitly lacks an `arm,psci-*` node (Apple Silicon via m1n1 — `hvc` there
+halts the guest). Boots with **no FDT in x0** (QEMU/VBox `-kernel` ELF, the
+UEFI stub) keep PSCI — gating those on FDT contents once silently turned SMP
+off on QEMU (`fdt::present` distinguishes "no FDT" from "FDT says no PSCI";
+the `smp: N cores online` ktrace is the first thing to check when inference
+is inexplicably slow). QEMU vCPU count comes from `CHITTI_SMP` (default 8).
+Also NB: `make`'s `RELEASE` defaults to **1** — a dev kernel's unoptimized
+NEON is many times slower and reads as an inference bug.
 
 ## STANDING RULE — real hardware, nothing hardcoded to an emulator
 
@@ -291,12 +300,26 @@ real UEFI hardware.
   **All mainstream GGML quants dequantize** (legacy Q4_0/Q4_1/Q5_0/Q5_1/Q8_0,
   K-quants Q2_K–Q8_K, i-quants IQ2/IQ3/IQ4 via `iq_tables.rs` — generated
   verbatim from ggml by `tools/gen_iq_tables.py` — plus F16/BF16 rows), so any
-  unsloth file incl. UD-* dynamic mixes runs; fast SDOT matvecs for
-  Q8_0/Q4_0/**Q4_K**, everything else through the generic dequant path (still
-  SMP row-split). Two tokenizer flavors behind one API (GPT-2 byte-BPE ∣
+  unsloth file incl. UD-* dynamic mixes runs; plus **PrismML's sub-2-bit packs**
+  (`Q1_0` binary type 41, `Q2_0` ternary type 42 — 128-elem blocks, one f16
+  scale; the Bonsai-27B builds). Fast SDOT matvecs for
+  Q8_0/Q4_0/**Q4_K**/**Q1_0**/**Q2_0** (the Q1_0 sign-expand and Q2_0 code
+  unpack run fully in vector registers — `vqtbl1q` broadcast / `vzip`
+  interleave, loads via the `ldq_*`/`ldp_*` asm helpers), everything else
+  through the generic dequant path (still SMP row-split). **Batched
+  (weight-stationary) prefill** is gated on `Model::batch_qt` — a uniform quant
+  type with a batched matmul kernel (Q8_0 ∣ Q1_0 ∣ Q2_0), not "all Q8_0" — and
+  the shell chat loop feeds batch-capable models **32-token chunks** through
+  `Model::prefill` (weight bytes + unpack amortized per chunk; UI pump +
+  Ctrl+C between chunks), so a 27B's ~1.5k-token system prompt prefills in
+  minutes, not hours. NB the paired Bonsai `dspark` GGUF is a *drafter*
+  conditioned on the target's hidden-state taps — not a standalone model; the
+  runnable Bonsai is the main `Q1_0`/`Q2_0` file. Two tokenizer flavors behind
+  one API (GPT-2 byte-BPE ∣
   gemma4 raw-UTF-8 ▁-BPE with `<0xXX>` fallback), per-family chat format in
   the shell (ChatML ∣ `<start_of_turn>` gemma turns, BOS per `add_bos`).
-  Select with `-model qwen3.5-0.8b|2b|4b|9b` **or any path**
+  Select with `-model qwen3.5-0.8b|2b|4b|9b|gemma-4-e4b|bonsai-27b|
+  bonsai-27b-ternary` **or any path**
   (`-model path/to/file.gguf` — guest RAM derived from file size), or at
   runtime with **`/model load <file.gguf>`** (reads off any FAT/ext4 volume
   into DMA frames and re-homes chat on it; the status bar shows the GGUF's own
