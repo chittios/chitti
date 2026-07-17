@@ -177,6 +177,69 @@ tail). Extend these for any new kernel variant (e.g. row-pair, new tile depths).
   position) — compare rates at the SAME context depth.
 - Don't benchmark while other QEMU instances / heavy builds run on the host.
 
+## Reference comparison: host llama.cpp (PrismML fork) on the SAME M2
+
+Built the fork's `llama-bench` CPU-only (`cmake -DGGML_METAL=OFF`; M2 has
+`FEAT_I8MM=1`, `FEAT_DotProd=1`) and ran the same models. Native host, not QEMU:
+
+| model | test | llama.cpp 8t | llama.cpp 4t | ChittiOS (QEMU-HVF 8vcpu) |
+|---|---|---|---|---|
+| Q1_0 27B | pp64 | **14.6 t/s** | 14.9 t/s | ~3 t/s |
+| Q1_0 27B | tg32 | 3.18 t/s | **4.37 t/s** | ~1.35 t/s |
+| Q2_0 27B | pp64 | 3.26 t/s | — | ~3 t/s |
+| Q2_0 27B | tg32 | **0.09 t/s** | — | ~1 t/s |
+
+Reading of this table (this is the actionable part):
+
+- **Q1_0 prefill: they are ~5× faster (14.6 vs 3).** The entire gap is the
+  **repacked i8mm GEMM**. The fork ships `block_q1_0x4` (4 rows interleaved) with
+  `ggml_gemm_q1_0_4x8_q8_0` using **`vmmlaq_s32`** (FEAT_I8MM matrix-multiply-
+  accumulate: a 2×2 int8 outer-product per instr = 2× the MAC/instr of `vdotq_s32`).
+  Our batched matmul uses `vdotq_s32` and a plain row-major weight layout. THIS is
+  the top prefill win. See `ggml/src/ggml-cpu/arch/arm/repack.cpp`
+  (`ggml_gemm_q1_0_4x8_q8_0`, `ggml_gemv_q1_0_4x8_q8_0`) and
+  `repack_q1_0_to_q1_0_4_bl`.
+- **Q1_0 decode: they are ~2.5–3× faster (3.18/4.37 vs 1.35).** Two causes: (a)
+  their vec_dot has an **i8mm 2-row path** (`nrc==2`, `vmmlaq_s32` over two weight
+  rows at once) — see `ggml_vec_dot_q1_0_q8_0` in `arch/arm/quants.c`; (b) **decode
+  is memory-bandwidth-bound — 4 threads BEAT 8** (4.37 > 3.18). Our equal/weighted
+  8-way split is actively counterproductive for tg: cap decode matvec to the P-cores
+  (~4) instead of all 8.
+- **Q2_0: we are at parity on prefill and ~11× AHEAD on decode.** The fork barely
+  optimized Q2_0 — no repack GEMM, and its tg path is pathological (0.09 t/s). So
+  **do not port their Q2_0**; ours already wins. Q2_0 effort should just mirror
+  whatever Q1_0 i8mm work lands.
+
+**Honest ceiling (important):** even *native* llama.cpp on this M2 tops out at
+**~14.6 t/s prefill / ~4.4 t/s decode** for a 27B 1-bit. 15–20 t/s decode is not
+reachable on this box by anyone. The real, achievable target is **to close the gap
+to llama.cpp**: ~14 t/s prefill (5×) and ~4 t/s decode (3×). Both come from the same
+two levers: **(1) i8mm (`vmmlaq_s32`) + a repacked interleaved weight layout**, and
+**(2) P-core-only decode**. Per-block micro-opts (the earlier list) are secondary now.
+
+### Concrete implementation notes from the fork
+
+- **i8mm `vmmlaq_s32`**: computes `C[2x2] += A[2xK]·B[Kx2]` for int8 K=8-lane
+  operands. To use it you feed 2 weight rows + 2 activation columns interleaved
+  (`vzip1q_s64`/`vzip2q_s64` to pair rows), accumulate an int32x4 holding the 2×2
+  partials, scale by the f16 d's. For **prefill** (m≥2) this is a natural 2-col
+  tile; for **decode** (m=1) pair 2 weight ROWS against the 1 activation broadcast
+  to 2 (their `nrc==2` path). Gate on `#[cfg(target_feature)]`/runtime detect —
+  and confirm HVF passes I8MM through (`-cpu host`; the guest must see it, else
+  fall back to the current `vdotq` path).
+- **Sign expand via LUT**: the fork expands 8 sign bits → `int8x8` of ±1 with a
+  256-entry `table_q1_signs` (`u64` per byte, `vcreate_u8(table[b])`) instead of our
+  `vqtbl1q`+`vtst`+`vbsl` (3 vec ops). Marginal vs i8mm but tidy; the NEON-only
+  fallback uses `veor`+`vsub` sign-flip masks (`table_q1_mask`) + `vpaddlq` — worth
+  a look for the non-dotprod path.
+- **Repack**: `repack_q1_0_to_q1_0_4_bl` rewrites the weight tensor once at load
+  into `block_q1_0x4` (4 rows interleaved, per-block). In ChittiOS this would be a
+  load-time transform of the QWeight bytes (or a parallel copy into DMA frames) —
+  weigh the one-time cost + extra memory vs. the 5× prefill.
+- **First check on any i8mm work**: does the QEMU-HVF guest actually expose I8MM?
+  Add a boot ktrace reading `ID_AA64ISAR1_EL1.I8MM` (bits 55:52). If HVF masks it,
+  i8mm gains are host-only and the kernel must keep the vdotq path.
+
 ## Deliverables
 
 1. Optimized Q1_0 + Q2_0 matvec and matmul kernels (and any dispatch/partitioning
