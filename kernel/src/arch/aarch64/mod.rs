@@ -385,6 +385,28 @@ pub fn cycle_count() -> u64 {
     cntvct()
 }
 
+/// True if the CPU implements **FEAT_I8MM** (`ID_AA64ISAR1_EL1.I8MM`, bits
+/// [55:52] == 1) — the `SMMLA`/`vmmlaq_s32` int8 matrix-multiply-accumulate the
+/// Q1_0/Q2_0 batched matmuls use for 2× the MAC/instr of `SDOT`. The M2 has it;
+/// what matters is whether HVF passes it through to the guest, which is exactly
+/// what this runtime read answers (the `-cpu host` ID registers are reflected).
+/// Cached — the register never changes at runtime.
+pub fn has_i8mm() -> bool {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = no, 2 = yes
+    match CACHE.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    let isar1: u64;
+    // SAFETY: reading the ID register is valid at EL1; no memory/flags effects.
+    unsafe { asm!("mrs {}, id_aa64isar1_el1", out(reg) isar1, options(nomem, nostack, preserves_flags)) };
+    let yes = (isar1 >> 52) & 0xf == 1;
+    CACHE.store(if yes { 2 } else { 1 }, Ordering::Relaxed);
+    yes
+}
+
 /// A hardware random word via `RNDR` (FEAT_RNG), or 0 when the feature is
 /// absent (QEMU `virt`/HVF usually lack it). See `arch::hw_rand`.
 pub fn hw_rand() -> u64 {

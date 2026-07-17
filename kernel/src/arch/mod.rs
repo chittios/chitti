@@ -19,7 +19,7 @@ pub use x86_64::{hlt, interrupts, poweroff, reboot};
 pub mod aarch64;
 
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::{hlt, interrupts, poweroff, reboot};
+pub use aarch64::{has_i8mm, hlt, interrupts, poweroff, reboot};
 
 /// Milliseconds since boot -- the PIT tick counter on x86, the generic timer
 /// on aarch64. Used for inference throughput timing.

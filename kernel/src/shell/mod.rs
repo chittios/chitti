@@ -4259,13 +4259,14 @@ impl ChatSession {
         let mut last_ui = t0;
         let mut last_log = 0usize;
         // Batch-capable models (uniform Q8_0/Q1_0/Q2_0 weights) prefill in
-        // 32-token weight-stationary chunks: each weight is read from memory
+        // 64-token weight-stationary chunks: each weight is read from memory
         // once per *chunk* instead of once per token, which is what makes a
         // 27B's ~1.5k-token system prompt minutes, not hours. The chunk
         // boundary keeps the UI pump + Ctrl+C cancel latency bounded (one
         // chunk = one bounded matmul pass); mixed-quant models keep the
-        // per-token path.
-        let chunk = if self.model.batched_prefill_supported() { 32 } else { 1 };
+        // per-token path. 64 amortizes weight traffic further than 32 at the
+        // cost of ~2× m-wide scratch (still well under the 1 GiB heap).
+        let chunk = if self.model.batched_prefill_supported() { 64 } else { 1 };
         let mut i = 0usize;
         while i < last {
             let j = core::cmp::min(i + chunk, last);
@@ -4277,7 +4278,7 @@ impl ChatSession {
             } else {
                 // Batched chunk. It computes logits after its last token —
                 // required for the final chunk (`prime`), ~0.3% overhead on
-                // the others (one vocab matvec per 32 full-model tokens).
+                // the others (one vocab matvec per chunk of full-model tokens).
                 self.model.prefill(&ids[i..j], self.pos + i, &mut self.kv, &mut self.state);
             }
             fed = j;

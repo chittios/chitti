@@ -658,10 +658,22 @@ impl<'a> Model<'a> {
         // splits `[0,rows)` across cores, each writing a disjoint row range.
         unsafe {
             match w.qt {
+                // Q1_0: the i8mm (vmmlaq_s32) 2×2-tile GEMM does 2× the MAC/instr
+                // of SDOT — used for real batches (m≥2) when the CPU has
+                // FEAT_I8MM; else the SDOT matmul. (m==1 has no 2nd column for a
+                // 2×2 tile, so i8mm gives nothing there — keep SDOT.)
+                tensor::QT_Q1_0 if m >= 2 && crate::arch::has_i8mm() => crate::arch::aarch64::smp::matmul_q1_0_i8mm(
+                    w.data.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols,
+                ),
                 tensor::QT_Q1_0 => crate::arch::aarch64::smp::matmul_q1_0_sdot(
                     w.data.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols,
                 ),
                 tensor::QT_Q2_0 => crate::arch::aarch64::smp::matmul_q2_0_sdot(
+                    w.data.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols,
+                ),
+                // Q8_0: weights are already int8, so i8mm needs no unpack — the
+                // cleanest 2×2 tile. Used for real batches (m≥2) with FEAT_I8MM.
+                tensor::QT_Q8_0 if m >= 2 && crate::arch::has_i8mm() => crate::arch::aarch64::smp::matmul_q8_0_i8mm(
                     w.data.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols,
                 ),
                 _ => crate::arch::aarch64::smp::matmul_sdot(

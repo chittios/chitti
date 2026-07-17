@@ -5,6 +5,9 @@
 #![no_std]
 #![cfg_attr(test, no_main)]
 #![feature(custom_test_frameworks)]
+// `vmmlaq_s32` (FEAT_I8MM int8 matrix-multiply) for the Q1_0/Q2_0 batched
+// matmul fast path — still unstable in core::arch::aarch64.
+#![cfg_attr(target_arch = "aarch64", feature(stdarch_neon_i8mm))]
 // The custom_test_frameworks harness and the `x86-interrupt` ABI are x86-only
 // (tests boot via Limine + isa-debug-exit on qemu-system-x86_64).
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]

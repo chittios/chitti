@@ -38,6 +38,25 @@ const AP_STACK_SIZE: usize = 64 * 1024;
 /// it alone.
 const PARALLEL_MIN_ROWS: usize = 256;
 
+/// Total cores (BSP + workers) a **decode** (single-vector) matvec may use.
+/// Decode re-streams the whole model per token, so it is memory-bandwidth-
+/// bound: it saturates DRAM well before all 8 cores are busy, and past ~4 the
+/// extra threads only contend on the bus while the slow (E-)cores drag the
+/// barrier. Measured on this M2: llama.cpp decodes *faster* on 4 threads than
+/// 8 (4.37 vs 3.18 t/s). Prefill (batched matmul) is compute-bound and keeps
+/// the full fleet.
+const DECODE_MAX_PARTS: usize = 4;
+
+/// Workers for a bandwidth-bound decode matvec — [`fleet_workers`] capped so
+/// BSP + workers ≤ [`DECODE_MAX_PARTS`]. Reserved: a hard core cap on decode
+/// measured *worse* here (our weighted-barrier row split degrades at small
+/// part counts, unlike llama.cpp's independent thread pool), so decode keeps
+/// the full fleet + speed-weighted rows; kept for future revisit.
+#[allow(dead_code)]
+fn decode_workers() -> usize {
+    fleet_workers().min(DECODE_MAX_PARTS.saturating_sub(1))
+}
+
 #[repr(C, align(16))]
 struct ApStack([u8; AP_STACK_SIZE]);
 /// One private stack per potential secondary core (BSS; never zeroed-critical).
@@ -139,6 +158,50 @@ fn add_busy(core: usize, cycles: u64) {
     if let Some(a) = CORE_BUSY.get(core) {
         a.fetch_add(cycles, Ordering::Relaxed);
     }
+    // Remember the last slice cost for inverse-speed row weighting. A zero
+    // sample means "no data yet" → equal split; store at least 1.
+    if let Some(a) = LAST_SLICE.get(core) {
+        a.store(cycles.max(1), Ordering::Relaxed);
+    }
+}
+
+/// Cycles spent on the most recent matvec/matmul slice per core (0 = unknown).
+/// Used by [`row_boundary`] so faster cores (P) absorb more rows and the
+/// barrier no longer waits on equal-share E-core stragglers under HVF.
+static LAST_SLICE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Exclusive end of part `k` in a `n_parts`-way split of `n_rows` (part 0 is
+/// the BSP). When every core has a [`LAST_SLICE`] sample, rows are allotted
+/// ∝ 1/cycles (faster cores get more work); otherwise equal split.
+#[inline]
+fn row_boundary(n_rows: usize, n_parts: usize, k: usize) -> usize {
+    if k == 0 {
+        return 0;
+    }
+    if k >= n_parts {
+        return n_rows;
+    }
+    let mut w = [0u64; MAX_CPUS];
+    let mut have = true;
+    for i in 0..n_parts {
+        let c = LAST_SLICE[i].load(Ordering::Relaxed);
+        if c == 0 {
+            have = false;
+            break;
+        }
+        // weight ∝ 1/cost; scale so small cycle counts stay integral.
+        w[i] = (1_000_000u64 / c).max(1);
+    }
+    if !have {
+        return k * n_rows / n_parts;
+    }
+    let sum: u64 = w[..n_parts].iter().sum::<u64>().max(1);
+    let mut acc_w = 0u64;
+    for i in 0..k {
+        acc_w += w[i];
+    }
+    let end = ((n_rows as u64 * acc_w) / sum) as usize;
+    end.min(n_rows)
 }
 
 extern "C" {
@@ -249,6 +312,14 @@ pub fn init() {
     }
     let online = N_WORKERS.load(Ordering::Acquire) + 1;
     crate::ktrace::log_fmt(format_args!("smp: {online} cores online (BSP + {} workers, discovered via PSCI)", online - 1));
+    // Whether the int8 matrix-multiply (FEAT_I8MM / `vmmlaq_s32`) is available
+    // to the guest gates the Q1_0/Q2_0 i8mm matmul fast path; log it once so a
+    // slow prefill can be diagnosed as "HVF masked I8MM → vdotq fallback".
+    crate::ktrace::log_fmt(format_args!(
+        "smp: FEAT_I8MM {} (Q1_0/Q2_0 batched matmul uses {})",
+        if super::has_i8mm() { "yes" } else { "no" },
+        if super::has_i8mm() { "vmmla i8mm" } else { "vdotq" }
+    ));
 
     // Wake self-test: push one trivial generation through the real job/barrier
     // machinery. A hypervisor that never wakes a `WFE`-parked vCPU (VirtualBox-
@@ -528,10 +599,19 @@ fn worker_loop(slot: usize) -> ! {
                     0 => tensor::matmul_q8_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols),
                     1 => tensor::matvec_q4_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols),
                     3 => tensor::matvec_q4_k_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols),
+                    // Q1/Q2: static contiguous row ranges (not work-steal).
+                    // Fine-grained steal re-ran Q1 act-sum precompute per slab
+                    // and shredded sequential weight locality — measured ~1 t/s
+                    // tg on 8 vCPUs, i.e. near single-core. Contiguous split
+                    // restores L2 streaming + one precompute per core.
                     5 => tensor::matvec_q2_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols),
                     6 => tensor::matvec_q1_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols),
                     7 => tensor::matmul_q1_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols),
                     8 => tensor::matmul_q2_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols),
+                    // 9/10 = Q1_0 / Q8_0 i8mm matmul. Only dispatched when
+                    // has_i8mm() is true, so the kernels' FEAT_I8MM precondition holds.
+                    9 => tensor::matmul_q1_0_i8mm_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols),
+                    10 => tensor::matmul_q8_0_i8mm_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols),
                     4 => {
                         // Generic row work (video YUV→RGB, etc.).
                         let fp = JOB.fn_ptr.load(Ordering::Relaxed);
@@ -763,9 +843,10 @@ pub unsafe fn matvec_q4_k_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
     barrier(workers, g, &|rs, re| unsafe { tensor::matvec_q4_k_sdot_rows(w, xq, xs, y, rs, re, n_cols) });
 }
 
-/// `y = W·x` for Q2_0 weights split across online cores by row range — the fast
-/// PrismML ternary path (`matvec_q2_0_sdot_rows`, Bonsai-27B). Falls back to
-/// single-core when only the BSP is online or the matrix is small.
+/// `y = W·x` for Q2_0 weights split across online cores by **contiguous**
+/// row range — the fast PrismML ternary path (`matvec_q2_0_sdot_rows`,
+/// Bonsai-27B). Falls back to single-core when only the BSP is online or the
+/// matrix is small.
 ///
 /// # Safety
 /// Same contract as `tensor::matvec_q2_0_sdot_rows` over `[0, n_rows)`.
@@ -777,7 +858,7 @@ pub unsafe fn matvec_q2_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
         return;
     }
     let n_parts = workers + 1;
-    let boundary = |k: usize| k * n_rows / n_parts;
+    let b0 = row_boundary(n_rows, n_parts, 1);
     JOB.w.store(w as *mut u8, Ordering::Relaxed);
     JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
     JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
@@ -785,24 +866,24 @@ pub unsafe fn matvec_q2_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
     JOB.n_cols.store(n_cols, Ordering::Relaxed);
     JOB.mode.store(5, Ordering::Relaxed); // Q2_0 SDOT
     for s in 0..workers {
-        JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
-        JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
+        JOB.row_start[s].store(row_boundary(n_rows, n_parts, s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(row_boundary(n_rows, n_parts, s + 2), Ordering::Relaxed);
     }
     clear_unused_slots(workers);
     let g = JOB.go.load(Ordering::Relaxed) + 1;
     JOB.go.store(g, Ordering::Release);
-    signal_workers(); // wake WFE-parked workers
-    // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    signal_workers();
     let t0 = super::cycle_count();
-    unsafe { tensor::matvec_q2_0_sdot_rows(w, xq, xs, y, 0, boundary(1), n_cols) };
+    // SAFETY: disjoint row range [0, b0); caller's contract.
+    unsafe { tensor::matvec_q2_0_sdot_rows(w, xq, xs, y, 0, b0, n_cols) };
     add_busy(0, super::cycle_count().wrapping_sub(t0));
-    // SAFETY: same contract as the chunk above, over the straggler's range.
     barrier(workers, g, &|rs, re| unsafe { tensor::matvec_q2_0_sdot_rows(w, xq, xs, y, rs, re, n_cols) });
 }
 
-/// `y = W·x` for Q1_0 (binary) weights split across online cores by row range —
-/// the fast PrismML 1-bit path (`matvec_q1_0_sdot_rows`, Bonsai-27B). Falls back
-/// to single-core when only the BSP is online or the matrix is small.
+/// `y = W·x` for Q1_0 (binary) weights split across online cores by
+/// contiguous row range — the fast PrismML 1-bit path
+/// (`matvec_q1_0_sdot_rows`, Bonsai-27B). Falls back to single-core when only
+/// the BSP is online or the matrix is small.
 ///
 /// # Safety
 /// Same contract as `tensor::matvec_q1_0_sdot_rows` over `[0, n_rows)`.
@@ -814,7 +895,7 @@ pub unsafe fn matvec_q1_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
         return;
     }
     let n_parts = workers + 1;
-    let boundary = |k: usize| k * n_rows / n_parts;
+    let b0 = row_boundary(n_rows, n_parts, 1);
     JOB.w.store(w as *mut u8, Ordering::Relaxed);
     JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
     JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
@@ -822,24 +903,23 @@ pub unsafe fn matvec_q1_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
     JOB.n_cols.store(n_cols, Ordering::Relaxed);
     JOB.mode.store(6, Ordering::Relaxed); // Q1_0 SDOT
     for s in 0..workers {
-        JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
-        JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
+        JOB.row_start[s].store(row_boundary(n_rows, n_parts, s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(row_boundary(n_rows, n_parts, s + 2), Ordering::Relaxed);
     }
     clear_unused_slots(workers);
     let g = JOB.go.load(Ordering::Relaxed) + 1;
     JOB.go.store(g, Ordering::Release);
-    signal_workers(); // wake WFE-parked workers
-    // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    signal_workers();
     let t0 = super::cycle_count();
-    unsafe { tensor::matvec_q1_0_sdot_rows(w, xq, xs, y, 0, boundary(1), n_cols) };
+    // SAFETY: disjoint row range [0, b0); caller's contract.
+    unsafe { tensor::matvec_q1_0_sdot_rows(w, xq, xs, y, 0, b0, n_cols) };
     add_busy(0, super::cycle_count().wrapping_sub(t0));
-    // SAFETY: same contract as the chunk above, over the straggler's range.
     barrier(workers, g, &|rs, re| unsafe { tensor::matvec_q1_0_sdot_rows(w, xq, xs, y, rs, re, n_cols) });
 }
 
 /// Batched weight-stationary `Q1_0` matmul (`y[m][r] = W[r]·xq[m]`) split
-/// across online cores by row range — the batched-prefill kernel for the
-/// 1-bit Bonsai (`matmul_q1_0_sdot_rows`).
+/// across online cores by contiguous row range — the batched-prefill kernel
+/// for the 1-bit Bonsai (`matmul_q1_0_sdot_rows`).
 ///
 /// # Safety
 /// Same contract as `tensor::matmul_q1_0_sdot_rows` over `[0, n_rows)`.
@@ -851,7 +931,7 @@ pub unsafe fn matmul_q1_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
         return;
     }
     let n_parts = workers + 1;
-    let boundary = |k: usize| k * n_rows / n_parts;
+    let b0 = row_boundary(n_rows, n_parts, 1);
     JOB.w.store(w as *mut u8, Ordering::Relaxed);
     JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
     JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
@@ -861,23 +941,107 @@ pub unsafe fn matmul_q1_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
     JOB.n_rows.store(n_rows, Ordering::Relaxed);
     JOB.mode.store(7, Ordering::Relaxed); // Q1_0 SDOT matmul
     for s in 0..workers {
-        JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
-        JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
+        JOB.row_start[s].store(row_boundary(n_rows, n_parts, s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(row_boundary(n_rows, n_parts, s + 2), Ordering::Relaxed);
     }
     clear_unused_slots(workers);
     let g = JOB.go.load(Ordering::Relaxed) + 1;
     JOB.go.store(g, Ordering::Release);
-    signal_workers(); // wake WFE-parked workers
-    // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    signal_workers();
     let t0 = super::cycle_count();
-    unsafe { tensor::matmul_q1_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, boundary(1), n_cols) };
+    // SAFETY: disjoint row range [0, b0); caller's contract.
+    unsafe { tensor::matmul_q1_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, b0, n_cols) };
     add_busy(0, super::cycle_count().wrapping_sub(t0));
-    // SAFETY: same contract as the chunk above, over the straggler's range.
-    barrier(workers, g, &|rs, re| unsafe { tensor::matmul_q1_0_sdot_rows(w, xq, xs, y, m_count, n_rows, rs, re, n_cols) });
+    barrier(workers, g, &|rs, re| unsafe {
+        tensor::matmul_q1_0_sdot_rows(w, xq, xs, y, m_count, n_rows, rs, re, n_cols)
+    });
 }
 
-/// Batched weight-stationary `Q2_0` matmul split across online cores — the
-/// batched-prefill kernel for Ternary-Bonsai (`matmul_q2_0_sdot_rows`).
+/// Batched weight-stationary `Q1_0` matmul via **i8mm** (`vmmlaq_s32`) split
+/// across online cores — the fast prefill path when the CPU has FEAT_I8MM.
+/// Same shape as [`matmul_q1_0_sdot`] but mode 9 / `matmul_q1_0_i8mm_rows`.
+///
+/// # Safety
+/// The CPU must implement FEAT_I8MM (caller gates on `super::has_i8mm()`);
+/// otherwise same contract as `tensor::matmul_q1_0_i8mm_rows` over `[0,n_rows)`.
+pub unsafe fn matmul_q1_0_i8mm(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, m_count: usize, n_rows: usize, n_cols: usize) {
+    let workers = fleet_workers();
+    if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
+        // SAFETY: caller guarantees FEAT_I8MM; whole range on this core.
+        unsafe { tensor::matmul_q1_0_i8mm_rows(w, xq, xs, y, m_count, n_rows, 0, n_rows, n_cols) };
+        return;
+    }
+    let n_parts = workers + 1;
+    let b0 = row_boundary(n_rows, n_parts, 1);
+    JOB.w.store(w as *mut u8, Ordering::Relaxed);
+    JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
+    JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
+    JOB.y.store(y, Ordering::Relaxed);
+    JOB.n_cols.store(n_cols, Ordering::Relaxed);
+    JOB.m_count.store(m_count, Ordering::Relaxed);
+    JOB.n_rows.store(n_rows, Ordering::Relaxed);
+    JOB.mode.store(9, Ordering::Relaxed); // Q1_0 i8mm matmul
+    for s in 0..workers {
+        JOB.row_start[s].store(row_boundary(n_rows, n_parts, s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(row_boundary(n_rows, n_parts, s + 2), Ordering::Relaxed);
+    }
+    clear_unused_slots(workers);
+    let g = JOB.go.load(Ordering::Relaxed) + 1;
+    JOB.go.store(g, Ordering::Release);
+    signal_workers();
+    let t0 = super::cycle_count();
+    // SAFETY: FEAT_I8MM per caller; disjoint row range [0, b0).
+    unsafe { tensor::matmul_q1_0_i8mm_rows(w, xq, xs, y, m_count, n_rows, 0, b0, n_cols) };
+    add_busy(0, super::cycle_count().wrapping_sub(t0));
+    barrier(workers, g, &|rs, re| unsafe {
+        tensor::matmul_q1_0_i8mm_rows(w, xq, xs, y, m_count, n_rows, rs, re, n_cols)
+    });
+}
+
+/// Batched weight-stationary `Q8_0` matmul via **i8mm** (`vmmlaq_s32`) split
+/// across online cores — the fast prefill path for Q8_0 (the 0.8B) when the CPU
+/// has FEAT_I8MM. Same shape as [`matmul_sdot`] but mode 10 / the i8mm kernel.
+///
+/// # Safety
+/// The CPU must implement FEAT_I8MM (caller gates on `super::has_i8mm()`);
+/// otherwise same contract as `tensor::matmul_q8_0_i8mm_rows` over `[0,n_rows)`.
+pub unsafe fn matmul_q8_0_i8mm(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, m_count: usize, n_rows: usize, n_cols: usize) {
+    let workers = fleet_workers();
+    if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
+        // SAFETY: caller guarantees FEAT_I8MM; whole range on this core.
+        unsafe { tensor::matmul_q8_0_i8mm_rows(w, xq, xs, y, m_count, n_rows, 0, n_rows, n_cols) };
+        return;
+    }
+    let n_parts = workers + 1;
+    let b0 = row_boundary(n_rows, n_parts, 1);
+    JOB.w.store(w as *mut u8, Ordering::Relaxed);
+    JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
+    JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
+    JOB.y.store(y, Ordering::Relaxed);
+    JOB.n_cols.store(n_cols, Ordering::Relaxed);
+    JOB.m_count.store(m_count, Ordering::Relaxed);
+    JOB.n_rows.store(n_rows, Ordering::Relaxed);
+    JOB.mode.store(10, Ordering::Relaxed); // Q8_0 i8mm matmul
+    for s in 0..workers {
+        JOB.row_start[s].store(row_boundary(n_rows, n_parts, s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(row_boundary(n_rows, n_parts, s + 2), Ordering::Relaxed);
+    }
+    clear_unused_slots(workers);
+    let g = JOB.go.load(Ordering::Relaxed) + 1;
+    JOB.go.store(g, Ordering::Release);
+    signal_workers();
+    let t0 = super::cycle_count();
+    // SAFETY: FEAT_I8MM per caller; disjoint row range [0, b0).
+    unsafe { tensor::matmul_q8_0_i8mm_rows(w, xq, xs, y, m_count, n_rows, 0, b0, n_cols) };
+    add_busy(0, super::cycle_count().wrapping_sub(t0));
+    barrier(workers, g, &|rs, re| unsafe {
+        tensor::matmul_q8_0_i8mm_rows(w, xq, xs, y, m_count, n_rows, rs, re, n_cols)
+    });
+}
+
+/// Batched weight-stationary `Q2_0` matmul split across online cores by
+/// contiguous row range — the batched-prefill kernel for Ternary-Bonsai
+/// (`matmul_q2_0_sdot_rows`).
 ///
 /// # Safety
 /// Same contract as `tensor::matmul_q2_0_sdot_rows` over `[0, n_rows)`.
@@ -889,7 +1053,7 @@ pub unsafe fn matmul_q2_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
         return;
     }
     let n_parts = workers + 1;
-    let boundary = |k: usize| k * n_rows / n_parts;
+    let b0 = row_boundary(n_rows, n_parts, 1);
     JOB.w.store(w as *mut u8, Ordering::Relaxed);
     JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
     JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
@@ -899,17 +1063,18 @@ pub unsafe fn matmul_q2_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
     JOB.n_rows.store(n_rows, Ordering::Relaxed);
     JOB.mode.store(8, Ordering::Relaxed); // Q2_0 SDOT matmul
     for s in 0..workers {
-        JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
-        JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
+        JOB.row_start[s].store(row_boundary(n_rows, n_parts, s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(row_boundary(n_rows, n_parts, s + 2), Ordering::Relaxed);
     }
     clear_unused_slots(workers);
     let g = JOB.go.load(Ordering::Relaxed) + 1;
     JOB.go.store(g, Ordering::Release);
-    signal_workers(); // wake WFE-parked workers
-    // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    signal_workers();
     let t0 = super::cycle_count();
-    unsafe { tensor::matmul_q2_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, boundary(1), n_cols) };
+    // SAFETY: disjoint row range [0, b0); caller's contract.
+    unsafe { tensor::matmul_q2_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, b0, n_cols) };
     add_busy(0, super::cycle_count().wrapping_sub(t0));
-    // SAFETY: same contract as the chunk above, over the straggler's range.
-    barrier(workers, g, &|rs, re| unsafe { tensor::matmul_q2_0_sdot_rows(w, xq, xs, y, m_count, n_rows, rs, re, n_cols) });
+    barrier(workers, g, &|rs, re| unsafe {
+        tensor::matmul_q2_0_sdot_rows(w, xq, xs, y, m_count, n_rows, rs, re, n_cols)
+    });
 }

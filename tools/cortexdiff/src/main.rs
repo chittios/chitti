@@ -1,3 +1,4 @@
+#![cfg_attr(target_arch = "aarch64", feature(stdarch_neon_i8mm))]
 //! **cortexdiff** — host-side calibration harness for the kernel's GGUF /
 //! transformer engine (`kernel/src/cortex`). Mounts the kernel's own parser,
 //! tensor kernels, tokenizer, and forward pass natively (`#[path]`, the
@@ -40,6 +41,18 @@ pub mod ktrace {
 /// wrappers row-split across cores in-kernel; here they run the identical
 /// single-core `tensor::*_rows` drivers, so the math under test is unchanged.
 pub mod arch {
+    /// Host-side FEAT_I8MM probe (the kernel reads ID_AA64ISAR1_EL1; on the
+    /// host we ask std). Gates the i8mm matmul in the mounted `model.rs`.
+    #[cfg(target_arch = "aarch64")]
+    pub fn has_i8mm() -> bool {
+        // CHITTI_NO_I8MM=1 forces the SDOT path for host A/B timing.
+        std::env::var("CHITTI_NO_I8MM").is_err() && std::arch::is_aarch64_feature_detected!("i8mm")
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn has_i8mm() -> bool {
+        false
+    }
+
     #[cfg(target_arch = "aarch64")]
     pub mod aarch64 {
         pub mod smp {
@@ -93,6 +106,19 @@ pub mod arch {
             /// Same contract as `tensor::matmul_q1_0_sdot_rows` over `[0, n_rows)`.
             pub unsafe fn matmul_q1_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, m_count: usize, n_rows: usize, n_cols: usize) {
                 unsafe { tensor::matmul_q1_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, n_rows, n_cols) }
+            }
+
+            /// # Safety
+            /// FEAT_I8MM required (caller gates on `crate::arch::has_i8mm()`);
+            /// same contract as `tensor::matmul_q1_0_i8mm_rows` over `[0, n_rows)`.
+            pub unsafe fn matmul_q1_0_i8mm(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, m_count: usize, n_rows: usize, n_cols: usize) {
+                unsafe { tensor::matmul_q1_0_i8mm_rows(w, xq, xs, y, m_count, n_rows, 0, n_rows, n_cols) }
+            }
+
+            /// # Safety
+            /// FEAT_I8MM required; same contract as `tensor::matmul_q8_0_i8mm_rows`.
+            pub unsafe fn matmul_q8_0_i8mm(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, m_count: usize, n_rows: usize, n_cols: usize) {
+                unsafe { tensor::matmul_q8_0_i8mm_rows(w, xq, xs, y, m_count, n_rows, 0, n_rows, n_cols) }
             }
 
             /// # Safety

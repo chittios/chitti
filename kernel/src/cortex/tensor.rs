@@ -1009,6 +1009,22 @@ unsafe fn ldp_s8(p: *const i8) -> (core::arch::aarch64::int8x16_t, core::arch::a
     (a, b)
 }
 
+/// Software prefetch of the next sequential weight/activation address into L1
+/// (`pldl1strm` — streaming, not retained past use). The Q1/Q2 matvec walks
+/// rows and blocks contiguously, so this hides DRAM latency behind SDOT.
+///
+/// # Safety
+/// Prefetch of an invalid address is architecturally a no-op on aarch64; the
+/// pointer need only be a plausible upcoming load target.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn prefetch_l1(p: *const u8) {
+    // SAFETY: `prfm` is side-effect-free w.r.t. architectural state.
+    unsafe {
+        core::arch::asm!("prfm pldl1strm, [{p}]", p = in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+}
+
 /// 16-byte-aligned constant block for `ldq_u8`-loaded NEON lookup vectors.
 #[cfg(target_arch = "aarch64")]
 #[repr(align(16))]
@@ -1275,39 +1291,133 @@ unsafe fn q2_0_unpack64(b: core::arch::aarch64::uint8x16_t) -> [core::arch::aarc
     ]
 }
 
+/// One Q2_0 128-elem block contribution into a float32x4 accumulator chain:
+/// unpack once, 4 sub-block SDOTs with independent FMA scales `d·xs_j`. The
+/// four lanes of `$f` hold independent partial sums of the *same* block (the
+/// SDOT int32x4 split) — matching [`sdot_one_row`]'s ILP shape.
+#[cfg(target_arch = "aarch64")]
+macro_rules! q2_0_block_into {
+    ($f:expr, $row:expr, $xq:expr, $xs:expr, $b:expr) => {{
+        use core::arch::aarch64::{
+            vaddq_s32, vcvtq_f32_s32, vdotq_s32, vdupq_n_s32, vfmaq_n_f32,
+        };
+        let base = $b * Q2_0_BLOCK_BYTES;
+        let d = f16_to_f32(u16::from_le_bytes([*$row.add(base), *$row.add(base + 1)]));
+        let qs = $row.add(base + 2);
+        let lo = q2_0_unpack64(ldq_u8(qs));
+        let hi = q2_0_unpack64(ldq_u8(qs.add(16)));
+        let s = [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]];
+        let xsp = $xs.add($b * (QK2_0 / QK));
+        let xqp = $xq.add($b * QK2_0);
+        // Four independent sub-block FMAs into the same chain (no serial f32).
+        let (x0, x1) = ldp_s8(xqp);
+        let d0 = vaddq_s32(vdotq_s32(vdupq_n_s32(0), s[0], x0), vdotq_s32(vdupq_n_s32(0), s[1], x1));
+        $f = vfmaq_n_f32($f, vcvtq_f32_s32(d0), d * *xsp);
+        let (x0, x1) = ldp_s8(xqp.add(32));
+        let d1 = vaddq_s32(vdotq_s32(vdupq_n_s32(0), s[2], x0), vdotq_s32(vdupq_n_s32(0), s[3], x1));
+        $f = vfmaq_n_f32($f, vcvtq_f32_s32(d1), d * *xsp.add(1));
+        let (x0, x1) = ldp_s8(xqp.add(64));
+        let d2 = vaddq_s32(vdotq_s32(vdupq_n_s32(0), s[4], x0), vdotq_s32(vdupq_n_s32(0), s[5], x1));
+        $f = vfmaq_n_f32($f, vcvtq_f32_s32(d2), d * *xsp.add(2));
+        let (x0, x1) = ldp_s8(xqp.add(96));
+        let d3 = vaddq_s32(vdotq_s32(vdupq_n_s32(0), s[6], x0), vdotq_s32(vdupq_n_s32(0), s[7], x1));
+        $f = vfmaq_n_f32($f, vcvtq_f32_s32(d3), d * *xsp.add(3));
+    }};
+}
+
 /// One Q2_0 row (`n_cols/128` blocks) · int8-quantized activation, NEON SDOT —
 /// the fast path for the PrismML ternary `Q2_0` weights (Bonsai-27B). Each
 /// 128-element block carries one f16 scale `d` + 128 2-bit codes (`c ∈ 0..3`,
 /// value `(c-1)·d`). Per 32-element sub-block `j` (the activation's quant
-/// granularity, scale `xs_j`): `d · xs_j · SDOT(c-1, xq_j)`. No per-element
-/// scalar work; all loads via the `ldq_*`/`ldp_*` inline-asm helpers (the
+/// granularity, scale `xs_j`): `d · xs_j · SDOT(c-1, xq_j)`.
+///
+/// **ILP:** four independent `float32x4` accumulator chains process four
+/// consecutive blocks (like [`sdot_one_row`]), so FMA latency is hidden on
+/// Firestorm's 4 SIMD pipes. All loads via `ldq_*`/`ldp_*` (the
 /// `+strict-align` rule).
 #[cfg(target_arch = "aarch64")]
 unsafe fn sdot_one_row_q2_0(row: *const u8, xq: *const i8, xs: *const f32, blocks: usize) -> f32 {
-    use core::arch::aarch64::{vaddvq_s32, vdotq_s32, vdupq_n_s32};
+    use core::arch::aarch64::{vaddq_f32, vaddvq_f32, vdupq_n_f32};
     // SAFETY: caller's contract; all loads in-bounds.
     unsafe {
-        let mut acc = 0.0f32;
+        let mut f0 = vdupq_n_f32(0.0);
+        let mut f1 = vdupq_n_f32(0.0);
+        let mut f2 = vdupq_n_f32(0.0);
+        let mut f3 = vdupq_n_f32(0.0);
+        let mut b = 0;
+        while b + 4 <= blocks {
+            q2_0_block_into!(f0, row, xq, xs, b);
+            q2_0_block_into!(f1, row, xq, xs, b + 1);
+            q2_0_block_into!(f2, row, xq, xs, b + 2);
+            q2_0_block_into!(f3, row, xq, xs, b + 3);
+            b += 4;
+        }
+        while b < blocks {
+            q2_0_block_into!(f0, row, xq, xs, b);
+            b += 1;
+        }
+        vaddvq_f32(vaddq_f32(vaddq_f32(f0, f1), vaddq_f32(f2, f3)))
+    }
+}
+
+/// Two Q2_0 rows against the same activation: unpack/SDOT both weight rows
+/// while the activation tile stays in registers — halves activation reload
+/// traffic on the decode matvec (weight is only 34 B/block; activation is
+/// 128 i8 + 4 scales per block).
+#[cfg(target_arch = "aarch64")]
+unsafe fn sdot_two_rows_q2_0(
+    row0: *const u8,
+    row1: *const u8,
+    xq: *const i8,
+    xs: *const f32,
+    blocks: usize,
+) -> (f32, f32) {
+    use core::arch::aarch64::{
+        vaddq_s32, vaddvq_f32, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32, vfmaq_n_f32,
+    };
+    // SAFETY: caller's contract; all loads in-bounds.
+    unsafe {
+        let mut a0 = vdupq_n_f32(0.0);
+        let mut a1 = vdupq_n_f32(0.0);
         for b in 0..blocks {
             let base = b * Q2_0_BLOCK_BYTES;
-            let d = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
-            let qs = row.add(base + 2);
-            // 128 codes = two 16-byte halves → 8 contiguous int8x16 (elements
-            // 0..64 then 64..128), i.e. 4 sub-blocks of 32 (2 vectors each).
-            let lo = q2_0_unpack64(ldq_u8(qs)); // elements 0..64  (sub-blocks 0,1)
-            let hi = q2_0_unpack64(ldq_u8(qs.add(16))); // elements 64..128 (sub-blocks 2,3)
-            let s = [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]];
+            let d0 = f16_to_f32(u16::from_le_bytes([*row0.add(base), *row0.add(base + 1)]));
+            let d1 = f16_to_f32(u16::from_le_bytes([*row1.add(base), *row1.add(base + 1)]));
+            let lo0 = q2_0_unpack64(ldq_u8(row0.add(base + 2)));
+            let hi0 = q2_0_unpack64(ldq_u8(row0.add(base + 18)));
+            let lo1 = q2_0_unpack64(ldq_u8(row1.add(base + 2)));
+            let hi1 = q2_0_unpack64(ldq_u8(row1.add(base + 18)));
+            let s0 = [lo0[0], lo0[1], lo0[2], lo0[3], hi0[0], hi0[1], hi0[2], hi0[3]];
+            let s1 = [lo1[0], lo1[1], lo1[2], lo1[3], hi1[0], hi1[1], hi1[2], hi1[3]];
+            let xsp = xs.add(b * (QK2_0 / QK));
+            let xqp = xq.add(b * QK2_0);
+            // Prefetch the next block of both weight rows (sequential).
+            if b + 1 < blocks {
+                prefetch_l1(row0.add((b + 1) * Q2_0_BLOCK_BYTES));
+                prefetch_l1(row1.add((b + 1) * Q2_0_BLOCK_BYTES));
+            }
             for j in 0..4 {
-                let (x0, x1) = ldp_s8(xq.add(b * QK2_0 + j * 32));
-                let dot = vaddvq_s32(vdotq_s32(vdotq_s32(vdupq_n_s32(0), s[2 * j], x0), s[2 * j + 1], x1));
-                acc += d * *xs.add(b * (QK2_0 / QK) + j) * dot as f32;
+                let (x0, x1) = ldp_s8(xqp.add(j * 32));
+                let scale0 = d0 * *xsp.add(j);
+                let scale1 = d1 * *xsp.add(j);
+                let dot0 = vaddq_s32(
+                    vdotq_s32(vdupq_n_s32(0), s0[2 * j], x0),
+                    vdotq_s32(vdupq_n_s32(0), s0[2 * j + 1], x1),
+                );
+                let dot1 = vaddq_s32(
+                    vdotq_s32(vdupq_n_s32(0), s1[2 * j], x0),
+                    vdotq_s32(vdupq_n_s32(0), s1[2 * j + 1], x1),
+                );
+                a0 = vfmaq_n_f32(a0, vcvtq_f32_s32(dot0), scale0);
+                a1 = vfmaq_n_f32(a1, vcvtq_f32_s32(dot1), scale1);
             }
         }
-        acc
+        (vaddvq_f32(a0), vaddvq_f32(a1))
     }
 }
 
 /// Q2_0 rows over `[row_start, row_end)` against int8-quantized activations.
+/// Processes rows in pairs (shared activation loads) with weight prefetch.
 ///
 /// # Safety
 /// `w` = rows of `n_cols/128` Q2_0 blocks; `xq` = `n_cols` i8; `xs` =
@@ -1326,7 +1436,18 @@ pub unsafe fn matvec_q2_0_sdot_rows(
     let row_bytes = blocks * Q2_0_BLOCK_BYTES;
     // SAFETY: caller's contract.
     unsafe {
-        for r in row_start..row_end {
+        let mut r = row_start;
+        while r + 1 < row_end {
+            if r + 2 < row_end {
+                prefetch_l1(w.add((r + 2) * row_bytes));
+                prefetch_l1(w.add((r + 3) * row_bytes));
+            }
+            let (v0, v1) = sdot_two_rows_q2_0(w.add(r * row_bytes), w.add((r + 1) * row_bytes), xq, xs, blocks);
+            *y.add(r) = v0;
+            *y.add(r + 1) = v1;
+            r += 2;
+        }
+        if r < row_end {
             *y.add(r) = sdot_one_row_q2_0(w.add(r * row_bytes), xq, xs, blocks);
         }
     }
@@ -1359,50 +1480,195 @@ pub fn matvec_q2_0_fast(w: &[u8], x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &
     }
 }
 
+/// Expand 16 Q1_0 sign-bit lanes to `{0,1}` int8 (not ±1): `vtst` + `vand`
+/// with 1. Combined with precomputed activation block sums this implements
+/// `dot(x, ±1) = 2·SDOT(x, bits∈{0,1}) − Σx` without a `vbsl`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn q1_0_bits01(
+    bytes: core::arch::aarch64::uint8x16_t,
+    idx: core::arch::aarch64::uint8x16_t,
+    bit_mask: core::arch::aarch64::uint8x16_t,
+    one_u8: core::arch::aarch64::uint8x16_t,
+) -> core::arch::aarch64::int8x16_t {
+    use core::arch::aarch64::{vandq_u8, vqtbl1q_u8, vreinterpretq_s8_u8, vtstq_u8};
+    // SAFETY: pure register ops; `bytes`/`idx`/`bit_mask` loaded by caller.
+    unsafe { vreinterpretq_s8_u8(vandq_u8(vtstq_u8(vqtbl1q_u8(bytes, idx), bit_mask), one_u8)) }
+}
+
+/// Sum of 32 consecutive `i8` activation lanes as `i32` (used by the Q1_0
+/// `2·SDOT − Σx` identity; precomputed once per matvec, amortized across rows).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sum32_i8(p: *const i8) -> i32 {
+    use core::arch::aarch64::{vaddvq_s32, vmovl_s16, vmovl_s8, vget_high_s16, vget_high_s8, vget_low_s16, vget_low_s8, vaddq_s32};
+    // SAFETY: caller guarantees 32 readable bytes.
+    unsafe {
+        let (a, b) = ldp_s8(p);
+        // Widen i8→i16→i32 and horizontal-add. No SDOT dependency on a constant
+        // ones vector (keeps the helper independent of `dotprod` for host tests
+        // that only exercise the sum path indirectly via the full kernel).
+        let a_lo = vmovl_s8(vget_low_s8(a));
+        let a_hi = vmovl_s8(vget_high_s8(a));
+        let b_lo = vmovl_s8(vget_low_s8(b));
+        let b_hi = vmovl_s8(vget_high_s8(b));
+        let s0 = vaddq_s32(vmovl_s16(vget_low_s16(a_lo)), vmovl_s16(vget_high_s16(a_lo)));
+        let s1 = vaddq_s32(vmovl_s16(vget_low_s16(a_hi)), vmovl_s16(vget_high_s16(a_hi)));
+        let s2 = vaddq_s32(vmovl_s16(vget_low_s16(b_lo)), vmovl_s16(vget_high_s16(b_lo)));
+        let s3 = vaddq_s32(vmovl_s16(vget_low_s16(b_hi)), vmovl_s16(vget_high_s16(b_hi)));
+        vaddvq_s32(vaddq_s32(vaddq_s32(s0, s1), vaddq_s32(s2, s3)))
+    }
+}
+
 /// One Q1_0 row (`n_cols/128` blocks) · int8-quantized activation, NEON SDOT —
 /// the fast path for PrismML binary `Q1_0` weights (Bonsai-27B 1-bit). Each
 /// 128-element block is one f16 scale `d` + 128 sign bits (value `bit ? +d :
-/// −d`). Per 32-element sub-block `j` (activation scale `xs_j`):
-/// `d · xs_j · SDOT(sign, xq_j)`, `sign ∈ {−1,+1}`.
+/// −d`).
 ///
-/// The sign expand is fully vectorized: all 16 sign bytes are loaded **once**
-/// per block (`ldq_u8`), then each 16-lane group is `vqtbl1q` byte-broadcast
-/// ([`Q1_0_TBL_IDX`]), `vtst`-tested against the per-lane bit mask
-/// ([`Q1_0_BITS`], LSB-first — matching `dequant_q1_0_block`) and `vbsl`
-/// selected to ±1: 3 vector ops per 16 elements, no per-element scalar work.
-/// Loads via `ldq_*`/`ldp_*` (the `+strict-align` rule).
+/// **Math identity:** `dot(x, ±1) = 2·SDOT(x, bits∈{0,1}) − Σx`. The expand
+/// is `vqtbl1q`+`vtst`+`vand` (no `vbsl`); `Σx` per 32-elem activation block
+/// is passed in via `xsum` (precomputed once per matvec). **ILP:** four
+/// independent `float32x4` chains across consecutive blocks (like
+/// [`sdot_one_row`]). Loads via `ldq_*`/`ldp_*` (the `+strict-align` rule).
 #[cfg(target_arch = "aarch64")]
-unsafe fn sdot_one_row_q1_0(row: *const u8, xq: *const i8, xs: *const f32, blocks: usize) -> f32 {
+unsafe fn sdot_one_row_q1_0(row: *const u8, xq: *const i8, xs: *const f32, xsum: *const i32, blocks: usize) -> f32 {
     use core::arch::aarch64::{
-        uint8x16_t, vaddvq_s32, vbslq_s8, vdotq_s32, vdupq_n_s32, vdupq_n_s8, vqtbl1q_u8, vtstq_u8,
+        uint8x16_t, vaddq_f32, vaddq_s32, vaddvq_f32, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32,
+        vdupq_n_u8, vfmaq_n_f32,
     };
     // SAFETY: caller's contract; all loads in-bounds.
     unsafe {
         let idx: [uint8x16_t; 8] = core::array::from_fn(|k| ldq_u8(Q1_0_TBL_IDX[k].0.as_ptr()));
         let bits = ldq_u8(Q1_0_BITS.0.as_ptr());
-        let plus = vdupq_n_s8(1);
-        let minus = vdupq_n_s8(-1);
-        let mut acc = 0.0f32;
+        let one_u8 = vdupq_n_u8(1);
+        let mut f0 = vdupq_n_f32(0.0);
+        let mut f1 = vdupq_n_f32(0.0);
+        let mut f2 = vdupq_n_f32(0.0);
+        let mut f3 = vdupq_n_f32(0.0);
+        // Running scalar for −Σ_b d_b · Σ_j (xs_j · xsum_j); applied once at
+        // the end so the hot block loop stays free of stack spills / vsub.
+        let mut adj_total = 0.0f32;
+        // Process one block into chain `$f` — open-coded so the compiler keeps
+        // idx/bits/one_u8 in registers across the block loop.
+        macro_rules! one_block {
+            ($f:expr, $b:expr) => {{
+                let base = $b * Q1_0_BLOCK_BYTES;
+                let d = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
+                let bytes = ldq_u8(row.add(base + 2));
+                let xsp = xs.add($b * (QK1_0 / QK));
+                let xqp = xq.add($b * QK1_0);
+                let xsum_b = xsum.add($b * (QK1_0 / QK));
+                let mut adj = 0.0f32;
+                let mut j = 0;
+                while j < 4 {
+                    let b0 = q1_0_bits01(bytes, idx[2 * j], bits, one_u8);
+                    let b1 = q1_0_bits01(bytes, idx[2 * j + 1], bits, one_u8);
+                    let (x0, x1) = ldp_s8(xqp.add(j * 32));
+                    let dot = vaddq_s32(
+                        vdotq_s32(vdupq_n_s32(0), b0, x0),
+                        vdotq_s32(vdupq_n_s32(0), b1, x1),
+                    );
+                    let xs_j = *xsp.add(j);
+                    $f = vfmaq_n_f32($f, vcvtq_f32_s32(dot), 2.0 * d * xs_j);
+                    adj += xs_j * (*xsum_b.add(j) as f32);
+                    j += 1;
+                }
+                adj_total += d * adj;
+            }};
+        }
+        let mut b = 0;
+        while b + 4 <= blocks {
+            one_block!(f0, b);
+            one_block!(f1, b + 1);
+            one_block!(f2, b + 2);
+            one_block!(f3, b + 3);
+            b += 4;
+        }
+        while b < blocks {
+            one_block!(f0, b);
+            b += 1;
+        }
+        vaddvq_f32(vaddq_f32(vaddq_f32(f0, f1), vaddq_f32(f2, f3))) - adj_total
+    }
+}
+
+/// Two Q1_0 rows · same activation (shared `xq` loads + shared `xsum`).
+#[cfg(target_arch = "aarch64")]
+unsafe fn sdot_two_rows_q1_0(
+    row0: *const u8,
+    row1: *const u8,
+    xq: *const i8,
+    xs: *const f32,
+    xsum: *const i32,
+    blocks: usize,
+) -> (f32, f32) {
+    use core::arch::aarch64::{
+        uint8x16_t, vaddq_s32, vaddvq_f32, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32, vdupq_n_u8,
+        vfmaq_n_f32,
+    };
+    // SAFETY: caller's contract; all loads in-bounds.
+    unsafe {
+        let idx: [uint8x16_t; 8] = core::array::from_fn(|k| ldq_u8(Q1_0_TBL_IDX[k].0.as_ptr()));
+        let bits = ldq_u8(Q1_0_BITS.0.as_ptr());
+        let one_u8 = vdupq_n_u8(1);
+        let mut a0 = vdupq_n_f32(0.0);
+        let mut a1 = vdupq_n_f32(0.0);
+        let mut adj0_total = 0.0f32;
+        let mut adj1_total = 0.0f32;
         for b in 0..blocks {
             let base = b * Q1_0_BLOCK_BYTES;
-            let d = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
-            let bytes = ldq_u8(row.add(base + 2)); // all 128 sign bits at once
-            let mut block_acc = 0.0f32;
-            for j in 0..4 {
-                // sub-block j = lane groups 2j, 2j+1 (elements 32j..32j+32)
-                let s0 = vbslq_s8(vtstq_u8(vqtbl1q_u8(bytes, idx[2 * j]), bits), plus, minus);
-                let s1 = vbslq_s8(vtstq_u8(vqtbl1q_u8(bytes, idx[2 * j + 1]), bits), plus, minus);
-                let (x0, x1) = ldp_s8(xq.add(b * QK1_0 + j * 32));
-                let dot = vaddvq_s32(vdotq_s32(vdotq_s32(vdupq_n_s32(0), s0, x0), s1, x1));
-                block_acc += *xs.add(b * (QK1_0 / QK) + j) * dot as f32;
+            let d0 = f16_to_f32(u16::from_le_bytes([*row0.add(base), *row0.add(base + 1)]));
+            let d1 = f16_to_f32(u16::from_le_bytes([*row1.add(base), *row1.add(base + 1)]));
+            let bytes0 = ldq_u8(row0.add(base + 2));
+            let bytes1 = ldq_u8(row1.add(base + 2));
+            if b + 1 < blocks {
+                prefetch_l1(row0.add((b + 1) * Q1_0_BLOCK_BYTES));
+                prefetch_l1(row1.add((b + 1) * Q1_0_BLOCK_BYTES));
             }
-            acc += d * block_acc;
+            let xsp = xs.add(b * (QK1_0 / QK));
+            let xqp = xq.add(b * QK1_0);
+            let xsum_b = xsum.add(b * (QK1_0 / QK));
+            let mut adj0 = 0.0f32;
+            let mut adj1 = 0.0f32;
+            for j in 0..4 {
+                let (x0, x1) = ldp_s8(xqp.add(j * 32));
+                let b00 = q1_0_bits01(bytes0, idx[2 * j], bits, one_u8);
+                let b01 = q1_0_bits01(bytes0, idx[2 * j + 1], bits, one_u8);
+                let b10 = q1_0_bits01(bytes1, idx[2 * j], bits, one_u8);
+                let b11 = q1_0_bits01(bytes1, idx[2 * j + 1], bits, one_u8);
+                let dot0 = vaddq_s32(vdotq_s32(vdupq_n_s32(0), b00, x0), vdotq_s32(vdupq_n_s32(0), b01, x1));
+                let dot1 = vaddq_s32(vdotq_s32(vdupq_n_s32(0), b10, x0), vdotq_s32(vdupq_n_s32(0), b11, x1));
+                let xs_j = *xsp.add(j);
+                a0 = vfmaq_n_f32(a0, vcvtq_f32_s32(dot0), 2.0 * d0 * xs_j);
+                a1 = vfmaq_n_f32(a1, vcvtq_f32_s32(dot1), 2.0 * d1 * xs_j);
+                let xs_sum = xs_j * (*xsum_b.add(j) as f32);
+                adj0 += xs_sum;
+                adj1 += xs_sum;
+            }
+            adj0_total += d0 * adj0;
+            adj1_total += d1 * adj1;
         }
-        acc
+        (vaddvq_f32(a0) - adj0_total, vaddvq_f32(a1) - adj1_total)
+    }
+}
+
+/// Precompute `Σ xq[j*32 .. j*32+32]` for every activation quant block. The
+/// Q1_0 math identity reuses these across every weight row of a matvec.
+///
+/// # Safety
+/// `xq` has `n_act_blocks * QK` readable i8; `out` has `n_act_blocks` writable i32.
+#[cfg(target_arch = "aarch64")]
+unsafe fn precompute_act_sums(xq: *const i8, out: *mut i32, n_act_blocks: usize) {
+    // SAFETY: caller sizes.
+    unsafe {
+        for j in 0..n_act_blocks {
+            *out.add(j) = sum32_i8(xq.add(j * QK));
+        }
     }
 }
 
 /// Q1_0 rows over `[row_start, row_end)` against int8-quantized activations.
+/// Precomputes per-block activation sums once, then processes rows in pairs.
 ///
 /// # Safety
 /// `w` = rows of `n_cols/128` Q1_0 blocks; `xq` = `n_cols` i8; `xs` =
@@ -1419,10 +1685,57 @@ pub unsafe fn matvec_q1_0_sdot_rows(
 ) {
     let blocks = n_cols / QK1_0;
     let row_bytes = blocks * Q1_0_BLOCK_BYTES;
+    let n_act = n_cols / QK;
+    // Stack scratch for activation sums. Bonsai peaks at ffn/32 ≈ 544; 1024
+    // (4 KiB) covers that with room and stays well under the 64 KiB worker
+    // stacks. Wider activations heap-allocate once per call.
+    const MAX_ACT_BLOCKS: usize = 1024;
     // SAFETY: caller's contract.
     unsafe {
-        for r in row_start..row_end {
-            *y.add(r) = sdot_one_row_q1_0(w.add(r * row_bytes), xq, xs, blocks);
+        if n_act <= MAX_ACT_BLOCKS {
+            let mut xsum = [0i32; MAX_ACT_BLOCKS];
+            precompute_act_sums(xq, xsum.as_mut_ptr(), n_act);
+            finish_q1_rows(w, xq, xs, xsum.as_ptr(), y, row_start, row_end, blocks, row_bytes);
+        } else {
+            let mut xsum = alloc::vec![0i32; n_act];
+            precompute_act_sums(xq, xsum.as_mut_ptr(), n_act);
+            finish_q1_rows(w, xq, xs, xsum.as_ptr(), y, row_start, row_end, blocks, row_bytes);
+        }
+    }
+}
+
+/// Shared row-pair loop for [`matvec_q1_0_sdot_rows`] once `xsum` is ready.
+/// (A 4-row tile was tried; NEON register pressure spilled and *slowed*
+/// host decode ~15%, so we stay at pairs.)
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn finish_q1_rows(
+    w: *const u8,
+    xq: *const i8,
+    xs: *const f32,
+    xsum: *const i32,
+    y: *mut f32,
+    row_start: usize,
+    row_end: usize,
+    blocks: usize,
+    row_bytes: usize,
+) {
+    // SAFETY: caller sized `xsum` for `n_cols/QK` act blocks; ranges in bounds.
+    unsafe {
+        let mut r = row_start;
+        while r + 1 < row_end {
+            if r + 2 < row_end {
+                prefetch_l1(w.add((r + 2) * row_bytes));
+                prefetch_l1(w.add((r + 3) * row_bytes));
+            }
+            let (v0, v1) =
+                sdot_two_rows_q1_0(w.add(r * row_bytes), w.add((r + 1) * row_bytes), xq, xs, xsum, blocks);
+            *y.add(r) = v0;
+            *y.add(r + 1) = v1;
+            r += 2;
+        }
+        if r < row_end {
+            *y.add(r) = sdot_one_row_q1_0(w.add(r * row_bytes), xq, xs, xsum, blocks);
         }
     }
 }
@@ -1577,6 +1890,71 @@ pub fn quantize_activations_q8(x: &[f32], xq: &mut [i8], xs: &mut [f32]) {
     let blocks = x.len() / QK;
     debug_assert_eq!(xq.len(), x.len());
     debug_assert_eq!(xs.len(), blocks);
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON: per 32-elem block, max|x| over 8×f32 vectors, then scale +
+        // round-half-away-from-zero + convert + saturating narrow to i8.
+        // Vector loads via `ldq_f32` (the `+strict-align` rule). Matches the
+        // scalar path's rounding (not IEEE rint).
+        use core::arch::aarch64::{
+            vabsq_f32, vaddq_f32, vcltq_f32, vcombine_s16, vcvtq_s32_f32, vdupq_n_f32, vdupq_n_s8,
+            vmaxq_f32, vmaxq_s8, vmaxvq_f32, vbslq_f32, vmulq_f32, vqmovn_s16, vqmovn_s32,
+        };
+        // SAFETY: x/xq sized to blocks*32; all ldq/str in-bounds.
+        unsafe {
+            let xp = x.as_ptr();
+            let xqp = xq.as_mut_ptr();
+            let half = vdupq_n_f32(0.5);
+            let neg_half = vdupq_n_f32(-0.5);
+            let zero = vdupq_n_f32(0.0);
+            let min_ok = vdupq_n_s8(-127);
+            for b in 0..blocks {
+                let base = xp.add(b * QK);
+                let mut mx = vdupq_n_f32(0.0);
+                let mut k = 0;
+                while k < 8 {
+                    mx = vmaxq_f32(mx, vabsq_f32(ldq_f32(base.add(k * 4))));
+                    k += 1;
+                }
+                let amax = vmaxvq_f32(mx);
+                let scale = amax / 127.0;
+                let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                xs[b] = scale;
+                let inv_v = vdupq_n_f32(inv);
+                // Two halves of 16 elems → one int8x16 store each.
+                for half_i in 0..2 {
+                    let off = half_i * 16;
+                    let mut parts = [
+                        core::arch::aarch64::vdupq_n_s32(0),
+                        core::arch::aarch64::vdupq_n_s32(0),
+                        core::arch::aarch64::vdupq_n_s32(0),
+                        core::arch::aarch64::vdupq_n_s32(0),
+                    ];
+                    for t in 0..4 {
+                        let v = ldq_f32(base.add(off + t * 4));
+                        let scaled = vmulq_f32(v, inv_v);
+                        let bias = vbslq_f32(vcltq_f32(scaled, zero), neg_half, half);
+                        parts[t] = vcvtq_s32_f32(vaddq_f32(scaled, bias));
+                    }
+                    let s16_lo = vcombine_s16(vqmovn_s32(parts[0]), vqmovn_s32(parts[1]));
+                    let s16_hi = vcombine_s16(vqmovn_s32(parts[2]), vqmovn_s32(parts[3]));
+                    // Narrow two s16x8 → s8x8 each, then combine to s8x16.
+                    let q8_lo = vqmovn_s16(s16_lo);
+                    let q8_hi = vqmovn_s16(s16_hi);
+                    let q8 = vmaxq_s8(core::arch::aarch64::vcombine_s8(q8_lo, q8_hi), min_ok);
+                    let dst = xqp.add(b * QK + off);
+                    core::arch::asm!(
+                        "str {v:q}, [{p}]",
+                        v = in(vreg) q8,
+                        p = in(reg) dst,
+                        options(nostack, preserves_flags),
+                    );
+                }
+            }
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     for b in 0..blocks {
         let xb = &x[b * QK..(b + 1) * QK];
         let mut amax = 0.0f32;
@@ -1716,13 +2094,115 @@ pub unsafe fn matmul_q8_0_sdot_rows(
     }
 }
 
+/// **i8mm** weight-stationary batched `Q8_0` × `int8`-activation matmul over
+/// rows `[row_start, row_end)` — the i8mm analog of [`matmul_q8_0_sdot_rows`]
+/// (used for batched prefill when the CPU has FEAT_I8MM). Q8_0 weights are
+/// already `int8`, so — unlike the Q1_0/Q2_0 i8mm kernels — there is no unpack:
+/// each `vmmlaq_s32` consumes a 2×2 tile (2 weight rows × 2 activation cols)
+/// directly, at 2× the MAC/instr of `vdotq_s32`. Column-tiled (`COLP=4`) so the
+/// two weight rows stream once per 8-column tile and the per-tile accumulators
+/// stay in registers. Per 32-elem block: 4 `SMMLA`s (K=8) into an int32 2×2,
+/// scaled by the 2×2 outer product of the block's weight/activation scales.
+/// Odd trailing row/column fall back to [`sdot_one_row`]. Loads via `ldq_*`.
+///
+/// # Safety
+/// As [`matmul_q8_0_sdot_rows`]; additionally the CPU **must** implement
+/// FEAT_I8MM (caller guarantees via `crate::arch::has_i8mm()`).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,i8mm")]
+pub unsafe fn matmul_q8_0_i8mm_rows(
+    w: *const u8,
+    xq: *const i8,
+    xs: *const f32,
+    y: *mut f32,
+    m_count: usize,
+    n_rows: usize,
+    row_start: usize,
+    row_end: usize,
+    n_cols: usize,
+) {
+    use core::arch::aarch64::{
+        vcombine_f32, vcombine_s8, vcvtq_f32_s32, vdup_n_f32, vdupq_n_f32, vdupq_n_s32, vfmaq_f32, vget_high_s8,
+        vget_low_s8, vgetq_lane_f32, vmmlaq_s32, vmulq_f32, vset_lane_f32,
+    };
+    let blocks = n_cols / QK;
+    let row_bytes = blocks * Q8_0_BLOCK_BYTES;
+    let nb = blocks; // scales per column
+    let cols_even = (m_count / 2) * 2;
+    let rows_even = row_start + ((row_end - row_start) / 2) * 2;
+    const COLP: usize = 4;
+    let full_cols = (cols_even / (2 * COLP)) * (2 * COLP);
+    // SAFETY: caller's contract; all loads in-bounds, `y` rows disjoint.
+    unsafe {
+        let mut r = row_start;
+        while r < rows_even {
+            let (row0, row1) = (w.add(r * row_bytes), w.add((r + 1) * row_bytes));
+            let mut mt = 0;
+            while mt < full_cols {
+                let mut res = [vdupq_n_f32(0.0); COLP]; // per col-pair: [m0·r m1·r m0·r+1 m1·r+1]
+                for b in 0..blocks {
+                    let base = b * Q8_0_BLOCK_BYTES;
+                    let dw0 = f16_to_f32(u16::from_le_bytes([*row0.add(base), *row0.add(base + 1)]));
+                    let dw1 = f16_to_f32(u16::from_le_bytes([*row1.add(base), *row1.add(base + 1)]));
+                    let dw_vec = vcombine_f32(vdup_n_f32(dw0), vdup_n_f32(dw1)); // {dw0,dw0,dw1,dw1}
+                    // Two weight rows' 32 int8 → 4 K-group int8x8 each.
+                    let (w0lo, w0hi) = (ldq_s8(row0.add(base + 2) as *const i8), ldq_s8(row0.add(base + 18) as *const i8));
+                    let (w1lo, w1hi) = (ldq_s8(row1.add(base + 2) as *const i8), ldq_s8(row1.add(base + 18) as *const i8));
+                    let wk0 = [vget_low_s8(w0lo), vget_high_s8(w0lo), vget_low_s8(w0hi), vget_high_s8(w0hi)];
+                    let wk1 = [vget_low_s8(w1lo), vget_high_s8(w1lo), vget_low_s8(w1hi), vget_high_s8(w1hi)];
+                    for t in 0..COLP {
+                        let (m0, m1) = (mt + 2 * t, mt + 2 * t + 1);
+                        let (a0lo, a0hi) = ldp_s8(xq.add(m0 * n_cols + b * QK));
+                        let (a1lo, a1hi) = ldp_s8(xq.add(m1 * n_cols + b * QK));
+                        let ak0 = [vget_low_s8(a0lo), vget_high_s8(a0lo), vget_low_s8(a0hi), vget_high_s8(a0hi)];
+                        let ak1 = [vget_low_s8(a1lo), vget_high_s8(a1lo), vget_low_s8(a1hi), vget_high_s8(a1hi)];
+                        let mut acc2 = vdupq_n_s32(0);
+                        for kg in 0..4 {
+                            // Vn = [w row0 | w row1], Vm = [act m0 | act m1].
+                            acc2 = vmmlaq_s32(acc2, vcombine_s8(wk0[kg], wk1[kg]), vcombine_s8(ak0[kg], ak1[kg]));
+                        }
+                        let dx0 = *xs.add(m0 * nb + b);
+                        let dx1 = *xs.add(m1 * nb + b);
+                        let pair = vset_lane_f32(dx1, vdup_n_f32(dx0), 1); // {dx0, dx1}
+                        let dx_vec = vcombine_f32(pair, pair); // {dx0,dx1,dx0,dx1}
+                        let scale = vmulq_f32(dw_vec, dx_vec); // {dw0dx0, dw0dx1, dw1dx0, dw1dx1}
+                        res[t] = vfmaq_f32(res[t], vcvtq_f32_s32(acc2), scale);
+                    }
+                }
+                for t in 0..COLP {
+                    let (m0, m1) = (mt + 2 * t, mt + 2 * t + 1);
+                    *y.add(m0 * n_rows + r) = vgetq_lane_f32(res[t], 0);
+                    *y.add(m1 * n_rows + r) = vgetq_lane_f32(res[t], 1);
+                    *y.add(m0 * n_rows + r + 1) = vgetq_lane_f32(res[t], 2);
+                    *y.add(m1 * n_rows + r + 1) = vgetq_lane_f32(res[t], 3);
+                }
+                mt += 2 * COLP;
+            }
+            r += 2;
+        }
+        // Tails (leftover columns for paired rows; odd trailing row × all cols).
+        for r2 in row_start..rows_even {
+            for m in full_cols..m_count {
+                *y.add(m * n_rows + r2) = sdot_one_row(w.add(r2 * row_bytes), xq.add(m * n_cols), xs.add(m * nb), blocks);
+            }
+        }
+        if row_end > rows_even {
+            let r = rows_even;
+            for m in 0..m_count {
+                *y.add(m * n_rows + r) = sdot_one_row(w.add(r * row_bytes), xq.add(m * n_cols), xs.add(m * nb), blocks);
+            }
+        }
+    }
+}
+
 /// **Weight-stationary batched** `Q1_0` × `int8`-activation matmul over rows
 /// `[row_start, row_end)` — the Q1_0 analog of [`matmul_q8_0_sdot_rows`], the
 /// kernel behind batched prefill for the 1-bit Bonsai. Per weight block the
-/// 128 sign bits are loaded + expanded to ±1 **once per activation tile**
-/// (`vqtbl1q`/`vtst`/`vbsl`, see [`sdot_one_row_q1_0`]) and SDOTed against
-/// every activation in the tile, so both the weight bytes *and* the expand
-/// work are amortized across the batch. `y` is `[m * n_rows + r]`.
+/// 128 sign bits are expanded to ±1 **once per activation tile**
+/// (`vqtbl1q`/`vtst`/`vbsl`) and SDOTed against every activation in the tile
+/// (MT=8). Prefill amortizes expand across the batch; the matvec path uses
+/// the `2·SDOT − Σx` identity instead (see [`sdot_one_row_q1_0`]).
+/// `y` is `[m * n_rows + r]`.
 ///
 /// # Safety
 /// `w` = `n_rows` `Q1_0` rows of `n_cols/128` blocks; `xq`/`xs` = `m_count`
@@ -1742,8 +2222,8 @@ pub unsafe fn matmul_q1_0_sdot_rows(
     n_cols: usize,
 ) {
     use core::arch::aarch64::{
-        int8x16_t, uint8x16_t, vaddvq_f32, vbslq_s8, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32,
-        vdupq_n_s8, vfmaq_n_f32, vqtbl1q_u8, vtstq_u8,
+        int8x16_t, uint8x16_t, vaddq_s32, vaddvq_f32, vbslq_s8, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32,
+        vdupq_n_s32, vdupq_n_s8, vfmaq_n_f32, vqtbl1q_u8, vtstq_u8,
     };
     if m_count == 1 {
         // SAFETY: caller's contract (matvec has better ILP for one column).
@@ -1753,7 +2233,8 @@ pub unsafe fn matmul_q1_0_sdot_rows(
     let blocks = n_cols / QK1_0;
     let row_bytes = blocks * Q1_0_BLOCK_BYTES;
     let nb = n_cols / QK; // activation scales per activation (32-wide blocks)
-    const MT: usize = 4;
+    // MT=8: one expand of 128 signs feeds 8 activations.
+    const MT: usize = 8;
     // SAFETY: caller's contract; all loads in-bounds, `y` rows disjoint.
     unsafe {
         let idx: [uint8x16_t; 8] = core::array::from_fn(|k| ldq_u8(Q1_0_TBL_IDX[k].0.as_ptr()));
@@ -1762,6 +2243,9 @@ pub unsafe fn matmul_q1_0_sdot_rows(
         let minus = vdupq_n_s8(-1);
         for r in row_start..row_end {
             let row = w.add(r * row_bytes);
+            if r + 1 < row_end {
+                prefetch_l1(w.add((r + 1) * row_bytes));
+            }
             let mut m0 = 0;
             while m0 < m_count {
                 let mt = core::cmp::min(MT, m_count - m0);
@@ -1770,7 +2254,7 @@ pub unsafe fn matmul_q1_0_sdot_rows(
                     let base = b * Q1_0_BLOCK_BYTES;
                     let d = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
                     let bytes = ldq_u8(row.add(base + 2));
-                    // Expand the block's 128 signs once for the whole tile.
+                    // Expand once to ±1 for the whole tile (no per-act xsum).
                     let mut s = [vdupq_n_s8(0); 8];
                     let mut k = 0;
                     while k < 8 {
@@ -1784,7 +2268,10 @@ pub unsafe fn matmul_q1_0_sdot_rows(
                         for j in 0..4 {
                             let (x0, x1) = ldp_s8(xqp.add(j * 32));
                             let a: int8x16_t = s[2 * j];
-                            let dot = vdotq_s32(vdotq_s32(vdupq_n_s32(0), a, x0), s[2 * j + 1], x1);
+                            let dot = vaddq_s32(
+                                vdotq_s32(vdupq_n_s32(0), a, x0),
+                                vdotq_s32(vdupq_n_s32(0), s[2 * j + 1], x1),
+                            );
                             acc[mm] = vfmaq_n_f32(acc[mm], vcvtq_f32_s32(dot), d * *xsp.add(j));
                         }
                     }
@@ -1798,12 +2285,192 @@ pub unsafe fn matmul_q1_0_sdot_rows(
     }
 }
 
+/// Byte → eight `int8` sign lanes (LSB-first): bit set → `+1`, clear → `-1`
+/// (`0xff` = −1 as `i8`). `vcreate_s8(Q1_0_SIGN_LUT[byte])` expands 8 Q1_0
+/// signs in one op — the reference (`table_q1_signs`) approach, and exactly the
+/// 8-wide operand `vmmlaq_s32` (i8mm) wants (vs the 16-wide `vtst`/`vbsl` path
+/// the plain SDOT kernel uses). Matches `dequant_q1_0_block`'s bit order.
+#[cfg(target_arch = "aarch64")]
+static Q1_0_SIGN_LUT: [u64; 256] = {
+    let mut t = [0u64; 256];
+    let mut v = 0usize;
+    while v < 256 {
+        let mut w = 0u64;
+        let mut k = 0;
+        while k < 8 {
+            let byte: u64 = if (v >> k) & 1 == 1 { 0x01 } else { 0xff };
+            w |= byte << (k * 8);
+            k += 1;
+        }
+        t[v] = w;
+        v += 1;
+    }
+    t
+};
+
+/// One Q1_0 row · one activation via the ±1 sign expand (no precomputed
+/// `xsum`) — self-contained fallback used only for the i8mm GEMM's odd
+/// row/column **tails** (≤1 row + 1 col), where the `xsum`-based
+/// [`sdot_one_row_q1_0`] would need its activation-sum side input threaded in.
+///
+/// # Safety
+/// `row` = `blocks` Q1_0 blocks; `xq`/`xs` = `blocks*128` i8 / `blocks*4` f32.
+#[cfg(target_arch = "aarch64")]
+unsafe fn sdot_one_row_q1_0_pm1(row: *const u8, xq: *const i8, xs: *const f32, blocks: usize) -> f32 {
+    use core::arch::aarch64::{
+        uint8x16_t, vaddvq_s32, vbslq_s8, vdotq_s32, vdupq_n_s32, vdupq_n_s8, vqtbl1q_u8, vtstq_u8,
+    };
+    // SAFETY: caller's contract; all loads in-bounds.
+    unsafe {
+        let idx: [uint8x16_t; 8] = core::array::from_fn(|k| ldq_u8(Q1_0_TBL_IDX[k].0.as_ptr()));
+        let bits = ldq_u8(Q1_0_BITS.0.as_ptr());
+        let plus = vdupq_n_s8(1);
+        let minus = vdupq_n_s8(-1);
+        let mut acc = 0.0f32;
+        for b in 0..blocks {
+            let base = b * Q1_0_BLOCK_BYTES;
+            let d = f16_to_f32(u16::from_le_bytes([*row.add(base), *row.add(base + 1)]));
+            let bytes = ldq_u8(row.add(base + 2));
+            let mut ba = 0.0f32;
+            for j in 0..4 {
+                let s0 = vbslq_s8(vtstq_u8(vqtbl1q_u8(bytes, idx[2 * j]), bits), plus, minus);
+                let s1 = vbslq_s8(vtstq_u8(vqtbl1q_u8(bytes, idx[2 * j + 1]), bits), plus, minus);
+                let (x0, x1) = ldp_s8(xq.add(b * QK1_0 + j * 32));
+                let dot = vaddvq_s32(vdotq_s32(vdotq_s32(vdupq_n_s32(0), s0, x0), s1, x1));
+                ba += *xs.add(b * (QK1_0 / QK) + j) * dot as f32;
+            }
+            acc += d * ba;
+        }
+        acc
+    }
+}
+
+/// **i8mm** weight-stationary batched `Q1_0` × `int8`-activation matmul over
+/// rows `[row_start, row_end)` — the fast prefill kernel when the CPU has
+/// FEAT_I8MM (`arch::has_i8mm()`; the caller gates on it). Processes a 2×2 tile
+/// (2 weight rows × 2 activation columns) per `vmmlaq_s32`, which does a 2×2
+/// int8 outer product = **2× the MAC/instr of `vdotq_s32`** (the lever behind
+/// llama.cpp's ~5× Q1_0 prefill). Per 32-elem activation sub-block: four
+/// `SMMLA`s (K=8 each) into an int32 2×2, scaled by the sub-block's two
+/// activation scales; the two f16 weight scales fold in per 128-block. Odd
+/// trailing row/column fall back to `sdot_one_row_q1_0`. All vector loads via
+/// the `ldq_*`/`ldp_*` asm helpers (the `+strict-align` rule); the `i8mm`
+/// target feature is enabled per-function (safe: dispatch is gated on the
+/// runtime `has_i8mm` check).
+///
+/// # Safety
+/// As [`matmul_q1_0_sdot_rows`]; additionally the CPU **must** implement
+/// FEAT_I8MM (caller guarantees via `crate::arch::has_i8mm()`).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,i8mm")]
+pub unsafe fn matmul_q1_0_i8mm_rows(
+    w: *const u8,
+    xq: *const i8,
+    xs: *const f32,
+    y: *mut f32,
+    m_count: usize,
+    n_rows: usize,
+    row_start: usize,
+    row_end: usize,
+    n_cols: usize,
+) {
+    use core::arch::aarch64::{
+        vcombine_f32, vcombine_s8, vcreate_s8, vcvtq_f32_s32, vdup_n_f32, vdupq_n_f32, vdupq_n_s32, vfmaq_f32,
+        vget_high_s8, vget_low_s8, vgetq_lane_f32, vmmlaq_s32, vset_lane_f32,
+    };
+    let blocks = n_cols / QK1_0;
+    let row_bytes = blocks * Q1_0_BLOCK_BYTES;
+    let nb = n_cols / QK; // activation scales per column
+    let cols_even = (m_count / 2) * 2;
+    let rows_even = row_start + ((row_end - row_start) / 2) * 2;
+    // Column-pairs processed per weight stream. Weight-stationary is only a win
+    // if each weight row is read from memory *once per tile*, not once per
+    // column — so a row-pair's blocks are streamed once and applied to `COLP`
+    // column-pairs (8 columns) held in registers. `COLP` is a const so the
+    // per-column-pair `res`/`bacc` arrays unroll into registers (a runtime tile
+    // width would spill them to the stack and erase the win).
+    const COLP: usize = 4;
+    let full_cols = (cols_even / (2 * COLP)) * (2 * COLP); // columns covered by full tiles
+    // SAFETY: caller's contract; all loads in-bounds, `y` rows disjoint.
+    unsafe {
+        let mut r = row_start;
+        while r < rows_even {
+            let (row0, row1) = (w.add(r * row_bytes), w.add((r + 1) * row_bytes));
+            let mut mt = 0;
+            while mt < full_cols {
+                // res[t] = [y(m0,r) y(m1,r) y(m0,r+1) y(m1,r+1)] for col-pair t.
+                let mut res = [vdupq_n_f32(0.0); COLP];
+                for b in 0..blocks {
+                    let base = b * Q1_0_BLOCK_BYTES;
+                    let d0 = f16_to_f32(u16::from_le_bytes([*row0.add(base), *row0.add(base + 1)]));
+                    let d1 = f16_to_f32(u16::from_le_bytes([*row1.add(base), *row1.add(base + 1)]));
+                    let d_vec = vcombine_f32(vdup_n_f32(d0), vdup_n_f32(d1));
+                    let (q0, q1) = (row0.add(base + 2), row1.add(base + 2));
+                    let mut bacc = [vdupq_n_f32(0.0); COLP];
+                    for j in 0..4 {
+                        // Expand the two weight rows' signs for this sub-block's 4
+                        // K-groups ONCE, then reuse across all COLP column-pairs.
+                        let aw: [_; 4] = core::array::from_fn(|kg| {
+                            let br0 = *q0.add(j * 4 + kg) as usize;
+                            let br1 = *q1.add(j * 4 + kg) as usize;
+                            vcombine_s8(vcreate_s8(Q1_0_SIGN_LUT[br0]), vcreate_s8(Q1_0_SIGN_LUT[br1]))
+                        });
+                        for t in 0..COLP {
+                            let (m0, m1) = (mt + 2 * t, mt + 2 * t + 1);
+                            let (a0lo, a0hi) = ldp_s8(xq.add(m0 * n_cols + b * QK1_0 + j * 32));
+                            let (a1lo, a1hi) = ldp_s8(xq.add(m1 * n_cols + b * QK1_0 + j * 32));
+                            let ak0 = [vget_low_s8(a0lo), vget_high_s8(a0lo), vget_low_s8(a0hi), vget_high_s8(a0hi)];
+                            let ak1 = [vget_low_s8(a1lo), vget_high_s8(a1lo), vget_low_s8(a1hi), vget_high_s8(a1hi)];
+                            let mut acc2 = vdupq_n_s32(0);
+                            for kg in 0..4 {
+                                // Vn = [row0 signs | row1 signs], Vm = [col m0 | col m1].
+                                acc2 = vmmlaq_s32(acc2, aw[kg], vcombine_s8(ak0[kg], ak1[kg]));
+                            }
+                            let xm0 = *xs.add(m0 * nb + b * 4 + j);
+                            let xm1 = *xs.add(m1 * nb + b * 4 + j);
+                            let pair = vset_lane_f32(xm1, vdup_n_f32(xm0), 1); // {xm0, xm1}
+                            let xs_vec = vcombine_f32(pair, pair); // {xm0,xm1,xm0,xm1}
+                            bacc[t] = vfmaq_f32(bacc[t], vcvtq_f32_s32(acc2), xs_vec);
+                        }
+                    }
+                    for t in 0..COLP {
+                        res[t] = vfmaq_f32(res[t], bacc[t], d_vec);
+                    }
+                }
+                for t in 0..COLP {
+                    let (m0, m1) = (mt + 2 * t, mt + 2 * t + 1);
+                    *y.add(m0 * n_rows + r) = vgetq_lane_f32(res[t], 0);
+                    *y.add(m1 * n_rows + r) = vgetq_lane_f32(res[t], 1);
+                    *y.add(m0 * n_rows + r + 1) = vgetq_lane_f32(res[t], 2);
+                    *y.add(m1 * n_rows + r + 1) = vgetq_lane_f32(res[t], 3);
+                }
+                mt += 2 * COLP;
+            }
+            r += 2;
+        }
+        // Tails via the single row·column ±1 kernel: (a) paired rows × the
+        // leftover columns a full tile didn't cover (< 8, incl. an odd last
+        // column); (b) an odd trailing row × all columns.
+        for r2 in (row_start..rows_even).step_by(1) {
+            for m in full_cols..m_count {
+                *y.add(m * n_rows + r2) = sdot_one_row_q1_0_pm1(w.add(r2 * row_bytes), xq.add(m * n_cols), xs.add(m * nb), blocks);
+            }
+        }
+        if row_end > rows_even {
+            let r = rows_even;
+            for m in 0..m_count {
+                *y.add(m * n_rows + r) = sdot_one_row_q1_0_pm1(w.add(r * row_bytes), xq.add(m * n_cols), xs.add(m * nb), blocks);
+            }
+        }
+    }
+}
+
 /// **Weight-stationary batched** `Q2_0` × `int8`-activation matmul over rows
 /// `[row_start, row_end)` — the ternary analog of [`matmul_q8_0_sdot_rows`],
 /// batched prefill for Ternary-Bonsai. Per weight block the 128 2-bit codes
 /// are unpacked to `code−1` int8 **once per activation tile**
 /// ([`q2_0_unpack64`]) and SDOTed against every activation in the tile.
-/// `y` is `[m * n_rows + r]`.
+/// Tile depth 8 amortizes unpack further. `y` is `[m * n_rows + r]`.
 ///
 /// # Safety
 /// As [`matmul_q1_0_sdot_rows`] with `Q2_0` rows (`n_cols/128` 34-byte blocks).
@@ -1819,7 +2486,7 @@ pub unsafe fn matmul_q2_0_sdot_rows(
     row_end: usize,
     n_cols: usize,
 ) {
-    use core::arch::aarch64::{vaddvq_f32, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32, vfmaq_n_f32};
+    use core::arch::aarch64::{vaddq_s32, vaddvq_f32, vcvtq_f32_s32, vdotq_s32, vdupq_n_f32, vdupq_n_s32, vfmaq_n_f32};
     if m_count == 1 {
         // SAFETY: caller's contract (matvec has better ILP for one column).
         unsafe { matvec_q2_0_sdot_rows(w, xq, xs, y, row_start, row_end, n_cols) };
@@ -1828,11 +2495,14 @@ pub unsafe fn matmul_q2_0_sdot_rows(
     let blocks = n_cols / QK2_0;
     let row_bytes = blocks * Q2_0_BLOCK_BYTES;
     let nb = n_cols / QK;
-    const MT: usize = 4;
+    const MT: usize = 8;
     // SAFETY: caller's contract; all loads in-bounds, `y` rows disjoint.
     unsafe {
         for r in row_start..row_end {
             let row = w.add(r * row_bytes);
+            if r + 1 < row_end {
+                prefetch_l1(w.add((r + 1) * row_bytes));
+            }
             let mut m0 = 0;
             while m0 < m_count {
                 let mt = core::cmp::min(MT, m_count - m0);
@@ -1851,7 +2521,10 @@ pub unsafe fn matmul_q2_0_sdot_rows(
                         let xsp = xs.add(mi * nb + b * (QK2_0 / QK));
                         for j in 0..4 {
                             let (x0, x1) = ldp_s8(xqp.add(j * 32));
-                            let dot = vdotq_s32(vdotq_s32(vdupq_n_s32(0), s[2 * j], x0), s[2 * j + 1], x1);
+                            let dot = vaddq_s32(
+                                vdotq_s32(vdupq_n_s32(0), s[2 * j], x0),
+                                vdotq_s32(vdupq_n_s32(0), s[2 * j + 1], x1),
+                            );
                             acc[mm] = vfmaq_n_f32(acc[mm], vcvtq_f32_s32(dot), d * *xsp.add(j));
                         }
                     }
@@ -2607,6 +3280,79 @@ mod tests {
         assert_eq!(block_layout(QT_Q1_0), (Q1_0_BLOCK_BYTES, QK1_0));
     }
 
+    /// The i8mm (vmmlaq_s32) Q1_0 GEMM must produce the same result as the SDOT
+    /// matmul — same math, different instruction — across odd m and odd row
+    /// counts (exercises the 2×2 tile body + both tails). aarch64-only, and only
+    /// meaningful where the host has FEAT_I8MM (skips otherwise).
+    #[cfg(target_arch = "aarch64")]
+    #[test_case]
+    fn matmul_q1_0_i8mm_matches_sdot() {
+        if !crate::arch::has_i8mm() {
+            return; // no i8mm on this host — nothing to compare
+        }
+        let (rows, cols, m) = (7usize, 256usize, 5usize); // odd rows AND odd m → both tails
+        let mut seed = 0x1188u32;
+        let mut w = Vec::new();
+        for _ in 0..rows * (cols / QK1_0) {
+            w.extend_from_slice(&F16_HALF);
+            for _ in 0..QK1_0 / 8 {
+                w.push((lcg(&mut seed) & 0xff) as u8);
+            }
+        }
+        let mut xq = alloc::vec![0i8; m * cols];
+        let mut xs = alloc::vec![0.0f32; m * (cols / QK)];
+        for mi in 0..m {
+            let x: Vec<f32> = (0..cols).map(|_| (lcg(&mut seed) % 1000) as f32 / 500.0 - 1.0).collect();
+            quantize_activations_q8(&x, &mut xq[mi * cols..(mi + 1) * cols], &mut xs[mi * (cols / QK)..(mi + 1) * (cols / QK)]);
+        }
+        let mut got = alloc::vec![0.0f32; m * rows];
+        let mut want = alloc::vec![0.0f32; m * rows];
+        // SAFETY: buffers sized per the kernel contracts; host has i8mm (checked).
+        unsafe {
+            matmul_q1_0_i8mm_rows(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), got.as_mut_ptr(), m, rows, 0, rows, cols);
+            matmul_q1_0_sdot_rows(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), want.as_mut_ptr(), m, rows, 0, rows, cols);
+        }
+        for i in 0..m * rows {
+            assert!((got[i] - want[i]).abs() < 1e-3, "i8mm vs sdot idx {i}: {} vs {}", got[i], want[i]);
+        }
+    }
+
+    /// The i8mm Q8_0 GEMM must match the SDOT matmul (Q8_0 weights are int8, so
+    /// no unpack — pure 2×2 tile vs vdot), across odd m and odd rows (both
+    /// tails). aarch64-only; skips without host FEAT_I8MM.
+    #[cfg(target_arch = "aarch64")]
+    #[test_case]
+    fn matmul_q8_0_i8mm_matches_sdot() {
+        if !crate::arch::has_i8mm() {
+            return;
+        }
+        let (rows, cols, m) = (7usize, 128usize, 5usize); // odd rows AND odd m
+        let mut seed = 0x9E37u32;
+        let mut w = Vec::new();
+        for _ in 0..rows * (cols / QK) {
+            w.extend_from_slice(&F16_HALF);
+            for _ in 0..QK {
+                w.push((lcg(&mut seed) % 255) as u8);
+            }
+        }
+        let mut xq = alloc::vec![0i8; m * cols];
+        let mut xs = alloc::vec![0.0f32; m * (cols / QK)];
+        for mi in 0..m {
+            let x: Vec<f32> = (0..cols).map(|_| (lcg(&mut seed) % 1000) as f32 / 500.0 - 1.0).collect();
+            quantize_activations_q8(&x, &mut xq[mi * cols..(mi + 1) * cols], &mut xs[mi * (cols / QK)..(mi + 1) * (cols / QK)]);
+        }
+        let mut got = alloc::vec![0.0f32; m * rows];
+        let mut want = alloc::vec![0.0f32; m * rows];
+        // SAFETY: buffers sized per the kernel contracts; host has i8mm (checked).
+        unsafe {
+            matmul_q8_0_i8mm_rows(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), got.as_mut_ptr(), m, rows, 0, rows, cols);
+            matmul_q8_0_sdot_rows(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), want.as_mut_ptr(), m, rows, 0, rows, cols);
+        }
+        for i in 0..m * rows {
+            assert!((got[i] - want[i]).abs() < 1e-2, "q8_0 i8mm vs sdot idx {i}: {} vs {}", got[i], want[i]);
+        }
+    }
+
     /// The Q1_0 NEON SDOT row kernel must match an f64 dot of the dequantized
     /// weight row against the dequantized int8 activation (oracle-free). Pins
     /// the in-register bit-expand (`vtst`/`vbsl`) + per-sub-block scaling.
@@ -2637,8 +3383,10 @@ mod tests {
                 want += dq[i] as f64 * (xs[col / QK] as f64 * xq[col] as f64);
             }
         }
-        // SAFETY: row = `blocks` Q1_0 blocks; xq/xs sized for `n_cols`.
-        let got = unsafe { sdot_one_row_q1_0(row.as_ptr(), xq.as_ptr(), xs.as_ptr(), blocks) };
+        // SAFETY: row = `blocks` Q1_0 blocks; xq/xs/xsum sized for `n_cols`.
+        let mut xsum = alloc::vec![0i32; n_cols / QK];
+        unsafe { precompute_act_sums(xq.as_ptr(), xsum.as_mut_ptr(), n_cols / QK) };
+        let got = unsafe { sdot_one_row_q1_0(row.as_ptr(), xq.as_ptr(), xs.as_ptr(), xsum.as_ptr(), blocks) };
         assert!((got as f64 - want).abs() <= 1e-2 + 1e-3 * want.abs(), "sdot_q1_0: got {got} want {want}");
     }
 
