@@ -4258,14 +4258,32 @@ impl ChatSession {
         // a 2560×1440 VBox GOP dominates wall time and looks like a hang.
         let mut last_ui = t0;
         let mut last_log = 0usize;
-        for (i, &tok) in ids.iter().enumerate() {
-            // Only the final token needs logits, and only when we're about to
-            // decode (`prime`); otherwise this is pure context prefill.
-            let want = prime && i + 1 == last;
-            self.model.forward(tok, self.pos + i, &mut self.kv, &mut self.state, want);
-            fed = i + 1;
+        // Batch-capable models (uniform Q8_0/Q1_0/Q2_0 weights) prefill in
+        // 32-token weight-stationary chunks: each weight is read from memory
+        // once per *chunk* instead of once per token, which is what makes a
+        // 27B's ~1.5k-token system prompt minutes, not hours. The chunk
+        // boundary keeps the UI pump + Ctrl+C cancel latency bounded (one
+        // chunk = one bounded matmul pass); mixed-quant models keep the
+        // per-token path.
+        let chunk = if self.model.batched_prefill_supported() { 32 } else { 1 };
+        let mut i = 0usize;
+        while i < last {
+            let j = core::cmp::min(i + chunk, last);
+            if j - i == 1 {
+                // Only the final token needs logits, and only when we're about
+                // to decode (`prime`); otherwise this is pure context prefill.
+                let want = prime && j == last;
+                self.model.forward(ids[i], self.pos + i, &mut self.kv, &mut self.state, want);
+            } else {
+                // Batched chunk. It computes logits after its last token —
+                // required for the final chunk (`prime`), ~0.3% overhead on
+                // the others (one vocab matvec per 32 full-model tokens).
+                self.model.prefill(&ids[i..j], self.pos + i, &mut self.kv, &mut self.state);
+            }
+            fed = j;
+            i = j;
             let now = crate::arch::now_ms();
-            if now.saturating_sub(last_ui) >= 100 || fed == last || fed == 1 {
+            if now.saturating_sub(last_ui) >= 100 || fed == last || fed <= chunk {
                 last_ui = now;
                 spin.tick();
                 ui_tick();
@@ -4277,7 +4295,7 @@ impl ChatSession {
             }
             // Dense early progress (1, 16, 32…) so a slow host shows life quickly.
             let step = if fed <= 64 { 16 } else { 64 };
-            if fed == 1 || fed - last_log >= step || fed == last {
+            if fed <= chunk || fed - last_log >= step || fed == last {
                 last_log = fed;
                 let dt = now.saturating_sub(t0).max(1);
                 let rate = (fed as u64).saturating_mul(1000) / dt;

@@ -72,6 +72,14 @@ fn matvec_qw(qw: QWeight, x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &mut [f32
         tensor::matvec_q4_k_fast(qw.data, x, y, xq, xs, n_rows, n_cols);
         return;
     }
+    if qw.qt == tensor::QT_Q2_0 && n_cols % tensor::QK2_0 == 0 {
+        tensor::matvec_q2_0_fast(qw.data, x, y, xq, xs, n_rows, n_cols);
+        return;
+    }
+    if qw.qt == tensor::QT_Q1_0 && n_cols % tensor::QK1_0 == 0 {
+        tensor::matvec_q1_0_fast(qw.data, x, y, xq, xs, n_rows, n_cols);
+        return;
+    }
     debug_assert_eq!(x.len(), n_cols);
     debug_assert_eq!(y.len(), n_rows);
     let _ = (&mut *xq, &mut *xs);
@@ -152,11 +160,13 @@ pub struct Model<'a> {
     output_norm: &'a [f32],
     layers: Vec<Layer<'a>>,
     vocab: usize,
-    /// True when every weight tensor is Q8_0 (the 0.8B) -- enables the
-    /// Q8_0-only batched prefill; mixed-quant models (9B) prefill sequentially.
-    /// Only consulted on aarch64 (the arch with batched prefill).
+    /// `Some(qt)` when every weight tensor shares one quant type `qt` that has
+    /// a weight-stationary batched matmul kernel (Q8_0 for the 0.8B, Q1_0/Q2_0
+    /// for the Bonsai binary/ternary builds) -- enables batched prefill;
+    /// mixed-quant models (9B) prefill sequentially. Only consulted on aarch64
+    /// (the arch with batched matmul kernels).
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-    all_q8_0: bool,
+    batch_qt: Option<u32>,
 }
 
 /// Reusable per-forward scratch (no per-token allocation).
@@ -433,31 +443,43 @@ impl<'a> Model<'a> {
             });
         }
 
-        // All-Q8_0 (0.8B) unlocks the batched-prefill fast path; mixed-quant
-        // models fall back to sequential prefill.
-        let q8 = |w: QWeight| w.qt == tensor::QT_Q8_0;
-        let all_q8_0 = q8(token_embd)
-            && output.map(q8).unwrap_or(true)
+        // A uniform quant type with a weight-stationary matmul kernel (Q8_0 for
+        // the 0.8B, Q1_0/Q2_0 for the Bonsai binary/ternary builds) unlocks the
+        // batched-prefill fast path; mixed-quant models fall back to sequential
+        // prefill.
+        let bq = token_embd.qt;
+        let same = |w: QWeight| w.qt == bq;
+        let uniform = output.map(same).unwrap_or(true)
             && layers.iter().all(|ly| {
-                q8(ly.ffn_gate)
-                    && q8(ly.ffn_up)
-                    && q8(ly.ffn_down)
+                same(ly.ffn_gate)
+                    && same(ly.ffn_up)
+                    && same(ly.ffn_down)
                     && match ly.kind {
-                        LayerKind::Attn { q, k, v, o, .. } => q8(q) && q8(k) && q8(v) && q8(o),
+                        LayerKind::Attn { q, k, v, o, .. } => same(q) && same(k) && same(v) && same(o),
                         LayerKind::Delta { qkv, gate, alpha, beta, out, .. } => {
-                            q8(qkv) && q8(gate) && q8(alpha) && q8(beta) && q8(out)
+                            same(qkv) && same(gate) && same(alpha) && same(beta) && same(out)
                         }
                         // The batched-prefill fast path is qwen-shaped; gemma
                         // always prefills sequentially.
                         LayerKind::GemmaAttn { .. } => false,
                     }
             });
+        let has_matmul = matches!(bq, tensor::QT_Q8_0 | tensor::QT_Q1_0 | tensor::QT_Q2_0);
+        let batch_qt = (uniform && has_matmul).then_some(bq);
 
-        Ok(Self { config: c, gguf, token_embd, output, output_norm, layers, vocab, all_q8_0 })
+        Ok(Self { config: c, gguf, token_embd, output, output_norm, layers, vocab, batch_qt })
     }
 
     pub fn vocab(&self) -> usize {
         self.vocab
+    }
+    /// Whether [`Model::prefill`] takes the weight-stationary batched path on
+    /// this model (uniform batch-capable quant type + an arch with the batched
+    /// matmul kernels). Callers feeding long prompts token-by-token should
+    /// instead feed chunks through `prefill` when this is true — each weight
+    /// is then read once per chunk instead of once per token.
+    pub fn batched_prefill_supported(&self) -> bool {
+        cfg!(target_arch = "aarch64") && self.batch_qt.is_some()
     }
     pub fn token_str(&self, id: usize) -> &str {
         self.gguf.tokens.get(id).copied().unwrap_or("")
@@ -491,7 +513,7 @@ impl<'a> Model<'a> {
         // cores -- just far less weight bandwidth. x86 (TCG, no batched matmul
         // kernel) uses the sequential path; prefill still works, just slower.
         #[cfg(target_arch = "aarch64")]
-        if prompt.len() >= 2 && self.all_q8_0 {
+        if prompt.len() >= 2 && self.batch_qt.is_some() {
             self.prefill_batched(prompt, pos0, cache, state);
             return;
         }
@@ -567,7 +589,7 @@ impl<'a> Model<'a> {
                     }
                     self.batched_proj(o_w, &attn_out, &mut proj_out, &mut xq, &mut xs, m, dim, ao);
                 }
-                // Batched prefill is gated on `all_q8_0`, which is always
+                // Batched prefill is gated on `batch_qt`, which is always
                 // false for Gemma models (see `Model::load`), so this arm can
                 // never be reached.
                 LayerKind::GemmaAttn { .. } => unreachable!("gemma never takes the batched-prefill path"),
@@ -622,7 +644,7 @@ impl<'a> Model<'a> {
     /// with stride `cols`/`cols/QK` (the layout `matmul_q8_0_sdot_rows` expects).
     #[cfg(target_arch = "aarch64")]
     fn batched_proj(&self, w: QWeight, input: &[f32], out: &mut [f32], xq: &mut [i8], xs: &mut [f32], m: usize, rows: usize, cols: usize) {
-        debug_assert_eq!(w.qt, tensor::QT_Q8_0); // batched prefill is Q8_0-only (all_q8_0)
+        debug_assert_eq!(Some(w.qt), self.batch_qt); // batched prefill needs the uniform batch quant
         let nb = cols / QK;
         for mi in 0..m {
             tensor::quantize_activations_q8(
@@ -631,11 +653,21 @@ impl<'a> Model<'a> {
                 &mut xs[mi * nb..(mi + 1) * nb],
             );
         }
-        // SAFETY: `w` is `rows` Q8_0 rows of `cols/QK` blocks; `xq`/`xs` hold `m`
-        // activations of `cols`/`nb`; `out` has `m*rows` slots. matmul_sdot
+        // SAFETY: `w` is `rows` rows of `w.qt` blocks; `xq`/`xs` hold `m`
+        // activations of `cols`/`nb`; `out` has `m*rows` slots. Each matmul
         // splits `[0,rows)` across cores, each writing a disjoint row range.
         unsafe {
-            crate::arch::aarch64::smp::matmul_sdot(w.data.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols);
+            match w.qt {
+                tensor::QT_Q1_0 => crate::arch::aarch64::smp::matmul_q1_0_sdot(
+                    w.data.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols,
+                ),
+                tensor::QT_Q2_0 => crate::arch::aarch64::smp::matmul_q2_0_sdot(
+                    w.data.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols,
+                ),
+                _ => crate::arch::aarch64::smp::matmul_sdot(
+                    w.data.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols,
+                ),
+            }
         }
     }
 

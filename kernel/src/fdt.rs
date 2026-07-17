@@ -223,6 +223,19 @@ unsafe fn header(dtb_pa: u64) -> Option<(*const u8, Header)> {
     Some((base, Header { total, off_struct, off_strings }))
 }
 
+/// True if `dtb_pa` points at a structurally valid FDT (magic + readable
+/// header). Callers gating platform behavior on FDT *contents* must first know
+/// whether an FDT exists at all: QEMU/VBox `-kernel` and the UEFI-stub boots
+/// carry **no** DTB in x0, and "no FDT" must not be conflated with "FDT says
+/// the feature is absent" (that conflation once turned PSCI SMP off on QEMU).
+///
+/// # Safety
+/// `dtb_pa`, if nonzero, must be readable for at least 16 bytes.
+pub unsafe fn present(dtb_pa: u64) -> bool {
+    // SAFETY: delegated to `header` (magic-checked, bounded reads).
+    unsafe { header(dtb_pa).is_some() }
+}
+
 /// True if the `compatible` property value at `[data_off, data_off+len)` — a
 /// sequence of NUL-terminated strings — contains an exact match for `want`.
 ///
@@ -1212,6 +1225,19 @@ mod tests {
         // like an Apple FDT, so SMP bring-up must skip PSCI.
         assert!(!unsafe { has_compatible(p, b"arm,psci-1.0") });
         assert!(!unsafe { has_compatible(p, b"arm,psci-0.2") });
+    }
+
+    /// `present` distinguishes "a valid FDT exists" from "no FDT at all" — the
+    /// PSCI gate must only trust `has_compatible == false` when an FDT is
+    /// actually present (QEMU/VBox `-kernel` ELF and the UEFI stub pass no DTB
+    /// in x0; treating that as "no PSCI" once turned SMP off on QEMU).
+    #[test_case]
+    fn present_accepts_fdt_rejects_garbage_and_zero() {
+        let blob = sample();
+        assert!(unsafe { present(blob.as_ptr() as u64) });
+        assert!(!unsafe { present(0) });
+        let junk = [0u8; 32]; // no FDT magic
+        assert!(!unsafe { present(junk.as_ptr() as u64) });
     }
 
     #[test_case]

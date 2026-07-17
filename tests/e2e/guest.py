@@ -23,7 +23,7 @@ def _repo_root():
 
 class Guest:
     def __init__(self, arch="aarch64", model="qwen3.5-0.8b", verbose=False, audio="off", hostfwd=None,
-                 no_model=False, model_disk=None):
+                 no_model=False, model_disk=None, release=False):
         self.verbose = verbose
         self.buf = bytearray()
         self.lock = threading.Lock()
@@ -49,6 +49,9 @@ class Guest:
         cmd = ["cargo", "xtask", "run", "-arch", arch, "-model", model]
         if no_model:
             cmd.append("--no-model")
+        # Optimized kernel — inference-speed scenarios need release timing.
+        if release:
+            cmd.append("--release")
         # New session/process group so `close()` can kill the whole tree
         # (cargo → xtask → qemu) at once — SIGTERM to just `cargo` would orphan
         # the qemu grandchild, which would keep the HVF/hostfwd ports and block a

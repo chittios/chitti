@@ -76,6 +76,30 @@ pub mod arch {
             pub unsafe fn matvec_q4_k_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, n_rows: usize, n_cols: usize) {
                 unsafe { tensor::matvec_q4_k_sdot_rows(w, xq, xs, y, 0, n_rows, n_cols) }
             }
+
+            /// # Safety
+            /// Same contract as `tensor::matvec_q2_0_sdot_rows` over `[0, n_rows)`.
+            pub unsafe fn matvec_q2_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, n_rows: usize, n_cols: usize) {
+                unsafe { tensor::matvec_q2_0_sdot_rows(w, xq, xs, y, 0, n_rows, n_cols) }
+            }
+
+            /// # Safety
+            /// Same contract as `tensor::matvec_q1_0_sdot_rows` over `[0, n_rows)`.
+            pub unsafe fn matvec_q1_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, n_rows: usize, n_cols: usize) {
+                unsafe { tensor::matvec_q1_0_sdot_rows(w, xq, xs, y, 0, n_rows, n_cols) }
+            }
+
+            /// # Safety
+            /// Same contract as `tensor::matmul_q1_0_sdot_rows` over `[0, n_rows)`.
+            pub unsafe fn matmul_q1_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, m_count: usize, n_rows: usize, n_cols: usize) {
+                unsafe { tensor::matmul_q1_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, n_rows, n_cols) }
+            }
+
+            /// # Safety
+            /// Same contract as `tensor::matmul_q2_0_sdot_rows` over `[0, n_rows)`.
+            pub unsafe fn matmul_q2_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, m_count: usize, n_rows: usize, n_cols: usize) {
+                unsafe { tensor::matmul_q2_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, n_rows, n_cols) }
+            }
         }
     }
 

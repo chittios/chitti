@@ -4,21 +4,27 @@
 
 # --- knobs (override on the command line: `make run ARCH=x86_64 MODEL=qwen3.5-9b RELEASE=1`) ---
 # ARCH:         aarch64 (native HVF on Apple Silicon) | x86_64
-# MODEL:        bonsai-27b (default) | qwen3.5-0.8b | qwen3.5-2b | qwen3.5-4b
-#               | qwen3.5-9b | gemma-4-e4b (aliases: e4b, gemma4-e4b)
-#               bonsai-27b = PrismML Ternary-Bonsai-27B main weights (Q2_0 ternary, ~7.17 GB)
-# RELEASE:      set to 1 for an optimized build
+# MODEL:        bonsai-27b (default) | bonsai-27b-ternary | qwen3.5-0.8b
+#               | qwen3.5-2b | qwen3.5-4b | qwen3.5-9b | gemma-4-e4b (e4b)
+#               bonsai-27b         = PrismML Bonsai-27B 1-bit (Q1_0 binary, ~3.8 GB)
+#               bonsai-27b-ternary = PrismML Ternary-Bonsai-27B (Q2_0, ~7.17 GB)
+# RELEASE:      1 (default) = optimized build — inference is many times faster;
+#               set RELEASE= (empty) for a fast-compile debug build
 # BRIDGE:       host NIC to L2-bridge (empty = QEMU user-net / slirp). macOS
 #               vmnet-bridged needs sudo — leave empty for host services via 10.0.2.2
-# REMOTE_URL:   auto `/model remote` at boot (empty = no seed). Under user-net
-#               the host is always 10.0.2.2 (not the Mac's LAN IP).
+# REMOTE_URL:   auto `/model remote` at boot (empty = no seed → local model).
+#               `make run` leaves this empty (boots the local GGUF); use
+#               `make run-remote` to seed a hosted backend. Under user-net the
+#               host is always 10.0.2.2 (not the Mac's LAN IP).
 # REMOTE_MODEL: model name sent to the hosted server (LM Studio / Ollama / …)
 ARCH         ?= aarch64
 MODEL        ?= bonsai-27b
-RELEASE      ?=
+RELEASE      ?= 1
 BRIDGE       ?=
-REMOTE_URL   ?= http://10.0.2.2:1234
+REMOTE_URL   ?=
 REMOTE_MODEL ?= ornith-1.0-9b
+# Hosted backend seeded by `run-remote` (override on the command line).
+REMOTE_RUN_URL ?= http://10.0.2.2:1234
 
 # VirtualBox (the `vbox` target): which VM to (re)load the aarch64 image into,
 # and where its boot disk is attached. Override e.g. `make vbox VBOX_VM=MyVM`.
@@ -41,10 +47,10 @@ help:
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /'
 	@echo
 	@echo "Override knobs, e.g.:"
+	@echo "  make model && make run                 # fetch + boot the default (bonsai-27b 1-bit)"
 	@echo "  make run ARCH=x86_64 MODEL=qwen3.5-9b RELEASE=1"
-	@echo "  make model MODEL=e4b && make run-uefi MODEL=e4b"
-	@echo "  make run REMOTE_URL=http://10.0.2.2:1234 REMOTE_MODEL=ornith-1.0-9b"
-	@echo "  make run REMOTE_URL=          # no auto /model remote"
+	@echo "  make model MODEL=bonsai-27b-ternary && make run MODEL=bonsai-27b-ternary  # Q2_0 build"
+	@echo "  make run-remote REMOTE_RUN_URL=http://10.0.2.2:1234 REMOTE_MODEL=ornith-1.0-9b"
 	@echo "  make run BRIDGE=en0           # L2 bridge (often needs sudo on macOS)"
 
 ## test: in-kernel test suite under QEMU (x86_64) — the gate, keep it 104/104
@@ -64,11 +70,21 @@ build-all:
 	$(XTASK) build -arch aarch64 -model $(MODEL) $(REL)
 
 ## run: boot the kernel in QEMU for ARCH (serial on stdio + a graphical window)
-##      seeds /model remote from REMOTE_URL + REMOTE_MODEL (LM Studio default)
+##      uses the local bundled GGUF (MODEL); no remote seed (see run-remote)
 .PHONY: run
 run:
 	CHITTI_NET_BRIDGE='$(BRIDGE)' \
 	CHITTI_REMOTE_URL='$(REMOTE_URL)' \
+	CHITTI_REMOTE_MODEL='$(REMOTE_MODEL)' \
+	$(XTASK) run $(FLAGS)
+
+## run-remote: like `run`, but seed `/model remote` at boot from REMOTE_RUN_URL
+##             + REMOTE_MODEL (hosted LM Studio / Ollama / vLLM). Override e.g.
+##             `make run-remote REMOTE_RUN_URL=http://10.0.2.2:1234 REMOTE_MODEL=ornith-1.0-9b`
+.PHONY: run-remote
+run-remote:
+	CHITTI_NET_BRIDGE='$(BRIDGE)' \
+	CHITTI_REMOTE_URL='$(REMOTE_RUN_URL)' \
 	CHITTI_REMOTE_MODEL='$(REMOTE_MODEL)' \
 	$(XTASK) run $(FLAGS)
 

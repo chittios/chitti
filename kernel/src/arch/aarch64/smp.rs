@@ -201,17 +201,23 @@ pub fn init() {
     // over an `hvc`/`smc` conduit. Apple Silicon has **no PSCI** — its FDT has
     // no `arm,psci-*` node and cores start via Apple's CPU-start MMIO (a
     // follow-up). Issuing `hvc` there traps to EL2 (m1n1) and halts the guest,
-    // so gate the whole PSCI path on the device tree advertising PSCI; without
-    // it, run single-core rather than fault.
+    // so skip PSCI **when a valid FDT explicitly lacks it** (the m1n1 path
+    // always passes one). Boots with *no* FDT in x0 — QEMU/VBox `-kernel`
+    // ELF and the UEFI stub — are SBSA platforms where PSCI is the norm, so
+    // they keep the PSCI bring-up (gating those on FDT contents once turned
+    // SMP off on QEMU entirely: "no FDT" is not "FDT says no PSCI").
     let fdt = super::boot::boot_x0();
-    // SAFETY: `boot_x0` is the FDT pointer (or non-FDT, rejected by the magic).
-    let has_psci = unsafe {
-        crate::fdt::has_compatible(fdt, b"arm,psci-1.0")
-            || crate::fdt::has_compatible(fdt, b"arm,psci-0.2")
-            || crate::fdt::has_compatible(fdt, b"arm,psci")
-    };
-    if !has_psci {
-        crate::ktrace::log("smp", "no PSCI in device tree (Apple Silicon?) -- single-core; Apple CPU-start is a follow-up");
+    // SAFETY: `boot_x0` is the FDT pointer (or non-FDT/0, rejected by the magic).
+    let fdt_present = unsafe { crate::fdt::present(fdt) };
+    // SAFETY: as above; only consulted when the header validated.
+    let has_psci = fdt_present
+        && unsafe {
+            crate::fdt::has_compatible(fdt, b"arm,psci-1.0")
+                || crate::fdt::has_compatible(fdt, b"arm,psci-0.2")
+                || crate::fdt::has_compatible(fdt, b"arm,psci")
+        };
+    if fdt_present && !has_psci {
+        crate::ktrace::log("smp", "FDT advertises no PSCI (Apple Silicon) -- single-core; Apple CPU-start is a follow-up");
         return;
     }
     let entry_fn: unsafe extern "C" fn() = smp_secondary_entry;
@@ -522,6 +528,10 @@ fn worker_loop(slot: usize) -> ! {
                     0 => tensor::matmul_q8_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols),
                     1 => tensor::matvec_q4_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols),
                     3 => tensor::matvec_q4_k_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols),
+                    5 => tensor::matvec_q2_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols),
+                    6 => tensor::matvec_q1_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols),
+                    7 => tensor::matmul_q1_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols),
+                    8 => tensor::matmul_q2_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols),
                     4 => {
                         // Generic row work (video YUV→RGB, etc.).
                         let fp = JOB.fn_ptr.load(Ordering::Relaxed);
@@ -751,4 +761,155 @@ pub unsafe fn matvec_q4_k_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
     add_busy(0, super::cycle_count().wrapping_sub(t0));
     // SAFETY: same contract as the chunk above, over the straggler's range.
     barrier(workers, g, &|rs, re| unsafe { tensor::matvec_q4_k_sdot_rows(w, xq, xs, y, rs, re, n_cols) });
+}
+
+/// `y = W·x` for Q2_0 weights split across online cores by row range — the fast
+/// PrismML ternary path (`matvec_q2_0_sdot_rows`, Bonsai-27B). Falls back to
+/// single-core when only the BSP is online or the matrix is small.
+///
+/// # Safety
+/// Same contract as `tensor::matvec_q2_0_sdot_rows` over `[0, n_rows)`.
+pub unsafe fn matvec_q2_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, n_rows: usize, n_cols: usize) {
+    let workers = fleet_workers();
+    if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
+        // SAFETY: caller's contract; whole range on this core.
+        unsafe { tensor::matvec_q2_0_sdot_rows(w, xq, xs, y, 0, n_rows, n_cols) };
+        return;
+    }
+    let n_parts = workers + 1;
+    let boundary = |k: usize| k * n_rows / n_parts;
+    JOB.w.store(w as *mut u8, Ordering::Relaxed);
+    JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
+    JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
+    JOB.y.store(y, Ordering::Relaxed);
+    JOB.n_cols.store(n_cols, Ordering::Relaxed);
+    JOB.mode.store(5, Ordering::Relaxed); // Q2_0 SDOT
+    for s in 0..workers {
+        JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
+    }
+    clear_unused_slots(workers);
+    let g = JOB.go.load(Ordering::Relaxed) + 1;
+    JOB.go.store(g, Ordering::Release);
+    signal_workers(); // wake WFE-parked workers
+    // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    let t0 = super::cycle_count();
+    unsafe { tensor::matvec_q2_0_sdot_rows(w, xq, xs, y, 0, boundary(1), n_cols) };
+    add_busy(0, super::cycle_count().wrapping_sub(t0));
+    // SAFETY: same contract as the chunk above, over the straggler's range.
+    barrier(workers, g, &|rs, re| unsafe { tensor::matvec_q2_0_sdot_rows(w, xq, xs, y, rs, re, n_cols) });
+}
+
+/// `y = W·x` for Q1_0 (binary) weights split across online cores by row range —
+/// the fast PrismML 1-bit path (`matvec_q1_0_sdot_rows`, Bonsai-27B). Falls back
+/// to single-core when only the BSP is online or the matrix is small.
+///
+/// # Safety
+/// Same contract as `tensor::matvec_q1_0_sdot_rows` over `[0, n_rows)`.
+pub unsafe fn matvec_q1_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, n_rows: usize, n_cols: usize) {
+    let workers = fleet_workers();
+    if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
+        // SAFETY: caller's contract; whole range on this core.
+        unsafe { tensor::matvec_q1_0_sdot_rows(w, xq, xs, y, 0, n_rows, n_cols) };
+        return;
+    }
+    let n_parts = workers + 1;
+    let boundary = |k: usize| k * n_rows / n_parts;
+    JOB.w.store(w as *mut u8, Ordering::Relaxed);
+    JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
+    JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
+    JOB.y.store(y, Ordering::Relaxed);
+    JOB.n_cols.store(n_cols, Ordering::Relaxed);
+    JOB.mode.store(6, Ordering::Relaxed); // Q1_0 SDOT
+    for s in 0..workers {
+        JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
+    }
+    clear_unused_slots(workers);
+    let g = JOB.go.load(Ordering::Relaxed) + 1;
+    JOB.go.store(g, Ordering::Release);
+    signal_workers(); // wake WFE-parked workers
+    // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    let t0 = super::cycle_count();
+    unsafe { tensor::matvec_q1_0_sdot_rows(w, xq, xs, y, 0, boundary(1), n_cols) };
+    add_busy(0, super::cycle_count().wrapping_sub(t0));
+    // SAFETY: same contract as the chunk above, over the straggler's range.
+    barrier(workers, g, &|rs, re| unsafe { tensor::matvec_q1_0_sdot_rows(w, xq, xs, y, rs, re, n_cols) });
+}
+
+/// Batched weight-stationary `Q1_0` matmul (`y[m][r] = W[r]·xq[m]`) split
+/// across online cores by row range — the batched-prefill kernel for the
+/// 1-bit Bonsai (`matmul_q1_0_sdot_rows`).
+///
+/// # Safety
+/// Same contract as `tensor::matmul_q1_0_sdot_rows` over `[0, n_rows)`.
+pub unsafe fn matmul_q1_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, m_count: usize, n_rows: usize, n_cols: usize) {
+    let workers = fleet_workers();
+    if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
+        // SAFETY: caller's contract; whole range on this core.
+        unsafe { tensor::matmul_q1_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, n_rows, n_cols) };
+        return;
+    }
+    let n_parts = workers + 1;
+    let boundary = |k: usize| k * n_rows / n_parts;
+    JOB.w.store(w as *mut u8, Ordering::Relaxed);
+    JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
+    JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
+    JOB.y.store(y, Ordering::Relaxed);
+    JOB.n_cols.store(n_cols, Ordering::Relaxed);
+    JOB.m_count.store(m_count, Ordering::Relaxed);
+    JOB.n_rows.store(n_rows, Ordering::Relaxed);
+    JOB.mode.store(7, Ordering::Relaxed); // Q1_0 SDOT matmul
+    for s in 0..workers {
+        JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
+    }
+    clear_unused_slots(workers);
+    let g = JOB.go.load(Ordering::Relaxed) + 1;
+    JOB.go.store(g, Ordering::Release);
+    signal_workers(); // wake WFE-parked workers
+    // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    let t0 = super::cycle_count();
+    unsafe { tensor::matmul_q1_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, boundary(1), n_cols) };
+    add_busy(0, super::cycle_count().wrapping_sub(t0));
+    // SAFETY: same contract as the chunk above, over the straggler's range.
+    barrier(workers, g, &|rs, re| unsafe { tensor::matmul_q1_0_sdot_rows(w, xq, xs, y, m_count, n_rows, rs, re, n_cols) });
+}
+
+/// Batched weight-stationary `Q2_0` matmul split across online cores — the
+/// batched-prefill kernel for Ternary-Bonsai (`matmul_q2_0_sdot_rows`).
+///
+/// # Safety
+/// Same contract as `tensor::matmul_q2_0_sdot_rows` over `[0, n_rows)`.
+pub unsafe fn matmul_q2_0_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, m_count: usize, n_rows: usize, n_cols: usize) {
+    let workers = fleet_workers();
+    if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
+        // SAFETY: caller's contract; whole range on this core.
+        unsafe { tensor::matmul_q2_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, n_rows, n_cols) };
+        return;
+    }
+    let n_parts = workers + 1;
+    let boundary = |k: usize| k * n_rows / n_parts;
+    JOB.w.store(w as *mut u8, Ordering::Relaxed);
+    JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
+    JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
+    JOB.y.store(y, Ordering::Relaxed);
+    JOB.n_cols.store(n_cols, Ordering::Relaxed);
+    JOB.m_count.store(m_count, Ordering::Relaxed);
+    JOB.n_rows.store(n_rows, Ordering::Relaxed);
+    JOB.mode.store(8, Ordering::Relaxed); // Q2_0 SDOT matmul
+    for s in 0..workers {
+        JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
+    }
+    clear_unused_slots(workers);
+    let g = JOB.go.load(Ordering::Relaxed) + 1;
+    JOB.go.store(g, Ordering::Release);
+    signal_workers(); // wake WFE-parked workers
+    // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    let t0 = super::cycle_count();
+    unsafe { tensor::matmul_q2_0_sdot_rows(w, xq, xs, y, m_count, n_rows, 0, boundary(1), n_cols) };
+    add_busy(0, super::cycle_count().wrapping_sub(t0));
+    // SAFETY: same contract as the chunk above, over the straggler's range.
+    barrier(workers, g, &|rs, re| unsafe { tensor::matmul_q2_0_sdot_rows(w, xq, xs, y, m_count, n_rows, rs, re, n_cols) });
 }
