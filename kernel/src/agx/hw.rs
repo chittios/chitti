@@ -475,6 +475,28 @@ fn dump_crashlog(phys: u64) {
         let _ = write!(line, " {w:08x}");
     }
     crate::ktrace::log_fmt(format_args!("agx: crashlog @ {phys:#x}{tag}:{line}"));
+
+    // Scan the first ~2 KiB for printable ASCII runs — the crashlog `Cstr`
+    // records carry the firmware's own crash message (often naming exactly what
+    // it faulted on), far more useful than the raw hex.
+    let mut s = alloc::string::String::new();
+    let mut run = alloc::string::String::new();
+    for i in 0..2048u64 {
+        // SAFETY: within our 16 KiB crashlog buffer.
+        let b = unsafe { core::ptr::read_volatile((phys + i) as *const u8) };
+        if (0x20..0x7f).contains(&b) {
+            run.push(b as char);
+        } else {
+            if run.len() >= 4 {
+                s.push_str(&run);
+                s.push('|');
+            }
+            run.clear();
+        }
+    }
+    if !s.is_empty() {
+        crate::ktrace::log_fmt(format_args!("agx: crashlog strings: {s}"));
+    }
 }
 
 /// The cooperative pump run between every mailbox poll: keep the UI/clock/net
@@ -728,7 +750,9 @@ fn probe_app_endpoints(asc: &Asc, rep: &mut Report) {
         }
     }
     let deadline = crate::arch::now_ms() + 3000;
-    let mut state = RtkitState { iop_power: POWER_ON, ap_power: POWER_ON, ..Default::default() };
+    // The crashlog buffer was already granted during boot, so a further crashlog
+    // message is a CRASH notification (not a getbuf).
+    let mut state = RtkitState { iop_power: POWER_ON, ap_power: POWER_ON, crashed: false, have_crashlog_buffer: true };
     let mut any = false;
     while crate::arch::now_ms() < deadline {
         let Some(m) = asc.recv_blocking(500, &mut pump) else {
@@ -747,6 +771,15 @@ fn probe_app_endpoints(asc: &Asc, rep: &mut Report) {
         // Further system messages (e.g. channel-ring buffer requests) — service
         // buffer requests through the shared TTBR1 UAT, ACK the rest.
         match handle_system_msg(&mut state, m.msg0, ep) {
+            Action::Crashed => {
+                // Expected without initdata — but it PROVES the buffer is
+                // reachable (the FW wrote crash data there). Dump the record.
+                crate::ktrace::log("agx", "compute: firmware CRASHED (expected without initdata) — dumping crash record:");
+                if rep.crashlog_phys != 0 {
+                    dump_crashlog(rep.crashlog_phys);
+                }
+                break;
+            }
             Action::AllocBuffer { ep, n_pages, addr, .. } if addr == 0 => {
                 let aligned = (n_pages * 4096).next_multiple_of(uat::PAGE_SIZE);
                 if let Some(phys) = alloc_shared(aligned / 4096) {
