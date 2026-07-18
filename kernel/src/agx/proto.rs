@@ -85,7 +85,10 @@ const EPMAP_REPLY_MORE_BIT: u32 = 0;
 const START_EP_IDX: (u32, u32) = (39, 32);
 const START_EP_FLAG_BIT: u32 = 1;
 const BUFFER_REQUEST_SIZE: (u32, u32) = (51, 44); // in 4 KiB pages
-const BUFFER_REQUEST_IOVA: (u32, u32) = (41, 0);
+// The buffer DVA field. Generic RTKit uses [41:0], but the AGX crashlog message
+// (crash.py `CrashLogMessage.DVA`) is [43:0] — needed for high-half TTBR1 kernel
+// VAs (e.g. 0xfae00000000, whose bits [43:40] are set). Use the wider field.
+const BUFFER_REQUEST_IOVA: (u32, u32) = (43, 0);
 
 /// The management/endpoint message type in `msg0` (bits [59:52]).
 #[inline]
@@ -456,10 +459,13 @@ mod tests {
 
     #[test_case]
     fn buffer_reply_carries_dva_and_size() {
-        let dva = 0x8_1234_0000u64;
+        // A high-half TTBR1 kernel VA (bits [43:40] set) must survive the reply,
+        // which the old [41:0] field truncated.
+        let dva = 0xfae00000000u64;
         let reply = msg_buffer_reply(4, dva);
         assert_eq!(mgmt_type(reply), MSG_BUFFER_REQUEST);
         assert_eq!(field_get(reply, 51, 44), 4);
+        assert_eq!(field_get(reply, 43, 0), dva); // full 44-bit DVA preserved
         assert_eq!(field_get(reply, 41, 0), dva & gen_mask(41, 0));
     }
 

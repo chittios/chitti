@@ -172,14 +172,15 @@ static ABORT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::n
 // shared-region tables (its own FW-side mappings). Mirrors the m1n1 proxyclient
 // (`m1n1/hw/uat.py`, `m1n1/agx/__init__.py`).
 
-/// The firmware's private VM-region base (asahi/proxyclient constant — not in
-/// the FDT). GPU VAs below `1<<47` walk TTBR0. `trace/agx.py:465`,
-/// `context.py:40 pipeline_base`.
-const FW_VA_BASE: u64 = 0x1100000000;
-/// GPU VA space we hand RTKit shared buffers out of (the proxyclient's klow/GEM
-/// region, `agx/__init__.py:85`, `context.py:37`) — comfortably in the TTBR0
-/// low half and clear of the firmware's own low mappings.
-const BUF_VA_BASE: u64 = 0x1500000000;
+/// GPU VA space we hand RTKit shared buffers out of. RTKit buffers MUST live in
+/// the shared **TTBR1** kernel range, not per-context TTBR0: during boot the
+/// firmware runs in its own context (ctx-0 TTBR0 isn't active), but TTBR1 is
+/// shared across all contexts (the firmware's `pagetables` region), so a TTBR1
+/// buffer is reachable from the firmware's boot context. This is Linux's
+/// `IOVA_KERN_RTKIT_RANGE` (~0xffffffae_00000000, sign-extended; the DVA field's
+/// low 44 bits = 0xfae00000000, bit 39 set ⇒ TTBR1). A TTBR0 VA (0x15…) was
+/// invisible to the firmware's boot context — the all-zero-crashlog stall.
+const BUF_VA_BASE: u64 = 0xfae00000000;
 
 struct UatState {
     ready: bool,
@@ -351,15 +352,18 @@ fn get_or_alloc_table(table: u64, idx: usize) -> Option<u64> {
     Some(next)
 }
 
-/// Map one 16 KiB `pa` page at GPU VA `va` into ctx-0 (walking our TTBR0 L1).
-fn uat_map_page(l1: u64, va: u64, pa: u64) -> bool {
+/// Map one 16 KiB `pa` page at GPU VA `va`. `l1_ttbr0`/`l1_ttbr1` are the L1
+/// table bases for each half; the VA's bit-39 select picks which — TTBR1 (the
+/// firmware's shared `pagetables`) for RTKit kernel buffers, so they're reachable
+/// from the firmware's boot context.
+fn uat_map_page(l1_ttbr0: u64, l1_ttbr1: u64, va: u64, pa: u64) -> bool {
     let (l0, i1, i2, i3, _) = uat::split_va(va);
-    debug_assert_eq!(l0, 0); // BUF_VA_BASE is in the TTBR0 half
+    let l1 = if l0 == 1 { l1_ttbr1 } else { l1_ttbr0 };
     let Some(l2) = get_or_alloc_table(l1, i1) else { return false };
     let Some(l3) = get_or_alloc_table(l2, i2) else { return false };
     let slot = l3 + i3 as u64 * 8;
-    // We are adding into the firmware's LIVE ctx-0 tables — a already-valid leaf
-    // here means our chosen VA collides with a firmware mapping (pick another).
+    // Adding into the firmware's LIVE shared tables — an already-valid leaf here
+    // means our chosen VA collides with a firmware mapping (pick another range).
     let existing = rd64(slot);
     if uat::is_valid(existing) {
         crate::ktrace::log_fmt(format_args!("agx: uat VA {va:#x} already mapped by firmware (leaf {existing:#018x}) — collision!"));
@@ -369,20 +373,21 @@ fn uat_map_page(l1: u64, va: u64, pa: u64) -> bool {
     true
 }
 
-/// Map a physically-contiguous RTKit buffer (`phys`, `bytes`) into ctx-0 and
-/// return its GPU VA (bump-allocated from `BUF_VA_BASE`). `None` on failure.
+/// Map a physically-contiguous RTKit buffer (`phys`, `bytes`) into the shared
+/// TTBR1 kernel range and return its GPU VA (bump-allocated from `BUF_VA_BASE`).
+/// `None` on failure.
 fn uat_map_buffer(phys: u64, bytes: u64) -> Option<u64> {
     if !uat_init() {
         return None;
     }
     let npages = bytes.div_ceil(uat::PAGE_SIZE).max(1);
-    let (l1, va) = UAT.with(|u| {
+    let (l1_ttbr0, l1_ttbr1, va) = UAT.with(|u| {
         let va = u.va_next;
         u.va_next += npages * uat::PAGE_SIZE;
-        (u.l1, va)
+        (u.l1, u.pagetables, va)
     });
     for i in 0..npages {
-        if !uat_map_page(l1, va + i * uat::PAGE_SIZE, phys + i * uat::PAGE_SIZE) {
+        if !uat_map_page(l1_ttbr0, l1_ttbr1, va + i * uat::PAGE_SIZE, phys + i * uat::PAGE_SIZE) {
             crate::ktrace::log("agx", "uat: page map failed (OOM)");
             return None;
         }
