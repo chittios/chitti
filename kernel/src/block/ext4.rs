@@ -245,20 +245,28 @@ impl<'d, D: BlockDevice> Ext4Writer<'d, D> {
             dir_entries.push((ino, f.name.as_bytes().to_vec(), 1));
         }
 
-        // Root directory block.
-        let rootblk = self.alloc_block(Some(0)).ok_or(BlockError::OutOfRange)?;
-        let dirbuf = make_dir_block(&dir_entries);
-        self.write_eblock(rootblk, &dirbuf)?;
+        // Root directory: pack the (flat) entries into as many 4 KiB blocks as
+        // they need — one dirent block per group. A single block overflowed
+        // once the app-agent file set's names exceeded 4096 B of dirents
+        // (KERNEL PANIC in `make_dir_block`). The reader already walks a
+        // multi-block directory (`ext4_read::list_root` iterates
+        // `size / block_size` blocks via `map_block`), so this stays readable.
+        let groups = partition_dir_entries(&dir_entries);
+        let mut root_blocks = Vec::with_capacity(groups.len());
+        for _ in 0..groups.len() {
+            root_blocks.push(self.alloc_block(Some(0)).ok_or(BlockError::OutOfRange)?);
+        }
+        for (g, &blk) in groups.iter().zip(root_blocks.iter()) {
+            let dirbuf = make_dir_block(&dir_entries[g.clone()]);
+            self.write_eblock(blk, &dirbuf)?;
+        }
+        let (slots, indirect) = self.build_iblocks(&root_blocks)?;
         inodes.push(InodeRec {
             ino: ROOT_INO,
             mode: S_IFDIR | 0o755,
-            size: EBS as u64,
-            blocks_512: SPB,
-            slots: {
-                let mut s = [0u32; 15];
-                s[0] = rootblk as u32;
-                s
-            },
+            size: (root_blocks.len() * EBS) as u64,
+            blocks_512: (root_blocks.len() as u64 + indirect) * SPB,
+            slots,
             links: 2,
         });
 
@@ -482,13 +490,43 @@ fn encode_superblock(sb: &mut [u8], total_blocks: u64, total_inodes: u64, free_b
     put32(sb, 100, ROCOMPAT_SPARSE_SUPER | ROCOMPAT_LARGE_FILE); // feature_ro_compat
 }
 
+/// On-disk size of one directory entry: an 8-byte header + the name rounded up
+/// to 4 bytes.
+fn dirent_len(name_len: usize) -> usize {
+    8 + name_len.div_ceil(4) * 4
+}
+
+/// Split directory entries into contiguous groups that each fit in one 4 KiB
+/// dirent block (each becomes one block of the directory inode, in order).
+/// Greedy: start a new block whenever the next entry would overflow the current
+/// one. A directory that used to be a single [`make_dir_block`] call now spans
+/// `groups.len()` blocks — the writer must give the inode all of them.
+fn partition_dir_entries(entries: &[(u64, Vec<u8>, u8)]) -> Vec<core::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+    let mut used = 0usize;
+    for (i, e) in entries.iter().enumerate() {
+        let need = dirent_len(e.1.len());
+        if i > start && used + need > EBS {
+            groups.push(start..i);
+            start = i;
+            used = 0;
+        }
+        used += need;
+    }
+    groups.push(start..entries.len());
+    groups
+}
+
 /// Pack directory entries into one 4 KiB block; the last entry's rec_len spans
-/// to the block end (classic ext2 linked directory).
+/// to the block end (classic ext2 linked directory). Callers must ensure the
+/// entries fit (`partition_dir_entries`); `make_dir_block` on an over-full
+/// group would write past the block.
 fn make_dir_block(entries: &[(u64, Vec<u8>, u8)]) -> [u8; EBS] {
     let mut buf = [0u8; EBS];
     let mut off = 0usize;
     for (j, (ino, name, ft)) in entries.iter().enumerate() {
-        let reclen = if j == entries.len() - 1 { EBS - off } else { 8 + name.len().div_ceil(4) * 4 };
+        let reclen = if j == entries.len() - 1 { EBS - off } else { dirent_len(name.len()) };
         buf[off..off + 4].copy_from_slice(&(*ino as u32).to_le_bytes());
         buf[off + 4..off + 6].copy_from_slice(&(reclen as u16).to_le_bytes());
         buf[off + 6] = name.len() as u8;
@@ -497,4 +535,55 @@ fn make_dir_block(entries: &[(u64, Vec<u8>, u8)]) -> [u8; EBS] {
         off += reclen;
     }
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::format;
+    use alloc::vec::Vec;
+
+    /// A flat file set whose dirents exceed one 4 KiB block must split into
+    /// multiple contiguous groups, each within `EBS`, covering every entry in
+    /// order — the fix for the `make_dir_block` overflow panic (real hardware
+    /// hit it once the app-agent set grew past a single root dir block).
+    #[test_case]
+    fn partition_dir_entries_splits_and_covers() {
+        let entries: Vec<(u64, Vec<u8>, u8)> =
+            (0..300).map(|i| (2u64, format!("agent/{i:04}/SOUL.md").into_bytes(), 1u8)).collect();
+        let groups = partition_dir_entries(&entries);
+        assert!(groups.len() >= 2, "should span multiple blocks, got {}", groups.len());
+        let mut expect = 0usize;
+        for g in &groups {
+            assert_eq!(g.start, expect, "groups must be contiguous");
+            assert!(g.end > g.start, "empty group");
+            let used: usize = entries[g.clone()].iter().map(|e| dirent_len(e.1.len())).sum();
+            assert!(used <= EBS, "group {g:?} uses {used} > {EBS}");
+            expect = g.end;
+        }
+        assert_eq!(expect, entries.len(), "all entries covered");
+    }
+
+    /// `make_dir_block` on a partitioned group stays within the block and its
+    /// rec_len chain reaches exactly the block end — exactly what the reader
+    /// (`ext4_read::list_root`) walks, so every entry is readable.
+    #[test_case]
+    fn make_dir_block_reclen_chain_reaches_end() {
+        let entries: Vec<(u64, Vec<u8>, u8)> =
+            (0..100).map(|i| (2u64, format!("file{i:03}.txt").into_bytes(), 1u8)).collect();
+        let groups = partition_dir_entries(&entries);
+        let blk = make_dir_block(&entries[groups[0].clone()]);
+        let mut off = 0usize;
+        let mut count = 0usize;
+        while off + 8 <= EBS {
+            let rec_len = u16::from_le_bytes([blk[off + 4], blk[off + 5]]) as usize;
+            assert!(rec_len >= 8, "rec_len {rec_len} at off {off}");
+            let nl = blk[off + 6] as usize;
+            assert!(off + 8 + nl <= EBS, "name overruns block at off {off}");
+            count += 1;
+            off += rec_len;
+        }
+        assert_eq!(off, EBS, "rec_len chain must reach block end exactly");
+        assert_eq!(count, groups[0].len(), "walked every entry in the block");
+    }
 }
