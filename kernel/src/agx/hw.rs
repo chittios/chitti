@@ -75,6 +75,7 @@ struct Report {
     ap_power: u64,
     n_buffers: u32,
     cpu_running: bool,
+    crashlog_phys: u64,
 }
 
 static REPORT: crate::mm::Locked<Report> = crate::mm::Locked::new(Report {
@@ -86,6 +87,7 @@ static REPORT: crate::mm::Locked<Report> = crate::mm::Locked::new(Report {
     ap_power: 0,
     n_buffers: 0,
     cpu_running: false,
+    crashlog_phys: 0,
 });
 
 /// True if `needle` appears in the FDT `/chosen bootargs` (the m1n1 `-b` command
@@ -416,6 +418,28 @@ fn sgx_fault_check() {
     ));
 }
 
+/// Dump the head of the crashlog shared buffer (identity-mapped DRAM we own). A
+/// firmware crash writes a `CLHE` (`'C''L''H''E'`) record here; a still-zero
+/// buffer means the firmware never touched it (stuck before any crash path).
+fn dump_crashlog(phys: u64) {
+    // SAFETY: `phys` is our own alloc_shared'd DMA buffer, identity-mapped.
+    let w0 = unsafe { core::ptr::read_volatile(phys as *const u32) };
+    let clhe = u32::from_le_bytes(*b"CLHE");
+    if w0 == 0 {
+        crate::ktrace::log_fmt(format_args!("agx: crashlog buffer @ {phys:#x} is all-zero (FW wrote nothing — stuck, not crashed)"));
+        return;
+    }
+    let tag = if w0 == clhe { " (CLHE crash record!)" } else { "" };
+    let mut line = alloc::string::String::new();
+    use core::fmt::Write;
+    for i in 0..16u64 {
+        // SAFETY: 16 words within our 16 KiB crashlog buffer.
+        let w = unsafe { core::ptr::read_volatile((phys + i * 4) as *const u32) };
+        let _ = write!(line, " {w:08x}");
+    }
+    crate::ktrace::log_fmt(format_args!("agx: crashlog @ {phys:#x}{tag}:{line}"));
+}
+
 /// The cooperative pump run between every mailbox poll: keep the UI/clock/net
 /// alive and report Ctrl+C (returns true to abort). Mirrors the inference/IO
 /// loops' `upkeep()` + interrupt-poll discipline (CLAUDE.md standing rule).
@@ -552,6 +576,11 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
                 handoff::dump(ho);
             }
             sgx_fault_check();
+            // Dump the crashlog buffer — if the firmware hit an internal error it
+            // may have written a 'CLHE' record here (plain DRAM we own).
+            if rep.crashlog_phys != 0 {
+                dump_crashlog(rep.crashlog_phys);
+            }
             return Outcome::Timeout;
         }
         let Some(m) = asc.recv_blocking(POWERUP_POLL_MS, &mut pump) else {
@@ -616,6 +645,7 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
                     rep.n_buffers += 1;
                     if kind == BufferKind::Crashlog {
                         state.have_crashlog_buffer = true;
+                        rep.crashlog_phys = phys;
                     }
                     // PPL init has now run (inside uat_map_buffer). Re-issue the
                     // power requests once — the firmware is finally ready to act
