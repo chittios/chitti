@@ -713,6 +713,61 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
     Outcome::Running
 }
 
+/// Compute-milestone step 1: start the app endpoints (0x20 firmware/KMD, 0x21
+/// doorbell) on a RUNNING coprocessor and observe for a few seconds. Logs every
+/// message; services any further system BUFFER_REQUESTs through the UAT (as
+/// during boot). App-endpoint traffic (ep >= 0x20) is just logged — handling it
+/// needs the initdata + channel rings (the next sub-step).
+fn probe_app_endpoints(asc: &Asc, rep: &mut Report) {
+    use proto::*;
+    crate::ktrace::log("agx", "compute: starting app endpoints 0x20 (firmware) + 0x21 (doorbell)");
+    for ep in [EP_APP_BASE, EP_APP_BASE + 1] {
+        if !send(asc, msg_start_ep(ep), EP_MGMT) {
+            crate::ktrace::log_fmt(format_args!("agx: compute: START_EP {ep:#x} failed"));
+            return;
+        }
+    }
+    let deadline = crate::arch::now_ms() + 3000;
+    let mut state = RtkitState { iop_power: POWER_ON, ap_power: POWER_ON, ..Default::default() };
+    let mut any = false;
+    while crate::arch::now_ms() < deadline {
+        let Some(m) = asc.recv_blocking(500, &mut pump) else {
+            if ABORT.load(core::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            continue;
+        };
+        any = true;
+        let ep = m.msg1 as u8;
+        crate::ktrace::log_fmt(format_args!("agx: compute: msg0={:#018x} ep={ep:#x}", m.msg0));
+        if ep >= EP_APP_BASE {
+            crate::ktrace::log("agx", "compute: app-endpoint message (needs initdata/channels — next step)");
+            continue;
+        }
+        // Further system messages (e.g. channel-ring buffer requests) — service
+        // buffer requests through the shared TTBR1 UAT, ACK the rest.
+        match handle_system_msg(&mut state, m.msg0, ep) {
+            Action::AllocBuffer { ep, n_pages, addr, .. } if addr == 0 => {
+                let aligned = (n_pages * 4096).next_multiple_of(uat::PAGE_SIZE);
+                if let Some(phys) = alloc_shared(aligned / 4096) {
+                    if let Some(dva) = uat_map_buffer(phys, aligned) {
+                        let _ = send(asc, msg_buffer_reply(aligned / 4096, dva), ep);
+                        rep.n_buffers += 1;
+                        crate::ktrace::log_fmt(format_args!("agx: compute: served buffer ep={ep:#x} -> dva={dva:#x}"));
+                    }
+                }
+            }
+            Action::Send(msg0, e) => {
+                let _ = send(asc, msg0, e);
+            }
+            _ => {}
+        }
+    }
+    if !any {
+        crate::ktrace::log("agx", "compute: firmware idle after app-endpoint start (expected — it awaits MSG_INIT/initdata)");
+    }
+}
+
 /// Bring up the AGX coprocessor. Gated on `is_apple()` + the `chitti.agx`
 /// bootarg; a clean no-op otherwise. Returns the human-facing summary line.
 fn up() -> Outcome {
@@ -752,6 +807,15 @@ fn up() -> Outcome {
     rep.outcome = outcome;
     rep.cpu_running = asc.cpu_running();
     REPORT.with(|r| *r = rep);
+
+    // Compute-milestone step 1: with the coprocessor RUNNING, start the app
+    // endpoints (0x20 firmware/KMD, 0x21 doorbell) and observe. drm/asahi does
+    // start_ep(0x20/0x21) then immediately MSG_INIT with the initdata GPU VA;
+    // we don't have initdata yet, so this just probes what the firmware sends
+    // (more buffer requests? nothing until MSG_INIT?) to shape that work.
+    if outcome == Outcome::Running {
+        probe_app_endpoints(&asc, &mut rep);
+    }
 
     match outcome {
         Outcome::Running => crate::serial_println!("agx> coprocessor RUNNING — RTKit v{} up, {} endpoint(s) started", rep.version, count_eps(&rep.eps)),
