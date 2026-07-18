@@ -411,6 +411,88 @@ fn status() {
     crate::serial_println!("  buffers:     {}", r.n_buffers);
 }
 
+/// Print one FDT property: name, byte length, and the value decoded as
+/// big-endian u32 cells (addresses/phandles) plus an ASCII rendering when it
+/// looks like a string list.
+fn dump_prop(name: &[u8], val: &[u8]) {
+    let n = core::str::from_utf8(name).unwrap_or("<name?>");
+    // ASCII string-ish values (all printable/NUL) — show them as text.
+    let stringish = !val.is_empty() && val.iter().all(|&b| b == 0 || (0x20..0x7f).contains(&b));
+    if stringish && val.len() <= 96 {
+        let s = core::str::from_utf8(&val[..val.len().saturating_sub(1)]).unwrap_or("");
+        crate::serial_println!("  {n} ({} B) = \"{}\"", val.len(), s.replace('\0', "\",\""));
+        return;
+    }
+    if val.len() % 4 == 0 && !val.is_empty() {
+        // Decode as up to 16 BE u32 cells (pairs read as u64 for addresses).
+        let mut line = alloc::string::String::new();
+        use core::fmt::Write;
+        let ncells = (val.len() / 4).min(16);
+        for i in 0..ncells {
+            let c = u32::from_be_bytes([val[i * 4], val[i * 4 + 1], val[i * 4 + 2], val[i * 4 + 3]]);
+            let _ = write!(line, " {c:#x}");
+        }
+        crate::serial_println!("  {n} ({} B) =<{} >", val.len(), line);
+    } else {
+        crate::serial_println!("  {n} ({} B) = <{} bytes>", val.len(), val.len());
+    }
+}
+
+/// `/agx sgx` — dump the AGX GPU node's every property + the resolved
+/// `memory-region` carveouts (ttbs/pagetables/handoff/…) AS FILLED on the live
+/// machine. This is the discovery step for Milestone 2's GPU-VA layout: it shows
+/// whether m1n1 populated the `uat-*` carveouts (they are `reg=<0,0,0,0>` in the
+/// static DTB) and surfaces any `rtkit-private-vm-region`-style property.
+fn sgx_dump() {
+    use alloc::vec::Vec;
+    if !crate::arch::aarch64::is_apple() {
+        crate::serial_println!("agx> not Apple Silicon");
+        return;
+    }
+    let fdt = crate::arch::aarch64::boot::boot_x0();
+    crate::serial_println!("agx sgx: GPU node ({})", core::str::from_utf8(AGX_COMPAT).unwrap_or("?"));
+    // reg[0]=asc, reg[1]=sgx.
+    for (i, nm) in [(0usize, "asc"), (1, "sgx")] {
+        // SAFETY: boot_x0 is the FDT pointer (or non-FDT, rejected by the magic).
+        if let Some((b, s)) = unsafe { crate::fdt::reg_nth_of_compatible(fdt, AGX_COMPAT, i) } {
+            crate::serial_println!("  reg[{i}] {nm}: base={b:#x} size={s:#x}");
+        }
+    }
+    crate::serial_println!("agx sgx: properties —");
+    let mut memregion: Vec<u32> = Vec::new();
+    let mut memnames: Vec<u8> = Vec::new();
+    // SAFETY: boot_x0 is the FDT pointer (or non-FDT, rejected by the magic).
+    let found = unsafe {
+        crate::fdt::for_each_prop_of_compatible(fdt, AGX_COMPAT, &mut |name, val| {
+            dump_prop(name, val);
+            if name == b"memory-region" {
+                for ch in val.chunks_exact(4) {
+                    memregion.push(u32::from_be_bytes([ch[0], ch[1], ch[2], ch[3]]));
+                }
+            } else if name == b"memory-region-names" {
+                memnames = val.to_vec();
+            }
+        })
+    };
+    if !found {
+        crate::serial_println!("agx sgx: no {} node in the device tree", core::str::from_utf8(AGX_COMPAT).unwrap_or("?"));
+        return;
+    }
+    // Resolve each memory-region phandle → its carveout (base,size) as filled.
+    if !memregion.is_empty() {
+        crate::serial_println!("agx sgx: memory-region carveouts (resolved) —");
+        let names: Vec<&[u8]> = memnames.split(|&b| b == 0).filter(|s| !s.is_empty()).collect();
+        for (i, &ph) in memregion.iter().enumerate() {
+            let nm = names.get(i).and_then(|s| core::str::from_utf8(s).ok()).unwrap_or("?");
+            // SAFETY: boot_x0 is the FDT pointer (or non-FDT, rejected by the magic).
+            match unsafe { crate::fdt::reg_by_phandle(fdt, ph) } {
+                Some((b, s)) => crate::serial_println!("  [{i}] {nm:14} phandle={ph:#x} base={b:#x} size={s:#x}"),
+                None => crate::serial_println!("  [{i}] {nm:14} phandle={ph:#x} <unresolved>"),
+            }
+        }
+    }
+}
+
 /// `/agx` command entry (aarch64).
 pub fn command(arg: &str) {
     match arg.trim() {
@@ -418,8 +500,9 @@ pub fn command(arg: &str) {
             up();
         }
         "status" | "info" => status(),
+        "sgx" | "dump" => sgx_dump(),
         other => {
-            crate::serial_println!("agx> unknown subcommand '{other}' (try: up | status)");
+            crate::serial_println!("agx> unknown subcommand '{other}' (try: up | status | sgx)");
         }
     }
 }

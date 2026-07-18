@@ -642,6 +642,93 @@ pub unsafe fn prop_cells_of_compatible(dtb_pa: u64, want: &[u8], prop: &[u8], ou
     }
 }
 
+/// Call `f(name, value)` for **every property** of the first node whose
+/// `compatible` list contains `want`, with the raw property bytes. Used to
+/// *discover* a node's whole property set when we don't know the exact names
+/// ahead of time (e.g. dumping the AGX GPU node to find its VA-layout
+/// properties). Returns true iff the node was found.
+///
+/// Props are buffered until the node's `compatible` is confirmed (it may not be
+/// the first prop), then flushed and subsequent props emitted live. This emits
+/// the props of a node whose properties precede any child nodes — always true in
+/// FDT layout; the target AGX GPU node has no child nodes. `MAXP` caps the
+/// pre-`compatible` buffer.
+///
+/// # Safety
+/// `dtb_pa`, if a valid FDT, must point at a readable blob.
+pub unsafe fn for_each_prop_of_compatible(dtb_pa: u64, want: &[u8], f: &mut dyn FnMut(&[u8], &[u8])) -> bool {
+    const MAXP: usize = 128;
+    let Some((base, h)) = (unsafe { header(dtb_pa) }) else { return false };
+    let mut matched = false;
+    let mut nbuf = 0usize;
+    // Buffered (name_str_off, val_off, val_len) for props seen before we know
+    // the node matches.
+    let mut buf = [(0usize, 0usize, 0usize); MAXP];
+    let mut depth: usize = 0;
+    let mut off = h.off_struct;
+    // Emit one property by (strings name offset, value offset, value length).
+    let emit = |name_off: usize, val_off: usize, val_len: usize, f: &mut dyn FnMut(&[u8], &[u8])| {
+        let nstart = h.off_strings + name_off;
+        // SAFETY: bounded by `cstr_len` / `val_len` against `h.total`.
+        let Some(nlen) = (unsafe { cstr_len(base, nstart, h.total) }) else { return };
+        let vend = (val_off + val_len).min(h.total);
+        // SAFETY: both ranges are within the blob (`h.total`).
+        let name = unsafe { core::slice::from_raw_parts(base.add(nstart), nlen) };
+        let value = unsafe { core::slice::from_raw_parts(base.add(val_off), vend.saturating_sub(val_off)) };
+        f(name, value);
+    };
+    loop {
+        // SAFETY: every read is bounded against `h.total`.
+        let Some(tok) = (unsafe { be32(base, off, h.total) }) else { return false };
+        off += 4;
+        match tok {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                matched = false;
+                nbuf = 0;
+                let Some(len) = (unsafe { cstr_len(base, off, h.total) }) else { return false };
+                off += (len + 1 + 3) & !3;
+            }
+            FDT_END_NODE => {
+                if matched {
+                    return true; // first matching node fully emitted
+                }
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            FDT_PROP => {
+                let Some(len) = (unsafe { be32(base, off, h.total) }) else { return false };
+                let len = len as usize;
+                let Some(name_off) = (unsafe { be32(base, off + 4, h.total) }) else { return false };
+                let name_off = name_off as usize;
+                let data_off = off + 8;
+                if matched {
+                    emit(name_off, data_off, len, f);
+                } else {
+                    if nbuf < MAXP {
+                        buf[nbuf] = (name_off, data_off, len);
+                        nbuf += 1;
+                    }
+                    if unsafe { prop_name_is(base, h.off_strings, name_off, b"compatible", h.total) }
+                        && unsafe { compat_has(base, data_off, len, want, h.total) }
+                    {
+                        matched = true;
+                        for i in 0..nbuf {
+                            emit(buf[i].0, buf[i].1, buf[i].2, f);
+                        }
+                    }
+                }
+                off += 8 + ((len + 3) & !3);
+            }
+            FDT_NOP => {}
+            FDT_END => return false,
+            _ => return false,
+        }
+    }
+}
+
 /// The `reg[0]` `(base, size)` of the node whose `phandle` (a.k.a.
 /// `linux,phandle`) property equals `phandle`. Resolves an `iommus`/`phys`
 /// reference to the target device's registers (e.g. a DART pointed at by a USB
@@ -1212,6 +1299,28 @@ mod tests {
         let mut c = [0u32; 2];
         assert_eq!(unsafe { prop_cells_of_nth_node(p, b"apple,t8112-dwc3", 1, b"iommus", &mut c) }, 2);
         assert_eq!(c, [0xb0, 1]);
+    }
+
+    #[test_case]
+    fn for_each_prop_enumerates_matched_node() {
+        let blob = sample();
+        let p = blob.as_ptr() as u64;
+        // The s5l-uart node has exactly `compatible` + `reg`.
+        let mut seen: Vec<(alloc::vec::Vec<u8>, usize)> = Vec::new();
+        let found = unsafe {
+            for_each_prop_of_compatible(p, b"apple,s5l-uart", &mut |name, val| {
+                seen.push((name.to_vec(), val.len()));
+            })
+        };
+        assert!(found);
+        assert!(seen.iter().any(|(n, _)| n == b"compatible"));
+        // reg = <base size> in 2+2 cells = 16 bytes.
+        assert!(seen.iter().any(|(n, l)| n == b"reg" && *l == 16));
+        // An absent compatible yields no node.
+        let mut none = 0;
+        let found2 = unsafe { for_each_prop_of_compatible(p, b"apple,nonexistent", &mut |_, _| none += 1) };
+        assert!(!found2);
+        assert_eq!(none, 0);
     }
 
     #[test_case]
