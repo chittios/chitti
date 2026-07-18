@@ -365,6 +365,51 @@ fn uat_map_buffer(phys: u64, bytes: u64) -> Option<u64> {
     Some(va)
 }
 
+/// The AGX **SGX** register block (GPU node `reg[1]`) and the fault-status
+/// register within it (`SGXRegs.FAULT_INFO`, m1n1 `hw/agx.py`). If the firmware
+/// (or the GPU) takes an MMU fault — e.g. it can't reach a buffer we mapped —
+/// `FAULTED` latches and `ADDR<<6`/`CONTEXT`/`REASON` say where and why. Reading
+/// this on a power-on timeout tells us a UAT-reachability failure apart from a
+/// generic hang.
+const SGX_FAULT_INFO: u64 = 0x17030;
+
+/// Fault reasons (m1n1 `FAULT_REASON`).
+fn fault_reason(r: u64) -> &'static str {
+    match r {
+        0 => "INVALID",
+        1 => "AF_FAULT",
+        2 => "WRITE_ONLY",
+        3 => "READ_ONLY",
+        4 => "NO_ACCESS",
+        _ => "UNK",
+    }
+}
+
+/// Read + log the SGX fault-status register. Returns true if a fault is latched.
+fn sgx_fault_check() -> bool {
+    let fdt = crate::arch::aarch64::boot::boot_x0();
+    // SAFETY: boot_x0 is the FDT pointer (or non-FDT, rejected by the magic).
+    let Some((sgx, _)) = (unsafe { crate::fdt::reg_nth_of_compatible(fdt, AGX_COMPAT, 1) }) else {
+        return false;
+    };
+    crate::arch::aarch64::mmu::map_device_gib(sgx);
+    // SAFETY: single 64-bit MMIO read of the mapped SGX FAULT_INFO register.
+    let fi = unsafe { core::ptr::read_volatile((sgx + SGX_FAULT_INFO) as *const u64) };
+    let faulted = fi & 1 != 0;
+    let reason = (fi >> 1) & 0x7;
+    let read = (fi >> 4) & 1;
+    let level = (fi >> 7) & 0x3;
+    let unit = (fi >> 9) & 0xff;
+    let context = (fi >> 17) & 0x3f;
+    let addr = (fi >> 30) << 6; // ADDR[63:30] << 6
+    crate::ktrace::log_fmt(format_args!(
+        "agx: SGX FAULT_INFO={fi:#018x} faulted={faulted} reason={} rw={} level={level} unit={unit:#x} ctx={context} addr={addr:#x}",
+        fault_reason(reason),
+        if read == 1 { "R" } else { "W" }
+    ));
+    faulted
+}
+
 /// The cooperative pump run between every mailbox poll: keep the UI/clock/net
 /// alive and report Ctrl+C (returns true to abort). Mirrors the inference/IO
 /// loops' `upkeep()` + interrupt-poll discipline (CLAUDE.md standing rule).
@@ -475,6 +520,7 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
                 "agx: timed out after {POWERUP_BUDGET_MS}ms (iop_power={:#x} ap_power={:#x}, buffers granted={})",
                 state.iop_power, state.ap_power, rep.n_buffers
             ));
+            sgx_fault_check();
             return Outcome::Timeout;
         }
         let Some(m) = asc.recv_blocking(POWERUP_POLL_MS, &mut pump) else {
