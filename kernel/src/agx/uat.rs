@@ -26,17 +26,24 @@
 pub const PAGE_BITS: u32 = 14;
 pub const PAGE_SIZE: u64 = 1 << PAGE_BITS; // 16 KiB
 pub const PAGE_MASK: u64 = PAGE_SIZE - 1;
-/// Bytes per table (2048 × 8) = one 16 KiB page.
+/// Bytes per table = one 16 KiB page.
 pub const TABLE_BYTES: u64 = PAGE_SIZE;
-/// Entries in an L1/L2/L3 table (`IDX_BITS = 11`).
+/// Entries in an L2/L3 table (`IDX_BITS = 11`).
 pub const LX_ENTRIES: usize = 1 << 11; // 2048
+/// Entries in the L1 table. **G14/t8112 IAS = 39** (m1n1 `UAT_L0_OFF = 39`), so
+/// bit 39 selects TTBR0/TTBR1 and L1 spans bits [38:36] = 8 entries — NOT the
+/// 2048-wide L1 a 47-bit L0 would give. Getting this wrong makes the firmware's
+/// page-table walk index L1 differently than where we wrote the PTE, so it never
+/// finds a mapped buffer (the observed all-zero-crashlog stall).
+pub const L1_ENTRIES: usize = 1 << (L0_OFF - L1_OFF); // 8
 /// Entries in the L0 (TTBR0/TTBR1 pair per context).
 pub const L0_ENTRIES: usize = 2;
 /// Bytes per context in the `gpu-region` ttbs array (2 × u64).
 pub const TTBR_PAIR_BYTES: u64 = 16;
 
-// VA field offsets per level (uat.py LEVELS).
-const L0_OFF: u32 = 47; // TTBR0/TTBR1 select (2 entries)
+// VA field offsets per level — G14/t8112 (IAS=39). bit 39 selects TTBR0/TTBR1;
+// L1 [38:36] (8), L2 [35:25] (2048), L3 [24:14] (2048), offset [13:0] (16 KiB).
+const L0_OFF: u32 = 39; // TTBR0/TTBR1 select (2 entries)
 const L1_OFF: u32 = 36;
 const L2_OFF: u32 = 25;
 const L3_OFF: u32 = 14;
@@ -74,7 +81,7 @@ const ASID_SHIFT: u32 = 48;
 /// walk. `l0` selects TTBR0 (0) / TTBR1 (1). Pure.
 pub const fn split_va(va: u64) -> (usize, usize, usize, usize, u64) {
     let l0 = ((va >> L0_OFF) & (L0_ENTRIES as u64 - 1)) as usize;
-    let l1 = ((va >> L1_OFF) & (LX_ENTRIES as u64 - 1)) as usize;
+    let l1 = ((va >> L1_OFF) & (L1_ENTRIES as u64 - 1)) as usize;
     let l2 = ((va >> L2_OFF) & (LX_ENTRIES as u64 - 1)) as usize;
     let l3 = ((va >> L3_OFF) & (LX_ENTRIES as u64 - 1)) as usize;
     (l0, l1, l2, l3, va & PAGE_MASK)
@@ -161,15 +168,16 @@ mod tests {
 
     #[test_case]
     fn va_split_indices_and_reconstruct() {
-        // Craft a VA with distinct indices at each level + a page offset.
+        // Craft a VA with distinct indices at each level + a page offset. G14
+        // geometry: L1 is only 3 bits (8 entries), bit 39 selects TTBR.
         let va = (1u64 << L0_OFF) // l0 = 1 (TTBR1)
-            | (0x123u64 << L1_OFF)
+            | (0x5u64 << L1_OFF) // 3-bit L1 index
             | (0x0abu64 << L2_OFF)
             | (0x1feu64 << L3_OFF)
             | 0x2000; // offset within the 16 KiB page
         let (l0, l1, l2, l3, off) = split_va(va);
         assert_eq!(l0, 1);
-        assert_eq!(l1, 0x123);
+        assert_eq!(l1, 0x5);
         assert_eq!(l2, 0x0ab);
         assert_eq!(l3, 0x1fe);
         assert_eq!(off, 0x2000);
@@ -183,9 +191,22 @@ mod tests {
     }
 
     #[test_case]
+    fn geometry_is_g14_ias39() {
+        assert_eq!(L0_OFF, 39);
+        assert_eq!(L1_ENTRIES, 8); // bits [38:36]
+        assert_eq!(LX_ENTRIES, 2048);
+    }
+
+    #[test_case]
     fn low_va_selects_ttbr0() {
-        let (l0, ..) = split_va(0x1500_0000); // klow base in uat.py — bit 47 clear
+        // 0x1500000000 (klow/GEM base) = 0x15<<32: bit 39 clear -> TTBR0;
+        // L1 = (0x15<<32 >> 36)&7 = 0x15>>4 = 1; L2 = (0x15<<32 >> 25)&0x7ff = 0x280.
+        let (l0, l1, l2, l3, off) = split_va(0x1500000000);
         assert_eq!(l0, 0);
+        assert_eq!(l1, 1);
+        assert_eq!(l2, 0x280);
+        assert_eq!(l3, 0);
+        assert_eq!(off, 0);
     }
 
     #[test_case]
@@ -262,7 +283,7 @@ mod tests {
         assert_eq!(pte_output(l3e), frame);
 
         // Indices index within their tables and the offset stays in-page.
-        assert!(i1 < LX_ENTRIES && i2 < LX_ENTRIES && i3 < LX_ENTRIES);
+        assert!(i1 < L1_ENTRIES && i2 < LX_ENTRIES && i3 < LX_ENTRIES);
         assert!(off < PAGE_SIZE);
         let _ = (l1, l2, l3); // bases only used via the descriptors above
     }

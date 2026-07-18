@@ -341,6 +341,11 @@ fn get_or_alloc_table(table: u64, idx: usize) -> Option<u64> {
         return Some(uat::pte_output(e));
     }
     let next = alloc_shared(1)?;
+    // Clean the ENTIRE new table page to PoC, not just the parent slot — the
+    // GPU MMU walker reads the table from DRAM and must see our zeros (Grok/
+    // proxyclient: full-page dc cvac before installing leaves), else it walks
+    // stale/garbage entries.
+    dcache_clean(next, uat::PAGE_SIZE);
     wr64(slot, uat::table_pte(next));
     dcache_clean(slot, 8);
     Some(next)
@@ -416,6 +421,33 @@ fn sgx_fault_check() {
         (fi >> 17) & 0x3f,
         (fi >> 30) << 6
     ));
+}
+
+/// SGX liveness poke (proxyclient `AGX.poke_sgx`): read-modify-write `0x70001`
+/// into sgx reg[1] + 0xd14000. Recoverable — if the SGX block is still gated the
+/// access external-aborts and we skip it (the sync-handler probe swallows the
+/// fault) rather than crashing.
+fn sgx_poke() {
+    let fdt = crate::arch::aarch64::boot::boot_x0();
+    // SAFETY: boot_x0 is the FDT pointer (or non-FDT, rejected by the magic).
+    let Some((sgx, _)) = (unsafe { crate::fdt::reg_nth_of_compatible(fdt, AGX_COMPAT, 1) }) else {
+        return;
+    };
+    crate::arch::aarch64::mmu::map_device_gib(sgx);
+    let addr = sgx + 0xd14000;
+    crate::arch::aarch64::set_agx_probing(true);
+    // SAFETY: recoverable MMIO read; a fault is swallowed by the sync handler.
+    let v = unsafe { core::ptr::read_volatile(addr as *const u32) };
+    if !crate::arch::aarch64::agx_probe_faulted() {
+        // SAFETY: recoverable MMIO write of the SGX liveness bit.
+        unsafe { core::ptr::write_volatile(addr as *mut u32, 0x70001 | v) };
+    }
+    crate::arch::aarch64::set_agx_probing(false);
+    if crate::arch::aarch64::agx_probe_faulted() {
+        crate::ktrace::log("agx", "SGX poke skipped — sgx block still gated (external abort)");
+    } else {
+        crate::ktrace::log_fmt(format_args!("agx: SGX poked @ {addr:#x} (was {v:#x})"));
+    }
 }
 
 /// Dump the head of the crashlog shared buffer (identity-mapped DRAM we own). A
@@ -647,15 +679,13 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
                         state.have_crashlog_buffer = true;
                         rep.crashlog_phys = phys;
                     }
-                    // PPL init has now run (inside uat_map_buffer). Re-issue the
-                    // power requests once — the firmware is finally ready to act
-                    // on them (see `resent_power`).
+                    // PPL init has now run (inside uat_map_buffer). Re-nudge ONLY
+                    // AP power ON once — never re-send IOP_PWR=INIT (INIT is a
+                    // wake/re-init that resets the power FSM mid-boot and prevents
+                    // a clean ON ack; m1n1/Linux send it exactly once at start).
                     if !resent_power {
                         resent_power = true;
-                        crate::ktrace::log("agx", "re-sending IOP_PWR=INIT + AP_PWR=ON after PPL init");
-                        if !send(asc, msg_iop_pwr_state(POWER_INIT), EP_MGMT) {
-                            return Outcome::SendFail;
-                        }
+                        crate::ktrace::log("agx", "re-sending AP_PWR=ON after PPL init (INIT never re-sent)");
                         if !send(asc, msg_ap_pwr_state(POWER_ON), EP_MGMT) {
                             return Outcome::SendFail;
                         }
@@ -703,6 +733,11 @@ fn up() -> Outcome {
         crate::serial_println!("agx> gfx power domain would not enable — aborting");
         return Outcome::SendFail;
     }
+    // SGX liveness poke every working proxyclient path does before ASC boot
+    // (`AGX.poke_sgx`): read then write `0x70001` to sgx reg[1] + 0xd14000.
+    // drm/asahi doesn't spell it out (genpd/firmware cover it), but bare
+    // bring-up treats it as load-bearing. After gfx is ACTIVE + the window mapped.
+    sgx_poke();
     crate::arch::aarch64::mmu::map_device_gib(base);
 
     let mut rep = Report { asc_base: base, ..Default::default() };
