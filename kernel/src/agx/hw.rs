@@ -451,21 +451,29 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
         }
     }
 
-    // --- pump until the IOP reaches power ON, servicing buffer requests -------
-    // Total-budget wait: the IOP may take several seconds to finish its own init
-    // (writing crashlog/syslog, powering rails) before it volunteers the power
-    // ACK, so we poll in short windows against one overall deadline rather than
-    // bailing on the first quiet gap. Every received message is logged so a
-    // silent IOP (→ buffers unreachable, the GPU-UAT boundary) is distinguishable
-    // from one sending something we mishandle.
+    // --- request AP power ON *immediately* (the AGX `boot_done`) --------------
+    // AGX-specific ordering (proxyclient `mgmt.py`: on the last EPMAP fragment it
+    // starts the endpoints and *then* `boot_done()` = SetAPPower(ON), and only
+    // after that `wait_boot` for BOTH iop and ap power == ON). The AGX firmware
+    // waits for this AP-power-ON before it transitions the IOP to ON — the
+    // generic `rtkit.c` order (wait for iop ON, *then* send AP ON) deadlocks it,
+    // which is exactly the silent-after-buffer-grant stall we saw.
+    if !send(asc, msg_ap_pwr_state(POWER_ON), EP_MGMT) {
+        return Outcome::SendFail;
+    }
+    crate::ktrace::log("agx", "sent AP_PWR_STATE=ON (boot_done); waiting for iop+ap power ON");
+
+    // --- pump until BOTH iop and ap power reach ON, servicing buffer requests -
+    // Total-budget wait: poll in short windows against one overall deadline so a
+    // slow-but-progressing IOP is not cut off. Every received message is logged.
     let mut state = RtkitState::default();
     let powerup_deadline = crate::arch::now_ms() + POWERUP_BUDGET_MS;
     let mut last_beat = crate::arch::now_ms();
-    while state.iop_power != POWER_ON {
+    while state.iop_power != POWER_ON || state.ap_power != POWER_ON {
         if crate::arch::now_ms() >= powerup_deadline {
             crate::ktrace::log_fmt(format_args!(
-                "agx: timed out after {POWERUP_BUDGET_MS}ms waiting for power ON (iop_power={:#x}, buffers granted={}) — IOP silent; likely needs GPU-UAT-addressable shared memory (Milestone 2)",
-                state.iop_power, rep.n_buffers
+                "agx: timed out after {POWERUP_BUDGET_MS}ms (iop_power={:#x} ap_power={:#x}, buffers granted={})",
+                state.iop_power, state.ap_power, rep.n_buffers
             ));
             return Outcome::Timeout;
         }
@@ -479,7 +487,7 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
             let now = crate::arch::now_ms();
             if now.saturating_sub(last_beat) >= 1000 {
                 last_beat = now;
-                crate::ktrace::log_fmt(format_args!("agx: waiting for power ON… ({}ms left, iop_power={:#x})", powerup_deadline.saturating_sub(now), state.iop_power));
+                crate::ktrace::log_fmt(format_args!("agx: waiting for power ON… ({}ms left, iop={:#x} ap={:#x})", powerup_deadline.saturating_sub(now), state.iop_power, state.ap_power));
             }
             continue;
         };
@@ -535,13 +543,10 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
             }
         }
     }
+    // Both iop and ap power reached ON — the coprocessor is RUNNING.
     rep.iop_power = state.iop_power;
-
-    // --- final: AP power → ON (RUNNING) --------------------------------------
-    if !send(asc, msg_ap_pwr_state(POWER_ON), EP_MGMT) {
-        return Outcome::SendFail;
-    }
-    rep.ap_power = POWER_ON;
+    rep.ap_power = state.ap_power;
+    crate::ktrace::log("agx", "power ON reached (iop+ap) — coprocessor RUNNING");
     Outcome::Running
 }
 
