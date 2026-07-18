@@ -31,6 +31,11 @@ REMOTE_RUN_URL ?= http://10.0.2.2:1234
 VBOX_VM   ?= Chitti
 VBOX_CTL  ?= nvme
 VBOX_PORT ?= 0
+# VM RAM (MiB). Must hold the model at its 2 GiB load offset + the kernel heap:
+# ~2 GiB + model-size + 1 GiB. 8192 fits every build up to the ~3.8 GiB 1-bit
+# Bonsai / ~5 GiB 9B; the ~7.2 GiB ternary Bonsai needs VBOX_MEM=12288. Too
+# little → "chitti-stub: model alloc failed -- booting without a model".
+VBOX_MEM  ?= 8192
 
 XTASK   := cargo xtask
 REL     := $(if $(filter 1 true yes,$(RELEASE)),--release,)
@@ -131,8 +136,8 @@ vbox:
 	UUID=$$(VBoxManage showvminfo "$$VM" --machinereadable 2>/dev/null | sed -n "s/^\"$$CTL-ImageUUID-$$PORT-0\"=//p" | tr -d '"'); \
 	echo "vbox: reloading VM '$$VM' (ctl=$$CTL port=$$PORT), preserving disk UUID $${UUID:-<new>}"; \
 	VBoxManage controlvm "$$VM" poweroff 2>/dev/null || true; sleep 1; \
-	echo "vbox: ensuring USB keyboard + USB tablet + xHCI controller"; \
-	VBoxManage modifyvm "$$VM" --keyboard usb --mouse usbtablet --usb-xhci on; \
+	echo "vbox: ensuring USB keyboard + USB tablet + xHCI controller; RAM $(VBOX_MEM) MiB"; \
+	VBoxManage modifyvm "$$VM" --keyboard usb --mouse usbtablet --usb-xhci on --memory $(VBOX_MEM); \
 	VBoxManage storageattach "$$VM" --storagectl "$$CTL" --port "$$PORT" --device 0 --medium none 2>/dev/null || true; \
 	if [ -n "$$UUID" ]; then VBoxManage closemedium disk "$$UUID" 2>/dev/null || true; fi; \
 	VBoxManage closemedium disk "$$VDI" 2>/dev/null || true; rm -f "$$VDI"; \
