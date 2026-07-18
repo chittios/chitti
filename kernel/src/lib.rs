@@ -23,6 +23,7 @@ pub const BUILD_TIME: &str = env!("CHITTI_BUILD_TIME");
 #[cfg(target_arch = "aarch64")]
 pub mod acpi;
 pub mod agent;
+pub mod agx;
 pub mod arch;
 pub mod audio;
 pub mod block;

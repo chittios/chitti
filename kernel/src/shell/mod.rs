@@ -602,6 +602,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
             #[cfg(target_arch = "x86_64")]
             crate::arch::x86_64::pci::dump_all();
         }
+        "agx" => crate::agx::command(arg),
         _ => return false,
     }
     true

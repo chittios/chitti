@@ -423,6 +423,30 @@ real UEFI hardware.
   running. The chat pane keeps a 2000-line scrollback (PgUp/PgDn; /clear
   wipes it); Shift+Tab / Ctrl+Tab / clicking switches pane focus.
 
+- **AGX GPU** (`agx/`) — **Milestone 1: the Apple-Silicon GPU coprocessor
+  bring-up** (the foundation for future GPU compute offload of `cortex`'s
+  `matvec_qw`/`batched_proj` matmuls; today it does **no** GPU compute yet). On a
+  real M2 (t8112, via `cargo xtask m1n1`) the AGX GPU's control coprocessor
+  (`gfx-asc`) is booted and driven through Apple's generic **RTKit** handshake to
+  a RUNNING state: `cpu_start` → **HELLO** version-negotiate → HELLO_ACK →
+  endpoint-map enumerate → START_EP each system endpoint → service
+  BUFFER_REQUESTs (DMA-alloc + reply DVA; no-IOMMU, `dva_base=0` pending the
+  `asc-dram-mask`) → pump to IOP power ON → AP power ON. The pure wire protocol
+  (`agx/proto.rs` — field codecs, version negotiation, EPMAP, the
+  received-message→`Action` state machine) is **arch-neutral and unit-tested
+  under `cargo xtask test`** (x86, no hardware — because `arch::aarch64` is
+  cfg-gated out of the test build, the pure logic must live *outside* it); the
+  ASC-mailbox MMIO transport (`agx/asc.rs`, single-`ldr x`/`str x` 64-bit FIFO +
+  `dsb`/`dmb` fences) and the discovery/PMGR/orchestration (`agx/hw.rs`) are
+  aarch64-only. Gated on `is_apple()` + a `chitti.agx` **bootarg** (never under
+  the m1n1 hv — same rationale as `chitti.usb`); a clean no-op on QEMU/VBox/other
+  SoC. `/agx up` runs the handshake (traces mirrored to the chat pane via
+  `ktrace::set_console_echo`), `/agx status` dumps bases/endpoints/power. Ported
+  from m1n1's `src/{asc,rtkit,pmgr}.c`. **De-risking finding baked in:** m1n1
+  never boots the gfx-asc over RTKit, so firmware residency is unproven — the
+  boot waits ~1 s for HELLO *first* and, if none arrives, reports **blocked on
+  Asahi GPU-firmware provisioning** rather than hanging. Every wait is bounded +
+  pumps `upkeep()`/`poll_interrupt()`.
 - **Storage** — virtio/NVMe/AHCI block devices, GPT/MBR/FAT/ext4 detection,
   ext4 (the default filesystem) + FAT, `/install` (self-hosting install to a
   disk; detects an existing Chitti GPT and **updates in place**, preserving the
