@@ -6,6 +6,7 @@
 
 use super::asc::{Asc, Message};
 use super::proto::{self, Action, BufferKind, EndpointSet, RtkitState};
+use super::uat;
 use alloc::alloc::{alloc_zeroed, Layout};
 
 /// t8112 GPU node: `gpu@206400000`, compatible `apple,agx-t8112`. Its `reg[0]`
@@ -26,13 +27,6 @@ const PMGR_PS_ACTIVE: u32 = 0xf;
 /// Bits `pmgr_set_mode` clears before setting TARGET (auto-enable + the sticky
 /// was-clock/power-gated bits): `AUTO_ENABLE(28) | WAS_CLKGATED(9) | WAS_PWRGATED(8) | TARGET(3:0)`.
 const PMGR_CLEAR: u32 = (1 << 28) | (1 << 9) | (1 << 8) | 0xf;
-
-/// No-IOMMU device-address base for RTKit shared buffers. The GPU node has no
-/// `iommus`, so shared DRAM is addressed directly; Apple ORs an `asc-dram-mask`
-/// that isn't in this FDT. Start at 0 and log every buffer request so the mask
-/// (if any) shows up in the trace.
-// TODO(asc-dram-mask): cross-check against drm/asahi's t8112 constant.
-const DVA_BASE: u64 = 0;
 
 /// Timeouts (ms) — generous, cooperative, always bounded.
 const HELLO_TIMEOUT_MS: u64 = 1000;
@@ -164,6 +158,212 @@ fn alloc_shared(pages: u64) -> Option<u64> {
 /// set, every subsequent `pump()` reports abort, so a multi-second wait bails
 /// promptly on the first Ctrl+C rather than only shortening the current poll.
 static ABORT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// ===================== Milestone 2: minimal GPU UAT ======================
+//
+// The gfx-asc addresses DRAM only through its UAT (ARMv8 16 KiB page tables),
+// so an RTKit shared buffer must be mapped into the kernel context (ctx 0) and
+// handed back as a GPU VA — that is what unblocks the power-ON stall. We reuse
+// the physical carveouts m1n1 already allocated (ttbs / pagetables) and program
+// ctx-0's TTBR0 to a fresh L1 table of our own, keeping TTBR1 = the firmware's
+// shared-region tables (its own FW-side mappings). Mirrors the m1n1 proxyclient
+// (`m1n1/hw/uat.py`, `m1n1/agx/__init__.py`).
+
+/// The firmware's private VM-region base (asahi/proxyclient constant — not in
+/// the FDT). GPU VAs below `1<<47` walk TTBR0. `trace/agx.py:465`,
+/// `context.py:40 pipeline_base`.
+const FW_VA_BASE: u64 = 0x1100000000;
+/// GPU VA space we hand RTKit shared buffers out of (the proxyclient's klow/GEM
+/// region, `agx/__init__.py:85`, `context.py:37`) — comfortably in the TTBR0
+/// low half and clear of the firmware's own low mappings.
+const BUF_VA_BASE: u64 = 0x1500000000;
+
+struct UatState {
+    ready: bool,
+    ttbs: u64,       // gpu-region carveout phys (per-context TTBR pairs)
+    pagetables: u64, // gfx-shared-region carveout phys (firmware TTBR1)
+    l1: u64,         // our ctx-0 TTBR0 L1 table phys
+    va_next: u64,    // bump allocator for buffer GPU VAs
+}
+
+static UAT: crate::mm::Locked<UatState> =
+    crate::mm::Locked::new(UatState { ready: false, ttbs: 0, pagetables: 0, l1: 0, va_next: BUF_VA_BASE });
+
+/// Clean `len` bytes of DRAM from `pa` to the point of coherency so the GPU's
+/// MMU walker sees our freshly-written PTEs (the xhci DART-publish pattern:
+/// `dc cvac` per line + `dsb sy`). aarch64 identity map ⇒ VA == PA.
+fn dcache_clean(pa: u64, len: u64) {
+    // SAFETY: cache maintenance over mapped Normal DRAM (a page table / TTBR).
+    unsafe {
+        let mut p = pa & !63;
+        let end = pa + len;
+        while p < end {
+            core::arch::asm!("dc cvac, {}", in(reg) p, options(nostack, preserves_flags));
+            p += 64;
+        }
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+/// Read a 64-bit page-table entry at identity-mapped physical `pa`.
+fn rd64(pa: u64) -> u64 {
+    // SAFETY: single aligned 64-bit read of mapped DRAM (a page-table slot).
+    unsafe { core::ptr::read_volatile(pa as *const u64) }
+}
+/// Write a 64-bit page-table entry at identity-mapped physical `pa`.
+fn wr64(pa: u64, v: u64) {
+    // SAFETY: single aligned 64-bit write of mapped DRAM (a page-table slot).
+    unsafe { core::ptr::write_volatile(pa as *mut u64, v) }
+}
+
+/// Resolve a GPU node `memory-region` carveout by its `memory-region-names`
+/// entry (e.g. `b"ttbs"`, `b"pagetables"`) to its live `(base, size)`. Returns
+/// `None` if absent/unpopulated.
+fn discover_carveout(want: &[u8]) -> Option<(u64, u64)> {
+    let fdt = crate::arch::aarch64::boot::boot_x0();
+    let mut phandles = [0u32; 8];
+    // SAFETY: boot_x0 is the FDT pointer (or non-FDT, rejected by the magic).
+    let n = unsafe { crate::fdt::prop_cells_of_compatible(fdt, AGX_COMPAT, b"memory-region", &mut phandles) };
+    // Find `want`'s index in memory-region-names, then resolve that phandle.
+    let mut idx = None;
+    let mut collected = 0usize;
+    // SAFETY: boot_x0 is the FDT pointer (or non-FDT, rejected by the magic).
+    unsafe {
+        crate::fdt::for_each_prop_of_compatible(fdt, AGX_COMPAT, &mut |name, val| {
+            if name == b"memory-region-names" {
+                for (i, s) in val.split(|&b| b == 0).filter(|s| !s.is_empty()).enumerate() {
+                    if s == want {
+                        idx = Some(i);
+                    }
+                    collected = i + 1;
+                }
+            }
+        });
+    }
+    let _ = collected;
+    let i = idx?;
+    if i >= n {
+        return None;
+    }
+    // SAFETY: boot_x0 is the FDT pointer (or non-FDT, rejected by the magic).
+    let (b, s) = unsafe { crate::fdt::reg_by_phandle(fdt, phandles[i])? };
+    (b != 0 && s != 0).then_some((b, s))
+}
+
+/// Bring up the ctx-0 kernel page tables. The firmware is **already running**
+/// (it did HELLO/EPMAP), so iBoot has set up its ctx-0 TTBR0 with the firmware's
+/// own mappings — we must **reuse** that live L1, not replace it, or the
+/// firmware loses its mappings and hangs. Read the existing ctx-0 TTBR0 from the
+/// `ttbs` carveout and adopt its L1 table; only if it is empty do we allocate a
+/// fresh one and program the TTBR pair. Idempotent; false if a carveout is
+/// missing.
+fn uat_init() -> bool {
+    if UAT.with(|u| u.ready) {
+        return true;
+    }
+    let Some((ttbs, ttbs_sz)) = discover_carveout(b"ttbs") else {
+        crate::ktrace::log("agx", "uat: no `ttbs` (gpu-region) carveout — cannot map GPU buffers");
+        return false;
+    };
+    let Some((pagetables, pt_sz)) = discover_carveout(b"pagetables") else {
+        crate::ktrace::log("agx", "uat: no `pagetables` (gfx-shared) carveout");
+        return false;
+    };
+    crate::ktrace::log_fmt(format_args!(
+        "agx: uat carveouts — ttbs={ttbs:#x}/{ttbs_sz:#x} pagetables={pagetables:#x}/{pt_sz:#x}"
+    ));
+    // Read the firmware's live ctx-0 TTBR pair BEFORE touching anything (so a
+    // clobber is diagnosable and we can adopt the firmware's own L1).
+    let fw_ttbr0 = rd64(ttbs + uat::ttbr_slot_offset(0, 0));
+    let fw_ttbr1 = rd64(ttbs + uat::ttbr_slot_offset(0, 1));
+    crate::ktrace::log_fmt(format_args!("agx: uat ttbs ctx-0 (as booted) TTBR0={fw_ttbr0:#018x} TTBR1={fw_ttbr1:#018x}"));
+
+    let l1 = if uat::is_valid(fw_ttbr0) {
+        // Adopt the firmware's live L1 — we ADD our buffer leaves into it and
+        // leave TTBR0/TTBR1 untouched, preserving every firmware mapping.
+        let l1 = uat::ttbr_base(fw_ttbr0);
+        crate::ktrace::log_fmt(format_args!("agx: uat reusing firmware ctx-0 L1 at {l1:#x} (TTBR untouched)"));
+        l1
+    } else {
+        // Empty ctx-0 — safe to install our own L1 + TTBR pair.
+        let Some(l1) = alloc_shared(1) else {
+            crate::ktrace::log("agx", "uat: L1 table alloc failed");
+            return false;
+        };
+        let ttbr0 = uat::ttbr(l1, 0, true);
+        let ttbr1 = uat::ttbr(pagetables, 0, true);
+        wr64(ttbs + uat::ttbr_slot_offset(0, 0), ttbr0);
+        wr64(ttbs + uat::ttbr_slot_offset(0, 1), ttbr1);
+        dcache_clean(ttbs, uat::TTBR_PAIR_BYTES);
+        dcache_clean(l1, uat::PAGE_SIZE);
+        crate::ktrace::log_fmt(format_args!("agx: uat installed fresh ctx-0 TTBR0={ttbr0:#018x} (L1 {l1:#x}) TTBR1={ttbr1:#018x}"));
+        l1
+    };
+    UAT.with(|u| {
+        u.ttbs = ttbs;
+        u.pagetables = pagetables;
+        u.l1 = l1;
+        u.va_next = BUF_VA_BASE;
+        u.ready = true;
+    });
+    true
+}
+
+/// Fetch the next-level table a descriptor points at, allocating + linking a
+/// fresh zeroed table if the slot is empty. `table` is the current level's
+/// physical base; `idx` the entry index. Returns the next table's phys, or
+/// `None` on OOM.
+fn get_or_alloc_table(table: u64, idx: usize) -> Option<u64> {
+    let slot = table + idx as u64 * 8;
+    let e = rd64(slot);
+    if uat::is_valid(e) {
+        return Some(uat::pte_output(e));
+    }
+    let next = alloc_shared(1)?;
+    wr64(slot, uat::table_pte(next));
+    dcache_clean(slot, 8);
+    Some(next)
+}
+
+/// Map one 16 KiB `pa` page at GPU VA `va` into ctx-0 (walking our TTBR0 L1).
+fn uat_map_page(l1: u64, va: u64, pa: u64) -> bool {
+    let (l0, i1, i2, i3, _) = uat::split_va(va);
+    debug_assert_eq!(l0, 0); // BUF_VA_BASE is in the TTBR0 half
+    let Some(l2) = get_or_alloc_table(l1, i1) else { return false };
+    let Some(l3) = get_or_alloc_table(l2, i2) else { return false };
+    let slot = l3 + i3 as u64 * 8;
+    // We are adding into the firmware's LIVE ctx-0 tables — a already-valid leaf
+    // here means our chosen VA collides with a firmware mapping (pick another).
+    let existing = rd64(slot);
+    if uat::is_valid(existing) {
+        crate::ktrace::log_fmt(format_args!("agx: uat VA {va:#x} already mapped by firmware (leaf {existing:#018x}) — collision!"));
+    }
+    wr64(slot, uat::kernel_buffer_pte(pa));
+    dcache_clean(slot, 8);
+    true
+}
+
+/// Map a physically-contiguous RTKit buffer (`phys`, `bytes`) into ctx-0 and
+/// return its GPU VA (bump-allocated from `BUF_VA_BASE`). `None` on failure.
+fn uat_map_buffer(phys: u64, bytes: u64) -> Option<u64> {
+    if !uat_init() {
+        return None;
+    }
+    let npages = bytes.div_ceil(uat::PAGE_SIZE).max(1);
+    let (l1, va) = UAT.with(|u| {
+        let va = u.va_next;
+        u.va_next += npages * uat::PAGE_SIZE;
+        (u.l1, va)
+    });
+    for i in 0..npages {
+        if !uat_map_page(l1, va + i * uat::PAGE_SIZE, phys + i * uat::PAGE_SIZE) {
+            crate::ktrace::log("agx", "uat: page map failed (OOM)");
+            return None;
+        }
+    }
+    crate::ktrace::log_fmt(format_args!("agx: uat mapped phys {phys:#x} ({npages} pg) -> GPU VA {va:#x}"));
+    Some(va)
+}
 
 /// The cooperative pump run between every mailbox poll: keep the UI/clock/net
 /// alive and report Ctrl+C (returns true to abort). Mirrors the inference/IO
@@ -309,7 +509,14 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
                         crate::ktrace::log("agx", "shared-buffer allocation failed (OOM)");
                         return Outcome::Timeout;
                     };
-                    let dva = phys | DVA_BASE;
+                    // Map the buffer into the GPU's ctx-0 page tables and reply
+                    // with the GPU VA (not raw phys) — the coprocessor reads DRAM
+                    // only through the UAT, so a raw-phys DVA is unreachable and
+                    // stalls power-ON (the Milestone-1 finding).
+                    let Some(dva) = uat_map_buffer(phys, n_pages * 4096) else {
+                        crate::ktrace::log("agx", "uat map failed — falling back to raw phys (will likely stall)");
+                        return Outcome::Timeout;
+                    };
                     if !send(asc, msg_buffer_reply(n_pages, dva), ep) {
                         return Outcome::SendFail;
                     }
