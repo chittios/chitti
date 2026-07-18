@@ -58,9 +58,10 @@ extern "C" fn aarch64_sync_dispatch(frame: *mut u64) {
     // past it (index 32 = byte offset 256; all aarch64 instructions are 4 bytes)
     // so the `eret` resumes at the next instruction. Any other synchronous
     // exception is a real kernel bug: log the syndrome and halt.
-    if super::gic::probing() || super::uart_probing() {
+    if super::gic::probing() || super::uart_probing() || super::agx_probing() {
         super::gic::note_probe_fault();
         super::note_uart_fault();
+        super::note_agx_fault();
         // SAFETY: `frame` is our own trap frame on the current stack.
         unsafe {
             let elr = frame.add(32);

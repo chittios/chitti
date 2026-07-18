@@ -384,6 +384,38 @@ fn uat_map_buffer(phys: u64, bytes: u64) -> Option<u64> {
     Some(va)
 }
 
+/// Read + log the SGX GPU-MMU fault-status register, *recoverably* (the block
+/// external-aborts until the GPU powers on, so we arm the sync-handler probe and
+/// treat a fault as "SGX unpowered" instead of crashing). `FAULTED`/`REASON`/
+/// `CONTEXT`/`ADDR<<6` say whether the firmware's MMU faulted (e.g. on a buffer
+/// we mapped) and where. Offsets from m1n1 `hw/agx.py` (`SGXRegs.FAULT_INFO`).
+fn sgx_fault_check() {
+    let fdt = crate::arch::aarch64::boot::boot_x0();
+    // SAFETY: boot_x0 is the FDT pointer (or non-FDT, rejected by the magic).
+    let Some((sgx, _)) = (unsafe { crate::fdt::reg_nth_of_compatible(fdt, AGX_COMPAT, 1) }) else {
+        return;
+    };
+    crate::arch::aarch64::mmu::map_device_gib(sgx);
+    crate::arch::aarch64::set_agx_probing(true);
+    // SAFETY: recoverable read — if the SGX block is unpowered the sync handler
+    // skips this `ldr` and flags the fault (agx_probe_faulted).
+    let fi = unsafe { core::ptr::read_volatile((sgx + 0x17030) as *const u64) };
+    crate::arch::aarch64::set_agx_probing(false);
+    if crate::arch::aarch64::agx_probe_faulted() {
+        crate::ktrace::log("agx", "SGX FAULT_INFO unreadable (external abort) → GPU core still unpowered");
+        return;
+    }
+    let reasons = ["INVALID", "AF_FAULT", "WRITE_ONLY", "READ_ONLY", "NO_ACCESS", "UNK", "UNK", "UNK"];
+    crate::ktrace::log_fmt(format_args!(
+        "agx: SGX FAULT_INFO={fi:#018x} faulted={} reason={} rw={} ctx={} addr={:#x}",
+        fi & 1,
+        reasons[((fi >> 1) & 0x7) as usize],
+        if (fi >> 4) & 1 == 1 { "R" } else { "W" },
+        (fi >> 17) & 0x3f,
+        (fi >> 30) << 6
+    ));
+}
+
 /// The cooperative pump run between every mailbox poll: keep the UI/clock/net
 /// alive and report Ctrl+C (returns true to abort). Mirrors the inference/IO
 /// loops' `upkeep()` + interrupt-poll discipline (CLAUDE.md standing rule).
@@ -494,11 +526,13 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
                 "agx: timed out after {POWERUP_BUDGET_MS}ms (iop_power={:#x} ap_power={:#x}, buffers granted={})",
                 state.iop_power, state.ap_power, rep.n_buffers
             ));
-            // NB: the SGX register block (GPU node reg[1]) is NOT readable until
-            // the GPU powers on — a read of FAULT_INFO here takes a synchronous
-            // EXTERNAL abort (ESR EC=0x25 DFSC=0x10), which itself confirms the
-            // GPU core is unpowered. So we do NOT probe it (it would fault the
-            // kernel); the silence + unpowered SGX is the diagnosis.
+            // Diagnostics: the handoff state (did the FW touch it post-PPL?) and
+            // the SGX GPU-MMU fault register (recoverable — the block
+            // external-aborts while the GPU is unpowered).
+            if let Some((ho, _)) = discover_carveout(b"handoff") {
+                handoff::dump(ho);
+            }
+            sgx_fault_check();
             return Outcome::Timeout;
         }
         let Some(m) = asc.recv_blocking(POWERUP_POLL_MS, &mut pump) else {

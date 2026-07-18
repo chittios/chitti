@@ -203,6 +203,33 @@ pub fn note_uart_fault() {
     UART_PROBE_FAULTED.store(true, Ordering::Release);
 }
 
+// Recoverable-probe flags for reading the AGX **SGX** register block, which
+// takes a synchronous external abort until the GPU/firmware powers it on. Same
+// mechanism as the UART probe: the sync handler skips the faulting `ldr` and
+// notes the fault, so `/agx` can safely test whether the SGX block responds.
+static AGX_PROBING: AtomicBool = AtomicBool::new(false);
+static AGX_PROBE_FAULTED: AtomicBool = AtomicBool::new(false);
+
+/// True while probing the SGX register block (read by the sync handler).
+pub fn agx_probing() -> bool {
+    AGX_PROBING.load(Ordering::Acquire)
+}
+/// Called by the sync handler when a probed SGX read faults.
+pub fn note_agx_fault() {
+    AGX_PROBE_FAULTED.store(true, Ordering::Release);
+}
+/// Arm the recoverable SGX probe and clear the prior fault flag.
+pub fn set_agx_probing(on: bool) {
+    if on {
+        AGX_PROBE_FAULTED.store(false, Ordering::Release);
+    }
+    AGX_PROBING.store(on, Ordering::Release);
+}
+/// Whether the last armed SGX probe took a fault (external abort).
+pub fn agx_probe_faulted() -> bool {
+    AGX_PROBE_FAULTED.load(Ordering::Acquire)
+}
+
 #[inline]
 fn uart_base() -> usize {
     UART_BASE.load(Ordering::Relaxed)

@@ -132,6 +132,19 @@ pub fn with_lock(base: u64, timeout_ms: u64, pump: &mut dyn FnMut() -> bool, f: 
     true
 }
 
+/// Dump the live handoff state (safe DRAM reads) — used on a power-on timeout to
+/// see what the firmware is doing after the PPL handshake.
+pub fn dump(base: u64) {
+    let cur_ctx = r32(base, 0x18);
+    let flush0 = r64(base, FLUSH_BASE);
+    crate::ktrace::log_fmt(format_args!(
+        "agx: handoff state — MAGIC_FW={:#018x} LOCK_FW={} TURN={} CUR_CTX={cur_ctx} FLUSH_STATE[0]={flush0:#x}",
+        r64(base, MAGIC_FW),
+        r8(base, LOCK_FW),
+        r32(base, TURN),
+    ));
+}
+
 /// The PPL init handshake (`GFXHandoff.initialize`): publish `MAGIC_AP`, take
 /// the lock, wait for the firmware's `MAGIC_FW`, then zero the flush-state
 /// array. This is what unblocks the firmware's MMU init → power-ON. Bounded +
