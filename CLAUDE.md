@@ -423,30 +423,38 @@ real UEFI hardware.
   running. The chat pane keeps a 2000-line scrollback (PgUp/PgDn; /clear
   wipes it); Shift+Tab / Ctrl+Tab / clicking switches pane focus.
 
-- **AGX GPU** (`agx/`) — **Milestone 1: the Apple-Silicon GPU coprocessor
-  bring-up** (the foundation for future GPU compute offload of `cortex`'s
-  `matvec_qw`/`batched_proj` matmuls; today it does **no** GPU compute yet). On a
-  real M2 (t8112, via `cargo xtask m1n1`) the AGX GPU's control coprocessor
-  (`gfx-asc`) is booted and driven through Apple's generic **RTKit** handshake to
-  a RUNNING state: `cpu_start` → **HELLO** version-negotiate → HELLO_ACK →
-  endpoint-map enumerate → START_EP each system endpoint → service
-  BUFFER_REQUESTs (DMA-alloc + reply DVA; no-IOMMU, `dva_base=0` pending the
-  `asc-dram-mask`) → pump to IOP power ON → AP power ON. The pure wire protocol
-  (`agx/proto.rs` — field codecs, version negotiation, EPMAP, the
-  received-message→`Action` state machine) is **arch-neutral and unit-tested
-  under `cargo xtask test`** (x86, no hardware — because `arch::aarch64` is
-  cfg-gated out of the test build, the pure logic must live *outside* it); the
-  ASC-mailbox MMIO transport (`agx/asc.rs`, single-`ldr x`/`str x` 64-bit FIFO +
-  `dsb`/`dmb` fences) and the discovery/PMGR/orchestration (`agx/hw.rs`) are
-  aarch64-only. Gated on `is_apple()` + a `chitti.agx` **bootarg** (never under
-  the m1n1 hv — same rationale as `chitti.usb`); a clean no-op on QEMU/VBox/other
-  SoC. `/agx up` runs the handshake (traces mirrored to the chat pane via
-  `ktrace::set_console_echo`), `/agx status` dumps bases/endpoints/power. Ported
-  from m1n1's `src/{asc,rtkit,pmgr}.c`. **De-risking finding baked in:** m1n1
-  never boots the gfx-asc over RTKit, so firmware residency is unproven — the
-  boot waits ~1 s for HELLO *first* and, if none arrives, reports **blocked on
-  Asahi GPU-firmware provisioning** rather than hanging. Every wait is bounded +
-  pumps `upkeep()`/`poll_interrupt()`.
+- **AGX GPU** (`agx/`) — **the Apple-Silicon GPU coprocessor is booted to
+  RUNNING on a real M2** (t8112, via `cargo xtask m1n1`; the foundation for GPU
+  compute offload of `cortex`'s `matvec_qw`/`batched_proj` — the compute path
+  itself is the next milestone, not done yet). `/agx up` drives the full
+  bring-up: PMGR `gfx` power-on + SGX liveness poke → `cpu_start` → **GFXHandoff
+  PPL handshake** (write `MAGIC_AP`, wait the firmware's `MAGIC_FW` — the shared-
+  memory memory-manager handshake, done *before* the RTKit handshake per
+  drm/asahi order) + UAT ctx-0 TTBRs under the handoff lock → RTKit **HELLO**
+  v-negotiate → HELLO_ACK → EPMAP → START_EP → `AP_PWR_STATE=ON` → service the
+  crashlog BUFFER_REQUEST (mapped into the **shared TTBR1 kernel range**, not
+  per-context TTBR0 — the firmware's boot context only sees TTBR1) → both IOP+AP
+  power reach ON = **RUNNING**. The **UAT** is real ARMv8 16 KiB paging with the
+  **G14 geometry — bit 39 TTBR select (IAS=39), NOT bit 47** (`agx/uat.rs`,
+  pure + unit-tested); getting that wrong makes the firmware's page-table walk
+  miss our PTEs (the buffer is then unreachable and it stalls silently). The
+  pure wire protocol (`agx/proto.rs`) + UAT encoder (`agx/uat.rs`) are
+  **arch-neutral, unit-tested under `cargo xtask test`** (x86 — `arch::aarch64`
+  is cfg-gated out of the test build, so pure logic must live outside it); the
+  ASC-mailbox MMIO (`agx/asc.rs`, single-`ldr x`/`str x` FIFO + `dsb`/`dmb`),
+  GFXHandoff (`agx/handoff.rs`, Dekker lock + cache-maintained shared mem), and
+  discovery/PMGR/orchestration (`agx/hw.rs`) are aarch64-only. Gated on
+  `is_apple()` + a `chitti.agx` **bootarg** (pass `chitti.usb chitti.agx`
+  together; bare boot only, never under the m1n1 hv — same rationale as
+  `chitti.usb`); a clean no-op on QEMU/VBox/other SoC. `/agx status` dumps
+  bases/endpoints/power; every wait is bounded + pumps `upkeep()`/`poll_interrupt()`
+  and answers Ctrl+C. Ported from m1n1 `src/{asc,rtkit,pmgr}.c` +
+  `proxyclient/m1n1/{hw/uat.py,fw/agx/*}` and drm/asahi `gpu.rs`. **Two hard-won
+  fixes were decisive:** UAT geometry = bit 39 (G14/t8112), and RTKit shared
+  buffers belong in TTBR1 (shared across contexts), not TTBR0 (per-context, not
+  active in the firmware's boot context). **Next:** app endpoints 0x20/0x21,
+  `initdata` (perf/power tables + channel rings), the firmware command ring, then
+  a GEMM microkernel into `cortex`.
 - **Storage** — virtio/NVMe/AHCI block devices, GPT/MBR/FAT/ext4 detection,
   ext4 (the default filesystem) + FAT, `/install` (self-hosting install to a
   disk; detects an existing Chitti GPT and **updates in place**, preserving the
