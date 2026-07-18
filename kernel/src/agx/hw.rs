@@ -520,6 +520,12 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
     let mut state = RtkitState::default();
     let powerup_deadline = crate::arch::now_ms() + POWERUP_BUDGET_MS;
     let mut last_beat = crate::arch::now_ms();
+    // Re-send the power requests ONCE after the crashlog buffer + PPL handshake:
+    // our initial SetIOPPower(INIT) (pre-HELLO) and SetAPPower(ON) (pre-PPL) were
+    // both sent before the firmware's memory manager was up, so it may have
+    // ignored them. Re-issuing them now that PPL init is done gives the firmware
+    // a fresh, in-order request to act on.
+    let mut resent_power = false;
     while state.iop_power != POWER_ON || state.ap_power != POWER_ON {
         if crate::arch::now_ms() >= powerup_deadline {
             crate::ktrace::log_fmt(format_args!(
@@ -597,6 +603,19 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
                     rep.n_buffers += 1;
                     if kind == BufferKind::Crashlog {
                         state.have_crashlog_buffer = true;
+                    }
+                    // PPL init has now run (inside uat_map_buffer). Re-issue the
+                    // power requests once — the firmware is finally ready to act
+                    // on them (see `resent_power`).
+                    if !resent_power {
+                        resent_power = true;
+                        crate::ktrace::log("agx", "re-sending IOP_PWR=INIT + AP_PWR=ON after PPL init");
+                        if !send(asc, msg_iop_pwr_state(POWER_INIT), EP_MGMT) {
+                            return Outcome::SendFail;
+                        }
+                        if !send(asc, msg_ap_pwr_state(POWER_ON), EP_MGMT) {
+                            return Outcome::SendFail;
+                        }
                     }
                 }
             }
