@@ -464,7 +464,22 @@ impl<'a> Model<'a> {
                         LayerKind::GemmaAttn { .. } => false,
                     }
             });
-        let has_matmul = matches!(bq, tensor::QT_Q8_0 | tensor::QT_Q1_0 | tensor::QT_Q2_0);
+        // Q8_0/Q1_0/Q2_0 have a batched matmul on any target. Q4_0 (2B/4B) gets
+        // batched prefill only where the i8mm kernel applies — there is no SDOT
+        // batched Q4_0, so without FEAT_I8MM those models keep sequential
+        // prefill (as before). `has_i8mm` is a runtime-constant CPU capability,
+        // fine to fold into this load-time gate.
+        let q4_0_i8mm = {
+            #[cfg(target_arch = "aarch64")]
+            {
+                bq == tensor::QT_Q4_0 && crate::arch::has_i8mm()
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                false
+            }
+        };
+        let has_matmul = matches!(bq, tensor::QT_Q8_0 | tensor::QT_Q1_0 | tensor::QT_Q2_0) || q4_0_i8mm;
         let batch_qt = (uniform && has_matmul).then_some(bq);
 
         Ok(Self { config: c, gguf, token_embd, output, output_norm, layers, vocab, batch_qt })
@@ -674,6 +689,11 @@ impl<'a> Model<'a> {
                 // Q8_0: weights are already int8, so i8mm needs no unpack — the
                 // cleanest 2×2 tile. Used for real batches (m≥2) with FEAT_I8MM.
                 tensor::QT_Q8_0 if m >= 2 && crate::arch::has_i8mm() => crate::arch::aarch64::smp::matmul_q8_0_i8mm(
+                    w.data.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols,
+                ),
+                // Q4_0: batch_qt is only Some(Q4_0) when has_i8mm() (no SDOT
+                // batched Q4_0), so this arm is the only Q4_0 path here.
+                tensor::QT_Q4_0 if m >= 2 && crate::arch::has_i8mm() => crate::arch::aarch64::smp::matmul_q4_0_i8mm(
                     w.data.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols,
                 ),
                 _ => crate::arch::aarch64::smp::matmul_sdot(

@@ -612,6 +612,7 @@ fn worker_loop(slot: usize) -> ! {
                     // has_i8mm() is true, so the kernels' FEAT_I8MM precondition holds.
                     9 => tensor::matmul_q1_0_i8mm_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols),
                     10 => tensor::matmul_q8_0_i8mm_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols),
+                    11 => tensor::matmul_q4_0_i8mm_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols),
                     4 => {
                         // Generic row work (video YUV→RGB, etc.).
                         let fp = JOB.fn_ptr.load(Ordering::Relaxed);
@@ -1036,6 +1037,47 @@ pub unsafe fn matmul_q8_0_i8mm(w: *const u8, xq: *const i8, xs: *const f32, y: *
     add_busy(0, super::cycle_count().wrapping_sub(t0));
     barrier(workers, g, &|rs, re| unsafe {
         tensor::matmul_q8_0_i8mm_rows(w, xq, xs, y, m_count, n_rows, rs, re, n_cols)
+    });
+}
+
+/// Batched weight-stationary `Q4_0` matmul via **i8mm** split across online
+/// cores — batched prefill for the Q4_0 models (2B/4B) when the CPU has
+/// FEAT_I8MM. Mode 11 / `matmul_q4_0_i8mm_rows`.
+///
+/// # Safety
+/// The CPU must implement FEAT_I8MM (caller gates on `super::has_i8mm()`);
+/// otherwise same contract as `tensor::matmul_q4_0_i8mm_rows` over `[0,n_rows)`.
+pub unsafe fn matmul_q4_0_i8mm(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, m_count: usize, n_rows: usize, n_cols: usize) {
+    let workers = fleet_workers();
+    if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
+        // SAFETY: caller guarantees FEAT_I8MM; whole range on this core.
+        unsafe { tensor::matmul_q4_0_i8mm_rows(w, xq, xs, y, m_count, n_rows, 0, n_rows, n_cols) };
+        return;
+    }
+    let n_parts = workers + 1;
+    let b0 = row_boundary(n_rows, n_parts, 1);
+    JOB.w.store(w as *mut u8, Ordering::Relaxed);
+    JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
+    JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
+    JOB.y.store(y, Ordering::Relaxed);
+    JOB.n_cols.store(n_cols, Ordering::Relaxed);
+    JOB.m_count.store(m_count, Ordering::Relaxed);
+    JOB.n_rows.store(n_rows, Ordering::Relaxed);
+    JOB.mode.store(11, Ordering::Relaxed); // Q4_0 i8mm matmul
+    for s in 0..workers {
+        JOB.row_start[s].store(row_boundary(n_rows, n_parts, s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(row_boundary(n_rows, n_parts, s + 2), Ordering::Relaxed);
+    }
+    clear_unused_slots(workers);
+    let g = JOB.go.load(Ordering::Relaxed) + 1;
+    JOB.go.store(g, Ordering::Release);
+    signal_workers();
+    let t0 = super::cycle_count();
+    // SAFETY: FEAT_I8MM per caller; disjoint row range [0, b0).
+    unsafe { tensor::matmul_q4_0_i8mm_rows(w, xq, xs, y, m_count, n_rows, 0, b0, n_cols) };
+    add_busy(0, super::cycle_count().wrapping_sub(t0));
+    barrier(workers, g, &|rs, re| unsafe {
+        tensor::matmul_q4_0_i8mm_rows(w, xq, xs, y, m_count, n_rows, rs, re, n_cols)
     });
 }
 

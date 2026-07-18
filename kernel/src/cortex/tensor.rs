@@ -2195,6 +2195,110 @@ pub unsafe fn matmul_q8_0_i8mm_rows(
     }
 }
 
+/// **i8mm** weight-stationary batched `Q4_0` × `int8`-activation matmul over
+/// rows `[row_start, row_end)` — batched prefill for the Q4_0 models (2B/4B)
+/// when the CPU has FEAT_I8MM. Like [`matmul_q8_0_i8mm_rows`] but each 32-elem
+/// block's weights are nibble-unpacked in-register: `vand 0x0f − 8` gives the
+/// low nibbles (elements 0..16), `vshr 4 − 8` the high nibbles (16..32) — the
+/// split-nibble Q4_0 layout — which slice into the four K-group `int8x8`
+/// operands the `vmmlaq_s32` 2×2 tile wants (matching the contiguous
+/// activation). Odd row/column tails fall back to [`sdot_one_row_q4_0`].
+///
+/// # Safety
+/// As [`matmul_q8_0_i8mm_rows`] with `Q4_0` rows (`n_cols/32` 18-byte blocks);
+/// the CPU **must** implement FEAT_I8MM (caller gates on `arch::has_i8mm()`).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,i8mm")]
+pub unsafe fn matmul_q4_0_i8mm_rows(
+    w: *const u8,
+    xq: *const i8,
+    xs: *const f32,
+    y: *mut f32,
+    m_count: usize,
+    n_rows: usize,
+    row_start: usize,
+    row_end: usize,
+    n_cols: usize,
+) {
+    use core::arch::aarch64::{
+        vandq_u8, vcombine_f32, vcombine_s8, vcvtq_f32_s32, vdup_n_f32, vdupq_n_f32, vdupq_n_s32, vdupq_n_s8,
+        vdupq_n_u8, vfmaq_f32, vget_high_s8, vget_low_s8, vgetq_lane_f32, vmmlaq_s32, vmulq_f32,
+        vreinterpretq_s8_u8, vset_lane_f32, vshrq_n_u8, vsubq_s8,
+    };
+    let blocks = n_cols / QK;
+    let row_bytes = blocks * Q4_0_BLOCK_BYTES;
+    let nb = blocks; // activation scales per column
+    let cols_even = (m_count / 2) * 2;
+    let rows_even = row_start + ((row_end - row_start) / 2) * 2;
+    const COLP: usize = 4;
+    let full_cols = (cols_even / (2 * COLP)) * (2 * COLP);
+    // SAFETY: caller's contract; all loads in-bounds, `y` rows disjoint.
+    unsafe {
+        let mask = vdupq_n_u8(0x0f);
+        let eight = vdupq_n_s8(8);
+        // Unpack a Q4_0 weight block (`base`) into 4 K-group int8x8 (elements
+        // 0..8, 8..16, 16..24, 24..32) of `code − 8`.
+        let unpack = |row: *const u8, base: usize| {
+            let wb = ldq_u8(row.add(base + 2));
+            let lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(wb, mask)), eight); // elems 0..16
+            let hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(wb, 4)), eight); // elems 16..32
+            [vget_low_s8(lo), vget_high_s8(lo), vget_low_s8(hi), vget_high_s8(hi)]
+        };
+        let mut r = row_start;
+        while r < rows_even {
+            let (row0, row1) = (w.add(r * row_bytes), w.add((r + 1) * row_bytes));
+            let mut mt = 0;
+            while mt < full_cols {
+                let mut res = [vdupq_n_f32(0.0); COLP];
+                for b in 0..blocks {
+                    let base = b * Q4_0_BLOCK_BYTES;
+                    let dw0 = f16_to_f32(u16::from_le_bytes([*row0.add(base), *row0.add(base + 1)]));
+                    let dw1 = f16_to_f32(u16::from_le_bytes([*row1.add(base), *row1.add(base + 1)]));
+                    let dw_vec = vcombine_f32(vdup_n_f32(dw0), vdup_n_f32(dw1));
+                    let wk0 = unpack(row0, base);
+                    let wk1 = unpack(row1, base);
+                    for t in 0..COLP {
+                        let (m0, m1) = (mt + 2 * t, mt + 2 * t + 1);
+                        let (a0lo, a0hi) = ldp_s8(xq.add(m0 * n_cols + b * QK));
+                        let (a1lo, a1hi) = ldp_s8(xq.add(m1 * n_cols + b * QK));
+                        let ak0 = [vget_low_s8(a0lo), vget_high_s8(a0lo), vget_low_s8(a0hi), vget_high_s8(a0hi)];
+                        let ak1 = [vget_low_s8(a1lo), vget_high_s8(a1lo), vget_low_s8(a1hi), vget_high_s8(a1hi)];
+                        let mut acc2 = vdupq_n_s32(0);
+                        for kg in 0..4 {
+                            acc2 = vmmlaq_s32(acc2, vcombine_s8(wk0[kg], wk1[kg]), vcombine_s8(ak0[kg], ak1[kg]));
+                        }
+                        let dx0 = *xs.add(m0 * nb + b);
+                        let dx1 = *xs.add(m1 * nb + b);
+                        let pair = vset_lane_f32(dx1, vdup_n_f32(dx0), 1);
+                        let dx_vec = vcombine_f32(pair, pair);
+                        res[t] = vfmaq_f32(res[t], vcvtq_f32_s32(acc2), vmulq_f32(dw_vec, dx_vec));
+                    }
+                }
+                for t in 0..COLP {
+                    let (m0, m1) = (mt + 2 * t, mt + 2 * t + 1);
+                    *y.add(m0 * n_rows + r) = vgetq_lane_f32(res[t], 0);
+                    *y.add(m1 * n_rows + r) = vgetq_lane_f32(res[t], 1);
+                    *y.add(m0 * n_rows + r + 1) = vgetq_lane_f32(res[t], 2);
+                    *y.add(m1 * n_rows + r + 1) = vgetq_lane_f32(res[t], 3);
+                }
+                mt += 2 * COLP;
+            }
+            r += 2;
+        }
+        for r2 in row_start..rows_even {
+            for m in full_cols..m_count {
+                *y.add(m * n_rows + r2) = sdot_one_row_q4_0(w.add(r2 * row_bytes), xq.add(m * n_cols), xs.add(m * nb), blocks);
+            }
+        }
+        if row_end > rows_even {
+            let r = rows_even;
+            for m in 0..m_count {
+                *y.add(m * n_rows + r) = sdot_one_row_q4_0(w.add(r * row_bytes), xq.add(m * n_cols), xs.add(m * nb), blocks);
+            }
+        }
+    }
+}
+
 /// **Weight-stationary batched** `Q1_0` × `int8`-activation matmul over rows
 /// `[row_start, row_end)` — the Q1_0 analog of [`matmul_q8_0_sdot_rows`], the
 /// kernel behind batched prefill for the 1-bit Bonsai. Per weight block the
@@ -3314,6 +3418,47 @@ mod tests {
         }
         for i in 0..m * rows {
             assert!((got[i] - want[i]).abs() < 1e-3, "i8mm vs sdot idx {i}: {} vs {}", got[i], want[i]);
+        }
+    }
+
+    /// The i8mm Q4_0 GEMM must match a per-column matvec (`matvec_q4_0_sdot_rows`)
+    /// — same nibble-unpacked dot, tiled — across odd m and odd rows (both
+    /// tails). aarch64-only; skips without host FEAT_I8MM.
+    #[cfg(target_arch = "aarch64")]
+    #[test_case]
+    fn matmul_q4_0_i8mm_matches_matvec() {
+        if !crate::arch::has_i8mm() {
+            return;
+        }
+        let (rows, cols, m) = (7usize, 128usize, 5usize); // odd rows AND odd m
+        let mut seed = 0x4D0Fu32;
+        let mut w = Vec::new();
+        for _ in 0..rows * (cols / QK) {
+            w.extend_from_slice(&F16_HALF);
+            for _ in 0..QK / 2 {
+                w.push((lcg(&mut seed) & 0xff) as u8);
+            }
+        }
+        let mut xq = alloc::vec![0i8; m * cols];
+        let mut xs = alloc::vec![0.0f32; m * (cols / QK)];
+        for mi in 0..m {
+            let x: Vec<f32> = (0..cols).map(|_| (lcg(&mut seed) % 1000) as f32 / 500.0 - 1.0).collect();
+            quantize_activations_q8(&x, &mut xq[mi * cols..(mi + 1) * cols], &mut xs[mi * (cols / QK)..(mi + 1) * (cols / QK)]);
+        }
+        let mut got = alloc::vec![0.0f32; m * rows];
+        // SAFETY: buffers sized per the kernel contracts; host has i8mm (checked).
+        unsafe {
+            matmul_q4_0_i8mm_rows(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), got.as_mut_ptr(), m, rows, 0, rows, cols);
+        }
+        for mi in 0..m {
+            let mut want = alloc::vec![0.0f32; rows];
+            // SAFETY: one activation column at a time.
+            unsafe {
+                matvec_q4_0_sdot_rows(w.as_ptr(), xq.as_ptr().add(mi * cols), xs.as_ptr().add(mi * (cols / QK)), want.as_mut_ptr(), 0, rows, cols);
+            }
+            for r in 0..rows {
+                assert!((got[mi * rows + r] - want[r]).abs() < 1e-2, "q4_0 i8mm m{mi} r{r}: {} vs {}", got[mi * rows + r], want[r]);
+            }
         }
     }
 
