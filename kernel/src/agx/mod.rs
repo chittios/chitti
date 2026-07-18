@@ -35,6 +35,9 @@ pub mod uat;
 mod asc;
 
 #[cfg(target_arch = "aarch64")]
+mod handoff;
+
+#[cfg(target_arch = "aarch64")]
 mod hw;
 
 /// The `/agx` shell command: `up` runs the coprocessor bring-up, `status` dumps

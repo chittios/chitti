@@ -5,6 +5,7 @@
 //! cooperative + bounded: every wait pumps the UI/clock/net and answers Ctrl+C.
 
 use super::asc::{Asc, Message};
+use super::handoff;
 use super::proto::{self, Action, BufferKind, EndpointSet, RtkitState};
 use super::uat;
 use alloc::alloc::{alloc_zeroed, Layout};
@@ -269,36 +270,54 @@ fn uat_init() -> bool {
         crate::ktrace::log("agx", "uat: no `pagetables` (gfx-shared) carveout");
         return false;
     };
+    let Some((handoff, ho_sz)) = discover_carveout(b"handoff") else {
+        crate::ktrace::log("agx", "uat: no `handoff` carveout — cannot PPL-init the firmware");
+        return false;
+    };
     crate::ktrace::log_fmt(format_args!(
-        "agx: uat carveouts — ttbs={ttbs:#x}/{ttbs_sz:#x} pagetables={pagetables:#x}/{pt_sz:#x}"
+        "agx: uat carveouts — ttbs={ttbs:#x}/{ttbs_sz:#x} pagetables={pagetables:#x}/{pt_sz:#x} handoff={handoff:#x}/{ho_sz:#x}"
     ));
-    // Read the firmware's live ctx-0 TTBR pair BEFORE touching anything (so a
-    // clobber is diagnosable and we can adopt the firmware's own L1).
+
+    // The unblock (Milestone 3): the firmware's memory manager blocks its MMU
+    // init until we complete the GFXHandoff PPL handshake (write MAGIC_AP, wait
+    // for MAGIC_FW). Do it first — without it the coprocessor never powers on.
+    if !handoff::initialize(handoff, 3000, &mut pump) {
+        crate::ktrace::log("agx", "uat: GFXHandoff PPL init failed/timed out");
+        return false;
+    }
+
+    // Read the firmware's ctx-0 TTBR pair (diagnostic — it was 0/0 as booted).
     let fw_ttbr0 = rd64(ttbs + uat::ttbr_slot_offset(0, 0));
     let fw_ttbr1 = rd64(ttbs + uat::ttbr_slot_offset(0, 1));
     crate::ktrace::log_fmt(format_args!("agx: uat ttbs ctx-0 (as booted) TTBR0={fw_ttbr0:#018x} TTBR1={fw_ttbr1:#018x}"));
 
+    // ctx-0 kernel context: a fresh L1 for TTBR0 (our buffer mappings), TTBR1 =
+    // the firmware's shared-region tables. Reuse the firmware's L1 if it already
+    // installed one (it hasn't — 0/0). Program the pair UNDER the handoff lock
+    // (proxyclient `UAT.init`: `with self.handoff.lock(): set_l0(0,0); set_l0(0,1)`).
     let l1 = if uat::is_valid(fw_ttbr0) {
-        // Adopt the firmware's live L1 — we ADD our buffer leaves into it and
-        // leave TTBR0/TTBR1 untouched, preserving every firmware mapping.
-        let l1 = uat::ttbr_base(fw_ttbr0);
-        crate::ktrace::log_fmt(format_args!("agx: uat reusing firmware ctx-0 L1 at {l1:#x} (TTBR untouched)"));
-        l1
+        uat::ttbr_base(fw_ttbr0)
     } else {
-        // Empty ctx-0 — safe to install our own L1 + TTBR pair.
         let Some(l1) = alloc_shared(1) else {
             crate::ktrace::log("agx", "uat: L1 table alloc failed");
             return false;
         };
-        let ttbr0 = uat::ttbr(l1, 0, true);
-        let ttbr1 = uat::ttbr(pagetables, 0, true);
+        l1
+    };
+    let ttbr0 = uat::ttbr(l1, 0, true);
+    let ttbr1 = uat::ttbr(pagetables, 0, true);
+    let locked = handoff::with_lock(handoff, 2000, &mut pump, || {
         wr64(ttbs + uat::ttbr_slot_offset(0, 0), ttbr0);
         wr64(ttbs + uat::ttbr_slot_offset(0, 1), ttbr1);
         dcache_clean(ttbs, uat::TTBR_PAIR_BYTES);
         dcache_clean(l1, uat::PAGE_SIZE);
-        crate::ktrace::log_fmt(format_args!("agx: uat installed fresh ctx-0 TTBR0={ttbr0:#018x} (L1 {l1:#x}) TTBR1={ttbr1:#018x}"));
-        l1
-    };
+    });
+    if !locked {
+        crate::ktrace::log("agx", "uat: could not take handoff lock to set ctx-0 TTBRs");
+        return false;
+    }
+    crate::ktrace::log_fmt(format_args!("agx: uat ctx-0 TTBR0={ttbr0:#018x} (L1 {l1:#x}) TTBR1={ttbr1:#018x} (fw {pagetables:#x})"));
+
     UAT.with(|u| {
         u.ttbs = ttbs;
         u.pagetables = pagetables;
