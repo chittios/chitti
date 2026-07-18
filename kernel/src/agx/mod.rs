@@ -29,6 +29,7 @@
 //! on external Asahi GPU-firmware provisioning (reported, not silently hung).
 
 pub mod proto;
+pub mod uat;
 
 #[cfg(target_arch = "aarch64")]
 mod asc;
