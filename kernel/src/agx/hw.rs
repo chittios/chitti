@@ -513,19 +513,27 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
                         state.have_crashlog_buffer = true;
                     }
                 } else {
-                    let Some(phys) = alloc_shared(n_pages) else {
+                    // 16 KiB-align the buffer (the UAT page granule) and reply
+                    // the aligned page count, exactly as the proxyclient crashlog
+                    // handler does (`align(0x1000*SIZE, 0x4000)`, reply
+                    // `SIZE=aligned/0x1000`) — a 2-page (8 KiB) request becomes a
+                    // 4-page (16 KiB) grant.
+                    let aligned_bytes = (n_pages * 4096).next_multiple_of(uat::PAGE_SIZE);
+                    let aligned_pages = aligned_bytes / 4096;
+                    let Some(phys) = alloc_shared(aligned_pages) else {
                         crate::ktrace::log("agx", "shared-buffer allocation failed (OOM)");
                         return Outcome::Timeout;
                     };
-                    // Map the buffer into the GPU's ctx-0 page tables and reply
-                    // with the GPU VA (not raw phys) — the coprocessor reads DRAM
-                    // only through the UAT, so a raw-phys DVA is unreachable and
-                    // stalls power-ON (the Milestone-1 finding).
-                    let Some(dva) = uat_map_buffer(phys, n_pages * 4096) else {
-                        crate::ktrace::log("agx", "uat map failed — falling back to raw phys (will likely stall)");
+                    // Map into the GPU's ctx-0 page tables and reply with the GPU
+                    // VA (not raw phys) — the coprocessor reads DRAM only through
+                    // the UAT.
+                    let Some(dva) = uat_map_buffer(phys, aligned_bytes) else {
+                        crate::ktrace::log("agx", "uat map failed");
                         return Outcome::Timeout;
                     };
-                    if !send(asc, msg_buffer_reply(n_pages, dva), ep) {
+                    let reply = msg_buffer_reply(aligned_pages, dva);
+                    crate::ktrace::log_fmt(format_args!("agx: buffer reply ep={ep:#x} pages={aligned_pages} dva={dva:#x} msg0={reply:#018x}"));
+                    if !send(asc, reply, ep) {
                         return Outcome::SendFail;
                     }
                     rep.n_buffers += 1;
