@@ -841,14 +841,13 @@ fn up() -> Outcome {
     rep.cpu_running = asc.cpu_running();
     REPORT.with(|r| *r = rep);
 
-    // Compute-milestone step 1: with the coprocessor RUNNING, start the app
-    // endpoints (0x20 firmware/KMD, 0x21 doorbell) and observe. drm/asahi does
-    // start_ep(0x20/0x21) then immediately MSG_INIT with the initdata GPU VA;
-    // we don't have initdata yet, so this just probes what the firmware sends
-    // (more buffer requests? nothing until MSG_INIT?) to shape that work.
-    if outcome == Outcome::Running {
-        probe_app_endpoints(&asc, &mut rep);
-    }
+    // NB: starting the app endpoints (0x20/0x21) without initdata makes the
+    // firmware CRASH ("Invalid AP power: 33" in its rtk_ep_work/power/
+    // agx_background task — it needs initdata's power/perf tables). So `/agx up`
+    // now STOPS cleanly at RUNNING; the app-endpoint start moves into the
+    // initdata flow (start_ep + MSG_INIT together). `probe_app_endpoints` is
+    // kept for reference / on-demand diagnosis.
+    let _ = probe_app_endpoints; // (retained; not auto-run — it crashes the FW)
 
     match outcome {
         Outcome::Running => crate::serial_println!("agx> coprocessor RUNNING — RTKit v{} up, {} endpoint(s) started", rep.version, count_eps(&rep.eps)),
