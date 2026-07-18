@@ -447,6 +447,19 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
         return Outcome::SendFail;
     }
 
+    // Initialise the UAT (GFXHandoff PPL handshake + ctx-0 tables) BEFORE the
+    // RTKit power handshake — drm/asahi does the whole UAT setup in `new()`
+    // before `rtk.boot()`, so the firmware's memory manager is up before the
+    // power handshake rather than being set up mid-way through it (which we did
+    // before, and the firmware then never reached power-ON). Non-fatal: if the
+    // firmware's PPL isn't ready this early, `uat_map_buffer` retries it when the
+    // first buffer is requested.
+    if uat_init() {
+        crate::ktrace::log("agx", "uat/PPL initialised before RTKit handshake (drm/asahi order)");
+    } else {
+        crate::ktrace::log("agx", "early uat/PPL init not ready — will retry at first buffer request");
+    }
+
     // --- Phase A decisive test: HELLO within ~1 s ⇒ firmware resident. --------
     let Some(hello) = asc.recv_blocking(HELLO_TIMEOUT_MS, &mut pump) else {
         crate::ktrace::log("agx", "no HELLO within 1s after cpu_start — gfx-asc firmware not resident (blocked on Asahi GPU-firmware provisioning)");
