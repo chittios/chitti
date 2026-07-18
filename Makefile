@@ -133,6 +133,8 @@ vbox:
 	VBoxManage controlvm "$$VM" poweroff 2>/dev/null || true; sleep 1; \
 	echo "vbox: ensuring USB keyboard + USB tablet + xHCI controller"; \
 	VBoxManage modifyvm "$$VM" --keyboard usb --mouse usbtablet --usb-xhci on; \
+	VBoxManage storageattach "$$VM" --storagectl "$$CTL" --port "$$PORT" --device 0 --medium none 2>/dev/null || true; \
+	if [ -n "$$UUID" ]; then VBoxManage closemedium disk "$$UUID" 2>/dev/null || true; fi; \
 	VBoxManage closemedium disk "$$VDI" 2>/dev/null || true; rm -f "$$VDI"; \
 	VBoxManage convertfromraw "$$IMG" "$$VDI" --format VDI; \
 	if [ -n "$$UUID" ]; then VBoxManage internalcommands sethduuid "$$VDI" "$$UUID"; fi; \
