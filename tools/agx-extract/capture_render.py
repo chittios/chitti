@@ -5,13 +5,21 @@
 # as the reference for porting AGX command submission into ChittiOS (see
 # kernel/src/agx/COMPUTE_PLAN.md, de-risking step 1).
 #
-# `experiments/agx_1tri.py` builds a full triangle render (WorkCommandTA +
-# WorkCommand3D + InitBM + microsequence) ENTIRELY IN CODE — no Metal capture file
-# — using the firmware's built-in clear/store pipelines. So running it under the
-# proxy and dumping the render context's whole VM gives us exact bytes for every
-# GPU object the firmware consumes: the two WorkCommands, the microsequences, the
-# cmdqueue RunCmdQueueMsg, the EventControl, the TVB/tiler buffers, and the context
-# TTBR. That is the plumbing reference — no shader work of our own required.
+# `experiments/agx_1tri.py` builds the WorkCommands/microsequence in code, then
+# submits a triangle render; dumping the render context's whole VM afterward gives
+# exact bytes for every GPU object the firmware consumes (WorkCommandTA/3D, the
+# microsequences, the cmdqueue RunCmdQueueMsg, EventControl, TVB/tiler buffers, the
+# context TTBR).
+#
+# !!! DEPENDENCY (confirmed 2026-07): agx_1tri is NOT self-contained. It does
+#     ctx.load_blob(0x1100000000, ..., "gpudata/bunny/mem_*.bin") — Metal-captured
+#     SHADER/PIPELINE bytes — which are NOT in the m1n1 tree. Without gpudata/bunny/
+#     it FileNotFoundErrors before submitting. To use this script you must first
+#     place the bunny capture at proxyclient/experiments/gpudata/bunny/ (a macOS
+#     Metal capture, or the Asahi m1n1 render-asset set). See COMPUTE_PLAN.md
+#     "Proxy-session findings": Layer 3 (shader bytes) is unavoidable even for a
+#     render, so Layers 1-2 are better ported from m1n1 SOURCE (Path A) and this
+#     capture is only for Path B (validate render plumbing with a sourced bunny).
 #
 # PREREQUISITES (same as the initdata capture):
 #   - The M2 booted into m1n1 PROXY mode (NOT ChittiOS), proxy cable attached.

@@ -67,33 +67,56 @@ Recommendation: **(1) Mesa AGX compiler** for the kernel binary, cross-checked
 against **(2) applegpu** for the ISA/USC understanding. Defer choosing until Layer
 1–2 are validated (below), since they're independent.
 
-## De-risking sequence (do the cheap decisive thing first)
+## Proxy-session findings (2026-07, real M2) — CONFIRMED ON HARDWARE
 
-The one self-contained, **capturable** real submission in the reference is
-`experiments/agx_1tri.py`: it builds a full triangle render (WorkCommandTA +
-WorkCommand3D + InitBM + microsequence) **entirely in code** — no Metal capture
-file — using the built-in clear/store pipelines. So we can get exact known-good
-bytes for the *plumbing* without solving Layer 3.
+Running the capture against the live proxy settled the two biggest unknowns:
 
-1. **Capture (proxy):** run `agx_1tri.py` under the m1n1 proxy on the M2, dump
-   every GPU object it creates (addr, size, bytes), the two `WorkCommand`s, the
-   microsequences, the cmdqueue `RunCmdQueueMsg`, and the context TTBR/`ctx_id`.
-   Script: `tools/agx-extract/capture_render.py` (companion to this doc) → a replay
-   blob in the same shape as `initdata_blob.rs`.
-2. **Port plumbing (ChittiOS):** implement Layer 1 (context) + Layer 2 (cmdqueue
-   channel + WorkCommand + microsequence encode + Event poll). Replay the captured
-   render at identical VAs, submit on the 3D/TA cmdqueue channels, **wait for the
-   Event stamp**. Success = the firmware completes the render and bumps the event
-   counter (and ideally the framebuffer shows the triangle). This proves context +
-   cmdqueue + microsequence + completion — the whole plumbing — with zero shader
-   work of our own.
-3. **Swap in compute:** replace the render WorkCommand with `WorkCommandCP` +
-   compute microsequence, and drop in the Layer-3 GEMM shader/command-list. Submit
-   on the CP channel, read back the result buffer.
+1. **There is NO self-contained GPU submission in m1n1.** `agx_1tri.py` looked
+   self-contained but actually `ctx.load_blob(0x1100000000, …, "gpudata/bunny/
+   mem_*.bin")` — it loads **Metal-captured shader/pipeline bytes** into
+   `pipeline_base`. `agx_renderframe.py` takes a saved `GPUFrame` capture as
+   `argv[1]`. Those `gpudata/` assets are **not in the m1n1 tree**. So even the
+   built-in clear/store pipelines come from captured data → **Layer 3 (shader
+   bytes) is unavoidable even for a render.** A "capture a known-good render to
+   validate the plumbing" plan is blocked unless we first source `gpudata/bunny`
+   (a macOS Metal capture) or compile our own shaders.
+2. **Layer 1 is fully specified from source — no byte capture needed.** A context
+   is: a zeroed 16 KiB TTBR0 L1 (`memalign`), `bind_context(ctx_id, ttbr0)`, and
+   `iomap_at` calls we already have (`uat.rs`). The proxy confirmed the exact ttbs
+   bind descriptor for a fresh ctx: `L0[ctx].0 = ttbr0|ASID(ctx)|VALID`,
+   `L0[ctx].1 = ttbr1_shared|ASID|VALID` (e.g. ctx 3 → `0x3000814884001` /
+   `0x30009fff78001`). VA layout: pipelines `0x1100000000`, GEM `0x1500000000`,
+   userspace `0x1600000000`, ctx "thing" `0x6fffff8000`; MemoryAttr.Shared, nG=1.
+
+Consequence: **Layers 1–2 can be built straight from m1n1 SOURCE without the
+proxy** (zeroed tables + struct encoders). The proxy/capture is only needed to
+(a) source a reference shader (Layer 3), or (b) validate a completed submission.
+
+## De-risking sequence (revised after the proxy findings)
+
+The original "replay a captured render" step is blocked on shader data. Two viable
+orderings:
+
+**Path A — plumbing first, shader last (recommended).**
+1. **Port Layer 1 (context) + Layer 2 (cmdqueue + WorkCommandCP + microsequence +
+   Event poll) from m1n1 SOURCE.** No proxy needed. Pure encoders get
+   `#[test_case]` tests. Build the full submission machinery with a *placeholder*
+   shader region.
+2. **Source ONE real AGX shader** (Layer 3): a trivial compute kernel via Mesa's
+   AGX compiler (or `dougallj/applegpu`). Just enough to write a known value to a
+   result buffer.
+3. **Submit on the CP channel; wait for the Event stamp; read back the buffer.**
+   Success = the firmware ran our shader and completed the job. This proves the
+   whole stack end-to-end with the smallest possible shader.
 4. **Wire into cortex:** upload weights to GPU memory once at `Model::load`; per
-   matmul, encode a `WorkCommandCP` dispatch over `matvec_qw`/`batched_proj`; only
-   small activations cross per token. Validate greedy parity vs `tools/cortexdiff`
-   / `cargo xtask ref-check` (rel-RMS tolerance — GPU reduction order ≠ NEON).
+   matmul encode a `WorkCommandCP` dispatch (`matvec_qw`/`batched_proj`); validate
+   greedy parity vs `tools/cortexdiff` / `cargo xtask ref-check` (rel-RMS tol —
+   GPU reduction order ≠ NEON).
+
+**Path B — source `gpudata/bunny` and validate render plumbing first.** If the
+bunny Metal capture can be obtained, `capture_render.py` yields a complete
+known-good render (shaders incl.) to replay, proving Layers 1–2 before writing any
+shader. Falls back to Path A for compute regardless.
 
 ## Testing posture (per repo standing rules)
 
