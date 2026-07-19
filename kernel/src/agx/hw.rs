@@ -974,27 +974,42 @@ const CHANNELS: &[ChannelVa] = &[
     ChannelVa { name: "Event", state: 0xffffffa040377fd0, ring: 0xffffffa0403b8800, ring_size: 0x4000 },
     ChannelVa { name: "DevCtrl", state: 0xffffffa040333fd0, ring: 0xffffffa000330000, ring_size: 0x4000 },
 ];
+const NCHAN: usize = 5;
 
-/// Read the firmware→AP channel rings back from shared memory after MSG_INIT and
-/// report whether the firmware wrote anything — the decisive liveness signal.
-/// Returns `true` if any channel shows firmware activity (non-zero state cursor
-/// or printable log text). Purely read-only.
-fn probe_firmware_liveness() -> bool {
-    let mut alive = false;
-    for ch in CHANNELS {
-        // Channel state header (read/write cursors the firmware bumps). 64 bytes
-        // covers ChannelState's read_ptr@0x0 / write_ptr@0x20 for all channels.
+/// Read the `(read_ptr@0x0, write_ptr@0x20)` cursor pair of every channel's state
+/// header. Snapshotted *before* MSG_INIT (the replayed baseline) and again after,
+/// so movement is unambiguous — a replayed-but-stale non-zero value (e.g. DevCtrl
+/// left at 0x2/0x2 by the proxy capture) is NOT mistaken for a fresh write.
+fn read_channel_cursors() -> [(u32, u32); NCHAN] {
+    let mut out = [(0u32, 0u32); NCHAN];
+    for (i, ch) in CHANNELS.iter().enumerate() {
         let mut st = [0u8; 64];
-        let got = gpu_read(ch.state, &mut st);
-        let nonzero = st[..got].iter().any(|&b| b != 0);
-        // First two u32s are the cursor pair for the simple channels.
+        let _ = gpu_read(ch.state, &mut st);
         let c0 = u32::from_le_bytes([st[0], st[1], st[2], st[3]]);
         let c1 = u32::from_le_bytes([st[0x20], st[0x21], st[0x22], st[0x23]]);
+        out[i] = (c0, c1);
+    }
+    out
+}
+
+/// Compare post-MSG_INIT channel state against the replayed `baseline` and report
+/// whether the firmware wrote anything — the decisive liveness signal. A cursor
+/// that **moved** (or fresh printable log text) is proof our firmware is
+/// executing; a merely-nonzero-but-unchanged cursor is stale replay data and does
+/// NOT count. Purely read-only.
+fn probe_firmware_liveness(baseline: &[(u32, u32); NCHAN]) -> bool {
+    let now = read_channel_cursors();
+    let mut alive = false;
+    for (i, ch) in CHANNELS.iter().enumerate() {
+        let (b0, b1) = baseline[i];
+        let (c0, c1) = now[i];
+        let moved = c0 != b0 || c1 != b1;
         crate::ktrace::log_fmt(format_args!(
-            "agx: chan {:>7} state cur0={c0:#x} cur1={c1:#x} nonzero={nonzero}",
-            ch.name
+            "agx: chan {:>7} cur0 {b0:#x}->{c0:#x} cur1 {b1:#x}->{c1:#x} {}",
+            ch.name,
+            if moved { "MOVED" } else { "(unchanged)" }
         ));
-        if nonzero {
+        if moved {
             alive = true;
         }
         // Scan the head of the ring for printable ASCII (FWLog/KTrace carry text).
@@ -1051,6 +1066,9 @@ fn boot_firmware(asc: &Asc, rep: &mut Report) {
         crate::ktrace::log("agx", "compute: initdata replay failed — aborting");
         return;
     };
+    // Snapshot channel cursors as replayed (pre-MSG_INIT) so the liveness probe
+    // can detect real firmware writes as movement, not stale replay data.
+    let baseline = read_channel_cursors();
     // Start the app endpoints then immediately MSG_INIT (drm/asahi order:
     // start_ep(0x20/0x21) → send_message(MSG_INIT | initdata)).
     for ep in [EP_FIRMWARE, EP_DOORBELL] {
@@ -1119,11 +1137,12 @@ fn boot_firmware(asc: &Asc, rep: &mut Report) {
         crate::ktrace::log_fmt(format_args!("agx: compute: firmware sent {msgs} mailbox message(s) after MSG_INIT"));
     }
     // The decisive check: did the firmware write its shared-memory channel rings?
-    // (Boot-log text / advanced cursors = initdata accepted + firmware executing.)
-    if probe_firmware_liveness() {
-        crate::ktrace::log("agx", "compute: FIRMWARE ALIVE — wrote channel rings (initdata accepted, GPU executing)");
+    // (A cursor that MOVED past its replayed baseline / fresh boot-log text =
+    // initdata accepted + firmware executing. A stale-but-nonzero cursor is not.)
+    if probe_firmware_liveness(&baseline) {
+        crate::ktrace::log("agx", "compute: FIRMWARE ALIVE — channel cursor advanced past replay baseline (initdata accepted, GPU executing)");
     } else {
-        crate::ktrace::log("agx", "compute: channels still zero — firmware parsed initdata but hasn't driven rings yet (may need DevCtrl kick)");
+        crate::ktrace::log("agx", "compute: no channel movement vs baseline — firmware parsed initdata but hasn't driven rings yet (may need DevCtrl kick)");
     }
 }
 
