@@ -29,3 +29,4 @@ tools/webcompat/wasm-testsuite/
 # large. Point CHITTI_DTB at the built file.
 third_party/dtb/*.dtb
 third_party/dtb/.asahi-linux/
+scratchpad-agx/

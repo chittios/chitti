@@ -1,0 +1,61 @@
+{
+  "initdata_va": 18446743662474575684,
+  "kern_va_base": 18446743661392691200,
+  "regions": [
+    {
+      "name": "InitData",
+      "va": 18446743662474575684,
+      "size": 188
+    },
+    {
+      "name": "InitData_RegionA",
+      "va": 18446743662474838016,
+      "size": 16384
+    },
+    {
+      "name": "InitData_RegionB",
+      "va": 18446743661396595776,
+      "size": 27584
+    },
+    {
+      "name": "InitData_RegionC",
+      "va": 18446743662475680876,
+      "size": 74644
+    },
+    {
+      "name": "AGXHWDataA",
+      "va": 18446743661397736932,
+      "size": 16924
+    },
+    {
+      "name": "AGXHWDataB",
+      "va": 18446743661398304636,
+      "size": 6276
+    },
+    {
+      "name": "AGXFaultInfo",
+      "va": 18446743662475132800,
+      "size": 128
+    },
+    {
+      "name": "InitData_BufferMgrCtl",
+      "va": 18446743662475409424,
+      "size": 2032
+    },
+    {
+      "name": "InitData_FWStatus",
+      "va": 18446743661399424896,
+      "size": 128
+    },
+    {
+      "name": "InitData_GPUGlobalStats3D",
+      "va": 18446743661397178552,
+      "size": 1864
+    },
+    {
+      "name": "InitData_GPUGlobalStatsTA",
+      "va": 18446743661396900208,
+      "size": 1680
+    }
+  ]
+}
