@@ -842,6 +842,13 @@ fn wifi_cmd(arg: &str) {
             Ok(()) => serial_println!("wifi> firmware loaded"),
             Err(e) => serial_println!("wifi> {e}"),
         },
+        "diag" => {
+            // Decisive BAR2/TCM read-abort diagnostic: (a) outbound-window vs
+            // (b) dongle RAM held in reset. One boot resolves it.
+            for line in crate::drivers::wifi::diag() {
+                serial_println!("wifi> {line}");
+            }
+        }
         "scan" => {
             serial_println!("wifi> nearby networks:");
             match crate::drivers::wifi::scan() {

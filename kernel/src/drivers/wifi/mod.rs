@@ -219,6 +219,26 @@ pub fn load_firmware() -> Result<(), &'static str> {
     }
 }
 
+/// Decisive on-hardware diagnostic for the BAR2/TCM read-abort blocker.
+/// Returns human-readable lines (also mirrored to ktrace). Apple-only.
+pub fn diag() -> Vec<String> {
+    #[cfg(all(target_arch = "aarch64", not(test)))]
+    {
+        if crate::arch::aarch64::is_apple() {
+            if !radio_ready() {
+                let _ = power_on();
+            }
+            if !radio_ready() {
+                return alloc::vec![String::from(
+                    "radio BARs not mapped — run /wifi power first (see /wifi info + ktrace)"
+                )];
+            }
+            return brcm::diag();
+        }
+    }
+    alloc::vec![String::from("/wifi diag is Apple-Silicon only")]
+}
+
 /// Scan for networks (real radio) or return the facade list.
 pub fn scan() -> Result<Vec<proto::BssInfo>, &'static str> {
     #[cfg(all(target_arch = "aarch64", not(test)))]

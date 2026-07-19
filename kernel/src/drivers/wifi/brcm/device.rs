@@ -1390,6 +1390,168 @@ fn read_file_bytes(path: &str) -> Result<Vec<u8>, ()> {
     crate::synapse::fs::read(path).ok_or(())
 }
 
+/// Is an AI core out of reset and clocked? Linux `brcmf_chip_ai_iscoreup`:
+/// IOCTL has CLK set (and not stuck in FGC-only) and RESET_CTL.RESET clear.
+/// Reads recoverably through the BAR0 backplane window; `None` when the wrap
+/// registers themselves abort (core unpowered).
+fn ai_iscoreup(bar0: u64, pci: &PciDevice, wrap: u32) -> Option<bool> {
+    if wrap == 0 {
+        return None;
+    }
+    let ioctl = bp_read32_probe(bar0, pci, wrap + BCMA_IOCTL)?;
+    let rst = bp_read32_probe(bar0, pci, wrap + BCMA_RESET_CTL)?;
+    Some((ioctl & (BCMA_IOCTL_FGC | BCMA_IOCTL_CLK)) == BCMA_IOCTL_CLK
+        && (rst & BCMA_RESET_CTL_RESET) == 0)
+}
+
+/// **Decisive BAR2/TCM read-abort diagnostic** — resolves the two candidate
+/// root causes of "BAR2 writes stick but every read external-aborts" *without
+/// guessing*, in a single boot:
+///
+/// - **(a) outbound-window / BAR placement**: BAR2 never translates → *every*
+///   BAR2 read aborts, **including offset 0**. Fix lives in `apple_pcie`
+///   (axi2af window / BAR2 pref-bit / placement).
+/// - **(b) dongle RAM not up**: the BAR2 aperture *does* translate (offset 0
+///   reads back) but the TCM/SYS_MEM region at `rambase` (`0x740000`) aborts
+///   because the CA7's SYS_MEM RAM core is held in reset (`coreinfo=0xffffffff`).
+///   The tell-tale: after `ai_core_reset(SYS_MEM)` the same TCM read starts
+///   answering. Fix lives here in the chip bring-up (reset SYS_MEM before copy).
+///
+/// All access is recoverable + bounded; safe to run anytime after `/wifi power`.
+pub fn diag() -> Vec<String> {
+    with_dev(diag_inner).unwrap_or_else(|| {
+        alloc::vec![String::from("no wifi device probed — run /wifi power first")]
+    })
+}
+
+fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
+    use alloc::format;
+    let mut out = Vec::new();
+
+    // Copy the primitives we need into locals so the probe closures capture by
+    // value (no borrow of `dev` held across the later core-reset calls).
+    let pci = dev.pci;
+    let bar0 = dev.bar0;
+    let bar2 = dev.bar2;
+
+    // BAR geometry + type bits straight from config space (pref bit matters:
+    // the pref window at 0x6a… L2C-aborts on this SoC, so a pref BAR2 in the
+    // non-pref window is a distinct failure mode).
+    let bar0_lo = crate::pci::read32(pci.bus, pci.dev, pci.func, 0x10);
+    let bar2_lo = crate::pci::read32(pci.bus, pci.dev, pci.func, 0x18);
+    out.push(format!(
+        "BAR0 cpu={bar0:#x} pci_lo={bar0_lo:#010x} pref={} | BAR2 cpu={bar2:#x} size={:#x} pci_lo={bar2_lo:#010x} pref={} 64b={}",
+        bar0_lo & 0x8 != 0,
+        dev.bar2_size,
+        bar2_lo & 0x8 != 0,
+        (bar2_lo >> 1) & 0x3 == 0x2,
+    ));
+
+    if bar2 == 0 {
+        out.push("BAR2 not mapped — cannot probe TCM (rerun /wifi power)".into());
+        return out;
+    }
+    // map_device_gib covers the whole GiB containing bar2, so every offset
+    // below (≤ 64 MiB) is MMU-mapped and a device non-response surfaces as a
+    // recoverable external abort (None), not an unrecoverable translation fault.
+    crate::arch::aarch64::mmu::map_device_gib(bar2);
+
+    let read_at = |off: u32| crate::arch::aarch64::probe_read32(bar2 + off as u64);
+    // Write+readback poke: distinguishes a real backing store (value sticks)
+    // from a posted-write-into-void (write "ok", read aborts).
+    let poke_at = |off: u32| -> (bool, Option<u32>) {
+        let magic = 0x4b4f_5445u32 ^ off; // 'KOTE' ^ off
+        let w = tcm_bar2_probe_write32(bar2, off, magic);
+        // SAFETY: order the store before the load on the same Device location.
+        unsafe {
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
+        let rb = tcm_bar2_probe_read32(bar2, off);
+        let _ = tcm_bar2_probe_write32(bar2, off, 0);
+        (w, rb)
+    };
+
+    let (w0, r0) = poke_at(0);
+    let (wr, rr) = poke_at(0x74_0000);
+    out.push(format!(
+        "BAR2 poke @0: write_ok={w0} read={r0:?} (want {:#x}) | @rambase(0x740000): write_ok={wr} read={rr:?} (want {:#x})",
+        0x4b4f_5445u32,
+        0x4b4f_5445u32 ^ 0x74_0000,
+    ));
+    out.push(format!(
+        "BAR2 plain read: @0={:?} @1M={:?} @rambase={:?}",
+        read_at(0),
+        read_at(0x10_0000),
+        read_at(0x74_0000),
+    ));
+
+    // Early verdict on window vs device: if offset 0 aborts on read, the whole
+    // BAR2 aperture is untranslated (cause a). If 0 reads but rambase aborts,
+    // the aperture is fine and the TCM RAM is simply not up (cause b).
+    let aperture_ok = r0.is_some();
+    let rambase_ok = rr.is_some();
+
+    // ── SYS_MEM (CA7 RAM) state via the SI backplane window ────────────────
+    let cores = discover_cores(bar0, &pci);
+    out.push(format!(
+        "cores: arm id={:#x} wrap={:#x} up={:?} | sysmem base={:#x} wrap={:#x} rev={} up={:?}",
+        cores.arm_id,
+        cores.arm_wrap,
+        ai_iscoreup(bar0, &pci, cores.arm_wrap),
+        cores.sysmem_base,
+        cores.sysmem_wrap,
+        cores.sysmem_rev,
+        ai_iscoreup(bar0, &pci, cores.sysmem_wrap),
+    ));
+
+    if cores.sysmem_base != 0 {
+        let ci_before = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
+        out.push(format!("SYS_MEM coreinfo(before reset)={ci_before:?}"));
+
+        // The decisive experiment: bring SYS_MEM out of reset, then re-read the
+        // same TCM location. If it flips None→Some, cause (b) is proven and the
+        // fix is to sequence this reset before the firmware copy.
+        crate::ktrace::log("wifi", "diag: resetting SYS_MEM then re-testing TCM read");
+        ai_core_reset(bar0, &pci, cores.sysmem_wrap, 0, 0, 0);
+        mdelay(3);
+        let ci_after = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
+        let up_after = ai_iscoreup(bar0, &pci, cores.sysmem_wrap);
+        out.push(format!(
+            "SYS_MEM coreinfo(after reset)={ci_after:?} up={up_after:?}"
+        ));
+        let rr_after = read_at(0x74_0000);
+        out.push(format!("BAR2 @rambase read AFTER SYS_MEM reset={rr_after:?}"));
+
+        // Verdict.
+        if !aperture_ok {
+            out.push(
+                "VERDICT (a): BAR2 aperture does not translate at all (offset 0 aborts) — fix the outbound window/placement in apple_pcie (axi2af / BAR2 pref-bit)".into(),
+            );
+        } else if rambase_ok {
+            out.push(
+                "VERDICT: BAR2 fully readable incl. rambase — no read-abort blocker; proceed to /wifi load".into(),
+            );
+        } else if rr_after.is_some() {
+            out.push(
+                "VERDICT (b): TCM read started answering only AFTER SYS_MEM reset — the RAM core was held in reset. Fix = reset SYS_MEM before firmware copy.".into(),
+            );
+        } else {
+            out.push(
+                "VERDICT (b, unconfirmed): aperture translates (offset 0 OK) but rambase still aborts even after SYS_MEM reset — RAM core not coming up (coreinfo/up above show why).".into(),
+            );
+        }
+    } else if !aperture_ok {
+        out.push(
+            "VERDICT (a): BAR2 offset 0 read aborts and no SYS_MEM core found — outbound-window/placement fault (apple_pcie).".into(),
+        );
+    }
+
+    for l in &out {
+        crate::ktrace::log_fmt(format_args!("wifi: diag: {l}"));
+    }
+    out
+}
+
 /// Kick a firmware scan (requires firmware_up). Populates `scan_cache`.
 pub fn scan() -> Result<Vec<proto::BssInfo>, &'static str> {
     let up = DEV.with(|d| d.as_ref().map(|x| x.firmware_up).unwrap_or(false));
