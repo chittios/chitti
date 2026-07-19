@@ -1378,12 +1378,16 @@ fn boot_firmware(asc: &Asc, rep: &mut Report) {
     kick_devctrl(asc, &post_init);
 }
 
-// The compute (CP) cmdqueue channel for queue 0 = "CL_0", channel id (0<<2)|2 = 2.
+// The compute (CP) cmdqueue channel. The proxyclient's working render example
+// (agx_1tri.py) submits on QUEUE INDEX 2 (channels 8/9/10), not queue 0 — queue 0
+// may be reserved/unmonitored. So we submit on **CL_2** = channel id (2<<2)|2 = 10.
 // Ring/state VAs from the initdata dump (in the replayed ranges → gpu_read/write).
-const CL0_STATE_VA: u64 = 0xffffffa04008bfd0;
-const CL0_RING_VA: u64 = 0xffffffa000088000;
-const CL0_ITEM: u64 = 0x40; // RunCmdQueueMsg size
-const CL0_CHANNEL: u16 = 2;
+const CL_STATE_VA: u64 = 0xffffffa040223fd0; // CL_2 state
+const CL_RING_VA: u64 = 0xffffffa000220000; // CL_2 ring
+const CL_ITEM: u64 = 0x40; // RunCmdQueueMsg size
+const CL_CHANNEL: u16 = 10; // (queue 2 << 2) | compute(2)
+// Stats channel state (firmware→AP) — re-read to confirm liveness during dispatch.
+const STATS_STATE_VA: u64 = 0xffffffa040563fd0;
 
 /// Round `n` up to the 16 KiB UAT page.
 fn page_up(n: u64) -> u64 {
@@ -1492,13 +1496,14 @@ fn dispatch_hello_compute() {
     });
     let arg = va_out.to_le_bytes();
 
-    // --- place everything ---
+    // --- place everything (capture RingState phys for post-run read-back) ---
+    let rs_phys = place(&ctx, va_rs, &rs, false);
     let ok = place(&ctx, va_shader, shaders::HELLO_COMPUTE, true).is_some()
         && place(&ctx, va_usc, &usc.bytes, true).is_some()
         && place(&ctx, va_cdm, &cdm_buf, false).is_some()
         && place(&ctx, va_ms, &ms, false).is_some()
         && place(&ctx, va_wc, &wc, false).is_some()
-        && place(&ctx, va_rs, &rs, false).is_some()
+        && rs_phys.is_some()
         && place(&ctx, va_ring, &ring, false).is_some()
         && place(&ctx, va_gbuf, &[], false).is_some()
         && place(&ctx, va_nl, &[], false).is_some()
@@ -1524,16 +1529,20 @@ fn dispatch_hello_compute() {
         ctx.ctx_id
     ));
 
-    // --- submit RunCmdQueueMsg on the CP channel (CL_0, id 2) + doorbell ---
+    // Snapshot the Stats cursor so we can tell if the firmware is even alive
+    // during the dispatch (it advanced during the DevCtrl kick).
+    let stats_before = gpu_read_u32(STATS_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
+
+    // --- submit RunCmdQueueMsg on the CP channel (CL_2, id 10) + doorbell ---
     let msg = workcmd::run_cmd_queue_msg(workcmd::QUEUE_COMPUTE, va_qi, 1, 1, true);
-    let wptr = gpu_read_u32(CL0_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
-    let slot = CL0_RING_VA + CL0_ITEM * (wptr as u64);
+    let wptr = gpu_read_u32(CL_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
+    let slot = CL_RING_VA + CL_ITEM * (wptr as u64);
     if gpu_write(slot, &msg) != msg.len() {
-        crate::ktrace::log("agx", "compute: CL_0 ring slot unmapped");
+        crate::ktrace::log("agx", "compute: CL ring slot unmapped");
         return;
     }
-    gpu_write_u32(CL0_STATE_VA + STATE_WRITE_PTR, wptr + 1);
-    crate::ktrace::log_fmt(format_args!("agx: compute: submitted on CP channel — CL_0 WRITE_PTR {}->{}, doorbell {CL0_CHANNEL:#x}", wptr, wptr + 1));
+    gpu_write_u32(CL_STATE_VA + STATE_WRITE_PTR, wptr + 1);
+    crate::ktrace::log_fmt(format_args!("agx: compute: submitted on CP channel CL_2 — WRITE_PTR {}->{}, doorbell {CL_CHANNEL:#x}", wptr, wptr + 1));
 
     let Some(base) = discover_asc_base() else {
         crate::ktrace::log("agx", "compute: ASC not available");
@@ -1541,7 +1550,7 @@ fn dispatch_hello_compute() {
     };
     // SAFETY: `base` is the discovered ASC MMIO base (mapped during `up`).
     let asc = unsafe { Asc::new(base as usize) };
-    let _ = send(&asc, proto::msg_doorbell(CL0_CHANNEL), proto::EP_DOORBELL);
+    let _ = send(&asc, proto::msg_doorbell(CL_CHANNEL), proto::EP_DOORBELL);
     // A general kick (0x10) nudges the firmware to pump its channels.
     let _ = send(&asc, proto::msg_doorbell(0x10), proto::EP_DOORBELL);
 
@@ -1570,9 +1579,27 @@ fn dispatch_hello_compute() {
             shaders::HELLO_COMPUTE_MAGIC
         ));
         sgx_fault_check();
-        let cl0_rd = gpu_read_u32(CL0_STATE_VA).unwrap_or(0);
-        let cl0_wr = gpu_read_u32(CL0_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
-        crate::ktrace::log_fmt(format_args!("agx: compute: CL_0 cursors read={cl0_rd:#x} write={cl0_wr:#x} (read advancing = firmware consumed the submit)"));
+        let cl_rd = gpu_read_u32(CL_STATE_VA).unwrap_or(0);
+        let cl_wr = gpu_read_u32(CL_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
+        crate::ktrace::log_fmt(format_args!("agx: compute: CL_2 cursors read={cl_rd:#x} write={cl_wr:#x} (read==write ⇒ firmware consumed the submit)"));
+        // Firmware liveness during the dispatch: did Stats advance?
+        let stats_after = gpu_read_u32(STATS_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
+        crate::ktrace::log_fmt(format_args!(
+            "agx: compute: Stats cursor {stats_before:#x}->{stats_after:#x} ({}), fw {}",
+            if stats_after != stats_before { "MOVED" } else { "unchanged" },
+            if stats_after != stats_before { "alive during dispatch" } else { "may be idle/stuck" }
+        ));
+        // The queue's own RingState: did the firmware bump gpu_rptr/gpu_doneptr?
+        if let Some(rsp) = rs_phys {
+            dcache_invalidate(rsp, 0x70);
+            // SAFETY: rsp is our identity-mapped RingState page.
+            let doneptr = unsafe { core::ptr::read_volatile(rsp as *const u32) };
+            let gpu_rptr = unsafe { core::ptr::read_volatile((rsp + 0x30) as *const u32) };
+            let cpu_wptr = unsafe { core::ptr::read_volatile((rsp + 0x40) as *const u32) };
+            crate::ktrace::log_fmt(format_args!(
+                "agx: compute: queue RingState gpu_doneptr={doneptr:#x} gpu_rptr={gpu_rptr:#x} cpu_wptr={cpu_wptr:#x} (gpu_rptr>0 ⇒ firmware read the queue ring)"
+            ));
+        }
     }
 }
 
