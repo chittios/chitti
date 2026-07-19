@@ -1485,11 +1485,51 @@ fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
         read_at(0x74_0000),
     ));
 
-    // Early verdict on window vs device: if offset 0 aborts on read, the whole
-    // BAR2 aperture is untranslated (cause a). If 0 reads but rambase aborts,
-    // the aperture is fine and the TCM RAM is simply not up (cause b).
-    let aperture_ok = r0.is_some();
     let rambase_ok = rr.is_some();
+
+    // ── DECISIVE: BAR2 relocation sweep ───────────────────────────────────
+    // BAR0 reads work at *its* CPU base, so the outbound window is live there.
+    // BAR2 maps the dongle's TCM regardless of where its base is programmed, so
+    // if BAR2 reads at ANY base inside the proven window, the TCM/device side is
+    // fine and the only bug is placement (BAR2 sat at a base the window doesn't
+    // translate — e.g. the very bottom edge below m1n1's axi2af start). If BAR2
+    // aborts at EVERY base, it is device-side (TCM/SYS_MEM not up).
+    // All config writes are restored afterward; reads are recoverable.
+    let orig_bar2_lo = crate::pci::read32(pci.bus, pci.dev, pci.func, 0x18);
+    let orig_bar2_hi = crate::pci::read32(pci.bus, pci.dev, pci.func, 0x1c);
+    let bar2_type = orig_bar2_lo & 0xf;
+    // PCI bases inside the non-pref bridge window (0xc000_0000..0xfff0_0000),
+    // spread across it, all above BAR0's slot to avoid a collision.
+    let sweep_bases = [0xc200_0000u64, 0xc400_0000, 0xc800_0000, 0xe000_0000];
+    let mut reloc_hit: Option<(u64, u64)> = None; // (pci_base, cpu_base)
+    for &b in &sweep_bases {
+        let cmd = crate::pci::read32(pci.bus, pci.dev, pci.func, 0x04);
+        crate::pci::write32(pci.bus, pci.dev, pci.func, 0x04, cmd & !0b10);
+        pci.program_bar64(2, b, bar2_type);
+        crate::pci::write32(pci.bus, pci.dev, pci.func, 0x04, cmd | 0b110);
+        let _ = crate::pci::read32(pci.bus, pci.dev, pci.func, 0x04);
+        // SAFETY: order the config writes before the MEM probe.
+        unsafe {
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
+        let cpu = crate::arch::aarch64::apple_pcie::bar_to_cpu(b);
+        crate::arch::aarch64::mmu::map_device_gib(cpu);
+        let z = crate::arch::aarch64::probe_read32(cpu);
+        let ram = crate::arch::aarch64::probe_read32(cpu + 0x74_0000);
+        out.push(format!(
+            "BAR2 relocate pci={b:#x} cpu={cpu:#x}: @0={z:?} @rambase={ram:?}"
+        ));
+        if reloc_hit.is_none() && (z.is_some() || ram.is_some()) {
+            reloc_hit = Some((b, cpu));
+        }
+    }
+    // Restore original BAR2 placement so /wifi load keeps working.
+    let cmd = crate::pci::read32(pci.bus, pci.dev, pci.func, 0x04);
+    crate::pci::write32(pci.bus, pci.dev, pci.func, 0x04, cmd & !0b10);
+    crate::pci::write32(pci.bus, pci.dev, pci.func, 0x18, orig_bar2_lo);
+    crate::pci::write32(pci.bus, pci.dev, pci.func, 0x1c, orig_bar2_hi);
+    crate::pci::write32(pci.bus, pci.dev, pci.func, 0x04, cmd | 0b110);
+    let _ = crate::pci::read32(pci.bus, pci.dev, pci.func, 0x04);
 
     // ── SYS_MEM (CA7 RAM) state via the SI backplane window ────────────────
     let cores = discover_cores(bar0, &pci);
@@ -1521,28 +1561,23 @@ fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
         ));
         let rr_after = read_at(0x74_0000);
         out.push(format!("BAR2 @rambase read AFTER SYS_MEM reset={rr_after:?}"));
+    }
 
-        // Verdict.
-        if !aperture_ok {
-            out.push(
-                "VERDICT (a): BAR2 aperture does not translate at all (offset 0 aborts) — fix the outbound window/placement in apple_pcie (axi2af / BAR2 pref-bit)".into(),
-            );
-        } else if rambase_ok {
-            out.push(
-                "VERDICT: BAR2 fully readable incl. rambase — no read-abort blocker; proceed to /wifi load".into(),
-            );
-        } else if rr_after.is_some() {
-            out.push(
-                "VERDICT (b): TCM read started answering only AFTER SYS_MEM reset — the RAM core was held in reset. Fix = reset SYS_MEM before firmware copy.".into(),
-            );
-        } else {
-            out.push(
-                "VERDICT (b, unconfirmed): aperture translates (offset 0 OK) but rambase still aborts even after SYS_MEM reset — RAM core not coming up (coreinfo/up above show why).".into(),
-            );
-        }
-    } else if !aperture_ok {
+    // ── Verdict ────────────────────────────────────────────────────────────
+    // BAR0 reads at its base prove the outbound window is live, so the sweep is
+    // authoritative: if BAR2 reads at some relocated base, TCM is up and the bug
+    // is placement; if it aborts everywhere, TCM is device-side down.
+    if rambase_ok {
         out.push(
-            "VERDICT (a): BAR2 offset 0 read aborts and no SYS_MEM core found — outbound-window/placement fault (apple_pcie).".into(),
+            "VERDICT: BAR2 already readable at rambase — no read-abort blocker; proceed to /wifi load".into(),
+        );
+    } else if let Some((b, cpu)) = reloc_hit {
+        out.push(format!(
+            "VERDICT (a): PLACEMENT — BAR2 reads at pci={b:#x} (cpu={cpu:#x}) but not at its programmed base {bar2:#x}. The outbound window doesn't translate BAR2's current spot; fix = place BAR2 in the proven range (apple_pcie probe_bar_candidates)."
+        ));
+    } else {
+        out.push(
+            "VERDICT (b): DEVICE-SIDE — BAR2 aborts at every relocated base though BAR0 reads fine, so the window is live but the dongle TCM/SYS_MEM RAM is not up (coreinfo=0xffffffff, CA7 reset path wrong). Fix = correct CA7 set_passive + SYS_MEM bring-up before copy.".into(),
         );
     }
 
