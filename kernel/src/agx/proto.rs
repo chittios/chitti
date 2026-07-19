@@ -44,6 +44,31 @@ pub const MSG_SYSLOG_INIT: u64 = 8;
 /// syslog "a line was written" — must be ACKed by echoing the message back.
 pub const MSG_SYSLOG_LOG: u64 = 5;
 
+// --- AGX app endpoints + GPU messages (fw/agx/__init__.py) ---------------
+/// Firmware (KMD) app endpoint — carries `MSG_INIT` (initdata pointer).
+pub const EP_FIRMWARE: u8 = 0x20;
+/// Doorbell app endpoint — kicks a channel.
+pub const EP_DOORBELL: u8 = 0x21;
+/// `GpuMsg.TYPE` is bits [63:48]. InitMsg=0x81 (INITDATA [43:0]);
+/// DoorbellMsg=0x83 (CHANNEL [15:0]).
+const GPUMSG_TYPE: (u32, u32) = (63, 48);
+const GPUMSG_INIT: u64 = 0x81;
+const GPUMSG_DOORBELL: u64 = 0x83;
+const INITDATA_FIELD: (u32, u32) = (43, 0);
+const DOORBELL_CHANNEL: (u32, u32) = (15, 0);
+/// DevCtrl channel doorbell number (agx `kick_firmware`/DevCtrl = 0x10/0x11).
+pub const DOORBELL_DEVCTRL: u16 = 0x10;
+
+/// `MSG_INIT` carrying the initdata GPU VA (low 44 bits), sent on `EP_FIRMWARE`.
+pub fn msg_fw_init(initdata_va: u64) -> u64 {
+    field_prep(GPUMSG_INIT, GPUMSG_TYPE.0, GPUMSG_TYPE.1) | field_prep(initdata_va, INITDATA_FIELD.0, INITDATA_FIELD.1)
+}
+
+/// A doorbell kicking `channel`, sent on `EP_DOORBELL`.
+pub fn msg_doorbell(channel: u16) -> u64 {
+    field_prep(GPUMSG_DOORBELL, GPUMSG_TYPE.0, GPUMSG_TYPE.1) | field_prep(channel as u64, DOORBELL_CHANNEL.0, DOORBELL_CHANNEL.1)
+}
+
 // --- RTKit power states (rtkit.c:75-81) ----------------------------------
 pub const POWER_OFF: u64 = 0x00;
 pub const POWER_SLEEP: u64 = 0x01;
@@ -475,6 +500,19 @@ mod tests {
         let msg0 = field_prep(MSG_BUFFER_REQUEST, 59, 52) | field_prep(2, 51, 44) | field_prep(0x1_0000, 41, 0);
         let br = buffer_request(msg0);
         assert_eq!(br, BufferRequest { n_pages: 2, addr: 0x1_0000 });
+    }
+
+    #[test_case]
+    fn gpu_init_and_doorbell_messages() {
+        // InitMsg: TYPE[63:48]=0x81, INITDATA[43:0]=va low 44 bits.
+        let va = 0xffffffa0407c3f44u64;
+        let m = msg_fw_init(va);
+        assert_eq!(field_get(m, 63, 48), 0x81);
+        assert_eq!(field_get(m, 43, 0), va & gen_mask(43, 0)); // 0xfa0407c3f44
+        // DoorbellMsg: TYPE=0x83, CHANNEL[15:0].
+        let d = msg_doorbell(DOORBELL_DEVCTRL);
+        assert_eq!(field_get(d, 63, 48), 0x83);
+        assert_eq!(field_get(d, 15, 0), DOORBELL_DEVCTRL as u64);
     }
 
     #[test_case]

@@ -38,6 +38,11 @@ pub mod asc;
 #[cfg(target_arch = "aarch64")]
 mod handoff;
 
+/// Captured ctx-0 GPU memory map + config bytes from the live M2 (t8112/FW13.5),
+/// replayed at identical GPU VAs so the firmware's initdata is satisfied.
+#[cfg(target_arch = "aarch64")]
+mod initdata_blob;
+
 #[cfg(target_arch = "aarch64")]
 mod hw;
 

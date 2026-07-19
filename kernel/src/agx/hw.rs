@@ -176,11 +176,11 @@ static ABORT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::n
 /// the shared **TTBR1** kernel range, not per-context TTBR0: during boot the
 /// firmware runs in its own context (ctx-0 TTBR0 isn't active), but TTBR1 is
 /// shared across all contexts (the firmware's `pagetables` region), so a TTBR1
-/// buffer is reachable from the firmware's boot context. This is Linux's
-/// `IOVA_KERN_RTKIT_RANGE` (~0xffffffae_00000000, sign-extended; the DVA field's
-/// low 44 bits = 0xfae00000000, bit 39 set ⇒ TTBR1). A TTBR0 VA (0x15…) was
-/// invisible to the firmware's boot context — the all-zero-crashlog stall.
-const BUF_VA_BASE: u64 = 0xfae00000000;
+/// buffer is reachable from the firmware's boot context. Set to the SAME VA the
+/// working proxyclient uses — `kern_va_base + 0x80000000` (kern_va_base =
+/// rtkit-private-vm-region-base 0xffffff8000000000 + size 0x2000000000) — so the
+/// crashlog/RTKit buffers land exactly where the replayed initdata expects them.
+const BUF_VA_BASE: u64 = 0xffffffa080000000;
 
 struct UatState {
     ready: bool,
@@ -381,19 +381,65 @@ fn uat_map_buffer(phys: u64, bytes: u64) -> Option<u64> {
         return None;
     }
     let npages = bytes.div_ceil(uat::PAGE_SIZE).max(1);
-    let (l1_ttbr0, l1_ttbr1, va) = UAT.with(|u| {
+    let va = UAT.with(|u| {
         let va = u.va_next;
         u.va_next += npages * uat::PAGE_SIZE;
-        (u.l1, u.pagetables, va)
+        va
     });
+    uat_map_range(va, phys, npages * uat::PAGE_SIZE).then_some(va)
+}
+
+/// Map `[va, va+bytes)` → `[phys, phys+bytes)` page-by-page into ctx-0 (TTBR0/1
+/// by the VA's bit-39 select). `bytes` is rounded up to the 16 KiB page. Used to
+/// place a buffer at a *specific* GPU VA (the initdata replay). Returns false on
+/// OOM/failure.
+fn uat_map_range(va: u64, phys: u64, bytes: u64) -> bool {
+    let (l1_ttbr0, l1_ttbr1) = UAT.with(|u| (u.l1, u.pagetables));
+    let npages = bytes.div_ceil(uat::PAGE_SIZE).max(1);
     for i in 0..npages {
-        if !uat_map_page(l1_ttbr0, l1_ttbr1, va + i * uat::PAGE_SIZE, phys + i * uat::PAGE_SIZE) {
+        let off = i * uat::PAGE_SIZE;
+        if !uat_map_page(l1_ttbr0, l1_ttbr1, (va + off) & !uat::PAGE_MASK, phys + off) {
             crate::ktrace::log("agx", "uat: page map failed (OOM)");
-            return None;
+            return false;
         }
     }
-    crate::ktrace::log_fmt(format_args!("agx: uat mapped phys {phys:#x} ({npages} pg) -> GPU VA {va:#x}"));
-    Some(va)
+    true
+}
+
+/// Replay the captured ctx-0 GPU memory map from the live M2: for every range,
+/// allocate DRAM, map it at the *identical* GPU VA (so the embedded pointers in
+/// the config bytes stay valid), and copy the captured bytes (or zero-fill).
+/// Returns the initdata GPU VA on success. Because it's the same machine, this
+/// reproduces exactly what the working driver hands the firmware.
+fn replay_initdata() -> Option<u64> {
+    use super::initdata_blob::{INITDATA_VA, RANGES, REPLAY_DATA};
+    if !uat_init() {
+        return None;
+    }
+    crate::ktrace::log_fmt(format_args!("agx: replaying {} initdata ranges ({} B config data)", RANGES.len(), REPLAY_DATA.len()));
+    let mut mapped_bytes: u64 = 0;
+    for &(va, size, data_off) in RANGES {
+        let size = size as u64;
+        // Page-aligned physical DRAM for this range.
+        let Some(phys) = alloc_shared(size.div_ceil(4096)) else {
+            crate::ktrace::log_fmt(format_args!("agx: replay OOM at va {va:#x} size {size:#x}"));
+            return None;
+        };
+        if data_off != u32::MAX {
+            // Copy the captured config bytes into the fresh DRAM (VA==PA).
+            let src = &REPLAY_DATA[data_off as usize..data_off as usize + size as usize];
+            // SAFETY: `phys` is our own alloc_shared'd, size-byte, identity-mapped buffer.
+            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), phys as *mut u8, size as usize) };
+        }
+        // Clean to PoC so the GPU sees it, then map at the exact VA.
+        dcache_clean(phys, size);
+        if !uat_map_range(va, phys, size) {
+            return None;
+        }
+        mapped_bytes += size;
+    }
+    crate::ktrace::log_fmt(format_args!("agx: initdata replay done — {mapped_bytes:#x} bytes mapped, initdata VA {INITDATA_VA:#x}"));
+    Some(INITDATA_VA)
 }
 
 /// Read + log the SGX GPU-MMU fault-status register, *recoverably* (the block
@@ -801,6 +847,84 @@ fn probe_app_endpoints(asc: &Asc, rep: &mut Report) {
     }
 }
 
+/// Compute milestone: replay the captured initdata memory map, start the app
+/// endpoints, hand the firmware the initdata pointer (MSG_INIT), and observe.
+/// If the firmware accepts it (no crash + it starts driving its channels), the
+/// GPU is initialised and ready for command submission (the next step).
+fn boot_firmware(asc: &Asc, rep: &mut Report) {
+    use proto::*;
+    let Some(initdata_va) = replay_initdata() else {
+        crate::ktrace::log("agx", "compute: initdata replay failed — aborting");
+        return;
+    };
+    // Start the app endpoints then immediately MSG_INIT (drm/asahi order:
+    // start_ep(0x20/0x21) → send_message(MSG_INIT | initdata)).
+    for ep in [EP_FIRMWARE, EP_DOORBELL] {
+        if !send(asc, msg_start_ep(ep), EP_MGMT) {
+            crate::ktrace::log_fmt(format_args!("agx: compute: START_EP {ep:#x} failed"));
+            return;
+        }
+    }
+    let init = msg_fw_init(initdata_va);
+    crate::ktrace::log_fmt(format_args!("agx: compute: MSG_INIT initdata={initdata_va:#x} msg0={init:#018x}"));
+    if !send(asc, init, EP_FIRMWARE) {
+        return;
+    }
+    // Kick the DevCtrl channel doorbell (agx: DC_Init) so the firmware processes
+    // the initial device-control ring.
+    let _ = send(asc, msg_doorbell(DOORBELL_DEVCTRL), EP_DOORBELL);
+
+    // Observe: accepted → the firmware drives its channels (fw-endpoint events /
+    // channel-ring buffer requests); rejected → a crashlog message.
+    crate::ktrace::log("agx", "compute: MSG_INIT sent — observing firmware response");
+    let deadline = crate::arch::now_ms() + 5000;
+    let mut state = RtkitState { iop_power: POWER_ON, ap_power: POWER_ON, crashed: false, have_crashlog_buffer: true };
+    let mut msgs = 0u32;
+    while crate::arch::now_ms() < deadline {
+        let Some(m) = asc.recv_blocking(500, &mut pump) else {
+            if ABORT.load(core::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            continue;
+        };
+        msgs += 1;
+        let ep = m.msg1 as u8;
+        crate::ktrace::log_fmt(format_args!("agx: compute: msg0={:#018x} ep={ep:#x}", m.msg0));
+        if ep >= EP_APP_BASE {
+            // Firmware endpoint event — the firmware is alive and driving its
+            // channels. This is the success signal.
+            continue;
+        }
+        match handle_system_msg(&mut state, m.msg0, ep) {
+            Action::Crashed => {
+                crate::ktrace::log("agx", "compute: firmware CRASHED after MSG_INIT — dumping crash record:");
+                if rep.crashlog_phys != 0 {
+                    dump_crashlog(rep.crashlog_phys);
+                }
+                return;
+            }
+            Action::AllocBuffer { ep, n_pages, addr, .. } if addr == 0 => {
+                let aligned = (n_pages * 4096).next_multiple_of(uat::PAGE_SIZE);
+                if let Some(phys) = alloc_shared(aligned / 4096) {
+                    if let Some(dva) = uat_map_buffer(phys, aligned) {
+                        let _ = send(asc, msg_buffer_reply(aligned / 4096, dva), ep);
+                        crate::ktrace::log_fmt(format_args!("agx: compute: served buffer ep={ep:#x} -> {dva:#x}"));
+                    }
+                }
+            }
+            Action::Send(msg0, e) => {
+                let _ = send(asc, msg0, e);
+            }
+            _ => {}
+        }
+    }
+    if msgs == 0 {
+        crate::ktrace::log("agx", "compute: firmware silent after MSG_INIT (accepted-but-idle, or wrong initdata) — inspect");
+    } else {
+        crate::ktrace::log_fmt(format_args!("agx: compute: firmware responded with {msgs} message(s) after MSG_INIT"));
+    }
+}
+
 /// Bring up the AGX coprocessor. Gated on `is_apple()` + the `chitti.agx`
 /// bootarg; a clean no-op otherwise. Returns the human-facing summary line.
 fn up() -> Outcome {
@@ -841,13 +965,12 @@ fn up() -> Outcome {
     rep.cpu_running = asc.cpu_running();
     REPORT.with(|r| *r = rep);
 
-    // NB: starting the app endpoints (0x20/0x21) without initdata makes the
-    // firmware CRASH ("Invalid AP power: 33" in its rtk_ep_work/power/
-    // agx_background task — it needs initdata's power/perf tables). So `/agx up`
-    // now STOPS cleanly at RUNNING; the app-endpoint start moves into the
-    // initdata flow (start_ep + MSG_INIT together). `probe_app_endpoints` is
-    // kept for reference / on-demand diagnosis.
-    let _ = probe_app_endpoints; // (retained; not auto-run — it crashes the FW)
+    // Compute milestone: replay the captured initdata memory map, start the app
+    // endpoints, MSG_INIT the firmware, and observe.
+    let _ = probe_app_endpoints; // (retained for on-demand diagnosis)
+    if outcome == Outcome::Running {
+        boot_firmware(&asc, &mut rep);
+    }
 
     match outcome {
         Outcome::Running => crate::serial_println!("agx> coprocessor RUNNING — RTKit v{} up, {} endpoint(s) started", rep.version, count_eps(&rep.eps)),
