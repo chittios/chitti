@@ -1006,10 +1006,15 @@ pub fn hard_reset_wifi_port() -> bool {
     }
     crate::ktrace::log(
         "pcie",
-        "HARD PERST# reset of WiFi endpoint (force full chip reset so PMU re-powers RAM)",
+        "HARD reset of WiFi endpoint: SMC power-cycle + PERST# (cold-boot so PMU re-powers RAM)",
     );
 
-    // SMC power stays on (airplane rail); ensure clocks then full PERST cycle.
+    // Full SMC power-cycle FIRST — PERST# alone leaves the dongle PMU's resource
+    // state intact (RAM stays gated); a rail off→on cold-boots the chip so the
+    // PMU reloads its defaults with the SYS_MEM/RAM domain powered.
+    super::apple_smc::wifi_power_cycle();
+
+    // Then the full PERST cycle to bring the freshly-powered chip's link back up.
     let app = r32(port0 + PORT_APPCLK as u64);
     w32(port0 + PORT_APPCLK as u64, app | PORT_APPCLK_EN);
     port_perst_cycle_and_ltssm(port0, port_phy, pinctrl);

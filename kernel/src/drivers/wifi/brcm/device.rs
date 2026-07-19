@@ -999,33 +999,6 @@ fn chip_subsystem_reset(bar0: u64, pci: &PciDevice, pcie2_rev: u8) {
     ));
 }
 
-// PMU resource masks (chipcommon, Asahi include/chipcommon.h).
-const CC_MIN_RES_MASK: u32 = 0x61c;
-const CC_MAX_RES_MASK: u32 = 0x620;
-
-/// Force every PMU resource up by copying `max_res_mask` → `min_res_mask`. The
-/// sledgehammer power-up (si_pmu_res_init style) that directly powers the
-/// SYS_MEM/RAM domain when the subsystem SSRESET alone doesn't restore the PMU
-/// defaults. Returns `(max, min_before, min_after)` for diagnosis.
-fn force_pmu_resources(
-    bar0: u64,
-    pci: &PciDevice,
-) -> (Option<u32>, Option<u32>, Option<u32>) {
-    let cc = proto::SI_ENUM_BASE;
-    let max = bp_read32_probe(bar0, pci, cc + CC_MAX_RES_MASK);
-    let before = bp_read32_probe(bar0, pci, cc + CC_MIN_RES_MASK);
-    if let Some(m) = max {
-        if m != 0 && m != 0xffff_ffff {
-            bp_write32(bar0, pci, cc + CC_MIN_RES_MASK, m);
-        }
-    }
-    mdelay(10);
-    let after = bp_read32_probe(bar0, pci, cc + CC_MIN_RES_MASK);
-    crate::ktrace::log_fmt(format_args!(
-        "wifi: force PMU resources: max_res={max:?} min_res {before:?} -> {after:?}"
-    ));
-    (max, before, after)
-}
 
 // SYS_MEM / SOCRAM register offsets (Linux `sbsocramregs`).
 const SYSMEM_COREINFO: u32 = 0x00;
@@ -1131,10 +1104,9 @@ fn download_fw_nvram(
     //    PMU defaults. Nothing reset the function on a bare m1n1 boot (the Apple
     //    PCIe root port would normally PERST# the chip), so the RAM domain is
     //    gated off and TCM/SYS_MEM don't decode. Keeps the host F0 link alive.
-    //    Follow with a PMU resource force (max→min) as a belt-and-suspenders
-    //    power-up in case SSRESET didn't restore the default mask.
+    //    NB: a full RAM power-up needs `/wifi reset` (SMC power-cycle + PERST) —
+    //    the in-band SSRESET can't reach the PMU on this chip.
     chip_subsystem_reset(dev.bar0, &dev.pci, cores.pcie2_rev);
-    let _ = force_pmu_resources(dev.bar0, &dev.pci);
 
     // 1. Halt ARM so TCM is ours (brcmf_chip_set_passive → disable_arm CA7).
     //    The per-core FGC|CLK in ai_core_reset is the only clock force needed;
@@ -1608,20 +1580,15 @@ fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
     ));
 
     // ── 2. Power up the RAM domain on a CLEAN bus (no aborting read yet) ────
-    // Subsystem SSRESET first (writes only, posted). Then read SYS_MEM coreinfo.
-    // If still dead, force all PMU resources and re-read.
+    // Subsystem SSRESET (writes only, posted), then read SYS_MEM coreinfo. NB:
+    // a real power-up needs `/wifi reset` first (SMC power-cycle) — the SSRESET
+    // alone can't reach the PMU on this chip. `Some(0xffffffff)` = still off.
     chip_subsystem_reset(bar0, &pci, cores.pcie2_rev);
     let ci_ss = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
     out.push(format!(
         "SYS_MEM coreinfo after SSRESET={ci_ss:?} (want a real value, not None/0xffffffff)"
     ));
     let dead = |v: &Option<u32>| v.map(|x| x == 0xffff_ffff).unwrap_or(true);
-    if dead(&ci_ss) {
-        let (max, b, a) = force_pmu_resources(bar0, &pci);
-        out.push(format!("PMU force: max_res={max:?} min_res {b:?}->{a:?}"));
-        let ci_pmu = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
-        out.push(format!("SYS_MEM coreinfo after PMU force={ci_pmu:?}"));
-    }
 
     // ── 3. Bring-up: halt CA7 (set_passive) then reset SYS_MEM ──────────────
     if cores.arm_wrap != 0 {

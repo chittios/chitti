@@ -553,6 +553,26 @@ pub fn wifi_power_on() -> bool {
     true
 }
 
+/// Power the WiFi/BT module **off** (GPIO 13 / `gP0d` output-low).
+pub fn wifi_power_off() -> bool {
+    crate::ktrace::log("smc", "de-asserting WiFi power gP0d=0x800000");
+    let ok = write_u32(KEY_GP0D, GPIO_OFF);
+    mdelay(50);
+    ok
+}
+
+/// **Full power-cycle** of the WiFi/BT module: rail off, settle, rail on. Unlike
+/// PERST# (which resets the PCIe link but leaves the dongle PMU's resource state
+/// intact), a rail cycle cold-boots the chip so its PMU reloads defaults with the
+/// SYS_MEM/RAM domain **powered** — required for TCM/firmware download on a bare
+/// boot where nothing power-cycled the module.
+pub fn wifi_power_cycle() -> bool {
+    crate::ktrace::log("smc", "power-cycling WiFi module (gP0d off→on)");
+    let _ = wifi_power_off();
+    mdelay(250);
+    wifi_power_on()
+}
+
 #[allow(dead_code)]
 pub fn read_u32(key: u32) -> Option<u32> {
     if !SMC.with(|s| s.ready) && !init() {
