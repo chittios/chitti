@@ -230,6 +230,175 @@ pub fn run_cmd_queue_msg(
     b.bytes // total 0x40
 }
 
+// ===================== microsequence (drm/asahi fw/microseq.rs) =====================
+//
+// The firmware executes this instruction list for the job: StartCompute (runs the
+// CDM encoder) → WaitForIdle → FinalizeCompute (signals the stamp) → RetireStamp.
+// Ops use 8-byte `GpuWeakPointer`s (object.rs: "64-bit non-zero VA"; m1n1 agrees).
+// `restart_branch_offset` in FinalizeCompute is the relative offset back to
+// StartCompute (for firmware preemption/restart).
+
+const OP_WAIT_FOR_IDLE: u32 = 0x01;
+const OP_RETIRE_STAMP: u32 = 0x18;
+const OP_START_COMPUTE: u32 = 0x29;
+const OP_FINALIZE_COMPUTE: u32 = 0x2a;
+const RETIRE_STAMP_ARGS: u32 = 0x4000_0000; // OpHeader::with_args (RetireStamp.HEADER)
+const MAX_ATTACHMENTS: usize = 16;
+
+/// Addresses the microsequence weaves together (all GPU VAs in the context).
+#[derive(Clone, Copy, Default)]
+pub struct MicroSeqRefs {
+    /// WorkCommandCP.job_params1 (= workcmd_addr + 0x70).
+    pub job_params1: u64,
+    /// WorkCommandCP.job_params2 (= workcmd_addr + 0x1fc).
+    pub job_params2: u64,
+    /// The QueueInfo (work_queue).
+    pub work_queue: u64,
+    /// GpuStatsComp region (may be 0 for a first attempt).
+    pub stats: u64,
+    pub vm_slot: u32,
+    pub event_seq: u64,
+    pub uuid: u32,
+    /// fw_stamp weak pointer (FinalizeCompute) + stamp value.
+    pub fw_stamp: u64,
+    pub stamp_value: u32,
+    pub unk_flag: u64,
+    pub counter: u64,
+    pub notifier_buf: u64,
+}
+
+fn attachments(b: &mut Buf) {
+    // Array<16, Attachment{address u64, size u32, unk_c u16, unk_e u16}> + count u32.
+    for _ in 0..MAX_ATTACHMENTS {
+        b.u64(0).u32(0).u16(0).u16(0);
+    }
+    b.u32(0); // count
+}
+
+/// Build the compute microsequence (StartCompute → WaitForIdle → FinalizeCompute
+/// → RetireStamp) for G14G/V13.5. Returns the bytes; the caller records the byte
+/// offset of StartCompute (0) so FinalizeCompute's restart branch is correct.
+pub fn microseq_compute(r: &MicroSeqRefs) -> Vec<u8> {
+    let mut b = Buf::new();
+    // --- StartCompute (op 0x29) ---
+    let start = b.len();
+    b.u32(OP_START_COMPUTE); // header
+    b.u64(0); // unk_pointer
+    b.u64(r.job_params1); // job_params1 (Option<weak>)
+    b.u64(r.stats); // stats
+    b.u64(r.work_queue); // work_queue
+    b.u32(r.vm_slot); // vm_slot
+    b.u32(0); // unk_28
+    b.u32(0); // event_generation
+    b.u64(r.event_seq); // event_seq
+    b.u32(0); // unk_38
+    b.u64(r.job_params2); // job_params2
+    b.u32(0); // unk_44
+    b.u32(r.uuid); // uuid
+    attachments(&mut b); // attachments + count
+    b.u32(0); // padding
+    b.u64(r.unk_flag); // unk_flag (V>=13.0B4)
+    b.u64(r.counter); // counter (V>=13.0B4)
+    b.u64(r.notifier_buf); // notifier_buf (V>=13.0B4)
+
+    // --- WaitForIdle (op 0x01) ---
+    b.u32(OP_WAIT_FOR_IDLE); // header (pipe<<8; compute pipe = 0 here)
+
+    // --- FinalizeCompute (op 0x2a) ---
+    let finalize = b.len();
+    b.u32(OP_FINALIZE_COMPUTE); // header
+    b.u64(r.stats); // stats
+    b.u64(r.work_queue); // work_queue
+    b.u32(r.vm_slot); // vm_slot
+    b.u64(r.job_params2); // job_params2
+    b.u32(0); // unk_24
+    b.u32(r.uuid); // uuid
+    b.u64(r.fw_stamp); // fw_stamp
+    b.u32(r.stamp_value); // stamp_value
+    b.u32(0); // unk_38
+    b.u32(0); // unk_3c
+    b.u32(0); // unk_40
+    b.u32(0); // unk_44
+    b.u32(0); // unk_48
+    b.u32(0); // unk_4c
+    b.u32(0); // unk_50
+    b.u32(0); // unk_54
+    b.u32(0); // unk_58
+    // restart_branch_offset: relative from FinalizeCompute back to StartCompute.
+    b.u32(((start as i64 - finalize as i64) as i32) as u32);
+    b.u32(0); // has_attachments
+    b.pad(0xd); // unk_64 (V>=13.0B4)
+    b.u64(r.unk_flag); // unk_flag (V>=13.0B4)
+    b.pad(0x7); // unk_79 (V>=13.0B4)
+
+    // --- RetireStamp (op 0x18 | 0x40000000) ---
+    b.u32(OP_RETIRE_STAMP | RETIRE_STAMP_ARGS);
+    b.bytes
+}
+
+// ===================== command queue (drm/asahi fw/workqueue.rs) =====================
+
+/// `RingState` (0x70) — the queue ring cursors. Field names encode offsets
+/// (unk_10@0x10 …): each 4-byte field is followed by 0xc pad. Set `cpu_wptr` +
+/// `rb_size` (in entries).
+pub fn ring_state(cpu_wptr: u32, rb_entries: u32) -> Vec<u8> {
+    let mut b = Buf::new();
+    b.u32(0).pad(0xc); // gpu_doneptr  @0x00
+    b.u32(0).pad(0xc); // unk_10       @0x10
+    b.u32(0).pad(0xc); // unk_20       @0x20
+    b.u32(0).pad(0xc); // gpu_rptr     @0x30
+    b.u32(cpu_wptr).pad(0xc); // cpu_wptr @0x40
+    b.u32(rb_entries).pad(0xc); // rb_size @0x50
+    b.u32(0).pad(0xc); // cpu_freeptr  @0x60
+    b.bytes // 0x70
+}
+
+/// Pointers the `QueueInfo` needs (all context GPU VAs).
+#[derive(Clone, Copy, Default)]
+pub struct QueueRefs {
+    pub state: u64,         // RingState addr
+    pub ring: u64,          // ring of u64 WorkCommand pointers
+    pub notifier_list: u64, // NotifierList
+    pub gpu_buf: u64,       // scratch gpu buffer
+    pub gpu_context: u64,   // GpuContextData
+    pub uuid: u32,
+    pub event_id: i32,
+}
+
+/// `QueueInfo` (G14G/V13.2, G<G14X). The firmware reads this when a
+/// `RunCmdQueueMsg` names it; `state` holds the cursors, `ring` the WorkCommand
+/// pointers, `gpu_context` the per-context data.
+pub fn queue_info(q: &QueueRefs) -> Vec<u8> {
+    let mut b = Buf::new();
+    b.u64(q.state); // state
+    b.u64(q.ring); // ring
+    b.u64(q.notifier_list); // notifier_list
+    b.u64(q.gpu_buf); // gpu_buf
+    b.u32(0); // gpu_rptr1
+    b.u32(0); // gpu_rptr2
+    b.u32(0); // gpu_rptr3
+    b.u32(q.event_id as u32); // event_id
+    b.u32(0); // priority
+    b.u32(0); // unk_4c
+    b.u32(q.uuid); // uuid
+    b.u32(0); // unk_54
+    b.u64(0); // unk_58
+    b.u32(0); // busy
+    b.pad(0x20); // __pad
+    b.u32(0); // unk_84_0 (V>=13.2 && G<G14X)
+    b.u32(0); // unk_84_state
+    b.u32(0); // error_count
+    b.u32(0); // unk_8c
+    b.u32(0); // unk_90
+    b.u32(0); // unk_94
+    b.u32(0); // pending
+    b.u32(0); // unk_9c
+    b.u64(q.gpu_context); // gpu_context
+    b.u64(0); // unk_a8
+    b.u32(0); // unk_b0 (V>=13.2 && G<G14X)
+    b.bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +482,42 @@ mod tests {
         let mut b = Buf::new();
         job_params2(&mut b, &c());
         assert_eq!(b.len(), 0x60);
+    }
+
+    #[test_case]
+    fn ring_state_layout() {
+        let rs = ring_state(1, 0x80);
+        assert_eq!(rs.len(), 0x70);
+        assert_eq!(rd32(&rs, 0x40), 1); // cpu_wptr
+        assert_eq!(rd32(&rs, 0x50), 0x80); // rb_size
+    }
+
+    #[test_case]
+    fn microseq_has_start_and_finalize() {
+        let ms = microseq_compute(&MicroSeqRefs {
+            job_params1: 0x1000,
+            work_queue: 0x2000,
+            ..Default::default()
+        });
+        // Starts with StartCompute (0x29); ends with RetireStamp header.
+        assert_eq!(rd32(&ms, 0), OP_START_COMPUTE);
+        assert_eq!(
+            rd32(&ms, ms.len() - 4),
+            OP_RETIRE_STAMP | RETIRE_STAMP_ARGS
+        );
+        // StartCompute.job_params1 @ +0x0c (header + unk_pointer).
+        assert_eq!(rd64(&ms, 0x0c), 0x1000);
+    }
+
+    #[test_case]
+    fn queue_info_key_pointers() {
+        let qi = queue_info(&QueueRefs {
+            state: 0xa000,
+            ring: 0xb000,
+            gpu_context: 0xc000,
+            ..Default::default()
+        });
+        assert_eq!(rd64(&qi, 0x00), 0xa000); // state
+        assert_eq!(rd64(&qi, 0x08), 0xb000); // ring
     }
 }

@@ -1378,6 +1378,204 @@ fn boot_firmware(asc: &Asc, rep: &mut Report) {
     kick_devctrl(asc, &post_init);
 }
 
+// The compute (CP) cmdqueue channel for queue 0 = "CL_0", channel id (0<<2)|2 = 2.
+// Ring/state VAs from the initdata dump (in the replayed ranges → gpu_read/write).
+const CL0_STATE_VA: u64 = 0xffffffa04008bfd0;
+const CL0_RING_VA: u64 = 0xffffffa000088000;
+const CL0_ITEM: u64 = 0x40; // RunCmdQueueMsg size
+const CL0_CHANNEL: u16 = 2;
+
+/// Round `n` up to the 16 KiB UAT page.
+fn page_up(n: u64) -> u64 {
+    (n + uat::PAGE_MASK) & !uat::PAGE_MASK
+}
+
+/// Place `data` at context VA `va` (alloc zeroed DRAM, map it, copy, clean).
+/// Returns the backing phys (identity-mapped, CPU-readable) or `None`.
+fn place(ctx: &GpuContext, va: u64, data: &[u8], pipeline: bool) -> Option<u64> {
+    let size = page_up((data.len() as u64).max(1));
+    let phys = ctx_alloc_at(ctx, va, size, pipeline)?;
+    if !data.is_empty() {
+        // SAFETY: `phys` is our identity-mapped, zeroed, page-sized alloc; the copy
+        // stays within it (data.len() <= size).
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), phys as *mut u8, data.len()) };
+        dcache_clean(phys, data.len() as u64);
+    }
+    Some(phys)
+}
+
+/// **First compute dispatch attempt** — build the full submission (context +
+/// shader + USC + CDM stream + microsequence + WorkCommandCP + command queue),
+/// submit it on the CP channel, and read back the output. A best-effort shot to
+/// get a hardware signal: the known-answer [`shaders::HELLO_COMPUTE`] kernel
+/// writes `0xCAFEF00D` to `out[0]`. Success = that value appears; otherwise the
+/// SGX fault register + channel state are dumped as the diagnostic. Several struct
+/// tails are still reverse-engineering-uncertain (see `workcmd.rs`), so a fault is
+/// an expected, informative outcome — not a regression.
+fn dispatch_hello_compute() {
+    use super::{cdm, shaders, workcmd};
+    use workcmd::{ComputeCmd, MicroSeqRefs, QueueRefs};
+    if !uat_init() {
+        crate::ktrace::log("agx", "compute: uat not ready — run /agx up first");
+        return;
+    }
+    let Some(ctx) = create_context(3) else {
+        crate::ktrace::log("agx", "compute: create_context failed");
+        return;
+    };
+    // --- assign context VAs (page-aligned; pre-assigned so cross-refs resolve) ---
+    let g = CTX_GEM_BASE;
+    let (va_out, va_arg, va_cdm, va_ms, va_wc, va_rs, va_ring, va_gbuf, va_nl, va_gctx, va_qi) = (
+        g, g + 0x04000, g + 0x08000, g + 0x0c000, g + 0x10000, g + 0x14000, g + 0x18000,
+        g + 0x1c000, g + 0x20000, g + 0x24000, g + 0x28000,
+    );
+    let p = CTX_PIPELINE_BASE + 0x10000;
+    let (va_shader, va_usc) = (p, p + 0x04000);
+
+    // --- build object contents (VAs known, so refs resolve) ---
+    // USC: bind arg buffer → uniforms, shared_none, shader code, reg count.
+    let mut usc = cdm::UscStream::new();
+    usc.uniform(0, shaders::HELLO_COMPUTE_UNIFORM_HALFS, va_arg);
+    usc.shared_none();
+    usc.shader((va_shader - CTX_PIPELINE_BASE) as u32);
+    usc.registers(shaders::HELLO_COMPUTE_GPRS, 0);
+    usc.no_preshader();
+
+    // CDM command stream: launch 1×1×1 thread of the USC pipeline.
+    let mut cdm_buf = alloc::vec::Vec::new();
+    cdm_buf.extend_from_slice(&cdm::cdm_launch_word0(shaders::HELLO_COMPUTE_UNIFORM_HALFS, 0, 0, 0, cdm::MODE_DIRECT).to_le_bytes());
+    cdm_buf.extend_from_slice(&cdm::cdm_launch_word1((va_usc & 0xffff_ffff) as u32).to_le_bytes());
+    for w in cdm::cdm_size(1, 1, 1) {
+        cdm_buf.extend_from_slice(&w.to_le_bytes());
+    }
+    for w in cdm::cdm_size(1, 1, 1) {
+        cdm_buf.extend_from_slice(&w.to_le_bytes());
+    }
+    cdm_buf.extend_from_slice(&cdm::cdm_barrier().to_le_bytes());
+
+    // Microsequence (references the WorkCommandCP's inline params + the queue).
+    let ms = workcmd::microseq_compute(&MicroSeqRefs {
+        job_params1: va_wc + 0x70,
+        job_params2: va_wc + 0x1fc,
+        work_queue: va_qi,
+        vm_slot: ctx.ctx_id as u32,
+        uuid: 1,
+        ..Default::default()
+    });
+
+    // WorkCommandCP.
+    let wc = workcmd::run_compute(&ComputeCmd {
+        vm_slot: ctx.ctx_id as u32,
+        notifier: va_nl,
+        encoder: va_cdm,
+        pipeline_base: CTX_PIPELINE_BASE,
+        encoder_end: va_cdm + cdm_buf.len() as u64,
+        encoder_id: 1,
+        microsequence: va_ms,
+        microsequence_size: ms.len() as u32,
+        uuid: 1,
+        stamp_value: 0,
+    });
+
+    // Command queue: RingState (wptr=1), a ring whose entry 0 = the WorkCommandCP.
+    let rs = workcmd::ring_state(1, 0x80);
+    let mut ring = alloc::vec![0u8; 0x80 * 8];
+    ring[..8].copy_from_slice(&va_wc.to_le_bytes());
+    let qi = workcmd::queue_info(&QueueRefs {
+        state: va_rs,
+        ring: va_ring,
+        notifier_list: va_nl,
+        gpu_buf: va_gbuf,
+        gpu_context: va_gctx,
+        uuid: 1,
+        event_id: 0,
+    });
+    let arg = va_out.to_le_bytes();
+
+    // --- place everything ---
+    let ok = place(&ctx, va_shader, shaders::HELLO_COMPUTE, true).is_some()
+        && place(&ctx, va_usc, &usc.bytes, true).is_some()
+        && place(&ctx, va_cdm, &cdm_buf, false).is_some()
+        && place(&ctx, va_ms, &ms, false).is_some()
+        && place(&ctx, va_wc, &wc, false).is_some()
+        && place(&ctx, va_rs, &rs, false).is_some()
+        && place(&ctx, va_ring, &ring, false).is_some()
+        && place(&ctx, va_gbuf, &[], false).is_some()
+        && place(&ctx, va_nl, &[], false).is_some()
+        && place(&ctx, va_gctx, &[], false).is_some()
+        && place(&ctx, va_qi, &qi, false).is_some();
+    let out_phys = place(&ctx, va_out, &arg, false); // out buffer (also holds nothing yet)
+    let Some(out_phys) = out_phys else {
+        crate::ktrace::log("agx", "compute: out buffer alloc failed");
+        return;
+    };
+    // Overwrite the out buffer with the arg (out_ptr) at va_arg, keep va_out zeroed.
+    let Some(_arg_phys) = place(&ctx, va_arg, &arg, false) else { return };
+    if !ok {
+        crate::ktrace::log("agx", "compute: object placement failed (OOM/map)");
+        return;
+    }
+    // Zero the output slot so a stale value can't masquerade as success.
+    // SAFETY: out_phys is our identity-mapped page.
+    unsafe { core::ptr::write_volatile(out_phys as *mut u32, 0) };
+    dcache_clean(out_phys, 4);
+    crate::ktrace::log_fmt(format_args!(
+        "agx: compute: ctx {} objects placed — shader@{va_shader:#x} usc@{va_usc:#x} cdm@{va_cdm:#x} wc@{va_wc:#x} qi@{va_qi:#x}",
+        ctx.ctx_id
+    ));
+
+    // --- submit RunCmdQueueMsg on the CP channel (CL_0, id 2) + doorbell ---
+    let msg = workcmd::run_cmd_queue_msg(workcmd::QUEUE_COMPUTE, va_qi, 1, 1, true);
+    let wptr = gpu_read_u32(CL0_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
+    let slot = CL0_RING_VA + CL0_ITEM * (wptr as u64);
+    if gpu_write(slot, &msg) != msg.len() {
+        crate::ktrace::log("agx", "compute: CL_0 ring slot unmapped");
+        return;
+    }
+    gpu_write_u32(CL0_STATE_VA + STATE_WRITE_PTR, wptr + 1);
+    crate::ktrace::log_fmt(format_args!("agx: compute: submitted on CP channel — CL_0 WRITE_PTR {}->{}, doorbell {CL0_CHANNEL:#x}", wptr, wptr + 1));
+
+    let Some(base) = discover_asc_base() else {
+        crate::ktrace::log("agx", "compute: ASC not available");
+        return;
+    };
+    // SAFETY: `base` is the discovered ASC MMIO base (mapped during `up`).
+    let asc = unsafe { Asc::new(base as usize) };
+    let _ = send(&asc, proto::msg_doorbell(CL0_CHANNEL), proto::EP_DOORBELL);
+    // A general kick (0x10) nudges the firmware to pump its channels.
+    let _ = send(&asc, proto::msg_doorbell(0x10), proto::EP_DOORBELL);
+
+    // --- poll the output buffer for the magic + watch for a GPU fault ---
+    let deadline = crate::arch::now_ms() + 3000;
+    let mut got = 0u32;
+    while crate::arch::now_ms() < deadline {
+        pump();
+        dcache_invalidate(out_phys, 4);
+        // SAFETY: out_phys is our identity-mapped page.
+        got = unsafe { core::ptr::read_volatile(out_phys as *const u32) };
+        if got == shaders::HELLO_COMPUTE_MAGIC {
+            break;
+        }
+        if ABORT.load(core::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+    }
+    if got == shaders::HELLO_COMPUTE_MAGIC {
+        crate::ktrace::log_fmt(format_args!(
+            "agx: compute: *** GPU DISPATCH SUCCEEDED *** out[0]={got:#x} (== HELLO_COMPUTE_MAGIC)"
+        ));
+    } else {
+        crate::ktrace::log_fmt(format_args!(
+            "agx: compute: no result — out[0]={got:#x} (want {:#x}). Dumping GPU fault state:",
+            shaders::HELLO_COMPUTE_MAGIC
+        ));
+        sgx_fault_check();
+        let cl0_rd = gpu_read_u32(CL0_STATE_VA).unwrap_or(0);
+        let cl0_wr = gpu_read_u32(CL0_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
+        crate::ktrace::log_fmt(format_args!("agx: compute: CL_0 cursors read={cl0_rd:#x} write={cl0_wr:#x} (read advancing = firmware consumed the submit)"));
+    }
+}
+
 /// Bring up the AGX coprocessor. Gated on `is_apple()` + the `chitti.agx`
 /// bootarg; a clean no-op otherwise. Returns the human-facing summary line.
 fn up() -> Outcome {
@@ -1554,8 +1752,9 @@ pub fn command(arg: &str) {
         "status" | "info" => status(),
         "sgx" | "dump" => sgx_dump(),
         "ctx" => context_selftest(),
+        "compute" => dispatch_hello_compute(),
         other => {
-            crate::serial_println!("agx> unknown subcommand '{other}' (try: up | status | sgx | ctx)");
+            crate::serial_println!("agx> unknown subcommand '{other}' (try: up | status | sgx | ctx | compute)");
         }
     }
 }
