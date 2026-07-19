@@ -964,9 +964,14 @@ const CC_WD_COUNTER_MASK: u32 = 0x0fff_ffff;
 /// Must run **before** any core bring-up; re-check SYS_MEM `coreinfo` after.
 fn chip_subsystem_reset(bar0: u64, pci: &PciDevice, pcie2_rev: u8) {
     // 1. Disable ASPM (config LINK_STATUS_CTRL 0xbc, clear bits 0x3) so L1 entry
-    //    can't interrupt the reset.
+    //    can't interrupt the reset. A garbage all-ones read means the bus is
+    //    wedged (a prior aborting MEM read) — skip the ASPM dance then, but still
+    //    drive the watchdog (its writes are posted and land regardless).
     let lsc = crate::pci::read32(pci.bus, pci.dev, pci.func, CFG_LINK_STATUS_CTRL);
-    crate::pci::write32(pci.bus, pci.dev, pci.func, CFG_LINK_STATUS_CTRL, lsc & !0x3);
+    let aspm_ok = lsc != 0xffff_ffff;
+    if aspm_ok {
+        crate::pci::write32(pci.bus, pci.dev, pci.func, CFG_LINK_STATUS_CTRL, lsc & !0x3);
+    }
 
     // 2. Subsystem watchdog reset — keep host F0 alive; older PCIE2 (rev < 66)
     //    also needs ALL_FN_EN.
@@ -986,10 +991,40 @@ fn chip_subsystem_reset(bar0: u64, pci: &PciDevice, pcie2_rev: u8) {
     bp_write32(bar0, pci, cc + CC_INTSTATUS, is | mask);
 
     // 4. Restore ASPM.
-    crate::pci::write32(pci.bus, pci.dev, pci.func, CFG_LINK_STATUS_CTRL, lsc);
+    if aspm_ok {
+        crate::pci::write32(pci.bus, pci.dev, pci.func, CFG_LINK_STATUS_CTRL, lsc);
+    }
     crate::ktrace::log_fmt(format_args!(
-        "wifi: subsystem SSRESET (mask={mask:#x} pcie2_rev={pcie2_rev} lsc={lsc:#x}) — re-powers RAM domain"
+        "wifi: subsystem SSRESET (mask={mask:#x} pcie2_rev={pcie2_rev} lsc={lsc:#x} aspm_ok={aspm_ok})"
     ));
+}
+
+// PMU resource masks (chipcommon, Asahi include/chipcommon.h).
+const CC_MIN_RES_MASK: u32 = 0x61c;
+const CC_MAX_RES_MASK: u32 = 0x620;
+
+/// Force every PMU resource up by copying `max_res_mask` → `min_res_mask`. The
+/// sledgehammer power-up (si_pmu_res_init style) that directly powers the
+/// SYS_MEM/RAM domain when the subsystem SSRESET alone doesn't restore the PMU
+/// defaults. Returns `(max, min_before, min_after)` for diagnosis.
+fn force_pmu_resources(
+    bar0: u64,
+    pci: &PciDevice,
+) -> (Option<u32>, Option<u32>, Option<u32>) {
+    let cc = proto::SI_ENUM_BASE;
+    let max = bp_read32_probe(bar0, pci, cc + CC_MAX_RES_MASK);
+    let before = bp_read32_probe(bar0, pci, cc + CC_MIN_RES_MASK);
+    if let Some(m) = max {
+        if m != 0 && m != 0xffff_ffff {
+            bp_write32(bar0, pci, cc + CC_MIN_RES_MASK, m);
+        }
+    }
+    mdelay(10);
+    let after = bp_read32_probe(bar0, pci, cc + CC_MIN_RES_MASK);
+    crate::ktrace::log_fmt(format_args!(
+        "wifi: force PMU resources: max_res={max:?} min_res {before:?} -> {after:?}"
+    ));
+    (max, before, after)
 }
 
 // SYS_MEM / SOCRAM register offsets (Linux `sbsocramregs`).
@@ -1096,7 +1131,10 @@ fn download_fw_nvram(
     //    PMU defaults. Nothing reset the function on a bare m1n1 boot (the Apple
     //    PCIe root port would normally PERST# the chip), so the RAM domain is
     //    gated off and TCM/SYS_MEM don't decode. Keeps the host F0 link alive.
+    //    Follow with a PMU resource force (max→min) as a belt-and-suspenders
+    //    power-up in case SSRESET didn't restore the default mask.
     chip_subsystem_reset(dev.bar0, &dev.pci, cores.pcie2_rev);
+    let _ = force_pmu_resources(dev.bar0, &dev.pci);
 
     // 1. Halt ARM so TCM is ours (brcmf_chip_set_passive → disable_arm CA7).
     //    The per-core FGC|CLK in ai_core_reset is the only clock force needed;
@@ -1535,170 +1573,79 @@ fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
     // recoverable external abort (None), not an unrecoverable translation fault.
     crate::arch::aarch64::mmu::map_device_gib(bar2);
 
-    let read_at = |off: u32| crate::arch::aarch64::probe_read32(bar2 + off as u64);
-    // Write+readback poke: distinguishes a real backing store (value sticks)
-    // from a posted-write-into-void (write "ok", read aborts).
-    let poke_at = |off: u32| -> (bool, Option<u32>) {
-        let magic = 0x4b4f_5445u32 ^ off; // 'KOTE' ^ off
-        let w = tcm_bar2_probe_write32(bar2, off, magic);
-        // SAFETY: order the store before the load on the same Device location.
-        unsafe {
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-        }
-        let rb = tcm_bar2_probe_read32(bar2, off);
-        let _ = tcm_bar2_probe_write32(bar2, off, 0);
-        (w, rb)
-    };
+    // ORDERING IS LOAD-BEARING: an external abort on the Apple APCIE bus wedges
+    // subsequent config/backplane access, so ALL potentially-aborting BAR2/TCM
+    // reads run LAST. The power-up + bring-up run first, on a clean bus.
 
-    let (w0, r0) = poke_at(0);
-    let (wr, rr) = poke_at(0x74_0000);
-    out.push(format!(
-        "BAR2 poke @0: write_ok={w0} read={r0:?} (want {:#x}) | @rambase(0x740000): write_ok={wr} read={rr:?} (want {:#x})",
-        0x4b4f_5445u32,
-        0x4b4f_5445u32 ^ 0x74_0000,
-    ));
-    out.push(format!(
-        "BAR2 plain read: @0={:?} @1M={:?} @rambase={:?}",
-        read_at(0),
-        read_at(0x10_0000),
-        read_at(0x74_0000),
-    ));
-
-    let rambase_ok = rr.is_some();
-
-    // ── DECISIVE: BAR2 relocation sweep ───────────────────────────────────
-    // BAR0 reads work at *its* CPU base, so the outbound window is live there.
-    // BAR2 maps the dongle's TCM regardless of where its base is programmed, so
-    // if BAR2 reads at ANY base inside the proven window, the TCM/device side is
-    // fine and the only bug is placement (BAR2 sat at a base the window doesn't
-    // translate — e.g. the very bottom edge below m1n1's axi2af start). If BAR2
-    // aborts at EVERY base, it is device-side (TCM/SYS_MEM not up).
-    // All config writes are restored afterward; reads are recoverable.
-    let orig_bar2_lo = crate::pci::read32(pci.bus, pci.dev, pci.func, 0x18);
-    let orig_bar2_hi = crate::pci::read32(pci.bus, pci.dev, pci.func, 0x1c);
-    let bar2_type = orig_bar2_lo & 0xf;
-    // PCI bases inside the non-pref bridge window (0xc000_0000..0xfff0_0000),
-    // spread across it, all above BAR0's slot to avoid a collision.
-    let sweep_bases = [0xc200_0000u64, 0xc400_0000, 0xc800_0000, 0xe000_0000];
-    let mut reloc_hit: Option<(u64, u64)> = None; // (pci_base, cpu_base)
-    for &b in &sweep_bases {
-        let cmd = crate::pci::read32(pci.bus, pci.dev, pci.func, 0x04);
-        crate::pci::write32(pci.bus, pci.dev, pci.func, 0x04, cmd & !0b10);
-        pci.program_bar64(2, b, bar2_type);
-        crate::pci::write32(pci.bus, pci.dev, pci.func, 0x04, cmd | 0b110);
-        let _ = crate::pci::read32(pci.bus, pci.dev, pci.func, 0x04);
-        // SAFETY: order the config writes before the MEM probe.
-        unsafe {
-            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-        }
-        let cpu = crate::arch::aarch64::apple_pcie::bar_to_cpu(b);
-        crate::arch::aarch64::mmu::map_device_gib(cpu);
-        let z = crate::arch::aarch64::probe_read32(cpu);
-        let ram = crate::arch::aarch64::probe_read32(cpu + 0x74_0000);
-        out.push(format!(
-            "BAR2 relocate pci={b:#x} cpu={cpu:#x}: @0={z:?} @rambase={ram:?}"
-        ));
-        if reloc_hit.is_none() && (z.is_some() || ram.is_some()) {
-            reloc_hit = Some((b, cpu));
-        }
-    }
-    // Restore original BAR2 placement so /wifi load keeps working.
-    let cmd = crate::pci::read32(pci.bus, pci.dev, pci.func, 0x04);
-    crate::pci::write32(pci.bus, pci.dev, pci.func, 0x04, cmd & !0b10);
-    crate::pci::write32(pci.bus, pci.dev, pci.func, 0x18, orig_bar2_lo);
-    crate::pci::write32(pci.bus, pci.dev, pci.func, 0x1c, orig_bar2_hi);
-    crate::pci::write32(pci.bus, pci.dev, pci.func, 0x04, cmd | 0b110);
-    let _ = crate::pci::read32(pci.bus, pci.dev, pci.func, 0x04);
-
-    // ── SYS_MEM (CA7 RAM) state via the SI backplane window ────────────────
+    // ── 1. Discover cores (EROM reads — clean) ─────────────────────────────
     let cores = discover_cores(bar0, &pci);
     out.push(format!(
-        "cores: arm id={:#x} wrap={:#x} up={:?} | sysmem base={:#x} wrap={:#x} rev={} up={:?}",
-        cores.arm_id,
-        cores.arm_wrap,
-        ai_iscoreup(bar0, &pci, cores.arm_wrap),
-        cores.sysmem_base,
-        cores.sysmem_wrap,
-        cores.sysmem_rev,
-        ai_iscoreup(bar0, &pci, cores.sysmem_wrap),
+        "cores: arm id={:#x} wrap={:#x} | sysmem base={:#x} wrap={:#x} rev={} | pcie2_rev={}",
+        cores.arm_id, cores.arm_wrap, cores.sysmem_base, cores.sysmem_wrap,
+        cores.sysmem_rev, cores.pcie2_rev,
     ));
 
-    // Config-space Broadcom register dump (always reachable — config space, not
-    // the clock-gated MEM window) — shows the chip's true clock/window state.
-    let rd = |o: u16| crate::pci::read32(pci.bus, pci.dev, pci.func, o);
+    // ── 2. Power up the RAM domain on a CLEAN bus (no aborting read yet) ────
+    // Subsystem SSRESET first (writes only, posted). Then read SYS_MEM coreinfo.
+    // If still dead, force all PMU resources and re-read.
+    chip_subsystem_reset(bar0, &pci, cores.pcie2_rev);
+    let ci_ss = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
     out.push(format!(
-        "cfg regs: BAR0_WIN(80)={:#x} BAR1_WIN(84)={:#x} SPROM(88)={:#x} SUBSYS(8c)={:#x} INTMASK(94)={:#x} CLK_CTL(a8)={:#x} LINKCTL(bc)={:#x}",
-        rd(0x80), rd(0x84), rd(0x88), rd(0x8c), rd(0x94), rd(0xa8), rd(0xbc),
+        "SYS_MEM coreinfo after SSRESET={ci_ss:?} (want a real value, not None/0xffffffff)"
     ));
-    // Core-liveness probe via the BAR0 window: read each core's first register.
-    // A live/in-reset core returns a real value; a powered-OFF core reads
-    // 0xffffffff or aborts (None). Distinguishes a power-domain gate from reset.
-    out.push(format!(
-        "core probe: cc@18000000={:?} pcie2@18001000={:?} ca7@18020000={:?} d11@18021000={:?} sysmem@18024000={:?} gci@18010000={:?} pmu@18012000={:?}",
-        bp_read32_probe(bar0, &pci, 0x1800_0000),
-        bp_read32_probe(bar0, &pci, 0x1800_1000),
-        bp_read32_probe(bar0, &pci, 0x1802_0000),
-        bp_read32_probe(bar0, &pci, 0x1802_1000),
-        bp_read32_probe(bar0, &pci, 0x1802_4000),
-        bp_read32_probe(bar0, &pci, 0x1801_0000),
-        bp_read32_probe(bar0, &pci, 0x1801_2000),
-    ));
-    let mut bringup_read: Option<u32> = None;
-    if cores.sysmem_base != 0 {
-        let ci_before = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
-        out.push(format!("SYS_MEM coreinfo(before)={ci_before:?}"));
-
-        // The decisive bring-up experiment (VERDICT b path). The RAM domain is
-        // power-gated off (SYS_MEM slave doesn't decode) because nothing reset
-        // the function. So, per the Asahi flow:
-        //  (0) subsystem SSRESET → re-powers the RAM domain via PMU defaults,
-        //  (1) verify SYS_MEM coreinfo now decodes,
-        //  (2) halt CA7 (set_passive), (3) ai_core_reset(SYS_MEM),
-        // then re-read TCM. None→Some ⇒ the sequence works and is in /wifi load.
-        crate::ktrace::log("wifi", "diag: SSRESET → verify SYS_MEM → CA7 halt → reset, re-test TCM");
-        chip_subsystem_reset(bar0, &pci, cores.pcie2_rev);
-        let ci_ssreset = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
-        let sm_slave = bp_read32_probe(bar0, &pci, cores.sysmem_base);
-        out.push(format!(
-            "SYS_MEM after SSRESET: coreinfo={ci_ssreset:?} slave@base={sm_slave:?} (want a real value, not None/0xffffffff)"
-        ));
-        if cores.arm_wrap != 0 {
-            arm_halt(bar0, &pci, cores.arm_wrap);
-        }
-        ai_core_reset(bar0, &pci, cores.sysmem_wrap, 0, 0, 0);
-        mdelay(3);
-        let ci_after = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
-        let up_after = ai_iscoreup(bar0, &pci, cores.sysmem_wrap);
-        out.push(format!(
-            "SYS_MEM coreinfo(after reset)={ci_after:?} up={up_after:?}"
-        ));
-        let rr_after = read_at(0x74_0000);
-        let r0_after = read_at(0);
-        out.push(format!(
-            "BAR2 read AFTER bring-up: @0={r0_after:?} @rambase={rr_after:?}"
-        ));
-        bringup_read = rr_after.or(r0_after);
+    let dead = |v: &Option<u32>| v.map(|x| x == 0xffff_ffff).unwrap_or(true);
+    if dead(&ci_ss) {
+        let (max, b, a) = force_pmu_resources(bar0, &pci);
+        out.push(format!("PMU force: max_res={max:?} min_res {b:?}->{a:?}"));
+        let ci_pmu = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
+        out.push(format!("SYS_MEM coreinfo after PMU force={ci_pmu:?}"));
     }
 
+    // ── 3. Bring-up: halt CA7 (set_passive) then reset SYS_MEM ──────────────
+    if cores.arm_wrap != 0 {
+        arm_halt(bar0, &pci, cores.arm_wrap);
+    }
+    if cores.sysmem_wrap != 0 {
+        ai_core_reset(bar0, &pci, cores.sysmem_wrap, 0, 0, 0);
+    }
+    mdelay(3);
+    let ci_after = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
+    let up_after = ai_iscoreup(bar0, &pci, cores.sysmem_wrap);
+    let sysmem_powered = !dead(&ci_after);
+    out.push(format!(
+        "SYS_MEM coreinfo after bring-up={ci_after:?} up={up_after:?} powered={sysmem_powered}"
+    ));
+
+    // ── 4. Config-space register dump (config reads, don't wedge) ──────────
+    let rd = |o: u16| crate::pci::read32(pci.bus, pci.dev, pci.func, o);
+    out.push(format!(
+        "cfg regs: BAR0_WIN(80)={:#x} BAR1_WIN(84)={:#x} INTMASK(94)={:#x} CLK_CTL(a8)={:#x} LINKCTL(bc)={:#x}",
+        rd(0x80), rd(0x84), rd(0x94), rd(0xa8), rd(0xbc),
+    ));
+
+    // ── 5. FINALLY: the money shot — read TCM (BAR2) after full bring-up ───
+    // These are the reads that abort/wedge, so they come last.
+    let read_at = |off: u32| crate::arch::aarch64::probe_read32(bar2 + off as u64);
+    let r0 = read_at(0);
+    let rr = read_at(0x74_0000);
+    out.push(format!(
+        "BAR2 read AFTER bring-up: @0={r0:?} @1M={:?} @rambase(0x740000)={rr:?}",
+        read_at(0x10_0000),
+    ));
+    let bringup_read = rr.or(r0);
+
     // ── Verdict ────────────────────────────────────────────────────────────
-    // BAR0 reads at its base prove the outbound window is live, so the sweep is
-    // authoritative: if BAR2 reads at some relocated base, TCM is up and the bug
-    // is placement; if it aborts everywhere, TCM is device-side down.
-    if rambase_ok {
+    if bringup_read.is_some() {
         out.push(
-            "VERDICT: BAR2 already readable at rambase — no read-abort blocker; proceed to /wifi load".into(),
+            "VERDICT FIXED: BAR2/TCM answered after SSRESET/PMU power-up + SYS_MEM reset. The same bring-up is wired into /wifi load — try it.".into(),
         );
-    } else if bringup_read.is_some() {
+    } else if sysmem_powered {
         out.push(
-            "VERDICT (b) FIXED: BAR2/TCM answered ONLY after force-clock + CA7-halt + SYS_MEM reset — the RAM was held in reset. The same bring-up is now wired into /wifi load; try it.".into(),
+            "VERDICT (progress): SYS_MEM RAM now POWERED + out of reset (coreinfo real) but TCM (BAR2) still aborts — the RAM is up; the remaining gap is the tcm-BAR mapping/enable, not power. Next: PCIE2 core BAR2 window config.".into(),
         );
-    } else if let Some((b, cpu)) = reloc_hit {
-        out.push(format!(
-            "VERDICT (a): PLACEMENT — BAR2 reads at pci={b:#x} (cpu={cpu:#x}) but not at its programmed base {bar2:#x}. The outbound window doesn't translate BAR2's current spot; fix = place BAR2 in the proven range (apple_pcie probe_bar_candidates)."
-        ));
     } else {
         out.push(
-            "VERDICT (b): DEVICE-SIDE — BAR2 aborts everywhere though BAR0 reads fine: window live, dongle RAM not up. force-clock + SYS_MEM reset did NOT wake it (see clk_ctl_st/coreinfo above) — needs PMU power-up or the full chip attach.".into(),
+            "VERDICT (b): DEVICE-SIDE — SYS_MEM RAM still not powered after SSRESET + PMU force (coreinfo above None/0xffffffff). Needs the PERST# hard-reset the Apple PCIe root port normally does, or a different power gate.".into(),
         );
     }
 
