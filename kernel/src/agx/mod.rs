@@ -30,7 +30,9 @@
 
 pub mod cdm;
 pub mod proto;
+pub mod shaders;
 pub mod uat;
+pub mod workcmd;
 
 /// ASC mailbox transport — shared by AGX and the SMC client (WiFi power).
 #[cfg(target_arch = "aarch64")]
