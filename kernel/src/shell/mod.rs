@@ -849,6 +849,20 @@ fn wifi_cmd(arg: &str) {
                 serial_println!("wifi> {line}");
             }
         }
+        "reset" => {
+            // Hard PERST# reset — forces a full chip reset so the dongle PMU
+            // re-powers the RAM domain (the in-band SSRESET/PMU-force can't).
+            serial_println!("wifi> hard PERST reset of the WiFi endpoint...");
+            match crate::drivers::wifi::hard_reset() {
+                Ok(()) => {
+                    serial_println!("wifi> reset OK — chip re-powered, BARs re-mapped. Now try /wifi diag");
+                    for line in crate::drivers::wifi::info_lines() {
+                        serial_println!("wifi> {line}");
+                    }
+                }
+                Err(e) => serial_println!("wifi> reset failed: {e}"),
+            }
+        }
         "scan" => {
             serial_println!("wifi> nearby networks:");
             match crate::drivers::wifi::scan() {

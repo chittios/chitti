@@ -219,6 +219,18 @@ pub fn load_firmware() -> Result<(), &'static str> {
     }
 }
 
+/// Hard PERST# reset of the WiFi endpoint (forces a full chip reset so the
+/// dongle PMU re-powers the SYS_MEM/RAM domain), then re-probe/re-map BARs.
+pub fn hard_reset() -> Result<(), &'static str> {
+    #[cfg(all(target_arch = "aarch64", not(test)))]
+    {
+        if crate::arch::aarch64::is_apple() {
+            return brcm::hard_reset();
+        }
+    }
+    Err("Apple Wi-Fi hard reset is aarch64-only")
+}
+
 /// Decisive on-hardware diagnostic for the BAR2/TCM read-abort blocker.
 /// Returns human-readable lines (also mirrored to ktrace). Apple-only.
 pub fn diag() -> Vec<String> {

@@ -969,6 +969,72 @@ pub fn retry_wifi_power() -> bool {
     power_wifi_and_wait_link(fdt_end)
 }
 
+/// **Hard PERST# reset** of the WiFi endpoint, then retrain the link.
+///
+/// This is the reset the Apple PCIe root port normally performs when the port
+/// comes up (`pcie-apple.c`), and it is what leaves the dongle's PMU at defaults
+/// with the SYS_MEM/RAM domain **powered**. Our normal bring-up takes the "light
+/// path" (skips PERST when the link is already up, to preserve the MEM outbound
+/// window), which means the chip is never actually reset — so its RAM domain
+/// stays gated off and TCM/SYS_MEM don't decode (diagnosed via `/wifi diag`:
+/// SSRESET + PMU-force both fail to power SYS_MEM).
+///
+/// Forces the full GPIO + PORT_PERST cycle unconditionally, re-applies the
+/// axi2af/RC tunables (a PERST retrain clears them, which otherwise leaves MEM
+/// outbound dead), waits for link, and reprograms the WiFi root-port windows.
+/// The endpoint config is reset by this — the caller MUST re-probe/re-map BARs
+/// afterward. Returns true if the link came back up. Bounded + pumps upkeep.
+pub fn hard_reset_wifi_port() -> bool {
+    if !REPORT.with(|r| r.ready) {
+        return init() && REPORT.with(|r| r.link_up);
+    }
+    let port0 = REPORT.with(|r| r.port0);
+    let port_phy = REPORT.with(|r| r.port0_phy);
+    let mut pinctrl = REPORT.with(|r| r.pinctrl);
+    if !is_plausible_mmio(port0) {
+        crate::ktrace::log_fmt(format_args!(
+            "pcie: hard reset refused — port0={port0:#x} not plausible MMIO"
+        ));
+        return false;
+    }
+    if pinctrl == 0 || !is_plausible_mmio(pinctrl) {
+        pinctrl = discover_pinctrl_ap();
+        if is_plausible_mmio(pinctrl) {
+            crate::arch::aarch64::mmu::map_device_gib(pinctrl);
+            REPORT.with(|r| r.pinctrl = pinctrl);
+        }
+    }
+    crate::ktrace::log(
+        "pcie",
+        "HARD PERST# reset of WiFi endpoint (force full chip reset so PMU re-powers RAM)",
+    );
+
+    // SMC power stays on (airplane rail); ensure clocks then full PERST cycle.
+    let app = r32(port0 + PORT_APPCLK as u64);
+    w32(port0 + PORT_APPCLK as u64, app | PORT_APPCLK_EN);
+    port_perst_cycle_and_ltssm(port0, port_phy, pinctrl);
+    // A PERST retrain clears the axi2af/RC/config tunables m1n1 applied — without
+    // re-applying them MEM outbound stays dead even though config works.
+    reapply_host_tunables();
+    let (up, st, ls) = wait_link(port0, LINK_WAIT_MS, "port0-hardreset");
+    configure_wifi_root_only();
+    let bus_end = if up {
+        REPORT.with(|r| if r.bus_end > 0 { r.bus_end } else { 4 })
+    } else {
+        0
+    };
+    crate::pci::init(REPORT.with(|r| r.ecam), bus_end);
+    REPORT.with(|r| {
+        r.bus_end = bus_end;
+        r.link_up = up;
+    });
+    crate::ktrace::log_fmt(format_args!(
+        "pcie: hard reset done link={} STATUS={st:#x} LINKSTS={ls:#x}",
+        if up { "up" } else { "DOWN" }
+    ));
+    up
+}
+
 /// Translate a PCI BAR **bus** address to a CPU physical address using the
 /// t8112 `ranges` (Asahi `t8112.dtsi`):
 ///

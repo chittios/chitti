@@ -1507,6 +1507,28 @@ fn read_file_bytes(path: &str) -> Result<Vec<u8>, ()> {
     crate::synapse::fs::read(path).ok_or(())
 }
 
+/// **Hard PERST# reset** of the WiFi endpoint, then re-probe/re-map BARs.
+///
+/// This resets the whole dongle chip so its on-chip PMU re-sequences and
+/// **re-powers the SYS_MEM/RAM domain** — the only lever that works, since the
+/// in-band subsystem SSRESET and PMU-mask force both fail to power it (the PMU
+/// registers themselves are unreachable; see `/wifi diag`). It is the reset the
+/// Apple PCIe root port normally performs but our light-path link bring-up
+/// skips. PERST resets the endpoint config, so we drop the stale device record
+/// and re-run `probe()` to re-size and re-place the BARs afterward.
+pub fn hard_reset() -> Result<(), &'static str> {
+    if !crate::arch::aarch64::apple_pcie::hard_reset_wifi_port() {
+        return Err("PERST hard reset: link did not come back up (see ktrace)");
+    }
+    // Endpoint config was reset by PERST — drop the record and re-probe.
+    DEV.with(|d| *d = None);
+    if probe() {
+        Ok(())
+    } else {
+        Err("re-probe after hard reset failed — BARs not re-mapped (see ktrace)")
+    }
+}
+
 /// Is an AI core out of reset and clocked? Linux `brcmf_chip_ai_iscoreup`:
 /// IOCTL has CLK set (and not stuck in FGC-only) and RESET_CTL.RESET clear.
 /// Reads recoverably through the BAR0 backplane window; `None` when the wrap
