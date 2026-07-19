@@ -887,6 +887,9 @@ struct ChipCores {
     sysmem_base: u32,
     sysmem_wrap: u32,
     sysmem_rev: u8,
+    /// PCIE2 core rev — selects the watchdog SSRESET gating mask (rev < 66 must
+    /// also set CC_WD_SSRESET_PCIE_ALL_FN_EN). 0 if the core wasn't found.
+    pcie2_rev: u8,
 }
 
 /// Scan the DMP EROM for ARM + SYS_MEM cores.
@@ -902,6 +905,7 @@ fn discover_cores(bar0: u64, pci: &PciDevice) -> ChipCores {
         sysmem_base: 0,
         sysmem_wrap: 0,
         sysmem_rev: 0,
+        pcie2_rev: 0,
     };
     let erom_ptr = bp_read32_probe(bar0, pci, proto::SI_ENUM_BASE + proto::CC_EROMPTR)
         .unwrap_or(0);
@@ -932,7 +936,60 @@ fn discover_cores(bar0: u64, pci: &PciDevice) -> ChipCores {
         out.sysmem_wrap = sm.wrap;
         out.sysmem_rev = sm.rev;
     }
+    if let Some(pc) = cores.iter().find(|c| c.id == proto::BCMA_CORE_PCIE2) {
+        out.pcie2_rev = pc.rev;
+    }
     out
+}
+
+// Chipcommon watchdog + intstatus (Asahi brcmfmac include/chipcommon.h).
+const CC_WATCHDOG: u32 = 0x80;
+const CC_INTSTATUS: u32 = 0x20;
+const CC_WD_SSRESET_PCIE_F0_EN: u32 = 0x1000_0000;
+const CC_WD_SSRESET_PCIE_ALL_FN_EN: u32 = 0x8000_0000;
+const CC_WD_ENABLE_MASK: u32 = 0xf000_0000;
+const CC_WD_COUNTER_MASK: u32 = 0x0fff_ffff;
+
+/// Subsystem watchdog **SSRESET** (chipcommon rev ≥ 65 path, `brcmf_pcie_reset_device`).
+///
+/// This is the reset the Apple PCIe root port normally performs (PERST#) before
+/// the driver ever runs — it re-runs the on-chip PMU's default resource masks,
+/// which **power the SYS_MEM / RAM domain**. On our bare m1n1 boot the link came
+/// up but nothing reset the function, so the RAM domain is gated off (SYS_MEM's
+/// slave port doesn't even decode — `coreinfo` reads 0xffffffff then aborts once
+/// we force a clock into the unpowered core). Gated by `CC_WD_SSRESET_PCIE_F0_EN`
+/// so the **host PCIe F0 link survives** — this resets only the WL subsystem, not
+/// the whole chip (a full chip reset would drop the link and need re-enumeration).
+///
+/// Must run **before** any core bring-up; re-check SYS_MEM `coreinfo` after.
+fn chip_subsystem_reset(bar0: u64, pci: &PciDevice, pcie2_rev: u8) {
+    // 1. Disable ASPM (config LINK_STATUS_CTRL 0xbc, clear bits 0x3) so L1 entry
+    //    can't interrupt the reset.
+    let lsc = crate::pci::read32(pci.bus, pci.dev, pci.func, CFG_LINK_STATUS_CTRL);
+    crate::pci::write32(pci.bus, pci.dev, pci.func, CFG_LINK_STATUS_CTRL, lsc & !0x3);
+
+    // 2. Subsystem watchdog reset — keep host F0 alive; older PCIE2 (rev < 66)
+    //    also needs ALL_FN_EN.
+    let mut mask = CC_WD_SSRESET_PCIE_F0_EN;
+    if pcie2_rev != 0 && pcie2_rev < 66 {
+        mask |= CC_WD_SSRESET_PCIE_ALL_FN_EN;
+    }
+    let cc = proto::SI_ENUM_BASE;
+    let cur = bp_read32_probe(bar0, pci, cc + CC_WATCHDOG).unwrap_or(0);
+    let v = (cur & !CC_WD_ENABLE_MASK) | mask;
+    bp_write32(bar0, pci, cc + CC_WATCHDOG, v);
+    let v = (v & !CC_WD_COUNTER_MASK) | 4;
+    bp_write32(bar0, pci, cc + CC_WATCHDOG, v);
+    mdelay(10);
+    // 3. Ack the watchdog interrupt.
+    let is = bp_read32_probe(bar0, pci, cc + CC_INTSTATUS).unwrap_or(0);
+    bp_write32(bar0, pci, cc + CC_INTSTATUS, is | mask);
+
+    // 4. Restore ASPM.
+    crate::pci::write32(pci.bus, pci.dev, pci.func, CFG_LINK_STATUS_CTRL, lsc);
+    crate::ktrace::log_fmt(format_args!(
+        "wifi: subsystem SSRESET (mask={mask:#x} pcie2_rev={pcie2_rev} lsc={lsc:#x}) — re-powers RAM domain"
+    ));
 }
 
 // SYS_MEM / SOCRAM register offsets (Linux `sbsocramregs`).
@@ -1034,6 +1091,12 @@ fn download_fw_nvram(
     let cores = discover_cores(dev.bar0, &dev.pci);
     dev.arm_core_id = cores.arm_id;
     dev.arm_wrap = cores.arm_wrap;
+
+    // 0. Subsystem SSRESET — re-powers the SYS_MEM/RAM domain via the on-chip
+    //    PMU defaults. Nothing reset the function on a bare m1n1 boot (the Apple
+    //    PCIe root port would normally PERST# the chip), so the RAM domain is
+    //    gated off and TCM/SYS_MEM don't decode. Keeps the host F0 link alive.
+    chip_subsystem_reset(dev.bar0, &dev.pci, cores.pcie2_rev);
 
     // 1. Halt ARM so TCM is ours (brcmf_chip_set_passive → disable_arm CA7).
     //    The per-core FGC|CLK in ai_core_reset is the only clock force needed;
@@ -1585,12 +1648,20 @@ fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
         let ci_before = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
         out.push(format!("SYS_MEM coreinfo(before)={ci_before:?}"));
 
-        // The decisive bring-up experiment (VERDICT b path), per the Asahi
-        // brcmfmac sequence: (1) halt the ARM CA7 (set_passive) so we own the
-        // RAM, (2) take SYS_MEM out of reset with ai_core_reset (its FGC|CLK is
-        // the entire clock force — no separate clock register), then re-read the
-        // same TCM location. None→Some ⇒ the sequence works and is in /wifi load.
-        crate::ktrace::log("wifi", "diag: CA7 halt + SYS_MEM reset (Asahi seq), re-test TCM");
+        // The decisive bring-up experiment (VERDICT b path). The RAM domain is
+        // power-gated off (SYS_MEM slave doesn't decode) because nothing reset
+        // the function. So, per the Asahi flow:
+        //  (0) subsystem SSRESET → re-powers the RAM domain via PMU defaults,
+        //  (1) verify SYS_MEM coreinfo now decodes,
+        //  (2) halt CA7 (set_passive), (3) ai_core_reset(SYS_MEM),
+        // then re-read TCM. None→Some ⇒ the sequence works and is in /wifi load.
+        crate::ktrace::log("wifi", "diag: SSRESET → verify SYS_MEM → CA7 halt → reset, re-test TCM");
+        chip_subsystem_reset(bar0, &pci, cores.pcie2_rev);
+        let ci_ssreset = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
+        let sm_slave = bp_read32_probe(bar0, &pci, cores.sysmem_base);
+        out.push(format!(
+            "SYS_MEM after SSRESET: coreinfo={ci_ssreset:?} slave@base={sm_slave:?} (want a real value, not None/0xffffffff)"
+        ));
         if cores.arm_wrap != 0 {
             arm_halt(bar0, &pci, cores.arm_wrap);
         }
@@ -1599,7 +1670,7 @@ fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
         let ci_after = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
         let up_after = ai_iscoreup(bar0, &pci, cores.sysmem_wrap);
         out.push(format!(
-            "SYS_MEM coreinfo(after)={ci_after:?} up={up_after:?}"
+            "SYS_MEM coreinfo(after reset)={ci_after:?} up={up_after:?}"
         ));
         let rr_after = read_at(0x74_0000);
         let r0_after = read_at(0);
