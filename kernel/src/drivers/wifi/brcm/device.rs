@@ -830,24 +830,6 @@ fn ai_core_reset(bar0: u64, pci: &PciDevice, wrap: u32, prereset: u32, reset: u3
     mdelay(1);
 }
 
-// Broadcom WLANCfgSpace indirect-backplane access (PCI config space, always
-// reachable — independent of the BAR0 MEM window being clocked).
-const CFG_BACKPLANE_ADDR: u16 = 0x98;
-const CFG_BACKPLANE_DATA: u16 = 0x9c;
-
-/// Indirect backplane read via config space: write the full backplane address
-/// to BACKPLANE_ADDR (0x98), read the 32-bit word from BACKPLANE_DATA (0x9c).
-fn cfg_bp_read(pci: &PciDevice, addr: u32) -> u32 {
-    crate::pci::write32(pci.bus, pci.dev, pci.func, CFG_BACKPLANE_ADDR, addr);
-    crate::pci::read32(pci.bus, pci.dev, pci.func, CFG_BACKPLANE_DATA)
-}
-
-/// Indirect backplane write via config space.
-fn cfg_bp_write(pci: &PciDevice, addr: u32, val: u32) {
-    crate::pci::write32(pci.bus, pci.dev, pci.func, CFG_BACKPLANE_ADDR, addr);
-    crate::pci::write32(pci.bus, pci.dev, pci.func, CFG_BACKPLANE_DATA, val);
-}
-
 // Backplane clock control/status bits (`clk_ctl_st`). Same bit layout whether
 // reached via the chipcommon MEM window or PCI **config** space.
 const CCS_FORCEALP: u32 = 0x0000_0001;
@@ -866,7 +848,10 @@ const CCS_HTAVAIL: u32 = 0x0002_0000;
 /// The dongle RAM/SYS_MEM array (and thus its TCM aperture) only answers reads
 /// once HT is available. Returns the last `clk_ctl_st` read. Bounded + Ctrl+C.
 fn force_backplane_clock(pci: &PciDevice) -> u32 {
-    let before = crate::pci::read32(pci.bus, pci.dev, pci.func, CFG_CLK_CTL_ST);
+    let raw = crate::pci::read32(pci.bus, pci.dev, pci.func, CFG_CLK_CTL_ST);
+    // A wedged/unbacked read comes back all-ones — don't OR the force bits onto
+    // 0xffffffff (that sets every reserved bit). Start from a clean base then.
+    let before = if raw == 0xffff_ffff { 0 } else { raw };
     crate::pci::write32(
         pci.bus,
         pci.dev,
@@ -1623,17 +1608,6 @@ fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
         "cfg regs: BAR0_WIN(80)={:#x} BAR1_WIN(84)={:#x} SPROM(88)={:#x} SUBSYS(8c)={:#x} INTMASK(94)={:#x} BP_ADDR(98)={:#x} BP_DATA(9c)={:#x} CLK_CTL(a8)={:#x} LINKCTL(bc)={:#x}",
         rd(0x80), rd(0x84), rd(0x88), rd(0x8c), rd(0x94), rd(0x98), rd(0x9c), rd(0xa8), rd(0xbc),
     ));
-    // Indirect-backplane self-test: read chipcommon chipid (0x18000000) — a
-    // working path returns ~0x_..4388; garbage/0xffffffff means the mechanism
-    // or its windowing differs.
-    let cc_id = cfg_bp_read(&pci, proto::SI_ENUM_BASE);
-    let cc_clk = cfg_bp_read(&pci, proto::SI_ENUM_BASE + 0x1e0);
-    let sm_ci = cfg_bp_read(&pci, cores.sysmem_base + SYSMEM_COREINFO);
-    let pmu_ci = cfg_bp_read(&pci, 0x1801_2000);
-    out.push(format!(
-        "cfg-bp indirect: chipid@18000000={cc_id:#x} clk_ctl@180001e0={cc_clk:#x} sysmem_coreinfo={sm_ci:#x} pmu@18012000={pmu_ci:#x}"
-    ));
-
     let mut bringup_read: Option<u32> = None;
     if cores.sysmem_base != 0 {
         let ci_before = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
@@ -1651,15 +1625,6 @@ fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
             "clk_ctl_st(cfg0xa8)={clk:#x} ALPAVAIL={} HTAVAIL={}",
             clk & CCS_ALPAVAIL != 0,
             clk & CCS_HTAVAIL != 0
-        ));
-        // Alternate force via the indirect-backplane path (writes chipcommon
-        // clk_ctl_st directly, reachable even when the MEM window is dead).
-        cfg_bp_write(&pci, proto::SI_ENUM_BASE + 0x1e0, CCS_FORCEALP | CCS_FORCEHT);
-        mdelay(5);
-        let cc_clk2 = cfg_bp_read(&pci, proto::SI_ENUM_BASE + 0x1e0);
-        out.push(format!(
-            "clk_ctl via cfg-bp force={cc_clk2:#x} HTAVAIL={}",
-            cc_clk2 & CCS_HTAVAIL != 0
         ));
         if cores.arm_wrap != 0 {
             arm_halt(bar0, &pci, cores.arm_wrap);
