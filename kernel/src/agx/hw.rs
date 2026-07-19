@@ -1378,14 +1378,15 @@ fn boot_firmware(asc: &Asc, rep: &mut Report) {
     kick_devctrl(asc, &post_init);
 }
 
-// The compute (CP) cmdqueue channel. The proxyclient's working render example
-// (agx_1tri.py) submits on QUEUE INDEX 2 (channels 8/9/10), not queue 0 — queue 0
-// may be reserved/unmonitored. So we submit on **CL_2** = channel id (2<<2)|2 = 10.
-// Ring/state VAs from the initdata dump (in the replayed ranges → gpu_read/write).
-const CL_STATE_VA: u64 = 0xffffffa040223fd0; // CL_2 state
-const CL_RING_VA: u64 = 0xffffffa000220000; // CL_2 ring
+// The compute (CP) cmdqueue channel. drm/asahi's run_job rings
+// MSG_TX_DOORBELL | pipe_type | (priority<<2), where the index is PRIORITY (not a
+// queue index). Compute priority 0 → channel (0<<2)|2 = 2 = CL_0, the canonical
+// default. (An earlier experiment used CL_2/chan 10; the doorbell was never the
+// blocker.) Ring/state VAs from the initdata dump (replayed → gpu_read/write).
+const CL_STATE_VA: u64 = 0xffffffa04008bfd0; // CL_0 state
+const CL_RING_VA: u64 = 0xffffffa000088000; // CL_0 ring
 const CL_ITEM: u64 = 0x40; // RunCmdQueueMsg size
-const CL_CHANNEL: u16 = 10; // (queue 2 << 2) | compute(2)
+const CL_CHANNEL: u16 = 2; // (priority 0 << 2) | compute(2)
 // Stats channel state (firmware→AP) — re-read to confirm liveness during dispatch.
 const STATS_STATE_VA: u64 = 0xffffffa040563fd0;
 
@@ -1544,7 +1545,7 @@ fn dispatch_hello_compute() {
     // during the dispatch (it advanced during the DevCtrl kick).
     let stats_before = gpu_read_u32(STATS_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
 
-    // --- submit RunCmdQueueMsg on the CP channel (CL_2, id 10) + doorbell ---
+    // --- submit RunCmdQueueMsg on the CP channel (CL_0, id 2) + doorbell ---
     let msg = workcmd::run_cmd_queue_msg(workcmd::QUEUE_COMPUTE, va_qi, 1, 1, true);
     let wptr = gpu_read_u32(CL_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
     let slot = CL_RING_VA + CL_ITEM * (wptr as u64);
@@ -1553,7 +1554,7 @@ fn dispatch_hello_compute() {
         return;
     }
     gpu_write_u32(CL_STATE_VA + STATE_WRITE_PTR, wptr + 1);
-    crate::ktrace::log_fmt(format_args!("agx: compute: submitted on CP channel CL_2 — WRITE_PTR {}->{}, doorbell {CL_CHANNEL:#x}", wptr, wptr + 1));
+    crate::ktrace::log_fmt(format_args!("agx: compute: submitted on CP channel CL_0 — WRITE_PTR {}->{}, doorbell {CL_CHANNEL:#x}", wptr, wptr + 1));
 
     let Some(base) = discover_asc_base() else {
         crate::ktrace::log("agx", "compute: ASC not available");
@@ -1592,7 +1593,7 @@ fn dispatch_hello_compute() {
         sgx_fault_check();
         let cl_rd = gpu_read_u32(CL_STATE_VA).unwrap_or(0);
         let cl_wr = gpu_read_u32(CL_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
-        crate::ktrace::log_fmt(format_args!("agx: compute: CL_2 cursors read={cl_rd:#x} write={cl_wr:#x} (read==write ⇒ firmware consumed the submit)"));
+        crate::ktrace::log_fmt(format_args!("agx: compute: CL_0 cursors read={cl_rd:#x} write={cl_wr:#x} (read==write ⇒ firmware consumed the submit)"));
         // Firmware liveness during the dispatch: did Stats advance?
         let stats_after = gpu_read_u32(STATS_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
         crate::ktrace::log_fmt(format_args!(
