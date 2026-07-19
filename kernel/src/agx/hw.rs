@@ -1433,6 +1433,8 @@ fn dispatch_hello_compute() {
         g, g + 0x04000, g + 0x08000, g + 0x0c000, g + 0x10000, g + 0x14000, g + 0x18000,
         g + 0x1c000, g + 0x20000, g + 0x24000, g + 0x28000,
     );
+    // Event/notifier objects (a work queue the firmware will service needs these).
+    let (va_notifier, va_threshold) = (g + 0x2c000, g + 0x30000);
     let p = CTX_PIPELINE_BASE + 0x10000;
     let (va_shader, va_usc) = (p, p + 0x04000);
 
@@ -1464,13 +1466,14 @@ fn dispatch_hello_compute() {
         work_queue: va_qi,
         vm_slot: ctx.ctx_id as u32,
         uuid: 1,
+        notifier_buf: va_notifier + 0xa8, // NotifierState.unk_buf
         ..Default::default()
     });
 
     // WorkCommandCP.
     let wc = workcmd::run_compute(&ComputeCmd {
         vm_slot: ctx.ctx_id as u32,
-        notifier: va_nl,
+        notifier: va_notifier,
         encoder: va_cdm,
         pipeline_base: CTX_PIPELINE_BASE,
         encoder_end: va_cdm + cdm_buf.len() as u64,
@@ -1496,6 +1499,12 @@ fn dispatch_hello_compute() {
     });
     let arg = va_out.to_le_bytes();
 
+    // Valid event/notifier/context objects (the work-queue scheduler prerequisite).
+    let nl = workcmd::notifier_list(va_nl); // empty circular list (self-linked)
+    let notif = workcmd::notifier(va_threshold, ctx.ctx_id as u32);
+    let thr = workcmd::threshold();
+    let gctx = workcmd::gpu_context_data();
+
     // --- place everything (capture RingState phys for post-run read-back) ---
     let rs_phys = place(&ctx, va_rs, &rs, false);
     let ok = place(&ctx, va_shader, shaders::HELLO_COMPUTE, true).is_some()
@@ -1506,8 +1515,10 @@ fn dispatch_hello_compute() {
         && rs_phys.is_some()
         && place(&ctx, va_ring, &ring, false).is_some()
         && place(&ctx, va_gbuf, &[], false).is_some()
-        && place(&ctx, va_nl, &[], false).is_some()
-        && place(&ctx, va_gctx, &[], false).is_some()
+        && place(&ctx, va_nl, &nl, false).is_some()
+        && place(&ctx, va_gctx, &gctx, false).is_some()
+        && place(&ctx, va_notifier, &notif, false).is_some()
+        && place(&ctx, va_threshold, &thr, false).is_some()
         && place(&ctx, va_qi, &qi, false).is_some();
     let out_phys = place(&ctx, va_out, &arg, false); // out buffer (also holds nothing yet)
     let Some(out_phys) = out_phys else {

@@ -399,6 +399,58 @@ pub fn queue_info(q: &QueueRefs) -> Vec<u8> {
     b.bytes
 }
 
+// ===================== event / notifier / context (fw/event.rs, fw/workqueue.rs) =====================
+//
+// A work queue the firmware will SERVICE needs a valid notifier (where it posts
+// completion) + a per-context data block. Ported from drm/asahi queue/mod.rs
+// Queue::new. GpuWeakPointer/GpuPointer = 8 bytes (object.rs).
+
+/// `event::raw::NotifierList` (0x18): an empty circular list — `list_head.next`
+/// points back to its own `list_head` (at offset 0, so = `self_va`).
+pub fn notifier_list(self_va: u64) -> Vec<u8> {
+    let mut b = Buf::new();
+    b.u64(0); // list_head.prev = None
+    b.u64(self_va); // list_head.next = &self.list_head (offset 0)
+    b.u64(0); // unkptr_10
+    b.bytes // 0x18
+}
+
+/// `event::Threshold` — a bare AtomicU64 (the queue's completion counter). 8 zero
+/// bytes.
+pub fn threshold() -> Vec<u8> {
+    alloc::vec![0u8; 8]
+}
+
+/// `event::raw::Notifier` (G14/V13.5, 0xb0): threshold ptr + generation + counts +
+/// a zeroed NotifierState whose `unk_buf` (V>=13.0B4) is all-0xff.
+pub fn notifier(threshold_va: u64, generation: u32) -> Vec<u8> {
+    let mut b = Buf::new();
+    b.u64(threshold_va); // threshold        @0x00
+    b.u32(generation); // generation         @0x08
+    b.u32(0); // cur_count                    @0x0c
+    b.u32(0x50); // unk_10                     @0x10
+    // NotifierState (@0x14, size 0x9c): all zero except unk_buf = 0xff*8.
+    b.pad(0x9c);
+    // unk_buf is the last 8 bytes of the state → notifier offset 0xb0-8 = 0xa8.
+    let n = b.bytes.len();
+    for x in &mut b.bytes[n - 8..] {
+        *x = 0xff;
+    }
+    b.bytes // 0xb0
+}
+
+/// `workqueue::raw::GpuContextData` (0x40) with the driver's default field values
+/// (unk_0/1=0xff, unk_5=1, unk_1e=0xff, unk_23=2).
+pub fn gpu_context_data() -> Vec<u8> {
+    let mut b = alloc::vec![0u8; 0x40];
+    b[0x00] = 0xff; // unk_0
+    b[0x01] = 0xff; // unk_1
+    b[0x05] = 1; // unk_5
+    b[0x1e] = 0xff; // unk_1e
+    b[0x23] = 2; // unk_23
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +559,22 @@ mod tests {
         );
         // StartCompute.job_params1 @ +0x0c (header + unk_pointer).
         assert_eq!(rd64(&ms, 0x0c), 0x1000);
+    }
+
+    #[test_case]
+    fn notifier_and_context_sizes() {
+        assert_eq!(notifier_list(0x1000).len(), 0x18);
+        assert_eq!(rd64(&notifier_list(0x1000), 8), 0x1000); // list_head.next = self
+        assert_eq!(threshold().len(), 8);
+        let n = notifier(0x2000, 3);
+        assert_eq!(n.len(), 0xb0);
+        assert_eq!(rd64(&n, 0), 0x2000); // threshold ptr
+        assert_eq!(rd32(&n, 0x10), 0x50); // unk_10
+        assert_eq!(&n[0xa8..0xb0], &[0xff; 8]); // state.unk_buf
+        let g = gpu_context_data();
+        assert_eq!(g.len(), 0x40);
+        assert_eq!(g[0], 0xff);
+        assert_eq!(g[0x23], 2);
     }
 
     #[test_case]
