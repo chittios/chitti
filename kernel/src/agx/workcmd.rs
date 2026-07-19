@@ -8,9 +8,19 @@
 //! `V >= V13_0B4`, `V >= V13_3` true; `G >= G14X` false). See `COMPUTE_ISA_REF.md`
 //! and the drm/asahi sources under scratchpad `asahi-fw/`.
 //!
-//! The struct field NAMES self-encode their byte offsets (`unk_2d4`@0x2d4,
-//! `unk_2e9`@0x2e9, …); the unit tests assert exactly those, so a layout slip is
-//! caught without hardware. Pure + arch-neutral (`cargo xtask test`).
+//! **KNOWN UNRESOLVED AMBIGUITY (JobMeta / tail):** drm/asahi's `JobMeta.stamp`
+//! and `.fw_stamp` are `GpuWeakPointer` = `NonZeroU64` (8 bytes), which makes
+//! `raw::JobMeta` 0x2c and total 0x319 — but drm/asahi *names* the following field
+//! `unk_2d4` (offset 0x2d4), which only holds if JobMeta is 0x24 (4-byte stamps),
+//! and m1n1 models those stamps as full 64-bit. Source alone cannot settle this
+//! 8-byte discrepancy in the **tail** (JobMeta onward: command_time, timestamps,
+//! the stamp fields). This module currently encodes the 0x24 (4-byte-stamp) form
+//! to match the field-name offsets, total 0x311. The tests below assert *internal
+//! self-consistency*, NOT firmware-validated offsets — resolving the tail needs a
+//! real dispatch (or a captured reference). **The early, critical fields are
+//! unambiguous and correct regardless:** encoder @0x78, pipeline_base @0xa0,
+//! microsequence @0x1f0, vm_slot @0x10, notifier @0x14 — all before JobMeta.
+//! Pure + arch-neutral (`cargo xtask test`).
 //!
 //! Still TODO for a full dispatch (next increment): the microsequence ops
 //! (StartCompute/FinalizeCompute), `CommandQueueInfo`, and the hw.rs wiring that
@@ -261,12 +271,13 @@ mod tests {
     }
 
     #[test_case]
-    fn run_compute_self_encoding_offset_anchors() {
-        // The drm/asahi field names encode their offsets — assert the layout lands
-        // exactly there (a slipped field size would move these).
+    fn run_compute_self_consistency() {
+        // NB: this checks INTERNAL self-consistency of the 0x24-JobMeta form, not
+        // firmware-validated offsets — see the module-level "KNOWN AMBIGUITY" note
+        // (the JobMeta/tail has an unresolved 8-byte discrepancy vs m1n1). The
+        // early fields asserted in `run_compute_size_and_key_offsets` ARE
+        // unambiguous; these tail anchors just pin the chosen encoding.
         let w = run_compute(&c());
-        // unk_2d4 is zero but its POSITION proves everything before it is sized
-        // right; the strongest anchor is uuid inside JobMeta and the total size.
         assert_eq!(w.len(), 0x311);
         // encoder_id lands in EncoderParams @ 0x25c + 0x0c.
         assert_eq!(rd32(&w, 0x25c + 0x0c), 7);
