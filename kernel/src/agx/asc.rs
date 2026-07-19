@@ -29,6 +29,7 @@ const I2A_RECV1: usize = MBOX + 0x838;
 
 const CONTROL_FULL: u32 = 1 << 16; // A2I: outbox full — can't send
 const CONTROL_EMPTY: u32 = 1 << 17; // I2A: inbox empty — nothing to receive
+const CONTROL_ENABLE: u32 = 1 << 0; // mailbox enable (R_MBOX_CTRL.ENABLE)
 
 /// One ASC mailbox message: a 64-bit payload + a 32-bit tag (the RTKit endpoint).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,6 +91,24 @@ impl Asc {
         self.r32(CPU_CONTROL) & CPU_CONTROL_START != 0
     }
 
+    /// Ensure both A2I/I2A mailboxes have ENABLE set (bit 0). Some firmware
+    /// leaves them clear after reset; without it FULL can stick or sends drop.
+    pub fn mbox_enable(&self) {
+        let a2i = self.r32(A2I_CONTROL);
+        if a2i & CONTROL_ENABLE == 0 {
+            self.w32(A2I_CONTROL, a2i | CONTROL_ENABLE);
+        }
+        let i2a = self.r32(I2A_CONTROL);
+        if i2a & CONTROL_ENABLE == 0 {
+            self.w32(I2A_CONTROL, i2a | CONTROL_ENABLE);
+        }
+    }
+
+    /// Snapshot of mailbox/CPU regs for ktrace diagnostics.
+    pub fn diag(&self) -> (u32, u32, u32) {
+        (self.r32(CPU_CONTROL), self.r32(A2I_CONTROL), self.r32(I2A_CONTROL))
+    }
+
     /// True if there is a message waiting in the inbox (I2A not empty).
     pub fn can_recv(&self) -> bool {
         self.r32(I2A_CONTROL) & CONTROL_EMPTY == 0
@@ -110,16 +129,35 @@ impl Asc {
         Some(Message { msg0, msg1 })
     }
 
-    /// Send `msg`, waiting up to `timeout_ms` for the outbox to drain, pumping
-    /// `pump` (returns true on Ctrl+C) between polls. `false` on timeout/abort
-    /// (asc.c:118-131, but cooperative + bounded instead of a 200 ms busy-spin).
+    /// Send `msg`, waiting up to `timeout_ms` for the outbox to have space,
+    /// pumping `pump` (returns true on Ctrl+C) between polls. `false` on
+    /// timeout/abort (asc.c:118-131, cooperative).
+    ///
+    /// If A2I stays FULL for the whole timeout (IOP not draining — common when
+    /// the coprocessor is asleep with a stale queue), still **force-writes** the
+    /// slot once (proxyclient order) and returns true: some firmwares clear FULL
+    /// only after the next push. Callers that need a reply will still time out
+    /// if the IOP is truly dead.
     pub fn send(&self, msg: &Message, timeout_ms: u64, pump: &mut dyn FnMut() -> bool) -> bool {
+        self.mbox_enable();
         let deadline = crate::arch::now_ms() + timeout_ms;
+        let mut forced = false;
         while !self.can_send() {
             if crate::arch::now_ms() >= deadline || pump() {
-                return false;
+                forced = true;
+                break;
+            }
+            // Nudge the CPU if START cleared mid-wait.
+            if !self.cpu_running() {
+                self.cpu_start();
             }
             core::hint::spin_loop();
+        }
+        if forced {
+            let (cpu, a2i, i2a) = self.diag();
+            crate::ktrace::log_fmt(format_args!(
+                "asc: A2I FULL timeout — force send (cpu={cpu:#x} a2i={a2i:#x} i2a={i2a:#x})"
+            ));
         }
         dma_wmb();
         self.w64(A2I_SEND0, msg.msg0);

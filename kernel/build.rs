@@ -29,4 +29,20 @@ fn main() {
         println!("cargo:rustc-cfg=voice_vad_embedded");
     }
     println!("cargo:rerun-if-changed=../assets/voice/silero_vad.onnx");
+
+    // Apple WiFi dongle firmware (~2.5 MiB, from macOS via `cargo xtask
+    // wifi-assets`). Embedded so bare m1n1 boots (no ESP disk) can still
+    // `/wifi load`. Absent in a fresh clone → stub, no embed.
+    println!("cargo:rustc-check-cfg=cfg(wifi_fw_embedded)");
+    println!("cargo:rustc-check-cfg=cfg(wifi_nvram_embedded)");
+    let wifi_fw = "../assets/wifi/brcm/brcmfmac4388-pcie.apple,miyake.bin";
+    let wifi_nv = "../assets/wifi/brcm/brcmfmac4388-pcie.apple,miyake.txt";
+    if std::path::Path::new(wifi_fw).exists() {
+        println!("cargo:rustc-cfg=wifi_fw_embedded");
+    }
+    if std::path::Path::new(wifi_nv).exists() {
+        println!("cargo:rustc-cfg=wifi_nvram_embedded");
+    }
+    println!("cargo:rerun-if-changed={wifi_fw}");
+    println!("cargo:rerun-if-changed={wifi_nv}");
 }

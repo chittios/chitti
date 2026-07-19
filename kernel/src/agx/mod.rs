@@ -31,8 +31,9 @@
 pub mod proto;
 pub mod uat;
 
+/// ASC mailbox transport — shared by AGX and the SMC client (WiFi power).
 #[cfg(target_arch = "aarch64")]
-mod asc;
+pub mod asc;
 
 #[cfg(target_arch = "aarch64")]
 mod handoff;

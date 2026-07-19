@@ -26,6 +26,10 @@ pub mod e1000;
 pub mod pci;
 pub mod virtio_net_pci;
 
+/// Wi-Fi driver facade — lives under [`crate::drivers::wifi`] (brcm FullMAC).
+/// Re-exported here so existing `crate::net::wifi` call sites keep working.
+pub use crate::drivers::wifi;
+
 /// A raw-Ethernet NIC the stack sits on. Frames exclude the FCS. Implemented by
 /// the virtio-net and e1000 drivers.
 pub trait NetDevice {

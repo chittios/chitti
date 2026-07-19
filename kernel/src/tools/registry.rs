@@ -185,7 +185,7 @@ fn shell_commands() -> Vec<ToolDef> {
         ToolDef::shell("mounts", "List the currently mounted volumes.", false),
         ToolDef::shell("network", "Show the network status (ip/gw/dns), or configure it. args: empty=status, 'dhcp', 'static <ip/prefix> [gw]', 'dns <ip>'.", false),
         ToolDef::shell("ping", "ICMP-ping a host to check connectivity. args: a hostname or IPv4 address, e.g. 'www.google.com'.", false),
-        ToolDef::shell("wifi", "Wi-Fi facade over the NIC. args: 'scan' | 'connect <ssid>' | 'info'.", false),
+        ToolDef::shell("wifi", "Wi-Fi: real Broadcom on Apple (chitti.wifi); facade on QEMU. args: info|scan|connect <ssid>|load.", false),
         ToolDef::shell(
             "channel",
             "Messaging channels (Telegram…). args: list|add telegram <name> <token>|start|stop|send|reply|pair|allow|status.",

@@ -388,6 +388,7 @@ fn main() {
         "m1n1" => cmd_m1n1(release),
         "test" => cmd_test(),
         "voice-assets" => cmd_voice_assets(),
+        "wifi-assets" => cmd_wifi_assets(),
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
         // boot the real model, run the acceptance checks, exit pass/fail.
         "ref-check" => cmd_ref_check(arch, model),
@@ -406,8 +407,9 @@ fn main() {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <build|image|run|m1n1|test|ref-check> [-arch x86_64|aarch64] \
+    "usage: cargo xtask <build|image|run|m1n1|test|ref-check|voice-assets|wifi-assets> [-arch x86_64|aarch64] \
      [-model qwen3.5-0.8b|2b|4b|9b|gemma-4-e4b|bonsai-27b|bonsai-27b-ternary] [--release] [--uefi] [-server]\n\
+     wifi-assets: extract Apple FullMAC firmware from macOS into assets/wifi/ (for /wifi load).\n\
      m1n1 (aarch64): package the kernel as a gzip'd arm64 Image and boot it on a \
      tethered Apple Silicon Mac over the m1n1 USB proxy; configure via env \
      CHITTI_M1N1/CHITTI_DTB[/CHITTI_INITRD/CHITTI_BOOTARGS/M1N1DEVICE].\n\
@@ -845,11 +847,16 @@ fn populate_fat_linux(img: &Path, label: &str, dirs: &[&str], copies: &[(PathBuf
 fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> Result<PathBuf, String> {
     let img = repo_root().join("target/chitti-esp-aa64.img");
     let model_bytes = model.map(|m| fs::metadata(m).map(|md| md.len()).unwrap_or(0)).unwrap_or(0);
-    // Voice models bundled onto the ESP too (kernel mounts the FAT ESP and reads
-    // them). Grow the image to fit them.
+    // Voice models + WiFi firmware bundled onto the ESP too (kernel mounts the
+    // FAT ESP and reads them). Grow the image to fit them.
     let voice: Vec<(String, PathBuf)> = voice_model_assets().into_iter().filter(|(_, p)| p.exists()).map(|(n, p)| (n.to_string(), p)).collect();
     let voice_bytes: u64 = voice.iter().map(|(_, p)| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
-    let size_mb = 64 + ((model_bytes + voice_bytes) / (1024 * 1024)) + if model_bytes > 0 { 64 } else { 0 };
+    let wifi = wifi_fw_assets();
+    let wifi_bytes: u64 = wifi.iter().map(|(_, p)| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
+    let size_mb = 64
+        + ((model_bytes + voice_bytes + wifi_bytes) / (1024 * 1024))
+        + if model_bytes > 0 { 64 } else { 0 }
+        + if wifi_bytes > 0 { 8 } else { 0 };
     // Recreate the image only when contents changed (cheap heuristic: sizes).
     let f = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&img).map_err(|e| e.to_string())?;
     f.set_len(size_mb * 1024 * 1024).map_err(|e| e.to_string())?;
@@ -867,8 +874,22 @@ fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> 
         for (n, pth) in &voice {
             copies.push((pth.clone(), format!("::/{n}")));
         }
-        populate_fat_linux(&img, "CHITTI", &["::/EFI", "::/EFI/BOOT"], &copies)?;
-        eprintln!("  ESP image: {} ({} MiB{})", img.display(), size_mb, if model.is_some() { ", model bundled" } else { "" });
+        for (n, pth) in &wifi {
+            copies.push((pth.clone(), format!("::/{n}")));
+        }
+        let dirs: &[&str] = if wifi.is_empty() {
+            &["::/EFI", "::/EFI/BOOT"]
+        } else {
+            &["::/EFI", "::/EFI/BOOT", "::/brcm"]
+        };
+        populate_fat_linux(&img, "CHITTI", dirs, &copies)?;
+        eprintln!(
+            "  ESP image: {} ({} MiB{}{})",
+            img.display(),
+            size_mb,
+            if model.is_some() { ", model bundled" } else { "" },
+            if !wifi.is_empty() { ", wifi fw" } else { "" }
+        );
         return Ok(img);
     }
     // macOS: attach raw, format FAT32, mount, copy, detach — via /bin/sh.
@@ -879,6 +900,15 @@ fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> 
             .collect::<Vec<_>>()
             .join("\n"),
         None => String::new(),
+    };
+    let wifi_cp = if wifi.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from("mkdir -p \"$MNT/brcm\"\n");
+        for (n, p) in &wifi {
+            s.push_str(&format!("cp \"{}\" \"$MNT/{}\"\n", p.display(), n));
+        }
+        s
     };
     let script = format!(
         r#"set -e
@@ -891,6 +921,7 @@ cp "{stub}" "$MNT/EFI/BOOT/BOOTAA64.EFI"
 cp "{kernel}" "$MNT/chitti-kernel"
 {model_cp}
 {voice_cp}
+{wifi_cp}
 diskutil unmount "$DEV" > /dev/null
 hdiutil detach "$DEV" > /dev/null
 "#,
@@ -900,6 +931,7 @@ hdiutil detach "$DEV" > /dev/null
         model_cp = model_cp,
         // Voice models at the ESP root, so the kernel's root-file readers find them.
         voice_cp = voice.iter().map(|(n, p)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), n)).collect::<Vec<_>>().join("\n"),
+        wifi_cp = wifi_cp,
     );
     let status = Command::new("/bin/sh").arg("-c").arg(&script).status().map_err(|e| format!("building ESP image: {e}"))?;
     if !status.success() {
@@ -1531,6 +1563,26 @@ fn voice_model_assets() -> [(&'static str, PathBuf); 2] {
     ]
 }
 
+/// Apple FullMAC WiFi firmware to place on the ESP / data image as
+/// `brcm/<name>`. Present only after `cargo xtask wifi-assets` (extracts from
+/// macOS `/usr/share/firmware/wifi`). The kernel also embeds the `.bin` when
+/// present so bare m1n1 boots can `/wifi load` without a disk.
+fn wifi_fw_assets() -> Vec<(String, PathBuf)> {
+    let dir = repo_root().join("assets/wifi/brcm");
+    let names = [
+        "brcmfmac4388-pcie.apple,miyake.bin",
+        "brcmfmac4388-pcie.apple,miyake.txt",
+        "brcmfmac4388-pcie.apple,miyake.clm_blob",
+        "brcmfmac4387c2-pcie.apple,miyake.bin",
+        "brcmfmac4387c2-pcie.apple,miyake.txt",
+    ];
+    names
+        .into_iter()
+        .map(|n| (format!("brcm/{n}"), dir.join(n)))
+        .filter(|(_, p)| p.exists())
+        .collect()
+}
+
 fn assemble_image(kernel_bin: &Path) -> Result<PathBuf, String> {
     assemble_image_opt(kernel_bin, Some("assets/model.gguf"))
 }
@@ -1694,16 +1746,19 @@ fn image_aarch64(model: Model, no_model: bool) -> Result<(), String> {
         p
     };
 
-    // Voice models bundled on the ESP too, so the kernel's `find_on_disks`
-    // auto-loads them (VirtualBox/real-hardware path). Present-only.
+    // Voice models + WiFi firmware on the ESP so `find_on_disks` auto-loads
+    // them (VirtualBox/real-hardware path). Present-only.
     let voice: Vec<(String, PathBuf)> = voice_model_assets().into_iter().filter(|(_, p)| p.exists()).map(|(n, p)| (n.to_string(), p)).collect();
     let voice_bytes: u64 = voice.iter().map(|(_, p)| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
+    let wifi = wifi_fw_assets();
+    let wifi_bytes: u64 = wifi.iter().map(|(_, p)| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
     // Layout: GPT (34 + 33 reserved sectors) + ESP (payload + 64 MiB slack) +
     // 256 MiB ext4 data partition.
     let payload: u64 = fs::metadata(&elf).map(|m| m.len()).unwrap_or(0)
         + fs::metadata(&stub).map(|m| m.len()).unwrap_or(0)
         + model_path.as_ref().and_then(|p| fs::metadata(p).ok()).map(|m| m.len()).unwrap_or(0)
-        + voice_bytes;
+        + voice_bytes
+        + wifi_bytes;
     let esp_secs = (payload + 64 * 1024 * 1024).div_ceil(512);
     let data_secs = 256 * 1024 * 1024 / 512u64;
     let total_secs = 34 + esp_secs + data_secs + 34;
@@ -1735,7 +1790,15 @@ fn image_aarch64(model: Model, no_model: bool) -> Result<(), String> {
         for (n, pth) in &voice {
             copies.push((pth.clone(), format!("::/{n}")));
         }
-        populate_fat_linux(&esp_tmp, "CHITTI", &["::/EFI", "::/EFI/BOOT"], &copies)?;
+        for (n, pth) in &wifi {
+            copies.push((pth.clone(), format!("::/{n}")));
+        }
+        let dirs: &[&str] = if wifi.is_empty() {
+            &["::/EFI", "::/EFI/BOOT"]
+        } else {
+            &["::/EFI", "::/EFI/BOOT", "::/brcm"]
+        };
+        populate_fat_linux(&esp_tmp, "CHITTI", dirs, &copies)?;
         splice_into(&img, esp.0 * 512, &esp_tmp)?;
         let _ = fs::remove_file(&esp_tmp);
 
@@ -1763,6 +1826,15 @@ fn image_aarch64(model: Model, no_model: bool) -> Result<(), String> {
             .join("\n"),
         None => String::new(),
     };
+    let wifi_cp = if wifi.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from("mkdir -p \"$MNT/brcm\"\n");
+        for (n, p) in &wifi {
+            s.push_str(&format!("cp \"{}\" \"$MNT/{}\"\n", p.display(), n));
+        }
+        s
+    };
     let script = format!(
         r#"set -e
 DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "{img}" | head -1 | awk '{{print $1}}')
@@ -1774,6 +1846,7 @@ cp "{stub}" "$MNT/EFI/BOOT/BOOTAA64.EFI"
 cp "{kernel}" "$MNT/chitti-kernel"
 {model_cp}
 {voice_cp}
+{wifi_cp}
 diskutil unmount "${{DEV}}s1" > /dev/null
 "{mke2fs}" -F -q -t ext4 -b 4096 "${{DEV}}s2"
 hdiutil detach "$DEV" > /dev/null
@@ -1784,6 +1857,7 @@ hdiutil detach "$DEV" > /dev/null
         mke2fs = mke2fs.display(),
         model_cp = model_cp,
         voice_cp = voice.iter().map(|(n, p)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), n)).collect::<Vec<_>>().join("\n"),
+        wifi_cp = wifi_cp,
     );
     let status = Command::new("/bin/sh").arg("-c").arg(&script).status().map_err(|e| format!("populating image: {e}"))?;
     if !status.success() {
@@ -2162,6 +2236,189 @@ fn cmd_voice_assets() -> Result<(), String> {
     }
     eprintln!("voice-assets: done — assets/voice/ ready");
     Ok(())
+}
+
+/// `cargo xtask wifi-assets`: extract Apple FullMAC dongle firmware from the
+/// host macOS tree (`/usr/share/firmware/wifi`) into `assets/wifi/brcm/` in
+/// the Asahi/brcmfmac naming layout:
+///
+/// - `brcmfmac4388-pcie.apple,miyake.bin`  (from `miyake.trx`)
+/// - `brcmfmac4388-pcie.apple,miyake.txt`  (NVRAM; prefers antenna X3)
+/// - optional `.clm_blob`
+///
+/// Cached — skips files already present. On non-macOS hosts, points at the
+/// expected source layout / Asahi extract path. The kernel embeds the `.bin`
+/// when present (m1n1) and ESP images copy the `brcm/` tree for disk boots.
+fn cmd_wifi_assets() -> Result<(), String> {
+    let out = repo_root().join("assets/wifi/brcm");
+    fs::create_dir_all(&out).map_err(|e| format!("mkdir {}: {e}", out.display()))?;
+
+    let bin_name = "brcmfmac4388-pcie.apple,miyake.bin";
+    let txt_name = "brcmfmac4388-pcie.apple,miyake.txt";
+    let clm_name = "brcmfmac4388-pcie.apple,miyake.clm_blob";
+    let bin_dst = out.join(bin_name);
+    let txt_dst = out.join(txt_name);
+    let clm_dst = out.join(clm_name);
+
+    if bin_dst.exists() && txt_dst.exists() {
+        eprintln!("wifi-assets: {bin_name} + NVRAM already present");
+        eprintln!("wifi-assets: done — assets/wifi/brcm/ ready (re-run after deleting to refresh)");
+        return Ok(());
+    }
+
+    // Prefer newer chip steppings when multiple exist (C0 > B0 > C2).
+    let mac_roots = [
+        "/usr/share/firmware/wifi/C-4388__s-C0",
+        "/usr/share/firmware/wifi/C-4388__s-B0",
+        "/usr/share/firmware/wifi/C-4388__s-C2",
+        // Asahi-style extract destinations (if the user already ran fwextract).
+        "/lib/firmware/brcm",
+        "/usr/lib/firmware/brcm",
+    ];
+
+    let mut trx: Option<PathBuf> = None;
+    let mut nvram: Option<PathBuf> = None;
+    let mut clmb: Option<PathBuf> = None;
+    let mut used_root = String::new();
+
+    for root in &mac_roots {
+        let r = Path::new(root);
+        if !r.exists() {
+            continue;
+        }
+        // Apple layout: <root>/miyake.trx
+        let candidate = r.join("miyake.trx");
+        if candidate.exists() {
+            trx = Some(candidate);
+            used_root = root.to_string();
+            // Antenna-specific NVRAM: prefer X3 (j473 reports antenna=X3), then
+            // generic miyake, highest m- version wins.
+            nvram = pick_miyake_nvram(r);
+            let c = r.join("miyake.clmb");
+            if c.exists() {
+                clmb = Some(c);
+            }
+            break;
+        }
+        // Already-converted brcmfmac names (Asahi/Linux tree).
+        let asahi_bin = r.join(bin_name);
+        if asahi_bin.exists() {
+            trx = Some(asahi_bin);
+            used_root = root.to_string();
+            let t = r.join(txt_name);
+            if t.exists() {
+                nvram = Some(t);
+            }
+            let c = r.join(clm_name);
+            if c.exists() {
+                clmb = Some(c);
+            }
+            break;
+        }
+    }
+
+    let Some(trx_src) = trx else {
+        return Err(
+            "wifi-assets: no miyake firmware found.\n  \
+             On the Mac that owns the radio, /usr/share/firmware/wifi/C-4388__s-*/miyake.trx \
+             must exist (shipped with macOS).\n  \
+             Or place Asahi files under /lib/firmware/brcm/ and re-run.\n  \
+             Expected: brcmfmac4388-pcie.apple,miyake.bin"
+                .into(),
+        );
+    };
+
+    if !bin_dst.exists() {
+        eprintln!(
+            "wifi-assets: copying {} → {bin_name} (from {used_root})",
+            trx_src.display()
+        );
+        fs::copy(&trx_src, &bin_dst).map_err(|e| format!("copy {}: {e}", trx_src.display()))?;
+    } else {
+        eprintln!("wifi-assets: {bin_name} already present");
+    }
+
+    if !txt_dst.exists() {
+        if let Some(src) = nvram {
+            eprintln!("wifi-assets: NVRAM {} → {txt_name}", src.display());
+            let raw = fs::read(&src).map_err(|e| format!("read {}: {e}", src.display()))?;
+            let cleaned = clean_nvram_txt(&raw);
+            fs::write(&txt_dst, cleaned).map_err(|e| format!("write {}: {e}", txt_dst.display()))?;
+        } else {
+            eprintln!("wifi-assets: warning — no miyake NVRAM .txt found (OTP-only boot may still work)");
+        }
+    } else {
+        eprintln!("wifi-assets: {txt_name} already present");
+    }
+
+    if !clm_dst.exists() {
+        if let Some(src) = clmb {
+            eprintln!("wifi-assets: CLM {} → {clm_name}", src.display());
+            fs::copy(&src, &clm_dst).map_err(|e| format!("copy {}: {e}", src.display()))?;
+        }
+    }
+
+    let sz = fs::metadata(&bin_dst).map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "wifi-assets: done — {} ({} KiB){}",
+        bin_dst.display(),
+        sz / 1024,
+        if txt_dst.exists() { " + NVRAM" } else { "" }
+    );
+    eprintln!("wifi-assets: rebuild the kernel so the image embeds (m1n1) / ESP copies (QEMU/VBox)");
+    Ok(())
+}
+
+/// Prefer antenna-X3 NVRAM (j473), then generic, highest `m-N.N` version.
+fn pick_miyake_nvram(dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<(u32, PathBuf)> = None;
+    let rd = fs::read_dir(dir).ok()?;
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let s = name.to_string_lossy();
+        // P-miyake-X3_M-…_m-4.7.txt or P-miyake_M-…_m-4.7.txt
+        let is_x3 = s.contains("miyake-X3") || s.contains("miyake_X3");
+        let is_generic = s.starts_with("P-miyake_M-") && s.ends_with(".txt");
+        if !(is_x3 || is_generic) || !s.ends_with(".txt") {
+            continue;
+        }
+        // Score: X3 gets +1000, version m-A.B → A*10+B.
+        let mut score = if is_x3 { 1000u32 } else { 0 };
+        if let Some(idx) = s.rfind("__m-") {
+            let ver = &s[idx + 4..s.len() - 4]; // strip __m- and .txt
+            let mut parts = ver.split('.');
+            let a: u32 = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+            let b: u32 = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+            score += a * 10 + b;
+        }
+        match &best {
+            Some((bs, _)) if *bs >= score => {}
+            _ => best = Some((score, ent.path())),
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Asahi `process_nvram`: strip spurious whitespace around keys/values.
+fn clean_nvram_txt(raw: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(raw);
+    let mut out = String::new();
+    for line in text.split('\n') {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            out.push_str(k.trim());
+            out.push('=');
+            out.push_str(v.trim());
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.into_bytes()
 }
 
 /// `cargo xtask test`: run the in-kernel `custom_test_frameworks` test

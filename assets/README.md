@@ -50,6 +50,23 @@ cargo xtask voice-assets             # -> assets/voice/
 
 Images bundle them on the ESP so `find_on_disks` auto-loads them at first use.
 
+## WiFi dongle firmware (extracted, gitignored)
+
+`wifi/brcm/` — Apple FullMAC firmware for the on-board radio (j473 Mac mini M2
+= BCM4388 / `apple,miyake`). Extracted from this Mac's
+`/usr/share/firmware/wifi/C-4388__s-*/miyake.trx` into the Asahi naming layout:
+
+```sh
+make wifi-assets                 # or: cargo xtask wifi-assets
+# -> assets/wifi/brcm/brcmfmac4388-pcie.apple,miyake.bin
+# -> assets/wifi/brcm/brcmfmac4388-pcie.apple,miyake.txt   (NVRAM, antenna X3)
+```
+
+When present, the **kernel embeds** the `.bin` (so bare `make m1n1` boots can
+`/wifi load` with no disk), and `image` / ESP builds also copy `brcm/` onto the
+FAT volume for QEMU/VBox/`find_on_disks`. Not redistributable as a URL — comes
+from the local macOS firmware tree (same source Asahi's fwextract uses).
+
 ## Note: agent app assets live elsewhere
 
 Built-in agent packages (SOULs, manifests, and their `tools.wasm` modules)

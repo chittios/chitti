@@ -98,6 +98,19 @@ run-remote:
 model:
 	./xtask/fetch-model.sh $(MODEL)
 
+## voice-assets: download ONNX voice models into assets/voice/
+.PHONY: voice-assets
+voice-assets:
+	$(XTASK) voice-assets
+
+## wifi-assets: extract Apple FullMAC dongle firmware (miyake 4388) into
+##              assets/wifi/brcm/ from this Mac's /usr/share/firmware/wifi.
+##              Required for `/wifi load` on bare m1n1 (embedded) and for
+##              ESP-bundled disk boots. Re-run after deleting assets/wifi/ to refresh.
+.PHONY: wifi-assets
+wifi-assets:
+	$(XTASK) wifi-assets
+
 ## run-uefi: boot aarch64 via the UEFI stub under AAVMF (not -kernel)
 ##          needs assets GGUF for MODEL — `make model MODEL=e4b` first
 .PHONY: run-uefi
@@ -115,8 +128,12 @@ image:
 ##       CHITTI_INITRD (model gguf), CHITTI_BOOTARGS, M1N1DEVICE (proxy tty).
 ##       Use RELEASE=1 for hardware. Without CHITTI_M1N1/CHITTI_DTB it just
 ##       builds the Image and prints the manual linux.py command.
+##       Best-effort: extract wifi-assets first so /wifi load embeds the dongle
+##       image (no-op if already present; skips with a warning if macOS fw is
+##       missing so CI/non-Apple hosts still build the Image).
 .PHONY: m1n1
 m1n1:
+	-$(XTASK) wifi-assets
 	$(XTASK) m1n1 $(REL)
 
 ## vbox: rebuild the aarch64 image and (re)load it into VirtualBox VM VBOX_VM

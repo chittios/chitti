@@ -358,11 +358,15 @@ pub extern "C" fn aarch64_start() -> ! {
         chitti_kernel::arch::aarch64::psci_system_off();
     }
     // Bring up networking (virtio-net over mmio, else a PCI NIC) so /network,
-    // /ping and /wifi work. No-op if no NIC is present. Skipped on Apple: the
-    // virtio-mmio/PCI NIC probes read unbacked QEMU addresses that fault under
-    // the hv (Apple PCIe + its NIC are a follow-up).
+    // /ping and /wifi work. No-op if no NIC is present. On Apple Silicon the
+    // QEMU virtio/PCI probes would fault (unbacked MMIO); instead we bring up
+    // APCIE + the Broadcom FullMAC WiFi when `chitti.wifi` is on the bootargs.
     #[cfg(not(feature = "refcheck"))]
-    if !chitti_kernel::arch::aarch64::is_apple() {
+    if chitti_kernel::arch::aarch64::is_apple() {
+        if chitti_kernel::drivers::wifi::init_apple() {
+            serial_println!("Chitti: Wi-Fi radio probed (see /wifi info)");
+        }
+    } else {
         chitti_kernel::net::autodetect();
         // Bring up audio (virtio-snd) for the /voice pipeline. No-op if absent.
         chitti_kernel::sound::autodetect();

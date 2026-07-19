@@ -350,6 +350,10 @@ pub unsafe fn reg_of_compatible(dtb_pa: u64, want: &[u8]) -> Option<(u64, u64)> 
 /// `core`/`usb2phy`/`pipehandler` blocks, a DART's register windows), selected
 /// by `reg-names`; `n == 0` is exactly [`reg_of_compatible`].
 ///
+/// Returns `None` if `n` is past the end of the `reg` property (does **not**
+/// read into adjacent FDT bytes — that used to yield garbage phys addrs and
+/// external-abort on MMIO).
+///
 /// # Safety
 /// `dtb_pa`, if a valid FDT, must point at a readable blob.
 pub unsafe fn reg_nth_of_compatible(dtb_pa: u64, want: &[u8], n: usize) -> Option<(u64, u64)> {
@@ -359,6 +363,7 @@ pub unsafe fn reg_nth_of_compatible(dtb_pa: u64, want: &[u8], n: usize) -> Optio
     let mut scells = [2u32; MAX_DEPTH];
     let mut matched = [false; MAX_DEPTH];
     let mut reg_off = [0usize; MAX_DEPTH];
+    let mut reg_len = [0usize; MAX_DEPTH];
     let mut depth: usize = 0;
     let mut off = h.off_struct;
     loop {
@@ -375,6 +380,7 @@ pub unsafe fn reg_nth_of_compatible(dtb_pa: u64, want: &[u8], n: usize) -> Optio
                 scells[depth] = 2;
                 matched[depth] = false;
                 reg_off[depth] = 0;
+                reg_len[depth] = 0;
                 // SAFETY: bounded.
                 let len = unsafe { cstr_len(base, off, h.total)? };
                 off += (len + 1 + 3) & !3;
@@ -387,8 +393,15 @@ pub unsafe fn reg_nth_of_compatible(dtb_pa: u64, want: &[u8], n: usize) -> Optio
                     let pa = acells[depth - 1];
                     let ps = scells[depth - 1];
                     let stride = (pa as usize + ps as usize) * 4;
+                    if stride == 0 {
+                        return None;
+                    }
+                    let nregs = reg_len[depth] / stride;
+                    if n >= nregs {
+                        return None;
+                    }
                     let o = reg_off[depth] + n * stride;
-                    // SAFETY: bounded.
+                    // SAFETY: `o` is within the reg property (checked above).
                     let b = unsafe { read_cells(base, o, pa, h.total)? };
                     let s = unsafe { read_cells(base, o + pa as usize * 4, ps, h.total)? };
                     return Some((b, s));
@@ -411,6 +424,7 @@ pub unsafe fn reg_nth_of_compatible(dtb_pa: u64, want: &[u8], n: usize) -> Optio
                         }
                     } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"reg", h.total) } {
                         reg_off[depth] = data_off;
+                        reg_len[depth] = len;
                     }
                 }
                 off += 8 + ((len + 3) & !3);
@@ -418,6 +432,92 @@ pub unsafe fn reg_nth_of_compatible(dtb_pa: u64, want: &[u8], n: usize) -> Optio
             FDT_NOP => {}
             FDT_END => return None,
             _ => return None,
+        }
+    }
+}
+
+/// Number of `(base, size)` pairs in the `reg` property of the first node
+/// whose `compatible` contains `want`. `0` if no match / no reg.
+///
+/// # Safety
+/// `dtb_pa`, if a valid FDT, must point at a readable blob.
+pub unsafe fn reg_count_of_compatible(dtb_pa: u64, want: &[u8]) -> usize {
+    // SAFETY: same walker as `reg_nth_of_compatible`.
+    let (base, h) = match unsafe { header(dtb_pa) } {
+        Some(x) => x,
+        None => return 0,
+    };
+    let mut acells = [2u32; MAX_DEPTH];
+    let mut scells = [2u32; MAX_DEPTH];
+    let mut matched = [false; MAX_DEPTH];
+    let mut reg_len = [0usize; MAX_DEPTH];
+    let mut depth: usize = 0;
+    let mut off = h.off_struct;
+    loop {
+        let tok = match unsafe { be32(base, off, h.total) } {
+            Some(t) => t,
+            None => return 0,
+        };
+        off += 4;
+        match tok {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                if depth >= MAX_DEPTH {
+                    return 0;
+                }
+                acells[depth] = 2;
+                scells[depth] = 2;
+                matched[depth] = false;
+                reg_len[depth] = 0;
+                let len = match unsafe { cstr_len(base, off, h.total) } {
+                    Some(l) => l,
+                    None => return 0,
+                };
+                off += (len + 1 + 3) & !3;
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    return 0;
+                }
+                if matched[depth] {
+                    let pa = acells[depth - 1];
+                    let ps = scells[depth - 1];
+                    let stride = (pa as usize + ps as usize) * 4;
+                    if stride == 0 {
+                        return 0;
+                    }
+                    return reg_len[depth] / stride;
+                }
+                depth -= 1;
+            }
+            FDT_PROP => {
+                let len = match unsafe { be32(base, off, h.total) } {
+                    Some(l) => l as usize,
+                    None => return 0,
+                };
+                let name_off = match unsafe { be32(base, off + 4, h.total) } {
+                    Some(n) => n as usize,
+                    None => return 0,
+                };
+                let data_off = off + 8;
+                if depth < MAX_DEPTH {
+                    if unsafe { prop_name_is(base, h.off_strings, name_off, b"#address-cells", h.total) } {
+                        acells[depth] = unsafe { be32(base, data_off, h.total) }.unwrap_or(2);
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"#size-cells", h.total) } {
+                        scells[depth] = unsafe { be32(base, data_off, h.total) }.unwrap_or(2);
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"compatible", h.total) } {
+                        if unsafe { compat_has(base, data_off, len, want, h.total) } {
+                            matched[depth] = true;
+                        }
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"reg", h.total) } {
+                        reg_len[depth] = len;
+                    }
+                }
+                off += 8 + ((len + 3) & !3);
+            }
+            FDT_NOP => {}
+            FDT_END => return 0,
+            _ => return 0,
         }
     }
 }
@@ -1249,6 +1349,10 @@ mod tests {
         // Both reg pairs of the dwc3.
         assert_eq!(unsafe { reg_nth_of_compatible(p, b"apple,t8112-dwc3", 0) }, Some((0x3_8228_0000, 0xcd00)));
         assert_eq!(unsafe { reg_nth_of_compatible(p, b"apple,t8112-dwc3", 1) }, Some((0x3_8228_cd00, 0x3200)));
+        // Past end of `reg` must be None (not a garbage read into adjacent props).
+        assert_eq!(unsafe { reg_nth_of_compatible(p, b"apple,t8112-dwc3", 2) }, None);
+        assert_eq!(unsafe { reg_nth_of_compatible(p, b"apple,t8112-dwc3", 6) }, None);
+        assert_eq!(unsafe { reg_count_of_compatible(p, b"apple,t8112-dwc3") }, 2);
         // iommus cells → [dart0, sid0, dartUSB, sid1].
         let mut c = [0u32; 4];
         let n = unsafe { prop_cells_of_compatible(p, b"apple,t8112-dwc3", b"iommus", &mut c) };

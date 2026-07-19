@@ -4,6 +4,7 @@
 target/
 .DS_Store
 assets/voice/
+assets/wifi/
 
 __pycache__/
 # e2e test-generated TLS certs

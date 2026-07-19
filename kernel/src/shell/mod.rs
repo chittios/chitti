@@ -739,9 +739,6 @@ fn net_ping(arg: &str) {
     }
 }
 
-/// `/wifi [scan|connect <ssid>|info]` — a facade over the wired NIC (QEMU/VBox
-/// expose no 802.11 hardware): "connect" takes a password via the approval modal,
-/// then brings the link up with DHCP and presents it as `wlan0`.
 /// `/tls` — show or set the HTTPS certificate-verification posture. Verified
 /// against the embedded Mozilla root store by default; `insecure on` is the
 /// `curl -k` escape hatch for a self-signed / self-hosted server (human-only,
@@ -788,48 +785,151 @@ fn run_js(arg: &str) {
     }
 }
 
+/// `/wifi [info|scan|connect <ssid>|load]` — real Broadcom FullMAC on Apple
+/// (`chitti.wifi` bootarg); on QEMU/VBox a facade over the wired NIC.
 fn wifi_cmd(arg: &str) {
     let (sub, rest) = match arg.trim().split_once(' ') {
         Some((s, r)) => (s, r.trim()),
         None => (arg.trim(), ""),
     };
+    let real = crate::drivers::wifi::hardware_present();
+    let radio = crate::drivers::wifi::radio_ready();
     match sub {
         "" | "info" => {
-            let Some(i) = crate::net::info() else {
-                serial_println!("wifi> no adapter");
-                return;
-            };
-            serial_println!("wifi> interface {} ({})", i.ifname, if i.ip.is_some() { "connected" } else { "not connected" });
-            serial_println!("  note: emulated platforms expose a wired NIC; /wifi drives it as the wireless link");
+            // Always print info_lines on Apple (PCIe + FDT + probe state) even
+            // when BARs are not mapped yet — never a bare "no adapter".
+            let lines = crate::drivers::wifi::info_lines();
+            let has_detail = lines.iter().any(|l| !l.contains("none"));
+            if real || has_detail {
+                for line in lines {
+                    serial_println!("wifi> {line}");
+                }
+                if let Some(i) = crate::net::info() {
+                    serial_println!(
+                        "wifi> smoltcp {} ({})",
+                        i.ifname,
+                        if i.ip.is_some() { "has IP" } else { "no IP yet" }
+                    );
+                }
+            } else {
+                let Some(i) = crate::net::info() else {
+                    serial_println!(
+                        "wifi> no adapter (on Apple: boot with chitti.wifi on a bare m1n1 boot)"
+                    );
+                    return;
+                };
+                serial_println!(
+                    "wifi> interface {} ({})",
+                    i.ifname,
+                    if i.ip.is_some() { "connected" } else { "not connected" }
+                );
+                serial_println!(
+                    "wifi>   note: emulated platforms expose a wired NIC; /wifi drives it as the wireless link"
+                );
+            }
+            let _ = radio;
         }
+        "power" | "up" => match crate::drivers::wifi::power_on() {
+            Ok(()) => {
+                serial_println!("wifi> power OK — link up, radio enumerated");
+                for line in crate::drivers::wifi::info_lines() {
+                    serial_println!("wifi> {line}");
+                }
+            }
+            Err(e) => serial_println!("wifi> power failed: {e}"),
+        },
+        "load" => match crate::drivers::wifi::load_firmware() {
+            Ok(()) => serial_println!("wifi> firmware loaded"),
+            Err(e) => serial_println!("wifi> {e}"),
+        },
         "scan" => {
             serial_println!("wifi> nearby networks:");
-            serial_println!("  chitti-lan      \x1b[32m****\x1b[0m  (wired uplink, DHCP)");
+            match crate::drivers::wifi::scan() {
+                Ok(list) => {
+                    if list.is_empty() {
+                        serial_println!("wifi>   (none)");
+                    }
+                    for b in list {
+                        let lock = if b.privacy { "****" } else { "open" };
+                        serial_println!(
+                            "  {:32}  \x1b[32m{lock}\x1b[0m  ch={} rssi={}  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                            b.ssid,
+                            b.channel,
+                            b.rssi,
+                            b.bssid[0],
+                            b.bssid[1],
+                            b.bssid[2],
+                            b.bssid[3],
+                            b.bssid[4],
+                            b.bssid[5]
+                        );
+                    }
+                    if !real {
+                        serial_println!("wifi>   (wired-facade SSID — not an RF scan)");
+                    } else if !radio {
+                        serial_println!(
+                            "wifi>   note: real RF scan needs BAR MMIO + firmware (/wifi power, /wifi load)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    serial_println!("wifi> scan failed: {e}");
+                    if real && !radio {
+                        serial_println!(
+                            "wifi> tip: /wifi power until BAR0 is non-zero, then `make wifi-assets` + rebuild (or place .bin in /brcm/) and /wifi load"
+                        );
+                    } else if radio {
+                        serial_println!(
+                            "wifi> tip: FullMAC needs dongle firmware — host: make wifi-assets && rebuild, then /wifi load"
+                        );
+                    }
+                }
+            }
         }
         "connect" => {
-            let ssid = if rest.is_empty() { "chitti-lan" } else { rest };
-            let _pw = crate::modal::input("Wi-Fi password", ssid, true);
+            let ssid = if rest.is_empty() {
+                if real {
+                    serial_println!("wifi> usage: /wifi connect <ssid>");
+                    return;
+                }
+                "chitti-lan"
+            } else {
+                rest
+            };
+            let pw = crate::modal::input("Wi-Fi password", ssid, true);
             serial_println!("wifi> connecting to '{ssid}'...");
-            crate::net::set_ifname("wlan0");
-            match crate::net::dhcp_start() {
+            match crate::drivers::wifi::connect(ssid, &pw) {
                 Ok(()) => {
-                    let deadline = crate::arch::now_ms() + 5000;
-                    while crate::arch::now_ms() < deadline {
-                        crate::net::poll();
-                        if crate::net::info().and_then(|i| i.ip).is_some() {
-                            break;
-                        }
-                        crate::sched::yield_now();
+                    if real {
+                        // Real radio: association done in the driver; DHCP when
+                        // the NetDevice is wired (M3).
+                        serial_println!("wifi> associated with '{ssid}' (bring smoltcp up when data path is ready)");
+                        return;
                     }
-                    match crate::net::info().and_then(|i| i.ip) {
-                        Some(ip) => serial_println!("wifi> connected to '{ssid}', got {ip}"),
-                        None => serial_println!("wifi> associated with '{ssid}' but no DHCP lease yet"),
+                    match crate::net::dhcp_start() {
+                        Ok(()) => {
+                            let deadline = crate::arch::now_ms() + 5000;
+                            while crate::arch::now_ms() < deadline {
+                                crate::net::poll();
+                                if crate::net::info().and_then(|i| i.ip).is_some() {
+                                    break;
+                                }
+                                crate::sched::yield_now();
+                            }
+                            match crate::net::info().and_then(|i| i.ip) {
+                                Some(ip) => serial_println!("wifi> connected to '{ssid}', got {ip}"),
+                                None => serial_println!(
+                                    "wifi> associated with '{ssid}' but no DHCP lease yet"
+                                ),
+                            }
+                        }
+                        Err(e) => serial_println!("wifi> {e}"),
                     }
                 }
                 Err(e) => serial_println!("wifi> {e}"),
             }
         }
-        _ => serial_println!("wifi> usage: /wifi [scan|connect <ssid>|info]"),
+        _ => serial_println!("wifi> usage: /wifi [info|power|scan|connect <ssid>|load]"),
     }
 }
 
@@ -11829,11 +11929,11 @@ fn ensure_disk_fallback_fonts() {
     }
 }
 
-/// Scan every disk + volume for the first readable root file named one of
-/// `names` (FAT or ext4). Independent of `/mount`, so it finds a bundled voice
-/// model on the FAT ESP (aarch64) or the ext4 data partition regardless of what
-/// is mounted where.
-fn find_on_disks(names: &[&str]) -> Option<alloc::vec::Vec<u8>> {
+/// Scan every disk + volume for the first readable file named one of
+/// `names` (FAT or ext4; root or subpath like `brcm/foo.bin`). Independent of
+/// `/mount`, so it finds a bundled voice model / WiFi firmware on the FAT ESP
+/// (aarch64) or the ext4 data partition regardless of what is mounted where.
+pub(crate) fn find_on_disks(names: &[&str]) -> Option<alloc::vec::Vec<u8>> {
     use crate::fs::detect::FsType;
     for disk in 0..4usize {
         let Some(mut dev) = crate::block::probe_disk_nth(disk) else {

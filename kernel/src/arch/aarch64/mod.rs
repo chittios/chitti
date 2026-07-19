@@ -6,6 +6,8 @@
 //! (`interrupts`, `hlt`) plus the aarch64-specific bring-up (boot stub, MMU,
 //! PL011 UART, generic timer) the shared upper layers build on.
 
+pub mod apple_pcie;
+pub mod apple_smc;
 pub mod apple_usb;
 pub mod boot;
 pub mod dart;
@@ -203,31 +205,47 @@ pub fn note_uart_fault() {
     UART_PROBE_FAULTED.store(true, Ordering::Release);
 }
 
-// Recoverable-probe flags for reading the AGX **SGX** register block, which
-// takes a synchronous external abort until the GPU/firmware powers it on. Same
-// mechanism as the UART probe: the sync handler skips the faulting `ldr` and
-// notes the fault, so `/agx` can safely test whether the SGX block responds.
+// Recoverable-probe flags for MMIO that external-aborts until the device is
+// powered / linked (AGX SGX block; APCIE secondary-bus ECAM while the WiFi
+// link is down). The sync handler skips the faulting `ldr` and notes the fault.
 static AGX_PROBING: AtomicBool = AtomicBool::new(false);
 static AGX_PROBE_FAULTED: AtomicBool = AtomicBool::new(false);
 
-/// True while probing the SGX register block (read by the sync handler).
+/// True while a recoverable MMIO probe is armed (read by the sync handler).
 pub fn agx_probing() -> bool {
     AGX_PROBING.load(Ordering::Acquire)
 }
-/// Called by the sync handler when a probed SGX read faults.
+/// Called by the sync handler when a probed MMIO read faults.
 pub fn note_agx_fault() {
     AGX_PROBE_FAULTED.store(true, Ordering::Release);
 }
-/// Arm the recoverable SGX probe and clear the prior fault flag.
+/// Arm the recoverable MMIO probe and clear the prior fault flag.
+/// Used for AGX SGX and for Apple PCIe ECAM of unlinked secondary buses.
 pub fn set_agx_probing(on: bool) {
     if on {
         AGX_PROBE_FAULTED.store(false, Ordering::Release);
     }
     AGX_PROBING.store(on, Ordering::Release);
 }
-/// Whether the last armed SGX probe took a fault (external abort).
+/// Whether the last armed MMIO probe took a fault (external abort).
 pub fn agx_probe_faulted() -> bool {
     AGX_PROBE_FAULTED.load(Ordering::Acquire)
+}
+
+/// Recoverable 32-bit Device MMIO read: on external abort returns `None`
+/// instead of killing the kernel. For optional hardware (unlinked PCIe, unpowered
+/// SGX). Always uses a single `ldr w`.
+pub fn probe_read32(addr: u64) -> Option<u32> {
+    set_agx_probing(true);
+    // SAFETY: single 32-bit load; if it external-aborts the sync handler skips
+    // the instruction and sets the fault flag.
+    let v = unsafe { core::ptr::read_volatile(addr as *const u32) };
+    set_agx_probing(false);
+    if agx_probe_faulted() {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 #[inline]

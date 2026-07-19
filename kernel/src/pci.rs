@@ -38,6 +38,13 @@ pub fn write32(bus: u8, dev: u8, func: u8, off: u16, v: u32) {
 pub fn read16(bus: u8, dev: u8, func: u8, off: u16) -> u16 {
     (read32(bus, dev, func, off & !3) >> ((off & 2) * 8)) as u16
 }
+pub fn write16(bus: u8, dev: u8, func: u8, off: u16, v: u16) {
+    let aligned = off & !3;
+    let shift = (off & 2) * 8;
+    let cur = read32(bus, dev, func, aligned);
+    let mask = !(0xffffu32 << shift);
+    write32(bus, dev, func, aligned, (cur & mask) | ((v as u32) << shift));
+}
 pub fn read8(bus: u8, dev: u8, func: u8, off: u16) -> u8 {
     (read32(bus, dev, func, off & !3) >> ((off & 3) * 8)) as u8
 }
@@ -59,7 +66,95 @@ impl PciDevice {
         write32(self.bus, self.dev, self.func, 0x04, cmd | 0b110);
     }
 
+    /// Find PCI Power Management capability and force **D0**.
+    /// Devices left in D3 after reset may still answer config cycles but
+    /// external-abort every BAR MMIO until brought back to D0.
+    pub fn set_power_d0(&self) {
+        // Status bit 4 = cap list present; pointer @0x34.
+        if read16(self.bus, self.dev, self.func, 0x06) & 0x10 == 0 {
+            return;
+        }
+        let mut cap = read8(self.bus, self.dev, self.func, 0x34) as u16 & 0xfc;
+        for _ in 0..48 {
+            if cap == 0 || cap == 0xff {
+                break;
+            }
+            let id = read8(self.bus, self.dev, self.func, cap);
+            if id == 0x01 {
+                // PMCSR at cap+4: bits 1:0 = power state (0 = D0).
+                let pmcsr = read16(self.bus, self.dev, self.func, cap + 4);
+                let state = pmcsr & 0x3;
+                if state != 0 {
+                    write16(
+                        self.bus,
+                        self.dev,
+                        self.func,
+                        cap + 4,
+                        (pmcsr & !0x3) | 0x8000, // D0 + clear PME status
+                    );
+                    crate::ktrace::log_fmt(format_args!(
+                        "pci: {:02x}:{:02x}.{} PM D{state}→D0 (pmcsr was {pmcsr:#06x})",
+                        self.bus, self.dev, self.func
+                    ));
+                } else {
+                    crate::ktrace::log_fmt(format_args!(
+                        "pci: {:02x}:{:02x}.{} already D0 (pmcsr={pmcsr:#06x})",
+                        self.bus, self.dev, self.func
+                    ));
+                }
+                return;
+            }
+            cap = read8(self.bus, self.dev, self.func, cap + 1) as u16 & 0xfc;
+        }
+    }
+
+    /// Program a single 64-bit MEM BAR index (`i` even) to `base`, preserving
+    /// 64-bit type bits. Used by the Apple BAR-window probe.
+    pub fn program_bar64(&self, i: u8, base: u64, type_bits: u32) {
+        let off = 0x10 + i as u16 * 4;
+        write32(
+            self.bus,
+            self.dev,
+            self.func,
+            off,
+            (base as u32 & 0xffff_fff0) | (type_bits & 0xf),
+        );
+        write32(self.bus, self.dev, self.func, off + 4, (base >> 32) as u32);
+    }
+
+    /// Size BAR `i` (write `!0`, read mask). Returns `(size, type_bits, is_64)`.
+    pub fn size_bar(&self, i: u8) -> Option<(u64, u32, bool)> {
+        let off = 0x10 + i as u16 * 4;
+        let cmd = read32(self.bus, self.dev, self.func, 0x04);
+        write32(self.bus, self.dev, self.func, 0x04, cmd & !0b10);
+        write32(self.bus, self.dev, self.func, off, 0xffff_ffff);
+        let mask = read32(self.bus, self.dev, self.func, off);
+        if mask == 0 || mask == 0xffff_ffff || mask & 1 != 0 {
+            write32(self.bus, self.dev, self.func, 0x04, cmd);
+            return None;
+        }
+        let is_64 = (mask >> 1) & 0x3 == 0x2;
+        let type_bits = mask & 0xf;
+        let size = if is_64 {
+            write32(self.bus, self.dev, self.func, off + 4, 0xffff_ffff);
+            let mask_hi = read32(self.bus, self.dev, self.func, off + 4);
+            let size_lo = (!(mask & 0xffff_fff0)).wrapping_add(1) as u64;
+            if mask_hi == 0xffff_ffff {
+                size_lo
+            } else {
+                let full = (mask_hi as u64) << 32 | (mask as u64 & 0xffff_fff0);
+                (!full).wrapping_add(1)
+            }
+        } else {
+            (!(mask & 0xffff_fff0)).wrapping_add(1) as u64
+        };
+        write32(self.bus, self.dev, self.func, 0x04, cmd);
+        Some((size.max(0x1000).next_power_of_two(), type_bits, is_64))
+    }
+
     /// Decode BAR `i`'s base address (memory BARs only), 64-bit aware.
+    /// Returns the **bus** address programmed in the BAR (not CPU PA — on
+    /// Apple Silicon translate with the host's `ranges`).
     pub fn bar(&self, i: u8) -> u64 {
         let off = 0x10 + i as u16 * 4;
         let lo = read32(self.bus, self.dev, self.func, off);
@@ -74,6 +169,103 @@ impl PciDevice {
         } else {
             base
         }
+    }
+
+    /// Size + assign all memory BARs starting at `mem32_base` (typically
+    /// `0xc000_0000` under an Apple root-port 32-bit window). 64-bit BARs use
+    /// `mem64_base` (typically `0x6_a000_0000`). Returns `(next_32, next_64)`.
+    ///
+    /// Firmware/iBoot often leave endpoint BARs at 0; without this, `bar(0)`
+    /// stays zero even after a live link. Follows the standard PCI sizing
+    /// dance (write `!0`, read mask, program base).
+    pub fn assign_mem_bars(&self, mut mem32_base: u64, mut mem64_base: u64) -> (u64, u64) {
+        // Disable MEM decode while reprogramming.
+        let cmd = read32(self.bus, self.dev, self.func, 0x04);
+        write32(self.bus, self.dev, self.func, 0x04, cmd & !0b10);
+
+        let mut i = 0u8;
+        while i < 6 {
+            let off = 0x10 + i as u16 * 4;
+            let orig = read32(self.bus, self.dev, self.func, off);
+            // Size the BAR.
+            write32(self.bus, self.dev, self.func, off, 0xffff_ffff);
+            let mask = read32(self.bus, self.dev, self.func, off);
+            if mask == 0 || mask == 0xffff_ffff {
+                write32(self.bus, self.dev, self.func, off, orig);
+                i += 1;
+                continue;
+            }
+            if mask & 1 != 0 {
+                // I/O BAR — leave alone on aarch64.
+                write32(self.bus, self.dev, self.func, off, orig);
+                i += 1;
+                continue;
+            }
+            let is_64 = (mask >> 1) & 0x3 == 0x2;
+            let pref = (mask >> 3) & 1 != 0;
+            let size_lo = (!(mask & 0xffff_fff0)).wrapping_add(1);
+
+            // Preserve type/prefetch bits from the size mask — NOT from `orig`.
+            // When firmware left the BAR at 0, `orig & 0xf == 0` would clear the
+            // 64-bit type field and the device would only decode the low 32 bits
+            // (e.g. 0xa0000000 instead of 0x6a0000000) → every MMIO external-aborts.
+            let type_bits = mask & 0xf;
+
+            if is_64 {
+                write32(self.bus, self.dev, self.func, off + 4, 0xffff_ffff);
+                let mask_hi = read32(self.bus, self.dev, self.func, off + 4);
+                let size = if mask_hi == 0xffff_ffff {
+                    size_lo as u64
+                } else {
+                    let full = (mask_hi as u64) << 32 | (mask as u64 & 0xffff_fff0);
+                    (!full).wrapping_add(1)
+                };
+                // Size must be power-of-two for the align mask below.
+                let size = size.max(0x1000).next_power_of_two();
+                // Always place 64-bit BARs in the high identity window
+                // (Apple t8112 ranges: PCI 0x6a00_0000_0 ↔ CPU 0x6a00_0000_0).
+                let _ = (pref, mem32_base, orig);
+                let b = (mem64_base + size - 1) & !(size - 1);
+                mem64_base = b + size;
+                write32(
+                    self.bus,
+                    self.dev,
+                    self.func,
+                    off,
+                    (b as u32 & 0xffff_fff0) | type_bits,
+                );
+                write32(self.bus, self.dev, self.func, off + 4, (b >> 32) as u32);
+                // Read back to confirm the device latched a 64-bit decode.
+                let rb_lo = read32(self.bus, self.dev, self.func, off);
+                let rb_hi = read32(self.bus, self.dev, self.func, off + 4);
+                crate::ktrace::log_fmt(format_args!(
+                    "pci: {:02x}:{:02x}.{} BAR{i} 64-bit size={size:#x} -> {b:#x} (type={type_bits:#x} rb={rb_hi:08x}_{rb_lo:08x})",
+                    self.bus, self.dev, self.func
+                ));
+                i += 2;
+            } else {
+                let size = (size_lo as u64).max(0x1000).next_power_of_two();
+                let b = (mem32_base + size - 1) & !(size - 1);
+                mem32_base = b + size;
+                write32(
+                    self.bus,
+                    self.dev,
+                    self.func,
+                    off,
+                    (b as u32 & 0xffff_fff0) | type_bits,
+                );
+                let rb = read32(self.bus, self.dev, self.func, off);
+                crate::ktrace::log_fmt(format_args!(
+                    "pci: {:02x}:{:02x}.{} BAR{i} 32-bit size={size:#x} -> {b:#x} (type={type_bits:#x} rb={rb:#010x})",
+                    self.bus, self.dev, self.func
+                ));
+                i += 1;
+            }
+        }
+
+        // Re-enable MEM + bus master.
+        write32(self.bus, self.dev, self.func, 0x04, cmd | 0b110);
+        (mem32_base, mem64_base)
     }
 
     /// Walk the capability list for a vendor-specific (0x09) cap matching
