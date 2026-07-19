@@ -1560,14 +1560,25 @@ fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
         ai_iscoreup(bar0, &pci, cores.sysmem_wrap),
     ));
 
-    // Config-space Broadcom register dump + indirect-backplane self-test. These
-    // are always reachable (config space, not the clock-gated MEM window), so
-    // they show the chip's true clock/window state and whether the 0x98/0x9c
-    // path can poke the backplane (PMU/SYS_MEM) when the MEM window can't.
+    // Config-space Broadcom register dump (always reachable — config space, not
+    // the clock-gated MEM window) — shows the chip's true clock/window state.
     let rd = |o: u16| crate::pci::read32(pci.bus, pci.dev, pci.func, o);
     out.push(format!(
-        "cfg regs: BAR0_WIN(80)={:#x} BAR1_WIN(84)={:#x} SPROM(88)={:#x} SUBSYS(8c)={:#x} INTMASK(94)={:#x} BP_ADDR(98)={:#x} BP_DATA(9c)={:#x} CLK_CTL(a8)={:#x} LINKCTL(bc)={:#x}",
-        rd(0x80), rd(0x84), rd(0x88), rd(0x8c), rd(0x94), rd(0x98), rd(0x9c), rd(0xa8), rd(0xbc),
+        "cfg regs: BAR0_WIN(80)={:#x} BAR1_WIN(84)={:#x} SPROM(88)={:#x} SUBSYS(8c)={:#x} INTMASK(94)={:#x} CLK_CTL(a8)={:#x} LINKCTL(bc)={:#x}",
+        rd(0x80), rd(0x84), rd(0x88), rd(0x8c), rd(0x94), rd(0xa8), rd(0xbc),
+    ));
+    // Core-liveness probe via the BAR0 window: read each core's first register.
+    // A live/in-reset core returns a real value; a powered-OFF core reads
+    // 0xffffffff or aborts (None). Distinguishes a power-domain gate from reset.
+    out.push(format!(
+        "core probe: cc@18000000={:?} pcie2@18001000={:?} ca7@18020000={:?} d11@18021000={:?} sysmem@18024000={:?} gci@18010000={:?} pmu@18012000={:?}",
+        bp_read32_probe(bar0, &pci, 0x1800_0000),
+        bp_read32_probe(bar0, &pci, 0x1800_1000),
+        bp_read32_probe(bar0, &pci, 0x1802_0000),
+        bp_read32_probe(bar0, &pci, 0x1802_1000),
+        bp_read32_probe(bar0, &pci, 0x1802_4000),
+        bp_read32_probe(bar0, &pci, 0x1801_0000),
+        bp_read32_probe(bar0, &pci, 0x1801_2000),
     ));
     let mut bringup_read: Option<u32> = None;
     if cores.sysmem_base != 0 {
