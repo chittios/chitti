@@ -28,6 +28,7 @@
 //! *first*: HELLO ⇒ firmware resident, milestone achievable; no HELLO ⇒ blocked
 //! on external Asahi GPU-firmware provisioning (reported, not silently hung).
 
+pub mod cdm;
 pub mod proto;
 pub mod uat;
 
