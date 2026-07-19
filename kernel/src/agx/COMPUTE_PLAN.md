@@ -67,6 +67,54 @@ Recommendation: **(1) Mesa AGX compiler** for the kernel binary, cross-checked
 against **(2) applegpu** for the ISA/USC understanding. Defer choosing until Layer
 1–2 are validated (below), since they're independent.
 
+## Layer 3 toolchain investigation (2026-07)
+
+Split the problem in two — they're independent and have different difficulty:
+
+**(3a) The shader ISA — assembling instructions — is the TRACTABLE half.**
+- `dougallj/applegpu`: `assemble.py` (hacky but works) + `applegpu.py` (ISA) +
+  disassembler + emulator + `hwtestbed.py`. **Targets G13 (M1)**; `hwtestbed`
+  injects into **macOS Metal** binary archives (macOS-tethered). G14/M2 ISA is
+  close but not identical — usable as a reference, not turnkey for our M2.
+- **Mesa** (`src/asahi/compiler`) is the authoritative compiler: full AGX/AGX2
+  ISA incl. **G14/G14X**, an OpenCL front-end (`asahi_clc`), XML ISA + XML
+  disassembler. It can compile a GEMM/matvec compute kernel to real G14 ISA.
+- A matvec/GEMM kernel is small (load, FMA loop, store) — assembling it is not the
+  blocker.
+
+**(3b) The compute DISPATCH ABI — USC words + WorkCommandCP register array — is
+the REAL gap.** How the shader address, uniform/argument buffers, and threadgroup/
+grid dims are bound. Findings:
+- The Asahi **kernel** docs (asahilinux.org/docs/hw/soc/agx) explicitly declare
+  this **"purely of userspace concern… out of scope"** — it is NOT documented at
+  the firmware/kernel level.
+- m1n1 has **no compute example** and does not annotate the compute registers
+  (`RegisterDefinition {number,data}`; USC_EXEC_BASE 0x10069 etc. appear only in
+  the *render* path, uncommented). So there are **no capturable reference bytes**
+  and no doc for the compute USC.
+- The ONLY complete public reference is **Mesa source** (`src/asahi/lib` +
+  the compute launch: USC packing, `ComputeInfo`/register-array construction,
+  `libagx`). Reverse-engineering the dispatch = reading that code.
+
+**Revised Layer-3 paths, by confidence:**
+1. **Capture from Asahi Linux + Mesa on the M2 (highest confidence).** Dual-boot
+   Asahi on the Mac mini, run a Mesa OpenCL/compute job, capture the WorkCommandCP
+   + USC + shader (drm/asahi cmdstream dump), replay/port on ChittiOS. This is the
+   compute analog of every capture that has worked for us (initdata, ttbs bind) —
+   known-good ground truth. Cost: dual-boot + dump tooling.
+2. **Port from Mesa source (most self-contained).** Read Mesa's compute launch +
+   USC packing, port to Rust, compile the matvec kernel with Mesa's compiler.
+   No external runtime dependency at run time; cost = weeks of RE from source.
+3. **macOS Metal capture (fallback).** Capture a Metal compute pipeline + command
+   buffer. macOS-tethered; Metal's encoding differs from Mesa's in ways that may
+   not match the firmware path we drive.
+
+**Recommendation:** Path 1 to get known-good compute bytes (mirrors what has
+worked), cross-referenced with Path 2 (Mesa source) to *understand* them, and
+Mesa's compiler for the kernel ISA. Assembling the shader (3a) is easy; the
+dispatch ABI (3b) is the multi-week reverse-engineering core. This is a distinct
+project from Layers 1–2 and gates any hardware validation of them.
+
 ## Proxy-session findings (2026-07, real M2) — CONFIRMED ON HARDWARE
 
 Running the capture against the live proxy settled the two biggest unknowns:
