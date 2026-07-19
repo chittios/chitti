@@ -1389,6 +1389,10 @@ const CL_ITEM: u64 = 0x40; // RunCmdQueueMsg size
 const CL_CHANNEL: u16 = 2; // (priority 0 << 2) | compute(2)
 // Stats channel state (firmware→AP) — re-read to confirm liveness during dispatch.
 const STATS_STATE_VA: u64 = 0xffffffa040563fd0;
+// Event channel state (firmware→AP) — the firmware posts job completion/error
+// events here. Movement ⇒ the firmware actually PROCESSED our submission (even if
+// it errored); no movement + Stats moving ⇒ it never scanned the work channel.
+const EVENT_STATE_VA: u64 = 0xffffffa040377fd0;
 
 /// Round `n` up to the 16 KiB UAT page.
 fn page_up(n: u64) -> u64 {
@@ -1542,8 +1546,10 @@ fn dispatch_hello_compute() {
     ));
 
     // Snapshot the Stats cursor so we can tell if the firmware is even alive
-    // during the dispatch (it advanced during the DevCtrl kick).
+    // during the dispatch (it advanced during the DevCtrl kick), and the Event
+    // cursor to tell if the firmware PROCESSED our job (posts completion/error).
     let stats_before = gpu_read_u32(STATS_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
+    let event_before = gpu_read_u32(EVENT_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
 
     // --- submit RunCmdQueueMsg on the CP channel (CL_0, id 2) + doorbell ---
     let msg = workcmd::run_cmd_queue_msg(workcmd::QUEUE_COMPUTE, va_qi, 1, 1, true);
@@ -1600,6 +1606,20 @@ fn dispatch_hello_compute() {
             "agx: compute: Stats cursor {stats_before:#x}->{stats_after:#x} ({}), fw {}",
             if stats_after != stats_before { "MOVED" } else { "unchanged" },
             if stats_after != stats_before { "alive during dispatch" } else { "may be idle/stuck" }
+        ));
+        // Did the firmware PROCESS the job at all? The Event channel is where it
+        // posts completion/error. MOVED ⇒ it read+processed (content bug, keep
+        // fixing); unchanged (+Stats moving) ⇒ it never scanned the work channel
+        // (firmware-internal activation prereq → needs a reference capture).
+        let event_after = gpu_read_u32(EVENT_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
+        crate::ktrace::log_fmt(format_args!(
+            "agx: compute: Event cursor {event_before:#x}->{event_after:#x} ({}) ⇒ firmware {}",
+            if event_after != event_before { "MOVED" } else { "unchanged" },
+            if event_after != event_before {
+                "PROCESSED the job (read+errored ⇒ content bug)"
+            } else {
+                "never scanned the work channel (activation prereq ⇒ capture needed)"
+            }
         ));
         // The queue's own RingState: did the firmware bump gpu_rptr/gpu_doneptr?
         if let Some(rsp) = rs_phys {
