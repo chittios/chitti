@@ -830,32 +830,37 @@ fn ai_core_reset(bar0: u64, pci: &PciDevice, wrap: u32, prereset: u32, reset: u3
     mdelay(1);
 }
 
-// Chipcommon clock control/status (`SI_CLK_CTL_ST`, chipcommon offset 0x1e0).
-const CC_CLK_CTL_ST: u32 = 0x1e0;
+// Backplane clock control/status bits (`clk_ctl_st`). Same bit layout whether
+// reached via the chipcommon MEM window or PCI **config** space.
 const CCS_FORCEALP: u32 = 0x0000_0001;
 const CCS_FORCEHT: u32 = 0x0000_0002;
 const CCS_ALPAVAIL: u32 = 0x0001_0000;
 const CCS_HTAVAIL: u32 = 0x0002_0000;
 
-/// Force the backplane ALP+HT clock on and wait for HT-available. The dongle
-/// RAM/SYS_MEM array is not reachable (TCM reads abort) unless the high-throughput
-/// backplane clock is running — on a cold m1n1 boot only the always-on domain is
-/// up, which is why chipcommon/EROM read but SYS_MEM/TCM do not. Returns the last
-/// `clk_ctl_st` read (bit 0x20000 = HTAVAIL). Recoverable + bounded.
-fn force_backplane_clock(bar0: u64, pci: &PciDevice) -> Option<u32> {
-    let reg = proto::SI_ENUM_BASE + CC_CLK_CTL_ST;
-    let before = bp_read32_probe(bar0, pci, reg);
-    bp_write32(
-        bar0,
-        pci,
-        reg,
-        before.unwrap_or(0) | CCS_FORCEALP | CCS_FORCEHT,
+/// Force the backplane ALP+HT clock on and wait for HT-available.
+///
+/// **Critical:** on these chips `clk_ctl_st` is a **PCI config-space** register
+/// at `CFG_CLK_CTL_ST` (0xa8) — the `WLANCfgSpace.CLK_CTL_ST` macOS drives
+/// (m1n1 `trace_wlan.py`) — **not** the chipcommon MEM register at 0x1e0. That
+/// matters because the backplane MEM window itself is dead until the clock runs
+/// (a read of chipcommon 0x1e0 external-aborts on a cold boot — observed via
+/// `/wifi diag`: `clk_ctl_st None`), whereas config space is always reachable.
+/// The dongle RAM/SYS_MEM array (and thus its TCM aperture) only answers reads
+/// once HT is available. Returns the last `clk_ctl_st` read. Bounded + Ctrl+C.
+fn force_backplane_clock(pci: &PciDevice) -> u32 {
+    let before = crate::pci::read32(pci.bus, pci.dev, pci.func, CFG_CLK_CTL_ST);
+    crate::pci::write32(
+        pci.bus,
+        pci.dev,
+        pci.func,
+        CFG_CLK_CTL_ST,
+        before | CCS_FORCEALP | CCS_FORCEHT,
     );
     let deadline = crate::arch::now_ms() + 200;
     let mut last = before;
     while crate::arch::now_ms() < deadline {
-        last = bp_read32_probe(bar0, pci, reg);
-        if last.map(|v| v & CCS_HTAVAIL != 0).unwrap_or(false) {
+        last = crate::pci::read32(pci.bus, pci.dev, pci.func, CFG_CLK_CTL_ST);
+        if last & CCS_HTAVAIL != 0 {
             break;
         }
         mdelay(2);
@@ -864,9 +869,9 @@ fn force_backplane_clock(bar0: u64, pci: &PciDevice) -> Option<u32> {
         }
     }
     crate::ktrace::log_fmt(format_args!(
-        "wifi: force backplane clock: clk_ctl_st {before:?} -> {last:?} (ALPAVAIL={} HTAVAIL={})",
-        last.map(|v| v & CCS_ALPAVAIL != 0).unwrap_or(false),
-        last.map(|v| v & CCS_HTAVAIL != 0).unwrap_or(false),
+        "wifi: force clock via cfg[0xa8]: {before:#x} -> {last:#x} (ALPAVAIL={} HTAVAIL={})",
+        last & CCS_ALPAVAIL != 0,
+        last & CCS_HTAVAIL != 0,
     ));
     last
 }
@@ -1067,7 +1072,7 @@ fn download_fw_nvram(
     //    high-throughput backplane clock runs — chipcommon/EROM sit on the
     //    always-on domain and read fine, which masks this. Diagnosed via
     //    `/wifi diag` (VERDICT b): BAR2 aborts at every base while BAR0 reads.
-    let _ = force_backplane_clock(dev.bar0, &dev.pci);
+    let _ = force_backplane_clock(&dev.pci);
 
     // 1. Halt ARM so TCM is ours.
     if cores.arm_wrap != 0 {
@@ -1602,11 +1607,12 @@ fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
         //  3. bring SYS_MEM out of reset with the fixed ai_core_reset,
         // then re-read the same TCM location. None→Some ⇒ the sequence works and
         // belongs in the download path.
-        crate::ktrace::log("wifi", "diag: force clock + CA7 halt + SYS_MEM reset, re-test TCM");
-        let clk = force_backplane_clock(bar0, &pci);
+        crate::ktrace::log("wifi", "diag: force clock (cfg 0xa8) + CA7 halt + SYS_MEM reset, re-test TCM");
+        let clk = force_backplane_clock(&pci);
         out.push(format!(
-            "clk_ctl_st={clk:?} HTAVAIL={}",
-            clk.map(|v| v & CCS_HTAVAIL != 0).unwrap_or(false)
+            "clk_ctl_st(cfg0xa8)={clk:#x} ALPAVAIL={} HTAVAIL={}",
+            clk & CCS_ALPAVAIL != 0,
+            clk & CCS_HTAVAIL != 0
         ));
         if cores.arm_wrap != 0 {
             arm_halt(bar0, &pci, cores.arm_wrap);
