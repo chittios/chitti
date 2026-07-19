@@ -356,19 +356,14 @@ fn get_or_alloc_table(table: u64, idx: usize) -> Option<u64> {
 /// table bases for each half; the VA's bit-39 select picks which — TTBR1 (the
 /// firmware's shared `pagetables`) for RTKit kernel buffers, so they're reachable
 /// from the firmware's boot context.
-fn uat_map_page(l1_ttbr0: u64, l1_ttbr1: u64, va: u64, pa: u64) -> bool {
+fn uat_map_page(l1_ttbr0: u64, l1_ttbr1: u64, va: u64, pa: u64, mmio: bool) -> bool {
     let (l0, i1, i2, i3, _) = uat::split_va(va);
     let l1 = if l0 == 1 { l1_ttbr1 } else { l1_ttbr0 };
     let Some(l2) = get_or_alloc_table(l1, i1) else { return false };
     let Some(l3) = get_or_alloc_table(l2, i2) else { return false };
     let slot = l3 + i3 as u64 * 8;
-    // Adding into the firmware's LIVE shared tables — an already-valid leaf here
-    // means our chosen VA collides with a firmware mapping (pick another range).
-    let existing = rd64(slot);
-    if uat::is_valid(existing) {
-        crate::ktrace::log_fmt(format_args!("agx: uat VA {va:#x} already mapped by firmware (leaf {existing:#018x}) — collision!"));
-    }
-    wr64(slot, uat::kernel_buffer_pte(pa));
+    let pte = if mmio { uat::mmio_page_pte(pa) } else { uat::kernel_buffer_pte(pa) };
+    wr64(slot, pte);
     dcache_clean(slot, 8);
     true
 }
@@ -394,17 +389,45 @@ fn uat_map_buffer(phys: u64, bytes: u64) -> Option<u64> {
 /// place a buffer at a *specific* GPU VA (the initdata replay). Returns false on
 /// OOM/failure.
 fn uat_map_range(va: u64, phys: u64, bytes: u64) -> bool {
+    uat_map_range_kind(va, phys, bytes, false)
+}
+
+/// Like [`uat_map_range`] but `mmio` selects the Device leaf attribute (for the
+/// AGX IOMappings — GPU-register MMIO mapped into the kernel VM).
+fn uat_map_range_kind(va: u64, phys: u64, bytes: u64, mmio: bool) -> bool {
     let (l1_ttbr0, l1_ttbr1) = UAT.with(|u| (u.l1, u.pagetables));
     let npages = bytes.div_ceil(uat::PAGE_SIZE).max(1);
     for i in 0..npages {
         let off = i * uat::PAGE_SIZE;
-        if !uat_map_page(l1_ttbr0, l1_ttbr1, (va + off) & !uat::PAGE_MASK, phys + off) {
+        if !uat_map_page(l1_ttbr0, l1_ttbr1, (va + off) & !uat::PAGE_MASK, phys + off, mmio) {
             crate::ktrace::log("agx", "uat: page map failed (OOM)");
             return false;
         }
     }
     true
 }
+
+/// The AGX **IOMappings** — GPU-register MMIO the firmware needs mapped into its
+/// kernel VM (initdata RegionC iomappings). Captured from the live-M2 struct
+/// dump (t8112); fixed SoC physical addresses. `(gpu_va, phys, size)`.
+const IOMAPPINGS: &[(u64, u64, u64)] = &[
+    (0xffffffa068000000, 0x204d00000, 0x14000),
+    (0xffffffa068018000, 0x20e100000, 0x4000),
+    (0xffffffa068020000, 0x23b0c4000, 0x4000),
+    (0xffffffa068028000, 0x204000000, 0x20000),
+    (0xffffffa06804c000, 0x23b2c0000, 0x1000),
+    (0xffffffa068054000, 0x204d80000, 0x8000),
+    (0xffffffa068061000, 0x204d61000, 0x1000),
+    (0xffffffa068068000, 0x200000000, 0xd6400),
+    (0xffffffa068144000, 0x204e00000, 0x10000),
+    (0xffffffa068158000, 0x27d050000, 0x4000),
+    (0xffffffa068160000, 0x23b3d0000, 0x1000),
+    (0xffffffa068168000, 0x23b3c0000, 0x1000),
+];
+/// The GPU timestamp region (initdata `timestamp_region_base`) — a DRAM buffer in
+/// the kgpurw allocator that the memmap scan didn't reach. Map zeroed DRAM here.
+const TIMESTAMP_REGION_VA: u64 = 0xffffffa071000000;
+const TIMESTAMP_REGION_SIZE: u64 = 0x10000;
 
 /// Replay the captured ctx-0 GPU memory map from the live M2: for every range,
 /// allocate DRAM, map it at the *identical* GPU VA (so the embedded pointers in
@@ -438,7 +461,26 @@ fn replay_initdata() -> Option<u64> {
         }
         mapped_bytes += size;
     }
-    crate::ktrace::log_fmt(format_args!("agx: initdata replay done — {mapped_bytes:#x} bytes mapped, initdata VA {INITDATA_VA:#x}"));
+
+    // Map the GPU-register IOMappings (MMIO → GPU VA, Device attr) at their exact
+    // VAs. These aren't DRAM — the physical is the SoC register block itself.
+    for &(gpu_va, phys, size) in IOMAPPINGS {
+        crate::arch::aarch64::mmu::map_device_gib(phys);
+        if !uat_map_range_kind(gpu_va, phys, size, true) {
+            crate::ktrace::log_fmt(format_args!("agx: IOMapping {gpu_va:#x}->{phys:#x} failed"));
+            return None;
+        }
+    }
+    // The timestamp region (DRAM, zeroed) that the memmap scan didn't reach.
+    if let Some(ts) = alloc_shared(TIMESTAMP_REGION_SIZE / 4096) {
+        dcache_clean(ts, TIMESTAMP_REGION_SIZE);
+        let _ = uat_map_range(TIMESTAMP_REGION_VA, ts, TIMESTAMP_REGION_SIZE);
+    }
+
+    crate::ktrace::log_fmt(format_args!(
+        "agx: initdata replay done — {mapped_bytes:#x} DRAM + {} IOMappings, initdata VA {INITDATA_VA:#x}",
+        IOMAPPINGS.len()
+    ));
     Some(INITDATA_VA)
 }
 

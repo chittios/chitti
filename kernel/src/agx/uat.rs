@@ -114,6 +114,13 @@ pub const fn kernel_buffer_pte(pa: u64) -> u64 {
     page_pte(pa, ATTR_NORMAL, 1, true, false, true)
 }
 
+/// A leaf page mapping GPU-register **MMIO** into the kernel context (the AGX
+/// IOMappings): Device attribute so the GPU's MMU treats it as registers, not
+/// cacheable RAM. Same OS/AP/UXN as a kernel buffer.
+pub const fn mmio_page_pte(pa: u64) -> u64 {
+    page_pte(pa, ATTR_DEVICE, 1, true, false, true)
+}
+
 /// Encode an L1/L2 **table** descriptor pointing at the next-level table at
 /// physical `next_table_pa` (16 KiB-aligned). Pure.
 pub const fn table_pte(next_table_pa: u64) -> u64 {
