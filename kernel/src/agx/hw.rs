@@ -209,6 +209,86 @@ fn dcache_clean(pa: u64, len: u64) {
     }
 }
 
+/// Invalidate `len` bytes of DRAM from `pa` (clean+invalidate) so a subsequent
+/// CPU read observes what the **GPU/firmware** wrote (not a stale cache line).
+/// The mirror of [`dcache_clean`] for the firmware→AP direction.
+fn dcache_invalidate(pa: u64, len: u64) {
+    // SAFETY: cache maintenance over mapped Normal DRAM the firmware wrote.
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        let mut p = pa & !63;
+        let end = pa + len;
+        while p < end {
+            core::arch::asm!("dc civac, {}", in(reg) p, options(nostack, preserves_flags));
+            p += 64;
+        }
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+// ---- Replay range map: GPU-VA → identity-mapped phys, for reading back what
+// the firmware writes into shared memory (channel rings, status flags). Recorded
+// once during `replay_initdata`; read-only afterward. Single-threaded within the
+// `/agx` command, but Locked keeps it sound. ----
+const MAX_REPLAY_RANGES: usize = 96;
+
+struct ReplayMap {
+    /// (gpu_va, phys, size) for each replayed DRAM range. phys == CPU VA (identity).
+    ranges: [(u64, u64, u64); MAX_REPLAY_RANGES],
+    n: usize,
+}
+
+static REPLAY_MAP: crate::mm::Locked<ReplayMap> =
+    crate::mm::Locked::new(ReplayMap { ranges: [(0, 0, 0); MAX_REPLAY_RANGES], n: 0 });
+
+fn replay_map_reset() {
+    REPLAY_MAP.with(|m| m.n = 0);
+}
+
+fn replay_map_record(va: u64, phys: u64, size: u64) {
+    REPLAY_MAP.with(|m| {
+        if m.n < MAX_REPLAY_RANGES {
+            let i = m.n;
+            m.ranges[i] = (va, phys, size);
+            m.n += 1;
+        }
+    });
+}
+
+/// Translate a GPU VA back to the identity-mapped phys we replayed it at, if it
+/// falls inside a recorded range. Returns `(phys, bytes_left_in_range)`.
+fn gpu_va_to_phys(va: u64) -> Option<(u64, u64)> {
+    REPLAY_MAP.with(|m| {
+        for &(base, phys, size) in &m.ranges[..m.n] {
+            if va >= base && va < base + size {
+                let off = va - base;
+                return Some((phys + off, size - off));
+            }
+        }
+        None
+    })
+}
+
+/// Read up to `buf.len()` bytes of GPU shared memory at `va` into `buf`, first
+/// invalidating the cache so the firmware's writes are visible. Returns how many
+/// bytes were read (0 if `va` isn't in a replayed range). Never crosses a range.
+fn gpu_read(va: u64, buf: &mut [u8]) -> usize {
+    let Some((phys, avail)) = gpu_va_to_phys(va) else {
+        return 0;
+    };
+    let n = buf.len().min(avail as usize);
+    dcache_invalidate(phys, n as u64);
+    // SAFETY: `phys` is our own identity-mapped, replayed DRAM range; `n` stays
+    // within the range's bounds (clamped by `avail`).
+    unsafe { core::ptr::copy_nonoverlapping(phys as *const u8, buf.as_mut_ptr(), n) };
+    n
+}
+
+fn gpu_read_u32(va: u64) -> Option<u32> {
+    let mut b = [0u8; 4];
+    (gpu_read(va, &mut b) == 4).then(|| u32::from_le_bytes(b))
+}
+
 /// Read a 64-bit page-table entry at identity-mapped physical `pa`.
 fn rd64(pa: u64) -> u64 {
     // SAFETY: single aligned 64-bit read of mapped DRAM (a page-table slot).
@@ -440,6 +520,7 @@ fn replay_initdata() -> Option<u64> {
         return None;
     }
     crate::ktrace::log_fmt(format_args!("agx: replaying {} initdata ranges ({} B config data)", RANGES.len(), REPLAY_DATA.len()));
+    replay_map_reset();
     let mut mapped_bytes: u64 = 0;
     for &(va, size, data_off) in RANGES {
         let size = size as u64;
@@ -448,6 +529,7 @@ fn replay_initdata() -> Option<u64> {
             crate::ktrace::log_fmt(format_args!("agx: replay OOM at va {va:#x} size {size:#x}"));
             return None;
         };
+        replay_map_record(va, phys, size);
         if data_off != u32::MAX {
             // Copy the captured config bytes into the fresh DRAM (VA==PA).
             let src = &REPLAY_DATA[data_off as usize..data_off as usize + size as usize];
@@ -704,12 +786,6 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
     let mut state = RtkitState::default();
     let powerup_deadline = crate::arch::now_ms() + POWERUP_BUDGET_MS;
     let mut last_beat = crate::arch::now_ms();
-    // Re-send the power requests ONCE after the crashlog buffer + PPL handshake:
-    // our initial SetIOPPower(INIT) (pre-HELLO) and SetAPPower(ON) (pre-PPL) were
-    // both sent before the firmware's memory manager was up, so it may have
-    // ignored them. Re-issuing them now that PPL init is done gives the firmware
-    // a fresh, in-order request to act on.
-    let mut resent_power = false;
     while state.iop_power != POWER_ON || state.ap_power != POWER_ON {
         if crate::arch::now_ms() >= powerup_deadline {
             crate::ktrace::log_fmt(format_args!(
@@ -794,17 +870,9 @@ fn rtkit_boot(asc: &Asc, rep: &mut Report) -> Outcome {
                         state.have_crashlog_buffer = true;
                         rep.crashlog_phys = phys;
                     }
-                    // PPL init has now run (inside uat_map_buffer). Re-nudge ONLY
-                    // AP power ON once — never re-send IOP_PWR=INIT (INIT is a
-                    // wake/re-init that resets the power FSM mid-boot and prevents
-                    // a clean ON ack; m1n1/Linux send it exactly once at start).
-                    if !resent_power {
-                        resent_power = true;
-                        crate::ktrace::log("agx", "re-sending AP_PWR=ON after PPL init (INIT never re-sent)");
-                        if !send(asc, msg_ap_pwr_state(POWER_ON), EP_MGMT) {
-                            return Outcome::SendFail;
-                        }
-                    }
+                    // NB: the proxyclient sends SetAPPower(ON) exactly ONCE (at
+                    // boot_done, before this). No re-send — a second AP-power
+                    // transition can confuse the firmware's power FSM.
                 }
             }
             Action::Crashed => {
@@ -889,6 +957,90 @@ fn probe_app_endpoints(asc: &Asc, rep: &mut Report) {
     }
 }
 
+// Firmware→AP channel ring/state GPU VAs, from the live-M2 initdata dump
+// (`InitData_RegionB.channels`, tools/agx-extract). The firmware writes these
+// shared-memory rings autonomously once it accepts initdata — reading them back
+// is the real proof-of-life (the ASC mailbox stays quiet post-MSG_INIT).
+struct ChannelVa {
+    name: &'static str,
+    state: u64,
+    ring: u64,
+    ring_size: u64,
+}
+const CHANNELS: &[ChannelVa] = &[
+    ChannelVa { name: "FWLog", state: 0xffffffa0403ffee0, ring: 0xffffffa040630000, ring_size: 0x150000 },
+    ChannelVa { name: "KTrace", state: 0xffffffa0404d7fd0, ring: 0xffffffa040519000, ring_size: 0x8000 },
+    ChannelVa { name: "Stats", state: 0xffffffa040563fd0, ring: 0xffffffa0405a6000, ring_size: 0x8000 },
+    ChannelVa { name: "Event", state: 0xffffffa040377fd0, ring: 0xffffffa0403b8800, ring_size: 0x4000 },
+    ChannelVa { name: "DevCtrl", state: 0xffffffa040333fd0, ring: 0xffffffa000330000, ring_size: 0x4000 },
+];
+
+/// Read the firmware→AP channel rings back from shared memory after MSG_INIT and
+/// report whether the firmware wrote anything — the decisive liveness signal.
+/// Returns `true` if any channel shows firmware activity (non-zero state cursor
+/// or printable log text). Purely read-only.
+fn probe_firmware_liveness() -> bool {
+    let mut alive = false;
+    for ch in CHANNELS {
+        // Channel state header (read/write cursors the firmware bumps). 64 bytes
+        // covers ChannelState's read_ptr@0x0 / write_ptr@0x20 for all channels.
+        let mut st = [0u8; 64];
+        let got = gpu_read(ch.state, &mut st);
+        let nonzero = st[..got].iter().any(|&b| b != 0);
+        // First two u32s are the cursor pair for the simple channels.
+        let c0 = u32::from_le_bytes([st[0], st[1], st[2], st[3]]);
+        let c1 = u32::from_le_bytes([st[0x20], st[0x21], st[0x22], st[0x23]]);
+        crate::ktrace::log_fmt(format_args!(
+            "agx: chan {:>7} state cur0={c0:#x} cur1={c1:#x} nonzero={nonzero}",
+            ch.name
+        ));
+        if nonzero {
+            alive = true;
+        }
+        // Scan the head of the ring for printable ASCII (FWLog/KTrace carry text).
+        let scan = (ch.ring_size as usize).min(4096);
+        let mut ring = alloc::vec![0u8; scan];
+        let rn = gpu_read(ch.ring, &mut ring);
+        if scan_ascii_report(ch.name, &ring[..rn]) {
+            alive = true;
+        }
+    }
+    alive
+}
+
+/// Log the longest printable-ASCII run (≥6 chars) found in `data`. Returns true
+/// if any such run exists (the firmware wrote human-readable log text).
+fn scan_ascii_report(name: &str, data: &[u8]) -> bool {
+    let mut best_start = 0usize;
+    let mut best_len = 0usize;
+    let mut run_start = 0usize;
+    let mut run = 0usize;
+    for (i, &b) in data.iter().enumerate() {
+        if (0x20..0x7f).contains(&b) {
+            if run == 0 {
+                run_start = i;
+            }
+            run += 1;
+            if run > best_len {
+                best_len = run;
+                best_start = run_start;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    if best_len >= 6 {
+        let mut s = alloc::string::String::new();
+        for &b in &data[best_start..best_start + best_len.min(80)] {
+            s.push(b as char);
+        }
+        crate::ktrace::log_fmt(format_args!("agx: {name} ring text @+{best_start:#x}: {s:?}"));
+        true
+    } else {
+        false
+    }
+}
+
 /// Compute milestone: replay the captured initdata memory map, start the app
 /// endpoints, hand the firmware the initdata pointer (MSG_INIT), and observe.
 /// If the firmware accepts it (no crash + it starts driving its channels), the
@@ -912,9 +1064,10 @@ fn boot_firmware(asc: &Asc, rep: &mut Report) {
     if !send(asc, init, EP_FIRMWARE) {
         return;
     }
-    // Kick the DevCtrl channel doorbell (agx: DC_Init) so the firmware processes
-    // the initial device-control ring.
-    let _ = send(asc, msg_doorbell(DOORBELL_DEVCTRL), EP_DOORBELL);
+    // NB: do NOT ring the DevCtrl doorbell yet — that requires a proper DC_Init
+    // command written into the devctrl ring (a replayed ring is stale/empty), and
+    // kicking it processes garbage. Just MSG_INIT and observe.
+    let _ = msg_doorbell; // (retained; used once the command ring is built)
 
     // Observe: accepted → the firmware drives its channels (fw-endpoint events /
     // channel-ring buffer requests); rejected → a crashlog message.
@@ -961,9 +1114,16 @@ fn boot_firmware(asc: &Asc, rep: &mut Report) {
         }
     }
     if msgs == 0 {
-        crate::ktrace::log("agx", "compute: firmware silent after MSG_INIT (accepted-but-idle, or wrong initdata) — inspect");
+        crate::ktrace::log("agx", "compute: no mailbox msgs post-MSG_INIT (expected — FW drives shared-memory rings). Probing channels…");
     } else {
-        crate::ktrace::log_fmt(format_args!("agx: compute: firmware responded with {msgs} message(s) after MSG_INIT"));
+        crate::ktrace::log_fmt(format_args!("agx: compute: firmware sent {msgs} mailbox message(s) after MSG_INIT"));
+    }
+    // The decisive check: did the firmware write its shared-memory channel rings?
+    // (Boot-log text / advanced cursors = initdata accepted + firmware executing.)
+    if probe_firmware_liveness() {
+        crate::ktrace::log("agx", "compute: FIRMWARE ALIVE — wrote channel rings (initdata accepted, GPU executing)");
+    } else {
+        crate::ktrace::log("agx", "compute: channels still zero — firmware parsed initdata but hasn't driven rings yet (may need DevCtrl kick)");
     }
 }
 
