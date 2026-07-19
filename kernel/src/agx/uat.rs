@@ -121,6 +121,17 @@ pub const fn mmio_page_pte(pa: u64) -> u64 {
     page_pte(pa, ATTR_DEVICE, 1, true, false, true)
 }
 
+/// A leaf page mapping a **per-context** object (userspace/GEM data or a pipeline
+/// page) into a GPU context's TTBR0. Context objects are `Shared` attr, host-owned
+/// (`OS=1`), **non-global** (`nG=1`, so the firmware's per-context TLB tagging is
+/// correct), and execute-never to the two privilege levels (`UXN|PXN`). `AP=0` for
+/// data buffers, `AP=1` for pipeline (shader) pages — mirrors uat.py context
+/// `buf_at(is_pipeline)`. Pure.
+pub const fn context_page_pte(pa: u64, is_pipeline: bool) -> u64 {
+    let ap = if is_pipeline { 1 } else { 0 };
+    page_pte(pa, ATTR_SHARED, ap, true, true, true) | PTE_NG
+}
+
 /// Encode an L1/L2 **table** descriptor pointing at the next-level table at
 /// physical `next_table_pa` (16 KiB-aligned). Pure.
 pub const fn table_pte(next_table_pa: u64) -> u64 {
@@ -233,6 +244,25 @@ mod tests {
         assert_eq!((d >> ATTR_SHIFT) & 0x7, ATTR_DEVICE);
         assert_eq!(d & PTE_OS, 0);
         assert_eq!(pte_output(d), pa);
+    }
+
+    #[test_case]
+    fn context_page_pte_flags() {
+        let pa = 0x8_1234_0000u64;
+        // Data buffer: Shared attr, AP=0, nG=1, UXN|PXN, OS=1.
+        let d = context_page_pte(pa, false);
+        assert!(is_valid(d));
+        assert_eq!((d >> ATTR_SHIFT) & 0x7, ATTR_SHARED);
+        assert_eq!((d >> AP_SHIFT) & 0x3, 0);
+        assert_eq!(d & PTE_NG, PTE_NG);
+        assert_eq!(d & PTE_UXN, PTE_UXN);
+        assert_eq!(d & PTE_PXN, PTE_PXN);
+        assert_eq!(d & PTE_OS, PTE_OS);
+        assert_eq!(pte_output(d), pa);
+        // Pipeline page: same, but AP=1 (shader-reachable).
+        let p = context_page_pte(pa, true);
+        assert_eq!((p >> AP_SHIFT) & 0x3, 1);
+        assert_eq!(p & PTE_NG, PTE_NG);
     }
 
     #[test_case]

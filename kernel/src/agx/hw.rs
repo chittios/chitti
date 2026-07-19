@@ -186,12 +186,13 @@ struct UatState {
     ready: bool,
     ttbs: u64,       // gpu-region carveout phys (per-context TTBR pairs)
     pagetables: u64, // gfx-shared-region carveout phys (firmware TTBR1)
+    handoff: u64,    // GFXHandoff carveout phys (PPL lock for TTBR writes)
     l1: u64,         // our ctx-0 TTBR0 L1 table phys
     va_next: u64,    // bump allocator for buffer GPU VAs
 }
 
 static UAT: crate::mm::Locked<UatState> =
-    crate::mm::Locked::new(UatState { ready: false, ttbs: 0, pagetables: 0, l1: 0, va_next: BUF_VA_BASE });
+    crate::mm::Locked::new(UatState { ready: false, ttbs: 0, pagetables: 0, handoff: 0, l1: 0, va_next: BUF_VA_BASE });
 
 /// Clean `len` bytes of DRAM from `pa` to the point of coherency so the GPU's
 /// MMU walker sees our freshly-written PTEs (the xhci DART-publish pattern:
@@ -423,6 +424,7 @@ fn uat_init() -> bool {
     UAT.with(|u| {
         u.ttbs = ttbs;
         u.pagetables = pagetables;
+        u.handoff = handoff;
         u.l1 = l1;
         u.va_next = BUF_VA_BASE;
         u.ready = true;
@@ -504,6 +506,132 @@ fn uat_map_range_kind(va: u64, phys: u64, bytes: u64, mmio: bool) -> bool {
         }
     }
     true
+}
+
+// ===================== Layer 1: per-agent GPU context =====================
+//
+// A GPU *context* is its own TTBR0 address space (a fresh L1) bound into the ttbs
+// per-context slot, sharing the firmware's TTBR1 (`pagetables`). Command buffers
+// and their data live in a context; a submission's `context_id` selects it.
+// Reference: m1n1 `agx/context.py GPUContext` — a zeroed L1,
+// `bind_context(ctx_id, ttbr0)`, object mappings via `iomap_at`. VA layout
+// (proxyclient): pipelines 0x1100000000, GEM 0x1500000000, userspace 0x1600000000.
+
+/// Standard GPU-VA region bases inside a context (proxyclient `GPUContext`).
+#[allow(dead_code)] // pipeline/userspace regions used by Layer 2, landing next
+const CTX_PIPELINE_BASE: u64 = 0x1100000000;
+const CTX_GEM_BASE: u64 = 0x1500000000;
+#[allow(dead_code)]
+const CTX_USERSPACE_BASE: u64 = 0x1600000000;
+
+/// A live GPU context: its numeric id (ASID) + the phys of its TTBR0 L1 table.
+#[derive(Clone, Copy)]
+struct GpuContext {
+    ctx_id: u16,
+    l1: u64,
+}
+
+/// Create + bind a fresh GPU context: allocate a zeroed TTBR0 L1 and program the
+/// ttbs pair for `ctx_id` (TTBR0 = our L1, TTBR1 = the shared firmware
+/// `pagetables`) under the GFXHandoff PPL lock — exactly as ctx-0 is set in
+/// `uat_init`, and as the proxyclient's `bind_context` does. `None` on OOM / lock
+/// failure. `ctx_id` 0 is the kernel context and is never re-bound here.
+fn create_context(ctx_id: u16) -> Option<GpuContext> {
+    if ctx_id == 0 || !uat_init() {
+        return None;
+    }
+    let (ttbs, pagetables, handoff) = UAT.with(|u| (u.ttbs, u.pagetables, u.handoff));
+    let l1 = alloc_shared(1)?;
+    dcache_clean(l1, uat::PAGE_SIZE);
+    let ttbr0 = uat::ttbr(l1, ctx_id as u64, true);
+    let ttbr1 = uat::ttbr(pagetables, ctx_id as u64, true);
+    let base = ttbs + uat::ttbr_slot_offset(ctx_id as usize, 0);
+    let locked = handoff::with_lock(handoff, 2000, &mut pump, || {
+        wr64(ttbs + uat::ttbr_slot_offset(ctx_id as usize, 0), ttbr0);
+        wr64(ttbs + uat::ttbr_slot_offset(ctx_id as usize, 1), ttbr1);
+        dcache_clean(base, uat::TTBR_PAIR_BYTES);
+        dcache_clean(l1, uat::PAGE_SIZE);
+    });
+    if !locked {
+        crate::ktrace::log("agx", "ctx: could not take handoff lock to bind context");
+        return None;
+    }
+    crate::ktrace::log_fmt(format_args!(
+        "agx: ctx {ctx_id} bound TTBR0={ttbr0:#018x} (L1 {l1:#x}) TTBR1={ttbr1:#018x}"
+    ));
+    Some(GpuContext { ctx_id, l1 })
+}
+
+/// Map one 16 KiB context object page into `ctx`'s TTBR0 (low-half VA; `pipeline`
+/// picks the shader AP). Intermediate tables are allocated in the context's own L1
+/// subtree. False if the VA is in the high half (bit 39 set) or on OOM.
+fn ctx_map_page(ctx: &GpuContext, va: u64, pa: u64, pipeline: bool) -> bool {
+    let (l0, i1, i2, i3, _) = uat::split_va(va);
+    if l0 != 0 {
+        return false; // context objects live in TTBR0
+    }
+    let Some(l2) = get_or_alloc_table(ctx.l1, i1) else { return false };
+    let Some(l3) = get_or_alloc_table(l2, i2) else { return false };
+    let slot = l3 + i3 as u64 * 8;
+    wr64(slot, uat::context_page_pte(pa, pipeline));
+    dcache_clean(slot, 8);
+    true
+}
+
+/// Map `[va, va+bytes)` → `[phys, …)` into `ctx` page-by-page. `bytes` rounds up
+/// to 16 KiB. False on OOM.
+#[allow(dead_code)] // used by Layer 2 (command-buffer objects), landing next
+fn ctx_map_range(ctx: &GpuContext, va: u64, phys: u64, bytes: u64, pipeline: bool) -> bool {
+    let npages = bytes.div_ceil(uat::PAGE_SIZE).max(1);
+    for i in 0..npages {
+        let off = i * uat::PAGE_SIZE;
+        if !ctx_map_page(ctx, (va + off) & !uat::PAGE_MASK, phys + off, pipeline) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Allocate `bytes` of zeroed DRAM and map it into `ctx` at `va` (bump-agnostic —
+/// caller picks the VA within a region). Returns the backing phys, or `None`.
+#[allow(dead_code)] // used by Layer 2, landing next
+fn ctx_alloc_at(ctx: &GpuContext, va: u64, bytes: u64, pipeline: bool) -> Option<u64> {
+    let npages = bytes.div_ceil(uat::PAGE_SIZE).max(1);
+    let phys = alloc_shared(npages)?;
+    dcache_clean(phys, npages * uat::PAGE_SIZE);
+    ctx_map_range(ctx, va, phys, npages * uat::PAGE_SIZE, pipeline).then_some(phys)
+}
+
+/// Smoke-test the context layer on hardware: create a fresh context, map one test
+/// page, and read the ttbs bind + L1 chain back to confirm the descriptors landed
+/// correctly (and that binding a new context doesn't fault the firmware). Does not
+/// submit work — that is Layer 2.
+fn context_selftest() {
+    let Some(ctx) = create_context(64) else {
+        crate::ktrace::log("agx", "ctx: selftest — create_context failed");
+        return;
+    };
+    let (ttbs,) = UAT.with(|u| (u.ttbs,));
+    let bound0 = rd64(ttbs + uat::ttbr_slot_offset(64, 0));
+    let bound1 = rd64(ttbs + uat::ttbr_slot_offset(64, 1));
+    crate::ktrace::log_fmt(format_args!(
+        "agx: ctx selftest — ttbs[64] TTBR0={bound0:#018x} TTBR1={bound1:#018x} (L1 {:#x})",
+        ctx.l1
+    ));
+    // Map a test page at the GEM base and verify the walk resolves to it.
+    let Some(phys) = alloc_shared(1) else { return };
+    if !ctx_map_page(&ctx, CTX_GEM_BASE, phys, false) {
+        crate::ktrace::log("agx", "ctx: selftest — ctx_map_page failed");
+        return;
+    }
+    let (_, i1, i2, i3, _) = uat::split_va(CTX_GEM_BASE);
+    let l2 = uat::pte_output(rd64(ctx.l1 + i1 as u64 * 8));
+    let l3 = uat::pte_output(rd64(l2 + i2 as u64 * 8));
+    let leaf = rd64(l3 + i3 as u64 * 8);
+    let ok = uat::is_valid(leaf) && uat::pte_output(leaf) == phys;
+    crate::ktrace::log_fmt(format_args!(
+        "agx: ctx selftest — GEM {CTX_GEM_BASE:#x} -> leaf {leaf:#018x} (phys {phys:#x}) walk_ok={ok}"
+    ));
 }
 
 /// The AGX **IOMappings** — GPU-register MMIO the firmware needs mapped into its
@@ -1425,8 +1553,9 @@ pub fn command(arg: &str) {
         }
         "status" | "info" => status(),
         "sgx" | "dump" => sgx_dump(),
+        "ctx" => context_selftest(),
         other => {
-            crate::serial_println!("agx> unknown subcommand '{other}' (try: up | status | sgx)");
+            crate::serial_println!("agx> unknown subcommand '{other}' (try: up | status | sgx | ctx)");
         }
     }
 }
