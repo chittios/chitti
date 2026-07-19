@@ -890,6 +890,8 @@ struct ChipCores {
     /// PCIE2 core rev — selects the watchdog SSRESET gating mask (rev < 66 must
     /// also set CC_WD_SSRESET_PCIE_ALL_FN_EN). 0 if the core wasn't found.
     pcie2_rev: u8,
+    /// PCIE2 core backplane base (for the BAR1/TCM window fixup). 0 if missing.
+    pcie2_base: u32,
 }
 
 /// Scan the DMP EROM for ARM + SYS_MEM cores.
@@ -906,6 +908,7 @@ fn discover_cores(bar0: u64, pci: &PciDevice) -> ChipCores {
         sysmem_wrap: 0,
         sysmem_rev: 0,
         pcie2_rev: 0,
+        pcie2_base: 0,
     };
     let erom_ptr = bp_read32_probe(bar0, pci, proto::SI_ENUM_BASE + proto::CC_EROMPTR)
         .unwrap_or(0);
@@ -938,8 +941,30 @@ fn discover_cores(bar0: u64, pci: &PciDevice) -> ChipCores {
     }
     if let Some(pc) = cores.iter().find(|c| c.id == proto::BCMA_CORE_PCIE2) {
         out.pcie2_rev = pc.rev;
+        out.pcie2_base = pc.base;
     }
     out
+}
+
+// PCIE2 core register offsets (Asahi brcmf_pcie_pcie2reg_*), reached via the
+// BAR0 sliding window at the PCIE2 core base.
+const PCIE2REG_CONFIGADDR: u32 = 0x120;
+const PCIE2REG_CONFIGDATA: u32 = 0x124;
+
+/// brcmfmac `brcmf_pcie_attach` BAR1/TCM window fixup: the tcm BAR "may not be
+/// sized properly" out of reset. Select the PCIE2 core, write `CONFIGADDR=0x4e0`,
+/// then read `CONFIGDATA` and write it straight back. Missing this can leave the
+/// TCM BAR failing to map dongle RAM, so BAR2 reads abort even with RAM powered.
+fn pcie2_bar_window_fixup(bar0: u64, pci: &PciDevice, pcie2_base: u32) {
+    if pcie2_base == 0 {
+        return;
+    }
+    bp_write32(bar0, pci, pcie2_base + PCIE2REG_CONFIGADDR, 0x4e0);
+    let config = bp_read32_probe(bar0, pci, pcie2_base + PCIE2REG_CONFIGDATA).unwrap_or(0);
+    bp_write32(bar0, pci, pcie2_base + PCIE2REG_CONFIGDATA, config);
+    crate::ktrace::log_fmt(format_args!(
+        "wifi: PCIE2 BAR-window fixup: CONFIGADDR=0x4e0 CONFIGDATA={config:#x}"
+    ));
 }
 
 // Chipcommon watchdog + intstatus (Asahi brcmfmac include/chipcommon.h).
@@ -1107,6 +1132,9 @@ fn download_fw_nvram(
     //    NB: a full RAM power-up needs `/wifi reset` (SMC power-cycle + PERST) —
     //    the in-band SSRESET can't reach the PMU on this chip.
     chip_subsystem_reset(dev.bar0, &dev.pci, cores.pcie2_rev);
+    // BAR1/TCM window fixup (brcmf_pcie_attach) — the tcm BAR may not be sized
+    // out of reset; without this BAR2 can fail to map RAM even when powered.
+    pcie2_bar_window_fixup(dev.bar0, &dev.pci, cores.pcie2_base);
 
     // 1. Halt ARM so TCM is ours (brcmf_chip_set_passive → disable_arm CA7).
     //    The per-core FGC|CLK in ai_core_reset is the only clock force needed;
@@ -1589,6 +1617,9 @@ fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
         "SYS_MEM coreinfo after SSRESET={ci_ss:?} (want a real value, not None/0xffffffff)"
     ));
     let dead = |v: &Option<u32>| v.map(|x| x == 0xffff_ffff).unwrap_or(true);
+
+    // ── 2.5. PCIE2 BAR1/TCM window fixup (brcmf_pcie_attach) ───────────────
+    pcie2_bar_window_fixup(bar0, &pci, cores.pcie2_base);
 
     // ── 3. Bring-up: halt CA7 (set_passive) then reset SYS_MEM ──────────────
     if cores.arm_wrap != 0 {
