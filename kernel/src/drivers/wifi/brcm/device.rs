@@ -808,76 +808,41 @@ fn ai_core_disable(bar0: u64, pci: &PciDevice, wrap: u32, prereset: u32, reset: 
     let _ = bp_read32_probe(bar0, pci, wrap + BCMA_IOCTL);
 }
 
-/// AI core: take out of reset with `postreset` ioctl bits.
-/// Straight-line port of Linux `brcmf_chip_ai_resetcore` — disable first (works
-/// for arbitrary current state), then the init sequence. The previous version
-/// skipped the `IOCTL = reset|CLK` step and used a deassert **poll that bailed
-/// on a read-abort**, so on the Apple backplane it never actually released
-/// SYS_MEM. Writes are posted, so we drive the sequence unconditionally.
+/// AI core: take out of reset with `postreset` ioctl bits. Port of Linux
+/// `brcmf_chip_ai_resetcore` (Asahi tree): disable first (works for arbitrary
+/// current state), then clear `RESET_CTL` in a bounded poll until it reads
+/// deasserted, then set `postreset | CLK`. `FGC` (force-gated-clock) is applied
+/// in the disable step — that per-core clock force is the *entire* clock setup;
+/// there is no chipcommon/PCI-config clock register in this path.
+///
+/// We always write `RESET_CTL=0` at least once before polling, so a flaky
+/// wrap read (which aborts to `None` on the Apple backplane) can never skip the
+/// deassert — the bug that left SYS_MEM stuck in reset with its TCM unreadable.
 fn ai_core_reset(bar0: u64, pci: &PciDevice, wrap: u32, prereset: u32, reset: u32, postreset: u32) {
     if wrap == 0 {
         return;
     }
     ai_core_disable(bar0, pci, wrap, prereset, reset);
-    // now do initialization sequence (all writes posted; reads are best-effort)
-    bp_write32(bar0, pci, wrap + BCMA_IOCTL, reset | BCMA_IOCTL_CLK);
-    let _ = bp_read32_probe(bar0, pci, wrap + BCMA_IOCTL);
-    bp_write32(bar0, pci, wrap + BCMA_RESET_CTL, 0); // deassert reset
-    let _ = bp_read32_probe(bar0, pci, wrap + BCMA_RESET_CTL);
-    mdelay(1);
+    let mut count = 0u32;
+    loop {
+        bp_write32(bar0, pci, wrap + BCMA_RESET_CTL, 0);
+        let still = bp_read32_probe(bar0, pci, wrap + BCMA_RESET_CTL)
+            .map(|r| r & BCMA_RESET_CTL_RESET != 0)
+            .unwrap_or(false);
+        count += 1;
+        if !still || count > 50 {
+            break;
+        }
+        mdelay(1);
+    }
     bp_write32(bar0, pci, wrap + BCMA_IOCTL, postreset | BCMA_IOCTL_CLK);
     let _ = bp_read32_probe(bar0, pci, wrap + BCMA_IOCTL);
-    mdelay(1);
 }
 
-// Backplane clock control/status bits (`clk_ctl_st`). Same bit layout whether
-// reached via the chipcommon MEM window or PCI **config** space.
-const CCS_FORCEALP: u32 = 0x0000_0001;
-const CCS_FORCEHT: u32 = 0x0000_0002;
-const CCS_ALPAVAIL: u32 = 0x0001_0000;
-const CCS_HTAVAIL: u32 = 0x0002_0000;
-
-/// Force the backplane ALP+HT clock on and wait for HT-available.
-///
-/// **Critical:** on these chips `clk_ctl_st` is a **PCI config-space** register
-/// at `CFG_CLK_CTL_ST` (0xa8) — the `WLANCfgSpace.CLK_CTL_ST` macOS drives
-/// (m1n1 `trace_wlan.py`) — **not** the chipcommon MEM register at 0x1e0. That
-/// matters because the backplane MEM window itself is dead until the clock runs
-/// (a read of chipcommon 0x1e0 external-aborts on a cold boot — observed via
-/// `/wifi diag`: `clk_ctl_st None`), whereas config space is always reachable.
-/// The dongle RAM/SYS_MEM array (and thus its TCM aperture) only answers reads
-/// once HT is available. Returns the last `clk_ctl_st` read. Bounded + Ctrl+C.
-fn force_backplane_clock(pci: &PciDevice) -> u32 {
-    let raw = crate::pci::read32(pci.bus, pci.dev, pci.func, CFG_CLK_CTL_ST);
-    // A wedged/unbacked read comes back all-ones — don't OR the force bits onto
-    // 0xffffffff (that sets every reserved bit). Start from a clean base then.
-    let before = if raw == 0xffff_ffff { 0 } else { raw };
-    crate::pci::write32(
-        pci.bus,
-        pci.dev,
-        pci.func,
-        CFG_CLK_CTL_ST,
-        before | CCS_FORCEALP | CCS_FORCEHT,
-    );
-    let deadline = crate::arch::now_ms() + 200;
-    let mut last = before;
-    while crate::arch::now_ms() < deadline {
-        last = crate::pci::read32(pci.bus, pci.dev, pci.func, CFG_CLK_CTL_ST);
-        if last & CCS_HTAVAIL != 0 {
-            break;
-        }
-        mdelay(2);
-        if crate::shell::poll_interrupt() {
-            break;
-        }
-    }
-    crate::ktrace::log_fmt(format_args!(
-        "wifi: force clock via cfg[0xa8]: {before:#x} -> {last:#x} (ALPAVAIL={} HTAVAIL={})",
-        last & CCS_ALPAVAIL != 0,
-        last & CCS_HTAVAIL != 0,
-    ));
-    last
-}
+// NB: on these chips the host bring-up does NOT force the clock via any
+// clk_ctl_st register (chipcommon 0x1e0 or PCI-config 0xa8) — those are firmware
+// state. The backplane ALP clock is already up after link training, and the
+// per-core `BCMA_IOCTL_FGC|CLK` in ai_core_disable/reset is the only clock force.
 
 /// Halt the ARM (CR4/CA7) via its wrapper. Linux `brcmf_chip_disable_arm`.
 fn arm_halt(bar0: u64, pci: &PciDevice, arm_wrap: u32) {
@@ -1070,14 +1035,10 @@ fn download_fw_nvram(
     dev.arm_core_id = cores.arm_id;
     dev.arm_wrap = cores.arm_wrap;
 
-    // 0. Force the backplane HT clock. The dongle RAM/SYS_MEM array is
-    //    unreachable (TCM reads abort) on a cold m1n1 boot until the
-    //    high-throughput backplane clock runs — chipcommon/EROM sit on the
-    //    always-on domain and read fine, which masks this. Diagnosed via
-    //    `/wifi diag` (VERDICT b): BAR2 aborts at every base while BAR0 reads.
-    let _ = force_backplane_clock(&dev.pci);
-
-    // 1. Halt ARM so TCM is ours.
+    // 1. Halt ARM so TCM is ours (brcmf_chip_set_passive → disable_arm CA7).
+    //    The per-core FGC|CLK in ai_core_reset is the only clock force needed;
+    //    SYS_MEM is then taken out of reset in step 2 (that is what makes TCM
+    //    readable — diagnosed via `/wifi diag`).
     if cores.arm_wrap != 0 {
         crate::ktrace::log("wifi", "halting ARM for download");
         arm_halt(dev.bar0, &dev.pci, cores.arm_wrap);
@@ -1613,19 +1574,12 @@ fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
         let ci_before = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
         out.push(format!("SYS_MEM coreinfo(before)={ci_before:?}"));
 
-        // The decisive bring-up experiment (VERDICT b path):
-        //  1. force the backplane HT clock (RAM array needs it),
-        //  2. hold the ARM CA7 in reset so we own the RAM,
-        //  3. bring SYS_MEM out of reset with the fixed ai_core_reset,
-        // then re-read the same TCM location. None→Some ⇒ the sequence works and
-        // belongs in the download path.
-        crate::ktrace::log("wifi", "diag: force clock (cfg 0xa8) + CA7 halt + SYS_MEM reset, re-test TCM");
-        let clk = force_backplane_clock(&pci);
-        out.push(format!(
-            "clk_ctl_st(cfg0xa8)={clk:#x} ALPAVAIL={} HTAVAIL={}",
-            clk & CCS_ALPAVAIL != 0,
-            clk & CCS_HTAVAIL != 0
-        ));
+        // The decisive bring-up experiment (VERDICT b path), per the Asahi
+        // brcmfmac sequence: (1) halt the ARM CA7 (set_passive) so we own the
+        // RAM, (2) take SYS_MEM out of reset with ai_core_reset (its FGC|CLK is
+        // the entire clock force — no separate clock register), then re-read the
+        // same TCM location. None→Some ⇒ the sequence works and is in /wifi load.
+        crate::ktrace::log("wifi", "diag: CA7 halt + SYS_MEM reset (Asahi seq), re-test TCM");
         if cores.arm_wrap != 0 {
             arm_halt(bar0, &pci, cores.arm_wrap);
         }
