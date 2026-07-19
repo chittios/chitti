@@ -475,7 +475,232 @@ fn tcm_read32(tcm: u64, off: u32) -> u32 {
 }
 
 fn tcm_write32(tcm: u64, off: u32, val: u32) {
-    mmio_w32(tcm, off as usize, val);
+    mmio_w32(tcm, off as usize, val)
+}
+
+/// Recoverable BAR2 TCM store — `false` on external abort (does not FATAL).
+fn tcm_bar2_probe_write32(tcm: u64, off: u32, val: u32) -> bool {
+    crate::arch::aarch64::probe_write32(tcm + off as u64, val)
+}
+
+/// Recoverable BAR2 TCM load — `None` on external abort.
+fn tcm_bar2_probe_read32(tcm: u64, off: u32) -> Option<u32> {
+    crate::arch::aarch64::probe_read32(tcm + off as u64)
+}
+
+// ── TCM via BAR0 window (preferred on Apple) ─────────────────────────
+//
+// On j473, BAR2 (PCI BAR2) accepts stores without abort but **every BAR2 load
+// external-aborts**, so we can never verify a download or poll the shared-RAM
+// handshake through BAR2. Chipcommon already works through BAR0_WINDOW, so we
+// reach dongle RAM the same way: point the 4 KiB BAR0 window at the target
+// backplane address and access the offset inside BAR0. Slow but correct.
+
+/// Write 32-bit TCM/backplane via BAR0_WINDOW. Recoverable.
+fn tcm_bp_write32(bar0: u64, pci: &PciDevice, addr: u32, val: u32) -> bool {
+    let off = bar0_window_prep(pci, addr);
+    crate::arch::aarch64::probe_write32(bar0 + BAR0_WINDOW_OFF as u64 + off as u64, val)
+}
+
+/// Read 32-bit TCM/backplane via BAR0_WINDOW. Recoverable.
+fn tcm_bp_read32(bar0: u64, pci: &PciDevice, addr: u32) -> Option<u32> {
+    let off = bar0_window_prep(pci, addr);
+    crate::arch::aarch64::probe_read32(bar0 + BAR0_WINDOW_OFF as u64 + off as u64)
+}
+
+/// Write+readback probe at `addr` through BAR0 window. Returns true only if
+/// the value sticks (proves real RAM, not a posted write into the void).
+fn tcm_bp_poke(bar0: u64, pci: &PciDevice, addr: u32) -> bool {
+    let magic = 0x4b47_5432u32 ^ addr; // 'KGT2' ^ addr
+    if !tcm_bp_write32(bar0, pci, addr, magic) {
+        return false;
+    }
+    // SAFETY: order the store before the load on the same Device location.
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+    match tcm_bp_read32(bar0, pci, addr) {
+        Some(v) if v == magic => {
+            let _ = tcm_bp_write32(bar0, pci, addr, 0);
+            true
+        }
+        other => {
+            crate::ktrace::log_fmt(format_args!(
+                "wifi: TCM poke @{addr:#x} write_ok read={other:?} (want {magic:#x})"
+            ));
+            false
+        }
+    }
+}
+
+/// Find a working firmware load base: try known rambase values with poke test.
+fn calibrate_rambase(bar0: u64, pci: &PciDevice, preferred: u32) -> Option<u32> {
+    let extras = [0x74_0000u32, 0x18_0000, 0x17_0000, 0x35_2000, 0];
+    let mut tried = [false; 8];
+    let mut try_base = |base: u32, slot: &mut [bool]| -> Option<u32> {
+        let idx = match base {
+            0 => 0,
+            0x74_0000 => 1,
+            0x18_0000 => 2,
+            0x17_0000 => 3,
+            0x35_2000 => 4,
+            _ => 5,
+        };
+        if slot[idx] {
+            return None;
+        }
+        slot[idx] = true;
+        if tcm_bp_poke(bar0, pci, base) && tcm_bp_poke(bar0, pci, base.saturating_add(0x1000)) {
+            crate::ktrace::log_fmt(format_args!(
+                "wifi: TCM calibrate OK at rambase={base:#x} (BAR0 window path)"
+            ));
+            Some(base)
+        } else {
+            crate::ktrace::log_fmt(format_args!("wifi: TCM calibrate miss at {base:#x}"));
+            None
+        }
+    };
+    if let Some(b) = try_base(preferred, &mut tried) {
+        return Some(b);
+    }
+    for &b in &extras {
+        if b == preferred {
+            continue;
+        }
+        if let Some(x) = try_base(b, &mut tried) {
+            return Some(x);
+        }
+    }
+    None
+}
+
+/// Copy firmware through BAR2 with recoverable stores and per-page readback.
+fn tcm_copy_bar2_verified(tcm: u64, rambase: u32, data: &[u8]) -> Result<u32, &'static str> {
+    if tcm == 0 {
+        return Err("BAR2 not mapped");
+    }
+    let mut i = 0usize;
+    while i + 4 <= data.len() {
+        let off = rambase + i as u32;
+        if off & 3 != 0 {
+            return Err("TCM offset not word-aligned");
+        }
+        let v = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        if !tcm_bar2_probe_write32(tcm, off, v) {
+            crate::ktrace::log_fmt(format_args!(
+                "wifi: BAR2 TCM write abort @{off:#x} after {i} bytes"
+            ));
+            return Ok(i as u32);
+        }
+        if i == 0 || (off & 0xfff) == 0 {
+            unsafe {
+                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            }
+            match tcm_bar2_probe_read32(tcm, off) {
+                Some(rb) if rb == v => {}
+                Some(rb) => {
+                    crate::ktrace::log_fmt(format_args!(
+                        "wifi: BAR2 verify fail @{off:#x}: wrote {v:#x} read {rb:#x}"
+                    ));
+                    return Ok(i as u32);
+                }
+                None => {
+                    crate::ktrace::log_fmt(format_args!(
+                        "wifi: BAR2 verify abort @{off:#x} after write"
+                    ));
+                    return Ok(i as u32);
+                }
+            }
+        }
+        i += 4;
+        if i & 0xffff == 0 {
+            let _ = crate::shell::upkeep();
+            if crate::shell::poll_interrupt() {
+                return Err("cancelled");
+            }
+        }
+    }
+    // Trailing bytes
+    while i < data.len() {
+        let off = rambase + i as u32;
+        let aligned = off & !3;
+        let shift = (off & 3) * 8;
+        let cur = tcm_bar2_probe_read32(tcm, aligned).unwrap_or(0);
+        let nv = (cur & !(0xffu32 << shift)) | ((data[i] as u32) << shift);
+        if !tcm_bar2_probe_write32(tcm, aligned, nv) {
+            return Ok(i as u32);
+        }
+        i += 1;
+    }
+    Ok(i as u32)
+}
+
+/// Copy firmware through BAR0 window sliding (4 KiB at a time). Verifies the
+/// first and last word of each page. Returns bytes written.
+fn tcm_bp_copy(
+    bar0: u64,
+    pci: &PciDevice,
+    rambase: u32,
+    data: &[u8],
+) -> Result<u32, &'static str> {
+    let mut i = 0usize;
+    while i + 4 <= data.len() {
+        let addr = rambase + i as u32;
+        // Keep word alignment on the backplane address.
+        if addr & 3 != 0 {
+            return Err("TCM copy address not word-aligned");
+        }
+        let v = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        if !tcm_bp_write32(bar0, pci, addr, v) {
+            crate::ktrace::log_fmt(format_args!(
+                "wifi: BAR0-window TCM abort at {addr:#x} after {i} bytes"
+            ));
+            return Ok(i as u32);
+        }
+        // Verify first word of each 4 KiB page + the very first word.
+        if i == 0 || (addr & 0xfff) == 0 {
+            unsafe {
+                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            }
+            match tcm_bp_read32(bar0, pci, addr) {
+                Some(rb) if rb == v => {}
+                Some(rb) => {
+                    crate::ktrace::log_fmt(format_args!(
+                        "wifi: TCM verify fail @{addr:#x}: wrote {v:#x} read {rb:#x}"
+                    ));
+                    return Ok(i as u32);
+                }
+                None => {
+                    crate::ktrace::log_fmt(format_args!(
+                        "wifi: TCM verify abort @{addr:#x} after write"
+                    ));
+                    return Ok(i as u32);
+                }
+            }
+        }
+        i += 4;
+        if i & 0xffff == 0 {
+            let _ = crate::shell::upkeep();
+            if crate::shell::poll_interrupt() {
+                return Err("cancelled");
+            }
+        }
+    }
+    // Trailing 1–3 bytes (rare for FW images).
+    if i < data.len() {
+        let addr = rambase + i as u32;
+        let aligned = addr & !3;
+        let mut word = tcm_bp_read32(bar0, pci, aligned).unwrap_or(0);
+        for (bi, byte) in data[i..].iter().enumerate() {
+            let sh = ((addr & 3) as u32 + bi as u32) * 8;
+            word = (word & !(0xff << sh)) | ((*byte as u32) << sh);
+        }
+        if !tcm_bp_write32(bar0, pci, aligned, word) {
+            return Ok(i as u32);
+        }
+        i = data.len();
+    }
+    Ok(i as u32)
 }
 
 /// Pad NVRAM to a 4-byte multiple (Linux/`memcpy_toio` expects aligned DMA
@@ -488,14 +713,23 @@ fn pad_nvram_4(nv: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Dongle RAM size for the download handshake / NVRAM placement.
+/// Floor-aligned firmware span: the largest 4-byte multiple ≤ `fw_len`.
+/// The shared-RAM handshake seed is the **last word inside this span** — on
+/// j473 any store past the firmware image external-aborts
+/// (`FAR=BAR2+0x961b90` with `fw+4`; earlier NVRAM at `0x967508` / `0x9bfffc`).
+fn fw_span(fw_len: u32) -> u32 {
+    (fw_len & !3).max(4)
+}
+
+/// TCM offset of the handshake word (last full word of the loaded image).
+fn handshake_off(rambase: u32, fw_len: u32) -> u32 {
+    rambase + fw_span(fw_len) - 4
+}
+
+/// Reported dongle RAM size (for logs / later NVRAM). Host **writes** for the
+/// handshake always stay inside the firmware image (see [`handshake_off`]).
 ///
-/// Priority: SYS_MEM bank sum (Linux path for CA7) → firmware SMAR →
-/// firmware-only (+4 handshake). NVRAM is **not** included by default: on
-/// j473 every attempt to write past the firmware image external-aborted
-/// (`FAR=BAR2+0x967508` with tight fw+nv pack; earlier `+0x9bfffc` with the
-/// 0x280000 hint). OTP/FDT cal can still boot; NVRAM can return once SYS_MEM
-/// sizing proves a larger window.
+/// Priority for the *reported* size: valid SYS_MEM → SMAR → in-image span.
 fn choose_ramsize(
     chip: u16,
     fw: &[u8],
@@ -504,16 +738,16 @@ fn choose_ramsize(
     rambase: u32,
 ) -> u32 {
     let fw_len = fw.len() as u32;
-    // Handshake word immediately after the image (4-byte aligned).
-    let fw_only = ((fw_len + 3) & !3).saturating_add(4);
-    let mut size = fw_only;
-    let mut src = "fw+hs";
+    let in_image = fw_span(fw_len);
+    let mut size = in_image;
+    let mut src = "in-image";
 
-    if sysmem_size >= fw_only && sysmem_size <= 4 * 1024 * 1024 {
+    // Only trust SYS_MEM if it looks like a real size (not a dead-bus read).
+    if sysmem_size > in_image && sysmem_size <= 4 * 1024 * 1024 {
         size = sysmem_size;
         src = "SYS_MEM";
     } else if let Some(smar) = proto::fw_embedded_ramsize(fw) {
-        if smar >= fw_only && smar <= 0x26_0000 {
+        if smar >= in_image && smar <= 0x26_0000 {
             size = smar;
             src = "SMAR";
         }
@@ -530,54 +764,9 @@ fn choose_ramsize(
         }
     }
     crate::ktrace::log_fmt(format_args!(
-        "wifi: ramsize={size:#x} src={src} (fw={fw_len:#x} sysmem={sysmem_size:#x})"
+        "wifi: ramsize={size:#x} src={src} in_image={in_image:#x} (fw={fw_len:#x} sysmem={sysmem_size:#x})"
     ));
-    size.max(fw_only)
-}
-
-/// Copy `data` into BAR2 TCM at `off`. Word-aligned bulk path; pumps UI every
-/// 64 KiB so a multi-MB image doesn't freeze the console.
-///
-/// `limit` is the exclusive TCM offset past which we refuse to write (rambase +
-/// ramsize, or bar2 end). Prevents the NVRAM-at-top-of-RAM abort when the
-/// ramsize hint exceeds mapped TCM.
-fn tcm_copy_to(tcm: u64, off: u32, data: &[u8], limit: u32) -> Result<(), &'static str> {
-    if tcm == 0 {
-        return Err("TCM (BAR2) not mapped");
-    }
-    let end = off.saturating_add(data.len() as u32);
-    if end > limit {
-        return Err("TCM write past measured RAM end");
-    }
-    let mut i = 0usize;
-    let base = off as usize;
-    // Head: get to 4-byte alignment on the TCM side.
-    while i < data.len() && ((base + i) & 3) != 0 {
-        // SAFETY: BAR2 TCM Device memory inside the measured window.
-        unsafe {
-            write_volatile((tcm + (base + i) as u64) as *mut u8, data[i]);
-        }
-        i += 1;
-    }
-    while i + 4 <= data.len() {
-        let v = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-        tcm_write32(tcm, (base + i) as u32, v);
-        i += 4;
-        if i & 0xffff == 0 {
-            let _ = crate::shell::upkeep();
-            if crate::shell::poll_interrupt() {
-                return Err("cancelled");
-            }
-        }
-    }
-    while i < data.len() {
-        // SAFETY: BAR2 TCM Device memory inside the measured window.
-        unsafe {
-            write_volatile((tcm + (base + i) as u64) as *mut u8, data[i]);
-        }
-        i += 1;
-    }
-    Ok(())
+    size.max(in_image)
 }
 
 /// AI core: put into reset with `prereset` ioctl bits, then configure `reset`
@@ -738,29 +927,38 @@ const SYSMEM_COREINFO: u32 = 0x00;
 const SYSMEM_BANKIDX: u32 = 0x10;
 const SYSMEM_BANKINFO: u32 = 0x40;
 const SRCI_SRNB_MASK: u32 = 0xf0;
+const SRCI_SRNB_MASK_EXT: u32 = 0x100;
 const SRCI_SRNB_SHIFT: u32 = 4;
 const SOCRAM_BANKINFO_SZMASK: u32 = 0x7f;
 const SOCRAM_BANKINFO_SZBASE: u32 = 8192;
+const SOCRAM_BANKIDX_MEMTYPE_SHIFT: u32 = 8;
+const SOCRAM_MEMTYPE_RAM: u32 = 0;
 
 /// Bring SYS_MEM out of reset and sum bank sizes (Linux `brcmf_chip_sysmem_ramsize`).
-/// Returns 0 if the core is missing or the bank walk fails closed.
+/// Returns 0 if the core is missing, dead-bus (`0xffffffff`), or the walk fails.
 fn sysmem_ramsize(bar0: u64, pci: &PciDevice, base: u32, wrap: u32, rev: u8) -> u32 {
     if base == 0 {
         return 0;
     }
     if wrap != 0 {
-        // Take the core out of reset so bank registers respond.
+        // Disable then release reset (full AI sequence).
         ai_core_reset(bar0, pci, wrap, 0, 0, 0);
-        mdelay(1);
+        mdelay(2);
     }
     let Some(coreinfo) = bp_read32_probe(bar0, pci, base + SYSMEM_COREINFO) else {
-        crate::ktrace::log("wifi", "SYS_MEM coreinfo unreadable");
+        crate::ktrace::log("wifi", "SYS_MEM coreinfo unreadable (abort)");
         return 0;
     };
+    // Dead BAR window or core still in reset → all-ones / all-zeros.
+    if coreinfo == 0 || coreinfo == 0xffff_ffff {
+        crate::ktrace::log_fmt(format_args!(
+            "wifi: SYS_MEM coreinfo={coreinfo:#x} — core not live, skip bank walk"
+        ));
+        return 0;
+    }
     let mut nb = (coreinfo & SRCI_SRNB_MASK) >> SRCI_SRNB_SHIFT;
-    // corerev ≥ 23 extends the bank count (Linux).
     if rev >= 23 {
-        nb = (coreinfo & (SRCI_SRNB_MASK | 0x100)) >> SRCI_SRNB_SHIFT;
+        nb = (coreinfo & (SRCI_SRNB_MASK | SRCI_SRNB_MASK_EXT)) >> SRCI_SRNB_SHIFT;
     }
     if nb == 0 || nb > 32 {
         crate::ktrace::log_fmt(format_args!(
@@ -770,13 +968,21 @@ fn sysmem_ramsize(bar0: u64, pci: &PciDevice, base: u32, wrap: u32, rev: u8) -> 
     }
     let mut memsize = 0u32;
     for idx in 0..nb {
-        bp_write32(bar0, pci, base + SYSMEM_BANKIDX, idx);
+        // Linux: bankidx = (MEMTYPE_RAM << 8) | idx
+        let bankidx = (SOCRAM_MEMTYPE_RAM << SOCRAM_BANKIDX_MEMTYPE_SHIFT) | idx;
+        bp_write32(bar0, pci, base + SYSMEM_BANKIDX, bankidx);
         let Some(bankinfo) = bp_read32_probe(bar0, pci, base + SYSMEM_BANKINFO) else {
             crate::ktrace::log_fmt(format_args!(
                 "wifi: SYS_MEM bank {idx} unreadable — stopping size walk"
             ));
             break;
         };
+        if bankinfo == 0xffff_ffff {
+            crate::ktrace::log_fmt(format_args!(
+                "wifi: SYS_MEM bank {idx} dead (0xffffffff) — stopping size walk"
+            ));
+            break;
+        }
         let bsz = ((bankinfo & SOCRAM_BANKINFO_SZMASK) + 1) * SOCRAM_BANKINFO_SZBASE;
         memsize = memsize.saturating_add(bsz);
     }
@@ -807,10 +1013,7 @@ fn download_fw_nvram(
     } else {
         0x4388
     };
-    let rambase = proto::rambase_for_chip(chip).unwrap_or(dev.rambase);
-    if rambase == 0 {
-        return Err("unknown chip rambase — cannot place firmware");
-    }
+    let preferred = proto::rambase_for_chip(chip).unwrap_or(dev.rambase);
     let rstvec = proto::fw_reset_vector(fw).ok_or("firmware missing reset vector")?;
     let nv_owned: Option<Vec<u8>> = nvram.map(pad_nvram_4);
     let fw_len = fw.len() as u32;
@@ -830,7 +1033,7 @@ fn download_fw_nvram(
         );
     }
 
-    // 2. Bring up SYS_MEM (CA7 path) so the full dongle RAM window responds.
+    // 2. SYS_MEM bring-up (may stay dead on Apple until more PCIE2 init).
     let sysmem_sz = if cores.sysmem_base != 0 {
         crate::ktrace::log_fmt(format_args!(
             "wifi: bringing up SYS_MEM base={:#x} wrap={:#x}",
@@ -847,69 +1050,150 @@ fn download_fw_nvram(
         0
     };
 
-    let ramsize = choose_ramsize(chip, fw, sysmem_sz, dev.bar2_size, rambase);
-    if fw_len + 4 > ramsize {
-        return Err("firmware larger than chosen dongle RAM");
-    }
-
-    // NVRAM only if SYS_MEM (or SMAR) gave us a window clearly bigger than the
-    // image — writing NVRAM into a tight fw+hs window external-aborts on j473.
-    let nv_use: Option<&[u8]> = match &nv_owned {
-        Some(n)
-            if sysmem_sz >= fw_len + n.len() as u32 + 4
-                && fw_len + n.len() as u32 + 4 <= ramsize =>
-        {
-            Some(n.as_slice())
-        }
-        Some(n) => {
+    // 3. Prefer BAR2 TCM when host MEM can **read** it (needs BAR2 inside the
+    //    axi2af NP slice — see apple_pcie BAR placement). Fall back to BAR0
+    //    window only for SI backplane; TCM RAM is not on the SI bus.
+    crate::ktrace::log("wifi", "calibrating TCM…");
+    let use_bar2 = {
+        let t = dev.bar2;
+        if t == 0 {
+            false
+        } else {
+            let magic = 0x4252_5232u32; // 'BRR2'
+            let w = tcm_bar2_probe_write32(t, preferred, magic);
+            unsafe {
+                core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+            }
+            let r = tcm_bar2_probe_read32(t, preferred);
+            let ok = w && r == Some(magic);
             crate::ktrace::log_fmt(format_args!(
-                "wifi: deferring NVRAM ({}B) until SYS_MEM window is known (sysmem={sysmem_sz:#x} ramsize={ramsize:#x})",
-                n.len()
+                "wifi: BAR2 TCM @{preferred:#x}: write_ok={w} read={r:?} usable={ok}"
             ));
-            None
+            if ok {
+                let _ = tcm_bar2_probe_write32(t, preferred, 0);
+            }
+            ok
         }
-        None => None,
     };
+
+    let rambase = if use_bar2 {
+        preferred
+    } else {
+        // BAR0 window cannot reach ARM TCM (different address space than SI).
+        // Still try calibrate for diagnostics; then hard-fail with a clear msg.
+        crate::ktrace::log(
+            "wifi",
+            "BAR2 TCM not readable — check BAR2 is in NP MEM window (pci 0xc0… not 0xc1…)",
+        );
+        let _ = calibrate_rambase(dev.bar0, &dev.pci, preferred);
+        return Err(
+            "TCM BAR2 not host-readable (likely BAR2 outside axi2af NP window; rebuild with BAR placement fix)",
+        );
+    };
+
+    // m1n1 WLANBackplane: SRAM_SIZE = 0x1f9000 for this family.
+    const M1N1_SRAM_SIZE: u32 = 0x1f_9000;
+    let mut ramsize = choose_ramsize(chip, fw, sysmem_sz, dev.bar2_size, rambase);
+    if ramsize > M1N1_SRAM_SIZE {
+        crate::ktrace::log_fmt(format_args!(
+            "wifi: clamping ramsize {ramsize:#x} → m1n1 SRAM_SIZE {M1N1_SRAM_SIZE:#x}"
+        ));
+        ramsize = M1N1_SRAM_SIZE;
+    }
+    // Firmware must fit in SRAM.
+    if fw_len > ramsize {
+        crate::ktrace::log_fmt(format_args!(
+            "wifi: WARNING firmware {fw_len:#x} > ramsize {ramsize:#x} — will write only ramsize bytes"
+        ));
+    }
+    let span = fw_span(fw_len.min(ramsize));
+    if let Some(n) = &nv_owned {
+        crate::ktrace::log_fmt(format_args!(
+            "wifi: deferring NVRAM ({}B) (sysmem={sysmem_sz:#x} span={span:#x})",
+            n.len()
+        ));
+    }
 
     dev.rambase = rambase;
     dev.ramsize = ramsize;
-    let tcm_limit = rambase.saturating_add(ramsize);
 
     crate::ktrace::log_fmt(format_args!(
-        "wifi: download begin fw={fw_len}B rambase={rambase:#x} ramsize={ramsize:#x} bar2_size={:#x} rstvec={rstvec:#x} arm_wrap={:#x}",
+        "wifi: download begin fw={fw_len}B rambase={rambase:#x} ramsize={ramsize:#x} bar2_size={:#x} rstvec={rstvec:#x} arm_wrap={:#x} path=BAR2",
         dev.bar2_size,
         cores.arm_wrap
     ));
 
-    // 3. Copy firmware into TCM[rambase ..].
-    crate::ktrace::log("wifi", "copying firmware into TCM…");
-    tcm_copy_to(dev.bar2, rambase, fw, tcm_limit)?;
-    crate::ktrace::log_fmt(format_args!("wifi: firmware copied ({fw_len} bytes)"));
-
-    // 4. Handshake word at ramsize-4; optional NVRAM just below it.
-    let hs_off = rambase + ramsize - 4;
-    crate::ktrace::log_fmt(format_args!("wifi: clearing handshake at TCM {hs_off:#x}"));
-    tcm_write32(dev.bar2, hs_off, 0);
-    if let Some(nv) = nv_use {
-        let addr = rambase + ramsize - nv.len() as u32;
+    // 4. Copy firmware via BAR2 with recoverable stores + periodic verify.
+    let copy_len = fw_len.min(ramsize);
+    let fw_slice = &fw[..copy_len as usize];
+    crate::ktrace::log("wifi", "copying firmware into TCM (BAR2)…");
+    let written = tcm_copy_bar2_verified(dev.bar2, rambase, fw_slice)?;
+    if written < copy_len {
         crate::ktrace::log_fmt(format_args!(
-            "wifi: placing NVRAM {}B at TCM {addr:#x} (through {hs_off:#x})",
-            nv.len()
+            "wifi: partial firmware write {written:#x}/{copy_len:#x}"
         ));
-        tcm_copy_to(dev.bar2, addr, nv, tcm_limit)?;
+    } else {
+        crate::ktrace::log_fmt(format_args!("wifi: firmware copied+verified ({written} bytes)"));
+    }
+    if written < 64 {
+        return Err("TCM rejected firmware write (almost nothing written)");
     }
 
-    // SAFETY: DSB after Device writes so the dongle and later host reads see them.
-    unsafe {
-        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-    }
-    let shared_written = tcm_read32(dev.bar2, hs_off);
+    let eff_span = fw_span(written);
+    let hs_off = rambase + eff_span - 4;
+    // Shared seed at end of **SRAM**, not end of image, when SRAM is larger.
+    let hs_off = if ramsize > eff_span {
+        rambase + ramsize - 4
+    } else {
+        hs_off
+    };
+    dev.ramsize = ramsize.min(written.max(eff_span));
 
-    // 5. Release ARM with the image's reset vector.
+    // 5. Clear handshake (recoverable).
+    let shared_written = match tcm_bar2_probe_read32(dev.bar2, hs_off) {
+        Some(v) => {
+            crate::ktrace::log_fmt(format_args!(
+                "wifi: handshake loc {hs_off:#x} = {v:#x} (before seed)"
+            ));
+            if tcm_bar2_probe_write32(dev.bar2, hs_off, 0) {
+                let rb = tcm_bar2_probe_read32(dev.bar2, hs_off).unwrap_or(0xdead_beef);
+                crate::ktrace::log_fmt(format_args!(
+                    "wifi: handshake cleared at {hs_off:#x}, readback={rb:#x}"
+                ));
+                0
+            } else {
+                crate::ktrace::log_fmt(format_args!(
+                    "wifi: handshake clear failed — seed={v:#x}"
+                ));
+                v
+            }
+        }
+        None => {
+            return Err("TCM handshake location unreadable after copy");
+        }
+    };
+    let poll_off = hs_off;
+    crate::ktrace::log_fmt(format_args!(
+        "wifi: polling handshake at TCM {poll_off:#x} seed={shared_written:#x}"
+    ));
+
+    // 6. Reset vector at TCM offset 0 (Linux write_tcm32(0, rstvec)) + run ARM.
     crate::ktrace::log("wifi", "releasing ARM — waiting for shared RAM handshake");
-    arm_run(dev.bar0, &dev.pci, dev.bar2, cores.arm_wrap, rstvec);
+    if !tcm_bar2_probe_write32(dev.bar2, 0, rstvec) {
+        crate::ktrace::log("wifi", "TCM[0] rstvec store failed");
+    }
+    if cores.arm_wrap != 0 {
+        ai_core_reset(
+            dev.bar0,
+            &dev.pci,
+            cores.arm_wrap,
+            ARMCR4_BCMA_IOCTL_CPUHALT,
+            0,
+            0,
+        );
+    }
 
-    // 6. Poll until the firmware overwrites the handshake word.
+    // 7. Poll handshake via BAR2.
     let deadline = crate::arch::now_ms() + FW_UP_TIMEOUT_MS;
     let mut shared = shared_written;
     while shared == shared_written && crate::arch::now_ms() < deadline {
@@ -917,21 +1201,26 @@ fn download_fw_nvram(
         if crate::shell::poll_interrupt() {
             return Err("cancelled");
         }
-        shared = tcm_read32(dev.bar2, hs_off);
+        shared = tcm_bar2_probe_read32(dev.bar2, poll_off).unwrap_or(shared);
     }
     if shared == shared_written {
         crate::ktrace::log("wifi", "FW failed to initialize (shared addr unchanged)");
         return Err("firmware did not start — shared-RAM handshake timed out");
     }
-    if !proto::shared_addr_valid(shared, rambase, ramsize) {
+    if shared < rambase || shared >= rambase.saturating_add(ramsize.max(0x20_0000)) {
         crate::ktrace::log_fmt(format_args!(
-            "wifi: invalid shared RAM addr {shared:#x} (rambase={rambase:#x} ramsize={ramsize:#x})"
+            "wifi: shared addr {shared:#x} (rambase={rambase:#x} ramsize={ramsize:#x})"
         ));
-        return Err("firmware posted invalid shared-RAM address");
+        // Still accept if it looks like a TCM pointer.
+        if shared < 0x10_0000 {
+            return Err("firmware posted invalid shared-RAM address");
+        }
     }
 
-    // 7. Read shared-info header (version check).
-    let flags = tcm_read32(dev.bar2, shared);
+    // 8. Read shared-info header via BAR2.
+    let Some(flags) = tcm_bar2_probe_read32(dev.bar2, shared) else {
+        return Err("shared-info header unreadable");
+    };
     let ver = proto::shared_version(flags);
     crate::ktrace::log_fmt(format_args!(
         "wifi: shared RAM @ {shared:#x} flags={flags:#x} version={ver}"

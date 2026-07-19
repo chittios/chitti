@@ -1229,14 +1229,51 @@ fn probe_bar_candidates(
     candidates: &[(u64, u64)],
 ) -> Option<(u64, u64, u64)> {
     for &(pci0, cpu_off) in candidates {
+        // ── Placement strategy (j473 bare m1n1) ─────────────────────────
+        // The proven host MEM HIT is PCI `0xc000_0000` → CPU `0x6c000_0000`
+        // (chipcommon via BAR0). axi2af may only translate a **16 MiB** NP
+        // slice there. A 16 MiB BAR2 placed *after* BAR0 lands at
+        // `0xc100_0000` → CPU `0x6c100_0000`, which is **outside** that slice:
+        // stores appear to succeed (posted) but **loads external-abort** —
+        // exactly the WiFi TCM symptom.
+        //
+        // So put **BAR2 (TCM) first** on the HIT base when it is large, and
+        // park the smaller BAR0 after it (still inside the root-port window
+        // `0xc000_0000..0xfff0_ffff`). Prefer packing both into the first
+        // 16 MiB when BAR2 is small enough.
         let align0 = bar0_size.next_power_of_two().max(0x1000);
-        let base0 = (pci0 + align0 - 1) & !(align0 - 1);
-        let base2 = if bar2_size != 0 {
-            let align2 = bar2_size.next_power_of_two().max(0x1000);
-            (base0 + bar0_size + align2 - 1) & !(align2 - 1)
+        let align2 = if bar2_size != 0 {
+            bar2_size.next_power_of_two().max(0x1000)
         } else {
-            0
+            0x1000
         };
+        let hit = (pci0 + align0.max(align2) - 1) & !(align0.max(align2) - 1);
+
+        let (base0, base2) = if bar2_size == 0 {
+            let b0 = (pci0 + align0 - 1) & !(align0 - 1);
+            (b0, 0u64)
+        } else if bar2_size <= 0x100_0000
+            && bar0_size + bar2_size <= 0x100_0000
+            && align2 <= 0x100_0000
+        {
+            // Both fit in 16 MiB: BAR0 at hit, BAR2 immediately after (aligned).
+            let b0 = (pci0 + align0 - 1) & !(align0 - 1);
+            let b2 = (b0 + bar0_size + align2 - 1) & !(align2 - 1);
+            if b2 + bar2_size <= b0 + 0x100_0000 {
+                (b0, b2)
+            } else {
+                // BAR2 alone on HIT; BAR0 after the 16 MiB slice.
+                let b2 = (pci0 + align2 - 1) & !(align2 - 1);
+                let b0 = (b2 + bar2_size + align0 - 1) & !(align0 - 1);
+                (b0, b2)
+            }
+        } else {
+            // Large BAR2: claim the HIT base for TCM; BAR0 after it.
+            let b2 = (pci0 + align2 - 1) & !(align2 - 1);
+            let b0 = (b2 + bar2_size + align0 - 1) & !(align0 - 1);
+            (b0, b2)
+        };
+        let _ = hit;
 
         // Disable MEM, program, re-enable.
         let cmd = crate::pci::read32(dev.bus, dev.dev, dev.func, 0x04);
@@ -1262,32 +1299,48 @@ fn probe_bar_candidates(
         }
 
         let cpu0 = base0.wrapping_add(cpu_off);
+        let cpu2 = if base2 != 0 {
+            base2.wrapping_add(cpu_off)
+        } else {
+            0
+        };
         crate::arch::aarch64::mmu::map_device_gib(cpu0);
+        if cpu2 != 0 {
+            crate::arch::aarch64::mmu::map_device_gib(cpu2);
+        }
         let end = crate::arch::now_ms() + 10;
         while crate::arch::now_ms() < end {
             core::hint::spin_loop();
         }
 
-        match super::probe_read32(cpu0) {
-            Some(w) => {
-                crate::ktrace::log_fmt(format_args!(
-                    "pcie: BAR window HIT pci={base0:#x} cpu={cpu0:#x} word={w:#010x}"
-                ));
-                let cpu2 = if base2 != 0 {
-                    let c = base2.wrapping_add(cpu_off);
-                    crate::arch::aarch64::mmu::map_device_gib(c);
-                    c
-                } else {
-                    0
-                };
-                return Some((cpu0, cpu2, base0));
-            }
-            None => {
-                crate::ktrace::log_fmt(format_args!(
-                    "pcie: BAR window miss pci={base0:#x} cpu={cpu0:#x}"
-                ));
-            }
+        // HIT if BAR0 (regs) **or** BAR2 (TCM base) responds. Prefer a layout
+        // where BAR2 reads work — required for firmware download.
+        let bar0_word = super::probe_read32(cpu0);
+        let bar2_word = if cpu2 != 0 {
+            super::probe_read32(cpu2)
+        } else {
+            None
+        };
+        // Also try TCM rambase offset on BAR2 (0x740000) when BAR2 is mapped.
+        let bar2_ram = if cpu2 != 0 {
+            super::probe_read32(cpu2 + 0x74_0000)
+        } else {
+            None
+        };
+
+        crate::ktrace::log_fmt(format_args!(
+            "pcie: BAR try pci0={base0:#x} pci2={base2:#x} cpu0={cpu0:#x} cpu2={cpu2:#x} r0={bar0_word:?} r2={bar2_word:?} r2+ram={bar2_ram:?}"
+        ));
+
+        if bar0_word.is_some() || bar2_word.is_some() || bar2_ram.is_some() {
+            crate::ktrace::log_fmt(format_args!(
+                "pcie: BAR window HIT pci0={base0:#x} pci2={base2:#x} cpu0={cpu0:#x} cpu2={cpu2:#x}"
+            ));
+            return Some((cpu0, cpu2, base0));
         }
+        crate::ktrace::log_fmt(format_args!(
+            "pcie: BAR window miss pci0={base0:#x} pci2={base2:#x}"
+        ));
     }
     None
 }

@@ -248,6 +248,16 @@ pub fn probe_read32(addr: u64) -> Option<u32> {
     }
 }
 
+/// Recoverable 32-bit Device MMIO write: on external abort returns `false`
+/// instead of killing the kernel. Single `str w` so the sync handler can skip it.
+pub fn probe_write32(addr: u64, val: u32) -> bool {
+    set_agx_probing(true);
+    // SAFETY: single 32-bit store; external abort → handler skips this insn.
+    unsafe { core::ptr::write_volatile(addr as *mut u32, val) };
+    set_agx_probing(false);
+    !agx_probe_faulted()
+}
+
 #[inline]
 fn uart_base() -> usize {
     UART_BASE.load(Ordering::Relaxed)
