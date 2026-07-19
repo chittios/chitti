@@ -56,8 +56,10 @@ const GPUMSG_INIT: u64 = 0x81;
 const GPUMSG_DOORBELL: u64 = 0x83;
 const INITDATA_FIELD: (u32, u32) = (43, 0);
 const DOORBELL_CHANNEL: (u32, u32) = (15, 0);
-/// DevCtrl channel doorbell number (agx `kick_firmware`/DevCtrl = 0x10/0x11).
-pub const DOORBELL_DEVCTRL: u16 = 0x10;
+/// DevCtrl channel id / doorbell number. The proxyclient allocates the device-
+/// control channel as id **0x11** (`alloc_channels(GPUDeviceControlChannel,
+/// "DevCtrl", 0x11)`) and rings `doorbell(0x11)`; the earlier 0x10 was wrong.
+pub const DOORBELL_DEVCTRL: u16 = 0x11;
 
 /// `MSG_INIT` carrying the initdata GPU VA (low 44 bits), sent on `EP_FIRMWARE`.
 pub fn msg_fw_init(initdata_va: u64) -> u64 {

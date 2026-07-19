@@ -289,6 +289,25 @@ fn gpu_read_u32(va: u64) -> Option<u32> {
     (gpu_read(va, &mut b) == 4).then(|| u32::from_le_bytes(b))
 }
 
+/// Write `buf` into GPU shared memory at `va` (translating via the replay map)
+/// and clean it to the point of coherency so the firmware's UAT walker + reads
+/// observe it. Returns bytes written (0 if `va` isn't in a replayed range).
+fn gpu_write(va: u64, buf: &[u8]) -> usize {
+    let Some((phys, avail)) = gpu_va_to_phys(va) else {
+        return 0;
+    };
+    let n = buf.len().min(avail as usize);
+    // SAFETY: `phys` is our own identity-mapped, replayed DRAM range; `n` clamped
+    // to the range's remaining bytes.
+    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), phys as *mut u8, n) };
+    dcache_clean(phys, n as u64);
+    n
+}
+
+fn gpu_write_u32(va: u64, val: u32) -> bool {
+    gpu_write(va, &val.to_le_bytes()) == 4
+}
+
 /// Read a 64-bit page-table entry at identity-mapped physical `pa`.
 fn rd64(pa: u64) -> u64 {
     // SAFETY: single aligned 64-bit read of mapped DRAM (a page-table slot).
@@ -1056,6 +1075,84 @@ fn scan_ascii_report(name: &str, data: &[u8]) -> bool {
     }
 }
 
+// DevCtrl channel geometry, from the proxyclient (fw/agx/channels.py, G14/V13.5):
+// item size 0x40, ring at the initdata's DevCtrl ringbuffer_addr, cursor pair in
+// the state header (READ_PTR@0x0 / WRITE_PTR@0x20). The device-control channel is
+// AP→FW; the AP writes a message at slot WRITE_PTR, bumps it, and rings doorbell
+// 0x11. The firmware drains READ_PTR→WRITE_PTR and processes each message.
+const DEVCTRL_STATE_VA: u64 = 0xffffffa040333fd0;
+const DEVCTRL_RING_VA: u64 = 0xffffffa000330000;
+const DEVCTRL_ITEM: u64 = 0x40;
+const DEVCTRL_RING_ITEMS: u32 = 0x100;
+const STATE_WRITE_PTR: u64 = 0x20;
+/// Device-control message types (V >= V13_3): DC_Init begins channel operation;
+/// DC_UpdateIdleTS follows it in the proxyclient boot sequence.
+const DC_INIT: u32 = 0x1a;
+const DC_UPDATE_IDLE_TS: u32 = 0x23;
+
+/// Append one device-control message (`msg_type` + zero body, 0x40 bytes) to the
+/// DevCtrl ring at the current WRITE_PTR, advance WRITE_PTR, and ring the DevCtrl
+/// doorbell — the exact `GPUTXChannel.send_message` sequence. Returns false only
+/// if the ring VA isn't mapped or the doorbell send fails.
+fn devctrl_send(asc: &Asc, msg_type: u32) -> bool {
+    let wptr = gpu_read_u32(DEVCTRL_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
+    let mut msg = [0u8; DEVCTRL_ITEM as usize];
+    msg[..4].copy_from_slice(&msg_type.to_le_bytes());
+    let slot = DEVCTRL_RING_VA + DEVCTRL_ITEM * (wptr as u64);
+    if gpu_write(slot, &msg) != msg.len() {
+        crate::ktrace::log_fmt(format_args!("agx: devctrl_send: ring slot {slot:#x} unmapped"));
+        return false;
+    }
+    let next = (wptr + 1) % DEVCTRL_RING_ITEMS;
+    gpu_write_u32(DEVCTRL_STATE_VA + STATE_WRITE_PTR, next);
+    crate::ktrace::log_fmt(format_args!(
+        "agx: devctrl_send type={msg_type:#x} slot={wptr} -> WRITE_PTR={next}, ringing doorbell 0x11"
+    ));
+    send(asc, proto::msg_doorbell(proto::DOORBELL_DEVCTRL), proto::EP_DOORBELL)
+}
+
+/// Kick the firmware into full operation after MSG_INIT: send DC_Init then
+/// DC_UpdateIdleTS on the DevCtrl channel (the proxyclient's post-initdata boot
+/// steps). This is what makes the firmware begin driving FWLog/Event/etc. — the
+/// channels the liveness probe showed still idle. Read-back reports the result.
+fn kick_devctrl(asc: &Asc, baseline: &[(u32, u32); NCHAN]) {
+    use proto::*;
+    crate::ktrace::log("agx", "compute: kicking DevCtrl (DC_Init + DC_UpdateIdleTS)…");
+    if !devctrl_send(asc, DC_INIT) {
+        crate::ktrace::log("agx", "compute: DC_Init doorbell send failed");
+        return;
+    }
+    // Give the firmware a moment to consume DC_Init and start its channels.
+    let mut pump_fn = pump;
+    let _ = asc.recv_blocking(500, &mut pump_fn);
+    if !devctrl_send(asc, DC_UPDATE_IDLE_TS) {
+        crate::ktrace::log("agx", "compute: DC_UpdateIdleTS doorbell send failed");
+    }
+    // Observe the mailbox briefly (the firmware fires an EP_FIRMWARE 0x42 event
+    // when it posts to a channel) then re-probe the rings.
+    let deadline = crate::arch::now_ms() + 3000;
+    let mut state = RtkitState { iop_power: POWER_ON, ap_power: POWER_ON, crashed: false, have_crashlog_buffer: true };
+    while crate::arch::now_ms() < deadline {
+        let Some(m) = asc.recv_blocking(500, &mut pump_fn) else {
+            if ABORT.load(core::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            continue;
+        };
+        let ep = m.msg1 as u8;
+        crate::ktrace::log_fmt(format_args!("agx: post-DC msg0={:#018x} ep={ep:#x}", m.msg0));
+        if ep < EP_APP_BASE {
+            let _ = handle_system_msg(&mut state, m.msg0, ep);
+        }
+    }
+    // Did the kick move any firmware→AP channel past its replayed baseline?
+    if probe_firmware_liveness(baseline) {
+        crate::ktrace::log("agx", "compute: DevCtrl kick WORKED — firmware channels advanced (FWLog/Event/Stats live)");
+    } else {
+        crate::ktrace::log("agx", "compute: no further channel movement after DevCtrl kick — inspect DC_Init handling");
+    }
+}
+
 /// Compute milestone: replay the captured initdata memory map, start the app
 /// endpoints, hand the firmware the initdata pointer (MSG_INIT), and observe.
 /// If the firmware accepts it (no crash + it starts driving its channels), the
@@ -1139,11 +1236,18 @@ fn boot_firmware(asc: &Asc, rep: &mut Report) {
     // The decisive check: did the firmware write its shared-memory channel rings?
     // (A cursor that MOVED past its replayed baseline / fresh boot-log text =
     // initdata accepted + firmware executing. A stale-but-nonzero cursor is not.)
-    if probe_firmware_liveness(&baseline) {
+    let alive = probe_firmware_liveness(&baseline);
+    if alive {
         crate::ktrace::log("agx", "compute: FIRMWARE ALIVE — channel cursor advanced past replay baseline (initdata accepted, GPU executing)");
     } else {
         crate::ktrace::log("agx", "compute: no channel movement vs baseline — firmware parsed initdata but hasn't driven rings yet (may need DevCtrl kick)");
     }
+    // Snapshot the post-MSG_INIT cursors, then kick DevCtrl (DC_Init +
+    // DC_UpdateIdleTS) to bring the firmware into full operation — this is what
+    // starts the FWLog/Event channels the probe showed idle. Movement measured
+    // against this fresh baseline is attributable to the kick, not to MSG_INIT.
+    let post_init = read_channel_cursors();
+    kick_devctrl(asc, &post_init);
 }
 
 /// Bring up the AGX coprocessor. Gated on `is_apple()` + the `chitti.agx`
