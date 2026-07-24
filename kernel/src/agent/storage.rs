@@ -25,6 +25,10 @@ use alloc::vec::Vec;
 pub const MAX_VALUE_BYTES: usize = 64 * 1024;
 /// Max total bytes of session storage per agent.
 pub const MAX_SESSION_TOTAL: usize = 1024 * 1024;
+/// Max total bytes of durable storage per agent (sum of value sizes).
+pub const MAX_DURABLE_TOTAL: usize = 4 * 1024 * 1024;
+/// Max number of durable keys per agent.
+pub const MAX_DURABLE_KEYS: usize = 256;
 
 /// Storage scope: ephemeral session vs durable home folder.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -86,10 +90,30 @@ pub fn set(id: u64, scope: Scope, key: &str, value: &[u8]) -> Result<(), &'stati
         Scope::Durable => {
             ensure_storage_dir(id);
             let p = storage_path(id, &k).ok_or("invalid storage key")?;
+            let prev = fs::size_of(&p).unwrap_or(0);
+            let keys = list(id, Scope::Durable);
+            let is_new = !keys.iter().any(|x| x == &k);
+            if is_new && keys.len() >= MAX_DURABLE_KEYS {
+                return Err("durable storage key limit (max 256 keys per agent)");
+            }
+            let total = durable_total(id).saturating_sub(prev).saturating_add(value.len());
+            if total > MAX_DURABLE_TOTAL {
+                return Err("durable storage full (max 4 MiB per agent)");
+            }
             fs::write(&p, value);
             Ok(())
         }
     }
+}
+
+/// Sum of durable value sizes for `id` (keys under `/agent/<id>/storage/`).
+fn durable_total(id: u64) -> usize {
+    let prefix = format!("{}/storage/", home::path(id));
+    fs::list()
+        .into_iter()
+        .filter(|p| p.starts_with(&prefix) && !p.ends_with("/.keep") && !p.ends_with(".keep"))
+        .filter_map(|p| fs::size_of(&p))
+        .sum()
 }
 
 /// `storage_get`: read value, or `None` if missing.

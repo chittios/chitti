@@ -135,27 +135,32 @@ pub fn uninstall(id: SkillId) {
 }
 
 /// Add the per-agent home sandbox (`Fs READ|WRITE|LIST|DELETE @ /agent/<id>/**`)
-/// to a grant, unless the agent is the orchestrator (the root, full-FS) or its
-/// manifest already carries an Fs capability the human approved (which may be
-/// broader — a deliberately privileged agent). Returns the effective grant the
-/// agent's task will be given. This is what confines every installed agent to
-/// its own folder by default.
+/// to a grant, unless the agent is the orchestrator (the root, full-FS).
+///
+/// The home floor is **always** injected for non-orchestrator agents, even when
+/// the human also approved other Fs scopes. A broader approved grant (e.g.
+/// `Fs @ Any`) still covers everything via scope OR-semantics; a narrow
+/// non-home grant no longer *replaces* the home floor (which used to leave an
+/// agent without its own working directory if the only approved Fs was elsewhere).
 pub fn with_home_sandbox(granted: &[CapabilityRequest], id: AgentId, kind: AgentKind) -> Vec<CapabilityRequest> {
     let mut out = granted.to_vec();
     // The orchestrator (shell agent) is the root — never sandboxed.
     if kind == AgentKind::Orchestrator {
         return out;
     }
-    // An explicit, approved Fs grant wins (it was shown on the install screen).
-    if out.iter().any(|c| c.domain == CapDomain::Fs) {
-        return out;
-    }
     let home = crate::agent::home::path(id.0);
-    out.push(CapabilityRequest::new(
-        CapDomain::Fs,
-        Rights::READ | Rights::WRITE | Rights::LIST | Rights::DELETE,
-        Scope::Path(alloc::format!("{home}/**")),
-    ));
+    let home_scope = Scope::Path(alloc::format!("{home}/**"));
+    let home_rights = Rights::READ | Rights::WRITE | Rights::LIST | Rights::DELETE;
+    // Skip only when an existing grant already covers the full home floor
+    // (rights + path). Scope::Any with full rights counts as covering.
+    let already = out.iter().any(|c| {
+        c.domain == CapDomain::Fs
+            && c.rights.contains(home_rights)
+            && c.scope.covers(&home_scope)
+    });
+    if !already {
+        out.push(CapabilityRequest::new(CapDomain::Fs, home_rights, home_scope));
+    }
     out
 }
 

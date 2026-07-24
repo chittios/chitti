@@ -92,7 +92,12 @@ pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Just
     // prompt-injection-as-privilege-escalation defence, enforced at the OS
     // boundary regardless of how the agent phrased the call. Only an explicit
     // human confirmation at the shell can let it through.
-    if spec.destructive && justification.blocks_destructive() {
+    //
+    // Identity-file writes (SOUL.md / MEMORY.md) are treated as destructive
+    // even though mem_fs_write is not: those files re-enter the system prompt
+    // as trusted persona, so an untrusted write is taint-laundering.
+    let identity_write = is_identity_file_mutation(spec, &call.args);
+    if (spec.destructive || identity_write) && justification.blocks_destructive() {
         crate::ktrace::log_fmt(format_args!(
             "synapse.taint: REFUSED destructive '{}' by task {caller} -- justification is untrusted ingested content ({:?})",
             spec.name, justification.provenance
@@ -149,20 +154,70 @@ fn resolve_channel_end(caller: TaskId, args: &[ArgValue], i: usize) -> Option<(C
     }
 }
 
+/// Like [`resolve_channel_end`], but also returns the caller's cap slot so
+/// transfer ops can revoke it after granting the target.
+fn resolve_channel_end_slot(caller: TaskId, args: &[ArgValue], i: usize) -> Option<(Cap, ChannelId, bool)> {
+    let slot = arg_uint(args, i) as u32;
+    let cap_h = Cap(slot);
+    match cap::lookup(caller, cap_h) {
+        Some(Right::ChannelWrite(c)) => Some((cap_h, c, true)),
+        Some(Right::ChannelRead(c)) => Some((cap_h, c, false)),
+        _ => None,
+    }
+}
+
 /// Map a validated call to the concrete (domain, rights, target scope) it
 /// touches, for the executor's scope gate. `None` = the primitive names no
 /// scopeable resource (console, sleep, emit_result, channel ops — channels are
 /// gated by their per-end cap, not a scope). This is the single place a
 /// primitive's arguments become the scope target the ledger is checked against.
+///
+/// FS paths are always [`vpath::normalize`]d first so `..` / `//` / `.` cannot
+/// slip past a prefix grant like `/agent/7/**`.
 fn scope_target(spec: &PrimitiveSpec, args: &[ArgValue]) -> Option<(CapDomain, Rights, Scope)> {
     match spec.id {
-        registry::MEM_FS_READ => Some((CapDomain::Fs, Rights::READ, Scope::Path(arg_str(args, 0).into()))),
-        registry::MEM_FS_WRITE => Some((CapDomain::Fs, Rights::WRITE, Scope::Path(arg_str(args, 0).into()))),
-        registry::MEM_FS_EDIT => Some((CapDomain::Fs, Rights::WRITE, Scope::Path(arg_str(args, 0).into()))),
-        registry::MEM_FS_DELETE => Some((CapDomain::Fs, Rights::DELETE, Scope::Path(arg_str(args, 0).into()))),
+        registry::MEM_FS_READ => Some((CapDomain::Fs, Rights::READ, Scope::Path(fs_path(args, 0)))),
+        registry::MEM_FS_WRITE => Some((CapDomain::Fs, Rights::WRITE, Scope::Path(fs_path(args, 0)))),
+        registry::MEM_FS_EDIT => Some((CapDomain::Fs, Rights::WRITE, Scope::Path(fs_path(args, 0)))),
+        registry::MEM_FS_DELETE => Some((CapDomain::Fs, Rights::DELETE, Scope::Path(fs_path(args, 0)))),
         registry::NET_HTTP_GET => net_scope(arg_str(args, 0), Rights::READ),
         registry::NET_HTTP_POST => net_scope(arg_str(args, 0), Rights::WRITE),
+        registry::NET_LISTEN => {
+            let port = arg_uint(args, 0) as u16;
+            Some((
+                CapDomain::Net,
+                Rights::EXEC,
+                Scope::Net {
+                    host: String::from("*"),
+                    port_lo: port,
+                    port_hi: port,
+                },
+            ))
+        }
         _ => None,
+    }
+}
+
+/// Normalised FS path argument (index `i`) for scope + I/O.
+fn fs_path(args: &[ArgValue], i: usize) -> String {
+    super::vpath::normalize(arg_str(args, i))
+}
+
+/// Paths that re-enter the agent as trusted persona / durable memory. Writing
+/// them under untrusted justification is prompt-injection taint-laundering.
+fn is_identity_path(path: &str) -> bool {
+    let n = super::vpath::normalize(path);
+    let base = n.rsplit('/').next().unwrap_or(n.as_str());
+    base.eq_ignore_ascii_case("SOUL.md") || base.eq_ignore_ascii_case("MEMORY.md")
+}
+
+/// Whether this call mutates an identity file (SOUL.md / MEMORY.md).
+fn is_identity_file_mutation(spec: &PrimitiveSpec, args: &[ArgValue]) -> bool {
+    match spec.id {
+        registry::MEM_FS_WRITE | registry::MEM_FS_EDIT | registry::MEM_FS_DELETE => {
+            is_identity_path(arg_str(args, 0))
+        }
+        _ => false,
     }
 }
 
@@ -212,16 +267,16 @@ fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> Str
             "ok".to_string()
         }
         registry::MEM_FS_READ => {
-            let path = arg_str(args, 0);
-            match fs::read(path) {
+            let path = fs_path(args, 0);
+            match fs::read(&path) {
                 Some(bytes) => format!("ok:{}", String::from_utf8_lossy(&bytes)),
                 None => format!("error:not_found:{path}"),
             }
         }
         registry::MEM_FS_WRITE => {
-            let path = arg_str(args, 0);
+            let path = fs_path(args, 0);
             let text = arg_str(args, 1);
-            fs::write(path, text.as_bytes());
+            fs::write(&path, text.as_bytes());
             format!("ok:wrote {} bytes to {path}", text.len())
         }
         registry::LIST => {
@@ -254,8 +309,8 @@ fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> Str
         registry::MEM_FS_DELETE => {
             // Destructive: only reached once the taint gate (above) has let
             // this call through.
-            let path = arg_str(args, 0);
-            if fs::delete(path) {
+            let path = fs_path(args, 0);
+            if fs::delete(&path) {
                 format!("ok:deleted {path}")
             } else {
                 format!("error:not_found:{path}")
@@ -265,15 +320,15 @@ fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> Str
             // Safer edit: refuse empty `old` and refuse multi-match unless the
             // tools Router rewrote to a single unique occurrence. Default path:
             // unique match only.
-            let path = arg_str(args, 0);
+            let path = fs_path(args, 0);
             let old = arg_str(args, 1);
             let new = arg_str(args, 2);
-            match fs::read(path) {
+            match fs::read(&path) {
                 Some(bytes) => {
                     let content = String::from_utf8_lossy(&bytes).into_owned();
                     match crate::tools::pathutil::safe_edit(&content, old, new, false) {
                         Ok(edited) => {
-                            fs::write(path, edited.as_bytes());
+                            fs::write(&path, edited.as_bytes());
                             format!("ok:edited {path}")
                         }
                         Err(e) => format!("error:{e}:{path}"),
@@ -367,10 +422,11 @@ fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> Str
             }
         }
         registry::CHANNEL_GRANT => {
-            // Move-authority op: the caller may only grant an end it actually
-            // holds (attenuation), to a target it can name. Destructive, so the
-            // taint gate already refused it if the justification is untrusted.
-            let (chan, is_write) = match resolve_channel_end(caller, args, 0) {
+            // Transfer-authority op: the caller may only grant an end it actually
+            // holds, to a target it can name. After grant, the caller's slot is
+            // revoked so authority is moved (not duplicated). Destructive, so
+            // the taint gate already refused it if the justification is untrusted.
+            let (caller_cap, chan, is_write) = match resolve_channel_end_slot(caller, args, 0) {
                 Some(x) => x,
                 None => {
                     cap::record_denial(caller, "channel_grant (handle)");
@@ -382,13 +438,13 @@ fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> Str
                 Some(t) => t,
                 None => return format!("error:no_such_agent:{target_name}"),
             };
-            // Register an extra live end for the new holder, then grant it the
-            // same direction the caller holds.
-            channel::dup_end(chan);
+            // Target receives the same directional right; caller's slot is
+            // cleared so a granted end is not ambiently shared.
             let right = if is_write { Right::ChannelWrite(chan) } else { Right::ChannelRead(chan) };
             let slot = cap::grant(target, right).0;
+            let _ = cap::revoke(caller, caller_cap);
             let dir = if is_write { "write" } else { "read" };
-            format!("ok:granted {dir} end to task {target} (slot {slot})")
+            format!("ok:transferred {dir} end to task {target} (slot {slot})")
         }
         registry::NET_LISTEN => {
             let port = arg_uint(args, 0);

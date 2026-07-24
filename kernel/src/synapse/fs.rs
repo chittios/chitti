@@ -48,28 +48,32 @@ pub fn mount_ext4(mut store: crate::block::ext4_store::Ext4Store) {
 }
 
 /// Create or replace the file at `path` with `contents`.
+/// Paths are normalised (`..` / `//` collapsed) so keys stay canonical.
 pub fn write(path: &str, contents: &[u8]) {
+    let path = vpath::normalize(path);
     STORE.with(|b| match b {
         Backend::Memory(s) => {
-            s.insert(String::from(path), contents.to_vec());
+            s.insert(path, contents.to_vec());
         }
-        Backend::Ext4(s) => s.write(path, contents),
+        Backend::Ext4(s) => s.write(&path, contents),
     });
 }
 
 /// Read the file at `path`, or `None` if it does not exist.
 pub fn read(path: &str) -> Option<Vec<u8>> {
+    let path = vpath::normalize(path);
     STORE.with(|b| match b {
-        Backend::Memory(s) => s.get(path).cloned(),
-        Backend::Ext4(s) => s.read(path),
+        Backend::Memory(s) => s.get(&path).cloned(),
+        Backend::Ext4(s) => s.read(&path),
     })
 }
 
 /// Whether a file exists at `path`.
 pub fn exists(path: &str) -> bool {
+    let path = vpath::normalize(path);
     STORE.with(|b| match b {
-        Backend::Memory(s) => s.contains_key(path),
-        Backend::Ext4(s) => s.exists(path),
+        Backend::Memory(s) => s.contains_key(&path),
+        Backend::Ext4(s) => s.exists(&path),
     })
 }
 
@@ -85,17 +89,19 @@ pub fn list() -> Vec<String> {
 /// **Destructive / irreversible** -- the reason `mem_fs_delete` is gated on
 /// provenance by the Synapse taint gate (Phase 6).
 pub fn delete(path: &str) -> bool {
+    let path = vpath::normalize(path);
     STORE.with(|b| match b {
-        Backend::Memory(s) => s.remove(path).is_some(),
-        Backend::Ext4(s) => s.delete(path),
+        Backend::Memory(s) => s.remove(&path).is_some(),
+        Backend::Ext4(s) => s.delete(&path),
     })
 }
 
 /// Byte size of a file key, or `None` if missing.
 pub fn size_of(path: &str) -> Option<usize> {
+    let path = vpath::normalize(path);
     STORE.with(|b| match b {
-        Backend::Memory(s) => s.get(path).map(|v| v.len()),
-        Backend::Ext4(s) => s.read(path).map(|v| v.len()),
+        Backend::Memory(s) => s.get(&path).map(|v| v.len()),
+        Backend::Ext4(s) => s.read(&path).map(|v| v.len()),
     })
 }
 

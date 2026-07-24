@@ -136,6 +136,9 @@ pub fn inflate(src: &[u8]) -> Result<Vec<u8>, &'static str> {
                 if br.pos + len > src.len() {
                     return Err("deflate: truncated stored block");
                 }
+                if out.len().saturating_add(len) > OUT_MAX {
+                    return Err("deflate: output too large");
+                }
                 out.extend_from_slice(&src[br.pos..br.pos + len]);
                 br.pos += len;
             }
@@ -218,7 +221,12 @@ fn inflate_block(br: &mut Bits<'_>, litt: &Huff, distt: &Huff, out: &mut Vec<u8>
     loop {
         let sym = litt.decode(br)? as usize;
         match sym {
-            0..=255 => out.push(sym as u8),
+            0..=255 => {
+                if out.len() >= OUT_MAX {
+                    return Err("deflate: output too large");
+                }
+                out.push(sym as u8);
+            }
             256 => return Ok(()),
             257..=285 => {
                 let li = sym - 257;
@@ -231,7 +239,7 @@ fn inflate_block(br: &mut Bits<'_>, litt: &Huff, distt: &Huff, out: &mut Vec<u8>
                 if dist == 0 || dist > out.len() {
                     return Err("deflate: distance beyond output");
                 }
-                if out.len() + len > OUT_MAX {
+                if out.len().saturating_add(len) > OUT_MAX {
                     return Err("deflate: output too large");
                 }
                 // Byte-by-byte on purpose: overlapping copies (dist < len)

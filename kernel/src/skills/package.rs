@@ -130,8 +130,10 @@ impl SkillPackage {
 
     /// Write the package's body + assets to the store and register its bundled
     /// tools + L0 metadata. Does NOT verify a signature or gate capabilities —
-    /// Phase F treats placed skills as trusted (Phase G adds verify + consent).
-    pub fn place_trusted(&self) -> Result<(), postcard::Error> {
+    /// only safe for **boot/bundled** paths and for [`crate::skills::install`]
+    /// *after* `verify()`. Not public so agent-facing code cannot place an
+    /// unsigned package by calling this directly.
+    pub(crate) fn place_trusted(&self) -> Result<(), postcard::Error> {
         // L1 body.
         crate::synapse::fs::write(&self.manifest.body_ref.0, self.body.as_bytes());
         // L2 assets: match payloads to declared asset store_refs by name.

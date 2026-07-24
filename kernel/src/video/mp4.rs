@@ -243,11 +243,25 @@ pub fn build_samples(t: &SampleTables) -> Vec<Sample> {
     samples
 }
 
+/// Absolute max table entries from an untrusted box (allocation-bomb guard).
+const MAX_TABLE_ENTRIES: usize = 2_000_000;
+
+/// Cap `count` against remaining body bytes for fixed-width records.
+fn capped_count(count: usize, body_remaining: usize, rec_size: usize) -> Result<usize, &'static str> {
+    if count > MAX_TABLE_ENTRIES {
+        return Err("mp4: table count too large");
+    }
+    if rec_size > 0 && count > body_remaining / rec_size {
+        return Err("mp4: table count exceeds box size");
+    }
+    Ok(count)
+}
+
 fn parse_stsz(body: &[u8]) -> Result<Vec<u32>, &'static str> {
     let mut r = Reader::new(body);
     let _ver_flags = r.u32()?;
     let default_size = r.u32()?;
-    let count = r.u32()? as usize;
+    let count = capped_count(r.u32()? as usize, r.remaining(), if default_size != 0 { 0 } else { 4 })?;
     if default_size != 0 {
         return Ok(alloc::vec![default_size; count]);
     }
@@ -261,7 +275,8 @@ fn parse_stsz(body: &[u8]) -> Result<Vec<u32>, &'static str> {
 fn parse_offsets(body: &[u8], wide: bool) -> Result<Vec<u64>, &'static str> {
     let mut r = Reader::new(body);
     let _ver_flags = r.u32()?;
-    let count = r.u32()? as usize;
+    let rec = if wide { 8 } else { 4 };
+    let count = capped_count(r.u32()? as usize, r.remaining(), rec)?;
     let mut v = Vec::with_capacity(count);
     for _ in 0..count {
         v.push(if wide { r.u64()? } else { r.u32()? as u64 });
@@ -272,7 +287,7 @@ fn parse_offsets(body: &[u8], wide: bool) -> Result<Vec<u64>, &'static str> {
 fn parse_stsc(body: &[u8]) -> Result<Vec<(u32, u32)>, &'static str> {
     let mut r = Reader::new(body);
     let _ver_flags = r.u32()?;
-    let count = r.u32()? as usize;
+    let count = capped_count(r.u32()? as usize, r.remaining(), 12)?;
     let mut v = Vec::with_capacity(count);
     for _ in 0..count {
         let first_chunk = r.u32()?; // 1-based in file
@@ -286,7 +301,7 @@ fn parse_stsc(body: &[u8]) -> Result<Vec<(u32, u32)>, &'static str> {
 fn parse_stts(body: &[u8]) -> Result<Vec<(u32, u32)>, &'static str> {
     let mut r = Reader::new(body);
     let _ver_flags = r.u32()?;
-    let count = r.u32()? as usize;
+    let count = capped_count(r.u32()? as usize, r.remaining(), 8)?;
     let mut v = Vec::with_capacity(count);
     for _ in 0..count {
         let sc = r.u32()?;
@@ -300,10 +315,7 @@ fn parse_stts(body: &[u8]) -> Result<Vec<(u32, u32)>, &'static str> {
 fn parse_ctts(body: &[u8]) -> Result<Vec<(u32, i64)>, &'static str> {
     let mut r = Reader::new(body);
     let ver = r.u32()? >> 24;
-    let n = r.u32()? as usize;
-    if n > body.len() / 8 {
-        return Err("mp4: ctts count too large");
-    }
+    let n = capped_count(r.u32()? as usize, r.remaining(), 8)?;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let cnt = r.u32()?;
@@ -317,7 +329,7 @@ fn parse_ctts(body: &[u8]) -> Result<Vec<(u32, i64)>, &'static str> {
 fn parse_stss(body: &[u8]) -> Result<Vec<u32>, &'static str> {
     let mut r = Reader::new(body);
     let _ver_flags = r.u32()?;
-    let count = r.u32()? as usize;
+    let count = capped_count(r.u32()? as usize, r.remaining(), 4)?;
     let mut v = Vec::with_capacity(count);
     for _ in 0..count {
         v.push(r.u32()?);

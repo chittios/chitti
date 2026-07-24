@@ -257,30 +257,41 @@ fn read_value<'a>(c: &mut Cursor<'a>, value_type: u32) -> Result<Value<'a>, Gguf
         9 => {
             let elem_type = c.u32()?;
             let count = c.u64()? as usize;
+            // Allocation-bomb guard: never `with_capacity` from an untrusted
+            // count alone. Cap absolute size; fixed-width arrays also check
+            // against remaining file bytes when possible.
+            const MAX_META_ARRAY: usize = 1_000_000;
+            if count > MAX_META_ARRAY {
+                return Err(GgufError::Truncated);
+            }
             match elem_type {
                 8 => {
-                    let mut v = Vec::with_capacity(count);
+                    let mut v = Vec::new();
+                    v.try_reserve(count.min(4096)).map_err(|_| GgufError::Truncated)?;
                     for _ in 0..count {
                         v.push(c.gstr()?);
                     }
                     Value::StrArray(v)
                 }
                 4 | 5 => {
-                    let mut v = Vec::with_capacity(count);
+                    let mut v = Vec::new();
+                    v.try_reserve(count.min(65_536)).map_err(|_| GgufError::Truncated)?;
                     for _ in 0..count {
                         v.push(c.u32()? as i32);
                     }
                     Value::I32Array(v)
                 }
                 6 => {
-                    let mut v = Vec::with_capacity(count);
+                    let mut v = Vec::new();
+                    v.try_reserve(count.min(65_536)).map_err(|_| GgufError::Truncated)?;
                     for _ in 0..count {
                         v.push(c.f32()?);
                     }
                     Value::F32Array(v)
                 }
                 7 => {
-                    let mut v = Vec::with_capacity(count);
+                    let mut v = Vec::new();
+                    v.try_reserve(count.min(65_536)).map_err(|_| GgufError::Truncated)?;
                     for _ in 0..count {
                         v.push(c.take(1)?[0] != 0);
                     }

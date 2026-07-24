@@ -45,8 +45,11 @@ pub struct Router {
 
 impl Router {
     pub fn new() -> Self {
+        // Default ON: agent tool paths must never silently drop taint. Callers
+        // that intentionally want a fully-trusted kernel path set
+        // `taint_aware = false` explicitly (rare).
         Self {
-            taint_aware: false,
+            taint_aware: true,
             human_confirmed: false,
             spawn_hook: None,
             load_skill_hook: None,
@@ -55,11 +58,10 @@ impl Router {
     }
 
     /// A taint-aware router (Phase E): destructive calls justified by untrusted
-    /// ingested content are refused at the Synapse gate.
+    /// ingested content are refused at the Synapse gate. Alias of [`Self::new`]
+    /// kept for call-site clarity.
     pub fn taint_aware() -> Self {
-        let mut r = Self::new();
-        r.taint_aware = true;
-        r
+        Self::new()
     }
 
     fn justification(&self, session: &Session) -> Justification {
@@ -147,6 +149,14 @@ impl ToolDispatch for Router {
                     );
                 }
                 if call.tool == "exit_plan_mode" {
+                    // Must not silently drop plan mode: shell `execute_chat_tool`
+                    // shows a human confirm modal. This Router path is only a
+                    // fallback — refuse unless the shell already confirmed.
+                    if !self.human_confirmed {
+                        return ToolOutcome::error(
+                            "exit_plan_mode: needs human approval (use the chat plan-exit confirm)",
+                        );
+                    }
                     crate::shell::set_plan_mode(false);
                     return ToolOutcome::ok("ok: plan mode off", Provenance::SystemTrusted);
                 }
@@ -189,8 +199,10 @@ impl ToolDispatch for Router {
             ToolBinding::Shell { command, destructive } => {
                 // Destructive system commands (format/install) are gated exactly
                 // like a DELETE: refused when justified by untrusted content and
-                // not human-confirmed.
-                if *destructive && self.justification(session).blocks_destructive() {
+                // not human-confirmed. Any `/http` under taint is also refused
+                // (GET is an egress/exfil channel, same as net_http_get).
+                let dest = *destructive || *command == "http" || shell_cmd_is_destructive_http(command, &call.args);
+                if dest && self.justification(session).blocks_destructive() {
                     return ToolOutcome::error(alloc::format!(
                         "refused: destructive command '/{command}' justified by untrusted content"
                     ));
@@ -200,10 +212,14 @@ impl ToolDispatch for Router {
                 ToolOutcome::ok(out, Provenance::UntrustedIngested)
             }
             ToolBinding::Mcp { server, tool } => {
-                // Forward to the connected MCP server. The whole `arguments`
-                // object is passed through as JSON. The result is external
-                // content, so it enters context as UntrustedIngested (taint
-                // gate applies to anything it later justifies).
+                // MCP tools/call is remote side-effectful egress. Gate it like a
+                // destructive primitive: untrusted justification cannot fire it
+                // without human confirmation (results stay UntrustedIngested).
+                if self.justification(session).blocks_destructive() {
+                    return ToolOutcome::error(alloc::format!(
+                        "refused: MCP '{server}/{tool}' justified by untrusted content"
+                    ));
+                }
                 match crate::mcp::call(server, tool, &call.args) {
                     Ok(text) => ToolOutcome::ok(text, Provenance::UntrustedIngested),
                     Err(e) => ToolOutcome::error(e),
@@ -211,15 +227,27 @@ impl ToolDispatch for Router {
             }
             ToolBinding::AgentMemory => {
                 // The session's agent owns the memory namespace
-                // (`/agent/<id>/memory/`).
+                // (`/agent/<id>/memory/`). Mutating tools re-enter the system
+                // prompt (MEMORY.md / stored facts), so under taint they are
+                // refused — same defence as SOUL.md writes at the Synapse gate.
                 let agent_id = session.agent.manifest_id.0;
+                let mutating = matches!(
+                    call.tool.as_str(),
+                    "memory_add" | "remember" | "memory_md_append"
+                );
+                if mutating && self.justification(session).blocks_destructive() {
+                    return ToolOutcome::error(alloc::format!(
+                        "refused: '{}' justified by untrusted content (would launder into system prompt)",
+                        call.tool
+                    ));
+                }
                 let out = crate::agent::home::run_memory_tool(&call.tool, agent_id, &call.args);
                 if out.starts_with("error:") {
                     ToolOutcome::error(out)
                 } else {
-                    // Recalled facts are durable agent state the human installed
-                    // into the agent's home — treat as system-trusted content
-                    // (same as a skill body), not untrusted web ingest.
+                    // Mutating under taint is refused above, so recalls cannot
+                    // launder *new* untrusted content. Tag as system-trusted
+                    // (durable agent state), matching skill-body steering.
                     ToolOutcome::ok(out, Provenance::SystemTrusted)
                 }
             }
@@ -257,6 +285,13 @@ impl ToolDispatch for Router {
                 }
             }
             ToolBinding::Download => {
+                // Network egress + store write: refuse under untrusted
+                // justification (exfil / overwrite via injected "download …").
+                if self.justification(session).blocks_destructive() {
+                    return ToolOutcome::error(
+                        "refused: download justified by untrusted content",
+                    );
+                }
                 let out = crate::shell::run_download_tool(&call.args);
                 if out.starts_with("error:") {
                     ToolOutcome::error(out)
@@ -266,6 +301,18 @@ impl ToolDispatch for Router {
                 }
             }
             ToolBinding::Browser => {
+                // Navigation / open under untrusted context is ambient network
+                // egress (and runs page scripts) — refuse like net_http_get.
+                let navigating = matches!(
+                    call.tool.as_str(),
+                    "browser_open" | "browser_navigate" | "browser_goto"
+                );
+                if navigating && self.justification(session).blocks_destructive() {
+                    return ToolOutcome::error(alloc::format!(
+                        "refused: '{}' justified by untrusted content",
+                        call.tool
+                    ));
+                }
                 let out = crate::shell::run_browser_tool(&call.tool, &call.args);
                 if out.starts_with("error:") {
                     ToolOutcome::error(out)
@@ -275,6 +322,30 @@ impl ToolDispatch for Router {
                 }
             }
             ToolBinding::RunShellCommand => {
+                // Same taint gate as Shell bindings: destructive first tokens
+                // (rm/install/…) and HTTP POST/body cannot run under untrusted
+                // justification without human confirmation.
+                let command = todo::json_str(&call.args, "command")
+                    .or_else(|| todo::json_str(&call.args, "cmd"))
+                    .unwrap_or_default();
+                if let Ok((name, rest)) = crate::tools::shell_cmd::parse_command_line(&command) {
+                    let extra = todo::json_str(&call.args, "args").unwrap_or_default();
+                    let full = if extra.is_empty() {
+                        rest
+                    } else if rest.is_empty() {
+                        extra
+                    } else {
+                        format!("{rest} {extra}")
+                    };
+                    let dest = crate::tools::shell_cmd::is_destructive_cmd(&name)
+                        || name == "http"
+                        || shell_http_args_destructive(&full);
+                    if dest && self.justification(session).blocks_destructive() {
+                        return ToolOutcome::error(alloc::format!(
+                            "refused: destructive command '/{name}' justified by untrusted content"
+                        ));
+                    }
+                }
                 let out = crate::tools::shell_cmd::run_from_tool_args(&call.args);
                 if out.starts_with("error:") {
                     ToolOutcome::error(out)
@@ -299,7 +370,7 @@ impl ToolDispatch for Router {
                 }
             }
             ToolBinding::Web => {
-                let out = dispatch_web_tool(&call.tool, &call.args);
+                let out = dispatch_web_tool_gated(session, self, &call.tool, &call.args);
                 if out.starts_with("error:") {
                     ToolOutcome::error(out)
                 } else {
@@ -446,6 +517,46 @@ fn strip_html_rough(html: &str, max: usize) -> String {
         }
     }
     compact
+}
+
+/// Whether a shell `/http` invocation is side-effectful (POST/body/download).
+fn shell_http_args_destructive(args: &str) -> bool {
+    let lower = args.to_ascii_lowercase();
+    // -X POST|PUT|PATCH|DELETE, -d body, -O/-o download (writes store + egress).
+    if lower.contains("-x post")
+        || lower.contains("-x put")
+        || lower.contains("-x patch")
+        || lower.contains("-x delete")
+    {
+        return true;
+    }
+    let mut tokens = lower.split_whitespace();
+    while let Some(t) = tokens.next() {
+        match t {
+            "-d" | "--data" | "--data-raw" | "-O" | "-o" | "--stream" => return true,
+            t if t.starts_with("-d") && t.len() > 2 => return true, // -dBODY
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Shell binding helper: `http` with POST/body counts as destructive for taint.
+fn shell_cmd_is_destructive_http(command: &str, call_args: &str) -> bool {
+    if command != "http" {
+        return false;
+    }
+    let arg = todo::json_str(call_args, "args").unwrap_or_default();
+    shell_http_args_destructive(&arg)
+}
+
+/// Web tools always hit the network; refuse when the Router's session
+/// justification is tainted (callers pass session via `call` wrapper).
+fn dispatch_web_tool_gated(session: &Session, router: &Router, name: &str, args: &str) -> String {
+    if router.justification(session).blocks_destructive() {
+        return format!("error: refused: '{name}' justified by untrusted content");
+    }
+    dispatch_web_tool(name, args)
 }
 
 fn dispatch_web_tool(name: &str, args: &str) -> String {

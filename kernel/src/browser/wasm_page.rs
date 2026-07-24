@@ -51,19 +51,19 @@ pub fn instantiate(url: &str, bytes: &[u8]) -> Result<PageInstance, String> {
     })
 }
 
-/// Call a string-in/string-out export (agent ABI).
+/// Call a string-in/string-out export on the **page** host-import surface
+/// (no agent storage/UI/sound — see [`crate::agent::wasm_rt::call_string_page`]).
 pub fn call_export(
     module_bytes: &[u8],
     export: &str,
     arg: &str,
 ) -> Result<String, String> {
     validate(module_bytes).map_err(|e| String::from(e))?;
-    crate::agent::wasm_abi::call_wasm_export(
+    crate::agent::wasm_rt::call_string_page(
         module_bytes,
         export,
         arg,
-        PAGE_FUEL,
-        crate::agent::wasm_rt::HostBindings::default(),
+        crate::agent::wasm_rt::Limits::default().with_fuel(PAGE_FUEL),
     )
     .map_err(|e| format!("{e}"))
 }

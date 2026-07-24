@@ -225,8 +225,8 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
         id: NET_HTTP_GET,
         name: "net_http_get",
         params: &[Param { key: "url", ty: STR }],
-        description: "HTTP GET a URL (scope-gated by host/port). Returns the response body.",
-        destructive: false,
+        description: "HTTP GET a URL (scope-gated by host/port). Returns the response body. Destructive under taint: GET is an egress/exfil channel.",
+        destructive: true,
     },
     PrimitiveSpec {
         id: NET_HTTP_POST,
@@ -332,9 +332,18 @@ mod tests {
     fn destructive_primitives_are_exactly_the_known_set() {
         // The taint gate keys off this flag, so guard against a careless future
         // addition: any new destructive primitive must be a deliberate edit here.
-        // `mem_fs_delete` (irreversible), `channel_grant` (moves authority to
-        // another principal — an exfiltration vector under prompt injection).
+        // `mem_fs_delete` (irreversible), `channel_grant` (moves authority),
+        // `net_listen` (binds a port), `net_http_get`/`post` (egress/exfil).
         let destructive: alloc::vec::Vec<_> = REGISTRY.iter().filter(|p| p.destructive).map(|p| p.name).collect();
-        assert_eq!(destructive, alloc::vec!["mem_fs_delete", "channel_grant", "net_listen", "net_http_post"]);
+        assert_eq!(
+            destructive,
+            alloc::vec![
+                "mem_fs_delete",
+                "channel_grant",
+                "net_listen",
+                "net_http_get",
+                "net_http_post"
+            ]
+        );
     }
 }

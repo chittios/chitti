@@ -183,6 +183,11 @@ impl Scope {
 
 /// Host-glob cover: `a` covers `b` if `a` is `*`, an exact match, or a
 /// `*.suffix` wildcard that `b` ends with (matching a label boundary).
+///
+/// **Consent UI note:** `*.example.com` also covers the apex `example.com`
+/// (intentional; matches common TLS SAN wildcard practice). Show the apex
+/// explicitly when rendering a `*.suffix` Net grant so humans are not
+/// surprised.
 fn host_glob_covers(a: &str, b: &str) -> bool {
     if a == "*" || a == b {
         return true;
@@ -201,7 +206,13 @@ fn host_glob_covers(a: &str, b: &str) -> bool {
 /// Minimal glob cover: `a` covers `b` when `a` equals `b`, or `a` ends in `**`
 /// and `b` starts with `a`'s prefix. Sufficient for the `/work/**`-style scopes
 /// the schemas use; not a full glob engine.
+///
+/// Both sides are path-normalised first (`..` / `//` / `.` collapsed) so a
+/// grant of `/agent/7/**` never covers `/agent/7/../../etc/passwd` once the
+/// target is canonicalised to `/etc/passwd`.
 fn glob_covers(a: &str, b: &str) -> bool {
+    let a = crate::synapse::vpath::normalize(a);
+    let b = crate::synapse::vpath::normalize(b);
     if a == b {
         return true;
     }
@@ -716,6 +727,17 @@ mod tests {
         assert_eq!(Provenance::SystemTrusted.join(Provenance::UserTyped), Provenance::SystemTrusted);
         assert!(Provenance::UntrustedIngested.is_untrusted());
         assert!(!Provenance::UserTyped.is_untrusted());
+    }
+
+    #[test_case]
+    fn path_scope_normalizes_dotdot_escape() {
+        // Grant /agent/7/** must not cover a ..-escaped path once normalised.
+        let grant = Scope::Path("/agent/7/**".into());
+        assert!(grant.covers(&Scope::Path("/agent/7/memory/x".into())));
+        assert!(!grant.covers(&Scope::Path("/agent/7/../../etc/passwd".into())));
+        assert!(!grant.covers(&Scope::Path("/agent/7/../9999/steal".into())));
+        // // and . collapse into the grant.
+        assert!(grant.covers(&Scope::Path("/agent/7/./memory//y".into())));
     }
 
     #[test_case]

@@ -204,6 +204,19 @@ pub fn call_string_bound(
     session.call_string(export, args)
 }
 
+/// String-ABI call for **browser page WASM**: only `env` / WASI stubs, no
+/// `chitti` storage/UI/sound imports (prevents host-import bleed from untrusted
+/// page modules).
+pub fn call_string_page(
+    wasm: &[u8],
+    export: &str,
+    args: &str,
+    limits: Limits,
+) -> Result<String, &'static str> {
+    let mut session = Session::instantiate_page(wasm, limits)?;
+    session.call_string(export, args)
+}
+
 /// A live module instance bound to one store (one per UI agent).
 pub struct Session {
     store: Store<HostState>,
@@ -211,11 +224,25 @@ pub struct Session {
 }
 
 impl Session {
-    /// Compile, link host imports, instantiate with limits + bindings.
+    /// Compile, link **agent** host imports, instantiate with limits + bindings.
     pub fn instantiate(
         wasm: &[u8],
         limits: Limits,
         bind: HostBindings,
+    ) -> Result<Self, &'static str> {
+        Self::instantiate_with(wasm, limits, bind, HostImportSet::Agent)
+    }
+
+    /// Page / untrusted module path: no `chitti.*` agent host imports.
+    pub fn instantiate_page(wasm: &[u8], limits: Limits) -> Result<Self, &'static str> {
+        Self::instantiate_with(wasm, limits, HostBindings::default(), HostImportSet::Page)
+    }
+
+    fn instantiate_with(
+        wasm: &[u8],
+        limits: Limits,
+        bind: HostBindings,
+        imports: HostImportSet,
     ) -> Result<Self, &'static str> {
         if wasm.is_empty() {
             return Err("empty wasm module");
@@ -241,7 +268,10 @@ impl Session {
             .map_err(|_| "fuel metering unavailable")?;
 
         let mut linker = Linker::<HostState>::new(&engine);
-        register_host_imports(&mut linker)?;
+        match imports {
+            HostImportSet::Agent => register_host_imports(&mut linker)?,
+            HostImportSet::Page => register_page_imports(&mut linker)?,
+        }
         let instance = linker
             .instantiate(&mut store, &module)
             .map_err(|_| "wasm instantiate failed (missing imports?)")?
@@ -379,6 +409,51 @@ impl Session {
 // Host imports
 // ---------------------------------------------------------------------------
 
+/// Which host-import surface a wasmi instance gets.
+#[derive(Clone, Copy, Debug)]
+enum HostImportSet {
+    /// Full agent package surface (`chitti.*` storage/UI/sound).
+    Agent,
+    /// Browser page surface: `env` + WASI stubs only (no agent effects).
+    Page,
+}
+
+/// Minimal imports for untrusted page WASM — no storage, UI, or sound.
+fn register_page_imports(linker: &mut Linker<HostState>) -> Result<(), &'static str> {
+    linker
+        .func_wrap("env", "abort", |_caller: Caller<'_, HostState>| {
+            // Trap-like: wasmi will surface as a call error if the guest aborts via this.
+        })
+        .map_err(|_| "define env.abort")?;
+    linker
+        .func_wrap(
+            "env",
+            "log",
+            |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| {
+                if caller.data().log_count >= 16 {
+                    return;
+                }
+                caller.data_mut().log_count += 1;
+                if let Some(msg) = read_guest_str(&caller, ptr, len) {
+                    let preview: String = msg.chars().take(120).collect();
+                    crate::serial_println!("page.wasm.log> {preview}");
+                }
+            },
+        )
+        .map_err(|_| "define env.log")?;
+    // WASI stubs: return ENOSYS (-1) so modules that probe WASI don't get FS.
+    for (mod_name, field) in [
+        ("wasi_snapshot_preview1", "fd_write"),
+        ("wasi_snapshot_preview1", "fd_close"),
+        ("wasi_snapshot_preview1", "environ_get"),
+        ("wasi_snapshot_preview1", "environ_sizes_get"),
+        ("wasi_snapshot_preview1", "proc_exit"),
+    ] {
+        let _ = linker.func_wrap(mod_name, field, |_caller: Caller<'_, HostState>| -> i32 { -1 });
+    }
+    Ok(())
+}
+
 fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static str> {
     // storage_set(scope, key_ptr, key_len, val_ptr, val_len) -> i32
     linker
@@ -392,6 +467,10 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
              val_ptr: i32,
              val_len: i32|
              -> i32 {
+                let id = caller.data().bind.agent_id;
+                if id == 0 {
+                    return -3; // no ambient agent-0 storage
+                }
                 let Some(key) = read_guest_str(&caller, key_ptr, key_len) else {
                     return -1;
                 };
@@ -399,7 +478,6 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
                     return -1;
                 };
                 let sc = scope_from_i32(scope);
-                let id = caller.data().bind.agent_id;
                 match storage::set(id, sc, &key, &val) {
                     Ok(()) => 0,
                     Err(_) => -1,
@@ -603,16 +681,28 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
         .map_err(|_| "define host_log")?;
 
     // host_sound_play(hz, ms) -> i32  — tone via the sound device (synth agents).
+    // Gated: requires a real agent binding (agent_id != 0) and a short rate
+    // limit so page/default instances cannot spam audio.
     linker
         .func_wrap(
             "chitti",
             "host_sound_play",
-            |_caller: Caller<'_, HostState>, hz: i32, ms: i32| -> i32 {
+            |mut caller: Caller<'_, HostState>, hz: i32, ms: i32| -> i32 {
+                let bind = caller.data().bind;
+                if bind.agent_id == 0 {
+                    caller.data_mut().last_error = Some("sound: no agent binding");
+                    return -3;
+                }
+                // Reuse log_count as a crude rate limit shared with host_log.
+                if caller.data().log_count >= 32 {
+                    return -4;
+                }
+                caller.data_mut().log_count = caller.data().log_count.saturating_add(1);
                 if !crate::sound::is_up() {
                     return -1;
                 }
                 let hz = (hz as u32).clamp(20, 4000);
-                let ms = (ms as u32).clamp(20, 5000);
+                let ms = (ms as u32).clamp(20, 500); // tighter per-call cap
                 let rate = 16_000u32;
                 let pcm = crate::sound::test_tone(hz, ms, rate);
                 match crate::sound::play(&pcm, rate) {

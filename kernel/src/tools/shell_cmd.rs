@@ -11,7 +11,9 @@ use alloc::format;
 use alloc::string::{String, ToString};
 
 /// Known destructive first-tokens (even if args look soft).
-fn is_destructive_cmd(name: &str) -> bool {
+/// Public so the Router can taint-gate `run_shell_command` the same way as
+/// per-command Shell bindings.
+pub fn is_destructive_cmd(name: &str) -> bool {
     matches!(
         name,
         "rm" | "mkext4" | "install" | "umount" | "mv" | "cp"
@@ -122,5 +124,14 @@ mod tests {
     fn parse_rejects_metachar() {
         assert!(parse_command_line("ls;rm").is_err());
         assert!(parse_command_line("").is_err());
+    }
+
+    #[test_case]
+    fn destructive_cmd_names() {
+        assert!(is_destructive_cmd("rm"));
+        assert!(is_destructive_cmd("install"));
+        assert!(is_destructive_cmd("mkext4"));
+        assert!(!is_destructive_cmd("ls"));
+        assert!(!is_destructive_cmd("ping"));
     }
 }

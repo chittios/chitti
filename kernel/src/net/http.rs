@@ -44,6 +44,10 @@ impl Response {
 /// Max hops when following 3xx `Location` (browsers typically allow ~20; keep tight).
 pub const MAX_REDIRECTS: u32 = 10;
 
+/// Hard cap on buffered HTTP response size (headers + body on the wire).
+/// Hostile peers must not be able to OOM the kernel via a single GET/POST.
+pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 /// True for redirect statuses we follow on GET (RFC 9110).
 pub fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
@@ -143,6 +147,10 @@ pub fn get_follow_headers(
 /// Split `http[s]://host[:port]/path` into `(tls, host, port, path)`. `https`
 /// tunnels through [`super::tls`]; `http` is plaintext. Default port follows
 /// the scheme (80 / 443).
+///
+/// Rejects userinfo (`user:pass@host`) to block credential smuggling / some
+/// open-redirect and parser-diff tricks. Bare IPv6 in brackets is not yet
+/// supported (returns `bad host`).
 pub(crate) fn parse_url(url: &str) -> Result<(bool, String, u16, String), String> {
     let (tls, rest, default_port) = if let Some(r) = url.strip_prefix("https://") {
         (true, r, 443u16)
@@ -151,16 +159,34 @@ pub(crate) fn parse_url(url: &str) -> Result<(bool, String, u16, String), String
     } else {
         return Err("URL must start with http:// or https://".into());
     };
+    // Strip fragment; keep query on path.
+    let rest = rest.split('#').next().unwrap_or(rest);
     let (hostport, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
+    if hostport.contains('@') {
+        return Err("URL userinfo (user@host) is not allowed".into());
+    }
+    if hostport.starts_with('[') {
+        return Err("IPv6 host literals are not supported".into());
+    }
     let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) => (h, p.parse::<u16>().map_err(|_| "bad port")?),
+        Some((h, p)) => {
+            // Ambiguous "host:port" vs IPv4 — require port is all digits.
+            if !p.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("bad port".into());
+            }
+            (h, p.parse::<u16>().map_err(|_| "bad port")?)
+        }
         None => (hostport, default_port),
     };
     if host.is_empty() {
         return Err("empty host".into());
+    }
+    // Reject control bytes / spaces in host.
+    if host.bytes().any(|b| b <= 0x20 || b == b'/') {
+        return Err("bad host".into());
     }
     Ok((tls, host.to_string(), port, path.to_string()))
 }
@@ -320,12 +346,26 @@ fn drive_stream(conn: &mut Conn, wire: &[u8], deadline: u64, on_head: &mut dyn F
         if k == 0 {
             break; // EOF / close
         }
+        if raw.len().saturating_add(k) > MAX_RESPONSE_BYTES {
+            return Err(format!(
+                "HTTP response exceeds {} MiB cap",
+                MAX_RESPONSE_BYTES / (1024 * 1024)
+            ));
+        }
         raw.extend_from_slice(&buf[..k]);
         if head.is_none() {
             if let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
                 let h = parse_head(&raw[..split])?;
                 chunked = h.get("transfer-encoding").map(|v| v.to_ascii_lowercase().contains("chunked")).unwrap_or(false);
                 clen = h.get("content-length").and_then(|v| v.trim().parse().ok());
+                if let Some(n) = clen {
+                    if n > MAX_RESPONSE_BYTES {
+                        return Err(format!(
+                            "HTTP Content-Length {n} exceeds {} MiB cap",
+                            MAX_RESPONSE_BYTES / (1024 * 1024)
+                        ));
+                    }
+                }
                 body_at = split + 4;
                 on_head(&h);
                 head = Some(h);
@@ -339,6 +379,12 @@ fn drive_stream(conn: &mut Conn, wire: &[u8], deadline: u64, on_head: &mut dyn F
                 let n = clen.unwrap_or(region.len()).min(region.len());
                 region[..n].to_vec()
             };
+            if decoded.len() > MAX_RESPONSE_BYTES {
+                return Err(format!(
+                    "HTTP body exceeds {} MiB cap",
+                    MAX_RESPONSE_BYTES / (1024 * 1024)
+                ));
+            }
             if decoded.len() > emitted {
                 on_body(&decoded[emitted..]);
                 emitted = decoded.len();
@@ -553,6 +599,9 @@ mod tests {
         // A bad scheme is rejected.
         assert!(parse_url("ftp://x").is_err());
         assert!(parse_url("http://").is_err());
+        // Userinfo and IPv6 literals refused (hardening).
+        assert!(parse_url("http://user:pass@evil.com/").is_err());
+        assert!(parse_url("https://[::1]/").is_err());
     }
 
     #[test_case]

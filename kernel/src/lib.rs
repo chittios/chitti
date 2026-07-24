@@ -1014,11 +1014,10 @@ fn agent_install_places_soul_and_grants_read_only_subset() {
     skills::install::uninstall(skill);
 }
 
-/// `channel_grant` moves a channel end to another agent (Phase 2): a holder of a
-/// write end hands it to a target task, which then genuinely holds
-/// `ChannelWrite`. Proves capability delegation across agents (the Network→SSH
-/// handoff primitive) — attenuation-only, since the caller can only grant an end
-/// it holds.
+/// `channel_grant` *transfers* a channel end to another agent (Phase 2): a
+/// holder of a write end hands it to a target task, which then genuinely holds
+/// `ChannelWrite`, and the caller's slot is revoked (authority is moved, not
+/// duplicated). Attenuation-only: the caller can only grant an end it holds.
 #[test_case]
 fn channel_grant_hands_an_end_to_another_agent() {
     use channel::ChannelKind;
@@ -1035,13 +1034,34 @@ fn channel_grant_hands_an_end_to_another_agent() {
     );
     match synapse::execute(me, &call) {
         synapse::Invocation::Executed { result, .. } => {
-            assert!(result.starts_with("ok:granted"), "unexpected grant result: {result}");
+            assert!(
+                result.starts_with("ok:transferred") || result.starts_with("ok:granted"),
+                "unexpected grant result: {result}"
+            );
         }
         other => panic!("channel_grant did not execute: {other:?}"),
     }
     assert!(cap::holds(target, cap::Right::ChannelWrite(c)), "target must now hold the granted write end");
-    // Grant to a non-existent agent is refused cleanly.
-    let bad = alloc::format!(r#"{{"name":"channel_grant","arguments":{{"chan":{write_slot},"to_agent":"no-such-svc"}}}}"#);
+    // Transfer: caller no longer holds the end at that slot / overall.
+    assert!(
+        !cap::holds(me, cap::Right::ChannelWrite(c)),
+        "caller must not retain the transferred write end"
+    );
+    // A second grant from the (now empty) slot is denied.
+    let bad_slot = alloc::format!(
+        r#"{{"name":"channel_grant","arguments":{{"chan":{write_slot},"to_agent":"{target}"}}}}"#
+    );
+    match synapse::execute(me, &bad_slot) {
+        synapse::Invocation::Executed { result, .. } => {
+            assert!(result.starts_with("error:denied_channel_handle"), "empty slot: {result}");
+        }
+        other => panic!("expected denied handle after transfer, got {other:?}"),
+    }
+    // Grant to a non-existent agent is refused cleanly (need a fresh end).
+    let write_slot2 = cap::grant(me, cap::Right::ChannelWrite(c)).0;
+    let bad = alloc::format!(
+        r#"{{"name":"channel_grant","arguments":{{"chan":{write_slot2},"to_agent":"no-such-svc"}}}}"#
+    );
     match synapse::execute(me, &bad) {
         synapse::Invocation::Executed { result, .. } => assert!(result.starts_with("error:no_such_agent")),
         other => panic!("expected a clean no-such-agent result, got {other:?}"),
@@ -1124,6 +1144,48 @@ fn agent_home_sandbox_confines_fs_and_list() {
     // The orchestrator (root) is never sandboxed: with_home_sandbox is a no-op.
     let root = skills::install::with_home_sandbox(&base, AgentId(1), AgentKind::Orchestrator);
     assert!(root.is_empty(), "orchestrator keeps its own (full) caps, no home injection");
+
+    // Path normalisation: `..` cannot slip past the home prefix grant.
+    let escape = synapse::execute(
+        task,
+        r#"{"name":"mem_fs_write","arguments":{"path":"/agent/4242/../../etc/leaked","text":"x"}}"#,
+    );
+    assert!(
+        matches!(escape, synapse::Invocation::DeniedScope { .. }),
+        "dotdot path must be scope-denied after normalize: {escape:?}"
+    );
+    assert!(!synapse::fs::exists("/etc/leaked"));
+    assert!(!synapse::fs::exists("/agent/4242/../../etc/leaked"));
+
+    let _ = sched::kill(task);
+}
+
+/// Identity-file writes (SOUL.md / MEMORY.md) are taint-gated: untrusted
+/// context cannot rewrite the persona that re-enters as the system prompt.
+#[test_case]
+fn taint_gate_blocks_identity_file_write() {
+    use security::taint::{Justification, Provenance as TaintProv};
+
+    let task = sched::spawn_parked("taint-soul");
+    // Full FS so scope is not the reason for refusal.
+    let caps = alloc::vec![agent::types::CapabilityRequest::new(
+        agent::types::CapDomain::Fs,
+        agent::types::Rights::WRITE | agent::types::Rights::READ,
+        agent::types::Scope::Any,
+    )];
+    agent::manifest::grant_to_task(task, &caps);
+
+    let raw = r#"{"name":"mem_fs_write","arguments":{"path":"/agent/1/SOUL.md","text":"pwned"}}"#;
+    let j = Justification::from_context(TaintProv::UntrustedIngested);
+    let refused = synapse::execute_with_justification(task, raw, j);
+    assert!(
+        matches!(refused, synapse::Invocation::RefusedTainted { .. }),
+        "tainted SOUL write must refuse: {refused:?}"
+    );
+    // Trusted justification still allowed (human / system).
+    let ok = synapse::execute(task, raw);
+    assert!(matches!(ok, synapse::Invocation::Executed { .. }), "trusted SOUL write: {ok:?}");
+    assert_eq!(synapse::fs::read("/agent/1/SOUL.md").as_deref(), Some(&b"pwned"[..]));
 
     let _ = sched::kill(task);
 }

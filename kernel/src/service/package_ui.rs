@@ -72,7 +72,15 @@ fn ui_caps() -> alloc::vec::Vec<Right> {
 }
 
 fn syn_exec(task: TaskId, raw: &str) -> String {
-    match crate::synapse::execute(task, raw) {
+    // Package UI host path: effects are ownership-gated UI primitives only
+    // (surface draw/event/close), not FS/net. Justification is system-trusted
+    // because the call is native code below the determinism boundary, not model
+    // output — the model never invents these strings.
+    match crate::synapse::execute_with_justification(
+        task,
+        raw,
+        crate::security::Justification::trusted(),
+    ) {
         crate::synapse::Invocation::Executed { result, .. } => result,
         other => format!("{other:?}"),
     }

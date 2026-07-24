@@ -3506,38 +3506,87 @@ fn json_parse_simple(s: &str) -> Val {
 }
 
 /// Network for `fetch` — real loader outside unit tests; stub inside.
+///
+/// Hardening (prompt-injection / SSRF defence for untrusted page scripts):
+/// - only `http://` / `https://`
+/// - no loopback / link-local / RFC1918 private destinations
+/// - non-GET methods refused (no ambient POST exfil from page JS)
 pub(crate) fn host_fetch(method: &str, url: &str, body: &str) -> String {
+    let _ = body;
+    if let Err(e) = fetch_policy_ok(method, url) {
+        return format!("{{\"error\":\"{e}\"}}");
+    }
     #[cfg(test)]
     {
-        let _ = (method, body);
         return format!("{{\"ok\":true,\"url\":\"{url}\"}}");
     }
     #[cfg(not(test))]
     {
         use super::cache::CacheMode;
         use super::loader::{Destination, LoadRequest};
-        if method.eq_ignore_ascii_case("POST") {
-            match crate::net::http::request(
-                "POST",
-                url,
-                &[("Content-Type", "application/x-www-form-urlencoded")],
-                body.as_bytes(),
-                30_000,
-            ) {
-                Ok(r) => String::from_utf8_lossy(&r.body).into_owned(),
-                Err(e) => format!("{{\"error\":\"{e}\"}}"),
-            }
-        } else {
-            let mut req = LoadRequest::get(url)
-                .with_cache_mode(CacheMode::Default)
-                .with_timeout(30_000);
-            req.destination = Destination::Other;
-            match super::loader::load(&req) {
-                Ok(r) => String::from_utf8_lossy(&r.body).into_owned(),
-                Err(e) => format!("{{\"error\":\"{e}\"}}"),
-            }
+        // Non-GET already refused by `fetch_policy_ok`.
+        let mut req = LoadRequest::get(url)
+            .with_cache_mode(CacheMode::Default)
+            .with_timeout(30_000);
+        req.destination = Destination::Other;
+        match super::loader::load(&req) {
+            Ok(r) => String::from_utf8_lossy(&r.body).into_owned(),
+            Err(e) => format!("{{\"error\":\"{e}\"}}"),
         }
     }
+}
+
+/// Pure policy for page-script `fetch` (unit-tested).
+pub(crate) fn fetch_policy_ok(method: &str, url: &str) -> Result<(), &'static str> {
+    let m = method.trim();
+    if !(m.eq_ignore_ascii_case("GET") || m.eq_ignore_ascii_case("HEAD")) {
+        return Err("page fetch: only GET/HEAD allowed (no POST from untrusted scripts)");
+    }
+    if !super::url::is_http_url(url) {
+        return Err("page fetch: only http(s) URLs");
+    }
+    let host = super::url::split_http(url)
+        .map(|(_, h, _)| h)
+        .ok_or("page fetch: bad url")?;
+    // strip port for IP checks
+    let host_only = host.split(':').next().unwrap_or(&host);
+    if is_blocked_fetch_host(host_only) {
+        return Err("page fetch: blocked host (loopback/private/link-local)");
+    }
+    Ok(())
+}
+
+/// True for hosts page scripts must not reach (SSRF / local-service probe).
+fn is_blocked_fetch_host(host: &str) -> bool {
+    let h = host.trim().trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") || h == "0.0.0.0" {
+        return true;
+    }
+    // IPv4 dotted-quad private/link-local/loopback.
+    let mut parts = [0u8; 4];
+    let mut i = 0usize;
+    for seg in h.split('.') {
+        if i >= 4 {
+            return false; // not a simple IPv4
+        }
+        if let Ok(n) = seg.parse::<u8>() {
+            parts[i] = n;
+            i += 1;
+        } else {
+            return false; // hostname — allow (no DNS-rebinding defence here)
+        }
+    }
+    if i != 4 {
+        return false;
+    }
+    let [a, b, _, _] = parts;
+    // 127.0.0.0/8, 10/8, 172.16/12, 192.168/16, 169.254/16, 0/8
+    a == 127
+        || a == 10
+        || a == 0
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        || (a == 169 && b == 254)
 }
 
 fn css_prop_name(js: &str) -> String {
@@ -3747,6 +3796,19 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
     use crate::browser::html;
+
+    #[test_case]
+    fn fetch_policy_blocks_private_and_post() {
+        assert!(super::fetch_policy_ok("GET", "https://example.com/x").is_ok());
+        assert!(super::fetch_policy_ok("HEAD", "http://cdn.example.org/a").is_ok());
+        assert!(super::fetch_policy_ok("POST", "https://example.com/x").is_err());
+        assert!(super::fetch_policy_ok("GET", "http://127.0.0.1/secret").is_err());
+        assert!(super::fetch_policy_ok("GET", "http://localhost/x").is_err());
+        assert!(super::fetch_policy_ok("GET", "http://192.168.1.1/").is_err());
+        assert!(super::fetch_policy_ok("GET", "http://10.0.0.5/").is_err());
+        assert!(super::fetch_policy_ok("GET", "http://169.254.169.254/").is_err());
+        assert!(super::fetch_policy_ok("GET", "file:///etc/passwd").is_err());
+    }
 
     #[test_case]
     fn dom_free_script_runs_on_just_tier() {

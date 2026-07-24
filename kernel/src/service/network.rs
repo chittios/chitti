@@ -13,6 +13,9 @@ use crate::service::{pipeline, ServiceSpec};
 /// dropping the connection. Generous: the HTTP agent's response waits on the Doc
 /// agent planning the route with a live model turn (+ a one-time model load).
 const CONN_DEADLINE_MS: u64 = 65_000;
+/// Cap on inbound request bytes (headers + early body) before we drop the
+/// connection — prevents a hostile client from growing the kernel heap forever.
+const MAX_REQUEST_BYTES: usize = 256 * 1024;
 
 extern "C" fn network_serve(_arg: u64) {
     let port = pipeline::net_port();
@@ -45,6 +48,14 @@ extern "C" fn network_serve(_arg: u64) {
                         }
                     }
                     Ok(n) => {
+                        if req.len().saturating_add(n) > MAX_REQUEST_BYTES {
+                            crate::ktrace::log(
+                                "service.network",
+                                "request exceeded MAX_REQUEST_BYTES; closing",
+                            );
+                            req.clear();
+                            break;
+                        }
                         req.extend_from_slice(&buf[..n]);
                         if req.windows(4).any(|w| w == b"\r\n\r\n") {
                             break;

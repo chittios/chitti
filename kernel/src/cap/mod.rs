@@ -100,6 +100,15 @@ impl CapTable {
     fn grants(&self, right: Right) -> bool {
         self.slots.iter().any(|slot| *slot == Some(right))
     }
+
+    /// Clear a specific slot (used by transfer-style `channel_grant`).
+    fn revoke_slot(&mut self, cap: Cap) -> Option<Right> {
+        let i = cap.0 as usize;
+        if i >= self.slots.len() {
+            return None;
+        }
+        self.slots[i].take()
+    }
 }
 
 /// Count of denied capability checks, incremented (and `ktrace`d)
@@ -123,6 +132,14 @@ pub(crate) fn record_denial(task: TaskId, operation: &str) {
 /// `Cap` on its own.
 pub fn grant(task: TaskId, right: Right) -> Cap {
     sched::with_cap_table_mut(task, |table| table.insert(right))
+}
+
+/// Revoke a specific capability slot in `task`'s own table. Returns the
+/// right that was held, or `None` if the slot was empty / OOB. Used by
+/// transfer-style operations (`channel_grant`) so authority is moved, not
+/// duplicated.
+pub fn revoke(task: TaskId, cap: Cap) -> Option<Right> {
+    sched::with_cap_table_mut(task, |table| table.revoke_slot(cap))
 }
 
 /// Look up what `cap` grants in `task`'s own table. Used by `ipc` to gate

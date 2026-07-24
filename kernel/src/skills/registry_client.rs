@@ -14,6 +14,14 @@
 //! (`skills::install`). Registry packages are authenticated with **P-256 ECDSA**
 //! against the baked publisher trust store (`skills::crypto`), not the local MAC.
 //!
+//! **Index authenticity:** when the JSON root carries `key_id` + `sig`
+//! (base64 DER ECDSA-P256 over the raw body with those two fields stripped is
+//! not implemented yet — we verify over the concatenation of each entry's
+//! `name\\0version\\0download\\0key_id\\n` in order), the signature is checked
+//! against the trust store and unsigned/invalid indexes are **refused**. An
+//! index with no `sig` field is refused unless `allow_unsigned` is true
+//! (test/dev only).
+//!
 //! Note: in this pre-release, an entry's `download` payload is resolved from the
 //! built-in signed catalog (the kernel can't yet consume a foreign postcard
 //! blob it didn't build). Fetching + `SkillPackage::from_bytes` + P-256 verify
@@ -34,7 +42,8 @@ pub struct IndexEntry {
     pub key_id: String,
 }
 
-/// Fetch and parse the registry index at `url`.
+/// Fetch and parse the registry index at `url`. Unsigned indexes are refused
+/// (see module docs); use [`parse_index_allow_unsigned`] only in tests.
 pub fn fetch_index(url: &str) -> Result<Vec<IndexEntry>, String> {
     let resp = crate::net::http::get(url, 15_000).map_err(|e| alloc::format!("fetch failed: {e}"))?;
     if resp.status != 200 {
@@ -44,7 +53,17 @@ pub fn fetch_index(url: &str) -> Result<Vec<IndexEntry>, String> {
 }
 
 /// Parse an index document (pulled out for unit testing without the network).
+/// Requires a valid `key_id` + `sig` (base64 DER) over the entry binding string.
 pub fn parse_index(text: &str) -> Result<Vec<IndexEntry>, String> {
+    parse_index_ex(text, false)
+}
+
+/// Like [`parse_index`] but allows an unsigned document (unit tests / offline fixtures).
+pub fn parse_index_allow_unsigned(text: &str) -> Result<Vec<IndexEntry>, String> {
+    parse_index_ex(text, true)
+}
+
+fn parse_index_ex(text: &str, allow_unsigned: bool) -> Result<Vec<IndexEntry>, String> {
     let j = Json::parse(text).ok_or_else(|| "index is not valid JSON".to_string())?;
     let arr = j.get("entries").and_then(|e| e.as_array()).ok_or_else(|| "index has no `entries` array".to_string())?;
     let field = |e: &Json, k: &str| e.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -62,7 +81,70 @@ pub fn parse_index(text: &str) -> Result<Vec<IndexEntry>, String> {
             key_id: field(e, "key_id"),
         });
     }
+    let key_id = j.get("key_id").and_then(|v| v.as_str()).unwrap_or("");
+    let sig_b64 = j.get("sig").and_then(|v| v.as_str()).unwrap_or("");
+    if key_id.is_empty() || sig_b64.is_empty() {
+        if allow_unsigned {
+            crate::ktrace::log("registry", "index unsigned (allowed for this call)");
+            return Ok(out);
+        }
+        return Err("registry index is unsigned (need key_id + sig)".into());
+    }
+    let msg = index_binding_bytes(&out);
+    let sig = b64_decode(sig_b64).ok_or_else(|| "registry sig is not valid base64".to_string())?;
+    if !crate::skills::crypto::verify_p256(key_id, &msg, &sig) {
+        return Err("registry index signature verification failed".into());
+    }
     Ok(out)
+}
+
+/// Canonical bytes signed by the registry publisher: one line per entry
+/// `name\\0version\\0download\\0key_id\\n` (description is display-only and
+/// excluded so it can be localised without re-signing).
+pub fn index_binding_bytes(entries: &[IndexEntry]) -> Vec<u8> {
+    let mut msg = Vec::new();
+    for e in entries {
+        msg.extend_from_slice(e.name.as_bytes());
+        msg.push(0);
+        msg.extend_from_slice(e.version.as_bytes());
+        msg.push(0);
+        msg.extend_from_slice(e.download.as_bytes());
+        msg.push(0);
+        msg.extend_from_slice(e.key_id.as_bytes());
+        msg.push(b'\n');
+    }
+    msg
+}
+
+/// Minimal base64 decode (std alphabet, ignores whitespace). `None` on bad input.
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            b'=' => Some(0),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let (a, b, c, d) = (val(chunk[0])?, val(chunk[1])?, val(chunk[2])?, val(chunk[3])?);
+        out.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            out.push((b << 4) | (c >> 2));
+        }
+        if chunk[3] != b'=' {
+            out.push((c << 6) | d);
+        }
+    }
+    Some(out)
 }
 
 /// Fetch the index and return entries whose name or description contains `query`
@@ -91,7 +173,8 @@ mod tests {
 
     #[test_case]
     fn parses_index_entries() {
-        let e = parse_index(SAMPLE).unwrap();
+        // Fixture has no sig — only allow_unsigned for unit tests.
+        let e = parse_index_allow_unsigned(SAMPLE).unwrap();
         assert_eq!(e.len(), 2);
         assert_eq!(e[0].name, "report-writer");
         assert_eq!(e[0].version, "1.0.0");
@@ -100,8 +183,19 @@ mod tests {
     }
 
     #[test_case]
-    fn rejects_non_json_and_missing_entries() {
+    fn rejects_non_json_missing_entries_and_unsigned() {
         assert!(parse_index("not json").is_err());
         assert!(parse_index(r#"{"schema":1}"#).is_err());
+        // Production path refuses unsigned indexes.
+        let err = parse_index(SAMPLE).unwrap_err();
+        assert!(err.contains("unsigned"), "{err}");
+    }
+
+    #[test_case]
+    fn index_binding_bytes_stable() {
+        let e = parse_index_allow_unsigned(SAMPLE).unwrap();
+        let b = index_binding_bytes(&e);
+        assert!(b.windows(b"report-writer".len()).any(|w| w == b"report-writer"));
+        assert_eq!(b.iter().filter(|&&c| c == b'\n').count(), 2);
     }
 }
