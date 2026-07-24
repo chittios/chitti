@@ -8,6 +8,31 @@
 //!
 //! Read-only, no allocation, no interpreter — table headers + one field each.
 
+/// Make an ACPI table at physical address `phys` readable, returning the address
+/// to read it at.
+///
+/// **x86 must map these pages explicitly.** Limine's HHDM covers *usable RAM*,
+/// and ACPI tables live in firmware-reserved regions outside it — so both the raw
+/// physical address and its HHDM translation are unmapped, and reading either is a
+/// page fault that halts the boot rather than a garbage read a signature check
+/// could reject. (Both faults happened: `0xf52e0`, then `0xffff8000000f52e0`.)
+///
+/// aarch64 keeps its previous behaviour exactly: it runs on a flat identity map
+/// where the tables are already reachable, and `init_uart` reads SPCR before the
+/// frame allocator exists, so calling into `mm` there would be worse than useless.
+#[inline]
+fn map_table(phys: u64, len: usize) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::mm::map_mmio(phys, len.max(0x1000))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = len;
+        phys
+    }
+}
+
 fn le16(p: *const u8, o: usize) -> u16 {
     unsafe { u16::from_le_bytes([*p.add(o), *p.add(o + 1)]) }
 }
@@ -53,7 +78,10 @@ fn find_table(rsdp: u64, sig: &[u8; 4]) -> Option<*const u8> {
     if table_ptr == 0 {
         return None;
     }
-    let t = table_ptr as *const u8;
+    // Map a page to read the header's length, then remap covering the whole table
+    // (an XSDT with many entries can exceed one page).
+    let t = map_table(table_ptr, 0x1000) as *const u8;
+    let t = map_table(table_ptr, le32(t, 4) as usize) as *const u8;
     // System description table header: length @4 (u32). Entries follow the
     // 36-byte header, each a pointer to another table.
     let len = le32(t, 4) as usize;
@@ -61,13 +89,18 @@ fn find_table(rsdp: u64, sig: &[u8; 4]) -> Option<*const u8> {
     for i in 0..n {
         let off = 36 + i * entry_size;
         let tbl = if entry_size == 8 { le64(t, off) } else { le32(t, off) as u64 };
-        let p = tbl as *const u8;
+        if tbl == 0 {
+            continue;
+        }
+        // Each entry points at another table in reserved memory: map before reading.
+        let p = map_table(tbl, 0x1000) as *const u8;
         let mut s = [0u8; 4];
         for (k, b) in s.iter_mut().enumerate() {
             *b = unsafe { *p.add(k) };
         }
         if &s == sig {
-            return Some(p);
+            let len = le32(p, 4) as usize;
+            return Some(map_table(tbl, len) as *const u8);
         }
     }
     None
@@ -83,6 +116,25 @@ pub fn ecam_from_rsdp(rsdp: u64) -> Option<EcamSegment> {
     let bus_end = unsafe { *p.add(44 + 11) };
     let _ = le16(p, 44 + 8);
     Some(EcamSegment { base, bus_start, bus_end })
+}
+
+/// Walk `rsdp` -> XSDT -> **HPET** and return the event-timer block's base
+/// address, if the platform has one.
+///
+/// The HPET is the reference clock used to calibrate the local-APIC timer on a
+/// machine whose legacy PIT is absent or non-functional — increasingly common on
+/// UEFI-only hardware, where the 8254 may simply not be wired up.
+pub fn hpet_from_rsdp(rsdp: u64) -> Option<u64> {
+    let p = find_table(rsdp, b"HPET")?;
+    // HPET table: 36-byte header, event-timer-block id @36 (u32), then a 12-byte
+    // Generic Address Structure @40 whose address field is at +4.
+    let space = unsafe { *p.add(40) };
+    let base = le64(p, 44);
+    // Only a memory-mapped (space 0) block is usable.
+    if space != 0 || base == 0 {
+        return None;
+    }
+    Some(base)
 }
 
 /// Everything needed to drive an ACPI **S5 (soft-off)** transition.

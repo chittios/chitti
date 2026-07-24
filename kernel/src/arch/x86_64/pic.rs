@@ -77,3 +77,19 @@ pub fn send_eoi(irq_line: u8) {
         outb(MASTER_COMMAND, EOI);
     }
 }
+
+/// Mask a master-PIC IRQ line (0..7) so it stops delivering.
+///
+/// Used when the local-APIC timer takes over the scheduler tick: leaving IRQ0
+/// unmasked as well would work, but both handlers bump `TICKS`, so the effective
+/// tick rate would double.
+pub fn mask_irq(irq: u8) {
+    if irq > 7 {
+        return; // slave-PIC lines are all masked at init and stay that way
+    }
+    // SAFETY: reading and writing the master PIC's interrupt-mask register.
+    unsafe {
+        let mask = inb(MASTER_DATA);
+        outb(MASTER_DATA, mask | (1 << irq));
+    }
+}

@@ -14,6 +14,7 @@ pub mod interrupts;
 pub mod i8042;
 pub mod keyboard;
 pub mod nvme;
+pub mod hpet;
 pub mod paging;
 pub mod pci;
 pub mod pic;
@@ -135,33 +136,48 @@ pub fn poweroff() -> ! {
 /// reachable / the DSDT has no decodable `\_S5_`.
 fn acpi_sleep_info() -> Option<crate::acpi::SleepInfo> {
     let rsdp = rsdp_address()?;
-    crate::acpi::s5_from_rsdp(rsdp, |phys| paging::phys_to_virt(phys))
+    crate::acpi::s5_from_rsdp(rsdp, |phys| crate::mm::map_mmio(phys, 0x4_0000))
+}
+
+/// Start of the higher half — any address at or above this is already virtual.
+const HIGHER_HALF: u64 = 0xffff_8000_0000_0000;
+
+/// Make an address the CPU can actually read.
+///
+/// Limine's RSDP address is **physical** on newer protocol revisions and
+/// HHDM-virtual on older ones, and the two cannot be distinguished by trying
+/// both: dereferencing a raw physical address in the higher-half kernel is a page
+/// fault, not a garbage read. (It faulted at `0xf52e0` and halted the boot.) They
+/// *can* be distinguished by range — a virtual HHDM address is in the higher half,
+/// a physical one never is.
+fn readable(addr: u64) -> u64 {
+    if addr >= HIGHER_HALF {
+        addr
+    } else {
+        // Not `phys_to_virt`: Limine's HHDM covers usable RAM, and the RSDP lives
+        // in firmware-reserved memory outside it, so the HHDM address is unmapped
+        // too. Map the page explicitly.
+        crate::mm::map_mmio(addr, 0x1000)
+    }
 }
 
 /// Locate the ACPI RSDP on x86.
 ///
-/// Two sources, both validated by signature rather than trusted: the Limine RSDP
-/// response (whose address is physical on newer revisions and HHDM-virtual on
-/// older ones — so both interpretations are offered), and, failing that, the
-/// legacy BIOS scan of the `0xE0000..0x100000` window, which is where a
-/// non-UEFI boot leaves it.
-fn rsdp_address() -> Option<u64> {
-    let mut cands = [0u64; 3];
-    let mut n = 0;
+/// The bootloader's pointer first (mapped via [`readable`], then signature-checked
+/// so a wrong guess is rejected rather than believed), else a scan of the legacy
+/// `0xE0000..0x100000` BIOS window where a non-UEFI boot leaves it.
+pub fn rsdp_address() -> Option<u64> {
     if let Some(r) = crate::RSDP_REQUEST.response() {
-        let a = r.address();
-        cands[n] = a;
-        n += 1;
-        cands[n] = paging::phys_to_virt(a);
-        n += 1;
+        let v = readable(r.address());
+        if crate::acpi::find_rsdp(&[v]).is_some() {
+            return Some(v);
+        }
     }
-    if let Some(a) = crate::acpi::find_rsdp(&cands[..n]) {
-        return Some(a);
-    }
-    // Legacy scan: the RSDP is 16-byte aligned in the BIOS ROM area.
+    // Legacy scan: the RSDP is 16-byte aligned in the BIOS ROM area. Read through
+    // the HHDM — the window is reserved physical memory, not kernel-mapped.
     let mut p = 0xE_0000u64;
     while p < 0x10_0000 {
-        let v = paging::phys_to_virt(p);
+        let v = crate::mm::map_mmio(p, 0x1000);
         if crate::acpi::find_rsdp(&[v]).is_some() {
             return Some(v);
         }

@@ -205,6 +205,20 @@ pub fn init() {
     mm::init(memmap, hhdm_offset);
     sched::init();
 
+    // Move the scheduler tick to the local-APIC timer where we can. The PIT/PIC
+    // arrangement programmed above is legacy-PC hardware a UEFI-only machine may
+    // omit entirely — there IRQ0 never arrives and the kernel runs with no
+    // preemption and no error message. Needs `mm::init` (the APIC and HPET MMIO
+    // pages are mapped) so it happens here, not in the PIC/PIT block above.
+    // Falls back silently to the PIT, which is what QEMU and older PCs use.
+    arch::x86_64::apic::init_mapping();
+    arch::x86_64::apic::software_enable();
+    if let Some(rsdp) = arch::x86_64::rsdp_address() {
+        arch::x86_64::pit::try_apic_timer(rsdp);
+    } else {
+        ktrace::log("init", "no ACPI RSDP -- scheduler tick stays on the PIT/PIC");
+    }
+
     arch::x86_64::interrupts::enable();
     ktrace::log("init", "Phase 1 bring-up complete, interrupts enabled");
 
