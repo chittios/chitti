@@ -34,6 +34,25 @@ fn set_bit(bitmap: &mut [u8], i: u64, used: bool) {
     }
 }
 
+/// Whether the physical run `[start, start + len)` satisfies an ISA-DMA-style
+/// placement constraint: entirely below `limit`, and not straddling a
+/// `boundary`-aligned block (`boundary == 0` disables that check).
+///
+/// Pure so the awkward part — the straddle test — is unit-testable. The subtlety
+/// is that it must compare the block of the **last byte** (`start + len - 1`),
+/// not of `start + len`: a run ending exactly on a boundary is legal, and
+/// testing the end address would reject it.
+pub(crate) fn run_fits(start: u64, len: u64, limit: u64, boundary: u64) -> bool {
+    match start.checked_add(len) {
+        Some(end) if end <= limit => {}
+        _ => return false,
+    }
+    if boundary == 0 || len == 0 {
+        return true;
+    }
+    start / boundary == (start + len - 1) / boundary
+}
+
 fn mark_range(bitmap: &mut [u8], base: u64, length: u64, used: bool) {
     let start_frame = base / FRAME_SIZE;
     let end_frame = (base + length) / FRAME_SIZE;
@@ -140,6 +159,49 @@ impl BitmapFrameAllocator {
         None
     }
 
+    /// Allocate `count` contiguous frames whose physical range lies entirely
+    /// below `limit` **and** does not straddle a `boundary`-aligned block.
+    ///
+    /// This exists for **ISA DMA**, whose constraints ordinary allocation cannot
+    /// express: the 8237 controller latches a 24-bit address (so buffers must live
+    /// under 16 MiB) and a fixed page register (so a transfer may not cross a
+    /// 64 KiB block on an 8-bit channel, or 128 KiB on a 16-bit one). Without
+    /// this, the SB16 driver could only allocate normally, find its buffer above
+    /// the limit, and decline — which is exactly what it always did.
+    ///
+    /// `boundary` of 0 means "no boundary constraint".
+    pub fn allocate_contiguous_bounded(&mut self, count: u64, limit: u64, boundary: u64) -> Option<u64> {
+        if count == 0 {
+            return None;
+        }
+        let len = count * FRAME_SIZE;
+        let max_frame = (limit / FRAME_SIZE).min(self.frame_count);
+        let mut start = 0u64;
+        while start + count <= max_frame {
+            if !run_fits(start * FRAME_SIZE, len, limit, boundary) {
+                // Jump to the start of the next boundary block rather than
+                // crawling a frame at a time through a region that cannot work.
+                if boundary != 0 {
+                    let next = (start * FRAME_SIZE / boundary + 1) * boundary;
+                    start = next / FRAME_SIZE;
+                    continue;
+                }
+                break; // only the limit can fail with no boundary, so we're done
+            }
+            if (start..start + count).all(|f| !get_bit(self.bitmap, f)) {
+                for f in start..start + count {
+                    set_bit(self.bitmap, f, true);
+                }
+                return Some(start * FRAME_SIZE);
+            }
+            match (start..start + count).find(|&f| get_bit(self.bitmap, f)) {
+                Some(blocker) => start = blocker + 1,
+                None => start += 1,
+            }
+        }
+        None
+    }
+
     /// Return a previously allocated frame to the pool.
     pub fn free(&mut self, phys: u64) {
         let frame = phys / FRAME_SIZE;
@@ -161,5 +223,55 @@ impl BitmapFrameAllocator {
 impl crate::arch::x86_64::paging::FrameAllocator for BitmapFrameAllocator {
     fn allocate_frame(&mut self) -> Option<u64> {
         self.allocate()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const K64: u64 = 64 * 1024;
+    const K128: u64 = 128 * 1024;
+    const M16: u64 = 16 * 1024 * 1024;
+
+    #[test_case]
+    fn run_fits_rejects_runs_above_the_limit() {
+        // ISA DMA latches a 24-bit address: the whole run must be under 16 MiB.
+        assert!(run_fits(M16 - 0x1000, 0x1000, M16, 0));
+        assert!(!run_fits(M16 - 0x1000, 0x2000, M16, 0)); // ends past the limit
+        assert!(!run_fits(M16, 0x1000, M16, 0)); // starts at the limit
+    }
+
+    #[test_case]
+    fn run_fits_allows_a_run_ending_exactly_on_a_boundary() {
+        // The off-by-one that matters: a run whose last byte is the final byte of
+        // a 64 KiB block is legal. Comparing the END address instead of the last
+        // byte would wrongly reject it and waste the whole block.
+        assert!(run_fits(0, K64, M16, K64));
+        assert!(run_fits(K64 - 0x1000, 0x1000, M16, K64));
+    }
+
+    #[test_case]
+    fn run_fits_rejects_boundary_straddles() {
+        // One byte over the block edge is a straddle.
+        assert!(!run_fits(K64 - 0x1000, 0x2000, M16, K64));
+        // A 16-bit channel's 128 KiB block: legal under 128 KiB, illegal across.
+        assert!(run_fits(0, K128, M16, K128));
+        assert!(!run_fits(K128 - 0x1000, 0x2000, M16, K128));
+        // Same run, different boundary: fits a 128 KiB block, not a 64 KiB one.
+        assert!(run_fits(K64, K64, M16, K128));
+        assert!(!run_fits(K64 - 0x1000, 0x2000, M16, K64));
+    }
+
+    #[test_case]
+    fn run_fits_boundary_zero_disables_the_straddle_check() {
+        assert!(run_fits(K64 - 0x1000, 0x8000, M16, 0));
+    }
+
+    #[test_case]
+    fn run_fits_handles_overflow_without_panicking() {
+        // A caller asking for an absurd length must get `false`, not a wrapped
+        // address that looks like it fits.
+        assert!(!run_fits(u64::MAX - 0x100, 0x1000, M16, K64));
     }
 }

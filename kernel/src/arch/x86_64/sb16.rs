@@ -79,27 +79,26 @@ impl Sb16 {
         if !dsp_reset() {
             return None;
         }
-        // Allocate a DMA buffer and verify it fits within one 16-bit DMA page
-        // (a 128 KiB-aligned region must contain [phys, phys+2*BUF_SAMPLES)).
-        let buf = crate::mm::alloc_dma(BUF_SAMPLES * 2)?;
-        let cbuf = crate::mm::alloc_dma(BUF_SAMPLES * 2)?;
-        // ISA DMA is 24-bit: buffers MUST live below 16 MiB, and within one
-        // 128 KiB 16-bit page. Our frame allocator hands out high memory (the
-        // kernel + model consume low RAM), so if the buffer is unreachable we
-        // decline rather than play silence — HDA/AC'97 already cover VBox and
-        // real hardware. (Reserving a low ISA-DMA pool at boot is the fix to
-        // make SB16 fully live; noted in CLAUDE.md.)
+        // DMA buffers that satisfy the 8237's placement rules: under 16 MiB
+        // (24-bit address latch) and inside one 128 KiB block (the page register
+        // does not increment across it on a 16-bit channel).
+        //
+        // This used to be an ordinary `alloc_dma` followed by a check — and the
+        // check always failed, because the allocator hands out high memory once
+        // the kernel and model have taken the low frames. SB16 was therefore
+        // unreachable code on every machine. `alloc_dma_bounded` asks for what
+        // the hardware actually needs instead of hoping.
         const ISA_LIMIT: u64 = 16 * 1024 * 1024;
-        for b in [buf.0, cbuf.0] {
-            let end = b + (BUF_SAMPLES * 2) as u64 - 1;
-            if end >= ISA_LIMIT {
-                crate::ktrace::log_fmt(format_args!("sb16: DMA buffer at {b:#x} is above the 16 MiB ISA limit; declining (use HDA/AC'97)"));
-                return None;
-            }
-            if (b >> 17) != (end >> 17) {
-                return None; // straddles a 128 KiB 16-bit DMA page
-            }
-        }
+        const ISA_16BIT_BLOCK: u64 = 128 * 1024;
+        let bytes = BUF_SAMPLES * 2;
+        let Some(buf) = crate::mm::alloc_dma_bounded(bytes, ISA_LIMIT, ISA_16BIT_BLOCK) else {
+            crate::ktrace::log("sb16", "no free DMA-reachable memory below 16 MiB; declining (use HDA/AC'97)");
+            return None;
+        };
+        let Some(cbuf) = crate::mm::alloc_dma_bounded(bytes, ISA_LIMIT, ISA_16BIT_BLOCK) else {
+            crate::ktrace::log("sb16", "no second DMA-reachable buffer below 16 MiB; declining (use HDA/AC'97)");
+            return None;
+        };
         // Turn the speaker on.
         dsp_write(0xd1);
         crate::ktrace::log_fmt(format_args!("sb16: up at {:#x}, DMA16 buffer phys {:#x}", BASE, buf.0));
