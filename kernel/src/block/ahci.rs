@@ -1,12 +1,25 @@
 //! **AHCI (SATA) block driver core** — arch-neutral, the storage controller
-//! VirtualBox defaults to and most SATA hardware exposes. Polled, single-port,
-//! one command slot; 48-bit LBA READ/WRITE DMA EXT; presented behind the shared
+//! VirtualBox defaults to and most SATA hardware exposes. Polled, one command
+//! slot per port; 48-bit LBA READ/WRITE DMA EXT; presented behind the shared
 //! [`BlockDevice`] API.
 //!
+//! **Every populated port is a disk.** A real SATA HBA has up to 32 ports and
+//! they are not densely packed — a drive on port 3 with ports 0-2 empty is
+//! completely normal, and desktops routinely have two or three drives on one
+//! controller. So enumeration is two-level: [`Ahci::present_count`] reports how
+//! many ports are implemented *and* populated (pure register reads, no
+//! allocation), and [`Ahci::bringup_nth`] brings up one of them. Callers map a
+//! global disk index onto (controller, port) using the count, so skipping past a
+//! disk costs nothing — bringing a port up allocates DMA, and a
+//! bring-up-then-discard loop would leak it on every enumeration.
+//!
 //! This module is the *logic*; device discovery is per-arch (each arch finds
-//! the AHCI function on its PCI bus, maps ABAR/BAR5, and hands the mapped MMIO
-//! base + a [`DmaAlloc`] to [`Ahci::bringup`]). x86 (`arch::x86_64::ahci`) and
+//! the AHCI functions on its PCI bus, maps ABAR/BAR5, and hands the mapped MMIO
+//! base + a [`DmaAlloc`] to the bring-up). x86 (`arch::x86_64::ahci`) and
 //! aarch64 (`arch::aarch64::ahci`) are thin wrappers over this one core.
+//!
+//! Still one command slot (slot 0) per port and strictly polled: I/O on a port is
+//! serialized. That bounds throughput, not correctness.
 
 use crate::block::{BlockDevice, BlockError, Dma, DmaAlloc, BLOCK_SIZE};
 use core::ptr::{read_volatile, write_volatile};
@@ -69,20 +82,67 @@ impl Ahci {
     /// `abar` must be a valid, mapped AHCI ABAR (at least [`MMIO_SPAN`] bytes),
     /// and `alloc` must return real physically-contiguous DMA memory.
     pub unsafe fn bringup(abar: u64, alloc: DmaAlloc) -> Option<Ahci> {
+        // SAFETY: forwarded to `bringup_nth` under the caller's contract.
+        unsafe { Self::bringup_nth(abar, alloc, 0) }
+    }
+
+    /// How many ports on this HBA are both implemented (`PI`) and have a device
+    /// attached (`SSTS.DET == 3`) — i.e. how many disks this controller offers.
+    ///
+    /// Pure register reads, no allocation and no state change beyond the
+    /// idempotent `GHC.AE` enable, so a caller can cheaply work out which
+    /// controller/port a global disk index lands on before committing to a
+    /// bring-up.
+    ///
+    /// # Safety
+    /// `abar` must be a valid, mapped AHCI ABAR (at least [`MMIO_SPAN`] bytes).
+    pub unsafe fn present_count(abar: u64) -> usize {
         unsafe {
             w32(abar + HBA_GHC, r32(abar + HBA_GHC) | GHC_AE);
             let pi = r32(abar + HBA_PI);
-            // Find the first implemented port with a device present (SSTS DET=3).
+            (0..32u32)
+                .filter(|p| pi & (1 << p) != 0)
+                .filter(|p| r32(abar + 0x100 + *p as u64 * 0x80 + P_SSTS) & 0xf == 3)
+                .count()
+        }
+    }
+
+    /// Bring up the **`nth`** port on this HBA that is both implemented (`PI`) and
+    /// has a device attached (`SSTS.DET == 3`), counting only such ports.
+    /// `None` once `nth` runs past the last one, which is what lets a caller
+    /// enumerate every disk on the controller by counting up from 0.
+    ///
+    /// A desktop SATA HBA routinely has several ports populated, and they are
+    /// **not** contiguous — a drive on port 3 with ports 0-2 empty is normal.
+    /// Only bringing up the first present port made every disk but one invisible.
+    ///
+    /// Ports are independent register blocks, so bringing up port 3 does not
+    /// disturb an already-running port 0: `GHC.AE` is idempotent and everything
+    /// else written here is inside the selected port's own 0x80-byte window.
+    ///
+    /// # Safety
+    /// As [`Ahci::bringup`].
+    pub unsafe fn bringup_nth(abar: u64, alloc: DmaAlloc, nth: usize) -> Option<Ahci> {
+        unsafe {
+            w32(abar + HBA_GHC, r32(abar + HBA_GHC) | GHC_AE);
+            let pi = r32(abar + HBA_PI);
+            // Walk implemented ports, counting the ones with a device present
+            // (SSTS DET=3) until we reach `nth`.
             let mut port = 0u64;
+            let mut seen = 0usize;
             for p in 0..32u32 {
                 if pi & (1 << p) == 0 {
                     continue;
                 }
                 let base = abar + 0x100 + p as u64 * 0x80;
-                if r32(base + P_SSTS) & 0xf == 3 {
+                if r32(base + P_SSTS) & 0xf != 3 {
+                    continue;
+                }
+                if seen == nth {
                     port = base;
                     break;
                 }
+                seen += 1;
             }
             if port == 0 {
                 return None;
