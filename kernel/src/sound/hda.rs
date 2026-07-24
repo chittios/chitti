@@ -8,10 +8,17 @@
 //! - controller reset (GCTL.CRST), then **CORB/RIRB** ring buffers for codec
 //!   verbs — the robust command path on real hardware (immediate-command
 //!   registers are optional in the spec).
-//! - a minimal codec-graph walk: find the Audio Function Group, the first DAC
-//!   (audio-output widget) + output pin, and the first ADC + mic/input pin;
-//!   wire connection selects, unmute amps (0 dB offset), enable the pins
-//!   (+EAPD), power everything to D0.
+//! - a codec-graph walk: find the Audio Function Group, **rank** the output pin
+//!   complexes by `CONFIG_DEFAULT` ([`rank_output_pin`] — speaker, then
+//!   headphone, then line-out, refusing pins the board wired nowhere and any
+//!   SPDIF/HDMI pin belonging to the graphics device), then **search the graph**
+//!   from that pin back to a DAC ([`Hda::find_output_path`]). The search matters:
+//!   a pin's connection list usually does not contain the DAC directly — the
+//!   common shape is `pin <- mixer <- dac` — so pointing the pin straight at "the
+//!   first DAC we saw" leaves the path unconnected and the codec mute. Every
+//!   widget along the discovered path gets its input select pointed at the next
+//!   hop, its amp unmuted (0 dB offset) and power set to D0; the pin also gets
+//!   output-enable + EAPD. The input side takes the first wired line-in/mic pin.
 //! - one output stream (first output SD, stream tag 1) and one input stream
 //!   (SD 0, tag 2). 16-bit mono; native 16 kHz when the converter's PCM caps
 //!   allow it, otherwise the stream runs at 48 kHz and this driver repeats
@@ -84,9 +91,62 @@ const P_WIDGET_CAP: u32 = 0x09;
 const P_PCM_CAPS: u32 = 0x0a;
 const P_CONN_LEN: u32 = 0x0e;
 const P_OUT_AMP: u32 = 0x12;
+/// Pin capabilities (GET_PARAM 0x0c).
+const P_PIN_CAPS: u32 = 0x0c;
+/// PIN_CAP bit 4: this pin complex can drive an output.
+const PIN_CAP_OUTPUT: u32 = 1 << 4;
+/// GET_CONFIG_DEFAULT verb — the pin's platform wiring description.
+const V_GET_CONFIG_DEFAULT: u32 = 0xf1c;
+
+/// Widget types (WIDGET_CAP bits 23:20).
+const WIDGET_AUDIO_OUT: u32 = 0x0;
+const WIDGET_MIXER: u32 = 0x2;
+const WIDGET_SELECTOR: u32 = 0x3;
+const WIDGET_PIN: u32 = 0x4;
+
+/// How far to search the widget graph from a pin back to a DAC. Real codecs need
+/// 2-3 hops (`pin <- mixer <- dac`); the bound stops a malformed or cyclic
+/// connection list from recursing without end.
+const MAX_PATH_DEPTH: usize = 6;
 
 const PIN_OUT_EN: u32 = 0x40;
 const PIN_IN_EN: u32 = 0x20;
+
+/// Rank an output pin from its `CONFIG_DEFAULT`, lower being more desirable, or
+/// `None` if it is not an output pin we should use.
+///
+/// Two things beyond the device type matter, and both are why picking the
+/// lowest-numbered output pin misbehaves on real machines:
+///
+/// * **Connectivity** (bits 31:30). `1` means "no physical connection" — the
+///   codec exposes the pin but the board wired it nowhere. Selecting one of those
+///   gives a path that configures cleanly and produces silence, so it is refused
+///   outright.
+/// * **Device type** (bits 23:20). A laptop's speaker is the right default; a
+///   headphone jack is next; a line-out is last, since many laptops report one
+///   they do not physically have. HDMI/SPDIF outputs belong to the graphics
+///   device and must never be chosen as the system output.
+pub(crate) fn rank_output_pin(cfg: u32) -> Option<u8> {
+    let connectivity = (cfg >> 30) & 0x3;
+    if connectivity == 1 {
+        return None; // no physical connection
+    }
+    match (cfg >> 20) & 0xf {
+        0x1 => Some(0), // speaker
+        0x2 => Some(1), // headphone out
+        0x0 => Some(2), // line out
+        _ => None,      // 3..7 = SPDIF/HDMI/other digital, 8.. = inputs
+    }
+}
+
+/// Whether a pin's `CONFIG_DEFAULT` describes an input we can capture from
+/// (line-in or mic), and that is actually wired up.
+pub(crate) fn is_input_pin(cfg: u32) -> bool {
+    if (cfg >> 30) & 0x3 == 1 {
+        return false; // no physical connection
+    }
+    matches!((cfg >> 20) & 0xf, 0x8 | 0xa)
+}
 
 /// PCM chunk for the capture ring: 100 ms of S16 mono at 48 kHz (worst case).
 const CAP_CHUNK: usize = 9600;
@@ -399,30 +459,52 @@ impl Hda {
 
         let sub = self.param(afg, P_SUB_NODES);
         let (w_start, w_count) = ((sub >> 16) & 0xff, sub & 0xff);
-        let (mut dac, mut adc, mut out_pin, mut in_pin) = (0u32, 0u32, 0u32, 0u32);
+        let (mut adc, mut in_pin) = (0u32, 0u32);
+        // Output pin: rank the candidates instead of taking the lowest node id.
+        // A real codec exposes several output pins and the first one in node
+        // order is regularly the wrong one — a rear line-out on a laptop that has
+        // none, or an HDMI pin belonging to the graphics device.
+        let mut best_out: Option<(u8, u32)> = None; // (rank, nid)
         for nid in w_start..w_start + w_count {
             let cap = self.param(nid, P_WIDGET_CAP);
             match (cap >> 20) & 0xf {
-                0x0 if dac == 0 => dac = nid,  // audio output (DAC)
-                0x1 if adc == 0 => adc = nid,  // audio input (ADC)
+                0x1 if adc == 0 => adc = nid, // audio input (ADC)
                 0x4 => {
-                    // Pin complex: default config device field picks out vs in.
-                    let cfg = self.verb(nid, 0xf1c, 0);
-                    let dev = (cfg >> 20) & 0xf;
-                    match dev {
-                        // 0 line-out, 1 speaker, 2 HP out
-                        0x0 | 0x1 | 0x2 if out_pin == 0 => out_pin = nid,
-                        // 8 line-in, A mic (0xA)
-                        0x8 | 0xa if in_pin == 0 => in_pin = nid,
-                        _ => {}
+                    let cfg = self.verb(nid, V_GET_CONFIG_DEFAULT, 0);
+                    if let Some(rank) = rank_output_pin(cfg) {
+                        // Only consider pins the codec says can actually drive
+                        // output (PIN_CAP bit 4).
+                        if self.param(nid, P_PIN_CAPS) & PIN_CAP_OUTPUT != 0
+                            && best_out.is_none_or(|(r, _)| rank < r)
+                        {
+                            best_out = Some((rank, nid));
+                        }
+                    } else if is_input_pin(cfg) && in_pin == 0 {
+                        in_pin = nid;
                     }
                 }
                 _ => {}
             }
         }
-        if dac == 0 || out_pin == 0 {
+        let Some((_, out_pin)) = best_out else {
+            crate::ktrace::log("hda", "no usable output pin complex on this codec");
+            return false;
+        };
+        // Walk the widget graph from the pin back to a DAC. The DAC is very often
+        // NOT directly in the pin's connection list — Realtek and friends put a
+        // mixer or selector in between — so pointing the pin straight at "the
+        // first DAC we saw" silently leaves the path unconnected and the codec
+        // mute. `path` comes back as [pin, .., dac].
+        let mut path = alloc::vec::Vec::new();
+        if !self.find_output_path(out_pin, 0, &mut path) {
+            crate::ktrace::log_fmt(format_args!(
+                "hda: no DAC reachable from output pin {out_pin} (searched {} levels)",
+                MAX_PATH_DEPTH
+            ));
             return false;
         }
+        let dac = *path.last().unwrap();
+        crate::ktrace::log_fmt(format_args!("hda: output path {path:?} (pin -> dac)"));
         self.dac = dac;
         self.adc = adc;
 
@@ -433,15 +515,18 @@ impl Hda {
         };
         self.native_16k = pcm & (1 << 2) != 0;
 
-        // Power up + wire the output path: pin's connection list → our DAC.
-        for &n in &[dac, out_pin] {
+        // Power up and wire every widget along the discovered path, not just the
+        // two ends: each selector/mixer in between needs its input select pointed
+        // at the next hop and its amp unmuted, or the signal stops there.
+        for &n in &path {
             self.verb(n, V_SET_POWER, 0);
+            self.unmute(n);
         }
-        self.select_connection(out_pin, dac);
+        for pair in path.windows(2) {
+            self.select_connection(pair[0], pair[1]);
+        }
         self.verb(out_pin, V_SET_PIN_CTL, PIN_OUT_EN);
         self.verb(out_pin, V_SET_EAPD, 0x02);
-        self.unmute(dac);
-        self.unmute(out_pin);
 
         // Input path (optional — capture still degrades gracefully without).
         if adc != 0 && in_pin != 0 {
@@ -454,6 +539,44 @@ impl Hda {
             self.unmute(in_pin);
         }
         true
+    }
+
+    /// Depth-first search from a pin complex back to an audio-output (DAC)
+    /// widget, through selectors and mixers, appending `[pin, .., dac]` to
+    /// `chain`. Returns false if no DAC is reachable within
+    /// [`MAX_PATH_DEPTH`] hops.
+    ///
+    /// This exists because a pin's connection list usually does **not** contain
+    /// the DAC directly: the common shape is `pin <- mixer <- dac` or
+    /// `pin <- selector <- mixer <- dac`.
+    fn find_output_path(&mut self, nid: u32, depth: usize, chain: &mut alloc::vec::Vec<u32>) -> bool {
+        if depth >= MAX_PATH_DEPTH || chain.contains(&nid) {
+            return false; // too deep, or a cycle in the graph
+        }
+        chain.push(nid);
+        let wtype = (self.param(nid, P_WIDGET_CAP) >> 20) & 0xf;
+        if wtype == WIDGET_AUDIO_OUT {
+            return true; // reached a DAC
+        }
+        // Pin complexes, selectors and mixers are all worth descending through;
+        // anything else (power widget, beep generator, vendor) is a dead end.
+        if !matches!(wtype, WIDGET_PIN | WIDGET_SELECTOR | WIDGET_MIXER) {
+            chain.pop();
+            return false;
+        }
+        let len = self.param(nid, P_CONN_LEN) & 0x7f;
+        for i in 0..len {
+            let resp = self.verb(nid, V_GET_CONN_LIST, i & !3);
+            let entry = (resp >> ((i & 3) * 8)) & 0xff;
+            if entry == 0 {
+                continue;
+            }
+            if self.find_output_path(entry, depth + 1, chain) {
+                return true;
+            }
+        }
+        chain.pop();
+        false
     }
 
     /// Point `widget`'s connection selector at `target` if it appears in the
@@ -664,5 +787,56 @@ impl SndDevice for Hda {
             self.cap_on = false;
             self.pending.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a CONFIG_DEFAULT with the given connectivity and device type.
+    fn cfg(connectivity: u32, device: u32) -> u32 {
+        (connectivity << 30) | (device << 20)
+    }
+
+    #[test_case]
+    fn output_pin_ranking_prefers_speaker_then_headphone_then_line_out() {
+        let spk = rank_output_pin(cfg(2, 0x1)).unwrap(); // fixed internal speaker
+        let hp = rank_output_pin(cfg(0, 0x2)).unwrap(); // headphone jack
+        let line = rank_output_pin(cfg(0, 0x0)).unwrap(); // line out
+        assert!(spk < hp, "speaker must outrank headphone");
+        assert!(hp < line, "headphone must outrank line-out");
+    }
+
+    #[test_case]
+    fn unconnected_pins_are_refused() {
+        // Connectivity 1 = "no physical connection": the codec reports the pin
+        // but the board wired it nowhere. Choosing it yields a path that
+        // configures fine and plays silence.
+        assert_eq!(rank_output_pin(cfg(1, 0x1)), None);
+        assert_eq!(rank_output_pin(cfg(1, 0x2)), None);
+        assert!(!is_input_pin(cfg(1, 0xa)));
+        // The same device types ARE accepted when connectivity says otherwise.
+        assert!(rank_output_pin(cfg(2, 0x1)).is_some());
+        assert!(is_input_pin(cfg(0, 0xa)));
+    }
+
+    #[test_case]
+    fn digital_and_input_pins_are_not_output_candidates() {
+        // SPDIF / HDMI belong to the graphics device — never the system output.
+        for dev in [0x3, 0x4, 0x5, 0x6, 0x7] {
+            assert_eq!(rank_output_pin(cfg(0, dev)), None, "device {dev:#x}");
+        }
+        // Input device types must not be picked as outputs either.
+        assert_eq!(rank_output_pin(cfg(0, 0x8)), None); // line in
+        assert_eq!(rank_output_pin(cfg(0, 0xa)), None); // mic
+    }
+
+    #[test_case]
+    fn input_pin_accepts_line_in_and_mic_only() {
+        assert!(is_input_pin(cfg(0, 0x8))); // line in
+        assert!(is_input_pin(cfg(0, 0xa))); // mic
+        assert!(!is_input_pin(cfg(0, 0x1))); // speaker is not an input
+        assert!(!is_input_pin(cfg(0, 0x9))); // 0x9 is not a type we capture from
     }
 }
