@@ -150,6 +150,52 @@ fn user_netdev(id: &str) -> String {
 ///   macOS uses QEMU's `vmnet-bridged` (Apple vmnet; needs root or the
 ///   `com.apple.vm.networking` entitlement); other hosts use the classic
 ///   `bridge` helper (`br=<ifname>`).
+/// QEMU storage attachment for the x86 data disk, from `CHITTI_DISK_IF`
+/// (default `virtio-blk`).
+///
+/// Exists so the **real-hardware** storage controllers can be exercised, not just
+/// the paravirtual one: `ahci` builds an ich9-ahci HBA (the SATA path most older
+/// desktops and laptops use), `nvme` an NVMe controller (what most machines from
+/// ~2016 on have), `virtio-blk` the default. Returns the `-device` arguments for
+/// drive id `id`; the caller has already added the matching `-drive ...,if=none`.
+///
+/// `ahci` needs its HBA declared once, so this emits the controller too — pass
+/// `first` true for the first disk on the bus. Multiple disks land on separate
+/// AHCI ports, which is what exercises the multi-port enumeration.
+fn disk_device_args(id: &str, first: bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let kind = std::env::var("CHITTI_DISK_IF").unwrap_or_else(|_| "virtio-blk".to_string());
+    match kind.as_str() {
+        "ahci" | "sata" => {
+            if first {
+                out.push("-device".into());
+                out.push("ich9-ahci,id=ahci".into());
+            }
+            out.push("-device".into());
+            out.push(format!("ide-hd,drive={id},bus=ahci.{}", if first { 0 } else { 1 }));
+        }
+        "nvme" => {
+            out.push("-device".into());
+            out.push(format!("nvme,drive={id},serial=chitti-{id}"));
+        }
+        _ => {
+            out.push("-device".into());
+            out.push(format!("virtio-blk-pci,drive={id},disable-modern=on"));
+        }
+    }
+    out
+}
+
+/// The QEMU NIC device model to attach, from `CHITTI_NIC` (default `e1000`).
+///
+/// Exists so the by-device-ID NIC dispatch (`net::nic_ids`) can be exercised
+/// against every family QEMU can emulate, not just the default:
+/// `e1000` (82540EM → the legacy e1000 driver), `e1000e` (82574L → e1000e),
+/// `igb` (82576 → the igb/igc driver), `rtl8139`, `virtio-net-pci`.
+fn nic_model() -> String {
+    std::env::var("CHITTI_NIC").unwrap_or_else(|_| "e1000".to_string())
+}
+
 /// * otherwise — slirp user-net via [`user_netdev`] (incl. optional
 ///   `CHITTI_HOSTFWD`). Hostfwd is ignored when bridging.
 fn guest_netdev(id: &str) -> String {
@@ -1212,7 +1258,16 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
     // or L2-bridged onto a host iface when CHITTI_NET_BRIDGE=<ifname> is set.
     // CHITTI_HOSTFWD only applies to user-net. Host services (LM Studio, …)
     // are reached at 10.0.2.2 under user-net.
-    qemu.args(["-netdev", &guest_netdev("chittinet"), "-device", "virtio-net-device,netdev=chittinet"]);
+    // CHITTI_NIC overrides the transport: virtio-net-device is the virtio-mmio
+    // NIC the aarch64 driver prefers; naming a PCI model instead (e1000e, igb,
+    // ...) puts it on the GPEX PCIe bus.
+    //
+    // NB this only finds the NIC on the **UEFI-stub** boot: `crate::pci` gets its
+    // ECAM base from the ACPI MCFG in the stub's boot-info page, so on the plain
+    // `-kernel` HVF path here there is no PCIe bus to enumerate and a PCI NIC is
+    // invisible. Use it with an image/OVMF boot, not `xtask run -arch aarch64`.
+    let a64_nic = std::env::var("CHITTI_NIC").unwrap_or_else(|_| "virtio-net-device".to_string());
+    qemu.args(["-netdev", &guest_netdev("chittinet"), "-device", &format!("{a64_nic},netdev=chittinet")]);
     // virtio-snd on the host's audio backend (mic + speaker) for /voice.
     qemu.args(audio_args("virtio-sound-device"));
     // Attach a virtio-blk disk on the virtio-mmio bus (the aarch64 block driver
@@ -2052,8 +2107,8 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         cmd.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", disk.display()));
         cmd.args(["-device", "virtio-blk-pci,drive=chittidisk,disable-modern=on"]);
         cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
-        // Intel e1000 NIC (user-net or CHITTI_NET_BRIDGE — see guest_netdev).
-        cmd.args(["-netdev", &guest_netdev("chittinet"), "-device", "e1000,netdev=chittinet"]);
+        // NIC (user-net or CHITTI_NET_BRIDGE — see guest_netdev); model from CHITTI_NIC.
+        cmd.args(["-netdev", &guest_netdev("chittinet"), "-device", &format!("{},netdev=chittinet", nic_model())]);
         eprintln!("booting FROM DISK ONLY via UEFI (OVMF) -- no ISO; the installed Chitti boots itself");
         eprintln!("  disk: {}", disk.display());
         let status = cmd.status().map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
@@ -2081,7 +2136,9 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         cmd.arg(a);
     }
     cmd.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", disk.display()));
-    cmd.args(["-device", "virtio-blk-pci,drive=chittidisk,disable-modern=on"]);
+    for a in disk_device_args("chittidisk", true) {
+        cmd.arg(a);
+    }
     // Opt-in FAT disk carrying a GGUF as `chat.gguf` for the runtime `/model
     // load` path (CHITTI_MODEL_DISK=<path>; the e2e model_load scenario).
     if let Some(md) = model_disk_from_env()? {
@@ -2092,8 +2149,8 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
     // A USB keyboard on an xHCI controller, so the xhci/HID driver drives the
     // shell (as a real USB keyboard would); PS/2 also still works.
     cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
-    // Intel e1000 NIC (user-net or CHITTI_NET_BRIDGE — see guest_netdev).
-    cmd.args(["-netdev", &guest_netdev("chittinet"), "-device", "e1000,netdev=chittinet"]);
+    // NIC (user-net or CHITTI_NET_BRIDGE — see guest_netdev); model from CHITTI_NIC.
+    cmd.args(["-netdev", &guest_netdev("chittinet"), "-device", &format!("{},netdev=chittinet", nic_model())]);
     // virtio-snd on the host's audio backend (mic + speaker) for /voice.
     cmd.args(audio_args("virtio-sound-pci"));
     if disk_size.is_some() {

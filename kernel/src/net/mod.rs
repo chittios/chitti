@@ -23,6 +23,9 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
 pub mod e1000;
+pub mod igb;
+pub mod nic_ids;
+pub mod r8169;
 pub mod pci;
 pub mod virtio_net_pci;
 

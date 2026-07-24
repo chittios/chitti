@@ -26,6 +26,7 @@ model/voice scenarios auto-skip when the bundled model / voice assets are absent
 """
 
 import os
+import re
 import socket
 import ssl
 import subprocess
@@ -372,6 +373,41 @@ def s_restart(g):
 
 
 # --- network scenarios ------------------------------------------------------
+
+def s_nic_dispatch(g):
+    """The NIC was claimed by a driver chosen from its vendor/device ID.
+
+    Guards the by-device-ID dispatch (`net::nic_ids`): matching on vendor alone
+    used to hand every Intel controller to the legacy-e1000 driver, which for an
+    igb/igc part configures rings at offsets that don't exist — the NIC "comes up"
+    and never receives a frame. The boot log must name the chosen driver, and it
+    must be the family the emulated device actually belongs to.
+
+    Boot the guest with CHITTI_NIC=e1000e|igb|rtl8139|virtio-net-pci to exercise
+    the other families against the same assertion.
+    """
+    txt = g.text()
+    m = re.search(r"net: ([0-9a-f]{4}):([0-9a-f]{4}) at [\d:.]+ -> (\S+) driver", txt)
+    if not m:
+        return False, "no 'net: vvvv:dddd -> <driver> driver' dispatch line in the boot log"
+    vendor, device, driver = m.group(1), m.group(2), m.group(3)
+    # The device QEMU was told to emulate must map to the right family. Default
+    # run is `-device e1000` = 8086:100e = the legacy family.
+    expected = {
+        "100e": "e1000", "100f": "e1000", "1008": "e1000",   # 82540EM/82545EM/82544
+        "10d3": "e1000e",                                     # 82574L (-device e1000e)
+        "10c9": "igb",                                        # 82576 (-device igb)
+        "8139": "rtl8139",
+        "1000": "virtio-net", "1041": "virtio-net",
+    }.get(device)
+    if expected and driver != expected:
+        return False, f"{vendor}:{device} was claimed by '{driver}', expected '{expected}'"
+    # And the NIC must actually work — the boot only reaches here once DHCP
+    # completed over it, but assert the address explicitly.
+    if "10.0.2.15" not in txt:
+        return False, f"{driver} claimed {vendor}:{device} but no DHCP lease followed"
+    return True, f"{vendor}:{device} -> {driver}, DHCP lease obtained"
+
 
 def s_network(g):
     m = g.mark()
@@ -1312,7 +1348,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("clipboard", s_clipboard),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]
-NET = [("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("browse", s_browse), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
+NET = [("nic_dispatch", s_nic_dispatch), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("browse", s_browse), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 # Runs after every other group: kills the guest (QEMU -no-reboot → exit).
 FINAL = [("restart", s_restart)]
 
