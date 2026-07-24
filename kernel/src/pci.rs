@@ -290,12 +290,13 @@ impl PciDevice {
     }
 }
 
-/// Find the first function matching a class code `(base, sub, prog_if)` —
-/// e.g. an xHCI USB controller is `(0x0c, 0x03, 0x30)`. Class triple is at
-/// config offset 0x08 (bits 31:8).
-pub fn find_class(base: u8, sub: u8, prog_if: u8) -> Option<PciDevice> {
+/// Visit every present PCI function in bus/device/function order; `f` returns
+/// `false` to stop the scan early. Bounded by the MCFG's `bus_end` (unlike the
+/// x86 legacy path, ECAM has a firmware-declared end bus). Mirror of
+/// `crate::arch::x86_64::pci::for_each`.
+pub fn for_each(f: &mut dyn FnMut(PciDevice) -> bool) {
     if ecam_base() == 0 {
-        return None;
+        return;
     }
     let bus_end = BUS_END.with(|b| *b);
     for bus in 0..=bus_end {
@@ -305,47 +306,72 @@ pub fn find_class(base: u8, sub: u8, prog_if: u8) -> Option<PciDevice> {
                 let v = (id & 0xffff) as u16;
                 if v == 0xffff {
                     if func == 0 {
-                        break;
+                        break; // no function 0 → nothing at this device slot
                     }
                     continue;
                 }
-                let class = read32(bus, dev, func, 0x08);
-                if ((class >> 24) & 0xff) as u8 == base && ((class >> 16) & 0xff) as u8 == sub && ((class >> 8) & 0xff) as u8 == prog_if {
-                    return Some(PciDevice { bus, dev, func, vendor: v, device: (id >> 16) as u16 });
+                if !f(PciDevice { bus, dev, func, vendor: v, device: (id >> 16) as u16 }) {
+                    return;
                 }
             }
         }
     }
-    None
 }
 
-/// Find the first function matching class `base`+subclass `sub`, **ignoring
+/// The class triple `(base, sub, prog_if)` of a located function (config 0x08,
+/// bits 31:8).
+pub fn class_of(d: &PciDevice) -> (u8, u8, u8) {
+    let class = read32(d.bus, d.dev, d.func, 0x08);
+    (((class >> 24) & 0xff) as u8, ((class >> 16) & 0xff) as u8, ((class >> 8) & 0xff) as u8)
+}
+
+/// The `n`-th function matching class `(base, sub, prog_if)`, in scan order —
+/// e.g. an xHCI USB controller is `(0x0c, 0x03, 0x30)`. Lets a probe path find
+/// the second AHCI HBA or the second NIC on a machine that has two.
+pub fn find_class_nth(base: u8, sub: u8, prog_if: u8, n: usize) -> Option<PciDevice> {
+    let mut seen = 0usize;
+    let mut found = None;
+    for_each(&mut |d| {
+        if class_of(&d) == (base, sub, prog_if) {
+            if seen == n {
+                found = Some(d);
+                return false;
+            }
+            seen += 1;
+        }
+        true
+    });
+    found
+}
+
+/// Find the first function matching a class code `(base, sub, prog_if)`.
+pub fn find_class(base: u8, sub: u8, prog_if: u8) -> Option<PciDevice> {
+    find_class_nth(base, sub, prog_if, 0)
+}
+
+/// The `n`-th function matching class `base`+subclass `sub`, **ignoring
 /// prog_if** — audio controllers report varying prog_if across hypervisors
 /// (VirtualBox HDA in particular), so device drivers match on subclass.
-pub fn find_class_sub(base: u8, sub: u8) -> Option<PciDevice> {
-    if ecam_base() == 0 {
-        return None;
-    }
-    let bus_end = BUS_END.with(|b| *b);
-    for bus in 0..=bus_end {
-        for dev in 0u8..32 {
-            for func in 0u8..8 {
-                let id = read32(bus, dev, func, 0x00);
-                let v = (id & 0xffff) as u16;
-                if v == 0xffff {
-                    if func == 0 {
-                        break;
-                    }
-                    continue;
-                }
-                let class = read32(bus, dev, func, 0x08);
-                if ((class >> 24) & 0xff) as u8 == base && ((class >> 16) & 0xff) as u8 == sub {
-                    return Some(PciDevice { bus, dev, func, vendor: v, device: (id >> 16) as u16 });
-                }
+pub fn find_class_sub_nth(base: u8, sub: u8, n: usize) -> Option<PciDevice> {
+    let mut seen = 0usize;
+    let mut found = None;
+    for_each(&mut |d| {
+        let (b, s, _) = class_of(&d);
+        if b == base && s == sub {
+            if seen == n {
+                found = Some(d);
+                return false;
             }
+            seen += 1;
         }
-    }
-    None
+        true
+    });
+    found
+}
+
+/// Find the first function matching class `base`+subclass `sub`.
+pub fn find_class_sub(base: u8, sub: u8) -> Option<PciDevice> {
+    find_class_sub_nth(base, sub, 0)
 }
 
 /// Print **every** PCI function to the chat pane (`serial_println!`) — the
