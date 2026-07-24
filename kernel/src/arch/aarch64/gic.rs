@@ -15,15 +15,36 @@ use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-// QEMU `virt` GICv3 MMIO bases (also the SBSA/typical real-hardware layout is
-// discovered from the DTB/ACPI; these match QEMU virt, our test target).
-const GICD_BASE: u64 = 0x0800_0000; // distributor
-const GICR_BASE: u64 = 0x080A_0000; // redistributor frame 0 (the BSP's)
+// GICv3 MMIO bases are **discovered**, never assumed: from the device tree's
+// `arm,gic-v3` node `reg` (QEMU `virt`, any FDT platform) or, when UEFI booted us
+// with no device tree, from the ACPI MADT (`acpi::gic_from_rsdp` — VirtualBox-ARM,
+// UTM, real SBSA machines). A real server's distributor is nowhere near QEMU's
+// address, and writing GICD_CTLR at a guessed base pokes unrelated MMIO.
+//
+// These defaults are the QEMU `virt` layout, used only as a last resort when a
+// device tree advertises `arm,gic-v3` but carries no usable `reg` (malformed, or
+// a truncated FDT) — the platform is then almost certainly QEMU-like anyway.
+const GICD_BASE_DEFAULT: u64 = 0x0800_0000; // distributor
+const GICR_BASE_DEFAULT: u64 = 0x080A_0000; // redistributor frame 0 (the BSP's)
+
+/// The resolved distributor base, set by [`init_bsp`] before any GIC access.
+static GICD: AtomicU64 = AtomicU64::new(GICD_BASE_DEFAULT);
+/// The resolved redistributor base for the BSP, set by [`init_bsp`].
+static GICR: AtomicU64 = AtomicU64::new(GICR_BASE_DEFAULT);
+
+#[inline]
+fn gicd_base() -> u64 {
+    GICD.load(Ordering::Relaxed)
+}
+#[inline]
+fn gicr_base() -> u64 {
+    GICR.load(Ordering::Relaxed)
+}
 
 // Distributor registers.
 const GICD_CTLR: u64 = 0x0000;
 
-// Redistributor: RD_base at GICR_BASE, SGI_base at +0x10000.
+// Redistributor: RD_base at `gicr_base()`, SGI_base at +0x10000.
 const GICR_WAKER: u64 = 0x0014; // in RD_base
 const GICR_SGI: u64 = 0x1_0000; // SGI_base offset
 const GICR_IGROUPR0: u64 = GICR_SGI + 0x0080;
@@ -108,6 +129,107 @@ fn timer_reload() {
     }
 }
 
+/// This core's `MPIDR_EL1` (affinity bits), for matching the ACPI MADT's per-CPU
+/// GICC entries.
+fn mpidr() -> u64 {
+    let v: u64;
+    // SAFETY: MPIDR_EL1 is readable at EL1.
+    unsafe { asm!("mrs {}, mpidr_el1", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+/// Discover the GICv3 distributor/redistributor bases from firmware and store
+/// them in [`GICD`]/[`GICR`]. Returns `false` when this platform has no GICv3 we
+/// can locate, in which case the caller must stay cooperative.
+///
+/// Order matters, and each branch encodes a real platform:
+///
+/// 1. **A device tree that advertises `arm,gic-v3`** (QEMU `virt` via `-kernel`,
+///    most FDT platforms) — take `reg[0]` as the distributor and `reg[1]` as the
+///    redistributor. Falls back to the QEMU-`virt` constants only if `reg` is
+///    unreadable.
+/// 2. **A device tree that does not** — Apple Silicon. There is no GIC; return
+///    false. Critically this must *not* fall through to ACPI: Apple has no ACPI,
+///    and probing a guessed base is an uncatchable data abort.
+/// 3. **No device tree at all** (UEFI stub boot: VirtualBox-ARM, UTM, real SBSA
+///    hardware) — parse the ACPI MADT. This is the case that previously left
+///    every UEFI-booted ARM machine with no timer interrupt at all, silently
+///    cooperative, because the old code required an FDT node that never existed.
+fn resolve_gic_bases() -> bool {
+    let fdt = super::boot::boot_x0();
+    // SAFETY: `boot_x0` is the FDT pointer (or a non-FDT value the magic rejects).
+    if unsafe { crate::fdt::present(fdt) } {
+        // SAFETY: as above; the FDT is mapped and its magic checked.
+        if !unsafe { crate::fdt::has_compatible(fdt, b"arm,gic-v3") } {
+            crate::ktrace::log("gic", "device tree advertises no GICv3 (Apple AIC?) -- cooperative scheduling; AIC is a follow-up");
+            return false;
+        }
+        // SAFETY: as above. reg[0] = distributor, reg[1] = redistributor.
+        let d = unsafe { crate::fdt::reg_nth_of_compatible(fdt, b"arm,gic-v3", 0) };
+        let r = unsafe { crate::fdt::reg_nth_of_compatible(fdt, b"arm,gic-v3", 1) };
+        match (d, r) {
+            (Some((dbase, _)), Some((rbase, _))) if dbase != 0 && rbase != 0 => {
+                GICD.store(dbase, Ordering::Relaxed);
+                GICR.store(rbase, Ordering::Relaxed);
+                super::mmu::map_device_gib(dbase);
+                super::mmu::map_device_gib(rbase);
+                crate::ktrace::log_fmt(format_args!(
+                    "gic: GICv3 from device tree -- GICD {dbase:#x} GICR {rbase:#x}"
+                ));
+            }
+            _ => {
+                crate::ktrace::log_fmt(format_args!(
+                    "gic: device tree has arm,gic-v3 but no usable reg -- assuming the QEMU virt layout (GICD {GICD_BASE_DEFAULT:#x} GICR {GICR_BASE_DEFAULT:#x})"
+                ));
+            }
+        }
+        return true;
+    }
+    // No device tree: UEFI handed us ACPI tables instead.
+    let bi = super::boot::boot_x1();
+    if bi == 0 {
+        crate::ktrace::log("gic", "no device tree and no boot-info page -- cannot locate a GIC; cooperative scheduling");
+        return false;
+    }
+    // SAFETY: `bi` is the stub's identity-mapped boot-info page; verify the magic
+    // before trusting the RSDP field at offset 40.
+    let magic = unsafe { core::slice::from_raw_parts(bi as *const u8, 8) };
+    if magic != b"CHITTIBI" {
+        crate::ktrace::log("gic", "boot-info magic mismatch -- cannot locate a GIC; cooperative scheduling");
+        return false;
+    }
+    // SAFETY: boot-info verified; RSDP pointer is at offset 40.
+    let rsdp = unsafe { core::ptr::read_volatile((bi + 40) as *const u64) };
+    match crate::acpi::gic_from_rsdp(rsdp, mpidr()) {
+        Some(g) => {
+            GICD.store(g.gicd, Ordering::Relaxed);
+            GICR.store(g.gicr, Ordering::Relaxed);
+            // A real machine's GIC is nowhere near the low Device block the
+            // identity map covers by default — map both windows explicitly.
+            super::mmu::map_device_gib(g.gicd);
+            super::mmu::map_device_gib(g.gicr);
+            crate::ktrace::log_fmt(format_args!(
+                "gic: GICv{} from ACPI MADT -- GICD {:#x} GICR {:#x}",
+                g.version, g.gicd, g.gicr
+            ));
+            if g.version != 0 && g.version < 3 {
+                crate::ktrace::log_fmt(format_args!(
+                    "gic: MADT reports GICv{} -- this driver is GICv3-only; cooperative scheduling",
+                    g.version
+                ));
+                return false;
+            }
+            true
+        }
+        None => {
+            crate::ktrace::log_fmt(format_args!(
+                "gic: no usable GIC in the ACPI MADT (RSDP {rsdp:#x}) -- cooperative scheduling"
+            ));
+            false
+        }
+    }
+}
+
 /// Bring up the GICv3 (distributor + this core's redistributor + CPU interface)
 /// and start the periodic timer, on the **BSP**. Returns `true` if the CPU
 /// interface is usable (→ enable IRQs for preemptive scheduling) or `false` if
@@ -118,42 +240,39 @@ fn timer_reload() {
 /// # Safety
 /// Runs at EL1 on the BSP; the GIC MMIO windows are Device-mapped.
 pub unsafe fn init_bsp() -> bool {
-    // The GICD/GICR MMIO windows below (0x0800_0000 / 0x080A_0000) are assumed
-    // present on QEMU/SBSA, but Apple Silicon has **no GIC** — it uses AIC at a
-    // wholly different base. Touching the phantom distributor there is a data
-    // abort the sysreg probe can't catch (it's MMIO, not an UNDEF). So gate the
-    // whole GICv3 path on the device tree advertising `arm,gic-v3`; without it,
-    // run cooperatively (no timer preemption) — Apple's AIC is a follow-up.
-    let fdt = super::boot::boot_x0();
-    // SAFETY: `boot_x0` is the FDT pointer (or non-FDT, rejected by the magic).
-    if !unsafe { crate::fdt::has_compatible(fdt, b"arm,gic-v3") } {
-        crate::ktrace::log("gic", "no GICv3 in device tree (Apple AIC?) -- cooperative scheduling; AIC is a follow-up");
+    // Locate the GIC before touching it. Apple Silicon has **no GIC** at all (it
+    // uses AIC at a wholly different base) and touching a phantom distributor is
+    // a data abort the sysreg probe below cannot catch — it is MMIO, not an UNDEF.
+    // So the base must come from firmware, and if firmware doesn't describe a
+    // GICv3 we stay cooperative rather than guess.
+    if !resolve_gic_bases() {
         PREEMPTIVE.store(false, Ordering::Release);
         return false;
     }
+    let (gicd_base, gicr_base) = (gicd_base(), gicr_base());
     unsafe {
         // --- Distributor: affinity routing + Group1 enable. ---
-        let ctlr = mmio_r32(GICD_BASE, GICD_CTLR);
-        mmio_w32(GICD_BASE, GICD_CTLR, ctlr | (1 << 4)); // ARE_NS
-        mmio_w32(GICD_BASE, GICD_CTLR, mmio_r32(GICD_BASE, GICD_CTLR) | (1 << 1)); // EnableGrp1NS
+        let ctlr = mmio_r32(gicd_base, GICD_CTLR);
+        mmio_w32(gicd_base, GICD_CTLR, ctlr | (1 << 4)); // ARE_NS
+        mmio_w32(gicd_base, GICD_CTLR, mmio_r32(gicd_base, GICD_CTLR) | (1 << 1)); // EnableGrp1NS
 
         // --- Redistributor: wake it, then configure the timer PPI. ---
         // Clear ProcessorSleep, wait for ChildrenAsleep to clear.
-        let waker = mmio_r32(GICR_BASE, GICR_WAKER);
-        mmio_w32(GICR_BASE, GICR_WAKER, waker & !(1 << 1));
+        let waker = mmio_r32(gicr_base, GICR_WAKER);
+        mmio_w32(gicr_base, GICR_WAKER, waker & !(1 << 1));
         let mut g = 0;
-        while mmio_r32(GICR_BASE, GICR_WAKER) & (1 << 2) != 0 && g < 1_000_000 {
+        while mmio_r32(gicr_base, GICR_WAKER) & (1 << 2) != 0 && g < 1_000_000 {
             g += 1;
         }
         // PPIs/SGIs to Group1 (bit per INTID).
-        mmio_w32(GICR_BASE, GICR_IGROUPR0, 0xFFFF_FFFF);
+        mmio_w32(gicr_base, GICR_IGROUPR0, 0xFFFF_FFFF);
         // Priority for all timer PPIs (byte-addressed): highest usable (0x00).
-        write_volatile((GICR_BASE + GICR_IPRIORITYR + TIMER_PPI_VIRT as u64) as *mut u8, 0x00);
-        write_volatile((GICR_BASE + GICR_IPRIORITYR + TIMER_PPI_EL1 as u64) as *mut u8, 0x00);
-        write_volatile((GICR_BASE + GICR_IPRIORITYR + TIMER_PPI_EL2 as u64) as *mut u8, 0x00);
+        write_volatile((gicr_base + GICR_IPRIORITYR + TIMER_PPI_VIRT as u64) as *mut u8, 0x00);
+        write_volatile((gicr_base + GICR_IPRIORITYR + TIMER_PPI_EL1 as u64) as *mut u8, 0x00);
+        write_volatile((gicr_base + GICR_IPRIORITYR + TIMER_PPI_EL2 as u64) as *mut u8, 0x00);
         // Enable the timer PPIs (virtual=27, physical EL1=30, EL2=26). We only
         // *program* the virtual timer, but enabling all is harmless.
-        mmio_w32(GICR_BASE, GICR_ISENABLER0, (1 << TIMER_PPI_VIRT) | (1 << TIMER_PPI_EL1) | (1 << TIMER_PPI_EL2));
+        mmio_w32(gicr_base, GICR_ISENABLER0, (1 << TIMER_PPI_VIRT) | (1 << TIMER_PPI_EL1) | (1 << TIMER_PPI_EL2));
 
         // --- CPU interface (system registers). ---
         // Enable the system-register interface for our EL. When we run at EL2

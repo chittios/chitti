@@ -85,6 +85,100 @@ pub fn ecam_from_rsdp(rsdp: u64) -> Option<EcamSegment> {
     Some(EcamSegment { base, bus_start, bus_end })
 }
 
+/// GICv3 register bases discovered from ACPI — for an ARM platform booted by UEFI
+/// with **no device tree** (VirtualBox-ARM, UTM, real SBSA servers/laptops).
+pub struct GicInfo {
+    /// Distributor base, from the MADT GICD structure (type 0x0D).
+    pub gicd: u64,
+    /// This CPU's redistributor base.
+    pub gicr: u64,
+    /// GIC architecture version reported by the GICD structure (3 = GICv3).
+    pub version: u8,
+}
+
+/// Walk `rsdp` → XSDT → **MADT** ("APIC") and return the GICv3 distributor and
+/// redistributor bases for the CPU whose `MPIDR_EL1` is `mpidr`.
+///
+/// This is the ARM-SBSA counterpart to reading the device tree's `arm,gic-v3`
+/// node. Without it a UEFI-booted ARM machine has no way to locate the GIC, and
+/// hardcoding QEMU `virt`'s `0x0800_0000` would poke whatever happens to live
+/// there on a real server.
+///
+/// Redistributor resolution follows the ACPI spec's own precedence:
+/// 1. the **GICC** structure (type 0x0C) whose `MPIDR` field matches this CPU —
+///    its `GicrBaseAddress` is exactly this core's redistributor frame;
+/// 2. failing an MPIDR match, the first GICC with a non-zero `GicrBaseAddress`;
+/// 3. failing that, the base of the **GICR** discovery range (type 0x0F), whose
+///    first frame belongs to the boot CPU on every platform that uses this form.
+///
+/// `None` if there is no MADT, no GICD, or no redistributor by any of those
+/// routes — the caller then stays on cooperative scheduling rather than guessing.
+pub fn gic_from_rsdp(rsdp: u64, mpidr: u64) -> Option<GicInfo> {
+    let p = find_table(rsdp, b"APIC")?;
+    let total = le32(p, 4) as usize;
+    // MADT header is 36 bytes + LocalApicAddress(u32) + Flags(u32); the
+    // interrupt-controller structures start at 44. Each is {type u8, length u8}.
+    let mut off = 44usize;
+    let mut gicd = 0u64;
+    let mut version = 0u8;
+    let mut gicr_matched = 0u64; // GICC with our MPIDR
+    let mut gicr_first = 0u64; // first GICC with a redistributor
+    let mut gicr_range = 0u64; // GICR discovery range base
+    while off + 2 <= total {
+        // SAFETY: `p` points at a mapped ACPI table; `off + 2 <= total` and
+        // `total` is the table's own declared length.
+        let (ty, len) = unsafe { (*p.add(off), *p.add(off + 1) as usize) };
+        if len < 2 || off + len > total {
+            break; // malformed length would otherwise loop or read past the table
+        }
+        match ty {
+            0x0c => {
+                // GICC: GicrBaseAddress @64, MPIDR @72 (both u64).
+                if len >= 80 {
+                    let base = le64(p, off + 64);
+                    // MPIDR comparison uses the affinity bits only (bits 63:40
+                    // are reserved/flags in MPIDR_EL1).
+                    if base != 0 {
+                        if le64(p, off + 72) & 0xff_00ff_ffff == mpidr & 0xff_00ff_ffff {
+                            gicr_matched = base;
+                        }
+                        if gicr_first == 0 {
+                            gicr_first = base;
+                        }
+                    }
+                }
+            }
+            0x0d => {
+                // GICD: PhysicalBaseAddress @8 (u64), GicVersion @20 (u8).
+                if len >= 24 {
+                    gicd = le64(p, off + 8);
+                    // SAFETY: `off + 20 < off + len <= total`, inside the table.
+                    version = unsafe { *p.add(off + 20) };
+                }
+            }
+            0x0f => {
+                // GICR: DiscoveryRangeBaseAddress @4 (u64).
+                if len >= 16 && gicr_range == 0 {
+                    gicr_range = le64(p, off + 4);
+                }
+            }
+            _ => {}
+        }
+        off += len;
+    }
+    let gicr = if gicr_matched != 0 {
+        gicr_matched
+    } else if gicr_first != 0 {
+        gicr_first
+    } else {
+        gicr_range
+    };
+    if gicd == 0 || gicr == 0 {
+        return None;
+    }
+    Some(GicInfo { gicd, gicr, version })
+}
+
 /// Walk `rsdp` → XSDT → **SPCR** (Serial Port Console Redirection) and return
 /// the console UART's `(base_address, interface_type)`. Interface type 0x03 is
 /// ARM PL011; 0x0e is ARM SBSA (PL011-compatible DR/FR layout). This is how the

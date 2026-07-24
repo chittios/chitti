@@ -171,6 +171,21 @@ RTC / UEFI `GetTime` / the virtual counter — each behind a shared facade with 
 per-arch implementation. The same kernel image must run on QEMU, VirtualBox, and
 real UEFI hardware.
 
+**Interrupt-controller bases are discovered, and there are two sources, not one.**
+aarch64 finds the GICv3 from the device tree's `arm,gic-v3` `reg` when there is an
+FDT, and otherwise from the **ACPI MADT** (`acpi::gic_from_rsdp`: GICD type `0x0D`
+for the distributor; the redistributor from the GICC entry whose `MPIDR` matches
+this core, else the first GICC's `GicrBaseAddress`, else the GICR discovery
+range). Both windows get `map_device_gib`. This matters because the two cases are
+*different real platforms*: QEMU `virt` boots via `-kernel` with an FDT, while
+VirtualBox-ARM, UTM and real SBSA machines boot the UEFI stub with **no FDT at
+all** — and requiring the FDT node left every one of those silently cooperative,
+with no timer preemption, forever. An FDT that exists but lacks `arm,gic-v3` is
+Apple Silicon: stay cooperative and do **not** fall through to ACPI (there is
+none, and probing a guessed base is an uncatchable data abort, not a trappable
+UNDEF). The QEMU-`virt` addresses survive only as a last-resort default when an
+FDT claims a GICv3 but carries no readable `reg`.
+
 ## What exists today (subsystems, not phases)
 
 - **Agent layer** — an orchestrator running a real tool-use loop
@@ -459,7 +474,16 @@ real UEFI hardware.
   ext4 (the default filesystem) + FAT, `/install` (self-hosting install to a
   disk; detects an existing Chitti GPT and **updates in place**, preserving the
   data partition — destructive actions confirm via the permission modal),
-  durable agent state on ext4. NVMe enumerates namespaces via the **IDENTIFY
+  durable agent state on ext4. **Every disk is enumerated, across controllers and
+  ports**: `ahci::probe_nth` indexes AHCI *disks* — each HBA on the bus × each
+  port that is implemented *and* populated (`Ahci::present_count` counts without
+  allocating, so skipping past a disk doesn't bring a port up and leak its DMA;
+  `bringup_nth` then takes the one the index names). Ports are sparse on real
+  hardware — a drive on port 3 with 0-2 empty is normal — and only taking the
+  first controller's first present port made every other disk invisible. Exercise
+  the real-hardware storage paths in QEMU with
+  `CHITTI_DISK_IF=ahci|nvme|virtio-blk cargo xtask run -arch x86_64`.
+  NVMe enumerates namespaces via the **IDENTIFY
   CNS=2 active list**, never "walk NSIDs until empty" — NSIDs are sparse on
   VirtualBox (port→NSID; an empty port 0 = inactive NSID 1, exactly what a VM
   looks like after its install medium is detached); the `nvme: N active
@@ -483,8 +507,32 @@ real UEFI hardware.
   smoltcp `route()` keeps the NIC from ever emitting loopback traffic on the wire.
   NIC drivers behind one
   `NetDevice` facade — **virtio-net** over virtio-mmio (aarch64 QEMU) and over
-  PCI, plus **e1000** (VirtualBox default + real Intel) — discovered the same way
-  on both arches. Shell surface: `/network` (info/dhcp/static/dns), `/ping`,
+  PCI, plus the PCI Ethernet families — discovered the same way on both arches.
+  **A PCI NIC is claimed by vendor+device ID, never by vendor alone**
+  (`net/nic_ids.rs`, pure + unit-tested): all Intel Ethernet reports
+  `8086`/class `02:00:00`, but the families are register-incompatible —
+  legacy **e1000** (82540-82547) and **e1000e** (82571…**I217/I218/I219**, the
+  NIC in most business laptops) keep the rings at `RDBAL 0x2800`/`TDBAL 0x3800`
+  and share `net/e1000.rs`, while **igb** (82575-I350) and **igc** (I225/I226)
+  moved them to `0xC000`/`0xE000` with *advanced* descriptors and need
+  `net/igb.rs`. Driving an I210 through the legacy path configures reserved
+  space: it links and never receives a frame — and having claimed the one NIC
+  slot, a second working card is never tried. So `net::pci::probe` walks **every**
+  Ethernet function, skips the ones with no driver (logging each), and dispatches
+  by table; unknown *Intel* IDs fall back to e1000e (the only open-ended family —
+  Intel adds I219 IDs every PCH generation) with the ID ktraced as a guess.
+  **Realtek** RTL8168/8111/8125 — the commonest consumer NIC — is `net/r8169.rs`:
+  descriptor-owned rings (`DescOwn` in the descriptor, no tail register; kick via
+  `TxPoll`), **unverified on hardware** (QEMU models no r8169-family part, only
+  `rtl8139`, which is recognised but deliberately not implemented — no
+  Windows-era machine has one). Test the dispatch against every family QEMU *can*
+  emulate with `CHITTI_NIC=e1000|e1000e|igb|rtl8139|virtio-net-pci cargo xtask run
+  -arch x86_64` (the `nic_dispatch` e2e scenario asserts the chosen driver matches
+  the emulated device). Still missing for real machines: Broadcom `tg3`,
+  Atheros/Killer `alx`, Aquantia, and **any** WiFi on x86 — a USB Ethernet dongle
+  (CDC-ECM/ASIX over the existing xHCI stack) is the cheap fix for a laptop with
+  no Ethernet port, and is not written yet.
+  Shell surface: `/network` (info/dhcp/static/dns), `/ping`,
   `/wifi` (scan/connect via the password modal), a **TCP listener**
   (`net::listen`/`try_accept`, backed by a pool of Listen-state sockets in
   *both* the NIC and loopback sets, so one listener serves external/hostfwd and
