@@ -50,6 +50,9 @@ static mut CUR: (u8, u8) = (4, 1);
 static mut MODEL: u8 = 0;
 /// An `ask:` (agent move) is in flight — inputs are ignored until `on_reply`.
 static mut WAITING: u8 = 0;
+/// Black to move on start/restore: emit `ask:` from the next `tick` so open
+/// never blocks the shell on a model turn (which can take minutes).
+static mut PENDING_ASK: u8 = 0;
 
 fn fen_get() -> String {
     unsafe {
@@ -162,6 +165,7 @@ pub fn start(args: &str) -> String {
     unsafe {
         MODEL = if args.contains("\"model\":true") { 1 } else { 0 };
         WAITING = 0;
+        PENDING_ASK = 0;
         SEL = (0xff, 0xff);
         CUR = (4, 1);
     }
@@ -175,9 +179,12 @@ pub fn start(args: &str) -> String {
     };
     fen_set(&fen);
     paint(&turn_status(&fen));
-    // A restored game may already be on the agent's turn.
+    // A restored game may already be on the agent's turn — do NOT run the
+    // model ask inline here: `handle_result` would block the shell for a full
+    // inference turn before the board is usable. Defer to the next `tick`.
     if unsafe { MODEL != 0 } && !white_to_move(&fen) {
-        return agent_ask(&fen);
+        unsafe { PENDING_ASK = 1 };
+        paint_hud("Agent to move (Black)…", "");
     }
     format!("ok:chess you play White{}", if unsafe { MODEL != 0 } { ", agent answers as Black" } else { " and Black (hotseat)" })
 }
@@ -187,6 +194,7 @@ fn new_game() -> String {
         SEL = (0xff, 0xff);
         CUR = (4, 1);
         WAITING = 0;
+        PENDING_ASK = 0;
     }
     fen_set(START_FEN);
     paint("New game - your move (White)");
@@ -320,7 +328,7 @@ fn activate(sq: &str) -> String {
 }
 
 pub fn on_click(x: i32, y: i32) -> String {
-    if unsafe { WAITING != 0 } {
+    if unsafe { WAITING != 0 || PENDING_ASK != 0 } {
         return String::from("ok:busy");
     }
     let fx = (x - OX) / SQ;
@@ -334,7 +342,8 @@ pub fn on_click(x: i32, y: i32) -> String {
 }
 
 pub fn on_key(key: &str) -> String {
-    if unsafe { WAITING != 0 } {
+    // Allow `n` (new game) even while the agent is thinking / pending.
+    if key != "n" && unsafe { WAITING != 0 || PENDING_ASK != 0 } {
         return String::from("ok:busy");
     }
     let (df, dr): (i8, i8) = match key {
@@ -372,7 +381,16 @@ pub fn on_key(key: &str) -> String {
 }
 
 /// Animate the thinking dots while an ask is in flight (runtime tick).
+/// Also drains a deferred agent-ask scheduled by [`start`] on Black-to-move
+/// restore so open never blocks the shell.
 pub fn tick() -> String {
+    if unsafe { PENDING_ASK != 0 && WAITING == 0 } {
+        unsafe { PENDING_ASK = 0 };
+        let fen = fen_get();
+        if unsafe { MODEL != 0 } && !white_to_move(&fen) {
+            return agent_ask(&fen);
+        }
+    }
     if unsafe { WAITING == 0 } {
         return String::from("ok:idle");
     }

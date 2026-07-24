@@ -4685,25 +4685,35 @@ pub fn present_surface_hud(id: u32, sw: usize, sh: usize, buf: &[u32], hud: &str
         present_surface_reserve(id, sw, sh, buf, 0);
         return;
     }
+    // Compute reserve *before* any SCREEN critical section. `draw_surface_hud`
+    // already holds SCREEN; calling `surface_hud_height` from inside it would
+    // re-enter the non-reentrant spinlock and hang forever (chess open path:
+    // host_hud_set → present → draw_surface_hud).
     let reserve = surface_hud_height(hud);
     present_surface_reserve(id, sw, sh, buf, reserve);
-    draw_surface_hud(id, hud);
+    draw_surface_hud(id, hud, reserve);
 }
 
 /// Height (px) a surface HUD needs: one status line + the wrapped hint lines,
 /// plus a top hairline and small padding — computed at the current pane width.
+///
+/// Must **not** be called while already holding `SCREEN` (see
+/// [`present_surface_hud`]). Pure layout math is in [`hud_strip_height`].
 fn surface_hud_height(hud: &str) -> u64 {
     SCREEN.with(|slot| {
         let Some(sc) = slot.as_ref() else { return 0 };
-        let ch = sc.ch();
-        let cw = sc.cw();
         let cols = (sc.logs.cols.saturating_sub(2)).max(4) as usize;
-        let _ = cw;
-        let mut lines = 1u64; // status
-        lines += wrapped_hint_lines(hud, cols);
-        // top hairline + half-cell top/bottom padding.
-        (lines * ch) + ch / 2 + 2
+        hud_strip_height(hud, sc.ch(), cols)
     })
+}
+
+/// Pure: pixel height of the reserved HUD strip for `hud` at cell height `ch`
+/// and wrap width `cols`. Unit-tested.
+fn hud_strip_height(hud: &str, ch: u64, cols: usize) -> u64 {
+    let mut lines = 1u64; // status
+    lines += wrapped_hint_lines(hud, cols);
+    // top hairline + half-cell top/bottom padding.
+    (lines * ch) + ch / 2 + 2
 }
 
 /// Count how many display lines the HUD's hint text (everything after line 0)
@@ -4738,7 +4748,11 @@ fn wrapped_hint_lines(hud: &str, cols: usize) -> u64 {
 
 /// Render a surface's HUD in the reserved bottom strip of its pane (native
 /// font, wrapping). No-op unless that surface tab is active.
-fn draw_surface_hud(id: u32, hud: &str) {
+///
+/// `barh` must be the same value used for `present_surface_reserve`'s
+/// `reserve_bottom` — precomputed *outside* this critical section so we never
+/// re-enter `SCREEN` (non-reentrant spinlock).
+fn draw_surface_hud(id: u32, hud: &str, barh: u64) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
         if sc.right != RightMode::Surface(id) {
@@ -4750,7 +4764,6 @@ fn draw_surface_hud(id: u32, hud: &str) {
         let cw = sc.cw();
         let (px, py) = (sc.logs.ix, sc.logs.iy);
         let (pw, ph) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
-        let barh = surface_hud_height(hud);
         let by = py + ph.saturating_sub(barh);
         let bg = sc.logs.bg;
         sc.fill_rect(px, by, pw, barh, bg);
@@ -5677,7 +5690,7 @@ mod theme_switch_tests {
 
 #[cfg(test)]
 mod hud_tests {
-    use super::wrapped_hint_lines;
+    use super::{hud_strip_height, wrapped_hint_lines};
 
     #[test_case]
     fn hud_hint_wrapping_counts_lines() {
@@ -5691,6 +5704,22 @@ mod hud_tests {
         assert!(wrapped_hint_lines(hud, 20) >= 3, "narrow pane wraps to several rows");
         // Two explicit hint lines are at least two rows.
         assert!(wrapped_hint_lines("s\nfirst line\nsecond line", 80) >= 2);
+    }
+
+    #[test_case]
+    fn hud_strip_height_matches_status_plus_hints() {
+        // Chess-shaped HUD: status + one shortcut line. Pure — must stay free
+        // of SCREEN so present_surface_hud can compute reserve outside the
+        // draw critical section (re-entering SCREEN deadlocks).
+        let hud = "Your move (White)\narrows/click move  enter select  esc clear  n new game";
+        let ch = 16u64;
+        let cols = 40usize;
+        let hints = wrapped_hint_lines(hud, cols);
+        let expect = (1 + hints) * ch + ch / 2 + 2;
+        assert_eq!(hud_strip_height(hud, ch, cols), expect);
+        assert!(hud_strip_height(hud, ch, cols) > ch, "strip taller than one cell");
+        // Status-only is shorter than status+hints.
+        assert!(hud_strip_height(hud, ch, cols) > hud_strip_height("status only", ch, cols));
     }
 }
 

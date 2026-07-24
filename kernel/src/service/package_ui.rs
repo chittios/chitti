@@ -302,13 +302,7 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
     // tells the app whether the runtime can serve `ask:` (e.g. chess opponent).
     let model = crate::shell::planner_available() || crate::shell::remote::is_remote_active();
     let init_args = format!(r#"{{"app":"{name}","surface":{surface},"model":{model}}}"#);
-    let start_owned = match name {
-        "minesweeper" => String::from("mines_start"),
-        "chess" => String::from("chess_start"),
-        // Hyphenated package names cannot be wasm export identifiers.
-        "sandbox-lab" => String::from("sandbox_start"),
-        other => format!("{other}_start"),
-    };
+    let start_owned = start_export_name(name);
     let init = call_running(&start_owned, &init_args)
         .or_else(|_| call_running("app_start", &init_args));
     match init {
@@ -319,6 +313,19 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
         Err(e) => crate::serial_println!("package_ui> {name} init: {e}"),
     }
     Ok(surface)
+}
+
+/// Guest init export for a package name. Pure — unit-tested so every package-UI
+/// agent maps to a real wasm export (`minesweeper` → `mines_start`, hyphenated
+/// names → underscores, everything else → `{name}_start`).
+pub fn start_export_name(name: &str) -> String {
+    match name {
+        "minesweeper" => String::from("mines_start"),
+        "chess" => String::from("chess_start"),
+        // Hyphenated package names cannot be wasm export identifiers.
+        "sandbox-lab" => String::from("sandbox_start"),
+        other => format!("{other}_start"),
+    }
 }
 
 /// Parse a Synapse `ui_event_poll` result (`ok:click=X,Y`) into coordinates.
@@ -451,5 +458,26 @@ mod tests {
         assert_eq!(nav_key_name(b'C'), Some("right"));
         assert_eq!(nav_key_name(b'D'), Some("left"));
         assert_eq!(nav_key_name(b'Z'), None);
+    }
+
+    #[test_case]
+    fn start_export_names_cover_all_package_ui_apps() {
+        // Every package-UI agent the shell can `/agents start` must resolve to
+        // a wasm export that tools/apps-wasm (or chess-wasm) actually ships.
+        assert_eq!(start_export_name("chess"), "chess_start");
+        assert_eq!(start_export_name("minesweeper"), "mines_start");
+        assert_eq!(start_export_name("sandbox-lab"), "sandbox_start");
+        for name in [
+            "paint", "slides", "snake", "synth", "calc", "clock", "files",
+            "gallery", "sheets", "calendar", "contacts", "writer", "archive",
+            "hex", "game2048", "activity", "weather", "settings", "dict",
+            "diff", "breakout", "tetris", "console", "maps", "radio",
+        ] {
+            assert_eq!(
+                start_export_name(name),
+                format!("{name}_start"),
+                "default export naming for {name}"
+            );
+        }
     }
 }

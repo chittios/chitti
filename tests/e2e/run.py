@@ -1232,44 +1232,68 @@ def s_surface(g):
 
 
 def s_package_apps(g):
-    """Package-UI apps (tools.wasm on a persistent instance): start chess,
-    minesweeper, snake, and synth in turn — each start instantiates the module,
-    resolves the app's start export, requests a surface, and paints. Starting
-    the next app stops the previous (observable), and stop-package closes the
-    last. Starting an app focuses the action pane (its keys go to the game), so
-    Shift+Tab (ESC[Z) returns focus to the chat line before the next command."""
-    m = g.mark()
-    g.send("/agents start chess")
-    # Model-less guest → hotseat mode (no agent opponent to wait on).
-    if not g.wait_for("package_ui> chess: ok:chess", 15, m):
-        return False, "chess did not start (wasm init failed?)"
-    g.send_raw(b"\x1b[Z")  # Shift+Tab: focus back to the chat line
-    m = g.mark()
-    g.send("/agents start minesweeper")
-    ok = g.wait_for("package_ui> stopped 'chess'", 15, m) and g.wait_for(
-        "package_ui> minesweeper: ok:mines 9x9", 10, m
-    )
-    if not ok:
-        return False, "minesweeper did not replace chess"
-    g.send_raw(b"\x1b[Z")
-    m = g.mark()
-    g.send("/agents start snake")
-    ok = g.wait_for("package_ui> stopped 'minesweeper'", 15, m) and g.wait_for(
-        "package_ui> snake: ok:snake", 10, m
-    )
-    if not ok:
-        return False, "snake did not replace minesweeper"
-    # Snake runs on the guest tick (persistent instance state) while we type.
-    g.send_raw(b"\x1b[Z")
-    m = g.mark()
-    g.send("/agents start synth")
-    if not g.wait_for("package_ui> synth: ok:synth piano", 15, m):
-        return False, "synth piano did not start"
-    g.send_raw(b"\x1b[Z")
+    """Package-UI apps (tools.wasm on a persistent instance): start every
+    package-UI agent in turn — each start instantiates the module, resolves
+    the app's start export, requests a surface, and paints. Starting the next
+    app stops the previous (observable), and stop-package closes the last.
+
+    Chess is special: it paints via board_set + host_hud_set (reserved HUD
+    strip). A prior SCREEN reentrancy hang on that path froze open; the rest
+    of the suite uses host_ui_draw only. Starting an app focuses the action
+    pane (its keys go to the game), so Shift+Tab (ESC[Z) returns focus to the
+    chat line before the next command."""
+    # (agent name, substring of package_ui> <name>: <start reply>)
+    # Chess: model-less guest → hotseat; reply starts with ok:chess.
+    apps = [
+        ("chess", "package_ui> chess: ok:chess"),
+        ("minesweeper", "package_ui> minesweeper: ok:mines 9x9"),
+        ("snake", "package_ui> snake: ok:snake"),
+        ("synth", "package_ui> synth: ok:synth piano"),
+        ("paint", "package_ui> paint: ok:paint ready"),
+        ("slides", "package_ui> slides: ok:slides n="),
+        ("calc", "package_ui> calc: ok:calc ready"),
+        ("clock", "package_ui> clock: ok:clock"),
+        ("files", "package_ui> files: ok:files"),
+        ("gallery", "package_ui> gallery: ok:gallery"),
+        ("sheets", "package_ui> sheets: ok:sheets"),
+        ("calendar", "package_ui> calendar: ok:calendar"),
+        ("contacts", "package_ui> contacts: ok:contacts"),
+        ("writer", "package_ui> writer: ok:writer"),
+        ("archive", "package_ui> archive: ok:archive"),
+        ("hex", "package_ui> hex: ok:hex"),
+        ("game2048", "package_ui> game2048: ok:2048"),
+        ("activity", "package_ui> activity: ok:activity"),
+        ("weather", "package_ui> weather: ok:weather"),
+        ("settings", "package_ui> settings: ok:settings"),
+        ("dict", "package_ui> dict: ok:dict"),
+        ("diff", "package_ui> diff: ok:diff"),
+        ("breakout", "package_ui> breakout: ok:breakout"),
+        ("tetris", "package_ui> tetris: ok:tetris"),
+        ("console", "package_ui> console: ok:console"),
+        ("maps", "package_ui> maps: ok:maps"),
+        ("radio", "package_ui> radio: ok:radio"),
+        ("sandbox-lab", "package_ui> sandbox-lab: ok:sandbox-lab"),
+    ]
+    prev = None
+    for name, expect in apps:
+        m = g.mark()
+        g.send(f"/agents start {name}")
+        if prev is not None:
+            if not g.wait_for(f"package_ui> stopped '{prev}'", 15, m):
+                return False, f"{name}: previous '{prev}' did not stop"
+        if not g.wait_for(expect, 15, m):
+            return False, f"{name} did not start (expected {expect!r})"
+        g.send_raw(b"\x1b[Z")  # Shift+Tab: focus back to the chat line
+        prev = name
     m = g.mark()
     g.send("/agents stop-package")
-    ok = g.wait_for("package_ui> stopped 'synth'", 15, m)
-    return ok, "chess/minesweeper/snake/synth start+stop over package_ui" if ok else "stop-package failed"
+    ok = g.wait_for(f"package_ui> stopped '{prev}'", 15, m)
+    return (
+        ok,
+        f"{len(apps)} package-UI apps start+stop over package_ui"
+        if ok
+        else f"stop-package failed (last={prev})",
+    )
 
 
 OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
