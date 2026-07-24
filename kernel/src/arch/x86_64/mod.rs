@@ -82,16 +82,92 @@ pub fn hlt() {
     unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)) }
 }
 
-/// Power off / exit QEMU cleanly (so typing `exit` at the shell terminates the
-/// emulator instead of leaving it idling). Uses the `isa-debug-exit` device
-/// (present in every `xtask` QEMU invocation): a dword write to port 0xf4
-/// exits QEMU. Falls back to a halt loop if that somehow returns.
+/// Power the machine off.
+///
+/// **ACPI S5 first, emulator exit second.** This used to write only port `0xf4` —
+/// QEMU's `isa-debug-exit` device — which does nothing at all on real hardware,
+/// so `/poweroff` left the machine running with the fans on and the shell gone.
+/// A real soft-off is a write of `SLP_TYPa | SLP_EN` to the FADT's `PM1a_CNT`
+/// (see [`crate::acpi::s5_from_rsdp`]).
+///
+/// Order matters: the ACPI path is attempted first because it is the one that
+/// works on a physical machine, and the `isa-debug-exit` write stays as the
+/// fallback so `exit` still terminates QEMU (where the device exists but the
+/// firmware's `_S5_` may not be reachable).
 pub fn poweroff() -> ! {
-    // SAFETY: 0xf4 is the isa-debug-exit device port; a write exits QEMU.
+    if let Some(s) = acpi_sleep_info() {
+        // SAFETY: single 16-bit writes to the firmware-declared PM1 control
+        // ports. If ACPI mode is off (legacy BIOS handoff), take ownership via
+        // SMI_CMD first — on a UEFI boot SCI_EN is already set and this is
+        // skipped.
+        unsafe {
+            if s.smi_cmd != 0 && port::inw(s.pm1a_cnt) & crate::acpi::SCI_EN == 0 {
+                port::outb(s.smi_cmd as u16, s.acpi_enable);
+                // Wait, bounded, for the firmware to hand ACPI over.
+                for _ in 0..100_000 {
+                    if port::inw(s.pm1a_cnt) & crate::acpi::SCI_EN != 0 {
+                        break;
+                    }
+                }
+            }
+            let a = (s.slp_typa as u16) << 10 | crate::acpi::SLP_EN;
+            port::outw(s.pm1a_cnt, a);
+            if s.pm1b_cnt != 0 {
+                let b = (s.slp_typb as u16) << 10 | crate::acpi::SLP_EN;
+                port::outw(s.pm1b_cnt, b);
+            }
+        }
+        // The transition is not instantaneous; give it a moment before falling
+        // through to the emulator path.
+        for _ in 0..1_000_000 {
+            core::hint::spin_loop();
+        }
+    }
+    // SAFETY: 0xf4 is QEMU's isa-debug-exit port; harmless on real hardware
+    // (an unclaimed I/O port), and exits the emulator under xtask.
     unsafe { port::outl(0xf4, 0x10) };
     loop {
         hlt();
     }
+}
+
+/// The S5 parameters from the firmware ACPI tables, or `None` if ACPI is not
+/// reachable / the DSDT has no decodable `\_S5_`.
+fn acpi_sleep_info() -> Option<crate::acpi::SleepInfo> {
+    let rsdp = rsdp_address()?;
+    crate::acpi::s5_from_rsdp(rsdp, |phys| paging::phys_to_virt(phys))
+}
+
+/// Locate the ACPI RSDP on x86.
+///
+/// Two sources, both validated by signature rather than trusted: the Limine RSDP
+/// response (whose address is physical on newer revisions and HHDM-virtual on
+/// older ones — so both interpretations are offered), and, failing that, the
+/// legacy BIOS scan of the `0xE0000..0x100000` window, which is where a
+/// non-UEFI boot leaves it.
+fn rsdp_address() -> Option<u64> {
+    let mut cands = [0u64; 3];
+    let mut n = 0;
+    if let Some(r) = crate::RSDP_REQUEST.response() {
+        let a = r.address();
+        cands[n] = a;
+        n += 1;
+        cands[n] = paging::phys_to_virt(a);
+        n += 1;
+    }
+    if let Some(a) = crate::acpi::find_rsdp(&cands[..n]) {
+        return Some(a);
+    }
+    // Legacy scan: the RSDP is 16-byte aligned in the BIOS ROM area.
+    let mut p = 0xE_0000u64;
+    while p < 0x10_0000 {
+        let v = paging::phys_to_virt(p);
+        if crate::acpi::find_rsdp(&[v]).is_some() {
+            return Some(v);
+        }
+        p += 16;
+    }
+    None
 }
 
 /// Reboot the machine. Pulse the 8042 keyboard-controller reset line (port

@@ -510,3 +510,59 @@ impl File {
         }
     }
 }
+
+/// Request the firmware ACPI **RSDP** pointer.
+///
+/// x86 previously had no ACPI at all — PCI config goes through the legacy
+/// `0xCF8/0xCFC` ports, so nothing needed the tables. Real-hardware **shutdown**
+/// does: an ACPI S5 transition needs `PM1a_CNT` out of the FADT (see
+/// [`crate::acpi::s5_from_rsdp`]), and without it `poweroff` can only spin.
+///
+/// NB the pointer's meaning shifted across Limine revisions — older builds hand
+/// back an HHDM-relative virtual address, newer ones a physical address. Callers
+/// must validate the `"RSD PTR "` signature rather than trust either
+/// interpretation; [`crate::acpi::find_rsdp`] does exactly that.
+#[repr(C)]
+pub struct RsdpRequest {
+    magic: [u64; 2],
+    id: [u64; 2],
+    revision: u64,
+    response: UnsafeCell<*const RsdpResponse>,
+}
+
+// SAFETY: as `FramebufferRequest` — one bootloader write before handoff.
+unsafe impl Sync for RsdpRequest {}
+
+impl RsdpRequest {
+    pub const fn new() -> Self {
+        Self {
+            magic: COMMON_MAGIC,
+            id: [0xc5e77b6b397e7b43, 0x27637845accdcf3c],
+            revision: 0,
+            response: UnsafeCell::new(core::ptr::null()),
+        }
+    }
+
+    pub fn response(&self) -> Option<&'static RsdpResponse> {
+        // SAFETY: Limine leaves this null or points it at a 'static response.
+        let ptr = unsafe { self.response.get().read_volatile() };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*ptr })
+        }
+    }
+}
+
+#[repr(C)]
+pub struct RsdpResponse {
+    pub revision: u64,
+    /// The RSDP address — physical or HHDM-virtual depending on Limine revision.
+    pub address: *const u8,
+}
+
+impl RsdpResponse {
+    pub fn address(&self) -> u64 {
+        self.address as u64
+    }
+}

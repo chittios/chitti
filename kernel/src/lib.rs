@@ -20,7 +20,9 @@ pub const VERSION: &str = env!("CHITTI_VERSION");
 /// Build timestamp (release workflows inject the real one; local = "dev").
 pub const BUILD_TIME: &str = env!("CHITTI_BUILD_TIME");
 
-#[cfg(target_arch = "aarch64")]
+// ACPI table parsing is arch-neutral (pure reads over firmware tables) and both
+// arches now need it: aarch64 for the ECAM/UART/GIC bases, x86 for the FADT S5
+// registers a real poweroff requires. It used to be aarch64-only.
 pub mod acpi;
 pub mod agent;
 pub mod agx;
@@ -155,6 +157,14 @@ pub static HHDM_REQUEST: limine_protocol::HhdmRequest = limine_protocol::HhdmReq
 #[used]
 #[link_section = ".requests"]
 pub static MODULE_REQUEST: limine_protocol::ModuleRequest = limine_protocol::ModuleRequest::new();
+
+/// The firmware ACPI RSDP, needed for a real ACPI S5 poweroff on x86 (see
+/// `arch::x86_64::poweroff`). Absent on the aarch64 stub path, which carries the
+/// RSDP in its own boot-info page instead.
+#[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
+#[used]
+#[link_section = ".requests"]
+pub static RSDP_REQUEST: limine_protocol::RsdpRequest = limine_protocol::RsdpRequest::new();
 
 #[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
 #[used]
