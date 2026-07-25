@@ -297,6 +297,29 @@ fn is_pl011(base: u64) -> bool {
 
 /// Discover the console UART base and switch the driver to it. First ACPI SPCR
 /// (via the stub's boot-info RSDP — the firmware-blessed way); then a
+/// Physical address of the ACPI **RSDP**, if firmware gave us one.
+///
+/// Mirrors x86's [`crate::arch::x86_64::rsdp_address`] so an ACPI driver takes the
+/// same argument on both arches instead of reaching into per-arch boot info. The
+/// stub passes it in its boot-info block; the `-kernel` path has none (there is no
+/// UEFI to ask), and a device-tree boot answers `None`, which every caller must
+/// treat as "no ACPI" rather than as an error.
+pub fn rsdp_address() -> Option<u64> {
+    let bi = boot::boot_x1();
+    if bi == 0 {
+        return None;
+    }
+    // SAFETY: `bi` is the stub's identity-mapped boot-info block; the magic check is
+    // what proves it is ours before any further field is read.
+    let magic = unsafe { core::slice::from_raw_parts(bi as *const u8, 8) };
+    if magic != b"CHITTIBI" {
+        return None;
+    }
+    // SAFETY: as above; the RSDP pointer sits at offset 40 of a validated block.
+    let rsdp = unsafe { core::ptr::read_volatile((bi + 40) as *const u64) };
+    (rsdp != 0).then_some(rsdp)
+}
+
 /// PrimeCell-id probe of known PL011 bases (for platforms like VirtualBox that
 /// place the PL011 off QEMU's 0x09000000 and provide no SPCR). Maps the chosen
 /// base's GiB block as Device. A no-op on the `-kernel` path (no boot-info) and

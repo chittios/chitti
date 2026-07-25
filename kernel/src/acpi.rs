@@ -273,6 +273,115 @@ pub fn i2c_resources(dsdt: *const u8) -> alloc::vec::Vec<I2cResource> {
     out
 }
 
+/// A **fixed I/O port range** from a `_CRS` resource template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoPortResource {
+    /// First port in the range.
+    pub base: u16,
+    /// Number of ports.
+    pub len: u8,
+}
+
+/// A **fixed 32-bit memory range** from a `_CRS` resource template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemResource {
+    /// Physical base address.
+    pub base: u32,
+    /// Length in bytes.
+    pub len: u32,
+}
+
+/// Everything this parser understands out of one `_CRS` buffer.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Resources {
+    /// I/O port ranges, **in declaration order** — the order carries meaning: ACPI
+    /// declares the embedded controller's data register first and its command
+    /// register second.
+    pub io: alloc::vec::Vec<IoPortResource>,
+    /// Fixed memory ranges, in declaration order.
+    pub mem: alloc::vec::Vec<MemResource>,
+}
+
+/// Small descriptor: I/O Port (variable range), 7 payload bytes.
+const RES_IO_PORT: u8 = 0x47;
+/// Small descriptor: Fixed Location I/O Port, 3 payload bytes.
+const RES_FIXED_IO: u8 = 0x4b;
+/// Small descriptor: End Tag.
+const RES_END_TAG: u8 = 0x79;
+/// Large descriptor: 32-bit Fixed Memory Range.
+const RES_MEM32_FIXED: u8 = 0x86;
+
+/// Parse a `_CRS` **resource template** into the port and memory ranges it declares.
+///
+/// Walks the descriptor chain properly — each descriptor's own length field decides
+/// where the next one begins — rather than scanning for tag bytes the way
+/// [`i2c_resources`] has to when it only has a raw table. A resource payload can
+/// contain any byte value, so a scan over a known-good template would invent
+/// descriptors out of address bits. Stops at the End Tag, at a truncated descriptor,
+/// or at one whose length runs past the buffer, returning whatever decoded cleanly
+/// before that point. Unknown descriptor types are skipped **by length**, never
+/// guessed at.
+pub fn parse_resources(crs: &[u8]) -> Resources {
+    let mut out = Resources::default();
+    let mut i = 0usize;
+    while i < crs.len() {
+        let tag = crs[i];
+        if tag == RES_END_TAG {
+            break;
+        }
+        if tag & 0x80 == 0 {
+            // Small descriptor: the low 3 bits of the tag are the payload length.
+            let plen = (tag & 0x07) as usize;
+            let end = i + 1 + plen;
+            if end > crs.len() {
+                break;
+            }
+            let p = &crs[i + 1..end];
+            match tag {
+                RES_IO_PORT if plen >= 7 => {
+                    // info, min lo/hi, max lo/hi, align, len. The address is the
+                    // range *minimum*; for the fixed assignments firmware makes for
+                    // an EC, min == max.
+                    out.io.push(IoPortResource {
+                        base: u16::from_le_bytes([p[1], p[2]]),
+                        len: p[6],
+                    });
+                }
+                RES_FIXED_IO if plen >= 3 => {
+                    out.io.push(IoPortResource {
+                        // The descriptor formally carries only 10 valid address bits,
+                        // but firmware writes all 16 and the decoder masks; take it as
+                        // written so a legitimate 0x62 is not mangled.
+                        base: u16::from_le_bytes([p[0], p[1]]),
+                        len: p[2],
+                    });
+                }
+                _ => {}
+            }
+            i = end;
+        } else {
+            // Large descriptor: a 2-byte little-endian length follows the tag.
+            if i + 3 > crs.len() {
+                break;
+            }
+            let plen = u16::from_le_bytes([crs[i + 1], crs[i + 2]]) as usize;
+            let end = i + 3 + plen;
+            if end > crs.len() {
+                break;
+            }
+            let p = &crs[i + 3..end];
+            if tag == RES_MEM32_FIXED && plen >= 9 {
+                out.mem.push(MemResource {
+                    base: u32::from_le_bytes([p[1], p[2], p[3], p[4]]),
+                    len: u32::from_le_bytes([p[5], p[6], p[7], p[8]]),
+                });
+            }
+            i = end;
+        }
+    }
+    out
+}
+
 /// Everything needed to drive an ACPI **S5 (soft-off)** transition.
 ///
 /// The values come from two different tables, which is the awkward part: the
@@ -595,6 +704,75 @@ pub fn uart_from_rsdp(rsdp: u64) -> Option<(u64, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- _CRS resource templates ------------------------------------------
+
+    /// `IO(Decode16, min, max, align, len)` — the descriptor firmware emits for an EC.
+    fn io_desc(min: u16, len: u8) -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec![0x47u8, 0x01];
+        v.extend_from_slice(&min.to_le_bytes());
+        v.extend_from_slice(&min.to_le_bytes()); // max == min for a fixed assignment
+        v.push(0x01); // align
+        v.push(len);
+        v
+    }
+
+    #[test_case]
+    fn parses_the_two_io_ports_of_an_embedded_controller() {
+        // The order is load-bearing: data register first, command register second.
+        let mut crs = io_desc(0x62, 1);
+        crs.extend_from_slice(&io_desc(0x66, 1));
+        crs.extend_from_slice(&[0x79, 0x00]); // End Tag
+        let r = parse_resources(&crs);
+        assert_eq!(r.io.len(), 2);
+        assert_eq!(r.io[0], IoPortResource { base: 0x62, len: 1 });
+        assert_eq!(r.io[1], IoPortResource { base: 0x66, len: 1 });
+        assert!(r.mem.is_empty());
+    }
+
+    #[test_case]
+    fn parses_fixed_io_and_memory32_descriptors() {
+        let mut crs = alloc::vec![0x4bu8, 0x62, 0x00, 0x01]; // FixedIO(0x62, 1)
+        crs.extend_from_slice(&[0x86, 0x09, 0x00, 0x01]); // Memory32Fixed, len 9, rw
+        crs.extend_from_slice(&0xfed0_0000u32.to_le_bytes());
+        crs.extend_from_slice(&0x400u32.to_le_bytes());
+        crs.extend_from_slice(&[0x79, 0x00]);
+        let r = parse_resources(&crs);
+        assert_eq!(r.io, alloc::vec![IoPortResource { base: 0x62, len: 1 }]);
+        assert_eq!(
+            r.mem,
+            alloc::vec![MemResource {
+                base: 0xfed0_0000,
+                len: 0x400
+            }]
+        );
+    }
+
+    #[test_case]
+    fn unknown_descriptors_are_skipped_by_length_not_scanned_past() {
+        // An unknown large descriptor whose payload happens to contain 0x47 must not
+        // be mistaken for an I/O port descriptor — the walk steps over it by length.
+        let mut crs = alloc::vec![0x88u8, 0x06, 0x00]; // unknown large, 6 payload bytes
+        crs.extend_from_slice(&[0x47, 0x01, 0xff, 0xff, 0xff, 0xff]);
+        crs.extend_from_slice(&io_desc(0x62, 1));
+        crs.extend_from_slice(&[0x79, 0x00]);
+        let r = parse_resources(&crs);
+        assert_eq!(r.io, alloc::vec![IoPortResource { base: 0x62, len: 1 }]);
+    }
+
+    #[test_case]
+    fn resource_walk_stops_at_end_tag_and_on_truncation() {
+        // Anything after the End Tag is not a resource.
+        let mut crs = io_desc(0x62, 1);
+        crs.extend_from_slice(&[0x79, 0x00]);
+        crs.extend_from_slice(&io_desc(0x300, 4));
+        assert_eq!(parse_resources(&crs).io.len(), 1);
+
+        // A descriptor cut short yields nothing rather than reading past the buffer.
+        assert!(parse_resources(&[0x47, 0x01, 0x62]).io.is_empty());
+        assert!(parse_resources(&[0x86, 0x09, 0x00, 0x01]).mem.is_empty());
+        assert_eq!(parse_resources(&[]), Resources::default());
+    }
     // --- I2C serial-bus resources ----------------------------------------
 
     /// Build an I2C Serial Bus descriptor for `addr` at `speed`.

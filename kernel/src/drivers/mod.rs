@@ -6,8 +6,11 @@
 //!
 //! - [`i2c`] — Synopsys DesignWare I2C master as Intel ships it in LPSS; the
 //!   controller a modern laptop's HID-over-I2C touchpad hangs off
+//! - [`ec`] — the ACPI embedded controller, which owns a laptop's battery,
+//!   lid and thermal state
 //! - [`wifi`] — Broadcom FullMAC PCIe (brcmfmac-class) on Apple Silicon
 
+pub mod ec;
 pub mod i2c;
 pub mod i2c_hid;
 pub mod wifi;

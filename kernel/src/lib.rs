@@ -219,6 +219,10 @@ pub fn init() {
         // HID-over-I2C touchpad: needs the DSDT (for the I2C address) and mapped
         // MMIO, so it belongs here rather than with the PS/2 init above.
         drivers::i2c_hid::init(rsdp);
+        // The embedded controller: a laptop's battery, lid and thermal state live
+        // behind it, and nothing else can read them. Bounded probe, so a machine
+        // without one costs milliseconds and logs why.
+        drivers::ec::init(rsdp);
     } else {
         ktrace::log("init", "no ACPI RSDP -- scheduler tick stays on the PIT/PIC");
     }
@@ -272,6 +276,12 @@ pub fn init() {
         // Do it before the GIC so its logs reach the discovered console too.
         arch::aarch64::init_uart();
         arch::aarch64::gic::init_bsp();
+    }
+    // Same ACPI devices as x86 gets, from the same code — an SBSA/UEFI machine
+    // describes its embedded controller in the DSDT exactly as a PC does. A
+    // device-tree or `-kernel` boot has no RSDP and simply skips it.
+    if let Some(rsdp) = arch::aarch64::rsdp_address() {
+        drivers::ec::init(rsdp);
     }
     ktrace::log("init", "aarch64 bring-up complete (MMU + heap + scheduler + SMP + GIC armed)");
 }
