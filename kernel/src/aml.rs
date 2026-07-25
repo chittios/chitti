@@ -828,6 +828,170 @@ pub fn eval_device_method(
     eval_method(aml.get(m.body.clone())?, args)
 }
 
+// --- OperationRegion and Field -------------------------------------------
+//
+// A method like `_BST` computes almost nothing: it reads *named fields* that alias
+// hardware. `OperationRegion` declares the window (which address space, where, how
+// big) and `Field` carves named bit-ranges out of it. Parsing both is what turns
+// "evaluate a method" into "read a battery".
+
+/// `OperationRegion` opcode (after [`EXT_OP_PREFIX`]).
+const REGION_OP: u8 = 0x80;
+/// `Field` opcode (after [`EXT_OP_PREFIX`]).
+const FIELD_OP: u8 = 0x81;
+
+/// ACPI address-space identifiers.
+pub const SPACE_SYSTEM_MEMORY: u8 = 0x00;
+pub const SPACE_SYSTEM_IO: u8 = 0x01;
+pub const SPACE_PCI_CONFIG: u8 = 0x02;
+pub const SPACE_EMBEDDED_CONTROL: u8 = 0x03;
+pub const SPACE_SMBUS: u8 = 0x04;
+
+/// An `OperationRegion` declaration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegionNode {
+    pub name: String,
+    /// Address space (`SPACE_*`). Battery fields are almost always
+    /// [`SPACE_EMBEDDED_CONTROL`], which needs an EC driver to actually read.
+    pub space: u8,
+    pub offset: u64,
+    pub length: u64,
+}
+
+/// One named bit-range within a region, from a `Field` declaration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldUnit {
+    pub name: String,
+    /// Name of the `OperationRegion` this field carves up.
+    pub region: String,
+    pub bit_offset: u64,
+    pub bit_width: u64,
+}
+
+impl FieldUnit {
+    /// Byte offset of the field's first bit within its region.
+    pub fn byte_offset(&self) -> u64 {
+        self.bit_offset / 8
+    }
+
+    /// True when the field is byte-aligned and a whole number of bytes — the common
+    /// case, and the only one a simple reader need handle without masking.
+    pub fn is_byte_aligned(&self) -> bool {
+        self.bit_offset % 8 == 0 && self.bit_width % 8 == 0 && self.bit_width > 0
+    }
+}
+
+/// Every `OperationRegion` in `aml`.
+///
+/// The offset and length are `TermArg`s, so they are evaluated — in practice they are
+/// constants, but an expression is handled rather than refused.
+pub fn regions(aml: &[u8]) -> Vec<RegionNode> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 3 < aml.len() {
+        if aml[i] != EXT_OP_PREFIX || aml[i + 1] != REGION_OP {
+            i += 1;
+            continue;
+        }
+        let after = i + 2;
+        let Some((name, used)) = aml.get(after..).and_then(name_string) else {
+            i += 1;
+            continue;
+        };
+        let mut p = after + used;
+        let Some(&space) = aml.get(p) else { break };
+        p += 1;
+        let mut env = Env::with_args(&[]);
+        let Some((off, uo)) = aml.get(p..).and_then(|d| term_arg(d, &mut env, 0)) else {
+            i += 1;
+            continue;
+        };
+        p += uo;
+        let Some((len, ul)) = aml.get(p..).and_then(|d| term_arg(d, &mut env, 0)) else {
+            i += 1;
+            continue;
+        };
+        match (off.as_int(), len.as_int()) {
+            (Some(o), Some(l)) => {
+                out.push(RegionNode { name, space, offset: o, length: l });
+                i = p + ul;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// Every `FieldUnit` declared by every `Field` in `aml`.
+///
+/// A field list is a running bit cursor: each entry advances it by its declared width.
+/// `0x00` introduces a **reserved** (unnamed) span, which still advances the cursor —
+/// skipping that instead of counting it shifts every subsequent field, which is the
+/// mistake that makes a battery report a voltage as a capacity.
+pub fn fields(aml: &[u8]) -> Vec<FieldUnit> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 3 < aml.len() {
+        if aml[i] != EXT_OP_PREFIX || aml[i + 1] != FIELD_OP {
+            i += 1;
+            continue;
+        }
+        let Some((total, lead)) = aml.get(i + 2..).and_then(pkg_length) else {
+            i += 1;
+            continue;
+        };
+        let end = i + 2 + total;
+        if total < lead || end > aml.len() {
+            i += 1;
+            continue;
+        }
+        let Some((region, used)) = aml.get(i + 2 + lead..end).and_then(name_string) else {
+            i += 1;
+            continue;
+        };
+        // FieldFlags byte follows the region name, then the field list.
+        let mut p = i + 2 + lead + used + 1;
+        let mut bit = 0u64;
+        while p < end {
+            match aml[p] {
+                0x00 => {
+                    // ReservedField: advances the cursor without naming anything.
+                    let Some((w, wl)) = aml.get(p + 1..end).and_then(pkg_length) else { break };
+                    bit += w as u64;
+                    p += 1 + wl;
+                }
+                // 0x01 AccessField / 0x02 ConnectField / 0x03 ExtendedAccessField change
+                // access width rather than position. Not modelled, and refused rather
+                // than mis-counted: continuing past one would misplace later fields.
+                0x01 | 0x02 | 0x03 => break,
+                _ => {
+                    let Some(name) = name_seg(aml.get(p..end).unwrap_or(&[])) else { break };
+                    let Some((w, wl)) = aml.get(p + 4..end).and_then(pkg_length) else { break };
+                    out.push(FieldUnit {
+                        name,
+                        region: region.clone(),
+                        bit_offset: bit,
+                        bit_width: w as u64,
+                    });
+                    bit += w as u64;
+                    p += 4 + wl;
+                }
+            }
+        }
+        i = end;
+    }
+    out
+}
+
+/// Find a field by name together with the region it lives in.
+pub fn find_field(aml: &[u8], name: &str) -> Option<(FieldUnit, RegionNode)> {
+    let f = fields(aml).into_iter().find(|f| f.name == name)?;
+    let r = regions(aml)
+        .into_iter()
+        .find(|r| r.name == f.region || r.name.rsplit('.').next() == f.region.rsplit('.').next())?;
+    Some((f, r))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1205,6 +1369,137 @@ mod tests {
             Some(Value::Integer(0x0f))
         );
         assert_eq!(eval_device_method(&aml, tpd, "_BST", &[]), None);
+    }
+
+// --- OperationRegion / Field ------------------------------------------
+
+    /// `OperationRegion(name, space, offset, length)`
+    fn region(name: &str, space: u8, off: u8, len: u8) -> vec::Vec<u8> {
+        let mut v = vec![EXT_OP_PREFIX, REGION_OP];
+        v.extend_from_slice(&seg(name));
+        v.push(space);
+        v.extend_from_slice(&[BYTE_PREFIX, off, BYTE_PREFIX, len]);
+        v
+    }
+
+    /// `Field(region, ...) { entries }` where entries are already encoded.
+    fn field(region_name: &str, entries: &[u8]) -> vec::Vec<u8> {
+        let mut inner = seg(region_name);
+        inner.push(0); // FieldFlags
+        inner.extend_from_slice(entries);
+        let mut v = vec![EXT_OP_PREFIX, FIELD_OP];
+        v.extend_from_slice(&pkglen(inner.len()));
+        v.extend_from_slice(&inner);
+        v
+    }
+
+    /// A named field of `bits` width.
+    fn fld(name: &str, bits: u8) -> vec::Vec<u8> {
+        let mut v = seg(name);
+        v.push(bits);
+        v
+    }
+
+    /// A reserved (unnamed) span of `bits`.
+    fn reserved(bits: u8) -> vec::Vec<u8> {
+        vec![0x00, bits]
+    }
+
+    #[test_case]
+    fn parses_an_embedded_control_region() {
+        // Battery fields live in an EmbeddedControl region — the space that will need
+        // the EC driver.
+        let aml = region("ECR_", SPACE_EMBEDDED_CONTROL, 0x00, 0xff);
+        let rs = regions(&aml);
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs[0].name, "ECR");
+        assert_eq!(rs[0].space, SPACE_EMBEDDED_CONTROL);
+        assert_eq!((rs[0].offset, rs[0].length), (0, 0xff));
+    }
+
+    #[test_case]
+    fn field_offsets_accumulate_across_entries() {
+        // Each entry advances a running bit cursor; this is the arithmetic that decides
+        // which byte a battery capacity is read from.
+        let mut entries = fld("BST0", 8);
+        entries.extend_from_slice(&fld("BST1", 8));
+        entries.extend_from_slice(&fld("BST2", 16));
+        let mut aml = region("ECR_", SPACE_EMBEDDED_CONTROL, 0, 0xff);
+        aml.extend_from_slice(&field("ECR_", &entries));
+        let fs = fields(&aml);
+        assert_eq!(fs.len(), 3);
+        assert_eq!((fs[0].bit_offset, fs[0].bit_width), (0, 8));
+        assert_eq!((fs[1].bit_offset, fs[1].bit_width), (8, 8));
+        assert_eq!((fs[2].bit_offset, fs[2].bit_width), (16, 16));
+        assert_eq!(fs[2].byte_offset(), 2);
+        assert!(fs.iter().all(|f| f.region == "ECR"));
+    }
+
+    #[test_case]
+    fn reserved_spans_advance_the_cursor() {
+        // The bug this guards: a reserved span must be *counted*, not skipped. Ignoring
+        // it shifts every later field, which is how a battery reports a voltage as a
+        // capacity.
+        let mut entries = fld("AAAA", 8);
+        entries.extend_from_slice(&reserved(16));
+        entries.extend_from_slice(&fld("BBBB", 8));
+        let mut aml = region("ECR_", SPACE_EMBEDDED_CONTROL, 0, 0xff);
+        aml.extend_from_slice(&field("ECR_", &entries));
+        let fs = fields(&aml);
+        assert_eq!(fs.len(), 2, "reserved span was emitted as a named field");
+        assert_eq!(fs[1].name, "BBBB");
+        assert_eq!(fs[1].bit_offset, 24, "reserved span did not advance the cursor");
+        assert_eq!(fs[1].byte_offset(), 3);
+    }
+
+    #[test_case]
+    fn byte_alignment_is_reported_honestly() {
+        // A sub-byte field needs masking; a reader that assumes byte alignment would
+        // return neighbouring bits.
+        let mut entries = fld("BITA", 1);
+        entries.extend_from_slice(&fld("BITB", 7));
+        entries.extend_from_slice(&fld("BYTE", 8));
+        let mut aml = region("ECR_", SPACE_SYSTEM_IO, 0, 0x10);
+        aml.extend_from_slice(&field("ECR_", &entries));
+        let fs = fields(&aml);
+        assert!(!fs[0].is_byte_aligned()); // 1 bit at offset 0
+        assert!(!fs[1].is_byte_aligned()); // 7 bits at offset 1
+        assert!(fs[2].is_byte_aligned()); // 8 bits at offset 8
+    }
+
+    #[test_case]
+    fn access_field_entries_stop_the_walk_rather_than_shifting_offsets() {
+        // AccessField changes access width, not position. It is not modelled, so the
+        // walk stops: continuing past one would misplace every later field, and a
+        // wrong offset is worse than a missing field.
+        let mut entries = fld("AAAA", 8);
+        entries.extend_from_slice(&[0x01, 0x40, 0x00]); // AccessField
+        entries.extend_from_slice(&fld("BBBB", 8));
+        let mut aml = region("ECR_", SPACE_EMBEDDED_CONTROL, 0, 0xff);
+        aml.extend_from_slice(&field("ECR_", &entries));
+        let fs = fields(&aml);
+        assert_eq!(fs.len(), 1, "walk continued past an unmodelled AccessField");
+        assert_eq!(fs[0].name, "AAAA");
+    }
+
+    #[test_case]
+    fn find_field_pairs_a_field_with_its_region() {
+        let mut aml = region("ECR_", SPACE_EMBEDDED_CONTROL, 0x20, 0xff);
+        aml.extend_from_slice(&field("ECR_", &fld("BCAP", 16)));
+        let (f, r) = find_field(&aml, "BCAP").unwrap();
+        assert_eq!(f.bit_width, 16);
+        assert_eq!(r.space, SPACE_EMBEDDED_CONTROL);
+        assert_eq!(r.offset, 0x20);
+        assert!(find_field(&aml, "NOPE").is_none());
+    }
+
+    #[test_case]
+    fn malformed_regions_and_fields_are_skipped() {
+        assert!(regions(&[]).is_empty());
+        assert!(fields(&[]).is_empty());
+        assert!(regions(&[EXT_OP_PREFIX, REGION_OP]).is_empty());
+        // A Field whose declared length exceeds the buffer must not be followed.
+        assert!(fields(&[EXT_OP_PREFIX, FIELD_OP, 0x7f, b'E', b'C', b'R', b'_']).is_empty());
     }
 
     #[test_case]
