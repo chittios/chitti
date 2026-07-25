@@ -24,6 +24,7 @@ pub const BUILD_TIME: &str = env!("CHITTI_BUILD_TIME");
 // arches now need it: aarch64 for the ECAM/UART/GIC bases, x86 for the FADT S5
 // registers a real poweroff requires. It used to be aarch64-only.
 pub mod acpi;
+pub mod aml;
 pub mod agent;
 pub mod agx;
 pub mod arch;
