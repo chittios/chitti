@@ -453,6 +453,7 @@ pub fn render_html(html_src: &str, vw: i32, vh: i32, scroll_y: i32) -> Frame {
         progress_bottom: false,
         scrollbar: lay.content_height > vh,
         hover_link: hover_link(),
+        selection: alloc::vec::Vec::new(),
     };
     let pixels = paint::paint_chrome(&lay, sy, chrome);
     Frame {
@@ -478,13 +479,29 @@ pub fn paint_layout_chrome(
     scroll_y: i32,
     progress: Option<u8>,
 ) -> (Vec<u32>, i32) {
+    paint_layout_chrome_sel(lay, vh, scroll_y, progress, None)
+}
+
+/// Paint with optional load progress and an active text selection
+/// (`anchor`/`head` carets into `lay.runs` — half-open when ordered).
+pub fn paint_layout_chrome_sel(
+    lay: &layout::Layout,
+    vh: i32,
+    scroll_y: i32,
+    progress: Option<u8>,
+    sel: Option<(layout::TextPos, layout::TextPos)>,
+) -> (Vec<u32>, i32) {
     let max_scroll = (lay.content_height - vh).max(0);
     let sy = scroll_y.clamp(0, max_scroll);
+    let selection = sel
+        .map(|(a, b)| layout::selection_rects(lay, a, b))
+        .unwrap_or_default();
     let chrome = paint::Chrome {
         progress,
         progress_bottom: false,
         scrollbar: lay.content_height > vh,
         hover_link: hover_link(),
+        selection,
     };
     (paint::paint_chrome(lay, sy, chrome), lay.content_height)
 }

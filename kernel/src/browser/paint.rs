@@ -8,7 +8,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 /// Optional chrome overlaid after content paint.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Chrome {
     /// 0..=100 loading progress; `None` = hide bar.
     pub progress: Option<u8>,
@@ -19,6 +19,9 @@ pub struct Chrome {
     /// Content-space `(x, y, w, h)` of the link currently under the cursor —
     /// its runs get a hover underline (CSS `a:hover { text-decoration: underline }`).
     pub hover_link: Option<(i32, i32, i32, i32)>,
+    /// Text selection highlight rects in **content** space (pre-scroll), painted
+    /// under glyphs so drag-to-copy is visible.
+    pub selection: alloc::vec::Vec<(i32, i32, i32, i32)>,
 }
 
 /// Paint `layout` into a `width * height` RGB buffer, scrolled by `scroll_y`.
@@ -148,6 +151,16 @@ pub fn paint_chrome(layout: &Layout, scroll_y: i32, chrome: Chrome) -> Vec<u32> 
     // Form controls.
     for c in &layout.controls {
         paint_control(&mut buf, w, h, c, scroll_y, layout.height);
+    }
+
+    // Text selection highlight (under glyphs, terracotta-tinted like chat).
+    const SEL_BG: u32 = 0xc4_9a_84; // warm selection, readable on cream/white
+    for &(sx, sy, sw, sh) in &chrome.selection {
+        let y0 = sy - scroll_y;
+        if y0 + sh < 0 || y0 >= layout.height || sw <= 0 || sh <= 0 {
+            continue;
+        }
+        fill_rect(&mut buf, w, h, sx, y0, sw, sh, SEL_BG);
     }
 
     // Text runs (baseline-correct TTF).
@@ -1144,6 +1157,7 @@ mod tests {
             progress_bottom: false,
             scrollbar: true,
             hover_link: None,
+            selection: alloc::vec::Vec::new(),
         };
         let buf = paint_chrome(&lay, 0, chrome);
         assert_eq!(buf.len(), 320 * 200);

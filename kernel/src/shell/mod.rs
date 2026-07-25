@@ -7402,21 +7402,12 @@ fn ui_tick() {
                     // present size — 640×400 browser, 256×192 chess, …).
                     if let Some((sid, sx, sy)) = crate::framebuffer::surface_hit(t.x, t.y) {
                         if sid == BROWSER_SURFACE || sid == crate::framebuffer::BROWSER_SURFACE {
-                            if browser_loaded() {
-                                crate::browser::events::EVENT_LOOP.with(|el| {
-                                    el.queue_ui_click(
-                                        crate::browser::events::TARGET_DOCUMENT,
-                                        sx as i32,
-                                        sy as i32,
-                                    );
-                                    el.drain(16);
-                                });
-                                let out = browser_click(sx as i32, sy as i32);
-                                if out.starts_with("ok:") && out.contains("http") {
-                                    serial_println!("browser> followed link → {}", out);
-                                } else if !out.starts_with("ok:no link") {
-                                    serial_println!("browser> {}", out);
-                                }
+                            if browser_loaded() && !browser_is_loading() {
+                                // Begin text selection; navigation happens on
+                                // release only if the pointer didn't drag
+                                // (same model as chat: drag = copy, click = activate).
+                                crate::framebuffer::chat_sel_clear();
+                                browser_sel_begin(sx as i32, sy as i32);
                             }
                         } else if crate::service::package_ui::owns_surface(sid) {
                             // A package-UI app (chess/mines/paint/…): queue the
@@ -7429,6 +7420,8 @@ fn ui_tick() {
                     }
                 } else {
                     // Press in the chat pane anchors a mouse text selection.
+                    BROWSER_SEL.with(|s| *s = None);
+                    BROWSER_SEL_DRAG.store(false, Ordering::Relaxed);
                     crate::framebuffer::chat_sel_begin(t.x, t.y);
                 }
             } else {
@@ -7436,12 +7429,16 @@ fn ui_tick() {
             }
         }
         // Drag: resize the split if the divider was grabbed, else extend the
-        // chat selection (release copies it; paste back with Ctrl+V).
+        // browser or chat selection (release copies it; paste with Ctrl+V).
         if t.left && t.moved {
             if DIVIDER_DRAG.load(Ordering::Relaxed) {
                 crate::framebuffer::set_divider_x(t.x);
                 // Live-resize: re-letterbox video/image into the new action pane.
                 repaint_active_tab();
+            } else if BROWSER_SEL_DRAG.load(Ordering::Relaxed) {
+                if let Some((_sid, sx, sy)) = crate::framebuffer::surface_hit(t.x, t.y) {
+                    browser_sel_drag(sx as i32, sy as i32);
+                }
             } else {
                 crate::framebuffer::chat_sel_drag(t.x, t.y);
             }
@@ -7450,6 +7447,38 @@ fn ui_tick() {
             if DIVIDER_DRAG.swap(false, Ordering::Relaxed) {
                 save_panes_config();
                 repaint_active_tab();
+            } else if BROWSER_SEL_DRAG.swap(false, Ordering::Relaxed) {
+                // Browser: copy if the user dragged a range; else treat as click.
+                match browser_sel_end() {
+                    Some(text) => {
+                        let n = text.len();
+                        crate::clipboard::set(text, false);
+                        serial_println!("browser> copied {n} byte(s) (Ctrl+V to paste)");
+                    }
+                    None => {
+                        // Plain click — follow links / focus controls.
+                        if let Some((sid, sx, sy)) = crate::framebuffer::surface_hit(t.x, t.y) {
+                            if sid == BROWSER_SURFACE || sid == crate::framebuffer::BROWSER_SURFACE {
+                                if browser_loaded() {
+                                    crate::browser::events::EVENT_LOOP.with(|el| {
+                                        el.queue_ui_click(
+                                            crate::browser::events::TARGET_DOCUMENT,
+                                            sx as i32,
+                                            sy as i32,
+                                        );
+                                        el.drain(16);
+                                    });
+                                    let out = browser_click(sx as i32, sy as i32);
+                                    if out.starts_with("ok:") && out.contains("http") {
+                                        serial_println!("browser> followed link → {}", out);
+                                    } else if !out.starts_with("ok:no link") {
+                                        serial_println!("browser> {}", out);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             } else {
                 // Capture the clicked line before chat_sel_end clears it.
                 let click_gi = crate::framebuffer::chat_click_gi();
@@ -7586,6 +7615,8 @@ fn close_active_tab() {
             BROWSER.with(|s| *s = None);
             BROWSER_LAYOUT.with(|s| *s = None);
             BROWSER_PRESENT.with(|s| *s = None);
+            BROWSER_SEL.with(|s| *s = None);
+            BROWSER_SEL_DRAG.store(false, core::sync::atomic::Ordering::Relaxed);
             BROWSER_LOADING.store(false, core::sync::atomic::Ordering::Relaxed);
             crate::framebuffer::close_action();
         }
@@ -8197,6 +8228,119 @@ struct BrowserPresentCache {
 static BROWSER_PRESENT: crate::mm::Locked<Option<BrowserPresentCache>> =
     crate::mm::Locked::new(None);
 
+/// Active drag-to-select in the browser surface (chat pane has its own `textsel`).
+/// Press anchors; drag extends; release with a real range copies via OSC 52.
+struct BrowserTextSel {
+    anchor: crate::browser::layout::TextPos,
+    head: crate::browser::layout::TextPos,
+    press_sx: i32,
+    press_sy: i32,
+    /// True once the pointer moved past a small threshold (else release = click).
+    moved: bool,
+}
+static BROWSER_SEL: crate::mm::Locked<Option<BrowserTextSel>> = crate::mm::Locked::new(None);
+/// True while LMB is down after a press that began a browser selection.
+static BROWSER_SEL_DRAG: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+fn browser_sel_range() -> Option<(crate::browser::layout::TextPos, crate::browser::layout::TextPos)> {
+    BROWSER_SEL.with(|s| s.as_ref().map(|x| (x.anchor, x.head)))
+}
+
+fn browser_sel_clear() {
+    let had = BROWSER_SEL.with(|s| s.take()).is_some();
+    BROWSER_SEL_DRAG.store(false, core::sync::atomic::Ordering::Relaxed);
+    if had && browser_loaded() && !browser_is_loading() {
+        let _ = browser_repaint();
+    }
+}
+
+/// Anchor a selection at content point under surface `(sx, sy)`.
+fn browser_sel_begin(sx: i32, sy: i32) {
+    let scroll = BROWSER.with(|s| s.as_ref().map(|b| b.scroll_y).unwrap_or(0));
+    let content_y = sy + scroll;
+    let pos = BROWSER_LAYOUT.with(|slot| {
+        slot.as_ref()
+            .and_then(|lay| crate::browser::layout::text_pos_at(lay, sx, content_y))
+    });
+    BROWSER_SEL.with(|s| {
+        *s = pos.map(|p| BrowserTextSel {
+            anchor: p,
+            head: p,
+            press_sx: sx,
+            press_sy: sy,
+            moved: false,
+        });
+    });
+    BROWSER_SEL_DRAG.store(true, core::sync::atomic::Ordering::Relaxed);
+    // Clear a prior highlight if any (repaint only when we had a range).
+    let _ = browser_repaint();
+}
+
+/// Extend the selection head to surface `(sx, sy)`.
+fn browser_sel_drag(sx: i32, sy: i32) {
+    let scroll = BROWSER.with(|s| s.as_ref().map(|b| b.scroll_y).unwrap_or(0));
+    let content_y = sy + scroll;
+    let pos = BROWSER_LAYOUT.with(|slot| {
+        slot.as_ref()
+            .and_then(|lay| crate::browser::layout::text_pos_at(lay, sx, content_y))
+    });
+    let Some(head) = pos else {
+        return;
+    };
+    let changed = BROWSER_SEL.with(|s| {
+        let Some(sel) = s.as_mut() else {
+            return false;
+        };
+        let dx = (sx - sel.press_sx).abs();
+        let dy = (sy - sel.press_sy).abs();
+        if dx > 3 || dy > 3 {
+            sel.moved = true;
+        }
+        if sel.head != head {
+            sel.head = head;
+            true
+        } else {
+            false
+        }
+    });
+    if changed {
+        let _ = browser_repaint();
+    }
+}
+
+/// Finish browser selection on mouse release.
+/// - Dragged range → `Some(text)` for clipboard (highlight kept).
+/// - Plain click → clear highlight, return `None` so the caller fires `browser_click`.
+fn browser_sel_end() -> Option<alloc::string::String> {
+    let (anchor, head, moved) = BROWSER_SEL.with(|s| {
+        s.as_ref()
+            .map(|x| (x.anchor, x.head, x.moved))
+            .unwrap_or((
+                crate::browser::layout::TextPos { run: 0, col: 0 },
+                crate::browser::layout::TextPos { run: 0, col: 0 },
+                false,
+            ))
+    });
+    if !moved || anchor == head {
+        BROWSER_SEL.with(|s| *s = None);
+        let _ = browser_repaint();
+        return None;
+    }
+    let text = BROWSER_LAYOUT.with(|slot| {
+        slot.as_ref()
+            .map(|lay| crate::browser::layout::selection_text(lay, anchor, head))
+            .unwrap_or_default()
+    });
+    if text.is_empty() {
+        BROWSER_SEL.with(|s| *s = None);
+        let _ = browser_repaint();
+        return None;
+    }
+    // Keep highlight visible until the next press (like chat).
+    Some(text)
+}
+
 /// Host entry for browser tools (`ToolBinding::Browser`).
 pub(crate) fn run_browser_tool(name: &str, args_json: &str) -> alloc::string::String {
     use crate::session::todo::json_str;
@@ -8277,6 +8421,9 @@ fn browser_begin_load() {
     // Drop the previous page's present cache so a mid-load `repaint_active_tab`
     // can't re-blit old pixels. The next `browser_present` will refill it.
     BROWSER_PRESENT.with(|s| *s = None);
+    // Selection indices are layout-relative — clear on navigation.
+    BROWSER_SEL.with(|s| *s = None);
+    BROWSER_SEL_DRAG.store(false, core::sync::atomic::Ordering::Relaxed);
 }
 
 fn browser_load(url: &str, push_hist: bool) -> alloc::string::String {
@@ -9268,8 +9415,9 @@ fn browser_repaint() -> alloc::string::String {
         return alloc::string::String::from("error: no page open (browser_open first)");
     };
     let progress = browser_progress_opt();
+    let sel = browser_sel_range();
     let (pixels, content_h) =
-        crate::browser::paint_layout_chrome(&lay, browser_vh(), scroll, progress);
+        crate::browser::paint_layout_chrome_sel(&lay, browser_vh(), scroll, progress, sel);
     BROWSER.with(|s| {
         if let Some(b) = s.as_mut() {
             b.content_height = content_h;
@@ -9623,8 +9771,9 @@ fn browser_repaint_hover() {
         return;
     }
     let progress = browser_progress_opt();
+    let sel = browser_sel_range();
     let (pixels, content_h) =
-        crate::browser::paint_layout_chrome(&lay, browser_vh(), scroll, progress);
+        crate::browser::paint_layout_chrome_sel(&lay, browser_vh(), scroll, progress, sel);
     BROWSER.with(|s| {
         if let Some(b) = s.as_mut() {
             b.content_height = content_h;

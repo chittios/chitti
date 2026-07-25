@@ -3139,6 +3139,183 @@ fn emit_text(
     }
 }
 
+/// Caret / selection endpoint into [`Layout::runs`]: run index + UTF-8 char
+/// offset (0..=len). Half-open selection `[anchor, head)` when ordered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TextPos {
+    pub run: usize,
+    pub col: usize,
+}
+
+fn run_line_h(run: &TextRun) -> i32 {
+    (crate::font_ttf::line_height(run.font_size.max(8) as f32) + 0.5) as i32
+}
+
+/// Pixel x of the caret before the `col`-th character of `run`.
+fn run_caret_x(run: &TextRun, col: usize) -> i32 {
+    let px = run.font_size.max(8) as f32;
+    let mut pen = run.x;
+    for (i, ch) in run.text.chars().enumerate() {
+        if i >= col {
+            break;
+        }
+        let mut b = [0u8; 4];
+        let s = ch.encode_utf8(&mut b);
+        let w = (crate::font_ttf::measure(s, px) + 0.5) as i32;
+        pen += w.max(1) + run.letter_spacing;
+    }
+    pen
+}
+
+fn run_end_x(run: &TextRun) -> i32 {
+    run_caret_x(run, run.text.chars().count())
+}
+
+/// Char index (caret) in `run` closest to pixel `x`.
+fn run_col_at_x(run: &TextRun, x: i32) -> usize {
+    let px = run.font_size.max(8) as f32;
+    let mut pen = run.x;
+    let mut col = 0usize;
+    for ch in run.text.chars() {
+        let mut b = [0u8; 4];
+        let s = ch.encode_utf8(&mut b);
+        let w = (crate::font_ttf::measure(s, px) + 0.5) as i32;
+        let mid = pen + w.max(1) / 2;
+        if x < mid {
+            return col;
+        }
+        pen += w.max(1) + run.letter_spacing;
+        col += 1;
+    }
+    col
+}
+
+/// Map a content-space point to the nearest text caret in `layout.runs`.
+/// Used for drag-to-select in the browser surface.
+pub fn text_pos_at(layout: &Layout, x: i32, y: i32) -> Option<TextPos> {
+    if layout.runs.is_empty() {
+        return None;
+    }
+    let mut best: Option<(i32, TextPos)> = None;
+    for (ri, run) in layout.runs.iter().enumerate() {
+        if run.text.is_empty() {
+            continue;
+        }
+        let lh = run_line_h(run).max(1);
+        let end_x = run_end_x(run);
+        let dy = if y < run.y {
+            run.y - y
+        } else if y >= run.y + lh {
+            y - (run.y + lh - 1)
+        } else {
+            0
+        };
+        let dx = if x < run.x {
+            run.x - x
+        } else if x > end_x {
+            x - end_x
+        } else {
+            0
+        };
+        // Prefer vertically matching runs heavily so a click on a line picks it.
+        let dist = dx + dy * 8;
+        let col = run_col_at_x(run, x);
+        let cand = TextPos { run: ri, col };
+        if best.map(|(d, _)| dist < d).unwrap_or(true) {
+            best = Some((dist, cand));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Order selection endpoints so `a <= b` in document order.
+pub fn normalize_text_pos(a: TextPos, b: TextPos) -> (TextPos, TextPos) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Extract selected plain text between carets `a` and `b` (any order, half-open).
+/// Inserts `\n` when consecutive selected runs sit on different lines.
+pub fn selection_text(layout: &Layout, a: TextPos, b: TextPos) -> String {
+    let (a, b) = normalize_text_pos(a, b);
+    if a == b {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut prev_y: Option<i32> = None;
+    for ri in a.run..=b.run {
+        let Some(run) = layout.runs.get(ri) else {
+            break;
+        };
+        let n = run.text.chars().count();
+        let lo = if ri == a.run { a.col.min(n) } else { 0 };
+        let hi = if ri == b.run { b.col.min(n) } else { n };
+        if lo >= hi {
+            continue;
+        }
+        if let Some(py) = prev_y {
+            if (run.y - py).abs() > 2 {
+                out.push('\n');
+            }
+        }
+        for (i, ch) in run.text.chars().enumerate() {
+            if i >= lo && i < hi {
+                out.push(ch);
+            }
+        }
+        prev_y = Some(run.y);
+    }
+    out
+}
+
+/// Highlight rectangles (content space) covering the selection, for paint.
+/// Each is `(x, y, w, h)` over a partial or full run.
+pub fn selection_rects(layout: &Layout, a: TextPos, b: TextPos) -> Vec<(i32, i32, i32, i32)> {
+    let (a, b) = normalize_text_pos(a, b);
+    if a == b {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for ri in a.run..=b.run {
+        let Some(run) = layout.runs.get(ri) else {
+            break;
+        };
+        let n = run.text.chars().count();
+        let lo = if ri == a.run { a.col.min(n) } else { 0 };
+        let hi = if ri == b.run { b.col.min(n) } else { n };
+        if lo >= hi {
+            continue;
+        }
+        let x0 = run_caret_x(run, lo);
+        let x1 = run_caret_x(run, hi);
+        let h = run_line_h(run).max(1);
+        let w = (x1 - x0).max(1);
+        out.push((x0, run.y, w, h));
+    }
+    out
+}
+
+/// True if `(x,y)` is over a text run (I-beam affordance).
+pub fn text_at(layout: &Layout, x: i32, y: i32) -> bool {
+    for run in &layout.runs {
+        if run.text.is_empty() {
+            continue;
+        }
+        let lh = run_line_h(run);
+        if y < run.y || y >= run.y + lh {
+            continue;
+        }
+        let end_x = run_end_x(run);
+        if x >= run.x && x < end_x.max(run.x + 1) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Link-only hit test (back-compat). Prefer [`hit_test_ex`].
 pub fn hit_test(layout: &Layout, x: i32, y: i32) -> Option<String> {
     match hit_test_ex(layout, x, y) {
@@ -3220,7 +3397,13 @@ pub fn cursor_at(layout: &Layout, x: i32, y: i32) -> CursorKind {
                 CursorKind::Default
             }
         }
-        Hit::Page => CursorKind::Default,
+        Hit::Page => {
+            if text_at(layout, x, y) {
+                CursorKind::Text
+            } else {
+                CursorKind::Default
+            }
+        }
     }
 }
 
@@ -3601,6 +3784,38 @@ mod tests {
             story.x,
             cream.x
         );
+    }
+
+    #[test_case]
+    fn text_selection_extracts_and_orders() {
+        let doc = html::parse(
+            r#"<html><body><p>Hello World</p><p>Second</p></body></html>"#,
+        );
+        let sheet = Stylesheet::parse("");
+        let lay = layout_document(&doc.root, &sheet, 400, 200);
+        assert!(!lay.runs.is_empty(), "expected text runs");
+        // Select from start of first run into the next line.
+        let a = TextPos { run: 0, col: 0 };
+        let last = lay.runs.len() - 1;
+        let b = TextPos {
+            run: last,
+            col: lay.runs[last].text.chars().count(),
+        };
+        let t = selection_text(&lay, a, b);
+        assert!(t.contains("Hello"), "got {t:?}");
+        assert!(t.contains("Second") || t.contains("World"), "got {t:?}");
+        // Reversed endpoints yield the same text.
+        assert_eq!(selection_text(&lay, b, a), t);
+        // Empty when carets equal.
+        assert!(selection_text(&lay, a, a).is_empty());
+        // text_pos_at over first run's origin lands near start.
+        let r0 = &lay.runs[0];
+        let p = text_pos_at(&lay, r0.x + 1, r0.y + 2).expect("pos");
+        assert_eq!(p.run, 0);
+        assert!(p.col <= 2, "col near start, got {}", p.col);
+        // Highlight rects non-empty for a real range.
+        let mid = TextPos { run: 0, col: 5.min(r0.text.chars().count()) };
+        assert!(!selection_rects(&lay, a, mid).is_empty());
     }
 
     #[test_case]
