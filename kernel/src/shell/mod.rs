@@ -7814,7 +7814,16 @@ fn update_composer_hint(_remote_on: bool, _remote_cfg: Option<&remote::RemoteCon
 /// exactly the class of action the permission modal exists for.
 fn run_suspend(arg: &str) {
     let plan = crate::power::plan();
-    let planning = matches!(arg.trim(), "plan" | "status" | "info" | "");
+    let a = arg.trim();
+    // `--yes` skips the modal, the same escape hatch `/agents install` has, so the e2e
+    // harness can drive a real suspend over serial. Human-typed input still confirms.
+    let assume_yes = a.split_whitespace().any(|w| w == "--yes" || w == "-y");
+    let a = a
+        .split_whitespace()
+        .filter(|w| *w != "--yes" && *w != "-y")
+        .next()
+        .unwrap_or("");
+    let planning = matches!(a, "plan" | "status" | "info" | "");
     for line in &plan.report {
         serial_println!("suspend> {line}");
     }
@@ -7827,7 +7836,7 @@ fn run_suspend(arg: &str) {
         None => serial_println!("suspend> this machine cannot suspend"),
     }
     if planning {
-        serial_println!("suspend> `/suspend now` to actually suspend");
+        serial_println!("suspend> `/suspend now` to actually suspend (`--yes` skips the prompt)");
         return;
     }
     if !plan.ready {
@@ -7835,11 +7844,13 @@ fn run_suspend(arg: &str) {
         return;
     }
     #[cfg(not(test))]
-    if !crate::modal::confirm(
+    if !assume_yes
+        && !crate::modal::confirm(
         "Suspend the machine?",
         "The machine will sleep. If it does not resume, unsaved state is lost and \
          the only way back is holding the power button.",
-    ) {
+        )
+    {
         serial_println!("suspend> cancelled");
         return;
     }

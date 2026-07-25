@@ -91,6 +91,15 @@ fn zero_table(table: &mut PageTable) {
     }
 }
 
+/// The active page-table root.
+///
+/// Public because the S3 resume path has to save it before firmware destroys `CR3` and
+/// put it back afterwards — and it must be the *same* value the kernel is running on,
+/// not a re-derived one.
+pub fn active_cr3() -> u64 {
+    read_cr3()
+}
+
 fn read_cr3() -> u64 {
     let v: u64;
     // SAFETY: reading CR3 has no side effects.

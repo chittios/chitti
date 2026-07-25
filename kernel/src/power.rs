@@ -228,8 +228,52 @@ fn probe() -> Plan {
 
 /// Perform the transition. Split from [`probe`] so the read-only path can never
 /// accidentally enter it.
+#[cfg(target_arch = "x86_64")]
+fn enter() -> Result<(), String> {
+    let rsdp = crate::arch::x86_64::rsdp_address().ok_or_else(|| String::from("no RSDP"))?;
+    let sleep = crate::acpi::sleep_from_rsdp(rsdp, 3, |phys| crate::mm::map_mmio(phys, 0x4_0000))
+        .ok_or_else(|| String::from("no \\_S3 package"))?;
+    let facs = crate::acpi::facs_from_rsdp(rsdp, crate::mm::map_mmio)
+        .ok_or_else(|| String::from("no FACS"))?;
+    crate::arch::x86_64::suspend::suspend(&sleep, &facs).map_err(String::from)?;
+    resume_devices();
+    Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 fn enter() -> Result<(), String> {
     Err(String::from(
-        "the transition itself is not wired up yet -- `/suspend plan` reports what this machine can do",
+        "the transition is implemented for ACPI S3 on x86; PSCI SYSTEM_SUSPEND is next",
     ))
+}
+
+/// Put back the device state firmware destroyed.
+///
+/// Deliberately minimal and explicit rather than a general "re-init everything": each
+/// call here is something the machine visibly loses across S3, and each is bounded. A
+/// broad re-probe would be slower *and* riskier — resume is not a good moment to
+/// discover a driver's init path is not idempotent.
+///
+/// What is **not** restored yet is honestly incomplete: the NIC, xHCI, AHCI/NVMe and the
+/// sound device all lose their controller state, and a follow-up gives each driver a
+/// `resume` of its own. Until then a resumed machine has a working console and scheduler
+/// but may need `/network dhcp` to get back on the network.
+fn resume_devices() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::arch::x86_64;
+        // The local APIC loses its software-enable and its timer; without this the
+        // scheduler silently stops preempting, which looks like a machine that resumed
+        // but hangs on the first long operation.
+        x86_64::apic::software_enable();
+        if let Some(rsdp) = x86_64::rsdp_address() {
+            x86_64::pit::try_apic_timer(rsdp);
+        }
+        // The i8042 controller comes back with its configuration byte reset, so a
+        // keyboard that worked before suspend types nothing after it.
+        x86_64::keyboard::init();
+        // The trampoline resumed with interrupts masked.
+        x86_64::interrupts::enable();
+        crate::ktrace::log("resume", "APIC timer, i8042 and interrupts re-armed");
+    }
 }

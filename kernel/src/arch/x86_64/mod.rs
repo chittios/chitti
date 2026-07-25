@@ -19,6 +19,7 @@ pub mod paging;
 pub mod pci;
 pub mod pic;
 pub mod pit;
+pub mod suspend;
 pub mod port;
 pub mod rtc;
 pub mod xhci;
