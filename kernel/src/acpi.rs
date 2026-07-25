@@ -137,6 +137,102 @@ pub fn hpet_from_rsdp(rsdp: u64) -> Option<u64> {
     Some(base)
 }
 
+/// An **I2C serial-bus connection** described by an ACPI resource descriptor.
+///
+/// This is how an I2C-attached device — notably a HID-over-I2C touchpad — is
+/// located. Such a device cannot be probed for: unlike PCI it has no enumerable
+/// identity, so its bus and 7-bit address come from its `_CRS`. Blind-scanning a
+/// laptop's I2C bus is not an acceptable substitute, because the same controller
+/// commonly hosts the embedded controller and the USB-C PD controller, and writing
+/// to the wrong address can misconfigure real hardware.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct I2cResource {
+    /// 7-bit (or 10-bit) target address.
+    pub address: u16,
+    /// Bus speed in Hz, as declared (typically 100_000 or 400_000).
+    pub speed_hz: u32,
+    /// True when the descriptor marks this device as the *controller* rather than
+    /// the target; such an entry does not describe something we can talk to.
+    pub controller_mode: bool,
+}
+
+/// ACPI large-resource tag for a Serial Bus connection.
+const RES_SERIAL_BUS: u8 = 0x8e;
+/// Serial-bus type 1 = I2C (2 = SPI, 3 = UART).
+const SERIAL_BUS_I2C: u8 = 0x01;
+
+/// Parse one **I2C Serial Bus** resource descriptor from the start of `d`.
+///
+/// Layout (ACPI 6.x, Large Resource 0x8E): tag, 16-bit length, revision, resource
+/// source index, bus type, general flags, 16-bit type flags, type revision, 16-bit
+/// type-data length, then for I2C a 32-bit connection speed and a 16-bit target
+/// address.
+///
+/// `None` if `d` is not an I2C serial-bus descriptor or is truncated — this parses
+/// firmware tables, so a short or foreign buffer must be refused rather than read
+/// past.
+pub fn parse_i2c_serial_bus(d: &[u8]) -> Option<I2cResource> {
+    if d.len() < 18 || d[0] != RES_SERIAL_BUS {
+        return None;
+    }
+    // Declared length covers everything after the 3-byte header.
+    let len = u16::from_le_bytes([d[1], d[2]]) as usize;
+    if 3 + len > d.len() || len < 15 {
+        return None;
+    }
+    if d[5] != SERIAL_BUS_I2C {
+        return None;
+    }
+    // General flags bit 1: 0 = this device is the target ("slave"), 1 = controller.
+    let controller_mode = d[6] & 0x02 != 0;
+    let speed_hz = u32::from_le_bytes([d[12], d[13], d[14], d[15]]);
+    let address = u16::from_le_bytes([d[16], d[17]]);
+    Some(I2cResource { address, speed_hz, controller_mode })
+}
+
+/// Every I2C connection described anywhere in `dsdt`.
+///
+/// Scans for Serial Bus descriptors rather than walking the ACPI namespace, because
+/// `_CRS` is in practice a static `ResourceTemplate` buffer — a fixed blob in the
+/// table — so it can be found without evaluating AML. That is what makes an
+/// I2C-attached device reachable before there is an AML interpreter.
+///
+/// **What this cannot do:** it does not associate a connection with the device that
+/// declared it, so it cannot tell a touchpad from a sensor. The caller must confirm
+/// identity over the bus (a HID-over-I2C device answers a HID descriptor read at its
+/// descriptor register), and must not write blindly to an address just because it
+/// appears here.
+pub fn i2c_resources(dsdt: *const u8) -> alloc::vec::Vec<I2cResource> {
+    let mut out = alloc::vec::Vec::new();
+    // SAFETY: `dsdt` points at a mapped ACPI table whose length is at offset 4.
+    let len = le32(dsdt, 4) as usize;
+    if len < 36 || len > 0x40_0000 {
+        return out;
+    }
+    let byte = |i: usize| -> u8 { unsafe { *dsdt.add(i) } };
+    let mut i = 36;
+    while i + 18 <= len {
+        if byte(i) == RES_SERIAL_BUS {
+            // Copy the candidate window out before parsing, so the parser works on
+            // a bounded slice rather than a raw pointer.
+            let want = (u16::from_le_bytes([byte(i + 1), byte(i + 2)]) as usize) + 3;
+            if want >= 18 && i + want <= len {
+                let mut buf = alloc::vec::Vec::with_capacity(want);
+                for k in 0..want {
+                    buf.push(byte(i + k));
+                }
+                if let Some(r) = parse_i2c_serial_bus(&buf) {
+                    if !out.contains(&r) {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Everything needed to drive an ACPI **S5 (soft-off)** transition.
 ///
 /// The values come from two different tables, which is the awkward part: the
@@ -435,6 +531,91 @@ pub fn uart_from_rsdp(rsdp: u64) -> Option<(u64, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // --- I2C serial-bus resources ----------------------------------------
+
+    /// Build an I2C Serial Bus descriptor for `addr` at `speed`.
+    fn i2c_desc(addr: u16, speed: u32, controller: bool) -> alloc::vec::Vec<u8> {
+        let mut d = alloc::vec::Vec::new();
+        d.push(0x8e); // Serial Bus large resource
+        d.extend_from_slice(&15u16.to_le_bytes()); // length after the 3-byte header
+        d.push(1); // revision
+        d.push(0); // resource source index
+        d.push(0x01); // bus type: I2C
+        d.push(if controller { 0x02 } else { 0x00 }); // general flags
+        d.extend_from_slice(&0u16.to_le_bytes()); // type flags
+        d.push(1); // type revision
+        d.extend_from_slice(&6u16.to_le_bytes()); // type data length
+        d.extend_from_slice(&speed.to_le_bytes());
+        d.extend_from_slice(&addr.to_le_bytes());
+        d
+    }
+
+    #[test_case]
+    fn parses_an_i2c_touchpad_connection() {
+        // 0x2c at 400 kHz is the shape a HID-over-I2C touchpad declares.
+        let d = i2c_desc(0x2c, 400_000, false);
+        let r = parse_i2c_serial_bus(&d).unwrap();
+        assert_eq!(r.address, 0x2c);
+        assert_eq!(r.speed_hz, 400_000);
+        assert!(!r.controller_mode);
+    }
+
+    #[test_case]
+    fn distinguishes_controller_mode_from_a_target() {
+        // General-flags bit 1 marks the descriptor as describing the controller,
+        // which is not something we can talk to — treating it as a device address
+        // would mean writing to the bus master itself.
+        let r = parse_i2c_serial_bus(&i2c_desc(0x2c, 100_000, true)).unwrap();
+        assert!(r.controller_mode);
+    }
+
+    #[test_case]
+    fn refuses_non_i2c_and_truncated_descriptors() {
+        // SPI (bus type 2) must not be read as I2C: the type-specific payload
+        // differs, so the "address" would be garbage.
+        let mut spi = i2c_desc(0x2c, 100_000, false);
+        spi[5] = 0x02;
+        assert_eq!(parse_i2c_serial_bus(&spi), None);
+        // A different large-resource tag entirely.
+        let mut other = i2c_desc(0x2c, 100_000, false);
+        other[0] = 0x87;
+        assert_eq!(parse_i2c_serial_bus(&other), None);
+        // Truncated: these are firmware bytes, so a short buffer must be refused
+        // rather than read past.
+        let d = i2c_desc(0x2c, 100_000, false);
+        for cut in 0..18 {
+            assert_eq!(parse_i2c_serial_bus(&d[..cut]), None, "cut {cut}");
+        }
+        // Declared length longer than the buffer.
+        let mut lying = i2c_desc(0x2c, 100_000, false);
+        lying[1] = 0xff;
+        assert_eq!(parse_i2c_serial_bus(&lying), None);
+    }
+
+    #[test_case]
+    fn scans_a_dsdt_for_every_distinct_connection() {
+        // Two devices at different addresses, plus a duplicate that must collapse.
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&[0x08, b'X']); // filler
+        body.extend_from_slice(&i2c_desc(0x2c, 400_000, false));
+        body.extend_from_slice(&[0x08, b'Y']);
+        body.extend_from_slice(&i2c_desc(0x15, 100_000, false));
+        body.extend_from_slice(&i2c_desc(0x2c, 400_000, false)); // duplicate
+        let t = dsdt(&body);
+        let got = i2c_resources(t.as_ptr());
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.iter().any(|r| r.address == 0x2c && r.speed_hz == 400_000));
+        assert!(got.iter().any(|r| r.address == 0x15 && r.speed_hz == 100_000));
+    }
+
+    #[test_case]
+    fn scan_of_a_table_with_no_i2c_finds_nothing() {
+        assert!(i2c_resources(dsdt(&[]).as_ptr()).is_empty());
+        // A plausible-looking table body with no serial-bus descriptors.
+        let t = dsdt(&[0x08, b'_', b'S', b'5', b'_', 0x12, 0x06, 0x02, 0x0a, 0x05]);
+        assert!(i2c_resources(t.as_ptr()).is_empty());
+    }
+
     use alloc::vec;
     use alloc::vec::Vec;
 
