@@ -161,6 +161,31 @@ impl NetDevice for UsbEth {
     }
 }
 
+/// Adopt a USB Ethernet adapter whose bulk endpoints the xHCI stack has already
+/// configured (see `classify_and_finish`). `None` if no adapter is present.
+///
+/// ## The MAC address
+///
+/// CDC-ECM reports the adapter's real MAC through the `iMACAddress` index in its
+/// Ethernet Networking functional descriptor, which requires fetching a *string*
+/// descriptor — a control transfer this does not yet do. So a **locally-administered**
+/// address is used instead (bit 1 of the first octet set, which is what that bit is
+/// for), derived deterministically so it is stable across reboots.
+///
+/// That is legitimate rather than a bodge: a CDC-ECM adapter bridges whatever frames
+/// the host sends, so the address the host uses is the address seen on the wire, and
+/// a locally-administered one cannot collide with a real vendor assignment. Reading
+/// the true MAC is a refinement, not a correctness fix.
+pub fn probe() -> Option<UsbEth> {
+    if !crate::arch::usb_bulk_ready() {
+        return None;
+    }
+    // Locally administered (0x02), stable, and obviously ours at a glance.
+    let mac = [0x02, 0x43, 0x48, 0x49, 0x54, 0x01];
+    crate::ktrace::log("usb_eth", "adopting CDC-ECM adapter with a locally-administered MAC (real MAC needs the iMACAddress string descriptor)");
+    UsbEth::new(mac, Variant::CdcEcm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

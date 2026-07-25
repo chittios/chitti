@@ -260,10 +260,20 @@ pub fn autodetect() {
             brought_up = true;
         }
     }
-    // PCI NICs (virtio-net-pci, e1000) — VBox + real Intel hardware.
+    // PCI NICs (virtio-net-pci, e1000/e1000e, igb/igc, r8169) — VBox + real hardware.
     if !brought_up {
         if let Some(nic) = crate::net::pci::probe() {
             init(nic, "eth0");
+            brought_up = true;
+        }
+    }
+    // USB Ethernet, last: it is the fallback for machines with no Ethernet port at
+    // all (most laptops) and no WiFi driver, so a built-in NIC should win if there
+    // is one. Only succeeds if enumeration already configured an adapter's bulk
+    // endpoints.
+    if !brought_up {
+        if let Some(nic) = crate::net::usb_eth::probe() {
+            init(Box::new(nic), "eth0");
             brought_up = true;
         }
     }

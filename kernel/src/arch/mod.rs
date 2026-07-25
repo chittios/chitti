@@ -185,6 +185,20 @@ pub unsafe fn parallel_for(n: usize, _min_chunk: usize, f: unsafe fn(usize, usiz
     unsafe { f(0, n, ctx) }
 }
 
+/// Whether a USB Ethernet adapter's bulk endpoints are configured.
+#[cfg(target_arch = "x86_64")]
+pub fn usb_bulk_ready() -> bool {
+    x86_64::xhci::usb_bulk_ready()
+}
+#[cfg(target_arch = "aarch64")]
+pub fn usb_bulk_ready() -> bool {
+    aarch64::xhci::usb_bulk_ready()
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn usb_bulk_ready() -> bool {
+    false
+}
+
 /// USB Ethernet bulk transport, arch-neutral (the controller lives under the
 /// per-arch xHCI wrapper, exactly like `mouse_poll`). Used by `net::usb_eth`.
 #[cfg(target_arch = "x86_64")]

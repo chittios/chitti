@@ -60,6 +60,10 @@ struct Trb {
 
 /// The controller + its rings. Addresses are stored both as physical (for the
 /// device) and virtual (HHDM, for the CPU).
+/// Bounce-buffer size for a USB Ethernet endpoint: one full Ethernet frame plus
+/// slack, rounded up. CDC-ECM sends one frame per transfer, so this bounds a frame.
+const USB_ETH_BUF: usize = 2048;
+
 /// A configured bulk IN/OUT endpoint pair on one device — what a USB Ethernet
 /// adapter needs. Each direction has its own transfer ring and a bounce buffer.
 ///
@@ -875,6 +879,22 @@ impl Xhci {
             if let Some((iface, ep, mps, ivl, proto)) = unsafe { parse_hid_pointer(c.buf_va, c.total as usize) } {
                 if let Some(p) = unsafe { self.finish_pointer(c, iface, ep, mps, ivl, proto) } {
                     self.mouse = Some(p);
+                    got = true;
+                }
+            }
+        }
+        // USB Ethernet: a CDC **Data** interface (class 0x0A) carrying a bulk
+        // IN/OUT pair. Matched by class rather than an id list because CDC-ECM is a
+        // standard; the vendor-specific ASIX/Realtek chips would need idVendor /
+        // idProduct, which `Common` does not retain, and are unimplemented anyway.
+        if self.bulk.is_none() {
+            // SAFETY: `buf_va` holds `total` bytes of configuration descriptor read
+            // during enumeration.
+            let desc = unsafe { core::slice::from_raw_parts(c.buf_va as *const u8, c.total as usize) };
+            if let Some(bi) = find_bulk_iface(desc, Some(0x0a)) {
+                // SAFETY: `c` is an addressed, configured device.
+                if unsafe { self.configure_bulk(c, bi, USB_ETH_BUF) } {
+                    crate::ktrace::log("xhci", "USB Ethernet (CDC-ECM) bulk endpoints configured");
                     got = true;
                 }
             }
