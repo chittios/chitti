@@ -264,6 +264,17 @@ impl NvmeController {
                 }
                 spins += 1;
                 if spins > 2_000_000_000 {
+                    crate::ktrace::log("nvme", "command never completed (2e9 spins) -- giving up");
+                    return false;
+                }
+                // Answer Ctrl+C, for the same reason as the AHCI completion wait:
+                // the bound is many seconds on a failing device, and a machine
+                // stuck in a disk read must still be escapable. `poll_interrupt`
+                // only (non-blocking, pushes back non-Ctrl+C bytes) — never
+                // `upkeep()`, which would re-enter the UI pump this can be called
+                // from.
+                if spins % 0x10_0000 == 0 && crate::shell::poll_interrupt() {
+                    crate::ktrace::log("nvme", "command cancelled by Ctrl+C");
                     return false;
                 }
                 core::hint::spin_loop();

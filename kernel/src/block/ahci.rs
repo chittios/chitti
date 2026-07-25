@@ -243,6 +243,23 @@ impl Ahci {
                 }
                 spins += 1;
                 if spins > 2_000_000_000 {
+                    crate::ktrace::log("ahci", "command never completed (2e9 spins) -- giving up");
+                    return false;
+                }
+                // Answer Ctrl+C. The bound above is generous enough to be many
+                // seconds on a failing drive, during which the machine would
+                // otherwise be unescapable — the standing rule is that every
+                // blocking operation stays interruptible. Checked periodically,
+                // not every spin, so it costs nothing on a healthy device.
+                //
+                // Only `poll_interrupt` (a non-blocking console-ring read that
+                // pushes back anything that is not Ctrl+C), never `upkeep()`:
+                // block I/O runs from inside the UI pump and from early boot, so
+                // pumping the UI here would risk exactly the re-entrancy hang that
+                // `fix(ui): stop package-app open hang on surface HUD reentrancy`
+                // addressed.
+                if spins % 0x10_0000 == 0 && crate::shell::poll_interrupt() {
+                    crate::ktrace::log("ahci", "command cancelled by Ctrl+C");
                     return false;
                 }
                 core::hint::spin_loop();
