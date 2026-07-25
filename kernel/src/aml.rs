@@ -325,6 +325,33 @@ impl DeviceNode {
     }
 }
 
+/// A `Method (...)` found in the namespace.
+///
+/// Located but **not evaluated**. Two things make its presence useful on its own: a
+/// driver can tell whether firmware provides a given method at all, and — the
+/// correctness point — a method's body must be *excluded* from device property
+/// lookups, because `Name` declarations inside it are locals, not device properties.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MethodNode {
+    /// Dotted path including enclosing scopes.
+    pub path: String,
+    /// Declared argument count (`MethodFlags` bits 0..2).
+    pub arg_count: u8,
+    /// True when the method is declared `Serialized`.
+    pub serialized: bool,
+    /// Byte range of the method's term list.
+    pub body: core::ops::Range<usize>,
+    /// Byte range of the whole `Method(...)` construct.
+    pub extent: core::ops::Range<usize>,
+}
+
+impl MethodNode {
+    /// The method's own name (last path segment).
+    pub fn name(&self) -> &str {
+        self.path.rsplit('.').next().unwrap_or(&self.path)
+    }
+}
+
 /// How deeply to descend through nested Scope/Device containers.
 const MAX_NESTING: usize = 12;
 
@@ -335,22 +362,62 @@ const MAX_NESTING: usize = 12;
 /// level it cares about.
 pub fn devices(aml: &[u8]) -> Vec<DeviceNode> {
     let mut out = Vec::new();
-    walk(aml, 0, "", 0, &mut out);
+    let mut m = Vec::new();
+    walk(aml, 0, "", 0, &mut out, &mut m);
     out
+}
+
+/// Every `Method` in `aml`, with its path, argument count and body range.
+pub fn methods(aml: &[u8]) -> Vec<MethodNode> {
+    let mut d = Vec::new();
+    let mut out = Vec::new();
+    walk(aml, 0, "", 0, &mut d, &mut out);
+    out
+}
+
+/// The method named `name` belonging to `dev` (excluding its child devices).
+pub fn device_method(aml: &[u8], dev: &DeviceNode, name: &str) -> Option<MethodNode> {
+    let kids: Vec<core::ops::Range<usize>> = devices(aml)
+        .iter()
+        .filter(|d| d.path != dev.path && d.extent.start >= dev.body.start && d.extent.end <= dev.body.end)
+        .map(|d| d.extent.clone())
+        .collect();
+    methods(aml).into_iter().find(|m| {
+        m.name() == name
+            && m.extent.start >= dev.body.start
+            && m.extent.end <= dev.body.end
+            && !kids.iter().any(|k| m.extent.start >= k.start && m.extent.end <= k.end)
+    })
 }
 
 /// Recursive container walk. `base` is the enclosing path, `off` the offset of `aml`
 /// within the original buffer so reported ranges are absolute.
-fn walk(aml: &[u8], off: usize, base: &str, depth: usize, out: &mut Vec<DeviceNode>) {
+#[allow(clippy::too_many_arguments)]
+fn walk(
+    aml: &[u8],
+    off: usize,
+    base: &str,
+    depth: usize,
+    out: &mut Vec<DeviceNode>,
+    meths: &mut Vec<MethodNode>,
+) {
     if depth > MAX_NESTING {
         return;
     }
     let mut i = 0usize;
     while i < aml.len() {
         // Scope(...) is one byte; Device(...) is the two-byte extended opcode.
-        let (header, is_device) = match aml[i] {
-            SCOPE_OP => (1usize, false),
-            EXT_OP_PREFIX if aml.get(i + 1) == Some(&DEVICE_OP) => (2usize, true),
+        // Scope, Device and Method all carry a PkgLength, so their extent is exact.
+        #[derive(PartialEq)]
+        enum Kind {
+            Scope,
+            Device,
+            Method,
+        }
+        let (header, kind) = match aml[i] {
+            SCOPE_OP => (1usize, Kind::Scope),
+            METHOD_OP => (1usize, Kind::Method),
+            EXT_OP_PREFIX if aml.get(i + 1) == Some(&DEVICE_OP) => (2usize, Kind::Device),
             _ => {
                 i += 1;
                 continue;
@@ -377,7 +444,23 @@ fn walk(aml: &[u8], off: usize, base: &str, depth: usize, out: &mut Vec<DeviceNo
             continue;
         }
         let path = join_path(base, &name);
-        if is_device {
+        if kind == Kind::Method {
+            // MethodFlags follows the name: arg count in bits 0..2, Serialized bit 3.
+            let flags = aml.get(body_start).copied().unwrap_or(0);
+            meths.push(MethodNode {
+                path,
+                arg_count: flags & 0x07,
+                serialized: flags & 0x08 != 0,
+                body: off + body_start + 1..off + end,
+                extent: off + i..off + end,
+            });
+            // A method body is code, not namespace structure: do not descend into it.
+            // Names declared inside are locals, so treating them as device properties
+            // would attribute a method's temporaries to the device.
+            i = end;
+            continue;
+        }
+        if kind == Kind::Device {
             out.push(DeviceNode {
                 path: path.clone(),
                 body: off + body_start..off + end,
@@ -388,7 +471,7 @@ fn walk(aml: &[u8], off: usize, base: &str, depth: usize, out: &mut Vec<DeviceNo
         }
         // Descend, then skip the whole container — this is why knowing the extent
         // matters: a scan would re-find the nested devices at the wrong path.
-        walk(&aml[body_start..end], off + body_start, &path, depth + 1, out);
+        walk(&aml[body_start..end], off + body_start, &path, depth + 1, out, meths);
         i = end;
     }
 }
@@ -453,6 +536,14 @@ pub fn device_name(aml: &[u8], dev: &DeviceNode, name: &str) -> Option<Value> {
         .filter(|d| d.path != dev.path && d.extent.start >= dev.body.start && d.extent.end <= dev.body.end)
         .map(|d| d.extent.clone())
         .collect();
+    // Method bodies are excluded too: a `Name` inside a method is a local, and
+    // attributing it to the device would report a temporary as a device property.
+    kids.extend(
+        methods(aml)
+            .iter()
+            .filter(|m| m.extent.start >= dev.body.start && m.extent.end <= dev.body.end)
+            .map(|m| m.extent.clone()),
+    );
     kids.sort_by_key(|r| r.start);
 
     let mut cursor = dev.body.start;
@@ -642,6 +733,86 @@ mod tests {
         let i2c = devs.iter().find(|d| d.name() == "I2C1").unwrap();
         assert_eq!(device_name(&aml, i2c, "_HID"), None, "parent inherited a child's _HID");
         assert_eq!(device_name(&aml, i2c, "_CRS"), None, "parent inherited a child's _CRS");
+    }
+
+// --- methods ----------------------------------------------------------
+
+    /// `Method (name, argc) { body }`
+    fn method(name: &str, argc: u8, body: &[u8]) -> vec::Vec<u8> {
+        let mut inner = seg(name);
+        inner.push(argc & 0x07);
+        inner.extend_from_slice(body);
+        let mut v = vec![METHOD_OP];
+        v.extend_from_slice(&pkglen(inner.len()));
+        v.extend_from_slice(&inner);
+        v
+    }
+
+    #[test_case]
+    fn finds_methods_with_their_arg_counts() {
+        // _DSM takes 4 arguments; _STA takes none. Arg count comes from MethodFlags.
+        let mut body = method("_DSM", 4, &[ZERO_OP]);
+        body.extend_from_slice(&method("_STA", 0, &[ONE_OP]));
+        let aml = scope("_SB_", &device("TPD0", &body));
+        let ms = methods(&aml);
+        let dsm = ms.iter().find(|m| m.name() == "_DSM").unwrap();
+        assert_eq!(dsm.arg_count, 4);
+        assert!(!dsm.serialized);
+        assert_eq!(ms.iter().find(|m| m.name() == "_STA").unwrap().arg_count, 0);
+    }
+
+    #[test_case]
+    fn a_name_inside_a_method_is_not_a_device_property() {
+        // This is the correctness point of locating methods at all: a `Name` declared
+        // inside a method body is a local. Reporting it as the device's property would
+        // hand a driver a method temporary — here, a bogus _CRS.
+        let mut m_body = vec![NAME_OP];
+        m_body.extend_from_slice(&seg("_CRS"));
+        m_body.push(BUFFER_OP);
+        let buf = [BYTE_PREFIX, 0x02, 0xde, 0xad];
+        m_body.extend_from_slice(&pkglen(buf.len()));
+        m_body.extend_from_slice(&buf);
+
+        let dev_body = method("FOO_", 0, &m_body);
+        let aml = scope("_SB_", &device("TPD0", &dev_body));
+        let devs = devices(&aml);
+        let tpd = devs.iter().find(|d| d.name() == "TPD0").unwrap();
+        assert_eq!(
+            device_name(&aml, tpd, "_CRS"),
+            None,
+            "a Name inside a method body was reported as a device property"
+        );
+    }
+
+    #[test_case]
+    fn device_method_is_scoped_to_its_device() {
+        // Two devices each declaring _DSM: the lookup must return the right one's.
+        let a = device("TPD0", &method("_DSM", 4, &[ZERO_OP]));
+        let b = device("SEN0", &method("_DSM", 2, &[ONE_OP]));
+        let mut body = a;
+        body.extend_from_slice(&b);
+        let aml = scope("_SB_", &body);
+        let devs = devices(&aml);
+        let tpd = devs.iter().find(|d| d.name() == "TPD0").unwrap();
+        let sen = devs.iter().find(|d| d.name() == "SEN0").unwrap();
+        assert_eq!(device_method(&aml, tpd, "_DSM").unwrap().arg_count, 4);
+        assert_eq!(device_method(&aml, sen, "_DSM").unwrap().arg_count, 2);
+        assert!(device_method(&aml, tpd, "_BST").is_none());
+    }
+
+    #[test_case]
+    fn a_devices_own_names_still_resolve_alongside_methods() {
+        // Excluding method bodies must not also exclude the device's real properties.
+        let mut body = name_str("_HID", "PNP0C50");
+        body.extend_from_slice(&method("_DSM", 4, &[ZERO_OP]));
+        let aml = scope("_SB_", &device("TPD0", &body));
+        let devs = devices(&aml);
+        let tpd = devs.iter().find(|d| d.name() == "TPD0").unwrap();
+        assert_eq!(
+            device_name(&aml, tpd, "_HID"),
+            Some(Value::String(String::from("PNP0C50")))
+        );
+        assert!(device_method(&aml, tpd, "_DSM").is_some());
     }
 
     #[test_case]
