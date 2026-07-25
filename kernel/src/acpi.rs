@@ -137,6 +137,33 @@ pub fn hpet_from_rsdp(rsdp: u64) -> Option<u64> {
     Some(base)
 }
 
+/// The DSDT named by the FADT, mapped for reading.
+///
+/// Exposed because the DSDT is where devices that cannot be enumerated are described
+/// — the I2C connections in [`i2c_resources`], and eventually anything an AML
+/// interpreter would evaluate.
+pub fn dsdt_from_rsdp(rsdp: u64, map: impl Fn(u64, usize) -> u64) -> Option<*const u8> {
+    let f = find_table(rsdp, b"FACP")?;
+    let len = le32(f, 4) as usize;
+    let dsdt_phys = if len >= 156 && le64(f, 148) != 0 { le64(f, 148) } else { le32(f, 40) as u64 };
+    // Refuse an implausible physical address instead of mapping it. A value with bits
+    // above the platform's physical-address width produces a page-table entry with
+    // reserved bits set, and the resulting fault (error 0x8) is far harder to read
+    // than this check is to write. 1 TiB is well past any real DSDT.
+    if dsdt_phys == 0 || dsdt_phys >= (1 << 40) {
+        return None;
+    }
+    // Map the header, learn the real length, then map exactly that much. Mapping a
+    // fixed guess and scanning to the declared length reads past the mapping on any
+    // table larger than the guess.
+    let hdr = map(dsdt_phys, 0x1000) as *const u8;
+    let total = le32(hdr, 4) as usize;
+    if total < 36 || total > 0x40_0000 {
+        return None;
+    }
+    Some(map(dsdt_phys, total) as *const u8)
+}
+
 /// An **I2C serial-bus connection** described by an ACPI resource descriptor.
 ///
 /// This is how an I2C-attached device — notably a HID-over-I2C touchpad — is

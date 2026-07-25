@@ -215,6 +215,9 @@ pub fn init() {
     arch::x86_64::apic::software_enable();
     if let Some(rsdp) = arch::x86_64::rsdp_address() {
         arch::x86_64::pit::try_apic_timer(rsdp);
+        // HID-over-I2C touchpad: needs the DSDT (for the I2C address) and mapped
+        // MMIO, so it belongs here rather than with the PS/2 init above.
+        drivers::i2c_hid::init(rsdp);
     } else {
         ktrace::log("init", "no ACPI RSDP -- scheduler tick stays on the PIT/PIC");
     }

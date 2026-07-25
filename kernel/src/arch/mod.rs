@@ -72,6 +72,9 @@ pub fn mouse_poll() {
 pub fn mouse_poll() {
     x86_64::i8042::poll_mouse();
     x86_64::xhci::poll_mouse();
+    // HID-over-I2C touchpad (Intel LPSS). A no-op unless one was found at boot;
+    // most laptops from ~2016 have no PS/2 aux port, so this is their only pointer.
+    crate::drivers::i2c_hid::poll();
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

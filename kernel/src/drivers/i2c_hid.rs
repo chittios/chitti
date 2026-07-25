@@ -184,6 +184,81 @@ impl I2cHid {
     }
 }
 
+// --- boot bring-up --------------------------------------------------------
+
+/// The touchpad, once found.
+static HID: crate::mm::Locked<Option<I2cHid>> = crate::mm::Locked::new(None);
+
+/// Find and bring up a HID-over-I2C pointer, if this machine has one.
+///
+/// Walks the I2C connections the DSDT declares ([`crate::acpi::i2c_resources`]) and
+/// asks each whether it answers as HID. Nothing is written to any address during
+/// identification — see [`I2cHid::probe`] — because those addresses may belong to the
+/// embedded controller or a sensor, and a laptop is not a safe place to guess.
+///
+/// A no-op where there is no DesignWare controller (every non-Intel machine, and
+/// QEMU), so it costs one PCI scan and returns.
+pub fn init(rsdp: u64) {
+    if HID.with(|h| h.is_some()) {
+        return;
+    }
+    let Some(dsdt) = crate::acpi::dsdt_from_rsdp(rsdp, crate::mm::map_mmio) else {
+        return;
+    };
+    let conns = crate::acpi::i2c_resources(dsdt);
+    if conns.is_empty() {
+        return;
+    }
+    // Try each controller in turn: a machine can have several I2C buses, and the
+    // touchpad is on exactly one of them.
+    let mut ctrl = 0usize;
+    while let Some(mut bus) = super::i2c::DwI2c::probe_nth(ctrl) {
+        ctrl += 1;
+        for c in conns.iter().filter(|c| !c.controller_mode) {
+            // Cheap zero-length check first, so a full descriptor read is only
+            // attempted where something actually answers.
+            if !bus.present(c.address) {
+                continue;
+            }
+            match I2cHid::probe(bus, c.address, DEFAULT_HID_DESC_REG) {
+                Some(dev) => {
+                    crate::ktrace::log_fmt(format_args!(
+                        "i2c_hid: touchpad at {:#x} on controller {}",
+                        dev.address(),
+                        ctrl - 1
+                    ));
+                    HID.with(|h| *h = Some(dev));
+                    return;
+                }
+                // `probe` consumes the bus, so re-acquire it to keep looking. The
+                // controller is stateless between transfers, so re-probing is safe.
+                None => match super::i2c::DwI2c::probe_nth(ctrl - 1) {
+                    Some(b) => bus = b,
+                    None => return,
+                },
+            }
+        }
+    }
+    if ctrl > 0 {
+        crate::ktrace::log("i2c_hid", "no HID-over-I2C device answered on any I2C bus");
+    }
+}
+
+/// Whether a HID-over-I2C pointer was found.
+pub fn present() -> bool {
+    HID.with(|h| h.is_some())
+}
+
+/// Drain any pending touchpad report. Pumped from `arch::mouse_poll` alongside the
+/// USB and PS/2 pointers.
+pub fn poll() {
+    HID.with(|h| {
+        if let Some(d) = h.as_mut() {
+            d.poll();
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

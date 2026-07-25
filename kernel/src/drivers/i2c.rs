@@ -97,7 +97,11 @@ impl DwI2c {
         let d = pci::find_class_nth(0x0c, 0x80, 0x00, n)?;
         d.enable_bus_master();
         let bar = d.bar(0);
-        if bar == 0 {
+        // Same reasoning as the DSDT mapping: an implausible BAR (unassigned, or with
+        // bits above the physical-address width) must be refused rather than mapped,
+        // or the bogus page-table entry faults with a reserved-bit error that says
+        // nothing about where it came from.
+        if bar == 0 || bar >= (1 << 40) {
             return None;
         }
         let regs = crate::mm::map_mmio(bar, 0x1000);
