@@ -306,8 +306,25 @@ pub fn prepare() -> Result<(), &'static str> {
     if code.len() > 4096 {
         return Err("resume trampoline does not fit in one page");
     }
-    let (phys, virt) = crate::mm::alloc_dma_bounded(4096, LOW_MEMORY_LIMIT, 0)
-        .ok_or("no free page below 1 MiB for the resume trampoline")?;
+    // A usable low frame if the firmware left one; otherwise a bootloader-reclaimable
+    // one. Limine's BIOS boot marks the whole first MiB reserved, so on that path the
+    // reclaimable route is the only one — and it is legitimate rather than a trick:
+    // "reclaimable" is the firmware's own statement that the range belongs to the OS
+    // once boot is over, which it is by the time anyone asks to suspend.
+    // The page boot set aside. Asking the allocator *now* would fail even on a machine
+    // with plenty of low memory: the heap maps a gigabyte from the lowest frames upward
+    // and has taken all of it long before anyone types `/suspend`. Falling back to a
+    // bootloader-reclaimable frame covers firmware that leaves nothing usable down there
+    // at all.
+    let (phys, virt) = match crate::mm::s3_page() {
+        Some(p) => p,
+        None => crate::mm::claim_low_reclaimable_frame().ok_or(
+            "no page below 1 MiB for the resume trampoline (see `/suspend plan`)",
+        )?,
+    };
+    if phys >= LOW_MEMORY_LIMIT {
+        return Err("the reserved trampoline page is not below 1 MiB");
+    }
     // SAFETY: `virt` maps a whole owned frame and `code` is at most a page.
     unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), virt as *mut u8, code.len()) };
 

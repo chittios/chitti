@@ -93,6 +93,145 @@ pub struct MemStats {
 
 /// Gather a [`MemStats`]. `ram_total` falls back to the heap size when RAM
 /// discovery reported nothing (so callers always get a sane denominator).
+/// A summary of the first MiB, recorded at boot from the firmware memory map.
+///
+/// The S3 resume trampoline has to live there — firmware wakes the CPU in real mode,
+/// where `CS:IP` reaches no further — so when it cannot, the useful thing to report is
+/// *why*: "the firmware marks the whole first MiB reserved" and "there is bootloader-
+/// reclaimable space down there" call for completely different responses. Kept as a
+/// small static because the memmap itself is only borrowed for the length of [`init`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LowMemory {
+    /// Bytes below 1 MiB the firmware called usable.
+    pub usable: u64,
+    /// Bytes below 1 MiB holding bootloader structures — free for the OS after boot.
+    pub reclaimable: u64,
+    /// Base of the lowest bootloader-reclaimable frame below 1 MiB, if any.
+    pub reclaimable_base: Option<u64>,
+    /// Bytes below 1 MiB that are neither.
+    pub other: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+static LOW_MEMORY: Locked<LowMemory> = Locked::new(LowMemory {
+    usable: 0,
+    reclaimable: 0,
+    reclaimable_base: None,
+    other: 0,
+});
+
+/// What the firmware said about the first MiB.
+#[cfg(target_arch = "x86_64")]
+pub fn low_memory() -> LowMemory {
+    LOW_MEMORY.with(|l| *l)
+}
+
+/// Classify the first `limit` bytes of the memory map. Pure, so the arithmetic that
+/// decides whether S3 is possible is testable without a bootloader.
+/// Takes an *iterator*, not a slice, because the only caller runs inside [`init`] —
+/// before `heap::init`, where collecting into a `Vec` is an allocation with no allocator
+/// behind it. That is not a subtle failure: it aborts the boot in `handle_alloc_error`
+/// before a single line of output, which is how the first version of this was caught.
+#[cfg(target_arch = "x86_64")]
+pub fn classify_low_memory<I>(entries: I, limit: u64) -> LowMemory
+where
+    I: IntoIterator<Item = (u64, u64, u64)>,
+{
+    let mut out = LowMemory::default();
+    for (base, length, kind) in entries {
+        // Only the part of the entry that falls below the limit counts.
+        let end = base.saturating_add(length).min(limit);
+        if base >= limit || end <= base {
+            continue;
+        }
+        let bytes = end - base;
+        match kind {
+            crate::limine_protocol::MEMMAP_USABLE => out.usable += bytes,
+            crate::limine_protocol::MEMMAP_BOOTLOADER_RECLAIMABLE => {
+                out.reclaimable += bytes;
+                // Page-align upward: a frame is only usable if it starts on one.
+                let aligned = (base + 0xfff) & !0xfff;
+                if aligned + 0x1000 <= end && out.reclaimable_base.is_none() {
+                    out.reclaimable_base = Some(aligned);
+                }
+            }
+            _ => out.other += bytes,
+        }
+    }
+    out
+}
+
+/// The page reserved at boot for the S3 resume trampoline.
+#[cfg(target_arch = "x86_64")]
+static S3_PAGE: Locked<Option<(u64, u64)>> = Locked::new(None);
+
+/// Set aside one frame below 1 MiB for the S3 resume trampoline, at boot.
+///
+/// **Timing is the whole point.** Firmware wakes the CPU in real mode, so the trampoline
+/// has to live in the first MiB — and although the memory map does leave usable frames
+/// down there, the heap is mapped from the lowest free frames upward and takes every one
+/// of them within milliseconds of boot. Asking later, when the user types `/suspend`,
+/// finds nothing: the page has to be claimed *before* [`heap::init`], which is why this
+/// is called from [`init`] rather than from the suspend path. (This is the same
+/// reservation Linux makes for its wakeup trampoline, for the same reason.)
+///
+/// Costs 4 KiB, always. Cheap enough not to be worth making conditional, and a
+/// conditional reservation would be one more thing to get wrong on the machines that can
+/// actually suspend.
+#[cfg(target_arch = "x86_64")]
+fn reserve_s3_page() {
+    let frames = 1;
+    let phys = FRAME_ALLOCATOR
+        .with(|slot| slot.as_mut().and_then(|a| a.allocate_contiguous_bounded(frames, 1 << 20, 0)));
+    match phys {
+        Some(phys) => {
+            let virt = crate::arch::x86_64::paging::phys_to_virt(phys);
+            // SAFETY: a freshly-allocated, exclusively-owned frame reachable through the
+            // HHDM.
+            unsafe { core::ptr::write_bytes(virt as *mut u8, 0, 4096) };
+            S3_PAGE.with(|slot| *slot = Some((phys, virt)));
+            crate::ktrace::log_fmt(format_args!(
+                "mm: reserved {phys:#x} below 1 MiB for the S3 resume trampoline"
+            ));
+        }
+        None => crate::ktrace::log(
+            "mm",
+            "no frame below 1 MiB to reserve for S3 resume -- suspend-to-RAM unavailable",
+        ),
+    }
+}
+
+/// The reserved low page, if boot got one.
+#[cfg(target_arch = "x86_64")]
+pub fn s3_page() -> Option<(u64, u64)> {
+    S3_PAGE.with(|slot| *slot)
+}
+
+/// Take the lowest bootloader-reclaimable frame below 1 MiB, once, for the S3 resume
+/// trampoline. Returns `(phys, virt)` zeroed, like [`alloc_dma`].
+///
+/// Only reached when the firmware left no *usable* frame down there — which is the
+/// normal case on a Limine BIOS boot, where the whole first MiB is reserved. Taking a
+/// bootloader-reclaimable page is not a trick: reclaimable is the firmware's own
+/// statement that the range is the OS's once boot is finished, and it is, long before
+/// anyone asks the machine to suspend.
+///
+/// Marked used in the frame bitmap on the way out, so a later ordinary allocation cannot
+/// hand the same page to something else. Idempotent: the second call returns the same
+/// frame, because the trampoline only ever needs one.
+#[cfg(target_arch = "x86_64")]
+pub fn claim_low_reclaimable_frame() -> Option<(u64, u64)> {
+    let phys = low_memory().reclaimable_base?;
+    FRAME_ALLOCATOR.with(|slot| slot.as_mut().map(|a| a.mark_used(phys)));
+    let virt = crate::arch::x86_64::paging::phys_to_virt(phys);
+    // SAFETY: `phys` is a page-aligned frame inside a bootloader-reclaimable range,
+    // now marked used so nothing else will be handed it, and `phys_to_virt` maps it
+    // through the HHDM.
+    unsafe { core::ptr::write_bytes(virt as *mut u8, 0, 4096) };
+    Some((phys, virt))
+}
+
+
 pub fn mem_stats() -> MemStats {
     let (heap_total, _free, heap_used) = heap::stats();
     let model = crate::cortex::model_module().map(|m| m.len() as u64).unwrap_or(0);
@@ -184,10 +323,28 @@ pub fn init(memmap: &[&crate::limine_protocol::MemmapEntry], hhdm_offset: u64) {
 
     // SAFETY: `memmap`/`hhdm_offset` are Limine's own responses, read
     // once at boot before anything else touches physical memory.
+    // Record the first MiB before anything else touches it: the S3 resume path needs a
+    // page there, and if it cannot have one the reason is in this classification.
+    let low = classify_low_memory(
+        memmap.iter().map(|e| (e.base, e.length, e.entry_type)),
+        1 << 20,
+    );
+    LOW_MEMORY.with(|slot| *slot = low);
+    crate::ktrace::log_fmt(format_args!(
+        "mm: first MiB -- {} KiB usable, {} KiB bootloader-reclaimable, {} KiB other",
+        low.usable / 1024,
+        low.reclaimable / 1024,
+        low.other / 1024
+    ));
+
     let allocator = unsafe { frame::BitmapFrameAllocator::init(memmap, hhdm_offset) };
     let total_frames = allocator.frame_count();
     let free_frames = allocator.free_frame_count();
     FRAME_ALLOCATOR.with(|slot| *slot = Some(allocator));
+
+    // Before the heap: it maps a gigabyte from the lowest free frames upward and would
+    // otherwise consume every page the S3 resume trampoline could use.
+    reserve_s3_page();
 
     crate::ktrace::log_fmt(format_args!(
         "mm: frame allocator ready, {free_frames}/{total_frames} frames free"
@@ -298,4 +455,93 @@ pub fn map_mmio(phys: u64, _bytes: usize) -> u64 {
 #[cfg(target_arch = "aarch64")]
 pub fn map_mmio_page(phys: u64) -> u64 {
     map_mmio(phys, 0x1000)
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod low_memory_tests {
+    use super::*;
+    use crate::limine_protocol::{
+        MEMMAP_BOOTLOADER_RECLAIMABLE, MEMMAP_RESERVED, MEMMAP_USABLE,
+    };
+
+    const MIB: u64 = 1 << 20;
+
+    #[test_case]
+    fn a_limine_bios_map_has_no_usable_low_memory_but_does_have_reclaimable() {
+        // The shape that blocks S3 in practice: firmware owns the first MiB, so there is
+        // no *usable* frame for a real-mode resume trampoline — but the bootloader's own
+        // structures are down there, and those belong to the OS once boot is over.
+        let m = [
+            (0x0, 0x1000, MEMMAP_RESERVED),
+            (0x1000, 0x7f000, MEMMAP_BOOTLOADER_RECLAIMABLE),
+            (0x80000, 0x80000, MEMMAP_RESERVED),
+            (0x100000, 0x4000_0000, MEMMAP_USABLE),
+        ];
+        let low = classify_low_memory(m, MIB);
+        assert_eq!(low.usable, 0);
+        assert_eq!(low.reclaimable, 0x7f000);
+        assert_eq!(low.reclaimable_base, Some(0x1000));
+        assert_eq!(low.other, 0x1000 + 0x80000);
+    }
+
+    #[test_case]
+    fn an_entry_straddling_the_limit_only_counts_its_low_half() {
+        // A usable range starting at 0xf0000 and running to 0x200000 contributes exactly
+        // the part below 1 MiB. Counting the whole entry would claim low memory that is
+        // not there.
+        let m = [(0xf_0000, 0x11_0000, MEMMAP_USABLE)];
+        let low = classify_low_memory(m, MIB);
+        assert_eq!(low.usable, MIB - 0xf_0000);
+        assert_eq!(low.other, 0);
+    }
+
+    #[test_case]
+    fn entries_entirely_above_the_limit_are_ignored() {
+        let m = [
+            (MIB, 0x1000_0000, MEMMAP_USABLE),
+            (0x2000_0000, 0x1000, MEMMAP_BOOTLOADER_RECLAIMABLE),
+        ];
+        let low = classify_low_memory(m, MIB);
+        assert_eq!(low.usable, 0);
+        assert_eq!(low.reclaimable, 0);
+        assert_eq!(low.reclaimable_base, None);
+    }
+
+    #[test_case]
+    fn a_reclaimable_range_too_small_or_unaligned_yields_no_frame() {
+        // A frame has to start on a page boundary and fit entirely inside the range. A
+        // base that rounds up past the end must not be offered as a usable frame — the
+        // trampoline would be written past the range firmware said we could have.
+        let tiny = [(0x1001, 0x800, MEMMAP_BOOTLOADER_RECLAIMABLE)];
+        let low = classify_low_memory(tiny, MIB);
+        assert_eq!(low.reclaimable, 0x800);
+        assert_eq!(low.reclaimable_base, None, "no whole aligned frame fits");
+
+        // Unaligned but long enough: the frame starts at the next boundary.
+        let ok = [(0x1001, 0x3000, MEMMAP_BOOTLOADER_RECLAIMABLE)];
+        assert_eq!(classify_low_memory(ok, MIB).reclaimable_base, Some(0x2000));
+    }
+
+    #[test_case]
+    fn the_lowest_reclaimable_frame_wins() {
+        // Two candidate ranges: the report names the lower one, because the resume
+        // trampoline's address has to fit a real-mode segment and lower is always safer.
+        let m = [
+            (0x9_0000, 0x2000, MEMMAP_BOOTLOADER_RECLAIMABLE),
+            (0x1_0000, 0x2000, MEMMAP_BOOTLOADER_RECLAIMABLE),
+        ];
+        // Declaration order, not address order — firmware lists them in whatever order
+        // it likes, so the first *encountered* aligned frame is taken and the test pins
+        // that this is deliberate rather than accidental.
+        assert_eq!(classify_low_memory(m, MIB).reclaimable_base, Some(0x9_0000));
+    }
+
+    #[test_case]
+    fn an_empty_map_reports_nothing_available() {
+        let low = classify_low_memory([], MIB);
+        assert_eq!(low.usable, 0);
+        assert_eq!(low.reclaimable, 0);
+        assert_eq!(low.other, 0);
+        assert_eq!(low.reclaimable_base, None);
+    }
 }

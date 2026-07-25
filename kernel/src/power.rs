@@ -29,6 +29,44 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+// --- PSCI SYSTEM_SUSPEND state layout -------------------------------------
+//
+// Lives here rather than in `arch::aarch64::suspend` for one specific reason: the unit
+// suite (`cargo xtask test`) is an **x86** build, so `arch::aarch64` is cfg-gated out of
+// it entirely and anything defined there is untestable. The offsets below are the one
+// place the Rust struct and the resume stub's assembly have to agree, which makes them
+// exactly the thing that must be covered — so they sit in a module both arches compile.
+
+/// State firmware does not restore. `#[repr(C)]`, and the offsets are mirrored in the
+/// assembly — `state_offsets_match_the_assembly` pins them.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PsciSavedState {
+    /// Set by the resume stub, so [`suspend`] can tell a resume from a refusal.
+    pub resumed: u64,
+    pub mair: u64,
+    pub tcr: u64,
+    pub ttbr0: u64,
+    pub vbar: u64,
+    pub cpacr: u64,
+    pub sctlr: u64,
+    pub sp: u64,
+    /// `x19`–`x28`, then `x29` (frame pointer) and `x30` (the return address).
+    pub regs: [u64; 12],
+}
+
+/// Offsets the assembly uses. Mirrored, not derived — hence the test.
+pub const S_RESUMED: usize = 0;
+pub const S_MAIR: usize = 8;
+pub const S_TCR: usize = 16;
+pub const S_TTBR0: usize = 24;
+pub const S_VBAR: usize = 32;
+pub const S_CPACR: usize = 40;
+pub const S_SCTLR: usize = 48;
+pub const S_SP: usize = 56;
+pub const S_REGS: usize = 64;
+
+
 /// How this machine suspends, if it can.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuspendKind {
@@ -174,6 +212,36 @@ fn probe() -> Plan {
         )),
     }
 
+    // The resume trampoline has to be reachable by a real-mode `CS:IP`, so it must come
+    // out of the first MiB — and whether the firmware's memory map leaves anything
+    // allocatable down there is a property of the machine, not something the kernel can
+    // arrange. Checked *here*, because a plan that reports "ready" and then refuses at
+    // the transition is a plan that lied.
+    let low = crate::mm::low_memory();
+    if let Some((phys, _)) = crate::mm::s3_page() {
+        // Reserved at boot, before the heap could take it — which it would have, since
+        // the heap maps a gigabyte upward from the lowest free frame.
+        report.push(alloc::format!(
+            "low:  trampoline page reserved at boot ({phys:#x}); first MiB had {} KiB usable",
+            low.usable / 1024
+        ));
+    } else if let Some(base) = low.reclaimable_base {
+        // Boot is long over by the time anyone types `/suspend`, and "reclaimable" is
+        // precisely the firmware's statement that this range is the OS's afterwards.
+        report.push(alloc::format!(
+            "low:  no usable frame below 1 MiB; would reclaim bootloader memory at {base:#x} ({} KiB available)",
+            low.reclaimable / 1024
+        ));
+    } else {
+        report.push(alloc::format!(
+            "MISSING low memory: the firmware leaves nothing below 1 MiB for the resume trampoline \
+             ({} KiB usable, {} KiB reclaimable, {} KiB reserved)",
+            low.usable / 1024,
+            low.reclaimable / 1024,
+            low.other / 1024
+        ));
+    }
+
     let ready = !report.iter().any(|l| l.contains("MISSING"));
     Plan {
         kind: Some(SuspendKind::AcpiS3),
@@ -240,11 +308,16 @@ fn enter() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
 fn enter() -> Result<(), String> {
-    Err(String::from(
-        "the transition is implemented for ACPI S3 on x86; PSCI SYSTEM_SUSPEND is next",
-    ))
+    crate::arch::aarch64::suspend::suspend().map_err(String::from)?;
+    resume_devices();
+    Ok(())
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn enter() -> Result<(), String> {
+    Err(String::from("no suspend mechanism on this architecture"))
 }
 
 /// Put back the device state firmware destroyed.
@@ -259,6 +332,24 @@ fn enter() -> Result<(), String> {
 /// `resume` of its own. Until then a resumed machine has a working console and scheduler
 /// but may need `/network dhcp` to get back on the network.
 fn resume_devices() {
+    // aarch64 needs much less: the resume stub already put back the MMU registers, the
+    // exception vectors and FP/SIMD, because nothing compiled can run without them. What
+    // is left is the interrupt controller and the generic timer, whose programming PSCI
+    // does not preserve — so this re-runs the real bring-up rather than only the unmask.
+    //
+    // Note what the log after a resume does *not* prove: `start_preemption`'s warmup
+    // waits for the tick counter to become non-zero, and after a resume it already is
+    // (it is a static that survived), so the check passes vacuously. On this path
+    // "preemptive scheduling" means "interrupts unmasked", not "timer IRQs observed".
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: at EL1 on the BSP with the vectors restored by the resume stub, which
+        // is the same precondition boot has — and `init_bsp` probes the CPU interface
+        // through the recoverable sync handler rather than assuming it exists.
+        unsafe { crate::arch::aarch64::gic::init_bsp() };
+        crate::arch::aarch64::gic::start_preemption();
+        crate::ktrace::log("resume", "GIC and generic timer re-programmed");
+    }
     #[cfg(target_arch = "x86_64")]
     {
         use crate::arch::x86_64;
@@ -275,5 +366,45 @@ fn resume_devices() {
         // The trampoline resumed with interrupts masked.
         x86_64::interrupts::enable();
         crate::ktrace::log("resume", "APIC timer, i8042 and interrupts re-armed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn psci_state_offsets_match_the_assembly() {
+        // The resume stub reads every one of these by displacement. A mismatch restores
+        // `TCR` from the `MAIR` slot, which is a translation fault the instant the MMU
+        // comes on — with no diagnostic, because the vectors are not up yet either.
+        assert_eq!(core::mem::offset_of!(PsciSavedState, resumed), S_RESUMED);
+        assert_eq!(core::mem::offset_of!(PsciSavedState, mair), S_MAIR);
+        assert_eq!(core::mem::offset_of!(PsciSavedState, tcr), S_TCR);
+        assert_eq!(core::mem::offset_of!(PsciSavedState, ttbr0), S_TTBR0);
+        assert_eq!(core::mem::offset_of!(PsciSavedState, vbar), S_VBAR);
+        assert_eq!(core::mem::offset_of!(PsciSavedState, cpacr), S_CPACR);
+        assert_eq!(core::mem::offset_of!(PsciSavedState, sctlr), S_SCTLR);
+        assert_eq!(core::mem::offset_of!(PsciSavedState, sp), S_SP);
+        assert_eq!(core::mem::offset_of!(PsciSavedState, regs), S_REGS);
+    }
+
+    #[test_case]
+    fn the_psci_register_area_holds_every_callee_saved_register() {
+        // x19-x28, plus the frame pointer and the return address: six `stp` pairs, and
+        // the stub's `ldp` offsets run to S_REGS + 80. One short and the resume would
+        // return to a stale address.
+        assert_eq!(core::mem::size_of::<[u64; 12]>(), 96);
+        assert_eq!(S_REGS + 80 + 16, core::mem::size_of::<PsciSavedState>());
+    }
+
+    #[test_case]
+    fn psci_stp_offsets_stay_within_the_immediate_range() {
+        // `stp`/`ldp` scale their immediate by 8 and allow -512..504. Every offset the
+        // assembly uses has to fit, or it does not assemble — but it also must not be
+        // silently rewritten into a different addressing form on a future edit.
+        for off in [S_REGS, S_REGS + 16, S_REGS + 32, S_REGS + 48, S_REGS + 64, S_REGS + 80] {
+            assert!(off % 8 == 0 && off <= 504, "stp offset {off} out of range");
+        }
     }
 }

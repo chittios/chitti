@@ -2103,7 +2103,12 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         for arg in ovmf_pflash_args()? {
             cmd.arg(arg);
         }
-        cmd.args(["-serial", "stdio"]);
+        // `mon:stdio` multiplexes QEMU's monitor onto the same stdio as the guest
+        // serial (Ctrl+A c toggles), which is what lets a test press hardware buttons:
+        // `system_powerdown` sets the ACPI power-button status bit and `system_wakeup`
+        // resumes from S3. aarch64 has always run this way; x86 used plain `stdio`, so
+        // those scenarios had no monitor to talk to on the arch that implements both.
+        cmd.args(["-serial", "mon:stdio"]);
         cmd.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", disk.display()));
         cmd.args(["-device", "virtio-blk-pci,drive=chittidisk,disable-modern=on"]);
         cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
@@ -2130,7 +2135,7 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         }
         eprintln!("booting via UEFI (OVMF) -- the same GOP framebuffer path real hardware uses");
     }
-    cmd.args(["-serial", "stdio"]);
+    cmd.args(["-serial", "mon:stdio"]);
     cmd.args(x86_run_extra_args()); // headless (-display none) + KVM on CI
     for a in remote_model_fw_cfg()? {
         cmd.arg(a);

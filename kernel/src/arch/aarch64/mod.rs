@@ -23,6 +23,7 @@ pub mod pl050_mouse;
 pub mod ramfb;
 pub mod rtc;
 pub mod smp;
+pub mod suspend;
 pub mod virtio_blk;
 pub mod virtio_input;
 pub mod virtio_net;

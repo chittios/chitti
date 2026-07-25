@@ -239,6 +239,34 @@ pub struct MemmapEntry {
 }
 
 pub const MEMMAP_USABLE: u64 = 0;
+/// Firmware-owned and never allocatable.
+pub const MEMMAP_RESERVED: u64 = 1;
+/// ACPI tables — reusable once the OS has finished reading them.
+pub const MEMMAP_ACPI_RECLAIMABLE: u64 = 2;
+pub const MEMMAP_ACPI_NVS: u64 = 3;
+pub const MEMMAP_BAD_MEMORY: u64 = 4;
+/// The bootloader's own structures. Free for the OS once boot is over — which is what
+/// "reclaimable" means, and the only source of low memory on a boot whose firmware
+/// marks the whole first MiB reserved.
+pub const MEMMAP_BOOTLOADER_RECLAIMABLE: u64 = 5;
+pub const MEMMAP_KERNEL_AND_MODULES: u64 = 6;
+pub const MEMMAP_FRAMEBUFFER: u64 = 7;
+
+/// A human-readable name for a memmap entry type, for diagnostics that have to explain
+/// *why* a physical range is unavailable rather than just that it is.
+pub fn memmap_type_name(t: u64) -> &'static str {
+    match t {
+        MEMMAP_USABLE => "usable",
+        MEMMAP_RESERVED => "reserved",
+        MEMMAP_ACPI_RECLAIMABLE => "acpi-reclaimable",
+        MEMMAP_ACPI_NVS => "acpi-nvs",
+        MEMMAP_BAD_MEMORY => "bad",
+        MEMMAP_BOOTLOADER_RECLAIMABLE => "bootloader-reclaimable",
+        MEMMAP_KERNEL_AND_MODULES => "kernel",
+        MEMMAP_FRAMEBUFFER => "framebuffer",
+        _ => "unknown",
+    }
+}
 
 /// Request the offset of the bootloader's higher-half direct map (HHDM):
 /// physical address `p` is reachable at virtual address `p + offset`.

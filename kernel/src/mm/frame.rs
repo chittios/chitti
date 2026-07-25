@@ -215,6 +215,19 @@ impl BitmapFrameAllocator {
         self.frame_count
     }
 
+    /// Mark the frame containing `phys` used, whatever it was before.
+    ///
+    /// For a frame that came from outside the allocator's own bookkeeping — the S3
+    /// trampoline's page, taken from bootloader-reclaimable memory the bitmap never
+    /// listed as free. Recording it here is what stops a later ordinary allocation from
+    /// handing the same page to something else.
+    pub fn mark_used(&mut self, phys: u64) {
+        let f = phys / FRAME_SIZE;
+        if f < self.frame_count {
+            set_bit(self.bitmap, f, true);
+        }
+    }
+
     pub fn free_frame_count(&self) -> u64 {
         (0..self.frame_count).filter(|&f| !get_bit(self.bitmap, f)).count() as u64
     }
