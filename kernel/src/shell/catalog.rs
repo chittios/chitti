@@ -139,6 +139,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "System & UI", title: "Date / Time", name: "datetime", shortcut: "" },
     Entry { category: "System & UI", title: "PCI Devices", name: "lspci", shortcut: "" },
     Entry { category: "System & UI", title: "Battery", name: "battery", shortcut: "" },
+    Entry { category: "System & UI", title: "Suspend", name: "suspend", shortcut: "" },
     Entry { category: "System & UI", title: "UI Config", name: "ui", shortcut: "" },
     Entry { category: "System & UI", title: "Theme", name: "theme", shortcut: "" },
     Entry { category: "System & UI", title: "Shortcuts", name: "shortcuts", shortcut: "" },

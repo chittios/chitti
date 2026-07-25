@@ -37,6 +37,7 @@ pub mod clipboard;
 pub mod clock;
 #[cfg(target_arch = "aarch64")]
 pub mod pci;
+pub mod power;
 pub mod console;
 pub mod cortex;
 pub mod fdt;

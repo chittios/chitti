@@ -590,6 +590,155 @@ pub fn parse_resources(crs: &[u8]) -> Resources {
     out
 }
 
+// --- FACS: where the resume entry point is published ----------------------
+//
+// The Firmware ACPI Control Structure is how an OS tells firmware where to jump
+// after a suspend-to-RAM: the OS writes its resume entry point into the waking
+// vector, then triggers the sleep transition, and on wake firmware jumps there.
+// Unusually for an ACPI table, the FACS is *not* in the XSDT — the FADT points at
+// it — and it has no checksum, so validation is the signature plus a plausible
+// length.
+
+/// FADT: 32-bit FACS address.
+const FADT_FIRMWARE_CTRL: usize = 36;
+/// FADT: 64-bit FACS address.
+const FADT_X_FIRMWARE_CTRL: usize = 132;
+
+/// Byte offset of the 32-bit **firmware waking vector** within the FACS.
+///
+/// Firmware enters this address in **real mode** on x86, which is why a resume path
+/// needs a trampoline in low memory rather than a plain function pointer.
+pub const FACS_FIRMWARE_WAKING_VECTOR: usize = 12;
+/// Byte offset of the 64-bit **extended** waking vector.
+pub const FACS_X_FIRMWARE_WAKING_VECTOR: usize = 24;
+/// Byte offset of the FACS version.
+const FACS_VERSION: usize = 32;
+/// Byte offset of the hardware signature.
+const FACS_HARDWARE_SIGNATURE: usize = 8;
+/// The specification's minimum FACS length.
+pub const FACS_MIN_LEN: usize = 64;
+
+/// What the FACS tells us, once located and validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FacsInfo {
+    /// Physical address of the structure — where a waking vector gets written.
+    pub addr: u64,
+    /// Declared length.
+    pub len: u32,
+    /// FACS version. Version 0 has no extended waking vector field.
+    pub version: u8,
+    /// Firmware's signature of the hardware configuration.
+    ///
+    /// ACPI requires an OS to compare this on resume with the value seen before
+    /// suspending, and to **not** resume if it changed: a different value means the
+    /// machine's configuration changed while it was asleep, so the saved state
+    /// describes hardware that is no longer there.
+    pub hardware_signature: u32,
+}
+
+impl FacsInfo {
+    /// True when this FACS is new enough to carry the 64-bit waking vector.
+    ///
+    /// Version 0 predates the field; writing there would scribble on reserved bytes
+    /// firmware may use for something else.
+    pub fn has_extended_waking_vector(&self) -> bool {
+        self.version >= 1 && self.len as usize >= FACS_X_FIRMWARE_WAKING_VECTOR + 8
+    }
+}
+
+/// Decode a FACS from its bytes.
+///
+/// `None` when the signature is wrong or the length is implausible. The FACS has no
+/// checksum, so those two checks are the whole of the validation available — which is
+/// the reason to do both rather than trust the FADT's pointer.
+pub fn facs_decode(addr: u64, facs: &[u8]) -> Option<FacsInfo> {
+    if facs.len() < FACS_MIN_LEN || &facs[0..4] != b"FACS" {
+        return None;
+    }
+    let len = read_u32(facs, 4)?;
+    if (len as usize) < FACS_MIN_LEN {
+        return None;
+    }
+    Some(FacsInfo {
+        addr,
+        len,
+        version: facs[FACS_VERSION],
+        hardware_signature: read_u32(facs, FACS_HARDWARE_SIGNATURE)?,
+    })
+}
+
+/// The FACS's physical address from a FADT, preferring the 64-bit field.
+pub fn fadt_facs(fadt: &[u8]) -> Option<u64> {
+    let x = read_u64(fadt, FADT_X_FIRMWARE_CTRL).unwrap_or(0);
+    let addr = if x != 0 {
+        x
+    } else {
+        read_u32(fadt, FADT_FIRMWARE_CTRL)? as u64
+    };
+    (addr != 0).then_some(addr)
+}
+
+/// Locate and validate the FACS.
+///
+/// `map` maps a physical address for reading, exactly as the DSDT path needs on x86
+/// (the tables live outside Limine's HHDM).
+pub fn facs_from_rsdp(rsdp: u64, map: impl Fn(u64, usize) -> u64) -> Option<FacsInfo> {
+    let f = find_table(rsdp, b"FACP")?;
+    // SAFETY: `find_table` mapped the FADT's full declared length.
+    let fadt = unsafe { table_slice(f)? };
+    let addr = fadt_facs(fadt)?;
+    // Same plausibility rule as the DSDT pointer: a value with bits above the
+    // platform's physical-address width becomes a page-table entry with reserved bits
+    // set, and that fault is much harder to read than this check is to write.
+    if addr >= (1 << 40) {
+        return None;
+    }
+    let va = map(addr, FACS_MIN_LEN) as *const u8;
+    // SAFETY: `map` just mapped at least `FACS_MIN_LEN` bytes at `va`.
+    let bytes = unsafe { core::slice::from_raw_parts(va, FACS_MIN_LEN) };
+    facs_decode(addr, bytes)
+}
+
+// --- Sleep states: any `_Sx`, not just `_S5_` -----------------------------
+
+/// Highest sleep state ACPI names with an `_Sx` package.
+pub const MAX_SLEEP_STATE: u8 = 5;
+
+/// Decode the `_Sx` package for one sleep state: the PM1a/PM1b sleep types.
+///
+/// The package's first two elements are `SLP_TYPa` and `SLP_TYPb`. A single-element
+/// package is legal — PM1b then has no sleep type of its own and reuses PM1a's, which
+/// is what firmware means by omitting it.
+///
+/// Pure, so the shape can be tested without a machine that implements the state.
+pub fn sleep_types(aml: &[u8], state: u8) -> Option<(u8, u8)> {
+    if state > MAX_SLEEP_STATE {
+        return None;
+    }
+    // `_S0` .. `_S5`; `aml::name_string` pads a short NameSeg with `_`.
+    let name = [b'_', b'S', b'0' + state];
+    let name = core::str::from_utf8(&name).ok()?;
+    let crate::aml::Value::Package(items) = crate::aml::find_name(aml, name)? else {
+        return None;
+    };
+    let a = items.first()?.as_int()?;
+    let b = items.get(1).and_then(|v| v.as_int()).unwrap_or(a);
+    Some((a as u8, b as u8))
+}
+
+/// Which sleep states this firmware declares, indexed by state number.
+///
+/// The presence of an `_Sx` package **is** the platform's declaration that it supports
+/// that state — there is no FADT flag for S3. So a machine with no `\_S3` cannot
+/// suspend to RAM, and that is a fact to report rather than a transition to attempt.
+pub fn supported_sleep_states(aml: &[u8]) -> [bool; MAX_SLEEP_STATE as usize + 1] {
+    let mut out = [false; MAX_SLEEP_STATE as usize + 1];
+    for (state, slot) in out.iter_mut().enumerate() {
+        *slot = sleep_types(aml, state as u8).is_some();
+    }
+    out
+}
+
 /// Everything needed to drive an ACPI **S5 (soft-off)** transition.
 ///
 /// The values come from two different tables, which is the awkward part: the
@@ -602,9 +751,16 @@ pub struct SleepInfo {
     pub pm1a_cnt: u16,
     /// `PM1b_CNT`, or 0 when the platform has no second block.
     pub pm1b_cnt: u16,
-    /// Sleep type for S5, from the DSDT `\_S5_` package.
+    /// Sleep type for [`Self::state`], from that state's DSDT `_Sx` package.
     pub slp_typa: u8,
     pub slp_typb: u8,
+    /// Which sleep state these values enter: 3 = suspend-to-RAM, 5 = soft-off.
+    ///
+    /// Carried explicitly because the *registers* are shared across states and only
+    /// the sleep type differs — so a value that came from `\_S3` and one that came
+    /// from `\_S5_` are indistinguishable without it, and writing the wrong one
+    /// powers a machine off when it was asked to sleep.
+    pub state: u8,
     /// `SMI_CMD` port and the `ACPI_ENABLE` value, for taking ownership from
     /// firmware when `SCI_EN` is clear (legacy BIOS boots; UEFI boots hand ACPI
     /// over already enabled).
@@ -651,6 +807,20 @@ pub fn find_rsdp(candidates: &[u64]) -> Option<u64> {
 /// `phys_to_virt` maps a physical table address for reading — identity on the
 /// aarch64 map, HHDM on x86.
 pub fn s5_from_rsdp(rsdp: u64, phys_to_virt: impl Fn(u64) -> u64) -> Option<SleepInfo> {
+    sleep_from_rsdp(rsdp, 5, phys_to_virt)
+}
+
+/// The PM1 registers and sleep type for **any** `_Sx` state.
+///
+/// `None` when the FADT is missing, its PM1a control block is not an I/O port, or the
+/// DSDT declares no `_Sx` package for `state` — the last of which is the normal answer
+/// on a machine that cannot enter that state, and must be reported rather than worked
+/// around.
+pub fn sleep_from_rsdp(
+    rsdp: u64,
+    state: u8,
+    phys_to_virt: impl Fn(u64) -> u64,
+) -> Option<SleepInfo> {
     let f = find_table(rsdp, b"FACP")?;
     // SAFETY: `find_table` mapped the FADT's full declared length.
     let fadt = unsafe { table_slice(f)? };
@@ -668,7 +838,11 @@ pub fn s5_from_rsdp(rsdp: u64, phys_to_virt: impl Fn(u64) -> u64) -> Option<Slee
     // The original pattern-scan stays as a fallback rather than being deleted — it is
     // tested, it works, and poweroff is not somewhere to trade a working path for a
     // new one without hardware to confirm on.
-    let (slp_typa, slp_typb) = s5_via_aml(dsdt).or_else(|| parse_s5_package(dsdt))?;
+    let (slp_typa, slp_typb) = sleep_via_aml(dsdt, state)
+        // The pattern-scan fallback only ever knew how to find `\_S5_`, and it stays
+        // for exactly that state: it is tested, it works, and poweroff is not somewhere
+        // to trade a working path for a new one without hardware to confirm on.
+        .or_else(|| (state == 5).then(|| parse_s5_package(dsdt)).flatten())?;
     Some(SleepInfo {
         pm1a_cnt: pm1.a_cnt,
         pm1b_cnt: pm1.b_cnt,
@@ -676,26 +850,20 @@ pub fn s5_from_rsdp(rsdp: u64, phys_to_virt: impl Fn(u64) -> u64) -> Option<Slee
         slp_typb,
         smi_cmd,
         acpi_enable,
+        state,
     })
 }
 
-/// Decode `\_S5_` through the AML layer: the first two package elements are the
-/// PM1a/PM1b sleep types. `None` if it is absent or not a package of integers, which
-/// sends the caller to the pattern-scan fallback.
-fn s5_via_aml(dsdt: *const u8) -> Option<(u8, u8)> {
+/// Decode an `_Sx` package through the AML layer. `None` if it is absent or not a
+/// package of integers, which sends an S5 caller to the pattern-scan fallback.
+fn sleep_via_aml(dsdt: *const u8, state: u8) -> Option<(u8, u8)> {
     // SAFETY: `dsdt` is a mapped table whose length is at offset 4.
     let len = le32(dsdt, 4) as usize;
     if len < 36 || len > 0x40_0000 {
         return None;
     }
     let aml = unsafe { core::slice::from_raw_parts(dsdt, len) };
-    let crate::aml::Value::Package(items) = crate::aml::find_name(aml, "_S5")? else {
-        return None;
-    };
-    let a = items.first()?.as_int()?;
-    // A single-element package is legal; PM1b then has no sleep type of its own.
-    let b = items.get(1).and_then(|v| v.as_int()).unwrap_or(a);
-    Some((a as u8, b as u8))
+    sleep_types(aml, state)
 }
 
 /// Find `\_S5_` in the DSDT and decode the two sleep-type values out of its
@@ -1013,6 +1181,160 @@ mod tests {
         let p = fadt_pm1(&f);
         assert_eq!(p.b_sts(), None);
         assert_eq!(p.b_en(), None);
+    }
+
+    // --- FACS and the _Sx sleep states --------------------------------------
+
+    /// A conforming FACS, version 2.
+    fn facs_bytes() -> alloc::vec::Vec<u8> {
+        let mut f = alloc::vec![0u8; 64];
+        f[0..4].copy_from_slice(b"FACS");
+        f[4..8].copy_from_slice(&64u32.to_le_bytes());
+        f[8..12].copy_from_slice(&0xdead_beefu32.to_le_bytes()); // hardware signature
+        f[32] = 2; // version
+        f
+    }
+
+    #[test_case]
+    fn decodes_a_facs() {
+        let f = facs_decode(0x7fff_2000, &facs_bytes()).unwrap();
+        assert_eq!(f.addr, 0x7fff_2000);
+        assert_eq!(f.len, 64);
+        assert_eq!(f.version, 2);
+        assert_eq!(f.hardware_signature, 0xdead_beef);
+        assert!(f.has_extended_waking_vector());
+    }
+
+    #[test_case]
+    fn a_facs_is_validated_by_signature_and_length_because_it_has_no_checksum() {
+        // Unusually for an ACPI table the FACS carries no checksum, so these two checks
+        // are the whole of the available validation — which is the reason to do both
+        // rather than trust the FADT's pointer and write a waking vector into whatever
+        // it named.
+        let mut bad = facs_bytes();
+        bad[0] = b'X';
+        assert!(facs_decode(0, &bad).is_none());
+
+        let mut short = facs_bytes();
+        short[4..8].copy_from_slice(&32u32.to_le_bytes()); // declared shorter than legal
+        assert!(facs_decode(0, &short).is_none());
+
+        assert!(facs_decode(0, &facs_bytes()[..40]).is_none()); // truncated buffer
+        assert!(facs_decode(0, &[]).is_none());
+    }
+
+    #[test_case]
+    fn a_version_0_facs_has_no_extended_waking_vector() {
+        // Version 0 predates the 64-bit field; writing there would scribble on reserved
+        // bytes firmware may be using for something else.
+        let mut f = facs_bytes();
+        f[32] = 0;
+        assert!(!facs_decode(0, &f).unwrap().has_extended_waking_vector());
+
+        // Version 1 has the field, but only if the table is long enough to hold it.
+        f[32] = 1;
+        assert!(facs_decode(0, &f).unwrap().has_extended_waking_vector());
+    }
+
+    #[test_case]
+    fn the_facs_address_comes_from_the_fadt_preferring_the_64_bit_field() {
+        let mut fadt = fadt_bytes();
+        fadt[36..40].copy_from_slice(&0x7fff_3000u32.to_le_bytes()); // FIRMWARE_CTRL
+        assert_eq!(fadt_facs(&fadt), Some(0x7fff_3000));
+
+        fadt[132..140].copy_from_slice(&0x7fff_4000u64.to_le_bytes()); // X_FIRMWARE_CTRL
+        assert_eq!(fadt_facs(&fadt), Some(0x7fff_4000));
+
+        // Neither set: no FACS, rather than address zero.
+        fadt[36..40].copy_from_slice(&0u32.to_le_bytes());
+        fadt[132..140].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(fadt_facs(&fadt), None);
+    }
+
+    #[test_case]
+    fn the_waking_vector_offsets_are_the_spec_ones() {
+        // Stage two writes a resume entry point at these offsets. Getting one wrong
+        // publishes an address firmware will jump to anyway, which is a machine that
+        // sleeps and never comes back — so they are pinned here rather than trusted to
+        // a comment.
+        assert_eq!(FACS_FIRMWARE_WAKING_VECTOR, 12);
+        assert_eq!(FACS_X_FIRMWARE_WAKING_VECTOR, 24);
+        assert_eq!(FACS_MIN_LEN, 64);
+    }
+
+    /// `Name (_Sx, Package () { a, b, 0, 0 })`
+    fn sx_package(state: u8, a: u8, b: u8) -> alloc::vec::Vec<u8> {
+        let items = alloc::vec![crate::aml::BYTE_PREFIX, a, crate::aml::BYTE_PREFIX, b];
+        let mut inner = alloc::vec![2u8];
+        inner.extend_from_slice(&items);
+        let mut pkg = alloc::vec![crate::aml::PACKAGE_OP, (inner.len() + 1) as u8];
+        pkg.extend_from_slice(&inner);
+        let mut v = alloc::vec![crate::aml::NAME_OP, b'_', b'S', b'0' + state, b'_'];
+        v.extend_from_slice(&pkg);
+        v
+    }
+
+    /// Wrap AML in a minimal table header, since the decoders take whole tables.
+    fn dsdt_with(body: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut t = alloc::vec![0u8; 36];
+        t[0..4].copy_from_slice(b"DSDT");
+        t.extend_from_slice(body);
+        let len = t.len() as u32;
+        t[4..8].copy_from_slice(&len.to_le_bytes());
+        t
+    }
+
+    #[test_case]
+    fn decodes_the_sleep_types_for_each_state() {
+        // The registers are shared across sleep states and only the sleep *type*
+        // differs, so reading the wrong `_Sx` powers a machine off when it was asked to
+        // sleep. Each state is looked up by its own name.
+        let mut body = sx_package(3, 5, 5);
+        body.extend_from_slice(&sx_package(5, 7, 7));
+        let dsdt = dsdt_with(&body);
+        let aml = &dsdt[36..];
+        assert_eq!(sleep_types(aml, 3), Some((5, 5)));
+        assert_eq!(sleep_types(aml, 5), Some((7, 7)));
+        assert_eq!(sleep_types(aml, 4), None);
+    }
+
+    #[test_case]
+    fn a_single_element_sx_package_reuses_pm1a_for_pm1b() {
+        // Legal, and what firmware means by omitting the second element: PM1b has no
+        // sleep type of its own. Treating the absence as zero would write 0 to a
+        // register that needs the same value as PM1a.
+        let mut pkg = alloc::vec![crate::aml::PACKAGE_OP, 4, 1, crate::aml::BYTE_PREFIX, 5];
+        let mut v = alloc::vec![crate::aml::NAME_OP, b'_', b'S', b'3', b'_'];
+        v.append(&mut pkg);
+        let dsdt = dsdt_with(&v);
+        assert_eq!(sleep_types(&dsdt[36..], 3), Some((5, 5)));
+    }
+
+    #[test_case]
+    fn supported_states_come_from_which_packages_exist() {
+        // The presence of an `_Sx` package *is* the platform's declaration that it
+        // supports that state — there is no FADT flag for S3 — so a machine with no
+        // `\\_S3` cannot suspend to RAM and that is a fact to report, not to work
+        // around.
+        let mut body = sx_package(3, 5, 5);
+        body.extend_from_slice(&sx_package(5, 7, 7));
+        let dsdt = dsdt_with(&body);
+        let s = supported_sleep_states(&dsdt[36..]);
+        assert!(s[3] && s[5]);
+        assert!(!s[1] && !s[2] && !s[4]);
+
+        // A desktop-style table with only soft-off.
+        let only5 = dsdt_with(&sx_package(5, 7, 7));
+        let s = supported_sleep_states(&only5[36..]);
+        assert!(s[5] && !s[3], "S3 must not be inferred from S5");
+    }
+
+    #[test_case]
+    fn a_state_out_of_range_is_refused() {
+        let dsdt = dsdt_with(&sx_package(3, 5, 5));
+        assert_eq!(sleep_types(&dsdt[36..], 6), None);
+        assert_eq!(sleep_types(&dsdt[36..], 200), None);
+        assert_eq!(sleep_types(&[], 3), None);
     }
 
     // --- _CRS resource templates ------------------------------------------

@@ -537,6 +537,66 @@ pub fn time_ms() -> u64 {
     cntvct() * 1000 / f
 }
 
+/// Whether PSCI calls may be issued on this machine at all.
+///
+/// **Fails open**, and that asymmetry is deliberate. Apple Silicon has no PSCI: its
+/// device tree carries no `arm,psci-*` node and an `hvc` there traps to EL2 (m1n1) and
+/// halts the guest — an uncatchable hang, not a status code. So PSCI is skipped only
+/// when a *valid* FDT explicitly lacks it. A boot with **no** FDT (QEMU/VirtualBox
+/// `-kernel`, the UEFI stub) is an SBSA-style platform where PSCI is the norm and keeps
+/// it; gating those on FDT contents once turned SMP off on QEMU entirely, because "no
+/// FDT" is not "FDT says no PSCI".
+///
+/// Shared by SMP bring-up and the suspend probe so the two cannot drift: a machine
+/// where `CPU_ON` is unsafe to call is a machine where `SYSTEM_SUSPEND` is too.
+pub fn psci_available() -> bool {
+    let fdt = boot::boot_x0();
+    // SAFETY: `boot_x0` is the FDT pointer (or a non-FDT value / 0, rejected by the
+    // header magic check inside `present`).
+    let fdt_present = unsafe { crate::fdt::present(fdt) };
+    if !fdt_present {
+        return true;
+    }
+    // SAFETY: as above; only consulted once the header validated.
+    unsafe {
+        crate::fdt::has_compatible(fdt, b"arm,psci-1.0")
+            || crate::fdt::has_compatible(fdt, b"arm,psci-0.2")
+            || crate::fdt::has_compatible(fdt, b"arm,psci")
+    }
+}
+
+/// PSCI `PSCI_FEATURES` (function id `0x8400_000A`): ask whether `query` is
+/// implemented. A non-negative return means yes; `NOT_SUPPORTED` (-1) means no.
+///
+/// Only call when [`psci_available`] is true — on a machine without PSCI this `hvc`
+/// does not return.
+pub fn psci_features(query: u32) -> i64 {
+    let ret: u64;
+    // SAFETY: PSCI_FEATURES has no memory effects and returns a status in x0; per
+    // SMCCC the callee may clobber x1-x3, which are declared.
+    unsafe {
+        core::arch::asm!(
+            "hvc #0",
+            inout("x0") 0x8400_000Au64 => ret,
+            in("x1") query as u64,
+            lateout("x2") _,
+            lateout("x3") _,
+            options(nomem, nostack),
+        );
+    }
+    ret as i64
+}
+
+/// PSCI 64-bit `SYSTEM_SUSPEND` function id.
+///
+/// The ARM analogue of ACPI S3, and a far smaller job for the OS: firmware saves and
+/// restores the CPU context itself, so the kernel supplies an entry point and a context
+/// value rather than a real-mode trampoline.
+pub const PSCI_SYSTEM_SUSPEND: u32 = 0xC400_000E;
+
+/// PSCI status for "this function is not implemented".
+pub const PSCI_NOT_SUPPORTED: i64 = -1;
+
 /// PSCI `SYSTEM_OFF` (function 0x8400_0008): power the machine off — how a
 /// `refcheck` build terminates QEMU on aarch64 (the x86 analogue is the
 /// isa-debug-exit device). QEMU `virt` exposes PSCI over HVC to an EL1 guest

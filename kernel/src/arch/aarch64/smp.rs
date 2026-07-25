@@ -269,17 +269,9 @@ pub fn init() {
     // ELF and the UEFI stub — are SBSA platforms where PSCI is the norm, so
     // they keep the PSCI bring-up (gating those on FDT contents once turned
     // SMP off on QEMU entirely: "no FDT" is not "FDT says no PSCI").
-    let fdt = super::boot::boot_x0();
-    // SAFETY: `boot_x0` is the FDT pointer (or non-FDT/0, rejected by the magic).
-    let fdt_present = unsafe { crate::fdt::present(fdt) };
-    // SAFETY: as above; only consulted when the header validated.
-    let has_psci = fdt_present
-        && unsafe {
-            crate::fdt::has_compatible(fdt, b"arm,psci-1.0")
-                || crate::fdt::has_compatible(fdt, b"arm,psci-0.2")
-                || crate::fdt::has_compatible(fdt, b"arm,psci")
-        };
-    if fdt_present && !has_psci {
+    // The same gate the suspend probe uses (`super::psci_available`), so the two
+    // cannot drift: where `CPU_ON` is unsafe to call, so is `SYSTEM_SUSPEND`.
+    if !super::psci_available() {
         crate::ktrace::log("smp", "FDT advertises no PSCI (Apple Silicon) -- single-core; Apple CPU-start is a follow-up");
         return;
     }

@@ -560,6 +560,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "memory" => run_memory_cmd(arg),
         "disks" => disk_list(),
         "battery" | "bat" => run_battery(),
+        "suspend" | "sleep" => run_suspend(arg),
         "ls" => fs_ls(arg),
         "mount" => disk_mount(arg),
         "umount" => disk_umount(arg),
@@ -7800,6 +7801,53 @@ fn update_composer_hint(remote_on: bool, remote_cfg: Option<&remote::RemoteConfi
 }
 #[cfg(test)]
 fn update_composer_hint(_remote_on: bool, _remote_cfg: Option<&remote::RemoteConfig>) {}
+
+/// `/suspend` — suspend the machine, or report why it cannot.
+///
+/// `/suspend plan` is read-only and enumerates every precondition, which is the useful
+/// form on a machine that will not suspend: a laptop with no `\_S3` package, ACPI mode
+/// still owned by firmware, or no FACS to publish a resume address in each fail for a
+/// different reason and need a different fix.
+///
+/// The transition itself confirms first. A suspend that does not resume loses
+/// everything unsaved and can only be escaped by holding the power button, so this is
+/// exactly the class of action the permission modal exists for.
+fn run_suspend(arg: &str) {
+    let plan = crate::power::plan();
+    let planning = matches!(arg.trim(), "plan" | "status" | "info" | "");
+    for line in &plan.report {
+        serial_println!("suspend> {line}");
+    }
+    match plan.kind {
+        Some(k) => serial_println!(
+            "suspend> mechanism: {} -- {}",
+            k.label(),
+            if plan.ready { "ready" } else { "NOT ready" }
+        ),
+        None => serial_println!("suspend> this machine cannot suspend"),
+    }
+    if planning {
+        serial_println!("suspend> `/suspend now` to actually suspend");
+        return;
+    }
+    if !plan.ready {
+        serial_println!("suspend> refusing: preconditions above are not met");
+        return;
+    }
+    #[cfg(not(test))]
+    if !crate::modal::confirm(
+        "Suspend the machine?",
+        "The machine will sleep. If it does not resume, unsaved state is lost and \
+         the only way back is holding the power button.",
+    ) {
+        serial_println!("suspend> cancelled");
+        return;
+    }
+    match crate::power::suspend() {
+        Ok(()) => serial_println!("suspend> resumed"),
+        Err(e) => serial_println!("suspend> not attempted: {e}"),
+    }
+}
 
 /// `/battery` — the ACPI battery, and which step failed if there is no reading.
 ///
