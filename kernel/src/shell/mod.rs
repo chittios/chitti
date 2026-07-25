@@ -2649,16 +2649,34 @@ static SPEECH_Q: crate::mm::Locked<alloc::collections::VecDeque<i16>> = crate::m
 /// Feed queued speech into free device periods (never blocks). Called from
 /// `ui_tick`, which the ONNX per-node loop pumps — that's what makes chunked
 /// TTS gapless: synthesis of chunk k+1 keeps chunk k's audio flowing.
+///
+/// Drivers that cannot report free slots (`out_free_bytes() == 0`, e.g. HDA /
+/// AC'97 single-shot DMA) fall back to: wait until not playing, then push a
+/// bounded batch. Without that fallback the queue never drains and
+/// `/voice say` hangs the shell forever after "speaking…".
 pub(crate) fn speech_pump() {
-    let free = crate::sound::out_free_bytes() / 2; // bytes → i16 samples
-    if free == 0 {
+    if SPEECH_Q.with(|q| q.is_empty()) {
+        return;
+    }
+    let free_bytes = crate::sound::out_free_bytes();
+    let free_samples = if free_bytes == 0 {
+        // Unknown free-slot accounting: only start a new play when the device
+        // is idle, then push up to ~1 s of 24 kHz mono.
+        if crate::sound::playing() {
+            return;
+        }
+        crate::sound::tts::RATE as usize // 1 second of samples
+    } else {
+        free_bytes / 2
+    };
+    if free_samples == 0 {
         return;
     }
     let slice: alloc::vec::Vec<i16> = SPEECH_Q.with(|q| {
         if q.is_empty() {
             return alloc::vec::Vec::new();
         }
-        let n = free.min(q.len());
+        let n = free_samples.min(q.len());
         q.drain(..n).collect()
     });
     if !slice.is_empty() {
@@ -2697,25 +2715,18 @@ pub(crate) fn split_speech(text: &str) -> alloc::vec::Vec<alloc::string::String>
     out
 }
 
-/// `/voice say <text>` — text-to-speech via KittenTTS (G2P → model → playback),
-/// **chunked**: each clause plays as soon as it is synthesized while the next
-/// one runs on the SMP fleet, so speech starts in ~a second instead of after
-/// the whole utterance. Ctrl+C stops between chunks and drains the queue.
-fn voice_say(text: &str) {
-    if !crate::sound::is_up() {
-        serial_println!("voice> no sound device");
-        return;
+/// Chunked TTS core shared by `/voice say` and the conversation loop.
+/// Returns total samples synthesized (0 on early failure).
+fn speak_text(text: &str) -> usize {
+    if !crate::sound::is_up() || text.trim().is_empty() {
+        return 0;
     }
-    // Remote TTS (human-configured) wins over the local model — but reuses the
-    // exact same chunked queue, so playback still streams per clause.
     let remote_tts = voice_remote::load().tts;
     if remote_tts.is_none() && !ensure_voice_model("kitten") {
-        serial_println!("voice> no kitten model found (bundle it in the image, /voice models load kitten <path>, or /voice remote tts …)");
-        return;
-    }
-    match &remote_tts {
-        Some(e) => serial_println!("voice> synthesizing via {} \u{201c}{}\u{201d}\u{2026}", e.provider.name(), text),
-        None => serial_println!("voice> synthesizing \u{201c}{}\u{201d}\u{2026}", text),
+        serial_println!(
+            "voice> no kitten model found (bundle it in the image, /voice models load kitten <path>, or /voice remote tts …)"
+        );
+        return 0;
     }
     let chunks = split_speech(text);
     let t0 = crate::arch::now_ms();
@@ -2740,7 +2751,7 @@ fn voice_say(text: &str) {
                 speech_pump();
             }
             Err(e) => {
-                serial_println!("voice> {}", e);
+                serial_println!("voice> tts: {}", e);
                 break;
             }
         }
@@ -2750,17 +2761,64 @@ fn voice_say(text: &str) {
         }
     }
     // Drain: keep feeding until the queue and device empty (or Ctrl+C).
+    // Bound the wait so a stuck DMA completion (or free-bytes==0 bug) can never
+    // freeze the shell: audio_duration + 5 s grace, min 3 s.
+    let ms_audio = if total == 0 {
+        0
+    } else {
+        (total as u64)
+            .saturating_mul(1000)
+            .saturating_div(crate::sound::tts::RATE as u64)
+    };
+    let deadline = crate::arch::now_ms()
+        .saturating_add(ms_audio.saturating_add(5_000).max(3_000));
     while SPEECH_Q.with(|q| !q.is_empty()) || crate::sound::playing() {
         speech_pump();
-        ui_tick();
+        // Full upkeep so USB keyboard / net / UI keep working during playback.
+        upkeep();
         crate::sched::yield_now();
-        if poll_cancel() {
+        if poll_cancel() || poll_interrupt() {
             cancelled = true;
             SPEECH_Q.with(|q| q.clear());
             break;
         }
+        if crate::arch::now_ms() >= deadline {
+            serial_println!(
+                "voice> playback timeout (queue still {} samples) — giving up",
+                SPEECH_Q.with(|q| q.len())
+            );
+            SPEECH_Q.with(|q| q.clear());
+            break;
+        }
     }
-    serial_println!("voice> {} samples; {}", total, if cancelled { "cancelled" } else { "done" });
+    if cancelled {
+        serial_println!("voice> {} samples; cancelled", total);
+    }
+    total
+}
+
+/// `/voice say <text>` — text-to-speech via KittenTTS (G2P → model → playback),
+/// **chunked**: each clause plays as soon as it is synthesized while the next
+/// one runs on the SMP fleet, so speech starts in ~a second instead of after
+/// the whole utterance. Ctrl+C stops between chunks and drains the queue.
+fn voice_say(text: &str) {
+    if !crate::sound::is_up() {
+        serial_println!("voice> no sound device");
+        return;
+    }
+    let remote_tts = voice_remote::load().tts;
+    match &remote_tts {
+        Some(e) => serial_println!(
+            "voice> synthesizing via {} \u{201c}{}\u{201d}\u{2026}",
+            e.provider.name(),
+            text
+        ),
+        None => serial_println!("voice> synthesizing \u{201c}{}\u{201d}\u{2026}", text),
+    }
+    let total = speak_text(text);
+    if total > 0 {
+        serial_println!("voice> {} samples; done", total);
+    }
 }
 
 /// `/onnx info|run <path>` — the generic ONNX runtime surface: inspect or
@@ -2935,9 +2993,10 @@ fn voice_models() {
     serial_println!("  host: cargo xtask voice-assets  (downloads into assets/voice/)");
 }
 
-/// `/voice stt </path/file.wav>` — transcribe a 16 kHz mono WAV from a mounted
-/// volume through the STT front-end. Mic-independent, so the mel + CTC path is
-/// exercisable without microphone hardware/permission.
+/// `/voice stt </path/file.wav>` — transcribe a WAV from a mounted volume
+/// through the STT front-end. Mic-independent, so the mel + CTC path is
+/// exercisable without microphone hardware/permission. Any PCM rate is
+/// resampled to 16 kHz for the local parakeet front-end.
 fn voice_stt_file(path: &str) {
     let remote_stt = voice_remote::load().stt;
     if remote_stt.is_none() && !ensure_voice_model("parakeet") {
@@ -2951,51 +3010,75 @@ fn voice_stt_file(path: &str) {
             return;
         }
     };
-    let pcm = match wav_to_pcm16(&bytes) {
+    let (pcm_src, rate) = match wav_to_pcm16(&bytes) {
         Some(p) => p,
         None => {
             serial_println!("voice> not a 16-bit PCM WAV: {}", path);
             return;
         }
     };
-    // STT WAVs are 16 kHz mono (the parakeet front-end + the mic path both use
-    // it); `wav_to_pcm16` downmixes to mono but keeps the source rate, so pass
-    // 16000 as the upload rate — providers resample server-side.
+    // Local STT is hard-wired to 16 kHz mel; remote providers accept the
+    // source rate (they resample server-side) but we still normalise for
+    // consistent local behaviour.
+    let pcm = if rate != 16_000 {
+        serial_println!("voice> resampling {} Hz → 16 kHz ({} samples)", rate, pcm_src.len());
+        crate::sound::resample(&pcm_src, rate, 16_000)
+    } else {
+        pcm_src
+    };
     match &remote_stt {
         Some(e) => {
-            serial_println!("voice> {}: {} samples; transcribing via {}\u{2026}", path, pcm.len(), e.provider.name());
+            serial_println!(
+                "voice> {}: {} samples @16k; transcribing via {}\u{2026}",
+                path,
+                pcm.len(),
+                e.provider.name()
+            );
             match voice_remote::transcribe(e, &pcm, 16_000) {
                 Ok(text) => serial_println!("voice> stt> {}", text),
                 Err(err) => serial_println!("voice> {}", err),
             }
         }
         None => {
-            serial_println!("voice> {}: {} samples; transcribing\u{2026}", path, pcm.len());
+            serial_println!("voice> {}: {} samples @16k; transcribing\u{2026}", path, pcm.len());
             let text = crate::sound::stt::transcribe(&pcm);
             serial_println!("voice> stt> {}", text);
         }
     }
 }
 
-/// Minimal RIFF/WAVE parser: returns mono S16LE samples (averaging stereo).
-/// Handles the standard 44-byte header; scans chunks for `data`.
-fn wav_to_pcm16(b: &[u8]) -> Option<alloc::vec::Vec<i16>> {
+/// Minimal RIFF/WAVE parser: returns mono S16LE samples (averaging stereo) and
+/// the source sample rate. Handles the standard 44-byte header; scans chunks
+/// for `fmt ` + `data`. Only 16-bit PCM is supported.
+fn wav_to_pcm16(b: &[u8]) -> Option<(alloc::vec::Vec<i16>, u32)> {
     if b.len() < 12 || &b[0..4] != b"RIFF" || &b[8..12] != b"WAVE" {
         return None;
     }
     let mut pos = 12;
     let mut channels = 1u16;
+    let mut rate = 16_000u32;
+    let mut bits = 16u16;
     let mut data: Option<&[u8]> = None;
     while pos + 8 <= b.len() {
         let id = &b[pos..pos + 4];
         let sz = u32::from_le_bytes([b[pos + 4], b[pos + 5], b[pos + 6], b[pos + 7]]) as usize;
         let body = b.get(pos + 8..pos + 8 + sz)?;
-        if id == b"fmt " && body.len() >= 4 {
+        if id == b"fmt " && body.len() >= 16 {
+            // audio format 1 = PCM
+            let fmt = u16::from_le_bytes([body[0], body[1]]);
+            if fmt != 1 {
+                return None;
+            }
             channels = u16::from_le_bytes([body[2], body[3]]).max(1);
+            rate = u32::from_le_bytes([body[4], body[5], body[6], body[7]]).max(1);
+            bits = u16::from_le_bytes([body[14], body[15]]);
         } else if id == b"data" {
             data = Some(body);
         }
         pos += 8 + sz + (sz & 1); // chunks are word-aligned
+    }
+    if bits != 16 {
+        return None;
     }
     let data = data?;
     let ch = channels as usize;
@@ -3007,7 +3090,7 @@ fn wav_to_pcm16(b: &[u8]) -> Option<alloc::vec::Vec<i16>> {
         }
         out.push((acc / ch as i32) as i16);
     }
-    Some(out)
+    Some((out, rate))
 }
 
 /// Sound self-test: play a short tone, then sample the mic for 2 s and report
@@ -3073,16 +3156,25 @@ fn voice_talk(
         serial_println!("voice> no sound device found");
         return;
     }
-    // The conversation loop needs STT (hear) and TTS (speak); load both up front
-    // so the first utterance doesn't stall mid-turn. Missing models degrade the
-    // loop rather than abort it (STT-only or TTS-only still narrates).
-    let have_stt = ensure_voice_model("parakeet");
-    let have_tts = ensure_voice_model("kitten");
+    // The conversation loop needs STT (hear) and TTS (speak). Prefer a
+    // human-configured remote endpoint; otherwise load the local ONNX models.
+    // Missing backends degrade the loop rather than abort it.
+    let voice_cfg = voice_remote::load();
+    let have_stt = voice_cfg.stt.is_some() || ensure_voice_model("parakeet");
+    let have_tts = voice_cfg.tts.is_some() || ensure_voice_model("kitten");
     if !have_stt {
-        serial_println!("voice> no parakeet (STT) model — utterances will be captured but not transcribed");
+        serial_println!(
+            "voice> no STT backend — load parakeet (`/voice models load parakeet`) or `/voice remote stt …`"
+        );
+    } else if voice_cfg.stt.is_some() {
+        serial_println!("voice> STT: remote ({})", voice_cfg.stt.as_ref().unwrap().provider.name());
     }
     if !have_tts {
-        serial_println!("voice> no kitten (TTS) model — replies will be printed, not spoken");
+        serial_println!(
+            "voice> no TTS backend — load kitten (`/voice models load kitten`) or `/voice remote tts …`"
+        );
+    } else if voice_cfg.tts.is_some() {
+        serial_println!("voice> TTS: remote ({})", voice_cfg.tts.as_ref().unwrap().provider.name());
     }
     // LLM: same backend as shell chat.
     if remote_on {
@@ -3217,18 +3309,27 @@ fn voice_converse_turn(
     have_tts: bool,
     levels: &mut alloc::vec::Vec<f32>,
 ) {
-    // 1. Hear.
+    // 1. Hear — remote STT if configured, else local parakeet.
     let heard = if have_stt {
         crate::framebuffer::draw_voice(levels, "transcribing\u{2026}");
-        let t = crate::sound::stt::transcribe(clip);
+        let t = match voice_remote::load().stt {
+            Some(e) => match voice_remote::transcribe(&e, clip, 16_000) {
+                Ok(s) => s,
+                Err(err) => {
+                    serial_println!("voice> remote stt: {err}");
+                    alloc::string::String::new()
+                }
+            },
+            None => crate::sound::stt::transcribe(clip),
+        };
         serial_println!("voice> you: {}", t);
         t
     } else {
         alloc::string::String::new()
     };
     let heard = heard.trim();
-    if heard.is_empty() {
-        // STT unavailable or produced nothing intelligible: keep listening.
+    // Treat diagnostic placeholders as "nothing heard".
+    if heard.is_empty() || (heard.starts_with('(') && heard.ends_with(')')) {
         serial_println!("voice> (nothing to transcribe \u{2014} continuing to listen)");
         return;
     }
@@ -3267,19 +3368,10 @@ fn voice_converse_turn(
     if reply.is_empty() {
         return;
     }
-    // 3. Speak.
+    // 3. Speak — same chunked/remote path as `/voice say` (first audio ASAP).
     if have_tts {
         crate::framebuffer::draw_voice(levels, "speaking\u{2026}");
-        match crate::sound::tts::synth(reply) {
-            Ok(pcm) => {
-                let _ = crate::sound::play(&pcm, crate::sound::tts::RATE);
-                while crate::sound::playing() {
-                    ui_tick();
-                    crate::sched::yield_now();
-                }
-            }
-            Err(e) => serial_println!("voice> tts: {}", e),
-        }
+        let _ = speak_text(reply);
     }
 }
 

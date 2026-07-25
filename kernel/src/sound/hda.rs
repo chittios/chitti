@@ -641,6 +641,11 @@ impl SndDevice for Hda {
         // path; see `fmt`/`hw_rate`.)
         const PLAY_HZ: u32 = 48_000;
         const PLAY_FMT: u16 = 1 << 4; // base 48 kHz, 16-bit, mono
+        // Single-shot DMA: refuse to start a new transfer while one is running
+        // (speech_pump waits for !playing() via out_free_bytes).
+        if self.playing() {
+            return Err("hda: still playing");
+        }
         let samples: Vec<i16> = crate::sound::resample(pcm, hz, PLAY_HZ);
         let bytes = samples.len() * 2;
         if bytes == 0 {
@@ -678,6 +683,17 @@ impl SndDevice for Hda {
         Ok(())
     }
 
+    /// Free bytes the speech pump can enqueue: whole second when idle, 0 while
+    /// the single DMA buffer is still running.
+    fn out_free_bytes(&mut self) -> usize {
+        if self.playing() {
+            0
+        } else {
+            // 1 s of 24 kHz mono S16 — matches the speech_pump fallback batch.
+            24_000 * 2
+        }
+    }
+
     fn playing(&mut self) -> bool {
         if !self.play_open {
             return false;
@@ -685,8 +701,12 @@ impl SndDevice for Hda {
         // SAFETY: live stream registers.
         unsafe {
             let sd = self.out_sd;
-            if r8(sd + SD_STS) & SDSTS_BCIS != 0 {
-                // Last buffer completed: stop before the cyclic engine replays.
+            // Buffer completion (IOC) *or* stream no longer RUN: some firmwares
+            // clear RUN without setting BCIS — treat either as done so we never
+            // hang the speech drain loop.
+            let sts = r8(sd + SD_STS);
+            let ctl = r32(sd + SD_CTL);
+            if sts & SDSTS_BCIS != 0 || ctl & SDCTL_RUN == 0 {
                 w32(sd + SD_CTL, 0);
                 w8(sd + SD_STS, SDSTS_BCIS);
                 self.play_open = false;

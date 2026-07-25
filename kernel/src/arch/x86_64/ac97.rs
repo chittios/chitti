@@ -163,6 +163,15 @@ impl SndDevice for Ac97 {
         Ok(())
     }
 
+    fn out_free_bytes(&mut self) -> usize {
+        // Single-shot BDL play: only accept more when idle.
+        if self.playing() {
+            0
+        } else {
+            24_000 * 2 // 1 s of 24 kHz mono S16
+        }
+    }
+
     fn playing(&mut self) -> bool {
         if !self.play_open {
             return false;

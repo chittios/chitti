@@ -164,6 +164,14 @@ impl SndDevice for Sb16 {
         Ok(())
     }
 
+    fn out_free_bytes(&mut self) -> usize {
+        if self.playing() {
+            0
+        } else {
+            24_000 * 2
+        }
+    }
+
     fn playing(&mut self) -> bool {
         if !self.play_open {
             return false;
