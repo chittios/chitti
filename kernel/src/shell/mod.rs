@@ -12207,27 +12207,95 @@ fn disk_ls_volume(n: usize) {
     }
 }
 
-/// Parse `/install` arguments: `(pre_confirmed, force_format, target_disk)`.
+/// Parse `/install` arguments into [`InstallArgs`].
 /// Tokens in any order: an optional numeric disk index, `yes` (skip the
-/// confirmation modal — for scripted use), and `format` (force a full
-/// repartition even when an existing Chitti install would be updated in
-/// place).
-fn parse_install_args(arg: &str) -> (bool, bool, Option<usize>) {
-    let mut confirm = false;
-    let mut format = false;
-    let mut target = None;
+/// confirmation modal — for scripted use), `format` (force a full repartition
+/// even when an existing Chitti install would be updated in place), and `plan`
+/// (read-only: report a possible install alongside an existing OS, write
+/// nothing).
+fn parse_install_args(arg: &str) -> InstallArgs {
+    let mut a = InstallArgs::default();
     for tok in arg.split_whitespace() {
         match tok {
-            "yes" => confirm = true,
-            "format" => format = true,
+            "yes" => a.pre_confirmed = true,
+            "format" => a.force_format = true,
+            "plan" => a.plan_only = true,
             t => {
                 if let Ok(n) = t.parse::<usize>() {
-                    target = Some(n);
+                    a.target = Some(n);
                 }
             }
         }
     }
-    (confirm, format, target)
+    a
+}
+
+/// Parsed `/install` arguments.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+struct InstallArgs {
+    pre_confirmed: bool,
+    force_format: bool,
+    /// `plan`: report what an install alongside the existing OS would do and
+    /// change **nothing**. Read-only, no modal, no confirmation — the point is to
+    /// be able to ask "will ChittiOS fit next to Windows on this machine?" without
+    /// risking the machine to find out.
+    plan_only: bool,
+    target: Option<usize>,
+}
+
+/// Report what installing **alongside** the existing OS on `target_idx` would do,
+/// and change nothing.
+///
+/// This is `/install plan`. It exists because the only way to find out whether
+/// ChittiOS fits next to Windows used to be to run `/install`, which writes a
+/// fresh GPT over the whole disk — you had to risk the machine to learn the
+/// answer. Every operation here is a read.
+///
+/// It reports rather than decides: the planner ([`gpt::plan_alongside`]) refuses
+/// when there is no ESP to share or no single gap big enough, and this prints that
+/// refusal with the free space it did find, so the reason is visible.
+fn install_plan(target_idx: usize) {
+    use crate::block::{gpt, BlockDevice};
+    let Some(mut dev) = crate::block::probe_disk_nth(target_idx) else {
+        serial_println!("install> no disk {target_idx} (see /disks)");
+        return;
+    };
+    let total = dev.block_count();
+    let Some((is_chitti, parts)) = gpt::read(&mut dev) else {
+        serial_println!("install> disk {target_idx} has no GPT ({total} sectors) -- nothing to install alongside;");
+        serial_println!("install>   a plain `/install {target_idx}` would partition the whole disk.");
+        return;
+    };
+    serial_println!("install> disk {target_idx}: {total} sectors, {} partition(s){}", parts.len(), if is_chitti { " (an existing ChittiOS disk)" } else { "" });
+    for p in &parts {
+        let mib = (p.last_lba.saturating_sub(p.first_lba) + 1) / 2048;
+        serial_println!("install>   {:>10}..{:<10} {:>7} MiB  {}", p.first_lba, p.last_lba, mib, p.name);
+    }
+    // 8 GiB of ext4 for the OS + model, and an ESP with room for our loader.
+    const NEED_SECTORS: u64 = 8 * 1024 * 2048;
+    const MIN_ESP_SECTORS: u64 = 64 * 2048; // 64 MiB
+    let free = gpt::free_extents(&parts, total, 2048);
+    if free.is_empty() {
+        serial_println!("install> no unallocated space -- shrink a Windows partition first (Disk Management)");
+    } else {
+        serial_println!("install> unallocated:");
+        for e in &free {
+            serial_println!("install>   {:>10}..{:<10} {:>7} MiB", e.first_lba, e.last_lba, e.sectors() / 2048);
+        }
+    }
+    match gpt::plan_alongside(&parts, total, NEED_SECTORS, MIN_ESP_SECTORS) {
+        Some(plan) => {
+            serial_println!("install> PLAN: share the existing ESP at {}..{} (adds our loader; Windows' stays)", plan.esp_first_lba, plan.esp_last_lba);
+            serial_println!("install>       new ChittiOS ext4 at {}..{} ({} MiB)", plan.os_first_lba, plan.os_last_lba, (plan.os_last_lba - plan.os_first_lba + 1) / 2048);
+            serial_println!("install>       existing partitions: untouched");
+            serial_println!("install> NOT YET EXECUTABLE: writing the loader into an existing ESP needs FAT32");
+            serial_println!("install>   write-into-existing-volume support, which is not implemented. `/install`");
+            serial_println!("install>   still repartitions the WHOLE disk and would erase the above.");
+        }
+        None => {
+            serial_println!("install> cannot install alongside: need an ESP >= {} MiB to share and {} MiB contiguous free", MIN_ESP_SECTORS / 2048, NEED_SECTORS / 2048);
+        }
+    }
 }
 
 /// The `/install` human gate: a permission modal (destructive actions are
@@ -12264,7 +12332,12 @@ fn disk_install(arg: &str) {
     use crate::block::{ext4::{Ext4Writer, FileSpec}, fat::FatWriter, gpt, BlockDevice, Partition};
     use alloc::string::String;
     use alloc::vec::Vec;
-    let (pre_confirmed, force_format, target_override) = parse_install_args(arg);
+    let a = parse_install_args(arg);
+    let (pre_confirmed, force_format, target_override) = (a.pre_confirmed, a.force_format, a.target);
+    if a.plan_only {
+        install_plan(target_override.unwrap_or(0));
+        return;
+    }
     let (Some(efi), Some(kernel)) = (crate::cortex::find_module("BOOTX64.EFI"), crate::cortex::find_module("payload/chitti-kernel")) else {
         serial_println!("install> installer payload missing (BOOTX64.EFI / kernel modules) -- build the ISO with xtask");
         return;
@@ -12383,7 +12456,12 @@ fn disk_install(arg: &str) {
 fn disk_install(arg: &str) {
     use crate::block::{ext4::Ext4Writer, fat::FatWriter, fat_read::FatReader, gpt, BlockDevice, Partition};
     use crate::fs::detect::FsType;
-    let (pre_confirmed, force_format, target_override) = parse_install_args(arg);
+    let a = parse_install_args(arg);
+    let (pre_confirmed, force_format, target_override) = (a.pre_confirmed, a.force_format, a.target);
+    if a.plan_only {
+        install_plan(target_override.unwrap_or(0));
+        return;
+    }
     // Identify the boot ESP (payload source): the FAT volume containing
     // `chitti-kernel`. Scan every disk's *volumes* (via the FS detector), so it
     // is found whether the ESP is a bare FAT disk (fresh `--uefi` boot) OR a GPT
