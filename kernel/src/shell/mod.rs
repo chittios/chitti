@@ -5909,7 +5909,7 @@ fn run_agent_start(
                         *chat = None;
                     }
                     serial_println!(
-                        "agents> started package UI '{pkg}' (surface {sid}) — tools from assets/tools.wasm"
+                        "agents> started package UI '{pkg}' (surface {sid}) — action pane focused; keys go to the app (Ctrl+Tab for chat)"
                     );
                 }
                 Err(e) => serial_println!("agents> {pkg} start failed: {e}"),

@@ -18,6 +18,7 @@
 //! one persistent instance per app session; the bump heap resets per call, so
 //! no static may hold a heap type).
 
+use crate::endscreen::{self, Outcome};
 use crate::rules;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -33,6 +34,7 @@ const OY: i32 = 0;
 
 /// The static shortcut line shown under the status in the HUD.
 const SHORTCUTS: &str = "arrows/click move  enter select  esc clear  n new game";
+const SHORTCUTS_ENDED: &str = "enter / n / r  new game";
 
 const START_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 const SELECT_COLOR: &str = "cc785c";
@@ -48,6 +50,8 @@ static mut SEL: (u8, u8) = (0xff, 0xff);
 static mut CUR: (u8, u8) = (4, 1);
 /// A model opponent is available (from the runtime's `model` start flag).
 static mut MODEL: u8 = 0;
+/// End-of-game overlay: 0 = playing, 1 = white/you win, 2 = black/agent wins, 3 = draw.
+static mut ENDED: u8 = 0;
 /// An `ask:` (agent move) is in flight — inputs are ignored until `on_reply`.
 static mut WAITING: u8 = 0;
 /// Black to move on start/restore: emit `ask:` from the next `tick` so open
@@ -125,11 +129,34 @@ fn parse_move_reply(reply: &str, legal: &[(String, String)]) -> Option<(String, 
 /// Set the HUD (status line + shortcut line). Rendered crisp in the reserved
 /// pane-space strip by the compositor — `dots` animates a thinking indicator.
 fn paint_hud(status: &str, dots: &str) {
-    crate::hud_set(&format!("{status}{dots}\n{SHORTCUTS}"));
+    let sc = if unsafe { ENDED != 0 } {
+        SHORTCUTS_ENDED
+    } else {
+        SHORTCUTS
+    };
+    crate::hud_set(&format!("{status}{dots}\n{sc}"));
+}
+
+/// Classify and store end-of-game for the in-canvas modal.
+fn set_ended_from(fen: &str, over: bool, in_check: bool) {
+    if !over {
+        unsafe { ENDED = 0 };
+        return;
+    }
+    // Side to move has no moves: if in check → mate (previous mover wins).
+    unsafe {
+        ENDED = if !in_check {
+            3 // draw
+        } else if white_to_move(fen) {
+            2 // white to move is mated → black wins
+        } else {
+            1 // black mated → white wins
+        };
+    }
 }
 
 /// Repaint everything: board (host primitive), selection + legal marks,
-/// cursor, HUD.
+/// cursor, HUD, and optional end-game modal.
 fn paint(status: &str) {
     let fen = fen_get();
     crate::board_set(&fen);
@@ -147,6 +174,25 @@ fn paint(status: &str) {
         crate::board_mark(&cur, CURSOR_COLOR);
     }
     paint_hud(status, "");
+    // End-game celebration / restart modal over the board.
+    match unsafe { ENDED } {
+        1 => {
+            let mut ops = String::new();
+            endscreen::append(&mut ops, Outcome::Win);
+            crate::ui_draw(&ops);
+        }
+        2 => {
+            let mut ops = String::new();
+            endscreen::append(&mut ops, Outcome::Lose);
+            crate::ui_draw(&ops);
+        }
+        3 => {
+            let mut ops = String::new();
+            endscreen::append(&mut ops, Outcome::Draw);
+            crate::ui_draw(&ops);
+        }
+        _ => {}
+    }
 }
 
 fn turn_status(fen: &str) -> String {
@@ -166,6 +212,7 @@ pub fn start(args: &str) -> String {
         MODEL = if args.contains("\"model\":true") { 1 } else { 0 };
         WAITING = 0;
         PENDING_ASK = 0;
+        ENDED = 0;
         SEL = (0xff, 0xff);
         CUR = (4, 1);
     }
@@ -178,11 +225,14 @@ pub fn start(args: &str) -> String {
         START_FEN.to_string()
     };
     fen_set(&fen);
+    // Restored position may already be finished.
+    let legal_empty = all_legal_moves(&fen).is_empty();
+    set_ended_from(&fen, legal_empty, rules::in_check(&fen));
     paint(&turn_status(&fen));
     // A restored game may already be on the agent's turn — do NOT run the
     // model ask inline here: `handle_result` would block the shell for a full
     // inference turn before the board is usable. Defer to the next `tick`.
-    if unsafe { MODEL != 0 } && !white_to_move(&fen) {
+    if unsafe { ENDED == 0 && MODEL != 0 } && !white_to_move(&fen) {
         unsafe { PENDING_ASK = 1 };
         paint_hud("Agent to move (Black)…", "");
     }
@@ -195,6 +245,7 @@ fn new_game() -> String {
         CUR = (4, 1);
         WAITING = 0;
         PENDING_ASK = 0;
+        ENDED = 0;
     }
     fen_set(START_FEN);
     paint("New game - your move (White)");
@@ -205,10 +256,12 @@ fn new_game() -> String {
 fn agent_ask(fen: &str) -> String {
     let legal = all_legal_moves(fen);
     if legal.is_empty() {
-        let over = if rules::in_check(fen) {
-            "Checkmate - you win! (n = new game)"
+        let check = rules::in_check(fen);
+        set_ended_from(fen, true, check);
+        let over = if check {
+            "Checkmate — you win!"
         } else {
-            "Stalemate - draw (n = new game)"
+            "Stalemate — draw"
         };
         paint(over);
         return format!("ok:{over}");
@@ -249,16 +302,17 @@ pub fn on_reply(args: &str) -> String {
             unsafe { SEL = (0xff, 0xff) };
             let check = rules::in_check(&new_fen);
             let over = all_legal_moves(&new_fen).is_empty();
+            set_ended_from(&new_fen, over, check);
             let status = if over && check {
-                format!("Agent: {from}{to} - CHECKMATE, agent wins (n = new)")
+                format!("Agent: {from}{to} — CHECKMATE, agent wins")
             } else if over {
-                format!("Agent: {from}{to} - stalemate, draw (n = new)")
+                format!("Agent: {from}{to} — stalemate, draw")
             } else if check {
-                format!("Agent: {from}{to} - CHECK! Your move")
+                format!("Agent: {from}{to} — CHECK! Your move")
             } else if fell_back {
-                format!("Agent: {from}{to} (fallback) - your move")
+                format!("Agent: {from}{to} (fallback) — your move")
             } else {
-                format!("Agent: {from}{to} - your move")
+                format!("Agent: {from}{to} — your move")
             };
             paint(&status);
             format!("ok:agent {from}{to}")
@@ -308,12 +362,13 @@ fn activate(sq: &str) -> String {
                 return agent_ask(&new_fen);
             }
             let over = all_legal_moves(&new_fen).is_empty();
+            set_ended_from(&new_fen, over, !check.is_empty());
             let status = if over && !check.is_empty() {
-                format!("You: {from}{sq} - CHECKMATE (n = new)")
+                format!("You: {from}{sq} — CHECKMATE, you win!")
             } else if over {
-                format!("You: {from}{sq} - stalemate (n = new)")
+                format!("You: {from}{sq} — stalemate, draw")
             } else {
-                format!("You: {from}{sq}{check} - {}", turn_status(&new_fen))
+                format!("You: {from}{sq}{check} — {}", turn_status(&new_fen))
             };
             paint(&status);
             format!("ok:moved {from}{sq}")
@@ -328,6 +383,12 @@ fn activate(sq: &str) -> String {
 }
 
 pub fn on_click(x: i32, y: i32) -> String {
+    if unsafe { ENDED != 0 } {
+        if endscreen::hit_restart(x, y) {
+            return new_game();
+        }
+        return String::from("ok:ended");
+    }
     if unsafe { WAITING != 0 || PENDING_ASK != 0 } {
         return String::from("ok:busy");
     }
@@ -342,6 +403,12 @@ pub fn on_click(x: i32, y: i32) -> String {
 }
 
 pub fn on_key(key: &str) -> String {
+    if unsafe { ENDED != 0 } {
+        if endscreen::key_restart(key) {
+            return new_game();
+        }
+        return String::from("ok:ended");
+    }
     // Allow `n` (new game) even while the agent is thinking / pending.
     if key != "n" && unsafe { WAITING != 0 || PENDING_ASK != 0 } {
         return String::from("ok:busy");
@@ -390,6 +457,19 @@ pub fn tick() -> String {
         if unsafe { MODEL != 0 } && !white_to_move(&fen) {
             return agent_ask(&fen);
         }
+    }
+    if unsafe { ENDED != 0 } {
+        // Re-paint so confetti keeps animating on the end modal.
+        let fen = fen_get();
+        let status = match unsafe { ENDED } {
+            1 => "Checkmate — you win!",
+            2 => "Checkmate — agent wins",
+            3 => "Stalemate — draw",
+            _ => "Game over",
+        };
+        let _ = fen;
+        paint(status);
+        return String::from("ok:ended");
     }
     if unsafe { WAITING == 0 } {
         return String::from("ok:idle");

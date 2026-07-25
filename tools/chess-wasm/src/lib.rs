@@ -21,6 +21,7 @@
 extern crate alloc;
 
 mod app;
+mod endscreen;
 mod rules;
 
 use alloc::format;

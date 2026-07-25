@@ -1,6 +1,7 @@
 //! Breakout — paddle, ball, brick rows.
 
-use crate::guest::ui_draw;
+use crate::endscreen::{self, Outcome};
+use crate::guest::{hud_status, ui_draw};
 use alloc::format;
 use alloc::string::String;
 
@@ -56,7 +57,24 @@ fn paint() {
         }
     }
     ops.push_str("rect 0 184 256 8 3a3632; ");
+    let over = unsafe { OVER != 0 };
+    if over {
+        endscreen::append(&mut ops, Outcome::Lose, "GAME OVER", "no lives left");
+    }
     ui_draw(&ops);
+    let status = unsafe {
+        if OVER != 0 {
+            format!("breakout  GAME OVER  score={SCORE}")
+        } else {
+            format!("breakout  score={SCORE}  lives={LIVES}")
+        }
+    };
+    let hints = if over {
+        "enter / n / r  restart"
+    } else {
+        "←/→ paddle  space launch  n new"
+    };
+    hud_status(&status, hints);
 }
 
 fn reset_ball() {
@@ -90,7 +108,13 @@ pub fn start(_: &str) -> String {
     String::from("ok:breakout (←/→ paddle, space launch, n new)")
 }
 
-pub fn on_click(x: i32, _y: i32) -> String {
+pub fn on_click(x: i32, y: i32) -> String {
+    if unsafe { OVER != 0 } {
+        if endscreen::hit_restart(x, y) {
+            return start("");
+        }
+        return String::from("ok:ended");
+    }
     unsafe {
         PX = (x - PADDLE_W / 2).clamp(0, W - PADDLE_W);
         if ACTIVE == 0 {
@@ -102,18 +126,24 @@ pub fn on_click(x: i32, _y: i32) -> String {
 }
 
 pub fn on_key(key: &str) -> String {
+    if unsafe { OVER != 0 } {
+        if endscreen::key_restart(key) {
+            return start("");
+        }
+        return String::from("ok:ended");
+    }
     match key {
-        "left" => unsafe {
+        "left" | "a" | "h" => unsafe {
             PX = (PX - 12).max(0);
         },
-        "right" => unsafe {
+        "right" | "d" | "l" => unsafe {
             PX = (PX + 12).min(W - PADDLE_W);
         },
         "space" | "enter" => unsafe {
             ACTIVE = 1;
         },
         "n" => return start(""),
-        _ => {}
+        _ => return String::from("ok"), // unhandled → shell keeps the key
     }
     paint();
     status("")
@@ -121,7 +151,11 @@ pub fn on_key(key: &str) -> String {
 
 pub fn tick(_: &str) -> String {
     unsafe {
-        if OVER != 0 || ACTIVE == 0 {
+        if OVER != 0 {
+            paint(); // animate confetti
+            return String::from("ok:ended");
+        }
+        if ACTIVE == 0 {
             return String::from("ok:idle");
         }
         BALL_X += VX;

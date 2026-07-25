@@ -153,6 +153,14 @@ pub fn ui_draw(ops: &str) -> i32 {
     unsafe { host_ui_draw(ops.as_ptr() as i32, ops.len() as i32) }
 }
 
+/// Append a `text` draw-op. Host rasterizes via Geist Mono (`text x y size hex string`).
+/// The string must not contain `;` (statement separator).
+pub fn text_op(ops: &mut String, x: i32, y: i32, size: i32, color: &str, s: &str) {
+    // Strip `;` so a malicious/odd label cannot terminate the draw program early.
+    let clean: String = s.chars().map(|c| if c == ';' { ' ' } else { c }).collect();
+    ops.push_str(&format!("text {x} {y} {size} {color} {clean}; "));
+}
+
 pub fn storage_set_durable(key: &str, val: &str) -> i32 {
     unsafe {
         host_storage_set(
@@ -198,6 +206,12 @@ pub fn now_ms() -> i64 {
 pub fn hud_set(text: &str) -> i32 {
     let b = text.as_bytes();
     unsafe { host_hud_set(b.as_ptr() as i32, b.len() as i32) }
+}
+
+/// Chess-style HUD: first line is status, second line is the shortcut legend.
+/// Call on start and after every interaction so the reserved strip stays live.
+pub fn hud_status(status: &str, shortcuts: &str) {
+    let _ = hud_set(&format!("{status}\n{shortcuts}"));
 }
 
 pub use result_string as export;

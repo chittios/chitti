@@ -18,6 +18,7 @@ mod console;
 mod contacts;
 mod dict;
 mod diff;
+mod endscreen;
 mod files;
 mod gallery;
 mod game2048;
@@ -218,6 +219,9 @@ pub extern "C" fn tick(args_ptr: i32, args_len: i32) -> i64 {
         "breakout" => breakout::tick(raw),
         "tetris" => tetris::tick(raw),
         "radio" => radio::tick(raw),
+        // Keep confetti animating on end screens even when the game is idle.
+        "minesweeper" | "mines" => mines::tick_anim(raw),
+        "game2048" => game2048::tick_anim(raw),
         _ => alloc::string::String::from("ok"),
     };
     result_string(&out)
@@ -256,6 +260,7 @@ pub extern "C" fn on_click(args_ptr: i32, args_len: i32) -> i64 {
         "diff" => diff::on_click(x, y),
         "breakout" => breakout::on_click(x, y),
         "tetris" => tetris::on_click(x, y),
+        "snake" => snake::on_click(x, y),
         "console" => console::on_click(x, y),
         "maps" => maps::on_click(x, y),
         "radio" => radio::on_click(x, y),
@@ -277,6 +282,7 @@ pub extern "C" fn on_key(args_ptr: i32, args_len: i32) -> i64 {
     let out = match app.as_str() {
         "minesweeper" => mines::on_key(&key),
         "snake" => snake::on_key(&key),
+        // note: snake also has on_click for endscreen restart
         "paint" => paint::on_key(&key),
         "slides" => slides::on_key(&key),
         "synth" => synth::on_key(&key),

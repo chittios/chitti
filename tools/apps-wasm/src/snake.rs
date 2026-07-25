@@ -1,4 +1,5 @@
-use crate::guest::{json_str, ui_draw};
+use crate::endscreen::{self, Outcome};
+use crate::guest::{hud_status, json_str, ui_draw};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -33,11 +34,30 @@ fn paint() {
             let color = if i == 0 { "e8e4df" } else { "5a8f5a" };
             ops.push_str(&format!("rect {x} {y} {} {} {color}; ", CELL - 1, CELL - 1));
         }
-        if DEAD != 0 {
-            ops.push_str("rect 0 176 256 16 aa3333; ");
-        }
+    }
+    let dead = unsafe { DEAD != 0 };
+    if dead {
+        endscreen::append(
+            &mut ops,
+            Outcome::Lose,
+            "GAME OVER",
+            "snake crashed",
+        );
     }
     ui_draw(&ops);
+    let status = unsafe {
+        if DEAD != 0 {
+            format!("snake  GAME OVER  score={SCORE}")
+        } else {
+            format!("snake  score={SCORE}  len={LEN}")
+        }
+    };
+    let hints = if dead {
+        "enter / n / r  restart"
+    } else {
+        "arrows/wasd steer  r restart"
+    };
+    hud_status(&status, hints);
 }
 
 fn spawn_food() {
@@ -151,6 +171,10 @@ pub fn dir(args: &str) -> String {
 
 pub fn tick_once(_: &str) -> String {
     unsafe {
+        if DEAD != 0 {
+            paint(); // confetti anim
+            return format!("ok:dead score={SCORE}");
+        }
         if ACTIVE == 0 {
             return String::from("ok:idle");
         }
@@ -170,8 +194,22 @@ pub fn status(_: &str) -> String {
     unsafe { format!("ok:score={SCORE} dead={DEAD} len={LEN}") }
 }
 
-/// Key: arrows/wasd steer, `r` restarts (also revives after death).
+/// Click: on death, the modal restart button starts a new game.
+pub fn on_click(x: i32, y: i32) -> String {
+    if unsafe { DEAD != 0 } && endscreen::hit_restart(x, y) {
+        return start("");
+    }
+    String::from("ok")
+}
+
+/// Key: arrows/wasd steer; on death enter/n/r restart.
 pub fn on_key(key: &str) -> String {
+    if unsafe { DEAD != 0 } {
+        if endscreen::key_restart(key) {
+            return start("");
+        }
+        return String::from("ok:dead");
+    }
     let d: i8 = match key {
         "up" | "w" | "k" => 0,
         "down" | "s" | "j" => 1,
@@ -181,9 +219,6 @@ pub fn on_key(key: &str) -> String {
         _ => return String::from("ok"),
     };
     unsafe {
-        if DEAD != 0 {
-            return String::from("ok:dead (r restarts)");
-        }
         PEND = d;
     }
     format!("ok:dir {key}")

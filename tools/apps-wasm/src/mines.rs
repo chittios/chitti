@@ -1,4 +1,5 @@
-use crate::guest::{json_i32, ui_draw};
+use crate::endscreen::{self, Outcome};
+use crate::guest::{hud_status, json_i32, ui_draw};
 use alloc::format;
 use alloc::string::String;
 
@@ -58,13 +59,40 @@ fn paint() {
             y + s - 2,
             x + s - 2
         ));
-        if WON != 0 {
-            ops.push_str("rect 0 176 256 16 5a8f5a; ");
-        } else if DEAD != 0 {
-            ops.push_str("rect 0 176 256 16 aa3333; ");
-        }
+    }
+    let (won, dead) = unsafe { (WON != 0, DEAD != 0) };
+    if won {
+        endscreen::append(&mut ops, Outcome::Win, "YOU WIN", "all clear");
+    } else if dead {
+        endscreen::append(&mut ops, Outcome::Lose, "BOOM", "stepped on a mine");
     }
     ui_draw(&ops);
+    let status = unsafe {
+        if WON != 0 {
+            String::from("mines  YOU WIN!")
+        } else if DEAD != 0 {
+            String::from("mines  BOOM")
+        } else {
+            let (r, c) = CUR;
+            format!("mines  {W}×{H}  {MINES} mines  cursor ({r},{c})")
+        }
+    };
+    let hints = if won || dead {
+        "enter / n / r  restart"
+    } else {
+        "arrows move  enter open  f flag  r restart"
+    };
+    hud_status(&status, hints);
+}
+
+/// Tick: re-paint when ended so confetti keeps animating.
+pub fn tick_anim(_: &str) -> String {
+    if unsafe { DEAD != 0 || WON != 0 } {
+        paint();
+        String::from("ok:anim")
+    } else {
+        String::from("ok")
+    }
 }
 
 fn adj(r: usize, c: usize) -> u8 {
@@ -225,7 +253,14 @@ pub fn flag(args: &str) -> String {
 }
 
 /// Surface click at pixel (x, y): map to a cell, move the cursor there, open.
+/// When the game is over, the modal restart button starts a new game.
 pub fn on_click(x: i32, y: i32) -> String {
+    if unsafe { DEAD != 0 || WON != 0 } {
+        if endscreen::hit_restart(x, y) {
+            return start("");
+        }
+        return String::from("ok:ended");
+    }
     let c = (x - OX) / CELL;
     let r = (y - OY) / CELL;
     if x < OX || y < OY || c < 0 || r < 0 || c as usize >= W || r as usize >= H {
@@ -237,6 +272,12 @@ pub fn on_click(x: i32, y: i32) -> String {
 
 /// Key: arrows move the cursor, Enter/space opens, `f` flags, `r` restarts.
 pub fn on_key(key: &str) -> String {
+    if unsafe { DEAD != 0 || WON != 0 } {
+        if endscreen::key_restart(key) {
+            return start("");
+        }
+        return String::from("ok:ended");
+    }
     let (dr, dc): (i32, i32) = match key {
         "up" => (-1, 0),
         "down" => (1, 0),

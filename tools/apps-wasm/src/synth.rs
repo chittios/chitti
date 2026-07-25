@@ -1,4 +1,4 @@
-use crate::guest::{json_i32, sound_play, ui_draw};
+use crate::guest::{hud_status, json_i32, sound_play, ui_draw};
 use alloc::format;
 use alloc::string::String;
 
@@ -29,6 +29,10 @@ const WHITE_H: i32 = 160;
 const BLACK_H: i32 = 96;
 const BLACK_W: i32 = 20;
 
+const SHORTCUTS: &str = "a s d f g h j k white  ·  w e t y u black  ·  click keys";
+
+static mut LAST_NOTE: i32 = 0;
+
 /// Paint the piano; `pressed` (a white index 0..8 or black index 8..13, -1 =
 /// none) is tinted terracotta so a played note is visible.
 fn paint(pressed: i32) {
@@ -40,16 +44,50 @@ fn paint(pressed: i32) {
     }
     for (bi, (_, _, after)) in BLACK.iter().enumerate() {
         let x = (after + 1) * KEY_W - BLACK_W / 2;
-        let c = if pressed == 8 + bi as i32 { "cc785c" } else { "2c2926" };
+        let c = if pressed == 8 + bi as i32 {
+            "cc785c"
+        } else {
+            "2c2926"
+        };
         ops.push_str(&format!("rect {x} {TOP} {BLACK_W} {BLACK_H} {c}; "));
     }
-    // Legend strip: the letter row a s d f g h j k (w e t y u above).
+    // Legend strip under the keys.
     ops.push_str("rect 0 0 256 12 3a3632; rect 0 180 256 12 3a3632; ");
     ui_draw(&ops);
 }
 
+fn note_name(hz: i32) -> &'static str {
+    match hz {
+        262 => "C4",
+        277 => "C#4",
+        294 => "D4",
+        311 => "D#4",
+        330 => "E4",
+        349 => "F4",
+        370 => "F#4",
+        392 => "G4",
+        415 => "G#4",
+        440 => "A4",
+        466 => "A#4",
+        494 => "B4",
+        523 => "C5",
+        _ => "note",
+    }
+}
+
+fn refresh_hud(hz: i32) {
+    let status = if hz > 0 {
+        format!("synth  {}  {hz} Hz", note_name(hz))
+    } else {
+        String::from("synth  piano ready")
+    };
+    hud_status(&status, SHORTCUTS);
+}
+
 fn play(idx: i32, hz: i32) -> String {
     paint(idx);
+    unsafe { LAST_NOTE = hz };
+    refresh_hud(hz);
     match sound_play(hz, NOTE_MS) {
         0 => format!("ok:note {hz} Hz"),
         -1 => String::from("error:no sound device"),
@@ -58,14 +96,16 @@ fn play(idx: i32, hz: i32) -> String {
 }
 
 pub fn start(_: &str) -> String {
+    unsafe { LAST_NOTE = 0 };
     paint(-1);
+    refresh_hud(0);
     String::from("ok:synth piano (keys a-k white, w e t y u black; click keys too)")
 }
 
 /// Key: a s d f g h j k = white notes, w e t y u = black notes.
 pub fn on_key(key: &str) -> String {
     let k = match key.chars().next() {
-        Some(c) => c,
+        Some(c) => c.to_ascii_lowercase(),
         None => return String::from("ok"),
     };
     for (i, (ch, hz)) in WHITE.iter().enumerate() {
@@ -78,6 +118,7 @@ pub fn on_key(key: &str) -> String {
             return play(8 + bi as i32, *hz);
         }
     }
+    // Unhandled → bare "ok" so the shell keeps the key for chat typing.
     String::from("ok")
 }
 
@@ -102,6 +143,7 @@ pub fn on_click(x: i32, y: i32) -> String {
 pub fn tone(args: &str) -> String {
     let hz = json_i32(args, "hz", 440).clamp(20, 4000);
     let ms = json_i32(args, "ms", 300).clamp(20, 5000);
+    refresh_hud(hz);
     match sound_play(hz, ms) {
         0 => format!("ok:tone {hz} Hz {ms} ms"),
         -1 => String::from("error:no sound device"),
@@ -111,6 +153,7 @@ pub fn tone(args: &str) -> String {
 
 pub fn beep(args: &str) -> String {
     let hz = json_i32(args, "hz", 880).clamp(20, 4000);
+    refresh_hud(hz);
     match sound_play(hz, 120) {
         0 => format!("ok:beep {hz}"),
         -1 => String::from("error:no sound device"),
@@ -119,9 +162,10 @@ pub fn beep(args: &str) -> String {
 }
 
 pub fn stop(_: &str) -> String {
+    refresh_hud(0);
     String::from("ok:stop (device drains)")
 }
 
 pub fn status(_: &str) -> String {
-    String::from("ok:synth ready")
+    format!("ok:synth last={} Hz", unsafe { LAST_NOTE })
 }

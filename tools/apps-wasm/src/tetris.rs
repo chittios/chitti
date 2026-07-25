@@ -1,6 +1,7 @@
 //! Tetris — 10×16 board, 7 piece types, line clear.
 
-use crate::guest::ui_draw;
+use crate::endscreen::{self, Outcome};
+use crate::guest::{hud_status, ui_draw};
 use alloc::format;
 use alloc::string::String;
 
@@ -190,7 +191,24 @@ fn paint() {
         }
     }
     ops.push_str("rect 0 184 256 8 3a3632; ");
+    let over = unsafe { OVER != 0 };
+    if over {
+        endscreen::append(&mut ops, Outcome::Lose, "GAME OVER", "stack out");
+    }
     ui_draw(&ops);
+    let status = unsafe {
+        if OVER != 0 {
+            format!("tetris  GAME OVER  score={SCORE}")
+        } else {
+            format!("tetris  score={SCORE}")
+        }
+    };
+    let hints = if over {
+        "enter / n / r  restart"
+    } else {
+        "←/→ move  ↑ rotate  ↓ soft  space hard  n new"
+    };
+    hud_status(&status, hints);
 }
 
 pub fn start(_: &str) -> String {
@@ -206,16 +224,19 @@ pub fn start(_: &str) -> String {
     String::from("ok:tetris (←/→ move, ↑ rotate, ↓ soft drop, space hard, n new)")
 }
 
-pub fn on_click(_x: i32, _y: i32) -> String {
+pub fn on_click(x: i32, y: i32) -> String {
+    if unsafe { OVER != 0 } && endscreen::hit_restart(x, y) {
+        return start("");
+    }
     status("")
 }
 
 pub fn on_key(key: &str) -> String {
     if unsafe { OVER != 0 } {
-        if key == "n" {
+        if endscreen::key_restart(key) {
             return start("");
         }
-        return status("");
+        return String::from("ok:ended");
     }
     match key {
         "left" => unsafe {
@@ -250,7 +271,7 @@ pub fn on_key(key: &str) -> String {
             lock();
         },
         "n" => return start(""),
-        _ => {}
+        _ => return String::from("ok"),
     }
     paint();
     status("")
@@ -259,7 +280,8 @@ pub fn on_key(key: &str) -> String {
 pub fn tick(_: &str) -> String {
     unsafe {
         if OVER != 0 {
-            return String::from("ok:idle");
+            paint(); // animate confetti
+            return String::from("ok:ended");
         }
         TICK_N = TICK_N.wrapping_add(1);
         if TICK_N % 8 != 0 {

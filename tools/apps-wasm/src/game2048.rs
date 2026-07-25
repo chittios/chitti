@@ -1,6 +1,7 @@
 //! 2048 — classic sliding puzzle on a 4×4 grid.
 
-use crate::guest::ui_draw;
+use crate::endscreen::{self, Outcome};
+use crate::guest::{hud_status, ui_draw};
 use alloc::format;
 use alloc::string::String;
 
@@ -43,7 +44,59 @@ fn paint() {
         }
     }
     ops.push_str("rect 0 176 256 16 3a3632; ");
+    let over = unsafe { OVER != 0 };
+    let best = unsafe {
+        let mut b = 0u16;
+        for i in 0..16 {
+            if GRID[i] > b {
+                b = GRID[i];
+            }
+        }
+        b
+    };
+    // Full modal only when no moves left. Hitting 2048 is celebrated in the HUD.
+    if over {
+        endscreen::append(
+            &mut ops,
+            if best >= 2048 {
+                Outcome::Win
+            } else {
+                Outcome::Lose
+            },
+            if best >= 2048 { "YOU WIN" } else { "GAME OVER" },
+            "2048",
+        );
+    }
     ui_draw(&ops);
+    let status = unsafe {
+        if OVER != 0 {
+            if best >= 2048 {
+                format!("2048  YOU WIN  score={SCORE}")
+            } else {
+                format!("2048  GAME OVER  score={SCORE}")
+            }
+        } else if best >= 2048 {
+            format!("2048  score={SCORE}  best={best}  (keep going!)")
+        } else {
+            format!("2048  score={SCORE}  best={best}")
+        }
+    };
+    let hints = if over {
+        "enter / n / r  restart"
+    } else {
+        "arrows/wasd slide  n new"
+    };
+    hud_status(&status, hints);
+}
+
+/// Tick: re-paint when ended so confetti keeps animating.
+pub fn tick_anim(_: &str) -> String {
+    if unsafe { OVER != 0 } {
+        paint();
+        String::from("ok:anim")
+    } else {
+        String::from("ok")
+    }
 }
 
 fn spawn() {
@@ -199,23 +252,29 @@ pub fn start(_: &str) -> String {
     String::from("ok:2048 (arrows move, n new)")
 }
 
-pub fn on_click(_x: i32, _y: i32) -> String {
+pub fn on_click(x: i32, y: i32) -> String {
+    if unsafe { OVER != 0 } && endscreen::hit_restart(x, y) {
+        return start("");
+    }
     status("")
 }
 
 pub fn on_key(key: &str) -> String {
+    if unsafe { OVER != 0 } {
+        if endscreen::key_restart(key) {
+            return start("");
+        }
+        return String::from("ok:ended");
+    }
     if key == "n" {
         return start("");
     }
-    if unsafe { OVER != 0 } {
-        return status("");
-    }
     let dir = match key {
-        "left" => 0,
-        "right" => 1,
-        "up" => 2,
-        "down" => 3,
-        _ => return status(""),
+        "left" | "h" | "a" => 0,
+        "right" | "l" | "d" => 1,
+        "up" | "k" | "w" => 2,
+        "down" | "j" | "s" => 3,
+        _ => return String::from("ok"), // unhandled → shell keeps the key
     };
     if move_dir(dir) {
         spawn();

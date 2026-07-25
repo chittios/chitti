@@ -1,4 +1,4 @@
-use crate::guest::ui_draw;
+use crate::guest::{hud_status, ui_draw};
 use alloc::format;
 use alloc::string::String;
 
@@ -10,6 +10,7 @@ const SLIDES: &[(&str, &str, &str)] = &[
     ("WASM", "Logic in tools.wasm — not the kernel", "5a8f5a"),
     ("Thanks", "slides_next / slides_prev", "8a6a4a"),
 ];
+const SHORTCUTS: &str = "← prev  →/space/enter next  r restart  ·  click L/R";
 
 fn paint() {
     let n = SLIDES.len();
@@ -24,6 +25,11 @@ fn paint() {
     }
     let _ = (title, body); // titles shown via host log optional
     ui_draw(&ops);
+    let (t, b, _) = SLIDES[i];
+    hud_status(
+        &format!("slides  {}/{}  {t} — {b}", i + 1, n),
+        SHORTCUTS,
+    );
 }
 
 pub fn start(_: &str) -> String {
@@ -78,9 +84,9 @@ pub fn on_click(x: i32, _y: i32) -> String {
 /// Key: ←/→ navigate, space advances, `r` restarts from slide 1.
 pub fn on_key(key: &str) -> String {
     match key {
-        "left" => prev(""),
-        "right" | "space" | "enter" => next(""),
+        "left" | "h" => prev(""),
+        "right" | "l" | "space" | "enter" => next(""),
         "r" => start(""),
-        _ => String::from("ok"),
+        _ => String::from("ok"), // unhandled → shell keeps the key
     }
 }
