@@ -409,6 +409,34 @@ def s_nic_dispatch(g):
     return True, f"{vendor}:{device} -> {driver}, DHCP lease obtained"
 
 
+def s_install_plan(g):
+    """`/install plan` is read-only and refuses cleanly rather than erasing.
+
+    Guards the non-destructive install surface. Plain `/install` repartitions the
+    whole disk, so the *safe* commands must stay reachable and must never fall back
+    to the destructive path when they cannot proceed.
+
+    NB the guest the harness boots has no disk attached (`cargo xtask run` only
+    adds one with `--disk <SIZE>`), so this exercises the command dispatch, the
+    argument parsing and the no-disk refusal — not the GPT planning itself, which
+    is covered by 20 unit tests in `block::gpt`/`block::fat32` plus 6 RamDisk tests
+    in `block::esp`. Attaching a partitioned disk to the e2e guest would let this
+    assert the plan output too, and is a worthwhile follow-up.
+    """
+    m = g.mark()
+    g.send("/install plan 9")
+    if not g.wait_for("install>", 12, m):
+        return False, "/install plan produced no output"
+    out = g.text()[m:]
+    # It must refuse, and must not have started anything destructive.
+    if "no disk 9" not in out:
+        return False, f"expected a clean refusal for a missing disk, got: {out[:200]!r}"
+    for bad in ("GPT:", "ERASES", "repartition"):
+        if bad in out:
+            return False, f"read-only plan mentioned destructive work ({bad})"
+    return True, "read-only, refused a missing disk without touching anything"
+
+
 def s_network(g):
     m = g.mark()
     g.send("/network")
@@ -1337,6 +1365,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("memory", s_memory),
     ("memory_hierarchy", s_memory_hierarchy),
     ("fs_basic", s_fs_basic),
+    ("install_plan", s_install_plan),
     ("skills_bundled", s_skills_bundled),
     ("plan_mode_and_permissions", s_plan_mode_and_permissions),
     ("todos_pane", s_todos_pane),
