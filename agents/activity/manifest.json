@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Activity / task status panel (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "activity_start",
     "activity_set",

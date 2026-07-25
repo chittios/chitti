@@ -78,6 +78,9 @@ const EV_KEY: u16 = 0x01;
 const KEY_LEFTSHIFT: u16 = 42;
 const KEY_RIGHTSHIFT: u16 = 54;
 const KEY_LEFTCTRL: u16 = 29;
+const KEY_LEFTMETA: u16 = 125;  // Super / ⌘
+const KEY_RIGHTMETA: u16 = 126;
+const KEY_SPACE: u16 = 57;
 
 #[inline]
 fn dsb() {
@@ -118,6 +121,8 @@ struct VirtioInput {
     avail_idx: u16,
     shift: bool,
     ctrl: bool,
+    /// Super / ⌘ (Linux KEY_LEFTMETA / KEY_RIGHTMETA).
+    gui: bool,
 }
 
 impl VirtioInput {
@@ -281,7 +286,17 @@ pub fn init() -> bool {
         (avail, used)
     };
 
-    let mut dev = VirtioInput { base, avail, used, events, last_used: 0, avail_idx: 0, shift: false, ctrl: false };
+    let mut dev = VirtioInput {
+        base,
+        avail,
+        used,
+        events,
+        last_used: 0,
+        avail_idx: 0,
+        shift: false,
+        ctrl: false,
+        gui: false,
+    };
     // Offer all buffers to the device.
     // SAFETY: rings are set up above.
     unsafe {
@@ -338,6 +353,10 @@ fn handle_event(dev: &mut VirtioInput, ev: InputEvent) {
             dev.ctrl = pressed;
             return;
         }
+        KEY_LEFTMETA | KEY_RIGHTMETA => {
+            dev.gui = pressed;
+            return;
+        }
         _ => {}
     }
     if ev.value == 0 {
@@ -346,6 +365,7 @@ fn handle_event(dev: &mut VirtioInput, ev: InputEvent) {
     // Arrow/nav keys (Linux keycodes) become the ANSI sequences a serial
     // terminal sends, so the shell/editor decode one encoding for every input
     // path. Ctrl+Tab is the pane-focus toggle (private CSI `ESC [ T`).
+    // Cmd/Super+Space opens the Agents browser (`ESC [ g`) — macOS Spotlight-style.
     if let Some(seq) = match ev.code {
         103 => Some(&b"[A"[..]),           // KEY_UP
         108 => Some(&b"[B"[..]),           // KEY_DOWN
@@ -357,6 +377,8 @@ fn handle_event(dev: &mut VirtioInput, ev: InputEvent) {
         109 => Some(&b"[6~"[..]),          // KEY_PAGEDOWN
         111 => Some(&b"[3~"[..]),          // KEY_DELETE
         15 if dev.ctrl => Some(&b"[T"[..]), // Ctrl+Tab
+        // Agents: GUI+Space or Ctrl+Space (host macOS often steals ⌘+Space).
+        KEY_SPACE if dev.gui || dev.ctrl => Some(&b"[g"[..]),
         _ => None,
     } {
         RING.with(|r| {

@@ -99,6 +99,51 @@ pub enum UiEvent {
 
 static NEXT_SURFACE: AtomicU32 = AtomicU32::new(1);
 static SURFACES: Locked<BTreeMap<u32, Surface>> = Locked::new(BTreeMap::new());
+/// When true, [`draw`] / board ops update the backing buffer only — no
+/// compositor present. Package-UI init draws dozens of ops; presenting each
+/// one at full pane scale (TTF re-raster) freezes the shell for a long time.
+static DEFER_PRESENT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// Surfaces dirtied while present was deferred (flushed by [`flush_deferred`]).
+static DIRTY: Locked<alloc::vec::Vec<u32>> = Locked::new(alloc::vec::Vec::new());
+
+/// Run `f` without compositor presents; one present per dirtied surface at the end.
+pub fn with_deferred_present(f: impl FnOnce()) {
+    DEFER_PRESENT.store(true, Ordering::SeqCst);
+    f();
+    DEFER_PRESENT.store(false, Ordering::SeqCst);
+    flush_deferred();
+}
+
+fn mark_dirty(id: u32) {
+    DIRTY.with(|v| {
+        if !v.iter().any(|&x| x == id) {
+            v.push(id);
+        }
+    });
+}
+
+fn flush_deferred() {
+    let ids = DIRTY.with(|v| core::mem::take(v));
+    #[cfg(not(test))]
+    for id in ids {
+        present(id);
+    }
+    #[cfg(test)]
+    let _ = ids;
+}
+
+/// Present now, or mark dirty if deferred (package-UI init batches presents).
+#[cfg(not(test))]
+fn maybe_present(id: u32) {
+    if DEFER_PRESENT.load(Ordering::Relaxed) {
+        mark_dirty(id);
+    } else {
+        present(id);
+    }
+}
+#[cfg(test)]
+fn maybe_present(_id: u32) {}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DrawErr {
@@ -146,8 +191,7 @@ pub fn draw(task: TaskId, id: u32, ops: &str) -> Result<usize, DrawErr> {
         }
         Ok(program.len())
     })?;
-    #[cfg(not(test))]
-    present(id);
+    maybe_present(id);
     Ok(n)
 }
 
@@ -365,11 +409,29 @@ fn f32_round_i(v: f32) -> i32 {
     f as i32
 }
 
+/// Whether surface `id` still has a backing buffer (for tab-switch repaint).
+pub fn has_surface(id: u32) -> bool {
+    SURFACES.with(|m| m.contains_key(&id))
+}
+
 /// Present geometry (nearest-upscaled) + **re-rasterized** labels at the pane's
 /// presentation scale so text matches the sharp HUD font, not a blown-up 10 px
 /// glyph. The HUD strip itself is still drawn by the compositor.
+///
+/// Gated on [`package_ui::should_present`]: after the user closes the canvas a
+/// late guest draw updates the backing buffer only and must not reopen the tab.
 #[cfg(not(test))]
 fn present(id: u32) {
+    if !crate::service::package_ui::should_present(id) {
+        return;
+    }
+    present_forced(id);
+}
+
+/// Present without the package-UI dismiss gate — used for explicit tab focus
+/// (`represent`) so switching back to a live app always repaints.
+#[cfg(not(test))]
+fn present_forced(id: u32) {
     let snap = SURFACES.with(|m| {
         m.get(&id)
             .map(|s| (s.back.clone(), s.labels.clone(), s.hud.clone()))
@@ -447,7 +509,8 @@ fn present(id: u32) {
 }
 
 /// Re-present a surface (e.g. after a pane resize / tab switch), from its own
-/// backing buffer — the source of truth. No-op if the surface is gone.
+/// backing buffer — the source of truth. No-op if the surface is gone or the
+/// package UI was dismissed (same gate as draw-path present).
 #[cfg(not(test))]
 pub fn represent(id: u32) {
     present(id);
@@ -467,8 +530,7 @@ pub fn set_hud(task: TaskId, id: u32, text: &str) -> Result<(), DrawErr> {
         s.hud.push_str(text);
         Ok(())
     })?;
-    #[cfg(not(test))]
-    present(id);
+    maybe_present(id);
     Ok(())
 }
 

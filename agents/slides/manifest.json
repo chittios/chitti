@@ -3,12 +3,45 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Slide deck on a canvas surface (tools.wasm).",
-  "toolset": ["slides_start", "slides_next", "slides_prev", "slides_goto", "slides_status"],
-  "capabilities": [
-    {"domain": "ui", "rights": ["exec", "write", "delete"], "scope": "any"},
-    {"domain": "fs", "rights": ["read", "write", "list"], "scope": "home"},
-    {"domain": "todo", "rights": ["read", "write"], "scope": "any"}
+  "package_ui": true,
+  "toolset": [
+    "slides_start",
+    "slides_next",
+    "slides_prev",
+    "slides_goto",
+    "slides_status"
   ],
-  "wasm": {"module": "assets/tools.wasm", "fuel": 2000000},
+  "capabilities": [
+    {
+      "domain": "ui",
+      "rights": [
+        "exec",
+        "write",
+        "delete"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list"
+      ],
+      "scope": "home"
+    },
+    {
+      "domain": "todo",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    }
+  ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "fuel": 2000000
+  },
   "autostart": false
 }

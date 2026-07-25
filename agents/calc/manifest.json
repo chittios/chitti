@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Calculator UI (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "calc_start",
     "calc_eval",

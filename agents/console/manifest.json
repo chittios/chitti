@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Log / ktrace-style console viewer (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "console_start",
     "console_log",

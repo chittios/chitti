@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Long-form document writer (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "writer_start",
     "writer_get",

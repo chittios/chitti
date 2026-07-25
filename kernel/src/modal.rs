@@ -419,3 +419,191 @@ fn esc_seq_param() -> Option<(u64, u8)> {
 pub fn browse_commands() -> Option<String> {
     None
 }
+
+/// Open the searchable **Agents** browser (the `/agents` modal). Returns an
+/// encoded pick on Enter:
+/// * `switch:<id>` — rebind chat to a live task
+/// * `ui:<name>` — start package UI (`/agents start <name>`)
+/// * `shell:<name>` — rebind chat to that SOUL package
+///
+/// `None` if dismissed (Esc / Ctrl+C / `[x]`).
+#[cfg(not(test))]
+pub fn browse_agents() -> Option<String> {
+    use crate::framebuffer::{self, CommandsRow, ModalHit};
+    use crate::shell::agents_catalog;
+    use crate::shell::catalog::Row;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    const VIEW: usize = 12;
+
+    // Drop residual keys (trailing CR from the `/agents` Enter, host paste
+    // crumbs, etc.) so the modal does not auto-select or auto-dismiss.
+    for _ in 0..64 {
+        if crate::console::read_byte().is_none() {
+            break;
+        }
+    }
+
+    let mut query = String::new();
+    let mut rows = agents_catalog::filter_rows("");
+    if rows.is_empty() {
+        // Should never happen (system agents are compiled in) — surface loudly.
+        crate::serial_println!("agents> browser: empty catalogue (bug)");
+        return None;
+    }
+    let mut sel = agents_catalog::first_sel(&rows);
+    let mut scroll = 0usize;
+    let mut caret_on = true;
+    let mut last_blink = crate::arch::now_ms();
+    // Ignore Enter for a short window so the same key that submitted `/agents`
+    // cannot immediately pick the first row.
+    let opened_ms = crate::arch::now_ms();
+    let mut arm_enter = false;
+
+    fn paint(query: &str, rows: &[Row], sel: usize, scroll: usize, caret_on: bool) {
+        let scroll = scroll.min(rows.len());
+        let end = (scroll + VIEW).min(rows.len());
+        let slice = &rows[scroll..end];
+        let mut kind_buf: Vec<String> = Vec::new();
+        for r in slice {
+            if let Row::Item { shortcut, .. } = r {
+                kind_buf.push(shortcut.clone());
+            }
+        }
+        let mut si = 0usize;
+        let mut view: Vec<CommandsRow<'_>> = Vec::new();
+        for (i, r) in slice.iter().enumerate() {
+            let abs = scroll + i;
+            match r {
+                Row::Header(h) => view.push(CommandsRow::Header(h.as_str())),
+                Row::Item { title, name, .. } => {
+                    let kind = kind_buf.get(si).map(|s| s.as_str()).unwrap_or("");
+                    si += 1;
+                    let _ = name;
+                    view.push(CommandsRow::Item {
+                        title: title.as_str(),
+                        slash: "",
+                        shortcut: kind,
+                        selected: abs == sel,
+                    });
+                }
+            }
+        }
+        framebuffer::draw_list_browser("Agents", query, &view, scroll, rows.len(), caret_on);
+    }
+
+    fn refilter(query: &str) -> (Vec<Row>, usize, usize) {
+        let rows = agents_catalog::filter_rows(query);
+        let sel = agents_catalog::first_sel(&rows);
+        let scroll = agents_catalog::clamp_scroll(sel, 0, VIEW, rows.len());
+        (rows, sel, scroll)
+    }
+
+    crate::serial_println!(
+        "agents> browser open ({} rows) — type to search, Enter select, Esc close",
+        rows.len()
+    );
+    paint(&query, &rows, sel, scroll, caret_on);
+
+    loop {
+        // Arm Enter only after ~200 ms so the submit key can't auto-pick.
+        if !arm_enter && crate::arch::now_ms().saturating_sub(opened_ms) >= 200 {
+            arm_enter = true;
+        }
+        if let Some(b) = crate::console::read_byte() {
+            match b {
+                b'\r' | b'\n' => {
+                    if !arm_enter {
+                        continue;
+                    }
+                    if let Some(name) = agents_catalog::name_at(&rows, sel) {
+                        let n = String::from(name);
+                        crate::framebuffer::modal_dismiss();
+                        return Some(n);
+                    }
+                }
+                0x1b => match esc_seq_param() {
+                    Some((0, b'A')) => {
+                        sel = agents_catalog::move_sel(&rows, sel, -1);
+                        scroll = agents_catalog::clamp_scroll(sel, scroll, VIEW, rows.len());
+                        paint(&query, &rows, sel, scroll, caret_on);
+                    }
+                    Some((0, b'B')) => {
+                        sel = agents_catalog::move_sel(&rows, sel, 1);
+                        scroll = agents_catalog::clamp_scroll(sel, scroll, VIEW, rows.len());
+                        paint(&query, &rows, sel, scroll, caret_on);
+                    }
+                    Some((5, b'~')) => {
+                        sel = agents_catalog::move_sel(&rows, sel, -(VIEW as i32));
+                        scroll = agents_catalog::clamp_scroll(sel, scroll, VIEW, rows.len());
+                        paint(&query, &rows, sel, scroll, caret_on);
+                    }
+                    Some((6, b'~')) => {
+                        sel = agents_catalog::move_sel(&rows, sel, VIEW as i32);
+                        scroll = agents_catalog::clamp_scroll(sel, scroll, VIEW, rows.len());
+                        paint(&query, &rows, sel, scroll, caret_on);
+                    }
+                    Some(_) => {}
+                    None => {
+                        crate::framebuffer::modal_dismiss();
+                        return None;
+                    }
+                },
+                0x03 => {
+                    crate::framebuffer::modal_dismiss();
+                    return None;
+                }
+                0x7f | 0x08 => {
+                    query.pop();
+                    let r = refilter(&query);
+                    rows = r.0;
+                    sel = r.1;
+                    scroll = r.2;
+                    paint(&query, &rows, sel, scroll, caret_on);
+                }
+                0x15 => {
+                    query.clear();
+                    let r = refilter("");
+                    rows = r.0;
+                    sel = r.1;
+                    scroll = r.2;
+                    paint(&query, &rows, sel, scroll, caret_on);
+                }
+                0x20..=0x7e => {
+                    query.push(b as char);
+                    let r = refilter(&query);
+                    rows = r.0;
+                    sel = r.1;
+                    scroll = r.2;
+                    paint(&query, &rows, sel, scroll, caret_on);
+                }
+                _ => {}
+            }
+        }
+        let t = crate::mouse::tick();
+        if t.moved {
+            framebuffer::cursor_move(t.x, t.y);
+        }
+        if t.pressed && framebuffer::modal_hit(t.x, t.y) == ModalHit::Close {
+            crate::framebuffer::modal_dismiss();
+            return None;
+        }
+        // Blink the search caret less often than /help did for full repaints —
+        // full modal redraws every 500 ms felt like flicker on large FB.
+        let now = crate::arch::now_ms();
+        if now.saturating_sub(last_blink) >= 800 {
+            last_blink = now;
+            caret_on = !caret_on;
+            paint(&query, &rows, sel, scroll, caret_on);
+        }
+        crate::shell::status_tick();
+        crate::sched::yield_now();
+    }
+}
+
+/// Test stub: no framebuffer agents browser.
+#[cfg(test)]
+pub fn browse_agents() -> Option<String> {
+    None
+}

@@ -622,6 +622,13 @@ pub struct ParsedManifest {
     pub mcp_servers: Vec<crate::agent::types::McpServerSpec>,
     /// Shell command hooks (`/open`, …) this package claims.
     pub command_hooks: Vec<CommandHook>,
+    /// Guest wasm module path from `wasm.module` (e.g. `"assets/tools.wasm"`).
+    /// Absent for chat/service agents that have no package-UI surface.
+    pub wasm_module: Option<String>,
+    /// Explicit `"package_ui": true` — the package is a canvas app started via
+    /// `package_ui::start`. When `None`, classification falls back to
+    /// wasm.module + Ui EXEC inference.
+    pub package_ui: Option<bool>,
 }
 
 fn parse_domain(s: &str) -> Option<CapDomain> {
@@ -722,6 +729,12 @@ pub fn parse_manifest(json: &str) -> Option<ParsedManifest> {
         }
     }
     let command_hooks = parse_command_hooks(&j);
+    let wasm_module = j
+        .get("wasm")
+        .and_then(|w| w.get("module"))
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+    let package_ui = j.get("package_ui").and_then(|v| v.as_bool());
     Some(ParsedManifest {
         name: j.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         version: j.get("version").and_then(|v| v.as_str()).unwrap_or("0.0.0").to_string(),
@@ -733,6 +746,8 @@ pub fn parse_manifest(json: &str) -> Option<ParsedManifest> {
         autostart: j.get("autostart").and_then(|v| v.as_bool()).unwrap_or(false),
         mcp_servers,
         command_hooks,
+        wasm_module,
+        package_ui,
     })
 }
 
@@ -1116,6 +1131,78 @@ pub fn list() -> Vec<(&'static str, u64)> {
     SYSTEM_AGENTS.iter().map(|d| (d.name, d.agent_id.0)).collect()
 }
 
+/// How an installed package presents itself in the `/agents` browser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentUiClass {
+    /// Canvas package UI (`tools.wasm` + `ui_surface_*` / Ui cap) — chess, paint, …
+    UiCanvas,
+    /// Chat/SOUL agent (notes, download, librarian, …) or content/service package.
+    Shell,
+}
+
+/// True when a parsed package manifest describes a **package-UI** canvas app.
+///
+/// Preference order (no name hardcoding):
+/// 1. Explicit `"package_ui": true|false` in the manifest (preferred).
+/// 2. Fallback inference: `wasm.module` is tools.wasm **and** `Ui` has `EXEC`.
+///
+/// Chat agents that only *call* Ui tools (browser/media) omit `package_ui` and
+/// lack `wasm.module`. Wasm chat tools (notes/pdf) and content services (doc)
+/// omit `package_ui` and lack `Ui` EXEC. Pure — unit-tested.
+pub fn is_package_ui_manifest(m: &ParsedManifest) -> bool {
+    if let Some(flag) = m.package_ui {
+        return flag;
+    }
+    let has_tools_wasm = m.wasm_module.as_ref().is_some_and(|p| {
+        p.ends_with("tools.wasm") || p.contains("/tools.wasm")
+    });
+    let has_ui_surface = m.capabilities.iter().any(|c| {
+        c.domain == CapDomain::Ui && c.rights.contains(Rights::EXEC)
+    });
+    has_tools_wasm && has_ui_surface
+}
+
+/// True when `name` is a **package-UI** app (`/agents start` → `package_ui::start`).
+/// Derived from the package's `manifest.json` via [`is_package_ui_manifest`] —
+/// not a hardcoded name list.
+pub fn is_package_ui_app(name: &str) -> bool {
+    let Some(def) = SYSTEM_AGENTS.iter().find(|d| d.name == name) else {
+        return false;
+    };
+    parse_manifest(def.manifest_json)
+        .map(|m| is_package_ui_manifest(&m))
+        .unwrap_or(false)
+}
+
+/// Classify a system agent as **UI (canvas)** vs **shell** for the agents popup.
+/// Only apps that `package_ui::start` can run are `UiCanvas` — so Enter always
+/// does something that matches the badge.
+pub fn ui_class(name: &str) -> AgentUiClass {
+    if is_package_ui_app(name) {
+        AgentUiClass::UiCanvas
+    } else {
+        AgentUiClass::Shell
+    }
+}
+
+/// Short badge for the agents browser right column (ASCII — safe for all fonts).
+pub fn ui_class_label(c: AgentUiClass) -> &'static str {
+    match c {
+        AgentUiClass::UiCanvas => "ui/canvas",
+        AgentUiClass::Shell => "shell",
+    }
+}
+
+/// One-line description from the package manifest (may be empty).
+pub fn description_of(name: &str) -> String {
+    let Some(def) = SYSTEM_AGENTS.iter().find(|d| d.name == name) else {
+        return String::new();
+    };
+    parse_manifest(def.manifest_json)
+        .map(|m| m.description)
+        .unwrap_or_default()
+}
+
 /// Human-readable command-hook summary for agent `name` (e.g. `"/open media"`),
 /// or empty if the package declares none.
 pub fn command_hook_summary(name: &str) -> String {
@@ -1154,6 +1241,100 @@ mod tests {
         assert_eq!(m.kind, AgentKind::Service);
         // The Doc agent reads files (channel + fs read), scoped to its home.
         assert!(m.capabilities.iter().any(|c| c.domain == CapDomain::Fs && c.rights.contains(Rights::READ)));
+    }
+
+    #[test_case]
+    fn ui_class_splits_canvas_and_shell() {
+        assert_eq!(ui_class("chess"), AgentUiClass::UiCanvas);
+        assert_eq!(ui_class("paint"), AgentUiClass::UiCanvas);
+        assert_eq!(ui_class("snake"), AgentUiClass::UiCanvas);
+        assert_eq!(ui_class("synth"), AgentUiClass::UiCanvas);
+        assert_eq!(ui_class("notes"), AgentUiClass::Shell);
+        assert_eq!(ui_class("download"), AgentUiClass::Shell);
+        assert_eq!(ui_class("doc"), AgentUiClass::Shell);
+        // Have Ui caps / tools but are chat agents, not package_ui canvases.
+        assert_eq!(ui_class("browser"), AgentUiClass::Shell);
+        assert_eq!(ui_class("media"), AgentUiClass::Shell);
+        assert!(is_package_ui_app("chess"));
+        assert!(!is_package_ui_app("browser"));
+        // Every system package classified from its own manifest, not a name list.
+        for def in SYSTEM_AGENTS {
+            let m = parse_manifest(def.manifest_json).expect(def.name);
+            assert_eq!(
+                is_package_ui_app(def.name),
+                is_package_ui_manifest(&m),
+                "{} classification must match its manifest",
+                def.name
+            );
+        }
+    }
+
+    #[test_case]
+    fn package_ui_manifest_prefers_explicit_flag() {
+        let mut m = parse_manifest(
+            SYSTEM_AGENTS
+                .iter()
+                .find(|d| d.name == "chess")
+                .unwrap()
+                .manifest_json,
+        )
+        .unwrap();
+        assert_eq!(m.package_ui, Some(true));
+        assert!(is_package_ui_manifest(&m));
+        // Explicit false wins over wasm + Ui.
+        m.package_ui = Some(false);
+        assert!(!is_package_ui_manifest(&m));
+        // Explicit true without inferable fields still counts.
+        m.package_ui = Some(true);
+        m.wasm_module = None;
+        m.capabilities.clear();
+        assert!(is_package_ui_manifest(&m));
+        // Fallback inference when flag absent: need wasm + Ui EXEC.
+        m.package_ui = None;
+        assert!(!is_package_ui_manifest(&m));
+        m.wasm_module = Some(String::from("assets/tools.wasm"));
+        m.capabilities.push(CapabilityRequest::new(
+            CapDomain::Ui,
+            Rights::EXEC | Rights::WRITE | Rights::DELETE,
+            Scope::Any,
+        ));
+        assert!(is_package_ui_manifest(&m));
+        // Notes: no package_ui flag, wasm tools but no Ui surface.
+        let notes = parse_manifest(
+            SYSTEM_AGENTS
+                .iter()
+                .find(|d| d.name == "notes")
+                .unwrap()
+                .manifest_json,
+        )
+        .unwrap();
+        assert!(notes.package_ui.is_none());
+        assert!(notes.wasm_module.is_some());
+        assert!(!is_package_ui_manifest(&notes));
+        // Browser: Ui but no guest tools.wasm / no package_ui flag.
+        let browser = parse_manifest(
+            SYSTEM_AGENTS
+                .iter()
+                .find(|d| d.name == "browser")
+                .unwrap()
+                .manifest_json,
+        )
+        .unwrap();
+        assert!(browser.package_ui.is_none());
+        assert!(browser.wasm_module.is_none());
+        assert!(!is_package_ui_manifest(&browser));
+        // Every canvas system package declares the flag.
+        for def in SYSTEM_AGENTS {
+            let m = parse_manifest(def.manifest_json).expect(def.name);
+            if is_package_ui_app(def.name) {
+                assert_eq!(
+                    m.package_ui,
+                    Some(true),
+                    "{} should declare package_ui: true",
+                    def.name
+                );
+            }
+        }
     }
 
     #[test_case]

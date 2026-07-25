@@ -153,15 +153,15 @@ vbox:
 	UUID=$$(VBoxManage showvminfo "$$VM" --machinereadable 2>/dev/null | sed -n "s/^\"$$CTL-ImageUUID-$$PORT-0\"=//p" | tr -d '"'); \
 	echo "vbox: reloading VM '$$VM' (ctl=$$CTL port=$$PORT), preserving disk UUID $${UUID:-<new>}"; \
 	VBoxManage controlvm "$$VM" poweroff 2>/dev/null || true; sleep 1; \
-	echo "vbox: ensuring USB keyboard + USB tablet + xHCI controller; RAM $(VBOX_MEM) MiB"; \
-	VBoxManage modifyvm "$$VM" --keyboard usb --mouse usbtablet --usb-xhci on --memory $(VBOX_MEM); \
+	echo "vbox: ensuring USB keyboard + USB tablet + xHCI controlle + ACPI; RAM $(VBOX_MEM) MiB"; \
+	VBoxManage modifyvm "$$VM" --keyboard usb --acpi on --mouse usbtablet --usb-xhci on --memory $(VBOX_MEM); \
 	VBoxManage storageattach "$$VM" --storagectl "$$CTL" --port "$$PORT" --device 0 --medium none 2>/dev/null || true; \
 	if [ -n "$$UUID" ]; then VBoxManage closemedium disk "$$UUID" 2>/dev/null || true; fi; \
 	VBoxManage closemedium disk "$$VDI" 2>/dev/null || true; rm -f "$$VDI"; \
 	VBoxManage convertfromraw "$$IMG" "$$VDI" --format VDI; \
 	if [ -n "$$UUID" ]; then VBoxManage internalcommands sethduuid "$$VDI" "$$UUID"; fi; \
 	VBoxManage storageattach "$$VM" --storagectl "$$CTL" --port "$$PORT" --device 0 --type hdd --medium "$$(pwd)/$$VDI"; \
-	VBoxManage showvminfo "$$VM" | grep -iE 'Pointing Device|Keyboard Device|xHCI USB|OHCI USB|EHCI USB' || true; \
+	VBoxManage showvminfo "$$VM" | grep -iE 'Pointing Device|Keyboard Device|xHCI USB|OHCI USB|EHCI USB|ACPI' || true; \
 	echo "vbox: done — start '$$VM'"; \
 	echo "vbox: tip: click the VM window, then Host+C (often left ⌘) to capture keyboard"; \
 	echo "vbox: boot line should show  usb-kbd=READY  usb-mse=READY"

@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Month calendar + events (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "calendar_start",
     "calendar_add",

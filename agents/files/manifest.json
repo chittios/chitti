@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Storage file browser (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "files_start",
     "files_list",

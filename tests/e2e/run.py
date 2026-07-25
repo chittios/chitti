@@ -1445,20 +1445,25 @@ def s_package_apps(g):
         ("radio", "package_ui> radio: ok:radio"),
         ("sandbox-lab", "package_ui> sandbox-lab: ok:sandbox-lab"),
     ]
+    # Production allows many package UIs in parallel (one tab each). This
+    # suite still stops between apps so QEMU stays within the 2G test budget
+    # when walking the full roster.
     prev = None
     for name, expect in apps:
+        if prev is not None:
+            m = g.mark()
+            g.send("/agents stop-package")
+            if not g.wait_for("agents> package UI stopped", 15, m):
+                return False, f"{name}: stop-package before start failed (prev={prev})"
         m = g.mark()
         g.send(f"/agents start {name}")
-        if prev is not None:
-            if not g.wait_for(f"package_ui> stopped '{prev}'", 15, m):
-                return False, f"{name}: previous '{prev}' did not stop"
         if not g.wait_for(expect, 15, m):
             return False, f"{name} did not start (expected {expect!r})"
         g.send_raw(b"\x1b[Z")  # Shift+Tab: focus back to the chat line
         prev = name
     m = g.mark()
     g.send("/agents stop-package")
-    ok = g.wait_for(f"package_ui> stopped '{prev}'", 15, m)
+    ok = g.wait_for("agents> package UI stopped", 15, m)
     return (
         ok,
         f"{len(apps)} package-UI apps start+stop over package_ui"

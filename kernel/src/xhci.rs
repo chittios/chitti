@@ -1557,14 +1557,19 @@ impl Xhci {
                         for (i, b) in report.iter_mut().enumerate() {
                             *b = read_volatile((k.report_va + i) as *const u8);
                         }
+                        // HID boot report byte 0: L/R Ctrl 0x11, Shift 0x22,
+                        // Alt 0x44, GUI (⌘ / Super / Win) 0x88.
                         let shift = report[0] & 0x22 != 0;
                         let ctrl = report[0] & 0x11 != 0;
+                        let gui = report[0] & 0x88 != 0;
                         for &usage in &report[2..8] {
                             if usage != 0 && !k.prev[2..8].contains(&usage) {
                                 // Arrow/nav keys become the ANSI sequences a
                                 // serial terminal sends, so the shell/editor
                                 // decode one encoding for every input path.
                                 // Ctrl+Tab = pane-focus toggle (`ESC [ T`).
+                                // Cmd/Super+Space = Agents browser (`ESC [ g`)
+                                // — macOS Spotlight-style.
                                 let mut seq = [0u8; crate::keyrepeat::SEQ_MAX];
                                 let mut n = 0usize;
                                 if let Some(s) = match usage {
@@ -1578,6 +1583,11 @@ impl Xhci {
                                     0x4e => Some(&b"[6~"[..]), // PgDn
                                     0x4c => Some(&b"[3~"[..]), // Delete
                                     0x2b if ctrl => Some(&b"[T"[..]), // Ctrl+Tab
+                                    // Agents browser (Spotlight-style). Prefer
+                                    // GUI (⌘/Super); also Ctrl+Space — macOS
+                                    // hosts often steal ⌘+Space for Spotlight
+                                    // before the guest sees it.
+                                    0x2c if gui || ctrl => Some(&b"[g"[..]),
                                     _ => None,
                                 } {
                                     seq[0] = 0x1b;

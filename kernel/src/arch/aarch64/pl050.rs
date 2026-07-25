@@ -46,6 +46,8 @@ pub fn keyboard_base() -> u64 {
 }
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+/// Left/Right GUI (⌘ / Super) — set-2 E0 0x1f / E0 0x27.
+static GUI_DOWN: AtomicBool = AtomicBool::new(false);
 static CAPS_ON: AtomicBool = AtomicBool::new(false);
 /// Set 2 sends a byte's *break* code as `0xF0 <code>`; this holds across polls.
 static BREAK_NEXT: AtomicBool = AtomicBool::new(false);
@@ -177,10 +179,14 @@ pub fn poll_key() -> Option<u8> {
                     // input path. Arrows + Home/End/PgUp/PgDn/Delete so the
                     // shell's history nav and pane scrollback work from a PS/2
                     // keyboard (VirtualBox-ARM presents one). Ctrl+Tab (E0 0x14)
-                    // is the pane-focus toggle.
+                    // is the pane-focus toggle. GUI (E0 0x1f / 0x27) tracks ⌘/Super.
                     if !breaking {
                         if sc == 0x14 {
                             CTRL_DOWN.store(true, Ordering::Relaxed);
+                            continue;
+                        }
+                        if sc == 0x1f || sc == 0x27 {
+                            GUI_DOWN.store(true, Ordering::Relaxed);
                             continue;
                         }
                         if let Some(seq) = match sc {
@@ -200,6 +206,8 @@ pub fn poll_key() -> Option<u8> {
                         }
                     } else if sc == 0x14 {
                         CTRL_DOWN.store(false, Ordering::Relaxed); // right Ctrl release
+                    } else if sc == 0x1f || sc == 0x27 {
+                        GUI_DOWN.store(false, Ordering::Relaxed);
                     }
                     continue;
                 }
@@ -212,6 +220,15 @@ pub fn poll_key() -> Option<u8> {
                     // Ctrl+Tab: pane-focus toggle, encoded as the private CSI `ESC [ T`.
                     0x0D if !breaking && CTRL_DOWN.load(Ordering::Relaxed) => {
                         PENDING.with(|p| p.extend_from_slice(b"[T"));
+                        return Some(0x1b);
+                    }
+                    // Cmd/Super+Space or Ctrl+Space: Agents browser (`ESC [ g`).
+                    // set-2 Space=0x29. Ctrl+Space is the reliable chord when a
+                    // macOS host steals ⌘+Space for Spotlight.
+                    0x29 if !breaking
+                        && (GUI_DOWN.load(Ordering::Relaxed) || CTRL_DOWN.load(Ordering::Relaxed)) =>
+                    {
+                        PENDING.with(|p| p.extend_from_slice(b"[g"));
                         return Some(0x1b);
                     }
                     _ if !breaking => {

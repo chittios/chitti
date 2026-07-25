@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Radio station toy with tones (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "radio_start",
     "radio_tune",

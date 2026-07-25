@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Image gallery over durable storage (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "gallery_start",
     "gallery_list",

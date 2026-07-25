@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Weather card UI (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "weather_start",
     "weather_set",

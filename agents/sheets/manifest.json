@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Tiny spreadsheet 4x6 (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "sheets_start",
     "sheets_get",

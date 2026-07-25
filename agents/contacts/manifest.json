@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Address book (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "contacts_start",
     "contacts_list",

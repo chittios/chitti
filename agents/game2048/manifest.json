@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "2048 puzzle game (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "game2048_start",
     "game2048_status"

@@ -3,10 +3,35 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Simple tone synth (tools.wasm + host sound).",
-  "toolset": ["synth_tone", "synth_beep", "synth_stop", "synth_status"],
-  "capabilities": [
-    {"domain": "todo", "rights": ["read", "write"], "scope": "any"}
+  "package_ui": true,
+  "toolset": [
+    "synth_tone",
+    "synth_beep",
+    "synth_stop",
+    "synth_status"
   ],
-  "wasm": {"module": "assets/tools.wasm", "fuel": 500000},
+  "capabilities": [
+    {
+      "domain": "ui",
+      "rights": [
+        "exec",
+        "write",
+        "delete"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "todo",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    }
+  ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "fuel": 500000
+  },
   "autostart": false
 }

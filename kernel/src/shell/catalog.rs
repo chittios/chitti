@@ -77,7 +77,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "Session", title: "Session Info", name: "session", shortcut: "" },
     Entry { category: "Session", title: "Clear Chat", name: "clear", shortcut: "" },
     Entry { category: "Session", title: "Compact History", name: "compact", shortcut: "" },
-    Entry { category: "Session", title: "Agents", name: "agents", shortcut: "" },
+    Entry { category: "Session", title: "Agents browser", name: "agents", shortcut: "" },
     Entry { category: "Session", title: "Exit / Power Off", name: "exit", shortcut: "Ctrl+D" },
     Entry { category: "Session", title: "Restart", name: "restart", shortcut: "" },
     // Context & memory

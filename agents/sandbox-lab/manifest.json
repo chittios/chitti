@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Capability attenuation demo lab (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "sandbox_start",
     "sandbox_home_write",

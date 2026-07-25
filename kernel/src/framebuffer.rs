@@ -1000,18 +1000,29 @@ pub const VIDEO_SURFACE: u32 = u32::MAX - 1;
 pub const BROWSER_SURFACE: u32 = u32::MAX - 2;
 
 /// The short tab-bar label for a view.
-fn tab_label(m: RightMode) -> &'static str {
+///
+/// Package-UI agent surfaces use the **agent name** (chess, paint, …) rather
+/// than the generic "surface" — the action-pane window title tracks the app.
+fn tab_label(m: RightMode) -> alloc::string::String {
     match m {
-        RightMode::Closed => "",
-        RightMode::Ktrace => "ktrace",
-        RightMode::Editor => "editor",
-        RightMode::Top => "top",
-        RightMode::Todos => "todos",
-        RightMode::Audio => "audio",
-        RightMode::Surface(IMAGE_SURFACE) => "image",
-        RightMode::Surface(VIDEO_SURFACE) => "video",
-        RightMode::Surface(BROWSER_SURFACE) => "browser",
-        RightMode::Surface(_) => "surface",
+        RightMode::Closed => alloc::string::String::new(),
+        RightMode::Ktrace => alloc::string::String::from("ktrace"),
+        RightMode::Editor => alloc::string::String::from("editor"),
+        RightMode::Top => alloc::string::String::from("top"),
+        RightMode::Todos => alloc::string::String::from("todos"),
+        RightMode::Audio => alloc::string::String::from("audio"),
+        RightMode::Surface(IMAGE_SURFACE) => alloc::string::String::from("image"),
+        RightMode::Surface(VIDEO_SURFACE) => alloc::string::String::from("video"),
+        RightMode::Surface(BROWSER_SURFACE) => alloc::string::String::from("browser"),
+        RightMode::Surface(id) => {
+            // Running package UI (chess/paint/snake/…) — title = agent name.
+            // Use surface_tab_name (display cache), never RUN: tab paint runs
+            // while SCREEN is held, often mid-present from a guest host import.
+            if let Some(name) = crate::service::package_ui::surface_tab_name(id) {
+                return name;
+            }
+            alloc::format!("surface-{id}")
+        }
     }
 }
 
@@ -2717,7 +2728,8 @@ impl Screen {
         let mut x = self.logs.x + BORDER + PAD;
         let mut out = Vec::with_capacity(self.tabs.len());
         for &m in &self.tabs {
-            let w = (tab_label(m).len() as u64 + 1) * cw; // label + trailing space
+            let lab = tab_label(m);
+            let w = (lab.chars().count() as u64 + 1) * cw; // label + trailing space
             out.push((m, x, w));
             x += w + cw; // one cell gap between tabs
         }
@@ -2743,7 +2755,8 @@ impl Screen {
             if is_active {
                 lx = self.draw_str(lx, ty, ">", self.theme.accent, self.logs.bg);
             }
-            self.draw_str(lx, ty, tab_label(m), fg, self.logs.bg);
+            let lab = tab_label(m);
+            self.draw_str(lx, ty, &lab, fg, self.logs.bg);
         }
     }
 
@@ -3726,7 +3739,21 @@ pub fn draw_input(title: &str, prompt: &str, buf: &str, masked: bool, caret_on: 
 /// `rows` is the **visible slice** (already scrolled). `query` is the search
 /// box contents; `caret_on` blinks the search caret; `scroll`/`total` drive the
 /// scrollbar thumb.
+/// Draw the searchable list modal used by `/help` (Commands) and `/agents`.
+/// `title` is the window chrome label (e.g. `"Commands"` / `"Agents"`).
 pub fn draw_commands_browser(
+    query: &str,
+    rows: &[CommandsRow<'_>],
+    scroll: usize,
+    total: usize,
+    caret_on: bool,
+) {
+    draw_list_browser("Commands", query, rows, scroll, total, caret_on);
+}
+
+/// Same as [`draw_commands_browser`] with a custom window title.
+pub fn draw_list_browser(
+    title: &str,
     query: &str,
     rows: &[CommandsRow<'_>],
     scroll: usize,
@@ -3753,6 +3780,9 @@ pub fn draw_commands_browser(
         let bh = rows_h * ch + 2 * (BORDER + PAD) + 12;
         let bx = (sc.width - bw) / 2;
         let by = (sc.height - bh) / 2;
+        // Do **not** full-screen `shade_rect` here: the caret blink repaints this
+        // every ~500 ms, and shade multiplies darkness each pass → cascading
+        // black + flicker. Same solid modal box as `/help` (draw_commands_browser).
         sc.drop_shadow(bx, by, bw, bh);
         sc.fill_rect(bx, by, bw, bh, bg);
         sc.rect_outline(bx, by, bw, bh, BORDER, sc.theme.accent);
@@ -3762,7 +3792,13 @@ pub fn draw_commands_browser(
         let content_w = cols * cw;
 
         // Title + [x] close.
-        sc.draw_str(ix, y, "Commands", sc.theme.accent, bg);
+        sc.draw_str(
+            ix,
+            y,
+            &crate::textsel::ellipsize(title, cols as usize),
+            sc.theme.accent,
+            bg,
+        );
         let close = "[x]";
         let cx = ix + content_w - close.len() as u64 * cw;
         sc.draw_str(cx, y, close, sc.theme.title_dim, bg);
@@ -3851,7 +3887,11 @@ pub fn draw_commands_browser(
         y = list_top + list_h + 6;
         sc.fill_rect(ix, y, content_w, 1, sc.theme.sep_dim);
         y += 4;
-        let foot = "up/dn nav  |  Enter fill input  |  Esc close";
+        let foot = if title.eq_ignore_ascii_case("Agents") {
+            "up/dn nav  |  Enter start/switch  |  Esc close"
+        } else {
+            "up/dn nav  |  Enter fill input  |  Esc close"
+        };
         sc.draw_str(
             ix,
             y,
@@ -4886,14 +4926,22 @@ pub fn present_surface_reserve_ex(
     remember_surf_dim(id, logical_sw, logical_sh);
     remember_surf_reserve(id, reserve_bottom);
     SCREEN.with(|slot| {
-        // Open (or focus) this surface's tab, then paint over its cleared
-        // interior. Idempotent: re-presenting the active surface tab is cheap.
-        let active_surface = slot.as_ref().map(|sc| sc.right == RightMode::Surface(id)).unwrap_or(false);
-        if !active_surface {
-            open_view_slot(slot, RightMode::Surface(id));
+        // Open the surface tab only when it is not already among open tabs
+        // (first present). If the tab exists but another tab is focused, do
+        // **not** steal focus — package-UI ticks used to re-select the canvas
+        // every ~180 ms and undo Ctrl+W / tab switches.
+        let mode = RightMode::Surface(id);
+        let (is_active, is_open) = slot.as_ref().map(|sc| {
+            (sc.right == mode, sc.tabs.iter().any(|&m| m == mode))
+        }).unwrap_or((false, false));
+        if !is_open {
+            open_view_slot(slot, mode);
+        } else if !is_active {
+            // Backing buffer is already updated by the caller; leave the FB alone.
+            return;
         }
         let Some(sc) = slot else { return };
-        if sc.right != RightMode::Surface(id) || logical_sw == 0 || logical_sh == 0 || buf_w == 0 || buf_h == 0
+        if sc.right != mode || logical_sw == 0 || logical_sh == 0 || buf_w == 0 || buf_h == 0
         {
             return;
         }

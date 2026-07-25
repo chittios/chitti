@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Tetris game (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "tetris_start",
     "tetris_status"

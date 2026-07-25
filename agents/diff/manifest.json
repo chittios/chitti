@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Side-by-side text diff (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "diff_start",
     "diff_set",

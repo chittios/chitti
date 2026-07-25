@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Settings panel (prefs in storage; tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "settings_start",
     "settings_get",

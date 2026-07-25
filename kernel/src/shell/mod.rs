@@ -9,6 +9,7 @@
 //! and [`run`] is the interactive read-eval loop over COM1 that a person
 //! drives at `cargo xtask run`.
 
+pub mod agents_catalog;
 pub mod catalog;
 pub mod chrome;
 pub mod remote;
@@ -249,6 +250,13 @@ pub fn run() -> ! {
         // a submitted command; loop to drain, then re-open the prompt with the
         // same draft still in `line`.
         if matches!(outcome, ReadOutcome::ChannelWake) {
+            continue;
+        }
+        // Cmd+Space (Agents browser) or other global hotkey — apply pick, keep draft.
+        if matches!(outcome, ReadOutcome::Hotkey) {
+            if let Some(pick) = take_agents_hotkey_pick() {
+                agents_apply_pick(&pick, &mut chat, &mut orch);
+            }
             continue;
         }
         let submitted = alloc::string::String::from(line.trim());
@@ -1130,7 +1138,11 @@ fn print_help_text() {
     serial_println!("Chitti commands:");
     serial_println!("  <message>        chat with the agent — it calls /commands as tools (Ctrl+C to stop)");
     serial_println!("  /help            Commands browser (search + scroll); /help text = this list");
+    serial_println!("  /agents          Agents browser (Ctrl+Space); /agents text = list");
     for e in catalog::ENTRIES {
+        if e.name == "agents" {
+            continue; // printed above with the fuller blurb
+        }
         serial_println!("  /{:<14} {}", e.name, e.title);
     }
 }
@@ -5783,34 +5795,26 @@ fn run_agents(
     };
     match sub {
         "" | "list" => {
-            let active = active_agent_id();
-            serial_println!("agents> id   name              state     (agent tasks are scheduler processes)");
-            for (id, name, state) in crate::sched::list() {
-                let marker = if id == active { " *chat" } else { "" };
-                serial_println!("agents> {:<4} {:<17} {:<9}{}", id, name, state, marker);
-            }
-            serial_println!("agents> system agents (installed in /agent/, start with /agents start <name>):");
-            let autostart = crate::agent::system::autostart_names();
-            for (name, agent_id) in crate::agent::system::list() {
-                let hooks = crate::agent::system::command_hook_summary(name);
-                let auto = if autostart.iter().any(|n| *n == name) {
-                    "  [autostart]"
-                } else {
-                    ""
-                };
-                if hooks.is_empty() {
-                    serial_println!("agents>   {:<10} /agent/{}/SOUL.md{}", name, agent_id, auto);
-                } else {
+            let force_text = matches!(sarg, "text" | "list" | "--text" | "-t");
+            // Framebuffer Agents browser (same UX as `/help`), unless forced
+            // to serial for e2e / scripting.
+            #[cfg(not(test))]
+            {
+                if !force_text && crate::framebuffer::composer_available() {
                     serial_println!(
-                        "agents>   {:<10} /agent/{}/SOUL.md  [command hook: {}]{}",
-                        name,
-                        agent_id,
-                        hooks,
-                        auto
+                        "agents> opening browser… (also: Ctrl+Space; on Mac host ⌘+Space is often stolen by Spotlight)"
                     );
+                    match crate::modal::browse_agents() {
+                        Some(pick) => agents_apply_pick(&pick, chat, orch),
+                        None => serial_println!(
+                            "agents> closed — type /agents text for the serial list"
+                        ),
+                    }
+                    return;
                 }
             }
-            serial_println!("agents> /agents switch <id> — chat as that agent; /agents kill <id> — terminate");
+            let _ = force_text;
+            print_agents_text();
         }
         "switch" => match sarg.parse::<u64>() {
             Ok(id) => {
@@ -5868,6 +5872,102 @@ fn run_agents(
     }
 }
 
+/// Serial flat listing (also `/agents list text` / e2e).
+fn print_agents_text() {
+    let active = active_agent_id();
+    serial_println!("agents> id   name              state     (agent tasks are scheduler processes)");
+    for (id, name, state) in crate::sched::list() {
+        let marker = if id == active { " *chat" } else { "" };
+        serial_println!("agents> {:<4} {:<17} {:<9}{}", id, name, state, marker);
+    }
+    serial_println!("agents> system agents (UI canvas vs shell) — start with /agents start <name>:");
+    let autostart = crate::agent::system::autostart_names();
+    for (name, agent_id) in crate::agent::system::list() {
+        let class = crate::agent::system::ui_class(name);
+        let kind = crate::agent::system::ui_class_label(class);
+        let hooks = crate::agent::system::command_hook_summary(name);
+        let auto = if autostart.iter().any(|n| *n == name) {
+            "  [autostart]"
+        } else {
+            ""
+        };
+        if hooks.is_empty() {
+            serial_println!(
+                "agents>   {:<12} [{kind:<9}] /agent/{}/SOUL.md{}",
+                name,
+                agent_id,
+                auto
+            );
+        } else {
+            serial_println!(
+                "agents>   {:<12} [{kind:<9}] /agent/{}/SOUL.md  [hook: {}]{}",
+                name,
+                agent_id,
+                hooks,
+                auto
+            );
+        }
+    }
+    serial_println!("agents> /agents          — Agents browser (search + kind badges)");
+    serial_println!("agents> /agents text     — this serial list");
+    serial_println!("agents> /agents switch <id> | kill <id> | start <name>");
+}
+
+/// Apply a pick from the Agents browser (`switch:N` / `ui:name` / `shell:name`).
+fn agents_apply_pick(
+    pick: &str,
+    chat: &mut Option<ChatSession>,
+    orch: &mut crate::agent::orchestrator::Orchestrator,
+) {
+    if let Some(id_s) = pick.strip_prefix("switch:") {
+        match id_s.parse::<u64>() {
+            Ok(id) => {
+                rebind_chat_agent(id, orch);
+                *chat = None;
+                serial_println!(
+                    "agents> chat → agent {id} (SOUL /agent/{id}/SOUL.md)"
+                );
+            }
+            Err(_) => serial_println!("agents> bad pick {pick}"),
+        }
+        return;
+    }
+    if let Some(name) = pick.strip_prefix("ui:") {
+        // Launch package UI (canvas) — same path as `/agents start <name>`.
+        // Modal is already dismissed; print progress so a slow wasm load is not
+        // mistaken for a hang (chess/paint tools.wasm + surface init).
+        serial_println!("agents> starting package UI '{name}'…");
+        #[cfg(not(test))]
+        crate::framebuffer::redraw_all();
+        run_agent_start(name, chat, orch);
+        #[cfg(not(test))]
+        {
+            // Surface may have been created; force action-pane focus + a repaint
+            // so the app is visible immediately after the agents modal.
+            crate::framebuffer::focus_set(true);
+            crate::shell::repaint_active_tab();
+        }
+        return;
+    }
+    if let Some(name) = pick.strip_prefix("shell:") {
+        if let Some(id) = crate::agent::system::list()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, id)| id)
+        {
+            rebind_chat_agent(id, orch);
+            *chat = None;
+            serial_println!(
+                "agents> chat → shell agent '{name}' (id {id}); /agents switch 1 for orchestrator"
+            );
+        } else {
+            serial_println!("agents> '{name}' not installed");
+        }
+        return;
+    }
+    serial_println!("agents> unknown pick {pick}");
+}
+
 /// The available installable agent packages (Phase 2 ships built-in signed
 /// samples; the public registry lands in a later phase). Returns a freshly-minted,
 /// signed package for `name`, or `None`.
@@ -5920,14 +6020,15 @@ fn run_agent_start(
             let task = crate::service::start(&crate::service::ssh::SSH_SERVICE);
             serial_println!("agents> started 'ssh' service (task {})", task);
         }
-        // Package UI apps (logic in tools.wasm only — package_ui is generic;
-        // chess is just another package: rules + board UI + agent-opponent ask
-        // all live in its tools.wasm).
-        "chess" | "ui-chess" | "paint" | "slides" | "minesweeper" | "mines" | "snake" | "synth"
-        | "calc" | "clock" | "files" | "gallery" | "sheets" | "calendar" | "contacts" | "writer"
-        | "archive" | "hex" | "game2048" | "activity" | "weather" | "settings" | "dict" | "diff"
-        | "breakout" | "tetris" | "console" | "maps" | "radio" | "sandbox-lab" | "sandbox" => {
-            // "sandbox" alias → sandbox-lab package
+        // Package UI apps: classified from each package's manifest
+        // (`wasm.module` + Ui EXEC) via `is_package_ui_app` — not a name list.
+        // Aliases map to the installed package name before the check.
+        _ if crate::agent::system::is_package_ui_app(match name {
+            "mines" => "minesweeper",
+            "ui-chess" => "chess",
+            "sandbox" => "sandbox-lab",
+            other => other,
+        }) => {
             let pkg = match name {
                 "mines" => "minesweeper",
                 "ui-chess" => "chess",
@@ -5956,7 +6057,34 @@ fn run_agent_start(
         }
         "stop-chess" | "chess-stop" | "stop-paint" | "stop-slides" | "stop-minesweeper"
         | "stop-snake" | "stop-synth" | "stop-package" | "stop-ui" => {
-            crate::service::package_ui::stop();
+            // Named stops kill only that app; stop-package / stop-ui kill all.
+            // Other package tabs keep running in parallel.
+            let prevs: alloc::vec::Vec<u32> = match name {
+                "stop-package" | "stop-ui" => crate::service::package_ui::stop_all(),
+                "stop-chess" | "chess-stop" => crate::service::package_ui::stop_named("chess")
+                    .into_iter()
+                    .collect(),
+                "stop-paint" => crate::service::package_ui::stop_named("paint")
+                    .into_iter()
+                    .collect(),
+                "stop-slides" => crate::service::package_ui::stop_named("slides")
+                    .into_iter()
+                    .collect(),
+                "stop-minesweeper" => crate::service::package_ui::stop_named("minesweeper")
+                    .into_iter()
+                    .collect(),
+                "stop-snake" => crate::service::package_ui::stop_named("snake")
+                    .into_iter()
+                    .collect(),
+                "stop-synth" => crate::service::package_ui::stop_named("synth")
+                    .into_iter()
+                    .collect(),
+                _ => crate::service::package_ui::stop().into_iter().collect(),
+            };
+            #[cfg(not(test))]
+            for id in prevs {
+                crate::framebuffer::close_tab_mode(crate::framebuffer::RightMode::Surface(id));
+            }
             serial_println!("agents> package UI stopped");
         }
         "notes" | "download" | "todo" | "browser" | "librarian" | "researcher" | "ops"
@@ -6897,6 +7025,16 @@ enum ReadOutcome {
     /// Inbound messaging-channel work is waiting — leave `buf` as the draft
     /// and let the main loop drain the agent queue.
     ChannelWake,
+    /// A global hotkey was handled (e.g. Cmd+Space → Agents browser). Draft
+    /// stays in `buf`; main loop applies any pending pick then re-prompts.
+    Hotkey,
+}
+
+/// Pending pick from the Agents browser opened by Cmd+Space (`ESC [ g`).
+static PENDING_AGENTS_PICK: crate::mm::Locked<Option<String>> = crate::mm::Locked::new(None);
+
+fn take_agents_hotkey_pick() -> Option<String> {
+    PENDING_AGENTS_PICK.with(|p| p.take())
 }
 
 fn read_line(buf: &mut String) -> ReadOutcome {
@@ -7051,6 +7189,30 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                 }
                 if matches!(fin, Some(b'Z')) {
                     tab_switch(false);
+                    continue;
+                }
+                // Cmd/Super+Space → Agents browser (macOS Spotlight-style).
+                // Private CSI `ESC [ g` from USB HID / PS/2 / virtio-input.
+                if matches!(fin, Some(b'g')) {
+                    #[cfg(not(test))]
+                    {
+                        if crate::framebuffer::composer_available() {
+                            match crate::modal::browse_agents() {
+                                Some(pick) => {
+                                    PENDING_AGENTS_PICK.with(|p| *p = Some(pick));
+                                    return ReadOutcome::Hotkey;
+                                }
+                                None => {} // Esc — stay at prompt with draft
+                            }
+                        } else {
+                            // No FB: fall through to serial text list.
+                            print_agents_text();
+                        }
+                    }
+                    #[cfg(test)]
+                    {
+                        print_agents_text();
+                    }
                     continue;
                 }
                 // Editor tab active: forward arrow/nav sequences to the editor.
@@ -7581,7 +7743,10 @@ fn repaint_active_tab() {
         // A package-UI app (chess, games): re-present from its own backing
         // buffer (a resize/tab-switch otherwise fell through to the image
         // viewer and blanked the pane).
-        crate::framebuffer::RightMode::Surface(id) if crate::service::package_ui::owns_surface(id) => {
+        crate::framebuffer::RightMode::Surface(id)
+            if crate::service::package_ui::owns_surface(id)
+                || crate::synapse::ui::has_surface(id) =>
+        {
             crate::synapse::ui::represent(id);
         }
         crate::framebuffer::RightMode::Surface(_) => repaint_image(),
@@ -7593,7 +7758,8 @@ fn repaint_active_tab() {
 fn repaint_active_tab() {}
 
 /// Close the active action tab, tearing down its background process: stop audio
-/// if the audio tab, drop the editor if the editor tab.
+/// if the audio tab, drop the editor if the editor tab, **kill package-UI
+/// agents** (chess/paint/…) so a guest tick cannot reopen the canvas.
 #[cfg(not(test))]
 fn close_active_tab() {
     match crate::framebuffer::right_mode() {
@@ -7620,6 +7786,26 @@ fn close_active_tab() {
             BROWSER_SEL.with(|s| *s = None);
             BROWSER_SEL_DRAG.store(false, core::sync::atomic::Ordering::Relaxed);
             BROWSER_LOADING.store(false, core::sync::atomic::Ordering::Relaxed);
+            crate::framebuffer::close_action();
+        }
+        crate::framebuffer::RightMode::Surface(id)
+            if id != crate::framebuffer::IMAGE_SURFACE
+                && crate::service::package_ui::close_kills_agent(id) =>
+        {
+            // Package-UI canvas: kill **only this** agent so other package tabs
+            // keep running in parallel. Then remove the tab.
+            let _ = crate::service::package_ui::stop_surface(id);
+            crate::framebuffer::close_action();
+            crate::serial_println!("agents> package UI surface {id} stopped (tab closed)");
+        }
+        crate::framebuffer::RightMode::Surface(id)
+            if id != crate::framebuffer::IMAGE_SURFACE
+                && id != crate::framebuffer::VIDEO_SURFACE
+                && id != BROWSER_SURFACE
+                && id != crate::framebuffer::BROWSER_SURFACE =>
+        {
+            // Orphan package surface tab (agent already stopped): just drop it.
+            let _ = crate::service::package_ui::stop_surface(id);
             crate::framebuffer::close_action();
         }
         _ => crate::framebuffer::close_action(),
@@ -8119,7 +8305,7 @@ fn toggle_ktrace() {
 
 /// `/close` (also Ctrl+W) — close the **active** action tab; the pane collapses
 /// once the last tab closes. Tears down that tab's process (stops audio,
-/// drops the editor buffer).
+/// drops the editor buffer, **kills package-UI agents**).
 fn close_action() {
     #[cfg(not(test))]
     {

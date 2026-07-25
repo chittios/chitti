@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Chess: the full game (rules, board UI, input) in assets/tools.wasm; the agent plays Black via the runtime's model-ask protocol.",
+  "package_ui": true,
   "toolset": [
     "ui_surface_request",
     "ui_draw",
@@ -20,26 +21,37 @@
     "memory_get",
     "memory_list"
   ],
-  "wasm": {
-    "module": "assets/tools.wasm",
-    "exports": {
-      "chess_legal": { "func": "chess_legal" },
-      "chess_try_move": { "func": "chess_try_move" }
-    },
-    "memory_pages": 32,
-    "fuel": 2000000
-  },
   "capabilities": [
     {
       "domain": "ui",
-      "rights": ["exec", "write", "delete"],
+      "rights": [
+        "exec",
+        "write",
+        "delete"
+      ],
       "scope": "any"
     },
     {
       "domain": "todo",
-      "rights": ["read", "write"],
+      "rights": [
+        "read",
+        "write"
+      ],
       "scope": "any"
     }
   ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "exports": {
+      "chess_legal": {
+        "func": "chess_legal"
+      },
+      "chess_try_move": {
+        "func": "chess_try_move"
+      }
+    },
+    "memory_pages": 32,
+    "fuel": 2000000
+  },
   "autostart": false
 }

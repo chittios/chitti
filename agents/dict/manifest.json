@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Offline dictionary + custom defs (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "dict_start",
     "dict_lookup",

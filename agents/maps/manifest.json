@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "kind": "skill_agent",
   "description": "Simple maps pin card (tools.wasm).",
+  "package_ui": true,
   "toolset": [
     "maps_start",
     "maps_set",

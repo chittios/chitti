@@ -17,6 +17,8 @@ pub static SCANCODES_RECEIVED: AtomicU64 = AtomicU64::new(0);
 
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+/// Left/Right GUI (⌘ on Mac host, Super/Win on PC) — for Cmd+Space Agents.
+static GUI_DOWN: AtomicBool = AtomicBool::new(false);
 static CAPS_ON: AtomicBool = AtomicBool::new(false);
 /// True when the previous scancode byte was the 0xE0 extended prefix (arrow
 /// keys, etc. arrive as `E0 <code>`).
@@ -128,6 +130,9 @@ extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
         match scancode {
             0x1d => CTRL_DOWN.store(true, Ordering::Relaxed), // right Ctrl make
             0x9d => CTRL_DOWN.store(false, Ordering::Relaxed), // right Ctrl break
+            // Left/Right GUI (⌘ / Super): make 0x5b/0x5c, break 0xdb/0xdc.
+            0x5b | 0x5c => GUI_DOWN.store(true, Ordering::Relaxed),
+            0xdb | 0xdc => GUI_DOWN.store(false, Ordering::Relaxed),
             _ => {
                 // Nav keys become the ANSI sequences a serial terminal sends,
                 // so the shell/editor decode one encoding for every input path.
@@ -171,6 +176,15 @@ extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
             r.push(b'[');
             r.push(b'T');
         }),
+        // Cmd/Super+Space or Ctrl+Space: Agents browser (`ESC [ g`).
+        // (macOS hosts often eat ⌘+Space for Spotlight — Ctrl+Space is reliable.)
+        0x39 if GUI_DOWN.load(Ordering::Relaxed) || CTRL_DOWN.load(Ordering::Relaxed) => {
+            KEYS.with(|r| {
+                r.push(0x1b);
+                r.push(b'[');
+                r.push(b'g');
+            })
+        }
         _ if scancode < 0x80 => {
             if let Some(ch) = decode(scancode) {
                 KEYS.with(|r| r.push(ch));
