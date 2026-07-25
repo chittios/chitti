@@ -74,6 +74,11 @@ pub struct Ext4Store {
     defer: bool,
     /// A mutation happened while deferring, so the flush has work to do.
     dirty: bool,
+    /// Block placement from the last successful full format, for the incremental
+    /// path in [`Ext4Store::sync`].
+    layout: Option<crate::block::ext4::Ext4Layout>,
+    /// Names mutated since the last successful sync.
+    changed: alloc::collections::BTreeSet<String>,
 }
 
 impl Ext4Store {
@@ -98,18 +103,86 @@ impl Ext4Store {
             }
         }
         crate::ktrace::log_fmt(format_args!("ext4_store: mounted ext4 data partition, {} file(s) recovered", cache.len()));
-        Some(Ext4Store { dev, start, count, cache, defer: false, dirty: false })
+        Some(Ext4Store { dev, start, count, cache, defer: false, dirty: false, layout: None, changed: alloc::collections::BTreeSet::new() })
     }
 
     /// Rewrite the partition from the current cache (verified mkfs + write-all).
+    /// Write the store to disk, rewriting only what changed when possible.
+    ///
+    /// A full [`Ext4Writer::format`] rewrites the entire partition, which is what
+    /// made a disk-backed boot cost minutes. But the block layout is fully
+    /// determined by the ordered `(name, size)` list (see
+    /// [`crate::block::ext4::Ext4Layout`]), so when only *contents* changed — no
+    /// additions, deletions or size changes — every file's blocks are exactly where
+    /// the last format put them, and the superblock, bitmaps, inode table and
+    /// directory are all still correct. Then only the changed files' data blocks
+    /// need writing.
+    ///
+    /// Any change to the name set or to a size shifts subsequent files, so that
+    /// falls back to a full format.
     fn sync(&mut self) {
+        if self.sync_incremental() {
+            return;
+        }
+        self.sync_full();
+    }
+
+    /// The fast path. Returns false when the layout cannot be reused, leaving the
+    /// volume untouched so the caller can do a full format.
+    fn sync_incremental(&mut self) -> bool {
+        let Some(layout) = self.layout.clone() else {
+            return false; // never formatted in this session
+        };
+        // Same names, same sizes, same order => same blocks.
+        let want: Vec<(String, usize)> =
+            self.cache.iter().map(|(k, v)| (key_encode(k), v.len())).collect();
+        if want != layout.signature() {
+            return false;
+        }
+        let changed: Vec<String> = self.changed.iter().cloned().collect();
+        for name in &changed {
+            let enc = key_encode(name);
+            let Some(blocks) = layout.blocks_of(&enc) else {
+                return false; // should not happen given the signature matched
+            };
+            let Some(data) = self.cache.get(name) else {
+                return false; // a deletion; signature check should have caught it
+            };
+            let data = data.clone();
+            let blocks = blocks.to_vec();
+            let mut part = Partition::new(&mut self.dev, self.start, self.count);
+            if let Err(e) = crate::block::ext4::write_file_blocks(&mut part, &blocks, &data) {
+                crate::ktrace::log_fmt(format_args!("ext4_store: incremental write failed: {:?} -- falling back to a full format", e));
+                return false;
+            }
+        }
+        self.changed.clear();
+        crate::ktrace::log_fmt(format_args!(
+            "ext4_store: incremental sync ({} file(s) rewritten, {} untouched)",
+            changed.len(),
+            layout.files.len().saturating_sub(changed.len())
+        ));
+        true
+    }
+
+    fn sync_full(&mut self) {
         // Encode keys to legal ext4 filenames; hold the owned strings so the
         // borrowed `FileSpec::name`s outlive the format call.
         let names: Vec<String> = self.cache.keys().map(|k| key_encode(k)).collect();
         let files: Vec<FileSpec> = names.iter().zip(self.cache.values()).map(|(n, d)| FileSpec { name: n.as_str(), data: d.as_slice() }).collect();
         let mut part = Partition::new(&mut self.dev, self.start, self.count);
-        if let Err(e) = Ext4Writer::format(&mut part, &files) {
-            crate::ktrace::log_fmt(format_args!("ext4_store: sync failed: {:?}", e));
+        match Ext4Writer::format_with_layout(&mut part, &files) {
+            Ok(layout) => {
+                self.layout = Some(layout);
+                self.changed.clear();
+            }
+            Err(e) => {
+                // Drop the remembered layout: after a failed format the on-disk
+                // placement is unknown, so a later incremental write could scribble
+                // over the wrong blocks.
+                self.layout = None;
+                crate::ktrace::log_fmt(format_args!("ext4_store: sync failed: {:?}", e));
+            }
         }
     }
 
@@ -145,6 +218,7 @@ impl Ext4Store {
             return;
         }
         self.cache.insert(String::from(name), data.to_vec());
+        self.changed.insert(String::from(name));
         self.touched();
     }
 
@@ -168,6 +242,9 @@ impl Ext4Store {
     pub fn delete(&mut self, name: &str) -> bool {
         let removed = self.cache.remove(name).is_some();
         if removed {
+            // A deletion changes the name set, so the layout cannot be reused; the
+            // signature check in `sync_incremental` will force a full format.
+            self.changed.insert(String::from(name));
             self.touched();
         }
         removed

@@ -38,6 +38,88 @@ const ROCOMPAT_LARGE_FILE: u32 = 0x0002;
 
 /// A file to write into the new filesystem's root: a name + its data (a slice
 /// into module memory — the kernel binary, a model part, or generated text).
+/// Rewrite one file's data into blocks it already occupies, leaving all metadata
+/// alone.
+///
+/// This is the incremental counterpart to a full format, for the case where a
+/// file's size is unchanged so its block placement is unchanged (see
+/// [`Ext4Layout`]). The superblock, bitmaps, inode table and directory already
+/// describe this file correctly, so only its data blocks are touched.
+///
+/// `blocks` must be the placement a previous format reported for a file of exactly
+/// `data.len()` bytes; a mismatch is refused rather than writing a truncated or
+/// overrunning file.
+pub fn write_file_blocks<D: BlockDevice>(dev: &mut D, blocks: &[u64], data: &[u8]) -> Result<(), BlockError> {
+    if blocks.len() != data.len().div_ceil(EBS) {
+        return Err(BlockError::OutOfRange);
+    }
+    let mut bi = 0usize;
+    while bi < blocks.len() {
+        // Coalesce a run of physically consecutive blocks into one request —
+        // the same reason the formatter does: one request per block would be one
+        // polled round trip per 4 KiB.
+        let mut run = 1usize;
+        while bi + run < blocks.len() && blocks[bi + run] == blocks[bi] + run as u64 {
+            run += 1;
+        }
+        let start = bi * EBS;
+        let end = (start + run * EBS).min(data.len());
+        let full = if end > start { (end - start) / BLOCK_SIZE * BLOCK_SIZE } else { 0 };
+        let sector0 = blocks[bi] * SPB;
+        if full > 0 {
+            dev.write_blocks(sector0, &data[start..start + full])?;
+        }
+        // Zero-pad the final partial sector and any trailing sectors of the run,
+        // so stale bytes from the previous contents cannot survive inside the file.
+        let written_secs = (full / BLOCK_SIZE) as u64;
+        let total_secs = run as u64 * SPB;
+        if written_secs < total_secs {
+            let mut tail = [0u8; BLOCK_SIZE];
+            if end > start + full {
+                let rem = end - (start + full);
+                tail[..rem].copy_from_slice(&data[start + full..end]);
+            }
+            dev.write_block(sector0 + written_secs, &tail)?;
+            let zero = [0u8; BLOCK_SIZE];
+            for sx in written_secs + 1..total_secs {
+                dev.write_block(sector0 + sx, &zero)?;
+            }
+        }
+        bi += run;
+    }
+    Ok(())
+}
+
+/// Where each file's data blocks ended up in a formatted volume.
+///
+/// The point of recording this is that **the layout is fully determined by the
+/// ordered list of `(name, size)`**: `alloc_block` hands out blocks sequentially in
+/// file order, so re-formatting the same names at the same sizes places every
+/// file's data in exactly the same blocks. A caller that changes only a file's
+/// *contents* — no additions, deletions or size changes — can therefore rewrite
+/// just that file's blocks and leave the superblock, bitmaps, inode table and
+/// directory untouched, instead of re-formatting the whole partition.
+///
+/// That is what makes an incremental `ext4_store::sync` possible; see there.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ext4Layout {
+    /// `(name, size, data blocks)` in the order the files were written.
+    pub files: alloc::vec::Vec<(alloc::string::String, usize, alloc::vec::Vec<u64>)>,
+}
+
+impl Ext4Layout {
+    /// The signature that decides whether a layout is reusable: the ordered
+    /// `(name, size)` pairs. Equal signature => identical block placement.
+    pub fn signature(&self) -> alloc::vec::Vec<(alloc::string::String, usize)> {
+        self.files.iter().map(|(n, sz, _)| (n.clone(), *sz)).collect()
+    }
+
+    /// The data blocks holding `name`, if present.
+    pub fn blocks_of(&self, name: &str) -> Option<&[u64]> {
+        self.files.iter().find(|(n, _, _)| n == name).map(|(_, _, b)| b.as_slice())
+    }
+}
+
 pub struct FileSpec<'a> {
     pub name: &'a str,
     pub data: &'a [u8],
@@ -120,7 +202,15 @@ impl<'d, D: BlockDevice> Ext4Writer<'d, D> {
     }
 
     /// Format `dev` as ext4 and write `files` into the root directory.
+    /// Format the volume, discarding the resulting layout.
     pub fn format(dev: &'d mut D, files: &[FileSpec]) -> Result<(), BlockError> {
+        Self::format_with_layout(dev, files).map(|_| ())
+    }
+
+    /// Format the volume and report where each file's data blocks landed, so a
+    /// caller can later rewrite one file in place instead of re-formatting. See
+    /// [`Ext4Layout`].
+    pub fn format_with_layout(dev: &'d mut D, files: &[FileSpec]) -> Result<Ext4Layout, BlockError> {
         let total_blocks = dev.block_count() / SPB;
         if total_blocks < 64 {
             return Err(BlockError::OutOfRange);
@@ -216,7 +306,8 @@ impl<'d, D: BlockDevice> Ext4Writer<'d, D> {
         self.write_eblock(b, &buf)
     }
 
-    fn write_all(&mut self, files: &[FileSpec]) -> Result<(), BlockError> {
+    fn write_all(&mut self, files: &[FileSpec]) -> Result<Ext4Layout, BlockError> {
+        let mut layout = Ext4Layout::default();
         let mut inodes: Vec<InodeRec> = Vec::new();
         let mut dir_entries: Vec<(u64, Vec<u8>, u8)> = Vec::new();
         dir_entries.push((ROOT_INO, b".".to_vec(), 2));
@@ -231,6 +322,7 @@ impl<'d, D: BlockDevice> Ext4Writer<'d, D> {
                 data_blocks.push(self.alloc_block(None).ok_or(BlockError::OutOfRange)?);
             }
             self.stream_file(f, &data_blocks)?;
+            layout.files.push((alloc::string::String::from(f.name), size, data_blocks.clone()));
             let (slots, indirect) = self.build_iblocks(&data_blocks)?;
             let ino = self.next_ino;
             self.next_ino += 1;
@@ -271,7 +363,8 @@ impl<'d, D: BlockDevice> Ext4Writer<'d, D> {
         });
 
         self.write_inode_table(&inodes)?;
-        self.write_bitmaps_gdt_super(&inodes)
+        self.write_bitmaps_gdt_super(&inodes)?;
+        Ok(layout)
     }
 
     /// Write a file's bytes across its data blocks (zero-padding the tail).
@@ -585,5 +678,96 @@ mod tests {
         }
         assert_eq!(off, EBS, "rec_len chain must reach block end exactly");
         assert_eq!(count, groups[0].len(), "walked every entry in the block");
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use crate::block::ramdisk::RamDisk;
+    use crate::block::ext4_read;
+    use alloc::vec;
+
+    /// 8 MiB is enough for a few groups without being slow to format.
+    fn disk() -> RamDisk {
+        RamDisk::new(16384)
+    }
+
+    #[test_case]
+    fn layout_is_stable_across_reformats_of_the_same_shape() {
+        // The property the incremental path depends on: same names, same sizes,
+        // same order => identical block placement. If this ever stops holding, an
+        // incremental write would scribble over the wrong file.
+        let a = vec![7u8; 5000];
+        let b = vec![9u8; 100];
+        let files = [FileSpec { name: "one", data: &a }, FileSpec { name: "two", data: &b }];
+        let mut d1 = disk();
+        let l1 = Ext4Writer::format_with_layout(&mut d1, &files).unwrap();
+        // Different *contents*, identical sizes.
+        let a2 = vec![1u8; 5000];
+        let b2 = vec![2u8; 100];
+        let files2 = [FileSpec { name: "one", data: &a2 }, FileSpec { name: "two", data: &b2 }];
+        let mut d2 = disk();
+        let l2 = Ext4Writer::format_with_layout(&mut d2, &files2).unwrap();
+        assert_eq!(l1, l2, "layout changed despite identical (name, size) shape");
+        assert_eq!(l1.signature(), l2.signature());
+        assert!(l1.blocks_of("one").is_some() && l1.blocks_of("two").is_some());
+    }
+
+    #[test_case]
+    fn incremental_write_replaces_contents_and_is_readable() {
+        // Format, then rewrite one file in place via `write_file_blocks`, then read
+        // the volume back through the real reader — the end-to-end property.
+        let a = vec![0xAAu8; 5000];
+        let b = vec![0xBBu8; 100];
+        let files = [FileSpec { name: "one", data: &a }, FileSpec { name: "two", data: &b }];
+        let mut dev = disk();
+        let layout = Ext4Writer::format_with_layout(&mut dev, &files).unwrap();
+
+        let new_a = vec![0x55u8; 5000];
+        let blocks = layout.blocks_of("one").unwrap().to_vec();
+        write_file_blocks(&mut dev, &blocks, &new_a).unwrap();
+
+        // "one" has the new bytes; "two" is untouched — read back through the real
+        // reader, so inode/extent metadata must still be valid too.
+        let mut r = ext4_read::Ext4Reader::open(&mut dev).expect("volume unreadable");
+        let mut buf = vec![0u8; new_a.len()];
+        let n = r.read_root_file("one", &mut buf).expect("one unreadable");
+        assert_eq!(&buf[..n], &new_a[..], "incremental write did not replace the contents");
+        let mut buf2 = vec![0u8; b.len()];
+        let n2 = r.read_root_file("two", &mut buf2).expect("two unreadable");
+        assert_eq!(&buf2[..n2], &b[..], "neighbouring file was disturbed");
+    }
+
+    #[test_case]
+    fn incremental_write_zero_pads_a_shrinking_tail() {
+        // A file whose new contents are shorter within the same block count must
+        // not leave stale bytes behind in the tail.
+        let a = vec![0xAAu8; 4096];
+        let files = [FileSpec { name: "f", data: &a }];
+        let mut dev = disk();
+        let layout = Ext4Writer::format_with_layout(&mut dev, &files).unwrap();
+        let blocks = layout.blocks_of("f").unwrap().to_vec();
+        // Same block count (1), fewer bytes.
+        let short = vec![0x11u8; 10];
+        write_file_blocks(&mut dev, &blocks, &short).unwrap();
+        // Read the raw block: the bytes past the new length must be zero, not 0xAA.
+        let mut buf = [0u8; BLOCK_SIZE];
+        dev.read_block(blocks[0] * SPB, &mut buf).unwrap();
+        assert_eq!(&buf[..10], &short[..]);
+        assert!(buf[10..].iter().all(|&b| b == 0), "stale bytes survived in the tail");
+    }
+
+    #[test_case]
+    fn incremental_write_refuses_a_size_mismatch() {
+        // Writing more data than the recorded placement holds would overrun into
+        // the next file, so it is refused rather than clamped.
+        let a = vec![0u8; 100];
+        let files = [FileSpec { name: "f", data: &a }];
+        let mut dev = disk();
+        let layout = Ext4Writer::format_with_layout(&mut dev, &files).unwrap();
+        let blocks = layout.blocks_of("f").unwrap().to_vec();
+        let too_big = vec![1u8; 100_000];
+        assert!(write_file_blocks(&mut dev, &blocks, &too_big).is_err());
     }
 }
