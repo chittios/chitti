@@ -88,9 +88,42 @@ fn matvec_qw(qw: QWeight, x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &mut [f32
     unsafe {
         crate::arch::aarch64::smp::matvec_quant(qw.qt, qw.data.as_ptr(), x.as_ptr(), y.as_mut_ptr(), n_rows, n_cols);
     }
+    // x86 (and any other arch): split the row range across the compute fleet.
+    // `matvec_quant_rows` was already row-ranged — this used to pass `0..n_rows`,
+    // i.e. the whole matrix on one core, which is what made inference single-core
+    // on x86 while aarch64 fanned the identical work across every core.
+    //
+    // Each worker writes only `y[start..end]` and reads only its own weight rows
+    // plus all of `x`, so the ranges are disjoint and the result is independent of
+    // how the split falls (no cross-range reassociation).
     #[cfg(not(target_arch = "aarch64"))]
-    unsafe {
-        tensor::matvec_quant_rows(qw.qt, qw.data.as_ptr(), x.as_ptr(), y.as_mut_ptr(), 0, n_rows, n_cols);
+    {
+        struct Ctx {
+            qt: u32,
+            w: *const u8,
+            x: *const f32,
+            y: *mut f32,
+            n_cols: usize,
+        }
+        /// # Safety
+        /// `ctx` is a live `Ctx` for the duration of the fan-out, and `[start,
+        /// end)` is disjoint from every other worker's range.
+        unsafe fn rows(start: usize, end: usize, ctx: *mut u8) {
+            // SAFETY: the caller passes the `Ctx` published below, which outlives
+            // the `parallel_for` call.
+            let c = unsafe { &*(ctx as *const Ctx) };
+            // SAFETY: forwarded contract; this worker owns rows `start..end`.
+            unsafe { tensor::matvec_quant_rows(c.qt, c.w, c.x, c.y, start, end, c.n_cols) };
+        }
+        let mut ctx =
+            Ctx { qt: qw.qt, w: qw.data.as_ptr(), x: x.as_ptr(), y: y.as_mut_ptr(), n_cols };
+        // Below this many rows the barrier costs more than the work.
+        const MIN_ROWS: usize = 32;
+        // SAFETY: `rows` is safe on disjoint sub-ranges sharing `ctx`, and `ctx`
+        // lives until `parallel_for` returns.
+        unsafe {
+            crate::arch::parallel_for(n_rows, MIN_ROWS, rows, &mut ctx as *mut Ctx as *mut u8)
+        };
     }
 }
 

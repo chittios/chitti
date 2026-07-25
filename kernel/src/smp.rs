@@ -13,19 +13,24 @@
 //! no lost updates; a broken lock would drop increments under contention.
 //! Per-core counters prove the work genuinely ran on more than one core.
 //!
-//! APs do a fixed chunk of work and then `hlt` forever (interrupts stay
-//! disabled, as Limine started them), so they never busy-spin stealing vCPU
-//! time from the BSP -- important under QEMU's cross-arch TCG. This establishes
-//! the substrate: multiple cores executing kernel code concurrently under
-//! correct locks.
+//! After the self-test each AP joins the **compute fleet** rather than halting
+//! forever: it claims a dense worker index and parks in `hlt` with interrupts
+//! enabled, waiting for a wake IPI. Idle workers therefore cost nothing (no busy
+//! spin stealing vCPU time from the BSP, which matters under QEMU TCG), but are
+//! available the moment there is data-parallel work.
 //!
-//! Data-parallel work (splitting the Cortex `Q8_0` matvec's rows across cores)
-//! is a real speedup on native multi-core x86, but measured a net *loss* under
-//! QEMU TCG -- `thread=multi` taxes every emulated instruction and idle worker
-//! cores contend for host CPU -- so inference is kept single-core here and the
-//! APs park. The row-range kernel (`tensor::matvec_q8_0_rows`) keeps that split
-//! a drop-in away for a real-hardware target. Preemptive per-core run queues +
-//! IPIs remain future work.
+//! [`parallel_for`] is that work: a static-partition job barrier, matching
+//! `arch::aarch64::smp::parallel_for` in both signature and semantics, reached
+//! through the arch-neutral `arch::parallel_for`. It backs the ONNX hot ops, the
+//! video row conversion, and the Cortex matvec row split — all of which
+//! previously ran on a single core here while aarch64 used the whole machine.
+//!
+//! Two safety properties are load-bearing, both learned on aarch64: the barrier
+//! is **bounded** and distinguishes a worker that never woke (whose range the BSP
+//! then runs itself) from one that is merely slow (which must never be
+//! duplicated); and a boot-time [`wake_self_test`] proves the IPI wake actually
+//! works, disabling the fleet if it does not. Preemptive per-core run queues
+//! remain future work — this is fan-out, not scheduling.
 
 use crate::arch::x86_64::{apic, gdt, idt};
 use crate::limine_protocol::SmpInfo;
@@ -455,4 +460,64 @@ pub fn wake_self_test() {
         return;
     }
     crate::ktrace::log_fmt(format_args!("smp: wake self-test ok ({workers} compute worker(s))"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TN: usize = 4096;
+    static TEST_OUT: [AtomicU64; TN] = [ZERO; TN];
+
+    /// Write an index-derived value, so a wrong split shows up as wrong *data*,
+    /// not merely a missing write.
+    ///
+    /// # Safety
+    /// Ranges are disjoint, so no two calls touch the same slot.
+    unsafe fn fill(start: usize, end: usize, _ctx: *mut u8) {
+        for i in start..end.min(TN) {
+            TEST_OUT[i].store((i as u64) * 3 + 1, Ordering::Relaxed);
+        }
+    }
+
+    #[test_case]
+    fn parallel_for_matches_the_serial_result() {
+        // The property the fan-out must have: the output is identical however the
+        // range is partitioned. A dropped or overlapping partition shows up here.
+        for slot in TEST_OUT.iter() {
+            slot.store(u64::MAX, Ordering::Relaxed);
+        }
+        // SAFETY: `fill` only writes its own disjoint range of a static array.
+        unsafe { parallel_for(TN, 32, fill, core::ptr::null_mut()) };
+        for i in 0..TN {
+            assert_eq!(
+                TEST_OUT[i].load(Ordering::Relaxed),
+                (i as u64) * 3 + 1,
+                "index {i} wrong after parallel_for -- partition dropped or overlapped"
+            );
+        }
+    }
+
+    #[test_case]
+    fn parallel_for_runs_small_ranges_inline_and_still_covers_them() {
+        // Below ~2*min_chunk the whole range runs on the calling core. It must
+        // still be fully computed — an early return here would silently produce
+        // zeros for small matrices.
+        for slot in TEST_OUT.iter().take(8) {
+            slot.store(u64::MAX, Ordering::Relaxed);
+        }
+        // SAFETY: as above.
+        unsafe { parallel_for(8, 32, fill, core::ptr::null_mut()) };
+        for i in 0..8 {
+            assert_eq!(TEST_OUT[i].load(Ordering::Relaxed), (i as u64) * 3 + 1);
+        }
+    }
+
+    #[test_case]
+    fn parallel_for_handles_a_zero_length_range() {
+        // n == 0 must be a no-op, not a division by n_parts producing an empty
+        // barrier the BSP waits on forever.
+        // SAFETY: as above.
+        unsafe { parallel_for(0, 32, fill, core::ptr::null_mut()) };
+    }
 }
