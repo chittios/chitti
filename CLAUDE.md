@@ -516,15 +516,28 @@ FDT claims a GICv3 but carries no readable `reg`.
   first controller's first present port made every other disk invisible. Exercise
   the real-hardware storage paths in QEMU with
   `CHITTI_DISK_IF=ahci|nvme|virtio-blk cargo xtask run -arch x86_64`.
-  **`/install` still writes a fresh GPT on any non-Chitti disk — it erases
-  Windows.** The *planning* half of installing alongside exists and is
-  unit-tested (`gpt::free_extents`, `gpt::plan_alongside`: gaps computed with a
-  high-water mark so an overlapping or contained entry can never make the inside
-  of a live partition look free; the existing ESP is **shared, not reformatted**,
-  since a PC has one and rewriting it removes the Windows boot manager; refuses
-  rather than guessing when there is no ESP or no gap). It is **not wired in** —
-  that needs FAT32 write-into-an-existing-volume support to drop our loader into
-  the Windows ESP.
+  **Installing next to an existing OS.** Plain `/install` still writes a fresh GPT
+  and erases the disk — that is the whole-disk path. Two non-destructive commands
+  sit alongside it: **`/install plan`** (read-only; reports the partition table,
+  free extents, and either a plan or why not) and **`/install alongside`** (x86;
+  adds `\EFI\BOOT\BOOTX64.EFI` to the ESP already on the disk, renaming any
+  existing loader to `BOOTX64.CHB` as a backup, touching no partition table and no
+  partition). Planning is `gpt::{free_extents, plan_alongside}` — gaps computed
+  with a high-water mark so an overlapping or contained entry can never make the
+  inside of a live partition look free, and the existing ESP is **shared, never
+  reformatted**, since a PC has one and rewriting it removes the Windows boot
+  manager. The writer is `block::esp` over the pure `block::fat32` layer, and the
+  backup is a **directory-entry rename** so the displaced loader keeps its original
+  cluster chain — preserved byte-for-byte, no copy, no half-written window; a
+  pre-existing backup is never overwritten because that one is the true original.
+  Write order is allocate → payload → FAT (to **every copy**, or chkdsk calls the
+  volume corrupt and Windows may "repair" it back to the stale copy, undoing the
+  install) → directory entry last. Verified by 6 tests against a real FAT32 volume
+  on a `RamDisk`; one of them caught the install overwriting Windows' loader
+  because the fixture had left its cluster marked free, which is the reminder that
+  **the FAT's allocation marks are the only thing protecting existing data**.
+  Still absent: no ChittiOS data partition is created by `alongside`, and NVRAM is
+  untouched, so firmware boot order may need changing by hand.
   NVMe enumerates namespaces via the **IDENTIFY
   CNS=2 active list**, never "walk NSIDs until empty" — NSIDs are sparse on
   VirtualBox (port→NSID; an empty port 0 = inactive NSID 1, exactly what a VM
