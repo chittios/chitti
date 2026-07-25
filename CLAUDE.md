@@ -256,8 +256,10 @@ it, so a desktop's bar is byte-identical to before. Every layer fails closed and
 which step gave up. **None of this is verified on hardware** — QEMU emulates no ACPI EC
 and no battery — so the pure arithmetic (bit assembly, `_BST`/`_BIF` shapes, the
 handshake against a simulated controller incl. slow/wedged/dead) is what the tests hold.
-Still open: retiring the touchpad `_DSM` `0x0020` default now that `_DSM` can be
-evaluated.
+The touchpad's descriptor register now comes from `_DSM` too
+(`drivers::i2c_hid::descriptor_register`) rather than the `0x0020` default — note the
+`_DSM` UUID goes in ACPI's **mixed-endian** buffer order, or the table's own `LEqual`
+fails and the method silently takes its unsupported branch.
 
 **Interrupt-controller bases are discovered, and there are two sources, not one.**
 aarch64 finds the GICv3 from the device tree's `arm,gic-v3` `reg` when there is an

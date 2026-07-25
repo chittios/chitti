@@ -9,10 +9,11 @@
 //! An I2C-HID device is not enumerable. Three facts have to come from elsewhere:
 //!
 //! * its **I2C address** — from `_CRS` ([`crate::acpi::i2c_resources`]);
-//! * the **HID descriptor register** — from `_DSM`, which needs AML evaluation. It
-//!   is `0x0020` on the large majority of devices, so that is the default, and the
-//!   descriptor read is validated (see [`HidDesc::parse`]) so a wrong guess is
-//!   *detected* rather than silently producing garbage;
+//! * the **HID descriptor register** — from `_DSM`, which is now evaluated
+//!   ([`descriptor_register`]). `0x0020` remains the fallback for a `_DSM` this AML
+//!   subset cannot evaluate, since it is the value on the large majority of devices,
+//!   and the descriptor read is validated (see [`HidDesc::parse`]) so a wrong
+//!   register is *detected* rather than silently producing garbage;
 //! * the **report layout** — from the HID report descriptor, parsed by the existing
 //!   [`crate::xhci::parse_report_layout`], which is already used for USB pointers.
 //!   Reusing it means precision touchpads and simple mice decode through one
@@ -35,6 +36,59 @@ pub const DEFAULT_HID_DESC_REG: u16 = 0x0020;
 
 /// The ACPI id every HID-over-I2C device reports in `_HID` or `_CID`.
 pub const HID_I2C_PNP_ID: &str = "PNP0C50";
+
+/// The HID-over-I2C `_DSM` UUID, `3CDFF6F7-4267-4555-AD05-B30A3D8938DE`, in the
+/// mixed-endian byte order ACPI buffers use (first three groups little-endian, the
+/// rest big-endian). Getting that order wrong makes the `LEqual` against the table's
+/// own buffer fail and the method return its "unsupported" branch — a silent
+/// fallback to the default, not an error, which is why the order is spelled out here.
+pub const HID_DSM_UUID: [u8; 16] = [
+    0xf7, 0xf6, 0xdf, 0x3c, // 3CDFF6F7 (LE)
+    0x67, 0x42, // 4267 (LE)
+    0x55, 0x45, // 4555 (LE)
+    0xad, 0x05, // AD05 (BE)
+    0xb3, 0x0a, 0x3d, 0x89, 0x38, 0xde, // B30A3D8938DE (BE)
+];
+
+/// `_DSM` function index that returns the HID descriptor register address.
+pub const HID_DSM_FN_DESC_REG: u64 = 1;
+
+/// Ask the firmware where this device's HID descriptor register is.
+///
+/// `_DSM(uuid, revision, function, args)` with function 1 returns the register
+/// address. Now that the evaluator exists this is answered rather than assumed — which
+/// matters for the minority of devices that do not use `0x0020`, where the old default
+/// meant the descriptor read failed validation and the touchpad was simply skipped.
+///
+/// Returns `None` when there is no `_DSM`, when it uses AML beyond this subset, or when
+/// it answers with something that cannot be a register (zero, or past the 16-bit
+/// register space). Each of those falls back to [`DEFAULT_HID_DESC_REG`], which is what
+/// shipped before — so this can only improve on the previous behaviour, never regress
+/// it.
+pub fn descriptor_register(aml: &[u8], dev: &crate::aml::DeviceNode) -> Option<u16> {
+    use crate::aml::Value;
+    let v = crate::aml::eval_device_method(
+        aml,
+        dev,
+        "_DSM",
+        &[
+            Value::Buffer(HID_DSM_UUID.to_vec()),
+            Value::Integer(1), // revision
+            Value::Integer(HID_DSM_FN_DESC_REG),
+            Value::Package(alloc::vec::Vec::new()),
+        ],
+    )?;
+    let reg = match v {
+        Value::Integer(i) => i,
+        _ => return None,
+    };
+    // Zero is `_DSM`'s "function not supported" answer, and a register cannot exceed
+    // the 16-bit I2C register space.
+    if reg == 0 || reg > u16::MAX as u64 {
+        return None;
+    }
+    Some(reg as u16)
+}
 
 /// Length of the HID descriptor, per the HID-over-I2C specification.
 pub const HID_DESC_LEN: usize = 30;
@@ -213,6 +267,7 @@ pub fn init(rsdp: u64) {
     // difference the AML walk buys: no addressing of devices that are not the
     // touchpad, on a bus that also carries the embedded controller.
     let mut conns = alloc::vec::Vec::new();
+    let mut desc_reg = DEFAULT_HID_DESC_REG;
     if let Some(dev) = crate::aml::device_by_hid(aml, HID_I2C_PNP_ID) {
         if let Some(crs) = crate::aml::device_name(aml, &dev, "_CRS") {
             if let Some(r) = crs.as_buffer().and_then(crate::acpi::parse_i2c_serial_bus) {
@@ -221,6 +276,22 @@ pub fn init(rsdp: u64) {
                     dev.path, HID_I2C_PNP_ID, r.address, r.speed_hz
                 ));
                 conns.push(r);
+            }
+            // Ask `_DSM` for the descriptor register instead of assuming it. A device
+            // that answers is read at the register firmware names; anything else keeps
+            // the majority default.
+            match descriptor_register(aml, &dev) {
+                Some(reg) => {
+                    crate::ktrace::log_fmt(format_args!(
+                        "i2c_hid: {} _DSM gives descriptor register {:#x}",
+                        dev.path, reg
+                    ));
+                    desc_reg = reg;
+                }
+                None => crate::ktrace::log_fmt(format_args!(
+                    "i2c_hid: {} _DSM not evaluable; using the default register {:#x}",
+                    dev.path, DEFAULT_HID_DESC_REG
+                )),
             }
         }
     }
@@ -245,7 +316,7 @@ pub fn init(rsdp: u64) {
             if !bus.present(c.address) {
                 continue;
             }
-            match I2cHid::probe(bus, c.address, DEFAULT_HID_DESC_REG) {
+            match I2cHid::probe(bus, c.address, desc_reg) {
                 Some(dev) => {
                     crate::ktrace::log_fmt(format_args!(
                         "i2c_hid: touchpad at {:#x} on controller {}",
@@ -288,6 +359,118 @@ pub fn poll() {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    // --- _DSM: where the HID descriptor register comes from -----------------
+
+    /// PkgLength for a body of `n` bytes (the encoding counts its own size).
+    fn pkglen(n: usize) -> vec::Vec<u8> {
+        let one = n + 1;
+        if one <= 0x3f {
+            return alloc::vec![one as u8];
+        }
+        let two = n + 2;
+        alloc::vec![0x40 | (two & 0x0f) as u8, (two >> 4) as u8]
+    }
+
+    /// `Buffer (len) { bytes }`
+    fn buffer(bytes: &[u8]) -> vec::Vec<u8> {
+        let mut inner = alloc::vec![0x0au8, bytes.len() as u8]; // BytePrefix size
+        inner.extend_from_slice(bytes);
+        let mut v = alloc::vec![0x11u8]; // BufferOp
+        v.extend_from_slice(&pkglen(inner.len()));
+        v.extend_from_slice(&inner);
+        v
+    }
+
+    /// `If (cond) { body }`
+    fn if_block(cond: &[u8], body: &[u8]) -> vec::Vec<u8> {
+        let mut inner = cond.to_vec();
+        inner.extend_from_slice(body);
+        let mut v = alloc::vec![0xa0u8]; // IfOp
+        v.extend_from_slice(&pkglen(inner.len()));
+        v.extend_from_slice(&inner);
+        v
+    }
+
+    /// `Method (_DSM, 4) { body }`, wrapped in a `DeviceNode` spanning it.
+    fn dsm_method(body: &[u8]) -> vec::Vec<u8> {
+        let mut inner: vec::Vec<u8> = "_DSM".bytes().collect();
+        inner.push(4); // 4 args
+        inner.extend_from_slice(body);
+        let mut v = alloc::vec![0x14u8]; // MethodOp
+        v.extend_from_slice(&pkglen(inner.len()));
+        v.extend_from_slice(&inner);
+        v
+    }
+
+    fn node(len: usize) -> crate::aml::DeviceNode {
+        crate::aml::DeviceNode {
+            path: alloc::string::String::from("\\_SB.PCI0.I2C1.TPD0"),
+            body: 0..len,
+            extent: 0..len,
+        }
+    }
+
+    /// The body every vendor writes: check the UUID, check the function, return the
+    /// register.
+    fn conforming_dsm(reg: u8) -> vec::Vec<u8> {
+        // If (LEqual (Arg0, Buffer(16){uuid})) { If (LEqual (Arg2, One)) { Return (reg) } }
+        let mut cond = alloc::vec![0x93u8, 0x68]; // LEqual, Arg0
+        cond.extend_from_slice(&buffer(&HID_DSM_UUID));
+        let inner_cond = alloc::vec![0x93u8, 0x6a, 0x01]; // LEqual, Arg2, One
+        let ret = alloc::vec![0xa4u8, 0x0a, reg]; // Return (BytePrefix reg)
+        let outer_body = if_block(&inner_cond, &ret);
+        let mut body = if_block(&cond, &outer_body);
+        body.extend_from_slice(&[0xa4, 0x00]); // Return (Zero)
+        dsm_method(&body)
+    }
+
+    #[test_case]
+    fn dsm_supplies_the_descriptor_register() {
+        // The point of evaluating `_DSM` at all: a device that does not use 0x0020 was
+        // previously read at the wrong register, failed descriptor validation, and was
+        // skipped entirely.
+        let aml = conforming_dsm(0x21);
+        assert_eq!(descriptor_register(&aml, &node(aml.len())), Some(0x21));
+    }
+
+    #[test_case]
+    fn the_uuid_byte_order_is_the_mixed_endian_one() {
+        // ACPI buffers store the first three UUID groups little-endian. With the order
+        // wrong the LEqual fails, `_DSM` takes its unsupported branch and returns zero,
+        // and the result is a *silent* fallback rather than an error — so this is worth
+        // pinning.
+        assert_eq!(HID_DSM_UUID[0], 0xf7);
+        assert_eq!(HID_DSM_UUID[3], 0x3c);
+        assert_eq!(HID_DSM_UUID[15], 0xde);
+
+        // A table whose UUID differs by one byte must not match.
+        let mut wrong = HID_DSM_UUID;
+        wrong[0] ^= 1;
+        let mut cond = alloc::vec![0x93u8, 0x68];
+        cond.extend_from_slice(&buffer(&wrong));
+        let ret = alloc::vec![0xa4u8, 0x0a, 0x21];
+        let mut body = if_block(&cond, &ret);
+        body.extend_from_slice(&[0xa4, 0x00]); // Return (Zero)
+        let aml = dsm_method(&body);
+        assert_eq!(descriptor_register(&aml, &node(aml.len())), None);
+    }
+
+    #[test_case]
+    fn an_unsupported_or_absent_dsm_falls_back_rather_than_failing() {
+        // Zero is `_DSM`'s "function not supported" answer; it is not a register.
+        let aml = dsm_method(&[0xa4, 0x00]); // Return (Zero)
+        assert_eq!(descriptor_register(&aml, &node(aml.len())), None);
+
+        // No `_DSM` at all.
+        assert_eq!(descriptor_register(&[], &node(0)), None);
+
+        // A register past the 16-bit register space cannot be one.
+        let mut body = alloc::vec![0xa4u8, 0x0c]; // Return (DWordPrefix ...)
+        body.extend_from_slice(&0x1_0000u32.to_le_bytes());
+        let aml = dsm_method(&body);
+        assert_eq!(descriptor_register(&aml, &node(aml.len())), None);
+    }
 
     /// A conforming HID descriptor.
     fn desc_bytes() -> vec::Vec<u8> {
