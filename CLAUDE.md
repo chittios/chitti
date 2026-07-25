@@ -136,8 +136,16 @@ Current figures (aarch64 HVF, 0.8B Q8): prefill 53 tok/s, decode 19 tok/s,
 `/voice stt` ~2 s, `/voice say` ~14 s for 3.5 s of audio. **aarch64 SMP
 row-split is live** (`arch/aarch64/smp.rs`): PSCI `CPU_ON` bring-up, `WFE`-parked
 workers, a static-partition job barrier splitting the SDOT matvecs + generic
-`parallel_for` (video YUV→RGB) across all online cores; x86 APs boot and park
-(`smp.rs`). **The barrier is bounded, never trust a worker wake**: workers
+`parallel_for` (video YUV→RGB) across all online cores. **x86 has an equivalent
+fleet** (`smp.rs`): APs park in `hlt` with interrupts enabled and are woken by an
+all-excluding-self **IPI** (a `pause` spin would cost a core of power per idle AP —
+real heat and battery on a laptop), with the same static-partition barrier, the
+same claim/done straggler protocol, and its own boot wake self-test. Callers reach
+both through **`arch::parallel_for` / `arch::online_cpus`** — never
+`arch::aarch64::smp::*` directly. That direct `cfg(aarch64)` call was how x86 came
+to run every ONNX op, video row conversion and matvec on one core while aarch64
+used the whole machine; a new parallel loop must use the neutral facade or the
+divergence comes straight back. **The barrier is bounded, never trust a worker wake**: workers
 enable the counter event stream (`CNTKCTL_EL1`) so `WFE` self-wakes, a
 claim/done protocol recomputes a straggler's range on the BSP, and a boot-time
 wake self-test (`smp: wake self-test ok|FAILED` ktrace) degrades to single-core
@@ -170,6 +178,31 @@ report-descriptor-driven), virtio-input, and PL050/PS-2; the wall clock from the
 RTC / UEFI `GetTime` / the virtual counter — each behind a shared facade with a
 per-arch implementation. The same kernel image must run on QEMU, VirtualBox, and
 real UEFI hardware.
+
+**On x86, ACPI tables must be mapped before they can be read.** Limine's HHDM
+covers **usable RAM**, and the tables live in firmware-reserved regions outside
+it — so *both* the raw physical address and its `phys_to_virt` translation are
+unmapped, and touching either is a page fault that halts the boot, not a garbage
+read a signature check can reject. (Cost two boot hangs to find: `0xf52e0`, then
+`0xffff8000000f52e0`.) `acpi::map_table` maps every table page explicitly on x86
+and remaps to the header's declared length, since an XSDT can exceed a page.
+aarch64 is deliberately untouched there: it has a flat identity map, and
+`init_uart` reads SPCR before the frame allocator exists. Relatedly, Limine's RSDP
+pointer is **physical on newer protocol revisions and HHDM-virtual on older ones**,
+and the two cannot be told apart by trying both — classify by range (higher half =
+already virtual), then signature-check.
+
+**Poweroff and the scheduler tick are real hardware now, not emulator stand-ins.**
+`/poweroff` performs an ACPI **S5** transition (`SLP_TYPa | SLP_EN` to the FADT's
+`PM1a_CNT`, with `SLP_TYPa` decoded from the DSDT's `\_S5_` package by bytecode
+scan — no AML interpreter yet), keeping QEMU's `isa-debug-exit` write only as a
+fallback; it used to write *only* that port, so on a physical machine `/poweroff`
+did nothing and left the fans running. The tick prefers the **local-APIC timer**
+calibrated against the **HPET** (`arch/x86_64/hpet.rs`), falling back to the
+PIT/8259 — both of which a UEFI-only machine may omit entirely, in which case the
+old code had no preemption at all and said nothing. Every wait added here is
+bounded and the HPET gets a counter-liveness probe, because an unbounded spin on a
+dead reference clock hung the boot before a single test ran.
 
 **Interrupt-controller bases are discovered, and there are two sources, not one.**
 aarch64 finds the GICv3 from the device tree's `arm,gic-v3` `reg` when there is an
@@ -483,6 +516,15 @@ FDT claims a GICv3 but carries no readable `reg`.
   first controller's first present port made every other disk invisible. Exercise
   the real-hardware storage paths in QEMU with
   `CHITTI_DISK_IF=ahci|nvme|virtio-blk cargo xtask run -arch x86_64`.
+  **`/install` still writes a fresh GPT on any non-Chitti disk — it erases
+  Windows.** The *planning* half of installing alongside exists and is
+  unit-tested (`gpt::free_extents`, `gpt::plan_alongside`: gaps computed with a
+  high-water mark so an overlapping or contained entry can never make the inside
+  of a live partition look free; the existing ESP is **shared, not reformatted**,
+  since a PC has one and rewriting it removes the Windows boot manager; refuses
+  rather than guessing when there is no ESP or no gap). It is **not wired in** —
+  that needs FAT32 write-into-an-existing-volume support to drop our loader into
+  the Windows ESP.
   NVMe enumerates namespaces via the **IDENTIFY
   CNS=2 active list**, never "walk NSIDs until empty" — NSIDs are sparse on
   VirtualBox (port→NSID; an empty port 0 = inactive NSID 1, exactly what a VM
@@ -584,7 +626,7 @@ FDT claims a GICv3 but carries no readable `reg`.
   wrong-host fail closed) + live `/http https://…` to real providers.
 - **Sound & voice** (`sound/`, `onnx/`) — virtio-snd PCM in/out (S16 mono,
   poll-driven, descriptor chains) over virtio-mmio (aarch64) and virtio-PCI
-  (x86 QEMU), **Intel HDA** for VirtualBox (x86+ARM) and real hardware, plus **AC'97** and **Sound Blaster 16** (x86 legacy; SB16 needs a <16 MiB ISA-DMA buffer, not yet reserved at boot); `/voice` (waveform modal, level-gated utterances) and `/voice test`
+  (x86 QEMU), **Intel HDA** for VirtualBox (x86+ARM) and real hardware, plus **AC'97** and **Sound Blaster 16** (x86 legacy; via `mm::alloc_dma_bounded`, which asks the frame allocator for the 8237's real constraints — under 16 MiB and inside one 128 KiB block — instead of allocating normally and hoping, which never held and made the driver unreachable code); `/voice` (waveform modal, level-gated utterances) and `/voice test`
   (tone + mic check). **`audio/`** is the pure media-decoder layer behind the
   `/open <file>.wav|.mp3|.aac` **player**: a full RIFF/WAVE parser (PCM
   8/16/24/32-bit + float32, any channel count downmixed), an MPEG Layer III
