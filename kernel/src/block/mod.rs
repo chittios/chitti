@@ -10,6 +10,7 @@ pub mod ext4;
 pub mod ext4_read;
 pub mod ext4_store;
 pub mod fat;
+pub mod esp;
 pub mod fat32;
 pub mod fat_read;
 pub mod gpt;
