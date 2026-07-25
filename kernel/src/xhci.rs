@@ -1262,7 +1262,7 @@ impl Xhci {
         let report_va = report_va as usize;
         let int_dci = (((ep_addr & 0x0f) as u32) * 2 + 1) as u8; // IN endpoint DCI
         unsafe {
-            self.build_input_configure(c, int_dci, ep_mps, interval, int_pa);
+            self.build_input_configure(c, int_dci, ep_mps, interval, int_pa, EpType::InterruptIn);
             let (cc, _) = self.command(c.in_ctx_pa, (TRB_CONFIGURE_ENDPOINT << 10) | ((c.slot as u32) << 24))?;
             if cc != CC_SUCCESS {
                 crate::ktrace::log_fmt(format_args!("xhci: configure endpoint failed cc={cc}"));
@@ -1405,7 +1405,7 @@ impl Xhci {
     /// Input Context for Configure Endpoint: copy the live Output Slot Context
     /// (port, speed, route — still valid after Address Device), bump Context
     /// Entries, and install the interrupt IN endpoint at `dci`.
-    unsafe fn build_input_configure(&self, c: &Common, dci: u8, mps: u32, interval: u8, int_pa: u64) {
+    unsafe fn build_input_configure(&self, c: &Common, dci: u8, mps: u32, interval: u8, int_pa: u64, ep_type: EpType) {
         unsafe {
             let in_ctx_va = c.in_ctx_va;
             // Control: Drop none; Add Slot (A0) + interrupt EP (A_dci).
@@ -1428,7 +1428,7 @@ impl Xhci {
             let biv = interval.max(1) as u32;
             let ivl = (biv.ilog2()).min(12) + 3; // 3..=15
             w32(ep, ivl << 16);
-            w32(ep + 4, (7 << 3) | (mps << 16) | (3 << 1)); // Interrupt IN, MPS, CErr=3
+            w32(ep + 4, ep_ctx_dword1(ep_type, mps)); // EP Type, MPS, CErr=3
             w64(ep + 8, int_pa | 1); // TR Dequeue | DCS=1
             // Avg TRB Length | Max ESIT Payload (FS INT requires ESIT == MPS).
             let esit = mps.min(0xffff);
@@ -1928,8 +1928,199 @@ fn shift_ascii(c: u8) -> u8 {
 }
 
 
+// --- endpoint types + bulk-capable descriptor parsing ---------------------
+//
+// Everything above configures exactly one kind of endpoint: an Interrupt IN for a
+// HID report. A USB Ethernet adapter needs **bulk** IN and OUT endpoints, which is
+// the same endpoint-context machinery with a different type field — so the type is
+// now a parameter rather than a constant, and the descriptor walk that finds the
+// endpoints is a pure function that can be tested against real descriptor bytes.
+
+/// xHCI Endpoint Context EP Type (dword 1, bits 5:3). Direction is part of the
+/// value, which is why IN and OUT are distinct entries rather than a flag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EpType {
+    IsochOut = 1,
+    BulkOut = 2,
+    InterruptOut = 3,
+    Control = 4,
+    IsochIn = 5,
+    BulkIn = 6,
+    InterruptIn = 7,
+}
+
+/// Pack Endpoint Context dword 1: EP Type, Max Packet Size, and CErr=3.
+///
+/// Pure because this is the field that silently misbehaves: a wrong EP Type does
+/// not fault, it produces an endpoint that configures cleanly and never completes
+/// a transfer — the same failure signature as a mis-wired HDA path.
+pub(crate) fn ep_ctx_dword1(ep: EpType, mps: u32) -> u32 {
+    ((ep as u32) << 3) | ((mps & 0xffff) << 16) | (3 << 1)
+}
+
+/// A bulk interface located in a configuration descriptor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BulkIface {
+    pub iface: u8,
+    /// Endpoint addresses, including the 0x80 direction bit as reported.
+    pub in_ep: u8,
+    pub out_ep: u8,
+    pub in_mps: u16,
+    pub out_mps: u16,
+}
+
+/// Walk a full configuration descriptor and find an interface exposing both a
+/// bulk IN and a bulk OUT endpoint.
+///
+/// `class_filter` restricts which interface class is accepted (`None` = any),
+/// because USB NICs are split across classes: CDC-ECM/NCM present class 0x0A
+/// (CDC Data), while ASIX and Realtek adapters are 0xFF vendor-specific.
+///
+/// The walk is length-prefixed (`bLength` at offset 0), so it must reject a zero
+/// length — a malformed or truncated descriptor would otherwise loop forever, and
+/// this parses bytes that came off an untrusted bus.
+pub(crate) fn find_bulk_iface(desc: &[u8], class_filter: Option<u8>) -> Option<BulkIface> {
+    const DT_INTERFACE: u8 = 0x04;
+    const DT_ENDPOINT: u8 = 0x05;
+    const XFER_BULK: u8 = 0x02;
+    let mut i = 0usize;
+    let mut cur: Option<(u8, bool)> = None; // (iface number, class matches)
+    let mut found: Option<BulkIface> = None;
+    while i + 2 <= desc.len() {
+        let len = desc[i] as usize;
+        if len < 2 || i + len > desc.len() {
+            break; // zero/short length would spin; truncated tail is not parseable
+        }
+        match desc[i + 1] {
+            DT_INTERFACE if len >= 9 => {
+                let number = desc[i + 2];
+                let class = desc[i + 5];
+                let ok = class_filter.is_none_or(|c| c == class);
+                cur = Some((number, ok));
+                // A new interface starts a fresh pair; a bulk IN on one interface
+                // must not be paired with a bulk OUT on another.
+                found = None;
+            }
+            DT_ENDPOINT if len >= 7 => {
+                if let Some((number, true)) = cur {
+                    let addr = desc[i + 2];
+                    let attrs = desc[i + 3];
+                    let mps = u16::from_le_bytes([desc[i + 4], desc[i + 5]]);
+                    if attrs & 0x03 == XFER_BULK {
+                        let f = found.get_or_insert(BulkIface {
+                            iface: number,
+                            in_ep: 0,
+                            out_ep: 0,
+                            in_mps: 0,
+                            out_mps: 0,
+                        });
+                        if addr & 0x80 != 0 {
+                            f.in_ep = addr;
+                            f.in_mps = mps;
+                        } else {
+                            f.out_ep = addr;
+                            f.out_mps = mps;
+                        }
+                        if f.in_ep != 0 && f.out_ep != 0 {
+                            return found;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += len;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
+    // --- endpoint types + bulk descriptor parsing -------------------------
+
+    fn iface_desc(number: u8, class: u8) -> [u8; 9] {
+        [9, 0x04, number, 0, 2, class, 0, 0, 0]
+    }
+    fn ep_desc(addr: u8, attrs: u8, mps: u16) -> [u8; 7] {
+        [7, 0x05, addr, attrs, mps.to_le_bytes()[0], mps.to_le_bytes()[1], 0]
+    }
+
+    #[test_case]
+    fn ep_ctx_dword1_packs_type_and_mps() {
+        // Interrupt IN with MPS 8 — the HID keyboard case, which must encode
+        // exactly as the previous hardcoded literal did.
+        assert_eq!(ep_ctx_dword1(EpType::InterruptIn, 8), (7 << 3) | (8 << 16) | (3 << 1));
+        // Bulk IN/OUT differ only in the type field; getting it wrong yields an
+        // endpoint that configures fine and never completes a transfer.
+        assert_eq!(ep_ctx_dword1(EpType::BulkIn, 512), (6 << 3) | (512 << 16) | (3 << 1));
+        assert_eq!(ep_ctx_dword1(EpType::BulkOut, 512), (2 << 3) | (512 << 16) | (3 << 1));
+        // MPS is a 16-bit field: a larger value must not bleed into the type bits.
+        assert_eq!(ep_ctx_dword1(EpType::BulkIn, 0x1_0000) & 0xff, (6 << 3) | (3 << 1));
+    }
+
+    #[test_case]
+    fn find_bulk_iface_locates_an_asix_style_vendor_interface() {
+        // ASIX / Realtek USB NICs are vendor-specific (class 0xFF) with one
+        // interface carrying both bulk endpoints.
+        let mut d = alloc::vec::Vec::new();
+        d.extend_from_slice(&iface_desc(0, 0xff));
+        d.extend_from_slice(&ep_desc(0x81, 0x02, 512)); // bulk IN
+        d.extend_from_slice(&ep_desc(0x02, 0x02, 512)); // bulk OUT
+        let f = find_bulk_iface(&d, Some(0xff)).unwrap();
+        assert_eq!((f.iface, f.in_ep, f.out_ep), (0, 0x81, 0x02));
+        assert_eq!((f.in_mps, f.out_mps), (512, 512));
+    }
+
+    #[test_case]
+    fn find_bulk_iface_skips_the_cdc_control_interface() {
+        // CDC-ECM: interface 0 is the control interface (class 0x02) with only an
+        // interrupt endpoint; the bulk pair lives on interface 1 (class 0x0A).
+        // Filtering on the data class must land on interface 1.
+        let mut d = alloc::vec::Vec::new();
+        d.extend_from_slice(&iface_desc(0, 0x02));
+        d.extend_from_slice(&ep_desc(0x83, 0x03, 16)); // interrupt IN, not bulk
+        d.extend_from_slice(&iface_desc(1, 0x0a));
+        d.extend_from_slice(&ep_desc(0x81, 0x02, 512));
+        d.extend_from_slice(&ep_desc(0x02, 0x02, 512));
+        let f = find_bulk_iface(&d, Some(0x0a)).unwrap();
+        assert_eq!(f.iface, 1);
+        assert_eq!((f.in_ep, f.out_ep), (0x81, 0x02));
+    }
+
+    #[test_case]
+    fn find_bulk_iface_does_not_pair_endpoints_across_interfaces() {
+        // A bulk IN on one interface and a bulk OUT on another are not a usable
+        // pair; configuring them as one would produce a NIC that never transmits.
+        let mut d = alloc::vec::Vec::new();
+        d.extend_from_slice(&iface_desc(0, 0xff));
+        d.extend_from_slice(&ep_desc(0x81, 0x02, 512)); // bulk IN only
+        d.extend_from_slice(&iface_desc(1, 0xff));
+        d.extend_from_slice(&ep_desc(0x02, 0x02, 512)); // bulk OUT only
+        assert_eq!(find_bulk_iface(&d, Some(0xff)), None);
+    }
+
+    #[test_case]
+    fn find_bulk_iface_rejects_non_matching_class_and_missing_bulk() {
+        let mut d = alloc::vec::Vec::new();
+        d.extend_from_slice(&iface_desc(0, 0x03)); // HID
+        d.extend_from_slice(&ep_desc(0x81, 0x03, 8)); // interrupt
+        assert_eq!(find_bulk_iface(&d, Some(0xff)), None);
+        assert_eq!(find_bulk_iface(&d, None), None); // no bulk endpoints at all
+    }
+
+    #[test_case]
+    fn find_bulk_iface_survives_malformed_descriptors() {
+        // These bytes come off an untrusted bus. A zero bLength must not spin
+        // forever, and a truncated tail must not read past the buffer.
+        assert_eq!(find_bulk_iface(&[0, 0x04, 0, 0, 0], None), None);
+        assert_eq!(find_bulk_iface(&[9, 0x04], None), None); // claims 9, has 2
+        assert_eq!(find_bulk_iface(&[], None), None);
+        let mut d = alloc::vec::Vec::new();
+        d.extend_from_slice(&iface_desc(0, 0xff));
+        d.extend_from_slice(&[7, 0x05, 0x81]); // endpoint cut short
+        assert_eq!(find_bulk_iface(&d, Some(0xff)), None);
+    }
+
     use super::*;
 
     /// A boot mouse with a scroll wheel: 3 button bits + 5 pad, then X, Y,
