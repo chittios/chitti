@@ -248,3 +248,224 @@ pub fn standard_parts(layout: &Layout) -> [PartitionSpec; 3] {
         PartitionSpec { type_guid: LINUX_GUID, first_lba: layout.data_first, last_lba: layout.data_last, name: "Chitti Data" },
     ]
 }
+
+// --- installing alongside an existing OS ---------------------------------
+//
+// `/install` currently has exactly two behaviours: update an existing Chitti disk
+// in place, or write a fresh GPT over the whole device. The second one erases
+// Windows, which makes "install on the machine you already have" impossible.
+//
+// The pieces below are the *planning* half of installing alongside: pure
+// arithmetic over the partition table, unit-tested, no device writes. They answer
+// "where could ChittiOS go without touching anything that is already there?" so
+// the destructive path can be replaced with a decision rather than an assumption.
+
+/// A run of unallocated sectors, inclusive of both ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreeExtent {
+    pub first_lba: u64,
+    pub last_lba: u64,
+}
+
+impl FreeExtent {
+    pub fn sectors(&self) -> u64 {
+        self.last_lba.saturating_sub(self.first_lba).saturating_add(1)
+    }
+}
+
+/// Sectors reserved at the start of the disk (protective MBR, GPT header, and a
+/// 128-entry partition array) and mirrored at the end (backup GPT).
+const GPT_RESERVED_HEAD: u64 = 34;
+const GPT_RESERVED_TAIL: u64 = 33;
+
+/// Every gap between existing partitions that is at least `min_sectors` long.
+///
+/// Existing entries may be unsorted and, on a disk that has been repartitioned by
+/// several tools, may even overlap; both are handled by sorting on `first_lba` and
+/// advancing a high-water mark rather than assuming the entries tile the disk in
+/// order. Zero-length / unused entries are ignored.
+pub fn free_extents(parts: &[ReadPart], total_sectors: u64, min_sectors: u64) -> alloc::vec::Vec<FreeExtent> {
+    let mut used: alloc::vec::Vec<(u64, u64)> = parts
+        .iter()
+        .filter(|p| p.last_lba >= p.first_lba && p.first_lba != 0)
+        .map(|p| (p.first_lba, p.last_lba))
+        .collect();
+    used.sort_unstable();
+
+    let mut out = alloc::vec::Vec::new();
+    let end = total_sectors.saturating_sub(GPT_RESERVED_TAIL); // exclusive
+    let mut cursor = GPT_RESERVED_HEAD;
+    for (first, last) in used {
+        if first > cursor {
+            let gap_last = (first - 1).min(end.saturating_sub(1));
+            if gap_last >= cursor {
+                let e = FreeExtent { first_lba: cursor, last_lba: gap_last };
+                if e.sectors() >= min_sectors {
+                    out.push(e);
+                }
+            }
+        }
+        // High-water mark, so an overlapping or contained entry cannot rewind it
+        // and manufacture free space inside another partition.
+        cursor = cursor.max(last.saturating_add(1));
+    }
+    if end > cursor {
+        let e = FreeExtent { first_lba: cursor, last_lba: end - 1 };
+        if e.sectors() >= min_sectors {
+            out.push(e);
+        }
+    }
+    out
+}
+
+/// Where ChittiOS would go on a disk that already has an OS on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlongsidePlan {
+    /// The existing EFI System Partition to add our loader to. We *share* it
+    /// rather than formatting one: a PC has exactly one ESP, and reformatting it
+    /// would remove the Windows boot manager.
+    pub esp_first_lba: u64,
+    pub esp_last_lba: u64,
+    /// Free space claimed for the ChittiOS ext4 partition.
+    pub os_first_lba: u64,
+    pub os_last_lba: u64,
+}
+
+/// Plan an install alongside the existing contents of a disk.
+///
+/// Returns `None` when it cannot be done safely, which is a real answer and not a
+/// failure: no ESP to share (so nothing would boot us), or no single free extent
+/// big enough. Refusing beats falling back to erasing the disk.
+///
+/// `esp_names` is matched case-insensitively against partition names because the
+/// ESP is identified differently by different tools ("EFI System Partition",
+/// "EFI system partition", "ESP"). A caller with GUID-level information should
+/// prefer that; this is the name-based fallback.
+pub fn plan_alongside(
+    parts: &[ReadPart],
+    total_sectors: u64,
+    needed_sectors: u64,
+    min_esp_sectors: u64,
+) -> Option<AlongsidePlan> {
+    // Find an existing ESP big enough to also hold our loader.
+    let esp = parts.iter().find(|p| {
+        let n = p.name.to_ascii_lowercase();
+        (n.contains("efi") || n == "esp")
+            && p.last_lba >= p.first_lba
+            && (p.last_lba - p.first_lba + 1) >= min_esp_sectors
+    })?;
+    // Largest free extent, so we do not strand the install in a tiny gap when a
+    // better one exists.
+    let best = free_extents(parts, total_sectors, needed_sectors)
+        .into_iter()
+        .max_by_key(|e| e.sectors())?;
+    Some(AlongsidePlan {
+        esp_first_lba: esp.first_lba,
+        esp_last_lba: esp.last_lba,
+        os_first_lba: best.first_lba,
+        os_last_lba: best.first_lba + needed_sectors - 1,
+    })
+}
+
+#[cfg(test)]
+mod alongside_tests {
+    use super::*;
+    use alloc::string::String;
+    use alloc::vec;
+
+    fn p(first: u64, last: u64, name: &str) -> ReadPart {
+        ReadPart { first_lba: first, last_lba: last, name: String::from(name) }
+    }
+
+    /// A realistic Windows disk: MSR, the ESP, Windows itself, a recovery
+    /// partition, and free space left at the end.
+    fn windows_disk() -> alloc::vec::Vec<ReadPart> {
+        vec![
+            p(2048, 206_847, "EFI system partition"),
+            p(206_848, 239_615, "Microsoft reserved partition"),
+            p(239_616, 4_000_000, "Basic data partition"),
+            p(4_000_001, 4_100_000, "Windows Recovery environment"),
+        ]
+    }
+
+    #[test_case]
+    fn free_extents_finds_the_tail_gap() {
+        let parts = windows_disk();
+        let free = free_extents(&parts, 8_000_000, 1000);
+        // Head is consumed by the ESP starting at 2048, so the only real gap is
+        // after the recovery partition.
+        assert_eq!(free.len(), 2, "{free:?}");
+        assert_eq!(free[0], FreeExtent { first_lba: 34, last_lba: 2047 });
+        assert_eq!(free[1].first_lba, 4_100_001);
+        assert_eq!(free[1].last_lba, 8_000_000 - 33 - 1);
+    }
+
+    #[test_case]
+    fn free_extents_respects_the_minimum() {
+        let parts = windows_disk();
+        // The 2014-sector head gap must drop out when a larger minimum is asked.
+        let free = free_extents(&parts, 8_000_000, 100_000);
+        assert_eq!(free.len(), 1);
+        assert_eq!(free[0].first_lba, 4_100_001);
+    }
+
+    #[test_case]
+    fn free_extents_never_reports_space_inside_a_partition() {
+        // Overlapping / contained entries appear on disks repartitioned by several
+        // tools. A naive scan that resets its cursor per entry would report the
+        // inside of the big partition as free — and installing there would
+        // overwrite live data.
+        let parts = vec![p(2048, 1_000_000, "Big"), p(4096, 8192, "Contained")];
+        let free = free_extents(&parts, 2_000_000, 1);
+        for e in &free {
+            assert!(
+                e.first_lba > 1_000_000 || e.last_lba < 2048,
+                "extent {e:?} overlaps an existing partition"
+            );
+        }
+    }
+
+    #[test_case]
+    fn free_extents_reserves_both_gpt_copies() {
+        // Nothing may be handed out below LBA 34 (protective MBR + primary GPT)
+        // or in the last 33 sectors (backup GPT).
+        let free = free_extents(&[], 100_000, 1);
+        assert_eq!(free.len(), 1);
+        assert_eq!(free[0].first_lba, 34);
+        assert_eq!(free[0].last_lba, 100_000 - 34);
+    }
+
+    #[test_case]
+    fn plan_alongside_shares_the_existing_esp() {
+        let parts = windows_disk();
+        let plan = plan_alongside(&parts, 8_000_000, 1_000_000, 100_000).unwrap();
+        // The ESP is *shared*, not recreated: a PC has one, and reformatting it
+        // would delete the Windows boot manager.
+        assert_eq!(plan.esp_first_lba, 2048);
+        assert_eq!(plan.esp_last_lba, 206_847);
+        // Our partition lands in the tail gap, and touches nothing existing.
+        assert_eq!(plan.os_first_lba, 4_100_001);
+        assert_eq!(plan.os_last_lba, 4_100_001 + 1_000_000 - 1);
+        for e in &parts {
+            assert!(
+                plan.os_first_lba > e.last_lba || plan.os_last_lba < e.first_lba,
+                "plan overlaps {}",
+                e.name
+            );
+        }
+    }
+
+    #[test_case]
+    fn plan_alongside_refuses_rather_than_guessing() {
+        let parts = windows_disk();
+        // Not enough contiguous free space -> None, so the caller reports it
+        // instead of falling back to erasing the disk.
+        assert!(plan_alongside(&parts, 8_000_000, 100_000_000, 100_000).is_none());
+        // No ESP at all -> nothing could boot us, so refuse.
+        let no_esp = vec![p(2048, 4_000_000, "Basic data partition")];
+        assert!(plan_alongside(&no_esp, 8_000_000, 1000, 1000).is_none());
+        // An ESP too small to also hold our loader is not usable either.
+        let tiny = vec![p(2048, 2148, "EFI system partition"), p(3000, 4_000_000, "Basic data partition")];
+        assert!(plan_alongside(&tiny, 8_000_000, 1000, 100_000).is_none());
+    }
+}
