@@ -184,3 +184,42 @@ pub unsafe fn parallel_for(n: usize, _min_chunk: usize, f: unsafe fn(usize, usiz
     // SAFETY: forwarded under the caller's contract; single-core.
     unsafe { f(0, n, ctx) }
 }
+
+/// USB Ethernet bulk transport, arch-neutral (the controller lives under the
+/// per-arch xHCI wrapper, exactly like `mouse_poll`). Used by `net::usb_eth`.
+#[cfg(target_arch = "x86_64")]
+pub fn usb_bulk_arm_in() {
+    x86_64::xhci::usb_bulk_arm_in()
+}
+#[cfg(target_arch = "aarch64")]
+pub fn usb_bulk_arm_in() {
+    aarch64::xhci::usb_bulk_arm_in()
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn usb_bulk_arm_in() {}
+
+#[cfg(target_arch = "x86_64")]
+pub fn usb_bulk_take_in(out: &mut [u8]) -> Option<usize> {
+    x86_64::xhci::usb_bulk_take_in(out)
+}
+#[cfg(target_arch = "aarch64")]
+pub fn usb_bulk_take_in(out: &mut [u8]) -> Option<usize> {
+    aarch64::xhci::usb_bulk_take_in(out)
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn usb_bulk_take_in(_out: &mut [u8]) -> Option<usize> {
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn usb_bulk_send(data: &[u8]) -> bool {
+    x86_64::xhci::usb_bulk_send(data)
+}
+#[cfg(target_arch = "aarch64")]
+pub fn usb_bulk_send(data: &[u8]) -> bool {
+    aarch64::xhci::usb_bulk_send(data)
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn usb_bulk_send(_data: &[u8]) -> bool {
+    false
+}

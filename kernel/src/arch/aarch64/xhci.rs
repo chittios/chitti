@@ -218,6 +218,47 @@ pub fn poll_mouse() {
     });
 }
 
+/// USB Ethernet bulk transport. aarch64 keeps a **list** of controllers (Apple
+/// exposes two dwc3 cores, one per Type-C port), so each of these walks the list and
+/// uses whichever controller actually has the bulk endpoints — the adapter could be
+/// plugged into either port.
+pub fn usb_bulk_ready() -> bool {
+    XHCI.with(|s| s.iter().any(|x| x.has_bulk()))
+}
+
+/// Queue a bulk IN transfer on the controller holding the adapter.
+pub fn usb_bulk_arm_in() {
+    XHCI.with(|s| {
+        for x in s.iter_mut().filter(|x| x.has_bulk()) {
+            x.bulk_arm_in();
+        }
+    });
+}
+
+/// Collect a received frame from whichever controller has one.
+pub fn usb_bulk_take_in(out: &mut [u8]) -> Option<usize> {
+    XHCI.with(|s| {
+        for x in s.iter_mut().filter(|x| x.has_bulk()) {
+            if let Some(n) = x.bulk_take_in(out) {
+                return Some(n);
+            }
+        }
+        None
+    })
+}
+
+/// Queue a frame on the controller holding the adapter.
+pub fn usb_bulk_send(data: &[u8]) -> bool {
+    XHCI.with(|s| {
+        for x in s.iter_mut().filter(|x| x.has_bulk()) {
+            if x.bulk_send(data) {
+                return true;
+            }
+        }
+        false
+    })
+}
+
 /// Page-aligned identity DMA: VA == PA on the aarch64 identity map (or via
 /// `dma_to_phys` under the HHDM handoff). Returns `(phys, virt)`.
 fn aa_alloc(bytes: usize) -> Option<(u64, usize)> {

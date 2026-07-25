@@ -45,6 +45,30 @@ pub fn poll_mouse() {
     });
 }
 
+/// Whether a USB Ethernet adapter's bulk endpoints are configured.
+pub fn usb_bulk_ready() -> bool {
+    XHCI.with(|s| s.as_ref().map(|x| x.has_bulk()).unwrap_or(false))
+}
+
+/// Queue a bulk IN transfer if none is outstanding, so a frame can arrive.
+pub fn usb_bulk_arm_in() {
+    XHCI.with(|s| {
+        if let Some(x) = s.as_mut() {
+            x.bulk_arm_in();
+        }
+    });
+}
+
+/// Collect a received frame, if a bulk IN transfer has completed.
+pub fn usb_bulk_take_in(out: &mut [u8]) -> Option<usize> {
+    XHCI.with(|s| s.as_mut().and_then(|x| x.bulk_take_in(out)))
+}
+
+/// Queue a frame for transmission; false if a transfer is still outstanding.
+pub fn usb_bulk_send(data: &[u8]) -> bool {
+    XHCI.with(|s| s.as_mut().map(|x| x.bulk_send(data)).unwrap_or(false))
+}
+
 /// `mm::alloc_dma` adapted to the core's `(phys, virt)` allocator shape.
 fn x86_alloc(bytes: usize) -> Option<(u64, usize)> {
     alloc_dma(bytes).map(|(pa, va)| (pa, va as usize))
