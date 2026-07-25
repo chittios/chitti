@@ -266,7 +266,7 @@ fn shell_commands() -> Vec<ToolDef> {
         ToolDef::shell("perf", "Benchmark end-to-end prefill/decode tokens-per-second.", false),
         ToolDef::shell("infer", "Run the reference-inference parity check.", false),
         ToolDef::shell("mkext4", "Format a disk with ext4. DESTRUCTIVE. args: '<disk> yes'.", true),
-        ToolDef::shell("install", "Install ChittiOS to a disk (GPT: ESP + ext4). DESTRUCTIVE -- repartitions the WHOLE disk, erasing any existing OS. args: '[<disk>] yes|format|plan'; 'plan' is READ-ONLY and reports whether a non-destructive install alongside an existing OS would be possible.", true),
+        ToolDef::shell("install", "Install ChittiOS to a disk (GPT: ESP + ext4). DESTRUCTIVE -- repartitions the WHOLE disk, erasing any existing OS. args: '[<disk>] yes|format|plan|alongside'; 'plan' is READ-ONLY and reports whether installing next to an existing OS is possible; 'alongside' does it non-destructively (adds our loader to the existing ESP, backing up the current one; no partition is modified).", true),
     ]
 }
 

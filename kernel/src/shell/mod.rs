@@ -12249,7 +12249,8 @@ fn disk_ls_volume(n: usize) {
 /// confirmation modal — for scripted use), `format` (force a full repartition
 /// even when an existing Chitti install would be updated in place), and `plan`
 /// (read-only: report a possible install alongside an existing OS, write
-/// nothing).
+/// nothing), and `alongside` (non-destructively add our loader to the existing
+/// ESP, modifying no partition).
 fn parse_install_args(arg: &str) -> InstallArgs {
     let mut a = InstallArgs::default();
     for tok in arg.split_whitespace() {
@@ -12257,6 +12258,7 @@ fn parse_install_args(arg: &str) -> InstallArgs {
             "yes" => a.pre_confirmed = true,
             "format" => a.force_format = true,
             "plan" => a.plan_only = true,
+            "alongside" => a.alongside = true,
             t => {
                 if let Ok(n) = t.parse::<usize>() {
                     a.target = Some(n);
@@ -12277,6 +12279,9 @@ struct InstallArgs {
     /// be able to ask "will ChittiOS fit next to Windows on this machine?" without
     /// risking the machine to find out.
     plan_only: bool,
+    /// `alongside`: add our loader to the **existing** ESP instead of
+    /// repartitioning. Non-destructive to every existing partition.
+    alongside: bool,
     target: Option<usize>,
 }
 
@@ -12335,6 +12340,82 @@ fn install_plan(target_idx: usize) {
     }
 }
 
+/// Install the ChittiOS loader into the **existing** ESP on `target_idx`, backing
+/// up whatever loader is there. `/install alongside`.
+///
+/// This is the non-destructive counterpart to `/install`: it adds one file to the
+/// EFI System Partition already on the disk and touches no partition table and no
+/// existing partition. What it does *not* do is create the ChittiOS data partition
+/// — so it makes a machine bootable into a ChittiOS kernel that came from the
+/// install medium, not a full on-disk install. The output says so rather than
+/// implying more than happened.
+/// x86-only, and legitimately so rather than as a dropped feature: the payload
+/// comes from a Limine module here, the fallback loader is `BOOTX64.EFI`, and the
+/// scenario is coexisting with an x86 Windows install. An ARM equivalent needs
+/// `BOOTAA64.EFI` and the aarch64 payload plumbing, which is separate work.
+#[cfg(target_arch = "x86_64")]
+fn install_alongside(target_idx: usize, pre_confirmed: bool) {
+    use crate::block::{esp::Esp, gpt, BlockDevice, Partition};
+    let Some(efi) = crate::cortex::find_module("BOOTX64.EFI") else {
+        serial_println!("install> no BOOTX64.EFI payload -- build the ISO with xtask");
+        return;
+    };
+    let Some(mut dev) = crate::block::probe_disk_nth(target_idx) else {
+        serial_println!("install> no disk {target_idx} (see /disks)");
+        return;
+    };
+    let Some((_, parts)) = gpt::read(&mut dev) else {
+        serial_println!("install> disk {target_idx} has no GPT -- nothing to install alongside");
+        return;
+    };
+    // Locate the ESP by name, the same way the planner does.
+    let Some(esp_part) = parts.iter().find(|p| {
+        let n = p.name.to_ascii_lowercase();
+        n.contains("efi") || n == "esp"
+    }) else {
+        serial_println!("install> no EFI System Partition on disk {target_idx}");
+        return;
+    };
+    // Destructive-enough to confirm: it rewrites a file in another OS's ESP.
+    if !pre_confirmed
+        && !crate::modal::confirm(
+            "Install ChittiOS loader alongside?",
+            &alloc::format!(
+                "Adds ChittiOS to the EXISTING EFI System Partition on disk {target_idx} (lba {}..{}). Any current \\EFI\\BOOT\\BOOTX64.EFI is renamed to BOOTX64.CHB as a backup, not deleted. No partition table or existing partition is modified. Proceed?",
+                esp_part.first_lba, esp_part.last_lba
+            ),
+        )
+    {
+        serial_println!("install> aborted (not confirmed)");
+        return;
+    }
+    let count = esp_part.last_lba.saturating_sub(esp_part.first_lba) + 1;
+    let mut part = Partition::new(&mut dev, esp_part.first_lba, count);
+    let mut esp = match Esp::open(&mut part) {
+        Ok(e) => e,
+        Err(e) => {
+            serial_println!("install> cannot open the ESP filesystem: {e:?}");
+            return;
+        }
+    };
+    serial_println!("install> ESP {} MiB free", esp.free_bytes() / (1024 * 1024));
+    match esp.install_loader(efi) {
+        Ok(done) => {
+            serial_println!("install> loader written to \\EFI\\BOOT\\BOOTX64.EFI ({} cluster(s))", done.clusters_used);
+            if done.backed_up {
+                serial_println!("install>   previous loader renamed to {} (restore it to undo)", crate::block::esp::BACKUP_NAME);
+            } else if done.backup_preserved {
+                serial_println!("install>   existing {} backup left untouched (it is the original)", crate::block::esp::BACKUP_NAME);
+            }
+            serial_println!("install> existing partitions: UNCHANGED");
+            serial_println!("install> NB no ChittiOS data partition was created, and firmware NVRAM was");
+            serial_println!("install>   not touched -- a machine that boots Windows via its own NVRAM entry");
+            serial_println!("install>   still needs its boot order changed by hand.");
+        }
+        Err(e) => serial_println!("install> failed: {e:?} (nothing was changed)"),
+    }
+}
+
 /// The `/install` human gate: a permission modal (destructive actions are
 /// confirmed via the modal, not an inline `yes` token — `yes` remains only as
 /// a scripted pre-confirmation). Returns true to proceed.
@@ -12373,6 +12454,10 @@ fn disk_install(arg: &str) {
     let (pre_confirmed, force_format, target_override) = (a.pre_confirmed, a.force_format, a.target);
     if a.plan_only {
         install_plan(target_override.unwrap_or(0));
+        return;
+    }
+    if a.alongside {
+        install_alongside(target_override.unwrap_or(0), pre_confirmed);
         return;
     }
     let (Some(efi), Some(kernel)) = (crate::cortex::find_module("BOOTX64.EFI"), crate::cortex::find_module("payload/chitti-kernel")) else {
@@ -12497,6 +12582,13 @@ fn disk_install(arg: &str) {
     let (pre_confirmed, force_format, target_override) = (a.pre_confirmed, a.force_format, a.target);
     if a.plan_only {
         install_plan(target_override.unwrap_or(0));
+        return;
+    }
+    if a.alongside {
+        // See `install_alongside`: the x86 path installs `BOOTX64.EFI` from a
+        // Limine module. The ARM equivalent needs `BOOTAA64.EFI` and the aarch64
+        // payload plumbing; the `plan` report works on both arches meanwhile.
+        serial_println!("install> `alongside` is x86-only so far (ARM needs BOOTAA64.EFI); try `/install plan`");
         return;
     }
     // Identify the boot ESP (payload source): the FAT volume containing
