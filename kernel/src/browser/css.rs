@@ -1022,13 +1022,88 @@ fn specificity(key: &Compound, ancestors: &[Compound]) -> (u8, u8, u8) {
     (a.min(255) as u8, b.min(255) as u8, c.min(255) as u8)
 }
 
-/// Parse one compound selector (`a.gb_1a`, `.gb_9a.gb_K`, `div#x`, `*`, `p`).
-/// A pseudo-class/element (`:hover`, `::before`) makes the whole selector
-/// unsupported (returns `None`) — matching today's behaviour of dropping such
-/// rules rather than applying them unconditionally.
+/// Strip simple dynamic pseudo-classes from a compound selector.
+///
+/// - `:link` / `:any-link` → keep the base (HN titles need
+///   `a:link { color:#000; text-decoration:none }` — previously dropped because
+///   of the colon). We treat every link as unvisited.
+/// - `:visited` → drop the rule (no visit history; if kept it would override
+///   `:link` via source order and paint every HN title grey).
+/// - `:hover` / `:active` / `:focus*` / `:target` → drop (state dependent).
+/// - Pseudo-elements (`::before`, …) and functional pseudos → drop.
+/// - Attribute selectors (`[…]`) → drop.
+fn strip_compound_pseudos(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            return None;
+        }
+        if bytes[i] == b':' {
+            let mut j = i + 1;
+            let double = j < bytes.len() && bytes[j] == b':';
+            if double {
+                j += 1;
+            }
+            let start = j;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'-') {
+                j += 1;
+            }
+            let name = s[start..j].to_ascii_lowercase();
+            if j < bytes.len() && bytes[j] == b'(' {
+                return None; // :nth-child(…), :not(…), …
+            }
+            if double
+                || matches!(
+                    name.as_str(),
+                    "before"
+                        | "after"
+                        | "first-line"
+                        | "first-letter"
+                        | "marker"
+                        | "selection"
+                        | "placeholder"
+                        | "backdrop"
+                )
+            {
+                return None;
+            }
+            match name.as_str() {
+                // Unvisited approximation — honor as the base compound.
+                "link" | "any-link" => {
+                    i = j;
+                    continue;
+                }
+                // No history store: drop so `:link` colors win (HN titles).
+                "visited" => return None,
+                "hover" | "active" | "focus" | "focus-visible" | "focus-within" | "target" => {
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    if out.is_empty() {
+        None
+    } else {
+        String::from_utf8(out).ok()
+    }
+}
+
+/// Parse one compound selector (`a.gb_1a`, `.gb_9a.gb_K`, `div#x`, `*`, `p`,
+/// `a:link`). State-dependent / structural pseudos that we can't honor make
+/// the whole selector unsupported (`None`).
 fn parse_compound(s: &str) -> Option<Compound> {
     let s = s.trim();
-    if s.is_empty() || s.contains(':') || s.contains('[') {
+    if s.is_empty() {
+        return None;
+    }
+    let s = strip_compound_pseudos(s)?;
+    let s = s.trim();
+    if s.is_empty() {
         return None;
     }
     if s == "*" {
@@ -2412,6 +2487,13 @@ pub fn compute_ex(
         "center" => {
             st.text_align = Align::Center;
         }
+        // Tables do **not** inherit an outer `text-align:center` into cell
+        // content — only the table box is centered (see `layout_table`). HN
+        // wraps `#hnmain` in `<center>`; without this reset every title was
+        // centered inside its column and subtext drifted off the title edge.
+        "table" | "td" => {
+            st.text_align = Align::Left;
+        }
         // `<th>` and `<caption>` default to centered text per the UA sheet.
         "th" | "caption" => {
             st.text_align = Align::Center;
@@ -3182,8 +3264,29 @@ mod tests {
         assert!(!key.matches("a", None, Some("other")));
         assert_eq!(anc.len(), 1);
         assert!(anc[0].matches("div", None, Some("card foo")));
-        // Pseudo-classes drop the rule (unsupported), not applied unconditionally.
+        // State-dependent pseudos drop the rule (not applied unconditionally).
         assert!(parse_complex("a:hover").is_none());
+        // `:link` / `:visited` strip to the base compound — HN needs this.
+        let (k, _) = parse_complex("a:link").expect("a:link");
+        assert!(k.matches("a", None, None));
+        let (k, a) = parse_complex(".subtext a:link").expect(".subtext a:link");
+        assert!(k.matches("a", None, None));
+        assert_eq!(a.len(), 1);
+        assert!(a[0].matches("span", None, Some("subtext")));
+    }
+
+    #[test_case]
+    fn a_link_overrides_ua_link_color() {
+        // news.css: `a:link { color:#000000; text-decoration:none }` must win
+        // over the UA terracotta + underline default.
+        let sheet = Stylesheet::parse("a:link{color:#000000;text-decoration:none}");
+        let parent = ComputedStyle::default();
+        let st = compute(&sheet, "a", None, None, None, &parent);
+        assert_eq!(st.color, 0x000000, "a:link color");
+        assert!(
+            matches!(st.text_decoration, TextDecoration::None),
+            "a:link clears underline"
+        );
     }
 
     #[test_case]

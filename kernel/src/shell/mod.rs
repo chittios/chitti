@@ -7538,8 +7538,14 @@ fn repaint_active_tab() {
         }
         // Browser must re-present its own buffer — fallthrough to image was
         // wiping Google/etc. to a blank dark pane after every tab/status tick.
+        // Prefer the last-present pixel cache (especially mid-load) so we never
+        // re-layout the *previous* page's HTML and flash it back onto the pane.
         crate::framebuffer::RightMode::Surface(id) if id == BROWSER_SURFACE || id == crate::framebuffer::BROWSER_SURFACE => {
-            let _ = browser_repaint();
+            if browser_is_loading() {
+                let _ = browser_represent_cached();
+            } else if !browser_represent_cached() {
+                let _ = browser_repaint();
+            }
         }
         // A package-UI app (chess, games): re-present from its own backing
         // buffer (a resize/tab-switch otherwise fell through to the image
@@ -7579,6 +7585,8 @@ fn close_active_tab() {
             crate::browser::js_just::page_close();
             BROWSER.with(|s| *s = None);
             BROWSER_LAYOUT.with(|s| *s = None);
+            BROWSER_PRESENT.with(|s| *s = None);
+            BROWSER_LOADING.store(false, core::sync::atomic::Ordering::Relaxed);
             crate::framebuffer::close_action();
         }
         _ => crate::framebuffer::close_action(),
@@ -8169,6 +8177,26 @@ static BROWSER_LAYOUT: crate::mm::Locked<Option<crate::browser::layout::Layout>>
 static BROWSER_PROGRESS: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(255);
 
+/// True while `browser_load_method` is mid-navigation (progressive stages).
+/// Hover / tab-repaint must not re-layout the *previous* session HTML in this
+/// window — that flashed the old page whenever the mouse moved or the action
+/// pane was re-composited.
+static BROWSER_LOADING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Last pixels we presented for the browser surface (logical RGB, no letterbox).
+/// Used to re-blit without re-layout when the action pane is repainted mid-load
+/// (tab switch, divider drag, status chrome) so the previous page can't return.
+struct BrowserPresentCache {
+    pixels: alloc::vec::Vec<u32>,
+    title: alloc::string::String,
+    url: alloc::string::String,
+    scroll_y: i32,
+    content_h: i32,
+}
+static BROWSER_PRESENT: crate::mm::Locked<Option<BrowserPresentCache>> =
+    crate::mm::Locked::new(None);
+
 /// Host entry for browser tools (`ToolBinding::Browser`).
 pub(crate) fn run_browser_tool(name: &str, args_json: &str) -> alloc::string::String {
     use crate::session::todo::json_str;
@@ -8220,6 +8248,7 @@ fn browser_set_progress(pct: u8) {
 
 fn browser_clear_progress() {
     BROWSER_PROGRESS.store(255, core::sync::atomic::Ordering::Relaxed);
+    BROWSER_LOADING.store(false, core::sync::atomic::Ordering::Relaxed);
     #[cfg(not(test))]
     {
         crate::framebuffer::set_cursor_shape(crate::framebuffer::CursorShape::Arrow);
@@ -8233,6 +8262,21 @@ fn browser_progress_opt() -> Option<u8> {
     } else {
         Some(p)
     }
+}
+
+fn browser_is_loading() -> bool {
+    BROWSER_LOADING.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Start a progressive navigation: mark loading, drop hover, and forget the
+/// previous page's layout so mouse-move hit-tests can't flash it back.
+fn browser_begin_load() {
+    BROWSER_LOADING.store(true, core::sync::atomic::Ordering::Relaxed);
+    let _ = crate::browser::set_hover_link(None);
+    BROWSER_LAYOUT.with(|s| *s = None);
+    // Drop the previous page's present cache so a mid-load `repaint_active_tab`
+    // can't re-blit old pixels. The next `browser_present` will refill it.
+    BROWSER_PRESENT.with(|s| *s = None);
 }
 
 fn browser_load(url: &str, push_hist: bool) -> alloc::string::String {
@@ -8530,6 +8574,7 @@ fn browser_load_method(
         el.microtasks.clear();
         el.queue_load();
     });
+    browser_begin_load();
     browser_set_progress(5);
 
     // Progressive render (stage 1/5): paint a loading screen immediately so the
@@ -9110,6 +9155,9 @@ fn browser_paint_stage(
             b.content_height = content_h;
         }
     });
+    // Keep hit-testing in sync with the stage just painted so hover never
+    // falls back to a stale previous-page layout mid-navigation.
+    BROWSER_LAYOUT.with(|s| *s = Some(lay.clone()));
     browser_present(&pixels, title, url, 0, content_h);
     crate::shell::upkeep();
 }
@@ -9118,6 +9166,17 @@ fn browser_paint_stage(
 fn browser_paint_stage(_lay: &crate::browser::layout::Layout, _t: &str, _u: &str, _p: u8) {}
 
 fn browser_present(pixels: &[u32], title: &str, url: &str, scroll_y: i32, content_h: i32) {
+    // Always cache what we last put on the surface so mid-load / tab-repaint
+    // can re-blit without re-laying out the previous page's HTML.
+    BROWSER_PRESENT.with(|s| {
+        *s = Some(BrowserPresentCache {
+            pixels: pixels.to_vec(),
+            title: title.into(),
+            url: url.into(),
+            scroll_y,
+            content_h,
+        });
+    });
     #[cfg(not(test))]
     {
         // present_surface_reserve already opens/focuses the Surface tab and blits.
@@ -9156,7 +9215,55 @@ fn browser_present(pixels: &[u32], title: &str, url: &str, scroll_y: i32, conten
     }
 }
 
+/// Re-blit the last presented frame without re-layout. Used while loading and
+/// by hover when a full layout_session would flash the wrong page.
+fn browser_represent_cached() -> bool {
+    BROWSER_PRESENT.with(|s| {
+        if let Some(c) = s.as_ref() {
+            let pixels = c.pixels.clone();
+            let title = c.title.clone();
+            let url = c.url.clone();
+            let scroll_y = c.scroll_y;
+            let content_h = c.content_h;
+            // Don't re-enter the cache writer with the same data via a nested
+            // present path that would clone twice — call the FB blit directly.
+            #[cfg(not(test))]
+            {
+                let hud = crate::framebuffer::browser_hud_height().max(1);
+                crate::framebuffer::present_surface_reserve(
+                    BROWSER_SURFACE,
+                    browser_vw() as usize,
+                    browser_vh() as usize,
+                    &pixels,
+                    hud,
+                );
+                let focused = BROWSER.with(|b| b.as_ref().and_then(|x| x.focused).is_some());
+                crate::framebuffer::draw_browser_status(
+                    &title,
+                    &url,
+                    scroll_y,
+                    content_h,
+                    browser_vh(),
+                    focused,
+                );
+            }
+            let _ = (pixels, title, url, scroll_y, content_h);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 fn browser_repaint() -> alloc::string::String {
+    // Mid-navigation: never re-layout the previous session HTML. Re-blit the
+    // last progressive stage (or no-op if nothing has painted yet).
+    if browser_is_loading() {
+        if browser_represent_cached() {
+            return alloc::string::String::from("ok:loading");
+        }
+        return alloc::string::String::from("ok:loading");
+    }
     let Some((lay, url, title, scroll, _focused)) = browser_layout_session() else {
         return alloc::string::String::from("error: no page open (browser_open first)");
     };
@@ -9174,6 +9281,9 @@ fn browser_repaint() -> alloc::string::String {
 }
 
 fn browser_scroll(dy: i32) -> alloc::string::String {
+    if browser_is_loading() {
+        return alloc::string::String::from("ok:loading");
+    }
     let max = BROWSER.with(|s| {
         s.as_ref()
             .map(|b| (b.content_height - browser_vh()).max(0))
@@ -9442,6 +9552,17 @@ fn browser_submit_control(
 
 /// Update cursor shape when hovering the browser surface.
 fn browser_hover(sx: i32, sy: i32) {
+    // During progressive load, never re-layout/repaint: `browser_repaint` reads
+    // the *previous* page's session HTML and was flashing it back whenever the
+    // mouse moved over a link. Keep the Wait cursor and leave the stage pixels.
+    if browser_is_loading() {
+        #[cfg(not(test))]
+        {
+            crate::framebuffer::set_cursor_shape(crate::framebuffer::CursorShape::Wait);
+        }
+        let _ = (sx, sy);
+        return;
+    }
     let scroll = BROWSER.with(|s| s.as_ref().map(|b| b.scroll_y).unwrap_or(0));
     let content_y = sy + scroll;
     let (kind, link_rect) = BROWSER_LAYOUT.with(|slot| match slot.as_ref() {
@@ -9460,8 +9581,10 @@ fn browser_hover(sx: i32, sy: i32) {
         None => (crate::browser::layout::CursorKind::Default, None),
     });
     // Underline the hovered link (repaint only when the hovered link changes).
+    // Use a paint-from-cached-layout path so we don't re-run the full layout
+    // pipeline on every hover change (still needed for underline chrome).
     if crate::browser::set_hover_link(link_rect) {
-        browser_repaint();
+        browser_repaint_hover();
     }
     #[cfg(not(test))]
     {
@@ -9474,6 +9597,40 @@ fn browser_hover(sx: i32, sy: i32) {
         crate::framebuffer::set_cursor_shape(shape);
     }
     let _ = (kind, sx, sy);
+}
+
+/// Hover-only repaint: paint the cached layout with the new hover underline.
+/// Avoids a full `layout_session` (which re-parses HTML) on every mouse move.
+fn browser_repaint_hover() {
+    if browser_is_loading() {
+        return;
+    }
+    let Some(lay) = BROWSER_LAYOUT.with(|s| s.clone()) else {
+        return;
+    };
+    let (url, title, scroll) = BROWSER.with(|s| {
+        s.as_ref()
+            .map(|b| (b.url.clone(), b.title.clone(), b.scroll_y))
+            .unwrap_or_else(|| {
+                (
+                    alloc::string::String::new(),
+                    alloc::string::String::new(),
+                    0,
+                )
+            })
+    });
+    if url.is_empty() {
+        return;
+    }
+    let progress = browser_progress_opt();
+    let (pixels, content_h) =
+        crate::browser::paint_layout_chrome(&lay, browser_vh(), scroll, progress);
+    BROWSER.with(|s| {
+        if let Some(b) = s.as_mut() {
+            b.content_height = content_h;
+        }
+    });
+    browser_present(&pixels, &title, &url, scroll, content_h);
 }
 
 fn browser_status() -> alloc::string::String {

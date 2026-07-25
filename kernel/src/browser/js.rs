@@ -637,6 +637,10 @@ fn insert_created_elems(root: &mut Node, dom: &JsDom) {
                     sandbox: None,
                     width_attr: None,
                     height_attr: None,
+                    colspan_attr: None,
+                    bgcolor_attr: None,
+                    width_pct: None,
+                    align_attr: None,
                     rel: None,
                     srcset: None,
                     on_attrs: er

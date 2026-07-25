@@ -48,6 +48,18 @@ pub enum NodeKind {
         /// `width=` / `height=` presentational hints (px).
         width_attr: Option<i32>,
         height_attr: Option<i32>,
+        /// `colspan=` on `<td>` / `<th>` (default 1). Used by table layout so
+        /// Hacker News subtext rows (`<td colspan=2></td><td class=subtext>`)
+        /// align under the title column instead of under the rank.
+        colspan_attr: Option<u32>,
+        /// HTML presentational `bgcolor=` (legacy; still used by HN, Google…).
+        /// Stored raw (`#f6f6ef` / `orange`); layout parses via `css::parse_color`.
+        bgcolor_attr: Option<String>,
+        /// Presentational `width=` as a percentage (e.g. `width="85%"` on HN's
+        /// `#hnmain` table). Pixel widths go through `width_attr`.
+        width_pct: Option<u8>,
+        /// Presentational `align=left|center|right` (HN rank column, etc.).
+        align_attr: Option<String>,
         /// `rel=` on `<link>` / `<a>` (stylesheet, icon, …).
         rel: Option<String>,
         /// `srcset=` on `<img>` / `<source>` (responsive candidates).
@@ -90,6 +102,10 @@ impl Node {
                 sandbox: None,
                 width_attr: None,
                 height_attr: None,
+                colspan_attr: None,
+                bgcolor_attr: None,
+                width_pct: None,
+                align_attr: None,
                 rel: None,
                 srcset: None,
                 on_attrs: Vec::new(),
@@ -491,6 +507,10 @@ pub fn parse(html: &str) -> Document {
                         sandbox,
                         width_attr,
                         height_attr,
+                        colspan_attr,
+                        bgcolor_attr,
+                        width_pct,
+                        align_attr,
                         rel,
                         srcset,
                         on_attrs,
@@ -534,8 +554,23 @@ pub fn parse(html: &str) -> Document {
                             "srcdoc" => *srcdoc = Some(val),
                             "target" => *target = Some(val),
                             "sandbox" => *sandbox = Some(val),
-                            "width" => *width_attr = val.parse().ok(),
+                            "width" => {
+                                // `width="85%"` → percentage; bare number → px.
+                                let t = val.trim();
+                                if let Some(p) = t.strip_suffix('%') {
+                                    *width_pct = p.parse().ok().filter(|&n: &u8| n > 0 && n <= 100);
+                                    *width_attr = None;
+                                } else {
+                                    *width_attr = t.parse().ok();
+                                    *width_pct = None;
+                                }
+                            }
                             "height" => *height_attr = val.parse().ok(),
+                            "colspan" => {
+                                *colspan_attr = val.parse().ok().filter(|&n| n >= 1);
+                            }
+                            "bgcolor" => *bgcolor_attr = Some(val),
+                            "align" => *align_attr = Some(val.to_ascii_lowercase()),
                             "rel" => *rel = Some(val),
                             "srcset" => *srcset = Some(val),
                             k if k.starts_with("on") => {
@@ -1111,6 +1146,32 @@ mod tests {
         // Non-stylesheet links don't register.
         let d2 = parse(r#"<html><head><link rel="icon" href="f.ico"></head><body></body></html>"#);
         assert!(d2.styles_ordered.is_empty());
+    }
+
+    #[test_case]
+    fn colspan_attr_parsed_on_td() {
+        let doc = parse(r#"<html><body><table><tr><td colspan="2"></td><td>x</td></tr></table></body></html>"#);
+        fn find_td_colspan(n: &Node) -> Option<u32> {
+            if let NodeKind::Element {
+                tag,
+                colspan_attr,
+                ..
+            } = &n.kind
+            {
+                if tag == "td" {
+                    if let Some(c) = colspan_attr {
+                        return Some(*c);
+                    }
+                }
+            }
+            for c in &n.children {
+                if let Some(v) = find_td_colspan(c) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        assert_eq!(find_td_colspan(&doc.root), Some(2));
     }
 
     #[test_case]

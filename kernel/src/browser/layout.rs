@@ -661,6 +661,8 @@ fn walk<'a>(
             sandbox,
             width_attr,
             height_attr,
+            bgcolor_attr,
+            width_pct,
             srcset,
             // rel/on_attrs and future attrs are read where needed.
             ..
@@ -674,7 +676,7 @@ fn walk<'a>(
             if in_head {
                 return;
             }
-            let st = css::compute_ex(
+            let mut st = css::compute_ex(
                 sheet,
                 tag,
                 id.as_deref(),
@@ -683,6 +685,10 @@ fn walk<'a>(
                 parent_st,
                 chain,
             );
+            // Presentational attrs (bgcolor / width%) — also applied in
+            // `layout_cell_isolated` for table cells (they skip this path).
+            let _ = (bgcolor_attr, width_pct, width_attr); // used via node
+            apply_presentational(n, &mut st, cur.max_w);
             if st.display_none || st.display == DisplayMode::None {
                 return;
             }
@@ -1139,12 +1145,14 @@ fn walk<'a>(
                     );
                 }
                 "table" => {
-                    let mut trows: Vec<Vec<&Node>> = Vec::new();
+                    let mut trows: Vec<Vec<TableCellRef<'_>>> = Vec::new();
                     collect_table_rows(n, &mut trows);
                     if trows.iter().any(|r| !r.is_empty()) {
+                        // Parent `text-align:center` (`<center>`) centers the
+                        // table *box*; cells themselves reset to start-align.
                         layout_table(
-                            n, sheet, &st, cur, runs, links, rects, images, controls, frames, aux,
-                            link, form, next_form_id, page_bg, vw, in_head, chain,
+                            n, sheet, &st, parent_st, cur, runs, links, rects, images, controls,
+                            frames, aux, link, form, next_form_id, page_bg, vw, in_head, chain,
                         );
                     } else {
                         block_before(cur, st.margin_top.max(4));
@@ -1345,12 +1353,25 @@ fn walk<'a>(
                     aux.push_bg_box(&st, block_x0, block_y0, box_w, block_h);
                     push_box_borders(rects, block_x0, block_y0, box_w, block_h, &st);
                     aux.push_elem_box(n.elem_idx, block_x0, block_y0, box_w, block_h);
-                    // Honor `text-align` for this block's own inline content.
+                    // Honor `text-align` for this block's own **inline** content.
                     // Gated on the alignment differing from the parent's, so a
                     // uniform-`center` subtree is shifted once (at the `<center>`
                     // / rule that introduces it), never re-shifted by inheriting
                     // descendants.
-                    if st.text_align != parent_st.text_align
+                    //
+                    // Critical: do NOT re-align content produced by a child
+                    // `<table>`. CSS `text-align` only affects inline content in
+                    // this block's line boxes; a table already placed ranks,
+                    // titles, and backgrounds. Without this gate, HN's
+                    // `<center><table id=hnmain>` had every story line
+                    // recentered after table layout (mid-cream instead of flush
+                    // left). Still run for `<center><p>…` / google.com-style
+                    // inline children so those keep centering.
+                    let has_table_child = n.children.iter().any(|c| {
+                        matches!(&c.kind, NodeKind::Element { tag: t, .. } if t == "table")
+                    });
+                    if !has_table_child
+                        && st.text_align != parent_st.text_align
                         && !matches!(st.text_align, Align::Left)
                     {
                         align_inline(
@@ -1740,19 +1761,89 @@ fn elem_parts(n: &Node) -> (&str, Option<&str>, Option<&str>, Option<&str>) {
     }
 }
 
+/// Apply HTML presentational attributes (`bgcolor`, `width="85%"`, `width=N`,
+/// `align`) onto a computed style. Used from both the general walk and
+/// table-cell isolation — cells never go through the walk path for their own
+/// box.
+fn apply_presentational(n: &Node, st: &mut ComputedStyle, avail_w: i32) {
+    let NodeKind::Element {
+        bgcolor_attr,
+        width_attr,
+        width_pct,
+        align_attr,
+        height_attr,
+        ..
+    } = &n.kind
+    else {
+        return;
+    };
+    // Presentational bgcolor always wins over an unset background; if CSS set
+    // one, leave it. HN's orange header/cream body are *only* presentational.
+    if st.background.is_none() {
+        if let Some(bg) = bgcolor_attr
+            .as_deref()
+            .and_then(|s| css::parse_color(s))
+        {
+            st.background = Some(bg);
+        }
+    }
+    if st.width.is_none() {
+        if let Some(pct) = *width_pct {
+            st.width = Some((avail_w as i64 * pct as i64 / 100).max(1) as i32);
+        } else if let Some(w) = *width_attr {
+            st.width = Some(w.max(1));
+        }
+    }
+    if st.height.is_none() {
+        if let Some(h) = *height_attr {
+            st.height = Some(h.max(1));
+        }
+    }
+    // Presentational `align=left|center|right` (HN rank column, etc.).
+    if let Some(a) = align_attr.as_deref() {
+        match a.to_ascii_lowercase().as_str() {
+            "center" | "middle" => st.text_align = Align::Center,
+            "right" => st.text_align = Align::Right,
+            "left" | "justify" => st.text_align = Align::Left,
+            _ => {}
+        }
+    }
+}
+
+/// One cell in a table row, with its HTML `colspan` (minimum 1).
+struct TableCellRef<'a> {
+    node: &'a Node,
+    colspan: u32,
+}
+
+fn cell_colspan(n: &Node) -> u32 {
+    match &n.kind {
+        NodeKind::Element {
+            colspan_attr: Some(c),
+            ..
+        } => (*c).max(1),
+        _ => 1,
+    }
+}
+
 /// Gather a table's rows as lists of cell nodes (`<td>`/`<th>`), descending
-/// through `<thead>`/`<tbody>`/`<tfoot>`. Rowspan is not modeled.
-fn collect_table_rows<'a>(n: &'a Node, rows: &mut Vec<Vec<&'a Node>>) {
+/// through `<thead>`/`<tbody>`/`<tfoot>`. Rowspan is not modeled; colspan is
+/// carried on each cell for placement.
+fn collect_table_rows<'a>(n: &'a Node, rows: &mut Vec<Vec<TableCellRef<'a>>>) {
     for child in &n.children {
         if let NodeKind::Element { tag, .. } = &child.kind {
             match tag.as_str() {
                 "tr" => {
-                    let cells: Vec<&Node> = child
+                    let cells: Vec<TableCellRef<'a>> = child
                         .children
                         .iter()
                         .filter(|c| {
                             matches!(&c.kind, NodeKind::Element { tag, .. }
                                 if tag == "td" || tag == "th")
+                        })
+                        .map(|c| TableCellRef {
+                            node: c,
+                            colspan: cell_colspan(c),
                         })
                         .collect();
                     rows.push(cells);
@@ -1768,6 +1859,19 @@ fn collect_table_rows<'a>(n: &'a Node, rows: &mut Vec<Vec<&'a Node>>) {
 /// insetting its content by the cell's padding. Returns `(mark, box_w, box_h)`
 /// (border-box dimensions). The caller either rewinds (trial measure) or
 /// translates the fragment into place.
+///
+/// **`box_w` is the intrinsic content width**, not forced to `width`. Forcing
+/// every cell's max-content to the table container (the previous behaviour)
+/// made each of HN's 3 story columns claim full width and destroyed column
+/// sizing. Final placement still lays out into the assigned column/`colspan`
+/// width; only the returned measure is intrinsic. Explicit CSS/presentational
+/// `width` is honored as a minimum (logo column, etc.).
+///
+/// `place`: when `false` (min/max-content trial), skip `text-align` /
+/// presentational `align` — right-aligning `"1."` into a full-table trial
+/// width made frag_bbox span the whole table and inflated the rank column
+/// to ~full width (HN ranks then sat mid-cream). When `true` (final place),
+/// apply alignment within the real column width.
 #[allow(clippy::too_many_arguments)]
 fn layout_cell_isolated<'a>(
     cell: &'a Node,
@@ -1789,18 +1893,25 @@ fn layout_cell_isolated<'a>(
     vw: i32,
     in_head: bool,
     chain: &[css::ElemRef<'a>],
+    place: bool,
 ) -> (FragMark, i32, i32, ComputedStyle) {
     let (ct, cid, cc, cs) = elem_parts(cell);
-    let cst = css::compute_ex(sheet, ct, cid, cc, cs, parent_st, chain);
+    let mut cst = css::compute_ex(sheet, ct, cid, cc, cs, parent_st, chain);
+    // Critical: table cells never go through `walk` for their own box, so
+    // presentational `bgcolor` / `width` / `align` must be applied here.
+    // Without this, HN's orange header (`<td bgcolor="#ff6600">`) is invisible
+    // and rank cells ignore `align=right`.
+    apply_presentational(cell, &mut cst, width);
     let child_chain = push_chain(chain, ct, cid, cc);
     let child_chain = child_chain.as_slice();
     let (pl, pr) = (cst.padding_left.max(0), cst.padding_right.max(0));
     let (pt, pb) = (cst.padding_top.max(0), cst.padding_bottom.max(0));
     let mark = mark_frag(runs, links, rects, images, controls, frames, aux);
+    let content_w_avail = (width - pl - pr).max(1);
     let mut ccur = Cursor {
         x: pl,
         y: pt,
-        max_w: (width - pl - pr).max(1),
+        max_w: content_w_avail,
         margin_x: pl,
         line_h,
         content_bottom: pt,
@@ -1815,10 +1926,49 @@ fn layout_cell_isolated<'a>(
             form, next_form_id, page_bg, vw, in_head, child_chain,
         );
     }
+    // Measure first (intrinsic), then optionally align for final paint.
     let (x0, _y0, x1, y1) = frag_bbox(mark, runs, links, rects, images, controls, frames, aux);
-    let content_w = if x1 >= x0 { x1 - pl } else { 0 };
-    let box_w = content_w.max(0) + pl + pr;
-    let box_h = (y1 - pt).max(ccur.content_bottom - pt).max(line_h) + pt + pb;
+    let content_w = if x1 >= x0 { (x1 - pl).max(0) } else { 0 };
+    // Intrinsic width from content (+ padding). Explicit width is a minimum
+    // (fixed logo column) — never force up to the trial `width` argument.
+    let mut box_w = content_w + pl + pr;
+    if let Some(fw) = cst.width {
+        box_w = box_w.max(fw).max(pl + pr);
+    }
+    let content_h = if y1 >= pt {
+        y1 - pt
+    } else {
+        0
+    };
+    let mut box_h = content_h
+        .max(ccur.content_bottom.saturating_sub(pt))
+        .max(if content_w > 0 || cst.background.is_some() {
+            line_h / 2
+        } else {
+            0
+        })
+        + pt
+        + pb;
+    if let Some(fh) = cst.height {
+        box_h = box_h.max(fh + pt + pb);
+    }
+    // Minimum height for cells with bgcolor but little content (header strip).
+    if cst.background.is_some() {
+        box_h = box_h.max(line_h + pt + pb);
+    }
+    // Final placement only: `text-align` / presentational `align` (login right,
+    // rank right) within the real column width — never during measure.
+    if place && !matches!(cst.text_align, Align::Left) {
+        align_inline(
+            cst.text_align,
+            pl,
+            content_w_avail,
+            &mut runs[mark.runs..],
+            &mut links[mark.links..],
+            &mut images[mark.images..],
+            &mut controls[mark.controls..],
+        );
+    }
     (mark, box_w.max(1), box_h.max(1), cst)
 }
 
@@ -1826,12 +1976,17 @@ fn layout_cell_isolated<'a>(
 /// distributes the container width across columns (fixed `width` honored,
 /// remaining space shared between min and max per the CSS auto algorithm), then
 /// places each cell into its column x / row y with the row's max height.
-/// `border-spacing` gutters cells. Simplified: no rowspan, colspan treated as 1.
+/// `border-spacing` gutters cells. Supports `colspan` (rowspan still ignored).
+///
+/// `parent_st` is the style of the table's parent — used so a `<center>`
+/// (text-align:center) can center a fixed-width table box without forcing
+/// every cell's content to center (tables/tds reset text-align in the UA sheet).
 #[allow(clippy::too_many_arguments)]
 fn layout_table<'a>(
     n: &'a Node,
     sheet: &Stylesheet,
     table_st: &ComputedStyle,
+    parent_st: &ComputedStyle,
     cur: &mut Cursor,
     runs: &mut Vec<TextRun>,
     links: &mut Vec<LinkBox>,
@@ -1855,39 +2010,71 @@ fn layout_table<'a>(
     let (tt, tid, tc, _) = elem_parts(n);
     let cell_chain = push_chain(chain, tt, tid, tc);
     let cell_chain = cell_chain.as_slice();
-    let mut rows: Vec<Vec<&Node>> = Vec::new();
+    let mut rows: Vec<Vec<TableCellRef<'a>>> = Vec::new();
     collect_table_rows(n, &mut rows);
     if rows.is_empty() {
         return;
     }
-    let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+    // Column count = max over rows of the sum of colspans (not the cell count).
+    let ncols = rows
+        .iter()
+        .map(|r| r.iter().map(|c| c.colspan as usize).sum::<usize>())
+        .max()
+        .unwrap_or(1)
+        .max(1);
     block_before(cur, table_st.margin_top.max(2));
-    let box_x = cur.margin_x + table_st.margin_left.max(0);
-    let container_w =
+    // Presentational `width="85%"` (HN `#hnmain`) / CSS width shrinks the
+    // table; `<center>` (inherited `text-align:center`) or `margin:auto` centers it.
+    let full_w =
         (cur.max_w - table_st.margin_left.max(0) - table_st.margin_right.max(0)).max(1);
+    let container_w = table_st
+        .width
+        .map(|w| w.clamp(1, full_w))
+        .unwrap_or(full_w);
+    let box_x = if table_st.width.is_some()
+        && (matches!(table_st.text_align, Align::Center)
+            || matches!(parent_st.text_align, Align::Center)
+            || (table_st.margin_left_auto && table_st.margin_right_auto))
+    {
+        cur.margin_x + (full_w - container_w) / 2
+    } else {
+        cur.margin_x + table_st.margin_left.max(0)
+    };
     let spacing = table_st.border_spacing.max(0);
 
     // 1. Per-column min/max-content widths (honoring an explicit cell `width`).
+    // Spanning cells contribute evenly across their columns for measurement.
     let mut col_min = alloc::vec![0i32; ncols];
     let mut col_max = alloc::vec![0i32; ncols];
     for row in &rows {
-        for (ci, &cell) in row.iter().enumerate() {
+        let mut ci = 0usize;
+        for cell in row {
+            let span = (cell.colspan as usize).max(1).min(ncols.saturating_sub(ci).max(1));
             if ci >= ncols {
                 break;
             }
             let (m1, maxw, _, cst) = layout_cell_isolated(
-                cell, sheet, table_st, container_w, line_h, runs, links, rects, images,
+                cell.node, sheet, table_st, container_w, line_h, runs, links, rects, images,
                 controls, frames, aux, link, form, next_form_id, page_bg, vw, in_head, cell_chain,
+                false, // measure: no text-align (would inflate align=right cols)
             );
             rewind_frag(m1, runs, links, rects, images, controls, frames, aux);
             let (m2, minw, _, _) = layout_cell_isolated(
-                cell, sheet, table_st, 8, line_h, runs, links, rects, images, controls,
+                cell.node, sheet, table_st, 8, line_h, runs, links, rects, images, controls,
                 frames, aux, link, form, next_form_id, page_bg, vw, in_head, cell_chain,
+                false,
             );
             rewind_frag(m2, runs, links, rects, images, controls, frames, aux);
             let fixed = cst.width;
-            col_max[ci] = col_max[ci].max(fixed.unwrap_or(maxw));
-            col_min[ci] = col_min[ci].max(fixed.unwrap_or(minw).min(fixed.unwrap_or(maxw)));
+            let max_one = fixed.unwrap_or(maxw) / span as i32;
+            let min_one = fixed.unwrap_or(minw).min(fixed.unwrap_or(maxw)) / span as i32;
+            for k in 0..span {
+                if ci + k < ncols {
+                    col_max[ci + k] = col_max[ci + k].max(max_one);
+                    col_min[ci + k] = col_min[ci + k].max(min_one);
+                }
+            }
+            ci += span;
         }
     }
 
@@ -1896,7 +2083,7 @@ fn layout_table<'a>(
     let avail = (container_w - gutters).max(1);
     let total_min: i32 = col_min.iter().sum();
     let total_max: i32 = col_max.iter().sum();
-    let col_w: Vec<i32> = if total_max <= avail {
+    let mut col_w: Vec<i32> = if total_max <= avail {
         col_max.clone()
     } else if total_min >= avail {
         col_min.clone()
@@ -1909,67 +2096,135 @@ fn layout_table<'a>(
             .map(|(&mn, &mx)| mn + (mx - mn) * extra / span)
             .collect()
     };
+    // Always expand columns to fill the table's used width. Without this a
+    // single full-row header cell (HN orange bar) paints only as wide as its
+    // text, and story tables leave a ragged cream edge.
+    //
+    // Prefer giving leftover to the last column (HN title column / login).
+    // For a 1-column table the sole column takes it all.
+    let used: i32 = col_w.iter().sum();
+    if used < avail {
+        let extra = avail - used;
+        if let Some(last) = col_w.last_mut() {
+            *last += extra;
+        }
+    } else if used > avail && avail > 0 {
+        // Shrink proportionally so we never overflow the table box.
+        for w in col_w.iter_mut() {
+            *w = ((*w as i64) * (avail as i64) / (used as i64)).max(1) as i32;
+        }
+        let used2: i32 = col_w.iter().sum();
+        if used2 < avail {
+            if let Some(last) = col_w.last_mut() {
+                *last += avail - used2;
+            }
+        }
+    }
     let mut col_x = Vec::with_capacity(ncols);
     let mut acc = box_x + spacing;
     for w in &col_w {
         col_x.push(acc);
         acc += w + spacing;
     }
-    let table_w = (acc - box_x).max(1);
+    // Table box uses the fixed container width when one was requested.
+    let table_w = if table_st.width.is_some() {
+        container_w
+    } else {
+        (acc - box_x).max(1)
+    };
 
     // 3. Place each row's cells; row height = tallest cell.
+    // Spanned width = sum of column widths + gutters between them.
     let table_y0 = cur.y;
+    // Table background is recorded *after* we know table_h (step 4), but must
+    // paint *under* cell backgrounds. We push a placeholder and fix up height
+    // once rows are done — or insert at the front. Simpler: remember the index
+    // and rewrite height later.
+    let table_bg_idx = if let Some(bg) = table_st.background {
+        let i = rects.len();
+        rects.push(RectBox {
+            x: box_x,
+            y: table_y0,
+            w: table_w,
+            h: 1, // patched after rows
+            color: fade(bg, table_st.opacity),
+            radius: table_st.border_radius.max(0),
+            blur: 0,
+        });
+        Some(i)
+    } else {
+        None
+    };
     let mut row_y = cur.y + spacing;
     for row in &rows {
-        let mut placed: Vec<(FragMark, FragMark, usize, ComputedStyle)> = Vec::new();
+        let mut placed: Vec<(FragMark, FragMark, usize, u32, ComputedStyle)> = Vec::new();
         let mut row_h = line_h;
-        for (ci, &cell) in row.iter().enumerate() {
+        let mut ci = 0usize;
+        for cell in row {
+            let span = (cell.colspan as usize).max(1).min(ncols.saturating_sub(ci).max(1));
             if ci >= ncols {
                 break;
             }
+            let mut span_w = 0i32;
+            for k in 0..span {
+                if ci + k < ncols {
+                    span_w += col_w[ci + k];
+                    if k + 1 < span {
+                        span_w += spacing;
+                    }
+                }
+            }
+            span_w = span_w.max(1);
             let (mark, _w, h, cst) = layout_cell_isolated(
-                cell, sheet, table_st, col_w[ci], line_h, runs, links, rects, images,
+                cell.node, sheet, table_st, span_w, line_h, runs, links, rects, images,
                 controls, frames, aux, link, form, next_form_id, page_bg, vw, in_head, cell_chain,
+                true, // final place: apply cell text-align / align=
             );
             let end = mark_frag(runs, links, rects, images, controls, frames, aux);
             row_h = row_h.max(h);
-            placed.push((mark, end, ci, cst));
+            placed.push((mark, end, ci, span as u32, cst));
+            ci += span;
         }
         // Now that the row height is known, position each cell fragment (only
         // its own `[mark, end)` range — a bounded translate) + its box.
-        for (mark, end, ci, cst) in &placed {
+        for (mark, end, ci, span, cst) in &placed {
+            let mut span_w = 0i32;
+            for k in 0..(*span as usize) {
+                if *ci + k < ncols {
+                    span_w += col_w[*ci + k];
+                    if k + 1 < *span as usize {
+                        span_w += spacing;
+                    }
+                }
+            }
+            span_w = span_w.max(1);
             translate_frag_range(
                 *mark, *end, col_x[*ci], row_y, runs, links, rects, images, controls, frames, aux,
             );
-            // Cell background/border box spans the full column × row cell.
+            // Cell background/border box spans all columns covered by colspan.
             if let Some(bg) = cst.background {
                 rects.push(RectBox {
                     x: col_x[*ci],
                     y: row_y,
-                    w: col_w[*ci],
+                    w: span_w,
                     h: row_h,
                     color: fade(bg, cst.opacity),
                     radius: cst.border_radius.max(0),
                     blur: 0,
                 });
             }
-            push_box_borders(rects, col_x[*ci], row_y, col_w[*ci], row_h, cst);
+            push_box_borders(rects, col_x[*ci], row_y, span_w, row_h, cst);
         }
         row_y += row_h + spacing;
     }
 
-    // 4. The table box itself (background/border) + advance the flow.
+    // 4. Patch the table background height (pushed under cells in step 3) and
+    // draw the border on top.
     let table_h = (row_y - table_y0).max(1);
-    if let Some(bg) = table_st.background {
-        rects.push(RectBox {
-            x: box_x,
-            y: table_y0,
-            w: table_w,
-            h: table_h,
-            color: fade(bg, table_st.opacity),
-            radius: table_st.border_radius.max(0),
-            blur: 0,
-        });
+    if let Some(i) = table_bg_idx {
+        if let Some(r) = rects.get_mut(i) {
+            r.h = table_h;
+        }
     }
     push_box_borders(rects, box_x, table_y0, table_w, table_h, table_st);
     aux.push_elem_box(n.elem_idx, box_x, table_y0, table_w, table_h);
@@ -3087,6 +3342,287 @@ mod tests {
         let a = lay.runs.iter().find(|r| r.text == "very").expect("A content");
         let b = lay.runs.iter().find(|r| r.text == "B").expect("B");
         assert!(b.x > a.x + 100, "wide column A pushes B well to the right (b.x={})", b.x);
+    }
+
+    #[test_case]
+    fn table_colspan_aligns_subtext_under_title() {
+        // Hacker News story rows: rank | vote | title, then colspan=2 empty + subtext.
+        // Subtext must sit under the title column (col 2), not under the rank.
+        let doc = html::parse(
+            r#"<html><body><table>
+              <tr><td>1.</td><td>^</td><td>TitleHere</td></tr>
+              <tr><td colspan="2"></td><td>99 points</td></tr>
+            </table></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let title = lay
+            .runs
+            .iter()
+            .find(|r| r.text.contains("TitleHere"))
+            .expect("title");
+        let points = lay
+            .runs
+            .iter()
+            .find(|r| r.text.contains("points"))
+            .expect("points");
+        assert!(
+            points.y > title.y,
+            "subtext below title: points.y={} title.y={}",
+            points.y,
+            title.y
+        );
+        // Align within one character cell of the title column start.
+        assert!(
+            (points.x - title.x).abs() < 40,
+            "colspan places points under title: points.x={} title.x={}",
+            points.x,
+            title.x
+        );
+    }
+
+    #[test_case]
+    fn bgcolor_presentational_paints_table() {
+        // HN's orange header uses presentational bgcolor (no CSS background).
+        // Use r## so `#rrggbb` inside attributes doesn't terminate the raw string.
+        let doc = html::parse(concat!(
+            r##"<html><body><table bgcolor="#f6f6ef"><tr>"##,
+            r##"<td bgcolor="#ff6600">HN</td>"##,
+            r##"</tr></table></body></html>"##,
+        ));
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        assert!(
+            lay.rects.iter().any(|r| r.color == 0xff_66_00),
+            "expected orange from bgcolor presentational attr"
+        );
+        assert!(
+            lay.rects.iter().any(|r| r.color == 0xf6_f6_ef),
+            "expected cream table bgcolor"
+        );
+    }
+
+    #[test_case]
+    fn hn_header_orange_bar_spans_full_table_width() {
+        // Real HN skeleton: centered 85% cream table, full-width orange header
+        // cell containing a nested 3-col nav table.
+        let html = concat!(
+            r##"<html><body><center>"##,
+            r##"<table id="hnmain" width="85%" bgcolor="#f6f6ef" cellpadding="0" cellspacing="0">"##,
+            r##"<tr><td bgcolor="#ff6600">"##,
+            r##"<table width="100%" cellpadding="0" cellspacing="0" style="padding:2px"><tr>"##,
+            r##"<td style="width:18px">Y</td>"##,
+            r##"<td><b class="hnname"><a href="news">Hacker News</a></b>"##,
+            r##" <a href="newest">new</a> | <a href="front">past</a></td>"##,
+            r##"<td style="text-align:right"><a href="login">login</a></td>"##,
+            r##"</tr></table></td></tr>"##,
+            r##"<tr><td><table cellpadding="0" cellspacing="0">"##,
+            r##"<tr><td align="right">1.</td><td>^</td>"##,
+            r##"<td class="title"><a href="/a">Android May Soon Restrict</a></td></tr>"##,
+            r##"<tr><td colspan="2"></td><td class="subtext">241 points by alice</td></tr>"##,
+            r##"<tr><td align="right">2.</td><td>^</td>"##,
+            r##"<td class="title"><a href="/b">Claude Opus 5</a></td></tr>"##,
+            r##"<tr><td colspan="2"></td><td class="subtext">1569 points by bob</td></tr>"##,
+            r##"</table></td></tr></table></center></body></html>"##,
+        );
+        let css = concat!(
+            "a:link{color:#000000;text-decoration:none}",
+            "a:visited{color:#828282;text-decoration:none}",
+            ".pagetop{color:#222222}",
+            ".subtext{font-size:7pt;color:#828282}",
+            ".title{font-size:10pt}",
+        );
+        let doc = html::parse(html);
+        let sheet = Stylesheet::parse(css);
+        let lay = layout_document(&doc.root, &sheet, 800, 600);
+
+        // Cream table background present and reasonably wide (85% of 800 ≈ 680).
+        let cream = lay
+            .rects
+            .iter()
+            .filter(|r| r.color == 0xf6_f6_ef)
+            .max_by_key(|r| r.w)
+            .expect("cream #f6f6ef table bg");
+        assert!(
+            cream.w >= 600,
+            "hnmain cream bar should be ~85% of viewport, got w={}",
+            cream.w
+        );
+        // Centered: not stuck at x=0.
+        assert!(
+            cream.x > 20,
+            "85% table should be centered under <center>, got x={}",
+            cream.x
+        );
+
+        // Orange header spans (nearly) the full cream table width.
+        let orange = lay
+            .rects
+            .iter()
+            .filter(|r| r.color == 0xff_66_00)
+            .max_by_key(|r| r.w)
+            .expect("orange #ff6600 header bg");
+        assert!(
+            orange.w + 4 >= cream.w && orange.w <= cream.w + 4,
+            "orange bar w={} must match cream table w={}",
+            orange.w,
+            cream.w
+        );
+        assert!(
+            (orange.x - cream.x).abs() <= 4,
+            "orange bar x={} must align with cream x={}",
+            orange.x,
+            cream.x
+        );
+
+        // Nav brand is black (a:link), not the UA terracotta.
+        let brand = lay
+            .runs
+            .iter()
+            .find(|r| r.text.contains("Hacker"))
+            .expect("Hacker News brand");
+        assert_eq!(
+            brand.color, 0x00_00_00,
+            "a:link must paint title/nav links black, got {:06x}",
+            brand.color
+        );
+
+        // Story columns: title to the right of rank; subtext under title.
+        let rank = lay
+            .runs
+            .iter()
+            .find(|r| r.text.trim() == "1.")
+            .expect("rank");
+        let title = lay
+            .runs
+            .iter()
+            .find(|r| r.text.contains("Android"))
+            .expect("title");
+        let points = lay
+            .runs
+            .iter()
+            .find(|r| r.text.contains("241"))
+            .expect("points");
+        assert!(
+            title.x > rank.x + 10,
+            "title must sit right of rank (title.x={} rank.x={})",
+            title.x,
+            rank.x
+        );
+        assert!(
+            points.y > title.y,
+            "subtext below title: points.y={} title.y={}",
+            points.y,
+            title.y
+        );
+        assert!(
+            (points.x - title.x).abs() < 40,
+            "colspan puts points under title: points.x={} title.x={}",
+            points.x,
+            title.x
+        );
+
+        // Second story: ranks share a column (right-aligned digits may differ a
+        // few px on the left edge; require both left of their titles).
+        let rank2 = lay
+            .runs
+            .iter()
+            .find(|r| r.text.trim() == "2.")
+            .expect("rank2");
+        let title2 = lay
+            .runs
+            .iter()
+            .find(|r| r.text.contains("Claude"))
+            .expect("title2");
+        assert!(
+            (rank2.x - rank.x).abs() < 24,
+            "rank column aligns: 1.x={} 2.x={}",
+            rank.x,
+            rank2.x
+        );
+        assert!(
+            title2.x > rank2.x + 10,
+            "story 2 title right of rank"
+        );
+        // Titles share a column (within a character cell).
+        assert!(
+            (title2.x - title.x).abs() < 24,
+            "title column aligns: t1.x={} t2.x={}",
+            title.x,
+            title2.x
+        );
+
+        // Stories must stay start-aligned under the cream table — not re-centered
+        // by the outer `<center>`'s text-align pass (the bug that floated HN
+        // content mid-page). Rank sits near the cream left edge.
+        assert!(
+            rank.x < cream.x + 80,
+            "rank must be left-aligned in cream (rank.x={} cream.x={})",
+            rank.x,
+            cream.x
+        );
+        assert!(
+            title.x < cream.x + cream.w / 2,
+            "title must not sit in the right half from center re-align (title.x={} cream mid={})",
+            title.x,
+            cream.x + cream.w / 2
+        );
+    }
+
+    #[test_case]
+    fn center_does_not_recenter_table_content() {
+        // `<center>` centers a fixed-width table *box*, but cell text stays
+        // start-aligned (CSS text-align only affects inline content of the
+        // center block itself).
+        let doc = html::parse(concat!(
+            r##"<html><body><center>"##,
+            r##"<table width="80%" bgcolor="#eeeeee"><tr>"##,
+            r##"<td>LeftEdgeStory</td></tr></table>"##,
+            r##"</center></body></html>"##,
+        ));
+        let sheet = Stylesheet::parse("");
+        let lay = layout_document(&doc.root, &sheet, 500, 200);
+        let cream = lay
+            .rects
+            .iter()
+            .find(|r| r.color == 0xee_ee_ee)
+            .expect("table bg");
+        let story = lay
+            .runs
+            .iter()
+            .find(|r| r.text.contains("LeftEdge"))
+            .expect("story");
+        // Table box is centered (x > 0 for 80% of 500).
+        assert!(cream.x > 20, "table box centered, x={}", cream.x);
+        // Content flush to the table's left, not mid-table.
+        assert!(
+            (story.x - cream.x).abs() < 30,
+            "cell text left-aligned in table: story.x={} cream.x={}",
+            story.x,
+            cream.x
+        );
+    }
+
+    #[test_case]
+    fn table_cell_align_right() {
+        // Fixed-width first column so right-align is visible (a min-content
+        // rank column is only as wide as "R", so align=right ≈ flush left).
+        let doc = html::parse(
+            r#"<html><body><table width="400"><tr>
+                 <td align="right" style="width:200px">R</td><td>L</td>
+               </tr></table></body></html>"#,
+        );
+        let sheet = Stylesheet::parse("");
+        let lay = layout_document(&doc.root, &sheet, 500, 200);
+        let r = lay.runs.iter().find(|t| t.text == "R").expect("R");
+        let l = lay.runs.iter().find(|t| t.text == "L").expect("L");
+        assert!(l.x > r.x, "L column right of R column");
+        // "R" sits near the right edge of the 200px column, not at x≈0.
+        assert!(
+            r.x > 100,
+            "align=right in a 200px col should inset R (r.x={})",
+            r.x
+        );
     }
 
     #[test_case]
