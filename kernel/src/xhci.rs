@@ -60,6 +60,37 @@ struct Trb {
 
 /// The controller + its rings. Addresses are stored both as physical (for the
 /// device) and virtual (HHDM, for the CPU).
+/// A configured bulk IN/OUT endpoint pair on one device — what a USB Ethernet
+/// adapter needs. Each direction has its own transfer ring and a bounce buffer.
+///
+/// Completion is asynchronous: `pump_events` clears `in_flight` and records the
+/// transferred length when the controller posts the transfer event, so the
+/// `NetDevice` side polls rather than blocking.
+pub struct BulkEp {
+    pub slot: u8,
+    pub in_dci: u8,
+    pub out_dci: u8,
+    in_ring_va: usize,
+    in_ring_pa: u64,
+    in_enq: usize,
+    in_cycle: u32,
+    out_ring_va: usize,
+    out_ring_pa: u64,
+    out_enq: usize,
+    out_cycle: u32,
+    in_buf_pa: u64,
+    in_buf_va: usize,
+    out_buf_pa: u64,
+    out_buf_va: usize,
+    /// Capacity of each bounce buffer.
+    buf_len: usize,
+    /// An IN transfer is queued and has not completed.
+    in_flight: bool,
+    /// Bytes the last completed IN transfer delivered, awaiting collection.
+    in_ready: Option<usize>,
+    out_flight: bool,
+}
+
 pub struct Xhci {
     mmio: usize,     // virtual base of the mapped register space
     op: usize,       // virtual base of operational registers
@@ -88,6 +119,8 @@ pub struct Xhci {
     kbd: Option<Kbd>,
     // The enumerated pointer (USB tablet / mouse), if one was found.
     mouse: Option<Ptr>,
+    /// A bulk IN/OUT pair (USB Ethernet); `None` until one is configured.
+    bulk: Option<BulkEp>,
     // Ports that already produced a working device. On an enumeration retry
     // (VirtualBox's async VUSB reset makes the *other* device time out) these
     // are skipped so we don't reset a port whose device already enumerated —
@@ -520,6 +553,7 @@ impl Xhci {
                 alloc,
                 kbd: None,
                 mouse: None,
+                bulk: None,
                 done_ports: 0,
                 key_buf: [0; 16],
                 key_head: 0,
@@ -1468,6 +1502,7 @@ impl Xhci {
     fn pump_events(&mut self) {
         let mut kbd = self.kbd.take();
         let mut mouse = self.mouse.take();
+        let mut bulk = self.bulk.take();
         // SAFETY: rings/buffers are live for the controller's lifetime.
         unsafe {
             while let Some(ev) = self.next_event() {
@@ -1476,6 +1511,23 @@ impl Xhci {
                 }
                 let slot = ((ev.control >> 24) & 0xff) as u8;
                 let dci = ((ev.control >> 16) & 0x1f) as u8;
+                // Bulk endpoints (USB Ethernet) complete asynchronously: record the
+                // transferred length and clear the in-flight flag; the NetDevice
+                // side collects it. `ev.status` low 24 bits are the *residual*
+                // (untransferred) count, so the delivered length is requested minus
+                // residual — reading it as a length is the classic xHCI mistake.
+                if let Some(b) = bulk.as_mut() {
+                    if b.slot == slot && (dci == b.in_dci || dci == b.out_dci) {
+                        let residual = (ev.status & 0x00ff_ffff) as usize;
+                        if dci == b.in_dci {
+                            b.in_flight = false;
+                            b.in_ready = Some(b.buf_len.saturating_sub(residual));
+                        } else {
+                            b.out_flight = false;
+                        }
+                        continue;
+                    }
+                }
                 if let Some(k) = kbd.as_mut() {
                     if k.slot == slot && k.int_dci == dci {
                         // Non-coherent DMA (real Apple): drop the stale cached
@@ -1583,6 +1635,136 @@ impl Xhci {
         }
         self.kbd = kbd;
         self.mouse = mouse;
+        self.bulk = bulk;
+    }
+
+    /// Configure a bulk IN/OUT pair on an already-addressed device.
+    ///
+    /// `bi` comes from [`find_bulk_iface`] over the device's configuration
+    /// descriptor. Two CONFIGURE_ENDPOINT commands are issued, one per direction,
+    /// because `build_input_configure` adds a single endpoint at a time and copies
+    /// the live slot context forward — so the second call keeps the first endpoint
+    /// rather than dropping it.
+    ///
+    /// # Safety
+    /// `c` must be a device this controller has addressed and configured.
+    pub unsafe fn configure_bulk(&mut self, c: &mut Common, bi: BulkIface, buf_len: usize) -> bool {
+        let Some((in_ring_pa, in_ring_va)) = (self.alloc)(RING_TRBS * 16) else { return false };
+        let Some((out_ring_pa, out_ring_va)) = (self.alloc)(RING_TRBS * 16) else { return false };
+        let Some((in_buf_pa, in_buf_va)) = (self.alloc)(buf_len) else { return false };
+        let Some((out_buf_pa, out_buf_va)) = (self.alloc)(buf_len) else { return false };
+        let (in_ring_va, out_ring_va) = (in_ring_va as usize, out_ring_va as usize);
+        // SAFETY: freshly allocated DMA rings; link TRBs make them circular.
+        unsafe {
+            self.init_link(in_ring_va, in_ring_pa);
+            self.init_link(out_ring_va, out_ring_pa);
+        }
+        // DCI = endpoint number * 2, +1 for IN.
+        let in_dci = ((bi.in_ep & 0x0f) * 2 + 1) as u8;
+        let out_dci = ((bi.out_ep & 0x0f) * 2) as u8;
+        for (dci, mps, pa, ep_type) in [
+            (in_dci, bi.in_mps as u32, in_ring_pa, EpType::BulkIn),
+            (out_dci, bi.out_mps as u32, out_ring_pa, EpType::BulkOut),
+        ] {
+            // SAFETY: `c` is an addressed device; interval is ignored for bulk.
+            unsafe { self.build_input_configure(c, dci, mps, 1, pa, ep_type) };
+            // SAFETY: input context is populated above.
+            let Some((cc, _)) = (unsafe {
+                self.command(c.in_ctx_pa, (TRB_CONFIGURE_ENDPOINT << 10) | ((c.slot as u32) << 24))
+            }) else {
+                return false;
+            };
+            if cc != CC_SUCCESS {
+                crate::ktrace::log_fmt(format_args!("xhci: bulk endpoint dci={dci} configure failed cc={cc}"));
+                return false;
+            }
+        }
+        crate::ktrace::log_fmt(format_args!(
+            "xhci: bulk endpoints up (slot {} in dci {in_dci} mps {} / out dci {out_dci} mps {})",
+            c.slot, bi.in_mps, bi.out_mps
+        ));
+        self.bulk = Some(BulkEp {
+            slot: c.slot,
+            in_dci,
+            out_dci,
+            in_ring_va,
+            in_ring_pa,
+            in_enq: 0,
+            in_cycle: 1,
+            out_ring_va,
+            out_ring_pa,
+            out_enq: 0,
+            out_cycle: 1,
+            in_buf_pa,
+            in_buf_va: in_buf_va as usize,
+            out_buf_pa,
+            out_buf_va: out_buf_va as usize,
+            buf_len,
+            in_flight: false,
+            in_ready: None,
+            out_flight: false,
+        });
+        true
+    }
+
+    /// True once a bulk pair is configured.
+    pub fn has_bulk(&self) -> bool {
+        self.bulk.is_some()
+    }
+
+    /// Queue a bulk IN transfer if none is outstanding, so a frame can arrive.
+    pub fn bulk_arm_in(&mut self) {
+        let Some(b) = self.bulk.as_mut() else { return };
+        if b.in_flight || b.in_ready.is_some() {
+            return;
+        }
+        let (va, pa, mut enq, mut cyc) = (b.in_ring_va, b.in_ring_pa, b.in_enq, b.in_cycle);
+        let (buf, len, slot, dci) = (b.in_buf_pa, b.buf_len as u32, b.slot, b.in_dci);
+        b.in_flight = true;
+        // SAFETY: the ring and buffer are live for the controller's lifetime.
+        unsafe { self.arm_int(va, pa, &mut enq, &mut cyc, buf, len, slot, dci) };
+        if let Some(b) = self.bulk.as_mut() {
+            b.in_enq = enq;
+            b.in_cycle = cyc;
+        }
+    }
+
+    /// Take a received frame, if one has completed. Copies out of the bounce
+    /// buffer and re-arms, so the caller can poll this in a loop.
+    pub fn bulk_take_in(&mut self, out: &mut [u8]) -> Option<usize> {
+        let b = self.bulk.as_mut()?;
+        let n = b.in_ready.take()?;
+        let n = n.min(out.len()).min(b.buf_len);
+        let src = b.in_buf_va;
+        dma_invalidate(src, n);
+        // SAFETY: `src` is this endpoint's bounce buffer; `n <= buf_len`.
+        unsafe { core::ptr::copy_nonoverlapping(src as *const u8, out.as_mut_ptr(), n) };
+        self.bulk_arm_in();
+        Some(n)
+    }
+
+    /// Queue a bulk OUT transfer. Returns false if one is still outstanding or the
+    /// frame does not fit the bounce buffer — the caller drops the frame, as an
+    /// Ethernet device may.
+    pub fn bulk_send(&mut self, data: &[u8]) -> bool {
+        let Some(b) = self.bulk.as_mut() else { return false };
+        if b.out_flight || data.len() > b.buf_len {
+            return false;
+        }
+        // SAFETY: `out_buf_va` is this endpoint's bounce buffer, big enough.
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), b.out_buf_va as *mut u8, data.len()) };
+        dma_clean(b.out_buf_va, data.len());
+        let (va, pa, mut enq, mut cyc) = (b.out_ring_va, b.out_ring_pa, b.out_enq, b.out_cycle);
+        let (buf, slot, dci) = (b.out_buf_pa, b.slot, b.out_dci);
+        let len = data.len() as u32;
+        b.out_flight = true;
+        // SAFETY: as `bulk_arm_in`.
+        unsafe { self.arm_int(va, pa, &mut enq, &mut cyc, buf, len, slot, dci) };
+        if let Some(b) = self.bulk.as_mut() {
+            b.out_enq = enq;
+            b.out_cycle = cyc;
+        }
+        true
     }
 
     fn key_push(&mut self, b: u8) {
