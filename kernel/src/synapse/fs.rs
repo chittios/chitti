@@ -47,6 +47,32 @@ pub fn mount_ext4(mut store: crate::block::ext4_store::Ext4Store) {
     });
 }
 
+/// Batch a group of writes into a single on-disk flush.
+///
+/// The ext4 backend's sync **re-formats the partition and rewrites every file**, so
+/// one write per file is quadratic in total bytes. Installing the boot agent roster
+/// (~120 files, several MB with the wasm assets) that way took minutes on a real
+/// disk and was invisible in testing, because a diskless guest keeps everything in
+/// memory. Anything writing many files in one go should wrap the group.
+///
+/// Reads inside a batch are correct — the backend serves them from its
+/// authoritative in-memory cache; only the on-disk copy lags until [`end_batch`].
+/// A no-op on the memory backend, which has nothing to flush.
+pub fn begin_batch() {
+    STORE.with(|b| match b {
+        Backend::Memory(_) => {}
+        Backend::Ext4(s) => s.begin_batch(),
+    });
+}
+
+/// End a [`begin_batch`] group, flushing once if anything changed.
+pub fn end_batch() {
+    STORE.with(|b| match b {
+        Backend::Memory(_) => {}
+        Backend::Ext4(s) => s.end_batch(),
+    });
+}
+
 /// Create or replace the file at `path` with `contents`.
 /// Paths are normalised (`..` / `//` collapsed) so keys stay canonical.
 pub fn write(path: &str, contents: &[u8]) {

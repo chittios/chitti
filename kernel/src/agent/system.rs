@@ -991,6 +991,12 @@ fn build_package(def: &SystemAgentDef, m: &ParsedManifest, caps: &[CapabilityReq
 /// and registering its role. Called once from `run_os` after the FS + net are up.
 /// Agents with `autostart: true` are then activated via [`autostart_agents`].
 pub fn install_all(now: Ticks) {
+    // One on-disk flush for the whole roster, not one per file. The ext4 store's
+    // sync re-formats the partition and rewrites every file, so installing ~40
+    // agents (~120 files, several MB once the wasm assets are counted) file by file
+    // is quadratic — it took *minutes* on a real disk, while a diskless guest kept
+    // everything in memory and showed nothing.
+    crate::synapse::fs::begin_batch();
     for def in SYSTEM_AGENTS {
         let Some(m) = parse_manifest(def.manifest_json) else {
             crate::ktrace::log_fmt(format_args!("system-agent: '{}' manifest.json failed to parse", def.name));
@@ -1009,6 +1015,9 @@ pub fn install_all(now: Ticks) {
             Err(e) => crate::ktrace::log_fmt(format_args!("system-agent: install '{}' failed: {:?}", def.name, e)),
         }
     }
+    // Flush before autostart: the service agents read their own files back, and a
+    // crash after this point should leave the roster on disk.
+    crate::synapse::fs::end_batch();
     crate::serial_println!(
         "Chitti: system agents installed (builtin suite + UI apps + chat agents) in /agent/"
     );

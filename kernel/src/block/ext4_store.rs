@@ -70,6 +70,10 @@ pub struct Ext4Store {
     start: u64,
     count: u64,
     cache: BTreeMap<String, Vec<u8>>,
+    /// While set, mutations only touch `cache`; see [`Ext4Store::begin_batch`].
+    defer: bool,
+    /// A mutation happened while deferring, so the flush has work to do.
+    dirty: bool,
 }
 
 impl Ext4Store {
@@ -94,7 +98,7 @@ impl Ext4Store {
             }
         }
         crate::ktrace::log_fmt(format_args!("ext4_store: mounted ext4 data partition, {} file(s) recovered", cache.len()));
-        Some(Ext4Store { dev, start, count, cache })
+        Some(Ext4Store { dev, start, count, cache, defer: false, dirty: false })
     }
 
     /// Rewrite the partition from the current cache (verified mkfs + write-all).
@@ -109,9 +113,41 @@ impl Ext4Store {
         }
     }
 
+    /// Stop syncing after every mutation; the caller must call [`Self::end_batch`].
+    ///
+    /// [`Self::sync`] re-formats the whole partition and rewrites **every** file,
+    /// so one `write` per file is quadratic in total bytes: installing the ~40
+    /// boot agents (~120 files, several MB once the wasm assets are in) meant ~120
+    /// full-partition rewrites and took *minutes* on a real disk. Batching turns
+    /// that into one.
+    ///
+    /// Reads stay correct inside a batch because they are served from `cache`,
+    /// which is authoritative; only the on-disk copy lags until the flush.
+    pub fn begin_batch(&mut self) {
+        self.defer = true;
+    }
+
+    /// Resume immediate syncing, flushing once if anything changed.
+    pub fn end_batch(&mut self) {
+        self.defer = false;
+        if self.dirty {
+            self.sync();
+            self.dirty = false;
+        }
+    }
+
     pub fn write(&mut self, name: &str, data: &[u8]) {
         self.cache.insert(String::from(name), data.to_vec());
-        self.sync();
+        self.touched();
+    }
+
+    /// Record a mutation, syncing immediately unless a batch is open.
+    fn touched(&mut self) {
+        if self.defer {
+            self.dirty = true;
+        } else {
+            self.sync();
+        }
     }
     pub fn read(&self, name: &str) -> Option<Vec<u8>> {
         self.cache.get(name).cloned()
@@ -125,7 +161,7 @@ impl Ext4Store {
     pub fn delete(&mut self, name: &str) -> bool {
         let removed = self.cache.remove(name).is_some();
         if removed {
-            self.sync();
+            self.touched();
         }
         removed
     }
