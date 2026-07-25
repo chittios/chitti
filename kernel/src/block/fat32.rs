@@ -280,8 +280,305 @@ pub fn count_free_clusters(fat: &[u8], bpb: &Bpb) -> u32 {
     n_free
 }
 
+// --- directory entries + chain write-back --------------------------------
+//
+// The remaining pure pieces needed to add a file to an existing FAT volume:
+// encode a short name, build a 32-byte directory entry, find a free slot in a
+// directory, link an allocated cluster list into a chain, and work out where each
+// FAT entry lives in *every* FAT copy.
+//
+// No long-filename support, and none is needed: `EFI`, `CHITTI` and `BOOTX64.EFI`
+// are all valid 8.3 names. Refusing a name that does not fit is better than
+// emitting LFN entries we cannot also maintain correctly.
+
+/// Directory-entry attribute bits.
+pub const ATTR_READ_ONLY: u8 = 0x01;
+pub const ATTR_HIDDEN: u8 = 0x02;
+pub const ATTR_SYSTEM: u8 = 0x04;
+pub const ATTR_DIRECTORY: u8 = 0x10;
+pub const ATTR_ARCHIVE: u8 = 0x20;
+/// The attribute combination that marks a long-filename entry, which must be
+/// recognised so LFN records are never mistaken for real files.
+pub const ATTR_LFN: u8 = 0x0f;
+
+/// Size of one directory entry.
+pub const DIR_ENTRY_LEN: usize = 32;
+
+/// Encode `name` as a padded 8.3 short name (11 bytes, no dot stored).
+///
+/// `None` if it does not fit 8.3 or contains a character FAT forbids. Refusing is
+/// deliberate: silently truncating would create a file at a path the firmware then
+/// cannot find, which looks like a mysterious boot failure rather than an install
+/// error.
+pub fn short_name(name: &str) -> Option<[u8; 11]> {
+    const FORBIDDEN: &[u8] = b"\"*+,/:;<=>?[\\]|";
+    let (base, ext) = match name.rsplit_once('.') {
+        Some((b, e)) => (b, e),
+        None => (name, ""),
+    };
+    if base.is_empty() || base.len() > 8 || ext.len() > 3 {
+        return None;
+    }
+    let mut out = [b' '; 11];
+    for (i, c) in base.bytes().enumerate() {
+        if c < 0x20 || FORBIDDEN.contains(&c) || c == b'.' {
+            return None;
+        }
+        out[i] = c.to_ascii_uppercase();
+    }
+    for (i, c) in ext.bytes().enumerate() {
+        if c < 0x20 || FORBIDDEN.contains(&c) || c == b'.' {
+            return None;
+        }
+        out[8 + i] = c.to_ascii_uppercase();
+    }
+    Some(out)
+}
+
+/// Build a 32-byte directory entry.
+///
+/// The first-cluster field is **split**: the high 16 bits live at offset 20 and
+/// the low at offset 26. Writing only the low half is the standard way to produce
+/// a file that works until the volume grows past 65535 clusters and then silently
+/// points at the wrong data.
+pub fn dir_entry(name: [u8; 11], attr: u8, first_cluster: u32, size: u32) -> [u8; DIR_ENTRY_LEN] {
+    let mut e = [0u8; DIR_ENTRY_LEN];
+    e[0..11].copy_from_slice(&name);
+    e[11] = attr;
+    e[20..22].copy_from_slice(&((first_cluster >> 16) as u16).to_le_bytes());
+    e[26..28].copy_from_slice(&((first_cluster & 0xffff) as u16).to_le_bytes());
+    e[28..32].copy_from_slice(&size.to_le_bytes());
+    e
+}
+
+/// Whether a directory entry slot is available: never used (`0x00`) or deleted
+/// (`0xE5`).
+pub fn dir_slot_free(entry: &[u8]) -> bool {
+    !entry.is_empty() && (entry[0] == 0x00 || entry[0] == 0xe5)
+}
+
+/// Byte offset of the first free slot in a directory's raw bytes, or `None` if it
+/// is full.
+///
+/// A `0x00` first byte means "this slot and every slot after it is unused", so the
+/// scan can stop there — but it must still be *returned*, which is why the loop
+/// checks free-ness rather than breaking on `0x00`.
+pub fn find_free_dir_slot(dir: &[u8]) -> Option<usize> {
+    let mut off = 0usize;
+    while off + DIR_ENTRY_LEN <= dir.len() {
+        if dir_slot_free(&dir[off..off + DIR_ENTRY_LEN]) {
+            return Some(off);
+        }
+        off += DIR_ENTRY_LEN;
+    }
+    None
+}
+
+/// Look up a name in a directory's raw bytes, returning `(offset, first_cluster,
+/// size, attr)`.
+///
+/// LFN records are skipped by attribute, and deleted entries by their `0xE5`
+/// marker — otherwise a stale entry for a previous install could be matched and
+/// followed to clusters that now belong to another file.
+pub fn find_dir_entry(dir: &[u8], name: [u8; 11]) -> Option<(usize, u32, u32, u8)> {
+    let mut off = 0usize;
+    while off + DIR_ENTRY_LEN <= dir.len() {
+        let e = &dir[off..off + DIR_ENTRY_LEN];
+        if e[0] == 0x00 {
+            return None; // no entries beyond this point
+        }
+        let attr = e[11];
+        if e[0] != 0xe5 && attr & ATTR_LFN != ATTR_LFN && e[0..11] == name {
+            let hi = u16::from_le_bytes([e[20], e[21]]) as u32;
+            let lo = u16::from_le_bytes([e[26], e[27]]) as u32;
+            let size = u32::from_le_bytes([e[28], e[29], e[30], e[31]]);
+            return Some((off, (hi << 16) | lo, size, attr));
+        }
+        off += DIR_ENTRY_LEN;
+    }
+    None
+}
+
+/// Link `clusters` into a chain: `(cluster, raw FAT value)` pairs, terminating the
+/// last with end-of-chain.
+///
+/// Empty input yields no writes — the caller allocates a zero-length file with a
+/// first cluster of 0 rather than a one-cluster chain.
+pub fn chain_entries(clusters: &[u32], fat_type: FatType) -> alloc::vec::Vec<(u32, u32)> {
+    let eoc = match fat_type {
+        FatType::Fat32 => 0x0fff_ffff,
+        FatType::Fat16 => 0xffff,
+        FatType::Fat12 => 0xfff,
+    };
+    let mut out = alloc::vec::Vec::with_capacity(clusters.len());
+    for (i, &c) in clusters.iter().enumerate() {
+        let v = clusters.get(i + 1).copied().unwrap_or(eoc);
+        out.push((c, v));
+    }
+    out
+}
+
+/// Where one FAT entry lives: `(absolute sector, byte offset within it)`, for FAT
+/// copy `copy` (0-based).
+///
+/// **Every copy must be written.** A volume with `num_fats == 2` whose copies
+/// disagree is what `chkdsk` reports as a corrupt filesystem, and Windows may
+/// "repair" it by reverting to the stale copy — quietly undoing the install. That
+/// is why `num_fats` is parsed at all.
+pub fn fat_entry_location(bpb: &Bpb, copy: u32, cluster: u32) -> Option<(u32, u32)> {
+    if copy >= bpb.num_fats {
+        return None;
+    }
+    let byte = bpb.fat_entry_offset(cluster) as u32;
+    let fat_start = bpb.reserved_sectors + copy * bpb.fat_size_sectors;
+    let sector_in_fat = byte / bpb.bytes_per_sector;
+    if sector_in_fat >= bpb.fat_size_sectors {
+        return None; // entry beyond this FAT's extent
+    }
+    Some((fat_start + sector_in_fat, byte % bpb.bytes_per_sector))
+}
+
 #[cfg(test)]
 mod tests {
+    // --- directory entries + chain write-back -----------------------------
+
+    #[test_case]
+    fn short_name_encodes_the_names_an_install_needs() {
+        // The three names an alongside-install actually writes.
+        assert_eq!(&short_name("EFI").unwrap(), b"EFI        ");
+        assert_eq!(&short_name("CHITTI").unwrap(), b"CHITTI     ");
+        assert_eq!(&short_name("BOOTX64.EFI").unwrap(), b"BOOTX64 EFI");
+        // Lowercase is folded; the dot is a separator, never stored.
+        assert_eq!(&short_name("bootx64.efi").unwrap(), b"BOOTX64 EFI");
+    }
+
+    #[test_case]
+    fn short_name_refuses_what_does_not_fit_83() {
+        // Truncating instead would create a file at a path the firmware cannot
+        // find — a mysterious boot failure rather than a clear install error.
+        assert_eq!(short_name("TOOLONGNAME.EFI"), None); // 11-char base
+        assert_eq!(short_name("A.LONGEXT"), None); // 5-char extension
+        assert_eq!(short_name(""), None);
+        assert_eq!(short_name(".EFI"), None); // empty base
+        // Characters FAT forbids in a short name.
+        for bad in ["A+B", "A?B", "A|B", "A:B", "A*B", "A[B"] {
+            assert_eq!(short_name(bad), None, "{bad} should be refused");
+        }
+    }
+
+    #[test_case]
+    fn dir_entry_splits_the_first_cluster_across_both_halves() {
+        // The high half at offset 20 and low at 26. Writing only the low half
+        // works until the volume exceeds 65535 clusters and then silently points
+        // at the wrong data — so assert both halves explicitly.
+        let e = dir_entry(short_name("BOOTX64.EFI").unwrap(), ATTR_ARCHIVE, 0x0012_3456, 4096);
+        assert_eq!(&e[0..11], b"BOOTX64 EFI");
+        assert_eq!(e[11], ATTR_ARCHIVE);
+        assert_eq!(u16::from_le_bytes([e[20], e[21]]), 0x0012);
+        assert_eq!(u16::from_le_bytes([e[26], e[27]]), 0x3456);
+        assert_eq!(u32::from_le_bytes([e[28], e[29], e[30], e[31]]), 4096);
+    }
+
+    #[test_case]
+    fn finds_a_free_directory_slot() {
+        let mut dir = vec![0u8; DIR_ENTRY_LEN * 4];
+        dir[0] = b'A'; // slot 0 in use
+        dir[DIR_ENTRY_LEN] = 0xe5; // slot 1 deleted -> reusable
+        assert_eq!(find_free_dir_slot(&dir), Some(DIR_ENTRY_LEN));
+        // A directory with every slot occupied must report full, not slot 0.
+        let full = vec![b'A'; DIR_ENTRY_LEN * 2];
+        assert_eq!(find_free_dir_slot(&full), None);
+    }
+
+    #[test_case]
+    fn find_dir_entry_skips_lfn_and_deleted_records() {
+        let mut dir = vec![0u8; DIR_ENTRY_LEN * 4];
+        // A long-filename record whose name bytes happen to collide with ours.
+        dir[0..11].copy_from_slice(b"BOOTX64 EFI");
+        dir[11] = ATTR_LFN;
+        // A deleted entry for a previous install: following it would lead to
+        // clusters that may now belong to another file.
+        dir[DIR_ENTRY_LEN] = 0xe5;
+        dir[DIR_ENTRY_LEN + 1..DIR_ENTRY_LEN + 11].copy_from_slice(b"OOTX64 EFI");
+        dir[DIR_ENTRY_LEN + 11] = ATTR_ARCHIVE;
+        // The real one.
+        let off = DIR_ENTRY_LEN * 2;
+        dir[off..off + DIR_ENTRY_LEN].copy_from_slice(&dir_entry(
+            short_name("BOOTX64.EFI").unwrap(),
+            ATTR_ARCHIVE,
+            9,
+            123,
+        ));
+        let (found_off, cluster, size, attr) =
+            find_dir_entry(&dir, short_name("BOOTX64.EFI").unwrap()).unwrap();
+        assert_eq!((found_off, cluster, size, attr), (off, 9, 123, ATTR_ARCHIVE));
+    }
+
+    #[test_case]
+    fn find_dir_entry_stops_at_the_end_marker() {
+        // A 0x00 first byte means nothing beyond here is in use; scanning past it
+        // would read uninitialised bytes as entries.
+        let mut dir = vec![0u8; DIR_ENTRY_LEN * 3];
+        let off = DIR_ENTRY_LEN * 2;
+        dir[off..off + DIR_ENTRY_LEN]
+            .copy_from_slice(&dir_entry(short_name("X").unwrap(), ATTR_ARCHIVE, 5, 1));
+        assert_eq!(find_dir_entry(&dir, short_name("X").unwrap()), None);
+    }
+
+    #[test_case]
+    fn chain_entries_links_clusters_and_terminates() {
+        let c = chain_entries(&[5, 6, 9], FatType::Fat32);
+        // Each cluster points at the next; the last carries end-of-chain.
+        assert_eq!(c, vec![(5, 6), (6, 9), (9, 0x0fff_ffff)]);
+        // A single cluster is immediately terminal.
+        assert_eq!(chain_entries(&[7], FatType::Fat32), vec![(7, 0x0fff_ffff)]);
+        // Empty means a zero-length file, not a one-cluster chain.
+        assert_eq!(chain_entries(&[], FatType::Fat32), vec![]);
+        // FAT16 terminates with its own marker.
+        assert_eq!(chain_entries(&[3], FatType::Fat16), vec![(3, 0xffff)]);
+    }
+
+    #[test_case]
+    fn chain_round_trips_through_cluster_state() {
+        // The links this produces must read back as the chain we intended — the
+        // property that matters, since these two functions are each other's
+        // inverse across a real FAT.
+        let clusters = [4u32, 8, 15];
+        let entries = chain_entries(&clusters, FatType::Fat32);
+        for (i, (_, raw)) in entries.iter().enumerate() {
+            match cluster_state(*raw, FatType::Fat32) {
+                ClusterState::Next(n) => assert_eq!(n, clusters[i + 1]),
+                ClusterState::End => assert_eq!(i, clusters.len() - 1),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test_case]
+    fn fat_entry_location_covers_every_fat_copy() {
+        let b = parse_bpb(&fat32_bpb(204_800, 1, 1600)).unwrap();
+        assert_eq!(b.num_fats, 2);
+        // Cluster 3 on FAT32 is at byte 12 of the FAT.
+        let (s0, o0) = fat_entry_location(&b, 0, 3).unwrap();
+        assert_eq!((s0, o0), (b.reserved_sectors, 12));
+        // The second copy is one FAT-length further in. Both must be written: if
+        // the copies disagree, chkdsk calls the volume corrupt and Windows may
+        // "repair" it back to the stale copy, undoing the install.
+        let (s1, o1) = fat_entry_location(&b, 1, 3).unwrap();
+        assert_eq!((s1, o1), (b.reserved_sectors + b.fat_size_sectors, 12));
+        // There is no third copy.
+        assert_eq!(fat_entry_location(&b, 2, 3), None);
+    }
+
+    #[test_case]
+    fn fat_entry_location_rejects_entries_past_the_fat() {
+        let b = parse_bpb(&fat32_bpb(204_800, 1, 1600)).unwrap();
+        // A cluster number whose entry would fall outside the FAT's own extent
+        // must be refused rather than computing a sector in the data region.
+        let past = b.fat_size_sectors * b.bytes_per_sector / 4 + 1;
+        assert_eq!(fat_entry_location(&b, 0, past), None);
+    }
+
     use super::*;
     use alloc::vec;
 
