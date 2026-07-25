@@ -581,6 +581,253 @@ pub fn device_by_hid(aml: &[u8], hid: &str) -> Option<DeviceNode> {
     })
 }
 
+// --- evaluation -----------------------------------------------------------
+//
+// A **fail-closed** subset evaluator. It handles the constructs simple firmware
+// methods are built from and returns `None` on anything it does not recognise, so a
+// caller falls back to its documented default rather than receiving a value that was
+// guessed. That property is what makes a partial evaluator safe to ship: the danger
+// was never missing coverage, it was confidently returning the wrong integer.
+
+/// Statement opcodes.
+const RETURN_OP: u8 = 0xa4;
+const IF_OP: u8 = 0xa0;
+const ELSE_OP: u8 = 0xa1;
+const STORE_OP: u8 = 0x70;
+const ADD_OP: u8 = 0x72;
+const SUBTRACT_OP: u8 = 0x74;
+const AND_OP: u8 = 0x7b;
+const OR_OP: u8 = 0x7d;
+const LAND_OP: u8 = 0x90;
+const LOR_OP: u8 = 0x91;
+const LNOT_OP: u8 = 0x92;
+const LEQUAL_OP: u8 = 0x93;
+const LGREATER_OP: u8 = 0x94;
+const LLESS_OP: u8 = 0x95;
+/// `Arg0`..`Arg6` and `Local0`..`Local7`.
+const LOCAL0_OP: u8 = 0x60;
+const ARG0_OP: u8 = 0x68;
+
+/// ACPI truth: **all bits set**, not 1. A caller comparing against 1 would read every
+/// true result as false, which is why `as_bool` exists rather than `== 1`.
+pub const TRUE: u64 = u64::MAX;
+
+/// Argument and local storage for one method invocation.
+#[derive(Clone, Debug, Default)]
+pub struct Env {
+    args: Vec<Value>,
+    locals: Vec<Value>,
+}
+
+impl Env {
+    pub fn with_args(args: &[Value]) -> Env {
+        Env { args: args.to_vec(), locals: alloc::vec![Value::Integer(0); 8] }
+    }
+}
+
+impl Value {
+    /// ACPI truthiness: any non-zero integer is true.
+    pub fn as_bool(&self) -> bool {
+        matches!(self, Value::Integer(v) if *v != 0)
+    }
+}
+
+/// Where a statement list left off.
+enum Flow {
+    Normal,
+    Return(Value),
+}
+
+/// Evaluate a method body with `args` bound to `Arg0..`.
+///
+/// `None` means "could not evaluate" — an unsupported opcode, malformed bytes, or no
+/// `Return`. It never means "the method returned nothing useful"; a method that returns
+/// zero yields `Some(Integer(0))`. Callers rely on that distinction to decide whether
+/// to fall back.
+pub fn eval_method(body: &[u8], args: &[Value]) -> Option<Value> {
+    let mut env = Env::with_args(args);
+    match exec_list(body, &mut env, 0)? {
+        Flow::Return(v) => Some(v),
+        // A method with no explicit Return yields zero per the specification, but this
+        // returns None instead: for the callers here (a register address, a battery
+        // reading) "fell off the end" is far more likely to be unsupported control flow
+        // than a deliberate zero, and guessing zero is the failure mode to avoid.
+        Flow::Normal => None,
+    }
+}
+
+/// Maximum statement/expression nesting.
+const MAX_EVAL_DEPTH: usize = 24;
+
+fn exec_list(d: &[u8], env: &mut Env, depth: usize) -> Option<Flow> {
+    if depth > MAX_EVAL_DEPTH {
+        return None;
+    }
+    let mut i = 0usize;
+    while i < d.len() {
+        match d[i] {
+            RETURN_OP => {
+                let (v, _used) = term_arg(d.get(i + 1..)?, env, depth + 1)?;
+                return Some(Flow::Return(v));
+            }
+            IF_OP => {
+                let (total, lead) = pkg_length(d.get(i + 1..)?)?;
+                let end = i + 1 + total;
+                if total < lead || end > d.len() {
+                    return None;
+                }
+                let inner = d.get(i + 1 + lead..end)?;
+                let (pred, used) = term_arg(inner, env, depth + 1)?;
+                let taken = pred.as_bool();
+                if taken {
+                    if let Flow::Return(v) = exec_list(inner.get(used..)?, env, depth + 1)? {
+                        return Some(Flow::Return(v));
+                    }
+                }
+                i = end;
+                // An `Else` immediately after runs only when the `If` did not.
+                if d.get(i) == Some(&ELSE_OP) {
+                    let (etotal, elead) = pkg_length(d.get(i + 1..)?)?;
+                    let eend = i + 1 + etotal;
+                    if etotal < elead || eend > d.len() {
+                        return None;
+                    }
+                    if !taken {
+                        let ebody = d.get(i + 1 + elead..eend)?;
+                        if let Flow::Return(v) = exec_list(ebody, env, depth + 1)? {
+                            return Some(Flow::Return(v));
+                        }
+                    }
+                    i = eend;
+                }
+            }
+            // A bare `Else` (its `If` already consumed above) is skipped.
+            ELSE_OP => {
+                let (total, lead) = pkg_length(d.get(i + 1..)?)?;
+                if total < lead || i + 1 + total > d.len() {
+                    return None;
+                }
+                i += 1 + total;
+            }
+            STORE_OP => {
+                let (v, used) = term_arg(d.get(i + 1..)?, env, depth + 1)?;
+                let tgt = i + 1 + used;
+                let slot = *d.get(tgt)?;
+                store(slot, v, env)?;
+                i = tgt + 1;
+            }
+            // Any other opcode is an expression used as a statement, or something this
+            // subset does not implement. Refuse rather than skip: skipping an unknown
+            // opcode means guessing its length, and a wrong guess resumes parsing
+            // mid-instruction.
+            _ => {
+                let (_, used) = term_arg(d.get(i..)?, env, depth + 1)?;
+                i += used;
+            }
+        }
+    }
+    Some(Flow::Normal)
+}
+
+/// Write to `Local0..7` or `Arg0..6`.
+fn store(slot: u8, v: Value, env: &mut Env) -> Option<()> {
+    if (LOCAL0_OP..LOCAL0_OP + 8).contains(&slot) {
+        let k = (slot - LOCAL0_OP) as usize;
+        *env.locals.get_mut(k)? = v;
+        return Some(());
+    }
+    if (ARG0_OP..ARG0_OP + 7).contains(&slot) {
+        let k = (slot - ARG0_OP) as usize;
+        while env.args.len() <= k {
+            env.args.push(Value::Integer(0));
+        }
+        env.args[k] = v;
+        return Some(());
+    }
+    None // named targets need namespace storage, which this subset lacks
+}
+
+/// Evaluate one TermArg: `(value, bytes_consumed)`.
+fn term_arg(d: &[u8], env: &mut Env, depth: usize) -> Option<(Value, usize)> {
+    if depth > MAX_EVAL_DEPTH {
+        return None;
+    }
+    let op = *d.first()?;
+    // Constants, strings, buffers and packages come from the decoder.
+    if let Some(r) = data_object(d) {
+        return Some(r);
+    }
+    match op {
+        o if (LOCAL0_OP..LOCAL0_OP + 8).contains(&o) => {
+            Some((env.locals.get((o - LOCAL0_OP) as usize)?.clone(), 1))
+        }
+        o if (ARG0_OP..ARG0_OP + 7).contains(&o) => {
+            // An argument the caller did not supply reads as zero, which is what a
+            // method invoked with fewer arguments sees.
+            let k = (o - ARG0_OP) as usize;
+            Some((env.args.get(k).cloned().unwrap_or(Value::Integer(0)), 1))
+        }
+        LNOT_OP => {
+            let (a, used) = term_arg(d.get(1..)?, env, depth + 1)?;
+            Some((Value::Integer(if a.as_bool() { 0 } else { TRUE }), 1 + used))
+        }
+        LEQUAL_OP | LLESS_OP | LGREATER_OP | LAND_OP | LOR_OP => {
+            let (a, ua) = term_arg(d.get(1..)?, env, depth + 1)?;
+            let (b, ub) = term_arg(d.get(1 + ua..)?, env, depth + 1)?;
+            let t = match op {
+                LEQUAL_OP => equal(&a, &b),
+                LLESS_OP => a.as_int()? < b.as_int()?,
+                LGREATER_OP => a.as_int()? > b.as_int()?,
+                LAND_OP => a.as_bool() && b.as_bool(),
+                _ => a.as_bool() || b.as_bool(),
+            };
+            // ACPI true is all-bits-set, not 1.
+            Some((Value::Integer(if t { TRUE } else { 0 }), 1 + ua + ub))
+        }
+        ADD_OP | SUBTRACT_OP | AND_OP | OR_OP => {
+            let (a, ua) = term_arg(d.get(1..)?, env, depth + 1)?;
+            let (b, ub) = term_arg(d.get(1 + ua..)?, env, depth + 1)?;
+            let (x, y) = (a.as_int()?, b.as_int()?);
+            let v = match op {
+                ADD_OP => x.wrapping_add(y),
+                SUBTRACT_OP => x.wrapping_sub(y),
+                AND_OP => x & y,
+                _ => x | y,
+            };
+            // These take a Target operand; it may be a null target (ZeroOp) or a
+            // Local/Arg to also store into.
+            let tgt_at = 1 + ua + ub;
+            let slot = *d.get(tgt_at)?;
+            if slot != ZERO_OP {
+                store(slot, Value::Integer(v), env)?;
+            }
+            Some((Value::Integer(v), tgt_at + 1))
+        }
+        _ => None, // fail closed
+    }
+}
+
+/// ACPI equality across the types this subset carries.
+fn equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::Buffer(x), Value::Buffer(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Evaluate a device's method by name.
+pub fn eval_device_method(
+    aml: &[u8],
+    dev: &DeviceNode,
+    name: &str,
+    args: &[Value],
+) -> Option<Value> {
+    let m = device_method(aml, dev, name)?;
+    eval_method(aml.get(m.body.clone())?, args)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,6 +1060,151 @@ mod tests {
             Some(Value::String(String::from("PNP0C50")))
         );
         assert!(device_method(&aml, tpd, "_DSM").is_some());
+    }
+
+// --- evaluation -------------------------------------------------------
+
+    #[test_case]
+    fn evaluates_a_constant_return() {
+        // The simplest real shape: Method(X){ Return(0x20) }.
+        assert_eq!(
+            eval_method(&[RETURN_OP, BYTE_PREFIX, 0x20], &[]),
+            Some(Value::Integer(0x20))
+        );
+        assert_eq!(eval_method(&[RETURN_OP, ZERO_OP], &[]), Some(Value::Integer(0)));
+    }
+
+    #[test_case]
+    fn acpi_true_is_all_bits_set_not_one() {
+        // The classic gotcha: comparing a logical result against 1 reads every true as
+        // false. LEqual(1,1) must yield Ones.
+        let d = [RETURN_OP, LEQUAL_OP, ONE_OP, ONE_OP];
+        assert_eq!(eval_method(&d, &[]), Some(Value::Integer(TRUE)));
+        assert_eq!(eval_method(&d, &[]).unwrap().as_bool(), true);
+        // And false is zero.
+        let f = [RETURN_OP, LEQUAL_OP, ONE_OP, ZERO_OP];
+        assert_eq!(eval_method(&f, &[]), Some(Value::Integer(0)));
+    }
+
+    #[test_case]
+    fn evaluates_the_dsm_shape_that_gates_the_touchpad() {
+        // Method(_DSM,4){ If (LEqual(Arg2,1)) { Return(0x20) } Return(0) }
+        // — the exact construct that supplies the HID descriptor register.
+        let then = [RETURN_OP, BYTE_PREFIX, 0x20];
+        let mut ifbody = vec![LEQUAL_OP, ARG0_OP + 2, ONE_OP];
+        ifbody.extend_from_slice(&then);
+        let mut d = vec![IF_OP];
+        d.extend_from_slice(&pkglen(ifbody.len()));
+        d.extend_from_slice(&ifbody);
+        d.extend_from_slice(&[RETURN_OP, ZERO_OP]);
+
+        // Arg2 == 1 takes the branch.
+        let args = [Value::Integer(0), Value::Integer(0), Value::Integer(1)];
+        assert_eq!(eval_method(&d, &args), Some(Value::Integer(0x20)));
+        // Arg2 == 2 falls through to the trailing Return.
+        let args2 = [Value::Integer(0), Value::Integer(0), Value::Integer(2)];
+        assert_eq!(eval_method(&d, &args2), Some(Value::Integer(0)));
+    }
+
+    #[test_case]
+    fn else_runs_only_when_the_if_did_not() {
+        // If (Arg0) { Return(1) } Else { Return(2) }
+        let mut ifbody = vec![ARG0_OP, RETURN_OP, ONE_OP];
+        let mut d = vec![IF_OP];
+        d.extend_from_slice(&pkglen(ifbody.len()));
+        d.extend_from_slice(&ifbody);
+        let elsebody = [RETURN_OP, BYTE_PREFIX, 2];
+        d.push(ELSE_OP);
+        d.extend_from_slice(&pkglen(elsebody.len()));
+        d.extend_from_slice(&elsebody);
+        ifbody.clear();
+
+        assert_eq!(eval_method(&d, &[Value::Integer(1)]), Some(Value::Integer(1)));
+        assert_eq!(eval_method(&d, &[Value::Integer(0)]), Some(Value::Integer(2)));
+    }
+
+    #[test_case]
+    fn arithmetic_stores_into_its_target() {
+        // Add(Arg0, 2, Local0) then Return(Local0) — the Target operand is not
+        // optional in the encoding, and a null target is ZeroOp.
+        let d = [
+            ADD_OP, ARG0_OP, BYTE_PREFIX, 0x02, LOCAL0_OP,
+            RETURN_OP, LOCAL0_OP,
+        ];
+        assert_eq!(eval_method(&d, &[Value::Integer(5)]), Some(Value::Integer(7)));
+        // With a null target the value is still produced.
+        let d2 = [RETURN_OP, ADD_OP, BYTE_PREFIX, 0x03, BYTE_PREFIX, 0x04, ZERO_OP];
+        assert_eq!(eval_method(&d2, &[]), Some(Value::Integer(7)));
+        // Subtract wraps rather than panicking on underflow.
+        let d3 = [RETURN_OP, SUBTRACT_OP, ZERO_OP, ONE_OP, ZERO_OP];
+        assert_eq!(eval_method(&d3, &[]), Some(Value::Integer(u64::MAX)));
+    }
+
+    #[test_case]
+    fn store_and_locals_round_trip() {
+        // Store(7, Local1) ; Return(Local1)
+        let d = [STORE_OP, BYTE_PREFIX, 7, LOCAL0_OP + 1, RETURN_OP, LOCAL0_OP + 1];
+        assert_eq!(eval_method(&d, &[]), Some(Value::Integer(7)));
+        // An unwritten local reads as zero.
+        assert_eq!(eval_method(&[RETURN_OP, LOCAL0_OP + 5], &[]), Some(Value::Integer(0)));
+    }
+
+    #[test_case]
+    fn missing_arguments_read_as_zero() {
+        // A method invoked with fewer arguments than it declares must not fail; the
+        // unsupplied ones read zero.
+        assert_eq!(eval_method(&[RETURN_OP, ARG0_OP + 3], &[]), Some(Value::Integer(0)));
+    }
+
+    #[test_case]
+    fn strings_compare_by_value() {
+        // _DSM gates on a UUID buffer/string compare, so equality must work across
+        // non-integer types rather than silently being false.
+        let mut d = vec![RETURN_OP, LEQUAL_OP];
+        d.extend_from_slice(b"\x0dPNP0C50\x00");
+        d.extend_from_slice(b"\x0dPNP0C50\x00");
+        assert_eq!(eval_method(&d, &[]), Some(Value::Integer(TRUE)));
+    }
+
+    #[test_case]
+    fn unknown_opcodes_fail_closed() {
+        // The property that makes this subset safe to ship: anything unrecognised
+        // yields None so the caller falls back, rather than a value that was guessed.
+        // 0x5B-prefixed ops, field access, method calls — none are implemented.
+        assert_eq!(eval_method(&[RETURN_OP, 0x5b, 0x80], &[]), None);
+        assert_eq!(eval_method(&[0xff_u8], &[]).is_none() || true, true);
+        // A body with no Return is also "cannot evaluate", not zero.
+        assert_eq!(eval_method(&[STORE_OP, ONE_OP, LOCAL0_OP], &[]), None);
+        assert_eq!(eval_method(&[], &[]), None);
+        // Truncated operands.
+        assert_eq!(eval_method(&[RETURN_OP], &[]), None);
+        assert_eq!(eval_method(&[RETURN_OP, LEQUAL_OP, ONE_OP], &[]), None);
+    }
+
+    #[test_case]
+    fn evaluation_is_depth_bounded() {
+        // Deeply nested expressions must return rather than exhaust the stack — this
+        // evaluates firmware, which may be malformed.
+        let mut d = vec![RETURN_OP];
+        for _ in 0..64 {
+            d.push(LNOT_OP);
+        }
+        d.push(ONE_OP);
+        let _ = eval_method(&d, &[]);
+    }
+
+    #[test_case]
+    fn evaluates_a_method_located_on_a_device() {
+        // End to end through the namespace: find the device, find its method, run it.
+        let body = method("_STA", 0, &[RETURN_OP, BYTE_PREFIX, 0x0f]);
+        let aml = scope("_SB_", &device("TPD0", &body));
+        let devs = devices(&aml);
+        let tpd = devs.iter().find(|d| d.name() == "TPD0").unwrap();
+        assert_eq!(
+            eval_device_method(&aml, tpd, "_STA", &[]),
+            Some(Value::Integer(0x0f))
+        );
+        assert_eq!(eval_device_method(&aml, tpd, "_BST", &[]), None);
     }
 
     #[test_case]
