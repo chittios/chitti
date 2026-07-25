@@ -398,6 +398,35 @@ pub fn blit_run_baseline(
     px: f32,
     color: u32,
 ) -> i32 {
+    blit_run_baseline_ex(buf, stride, height, pen_x, baseline_y, text, px, color, false)
+}
+
+/// Like [`blit_run_baseline`] but with hard-edged (non-AA) glyphs for surfaces
+/// that will be nearest-neighbour upscaled (package-UI canvas text).
+pub fn blit_run_baseline_crisp(
+    buf: &mut [u32],
+    stride: usize,
+    height: usize,
+    pen_x: f32,
+    baseline_y: f32,
+    text: &str,
+    px: f32,
+    color: u32,
+) -> i32 {
+    blit_run_baseline_ex(buf, stride, height, pen_x, baseline_y, text, px, color, true)
+}
+
+fn blit_run_baseline_ex(
+    buf: &mut [u32],
+    stride: usize,
+    height: usize,
+    mut pen_x: f32,
+    baseline_y: f32,
+    text: &str,
+    px: f32,
+    color: u32,
+    crisp: bool,
+) -> i32 {
     ensure_default();
     let shaped = crate::font_shape::shape(text);
     FACE.with(|s| {
@@ -405,7 +434,9 @@ pub fn blit_run_baseline(
         FALLBACKS.with(|chain| {
             for ch in shaped.chars() {
                 pen_x += match pick_font(None, global, chain, ch) {
-                    Some(f) => blit_glyph(buf, stride, height, pen_x, baseline_y, ch, px, color, f),
+                    Some(f) => {
+                        blit_glyph(buf, stride, height, pen_x, baseline_y, ch, px, color, f, crisp)
+                    }
                     None => {
                         blit_box(buf, stride, height, pen_x as i32, baseline_y as i32, px, color)
                     }
@@ -416,8 +447,20 @@ pub fn blit_run_baseline(
     })
 }
 
+/// Hi-res coverage floor for the crisp supersample path. Samples below this
+/// are pure AA fringe and get dropped; anything above solidifies the destination
+/// pixel. Kept low so thin curves (o, e, s, g) survive at 10–14 px canvas sizes.
+const CRISP_SS_FLOOR: u8 = 40;
+/// Supersample factor for package-UI text (render at N×, max-pool to canvas).
+const CRISP_SS: i32 = 2;
+
 /// Rasterize one glyph from `font` with the pen at `(pen_x, baseline_y)` and
 /// blend it into `buf`; returns the glyph advance.
+///
+/// When `crisp` is true, the glyph is rendered at [`CRISP_SS`]× size and
+/// max-pooled onto the canvas as solid ink. That keeps curves intact (a 1×
+/// hard threshold was punching holes in e/s/o stems) while still avoiding the
+/// soft grey AA fringes that blur under integer upscale of the 256×192 surface.
 #[allow(clippy::too_many_arguments)]
 fn blit_glyph(
     buf: &mut [u32],
@@ -429,7 +472,11 @@ fn blit_glyph(
     px: f32,
     color: u32,
     font: &Font,
+    crisp: bool,
 ) -> f32 {
+    if crisp {
+        return blit_glyph_crisp(buf, stride, height, pen_x, baseline_y, ch, px, color, font);
+    }
     let (m, coverage) = font.rasterize(ch, px);
     // Ladybird/LibGfx-style: bitmap left = pen + xmin;
     // bitmap bottom (Y-up) sits at baseline + ymin → screen Y-down:
@@ -449,6 +496,48 @@ fn blit_glyph(
         }
     }
     m.advance_width
+}
+
+/// Supersampled solid-ink glyph for package-UI canvases.
+#[allow(clippy::too_many_arguments)]
+fn blit_glyph_crisp(
+    buf: &mut [u32],
+    stride: usize,
+    height: usize,
+    pen_x: f32,
+    baseline_y: f32,
+    ch: char,
+    px: f32,
+    color: u32,
+    font: &Font,
+) -> f32 {
+    let ss = CRISP_SS as f32;
+    let (m, coverage) = font.rasterize(ch, (px * ss).max(1.0));
+    // Pen/baseline on the hi-res grid, then each ink sample folds into the
+    // lo-res pixel that covers it (floor-div by SS). Any sample above the floor
+    // paints the dest pixel solid — max-pool semantics, preserves thin strokes.
+    let gx_hi = f32_floor(pen_x * ss) + m.xmin;
+    let gy_hi = f32_floor(baseline_y * ss) - m.height as i32 - m.ymin;
+    let gw = m.width;
+    let gh = m.height;
+    if gw > 0 && gh > 0 && coverage.len() >= gw * gh {
+        for row in 0..gh {
+            for col in 0..gw {
+                let a = coverage[row * gw + col];
+                if a < CRISP_SS_FLOOR {
+                    continue;
+                }
+                let hx = gx_hi + col as i32;
+                let hy = gy_hi + row as i32;
+                // i32 div_euclid maps negative coords correctly for off-left glyphs.
+                let dx = hx.div_euclid(CRISP_SS);
+                let dy = hy.div_euclid(CRISP_SS);
+                put_blend(buf, stride, height, dx, dy, color, 255);
+            }
+        }
+    }
+    // Advance at the *requested* (lo-res) size so spacing matches layout.
+    font.metrics(ch, px).advance_width
 }
 
 /// No face loaded at all: draw a crude filled box and return its advance.
@@ -485,6 +574,23 @@ pub fn blit_run(
     let (asc, _, _) = vertical_metrics(px);
     let baseline = y_top as f32 + asc;
     blit_run_baseline(buf, stride, height, x as f32, baseline, text, px, color)
+}
+
+/// Hard-edged variant of [`blit_run`] for package-UI canvas labels: no soft
+/// antialiasing, so integer upscale of the 256×192 surface stays sharp.
+pub fn blit_run_crisp(
+    buf: &mut [u32],
+    stride: usize,
+    height: usize,
+    x: i32,
+    y_top: i32,
+    text: &str,
+    px: f32,
+    color: u32,
+) -> i32 {
+    let (asc, _, _) = vertical_metrics(px);
+    let baseline = y_top as f32 + asc;
+    blit_run_baseline_crisp(buf, stride, height, x as f32, baseline, text, px, color)
 }
 
 // --- font-family registry (web fonts) --------------------------------
@@ -614,7 +720,7 @@ pub fn blit_run_family(
                 for ch in shaped.chars() {
                     pen_x += match pick_font(primary, global, chain, ch) {
                         Some(f) => {
-                            blit_glyph(buf, stride, height, pen_x, baseline, ch, px, color, f)
+                            blit_glyph(buf, stride, height, pen_x, baseline, ch, px, color, f, false)
                         }
                         None => {
                             blit_box(buf, stride, height, pen_x as i32, baseline as i32, px, color)

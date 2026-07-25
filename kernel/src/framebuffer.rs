@@ -4681,8 +4681,22 @@ pub fn present_surface(id: u32, sw: usize, sh: usize, buf: &[u32]) {
 /// size — instead of being baked into the (upscaled) surface buffer. Empty
 /// `hud` behaves exactly like [`present_surface`].
 pub fn present_surface_hud(id: u32, sw: usize, sh: usize, buf: &[u32], hud: &str) {
+    present_surface_hud_ex(id, sw, sh, sw, sh, buf, hud);
+}
+
+/// Like [`present_surface_hud`], but the pixel buffer may already be presentation-
+/// scaled (`buf_w×buf_h`) while hit-testing still uses `logical_sw×logical_sh`.
+pub fn present_surface_hud_ex(
+    id: u32,
+    logical_sw: usize,
+    logical_sh: usize,
+    buf_w: usize,
+    buf_h: usize,
+    buf: &[u32],
+    hud: &str,
+) {
     if hud.trim().is_empty() {
-        present_surface_reserve(id, sw, sh, buf, 0);
+        present_surface_reserve_ex(id, logical_sw, logical_sh, buf_w, buf_h, buf, 0);
         return;
     }
     // Compute reserve *before* any SCREEN critical section. `draw_surface_hud`
@@ -4690,7 +4704,7 @@ pub fn present_surface_hud(id: u32, sw: usize, sh: usize, buf: &[u32], hud: &str
     // re-enter the non-reentrant spinlock and hang forever (chess open path:
     // host_hud_set → present → draw_surface_hud).
     let reserve = surface_hud_height(hud);
-    present_surface_reserve(id, sw, sh, buf, reserve);
+    present_surface_reserve_ex(id, logical_sw, logical_sh, buf_w, buf_h, buf, reserve);
     draw_surface_hud(id, hud, reserve);
 }
 
@@ -4699,6 +4713,12 @@ pub fn present_surface_hud(id: u32, sw: usize, sh: usize, buf: &[u32], hud: &str
 ///
 /// Must **not** be called while already holding `SCREEN` (see
 /// [`present_surface_hud`]). Pure layout math is in [`hud_strip_height`].
+/// Public so package-UI present can size its pre-scaled text buffer to the
+/// same usable pane the compositor will use.
+pub fn surface_hud_reserve(hud: &str) -> u64 {
+    surface_hud_height(hud)
+}
+
 fn surface_hud_height(hud: &str) -> u64 {
     SCREEN.with(|slot| {
         let Some(sc) = slot.as_ref() else { return 0 };
@@ -4805,13 +4825,65 @@ fn draw_surface_hud(id: u32, hud: &str, barh: u64) {
     });
 }
 
+/// Choose destination size for presenting `sw×sh` into a `pw×ph` pane.
+///
+/// * **Upscale** (`free fit ≥ source`): integer pixel scale so each source
+///   pixel becomes an `s×s` block — keeps package-UI text/rects crisp.
+/// * **Downscale** (source larger than pane): free aspect-fit so video still
+///   fills without cropping.
+///
+/// Pure — unit-tested.
+pub fn present_fit(sw: u64, sh: u64, pw: u64, ph: u64) -> (u64, u64) {
+    if sw == 0 || sh == 0 || pw == 0 || ph == 0 {
+        return (0, 0);
+    }
+    // Free aspect-fit ("contain").
+    let fit_w = pw;
+    let fit_h = sh.saturating_mul(pw).saturating_div(sw).max(1);
+    let (free_w, free_h) = if fit_h <= ph {
+        (fit_w, fit_h)
+    } else {
+        let fit_h = ph;
+        let fit_w = sw.saturating_mul(ph).saturating_div(sh).max(1);
+        (fit_w.min(pw), fit_h)
+    };
+    // Integer upscale when the free fit would grow the image.
+    if free_w >= sw && free_h >= sh {
+        let s = (pw / sw).min(ph / sh).max(1);
+        let iw = sw.saturating_mul(s);
+        let ih = sh.saturating_mul(s);
+        if iw <= pw && ih <= ph && s >= 1 {
+            return (iw, ih);
+        }
+    }
+    (free_w, free_h)
+}
+
 /// Like [`present_surface`], but leaves `reserve_bottom` px at the bottom of the
 /// pane untouched — the frame is scaled/letterboxed into the region *above* the
 /// reserve and the reserved strip is never cleared. The video player uses this
 /// to keep its control HUD in a fixed strip that the per-frame blit doesn't
 /// repaint (so the HUD updates in place instead of flickering under it).
 pub fn present_surface_reserve(id: u32, sw: usize, sh: usize, buf: &[u32], reserve_bottom: u64) {
-    remember_surf_dim(id, sw, sh);
+    // Hit-testing uses the same dimensions as the buffer (logical == pixel).
+    present_surface_reserve_ex(id, sw, sh, sw, sh, buf, reserve_bottom);
+}
+
+/// Present a **pre-scaled** buffer while remembering `logical_sw×logical_sh`
+/// for hit-testing. Package-UI builds a presentation-sized RGB buffer (geometry
+/// nearest-upscaled + labels re-rasterized at that scale) but clicks must still
+/// map into the agent's 256×192 coordinate space.
+pub fn present_surface_reserve_ex(
+    id: u32,
+    logical_sw: usize,
+    logical_sh: usize,
+    buf_w: usize,
+    buf_h: usize,
+    buf: &[u32],
+    reserve_bottom: u64,
+) {
+    // Hit map uses logical size; the frame we blit is `buf_w×buf_h`.
+    remember_surf_dim(id, logical_sw, logical_sh);
     remember_surf_reserve(id, reserve_bottom);
     SCREEN.with(|slot| {
         // Open (or focus) this surface's tab, then paint over its cleared
@@ -4821,7 +4893,8 @@ pub fn present_surface_reserve(id: u32, sw: usize, sh: usize, buf: &[u32], reser
             open_view_slot(slot, RightMode::Surface(id));
         }
         let Some(sc) = slot else { return };
-        if sc.right != RightMode::Surface(id) || sw == 0 || sh == 0 {
+        if sc.right != RightMode::Surface(id) || logical_sw == 0 || logical_sh == 0 || buf_w == 0 || buf_h == 0
+        {
             return;
         }
         sc.cursor_restore();
@@ -4830,27 +4903,14 @@ pub fn present_surface_reserve(id: u32, sw: usize, sh: usize, buf: &[u32], reser
         let (pw, ph_full) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
         // Usable frame height excludes the reserved HUD strip at the bottom.
         let ph = ph_full.saturating_sub(reserve_bottom);
-        if pw == 0 || ph == 0 || buf.len() < sw * sh {
+        if pw == 0 || ph == 0 || buf.len() < buf_w * buf_h {
             sc.cursor_overlay();
             return;
         }
-        // Aspect-fit ("contain") into the pane: scale up *or* down so the
-        // picture uses as much of the pane as possible without cropping.
-        // (Integer-only upscale left large empty bars in fullscreen when the
-        // source was smaller than the pane — e.g. 640×360 in a full-HD action
-        // pane.)
-        let (dw, dh) = {
-            // Compare sw/pw vs sh/ph via cross-multiply to pick the limiting edge.
-            let fit_w = pw;
-            let fit_h = (sh as u64).saturating_mul(pw).saturating_div(sw as u64).max(1);
-            if fit_h <= ph {
-                (fit_w, fit_h)
-            } else {
-                let fit_h = ph;
-                let fit_w = (sw as u64).saturating_mul(ph).saturating_div(sh as u64).max(1);
-                (fit_w.min(pw), fit_h)
-            }
-        };
+        // Destination frame follows the **logical** aspect-fit (matches
+        // surface_hit). When the buffer is already that size, the sample loop
+        // is 1:1; otherwise nearest-neighbour from buf into the frame.
+        let (dw, dh) = present_fit(logical_sw as u64, logical_sh as u64, pw, ph);
         let ox = px + (pw.saturating_sub(dw)) / 2;
         let oy = py + (ph.saturating_sub(dh)) / 2;
         // **No full-pane clear.** Clearing the whole surface with fill_rect
@@ -4877,10 +4937,10 @@ pub fn present_surface_reserve(id: u32, sw: usize, sh: usize, buf: &[u32], reser
         // hundreds of thousands of put_pixel calls for video.
         let mut row = alloc::vec![0u32; dw as usize];
         for dy in 0..dh {
-            let sy = (dy * sh as u64 / dh) as usize;
-            let srow = sy * sw;
+            let sy = (dy * buf_h as u64 / dh) as usize;
+            let srow = sy * buf_w;
             for dx in 0..dw as usize {
-                let sx = (dx as u64 * sw as u64 / dw) as usize;
+                let sx = (dx as u64 * buf_w as u64 / dw) as usize;
                 row[dx] = buf[srow + sx];
             }
             sc.blit_rgb32_row(ox, oy + dy, &row);
@@ -5431,18 +5491,8 @@ pub fn surface_hit(mx: u64, my: u64) -> Option<(u32, u16, u16)> {
         if sw == 0 || sh == 0 {
             return None;
         }
-        // Same aspect-fit as present_surface_reserve.
-        let (dw, dh) = {
-            let fit_w = pw;
-            let fit_h = sh.saturating_mul(pw).saturating_div(sw).max(1);
-            if fit_h <= ph {
-                (fit_w, fit_h)
-            } else {
-                let fit_h = ph;
-                let fit_w = sw.saturating_mul(ph).saturating_div(sh).max(1);
-                (fit_w.min(pw), fit_h)
-            }
-        };
+        // Same fit as present_surface_reserve (integer upscale when growing).
+        let (dw, dh) = present_fit(sw, sh, pw, ph);
         let ox = px + (pw.saturating_sub(dw)) / 2;
         let oy = py + (ph.saturating_sub(dh)) / 2;
         if mx < ox || my < oy || mx >= ox + dw || my >= oy + dh {
@@ -5720,6 +5770,45 @@ mod hud_tests {
         assert!(hud_strip_height(hud, ch, cols) > ch, "strip taller than one cell");
         // Status-only is shorter than status+hints.
         assert!(hud_strip_height(hud, ch, cols) > hud_strip_height("status only", ch, cols));
+    }
+}
+
+#[cfg(test)]
+mod present_fit_tests {
+    use super::present_fit;
+
+    #[test_case]
+    fn present_fit_integer_upscales_package_ui() {
+        // 256×192 into a large pane: free scale is non-integer (~4.6×); we
+        // want exact integer blocks so text stays crisp.
+        let (dw, dh) = present_fit(256, 192, 1200, 900);
+        assert_eq!(dw % 256, 0, "width is integer multiple of source");
+        assert_eq!(dh % 192, 0, "height is integer multiple of source");
+        assert_eq!(dw / 256, dh / 192, "uniform scale");
+        assert!(dw / 256 >= 4, "at least 4× on a 1200×900 pane");
+        assert!(dw <= 1200 && dh <= 900);
+    }
+
+    #[test_case]
+    fn present_fit_one_to_one_when_pane_equals_source() {
+        assert_eq!(present_fit(256, 192, 256, 192), (256, 192));
+    }
+
+    #[test_case]
+    fn present_fit_downscales_large_video() {
+        // 1920×1080 into 640×360 — free aspect-fit, not integer upscale.
+        let (dw, dh) = present_fit(1920, 1080, 640, 360);
+        assert!(dw <= 640 && dh <= 360);
+        // Full width or height is used.
+        assert!(dw == 640 || dh == 360);
+        // Aspect preserved: 16:9.
+        assert_eq!(dw * 9, dh * 16);
+    }
+
+    #[test_case]
+    fn present_fit_zero_dims_is_empty() {
+        assert_eq!(present_fit(0, 192, 100, 100), (0, 0));
+        assert_eq!(present_fit(256, 192, 0, 100), (0, 0));
     }
 }
 

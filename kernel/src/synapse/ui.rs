@@ -26,6 +26,10 @@ use core::sync::atomic::{AtomicU32, Ordering};
 pub const SURF_W: usize = 256;
 pub const SURF_H: usize = 192;
 
+/// Longest string a single `text` op may carry (bounded so labels stay `Copy`
+/// and a hostile program can't allocate unboundedly).
+const TEXT_MAX: usize = 48;
+
 /// A surface's intended content kind — a hint for the compositor and a bound the
 /// grant can name. `Board` = chess/dynamic grid; the rest are self-describing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -50,12 +54,32 @@ impl SurfaceKind {
     }
 }
 
+/// Deferred text label. Geometry is in **logical** surface coords (256×192);
+/// the compositor re-rasterizes at the pane's presentation scale so glyphs
+/// match the sharp HUD/console font instead of looking like upscaled pixel soup.
+#[derive(Clone, Copy, Debug)]
+struct TextLabel {
+    x: i32,
+    y: i32,
+    size: i32,
+    color: u32,
+    buf: [u8; TEXT_MAX],
+    len: u8,
+}
+
+/// Cap deferred labels so a hostile draw program can't grow the surface without
+/// bound. Plenty for any real package UI (settings ~30 labels).
+const LABEL_CAP: usize = 96;
+
 struct Surface {
     owner: TaskId,
     #[allow(dead_code)] // recorded for the compositor / future kind-specific layout
     kind: SurfaceKind,
-    /// 0xRRGGBB pixels, row-major, `SURF_W * SURF_H`.
+    /// 0xRRGGBB pixels, row-major, `SURF_W * SURF_H`. Geometry only — text is
+    /// in [`Self::labels`] and painted at present scale.
     back: Vec<u32>,
+    /// Deferred `text` ops (see [`TextLabel`]).
+    labels: Vec<TextLabel>,
     /// Input events the compositor routed to this surface (mouse/keys), drained
     /// by `ui_event_poll`. Empty headless.
     events: VecDeque<UiEvent>,
@@ -90,7 +114,14 @@ pub fn request(owner: TaskId, kind: SurfaceKind) -> u32 {
     SURFACES.with(|m| {
         m.insert(
             id,
-            Surface { owner, kind, back: vec![0u32; SURF_W * SURF_H], events: VecDeque::new(), hud: alloc::string::String::new() },
+            Surface {
+                owner,
+                kind,
+                back: vec![0u32; SURF_W * SURF_H],
+                labels: Vec::new(),
+                events: VecDeque::new(),
+                hud: alloc::string::String::new(),
+            },
         );
     });
     id
@@ -111,7 +142,7 @@ pub fn draw(task: TaskId, id: u32, ops: &str) -> Result<usize, DrawErr> {
             return Err(DrawErr::NotOwner);
         }
         for op in &program {
-            apply(&mut s.back, *op);
+            apply_surface(s, *op);
         }
         Ok(program.len())
     })?;
@@ -181,10 +212,6 @@ pub fn push_event(id: u32, ev: UiEvent) {
 }
 
 // --- the bounded draw-op DSL -------------------------------------------------
-
-/// Longest string a single `text` op may carry (bounded so `DrawOp` stays
-/// `Copy` and a hostile program can't allocate unboundedly).
-const TEXT_MAX: usize = 48;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DrawOp {
@@ -261,13 +288,16 @@ fn put(back: &mut [u32], x: i32, y: i32, color: u32) {
     }
 }
 
-fn apply(back: &mut [u32], op: DrawOp) {
+fn apply_surface(s: &mut Surface, op: DrawOp) {
     match op {
-        DrawOp::Clear(c) => back.iter_mut().for_each(|p| *p = c),
+        DrawOp::Clear(c) => {
+            s.back.iter_mut().for_each(|p| *p = c);
+            s.labels.clear();
+        }
         DrawOp::Rect { x, y, w, h, color } => {
             for dy in 0..h.max(0) {
                 for dx in 0..w.max(0) {
-                    put(back, x + dx, y + dy, color);
+                    put(&mut s.back, x + dx, y + dy, color);
                 }
             }
         }
@@ -280,7 +310,7 @@ fn apply(back: &mut [u32], op: DrawOp) {
             let sy = if y0 < y1 { 1 } else { -1 };
             let mut err = dx + dy;
             loop {
-                put(back, x, y, color);
+                put(&mut s.back, x, y, color);
                 if x == x1 && y == y1 {
                     break;
                 }
@@ -295,34 +325,125 @@ fn apply(back: &mut [u32], op: DrawOp) {
                 }
             }
         }
-        DrawOp::Pixel { x, y, color } => put(back, x, y, color),
-        DrawOp::Text { x, y, size, color, buf, len } => {
-            if let Ok(s) = core::str::from_utf8(&buf[..len as usize]) {
-                draw_text(back, x, y, size, color, s);
+        DrawOp::Pixel { x, y, color } => put(&mut s.back, x, y, color),
+        DrawOp::Text {
+            x,
+            y,
+            size,
+            color,
+            buf,
+            len,
+        } => {
+            // Defer: painted at present scale (see [`present`]). Also bake a
+            // 1× copy into `back` under test so checksums still see ink.
+            if s.labels.len() < LABEL_CAP {
+                s.labels.push(TextLabel {
+                    x,
+                    y,
+                    size,
+                    color,
+                    buf,
+                    len,
+                });
+            }
+            #[cfg(test)]
+            if let Ok(txt) = core::str::from_utf8(&buf[..len as usize]) {
+                draw_text_lo(&mut s.back, x, y, size, color, txt);
             }
         }
     }
 }
 
-/// Rasterize `s` at `(x, y)` (top-left of the line box), `size` = px height,
-/// alpha-blending onto whatever the app already painted. Uses the runtime TTF
-/// rasterizer (`font_ttf`, fontdue on the bundled Geist Mono face) so glyphs
-/// are hinted/antialiased **at the requested size** — downscaling the console's
-/// fixed-cell coverage atlas smeared strokes at small sizes.
-fn draw_text(back: &mut [u32], x: i32, y: i32, size: i32, color: u32, s: &str) {
+/// 1× logical-surface raster (tests / fallback). Display path uses [`present`].
+fn draw_text_lo(back: &mut [u32], x: i32, y: i32, size: i32, color: u32, s: &str) {
     let _ = crate::font_ttf::blit_run(back, SURF_W, SURF_H, x, y, s, size as f32, color);
 }
 
-/// Present a surface's backing buffer into the compositor's action pane. A
-/// best-effort side effect; the backing buffer is the source of truth. If the
-/// surface has HUD text, the compositor reserves a pane-space strip for it
-/// (crisp native font, wrapped) below the scaled surface.
+#[inline]
+fn f32_round_i(v: f32) -> i32 {
+    let f = if v >= 0.0 { v + 0.5 } else { v - 0.5 };
+    f as i32
+}
+
+/// Present geometry (nearest-upscaled) + **re-rasterized** labels at the pane's
+/// presentation scale so text matches the sharp HUD font, not a blown-up 10 px
+/// glyph. The HUD strip itself is still drawn by the compositor.
 #[cfg(not(test))]
 fn present(id: u32) {
-    let snap = SURFACES.with(|m| m.get(&id).map(|s| (s.back.clone(), s.hud.clone())));
-    if let Some((buf, hud)) = snap {
-        crate::framebuffer::present_surface_hud(id, SURF_W, SURF_H, &buf, &hud);
+    let snap = SURFACES.with(|m| {
+        m.get(&id)
+            .map(|s| (s.back.clone(), s.labels.clone(), s.hud.clone()))
+    });
+    let Some((back, labels, hud)) = snap else {
+        return;
+    };
+    // Usable pane (minus HUD strip) so fit matches what present_surface_reserve
+    // will do with the same hud text.
+    let (pw, ph_full) = crate::framebuffer::action_dims_px()
+        .unwrap_or((SURF_W as u64, SURF_H as u64));
+    let reserve = crate::framebuffer::surface_hud_reserve(&hud);
+    let ph = ph_full.saturating_sub(reserve);
+    let (dw, dh) = crate::framebuffer::present_fit(SURF_W as u64, SURF_H as u64, pw, ph);
+    if dw == 0 || dh == 0 {
+        return;
     }
+    let scale_x = dw as f32 / SURF_W as f32;
+    let scale_y = dh as f32 / SURF_H as f32;
+    // Uniform text scale (min axis) so glyphs aren't stretched.
+    let scale_t = if scale_x < scale_y { scale_x } else { scale_y };
+    // Nearest-neighbour upscale of geometry into a presentation buffer, then
+    // paint labels at display resolution with full AA (Geist Mono).
+    let mut full = vec![0u32; (dw * dh) as usize];
+    let dw_u = dw as usize;
+    let dh_u = dh as usize;
+    for dy in 0..dh_u {
+        let sy = (dy as u64 * SURF_H as u64 / dh) as usize;
+        let srow = sy * SURF_W;
+        let drow = dy * dw_u;
+        for dx in 0..dw_u {
+            let sx = (dx as u64 * SURF_W as u64 / dw) as usize;
+            full[drow + dx] = back[srow + sx];
+        }
+    }
+    for lab in &labels {
+        let txt = match core::str::from_utf8(&lab.buf[..lab.len as usize]) {
+            Ok(t) if !t.is_empty() => t,
+            _ => continue,
+        };
+        let px = f32_round_i(lab.x as f32 * scale_x);
+        let py = f32_round_i(lab.y as f32 * scale_y);
+        // Keep a readable floor; logical sizes 8–22 become ~pane-proportional.
+        let psz = {
+            let p = lab.size as f32 * scale_t;
+            if p < 12.0 {
+                12.0
+            } else if p > 64.0 {
+                64.0
+            } else {
+                p
+            }
+        };
+        let _ = crate::font_ttf::blit_run(
+            &mut full,
+            dw_u,
+            dh_u,
+            px,
+            py,
+            txt,
+            psz,
+            lab.color,
+        );
+    }
+    // Buffer is presentation-sized; hit-testing still uses logical 256×192.
+    crate::framebuffer::present_surface_hud_ex(
+        id,
+        SURF_W,
+        SURF_H,
+        dw_u,
+        dh_u,
+        &full,
+        &hud,
+    );
 }
 
 /// Re-present a surface (e.g. after a pane resize / tab switch), from its own
@@ -593,6 +714,35 @@ mod tests {
         assert!(draw(owner, id, long).is_ok());
         assert!(matches!(draw(owner, id, "text 1 2 22 zz oops"), Err(DrawErr::BadOp(_))));
         assert!(matches!(draw(owner, id, "text 1 2"), Err(DrawErr::BadOp(_))));
+        close(owner, id).unwrap();
+    }
+
+    #[test_case]
+    fn text_op_defers_labels_and_bakes_for_tests() {
+        // Live path defers labels for present-scale raster; under test we also
+        // bake 1× ink so checksums still see text, and labels are recorded.
+        reset();
+        let owner = crate::sched::current_task_id();
+        let id = request(owner, SurfaceKind::Canvas);
+        draw(owner, id, "clear 000000; text 8 8 14 ffffff Settings").unwrap();
+        let (n_labels, ink) = SURFACES.with(|m| {
+            let s = m.get(&id).unwrap();
+            let mut ink = 0u32;
+            for y in 4..36 {
+                for x in 4..140 {
+                    if s.back[y * SURF_W + x] != 0 {
+                        ink += 1;
+                    }
+                }
+            }
+            (s.labels.len(), ink)
+        });
+        assert_eq!(n_labels, 1, "text op must be deferred as a label");
+        assert!(ink > 20, "test build still bakes 1× ink for checksums, ink={ink}");
+        // clear drops labels
+        draw(owner, id, "clear 000000").unwrap();
+        let n2 = SURFACES.with(|m| m.get(&id).unwrap().labels.len());
+        assert_eq!(n2, 0);
         close(owner, id).unwrap();
     }
 
