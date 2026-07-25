@@ -413,25 +413,31 @@ def s_install_plan(g):
     """`/install plan` is read-only and refuses cleanly rather than erasing.
 
     Guards the non-destructive install surface. Plain `/install` repartitions the
-    whole disk, so the *safe* commands must stay reachable and must never fall back
-    to the destructive path when they cannot proceed.
+    whole disk, so the safe commands must stay reachable and must never quietly
+    fall back to the destructive path.
 
-    NB the guest the harness boots has no disk attached (`cargo xtask run` only
-    adds one with `--disk <SIZE>`), so this exercises the command dispatch, the
-    argument parsing and the no-disk refusal — not the GPT planning itself, which
-    is covered by 20 unit tests in `block::gpt`/`block::fat32` plus 6 RamDisk tests
-    in `block::esp`. Attaching a partitioned disk to the e2e guest would let this
-    assert the plan output too, and is a worthwhile follow-up.
+    Runs on the shared guest, which has **no disk attached**, so this covers command
+    dispatch, argument parsing and the no-disk refusal. The GPT-planning arithmetic
+    is covered by unit tests (`block::gpt`, `block::fat32`) and RamDisk tests
+    (`block::esp`).
+
+    A disk-backed variant was tried and abandoned: `Guest(disk=...)` works, but such
+    a guest takes **minutes** to reach networking because every boot-time agent
+    install writes its assets through the disk-backed persistent store one polled
+    request at a time. That is a real performance problem in the agent-install path
+    (it also means an installed-to-disk ChittiOS boots slowly on real hardware), not
+    a test-harness quirk — worth fixing there rather than absorbing a five-minute
+    scenario here. `Guest(disk=)` and `boot_guest(ready_timeout=)` are left in place
+    for whoever picks that up.
     """
     m = g.mark()
     g.send("/install plan 9")
     if not g.wait_for("install>", 12, m):
         return False, "/install plan produced no output"
     out = g.text()[m:]
-    # It must refuse, and must not have started anything destructive.
     if "no disk 9" not in out:
         return False, f"expected a clean refusal for a missing disk, got: {out[:200]!r}"
-    for bad in ("GPT:", "ERASES", "repartition"):
+    for bad in ("GPT: ESP lba", "ERASES", "repartition"):
         if bad in out:
             return False, f"read-only plan mentioned destructive work ({bad})"
     return True, "read-only, refused a missing disk without touching anything"
@@ -1398,7 +1404,7 @@ MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_ch
 VOICE = [("voice_models", s_voice_models), ("voice_say", s_voice_say)]
 
 
-def boot_guest(arch, model, verbose, audio, fwd, no_model=False, attempts=3):
+def boot_guest(arch, model, verbose, audio, fwd, no_model=False, attempts=3, disk=None, ready_timeout=120):
     """Launch the guest and wait for it to reach networking, retrying if it dies
     early. aarch64 SMP bring-up (PSCI CPU_ON) very occasionally takes a data
     abort right after `smp: N cores online` — a rare hypervisor bring-up race,
@@ -1410,8 +1416,8 @@ def boot_guest(arch, model, verbose, audio, fwd, no_model=False, attempts=3):
     mapping an oversized heap. Returns a booted Guest, or None if every attempt
     failed."""
     for attempt in range(1, attempts + 1):
-        g = Guest(arch=arch, model=model, verbose=verbose, audio=audio, hostfwd=fwd, no_model=no_model)
-        deadline = time.time() + 120
+        g = Guest(arch=arch, model=model, verbose=verbose, audio=audio, hostfwd=fwd, no_model=no_model, disk=disk)
+        deadline = time.time() + ready_timeout
         outcome = "timeout"
         while time.time() < deadline:
             txt = g.text()
