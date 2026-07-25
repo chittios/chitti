@@ -110,11 +110,28 @@ OS_CMDS = [
 
 
 def make_cmd_scenario(cmd, marker, timeout=15):
+    """A scenario that types `cmd` and waits for `marker` in the guest's output.
+
+    Sends the command a second time if the first produced nothing. The guest's
+    line editor is driven by a cooperative scheduler, so a keystroke that arrives
+    while the shell is mid-print (or while the host is busy running another VM) can
+    sit unread past the timeout — a human would press Enter again, and so does
+    this. Two silent attempts still fail, so a genuinely broken command is not
+    masked; only the timing is forgiven.
+
+    Measured on a host running a second VM: this took `info`, `disks`, `lspci` and
+    `mounts` from failing to passing, none of which had anything to do with the
+    code under test. It is not a cure — `datetime` still flakes there — so a
+    contended host is not a place to read an e2e result from.
+    """
     def fn(g):
-        m = g.mark()
-        g.send(cmd)
-        ok = g.wait_for(marker, timeout, m)
-        return ok, f"{cmd!r} -> {marker!r}" if ok else f"{cmd!r}: no {marker!r}"
+        for attempt in (1, 2):
+            m = g.mark()
+            g.send(cmd)
+            if g.wait_for(marker, timeout, m):
+                suffix = "" if attempt == 1 else " (on the second attempt)"
+                return True, f"{cmd!r} -> {marker!r}{suffix}"
+        return False, f"{cmd!r}: no {marker!r} after two attempts"
     return fn
 
 
@@ -407,6 +424,90 @@ def s_nic_dispatch(g):
     if "10.0.2.15" not in txt:
         return False, f"{driver} claimed {vendor}:{device} but no DHCP lease followed"
     return True, f"{vendor}:{device} -> {driver}, DHCP lease obtained"
+
+
+def s_battery(g):
+    """`/battery` must name the step that stopped it, never invent a reading.
+
+    A VM has no ACPI battery and no embedded controller, so the whole path is
+    expected to fail — the point of the scenario is *how* it fails. The failure
+    mode worth catching is a confident percentage from a machine that has none,
+    because that is exactly what a default-filled `_BST` would produce and what
+    would then appear in the status bar.
+    """
+    # Two attempts, for the same reason `make_cmd_scenario` retries.
+    m = g.mark()
+    for attempt in (1, 2):
+        m = g.mark()
+        g.send("/battery")
+        if g.wait_for("battery>", 15, m):
+            break
+        if attempt == 2:
+            return False, "/battery printed nothing after two attempts"
+    out = g.text()[m:]
+    lines = [l.strip() for l in out.splitlines() if "battery>" in l]
+    invented = [l for l in lines if "battery: " in l and "%" in l]
+    if invented:
+        return False, f"invented a reading in a VM: {invented}"
+    reasons = (
+        "no RSDP",
+        "no DSDT",
+        "no PNP0C0A",
+        "did not evaluate",
+        "no reading",
+        "no usable last-full",
+    )
+    if not any(r in out for r in reasons):
+        return False, f"gave no reason for the absence: {lines}"
+    return True, f"reported absence: {lines[-1][:70]}"
+
+
+def s_power_button(_g):
+    """Press the machine's power button for real and assert a clean shutdown.
+
+    The ACPI fixed-feature power button is a bit in the PM1 status register — x86
+    ACPI legacy hardware, so this only applies to an x86 guest and skips on any
+    other arch (ACPI's reduced-hardware profile, which is what an ARM machine
+    uses, has no fixed-feature registers at all).
+
+    QEMU's `system_powerdown` sets exactly that bit, which makes this the rare
+    laptop-hardware feature that *is* verifiable in a VM. The monitor is reachable
+    without extra plumbing because xtask already runs QEMU with
+    `-serial mon:stdio`: Ctrl+A c switches stdio from the guest serial to the
+    monitor.
+
+    Boots its own guest, because it deliberately ends with the machine off.
+    """
+    if RUN_ARCH != "x86_64":
+        return None, f"skipped (fixed-feature PM1 is x86-only; arch={RUN_ARCH})"
+    g = boot_guest("x86_64", "qwen3.5-0.8b", RUN_VERBOSE, "off", None, no_model=True,
+                   attempts=1, ready_timeout=420)
+    if g is None:
+        return None, "skipped (x86_64 guest would not boot)"
+    try:
+        # The boot ktrace has to say the button was armed; without that the press
+        # below would prove nothing (a machine whose ACPI mode is off, or which uses
+        # a control-method button, correctly refuses to arm).
+        txt = g.text()
+        if "pwrbtn: fixed-feature power button armed" not in txt:
+            reason = next((l.strip() for l in txt.splitlines() if "pwrbtn:" in l), "no pwrbtn: line")
+            return False, f"button not armed: {reason}"
+        m = g.mark()
+        # Ctrl+A c -> QEMU monitor, then press the button.
+        g.send_raw(b"\x01c")
+        time.sleep(0.5)
+        g.send_raw(b"system_powerdown\n")
+        if not g.wait_for("power button pressed", 30, m):
+            return False, "press was not noticed"
+        # And it must actually power off, not just log.
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if g.proc.poll() is not None:
+                return True, "press -> clean shutdown"
+            time.sleep(0.2)
+        return False, "noticed the press but did not power off"
+    finally:
+        g.close()
 
 
 def s_install_plan(g):
@@ -1372,6 +1473,8 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("memory_hierarchy", s_memory_hierarchy),
     ("fs_basic", s_fs_basic),
     ("install_plan", s_install_plan),
+    ("battery", s_battery),
+    ("power_button", s_power_button),
     ("skills_bundled", s_skills_bundled),
     ("plan_mode_and_permissions", s_plan_mode_and_permissions),
     ("todos_pane", s_todos_pane),
@@ -1451,11 +1554,18 @@ def main():
     verbose = "-v" in sys.argv or "--verbose" in sys.argv
     slow = "--slow" in sys.argv or "--full" in sys.argv
     args = [a for a in sys.argv[1:] if a not in ("-v", "--verbose", "--slow", "--full")]
+    only = None
     for i, a in enumerate(args):
         if a == "-arch" and i + 1 < len(args):
             arch = args[i + 1]
         if a == "-model" and i + 1 < len(args):
             model = args[i + 1]
+        # `--only a,b` runs just those scenarios. Development affordance: the full
+        # os+agents+net sweep is ~30 min, which is too slow a loop for iterating on
+        # one scenario, and an unrecognised flag used to be silently ignored — so a
+        # typo ran everything instead of saying so.
+        if a == "--only" and i + 1 < len(args):
+            only = [n.strip() for n in args[i + 1].split(",") if n.strip()]
     RUN_ARCH, RUN_VERBOSE = arch, verbose
 
     have_tls = ssl.HAS_TLSv1_3 and ensure_cert()
@@ -1483,6 +1593,16 @@ def main():
         else:
             print("  (voice scenarios skipped — assets/voice/ absent)")
     scenarios += list(FINAL)
+
+    if only:
+        known = {n for n, _ in scenarios}
+        unknown = [n for n in only if n not in known]
+        if unknown:
+            print(f"e2e: unknown scenario(s) {unknown}; known: {sorted(known)}")
+            return 2
+        # Keep the declared order (FINAL still last), not the order given.
+        scenarios = [(n, f) for (n, f) in scenarios if n in only]
+        print(f"e2e: --only {[n for n, _ in scenarios]}")
 
     # Voice needs a sound device; give the guest a silent audio backend then.
     audio = "none" if (slow and have_voice) else "off"
