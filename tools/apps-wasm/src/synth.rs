@@ -1,6 +1,6 @@
-use crate::guest::{hud_status, json_i32, sound_play, ui_draw};
+use crate::guest::{hud_status, json_i32, sound_play, text_op, ui_draw};
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 
 /// One octave, C4..C5. White keys left→right; rows: (key char, frequency Hz).
 const WHITE: [(char, i32); 8] = [
@@ -41,8 +41,11 @@ fn paint(pressed: i32) {
         let x = i * KEY_W;
         let c = if pressed == i { "cc785c" } else { "e8e4df" };
         ops.push_str(&format!("rect {} {TOP} {} {WHITE_H} {c}; ", x + 1, KEY_W - 2));
+        let (ch, _) = WHITE[i as usize];
+        let tc = if pressed == i { "e8e4df" } else { "1a1816" };
+        text_op(&mut ops, x + 10, TOP + WHITE_H - 28, 12, tc, &ch.to_string());
     }
-    for (bi, (_, _, after)) in BLACK.iter().enumerate() {
+    for (bi, (ch, _, after)) in BLACK.iter().enumerate() {
         let x = (after + 1) * KEY_W - BLACK_W / 2;
         let c = if pressed == 8 + bi as i32 {
             "cc785c"
@@ -50,9 +53,19 @@ fn paint(pressed: i32) {
             "2c2926"
         };
         ops.push_str(&format!("rect {x} {TOP} {BLACK_W} {BLACK_H} {c}; "));
+        text_op(
+            &mut ops,
+            x + 4,
+            TOP + 8,
+            10,
+            "e8e4df",
+            &ch.to_string(),
+        );
     }
     // Legend strip under the keys.
     ops.push_str("rect 0 0 256 12 3a3632; rect 0 180 256 12 3a3632; ");
+    text_op(&mut ops, 8, 0, 10, "e8e4df", "Synth");
+    text_op(&mut ops, 8, 180, 9, "a8a4a0", "a s d f g h j k  ·  w e t y u");
     ui_draw(&ops);
 }
 

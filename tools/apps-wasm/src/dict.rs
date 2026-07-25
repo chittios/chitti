@@ -1,6 +1,6 @@
 //! Dict — tiny offline glossary + durable custom entries.
 
-use crate::guest::{json_str, storage_get_durable, storage_set_durable, ui_draw};
+use crate::guest::{hud_status, json_str, storage_get_durable, storage_set_durable, text_op, ui_draw};
 use alloc::format;
 use alloc::string::{String, ToString};
 
@@ -22,22 +22,40 @@ static mut HIT: i32 = -1;
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 16 3a3632; ");
+    text_op(&mut ops, 8, 1, 12, "e8e4df", "Dictionary");
     // Query bar.
     ops.push_str("rect 8 24 240 20 2c2926; ");
-    let qw = (unsafe { QLEN } as i32 * 6).min(230);
-    ops.push_str(&format!("rect 12 28 {qw} 12 cc785c; "));
+    let q = query_str();
+    if q.is_empty() {
+        text_op(&mut ops, 12, 27, 11, "a8a4a0", "type a word…");
+    } else {
+        text_op(&mut ops, 12, 27, 11, "e8e4df", &q);
+    }
     // Results list.
     for i in 0..BUILTIN.len().min(8) {
-        let y = 56 + i as i32 * 14;
+        let y = 52 + i as i32 * 14;
         let c = if unsafe { HIT } == i as i32 {
             "5a8f5a"
         } else {
             "3a3632"
         };
         ops.push_str(&format!("rect 8 {y} 240 12 {c}; "));
+        text_op(&mut ops, 12, y + 1, 10, "e8e4df", BUILTIN[i].0);
+    }
+    // Definition for hit.
+    if unsafe { HIT } >= 0 {
+        let i = unsafe { HIT } as usize;
+        if i < BUILTIN.len() {
+            text_op(&mut ops, 8, 168, 9, "a8a4a0", BUILTIN[i].1);
+        }
     }
     ops.push_str("rect 0 176 256 16 3a3632; ");
+    text_op(&mut ops, 8, 178, 10, "a8a4a0", "type letters  enter lookup  esc clear");
     ui_draw(&ops);
+    hud_status(
+        &format!("dict  q={}  hit={}", q, unsafe { HIT }),
+        "type letters  enter lookup  esc clear",
+    );
 }
 
 fn query_str() -> String {

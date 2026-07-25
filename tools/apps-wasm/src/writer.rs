@@ -1,6 +1,6 @@
 //! Writer — long-form document in durable storage (`doc_main`).
 
-use crate::guest::{json_str, storage_get_durable, storage_set_durable, ui_draw};
+use crate::guest::{hud_status, json_str, storage_get_durable, storage_set_durable, text_op, ui_draw};
 use alloc::format;
 use alloc::string::{String, ToString};
 
@@ -38,10 +38,32 @@ fn save() {
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 16 3a3632; ");
+    text_op(
+        &mut ops,
+        8,
+        1,
+        12,
+        "e8e4df",
+        &format!("Writer  {} bytes", unsafe { DOC_LEN }),
+    );
     ops.push_str("rect 8 24 240 148 2c2926; ");
-    // Represent text as wrapped bars by line.
+    // Draw wrapped lines as host text (max ~36 cols, 12 rows).
     unsafe {
         let text = core::str::from_utf8(&DOC[..DOC_LEN]).unwrap_or("");
+        let mut lines: [String; 12] = [
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ];
         let mut line = 0i32;
         let mut col = 0i32;
         let skip = SCROLL as i32;
@@ -59,10 +81,8 @@ fn paint() {
             if line >= 12 {
                 break;
             }
-            let x = 12 + col * 6;
-            let y = 28 + line * 12;
-            if x < 240 {
-                ops.push_str(&format!("rect {x} {y} 4 8 e8e4df; "));
+            if col < 36 {
+                lines[line as usize].push(ch);
             }
             col += 1;
             if col > 36 {
@@ -70,12 +90,25 @@ fn paint() {
                 col = 0;
             }
         }
-        // Cursor.
+        for (i, ln) in lines.iter().enumerate() {
+            if !ln.is_empty() {
+                text_op(&mut ops, 12, 28 + i as i32 * 12, 10, "e8e4df", ln);
+            }
+        }
+        if DOC_LEN == 0 {
+            text_op(&mut ops, 12, 80, 11, "a8a4a0", "(type to write…)");
+        }
+        // Cursor bar.
         let cy = 28 + ((CURSOR.min(DOC_LEN) as i32 / 36) - skip).max(0) * 12;
         ops.push_str(&format!("rect 12 {cy} 2 10 cc785c; "));
     }
     ops.push_str("rect 0 176 256 16 3a3632; ");
+    text_op(&mut ops, 8, 178, 10, "a8a4a0", "type  backspace  enter  s save");
     ui_draw(&ops);
+    hud_status(
+        &format!("writer  {} bytes", unsafe { DOC_LEN }),
+        "type  backspace  enter  s save",
+    );
 }
 
 pub fn start(_: &str) -> String {

@@ -2516,6 +2516,43 @@ fn approval_mode() -> ApprovalMode {
     }
 }
 
+/// Live approval mode name (`manual` / `auto` / `bypass` / `plan`) for the
+/// settings package UI and status chrome.
+pub fn approval_mode_name() -> &'static str {
+    match approval_mode() {
+        ApprovalMode::Manual => "manual",
+        ApprovalMode::Auto => "auto",
+        ApprovalMode::Bypass => "bypass",
+        ApprovalMode::Plan => "plan",
+    }
+}
+
+/// Set approval mode by name (same vocabulary as `/mode`). Returns false on
+/// unknown names. Used by the settings package-UI host import so a human click
+/// in the settings app applies the same state as the shell command.
+pub fn set_approval_mode_name(name: &str) -> bool {
+    use core::sync::atomic::Ordering;
+    match name.trim() {
+        "manual" | "0" => {
+            MODE.store(0, Ordering::Relaxed);
+            true
+        }
+        "auto" | "1" => {
+            MODE.store(1, Ordering::Relaxed);
+            true
+        }
+        "bypass" | "2" => {
+            MODE.store(2, Ordering::Relaxed);
+            true
+        }
+        "plan" | "3" => {
+            MODE.store(3, Ordering::Relaxed);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Enter / exit plan mode (also exposed as tools for the agent).
 pub fn set_plan_mode(on: bool) {
     use core::sync::atomic::Ordering;

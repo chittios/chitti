@@ -21,8 +21,10 @@
 //! | `host_storage_{get,set,remove,list}` | [`crate::agent::storage`] for `agent_id` |
 //! | `host_board_set` / `host_board_mark` | Synapse UI (task + surface ownership) |
 //! | `host_ui_draw` | raw draw-ops string |
+//! | `host_hud_set` | reserved pane HUD strip |
 //! | `host_surface_id` | active surface for this binding |
 //! | `host_now_ms` / `host_log` | clock + ktrace |
+//! | `host_sys_{get,set}` | shell theme / approval mode / opacity (settings UI) | |
 //!
 //! # Security
 //!
@@ -713,7 +715,115 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
         )
         .map_err(|_| "define host_sound_play")?;
 
+    // host_sys_set(key, val) / host_sys_get(key, out) — apply or read OS UI
+    // preferences from the settings package. Keys: theme, mode, opacity.
+    // Requires a real agent binding so unbound page instances cannot flip mode.
+    linker
+        .func_wrap(
+            "chitti",
+            "host_sys_set",
+            |mut caller: Caller<'_, HostState>,
+             k_ptr: i32,
+             k_len: i32,
+             v_ptr: i32,
+             v_len: i32|
+             -> i32 {
+                if caller.data().bind.agent_id == 0 {
+                    caller.data_mut().last_error = Some("sys_set: no agent binding");
+                    return -3;
+                }
+                let Some(key) = read_guest_str(&caller, k_ptr, k_len) else {
+                    return -1;
+                };
+                let Some(val) = read_guest_str(&caller, v_ptr, v_len) else {
+                    return -1;
+                };
+                match apply_sys_pref(&key, &val) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        caller.data_mut().last_error = Some(e);
+                        -2
+                    }
+                }
+            },
+        )
+        .map_err(|_| "define host_sys_set")?;
+
+    linker
+        .func_wrap(
+            "chitti",
+            "host_sys_get",
+            |mut caller: Caller<'_, HostState>,
+             k_ptr: i32,
+             k_len: i32,
+             out_ptr: i32,
+             out_cap: i32|
+             -> i32 {
+                let Some(key) = read_guest_str(&caller, k_ptr, k_len) else {
+                    return -1;
+                };
+                let Some(val) = read_sys_pref(&key) else {
+                    return -2;
+                };
+                if out_ptr < 0 || out_cap < 0 {
+                    return -1;
+                }
+                let bytes = val.as_bytes();
+                let n = bytes.len().min(out_cap as usize);
+                if write_guest_bytes(&mut caller, out_ptr, &bytes[..n]).is_err() {
+                    return -1;
+                }
+                n as i32
+            },
+        )
+        .map_err(|_| "define host_sys_get")?;
+
     Ok(())
+}
+
+/// Apply a settings-app preference to live shell/UI state.
+fn apply_sys_pref(key: &str, val: &str) -> Result<(), &'static str> {
+    match key {
+        "theme" => {
+            let name = val.trim();
+            if name.is_empty() {
+                return Err("empty theme");
+            }
+            crate::theme::apply(name).map_err(|_| "theme apply failed")
+        }
+        "mode" => {
+            if crate::shell::set_approval_mode_name(val) {
+                Ok(())
+            } else {
+                Err("unknown mode")
+            }
+        }
+        "opacity" => {
+            let parsed: u64 = val.trim().parse().map_err(|_| "bad opacity")?;
+            let o = parsed.min(255);
+            let mut cfg = crate::ui_config::current();
+            cfg.opacity = o;
+            crate::ui_config::set_config(cfg);
+            Ok(())
+        }
+        _ => Err("unknown sys key"),
+    }
+}
+
+fn read_sys_pref(key: &str) -> Option<String> {
+    match key {
+        "theme" => {
+            let name = crate::ui_config::current().theme_name;
+            Some(if name.is_empty() {
+                String::from("dark")
+            } else {
+                name
+            })
+        }
+        "mode" => Some(String::from(crate::shell::approval_mode_name())),
+        "opacity" => Some(format!("{}", crate::ui_config::current().opacity)),
+        _ => None,
+    }
 }
 
 fn scope_from_i32(s: i32) -> StorageScope {

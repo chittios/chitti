@@ -1,8 +1,8 @@
 //! Contacts — durable address book (`contact_<id>`).
 
 use crate::guest::{
-    json_str, storage_get_durable, storage_list_durable, storage_remove_durable,
-    storage_set_durable, ui_draw,
+    hud_status, json_str, storage_get_durable, storage_list_durable, storage_remove_durable,
+    storage_set_durable, text_op, ui_draw,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -56,18 +56,34 @@ fn sel_name() -> String {
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 16 3a3632; ");
+    text_op(
+        &mut ops,
+        8,
+        1,
+        12,
+        "e8e4df",
+        &format!("Contacts  {}", unsafe { NKEYS }),
+    );
     ops.push_str("rect 8 24 240 144 2c2926; ");
     unsafe {
+        if NKEYS == 0 {
+            text_op(&mut ops, 20, 80, 12, "a8a4a0", "(no contacts yet)");
+        }
         for i in 0..NKEYS.min(8) {
             let y = 28 + i as i32 * 18;
             let c = if i as i32 == SEL { "cc785c" } else { "5a5652" };
             ops.push_str(&format!("rect 12 {y} 232 16 {c}; "));
-            let w = (KEY_LEN[i] as i32 * 3).min(200);
-            ops.push_str(&format!("rect 16 {} {w} 8 e8e4df; ", y + 4));
+            let name = core::str::from_utf8(&KEYS[i][..KEY_LEN[i] as usize]).unwrap_or("?");
+            text_op(&mut ops, 16, y + 2, 11, "e8e4df", name);
         }
     }
     ops.push_str("rect 0 176 256 16 3a3632; ");
+    text_op(&mut ops, 8, 178, 10, "a8a4a0", "arrows select  d delete  r reload");
     ui_draw(&ops);
+    hud_status(
+        &format!("contacts  {}  {}", unsafe { NKEYS }, sel_name()),
+        "arrows select  d delete  r reload",
+    );
 }
 
 pub fn start(_: &str) -> String {

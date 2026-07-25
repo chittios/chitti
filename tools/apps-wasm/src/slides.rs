@@ -1,4 +1,4 @@
-use crate::guest::{hud_status, ui_draw};
+use crate::guest::{hud_status, text_op, ui_draw};
 use alloc::format;
 use alloc::string::String;
 
@@ -16,18 +16,26 @@ fn paint() {
     let n = SLIDES.len();
     let i = unsafe { IDX.min(n - 1) };
     let (title, body, color) = SLIDES[i];
-    let mut ops = format!("clear 1a1816; rect 0 0 256 48 {color}; rect 16 64 224 96 {color}; ");
+    let mut ops = format!("clear 1a1816; rect 0 0 256 48 {color}; rect 16 64 224 96 2c2926; ");
+    text_op(&mut ops, 16, 12, 18, "e8e4df", title);
+    text_op(&mut ops, 24, 96, 12, "e8e4df", body);
+    text_op(
+        &mut ops,
+        24,
+        120,
+        10,
+        "a8a4a0",
+        &format!("{}/{}", i + 1, n),
+    );
     let slot = 256 / n as i32;
     for k in 0..n {
         let x = k as i32 * slot + 4;
         let c = if k == i { "e8e4df" } else { "3a3632" };
         ops.push_str(&format!("rect {x} 176 {} 8 {c}; ", (slot - 8).max(4)));
     }
-    let _ = (title, body); // titles shown via host log optional
     ui_draw(&ops);
-    let (t, b, _) = SLIDES[i];
     hud_status(
-        &format!("slides  {}/{}  {t} — {b}", i + 1, n),
+        &format!("slides  {}/{}  {title} — {body}", i + 1, n),
         SHORTCUTS,
     );
 }

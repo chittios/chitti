@@ -1,8 +1,8 @@
 //! Files — durable-storage browser (virtual FS under agent storage).
 
 use crate::guest::{
-    json_str, storage_get_durable, storage_list_durable, storage_remove_durable,
-    storage_set_durable, ui_draw,
+    hud_status, json_str, storage_get_durable, storage_list_durable, storage_remove_durable,
+    storage_set_durable, text_op, ui_draw,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -89,8 +89,17 @@ fn load_preview() {
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 16 3a3632; "); // title bar
+    text_op(
+        &mut ops,
+        8,
+        1,
+        12,
+        "e8e4df",
+        &format!("Files  {} entries", unsafe { NKEYS }),
+    );
     ops.push_str("rect 0 16 120 160 2c2926; "); // list
     ops.push_str("rect 124 16 128 160 2c2926; "); // preview
+    text_op(&mut ops, 128, 20, 10, "a8a4a0", "preview");
     unsafe {
         let start = SCROLL as usize;
         for i in 0..8 {
@@ -101,17 +110,37 @@ fn paint() {
             let y = 20 + i as i32 * 18;
             let c = if idx as i32 == SEL { "cc785c" } else { "5a5652" };
             ops.push_str(&format!("rect 4 {y} 112 16 {c}; "));
-            // Length bar as name stand-in.
-            let w = (KEY_LEN[idx] as i32 * 2).min(100);
-            ops.push_str(&format!("rect 8 {} {w} 8 e8e4df; ", y + 4));
+            let name = core::str::from_utf8(&KEYS[idx][..KEY_LEN[idx] as usize]).unwrap_or("?");
+            // Truncate long names for the narrow list column.
+            let shown = if name.len() > 14 { &name[..14] } else { name };
+            text_op(&mut ops, 8, y + 2, 10, "e8e4df", shown);
         }
         if PREVIEW_LEN > 0 {
-            let w = (PREVIEW_LEN as i32 / 2).min(120);
-            ops.push_str(&format!("rect 128 24 {w} 12 5a8f5a; "));
+            let prev =
+                core::str::from_utf8(&PREVIEW[..PREVIEW_LEN.min(48)]).unwrap_or("(binary)");
+            // Wrap preview into a few short lines.
+            let mut row = 0i32;
+            let mut col = 0usize;
+            let bytes = prev.as_bytes();
+            while col < bytes.len() && row < 10 {
+                let end = (col + 16).min(bytes.len());
+                if let Ok(chunk) = core::str::from_utf8(&bytes[col..end]) {
+                    text_op(&mut ops, 128, 36 + row * 12, 10, "e8e4df", chunk);
+                }
+                col = end;
+                row += 1;
+            }
+        } else {
+            text_op(&mut ops, 128, 40, 10, "a8a4a0", "(empty)");
         }
     }
     ops.push_str("rect 0 176 256 16 3a3632; ");
+    text_op(&mut ops, 8, 178, 10, "a8a4a0", "arrows select  d delete  r reload");
     ui_draw(&ops);
+    hud_status(
+        &format!("files  {}  sel={}", unsafe { NKEYS }, selected_name()),
+        "arrows select  enter open  d delete  r reload",
+    );
 }
 
 pub fn start(_: &str) -> String {

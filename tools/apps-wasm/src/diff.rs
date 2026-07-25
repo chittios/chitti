@@ -1,6 +1,6 @@
 //! Diff — compare two durable text blobs side by side.
 
-use crate::guest::{json_str, storage_get_durable, storage_set_durable, ui_draw};
+use crate::guest::{hud_status, json_str, storage_get_durable, storage_set_durable, text_op, ui_draw};
 use alloc::format;
 use alloc::string::{String, ToString};
 
@@ -13,18 +13,20 @@ static mut SCROLL: usize = 0;
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 16 3a3632; ");
+    text_op(&mut ops, 8, 1, 12, "e8e4df", "Diff  A | B");
     ops.push_str("rect 4 20 122 150 2c2926; ");
     ops.push_str("rect 130 20 122 150 2c2926; ");
-    // Line-ish bars: green equal, red differ, grey missing.
+    text_op(&mut ops, 8, 22, 10, "a8a4a0", "A");
+    text_op(&mut ops, 134, 22, 10, "a8a4a0", "B");
     unsafe {
         let lines = ALEN.max(BLEN).div_ceil(16).max(1);
         let start = SCROLL;
-        for i in 0..12usize {
+        for i in 0..10usize {
             let li = start + i;
             if li >= lines {
                 break;
             }
-            let y = 24 + i as i32 * 12;
+            let y = 36 + i as i32 * 12;
             let a_off = li * 16;
             let b_off = li * 16;
             let a_slice = if a_off < ALEN {
@@ -52,14 +54,23 @@ fn paint() {
             } else {
                 "aa3333"
             };
-            let wa = (a_slice.len() as i32 * 6).min(110);
-            let wb = (b_slice.len() as i32 * 6).min(110);
-            ops.push_str(&format!("rect 8 {y} {wa} 8 {ca}; "));
-            ops.push_str(&format!("rect 134 {y} {wb} 8 {cb}; "));
+            ops.push_str(&format!("rect 8 {y} 114 10 {ca}; "));
+            ops.push_str(&format!("rect 134 {y} 114 10 {cb}; "));
+            let as_ = core::str::from_utf8(a_slice).unwrap_or(".");
+            let bs = core::str::from_utf8(b_slice).unwrap_or(".");
+            let as_ = if as_.len() > 14 { &as_[..14] } else { as_ };
+            let bs = if bs.len() > 14 { &bs[..14] } else { bs };
+            text_op(&mut ops, 10, y, 9, "e8e4df", as_);
+            text_op(&mut ops, 136, y, 9, "e8e4df", bs);
         }
     }
     ops.push_str("rect 0 176 256 16 3a3632; ");
+    text_op(&mut ops, 8, 178, 10, "a8a4a0", "arrows scroll");
     ui_draw(&ops);
+    hud_status(
+        &format!("diff  a={} b={} bytes", unsafe { ALEN }, unsafe { BLEN }),
+        "arrows scroll",
+    );
 }
 
 fn load_pair() {

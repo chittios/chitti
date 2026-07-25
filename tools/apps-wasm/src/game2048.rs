@@ -1,7 +1,7 @@
 //! 2048 — classic sliding puzzle on a 4×4 grid.
 
 use crate::endscreen::{self, Outcome};
-use crate::guest::{hud_status, ui_draw};
+use crate::guest::{hud_status, text_op, ui_draw};
 use alloc::format;
 use alloc::string::String;
 
@@ -13,6 +13,14 @@ static mut OVER: u8 = 0;
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 16 3a3632; ");
+    text_op(
+        &mut ops,
+        8,
+        1,
+        12,
+        "e8e4df",
+        &format!("2048  score {}", unsafe { SCORE }),
+    );
     let cell = 44;
     let ox = 40;
     let oy = 24;
@@ -37,6 +45,26 @@ fn paint() {
                     _ => "e8e4df",
                 };
                 ops.push_str(&format!("rect {x} {y} 40 40 {color}; "));
+                if v != 0 {
+                    let tc = if v >= 8 && v < 2048 {
+                        "e8e4df"
+                    } else if v >= 2048 {
+                        "1a1816"
+                    } else {
+                        "e8e4df"
+                    };
+                    let label = format!("{v}");
+                    let lx = x + if v >= 1000 {
+                        2
+                    } else if v >= 100 {
+                        6
+                    } else if v >= 10 {
+                        10
+                    } else {
+                        14
+                    };
+                    text_op(&mut ops, lx, y + 10, 14, tc, &label);
+                }
             }
         }
         if OVER != 0 {

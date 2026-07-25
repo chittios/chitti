@@ -1,6 +1,6 @@
-//! Clock / stopwatch / timer — uses host_now_ms for wall-ish ticks.
+//! Clock / stopwatch / timer — digital labels via host text draw-ops.
 
-use crate::guest::{json_i32, ui_draw};
+use crate::guest::{hud_status, json_i32, text_op, ui_draw};
 use alloc::format;
 use alloc::string::String;
 
@@ -14,6 +14,8 @@ static mut TMR_DEADLINE: i64 = 0;
 static mut TMR_RUN: u8 = 0;
 static mut PHASE: u8 = 0;
 
+const TABS: [&str; 3] = ["Clock", "Watch", "Timer"];
+
 fn now() -> i64 {
     crate::guest::now_ms()
 }
@@ -21,28 +23,32 @@ fn now() -> i64 {
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     let mode = unsafe { MODE };
-    // Mode tabs.
+    // Mode tabs with labels.
     for i in 0..3i32 {
         let x = 8 + i * 80;
         let c = if mode as i32 == i { "cc785c" } else { "3a3632" };
-        ops.push_str(&format!("rect {x} 8 72 20 {c}; "));
+        ops.push_str(&format!("rect {x} 8 72 22 {c}; "));
+        text_op(&mut ops, x + 10, 11, 12, "e8e4df", TABS[i as usize]);
     }
     // Face.
     ops.push_str("rect 48 40 160 120 2c2926; ");
-    let status_bar = match mode {
+    let (main, sub) = match mode {
         0 => {
-            // Digital bars from time-of-day ms (host may be virtual).
             let ms = now();
             let sec = ((ms / 1000) % 60) as i32;
             let min = ((ms / 60_000) % 60) as i32;
             let hr = ((ms / 3_600_000) % 24) as i32;
+            let main = format!("{hr:02}:{min:02}:{sec:02}");
+            text_op(&mut ops, 64, 72, 22, "e8e4df", &main);
+            text_op(&mut ops, 72, 110, 12, "a8a4a0", "host clock");
+            // Small progress bars under the digits.
             let hx = 56 + (hr % 12) * 12;
             let mx = 56 + min * 2;
             let sx = 56 + sec * 2;
-            ops.push_str(&format!("rect {hx} 56 8 40 e8e4df; "));
-            ops.push_str(&format!("rect {mx} 100 4 48 5a8f5a; "));
-            ops.push_str(&format!("rect {sx} 140 2 16 cc785c; "));
-            format!("clock ~{hr:02}:{min:02}:{sec:02}")
+            ops.push_str(&format!("rect {hx} 140 8 8 e8e4df; "));
+            ops.push_str(&format!("rect {mx} 140 4 8 5a8f5a; "));
+            ops.push_str(&format!("rect {sx} 140 2 8 cc785c; "));
+            (main, String::from("clock"))
         }
         1 => {
             let elapsed = unsafe {
@@ -52,9 +58,24 @@ fn paint() {
                     SW_ACC
                 }
             };
+            let cs = elapsed / 10; // centiseconds
+            let sec = (cs / 100) % 60;
+            let min = (cs / 6_000) % 60;
+            let hr = cs / 360_000;
+            let frac = cs % 100;
+            let main = format!("{hr:02}:{min:02}:{sec:02}.{frac:02}");
+            text_op(&mut ops, 56, 72, 18, "e8e4df", &main);
+            let state = if unsafe { SW_RUN } != 0 {
+                "running"
+            } else if elapsed > 0 {
+                "paused"
+            } else {
+                "ready"
+            };
+            text_op(&mut ops, 88, 110, 12, "a8a4a0", state);
             let w = ((elapsed / 100) % 220) as i32 + 8;
-            ops.push_str(&format!("rect 56 80 {w} 24 5a8f5a; "));
-            format!("stopwatch {} ms", elapsed)
+            ops.push_str(&format!("rect 56 140 {w} 8 5a8f5a; "));
+            (main, format!("stopwatch {state}"))
         }
         _ => {
             let left = unsafe {
@@ -64,16 +85,38 @@ fn paint() {
                     TMR_LEFT
                 }
             };
+            let sec = left / 1000;
+            let main = format!("{sec:03} s");
+            let c = if left == 0 { "aa3333" } else { "e8e4df" };
+            text_op(&mut ops, 88, 72, 22, c, &main);
+            let state = if left == 0 {
+                "done"
+            } else if unsafe { TMR_RUN } != 0 {
+                "running"
+            } else {
+                "ready"
+            };
+            text_op(&mut ops, 88, 110, 12, "a8a4a0", state);
             let w = ((left / 1000).min(220)) as i32;
-            let c = if left == 0 { "aa3333" } else { "6688cc" };
-            ops.push_str(&format!("rect 56 80 {w} 24 {c}; "));
-            format!("timer {} s left", left / 1000)
+            let bc = if left == 0 { "aa3333" } else { "6688cc" };
+            ops.push_str(&format!("rect 56 140 {w} 8 {bc}; "));
+            (main, format!("timer {state}"))
         }
     };
-    // Controls strip.
     ops.push_str("rect 8 168 240 16 3a3632; ");
-    let _ = status_bar;
+    text_op(
+        &mut ops,
+        12,
+        170,
+        10,
+        "a8a4a0",
+        "space start/stop  r reset  +/- timer",
+    );
     ui_draw(&ops);
+    hud_status(
+        &format!("clock  {sub}  {main}"),
+        "1-3 modes  space start/stop  r reset  +/- timer",
+    );
 }
 
 pub fn start(_: &str) -> String {
@@ -95,7 +138,6 @@ pub fn on_click(x: i32, y: i32) -> String {
         paint();
         return format!("ok:mode={tab}");
     }
-    // Toggle run in middle.
     on_key("space")
 }
 

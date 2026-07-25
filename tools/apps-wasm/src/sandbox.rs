@@ -1,7 +1,8 @@
 //! Sandbox lab — teaches capability attenuation with home-only storage demos.
 
 use crate::guest::{
-    json_str, storage_get_durable, storage_list_durable, storage_set_durable, ui_draw,
+    hud_status, json_str, storage_get_durable, storage_list_durable, storage_set_durable, text_op,
+    ui_draw,
 };
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -41,7 +42,9 @@ fn push_log(s: &str) {
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 16 3a3632; ");
+    text_op(&mut ops, 8, 1, 12, "e8e4df", "Sandbox lab");
     // Tabs: overview / home / escape / child
+    let tabs = ["Over", "Home", "Esc", "Child"];
     for i in 0..4i32 {
         let x = 8 + i * 60;
         let c = if unsafe { PANEL } as i32 == i {
@@ -50,47 +53,85 @@ fn paint() {
             "3a3632"
         };
         ops.push_str(&format!("rect {x} 20 56 16 {c}; "));
+        text_op(&mut ops, x + 6, 22, 10, "e8e4df", tabs[i as usize]);
     }
     // Body.
     ops.push_str("rect 8 44 240 100 2c2926; ");
     match unsafe { PANEL } {
         0 => {
-            // allows vs denies bars
             let aw = (unsafe { ALLOWS }.min(20) as i32) * 10;
             let dw = (unsafe { DENIES }.min(20) as i32) * 10;
             ops.push_str(&format!("rect 16 56 {aw} 16 5a8f5a; "));
             ops.push_str(&format!("rect 16 80 {dw} 16 aa3333; "));
+            text_op(
+                &mut ops,
+                20,
+                58,
+                11,
+                "e8e4df",
+                &format!("allows {}", unsafe { ALLOWS }),
+            );
+            text_op(
+                &mut ops,
+                20,
+                82,
+                11,
+                "e8e4df",
+                &format!("denies {}", unsafe { DENIES }),
+            );
             if unsafe { CHILD } != 0 {
                 ops.push_str("rect 16 110 80 16 6688cc; ");
+                text_op(&mut ops, 24, 112, 10, "e8e4df", "child on");
             }
         }
         1 => {
-            // home write success strip
             ops.push_str("rect 24 60 200 40 5a8f5a; ");
+            text_op(&mut ops, 40, 72, 12, "e8e4df", "home write OK");
         }
         2 => {
-            // escape denied
             ops.push_str("rect 24 60 200 40 aa3333; ");
+            text_op(&mut ops, 40, 72, 12, "e8e4df", "escape DENIED");
         }
         _ => {
-            // child sandbox
             let c = if unsafe { CHILD } != 0 {
                 "6688cc"
             } else {
                 "5a5652"
             };
             ops.push_str(&format!("rect 24 60 200 40 {c}; "));
+            text_op(
+                &mut ops,
+                40,
+                72,
+                12,
+                "e8e4df",
+                if unsafe { CHILD } != 0 {
+                    "child active"
+                } else {
+                    "child idle"
+                },
+            );
         }
     }
     // Log lines.
     unsafe {
         for i in 0..NLOG.min(4) {
-            let y = 150 + i as i32 * 8;
-            let w = (LLEN[i] as i32 * 3).min(230);
-            ops.push_str(&format!("rect 12 {y} {w} 6 5a5652; "));
+            let y = 148 + i as i32 * 10;
+            let s = core::str::from_utf8(&LOG[i][..LLEN[i] as usize]).unwrap_or("");
+            let shown = if s.len() > 36 { &s[..36] } else { s };
+            text_op(&mut ops, 12, y, 9, "a8a4a0", shown);
         }
     }
     ui_draw(&ops);
+    hud_status(
+        &format!(
+            "sandbox  panel={}  allows={}  denies={}",
+            unsafe { PANEL },
+            unsafe { ALLOWS },
+            unsafe { DENIES }
+        ),
+        "1-4 panels  h home  e escape  c child",
+    );
 }
 
 pub fn start(_: &str) -> String {

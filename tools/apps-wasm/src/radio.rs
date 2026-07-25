@@ -1,6 +1,8 @@
 //! Radio — station list + tone “playback” via host_sound_play.
 
-use crate::guest::{json_str, sound_play, storage_get_durable, storage_set_durable, ui_draw};
+use crate::guest::{
+    hud_status, json_str, sound_play, storage_get_durable, storage_set_durable, text_op, ui_draw,
+};
 use alloc::format;
 use alloc::string::{String, ToString};
 
@@ -20,10 +22,25 @@ static mut VOL: u8 = 5;
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 16 3a3632; ");
+    let (name, hz) = STATIONS[unsafe { SEL }.min(STATIONS.len() - 1)];
+    let state = if unsafe { PLAYING } != 0 {
+        "ON AIR"
+    } else {
+        "paused"
+    };
+    text_op(
+        &mut ops,
+        8,
+        1,
+        12,
+        "e8e4df",
+        &format!("Radio  {name}  {state}"),
+    );
     // Dial.
     ops.push_str("rect 16 24 224 48 2c2926; ");
     let dial = 20 + (unsafe { SEL } as i32 * 34);
     ops.push_str(&format!("rect {dial} 36 24 24 cc785c; "));
+    text_op(&mut ops, 24, 40, 14, "e8e4df", &format!("{hz} Hz"));
     // Station list.
     for (i, (name, hz)) in STATIONS.iter().enumerate() {
         let y = 84 + i as i32 * 14;
@@ -37,13 +54,31 @@ fn paint() {
             "3a3632"
         };
         ops.push_str(&format!("rect 16 {y} 224 12 {c}; "));
-        let w = (name.len() as i32 * 4 + hz / 50).min(200);
-        ops.push_str(&format!("rect 20 {} {w} 6 e8e4df; ", y + 3));
+        text_op(
+            &mut ops,
+            20,
+            y + 1,
+            10,
+            "e8e4df",
+            &format!("{name}  {hz}Hz"),
+        );
     }
     // Volume.
     let vw = (unsafe { VOL } as i32 * 20).min(200);
     ops.push_str(&format!("rect 16 172 {vw} 8 6688cc; "));
+    text_op(
+        &mut ops,
+        180,
+        170,
+        10,
+        "a8a4a0",
+        &format!("vol {}", unsafe { VOL }),
+    );
     ui_draw(&ops);
+    hud_status(
+        &format!("radio  {name}  {state}  vol={}", unsafe { VOL }),
+        "arrows station  space play  +/- volume",
+    );
 }
 
 fn play_sel() {

@@ -1,6 +1,6 @@
 //! Weather card — displays durable `weather` JSON-ish payload from the agent.
 
-use crate::guest::{json_str, storage_get_durable, storage_set_durable, ui_draw};
+use crate::guest::{hud_status, json_str, storage_get_durable, storage_set_durable, text_op, ui_draw};
 use alloc::format;
 use alloc::string::{String, ToString};
 
@@ -12,6 +12,12 @@ static mut PLACE_LEN: usize = 5;
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 16 3a3632; ");
+    let place = unsafe {
+        core::str::from_utf8(&PLACE[..PLACE_LEN])
+            .unwrap_or("local")
+            .to_string()
+    };
+    text_op(&mut ops, 8, 1, 12, "e8e4df", &format!("Weather  {place}"));
     // Sky panel.
     let sky = match unsafe { COND } {
         0 => "6688cc",
@@ -21,11 +27,15 @@ fn paint() {
     };
     ops.push_str(&format!("rect 16 28 224 120 {sky}; "));
     // Sun / cloud / rain marks.
-    match unsafe { COND } {
-        0 => ops.push_str("rect 100 48 40 40 e8c060; "),
+    let cond_name = match unsafe { COND } {
+        0 => {
+            ops.push_str("rect 100 48 40 40 e8c060; ");
+            "clear"
+        }
         1 => {
             ops.push_str("rect 80 60 80 28 e8e4df; ");
             ops.push_str("rect 100 48 48 24 e8e4df; ");
+            "cloudy"
         }
         2 => {
             ops.push_str("rect 80 50 80 28 8a8a9a; ");
@@ -33,18 +43,27 @@ fn paint() {
                 let x = 90 + i * 16;
                 ops.push_str(&format!("rect {x} 90 4 24 88aacc; "));
             }
+            "rain"
         }
         _ => {
             ops.push_str("rect 80 50 80 28 4a4a5a; ");
             ops.push_str("rect 120 90 8 40 e8e060; ");
+            "storm"
         }
-    }
-    // Temp bar.
+    };
     let t = unsafe { TEMP }.clamp(-20, 45);
+    text_op(&mut ops, 28, 100, 22, "e8e4df", &format!("{t} C"));
+    text_op(&mut ops, 28, 130, 12, "e8e4df", cond_name);
+    // Temp bar.
     let w = ((t + 20) * 4).min(220);
     ops.push_str(&format!("rect 16 156 {w} 12 cc785c; "));
     ops.push_str("rect 0 176 256 16 3a3632; ");
+    text_op(&mut ops, 8, 178, 10, "a8a4a0", "1-4 cond  +/- temp");
     ui_draw(&ops);
+    hud_status(
+        &format!("weather  {t}C  {cond_name}  @{place}"),
+        "1-4 conditions  +/- temperature",
+    );
 }
 
 fn load() {

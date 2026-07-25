@@ -1,4 +1,4 @@
-use crate::guest::{hud_status, json_i32, json_str, ui_draw};
+use crate::guest::{hud_status, json_i32, json_str, text_op, ui_draw};
 use alloc::format;
 use alloc::string::{String, ToString};
 
@@ -93,7 +93,7 @@ fn paint_all() {
             }
         }
     }
-    // Palette strip.
+    // Palette strip with key digits.
     let cur = color();
     for (i, c) in PALETTE.iter().enumerate() {
         let x = i as i32 * 32;
@@ -101,6 +101,9 @@ fn paint_all() {
         if *c == cur {
             ops.push_str(&format!("rect {x} {} 31 2 e8e4df; ", BAR - 2));
         }
+        let digit = format!("{}", i + 1);
+        let tc = if i == 1 || i == 6 { "1a1816" } else { "e8e4df" };
+        text_op(&mut ops, x + 10, 0, 9, tc, &digit);
     }
     // Cursor crosshair (hollow so it doesn't hide the stamp).
     let (cx, cy, b) = unsafe { (CX, CY, BRUSH) };

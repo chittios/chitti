@@ -4,7 +4,7 @@
 //! hints go through the HUD). Games call [`append`] after their normal paint,
 //! then [`hit_restart`] / [`key_restart`] from click/key handlers.
 
-use crate::guest::now_ms;
+use crate::guest::{now_ms, text_op};
 use alloc::format;
 use alloc::string::String;
 
@@ -37,10 +37,9 @@ pub fn key_restart(key: &str) -> bool {
 /// Append a modal overlay + confetti to `ops` (caller then `ui_draw`s).
 ///
 /// * `outcome` — win (terracotta), lose (red), draw (slate)
-/// * `title` / `detail` — reserved for future glyph text; today they only
-///   shape confetti density via length (HUD carries the real copy)
+/// * `title` / `detail` — drawn as host text on the panel
 /// * animation phase comes from the wall clock so idle games still sparkle
-pub fn append(ops: &mut String, outcome: Outcome, _title: &str, _detail: &str) {
+pub fn append(ops: &mut String, outcome: Outcome, title: &str, detail: &str) {
     let phase = (now_ms() / 55) as u32;
     let accent = match outcome {
         Outcome::Win => "cc785c",
@@ -54,36 +53,10 @@ pub fn append(ops: &mut String, outcome: Outcome, _title: &str, _detail: &str) {
     ops.push_str("rect 32 36 192 120 1a1816; ");
     // Accent top bar.
     ops.push_str(&format!("rect 32 36 192 6 {accent}; "));
-    // Trophy / result bars (glyph-free "banner").
-    match outcome {
-        Outcome::Win => {
-            // Rising steps = celebration.
-            for i in 0..5 {
-                let h = 10 + i * 6;
-                let x = 56 + i * 28;
-                let y = 100 - h;
-                ops.push_str(&format!("rect {x} {y} 18 {h} {accent}; "));
-            }
-            // Crown dots.
-            ops.push_str("rect 112 52 32 8 c9a54a; rect 120 44 16 8 c9a54a; ");
-        }
-        Outcome::Lose => {
-            // X mark.
-            for i in 0..8 {
-                let o = i * 6;
-                ops.push_str(&format!(
-                    "rect {} {} 10 6 aa3333; rect {} {} 10 6 aa3333; ",
-                    88 + o,
-                    52 + o,
-                    158 - o,
-                    52 + o
-                ));
-            }
-        }
-        Outcome::Draw => {
-            // Equal bars.
-            ops.push_str("rect 72 64 112 10 6688cc; rect 72 86 112 10 6688cc; ");
-        }
+    // Title + detail as real text.
+    text_op(ops, 48, 52, 18, accent, title);
+    if !detail.is_empty() {
+        text_op(ops, 48, 78, 11, "a8a4a0", detail);
     }
     // Confetti burst (win) / ash (lose) / calm flakes (draw).
     let n = match outcome {
@@ -100,10 +73,11 @@ pub fn append(ops: &mut String, outcome: Outcome, _title: &str, _detail: &str) {
         let h = 2 + ((i + 1) % 3) as i32;
         ops.push_str(&format!("rect {x} {y} {w} {h} {c}; "));
     }
-    // Restart button (bright strip — HUD says "enter / n restart").
+    // Restart button with label.
     ops.push_str(&format!(
         "rect {BTN_X} {BTN_Y} {BTN_W} {BTN_H} {accent}; "
     ));
+    text_op(ops, BTN_X + 36, BTN_Y + 5, 14, "e8e4df", "Restart");
     // Button inner highlight pulse.
     if phase % 2 == 0 {
         ops.push_str(&format!(

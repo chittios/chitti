@@ -1,6 +1,6 @@
 //! Hex — dump durable storage value as hex grid.
 
-use crate::guest::{json_str, storage_get_durable, storage_set_durable, ui_draw};
+use crate::guest::{hud_status, json_str, storage_get_durable, storage_set_durable, text_op, ui_draw};
 use alloc::format;
 use alloc::string::{String, ToString};
 
@@ -13,34 +13,55 @@ static mut KEY_LEN: usize = 0;
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 16 3a3632; ");
+    let key = unsafe {
+        core::str::from_utf8(&KEY[..KEY_LEN])
+            .unwrap_or("hex")
+            .to_string()
+    };
+    text_op(
+        &mut ops,
+        8,
+        1,
+        11,
+        "e8e4df",
+        &format!("Hex  {key}  {}b", unsafe { LEN }),
+    );
     unsafe {
         let start = OFF;
-        let rows = 14usize;
+        let rows = 12usize;
         for r in 0..rows {
-            let base = start + r * 16;
+            let base = start + r * 8;
             if base >= LEN {
                 break;
             }
-            let y = 20 + r as i32 * 11;
-            for c in 0..16usize {
+            let y = 22 + r as i32 * 12;
+            // Offset label.
+            text_op(&mut ops, 4, y, 9, "a8a4a0", &format!("{base:02x}"));
+            let mut hexline = String::new();
+            let mut ascii = String::new();
+            for c in 0..8usize {
                 if base + c >= LEN {
                     break;
                 }
                 let b = DATA[base + c];
-                let x = 8 + c as i32 * 15;
-                // Nibble intensity as color bands.
-                let cname = match b >> 6 {
-                    0 => "3a3632",
-                    1 => "5a5652",
-                    2 => "8a8a6a",
-                    _ => "cc785c",
-                };
-                ops.push_str(&format!("rect {x} {y} 12 9 {cname}; "));
+                hexline.push_str(&format!("{b:02x} "));
+                if b.is_ascii_graphic() || b == b' ' {
+                    ascii.push(b as char);
+                } else {
+                    ascii.push('.');
+                }
             }
+            text_op(&mut ops, 28, y, 9, "e8e4df", &hexline);
+            text_op(&mut ops, 200, y, 9, "cc785c", &ascii);
         }
     }
     ops.push_str("rect 0 176 256 16 3a3632; ");
+    text_op(&mut ops, 8, 178, 10, "a8a4a0", "pgup/pgdn scroll");
     ui_draw(&ops);
+    hud_status(
+        &format!("hex  {key}  {} bytes  off={}", unsafe { LEN }, unsafe { OFF }),
+        "pgup/pgdn scroll",
+    );
 }
 
 fn load_key(k: &str) {

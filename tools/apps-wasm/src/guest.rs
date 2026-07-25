@@ -52,6 +52,10 @@ extern "C" {
     pub fn host_now_ms() -> i64;
     pub fn host_log(p: i32, l: i32);
     pub fn host_sound_play(hz: i32, ms: i32) -> i32;
+    /// Set a shell/UI preference (`theme` / `mode` / `opacity`). Returns 0 on ok.
+    pub fn host_sys_set(k: i32, kl: i32, v: i32, vl: i32) -> i32;
+    /// Read a shell/UI preference into `out`; returns byte length or <0 on error.
+    pub fn host_sys_get(k: i32, kl: i32, out: i32, cap: i32) -> i32;
 }
 
 /// Reset the bump allocator. Called at the start of every host→guest call
@@ -212,6 +216,39 @@ pub fn hud_set(text: &str) -> i32 {
 /// Call on start and after every interaction so the reserved strip stays live.
 pub fn hud_status(status: &str, shortcuts: &str) {
     let _ = hud_set(&format!("{status}\n{shortcuts}"));
+}
+
+/// Apply a live OS preference from the settings package (`theme` name, `mode`
+/// name, or `opacity` 0..=255). Returns true when the host accepted it.
+pub fn sys_set(key: &str, val: &str) -> bool {
+    let rc = unsafe {
+        host_sys_set(
+            key.as_ptr() as i32,
+            key.len() as i32,
+            val.as_ptr() as i32,
+            val.len() as i32,
+        )
+    };
+    rc == 0
+}
+
+/// Read a live OS preference (`theme` / `mode` / `opacity`).
+pub fn sys_get(key: &str) -> Option<String> {
+    let mut buf = [0u8; 64];
+    let n = unsafe {
+        host_sys_get(
+            key.as_ptr() as i32,
+            key.len() as i32,
+            buf.as_mut_ptr() as i32,
+            buf.len() as i32,
+        )
+    };
+    if n <= 0 {
+        return None;
+    }
+    core::str::from_utf8(&buf[..n as usize])
+        .ok()
+        .map(|s| s.to_string())
 }
 
 pub use result_string as export;

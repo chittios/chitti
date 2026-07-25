@@ -1,6 +1,9 @@
 //! Gallery — thumbnail grid over durable `img_*` storage keys.
 
-use crate::guest::{json_str, storage_get_durable, storage_list_durable, storage_set_durable, ui_draw};
+use crate::guest::{
+    hud_status, json_str, storage_get_durable, storage_list_durable, storage_set_durable, text_op,
+    ui_draw,
+};
 use alloc::format;
 use alloc::string::{String, ToString};
 
@@ -40,6 +43,14 @@ fn reload() {
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 16 3a3632; ");
+    text_op(
+        &mut ops,
+        8,
+        1,
+        12,
+        "e8e4df",
+        &format!("Gallery  {}", unsafe { NKEYS }),
+    );
     // 4×3 grid of "thumbnails" (color from key hash).
     unsafe {
         for i in 0..12usize {
@@ -59,13 +70,21 @@ fn paint() {
                 let border = if i as i32 == SEL { "e8e4df" } else { c };
                 ops.push_str(&format!("rect {x} {y} 56 44 {border}; "));
                 ops.push_str(&format!("rect {} {} 48 36 {c}; ", x + 4, y + 4));
+                let name = core::str::from_utf8(&KEYS[i][..KEY_LEN[i] as usize]).unwrap_or("?");
+                let shown = if name.len() > 8 { &name[..8] } else { name };
+                text_op(&mut ops, x + 4, y + 28, 9, "e8e4df", shown);
             } else {
                 ops.push_str(&format!("rect {x} {y} 56 44 2c2926; "));
             }
         }
     }
     ops.push_str("rect 0 176 256 16 3a3632; ");
+    text_op(&mut ops, 8, 178, 10, "a8a4a0", "arrows select  a add demo");
     ui_draw(&ops);
+    hud_status(
+        &format!("gallery  {} images", unsafe { NKEYS }),
+        "arrows select  a add demo",
+    );
 }
 
 pub fn start(_: &str) -> String {

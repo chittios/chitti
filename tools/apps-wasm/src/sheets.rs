@@ -1,6 +1,8 @@
 //! Sheets — tiny spreadsheet (4×6 cells, integer formulas A1+B1 style).
 
-use crate::guest::{json_i32, json_str, storage_get_durable, storage_set_durable, ui_draw};
+use crate::guest::{
+    hud_status, json_i32, json_str, storage_get_durable, storage_set_durable, text_op, ui_draw,
+};
 use alloc::format;
 use alloc::string::{String, ToString};
 
@@ -112,25 +114,84 @@ fn ref_or_num(s: &str, depth: u8) -> i64 {
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 16 3a3632; ");
-    // Entry bar.
-    ops.push_str("rect 8 16 240 6 2c2926; ");
-    let ew = (unsafe { ENTRY_LEN } as i32 * 4).min(230);
-    ops.push_str(&format!("rect 10 16 {ew} 4 cc785c; "));
+    let entry = unsafe {
+        core::str::from_utf8(&ENTRY[..ENTRY_LEN])
+            .unwrap_or("")
+            .to_string()
+    };
+    let cell_ref = format!(
+        "{}{}",
+        (b'A' + unsafe { CUR_C }) as char,
+        unsafe { CUR_R } + 1
+    );
+    text_op(
+        &mut ops,
+        8,
+        1,
+        11,
+        "e8e4df",
+        &format!("Sheets  {cell_ref}  {entry}"),
+    );
+    // Column headers.
+    for c in 0..COLS {
+        let x = OX + c as i32 * CW + 20;
+        text_op(
+            &mut ops,
+            x,
+            OY - 12,
+            10,
+            "a8a4a0",
+            &format!("{}", (b'A' + c as u8) as char),
+        );
+    }
     for r in 0..ROWS {
+        text_op(
+            &mut ops,
+            2,
+            OY + r as i32 * CH + 4,
+            10,
+            "a8a4a0",
+            &format!("{}", r + 1),
+        );
         for c in 0..COLS {
             let x = OX + c as i32 * CW;
             let y = OY + r as i32 * CH;
             let sel = unsafe { CUR_C as usize == c && CUR_R as usize == r };
             let color = if sel { "cc785c" } else { "3a3632" };
             ops.push_str(&format!("rect {x} {y} {} {} {color}; ", CW - 2, CH - 2));
-            let v = eval_cell(c, r, 0);
-            // Magnitude bar.
-            let w = ((v.abs() % 50) as i32).max(2);
-            ops.push_str(&format!("rect {} {} {w} 6 e8e4df; ", x + 4, y + 8));
+            let raw = cell_str(c, r);
+            let shown = if raw.starts_with('=') {
+                format!("{}", eval_cell(c, r, 0))
+            } else if raw.is_empty() {
+                String::new()
+            } else {
+                raw
+            };
+            if !shown.is_empty() {
+                let tc = if sel { "1a1816" } else { "e8e4df" };
+                let label = if shown.len() > 7 {
+                    &shown[..7]
+                } else {
+                    &shown
+                };
+                text_op(&mut ops, x + 4, y + 4, 10, tc, label);
+            }
         }
     }
     ops.push_str("rect 0 176 256 16 3a3632; ");
+    text_op(
+        &mut ops,
+        8,
+        178,
+        10,
+        "a8a4a0",
+        "arrows cell  type  enter commit",
+    );
     ui_draw(&ops);
+    hud_status(
+        &format!("sheets  {cell_ref}  entry={entry}"),
+        "arrows cell  type value/=A1+B1  enter commit",
+    );
 }
 
 fn commit_entry() {

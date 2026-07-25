@@ -1,6 +1,6 @@
 //! Activity — simple process/agent status panel (storage + static counters).
 
-use crate::guest::{json_i32, storage_get_durable, storage_set_durable, ui_draw};
+use crate::guest::{hud_status, json_i32, storage_get_durable, storage_set_durable, text_op, ui_draw};
 use alloc::format;
 use alloc::string::String;
 
@@ -11,6 +11,14 @@ static mut MEM: u8 = 40;
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 16 3a3632; ");
+    text_op(
+        &mut ops,
+        8,
+        1,
+        12,
+        "e8e4df",
+        &format!("Activity  ticks {}", unsafe { TICKS }),
+    );
     // Fake task rows.
     unsafe {
         for i in 0..TASKS.min(8) {
@@ -18,14 +26,40 @@ fn paint() {
             ops.push_str(&format!("rect 12 {y} 232 14 2c2926; "));
             let w = 40 + (i as i32 * 17 + (TICKS as i32 % 30));
             ops.push_str(&format!("rect 16 {} {} 8 5a8f5a; ", y + 3, w.min(220)));
+            text_op(
+                &mut ops,
+                20,
+                y + 1,
+                10,
+                "e8e4df",
+                &format!("task-{}", i + 1),
+            );
         }
         // Memory bar.
         ops.push_str("rect 12 160 232 10 2c2926; ");
         let mw = (MEM as i32 * 2).min(232);
         ops.push_str(&format!("rect 12 160 {mw} 10 6688cc; "));
+        text_op(
+            &mut ops,
+            16,
+            148,
+            10,
+            "a8a4a0",
+            &format!("mem {MEM}%"),
+        );
     }
     ops.push_str("rect 0 176 256 16 3a3632; ");
+    text_op(&mut ops, 8, 178, 10, "a8a4a0", "+/- tasks  r reset");
     ui_draw(&ops);
+    hud_status(
+        &format!(
+            "activity  tasks={}  mem%={}  ticks={}",
+            unsafe { TASKS },
+            unsafe { MEM },
+            unsafe { TICKS }
+        ),
+        "+/- tasks  r reset",
+    );
 }
 
 pub fn start(_: &str) -> String {

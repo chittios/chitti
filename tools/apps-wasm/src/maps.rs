@@ -1,6 +1,9 @@
 //! Maps — simple lat/lon pin card (no tile stack; storage-backed places).
 
-use crate::guest::{json_str, storage_get_durable, storage_list_durable, storage_set_durable, ui_draw};
+use crate::guest::{
+    hud_status, json_str, storage_get_durable, storage_list_durable, storage_set_durable, text_op,
+    ui_draw,
+};
 use alloc::format;
 use alloc::string::{String, ToString};
 
@@ -21,27 +24,46 @@ fn place_str() -> String {
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 16 3a3632; ");
+    let place = place_str();
+    text_op(&mut ops, 8, 1, 12, "e8e4df", &format!("Maps  {place}"));
     // Map frame (stylized grid).
     ops.push_str("rect 16 24 224 140 2a3a4a; ");
     let z = unsafe { ZOOM }.max(1) as i32;
     for i in 0..8 {
-        let x = 16 + i * 28;
         let y = 24 + i * 16;
+        let x = 16 + i * 28;
         ops.push_str(&format!("rect {x} 24 1 140 3a4a5a; "));
         ops.push_str(&format!("rect 16 {y} 224 1 3a4a5a; "));
     }
     // Pin from lat/lon (mapped into frame).
-    let px = 16 + (((unsafe { LON } + 1800).rem_euclid(3600)) * 224 / 3600);
-    let py = 24 + (((900 - unsafe { LAT }).rem_euclid(1800)) * 140 / 1800);
+    let lat = unsafe { LAT };
+    let lon = unsafe { LON };
+    let px = 16 + (((lon + 1800).rem_euclid(3600)) * 224 / 3600);
+    let py = 24 + (((900 - lat).rem_euclid(1800)) * 140 / 1800);
     let pin_x = px.clamp(20, 230);
     let pin_y = py.clamp(28, 155);
     ops.push_str(&format!("rect {} {} 8 8 cc785c; ", pin_x - 4, pin_y - 4));
     ops.push_str(&format!("rect {} {} 2 12 e8e4df; ", pin_x - 1, pin_y));
+    // lat is tenths*10 (377 => 37.7); show one decimal.
+    let lat_s = format!("{}.{}", lat / 10, (lat % 10).abs());
+    let lon_s = format!("{}.{}", lon / 10, (lon % 10).abs());
+    text_op(
+        &mut ops,
+        24,
+        148,
+        10,
+        "e8e4df",
+        &format!("{lat_s}, {lon_s}  z{z}"),
+    );
     // Zoom ticks.
     let zw = z * 20;
     ops.push_str(&format!("rect 16 168 {zw} 8 5a8f5a; "));
     ops.push_str("rect 0 184 256 8 3a3632; ");
     ui_draw(&ops);
+    hud_status(
+        &format!("maps  {place}  {lat_s},{lon_s}  z{z}"),
+        "arrows pan  +/- zoom  s save",
+    );
 }
 
 fn load() {

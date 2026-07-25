@@ -1,6 +1,6 @@
 //! Console — ring-buffer log viewer (durable lines + demo seed).
 
-use crate::guest::{json_str, storage_get_durable, storage_set_durable, ui_draw};
+use crate::guest::{hud_status, json_str, storage_get_durable, storage_set_durable, text_op, ui_draw};
 use alloc::format;
 use alloc::string::{String, ToString};
 
@@ -91,10 +91,15 @@ fn visible_indices() -> ([usize; VIS], usize) {
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 16 3a3632; ");
+    text_op(&mut ops, 8, 1, 12, "e8e4df", "Console");
     // Filter bar.
     ops.push_str("rect 8 18 240 14 2c2926; ");
-    let fw = (unsafe { FLEN } as i32 * 6).min(220);
-    ops.push_str(&format!("rect 12 20 {fw} 10 cc785c; "));
+    let f = filter_str();
+    if f.is_empty() {
+        text_op(&mut ops, 12, 19, 10, "a8a4a0", "filter…");
+    } else {
+        text_op(&mut ops, 12, 19, 10, "cc785c", &f);
+    }
     let (idx, count) = visible_indices();
     for row in 0..count {
         let y = 36 + row as i32 * 12;
@@ -109,11 +114,15 @@ fn paint() {
             "5a5652"
         };
         ops.push_str(&format!("rect 8 {y} 240 10 {level}; "));
-        let w = (s.len() as i32 * 3).min(220);
-        ops.push_str(&format!("rect 12 {} {w} 6 e8e4df; ", y + 2));
+        let shown = if s.len() > 36 { &s[..36] } else { &s };
+        text_op(&mut ops, 12, y + 0, 9, "e8e4df", shown);
     }
     ops.push_str("rect 0 184 256 8 3a3632; ");
     ui_draw(&ops);
+    hud_status(
+        &format!("console  {} lines  scroll={}", unsafe { N }, unsafe { SCROLL }),
+        "arrows scroll  type filter  c clear",
+    );
 }
 
 fn seed() {

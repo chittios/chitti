@@ -1,6 +1,9 @@
 //! Calendar — month grid; events stored as durable `cal_YYYY-MM-DD` keys.
 
-use crate::guest::{json_str, storage_get_durable, storage_list_durable, storage_set_durable, ui_draw};
+use crate::guest::{
+    hud_status, json_str, storage_get_durable, storage_list_durable, storage_set_durable, text_op,
+    ui_draw,
+};
 use alloc::format;
 use alloc::string::{String, ToString};
 
@@ -43,18 +46,29 @@ fn has_event(d: i32) -> bool {
 fn paint() {
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 20 3a3632; ");
-    // Month length bar.
+    let y = unsafe { YEAR };
     let m = unsafe { MONTH };
-    ops.push_str(&format!("rect 8 4 {} 12 cc785c; ", m * 16));
-    let dim = days_in_month(unsafe { YEAR }, m);
-    let start = dow1(unsafe { YEAR }, m);
+    text_op(
+        &mut ops,
+        8,
+        2,
+        12,
+        "e8e4df",
+        &format!("{y}-{m:02}  (n/p month)"),
+    );
+    let dim = days_in_month(y, m);
+    let start = dow1(y, m);
     let cell = 32;
+    // Weekday headers.
+    for (i, d) in ["S", "M", "T", "W", "T", "F", "S"].iter().enumerate() {
+        text_op(&mut ops, 16 + i as i32 * cell, 22, 10, "a8a4a0", d);
+    }
     for d in 1..=dim {
         let slot = start + d - 1;
         let col = slot % 7;
         let row = slot / 7;
         let x = 8 + col * cell;
-        let y = 28 + row * cell;
+        let y = 36 + row * cell;
         let sel = d == unsafe { CURSOR };
         let ev = has_event(d);
         let c = if sel {
@@ -64,10 +78,24 @@ fn paint() {
         } else {
             "3a3632"
         };
-        ops.push_str(&format!("rect {x} {y} 28 28 {c}; "));
+        ops.push_str(&format!("rect {x} {y} 28 24 {c}; "));
+        let tc = if sel { "1a1816" } else { "e8e4df" };
+        text_op(&mut ops, x + 6, y + 4, 12, tc, &format!("{d}"));
     }
     ops.push_str("rect 0 176 256 16 3a3632; ");
+    text_op(
+        &mut ops,
+        8,
+        178,
+        10,
+        "a8a4a0",
+        "arrows day  n/p month  e event",
+    );
     ui_draw(&ops);
+    hud_status(
+        &format!("calendar  {y}-{m:02}  day {}", unsafe { CURSOR }),
+        "arrows day  n/p month  e add event",
+    );
 }
 
 pub fn start(_: &str) -> String {
@@ -92,11 +120,11 @@ pub fn start(_: &str) -> String {
 }
 
 pub fn on_click(x: i32, y: i32) -> String {
-    if y < 28 {
+    if y < 36 {
         return status("");
     }
     let col = ((x - 8) / 32).clamp(0, 6);
-    let row = ((y - 28) / 32).clamp(0, 5);
+    let row = ((y - 36) / 32).clamp(0, 5);
     let start = dow1(unsafe { YEAR }, unsafe { MONTH });
     let slot = row * 7 + col;
     let d = slot - start + 1;

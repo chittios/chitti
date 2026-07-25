@@ -1,5 +1,5 @@
 use crate::endscreen::{self, Outcome};
-use crate::guest::{hud_status, json_i32, ui_draw};
+use crate::guest::{hud_status, json_i32, text_op, ui_draw};
 use alloc::format;
 use alloc::string::String;
 
@@ -47,6 +47,19 @@ fn paint() {
                     "5a5652"
                 };
                 ops.push_str(&format!("rect {x} {y} {} {} {color}; ", CELL - 1, CELL - 1));
+                // Number / flag / mine glyph on the cell.
+                if OPEN[r][c] != 0 {
+                    if MINE[r][c] != 0 {
+                        text_op(&mut ops, x + 5, y + 2, 12, "e8e4df", "*");
+                    } else {
+                        let n = adj(r, c);
+                        if n > 0 {
+                            text_op(&mut ops, x + 5, y + 2, 12, "e8e4df", &format!("{n}"));
+                        }
+                    }
+                } else if FLAG[r][c] != 0 {
+                    text_op(&mut ops, x + 5, y + 2, 12, "1a1816", "F");
+                }
             }
         }
         // Keyboard cursor: a bright 2px frame around the current cell.
