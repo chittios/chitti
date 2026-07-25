@@ -1006,7 +1006,7 @@ fn execute_try_statement(
             if let Some(catch_clause) = handler {
                 let throw_completion = Completion {
                     completion_type: CompletionType::Throw,
-                    value: Some(error_to_js_value(&err)),
+                    value: Some(error_to_js_value(&err, ctx)),
                     target: None,
                 };
                 handle_catch(throw_completion, catch_clause, ctx)?
@@ -1057,16 +1057,46 @@ fn handle_catch(
 }
 
 /// Convert a JErrorType to a JsValue for catching.
-fn error_to_js_value(err: &JErrorType) -> JsValue {
-    match err {
-        JErrorType::TypeError(msg) => JsValue::String(format!("TypeError: {}", msg)),
-        JErrorType::ReferenceError(msg) => JsValue::String(format!("ReferenceError: {}", msg)),
-        JErrorType::SyntaxError(msg) => JsValue::String(format!("SyntaxError: {}", msg)),
-        JErrorType::RangeError(msg) => JsValue::String(format!("RangeError: {}", msg)),
-        JErrorType::YieldValue(v) => v.clone(),
+///
+/// Must produce a **real** Error object (with the correct `[[Prototype]]`) so
+/// `catch (e) { e instanceof ReferenceError }` works — test262 and real pages
+/// all key off that. A string `"ReferenceError: …"` makes every such check fail
+/// and the test then `throw new Test262Error(...)` at top-level.
+fn error_to_js_value(err: &JErrorType, ctx: &mut EvalContext) -> JsValue {
+    use crate::runner::eval::expression::{make_object, set_own_prop};
+    let (name, msg): (&str, String) = match err {
+        JErrorType::TypeError(m) => ("TypeError", m.clone()),
+        JErrorType::ReferenceError(m) => ("ReferenceError", m.clone()),
+        JErrorType::SyntaxError(m) => ("SyntaxError", m.clone()),
+        JErrorType::RangeError(m) => ("RangeError", m.clone()),
+        JErrorType::YieldValue(v) => return v.clone(),
         // A user `throw <value>` — hand the ORIGINAL value to `catch (e)`.
-        JErrorType::Thrown(v) => v.clone(),
+        JErrorType::Thrown(v) => return v.clone(),
+    };
+    // Prefer the registered constructor so [[Prototype]] + instanceof work.
+    let sg = ctx.super_global.clone();
+    if let Some(result) = sg.borrow().call_constructor(
+        name,
+        ctx,
+        JsValue::Undefined,
+        alloc::vec![JsValue::String(msg.clone())],
+    ) {
+        if let Ok(v @ JsValue::Object(_)) = result {
+            return v;
+        }
     }
+    // Fallback: plain tagged object (still better than a bare string).
+    let obj = make_object(alloc::vec![
+        ("name".to_string(), JsValue::String(name.to_string())),
+        ("message".to_string(), JsValue::String(msg)),
+    ]);
+    set_own_prop(
+        &obj,
+        "__builtin_name__",
+        JsValue::String(name.to_string()),
+        false,
+    );
+    obj
 }
 
 /// Execute a for-in statement (iterate over enumerable property keys).

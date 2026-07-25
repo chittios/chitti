@@ -33,6 +33,7 @@ pub fn register(registry: &mut BuiltInRegistry) {
         .add_method("parseFloat", number_parse_float)
         .add_method("parseInt", number_parse_int)
         .add_method("toString", number_to_string)
+        .add_method("valueOf", number_value_of)
         .add_method("toFixed", number_to_fixed)
         .add_method("toExponential", number_to_exponential)
         .add_method("toPrecision", number_to_precision);
@@ -41,16 +42,32 @@ pub fn register(registry: &mut BuiltInRegistry) {
 }
 
 /// Number constructor.
+///
+/// `Number(x)` → ToNumber primitive. `new Number(x)` → Number object carrying
+/// the primitive under `__primitive_value__` (so `+` / `ToPrimitive` unwrap).
 fn number_constructor(
-    _ctx: &mut EvalContext,
-    _this: JsValue,
+    ctx: &mut EvalContext,
+    this: JsValue,
     args: Vec<JsValue>,
 ) -> Result<JsValue, JErrorType> {
-    if args.is_empty() {
-        return Ok(JsValue::Number(JsNumberType::Integer(0)));
+    let n = if args.is_empty() {
+        JsValue::Number(JsNumberType::Integer(0))
+    } else {
+        to_number(&args[0])?
+    };
+    // Only box on `new Number` — bare `Number(x)` must return a primitive even
+    // when `this` is `globalThis` (non-strict call).
+    if crate::runner::eval::expression::is_new_this_for("Number", &this, ctx) {
+        crate::runner::eval::expression::set_own_prop(
+            &this,
+            "__primitive_value__",
+            n,
+            false,
+        );
+        Ok(this)
+    } else {
+        Ok(n)
     }
-
-    to_number(&args[0])
 }
 
 /// Number.isNaN - Check if value is NaN (strict).
@@ -207,6 +224,22 @@ fn number_parse_int(
     match i64::from_str_radix(s, radix) {
         Ok(i) => Ok(JsValue::Number(JsNumberType::Integer(i))),
         Err(_) => Ok(JsValue::Number(JsNumberType::NaN)),
+    }
+}
+
+/// Number.prototype.valueOf — the boxed primitive (or `this` if already a number).
+fn number_value_of(
+    _ctx: &mut EvalContext,
+    this: JsValue,
+    _args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    if let Some(p) = crate::runner::eval::expression::get_own_prop_value(&this, "__primitive_value__")
+    {
+        return Ok(p);
+    }
+    match this {
+        n @ JsValue::Number(_) => Ok(n),
+        other => to_number(&other),
     }
 }
 
@@ -368,6 +401,12 @@ fn number_to_precision(
 
 /// Convert JsValue to number.
 fn to_number(value: &JsValue) -> Result<JsValue, JErrorType> {
+    // Unwrap boxed primitives (`new Number(1)`, `Object(true)`, …).
+    if let Some(p) =
+        crate::runner::eval::expression::get_own_prop_value(value, "__primitive_value__")
+    {
+        return to_number(&p);
+    }
     Ok(match value {
         JsValue::Undefined => JsValue::Number(JsNumberType::NaN),
         JsValue::Null => JsValue::Number(JsNumberType::Integer(0)),

@@ -353,6 +353,7 @@ impl PluginResolver for GlobalsResolver {
         &self,
         object_name: &str,
         ctx: &mut EvalContext,
+        this: JsValue,
         args: Vec<JsValue>,
     ) -> Option<Result<JsValue, JErrorType>> {
         if !is_global_fn(object_name) {
@@ -404,7 +405,23 @@ impl PluginResolver for GlobalsResolver {
                     Err(e) => return Some(Err(e)),
                 }
             }
-            "Boolean" => JsValue::Boolean(truthy(&a0)),
+            "Boolean" => {
+                let b = JsValue::Boolean(truthy(&a0));
+                // `new Boolean(x)` boxes; bare `Boolean(x)` coerces.
+                // Detect `new` via [[Prototype]] === Boolean.prototype (same
+                // rule as Number/String — don't treat globalThis as a target).
+                if crate::runner::eval::expression::is_new_this_for("Boolean", &this, ctx) {
+                    crate::runner::eval::expression::set_own_prop(
+                        &this,
+                        "__primitive_value__",
+                        b,
+                        false,
+                    );
+                    this
+                } else {
+                    b
+                }
+            }
             "BigInt" => {
                 return Some(to_bigint(&a0));
             }

@@ -20,6 +20,7 @@ use super::number;
 use super::math;
 use super::json;
 use super::error;
+use super::function;
 use super::collections;
 use super::date;
 use super::regexp;
@@ -30,6 +31,7 @@ use super::proxy;
 pub fn register_core_builtins(registry: &mut BuiltInRegistry) {
     // Register in order (some may depend on Object)
     object::register(registry);
+    function::register(registry);
     array::register(registry);
     string::register(registry);
     number::register(registry);

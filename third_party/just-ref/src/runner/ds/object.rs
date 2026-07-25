@@ -142,6 +142,8 @@ pub trait JsObject {
 
     fn set_prototype_of(&mut self, prototype: Option<JsObjectType>) -> bool {
         let current_value = &self.get_object_base().prototype;
+        // ECMA-262 OrdinarySetPrototypeOf: `V` is Object or null. Same value →
+        // true; otherwise install (or clear) the slot after a cycle check.
         let new_value: Option<JsObjectType> = match prototype {
             None => {
                 if current_value.is_none() {
@@ -157,12 +159,10 @@ pub trait JsObject {
                         current_p.deref().borrow().deref(),
                     ) {
                         return true;
-                    } else {
-                        Some(p.clone())
                     }
-                } else {
-                    None
                 }
+                // Was null, or different object — install `p`.
+                Some(p.clone())
             }
         };
         if self.is_extensible() {

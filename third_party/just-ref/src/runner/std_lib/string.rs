@@ -33,6 +33,8 @@ pub fn register(registry: &mut BuiltInRegistry) {
         .add_method("trimEnd", string_trim_end)
         .add_method("toUpperCase", string_to_upper_case)
         .add_method("toLowerCase", string_to_lower_case)
+        .add_method("toString", string_to_string_method)
+        .add_method("valueOf", string_value_of)
         .add_method("repeat", string_repeat)
         .add_method("padStart", string_pad_start)
         .add_method("padEnd", string_pad_end)
@@ -47,6 +49,12 @@ pub fn register(registry: &mut BuiltInRegistry) {
 
 /// Get a string from a JsValue.
 fn to_string(value: &JsValue) -> String {
+    // Boxed String/Number/Boolean wrappers store the primitive here.
+    if let Some(p) =
+        crate::runner::eval::expression::get_own_prop_value(value, "__primitive_value__")
+    {
+        return to_string(&p);
+    }
     match value {
         JsValue::String(s) => s.clone(),
         JsValue::Undefined => "undefined".to_string(),
@@ -59,16 +67,56 @@ fn to_string(value: &JsValue) -> String {
     }
 }
 
-/// String constructor.
-fn string_constructor(
+/// String.prototype.toString / valueOf — the boxed primitive string.
+fn string_to_string_method(
     _ctx: &mut EvalContext,
-    _this: JsValue,
+    this: JsValue,
+    _args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    Ok(JsValue::String(to_string(&this)))
+}
+
+fn string_value_of(
+    _ctx: &mut EvalContext,
+    this: JsValue,
+    _args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    if let Some(p) = crate::runner::eval::expression::get_own_prop_value(&this, "__primitive_value__")
+    {
+        return Ok(p);
+    }
+    match this {
+        s @ JsValue::String(_) => Ok(s),
+        other => Ok(JsValue::String(to_string(&other))),
+    }
+}
+
+/// String constructor.
+///
+/// `String(x)` → ToString primitive. `new String(x)` → String object carrying
+/// the primitive under `__primitive_value__`.
+fn string_constructor(
+    ctx: &mut EvalContext,
+    this: JsValue,
     args: Vec<JsValue>,
 ) -> Result<JsValue, JErrorType> {
-    if args.is_empty() {
-        Ok(JsValue::String(String::new()))
+    let s = if args.is_empty() {
+        JsValue::String(String::new())
     } else {
-        Ok(JsValue::String(to_string(&args[0])))
+        JsValue::String(to_string(&args[0]))
+    };
+    // Only box on `new String` — bare `String(x)` (common in harnesses) must
+    // return a primitive string even when `this` is `globalThis`.
+    if crate::runner::eval::expression::is_new_this_for("String", &this, ctx) {
+        crate::runner::eval::expression::set_own_prop(
+            &this,
+            "__primitive_value__",
+            s,
+            false,
+        );
+        Ok(this)
+    } else {
+        Ok(s)
     }
 }
 

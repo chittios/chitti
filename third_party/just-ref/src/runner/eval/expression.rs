@@ -601,9 +601,53 @@ fn evaluate_object_expression(
         );
     }
 
+    // Ordinary object literals inherit from `Object.prototype` (ES OrdinaryObjectCreate).
+    // Without this, `Object.prototype.isPrototypeOf({})` and similar chain walks fail.
+    if let Some(proto) = object_prototype_object(ctx) {
+        obj.get_object_base_mut().prototype = Some(proto);
+    }
+
     // Wrap in JsObjectType
     let obj_ref: JsObjectType = Rc::new(RefCell::new(ObjectType::Ordinary(Box::new(obj))));
     Ok(JsValue::Object(obj_ref))
+}
+
+/// Resolve the live `Object.prototype` carrier (materialising it if needed).
+fn object_prototype_object(ctx: &mut EvalContext) -> Option<JsObjectType> {
+    let sg = ctx.super_global.clone();
+    let object_ctor = sg.borrow().resolve_binding("Object", ctx).ok()?;
+    drop(sg);
+    match get_property_with_ctx(&object_ctor, "prototype", ctx) {
+        Ok(JsValue::Object(p)) => Some(p),
+        _ => None,
+    }
+}
+
+/// True when `this` looks like a `new X(...)` instance: its `[[Prototype]]` is
+/// the live `X.prototype` carrier. Used by `Number`/`String`/`Boolean`
+/// constructors so a bare `String(x)` call (whose `this` is `globalThis` or
+/// `undefined`) returns a **primitive**, while `new String(x)` boxes.
+///
+/// Without this check, bare `String("hi")` stamped onto `globalThis` and
+/// returned the global object — breaking every `String(msg)` in the harness
+/// and `typeof String(1) === "string"` tests.
+pub fn is_new_this_for(type_name: &str, this: &JsValue, ctx: &mut EvalContext) -> bool {
+    let JsValue::Object(o) = this else {
+        return false;
+    };
+    let Some(proto) = o.borrow().as_js_object().get_prototype_of() else {
+        return false;
+    };
+    let sg = ctx.super_global.clone();
+    let ctor = match sg.borrow().resolve_binding(type_name, ctx) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    drop(sg);
+    match get_property_with_ctx(&ctor, "prototype", ctx) {
+        Ok(JsValue::Object(expected)) => Rc::ptr_eq(&proto, &expected),
+        _ => false,
+    }
 }
 
 /// Get the property key from an object literal property.
@@ -873,18 +917,32 @@ fn evaluate_new_expression(
 
         // Evaluate arguments first
         let args = evaluate_arguments(arguments, ctx)?;
-        
-        // Try super-global constructor dispatch
-        let sg = ctx.super_global.clone();
-        let sg_result = sg.borrow().call_constructor(ctor_name, ctx, args.clone());
-        
-        if let Some(result) = sg_result {
-            return result;
+
+        // Resolve the constructor so we can wire `[[Prototype]]` on the instance
+        // before calling it (built-in sentinels aren't `is_callable` but still
+        // construct via the registry).
+        if let Ok(constructor) = evaluate_expression(callee, ctx) {
+            if let JsValue::Object(ctor_obj) = &constructor {
+                let new_obj = create_new_object_for_constructor(ctor_obj, ctx)?;
+                let this_val = JsValue::Object(new_obj.clone());
+                let sg = ctx.super_global.clone();
+                let sg_result =
+                    sg.borrow()
+                        .call_constructor(ctor_name, ctx, this_val, args.clone());
+                if let Some(result) = sg_result {
+                    // Prefer an object return; else the pre-created instance.
+                    return match result {
+                        Ok(JsValue::Object(o)) => Ok(JsValue::Object(o)),
+                        Ok(_) => Ok(JsValue::Object(new_obj)),
+                        Err(e) => Err(e),
+                    };
+                }
+            }
         }
-        
+
         // Fall through to normal evaluation if super-global doesn't handle it
     }
-    
+
     // Normal constructor path: evaluate the callee to get the constructor function
     let constructor = evaluate_expression(callee, ctx)?;
 
@@ -892,6 +950,22 @@ fn evaluate_new_expression(
     let ctor_obj = match &constructor {
         JsValue::Object(obj) => {
             if !obj.borrow().is_callable() {
+                // Built-in constructor sentinel (Error, Array, …): still construct.
+                let name = builtin_type_name(&constructor);
+                let new_obj = create_new_object_for_constructor(obj, ctx)?;
+                let this_val = JsValue::Object(new_obj.clone());
+                let args = evaluate_arguments(arguments, ctx)?;
+                let sg = ctx.super_global.clone();
+                let sg_result =
+                    sg.borrow()
+                        .call_constructor(&name, ctx, this_val, args);
+                if let Some(result) = sg_result {
+                    return match result {
+                        Ok(JsValue::Object(o)) => Ok(JsValue::Object(o)),
+                        Ok(_) => Ok(JsValue::Object(new_obj)),
+                        Err(e) => Err(e),
+                    };
+                }
                 return Err(JErrorType::TypeError(format!(
                     "{} is not a constructor",
                     constructor
@@ -908,7 +982,7 @@ fn evaluate_new_expression(
     };
 
     // Create a new object for 'this'
-    let new_obj = create_new_object_for_constructor(&ctor_obj)?;
+    let new_obj = create_new_object_for_constructor(&ctor_obj, ctx)?;
 
     // Evaluate the arguments
     let args = evaluate_arguments(arguments, ctx)?;
@@ -928,27 +1002,19 @@ fn evaluate_new_expression(
 /// Sets up the prototype chain from the constructor's prototype property.
 fn create_new_object_for_constructor(
     constructor: &JsObjectType,
+    ctx: &mut EvalContext,
 ) -> Result<JsObjectType, JErrorType> {
-    use crate::runner::ds::object::{JsObject, ObjectType};
-    use crate::runner::ds::object_property::{PropertyDescriptor, PropertyKey};
+    use crate::runner::ds::object::ObjectType;
 
     // Create a new empty object
     let mut new_obj = SimpleObject::new();
 
-    // Get the prototype from the constructor's 'prototype' property
-    let ctor_borrowed = constructor.borrow();
-    let prototype_key = PropertyKey::Str("prototype".to_string());
-
-    if let Some(PropertyDescriptor::Data(data)) =
-        ctor_borrowed.as_js_object().get_object_base().properties.get(&prototype_key)
-    {
-        if let JsValue::Object(proto_obj) = &data.value {
-            // Set the prototype field on ObjectBase (used by get_prototype_of)
-            new_obj.get_object_base_mut().prototype = Some(proto_obj.clone());
-        }
+    // Resolve `ctor.prototype` via the normal property path (synthetic carriers
+    // for built-in constructors; real own props for user functions/classes).
+    let ctor_val = JsValue::Object(constructor.clone());
+    if let Ok(JsValue::Object(proto_obj)) = get_property_with_ctx(&ctor_val, "prototype", ctx) {
+        new_obj.get_object_base_mut().prototype = Some(proto_obj);
     }
-
-    drop(ctor_borrowed);
 
     let obj: JsObjectType = Rc::new(RefCell::new(ObjectType::Ordinary(Box::new(new_obj))));
     Ok(obj)
@@ -1094,7 +1160,12 @@ pub fn call_value(
                 drop(obj_ref);
                 if let Some(name) = builtin {
                     let sg = ctx.super_global.clone();
-                    let result = sg.borrow().call_constructor(&name, ctx, args);
+                    // Pass through `this` so `super()` / `Error.call(this, …)`
+                    // stamp the instance rather than allocating a free object.
+                    let result =
+                        sg.borrow()
+                            .call_constructor(&name, ctx, this_value, args);
+                    drop(sg);
                     if let Some(r) = result {
                         return r;
                     }
@@ -1430,28 +1501,75 @@ fn get_property_with_receiver(
                     }
                 }
             } else {
-                // `Constructor.prototype` (Object/Array/String/…): a synthetic
-                // carrier whose method reads dispatch to the constructor's
-                // registry methods — so `Object.prototype.toString.call(x)` and
+                // `Constructor.prototype` (Object/Array/String/Error/…): a
+                // synthetic carrier whose method reads dispatch to the
+                // constructor's registry methods — so
+                // `Object.prototype.toString.call(x)` and
                 // `Array.prototype.slice.call(args)` resolve to real callables.
+                //
+                // The carrier is installed as an own property on the constructor
+                // the first time it is read, so `Error.prototype === Error.prototype`
+                // and `class X extends Error` / `instanceof Error` share one identity.
                 if prop_name == "prototype" {
-                    if let Some(PropertyDescriptor::Data(d)) = obj
-                        .borrow()
-                        .as_js_object()
-                        .get_object_base()
-                        .properties
-                        .get(&PropertyKey::Str("__builtin_name__".to_string()))
-                    {
-                        if let JsValue::String(name) = &d.value {
-                            let carrier = make_object(Vec::new());
-                            set_own_prop(
-                                &carrier,
-                                "__proto_of__",
-                                JsValue::String(name.clone()),
-                                false,
-                            );
-                            return Ok(carrier);
+                    let builtin_name = {
+                        let obj_ref = obj.borrow();
+                        match obj_ref
+                            .as_js_object()
+                            .get_object_base()
+                            .properties
+                            .get(&PropertyKey::Str("__builtin_name__".to_string()))
+                        {
+                            Some(PropertyDescriptor::Data(d)) => match &d.value {
+                                JsValue::String(name) => Some(name.clone()),
+                                _ => None,
+                            },
+                            _ => None,
                         }
+                    };
+                    if let Some(name) = builtin_name {
+                        let carrier = make_object(Vec::new());
+                        set_own_prop(
+                            &carrier,
+                            "__proto_of__",
+                            JsValue::String(name.clone()),
+                            false,
+                        );
+                        // Cache on the constructor *before* wiring the parent
+                        // chain so a re-entrant read of `X.prototype` is stable.
+                        set_own_prop(
+                            lookup_target,
+                            "prototype",
+                            carrier.clone(),
+                            false,
+                        );
+                        // Wire `X.prototype.[[Prototype]] = Parent.prototype`
+                        // from the registry (TypeError→Error→Object→null).
+                        // Without this, `instanceof Error` / class-extends
+                        // Error and `Object.getPrototypeOf(TypeError.prototype)`
+                        // all fail once the carrier is materialised.
+                        let parent_name = {
+                            let sg = ctx.super_global.borrow();
+                            sg.builtin_parent(&name)
+                        };
+                        if let Some(parent_name) = parent_name {
+                            let sg = ctx.super_global.clone();
+                            let parent_ctor = sg.borrow().resolve_binding(&parent_name, ctx).ok();
+                            // Drop the super-global borrow before further ctx use.
+                            drop(sg);
+                            if let Some(parent_ctor) = parent_ctor {
+                                if let Ok(JsValue::Object(parent_proto)) =
+                                    get_property_with_ctx(&parent_ctor, "prototype", ctx)
+                                {
+                                    if let JsValue::Object(c) = &carrier {
+                                        c.borrow_mut()
+                                            .as_js_object_mut()
+                                            .get_object_base_mut()
+                                            .prototype = Some(parent_proto);
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(carrier);
                     }
                 }
                 // Check prototype chain - receiver stays the same
@@ -2243,29 +2361,14 @@ fn evaluate_binary_expression(
                 _ => return Err(JErrorType::TypeError("Right-hand side of 'instanceof' is not an object".to_string())),
             };
 
-            // Get the prototype property from the right-hand side (constructor.prototype)
-            let proto_key = PropertyKey::Str("prototype".to_string());
-            let right_prototype = {
-                let right_borrowed = right_obj.borrow();
-                if let Some(desc) = right_borrowed.as_js_object().get_own_property(&proto_key)? {
-                    match desc {
-                        PropertyDescriptor::Data(data) => {
-                            match &data.value {
-                                JsValue::Object(p) => Some(p.clone()),
-                                _ => None,
-                            }
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            };
-
-            // If right.prototype is not an object, return false
-            let target_proto = match right_prototype {
-                Some(p) => p,
-                None => return Ok(JsValue::Boolean(false)),
+            // Resolve `constructor.prototype` via the normal property path so
+            // synthetic built-in carriers (Error/TypeError/…) are materialised
+            // and cached — own-property-only lookup left `instanceof Error`
+            // false until something else had forced the carrier into place.
+            let ctor_val = JsValue::Object(right_obj);
+            let target_proto = match get_property_with_ctx(&ctor_val, "prototype", ctx)? {
+                JsValue::Object(p) => p,
+                _ => return Ok(JsValue::Boolean(false)),
             };
 
             // Walk the prototype chain of left
@@ -2282,13 +2385,31 @@ fn evaluate_binary_expression(
             Ok(JsValue::Boolean(false))
         }
         BinaryOperator::In => {
-            let prop_key = PropertyKey::Str(to_property_key(&left_val));
+            let prop_name = to_property_key(&left_val);
+            let prop_key = PropertyKey::Str(prop_name.clone());
             match &right_val {
                 JsValue::Object(obj) => {
-                    let has = obj.borrow().as_js_object().has_property(&prop_key);
-                    Ok(JsValue::Boolean(has))
+                    let has_own = obj.borrow().as_js_object().has_property(&prop_key);
+                    if has_own {
+                        return Ok(JsValue::Boolean(true));
+                    }
+                    // Built-in constructor statics (`Object.create`, `Array.from`)
+                    // and prototype methods live in the registry, not as real
+                    // own properties on the sentinel — still visible to `in`.
+                    let type_name = builtin_type_name(&right_val);
+                    if ctx.super_global.borrow().has_method(&type_name, &prop_name) {
+                        // Statics only on the constructor; prototype methods on
+                        // any instance/carrier of that type.
+                        if is_static_method(&type_name, &prop_name) {
+                            return Ok(JsValue::Boolean(is_constructor_sentinel(&right_val)));
+                        }
+                        return Ok(JsValue::Boolean(true));
+                    }
+                    Ok(JsValue::Boolean(false))
                 }
-                _ => Err(JErrorType::TypeError("Cannot use 'in' operator with non-object".to_string()))
+                _ => Err(JErrorType::TypeError(
+                    "Cannot use 'in' operator with non-object".to_string(),
+                )),
             }
         }
     }
@@ -2891,6 +3012,16 @@ fn loose_equality(left: &JsValue, right: &JsValue) -> bool {
         _ => {}
     }
 
+    // Boxed primitives (`new String("x")`, `Object(1)`) store the primitive
+    // under `__primitive_value__` — unwrap before the rest of the algorithm so
+    // `"ABC" == new String("ABC")` holds.
+    if let Some(p) = get_own_prop_value(left, "__primitive_value__") {
+        return loose_equality(&p, right);
+    }
+    if let Some(p) = get_own_prop_value(right, "__primitive_value__") {
+        return loose_equality(left, &p);
+    }
+
     match (left, right) {
         (JsValue::Null, JsValue::Undefined) | (JsValue::Undefined, JsValue::Null) => true,
         (JsValue::Number(_), JsValue::String(_)) => {
@@ -3408,18 +3539,58 @@ pub fn to_primitive(value: &JsValue, hint: &str, ctx: &mut EvalContext) -> Value
     } else {
         ["valueOf", "toString"]
     };
+    // Date's @@toPrimitive treats hint "default" like "string" (prefer
+    // toString over valueOf) so `date + date` string-concats. Without a real
+    // Symbol.toPrimitive install, flip the order for Date receivers.
+    let order: [&str; 2] = if hint == "default" && builtin_type_name(value) == "Date" {
+        ["toString", "valueOf"]
+    } else {
+        order
+    };
+
+    let mut tried_coercer = false;
     for m in order {
         let method = get_property_with_ctx(value, m, ctx)?;
-        // Skip the materialized native-method values — only honor real
-        // user-defined `valueOf`/`toString` (own or on a user prototype).
-        if value_is_callable(&method) && native_method_parts(&method).is_none() {
-            let res = call_value(&method, value.clone(), alloc::vec![], ctx)?;
-            if !matches!(res, JsValue::Object(_)) {
-                return Ok(res);
+        if !value_is_callable(&method) {
+            continue;
+        }
+        // Skip *only* Object.prototype's generic valueOf (returns `this`) and
+        // toString (`[object Object]`) — otherwise every plain `{}` would
+        // coerce via the now-materialized natives. Number/String/Date/etc.
+        // natives and all user methods must still run.
+        if let Some((objname, mname)) = native_method_parts(&method) {
+            if objname == "Object" && (mname == "valueOf" || mname == "toString") {
+                continue;
             }
         }
+        tried_coercer = true;
+        let res = call_value(&method, value.clone(), alloc::vec![], ctx)?;
+        if !matches!(res, JsValue::Object(_)) {
+            return Ok(res);
+        }
     }
-    // 4. No user coercion available: leave the object for the legacy path.
+    // Spec OrdinaryToPrimitive: if every callable returned an Object, TypeError.
+    // Only when we actually tried a coercer (user or type-specific native) —
+    // plain `{}` (Object natives skipped) still falls through for legacy paths.
+    if tried_coercer {
+        return Err(JErrorType::TypeError(
+            "Cannot convert object to primitive value".to_string(),
+        ));
+    }
+    // Functions have no user valueOf/toString and Object natives are skipped —
+    // still coerce to a function source string so `fn + 1` / `"" + fn` work
+    // (Function.prototype.toString semantics, source not preserved).
+    if value_is_callable(value) {
+        let name = match get_own_prop_value(value, "name") {
+            Some(JsValue::String(s)) if !s.is_empty() => s,
+            _ => String::new(),
+        };
+        return Ok(JsValue::String(alloc::format!(
+            "function {}() {{ [native code] }}",
+            name
+        )));
+    }
+    // 4. No coercer available: leave the object for the legacy path.
     Ok(value.clone())
 }
 
@@ -3456,10 +3627,38 @@ pub fn builtin_type_name(v: &JsValue) -> String {
                 .properties
                 .contains_key(&PropertyKey::Str("__array__".to_string()))
             {
-                "Array".to_string()
-            } else {
-                "Object".to_string()
+                return "Array".to_string();
             }
+            // Boxed primitives (`new Number(1)`, `new String("x")`): the
+            // instance itself has no tag, but its [[Prototype]] is the
+            // synthetic `Number.prototype` / `String.prototype` carrier.
+            // Walk one step (and a few more for Error subclasses) so
+            // `(new Number(1)).toString` resolves to Number's method, not
+            // Object.prototype.toString → "[object Object]".
+            let mut cur = base.prototype.clone();
+            let mut steps = 0usize;
+            while let Some(p) = cur {
+                if steps > 8 {
+                    break;
+                }
+                steps += 1;
+                let pb = p.borrow();
+                let pbase = pb.as_js_object().get_object_base();
+                if let Some(PropertyDescriptor::Data(d)) = pbase
+                    .properties
+                    .get(&PropertyKey::Str("__proto_of__".to_string()))
+                {
+                    if let JsValue::String(name) = &d.value {
+                        // Object.prototype is the default chain root — keep
+                        // looking only if we haven't found a more specific type.
+                        if name != "Object" {
+                            return name.clone();
+                        }
+                    }
+                }
+                cur = pbase.prototype.clone();
+            }
+            "Object".to_string()
         }
         _ => "Object".to_string(),
     }
@@ -3487,23 +3686,62 @@ pub fn make_native_method(objname: &str, method: &str, default_this: JsValue) ->
     obj
 }
 
+/// True when `v` is a built-in **constructor sentinel** (`Object`, `Array`, …)
+/// as materialized by `CorePluginResolver` — not an instance and not a
+/// synthetic `X.prototype` carrier (`__proto_of__`).
+fn is_constructor_sentinel(v: &JsValue) -> bool {
+    let JsValue::Object(o) = v else {
+        return false;
+    };
+    let b = o.borrow();
+    let base = b.as_js_object().get_object_base();
+    if base
+        .properties
+        .contains_key(&PropertyKey::Str("__proto_of__".to_string()))
+    {
+        return false;
+    }
+    matches!(
+        base.properties
+            .get(&PropertyKey::Str("__builtin_name__".to_string())),
+        Some(PropertyDescriptor::Data(d)) if matches!(&d.value, JsValue::String(_))
+    )
+}
+
 /// If `receiver`'s builtin type provides `prop_name` as a registry method,
 /// return a first-class callable bound (by default) to `receiver`. Used as the
 /// fallback when a property isn't found as a real own/prototype property, so a
 /// builtin prototype method read (`[].map`, `obj.hasOwnProperty`) yields a
 /// function value instead of `undefined`.
+///
+/// Constructor **statics** (`Object.create`, `Object.keys`, `Array.from`) are
+/// only materialised when the receiver *is* that constructor sentinel — so
+/// `Object.create` is a real function value (for extract/pass/feature-detect)
+/// while `({}).create` stays undefined.
 pub fn materialize_builtin_method(
     receiver: &JsValue,
     prop_name: &str,
     ctx: &EvalContext,
 ) -> Option<JsValue> {
-    let type_name = builtin_type_name(receiver);
-    // The registry stores constructor *statics* (`Object.keys`, `Array.from`)
-    // in the same table as prototype methods. Statics live on the constructor,
-    // never on instances/prototypes — exposing them here would make
-    // `({}).keys` a function (a spec violation and a test262 regression), so
-    // exclude them. `Object.keys(x)` still works via the static-dispatch path.
+    let mut type_name = builtin_type_name(receiver);
+    // Callables that aren't a more specific builtin (Array/Date/…) still need
+    // Function.prototype methods (`toString`, `call`, `apply`, `bind`).
+    if type_name == "Object" && value_is_callable(receiver) {
+        type_name = "Function".to_string();
+    }
     if is_static_method(&type_name, prop_name) {
+        if !is_constructor_sentinel(receiver) {
+            // Statics never live on instances / prototype carriers.
+            return None;
+        }
+        // Constructor static — materialise if the registry has it.
+        if ctx.super_global.borrow().has_method(&type_name, prop_name) {
+            return Some(make_native_method(
+                &type_name,
+                prop_name,
+                receiver.clone(),
+            ));
+        }
         return None;
     }
     if ctx.super_global.borrow().has_method(&type_name, prop_name) {
@@ -3520,19 +3758,34 @@ fn is_static_method(type_name: &str, method: &str) -> bool {
     match type_name {
         "Object" => matches!(
             method,
-            "keys" | "values" | "entries" | "assign" | "defineProperty"
-                | "defineProperties" | "getOwnPropertyDescriptor"
-                | "getOwnPropertyDescriptors" | "getOwnPropertyNames"
-                | "getOwnPropertySymbols" | "create" | "freeze" | "seal"
-                | "preventExtensions" | "isFrozen" | "isSealed" | "isExtensible"
-                | "getPrototypeOf" | "setPrototypeOf" | "is" | "fromEntries"
+            "keys"
+                | "values"
+                | "entries"
+                | "assign"
+                | "defineProperty"
+                | "defineProperties"
+                | "getOwnPropertyDescriptor"
+                | "getOwnPropertyDescriptors"
+                | "getOwnPropertyNames"
+                | "getOwnPropertySymbols"
+                | "hasOwn"
+                | "create"
+                | "freeze"
+                | "seal"
+                | "preventExtensions"
+                | "isFrozen"
+                | "isSealed"
+                | "isExtensible"
+                | "getPrototypeOf"
+                | "setPrototypeOf"
+                | "is"
+                | "fromEntries"
         ),
         "Array" => matches!(method, "from" | "isArray" | "of"),
         "String" => matches!(method, "fromCharCode" | "fromCodePoint" | "raw"),
         "Number" => matches!(
             method,
-            "isInteger" | "isFinite" | "isNaN" | "isSafeInteger"
-                | "parseFloat" | "parseInt"
+            "isInteger" | "isFinite" | "isNaN" | "isSafeInteger" | "parseFloat" | "parseInt"
         ),
         _ => false,
     }
@@ -4557,20 +4810,29 @@ pub fn evaluate_class(class_data: &ClassData, ctx: &mut EvalContext) -> ValueRes
         let parent = evaluate_expression(super_class, ctx)?;
         match &parent {
             JsValue::Object(parent_obj) => {
-                // Get parent.prototype
-                let borrowed = parent_obj.borrow();
-                let proto_key = PropertyKey::Str("prototype".to_string());
-                if let Some(PropertyDescriptor::Data(data)) = borrowed.as_js_object().get_object_base().properties.get(&proto_key) {
-                    if let JsValue::Object(proto) = &data.value {
-                        Some((parent_obj.clone(), proto.clone()))
-                    } else {
-                        return Err(JErrorType::TypeError("Parent class prototype is not an object".to_string()));
+                // Resolve `Parent.prototype` through the normal property path so
+                // built-in constructors (Error, Array, …) whose `prototype` is a
+                // synthetic carrier still work with `class X extends Error`.
+                let proto_val = get_property_with_ctx(&parent, "prototype", ctx)?;
+                match proto_val {
+                    JsValue::Object(proto) => Some((parent_obj.clone(), proto)),
+                    JsValue::Null => {
+                        return Err(JErrorType::TypeError(
+                            "Class extends null is not supported".to_string(),
+                        ));
                     }
-                } else {
-                    return Err(JErrorType::TypeError("Parent class has no prototype".to_string()));
+                    _ => {
+                        return Err(JErrorType::TypeError(
+                            "Parent class prototype is not an object".to_string(),
+                        ));
+                    }
                 }
             }
-            _ => return Err(JErrorType::TypeError("Class extends value is not a constructor".to_string())),
+            _ => {
+                return Err(JErrorType::TypeError(
+                    "Class extends value is not a constructor".to_string(),
+                ))
+            }
         }
     } else {
         None

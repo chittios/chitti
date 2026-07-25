@@ -12,6 +12,7 @@ pub mod number;
 pub mod math;
 pub mod json;
 pub mod error;
+pub mod function;
 pub mod collections;
 pub mod date;
 pub mod regexp;

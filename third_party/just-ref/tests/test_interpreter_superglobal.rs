@@ -245,6 +245,7 @@ impl PluginResolver for TestLibPlugin {
         &self,
         object_name: &str,
         _ctx: &mut EvalContext,
+        _this: JsValue,
         args: Vec<JsValue>,
     ) -> Option<Result<JsValue, JErrorType>> {
         if object_name == "CustomObject" {

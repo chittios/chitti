@@ -113,11 +113,18 @@ impl PluginResolver for CorePluginResolver {
         &self,
         object_name: &str,
         ctx: &mut EvalContext,
+        this: JsValue,
         args: Vec<JsValue>,
     ) -> Option<Result<JsValue, JErrorType>> {
         self.registry
             .get_constructor(object_name)
-            .map(|ctor_fn| ctor_fn.call(ctx, JsValue::Undefined, args))
+            .map(|ctor_fn| ctor_fn.call(ctx, this, args))
+    }
+
+    fn builtin_parent(&self, object_name: &str) -> Option<String> {
+        self.registry
+            .get_object(object_name)
+            .and_then(|o| o.prototype.clone())
     }
 
     fn name(&self) -> &str {

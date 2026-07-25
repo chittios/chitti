@@ -717,6 +717,7 @@ impl PluginResolver for DomResolver {
             }
             "navigator" => {
                 let n = make_object(vec![]);
+                set_own_prop(&n, "__builtin_name__", s("navigator"), false);
                 // Match the HTTP `User-Agent` the loader sends, so UA-sniffing
                 // page scripts agree with the server's content negotiation.
                 set_own_prop(&n, "userAgent", s(super::loader::BROWSER_USER_AGENT), true);
@@ -727,6 +728,11 @@ impl PluginResolver for DomResolver {
                 set_own_prop(&n, "appName", s("Netscape"), true);
                 set_own_prop(&n, "product", s("Gecko"), true);
                 set_own_prop(&n, "onLine", JsValue::Boolean(true), true);
+                // Beacon API (https://w3c.github.io/beacon/) — standard; no-op
+                // success so feature-detecting pages don't branch into Image hacks.
+                let sb = make_object(vec![]);
+                set_own_prop(&sb, "__builtin_name__", s("sendBeacon"), false);
+                set_own_prop(&n, "sendBeacon", sb, true);
                 n
             }
             "performance" => {
@@ -757,6 +763,7 @@ impl PluginResolver for DomResolver {
         &self,
         object_name: &str,
         ctx: &mut EvalContext,
+        _this: JsValue,
         args: Vec<JsValue>,
     ) -> Option<Result<JsValue, JErrorType>> {
         // Bare window globals invoked as functions.
@@ -1113,6 +1120,8 @@ impl PluginResolver for DomResolver {
                 self.dom.borrow_mut().log.push(as_str(&a0));
                 JsValue::Undefined
             }
+            // Beacon API: `navigator.sendBeacon(url[, data])` — no-op success.
+            ("navigator", "sendBeacon") | ("sendBeacon", _) => JsValue::Boolean(true),
             ("window", "getComputedStyle") => {
                 match self.node_of(&a0) {
                     Some(i) => style_wrapper(i),

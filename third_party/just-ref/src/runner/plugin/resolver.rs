@@ -60,13 +60,28 @@ pub trait PluginResolver {
 
     /// Get a constructor for the given object name, if available.
     ///
+    /// `this` is the pre-created instance when called via `new` / `super()`
+    /// (so constructors can stamp fields onto it); may be `undefined` for a
+    /// bare `Error("msg")`-style call.
+    ///
     /// Returns `None` if this resolver doesn't provide a constructor for the name.
     fn call_constructor(
         &self,
         _object_name: &str,
         _ctx: &mut EvalContext,
+        _this: JsValue,
         _args: Vec<JsValue>,
     ) -> Option<Result<JsValue, JErrorType>> {
+        None
+    }
+
+    /// Declared prototype-chain parent for a built-in constructor, if any.
+    ///
+    /// e.g. `TypeError` → `Some("Error")`, `Error` → `Some("Object")`,
+    /// `Object` → `None` (`with_no_prototype`). Used to wire synthetic
+    /// `X.prototype.[[Prototype]] = Parent.prototype` so `instanceof` and
+    /// `Object.getPrototypeOf(TypeError.prototype)` match real engines.
+    fn builtin_parent(&self, _object_name: &str) -> Option<String> {
         None
     }
 

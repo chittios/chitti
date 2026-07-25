@@ -188,10 +188,13 @@ impl SuperGlobalEnvironment {
     }
 
     /// Call a constructor on a super-global object.
+    ///
+    /// `this` is the instance for `new`/`super()` (or `undefined` for a bare call).
     pub fn call_constructor(
         &self,
         object_name: &str,
         ctx: &mut EvalContext,
+        this: JsValue,
         args: Vec<JsValue>,
     ) -> Option<Result<JsValue, JErrorType>> {
         let idx = if let Some(&idx) = self.resolver_map.borrow().get(object_name) {
@@ -199,7 +202,18 @@ impl SuperGlobalEnvironment {
         } else {
             self.find_resolver_index(object_name)?
         };
-        self.resolvers[idx].call_constructor(object_name, ctx, args)
+        self.resolvers[idx].call_constructor(object_name, ctx, this, args)
+    }
+
+    /// Registry-declared parent for a built-in constructor (`TypeError` →
+    /// `"Error"`, `Object` → `None`). See [`PluginResolver::builtin_parent`].
+    pub fn builtin_parent(&self, object_name: &str) -> Option<String> {
+        let idx = if let Some(&idx) = self.resolver_map.borrow().get(object_name) {
+            idx
+        } else {
+            self.find_resolver_index(object_name)?
+        };
+        self.resolvers[idx].builtin_parent(object_name)
     }
 
     /// Check if any resolver provides the given name.

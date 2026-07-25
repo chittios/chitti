@@ -13,6 +13,7 @@
 use just_engine::parser::JsParser;
 use just_engine::runner::ds::value::JsValue;
 use just_engine::runner::eval::statement::execute_statement;
+use just_engine::runner::eval::types::CompletionType;
 use just_engine::runner::plugin::registry::BuiltInRegistry;
 use just_engine::runner::plugin::types::EvalContext;
 use std::env;
@@ -120,9 +121,24 @@ fn run_raw(src: &str) -> Outcome {
     ctx.install_core_builtins(BuiltInRegistry::with_core());
     just_engine::runner::eval::statement::hoist_var_declarations(&ast.body, &mut ctx);
     for stmt in &ast.body {
-        if let Err(e) = execute_statement(stmt, &mut ctx) {
-            let msg: String = describe_error(&e).replace('\n', " ").chars().take(220).collect();
-            return Outcome::Fail(format!("runtime threw: {msg}"));
+        match execute_statement(stmt, &mut ctx) {
+            Err(e) => {
+                let msg: String =
+                    describe_error(&e).replace('\n', " ").chars().take(220).collect();
+                return Outcome::Fail(format!("runtime threw: {msg}"));
+            }
+            // Top-level `throw x` returns Ok(Throw completion), not Err —
+            // treat it as a failure the same way an in-function throw does.
+            Ok(comp) if comp.completion_type == CompletionType::Throw => {
+                let v = comp.value.unwrap_or(JsValue::Undefined);
+                let msg: String = describe_thrown_value(&v)
+                    .replace('\n', " ")
+                    .chars()
+                    .take(220)
+                    .collect();
+                return Outcome::Fail(format!("runtime threw: {msg}"));
+            }
+            Ok(_) => {}
         }
     }
     Outcome::Pass
@@ -536,31 +552,34 @@ function verifyNotConfigurable(obj, name) {
     Ok(format!("{preamble}\n{s}\n"))
 }
 
+/// Render a thrown JS value into a readable one-liner.
+fn describe_thrown_value(v: &JsValue) -> String {
+    use just_engine::runner::eval::expression::get_own_prop_value;
+    let name = match get_own_prop_value(v, "name") {
+        Some(JsValue::String(s)) => s,
+        _ => "Thrown".to_string(),
+    };
+    let msg = match get_own_prop_value(v, "message") {
+        Some(JsValue::String(s)) => s,
+        _ => match v {
+            JsValue::String(s) => s.clone(),
+            _ => String::new(),
+        },
+    };
+    format!("Thrown[{name}]: {msg}")
+}
+
 /// Render a thrown error into a readable one-liner, extracting `.name`/
 /// `.message` from thrown Error-like objects so assertion failures are legible.
 fn describe_error(e: &just_engine::runner::ds::error::JErrorType) -> String {
     use just_engine::runner::ds::error::JErrorType;
-    use just_engine::runner::eval::expression::get_own_prop_value;
     match e {
         JErrorType::ReferenceError(m) => format!("ReferenceError({m:?})"),
         JErrorType::TypeError(m) => format!("TypeError({m:?})"),
         JErrorType::RangeError(m) => format!("RangeError({m:?})"),
         JErrorType::SyntaxError(m) => format!("SyntaxError({m:?})"),
         JErrorType::YieldValue(_) => "YieldValue".to_string(),
-        JErrorType::Thrown(v) => {
-            let name = match get_own_prop_value(v, "name") {
-                Some(JsValue::String(s)) => s,
-                _ => "Thrown".to_string(),
-            };
-            let msg = match get_own_prop_value(v, "message") {
-                Some(JsValue::String(s)) => s,
-                _ => match v {
-                    JsValue::String(s) => s.clone(),
-                    _ => String::new(),
-                },
-            };
-            format!("Thrown[{name}]: {msg}")
-        }
+        JErrorType::Thrown(v) => describe_thrown_value(v),
     }
 }
 
@@ -630,9 +649,19 @@ fn run_one(path: &Path, raw: bool) -> Outcome {
 
     let mut threw: Option<String> = None;
     for stmt in &ast.body {
-        if let Err(e) = execute_statement(stmt, &mut ctx) {
-            threw = Some(describe_error(&e));
-            break;
+        match execute_statement(stmt, &mut ctx) {
+            Err(e) => {
+                threw = Some(describe_error(&e));
+                break;
+            }
+            // Top-level `throw x` is Ok(Throw), not Err — still a failure for
+            // positive tests / success for negative tests (handled below).
+            Ok(comp) if comp.completion_type == CompletionType::Throw => {
+                let v = comp.value.unwrap_or(JsValue::Undefined);
+                threw = Some(describe_thrown_value(&v));
+                break;
+            }
+            Ok(_) => {}
         }
     }
     let _ = JsValue::Undefined;

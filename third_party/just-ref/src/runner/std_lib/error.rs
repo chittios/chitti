@@ -1,6 +1,8 @@
 //! Error built-in objects.
 //!
 //! Provides Error, TypeError, ReferenceError, SyntaxError, RangeError constructors.
+//! Each constructs a real object with `name` + `message` (and a `__builtin_name__`
+//! tag so `Object.prototype.toString` reports the right class).
 
 // ChittiOS-alloc-prelude
 #[allow(unused_imports)]
@@ -11,6 +13,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use crate::runner::ds::error::JErrorType;
 use crate::runner::ds::value::JsValue;
+use crate::runner::eval::expression::{make_object, set_own_prop};
 use crate::runner::plugin::registry::BuiltInRegistry;
 use crate::runner::plugin::types::{BuiltInObject, EvalContext};
 
@@ -19,8 +22,7 @@ pub fn register(registry: &mut BuiltInRegistry) {
     // Base Error
     let error = BuiltInObject::new("Error")
         .with_constructor(error_constructor)
-        .add_method("toString", error_to_string)
-        .add_method("message", error_message);
+        .add_method("toString", error_to_string);
     registry.register_object(error);
 
     // TypeError
@@ -79,111 +81,147 @@ fn get_message(args: &[JsValue]) -> String {
     }
 }
 
-/// Error constructor.
+/// Build a real Error-like object: `{ name, message }` + tag.
+fn make_error(name: &str, message: String) -> JsValue {
+    let obj = make_object(alloc::vec![
+        ("name".to_string(), JsValue::String(name.to_string())),
+        ("message".to_string(), JsValue::String(message)),
+    ]);
+    // So `Object.prototype.toString.call(e)` → `[object Error]`.
+    set_own_prop(
+        &obj,
+        "__builtin_name__",
+        JsValue::String(name.to_string()),
+        false,
+    );
+    obj
+}
+
+/// Shared body for all Error* constructors.
+fn construct_error(
+    name: &str,
+    ctx: &mut EvalContext,
+    this: JsValue,
+    args: Vec<JsValue>,
+) -> Result<JsValue, JErrorType> {
+    use crate::runner::eval::expression::get_property_with_ctx;
+    let message = get_message(&args);
+    // Prefer to stamp fields onto the `new`-created `this` when it's already an
+    // object (prototype already wired by `create_new_object_for_constructor`).
+    let result = if let JsValue::Object(_) = &this {
+        set_own_prop(&this, "name", JsValue::String(name.to_string()), true);
+        set_own_prop(&this, "message", JsValue::String(message), true);
+        set_own_prop(
+            &this,
+            "__builtin_name__",
+            JsValue::String(name.to_string()),
+            false,
+        );
+        this
+    } else {
+        // `Error("msg")` without `new` also creates an Error object (ES5+).
+        make_error(name, message)
+    };
+    // Ensure `[[Prototype]]` is `Name.prototype` when the super-global
+    // short-circuit path called us with `this === undefined` (no pre-wired
+    // instance). Synthetic carriers for built-in constructors come from the
+    // property path, not own data props.
+    if let JsValue::Object(o) = &result {
+        let needs_proto = o.borrow().as_js_object().get_prototype_of().is_none();
+        if needs_proto {
+            let sg = ctx.super_global.clone();
+            let ctor = {
+                let env = sg.borrow();
+                env.resolve_binding(name, ctx).ok()
+            }; // drop env borrow before further ctx use
+            if let Some(ctor) = ctor {
+                if let Ok(JsValue::Object(proto)) = get_property_with_ctx(&ctor, "prototype", ctx) {
+                    o.borrow_mut()
+                        .as_js_object_mut()
+                        .get_object_base_mut()
+                        .prototype = Some(proto);
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
 fn error_constructor(
-    _ctx: &mut EvalContext,
-    _this: JsValue,
+    ctx: &mut EvalContext,
+    this: JsValue,
     args: Vec<JsValue>,
 ) -> Result<JsValue, JErrorType> {
-    let message = get_message(&args);
-    // TODO: Return an actual Error object when object creation is implemented
-    // For now, return the message as a string
-    Ok(JsValue::String(format!("Error: {}", message)))
+    construct_error("Error", ctx, this, args)
 }
 
-/// TypeError constructor.
 fn type_error_constructor(
-    _ctx: &mut EvalContext,
-    _this: JsValue,
+    ctx: &mut EvalContext,
+    this: JsValue,
     args: Vec<JsValue>,
 ) -> Result<JsValue, JErrorType> {
-    let message = get_message(&args);
-    Ok(JsValue::String(format!("TypeError: {}", message)))
+    construct_error("TypeError", ctx, this, args)
 }
 
-/// ReferenceError constructor.
 fn reference_error_constructor(
-    _ctx: &mut EvalContext,
-    _this: JsValue,
+    ctx: &mut EvalContext,
+    this: JsValue,
     args: Vec<JsValue>,
 ) -> Result<JsValue, JErrorType> {
-    let message = get_message(&args);
-    Ok(JsValue::String(format!("ReferenceError: {}", message)))
+    construct_error("ReferenceError", ctx, this, args)
 }
 
-/// SyntaxError constructor.
 fn syntax_error_constructor(
-    _ctx: &mut EvalContext,
-    _this: JsValue,
+    ctx: &mut EvalContext,
+    this: JsValue,
     args: Vec<JsValue>,
 ) -> Result<JsValue, JErrorType> {
-    let message = get_message(&args);
-    Ok(JsValue::String(format!("SyntaxError: {}", message)))
+    construct_error("SyntaxError", ctx, this, args)
 }
 
-/// RangeError constructor.
 fn range_error_constructor(
-    _ctx: &mut EvalContext,
-    _this: JsValue,
+    ctx: &mut EvalContext,
+    this: JsValue,
     args: Vec<JsValue>,
 ) -> Result<JsValue, JErrorType> {
-    let message = get_message(&args);
-    Ok(JsValue::String(format!("RangeError: {}", message)))
+    construct_error("RangeError", ctx, this, args)
 }
 
-/// EvalError constructor.
 fn eval_error_constructor(
-    _ctx: &mut EvalContext,
-    _this: JsValue,
+    ctx: &mut EvalContext,
+    this: JsValue,
     args: Vec<JsValue>,
 ) -> Result<JsValue, JErrorType> {
-    let message = get_message(&args);
-    Ok(JsValue::String(format!("EvalError: {}", message)))
+    construct_error("EvalError", ctx, this, args)
 }
 
-/// URIError constructor.
 fn uri_error_constructor(
-    _ctx: &mut EvalContext,
-    _this: JsValue,
+    ctx: &mut EvalContext,
+    this: JsValue,
     args: Vec<JsValue>,
 ) -> Result<JsValue, JErrorType> {
-    let message = get_message(&args);
-    Ok(JsValue::String(format!("URIError: {}", message)))
+    construct_error("URIError", ctx, this, args)
 }
 
-/// Error.prototype.toString
+/// Error.prototype.toString → `"Name: message"` or just `Name`.
 fn error_to_string(
     _ctx: &mut EvalContext,
     this: JsValue,
     _args: Vec<JsValue>,
 ) -> Result<JsValue, JErrorType> {
-    // For now, just return the value itself if it's a string
-    match this {
-        JsValue::String(s) => Ok(JsValue::String(s)),
-        JsValue::Object(_) => {
-            // TODO: Get name and message properties from object
-            Ok(JsValue::String("Error".to_string()))
-        }
-        _ => Ok(JsValue::String("Error".to_string())),
-    }
-}
-
-/// Error.prototype.message getter
-fn error_message(
-    _ctx: &mut EvalContext,
-    this: JsValue,
-    _args: Vec<JsValue>,
-) -> Result<JsValue, JErrorType> {
-    // For now, return empty string (actual implementation needs object properties)
-    match this {
-        JsValue::String(s) => {
-            // Extract message part from "ErrorType: message" format
-            if let Some(idx) = s.find(": ") {
-                Ok(JsValue::String(s[idx + 2..].to_string()))
-            } else {
-                Ok(JsValue::String(String::new()))
-            }
-        }
-        _ => Ok(JsValue::String(String::new())),
+    use crate::runner::eval::expression::get_own_prop_value;
+    let name = match get_own_prop_value(&this, "name") {
+        Some(JsValue::String(s)) => s,
+        _ => String::from("Error"),
+    };
+    let message = match get_own_prop_value(&this, "message") {
+        Some(JsValue::String(s)) => s,
+        Some(v) => v.to_string(),
+        None => String::new(),
+    };
+    if message.is_empty() {
+        Ok(JsValue::String(name))
+    } else {
+        Ok(JsValue::String(format!("{name}: {message}")))
     }
 }
