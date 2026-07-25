@@ -101,7 +101,7 @@ impl Default for UiConfig {
             chat_title: "Shell Agent".to_string(),
             logs_title: "ktrace".to_string(),
             status_left: "ChittiOS v${version}".to_string(),
-            status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${datetime} ${tz}".to_string(),
+            status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${datetime} ${tz}".to_string(),
             tz_offset: 0,
             splash: true,
             theme: THEME_DEFAULTS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
@@ -173,6 +173,7 @@ impl UiConfig {
             // Forward-migrate the earlier built-in defaults to the current one.
             t if t == "${datetime}  ${tz}" => d.status_right.clone(),
             t if t == "${kbd} ${mouse}  ${net}  ${mem}  ${cpu}  ${datetime} ${tz}" => d.status_right.clone(),
+            t if t == "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${datetime} ${tz}" => d.status_right.clone(),
             t => t,
         };
         UiConfig {
@@ -353,8 +354,17 @@ pub fn status_strings() -> (String, String) {
 }
 
 /// Substitute `${var}` tokens: brand, version, date, time, datetime, tz, model,
-/// arch, uptime. Unknown vars are left as-is.
+/// arch, uptime, battery. Unknown vars are left as-is.
 fn resolve_template(t: &str) -> String {
+    expand(t, &resolve_var)
+}
+
+/// The pure substitution, with the variable lookup passed in.
+///
+/// Split from [`resolve_template`] so the separator handling is testable: every real
+/// variable reads the clock, the network or the battery, and the interesting behaviour
+/// here is what happens to the layout when one of them resolves to nothing.
+pub(crate) fn expand(t: &str, resolve: &dyn Fn(&str) -> String) -> String {
     let mut out = String::new();
     let bytes = t.as_bytes();
     let mut i = 0;
@@ -362,13 +372,31 @@ fn resolve_template(t: &str) -> String {
         if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
             if let Some(end) = t[i + 2..].find('}') {
                 let var = &t[i + 2..i + 2 + end];
-                out.push_str(&resolve_var(var));
+                let v = resolve(var);
                 i += 2 + end + 1;
+                if v.is_empty() {
+                    // A variable that resolves to nothing (no battery, say) would
+                    // otherwise leave its separator behind and the bar would read as
+                    // though something failed to draw. Swallow the spaces that follow
+                    // it — the ones *before* it stay, so the neighbouring fields keep
+                    // exactly one separator between them and no other spacing in the
+                    // template changes.
+                    while bytes.get(i) == Some(&b' ') {
+                        i += 1;
+                    }
+                    continue;
+                }
+                out.push_str(&v);
                 continue;
             }
         }
         out.push(bytes[i] as char);
         i += 1;
+    }
+    // An empty variable at the very end leaves its leading separator as trailing
+    // space, which shifts a right-aligned bar by a cell.
+    while out.ends_with(' ') {
+        out.pop();
     }
     out
 }
@@ -405,6 +433,14 @@ fn resolve_var(var: &str) -> String {
         }
         "cpu" => alloc::format!("cpu {:>3}%", crate::shell::cpu_percent()),
         "cores" => alloc::format!("{}c", crate::arch::cpu_count()),
+        // The ACPI battery percentage, evaluated out of the firmware's own `_BST`
+        // (cached — one reading costs an AML evaluation plus a handful of embedded-
+        // controller transactions). Empty on a machine with no readable battery, and
+        // `resolve_template` drops the separator that follows an empty expansion, so a
+        // desktop's status bar looks exactly as it did before.
+        "battery" => crate::drivers::battery::cached()
+            .map(|b| crate::drivers::battery::format(&b))
+            .unwrap_or_default(),
         "net" => (if crate::net::is_up() { "net up" } else { "net --" }).to_string(),
         "kbd" => {
             let last = crate::console::input_activity_ms();
@@ -481,6 +517,75 @@ pub fn shortcuts() -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default status-bar template, so the tests below exercise the real layout.
+    const BAR: &str = "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${datetime} ${tz}";
+
+    #[test_case]
+    fn a_present_battery_appears_between_cores_and_the_clock() {
+        let r = |v: &str| -> String {
+            match v {
+                "kbd" => "kbd ".to_string(),
+                "mouse" => "mse ".to_string(),
+                "net" => "net up".to_string(),
+                "mem" => "mem 40M/6.0G".to_string(),
+                "cpu" => "cpu   3%".to_string(),
+                "cores" => "8c".to_string(),
+                "battery" => "+42%".to_string(),
+                "datetime" => "2026-07-25 19:30".to_string(),
+                "tz" => "UTC".to_string(),
+                other => alloc::format!("${{{}}}", other),
+            }
+        };
+        assert_eq!(
+            expand(BAR, &r),
+            "kbd  mse   net up  mem 40M/6.0G  cpu   3% 8c  +42%  2026-07-25 19:30 UTC"
+        );
+    }
+
+    #[test_case]
+    fn an_empty_variable_takes_its_separator_with_it() {
+        // A desktop has no battery. The bar must look exactly as it did before the
+        // variable existed — not carry a four-space hole where a field would be.
+        let r = |v: &str| -> String {
+            match v {
+                "battery" => String::new(),
+                "cores" => "8c".to_string(),
+                "datetime" => "2026-07-25 19:30".to_string(),
+                other => alloc::format!("${{{}}}", other),
+            }
+        };
+        assert_eq!(expand("${cores}  ${battery}  ${datetime}", &r), "8c  2026-07-25 19:30");
+        // First and last positions too: neither may leave a stray edge space, because
+        // the right-hand text is placed by its own length.
+        assert_eq!(expand("${battery}  ${cores}", &r), "8c");
+        assert_eq!(expand("${cores}  ${battery}", &r), "8c");
+    }
+
+    #[test_case]
+    fn deliberate_spacing_elsewhere_in_a_template_is_untouched() {
+        // The fix must not be a global whitespace collapse: the bar's own single- and
+        // double-space separators, and the trailing pad that keeps `kbd `/`kbd*` the
+        // same width, all carry meaning.
+        let r = |v: &str| -> String {
+            match v {
+                "kbd" => "kbd ".to_string(),
+                "mouse" => "mse ".to_string(),
+                "battery" => "42%".to_string(),
+                other => alloc::format!("${{{}}}", other),
+            }
+        };
+        assert_eq!(expand("${kbd} ${mouse}  ${battery}", &r), "kbd  mse   42%");
+        assert_eq!(expand("a   b", &r), "a   b");
+    }
+
+    #[test_case]
+    fn an_unknown_variable_is_still_left_visible() {
+        // A typo in ui.json must show itself rather than silently vanish the way an
+        // empty expansion now does.
+        let r = |v: &str| -> String { alloc::format!("${{{}}}", v) };
+        assert_eq!(expand("x ${nope} y", &r), "x ${nope} y");
+    }
 
     #[test_case]
     fn roundtrip_preserves_theme_fields() {

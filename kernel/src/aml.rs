@@ -596,8 +596,16 @@ const ELSE_OP: u8 = 0xa1;
 const STORE_OP: u8 = 0x70;
 const ADD_OP: u8 = 0x72;
 const SUBTRACT_OP: u8 = 0x74;
+const MULTIPLY_OP: u8 = 0x77;
+const SHIFT_LEFT_OP: u8 = 0x79;
+const SHIFT_RIGHT_OP: u8 = 0x7a;
 const AND_OP: u8 = 0x7b;
+const NAND_OP: u8 = 0x7c;
 const OR_OP: u8 = 0x7d;
+const NOR_OP: u8 = 0x7e;
+const XOR_OP: u8 = 0x7f;
+const NOT_OP: u8 = 0x80;
+const MOD_OP: u8 = 0x85;
 const LAND_OP: u8 = 0x90;
 const LOR_OP: u8 = 0x91;
 const LNOT_OP: u8 = 0x92;
@@ -613,15 +621,49 @@ const ARG0_OP: u8 = 0x68;
 pub const TRUE: u64 = u64::MAX;
 
 /// Argument and local storage for one method invocation.
-#[derive(Clone, Debug, Default)]
-pub struct Env {
+#[derive(Clone, Default)]
+pub struct Env<'a> {
     args: Vec<Value>,
     locals: Vec<Value>,
+    /// Reads a named field unit's current value.
+    ///
+    /// This is the whole reason the evaluator is worth having: `_BST` computes almost
+    /// nothing, it *reads hardware* through names that alias an `OperationRegion`.
+    /// Without a resolver those names have no value and evaluation fails closed,
+    /// which is correct — the alternative is a battery percentage invented from a
+    /// default.
+    fields: Option<&'a dyn Fn(&str) -> Option<u64>>,
 }
 
-impl Env {
-    pub fn with_args(args: &[Value]) -> Env {
-        Env { args: args.to_vec(), locals: alloc::vec![Value::Integer(0); 8] }
+impl<'a> Env<'a> {
+    /// An environment with no hardware access: named fields do not resolve.
+    pub fn with_args(args: &[Value]) -> Env<'a> {
+        Env {
+            args: args.to_vec(),
+            locals: alloc::vec![Value::Integer(0); 8],
+            fields: None,
+        }
+    }
+
+    /// An environment that can read named fields through `fields`.
+    pub fn with_fields(args: &[Value], fields: &'a dyn Fn(&str) -> Option<u64>) -> Env<'a> {
+        Env {
+            args: args.to_vec(),
+            locals: alloc::vec![Value::Integer(0); 8],
+            fields: Some(fields),
+        }
+    }
+}
+
+// A closure has no `Debug`, so this reports whether one is present rather than what
+// it is — which is the part a caller debugging a failed evaluation needs to know.
+impl core::fmt::Debug for Env<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Env")
+            .field("args", &self.args)
+            .field("locals", &self.locals)
+            .field("fields", &self.fields.is_some())
+            .finish()
     }
 }
 
@@ -645,8 +687,26 @@ enum Flow {
 /// zero yields `Some(Integer(0))`. Callers rely on that distinction to decide whether
 /// to fall back.
 pub fn eval_method(body: &[u8], args: &[Value]) -> Option<Value> {
-    let mut env = Env::with_args(args);
-    match exec_list(body, &mut env, 0)? {
+    eval_in(body, &mut Env::with_args(args))
+}
+
+/// Evaluate a method body that may **read named fields** through `fields`.
+///
+/// The resolver is given a field's name and returns its current value, or `None` if
+/// it cannot be read — an unmapped address space, an absent embedded controller, a
+/// field this build cannot access. A `None` from the resolver fails the whole
+/// evaluation rather than substituting zero, because a plausible-looking wrong number
+/// is worse than no number.
+pub fn eval_method_with_fields(
+    body: &[u8],
+    args: &[Value],
+    fields: &dyn Fn(&str) -> Option<u64>,
+) -> Option<Value> {
+    eval_in(body, &mut Env::with_fields(args, fields))
+}
+
+fn eval_in(body: &[u8], env: &mut Env) -> Option<Value> {
+    match exec_list(body, env, 0)? {
         Flow::Return(v) => Some(v),
         // A method with no explicit Return yields zero per the specification, but this
         // returns None instead: for the callers here (a register address, a battery
@@ -784,15 +844,43 @@ fn term_arg(d: &[u8], env: &mut Env, depth: usize) -> Option<(Value, usize)> {
             // ACPI true is all-bits-set, not 1.
             Some((Value::Integer(if t { TRUE } else { 0 }), 1 + ua + ub))
         }
-        ADD_OP | SUBTRACT_OP | AND_OP | OR_OP => {
+        ADD_OP | SUBTRACT_OP | MULTIPLY_OP | SHIFT_LEFT_OP | SHIFT_RIGHT_OP | AND_OP
+        | NAND_OP | OR_OP | NOR_OP | XOR_OP | MOD_OP => {
             let (a, ua) = term_arg(d.get(1..)?, env, depth + 1)?;
             let (b, ub) = term_arg(d.get(1 + ua..)?, env, depth + 1)?;
             let (x, y) = (a.as_int()?, b.as_int()?);
             let v = match op {
                 ADD_OP => x.wrapping_add(y),
                 SUBTRACT_OP => x.wrapping_sub(y),
+                MULTIPLY_OP => x.wrapping_mul(y),
+                // A shift count of 64 or more is undefined in Rust and zero in ACPI.
+                SHIFT_LEFT_OP => {
+                    if y >= 64 {
+                        0
+                    } else {
+                        x << y
+                    }
+                }
+                SHIFT_RIGHT_OP => {
+                    if y >= 64 {
+                        0
+                    } else {
+                        x >> y
+                    }
+                }
                 AND_OP => x & y,
-                _ => x | y,
+                NAND_OP => !(x & y),
+                OR_OP => x | y,
+                NOR_OP => !(x | y),
+                XOR_OP => x ^ y,
+                // Modulo by zero raises an AML fault; fail closed rather than divide.
+                MOD_OP => {
+                    if y == 0 {
+                        return None;
+                    }
+                    x % y
+                }
+                _ => return None,
             };
             // These take a Target operand; it may be a null target (ZeroOp) or a
             // Local/Arg to also store into.
@@ -803,7 +891,52 @@ fn term_arg(d: &[u8], env: &mut Env, depth: usize) -> Option<(Value, usize)> {
             }
             Some((Value::Integer(v), tgt_at + 1))
         }
-        _ => None, // fail closed
+        NOT_OP => {
+            // One operand plus a target, unlike the binary operators above.
+            let (a, ua) = term_arg(d.get(1..)?, env, depth + 1)?;
+            let v = !a.as_int()?;
+            let slot = *d.get(1 + ua)?;
+            if slot != ZERO_OP {
+                store(slot, Value::Integer(v), env)?;
+            }
+            Some((Value::Integer(v), 2 + ua))
+        }
+        PACKAGE_OP => {
+            // `data_object` above already handled a package of constants. Reaching
+            // here means at least one element is computed — which is exactly what
+            // `_BST` returns: four values read from hardware.
+            let (total, lead) = pkg_length(d.get(1..)?)?;
+            if total < lead || 1 + total > d.len() {
+                return None;
+            }
+            let body = d.get(1 + lead..1 + total)?;
+            let n = *body.first()? as usize;
+            let mut items = Vec::with_capacity(n.min(64));
+            let mut off = 1usize;
+            for _ in 0..n {
+                if off >= body.len() {
+                    break; // a package may declare more elements than it encodes
+                }
+                let (v, used) = term_arg(body.get(off..)?, env, depth + 1)?;
+                if used == 0 {
+                    return None; // no progress: refuse rather than loop
+                }
+                items.push(v);
+                off += used;
+            }
+            Some((Value::Package(items), 1 + total))
+        }
+        _ => {
+            // Last resort: a bare name. In a method body that is a read of a named
+            // field aliasing hardware, so it only resolves when a resolver was
+            // supplied — and a resolver that cannot read it fails the evaluation
+            // instead of yielding a default.
+            let resolver = env.fields?;
+            let (name, used) = name_string(d)?;
+            let leaf = name.rsplit('.').next().unwrap_or(&name);
+            let v = resolver(leaf)?;
+            Some((Value::Integer(v), used))
+        }
     }
 }
 
@@ -826,6 +959,18 @@ pub fn eval_device_method(
 ) -> Option<Value> {
     let m = device_method(aml, dev, name)?;
     eval_method(aml.get(m.body.clone())?, args)
+}
+
+/// [`eval_device_method`], with a resolver for the named fields the method reads.
+pub fn eval_device_method_with_fields(
+    aml: &[u8],
+    dev: &DeviceNode,
+    name: &str,
+    args: &[Value],
+    fields: &dyn Fn(&str) -> Option<u64>,
+) -> Option<Value> {
+    let m = device_method(aml, dev, name)?;
+    eval_method_with_fields(aml.get(m.body.clone())?, args, fields)
 }
 
 // --- OperationRegion and Field -------------------------------------------
@@ -1371,7 +1516,104 @@ mod tests {
         assert_eq!(eval_device_method(&aml, tpd, "_BST", &[]), None);
     }
 
-// --- OperationRegion / Field ------------------------------------------
+    // --- evaluating a method that reads hardware ----------------------------
+
+    #[test_case]
+    fn a_method_reading_named_fields_needs_a_resolver_to_evaluate() {
+        // `Return (BRC0)` — the whole of what a trivial battery accessor does.
+        let mut body = vec![RETURN_OP];
+        body.extend_from_slice(&seg("BRC0"));
+
+        // Without a resolver a bare name has no value, and the evaluation fails rather
+        // than substituting one. This is the difference between "no battery shown" and
+        // "a battery percentage invented from a default".
+        assert_eq!(eval_method(&body, &[]), None);
+
+        let ok = |n: &str| -> Option<u64> { (n == "BRC0").then_some(3200) };
+        assert_eq!(
+            eval_method_with_fields(&body, &[], &ok),
+            Some(Value::Integer(3200))
+        );
+
+        // A resolver that cannot read the field fails the whole evaluation too — half a
+        // reading is worse than none.
+        let dead = |_: &str| -> Option<u64> { None };
+        assert_eq!(eval_method_with_fields(&body, &[], &dead), None);
+    }
+
+    #[test_case]
+    fn a_dynamic_package_of_field_reads_is_what_bst_returns() {
+        // `Return (Package(4) { Zero, Zero, BRC0, BVOL })`. Constant packages already
+        // decode; this is the computed form, which is the shape `_BST` actually has.
+        let mut items = vec![ZERO_OP, ZERO_OP];
+        items.extend_from_slice(&seg("BRC0"));
+        items.extend_from_slice(&seg("BVOL"));
+        let mut inner = vec![4u8];
+        inner.extend_from_slice(&items);
+        let mut pkg = vec![PACKAGE_OP];
+        pkg.extend_from_slice(&pkglen(inner.len()));
+        pkg.extend_from_slice(&inner);
+        let mut body = vec![RETURN_OP];
+        body.extend_from_slice(&pkg);
+
+        let r = |n: &str| -> Option<u64> {
+            match n {
+                "BRC0" => Some(3200),
+                "BVOL" => Some(11000),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            eval_method_with_fields(&body, &[], &r),
+            Some(Value::Package(vec![
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(3200),
+                Value::Integer(11000),
+            ]))
+        );
+    }
+
+    #[test_case]
+    fn a_16_bit_value_assembled_from_two_ec_bytes_evaluates() {
+        // `Return (Or (ShiftLeft (BTH, 8), BTL))` — the idiom every battery table uses
+        // to join two 8-bit EC registers, and the reason the shift operators are here.
+        let mut sl = vec![SHIFT_LEFT_OP];
+        sl.extend_from_slice(&seg("BTH_"));
+        sl.extend_from_slice(&[BYTE_PREFIX, 8, ZERO_OP]); // shift 8, null target
+        let mut or = vec![OR_OP];
+        or.extend_from_slice(&sl);
+        or.extend_from_slice(&seg("BTL_"));
+        or.push(ZERO_OP); // null target
+        let mut body = vec![RETURN_OP];
+        body.extend_from_slice(&or);
+
+        let r = |n: &str| -> Option<u64> {
+            match n {
+                "BTH" => Some(0x0c),
+                "BTL" => Some(0x80),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            eval_method_with_fields(&body, &[], &r),
+            Some(Value::Integer(0x0c80))
+        );
+    }
+
+    #[test_case]
+    fn a_shift_wider_than_the_word_is_zero_not_a_panic() {
+        // Rust's `<<` is undefined past 63; ACPI says the result is zero. A malformed
+        // table must not take the kernel down.
+        let body = vec![RETURN_OP, SHIFT_LEFT_OP, ONE_OP, BYTE_PREFIX, 200, ZERO_OP];
+        assert_eq!(eval_method(&body, &[]), Some(Value::Integer(0)));
+
+        // Modulo by zero is an AML fault; fail closed rather than divide.
+        let body = vec![RETURN_OP, MOD_OP, BYTE_PREFIX, 10, ZERO_OP, ZERO_OP];
+        assert_eq!(eval_method(&body, &[]), None);
+    }
+
+    // --- OperationRegion / Field ------------------------------------------
 
     /// `OperationRegion(name, space, offset, length)`
     fn region(name: &str, space: u8, off: u8, len: u8) -> vec::Vec<u8> {

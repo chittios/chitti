@@ -214,8 +214,8 @@ old code had no preemption at all and said nothing. Every wait added here is
 bounded and the HPET gets a counter-liveness probe, because an unbounded spin on a
 dead reference clock hung the boot before a single test ran.
 
-**AML (`aml.rs`) decodes and locates, but does not yet evaluate.** ACPI describes
-anything unenumerable as bytecode in the DSDT, so `aml.rs` is the byte layer:
+**AML (`aml.rs`) decodes, locates, and evaluates a fail-closed subset.** ACPI
+describes anything unenumerable as bytecode in the DSDT, so `aml.rs` is the byte layer:
 `PkgLength`, `NameString`, data objects, then `devices()` / `methods()` walking
 `Scope`/`Device`/`Method` (all three carry a PkgLength, so their extent is exact).
 `device_by_hid` + `device_name` answer "what is *this* device's `_CRS`" — which is the
@@ -224,11 +224,40 @@ bugs, each pinned by a test: **`PkgLength` is asymmetric** (low six bits alone, 
 when more bytes follow), **`NameString` has five forms**, and **`OnesOp` is all-bits-set,
 not `0xFF`**. Containment is the other bug source — a parent's body contains its
 children, and a `Name` inside a **method body is a local**; both are excluded from
-`device_name`, and both were shipped wrong first and caught by tests. What remains is
-**evaluation** (operators, value stack, argument binding, named storage), which is what
-would retire the `_DSM` `0x0020` default and open `_BST`/`_BCM` for battery and
-backlight. Deliberately not half-built: a partially-correct evaluator returning a wrong
-integer is *worse* than the validated default it would replace.
+`device_name`, and both were shipped wrong first and caught by tests.
+
+On top of that sits an **evaluator** (`eval_method`, `eval_device_method`, and the
+`_with_fields` variants): `Return`/`If`/`Else`/`Store`, `Local0-7`/`Arg0-6`, the
+comparison and one-target arithmetic operators, and dynamic `Package` construction. Its
+governing rule is that **an unsupported opcode returns `None`, never a value** — an
+evaluator that guesses an integer is worse than the validated default it would replace,
+which is why it was not half-built earlier. Note two ACPI traps it encodes: **`TRUE` is
+all-bits-set**, so a caller comparing against `1` reads every true result as false, and a
+method that falls off its end without `Return` yields `None` here rather than the spec's
+zero — for these callers "unsupported control flow" is far likelier than a deliberate
+zero. `OperationRegion`/`Field` (`regions`, `fields`, `find_field`) locate the named
+bit-ranges a method actually reads; a **reserved field entry still advances the bit
+cursor** (skipping it shifts every later field, which is how a battery reports a voltage
+as a capacity), and an `AccessField` stops the walk rather than continuing with offsets
+that would be wrong.
+
+**A real battery percentage is the composition of all of it.** `drivers/ec.rs` is the
+ACPI **embedded controller** — `PNP0C09`'s `_CRS` (authoritative; the fixed `0x62`/`0x66`
+are only an x86 fallback) driven through bounded spins, with a `0xff` status rejected as
+an unclaimed port *before* any command is written and a stale output byte drained so a
+read cannot return the previous transaction's value. `drivers/battery.rs` evaluates the
+firmware's own `_BST` with a field resolver that reads `EmbeddedControl`/`SystemMemory`/
+`SystemIO` bytes, takes last-full capacity from `_BIX` (index 3) or `_BIF` (index 2), and
+reports `remaining / last-full` — **last-full, not design**, or a worn battery reads
+permanently below 100%. Surfaced as the `${battery}` status-bar variable
+(`ui_config.rs`), cached for 5 s because one reading costs an AML evaluation plus a
+handful of EC transactions; a variable that resolves to nothing takes its separator with
+it, so a desktop's bar is byte-identical to before. Every layer fails closed and ktraces
+which step gave up. **None of this is verified on hardware** — QEMU emulates no ACPI EC
+and no battery — so the pure arithmetic (bit assembly, `_BST`/`_BIF` shapes, the
+handshake against a simulated controller incl. slow/wedged/dead) is what the tests hold.
+Still open: retiring the touchpad `_DSM` `0x0020` default now that `_DSM` can be
+evaluated.
 
 **Interrupt-controller bases are discovered, and there are two sources, not one.**
 aarch64 finds the GICv3 from the device tree's `arm,gic-v3` `reg` when there is an
