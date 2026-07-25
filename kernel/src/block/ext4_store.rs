@@ -137,6 +137,13 @@ impl Ext4Store {
     }
 
     pub fn write(&mut self, name: &str, data: &[u8]) {
+        // Writing identical content is not a change. This matters because `sync`
+        // re-formats the whole partition: on every reboot of an installed system
+        // the agent roster rewrites ~120 byte-identical files, which would
+        // otherwise dirty the store and trigger a full rewrite for no reason.
+        if self.cache.get(name).is_some_and(|old| old.as_slice() == data) {
+            return;
+        }
         self.cache.insert(String::from(name), data.to_vec());
         self.touched();
     }
