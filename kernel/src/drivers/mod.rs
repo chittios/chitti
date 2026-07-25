@@ -4,16 +4,19 @@
 //! …); device bring-up that is larger than a single bus glue file lives here
 //! so the tree stays navigable. Today:
 //!
+//! - [`pwrbtn`] — the ACPI fixed-feature power button, so a press shuts the
+//!   machine down instead of doing nothing
+//! - [`i2c`] — Synopsys DesignWare I2C master as Intel ships it in LPSS; the
+//!   controller a modern laptop's HID-over-I2C touchpad hangs off
 //! - [`battery`] — the ACPI control-method battery, read by evaluating the
 //!   firmware's own `_BST`/`_BIF` through [`crate::aml`] and [`ec`]
 //! - [`ec`] — the ACPI embedded controller, which owns a laptop's battery,
 //!   lid and thermal state
-//! - [`i2c`] — Synopsys DesignWare I2C master as Intel ships it in LPSS; the
-//!   controller a modern laptop's HID-over-I2C touchpad hangs off
 //! - [`wifi`] — Broadcom FullMAC PCIe (brcmfmac-class) on Apple Silicon
 
 pub mod battery;
 pub mod ec;
 pub mod i2c;
 pub mod i2c_hid;
+pub mod pwrbtn;
 pub mod wifi;

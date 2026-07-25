@@ -337,11 +337,121 @@ pub fn cached() -> Option<BatteryState> {
             Some(b)
         }
         None => {
-            // SAFETY: as above.
-            unsafe { CACHE = (None, now.max(1), fails + 1) };
-            None
+            // A failure only counts toward giving up while we have *never* had a
+            // reading. Once a battery has answered, a transient failure (a busy EC, a
+            // read that lost a race with firmware) must not retire the feature or throw
+            // away the last good percentage — it keeps showing until the next refresh
+            // succeeds.
+            match last {
+                Some(b) => {
+                    // SAFETY: as above.
+                    unsafe { CACHE = (Some(b), now.max(1), 0) };
+                    Some(b)
+                }
+                None => {
+                    // SAFETY: as above.
+                    unsafe { CACHE = (None, now.max(1), fails + 1) };
+                    None
+                }
+            }
         }
     }
+}
+
+/// Walk the battery path step by step, reporting what each layer found.
+///
+/// This exists because none of it can be verified here: no ACPI battery, no embedded
+/// controller. On a real laptop the difference between "no PNP0C0A device", "the EC
+/// never answered" and "`_BST` used AML we do not implement" decides what to fix, and
+/// a single "no battery" line does not carry it. Read-only throughout.
+pub fn diagnose() -> alloc::vec::Vec<String> {
+    let mut out = alloc::vec::Vec::new();
+    let mut say = |s: String| out.push(s);
+
+    #[cfg(target_arch = "x86_64")]
+    let rsdp = crate::arch::x86_64::rsdp_address();
+    #[cfg(target_arch = "aarch64")]
+    let rsdp = crate::arch::aarch64::rsdp_address();
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let rsdp: Option<u64> = None;
+
+    let Some(rsdp) = rsdp else {
+        say(String::from("acpi: no RSDP (device-tree or -kernel boot) -- no battery"));
+        return out;
+    };
+    say(alloc::format!("acpi: RSDP at {rsdp:#x}"));
+
+    let Some(dsdt) = crate::acpi::dsdt_bytes(rsdp, crate::mm::map_mmio) else {
+        say(String::from("acpi: no DSDT"));
+        return out;
+    };
+    say(alloc::format!("acpi: DSDT {} bytes", dsdt.len()));
+
+    say(alloc::format!(
+        "ec:   {}",
+        if super::ec::present() {
+            "present"
+        } else {
+            "absent or did not answer (see the ec: ktrace lines from boot)"
+        }
+    ));
+    // The other half of "does this laptop work": the power button lives behind the same
+    // FADT this walk already needed.
+    say(alloc::format!("btn:  {}", super::pwrbtn::status()));
+
+    let Some(dev) = aml::device_by_hid(dsdt, BATTERY_HID) else {
+        say(alloc::format!("aml:  no {BATTERY_HID} device in the namespace"));
+        return out;
+    };
+    say(alloc::format!("aml:  {} claims {}", dev.path, BATTERY_HID));
+
+    // Which methods firmware provides at all, before trying to run them: "no _BST"
+    // and "_BST would not evaluate" are different problems.
+    for m in ["_STA", "_BST", "_BIF", "_BIX"] {
+        if aml::device_method(dsdt, &dev, m).is_some() {
+            say(alloc::format!("aml:  {} provides {}", dev.name(), m));
+        }
+    }
+
+    match eval(dsdt, &dev, "_BST") {
+        Some(v) => match parse_bst(&v) {
+            Some(b) => say(alloc::format!(
+                "_BST: state {:#x}{}{}{}, rate {}, remaining {}, voltage {}",
+                b.state,
+                if b.charging() { " charging" } else { "" },
+                if b.discharging() { " discharging" } else { "" },
+                if b.critical() { " CRITICAL" } else { "" },
+                b.rate,
+                b.remaining,
+                b.voltage
+            )),
+            None => say(alloc::format!("_BST: evaluated to {v:?}, not a 4-element package")),
+        },
+        None => say(String::from(
+            "_BST: did not evaluate (unsupported AML, or a field read failed)",
+        )),
+    }
+
+    let full = eval(dsdt, &dev, "_BIX")
+        .as_ref()
+        .and_then(full_capacity)
+        .map(|c| (c, "_BIX"))
+        .or_else(|| {
+            eval(dsdt, &dev, "_BIF")
+                .as_ref()
+                .and_then(full_capacity)
+                .map(|c| (c, "_BIF"))
+        });
+    match full {
+        Some((c, from)) => say(alloc::format!("{from}: last-full capacity {c}")),
+        None => say(String::from("_BIX/_BIF: no usable last-full capacity")),
+    }
+
+    match read() {
+        Some(b) => say(alloc::format!("battery: {} ({:?})", format(&b), b)),
+        None => say(String::from("battery: no reading")),
+    }
+    out
 }
 
 /// Format a battery state for the status bar.

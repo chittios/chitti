@@ -559,6 +559,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         // Human/e2e surface over the same store as the agent `memory_*` tools.
         "memory" => run_memory_cmd(arg),
         "disks" => disk_list(),
+        "battery" | "bat" => run_battery(),
         "ls" => fs_ls(arg),
         "mount" => disk_mount(arg),
         "umount" => disk_umount(arg),
@@ -7743,6 +7744,15 @@ pub fn upkeep() {
     thinking_tick();
     // Mid-turn interjection: buffer non-cancel keystrokes into a follow-up queue.
     drain_followup_keys();
+    // The ACPI power button. One port read when armed, nothing at all otherwise. A
+    // press is acted on *here* rather than inside the driver's poll, so the machine is
+    // never powered off from underneath a repaint.
+    crate::drivers::pwrbtn::poll();
+    if crate::drivers::pwrbtn::take_press() {
+        crate::ktrace::log("pwrbtn", "power button pressed -- powering off");
+        serial_println!("Chitti: power button pressed, powering off.");
+        crate::arch::poweroff();
+    }
 }
 
 /// Lighter upkeep for loops that consume their own mouse events (modals, the
@@ -7790,6 +7800,18 @@ fn update_composer_hint(remote_on: bool, remote_cfg: Option<&remote::RemoteConfi
 }
 #[cfg(test)]
 fn update_composer_hint(_remote_on: bool, _remote_cfg: Option<&remote::RemoteConfig>) {}
+
+/// `/battery` — the ACPI battery, and which step failed if there is no reading.
+///
+/// A diagnostic more than a display (the percentage lives in the status bar via
+/// `${battery}`): none of the battery path can be verified in a VM, so on a real
+/// laptop this is what says whether the namespace, the embedded controller or the
+/// `_BST` evaluation is the thing to fix. Read-only.
+fn run_battery() {
+    for line in crate::drivers::battery::diagnose() {
+        serial_println!("battery> {line}");
+    }
+}
 
 /// `/datetime` — show or set the wall clock and timezone.
 fn run_datetime(arg: &str) {

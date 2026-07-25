@@ -223,6 +223,9 @@ pub fn init() {
         // behind it, and nothing else can read them. Bounded probe, so a machine
         // without one costs milliseconds and logs why.
         drivers::ec::init(rsdp);
+        // Arm the ACPI power button, so a press shuts the machine down cleanly
+        // instead of doing nothing. Needs the FADT's PM1 blocks, hence here.
+        drivers::pwrbtn::init(rsdp);
     } else {
         ktrace::log("init", "no ACPI RSDP -- scheduler tick stays on the PIT/PIC");
     }
@@ -282,6 +285,9 @@ pub fn init() {
     // device-tree or `-kernel` boot has no RSDP and simply skips it.
     if let Some(rsdp) = arch::aarch64::rsdp_address() {
         drivers::ec::init(rsdp);
+        // No-op where ACPI's reduced-hardware profile applies (no fixed-feature PM1
+        // registers exist there); it reports that rather than polling a dead bit.
+        drivers::pwrbtn::init(rsdp);
     }
     ktrace::log("init", "aarch64 bring-up complete (MMU + heap + scheduler + SMP + GIC armed)");
 }

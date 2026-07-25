@@ -137,6 +137,213 @@ pub fn hpet_from_rsdp(rsdp: u64) -> Option<u64> {
     Some(base)
 }
 
+// --- FADT field offsets ---------------------------------------------------
+//
+// Spelled out as named constants because they are the single easiest thing in ACPI to
+// get wrong, and getting one wrong is *silent*: a mis-offset read of a Generic Address
+// Structure yields a large plausible-looking integer, not an obviously bad one. That
+// is exactly what happened here — `X_DSDT` was read from 148, which is where
+// `X_PM1a_EVT_BLK`'s GAS starts, so on every machine with a modern FADT the DSDT
+// address was `space|width|offset|access|addr_lo` reinterpreted as a u64. It landed
+// past the plausibility guard, the DSDT was never found, and every AML-dependent
+// feature (`_S5_` poweroff, the I2C touchpad, the battery) quietly did nothing.
+//
+// Offsets are from ACPI 6.5 Table 5.9 / ACPICA's `struct acpi_table_fadt`.
+
+/// 32-bit DSDT address.
+const FADT_DSDT: usize = 40;
+/// `PM1a_EVT_BLK` (32-bit I/O port).
+const FADT_PM1A_EVT: usize = 56;
+/// `PM1b_EVT_BLK`.
+const FADT_PM1B_EVT: usize = 60;
+/// `PM1a_CNT_BLK`.
+const FADT_PM1A_CNT: usize = 64;
+/// `PM1b_CNT_BLK`.
+const FADT_PM1B_CNT: usize = 68;
+/// `PM1_EVT_LEN` — byte length of each PM1 event block (status half, then enable half).
+const FADT_PM1_EVT_LEN: usize = 88;
+/// 64-bit DSDT address. **140, not 148.**
+const FADT_X_DSDT: usize = 140;
+/// `X_PM1a_EVT_BLK`, a 12-byte Generic Address Structure.
+const FADT_X_PM1A_EVT: usize = 148;
+/// `X_PM1b_EVT_BLK`.
+const FADT_X_PM1B_EVT: usize = 160;
+/// `X_PM1a_CNT_BLK`.
+const FADT_X_PM1A_CNT: usize = 172;
+/// `X_PM1b_CNT_BLK`.
+const FADT_X_PM1B_CNT: usize = 184;
+
+/// Generic Address Structure: `space_id`, `bit_width`, `bit_offset`, `access_width`,
+/// then a 64-bit address.
+const GAS_SPACE: usize = 0;
+const GAS_ADDRESS: usize = 4;
+const GAS_LEN: usize = 12;
+
+/// ACPI address-space id for system I/O ports.
+const SPACE_SYSTEM_IO: u8 = 1;
+
+/// The DSDT's physical address from a FADT.
+///
+/// Prefers the 64-bit `X_DSDT` when the table is long enough to have it and it is
+/// non-zero, else the 32-bit field. Pure so the offset is pinned by a test rather than
+/// by a comment.
+pub fn fadt_dsdt(fadt: &[u8]) -> Option<u64> {
+    let x = read_u64(fadt, FADT_X_DSDT).unwrap_or(0);
+    let addr = if x != 0 { x } else { read_u32(fadt, FADT_DSDT)? as u64 };
+    (addr != 0).then_some(addr)
+}
+
+/// An I/O-port pair from a FADT: the legacy 32-bit field, overridden by the extended
+/// GAS when that is present *and* describes a system-I/O port.
+///
+/// Returns 0 for "the platform has no such block", which is a legal answer for every
+/// `b` register. A memory-mapped block is reported as 0 rather than as its address:
+/// nothing here can drive one, and handing back an address that would be written with
+/// `out` instructions is worse than admitting the block is unreachable.
+fn fadt_port(fadt: &[u8], legacy: usize, extended: usize) -> u16 {
+    let mut port = read_u32(fadt, legacy).unwrap_or(0) as u64;
+    if fadt.len() >= extended + GAS_LEN {
+        let space = fadt[extended + GAS_SPACE];
+        let addr = read_u64(fadt, extended + GAS_ADDRESS).unwrap_or(0);
+        if addr != 0 && space == SPACE_SYSTEM_IO {
+            port = addr;
+        }
+    }
+    if port <= u16::MAX as u64 {
+        port as u16
+    } else {
+        0
+    }
+}
+
+/// The PM1 register blocks a machine actually has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Pm1Blocks {
+    /// `PM1a_CNT` — where a sleep type plus `SLP_EN` is written.
+    pub a_cnt: u16,
+    /// `PM1b_CNT`, or 0.
+    pub b_cnt: u16,
+    /// `PM1a_EVT` — the status half; the enable half is `evt_len / 2` bytes further on.
+    pub a_evt: u16,
+    /// `PM1b_EVT`, or 0.
+    pub b_evt: u16,
+    /// `PM1_EVT_LEN`: the whole block, both halves.
+    pub evt_len: u8,
+}
+
+impl Pm1Blocks {
+    /// Port of the `PM1a_STS` register (the status half of the event block).
+    pub fn a_sts(&self) -> Option<u16> {
+        (self.a_evt != 0 && self.evt_len >= 4).then_some(self.a_evt)
+    }
+
+    /// Port of the `PM1a_EN` register.
+    ///
+    /// The event block is split down the middle — status first, enable second — so the
+    /// enable register is at `+ len/2`, **not** at a fixed `+2`. A machine with a
+    /// 4-byte block puts it at `+2` and one with an 8-byte block at `+4`; assuming the
+    /// former would write an enable mask into the middle of the status register.
+    pub fn a_en(&self) -> Option<u16> {
+        let half = (self.evt_len / 2) as u16;
+        (self.a_evt != 0 && half >= 2).then_some(self.a_evt + half)
+    }
+
+    /// The `b` block's status/enable pair, when the platform has one.
+    pub fn b_sts(&self) -> Option<u16> {
+        (self.b_evt != 0 && self.evt_len >= 4).then_some(self.b_evt)
+    }
+
+    /// See [`Self::a_en`].
+    pub fn b_en(&self) -> Option<u16> {
+        let half = (self.evt_len / 2) as u16;
+        (self.b_evt != 0 && half >= 2).then_some(self.b_evt + half)
+    }
+}
+
+/// Decode the PM1 control and event blocks from a FADT.
+pub fn fadt_pm1(fadt: &[u8]) -> Pm1Blocks {
+    Pm1Blocks {
+        a_cnt: fadt_port(fadt, FADT_PM1A_CNT, FADT_X_PM1A_CNT),
+        b_cnt: fadt_port(fadt, FADT_PM1B_CNT, FADT_X_PM1B_CNT),
+        a_evt: fadt_port(fadt, FADT_PM1A_EVT, FADT_X_PM1A_EVT),
+        b_evt: fadt_port(fadt, FADT_PM1B_EVT, FADT_X_PM1B_EVT),
+        evt_len: fadt.get(FADT_PM1_EVT_LEN).copied().unwrap_or(0),
+    }
+}
+
+fn read_u32(d: &[u8], at: usize) -> Option<u32> {
+    let b = d.get(at..at + 4)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn read_u64(d: &[u8], at: usize) -> Option<u64> {
+    let b = d.get(at..at + 8)?;
+    let mut v = [0u8; 8];
+    v.copy_from_slice(b);
+    Some(u64::from_le_bytes(v))
+}
+
+/// `SMI_CMD` — the port firmware watches for an ACPI-ownership request.
+const FADT_SMI_CMD: usize = 48;
+/// `ACPI_ENABLE` — the value to write there.
+const FADT_ACPI_ENABLE: usize = 52;
+/// FADT `Flags` — bit 4 says the power button is a control-method device, bit 5 the
+/// same of the sleep button.
+const FADT_FLAGS: usize = 112;
+
+/// The PM1 blocks plus the FADT flags that say what they mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Pm1Info {
+    /// Decoded register block addresses.
+    pub blocks: Pm1Blocks,
+    /// FADT `Flags`, whose bits 4/5 decide whether the power and sleep buttons are
+    /// fixed-feature or control-method devices.
+    pub flags: u32,
+    /// `SMI_CMD` port, or 0 when the platform has no SMI-based ACPI handoff.
+    pub smi_cmd: u16,
+    /// Value to write to `SMI_CMD` to ask firmware to hand ACPI over.
+    pub acpi_enable: u8,
+}
+
+/// The PM1 event/control blocks and FADT flags, for the power-button driver.
+///
+/// `None` when there is no FADT or it declares no usable PM1a event block — which is
+/// the truth on ACPI's reduced-hardware profile, where fixed-feature registers do not
+/// exist at all.
+pub fn pm1_from_rsdp(rsdp: u64) -> Option<Pm1Info> {
+    let f = find_table(rsdp, b"FACP")?;
+    // SAFETY: `find_table` mapped the FADT's full declared length.
+    let fadt = unsafe { table_slice(f)? };
+    let blocks = fadt_pm1(fadt);
+    if blocks.a_evt == 0 {
+        return None;
+    }
+    let smi = read_u32(fadt, FADT_SMI_CMD).unwrap_or(0);
+    Some(Pm1Info {
+        blocks,
+        flags: read_u32(fadt, FADT_FLAGS).unwrap_or(0),
+        // A SMI_CMD outside the I/O port range is not usable; treat it as absent
+        // rather than truncating it to a port that means something else.
+        smi_cmd: if smi <= u16::MAX as u32 { smi as u16 } else { 0 },
+        acpi_enable: fadt.get(FADT_ACPI_ENABLE).copied().unwrap_or(0),
+    })
+}
+
+/// Borrow a mapped ACPI table as a slice using its own declared length.
+///
+/// # Safety
+/// `p` must point at a mapped table whose declared length (offset 4) bytes are all
+/// mapped — which is what [`map_table`] and [`find_table`] guarantee.
+unsafe fn table_slice(p: *const u8) -> Option<&'static [u8]> {
+    let len = le32(p, 4) as usize;
+    // A FADT is at least the ACPI 1.0 size; the ceiling rejects a length field that is
+    // itself garbage rather than trusting it into a slice.
+    if len < 36 || len > 0x1_0000 {
+        return None;
+    }
+    Some(core::slice::from_raw_parts(p, len))
+}
+
 /// The DSDT named by the FADT, mapped for reading.
 ///
 /// Exposed because the DSDT is where devices that cannot be enumerated are described
@@ -144,8 +351,9 @@ pub fn hpet_from_rsdp(rsdp: u64) -> Option<u64> {
 /// interpreter would evaluate.
 pub fn dsdt_from_rsdp(rsdp: u64, map: impl Fn(u64, usize) -> u64) -> Option<*const u8> {
     let f = find_table(rsdp, b"FACP")?;
-    let len = le32(f, 4) as usize;
-    let dsdt_phys = if len >= 156 && le64(f, 148) != 0 { le64(f, 148) } else { le32(f, 40) as u64 };
+    // SAFETY: `find_table` mapped the FADT's full declared length.
+    let fadt = unsafe { table_slice(f)? };
+    let dsdt_phys = fadt_dsdt(fadt)?;
     // Refuse an implausible physical address instead of mapping it. A value with bits
     // above the platform's physical-address width produces a page-table entry with
     // reserved bits set, and the resulting fault (error 0x8) is far harder to read
@@ -444,35 +652,16 @@ pub fn find_rsdp(candidates: &[u64]) -> Option<u64> {
 /// aarch64 map, HHDM on x86.
 pub fn s5_from_rsdp(rsdp: u64, phys_to_virt: impl Fn(u64) -> u64) -> Option<SleepInfo> {
     let f = find_table(rsdp, b"FACP")?;
-    // FADT: SMI_CMD@48, ACPI_ENABLE@52, PM1a_CNT_BLK@64, PM1b_CNT_BLK@68,
-    // DSDT@40, X_DSDT@148, X_PM1a_CNT_BLK@180 (a 12-byte Generic Address
-    // Structure: space@0, width@1, offset@2, access@3, address@4).
-    let len = le32(f, 4) as usize;
+    // SAFETY: `find_table` mapped the FADT's full declared length.
+    let fadt = unsafe { table_slice(f)? };
     let smi_cmd = le32(f, 48);
     let acpi_enable = unsafe { *f.add(52) };
-    let mut pm1a = le32(f, 64) as u64;
-    let mut pm1b = le32(f, 68) as u64;
-    // Prefer the extended GAS forms when present and in system-I/O space (1).
-    if len >= 192 {
-        let space = unsafe { *f.add(180) };
-        let addr = le64(f, 184);
-        if addr != 0 && space == 1 {
-            pm1a = addr;
-        }
-        let space_b = unsafe { *f.add(192) };
-        let addr_b = le64(f, 196);
-        if len >= 204 && addr_b != 0 && space_b == 1 {
-            pm1b = addr_b;
-        }
-    }
-    if pm1a == 0 || pm1a > u16::MAX as u64 {
-        return None; // not an I/O-port PM1a_CNT — memory-mapped PM blocks unsupported
+    let pm1 = fadt_pm1(fadt);
+    if pm1.a_cnt == 0 {
+        return None; // no I/O-port PM1a_CNT — memory-mapped PM blocks unsupported
     }
     // DSDT, for the `\_S5_` package.
-    let dsdt_phys = if len >= 156 && le64(f, 148) != 0 { le64(f, 148) } else { le32(f, 40) as u64 };
-    if dsdt_phys == 0 {
-        return None;
-    }
+    let dsdt_phys = fadt_dsdt(fadt)?;
     let dsdt = phys_to_virt(dsdt_phys) as *const u8;
     // Prefer real AML decoding: `aml::find_name` requires an actual `NameOp` to
     // introduce the name, so it cannot be fooled by bytes that merely contain `_S5_`.
@@ -481,8 +670,8 @@ pub fn s5_from_rsdp(rsdp: u64, phys_to_virt: impl Fn(u64) -> u64) -> Option<Slee
     // new one without hardware to confirm on.
     let (slp_typa, slp_typb) = s5_via_aml(dsdt).or_else(|| parse_s5_package(dsdt))?;
     Some(SleepInfo {
-        pm1a_cnt: pm1a as u16,
-        pm1b_cnt: if pm1b <= u16::MAX as u64 { pm1b as u16 } else { 0 },
+        pm1a_cnt: pm1.a_cnt,
+        pm1b_cnt: pm1.b_cnt,
         slp_typa,
         slp_typb,
         smi_cmd,
@@ -704,6 +893,127 @@ pub fn uart_from_rsdp(rsdp: u64) -> Option<(u64, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- FADT field offsets -------------------------------------------------
+
+    /// A modern FADT (revision 6, full length) with the fields this reads set to
+    /// distinguishable values, so a wrong offset cannot accidentally produce the right
+    /// answer.
+    fn fadt_bytes() -> alloc::vec::Vec<u8> {
+        let mut f = alloc::vec![0u8; 276];
+        f[0..4].copy_from_slice(b"FACP");
+        f[4..8].copy_from_slice(&276u32.to_le_bytes());
+        f[8] = 6; // revision
+        f[40..44].copy_from_slice(&0x7fff_0000u32.to_le_bytes()); // DSDT (32-bit)
+        f[56..60].copy_from_slice(&0x0000_1800u32.to_le_bytes()); // PM1a_EVT_BLK
+        f[60..64].copy_from_slice(&0x0000_1900u32.to_le_bytes()); // PM1b_EVT_BLK
+        f[64..68].copy_from_slice(&0x0000_1804u32.to_le_bytes()); // PM1a_CNT_BLK
+        f[68..72].copy_from_slice(&0x0000_1904u32.to_le_bytes()); // PM1b_CNT_BLK
+        f[88] = 4; // PM1_EVT_LEN
+        f[140..148].copy_from_slice(&0x7fff_1000u64.to_le_bytes()); // X_DSDT
+        // X_PM1a_EVT_BLK GAS @148 — the block that used to be read as X_DSDT.
+        f[148] = 1; // SystemIO
+        f[149] = 32; // bit width
+        f[151] = 2; // access size
+        f[152..160].copy_from_slice(&0x0000_2800u64.to_le_bytes());
+        // X_PM1a_CNT_BLK GAS @172
+        f[172] = 1;
+        f[173] = 16;
+        f[176..184].copy_from_slice(&0x0000_2804u64.to_le_bytes());
+        f
+    }
+
+    #[test_case]
+    fn x_dsdt_is_at_offset_140_not_148() {
+        // The bug this pins: 148 is where X_PM1a_EVT_BLK's GAS starts, and reading it
+        // as a u64 gives a large plausible-looking address rather than an obviously bad
+        // one — so the DSDT was never found and every AML feature silently did nothing.
+        let f = fadt_bytes();
+        assert_eq!(fadt_dsdt(&f), Some(0x7fff_1000));
+        // What the wrong offset would have produced, spelled out so the test explains
+        // itself: space | width | offset | access | address_low32.
+        let wrong = u64::from_le_bytes(f[148..156].try_into().unwrap());
+        assert_ne!(wrong, 0x7fff_1000);
+        assert!(wrong > (1 << 40), "the wrong read was rejected as implausible, not used");
+    }
+
+    #[test_case]
+    fn a_short_fadt_falls_back_to_the_32_bit_dsdt() {
+        // An ACPI 1.0 FADT has no X_DSDT at all; a machine like that must still boot.
+        let mut f = fadt_bytes();
+        f.truncate(116);
+        f[4..8].copy_from_slice(&116u32.to_le_bytes());
+        assert_eq!(fadt_dsdt(&f), Some(0x7fff_0000));
+
+        // A long FADT whose X_DSDT is zero (firmware filled only the legacy field).
+        let mut f = fadt_bytes();
+        f[140..148].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(fadt_dsdt(&f), Some(0x7fff_0000));
+
+        // Neither field set: no DSDT, rather than address zero.
+        let mut f = fadt_bytes();
+        f[40..44].copy_from_slice(&0u32.to_le_bytes());
+        f[140..148].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(fadt_dsdt(&f), None);
+    }
+
+    #[test_case]
+    fn pm1_blocks_prefer_the_extended_gas_at_the_right_offsets() {
+        let p = fadt_pm1(&fadt_bytes());
+        // X_PM1a_CNT_BLK (172) overrides the legacy field; X_PM1b_CNT has no GAS set
+        // here, so the legacy value stands.
+        assert_eq!(p.a_cnt, 0x2804);
+        assert_eq!(p.b_cnt, 0x1904);
+        assert_eq!(p.a_evt, 0x2800);
+        assert_eq!(p.b_evt, 0x1900);
+        assert_eq!(p.evt_len, 4);
+    }
+
+    #[test_case]
+    fn a_memory_mapped_pm1_block_is_reported_as_absent() {
+        // Nothing here can drive a memory-mapped PM block. Reporting its address would
+        // send an `out` instruction to a port number made of address bits.
+        let mut f = fadt_bytes();
+        f[172] = 0; // SystemMemory
+        f[176..184].copy_from_slice(&0xfed0_0000u64.to_le_bytes());
+        let p = fadt_pm1(&f);
+        assert_eq!(p.a_cnt, 0x1804, "fell back to the legacy I/O port");
+
+        // And a legacy field that is itself out of port range is absent, not truncated.
+        let mut f = fadt_bytes();
+        f[172] = 0;
+        f[64..68].copy_from_slice(&0x1_0000u32.to_le_bytes());
+        assert_eq!(fadt_pm1(&f).a_cnt, 0);
+    }
+
+    #[test_case]
+    fn the_pm1_enable_register_is_half_a_block_past_the_status_one() {
+        // The event block is split down the middle. Assuming a fixed `+2` writes an
+        // enable mask into the middle of the status register on any machine with an
+        // 8-byte block.
+        let mut f = fadt_bytes();
+        f[88] = 4;
+        let p = fadt_pm1(&f);
+        assert_eq!(p.a_sts(), Some(0x2800));
+        assert_eq!(p.a_en(), Some(0x2802));
+
+        f[88] = 8;
+        let p = fadt_pm1(&f);
+        assert_eq!(p.a_en(), Some(0x2804));
+
+        // A block too short to hold both halves has neither.
+        f[88] = 2;
+        let p = fadt_pm1(&f);
+        assert_eq!(p.a_sts(), None);
+        assert_eq!(p.a_en(), None);
+
+        // No `b` block at all.
+        let mut f = fadt_bytes();
+        f[60..64].copy_from_slice(&0u32.to_le_bytes());
+        let p = fadt_pm1(&f);
+        assert_eq!(p.b_sts(), None);
+        assert_eq!(p.b_en(), None);
+    }
 
     // --- _CRS resource templates ------------------------------------------
 

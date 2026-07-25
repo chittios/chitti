@@ -202,6 +202,42 @@ pointer is **physical on newer protocol revisions and HHDM-virtual on older ones
 and the two cannot be told apart by trying both — classify by range (higher half =
 already virtual), then signature-check.
 
+**FADT field offsets are named constants, and one of them was wrong.** `X_DSDT` is
+at **140**; the code read it from **148**, which is where `X_PM1a_EVT_BLK`'s Generic
+Address Structure starts. That does not fail loudly — it yields
+`space|width|offset|access|address_lo32` reinterpreted as a `u64`, a large
+*plausible* number that sailed past the plausibility guard and made the DSDT
+unfindable on every machine with a modern FADT. Consequence: on x86 the whole AML
+layer silently did nothing — no `_S5_` poweroff, no I2C touchpad, no battery — and
+nothing reported an error, because "no DSDT" is a legitimate state. Every offset this
+reads is now a named constant with a test that pins it (`x_dsdt_is_at_offset_140_not_148`
+spells out the wrong read for the next person), and the pure decoders
+(`acpi::fadt_dsdt`, `acpi::fadt_pm1`) take a slice so they are testable off-hardware.
+A related trap in the same family: the PM1 **event** block is split down the middle —
+status first, enable second — so `PM1a_EN` is at `PM1a_EVT + PM1_EVT_LEN/2`, **not**
+a fixed `+2`; assuming `+2` writes an enable mask into the middle of the status
+register on any machine with an 8-byte block.
+
+**The power button works, and the FADT says which kind it is.** `drivers/pwrbtn.rs`
+arms the ACPI **fixed-feature** button (PM1 status bit 8) and `shell::upkeep` polls it
+— one `in` per pump, which is cheaper than routing an SCI on a cooperative scheduler,
+and a button press is a human-timescale event. It refuses to arm unless the FADT
+described a fixed-feature button, ACPI mode is on (`SCI_EN`), and the event block is
+long enough — each refusal ktraced, because "the power button does nothing" is
+otherwise indistinguishable between those cases. Two rules keep it from powering a
+machine off by accident: an all-ones status read is an **unclaimed port**, not every
+event firing at once, and PM1 status bits are **write-1-to-clear**, so the ack writes
+*only* the button bit rather than the whole word (which would acknowledge every other
+pending event). The **control-method** (`PNP0C0C` GPE) button — what many laptops
+use — is *reported, not guessed at*: FADT flags bit 4 says so, and GPE dispatch is
+honestly unimplemented rather than silently polling a bit that will never change.
+Uniquely for this hardware area, it is **verifiable in a VM**: QEMU's
+`system_powerdown` sets exactly that status bit, and the `power_button` e2e scenario
+presses it through the monitor (`-serial mon:stdio`, so Ctrl+A c reaches it — no extra
+plumbing) and asserts a clean shutdown. `/battery` prints the button's state alongside
+the battery's, and `tests/e2e/run.py --only <names>` exists so one scenario can be
+iterated on without the 30-minute sweep.
+
 **Poweroff and the scheduler tick are real hardware now, not emulator stand-ins.**
 `/poweroff` performs an ACPI **S5** transition (`SLP_TYPa | SLP_EN` to the FADT's
 `PM1a_CNT`, with `SLP_TYPa` decoded from the DSDT's `\_S5_` package by bytecode
