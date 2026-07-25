@@ -174,7 +174,17 @@ works under QEMU is not done.
 Concretely: display comes from the firmware (Limine GOP on x86, UEFI GOP via the
 `stub/` bootloader on aarch64, QEMU ramfb as a fallback); disks via virtio /
 NVMe / AHCI over discovered PCIe; input via USB xHCI/HID (keyboard **and** mouse,
-report-descriptor-driven), virtio-input, and PL050/PS-2; the wall clock from the
+report-descriptor-driven), virtio-input, PL050/PS-2, and **HID-over-I2C**
+(`drivers/i2c_hid.rs` on `drivers/i2c.rs`, the DesignWare/LPSS master) — the touchpad on
+laptops from ~2016, which have no PS/2 aux port. An I2C device **cannot be probed for**:
+its address comes from `_CRS`, so it is located by asking the namespace which device
+claims `PNP0C50` (`aml::device_by_hid`). Identification only ever *reads*, and
+`present()` is a zero-length probe, because the same bus commonly carries the embedded
+controller and the PD controller — a stray write there misconfigures real hardware. The
+HID descriptor register comes from `_DSM` and is defaulted to `0x0020`, but the
+descriptor read is **validated** (length + version), so a wrong guess is detected rather
+than silently producing garbage. Report decoding is shared with USB via
+`xhci::feed_pointer_report`, so a touchpad and a mouse cannot drift apart; the wall clock from the
 RTC / UEFI `GetTime` / the virtual counter — each behind a shared facade with a
 per-arch implementation. The same kernel image must run on QEMU, VirtualBox, and
 real UEFI hardware.
@@ -195,7 +205,7 @@ already virtual), then signature-check.
 **Poweroff and the scheduler tick are real hardware now, not emulator stand-ins.**
 `/poweroff` performs an ACPI **S5** transition (`SLP_TYPa | SLP_EN` to the FADT's
 `PM1a_CNT`, with `SLP_TYPa` decoded from the DSDT's `\_S5_` package by bytecode
-scan — no AML interpreter yet), keeping QEMU's `isa-debug-exit` write only as a
+scan; see the AML note below), keeping QEMU's `isa-debug-exit` write only as a
 fallback; it used to write *only* that port, so on a physical machine `/poweroff`
 did nothing and left the fans running. The tick prefers the **local-APIC timer**
 calibrated against the **HPET** (`arch/x86_64/hpet.rs`), falling back to the
@@ -203,6 +213,22 @@ PIT/8259 — both of which a UEFI-only machine may omit entirely, in which case 
 old code had no preemption at all and said nothing. Every wait added here is
 bounded and the HPET gets a counter-liveness probe, because an unbounded spin on a
 dead reference clock hung the boot before a single test ran.
+
+**AML (`aml.rs`) decodes and locates, but does not yet evaluate.** ACPI describes
+anything unenumerable as bytecode in the DSDT, so `aml.rs` is the byte layer:
+`PkgLength`, `NameString`, data objects, then `devices()` / `methods()` walking
+`Scope`/`Device`/`Method` (all three carry a PkgLength, so their extent is exact).
+`device_by_hid` + `device_name` answer "what is *this* device's `_CRS`" — which is the
+question a driver asks and a flat scan cannot answer. Three encodings cause all the
+bugs, each pinned by a test: **`PkgLength` is asymmetric** (low six bits alone, low four
+when more bytes follow), **`NameString` has five forms**, and **`OnesOp` is all-bits-set,
+not `0xFF`**. Containment is the other bug source — a parent's body contains its
+children, and a `Name` inside a **method body is a local**; both are excluded from
+`device_name`, and both were shipped wrong first and caught by tests. What remains is
+**evaluation** (operators, value stack, argument binding, named storage), which is what
+would retire the `_DSM` `0x0020` default and open `_BST`/`_BCM` for battery and
+backlight. Deliberately not half-built: a partially-correct evaluator returning a wrong
+integer is *worse* than the validated default it would replace.
 
 **Interrupt-controller bases are discovered, and there are two sources, not one.**
 aarch64 finds the GICv3 from the device tree's `arm,gic-v3` `reg` when there is an
@@ -583,10 +609,19 @@ FDT claims a GICv3 but carries no readable `reg`.
   Windows-era machine has one). Test the dispatch against every family QEMU *can*
   emulate with `CHITTI_NIC=e1000|e1000e|igb|rtl8139|virtio-net-pci cargo xtask run
   -arch x86_64` (the `nic_dispatch` e2e scenario asserts the chosen driver matches
-  the emulated device). Still missing for real machines: Broadcom `tg3`,
-  Atheros/Killer `alx`, Aquantia, and **any** WiFi on x86 — a USB Ethernet dongle
-  (CDC-ECM/ASIX over the existing xHCI stack) is the cheap fix for a laptop with
-  no Ethernet port, and is not written yet.
+  the emulated device). **USB Ethernet** exists now
+  (`net/usb_eth.rs` over the xHCI bulk transport): **CDC-ECM only**, chosen because it
+  is the one real standard of the three shapes and puts one frame per transfer with no
+  framing header, so the transferred length *is* the frame length. ASIX and Realtek
+  dongles are recognised and then **refused with a log** — they need per-chip register
+  setup and packet headers, and treating their framed packets as raw would hand smoltcp
+  garbage. CDC-ECM is matched by interface class, not an id list (it is a standard, so a
+  list would guarantee gaps). Tried **last** in `autodetect`, after virtio and PCI, so a
+  built-in NIC always wins. Bulk transport is in `xhci.rs`: `configure_bulk` +
+  `bulk_arm_in`/`bulk_take_in`/`bulk_send`; note the delivered length is
+  **`requested - residual`** (a transfer event's low 24 bits are the *untransferred*
+  count). Still missing for real machines: Broadcom `tg3`, Atheros/Killer `alx`,
+  Aquantia, and **any** WiFi on x86.
   Shell surface: `/network` (info/dhcp/static/dns), `/ping`,
   `/wifi` (scan/connect via the password modal), a **TCP listener**
   (`net::listen`/`try_accept`, backed by a pool of Listen-state sockets in
