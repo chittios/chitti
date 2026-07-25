@@ -214,3 +214,22 @@ mod tests {
         assert_eq!(periodic_count(u32::MAX, 1, 1), Some(u32::MAX));
     }
 }
+
+// --- inter-processor interrupts -------------------------------------------
+
+/// Interrupt Command Register (low dword). Writing it sends the IPI.
+const REG_ICR_LOW: u64 = 0x300;
+/// Destination shorthand "all excluding self" (bits 19:18 = 0b11).
+const ICR_ALL_EXCLUDING_SELF: u32 = 0b11 << 18;
+/// Fixed delivery mode, edge triggered, assert level.
+const ICR_FIXED_ASSERT: u32 = 1 << 14;
+
+/// Send `vector` to every other core.
+///
+/// This is how the compute fleet is woken. The alternative — parking the APs in a
+/// `pause` spin on a generation counter — works but burns a core's worth of power
+/// per idle AP, which on a laptop means heat and battery for nothing. With an IPI
+/// the APs can sit in `hlt` and cost nothing until there is work.
+pub fn send_wake_ipi(vector: u8) {
+    write_reg(REG_ICR_LOW, ICR_ALL_EXCLUDING_SELF | ICR_FIXED_ASSERT | vector as u32);
+}

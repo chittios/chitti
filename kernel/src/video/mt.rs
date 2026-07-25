@@ -11,12 +11,14 @@
 /// `f` must be safe for concurrent calls on **disjoint** row ranges.
 #[inline]
 pub unsafe fn parallel_rows(n_rows: usize, min_chunk: usize, f: unsafe fn(usize, usize, *mut u8), ctx: *mut u8) {
-    #[cfg(all(target_arch = "aarch64", not(test)))]
+    #[cfg(not(test))]
     {
-        if crate::arch::aarch64::smp::online_cpus() > 1 && n_rows >= min_chunk.saturating_mul(2).max(16) {
+        // Arch-neutral: was `cfg(aarch64)`, so x86 converted every video frame's
+        // rows on one core.
+        if crate::arch::online_cpus() > 1 && n_rows >= min_chunk.saturating_mul(2).max(16) {
             // SAFETY: caller contract.
             unsafe {
-                crate::arch::aarch64::smp::parallel_for(n_rows, min_chunk.max(8), f, ctx);
+                crate::arch::parallel_for(n_rows, min_chunk.max(8), f, ctx);
             }
             return;
         }

@@ -546,7 +546,7 @@ fn reduce(v: &Val, axes: &[i64], keep: bool, op: &str) -> Val {
 /// once, and each tile of output positions is gathered into contiguous
 /// `[ccg*k]` columns dotted against each output channel's contiguous weight
 /// Split `f(start, end, ctx)` over `[0, n)` across the SMP worker fleet when
-/// one exists (aarch64 kernel), else run it whole on this core. The contract
+/// one exists (either arch), else run it whole on this core. The contract
 /// mirrors `smp::parallel_for`: `f` must be safe on disjoint ranges sharing
 /// `ctx`, and every output element must depend only on its own index — so the
 /// result is **identical for any split** (no cross-range reassociation).
@@ -556,15 +556,18 @@ fn par_range(n: usize, min_chunk: usize, f: unsafe fn(usize, usize, *mut u8), ct
     if n == 0 {
         return;
     }
-    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    #[cfg(target_os = "none")]
     // SAFETY: forwarded contract (disjoint ranges, ctx outlives the call).
+    // Arch-neutral: `arch::parallel_for` fans out on whichever arch has a fleet
+    // and runs inline where it does not. This was `cfg(aarch64)`, which is why
+    // x86 ran every ONNX hot op on a single core.
     unsafe {
-        crate::arch::aarch64::smp::parallel_for(n, min_chunk, f, ctx);
+        crate::arch::parallel_for(n, min_chunk, f, ctx);
     }
-    #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
+    #[cfg(not(target_os = "none"))]
     {
         let _ = min_chunk;
-        // SAFETY: the whole range on this core; same contract.
+        // SAFETY: the whole range on this core; same contract (host test build).
         unsafe { f(0, n, ctx) };
     }
 }

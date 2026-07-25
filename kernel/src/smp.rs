@@ -145,6 +145,9 @@ pub fn init() {
         n * WORK_PER_CPU,
         if total == n * WORK_PER_CPU { "OK" } else { "LOST UPDATES" }
     ));
+
+    // Prove the compute fleet's wake path before anything relies on it.
+    wake_self_test();
 }
 
 /// AP entry point. Limine jumps here (with `rdi` = this core's `SmpInfo`) on a
@@ -174,11 +177,18 @@ extern "C" fn ap_entry(info: *const SmpInfo) -> ! {
     do_work_chunk(slot);
     WORKERS_DONE.fetch_add(1, Ordering::SeqCst);
 
-    // Parked: halt forever with interrupts disabled. The core is done; it
-    // consumes no vCPU time (unlike a busy spin) until the next reset.
-    loop {
-        crate::arch::x86_64::hlt();
+    // Join the compute fleet rather than halting forever. Claim a dense worker
+    // index (independent of the sparse Limine slot, so `parallel_for` can address
+    // workers 0..WORKERS without gaps) and park waiting for work.
+    let worker = WORKERS.fetch_add(1, Ordering::AcqRel) as usize;
+    if worker >= MAX_CPUS - 1 {
+        // More cores than the job tables address: park this one for good rather
+        // than index out of range.
+        loop {
+            crate::arch::x86_64::hlt();
+        }
     }
+    fleet_worker(worker)
 }
 
 /// One core's contribution to the shared-counter self-test: `WORK_PER_CPU`
@@ -207,4 +217,242 @@ pub fn stats() -> SmpStats {
         expected_counter: expected * WORK_PER_CPU,
         cpus_that_worked: PERCPU_WORK.iter().filter(|w| w.load(Ordering::SeqCst) > 0).count(),
     }
+}
+
+// --- compute fleet: parallel_for across the application processors ---------
+//
+// Until now the APs booted, ran a self-test and halted forever, so every
+// compute-heavy loop in the kernel ran on one core on x86 while the identical
+// workload was split across all cores on aarch64. That is the dual-architecture
+// rule's "capability exists on one arch but not the other" case, and on an 8-core
+// laptop it means inference used an eighth of the machine.
+//
+// Design mirrors `arch::aarch64::smp`: a static-partition job barrier, not a
+// scheduler. The BSP publishes a row range per worker, bumps a generation
+// counter, wakes the fleet, computes its own share, then waits.
+//
+// Wake mechanism differs by necessity. aarch64 parks workers in `WFE` and relies
+// on the event stream; x86 has no equivalent, so workers sit in `hlt` with
+// interrupts enabled and the BSP pokes them with an IPI. A `pause` spin would
+// also work and need no interrupt plumbing, but it costs a core of power per idle
+// AP — unacceptable on a laptop.
+
+use core::sync::atomic::{AtomicPtr, AtomicUsize};
+
+/// Vector the wake IPI is delivered on. Above the PIC's 32..47 range and the
+/// APIC timer's 0x40.
+const WAKE_VECTOR: u8 = 0x41;
+
+/// A unit of fan-out work: `f(start, end, ctx)` over a disjoint index range.
+struct Job {
+    /// Generation counter; incremented to publish new work.
+    go: AtomicU64,
+    fn_ptr: AtomicUsize,
+    ctx: AtomicPtr<u8>,
+    start: [AtomicUsize; MAX_CPUS],
+    end: [AtomicUsize; MAX_CPUS],
+    /// Generation this worker has *begun* — set before it touches the range, so
+    /// the BSP can tell "never started" (safe to take over) from "still running"
+    /// (must not duplicate).
+    claimed: [AtomicU64; MAX_CPUS],
+    /// Generation this worker has finished.
+    done: [AtomicU64; MAX_CPUS],
+}
+
+const AZERO: AtomicUsize = AtomicUsize::new(0);
+static JOB: Job = Job {
+    go: AtomicU64::new(0),
+    fn_ptr: AtomicUsize::new(0),
+    ctx: AtomicPtr::new(core::ptr::null_mut()),
+    start: [AZERO; MAX_CPUS],
+    end: [AZERO; MAX_CPUS],
+    claimed: [ZERO; MAX_CPUS],
+    done: [ZERO; MAX_CPUS],
+};
+
+/// Number of APs that have registered as fleet workers.
+static WORKERS: AtomicU64 = AtomicU64::new(0);
+
+/// Workers available for fan-out (online APs). The BSP is always an extra
+/// participant on top of this.
+pub fn online_cpus() -> usize {
+    WORKERS.load(Ordering::Acquire) as usize + 1
+}
+
+/// The wake-IPI handler: nothing to do but acknowledge. Its only purpose is to
+/// bring the core out of `hlt` so the park loop re-checks the generation.
+extern "x86-interrupt" fn wake_handler(_frame: crate::arch::x86_64::idt::InterruptStackFrame) {
+    crate::arch::x86_64::apic::eoi();
+}
+
+/// Park this AP as a fleet worker: wait for a job generation, run this worker's
+/// range, mark it done, sleep again.
+///
+/// Never returns. Interrupts are enabled here (they are not during bring-up) so
+/// the wake IPI can land; the handler does nothing but EOI.
+fn fleet_worker(worker: usize) -> ! {
+    crate::arch::x86_64::idt::set_irq_handler(WAKE_VECTOR, wake_handler);
+    crate::arch::x86_64::interrupts::enable();
+    let mut last = JOB.go.load(Ordering::Acquire);
+    loop {
+        let g = JOB.go.load(Ordering::Acquire);
+        if g != last {
+            last = g;
+            let f = JOB.fn_ptr.load(Ordering::Acquire);
+            let s = JOB.start[worker].load(Ordering::Relaxed);
+            let e = JOB.end[worker].load(Ordering::Relaxed);
+            if f != 0 && e > s {
+                // Publish "started" before doing any work, so a straggler check
+                // cannot conclude this range is untouched and run it as well.
+                JOB.claimed[worker].store(g, Ordering::Release);
+                // SAFETY: the BSP published `f` as a `unsafe fn(usize, usize,
+                // *mut u8)` together with a range disjoint from every other
+                // worker's, and keeps `ctx` alive across the barrier.
+                unsafe {
+                    let f: unsafe fn(usize, usize, *mut u8) = core::mem::transmute(f);
+                    f(s, e, JOB.ctx.load(Ordering::Acquire));
+                }
+            } else {
+                JOB.claimed[worker].store(g, Ordering::Release);
+            }
+            JOB.done[worker].store(g, Ordering::Release);
+        }
+        // Sleep until the next IPI. `hlt` with interrupts enabled costs nothing
+        // while idle, unlike a spin.
+        crate::arch::x86_64::hlt();
+    }
+}
+
+/// How long the BSP waits for the fleet before treating a worker as a straggler.
+/// Generous: this is a bound against broken wake delivery, not a scheduling
+/// deadline.
+const BARRIER_SPINS: u64 = 200_000_000;
+
+/// Run `f` over `[0, n)` split across the BSP and every online AP.
+///
+/// Falls back to running inline on the calling core when there are no workers or
+/// the range is too small to be worth splitting — the same shape, and the same
+/// signature, as `arch::aarch64::smp::parallel_for`, so callers need no `cfg`.
+///
+/// # Safety
+/// `f` must be safe to call concurrently on disjoint sub-ranges of `[0, n)`
+/// sharing `ctx`; `ctx` must outlive the call.
+pub unsafe fn parallel_for(n: usize, min_chunk: usize, f: unsafe fn(usize, usize, *mut u8), ctx: *mut u8) {
+    let workers = (WORKERS.load(Ordering::Acquire) as usize).min(MAX_CPUS - 1);
+    if workers == 0 || n < min_chunk.saturating_mul(2).max(16) {
+        // SAFETY: caller's contract, over the whole range on this core.
+        unsafe { f(0, n, ctx) };
+        return;
+    }
+    let n_parts = workers + 1; // + the BSP
+    let boundary = |k: usize| k * n / n_parts;
+    JOB.fn_ptr.store(f as usize, Ordering::Relaxed);
+    JOB.ctx.store(ctx, Ordering::Relaxed);
+    for w in 0..workers {
+        JOB.start[w].store(boundary(w + 1), Ordering::Relaxed);
+        JOB.end[w].store(boundary(w + 2), Ordering::Relaxed);
+    }
+    let g = JOB.go.load(Ordering::Relaxed) + 1;
+    JOB.go.store(g, Ordering::Release);
+    crate::arch::x86_64::apic::send_wake_ipi(WAKE_VECTOR);
+
+    // The BSP takes the first partition while the fleet works.
+    // SAFETY: caller's contract, over a range disjoint from every worker's.
+    unsafe { f(0, boundary(1), ctx) };
+
+    // Bounded barrier. A worker that never *claimed* its range cannot have
+    // touched it, so the BSP runs it rather than returning a partial result — the
+    // failure mode to avoid is silently-wrong output, and slow beats stuck.
+    for w in 0..workers {
+        let mut spins = 0u64;
+        while JOB.done[w].load(Ordering::Acquire) != g {
+            if spins > BARRIER_SPINS {
+                if JOB.claimed[w].load(Ordering::Acquire) != g {
+                    let (s, e) = (JOB.start[w].load(Ordering::Relaxed), JOB.end[w].load(Ordering::Relaxed));
+                    crate::ktrace::log_fmt(format_args!(
+                        "smp: worker {w} never woke for generation {g}; BSP running rows {s}..{e}"
+                    ));
+                    // SAFETY: `claimed != g` proves the worker never entered this
+                    // range, so running it here cannot race.
+                    unsafe { f(s, e, ctx) };
+                    JOB.done[w].store(g, Ordering::Release);
+                } else {
+                    // Claimed but unfinished: it IS running, so duplicating would
+                    // corrupt the output. Keep waiting, but say so.
+                    crate::ktrace::log_fmt(format_args!(
+                        "smp: worker {w} claimed generation {g} but has not finished -- still waiting"
+                    ));
+                    spins = 0;
+                    continue;
+                }
+                break;
+            }
+            spins += 1;
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Scratch buffer for the wake self-test: one slot per index, each written by
+/// whichever core owns that index.
+static SELFTEST_MARKS: [AtomicU64; SELFTEST_N] = [ZERO; SELFTEST_N];
+const SELFTEST_N: usize = 4096;
+
+/// Self-test body: stamp `gen` into every index of this core's range.
+///
+/// # Safety
+/// Ranges handed to it are disjoint, so the writes never overlap.
+unsafe fn selftest_mark(start: usize, end: usize, ctx: *mut u8) {
+    let gen = ctx as u64;
+    for i in start..end.min(SELFTEST_N) {
+        SELFTEST_MARKS[i].store(gen, Ordering::Relaxed);
+    }
+}
+
+/// Push one real job through the fleet to prove the wake path works, and fall
+/// back to single-core if it does not.
+///
+/// This mirrors aarch64's `wake self-test`, and exists for the same hard-won
+/// reason: a hypervisor can accept the parked state and never deliver the wake.
+/// (On aarch64 that was VirtualBox holding a trapped `WFE` until an interrupt,
+/// which hung the first prefill forever.) x86 wakes with an IPI, which a
+/// hypervisor could equally drop — so verify it once, at boot, on the real job
+/// and barrier path rather than trusting it.
+///
+/// A failure is not fatal: `WORKERS` is zeroed, so `parallel_for` runs everything
+/// inline from then on. Slow beats stuck, and slow beats silently wrong.
+pub fn wake_self_test() {
+    let workers = WORKERS.load(Ordering::Acquire) as usize;
+    if workers == 0 {
+        return; // single-core boot; nothing to prove
+    }
+    for m in SELFTEST_MARKS.iter() {
+        m.store(0, Ordering::Relaxed);
+    }
+    let gen = 0xa5u64;
+    // SAFETY: `selftest_mark` only writes its own disjoint range of a static
+    // array, and `ctx` is a plain integer, not a pointer that must outlive.
+    unsafe { parallel_for(SELFTEST_N, 1, selftest_mark, gen as *mut u8) };
+
+    // Did every worker actually run its own range, or did the BSP have to cover?
+    let g = JOB.go.load(Ordering::Acquire);
+    let unwoken = (0..workers).filter(|&w| JOB.claimed[w].load(Ordering::Acquire) != g).count();
+    // And is the output complete regardless of who computed it?
+    let unmarked = SELFTEST_MARKS.iter().filter(|m| m.load(Ordering::Relaxed) != gen).count();
+
+    if unmarked != 0 {
+        crate::ktrace::log_fmt(format_args!(
+            "smp: wake self-test FAILED -- {unmarked}/{SELFTEST_N} indices unwritten; disabling the compute fleet"
+        ));
+        WORKERS.store(0, Ordering::Release);
+        return;
+    }
+    if unwoken != 0 {
+        crate::ktrace::log_fmt(format_args!(
+            "smp: wake self-test degraded -- {unwoken}/{workers} worker(s) never woke (IPI not delivered); disabling the compute fleet"
+        ));
+        WORKERS.store(0, Ordering::Release);
+        return;
+    }
+    crate::ktrace::log_fmt(format_args!("smp: wake self-test ok ({workers} compute worker(s))"));
 }

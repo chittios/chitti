@@ -139,3 +139,48 @@ pub fn cycle_count() -> u64 {
 pub fn cycle_count() -> u64 {
     now_ms()
 }
+
+/// Cores available to fan work out across, counting the caller's own core.
+///
+/// Arch-neutral so compute-heavy code does not have to `cfg` on the arch to find
+/// out whether parallelism exists — which is exactly how x86 ended up running
+/// every parallel loop on one core while aarch64 split it across the fleet.
+#[cfg(target_arch = "x86_64")]
+pub fn online_cpus() -> usize {
+    crate::smp::online_cpus()
+}
+#[cfg(target_arch = "aarch64")]
+pub fn online_cpus() -> usize {
+    aarch64::smp::online_cpus()
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn online_cpus() -> usize {
+    1
+}
+
+/// Run `f` over `[0, n)`, split across every online core.
+///
+/// `min_chunk` is the smallest range worth handing to a worker; below roughly
+/// twice that the whole range runs inline on the calling core, since the barrier
+/// would cost more than the work. Both arches implement the same static-partition
+/// barrier and the same fallback, so a caller gets parallelism wherever it exists
+/// and correct serial behaviour where it does not.
+///
+/// # Safety
+/// `f` must be safe to call concurrently on disjoint sub-ranges of `[0, n)`
+/// sharing `ctx`, and `ctx` must outlive the call.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn parallel_for(n: usize, min_chunk: usize, f: unsafe fn(usize, usize, *mut u8), ctx: *mut u8) {
+    // SAFETY: forwarded under the caller's contract.
+    unsafe { crate::smp::parallel_for(n, min_chunk, f, ctx) }
+}
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn parallel_for(n: usize, min_chunk: usize, f: unsafe fn(usize, usize, *mut u8), ctx: *mut u8) {
+    // SAFETY: forwarded under the caller's contract.
+    unsafe { aarch64::smp::parallel_for(n, min_chunk, f, ctx) }
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub unsafe fn parallel_for(n: usize, _min_chunk: usize, f: unsafe fn(usize, usize, *mut u8), ctx: *mut u8) {
+    // SAFETY: forwarded under the caller's contract; single-core.
+    unsafe { f(0, n, ctx) }
+}
