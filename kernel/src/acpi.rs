@@ -164,6 +164,19 @@ pub fn dsdt_from_rsdp(rsdp: u64, map: impl Fn(u64, usize) -> u64) -> Option<*con
     Some(map(dsdt_phys, total) as *const u8)
 }
 
+/// The DSDT as a byte slice, for the AML layer.
+///
+/// # Safety
+/// The returned slice borrows the mapped ACPI table, which lives for the kernel's
+/// lifetime, so `'static` is honest here.
+pub fn dsdt_bytes(rsdp: u64, map: impl Fn(u64, usize) -> u64) -> Option<&'static [u8]> {
+    let p = dsdt_from_rsdp(rsdp, map)?;
+    // SAFETY: `dsdt_from_rsdp` mapped at least the table's declared length and
+    // validated it; the mapping is never torn down.
+    let len = le32(p, 4) as usize;
+    Some(unsafe { core::slice::from_raw_parts(p, len) })
+}
+
 /// An **I2C serial-bus connection** described by an ACPI resource descriptor.
 ///
 /// This is how an I2C-attached device — notably a HID-over-I2C touchpad — is
@@ -352,7 +365,12 @@ pub fn s5_from_rsdp(rsdp: u64, phys_to_virt: impl Fn(u64) -> u64) -> Option<Slee
         return None;
     }
     let dsdt = phys_to_virt(dsdt_phys) as *const u8;
-    let (slp_typa, slp_typb) = parse_s5_package(dsdt)?;
+    // Prefer real AML decoding: `aml::find_name` requires an actual `NameOp` to
+    // introduce the name, so it cannot be fooled by bytes that merely contain `_S5_`.
+    // The original pattern-scan stays as a fallback rather than being deleted — it is
+    // tested, it works, and poweroff is not somewhere to trade a working path for a
+    // new one without hardware to confirm on.
+    let (slp_typa, slp_typb) = s5_via_aml(dsdt).or_else(|| parse_s5_package(dsdt))?;
     Some(SleepInfo {
         pm1a_cnt: pm1a as u16,
         pm1b_cnt: if pm1b <= u16::MAX as u64 { pm1b as u16 } else { 0 },
@@ -361,6 +379,25 @@ pub fn s5_from_rsdp(rsdp: u64, phys_to_virt: impl Fn(u64) -> u64) -> Option<Slee
         smi_cmd,
         acpi_enable,
     })
+}
+
+/// Decode `\_S5_` through the AML layer: the first two package elements are the
+/// PM1a/PM1b sleep types. `None` if it is absent or not a package of integers, which
+/// sends the caller to the pattern-scan fallback.
+fn s5_via_aml(dsdt: *const u8) -> Option<(u8, u8)> {
+    // SAFETY: `dsdt` is a mapped table whose length is at offset 4.
+    let len = le32(dsdt, 4) as usize;
+    if len < 36 || len > 0x40_0000 {
+        return None;
+    }
+    let aml = unsafe { core::slice::from_raw_parts(dsdt, len) };
+    let crate::aml::Value::Package(items) = crate::aml::find_name(aml, "_S5")? else {
+        return None;
+    };
+    let a = items.first()?.as_int()?;
+    // A single-element package is legal; PM1b then has no sleep type of its own.
+    let b = items.get(1).and_then(|v| v.as_int()).unwrap_or(a);
+    Some((a as u8, b as u8))
 }
 
 /// Find `\_S5_` in the DSDT and decode the two sleep-type values out of its

@@ -33,6 +33,9 @@ use crate::block::BlockError;
 /// on the large majority of devices and is what Linux falls back to.
 pub const DEFAULT_HID_DESC_REG: u16 = 0x0020;
 
+/// The ACPI id every HID-over-I2C device reports in `_HID` or `_CID`.
+pub const HID_I2C_PNP_ID: &str = "PNP0C50";
+
 /// Length of the HID descriptor, per the HID-over-I2C specification.
 pub const HID_DESC_LEN: usize = 30;
 /// The `bcdVersion` a conforming device reports.
@@ -202,12 +205,34 @@ pub fn init(rsdp: u64) {
     if HID.with(|h| h.is_some()) {
         return;
     }
-    let Some(dsdt) = crate::acpi::dsdt_from_rsdp(rsdp, crate::mm::map_mmio) else {
+    let Some(aml) = crate::acpi::dsdt_bytes(rsdp, crate::mm::map_mmio) else {
         return;
     };
-    let conns = crate::acpi::i2c_resources(dsdt);
+    // Ask the namespace which device claims to be a HID-over-I2C touchpad and read
+    // *its* `_CRS`, rather than trying every I2C connection in the table. That is the
+    // difference the AML walk buys: no addressing of devices that are not the
+    // touchpad, on a bus that also carries the embedded controller.
+    let mut conns = alloc::vec::Vec::new();
+    if let Some(dev) = crate::aml::device_by_hid(aml, HID_I2C_PNP_ID) {
+        if let Some(crs) = crate::aml::device_name(aml, &dev, "_CRS") {
+            if let Some(r) = crs.as_buffer().and_then(crate::acpi::parse_i2c_serial_bus) {
+                crate::ktrace::log_fmt(format_args!(
+                    "i2c_hid: {} declares {} at {:#x} ({} Hz)",
+                    dev.path, HID_I2C_PNP_ID, r.address, r.speed_hz
+                ));
+                conns.push(r);
+            }
+        }
+    }
     if conns.is_empty() {
-        return;
+        // No device claims the touchpad ID (or its `_CRS` is not a static buffer), so
+        // fall back to every declared I2C connection. Identification is read-only, so
+        // this is safe — just less targeted.
+        conns = crate::acpi::i2c_resources(aml.as_ptr());
+        if conns.is_empty() {
+            return;
+        }
+        crate::ktrace::log("i2c_hid", "no PNP0C50 device in the namespace; trying every declared I2C connection");
     }
     // Try each controller in turn: a machine can have several I2C buses, and the
     // touchpad is on exactly one of them.
