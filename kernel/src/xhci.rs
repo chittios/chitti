@@ -1443,7 +1443,15 @@ impl Xhci {
         }
     }
 
-    /// Queue one interrupt IN transfer of `len` bytes on `(ring, slot, dci)`.
+    /// Queue one transfer of `len` bytes on `(ring, slot, dci)`.
+    ///
+    /// Despite the historical name this is **not** interrupt-specific: a bulk
+    /// transfer uses the identical Normal TRB with IOC set, and the endpoint type
+    /// lives in the endpoint *context* (see [`ep_ctx_dword1`]), not in the TRB. So
+    /// USB Ethernet needs no new submit path — only bulk endpoint contexts
+    /// (already possible via [`EpType`]) and routing of the resulting transfer
+    /// events for those DCIs in `pump_events`, which today dispatches solely to
+    /// the keyboard and pointer.
     #[allow(clippy::too_many_arguments)]
     unsafe fn arm_int(&self, ring_va: usize, ring_pa: u64, enq: &mut usize, cycle: &mut u32, report_pa: u64, len: u32, slot: u8, dci: u8) {
         unsafe {
