@@ -182,7 +182,7 @@ struct Ptr {
 /// can't express the 12-bit packed X/Y many real mice use (a wireless dongle's
 /// `[id][buttons:8][X:12][Y:12][wheel:8]`).
 #[derive(Clone, Copy)]
-struct PtrLayout {
+pub(crate) struct PtrLayout {
     report_id: u8, // report-ID prefix (0 = none); only decode reports with this id
     btn_bit: u16,  // bit offset of button 1 (left)
     x_bit: u16,
@@ -1619,34 +1619,7 @@ impl Xhci {
                             *b = read_volatile((m.report_va + i) as *const u8);
                         }
                         let lo = m.layout;
-                        // A multi-report-ID interface (this dongle also carries a
-                        // vendor report) prefixes each report with its ID; only
-                        // decode the pointer's, else a vendor report is garbage.
-                        let id_ok = lo.report_id == 0 || rep.first().copied() == Some(lo.report_id);
-                        let xr = extract_bits(&rep[..n], lo.x_bit as usize, lo.x_bits as usize);
-                        let yr = extract_bits(&rep[..n], lo.y_bit as usize, lo.y_bits as usize);
-                        if m.dbg > 0 {
-                            m.dbg -= 1;
-                            crate::ktrace::log_fmt(format_args!(
-                                "xhci: ptr report [{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] id_ok={id_ok} xraw={xr} yraw={yr}",
-                                rep[0], rep[1], rep[2], rep[3], rep[4], rep[5], rep[6], rep[7]
-                            ));
-                        }
-                        if id_ok {
-                            if lo.relative {
-                                crate::mouse::move_rel(sign_extend(xr, lo.x_bits as usize), sign_extend(yr, lo.y_bits as usize));
-                            } else {
-                                crate::mouse::set_abs(xr as i32, yr as i32, lo.scale_max);
-                            }
-                            crate::mouse::set_left(extract_bits(&rep[..n], lo.btn_bit as usize, 1) != 0);
-                            // Scroll wheel (HID Usage 0x38): a signed delta, + = up.
-                            if let Some(wb) = lo.wheel_bit {
-                                let dz = sign_extend(extract_bits(&rep[..n], wb as usize, lo.wheel_bits as usize), lo.wheel_bits as usize);
-                                if dz != 0 {
-                                    crate::mouse::add_wheel(dz);
-                                }
-                            }
-                        }
+                        feed_pointer_report(&lo, &rep[..n], Some(&mut m.dbg));
                         self.arm_int(m.int_ring_va, m.int_ring_pa, &mut m.int_enqueue, &mut m.int_cycle, m.report_pa, m.report_len, m.slot, m.int_dci);
                         continue;
                     }
@@ -1980,7 +1953,51 @@ unsafe fn parse_hid_report_len(buf: usize, len: usize, iface: u8) -> Option<u16>
 /// (works for any tablet/mouse layout, incl. a leading report-ID byte). Walks
 /// the item stream tracking usage page / report size / count / id and, on each
 /// Input item, assigns bit offsets to its usages.
-unsafe fn parse_report_layout(buf: usize, len: usize) -> Option<PtrLayout> {
+/// Decode a pointer input report through `lo` and feed [`crate::mouse`].
+///
+/// Shared by the USB interrupt-endpoint path and HID-over-I2C
+/// ([`crate::drivers::i2c_hid`]): both transports deliver the same HID report bytes,
+/// so decoding them in one place means a precision touchpad and a plain mouse cannot
+/// drift apart in behaviour.
+pub(crate) fn feed_pointer_report(lo: &PtrLayout, rep: &[u8], dbg: Option<&mut u8>) {
+    let n = rep.len();
+    let lo = *lo;
+    // A multi-report-ID interface (this dongle also carries a
+        // vendor report) prefixes each report with its ID; only
+        // decode the pointer's, else a vendor report is garbage.
+        let id_ok = lo.report_id == 0 || rep.first().copied() == Some(lo.report_id);
+        let xr = extract_bits(&rep[..n], lo.x_bit as usize, lo.x_bits as usize);
+        let yr = extract_bits(&rep[..n], lo.y_bit as usize, lo.y_bits as usize);
+        // First few reports are logged so a mis-decoded layout is diagnosable. The
+        // budget belongs to the caller (it is per-device state), not to this shared
+        // decoder.
+        if let Some(d) = dbg {
+            if *d > 0 && rep.len() >= 8 {
+                *d -= 1;
+                crate::ktrace::log_fmt(format_args!(
+                    "hid: ptr report [{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] id_ok={id_ok} xraw={xr} yraw={yr}",
+                    rep[0], rep[1], rep[2], rep[3], rep[4], rep[5], rep[6], rep[7]
+                ));
+            }
+        }
+        if id_ok {
+            if lo.relative {
+                crate::mouse::move_rel(sign_extend(xr, lo.x_bits as usize), sign_extend(yr, lo.y_bits as usize));
+            } else {
+                crate::mouse::set_abs(xr as i32, yr as i32, lo.scale_max);
+            }
+            crate::mouse::set_left(extract_bits(&rep[..n], lo.btn_bit as usize, 1) != 0);
+            // Scroll wheel (HID Usage 0x38): a signed delta, + = up.
+            if let Some(wb) = lo.wheel_bit {
+                let dz = sign_extend(extract_bits(&rep[..n], wb as usize, lo.wheel_bits as usize), lo.wheel_bits as usize);
+                if dz != 0 {
+                    crate::mouse::add_wheel(dz);
+                }
+            }
+        }
+}
+
+pub(crate) unsafe fn parse_report_layout(buf: usize, len: usize) -> Option<PtrLayout> {
     let (mut usage_page, mut report_size, mut report_count) = (0u16, 0u32, 0u32);
     let mut logical_max = 0i32;
     let mut x_scale = 0i32; // logical max in effect when the X field is seen

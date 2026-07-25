@@ -9,4 +9,5 @@
 //! - [`wifi`] — Broadcom FullMAC PCIe (brcmfmac-class) on Apple Silicon
 
 pub mod i2c;
+pub mod i2c_hid;
 pub mod wifi;
