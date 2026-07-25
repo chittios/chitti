@@ -290,10 +290,382 @@ pub fn find_name(aml: &[u8], name: &str) -> Option<Value> {
     None
 }
 
+// --- namespace structure --------------------------------------------------
+//
+// `find_name` above is a scan: it finds *a* `_CRS`, not a particular device's. That is
+// useless for the case that motivated this module — a laptop has several I2C devices
+// and only one is the touchpad — so the containers have to be walked.
+//
+// This is structure-aware without a full opcode table, which is the pragmatic middle
+// ground. `Scope` and `Device` both carry a PkgLength, so their extent is known
+// exactly and they can be descended into and skipped over reliably. Within a body,
+// names are still found by scanning, because skipping an *arbitrary* opcode requires
+// knowing every opcode's encoding — that is what full evaluation needs and this
+// deliberately does not attempt.
+//
+// The result is enough to answer "what is *this* device's `_CRS`", which is the
+// question a driver actually asks.
+
+/// A `Device (...)` found in the namespace, with the byte range of its body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceNode {
+    /// Dotted path including enclosing scopes, e.g. `\_SB.PCI0.I2C1.TPD0`.
+    pub path: String,
+    /// Byte range of the device's term list within the AML passed to [`devices`].
+    pub body: core::ops::Range<usize>,
+    /// Byte range of the whole `Device(...)` construct, including its opcode, length
+    /// and name — what a parent must skip over entirely.
+    pub extent: core::ops::Range<usize>,
+}
+
+impl DeviceNode {
+    /// The device's own name (last path segment).
+    pub fn name(&self) -> &str {
+        self.path.rsplit('.').next().unwrap_or(&self.path)
+    }
+}
+
+/// How deeply to descend through nested Scope/Device containers.
+const MAX_NESTING: usize = 12;
+
+/// Every `Device` in `aml`, with its full namespace path and body range.
+///
+/// Nested devices are reported as well as their parents — a touchpad is commonly
+/// `Device` inside the I2C controller's `Device` — so a caller can look at whichever
+/// level it cares about.
+pub fn devices(aml: &[u8]) -> Vec<DeviceNode> {
+    let mut out = Vec::new();
+    walk(aml, 0, "", 0, &mut out);
+    out
+}
+
+/// Recursive container walk. `base` is the enclosing path, `off` the offset of `aml`
+/// within the original buffer so reported ranges are absolute.
+fn walk(aml: &[u8], off: usize, base: &str, depth: usize, out: &mut Vec<DeviceNode>) {
+    if depth > MAX_NESTING {
+        return;
+    }
+    let mut i = 0usize;
+    while i < aml.len() {
+        // Scope(...) is one byte; Device(...) is the two-byte extended opcode.
+        let (header, is_device) = match aml[i] {
+            SCOPE_OP => (1usize, false),
+            EXT_OP_PREFIX if aml.get(i + 1) == Some(&DEVICE_OP) => (2usize, true),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let Some((total, lead)) = aml.get(i + header..).and_then(pkg_length) else {
+            i += 1;
+            continue;
+        };
+        // PkgLength counts itself, so the container ends here.
+        let end = i + header + total;
+        if total < lead || end > aml.len() {
+            i += 1;
+            continue;
+        }
+        let name_at = i + header + lead;
+        let Some((name, used)) = aml.get(name_at..end).and_then(name_string) else {
+            i += 1;
+            continue;
+        };
+        let body_start = name_at + used;
+        if body_start > end {
+            i += 1;
+            continue;
+        }
+        let path = join_path(base, &name);
+        if is_device {
+            out.push(DeviceNode {
+                path: path.clone(),
+                body: off + body_start..off + end,
+                // The container's own bytes (opcode, length, name) must be excluded
+                // from a parent's search too, or the child's name would be found there.
+                extent: off + i..off + end,
+            });
+        }
+        // Descend, then skip the whole container — this is why knowing the extent
+        // matters: a scan would re-find the nested devices at the wrong path.
+        walk(&aml[body_start..end], off + body_start, &path, depth + 1, out);
+        i = end;
+    }
+}
+
+/// Join an enclosing path with a (possibly root- or parent-prefixed) name.
+///
+/// A leading `\` restarts from the root — ignoring that would nest an absolute path
+/// under whatever happened to enclose it. Each leading `^` climbs one level.
+fn join_path(base: &str, name: &str) -> String {
+    if let Some(rest) = name.strip_prefix('\\') {
+        let mut s = String::from("\\");
+        s.push_str(rest);
+        return s;
+    }
+    let mut up = 0usize;
+    let mut rest = name;
+    while let Some(r) = rest.strip_prefix('^') {
+        up += 1;
+        rest = r;
+    }
+    let mut parts: Vec<&str> = base.split('.').filter(|p| !p.is_empty()).collect();
+    for _ in 0..up {
+        parts.pop();
+    }
+    let mut s = String::new();
+    if base.starts_with('\\') {
+        s.push('\\');
+    }
+    for (k, p) in parts.iter().enumerate() {
+        let p = p.trim_start_matches('\\');
+        if p.is_empty() {
+            continue;
+        }
+        if k > 0 || !s.is_empty() && s != "\\" {
+            if !s.is_empty() && !s.ends_with('\\') {
+                s.push('.');
+            }
+        }
+        s.push_str(p);
+    }
+    if !rest.is_empty() {
+        if !s.is_empty() && !s.ends_with('\\') {
+            s.push('.');
+        }
+        s.push_str(rest);
+    }
+    s
+}
+
+/// Look up a named object **belonging to one device**, excluding its children.
+///
+/// This is the per-device answer `find_name` cannot give. The subtlety is that a
+/// parent's body *contains* its nested devices, so searching the range naively makes a
+/// parent inherit its children's names — an I2C controller would report the touchpad's
+/// `_HID` as its own, which is precisely the bug the tests caught. Child ranges are
+/// therefore excluded and only the gaps between them searched.
+pub fn device_name(aml: &[u8], dev: &DeviceNode, name: &str) -> Option<Value> {
+    let all = devices(aml);
+    // Direct or indirect children: any device whose body sits strictly inside this one.
+    let mut kids: Vec<core::ops::Range<usize>> = all
+        .iter()
+        .filter(|d| d.path != dev.path && d.extent.start >= dev.body.start && d.extent.end <= dev.body.end)
+        .map(|d| d.extent.clone())
+        .collect();
+    kids.sort_by_key(|r| r.start);
+
+    let mut cursor = dev.body.start;
+    for k in &kids {
+        if k.start > cursor {
+            if let Some(v) = aml.get(cursor..k.start).and_then(|w| find_name(w, name)) {
+                return Some(v);
+            }
+        }
+        cursor = cursor.max(k.end);
+    }
+    if cursor < dev.body.end {
+        if let Some(v) = aml.get(cursor..dev.body.end).and_then(|w| find_name(w, name)) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Find the device whose `_HID` (or `_CID`) matches `hid`.
+///
+/// `PNP0C50` is the HID-over-I2C touchpad identifier, which is what makes this the
+/// replacement for guessing an I2C address: instead of probing every connection, ask
+/// the namespace which device claims to be a touchpad and read *its* `_CRS`.
+pub fn device_by_hid(aml: &[u8], hid: &str) -> Option<DeviceNode> {
+    devices(aml).into_iter().find(|d| {
+        for key in ["_HID", "_CID"] {
+            if let Some(Value::String(s)) = device_name(aml, d, key) {
+                if s == hid {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::vec;
+    // --- namespace structure ----------------------------------------------
+
+    /// Encode a PkgLength for a body of `n` bytes, returning the bytes.
+    ///
+    /// The encoding must account for its own size, which is the trap: a body needing
+    /// a 2-byte length has a different total than the same body with a 1-byte one.
+    fn pkglen(n: usize) -> vec::Vec<u8> {
+        let one = n + 1;
+        if one <= 0x3f {
+            return vec![one as u8];
+        }
+        let two = n + 2;
+        vec![0x40 | (two & 0x0f) as u8, (two >> 4) as u8]
+    }
+
+    fn seg(name: &str) -> vec::Vec<u8> {
+        let mut v: vec::Vec<u8> = name.bytes().collect();
+        while v.len() < 4 {
+            v.push(b'_');
+        }
+        v
+    }
+
+    /// `Device (name) { body }`
+    fn device(name: &str, body: &[u8]) -> vec::Vec<u8> {
+        let mut inner = seg(name);
+        inner.extend_from_slice(body);
+        let mut v = vec![EXT_OP_PREFIX, DEVICE_OP];
+        v.extend_from_slice(&pkglen(inner.len()));
+        v.extend_from_slice(&inner);
+        v
+    }
+
+    /// `Scope (name) { body }`
+    fn scope(name: &str, body: &[u8]) -> vec::Vec<u8> {
+        let mut inner = seg(name);
+        inner.extend_from_slice(body);
+        let mut v = vec![SCOPE_OP];
+        v.extend_from_slice(&pkglen(inner.len()));
+        v.extend_from_slice(&inner);
+        v
+    }
+
+    /// `Name (name, "value")`
+    fn name_str(name: &str, value: &str) -> vec::Vec<u8> {
+        let mut v = vec![NAME_OP];
+        v.extend_from_slice(&seg(name));
+        v.push(STRING_PREFIX);
+        v.extend_from_slice(value.as_bytes());
+        v.push(0);
+        v
+    }
+
+    /// A DSDT body with two I2C devices, only one of which is a touchpad — the exact
+    /// situation that makes a per-device lookup necessary.
+    fn two_i2c_devices() -> vec::Vec<u8> {
+        let mut tpd = name_str("_HID", "PNP0C50");
+        tpd.extend_from_slice(&{
+            // Name(_CRS, Buffer(2){0xAA,0xBB})
+            let mut v = vec![NAME_OP];
+            v.extend_from_slice(&seg("_CRS"));
+            v.push(BUFFER_OP);
+            let body = [BYTE_PREFIX, 0x02, 0xaa, 0xbb];
+            v.extend_from_slice(&pkglen(body.len()));
+            v.extend_from_slice(&body);
+            v
+        });
+        let mut sensor = name_str("_HID", "ACPI0C60");
+        sensor.extend_from_slice(&{
+            let mut v = vec![NAME_OP];
+            v.extend_from_slice(&seg("_CRS"));
+            v.push(BUFFER_OP);
+            let body = [BYTE_PREFIX, 0x02, 0x11, 0x22];
+            v.extend_from_slice(&pkglen(body.len()));
+            v.extend_from_slice(&body);
+            v
+        });
+        let mut i2c_body = device("TPD0", &tpd);
+        i2c_body.extend_from_slice(&device("SEN0", &sensor));
+        let i2c = device("I2C1", &i2c_body);
+        scope("_SB_", &i2c)
+    }
+
+    #[test_case]
+    fn walks_nested_devices_with_full_paths() {
+        let aml = two_i2c_devices();
+        let devs = devices(&aml);
+        let paths: vec::Vec<&str> = devs.iter().map(|d| d.path.as_str()).collect();
+        // The enclosing Scope must contribute to the path, and nested devices must be
+        // reported under their parent — not at the root, which is what a flat scan
+        // would produce.
+        assert!(paths.contains(&"_SB.I2C1"), "{paths:?}");
+        assert!(paths.contains(&"_SB.I2C1.TPD0"), "{paths:?}");
+        assert!(paths.contains(&"_SB.I2C1.SEN0"), "{paths:?}");
+    }
+
+    #[test_case]
+    fn resolves_the_right_devices_crs() {
+        // The whole point: two devices each have a _CRS, and a scan would return
+        // whichever came first. Per-device lookup must return each one's own.
+        let aml = two_i2c_devices();
+        let devs = devices(&aml);
+        let tpd = devs.iter().find(|d| d.name() == "TPD0").unwrap();
+        let sen = devs.iter().find(|d| d.name() == "SEN0").unwrap();
+        assert_eq!(
+            device_name(&aml, tpd, "_CRS").and_then(|v| v.as_buffer().map(|b| b.to_vec())),
+            Some(vec![0xaa, 0xbb])
+        );
+        assert_eq!(
+            device_name(&aml, sen, "_CRS").and_then(|v| v.as_buffer().map(|b| b.to_vec())),
+            Some(vec![0x11, 0x22])
+        );
+    }
+
+    #[test_case]
+    fn finds_the_touchpad_by_hid() {
+        // PNP0C50 is the HID-over-I2C identifier. This is what replaces guessing an
+        // I2C address: ask which device claims to be a touchpad, then read its _CRS.
+        let aml = two_i2c_devices();
+        let dev = device_by_hid(&aml, "PNP0C50").unwrap();
+        assert_eq!(dev.name(), "TPD0");
+        assert_eq!(
+            device_name(&aml, &dev, "_CRS").and_then(|v| v.as_buffer().map(|b| b.to_vec())),
+            Some(vec![0xaa, 0xbb])
+        );
+        // And a HID nothing claims yields nothing, rather than the first device.
+        assert!(device_by_hid(&aml, "PNP9999").is_none());
+    }
+
+    #[test_case]
+    fn a_devices_body_excludes_its_siblings() {
+        // If the body range were wrong, TPD0's lookup would see SEN0's names and the
+        // per-device guarantee would be an illusion.
+        let aml = two_i2c_devices();
+        let devs = devices(&aml);
+        let tpd = devs.iter().find(|d| d.name() == "TPD0").unwrap();
+        match device_name(&aml, tpd, "_HID") {
+            Some(Value::String(s)) => assert_eq!(s, "PNP0C50"),
+            other => panic!("unexpected {other:?}"),
+        }
+        let sen = devs.iter().find(|d| d.name() == "SEN0").unwrap();
+        assert!(!tpd.body.contains(&sen.body.start), "TPD0 body swallowed SEN0");
+        // And the parent must NOT inherit a child's name. A parent's body contains its
+        // children, so a naive range search made the I2C controller report the
+        // touchpad's _HID as its own — this is the regression guard for that.
+        let i2c = devs.iter().find(|d| d.name() == "I2C1").unwrap();
+        assert_eq!(device_name(&aml, i2c, "_HID"), None, "parent inherited a child's _HID");
+        assert_eq!(device_name(&aml, i2c, "_CRS"), None, "parent inherited a child's _CRS");
+    }
+
+    #[test_case]
+    fn root_prefixed_name_restarts_the_path() {
+        // A `\`-prefixed name is absolute; nesting it under the enclosing scope would
+        // produce a path that does not exist.
+        // Input is what `name_string` produces, i.e. already underscore-trimmed.
+        assert_eq!(join_path("_SB.PCI0", "\\_SB"), String::from("\\_SB"));
+        // `^` climbs one level.
+        assert_eq!(join_path("_SB.PCI0", "^ABCD"), String::from("_SB.ABCD"));
+        assert_eq!(join_path("", "I2C1"), String::from("I2C1"));
+    }
+
+    #[test_case]
+    fn malformed_containers_do_not_derail_the_walk() {
+        // Firmware bytes: a truncated container must be skipped, not followed.
+        let mut aml = vec![EXT_OP_PREFIX, DEVICE_OP, 0x7f]; // claims a long body
+        aml.extend_from_slice(&two_i2c_devices());
+        let devs = devices(&aml);
+        assert!(devs.iter().any(|d| d.name() == "TPD0"), "{devs:?}");
+        assert!(devices(&[]).is_empty());
+        assert!(devices(&[EXT_OP_PREFIX]).is_empty());
+    }
+
 
     #[test_case]
     fn pkg_length_single_byte_uses_six_bits() {
