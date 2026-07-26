@@ -1233,6 +1233,14 @@ def s_display(g):
             return False, "/display boot did not record the preference"
         if not g.wait_for("not yet applied by the loader", 5, m):
             return False, "/display boot must not claim the loader applies it"
+        # ...and must point at a route that works. It used to suggest
+        # `VBoxInternal2/EfiGraphicsResolution`, which VirtualBox-ARM stores and then
+        # ignores; the working routes are CHITTI_RESOLUTION at image build and the
+        # ESP file the stub reads. Advice that does nothing is worse than none.
+        if not g.wait_for("CHITTI_RESOLUTION=1920x1080", 5, m):
+            return False, "/display boot should point at the image-build override"
+        if not g.wait_for("chitti-display.cfg", 5, m):
+            return False, "/display boot should name the ESP file the loader reads"
 
         return True, "output named, list, live letterboxed resize, clamping, per-display font scale, boot pref recorded"
     finally:

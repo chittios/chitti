@@ -11090,12 +11090,13 @@ fn run_display(arg: &str) {
                         "display> NOTE: not yet applied by the loader — the panel mode still comes from EDID."
                     );
                     serial_println!(
-                        "display>   VirtualBox: VBoxManage setextradata <vm> VBoxInternal2/EfiGraphicsResolution {}",
+                        "display>   at image build: CHITTI_RESOLUTION={} cargo xtask image -arch <arch>",
                         format_wxh(m)
                     );
                     serial_println!(
-                        "display>   x86 image:  CHITTI_RESOLUTION={} cargo xtask image -arch x86_64",
-                        format_wxh(m)
+                        "display>   by hand: put 'resolution={}' in \\{} on the ESP",
+                        format_wxh(m),
+                        crate::edid::BOOT_CFG_PATH
                     );
                     serial_println!(
                         "display>   for an instant change with no reboot: /display set {}",

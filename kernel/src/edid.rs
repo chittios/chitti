@@ -259,6 +259,54 @@ pub fn is_implausibly_small(w: u32, h: u32) -> bool {
     w < 1024 || h < 768
 }
 
+/// The name of the loader's display-preference file on the ESP.
+///
+/// It lives on the **FAT ESP** rather than with the rest of the settings on the
+/// ext4 data partition for one reason: the stub runs before any of the kernel
+/// exists and can only read FAT, so this is the one channel a human has to the
+/// mode the framebuffer is *created* in.
+pub const BOOT_CFG_PATH: &str = "chitti-display.cfg";
+
+/// Parse the loader display-preference file: `resolution=<W>x<H>` lines, `#`
+/// comments, blank lines and unknown keys ignored.
+///
+/// Deliberately tolerant about everything except the value itself: a file a
+/// human hand-edited on the ESP of a machine that will not boot should not brick
+/// the boot, so a malformed line is skipped rather than failing the parse. A
+/// malformed *resolution* returns `None` (keep the firmware's mode) instead of a
+/// guess — the whole point of this file is that the guess was wrong.
+///
+/// The last valid `resolution` wins, so appending a line overrides an earlier one.
+pub fn parse_boot_cfg(text: &str) -> Option<(u32, u32)> {
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some((key, val)) = line.split_once('=') else { continue };
+        if key.trim() != "resolution" {
+            continue;
+        }
+        if let Some(dims) = parse_dims(val.trim()) {
+            found = Some(dims);
+        }
+    }
+    found
+}
+
+/// `<W>x<H>` → dimensions, rejecting anything a framebuffer could not be.
+///
+/// The ceiling is not arbitrary politeness: the surface is `w * h * 4` bytes of
+/// contiguous framebuffer, so an absurd value asks the firmware for a mode it
+/// will refuse (or, worse, one that will not fit VRAM).
+pub fn parse_dims(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.split_once(['x', 'X'])?;
+    let w: u32 = w.trim().parse().ok()?;
+    let h: u32 = h.trim().parse().ok()?;
+    if w < 320 || h < 200 || w > 16384 || h > 16384 {
+        return None;
+    }
+    Some((w, h))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +509,39 @@ mod tests {
         assert!(!is_implausibly_small(1024, 768));
         assert!(!is_implausibly_small(1280, 800));
         assert!(!is_implausibly_small(1920, 1080));
+    }
+
+    #[test_case]
+    fn boot_cfg_reads_a_resolution_and_tolerates_the_rest() {
+        assert_eq!(parse_boot_cfg("resolution=1920x1080\n"), Some((1920, 1080)));
+        // Comments, blank lines, whitespace and unknown keys are all survivable —
+        // this file gets hand-edited on the ESP of a machine that will not boot.
+        let cfg = "# ChittiOS display\n\n  resolution = 1280x720  # comment\nscale=2\n";
+        assert_eq!(parse_boot_cfg(cfg), Some((1280, 720)));
+        // Last valid wins, so a line can be appended to override.
+        assert_eq!(parse_boot_cfg("resolution=800x600\nresolution=1920x1200\n"), Some((1920, 1200)));
+        // A malformed value keeps the firmware's mode rather than guessing.
+        assert_eq!(parse_boot_cfg("resolution=lots\n"), None);
+        assert_eq!(parse_boot_cfg("resolution=\n"), None);
+        assert_eq!(parse_boot_cfg(""), None);
+        assert_eq!(parse_boot_cfg("scale=2\n"), None);
+        // A bad line does not discard a good one, whichever order they come in.
+        assert_eq!(parse_boot_cfg("resolution=1600x900\nresolution=nonsense\n"), Some((1600, 900)));
+    }
+
+    #[test_case]
+    fn parse_dims_rejects_what_cannot_be_a_framebuffer() {
+        assert_eq!(parse_dims("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_dims("1920X1080"), Some((1920, 1080)));
+        assert_eq!(parse_dims("320x200"), Some((320, 200)));
+        // Below any console's floor, and past what VRAM would hold.
+        assert_eq!(parse_dims("319x200"), None);
+        assert_eq!(parse_dims("320x199"), None);
+        assert_eq!(parse_dims("99999x1080"), None);
+        // Not two numbers at all.
+        assert_eq!(parse_dims("1920"), None);
+        assert_eq!(parse_dims("x1080"), None);
+        assert_eq!(parse_dims("-1920x1080"), None);
+        assert_eq!(parse_dims("1920x1080x60"), None);
     }
 }

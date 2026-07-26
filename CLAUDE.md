@@ -198,10 +198,35 @@ surface regardless of its settings. On x86 the fix is simply **not** to set
 none); `CHITTI_RESOLUTION=WxH cargo xtask image` appends an explicit override for
 a headless VM. Only fall back to the largest mode when there is no EDID *and* the
 firmware's mode is below 1024x768 — a default nobody chose, which is the real
-"UEFI came up at 800x600" case the largest-mode heuristic was written for. Under
-VirtualBox the knob is the VM's own `VBoxInternal2/EfiGraphicsResolution`
-(`make vbox VBOX_RES=1920x1080` sets it), because that becomes the firmware mode
-the stub then keeps.
+"UEFI came up at 800x600" case the largest-mode heuristic was written for.
+
+**A hypervisor's resolution knob cannot be trusted, so there is a channel that
+does not need one.** `VBoxInternal2/EfiGraphicsResolution` is *stored* by
+VirtualBox-ARM and then ignored — the guest boots at the host panel's size
+whatever it says — which left no way to ask for a framebuffer that fits the VM
+window (VirtualBox draws the guest 1:1, so a 2560x1440 guest in a 1440-wide
+window has half of itself off-screen; that is a clipped console, not a driver
+bug). So the loader reads a preference off the ESP: `\chitti-display.cfg`,
+`resolution=<W>x<H>`, parsed by `edid::parse_boot_cfg` and applied with GOP
+`set_mode` **before the kernel starts**, outranking even the display's EDID-native
+mode because it is the one size a human typed on purpose. `CHITTI_RESOLUTION=WxH`
+now writes it at image-assembly time on aarch64 exactly as it appends
+`resolution:` to `limine.conf` on x86, and `make vbox VBOX_RES=` goes through it.
+Three rules it must keep: **empty means unset** (a wrapper passes the variable
+through unconditionally), the depth component of Limine's `WxHxBPP` is **dropped**
+(a GOP mode is chosen by dimensions, so writing it out would be ignored silently),
+and a request is a **ceiling** — `best_mode_for` never exceeds it, since the reason
+for asking is usually that something bigger does not fit. The stub logs the
+firmware's entire mode list and says so when the requested size was not on offer;
+without that, "the resolution I asked for did not happen" has two
+indistinguishable causes (never offered vs. `set_mode` failed), and on a machine
+that will not boot right that distinction is the whole diagnosis. Verified by
+booting `--uefi` under AAVMF, which offers only 640x480/800x600/1024x768: a pinned
+1024x768 reaches `framebuffer TUI up (1024x768)`, a pinned 1280x720 correctly
+lands on 800x600 (1024x768 is *taller* than 720) and says why, and an unset build
+writes no file and behaves exactly as before. `/display boot` still only *records*
+a preference — the kernel would have to write FAT to mirror it to the ESP — and
+says so rather than implying a reboot will apply it.
 
 **Resolution is a setting, and there are exactly two kinds of it** — `/display`
 (`kernel/src/display.rs`, pure + unit-tested; persisted to

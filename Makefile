@@ -28,11 +28,25 @@ REMOTE_RUN_URL ?= http://10.0.2.2:1234
 
 # VirtualBox (the `vbox` target): which VM to (re)load the aarch64 image into,
 # and where its boot disk is attached. Override e.g. `make vbox VBOX_VM=MyVM`.
-# Guest screen resolution for the EFI firmware to come up in. The stub keeps
-# whatever mode the firmware is in when the display reports no EDID (which is the
-# VirtualBox case), so THIS is what sets ChittiOS's resolution under VBox. Leave
-# empty to keep the VM's existing setting.
+# Guest screen resolution, e.g. `make vbox VBOX_RES=1920x1080`. Empty = leave the
+# guest at whatever the firmware chooses.
+#
+# This sets it two ways on purpose, because the obvious one does not work:
+# VirtualBox-ARM *stores* VBoxInternal2/EfiGraphicsResolution and then boots the
+# guest at its own resolution regardless. So the value is also written to
+# `\chitti-display.cfg` on the image's ESP, which the stub reads and applies with
+# GOP set_mode before the kernel starts — that path does not depend on the
+# hypervisor honouring anything. The stub logs the firmware's whole mode list, so
+# when a size cannot be had you can see what was on offer.
+#
+# NB this is the size of the guest *framebuffer*. VirtualBox draws it 1:1, so a
+# framebuffer larger than the VM window leaves part of it off-screen (which is what
+# a 2560x1440 guest looks like in a 1440-wide window). VBOX_SCALE is the other
+# lever: it scales the whole guest display to fit, changing nothing in the guest.
 VBOX_RES  ?=
+# VirtualBox window scale factor, e.g. `make vbox VBOX_SCALE=0.5` to fit an
+# oversized guest framebuffer into the window. Purely host-side.
+VBOX_SCALE ?=
 VBOX_VM   ?= Chitti
 VBOX_CTL  ?= nvme
 VBOX_PORT ?= 0
@@ -147,7 +161,7 @@ m1n1:
 ##       line continuation and re-run later lines in a fresh shell with VM empty.
 .PHONY: vbox
 vbox:
-	$(XTASK) image -arch aarch64 -model $(MODEL)
+	CHITTI_RESOLUTION='$(VBOX_RES)' $(XTASK) image -arch aarch64 -model $(MODEL)
 	@command -v VBoxManage >/dev/null || { echo "VBoxManage not found — install VirtualBox"; exit 1; }
 	@set -e; \
 	VM='$(VBOX_VM)'; CTL='$(VBOX_CTL)'; PORT='$(VBOX_PORT)'; \
@@ -161,11 +175,15 @@ vbox:
 	echo "vbox: ensuring USB keyboard + USB tablet + xHCI controlle + ACPI; RAM $(VBOX_MEM) MiB"; \
 	VBoxManage modifyvm "$$VM" --keyboard usb --acpi on --mouse usbtablet --usb-xhci on --memory $(VBOX_MEM); \
 	if [ -n '$(VBOX_RES)' ]; then \
-	  echo "vbox: EFI graphics resolution -> $(VBOX_RES)"; \
+	  echo "vbox: resolution -> $(VBOX_RES) (via the ESP display pref; EFI knob set too, but VBox-ARM ignores it)"; \
 	  VBoxManage setextradata "$$VM" VBoxInternal2/EfiGraphicsResolution '$(VBOX_RES)'; \
 	else \
 	  CUR=$$(VBoxManage getextradata "$$VM" VBoxInternal2/EfiGraphicsResolution 2>/dev/null | sed -n 's/^Value: //p'); \
-	  echo "vbox: EFI graphics resolution = $${CUR:-<firmware default>} (set with: make vbox VBOX_RES=1920x1080)"; \
+	  echo "vbox: resolution = firmware default (EFI knob = $${CUR:-unset}; set with: make vbox VBOX_RES=1920x1080)"; \
+	fi; \
+	if [ -n '$(VBOX_SCALE)' ]; then \
+	  echo "vbox: window scale factor -> $(VBOX_SCALE) (host-side; scales the guest display to fit the window)"; \
+	  VBoxManage setextradata "$$VM" GUI/ScaleFactor '$(VBOX_SCALE)'; \
 	fi; \
 	VBoxManage storageattach "$$VM" --storagectl "$$CTL" --port "$$PORT" --device 0 --medium none 2>/dev/null || true; \
 	if [ -n "$$UUID" ]; then VBoxManage closemedium disk "$$UUID" 2>/dev/null || true; fi; \

@@ -224,23 +224,45 @@ The boot log's `INPUT` line reports which keyboard/mouse/clock sources were foun
 — the ground truth when input or the clock misbehaves on a given platform.
 
 **Screen resolution.** The console follows the display, not a constant: the stub
-reads the monitor's **EDID** and uses its preferred (native) timing, and when
-there is no EDID — the usual case on a hypervisor — it keeps whatever mode the
-firmware is in. So on VirtualBox the resolution is the one *you* configure, and
-`make vbox` will set it for you:
+reads the monitor's **EDID** and uses its preferred (native) timing, and when there
+is no EDID — the usual case on a hypervisor — it keeps whatever mode the firmware is
+in. To override it on either arch, pin one at image-assembly time:
 
 ```sh
-make vbox VBOX_RES=1920x1080     # persists to the VM; plain `make vbox` prints the current value
-# equivalently:
-VBoxManage setextradata "Chitti" VBoxInternal2/EfiGraphicsResolution 1920x1080
+make vbox VBOX_RES=1920x1080                                  # aarch64 + VirtualBox
+CHITTI_RESOLUTION=1920x1080 cargo xtask image -arch x86_64    # x86 (appends to limine.conf)
+CHITTI_RESOLUTION=1920x1080 cargo xtask image -arch aarch64   # aarch64 (writes the ESP pref)
 ```
 
-The stub logs which path it took (`EDID native WxH`, `no EDID — keeping the
-firmware's WxH mode`, or `taking the largest mode`), and the kernel's boot banner
-prints the resolution it came up at — check that line first if the size is wrong.
-On x86, Limine does the same EDID query because `kernel/limine.conf` deliberately
-pins no `resolution:`; pass `CHITTI_RESOLUTION=1920x1080 cargo xtask image -arch
-x86_64` to force one.
+On aarch64 that writes `\chitti-display.cfg` (`resolution=<W>x<H>`) onto the image's
+ESP; the stub reads it and calls GOP `set_mode` before the kernel starts, ahead of
+even the EDID-native mode. **Do not rely on the hypervisor's own knob:**
+VirtualBox-ARM stores `VBoxInternal2/EfiGraphicsResolution` and boots the guest at a
+different size anyway, which is why this path exists.
+
+A request is a **ceiling**, never exceeded — ask for 1280x720 where the firmware
+offers only 640x480/800x600/1024x768 and you get 800x600, because 1024x768 is taller
+than 720. The stub logs the firmware's whole mode list and says when the size asked
+for was not on offer, so `resolution I asked for did not happen` tells you *which*
+of the two causes it was:
+
+```text
+chitti-stub: chitti-display.cfg asks for 1280x720
+chitti-stub: GOP current 800x600, 3 usable mode(s): [(640, 480), (800, 600), (1024, 768)]
+chitti-stub: 1280x720 is not offered; closest that fits is 800x600
+```
+
+The kernel's boot banner prints the resolution it came up at — check that line first
+if the size is wrong.
+
+**VirtualBox draws the guest 1:1, so an oversized framebuffer is clipped, not
+scaled.** A 2560x1440 guest in a 1440-wide window shows about half of itself and
+looks like a broken console. Either shrink the framebuffer (`VBOX_RES` above) or
+scale the window host-side, which changes nothing in the guest:
+
+```sh
+make vbox VBOX_SCALE=0.5         # or: VBoxManage setextradata "Chitti" GUI/ScaleFactor 0.5
+```
 
 **"Everything is tiny on my 2K/4K screen" — use the font scale, not a smaller
 resolution.** Cells are `8*scale` x `16*scale` px, so the scale is what actually

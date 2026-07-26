@@ -1095,6 +1095,25 @@ mod display_tests {
         assert!(!valid_resolution("abcxdef"));
         assert!(!valid_resolution(""));
     }
+
+    #[test]
+    fn boot_cfg_drops_the_bpp_the_stub_cannot_use() {
+        // A GOP mode is chosen by dimensions; Limine's depth component would be
+        // written out and silently ignored, so it is stripped here instead.
+        let c = boot_cfg_contents("1920x1080x32").expect("valid");
+        assert!(c.contains("resolution=1920x1080\n"), "{c}");
+        assert!(!c.contains("x32"), "{c}");
+        let c = boot_cfg_contents("1280x720").expect("valid");
+        assert!(c.contains("resolution=1280x720\n"), "{c}");
+        // Every non-comment line must be a key=value the stub's parser accepts.
+        for line in c.lines().filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty()) {
+            assert!(line.contains('='), "unparseable line {line:?}");
+        }
+        // Junk is a hard error at the call site, not a file with a bad value in it.
+        assert!(boot_cfg_contents("1920").is_none());
+        assert!(boot_cfg_contents("").is_none());
+        assert!(boot_cfg_contents("0x1080").is_none());
+    }
 }
 
 /// Guard against artifact mixups: assert `elf` is the identity-map `-kernel`
@@ -1203,11 +1222,15 @@ fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> 
     let f = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&img).map_err(|e| e.to_string())?;
     f.set_len(size_mb * 1024 * 1024).map_err(|e| e.to_string())?;
     drop(f);
+    let disp_cfg = boot_display_cfg()?;
     if cfg!(target_os = "linux") {
         let mut copies: Vec<(PathBuf, String)> = vec![
             (stub.to_path_buf(), "::/EFI/BOOT/BOOTAA64.EFI".into()),
             (kernel.to_path_buf(), "::/chitti-kernel".into()),
         ];
+        if let Some(c) = &disp_cfg {
+            copies.push((c.clone(), "::/chitti-display.cfg".into()));
+        }
         if let Some(m) = model {
             for (src, name) in esp_model_parts(m)? {
                 copies.push((src, format!("::/{name}")));
@@ -1261,6 +1284,7 @@ MNT=$(diskutil info "$DEV" | awk -F': *' '/Mount Point/{{print $2}}')
 mkdir -p "$MNT/EFI/BOOT"
 cp "{stub}" "$MNT/EFI/BOOT/BOOTAA64.EFI"
 cp "{kernel}" "$MNT/chitti-kernel"
+{disp_cp}
 {model_cp}
 {voice_cp}
 {wifi_cp}
@@ -1270,6 +1294,7 @@ hdiutil detach "$DEV" > /dev/null
         img = img.display(),
         stub = stub.display(),
         kernel = kernel.display(),
+        disp_cp = disp_cfg.as_ref().map(|c| format!("cp \"{}\" \"$MNT/chitti-display.cfg\"", c.display())).unwrap_or_default(),
         model_cp = model_cp,
         // Voice models at the ESP root, so the kernel's root-file readers find them.
         voice_cp = voice.iter().map(|(n, p)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), n)).collect::<Vec<_>>().join("\n"),
@@ -1834,6 +1859,51 @@ fn valid_resolution(s: &str) -> bool {
     })
 }
 
+/// Body of the loader's display-preference file (`\chitti-display.cfg` on the
+/// ESP) for a pinned `CHITTI_RESOLUTION`, or `None` if it names no usable size.
+///
+/// `CHITTI_RESOLUTION` carries Limine's optional `xBPP` third component, which the
+/// stub's parser rejects — a GOP mode is selected by dimensions alone — so the
+/// depth is dropped here rather than written out and silently ignored.
+fn boot_cfg_contents(res: &str) -> Option<String> {
+    if !valid_resolution(res) {
+        return None;
+    }
+    let mut parts = res.split('x');
+    let (w, h) = (parts.next()?, parts.next()?);
+    Some(format!(
+        "# ChittiOS loader display preference — written by `cargo xtask image`.\n\
+         # The UEFI stub sets this GOP mode before the kernel starts, so it wins over\n\
+         # both the display's EDID-native mode and any hypervisor resolution setting.\n\
+         resolution={w}x{h}\n"
+    ))
+}
+
+/// Write the display-preference file for the ESP, returning its path, or `None`
+/// when nothing is pinned.
+///
+/// This is the aarch64 half of `CHITTI_RESOLUTION` — the x86 half rewrites
+/// `limine.conf`. It exists because a hypervisor's own resolution knob cannot be
+/// relied on: VirtualBox-ARM stores `VBoxInternal2/EfiGraphicsResolution` and then
+/// boots its guest at a different size anyway, leaving no way to ask for a
+/// framebuffer that fits the window.
+fn boot_display_cfg() -> Result<Option<PathBuf>, String> {
+    let Ok(res) = env::var("CHITTI_RESOLUTION") else { return Ok(None) };
+    let res = res.trim();
+    // Empty means unset: `make vbox` passes `CHITTI_RESOLUTION='$(VBOX_RES)'`
+    // unconditionally, and VBOX_RES is empty unless the human named a size.
+    if res.is_empty() {
+        return Ok(None);
+    }
+    let Some(body) = boot_cfg_contents(res) else {
+        return Err(format!("CHITTI_RESOLUTION='{res}' is not <width>x<height>[x<bpp>] (e.g. 1920x1080)"));
+    };
+    let path = repo_root().join("target/chitti-display.cfg");
+    fs::write(&path, body).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    eprintln!("  ESP display pref: resolution={res} (stub sets this GOP mode; unset CHITTI_RESOLUTION for EDID-native)");
+    Ok(Some(path))
+}
+
 fn limine_share_dir() -> Result<PathBuf, String> {
     if let Ok(dir) = env::var("CHITTI_LIMINE_SHARE") {
         return Ok(PathBuf::from(dir));
@@ -1988,8 +2058,9 @@ fn assemble_image_opt(kernel_bin: &Path, model_rel: Option<&str>) -> Result<Path
     // display's EDID-preferred (native) mode — the same discovery the aarch64 stub
     // does. `CHITTI_RESOLUTION=WxH[xBPP]` appends an explicit override for the
     // cases EDID can't answer: a headless VM, or matching a fixed window size.
-    if let Ok(res) = std::env::var("CHITTI_RESOLUTION") {
-        let res = res.trim();
+    // Empty is unset, so a wrapper can pass the variable through unconditionally.
+    if let Some(res) = std::env::var("CHITTI_RESOLUTION").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        let res = res.as_str();
         if !valid_resolution(res) {
             return Err(format!(
                 "CHITTI_RESOLUTION='{res}' is not <width>x<height>[x<bpp>] (e.g. 1920x1080)"
@@ -2170,6 +2241,9 @@ fn image_aarch64(model: Model, no_model: bool) -> Result<(), String> {
             (stub.clone(), "::/EFI/BOOT/BOOTAA64.EFI".into()),
             (elf.clone(), "::/chitti-kernel".into()),
         ];
+        if let Some(c) = boot_display_cfg()? {
+            copies.push((c, "::/chitti-display.cfg".into()));
+        }
         if let Some(m) = &model_path {
             for (src, name) in esp_model_parts(m)? {
                 copies.push((src, format!("::/{name}")));
@@ -2232,6 +2306,7 @@ MNT=$(diskutil info "${{DEV}}s1" | awk -F': *' '/Mount Point/{{print $2}}')
 mkdir -p "$MNT/EFI/BOOT"
 cp "{stub}" "$MNT/EFI/BOOT/BOOTAA64.EFI"
 cp "{kernel}" "$MNT/chitti-kernel"
+{disp_cp}
 {model_cp}
 {voice_cp}
 {wifi_cp}
@@ -2243,6 +2318,7 @@ hdiutil detach "$DEV" > /dev/null
         stub = stub.display(),
         kernel = elf.display(),
         mke2fs = mke2fs.display(),
+        disp_cp = boot_display_cfg()?.map(|c| format!("cp \"{}\" \"$MNT/chitti-display.cfg\"", c.display())).unwrap_or_default(),
         model_cp = model_cp,
         voice_cp = voice.iter().map(|(n, p)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), n)).collect::<Vec<_>>().join("\n"),
         wifi_cp = wifi_cp,

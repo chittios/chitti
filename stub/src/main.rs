@@ -372,6 +372,23 @@ fn main() -> Status {
     let kernel = fs.read(cstr16!("\\chitti-kernel")).expect("read \\chitti-kernel");
     log::info!("chitti-stub: kernel {} bytes", kernel.len());
 
+    // The human's mode preference, if they left one on the ESP. This is the only
+    // channel that exists this early: the rest of the display settings live on the
+    // ext4 data partition, which nothing here can read, and the framebuffer's
+    // dimensions are fixed the moment GOP hands it over. Absent file → None, and
+    // the firmware's own configuration decides as before.
+    //
+    // It has to be honoured even where a hypervisor's resolution knob exists,
+    // because some of them are ignored: VirtualBox-ARM accepts
+    // `VBoxInternal2/EfiGraphicsResolution` and boots at its own resolution anyway.
+    let boot_res: Option<(u32, u32)> = fs
+        .read(cstr16!("\\chitti-display.cfg"))
+        .ok()
+        .and_then(|b| core::str::from_utf8(&b).ok().and_then(edid::parse_boot_cfg));
+    if let Some((w, h)) = boot_res {
+        log::info!("chitti-stub: {} asks for {w}x{h}", edid::BOOT_CFG_PATH);
+    }
+
     // Parse the ELF64 header; find the PT_LOAD span, allocate it once (segments
     // can share page boundaries, so per-segment AllocateAddress conflicts), then
     // copy each segment to its physical address.
@@ -520,9 +537,29 @@ fn main() -> Status {
                 (i, w as u32, hh as u32)
             })
             .collect();
-        let pick = match native {
+        // Log the candidate list. Without it, "the resolution I asked for did not
+        // happen" has two indistinguishable causes — the mode was not offered, or it
+        // was offered and `set_mode` failed — and on a machine that will not boot
+        // right, that distinction is the whole diagnosis.
+        log::info!(
+            "chitti-stub: GOP current {}x{}, {} usable mode(s): {:?}",
+            cur.0,
+            cur.1,
+            dims.len(),
+            dims.iter().map(|&(_, w, h)| (w, h)).collect::<alloc::vec::Vec<_>>()
+        );
+        let pick = match boot_res.or(native) {
+            // A resolution asked for on the ESP outranks the display's own native
+            // mode: it is the one preference here a human typed on purpose, and it
+            // exists precisely for the cases where the automatic answer was wrong
+            // (a hypervisor that ignores its resolution setting, a panel whose EDID
+            // native mode is larger than the window showing it).
             Some((nw, nh)) => {
-                log::info!("chitti-stub: EDID native {nw}x{nh}");
+                if boot_res.is_some() {
+                    log::info!("chitti-stub: requested {nw}x{nh}");
+                } else {
+                    log::info!("chitti-stub: EDID native {nw}x{nh}");
+                }
                 edid::best_mode_for((nw, nh), dims.iter().copied())
             }
             None if edid::is_implausibly_small(cur.0 as u32, cur.1 as u32) => {
@@ -544,6 +581,18 @@ fn main() -> Status {
         if let Some(i) = pick {
             let m = &modes[i];
             let (mw, mh) = m.info().resolution();
+            // Say so when the request could not be met exactly. `best_mode_for` never
+            // exceeds what was asked for — a request usually means "no bigger than
+            // this", e.g. it has to fit a window — so the answer can be a good deal
+            // smaller, and silently landing there looks like the file was ignored.
+            if let Some((rw, rh)) = boot_res {
+                if (mw as u32, mh as u32) != (rw, rh) {
+                    log::info!(
+                        "chitti-stub: {rw}x{rh} is not offered; closest that fits is {mw}x{mh} \
+                         (the firmware's mode list is above)"
+                    );
+                }
+            }
             if (mw, mh) == cur {
                 log::info!("chitti-stub: GOP already at {mw}x{mh}");
             } else if let Err(e) = gop.set_mode(m) {
