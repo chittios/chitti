@@ -462,6 +462,79 @@ def s_battery(g):
     return True, f"reported absence: {lines[-1][:70]}"
 
 
+def s_suspend_resume(_g):
+    """Suspend the machine to RAM and wake it, then prove the shell survived.
+
+    ACPI S3 is x86 (the aarch64 analogue is PSCI `SYSTEM_SUSPEND`, which QEMU's
+    `virt` machine does not implement), so this skips on any other arch. QEMU does
+    implement S3: the guest's `SLP_EN` write parks the VM and the monitor's
+    `system_wakeup` makes firmware jump to the FACS waking vector — which is the
+    real-mode resume trampoline. So the whole round trip actually happens here,
+    including the 16-bit -> long-mode walk that no unit test can cover.
+
+    Boots its own guest: a suspend that fails to resume leaves the VM unusable, and
+    that must not take the shared guest down with it.
+
+    Every step waits on output rather than sleeping. A blind schedule cannot work —
+    under TCG the guest spends minutes of wall clock loading fallback fonts, reading
+    no input at all, so a timed keystroke lands in a void.
+    """
+    if RUN_ARCH != "x86_64":
+        return None, f"skipped (ACPI S3 is x86; arch={RUN_ARCH})"
+    g = boot_guest("x86_64", "qwen3.5-0.8b", RUN_VERBOSE, "off", None, no_model=True,
+                   attempts=1, ready_timeout=600)
+    if g is None:
+        return None, "skipped (x86_64 guest would not boot)"
+    try:
+        # The plan first: it enumerates every precondition, and on a machine that
+        # cannot suspend the right outcome is to say so rather than to try.
+        m = g.mark()
+        for attempt in (1, 2):
+            g.send("/suspend plan")
+            if g.wait_for("suspend>", 60, m):
+                break
+            if attempt == 2:
+                return False, "/suspend plan printed nothing"
+        plan = g.text()[m:]
+        if "NOT ready" in plan or "cannot suspend" in plan:
+            reason = next((l.strip() for l in plan.splitlines() if "MISSING" in l), "no MISSING line")
+            return None, f"skipped (guest reports it cannot suspend: {reason})"
+        # The trampoline page has to have been reserved at boot; without it the
+        # transition refuses, and the plan is what says so.
+        if "trampoline page reserved" not in plan:
+            return False, "no trampoline page was reserved at boot"
+
+        m = g.mark()
+        g.send("/suspend now --yes")
+        if not g.wait_for("entering S3", 90, m):
+            return False, "guest never reported entering S3"
+
+        # Give firmware a moment to actually park the VM, then press the button that
+        # only the monitor can press. `-serial mon:stdio` means Ctrl+A c switches
+        # stdio between the guest serial and the monitor.
+        time.sleep(4)
+        wm = g.mark()
+        g.send_raw(b"\x01c")
+        time.sleep(0.8)
+        g.send_raw(b"system_wakeup\n")
+        time.sleep(1.0)
+        g.send_raw(b"\x01c")
+        if not g.wait_for("resumed from S3", 120, wm):
+            return False, "no resume observed after system_wakeup"
+
+        # Resuming is only half of it: the machine has to still work. `/info` needs
+        # the heap, the scheduler and the console, all of which the resume path had to
+        # put back.
+        m = g.mark()
+        for attempt in (1, 2):
+            g.send("/info")
+            if g.wait_for("RAM installed", 60, m):
+                return True, "suspended to RAM, woke, shell alive"
+        return False, "resumed but the shell did not answer afterwards"
+    finally:
+        g.close()
+
+
 def s_power_button(_g):
     """Press the machine's power button for real and assert a clean shutdown.
 
@@ -1658,6 +1731,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("install_plan", s_install_plan),
     ("battery", s_battery),
     ("power_button", s_power_button),
+    ("suspend_resume", s_suspend_resume),
     ("skills_bundled", s_skills_bundled),
     ("plan_mode_and_permissions", s_plan_mode_and_permissions),
     ("todos_pane", s_todos_pane),
@@ -1797,7 +1871,12 @@ def main():
     # guest model-less: it uses the small desktop heap and fits a CI runner
     # instead of OOMing while mapping the model-sized heap. The slow group
     # keeps the model loaded for the inference/chat scenarios.
-    g = boot_guest(arch, model, verbose, audio, fwd, no_model=not slow)
+    # An x86 guest has no hardware acceleration on an Apple-Silicon host — QEMU falls
+    # back to TCG, where the same boot takes several minutes rather than seconds. The
+    # 120 s default is an aarch64/HVF figure, and leaving it in place meant
+    # `-arch x86_64` could never finish its first boot anywhere but a KVM machine.
+    ready = 120 if arch == "aarch64" else 600
+    g = boot_guest(arch, model, verbose, audio, fwd, no_model=not slow, ready_timeout=ready)
     if g is None:
         print("e2e: FAILED — guest never booted (networking not configured after retries)")
         return 1
