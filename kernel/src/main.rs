@@ -76,6 +76,9 @@ pub extern "C" fn _start() -> ! {
     // Bring up USB HID keyboard + pointer (xHCI) if present, so a real USB
     // keyboard/tablet drives the shell alongside PS/2. No-op without xHCI.
     let _usb = chitti_kernel::arch::x86_64::xhci::init_global();
+    // A display driver, if this machine has one we can drive. PCI is already up on
+    // x86 by this point; finding nothing keeps Limine's framebuffer.
+    chitti_kernel::kms::probe();
     // INPUT summary (parity with aarch64): PS/2 (i8042) is always present on a
     // PC; USB is READY only if a HID device enumerated on the xHCI.
     serial_println!(
@@ -234,6 +237,13 @@ pub extern "C" fn aarch64_start() -> ! {
     // pci transport is available before probing disks. No-op on the `-kernel`
     // path (no boot-info RSDP) — there the virtio-mmio fallback is used.
     aarch64_pcie_init();
+    aarch64_display_edid_init();
+    // Bind a display driver if this machine has one. Must follow PCIe discovery.
+    // Deliberately **bind only** — the console hand-off happens after the platform
+    // framebuffer init below, because on aarch64 that init runs *after* this point:
+    // taking the console over here meant KMS brought it up at one size and the
+    // firmware/ramfb path then replaced it, leaving the driver's scanout orphaned.
+    chitti_kernel::kms::probe_bind_only();
 
     // Preferred: the UEFI GOP framebuffer (with its real pixel format) from the
     // stub's boot-info page — works on real hardware / VirtualBox / UTM at the
@@ -292,6 +302,9 @@ pub extern "C" fn aarch64_start() -> ! {
             .unwrap_or_else(|| chitti_kernel::arch::aarch64::mmu::ram_end().saturating_sub(0x4000_0000));
         chitti_kernel::mm::set_ram_total(ram);
     }
+    // Now that the platform framebuffer (if any) is up, let a bound display driver
+    // take the console only if nothing else provided one.
+    chitti_kernel::kms::adopt_console_if_needed();
     if let Some((w, h)) = fb {
         serial_println!("Chitti: framebuffer TUI up ({}x{}) -- console mirrored to the window", w, h);
         // Bring up USB HID keyboard + mouse (xHCI). On Apple Silicon the
@@ -420,6 +433,30 @@ fn aarch64_pcie_init() {
 
 #[cfg(all(target_arch = "aarch64", feature = "boot-limine"))]
 fn aarch64_pcie_init() {}
+
+/// Adopt the active display's EDID from the stub's boot-info page (length at
+/// offset 384, the 128-byte base block at 388).
+///
+/// This is what lets the OS know *which* screen it is on — its identity keys the
+/// per-display settings, and its name is what `/display` reports. The firmware's
+/// EDID buffer is gone by the time the kernel runs, so the loader has to hand the
+/// bytes over; nothing here is fatal if it didn't (a hypervisor usually has no
+/// EDID at all, and the settings then key off the framebuffer size instead).
+#[cfg(all(target_arch = "aarch64", not(feature = "boot-limine")))]
+fn aarch64_display_edid_init() {
+    let Some(bi) = bootinfo_page() else { return };
+    // SAFETY: identity-mapped RAM below the map limit; the boot-info page is one
+    // 4 KiB page, so 388 + 128 is well inside it.
+    let page = unsafe { core::slice::from_raw_parts(bi as *const u8, 4096) };
+    let len = u32::from_le_bytes(page[384..388].try_into().unwrap()) as usize;
+    if len == 0 || len > chitti_kernel::edid::BASE_BLOCK_LEN {
+        return;
+    }
+    chitti_kernel::display::set_edid(&page[388..388 + len]);
+}
+
+#[cfg(not(all(target_arch = "aarch64", not(feature = "boot-limine"))))]
+fn aarch64_display_edid_init() {}
 
 /// Read the UEFI stub's boot-info page (magic "CHITTIBI"): the GOP framebuffer
 /// `(addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift)` captured

@@ -171,6 +171,161 @@ specific emulator/hypervisor. Discover hardware the way real firmware does
 mode tables) and degrade gracefully when a facility is absent. A feature that only
 works under QEMU is not done.
 
+**The display mode comes from the display, via EDID — never a constant, never
+"the biggest mode advertised".** The kernel itself holds **no resolution at all**:
+`width`/`height`/`pitch`/pixel-format arrive from the firmware (Limine's
+`Framebuffer` on x86, the stub's boot-info page on aarch64, m1n1's prepared
+framebuffer on Apple Silicon) and the font scale is derived from the height
+(`pick_scale`), so every layout is a ratio of whatever the panel turned out to be.
+That means the *only* place a resolution is decided is the loader, and on real
+hardware the chain is **monitor EDID → loader picks the mode → kernel adopts the
+framebuffer geometry**.
+
+`kernel/src/edid.rs` parses the EDID base block
+(header + checksum validated, then the first detailed timing descriptor) into the
+panel's native resolution; the aarch64 `stub/` mounts that same file with
+`#[path]` so the two can't disagree, and its pure bit-packing is unit-tested
+(`cargo xtask test`) rather than only on hardware. The selection order is
+**EDID-preferred → keep the firmware's current mode → largest advertised mode**,
+and the middle step is the load-bearing one: with no EDID, the mode the firmware
+is already in *is* the resolution the platform was configured for (VirtualBox's
+`VBoxInternal2/EfiGraphicsResolution`, UTM's display setting), so overriding it
+throws away the user's choice. Both arches had this wrong in different ways —
+`kernel/limine.conf` pinned `resolution: 2560x1440`, and the stub always jumped
+to the largest GOP mode — which is why a VirtualBox guest came up at a fixed QHD
+surface regardless of its settings. On x86 the fix is simply **not** to set
+`resolution:` (Limine then queries EDID itself, falling back to 1024x768 with
+none); `CHITTI_RESOLUTION=WxH cargo xtask image` appends an explicit override for
+a headless VM. Only fall back to the largest mode when there is no EDID *and* the
+firmware's mode is below 1024x768 — a default nobody chose, which is the real
+"UEFI came up at 800x600" case the largest-mode heuristic was written for. Under
+VirtualBox the knob is the VM's own `VBoxInternal2/EfiGraphicsResolution`
+(`make vbox VBOX_RES=1920x1080` sets it), because that becomes the firmware mode
+the stub then keeps.
+
+**Resolution is a setting, and there are exactly two kinds of it** — `/display`
+(`kernel/src/display.rs`, pure + unit-tested; persisted to
+`/configs/core/display.json`; also exposed to the **settings agent** as the
+`display` shell tool, which may apply it directly since it is reversible):
+
+- **The logical desktop** (`/display set <WxH>|native`) — applies *instantly* on
+  both arches. `width`/`height` on `Screen` are the **logical** desktop and
+  `origin_x`/`origin_y` place it inside the physical framebuffer, so a smaller
+  resolution is a centred, letterboxed viewport that still renders **1:1** —
+  glyphs are rasterised at physical pixels, nothing is scaled, text stays sharp.
+  The entire translation is one function, `Screen::fb_offset`, which every
+  framebuffer write goes through (there are only four such sites — `put_pixel`,
+  the row blit, the cursor read-back, and the pane scroll's row copy; keep it that
+  way). At native both origins are 0 and it is the identity, so the default path
+  is byte-identical to before. Note `rebuilt`/`relayout` must feed `build` the
+  **`fb_w`/`fb_h`** physical size, never `width`/`height`, or the viewport shrinks
+  on every rebuild; and `pick_scale` takes the *logical* height so a smaller
+  desktop gets proportionally sized text.
+- **The font scale** (`/display scale <1-4>|auto`) — cells are `8*scale` x
+  `16*scale` px, so **this** is what answers "everything is too small on a
+  high-resolution screen"; a smaller desktop only letterboxes. The automatic value
+  is `display::auto_font_scale(height)`, thresholds not a division: the old
+  `(h + 550) / 1100` needed **1650** px to reach scale 2, so a 2560x1440 panel
+  rendered at scale 1 — 8x16 px cells, 320 columns — which is what actually made a
+  2K display look broken, independently of which mode the loader picked.
+- **The panel's own mode** (`/display boot <WxH>|auto`) — only the loader can set
+  this, so it costs a reboot. **This is recorded but NOT yet applied**: the
+  preference lives on the ext4 store and the loader can only read the ESP, so
+  mirroring it there (a FAT write via `block::esp`, then the stub reading it and
+  the x86 `limine.conf` `resolution:` line being rewritten) is the missing bridge.
+  Until then `/display boot` says so explicitly and points at the platform knobs
+  that do work (`VBOX_RES`, `CHITTI_RESOLUTION`) — do not let it claim otherwise.
+
+**Display settings are stored per monitor, the way `monitors.xml` does it.** The
+stub copies the chosen output's **EDID base block** into the boot-info page
+(length at 384, block at 388) — the firmware's buffer is gone by the time the
+kernel runs, so it is handed over or lost, the same handoff Linux's EFI stub makes.
+`edid::identity` unpacks the display's own vendor/product/serial (the manufacturer
+code is three **five-bit** letters packed big-endian in bytes 8..10 — reading it as
+a `u16` gives nonsense) and `edid::monitor_name` reads the `0xFC` descriptor, so
+`/display` can name the output it is talking about. `display::profile_key` keys the
+settings on that identity, falling back to `fb-<W>x<H>` where no EDID is published
+(hypervisors, and the x86/Limine path, which passes none) so two
+*differently-sized* monitors still get separate profiles. `display.json` is
+therefore a `displays: { key: {logical, font_scale} }` map plus a global
+`boot_mode`; the older flat shape is adopted for the display in use and migrated on
+the next save rather than discarded. A save rewrites **only** the current
+display's entry.
+
+**KMS — real kernel mode setting** (`kernel/src/kms/`) follows Linux's DRM split:
+`kms/mod.rs` is the device-independent core (`Mode`/`Connector`/`Scanout`, the
+`DisplayDriver` trait, mode-set orchestration, damage accumulation, polled
+hot-plug), and each device is a backend. **virtio-gpu is implemented and verified**
+(`kms/virtio_gpu.rs`): `GET_DISPLAY_INFO` → `RESOURCE_CREATE_2D` →
+`RESOURCE_ATTACH_BACKING` (the device scans out of **our** DMA pages, so the
+compositor draws with no copy) → `SET_SCANOUT`, then
+`TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH` to present. Confirmed by screendumping the
+virtio-gpu device itself: a `1280x800` console really becomes `1280x720`, full
+panel, scrollback intact.
+
+Four things that path teaches:
+
+- **virtio-gpu does not scan out of guest memory continuously.** Drawing alone
+  changes nothing on screen — it must be transferred and flushed. Damage is unioned
+  by `kms::damage` from the *coarse* painters (`fill_rect`, `blit_rgb32_row`,
+  `draw_str`, `redraw`) and flushed once per `upkeep`; `put_pixel` deliberately does
+  **not** report, because a redraw is millions of calls and a per-pixel union costs
+  more than the flush it feeds. A flush per glyph is a queue round trip per glyph.
+- **Damage is in physical coordinates**, so the logical-viewport origin has to be
+  added — a scanout is the whole framebuffer, not the desktop.
+- **A KMS-only machine has no framebuffer to re-init.** `reinit_scanout` therefore
+  *initialises* the console when none exists; without that, booting with only a
+  virtio-gpu gives a blank screen (found by doing exactly that).
+- **On aarch64 `-kernel` there is no PCI** (ECAM comes from the stub's ACPI), so
+  virtio-gpu binds on the **UEFI** path and on x86, not on the plain `-kernel` dev
+  loop. Matched by **vendor+device id**, never display class: `virtio-gpu-pci`
+  reports class `03:00` like every other VGA device.
+
+**VMSVGA (`kms/vmsvga.rs`) is written, detected, and deliberately NOT bound.** The
+mode registers are the easy part; SVGA II ignores them until the **FIFO** is set up
+and `SVGA_REG_CONFIG_DONE` is written, so until then the device stays in its VGA
+mode. A mode set then *appears* to succeed — the registers read back what was
+written — while the scanout keeps its old geometry, and the compositor draws at a
+pitch the device is not using. Against `qemu-system-x86_64 -device vmware-svga` that
+rendered the console **four times side by side**; the first guess (a stale
+`BYTES_PER_LINE`, fixed by disabling across the change and validating
+`pitch >= w*4`) did not help, because the cause is upstream of the pitch. So probe
+reports the device and declines: a scrambled screen is worse than no driver, and the
+firmware framebuffer still works. To finish: map BAR2, program
+`FIFO_MIN/MAX/NEXT_CMD/STOP`, write `CONFIG_DONE`, retest against that QEMU device.
+Note `Regs` already abstracts BAR0 as I/O ports (x86) *or* MMIO, decided from the
+BAR's type bit — VirtualBox-ARM must use the latter, and that path is unexercised.
+
+Without a bound backend the whole module is inert and the compositor keeps the
+loader's framebuffer — the position Linux is in with `efifb`/`simpledrm`
+(`nomodeset`): mode fixed by firmware, `/display set` letterboxes instead, console
+legibility via font size. Still absent: a working **VMSVGA** backend (what
+VirtualBox needs — see below), and real-hardware drivers (i915/AMD/AGX).
+
+**A machine can have more than one display, so the stub enumerates every graphics
+output** (`locate_handle_buffer`, not `get_handle_for_protocol`) and picks one via
+`edid::pick_output`: the output carrying the firmware's **console-out marker**
+(`EFI_CONSOLE_OUT_DEVICE_GUID`) first — that is where the firmware drew its own
+boot messages, hence the display the user is watching — then any output with a
+readable EDID (proof something is plugged in), then output 0 so a headless box
+still gets a console. Taking handle 0 unconditionally, as this did, was a coin flip
+between a laptop's built-in panel and its attached monitor: it would read one
+display's EDID and set the mode on the other. Each output's `console_out`/`edid` is
+logged, so "wrong screen" is diagnosable from the boot log alone.
+
+The **QEMU ramfb** window is a separate path with the same "match the display, not
+a constant" rule, and it was wrong in its own way: it scanned `system_profiler`
+for the *first* `Resolution:` line and used the **physical** pixel count. On a
+multi-monitor Mac that silently picked whichever display was listed first, and on
+a HiDPI panel it handed the guest a framebuffer bigger than the desktop showing it
+(a 2560x1600 panel whose desktop is 1440x900). `xtask::parse_displays` now parses
+the per-display blocks (pure, `cargo test -p xtask`) and takes the **main**
+display's *desktop* size — macOS's `UI Looks like` when present, else the physical
+size halved for a Retina panel, since Apple's default scaled modes are an
+unpublished per-panel table and the pixel count is never the right answer.
+`CHITTI_FB_DISPLAY=<name substring>` picks another monitor; `CHITTI_FB_RES=WxH`
+pins it. Every detected display is logged with `*` on the main one.
+
 Concretely: display comes from the firmware (Limine GOP on x86, UEFI GOP via the
 `stub/` bootloader on aarch64, QEMU ramfb as a fallback); disks via virtio /
 NVMe / AHCI over discovered PCIe; input via USB xHCI/HID (keyboard **and** mouse,
@@ -492,15 +647,56 @@ FDT claims a GICv3 but carries no readable `reg`.
 - **Microkernel** — tasks + context switch, cooperative + timer-preemptive
   scheduler, unforgeable capabilities, IPC, SMP, frame allocator + heap, MMU.
 - **UI** — a tmux-style split-pane framebuffer compositor in Geist Mono. The
-  chat|action split is **resizable** (drag the divider with the mouse, or
-  `/pane split <10-90>`; persisted to `/configs/core/panes.json` and reloaded at
-  boot) and either pane can go **fullscreen** (Ctrl+F, or `/pane full` —
-  `LayoutCfg.fullscreen`). (`panes.json` also carries `num_action_panes` 1–6;
-  the N-pane split + inter-pane tab drag-drop is a scoped follow-up — today one
-  action pane.) The compositor pairs the chat
-  pane + an on-demand **tabbed "action" pane**: opening the ktrace stream, the
+  shell (chat) pane is fixed in the primary band; the other band is a
+  **resizable grid of 1–8 action panes** (`/pane grid <cols> <rows>`, or
+  `/pane max <2-9>` for a balanced shape — `panes_layout::grid_for_count`).
+  **Every divider drags**: the shell|band split (`/pane split <10-90>`) and each
+  grid column/row gap, and a grid drag is **per-gap** — it re-splits only the two
+  tracks it separates, so panes you weren't touching keep their exact pixel
+  sizes. Either band can go **fullscreen** (Ctrl+F, or `/pane full` —
+  `LayoutCfg.fullscreen`, which maximises the **focused** action pane, not pane
+  0). Shape, `chat_pct`, and the permille track weights persist to
+  `/configs/core/panes.json` and reload at boot (legacy `num_action_panes` is
+  still read as an action-pane count). The geometry is **pure and unit-tested**
+  in [`kernel/src/panes_layout.rs`](kernel/src/panes_layout.rs) in two steps —
+  `split_band` (chat | band, one gap) then `layout_grid` (`cols × rows` cells
+  from track weights) — with `band_divider_pct` / `resize_tracks` as their exact
+  inverses, asserted by round-trip tests; weights are permille so a saved layout
+  restores byte-identically and `GridSpec::sanitized` repairs a hand-edited file
+  rather than producing a zero-size pane (`MIN_TRACK_PX` bounds every drag).
+  Panes are addressed **row-major** (`index = row * cols + col`).
+  **Tabs move between action panes by drag-and-drop** — press a tab label, drag
+  past a ~4 px threshold (the target pane highlights), drop on a tab bar to
+  insert there or on a body to append; a drop on the shell pane or outside the
+  band **cancels**, so the shell can never acquire an action tab. The
+  insert-index math is `panes_layout::insert_index` (the same-pane removal shift
+  must be applied **before** the clamp, or a drop-at-the-end lands
+  second-to-last — a test pins every from/to slot pair).
+  With `max_panes == 2` the band still collapses when its last tab closes, so
+  the default boot UI is byte-identical to the classic two-pane look; with
+  `max_panes > 2` empty panes stay visible as drop targets.
+  Note three traps this cost: **a pane's frame carries its selection state**, so
+  focusing one must repaint the pane *losing* focus too, and
+  `focus_action_column` must repaint **itself** — it has already moved focus to
+  the action side, so a following `focus_set(true)` sees no flip and draws
+  nothing (which made clicking a pane change the selection invisibly).
+  **Opening a view must never move keyboard focus** to the action pane
+  (`open_view_slot`): the user typed that command at the composer and is still
+  typing there, which is exactly why `action_focused` leaves focus on the chat for
+  every mode but the editor — setting `focus_action` on open sent the *next*
+  command to the pane instead of the prompt, indistinguishable from the shell
+  freezing. Focus moves only on an explicit act (click, `/pane focus`, Ctrl+Tab).
+  And the
+  per-view painters (`/top`, the audio/video/browser HUDs, the editor,
+  `surface_dims_px`) resolve their target pane by **which pane holds their
+  tab** (`Screen::mode_dims`), never the focused one — otherwise a `/top` on
+  pane 3 paints into pane 1's rectangle as soon as you click elsewhere.
+  The compositor pairs the chat
+  pane + on-demand **tabbed "action" panes**: opening the ktrace stream, the
   `/top` dashboard, a vim-like editor, an **image viewer** (`/open .png|.jpg`),
-  or the **audio player** (`/open .wav|.mp3`) each adds a tab; a tab bar in the
+  or the **audio player** (`/open .wav|.mp3`) each adds a tab **on the focused
+  action pane** (already-open views focus their existing pane + tab instead of
+  reopening); a tab bar in each
   pane header switches them (Ctrl+Tab / Shift+Tab / click), and every tab keeps
   its process alive when you switch away — the audio player keeps playing
   (pumped chunk-by-chunk from `ui_tick`, not a blocking loop), ktrace keeps

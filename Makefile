@@ -28,6 +28,11 @@ REMOTE_RUN_URL ?= http://10.0.2.2:1234
 
 # VirtualBox (the `vbox` target): which VM to (re)load the aarch64 image into,
 # and where its boot disk is attached. Override e.g. `make vbox VBOX_VM=MyVM`.
+# Guest screen resolution for the EFI firmware to come up in. The stub keeps
+# whatever mode the firmware is in when the display reports no EDID (which is the
+# VirtualBox case), so THIS is what sets ChittiOS's resolution under VBox. Leave
+# empty to keep the VM's existing setting.
+VBOX_RES  ?=
 VBOX_VM   ?= Chitti
 VBOX_CTL  ?= nvme
 VBOX_PORT ?= 0
@@ -155,6 +160,13 @@ vbox:
 	VBoxManage controlvm "$$VM" poweroff 2>/dev/null || true; sleep 1; \
 	echo "vbox: ensuring USB keyboard + USB tablet + xHCI controlle + ACPI; RAM $(VBOX_MEM) MiB"; \
 	VBoxManage modifyvm "$$VM" --keyboard usb --acpi on --mouse usbtablet --usb-xhci on --memory $(VBOX_MEM); \
+	if [ -n '$(VBOX_RES)' ]; then \
+	  echo "vbox: EFI graphics resolution -> $(VBOX_RES)"; \
+	  VBoxManage setextradata "$$VM" VBoxInternal2/EfiGraphicsResolution '$(VBOX_RES)'; \
+	else \
+	  CUR=$$(VBoxManage getextradata "$$VM" VBoxInternal2/EfiGraphicsResolution 2>/dev/null | sed -n 's/^Value: //p'); \
+	  echo "vbox: EFI graphics resolution = $${CUR:-<firmware default>} (set with: make vbox VBOX_RES=1920x1080)"; \
+	fi; \
 	VBoxManage storageattach "$$VM" --storagectl "$$CTL" --port "$$PORT" --device 0 --medium none 2>/dev/null || true; \
 	if [ -n "$$UUID" ]; then VBoxManage closemedium disk "$$UUID" 2>/dev/null || true; fi; \
 	VBoxManage closemedium disk "$$VDI" 2>/dev/null || true; rm -f "$$VDI"; \

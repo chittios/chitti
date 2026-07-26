@@ -58,6 +58,15 @@ pub mod drivers;
 pub mod net;
 pub mod onnx;
 pub mod persona;
+/// Display settings: the logical desktop viewport + next-boot mode preference.
+pub mod display;
+/// EDID parsing: a display's own native resolution (unit-tested; also mounted by
+/// the UEFI stub, so it must stay free of `crate::` imports).
+pub mod edid;
+/// KMS: the device-independent half of a real display driver (DRM-style split).
+pub mod kms;
+/// Pure multi-pane geometry + tab-move helpers (unit-tested).
+pub mod panes_layout;
 #[cfg(target_arch = "x86_64")]
 pub mod qemu;
 pub mod sched;

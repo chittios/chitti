@@ -49,6 +49,13 @@ impl Json {
             _ => None,
         }
     }
+    /// An object's `(key, value)` pairs, in document order.
+    pub fn as_object(&self) -> Option<&[(String, Json)]> {
+        match self {
+            Json::Obj(pairs) => Some(pairs),
+            _ => None,
+        }
+    }
     pub fn as_array(&self) -> Option<&[Json]> {
         match self {
             Json::Arr(a) => Some(a),

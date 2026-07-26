@@ -223,6 +223,118 @@ VBoxManage convertfromraw target/chitti-aa64.img chitti.vdi --format VDI
 The boot log's `INPUT` line reports which keyboard/mouse/clock sources were found
 — the ground truth when input or the clock misbehaves on a given platform.
 
+**Screen resolution.** The console follows the display, not a constant: the stub
+reads the monitor's **EDID** and uses its preferred (native) timing, and when
+there is no EDID — the usual case on a hypervisor — it keeps whatever mode the
+firmware is in. So on VirtualBox the resolution is the one *you* configure, and
+`make vbox` will set it for you:
+
+```sh
+make vbox VBOX_RES=1920x1080     # persists to the VM; plain `make vbox` prints the current value
+# equivalently:
+VBoxManage setextradata "Chitti" VBoxInternal2/EfiGraphicsResolution 1920x1080
+```
+
+The stub logs which path it took (`EDID native WxH`, `no EDID — keeping the
+firmware's WxH mode`, or `taking the largest mode`), and the kernel's boot banner
+prints the resolution it came up at — check that line first if the size is wrong.
+On x86, Limine does the same EDID query because `kernel/limine.conf` deliberately
+pins no `resolution:`; pass `CHITTI_RESOLUTION=1920x1080 cargo xtask image -arch
+x86_64` to force one.
+
+**"Everything is tiny on my 2K/4K screen" — use the font scale, not a smaller
+resolution.** Cells are `8*scale` x `16*scale` px, so the scale is what actually
+changes text size; a smaller *desktop* only letterboxes (smaller usable area, black
+borders, same text size). The automatic scale comes from the desktop height —
+1080p and below → 1, 1200p-1600p → 2, 4K → 3 — and is settable:
+
+```sh
+/display scale 3       # bigger text, applies now, persisted
+/display scale auto    # back to deriving it from the height
+```
+
+(A 2560x1440 panel used to land on scale 1 because the old formula needed 1650px
+for scale 2 — 320 columns of 8px text. That was the real reason a 2K display
+looked broken; `display::auto_font_scale` fixes it and pins the thresholds with
+tests.)
+
+**Running with virtio-gpu (real mode setting).** `CHITTI_GPU` picks the display
+device:
+
+```sh
+CHITTI_GPU=virtio cargo xtask run -arch aarch64 --uefi   # ramfb + virtio-gpu-pci
+CHITTI_GPU=virtio cargo xtask run -arch x86_64
+CHITTI_GPU=vmware cargo xtask run -arch x86_64           # exercises the declined VMSVGA path
+```
+
+Two things that are not obvious:
+
+- **aarch64 needs `--uefi`.** PCI comes from the stub's ACPI, so on the plain
+  `-kernel` path virtio-gpu is invisible; the knob says so and falls back to ramfb.
+- **ramfb is kept alongside virtio-gpu.** Booting aarch64/HVF with virtio-gpu as the
+  *only* display puts the firmware's GOP framebuffer inside the device's BAR, and
+  writing there after ExitBootServices aborts QEMU with
+  `Assertion failed: (isv), function hvf_handle_exception`. Confirmed to be the
+  environment and not the driver by bisecting with the KMS probe disabled. With ramfb
+  present the console lives in safe memory and virtio-gpu is a second device the
+  driver binds — its scanout is DMA RAM, which is writable normally.
+
+**Real mode setting (virtio-gpu).** With a `virtio-gpu-pci` device the OS drives
+the display itself, so `/display set` changes the actual mode instead of
+letterboxing — `/display status` shows `driver virtio-gpu` and `/display list`
+shows the device's modes. Try it:
+
+```sh
+qemu-system-x86_64 -M q35 -cpu max -m 4G -cdrom target/chitti.iso \
+  -device virtio-gpu-pci,id=gpu0 -serial mon:stdio
+# then in the guest:  /display set 1280x720   -> "mode 1280x720 set on virtio-gpu"
+```
+
+NB on aarch64 the plain `-kernel` path has no PCI (ECAM comes from the stub's
+ACPI), so virtio-gpu binds on the `--uefi` path and on x86. Without a driver the
+module is inert and everything behaves as before.
+
+**Changing the resolution from inside the OS.** `/display` (also the settings
+agent's `display` tool) has two knobs, because only one of them can work without
+a reboot:
+
+```sh
+/display                  # panel size, current desktop, next-boot setting
+/display list             # desktop sizes this panel can show (native first)
+/display set 1920x1080    # applies NOW — centred, letterboxed, still 1:1 (crisp)
+/display set native       # back to the whole panel
+/display boot 1920x1080   # records the panel's own mode for the next boot
+```
+
+`set` is the logical desktop: the compositor lays out against it and blits it as a
+viewport inside the physical framebuffer, so text is rasterised at real pixels and
+stays sharp — nothing is scaled. It persists to `/configs/core/display.json` and is
+re-applied at boot. `boot` is the hardware mode, which only the loader can set;
+it is **recorded but not yet applied** (see the note it prints), so today use
+`VBOX_RES=` / `CHITTI_RESOLUTION=` for that.
+
+**Multi-monitor hosts (the QEMU window).** `cargo xtask run` sizes the ramfb to the
+chosen display's **desktop**, read from `system_profiler SPDisplaysDataType -json`:
+
+| Field | Meaning | Used for |
+|---|---|---|
+| `_spdisplays_resolution` | the desktop actually in use (`1440 x 900 @ 60Hz`) | the default |
+| `_spdisplays_pixels` | the backing store (`2880 x 1800`) | `CHITTI_FB_RES=max` |
+| `spdisplays_main` | which display is primary | the default pick |
+
+```sh
+cargo xtask run -arch aarch64                     # main display's desktop
+CHITTI_FB_RES=max cargo xtask run                 # its full backing store
+CHITTI_FB_DISPLAY=DELL cargo xtask run            # a specific monitor (substring, any case)
+CHITTI_FB_RES=1920x1080 cargo xtask run           # pin it outright
+```
+
+Use the **JSON**, not the plain-text output: the text form omits the current
+resolution for a display at its default scaled mode, which forced the earlier
+version to guess — it halved a 2560x1600 panel to 1280x800 on a machine whose
+desktop was really 1440x900. Parsing is pure and unit-tested (`cargo test -p xtask`)
+against captured real output.
+
 ### Real Mac mini (Apple Silicon, via m1n1) — work in progress
 
 ChittiOS boots on a **bare Mac mini M2 (`t8112` / j473)** through the Asahi

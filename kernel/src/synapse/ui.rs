@@ -441,7 +441,9 @@ fn present_forced(id: u32) {
     };
     // Usable pane (minus HUD strip) so fit matches what present_surface_reserve
     // will do with the same hud text.
-    let (pw, ph_full) = crate::framebuffer::action_dims_px()
+    // Fit to the column this surface's tab actually lives in — a package-UI app
+    // dragged to another column must re-scale to that column, not the focused one.
+    let (pw, ph_full) = crate::framebuffer::surface_dims_px(id)
         .unwrap_or((SURF_W as u64, SURF_H as u64));
     let reserve = crate::framebuffer::surface_hud_reserve(&hud);
     let ph = ph_full.saturating_sub(reserve);

@@ -202,7 +202,20 @@ impl UiConfig {
     fn layout_cfg(&self) -> crate::framebuffer::LayoutCfg {
         crate::framebuffer::LayoutCfg {
             chat_pct: self.chat_pct,
-            scale: self.font_scale,
+            // The pane budget lives in `panes.json` (with the split ratio), not
+            // ui.json — so carry the live value through instead of defaulting it,
+            // or every `/theme set` and ui-config reload would silently collapse
+            // an N-column layout back to two panes (orphaning its tabs).
+            max_panes: crate::framebuffer::max_panes(),
+            grid: {
+                let (c, r) = crate::framebuffer::grid_shape();
+                let (col_w, row_h) = crate::framebuffer::grid_weights();
+                crate::panes_layout::GridSpec { cols: c, rows: r, col_w, row_h }
+            },
+            // The live pinned scale wins once the console is up: `/display scale`
+            // persists to display.json, and defaulting to ui.json's value here
+            // would silently undo it on every theme/appearance apply.
+            scale: crate::framebuffer::pinned_font_scale().unwrap_or(self.font_scale),
             swap: self.swap_panes,
             chat_title: self.chat_title.clone(),
             logs_title: self.logs_title.clone(),
@@ -294,6 +307,10 @@ fn apply_appearance() {
     }
     // Palette + wallpaper + opacity via the layout.
     crate::framebuffer::relayout(&cfg.layout_cfg());
+    // `relayout` redraws the frames but each tab owns its interior, so every
+    // visible pane has to re-present — a theme/font change otherwise leaves the
+    // non-focused panes' content in the old palette (or blank) until they tick.
+    crate::shell::repaint_visible_tabs();
 }
 
 /// Load `ui.json`, apply it to the framebuffer layout, and ensure the shortcuts

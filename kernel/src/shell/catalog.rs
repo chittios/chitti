@@ -36,7 +36,9 @@ pub const COMMAND_ALIASES: &[&str] = &[
     "quit",     // → exit
     "reboot",   // → restart
     "perms",    // → permissions
-    "panes",    // → pane (if present)
+    "panes",      // → pane
+    "resolution", // → display
+    "res",        // → display
 ];
 
 /// Whether `name` is a known slash command or alias (for completion).
@@ -142,6 +144,8 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "System & UI", title: "Suspend", name: "suspend", shortcut: "" },
     Entry { category: "System & UI", title: "UI Config", name: "ui", shortcut: "" },
     Entry { category: "System & UI", title: "Theme", name: "theme", shortcut: "" },
+    Entry { category: "System & UI", title: "Panes & Grid", name: "pane", shortcut: "Ctrl+F" },
+    Entry { category: "System & UI", title: "Display / Resolution", name: "display", shortcut: "" },
     Entry { category: "System & UI", title: "Shortcuts", name: "shortcuts", shortcut: "" },
     Entry { category: "System & UI", title: "Clipboard", name: "clip", shortcut: "" },
     Entry { category: "System & UI", title: "Close Action Pane", name: "close", shortcut: "Ctrl+W" },

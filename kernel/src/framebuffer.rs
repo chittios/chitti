@@ -188,12 +188,13 @@ const COMPOSER_HINT_GAP: u64 = 4;
 /// Margin between chat scrollback and the composer box (px, unscaled).
 const COMPOSER_TOP_GAP: u64 = 8;
 
-/// Pick an integer font scale from the panel height so glyphs stay a legible
-/// physical size across resolutions: 1x up to ~1600 tall, 2x for 4K-class
-/// panels, 3x beyond. Normal 1080p/1440p monitors render the crisp native
-/// 10x22 atlas; a 4K HDMI display doubles it instead of showing 6px text.
+/// Pick an integer font scale from the **desktop** height so glyphs stay a
+/// legible physical size across resolutions. See
+/// [`crate::display::auto_font_scale`] for the thresholds and why they are not a
+/// division — the old formula left a 1440p panel at scale 1 (320 columns of 8px
+/// text), which is what made a 2K display look broken.
 fn pick_scale(height: u64) -> u64 {
-    ((height + 550) / 1100).max(1)
+    crate::display::auto_font_scale(height)
 }
 
 /// One bordered text pane: an outer box plus the interior character grid it
@@ -676,7 +677,11 @@ pub struct Screen {
     b_shift: u32,
     scale: u64,
     chat: Pane,
-    logs: Pane,
+    /// Action columns (1..=8). Index 0 is the primary; focused column is
+    /// [`Self::focused_action`].
+    actions: Vec<ActionSlot>,
+    /// Which action column has keyboard/mouse focus for tabs and open targets.
+    focused_action: usize,
     /// Status-bar text (left = brand, right = datetime); set by the shell from
     /// the UI-config templates + clock, so it stays configurable.
     status_left: String,
@@ -708,21 +713,20 @@ pub struct Screen {
     blink_seen_ms: u64,
     blink_calls: u32,
     clock_alive: bool,
-    /// Whether keyboard focus is on the action (right) pane. Only meaningful
-    /// while the action pane shows ktrace; the editor always owns focus.
+    /// Physical framebuffer size, as the firmware reported it. `width`/`height`
+    /// are the **logical** desktop, which may be smaller (a letterboxed viewport).
+    fb_w: u64,
+    fb_h: u64,
+    /// Top-left of the logical desktop inside the physical framebuffer. Both zero
+    /// when the desktop is native.
+    origin_x: u64,
+    origin_y: u64,
+    /// The requested logical desktop, carried across rebuilds. `None` = native.
+    logical_pref: Option<(u64, u64)>,
+    /// Whether keyboard focus is on an action column (vs the shell/chat).
     focus_action: bool,
-    /// What the active tab in the right ("action") pane shows. Mirrors
-    /// `tabs[active]` (or `Closed` when `tabs` is empty). Kept as a field so the
-    /// many `self.right == …` readers stay valid.
-    right: RightMode,
-    /// The open action-pane tabs, tmux-style: opening a view adds/selects a tab,
-    /// switching keeps every other tab's process alive (audio keeps playing,
-    /// ktrace keeps streaming, the editor keeps its buffer). Empty = pane closed.
-    tabs: Vec<RightMode>,
-    /// Index of the active tab within `tabs`.
-    active: usize,
-    /// Unused since the action pane became tabbed (kept for struct stability).
-    right_before_editor: RightMode,
+    /// Action column currently highlighted as a tab drag's drop target.
+    drop_target: Option<usize>,
     /// The last-applied layout config, reused when opening/closing the action
     /// pane so the split ratio / titles / scale are preserved.
     layout: LayoutCfg,
@@ -991,6 +995,61 @@ pub enum RightMode {
     Surface(u32),
 }
 
+/// A snapshot of one action pane's interior geometry, copied out so a painter
+/// can keep using it while it mutates the screen (no borrow held on `actions`).
+#[derive(Clone, Copy)]
+struct PaneDims {
+    /// Outer box origin (frame, not interior).
+    x: u64,
+    /// Interior origin.
+    ix: u64,
+    iy: u64,
+    /// Interior size in pixels.
+    w: u64,
+    iw: u64,
+    ih: u64,
+    cw: u64,
+    ch: u64,
+    cols: u64,
+    rows: u64,
+    bg: Rgb,
+}
+
+impl PaneDims {
+    fn of(p: &Pane) -> PaneDims {
+        PaneDims {
+            x: p.x,
+            ix: p.ix,
+            iy: p.iy,
+            w: p.w,
+            iw: p.cols * p.cw,
+            ih: p.rows * p.ch,
+            cw: p.cw,
+            ch: p.ch,
+            cols: p.cols,
+            rows: p.rows,
+            bg: p.bg,
+        }
+    }
+}
+
+/// One action pane in the grid: its geometry + tmux-style tab list.
+struct ActionSlot {
+    pane: Pane,
+    tabs: Vec<RightMode>,
+    active: usize,
+}
+
+impl ActionSlot {
+    fn right(&self) -> RightMode {
+        self.tabs.get(self.active).copied().unwrap_or(RightMode::Closed)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tabs.is_empty()
+    }
+}
+
 /// Surface id the `/open` image viewer uses (also known to the shell). A
 /// `Surface(IMAGE_SURFACE)` tab is labelled "image" in the tab bar.
 pub const IMAGE_SURFACE: u32 = u32::MAX;
@@ -1031,6 +1090,12 @@ fn tab_label(m: RightMode) -> alloc::string::String {
 pub struct LayoutCfg {
     /// Chat pane width as a % of the content region (10..90).
     pub chat_pct: u64,
+    /// Total panes including the shell (2..=9). Action panes = max_panes - 1.
+    pub max_panes: u8,
+    /// The action band's grid shape and per-track weights. `cols * rows` is the
+    /// action-pane count, so it and `max_panes` are kept consistent by
+    /// [`set_max_panes`] / [`set_grid`].
+    pub grid: crate::panes_layout::GridSpec,
     /// Font scale; 0 = auto from panel height.
     pub scale: u64,
     /// Put the chat pane on the right instead of the left.
@@ -1056,6 +1121,8 @@ impl Default for LayoutCfg {
     fn default() -> Self {
         LayoutCfg {
             chat_pct: CHAT_PCT,
+            max_panes: crate::panes_layout::MAX_PANES_DEFAULT,
+            grid: crate::panes_layout::GridSpec::even(1, 1),
             scale: 0,
             swap: false,
             chat_title: String::from("Shell Agent"),
@@ -1081,10 +1148,24 @@ impl Screen {
         g_shift: u32,
         b_shift: u32,
     ) -> Screen {
-        // Default boot layout: the action pane is closed, so the chat pane is
-        // full-width (only the shell/chat shows until `/ktrace` or `/open`). The
-        // theme + splash come from the UI config (brand defaults until it loads).
-        Screen::build(addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift, &crate::ui_config::boot_layout(), false)
+        // Default: max_panes=2 → action band closed until first tab. max_panes>2
+        // shows empty action columns as drop targets from boot.
+        let cfg = crate::ui_config::boot_layout();
+        let band = crate::panes_layout::action_band_visible(cfg.max_panes, false);
+        Screen::build(
+            addr,
+            width,
+            height,
+            pitch,
+            bpp_bytes,
+            r_shift,
+            g_shift,
+            b_shift,
+            &cfg,
+            band,
+            0,
+            None, // native until `display.json` is applied
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1099,7 +1180,26 @@ impl Screen {
         b_shift: u32,
         cfg: &LayoutCfg,
         split: bool,
+        focused: usize,
+        logical_pref: Option<(u64, u64)>,
     ) -> Screen {
+        // `width`/`height` arrive as the PHYSICAL framebuffer. A logical
+        // preference turns them into a centred viewport; everything below this
+        // point lays out against the logical size only, so the whole compositor
+        // is resolution-agnostic and needs no other change.
+        let (fb_w, fb_h) = (width, height);
+        let (origin_x, origin_y, width, height) = match logical_pref {
+            Some((lw, lh)) => {
+                let (x, y, w, h) = crate::display::viewport(
+                    (fb_w as u32, fb_h as u32),
+                    (lw as u32, lh as u32),
+                );
+                (x as u64, y as u64, w as u64, h as u64)
+            }
+            None => (0, 0, fb_w, fb_h), // native: identity, byte-for-byte the old path
+        };
+        // Font scale follows the LOGICAL height, so a smaller desktop gets
+        // proportionally sized text rather than the panel's.
         let scale = if cfg.scale > 0 { cfg.scale } else { pick_scale(height) };
         let cw = CELL_W * scale;
         let ch = CELL_H * scale;
@@ -1108,35 +1208,63 @@ impl Screen {
         let box_y = OUTER;
         let box_h = content_h.saturating_sub(2 * OUTER);
         let pct = cfg.chat_pct.clamp(10, 90);
+        let grid = cfg.grid.sanitized();
+        let n_act = grid.len();
         let full_w = width.saturating_sub(2 * OUTER);
-        let (chat_x, chat_bw, logs_x, logs_bw) = if cfg.fullscreen == 2 && split {
-            // Action pane fills the screen; chat parked offscreen (w=0).
-            // Parked panes keep w==0 so `Pane::adopt` clones content without a
-            // catastrophic 1-column reflow of the full scrollback.
-            (width, 0, OUTER, full_w)
-        } else if cfg.fullscreen == 1 || !split {
-            // Chat fills the screen; action parked offscreen (w=0).
-            (OUTER, full_w, width, 0)
-        } else {
-            let avail_w = width.saturating_sub(2 * OUTER + GAP);
-            let chat_w = avail_w * pct / 100;
-            let logs_w = avail_w - chat_w;
-            // chat takes the right box when swapped.
-            if cfg.swap {
-                (OUTER + logs_w + GAP, chat_w, OUTER, logs_w)
-            } else {
-                (OUTER, chat_w, OUTER + chat_w + GAP, logs_w)
-            }
-        };
         let th = cfg.theme;
-        // Allow w==0 for parked panes — do not `.max(cw)` the outer box or
-        // fullscreen parking becomes a 1-col reflow of the whole history.
+        let focused = focused.min(n_act - 1);
+        // Parked panes keep w==0 so `Pane::adopt` clones content without a
+        // catastrophic 1-column reflow of the full scrollback.
+        let parked = (width, box_y, 0u64, box_h);
+        let mut action_boxes = if cfg.fullscreen == 2 && split {
+            // The **focused** action pane fills the screen; chat + every other
+            // pane park. Maximising cell 0 regardless of focus would show a
+            // different pane than the one the user was working in.
+            let mut boxes = alloc::vec![parked; n_act];
+            boxes[focused] = (OUTER, box_y, full_w, box_h);
+            boxes
+        } else if cfg.fullscreen == 1 || !split {
+            // Chat fills; the whole action grid parks.
+            alloc::vec![parked; n_act]
+        } else {
+            let (_, _, bx, bw) = crate::panes_layout::split_band(width, OUTER, GAP, pct, true, cfg.swap);
+            crate::panes_layout::layout_grid(bx, box_y, bw, box_h, GAP, &grid)
+        };
+        // Keep the vector's length pinned to the cell count regardless.
+        action_boxes.resize(n_act, parked);
+        let (chat_x, chat_bw) = if cfg.fullscreen == 2 && split {
+            (width, 0)
+        } else if cfg.fullscreen == 1 || !split {
+            (OUTER, full_w)
+        } else {
+            let (cx, cwid, ..) = crate::panes_layout::split_band(width, OUTER, GAP, pct, true, cfg.swap);
+            (cx, cwid)
+        };
         let chat = Pane::new(chat_x, box_y, chat_bw, box_h, cw, ch, th.chat_fg, th.chat_bg, cfg.chat_title.clone(), true);
-        let logs = Pane::new(logs_x, box_y, logs_bw, box_h, cw, ch, th.logs_fg, th.logs_bg, cfg.logs_title.clone(), false);
+        let mut actions = alloc::vec::Vec::with_capacity(n_act);
+        for (i, &(ax, ay, aw, ah)) in action_boxes.iter().enumerate() {
+            let title = if i == 0 {
+                cfg.logs_title.clone()
+            } else {
+                alloc::format!("action {}", i + 1)
+            };
+            actions.push(ActionSlot {
+                pane: Pane::new(ax, ay, aw, ah, cw, ch, th.logs_fg, th.logs_bg, title, false),
+                tabs: Vec::new(),
+                active: 0,
+            });
+        }
         let mut status_left = String::from("ChittiOS v");
         status_left.push_str(crate::VERSION);
         let mut scr = Screen {
-            addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift, scale, chat, logs,
+            addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift, scale, chat,
+            fb_w,
+            fb_h,
+            origin_x,
+            origin_y,
+            logical_pref,
+            actions,
+            focused_action: focused,
             status_left,
             status_right: String::new(),
             caret_on: true,
@@ -1154,10 +1282,7 @@ impl Screen {
             blink_calls: 0,
             clock_alive: false,
             focus_action: false,
-            right: RightMode::Closed,
-            tabs: Vec::new(),
-            active: 0,
-            right_before_editor: RightMode::Closed,
+            drop_target: None,
             layout: cfg.clone(),
             theme: th,
             cur_x: width / 2,
@@ -1176,6 +1301,7 @@ impl Screen {
         scr
     }
 
+
     fn cw(&self) -> u64 {
         CELL_W * self.scale
     }
@@ -1183,13 +1309,168 @@ impl Screen {
         CELL_H * self.scale
     }
 
+    /// Focused action slot (falls back to 0).
+    fn focused_slot(&self) -> &ActionSlot {
+        let i = self.focused_action.min(self.actions.len().saturating_sub(1));
+        &self.actions[i]
+    }
+    fn focused_slot_mut(&mut self) -> &mut ActionSlot {
+        let i = self.focused_action.min(self.actions.len().saturating_sub(1));
+        &mut self.actions[i]
+    }
+    /// Active tab of the focused action column.
+    fn right(&self) -> RightMode {
+        if self.actions.is_empty() {
+            RightMode::Closed
+        } else {
+            self.focused_slot().right()
+        }
+    }
+    /// True if any action column has at least one tab.
+    fn any_action_open(&self) -> bool {
+        self.actions.iter().any(|a| !a.is_empty())
+    }
+    /// Primary geometry pane for the focused action column (`logs` legacy).
+    fn logs(&self) -> &Pane {
+        &self.focused_slot().pane
+    }
+    fn logs_mut(&mut self) -> &mut Pane {
+        &mut self.focused_slot_mut().pane
+    }
+    /// Whether action pane `i` should be painted.
+    ///
+    /// A parked pane (`w == 0`, fullscreen or a collapsed band) never paints. An
+    /// *empty* pane paints its frame only in a multi-pane grid, where it is a
+    /// visible drop target; a lone action pane collapses when its last tab
+    /// closes, keeping the classic two-pane look byte-identical.
+    ///
+    /// The test is the **grid's own** pane count, not `layout.max_panes`: the two
+    /// are kept in sync but deriving visibility from the geometry that is
+    /// actually laid out means a stale config can't make them disagree.
+    fn column_visible(&self, i: usize) -> bool {
+        let Some(a) = self.actions.get(i) else { return false };
+        if a.pane.w == 0 {
+            return false;
+        }
+        !a.is_empty() || self.actions.len() > 1
+    }
+
+    /// The visible pane of the action column whose **active** tab is `mode`.
+    ///
+    /// The per-view painters (`draw_top`, the audio/video/browser HUDs, the
+    /// editor) resolve their target through this rather than the focused column:
+    /// a `/top` tab on column 2 must keep refreshing while the user works in
+    /// column 1, and it must paint into its own column's rectangle.
+    fn mode_dims(&self, mode: RightMode) -> Option<PaneDims> {
+        let i = self.mode_column(mode)?;
+        Some(PaneDims::of(&self.actions[i].pane))
+    }
+
+    /// Index of the visible action column whose **active** tab is `mode`.
+    fn mode_column(&self, mode: RightMode) -> Option<usize> {
+        (0..self.actions.len())
+            .find(|&i| self.actions[i].right() == mode && self.actions[i].pane.w > 0)
+    }
+
+    /// Whether any action column is painted — i.e. the band is up, so keyboard
+    /// focus can move to it. With `max_panes > 2` an *empty* column is visible
+    /// and focusable (it is a drop target), which is why this is not the same
+    /// question as "does the focused column have a tab".
+    fn any_column_visible(&self) -> bool {
+        (0..self.actions.len()).any(|i| self.column_visible(i))
+    }
+
+    /// Find which column owns `mode`.
+    fn find_mode(&self, mode: RightMode) -> Option<(usize, usize)> {
+        for (pi, a) in self.actions.iter().enumerate() {
+            if let Some(ti) = a.tabs.iter().position(|&m| m == mode) {
+                return Some((pi, ti));
+            }
+        }
+        None
+    }
+
     // --- pixel plumbing --------------------------------------------------
+
+    /// Byte offset into the framebuffer for **logical** pixel `(x, y)`.
+    ///
+    /// The single place the logical desktop is translated into physical pixels.
+    /// `width`/`height` are the *logical* desktop (what every layout is computed
+    /// against) and `origin_x`/`origin_y` place it inside the real framebuffer, so
+    /// a smaller-than-native resolution is a centred, letterboxed viewport that
+    /// still renders 1:1 — glyphs are rasterised at physical pixels, nothing is
+    /// scaled, so text stays crisp. When the desktop is native both origins are 0
+    /// and this is the identity, i.e. the default path is unchanged.
+    #[inline]
+    fn fb_offset(&self, x: u64, y: u64) -> u64 {
+        (y + self.origin_y) * self.pitch + (x + self.origin_x) * self.bpp_bytes
+    }
+
+    /// Fill a rectangle in **physical** framebuffer coordinates, bypassing the
+    /// logical viewport. Only the letterbox uses this — everything else must go
+    /// through the logical path so it lands inside the desktop.
+    fn fill_phys(&self, x: u64, y: u64, w: u64, h: u64, c: Rgb) {
+        let value = self.pack_rgb(c);
+        if x >= self.fb_w {
+            return;
+        }
+        let n = w.min(self.fb_w - x);
+        for yy in y..(y + h).min(self.fb_h) {
+            let offset = yy * self.pitch + x * self.bpp_bytes;
+            // SAFETY: clipped to the physical framebuffer, which is kernel-owned
+            // MMIO for its full `fb_h * pitch` extent.
+            unsafe {
+                let ptr = (self.addr as *mut u8).add(offset as usize);
+                if self.bpp_bytes == 4 {
+                    let dst = ptr as *mut u32;
+                    for i in 0..n {
+                        dst.add(i as usize).write_volatile(value);
+                    }
+                } else {
+                    for i in 0..n {
+                        let p = ptr.add((i * self.bpp_bytes) as usize);
+                        for b in 0..self.bpp_bytes {
+                            p.add(b as usize).write_volatile((value >> (b * 8)) as u8);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Paint the dead space around a smaller-than-native desktop.
+    ///
+    /// A no-op at native resolution (the common case), so the default boot path
+    /// touches nothing extra. Painted black rather than the theme background: it
+    /// is outside the desktop, so it should read as "no screen here" rather than
+    /// as an oversized margin.
+    fn paint_letterbox(&self) {
+        if self.origin_x == 0
+            && self.origin_y == 0
+            && self.width == self.fb_w
+            && self.height == self.fb_h
+        {
+            return;
+        }
+        let black = (0, 0, 0);
+        let (ox, oy) = (self.origin_x, self.origin_y);
+        self.fill_phys(0, 0, self.fb_w, oy, black); // above
+        let below = oy + self.height;
+        self.fill_phys(0, below, self.fb_w, self.fb_h.saturating_sub(below), black);
+        self.fill_phys(0, oy, ox, self.height, black); // left
+        let right = ox + self.width;
+        self.fill_phys(right, oy, self.fb_w.saturating_sub(right), self.height, black);
+    }
 
     fn put_pixel(&self, x: u64, y: u64, c: Rgb) {
         if x >= self.width || y >= self.height {
             return;
         }
-        let offset = y * self.pitch + x * self.bpp_bytes;
+        // NB: damage is NOT tracked here. A redraw is millions of put_pixel calls
+        // and a per-pixel union would cost more than the flush it feeds. The coarse
+        // painters (`fill_rect`, `blit_rgb32_row`, `redraw`) report damage instead,
+        // and they are what every glyph and frame ultimately goes through.
+        let offset = self.fb_offset(x, y);
         let value: u32 =
             ((c.0 as u32) << self.r_shift) | ((c.1 as u32) << self.g_shift) | ((c.2 as u32) << self.b_shift);
         // SAFETY: `offset` is bounds-checked against the reported geometry; the
@@ -1220,8 +1501,14 @@ impl Screen {
         if y >= self.height || x >= self.width || row.is_empty() {
             return;
         }
+        crate::kms::damage(
+            (x + self.origin_x) as u32,
+            (y + self.origin_y) as u32,
+            row.len() as u32,
+            1,
+        );
         let n = row.len().min((self.width - x) as usize);
-        let offset = y * self.pitch + x * self.bpp_bytes;
+        let offset = self.fb_offset(x, y);
         // SAFETY: n is clipped to the scanline; FB is kernel-owned MMIO.
         unsafe {
             let mut ptr = (self.addr as *mut u8).add(offset as usize);
@@ -1265,6 +1552,14 @@ impl Screen {
     }
 
     fn fill_rect(&self, x: u64, y: u64, w: u64, h: u64, c: Rgb) {
+        // Report to KMS in *physical* coordinates: a driver's scanout is the whole
+        // framebuffer, not the logical desktop, so the viewport origin must be added.
+        crate::kms::damage(
+            (x + self.origin_x) as u32,
+            (y + self.origin_y) as u32,
+            w as u32,
+            h as u32,
+        );
         if w == 0 || h == 0 {
             return;
         }
@@ -1422,7 +1717,7 @@ impl Screen {
         if x >= self.width || y >= self.height {
             return (0, 0, 0);
         }
-        let offset = y * self.pitch + x * self.bpp_bytes;
+        let offset = self.fb_offset(x, y);
         // SAFETY: bounds-checked offset into the kernel-owned framebuffer.
         let mut val: u32 = 0;
         unsafe {
@@ -1511,11 +1806,15 @@ impl Screen {
 
     /// The action-pane close-button rectangle `(x, y, w, h)` — a `[x]` at the
     /// top-right of the action pane title. Only meaningful when the pane is open.
-    fn close_btn(&self) -> (u64, u64, u64, u64) {
-        let cw = self.cw();
-        let w = cw * 3;
-        let x = self.logs.x + self.logs.w - BORDER - PAD - w;
-        let y = self.logs.y + BORDER + 4;
+    /// The `[x]` rectangle for action column `pane_i` — the one geometry both the
+    /// renderer and the click hit-test use, so they can never disagree.
+    fn close_btn_for(&self, pane_i: usize) -> (u64, u64, u64, u64) {
+        let w = self.cw() * 3;
+        let Some(a) = self.actions.get(pane_i) else {
+            return (0, 0, 0, 0);
+        };
+        let x = (a.pane.x + a.pane.w).saturating_sub(BORDER + PAD + w);
+        let y = a.pane.y + BORDER + 4;
         (x, y, w, self.ch())
     }
 
@@ -1656,6 +1955,13 @@ impl Screen {
     /// Render `s` at pixel `(px,py)`, advancing one scaled cell per char. Returns
     /// the x past the last glyph. Clips at `self.width`. Titles + status bar.
     fn draw_str(&self, px: u64, py: u64, s: &str, fg: Rgb, bg: Rgb) -> u64 {
+        // Glyphs blit pixel-by-pixel, so report the whole run's box once.
+        crate::kms::damage(
+            (px + self.origin_x) as u32,
+            (py + self.origin_y) as u32,
+            (s.chars().count() as u64 * self.cw()) as u32,
+            self.ch() as u32,
+        );
         let mut x = px;
         let cw = self.cw();
         for ch in s.chars() {
@@ -1737,7 +2043,7 @@ impl Screen {
         unsafe {
             let base = self.addr as *mut u8;
             for row in 0..(h - p.ch) {
-                let dst = ((top + row) * self.pitch + x0 * self.bpp_bytes) as usize;
+                let dst = self.fb_offset(x0, top + row) as usize;
                 base.add(dst).copy_from_nonoverlapping(base.add(dst + step), row_bytes);
             }
         }
@@ -2607,7 +2913,7 @@ impl Screen {
     /// Whether the action (right) pane holds keyboard focus: always while the
     /// editor owns it, by toggle (`focus_toggle` / click) while it shows ktrace.
     fn action_focused(&self) -> bool {
-        match self.right {
+        match self.right() {
             RightMode::Editor => true,
             RightMode::Closed => false,
             // ktrace / top / surface: chat keeps focus by default so you can keep
@@ -2624,6 +2930,11 @@ impl Screen {
     /// Parked panes (`w == 0`, fullscreen) are skipped entirely — their content
     /// is preserved in memory via [`Pane::take_content`] and restored on unpark.
     fn redraw(&self) {
+        crate::kms::damage(0, 0, self.fb_w as u32, self.fb_h as u32);
+        // Dead space around a smaller-than-native desktop. A no-op at native, and
+        // painted here (not per-frame) because the letterbox only changes when the
+        // geometry does — which is exactly when a redraw happens.
+        self.paint_letterbox();
         // Paint only the background *gutters* (margins + the gap between panes),
         // never a full-screen clear — the panes are painted over their own areas
         // below, so their content is never flashed to background. This is what
@@ -2637,18 +2948,18 @@ impl Screen {
             self.render_view(&self.chat);
             self.draw_composer(); // includes suggest popup when open
         }
-        if self.right != RightMode::Closed && self.logs.w > 0 {
-            self.drop_shadow(self.logs.x, self.logs.y, self.logs.w, self.logs.h);
-            self.paint_surface(self.logs.x, self.logs.y, self.logs.w, self.logs.h, self.logs.bg);
-            // The header is a tmux-style tab bar (drawn by draw_tab_bar), so the
-            // frame is drawn with an empty title.
-            self.draw_frame_titled(&self.logs, self.action_focused(), "");
-            self.draw_tab_bar();
-            self.draw_close_btn();
-            // The editor + /top + audio repaint their own interiors (from the
-            // shell, on switch + idle tick); ktrace re-renders from the grid.
-            if self.right == RightMode::Ktrace {
-                self.render_view(&self.logs);
+        for (i, a) in self.actions.iter().enumerate() {
+            if !self.column_visible(i) {
+                continue;
+            }
+            let focused = self.focus_action && i == self.focused_action;
+            self.drop_shadow(a.pane.x, a.pane.y, a.pane.w, a.pane.h);
+            self.paint_surface(a.pane.x, a.pane.y, a.pane.w, a.pane.h, a.pane.bg);
+            self.draw_frame_titled(&a.pane, focused, "");
+            self.draw_tab_bar_for(i);
+            self.draw_close_btn_for(i);
+            if a.right() == RightMode::Ktrace {
+                self.render_view(&a.pane);
             }
         }
         // Grid caret only when there is no composer; otherwise the caret is in
@@ -2671,22 +2982,26 @@ impl Screen {
         let below = by + bh;
         let status_top = self.height.saturating_sub(self.ch() + 8);
         self.paint_wallpaper(0, below, self.width, status_top.saturating_sub(below), bg);
-        // Horizontal gutters within the pane band. Order the two panes by x
-        // (the layout may put chat on the right when swapped).
-        let (mut a, mut b) = ((self.chat.x, self.chat.x + self.chat.w), (0u64, 0u64));
-        let two = self.right != RightMode::Closed;
-        if two {
-            b = (self.logs.x, self.logs.x + self.logs.w);
-            if a.0 > b.0 {
-                core::mem::swap(&mut a, &mut b);
+        // Horizontal gutters: left of chat, gaps between all boxes, right margin.
+        let mut boxes: alloc::vec::Vec<(u64, u64)> = alloc::vec![];
+        if self.chat.w > 0 {
+            boxes.push((self.chat.x, self.chat.x + self.chat.w));
+        }
+        for a in &self.actions {
+            if a.pane.w > 0 {
+                boxes.push((a.pane.x, a.pane.x + a.pane.w));
             }
         }
-        self.paint_wallpaper(0, by, a.0, bh, bg); // left margin
-        if two {
-            self.paint_wallpaper(a.1, by, b.0.saturating_sub(a.1), bh, bg); // gap between panes
-            self.paint_wallpaper(b.1, by, self.width.saturating_sub(b.1), bh, bg); // right margin
-        } else {
-            self.paint_wallpaper(a.1, by, self.width.saturating_sub(a.1), bh, bg); // right margin
+        boxes.sort_by_key(|b| b.0);
+        let mut x = 0u64;
+        for &(l, r) in &boxes {
+            if l > x {
+                self.paint_wallpaper(x, by, l - x, bh, bg);
+            }
+            x = r.max(x);
+        }
+        if x < self.width {
+            self.paint_wallpaper(x, by, self.width - x, bh, bg);
         }
     }
 
@@ -2697,66 +3012,85 @@ impl Screen {
     /// The active tab's dynamic interior (top/audio/image/editor) is repainted by
     /// the shell right after (`repaint_active_tab`).
     fn repaint_action(&mut self) {
-        if self.right == RightMode::Closed {
-            return;
-        }
         self.cursor_restore();
-        // Update the chat frame's active state (border colour) without touching
-        // its content — cheap, no blank.
         self.draw_frame(&self.chat, !self.action_focused());
-        self.paint_surface(self.logs.ix, self.logs.iy, self.logs.cols * self.logs.cw, self.logs.rows * self.logs.ch, self.logs.bg);
-        self.draw_frame_titled(&self.logs, self.action_focused(), "");
-        self.draw_tab_bar();
-        self.draw_close_btn();
-        if self.right == RightMode::Ktrace {
-            self.render_view(&self.logs);
+        for i in 0..self.actions.len() {
+            if !self.column_visible(i) {
+                continue;
+            }
+            let a = &self.actions[i];
+            let focused = self.focus_action && i == self.focused_action;
+            self.paint_surface(
+                a.pane.ix,
+                a.pane.iy,
+                a.pane.cols * self.cw(),
+                a.pane.rows * self.ch(),
+                a.pane.bg,
+            );
+            self.draw_frame_titled(&a.pane, focused, "");
+            self.draw_tab_bar_for(i);
+            self.draw_close_btn_for(i);
+            if a.right() == RightMode::Ktrace {
+                self.render_view(&a.pane);
+            }
         }
         self.cursor_overlay();
     }
 
-    /// Draw the `[x]` close button at the top-right of the action pane title.
-    fn draw_close_btn(&self) {
-        let (x, y, _, _) = self.close_btn();
-        self.draw_str(x, y, "[x]", (230, 120, 120), self.logs.bg);
+    fn draw_close_btn_for(&self, pane_i: usize) {
+        let Some(a) = self.actions.get(pane_i) else { return };
+        // An empty drop-target column has nothing to close.
+        if a.pane.w == 0 || a.is_empty() {
+            return;
+        }
+        let (x, y, ..) = self.close_btn_for(pane_i);
+        self.draw_str(x, y, "[x]", (230, 120, 120), a.pane.bg);
     }
 
-    /// Per-tab header layout: `(mode, x_pixel, width_pixels)` for each open tab,
-    /// laid out left-to-right on the action pane's title row. Used by both the
-    /// tab-bar renderer and the click hit-test so they never disagree.
-    fn tab_layout(&self) -> Vec<(RightMode, u64, u64)> {
+    /// Per-tab header layout for action column `pane_i`.
+    fn tab_layout_for(&self, pane_i: usize) -> Vec<(RightMode, u64, u64)> {
+        let Some(a) = self.actions.get(pane_i) else {
+            return Vec::new();
+        };
         let cw = self.cw();
-        let mut x = self.logs.x + BORDER + PAD;
-        let mut out = Vec::with_capacity(self.tabs.len());
-        for &m in &self.tabs {
+        let mut x = a.pane.x + BORDER + PAD;
+        let mut out = Vec::with_capacity(a.tabs.len());
+        for &m in &a.tabs {
             let lab = tab_label(m);
-            let w = (lab.chars().count() as u64 + 1) * cw; // label + trailing space
+            let w = (lab.chars().count() as u64 + 1) * cw;
             out.push((m, x, w));
-            x += w + cw; // one cell gap between tabs
+            x += w + cw;
         }
         out
     }
 
-    /// Draw the tab bar on the action pane's title row: active tab in accent
-    /// with a `▸` marker, the rest dim. Stops before the `[x]` close button.
-    fn draw_tab_bar(&self) {
-        let ty = self.logs.y + BORDER + 4;
-        let (close_x, ..) = self.close_btn();
-        // Clear the tab-bar row (up to the close button) first, so switching
-        // tabs leaves no stale glyphs from a longer previous label.
-        let x0 = self.logs.x + BORDER + PAD;
-        self.fill_rect(x0, ty, close_x.saturating_sub(x0), self.ch(), self.logs.bg);
-        for (i, (m, x, w)) in self.tab_layout().into_iter().enumerate() {
+    fn draw_tab_bar_for(&self, pane_i: usize) {
+        let Some(a) = self.actions.get(pane_i) else { return };
+        if a.pane.w == 0 {
+            return;
+        }
+        // Share the close button's geometry so the bar always stops exactly
+        // where the `[x]` starts. `close_btn_for` saturates, which matters now
+        // that a grid pane can be far narrower than the old single action pane.
+        let (close_x, ty, ..) = self.close_btn_for(pane_i);
+        let x0 = a.pane.x + BORDER + PAD;
+        self.fill_rect(x0, ty, close_x.saturating_sub(x0), self.ch(), a.pane.bg);
+        for (i, (m, x, w)) in self.tab_layout_for(pane_i).into_iter().enumerate() {
             if x + w >= close_x {
-                break; // ran into the close button; overflow tabs are hidden
+                break;
             }
-            let is_active = i == self.active;
-            let fg = if is_active { self.theme.title_active } else { self.theme.title_dim };
+            let is_active = i == a.active;
+            let fg = if is_active {
+                self.theme.title_active
+            } else {
+                self.theme.title_dim
+            };
             let mut lx = x;
             if is_active {
-                lx = self.draw_str(lx, ty, ">", self.theme.accent, self.logs.bg);
+                lx = self.draw_str(lx, ty, ">", self.theme.accent, a.pane.bg);
             }
             let lab = tab_label(m);
-            self.draw_str(lx, ty, &lab, fg, self.logs.bg);
+            self.draw_str(lx, ty, &lab, fg, a.pane.bg);
         }
     }
 
@@ -2897,18 +3231,18 @@ pub struct TopView<'a> {
 pub fn draw_top(v: &TopView) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
-        if sc.right != RightMode::Top {
+        let Some(d) = sc.mode_dims(RightMode::Top) else {
             return;
-        }
+        };
         sc.cursor_restore();
         sc.cur_vis = false;
         let ch = sc.ch();
         let cw = sc.cw();
-        let (px, iy, iw) = (sc.logs.ix, sc.logs.iy, sc.logs.cols * sc.logs.cw);
-        let bottom = iy + sc.logs.rows * sc.logs.ch;
+        let (px, iy, iw) = (d.ix, d.iy, d.iw);
+        let bottom = iy + d.ih;
         // NO full-interior clear: overwrite in place (padded strings + self-
         // filling bars) so the 1 Hz refresh does not flicker.
-        let bg = sc.logs.bg;
+        let bg = d.bg;
         let mib = 1024 * 1024;
         let gib = 1024 * mib;
         let fmt = |b: u64| -> String {
@@ -3155,16 +3489,16 @@ pub struct AudioView<'a> {
 pub fn draw_audio(v: &AudioView) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
-        if sc.right != RightMode::Audio {
+        let Some(d) = sc.mode_dims(RightMode::Audio) else {
             return;
-        }
+        };
         sc.cursor_restore();
         sc.cur_vis = false;
         let ch = sc.ch();
         let cw = sc.cw();
-        let (px, py) = (sc.logs.ix, sc.logs.iy);
-        let (pw, ph) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
-        let bg = sc.logs.bg;
+        let (px, py) = (d.ix, d.iy);
+        let (pw, ph) = (d.iw, d.ih);
+        let bg = d.bg;
         // Same HUD height as the video player so the two tabs feel identical.
         let barh = ch * 4 + ch / 2;
         let by = py + ph.saturating_sub(barh);
@@ -3306,16 +3640,16 @@ pub fn draw_browser_status(
 ) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
-        if sc.right != RightMode::Surface(BROWSER_SURFACE) {
+        let Some(d) = sc.mode_dims(RightMode::Surface(BROWSER_SURFACE)) else {
             return;
-        }
+        };
         sc.cursor_restore();
         sc.cur_vis = false;
         let ch = sc.ch();
         let cw = sc.cw();
-        let (px, py) = (sc.logs.ix, sc.logs.iy);
-        let (pw, ph) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
-        let bg = sc.logs.bg;
+        let (px, py) = (d.ix, d.iy);
+        let (pw, ph) = (d.iw, d.ih);
+        let bg = d.bg;
         let barh = ch * 4 + ch / 2;
         let by = py + ph.saturating_sub(barh);
         sc.fill_rect(px, by, pw, barh, bg);
@@ -3445,19 +3779,19 @@ pub fn draw_video_status(
 ) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
-        if sc.right != RightMode::Surface(VIDEO_SURFACE) {
+        let Some(d) = sc.mode_dims(RightMode::Surface(VIDEO_SURFACE)) else {
             return;
-        }
+        };
         sc.cursor_restore();
         sc.cur_vis = false;
         let ch = sc.ch();
         let cw = sc.cw();
-        let (px, py) = (sc.logs.ix, sc.logs.iy);
-        let (pw, ph) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
+        let (px, py) = (d.ix, d.iy);
+        let (pw, ph) = (d.iw, d.ih);
         // Reserved HUD strip (below the video frame). Fill the whole strip once
         // so time/fps string length changes never leave glyph trails; the strip
         // is small (~4 lines) so this is cheap and does not flash the picture.
-        let bg = sc.logs.bg;
+        let bg = d.bg;
         let barh = ch * 4 + ch / 2;
         let by = py + ph.saturating_sub(barh);
         sc.fill_rect(px, by, pw, barh, bg);
@@ -4035,6 +4369,58 @@ pub fn init_console_raw_fmt(
     init_from(s);
 }
 
+/// Re-init the console onto a **different framebuffer** — a new address, pitch and
+/// size — after a real mode set, preserving the session.
+///
+/// Unlike `init_console_raw_fmt` this keeps the layout config, the status text, the
+/// interactive state and (via [`Pane::adopt`]) every pane's scrollback, so changing
+/// resolution does not clear the screen or drop history; it reflows, exactly as a
+/// font-scale change does. No splash, either — this is not a boot.
+///
+/// The logical-desktop preference is deliberately **dropped** here: it existed to
+/// letterbox a desktop inside a too-large panel, and a real mode set is the better
+/// answer to the same problem. Keeping it would letterbox *inside* the new mode.
+#[allow(clippy::too_many_arguments)]
+pub fn reinit_scanout(
+    addr: usize,
+    width: u64,
+    height: u64,
+    pitch: u64,
+    bpp_bytes: u64,
+    r_shift: u32,
+    g_shift: u32,
+    b_shift: u32,
+) {
+    // No console yet — this device *is* the display (virtio-gpu with no firmware
+    // framebuffer behind it), so bring the console up on it rather than returning.
+    // Without this a KMS-only machine boots to a blank screen: the compositor has
+    // nothing to re-init and the driver has nowhere to draw.
+    if SCREEN.with(|slot| slot.is_none()) {
+        init_console_raw_fmt(addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift);
+        return;
+    }
+    SCREEN.with(|slot| {
+        let Some(old) = slot.as_ref() else { return };
+        let cfg = old.layout.clone();
+        let split = old.any_action_open() || old.actions.len() > 1;
+        let focused = old.focused_action;
+        let mut ns = Screen::build(
+            addr, width, height, pitch, bpp_bytes, r_shift, g_shift, b_shift, &cfg, split, focused,
+            None, // a real mode set replaces the letterbox, it does not nest inside it
+        );
+        ns.status_left = old.status_left.clone();
+        ns.status_right = old.status_right.clone();
+        carry_tabs(&mut ns, old);
+        preserve_interactive(&mut ns, old);
+        ns.chat.adopt(&old.chat);
+        if !ns.any_action_open() {
+            ns.focus_action = false;
+        }
+        ns.redraw();
+        *slot = Some(ns);
+    });
+}
+
 fn init_from(screen: Screen) {
     // Brand splash first (logo + wordmark), held briefly, then the live UI.
     if screen.layout.splash {
@@ -4404,14 +4790,19 @@ pub fn cursor_move_here() {
     });
 }
 
-/// True if `(x, y)` is on the action-pane `[x]` close button (and it's shown).
-pub fn hit_close(x: u64, y: u64) -> bool {
+/// The action column whose `[x]` close button is under `(x, y)`, if any.
+///
+/// Returns the column index rather than a bool so a click on a **non-focused**
+/// column's `[x]` closes that column's tab: testing only the focused column's
+/// button meant the other columns' `[x]` were painted but dead.
+pub fn close_hit_pane(x: u64, y: u64) -> Option<usize> {
     SCREEN.with(|slot| {
-        slot.as_ref().is_some_and(|sc| {
-            if sc.right == RightMode::Closed {
+        let sc = slot.as_ref()?;
+        (0..sc.actions.len()).find(|&i| {
+            if sc.actions[i].is_empty() || !sc.column_visible(i) {
                 return false;
             }
-            let (bx, by, bw, bh) = sc.close_btn();
+            let (bx, by, bw, bh) = sc.close_btn_for(i);
             x >= bx && x < bx + bw && y >= by && y < by + bh
         })
     })
@@ -4422,10 +4813,8 @@ pub fn hit_close(x: u64, y: u64) -> bool {
 pub fn editor_pane_geom() -> Option<(u64, u64, u64, u64, u64, u64)> {
     SCREEN.with(|slot| {
         slot.as_ref().and_then(|sc| {
-            if sc.right != RightMode::Editor {
-                return None;
-            }
-            Some((sc.logs.ix, sc.logs.iy, sc.logs.cw, sc.logs.ch, sc.logs.cols, sc.logs.rows.saturating_sub(1)))
+            let d = sc.mode_dims(RightMode::Editor)?;
+            Some((d.ix, d.iy, d.cw, d.ch, d.cols, d.rows.saturating_sub(1)))
         })
     })
 }
@@ -4479,16 +4868,20 @@ pub fn blink(now_ms: u64) {
 pub fn log_print(s: &str) {
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
-            if sc.right != RightMode::Ktrace {
-                return; // action pane closed or owned by the editor; ktrace still hits serial
+            // Write into whichever action column currently shows ktrace.
+            let Some((pi, _)) = sc.find_mode(RightMode::Ktrace) else {
+                return;
+            };
+            if sc.actions[pi].right() != RightMode::Ktrace {
+                return;
             }
             sc.cursor_restore();
             sc.cur_vis = false;
-            let mut logs = core::mem::replace(&mut sc.logs, dummy_pane());
+            let mut logs = core::mem::replace(&mut sc.actions[pi].pane, dummy_pane());
             for &b in s.as_bytes() {
                 Screen::pane_putc(sc, &mut logs, b);
             }
-            sc.logs = logs;
+            sc.actions[pi].pane = logs;
             sc.cursor_overlay();
         }
     });
@@ -4515,9 +4908,13 @@ fn dummy_pane() -> Pane {
 pub fn editor_dims() -> Option<(usize, usize)> {
     SCREEN.with(|slot| {
         slot.as_ref().map(|sc| {
-            let cols = sc.logs.cols as usize;
-            let rows = (sc.logs.rows.saturating_sub(1)).max(1) as usize;
-            (cols, rows)
+            // The editor's own column when its tab is up (it may not be the
+            // focused one), else the focused column for a not-yet-opened editor.
+            let (cols, rows) = match sc.mode_dims(RightMode::Editor) {
+                Some(d) => (d.cols, d.rows),
+                None => (sc.logs().cols, sc.logs().rows),
+            };
+            (cols as usize, (rows.saturating_sub(1)).max(1) as usize)
         })
     })
 }
@@ -4542,75 +4939,144 @@ fn preserve_interactive(ns: &mut Screen, old: &Screen) {
     ns.blink_seen_ms = old.blink_seen_ms;
 }
 
-/// Rebuild the screen for a new split/right-mode, preserving geometry, layout
-/// config, status text, interactive state, and — via [`Pane::adopt`] — the pane
-/// text content.
-fn rebuilt(old: &Screen, split: bool, right: RightMode) -> Screen {
+/// Carry the action columns' tabs, active index, and pane text from `old` into a
+/// freshly-built `ns`, column by column.
+///
+/// When the new layout has **fewer** columns (`/pane max` shrank the budget) the
+/// dropped columns' tabs are appended to the last surviving column rather than
+/// discarded: a tab is a live process (a package-UI agent, a streaming ktrace, a
+/// playing audio track), so dropping the list would leak the task and leave no
+/// way to reach or close it.
+fn carry_tabs(ns: &mut Screen, old: &Screen) {
+    let n = ns.actions.len().min(old.actions.len());
+    for i in 0..n {
+        ns.actions[i].tabs = old.actions[i].tabs.clone();
+        ns.actions[i].active = old.actions[i].active.min(ns.actions[i].tabs.len().saturating_sub(1));
+        ns.actions[i].pane.adopt(&old.actions[i].pane);
+    }
+    if old.actions.len() > n && n > 0 {
+        let last = n - 1;
+        for i in n..old.actions.len() {
+            for &m in &old.actions[i].tabs {
+                if !ns.actions[last].tabs.contains(&m) {
+                    ns.actions[last].tabs.push(m);
+                }
+            }
+        }
+        let len = ns.actions[last].tabs.len();
+        ns.actions[last].active = ns.actions[last].active.min(len.saturating_sub(1));
+    }
+    ns.focused_action = old.focused_action.min(ns.actions.len().saturating_sub(1));
+}
+
+/// Rebuild geometry for a new split state, preserving layout config, status,
+/// interactive state, action tabs, and pane text via [`Pane::adopt`].
+fn rebuilt(old: &Screen, split: bool) -> Screen {
     let mut ns = Screen::build(
-        old.addr, old.width, old.height, old.pitch, old.bpp_bytes, old.r_shift, old.g_shift, old.b_shift, &old.layout, split,
+        // `fb_w`/`fb_h`, never `width`/`height` — those are the logical desktop,
+        // and feeding them back in would shrink the viewport on every rebuild.
+        old.addr, old.fb_w, old.fb_h, old.pitch, old.bpp_bytes, old.r_shift, old.g_shift, old.b_shift, &old.layout, split,
+        old.focused_action,
+        old.logical_pref,
     );
     ns.status_left = old.status_left.clone();
     ns.status_right = old.status_right.clone();
-    ns.right = right;
-    ns.tabs = old.tabs.clone();
-    ns.active = old.active;
-    ns.right_before_editor = old.right_before_editor;
+    carry_tabs(&mut ns, old);
     preserve_interactive(&mut ns, old);
-    // No action pane → keyboard focus is always the chat/composer.
-    if right == RightMode::Closed {
+    if !ns.any_action_open() {
         ns.focus_action = false;
     }
     ns.chat.adopt(&old.chat);
-    ns.logs.adopt(&old.logs);
     ns
 }
 
-/// The current (active tab's) action-pane mode.
+/// The current (focused action column's active tab) mode.
 pub fn right_mode() -> RightMode {
-    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.right).unwrap_or(RightMode::Closed))
+    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.right()).unwrap_or(RightMode::Closed))
 }
 
-/// The open tab modes, in bar order (for the shell to know what's open).
+/// Index of the focused action column (0-based).
+pub fn focused_action_index() -> usize {
+    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.focused_action).unwrap_or(0))
+}
+
+/// Number of action columns currently laid out.
+pub fn action_column_count() -> usize {
+    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.actions.len()).unwrap_or(1))
+}
+
+/// The active tab mode of every **visible** action pane, in grid order.
+///
+/// A relayout (divider drag, grid reshape, tab move) repaints all the frames but
+/// not the tab *interiors*, which each view owns. With more than one pane showing
+/// content, the caller has to re-present every one of them — repainting only the
+/// focused pane leaves the others blank until they happen to tick.
+pub fn visible_tab_modes() -> Vec<RightMode> {
+    SCREEN.with(|slot| {
+        let Some(sc) = slot.as_ref() else { return Vec::new() };
+        (0..sc.actions.len())
+            .filter(|&i| sc.column_visible(i))
+            .map(|i| sc.actions[i].right())
+            .filter(|&m| m != RightMode::Closed)
+            .collect()
+    })
+}
+
+/// The open tab modes on the **focused** action column, in bar order.
 pub fn tab_modes() -> Vec<RightMode> {
-    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.tabs.clone()).unwrap_or_default())
+    SCREEN.with(|slot| {
+        slot.as_ref()
+            .map(|sc| sc.focused_slot().tabs.clone())
+            .unwrap_or_default()
+    })
 }
 
-/// True if a tab of `mode` is currently open.
+/// True if a tab of `mode` is open on **any** action column.
 pub fn has_tab(mode: RightMode) -> bool {
-    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.tabs.contains(&mode)).unwrap_or(false))
+    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.find_mode(mode).is_some()).unwrap_or(false))
 }
 
-/// Open a tab for `mode`, or select it if already open. First tab opens the
-/// split; additional tabs reuse the geometry (every other tab stays alive).
-/// Operates on the slot directly so surface/editor openers can reuse it without
-/// re-entering `SCREEN.with`.
+/// Open `mode` on the focused action column (or select it if already open
+/// anywhere — focuses that column). First tab on a collapsed band opens the split.
 fn open_view_slot(slot: &mut Option<Screen>, mode: RightMode) {
     let Some(old) = slot else { return };
-    if let Some(i) = old.tabs.iter().position(|&m| m == mode) {
-        old.active = i;
-        old.right = mode;
-        old.repaint_action(); // geometry unchanged → action pane only
+    // NB: opening a view must **not** move keyboard focus to the action pane.
+    // The user typed a command at the composer and is still typing there — see
+    // `action_focused`, where every mode but the editor leaves focus on the chat
+    // deliberately. Setting `focus_action` here made the *next* command go to the
+    // pane instead of the prompt, which reads as the shell having frozen. Focus
+    // moves only on an explicit act: clicking a pane, `/pane focus`, Ctrl+Tab.
+    //
+    // Already open somewhere → select that pane's tab (and make it the open
+    // target for the next view) without taking focus.
+    if let Some((pi, ti)) = old.find_mode(mode) {
+        old.focused_action = pi;
+        old.actions[pi].active = ti;
+        old.repaint_action();
         return;
     }
-    if old.tabs.is_empty() {
-        // First tab: the chat pane resizes, so a full relayout + redraw.
-        let mut ns = rebuilt(old, true, mode);
-        ns.tabs = alloc::vec![mode];
-        ns.active = 0;
-        ns.right = mode;
+    let fi = old.focused_action.min(old.actions.len().saturating_sub(1));
+    // Only a lone action pane collapses, so only it needs a full relayout when
+    // its first tab opens; a multi-pane grid is already on screen.
+    let need_relayout = !old.any_action_open() && old.actions.len() == 1;
+    if need_relayout || old.actions.is_empty() {
+        let mut ns = rebuilt(old, true);
+        let fi = ns.focused_action.min(ns.actions.len().saturating_sub(1));
+        ns.actions[fi].tabs = alloc::vec![mode];
+        ns.actions[fi].active = 0;
+        ns.focused_action = fi;
         ns.redraw();
         *slot = Some(ns);
-    } else {
-        // Additional tab: geometry is unchanged; append + select + repaint just
-        // the action pane (no whole-screen redraw → no flicker).
-        old.tabs.push(mode);
-        old.active = old.tabs.len() - 1;
-        old.right = mode;
-        old.repaint_action();
+        return;
     }
+    // Additional tab on the focused pane (geometry unchanged).
+    let a = &mut old.actions[fi];
+    a.tabs.push(mode);
+    a.active = a.tabs.len() - 1;
+    old.repaint_action();
 }
 
-/// Open (or focus) a tab for `mode`. `Closed` is a no-op (use `close_action`).
+/// Open (or focus) a tab for `mode` on the focused action column.
 pub fn set_right(mode: RightMode) {
     if mode == RightMode::Closed {
         return;
@@ -4618,83 +5084,258 @@ pub fn set_right(mode: RightMode) {
     SCREEN.with(|slot| open_view_slot(slot, mode));
 }
 
-/// Cycle to the next/previous tab, returning the newly active mode. Keeps every
-/// tab's state — the switch only changes which one paints into the pane.
+/// Cycle tabs on the focused action column.
 pub fn cycle_tab(forward: bool) -> RightMode {
     SCREEN.with(|slot| {
         let Some(old) = slot else { return RightMode::Closed };
-        let n = old.tabs.len();
+        let fi = old.focused_action.min(old.actions.len().saturating_sub(1));
+        let n = old.actions[fi].tabs.len();
         if n <= 1 {
-            return old.right;
+            return old.right();
         }
-        old.active = if forward { (old.active + 1) % n } else { (old.active + n - 1) % n };
-        old.right = old.tabs[old.active];
+        let a = &mut old.actions[fi];
+        a.active = if forward {
+            (a.active + 1) % n
+        } else {
+            (a.active + n - 1) % n
+        };
         old.repaint_action();
-        old.right
+        old.right()
     })
 }
 
-/// Select tab `i` (clamped), returning the active mode.
+/// Select tab `i` on the focused action column.
 pub fn select_tab(i: usize) -> RightMode {
     SCREEN.with(|slot| {
         let Some(old) = slot else { return RightMode::Closed };
-        if i >= old.tabs.len() {
-            return old.right;
+        let fi = old.focused_action.min(old.actions.len().saturating_sub(1));
+        if i >= old.actions[fi].tabs.len() {
+            return old.right();
         }
-        old.active = i;
-        old.right = old.tabs[i];
+        old.actions[fi].active = i;
         old.repaint_action();
-        old.right
+        old.right()
     })
 }
 
-/// The tab index under pixel `(x, y)`, if the click hit the tab bar.
+/// The tab index under pixel `(x, y)` on the **focused** action column's bar.
 pub fn tab_hit(x: u64, y: u64) -> Option<usize> {
     SCREEN.with(|slot| {
-        slot.as_ref().and_then(|sc| {
-            if sc.tabs.is_empty() {
-                return None;
-            }
-            let ty = sc.logs.y + BORDER + 4;
-            if y < ty || y >= ty + sc.ch() {
-                return None;
-            }
-            sc.tab_layout().into_iter().position(|(_, tx, w)| x >= tx && x < tx + w)
-        })
+        let sc = slot.as_ref()?;
+        tab_hit_in(sc, sc.focused_action, x, y)
     })
 }
 
-/// Close the tab of `mode` if open (used by `editor_leave`, `/ktrace` toggle).
+/// The tab index under `(x, y)` on action column `pane_i`'s bar.
+pub fn tab_hit_in_pane(pane_i: usize, x: u64, y: u64) -> Option<usize> {
+    SCREEN.with(|slot| {
+        let sc = slot.as_ref()?;
+        tab_hit_in(sc, pane_i, x, y)
+    })
+}
+
+fn tab_hit_in(sc: &Screen, pane_i: usize, x: u64, y: u64) -> Option<usize> {
+    let a = sc.actions.get(pane_i)?;
+    if a.tabs.is_empty() || a.pane.w == 0 {
+        return None;
+    }
+    let ty = a.pane.y + BORDER + 4;
+    if y < ty || y >= ty + sc.ch() {
+        return None;
+    }
+    sc.tab_layout_for(pane_i)
+        .into_iter()
+        .position(|(_, tx, w)| x >= tx && x < tx + w)
+}
+
+/// Where a dragged tab dropped at `(x, y)` should be inserted in column
+/// `pane_i`: before the tab under the cursor if the drop landed on the tab bar,
+/// otherwise at the end (a drop anywhere in the body appends).
+pub fn drop_index_in_pane(pane_i: usize, x: u64, y: u64) -> usize {
+    SCREEN.with(|slot| {
+        let Some(sc) = slot.as_ref() else { return 0 };
+        let len = sc.actions.get(pane_i).map(|a| a.tabs.len()).unwrap_or(0);
+        tab_hit_in(sc, pane_i, x, y).unwrap_or(len)
+    })
+}
+
+/// Which action column contains `(x,y)`, if any.
+pub fn action_pane_at(x: u64, y: u64) -> Option<usize> {
+    SCREEN.with(|slot| {
+        let sc = slot.as_ref()?;
+        for (i, a) in sc.actions.iter().enumerate() {
+            if a.pane.w == 0 {
+                continue;
+            }
+            if x >= a.pane.x
+                && x < a.pane.x + a.pane.w
+                && y >= a.pane.y
+                && y < a.pane.y + a.pane.h
+            {
+                return Some(i);
+            }
+        }
+        None
+    })
+}
+
+/// Focus action column `i` (for click / drop).
+pub fn focus_action_column(i: usize) {
+    SCREEN.with(|slot| {
+        let Some(sc) = slot else { return };
+        if i >= sc.actions.len() || !sc.column_visible(i) {
+            return;
+        }
+        let was = (sc.focused_action, sc.focus_action);
+        sc.focused_action = i;
+        sc.focus_action = true;
+        if was == (i, true) {
+            return; // already the selected pane
+        }
+        // Repaint here rather than leaving it to `focus_set`: this function has
+        // already moved focus onto the action side, so `focus_set(true)` would
+        // see no flip and draw nothing — which is exactly why clicking a pane
+        // used to change the selection invisibly.
+        sc.cursor_restore();
+        sc.cur_vis = false;
+        sc.draw_frame(&sc.chat, !sc.action_focused());
+        // Every visible pane's frame carries the selection state, so the pane
+        // losing focus must be redrawn too, not just the one gaining it.
+        for j in 0..sc.actions.len() {
+            if !sc.column_visible(j) {
+                continue;
+            }
+            let active = sc.focus_action && j == sc.focused_action;
+            sc.draw_frame_titled(&sc.actions[j].pane, active, "");
+            sc.draw_tab_bar_for(j);
+            sc.draw_close_btn_for(j);
+        }
+        if sc.chat.has_composer {
+            sc.draw_composer();
+        }
+        sc.cursor_overlay();
+    });
+}
+
+/// Move keyboard focus to the next/previous action pane (grid order), returning
+/// the newly focused index. Skips parked panes.
+pub fn focus_cycle_column(forward: bool) -> usize {
+    // Pick the target inside the lock, then repaint outside it —
+    // `focus_action_column` takes `SCREEN` itself and re-entering would deadlock.
+    let target = SCREEN.with(|slot| {
+        let Some(sc) = slot.as_ref() else { return 0 };
+        let visible: Vec<usize> =
+            (0..sc.actions.len()).filter(|&i| sc.column_visible(i)).collect();
+        if visible.len() < 2 {
+            return sc.focused_action;
+        }
+        let at = visible.iter().position(|&i| i == sc.focused_action).unwrap_or(0);
+        let next = if forward {
+            (at + 1) % visible.len()
+        } else {
+            (at + visible.len() - 1) % visible.len()
+        };
+        visible[next]
+    });
+    focus_action_column(target);
+    target
+}
+
+/// Move a tab from one action column to another (drag-drop). Pure list surgery
+/// on the live screen. Returns false if the move is invalid.
+pub fn move_tab_between(from_pane: usize, from_idx: usize, to_pane: usize, to_idx: usize) -> bool {
+    SCREEN.with(|slot| {
+        let Some(sc) = slot else { return false };
+        if from_pane >= sc.actions.len() || to_pane >= sc.actions.len() {
+            return false;
+        }
+        if from_idx >= sc.actions[from_pane].tabs.len() {
+            return false;
+        }
+        let mode = sc.actions[from_pane].tabs.remove(from_idx);
+        // Fix active on source.
+        if sc.actions[from_pane].active >= sc.actions[from_pane].tabs.len()
+            && !sc.actions[from_pane].tabs.is_empty()
+        {
+            sc.actions[from_pane].active = sc.actions[from_pane].tabs.len() - 1;
+        }
+        let insert = crate::panes_layout::insert_index(
+            from_pane,
+            from_idx,
+            to_pane,
+            sc.actions[to_pane].tabs.len(),
+            to_idx,
+        );
+        sc.actions[to_pane].tabs.insert(insert, mode);
+        sc.actions[to_pane].active = insert;
+        sc.focused_action = to_pane;
+        sc.focus_action = true;
+        true
+    })
+}
+
+/// Highlight action column `target` as the live drop target during a tab drag
+/// (accent frame), clearing any previously highlighted column.
+///
+/// Only repaints the two frames that changed, and only when the target actually
+/// moved — a mouse drag fires on every pointer report, so repainting the band
+/// each time would flicker the whole action band while dragging.
+pub fn highlight_drop_target(target: Option<usize>) {
+    SCREEN.with(|slot| {
+        let Some(sc) = slot else { return };
+        if sc.drop_target == target {
+            return;
+        }
+        let prev = sc.drop_target;
+        sc.drop_target = target;
+        sc.cursor_restore();
+        for i in prev.into_iter().chain(target) {
+            if !sc.column_visible(i) {
+                continue;
+            }
+            let active = Some(i) == target || (sc.focus_action && i == sc.focused_action);
+            sc.draw_frame_titled(&sc.actions[i].pane, active, "");
+            sc.draw_tab_bar_for(i);
+            sc.draw_close_btn_for(i);
+        }
+        sc.cursor_overlay();
+    });
+}
+
+/// Close the tab of `mode` if open (any column).
 pub fn close_tab_mode(mode: RightMode) {
     SCREEN.with(|slot| {
         let Some(old) = slot else { return };
-        if let Some(i) = old.tabs.iter().position(|&m| m == mode) {
-            old.active = i;
+        if let Some((pi, ti)) = old.find_mode(mode) {
+            old.focused_action = pi;
+            old.actions[pi].active = ti;
             close_active_slot(slot);
         }
     });
 }
 
-/// Close the active tab. If it was the last, collapse the split.
+/// Close the active tab of the focused action column.
 fn close_active_slot(slot: &mut Option<Screen>) {
     let Some(old) = slot else { return };
-    if old.tabs.is_empty() {
+    let fi = old.focused_action.min(old.actions.len().saturating_sub(1));
+    if old.actions[fi].tabs.is_empty() {
         return;
     }
-    old.tabs.remove(old.active);
-    if old.tabs.is_empty() {
-        let mut ns = rebuilt(old, false, RightMode::Closed);
-        ns.tabs.clear();
-        ns.active = 0;
-        ns.right = RightMode::Closed;
+    let ai = old.actions[fi].active.min(old.actions[fi].tabs.len() - 1);
+    old.actions[fi].tabs.remove(ai);
+    if old.actions[fi].active >= old.actions[fi].tabs.len()
+        && !old.actions[fi].tabs.is_empty()
+    {
+        old.actions[fi].active = old.actions[fi].tabs.len() - 1;
+    }
+    let any = old.any_action_open();
+    // A lone action pane collapses the band when its last tab closes (the classic
+    // two-pane behaviour); a grid keeps its now-empty pane as a drop target.
+    if !any && old.actions.len() == 1 {
+        let ns = rebuilt(old, false);
         ns.redraw();
         *slot = Some(ns);
     } else {
-        // Other tabs remain → geometry unchanged; repaint just the action pane.
-        if old.active >= old.tabs.len() {
-            old.active = old.tabs.len() - 1;
-        }
-        old.right = old.tabs[old.active];
         old.repaint_action();
     }
 }
@@ -4762,7 +5403,7 @@ pub fn surface_hud_reserve(hud: &str) -> u64 {
 fn surface_hud_height(hud: &str) -> u64 {
     SCREEN.with(|slot| {
         let Some(sc) = slot.as_ref() else { return 0 };
-        let cols = (sc.logs.cols.saturating_sub(2)).max(4) as usize;
+        let cols = (sc.logs().cols.saturating_sub(2)).max(4) as usize; // focused column's width
         hud_strip_height(hud, sc.ch(), cols)
     })
 }
@@ -4815,17 +5456,17 @@ fn wrapped_hint_lines(hud: &str, cols: usize) -> u64 {
 fn draw_surface_hud(id: u32, hud: &str, barh: u64) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
-        if sc.right != RightMode::Surface(id) {
+        let Some(d) = sc.mode_dims(RightMode::Surface(id)) else {
             return;
-        }
+        };
         sc.cursor_restore();
         sc.cur_vis = false;
         let ch = sc.ch();
         let cw = sc.cw();
-        let (px, py) = (sc.logs.ix, sc.logs.iy);
-        let (pw, ph) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
+        let (px, py) = (d.ix, d.iy);
+        let (pw, ph) = (d.iw, d.ih);
         let by = py + ph.saturating_sub(barh);
-        let bg = sc.logs.bg;
+        let bg = d.bg;
         sc.fill_rect(px, by, pw, barh, bg);
         sc.fill_rect(px, by, pw, 1, sc.theme.accent); // top hairline
         let cols = (pw / cw).saturating_sub(2).max(4) as usize;
@@ -4927,28 +5568,31 @@ pub fn present_surface_reserve_ex(
     remember_surf_reserve(id, reserve_bottom);
     SCREEN.with(|slot| {
         // Open the surface tab only when it is not already among open tabs
-        // (first present). If the tab exists but another tab is focused, do
-        // **not** steal focus — package-UI ticks used to re-select the canvas
-        // every ~180 ms and undo Ctrl+W / tab switches.
+        // (first present → focused action column). If the tab exists but that
+        // column is not showing it, do **not** steal focus.
         let mode = RightMode::Surface(id);
-        let (is_active, is_open) = slot.as_ref().map(|sc| {
-            (sc.right == mode, sc.tabs.iter().any(|&m| m == mode))
-        }).unwrap_or((false, false));
-        if !is_open {
+        let found = slot.as_ref().and_then(|sc| sc.find_mode(mode));
+        if found.is_none() {
             open_view_slot(slot, mode);
-        } else if !is_active {
-            // Backing buffer is already updated by the caller; leave the FB alone.
-            return;
         }
         let Some(sc) = slot else { return };
-        if sc.right != mode || logical_sw == 0 || logical_sh == 0 || buf_w == 0 || buf_h == 0
-        {
+        let Some((pi, ti)) = sc.find_mode(mode) else {
+            return;
+        };
+        // Not the active tab of its column → skip FB blit (backing already updated).
+        if sc.actions[pi].active != ti {
+            return;
+        }
+        if logical_sw == 0 || logical_sh == 0 || buf_w == 0 || buf_h == 0 {
             return;
         }
         sc.cursor_restore();
         sc.cur_vis = false;
-        let (px, py) = (sc.logs.ix, sc.logs.iy);
-        let (pw, ph_full) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
+        let (px, py) = (sc.actions[pi].pane.ix, sc.actions[pi].pane.iy);
+        let (pw, ph_full) = (
+            sc.actions[pi].pane.cols * sc.actions[pi].pane.cw,
+            sc.actions[pi].pane.rows * sc.actions[pi].pane.ch,
+        );
         // Usable frame height excludes the reserved HUD strip at the bottom.
         let ph = ph_full.saturating_sub(reserve_bottom);
         if pw == 0 || ph == 0 || buf.len() < buf_w * buf_h {
@@ -4966,7 +5610,7 @@ pub fn present_surface_reserve_ex(
         // FB for tens of ms every present — visible as a once-per-second
         // (or every-frame) flicker. Only paint letterbox *margins*; the frame
         // blit overwrites the content rectangle in place.
-        let bg = sc.logs.bg;
+        let bg = sc.actions[pi].pane.bg;
         if oy > py {
             sc.fill_rect(px, py, pw, oy - py, bg); // top bar
         }
@@ -5008,8 +5652,26 @@ pub fn video_hud_height() -> u64 {
 pub fn action_dims_px() -> Option<(u64, u64)> {
     SCREEN.with(|slot| {
         slot.as_ref().and_then(|sc| {
-            (sc.right != RightMode::Closed).then(|| (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch))
+            (sc.right() != RightMode::Closed).then(|| (sc.logs().cols * sc.logs().cw, sc.logs().rows * sc.logs().ch))
         })
+    })
+}
+
+/// Interior pixel dims of the column that owns surface `id`, falling back to the
+/// focused column when the surface has no tab yet (first present).
+///
+/// A surface's content must be laid out for the column it is actually blitted
+/// into — using the focused column's width would render a browser page or a
+/// package-UI canvas at the wrong scale as soon as its tab lived elsewhere.
+pub fn surface_dims_px(id: u32) -> Option<(u64, u64)> {
+    SCREEN.with(|slot| {
+        let sc = slot.as_ref()?;
+        let i = sc
+            .find_mode(RightMode::Surface(id))
+            .map(|(pi, _)| pi)
+            .unwrap_or(sc.focused_action);
+        let p = &sc.actions.get(i)?.pane;
+        (p.w > 0).then(|| (p.cols * p.cw, p.rows * p.ch))
     })
 }
 
@@ -5019,7 +5681,7 @@ pub fn action_dims_px() -> Option<(u64, u64)> {
 pub fn pane_bg() -> Option<u32> {
     SCREEN.with(|slot| {
         slot.as_ref().map(|sc| {
-            let (r, g, b) = sc.logs.bg;
+            let (r, g, b) = sc.logs().bg;
             ((r as u32) << 16) | ((g as u32) << 8) | b as u32
         })
     })
@@ -5057,14 +5719,15 @@ pub struct TodoViewItem<'a> {
 pub fn draw_todos(items: &[TodoViewItem<'_>], title: &str) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
-        if sc.right != RightMode::Todos {
+        let Some(d) = sc.mode_dims(RightMode::Todos) else {
             return;
-        }
+        };
         sc.cursor_restore();
         sc.cur_vis = false;
         let ch = sc.ch();
-        let (px, iy, iw) = (sc.logs.ix, sc.logs.iy, sc.logs.cols * sc.logs.cw);
-        let bg = sc.logs.bg;
+        let (px, iy, iw) = (d.ix, d.iy, d.iw);
+        let bg = d.bg;
+        let rows = d.rows;
         let cols = (iw / sc.cw()).max(1) as usize;
         let mut y = iy;
         let head = if title.is_empty() { "Todos" } else { title };
@@ -5091,12 +5754,12 @@ pub fn draw_todos(items: &[TodoViewItem<'_>], title: &str) {
             };
             sc.draw_str_bg(px, y, &pad_trunc(&row, cols), fg, bg);
             y += ch;
-            if y + ch > iy + sc.logs.rows * ch {
+            if y + ch > iy + rows * ch {
                 break;
             }
         }
         let blank = pad_trunc("", cols);
-        while y + ch <= iy + sc.logs.rows * ch {
+        while y + ch <= iy + rows * ch {
             sc.draw_str_bg(px, y, &blank, bg, bg);
             y += ch;
         }
@@ -5146,12 +5809,16 @@ pub fn editor_render(
 ) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
+        // Paint into the column that holds the editor tab, not the focused one.
+        let Some(ei) = sc.mode_column(RightMode::Editor) else {
+            return;
+        };
+        let d = PaneDims::of(&sc.actions[ei].pane);
         sc.cursor_restore();
         sc.cur_vis = false;
-        let (px, pw, cw, ch, cols, rows) =
-            (sc.logs.x, sc.logs.w, sc.logs.cw, sc.logs.ch, sc.logs.cols, sc.logs.rows);
-        let (ix, iy) = (sc.logs.ix, sc.logs.iy);
-        sc.draw_frame_titled(&sc.logs, true, title);
+        let (px, pw, cw, ch, cols, rows) = (d.x, d.w, d.cw, d.ch, d.cols, d.rows);
+        let (ix, iy) = (d.ix, d.iy);
+        sc.draw_frame_titled(&sc.actions[ei].pane, true, title);
         // Clear the interior to the editor background — wallpaper-aware so the
         // translucent desktop shows behind the editor too (glyphs blend via
         // `blit_glyph`/`bg_at`).
@@ -5244,24 +5911,30 @@ pub fn editor_render(
 pub fn relayout(cfg: &LayoutCfg) {
     SCREEN.with(|slot| {
         if let Some(old) = slot {
-            let (sl, sr) = (old.status_left.clone(), old.status_right.clone());
-            let mode = old.right;
+            let any = old.any_action_open();
+            let band = crate::panes_layout::action_band_visible(cfg.max_panes, any);
             let mut ns = Screen::build(
-                old.addr, old.width, old.height, old.pitch, old.bpp_bytes, old.r_shift, old.g_shift, old.b_shift, cfg,
-                mode != RightMode::Closed,
+                old.addr,
+                old.fb_w,
+                old.fb_h,
+                old.pitch,
+                old.bpp_bytes,
+                old.r_shift,
+                old.g_shift,
+                old.b_shift,
+                cfg,
+                band,
+                old.focused_action,
+                old.logical_pref,
             );
-            ns.status_left = sl;
-            ns.status_right = sr;
-            ns.right = mode;
-            ns.tabs = old.tabs.clone();
-            ns.active = old.active;
-            ns.right_before_editor = old.right_before_editor;
+            ns.status_left = old.status_left.clone();
+            ns.status_right = old.status_right.clone();
+            carry_tabs(&mut ns, old);
             preserve_interactive(&mut ns, old);
             ns.chat.adopt(&old.chat);
-            ns.logs.adopt(&old.logs);
             // Fullscreen can park the chat (action-full): keep focus on action.
-            // Chat-full parks the action pane — snap keyboard back to the composer.
-            if cfg.fullscreen == 1 || mode == RightMode::Closed {
+            // Chat-full parks the columns — snap keyboard back to the composer.
+            if cfg.fullscreen == 1 || !ns.any_action_open() {
                 ns.focus_action = false;
             }
             ns.redraw();
@@ -5270,12 +5943,230 @@ pub fn relayout(cfg: &LayoutCfg) {
     });
 }
 
+/// Set total pane count (2..=9, including shell) and relayout.
+///
+/// The grid is reshaped to the most balanced arrangement holding exactly
+/// `n - 1` action panes, with even track weights — a pane-count change is a new
+/// layout, so carrying over the old weights would leave the new grid lopsided.
+pub fn set_max_panes(n: u8) {
+    let n = crate::panes_layout::clamp_max_panes(n as u64);
+    let (cols, rows) = crate::panes_layout::grid_for_count(
+        crate::panes_layout::action_column_count(n),
+    );
+    set_grid_weighted(cols, rows, None);
+}
+
+/// Set the action grid shape explicitly (`/pane grid <cols> <rows>`), clamped to
+/// at most 8 action panes, and sync `max_panes` to the resulting cell count.
+pub fn set_grid(cols: usize, rows: usize) -> (usize, usize) {
+    let (cols, rows) = crate::panes_layout::clamp_grid(cols, rows);
+    set_grid_weighted(cols, rows, None);
+    // Report what was actually applied — the band may not fit the request.
+    grid_shape()
+}
+
+/// Shared tail of the grid setters: clamp the shape to what the band can host,
+/// build the spec (even weights, or the given ones), and relayout.
+///
+/// `max_panes` is **derived** from the shape that survives clamping rather than
+/// passed in, so the pane budget and the grid can never disagree.
+fn set_grid_weighted(cols: usize, rows: usize, weights: Option<(Vec<u64>, Vec<u64>)>) {
+    let cfg = SCREEN.with(|slot| {
+        let sc = slot.as_mut()?;
+        // Clamp to the pixels available: a shape the band cannot host would draw
+        // cells shorter than their own header. Doing it here (not in `build`)
+        // keeps `grid_shape()` — used by the status line and by `panes.json` —
+        // reporting exactly what is on screen.
+        let (bw, bh) = sc.band_capacity();
+        let cols = crate::panes_layout::fit_tracks(bw, GAP, cols, crate::panes_layout::MIN_TRACK_PX);
+        let rows = crate::panes_layout::fit_tracks(bh, GAP, rows, sc.min_pane_h());
+        let (cols, rows) = crate::panes_layout::clamp_grid(cols, rows);
+        let mut c = sc.layout.clone();
+        c.grid = match weights {
+            Some((col_w, row_h)) => {
+                crate::panes_layout::GridSpec { cols, rows, col_w, row_h }.sanitized()
+            }
+            None => crate::panes_layout::GridSpec::even(cols, rows),
+        };
+        c.max_panes = crate::panes_layout::clamp_max_panes(c.grid.len() as u64 + 1);
+        c.fullscreen = 0;
+        Some(c)
+    });
+    if let Some(c) = cfg {
+        relayout(&c);
+    }
+}
+
+impl Screen {
+    /// Pixel size the action band would have at the current split, whether or not
+    /// it is presently on screen (the grid is sized before the band is opened).
+    fn band_capacity(&self) -> (u64, u64) {
+        let (_, _, _, bw) = crate::panes_layout::split_band(
+            self.width,
+            OUTER,
+            GAP,
+            self.layout.chat_pct.clamp(10, 90),
+            true,
+            self.layout.swap,
+        );
+        let status_h = self.ch() + 8;
+        let bh = self
+            .height
+            .saturating_sub(status_h)
+            .saturating_sub(2 * OUTER);
+        (bw, bh)
+    }
+
+    /// Smallest usable pane height: its title header plus one text row of
+    /// padded interior. Scale-derived, so it is right at any font size.
+    fn min_pane_h(&self) -> u64 {
+        let ch = self.ch();
+        // Mirrors `Pane::new`'s header_h + the interior's bottom border/padding.
+        (BORDER + 4 + ch + 6) + BORDER + PAD + ch
+    }
+}
+
+/// Set the font scale (`0` = automatic from the desktop height) and relayout.
+///
+/// The knob that actually makes a high-resolution screen readable: cells are
+/// `8*scale` x `16*scale` pixels, so this changes how much fits on screen and how
+/// big the text is — unlike a smaller desktop, which only letterboxes. Returns the
+/// scale now in effect.
+pub fn set_font_scale(scale: u64) -> Option<u64> {
+    let n = crate::display::clamp_font_scale(scale);
+    let cfg = SCREEN.with(|slot| {
+        slot.as_mut().map(|sc| {
+            let mut c = sc.layout.clone();
+            c.scale = n; // 0 → `pick_scale` recomputes from the desktop height
+            c
+        })
+    })?;
+    relayout(&cfg);
+    effective_font_scale()
+}
+
+/// The font scale currently rendering (never 0 — the resolved value).
+pub fn effective_font_scale() -> Option<u64> {
+    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.scale))
+}
+
+/// The **pinned** font scale (`0` = automatic), i.e. the setting rather than the
+/// resolved value. `None` before the console is up.
+///
+/// `ui_config::layout_cfg` carries this through so a `/theme` apply can't reset a
+/// `/display scale` back to ui.json's value — the same live-value trap that
+/// `max_panes` and the pane grid already have to avoid.
+pub fn pinned_font_scale() -> Option<u64> {
+    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.layout.scale))
+}
+
+/// The **physical** framebuffer size the firmware gave us — the panel, whatever
+/// the desktop is currently set to.
+pub fn physical_size() -> Option<(u32, u32)> {
+    SCREEN.with(|slot| slot.as_ref().map(|sc| (sc.fb_w as u32, sc.fb_h as u32)))
+}
+
+/// The current **logical** desktop size (what layouts are computed against).
+pub fn logical_size() -> Option<(u32, u32)> {
+    SCREEN.with(|slot| slot.as_ref().map(|sc| (sc.width as u32, sc.height as u32)))
+}
+
+/// Whether the desktop is a letterboxed viewport rather than the whole panel.
+pub fn is_letterboxed() -> bool {
+    SCREEN
+        .with(|slot| {
+            slot.as_ref()
+                .map(|sc| sc.width != sc.fb_w || sc.height != sc.fb_h)
+        })
+        .unwrap_or(false)
+}
+
+/// Set the logical desktop size, applying immediately. `None` = native (use the
+/// whole framebuffer).
+///
+/// Rebuilds the whole screen: every pane's cell grid depends on the desktop size,
+/// so this reflows scrollback exactly as a font-scale change does. Returns the
+/// size actually applied (clamped to the framebuffer), or `None` if the console
+/// isn't up.
+pub fn set_logical_size(want: Option<(u32, u32)>) -> Option<(u32, u32)> {
+    let applied = SCREEN.with(|slot| {
+        let old = slot.as_mut()?;
+        let pref = want.map(|(w, h)| {
+            let (w, h) = crate::display::clamp_logical((old.fb_w as u32, old.fb_h as u32), (w, h));
+            (w as u64, h as u64)
+        });
+        if pref == old.logical_pref {
+            return Some((old.width as u32, old.height as u32)); // already there
+        }
+        old.logical_pref = pref;
+        // Rebuild at the current split so the action band's open/closed state and
+        // every tab survive the resolution change.
+        let split = old.any_action_open() || old.actions.len() > 1;
+        let mut ns = rebuilt(old, split);
+        // The desktop shrank or moved: clear the *whole* panel once, or the old
+        // desktop's pixels stay lit outside the new viewport.
+        ns.fill_phys(0, 0, ns.fb_w, ns.fb_h, (0, 0, 0));
+        ns.redraw();
+        let got = (ns.width as u32, ns.height as u32);
+        *slot = Some(ns);
+        Some(got)
+    })?;
+    Some(applied)
+}
+
+/// The logical desktop sizes selectable on this framebuffer (native first).
+pub fn available_modes() -> Vec<(u32, u32)> {
+    match physical_size() {
+        Some(p) => crate::display::modes_for(p),
+        None => Vec::new(),
+    }
+}
+
+/// The action grid's current shape `(cols, rows)`.
+pub fn grid_shape() -> (usize, usize) {
+    SCREEN.with(|slot| {
+        slot.as_ref()
+            .map(|sc| {
+                let g = sc.layout.grid.sanitized();
+                (g.cols, g.rows)
+            })
+            .unwrap_or((1, 1))
+    })
+}
+
+/// The action grid's track weights `(col_w, row_h)` in permille, for persisting.
+pub fn grid_weights() -> (Vec<u64>, Vec<u64>) {
+    SCREEN.with(|slot| {
+        slot.as_ref()
+            .map(|sc| {
+                let g = sc.layout.grid.sanitized();
+                (g.col_w, g.row_h)
+            })
+            .unwrap_or_else(|| (alloc::vec![1000], alloc::vec![1000]))
+    })
+}
+
+/// Restore a saved grid (shape + weights) from `panes.json` at boot.
+pub fn set_grid_spec(cols: usize, rows: usize, col_w: Vec<u64>, row_h: Vec<u64>) {
+    let (cols, rows) = crate::panes_layout::clamp_grid(cols, rows);
+    set_grid_weighted(cols, rows, Some((col_w, row_h)));
+}
+
+/// Current total pane budget (shell + action columns).
+pub fn max_panes() -> u8 {
+    SCREEN.with(|slot| {
+        slot.as_ref()
+            .map(|sc| crate::panes_layout::clamp_max_panes(sc.layout.max_panes as u64))
+            .unwrap_or(crate::panes_layout::MAX_PANES_DEFAULT)
+    })
+}
+
 /// Toggle fullscreen: maximise the focused pane to fill the screen, or restore
 /// the split. Returns the new state (0 normal, 1 chat-full, 2 action-full).
 pub fn toggle_fullscreen() -> u8 {
     let cfg = SCREEN.with(|slot| {
         slot.as_mut().map(|sc| {
-            let action_open = sc.right != RightMode::Closed;
+            let action_open = sc.right() != RightMode::Closed;
             let mut c = sc.layout.clone();
             c.fullscreen = if c.fullscreen != 0 {
                 0
@@ -5332,58 +6223,189 @@ pub fn nudge_split(delta: i64) {
 /// If `(x,y)` is on the draggable divider between the two panes, return its
 /// current gap centre x (so the caller can enter a resize drag). `None` when
 /// fullscreen/closed (no divider) or the point is elsewhere.
-pub fn divider_hit(x: u64, y: u64) -> Option<u64> {
+pub fn divider_hit(x: u64, y: u64) -> Option<Divider> {
     SCREEN.with(|slot| {
         let sc = slot.as_ref()?;
-        if sc.right == RightMode::Closed || sc.layout.fullscreen != 0 {
+        if sc.layout.fullscreen != 0 {
             return None;
         }
-        // The gap sits between the two pane boxes.
-        let (a, b) = (&sc.chat, &sc.logs);
-        let gap_l = a.x.min(b.x) + if a.x < b.x { a.w } else { b.w };
-        let gap_r = gap_l + GAP;
-        let within_y = y >= a.y && y < a.y + a.h;
-        // Give the divider a few px of grab tolerance either side.
-        if within_y && x + 4 >= gap_l && x <= gap_r + 4 {
-            Some((gap_l + gap_r) / 2)
-        } else {
-            None
-        }
+        sc.divider_at(x, y)
     })
 }
 
-/// Set the split so the divider sits at pixel `x` (from a resize drag).
-pub fn set_divider_x(x: u64) {
-    let pct = SCREEN.with(|slot| {
-        slot.as_ref().map(|sc| {
-            let avail = sc.width.saturating_sub(2 * OUTER + GAP).max(1);
-            // x measured from the content's left edge to the chat width.
-            let chat_w = if sc.layout.swap { (sc.width.saturating_sub(x)).min(avail) } else { x.saturating_sub(OUTER).min(avail) };
-            (chat_w * 100 / avail).clamp(10, 90)
-        })
+impl Screen {
+    /// Which divider (if any) is under `(x, y)`, with a few pixels of grab
+    /// tolerance either side of the gap.
+    ///
+    /// Grid dividers are checked **before** the shell|band one: a grid column
+    /// gap can sit within grab tolerance of the band gap on a narrow screen, and
+    /// the inner divider is the more specific target.
+    fn divider_at(&self, x: u64, y: u64) -> Option<Divider> {
+        let grid = self.layout.grid.sanitized();
+        let (bx, by, bw, bh) = self.band_rect()?;
+        let in_band_y = y + 4 >= by && y <= by + bh + 4;
+        let in_band_x = x + 4 >= bx && x <= bx + bw + 4;
+        if in_band_x && in_band_y {
+            // Vertical dividers between grid columns.
+            let cw = crate::panes_layout::track_sizes(bw, GAP, &grid.col_w);
+            let cx = crate::panes_layout::track_offsets(bw, GAP, &grid.col_w);
+            for i in 0..grid.cols.saturating_sub(1) {
+                let gap_l = bx + cx[i] + cw[i];
+                if x + 4 >= gap_l && x <= gap_l + GAP + 4 {
+                    return Some(Divider::Col(i));
+                }
+            }
+            // Horizontal dividers between grid rows.
+            let rh = crate::panes_layout::track_sizes(bh, GAP, &grid.row_h);
+            let ry = crate::panes_layout::track_offsets(bh, GAP, &grid.row_h);
+            for i in 0..grid.rows.saturating_sub(1) {
+                let gap_t = by + ry[i] + rh[i];
+                if y + 4 >= gap_t && y <= gap_t + GAP + 4 {
+                    return Some(Divider::Row(i));
+                }
+            }
+        }
+        // The shell | action-band divider.
+        if self.chat.w == 0 || bw == 0 {
+            return None; // band collapsed, or a pane parked by fullscreen
+        }
+        let a = &self.chat;
+        let gap_l = a.x.min(bx) + if a.x < bx { a.w } else { bw };
+        let gap_r = gap_l + GAP;
+        if y >= a.y && y < a.y + a.h && x + 4 >= gap_l && x <= gap_r + 4 {
+            return Some(Divider::Band);
+        }
+        None
+    }
+
+    /// The action band's bounding rectangle `(x, y, w, h)` — the union of every
+    /// unparked grid cell. `None` when the whole band is parked.
+    fn band_rect(&self) -> Option<(u64, u64, u64, u64)> {
+        let mut r: Option<(u64, u64, u64, u64)> = None;
+        for a in &self.actions {
+            if a.pane.w == 0 {
+                continue;
+            }
+            let (x0, y0, x1, y1) = (a.pane.x, a.pane.y, a.pane.x + a.pane.w, a.pane.y + a.pane.h);
+            r = Some(match r {
+                None => (x0, y0, x1 - x0, y1 - y0),
+                Some((rx, ry, rw, rh)) => {
+                    let (nx, ny) = (rx.min(x0), ry.min(y0));
+                    let (ex, ey) = ((rx + rw).max(x1), (ry + rh).max(y1));
+                    (nx, ny, ex - nx, ey - ny)
+                }
+            });
+        }
+        r
+    }
+}
+
+/// The kind of divider under the pointer (see [`divider_hit`]).
+pub use crate::panes_layout::Divider;
+
+/// Drag `which` divider to pixel `(x, y)` and relayout.
+///
+/// [`Divider::Band`] moves `chat_pct`; a grid divider re-splits only the two
+/// tracks it separates, so panes elsewhere in the band keep their exact sizes.
+pub fn drag_divider(which: Divider, x: u64, y: u64) {
+    let cfg = SCREEN.with(|slot| {
+        let sc = slot.as_mut()?;
+        let mut c = sc.layout.clone();
+        c.fullscreen = 0;
+        match which {
+            Divider::Band => {
+                c.chat_pct = crate::panes_layout::band_divider_pct(
+                    sc.width,
+                    OUTER,
+                    GAP,
+                    c.swap,
+                    x,
+                );
+            }
+            Divider::Col(i) => {
+                let (bx, _, bw, _) = sc.band_rect()?;
+                let mut g = c.grid.sanitized();
+                if !crate::panes_layout::resize_tracks(
+                    &mut g.col_w,
+                    i,
+                    bw,
+                    GAP,
+                    x.saturating_sub(bx),
+                ) {
+                    return None;
+                }
+                c.grid = g;
+            }
+            Divider::Row(i) => {
+                let (_, by, _, bh) = sc.band_rect()?;
+                let mut g = c.grid.sanitized();
+                if !crate::panes_layout::resize_tracks(
+                    &mut g.row_h,
+                    i,
+                    bh,
+                    GAP,
+                    y.saturating_sub(by),
+                ) {
+                    return None;
+                }
+                c.grid = g;
+            }
+        }
+        Some(c)
     });
-    if let Some(p) = pct {
-        set_split_pct(p);
+    if let Some(c) = cfg {
+        relayout(&c);
     }
 }
 
 /// Scroll a pane's view by `delta` lines (`+` = back in time, `-` = toward
-/// live); `action` picks the ktrace pane, else chat. Snaps caret handling
-/// automatically: the caret only draws on a live view.
+/// live); `action` picks the **focused** action pane's ktrace, else chat. Snaps
+/// caret handling automatically: the caret only draws on a live view.
 pub fn scroll_view(action: bool, delta: i64) {
+    let target = if action {
+        ScrollTarget::Action(focused_action_index())
+    } else {
+        ScrollTarget::Chat
+    };
+    scroll_target(target, delta);
+}
+
+/// Which view a scroll applies to.
+#[derive(Clone, Copy)]
+pub enum ScrollTarget {
+    Chat,
+    /// Action pane by grid index — the pane under the mouse pointer, which with a
+    /// grid need not be the focused one.
+    Action(usize),
+}
+
+/// Scroll the ktrace view of a specific action pane (mouse wheel over it).
+pub fn scroll_action_pane(i: usize, delta: i64) {
+    scroll_target(ScrollTarget::Action(i), delta);
+}
+
+fn scroll_target(target: ScrollTarget, delta: i64) {
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
-            if action && sc.right != RightMode::Ktrace {
-                return;
-            }
+            let action = matches!(target, ScrollTarget::Action(_));
+            let idx = match target {
+                ScrollTarget::Chat => 0,
+                ScrollTarget::Action(i) => {
+                    // Only a ktrace view has scrollback to move.
+                    if sc.actions.get(i).map(|a| a.right()) != Some(RightMode::Ktrace) {
+                        return;
+                    }
+                    i
+                }
+            };
             sc.cursor_restore();
             sc.cur_vis = false;
-            let p = if action { &mut sc.logs } else { &mut sc.chat };
+            let p = if action { &mut sc.actions[idx].pane } else { &mut sc.chat };
             let max = p.hist.len();
             let v = (p.view as i64 + delta).clamp(0, max as i64) as usize;
             if v != p.view {
                 p.view = v;
-                let p = if action { &sc.logs } else { &sc.chat };
+                let p = if action { &sc.actions[idx].pane } else { &sc.chat };
                 sc.render_view(p);
                 if !action && v == 0 {
                     sc.caret_draw(&sc.chat); // no-op when chat has_composer
@@ -5397,7 +6419,7 @@ pub fn scroll_view(action: bool, delta: i64) {
 /// Scroll a pane's view by one page (its row count minus one).
 pub fn scroll_page(action: bool, up: bool) {
     let rows = SCREEN.with(|slot| {
-        slot.as_ref().map(|sc| if action { sc.logs.rows } else { sc.chat.rows }).unwrap_or(1)
+        slot.as_ref().map(|sc| if action { sc.logs().rows } else { sc.chat.rows }).unwrap_or(1)
     }) as i64;
     scroll_view(action, if up { rows - 1 } else { -(rows - 1) });
 }
@@ -5417,17 +6439,25 @@ pub fn scroll_live(action: bool) {
 pub fn focus_toggle() -> bool {
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
-            if sc.right == RightMode::Closed || sc.right == RightMode::Editor {
-                // Nothing to focus (closed), or the editor already owns input.
-                return sc.right == RightMode::Editor;
+            if !sc.any_column_visible() || sc.right() == RightMode::Editor {
+                // Nothing to focus (band collapsed), or the editor owns input.
+                return sc.right() == RightMode::Editor;
             }
             sc.focus_action = !sc.focus_action;
             sc.cursor_restore();
             sc.cur_vis = false;
             sc.draw_frame(&sc.chat, !sc.action_focused());
-            sc.draw_frame_titled(&sc.logs, sc.action_focused(), "");
-            sc.draw_tab_bar();
-            sc.draw_close_btn();
+            // Repaint every visible pane's chrome: the frame carries the
+            // selection state, so panes *losing* it must be redrawn too.
+            for j in 0..sc.actions.len() {
+                if !sc.column_visible(j) {
+                    continue;
+                }
+                let active = sc.action_focused() && j == sc.focused_action;
+                sc.draw_frame_titled(&sc.actions[j].pane, active, "");
+                sc.draw_tab_bar_for(j);
+                sc.draw_close_btn_for(j);
+            }
             // Composer chrome reflects focus (accent border + caret only when
             // the chat holds keyboard focus). Force caret on so it is visible
             // the instant focus returns — no need to type first.
@@ -5459,8 +6489,8 @@ pub fn focus_set(action: bool) {
     let (flips, need_composer) = SCREEN.with(|slot| {
         slot.as_ref()
             .map(|sc| {
-                let editor = sc.right == RightMode::Editor;
-                let closed = sc.right == RightMode::Closed;
+                let editor = sc.right() == RightMode::Editor;
+                let closed = !sc.any_column_visible();
                 let flips = !closed && !editor && sc.focus_action != action;
                 // Focusing chat: repaint composer even when already focused so
                 // the caret/border activate without a first keystroke.
@@ -5517,12 +6547,25 @@ fn remember_surf_reserve(id: u32, reserve_bottom: u64) {
 pub fn surface_hit(mx: u64, my: u64) -> Option<(u32, u16, u16)> {
     SCREEN.with(|slot| {
         let sc = slot.as_ref()?;
-        let id = match sc.right {
+        // Prefer the action column under the pointer; else the focused column.
+        let pi = sc
+            .actions
+            .iter()
+            .position(|a| {
+                a.pane.w > 0
+                    && mx >= a.pane.x
+                    && mx < a.pane.x + a.pane.w
+                    && my >= a.pane.y
+                    && my < a.pane.y + a.pane.h
+            })
+            .unwrap_or(sc.focused_action.min(sc.actions.len().saturating_sub(1)));
+        let a = sc.actions.get(pi)?;
+        let id = match a.right() {
             RightMode::Surface(id) => id,
             _ => return None,
         };
-        let (px, py) = (sc.logs.ix, sc.logs.iy);
-        let (pw, ph_full) = (sc.logs.cols * sc.logs.cw, sc.logs.rows * sc.logs.ch);
+        let (px, py) = (a.pane.ix, a.pane.iy);
+        let (pw, ph_full) = (a.pane.cols * a.pane.cw, a.pane.rows * a.pane.ch);
         // Exclude the HUD strip (video / browser) so clicks there are not mapped
         // into content coordinates — same usable height as present_surface_reserve.
         let reserve = LAST_SURF_RESERVE.with(|m| m.get(&id).copied().unwrap_or(0));
@@ -5555,8 +6598,10 @@ pub fn surface_hit(mx: u64, my: u64) -> Option<(u32, u16, u16)> {
 pub fn pane_hit(x: u64, y: u64) -> Option<bool> {
     SCREEN.with(|slot| {
         slot.as_ref().and_then(|sc| {
-            let hit = |p: &Pane| x >= p.x && x < p.x + p.w && y >= p.y && y < p.y + p.h;
-            if sc.right != RightMode::Closed && hit(&sc.logs) {
+            let hit = |p: &Pane| p.w > 0 && x >= p.x && x < p.x + p.w && y >= p.y && y < p.y + p.h;
+            // Any visible action column counts as "action", not just the focused
+            // one — otherwise a click/scroll over column 2 fell through to chat.
+            if (0..sc.actions.len()).any(|i| sc.column_visible(i) && hit(&sc.actions[i].pane)) {
                 Some(true)
             } else if hit(&sc.chat) {
                 Some(false)

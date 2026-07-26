@@ -2,13 +2,14 @@
   "name": "settings",
   "version": "1.0.0",
   "kind": "skill_agent",
-  "description": "Settings panel (prefs in storage; tools.wasm).",
+  "description": "Settings panel: display resolution + prefs (tools.wasm UI).",
   "package_ui": true,
   "toolset": [
     "settings_start",
     "settings_get",
     "settings_set",
-    "settings_status"
+    "settings_status",
+    "display"
   ],
   "capabilities": [
     {

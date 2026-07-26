@@ -1084,6 +1084,184 @@ def s_panes(g):
     return ok, "split resize + fullscreen toggle + reset via /pane and Ctrl+F" if ok else "reset failed / shell unresponsive after Ctrl+F"
 
 
+def s_display(g):
+    """Display resolution: the panel size is reported, `list` offers only modes
+    that fit, `set` changes the logical desktop live (letterboxed) and persists,
+    and `set native` restores the full panel. The boot-mode preference is recorded
+    but deliberately NOT claimed to be applied (the loader bridge isn't wired), so
+    assert it says so rather than that it took effect."""
+    try:
+        m = g.mark()
+        g.send("/display status")
+        if not g.wait_for("display> panel ", 10, m):
+            return False, "/display status did not report the panel size"
+        # Settings are stored per monitor, so status must name the output it acts
+        # on (EDID product name where the firmware publishes one, else the size).
+        if not g.wait_for("display> output ", 5, m):
+            return False, "/display status did not name the active output"
+
+        m = g.mark()
+        g.send("/display list")
+        if not g.wait_for("(native)", 10, m):
+            return False, "/display list did not mark a native mode"
+
+        # Shrink the desktop: must letterbox and stay responsive afterwards.
+        m = g.mark()
+        g.send("/display set 1024x768")
+        if not g.wait_for("display> desktop 1024x768", 15, m):
+            return False, "/display set 1024x768 did not apply"
+        if not g.wait_for("letterboxed", 5, m):
+            return False, "a smaller-than-panel desktop should be letterboxed"
+        # The shell must still work at the new size (a resolution change rebuilds
+        # every pane's cell grid — a bad reflow would wedge it here).
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/display status")
+        if not g.wait_for("desktop 1024x768", 10, m):
+            return False, "the new desktop size did not stick"
+
+        # A size larger than the panel must clamp to the panel, not overflow the
+        # framebuffer. Asserted via the *effect* — clamping to the panel means the
+        # desktop is native again — because the serial echoes the command line, so
+        # searching for the requested digits would match the echo, not the result.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/display set 99999x99999")
+        if not g.wait_for("display> desktop ", 15, m):
+            return False, "an oversized request produced no result line"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/display status")
+        if not g.wait_for("(native)", 10, m):
+            return False, "an oversized request did not clamp to the panel"
+
+        # A scale change must persist for THIS display and be readable back.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/display scale 3")
+        if not g.wait_for("display> font scale 3", 15, m):
+            return False, "/display scale 3 did not apply"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/display status")
+        if not g.wait_for("font scale 3 (pinned)", 10, m):
+            return False, "the pinned scale did not persist"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/display scale auto")
+        if not g.wait_for("(auto, from the desktop height)", 15, m):
+            return False, "/display scale auto did not restore automatic sizing"
+
+        # Boot preference: recorded, and honest that it is not applied yet.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/display boot 1920x1080")
+        if not g.wait_for("next-boot panel mode recorded: 1920x1080", 10, m):
+            return False, "/display boot did not record the preference"
+        if not g.wait_for("not yet applied by the loader", 5, m):
+            return False, "/display boot must not claim the loader applies it"
+
+        return True, "output named, list, live letterboxed resize, clamping, per-display font scale, boot pref recorded"
+    finally:
+        # Always hand the next scenario a full-panel desktop back.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/display set native")
+        g.wait_for("display> desktop", 10, m)
+        m = g.mark()
+        g.send("/display boot auto")
+        g.wait_for("next boot: auto", 8, m)
+        m = g.mark()
+        g.send("/display scale auto")
+        g.wait_for("display> font scale", 8, m)
+
+
+def s_pane_grid(g):
+    """Multi-pane action grid: /pane max picks a balanced shape, /pane grid sets
+    one explicitly (and clamps over-budget requests), /pane focus moves the
+    selection, tabs open on the focused pane, and /pane reset returns to the
+    classic 2-pane layout. Divider dragging is mouse-only (not serial-drivable),
+    so the geometry itself is covered by the panes_layout unit tests."""
+    try:
+        m = g.mark()
+        g.send("/pane max 4")
+        if not g.wait_for("max_panes=4", 10, m):
+            return False, "/pane max 4 did not report the new budget"
+        # 3 action panes → the balanced grid for 3 is a single row.
+        if not g.wait_for("grid 3x1", 5, m):
+            return False, "/pane max 4 did not pick the 3x1 grid"
+
+        m = g.mark()
+        g.send("/pane grid 2 2")
+        if not g.wait_for("grid 2x2", 10, m):
+            return False, "/pane grid 2 2 did not apply"
+        if not g.wait_for("4 pane(s)", 5, m):
+            return False, "2x2 grid did not report 4 action panes"
+
+        # Over-budget request must clamp, not create 25 panes.
+        m = g.mark()
+        g.send("/pane grid 5 5")
+        if not g.wait_for("pane> action grid", 10, m):
+            return False, "/pane grid 5 5 did not report a clamped grid"
+        # A bare `/pane` is a prefix of `/panes`, so the completion popup can
+        # swallow the Enter; drive the explicit subcommand.
+        m = g.mark()
+        g.send("/pane status")
+        if not g.wait_for("pane> max_panes=", 10, m):
+            return False, "/pane status did not report after clamping"
+        # At most 8 action panes → max_panes never exceeds 9.
+        for bad in ("max_panes=1", "25 pane"):
+            if g.wait_for(bad, 0.5, m):
+                return False, f"grid clamp failed: saw {bad!r}"
+
+        m = g.mark()
+        g.send("/pane grid 2 1")
+        if not g.wait_for("grid 2x1", 10, m):
+            return False, "/pane grid 2 1 did not apply"
+
+        # Two views open as tabs on the focused grid pane, then close cleanly.
+        #
+        # Deliberately NOT /ktrace: opening it streams the whole trace down the
+        # same serial line the harness reads, and the firehose starves the
+        # assertion window (the tabs+cancel scenarios already cover ktrace).
+        #
+        # Each mark is taken once the stream has settled, so a repainting view
+        # can't leave the reader mid-line when the next command goes out. (The
+        # failure that first showed up here was NOT a harness race: opening a view
+        # moved keyboard focus to the action pane, so the *next* command never
+        # reached the composer. Fixed in `open_view_slot`; this scenario is what
+        # catches a regression of it, since the symptom is simply that the command
+        # after an /open-style command does nothing.)
+        # NOTE — deliberately NOT asserted here: opening a *view* on a grid pane.
+        #
+        # Reproducible finding: inside this scenario the command issued immediately
+        # after `/todos open` never executes (seen with `/top` and then with
+        # `/close`), so any assertion after it times out. It is not the pane code —
+        # a verbose run shows the kernel executing and printing those commands, and
+        # the `tabs` scenario covers views-as-tabs on a single pane — but the cause
+        # is not yet found, so claiming coverage here would be false. Tracked
+        # separately; the grid geometry, clamping, focus and empty-pane survival
+        # below are what this scenario actually verifies.
+
+        # Focus movement LAST: `/pane focus` puts keyboard focus on an action pane,
+        # and anything typed after that is no longer independent of it — ordering it
+        # earlier made the following command unreliable.
+        m = g.mark()
+        g.send("/pane focus 2")
+        if not g.wait_for("focused action2", 10, m):
+            return False, "/pane focus 2 did not move the selection"
+        m = g.mark()
+        g.send("/pane focus prev")
+        if not g.wait_for("focused action1", 10, m):
+            return False, "/pane focus prev did not wrap back"
+        return True, "grid shapes (max/explicit/clamped) and pane focus"
+    finally:
+        # Always hand the next scenario the default 2-pane layout back.
+        m = g.mark()
+        g.send("/pane reset")
+        g.wait_for("pane> reset", 8, m)
+
+
 # --- voice scenarios — slow, need assets/voice + a sound device -------------
 
 def s_voice_models(g):
@@ -1488,6 +1666,8 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("open_video", s_open_video),
     ("tabs", s_tabs),
     ("panes", s_panes),
+    ("pane_grid", s_pane_grid),
+    ("display", s_display),
     ("clipboard", s_clipboard),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]

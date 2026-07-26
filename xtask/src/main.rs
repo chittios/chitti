@@ -759,13 +759,67 @@ fn build_stub_aarch64() -> Result<PathBuf, String> {
 /// `$CHITTI_FB_RES=WxH`, else auto-detects the host display, else a safe
 /// default. Real hardware / the UEFI path takes its resolution from GOP instead,
 /// so this only shapes the QEMU ramfb window.
+/// The display device(s) to give the guest, from `$CHITTI_GPU`.
+///
+/// * unset / `ramfb` — the simple linear framebuffer the kernel configures via
+///   fw_cfg. The default, and the only one that works on the aarch64 `-kernel`
+///   path (see below).
+/// * `virtio` — `virtio-gpu-pci`, which the in-kernel **KMS** driver binds for real
+///   mode setting (`/display set` changes the hardware mode instead of
+///   letterboxing).
+/// * `vmware` — `vmware-svga`, to exercise the (currently declined) VMSVGA path.
+///
+/// **`virtio` needs PCI**, and on aarch64 PCI comes from the stub's ACPI — so pass
+/// `--uefi` there, or use `-arch x86_64`. On the plain aarch64 `-kernel` path the
+/// device is invisible and the driver will not bind.
+fn gpu_device_args(arch: &str, uefi: bool) -> Vec<String> {
+    let want = std::env::var("CHITTI_GPU").unwrap_or_default();
+    let want = want.trim().to_lowercase();
+    match want.as_str() {
+        "virtio" | "virtio-gpu" => {
+            if arch == "aarch64" && !uefi {
+                eprintln!(
+                    "  CHITTI_GPU=virtio needs PCI: on aarch64 add --uefi (ECAM comes from the stub's ACPI). Using ramfb."
+                );
+                return vec!["-device".into(), "ramfb".into()];
+            }
+            // Keep **ramfb as well**. Booting aarch64/HVF with virtio-gpu as the
+            // only display puts the firmware's GOP framebuffer inside the device's
+            // BAR, and writing there after ExitBootServices aborts QEMU with
+            // `hvf: isv` — verified with the KMS probe disabled, so it is the
+            // environment, not the driver. With ramfb present the console comes up
+            // on safe memory and virtio-gpu is a second device the driver binds; its
+            // scanout is DMA RAM, which is writable normally.
+            eprintln!("  gpu: ramfb (console) + virtio-gpu-pci (KMS: real mode setting)");
+            vec![
+                "-device".into(),
+                "ramfb".into(),
+                "-device".into(),
+                "virtio-gpu-pci,id=gpu0".into(),
+            ]
+        }
+        "vmware" | "vmsvga" => {
+            eprintln!("  gpu: vmware-svga (VMSVGA driver is detected but declined — see kms/vmsvga.rs)");
+            vec!["-device".into(), "vmware-svga,id=gpu0".into()]
+        }
+        "" | "ramfb" => vec!["-device".into(), "ramfb".into()],
+        other => {
+            eprintln!("  CHITTI_GPU='{other}' unknown (ramfb|virtio|vmware) — using ramfb");
+            vec!["-device".into(), "ramfb".into()]
+        }
+    }
+}
+
 fn ramfb_res_fw_cfg() -> Vec<String> {
     let (w, h) = std::env::var("CHITTI_FB_RES")
         .ok()
+        .filter(|v| !v.trim().eq_ignore_ascii_case("max")) // handled by detection
         .and_then(|s| parse_wxh(&s))
         .or_else(detect_host_res)
         .unwrap_or((1600, 1000));
-    eprintln!("  framebuffer: {w}x{h} (set CHITTI_FB_RES=WxH to override)");
+    eprintln!(
+        "  framebuffer: {w}x{h} (CHITTI_FB_RES=WxH|max to pin, CHITTI_FB_DISPLAY=<name> to pick a monitor)"
+    );
     vec!["-fw_cfg".into(), format!("name=opt/chitti/fbres,string={w}x{h}")]
 }
 
@@ -775,30 +829,270 @@ fn parse_wxh(s: &str) -> Option<(u32, u32)> {
     Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
 }
 
-/// Best-effort host main-display resolution on macOS via `system_profiler`.
-/// Returns **physical pixels** — the same thing VirtualBox's GOP hands the
-/// stub (native panel mode). The QEMU window runs `zoom-to-fit=on`, so a
-/// full-resolution guest FB scales down cleanly when windowed and is 1:1 in
-/// fullscreen — identical rendering across VBox / QEMU / laptop / monitor
-/// (halving Retina + subtracting chrome made QEMU pick a different, smaller
-/// mode than VBox on the same display, so fonts/layout looked different).
-fn detect_host_res() -> Option<(u32, u32)> {
-    if !cfg!(target_os = "macos") {
-        return None; // Linux hosts: use the default (or CHITTI_FBRES)
-    }
-    let out = Command::new("system_profiler").arg("SPDisplaysDataType").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        let Some(rest) = line.trim().strip_prefix("Resolution:") else { continue };
-        // e.g. "3456 x 2234 Retina" or "2560 x 1440"
-        let parts: Vec<&str> = rest.split_whitespace().collect();
-        if parts.len() >= 3 && parts[1] == "x" {
-            if let (Ok(w), Ok(h)) = (parts[0].parse::<u32>(), parts[2].parse::<u32>()) {
-                return Some((w.clamp(1024, 3840), h.clamp(720, 2160)));
-            }
-        }
+/// One attached display as `system_profiler -json` describes it.
+#[derive(Debug, PartialEq)]
+struct HostDisplay {
+    name: String,
+    /// `_spdisplays_resolution` — the **desktop** size actually in use. This is the
+    /// authoritative value and the one to match; the plain-text `system_profiler`
+    /// output omits it for a display at its default scaled mode, which is why the
+    /// earlier text-scraping version had to guess (and got a 1440x900 desktop wrong
+    /// by halving the 2560x1600 panel to 1280x800).
+    desktop: (u32, u32),
+    /// `_spdisplays_pixels` — the backing store, i.e. the most pixels this display
+    /// can actually show (2880x1800 for a 1440x900 HiDPI desktop). What `max` means.
+    native: (u32, u32),
+    main: bool,
+}
+
+/// Pull `"key" : "value"` out of one JSON object body. Adequate because every field
+/// wanted here is a flat string and the objects are machine-generated.
+fn json_str_field(body: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let at = body.find(&pat)?;
+    let rest = &body[at + pat.len()..];
+    let colon = rest.find(':')?;
+    let after = &rest[colon + 1..];
+    let open = after.find('"')?;
+    let tail = &after[open + 1..];
+    let close = tail.find('"')?;
+    Some(tail[..close].to_string())
+}
+
+/// `"1440 x 900 @ 60.00Hz"` / `"2880 x 1800"` → `(1440, 900)`.
+fn parse_res_field(v: &str) -> Option<(u32, u32)> {
+    let parts: Vec<&str> = v.split_whitespace().collect();
+    if parts.len() >= 3 && parts[1] == "x" {
+        return Some((parts[0].parse().ok()?, parts[2].parse().ok()?));
     }
     None
+}
+
+/// Split the objects of the first `spdisplays_ndrvs` array, brace-matched.
+fn ndrvs_objects(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(at) = text.find("\"spdisplays_ndrvs\"") else { return out };
+    let bytes = text.as_bytes();
+    let mut i = at;
+    // Advance to the '[' that opens the array.
+    while i < bytes.len() && bytes[i] != b'[' {
+        i += 1;
+    }
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    out.push(text[start..=i].to_string());
+                }
+            }
+            b']' if depth == 0 => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Parse `system_profiler SPDisplaysDataType -json` into the attached displays.
+fn parse_displays(text: &str) -> Vec<HostDisplay> {
+    ndrvs_objects(text)
+        .iter()
+        .filter_map(|o| {
+            let name = json_str_field(o, "_name")?;
+            let desktop = json_str_field(o, "_spdisplays_resolution").and_then(|v| parse_res_field(&v));
+            let native = json_str_field(o, "_spdisplays_pixels").and_then(|v| parse_res_field(&v));
+            // A display with neither field is not something we can size a window to.
+            let desktop = desktop.or(native)?;
+            Some(HostDisplay {
+                name,
+                desktop,
+                native: native.unwrap_or(desktop),
+                main: json_str_field(o, "spdisplays_main").as_deref() == Some("spdisplays_yes"),
+            })
+        })
+        .collect()
+}
+
+/// Choose the display whose size the guest window should match: the one named by
+/// `want` (case-insensitive substring), else the main display, else the first.
+fn pick_display<'a>(displays: &'a [HostDisplay], want: Option<&str>) -> Option<&'a HostDisplay> {
+    if let Some(want) = want.map(str::trim).filter(|w| !w.is_empty()) {
+        let lower = want.to_lowercase();
+        if let Some(d) = displays.iter().find(|d| d.name.to_lowercase().contains(&lower)) {
+            return Some(d);
+        }
+        eprintln!(
+            "  CHITTI_FB_DISPLAY='{want}' matched no display (have: {}) — using the main one",
+            displays.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
+    displays.iter().find(|d| d.main).or_else(|| displays.first())
+}
+
+/// Best-effort host display size on macOS.
+///
+/// Returns the chosen display's **desktop** size (so the QEMU window fits the screen
+/// it opens on), or its full backing-store size when `CHITTI_FB_RES=max`.
+fn detect_host_res() -> Option<(u32, u32)> {
+    if !cfg!(target_os = "macos") {
+        return None; // Linux hosts: use the default (or CHITTI_FB_RES)
+    }
+    let out = Command::new("system_profiler")
+        .args(["SPDisplaysDataType", "-json"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let displays = parse_displays(&text);
+    if displays.is_empty() {
+        return None;
+    }
+    if displays.len() > 1 {
+        let list: Vec<String> = displays
+            .iter()
+            .map(|d| {
+                format!(
+                    "{}{} {}x{} (max {}x{})",
+                    d.name,
+                    if d.main { "*" } else { "" },
+                    d.desktop.0,
+                    d.desktop.1,
+                    d.native.0,
+                    d.native.1
+                )
+            })
+            .collect();
+        eprintln!("  displays: {} (* = main)", list.join(", "));
+    }
+    let want = std::env::var("CHITTI_FB_DISPLAY").ok();
+    let d = pick_display(&displays, want.as_deref())?;
+    let wants_max = std::env::var("CHITTI_FB_RES").map(|v| v.trim().eq_ignore_ascii_case("max")).unwrap_or(false);
+    let (w, h) = if wants_max { d.native } else { d.desktop };
+    Some((w.clamp(640, 3840), h.clamp(480, 2400)))
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    /// Real `system_profiler SPDisplaysDataType -json` output (trimmed to the fields
+    /// used): an M2 laptop whose **desktop is 1440x900** on a 2880x1800 backing
+    /// store, plus an external 1080p monitor. The laptop entry is exactly the case
+    /// the old text-scraping version got wrong.
+    const TWO_DISPLAYS: &str = r#"{
+  "SPDisplaysDataType" : [
+    {
+      "spdisplays_ndrvs" : [
+        {
+          "_name" : "Color LCD",
+          "_spdisplays_pixels" : "2880 x 1800",
+          "_spdisplays_resolution" : "1440 x 900 @ 60.00Hz",
+          "spdisplays_main" : "spdisplays_yes"
+        },
+        {
+          "_name" : "DELL P2722HE",
+          "_spdisplays_pixels" : "1920 x 1080",
+          "_spdisplays_resolution" : "1920 x 1080 @ 60.00Hz"
+        }
+      ]
+    }
+  ]
+}"#;
+
+    #[test]
+    fn parses_the_real_desktop_size_not_the_panel_mode() {
+        let d = parse_displays(TWO_DISPLAYS);
+        assert_eq!(d.len(), 2, "got {d:?}");
+        assert_eq!(d[0].name, "Color LCD");
+        // The whole point: 1440x900, NOT the 2560x1600 panel mode and NOT a halving
+        // of it (1280x800) — both of which this got wrong before.
+        assert_eq!(d[0].desktop, (1440, 900));
+        assert_eq!(d[0].native, (2880, 1800), "backing store = what `max` means");
+        assert!(d[0].main);
+        assert_eq!(d[1].name, "DELL P2722HE");
+        assert_eq!(d[1].desktop, (1920, 1080));
+        assert_eq!(d[1].native, (1920, 1080));
+        assert!(!d[1].main);
+    }
+
+    #[test]
+    fn picks_the_main_display_by_default() {
+        let d = parse_displays(TWO_DISPLAYS);
+        assert_eq!(pick_display(&d, None).unwrap().name, "Color LCD");
+        assert_eq!(pick_display(&d, Some("dell")).unwrap().name, "DELL P2722HE");
+        assert_eq!(pick_display(&d, Some("P2722")).unwrap().name, "DELL P2722HE");
+        // An unmatched or blank name falls back to main rather than failing a boot.
+        assert_eq!(pick_display(&d, Some("nope")).unwrap().name, "Color LCD");
+        assert_eq!(pick_display(&d, Some("  ")).unwrap().name, "Color LCD");
+    }
+
+    #[test]
+    fn res_fields_parse_with_and_without_refresh() {
+        assert_eq!(parse_res_field("1440 x 900 @ 60.00Hz"), Some((1440, 900)));
+        assert_eq!(parse_res_field("2880 x 1800"), Some((2880, 1800)));
+        assert_eq!(parse_res_field("1440x900"), None, "system_profiler always spaces it");
+        assert_eq!(parse_res_field(""), None);
+        assert_eq!(parse_res_field("garbage here now"), None);
+    }
+
+    #[test]
+    fn json_field_extraction_is_exact() {
+        let o = r#"{ "_name" : "Color LCD", "spdisplays_main" : "spdisplays_yes" }"#;
+        assert_eq!(json_str_field(o, "_name").as_deref(), Some("Color LCD"));
+        assert_eq!(json_str_field(o, "spdisplays_main").as_deref(), Some("spdisplays_yes"));
+        assert_eq!(json_str_field(o, "absent"), None);
+    }
+
+    #[test]
+    fn object_splitting_is_brace_matched() {
+        let objs = ndrvs_objects(TWO_DISPLAYS);
+        assert_eq!(objs.len(), 2);
+        assert!(objs[0].contains("Color LCD") && !objs[0].contains("DELL"));
+        assert!(objs[1].contains("DELL"));
+        // No displays array at all → nothing, not a panic.
+        assert!(ndrvs_objects("{}").is_empty());
+        assert!(ndrvs_objects("").is_empty());
+    }
+
+    #[test]
+    fn a_display_with_no_size_is_skipped() {
+        let t = r#"{ "spdisplays_ndrvs" : [ { "_name" : "Headless" } ] }"#;
+        assert!(parse_displays(t).is_empty());
+        // Only `_spdisplays_pixels` present → used for both.
+        let t = r#"{ "spdisplays_ndrvs" : [ { "_name" : "P", "_spdisplays_pixels" : "800 x 600" } ] }"#;
+        let d = parse_displays(t);
+        assert_eq!(d[0].desktop, (800, 600));
+        assert_eq!(d[0].native, (800, 600));
+    }
+
+    #[test]
+    fn empty_or_garbage_input_yields_nothing() {
+        assert!(parse_displays("").is_empty());
+        assert!(parse_displays("not json at all").is_empty());
+        assert!(pick_display(&[], None).is_none());
+    }
+
+    #[test]
+    fn valid_resolution_accepts_only_wxh() {
+        assert!(valid_resolution("1920x1080"));
+        assert!(valid_resolution("1920x1080x32"));
+        assert!(!valid_resolution("1920"));
+        assert!(!valid_resolution("1920x"));
+        assert!(!valid_resolution("x1080"));
+        assert!(!valid_resolution("1920x1080x"));
+        assert!(!valid_resolution("1920X1080"), "Limine wants a lowercase x");
+        assert!(!valid_resolution("0x1080"));
+        assert!(!valid_resolution("abcxdef"));
+        assert!(!valid_resolution(""));
+    }
 }
 
 /// Guard against artifact mixups: assert `elf` is the identity-map `-kernel`
@@ -1163,7 +1457,10 @@ fn cmd_run_aarch64_uefi(model: Model, disk: Option<PathBuf>, disk_only: bool, no
     for a in aavmf_pflash_args()? {
         qemu.arg(a);
     }
-    qemu.args(["-device", "ramfb", "-device", "virtio-keyboard-device", "-device", "virtio-tablet-device"]);
+    for a in gpu_device_args("aarch64", true) {
+        qemu.arg(a);
+    }
+    qemu.args(["-device", "virtio-keyboard-device", "-device", "virtio-tablet-device"]);
     qemu.args(display_args());
     // Same host-derived framebuffer resolution as the `-kernel` path, so the
     // UEFI ramfb fallback matches VBox GOP / QEMU direct (was 1920x1080 fixed).
@@ -1232,8 +1529,11 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
     // Ctrl-A C for the monitor).
     qemu.args(["-M", "virt", "-smp", &smp_count(), "-m", model.qemu_mem()]);
     qemu.args(accel_args("aarch64"));
+    for a in gpu_device_args("aarch64", false) {
+        qemu.arg(a);
+    }
     qemu.args([
-        "-device", "ramfb", "-device", "virtio-keyboard-device",
+        "-device", "virtio-keyboard-device",
         // A virtio tablet gives the window an absolute-position mouse.
         "-device", "virtio-tablet-device",
     ]);
@@ -1519,6 +1819,19 @@ fn brew_prefix(pkg: &str) -> Result<PathBuf, String> {
     ))
 }
 
+/// Whether `s` is a Limine `resolution:` value — `<width>x<height>` with an
+/// optional `x<bpp>`. Validated rather than passed through, because a typo would
+/// otherwise be silently ignored by Limine and read as "EDID detection is broken".
+fn valid_resolution(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('x').collect();
+    if parts.len() != 2 && parts.len() != 3 {
+        return false;
+    }
+    parts.iter().all(|p| {
+        !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && p.parse::<u32>().is_ok_and(|n| n > 0)
+    })
+}
+
 fn limine_share_dir() -> Result<PathBuf, String> {
     if let Ok(dir) = env::var("CHITTI_LIMINE_SHARE") {
         return Ok(PathBuf::from(dir));
@@ -1668,6 +1981,24 @@ fn assemble_image_opt(kernel_bin: &Path, model_rel: Option<&str>) -> Result<Path
         iso_root.join("boot/limine/limine.conf"),
     )
     .map_err(|e| format!("copying limine.conf: {e}"))?;
+
+    // Framebuffer mode: `limine.conf` deliberately pins none, so Limine uses the
+    // display's EDID-preferred (native) mode — the same discovery the aarch64 stub
+    // does. `CHITTI_RESOLUTION=WxH[xBPP]` appends an explicit override for the
+    // cases EDID can't answer: a headless VM, or matching a fixed window size.
+    if let Ok(res) = std::env::var("CHITTI_RESOLUTION") {
+        let res = res.trim();
+        if !valid_resolution(res) {
+            return Err(format!(
+                "CHITTI_RESOLUTION='{res}' is not <width>x<height>[x<bpp>] (e.g. 1920x1080)"
+            ));
+        }
+        let conf_path = iso_root.join("boot/limine/limine.conf");
+        let mut conf = fs::read_to_string(&conf_path).map_err(|e| e.to_string())?;
+        conf.push_str(&format!("    resolution: {res}\n"));
+        fs::write(&conf_path, conf).map_err(|e| format!("appending resolution: {e}"))?;
+        eprintln!("xtask: pinned framebuffer resolution to {res} (unset CHITTI_RESOLUTION for EDID-native)");
+    }
 
     // The Phase 3 model is loaded as a Limine boot module, not compiled in.
     // It's optional at image-assembly time: the tensor-kernel unit tests

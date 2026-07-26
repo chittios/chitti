@@ -139,7 +139,12 @@ pub fn run() -> ! {
     // Once loaded it joins the system fallback chain and is available OS-wide
     // (console/UI + browser), alongside the always-bundled Indic + emoji faces.
     #[cfg(all(not(feature = "server"), not(test)))]
-    load_panes_config();
+    {
+        // Display first: the desktop size determines every pane's cell grid, so
+        // applying it after the pane layout would reflow everything twice.
+        load_display_config();
+        load_panes_config();
+    }
     update_status();
     // Ask the host terminal to bracket pastes, so a host->guest paste arrives as
     // one `ESC[200~ … ESC[201~` block the line editor can capture (see
@@ -559,6 +564,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "ui" => run_ui(arg),
         "theme" | "themes" => run_theme(arg),
         "pane" | "panes" => run_pane(arg),
+        "display" | "resolution" | "res" => run_display(arg),
         "shortcuts" | "keys" => run_shortcuts(),
         "clip" | "clipboard" => run_clip(arg),
         "ktrace" | "logs" => toggle_ktrace(),
@@ -7535,6 +7541,23 @@ fn ui_tick() {
         let t = crate::mouse::tick();
         if t.moved {
             crate::framebuffer::cursor_move(t.x, t.y);
+            // Hovering a divider shows the grab cursor, so it is discoverable
+            // that the shell|band split *and* every grid gap can be dragged.
+            // Skipped mid-drag, where the drag itself owns the cursor.
+            if DIVIDER_DRAG.with(|d| d.is_none()) {
+                if crate::framebuffer::divider_hit(t.x, t.y).is_some() {
+                    crate::framebuffer::set_cursor_shape(
+                        crate::framebuffer::CursorShape::Hand,
+                    );
+                } else if crate::framebuffer::cursor_shape()
+                    == crate::framebuffer::CursorShape::Hand
+                    && !browser_loaded()
+                {
+                    crate::framebuffer::set_cursor_shape(
+                        crate::framebuffer::CursorShape::Arrow,
+                    );
+                }
+            }
             // Browser hover: hand on links, I-beam on inputs.
             if browser_loaded() {
                 if let Some((sid, sx, sy)) = crate::framebuffer::surface_hit(t.x, t.y) {
@@ -7547,43 +7570,48 @@ fn ui_tick() {
             }
         }
         if t.pressed {
-            if crate::framebuffer::divider_hit(t.x, t.y).is_some() {
-                // Grab the pane divider to resize the split.
-                DIVIDER_DRAG.store(true, Ordering::Relaxed);
-            } else if crate::framebuffer::hit_close(t.x, t.y) {
+            if let Some(which) = crate::framebuffer::divider_hit(t.x, t.y) {
+                // Grab a divider: the shell|band split, or a grid column/row gap.
+                DIVIDER_DRAG.with(|d| *d = Some(which));
+            } else if let Some(ci) = crate::framebuffer::close_hit_pane(t.x, t.y) {
+                // The `[x]` of *that* column, which need not be the focused one.
+                crate::framebuffer::focus_action_column(ci);
                 close_active_tab();
-            } else if let Some(i) = crate::framebuffer::tab_hit(t.x, t.y) {
-                // Click a tab label: select it, focus the action pane, repaint.
-                crate::framebuffer::select_tab(i);
+            } else if let Some(pi) = crate::framebuffer::action_pane_at(t.x, t.y) {
+                // Click landed in an action column — focus it first so tab_hit
+                // / surface_hit apply to that column.
+                crate::framebuffer::focus_action_column(pi);
                 crate::framebuffer::focus_set(true);
-                repaint_active_tab();
                 crate::framebuffer::chat_sel_clear();
+                if let Some(ti) = crate::framebuffer::tab_hit_in_pane(pi, t.x, t.y) {
+                    // Start a potential tab drag (move between action columns).
+                    TAB_DRAG.with(|d| {
+                        *d = Some(TabDrag {
+                            from_pane: pi,
+                            from_idx: ti,
+                            start_x: t.x,
+                            start_y: t.y,
+                            dragging: false,
+                        });
+                    });
+                    crate::framebuffer::select_tab(ti);
+                    repaint_active_tab();
+                } else if let Some((sid, sx, sy)) = crate::framebuffer::surface_hit(t.x, t.y) {
+                    if sid == BROWSER_SURFACE || sid == crate::framebuffer::BROWSER_SURFACE {
+                        if browser_loaded() && !browser_is_loading() {
+                            crate::framebuffer::chat_sel_clear();
+                            browser_sel_begin(sx as i32, sy as i32);
+                        }
+                    } else if crate::service::package_ui::owns_surface(sid) {
+                        crate::synapse::ui::push_event(
+                            sid,
+                            crate::synapse::ui::UiEvent::Click { x: sx, y: sy },
+                        );
+                    }
+                }
             } else if let Some(action) = crate::framebuffer::pane_hit(t.x, t.y) {
                 crate::framebuffer::focus_set(action);
-                if action {
-                    crate::framebuffer::chat_sel_clear();
-                    // Map click into surface coords (letterbox-aware, uses last
-                    // present size — 640×400 browser, 256×192 chess, …).
-                    if let Some((sid, sx, sy)) = crate::framebuffer::surface_hit(t.x, t.y) {
-                        if sid == BROWSER_SURFACE || sid == crate::framebuffer::BROWSER_SURFACE {
-                            if browser_loaded() && !browser_is_loading() {
-                                // Begin text selection; navigation happens on
-                                // release only if the pointer didn't drag
-                                // (same model as chat: drag = copy, click = activate).
-                                crate::framebuffer::chat_sel_clear();
-                                browser_sel_begin(sx as i32, sy as i32);
-                            }
-                        } else if crate::service::package_ui::owns_surface(sid) {
-                            // A package-UI app (chess/mines/paint/…): queue the
-                            // click; the runtime's tick drains it into the wasm.
-                            crate::synapse::ui::push_event(
-                                sid,
-                                crate::synapse::ui::UiEvent::Click { x: sx, y: sy },
-                            );
-                        }
-                    }
-                } else {
-                    // Press in the chat pane anchors a mouse text selection.
+                if !action {
                     BROWSER_SEL.with(|s| *s = None);
                     BROWSER_SEL_DRAG.store(false, Ordering::Relaxed);
                     crate::framebuffer::chat_sel_begin(t.x, t.y);
@@ -7594,23 +7622,79 @@ fn ui_tick() {
         }
         // Drag: resize the split if the divider was grabbed, else extend the
         // browser or chat selection (release copies it; paste with Ctrl+V).
+        // Tab drag: move tabs between action columns (never into shell).
         if t.left && t.moved {
-            if DIVIDER_DRAG.load(Ordering::Relaxed) {
-                crate::framebuffer::set_divider_x(t.x);
-                // Live-resize: re-letterbox video/image into the new action pane.
-                repaint_active_tab();
-            } else if BROWSER_SEL_DRAG.load(Ordering::Relaxed) {
-                if let Some((_sid, sx, sy)) = crate::framebuffer::surface_hit(t.x, t.y) {
-                    browser_sel_drag(sx as i32, sy as i32);
-                }
+            if let Some(which) = DIVIDER_DRAG.with(|d| *d) {
+                crate::framebuffer::drag_divider(which, t.x, t.y);
+                // Live-resize: re-letterbox every pane's view into its new size.
+                repaint_all_tabs();
             } else {
-                crate::framebuffer::chat_sel_drag(t.x, t.y);
+                let mut tab_dragging = false;
+                TAB_DRAG.with(|d| {
+                    if let Some(td) = d.as_mut() {
+                        let dx = t.x.abs_diff(td.start_x);
+                        let dy = t.y.abs_diff(td.start_y);
+                        if dx > 4 || dy > 4 {
+                            td.dragging = true;
+                        }
+                        tab_dragging = td.dragging;
+                    }
+                });
+                if tab_dragging {
+                    // Cursor feedback + accent frame on the column under the
+                    // pointer, so it is obvious where the tab will land. The
+                    // shell pane is not a valid target, so it highlights nothing.
+                    crate::framebuffer::set_cursor_shape(crate::framebuffer::CursorShape::Hand);
+                    crate::framebuffer::highlight_drop_target(
+                        crate::framebuffer::action_pane_at(t.x, t.y),
+                    );
+                } else if BROWSER_SEL_DRAG.load(Ordering::Relaxed) {
+                    if let Some((_sid, sx, sy)) = crate::framebuffer::surface_hit(t.x, t.y) {
+                        browser_sel_drag(sx as i32, sy as i32);
+                    }
+                } else {
+                    crate::framebuffer::chat_sel_drag(t.x, t.y);
+                }
             }
         }
         if t.released {
-            if DIVIDER_DRAG.swap(false, Ordering::Relaxed) {
+            // Finish tab drag if any.
+            let finished = TAB_DRAG.with(|d| d.take());
+            if let Some(td) = finished {
+                if td.dragging {
+                    crate::framebuffer::highlight_drop_target(None);
+                    // A drop on the shell pane or outside the band cancels — only
+                    // an action column is a valid target, so the shell can never
+                    // acquire an action tab.
+                    if let Some(to_pane) = crate::framebuffer::action_pane_at(t.x, t.y) {
+                        // Insert before the tab under the cursor on the
+                        // **destination** bar (a drop on the body appends).
+                        let to_idx =
+                            crate::framebuffer::drop_index_in_pane(to_pane, t.x, t.y);
+                        if crate::framebuffer::move_tab_between(
+                            td.from_pane,
+                            td.from_idx,
+                            to_pane,
+                            to_idx,
+                        ) {
+                            // Geometry is unchanged but both bars and both
+                            // interiors changed owner → full redraw, then let the
+                            // now-active tab repaint its own content.
+                            crate::framebuffer::redraw_all();
+                            repaint_all_tabs();
+                            serial_println!(
+                                "pane> moved tab action{} → action{}",
+                                td.from_pane + 1,
+                                to_pane + 1
+                            );
+                        }
+                    }
+                    crate::framebuffer::set_cursor_shape(crate::framebuffer::CursorShape::Arrow);
+                }
+                // Non-dragging click already selected the tab on press.
+            } else if DIVIDER_DRAG.with(|d| d.take()).is_some() {
                 save_panes_config();
-                repaint_active_tab();
+                repaint_all_tabs();
             } else if BROWSER_SEL_DRAG.swap(false, Ordering::Relaxed) {
                 // Browser: copy if the user dragged a range; else treat as click.
                 match browser_sel_end() {
@@ -7671,9 +7755,14 @@ fn ui_tick() {
                 }
             }
             if !handled {
-                // + wheel = up = back in history; scroll the pane under the pointer.
-                let action = crate::framebuffer::pane_hit(t.x, t.y).unwrap_or(false);
-                crate::framebuffer::scroll_view(action, t.wheel as i64 * 3);
+                // + wheel = up = back in history; scroll the pane under the
+                // pointer — with a grid that is often not the focused pane, so
+                // resolve the exact pane rather than just "action vs chat".
+                let d = t.wheel as i64 * 3;
+                match crate::framebuffer::action_pane_at(t.x, t.y) {
+                    Some(i) => crate::framebuffer::scroll_action_pane(i, d),
+                    None => crate::framebuffer::scroll_view(false, d),
+                }
             }
         }
         // Background audio: feed the sound device chunk-by-chunk regardless of
@@ -7722,7 +7811,39 @@ static LAST_AUDIO_MS: AtomicU64 = AtomicU64::new(0);
 /// ktrace repaints from its grid during the switch's `redraw`.
 #[cfg(not(test))]
 fn repaint_active_tab() {
-    match crate::framebuffer::right_mode() {
+    repaint_tab(crate::framebuffer::right_mode());
+}
+
+/// Repaint the active tab of **every visible action pane**.
+///
+/// Anything that relayouts the band (a divider drag, `/pane grid|max|split`, a
+/// tab move) must use this rather than [`repaint_active_tab`]: the compositor
+/// redraws the frames, but each view owns its interior, so the panes that are not
+/// focused would otherwise stay blank until they happened to tick.
+/// [`repaint_all_tabs`] for callers outside this module (the UI config applies a
+/// theme via `framebuffer::relayout`, which repaints frames but not interiors).
+pub fn repaint_visible_tabs() {
+    repaint_all_tabs();
+}
+
+#[cfg(not(test))]
+fn repaint_all_tabs() {
+    let focused = crate::framebuffer::right_mode();
+    for m in crate::framebuffer::visible_tab_modes() {
+        if m != focused {
+            repaint_tab(m);
+        }
+    }
+    // The focused pane last, so it wins if two views race the same pixels.
+    repaint_tab(focused);
+}
+#[cfg(test)]
+fn repaint_all_tabs() {}
+
+/// Repaint the interior of whichever pane currently shows `mode`.
+#[cfg(not(test))]
+fn repaint_tab(mode: crate::framebuffer::RightMode) {
+    match mode {
         crate::framebuffer::RightMode::Top => refresh_top(),
         crate::framebuffer::RightMode::Todos => {}
         crate::framebuffer::RightMode::Audio => repaint_audio(),
@@ -7920,6 +8041,16 @@ fn refresh_top() {
 /// can run longer than ~50 ms — the standing UI rule.
 pub fn upkeep() {
     ui_tick();
+    // Present anything drawn since the last tick. A virtio-gpu resource is not
+    // scanned out continuously, so without this the screen never changes however
+    // much we paint; a no-op on a firmware framebuffer. One flush per pump rather
+    // than per draw call — a queue round trip per glyph would be unusable.
+    crate::kms::flush_damage();
+    // A display change (host window resized, output attached) is the analogue of a
+    // hot-plug-detect interrupt; re-apply the preferred mode when it fires.
+    if crate::kms::poll_events() {
+        display_hotplug();
+    }
     // Package-UI apps (chess, games…): surface events + guest tick.
     crate::service::package_ui::tick();
     crate::net::poll();
@@ -8412,7 +8543,7 @@ const BROWSER_BODY_MAX: usize = 1 << 20; // 1 MiB
 fn browser_vw() -> i32 {
     #[cfg(not(test))]
     {
-        crate::framebuffer::action_dims_px()
+        crate::framebuffer::surface_dims_px(BROWSER_SURFACE)
             .map(|(w, _)| w as i32)
             .unwrap_or(960)
             .clamp(320, 4096)
@@ -8429,7 +8560,7 @@ fn browser_vh() -> i32 {
     #[cfg(not(test))]
     {
         let hud = crate::framebuffer::browser_hud_height() as i32;
-        crate::framebuffer::action_dims_px()
+        crate::framebuffer::surface_dims_px(BROWSER_SURFACE)
             .map(|(_, h)| (h as i32 - hud).max(200))
             .unwrap_or(700)
             .clamp(200, 4096)
@@ -10646,21 +10777,346 @@ fn run_open_inner(
     let _ = (arg, chat, orch);
 }
 
-/// True while the pane divider is being dragged with the mouse (resize).
-static DIVIDER_DRAG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Which divider is being dragged with the mouse, if any (resize in progress).
+// Named from `panes_layout` (always compiled), not the `cfg(not(test))`
+// `framebuffer` re-export, so the unit-test build still sees this module.
+static DIVIDER_DRAG: crate::mm::Locked<Option<crate::panes_layout::Divider>> =
+    crate::mm::Locked::new(None);
+
+/// In-progress tab drag between action columns (not into the shell).
+struct TabDrag {
+    from_pane: usize,
+    from_idx: usize,
+    start_x: u64,
+    start_y: u64,
+    dragging: bool,
+}
+static TAB_DRAG: crate::mm::Locked<Option<TabDrag>> = crate::mm::Locked::new(None);
 
 /// Persistent pane layout config.
 #[cfg(not(feature = "server"))]
 const PANES_PATH: &str = "/configs/core/panes.json";
+
+/// Persistent display config: the logical desktop + the next-boot mode.
+#[cfg(not(feature = "server"))]
+const DISPLAY_PATH: &str = "/configs/core/display.json";
+
+/// The settings-profile key for the display in use — its EDID identity where the
+/// firmware gave us one, else its framebuffer size.
+#[cfg(all(not(feature = "server"), not(test)))]
+pub(crate) fn display_key() -> alloc::string::String {
+    crate::display::profile_key(
+        crate::display::edid_bytes().as_deref(),
+        crate::framebuffer::physical_size(),
+    )
+}
+
+/// A human label for the display in use (its EDID product name, else its size).
+#[cfg(all(not(feature = "server"), not(test)))]
+pub(crate) fn display_name() -> alloc::string::String {
+    crate::display::profile_name(
+        crate::display::edid_bytes().as_deref(),
+        crate::framebuffer::physical_size(),
+    )
+}
+
+/// Read the whole `/configs/core/display.json` (all displays' profiles).
+#[cfg(all(not(feature = "server"), not(test)))]
+pub(crate) fn display_settings() -> crate::display::DisplaySettings {
+    let key = display_key();
+    crate::synapse::fs::read(DISPLAY_PATH)
+        .and_then(|b| core::str::from_utf8(&b).ok().and_then(crate::json::Json::parse))
+        .map(|j| crate::display::DisplaySettings::from_json(&j, &key))
+        .unwrap_or_default()
+}
+
+/// The profile for the display in use.
+#[cfg(all(not(feature = "server"), not(test)))]
+pub(crate) fn display_config() -> crate::display::DisplayCfg {
+    let mut p = display_settings().profile(&display_key());
+    // `boot_mode` is global, not per-display; carry it into the profile view so
+    // callers see one coherent object.
+    p.boot_mode = display_settings().boot_mode;
+    p
+}
+
+/// Persist `cfg` **as the profile for the display in use**, leaving every other
+/// display's remembered settings alone.
+#[cfg(all(not(feature = "server"), not(test)))]
+pub(crate) fn save_display_config(cfg: &crate::display::DisplayCfg) {
+    let key = display_key();
+    let mut all = display_settings();
+    all.boot_mode = cfg.boot_mode;
+    let mut profile = cfg.clone();
+    profile.boot_mode = None; // stored once, at the top level
+    all.set_profile(&key, profile);
+    crate::synapse::fs::write(DISPLAY_PATH, all.to_json_string().as_bytes());
+}
+
+/// Apply the saved logical desktop at boot. The `boot_mode` field is for the
+/// *loader*, not us — by the time the kernel runs, the hardware mode is set.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn load_display_config() {
+    let cfg = display_config();
+    if cfg.font_scale > 0 {
+        if let Some(n) = crate::framebuffer::set_font_scale(cfg.font_scale) {
+            serial_println!("display> font scale {}", n);
+        }
+    }
+    let Some((w, h)) = cfg.logical else { return };
+    match crate::framebuffer::set_logical_size(Some((w, h))) {
+        Some(got) => serial_println!("display> desktop {}x{} (panel {})", got.0, got.1,
+            crate::framebuffer::physical_size()
+                .map(crate::display::format_wxh)
+                .unwrap_or_else(|| alloc::string::String::from("?"))),
+        None => serial_println!("display> could not apply {}x{}", w, h),
+    }
+}
+
+/// Re-apply display policy after the outputs changed (the KMS hotplug path).
+///
+/// Follows the connector's new preferred mode, which on virtio-gpu is the host
+/// window's current size — so resizing the window resizes the desktop, the way a
+/// real OS behaves. Bounded and quiet: if the driver reports nothing usable we
+/// leave the screen exactly as it is.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn display_hotplug() {
+    let cs = crate::kms::connectors();
+    let Some(c) = cs.iter().find(|c| c.connected).or_else(|| cs.first()) else { return };
+    let Some(m) = c.preferred else { return };
+    if crate::framebuffer::physical_size() == Some((m.w, m.h)) {
+        return; // already there — a spurious event, not a change
+    }
+    if let Some(applied) = crate::kms::set_mode((m.w, m.h)) {
+        repaint_all_tabs();
+        update_status();
+        serial_println!("display> output changed -> {}x{}", applied.w, applied.h);
+    }
+}
+#[cfg(any(feature = "server", test))]
+fn display_hotplug() {}
+
+/// `/display` — inspect/change the screen resolution.
+///
+/// Two different things, deliberately separate commands: `set` changes the
+/// **logical desktop** now (a letterboxed viewport, no reboot), while `boot`
+/// records the **physical mode** for the loader to set next boot. Only the second
+/// can reclaim the panel's full pixel count, and only the first is instant.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn run_display(arg: &str) {
+    use crate::display::{format_wxh, parse_wxh};
+    let phys = crate::framebuffer::physical_size();
+    let mut it = arg.split_whitespace();
+    match it.next() {
+        None | Some("status") => {
+            let p = phys.map(format_wxh).unwrap_or_else(|| alloc::string::String::from("?"));
+            let l = crate::framebuffer::logical_size()
+                .map(format_wxh)
+                .unwrap_or_else(|| alloc::string::String::from("?"));
+            let cfg = display_config();
+            serial_println!("display> output {} [{}]", display_name(), display_key());
+            serial_println!(
+                "display> driver {}",
+                match crate::kms::driver_name() {
+                    Some(n) => n,
+                    // Same state as Linux with `nomodeset`: the loader's surface,
+                    // mode fixed for the boot, `set` letterboxes instead.
+                    None => "none (firmware framebuffer — /display set letterboxes)",
+                }
+            );
+            serial_println!(
+                "display> panel {} desktop {}{}",
+                p,
+                l,
+                if crate::framebuffer::is_letterboxed() { " (letterboxed)" } else { " (native)" }
+            );
+            serial_println!(
+                "display> next boot: {}",
+                cfg.boot_mode.map(format_wxh).unwrap_or_else(|| alloc::string::String::from("auto (from the display's EDID)"))
+            );
+            serial_println!(
+                "display> font scale {}{}",
+                crate::framebuffer::effective_font_scale().unwrap_or(1),
+                if cfg.font_scale == 0 { " (auto)" } else { " (pinned)" }
+            );
+            serial_println!(
+                "display> list | set <WxH>|native | scale <1-{}>|auto | boot <WxH>|auto",
+                crate::display::MAX_FONT_SCALE
+            );
+        }
+        Some("list") | Some("modes") => {
+            let cur = crate::framebuffer::logical_size();
+            // A bound driver reports the *display's* modes; without one we can only
+            // offer viewport sizes that fit the firmware framebuffer.
+            let driver_modes = crate::kms::modes();
+            let modes: alloc::vec::Vec<(u32, u32)> = if driver_modes.is_empty() {
+                crate::framebuffer::available_modes()
+            } else {
+                driver_modes.iter().map(|m| (m.w, m.h)).collect()
+            };
+            if modes.is_empty() {
+                serial_println!("display> no modes (console not up?)");
+                return;
+            }
+            for (i, m) in modes.iter().enumerate() {
+                serial_println!(
+                    "display>   {}{}{}",
+                    format_wxh(*m),
+                    if i == 0 { "  (native)" } else { "" },
+                    if Some(*m) == cur { "  *current" } else { "" }
+                );
+            }
+        }
+        Some("set") => {
+            let want = it.next().unwrap_or("");
+            let pref = if want.eq_ignore_ascii_case("native") || want.eq_ignore_ascii_case("auto") {
+                None
+            } else {
+                match parse_wxh(want) {
+                    Some(m) => Some(m),
+                    None => {
+                        serial_println!("usage: /display set <WxH>|native   (see /display list)");
+                        return;
+                    }
+                }
+            };
+            // With a display driver bound, honour the request by programming the
+            // hardware — the full panel, no letterbox. `set_logical_size` is the
+            // `nomodeset` fallback for a firmware framebuffer.
+            if let Some(want) = pref {
+                if crate::kms::has_driver() {
+                    if let Some(m) = crate::kms::set_mode(want) {
+                        let mut cfg = display_config();
+                        cfg.logical = None; // a real mode set replaces the viewport
+                        save_display_config(&cfg);
+                        repaint_all_tabs();
+                        update_status();
+                        serial_println!("");
+                        serial_println!(
+                            "display> mode {}x{} set on {} (full panel)",
+                            m.w,
+                            m.h,
+                            crate::kms::driver_name().unwrap_or("?")
+                        );
+                        return;
+                    }
+                    serial_println!("display> driver refused {}x{} — falling back to a viewport", want.0, want.1);
+                }
+            }
+            match crate::framebuffer::set_logical_size(pref) {
+                Some(got) => {
+                    let mut cfg = display_config();
+                    // Persist `native` as absent, so the setting keeps meaning
+                    // "follow the panel" if a different display is attached.
+                    cfg.logical = pref.map(|_| got);
+                    save_display_config(&cfg);
+                    repaint_all_tabs();
+                    update_status();
+                    serial_println!(""); // the relayout consumed the echo's newline
+                    serial_println!(
+                        "display> desktop {}{}",
+                        format_wxh(got),
+                        if crate::framebuffer::is_letterboxed() { " (letterboxed)" } else { " (native)" }
+                    );
+                }
+                None => serial_println!("display> console not up"),
+            }
+        }
+        Some("scale") | Some("zoom") => {
+            let want = it.next().unwrap_or("");
+            let n = if want.eq_ignore_ascii_case("auto") || want.is_empty() {
+                0
+            } else {
+                match want.parse::<u64>() {
+                    Ok(n) => crate::display::clamp_font_scale(n),
+                    Err(_) => {
+                        serial_println!(
+                            "usage: /display scale <1-{}>|auto   (bigger scale = bigger text)",
+                            crate::display::MAX_FONT_SCALE
+                        );
+                        return;
+                    }
+                }
+            };
+            match crate::framebuffer::set_font_scale(n) {
+                Some(got) => {
+                    let mut cfg = display_config();
+                    cfg.font_scale = n;
+                    save_display_config(&cfg);
+                    repaint_all_tabs();
+                    update_status();
+                    serial_println!(""); // the relayout consumed the echo's newline
+                    serial_println!(
+                        "display> font scale {}{}",
+                        got,
+                        if n == 0 { " (auto, from the desktop height)" } else { "" }
+                    );
+                }
+                None => serial_println!("display> console not up"),
+            }
+        }
+        Some("boot") => {
+            let want = it.next().unwrap_or("");
+            let pref = if want.eq_ignore_ascii_case("auto") || want.eq_ignore_ascii_case("native") {
+                None
+            } else {
+                match parse_wxh(want) {
+                    Some(m) => Some(m),
+                    None => {
+                        serial_println!("usage: /display boot <WxH>|auto");
+                        return;
+                    }
+                }
+            };
+            let mut cfg = display_config();
+            cfg.boot_mode = pref;
+            save_display_config(&cfg);
+            match pref {
+                Some(m) => {
+                    serial_println!("display> next-boot panel mode recorded: {}", format_wxh(m));
+                    // Be exact about what this does today. The preference lives on
+                    // the ext4 store, but the loader can only read the ESP — so
+                    // mirroring it there (a FAT write) is what would make this
+                    // self-applying, and that is not wired up yet. Saying
+                    // "reboot to apply" would be untrue.
+                    serial_println!(
+                        "display> NOTE: not yet applied by the loader — the panel mode still comes from EDID."
+                    );
+                    serial_println!(
+                        "display>   VirtualBox: VBoxManage setextradata <vm> VBoxInternal2/EfiGraphicsResolution {}",
+                        format_wxh(m)
+                    );
+                    serial_println!(
+                        "display>   x86 image:  CHITTI_RESOLUTION={} cargo xtask image -arch x86_64",
+                        format_wxh(m)
+                    );
+                    serial_println!(
+                        "display>   for an instant change with no reboot: /display set {}",
+                        format_wxh(m)
+                    );
+                }
+                None => serial_println!("display> next boot: auto (the display's EDID decides)"),
+            }
+        }
+        Some(other) => serial_println!(
+            "display> unknown '{}' (status | list | set <WxH>|native | scale <n>|auto | boot <WxH>|auto)",
+            other
+        ),
+    }
+}
+#[cfg(any(feature = "server", test))]
+fn run_display(_arg: &str) {}
 
 /// Toggle fullscreen on the focused pane (Ctrl+F / `/pane full`).
 fn fb_toggle_fullscreen() {
     #[cfg(not(test))]
     {
         let st = crate::framebuffer::toggle_fullscreen();
-        // Geometry changed — re-present the active tab (video must re-letterbox
+        // Geometry changed — re-present every visible tab (video must re-letterbox
         // into the new pane size; without this the last small frame stays put).
-        repaint_active_tab();
+        // Restoring from fullscreen brings the other grid panes back, so they all
+        // need their interiors repainted, not just the focused one.
+        repaint_all_tabs();
         serial_println!(
             "pane> {}",
             match st {
@@ -10672,22 +11128,47 @@ fn fb_toggle_fullscreen() {
     }
 }
 
-/// Persist the current split ratio to `panes.json` (called after a resize drag).
+/// Persist the split ratio, pane budget, and action-grid shape + track weights
+/// to `panes.json`, so a resized layout comes back byte-identical after a reboot.
 #[cfg(all(not(feature = "server"), not(test)))]
 fn save_panes_config() {
     let pct = crate::framebuffer::split_pct();
+    let max = crate::framebuffer::max_panes();
+    let (cols, rows) = crate::framebuffer::grid_shape();
+    let (col_w, row_h) = crate::framebuffer::grid_weights();
+    let list = |v: &[u64]| -> alloc::string::String {
+        let mut s = alloc::string::String::from("[");
+        for (i, n) in v.iter().enumerate() {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(&alloc::format!("{}", n));
+        }
+        s.push(']');
+        s
+    };
     let text = alloc::format!(
-        "{{\n  \"chat_pct\": {},\n  \"num_action_panes\": 1\n}}\n",
-        pct
+        "{{\n  \"chat_pct\": {},\n  \"max_panes\": {},\n  \"grid_cols\": {},\n  \"grid_rows\": {},\n  \"col_weights\": {},\n  \"row_weights\": {}\n}}\n",
+        pct,
+        max,
+        cols,
+        rows,
+        list(&col_w),
+        list(&row_h)
     );
     crate::synapse::fs::write(PANES_PATH, text.as_bytes());
 }
 #[cfg(any(feature = "server", test))]
 fn save_panes_config() {}
 
-/// Load `panes.json` at boot and apply the split ratio. `num_action_panes` is
-/// read + clamped to 1..6; a value >1 is noted (the N-pane split is a scoped
-/// follow-up, so 1 is used for now).
+/// Load `panes.json` at boot: `chat_pct`, the pane budget, and the action-grid
+/// shape + track weights.
+///
+/// An explicit `grid_cols`/`grid_rows` wins (it also carries the drag-resized
+/// weights); otherwise `max_panes` picks a balanced grid, and legacy
+/// `num_action_panes` is still read as an action-pane count. Everything is
+/// re-clamped by `GridSpec::sanitized`, so a hand-edited file cannot produce a
+/// zero-size pane.
 #[cfg(all(not(feature = "server"), not(test)))]
 fn load_panes_config() {
     let Some(bytes) = crate::synapse::fs::read(PANES_PATH) else { return };
@@ -10696,40 +11177,136 @@ fn load_panes_config() {
     if let Some(p) = j.get("chat_pct").and_then(|v| v.as_i64()) {
         crate::framebuffer::set_split_pct(p.clamp(10, 90) as u64);
     }
-    if let Some(n) = j.get("num_action_panes").and_then(|v| v.as_i64()) {
-        if n.clamp(1, 6) > 1 {
-            serial_println!("panes> num_action_panes={} configured — multi-pane split lands in a follow-up; using 1", n);
-        }
+    let weights = |key: &str| -> alloc::vec::Vec<u64> {
+        j.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_i64()).map(|n| n.max(0) as u64).collect())
+            .unwrap_or_default()
+    };
+    let cols = j.get("grid_cols").and_then(|v| v.as_i64());
+    let rows = j.get("grid_rows").and_then(|v| v.as_i64());
+    if let (Some(c), Some(r)) = (cols, rows) {
+        let (c, r) = (c.max(1) as usize, r.max(1) as usize);
+        crate::framebuffer::set_grid_spec(c, r, weights("col_weights"), weights("row_weights"));
+        let (c, r) = crate::framebuffer::grid_shape();
+        serial_println!("panes> action grid {}x{} ({} pane(s))", c, r, c * r);
+        return;
     }
+    let Some(max) = crate::panes_layout::max_panes_from_cfg(
+        j.get("max_panes").and_then(|v| v.as_i64()),
+        j.get("num_action_panes").and_then(|v| v.as_i64()),
+    ) else {
+        return; // no layout keys present — leave the default alone
+    };
+    crate::framebuffer::set_max_panes(max);
+    let (c, r) = crate::framebuffer::grid_shape();
+    serial_println!("panes> max_panes={} (action grid {}x{})", max, c, r);
 }
 
-/// `/pane` — inspect/adjust the pane layout. Subcommands: `full` (toggle
-/// fullscreen), `split <10-90>` (set the chat width %), `swap`, `reset`.
+/// `/pane` — inspect/adjust the pane layout.
+/// Subcommands: `full`, `split <10-90>`, `max <2-9>`, `grid <cols> <rows>`,
+/// `focus <n|next|prev>`, `reset`.
 #[cfg(all(not(feature = "server"), not(test)))]
 fn run_pane(arg: &str) {
     let mut it = arg.split_whitespace();
     match it.next() {
         None | Some("status") => {
-            serial_println!("pane> split chat={}%  (F=fullscreen; /pane split <10-90>, /pane swap)", crate::framebuffer::split_pct());
+            let (cols, rows) = crate::framebuffer::grid_shape();
+            serial_println!(
+                "pane> max_panes={} action grid {}x{} ({} pane(s)) chat={}% focused=action{}",
+                crate::framebuffer::max_panes(),
+                cols,
+                rows,
+                cols * rows,
+                crate::framebuffer::split_pct(),
+                crate::framebuffer::focused_action_index() + 1
+            );
+            serial_println!(
+                "pane> full | split <10-90> | max <2-9> | grid <cols> <rows> | focus <n|next|prev> | reset  (drag any divider to resize)"
+            );
         }
         Some("full") | Some("fullscreen") => fb_toggle_fullscreen(),
         Some("split") => {
             if let Some(p) = it.next().and_then(|s| s.parse::<u64>().ok()) {
                 crate::framebuffer::set_split_pct(p);
                 save_panes_config();
-                repaint_active_tab();
+                repaint_all_tabs();
                 serial_println!("pane> chat width {}%", crate::framebuffer::split_pct());
             } else {
                 serial_println!("usage: /pane split <10-90>");
             }
         }
+        Some("max") | Some("panes") => {
+            if let Some(n) = it.next().and_then(|s| s.parse::<u64>().ok()) {
+                let n = crate::panes_layout::clamp_max_panes(n);
+                crate::framebuffer::set_max_panes(n);
+                save_panes_config();
+                repaint_all_tabs();
+                let (c, r) = crate::framebuffer::grid_shape();
+                serial_println!(
+                    "pane> max_panes={} (action grid {}x{}; shell always in the primary band)",
+                    n,
+                    c,
+                    r
+                );
+            } else {
+                serial_println!("usage: /pane max <2-9>");
+            }
+        }
+        Some("grid") => {
+            let c = it.next().and_then(|s| s.parse::<usize>().ok());
+            let r = it.next().and_then(|s| s.parse::<usize>().ok());
+            match (c, r) {
+                (Some(c), Some(r)) => {
+                    let (c, r) = crate::framebuffer::set_grid(c, r);
+                    save_panes_config();
+                    repaint_all_tabs();
+                    serial_println!(
+                        "pane> action grid {}x{} ({} pane(s), {} total)",
+                        c,
+                        r,
+                        c * r,
+                        c * r + 1
+                    );
+                }
+                _ => serial_println!("usage: /pane grid <cols> <rows>  (cols*rows <= 8)"),
+            }
+        }
+        Some("focus") => {
+            let i = match it.next() {
+                Some("next") | None => crate::framebuffer::focus_cycle_column(true),
+                Some("prev") => crate::framebuffer::focus_cycle_column(false),
+                Some(n) => match n.parse::<usize>() {
+                    // 1-based to match the `action<n>` labels in the status line.
+                    Ok(n) if n >= 1 => {
+                        crate::framebuffer::focus_action_column(n - 1);
+                        crate::framebuffer::focused_action_index()
+                    }
+                    _ => {
+                        serial_println!("usage: /pane focus <n|next|prev>");
+                        return;
+                    }
+                },
+            };
+            repaint_active_tab();
+            serial_println!("pane> focused action{}", i + 1);
+        }
         Some("reset") => {
+            crate::framebuffer::set_max_panes(crate::panes_layout::MAX_PANES_DEFAULT);
             crate::framebuffer::set_split_pct(crate::framebuffer::default_chat_pct());
             save_panes_config();
-            repaint_active_tab();
-            serial_println!("pane> reset");
+            repaint_all_tabs();
+            serial_println!(
+                "pane> reset (max_panes=2, grid 1x1, chat={}%)",
+                crate::framebuffer::default_chat_pct()
+            );
         }
-        Some(other) => serial_println!("pane> unknown '{}' (full | split <pct> | reset)", other),
+        Some(other) => {
+            serial_println!(
+                "pane> unknown '{}' (full | split <pct> | max <2-9> | grid <c> <r> | focus <n> | reset)",
+                other
+            )
+        }
     }
 }
 #[cfg(any(feature = "server", test))]
@@ -11494,7 +12071,7 @@ fn view_image(path: &str) {
 /// Also the repaint-on-switch path (surfaces aren't otherwise backed).
 #[cfg(all(not(feature = "server"), not(test)))]
 fn render_image() {
-    let (pw, ph) = crate::framebuffer::action_dims_px().unwrap_or((640, 480));
+    let (pw, ph) = crate::framebuffer::surface_dims_px(VIEWER_SURFACE).unwrap_or((640, 480));
     let bg = crate::framebuffer::pane_bg().unwrap_or(0);
     IMAGE.with(|s| {
         if let Some(t) = s.as_ref() {
@@ -11514,7 +12091,7 @@ fn repaint_image() {
 /// re-render the tab. No-op unless the image tab is loaded.
 #[cfg(all(not(feature = "server"), not(test)))]
 fn image_cmd(c: u8) {
-    let (pw, ph) = crate::framebuffer::action_dims_px().unwrap_or((640, 480));
+    let (pw, ph) = crate::framebuffer::surface_dims_px(VIEWER_SURFACE).unwrap_or((640, 480));
     let (pw, ph) = (pw as i64, ph as i64);
     IMAGE.with(|s| {
         let Some(t) = s.as_mut() else { return };

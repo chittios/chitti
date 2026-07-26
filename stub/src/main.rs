@@ -22,6 +22,114 @@ extern crate alloc;
 use uefi::boot::{self, AllocateType, MemoryType};
 use uefi::prelude::*;
 
+/// The kernel's EDID parser, mounted directly so the stub and the kernel cannot
+/// disagree about a display's native resolution (and so the bit-packing is
+/// covered by `cargo xtask test`, which the stub crate has no harness for).
+#[path = "../../kernel/src/edid.rs"]
+mod edid;
+
+/// `EFI_EDID_ACTIVE_PROTOCOL` / `EFI_EDID_DISCOVERED_PROTOCOL` — the EDID the
+/// firmware is currently using for a display, and the raw one it read from the
+/// monitor. Not in the `uefi` crate, so declared here; both protocols share this
+/// layout, sitting on the same handle as the `GraphicsOutput` protocol.
+#[repr(C)]
+struct EdidProtocol {
+    size_of_edid: u32,
+    edid: *const u8,
+}
+
+/// `EFI_EDID_ACTIVE_PROTOCOL_GUID`.
+const EDID_ACTIVE_GUID: uefi::Guid = uefi::guid!("bd8c1056-9f36-44ec-92a8-a6337f817986");
+/// `EFI_EDID_DISCOVERED_PROTOCOL_GUID`.
+const EDID_DISCOVERED_GUID: uefi::Guid = uefi::guid!("1c0c34f6-d380-41fa-a049-8ad06c1a66aa");
+
+/// The EDID the firmware settled on for this display.
+#[repr(transparent)]
+#[uefi::proto::unsafe_protocol(EDID_ACTIVE_GUID)]
+struct EdidActive(EdidProtocol);
+
+/// The raw EDID the firmware read from the monitor.
+#[repr(transparent)]
+#[uefi::proto::unsafe_protocol(EDID_DISCOVERED_GUID)]
+struct EdidDiscovered(EdidProtocol);
+
+/// Both EDID protocols share a layout; this lets one reader serve both.
+trait AsEdid {
+    fn as_edid(&self) -> &EdidProtocol;
+}
+impl AsEdid for EdidActive {
+    fn as_edid(&self) -> &EdidProtocol {
+        &self.0
+    }
+}
+impl AsEdid for EdidDiscovered {
+    fn as_edid(&self) -> &EdidProtocol {
+        &self.0
+    }
+}
+
+/// Read one EDID protocol off `handle` and return its **base block**.
+fn edid_from<T: uefi::proto::ProtocolPointer + AsEdid>(
+    handle: uefi::Handle,
+) -> Option<alloc::vec::Vec<u8>> {
+    // SAFETY: GetProtocol only reads the interface pointer — the firmware console
+    // already owns this handle, so an exclusive open would be denied.
+    let p = unsafe {
+        boot::open_protocol::<T>(
+            boot::OpenProtocolParams { handle, agent: boot::image_handle(), controller: None },
+            boot::OpenProtocolAttributes::GetProtocol,
+        )
+    }
+    .ok()?;
+    let e = p.as_edid();
+    let (len, ptr) = (e.size_of_edid as usize, e.edid);
+    // A protocol that exists but describes no data is common on virtual GPUs.
+    if ptr.is_null() || len < edid::BASE_BLOCK_LEN {
+        return None;
+    }
+    // SAFETY: the firmware owns this buffer and reports its length; we read only
+    // `len` bytes, and the borrow ends before boot services are exited.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    // Copy it out: the firmware's buffer is gone after ExitBootServices, and the
+    // kernel needs these bytes to identify the display.
+    edid::is_valid(bytes).then(|| bytes[..edid::BASE_BLOCK_LEN].to_vec())
+}
+
+/// `EFI_CONSOLE_OUT_DEVICE_GUID` — a marker (no interface) the firmware installs
+/// on the handle(s) it uses for console output.
+const CONSOLE_OUT_GUID: uefi::Guid = uefi::guid!("d3b36f2c-d551-11d4-9a46-0090273fc14d");
+
+/// A zero-sized stand-in for the console-out marker, which carries no interface —
+/// only its presence on a handle is meaningful.
+#[repr(transparent)]
+#[uefi::proto::unsafe_protocol(CONSOLE_OUT_GUID)]
+struct ConsoleOutDevice(u8);
+
+/// Whether the firmware draws its own console on `handle`.
+///
+/// This is the signal that identifies *the display the user is looking at* on a
+/// machine with more than one output: the firmware's boot messages went there.
+/// `test_protocol` only asks whether the marker is installed — it opens nothing,
+/// which matters because the console splitter already owns these handles.
+fn has_console_out(handle: uefi::Handle) -> bool {
+    boot::test_protocol::<ConsoleOutDevice>(boot::OpenProtocolParams {
+        handle,
+        agent: boot::image_handle(),
+        controller: None,
+    })
+    .unwrap_or(false)
+}
+
+/// The display's EDID base block on `handle`, if it publishes a valid one.
+///
+/// Tries the **active** EDID first (what the firmware settled on) and falls back
+/// to the **discovered** one (what the monitor actually said). Absent on most
+/// hypervisors and on headless boots, which is a legitimate answer — the caller
+/// must then keep the firmware's mode rather than invent one.
+fn edid_block(handle: uefi::Handle) -> Option<alloc::vec::Vec<u8>> {
+    edid_from::<EdidActive>(handle).or_else(|| edid_from::<EdidDiscovered>(handle))
+}
+
 /// The most heap the kernel will ever want (its largest per-model tier is 1 GiB
 /// for the 9B). The stub reserves this much in free RAM and reports the base; the
 /// kernel uses its own (<= this) tier within the reservation.
@@ -325,13 +433,46 @@ fn main() -> Status {
     // blt-only mode just means no boot-info (kernel falls back to ramfb/serial).
     let bootinfo: Option<u64> = (|| {
         use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
-        let h = match boot::get_handle_for_protocol::<GraphicsOutput>() {
-            Ok(h) => h,
-            Err(e) => {
-                log::info!("chitti-stub: no GOP handle: {e:?}");
+        // Enumerate **every** graphics output, not just the first. A real laptop
+        // with an external monitor attached exposes one GOP handle per display, so
+        // taking `get_handle_for_protocol` (= handle[0]) read the EDID of, and set
+        // the mode on, whichever output the firmware happened to list first — a
+        // coin flip between the built-in panel and the monitor.
+        let handles = match boot::locate_handle_buffer(
+            boot::SearchType::from_proto::<GraphicsOutput>(),
+        ) {
+            Ok(hs) if !hs.is_empty() => hs,
+            _ => {
+                log::info!("chitti-stub: no GOP handle");
                 return None;
             }
         };
+        // Describe each output, then let the shared policy choose (see
+        // `edid::pick_output`: firmware console-out first, then any output with a
+        // connected display, then output 0).
+        let mut infos = alloc::vec::Vec::with_capacity(handles.len());
+        let mut blocks: alloc::vec::Vec<Option<alloc::vec::Vec<u8>>> =
+            alloc::vec::Vec::with_capacity(handles.len());
+        for (i, &hh) in handles.iter().enumerate() {
+            let block = edid_block(hh);
+            let info = edid::OutputInfo {
+                console_out: has_console_out(hh),
+                edid_native: block.as_deref().and_then(edid::preferred_resolution),
+            };
+            log::info!(
+                "chitti-stub: GOP output {i}: console_out={} edid={:?} name={:?}",
+                info.console_out,
+                info.edid_native,
+                block.as_deref().and_then(edid::monitor_name)
+            );
+            infos.push(info);
+            blocks.push(block);
+        }
+        let out_idx = edid::pick_output(&infos)?;
+        let h = handles[out_idx];
+        if handles.len() > 1 {
+            log::info!("chitti-stub: driving GOP output {out_idx} of {}", handles.len());
+        }
         // Non-exclusive open: the firmware console (ConSplitter) already owns
         // GOP, so an exclusive open is denied. GetProtocol just reads it.
         let mut gop = match unsafe {
@@ -346,26 +487,69 @@ fn main() -> Status {
                 return None;
             }
         };
-        // Select the LARGEST available mode so an HDMI monitor runs at its full
-        // native resolution instead of whatever (often 800x600/1024x768) mode
-        // the firmware left GOP in. `Mode` is `Copy`, so pick the best while the
-        // read-only `modes()` iterator is alive, then `set_mode` it.
-        let mut best: Option<(uefi::proto::console::gop::Mode, usize)> = None;
-        for m in gop.modes() {
-            let mi = m.info();
-            if mi.pixel_format() == PixelFormat::BltOnly {
-                continue;
+        // Choose the display mode. Three cases, in order — the ordering is the
+        // whole point, because "biggest mode advertised" is NOT "native":
+        //
+        //  1. The display reports an EDID → use its **preferred timing**, the
+        //     panel's real native resolution. This is what firmware and every
+        //     other OS loader do.
+        //  2. No EDID → keep whatever mode the firmware is already in. On a
+        //     hypervisor that is the resolution the VM was *configured* for
+        //     (VirtualBox `VBoxInternal2/EfiGraphicsResolution`, UTM's display
+        //     setting), so overriding it ignored the user's choice — this stub
+        //     used to always jump to the largest advertised mode, which is why
+        //     a VirtualBox guest came up at a fixed 2560x1440 no matter what the
+        //     VM was set to.
+        //  3. No EDID *and* the firmware left a mode nobody would choose
+        //     (< 1024x768 — the classic real-hardware "UEFI came up at 800x600")
+        //     → then, and only then, take the largest advertised mode.
+        //
+        // `Mode` is `Copy`, so collect candidates while the read-only `modes()`
+        // iterator is alive, then `set_mode` outside it.
+        let native = infos[out_idx].edid_native;
+        let cur = gop.current_mode_info().resolution();
+        let modes: alloc::vec::Vec<uefi::proto::console::gop::Mode> = gop
+            .modes()
+            .filter(|m| m.info().pixel_format() != PixelFormat::BltOnly)
+            .collect();
+        let dims: alloc::vec::Vec<(usize, u32, u32)> = modes
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let (w, hh) = m.info().resolution();
+                (i, w as u32, hh as u32)
+            })
+            .collect();
+        let pick = match native {
+            Some((nw, nh)) => {
+                log::info!("chitti-stub: EDID native {nw}x{nh}");
+                edid::best_mode_for((nw, nh), dims.iter().copied())
             }
-            let (mw, mh) = mi.resolution();
-            let area = mw * mh;
-            if best.as_ref().map_or(true, |&(_, ba)| area > ba) {
-                best = Some((m, area));
+            None if edid::is_implausibly_small(cur.0 as u32, cur.1 as u32) => {
+                log::info!(
+                    "chitti-stub: no EDID and firmware mode {}x{} is a default nobody chose — taking the largest mode",
+                    cur.0,
+                    cur.1
+                );
+                dims.iter()
+                    .max_by_key(|(_, w, hh)| *w as u64 * *hh as u64)
+                    .map(|&(i, _, _)| i)
             }
-        }
-        if let Some((ref m, _)) = best {
+            None => {
+                // Respect the platform's configured resolution.
+                log::info!("chitti-stub: no EDID — keeping the firmware's {}x{} mode", cur.0, cur.1);
+                None
+            }
+        };
+        if let Some(i) = pick {
+            let m = &modes[i];
             let (mw, mh) = m.info().resolution();
-            if let Err(e) = gop.set_mode(m) {
+            if (mw, mh) == cur {
+                log::info!("chitti-stub: GOP already at {mw}x{mh}");
+            } else if let Err(e) = gop.set_mode(m) {
                 log::info!("chitti-stub: GOP set_mode {mw}x{mh} failed: {e:?} (keeping current)");
+            } else {
+                log::info!("chitti-stub: GOP set_mode {mw}x{mh}");
             }
         }
 
@@ -443,7 +627,23 @@ fn main() -> Status {
             page[112 + i * 16..120 + i * 16].copy_from_slice(&rb.to_le_bytes());
             page[120 + i * 16..128 + i * 16].copy_from_slice(&rsz.to_le_bytes());
         }
-        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x}, heap {hb:#x}, model {mb:#x}, RAM {} MiB in {n} extent(s) -> boot-info {addr:#x}", ram >> 20);
+        // The chosen output's EDID base block: length at 384..388, then the 128
+        // bytes at 388..516 (RAM extents end at 368, so this is free space).
+        //
+        // Passing the raw block — rather than a resolution the stub already
+        // digested — is the same handoff Linux's EFI stub does: the kernel needs
+        // the display's *identity* (vendor/product/serial) to keep per-monitor
+        // settings, and its name to show which output it is talking about. The
+        // firmware's buffer is gone after ExitBootServices, so it has to be copied
+        // here or not at all. Zero length = this display published no EDID.
+        let edid_bytes: &[u8] = blocks
+            .get(out_idx)
+            .and_then(|b| b.as_deref())
+            .unwrap_or(&[]);
+        let elen = edid_bytes.len().min(edid::BASE_BLOCK_LEN);
+        page[384..388].copy_from_slice(&(elen as u32).to_le_bytes());
+        page[388..388 + elen].copy_from_slice(&edid_bytes[..elen]);
+        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x}, heap {hb:#x}, model {mb:#x}, RAM {} MiB in {n} extent(s), EDID {elen}B -> boot-info {addr:#x}", ram >> 20);
         Some(addr)
     })();
 
