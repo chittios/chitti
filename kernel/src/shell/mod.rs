@@ -10962,7 +10962,14 @@ fn run_display(arg: &str) {
                 serial_println!(
                     "display>   {}{}{}",
                     format_wxh(*m),
-                    if i == 0 { "  (native)" } else { "" },
+                    // With a driver bound the list is the *display's*, so the head is
+                    // its preferred mode; without one it is viewport sizes inside the
+                    // firmware framebuffer, whose head really is native.
+                    if i == 0 {
+                        if crate::kms::has_driver() { "  (preferred)" } else { "  (native)" }
+                    } else {
+                        ""
+                    },
                     if Some(*m) == cur { "  *current" } else { "" }
                 );
             }

@@ -146,25 +146,14 @@ pub fn probe_bind_only() {
     if has_driver() {
         return;
     }
-    // VMware SVGA II (VirtualBox, QEMU `vmware-svga`) is **detected but not bound**:
-    // the driver is incomplete and binding it corrupts the display.
-    //
-    // SVGA II ignores the mode registers until the **FIFO** has been set up and
-    // `SVGA_REG_CONFIG_DONE` written — until then the device stays in its VGA mode.
-    // So a mode set appears to succeed (the registers read back what was written)
-    // while the scanout keeps its old geometry, and the compositor draws at a pitch
-    // the device is not using: verified against `qemu-system-x86_64 -device
-    // vmware-svga`, which rendered the console four times side by side. Reporting
-    // the device and declining is strictly better than a scrambled screen — the
-    // firmware framebuffer still works.
-    //
-    // To finish it: map BAR2, program FIFO_MIN/MAX/NEXT_CMD/STOP, write
-    // CONFIG_DONE, then re-test the mode set against that same QEMU device.
-    if vmsvga::VmSvga::probe().is_some() {
-        crate::serial_println!(
-            "kms> vmsvga detected but NOT enabled (needs FIFO/CONFIG_DONE init) -- using the firmware framebuffer"
-        );
-        crate::ktrace::log("kms", "vmsvga present, driver incomplete: not bound");
+    // VMware SVGA II (VirtualBox, QEMU `vmware-svga`) first: where both exist the
+    // SVGA device is the machine's actual display. It only leaves VGA mode once its
+    // FIFO is configured and `CONFIG_DONE` accepted, which `VmSvga::init` does —
+    // and it refuses to bind if the device rejects the ring, because driving it in
+    // that state makes a mode set silently do nothing.
+    if let Some(v) = vmsvga::VmSvga::probe() {
+        bind(Box::new(v));
+        return;
     }
     if let Some(g) = virtio_gpu::VirtioGpu::probe() {
         bind(Box::new(g));

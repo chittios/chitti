@@ -281,26 +281,53 @@ Four things that path teaches:
   loop. Matched by **vendor+device id**, never display class: `virtio-gpu-pci`
   reports class `03:00` like every other VGA device.
 
-**VMSVGA (`kms/vmsvga.rs`) is written, detected, and deliberately NOT bound.** The
-mode registers are the easy part; SVGA II ignores them until the **FIFO** is set up
-and `SVGA_REG_CONFIG_DONE` is written, so until then the device stays in its VGA
-mode. A mode set then *appears* to succeed — the registers read back what was
-written — while the scanout keeps its old geometry, and the compositor draws at a
-pitch the device is not using. Against `qemu-system-x86_64 -device vmware-svga` that
-rendered the console **four times side by side**; the first guess (a stale
-`BYTES_PER_LINE`, fixed by disabling across the change and validating
-`pitch >= w*4`) did not help, because the cause is upstream of the pitch. So probe
-reports the device and declines: a scrambled screen is worse than no driver, and the
-firmware framebuffer still works. To finish: map BAR2, program
-`FIFO_MIN/MAX/NEXT_CMD/STOP`, write `CONFIG_DONE`, retest against that QEMU device.
-Note `Regs` already abstracts BAR0 as I/O ports (x86) *or* MMIO, decided from the
-BAR's type bit — VirtualBox-ARM must use the latter, and that path is unexercised.
+**VMSVGA (`kms/vmsvga.rs`) works** — the backend for **VirtualBox** and QEMU's
+`vmware-svga`. Verified by screendump: `1024x768` -> `1280x720`, clean. Getting there
+needed three things that are each easy to get wrong:
+
+- **The FIFO, not just the mode registers.** SVGA II ignores `WIDTH`/`HEIGHT` until
+  its command ring (BAR2) is configured and `CONFIG_DONE` is *accepted*: set
+  `MIN`/`MAX`/`NEXT_CMD`/`STOP`, where `MIN` must clear the extended register area
+  (`SVGA_FIFO_NUM_REGS * 4`) when `SVGA_CAP_EXTENDED_FIFO` is set, and `MAX - MIN`
+  must leave at least 10 KiB or the device rejects the ring. Before that the registers
+  read back whatever was written while the scanout keeps its geometry — the console
+  rendered **four times side by side**. `init` refuses to bind if `CONFIG_DONE` reads
+  back 0, because driving it in that state makes a mode set silently do nothing.
+- **`flush` is NOT a no-op.** In VGA mode the device tracks framebuffer writes; once
+  in SVGA mode it only repaints from `SVGA_CMD_UPDATE` in the FIFO. So the driver
+  queues an update rect per damage flush and pokes `SVGA_REG_SYNC`. Drawing without it
+  leaves the screen frozen on the mode-set frame. (virtio-gpu needs the same thing for
+  a different reason — see above — so both backends are damage-driven.)
+- **The geometry registers do not report the mode in effect.** Before the guest first
+  enables SVGA mode they hold the device's defaults (QEMU answers 640x480) while the
+  display is at whatever the firmware programmed through VGA. So the current mode is
+  seeded from the **live framebuffer** and only falls back to the registers; trusting
+  them made `preferred` 640x480 on a 1024x768 console, which is what a KMS-only boot
+  would then have come up in. `MAX_WIDTH/MAX_HEIGHT` is a VRAM ceiling (an odd
+  2368x1770 on QEMU), never a mode to offer as native.
+
+Two safety rules this driver had to learn the hard way, both after breaking a real
+VirtualBox display:
+
+- **Probing must not change the device.** `CONFIG_DONE` and the ring pointers alter
+  how the device scans out, and at probe time the console is still drawing into the
+  *firmware's* framebuffer — so writing them in `init` moved the scanout out from
+  under a live console and left the display offset and clipped. They now happen
+  lazily in `ensure_fifo`, on the first actual mode set. Same rule the I2C/EC drivers
+  follow: identification only ever reads.
+- **`VMSVGA_ALLOW_MMIO` is off.** `Regs` can reach BAR0 as I/O ports *or* MMIO, but
+  only the port path can be tested here (QEMU emulates `vmware-svga` on x86 only,
+  where BAR0 is I/O). VirtualBox-ARM needs the MMIO path and its register layout is a
+  guess; acting on that guess mis-programmed a real display. So it declines and keeps
+  the firmware framebuffer — the KMS layer is optional, and getting these registers
+  wrong costs the console, not just a feature. Verify the layout on the target before
+  flipping the flag.
 
 Without a bound backend the whole module is inert and the compositor keeps the
 loader's framebuffer — the position Linux is in with `efifb`/`simpledrm`
 (`nomodeset`): mode fixed by firmware, `/display set` letterboxes instead, console
-legibility via font size. Still absent: a working **VMSVGA** backend (what
-VirtualBox needs — see below), and real-hardware drivers (i915/AMD/AGX).
+legibility via font size. Still absent: real-hardware GPU drivers (i915/AMD/AGX) —
+see the note on why there is no display equivalent of xHCI/AHCI.
 
 **A machine can have more than one display, so the stub enumerates every graphics
 output** (`locate_handle_buffer`, not `get_handle_for_protocol`) and picks one via

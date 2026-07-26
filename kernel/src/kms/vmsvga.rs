@@ -66,6 +66,13 @@ use crate::pci::{self, PciDevice};
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::pci::{self, PciDevice};
 
+/// Whether to drive the device when BAR0 is memory-mapped rather than an I/O BAR.
+///
+/// Off: that path cannot be tested here (QEMU emulates `vmware-svga` on x86 only,
+/// where BAR0 is I/O), and enabling it on a guess mis-programmed a real
+/// VirtualBox-ARM display. Verify the register layout on the target first.
+const VMSVGA_ALLOW_MMIO: bool = false;
+
 /// VMware's PCI vendor id, and the SVGA II device id.
 const VENDOR_VMWARE: u16 = 0x15AD;
 const DEVICE_SVGA2: u16 = 0x0405;
@@ -83,6 +90,39 @@ const REG_FB_START: u32 = 13;
 const REG_FB_OFFSET: u32 = 14;
 const REG_VRAM_SIZE: u32 = 15;
 const REG_FB_SIZE: u32 = 16;
+const REG_CAPABILITIES: u32 = 17;
+/// FIFO size in bytes (the BAR2 window).
+const REG_MEM_SIZE: u32 = 19;
+/// Set once the FIFO area is validly configured. **Without this the device stays in
+/// VGA mode and ignores the mode registers entirely.**
+const REG_CONFIG_DONE: u32 = 20;
+/// Write to ask the device to process the FIFO now.
+const REG_SYNC: u32 = 21;
+/// Nonzero while the device is still working through the FIFO.
+const REG_BUSY: u32 = 22;
+
+/// `SVGA_CAP_EXTENDED_FIFO` — the FIFO carries a register area the device writes
+/// into, which the guest must reserve by setting `MIN` past it.
+const CAP_EXTENDED_FIFO: u32 = 0x0000_8000;
+
+// FIFO layout, as **dword indices** into the BAR2 window.
+const FIFO_MIN: u64 = 0;
+const FIFO_MAX: u64 = 1;
+const FIFO_NEXT_CMD: u64 = 2;
+const FIFO_STOP: u64 = 3;
+/// Size of the extended FIFO register area, in dwords (`SVGA_FIFO_NUM_REGS`).
+const FIFO_NUM_REGS: u32 = 291;
+
+/// `SVGA_CMD_UPDATE` — "this rectangle of the framebuffer changed". Followed by
+/// x, y, width, height.
+const CMD_UPDATE: u32 = 1;
+
+/// Bounded spin while waiting for the device to consume FIFO space.
+const FIFO_DRAIN_SPINS: u32 = 200_000;
+
+/// The device validates the FIFO before accepting `CONFIG_DONE`, and one of the
+/// checks is that there is at least 10 KiB of command space (`max - min`).
+const FIFO_MIN_CMD_BYTES: u32 = 10 * 1024;
 
 /// Version handshake values. The driver writes the highest it supports and reads
 /// back what the device agreed to; anything below `ID_0` means this is not a
@@ -164,6 +204,13 @@ pub struct VmSvga {
     fb_virt: u64,
     fb_phys: u64,
     fb_size: u32,
+    /// Mapped FIFO (BAR2) and the ring bounds, in bytes.
+    fifo: u64,
+    fifo_min: u32,
+    fifo_max: u32,
+    /// Whether the ring has been published and `CONFIG_DONE` accepted. Deferred out
+    /// of probe so binding the driver cannot disturb a live console.
+    configured: bool,
     max: (u32, u32),
     cur: Option<Mode>,
 }
@@ -189,6 +236,26 @@ impl VmSvga {
         let regs = if bar0 & 1 != 0 {
             Regs::Port { base: (bar0 & 0xffff_fffc) as u16 }
         } else {
+            // **Refused by default.** The index/value pair over MMIO is the branch no
+            // emulator here can exercise — QEMU only provides `vmware-svga` on x86,
+            // where BAR0 is an I/O BAR — and this register layout is a guess. Acting
+            // on a guess drove a VirtualBox-ARM display into a wrong geometry, so the
+            // safe answer is to decline and leave the firmware framebuffer alone. The
+            // whole KMS layer is optional; losing mode setting costs a feature,
+            // getting the registers wrong costs the console.
+            //
+            // To enable: confirm on the target that BAR0 really is an index/value pair
+            // at +0/+4, then flip `VMSVGA_ALLOW_MMIO`.
+            if !VMSVGA_ALLOW_MMIO {
+                crate::ktrace::log(
+                    "vmsvga",
+                    "BAR0 is memory-mapped; that transport is unverified — declining",
+                );
+                crate::serial_println!(
+                    "kms> vmsvga found but its BAR0 is MMIO (unverified transport) -- keeping the firmware framebuffer"
+                );
+                return None;
+            }
             let phys = (bar0 & 0xffff_fff0) as u64;
             if phys == 0 {
                 return None;
@@ -219,16 +286,70 @@ impl VmSvga {
             return None;
         }
         let fb_virt = crate::mm::map_mmio(fb_phys, fb_size as usize);
+
+        // --- FIFO geometry: **read only** -----------------------------------------
+        //
+        // Probing must not change the device. `CONFIG_DONE` and the ring pointers
+        // alter how the device scans out, and at probe time the console is still
+        // drawing into the *firmware's* framebuffer — so writing them here moved the
+        // scanout out from under a live console and produced a display offset and
+        // clipped on VirtualBox. Same rule the I2C/EC drivers follow: identification
+        // only ever reads. The ring is configured lazily on the first real mode set
+        // (`ensure_fifo`).
+        let fifo_phys = d.bar(2);
+        let fifo_size = regs.read(REG_MEM_SIZE);
+        if fifo_phys == 0 || fifo_size == 0 {
+            crate::ktrace::log("vmsvga", "no FIFO (BAR2/MEM_SIZE) — cannot leave VGA mode");
+            return None;
+        }
+        let caps = regs.read(REG_CAPABILITIES);
+        // With the extended FIFO the device writes its own registers into the front of
+        // the ring, so `MIN` must sit past them or command data and those registers
+        // overwrite each other.
+        let fifo_min = if caps & CAP_EXTENDED_FIFO != 0 { FIFO_NUM_REGS * 4 } else { 4 * 4 };
+        let fifo_max = fifo_size;
+        if fifo_max < fifo_min + FIFO_MIN_CMD_BYTES {
+            crate::ktrace::log_fmt(format_args!(
+                "vmsvga: FIFO too small ({fifo_size} bytes, need {fifo_min} + 10 KiB)"
+            ));
+            return None;
+        }
+        let fifo = crate::mm::map_mmio(fifo_phys, fifo_size as usize);
+
         crate::ktrace::log_fmt(format_args!(
-            "vmsvga: up (id {:#x}, {} regs), fb {:#x} ({} KiB), max {}x{}",
+            "vmsvga: up (id {:#x}, {} regs), fb {:#x} ({} KiB), fifo {:#x} ({} KiB, min {}), caps {:#x}, max {}x{}",
             agreed,
             regs.kind(),
             fb_phys,
             fb_size / 1024,
+            fifo_phys,
+            fifo_size / 1024,
+            fifo_min,
+            caps,
             max.0,
             max.1
         ));
-        Some(VmSvga { regs, fb_virt, fb_phys, fb_size, max, cur: None })
+        // Seed the current mode from the device's own geometry registers. Without
+        // this `preferred` fell back to MAX_WIDTH/MAX_HEIGHT — the largest surface
+        // the VRAM could hold (an odd 2368x1770 on QEMU), which is a ceiling, not a
+        // mode anyone chose, and it would be what a KMS-only boot came up in.
+        // Seed the current mode from the framebuffer the console is **actually** using,
+        // and only fall back to the device's geometry registers.
+        //
+        // The order matters and is counter-intuitive: those registers do not report
+        // the mode in effect. Before the guest has ever enabled SVGA mode they hold
+        // the device's own defaults — QEMU answers 640x480 — while the display is
+        // really at whatever the firmware programmed through the VGA path. Trusting
+        // them made `preferred` 640x480 on a 1024x768 console, which is the mode a
+        // KMS-only boot would then have come up in.
+        let cur = crate::framebuffer::physical_size()
+            .filter(|&(w, h)| w > 0 && h > 0 && w <= max.0 && h <= max.1)
+            .map(|(w, h)| Mode::new(w, h))
+            .or_else(|| {
+                let (cw, ch) = (regs.read(REG_WIDTH), regs.read(REG_HEIGHT));
+                (cw > 0 && ch > 0 && cw <= max.0 && ch <= max.1).then(|| Mode::new(cw, ch))
+            });
+        Some(VmSvga { regs, fb_virt, fb_phys, fb_size, fifo, fifo_min, fifo_max, configured: false, max, cur })
     }
 }
 
@@ -241,11 +362,13 @@ impl DisplayDriver for VmSvga {
         // One output: SVGA II's multi-monitor support is a separate (screen-object)
         // feature this driver does not use, so reporting one is the honest answer
         // rather than inventing connectors we cannot program.
-        let cur = self.cur.unwrap_or(Mode::new(self.max.0, self.max.1));
-        let mut modes = alloc::vec![cur];
+        let mut modes = Vec::new();
+        if let Some(cur) = self.cur {
+            modes.push(cur);
+        }
         for &(w, h) in crate::display::STANDARD_MODES {
             let m = Mode::new(w, h);
-            if m != cur && w <= self.max.0 && h <= self.max.1 {
+            if Some(m) != self.cur && w <= self.max.0 && h <= self.max.1 {
                 modes.push(m);
             }
         }
@@ -253,7 +376,7 @@ impl DisplayDriver for VmSvga {
             id: 0,
             name: alloc::string::String::from("SVGA-1"),
             connected: true,
-            preferred: Some(cur),
+            preferred: self.cur,
             modes,
             edid: None,
         }]
@@ -266,6 +389,8 @@ impl DisplayDriver for VmSvga {
         if mode.w > self.max.0 || mode.h > self.max.1 {
             return Err("mode exceeds the device maximum");
         }
+        // Take the device out of VGA mode now, not at probe.
+        self.ensure_fifo()?;
         // Disable across the change. Writing geometry to an already-enabled device
         // leaves it scanning out with the *previous* configuration, and the
         // registers read back stale — which is how this first produced a screen
@@ -315,7 +440,110 @@ impl DisplayDriver for VmSvga {
         })
     }
 
-    // `flush` is intentionally the default no-op: this framebuffer is scanned out
-    // continuously, so a write is on screen already. (The FIFO update command
-    // exists for the accelerated paths this driver does not use.)
+    /// Present a dirty rectangle by queueing `SVGA_CMD_UPDATE`.
+    ///
+    /// **Not** a no-op, which is the trap here: in VGA mode the device tracks
+    /// framebuffer writes, but once it is in SVGA mode (`ENABLE` + `CONFIG_DONE`) it
+    /// only repaints from FIFO commands. Drawing without this leaves the screen
+    /// frozen on whatever was there when the mode was set.
+    fn flush(&mut self, x: u32, y: u32, w: u32, h: u32) {
+        let Some(cur) = self.cur else { return };
+        // Clip to the scanout: a damage rect computed against a stale size would ask
+        // the device to read past the surface.
+        let x0 = x.min(cur.w);
+        let y0 = y.min(cur.h);
+        let w = w.min(cur.w - x0);
+        let h = h.min(cur.h - y0);
+        if w == 0 || h == 0 {
+            return;
+        }
+        if self.fifo_write(&[CMD_UPDATE, x0, y0, w, h]) {
+            // Ask the device to process what we just queued, so the update lands now
+            // rather than on its next refresh tick.
+            self.regs.write(REG_SYNC, 1);
+        }
+    }
+}
+
+impl VmSvga {
+    /// Publish the ring and take the device out of VGA mode. Idempotent.
+    ///
+    /// Deliberately **not** done at probe: this is the write that changes the
+    /// scanout, so it happens only when a mode set is actually requested.
+    fn ensure_fifo(&mut self) -> Result<(), &'static str> {
+        if self.configured {
+            return Ok(());
+        }
+        // SAFETY: `fifo` is the mapped BAR2 window, at least `fifo_max` bytes.
+        unsafe {
+            mmio_w32(self.fifo + FIFO_MIN * 4, self.fifo_min);
+            mmio_w32(self.fifo + FIFO_MAX * 4, self.fifo_max);
+            mmio_w32(self.fifo + FIFO_NEXT_CMD * 4, self.fifo_min);
+            mmio_w32(self.fifo + FIFO_STOP * 4, self.fifo_min);
+        }
+        self.regs.write(REG_CONFIG_DONE, 1);
+        if self.regs.read(REG_CONFIG_DONE) == 0 {
+            return Err("device refused CONFIG_DONE (FIFO rejected)");
+        }
+        self.configured = true;
+        Ok(())
+    }
+
+    /// Bytes free in the command ring, i.e. how far `NEXT_CMD` may advance before it
+    /// would run into `STOP` (the device's read pointer).
+    fn fifo_free(&self) -> u32 {
+        // SAFETY: `fifo` is the mapped BAR2 window.
+        let (next, stop) = unsafe {
+            (mmio_r32(self.fifo + FIFO_NEXT_CMD * 4), mmio_r32(self.fifo + FIFO_STOP * 4))
+        };
+        let span = self.fifo_max - self.fifo_min;
+        if span == 0 {
+            return 0;
+        }
+        // One word is always left unused so full and empty stay distinguishable.
+        if next >= stop {
+            span - (next - stop) - 4
+        } else {
+            (stop - next) - 4
+        }
+    }
+
+    /// Append `words` to the command ring, wrapping at `MAX`.
+    ///
+    /// Drains first if the ring is too full, with a **bounded** wait: a wedged device
+    /// must cost a dropped frame, not a hung console.
+    fn fifo_write(&mut self, words: &[u32]) -> bool {
+        let need = (words.len() * 4) as u32;
+        let mut spins = 0u32;
+        while self.fifo_free() < need {
+            if spins == 0 {
+                self.regs.write(REG_SYNC, 1); // ask it to consume
+            }
+            spins += 1;
+            if spins > FIFO_DRAIN_SPINS || self.regs.read(REG_BUSY) == 0 {
+                // Either it will not drain, or it is idle and still has no room —
+                // both mean this update is dropped. The next damage flush retries.
+                crate::ktrace::log("vmsvga", "FIFO full; dropping an update");
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        // SAFETY: `fifo` is the mapped BAR2 window and every offset below is kept
+        // inside [fifo_min, fifo_max) by the wrap.
+        unsafe {
+            let mut next = mmio_r32(self.fifo + FIFO_NEXT_CMD * 4);
+            for &word in words {
+                mmio_w32(self.fifo + next as u64, word);
+                next += 4;
+                if next >= self.fifo_max {
+                    next = self.fifo_min;
+                }
+            }
+            // Publish the new write pointer only after the whole command is in
+            // place, or the device can consume a half-written command.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            mmio_w32(self.fifo + FIFO_NEXT_CMD * 4, next);
+        }
+        true
+    }
 }

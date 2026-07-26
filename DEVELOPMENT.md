@@ -264,13 +264,18 @@ device:
 ```sh
 CHITTI_GPU=virtio cargo xtask run -arch aarch64 --uefi   # ramfb + virtio-gpu-pci
 CHITTI_GPU=virtio cargo xtask run -arch x86_64
-CHITTI_GPU=vmware cargo xtask run -arch x86_64           # exercises the declined VMSVGA path
+CHITTI_GPU=vmware cargo xtask run -arch x86_64           # VMSVGA (x86 only; see below)
 ```
 
 Two things that are not obvious:
 
 - **aarch64 needs `--uefi`.** PCI comes from the stub's ACPI, so on the plain
   `-kernel` path virtio-gpu is invisible; the knob says so and falls back to ramfb.
+- **VMSVGA only drives an I/O-BAR device.** VirtualBox-ARM exposes BAR0 as memory,
+  and that register layout is unverified — driving it on a guess put a real VBox
+  display into the wrong geometry, so it now declines and keeps the firmware
+  framebuffer (`VMSVGA_ALLOW_MMIO` in `kms/vmsvga.rs`). On VirtualBox, resolution
+  therefore still comes from the firmware: `make vbox VBOX_RES=1920x1080`.
 - **ramfb is kept alongside virtio-gpu.** Booting aarch64/HVF with virtio-gpu as the
   *only* display puts the firmware's GOP framebuffer inside the device's BAR, and
   writing there after ExitBootServices aborts QEMU with
