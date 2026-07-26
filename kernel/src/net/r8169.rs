@@ -51,9 +51,65 @@ const MAR0: usize = 0x08; // multicast filter, 8 bytes
 const TX_DESC_LO: usize = 0x20;
 const TX_DESC_HI: usize = 0x24;
 const CHIP_CMD: usize = 0x37; // u8
-const TX_POLL: usize = 0x38; // u8
-const INTR_MASK: usize = 0x3c; // u16
-const INTR_STATUS: usize = 0x3e; // u16
+const TX_POLL: usize = 0x38; // u8   (8168; the 8125 moves it — see `RegMap`)
+const INTR_MASK: usize = 0x3c; // u16  (8168)
+const INTR_STATUS: usize = 0x3e; // u16 (8168)
+
+// --- the three registers the RTL8125 moves --------------------------------
+//
+// 2.5GbE parts are dispatched to this driver because Linux drives them with it, but
+// they are not register-compatible everywhere: the interrupt mask and status widen to
+// 32 bits and move to 0x38/0x3c, and the transmit doorbell moves to 0x90. The 8168
+// offsets overlap those new positions, so driving an 8125 with them writes the transmit
+// doorbell into the interrupt mask — which is why this is a per-chip map rather than a
+// comment saying "treat 8125 with caution".
+//
+// Offsets from Linux's `r8169_main.c` register map. **Unverified on hardware**: QEMU
+// models no r8169-family part at all, so the value of splitting them is that an 8125 is
+// now driven with its own offsets instead of another chip's, not that it is proven.
+
+/// RTL8125 interrupt mask — 32-bit, at the offset the 8168 uses for the doorbell.
+const INTR_MASK_8125: usize = 0x38;
+/// RTL8125 interrupt status — 32-bit.
+const INTR_STATUS_8125: usize = 0x3c;
+/// RTL8125 transmit doorbell.
+const TX_POLL_8125: usize = 0x90;
+
+/// Which registers this chip actually has, and how wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegMap {
+    pub intr_mask: usize,
+    pub intr_status: usize,
+    pub tx_poll: usize,
+    /// True on the 8125, whose interrupt registers are 32 bits rather than 16.
+    pub wide_intr: bool,
+}
+
+/// PCI device ids of the 2.5GbE parts.
+const RTL8125_IDS: &[u16] = &[0x8125, 0x3000];
+
+/// The register map for a Realtek device id.
+///
+/// Pure, so the one thing that decides whether an 8125 is driven correctly is testable
+/// without the card — which matters more than usual here, because there is no emulated
+/// r8169 anywhere to catch a mistake.
+pub fn reg_map(device: u16) -> RegMap {
+    if RTL8125_IDS.contains(&device) {
+        RegMap {
+            intr_mask: INTR_MASK_8125,
+            intr_status: INTR_STATUS_8125,
+            tx_poll: TX_POLL_8125,
+            wide_intr: true,
+        }
+    } else {
+        RegMap {
+            intr_mask: INTR_MASK,
+            intr_status: INTR_STATUS,
+            tx_poll: TX_POLL,
+            wide_intr: false,
+        }
+    }
+}
 const TX_CONFIG: usize = 0x40;
 const RX_CONFIG: usize = 0x44;
 const CFG_9346: usize = 0x50; // u8 — register write lock
@@ -130,9 +186,26 @@ const BUFSZ: usize = 2048;
 const DESC_SZ: usize = 16;
 const MMIO_SPAN: usize = 0x1000;
 
+/// Mask every interrupt and acknowledge whatever was pending, at whatever width and
+/// offset this chip keeps those registers.
+///
+/// A 16-bit write to the 8125's 32-bit mask would leave the upper half whatever firmware
+/// left it as — and this driver polls, so an unmasked source has nothing to service it.
+fn mask_intr(regs: u64, map: &RegMap) {
+    if map.wide_intr {
+        w32(regs, map.intr_mask, 0);
+        w32(regs, map.intr_status, 0xffff_ffff);
+    } else {
+        w16(regs, map.intr_mask, 0);
+        w16(regs, map.intr_status, 0xffff);
+    }
+}
+
 /// A poll-driven Realtek r8169-family NIC.
 pub struct Rtl8169 {
     regs: u64,
+    /// Where this chip's moving registers actually are.
+    map: RegMap,
     mac: [u8; 6],
     rx_ring: u64,
     tx_ring: u64,
@@ -189,9 +262,15 @@ impl Rtl8169 {
         crate::ktrace::log_fmt(format_args!("r8169: registers in BAR{which} at {bar:#x}"));
         let regs = crate::mm::map_mmio(bar, MMIO_SPAN);
 
+        // Which registers this chip has. Done before the first write, because two of the
+        // three that move are ones this very sequence touches.
+        let map = reg_map(d.device);
+        if map.wide_intr {
+            crate::ktrace::log("r8169", "RTL8125-class part: 32-bit interrupt registers at 0x38/0x3c, doorbell at 0x90");
+        }
+
         // Mask interrupts and clear any pending status — this driver polls.
-        w16(regs, INTR_MASK, 0);
-        w16(regs, INTR_STATUS, 0xffff);
+        mask_intr(regs, &map);
 
         // Soft reset: self-clearing, spec allows ~100 us.
         w8(regs, CHIP_CMD, CMD_RESET);
@@ -280,7 +359,7 @@ impl Rtl8169 {
         w32(regs, MAR0, 0xffff_ffff);
         w32(regs, MAR0 + 4, 0xffff_ffff);
 
-        w16(regs, INTR_MASK, 0); // still polling
+        mask_intr(regs, &map); // still polling
         w8(regs, CFG_9346, CFG9346_LOCK);
 
         // Link state, bounded — auto-negotiation on a gigabit PHY takes a while.
@@ -319,7 +398,7 @@ impl Rtl8169 {
             crate::ktrace::log("r8169", "link down after bring-up -- check the cable; this driver is unverified on hardware, see the module docs");
         }
 
-        Some(Rtl8169 { regs, mac, rx_ring, tx_ring, rx_bufs, tx_bufs, tx_bufs_phys, rx_cur: 0, tx_cur: 0 })
+        Some(Rtl8169 { regs, map, mac, rx_ring, tx_ring, rx_bufs, tx_bufs, tx_bufs_phys, rx_cur: 0, tx_cur: 0 })
     }
 }
 
@@ -390,6 +469,50 @@ impl NetDevice for Rtl8169 {
         fence(Ordering::Release);
         self.tx_cur = (i + 1) % NTX;
         // Realtek has no tail register — poke TxPoll to tell the NIC to look.
-        w8(self.regs, TX_POLL, TX_POLL_NPQ);
+        w8(self.regs, self.map.tx_poll, TX_POLL_NPQ);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn the_8125_gets_its_own_register_offsets() {
+        // The reason this is a map and not a comment: the 8168's transmit doorbell (0x38)
+        // is the 8125's interrupt *mask*, and the 8168's mask (0x3c) is the 8125's
+        // status. Driving an 8125 with 8168 offsets writes the doorbell into the mask —
+        // a NIC that neither transmits nor stays quiet.
+        let m = reg_map(0x8125);
+        assert!(m.wide_intr);
+        assert_eq!(m.intr_mask, 0x38);
+        assert_eq!(m.intr_status, 0x3c);
+        assert_eq!(m.tx_poll, 0x90);
+        assert_ne!(m.tx_poll, TX_POLL, "the doorbell must not stay at the 8168 offset");
+    }
+
+    #[test_case]
+    fn the_8168_family_keeps_the_classic_layout() {
+        // 0x8168 is the single most common Ethernet controller in consumer PCs; nothing
+        // about adding 8125 support may move its registers.
+        for id in [0x8168u16, 0x8169, 0x8136, 0x8161, 0x8162, 0x8167] {
+            let m = reg_map(id);
+            assert!(!m.wide_intr, "{id:#06x} must not be treated as 8125-class");
+            assert_eq!(m.intr_mask, 0x3c);
+            assert_eq!(m.intr_status, 0x3e);
+            assert_eq!(m.tx_poll, 0x38);
+        }
+    }
+
+    #[test_case]
+    fn every_id_the_dispatcher_sends_here_gets_a_map() {
+        // `nic_ids` claims a fixed list for this driver; each one has to land in exactly
+        // one of the two layouts, or a card would be driven with a default that suits
+        // neither.
+        for &id in crate::net::nic_ids::realtek_r8169_ids() {
+            let m = reg_map(id);
+            let is_8125 = RTL8125_IDS.contains(&id);
+            assert_eq!(m.wide_intr, is_8125, "{id:#06x} classified inconsistently");
+        }
     }
 }

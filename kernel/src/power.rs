@@ -303,6 +303,9 @@ fn enter() -> Result<(), String> {
         .ok_or_else(|| String::from("no \\_S3 package"))?;
     let facs = crate::acpi::facs_from_rsdp(rsdp, crate::mm::map_mmio)
         .ok_or_else(|| String::from("no FACS"))?;
+    // Ask the touchpad to sleep before the machine does: a device left powered while the
+    // bus controller loses its state is the one most likely to come back confused.
+    crate::drivers::i2c_hid::suspend();
     crate::arch::x86_64::suspend::suspend(&sleep, &facs).map_err(String::from)?;
     resume_devices();
     Ok(())
@@ -363,6 +366,9 @@ fn resume_devices() {
         // The i8042 controller comes back with its configuration byte reset, so a
         // keyboard that worked before suspend types nothing after it.
         x86_64::keyboard::init();
+        // And the HID-over-I2C touchpad, which loses its power state the same way — it
+        // would otherwise answer register reads and produce no reports.
+        crate::drivers::i2c_hid::resume();
         // The trampoline resumed with interrupts masked.
         x86_64::interrupts::enable();
         crate::ktrace::log("resume", "APIC timer, i8042 and interrupts re-armed");

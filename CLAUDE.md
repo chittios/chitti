@@ -479,6 +479,51 @@ The touchpad's descriptor register now comes from `_DSM` too
 `_DSM` UUID goes in ACPI's **mixed-endian** buffer order, or the table's own `LEqual`
 fails and the method silently takes its unsupported branch.
 
+**A HID-over-I2C touchpad reads fine while powered down, which is the trap.** The HID
+descriptor is answerable from a device that has never been powered on — so descriptor
+parsing appeared to work while no report would ever arrive. `SET_POWER(ON)` then `RESET`
+through the **command register** (`drivers::i2c_hid`) is what makes reports flow, and the
+command encoding is register-address-LE then argument then opcode: swapping the last two
+sends `SET_POWER` as report-type 8 of opcode 0, which a device answers by doing nothing
+rather than by NAKing, so the symptom is a dead touchpad and not an error. The sequence is
+deliberately only reachable *after* `HidDesc::parse` validates, because those are the
+first **writes** this driver makes and the same bus carries the embedded controller.
+`sleep()`/`resume()` exist for the suspend path, where the device loses its state.
+
+**A battery percentage needs the AC adapter to be meaningful, and `_BST` will not tell
+you.** Once a pack is full, `_BST` reports *neither* charging nor discharging — so a
+plugged-in machine and one running down produce byte-identical flags. `ACPI0003`'s `_PSR`
+is the missing half (`=` in the status bar), reported as `None` rather than guessed as
+unplugged when no adapter device exists. Two more things a laptop needs: `_STA` bit 4 says
+whether a bay actually contains a pack (a removed battery leaves its device in the
+namespace), and a machine with two packs has two `PNP0C0A` devices — `aml::devices_by_hid`
+returns all of them and the capacities are **summed**, because reporting the first pack
+presents half the machine's charge as all of it. Flags union: one pack discharging means
+the machine is.
+
+**The RTL8125 is not register-compatible with the 8168 it is dispatched with.** The
+2.5GbE parts move the interrupt mask and status to 0x38/0x3c and widen them to 32 bits,
+and the transmit doorbell to 0x90 — and the 8168 offsets *overlap* those positions, so
+driving an 8125 with them writes the doorbell into the interrupt mask. `net::r8169`
+carries a per-chip `RegMap` (pure, unit-tested, including that every id the dispatcher
+sends here lands in exactly one layout) rather than a comment saying to treat 8125 with
+caution. Still unverified: QEMU models no r8169-family part at all.
+
+**Intel WiFi (`drivers::wifi::iwl`) is identification and firmware only, deliberately.**
+An Intel radio does nothing until an image is loaded, and the image is chosen by chip
+family plus an API version that is a property of the *file* — Linux tries filenames
+newest-first, and so does `fw::firmware_candidates`. An unrecognised Intel id is **not**
+claimed: the wrong firmware fails a signature check *inside* the device with no error the
+host can read, which is worse than the Ethernet dispatcher's silent non-receiving NIC.
+The `.ucode` TLV parser refuses a pre-TLV image (leading word non-zero), a wrong magic and
+any record claiming more than the file holds, and pads record lengths to 4 bytes — one
+odd-length record misaligns every record after it. Firmware is **fetched, never
+committed** (`cargo xtask iwlwifi-assets` into the gitignored `assets/wifi/iwl/`), which
+is the same rule the Broadcom assets follow and the reason this needed no licensing
+decision. What does *not* exist: the register interface, NIC reset, command rings, the
+firmware handshake, and 802.11 + WPA2 — so `/wifi` reports the part and the image it would
+need, and says it cannot connect.
+
 **Interrupt-controller bases are discovered, and there are two sources, not one.**
 aarch64 finds the GICv3 from the device tree's `arm,gic-v3` `reg` when there is an
 FDT, and otherwise from the **ACPI MADT** (`acpi::gic_from_rsdp`: GICD type `0x0D`

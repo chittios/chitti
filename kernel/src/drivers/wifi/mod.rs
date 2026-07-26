@@ -14,6 +14,7 @@
 //! SSID and connect runs DHCP on the virtio/e1000 NIC.
 
 pub mod brcm;
+pub mod iwl;
 
 /// Pure brcmfmac helpers (always available for unit tests).
 pub use brcm::proto;
@@ -105,6 +106,24 @@ pub fn radio_ready() -> bool {
 pub fn info_lines() -> Vec<String> {
     use alloc::format;
     let mut lines = Vec::new();
+    // Intel WiFi, if the machine has one. Identification only — say so on the same line
+    // as the part name, so nobody reads "AX200 found" as "WiFi works".
+    if let Some(f) = iwl::probe() {
+        lines.push(format!(
+            "adapter: Intel {} (device {:#06x}) -- identified only, no driver yet",
+            f.family.label(),
+            f.device_id
+        ));
+        lines.push(format!(
+            "  firmware needed: {} (would try {} API versions down to {})",
+            f.firmware.first().map(|s| s.as_str()).unwrap_or("?"),
+            f.firmware.len(),
+            f.family.min_api()
+        ));
+        lines.push(
+            "  fetch with `cargo xtask iwlwifi-assets`; scan/associate is not implemented".into(),
+        );
+    }
     #[cfg(all(target_arch = "aarch64", not(test)))]
     {
         if crate::arch::aarch64::is_apple() {

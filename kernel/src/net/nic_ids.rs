@@ -95,6 +95,13 @@ const REALTEK_8139: &[u16] = &[0x8129, 0x8138, 0x8139];
 
 /// Realtek **r8169**-class gigabit/2.5G (Linux `r8169`): RTL8169/8168/8111/8101/
 /// 8125. `0x8168` is the single most common Ethernet controller in consumer PCs.
+/// The ids dispatched to [`super::r8169`], so that driver's own tests can assert every
+/// one of them lands in a known register layout rather than a default that suits neither
+/// generation.
+pub fn realtek_r8169_ids() -> &'static [u16] {
+    REALTEK_R8169
+}
+
 const REALTEK_R8169: &[u16] = &[0x3000, 0x8125, 0x8136, 0x8161, 0x8162, 0x8167, 0x8168, 0x8169];
 
 /// Classify a PCI network function by vendor/device ID.

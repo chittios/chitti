@@ -435,6 +435,7 @@ fn main() {
         "test" => cmd_test(),
         "voice-assets" => cmd_voice_assets(),
         "wifi-assets" => cmd_wifi_assets(),
+        "iwlwifi-assets" => cmd_iwlwifi_assets(),
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
         // boot the real model, run the acceptance checks, exit pass/fail.
         "ref-check" => cmd_ref_check(arch, model),
@@ -456,6 +457,7 @@ fn usage() -> String {
     "usage: cargo xtask <build|image|run|m1n1|test|ref-check|voice-assets|wifi-assets> [-arch x86_64|aarch64] \
      [-model qwen3.5-0.8b|2b|4b|9b|gemma-4-e4b|bonsai-27b|bonsai-27b-ternary] [--release] [--uefi] [-server]\n\
      wifi-assets: extract Apple FullMAC firmware from macOS into assets/wifi/ (for /wifi load).\n\
+     iwlwifi-assets: fetch Intel WiFi firmware from linux-firmware into assets/wifi/iwl/.\n\
      m1n1 (aarch64): package the kernel as a gzip'd arm64 Image and boot it on a \
      tethered Apple Silicon Mac over the m1n1 USB proxy; configure via env \
      CHITTI_M1N1/CHITTI_DTB[/CHITTI_INITRD/CHITTI_BOOTARGS/M1N1DEVICE].\n\
@@ -2628,6 +2630,75 @@ fn cmd_voice_assets() -> Result<(), String> {
         eprintln!("voice-assets: parakeet already present");
     }
     eprintln!("voice-assets: done — assets/voice/ ready");
+    Ok(())
+}
+
+/// `cargo xtask iwlwifi-assets`: fetch Intel WiFi firmware into `assets/wifi/iwl/`.
+///
+/// **Fetched, never committed** — the same rule as the Broadcom assets, and the reason
+/// this needed no licensing decision: `assets/wifi/` is gitignored, so the repository
+/// carries no redistributable blob and each machine pulls what its own hardware needs.
+///
+/// Takes the family stem to fetch, or every family's newest known image by default. The
+/// API version is a property of the file rather than the chip, so this walks candidates
+/// newest-first and stops at the first one the upstream tree actually has — exactly what
+/// the in-kernel loader does with the local directory.
+fn cmd_iwlwifi_assets() -> Result<(), String> {
+    let out = repo_root().join("assets/wifi/iwl");
+    fs::create_dir_all(&out).map_err(|e| format!("mkdir {}: {e}", out.display()))?;
+
+    // The kernel's own table, kept in one place: a stem plus the API range to try.
+    // Duplicated deliberately as data rather than shared code — xtask is a host binary
+    // and does not link the kernel — and `iwlwifi_stems_match_the_kernel` in
+    // `drivers::wifi::iwl::fw` is what stops the two drifting.
+    let families: &[(&str, u32, u32)] = &[
+        ("iwlwifi-cc-a0", 50, 89),        // AX200/AX201
+        ("iwlwifi-ty-a0-gf-a0", 50, 89),  // AX210/AX211
+        ("iwlwifi-gl-c0-fm-c0", 50, 89),  // BE200
+        ("iwlwifi-9260", 30, 46),
+        ("iwlwifi-8265", 22, 36),
+        ("iwlwifi-7260", 12, 17),
+    ];
+    const BASE: &str = "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/main";
+
+    let mut got = 0usize;
+    for (stem, min_api, max_api) in families {
+        if (*min_api..=*max_api).rev().any(|api| {
+            let name = format!("{stem}-{api}.ucode");
+            let dst = out.join(&name);
+            if dst.exists() {
+                eprintln!("iwlwifi-assets: {name} already present");
+                return true;
+            }
+            let url = format!("{BASE}/{name}");
+            match Command::new("curl")
+                .args(["-fsSL", "-o"])
+                .arg(&dst)
+                .arg(&url)
+                .status()
+            {
+                Ok(st) if st.success() => {
+                    eprintln!("iwlwifi-assets: fetched {name}");
+                    true
+                }
+                _ => {
+                    // A missing API version is the normal case, not an error: only a few
+                    // of the range exist upstream. Remove the empty file curl may leave.
+                    let _ = fs::remove_file(&dst);
+                    false
+                }
+            }
+        }) {
+            got += 1;
+        } else {
+            eprintln!("iwlwifi-assets: no image found upstream for {stem}");
+        }
+    }
+    if got == 0 {
+        return Err("iwlwifi-assets: fetched nothing -- check network access".into());
+    }
+    eprintln!("iwlwifi-assets: {got} image(s) in {}", out.display());
+    eprintln!("iwlwifi-assets: note -- identification only so far; there is no driver to load them yet");
     Ok(())
 }
 

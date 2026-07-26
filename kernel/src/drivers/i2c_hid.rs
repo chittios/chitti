@@ -34,6 +34,40 @@ use crate::block::BlockError;
 /// on the large majority of devices and is what Linux falls back to.
 pub const DEFAULT_HID_DESC_REG: u16 = 0x0020;
 
+// --- HID-over-I2C commands ------------------------------------------------
+//
+// A command is a write of the 2-byte command-register address followed by two command
+// bytes: the low byte carries the report type/ID (and, for SET_POWER, the power state),
+// the high byte the opcode. Nothing here reads a report — these are the writes that make
+// a device start producing them at all.
+
+/// `RESET` — the device re-initialises and then signals completion by presenting a
+/// zero-length input report.
+pub const HID_OP_RESET: u8 = 0x01;
+/// `SET_POWER` — the power state travels in the command's low byte.
+pub const HID_OP_SET_POWER: u8 = 0x08;
+
+/// `SET_POWER` argument: fully on.
+pub const HID_POWER_ON: u8 = 0x00;
+/// `SET_POWER` argument: sleep. What a suspend should leave the touchpad in.
+pub const HID_POWER_SLEEP: u8 = 0x01;
+
+/// Encode one HID-over-I2C command as the bytes to write.
+///
+/// Register address little-endian, then the command's low byte (argument) and high byte
+/// (opcode) — in that order, which is the part worth pinning: swapping them sends
+/// `SET_POWER` as report-type 8 of opcode 0, which a device answers by doing nothing at
+/// all rather than by NAKing.
+pub fn encode_command(cmd_reg: u16, opcode: u8, arg: u8) -> [u8; 4] {
+    let r = cmd_reg.to_le_bytes();
+    [r[0], r[1], arg, opcode]
+}
+
+/// Spins to wait for a reset to complete. A device answers within milliseconds; this is
+/// generous and finite, because a touchpad that never finishes resetting must not hang
+/// the boot.
+const RESET_SPINS: u32 = 200_000;
+
 /// The ACPI id every HID-over-I2C device reports in `_HID` or `_CID`.
 pub const HID_I2C_PNP_ID: &str = "PNP0C50";
 
@@ -189,6 +223,66 @@ impl I2cHid {
         bus.write_read(addr, &reg.to_le_bytes(), out)
     }
 
+    /// Send one HID-over-I2C command.
+    fn command(bus: &mut DwI2c, addr: u16, cmd_reg: u16, opcode: u8, arg: u8) -> Result<(), BlockError> {
+        let bytes = encode_command(cmd_reg, opcode, arg);
+        // A write with nothing to read: `write_read` puts STOP on the last data byte
+        // when the read buffer is empty, which is exactly a write-only transfer.
+        bus.write_read(addr, &bytes, &mut [])
+    }
+
+    /// Power the device on and reset it, so it starts producing input reports.
+    ///
+    /// **This is what was missing.** The HID descriptor is readable from a device that
+    /// is still powered down — which is why the descriptor phase appeared to work — but
+    /// no report ever arrives until `SET_POWER(ON)` and `RESET` have been sent. A
+    /// touchpad without this reads perfectly and then does nothing, forever.
+    ///
+    /// Deliberately only reachable *after* [`HidDesc::parse`] has validated the
+    /// descriptor. That ordering is the safety property the probe path depends on: the
+    /// caller may be walking `_CRS` addresses that belong to the embedded controller or
+    /// a sensor, and these are the first *writes* this driver makes to the device.
+    fn power_on_and_reset(bus: &mut DwI2c, addr: u16, cmd_reg: u16, input_reg_len: usize) -> bool {
+        if Self::command(bus, addr, cmd_reg, HID_OP_SET_POWER, HID_POWER_ON).is_err() {
+            crate::ktrace::log("i2c_hid", "SET_POWER(ON) was not acknowledged");
+            return false;
+        }
+        if Self::command(bus, addr, cmd_reg, HID_OP_RESET, 0).is_err() {
+            crate::ktrace::log("i2c_hid", "RESET was not acknowledged");
+            return false;
+        }
+        // A reset completes when the device presents a report — a zero-length one, which
+        // is its documented way of saying "nothing pending". Either answer means it is
+        // talking to us; only silence for the whole budget is a failure.
+        let mut buf = alloc::vec![0u8; input_reg_len.min(64).max(2)];
+        for _ in 0..RESET_SPINS {
+            if bus.write_read(addr, &[], &mut buf).is_ok() {
+                crate::ktrace::log("i2c_hid", "powered on and reset");
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        crate::ktrace::log("i2c_hid", "device never answered after RESET");
+        false
+    }
+
+    /// Put the device to sleep, for a suspend.
+    pub fn sleep(&mut self) -> bool {
+        let r = Self::command(&mut self.bus, self.addr, self.desc.command_reg, HID_OP_SET_POWER, HID_POWER_SLEEP);
+        r.is_ok()
+    }
+
+    /// Power the device back on after a resume. The controller and the device both lose
+    /// their state across S3, so this is the same sequence boot uses.
+    pub fn resume(&mut self) -> bool {
+        Self::power_on_and_reset(
+            &mut self.bus,
+            self.addr,
+            self.desc.command_reg,
+            self.desc.max_input_len as usize,
+        )
+    }
+
     /// Try to bring up a HID-over-I2C device at `addr`.
     ///
     /// Returns `None` for anything that does not answer as one. This is deliberately
@@ -205,6 +299,12 @@ impl I2cHid {
             "i2c_hid: device at {addr:#x}: report desc {} bytes at reg {:#x}, input reg {:#x}, max input {}",
             desc.report_desc_len, desc.report_desc_reg, desc.input_reg, desc.max_input_len
         ));
+        // Now that the descriptor has validated — so we know this is a HID device and
+        // not the embedded controller sharing the bus — power it on and reset it. Until
+        // this happens the device answers register reads but produces no reports.
+        if !Self::power_on_and_reset(&mut bus, addr, desc.command_reg, desc.max_input_len as usize) {
+            return None;
+        }
         // Fetch and decode the report descriptor with the same parser the USB pointer
         // path uses, so both decode identically.
         let mut rd = alloc::vec![0u8; desc.report_desc_len as usize];
@@ -245,6 +345,35 @@ impl I2cHid {
 
 /// The touchpad, once found.
 static HID: crate::mm::Locked<Option<I2cHid>> = crate::mm::Locked::new(None);
+
+/// Put the touchpad to sleep before a suspend, if there is one.
+pub fn suspend() {
+    HID.with(|h| {
+        if let Some(d) = h.as_mut() {
+            if !d.sleep() {
+                crate::ktrace::log("i2c_hid", "SET_POWER(SLEEP) failed; suspending anyway");
+            }
+        }
+    });
+}
+
+/// Power the touchpad back on after a resume.
+///
+/// The device loses its state across S3 exactly as the controller does, so this is the
+/// same power-on-and-reset boot uses. Without it a resumed machine has a touchpad that
+/// answers register reads and produces no reports — the same failure the boot path had
+/// before the sequence existed.
+pub fn resume() {
+    HID.with(|h| {
+        if let Some(d) = h.as_mut() {
+            if d.resume() {
+                crate::ktrace::log("i2c_hid", "touchpad powered back on after resume");
+            } else {
+                crate::ktrace::log("i2c_hid", "touchpad did not come back after resume");
+            }
+        }
+    });
+}
 
 /// Find and bring up a HID-over-I2C pointer, if this machine has one.
 ///
@@ -484,6 +613,41 @@ mod tests {
         d[22..24].copy_from_slice(&0x0023u16.to_le_bytes()); // command reg
         d[24..26].copy_from_slice(&0x0024u16.to_le_bytes()); // data reg
         d
+    }
+
+    #[test_case]
+    fn a_command_is_the_register_then_argument_then_opcode() {
+        // Byte order is the whole encoding. Swapping the last two sends SET_POWER as
+        // report-type 8 of opcode 0, which a device answers by doing nothing at all
+        // rather than by NAKing — so the failure looks like a dead touchpad, not an
+        // error.
+        assert_eq!(
+            encode_command(0x0023, HID_OP_SET_POWER, HID_POWER_ON),
+            [0x23, 0x00, 0x00, 0x08]
+        );
+        assert_eq!(
+            encode_command(0x0023, HID_OP_SET_POWER, HID_POWER_SLEEP),
+            [0x23, 0x00, 0x01, 0x08]
+        );
+        assert_eq!(encode_command(0x0023, HID_OP_RESET, 0), [0x23, 0x00, 0x00, 0x01]);
+    }
+
+    #[test_case]
+    fn the_command_register_address_is_little_endian() {
+        // A two-byte register address, low byte first — the same convention every other
+        // register access here uses, and a device NAKs a swapped one.
+        assert_eq!(encode_command(0x1234, HID_OP_RESET, 0)[..2], [0x34, 0x12]);
+        assert_eq!(encode_command(0x00ff, HID_OP_RESET, 0)[..2], [0xff, 0x00]);
+    }
+
+    #[test_case]
+    fn the_reset_and_power_opcodes_are_the_spec_values() {
+        // From the HID-over-I2C specification. Pinned because a wrong opcode is
+        // indistinguishable at runtime from a device that simply does not respond.
+        assert_eq!(HID_OP_RESET, 0x01);
+        assert_eq!(HID_OP_SET_POWER, 0x08);
+        assert_eq!(HID_POWER_ON, 0x00);
+        assert_eq!(HID_POWER_SLEEP, 0x01);
     }
 
     #[test_case]

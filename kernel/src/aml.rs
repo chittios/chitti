@@ -569,16 +569,28 @@ pub fn device_name(aml: &[u8], dev: &DeviceNode, name: &str) -> Option<Value> {
 /// replacement for guessing an I2C address: instead of probing every connection, ask
 /// the namespace which device claims to be a touchpad and read *its* `_CRS`.
 pub fn device_by_hid(aml: &[u8], hid: &str) -> Option<DeviceNode> {
-    devices(aml).into_iter().find(|d| {
-        for key in ["_HID", "_CID"] {
-            if let Some(Value::String(s)) = device_name(aml, d, key) {
-                if s == hid {
-                    return true;
+    devices_by_hid(aml, hid).into_iter().next()
+}
+
+/// **Every** device claiming `hid`, in namespace order.
+///
+/// A laptop with two batteries has two `PNP0C0A` devices, and taking only the first
+/// reports one pack as if it were the machine's whole charge. Same shape for anything
+/// else a machine can have more than one of.
+pub fn devices_by_hid(aml: &[u8], hid: &str) -> Vec<DeviceNode> {
+    devices(aml)
+        .into_iter()
+        .filter(|d| {
+            for key in ["_HID", "_CID"] {
+                if let Some(Value::String(s)) = device_name(aml, d, key) {
+                    if s == hid {
+                        return true;
+                    }
                 }
             }
-        }
-        false
-    })
+            false
+        })
+        .collect()
 }
 
 // --- evaluation -----------------------------------------------------------

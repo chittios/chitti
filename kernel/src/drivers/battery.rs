@@ -36,6 +36,17 @@ use alloc::string::String;
 /// ACPI hardware ID of a control-method battery.
 pub const BATTERY_HID: &str = "PNP0C0A";
 
+/// ACPI hardware ID of an **AC adapter**.
+///
+/// The other half of a laptop's power state: a full battery sitting on mains reports
+/// neither charging nor discharging in `_BST`, so without this "100%" and "100%,
+/// plugged in" are indistinguishable.
+pub const AC_ADAPTER_HID: &str = "ACPI0003";
+
+/// `_STA` bit 4 — the device is **present**. A bay a battery was removed from still has
+/// a `PNP0C0A` device in the namespace; only `_STA` says whether anything is in it.
+pub const STA_BATTERY_PRESENT: u64 = 1 << 4;
+
 /// ACPI's "this value is unknown" sentinel for a 32-bit capacity or rate.
 pub const UNKNOWN: u64 = 0xffff_ffff;
 
@@ -88,6 +99,9 @@ pub struct BatteryState {
     pub discharging: bool,
     /// True when firmware says the level is critical.
     pub critical: bool,
+    /// Whether the machine is on mains, if an AC adapter device answered. `None` means
+    /// the firmware exposes none — reported as unknown rather than guessed as unplugged.
+    pub ac: Option<bool>,
 }
 
 /// Decode a `_BST` return value.
@@ -230,6 +244,17 @@ fn read_space_byte(space: u8, addr: u64) -> Option<u8> {
     }
 }
 
+/// Whether the machine is on mains, from the AC adapter's `_PSR`.
+///
+/// `None` when the firmware exposes no `ACPI0003` device or its `_PSR` will not
+/// evaluate — reported as unknown rather than guessed as unplugged, because "on battery"
+/// is a claim a status bar should not invent.
+fn ac_online(dsdt: &'static [u8]) -> Option<bool> {
+    let dev = aml::device_by_hid(dsdt, AC_ADAPTER_HID)?;
+    let v = eval(dsdt, &dev, "_PSR")?.as_int()?;
+    Some(v != 0)
+}
+
 /// Evaluate one method on the battery device, resolving its field reads against
 /// hardware.
 fn eval(dsdt: &'static [u8], dev: &aml::DeviceNode, method: &str) -> Option<Value> {
@@ -256,37 +281,69 @@ pub fn read() -> Option<BatteryState> {
     let rsdp = return None;
 
     let dsdt = crate::acpi::dsdt_bytes(rsdp, crate::mm::map_mmio)?;
-    let dev = aml::device_by_hid(dsdt, BATTERY_HID)?;
+    let ac = ac_online(dsdt);
 
-    let bst = match eval(dsdt, &dev, "_BST").as_ref().and_then(parse_bst) {
-        Some(b) => b,
-        None => {
+    // Every battery, not the first: a laptop with two packs reports each separately, and
+    // taking one of them would present half the machine's charge as all of it.
+    let mut remaining = 0u64;
+    let mut full_total = 0u64;
+    let mut state = 0u64;
+    let mut found = 0usize;
+    for dev in aml::devices_by_hid(dsdt, BATTERY_HID) {
+        // A bay whose battery was removed still has its device in the namespace; only
+        // `_STA` says whether anything is in it. A machine with no `_STA` at all is
+        // treated as present, which is what the specification's default says.
+        if let Some(sta) = eval(dsdt, &dev, "_STA").and_then(|v| v.as_int()) {
+            if sta & STA_BATTERY_PRESENT == 0 {
+                crate::ktrace::log_fmt(format_args!("battery: {} reports no battery in the bay", dev.path));
+                continue;
+            }
+        }
+        let Some(bst) = eval(dsdt, &dev, "_BST").as_ref().and_then(parse_bst) else {
             crate::ktrace::log_fmt(format_args!(
                 "battery: {} _BST did not evaluate to a 4-element package",
                 dev.path
             ));
-            return None;
+            continue;
+        };
+        // `_BIX` first: it is the newer method, and a machine providing both should be
+        // read through the one with more information.
+        let full = eval(dsdt, &dev, "_BIX")
+            .as_ref()
+            .and_then(full_capacity)
+            .or_else(|| eval(dsdt, &dev, "_BIF").as_ref().and_then(full_capacity));
+        let Some(full) = full else {
+            crate::ktrace::log_fmt(format_args!(
+                "battery: {} gave no usable last-full capacity (_BIX/_BIF)",
+                dev.path
+            ));
+            continue;
+        };
+        if bst.remaining == UNKNOWN {
+            continue;
         }
-    };
-    // `_BIX` first: it is the newer method, and a machine providing both should be
-    // read through the one with more information.
-    let full = eval(dsdt, &dev, "_BIX")
-        .as_ref()
-        .and_then(full_capacity)
-        .or_else(|| eval(dsdt, &dev, "_BIF").as_ref().and_then(full_capacity));
-    let Some(full) = full else {
-        crate::ktrace::log_fmt(format_args!(
-            "battery: {} gave no usable last-full capacity (_BIX/_BIF)",
-            dev.path
-        ));
+        remaining += bst.remaining;
+        full_total += full;
+        // Flags are unioned: with two packs, one discharging means the machine is.
+        state |= bst.state;
+        found += 1;
+    }
+    if found == 0 {
         return None;
+    }
+    let combined = Bst {
+        state,
+        rate: 0,
+        remaining,
+        voltage: 0,
     };
-    let percent = percent(&bst, full)?;
+    let percent = percent(&combined, full_total)?;
     Some(BatteryState {
         percent,
-        charging: bst.charging(),
-        discharging: bst.discharging(),
-        critical: bst.critical(),
+        charging: combined.charging(),
+        discharging: combined.discharging(),
+        critical: combined.critical(),
+        ac,
     })
 }
 
@@ -460,8 +517,13 @@ pub fn diagnose() -> alloc::vec::Vec<String> {
 /// marked differently, and the percentage never gains a leading space that would
 /// shift the rest of the bar.
 pub fn format(b: &BatteryState) -> String {
+    // Charging first: it is the most actionable fact. Then a plugged-in-but-not-charging
+    // machine — a full battery on mains reports neither flag in `_BST`, so without the AC
+    // adapter it would read identically to one running down. Then critical.
     let mark = if b.charging {
         "+"
+    } else if b.ac == Some(true) && !b.discharging {
+        "="
     } else if b.critical {
         "!"
     } else {
@@ -652,12 +714,73 @@ mod tests {
     }
 
     #[test_case]
+    fn a_full_battery_on_mains_is_not_the_same_as_one_running_down() {
+        // The reason the AC adapter is read at all: `_BST` reports *neither* charging nor
+        // discharging once a pack is full, so a plugged-in machine and one on battery
+        // produce byte-identical flags. Without the mains state the status bar cannot
+        // tell them apart.
+        let full_on_mains = BatteryState {
+            percent: 100,
+            charging: false,
+            discharging: false,
+            critical: false,
+            ac: Some(true),
+        };
+        let full_on_battery = BatteryState {
+            ac: Some(false),
+            ..full_on_mains
+        };
+        assert_eq!(format(&full_on_mains), "=100%");
+        assert_eq!(format(&full_on_battery), "100%");
+        // Unknown mains state must not be reported as unplugged.
+        assert_eq!(format(&BatteryState { ac: None, ..full_on_mains }), "100%");
+    }
+
+    #[test_case]
+    fn charging_outranks_the_plug_and_the_critical_mark() {
+        let b = BatteryState {
+            percent: 5,
+            charging: true,
+            discharging: false,
+            critical: true,
+            ac: Some(true),
+        };
+        assert_eq!(format(&b), "+5%");
+    }
+
+    #[test_case]
+    fn two_packs_combine_into_one_percentage() {
+        // Two batteries are summed, not averaged and not taken one at a time: 1000 of
+        // 4000 plus 3000 of 4000 is 50% of the machine, which neither pack reports on
+        // its own. And the flags are unioned — one pack discharging means the machine is.
+        let a = Bst { state: 0, rate: 0, remaining: 1000, voltage: 0 };
+        let b = Bst { state: BST_DISCHARGING, rate: 0, remaining: 3000, voltage: 0 };
+        let combined = Bst {
+            state: a.state | b.state,
+            rate: 0,
+            remaining: a.remaining + b.remaining,
+            voltage: 0,
+        };
+        assert_eq!(percent(&combined, 4000 + 4000), Some(50));
+        assert!(combined.discharging());
+    }
+
+    #[test_case]
+    fn the_sta_present_bit_is_the_spec_one() {
+        // Bit 4 of `_STA`. A removed battery leaves its device in the namespace, so this
+        // bit is the only thing that says the bay is empty — and reading the wrong bit
+        // would report a phantom pack's stale capacity.
+        assert_eq!(STA_BATTERY_PRESENT, 0x10);
+    }
+
+    #[test_case]
     fn status_text_marks_charging_and_critical() {
         let base = BatteryState {
             percent: 42,
             charging: false,
             discharging: true,
             critical: false,
+            ac: None,
         };
         assert_eq!(format(&base), "42%");
         assert_eq!(
