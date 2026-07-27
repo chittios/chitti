@@ -36,6 +36,7 @@ pub mod csr;
 #[cfg(target_arch = "x86_64")]
 pub mod device;
 pub mod fw;
+pub mod proto;
 
 use alloc::string::String;
 
@@ -187,12 +188,22 @@ pub fn bring_up() -> Result<String, String> {
     let mut dev = device::IwlDevice::open(d, found.family)
         .ok_or_else(|| String::from("bring-up failed -- see the iwlwifi: ktrace lines"))?;
     let phys = dev.load_firmware(&image, &bytes).map_err(String::from)?;
-    Ok(alloc::format!(
-        "{} reset, {} ({}) handed over at {phys:#x}; no receive path yet, so firmware cannot be confirmed alive",
-        found.family.label(),
-        name,
-        image.version
-    ))
+    // The load is only believable if firmware answers. Before the receive ring existed
+    // this was where bring-up stopped and "handed over" was the strongest claim available.
+    match dev.wait_for_alive() {
+        Ok(()) => Ok(alloc::format!(
+            "{} reset, {} ({}) loaded at {phys:#x} -- firmware is alive. No command queue or \
+             802.11 yet, so it cannot associate.",
+            found.family.label(),
+            name,
+            image.version
+        )),
+        Err(e) => Err(alloc::format!(
+            "{} reset and {} handed over at {phys:#x}, but {e}",
+            found.family.label(),
+            name
+        )),
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]

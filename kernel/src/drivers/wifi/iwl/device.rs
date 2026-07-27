@@ -21,7 +21,7 @@
 //! round-trip, no 802.11 state machine and no WPA2 — so the radio does not associate and
 //! `/wifi connect` still cannot work. Those are further stages; see [`super`].
 
-use super::{context, csr, fw};
+use super::{context, csr, fw, proto};
 
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::pci::PciDevice;
@@ -34,6 +34,29 @@ const HANDSHAKE_SPINS: u32 = 500_000;
 /// BAR0 window. The CSRs and the indirect-access registers all live inside it.
 const MMIO_SPAN: usize = 0x2000;
 
+/// Number of receive buffers handed to the device. Small on purpose: this path only has
+/// to catch firmware's startup notifications, not carry traffic.
+const NRX: usize = 16;
+/// Size of each. Firmware's notifications are far smaller, but the device is told the
+/// buffer order, so this has to be a real page.
+const RX_BUF: usize = 4096;
+
+/// Offset of `closed_rb_num` in the device's status block, and the mask that makes it an
+/// index. The upper bits are not part of the number — used unmasked, the index runs off
+/// the end of the ring immediately.
+const RB_STATUS_CLOSED: usize = 0;
+const RB_CLOSED_MASK: u16 = 0x0fff;
+
+/// The receive ring, kept so notifications can be read after firmware starts.
+struct Rings {
+    /// Virtual addresses of the receive buffers, indexed as the device indexes them.
+    bufs: [u64; NRX],
+    /// Virtual address of the status block the device writes its progress into.
+    status: u64,
+    /// Next buffer this driver has not yet looked at.
+    read: usize,
+}
+
 /// A mapped, reset Intel WiFi device.
 pub struct IwlDevice {
     regs: u64,
@@ -41,6 +64,7 @@ pub struct IwlDevice {
     pub hw_rev: u32,
     /// Physical address of the context info handed to the device, once firmware is loaded.
     pub ctxt_phys: u64,
+    rings: Option<Rings>,
 }
 
 fn r32(base: u64, off: usize) -> u32 {
@@ -237,6 +261,7 @@ impl IwlDevice {
             family,
             hw_rev,
             ctxt_phys: 0,
+            rings: None,
         };
         if !dev.grab_nic_access() {
             return None;
@@ -284,11 +309,27 @@ impl IwlDevice {
             )
         };
 
-        // Rings the device wants addresses for even before it is asked to receive
-        // anything: it validates the structure as a whole.
-        let (free_rbd, _) = crate::mm::alloc_dma(4096).ok_or("no DMA memory for the free RBD list")?;
+        // Real receive buffers, not placeholders: firmware's first act after loading is to
+        // send a notification, and without somewhere to put it a successful load and a
+        // failed one are indistinguishable from here.
+        let mut rx_virt = [0u64; NRX];
+        let mut rx_phys = [0u64; NRX];
+        for i in 0..NRX {
+            let (p, v) = crate::mm::alloc_dma(RX_BUF).ok_or("no DMA memory for a receive buffer")?;
+            rx_phys[i] = p;
+            rx_virt[i] = v;
+        }
+        let list = proto::build_rbd_list(&rx_phys).ok_or("receive buffer list rejected")?;
+
+        let (free_rbd, free_virt) =
+            crate::mm::alloc_dma(4096).ok_or("no DMA memory for the free RBD list")?;
+        // SAFETY: `free_virt` is a whole owned page; the list is NRX u64s, far smaller.
+        unsafe {
+            core::ptr::copy_nonoverlapping(list.as_ptr(), free_virt as *mut u64, list.len())
+        };
         let (used_rbd, _) = crate::mm::alloc_dma(4096).ok_or("no DMA memory for the used RBD list")?;
-        let (status, _) = crate::mm::alloc_dma(4096).ok_or("no DMA memory for the status block")?;
+        let (status, status_virt) =
+            crate::mm::alloc_dma(4096).ok_or("no DMA memory for the status block")?;
         let (cmdq, _) = crate::mm::alloc_dma(4096).ok_or("no DMA memory for the command queue")?;
 
         let ctxt = context::ContextInfo {
@@ -344,14 +385,72 @@ impl IwlDevice {
             }
         }
         self.ctxt_phys = ctxt_phys;
+        self.rings = Some(Rings {
+            bufs: rx_virt,
+            status: status_virt,
+            read: 0,
+        });
         crate::ktrace::log_fmt(format_args!(
             "iwlwifi: context info at {ctxt_phys:#x}, {} byte runtime section at {fw_phys:#x} -- handed to the device",
             bytes.len()
         ));
-        crate::ktrace::log(
-            "iwlwifi",
-            "no receive path yet, so firmware's alive notification cannot be observed",
-        );
         Ok(ctxt_phys)
+    }
+}
+
+impl IwlDevice {
+    /// How long to wait for firmware to say something. Firmware answers in milliseconds;
+    /// this is generous and finite.
+    const ALIVE_SPINS: u32 = 2_000_000;
+
+    /// Wait for firmware's *alive* notification.
+    ///
+    /// This is what makes a firmware load checkable. Before it existed, a load that
+    /// silently failed and one that worked produced exactly the same host-side outcome —
+    /// the address was written, and nothing more could be said. Now the device either
+    /// answers or it does not, and either way the log says which.
+    ///
+    /// Reads progress from the status block's `closed_rb_num`, masked: the upper bits are
+    /// not part of the index, and unmasked it runs off the ring on the first read. Every
+    /// newly closed buffer is parsed, so an *error* notification is reported as firmware
+    /// failing rather than as a timeout.
+    pub fn wait_for_alive(&mut self) -> Result<(), &'static str> {
+        let rings = self.rings.as_mut().ok_or("no receive ring; load firmware first")?;
+        for _ in 0..Self::ALIVE_SPINS {
+            // SAFETY: the status block is a DMA page this driver owns, and the device
+            // writes the closed index into its first halfword.
+            let closed = unsafe {
+                core::ptr::read_volatile((rings.status + RB_STATUS_CLOSED as u64) as *const u16)
+            } & RB_CLOSED_MASK;
+            let closed = closed as usize % NRX;
+            while rings.read != closed {
+                let idx = rings.read;
+                rings.read = (rings.read + 1) % NRX;
+                // SAFETY: `bufs[idx]` maps a whole owned receive buffer of `RX_BUF` bytes.
+                let buf = unsafe {
+                    core::slice::from_raw_parts(rings.bufs[idx] as *const u8, RX_BUF)
+                };
+                let Some(pkt) = proto::parse_rx(buf) else {
+                    continue; // an unparseable buffer is not evidence either way
+                };
+                if pkt.is_alive() {
+                    crate::ktrace::log_fmt(format_args!(
+                        "iwlwifi: firmware is alive ({} byte notification)",
+                        pkt.payload.len()
+                    ));
+                    return Ok(());
+                }
+                if pkt.is_error() {
+                    crate::ktrace::log("iwlwifi", "firmware reported its own failure");
+                    return Err("firmware reported an error instead of coming alive");
+                }
+                crate::ktrace::log_fmt(format_args!(
+                    "iwlwifi: notification group {:#02x} cmd {:#02x} while waiting for alive",
+                    pkt.group_id, pkt.cmd
+                ));
+            }
+            core::hint::spin_loop();
+        }
+        Err("firmware never sent an alive notification")
     }
 }
