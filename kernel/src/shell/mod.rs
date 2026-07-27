@@ -888,6 +888,44 @@ fn wifi_cmd(arg: &str) {
                 Err(e) => serial_println!("wifi> reset failed: {e}"),
             }
         }
+        // Derive the WPA2 pre-shared key from a passphrase and SSID. A diagnostic with an
+        // independent oracle: the same two arguments to `wpa_passphrase` on any Linux box
+        // must produce the same 32 bytes. Worth having reachable because the derivation is
+        // the one part of joining a network that is checkable *without* a radio — if these
+        // agree, a failure to connect is not the key schedule.
+        "psk" => {
+            // Everything after the SSID is the passphrase, spaces and all — a WPA2
+            // passphrase may legitimately contain them, so splitting on whitespace would
+            // silently derive a key from the first word. With no passphrase on the line it
+            // is asked for through the hidden-input modal, the same way `connect` does.
+            let (ssid, tail) = match rest.split_once(' ') {
+                Some((s, p)) => (s, p),
+                None => (rest, ""),
+            };
+            let pass = if tail.is_empty() {
+                crate::modal::input("Wi-Fi passphrase", ssid, true)
+            } else {
+                alloc::string::String::from(tail)
+            };
+            if ssid.is_empty() || pass.is_empty() {
+                serial_println!("wifi> usage: /wifi psk <ssid> [passphrase]");
+            } else if pass.len() < 8 || pass.len() > 63 {
+                // The standard's own bounds. Outside them the derivation still runs, but no
+                // access point will have used it.
+                serial_println!(
+                    "wifi> a WPA2 passphrase is 8-63 characters ({} given)",
+                    pass.len()
+                );
+            } else {
+                let pmk = crate::drivers::wifi::wpa::pmk_from_passphrase(&pass, ssid.as_bytes());
+                let mut hex = alloc::string::String::new();
+                for b in pmk.iter() {
+                    hex.push_str(&alloc::format!("{b:02x}"));
+                }
+                serial_println!("wifi> psk {ssid}: {hex}");
+                serial_println!("wifi>   cross-check: wpa_passphrase '{ssid}' <passphrase>");
+            }
+        }
         "scan" => {
             serial_println!("wifi> nearby networks:");
             match crate::drivers::wifi::scan() {
@@ -975,7 +1013,9 @@ fn wifi_cmd(arg: &str) {
                 Err(e) => serial_println!("wifi> {e}"),
             }
         }
-        _ => serial_println!("wifi> usage: /wifi [info|power|scan|connect <ssid>|load]"),
+        _ => serial_println!(
+            "wifi> usage: /wifi [info|power|scan|connect <ssid>|load|psk <ssid> [passphrase]]"
+        ),
     }
 }
 

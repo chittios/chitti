@@ -9,7 +9,8 @@
 //!
 //! - **SHA-1, HMAC-SHA-1, PBKDF2** live in [`crate::net::sha1`], against FIPS 180-2 and
 //!   RFC 2202.
-//! - **AES-128 decryption and RFC 3394 key unwrap**, against the RFC's own vector.
+//! - **AES-128 and RFC 3394 key unwrap**, against FIPS 197 and the RFC's own vector, in
+//!   both directions (the wrap half exists to check the unwrap, not for the client path).
 //! - **The PMK, the PTK and the MIC**, against values computed independently for the
 //!   fixtures below.
 //!
@@ -25,6 +26,16 @@
 //! addresses and the nonces are each concatenated **smaller first**, numerically. Both
 //! sides do it, so getting it wrong yields a PTK that is self-consistent and different
 //! from the access point's — a MIC failure reported as a wrong password.
+//!
+//! ## Why there is no CCMP here
+//!
+//! The TK this file derives encrypts traffic, but **not in software**: both radio families
+//! this kernel targets do CCMP in hardware. A FullMAC part (Broadcom) is given the
+//! passphrase and runs the whole handshake in firmware; a SoftMAC part (Intel) is given the
+//! TK through a key command and its hardware encrypts each frame. So the driver's job ends
+//! at *deriving and installing* keys, which is what this is. A software CCMP
+//! implementation would be code that never runs on either — worth noting explicitly, since
+//! its absence otherwise looks like an unfinished layer rather than a decision.
 
 use crate::net::sha1::{hmac_sha1, pbkdf2_sha1};
 use alloc::vec::Vec;
@@ -121,10 +132,11 @@ pub fn eapol_mic(kck: &[u8; 16], frame_with_zeroed_mic: &[u8]) -> [u8; 16] {
     mic
 }
 
-// --- AES-128, decryption only ---------------------------------------------
+// --- AES-128 ---------------------------------------------------------------
 //
-// Needed for exactly one thing: unwrapping the group key out of the third handshake
-// message. Decryption only, because nothing here ever wraps a key.
+// Needed for exactly one thing on the client path: unwrapping the group key out of the third
+// handshake message. The encrypt direction exists only because it is what makes the unwrap
+// checkable — see `aes128_encrypt_block`.
 
 const SBOX: [u8; 256] = [
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
@@ -235,9 +247,89 @@ pub fn aes128_decrypt_block(key: &[u8; 16], block: &mut [u8; 16]) {
     }
 }
 
+/// Encrypt one 16-byte block in place.
+///
+/// **The client path never uses this** — it only ever unwraps a group key the access point
+/// wrapped. It exists because it is what makes the unwrap checkable: RFC 3394 publishes the
+/// forward direction, and a wrap/unwrap round trip catches an error in either half that a
+/// one-directional test would let through.
+pub fn aes128_encrypt_block(key: &[u8; 16], block: &mut [u8; 16]) {
+    let rk = expand_key(key);
+    for (i, b) in block.iter_mut().enumerate() {
+        *b ^= rk[0][i];
+    }
+    for round in 1..11 {
+        // SubBytes
+        let mut t = [0u8; 16];
+        for (i, b) in block.iter().enumerate() {
+            t[i] = SBOX[*b as usize];
+        }
+        // ShiftRows
+        let s = t;
+        for c in 0..4 {
+            for r in 0..4 {
+                t[c * 4 + r] = s[((c + r) % 4) * 4 + r];
+            }
+        }
+        // MixColumns, skipped on the final round
+        if round < 10 {
+            let mut m = [0u8; 16];
+            for c in 0..4 {
+                let col = &t[c * 4..c * 4 + 4];
+                m[c * 4] = xtime(col[0], 2) ^ xtime(col[1], 3) ^ col[2] ^ col[3];
+                m[c * 4 + 1] = col[0] ^ xtime(col[1], 2) ^ xtime(col[2], 3) ^ col[3];
+                m[c * 4 + 2] = col[0] ^ col[1] ^ xtime(col[2], 2) ^ xtime(col[3], 3);
+                m[c * 4 + 3] = xtime(col[0], 3) ^ col[1] ^ col[2] ^ xtime(col[3], 2);
+            }
+            t = m;
+        }
+        for i in 0..16 {
+            t[i] ^= rk[round][i];
+        }
+        *block = t;
+    }
+}
+
 /// The RFC 3394 default initial value. A wrapped key that does not decrypt to this has
 /// been tampered with, or the KEK is wrong — and those are the same thing to a client.
 pub const KEY_WRAP_IV: [u8; 8] = [0xa6; 8];
+
+/// Wrap a key (RFC 3394) — the inverse of [`aes_key_unwrap`], for the same reason
+/// [`aes128_encrypt_block`] exists: it is what proves the unwrap right in both directions.
+pub fn aes_key_wrap(kek: &[u8; 16], plain: &[u8]) -> Option<Vec<u8>> {
+    if plain.len() < 16 || plain.len() % 8 != 0 {
+        return None;
+    }
+    let n = plain.len() / 8;
+    let mut a = KEY_WRAP_IV;
+    let mut r: Vec<[u8; 8]> = plain
+        .chunks_exact(8)
+        .map(|c| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(c);
+            b
+        })
+        .collect();
+    for j in 0..6 {
+        for i in 1..=n {
+            let mut blk = [0u8; 16];
+            blk[..8].copy_from_slice(&a);
+            blk[8..].copy_from_slice(&r[i - 1]);
+            aes128_encrypt_block(kek, &mut blk);
+            let t = (n * j + i) as u64;
+            for k in 0..8 {
+                a[k] = blk[k] ^ t.to_be_bytes()[k];
+            }
+            r[i - 1].copy_from_slice(&blk[8..]);
+        }
+    }
+    let mut out = Vec::with_capacity(plain.len() + 8);
+    out.extend_from_slice(&a);
+    for b in &r {
+        out.extend_from_slice(b);
+    }
+    Some(out)
+}
 
 /// Unwrap an AES-wrapped key (RFC 3394).
 ///
@@ -282,6 +374,354 @@ pub fn aes_key_unwrap(kek: &[u8; 16], wrapped: &[u8]) -> Option<Vec<u8>> {
     Some(r.concat())
 }
 
+// --- EAPOL-Key: the four-way handshake ------------------------------------
+
+/// EAPOL version and packet type for a Key frame.
+pub const EAPOL_VERSION: u8 = 2;
+pub const EAPOL_TYPE_KEY: u8 = 3;
+/// Descriptor type 2 is the 802.11i / WPA2 key descriptor. WPA1 used 254.
+pub const KEY_DESC_RSN: u8 = 2;
+/// Fixed length of an EAPOL-Key body, from the descriptor type through the key-data length.
+pub const EAPOL_KEY_BODY_LEN: usize = 95;
+/// Offset of the MIC field within the whole EAPOL frame (4-byte EAPOL header + 77).
+pub const EAPOL_MIC_OFFSET: usize = 4 + 77;
+
+/// Key Information bits. These are what distinguish the four messages from each other —
+/// there is no message number in the frame.
+pub const KEY_INFO_PAIRWISE: u16 = 1 << 3;
+pub const KEY_INFO_INSTALL: u16 = 1 << 6;
+pub const KEY_INFO_ACK: u16 = 1 << 7;
+pub const KEY_INFO_MIC: u16 = 1 << 8;
+pub const KEY_INFO_SECURE: u16 = 1 << 9;
+pub const KEY_INFO_ERROR: u16 = 1 << 10;
+pub const KEY_INFO_REQUEST: u16 = 1 << 11;
+pub const KEY_INFO_ENCRYPTED: u16 = 1 << 12;
+/// Key-descriptor-version 2 = HMAC-SHA1 MIC with AES key wrap, which is CCMP's pairing.
+pub const KEY_INFO_VERSION_MASK: u16 = 0x7;
+
+/// A parsed EAPOL-Key frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EapolKey {
+    pub key_info: u16,
+    pub key_len: u16,
+    pub replay_counter: u64,
+    pub nonce: [u8; 32],
+    pub rsc: [u8; 8],
+    pub mic: [u8; 16],
+    pub key_data: Vec<u8>,
+}
+
+/// Which message of the handshake a frame is, deduced from its Key Information bits.
+///
+/// The frame carries no message number, so this **is** the identification — and message 1
+/// and 3 differ only by the MIC and Secure bits. Treating a replayed message 1 as a 3 (or
+/// the reverse) is the shape of the well-known handshake attacks, so the classification is
+/// explicit rather than positional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeMessage {
+    /// AP → client: the ANonce, no MIC (no key exists yet to compute one with).
+    One,
+    /// Client → AP: the SNonce plus a MIC.
+    Two,
+    /// AP → client: MIC, Install, Secure, and the encrypted group key.
+    Three,
+    /// Client → AP: confirmation. Distinguished from [`Self::Two`] **only** by the Secure
+    /// bit — it carries no Install bit, despite being the message that confirms the key was
+    /// installed.
+    Four,
+}
+
+impl EapolKey {
+    /// Parse an EAPOL frame (starting at the EAPOL header, not the 802.11 header).
+    ///
+    /// These arrive before any key is confirmed, from whatever is claiming to be the access
+    /// point, so every length is checked. In particular the key-data length is a claim: a
+    /// frame declaring 60 KiB of key data in a 200-byte packet is refused rather than
+    /// clamped.
+    pub fn parse(frame: &[u8]) -> Option<EapolKey> {
+        if frame.len() < 4 + EAPOL_KEY_BODY_LEN {
+            return None;
+        }
+        if frame[1] != EAPOL_TYPE_KEY {
+            return None;
+        }
+        let declared = u16::from_be_bytes([frame[2], frame[3]]) as usize;
+        let body = &frame[4..];
+        if declared < EAPOL_KEY_BODY_LEN || body.len() < declared {
+            return None;
+        }
+        let body = &body[..declared];
+        if body[0] != KEY_DESC_RSN {
+            return None;
+        }
+        let data_len = u16::from_be_bytes([body[93], body[94]]) as usize;
+        if body.len() < EAPOL_KEY_BODY_LEN + data_len {
+            return None;
+        }
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&body[13..45]);
+        let mut rsc = [0u8; 8];
+        rsc.copy_from_slice(&body[61..69]);
+        let mut mic = [0u8; 16];
+        mic.copy_from_slice(&body[77..93]);
+        Some(EapolKey {
+            key_info: u16::from_be_bytes([body[1], body[2]]),
+            key_len: u16::from_be_bytes([body[3], body[4]]),
+            replay_counter: u64::from_be_bytes([
+                body[5], body[6], body[7], body[8], body[9], body[10], body[11], body[12],
+            ]),
+            nonce,
+            rsc,
+            mic,
+            key_data: body[EAPOL_KEY_BODY_LEN..EAPOL_KEY_BODY_LEN + data_len].to_vec(),
+        })
+    }
+
+    /// Which handshake message this is, or `None` for a combination that is none of them.
+    ///
+    /// Messages **2 and 4 differ only by the Secure bit** — 4 carries no Install and no Ack,
+    /// exactly like 2. That is the one distinction available, and it is worth spelling out:
+    /// the obvious guess is that message 4 sets Install (it is the one that confirms the key
+    /// was installed), and a classifier built on that reads every message 4 as a message 2.
+    /// Nothing catches it in normal operation, because a client never receives either.
+    pub fn message(&self) -> Option<HandshakeMessage> {
+        let pairwise = self.key_info & KEY_INFO_PAIRWISE != 0;
+        let mic = self.key_info & KEY_INFO_MIC != 0;
+        let ack = self.key_info & KEY_INFO_ACK != 0;
+        let secure = self.key_info & KEY_INFO_SECURE != 0;
+        if !pairwise {
+            return None; // a group-key rekey, not part of the four-way handshake
+        }
+        match (mic, ack) {
+            // Message 1 is the only one without a MIC: no key exists yet to compute one.
+            (false, true) => Some(HandshakeMessage::One),
+            // Both AP-to-client messages set Ack; 3 is the one with a MIC.
+            (true, true) => Some(HandshakeMessage::Three),
+            (true, false) if secure => Some(HandshakeMessage::Four),
+            (true, false) => Some(HandshakeMessage::Two),
+            _ => None,
+        }
+    }
+
+    /// Serialise, with the MIC field zeroed — the form the MIC is computed over.
+    pub fn to_bytes_for_mic(&self) -> Vec<u8> {
+        self.encode(&[0u8; 16])
+    }
+
+    /// Serialise with a MIC in place.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.encode(&self.mic)
+    }
+
+    fn encode(&self, mic: &[u8; 16]) -> Vec<u8> {
+        let body_len = EAPOL_KEY_BODY_LEN + self.key_data.len();
+        let mut f = Vec::with_capacity(4 + body_len);
+        f.push(EAPOL_VERSION);
+        f.push(EAPOL_TYPE_KEY);
+        f.extend_from_slice(&(body_len as u16).to_be_bytes());
+        f.push(KEY_DESC_RSN);
+        f.extend_from_slice(&self.key_info.to_be_bytes());
+        f.extend_from_slice(&self.key_len.to_be_bytes());
+        f.extend_from_slice(&self.replay_counter.to_be_bytes());
+        f.extend_from_slice(&self.nonce);
+        f.extend_from_slice(&[0u8; 16]); // key IV, unused with descriptor version 2
+        f.extend_from_slice(&self.rsc);
+        f.extend_from_slice(&[0u8; 8]); // reserved (the old Key ID field)
+        f.extend_from_slice(mic);
+        f.extend_from_slice(&(self.key_data.len() as u16).to_be_bytes());
+        f.extend_from_slice(&self.key_data);
+        f
+    }
+
+    /// Whether this frame's MIC is the one `kck` produces over it.
+    pub fn mic_valid(&self, kck: &[u8; 16]) -> bool {
+        // Compared byte-wise rather than by an early-exit search: this is not a secret-
+        // dependent timing concern here (the attacker already knows the MIC they sent), but
+        // a whole-array compare is also simply harder to get wrong.
+        eapol_mic(kck, &self.to_bytes_for_mic()) == self.mic
+    }
+}
+
+/// The group temporal key, as delivered inside message 3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gtk {
+    pub id: u8,
+    pub key: Vec<u8>,
+}
+
+/// KDE header for the GTK: vendor element, OUI 00-0f-ac, data type 1.
+const KDE_OUI: [u8; 3] = [0x00, 0x0f, 0xac];
+const KDE_TYPE_GTK: u8 = 1;
+
+/// Find the GTK in decrypted key data.
+///
+/// The key data is a sequence of KDEs and RSN elements; the GTK arrives as a vendor-specific
+/// KDE with two bytes of key-id/tx flags before the key itself. Bounded like every other
+/// off-the-air parse — the bytes were encrypted, which proves the sender knew the KEK, not
+/// that the contents are well formed.
+pub fn find_gtk(key_data: &[u8]) -> Option<Gtk> {
+    let mut at = 0usize;
+    while at + 2 <= key_data.len() {
+        let id = key_data[at];
+        let len = key_data[at + 1] as usize;
+        if len == 0 || at + 2 + len > key_data.len() {
+            return None;
+        }
+        let body = &key_data[at + 2..at + 2 + len];
+        // 0xdd with an all-zero body is the padding that fills the wrapped block.
+        if id == 0xdd && body.len() > 6 && body[..3] == KDE_OUI && body[3] == KDE_TYPE_GTK {
+            return Some(Gtk {
+                id: body[4] & 0x03,
+                key: body[6..].to_vec(),
+            });
+        }
+        at += 2 + len;
+    }
+    None
+}
+
+/// A four-way handshake in progress.
+///
+/// Deliberately a pure state machine over frames: it never touches a radio, so the whole
+/// handshake — including the failure paths that matter most — is testable off-hardware.
+#[derive(Debug, Clone)]
+pub struct Handshake {
+    pmk: [u8; 32],
+    /// Our MAC.
+    spa: [u8; 6],
+    /// The access point's MAC.
+    aa: [u8; 6],
+    snonce: [u8; 32],
+    /// Our association request's RSN element, echoed in message 2 for the AP to compare.
+    rsn_element: Vec<u8>,
+    ptk: Option<Ptk>,
+    /// Highest replay counter seen. A frame at or below it is a replay.
+    last_replay: Option<u64>,
+    pub gtk: Option<Gtk>,
+    pub done: bool,
+}
+
+impl Handshake {
+    pub fn new(
+        pmk: [u8; 32],
+        spa: [u8; 6],
+        aa: [u8; 6],
+        snonce: [u8; 32],
+        rsn_element: Vec<u8>,
+    ) -> Handshake {
+        Handshake {
+            pmk,
+            spa,
+            aa,
+            snonce,
+            rsn_element,
+            ptk: None,
+            last_replay: None,
+            gtk: None,
+            done: false,
+        }
+    }
+
+    /// The derived pairwise key, once message 1 has arrived.
+    pub fn ptk(&self) -> Option<&Ptk> {
+        self.ptk.as_ref()
+    }
+
+    /// Feed a received EAPOL-Key frame; returns the frame to send in reply, if any.
+    ///
+    /// Errors are returned rather than logged-and-ignored because each one means something
+    /// specific to a user: a MIC failure on message 3 is a wrong passphrase, while a replay
+    /// is an attack or a retransmission.
+    pub fn on_frame(&mut self, frame: &[u8]) -> Result<Option<Vec<u8>>, &'static str> {
+        let key = EapolKey::parse(frame).ok_or("malformed EAPOL-Key frame")?;
+        match key.message().ok_or("EAPOL-Key frame is not a handshake message")? {
+            HandshakeMessage::One => self.on_msg1(&key).map(Some),
+            HandshakeMessage::Three => self.on_msg3(&key).map(Some),
+            // The AP does not send these; receiving one means something is impersonating a
+            // client, and answering it would be free work for an attacker.
+            HandshakeMessage::Two | HandshakeMessage::Four => Err("unexpected handshake message"),
+        }
+    }
+
+    fn on_msg1(&mut self, key: &EapolKey) -> Result<Vec<u8>, &'static str> {
+        // Message 1 carries no MIC, so a replay cannot be detected by authentication — only
+        // by the counter. Accepting an old one would restart the handshake with a nonce an
+        // attacker has already seen traffic under.
+        if let Some(last) = self.last_replay {
+            if key.replay_counter <= last {
+                return Err("replayed EAPOL-Key message 1");
+            }
+        }
+        self.last_replay = Some(key.replay_counter);
+        let ptk = derive_ptk(&self.pmk, &self.aa, &self.spa, &key.nonce, &self.snonce);
+        self.ptk = Some(ptk);
+
+        let mut msg2 = EapolKey {
+            // Descriptor version copied from the AP's frame: it chose the MIC algorithm and
+            // disagreeing means every MIC we send is computed the wrong way.
+            key_info: (key.key_info & KEY_INFO_VERSION_MASK) | KEY_INFO_PAIRWISE | KEY_INFO_MIC,
+            key_len: 0,
+            replay_counter: key.replay_counter,
+            nonce: self.snonce,
+            rsc: [0; 8],
+            mic: [0; 16],
+            key_data: self.rsn_element.clone(),
+        };
+        msg2.mic = eapol_mic(&ptk.kck, &msg2.to_bytes_for_mic());
+        Ok(msg2.to_bytes())
+    }
+
+    fn on_msg3(&mut self, key: &EapolKey) -> Result<Vec<u8>, &'static str> {
+        let ptk = *self.ptk.as_ref().ok_or("message 3 before message 1")?;
+
+        // The ANonce is checked **before** the MIC, and the order is the whole point. A
+        // message 3 carrying a different ANonce was MIC'd by the AP under *its* PTK, so the
+        // MIC fails too — and checking the MIC first would report that as a wrong
+        // passphrase, sending the user off to retype a password that was always correct.
+        let from_this_nonce = derive_ptk(&self.pmk, &self.aa, &self.spa, &key.nonce, &self.snonce);
+        if from_this_nonce != ptk {
+            return Err("message 3 carries a different ANonce than message 1");
+        }
+        // With the nonce confirmed, a MIC mismatch really does mean the two sides derived
+        // different keys from the same inputs — which leaves the passphrase as the only
+        // input that can differ. This is the first and only point where a wrong password
+        // becomes visible.
+        if !key.mic_valid(&ptk.kck) {
+            return Err("EAPOL-Key MIC mismatch — wrong passphrase");
+        }
+        if let Some(last) = self.last_replay {
+            if key.replay_counter < last {
+                return Err("replayed EAPOL-Key message 3");
+            }
+        }
+        self.last_replay = Some(key.replay_counter);
+
+        if key.key_info & KEY_INFO_ENCRYPTED != 0 && !key.key_data.is_empty() {
+            let plain = aes_key_unwrap(&ptk.kek, &key.key_data)
+                .ok_or("group key failed its integrity check")?;
+            self.gtk = find_gtk(&plain);
+        }
+
+        let mut msg4 = EapolKey {
+            key_info: (key.key_info & KEY_INFO_VERSION_MASK)
+                | KEY_INFO_PAIRWISE
+                | KEY_INFO_MIC
+                | KEY_INFO_SECURE,
+            key_len: 0,
+            replay_counter: key.replay_counter,
+            // Message 4 carries a zero nonce. Echoing the SNonce here is a common mistake
+            // that some access points accept and others reject.
+            nonce: [0; 32],
+            rsc: [0; 8],
+            mic: [0; 16],
+            key_data: Vec::new(),
+        };
+        msg4.mic = eapol_mic(&ptk.kck, &msg4.to_bytes_for_mic());
+        self.done = true;
+        Ok(msg4.to_bytes())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,7 +758,7 @@ mod tests {
         // Computed from the same primitives by a separate implementation. This is the one
         // value in WPA2 that neither side transmits, so a mismatch is only ever visible as
         // a MIC failure the access point reports as a wrong password.
-        let pmk = pmk_from_passphrase("password", b"IEEE");
+        let pmk = TEST_PMK; // == pmk_from_passphrase("password", b"IEEE"), pinned above
         let aa = [0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
         let spa = [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5];
         let mut anonce = [0u8; 32];
@@ -338,7 +778,7 @@ mod tests {
         // The point of ordering both pairs smaller-first: the access point and the client
         // hold the arguments in opposite roles and must still land on one key. Swapping
         // both pairs is exactly what the peer does.
-        let pmk = pmk_from_passphrase("secret", b"net");
+        let pmk = TEST_PMK;
         let a = [0x02u8, 0, 0, 0, 0, 1];
         let s = [0x02u8, 0, 0, 0, 0, 2];
         let n1 = [0x11u8; 32];
@@ -355,13 +795,14 @@ mod tests {
         // A derivation that silently ignored a nonce would still produce a working-looking
         // key — and would reuse it across sessions, which is the failure that makes the
         // whole handshake pointless.
-        let pmk = pmk_from_passphrase("secret", b"net");
+        let pmk = TEST_PMK;
         let a = [1u8, 0, 0, 0, 0, 1];
         let s = [2u8, 0, 0, 0, 0, 2];
         let n1 = [0x11u8; 32];
         let n2 = [0x22u8; 32];
         let base = derive_ptk(&pmk, &a, &s, &n1, &n2);
-        let other_pmk = pmk_from_passphrase("secret2", b"net");
+        let mut other_pmk = TEST_PMK;
+        other_pmk[0] ^= 1;
         assert_ne!(derive_ptk(&other_pmk, &a, &s, &n1, &n2), base);
         assert_ne!(derive_ptk(&pmk, &a, &[3u8, 0, 0, 0, 0, 3], &n1, &n2), base);
         assert_ne!(derive_ptk(&pmk, &a, &s, &[0x33u8; 32], &n2), base);
@@ -425,6 +866,36 @@ mod tests {
     }
 
     #[test_case]
+    fn aes_wrap_and_unwrap_are_inverses_in_both_directions() {
+        // RFC 3394 section 4.1 forwards, which pins the block cipher's encrypt half too, and
+        // then a round trip at every legal length. A one-directional test would let an error
+        // in either half through, since a consistent-but-wrong pair still round-trips —
+        // hence the published vector as well.
+        let mut kek = [0u8; 16];
+        kek.copy_from_slice(&unhex("000102030405060708090a0b0c0d0e0f"));
+        let key = unhex("00112233445566778899aabbccddeeff");
+        assert_eq!(
+            hex(&aes_key_wrap(&kek, &key).unwrap()),
+            "1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5"
+        );
+        // FIPS 197 forwards, for the same reason.
+        let mut blk = [0u8; 16];
+        blk.copy_from_slice(&key);
+        aes128_encrypt_block(&kek, &mut blk);
+        assert_eq!(hex(&blk), "69c4e0d86a7b0430d8cdb78070b4c55a");
+
+        for len in [16usize, 24, 32, 48] {
+            let plain: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let w = aes_key_wrap(&kek, &plain).unwrap();
+            assert_eq!(w.len(), len + 8);
+            assert_eq!(aes_key_unwrap(&kek, &w).unwrap(), plain, "len {len}");
+        }
+        // Lengths the RFC does not define.
+        assert!(aes_key_wrap(&kek, &[0u8; 8]).is_none());
+        assert!(aes_key_wrap(&kek, &[0u8; 20]).is_none());
+    }
+
+    #[test_case]
     fn a_tampered_or_wrongly_keyed_wrap_is_refused() {
         // The integrity check is the only thing stopping a client from installing a group
         // key an attacker chose, so it has to reject rather than return plausible bytes.
@@ -447,5 +918,327 @@ mod tests {
         assert!(aes_key_unwrap(&kek, &good[..16]).is_none());
         assert!(aes_key_unwrap(&kek, &good[..23]).is_none());
         assert!(aes_key_unwrap(&kek, &[]).is_none());
+    }
+
+    // --- the handshake ----------------------------------------------------
+    //
+    // These tests are an access point: they build the frames a real one sends, using the
+    // same primitives from the other side. That is weaker than a capture would be for the
+    // wire format, and exactly as strong for the *logic* — which is what has the failure
+    // paths worth pinning (a wrong passphrase, a replay, a lying length).
+
+    const AP: [u8; 6] = [0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+    const ME: [u8; 6] = [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5];
+
+    /// The PMK the 802.11i vector produces, as a literal.
+    ///
+    /// Deliberately not re-derived per test: PBKDF2 is 4096 iterations by design, and the
+    /// handshake tests below would spend the whole unit suite's time on a derivation that
+    /// `the_pmk_comes_from_the_passphrase_and_ssid` already pins. Kept equal to it by
+    /// `the_literal_pmk_is_the_one_the_vector_produces`, so the shortcut cannot drift.
+    const TEST_PMK: [u8; 32] = [
+        0xf4, 0x2c, 0x6f, 0xc5, 0x2d, 0xf0, 0xeb, 0xef, 0x9e, 0xbb, 0x4b, 0x90, 0xb3, 0x8a,
+        0x5f, 0x90, 0x2e, 0x83, 0xfe, 0x1b, 0x13, 0x5a, 0x70, 0xe2, 0x3a, 0xed, 0x76, 0x2e,
+        0x97, 0x10, 0xa1, 0x2e,
+    ];
+
+    fn test_pmk() -> [u8; 32] {
+        TEST_PMK
+    }
+
+    #[test_case]
+    fn the_literal_pmk_is_the_one_the_vector_produces() {
+        // The one place the shortcut is checked against the real derivation.
+        assert_eq!(pmk_from_passphrase("password", b"IEEE"), TEST_PMK);
+    }
+
+    fn nonce(seed: u8) -> [u8; 32] {
+        let mut n = [0u8; 32];
+        for (i, b) in n.iter_mut().enumerate() {
+            *b = seed ^ i as u8;
+        }
+        n
+    }
+
+    /// Message 1: the ANonce, no MIC — there is no key yet to compute one with.
+    fn ap_msg1(anonce: [u8; 32], replay: u64) -> Vec<u8> {
+        EapolKey {
+            key_info: 2 | KEY_INFO_PAIRWISE | KEY_INFO_ACK,
+            key_len: 16,
+            replay_counter: replay,
+            nonce: anonce,
+            rsc: [0; 8],
+            mic: [0; 16],
+            key_data: Vec::new(),
+        }
+        .to_bytes()
+    }
+
+    /// Message 3: MIC, Install, Secure, and the group key wrapped under the KEK.
+    fn ap_msg3(ptk: &Ptk, anonce: [u8; 32], replay: u64, gtk: &[u8]) -> Vec<u8> {
+        let mut kde = alloc::vec![0xdd, (4 + 2 + gtk.len()) as u8, 0x00, 0x0f, 0xac, 0x01, 0x01, 0x00];
+        kde.extend_from_slice(gtk);
+        while kde.len() % 8 != 0 {
+            kde.push(0xdd); // the RFC 3394 input must be a multiple of 8
+        }
+        let mut k = EapolKey {
+            key_info: 2
+                | KEY_INFO_PAIRWISE
+                | KEY_INFO_MIC
+                | KEY_INFO_ACK
+                | KEY_INFO_INSTALL
+                | KEY_INFO_SECURE
+                | KEY_INFO_ENCRYPTED,
+            key_len: 16,
+            replay_counter: replay,
+            nonce: anonce,
+            rsc: [0; 8],
+            mic: [0; 16],
+            key_data: aes_key_wrap(&ptk.kek, &kde).unwrap(),
+        };
+        k.mic = eapol_mic(&ptk.kck, &k.to_bytes_for_mic());
+        k.to_bytes()
+    }
+
+    #[test_case]
+    fn the_four_way_handshake_completes_and_installs_the_group_key() {
+        let anonce = nonce(0x11);
+        let snonce = nonce(0x22);
+        let mut hs = Handshake::new(test_pmk(), ME, AP, snonce, super::super::ieee80211::client_rsn_element()[2..].to_vec());
+
+        // Message 1 in, message 2 out — carrying our SNonce, a MIC, and our RSN element.
+        let msg2 = hs
+            .on_frame(&ap_msg1(anonce, 1))
+            .expect("message 1 must be accepted")
+            .expect("message 1 must be answered");
+        let parsed = EapolKey::parse(&msg2).expect("our own frame must parse");
+        assert_eq!(parsed.message(), Some(HandshakeMessage::Two));
+        assert_eq!(parsed.nonce, snonce);
+        assert_eq!(parsed.replay_counter, 1, "message 2 echoes the AP's counter");
+        assert!(!parsed.key_data.is_empty(), "message 2 must carry our RSN element");
+
+        // The AP derives the same PTK from its side and can check that MIC.
+        let ptk = derive_ptk(&test_pmk(), &AP, &ME, &anonce, &snonce);
+        assert_eq!(hs.ptk(), Some(&ptk));
+        assert!(parsed.mic_valid(&ptk.kck), "the AP would reject our message 2");
+
+        // Message 3 in, message 4 out, group key installed.
+        let gtk = [0x5au8; 16];
+        let msg4 = hs
+            .on_frame(&ap_msg3(&ptk, anonce, 2, &gtk))
+            .expect("a correctly MIC'd message 3 must be accepted")
+            .expect("message 3 must be answered");
+        let parsed4 = EapolKey::parse(&msg4).unwrap();
+        assert_eq!(parsed4.message(), Some(HandshakeMessage::Four));
+        assert!(parsed4.mic_valid(&ptk.kck));
+        // Message 4 carries a zero nonce — echoing the SNonce is a common mistake that some
+        // access points accept and others reject.
+        assert_eq!(parsed4.nonce, [0u8; 32]);
+        assert!(hs.done);
+        assert_eq!(hs.gtk.as_ref().map(|g| g.key.clone()), Some(gtk.to_vec()));
+        assert_eq!(hs.gtk.as_ref().unwrap().id, 1);
+    }
+
+    #[test_case]
+    fn messages_two_and_four_are_told_apart_by_the_secure_bit_alone() {
+        // The trap: message 4 is the one that confirms the key was installed, so the obvious
+        // guess is that it carries the Install bit. It does not — it looks exactly like
+        // message 2 except for Secure. A classifier built on Install reads every message 4 as
+        // a message 2, and nothing catches it, because a client never receives either.
+        let base = EapolKey {
+            key_info: 2 | KEY_INFO_PAIRWISE | KEY_INFO_MIC,
+            key_len: 0,
+            replay_counter: 1,
+            nonce: [0; 32],
+            rsc: [0; 8],
+            mic: [0; 16],
+            key_data: Vec::new(),
+        };
+        assert_eq!(base.message(), Some(HandshakeMessage::Two));
+        let mut four = base.clone();
+        four.key_info |= KEY_INFO_SECURE;
+        assert_eq!(four.message(), Some(HandshakeMessage::Four));
+        // Install must not be what decides it.
+        let mut two_with_install = base.clone();
+        two_with_install.key_info |= KEY_INFO_INSTALL;
+        assert_eq!(two_with_install.message(), Some(HandshakeMessage::Two));
+        // And the AP's two messages, which both set Ack.
+        let mut one = base.clone();
+        one.key_info = 2 | KEY_INFO_PAIRWISE | KEY_INFO_ACK;
+        assert_eq!(one.message(), Some(HandshakeMessage::One));
+        let mut three = base.clone();
+        three.key_info |= KEY_INFO_ACK | KEY_INFO_INSTALL | KEY_INFO_SECURE;
+        assert_eq!(three.message(), Some(HandshakeMessage::Three));
+    }
+
+    #[test_case]
+    fn a_wrong_passphrase_fails_at_message_three_and_says_so() {
+        // This is the only point in the whole exchange where a wrong password becomes
+        // visible: messages 1 and 2 succeed regardless, because neither side has proved
+        // anything yet. The error text is what the user is shown, so it has to be the right
+        // diagnosis rather than "handshake failed".
+        let anonce = nonce(0x33);
+        // A PMK one bit away from the right one: the same thing a wrong passphrase produces,
+        // without a second PBKDF2 in the suite.
+        let mut wrong = TEST_PMK;
+        wrong[31] ^= 1;
+        let mut hs = Handshake::new(wrong, ME, AP, nonce(0x44), Vec::new());
+        assert!(hs.on_frame(&ap_msg1(anonce, 1)).is_ok(), "message 1 always succeeds");
+
+        let real_ptk = derive_ptk(&test_pmk(), &AP, &ME, &anonce, &nonce(0x44));
+        let err = hs
+            .on_frame(&ap_msg3(&real_ptk, anonce, 2, &[0u8; 16]))
+            .expect_err("a MIC computed under a different PMK must be rejected");
+        assert!(err.contains("passphrase"), "unhelpful error: {err}");
+        assert!(!hs.done);
+        assert!(hs.gtk.is_none(), "no key may be installed after a MIC failure");
+    }
+
+    #[test_case]
+    fn a_replayed_message_one_is_refused() {
+        // Message 1 has no MIC, so the replay counter is the only defence. Accepting an old
+        // one restarts the handshake under a nonce an attacker has already seen traffic
+        // encrypted with.
+        let mut hs = Handshake::new(test_pmk(), ME, AP, nonce(0x55), Vec::new());
+        assert!(hs.on_frame(&ap_msg1(nonce(0x11), 5)).is_ok());
+        assert!(hs.on_frame(&ap_msg1(nonce(0x11), 5)).is_err(), "same counter accepted");
+        assert!(hs.on_frame(&ap_msg1(nonce(0x11), 4)).is_err(), "older counter accepted");
+        // A genuinely newer one is a legitimate restart.
+        assert!(hs.on_frame(&ap_msg1(nonce(0x66), 6)).is_ok());
+    }
+
+    #[test_case]
+    fn messages_out_of_order_or_out_of_role_are_refused() {
+        let mut hs = Handshake::new(test_pmk(), ME, AP, nonce(0x77), Vec::new());
+        let ptk = derive_ptk(&test_pmk(), &AP, &ME, &nonce(0x11), &nonce(0x77));
+
+        // Message 3 with no message 1: there is no PTK, so there is nothing to check its MIC
+        // with — it must not be treated as a MIC failure (which would read as a wrong
+        // password) nor accepted.
+        let err = hs
+            .on_frame(&ap_msg3(&ptk, nonce(0x11), 2, &[0u8; 16]))
+            .expect_err("message 3 without message 1 was accepted");
+        assert!(err.contains("before"), "misdiagnosed: {err}");
+
+        // A frame in the client's role. An AP does not send these, so something is
+        // impersonating a client and answering it would be free work for an attacker.
+        let msg2 = EapolKey {
+            key_info: 2 | KEY_INFO_PAIRWISE | KEY_INFO_MIC,
+            key_len: 0,
+            replay_counter: 1,
+            nonce: nonce(0x77),
+            rsc: [0; 8],
+            mic: [0; 16],
+            key_data: Vec::new(),
+        }
+        .to_bytes();
+        assert!(hs.on_frame(&msg2).is_err(), "a message 2 was accepted from the AP");
+
+        // A group rekey is not part of the four-way handshake (no Pairwise bit).
+        let rekey = EapolKey {
+            key_info: 2 | KEY_INFO_MIC | KEY_INFO_ACK | KEY_INFO_SECURE,
+            key_len: 16,
+            replay_counter: 9,
+            nonce: [0; 32],
+            rsc: [0; 8],
+            mic: [0; 16],
+            key_data: Vec::new(),
+        };
+        assert_eq!(EapolKey::parse(&rekey.to_bytes()).unwrap().message(), None);
+    }
+
+    #[test_case]
+    fn message_three_must_carry_the_same_anonce_as_message_one() {
+        // A different ANonce means two different PTKs, which would otherwise show up as
+        // traffic that decrypts to nothing. The MIC has to be valid for the check to be
+        // reachable at all, so this is a confused AP rather than an attacker — but a silent
+        // wrong key is the worst of the outcomes.
+        let mut hs = Handshake::new(test_pmk(), ME, AP, nonce(0x88), Vec::new());
+        assert!(hs.on_frame(&ap_msg1(nonce(0x11), 1)).is_ok());
+        let other = derive_ptk(&test_pmk(), &AP, &ME, &nonce(0x99), &nonce(0x88));
+        let err = hs
+            .on_frame(&ap_msg3(&other, nonce(0x99), 2, &[0u8; 16]))
+            .expect_err("a changed ANonce was accepted");
+        assert!(err.contains("ANonce"), "misdiagnosed: {err}");
+    }
+
+    #[test_case]
+    fn a_malformed_eapol_frame_is_refused_not_salvaged() {
+        // Like the beacon parser, this runs on bytes from an unauthenticated sender: the
+        // handshake happens before any key is confirmed. Nothing may panic.
+        let ptk = derive_ptk(&test_pmk(), &AP, &ME, &nonce(0x11), &nonce(0x22));
+        let good = ap_msg3(&ptk, nonce(0x11), 2, &[0x5a; 16]);
+
+        for n in 0..good.len() {
+            let mut hs = Handshake::new(test_pmk(), ME, AP, nonce(0x22), Vec::new());
+            let _ = hs.on_frame(&good[..n]);
+            assert!(EapolKey::parse(&good[..n]).is_none() || n == good.len());
+        }
+
+        // A key-data length claiming more than the frame holds. Clamping it would hand the
+        // unwrap a truncated buffer that might still pass its integrity check on a prefix.
+        let mut lying = good.clone();
+        lying[4 + 93] = 0xff;
+        lying[4 + 94] = 0xff;
+        assert!(EapolKey::parse(&lying).is_none(), "a lying key-data length was accepted");
+
+        // A body length shorter than the fixed fields, and a non-Key packet type.
+        let mut short = good.clone();
+        short[2] = 0;
+        short[3] = 10;
+        assert!(EapolKey::parse(&short).is_none());
+        let mut wrong_type = good.clone();
+        wrong_type[1] = 0; // EAP-Packet, not Key
+        assert!(EapolKey::parse(&wrong_type).is_none());
+        // And a WPA1 descriptor type, which this code does not implement.
+        let mut wpa1 = good.clone();
+        wpa1[4] = 254;
+        assert!(EapolKey::parse(&wpa1).is_none());
+    }
+
+    #[test_case]
+    fn a_tampered_group_key_is_refused_rather_than_installed() {
+        // The unwrap's integrity check is the only thing between an attacker and a group key
+        // of their choosing — and unlike the pairwise key, a bad group key means accepting
+        // forged broadcast traffic.
+        let anonce = nonce(0x11);
+        let snonce = nonce(0x22);
+        let ptk = derive_ptk(&test_pmk(), &AP, &ME, &anonce, &snonce);
+        let mut hs = Handshake::new(test_pmk(), ME, AP, snonce, Vec::new());
+        assert!(hs.on_frame(&ap_msg1(anonce, 1)).is_ok());
+
+        let mut msg3 = ap_msg3(&ptk, anonce, 2, &[0x5a; 16]);
+        // Flip a bit inside the wrapped key data, then re-MIC so the frame is otherwise
+        // valid — which is precisely the attack the integrity check exists for.
+        let data_at = 4 + EAPOL_KEY_BODY_LEN;
+        msg3[data_at + 9] ^= 1;
+        let mut k = EapolKey::parse(&msg3).unwrap();
+        k.mic = eapol_mic(&ptk.kck, &k.to_bytes_for_mic());
+        let err = hs.on_frame(&k.to_bytes()).expect_err("a tampered group key was installed");
+        assert!(err.contains("integrity"), "misdiagnosed: {err}");
+        assert!(hs.gtk.is_none());
+    }
+
+    #[test_case]
+    fn the_gtk_is_found_among_other_key_data_and_never_past_its_end() {
+        // Real key data carries the AP's RSN element and padding alongside the GTK KDE.
+        let mut kd = alloc::vec![0x30, 0x14];
+        kd.extend_from_slice(&[0u8; 20]); // an RSN element
+        kd.extend_from_slice(&[0xdd, 0x16, 0x00, 0x0f, 0xac, 0x01, 0x02, 0x00]);
+        kd.extend_from_slice(&[0x77; 16]); // the GTK
+        kd.extend_from_slice(&[0xdd, 0x00]); // trailing padding
+        let g = find_gtk(&kd).expect("the GTK KDE was not found among the others");
+        assert_eq!(g.key, alloc::vec![0x77; 16]);
+        assert_eq!(g.id, 2);
+
+        // No GTK at all, and lengths that run off the end.
+        assert!(find_gtk(&[]).is_none());
+        assert!(find_gtk(&[0x30, 0x14, 0, 0]).is_none());
+        assert!(find_gtk(&[0xdd, 0x60, 0x00, 0x0f, 0xac, 0x01]).is_none());
+        // A GTK KDE with no key bytes is not a key.
+        assert!(find_gtk(&[0xdd, 0x06, 0x00, 0x0f, 0xac, 0x01, 0x01, 0x00]).is_none());
+        for n in 0..kd.len() {
+            let _ = find_gtk(&kd[..n]); // must not panic
+        }
     }
 }

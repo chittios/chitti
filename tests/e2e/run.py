@@ -462,6 +462,49 @@ def s_battery(g):
     return True, f"reported absence: {lines[-1][:70]}"
 
 
+def s_wifi_psk(g):
+    """`/wifi psk` must derive the published WPA2 key, on the running kernel.
+
+    The one part of joining a Wi-Fi network that is checkable without a radio.
+    These are the IEEE 802.11i Annex H vectors, and `wpa_passphrase 'IEEE'
+    password` on any Linux box prints the same 32 bytes — an independent oracle,
+    which is why this asserts the exact digest rather than "some hex appeared".
+
+    In-kernel unit tests cover the same vectors, so what this adds is the whole
+    path on the real kernel: the command parse, the 4096-iteration PBKDF2 running
+    under the cooperative scheduler without stalling the shell, and the formatting.
+    A wrong key here is a network that reports a wrong password forever.
+    """
+    cases = [
+        ("IEEE", "password", "f42c6fc52df0ebef9ebb4b90b38a5f902e83fe1b135a70e23aed762e9710a12e"),
+        (
+            "ThisIsASSID",
+            "ThisIsAPassword",
+            "0dc0d6eb90555ed6419756b9a15ec3e3209b63df707dd508d14581f8982721af",
+        ),
+    ]
+    for ssid, passphrase, want in cases:
+        m = g.mark()
+        for attempt in (1, 2):
+            m = g.mark()
+            g.send(f"/wifi psk {ssid} {passphrase}")
+            if g.wait_for(f"psk {ssid}:", 20, m):
+                break
+            if attempt == 2:
+                return False, f"/wifi psk {ssid} printed nothing after two attempts"
+        out = g.text()[m:]
+        if want not in out:
+            got = [l.strip() for l in out.splitlines() if "psk" in l]
+            return False, f"{ssid}: derived key does not match the published vector: {got}"
+    # And the bounds the standard sets, so a key nobody could have used is not
+    # presented as one.
+    m = g.mark()
+    g.send("/wifi psk net short")
+    if not g.wait_for("8-63", 15, m):
+        return False, "a too-short passphrase was accepted"
+    return True, f"{len(cases)} published PSK vectors derived correctly"
+
+
 def s_suspend_resume(_g):
     """Suspend the machine to RAM and wake it, then prove the shell survived.
 
@@ -1824,7 +1867,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("clipboard", s_clipboard),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]
-NET = [("nic_dispatch", s_nic_dispatch), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("browse", s_browse), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
+NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("browse", s_browse), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 # Runs after every other group: kills the guest (QEMU -no-reboot → exit).
 FINAL = [("restart", s_restart)]
 
