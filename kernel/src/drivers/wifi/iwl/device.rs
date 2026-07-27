@@ -521,8 +521,9 @@ impl IwlDevice {
     pub fn send_cmd(&mut self, group: u8, cmd: u8, payload: &[u8]) -> Result<u16, &'static str> {
         let regs = self.regs;
         let rings = self.rings.as_mut().ok_or("no command queue; load firmware first")?;
-        let bytes = proto::build_command(group, cmd, 0, payload);
-        if bytes.len() > CMD_SLOT {
+        // Check the size before claiming a slot, so an over-long command does not consume
+        // one and leave it in flight forever.
+        if proto::CMD_HEADER_WIDE_LEN + payload.len() > CMD_SLOT {
             return Err("command payload does not fit its queue slot");
         }
         // Claiming can fail, and it must be allowed to: reusing a slot whose command the
@@ -531,8 +532,8 @@ impl IwlDevice {
             .queue
             .claim()
             .ok_or("command queue is full; a previous command never answered")?;
-        // Rebuild with the real sequence now that the slot is known — the sequence *is* the
-        // slot, so it cannot be chosen before claiming one.
+        // Built after claiming, because the sequence number *is* the slot — it cannot be
+        // chosen before there is a slot to name.
         let bytes = proto::build_command(group, cmd, seq, payload);
 
         let split = proto::split_command(bytes.len());
