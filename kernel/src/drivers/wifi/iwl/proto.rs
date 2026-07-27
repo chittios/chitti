@@ -27,6 +27,13 @@ pub const GROUP_MAC_CONF: u8 = 0x3;
 pub const GROUP_PHY_OPS: u8 = 0x4;
 pub const GROUP_DATA_PATH: u8 = 0x5;
 
+/// Regulatory and NVM group — where the device's own configuration is read from.
+pub const GROUP_REGULATORY_NVM: u8 = 0xc;
+/// Read the NVM's summary. **Read-only**, which is why it is the first command sent: a
+/// wrong guess about a configuration command's payload misconfigures a radio, while a wrong
+/// guess here can only be answered with an error.
+pub const NVM_GET_INFO: u8 = 0x02;
+
 /// Firmware's first word after a successful load: it is alive.
 pub const UCODE_ALIVE_NTFY: u8 = 0x01;
 /// Initialisation finished.
@@ -143,6 +150,132 @@ pub fn build_tfd(bufs: &[(u64, u16)]) -> Option<Tfd> {
     Some(t)
 }
 
+/// Serialise a command: the wide header followed by its payload.
+///
+/// Kept pure and separate from the queue plumbing because this is the byte layout firmware
+/// parses, and the two mistakes it can contain — a length that counts the header, and a
+/// little-endian field written big-endian — both produce a command that is *obeyed*, with
+/// the wrong size or the wrong contents.
+pub fn build_command(group: u8, cmd: u8, sequence: u16, payload: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(CMD_HEADER_WIDE_LEN + payload.len());
+    v.push(cmd);
+    v.push(group);
+    v.extend_from_slice(&sequence.to_le_bytes());
+    v.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    v.push(0); // reserved
+    v.push(0); // version
+    v.extend_from_slice(payload);
+    v
+}
+
+/// Size of the first transfer buffer, which the device fetches into a small internal
+/// staging buffer rather than reading in place.
+///
+/// This is why a command cannot simply be pointed at as one buffer: the first 20 bytes must
+/// live in a separate, aligned allocation. Getting it wrong does not fail cleanly — the
+/// device reads a partly-stale header.
+pub const FIRST_TB_SIZE: usize = 20;
+/// The alignment that staging buffer needs.
+pub const FIRST_TB_ALIGN: usize = 64;
+
+/// How a command's bytes are split across transfer buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandSplit {
+    /// Bytes copied into the aligned first-TB staging buffer.
+    pub first: usize,
+    /// Bytes left in the command buffer, described by a second TB — zero for a short
+    /// command that fits entirely in the first.
+    pub rest: usize,
+}
+
+/// Split a command of `len` bytes the way the device expects to fetch it.
+pub fn split_command(len: usize) -> CommandSplit {
+    let first = core::cmp::min(len, FIRST_TB_SIZE);
+    CommandSplit {
+        first,
+        rest: len - first,
+    }
+}
+
+/// The host's view of a command queue: where the next command goes and what is in flight.
+///
+/// Pure bookkeeping, deliberately separate from the DMA and the doorbell. The failure it
+/// exists to prevent is a wrapped write index overwriting a descriptor the device has not
+/// read yet — which loses a command already counted as sent, so the driver waits forever
+/// for a response to something the device never saw.
+#[derive(Debug, Clone)]
+pub struct CmdQueue {
+    /// Number of slots, a power of two.
+    pub slots: usize,
+    /// Next slot the host will write.
+    write: usize,
+    /// Sequence occupying each slot, or `None` when free.
+    inflight: Vec<Option<u16>>,
+    /// Queue id, which goes into both the doorbell and every sequence number.
+    pub id: u8,
+}
+
+impl CmdQueue {
+    /// `slots` must be a power of two — the device wraps the index by masking, so anything
+    /// else makes the host and the device disagree about which descriptor is which.
+    pub fn new(id: u8, slots: usize) -> Option<CmdQueue> {
+        if slots == 0 || !slots.is_power_of_two() || slots > 256 {
+            return None;
+        }
+        Some(CmdQueue {
+            slots,
+            write: 0,
+            inflight: alloc::vec![None; slots],
+            id,
+        })
+    }
+
+    /// Log2 of the slot count, which is what the context info wants.
+    pub fn size_log2(&self) -> u8 {
+        self.slots.trailing_zeros() as u8
+    }
+
+    /// Claim the next slot, returning `(slot, sequence)`.
+    ///
+    /// `None` when that slot is still in flight: the queue is full, and reusing the slot
+    /// would overwrite a descriptor the device may not have read.
+    pub fn claim(&mut self) -> Option<(usize, u16)> {
+        if self.inflight[self.write].is_some() {
+            return None;
+        }
+        let slot = self.write;
+        let seq = make_sequence(self.id, slot as u8);
+        self.inflight[slot] = Some(seq);
+        self.write = (self.write + 1) % self.slots;
+        Some((slot, seq))
+    }
+
+    /// The write index to ring the doorbell with after filling a slot.
+    pub fn write_index(&self) -> u16 {
+        self.write as u16
+    }
+
+    /// Retire a response's sequence, freeing its slot.
+    ///
+    /// Returns false for a sequence that is not in flight — a duplicate response, or one
+    /// for a command this driver never sent. Both happen (firmware retransmits), and
+    /// freeing a slot on the strength of one would release a slot still in use.
+    pub fn retire(&mut self, seq: u16) -> bool {
+        let slot = sequence_slot(seq) as usize;
+        if slot >= self.slots || self.inflight[slot] != Some(seq) {
+            return false;
+        }
+        self.inflight[slot] = None;
+        true
+    }
+
+    /// Whether `seq` is a command still awaiting its response.
+    pub fn is_inflight(&self, seq: u16) -> bool {
+        let slot = sequence_slot(seq) as usize;
+        slot < self.slots && self.inflight[slot] == Some(seq)
+    }
+}
+
 // --- receive packets ------------------------------------------------------
 
 /// The frame-size field of `len_n_flags` — the rest are flags, and masking them off is
@@ -158,10 +291,38 @@ pub struct RxPacket<'a> {
     pub payload: &'a [u8],
 }
 
+/// Firmware's own verdict on its startup, in the first halfword of the alive notification.
+pub const ALIVE_STATUS_OK: u16 = 0xcafe;
+/// The value firmware writes when it started but is not usable.
+pub const ALIVE_STATUS_ERR: u16 = 0xdead;
+
 impl RxPacket<'_> {
     /// Whether this is firmware announcing it is alive.
     pub fn is_alive(&self) -> bool {
         self.group_id == GROUP_LEGACY && self.cmd == UCODE_ALIVE_NTFY
+    }
+
+    /// The status word out of an alive notification.
+    ///
+    /// Only the status is read. The rest of that structure has gone through many revisions
+    /// with fields at different offsets per firmware version, and there is no honest way to
+    /// pick one here without a device to check against — whereas the status is the field
+    /// that decides whether to continue, and an *unusable* firmware that announced itself is
+    /// otherwise taken for a working one.
+    pub fn alive_status(&self) -> Option<u16> {
+        if !self.is_alive() || self.payload.len() < 2 {
+            return None;
+        }
+        Some(u16::from_le_bytes([self.payload[0], self.payload[1]]))
+    }
+
+    /// Whether this packet is the response to a command sent with `sequence`.
+    ///
+    /// Group and command must match too. Firmware sends unsolicited notifications
+    /// constantly, and a sequence number is only 13 meaningful bits — so matching on it
+    /// alone eventually hands a scan notification to whatever is waiting for a reply.
+    pub fn answers(&self, group: u8, cmd: u8, sequence: u16) -> bool {
+        self.group_id == group && self.cmd == cmd && self.sequence == sequence
     }
 
     /// Whether this is firmware reporting its own failure.
@@ -195,6 +356,52 @@ pub fn parse_rx(buf: &[u8]) -> Option<RxPacket<'_>> {
         sequence: u16::from_le_bytes([h[2], h[3]]),
         payload: &buf[4 + CMD_HEADER_WIDE_LEN..4 + size],
     })
+}
+
+/// The part of the NVM info response whose layout is stable.
+///
+/// Only the general section is decoded, and deliberately so: the response continues with SKU,
+/// PHY and regulatory sections whose sizes differ per firmware version, and there is no
+/// device here to check a guess against. What these four fields buy is worth having on its
+/// own — a plausible NVM version and hardware-address count is evidence the command
+/// round-trip *worked*, as opposed to firmware answering something else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvmInfo {
+    pub flags: u32,
+    pub nvm_version: u32,
+    pub board_type: u32,
+    /// How many MAC addresses the device is provisioned with. Zero would mean the device
+    /// cannot address a frame, so it is a useful sanity check on the whole exchange.
+    pub n_hw_addrs: u32,
+}
+
+impl NvmInfo {
+    /// Parse the general section from the head of an NVM info response.
+    pub fn parse(payload: &[u8]) -> Option<NvmInfo> {
+        if payload.len() < 16 {
+            return None;
+        }
+        let w = |i: usize| {
+            u32::from_le_bytes([
+                payload[i * 4],
+                payload[i * 4 + 1],
+                payload[i * 4 + 2],
+                payload[i * 4 + 3],
+            ])
+        };
+        let info = NvmInfo {
+            flags: w(0),
+            nvm_version: w(1),
+            board_type: w(2),
+            n_hw_addrs: w(3),
+        };
+        // An all-ones response is a floating read dressed up as data, and a device
+        // provisioned with an implausible number of addresses did not answer this command.
+        if info.nvm_version == u32::MAX || info.n_hw_addrs == 0 || info.n_hw_addrs > 16 {
+            return None;
+        }
+        Some(info)
+    }
 }
 
 /// Build the free-receive-buffer list the device consumes.
@@ -343,6 +550,180 @@ mod tests {
         let b = rx_bytes(GROUP_DATA_PATH, 0x01, 0, &[], 0);
         assert!(parse_rx(&a).unwrap().is_alive());
         assert!(!parse_rx(&b).unwrap().is_alive(), "group ignored when matching ALIVE");
+    }
+
+    #[test_case]
+    fn a_command_is_a_header_then_its_payload() {
+        let c = build_command(GROUP_SYSTEM, 0x1c, 0x0304, &[0xaa, 0xbb, 0xcc]);
+        assert_eq!(c.len(), CMD_HEADER_WIDE_LEN + 3);
+        assert_eq!(c[0], 0x1c, "cmd id first");
+        assert_eq!(c[1], GROUP_SYSTEM);
+        assert_eq!(&c[2..4], &0x0304u16.to_le_bytes(), "sequence is little-endian");
+        assert_eq!(&c[4..6], &3u16.to_le_bytes(), "the length counts the payload only");
+        assert_eq!(&c[6..8], &[0, 0]);
+        assert_eq!(&c[8..], &[0xaa, 0xbb, 0xcc]);
+
+        // It must parse as the packet firmware would echo, so the encoder and the decoder
+        // cannot drift apart.
+        let mut framed = ((c.len() as u32).to_le_bytes()).to_vec();
+        framed.extend_from_slice(&c);
+        let p = parse_rx(&framed).unwrap();
+        assert_eq!((p.group_id, p.cmd, p.sequence), (GROUP_SYSTEM, 0x1c, 0x0304));
+        assert_eq!(p.payload, &[0xaa, 0xbb, 0xcc]);
+    }
+
+    #[test_case]
+    fn a_command_is_split_so_its_first_twenty_bytes_are_staged() {
+        // The device fetches the first transfer buffer into an internal staging buffer
+        // instead of reading it in place, so those bytes must come from a separate aligned
+        // allocation. A command described as one buffer is read with a partly-stale header.
+        assert_eq!(split_command(8), CommandSplit { first: 8, rest: 0 });
+        assert_eq!(split_command(20), CommandSplit { first: 20, rest: 0 });
+        assert_eq!(split_command(21), CommandSplit { first: 20, rest: 1 });
+        assert_eq!(split_command(200), CommandSplit { first: 20, rest: 180 });
+        // Every split covers the whole command exactly.
+        for len in 1..300usize {
+            let s = split_command(len);
+            assert_eq!(s.first + s.rest, len, "len {len} lost bytes in the split");
+            assert!(s.first <= FIRST_TB_SIZE);
+        }
+        assert_eq!(FIRST_TB_ALIGN % FIRST_TB_SIZE.next_power_of_two(), 0);
+    }
+
+    #[test_case]
+    fn the_doorbell_packs_the_queue_and_index_without_overlap() {
+        // One register serves every queue, so an index bleeding into the id field rings a
+        // different queue's doorbell — leaving this command unqueued while another queue is
+        // told to run.
+        assert_eq!(csr_doorbell(0, 1), 0x0000_0001);
+        assert_eq!(csr_doorbell(4, 0x10), 0x0004_0010);
+        assert_eq!(csr_doorbell(31, 0xffff), 0x001f_ffff);
+        for q in [0u8, 1, 9, 31] {
+            for idx in [0u16, 1, 15, 0xffff] {
+                let v = csr_doorbell(q, idx);
+                assert_eq!(v >> 16, q as u32, "queue lost for {q}/{idx}");
+                assert_eq!(v & 0xffff, idx as u32, "index lost for {q}/{idx}");
+            }
+        }
+    }
+
+    /// The doorbell encoder lives in `csr` with the register it writes; re-exported here so
+    /// the packing test sits next to the sequence packing it has to stay distinct from.
+    fn csr_doorbell(queue: u8, idx: u16) -> u32 {
+        super::super::csr::txq_doorbell(queue, idx)
+    }
+
+    #[test_case]
+    fn the_queue_refuses_to_reuse_a_slot_still_in_flight() {
+        // The failure this prevents: a wrapped write index overwriting a descriptor the
+        // device has not read, which loses a command already counted as sent — so the driver
+        // waits forever for a response to something the device never saw.
+        let mut q = CmdQueue::new(4, 4).unwrap();
+        assert_eq!(q.size_log2(), 2);
+        let mut seqs = alloc::vec::Vec::new();
+        for expect_slot in 0..4 {
+            let (slot, seq) = q.claim().expect("a fresh queue has room");
+            assert_eq!(slot, expect_slot);
+            assert_eq!(sequence_queue(seq), 4, "the sequence must name its queue");
+            assert_eq!(sequence_slot(seq) as usize, slot);
+            seqs.push(seq);
+        }
+        assert!(q.claim().is_none(), "a full queue handed out a fifth slot");
+
+        // Retiring the oldest frees exactly its slot, and the index wraps to it.
+        assert!(q.retire(seqs[0]));
+        assert_eq!(q.write_index(), 0);
+        let (slot, _) = q.claim().unwrap();
+        assert_eq!(slot, 0);
+        assert!(q.claim().is_none());
+    }
+
+    #[test_case]
+    fn a_duplicate_or_unknown_response_does_not_free_a_slot() {
+        // Firmware retransmits, and a sequence is only 13 meaningful bits. Freeing a slot on
+        // a response we cannot account for releases one that is still in use.
+        let mut q = CmdQueue::new(0, 8).unwrap();
+        let (_, seq) = q.claim().unwrap();
+        assert!(q.is_inflight(seq));
+        assert!(q.retire(seq));
+        assert!(!q.is_inflight(seq));
+        assert!(!q.retire(seq), "a duplicate response retired the slot twice");
+        assert!(!q.retire(make_sequence(0, 7)), "an unsent sequence was retired");
+        // A sequence naming a slot past the end of the queue must not index out of bounds.
+        assert!(!q.retire(make_sequence(0, 200)));
+        assert!(!q.is_inflight(make_sequence(0, 200)));
+
+        // Slot counts the device cannot wrap by masking.
+        assert!(CmdQueue::new(0, 0).is_none());
+        assert!(CmdQueue::new(0, 6).is_none());
+        assert!(CmdQueue::new(0, 512).is_none());
+    }
+
+    #[test_case]
+    fn a_response_is_matched_by_group_and_command_as_well_as_sequence() {
+        // Firmware sends unsolicited notifications constantly; matching on the sequence
+        // alone eventually hands one to whatever is waiting for a reply.
+        let b = rx_bytes(GROUP_SYSTEM, 0x1c, 0x0405, &[1], 0);
+        let p = parse_rx(&b).unwrap();
+        assert!(p.answers(GROUP_SYSTEM, 0x1c, 0x0405));
+        assert!(!p.answers(GROUP_SYSTEM, 0x1d, 0x0405), "wrong command matched");
+        assert!(!p.answers(GROUP_MAC_CONF, 0x1c, 0x0405), "wrong group matched");
+        assert!(!p.answers(GROUP_SYSTEM, 0x1c, 0x0406), "wrong sequence matched");
+    }
+
+    #[test_case]
+    fn firmware_that_announces_itself_unusable_is_not_taken_for_working() {
+        // The alive notification carries firmware's own verdict, and 0xdead is a firmware
+        // that started and cannot be used — indistinguishable from a good one if only the
+        // notification's arrival is checked.
+        let ok = rx_bytes(
+            GROUP_LEGACY,
+            UCODE_ALIVE_NTFY,
+            0,
+            &ALIVE_STATUS_OK.to_le_bytes(),
+            0,
+        );
+        assert_eq!(parse_rx(&ok).unwrap().alive_status(), Some(ALIVE_STATUS_OK));
+        let bad = rx_bytes(
+            GROUP_LEGACY,
+            UCODE_ALIVE_NTFY,
+            0,
+            &ALIVE_STATUS_ERR.to_le_bytes(),
+            0,
+        );
+        assert_eq!(parse_rx(&bad).unwrap().alive_status(), Some(ALIVE_STATUS_ERR));
+        // A notification too short to carry a status, and a packet that is not one at all.
+        let runt = rx_bytes(GROUP_LEGACY, UCODE_ALIVE_NTFY, 0, &[1], 0);
+        assert_eq!(parse_rx(&runt).unwrap().alive_status(), None);
+        let other = rx_bytes(GROUP_LEGACY, 0x33, 0, &[0xfe, 0xca], 0);
+        assert_eq!(parse_rx(&other).unwrap().alive_status(), None);
+    }
+
+    #[test_case]
+    fn the_nvm_response_is_decoded_only_as_far_as_its_layout_is_stable() {
+        let mut p = alloc::vec::Vec::new();
+        for v in [0x1u32, 0x0c11, 0x1234, 2] {
+            p.extend_from_slice(&v.to_le_bytes());
+        }
+        p.extend_from_slice(&[0xab; 32]); // the sections this code does not decode
+        let n = NvmInfo::parse(&p).expect("a well-formed response must parse");
+        assert_eq!(n.nvm_version, 0x0c11);
+        assert_eq!(n.board_type, 0x1234);
+        assert_eq!(n.n_hw_addrs, 2);
+
+        // A response that is really a floating read, or one describing a device that cannot
+        // address a frame: both mean the command was not answered, not that it was.
+        let ones = alloc::vec![0xffu8; 32];
+        assert!(NvmInfo::parse(&ones).is_none(), "a floating read was accepted as NVM data");
+        let mut zero_addrs = p.clone();
+        zero_addrs[12..16].copy_from_slice(&0u32.to_le_bytes());
+        assert!(NvmInfo::parse(&zero_addrs).is_none());
+        let mut absurd = p.clone();
+        absurd[12..16].copy_from_slice(&99u32.to_le_bytes());
+        assert!(NvmInfo::parse(&absurd).is_none());
+        for n in 0..16 {
+            assert!(NvmInfo::parse(&p[..n]).is_none(), "a truncated response parsed");
+        }
     }
 
     #[test_case]

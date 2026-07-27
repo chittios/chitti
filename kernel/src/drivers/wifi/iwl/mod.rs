@@ -25,20 +25,54 @@
 //! card, APM init, software reset, grab MAC access, then build the context info and hand
 //! it over.
 //!
-//! What still does not exist: the receive path — so firmware's *alive* notification
-//! cannot be observed — the command round-trip, and then the 802.11 state machine and
-//! WPA2. So the radio does not associate and `/wifi connect` still cannot work. Shipping
-//! a half-built version of that would put a connect in the shell that fails silently;
-//! `/wifi` reports how far bring-up got instead.
+//! [`proto`] then adds the message layer — command out, notification in — and [`device`]
+//! the queue that carries it: a command is placed in a slot, split across the two transfer
+//! buffers the device fetches it with, and the doorbell rung; the reply is matched by the
+//! sequence firmware echoes. Bring-up ends by reading the device's MAC address out of its
+//! own registers and sending one **read-only** command (`NVM_GET_INFO`), because that is the
+//! strongest claim that can be checked: firmware answered a question.
+//!
+//! ## What still does not exist, and why not
+//!
+//! **The configuration commands, so it cannot scan or associate.** Not for want of
+//! plumbing — the transport above would carry them. The obstacle is that a scan request,
+//! a MAC context and a station key are large versioned structures whose field layouts vary
+//! per firmware API, and there is no Intel WiFi device in any emulator to check a guess
+//! against. Writing them from memory would produce code that looks complete, sends
+//! well-formed garbage to a real radio, and reports success — which is worse than not
+//! having it, because the failure would then be somebody's laptop rather than a missing
+//! feature. They need a machine with the part in it.
+//!
+//! The WPA2 and 802.11 layers those commands would feed **do** exist and are tested:
+//! [`super::wpa`] and [`super::ieee80211`].
+//!
+//! ## Both arches, one driver
+//!
+//! Nothing here is gated on `x86_64`. It was, and that was wrong: an Intel WiFi card in an
+//! ARM machine's PCIe slot is an ordinary endpoint, and the only thing that actually differed
+//! was the *import* — the PCI config surface is `crate::arch::x86_64::pci` (I/O ports) on x86
+//! and `crate::pci` (ECAM) on aarch64, with the same `for_each`/`class_of`/`PciDevice` API,
+//! exactly as `net::pci` does it. So there is one cfg pair at the top of this module and one
+//! in [`device`], and no behaviour behind either. A machine with no PCI at all (aarch64
+//! `-kernel`, where ECAM comes from the stub's ACPI) simply finds nothing: `pci::for_each`
+//! returns immediately when no ECAM base was published.
 
 pub mod context;
 pub mod csr;
-#[cfg(target_arch = "x86_64")]
 pub mod device;
 pub mod fw;
 pub mod proto;
 
 use alloc::string::String;
+
+// The PCI config surface, same API either side: legacy I/O ports on x86, ECAM on aarch64.
+// One cfg pair here and nothing below it is arch-gated — an Intel WiFi card in an ARM
+// machine's PCIe slot is an ordinary endpoint, and gating the whole driver on x86 would
+// make it invisible there for no reason but the import.
+#[cfg(target_arch = "aarch64")]
+use crate::pci;
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::pci;
 
 /// What was found on the bus, for `/wifi` to report.
 #[derive(Debug, Clone)]
@@ -54,9 +88,7 @@ pub struct Found {
 /// Read-only: it reads configuration space and nothing else. An unrecognised Intel WiFi
 /// id yields `None` with a log naming it, rather than being driven as a nearby family —
 /// the same rule the Ethernet dispatcher follows, for a worse failure mode.
-#[cfg(target_arch = "x86_64")]
 pub fn probe() -> Option<Found> {
-    use crate::arch::x86_64::pci;
     let mut found: Option<Found> = None;
     // Network controller, "other" subclass (02:80) is where WiFi lives. Walk every
     // function rather than taking the first match, so an unrecognised part still gets
@@ -105,18 +137,9 @@ pub fn probe() -> Option<Found> {
     found
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-pub fn probe() -> Option<Found> {
-    // Intel WiFi is a PCIe part found in x86 laptops. An aarch64 machine with one would
-    // work through the same code, but there is no such machine to test against and the
-    // PCI facade differs, so this is honest rather than speculative.
-    None
-}
-
 /// Whether a PCI function looks like a wireless controller (class 02, subclass 80).
-#[cfg(target_arch = "x86_64")]
-fn is_wifi_class(d: &crate::arch::x86_64::pci::PciDevice) -> bool {
-    let class = crate::arch::x86_64::pci::class_of(d);
+fn is_wifi_class(d: &pci::PciDevice) -> bool {
+    let class = pci::class_of(d);
     class.0 == 0x02 && class.1 == 0x80
 }
 
@@ -133,7 +156,6 @@ pub const FW_DIR: &str = "/wifi/iwl";
 /// Candidates are tried newest-API first, which is what Linux does and the reason the API
 /// number is enumerated rather than computed: it belongs to the file, not the chip.
 /// Returns the bytes and the name they came from.
-#[cfg(target_arch = "x86_64")]
 fn find_firmware(family: fw::Family) -> Option<(String, alloc::vec::Vec<u8>)> {
     for name in fw::firmware_candidates(family) {
         let path = alloc::format!("{FW_DIR}/{name}");
@@ -153,10 +175,7 @@ fn find_firmware(family: fw::Family) -> Option<(String, alloc::vec::Vec<u8>)> {
 /// Ends after firmware is handed over, which is honestly short of working: without a
 /// receive path the device's *alive* notification cannot be seen, so "handed over" is the
 /// strongest claim available and the log says so.
-#[cfg(target_arch = "x86_64")]
 pub fn bring_up() -> Result<String, String> {
-    use crate::arch::x86_64::pci;
-
     let found = probe().ok_or_else(|| String::from("no recognised Intel WiFi device"))?;
     // Re-find the function so the device handle is fresh rather than cached from a probe
     // that may have happened long ago.
@@ -190,23 +209,43 @@ pub fn bring_up() -> Result<String, String> {
     let phys = dev.load_firmware(&image, &bytes).map_err(String::from)?;
     // The load is only believable if firmware answers. Before the receive ring existed
     // this was where bring-up stopped and "handed over" was the strongest claim available.
-    match dev.wait_for_alive() {
-        Ok(()) => Ok(alloc::format!(
-            "{} reset, {} ({}) loaded at {phys:#x} -- firmware is alive. No command queue or \
-             802.11 yet, so it cannot associate.",
-            found.family.label(),
-            name,
-            image.version
-        )),
-        Err(e) => Err(alloc::format!(
+    if let Err(e) = dev.wait_for_alive() {
+        return Err(alloc::format!(
             "{} reset and {} handed over at {phys:#x}, but {e}",
             found.family.label(),
             name
-        )),
+        ));
     }
-}
 
-#[cfg(not(target_arch = "x86_64"))]
-pub fn bring_up() -> Result<String, String> {
-    Err(String::from("Intel WiFi is a PCIe part found in x86 machines"))
+    let mut report = alloc::format!(
+        "{} reset, {} ({}) loaded at {phys:#x} -- firmware is alive",
+        found.family.label(),
+        name,
+        image.version
+    );
+
+    // The device's own MAC address, straight out of its registers. Worth reading here
+    // because it is the one fact this driver can *check*: a plausible unicast address means
+    // the register window is right, and an absent one means it is not — a distinction that
+    // otherwise only shows up much later as traffic nobody answers.
+    match dev.read_mac() {
+        Some(m) => report.push_str(&alloc::format!(
+            "; mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            m[0], m[1], m[2], m[3], m[4], m[5]
+        )),
+        None => report.push_str("; no MAC address in the strap or OTP registers"),
+    }
+
+    // One read-only command, to see whether the round-trip works at all. Read-only on
+    // purpose: this transport has never run against a real device, and a first command that
+    // configured something would misconfigure a radio if any part of it is wrong.
+    match dev.nvm_info() {
+        Ok(n) => report.push_str(&alloc::format!(
+            "; NVM v{:#x} board {:#x}, {} hw address(es) -- the command round-trip works",
+            n.nvm_version, n.board_type, n.n_hw_addrs
+        )),
+        Err(e) => report.push_str(&alloc::format!("; the first command got no usable reply ({e})")),
+    }
+    report.push_str(". Scan and associate need the firmware's configuration commands, which are not implemented.");
+    Ok(report)
 }

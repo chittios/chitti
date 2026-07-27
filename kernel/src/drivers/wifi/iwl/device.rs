@@ -17,12 +17,15 @@
 //!
 //! ## What this does not do
 //!
-//! It stops after firmware is handed over. There is no receive path, no command
-//! round-trip, no 802.11 state machine and no WPA2 — so the radio does not associate and
-//! `/wifi connect` still cannot work. Those are further stages; see [`super`].
+//! It carries commands and notifications, and stops there. The firmware **configuration**
+//! commands a scan needs are not here — see [`super`] for why guessing their layouts would
+//! be worse than their absence.
 
 use super::{context, csr, fw, proto};
 
+// Same API either side — see the note in [`super`] on why nothing here is arch-gated.
+#[cfg(target_arch = "aarch64")]
+use crate::pci::PciDevice;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::pci::PciDevice;
 
@@ -47,14 +50,37 @@ const RX_BUF: usize = 4096;
 const RB_STATUS_CLOSED: usize = 0;
 const RB_CLOSED_MASK: u16 = 0x0fff;
 
+/// Slots in the command queue. A power of two, because the device wraps the index by
+/// masking — and 16 descriptors of 256 bytes is exactly one page.
+const NCMD: usize = 16;
+/// Bytes reserved per command. Startup commands are tens of bytes; a payload larger than
+/// this is refused rather than run off the end of its slot.
+const CMD_SLOT: usize = 256;
+/// The command queue's id. Queue 0 on gen2 parts, and it appears in two unrelated places —
+/// the doorbell and every sequence number — which is why it is one constant.
+const CMD_QUEUE_ID: u8 = 0;
+
 /// The receive ring, kept so notifications can be read after firmware starts.
 struct Rings {
     /// Virtual addresses of the receive buffers, indexed as the device indexes them.
     bufs: [u64; NRX],
+    /// Physical addresses of the same, needed to hand a buffer back after reading it.
+    bufs_phys: [u64; NRX],
     /// Virtual address of the status block the device writes its progress into.
     status: u64,
     /// Next buffer this driver has not yet looked at.
     read: usize,
+    /// Virtual address of the free-buffer list, and how far the host has filled it.
+    free_list: u64,
+    free_widx: usize,
+
+    /// Command queue: descriptor ring, per-slot command bytes, per-slot staging buffer.
+    cmd_tfd: u64,
+    cmd_buf_virt: u64,
+    cmd_buf_phys: u64,
+    first_tb_virt: u64,
+    first_tb_phys: u64,
+    queue: proto::CmdQueue,
 }
 
 /// A mapped, reset Intel WiFi device.
@@ -215,7 +241,6 @@ impl IwlDevice {
     /// device is — [`fw::family_for`] has already refused anything unrecognised, because
     /// the wrong bring-up path on a WiFi part fails inside the device with no error the
     /// host can read.
-    #[cfg(target_arch = "x86_64")]
     pub fn open(d: PciDevice, family: fw::Family) -> Option<IwlDevice> {
         d.enable_bus_master();
         let bar = d.bar(0);
@@ -330,7 +355,18 @@ impl IwlDevice {
         let (used_rbd, _) = crate::mm::alloc_dma(4096).ok_or("no DMA memory for the used RBD list")?;
         let (status, status_virt) =
             crate::mm::alloc_dma(4096).ok_or("no DMA memory for the status block")?;
-        let (cmdq, _) = crate::mm::alloc_dma(4096).ok_or("no DMA memory for the command queue")?;
+
+        // The command queue: one page of descriptors, one page of command bytes, and one
+        // page of first-transfer-buffer staging. Three allocations rather than one because
+        // the device DMAs from all three independently and the staging buffers have their
+        // own alignment.
+        let (cmdq, cmdq_virt) =
+            crate::mm::alloc_dma(NCMD * 256).ok_or("no DMA memory for the command queue")?;
+        let (cmd_buf_phys, cmd_buf_virt) =
+            crate::mm::alloc_dma(NCMD * CMD_SLOT).ok_or("no DMA memory for command payloads")?;
+        let (first_tb_phys, first_tb_virt) = crate::mm::alloc_dma(NCMD * proto::FIRST_TB_ALIGN)
+            .ok_or("no DMA memory for the command staging buffers")?;
+        let queue = proto::CmdQueue::new(CMD_QUEUE_ID, NCMD).ok_or("command queue size rejected")?;
 
         let ctxt = context::ContextInfo {
             control: context::ControlBlock {
@@ -346,7 +382,7 @@ impl IwlDevice {
             },
             tx: context::TxControl {
                 cmd_queue_addr: cmdq,
-                cmd_queue_size: 4,
+                cmd_queue_size: queue.size_log2(),
                 _rsvd: [0; 7],
             },
             fw: context::FwControl {
@@ -387,8 +423,18 @@ impl IwlDevice {
         self.ctxt_phys = ctxt_phys;
         self.rings = Some(Rings {
             bufs: rx_virt,
+            bufs_phys: rx_phys,
             status: status_virt,
             read: 0,
+            free_list: free_virt,
+            // Every buffer is already in the list, so the device may fill all of them.
+            free_widx: NRX,
+            cmd_tfd: cmdq_virt,
+            cmd_buf_virt,
+            cmd_buf_phys,
+            first_tb_virt,
+            first_tb_phys,
+            queue,
         });
         crate::ktrace::log_fmt(format_args!(
             "iwlwifi: context info at {ctxt_phys:#x}, {} byte runtime section at {fw_phys:#x} -- handed to the device",
@@ -398,10 +444,211 @@ impl IwlDevice {
     }
 }
 
+/// One notification, copied out of the ring.
+///
+/// Owned rather than borrowed on purpose: the buffer it came from is handed straight back to
+/// the device, which may overwrite it before the caller has finished looking.
+#[derive(Debug, Clone)]
+pub struct Notification {
+    pub group_id: u8,
+    pub cmd: u8,
+    pub sequence: u16,
+    pub payload: alloc::vec::Vec<u8>,
+}
+
 impl IwlDevice {
     /// How long to wait for firmware to say something. Firmware answers in milliseconds;
     /// this is generous and finite.
     const ALIVE_SPINS: u32 = 2_000_000;
+    /// How long to wait for a command's response, once firmware is running.
+    const RESPONSE_SPINS: u32 = 1_000_000;
+
+    /// Take the next notification the device has finished writing, if any.
+    ///
+    /// Non-blocking, and it hands each buffer back after reading — without that the ring is
+    /// a one-off budget of sixteen notifications, which is enough for startup and nowhere
+    /// near enough for a scan, where every beacon is a notification. The symptom of not
+    /// recycling is a driver that works during bring-up and goes deaf under traffic.
+    pub fn poll_notification(&mut self) -> Option<Notification> {
+        let regs = self.regs;
+        let rings = self.rings.as_mut()?;
+        // SAFETY: the status block is a DMA page this driver owns, and the device writes
+        // the closed index into its first halfword.
+        let closed = unsafe {
+            core::ptr::read_volatile((rings.status + RB_STATUS_CLOSED as u64) as *const u16)
+        } & RB_CLOSED_MASK;
+        let closed = closed as usize % NRX;
+        if rings.read == closed {
+            return None;
+        }
+        let idx = rings.read;
+        rings.read = (rings.read + 1) % NRX;
+
+        // SAFETY: `bufs[idx]` maps a whole owned receive buffer of `RX_BUF` bytes.
+        let buf = unsafe { core::slice::from_raw_parts(rings.bufs[idx] as *const u8, RX_BUF) };
+        let parsed = proto::parse_rx(buf).map(|p| Notification {
+            group_id: p.group_id,
+            cmd: p.cmd,
+            sequence: p.sequence,
+            payload: p.payload.to_vec(),
+        });
+
+        // Republish the buffer and tell the device the list grew. The write index is the
+        // *count* of buffers published, not a slot number, so it keeps rising and the device
+        // masks it — publishing the slot index instead makes the device believe the list
+        // never grows past the ring size and it stops receiving.
+        let slot = rings.free_widx % NRX;
+        // SAFETY: `free_list` is an owned DMA page holding NRX u64 entries.
+        unsafe {
+            core::ptr::write_volatile((rings.free_list as *mut u64).add(slot), rings.bufs_phys[idx])
+        };
+        rings.free_widx = rings.free_widx.wrapping_add(1);
+        let widx = (rings.free_widx & 0xffff) as u32;
+        // Written through the peripheral window, which is a different register space from
+        // the transmit doorbell — see `csr::frbdcb_widx`.
+        w32(regs, csr::HBUS_TARG_PRPH_WADDR, csr::prph_write_addr(csr::frbdcb_widx(0)));
+        w32(regs, csr::HBUS_TARG_PRPH_WDAT, widx);
+
+        parsed
+    }
+
+    /// Send a command and return the sequence firmware will echo on its response.
+    ///
+    /// The command is placed in its slot, split across two transfer buffers the way the
+    /// device fetches it, and the doorbell rung. It does **not** wait — a caller that needs
+    /// the answer follows with [`Self::wait_for_response`], and a caller that does not
+    /// (there are such commands) is not made to.
+    pub fn send_cmd(&mut self, group: u8, cmd: u8, payload: &[u8]) -> Result<u16, &'static str> {
+        let regs = self.regs;
+        let rings = self.rings.as_mut().ok_or("no command queue; load firmware first")?;
+        let bytes = proto::build_command(group, cmd, 0, payload);
+        if bytes.len() > CMD_SLOT {
+            return Err("command payload does not fit its queue slot");
+        }
+        // Claiming can fail, and it must be allowed to: reusing a slot whose command the
+        // device has not read loses that command silently.
+        let (slot, seq) = rings
+            .queue
+            .claim()
+            .ok_or("command queue is full; a previous command never answered")?;
+        // Rebuild with the real sequence now that the slot is known — the sequence *is* the
+        // slot, so it cannot be chosen before claiming one.
+        let bytes = proto::build_command(group, cmd, seq, payload);
+
+        let split = proto::split_command(bytes.len());
+        let first_virt = rings.first_tb_virt + (slot * proto::FIRST_TB_ALIGN) as u64;
+        let first_phys = rings.first_tb_phys + (slot * proto::FIRST_TB_ALIGN) as u64;
+        let rest_virt = rings.cmd_buf_virt + (slot * CMD_SLOT) as u64;
+        let rest_phys = rings.cmd_buf_phys + (slot * CMD_SLOT) as u64;
+
+        // SAFETY: both are owned DMA regions with at least this slot's stride available, and
+        // the split is bounded by `bytes.len()`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), first_virt as *mut u8, split.first);
+            if split.rest > 0 {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr().add(split.first),
+                    rest_virt as *mut u8,
+                    split.rest,
+                );
+            }
+        }
+
+        let mut bufs = alloc::vec![(first_phys, split.first as u16)];
+        if split.rest > 0 {
+            // The remainder was copied to the start of the slot, so that is where the
+            // device is pointed — not `+ first`, which is where those bytes live in the
+            // command, not in memory.
+            bufs.push((rest_phys, split.rest as u16));
+        }
+        let tfd = proto::build_tfd(&bufs).ok_or("command descriptor rejected")?;
+        // SAFETY: the descriptor ring is an owned DMA region of NCMD entries and `slot` is
+        // inside it; `Tfd` is exactly the layout the device reads.
+        unsafe { core::ptr::write((rings.cmd_tfd as *mut proto::Tfd).add(slot), tfd) };
+
+        let doorbell = csr::txq_doorbell(rings.queue.id, rings.queue.write_index());
+        // The descriptor and the command bytes must be visible before the doorbell, or the
+        // device fetches whatever the slot held last time.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        w32(regs, csr::HBUS_TARG_WRPTR, doorbell);
+        Ok(seq)
+    }
+
+    /// Wait for the response to `seq`, returning its payload.
+    ///
+    /// Notifications arriving in the meantime are logged and dropped — except firmware's
+    /// error notification, which is reported as such: a command that will never be answered
+    /// because firmware has died should not be reported as a timeout.
+    pub fn wait_for_response(
+        &mut self,
+        group: u8,
+        cmd: u8,
+        seq: u16,
+    ) -> Result<alloc::vec::Vec<u8>, &'static str> {
+        for _ in 0..Self::RESPONSE_SPINS {
+            if let Some(n) = self.poll_notification() {
+                if n.group_id == proto::GROUP_LEGACY && n.cmd == proto::UCODE_ERROR_NTFY {
+                    crate::ktrace::log("iwlwifi", "firmware reported an error while a command was in flight");
+                    return Err("firmware failed while a command was in flight");
+                }
+                if n.group_id == group && n.cmd == cmd && n.sequence == seq {
+                    if let Some(rings) = self.rings.as_mut() {
+                        rings.queue.retire(seq);
+                    }
+                    return Ok(n.payload);
+                }
+                crate::ktrace::log_fmt(format_args!(
+                    "iwlwifi: notification group {:#02x} cmd {:#02x} seq {:#06x} while awaiting {group:#02x}/{cmd:#02x}",
+                    n.group_id, n.cmd, n.sequence
+                ));
+                continue;
+            }
+            core::hint::spin_loop();
+        }
+        Err("no response to the command")
+    }
+
+    /// Send a command and wait for its reply.
+    pub fn cmd(
+        &mut self,
+        group: u8,
+        cmd: u8,
+        payload: &[u8],
+    ) -> Result<alloc::vec::Vec<u8>, &'static str> {
+        let seq = self.send_cmd(group, cmd, payload)?;
+        self.wait_for_response(group, cmd, seq)
+    }
+
+    /// Read the device's own MAC address.
+    ///
+    /// Strap registers first, then OTP: either can be blank depending on how the board was
+    /// provisioned, and preferring one unconditionally yields an all-zero address on half the
+    /// machines. `None` when neither holds one, which is worth reporting rather than papering
+    /// over — an interface with no address cannot associate, and a made-up one would fail
+    /// later and further away.
+    pub fn read_mac(&self) -> Option<[u8; 6]> {
+        for (w0, w1) in [
+            (csr::CSR_MAC_ADDR0_STRAP, csr::CSR_MAC_ADDR1_STRAP),
+            (csr::CSR_MAC_ADDR0_OTP, csr::CSR_MAC_ADDR1_OTP),
+        ] {
+            if let Some(mac) = csr::mac_from_words(r32(self.regs, w0), r32(self.regs, w1)) {
+                return Some(mac);
+            }
+        }
+        None
+    }
+
+    /// Ask firmware for the NVM summary — the first command this driver sends.
+    ///
+    /// Chosen because it is **read-only**. The transport has never run against a real device,
+    /// and a first command that configures something would, if any part of it is wrong,
+    /// misconfigure a radio; this one can at worst be answered with an error. What comes back
+    /// is only decoded as far as [`proto::NvmInfo`] goes.
+    pub fn nvm_info(&mut self) -> Result<proto::NvmInfo, &'static str> {
+        let payload = self.cmd(proto::GROUP_REGULATORY_NVM, proto::NVM_GET_INFO, &[])?;
+        proto::NvmInfo::parse(&payload)
+            .ok_or("the NVM response did not decode as NVM information")
+    }
 
     /// Wait for firmware's *alive* notification.
     ///
@@ -410,46 +657,51 @@ impl IwlDevice {
     /// the address was written, and nothing more could be said. Now the device either
     /// answers or it does not, and either way the log says which.
     ///
-    /// Reads progress from the status block's `closed_rb_num`, masked: the upper bits are
-    /// not part of the index, and unmasked it runs off the ring on the first read. Every
-    /// newly closed buffer is parsed, so an *error* notification is reported as firmware
-    /// failing rather than as a timeout.
+    /// The notification's own status word is checked too, because firmware that comes up
+    /// *unusable* still announces itself, and taking the announcement alone as success means
+    /// the next command is sent into a dead device.
     pub fn wait_for_alive(&mut self) -> Result<(), &'static str> {
-        let rings = self.rings.as_mut().ok_or("no receive ring; load firmware first")?;
+        if self.rings.is_none() {
+            return Err("no receive ring; load firmware first");
+        }
         for _ in 0..Self::ALIVE_SPINS {
-            // SAFETY: the status block is a DMA page this driver owns, and the device
-            // writes the closed index into its first halfword.
-            let closed = unsafe {
-                core::ptr::read_volatile((rings.status + RB_STATUS_CLOSED as u64) as *const u16)
-            } & RB_CLOSED_MASK;
-            let closed = closed as usize % NRX;
-            while rings.read != closed {
-                let idx = rings.read;
-                rings.read = (rings.read + 1) % NRX;
-                // SAFETY: `bufs[idx]` maps a whole owned receive buffer of `RX_BUF` bytes.
-                let buf = unsafe {
-                    core::slice::from_raw_parts(rings.bufs[idx] as *const u8, RX_BUF)
-                };
-                let Some(pkt) = proto::parse_rx(buf) else {
-                    continue; // an unparseable buffer is not evidence either way
-                };
-                if pkt.is_alive() {
-                    crate::ktrace::log_fmt(format_args!(
-                        "iwlwifi: firmware is alive ({} byte notification)",
-                        pkt.payload.len()
-                    ));
-                    return Ok(());
-                }
-                if pkt.is_error() {
-                    crate::ktrace::log("iwlwifi", "firmware reported its own failure");
-                    return Err("firmware reported an error instead of coming alive");
-                }
-                crate::ktrace::log_fmt(format_args!(
-                    "iwlwifi: notification group {:#02x} cmd {:#02x} while waiting for alive",
-                    pkt.group_id, pkt.cmd
-                ));
+            let Some(n) = self.poll_notification() else {
+                core::hint::spin_loop();
+                continue;
+            };
+            if n.group_id == proto::GROUP_LEGACY && n.cmd == proto::UCODE_ERROR_NTFY {
+                crate::ktrace::log("iwlwifi", "firmware reported its own failure");
+                return Err("firmware reported an error instead of coming alive");
             }
-            core::hint::spin_loop();
+            if n.group_id == proto::GROUP_LEGACY && n.cmd == proto::UCODE_ALIVE_NTFY {
+                let status = if n.payload.len() >= 2 {
+                    Some(u16::from_le_bytes([n.payload[0], n.payload[1]]))
+                } else {
+                    None
+                };
+                match status {
+                    // A notification too short to carry a status is accepted: the field's
+                    // position is stable but its presence depends on the firmware version,
+                    // and refusing here would reject a working device over a missing check.
+                    Some(proto::ALIVE_STATUS_OK) | None => {
+                        crate::ktrace::log_fmt(format_args!(
+                            "iwlwifi: firmware is alive ({} byte notification)",
+                            n.payload.len()
+                        ));
+                        return Ok(());
+                    }
+                    Some(s) => {
+                        crate::ktrace::log_fmt(format_args!(
+                            "iwlwifi: firmware announced itself with status {s:#06x}, not OK"
+                        ));
+                        return Err("firmware came up but reported a bad status");
+                    }
+                }
+            }
+            crate::ktrace::log_fmt(format_args!(
+                "iwlwifi: notification group {:#02x} cmd {:#02x} while waiting for alive",
+                n.group_id, n.cmd
+            ));
         }
         Err("firmware never sent an alive notification")
     }

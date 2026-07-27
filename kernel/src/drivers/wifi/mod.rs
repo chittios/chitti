@@ -14,6 +14,7 @@
 //! SSID and connect runs DHCP on the virtio/e1000 NIC.
 
 pub mod brcm;
+pub mod ieee80211;
 pub mod iwl;
 pub mod wpa;
 
@@ -115,7 +116,7 @@ pub fn info_lines() -> Vec<String> {
     // as the part name, so nobody reads "AX200 found" as "WiFi works".
     if let Some(f) = iwl::probe() {
         lines.push(format!(
-            "adapter: Intel {} (device {:#06x}) -- identified only, no driver yet",
+            "adapter: Intel {} (device {:#06x})",
             f.family.label(),
             f.device_id
         ));
@@ -125,8 +126,21 @@ pub fn info_lines() -> Vec<String> {
             f.firmware.len(),
             f.family.min_api()
         ));
+        lines.push(format!(
+            "  fetch with `cargo xtask iwlwifi-assets`, then put it in {}/",
+            iwl::FW_DIR
+        ));
+        // Say exactly what `/wifi up` will and will not achieve. "Driver present" reads as
+        // "wifi works" otherwise, and the gap between the two is the whole 802.11
+        // configuration layer.
         lines.push(
-            "  fetch with `cargo xtask iwlwifi-assets`; scan/associate is not implemented".into(),
+            "  /wifi up: resets the radio, loads firmware, reads the MAC, sends one command"
+                .into(),
+        );
+        lines.push(
+            "  scan/connect: NOT implemented for Intel -- the firmware configuration commands \
+             need a machine with the part in it to verify against"
+                .into(),
         );
     }
     #[cfg(all(target_arch = "aarch64", not(test)))]

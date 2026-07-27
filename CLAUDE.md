@@ -1021,7 +1021,59 @@ FDT claims a GICv3 but carries no readable `reg`.
   `bulk_arm_in`/`bulk_take_in`/`bulk_send`; note the delivered length is
   **`requested - residual`** (a transfer event's low 24 bits are the *untransferred*
   count). Still missing for real machines: Broadcom `tg3`, Atheros/Killer `alx`,
-  Aquantia, and **any** WiFi on x86.
+  Aquantia.
+- **WPA2-PSK and 802.11 frames** (`drivers/wifi/wpa.rs`, `drivers/wifi/ieee80211.rs`,
+  `net/sha1.rs`) — the supplicant a SoftMAC radio needs, **built entirely as pure,
+  vector-pinned logic**, because joining a Wi-Fi network is code where a bug is
+  invisible: every step produces bytes as random-looking as the correct ones and the
+  only feedback is that the access point stops answering, which is indistinguishable
+  from a wrong password. So nothing here waits on a radio to be checkable. SHA-1 is
+  deliberately absent from the TLS path (broken for signatures) and exists **only**
+  because IEEE 802.11i mandates it — pinned to FIPS 180-2, RFC 2202 and the 802.11i
+  Annex H PSK vectors; then PBKDF2→PMK, PRF-384→PTK (KCK/KEK/TK), the EAPOL-Key MIC,
+  and AES-128 + RFC 3394 key unwrap for the group key. Four things are silent when
+  wrong and each has a test: the MAC addresses and nonces concatenate **smaller
+  first** (both sides do it, neither transmits the result, so a mistake is a
+  self-consistent PTK the AP disagrees with — reported to the user as a wrong
+  password); the PRF puts a **NUL** between label and data; the MIC is the first 16
+  bytes of HMAC-SHA-1 over the frame with **its own MIC field zeroed**; and PBKDF2
+  counts **bits** and must hash an over-long HMAC key first (every short vector passes
+  without that branch). `Handshake` is the four-way exchange as a pure state machine
+  over frames — `on_frame` in, reply out — so the failure paths are the tested ones:
+  a replayed message 1 (which carries no MIC, so the replay counter is the only
+  defence), a message 3 whose group key fails its integrity check, and the **ordering
+  that matters**: the ANonce is checked *before* the MIC, because a changed ANonce
+  fails the MIC too and checking the MIC first blames the passphrase. `ieee80211`
+  parses beacons/RSN elements — attacker-controlled bytes from an unauthenticated
+  sender, so every length is a claim and a lying one is refused, never clamped — and
+  reports TKIP/SAE/802.1X/required-MFP as **unsupported up front** rather than as a
+  timeout. Reachable and checkable by a user: **`/wifi psk <ssid> [passphrase]`**
+  prints the derived key, and `wpa_passphrase` on any Linux box is an independent
+  oracle for it (e2e `wifi_psk` asserts the published vectors on the running kernel).
+- **Intel WiFi** (`drivers/wifi/iwl/`) — the part in most x86 laptops. Staged, and the
+  stages are the point: `fw` (family from the PCI id, firmware filename search order,
+  `.ucode` TLV parse), `csr` (registers + pure predicates), `context` (the gen2
+  **context info** — the device's own loader fetches firmware out of host memory once
+  it has that structure's address), `proto` (command out / notification in), `device`
+  (the sequences and the queue). `/wifi up` resets the radio, hands over firmware,
+  waits for the **alive** notification *and checks its status word* (firmware that comes
+  up unusable still announces itself), reads the MAC out of the strap/OTP registers, and
+  sends one **read-only** command (`NVM_GET_INFO`) — read-only on purpose, since a first
+  command that configured something would misconfigure a real radio if any part of the
+  untested transport is wrong. Traps pinned by tests: the MAC's first word is
+  **big-endian** and the second contributes only its low two bytes reversed
+  (`to_le_bytes`-and-concatenate gives a plausible wrong address); `prph` addresses are
+  **20 bits** (the hardware supplies the `0xA00000` base, so truncation is correct);
+  the transmit doorbell packs queue id and write index in one word; a command's first
+  **20 bytes** must come from a separate aligned staging buffer; and a receive buffer
+  must be **handed back** (the free-list write index is a *count*, not a slot) or the
+  driver works during bring-up and goes deaf under traffic. **It cannot scan or
+  associate**, and that is deliberate: a scan request, MAC context and station key are
+  large per-API-version structures, no emulator provides an Intel WiFi part, and code
+  written from memory would look complete, send well-formed garbage to a real radio and
+  report success — the failure would be somebody's laptop rather than a missing feature.
+  Those need a machine with the part in it. Also still absent: **any** WiFi on x86
+  beyond this, and Broadcom's SoftMAC parts.
   Shell surface: `/network` (info/dhcp/static/dns), `/ping`,
   `/wifi` (scan/connect via the password modal), a **TCP listener**
   (`net::listen`/`try_accept`, backed by a pool of Listen-state sockets in

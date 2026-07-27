@@ -73,6 +73,73 @@ pub const PRPH_ADDR_MASK: u32 = 0x000f_ffff;
 pub const PRPH_WRITE_ENABLE: u32 = 0x3 << 24;
 pub const PRPH_READ_ENABLE: u32 = 0x3 << 24;
 
+// --- the device's own MAC address -----------------------------------------
+
+/// The MAC address as strapped on the board, and as burned into the part's OTP.
+///
+/// Two sources because either can be blank: a board that straps the address leaves the OTP
+/// words zero, and vice versa. Preferring one unconditionally gets an all-zero address on
+/// half the machines.
+pub const CSR_MAC_ADDR0_STRAP: usize = 0x380;
+pub const CSR_MAC_ADDR1_STRAP: usize = 0x384;
+pub const CSR_MAC_ADDR0_OTP: usize = 0x388;
+pub const CSR_MAC_ADDR1_OTP: usize = 0x38c;
+
+/// Assemble a MAC address from the two register words.
+///
+/// The byte order is the part that cannot be guessed: the first word holds the leading four
+/// bytes **big-endian** while the register itself reads little-endian, and the second word
+/// contributes only its low two bytes, also reversed. A straightforward
+/// `to_le_bytes`-and-concatenate produces a plausible-looking address that is wrong in a way
+/// nothing local detects — the traffic simply never comes back.
+///
+/// `None` when the words describe no address: all-zero (unwritten), all-ones (a floating
+/// read), or a multicast address, which a station's own address never is.
+pub fn mac_from_words(w0: u32, w1: u32) -> Option<[u8; 6]> {
+    let mac = [
+        (w0 >> 24) as u8,
+        (w0 >> 16) as u8,
+        (w0 >> 8) as u8,
+        w0 as u8,
+        (w1 >> 8) as u8,
+        w1 as u8,
+    ];
+    if mac.iter().all(|&b| b == 0) || mac.iter().all(|&b| b == 0xff) {
+        return None;
+    }
+    if mac[0] & 1 != 0 {
+        return None; // a multicast address is not an interface's own
+    }
+    Some(mac)
+}
+
+// --- transmit and receive doorbells ---------------------------------------
+
+/// The transmit-queue doorbell. One register serves every queue: the queue id and the new
+/// write index are packed into the same word.
+pub const HBUS_TARG_WRPTR: usize = 0x460;
+
+/// Peripheral address of a receive queue's free-buffer write index, per queue.
+///
+/// A `prph` address, not a CSR — so it goes through [`prph_write_addr`], and using it as a
+/// direct BAR0 offset lands in an unrelated register a long way away.
+pub const RFH_Q_FRBDCB_WIDX_TRANS: u32 = 0x00A0_8080;
+
+/// Pack a queue id and write index for [`HBUS_TARG_WRPTR`].
+///
+/// The index is what tells the device how far the host has filled the ring, and the queue
+/// id selects which ring — in the same word, so an unmasked index bleeding into the id
+/// field rings a *different* queue's doorbell. That is not a lost command: it is a command
+/// left unqueued while some other queue is told to run.
+pub fn txq_doorbell(queue: u8, write_index: u16) -> u32 {
+    ((queue as u32) << 16) | (write_index as u32 & 0xffff)
+}
+
+/// Peripheral address of the free-buffer write index for `queue`.
+pub fn frbdcb_widx(queue: u8) -> u32 {
+    RFH_Q_FRBDCB_WIDX_TRANS + (queue as u32) * 4
+}
+
 // --- CSR_GP_CNTRL bits ----------------------------------------------------
 
 /// Ask for access to the MAC's clock domain.
@@ -213,6 +280,41 @@ mod tests {
         assert_eq!(prph_read_addr(0x00a0_30b4) & PRPH_ADDR_MASK, 0x0003_0b4);
         // And nothing above the field ever reaches the control bits.
         assert_eq!(prph_write_addr(0xffff_ffff), PRPH_ADDR_MASK | PRPH_WRITE_ENABLE);
+    }
+
+    #[test_case]
+    fn a_mac_address_is_assembled_in_the_order_the_registers_hold_it() {
+        // The first word's four bytes are big-endian and the second contributes only its low
+        // two, reversed. A `to_le_bytes`-and-concatenate gives a plausible address that is
+        // wrong in a way nothing local detects — traffic just never comes back — so the byte
+        // order is pinned here rather than discovered on a laptop.
+        assert_eq!(
+            mac_from_words(0x0011_2233, 0x0000_4455),
+            Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
+        );
+        // The high half of the second word is not part of the address.
+        assert_eq!(
+            mac_from_words(0x0011_2233, 0xdead_4455),
+            Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
+        );
+    }
+
+    #[test_case]
+    fn an_absent_or_impossible_mac_address_is_refused() {
+        // Both sources exist because either can be blank, so "unwritten" has to be
+        // distinguishable from an address — otherwise the interface comes up as 00:00:00:…
+        // and every frame it sends is dropped by the access point.
+        assert_eq!(mac_from_words(0, 0), None, "an unwritten address was accepted");
+        assert_eq!(
+            mac_from_words(u32::MAX, u32::MAX),
+            None,
+            "a floating read was accepted as an address"
+        );
+        // Bit 0 of the first byte is the multicast bit; an interface's own address is never
+        // multicast, so this is a misread rather than a valid value.
+        assert_eq!(mac_from_words(0x0111_2233, 0x0000_4455), None);
+        // A locally-administered but unicast address is legitimate.
+        assert!(mac_from_words(0x0211_2233, 0x0000_4455).is_some());
     }
 
     #[test_case]
