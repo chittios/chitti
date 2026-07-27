@@ -185,6 +185,49 @@ pub const TLV_API_CHANGES_SET: u32 = 29;
 pub const TLV_ENABLED_CAPABILITIES: u32 = 30;
 /// A version string record.
 pub const TLV_FW_VERSION: u32 = 36;
+/// The command-version table: which version of each command *this* firmware speaks.
+pub const TLV_CMD_VERSIONS: u32 = 48;
+
+/// One entry of the command-version table: four bytes, `cmd`, `group`, `cmd_ver`,
+/// `notif_ver`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CmdVersion {
+    pub cmd: u8,
+    pub group: u8,
+    /// Version of the command's *request* structure.
+    pub cmd_ver: u8,
+    /// Version of its notification/response structure.
+    pub notif_ver: u8,
+}
+
+/// Bytes per entry. The record's length divided by this is the entry count — a length that
+/// is not a multiple of four is a record this parser does not understand, not one to read
+/// as far as it goes.
+pub const CMD_VERSION_ENTRY_LEN: usize = 4;
+
+/// Parse the command-version table.
+///
+/// This is the table that makes it *safe* to add configuration commands later. Their
+/// request structures differ between firmware API versions — the same command id takes a
+/// different layout in different releases — and the firmware image says which one it
+/// expects. So a driver can either check, or send a plausible structure the firmware reads
+/// as something else. There is no third option and no error path from the device.
+pub fn parse_cmd_versions(payload: &[u8]) -> Option<Vec<CmdVersion>> {
+    if payload.is_empty() || payload.len() % CMD_VERSION_ENTRY_LEN != 0 {
+        return None;
+    }
+    Some(
+        payload
+            .chunks_exact(CMD_VERSION_ENTRY_LEN)
+            .map(|c| CmdVersion {
+                cmd: c[0],
+                group: c[1],
+                cmd_ver: c[2],
+                notif_ver: c[3],
+            })
+            .collect(),
+    )
+}
 
 /// One record in the container: its type and the byte range of its payload.
 ///
@@ -221,6 +264,26 @@ impl FirmwareImage {
     /// that out here is much better than after the device has been reset.
     pub fn has_runtime_section(&self) -> bool {
         self.sections.iter().any(|s| s.kind == TLV_SEC_RT)
+    }
+
+    /// The command-version table, if the image carries one, parsed from `blob`.
+    ///
+    /// Takes the bytes the image was parsed from because [`Section`] holds ranges rather
+    /// than copies — the image is megabytes and the allocator punishes churn.
+    pub fn cmd_versions(&self, blob: &[u8]) -> Option<Vec<CmdVersion>> {
+        let r = self.section(TLV_CMD_VERSIONS)?;
+        parse_cmd_versions(blob.get(r)?)
+    }
+
+    /// Which version of `(group, cmd)` this firmware speaks, if it says.
+    ///
+    /// `None` means the table is absent or silent about this command — which is not the same
+    /// as version 0, and callers must treat it as "unknown" rather than assume the layout
+    /// they happen to implement.
+    pub fn cmd_version(&self, blob: &[u8], group: u8, cmd: u8) -> Option<CmdVersion> {
+        self.cmd_versions(blob)?
+            .into_iter()
+            .find(|v| v.group == group && v.cmd == cmd)
     }
 }
 
@@ -313,6 +376,42 @@ mod tests {
             }
         }
         d
+    }
+
+    #[test_case]
+    fn the_firmware_says_which_version_of_each_command_it_speaks() {
+        // This table is what makes adding a configuration command safe rather than a guess:
+        // the same command id takes a different request structure in different firmware
+        // releases, and the image itself says which. Four bytes per entry — `cmd`, `group`,
+        // `cmd_ver`, `notif_ver` — from Linux's `iwl_fw_cmd_version`.
+        let table: &[u8] = &[
+            0x02, 0x0c, 0x04, 0x00, // NVM_GET_INFO in the regulatory group, request v4
+            0x0d, 0x01, 0x0e, 0x02, // SCAN_REQ_UMAC in the long group, request v14
+        ];
+        let d = image("v", &[(TLV_SEC_RT, &[1, 2, 3, 4]), (TLV_CMD_VERSIONS, table)]);
+        let img = parse_image(&d).unwrap();
+        let v = img.cmd_versions(&d).expect("the table must parse");
+        assert_eq!(v.len(), 2);
+        assert_eq!(
+            img.cmd_version(&d, 0x0c, 0x02),
+            Some(CmdVersion { cmd: 0x02, group: 0x0c, cmd_ver: 4, notif_ver: 0 })
+        );
+        assert_eq!(img.cmd_version(&d, 0x01, 0x0d).unwrap().cmd_ver, 14);
+
+        // Silence about a command is not version 0 — a caller must be able to tell "this
+        // firmware wants v0" from "it did not say", or it will send the layout it happens to
+        // implement and be read as something else.
+        assert_eq!(img.cmd_version(&d, 0x01, 0x02), None, "cmd/group were matched crosswise");
+        let bare = image("v", &[(TLV_SEC_RT, &[1])]);
+        let bare_img = parse_image(&bare).unwrap();
+        assert!(bare_img.cmd_versions(&bare).is_none());
+        assert!(bare_img.cmd_version(&bare, 0x0c, 0x02).is_none());
+
+        // A length that is not a whole number of entries is a record this parser does not
+        // understand, not one to read as far as it goes.
+        assert!(parse_cmd_versions(&[0x02, 0x0c, 0x04]).is_none());
+        assert!(parse_cmd_versions(&[]).is_none());
+        assert_eq!(parse_cmd_versions(table).unwrap().len(), 2);
     }
 
     #[test_case]

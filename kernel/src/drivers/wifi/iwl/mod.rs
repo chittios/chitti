@@ -35,13 +35,21 @@
 //! ## What still does not exist, and why not
 //!
 //! **The configuration commands, so it cannot scan or associate.** Not for want of
-//! plumbing — the transport above would carry them. The obstacle is that a scan request,
-//! a MAC context and a station key are large versioned structures whose field layouts vary
-//! per firmware API, and there is no Intel WiFi device in any emulator to check a guess
-//! against. Writing them from memory would produce code that looks complete, sends
-//! well-formed garbage to a real radio, and reports success — which is worse than not
-//! having it, because the failure would then be somebody's laptop rather than a missing
-//! feature. They need a machine with the part in it.
+//! plumbing — the transport above would carry them. A scan request, a MAC context and a
+//! station key are large structures whose layouts vary **per firmware API version**, and no
+//! emulator provides an Intel WiFi part to check one against. So the groundwork for adding
+//! them safely is here instead: [`fw::parse_cmd_versions`] reads the image's own
+//! command-version table (`IWL_UCODE_TLV_CMD_VERSIONS`), which is how the firmware states
+//! which layout it expects. A command added later must consult it and **refuse** an
+//! unimplemented version rather than send a plausible structure the firmware reads as
+//! something else — there is no error path from the device for that.
+//!
+//! One correction worth recording, because it is the shape of the mistake this whole posture
+//! exists to avoid: the NVM response's general section was first written as four `u32`s. It
+//! is `u32, u16, u8, u8`. Read as words, `n_hw_addrs` lands on the transmit chain mask —
+//! a small, plausible number that passes every sanity check — so the bug reports a
+//! confident wrong answer. It was caught by reading Linux's `fw/api/nvm-reg.h` rather than
+//! trusting recall, and every layout here now comes from those headers.
 //!
 //! The WPA2 and 802.11 layers those commands would feed **do** exist and are tested:
 //! [`super::wpa`] and [`super::ieee80211`].
@@ -240,12 +248,28 @@ pub fn bring_up() -> Result<String, String> {
     // purpose: this transport has never run against a real device, and a first command that
     // configured something would misconfigure a radio if any part of it is wrong.
     match dev.nvm_info() {
-        Ok(n) => report.push_str(&alloc::format!(
-            "; NVM v{:#x} board {:#x}, {} hw address(es) -- the command round-trip works",
-            n.nvm_version, n.board_type, n.n_hw_addrs
-        )),
+        Ok(n) => {
+            report.push_str(&alloc::format!(
+                "; NVM v{:#x} board {:#x}, {} hw address(es)",
+                n.nvm_version, n.board_type, n.n_hw_addrs
+            ));
+            if let Some((tx, rx)) = n.chains {
+                report.push_str(&alloc::format!(" chains tx {tx:#x} rx {rx:#x}"));
+            }
+            report.push_str(" -- the command round-trip works");
+        }
         Err(e) => report.push_str(&alloc::format!("; the first command got no usable reply ({e})")),
     }
-    report.push_str(". Scan and associate need the firmware's configuration commands, which are not implemented.");
+    // How many commands this firmware declares versions for. Not cosmetic: it is the table
+    // any future configuration command has to consult, and its presence is what would make
+    // adding one safe rather than a guess.
+    match image.cmd_versions(&bytes) {
+        Some(v) => report.push_str(&alloc::format!(
+            ". Firmware declares versions for {} commands",
+            v.len()
+        )),
+        None => report.push_str(". Firmware declares no command-version table"),
+    }
+    report.push_str("; scan and associate need its configuration commands, which are not implemented.");
     Ok(report)
 }

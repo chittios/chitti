@@ -358,46 +358,62 @@ pub fn parse_rx(buf: &[u8]) -> Option<RxPacket<'_>> {
     })
 }
 
-/// The part of the NVM info response whose layout is stable.
+/// What the NVM info response says about the device.
 ///
-/// Only the general section is decoded, and deliberately so: the response continues with SKU,
-/// PHY and regulatory sections whose sizes differ per firmware version, and there is no
-/// device here to check a guess against. What these four fields buy is worth having on its
-/// own — a plausible NVM version and hardware-address count is evidence the command
-/// round-trip *worked*, as opposed to firmware answering something else.
+/// Field widths are **not** uniform, and that is the whole reason this struct exists rather
+/// than a slice of `u32`s: the general section is `u32, u16, u8, u8`. Read as four words —
+/// which is what a plausible-looking guess produces — `nvm_version` swallows the board type
+/// and address count, `board_type` reads the SKU flags and `n_hw_addrs` reads the transmit
+/// chain mask, which is a small number and passes any sanity check. Taken from Linux's
+/// `iwl_nvm_get_info_rsp` in `fw/api/nvm-reg.h`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NvmInfo {
     pub flags: u32,
-    pub nvm_version: u32,
-    pub board_type: u32,
-    /// How many MAC addresses the device is provisioned with. Zero would mean the device
-    /// cannot address a frame, so it is a useful sanity check on the whole exchange.
-    pub n_hw_addrs: u32,
+    pub nvm_version: u16,
+    pub board_type: u8,
+    /// How many MAC addresses the device is provisioned with. Zero would mean it cannot
+    /// address a frame, so it is a useful check on the whole exchange.
+    pub n_hw_addrs: u8,
+    /// Transmit and receive chain masks from the PHY section — the radio's antenna
+    /// configuration, and `None` on a response too short to carry it (older API versions
+    /// return less, and reporting the absence beats inventing a chain count).
+    pub chains: Option<(u32, u32)>,
 }
 
+/// Length of the response's general section: `flags`, `nvm_version`, `board_type`,
+/// `n_hw_addrs`.
+pub const NVM_GENERAL_LEN: usize = 8;
+/// Offset of the PHY section: past the general section and the 4-byte SKU section.
+pub const NVM_PHY_OFFSET: usize = NVM_GENERAL_LEN + 4;
+
 impl NvmInfo {
-    /// Parse the general section from the head of an NVM info response.
+    /// Parse an NVM info response.
     pub fn parse(payload: &[u8]) -> Option<NvmInfo> {
-        if payload.len() < 16 {
+        if payload.len() < NVM_GENERAL_LEN {
             return None;
         }
-        let w = |i: usize| {
+        let le32 = |at: usize| {
             u32::from_le_bytes([
-                payload[i * 4],
-                payload[i * 4 + 1],
-                payload[i * 4 + 2],
-                payload[i * 4 + 3],
+                payload[at],
+                payload[at + 1],
+                payload[at + 2],
+                payload[at + 3],
             ])
         };
         let info = NvmInfo {
-            flags: w(0),
-            nvm_version: w(1),
-            board_type: w(2),
-            n_hw_addrs: w(3),
+            flags: le32(0),
+            nvm_version: u16::from_le_bytes([payload[4], payload[5]]),
+            board_type: payload[6],
+            n_hw_addrs: payload[7],
+            chains: if payload.len() >= NVM_PHY_OFFSET + 8 {
+                Some((le32(NVM_PHY_OFFSET), le32(NVM_PHY_OFFSET + 4)))
+            } else {
+                None
+            },
         };
         // An all-ones response is a floating read dressed up as data, and a device
-        // provisioned with an implausible number of addresses did not answer this command.
-        if info.nvm_version == u32::MAX || info.n_hw_addrs == 0 || info.n_hw_addrs > 16 {
+        // provisioned with no addresses did not answer this command.
+        if info.nvm_version == u16::MAX || info.n_hw_addrs == 0 || info.n_hw_addrs > 16 {
             return None;
         }
         Some(info)
@@ -700,28 +716,46 @@ mod tests {
     }
 
     #[test_case]
-    fn the_nvm_response_is_decoded_only_as_far_as_its_layout_is_stable() {
+    fn the_nvm_response_is_decoded_with_its_real_field_widths() {
+        // The general section is u32, u16, u8, u8 — not four words. This shipped as four
+        // words first, which is a mistake with no symptom: `nvm_version` swallows the board
+        // type and address count, `board_type` reads the SKU flags, and `n_hw_addrs` reads
+        // the transmit chain mask, which is a small number and passes any sanity check. The
+        // layout is Linux's `iwl_nvm_get_info_rsp`; this test is what pins it.
         let mut p = alloc::vec::Vec::new();
-        for v in [0x1u32, 0x0c11, 0x1234, 2] {
-            p.extend_from_slice(&v.to_le_bytes());
-        }
-        p.extend_from_slice(&[0xab; 32]); // the sections this code does not decode
+        p.extend_from_slice(&0x1u32.to_le_bytes()); // flags
+        p.extend_from_slice(&0x0c11u16.to_le_bytes()); // nvm_version
+        p.push(0x12); // board_type
+        p.push(2); // n_hw_addrs
+        p.extend_from_slice(&0xdead_beefu32.to_le_bytes()); // mac_sku_flags
+        p.extend_from_slice(&3u32.to_le_bytes()); // tx_chains
+        p.extend_from_slice(&2u32.to_le_bytes()); // rx_chains
+        p.extend_from_slice(&[0xab; 16]); // regulatory, not decoded
+
         let n = NvmInfo::parse(&p).expect("a well-formed response must parse");
+        assert_eq!(n.flags, 1);
         assert_eq!(n.nvm_version, 0x0c11);
-        assert_eq!(n.board_type, 0x1234);
+        assert_eq!(n.board_type, 0x12);
         assert_eq!(n.n_hw_addrs, 2);
+        assert_eq!(n.chains, Some((3, 2)), "the PHY section was read from the wrong offset");
+
+        // A response carrying only the general section is legal on older API versions, and
+        // the absence of a chain count is reported rather than invented.
+        let short = NvmInfo::parse(&p[..NVM_GENERAL_LEN]).expect("the general section suffices");
+        assert_eq!(short.n_hw_addrs, 2);
+        assert_eq!(short.chains, None);
 
         // A response that is really a floating read, or one describing a device that cannot
         // address a frame: both mean the command was not answered, not that it was.
         let ones = alloc::vec![0xffu8; 32];
         assert!(NvmInfo::parse(&ones).is_none(), "a floating read was accepted as NVM data");
         let mut zero_addrs = p.clone();
-        zero_addrs[12..16].copy_from_slice(&0u32.to_le_bytes());
+        zero_addrs[7] = 0;
         assert!(NvmInfo::parse(&zero_addrs).is_none());
         let mut absurd = p.clone();
-        absurd[12..16].copy_from_slice(&99u32.to_le_bytes());
+        absurd[7] = 99;
         assert!(NvmInfo::parse(&absurd).is_none());
-        for n in 0..16 {
+        for n in 0..NVM_GENERAL_LEN {
             assert!(NvmInfo::parse(&p[..n]).is_none(), "a truncated response parsed");
         }
     }
