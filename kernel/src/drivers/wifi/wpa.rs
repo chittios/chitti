@@ -14,6 +14,14 @@
 //! - **The PMK, the PTK and the MIC**, against values computed independently for the
 //!   fixtures below.
 //!
+//! Every constant and ordering here was then cross-checked against hostap's
+//! `wpa_common.{h,c}` — the `wpa_eapol_key` field offsets (MIC at body offset 77, a 95-byte
+//! fixed body), the `WPA_KEY_INFO_*` bit positions, the `"Pairwise key expansion"` label, the
+//! memcmp-ordered address and nonce pairs, the 48-byte PTK sliced KCK/KEK/TK, and the MIC as
+//! the first 16 bytes of HMAC-SHA-1. That matters because self-consistent tests cannot catch
+//! a shared misunderstanding: this code and its fixtures would agree perfectly while the
+//! access point disagreed.
+//!
 //! ## The shape of WPA2-PSK
 //!
 //! The passphrase becomes a **PMK** (PBKDF2 over the SSID). Then the access point and the
@@ -592,7 +600,10 @@ pub struct Handshake {
     /// The access point's MAC.
     aa: [u8; 6],
     snonce: [u8; 32],
-    /// Our association request's RSN element, echoed in message 2 for the AP to compare.
+    /// Our association request's RSN element — the **whole** element, including its id and
+    /// length bytes, because that is what message 2's key data carries. Passing the body
+    /// alone yields a malformed element the AP rejects mid-handshake, which looks like a key
+    /// failure.
     rsn_element: Vec<u8>,
     ptk: Option<Ptk>,
     /// Highest replay counter seen. A frame at or below it is a replay.
@@ -1004,7 +1015,10 @@ mod tests {
     fn the_four_way_handshake_completes_and_installs_the_group_key() {
         let anonce = nonce(0x11);
         let snonce = nonce(0x22);
-        let mut hs = Handshake::new(test_pmk(), ME, AP, snonce, super::super::ieee80211::client_rsn_element()[2..].to_vec());
+        // The whole element, id and length included — that is what the key data carries, and
+        // what the AP compares against the element we associated with.
+        let rsn = super::super::ieee80211::client_rsn_element();
+        let mut hs = Handshake::new(test_pmk(), ME, AP, snonce, rsn.clone());
 
         // Message 1 in, message 2 out — carrying our SNonce, a MIC, and our RSN element.
         let msg2 = hs
@@ -1015,7 +1029,10 @@ mod tests {
         assert_eq!(parsed.message(), Some(HandshakeMessage::Two));
         assert_eq!(parsed.nonce, snonce);
         assert_eq!(parsed.replay_counter, 1, "message 2 echoes the AP's counter");
-        assert!(!parsed.key_data.is_empty(), "message 2 must carry our RSN element");
+        assert_eq!(
+            parsed.key_data, rsn,
+            "message 2 must carry our RSN element verbatim, id and length included"
+        );
 
         // The AP derives the same PTK from its side and can check that MIC.
         let ptk = derive_ptk(&test_pmk(), &AP, &ME, &anonce, &snonce);

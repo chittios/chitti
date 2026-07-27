@@ -1072,8 +1072,16 @@ FDT claims a GICv3 but carries no readable `reg`.
   large per-API-version structures, no emulator provides an Intel WiFi part, and code
   written from memory would look complete, send well-formed garbage to a real radio and
   report success — the failure would be somebody's laptop rather than a missing feature.
-  Those need a machine with the part in it. Also still absent: **any** WiFi on x86
-  beyond this, and Broadcom's SoftMAC parts.
+  Those need a machine with the part in it. **Every layout here comes from Linux's
+  `fw/api/*.h`, fetched, never recalled** — the one written from memory (`NVM_GET_INFO`'s
+  general section as four `u32`s instead of `u32,u16,u8,u8`) put `n_hw_addrs` on the
+  transmit chain mask: a small, plausible number that passes any sanity check, i.e. a
+  confident wrong answer rather than an error. The groundwork for adding a command
+  safely is `fw::cmd_version` (`IWL_UCODE_TLV_CMD_VERSIONS`, TLV 48), the table where the
+  image states which request version it expects; a new command must consult it and
+  **refuse** an unimplemented version, since silence in that table is *not* version 0.
+  Also still absent: Realtek RTL8852 and Qualcomm/Killer WiFi, and Broadcom's SoftMAC
+  parts.
   Shell surface: `/network` (info/dhcp/static/dns), `/ping`,
   `/wifi` (scan/connect via the password modal), a **TCP listener**
   (`net::listen`/`try_accept`, backed by a pool of Listen-state sockets in
