@@ -542,12 +542,26 @@ claimed: the wrong firmware fails a signature check *inside* the device with no 
 host can read, which is worse than the Ethernet dispatcher's silent non-receiving NIC.
 The `.ucode` TLV parser refuses a pre-TLV image (leading word non-zero), a wrong magic and
 any record claiming more than the file holds, and pads record lengths to 4 bytes — one
-odd-length record misaligns every record after it. Firmware is **fetched, never
+odd-length record misaligns every record after it. On top of that, `csr` is the register
+map with its pure predicates (all-ones is a floating bus, not data; a `prph` address needs
+its access-size bits or the following write vanishes), `context` is the gen2 **context
+info** — from AX200 onward the host does not feed firmware section by section, it hands the
+device a structure and the device's own loader fetches the image, so nearly all the risk
+moves into one struct layout and every offset is pinned with `offset_of!` — and `device` is
+the ordering: prepare the card (`NIC_READY` going **clear** is the ready signal; waiting
+for it to set never completes), APM init, stop the DMA master *before* resetting so no
+transfer is in flight against memory about to be reused, then grab MAC access — proceeding
+without the grant is worse than failing, because reads return stale values and writes are
+dropped, so bring-up appears to work and the device never starts. Every wait is bounded and
+names itself. Bring-up is **command-driven** (`/wifi up`), never automatic at boot: the
+same posture AGX and the Broadcom radio take, because an untested driver should not touch a
+device just because the machine started. Firmware is **fetched, never
 committed** (`cargo xtask iwlwifi-assets` into the gitignored `assets/wifi/iwl/`), which
 is the same rule the Broadcom assets follow and the reason this needed no licensing
-decision. What does *not* exist: the register interface, NIC reset, command rings, the
-firmware handshake, and 802.11 + WPA2 — so `/wifi` reports the part and the image it would
-need, and says it cannot connect.
+decision. What still does *not* exist: the **receive path** — so firmware's own *alive*
+notification cannot be observed, which is why "handed over" is the strongest claim the load
+makes — the command round-trip, and then 802.11 + WPA2. So the radio does not associate and
+`/wifi connect` still cannot work; `/wifi up` reports how far bring-up got instead.
 
 **Interrupt-controller bases are discovered, and there are two sources, not one.**
 aarch64 finds the GICv3 from the device tree's `arm,gic-v3` `reg` when there is an

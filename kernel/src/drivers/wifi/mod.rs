@@ -44,6 +44,10 @@ pub fn init_apple() -> bool {
 
 /// Re-run SMC power + link wait + probe (e.g. `/wifi power`).
 pub fn power_on() -> Result<(), &'static str> {
+    // An Intel radio needs no board-level power sequencing — it is an ordinary PCIe
+    // function — so `up` on such a machine means bring-up, which `/wifi up` routes to
+    // `iwl::bring_up`. Handled by the caller so the message can carry detail.
+
     #[cfg(all(target_arch = "aarch64", not(test)))]
     {
         if !crate::arch::aarch64::is_apple() {

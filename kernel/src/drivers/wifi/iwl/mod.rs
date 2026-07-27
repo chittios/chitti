@@ -19,12 +19,22 @@
 //! What exists: family identification from the PCI id, the firmware filename search
 //! order, and a `.ucode` TLV parser that refuses malformed or pre-TLV images.
 //!
-//! What does not: everything that makes a radio work — the device's register interface,
-//! NIC reset and power-up, the command and receive rings, the firmware load handshake,
-//! then scan/associate and WPA2. That is a large job, and shipping a half-built version
-//! of it would put a `/wifi connect` in the shell that cannot connect. `/wifi` reports
-//! what was found and what firmware it would need instead.
+//! Since then, [`csr`] carries the register map and its pure predicates, [`context`] the
+//! gen2 **context info** layout (how an AX200-and-later device is told where firmware is,
+//! so its own loader fetches it), and [`device`] the sequences: map BAR0, prepare the
+//! card, APM init, software reset, grab MAC access, then build the context info and hand
+//! it over.
+//!
+//! What still does not exist: the receive path — so firmware's *alive* notification
+//! cannot be observed — the command round-trip, and then the 802.11 state machine and
+//! WPA2. So the radio does not associate and `/wifi connect` still cannot work. Shipping
+//! a half-built version of that would put a connect in the shell that fails silently;
+//! `/wifi` reports how far bring-up got instead.
 
+pub mod context;
+pub mod csr;
+#[cfg(target_arch = "x86_64")]
+pub mod device;
 pub mod fw;
 
 use alloc::string::String;
@@ -107,4 +117,85 @@ pub fn probe() -> Option<Found> {
 fn is_wifi_class(d: &crate::arch::x86_64::pci::PciDevice) -> bool {
     let class = crate::arch::x86_64::pci::class_of(d);
     class.0 == 0x02 && class.1 == 0x80
+}
+
+/// Where a fetched `.ucode` is looked for at runtime.
+///
+/// A path in the store rather than an `include_bytes!` because the filename carries a
+/// firmware API version that varies per release — the Broadcom driver can embed one fixed
+/// name, this cannot. `cargo xtask iwlwifi-assets` fetches into `assets/wifi/iwl/`; put
+/// the file here on the installed system.
+pub const FW_DIR: &str = "/wifi/iwl";
+
+/// Read the newest firmware image present for `family`.
+///
+/// Candidates are tried newest-API first, which is what Linux does and the reason the API
+/// number is enumerated rather than computed: it belongs to the file, not the chip.
+/// Returns the bytes and the name they came from.
+#[cfg(target_arch = "x86_64")]
+fn find_firmware(family: fw::Family) -> Option<(String, alloc::vec::Vec<u8>)> {
+    for name in fw::firmware_candidates(family) {
+        let path = alloc::format!("{FW_DIR}/{name}");
+        if let Some(bytes) = crate::synapse::fs::read(&path) {
+            return Some((name, bytes));
+        }
+    }
+    None
+}
+
+/// Bring the radio as far as this driver goes: reset it and hand it firmware.
+///
+/// Deliberately **command-driven, never automatic at boot**. The same posture the AGX
+/// coprocessor and the Broadcom radio take: an untested driver does not touch a device
+/// because the machine happened to start. `/wifi up` asks for it.
+///
+/// Ends after firmware is handed over, which is honestly short of working: without a
+/// receive path the device's *alive* notification cannot be seen, so "handed over" is the
+/// strongest claim available and the log says so.
+#[cfg(target_arch = "x86_64")]
+pub fn bring_up() -> Result<String, String> {
+    use crate::arch::x86_64::pci;
+
+    let found = probe().ok_or_else(|| String::from("no recognised Intel WiFi device"))?;
+    // Re-find the function so the device handle is fresh rather than cached from a probe
+    // that may have happened long ago.
+    let mut target = None;
+    pci::for_each(&mut |d| {
+        if d.vendor == fw::VENDOR_INTEL && d.device == found.device_id {
+            target = Some(d);
+            return false;
+        }
+        true
+    });
+    let d = target.ok_or_else(|| String::from("the device disappeared between probe and open"))?;
+
+    let (name, bytes) = find_firmware(found.family).ok_or_else(|| {
+        alloc::format!(
+            "no firmware in {FW_DIR}/ -- wanted {} (fetch with `cargo xtask iwlwifi-assets`)",
+            fw::firmware_candidates(found.family)
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or("?")
+        )
+    })?;
+    let image = fw::parse_image(&bytes)
+        .ok_or_else(|| alloc::format!("{name} is not a valid TLV firmware image"))?;
+    if !image.has_runtime_section() {
+        return Err(alloc::format!("{name} carries no runtime section"));
+    }
+
+    let mut dev = device::IwlDevice::open(d, found.family)
+        .ok_or_else(|| String::from("bring-up failed -- see the iwlwifi: ktrace lines"))?;
+    let phys = dev.load_firmware(&image, &bytes).map_err(String::from)?;
+    Ok(alloc::format!(
+        "{} reset, {} ({}) handed over at {phys:#x}; no receive path yet, so firmware cannot be confirmed alive",
+        found.family.label(),
+        name,
+        image.version
+    ))
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn bring_up() -> Result<String, String> {
+    Err(String::from("Intel WiFi is a PCIe part found in x86 machines"))
 }

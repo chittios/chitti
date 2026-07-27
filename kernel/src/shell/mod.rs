@@ -845,6 +845,14 @@ fn wifi_cmd(arg: &str) {
             }
             let _ = radio;
         }
+        // Intel first: on an x86 laptop that is the radio present, and it needs bring-up
+        // rather than the board-power sequencing an Apple dongle wants.
+        "power" | "up" if crate::drivers::wifi::iwl::probe().is_some() => {
+            match crate::drivers::wifi::iwl::bring_up() {
+                Ok(msg) => serial_println!("wifi> {msg}"),
+                Err(e) => serial_println!("wifi> iwlwifi bring-up failed: {e}"),
+            }
+        }
         "power" | "up" => match crate::drivers::wifi::power_on() {
             Ok(()) => {
                 serial_println!("wifi> power OK — link up, radio enumerated");
