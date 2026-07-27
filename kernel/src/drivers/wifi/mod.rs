@@ -15,6 +15,7 @@
 
 pub mod brcm;
 pub mod iwl;
+pub mod wpa;
 
 /// Pure brcmfmac helpers (always available for unit tests).
 pub use brcm::proto;

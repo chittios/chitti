@@ -66,6 +66,7 @@ pub mod ca_roots;
 pub mod hashes;
 pub mod http;
 pub mod rsa;
+pub mod sha1;
 pub mod tls;
 pub mod ws;
 pub mod x509;
