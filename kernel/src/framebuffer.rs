@@ -176,6 +176,22 @@ fn aa_coverage<F: Fn(i64, i64) -> bool>(dx: i64, dy: i64, inside: F) -> u32 {
     cov * 255 / (AA_SS * AA_SS) as u32
 }
 
+/// Padding around the status bar's text, on both sides of its short axis.
+const STATUS_PAD: u64 = 8;
+
+/// How thick the status bar is on a given edge, in pixels.
+///
+/// Horizontal (top/bottom): one text row plus padding — the historical `ch + 8`.
+/// Vertical (left/right): a fixed [`crate::panes_layout::STATUS_V_COLS`]-column
+/// span, because text cannot run across a column and its content stacks instead.
+fn status_thickness(pos: crate::panes_layout::StatusPos, cw: u64, ch: u64) -> u64 {
+    if pos.vertical() {
+        crate::panes_layout::STATUS_V_COLS * cw + STATUS_PAD
+    } else {
+        ch + STATUS_PAD
+    }
+}
+
 const OUTER: u64 = 8; // margin around the whole content region
 const GAP: u64 = 10; // between the two panes
 const BORDER: u64 = 2; // pane border thickness
@@ -723,6 +739,16 @@ pub struct Screen {
     origin_y: u64,
     /// The requested logical desktop, carried across rebuilds. `None` = native.
     logical_pref: Option<(u64, u64)>,
+    /// The status bar's rect and the content rect left over, from
+    /// `panes_layout::status_split`. Every pane-layout calculation works inside
+    /// `content_*` rather than `0..width`/`0..height`, so the bar can sit on any
+    /// edge without a second set of layout paths. At the default `Bottom` the
+    /// content origin is `(0, 0)` and this is the historical geometry exactly.
+    status_rect: crate::panes_layout::Rect,
+    content_x: u64,
+    content_y: u64,
+    content_w: u64,
+    content_h: u64,
     /// Whether keyboard focus is on an action column (vs the shell/chat).
     focus_action: bool,
     /// Action column currently highlighted as a tab drag's drop target.
@@ -1100,6 +1126,9 @@ pub struct LayoutCfg {
     pub scale: u64,
     /// Put the chat pane on the right instead of the left.
     pub swap: bool,
+    /// Which desktop edge the OS status bar occupies. Everything else lays out
+    /// inside the leftover content rect, so this shifts the whole UI.
+    pub status_pos: crate::panes_layout::StatusPos,
     pub chat_title: String,
     pub logs_title: String,
     /// Colour palette (from `ui.json` `theme`; default = brand dark).
@@ -1125,6 +1154,7 @@ impl Default for LayoutCfg {
             grid: crate::panes_layout::GridSpec::even(1, 1),
             scale: 0,
             swap: false,
+            status_pos: crate::panes_layout::StatusPos::default(),
             chat_title: String::from("Shell Agent"),
             logs_title: String::from("ktrace"),
             theme: Theme::default(),
@@ -1203,41 +1233,57 @@ impl Screen {
         let scale = if cfg.scale > 0 { cfg.scale } else { pick_scale(height) };
         let cw = CELL_W * scale;
         let ch = CELL_H * scale;
-        let status_h = ch + 8;
-        let content_h = height.saturating_sub(status_h);
-        let box_y = OUTER;
+        // Carve the status bar off its edge; everything below lays out in what is
+        // left. A vertical bar is a fixed column of cells wide (see
+        // `STATUS_V_COLS`), a horizontal one a single text row plus padding.
+        let (status_rect, (content_x, content_y, content_w, content_h)) =
+            crate::panes_layout::status_split(
+                width,
+                height,
+                cfg.status_pos,
+                status_thickness(cfg.status_pos, cw, ch),
+            );
+        let box_y = content_y + OUTER;
         let box_h = content_h.saturating_sub(2 * OUTER);
         let pct = cfg.chat_pct.clamp(10, 90);
         let grid = cfg.grid.sanitized();
         let n_act = grid.len();
-        let full_w = width.saturating_sub(2 * OUTER);
+        let full_w = content_w.saturating_sub(2 * OUTER);
         let th = cfg.theme;
         let focused = focused.min(n_act - 1);
+        // `split_band` works in a 0-based span, so its x results are shifted into
+        // the content rect. With a left-edge status bar `content_x` is the bar's
+        // width; at every other position it is 0 and this is the identity.
+        let band_split = || {
+            let (cx, cwid, bx, bw) =
+                crate::panes_layout::split_band(content_w, OUTER, GAP, pct, true, cfg.swap);
+            (content_x + cx, cwid, content_x + bx, bw)
+        };
         // Parked panes keep w==0 so `Pane::adopt` clones content without a
         // catastrophic 1-column reflow of the full scrollback.
-        let parked = (width, box_y, 0u64, box_h);
+        let parked = (content_x + content_w, box_y, 0u64, box_h);
         let mut action_boxes = if cfg.fullscreen == 2 && split {
             // The **focused** action pane fills the screen; chat + every other
             // pane park. Maximising cell 0 regardless of focus would show a
             // different pane than the one the user was working in.
             let mut boxes = alloc::vec![parked; n_act];
-            boxes[focused] = (OUTER, box_y, full_w, box_h);
+            boxes[focused] = (content_x + OUTER, box_y, full_w, box_h);
             boxes
         } else if cfg.fullscreen == 1 || !split {
             // Chat fills; the whole action grid parks.
             alloc::vec![parked; n_act]
         } else {
-            let (_, _, bx, bw) = crate::panes_layout::split_band(width, OUTER, GAP, pct, true, cfg.swap);
+            let (_, _, bx, bw) = band_split();
             crate::panes_layout::layout_grid(bx, box_y, bw, box_h, GAP, &grid)
         };
         // Keep the vector's length pinned to the cell count regardless.
         action_boxes.resize(n_act, parked);
         let (chat_x, chat_bw) = if cfg.fullscreen == 2 && split {
-            (width, 0)
+            (content_x + content_w, 0)
         } else if cfg.fullscreen == 1 || !split {
-            (OUTER, full_w)
+            (content_x + OUTER, full_w)
         } else {
-            let (cx, cwid, ..) = crate::panes_layout::split_band(width, OUTER, GAP, pct, true, cfg.swap);
+            let (cx, cwid, ..) = band_split();
             (cx, cwid)
         };
         let chat = Pane::new(chat_x, box_y, chat_bw, box_h, cw, ch, th.chat_fg, th.chat_bg, cfg.chat_title.clone(), true);
@@ -1263,6 +1309,11 @@ impl Screen {
             origin_x,
             origin_y,
             logical_pref,
+            status_rect,
+            content_x,
+            content_y,
+            content_w,
+            content_h,
             actions,
             focused_action: focused,
             status_left,
@@ -2373,8 +2424,66 @@ impl Screen {
     }
 
     fn draw_status(&self) {
-        let bar_h = self.ch() + 8;
-        let sy_top = self.height - bar_h;
+        if self.layout.status_pos.vertical() {
+            self.draw_status_vertical();
+        } else {
+            self.draw_status_horizontal();
+        }
+    }
+
+    /// The status bar as a **column** (left/right edge).
+    ///
+    /// Text cannot run across a 16-cell column, so the two templates are split
+    /// into their groups by `panes_layout::status_segments` and stacked as rows —
+    /// `status_left` from the top under the brand mark, `status_right` up from the
+    /// bottom. That mirrors the horizontal bar, where "right" means the far edge.
+    fn draw_status_vertical(&self) {
+        let (bx, by, bw, bh) = self.status_rect;
+        self.paint_surface(bx, by, bw, bh, self.theme.status_bg);
+        let (cw, ch) = (self.cw(), self.ch());
+        let row = ch + 4;
+        // Brand mark centred across the column, one row tall.
+        let lr = (((row / 2).saturating_sub(2)) * 6 / 7).max(5);
+        self.draw_logo(bx + bw / 2, by + STATUS_PAD / 2 + row / 2, lr, self.theme.accent, self.theme.chat_fg);
+        let tx = bx + STATUS_PAD / 2;
+        let cols = (bw.saturating_sub(STATUS_PAD) / cw).max(4) as usize;
+        // Rows available below the brand mark. The two stacks grow towards each
+        // other and stop when they would meet, so neither can overdraw the other
+        // however long the templates get.
+        let first = by + STATUS_PAD / 2 + row;
+        let last = by + bh;
+        // Each segment wraps to as many rows as it needs, so a long field (the
+        // clock) keeps its tail instead of being cut.
+        let wrap = |s: &str| -> alloc::vec::Vec<alloc::string::String> {
+            crate::panes_layout::status_segments(s)
+                .into_iter()
+                .flat_map(|seg| crate::panes_layout::wrap_segment(seg, cols))
+                .map(|r| crate::textsel::ellipsize(r, cols))
+                .collect()
+        };
+        let mut top = first;
+        for line in wrap(&self.status_left) {
+            if top + row > last {
+                break;
+            }
+            self.draw_str(tx, top, &line, self.theme.accent, self.theme.status_bg);
+            top += row;
+        }
+        let right = wrap(&self.status_right);
+        let mut bot = last;
+        for line in right.iter().rev() {
+            if bot < top + row {
+                break;
+            }
+            bot -= row;
+            self.draw_str(tx, bot, line, self.theme.status_fg, self.theme.status_bg);
+        }
+    }
+
+    /// The status bar as a **row** (top/bottom edge) — brand left, system info
+    /// right, each ellipsized into its half.
+    fn draw_status_horizontal(&self) {
+        let (_, sy_top, _, bar_h) = self.status_rect;
         self.paint_surface(0, sy_top, self.width, bar_h, self.theme.status_bg);
         let ty = sy_top + 4;
         let cw = self.cw();
@@ -2977,11 +3086,15 @@ impl Screen {
     fn paint_gutters(&self) {
         let bg = self.theme.screen_bg;
         let (by, bh) = (self.chat.y, self.chat.h);
-        // Top strip (above the pane band) + bottom strip (down to the status bar).
-        self.paint_wallpaper(0, 0, self.width, by, bg);
+        // Gutters are confined to the content rect: the status bar paints its own
+        // area, and painting over it here would blank the bar on every redraw
+        // wherever it does not happen to be the bottom edge.
+        let (cx0, cy0) = (self.content_x, self.content_y);
+        let (cx1, cy1) = (cx0 + self.content_w, cy0 + self.content_h);
+        // Strip above the pane band, and the strip below it down to the content edge.
+        self.paint_wallpaper(cx0, cy0, self.content_w, by.saturating_sub(cy0), bg);
         let below = by + bh;
-        let status_top = self.height.saturating_sub(self.ch() + 8);
-        self.paint_wallpaper(0, below, self.width, status_top.saturating_sub(below), bg);
+        self.paint_wallpaper(cx0, below, self.content_w, cy1.saturating_sub(below), bg);
         // Horizontal gutters: left of chat, gaps between all boxes, right margin.
         let mut boxes: alloc::vec::Vec<(u64, u64)> = alloc::vec![];
         if self.chat.w > 0 {
@@ -2993,15 +3106,15 @@ impl Screen {
             }
         }
         boxes.sort_by_key(|b| b.0);
-        let mut x = 0u64;
+        let mut x = cx0;
         for &(l, r) in &boxes {
             if l > x {
                 self.paint_wallpaper(x, by, l - x, bh, bg);
             }
             x = r.max(x);
         }
-        if x < self.width {
-            self.paint_wallpaper(x, by, self.width - x, bh, bg);
+        if x < cx1 {
+            self.paint_wallpaper(x, by, cx1 - x, bh, bg);
         }
     }
 
@@ -6002,18 +6115,14 @@ impl Screen {
     /// it is presently on screen (the grid is sized before the band is opened).
     fn band_capacity(&self) -> (u64, u64) {
         let (_, _, _, bw) = crate::panes_layout::split_band(
-            self.width,
+            self.content_w,
             OUTER,
             GAP,
             self.layout.chat_pct.clamp(10, 90),
             true,
             self.layout.swap,
         );
-        let status_h = self.ch() + 8;
-        let bh = self
-            .height
-            .saturating_sub(status_h)
-            .saturating_sub(2 * OUTER);
+        let bh = self.content_h.saturating_sub(2 * OUTER);
         (bw, bh)
     }
 
@@ -6048,6 +6157,28 @@ pub fn set_font_scale(scale: u64) -> Option<u64> {
 /// The font scale currently rendering (never 0 — the resolved value).
 pub fn effective_font_scale() -> Option<u64> {
     SCREEN.with(|slot| slot.as_ref().map(|sc| sc.scale))
+}
+
+/// Move the OS status bar to a desktop edge and relayout.
+///
+/// Applies instantly: every pane is laid out inside the leftover content rect, so
+/// this is a full relayout (scrollback is preserved by `Pane::adopt`, as with a
+/// resolution or font-scale change). Returns the position now in effect.
+pub fn set_status_pos(pos: crate::panes_layout::StatusPos) -> Option<crate::panes_layout::StatusPos> {
+    let cfg = SCREEN.with(|slot| {
+        slot.as_mut().map(|sc| {
+            let mut c = sc.layout.clone();
+            c.status_pos = pos;
+            c
+        })
+    })?;
+    relayout(&cfg);
+    status_pos()
+}
+
+/// The edge the status bar is currently on.
+pub fn status_pos() -> Option<crate::panes_layout::StatusPos> {
+    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.layout.status_pos))
 }
 
 /// The **pinned** font scale (`0` = automatic), i.e. the setting rather than the
@@ -6314,12 +6445,15 @@ pub fn drag_divider(which: Divider, x: u64, y: u64) {
         c.fullscreen = 0;
         match which {
             Divider::Band => {
+                // Inverse of `split_band`, so it must be handed the same span and a
+                // content-relative x — otherwise a left-edge status bar offsets
+                // every drag by the bar's width.
                 c.chat_pct = crate::panes_layout::band_divider_pct(
-                    sc.width,
+                    sc.content_w,
                     OUTER,
                     GAP,
                     c.swap,
-                    x,
+                    x.saturating_sub(sc.content_x),
                 );
             }
             Divider::Col(i) => {

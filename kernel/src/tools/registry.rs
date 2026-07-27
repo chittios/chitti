@@ -192,6 +192,11 @@ fn shell_commands() -> Vec<ToolDef> {
             false,
         ),
         ToolDef::shell(
+            "statusbar",
+            "Move the OS status bar to a screen edge. args: empty=current position, or one of 'top' | 'bottom' | 'left' | 'right'. Applies instantly and persists; left/right make it a column that stacks its fields.",
+            false,
+        ),
+        ToolDef::shell(
             "channel",
             "Messaging channels (Telegram…). args: list|add telegram <name> <token>|start|stop|send|reply|pair|allow|status.",
             false,

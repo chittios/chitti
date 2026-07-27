@@ -72,6 +72,11 @@ pub struct UiConfig {
     pub logs_title: String,
     pub status_left: String,  // template
     pub status_right: String, // template
+    /// Which desktop edge the status bar occupies: `top` | `bottom` (default) |
+    /// `left` | `right`. Stored as the string that appears in `ui.json`; parsed by
+    /// `panes_layout::StatusPos::parse`, which rejects a typo rather than moving
+    /// the bar somewhere unasked-for.
+    pub status_pos: String,
     pub tz_offset: i32,       // seconds east of UTC
     pub splash: bool,         // show the boot splash (logo + wordmark)
     /// Colour palette as `(name, "#rrggbb")` pairs (kept as strings so the config
@@ -102,6 +107,7 @@ impl Default for UiConfig {
             logs_title: "ktrace".to_string(),
             status_left: "ChittiOS v${version}".to_string(),
             status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${datetime} ${tz}".to_string(),
+            status_pos: crate::panes_layout::StatusPos::default().as_str().to_string(),
             tz_offset: 0,
             splash: true,
             theme: THEME_DEFAULTS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
@@ -128,6 +134,7 @@ impl UiConfig {
             ("logs_title".to_string(), Json::Str(self.logs_title.clone())),
             ("status_left".to_string(), Json::Str(self.status_left.clone())),
             ("status_right".to_string(), Json::Str(self.status_right.clone())),
+            ("status_pos".to_string(), Json::Str(self.status_pos.clone())),
             ("tz_offset".to_string(), Json::Num(self.tz_offset as f64)),
             ("splash".to_string(), Json::Bool(self.splash)),
             ("theme_name".to_string(), Json::Str(self.theme_name.clone())),
@@ -185,6 +192,12 @@ impl UiConfig {
             logs_title: s("logs_title", &d.logs_title),
             status_left: s("status_left", &d.status_left),
             status_right,
+            // Normalise through the parser so an unrecognised value lands on the
+            // default rather than being carried around as a string nothing honours.
+            status_pos: crate::panes_layout::StatusPos::parse(&s("status_pos", &d.status_pos))
+                .unwrap_or_default()
+                .as_str()
+                .to_string(),
             tz_offset: j.get("tz_offset").and_then(|v| v.as_i64()).map(|n| n as i32).unwrap_or(d.tz_offset),
             splash: j.get("splash").and_then(|v| v.as_bool()).unwrap_or(d.splash),
             theme,
@@ -217,6 +230,7 @@ impl UiConfig {
             // would silently undo it on every theme/appearance apply.
             scale: crate::framebuffer::pinned_font_scale().unwrap_or(self.font_scale),
             swap: self.swap_panes,
+            status_pos: crate::panes_layout::StatusPos::parse(&self.status_pos).unwrap_or_default(),
             chat_title: self.chat_title.clone(),
             logs_title: self.logs_title.clone(),
             theme: crate::framebuffer::theme_from_pairs(&self.theme),

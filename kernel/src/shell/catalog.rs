@@ -144,6 +144,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "System & UI", title: "Suspend", name: "suspend", shortcut: "" },
     Entry { category: "System & UI", title: "UI Config", name: "ui", shortcut: "" },
     Entry { category: "System & UI", title: "Theme", name: "theme", shortcut: "" },
+    Entry { category: "System & UI", title: "Status Bar Position", name: "statusbar", shortcut: "" },
     Entry { category: "System & UI", title: "Panes & Grid", name: "pane", shortcut: "Ctrl+F" },
     Entry { category: "System & UI", title: "Display / Resolution", name: "display", shortcut: "" },
     Entry { category: "System & UI", title: "Shortcuts", name: "shortcuts", shortcut: "" },

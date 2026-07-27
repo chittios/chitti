@@ -43,3 +43,20 @@ undoes it — or point at `/ui` font_scale for bigger text at the same resolutio
 
 Never offer a size `list` did not report: a desktop larger than the panel has no
 pixels to show.
+
+## Status bar position
+
+The `statusbar` tool moves the OS status bar to any screen edge, and you may apply
+it directly — it is instant, reversible, and purely cosmetic.
+
+- `statusbar` with no args → which edge it is on now.
+- `statusbar` with `top` | `bottom` | `left` | `right` → move it there.
+
+`left` and `right` turn it into a **column**: it becomes a fixed-width sidebar and
+its fields stack as rows instead of running across. That costs screen *width*, which
+is usually the scarcer direction on a wide display, so say so when you put it there.
+`bottom` is the default.
+
+This is a different question from resolution — moving the bar does not change how
+big anything is. If someone wants more room for the panes, a horizontal bar
+(`top`/`bottom`) takes one text row; a vertical one takes about 16 columns.

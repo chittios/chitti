@@ -280,6 +280,22 @@ for scale 2 — 320 columns of 8px text. That was the real reason a 2K display
 looked broken; `display::auto_font_scale` fixes it and pins the thresholds with
 tests.)
 
+**Status bar position.** The bar can sit on any edge; it applies instantly and
+persists to `ui.json` (`status_pos`), so it is also editable by hand via `/open`, and
+the settings agent can move it with its `statusbar` tool.
+
+```sh
+/statusbar               # which edge it is on now
+/statusbar top           # or bottom (default) | left | right
+```
+
+`left`/`right` make it a **column**: a fixed 16-cell-wide sidebar whose fields stack
+as rows instead of running across, with the brand at the top and the system info at
+the far end. That costs screen *width*, usually the scarcer direction, so a
+horizontal bar (one text row) leaves more room for the panes. Everything else — the
+shell pane, the action grid, every divider drag — lays out inside whatever the bar
+leaves over, so no surface ever sits under it.
+
 **Running with virtio-gpu (real mode setting).** `CHITTI_GPU` picks the display
 device:
 

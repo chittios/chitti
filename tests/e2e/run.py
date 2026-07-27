@@ -1257,6 +1257,63 @@ def s_display(g):
         g.wait_for("display> font scale", 8, m)
 
 
+def s_statusbar(g):
+    """Status-bar position: reports the current edge, moves to each of the four,
+    rejects a typo without moving, persists to ui.json, and the shell keeps working
+    after each move (every move is a full relayout of every pane)."""
+    try:
+        m = g.mark()
+        g.send("/statusbar")
+        if not g.wait_for("statusbar> bottom", 10, m):
+            return False, "/statusbar did not report bottom as the default"
+
+        for pos in ("top", "left", "right", "bottom"):
+            g.wait_quiet(0.4, 10)
+            m = g.mark()
+            g.send(f"/statusbar {pos}")
+            if not g.wait_for(f"moved to the {pos} edge", 15, m):
+                return False, f"/statusbar {pos} did not apply"
+            # A relayout rebuilds every pane's cell grid; a bad reflow wedges here.
+            g.wait_quiet(0.4, 10)
+            m = g.mark()
+            g.send("/statusbar")
+            if not g.wait_for(f"statusbar> {pos}", 10, m):
+                return False, f"the {pos} position did not stick"
+
+        # A typo must be refused, not silently defaulted — otherwise a mistyped
+        # value moves the bar somewhere the user never asked for.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/statusbar centre")
+        if not g.wait_for("unknown position", 10, m):
+            return False, "an unknown position should be refused"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/statusbar")
+        if not g.wait_for("statusbar> bottom", 10, m):
+            return False, "a refused position must leave the bar where it was"
+
+        # It is a ui.json setting, so it has to be in the persisted config.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/statusbar left")
+        if not g.wait_for("moved to the left edge", 15, m):
+            return False, "/statusbar left did not apply"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/ui config")
+        if not g.wait_for('"status_pos"', 10, m):
+            return False, "status_pos is not written to ui.json"
+
+        return True, "default reported, all four edges applied + stuck, typo refused, persisted to ui.json"
+    finally:
+        # Hand the next scenario the default bar back.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/statusbar bottom")
+        g.wait_for("statusbar>", 10, m)
+
+
 def s_pane_grid(g):
     """Multi-pane action grid: /pane max picks a balanced shape, /pane grid sets
     one explicitly (and clamps over-budget requests), /pane focus moves the
@@ -1313,16 +1370,29 @@ def s_pane_grid(g):
         # reached the composer. Fixed in `open_view_slot`; this scenario is what
         # catches a regression of it, since the symptom is simply that the command
         # after an /open-style command does nothing.)
-        # NOTE — deliberately NOT asserted here: opening a *view* on a grid pane.
-        #
-        # Reproducible finding: inside this scenario the command issued immediately
-        # after `/todos open` never executes (seen with `/top` and then with
-        # `/close`), so any assertion after it times out. It is not the pane code —
-        # a verbose run shows the kernel executing and printing those commands, and
-        # the `tabs` scenario covers views-as-tabs on a single pane — but the cause
-        # is not yet found, so claiming coverage here would be false. Tracked
-        # separately; the grid geometry, clamping, focus and empty-pane survival
-        # below are what this scenario actually verifies.
+        # Opening a view on a grid pane, then another command right after it. This
+        # used to be unassertable: the command issued immediately after `/todos open`
+        # never ran. The cause was the composer's suggestion menu — a fully-typed
+        # subcommand keeps its own entry highlighted, and Enter "accepted" it instead
+        # of submitting, so one keystroke was swallowed and every later line was one
+        # out of step. Fixed by `suggest_would_complete`; asserted here so it stays
+        # fixed, because the symptom (a command silently not running) reads as a
+        # frozen shell rather than as a completion bug.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/todos open")
+        if not g.wait_for("todos>", 15, m):
+            return False, "/todos open did not open on a grid pane"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/top")
+        if not g.wait_for("top>", 15, m):
+            return False, "the command after /todos open did not execute"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/close")
+        if not g.wait_for("close", 15, m):
+            return False, "/close after a view-open did not execute"
 
         # Focus movement LAST: `/pane focus` puts keyboard focus on an action pane,
         # and anything typed after that is no longer independent of it — ordering it
@@ -1750,6 +1820,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("panes", s_panes),
     ("pane_grid", s_pane_grid),
     ("display", s_display),
+    ("statusbar", s_statusbar),
     ("clipboard", s_clipboard),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]

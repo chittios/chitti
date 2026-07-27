@@ -48,6 +48,141 @@ pub const MIN_TRACK_PX: u64 = 64;
 /// arithmetic and a saved layout restores byte-identically.
 pub const WEIGHT_TOTAL: u64 = 1000;
 
+/// A screen rectangle as `(x, y, w, h)`, matching what [`layout_grid`] yields.
+pub type Rect = (u64, u64, u64, u64);
+
+/// Which edge of the desktop the OS status bar occupies.
+///
+/// Everything else — the shell pane, the action grid, the gutters — lays out
+/// inside the [`status_split`] content rect, so moving the bar moves the whole UI
+/// rather than overlapping it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum StatusPos {
+    Top,
+    #[default]
+    Bottom,
+    Left,
+    Right,
+}
+
+impl StatusPos {
+    /// True for the edges that make the bar a **column**. This is the one
+    /// distinction the renderer needs: a column cannot run text across it, so its
+    /// content stacks as rows instead (see [`status_segments`]).
+    pub fn vertical(self) -> bool {
+        matches!(self, StatusPos::Left | StatusPos::Right)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StatusPos::Top => "top",
+            StatusPos::Bottom => "bottom",
+            StatusPos::Left => "left",
+            StatusPos::Right => "right",
+        }
+    }
+
+    /// Parse a config or command value.
+    ///
+    /// `None` for anything unrecognised, so a typo in `ui.json` leaves the bar
+    /// where it is instead of silently moving it somewhere the user didn't ask
+    /// for. Case- and whitespace-insensitive.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            s if s.eq_ignore_ascii_case("top") => Some(StatusPos::Top),
+            s if s.eq_ignore_ascii_case("bottom") => Some(StatusPos::Bottom),
+            s if s.eq_ignore_ascii_case("left") => Some(StatusPos::Left),
+            s if s.eq_ignore_ascii_case("right") => Some(StatusPos::Right),
+            _ => None,
+        }
+    }
+}
+
+/// Width of a **vertical** status bar, in text columns.
+///
+/// Deliberately fixed rather than fitted to the longest segment: the segments
+/// hold live values (a clock, an IP, a battery percentage), so a fitted width
+/// would relayout every pane — reflowing scrollback — each time one of them
+/// changed a digit. 16 columns holds `255.255.255.255` and `00:00:00 UTC`.
+pub const STATUS_V_COLS: u64 = 16;
+
+/// Carve the status bar off one edge of a `w × h` desktop, returning
+/// `(bar, content)`.
+///
+/// `thickness` is the bar's height for [`StatusPos::Top`]/[`StatusPos::Bottom`]
+/// and its **width** for [`StatusPos::Left`]/[`StatusPos::Right`]. It is clamped
+/// to half the span it consumes: a vertical bar is many times thicker than a
+/// horizontal one, and on a small desktop an unclamped one would leave the panes
+/// no room at all (a zero-width pane reflows its whole scrollback to one column,
+/// the same failure `MIN_TRACK_PX` guards against).
+pub fn status_split(w: u64, h: u64, pos: StatusPos, thickness: u64) -> (Rect, Rect) {
+    match pos {
+        StatusPos::Top => {
+            let t = thickness.min(h / 2);
+            ((0, 0, w, t), (0, t, w, h - t))
+        }
+        StatusPos::Bottom => {
+            let t = thickness.min(h / 2);
+            ((0, h - t, w, t), (0, 0, w, h - t))
+        }
+        StatusPos::Left => {
+            let t = thickness.min(w / 2);
+            ((0, 0, t, h), (t, 0, w - t, h))
+        }
+        StatusPos::Right => {
+            let t = thickness.min(w / 2);
+            ((w - t, 0, t, h), (0, 0, w - t, h))
+        }
+    }
+}
+
+/// Split a resolved status template into the groups it was written as.
+///
+/// The templates join *related* fields with one space and separate *groups* with
+/// two or more (`"${kbd} ${mouse}  ${net}  ${mem}"`), so runs of 2+ spaces are
+/// already the author's own grouping — exactly the unit a vertical bar needs to
+/// stack. That means a re-themed template stacks sensibly with no extra syntax,
+/// and a template with no double spaces yields one segment rather than nothing.
+pub fn status_segments(s: &str) -> Vec<&str> {
+    s.split("  ").map(str::trim).filter(|t| !t.is_empty()).collect()
+}
+
+/// Wrap one status segment onto `cols`-wide rows, breaking at spaces.
+///
+/// A vertical bar is narrow enough that the most-read field does not fit:
+/// `${datetime} ${tz}` resolves to `Mon 2026-07-27 05:59:12 UTC`, and ellipsizing
+/// it to 16 columns cuts off the **time** — the part anyone actually looks at. So a
+/// long segment takes as many rows as it needs instead of losing its tail.
+///
+/// A single word wider than `cols` is emitted whole for the caller to ellipsize:
+/// breaking mid-token would turn one unreadable value into two.
+pub fn wrap_segment(seg: &str, cols: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    if cols == 0 {
+        return out;
+    }
+    let (mut start, mut end) = (0usize, 0usize); // byte range of the current row
+    for word in seg.split_whitespace() {
+        let w_start = word.as_ptr() as usize - seg.as_ptr() as usize;
+        let w_end = w_start + word.len();
+        if end == start {
+            (start, end) = (w_start, w_end); // first word of a row always fits
+            continue;
+        }
+        // Would appending "<space><word>" overflow the row?
+        if seg[start..w_end].chars().count() <= cols {
+            end = w_end;
+        } else {
+            out.push(&seg[start..end]);
+            (start, end) = (w_start, w_end);
+        }
+    }
+    if end > start {
+        out.push(&seg[start..end]);
+    }
+    out
+}
+
 /// Which divider a pointer grabbed. There is one shell|band divider plus a
 /// divider between each pair of adjacent grid tracks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -833,4 +968,137 @@ mod tests {
         assert_eq!(max_panes_from_cfg(None, None), None);
     }
 
+    #[test_case]
+    fn status_split_carves_the_named_edge_and_leaves_the_rest() {
+        // Bottom is the historical layout, so it must be exactly what it was:
+        // content starts at the origin and simply stops short of the bar.
+        let (bar, content) = status_split(1920, 1080, StatusPos::Bottom, 24);
+        assert_eq!(bar, (0, 1056, 1920, 24));
+        assert_eq!(content, (0, 0, 1920, 1056));
+        // Top: same sizes, but the content is pushed down by the bar.
+        let (bar, content) = status_split(1920, 1080, StatusPos::Top, 24);
+        assert_eq!(bar, (0, 0, 1920, 24));
+        assert_eq!(content, (0, 24, 1920, 1056));
+        // Left/right take width instead of height, full height either way.
+        let (bar, content) = status_split(1920, 1080, StatusPos::Left, 200);
+        assert_eq!(bar, (0, 0, 200, 1080));
+        assert_eq!(content, (200, 0, 1720, 1080));
+        let (bar, content) = status_split(1920, 1080, StatusPos::Right, 200);
+        assert_eq!(bar, (1720, 0, 200, 1080));
+        assert_eq!(content, (0, 0, 1720, 1080));
+    }
+
+    #[test_case]
+    fn status_split_is_exact_and_never_starves_the_content() {
+        // Bar + content must tile the desktop with no overlap and no gap, on every
+        // edge and at any thickness — including ones past the clamp.
+        for &pos in &[StatusPos::Top, StatusPos::Bottom, StatusPos::Left, StatusPos::Right] {
+            for &t in &[0u64, 1, 24, 200, 5000] {
+                let ((bx, by, bw, bh), (cx, cy, cw, ch)) = status_split(800, 600, pos, t);
+                if pos.vertical() {
+                    assert_eq!(bw + cw, 800, "{pos:?} t={t} widths must tile");
+                    assert_eq!((bh, ch), (600, 600), "{pos:?} full height");
+                    assert!(bw <= 400, "{pos:?} t={t}: bar took more than half");
+                    assert_eq!(by, 0);
+                    assert_eq!(cy, 0);
+                    // Adjacent, in the order the edge implies.
+                    if pos == StatusPos::Left {
+                        assert_eq!((bx, cx), (0, bw));
+                    } else {
+                        assert_eq!((cx, bx), (0, cw));
+                    }
+                } else {
+                    assert_eq!(bh + ch, 600, "{pos:?} t={t} heights must tile");
+                    assert_eq!((bw, cw), (800, 800), "{pos:?} full width");
+                    assert!(bh <= 300, "{pos:?} t={t}: bar took more than half");
+                    assert_eq!(bx, 0);
+                    assert_eq!(cx, 0);
+                    if pos == StatusPos::Top {
+                        assert_eq!((by, cy), (0, bh));
+                    } else {
+                        assert_eq!((cy, by), (0, ch));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test_case]
+    fn status_pos_round_trips_and_rejects_typos() {
+        for &pos in &[StatusPos::Top, StatusPos::Bottom, StatusPos::Left, StatusPos::Right] {
+            assert_eq!(StatusPos::parse(pos.as_str()), Some(pos));
+        }
+        assert_eq!(StatusPos::parse(" Bottom "), Some(StatusPos::Bottom));
+        assert_eq!(StatusPos::parse("LEFT"), Some(StatusPos::Left));
+        // A typo must not move the bar — the caller keeps the current position.
+        assert_eq!(StatusPos::parse("botom"), None);
+        assert_eq!(StatusPos::parse("centre"), None);
+        assert_eq!(StatusPos::parse(""), None);
+        // Bottom is the default, so an absent setting is today's look.
+        assert_eq!(StatusPos::default(), StatusPos::Bottom);
+        assert!(StatusPos::Left.vertical() && StatusPos::Right.vertical());
+        assert!(!StatusPos::Top.vertical() && !StatusPos::Bottom.vertical());
+    }
+
+    #[test_case]
+    fn status_segments_splits_on_group_gaps_not_field_gaps() {
+        // The real default template: single spaces bind a group, doubles separate.
+        let t = "usb usb  10.0.2.15  12%/8G  3%  8 cores  84%=  00:12:34 UTC";
+        assert_eq!(
+            status_segments(t),
+            alloc::vec!["usb usb", "10.0.2.15", "12%/8G", "3%", "8 cores", "84%=", "00:12:34 UTC"]
+        );
+        // Three-plus spaces are one separator, not an empty segment.
+        assert_eq!(status_segments("a    b"), alloc::vec!["a", "b"]);
+        // No double space at all is one segment, never zero.
+        assert_eq!(status_segments("ChittiOS v0.1"), alloc::vec!["ChittiOS v0.1"]);
+        // Nothing to show yields nothing to draw.
+        assert!(status_segments("").is_empty());
+        assert!(status_segments("   ").is_empty());
+    }
+
+    #[test_case]
+    fn wrap_segment_keeps_the_clock_whole() {
+        // The case this exists for: at 16 columns, ellipsizing loses the time.
+        assert_eq!(
+            wrap_segment("Mon 2026-07-27 05:59:12 UTC", 16),
+            alloc::vec!["Mon 2026-07-27", "05:59:12 UTC"]
+        );
+        // Something that already fits stays on one row.
+        assert_eq!(wrap_segment("mem 88M/6.0G", 16), alloc::vec!["mem 88M/6.0G"]);
+        assert_eq!(wrap_segment("kbd", 16), alloc::vec!["kbd"]);
+        // Exactly-at-the-limit fits; one over wraps.
+        assert_eq!(wrap_segment("abcd efgh", 9), alloc::vec!["abcd efgh"]);
+        assert_eq!(wrap_segment("abcd efgh", 8), alloc::vec!["abcd", "efgh"]);
+        // A word longer than the row is handed over whole rather than split
+        // mid-token — the painter ellipsizes it.
+        assert_eq!(wrap_segment("supercalifragilistic", 8), alloc::vec!["supercalifragilistic"]);
+        assert_eq!(wrap_segment("ab supercalifragilistic", 8), alloc::vec!["ab", "supercalifragilistic"]);
+        // Degenerate inputs draw nothing rather than panicking.
+        assert!(wrap_segment("", 16).is_empty());
+        assert!(wrap_segment("   ", 16).is_empty());
+        assert!(wrap_segment("anything", 0).is_empty());
+        // Multi-byte content must not slice a char boundary (byte ranges, char counts).
+        assert_eq!(wrap_segment("84%≡ 12°C", 5), alloc::vec!["84%≡", "12°C"]);
+    }
+
+    #[test_case]
+    fn wrap_segment_never_loses_or_reorders_words() {
+        // Whatever the width, the words come back in order and all of them come back.
+        let s = "Mon 2026-07-27 05:59:12 UTC and some more fields here";
+        for cols in 1..40usize {
+            let rows = wrap_segment(s, cols);
+            let flat: alloc::vec::Vec<&str> = rows.iter().flat_map(|r| r.split_whitespace()).collect();
+            let want: alloc::vec::Vec<&str> = s.split_whitespace().collect();
+            assert_eq!(flat, want, "cols={cols} dropped or reordered words");
+            // No row is blank, and no row overflows unless it is a single long word.
+            for r in &rows {
+                assert!(!r.is_empty(), "cols={cols} produced an empty row");
+                assert!(
+                    r.chars().count() <= cols || !r.contains(' '),
+                    "cols={cols} row {r:?} overflows and could have been broken"
+                );
+            }
+        }
+    }
 }

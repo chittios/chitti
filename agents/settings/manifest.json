@@ -9,7 +9,8 @@
     "settings_get",
     "settings_set",
     "settings_status",
-    "display"
+    "display",
+    "statusbar"
   ],
   "capabilities": [
     {

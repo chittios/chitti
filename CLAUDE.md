@@ -825,7 +825,15 @@ FDT claims a GICv3 but carries no readable `reg`.
   set, unit-tested against real fixture files (plus `rotate90`/`render_view`
   transform tests) — then presents box-downscaled + letterboxed), a boot splash +
   status-bar **Synapse-C** brand mark, a live
-  clock, a blinking caret, mouse cursor + click, **mouse text selection in the
+  clock, a blinking caret, **Enter submits a fully-typed command** — the suggestion
+  menu stays open while the typed token still matches an entry, so a command name
+  typed in full kept *its own* entry highlighted and Enter "accepted" it, appended a
+  space, and swallowed the keystroke; every later line was then one out of step, so
+  a command silently did not run and it read as a frozen shell. `suggest_would_
+  complete` gates the Enter path on whether accepting would change anything beyond
+  the trailing separator (Tab is untouched — completing is its job). This is what
+  made the command after `/todos open` never execute, an e2e gap that sat unexplained
+  for a while; the `pane_grid` scenario now asserts it. mouse cursor + click, **mouse text selection in the
   chat pane** (drag-to-copy → clipboard, paste with Ctrl+V; absolute-indexed
   over scrollback via `textsel`, like the editor's drag-select), a **host
   clipboard bridge** (`clipboard`: an in-OS copy emits an **OSC 52** escape so a
@@ -840,7 +848,25 @@ FDT claims a GICv3 but carries no readable `reg`.
   JS/TOML/sh lexers colour the editor per-cell, `/cat` output, and the chat's
   streamed markdown — fence-tagged code blocks are lexed per language without
   breaking token streaming), ANSI-coloured agent output, a `/`-command shell,
-  and an on-disk UI config (`/configs/core/ui.json`, `shortcuts.json`). The brand — logo, the terracotta `#cc785c` / warm-ink /
+  and an on-disk UI config (`/configs/core/ui.json`, `shortcuts.json`).
+  **The status bar sits on any edge** — `/statusbar top|bottom|left|right`, the
+  `status_pos` key in `ui.json`, and the settings agent's `statusbar` tool; applies
+  instantly and persists. The geometry is one pure function,
+  `panes_layout::status_split`, which carves the bar off its edge and returns the
+  **content rect**; `Screen` stores that rect and *every* pane calculation works
+  inside it (`build`, `paint_gutters`, `band_capacity`, and the `band_divider_pct`
+  drag inverse) rather than `0..width`/`0..height`. Keep it that way — a layout site
+  that reaches for the full desktop is correct only for `Bottom`, where the content
+  origin is `(0, 0)` and the split is the identity, so the bug hides until someone
+  moves the bar. `left`/`right` make it a **column**: text cannot run across 16
+  cells, so `status_segments` splits each template on the runs of 2+ spaces the
+  author already used to group fields, `wrap_segment` wraps a long one onto extra
+  rows (ellipsizing `${datetime} ${tz}` cut off the *time* — the part anyone reads),
+  and the two stacks grow towards each other from the brand mark and the far edge,
+  stopping when they would meet. The column width is a **fixed**
+  `STATUS_V_COLS`, never fitted to the longest segment: the fields hold live values,
+  so a fitted width would relayout every pane — reflowing scrollback — each time the
+  clock ticked a digit. The brand — logo, the terracotta `#cc785c` / warm-ink /
   cream palette (fully re-themable from `ui.json`), and typography — is specified
   in [DESIGN.md](DESIGN.md); honour it for any UI change. **Themes**
   (`theme.rs`, `/theme`) are presets layered over `ui.json` (still the single

@@ -563,6 +563,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "datetime" | "date" => run_datetime(arg),
         "ui" => run_ui(arg),
         "theme" | "themes" => run_theme(arg),
+        "statusbar" | "bar" => run_statusbar(arg),
         "pane" | "panes" => run_pane(arg),
         "display" | "resolution" | "res" => run_display(arg),
         "shortcuts" | "keys" => run_shortcuts(),
@@ -6638,6 +6639,31 @@ fn suggest_refresh(
     suggest_paint(items, *sel);
 }
 
+/// Whether accepting the highlighted suggestion would complete anything the user
+/// has not already typed — ignoring the trailing separator `apply` adds.
+///
+/// This is what makes **Enter** submit a fully-typed command instead of swallowing
+/// the keystroke. The menu stays open while the typed token still matches an entry,
+/// so typing a command name in full leaves that same name highlighted; Enter then
+/// "accepted" it, `apply` appended a space, the line looked unchanged and the
+/// command did not run until Enter was pressed a second time. Tab is unaffected —
+/// it still accepts (and gets the space), because completing is its whole job.
+///
+/// Found while testing `/statusbar`, but it applied to every bare `/command`.
+fn suggest_would_complete(buf: &str, cur: usize, sel: usize, items: &[suggest::Item]) -> bool {
+    if items.is_empty() {
+        return false;
+    }
+    let item = items[sel.min(items.len() - 1)].clone();
+    let Some(ctx) = suggest::context(buf, cur) else {
+        return false;
+    };
+    let start = ctx.token_start.min(cur);
+    let mut probe = alloc::string::String::from(buf);
+    suggest::apply(&mut probe, cur, start, &item);
+    probe.trim_end() != buf.trim_end()
+}
+
 /// Accept the selected suggestion into `buf`, re-echo, refresh menu.
 fn suggest_accept(
     buf: &mut String,
@@ -7100,8 +7126,11 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                 if media_key(b'\r') {
                     continue;
                 }
-                // Enter accepts the highlighted suggestion when the menu is open.
-                if !sug_items.is_empty() {
+                // Enter accepts the highlighted suggestion when the menu is open —
+                // but only when that would actually complete something. A
+                // fully-typed command name keeps its own entry highlighted, and
+                // "accepting" it there just ate the keystroke.
+                if !sug_items.is_empty() && suggest_would_complete(buf, cur, sug_sel, &sug_items) {
                     let accepted = suggest_accept(
                         buf,
                         &mut cur,
@@ -8263,7 +8292,63 @@ fn run_ui_inner(arg: &str) {
             update_status();
             serial_println!("ui> reset to defaults and re-applied");
         }
-        _ => serial_println!("usage: /ui [config|reload|reset]   (edit {} via /open)", ui_config::ui_path()),
+        // `status_pos` is the one ui.json field with a dedicated command, since
+        // editing JSON to move a bar is a poor trade; keep them discoverable
+        // from each other.
+        "statusbar" | "bar" => run_statusbar(""),
+        _ => {
+            serial_println!("usage: /ui [config|reload|reset]   (edit {} via /open)", ui_config::ui_path());
+            serial_println!("  /statusbar <top|bottom|left|right>   move the OS status bar");
+        }
+    }
+}
+
+/// `/statusbar` — which desktop edge the OS status bar sits on.
+///
+/// Applies instantly and persists to `ui.json` (`status_pos`), so it survives a
+/// reboot and is also editable by hand via `/open`. Reversible and purely
+/// cosmetic, which is why the settings agent may set it directly.
+fn run_statusbar(arg: &str) {
+    #[cfg(any(feature = "server", test))]
+    {
+        let _ = arg;
+        serial_println!("statusbar> unavailable in the server build (no GUI)");
+    }
+    #[cfg(all(not(feature = "server"), not(test)))]
+    run_statusbar_inner(arg);
+}
+
+#[cfg(all(not(feature = "server"), not(test)))]
+fn run_statusbar_inner(arg: &str) {
+    use crate::panes_layout::StatusPos;
+    let arg = arg.trim();
+    if arg.is_empty() || arg == "status" {
+        let cur = crate::framebuffer::status_pos().unwrap_or_default();
+        serial_println!("statusbar> {} (top | bottom | left | right)", cur.as_str());
+        if cur.vertical() {
+            serial_println!(
+                "statusbar>   a side bar is {} columns wide and stacks its fields as rows",
+                crate::panes_layout::STATUS_V_COLS
+            );
+        }
+        serial_println!("statusbar> usage: /statusbar <top|bottom|left|right>");
+        return;
+    }
+    // A typo must not move the bar somewhere unasked-for, so parse strictly and
+    // say what was accepted rather than silently defaulting.
+    let Some(pos) = StatusPos::parse(arg) else {
+        serial_println!("statusbar> unknown position '{}' (expected top | bottom | left | right)", arg);
+        return;
+    };
+    let now = crate::framebuffer::set_status_pos(pos);
+    let mut cfg = crate::ui_config::current();
+    cfg.status_pos = pos.as_str().to_string();
+    crate::ui_config::set_config(cfg);
+    update_status();
+    match now {
+        Some(p) => serial_println!("statusbar> moved to the {} edge", p.as_str()),
+        // No console (serial-only boot): the preference is still saved for next time.
+        None => serial_println!("statusbar> recorded {} (no framebuffer to apply it to)", pos.as_str()),
     }
 }
 
@@ -14186,6 +14271,39 @@ mod agent_flow_tests {
         assert!(mem.contains("teal"), "{mem}");
         // Already-JSON is passed through.
         assert_eq!(normalize_tool_args_json("read", r#"{"path":"x"}"#), r#"{"path":"x"}"#);
+    }
+
+    /// Enter must submit a command the user has typed in full, rather than
+    /// "accepting" the suggestion that is its own name and swallowing the keystroke.
+    ///
+    /// That swallowed Enter left every following line one out of step, so a command
+    /// silently did not run — which reads as a frozen shell, not a completion bug.
+    /// It is what made the command after `/todos open` never execute.
+    #[test_case]
+    fn enter_submits_a_fully_typed_command_and_still_completes_a_prefix() {
+        let items = |buf: &str| match suggest::context(buf, buf.len()) {
+            Some(ctx) => suggest::items_for(&ctx, &[]),
+            None => alloc::vec::Vec::new(),
+        };
+        // A partial name has something to complete → Enter accepts it.
+        let buf = "/statusb";
+        let it = items(buf);
+        assert!(!it.is_empty(), "expected suggestions for {buf}");
+        assert!(
+            suggest_would_complete(buf, buf.len(), 0, &it),
+            "a prefix must still complete on Enter"
+        );
+        // The same name typed in full completes nothing but a trailing space, so
+        // Enter must fall through and run it.
+        let buf = "/statusbar";
+        let it = items(buf);
+        assert!(!it.is_empty(), "the menu stays open on an exact match");
+        assert!(
+            !suggest_would_complete(buf, buf.len(), 0, &it),
+            "a fully-typed command must submit, not re-accept itself"
+        );
+        // No menu → nothing to accept, whatever is highlighted.
+        assert!(!suggest_would_complete("/statusbar", 10, 0, &[]));
     }
 
     /// `poll_interrupt` (the cancel-poll for running commands like `/http`)
