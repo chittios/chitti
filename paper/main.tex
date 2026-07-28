@@ -12,6 +12,11 @@
 \usepackage{amsmath}
 \usepackage{amssymb}
 \usepackage{graphicx}
+% `float` for the [H] specifier: the appendix's registry table must stay in the
+% appendix. As a plain [h] float it did not fit the page, got deferred, and LaTeX
+% flushed it *after* the bibliography — a 26-row table sitting in the middle of
+% the references.
+\usepackage{float}
 \usepackage{enumitem}
 \usepackage{hyperref}
 \hypersetup{colorlinks=true, linkcolor=black, citecolor=black, urlcolor=blue}
@@ -843,7 +848,7 @@ rather than implied by geometry.}
 \label{fig:cost}
 \end{figure}
 
-\begin{table}[h]
+\begin{table}[htb]
 \centering
 \small
 \begin{tabular}{@{}lrrl@{}}
@@ -1368,6 +1373,10 @@ follows is not a better prompt or a bigger corpus --- it is moving provenance fr
 the turn to the value, so the kernel can tell which data justified an action
 instead of only that some untrusted data was present when it happened.
 
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\clearpage
 \appendix
 \section{The primitive registry}
 \label{app:registry}
@@ -1375,7 +1384,7 @@ instead of only that some untrusted data was present when it happened.
 26 primitives, ids fixed at build time. \textbf{D} marks destructive (subject
 to the taint gate); \textbf{S} marks scope-gated on a concrete target.
 
-\begin{table}[h]
+\begin{table}[H]
 \centering
 \small
 \begin{tabular}{@{}llp{0.40\linewidth}cc@{}}
@@ -1414,8 +1423,5 @@ to the taint gate); \textbf{S} marks scope-gated on a concrete target.
 
 \noindent UI primitives carry a third gating dimension not shown: surface
 \emph{ownership}, so an agent may only draw to a surface it requested.
-
-\bibliographystyle{plain}
-\bibliography{refs}
 
 \end{document}
