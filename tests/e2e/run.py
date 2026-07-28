@@ -809,6 +809,44 @@ def s_compact(g):
     return ok, "context compaction" if ok else "no compact output"
 
 
+def s_prefix_cache(g):
+    """A repeated system prompt is reused from the prefix cache, not re-prefilled.
+
+    Runs after `chat` + `compact` in this group, so by now at least one system
+    prompt has been prefilled and stored. A second `/compact` starts another
+    fresh context on the *same* compaction system prompt, which must come back as
+    a reuse rather than a prefill — that is the whole point of the cache, and the
+    counters in `/model` are the only externally visible proof of it.
+
+    Asserted on the counters, not on wall time: prefill throughput on a contended
+    CI host swings by more than the effect on a short prompt, so a timing
+    assertion here would flake without telling anyone anything.
+    """
+    m = g.mark()
+    g.send("/compact")
+    if not (g.wait_for("compacted", 180, m) or g.wait_for("nothing to compact", 10, m)):
+        return False, "second /compact produced no output"
+    g.wait_quiet(2.0, 180)
+    m = g.mark()
+    g.send("/model")
+    if not g.wait_for("prefix cache:", 30, m):
+        return False, "/model did not report prefix-cache stats (no chat session?)"
+    mt = re.search(
+        r"prefix cache: (\d+) prefix\(es\), (\d+) KiB, (\d+) reused / (\d+) prefilled",
+        g.text()[m:],
+    )
+    if not mt:
+        return False, "could not parse prefix-cache stats from /model output"
+    n, kib, reused, prefilled = (int(x) for x in mt.groups())
+    if prefilled == 0:
+        return False, "no system prefix was ever cached"
+    if reused == 0:
+        return False, f"cache never hit ({n} prefix(es), {prefilled} prefilled)"
+    if n == 0 or kib == 0:
+        return False, f"stats claim a reuse but the store is empty ({n} prefix(es), {kib} KiB)"
+    return True, f"{reused} prefix reuse(s) vs {prefilled} prefill(s), {n} held ({kib} KiB)"
+
+
 def s_model_load(_g):
     """Prove the runtime `/model load` path end-to-end, from nothing: boot a
     second guest with NO model in RAM but a FAT model disk attached
@@ -1884,7 +1922,7 @@ FLAKY = {"doc_pipeline", "ssh_agent"}
 RUN_ARCH = "aarch64"
 RUN_VERBOSE = False
 NET_TLS = [("wss", s_wss), ("model_remote_https", s_model_remote_https)]
-MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("compact", s_compact), ("model_load", s_model_load), ("doc_website", s_doc_website)]
+MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("compact", s_compact), ("prefix_cache", s_prefix_cache), ("model_load", s_model_load), ("doc_website", s_doc_website)]
 VOICE = [("voice_models", s_voice_models), ("voice_say", s_voice_say)]
 
 

@@ -25,6 +25,16 @@ pub mod shell {
     pub fn upkeep() {}
 }
 
+/// Stub of the kernel's heap module. Only `HEAP_SIZE` is referenced (by
+/// `model::chunk_for_scratch`, which sizes the prefill chunk as a fraction of
+/// the heap); mirror the 1 GiB tier so the harness picks the same chunk the
+/// kernel would.
+pub mod mm {
+    pub mod heap {
+        pub const HEAP_SIZE: usize = 1024 * 1024 * 1024;
+    }
+}
+
 /// Stub of the kernel's ktrace: forwarded to stderr so decode output on
 /// stdout stays machine-parseable.
 pub mod ktrace {
@@ -51,6 +61,26 @@ pub mod arch {
     #[cfg(not(target_arch = "aarch64"))]
     pub fn has_i8mm() -> bool {
         false
+    }
+
+    /// Stub of the kernel's free-running cycle counter, used by the prefill
+    /// phase accounting. Host monotonic nanoseconds are the same shape (a
+    /// monotonically-advancing tick), which is all the counters need.
+    pub fn cycle_count() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+    }
+
+    /// Stub of the kernel's arch-neutral compute fan-out: the harness is
+    /// single-threaded, so the whole range runs inline. `parallel_for`'s own
+    /// contract is that a serial run over `[0, n)` is a valid partition, which
+    /// is exactly what makes the kernel's parallel cores comparable here.
+    ///
+    /// # Safety
+    /// Same contract as `crate::smp::parallel_for`: `f` must be safe over
+    /// `[0, n)` with `ctx` live for the call.
+    pub unsafe fn parallel_for(n: usize, _min_chunk: usize, f: unsafe fn(usize, usize, *mut u8), ctx: *mut u8) {
+        unsafe { f(0, n, ctx) }
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -222,9 +252,22 @@ fn main() {
 
             let mut kv = m.new_cache();
             let mut state = m.new_state();
+            // Feed in the same chunks the OS does, so chunk sizing can be A/B'd
+            // here (seconds, single core) instead of in a VM. `CHITTI_CHUNK`
+            // overrides; default is the model's own `prefill_chunk`.
+            let chunk = std::env::var("CHITTI_CHUNK")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(64)
+                .max(1);
             let t1 = std::time::Instant::now();
-            m.prefill(&prompt, 0, &mut kv, &mut state);
-            eprintln!("prefill {} tokens in {:?}", prompt.len(), t1.elapsed());
+            let mut i = 0usize;
+            while i < prompt.len() {
+                let j = (i + chunk).min(prompt.len());
+                m.prefill(&prompt[i..j], i, &mut kv, &mut state);
+                i = j;
+            }
+            eprintln!("prefill {} tokens in {:?} (chunk {chunk})", prompt.len(), t1.elapsed());
 
             let mut next = model::argmax(&state.logits);
             let mut pos = prompt.len();

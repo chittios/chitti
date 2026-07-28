@@ -1,3 +1,7 @@
 # The model is a multi-hundred-MB binary fetched on demand, never committed.
 # Run `xtask/fetch-model.sh` (or `cargo xtask fetch-model` once wired) to get it.
 *.gguf
+
+# Markers written by fetch-model.sh CHITTI_PURE (records that a GGUF was made
+# uniformly quantized, so a re-run does not requantize it again).
+*.gguf.pure

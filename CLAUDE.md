@@ -132,8 +132,32 @@ natively on the host (seconds per iteration, layer-by-layer diff vs
 onnxruntime) — use it for any voice-model numeric or perf work before touching
 QEMU.
 
-Current figures (aarch64 HVF, 0.8B Q8): prefill 53 tok/s, decode 19 tok/s,
-`/voice stt` ~2 s, `/voice say` ~14 s for 3.5 s of audio. **aarch64 SMP
+Current figures (aarch64 HVF, 0.8B Q8, `/perf 512`): prefill ~105 tok/s, decode
+~23 tok/s (same box, same run: prefill was ~60 tok/s before the window-wide
+cores below), `/voice stt` ~2 s, `/voice say` ~14 s for 3.5 s of audio.
+
+**Prefill's parallel axis is not the position, and getting that wrong is what
+kept `pp` pinned near `tg`.** The projections were weight-stationary matmuls
+across the whole fleet while the attention and DeltaNet cores ran a position at
+a time on the BSP — so seven cores idled through the part that was left, and a
+2x-of-decode prefill looked like a matmul problem when it was an Amdahl one.
+Both cores are now window-wide (`attn_core_batched`, `delta_core_batched`, with
+decode entering them as a one-position window so the two paths cannot drift):
+attention fans out over **positions** (every `(position, head)` is independent
+once the batched K/V are in the cache), the recurrence over **heads** (sequential
+in position, but each head owns its own state slice). Three things that bite
+here: the conv1d's window/ring index is `ck + p`, **not** `ck - 1 + p` — the
+per-position form shifted the ring before convolving and that `-1` follows you
+into the rewrite, where it reads every tap one position too old and still decodes
+fluent text (`conv_tap`, pinned by `conv_window_matches_the_per_position_ring`);
+parallelism that exists is not parallelism worth taking — fanning a *decode*
+step's 0.8M-MAC DeltaNet layer across the fleet measured **slower** than inline
+(35 -> 20 tok/s), hence `fanout_chunk`; and `/perf [n_prompt [n_decode]]` now
+prints a **proj / attn / delta / elementwise** split, because "prefill is slow"
+is three different diagnoses and they scale differently. Measure with a real
+prompt length: at 64 tokens prefill is one chunk and tells you nothing.
+
+**aarch64 SMP
 row-split is live** (`arch/aarch64/smp.rs`): PSCI `CPU_ON` bring-up, `WFE`-parked
 workers, a static-partition job barrier splitting the SDOT matvecs + generic
 `parallel_for` (video YUV→RGB) across all online cores. **x86 has an equivalent
@@ -714,12 +738,30 @@ FDT claims a GICv3 but carries no readable `reg`.
   unpack run fully in vector registers — `vqtbl1q` broadcast / `vzip`
   interleave, loads via the `ldq_*`/`ldp_*` asm helpers), everything else
   through the generic dequant path (still SMP row-split). **Batched
-  (weight-stationary) prefill** is gated on `Model::batch_qt` — a uniform quant
-  type with a batched matmul kernel (Q8_0 ∣ Q1_0 ∣ Q2_0), not "all Q8_0" — and
-  the shell chat loop feeds batch-capable models **32-token chunks** through
-  `Model::prefill` (weight bytes + unpack amortized per chunk; UI pump +
-  Ctrl+C between chunks), so a 27B's ~1.5k-token system prompt prefills in
-  minutes, not hours. NB the paired Bonsai `dspark` GGUF is a *drafter*
+  (weight-stationary) prefill is decided per *tensor*, never per model**
+  (`has_batched_kernel`): Q8_0 ∣ Q1_0 ∣ Q2_0 always have a kernel, Q4_0 only
+  with FEAT_I8MM, K-quants none — and a projection without one falls back to a
+  matvec per position instead of disqualifying the whole file. The old
+  per-model gate demanded one uniform quant type and read it from
+  `token_embd.qt`, which is the worst possible anchor: prefill never batches
+  `token_embd` (a row lookup, plus one matvec for the final position on a tied
+  output). Real GGUFs are almost never uniform — `llama-quantize` upcasts
+  selected tensors unless `--pure` is passed, so the file published as "Q4_0"
+  arrives Q4_0+Q8_0+Q5_K+Q4_1 with `token_embd` at Q6_K, and that one tensor
+  put a whole 4B on the per-token path. **A fallback tensor costs far more than
+  its share of bytes**: `ssm_out` at Q5_K has no SDOT matvec either, so it goes
+  through the *generic dequant* path — 11% of projection bytes was eating ~69%
+  of prefill, ~18x less efficient per byte than i8mm. Hence
+  `xtask/fetch-model.sh CHITTI_PURE=1|bf16`, and `/perf`'s `batched weights: N%`
+  line. Measured on the 4B (`/perf 512`, 8 cores): per-token 3 pp / 1 tg →
+  windowed at 89% batchable → **pure file 23 pp / 6 tg**. The shell chat loop
+  feeds **64-token chunks** through `Model::prefill` (weight bytes + unpack
+  amortized per chunk; UI pump + Ctrl+C between chunks), so a 27B's ~1.5k-token
+  system prompt prefills in minutes, not hours. Chunk size is measured, not
+  assumed — sizing it to the heap (128/256) was **slower** on a host sweep
+  (4.06 s at 64, 4.17 s at 128, 4.22 s at 256): a bigger chunk only cuts weight
+  *traffic*, and prefill is compute-bound while the wider activation tile costs
+  cache locality. NB the paired Bonsai `dspark` GGUF is a *drafter*
   conditioned on the target's hidden-state taps — not a standalone model; the
   runnable Bonsai is the main `Q1_0`/`Q2_0` file. Two tokenizer flavors behind
   one API (GPT-2 byte-BPE ∣

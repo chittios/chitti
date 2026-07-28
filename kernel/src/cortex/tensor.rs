@@ -1009,6 +1009,40 @@ unsafe fn ldp_s8(p: *const i8) -> (core::arch::aarch64::int8x16_t, core::arch::a
     (a, b)
 }
 
+/// Build the low half of an `i8mm` 2×2 tile operand: lanes `{a[0..8], b[0..8]}`
+/// — i.e. `vcombine_s8(vget_low_s8(a), vget_low_s8(b))`, but spelled as the
+/// single `zip1 v.2d` that is.
+///
+/// Spelling matters here. Written the `vcombine`/`vget_low` way, LLVM
+/// materialised each half-register pairing as a **pair of `mov`s**, so the hot
+/// `Q8_0` GEMM block disassembled to 53 `mov`s against 16 `smmla` (2.6 MAC per
+/// instruction against a 32 MAC/instr ceiling) — the same class of bug as the
+/// `+strict-align` scalarization: the SIMD instruction you asked for is there,
+/// and everything around it is not.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn zip_lo_s8(
+    a: core::arch::aarch64::int8x16_t,
+    b: core::arch::aarch64::int8x16_t,
+) -> core::arch::aarch64::int8x16_t {
+    use core::arch::aarch64::{vreinterpretq_s64_s8, vreinterpretq_s8_s64, vzip1q_s64};
+    // SAFETY: pure register shuffle, no memory access.
+    unsafe { vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(a), vreinterpretq_s64_s8(b))) }
+}
+
+/// High-half counterpart of [`zip_lo_s8`]: lanes `{a[8..16], b[8..16]}`, one
+/// `zip2 v.2d`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn zip_hi_s8(
+    a: core::arch::aarch64::int8x16_t,
+    b: core::arch::aarch64::int8x16_t,
+) -> core::arch::aarch64::int8x16_t {
+    use core::arch::aarch64::{vreinterpretq_s64_s8, vreinterpretq_s8_s64, vzip2q_s64};
+    // SAFETY: pure register shuffle, no memory access.
+    unsafe { vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(a), vreinterpretq_s64_s8(b))) }
+}
+
 /// Software prefetch of the next sequential weight/activation address into L1
 /// (`pldl1strm` — streaming, not retained past use). The Q1/Q2 matvec walks
 /// rows and blocks contiguously, so this hides DRAM latency behind SDOT.
@@ -2122,8 +2156,8 @@ pub unsafe fn matmul_q8_0_i8mm_rows(
     n_cols: usize,
 ) {
     use core::arch::aarch64::{
-        vcombine_f32, vcombine_s8, vcvtq_f32_s32, vdup_n_f32, vdupq_n_f32, vdupq_n_s32, vfmaq_f32, vget_high_s8,
-        vget_low_s8, vgetq_lane_f32, vmmlaq_s32, vmulq_f32, vset_lane_f32,
+        vcombine_f32, vcvtq_f32_s32, vdup_n_f32, vdupq_n_f32, vdupq_n_s32, vfmaq_f32, vgetq_lane_f32, vmmlaq_s32,
+        vmulq_f32, vset_lane_f32,
     };
     let blocks = n_cols / QK;
     let row_bytes = blocks * Q8_0_BLOCK_BYTES;
@@ -2139,42 +2173,69 @@ pub unsafe fn matmul_q8_0_i8mm_rows(
             let (row0, row1) = (w.add(r * row_bytes), w.add((r + 1) * row_bytes));
             let mut mt = 0;
             while mt < full_cols {
-                let mut res = [vdupq_n_f32(0.0); COLP]; // per col-pair: [m0·r m1·r m0·r+1 m1·r+1]
-                for b in 0..blocks {
-                    let base = b * Q8_0_BLOCK_BYTES;
-                    let dw0 = f16_to_f32(u16::from_le_bytes([*row0.add(base), *row0.add(base + 1)]));
-                    let dw1 = f16_to_f32(u16::from_le_bytes([*row1.add(base), *row1.add(base + 1)]));
+                // Per col-pair accumulator: [m0·r m1·r m0·r+1 m1·r+1]. Named
+                // rather than an array, and the K-group step below is unrolled
+                // rather than a `for kg in 0..4` over one — an *indexed* array
+                // in the hot loop is what LLVM spills to the stack, and it did:
+                // 11 stores an iteration, against 16 `smmla`.
+                let (mut res0, mut res1, mut res2, mut res3) =
+                    (vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+                // Walk the two weight rows and the activation tile with cursors
+                // rather than recomputing `b * …` products per access.
+                let mut p0 = row0;
+                let mut p1 = row1;
+                let mut aq = xq.add(mt * n_cols);
+                let mut asc = xs.add(mt * nb);
+                for _ in 0..blocks {
+                    let dw0 = f16_to_f32(u16::from_le_bytes([*p0, *p0.add(1)]));
+                    let dw1 = f16_to_f32(u16::from_le_bytes([*p1, *p1.add(1)]));
                     let dw_vec = vcombine_f32(vdup_n_f32(dw0), vdup_n_f32(dw1)); // {dw0,dw0,dw1,dw1}
-                    // Two weight rows' 32 int8 → 4 K-group int8x8 each.
-                    let (w0lo, w0hi) = (ldq_s8(row0.add(base + 2) as *const i8), ldq_s8(row0.add(base + 18) as *const i8));
-                    let (w1lo, w1hi) = (ldq_s8(row1.add(base + 2) as *const i8), ldq_s8(row1.add(base + 18) as *const i8));
-                    let wk0 = [vget_low_s8(w0lo), vget_high_s8(w0lo), vget_low_s8(w0hi), vget_high_s8(w0hi)];
-                    let wk1 = [vget_low_s8(w1lo), vget_high_s8(w1lo), vget_low_s8(w1hi), vget_high_s8(w1hi)];
-                    for t in 0..COLP {
-                        let (m0, m1) = (mt + 2 * t, mt + 2 * t + 1);
-                        let (a0lo, a0hi) = ldp_s8(xq.add(m0 * n_cols + b * QK));
-                        let (a1lo, a1hi) = ldp_s8(xq.add(m1 * n_cols + b * QK));
-                        let ak0 = [vget_low_s8(a0lo), vget_high_s8(a0lo), vget_low_s8(a0hi), vget_high_s8(a0hi)];
-                        let ak1 = [vget_low_s8(a1lo), vget_high_s8(a1lo), vget_low_s8(a1hi), vget_high_s8(a1hi)];
-                        let mut acc2 = vdupq_n_s32(0);
-                        for kg in 0..4 {
+                    // Two weight rows' 32 int8 → the four K-group 2×2 operands
+                    // `[row0 | row1]`, one `zip` each and hoisted out of the
+                    // column loop (they do not depend on the column pair).
+                    let (w0lo, w0hi) = (ldq_s8(p0.add(2) as *const i8), ldq_s8(p0.add(18) as *const i8));
+                    let (w1lo, w1hi) = (ldq_s8(p1.add(2) as *const i8), ldq_s8(p1.add(18) as *const i8));
+                    let wz0 = zip_lo_s8(w0lo, w1lo);
+                    let wz1 = zip_hi_s8(w0lo, w1lo);
+                    let wz2 = zip_lo_s8(w0hi, w1hi);
+                    let wz3 = zip_hi_s8(w0hi, w1hi);
+                    // One column pair: 4 `smmla` (K=8 each) into an int32 2×2,
+                    // scaled by the outer product of the block's weight and
+                    // activation scales. `$t` is a literal, so every offset
+                    // folds to a loop-invariant constant.
+                    macro_rules! col_pair {
+                        ($t:expr, $res:ident) => {{
                             // Vn = [w row0 | w row1], Vm = [act m0 | act m1].
-                            acc2 = vmmlaq_s32(acc2, vcombine_s8(wk0[kg], wk1[kg]), vcombine_s8(ak0[kg], ak1[kg]));
-                        }
-                        let dx0 = *xs.add(m0 * nb + b);
-                        let dx1 = *xs.add(m1 * nb + b);
-                        let pair = vset_lane_f32(dx1, vdup_n_f32(dx0), 1); // {dx0, dx1}
-                        let dx_vec = vcombine_f32(pair, pair); // {dx0,dx1,dx0,dx1}
-                        let scale = vmulq_f32(dw_vec, dx_vec); // {dw0dx0, dw0dx1, dw1dx0, dw1dx1}
-                        res[t] = vfmaq_f32(res[t], vcvtq_f32_s32(acc2), scale);
+                            let (a0lo, a0hi) = ldp_s8(aq.add(2 * $t * n_cols));
+                            let (a1lo, a1hi) = ldp_s8(aq.add((2 * $t + 1) * n_cols));
+                            let mut acc2 = vdupq_n_s32(0);
+                            acc2 = vmmlaq_s32(acc2, wz0, zip_lo_s8(a0lo, a1lo));
+                            acc2 = vmmlaq_s32(acc2, wz1, zip_hi_s8(a0lo, a1lo));
+                            acc2 = vmmlaq_s32(acc2, wz2, zip_lo_s8(a0hi, a1hi));
+                            acc2 = vmmlaq_s32(acc2, wz3, zip_hi_s8(a0hi, a1hi));
+                            let dx0 = *asc.add(2 * $t * nb);
+                            let dx1 = *asc.add((2 * $t + 1) * nb);
+                            let pair = vset_lane_f32(dx1, vdup_n_f32(dx0), 1); // {dx0, dx1}
+                            let dx_vec = vcombine_f32(pair, pair); // {dx0,dx1,dx0,dx1}
+                            let scale = vmulq_f32(dw_vec, dx_vec); // {dw0dx0, dw0dx1, dw1dx0, dw1dx1}
+                            $res = vfmaq_f32($res, vcvtq_f32_s32(acc2), scale);
+                        }};
                     }
+                    col_pair!(0, res0);
+                    col_pair!(1, res1);
+                    col_pair!(2, res2);
+                    col_pair!(3, res3);
+                    p0 = p0.add(Q8_0_BLOCK_BYTES);
+                    p1 = p1.add(Q8_0_BLOCK_BYTES);
+                    aq = aq.add(QK);
+                    asc = asc.add(1);
                 }
-                for t in 0..COLP {
+                for (t, res) in [res0, res1, res2, res3].into_iter().enumerate() {
                     let (m0, m1) = (mt + 2 * t, mt + 2 * t + 1);
-                    *y.add(m0 * n_rows + r) = vgetq_lane_f32(res[t], 0);
-                    *y.add(m1 * n_rows + r) = vgetq_lane_f32(res[t], 1);
-                    *y.add(m0 * n_rows + r + 1) = vgetq_lane_f32(res[t], 2);
-                    *y.add(m1 * n_rows + r + 1) = vgetq_lane_f32(res[t], 3);
+                    *y.add(m0 * n_rows + r) = vgetq_lane_f32(res, 0);
+                    *y.add(m1 * n_rows + r) = vgetq_lane_f32(res, 1);
+                    *y.add(m0 * n_rows + r + 1) = vgetq_lane_f32(res, 2);
+                    *y.add(m1 * n_rows + r + 1) = vgetq_lane_f32(res, 3);
                 }
                 mt += 2 * COLP;
             }

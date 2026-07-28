@@ -545,7 +545,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "help" => print_help(arg),
         "infer" => run_infer(),
         "bench" => run_bench(),
-        "perf" => run_perf(),
+        "perf" => run_perf(arg),
         "modelhash" => {
             // Integrity probe for the bundled model region (diagnoses a corrupt
             // load on the various boot paths): FNV-1a over the mapped bytes.
@@ -2269,11 +2269,20 @@ pub(crate) fn parse_tool_calls(
             .find('{')
             .and_then(|b| extract_balanced_json_object(&block[b..]))
             .unwrap_or_else(|| block.to_string());
-        if let Some(name) = json_str(&obj, "name") {
-            let name = name.trim().trim_start_matches('/').to_string();
-            if !name.is_empty() {
-                out.push((name, extract_arguments_json(&obj)));
-            }
+        let parsed = json_str(&obj, "name").map(|n| n.trim().trim_start_matches('/').to_string());
+        match parsed {
+            Some(name) if !name.is_empty() => out.push((name, extract_arguments_json(&obj))),
+            // The model *tried* and we could not read a tool name out of it.
+            // Without this trace that is indistinguishable from the model never
+            // calling a tool at all — which is exactly the wrong thing to be
+            // guessing about on a heavily-quantized model, where malformed JSON
+            // is the likely failure and "it ignores its tools" is the likely
+            // wrong conclusion. Truncated: a block can be long.
+            _ => crate::ktrace::log_fmt(format_args!(
+                "chat.toolcall: unparsable <tool_call> block ({} bytes), no usable \"name\": {:.160}",
+                block.len(),
+                obj.trim()
+            )),
         }
         // Advance past this block (prefer explicit close when present).
         let advance = if after.find("</tool_call>").map(|c| c < next_open).unwrap_or(false) {
@@ -4083,7 +4092,32 @@ struct ChatSession {
     next_call_id: u64,
     /// Last generate_assistant think duration (secs); printed at turn footer.
     last_thought_secs: f32,
+    /// Prefilled system-prompt contexts, reused instead of re-prefilled (see
+    /// [`crate::cortex::prefix`]). Session-owned so it cannot outlive the model
+    /// that produced it — `/model load` drops the whole `ChatSession`.
+    prefix: crate::cortex::prefix::PrefixStore<crate::cortex::prefix::Snapshot>,
 }
+
+/// Heap the prefix cache may hold — **half** of it.
+///
+/// Sized as a fraction rather than a constant because a prefix costs what the
+/// model costs: a 1.5k-token prefix is ~57 MiB on the 0.8B but ~353 MiB on the
+/// 27B (16 attention layers of growing KV, plus 48 DeltaNet layers of flat
+/// recurrent state). The original flat 192 MiB therefore *declined* the 27B's
+/// prefix outright, which meant re-paying a **511-second** system-prompt prefill
+/// on every fresh context — by far the largest single cost in that
+/// configuration, and much larger than the memory it was protecting.
+///
+/// Half the heap sounds aggressive and is deliberate: it is a ceiling, not a
+/// reservation (nothing is allocated until a prefix is stored), the entries are
+/// evicted LRU, and the alternative is minutes of recomputation. The other half
+/// still has to hold the KV of the live context plus the per-chunk prefill
+/// scratch, which `chunk_for_scratch` independently caps at a sixteenth.
+const PREFIX_CACHE_BUDGET: usize = crate::mm::heap::HEAP_SIZE / 2;
+
+/// Below this many tokens, prefilling is quick enough that a snapshot is not
+/// worth its memory — a short routing SOUL is a few hundred milliseconds.
+const PREFIX_CACHE_MIN_TOKENS: usize = 128;
 
 impl ChatSession {
     /// Load the bundled model + build the tokenizer. `None` if no model. Ticks
@@ -4135,6 +4169,7 @@ impl ChatSession {
             history: alloc::vec::Vec::new(),
             next_call_id: 1,
             last_thought_secs: 0.0,
+            prefix: crate::cortex::prefix::PrefixStore::new(PREFIX_CACHE_BUDGET),
         })
     }
 
@@ -4189,13 +4224,16 @@ impl ChatSession {
     /// recursive rebuild if the user holds Ctrl+C through the rebuild itself.
     fn rebuild_kv_from_history(&mut self) {
         let turns: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> = self.history.clone();
-        self.kv = self.model.new_cache();
-        self.state = self.model.new_state();
-        self.pos = 0;
-        self.gen.clear();
-        self.cancelled = false;
-        for (header, body) in &turns {
-            self.prefill_turn(header, body, false);
+        self.reset_context();
+        for (i, (header, body)) in turns.iter().enumerate() {
+            // Turn 0 is the system prompt, and after a cancel it is the same
+            // text the cache already holds — so the expensive part of a rebuild
+            // is a clone. Later turns are conversation-specific: prefill them.
+            if i == 0 && header == "system\n" {
+                self.prefill_system_cached(body, false);
+            } else {
+                self.prefill_turn(header, body, false);
+            }
             if self.cancelled {
                 // User held cancel through rebuild: keep the full logical
                 // history; KV may be short. Clear the flag so the outer turn
@@ -4245,7 +4283,10 @@ impl ChatSession {
         session.budget.turns_used = session.budget.turns_used.saturating_add(1);
 
         if self.history.is_empty() {
-            self.prefill_committed("system\n", &agent_system_prompt(), false);
+            // Caching this one is what makes a post-cancel `rebuild_kv_from_history`
+            // (and `/compact`'s rebuild) cheap: the system prompt is by far the
+            // largest turn in the replay and it never changes.
+            self.prefill_system_cached(&agent_system_prompt(), true);
         }
         // Inject host system-reminders (MCP connect, etc.) as SystemTrusted user
         // envelope so they don't look like human-typed facts.
@@ -4461,11 +4502,10 @@ impl ChatSession {
         let before = self.pos;
         let s = summary.trim();
         self.history.clear();
-        self.kv = self.model.new_cache();
-        self.state = self.model.new_state();
-        self.pos = 0;
-        self.gen.clear();
-        self.prefill_committed("system\n", &agent_system_prompt_compact(), false);
+        // `cancelled` is already false here (the early returns above cover it),
+        // so the extra clear in `reset_context` changes nothing.
+        self.reset_context();
+        self.prefill_system_cached(&agent_system_prompt_compact(), true);
         if !s.is_empty() && !self.cancelled {
             self.prefill_committed(
                 "system\n",
@@ -4475,6 +4515,81 @@ impl ChatSession {
         }
         crate::ktrace::log_fmt(format_args!("chat.compact: {} -> {} tokens", before, self.pos));
         serial_println!("(compacted: context {} -> {} tokens)", before, self.pos);
+    }
+
+    /// Drop the model context back to empty (no tokens prefilled). Does not
+    /// touch `history` — callers decide whether the logical conversation is
+    /// being replayed or discarded.
+    fn reset_context(&mut self) {
+        self.kv = self.model.new_cache();
+        self.state = self.model.new_state();
+        self.pos = 0;
+        self.gen.clear();
+        self.cancelled = false;
+    }
+
+    /// Prefill a system turn at position 0, reusing a cached KV prefix when this
+    /// exact system text has been prefilled on this model before.
+    ///
+    /// Must be called on an empty context (`pos == 0`): a snapshot is only valid
+    /// as the *start* of a context, because it carries the BOS token and every
+    /// cached position is absolute. `commit` appends the turn to `history` for
+    /// callers that maintain a replayable conversation.
+    ///
+    /// A hit still costs a clone of the cache — decoding mutates the KV in place,
+    /// so the snapshot cannot be shared — but that is a memcpy against a prefill,
+    /// and it does not grow with the prompt.
+    fn prefill_system_cached(&mut self, sys: &str, commit: bool) {
+        debug_assert_eq!(self.pos, 0, "a cached prefix is only valid at the start of a context");
+        // Clone inside the borrow so the store is free before `self.kv` is
+        // assigned; the copy is needed regardless.
+        if let Some((cache, pos)) = self.prefix.get(sys).map(|s| (s.cache.clone(), s.pos)) {
+            self.kv = cache;
+            self.pos = pos;
+            if commit {
+                self.history.push((alloc::string::String::from("system\n"), alloc::string::String::from(sys)));
+            }
+            let (hits, misses) = self.prefix.stats();
+            crate::ktrace::log_fmt(format_args!(
+                "chat.prefix: reused {pos}-token system prefix ({} hit / {} miss, {} KiB cached)",
+                hits,
+                misses,
+                self.prefix.bytes() >> 10
+            ));
+            return;
+        }
+        if commit {
+            self.prefill_committed("system\n", sys, false);
+        } else {
+            self.prefill_turn("system\n", sys, false);
+        }
+        // A cancelled prefill leaves a truncated context — never cache that.
+        if self.cancelled || self.pos < PREFIX_CACHE_MIN_TOKENS {
+            return;
+        }
+        // Ask before cloning: on a 27B this snapshot is ~353 MiB, and cloning it
+        // only for `insert` to decline it is a third of a gigabyte of pointless
+        // allocator churn on the slowest path in the system.
+        let bytes = self.kv.bytes();
+        if !self.prefix.accepts(bytes) {
+            crate::ktrace::log_fmt(format_args!(
+                "chat.prefix: NOT caching {}-token system prefix -- {} MiB exceeds the {} MiB budget \
+                 (this context will be prefilled again from scratch)",
+                self.pos,
+                bytes >> 20,
+                PREFIX_CACHE_BUDGET >> 20
+            ));
+            return;
+        }
+        let snap = crate::cortex::prefix::Snapshot { cache: self.kv.clone(), pos: self.pos };
+        let stored = self.prefix.insert(alloc::string::String::from(sys), snap, bytes);
+        crate::ktrace::log_fmt(format_args!(
+            "chat.prefix: {} {}-token system prefix ({} KiB; store {} KiB)",
+            if stored { "cached" } else { "declined" },
+            self.pos,
+            bytes >> 10,
+            self.prefix.bytes() >> 10
+        ));
     }
 
     /// Prefill `header`+`body` and, on success, append them to [`Self::history`].
@@ -4579,13 +4694,21 @@ impl ChatSession {
         let mut last_ui = t0;
         let mut last_log = 0usize;
         // Batch-capable models (uniform Q8_0/Q1_0/Q2_0 weights) prefill in
-        // 64-token weight-stationary chunks: each weight is read from memory
-        // once per *chunk* instead of once per token, which is what makes a
-        // 27B's ~1.5k-token system prompt minutes, not hours. The chunk
-        // boundary keeps the UI pump + Ctrl+C cancel latency bounded (one
-        // chunk = one bounded matmul pass); mixed-quant models keep the
-        // per-token path. 64 amortizes weight traffic further than 32 at the
-        // cost of ~2× m-wide scratch (still well under the 1 GiB heap).
+        // weight-stationary chunks: each weight is read from memory once per
+        // *chunk* instead of once per token, which is what makes a 27B's
+        // ~1.5k-token system prompt minutes, not hours. The chunk boundary keeps
+        // the UI pump + Ctrl+C cancel latency bounded (one chunk = one bounded
+        // matmul pass); mixed-quant models keep the per-token path.
+        //
+        // 64 is measured, not assumed. Sizing the chunk to the heap instead
+        // (256 on the 0.8B, 134 on a 27B) was tried and is **slower**: a host
+        // sweep at 440 tokens gave 4.06 s at 64, 4.17 s at 128, 4.22 s at 256 --
+        // monotonic, so real. A bigger chunk only cuts weight *traffic*
+        // (`model_bytes / chunk` per token), and prefill here is compute-bound,
+        // while the wider activation tile costs cache locality. A model too big
+        // to stay resident would flip that trade -- if you revisit this, measure
+        // on one (`CHITTI_CHUNK` in `tools/cortexdiff` sweeps it without a VM),
+        // and note that a 16 GiB host cannot benchmark a 27B at all.
         let chunk = if self.model.batched_prefill_supported() { 64 } else { 1 };
         let mut i = 0usize;
         while i < last {
@@ -4819,13 +4942,11 @@ impl ChatSession {
         const MAX_ITERS: usize = 6;
         let prev_think = THINK_ON.swap(false, Ordering::Relaxed);
         self.greedy = true;
-        self.kv = self.model.new_cache();
-        self.state = self.model.new_state();
-        self.pos = 0;
-        self.gen.clear();
-        self.cancelled = false;
+        self.reset_context();
+        // One ask per app interaction, all sharing this app's SOUL + protocol:
+        // the prefix cache turns every ask after the first into a cache clone.
         let sys = alloc::format!("{soul}\n\n{}", ui_agent_protocol(surface));
-        self.prefill_turn("system\n", &sys, false);
+        self.prefill_system_cached(&sys, false);
         self.prefill_turn("user\n", user, true);
         let mut last_call: Option<(alloc::string::String, alloc::string::String)> = None;
         let mut result = alloc::string::String::new();
@@ -4908,13 +5029,12 @@ impl ChatSession {
         const MAX_ITERS: usize = 4;
         let prev_think = THINK_ON.swap(false, Ordering::Relaxed);
         self.greedy = true;
-        self.kv = self.model.new_cache();
-        self.state = self.model.new_state();
-        self.pos = 0;
-        self.gen.clear();
-        self.cancelled = false;
+        self.reset_context();
+        // This runs per HTTP request with a byte-identical system prompt, which
+        // is what the prefix cache exists for: the SOUL is prefilled once per
+        // served agent, not once per request.
         let sys = alloc::format!("{soul}\n\n{}", serve_protocol());
-        self.prefill_turn("system\n", &sys, false);
+        self.prefill_system_cached(&sys, false);
         self.prefill_turn("user\n", user, true);
         let mut last_read: Option<(alloc::string::String, alloc::vec::Vec<u8>)> = None;
         let mut last_arg: Option<alloc::string::String> = None;
@@ -4996,7 +5116,9 @@ impl ChatSession {
         // Each dispatched sub-agent gets its own home (SOUL.md, skills/, memory/).
         crate::agent::home::ensure(role.id.0, &role.name);
         let role_label = role.name.clone();
-        self.prefill_turn("system\n", &subagent_system_prompt(&role.toolset), false);
+        // Same role dispatched repeatedly gets the same system prompt; cache it.
+        // `pos` was reset to 0 by the swap above, so this is a context start.
+        self.prefill_system_cached(&subagent_system_prompt(&role.toolset), false);
         let result = {
             let mut steps = ModelSteps { chat: self, seen: 0, call_id: 0, last_call: None };
             let mut tools = CommandTools;
@@ -5257,6 +5379,19 @@ fn run_model(
                     if c.key.is_some() { ", bearer key set" } else { "" }
                 ),
                 None => serial_println!("model>   remote: not configured"),
+            }
+            // Prefix cache: how many system prompts are held prefilled, and how
+            // often a fresh context avoided re-prefilling one. Observable so
+            // "why is a served request still slow" is answerable.
+            if let Some(c) = chat.as_ref() {
+                let (hits, misses) = c.prefix.stats();
+                serial_println!(
+                    "model>   prefix cache: {} prefix(es), {} KiB, {} reused / {} prefilled",
+                    c.prefix.len(),
+                    c.prefix.bytes() >> 10,
+                    hits,
+                    misses,
+                );
             }
             serial_println!("model> usage: /model local | /model load <file.gguf> | /model remote <http://host:port> [name] [key <k>]");
             serial_println!("model>        (voice + /infer//perf always use the local model)");
@@ -6430,9 +6565,15 @@ fn run_bench() {
 /// Builtin: end-to-end inference throughput benchmark (prefill `pp` + decode
 /// `tg`), directly comparable to `llama-bench`. A regression gauge to run after
 /// any change; `infer` remains the correctness (reference-parity) check.
-fn run_perf() {
-    const N_PROMPT: usize = 64;
-    const N_DECODE: usize = 32;
+/// `/perf [n_prompt [n_decode]]` — the pp/tg gauge. The prompt length is an
+/// argument because prefill throughput is a function of it: a 64-token prompt
+/// is one batched chunk, while a real system prompt is ~1.5k tokens, where the
+/// quadratic attention term and the per-position recurrence matter. Defaults
+/// match the historical fixed sizes.
+fn run_perf(arg: &str) {
+    let mut it = arg.split_whitespace();
+    let n_prompt = it.next().and_then(|s| s.parse().ok()).unwrap_or(64usize).clamp(1, 32768);
+    let n_decode = it.next().and_then(|s| s.parse().ok()).unwrap_or(32usize).clamp(1, 4096);
     // Pump the UI/net between phases and per decoded token, and honor Ctrl+C —
     // a 27B bench is minutes of blocking wall time otherwise (standing rule).
     let mut pump = || {
@@ -6440,7 +6581,7 @@ fn run_perf() {
         crate::net::poll();
         poll_cancel()
     };
-    match crate::cortex::bench_inference(N_PROMPT, N_DECODE, &mut pump) {
+    match crate::cortex::bench_inference(n_prompt, n_decode, &mut pump) {
         Some(r) => {
             let pp = if r.prefill_ms > 0 { (r.n_prompt as u64 * 1000) / r.prefill_ms } else { 0 };
             let tg = if r.decode_ms > 0 { (r.n_decode as u64 * 1000) / r.decode_ms } else { 0 };
@@ -6453,6 +6594,46 @@ fn run_perf() {
                 r.decode_ms,
                 tg,
             );
+            // What prefill had to work with. A slow `pp` is usually one of these
+            // three being absent rather than a slow kernel: a hypervisor that
+            // parks the fleet, an ID register that does not advertise i8mm, or a
+            // mixed-quant GGUF that cannot take the batched path at all.
+            serial_println!(
+                "perf>   compute: {} core(s), i8mm {}, window prefill {}",
+                r.cores,
+                if r.i8mm { "yes" } else { "NO (SDOT only — half the MAC/instr)" },
+                if r.batched { "yes" } else { "NO (per-token path: pp can't exceed tg)" },
+            );
+            // Batching is per tensor, so the mix is the number that matters. A
+            // `llama-quantize` file without `--pure` upcasts some tensors, and
+            // those fall back to per-position matvecs; anything well under 100%
+            // means requantizing (or a `--pure` file) would buy real prefill.
+            if r.batched {
+                serial_println!(
+                    "perf>   batched weights: {}% of projection bytes ({})",
+                    r.batch_pct,
+                    match r.batch_pct {
+                        100 => "uniform: every projection is weight-stationary",
+                        1..=99 => "mixed quant: the rest fall back to per-position matvecs",
+                        _ => "no batchable projection — only the attn/delta cores are windowed",
+                    },
+                );
+            }
+            // Where prefill went. The three kinds of work scale differently
+            // (weight-stationary matmul, quadratic attention, per-head
+            // recurrence), so the split is the difference between "the matmul
+            // is slow" and "something serial is holding the fleet".
+            let total: u64 = r.phases.iter().sum();
+            if total > 0 {
+                let pct = |x: u64| (x * 100) / total;
+                serial_println!(
+                    "perf>   prefill split: proj {}% attn {}% delta {}% elementwise {}%",
+                    pct(r.phases[0]),
+                    pct(r.phases[1]),
+                    pct(r.phases[2]),
+                    pct(r.phases[3]),
+                );
+            }
         }
         None => serial_println!("perf> no model present (or cancelled)"),
     }

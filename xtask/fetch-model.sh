@@ -5,6 +5,31 @@
 #
 # Usage: fetch-model.sh [NAME]  (default: qwen3.5-0.8b)
 #
+# CHITTI_PURE -- make the GGUF *uniformly* quantized, which is what unlocks
+# Cortex's weight-stationary batched prefill on the largest share of the weights.
+#
+#   Batching is decided per tensor (cortex::model::has_batched_kernel): Q8_0,
+#   Q1_0, Q2_0 always have a batched kernel, Q4_0 has one only with FEAT_I8MM,
+#   and the K-quants have none -- those tensors fall back to one matvec per
+#   position. `llama-quantize` upcasts selected tensors unless `--pure` is
+#   passed, so the file published as "Q4_0" arrives as Q4_0 + Q8_0 + Q5_K + Q4_1
+#   and leaves ~11% of projection bytes on the slow path. Making it pure
+#   measured 25.0s -> 10.5s on a 44-token 4B prefill (2.4x, single core).
+#
+#   CHITTI_PURE=1      requantize the downloaded file in place
+#                      (`--allow-requantize`; no extra download). The tensors
+#                      that were upcast take a second lossy pass -- fine for
+#                      throughput work, not for quality work.
+#   CHITTI_PURE=bf16   fetch the BF16 weights and quantize from those instead
+#                      (no requantize loss, but a much larger download).
+#   CHITTI_PURE_TYPE   target type, default Q4_0. Use Q8_0 for VirtualBox: it
+#                      masks FEAT_I8MM, and Q4_0's batched kernel is i8mm-only,
+#                      so a pure Q4_0 file batches *nothing* there.
+#
+# Only applies to the mixed-quant Qwen fetches (2b/4b/9b). The 0.8B (Q8_0) and
+# both Bonsai builds (Q1_0/Q2_0) are already uniform, and Gemma never takes the
+# batched path at all, so those are left alone.
+#
 #   qwen3.5-0.8b  -> assets/model.gguf            (Q8_0, ~812 MB) -- DEFAULT
 #   qwen3.5-2b    -> assets/model-2b.gguf         (Q4_0, ~1.2 GB)
 #   qwen3.5-4b    -> assets/model-4b.gguf         (Q4_0, ~2.6 GB)
@@ -28,19 +53,28 @@ case "$MODEL" in
   qwen3.5-2b|2b)
     DEST="$DIR/assets/model-2b.gguf"
     # Q4_0 (not Q4_K): Q4_0 is a format Chitti's kernel supports directly.
+    # NB this file is NOT uniformly Q4_0 -- see CHITTI_PURE above.
     URL="https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_0.gguf"
+    BF16_URL="https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-BF16.gguf"
+    PURE_OK=yes
     SIZE="~1.2 GB (Q4_0)"
     ;;
   qwen3.5-4b|4b)
     DEST="$DIR/assets/model-4b.gguf"
     # Q4_0 (not Q4_K): Q4_0 is a format Chitti's kernel supports directly.
+    # NB this file is NOT uniformly Q4_0 -- see CHITTI_PURE above.
     URL="https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_0.gguf"
+    BF16_URL="https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-BF16.gguf"
+    PURE_OK=yes
     SIZE="~2.6 GB (Q4_0)"
     ;;
   qwen3.5-9b|9b)
     DEST="$DIR/assets/model-9b.gguf"
     # Q4_0 (not Q4_K): Q4_0 is a format Chitti's kernel supports directly.
+    # NB this file is NOT uniformly Q4_0 -- see CHITTI_PURE above.
     URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_0.gguf"
+    BF16_URL="https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-BF16.gguf"
+    PURE_OK=yes
     SIZE="~5.0 GB (Q4_0)"
     ;;
   gemma-4-e4b|gemma-4-E4B|gemma4-e4b|gemma4-E4B|gemma-4-E4B-it|e4b|E4B)
@@ -73,14 +107,62 @@ case "$MODEL" in
     ;;
 esac
 
-if [ -f "$DEST" ]; then
+# Download $2 to $1. `-C -` resumes a prior interrupted download (HF supports
+# byte ranges), so a killed `make model` (e.g. SIGTERM) can pick up the existing
+# `.partial` instead of re-pulling multi-GB weights from scratch. `--retry`
+# covers transient drops. Only moved into place once complete, so an aborted
+# fetch never leaves a truncated GGUF that would fail to parse at boot.
+fetch() {
+  curl -fL -C - --retry 5 --retry-delay 2 -o "$1.partial" "$2"
+  mv "$1.partial" "$1"
+}
+
+PURE="${CHITTI_PURE:-}"
+PURE_TYPE="${CHITTI_PURE_TYPE:-Q4_0}"
+# `.pure` marks a file this script already made uniform, so re-running is a
+# no-op instead of putting the weights through another lossy pass.
+if [ -n "$PURE" ] && [ "${PURE_OK:-}" != "yes" ]; then
+  echo "note: CHITTI_PURE ignored for '$MODEL' (already uniform, or never batched)"
+  PURE=""
+fi
+if [ -n "$PURE" ] && ! command -v llama-quantize >/dev/null 2>&1; then
+  echo "CHITTI_PURE set but llama-quantize is not on PATH (brew install llama.cpp)" >&2
+  exit 1
+fi
+
+if [ "$PURE" = "bf16" ]; then
+  # Quality-correct path: quantize from 16-bit weights, never requantize.
+  SRC="$DIR/assets/.bf16-$(basename "$DEST")"
+  if [ -f "$DEST" ] && [ -f "$DEST.pure" ]; then
+    echo "model already present and uniform: $DEST"
+    exit 0
+  fi
+  [ -f "$SRC" ] || { echo "fetching $MODEL BF16 source -> $SRC"; fetch "$SRC" "$BF16_URL"; }
+  echo "quantizing $SRC -> $DEST ($PURE_TYPE, pure)"
+  # token_embd stays at Q6_K: prefill never batches it (a row lookup, plus one
+  # matvec for the final position when the output is tied), so upcasting it costs
+  # no batching and keeps embedding quality.
+  llama-quantize --pure --token-embedding-type q6_K "$SRC" "$DEST.partial" "$PURE_TYPE" 8
+  mv "$DEST.partial" "$DEST"
+  touch "$DEST.pure"
+  [ -n "${CHITTI_KEEP_BF16:-}" ] || rm -f "$SRC"
+elif [ -f "$DEST" ] && { [ -z "$PURE" ] || [ -f "$DEST.pure" ]; }; then
   echo "model already present: $DEST"
   exit 0
+else
+  [ -f "$DEST" ] || { echo "fetching $MODEL $SIZE -> $DEST"; fetch "$DEST" "$URL"; }
+  if [ -n "$PURE" ]; then
+    echo "requantizing $DEST in place ($PURE_TYPE, pure) -- upcast tensors take a second lossy pass"
+    llama-quantize --allow-requantize --pure --token-embedding-type q6_K \
+      "$DEST" "$DEST.partial" "$PURE_TYPE" 8
+    mv "$DEST.partial" "$DEST"
+    touch "$DEST.pure"
+  fi
 fi
-echo "fetching $MODEL $SIZE -> $DEST"
-# `-C -` resumes a prior interrupted download (HF supports byte ranges), so a
-# killed `make model` (e.g. SIGTERM) can pick up the existing `.partial` instead
-# of re-pulling multi-GB weights from scratch. `--retry` covers transient drops.
-curl -fL -C - --retry 5 --retry-delay 2 -o "$DEST.partial" "$URL"
-mv "$DEST.partial" "$DEST"
 echo "done: $DEST"
+# An `if` rather than `[ … ] && echo`: whether `set -e` aborts on the failing
+# test in an AND-list is shell-dependent, and this is the last line — a false
+# test must not make `make model` look like it failed.
+if [ -f "$DEST.pure" ]; then
+  echo "  uniform $PURE_TYPE -- expect \"batched weights: 100%\" from /perf"
+fi

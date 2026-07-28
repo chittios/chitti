@@ -12,6 +12,7 @@ pub mod batch;
 pub mod gguf;
 pub mod model;
 pub mod iq_tables;
+pub mod prefix;
 pub mod refcheck;
 pub mod sampler;
 pub mod tensor;
@@ -453,6 +454,26 @@ pub struct InferBench {
     pub prefill_ms: u64,
     pub n_decode: usize,
     pub decode_ms: u64,
+    /// Prefill cycles split as projections / attention / DeltaNet / elementwise
+    /// (see `model::prefill_phases`). All zero on the per-token path, which does
+    /// not go through `prefill_batched`.
+    pub phases: [u64; 4],
+    /// The three facts that decide what prefill *can* reach, and every one of
+    /// them can be silently absent: cores actually online, FEAT_I8MM (2× the
+    /// MAC/instr of SDOT, and a hypervisor may not pass it through), and whether
+    /// this model takes the window-batched path at all (Gemma does not).
+    ///
+    /// Reported because a slow prefill has these as its first three suspects and
+    /// none of them was previously visible from inside the OS — the same reason
+    /// `smp: N cores online` is ktraced at boot.
+    pub cores: usize,
+    pub i8mm: bool,
+    pub batched: bool,
+    /// Percent of quantized projection bytes with a batched kernel. Batching is
+    /// per tensor, so this — not a yes/no — is what predicts prefill throughput
+    /// on a real GGUF: `llama-quantize` upcasts selected tensors unless `--pure`
+    /// is passed, and a file labelled "Q4_0" can arrive 89% batchable.
+    pub batch_pct: u8,
 }
 
 /// Benchmark inference throughput on a synthetic prompt of `n_prompt` tokens
@@ -483,8 +504,22 @@ pub fn bench_inference(n_prompt: usize, n_decode: usize, pump: &mut dyn FnMut() 
     let vocab = m.vocab().max(3);
     let prompt: Vec<usize> = (0..n_prompt).map(|i| 1 + (i * 97) % (vocab - 2)).collect();
 
+    // Prefill in the same chunks the chat loop feeds (see `shell::Chat::feed`),
+    // so the gauge reports the throughput a user actually gets rather than a
+    // one-shot best case.
+    let chunk = if m.batched_prefill_supported() { 64 } else { 1 };
+    crate::ktrace::log_fmt(format_args!("cortex.bench: prefill chunk {chunk}"));
+    model::reset_prefill_phases();
     let t0 = crate::arch::now_ms();
-    m.prefill(&prompt, 0, &mut kv, &mut state);
+    let mut i = 0usize;
+    while i < prompt.len() {
+        let j = core::cmp::min(i + chunk, prompt.len());
+        m.prefill(&prompt[i..j], i, &mut kv, &mut state);
+        i = j;
+        if pump() {
+            return None;
+        }
+    }
     let prefill_ms = crate::arch::now_ms().saturating_sub(t0);
     crate::ktrace::log_fmt(format_args!("cortex.bench: prefill {n_prompt} done in {prefill_ms} ms"));
     if pump() {
@@ -508,7 +543,21 @@ pub fn bench_inference(n_prompt: usize, n_decode: usize, pump: &mut dyn FnMut() 
     let decode_ms = crate::arch::now_ms().saturating_sub(t1);
     core::hint::black_box(next);
 
-    Some(InferBench { n_prompt, prefill_ms, n_decode, decode_ms })
+    #[cfg(target_arch = "aarch64")]
+    let i8mm = crate::arch::has_i8mm();
+    #[cfg(not(target_arch = "aarch64"))]
+    let i8mm = false;
+    Some(InferBench {
+        n_prompt,
+        prefill_ms,
+        n_decode,
+        decode_ms,
+        phases: model::prefill_phases(),
+        cores: crate::arch::online_cpus(),
+        i8mm,
+        batched: m.batched_prefill_supported(),
+        batch_pct: m.batch_pct(),
+    })
 }
 
 fn bytemuck_ids(ids: &[u32]) -> &[u8] {

@@ -20,6 +20,113 @@ use super::tensor::{self, QK};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Cycles spent in each phase of [`Model::prefill_batched`], accumulated across
+/// every chunk since the last [`reset_prefill_phases`]. Prefill has exactly
+/// three kinds of work and they scale differently — the projections are
+/// weight-stationary matmuls, attention is quadratic in position, and the
+/// DeltaNet recurrence is linear but only parallel across heads — so "prefill is
+/// slow" is three different diagnoses. `/perf` prints the split.
+///
+/// Ordering is `Relaxed` throughout: these are counters read after the fact,
+/// never a synchronisation signal.
+static PHASE_PROJ: AtomicU64 = AtomicU64::new(0);
+static PHASE_ATTN: AtomicU64 = AtomicU64::new(0);
+static PHASE_DELTA: AtomicU64 = AtomicU64::new(0);
+static PHASE_ELEM: AtomicU64 = AtomicU64::new(0);
+
+/// Zero the prefill phase counters (call before a measured run).
+pub fn reset_prefill_phases() {
+    for c in [&PHASE_PROJ, &PHASE_ATTN, &PHASE_DELTA, &PHASE_ELEM] {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Prefill cycles by phase since the last reset: projections, attention core,
+/// DeltaNet core, elementwise (norms/SwiGLU/residuals).
+pub fn prefill_phases() -> [u64; 4] {
+    [
+        PHASE_PROJ.load(Ordering::Relaxed),
+        PHASE_ATTN.load(Ordering::Relaxed),
+        PHASE_DELTA.load(Ordering::Relaxed),
+        PHASE_ELEM.load(Ordering::Relaxed),
+    ]
+}
+
+/// Add the cycles elapsed since `t0` to `c`, and return a fresh timestamp — so
+/// a phase boundary is one call and no interval is double-counted or dropped.
+fn phase_mark(c: &AtomicU64, t0: u64) -> u64 {
+    let now = crate::arch::cycle_count();
+    c.fetch_add(now.wrapping_sub(t0), Ordering::Relaxed);
+    now
+}
+
+/// Where tap `j` of window position `mi` reads from, in a causal depthwise
+/// conv1d of kernel width `ck` run over a whole prefill window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvTap {
+    /// Row `p` of the window's own qkv batch.
+    Window(usize),
+    /// Slot `x` of the conv ring as it stood *entering* the window.
+    Ring(usize),
+}
+
+/// Resolve one tap of the windowed conv1d — pure, so the mapping can be pinned
+/// off-hardware.
+///
+/// The per-position form shifted the ring down a slot and appended the current
+/// vector *before* convolving, so its tap `j` read post-shift slot `j`. Over a
+/// window there is no shift: tap `j` wants the vector at `p = mi + j - (ck-1)`,
+/// which is window row `p` when `p >= 0` and otherwise entering-ring slot
+/// `ck + p` — **not** `ck - 1 + p`, which is where the shift's `-1` tries to
+/// follow you. That off-by-one reads every tap one position too old, which
+/// still produces fluent text, so it is a bug you find by fixture, not by eye.
+pub fn conv_tap(mi: usize, j: usize, ck: usize) -> ConvTap {
+    let p = mi as isize + j as isize - (ck as isize - 1);
+    if p >= 0 {
+        ConvTap::Window(p as usize)
+    } else {
+        ConvTap::Ring((ck as isize + p) as usize)
+    }
+}
+
+/// Advance the conv ring past an `m`-position window, in place.
+///
+/// New slot `j` must hold the qkv vector at window index `m - ck + j`: inside
+/// the window when that is non-negative, else the old ring's slot `m + j`.
+/// Reading from a strictly higher index makes the carry-over a forward
+/// in-place copy.
+pub fn advance_conv_ring(ring: &mut [f32], qkv: &[f32], m: usize, conv_dim: usize, ck: usize) {
+    if m >= ck {
+        ring.copy_from_slice(&qkv[(m - ck) * conv_dim..m * conv_dim]);
+    } else {
+        let keep = ck - m; // slots that survive from the old ring
+        ring.copy_within(m * conv_dim.., 0);
+        ring[keep * conv_dim..].copy_from_slice(&qkv[..m * conv_dim]);
+    }
+}
+
+/// `parallel_for`'s `min_chunk` for a fan-out of roughly `work` multiply-adds:
+/// `1` (split freely) once the job outweighs a fleet wake, else a value large
+/// enough that `parallel_for` keeps the whole range inline.
+///
+/// This exists because the DeltaNet recurrence is *always* parallel across
+/// heads, at every window size — but at a decode step's one position it is only
+/// ~0.8M MACs a layer, and fanning that out measured **slower** than running it
+/// inline (35 -> 20 tok/s of decode: 36 extra fleet wakes a token bought less
+/// work than they cost). Parallelism that is available is not automatically
+/// parallelism that is worth taking.
+fn fanout_chunk(work: usize) -> usize {
+    /// Measured on the 0.8B under HVF: below roughly this much work per
+    /// dispatch, the wake + barrier dominates.
+    const WORTH_A_WAKE: usize = 4 << 20;
+    if work >= WORTH_A_WAKE {
+        1
+    } else {
+        usize::MAX
+    }
+}
 
 /// A quantized weight tensor: its raw bytes plus the GGUF quant type, so the
 /// matvec can pick the right kernel per tensor (the 9B GGUF mixes Q4_0, Q4_1,
@@ -193,13 +300,42 @@ pub struct Model<'a> {
     output_norm: &'a [f32],
     layers: Vec<Layer<'a>>,
     vocab: usize,
-    /// `Some(qt)` when every weight tensor shares one quant type `qt` that has
-    /// a weight-stationary batched matmul kernel (Q8_0 for the 0.8B, Q1_0/Q2_0
-    /// for the Bonsai binary/ternary builds) -- enables batched prefill;
-    /// mixed-quant models (9B) prefill sequentially. Only consulted on aarch64
-    /// (the arch with batched matmul kernels).
+    /// Whether prefill takes the window-batched path. Deliberately **not** a
+    /// function of the quant mix: [`Model::batched_proj`] batches the tensors
+    /// whose type has a weight-stationary kernel and applies the rest a position
+    /// at a time, so a mixed file loses only the amortization on its
+    /// non-batchable tensors instead of dropping the whole model to the
+    /// per-token path. Gemma is excluded because `prefill_batched` has no
+    /// implementation for its attention layer shape.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-    batch_qt: Option<u32>,
+    batched: bool,
+    /// Percent of quantized *projection* bytes whose quant type has a batched
+    /// kernel. Reported by `/perf`, because "batched prefill" stopped being a
+    /// yes/no once batching became per tensor — and because this number is the
+    /// one that predicts prefill throughput on a real-world GGUF.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    batch_pct: u8,
+}
+
+/// Whether `qt` has a weight-stationary batched matmul kernel, i.e. whether a
+/// projection with this quant type can be applied to a whole prefill window in
+/// one pass over the weights.
+///
+/// Q8_0/Q1_0/Q2_0 have SDOT kernels on any aarch64; Q4_0's batched kernel is
+/// i8mm-only, so it depends on a runtime CPU capability (and a hypervisor can
+/// withhold it — VirtualBox does). Everything else — the K-quants, Q4_1, the
+/// i-quants — has none, and falls back per tensor.
+#[cfg(target_arch = "aarch64")]
+fn has_batched_kernel(qt: u32) -> bool {
+    match qt {
+        tensor::QT_Q8_0 | tensor::QT_Q1_0 | tensor::QT_Q2_0 => true,
+        tensor::QT_Q4_0 => crate::arch::has_i8mm(),
+        _ => false,
+    }
+}
+#[cfg(not(target_arch = "aarch64"))]
+fn has_batched_kernel(_qt: u32) -> bool {
+    false
 }
 
 /// Reusable per-forward scratch (no per-token allocation).
@@ -283,6 +419,12 @@ impl State {
 /// Per-stream cache: KV history for attention layers (a fixed W-slot ring on
 /// sliding-window layers), recurrent state + conv ring for gated-DeltaNet
 /// layers.
+///
+/// `Clone` is what makes the prefix cache (`cortex::prefix`) possible: a
+/// prefilled system prompt is kept as a snapshot and cloned back in, rather than
+/// prefilled again. It has to be a copy, not a borrow — decoding mutates the KV
+/// in place, so the snapshot would not survive the turn it seeded.
+#[derive(Clone)]
 pub struct Cache {
     attn_k: Vec<Vec<f32>>, // [layer] -> flattened [pos * (n_kv*head_dim)] (or a W-slot ring)
     attn_v: Vec<Vec<f32>>,
@@ -339,6 +481,25 @@ impl Cache {
 
     pub fn len(&self) -> usize {
         self.positions
+    }
+
+    /// Heap bytes this cache holds — what a snapshot of it costs to keep.
+    ///
+    /// Measured from `len`, not `capacity`: a clone allocates exactly the live
+    /// length, so this is the size of the copy the prefix cache would store, and
+    /// budgeting on capacity would over-charge a cache that had grown and been
+    /// rebuilt. The attention halves scale with position; the DeltaNet state and
+    /// conv ring are fixed per layer.
+    pub fn bytes(&self) -> usize {
+        let f32s: usize = self
+            .attn_k
+            .iter()
+            .chain(self.attn_v.iter())
+            .chain(self.delta_s.iter())
+            .chain(self.conv.iter())
+            .map(|v| v.len())
+            .sum();
+        f32s * core::mem::size_of::<f32>() + self.ring.len()
     }
     pub fn is_empty(&self) -> bool {
         self.positions == 0
@@ -476,46 +637,62 @@ impl<'a> Model<'a> {
             });
         }
 
-        // A uniform quant type with a weight-stationary matmul kernel (Q8_0 for
-        // the 0.8B, Q1_0/Q2_0 for the Bonsai binary/ternary builds) unlocks the
-        // batched-prefill fast path; mixed-quant models fall back to sequential
-        // prefill.
-        let bq = token_embd.qt;
-        let same = |w: QWeight| w.qt == bq;
-        let uniform = output.map(same).unwrap_or(true)
-            && layers.iter().all(|ly| {
-                same(ly.ffn_gate)
-                    && same(ly.ffn_up)
-                    && same(ly.ffn_down)
-                    && match ly.kind {
-                        LayerKind::Attn { q, k, v, o, .. } => same(q) && same(k) && same(v) && same(o),
-                        LayerKind::Delta { qkv, gate, alpha, beta, out, .. } => {
-                            same(qkv) && same(gate) && same(alpha) && same(beta) && same(out)
-                        }
-                        // The batched-prefill fast path is qwen-shaped; gemma
-                        // always prefills sequentially.
-                        LayerKind::GemmaAttn { .. } => false,
+        // Batching is decided **per tensor**, not per model. The old gate
+        // required one uniform quant type across every weight and anchored it on
+        // `token_embd.qt` — which is the worst possible anchor, because prefill
+        // never batches `token_embd` at all (it is a row lookup via
+        // `dequant_embed_row`, plus one `matvec_qw` for the final position when
+        // the output is tied).
+        //
+        // Real GGUFs are almost never uniform. `llama-quantize` upcasts selected
+        // tensors unless `--pure` is passed, so a file *labelled* Q4_0 arrives as
+        // Q4_0 + Q8_0 + Q5_K + Q4_1 with `token_embd` at Q6_K — and the old gate
+        // read that one Q6_K tensor and put the entire 4B model on the per-token
+        // path, forfeiting batching for the 89% of its projection bytes that do
+        // have a kernel. Now each projection takes the batched kernel when its own
+        // type has one and falls back to per-position matvecs when it does not.
+        let mut batchable = 0usize;
+        let mut quantized = 0usize;
+        {
+            let mut acct = |w: QWeight| {
+                quantized += w.data.len();
+                if has_batched_kernel(w.qt) {
+                    batchable += w.data.len();
+                }
+            };
+            for ly in &layers {
+                acct(ly.ffn_gate);
+                acct(ly.ffn_up);
+                acct(ly.ffn_down);
+                match ly.kind {
+                    LayerKind::Attn { q, k, v, o, .. } => {
+                        acct(q);
+                        acct(k);
+                        acct(v);
+                        acct(o);
                     }
-            });
-        // Q8_0/Q1_0/Q2_0 have a batched matmul on any target. Q4_0 (2B/4B) gets
-        // batched prefill only where the i8mm kernel applies — there is no SDOT
-        // batched Q4_0, so without FEAT_I8MM those models keep sequential
-        // prefill (as before). `has_i8mm` is a runtime-constant CPU capability,
-        // fine to fold into this load-time gate.
-        let q4_0_i8mm = {
-            #[cfg(target_arch = "aarch64")]
-            {
-                bq == tensor::QT_Q4_0 && crate::arch::has_i8mm()
+                    LayerKind::Delta { qkv, gate, alpha, beta, out, .. } => {
+                        acct(qkv);
+                        acct(gate);
+                        acct(alpha);
+                        acct(beta);
+                        acct(out);
+                    }
+                    // Gemma never reaches the batched path; leave it out of the
+                    // accounting rather than reporting a figure that cannot apply.
+                    LayerKind::GemmaAttn { .. } => {}
+                }
             }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                false
-            }
-        };
-        let has_matmul = matches!(bq, tensor::QT_Q8_0 | tensor::QT_Q1_0 | tensor::QT_Q2_0) || q4_0_i8mm;
-        let batch_qt = (uniform && has_matmul).then_some(bq);
+        }
+        let batch_pct = if quantized == 0 { 0 } else { (batchable * 100 / quantized) as u8 };
+        // The window-batched path is worth taking even at 0% batchable weights:
+        // the attention core fans out over positions and the DeltaNet core over
+        // heads (with the position loop inside), the conv ring advances once per
+        // window instead of once per position, and the matvec work in the
+        // fallback is exactly what the per-token path would have done anyway.
+        let batched = cfg!(target_arch = "aarch64") && c.family != Family::Gemma4;
 
-        Ok(Self { config: c, gguf, token_embd, output, output_norm, layers, vocab, batch_qt })
+        Ok(Self { config: c, gguf, token_embd, output, output_norm, layers, vocab, batched, batch_pct })
     }
 
     pub fn vocab(&self) -> usize {
@@ -527,7 +704,15 @@ impl<'a> Model<'a> {
     /// instead feed chunks through `prefill` when this is true — each weight
     /// is then read once per chunk instead of once per token.
     pub fn batched_prefill_supported(&self) -> bool {
-        cfg!(target_arch = "aarch64") && self.batch_qt.is_some()
+        self.batched
+    }
+
+    /// Percent of quantized projection bytes with a batched kernel — see
+    /// [`Model::batch_pct`]'s field docs. 100 means every projection is
+    /// weight-stationary; 0 means every one falls back to per-position matvecs
+    /// (the window-parallel attention/DeltaNet cores still apply).
+    pub fn batch_pct(&self) -> u8 {
+        self.batch_pct
     }
     pub fn token_str(&self, id: usize) -> &str {
         self.gguf.tokens.get(id).copied().unwrap_or("")
@@ -561,7 +746,7 @@ impl<'a> Model<'a> {
         // cores -- just far less weight bandwidth. x86 (TCG, no batched matmul
         // kernel) uses the sequential path; prefill still works, just slower.
         #[cfg(target_arch = "aarch64")]
-        if prompt.len() >= 2 && self.batch_qt.is_some() {
+        if prompt.len() >= 2 && self.batched {
             self.prefill_batched(prompt, pos0, cache, state);
             return;
         }
@@ -598,7 +783,11 @@ impl<'a> Model<'a> {
         let mut k = alloc::vec![0.0f32; m * kv_dim];
         let mut v = alloc::vec![0.0f32; m * kv_dim];
         let mut attn_out = alloc::vec![0.0f32; m * ao];
+        // One scores row per position, each `pos0 + mi + 1` long — the rows must
+        // be separate because every position's attention runs concurrently.
+        let mut scores = alloc::vec![0.0f32; m * (pos0 + m)];
         let mut qkv = alloc::vec![0.0f32; m * conv_dim];
+        let mut conv_act = alloc::vec![0.0f32; m * conv_dim];
         let mut z = alloc::vec![0.0f32; m * value_dim];
         let mut gates = alloc::vec![0.0f32; m * nh];
         let mut betas = alloc::vec![0.0f32; m * nh];
@@ -616,11 +805,15 @@ impl<'a> Model<'a> {
             dequant_embed_row(self.token_embd, tok, &mut hidden[mi * dim..(mi + 1) * dim]);
         }
 
+        // Phase timing: see `prefill_phases`. `t` is advanced at every boundary
+        // by `phase_mark`, so the four counters partition the loop exactly.
+        let mut t = crate::arch::cycle_count();
         for l in 0..self.layers.len() {
             // rmsnorm(attn_norm) per position.
             for mi in 0..m {
                 tensor::rmsnorm(&hidden[mi * dim..(mi + 1) * dim], self.layers[l].attn_norm, c.rms_eps, &mut norm[mi * dim..(mi + 1) * dim]);
             }
+            t = phase_mark(&PHASE_ELEM, t);
 
             match &self.layers[l].kind {
                 LayerKind::Attn { q: q_w, k: k_w, v: v_w, o: o_w, .. } => {
@@ -628,18 +821,13 @@ impl<'a> Model<'a> {
                     self.batched_proj(q_w, &norm, &mut q, &mut xq, &mut xs, m, qdim, dim);
                     self.batched_proj(k_w, &norm, &mut k, &mut xq, &mut xs, m, kv_dim, dim);
                     self.batched_proj(v_w, &norm, &mut v, &mut xq, &mut xs, m, kv_dim, dim);
-                    for mi in 0..m {
-                        s.q.copy_from_slice(&q[mi * qdim..(mi + 1) * qdim]);
-                        s.k.copy_from_slice(&k[mi * kv_dim..(mi + 1) * kv_dim]);
-                        s.v.copy_from_slice(&v[mi * kv_dim..(mi + 1) * kv_dim]);
-                        self.attn_core(l, pos0 + mi, cache, s);
-                        attn_out[mi * ao..(mi + 1) * ao].copy_from_slice(&s.attn_out[..ao]);
-                    }
+                    t = phase_mark(&PHASE_PROJ, t);
+                    self.attn_core_batched(l, pos0, m, &mut q, &mut k, &v, cache, &mut scores, &mut attn_out);
+                    t = phase_mark(&PHASE_ATTN, t);
                     self.batched_proj(o_w, &attn_out, &mut proj_out, &mut xq, &mut xs, m, dim, ao);
                 }
-                // Batched prefill is gated on `batch_qt`, which is always
-                // false for Gemma models (see `Model::load`), so this arm can
-                // never be reached.
+                // The window path is never taken for Gemma (see `Model::load`
+                // sets `batched` false there), so this arm cannot be reached.
                 LayerKind::GemmaAttn { .. } => unreachable!("gemma never takes the batched-prefill path"),
                 LayerKind::Delta { qkv: qkv_w, gate: gate_w, alpha: alpha_w, beta: beta_w, out: out_w, .. } => {
                     let (qkv_w, gate_w, alpha_w, beta_w, out_w) = (*qkv_w, *gate_w, *alpha_w, *beta_w, *out_w);
@@ -647,17 +835,15 @@ impl<'a> Model<'a> {
                     self.batched_proj(gate_w, &norm, &mut z, &mut xq, &mut xs, m, value_dim, dim);
                     self.batched_proj(alpha_w, &norm, &mut gates, &mut xq, &mut xs, m, nh, dim);
                     self.batched_proj(beta_w, &norm, &mut betas, &mut xq, &mut xs, m, nh, dim);
-                    for mi in 0..m {
-                        s.qkv.copy_from_slice(&qkv[mi * conv_dim..(mi + 1) * conv_dim]);
-                        s.z.copy_from_slice(&z[mi * value_dim..(mi + 1) * value_dim]);
-                        s.gates[..nh].copy_from_slice(&gates[mi * nh..(mi + 1) * nh]);
-                        s.betas[..nh].copy_from_slice(&betas[mi * nh..(mi + 1) * nh]);
-                        self.delta_core(l, cache, s);
-                        delta_o[mi * value_dim..(mi + 1) * value_dim].copy_from_slice(&s.delta_o[..value_dim]);
-                    }
+                    t = phase_mark(&PHASE_PROJ, t);
+                    self.delta_core_batched(
+                        l, cache, m, &qkv, &z, &mut gates, &mut betas, &mut conv_act, &mut delta_o,
+                    );
+                    t = phase_mark(&PHASE_DELTA, t);
                     self.batched_proj(out_w, &delta_o, &mut proj_out, &mut xq, &mut xs, m, dim, value_dim);
                 }
             }
+            t = phase_mark(&PHASE_PROJ, t);
             // Residual after the attn/delta block.
             for i in 0..m * dim {
                 hidden[i] += proj_out[i];
@@ -667,15 +853,20 @@ impl<'a> Model<'a> {
             for mi in 0..m {
                 tensor::rmsnorm(&hidden[mi * dim..(mi + 1) * dim], self.layers[l].post_norm, c.rms_eps, &mut norm[mi * dim..(mi + 1) * dim]);
             }
+            t = phase_mark(&PHASE_ELEM, t);
             self.batched_proj(self.layers[l].ffn_gate, &norm, &mut ffn_gate, &mut xq, &mut xs, m, ffn, dim);
             self.batched_proj(self.layers[l].ffn_up, &norm, &mut ffn_up, &mut xq, &mut xs, m, ffn, dim);
+            t = phase_mark(&PHASE_PROJ, t);
             for i in 0..m * ffn {
                 ffn_act[i] = tensor::silu(ffn_gate[i]) * ffn_up[i];
             }
+            t = phase_mark(&PHASE_ELEM, t);
             self.batched_proj(self.layers[l].ffn_down, &ffn_act, &mut proj_out, &mut xq, &mut xs, m, dim, ffn);
+            t = phase_mark(&PHASE_PROJ, t);
             for i in 0..m * dim {
                 hidden[i] += proj_out[i];
             }
+            t = phase_mark(&PHASE_ELEM, t);
         }
 
         // Only the final position's logits are needed to pick the first token.
@@ -690,9 +881,32 @@ impl<'a> Model<'a> {
     /// vectors (`input[mi*cols..]`) to int8, then run one matmul that reads the
     /// weight once and writes `out[mi*rows + r]`. `xq`/`xs` are packed tightly
     /// with stride `cols`/`cols/QK` (the layout `matmul_q8_0_sdot_rows` expects).
+    ///
+    /// **Per tensor, not per model.** A quant type with no batched kernel is
+    /// applied a position at a time instead of disqualifying the whole model —
+    /// see the note in [`Model::load`]. The fallback is bit-identical to the
+    /// per-token path (same `matvec_qw`, same order), and `matvec_qw` still
+    /// splits its rows across the fleet, so the only thing lost on those tensors
+    /// is the weight-read amortization.
     #[cfg(target_arch = "aarch64")]
     fn batched_proj(&self, w: QWeight, input: &[f32], out: &mut [f32], xq: &mut [i8], xs: &mut [f32], m: usize, rows: usize, cols: usize) {
-        debug_assert_eq!(Some(w.qt), self.batch_qt); // batched prefill needs the uniform batch quant
+        if !has_batched_kernel(w.qt) {
+            // Row-major `out` means position `mi`'s outputs are the contiguous
+            // run `out[mi*rows .. (mi+1)*rows]` — the same layout a matvec
+            // writes, so this needs no gather.
+            for mi in 0..m {
+                matvec_qw(
+                    w,
+                    &input[mi * cols..(mi + 1) * cols],
+                    &mut out[mi * rows..(mi + 1) * rows],
+                    xq,
+                    xs,
+                    rows,
+                    cols,
+                );
+            }
+            return;
+        }
         let nb = cols / QK;
         for mi in 0..m {
             tensor::quantize_activations_q8(
@@ -724,14 +938,36 @@ impl<'a> Model<'a> {
                 tensor::QT_Q8_0 if m >= 2 && crate::arch::has_i8mm() => crate::arch::aarch64::smp::matmul_q8_0_i8mm(
                     w.data.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols,
                 ),
-                // Q4_0: batch_qt is only Some(Q4_0) when has_i8mm() (no SDOT
-                // batched Q4_0), so this arm is the only Q4_0 path here.
-                tensor::QT_Q4_0 if m >= 2 && crate::arch::has_i8mm() => crate::arch::aarch64::smp::matmul_q4_0_i8mm(
+                // Q4_0's only batched kernel is the i8mm one, and
+                // `has_batched_kernel` reports Q4_0 batchable *only* when the CPU
+                // has FEAT_I8MM — so reaching here means m == 1 (a one-position
+                // window), which the matvec below handles.
+                tensor::QT_Q4_0 if m >= 2 => crate::arch::aarch64::smp::matmul_q4_0_i8mm(
                     w.data.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols,
                 ),
-                _ => crate::arch::aarch64::smp::matmul_sdot(
+                // Q8_0 without i8mm: the SDOT batched matmul. Named explicitly —
+                // this arm used to be a catch-all `_`, which would have silently
+                // read *any* quant type's bytes as Q8_0 once batching stopped
+                // requiring a uniform model. Anything else cannot reach here
+                // (`has_batched_kernel` gated it into the fallback above), so an
+                // unreachable is the honest arm rather than a wrong answer.
+                tensor::QT_Q8_0 => crate::arch::aarch64::smp::matmul_sdot(
                     w.data.as_ptr(), xq.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), m, rows, cols,
                 ),
+                // m == 1 for a type whose batched kernel needs a column pair.
+                _ => {
+                    for mi in 0..m {
+                        matvec_qw(
+                            w,
+                            &input[mi * cols..(mi + 1) * cols],
+                            &mut out[mi * rows..(mi + 1) * rows],
+                            xq,
+                            xs,
+                            rows,
+                            cols,
+                        );
+                    }
+                }
             }
         }
     }
@@ -947,18 +1183,51 @@ impl<'a> Model<'a> {
         matvec_qw(o_w, &s.attn_out[..nq * hd], &mut s.proj, &mut s.xq, &mut s.xs, dim, nq * hd);
     }
 
-    /// The position-sequential part of an attention layer, shared by decode
-    /// (`attn_layer`) and batched prefill: QK-norm + partial RoPE, append K/V to
-    /// this layer's history, GQA causal attention, per-head sigmoid gate. Reads
-    /// the projections in `s.q`/`s.k`/`s.v`; writes `s.attn_out`. Kept separate
-    /// so the projections above can be batched across positions while this
-    /// (cheap, order-dependent) core stays identical -- parity by construction.
+    /// The position-sequential part of an attention layer for a single position
+    /// — decode's entry point. A one-position window through
+    /// [`Model::attn_core_batched`], so decode and prefill run the same code and
+    /// cannot drift.
     fn attn_core(&self, l: usize, pos: usize, cache: &mut Cache, s: &mut State) {
+        self.attn_core_batched(l, pos, 1, &mut s.q, &mut s.k, &s.v, cache, &mut s.scores, &mut s.attn_out);
+    }
+
+    /// The "position-sequential" part of an attention layer over a whole
+    /// `m`-position prefill window: QK-norm + partial RoPE, append K/V to this
+    /// layer's history, GQA causal attention, per-head sigmoid gate. Reads the
+    /// batched projections in `q`/`k`/`v` (row stride `qdim`/`kv_dim`); writes
+    /// `out` (row stride `n_head*head_dim`).
+    ///
+    /// **It is not actually sequential.** Attention at position `mi` reads the
+    /// K/V prefix `0..=pos0+mi`, all of which is known once the batched K/V
+    /// projections have been written — so every `(position, head)` pair is
+    /// independent and the window fans out across the fleet. Doing it a position
+    /// at a time (as this did) left the whole causal core on one core while the
+    /// projections used all of them, which is most of why prefill throughput sat
+    /// near decode throughput instead of an order above it.
+    ///
+    /// The arithmetic per `(position, head)` is unchanged and in the same order,
+    /// so the result is bit-identical to the per-position loop — the reference
+    /// fixtures (`cargo xtask ref-check`) hold it to that.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_core_batched(
+        &self,
+        l: usize,
+        pos0: usize,
+        m: usize,
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &[f32],
+        cache: &mut Cache,
+        scores: &mut [f32],
+        out: &mut [f32],
+    ) {
         let c = &self.config;
         let hd = c.head_dim;
         let nq = c.head_count;
         let nkv = c.head_count_kv;
         let kv_dim = nkv * hd;
+        let qdim = nq * hd * 2; // query+gate interleaved
+        let ao = nq * hd;
         let group = nq / nkv;
         let scale = 1.0 / tensor_sqrtf(hd as f32);
         let (q_norm, k_norm) = match &self.layers[l].kind {
@@ -966,45 +1235,121 @@ impl<'a> Model<'a> {
             _ => unreachable!(),
         };
 
-        // QK-norm per head, partial RoPE on the first rope_dim dims.
-        for h in 0..nq {
-            let q = &mut s.q[h * 2 * hd..h * 2 * hd + hd]; // query half of this head
-            tensor::rmsnorm_inplace(q, q_norm, c.rms_eps);
-            tensor::rope(&mut q[0..c.rope_dim], pos, c.rope_dim, c.rope_freq_base);
-        }
-        for h in 0..nkv {
-            let k = &mut s.k[h * hd..(h + 1) * hd];
-            tensor::rmsnorm_inplace(k, k_norm, c.rms_eps);
-            tensor::rope(&mut k[0..c.rope_dim], pos, c.rope_dim, c.rope_freq_base);
-        }
-
-        // Append k,v to this layer's KV history.
-        cache.attn_k[l].extend_from_slice(&s.k);
-        cache.attn_v[l].extend_from_slice(&s.v);
-
-        // GQA causal attention with per-head sigmoid output gate.
-        for h in 0..nq {
-            let kvh = h / group;
-            let q_head = &s.q[h * 2 * hd..h * 2 * hd + hd];
-            for t in 0..=pos {
-                let k_t = &cache.attn_k[l][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd];
-                s.scores[t] = tensor::dot_f32(q_head, k_t) * scale;
+        // QK-norm per head, partial RoPE on the first rope_dim dims. Position
+        // `mi`'s rotation depends only on its own absolute position, so this is
+        // order-independent even though it is written as a loop.
+        for mi in 0..m {
+            let pos = pos0 + mi;
+            for h in 0..nq {
+                let qh = &mut q[mi * qdim + h * 2 * hd..mi * qdim + h * 2 * hd + hd];
+                tensor::rmsnorm_inplace(qh, q_norm, c.rms_eps);
+                tensor::rope(&mut qh[0..c.rope_dim], pos, c.rope_dim, c.rope_freq_base);
             }
-            tensor::softmax(&mut s.scores[0..=pos]);
-            let out = &mut s.attn_out[h * hd..(h + 1) * hd];
-            out.iter_mut().for_each(|x| *x = 0.0);
-            for t in 0..=pos {
-                let v_t = &cache.attn_v[l][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd];
-                let w = s.scores[t];
-                for i in 0..hd {
-                    out[i] += w * v_t[i];
+            for h in 0..nkv {
+                let kh = &mut k[mi * kv_dim + h * hd..mi * kv_dim + (h + 1) * hd];
+                tensor::rmsnorm_inplace(kh, k_norm, c.rms_eps);
+                tensor::rope(&mut kh[0..c.rope_dim], pos, c.rope_dim, c.rope_freq_base);
+            }
+        }
+
+        // Append the window's K/V in one extend: the batch buffers already carry
+        // the cache's `[pos][kv_dim]` layout, so this is one copy, not `m`.
+        cache.attn_k[l].extend_from_slice(&k[..m * kv_dim]);
+        cache.attn_v[l].extend_from_slice(&v[..m * kv_dim]);
+
+        /// Shared, immutable view for the fan-out below. Raw pointers because
+        /// `parallel_for` takes a plain `fn` — every worker reads `q`/`kc`/`vc`
+        /// and writes only its own positions' `scores`/`out` rows.
+        struct Ctx {
+            q: *const f32,
+            kc: *const f32,
+            vc: *const f32,
+            scores: *mut f32,
+            out: *mut f32,
+            pos0: usize,
+            nq: usize,
+            hd: usize,
+            kv_dim: usize,
+            group: usize,
+            qdim: usize,
+            ao: usize,
+            sl: usize,
+            scale: f32,
+        }
+        /// # Safety
+        /// `ctx` is the live `Ctx` published below and `[start, end)` is a range
+        /// of positions disjoint from every other worker's, so the `scores` and
+        /// `out` rows written here are touched by no one else.
+        unsafe fn positions(start: usize, end: usize, ctx: *mut u8) {
+            // SAFETY: the caller passes the `Ctx` published below, which outlives
+            // the `parallel_for` call.
+            let c = unsafe { &*(ctx as *const Ctx) };
+            for mi in start..end {
+                let pos = c.pos0 + mi;
+                // SAFETY: this worker owns position `mi`, and `sl >= pos + 1`.
+                let sc = unsafe { core::slice::from_raw_parts_mut(c.scores.add(mi * c.sl), pos + 1) };
+                for h in 0..c.nq {
+                    let kvh = h / c.group;
+                    // SAFETY: `q` holds `m` rows of `qdim`; head `h`'s query half
+                    // is `hd` wide at `h * 2 * hd`.
+                    let q_head =
+                        unsafe { core::slice::from_raw_parts(c.q.add(mi * c.qdim + h * 2 * c.hd), c.hd) };
+                    for t in 0..=pos {
+                        // SAFETY: the cache holds at least `pos + 1` rows of `kv_dim`.
+                        let k_t =
+                            unsafe { core::slice::from_raw_parts(c.kc.add(t * c.kv_dim + kvh * c.hd), c.hd) };
+                        sc[t] = tensor::dot_f32(q_head, k_t) * c.scale;
+                    }
+                    tensor::softmax(sc);
+                    // SAFETY: `out` holds `m` rows of `ao`; this worker owns row `mi`.
+                    let o = unsafe { core::slice::from_raw_parts_mut(c.out.add(mi * c.ao + h * c.hd), c.hd) };
+                    o.iter_mut().for_each(|x| *x = 0.0);
+                    for t in 0..=pos {
+                        // SAFETY: as `k_t` above.
+                        let v_t =
+                            unsafe { core::slice::from_raw_parts(c.vc.add(t * c.kv_dim + kvh * c.hd), c.hd) };
+                        let w = sc[t];
+                        for i in 0..c.hd {
+                            o[i] += w * v_t[i];
+                        }
+                    }
+                    // gate is the second half of head h's slice in `q`
+                    // SAFETY: the gate half sits `hd` past the query half.
+                    let gate = unsafe {
+                        core::slice::from_raw_parts(c.q.add(mi * c.qdim + h * 2 * c.hd + c.hd), c.hd)
+                    };
+                    for i in 0..c.hd {
+                        o[i] *= tensor::sigmoid(gate[i]);
+                    }
                 }
             }
-            // gate is the second half of head h's slice in s.q
-            for i in 0..hd {
-                out[i] *= tensor::sigmoid(s.q[h * 2 * hd + hd + i]);
-            }
         }
+        let mut ctx = Ctx {
+            q: q.as_ptr(),
+            kc: cache.attn_k[l].as_ptr(),
+            vc: cache.attn_v[l].as_ptr(),
+            scores: scores.as_mut_ptr(),
+            out: out.as_mut_ptr(),
+            pos0,
+            nq,
+            hd,
+            kv_dim,
+            group,
+            qdim,
+            ao,
+            sl: pos0 + m,
+            scale,
+        };
+        // One position is a real unit of work here (`nq * pos` dot products), so
+        // a chunk of 1 is worth handing out; `parallel_for` still runs a whole
+        // window inline when it is too small to split (decode's `m == 1`). The
+        // static split is by position count, not by cost — work grows with
+        // `pos0 + mi`, so the split is slightly uneven on the very first chunk
+        // (`pos0 == 0`, where attention is cheapest anyway) and within a few
+        // percent once `pos0 >> m`.
+        // SAFETY: `positions` is safe on disjoint position ranges sharing `ctx`,
+        // and `ctx` lives until `parallel_for` returns.
+        unsafe { crate::arch::parallel_for(m, 1, positions, &mut ctx as *mut Ctx as *mut u8) };
     }
 
     fn delta_layer(&self, l: usize, cache: &mut Cache, s: &mut State) {
@@ -1030,16 +1375,60 @@ impl<'a> Model<'a> {
         matvec_qw(out_w, &s.delta_o, &mut s.proj, &mut s.xq, &mut s.xs, dim, value_dim);
     }
 
-    /// The position-sequential (recurrent) part of a DeltaNet layer, shared by
-    /// decode (`delta_layer`) and batched prefill: gate/beta activation, causal
-    /// conv1d over the ring, and the gated delta rule that advances the
-    /// recurrent state. Reads the projections in `s.qkv`/`s.z`/`s.gates`
-    /// (=alpha)/`s.betas`; writes `s.delta_o`. Split out so the projections can
-    /// be batched while this order-dependent recurrence stays identical.
+    /// One position through the DeltaNet recurrence — decode's entry point. A
+    /// one-position window through [`Model::delta_core_batched`], so decode and
+    /// prefill run the same code and cannot drift.
     fn delta_core(&self, l: usize, cache: &mut Cache, s: &mut State) {
+        self.delta_core_batched(
+            l,
+            cache,
+            1,
+            &s.qkv,
+            &s.z,
+            &mut s.gates,
+            &mut s.betas,
+            &mut s.conv,
+            &mut s.delta_o,
+        );
+    }
+
+    /// The recurrent part of a DeltaNet layer over an `m`-position prefill
+    /// window: gate/beta activation, causal conv1d, and the gated delta rule
+    /// that advances the recurrent state. Reads the batched projections in
+    /// `qkv`/`z`/`gates` (=alpha)/`betas`; writes `out` (row stride `inner`).
+    /// `conv` is `m * conv_dim` of scratch.
+    ///
+    /// The recurrence is sequential **in position** but completely independent
+    /// **per head** — head `h` owns its own `hk×hv` state slice and never reads
+    /// another's. So the parallel axis is the head, with the position loop
+    /// *inside* it: one `parallel_for` per layer rather than one per position,
+    /// which is what makes the fan-out worth its barrier (a 64-token window is
+    /// 64 barriers per layer the other way round). Everything before it — the
+    /// activations and the conv — is position-independent.
+    ///
+    /// Two things the per-position version paid for that the window does not:
+    /// the conv ring was **shifted down a slot per position** (`(ck-1)*conv_dim`
+    /// floats — 72 KiB a token on the 0.8B, per layer), and each head
+    /// re-allocated its `q`/`k` copies on the heap every position. The window
+    /// reads its history straight out of the batch and updates the ring once,
+    /// and the per-head copies live on the stack.
+    #[allow(clippy::too_many_arguments)]
+    fn delta_core_batched(
+        &self,
+        l: usize,
+        cache: &mut Cache,
+        m: usize,
+        qkv: &[f32],
+        z: &[f32],
+        gates: &mut [f32],
+        betas: &mut [f32],
+        conv: &mut [f32],
+        out: &mut [f32],
+    ) {
         let c = &self.config;
         let ssm = c.ssm.expect("delta core requires ssm config");
         let conv_dim = ssm.conv_dim();
+        let value_dim = ssm.inner;
         let nh = ssm.dt_rank; // value heads
         let hk = ssm.state;
         let hv = ssm.head_dim();
@@ -1055,78 +1444,215 @@ impl<'a> Model<'a> {
         };
 
         // g = -exp(A_log) * softplus(alpha + dt_bias)  (log-decay); beta = sigmoid.
-        for h in 0..nh {
-            let a = -tensor::expf(a_log[h]);
-            let g = a * tensor::softplus(s.gates[h] + dt_bias[h]);
-            s.gates[h] = tensor::expf(g); // decay multiplier in (0,1)
-            s.betas[h] = tensor::sigmoid(s.betas[h]);
-        }
-
-        // Causal depthwise conv1d over the conv ring (last `ck` qkv vectors)
-        // + SiLU. Ring layout: conv[j*conv_dim + c], j=0 oldest .. ck-1 newest.
-        let ring = &mut cache.conv[l];
-        // shift older, append current qkv at the newest slot
-        for j in 0..ck - 1 {
-            let (a, b) = ring.split_at_mut((j + 1) * conv_dim);
-            a[j * conv_dim..(j + 1) * conv_dim].copy_from_slice(&b[..conv_dim]);
-        }
-        ring[(ck - 1) * conv_dim..].copy_from_slice(&s.qkv);
-        for cidx in 0..conv_dim {
-            let mut acc = 0.0f32;
-            for j in 0..ck {
-                acc += ring[j * conv_dim + cidx] * conv1d[cidx * ck + j];
+        for mi in 0..m {
+            for h in 0..nh {
+                let a = -tensor::expf(a_log[h]);
+                let g = a * tensor::softplus(gates[mi * nh + h] + dt_bias[h]);
+                gates[mi * nh + h] = tensor::expf(g); // decay multiplier in (0,1)
+                betas[mi * nh + h] = tensor::sigmoid(betas[mi * nh + h]);
             }
-            s.conv[cidx] = tensor::silu(acc);
         }
 
-        // Recurrent gated delta rule per head.
+        // Causal depthwise conv1d + SiLU over the window. Tap `j` of position
+        // `mi` is the qkv vector at `p = mi + j - (ck-1)`: inside the window for
+        // `p >= 0`, else out of the carried-in ring. The ring runs slot 0 oldest
+        // .. ck-1 newest, and entering the window slot `x` holds `qkv(x - ck)` —
+        // so a negative `p` is slot `ck + p`, **not** `ck - 1 + p`. (The
+        // per-position form shifted the ring down a slot *before* convolving,
+        // which is where that extra `-1` hides; getting it wrong reads each tap
+        // one position too old and still produces plausible text.) Same `j`
+        // order as the per-position form, so the sum is bit-identical.
+        {
+            /// Shared view for the channel fan-out. Each worker writes only its
+            /// own channels of `out` and reads `qkv`/`ring`/`w`.
+            struct ConvCtx {
+                qkv: *const f32,
+                ring: *const f32,
+                w: *const f32,
+                out: *mut f32,
+                m: usize,
+                conv_dim: usize,
+                ck: usize,
+            }
+            /// # Safety
+            /// `ctx` is the live `ConvCtx` published below; `[start, end)` is a
+            /// channel range disjoint from every other worker's.
+            unsafe fn channels(start: usize, end: usize, ctx: *mut u8) {
+                // SAFETY: the caller passes the `ConvCtx` published below.
+                let c = unsafe { &*(ctx as *const ConvCtx) };
+                for mi in 0..c.m {
+                    for ci in start..end {
+                        let mut acc = 0.0f32;
+                        for j in 0..c.ck {
+                            // SAFETY: `conv_tap` returns a window row `< m` or a
+                            // ring slot in `1..ck`, both in bounds.
+                            let x = unsafe {
+                                match conv_tap(mi, j, c.ck) {
+                                    ConvTap::Window(p) => *c.qkv.add(p * c.conv_dim + ci),
+                                    ConvTap::Ring(x) => *c.ring.add(x * c.conv_dim + ci),
+                                }
+                            };
+                            // SAFETY: `w` is `conv_dim` rows of `ck` taps.
+                            acc += x * unsafe { *c.w.add(ci * c.ck + j) };
+                        }
+                        // SAFETY: this worker owns channel `ci` of every row.
+                        unsafe { *c.out.add(mi * c.conv_dim + ci) = tensor::silu(acc) };
+                    }
+                }
+            }
+            let mut ctx = ConvCtx {
+                qkv: qkv.as_ptr(),
+                ring: cache.conv[l].as_ptr(),
+                w: conv1d.as_ptr(),
+                out: conv.as_mut_ptr(),
+                m,
+                conv_dim,
+                ck,
+            };
+            // SAFETY: `channels` is safe on disjoint channel ranges sharing
+            // `ctx`, and `ctx` lives until `parallel_for` returns.
+            unsafe {
+                crate::arch::parallel_for(
+                    conv_dim,
+                    fanout_chunk(m * conv_dim * ck),
+                    channels,
+                    &mut ctx as *mut ConvCtx as *mut u8,
+                )
+            };
+        }
+
+        // Advance the ring past the window, once instead of per position.
+        advance_conv_ring(&mut cache.conv[l], qkv, m, conv_dim, ck);
+
+        // Recurrent gated delta rule: sequential in position, independent per
+        // head, so the fan-out is over heads and each worker walks the window.
         let scale = 1.0 / tensor_sqrtf(hk as f32);
-        let s_state = &mut cache.delta_s[l];
-        for h in 0..nh {
-            let g = h % ssm.n_group; // key/query head (ggml_repeat tiling, per llama.cpp)
-            let q = &mut s.conv[g * hk..(g + 1) * hk].to_vec();
-            let k = &mut s.conv[key_dim + g * hk..key_dim + (g + 1) * hk].to_vec();
-            let vv = &s.conv[2 * key_dim + h * hv..2 * key_dim + (h + 1) * hv];
-            tensor::l2norm(q, 1e-6);
-            tensor::l2norm(k, 1e-6);
-            for x in q.iter_mut() {
-                *x *= scale;
-            }
-            let sh = &mut s_state[h * hk * hv..(h + 1) * hk * hv]; // S[k*hv + v]
-            let gd = s.gates[h];
-            let beta = s.betas[h];
-            tensor::scale_f32(sh, gd);
-            let out = &mut s.delta_o[h * hv..(h + 1) * hv];
-            // kv_mem[v] = sum_k S[k,v]*k[k]; delta = (v - kv_mem)*beta;
-            // S[k,v] += k[k]*delta[v]; o[v] = sum_k S[k,v]*q[k]
-            //
-            // Iterated **row-wise** (ki outer): each S row `sh[ki*hv..]` is a
-            // contiguous [hv] slice, so every pass is a SIMD AXPY instead of a
-            // stride-hv scalar walk — this delta rule (18 layers × 16 heads ×
-            // 128×128 state, every token) was the decode-time hot spot.
-            debug_assert!(hv <= 256, "DeltaNet head_v dim {hv} exceeds the fixed delta scratch");
-            let mut delta = [0.0f32; 256]; // hv <= 256 for the supported models
-            let delta = &mut delta[..hv];
-            delta.copy_from_slice(vv);
-            for ki in 0..hk {
-                // delta[v] -= k[ki] * S[ki, v]  (accumulating -kv_mem into vv)
-                tensor::axpy_f32(delta, &sh[ki * hv..(ki + 1) * hv], -k[ki]);
-            }
-            for d in delta.iter_mut() {
-                *d *= beta;
-            }
-            out.fill(0.0);
-            for ki in 0..hk {
-                let row = &mut sh[ki * hv..(ki + 1) * hv];
-                tensor::axpy_f32(row, delta, k[ki]);
-                tensor::axpy_f32(out, row, q[ki]);
-            }
-            // gated RMSNorm: RMSNorm(out over hv) * SiLU(z_head)
-            tensor::rmsnorm_inplace(out, norm_w, c.rms_eps);
-            for vi in 0..hv {
-                out[vi] *= tensor::silu(s.z[h * hv + vi]);
+        debug_assert!(hv <= 256, "DeltaNet head_v dim {hv} exceeds the fixed delta scratch");
+        debug_assert!(hk <= 256, "DeltaNet head_k dim {hk} exceeds the fixed delta scratch");
+        /// Shared view for the head fan-out: head `h` owns state slice `h` and
+        /// the `h`-th span of every output row, so no two workers overlap.
+        struct DeltaCtx {
+            conv: *const f32,
+            z: *const f32,
+            gates: *const f32,
+            betas: *const f32,
+            state: *mut f32,
+            out: *mut f32,
+            norm_w: *const f32,
+            m: usize,
+            nh: usize,
+            hk: usize,
+            hv: usize,
+            n_group: usize,
+            key_dim: usize,
+            conv_dim: usize,
+            value_dim: usize,
+            scale: f32,
+            rms_eps: f32,
+        }
+        /// # Safety
+        /// `ctx` is the live `DeltaCtx` published below; `[start, end)` is a head
+        /// range disjoint from every other worker's.
+        unsafe fn heads(start: usize, end: usize, ctx: *mut u8) {
+            // SAFETY: the caller passes the `DeltaCtx` published below.
+            let c = unsafe { &*(ctx as *const DeltaCtx) };
+            // Per-head scratch, reused across the window (the per-position form
+            // heap-allocated these; hk/hv <= 256 is asserted by the caller).
+            let mut qbuf = [0.0f32; 256];
+            let mut kbuf = [0.0f32; 256];
+            let mut dbuf = [0.0f32; 256];
+            // SAFETY: `norm_w` is the layer's `hv`-wide DeltaNet norm weight.
+            let norm_w = unsafe { core::slice::from_raw_parts(c.norm_w, c.hv) };
+            for h in start..end {
+                let g = h % c.n_group; // key/query head (ggml_repeat tiling, per llama.cpp)
+                // SAFETY: this worker owns head `h`'s `hk*hv` state slice.
+                let sh = unsafe { core::slice::from_raw_parts_mut(c.state.add(h * c.hk * c.hv), c.hk * c.hv) };
+                for mi in 0..c.m {
+                    // SAFETY: `conv` holds `m` rows of `conv_dim`.
+                    let cv = unsafe { core::slice::from_raw_parts(c.conv.add(mi * c.conv_dim), c.conv_dim) };
+                    let q = &mut qbuf[..c.hk];
+                    q.copy_from_slice(&cv[g * c.hk..(g + 1) * c.hk]);
+                    let k = &mut kbuf[..c.hk];
+                    k.copy_from_slice(&cv[c.key_dim + g * c.hk..c.key_dim + (g + 1) * c.hk]);
+                    let vv = &cv[2 * c.key_dim + h * c.hv..2 * c.key_dim + (h + 1) * c.hv];
+                    tensor::l2norm(q, 1e-6);
+                    tensor::l2norm(k, 1e-6);
+                    for x in q.iter_mut() {
+                        *x *= c.scale;
+                    }
+                    // SAFETY: `gates`/`betas` hold `m` rows of `nh`.
+                    let gd = unsafe { *c.gates.add(mi * c.nh + h) };
+                    let beta = unsafe { *c.betas.add(mi * c.nh + h) };
+                    tensor::scale_f32(sh, gd);
+                    // SAFETY: `out` holds `m` rows of `value_dim`; head `h`'s span
+                    // within a row belongs to this worker alone.
+                    let o = unsafe {
+                        core::slice::from_raw_parts_mut(c.out.add(mi * c.value_dim + h * c.hv), c.hv)
+                    };
+                    // kv_mem[v] = sum_k S[k,v]*k[k]; delta = (v - kv_mem)*beta;
+                    // S[k,v] += k[k]*delta[v]; o[v] = sum_k S[k,v]*q[k]
+                    //
+                    // Iterated **row-wise** (ki outer): each S row `sh[ki*hv..]`
+                    // is a contiguous [hv] slice, so every pass is a SIMD AXPY
+                    // instead of a stride-hv scalar walk — this delta rule
+                    // (18 layers × 16 heads × 128×128 state, every token) was
+                    // the decode-time hot spot.
+                    let delta = &mut dbuf[..c.hv];
+                    delta.copy_from_slice(vv);
+                    for ki in 0..c.hk {
+                        // delta[v] -= k[ki] * S[ki, v]  (accumulating -kv_mem into vv)
+                        tensor::axpy_f32(delta, &sh[ki * c.hv..(ki + 1) * c.hv], -k[ki]);
+                    }
+                    for d in delta.iter_mut() {
+                        *d *= beta;
+                    }
+                    o.fill(0.0);
+                    for ki in 0..c.hk {
+                        let row = &mut sh[ki * c.hv..(ki + 1) * c.hv];
+                        tensor::axpy_f32(row, delta, k[ki]);
+                        tensor::axpy_f32(o, row, q[ki]);
+                    }
+                    // gated RMSNorm: RMSNorm(out over hv) * SiLU(z_head)
+                    tensor::rmsnorm_inplace(o, norm_w, c.rms_eps);
+                    for vi in 0..c.hv {
+                        // SAFETY: `z` holds `m` rows of `value_dim`.
+                        o[vi] *= tensor::silu(unsafe { *c.z.add(mi * c.value_dim + h * c.hv + vi) });
+                    }
+                }
             }
         }
+        let mut ctx = DeltaCtx {
+            conv: conv.as_ptr(),
+            z: z.as_ptr(),
+            gates: gates.as_ptr(),
+            betas: betas.as_ptr(),
+            state: cache.delta_s[l].as_mut_ptr(),
+            out: out.as_mut_ptr(),
+            norm_w: norm_w.as_ptr(),
+            m,
+            nh,
+            hk,
+            hv,
+            n_group: ssm.n_group,
+            key_dim,
+            conv_dim,
+            value_dim,
+            scale,
+            rms_eps: c.rms_eps,
+        };
+        // The recurrence is head-parallel at every window size, but a single
+        // decode position is too little work to pay for the wake — see
+        // `fanout_chunk`.
+        // SAFETY: `heads` is safe on disjoint head ranges sharing `ctx`, and
+        // `ctx` lives until `parallel_for` returns.
+        unsafe {
+            crate::arch::parallel_for(
+                nh,
+                fanout_chunk(m * nh * hk * hv * 3),
+                heads,
+                &mut ctx as *mut DeltaCtx as *mut u8,
+            )
+        };
     }
 }
 
@@ -1237,4 +1763,131 @@ pub fn detokenize(model: &Model, ids: &[usize]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// Reference for the windowed conv: the per-position form this replaced —
+    /// shift the ring down a slot, append the current vector, then convolve
+    /// post-shift slots. Kept verbatim as the oracle.
+    fn conv_per_position(
+        qkv: &[f32],
+        ring0: &[f32],
+        w: &[f32],
+        m: usize,
+        conv_dim: usize,
+        ck: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut ring = ring0.to_vec();
+        let mut out = alloc::vec![0.0f32; m * conv_dim];
+        for mi in 0..m {
+            for j in 0..ck - 1 {
+                let (a, b) = ring.split_at_mut((j + 1) * conv_dim);
+                a[j * conv_dim..(j + 1) * conv_dim].copy_from_slice(&b[..conv_dim]);
+            }
+            ring[(ck - 1) * conv_dim..].copy_from_slice(&qkv[mi * conv_dim..(mi + 1) * conv_dim]);
+            for ci in 0..conv_dim {
+                let mut acc = 0.0f32;
+                for j in 0..ck {
+                    acc += ring[j * conv_dim + ci] * w[ci * ck + j];
+                }
+                out[mi * conv_dim + ci] = acc;
+            }
+        }
+        (out, ring)
+    }
+
+    /// The window form of the conv (`conv_tap` + `advance_conv_ring`) must equal
+    /// the per-position shift-and-convolve it replaced, for every window size
+    /// either side of the kernel width — including `m == 1` (decode) and
+    /// `m < ck`, where part of the history survives in the ring.
+    ///
+    /// This is the test the off-by-one needed: reading the ring at `ck - 1 + p`
+    /// instead of `ck + p` takes every tap one position too old, which changes
+    /// no shape, trips no assertion, and still decodes fluent text.
+    #[test_case]
+    fn conv_window_matches_the_per_position_ring() {
+        const CK: usize = 4;
+        const CD: usize = 5; // small but not a multiple of anything convenient
+        let w: Vec<f32> = (0..CD * CK).map(|i| ((i % 7) as f32 - 3.0) * 0.25).collect();
+        let ring0: Vec<f32> = (0..CK * CD).map(|i| (i as f32) * 0.5 - 2.0).collect();
+        for m in [1usize, 2, 3, 4, 5, 9] {
+            let qkv: Vec<f32> = (0..m * CD).map(|i| 1.0 - (i as f32) * 0.125).collect();
+            let (want_out, want_ring) = conv_per_position(&qkv, &ring0, &w, m, CD, CK);
+
+            let mut got_out = alloc::vec![0.0f32; m * CD];
+            for mi in 0..m {
+                for ci in 0..CD {
+                    let mut acc = 0.0f32;
+                    for j in 0..CK {
+                        let x = match conv_tap(mi, j, CK) {
+                            ConvTap::Window(p) => qkv[p * CD + ci],
+                            ConvTap::Ring(s) => ring0[s * CD + ci],
+                        };
+                        acc += x * w[ci * CK + j];
+                    }
+                    got_out[mi * CD + ci] = acc;
+                }
+            }
+            let mut got_ring = ring0.clone();
+            advance_conv_ring(&mut got_ring, &qkv, m, CD, CK);
+
+            assert_eq!(got_out, want_out, "conv output diverges at window m={m}");
+            assert_eq!(got_ring, want_ring, "conv ring diverges after window m={m}");
+        }
+    }
+
+    /// A window never reaches further back than `ck-1` positions, so ring slot 0
+    /// — the oldest, which the per-position shift would have discarded first —
+    /// is never a tap source. Pins the boundary the `ck + p` mapping turns on.
+    #[test_case]
+    fn conv_taps_never_reach_the_discarded_ring_slot() {
+        for ck in [2usize, 3, 4, 8] {
+            for mi in 0..6 {
+                for j in 0..ck {
+                    match conv_tap(mi, j, ck) {
+                        ConvTap::Ring(s) => {
+                            assert!(s >= 1 && s < ck, "ck={ck} mi={mi} j={j}: ring slot {s} out of 1..{ck}");
+                        }
+                        ConvTap::Window(p) => assert!(p <= mi, "ck={ck} mi={mi} j={j}: tap {p} is not causal"),
+                    }
+                }
+            }
+            // The newest tap is always the current position.
+            assert_eq!(conv_tap(3, ck - 1, ck), ConvTap::Window(3));
+        }
+    }
+
+    /// Batching is a property of each tensor's quant type, never of the model.
+    /// The regression this guards: the old gate demanded one uniform type across
+    /// every weight *and* read it from `token_embd`, so a single Q6_K embedding —
+    /// a tensor prefill never batches — put a whole 4B model on the per-token
+    /// path and forfeited batching for 89% of its projection bytes.
+    #[test_case]
+    fn batchable_types_are_per_tensor_and_k_quants_fall_back() {
+        // K-quants, Q4_1 and the i-quants have no weight-stationary kernel.
+        for qt in [tensor::QT_Q4_K, tensor::QT_Q6_K, tensor::QT_Q5_K, tensor::QT_Q4_1, tensor::QT_Q2_K] {
+            assert!(!has_batched_kernel(qt), "quant {qt} must fall back, not claim a batched kernel");
+        }
+        // On aarch64 these do; on other arches there are no batched kernels at
+        // all, so the predicate is uniformly false and everything falls back.
+        for qt in [tensor::QT_Q8_0, tensor::QT_Q1_0, tensor::QT_Q2_0] {
+            assert_eq!(has_batched_kernel(qt), cfg!(target_arch = "aarch64"), "quant {qt}");
+        }
+    }
+
+    /// A decode step's DeltaNet layer must stay inline: it is head-parallel in
+    /// principle, but fanning ~0.8M MACs across the fleet measured slower than
+    /// running it on one core (35 -> 20 tok/s). A prefill window must fan out.
+    #[test_case]
+    fn fanout_chunk_keeps_a_decode_step_inline_and_splits_a_window() {
+        // 0.8B DeltaNet geometry: nh=16, hk=hv=128, 3 passes.
+        let per_pos = 16 * 128 * 128 * 3;
+        let inline = fanout_chunk(per_pos);
+        assert!(inline > 16, "one decode position must not split across 16 heads (got {inline})");
+        assert_eq!(fanout_chunk(per_pos * 64), 1, "a 64-token window must split");
+    }
 }
