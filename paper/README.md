@@ -9,7 +9,7 @@ an agent rather than a program.
   pages / arXiv / ACL Anthology (the four entries written from working knowledge —
   CaMeL, AgentDojo, InjecAgent, Outlines — were all correct as written; page
   ranges added for LOMAC and Greshake)
-- `make` — build `main.pdf` (`make manual` if you have no `latexmk`). Verified: 24 pages, 0 errors, 0 overfull boxes, 0 undefined references with TeX Live 2026
+- `make` — build `main.pdf` (`make manual` if you have no `latexmk`). Verified: 25 pages, 0 errors, 0 overfull boxes, 0 undefined references with TeX Live 2026
 
 Intended categories: **cs.OS** (primary), cross-list **cs.CR**, **cs.AI**.
 
@@ -212,13 +212,19 @@ Three decisions worth not undoing:
 
 ## Before submitting
 
-1. Bib entries are verified; re-check only if a preprint has since appeared in
+1. **Make `github.com/chittios/chitti` public, or remove the artifact link.** The
+   paper now cites the repo (`\cite{chittios}`) and §4 carries an
+   *Artifact availability* paragraph naming commit `733ae9a` and the commands that
+   reproduce every number. The repo is **private** as of this draft, so that URL
+   404s for every reader — which is worse than no URL. This is the one blocker
+   that is not a writing task.
+2. Bib entries are verified; re-check only if a preprint has since appeared in
    proceedings.
-2. **§5 is filled** (E1–E4 measured; E5 partial — the per-gate LOC/test
+3. **§5 is filled** (E1–E4 measured; E5 partial — the per-gate LOC/test
    breakdown is still TBD). Re-run E1 on an idle machine before camera-ready;
    consider porting AgentDojo/InjecAgent for the model-in-the-loop half E2
    deliberately assumes away.
-3. Re-count the headline figures at submission time — LOC, primitive count,
+4. Re-count the headline figures at submission time — LOC, primitive count,
    test count, and the `/perf` throughput numbers all drift:
 
    ```sh
@@ -235,9 +241,8 @@ Three decisions worth not undoing:
    done | paste -sd+ - | bc
    ```
 
-4. Decide authorship/affiliation and add an acknowledgements section.
-5. Consider whether the artifact should be cited with a commit hash and a
-   reproduction recipe (`cargo xtask test`, `make e2e`).
+5. Decide authorship/affiliation and add an acknowledgements section.
+6. Consider adding an acknowledgements section.
 
 ## The argument, in one page
 
