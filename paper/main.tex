@@ -83,10 +83,11 @@ Measured on the running system: the four-gate authorization decision costs
 1.4\,$\mu$s, $3\times10^{-5}$ of the cost of decoding one token, so the boundary
 is free relative to the thing it guards. An injection corpus spanning four
 attack goals and five ingestion vectors is refused 12 times out of 12; removing
-provenance and changing nothing else lets 9 of them through, and removing
-attenuation as well lets all 12 through --- so capabilities and provenance
-demonstrably do different jobs, and the capability gate alone stops none of the
-attacks, because indirect injection exploits authority the agent already holds.
+provenance and changing nothing else lets 9 of them past the policy (6 of which
+then take effect), and removing attenuation as well lets all 12 past --- so
+capabilities and provenance demonstrably do different jobs, and the capability
+gate alone stops none of the attacks, because indirect injection exploits
+authority the agent already holds.
 The cost is real and we report it as the headline liability: half of the
 \emph{legitimate} irreversible operations in a benign task suite are refused
 because turn-granular taint cannot tell which data justified them, which is the
@@ -313,9 +314,9 @@ by its small size and its tests.
   No effect occurs that the invoking task does not hold a capability for, and
   no capability can be forged or guessed by any string the model emits.
   \item[\textnormal{\textbf{G2} \emph{No destructive effect on untrusted
-  authority.}}] An irreversible or externally-visible primitive whose
-  justification traces to untrusted ingested content is refused unless a human
-  endorses it at the console.
+  authority.}}] An irreversible or externally-visible primitive is refused when
+  its justification traces to untrusted ingested content, unless a human endorses
+  it at the console.
   \item[\textnormal{\textbf{G3} \emph{Delegation only narrows.}}] A spawned
   sub-agent, and an installed agent package, hold a subset of the granting
   context's authority, permanently.
@@ -709,6 +710,21 @@ network relay, HTTP framing, a content server runtime --- are deterministic code
 below the boundary, so an agent that serves web pages does not implement HTTP;
 it decides what to serve while native code parses and frames.
 
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/panes.png}
+\caption{\os{} running, captured from the guest's own framebuffer through the
+QEMU monitor (\code{screendump}) rather than reconstructed from a terminal
+transcript. The chat pane on the left is the shell agent --- the orchestrator
+whose authority \S\ref{sec:cap} describes --- and the right pane is a live
+\code{/top}, showing the eight cores the SMP fleet is running on, the two tasks
+alive at that moment (the bootstrap task and the parked capability-owning
+orchestrator), and the kernel heap. Everything in the figure is one process
+image on bare metal: compositor, scheduler, network stack, and the inference
+engine that would occupy the ``Model'' slot on a model-loaded boot.}
+\label{fig:system}
+\end{figure}
+
 \paragraph{Testing posture.} Two layers, and the split reflects the
 determinism boundary itself. Pure logic --- grammar, provenance algebra,
 capability and scope arithmetic, path normalization, registry invariants --- is
@@ -723,9 +739,10 @@ hardware.
 \section{Evaluation}
 \label{sec:eval}
 
-\emph{This section states the questions, the method, and the current status.
-Measurements marked \textsc{tbd} are in progress; we report them rather than
-omit the section so the design can be read against what will falsify it.}
+\emph{E1--E4 are measured on the running system and reported below with their
+methods; E5 is partial and says so. Where a measurement carries a caveat --- a
+contended host, a corpus we wrote ourselves, an architecture we could not test
+on --- it is stated beside the number rather than in a footnote.}
 
 \subsection{E1: What does the boundary cost?}
 
@@ -811,6 +828,21 @@ The end-to-end test asserts the attribution as well as the cost: each refusal
 row must name the gate that refused it, so the same run that produces these
 numbers also demonstrates that each gate is the one stopping its own case.
 
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/fig_cost.pdf}
+\caption{E1. \textbf{Left:} the authorization decision decomposed into its
+gates. The fine-grained gate dominates --- scope is 68\% of the total, and it is
+the only gate that allocates --- while capability and taint are at or below the
+method's noise floor. One audit append costs almost as much as the entire
+decision it records. \textbf{Right:} whether any of that matters. The decision
+is $3\times10^{-5}$ of the cost of decoding one token, so the boundary could be
+crossed roughly 31{,}000 times per token generated. Two panels rather than two
+y-axes: the measures are five orders of magnitude apart, and the ratio is stated
+rather than implied by geometry.}
+\label{fig:cost}
+\end{figure}
+
 \begin{table}[h]
 \centering
 \small
@@ -878,8 +910,8 @@ it; a network that happened to be down is not a defence.
 
 \emph{The corpus tracks whether each turn actually became tainted}, and reports
 it per attack. This is not decoration: it caught two flawed corpus entries
-(below), and it is the check that separates "the gate refused" from "the gate
-was never reached".
+(below), and it is the check that separates ``the gate refused'' from ``the gate
+was never reached''.
 
 \textbf{Result.} \textbf{0 of 12 permitted} under the full policy: 10 refused by
 the provenance gate, 2 by scope, and all 12 turns correctly tainted. The
@@ -890,7 +922,7 @@ Two observations matter more than the headline.
 \emph{The capability gate stops nothing here}, in any configuration. That is not
 a defect; it is the thesis. Indirect injection does not need authority the agent
 lacks --- it turns the authority the agent legitimately holds against the user,
-so a mechanism that only answers "may this principal ever do this?" is
+so a mechanism that only answers ``may this principal ever do this?'' is
 structurally unable to see the attack. Capabilities are necessary (they bound
 what the compromised turn can reach at all, which is what the two scope
 refusals are) and demonstrably not sufficient.
@@ -907,6 +939,22 @@ nameable from any tool call, so the gate is their second line of defence rather
 than their first. Egress is the case that must not be misread --- no tool lowers
 to \code{net\_http\_post} either, yet an agent can still exfiltrate through four
 other bindings, which is exactly why those bindings carry their own checks.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/redteam.png}
+\caption{E2 and E4 as they actually run, screenshotted from the guest's own
+framebuffer (the per-attack detail is Table~\ref{tab:e2}; the full-width table
+view is \code{figures/redteam\_table.png}). The left pane is the comparison this
+evaluation exists to make, printed by the machine under test: zero attacks
+permitted under the full policy, 9 of 12 with provenance removed, 12 of 12 under
+ambient authority, and the effective counts beside each. The right pane is not
+decoration --- it is the \code{browser-navigate-egress} attack \emph{executing}
+under the ambient baseline, stuck on ``Loading'' because the corpus points every
+egress at the loopback discard port. A permitted attack therefore demonstrably
+runs, and demonstrably cannot reach the network.}
+\label{fig:redteam}
+\end{figure}
 
 \textbf{What the harness found in itself.} Two of the first corpus entries were
 wrong in ways that would have flattered the result. An authority-transfer attack
@@ -973,6 +1021,22 @@ interruption at all, and 3 of 11 steps needed a human. The control task
 confirms the gate is provenance-based and not a blanket block: with nothing
 untrusted in context, the destructive step proceeds untouched.
 
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/fig_blocked.pdf}
+\caption{The benefit and its price, in one grammar. \textbf{Left:} removing
+provenance and changing nothing else moves 9 of 12 attacks from refused to
+permitted; removing attenuation as well moves the remaining 3. Hatching marks
+the subset that the policy permitted but which failed anyway for a non-policy
+reason, so the honest count of attacks that \emph{took effect} is 6 and 9 rather
+than 9 and 12. \textbf{Right:} the same colour means the same thing --- a call
+nothing stopped --- but here that is the goal rather than the failure, and the
+hatch marks the two refusals where the untrusted content never named the target.
+Hue encodes only which mechanism acted; whether that was good is what the panel
+titles say.}
+\label{fig:blocked}
+\end{figure}
+
 \textbf{Reading this honestly.} A 50\% false-refusal rate on destructive steps
 is a real cost and we do not want to dress it up. Three things temper it and one
 sharpens it. It tempers: destructive steps are a small minority of agent work
@@ -1003,21 +1067,47 @@ Attack success comes from the corpus and human interruption from the E3 suite;
 measuring interruption on the attack corpus would flatter every design, since
 interrupting an attack is the point.
 
-\textbf{Result} (Table~\ref{tab:e4}). Removing provenance and changing nothing
-else takes attack success from 0 to \textbf{9 of 12}; removing attenuation as
-well takes it to \textbf{12 of 12}. So the two mechanisms do visibly different
-jobs: scope contains what a compromised turn can reach (3 refusals with the
-taint gate off), and provenance is what stops the agent's own authority being
-turned against the user (the other 9). Only the full policy is good on both
-axes: it is the sole configuration with zero attack success, and it interrupts a
-human on 3 of 11 benign steps against confirm-every-call's 11 of 11.
+\textbf{Result} (Table~\ref{tab:e4}, Figure~\ref{fig:tradeoff}). Removing
+provenance and changing nothing else takes attack success from 0 to \textbf{9 of
+12}; removing attenuation as well takes it to \textbf{12 of 12}. So the two
+mechanisms do visibly different jobs: scope contains what a compromised turn can
+reach (3 refusals with the taint gate off), and provenance is what stops the
+agent's own authority being turned against the user (the other 9). Only the full
+policy is good on both axes: it is the sole configuration with zero attack
+success, and it interrupts a human on 3 of 11 benign steps against
+confirm-every-call's 11 of 11.
+
+Those counts are attacks the policy \emph{permitted}. Of the 9 under
+capabilities-and-scope, 6 then actually took effect, and of the 12 under ambient
+authority, 9 did; the remainder failed for reasons that are not defences --- a
+loopback connection refused, and \code{/http} not being exposed to agents as a
+tool at all. We report both numbers because either alone misleads: the permitted
+count is the authorization failure, which is what the mechanism is responsible
+for, while the effective count is what the user would actually have lost. It is
+worth noting how we found this. The summary line said only ``permitted'', and it
+was a screenshot of the run (Figure~\ref{fig:redteam}) that showed the tool
+layer answering ``\code{/http} is not available as a tool'' underneath ---
+an incidental restriction doing security work that no part of the design had
+claimed credit for, and which a table of aggregates had hidden.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.52\linewidth]{figures/fig_tradeoff.pdf}
+\caption{E4 as a position rather than a column. A defence has to be good on both
+axes, and only one configuration is: the two that omit provenance or attenuation
+sit at the right-hand edge, and confirm-every-call is drawn as the span it
+actually occupies, since its attack rate is whatever the human notices. Nothing
+is shaded as a ``good'' region --- Synapse's 27\% interruption rate is a real
+cost (\S\ref{sec:e3}) and a box around it would launder that.}
+\label{fig:tradeoff}
+\end{figure}
 
 \begin{table}[t]
 \centering
 \small
 \begin{tabular}{@{}lrrl@{}}
 \toprule
-\textbf{Configuration} & \textbf{Attacks permitted} & \textbf{Benign steps needing a human} & \textbf{Fails on} \\
+\textbf{Configuration} & \textbf{Attacks permitted} & \textbf{Human interruptions} & \textbf{Fails on} \\
 \midrule
 \syn{} (caps + scope + provenance) & \textbf{0 / 12} & \textbf{3 / 11} & --- \\
 Capabilities + scope, no provenance & 9 / 12 & 0 / 11 & attack success \\
@@ -1026,8 +1116,8 @@ Confirm every call & human-dependent & 11 / 11 & interruption \\
 \bottomrule
 \end{tabular}
 \caption{E4: the pair. A defence is only interesting if it is good on both
-columns. Confirm-every-call's attack rate is left as "human-dependent" on
-purpose --- it is exactly as good as the human's attention, which is the axis it
+columns; interruptions are benign steps out of 11 that needed a human.
+Confirm-every-call's attack rate is left as ``human-dependent'' on purpose --- it is exactly as good as the human's attention, which is the axis it
 loses on and the reason per-call approval is not a mechanism.}
 \label{tab:e4}
 \end{table}

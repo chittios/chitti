@@ -1,4 +1,3 @@
-main.pdf
 *.aux
 *.bbl
 *.blg
@@ -8,3 +7,5 @@ main.pdf
 *.fdb_latexmk
 *.synctex.gz
 *.toc
+figures/*.ppm
+figures/fig_*.png

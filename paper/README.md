@@ -9,7 +9,7 @@ an agent rather than a program.
   pages / arXiv / ACL Anthology (the four entries written from working knowledge —
   CaMeL, AgentDojo, InjecAgent, Outlines — were all correct as written; page
   ranges added for LOMAC and Greshake)
-- `make` — build `main.pdf` (`make manual` if you have no `latexmk`)
+- `make` — build `main.pdf` (`make manual` if you have no `latexmk`). Verified: 24 pages, 0 errors, 0 overfull boxes, 0 undefined references with TeX Live 2026
 
 Intended categories: **cs.OS** (primary), cross-list **cs.CR**, **cs.AI**.
 
@@ -168,6 +168,41 @@ can run `/redteam` on a real machine. Pinned by
   memory-poison attack writes durable memory that re-enters the system prompt —
   running it as the live orchestrator would poison the real shell agent as a side
   effect of measuring whether that was possible.
+
+## Figures
+
+`figures/` holds both the generators and their output, so every figure is
+reproducible and none is hand-drawn.
+
+| File | What it is |
+| --- | --- |
+| [`make_figures.py`](figures/make_figures.py) | the three data figures (`fig_cost`, `fig_blocked`, `fig_tradeoff`). Every number in its `DATA` block is a median from a real run — re-measure and edit `DATA`, never nudge a figure |
+| [`capture.py`](figures/capture.py) | the screenshots, taken from the guest's **own framebuffer** via the QEMU monitor's `screendump` (reachable because `xtask run` uses `-serial mon:stdio`), not reconstructed from a terminal transcript |
+| `fig_*.pdf` | vector figures the paper includes. `make_figures.py` also writes `.png` twins for eyeballing; those are gitignored, since they are regenerable duplicates of the PDFs |
+| `panes.png`, `redteam_table.png` | the two screenshots the paper uses |
+| `desktop.png`, `redteam.png` | alternates kept for reuse (clean boot console; the split-pane redteam summary) |
+
+```sh
+python3 -m venv /tmp/figvenv && /tmp/figvenv/bin/pip install matplotlib
+/tmp/figvenv/bin/python figures/make_figures.py    # data figures
+python3 figures/capture.py                         # screenshots (boots QEMU, ~4 min)
+```
+
+Three decisions worth not undoing:
+
+- **Palette** is the OS's own brand terracotta (`DESIGN.md`) plus three hues that
+  pass the CVD validator in the `dataviz` skill (light mode, all checks; the exact
+  adjacent pairs each figure uses were validated separately, not just the full set).
+- **Hue encodes exactly one dimension: which mechanism acted.** Terracotta always
+  means "no gate stopped it", cyan provenance, gold scope, indigo grammar, grey a
+  non-mechanism reference. The first draft had terracotta doubling as "the scope
+  gate", which is the mistake the rule exists to prevent. Hatching always marks a
+  *subset* of the segment beside it.
+- **Screenshots are captured at `/display scale 2`.** At the panel's native 8×16
+  cells, a 1440×900 framebuffer scaled to a 6.5in column puts the glyphs at ~4pt —
+  a screenshot nobody can read is decoration. The table shot additionally closes
+  the action band so the chat pane is ~90 columns, which is what the output was
+  formatted for.
 
 ## Before submitting
 

@@ -6534,7 +6534,14 @@ fn run_infer() {
 /// Builtin: microbenchmark the hottest tensor kernel (`matvec_q8_0`) in
 /// isolation and report throughput in MMAC/s. Meaningful under native
 /// execution (aarch64 on HVF); under x86 TCG it just measures the emulator.
-fn run_bench() {
+/// Builtin: `/bench [synapse]`. Bare `/bench` is the matvec/SDOT gauge; `/bench
+/// synapse` prices the determinism boundary itself (see `synapse::bench`) — the
+/// authorization decision in ns/call against a per-token cost from `/perf`.
+fn run_bench(arg: &str) {
+    if arg.trim() == "synapse" {
+        crate::synapse::bench::run();
+        return;
+    }
     #[cfg(target_arch = "aarch64")]
     serial_println!("bench> Q4_0 SDOT vs exact rel_rms_err = {}", crate::cortex::check_q4_0_sdot());
     #[cfg(target_arch = "aarch64")]
