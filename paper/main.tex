@@ -942,17 +942,19 @@ other bindings, which is exactly why those bindings carry their own checks.
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\linewidth]{figures/redteam.png}
+\includegraphics[width=\linewidth]{figures/redteam_table.png}
 \caption{E2 and E4 as they actually run, screenshotted from the guest's own
-framebuffer (the per-attack detail is Table~\ref{tab:e2}; the full-width table
-view is \code{figures/redteam\_table.png}). The left pane is the comparison this
-evaluation exists to make, printed by the machine under test: zero attacks
-permitted under the full policy, 9 of 12 with provenance removed, 12 of 12 under
-ambient authority, and the effective counts beside each. The right pane is not
-decoration --- it is the \code{browser-navigate-egress} attack \emph{executing}
-under the ambient baseline, stuck on ``Loading'' because the corpus points every
-egress at the loopback discard port. A permitted attack therefore demonstrably
-runs, and demonstrably cannot reach the network.}
+framebuffer at the console's native font scale. The shape is the result: a column
+of \code{refused:taint} down every attack, each row also confirming the turn
+really was tainted (per-attack values in Table~\ref{tab:e2}; the figure is
+included for what it demonstrates rather than as a table substitute). Three
+incidental details are worth more than the numbers. The \code{rm>} lines are the
+ambient-authority baseline \emph{actually deleting} the sandbox files, so a
+permitted attack demonstrably takes effect. The \code{browser>} line is an egress
+attack stuck on the loopback discard port, so it demonstrably cannot leave the
+machine. And ``\code{/http} is not available as a tool'' is what prompted
+separating \emph{permitted by policy} from \emph{took effect} --- an incidental
+restriction doing security work no part of the design had claimed credit for.}
 \label{fig:redteam}
 \end{figure}
 

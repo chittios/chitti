@@ -180,7 +180,7 @@ reproducible and none is hand-drawn.
 | [`capture.py`](figures/capture.py) | the screenshots, taken from the guest's **own framebuffer** via the QEMU monitor's `screendump` (reachable because `xtask run` uses `-serial mon:stdio`), not reconstructed from a terminal transcript |
 | `fig_*.pdf` | vector figures the paper includes. `make_figures.py` also writes `.png` twins for eyeballing; those are gitignored, since they are regenerable duplicates of the PDFs |
 | `panes.png`, `redteam_table.png` | the two screenshots the paper uses |
-| `desktop.png`, `redteam.png` | alternates kept for reuse (clean boot console; the split-pane redteam summary) |
+| `desktop.png`, `redteam.png` | alternates kept for reuse (clean boot console; the split-pane summary with the browser pane mid-attack) |
 
 ```sh
 python3 -m venv /tmp/figvenv && /tmp/figvenv/bin/pip install matplotlib
@@ -198,11 +198,17 @@ Three decisions worth not undoing:
   non-mechanism reference. The first draft had terracotta doubling as "the scope
   gate", which is the mistake the rule exists to prevent. Hatching always marks a
   *subset* of the segment beside it.
-- **Screenshots are captured at `/display scale 2`.** At the panel's native 8×16
-  cells, a 1440×900 framebuffer scaled to a 6.5in column puts the glyphs at ~4pt —
-  a screenshot nobody can read is decoration. The table shot additionally closes
-  the action band so the chat pane is ~90 columns, which is what the output was
-  formatted for.
+- **Screenshots are captured at the console's native font scale.** Capturing at
+  `/display scale 2` was tried and reverted: it makes fine print legible at print
+  size but the console stops looking like itself — chunky glyphs, half the columns,
+  output wrapping where it normally would not. A screenshot's job is to show what
+  the system looks like, so the table shot instead buys readability by `/close`-ing
+  the action band (giving the output the full 176-column pane) and the paper carries
+  the values in a table beside it.
+- **Wait on a marker the *guest* prints.** `wait_for("chitti")` matched
+  `chitti-kernel` in cargo's build output, so when a release rebuild ran first the
+  script screendumped a machine that had not booted — and every dump was silently
+  empty. It now waits for `Commands start with`, which only the booted shell emits.
 
 ## Before submitting
 

@@ -85,18 +85,25 @@ def main():
     made = []
     try:
         print("capture: booting…", flush=True)
-        if not g.wait_for("chitti", 180):
+        # Wait for a marker the *guest* prints, not one cargo does. Waiting for
+        # "chitti" matched "chitti-kernel" in the build output, so when a release
+        # rebuild ran first the script sailed past the wait and screendumped a
+        # machine that had not booted — every dump silently empty. This string only
+        # appears once the shell is interactive.
+        if not g.wait_for("Commands start with", 420):
             print("capture: guest never reached the shell prompt", file=sys.stderr)
+            print(g.text()[-800:], file=sys.stderr)
             return 1
         time.sleep(4)  # let the splash settle into the steady-state console
-        # Double the font scale before capturing anything. At the panel's native
-        # 8x16 cells a 1440x900 framebuffer scaled to a 6.5in text column puts the
-        # glyphs at about 4pt -- a screenshot nobody can read is decoration.
-        # `/display scale 2` is the OS's own answer to "everything is too small", and
-        # it makes the type legible at print size while keeping every pixel 1:1 (no
-        # resampling: cells become 16x32 px and the column count halves).
-        g.send("/display scale 2")
-        time.sleep(2.5)
+        # Captured at the console's NATIVE font scale (8x16 cells). Doubling the
+        # scale first was tried and abandoned: it makes the type legible at print
+        # size but the console stops looking like itself -- chunky glyphs, half the
+        # columns, and every line of output wrapping in places it normally would
+        # not. A screenshot's job here is to show what the system actually looks
+        # like. Where the fine print matters, the figure earns legibility by giving
+        # the output the full pane width (see the `/close` in the table shot) and by
+        # the paper carrying the values in a table beside it — not by photographing
+        # the OS at a font size nobody runs it at.
 
         for name, cmds, scrollups, why in SHOTS:
             for c in cmds:
