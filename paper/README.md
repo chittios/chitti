@@ -5,8 +5,10 @@ what an OS's protection mechanism has to become when the unit of execution is
 an agent rather than a program.
 
 - [main.tex](main.tex) — the draft
-- [refs.bib](refs.bib) — bibliography (**metadata needs a verification pass**;
-  entries written from working knowledge, some flagged `VERIFY`)
+- [refs.bib](refs.bib) — bibliography, **verified 2026-07-29** against publisher
+  pages / arXiv / ACL Anthology (the four entries written from working knowledge —
+  CaMeL, AgentDojo, InjecAgent, Outlines — were all correct as written; page
+  ranges added for LOMAC and Greshake)
 - `make` — build `main.pdf` (`make manual` if you have no `latexmk`)
 
 Intended categories: **cs.OS** (primary), cross-list **cs.CR**, **cs.AI**.
@@ -15,9 +17,12 @@ Intended categories: **cs.OS** (primary), cross-list **cs.CR**, **cs.AI**.
 
 Sections 1–4 (introduction, execution model + threat model, mechanism,
 implementation) are drafted against the code and are meant to be accurate as
-written. Section 5 (evaluation) is **deliberately stubbed**: it states each
-experiment's question, method, and hypothesis, and marks the numbers `TBD`.
-Sections 6–8 (limitations, related work, conclusion) are drafted.
+written. Section 5 carries **measured results for E1–E4** (cost, attack corpus,
+utility cost, baselines); E5 (per-gate complexity breakdown) is still partial.
+Sections 6–8 (limitations, related work, conclusion) are drafted, and §6 now
+reports the two liabilities the evaluation turned from predictions into numbers:
+the 50% false-refusal rate, and the fact that the provenance policy is enforced
+at eight sites rather than one.
 
 Every factual claim about the mechanism traces to source:
 
@@ -69,7 +74,6 @@ remembering because each printed a plausible wrong number:
    four prefixes. A non-positive delta now prints "below noise floor", not zero.
 3. **"cycles" that were not cycles.** `CNTVCT_EL0` is a fixed ~24 MHz counter;
    the column is now `tick/call` with the rate printed beside it.
-
 4. **Sub-nanosecond is also a lie.** After the `black_box` fix the FNV row still
    read 0.36 ns/call: `black_box` on the *return value* does not stop a pure
    function of a `const` input being hoisted out of the loop. Both ends need the
@@ -97,11 +101,82 @@ expected:
 Not measured on **x86** — the only x86 target here is QEMU TCG, where the figure
 would be meaningless. That row needs real hardware or KVM.
 
+## E2/E3/E4 (attacks, utility, baselines) — the harness
+
+Built: [`kernel/src/security/redteam.rs`](../kernel/src/security/redteam.rs),
+run with **`/redteam`** on the booted kernel. E2E scenario `redteam` (always-run
+`os` group) asserts the *comparison*, not a single number.
+
+```sh
+python3 tests/e2e/run.py --only redteam -v     # ~3 min, no model needed
+```
+
+It drives every attack through the **real tool `Router`**, so the justification
+comes from `Router::justification` over `Session::resident_max_taint` exactly as
+in an agent turn — a provenance-laundering bug shows up as a `NOT TAINTED` row.
+
+**It assumes the injection persuaded the model.** No gate reads the payload, so
+varying wording would measure nothing; taking persuasion as given is the worst
+case and makes the results deterministic and model-independent.
+
+### Results
+
+| Configuration | Attacks permitted | Benign steps needing a human |
+| --- | --- | --- |
+| Synapse (caps + scope + provenance) | **0 / 12** | **3 / 11** |
+| Capabilities + scope, no provenance | 9 / 12 | 0 / 11 |
+| Ambient authority (container) | 12 / 12 | 0 / 11 |
+| Confirm every call | human-dependent | 11 / 11 |
+
+- **E2:** 0/12 permitted — 10 refused by provenance, 2 by scope, all 12 turns
+  correctly tainted. All eight taint enforcement sites held.
+- **E3:** **false-refusal rate 50%** of benign destructive steps (2 of 4); 3/6
+  tasks completely clean. This is the paper's headline liability.
+- **E4:** provenance is worth 9 of the 12 refusals; scope is worth the other
+  3 — they do measurably different jobs.
+- **The capability gate stops none of the attacks**, in any configuration. Not a
+  defect: injection uses authority the agent legitimately holds, which is
+  precisely why capabilities are necessary and insufficient.
+
+### Two things the harness found in itself
+
+Both would have flattered the result, and both were caught by instrumentation
+rather than by inspection:
+
+1. An authority-transfer attack on `channel_grant` returned **malformed** — no
+   tool lowers to that primitive, so the call died in shape validation and would
+   have been scored as a gate refusal that never happened. Now measured properly
+   by `synapse_reachable_destructive()` (only `mem_fs_delete` is Synapse-bound;
+   egress is reachable through four *other* bindings, so "no Synapse-bound tool"
+   must not be read as "unreachable").
+2. The confined victim's ingestion pointed outside its own scope, so the read was
+   scope-denied, the error result carried *trusted* provenance, the turn never
+   tainted — and two later scope denials would have been reported as though
+   provenance were involved. This is why the taint flag is reported per attack.
+
+### Safety rules this harness must keep
+
+A permitted attack under the ambient baseline **really executes**, and any user
+can run `/redteam` on a real machine. Pinned by
+`corpus_targets_are_sandboxed_and_offline`:
+
+- every filesystem target under `/redteam/` (or the throwaway agent's own home);
+- every network target the loopback **discard** port, so no packet leaves;
+- no device/partition verbs — the destructive-shell attack is `rm` on a sandbox
+  file, never `install`;
+- the victim runs as a throwaway agent identity (`REDTEAM_AGENT`), because the
+  memory-poison attack writes durable memory that re-enters the system prompt —
+  running it as the live orchestrator would poison the real shell agent as a side
+  effect of measuring whether that was possible.
+
 ## Before submitting
 
-1. **Verify every bib entry** against DOI/DBLP. Several are flagged.
-2. **Fill §5.** E1's harness exists (above) — run it on an idle machine and fill
-   Table `tab:e1`. E2–E4 still need the adversarial corpus and the baselines.
+1. Bib entries are verified; re-check only if a preprint has since appeared in
+   proceedings.
+2. **§5 is filled** (E1–E4 measured; E5 partial — the per-gate LOC/test
+   breakdown is still TBD). Re-run E1 on an idle machine before camera-ready;
+   consider porting AgentDojo/InjecAgent for the model-in-the-loop half E2
+   deliberately assumes away.
 3. Re-count the headline figures at submission time — LOC, primitive count,
    test count, and the `/perf` throughput numbers all drift:
 

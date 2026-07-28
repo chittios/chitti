@@ -1,9 +1,11 @@
 % Bibliography for "The Determinism Boundary".
 %
-% NOTE: metadata here was written from working knowledge and MUST be verified
-% against the canonical entry (DOI / publisher page / DBLP) before submission.
-% Entries flagged VERIFY are the ones most likely to have a wrong year, venue,
-% page range, or author list.
+% Verified 2026-07-29 against publisher pages / arXiv / ACL Anthology / DBLP.
+% Author lists, years, venues and (where known) page ranges were checked
+% individually; the four entries that had been written from working knowledge
+% (CaMeL, AgentDojo, InjecAgent, Outlines) were confirmed correct as written and
+% their identifiers pinned. Re-check before camera-ready only if a preprint has
+% since appeared in proceedings.
 
 % --- Classical protection & capabilities ------------------------------------
 
@@ -79,7 +81,8 @@
 @inproceedings{fraser2000lomac,
   author    = {Fraser, Timothy},
   title     = {{LOMAC}: Low Water-Mark Integrity Protection for {COTS} Environments},
-  booktitle = {Proceedings of the IEEE Symposium on Security and Privacy},
+  booktitle = {Proceedings of the IEEE Symposium on Security and Privacy (S\&P)},
+  pages     = {230--245},
   year      = {2000},
 }
 
@@ -118,13 +121,14 @@
   title   = {Efficient Guided Generation for Large Language Models},
   journal = {arXiv preprint arXiv:2307.09702},
   year    = {2023},
+  note    = {The Outlines library},
 }
 
 @misc{llamacpp,
   author       = {Gerganov, Georgi and {llama.cpp contributors}},
   title        = {{llama.cpp}: {LLM} inference in {C/C++}, and the {GBNF} grammar format},
   howpublished = {\url{https://github.com/ggml-org/llama.cpp}},
-  note         = {VERIFY: repository owner/URL and citation form},
+  note         = {The GBNF grammar format; repository formerly ggerganov/llama.cpp},
   year         = {2023},
 }
 
@@ -155,23 +159,22 @@
   author    = {Greshake, Kai and Abdelnabi, Sahar and Mishra, Shailesh and Endres, Christoph and Holz, Thorsten and Fritz, Mario},
   title     = {Not What You've Signed Up For: Compromising Real-World {LLM}-Integrated Applications with Indirect Prompt Injection},
   booktitle = {Proceedings of the 16th ACM Workshop on Artificial Intelligence and Security (AISec)},
+  pages     = {79--90},
   year      = {2023},
 }
 
 @inproceedings{debenedetti2024agentdojo,
   author    = {Debenedetti, Edoardo and Zhang, Jie and Balunovi{\'c}, Mislav and Beurer-Kellner, Luca and Fischer, Marc and Tram{\`e}r, Florian},
   title     = {{AgentDojo}: A Dynamic Environment to Evaluate Prompt Injection Attacks and Defenses for {LLM} Agents},
-  booktitle = {Advances in Neural Information Processing Systems (NeurIPS) Datasets and Benchmarks Track},
+  booktitle = {Advances in Neural Information Processing Systems 37 (NeurIPS), Datasets and Benchmarks Track},
   year      = {2024},
-  note      = {VERIFY: author list and track},
 }
 
 @inproceedings{zhan2024injecagent,
   author    = {Zhan, Qiusi and Liang, Zhixiang and Ying, Zifan and Kang, Daniel},
   title     = {{InjecAgent}: Benchmarking Indirect Prompt Injections in Tool-Integrated Large Language Model Agents},
-  booktitle = {Findings of the Association for Computational Linguistics (ACL)},
+  booktitle = {Findings of the Association for Computational Linguistics: ACL 2024},
   year      = {2024},
-  note      = {VERIFY: author list},
 }
 
 @article{debenedetti2025camel,
@@ -179,5 +182,5 @@
   title   = {Defeating Prompt Injections by Design},
   journal = {arXiv preprint arXiv:2503.18813},
   year    = {2025},
-  note    = {CaMeL. VERIFY: author list and arXiv id},
+  note    = {CaMeL},
 }

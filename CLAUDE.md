@@ -818,6 +818,34 @@ FDT claims a GICv3 but carries no readable `reg`.
   non-positive marginal cost prints "below noise floor" — a saturating
   subtraction is not evidence that a gate is free. The design write-up lives in
   [`paper/`](paper/).
+  **The taint policy is enforced at EIGHT sites, not one, and `/redteam`
+  (`security::redteam`) is the census.** The Synapse executor gates destructive
+  primitives; the tool router *separately* gates destructive shell commands,
+  `/http`, MCP `tools/call`, agent-memory mutations, downloads, browser
+  navigation, nested `run_shell_command`, and the web tools — so a **new tool
+  binding that forgets its check is a hole by omission**, and the corpus carries
+  one attack per site precisely so that shows up as a permitted attack instead of
+  as silence. It runs through the **real `Router`**, so the justification is
+  computed by `Router::justification` over `Session::resident_max_taint` exactly
+  as in an agent turn; a laundering bug on the way to the gate would surface as a
+  `NOT TAINTED` row. Three rules this harness must keep. It **assumes the
+  injection persuaded the model** (the payload text is never read by a gate) —
+  that is the worst case and it is what makes the numbers deterministic and
+  model-independent; it measures the *authorization* boundary, not the planner.
+  A **permitted attack really executes** under the baselines, so every target is
+  a sandbox path or the loopback discard port, pinned by
+  `corpus_targets_are_sandboxed_and_offline` — this is why the destructive-shell
+  attack is `rm` on a sandbox file and never `install`, and why the victim runs
+  as a throwaway agent identity (`REDTEAM_AGENT`): the memory-poison attack, if
+  permitted, writes durable memory that re-enters the system prompt, so running
+  it as the live orchestrator would poison the real shell agent as a side effect
+  of measuring whether that was possible. And **a non-policy error counts as
+  permitted** — a refused loopback connection is not a defence. The counterpart
+  measurement is the utility suite: benign tasks over the same primitives, whose
+  **false-refusal rate** (a destructive step refused when the untrusted content
+  never named its target) is the number that decides whether the policy is
+  usable, and it is reported next to the attack rate rather than separately,
+  because a defence is only interesting if it is good on both axes.
 - **Microkernel** — tasks + context switch, cooperative + timer-preemptive
   scheduler, unforgeable capabilities, IPC, SMP, frame allocator + heap, MMU.
 - **UI** — a tmux-style split-pane framebuffer compositor in Geist Mono. The
@@ -1388,6 +1416,7 @@ that can block without an interrupt check is a bug; cover it with an e2e `cancel
 scenario (drive raw `b"\x03"` via `guest.send_raw`, assert it aborts fast **and**
 the next command still runs) and a unit test on the pure poll logic
 (`poll_interrupt_ctrl_c_only_and_pushes_back`, `console::pushback_*`).
+
 ## Build / run / test
 
 Everything goes through `cargo xtask`. Arch is chosen explicitly, never

@@ -96,6 +96,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "Model & Agent", title: "Infer (parity)", name: "infer", shortcut: "" },
     Entry { category: "Model & Agent", title: "Perf Benchmark", name: "perf", shortcut: "" },
     Entry { category: "Model & Agent", title: "Bench: matvec | synapse gates", name: "bench", shortcut: "" },
+    Entry { category: "Model & Agent", title: "Red-team the agent boundary", name: "redteam", shortcut: "" },
     // Files
     Entry { category: "Files", title: "List Directory", name: "ls", shortcut: "" },
     Entry { category: "Files", title: "Print File", name: "cat", shortcut: "" },

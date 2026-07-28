@@ -11,6 +11,12 @@
 //! The other Phase 6 feature, self-compiling agents (compiled intents), lives
 //! with the runtime it caches in `crate::persona::compiled`.
 
+//! [`redteam`] is the evaluation half of the same story: an attack corpus, a
+//! benign-task suite, and weaker baselines, run against the real tool router so
+//! the policy is measured where it is actually enforced rather than where it is
+//! defined.
+
+pub mod redteam;
 pub mod taint;
 
 pub use taint::{Justification, Provenance};

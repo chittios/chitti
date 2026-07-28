@@ -544,7 +544,13 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
     match name {
         "help" => print_help(arg),
         "infer" => run_infer(),
-        "bench" => run_bench(),
+        "bench" => run_bench(arg),
+        // Self-evaluation of the determinism boundary: an injection corpus, the
+        // benign-task suite that prices its false refusals, and the weaker
+        // baselines it is claimed to beat (`security::redteam`).
+        "redteam" => {
+            crate::security::redteam::run();
+        }
         "perf" => run_perf(arg),
         "modelhash" => {
             // Integrity probe for the bundled model region (diagnoses a corrupt
