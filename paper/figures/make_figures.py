@@ -10,10 +10,16 @@ zoom and the type matches the body at 8pt.
 
 Design decisions, deliberate and worth keeping:
 
-* **Palette** is the OS's own brand terracotta plus three hues validated for
-  colour-vision deficiency (`dataviz/scripts/validate_palette.js`, light mode:
-  all checks pass, worst adjacent pair dE 12.5 protan / 22.9 normal; the exact
-  adjacent pairs each figure uses were validated separately).
+* **Palette** is the OS's own brand terracotta plus four hues validated for
+  colour-vision deficiency with `dataviz/scripts/validate_palette.js`, light mode,
+  **`--pairs all`** — every pair, not the adjacent ones a first pass happens to
+  sample. That distinction caught a real defect: the original gold scope hue
+  passed as an adjacent pair but sits at dE 10.0 (normal vision) against
+  terracotta, and `fig_blocked`'s caps+scope bar puts exactly those two segments
+  side by side. Gold is gone; scope is green. The surviving warning is
+  green-vs-terracotta at dE 6.8 protan, which the skill permits only with
+  secondary encoding — satisfied here by a direct value label in every segment, a
+  white gap between segments, and hatching on the subsets.
 * **Hue encodes exactly one dimension: which mechanism acted.** Terracotta is
   always "no gate stopped it", cyan always provenance, gold always scope, indigo
   always grammar, grey always a non-mechanism reference. Whether "nothing stopped
@@ -49,8 +55,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # "the scope gate" in one panel while meaning "nothing stopped it" in another.
 THROUGH = "#cc785c"  # terracotta: no gate stopped it (permitted / proceeded)
 PROV = "#0891b2"  # cyan: provenance (the taint gate)
-SCOPE = "#b58900"  # gold: scope
+SCOPE = "#2e7d32"  # green: scope
 GRAMMAR = "#6349b8"  # indigo: grammar
+CAPABILITY = "#b0447a"  # rose: capability
 # Grey is the non-mechanism role: reference magnitudes and whole-policy baselines.
 INK = "#141413"
 BODY = "#3d3d3a"
@@ -114,9 +121,9 @@ def _label_on(colour):
     """Ink or white, whichever the segment can actually carry.
 
     The cut is at 0.22 rather than the intuitive 0.5 because it is set by the
-    marginal case: white on this gold is 3.2:1, which is legal for large text and
-    not for a 7pt number, while ink on it is 5.4:1. So the three mid-tone hues take
-    ink and only the two dark ones take white — legible per segment instead of
+    marginal cases, not the obvious ones: terracotta and cyan are light enough that
+    a 7pt number reads better in ink than in white, while green, rose, indigo and
+    grey are not. Picking per segment keeps every in-bar number legible instead of
     legible on average.
     """
     r, g, b = (int(colour[i:i + 2], 16) / 255 for i in (1, 3, 5))
@@ -136,7 +143,7 @@ def fig_cost(path):
     fig, (a, b) = plt.subplots(1, 2, figsize=(6.6, 2.1), gridspec_kw={"width_ratios": [1.25, 1]})
     fig.subplots_adjust(wspace=0.5)
 
-    seg_colours = {"grammar": GRAMMAR, "capability": MUTED, "taint": PROV, "scope": SCOPE}
+    seg_colours = {"grammar": GRAMMAR, "capability": CAPABILITY, "taint": PROV, "scope": SCOPE}
     left = 0.0
     for name, ns in DATA["gates"]:
         if ns <= 0:

@@ -9,6 +9,21 @@
 \usepackage{booktabs}
 \usepackage{listings}
 \usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,fit,backgrounds,calc}
+
+% The figure palette, shared with the generated figures so the paper has one
+% visual language: hue encodes which mechanism acted, never anything else.
+\definecolor{cThrough}{HTML}{CC785C} % terracotta: no gate stopped it
+\definecolor{cProv}{HTML}{0891B2}    % cyan: provenance
+\definecolor{cScope}{HTML}{2E7D32}   % green: scope
+\definecolor{cCap}{HTML}{B0447A}     % rose: capability
+\definecolor{cGrammar}{HTML}{6349B8} % indigo: grammar
+\definecolor{cInk}{HTML}{141413}
+\definecolor{cBody}{HTML}{3D3D3A}
+\definecolor{cMuted}{HTML}{6C6A64}
+\definecolor{cHair}{HTML}{E6DFD8}
+\definecolor{cWarm}{HTML}{FAF7F2}
 \usepackage{amsmath}
 \usepackage{amssymb}
 \usepackage{graphicx}
@@ -358,30 +373,70 @@ registry's declared order.},label={lst:wire}]
 {"name":"<registered name>","arguments":{"<k1>":<v1>,"<k2>":<v2>}}
 \end{lstlisting}
 
-% DRAFT FIGURE: monospace so it always compiles. Redraw as a vector figure
-% (TikZ) before submission -- the boundary line should be visually emphatic.
 \begin{figure}[t]
 \centering
-\begin{lstlisting}[frame=none,basicstyle=\ttfamily\footnotesize]
-        STOCHASTIC                      context: system | user | INGESTED
-   .-------------------------------------------------------------------.
-   |  model  --tokens-->  sampler  <--mask--  grammar (from registry)  |
-   '-------------------------------------------------------------------'
-                             |  candidate plan (a string)
-=============================|===================== the determinism boundary
-                             v      justification = join(resident provenance)
-   .-------------------------------------------------------------------.
-   |  1 grammar --> 2 capability --> 3 taint --> 4 scope --> execute   |
-   |      |              |              |           |                 |
-   |   Rejected       Denied      RefusedTainted  DeniedScope          |
-   |      '--------------'--------------'-----------'---> audit (all)  |
-   '-------------------------------------------------------------------'
-        DETERMINISTIC                   effects: store | net | ui | agents
-\end{lstlisting}
-\caption{A call's life. The grammar is generated once from the registry and
-used twice --- to mask the sampler above the boundary (liveness) and to
-revalidate below it (security). Every path, including all four refusals, writes
-exactly one audit record. Nothing below the line reads the model's prose.}
+\begin{tikzpicture}[
+  font=\footnotesize,
+  box/.style={draw=cMuted, line width=0.5pt, rounded corners=1.5pt, fill=white,
+              inner sep=3.5pt, align=center},
+  gate/.style={box, text=white, draw=none, minimum height=6.5mm, minimum width=15mm},
+  flow/.style={-{Stealth[length=4pt]}, draw=cBody, line width=0.5pt},
+  drop/.style={-{Stealth[length=3pt]}, draw=cMuted, line width=0.4pt, dashed, dash pattern=on 1pt off 1pt},
+  lbl/.style={text=cMuted, font=\scriptsize},
+]
+
+% --- above the boundary: the stochastic half -----------------------------
+\begin{scope}[on background layer]
+  \fill[cWarm] (-0.35,0.2) rectangle (13.15,2.6);
+\end{scope}
+\node[lbl, anchor=west, text=cBody] at (-0.3,2.35) {\textbf{STOCHASTIC}};
+\node[lbl, anchor=east] at (13.1,2.35) {context: \textsc{system} $\sqcup$ \textsc{user} $\sqcup$ \textsc{ingested}};
+
+\node[box] (model) at (1.5,1.4) {model};
+\node[box] (sampler) at (5.0,1.4) {sampler};
+\node[box, draw=cGrammar, text=cGrammar] (gram) at (9.6,1.4) {grammar\\\scriptsize generated from the registry};
+\draw[flow] (model) -- node[lbl, above] {tokens} (sampler);
+\draw[flow] (gram) -- node[lbl, above] {mask} node[lbl, below] {(liveness)} (sampler);
+
+% --- the boundary ---------------------------------------------------------
+\draw[cInk, line width=1.1pt] (-0.35,0.2) -- (13.15,0.2);
+\node[fill=white, inner xsep=4pt, font=\scriptsize\bfseries, text=cInk] at (10.6,0.2)
+  {the determinism boundary};
+\draw[flow, line width=0.7pt] (5.0,0.95) -- (5.0,-0.55);
+\node[lbl, anchor=west, align=left] at (5.15,0.62)
+  {a candidate plan: \emph{a string}, plus a justification};
+\node[lbl, anchor=west, align=left] at (5.15,-0.2)
+  {$=$ join of the resident context's provenance};
+
+% --- below the boundary: the deterministic half ---------------------------
+\node[gate, fill=cGrammar] (g1) at (1.6,-1.35) {1 grammar};
+\node[gate, fill=cCap]     (g2) at (4.0,-1.35) {2 capability};
+\node[gate, fill=cProv]    (g3) at (6.4,-1.35) {3 taint};
+\node[gate, fill=cScope]   (g4) at (8.8,-1.35) {4 scope};
+\node[box, fill=cThrough, text=white, draw=none, minimum height=6.5mm,
+      minimum width=15mm] (ex) at (11.5,-1.35) {execute};
+\foreach \a/\b in {g1/g2, g2/g3, g3/g4, g4/ex} \draw[flow] (\a) -- (\b);
+
+\node[box, draw=cMuted, minimum width=104mm] (audit) at (6.55,-3.15)
+  {audit log --- append-only, one record per attempt, refusals included};
+
+% Every path lands in the log, which is the claim the caption makes: four
+% refusals and the executed call, five arrows, one box.
+\foreach \g/\t in {g1/{rejected}, g2/{denied}, g3/{refused}, g4/{out of scope}}
+  \draw[drop] (\g.south) -- (\g.south |- audit.north)
+    node[lbl, midway, right, inner sep=1.5pt] {\t};
+\draw[flow, draw=cMuted] (ex.south) -- (ex.south |- audit.north);
+
+\node[lbl, anchor=west, text=cBody] at (-0.3,-3.75) {\textbf{DETERMINISTIC}};
+\node[lbl, anchor=east] at (13.1,-3.75) {effects: store $\cdot$ net $\cdot$ ui $\cdot$ agents};
+\end{tikzpicture}
+\caption{A call's life. One grammar, generated from the registry, is used
+\emph{twice}: above the boundary it masks the sampler so an ill-formed call
+cannot be emitted, and below it the executor reparses --- only the second use is
+in the trusted computing base (\S\ref{sec:grammar}). The four gates run in a
+fixed order and only then does a primitive execute; every path, including all
+four refusals, writes exactly one audit record. Nothing below the line reads the
+model's prose.}
 \label{fig:boundary}
 \end{figure}
 

@@ -190,12 +190,21 @@ python3 figures/capture.py                         # screenshots (boots QEMU, ~4
 
 Three decisions worth not undoing:
 
-- **Palette** is the OS's own brand terracotta (`DESIGN.md`) plus three hues that
-  pass the CVD validator in the `dataviz` skill (light mode, all checks; the exact
-  adjacent pairs each figure uses were validated separately, not just the full set).
+- **Palette** is the OS's own brand terracotta (`DESIGN.md`) plus four hues that
+  pass the CVD validator in the `dataviz` skill under **`--pairs all`** — every
+  pair, not just the adjacent ones a first pass samples. That distinction caught a
+  shipped defect: the original **gold** scope hue passed as an adjacent pair but
+  sits at ΔE 10.0 (normal vision) against terracotta, and `fig_blocked`'s
+  caps+scope bar puts exactly those two side by side. Scope is now green. The one
+  surviving warning (green vs terracotta, ΔE 6.8 protan) is in the band the skill
+  allows *only* with secondary encoding — satisfied by a direct value label in
+  every segment, a white gap between segments, and hatching on subsets.
 - **Hue encodes exactly one dimension: which mechanism acted.** Terracotta always
-  means "no gate stopped it", cyan provenance, gold scope, indigo grammar, grey a
-  non-mechanism reference. The first draft had terracotta doubling as "the scope
+  means "no gate stopped it", cyan provenance, green scope, indigo grammar, rose
+  capability, grey a non-mechanism reference. The boundary diagram (`fig:boundary`,
+  drawn in TikZ so its type matches the body) uses the same key, which is why
+  capability needed a hue of its own rather than the grey it started with — grey
+  says "not a mechanism", and capability is one. The first draft had terracotta doubling as "the scope
   gate", which is the mistake the rule exists to prevent. Hatching always marks a
   *subset* of the segment beside it.
 - **Screenshots are captured at the console's native font scale.** Capturing at
