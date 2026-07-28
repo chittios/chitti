@@ -780,9 +780,9 @@ floor of the thing it guards, and there is no security/performance tradeoff
 here to argue about.
 
 \textbf{Result} (Table~\ref{tab:e1}). The full decision costs
-$\mathbf{1.36\,\mu s}$ (median of 4 runs; range 1.14--1.64\,$\mu$s), against
+$\mathbf{1.37\,\mu s}$ (median of 5 runs; range 1.14--1.68\,$\mu$s), against
 43\,ms to decode one token at the measured 23\,tok/s. The boundary is therefore
-$\mathbf{3\times10^{-5}}$ of a token: the system could cross it roughly 32{,}000
+$\mathbf{3\times10^{-5}}$ of a token: the system could cross it roughly 31{,}000
 times per token generated. The hypothesis is confirmed in the only sense that
 matters --- the ratio --- and refuted in its detail: the decision is
 microseconds, not hundreds of nanoseconds, and \S\ref{sec:limits-cost} says
@@ -791,20 +791,21 @@ useful property: the argument survives the cost being wrong by a factor of ten
 in either direction.
 
 Two results were not anticipated. First, \emph{the fine-grained gate dominates}:
-the scope check is $\sim$920\,ns, about 68\% of the decision and more than twice
+the scope check is $\sim$930\,ns, about 68\% of the decision and more than twice
 the other three gates combined, while capability and taint are at or below this
 method's noise floor (a table scan and a boolean, respectively --- they cost
 nothing measurable). Second, \emph{recording the decision costs about as much as
-making it}: one audit append is $\sim$990\,ns, 73\% of the gate chain. Neither
+making it}: one audit append is $\sim$970\,ns, 71\% of the gate chain. Neither
 threatens the ratio, but both say the same thing about where effort should go if
 this path ever becomes hot.
 
 \textbf{Status.} Measured on aarch64 under HVF at release profile
-(model-less guest, 8 vCPU, Apple silicon). \textbf{Not} measured on x86: the
-only x86 target available here is QEMU TCG, where an emulated figure would be
+(model-less guest, 8 vCPU, Apple silicon), 5 runs. \textbf{Not} measured on x86:
+the only x86 target available here is QEMU TCG, where an emulated figure would be
 meaningless, so that row needs real hardware or KVM. Run-to-run variance is
-$\pm$18\%, from hypervisor scheduling and allocator state; we report medians and
-the range rather than a single best number.
+$\pm$20\%, from hypervisor scheduling and allocator state; we report medians and
+the full range rather than a single best number, and no conclusion here turns on
+a factor of two.
 
 The end-to-end test asserts the attribution as well as the cost: each refusal
 row must name the gate that refused it, so the same run that produces these
@@ -817,25 +818,25 @@ numbers also demonstrates that each gate is the one stopping its own case.
 \toprule
 \textbf{Measured} & \textbf{ns/call} & \textbf{ticks} & \textbf{Note} \\
 \midrule
-Gate 1 grammar (marginal)        & 421  & 10 & parse + typed args of a 60-byte call \\
+Gate 1 grammar (marginal)        & 435  & 10 & parse + typed args of a 60-byte call \\
 Gate 2 capability (marginal)     & $<$20 & --- & below noise floor; a table scan \\
 Gate 3 taint (marginal)          & $<$20 & --- & below noise floor; flag $\wedge$ integrity \\
-Gate 4 scope (marginal)          & 921  & 22 & normalize + build target + ledger walk \\
+Gate 4 scope (marginal)          & 934  & 22 & normalize + build target + ledger walk \\
 \midrule
-\textbf{Full authorization decision} & \textbf{1358} & 32 & all four, target in scope \\
-\quad with no scope ledger       & 812  & 20 & deny-only-when-recorded: the common path \\
-\quad refused at gate 1 (malformed) & 66   & 2  & cheapest path: dies at the first bad byte \\
-\quad refused at gate 2 (no capability) & 1038 & 25 & \\
-\quad refused at gate 3 (tainted) & 1060 & 25 & \\
-\quad refused at gate 4 (out of scope) & 1510 & 36 & \\
+\textbf{Full authorization decision} & \textbf{1373} & 32 & all four, target in scope \\
+\quad with no scope ledger       & 832  & 20 & deny-only-when-recorded: the common path \\
+\quad refused at gate 1 (malformed) & 72   & 2  & cheapest path: dies at the first bad byte \\
+\quad refused at gate 2 (no capability) & 992  & 24 & \\
+\quad refused at gate 3 (tainted) & 1053 & 25 & \\
+\quad refused at gate 4 (out of scope) & 1465 & 35 & \\
 \midrule
-Argument hash (FNV-1a, 60 B)     & 70   & 2  & computed before gate 1 \\
-Audit append (one record)        & 986  & 24 & \\
+Argument hash (FNV-1a, 60 B)     & 69   & 2  & computed before gate 1 \\
+Audit append (one record)        & 966  & 23 & \\
 \midrule
 One decoded token (reference)    & $4.3\times10^{7}$ & --- & 0.8B Q8, 23\,tok/s, \code{/perf} \\
 \bottomrule
 \end{tabular}
-\caption{E1, medians of 4 runs on aarch64/HVF, release profile. Ticks are a
+\caption{E1, medians of 5 runs on aarch64/HVF, release profile. Ticks are a
 constant-rate counter at $\sim$24\,MHz ($\sim$42\,ns each), reported as a
 cross-check on the millisecond clock, not as CPU cycles. The claim under test is
 the ratio between the bold row and the last one.}
@@ -1144,8 +1145,8 @@ undone.
 \label{sec:limits-cost}
 E1 puts $\sim$68\% of the authorization decision in the scope gate, and the
 breakdown says why: against a task with \emph{no} ledger entry the same call
-costs 812\,ns rather than 1358, so roughly 550\,ns is the ledger walk and glob
-match \emph{for a single-entry ledger}, and most of the remaining 375\,ns is
+costs 832\,ns rather than 1373, so roughly 540\,ns is the ledger walk and glob
+match \emph{for a single-entry ledger}, and most of the remaining 390\,ns is
 building the target --- the path is normalized into a fresh string and wrapped in
 a fresh \code{Scope} before anything is compared. Both are allocations on a
 first-fit kernel heap, in the one gate that runs per call on every path. Nothing
@@ -1160,7 +1161,7 @@ should --- should expect to pay there, and should not assume the total stays in
 the noise merely because it does today.
 
 The same measurement makes an odd observation about the audit log: appending one
-record ($\sim$990\,ns) costs about as much as the entire decision it records.
+record ($\sim$970\,ns) costs about as much as the entire decision it records.
 That is a Vec push under a lock plus the field-by-field comparison the ktrace
 coalescer does to decide whether this entry repeats the last one. It is fixable
 and unfixed.

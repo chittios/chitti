@@ -82,20 +82,20 @@ remembering because each printed a plausible wrong number:
 
 ### Results (filled in §5.1, Table `tab:e1`)
 
-Medians of 4 runs, aarch64/HVF, release, idle host. Full authorization decision
-**1358 ns** (range 1144–1644, ±18%) against 43 ms per decoded token — a ratio of
-**3×10⁻⁵**, i.e. ~32,000 gate crossings per token. Two findings that were not
+Medians of 5 runs, aarch64/HVF, release, idle host. Full authorization decision
+**1373 ns** (range 1144–1682, ±20%) against 43 ms per decoded token — a ratio of
+**3×10⁻⁵**, i.e. ~31,000 gate crossings per token. Two findings that were not
 expected:
 
-- **The fine-grained gate dominates.** Scope is ~921 ns (68% of the decision);
+- **The fine-grained gate dominates.** Scope is ~934 ns (68% of the decision);
   capability and taint are both *below the noise floor*. Against a task with no
-  ledger entry the same call is 812 ns, so ~550 ns is the ledger walk + glob for
-  a **single-entry** ledger and ~375 ns is building the normalized target. Both
+  ledger entry the same call is 832 ns, so ~540 ns is the ledger walk + glob for
+  a **single-entry** ledger and ~390 ns is building the normalized target. Both
   are heap allocations in the one gate that runs on every path — fixable
   (borrow the normalized path; compare a one-entry ledger without constructing a
   `Scope`), and written up as a limitation rather than hidden.
 - **Recording the decision costs as much as making it.** One audit append is
-  ~986 ns, 73% of the whole gate chain: a `Vec` push under a lock plus the
+  ~966 ns, 71% of the whole gate chain: a `Vec` push under a lock plus the
   field-by-field comparison the ktrace coalescer does per record.
 
 Not measured on **x86** — the only x86 target here is QEMU TCG, where the figure
