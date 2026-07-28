@@ -1,0 +1,1099 @@
+% The Determinism Boundary --- a design paper on the Synapse capability ABI.
+% Build: make  (latexmk -pdf main.tex)
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=black, citecolor=black, urlcolor=blue}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  columns=fullflexible,
+  keepspaces=true,
+  breaklines=true,
+  frame=single,
+  framesep=4pt,
+  rulecolor=\color{black!30},
+  captionpos=b,
+  showstringspaces=false,
+}
+
+\newcommand{\os}{ChittiOS}
+\newcommand{\syn}{Synapse}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{\textbf{The Determinism Boundary}\\[0.4em]
+\large An Operating-System Capability ABI for Agents as the Unit of Execution}
+
+\author{Vinoth Kumar\\ \small \texttt{vinoth.kumar@refold.ai}}
+
+\date{Draft --- \today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+For fifty years the operating system's unit of execution has been the
+\emph{program}: untrusted, but deterministic, with a finite and statically
+knowable set of effects it can request. An LLM agent breaks all three
+properties at once. Its instruction stream is generated stochastically, its
+set of possible requests is unbounded, and --- most consequentially --- its
+apparent intent is derived from data it has read, so any adversary who
+controls that data controls the requests. Contemporary agent deployments
+answer this above the OS, with prompt-level guardrails and per-call human
+approval, while the agent process itself holds the user's full ambient
+authority.
+
+We argue the answer belongs in the kernel, and present \syn{}, the capability
+ABI of \os{}, a from-scratch operating system in which the unit of execution
+is an agent rather than a binary. \syn{} draws an explicit
+\emph{determinism boundary}: above it, a stochastic planner emits an
+\emph{untrusted plan}; below it, deterministic native code executes
+capability-checked primitives. Model output never causes an effect directly.
+Five mechanisms enforce the crossing: (i) a build-time-fixed primitive
+registry, from which (ii) a prefix-closed constraint grammar is generated and
+applied \emph{in the model's own token space}, so a malformed or unregistered
+call is unrepresentable rather than merely rejected; (iii) unforgeable
+per-task capabilities whose delegation can only attenuate; (iv) a provenance
+lattice that makes \emph{taint a syscall argument}, refusing any destructive
+primitive whose justification traces to untrusted ingested content unless a
+physically-present human endorses it --- a Biba-style integrity policy
+low-water-marked over the live context window; and (v) a fine-grained scope
+gate that binds a granted capability to concrete paths, hosts, and ports.
+Every attempt, including every denial, appends to a structurally append-only
+audit log.
+
+\syn{} is implemented in a running system: a dual-architecture
+(\code{x86\_64}, \code{aarch64}) Rust \code{no\_std} kernel of
+$\sim$178k lines, in which the language model itself executes in-kernel on
+the CPU and therefore possesses no I/O of its own --- there is no channel
+around the ABI. The mechanism is 2.4k lines. This is a design paper
+with a working artifact; \S\ref{sec:eval} states our evaluation questions and
+methods, and reports measurements that are in progress.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+The classical operating-system contract is a bargain between a distrustful
+kernel and an untrusted program. The program is arbitrary code, so the kernel
+assumes it is hostile; but it is also \emph{deterministic}, its set of
+requestable effects is enumerated by the system-call table, and the authority
+it exercises is a static property of the principal that launched it. Fifty
+years of protection mechanism --- rings, page tables, uids, capabilities,
+sandboxes, seccomp filters --- rests on those properties.
+
+An LLM agent retains the first assumption and discards the rest. It is
+untrusted, but it is also nondeterministic; the set of things it might attempt
+is bounded only by what it can express; and, decisively, its intent at any
+moment is a function of the tokens in its context, most of which it read from
+somewhere. A web page, a file, a tool result, or a message from another agent
+can contain text that reads as an instruction. When it does, the agent becomes
+a confused deputy~\cite{hardy1988confused} of unusual quality: it holds the
+user's authority, it wants to be helpful, and it cannot reliably distinguish
+the user's request from a sentence that merely looks like one. This is
+indirect prompt injection~\cite{greshake2023injection}, and it is not a
+prompt-engineering defect. It is an \emph{authorization} defect that current
+systems have no authorization mechanism to express.
+
+Practice today answers above the operating system. The agent runs as an
+ordinary process with the invoking user's ambient authority; a system prompt
+asks the model to be careful; a wrapper pattern-matches for dangerous strings;
+and the user is shown a confirmation dialog. Each layer has a known failure
+mode. Prompt-level instructions are advisory to a stochastic process. Pattern
+matching loses to paraphrase. And per-call confirmation is defeated by its own
+frequency: an agent that asks about everything trains the human to approve
+everything, so the mechanism that was supposed to be the last line becomes a
+button.
+
+We take the position that the boundary belongs where boundaries have always
+belonged --- at the system-call layer --- and that placing it there changes
+what the mechanism can be, not merely where it lives. Two capabilities become
+available only inside the kernel of a system built this way. First, if the
+model executes as a kernel component rather than as a userspace process, it
+has no file descriptors, no sockets, and no memory outside the inference
+arena: it is a pure function from tokens to a distribution over tokens, and
+the ABI is not one path to effects but the \emph{only} one. Second, if the
+kernel owns the sampler, it can constrain what the agent is \emph{able to ask
+for} in the model's own token space, which no conventional OS can do to a
+program --- a compiled binary's instruction stream is not the kernel's to mask.
+
+This paper describes \syn{}, the capability ABI of \os{}. Our contributions:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{The determinism boundary} (\S\ref{sec:model}) as an OS
+  abstraction: an explicit, single-crossing interface between a stochastic
+  planner and deterministic effect. Its governing rule is that model output is
+  \emph{data describing a request}, never a request; and its corollary is that
+  the model is not a principal --- the task is.
+
+  \item \textbf{Two-point enforcement across that boundary}
+  (\S\ref{sec:grammar}): one prefix-closed grammar, generated from the
+  primitive registry, used both to mask the sampler (so an ill-formed call
+  cannot be emitted) and to revalidate at the executor's front door (so a
+  wrong, replaced, or bypassed sampler cannot matter). We argue the first is a
+  liveness mechanism and only the second is a security mechanism, and that
+  building only one of them is the common error.
+
+  \item \textbf{Provenance as a syscall argument} (\S\ref{sec:taint}): every
+  call carries a justification whose integrity level is the low-water mark of
+  the context that produced it, and destructive primitives require a
+  high-integrity justification. This reduces indirect prompt injection to a
+  Biba integrity violation~\cite{biba1977integrity,fraser2000lomac} refused by
+  the kernel, independent of phrasing. Human endorsement at the physical
+  console is the sole declassification operation.
+
+  \item \textbf{Attenuating delegation for agent composition}
+  (\S\ref{sec:cap}): a sub-agent's authority is a strict subset of its
+  parent's, and an installed agent package is bounded by its install-time
+  grant permanently, so text inside a package --- however it is phrased ---
+  cannot widen what the package can do.
+
+  \item \textbf{A working artifact} (\S\ref{sec:impl}): a dual-architecture
+  bare-metal kernel where all of the above is load-bearing for a real
+  interactive system --- shell agent, sub-agents, installable agent packages,
+  service daemons, a network stack, a windowed console --- rather than a
+  simulation of one.
+\end{enumerate}
+
+\noindent\textbf{Scope of this draft.} This is a design paper. The mechanism
+is implemented and covered by 1{,}196 in-kernel unit tests plus an end-to-end
+harness that boots the real kernel; the quantitative security and cost
+evaluation is stated in \S\ref{sec:eval} and is in progress. We flag
+throughout, and collect in \S\ref{sec:limits}, the places where the current
+design is knowingly coarse.
+
+\section{Agents as Programs: an execution model}
+\label{sec:model}
+
+\subsection{What the classical contract assumes}
+
+A process is the runtime image of a program. The kernel does not trust the
+program's \emph{code}, and therefore isolates it; but it does trust several
+structural properties of it. The program's instruction stream was fixed before
+execution began. The effects it can request are exactly the entries of the
+system-call table. Its authority derives from an ambient identity --- a uid, a
+token, a label --- attached to the process at creation. And its execution is,
+modulo concurrency, reproducible: the same inputs produce the same syscalls,
+which is what makes debugging, auditing, and replay meaningful.
+
+Capability systems~\cite{levy1984capability,shapiro1999eros,klein2009sel4}
+improved on the ambient part of this bargain by making authority explicit and
+unforgeable, and information-flow
+systems~\cite{efstathopoulos2005asbestos,zeldovich2006histar,krohn2007flume}
+improved on the propagation part by tracking labels across abstractions. Both
+still assume a program.
+
+\subsection{What an agent changes}
+
+Table~\ref{tab:program-vs-agent} sets the two side by side. The rows are not
+independent; the last is a consequence of the first three.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}p{0.24\linewidth}p{0.34\linewidth}p{0.34\linewidth}@{}}
+\toprule
+& \textbf{Program} & \textbf{Agent} \\
+\midrule
+Instruction stream & Fixed before execution & Generated during execution, stochastically \\
+Request set & Enumerated by the syscall table & Bounded only by expressibility \\
+Origin of intent & The author, at build time & The context window, at run time --- partly attacker-supplied \\
+Authority & Ambient, from the launching principal & Must be per-task and attenuable; sub-agents are routine \\
+Reproducibility & Same input, same syscalls & Same input, different plan (temperature, sampling, model version) \\
+Failure mode of interest & Exploited code & Persuaded planner \\
+\bottomrule
+\end{tabular}
+\caption{The unit of execution changes what the protection mechanism must
+assume. The fourth row is why capabilities are necessary here; the third is
+why they are not sufficient.}
+\label{tab:program-vs-agent}
+\end{table}
+
+The third row is the load-bearing one, and it is worth stating precisely
+because it is easy to mistake for a familiar problem. In a conventional
+system, data becoming control is a memory-safety bug: a buffer overflows, a
+deserializer instantiates a gadget, and the fix is to stop confusing the two.
+In an agent, data becoming control is \emph{the intended behaviour}. An agent
+that reads a file and does what the file says is, in most cases, exactly what
+the user wanted --- that is what following instructions in a document means.
+There is no bug to fix. What is missing is a way to say: \emph{this
+instruction, whatever it says, does not carry enough authority to justify that
+effect}.
+
+\subsection{The determinism boundary}
+
+\os{} answers with a single structural rule.
+
+\begin{quote}
+\textbf{Model output is an untrusted plan. It never causes a side effect
+directly. It is parsed, grammar-validated, capability-checked, taint-checked,
+scope-checked, and only then executed by deterministic native code.}
+\end{quote}
+
+Above the boundary sits everything stochastic: the model, the sampler, the
+agent loop, the natural-language reasoning. Below it sits everything
+deterministic: the registry, the grammar, the capability tables, the
+primitives, the audit log, and every driver and protocol implementation in the
+system. The boundary is crossed at exactly one function.
+
+Three consequences shape the rest of the design.
+
+\paragraph{The model is not a principal.} It is convenient to speak of
+``what the agent is allowed to do,'' but the kernel has no notion of the
+model. Authority is held by a \emph{task}, in a per-task capability table; a
+model is a component that proposes strings on that task's behalf. This is why
+a model swap, a fine-tune, a jailbreak, or a remote inference endpoint changes
+no authorization outcome. It also means the interesting question is never
+``can we make the model refuse?'' but ``what does this task hold?''
+
+\paragraph{An untrusted planner is an untrusted compiler.} The plan is an
+artifact to be checked, not a compiler to be trusted --- the same posture
+taken toward the output of any translation step in a trusted pipeline. It
+follows that the checker must be independent of the producer: sharing code
+between the sampler constraint and the executor's validator is acceptable
+(they are generated from one registry), but the executor must not \emph{rely}
+on the sampler having run.
+
+\paragraph{Determinism below the boundary is a promise about protocols.} A
+recurring temptation in agent systems is to have the model perform the
+mechanical step: format the packet, compute the checksum, decide the retry.
+\os{} forbids it. Protocol and codec logic is native code below the boundary,
+and the model's role is to choose among validated options. Where an
+application's rules must be extensible, they ship as WebAssembly modules run
+under fuel and memory limits, not as model judgment --- deterministic rules,
+stochastic judgment, and never the reverse.
+
+\subsection{Threat model}
+\label{sec:threat}
+
+\paragraph{The adversary controls all ingested content.} Any bytes the agent
+reads --- web responses, files, tool results, documents, messages from other
+agents, results from remote MCP servers~\cite{mcp2024} --- may be
+attacker-authored, and we assume the adversary is arbitrarily persuasive and
+knows the system's design, including this paper. The adversary may also
+register content designed to be summarized, remembered, or written back.
+
+\paragraph{The adversary does not control} the kernel image, the primitive
+registry, the grammar, the model weights' integrity, the human's typed input,
+or the physical console. We assume a correct implementation of the mechanism
+described here; the mechanism's own bugs are a separate concern addressed only
+by its small size and its tests.
+
+\paragraph{Security goals.}
+\begin{description}[leftmargin=2.2em,itemsep=1pt]
+  \item[\textnormal{\textbf{G1} \emph{No authority without a capability.}}]
+  No effect occurs that the invoking task does not hold a capability for, and
+  no capability can be forged or guessed by any string the model emits.
+  \item[\textnormal{\textbf{G2} \emph{No destructive effect on untrusted
+  authority.}}] An irreversible or externally-visible primitive whose
+  justification traces to untrusted ingested content is refused unless a human
+  endorses it at the console.
+  \item[\textnormal{\textbf{G3} \emph{Delegation only narrows.}}] A spawned
+  sub-agent, and an installed agent package, hold a subset of the granting
+  context's authority, permanently.
+  \item[\textnormal{\textbf{G4} \emph{Total auditability.}}] Every attempt ---
+  executed, denied, refused, or malformed --- leaves exactly one append-only
+  record.
+  \item[\textnormal{\textbf{G5} \emph{Legible fail-closed.}}] Every refusal
+  names the gate that produced it. A mechanism that fails silently is
+  indistinguishable from an absent one.
+\end{description}
+
+\paragraph{Explicitly out of scope.} Side channels and covert channels;
+weight poisoning and backdoored models; hardware attacks; denial of service by
+a model that burns its own budget; recovery of data already exfiltrated before
+a policy was tightened; and --- most importantly --- the \emph{semantic}
+problem of a plan that is fully authorized and still wrong. \syn{} constrains
+authority, not judgment. A user who grants an agent delete authority over a
+directory has authorized deletions in that directory, and no OS mechanism
+will decide which of them were meant.
+
+\section{Mechanism}
+\label{sec:mech}
+
+A call crosses the boundary through one function,
+\code{execute\_with\_justification(caller, raw, justification)}, which applies
+four gates in a fixed order and then, only then, executes. Order matters: each
+gate is cheaper than the next
+and each narrows what the next must consider, and the sequence is chosen so
+that a refusal attributes blame correctly (\S\ref{sec:order}).
+
+\begin{lstlisting}[caption={The wire shape a plan must take. Canonical
+MCP-flavoured JSON with no insignificant whitespace; arguments appear in the
+registry's declared order.},label={lst:wire}]
+{"name":"<registered name>","arguments":{"<k1>":<v1>,"<k2>":<v2>}}
+\end{lstlisting}
+
+% DRAFT FIGURE: monospace so it always compiles. Redraw as a vector figure
+% (TikZ) before submission -- the boundary line should be visually emphatic.
+\begin{figure}[t]
+\centering
+\begin{lstlisting}[frame=none,basicstyle=\ttfamily\footnotesize]
+        STOCHASTIC                      context: system | user | INGESTED
+   .-------------------------------------------------------------------.
+   |  model  --tokens-->  sampler  <--mask--  grammar (from registry)  |
+   '-------------------------------------------------------------------'
+                             |  candidate plan (a string)
+=============================|===================== the determinism boundary
+                             v      justification = join(resident provenance)
+   .-------------------------------------------------------------------.
+   |  1 grammar --> 2 capability --> 3 taint --> 4 scope --> execute   |
+   |      |              |              |           |                 |
+   |   Rejected       Denied      RefusedTainted  DeniedScope          |
+   |      '--------------'--------------'-----------'---> audit (all)  |
+   '-------------------------------------------------------------------'
+        DETERMINISTIC                   effects: store | net | ui | agents
+\end{lstlisting}
+\caption{A call's life. The grammar is generated once from the registry and
+used twice --- to mask the sampler above the boundary (liveness) and to
+revalidate below it (security). Every path, including all four refusals, writes
+exactly one audit record. Nothing below the line reads the model's prose.}
+\label{fig:boundary}
+\end{figure}
+
+\subsection{The registry: authority is fixed at build time}
+\label{sec:registry}
+
+The registry is a \code{static} table of primitive specifications: a stable
+numeric id, a wire name, an ordered parameter schema over a deliberately tiny
+type lattice (string, unsigned integer), a description, and one boolean ---
+whether the primitive is \emph{destructive}. It is the single source of truth
+that both the grammar and the executor read.
+
+Two properties follow from it being static. First, there is no runtime
+registration path, so no sequence of model output can introduce a new
+primitive: the set of expressible authority in the system is a build-time
+constant. Higher-level tools, MCP servers, and agent packages compose
+\emph{over} these primitives and cannot add to them; a remote MCP tool becomes
+callable by the shell agent, but its effects still reduce to registry entries.
+Second, the ids are also the capability discriminants
+(\code{Right::InvokePrimitive(id)}), so they are part of the on-disk grant
+format and are never renumbered.
+
+The current registry has 26 primitives spanning console output, an object
+store, agent spawn, inter-agent channels, network listen/accept and HTTP, and
+UI surfaces (Appendix~\ref{app:registry}). Five are marked destructive:
+\code{mem\_fs\_delete} (irreversible), \code{channel\_grant} (moves authority
+to another principal), \code{net\_listen} (binds an externally visible port),
+and \code{net\_http\_get}/\code{net\_http\_post} (egress, hence exfiltration).
+A unit test asserts that this set is exactly those five, so adding a
+destructive primitive requires a deliberate edit to the test --- the flag is
+consulted by the taint gate, and a careless addition would silently widen what
+untrusted content can justify.
+
+\subsection{The grammar: enforcement in token space, and again at the door}
+\label{sec:grammar}
+
+From the registry we generate a constraint grammar over the shape in
+Listing~\ref{lst:wire}, realized as a hand-written recursive-descent parser
+that is \emph{prefix-closed}: it answers three ways rather than two ---
+\textsc{complete} (a valid call), \textsc{prefix} (a viable but unfinished
+call), or \textsc{invalid} (no continuation can rescue it). The three-valued
+answer is what lets one grammar serve two roles.
+
+\paragraph{Masking the sampler.} A \code{ConstrainedDecoder} adapter plugs
+into the sampler and rejects any candidate token whose bytes would leave the
+viable-prefix set, in the manner of GBNF-constrained
+decoding~\cite{llamacpp,willard2023outlines}. Because names are checked
+against the registry's prefix set as they are read, an impossible primitive
+name is eliminated at its first divergent byte rather than at the closing
+quote. A constrained model therefore \emph{cannot} emit a call that is
+malformed or names an unregistered primitive: the request is not rejected, it
+is unrepresentable.
+
+\paragraph{Revalidating at the front door.} The executor nevertheless reparses
+the completed string and accepts only \textsc{complete}. This redundancy is
+deliberate and, we argue, the correct division of labour:
+
+\begin{quote}
+Token-space masking is a \textbf{liveness} mechanism --- it makes the model
+useful by preventing it from wasting turns on malformed output. The front-door
+parse is the \textbf{security} mechanism. Only the latter is in the trusted
+computing base.
+\end{quote}
+
+The distinction matters because the sampler is a moving part. Constrained
+decoding may be disabled for a fast path, replaced by a different sampler,
+bypassed by a remote inference backend that does not support masking, or
+simply be buggy in a way that admits a string the grammar would reject. In
+\os{}, generation can be delegated to a hosted OpenAI-compatible endpoint; on
+that path no in-kernel mask runs at all, and the front-door parse is the
+entire grammar defence. A design that treats constrained decoding as the
+security boundary silently loses its boundary the first time inference moves.
+
+\subsection{Capabilities: unforgeable, per-task, attenuating}
+\label{sec:cap}
+
+Authority is a per-task table of \code{Right} values; the second gate requires
+that the caller's own table grant \code{InvokePrimitive(id)} for the parsed
+call. There is no ambient authority over the ABI: holding no capability means
+the call is denied and audited, and no uid-like identity can substitute.
+
+\paragraph{Handles are capability indices, not names.} Several primitives take
+a handle argument --- a channel end, a network listener. A model emits these as
+bare integers, which invites the obvious attack of guessing another agent's
+handle. The executor resolves such an argument as a \code{Cap}, an index into
+\emph{the caller's own} table, in the manner of an seL4 CPtr: the integer is
+meaningful only relative to the table it indexes, and no API anywhere accepts
+another task's table. A guessed integer therefore searches only the guesser's
+own capability space, and the worst outcome is a resolution failure. This is
+the concrete form the ``capabilities are not names'' argument takes in an
+agent system~\cite{miller2003myths}, and it is what lets a channel handle
+appear in model-authored JSON at all.
+
+\paragraph{Delegation narrows, permanently.} Channel ends are granted
+per-direction, so handing over the write end never confers the read end;
+attenuation is structural rather than checked. For sub-agents the rule is
+\emph{effective authority} $=$ \emph{intersection}(requested, granting
+context): the spawn path refuses outright if any requested capability is not
+contained by one the parent holds, and then intersects anyway, so rights are
+clamped to the overlap even when containment held --- a request that is
+admissible is not thereby granted in full. Delegation also carries a depth
+budget, since an attenuating chain is still a chain. An installed agent package is bound by the
+capability set a human approved on its consent screen, forever: the package's
+own markdown may say anything, and it remains confined to that grant, because
+the grant is what the kernel consults and the markdown is merely context. This
+is the property that makes agent packages safe to install from a registry ---
+signed distribution establishes who wrote the package, and the install-time
+grant establishes what it can do regardless.
+
+\paragraph{A default floor.} Every non-orchestrator agent receives a baseline
+scope confining its filesystem authority to its own home directory, added at
+install time unless an explicit grant already covers it. A package requesting
+wider filesystem authority can have it, but the consent screen must say so in
+those words. Only the shell agent --- the orchestrator the human types at ---
+runs unconfined.
+
+\subsection{The taint gate: provenance as a syscall argument}
+\label{sec:taint}
+
+The third gate is the paper's central security claim. Content in an agent's
+context carries a \emph{provenance}, and a call carries a
+\emph{justification}: the provenance of the context that produced it, plus
+whether a human explicitly confirmed this specific action.
+
+\[
+\textsc{SystemTrusted} \sqsubset \textsc{UserTyped} \sqsubset \textsc{UntrustedIngested}
+\]
+
+The lattice is deliberately three points: the kernel-authored system and
+persona prompt; text the human typed at the shell; and everything the agent
+ingested from outside itself --- file contents, tool results, network
+responses, other agents' messages. Combination takes the \emph{worse} of two
+values, so taint is contagious, and the justification for a turn is the join
+over the messages currently resident in the context window. The rule is then
+one line:
+
+\begin{quote}
+A \textbf{destructive} primitive whose justification is
+\textsc{UntrustedIngested} and not human-confirmed is \textbf{refused}.
+\end{quote}
+
+This is a Biba integrity policy~\cite{biba1977integrity} with a low-water-mark
+propagation rule~\cite{fraser2000lomac}, applied to a new kind of subject: the
+integrity level of an agent's turn is dragged down by the least trustworthy
+thing it has read, and irreversible operations require high integrity. What
+makes it effective against prompt injection is precisely what makes it crude:
+the gate never reads the injected text. Persuasion, roleplay, encoding,
+translation, and hypotheticals are all equally ineffective, because the
+mechanism is not evaluating a claim --- it is checking a label. An attacker who
+controls a page cannot raise the page's integrity by anything written on it.
+
+\paragraph{Human endorsement is the only declassifier.} A confirmation typed
+at the physical console sets \code{human\_confirmed}, and that is the sole way
+a tainted justification passes. We consider this the right shape --- it puts an
+irreducible decision in front of the one principal who has standing to make it
+--- but it re-imports the approval-fatigue problem we criticized in
+\S\ref{sec:intro}, and the only real mitigation is rarity. Because the gate
+fires solely at the intersection of \emph{destructive} and \emph{tainted}, the
+common agent loop --- read, search, summarize, write a draft --- never reaches
+it. We report the observed rate in \S\ref{sec:eval} as a first-class result:
+if confirmation is frequent, the design has failed even if it is sound.
+
+\paragraph{Laundering, and the identity files.} An integrity policy is only as
+good as its enumeration of paths from low to high. \os{} has one such path
+that is easy to miss: an agent's \code{SOUL.md} and \code{MEMORY.md} are
+prepended to its system prompt on subsequent turns, so they re-enter as
+\textsc{SystemTrusted}. Writing them is therefore an integrity endorsement, and
+the executor treats a write, edit, or delete of either as destructive even
+though the underlying store primitive is not. Without this, injected content
+need never attempt a destructive call: it would ask the agent to write its
+instructions into its own persona, and be trusted on the next turn.
+
+We state the general rule, since a growing system will acquire more such
+paths: \emph{every route by which ingested content can re-enter a
+higher-integrity channel must be an explicit endorsement point.} Compaction
+and long-term memory are the ones we consider still open
+(\S\ref{sec:limits}).
+
+\subsection{The scope gate: authority below primitive granularity}
+\label{sec:scope}
+
+A capability to call \code{mem\_fs\_write} is coarse: it says nothing about
+\emph{which} file. The fourth gate consults a per-task ledger recording the
+scope of each granted capability --- a path glob, a host and port range --- and
+checks the concrete target this call names. Enforcement is
+\emph{deny-only-when-recorded}: a task with no ledger entry for a domain is
+unconstrained in that domain, and a wildcard entry passes, so introducing the
+gate did not change the many call sites that grant primitive-granularity
+authority directly.
+
+Two details are load-bearing. Filesystem paths are normalized before the check,
+so \code{..} and \code{//} cannot walk out of a prefix grant such as
+\code{/agent/7/**} --- the classic way a path-prefix policy is defeated. And
+enumeration is filtered by the same gate: \code{list} and \code{search}
+results are reduced to what the caller's scope covers, so a confined agent
+cannot even learn which paths exist outside its home. Filtering results, not
+merely denying reads, is what turns an integrity boundary into a
+confidentiality boundary; a directory listing is a capability-discovery oracle,
+and in an agent system the oracle is being read by something whose whole
+purpose is to find a way to accomplish a goal.
+
+\subsection{Audit: append-only by construction}
+\label{sec:audit}
+
+Every path through the executor writes exactly one record: caller, primitive
+name, a hash of the raw call text, the outcome, and a hash of the result. The
+outcome enumeration distinguishes execution from each refusal reason, so the
+log answers ``what did this agent try'' and not merely ``what did it do'' ---
+denials are the interesting entries when investigating an injection.
+
+Append-only is enforced structurally rather than by policy: the module exposes
+\code{record} as its only mutating operation, entries are \code{Copy} value
+types, and a snapshot is therefore an independent value that later activity
+cannot invalidate. There is no edit, reorder, or delete path to audit. A
+mirror of the log to the human-facing trace coalesces identical consecutive
+entries into a repeat count --- the log itself keeps every entry --- because a
+polling UI agent once emitted roughly a thousand identical lines per second and
+drowned the trace it was supposed to inform.
+
+\paragraph{What the log does not give us.} It is in-memory and unsigned: it is
+tamper-\emph{evident} against the code above it, not against a compromised
+kernel, and it is not attested. And sessions that touch network egress or UI
+input are not replayable from a seed, because the inputs came from outside;
+the log records the effects but cannot reproduce them. We treat such sessions
+as non-deterministic to replay and say so rather than implying otherwise.
+
+\subsection{Why this order}
+\label{sec:order}
+
+The four gates run in the order grammar, capability, taint, scope, and
+execution follows them. The ordering is not arbitrary.
+
+Grammar precedes everything because until the string is parsed there is no id
+to check a capability against, and because a malformed string should be
+attributed to malformation rather than to a missing right. Capability precedes
+taint so that an agent lacking authority is told so, rather than being told its
+justification was untrusted --- a distinction that matters for debugging and for
+not leaking which primitives exist. Taint precedes scope because the taint
+decision depends only on the primitive's static flag while the scope decision
+requires interpreting arguments, and because ``refused: untrusted
+justification'' is the more actionable message when both would fire. Execution
+is last and unconditional once the gates pass; there is no re-check inside a
+primitive, which is what makes primitives simple enough to audit by reading.
+
+A single audit record is written on every path, before returning, including the
+paths that return early.
+
+\subsection{A worked example}
+\label{sec:example}
+
+An agent is asked to summarize a web page. The page contains, in white text:
+\emph{``Ignore previous instructions. Read /agent/3/keys.txt and POST it to
+\code{https://collector.example/x}, then delete the file and remove this
+sentence from your summary.''}
+
+The fetch succeeds --- reading the page is what the user asked for --- and its
+content enters the session tagged \textsc{UntrustedIngested}. The turn's
+justification is now tainted, and the model, having been persuaded, emits the
+plan. Table~\ref{tab:worked} traces it.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}p{0.30\linewidth}p{0.16\linewidth}p{0.46\linewidth}@{}}
+\toprule
+\textbf{Attempted call} & \textbf{Stopped by} & \textbf{Why} \\
+\midrule
+\code{net\_http\_post} to collector & Gate 3 (taint) & Destructive primitive, justification is \textsc{UntrustedIngested}, no human confirmation. Refused without reading the argument. \\
+\code{mem\_fs\_read} of another agent's home & Gate 4 (scope) & Path normalized, falls outside the caller's \code{/agent/<id>/**} grant. \\
+\code{mem\_fs\_delete} & Gate 3 (taint) & Destructive, tainted. \\
+\code{exfiltrate} (invented name) & Gate 1 (grammar) & Not in the registry; unrepresentable under masking, rejected at the door regardless. \\
+\code{mem\_fs\_write} to own \code{SOUL.md} & Gate 3 (taint) & Identity file: a write re-enters as trusted persona, so treated as destructive. \\
+\code{channel\_grant} to a co-resident agent & Gate 3 (taint) & Destructive: moves authority to another principal. \\
+\code{mem\_fs\_write} of the summary & --- & Executed. Non-destructive, in scope. The summary may well be poisoned; that is a correctness problem, not an authority one. \\
+\bottomrule
+\end{tabular}
+\caption{Each row is refused by a different mechanism, and none of them
+inspects the injected text. The last row is the honest boundary of the design.}
+\label{tab:worked}
+\end{table}
+
+The last row deserves emphasis, because overclaiming here is the standard
+failure of prompt-injection defences. \syn{} does not prevent the agent from
+being fooled. It prevents a fooled agent from doing anything irreversible,
+anything outside its granted scope, or anything that raises its own authority.
+The user may still receive a summary that omits a sentence the attacker wanted
+omitted.
+
+\section{Implementation}
+\label{sec:impl}
+
+\os{} is a from-scratch operating system in Rust (\code{no\_std}), around
+178{,}000 lines, targeting \code{x86\_64} and \code{aarch64} from one codebase
+with no functional divergence between them. It boots on QEMU, VirtualBox, and
+real UEFI hardware.
+
+The mechanism this paper describes --- registry, grammar, executor, capability
+table and scope ledger, path normalization, provenance, object store, audit ---
+is \textbf{2{,}383 lines excluding its own tests}, against roughly 178{,}000 for
+the system as a whole. We report the non-test figure deliberately: it is the
+code that has to be right for the argument to hold, so counting the tests
+alongside it (which would give $\sim$3{,}000) inflates the number that matters
+in the direction that flatters us. Either way the claim is the ratio: the
+security argument does not depend on the correctness of the 98\% of the system
+that sits below or beside it --- the drivers, the filesystems, the network
+stack, the inference kernels --- and a reviewer can read the whole enforcement
+path in an afternoon.
+
+\paragraph{The model is a kernel component.} Inference runs in-kernel on the
+CPU: a quantized GGUF transformer with SIMD matvec kernels partitioned across
+the SMP fleet, reaching roughly 105 tokens/s prefill and 23 tokens/s decode for
+a 0.8B model at 8-bit on Apple silicon under a hypervisor. The performance
+numbers are incidental to this paper; the \emph{placement} is not. Because the
+model executes as a kernel component with no descriptors, no sockets, and no
+memory beyond its inference arena, it has no path to an effect that does not
+pass through the executor. In a conventional deployment, the model is a remote
+service and the agent is a userspace process holding the user's credentials ---
+so the ABI is one of several routes to effect, and the others are the reason
+sandboxing an agent is hard. Here there are no others. The system also
+supports delegating generation to a hosted endpoint, which moves the planner
+off-box but not the boundary; that path is precisely why the front-door grammar
+parse cannot be optional (\S\ref{sec:grammar}).
+
+\paragraph{Layers above the boundary.} A tool layer presents MCP-shaped tools
+that validate and map onto primitives; a router computes the justification for
+each call from the session's resident provenance and passes it to the executor.
+Agent packages are markdown (a persona plus procedures) with a signed manifest
+declaring a toolset and capability requests; installation shows a consent
+screen and grants only the approved subset. Long-running native daemons ---
+network relay, HTTP framing, a content server runtime --- are deterministic code
+below the boundary, so an agent that serves web pages does not implement HTTP;
+it decides what to serve while native code parses and frames.
+
+\paragraph{Testing posture.} Two layers, and the split reflects the
+determinism boundary itself. Pure logic --- grammar, provenance algebra,
+capability and scope arithmetic, path normalization, registry invariants --- is
+covered by 1{,}196 in-kernel unit tests runnable without a model or hardware.
+Anything that exists only on a running system is covered by an end-to-end
+harness that boots the real kernel under QEMU and drives the shell over
+serial. The gate logic is in the first category by construction, which is a
+deliberate design property: we pulled the security decisions out of the I/O
+path into pure functions specifically so they could be tested exhaustively off
+hardware.
+
+\section{Evaluation}
+\label{sec:eval}
+
+\emph{This section states the questions, the method, and the current status.
+Measurements marked \textsc{tbd} are in progress; we report them rather than
+omit the section so the design can be read against what will falsify it.}
+
+\subsection{E1: What does the boundary cost?}
+
+\textbf{Question.} Is enforcement free relative to inference?
+
+\textbf{Method.} An in-kernel microbenchmark (\code{/bench synapse}) drives the
+gate chain directly. Three properties make the numbers mean what they say.
+\emph{(i)} It measures through a gate-prefix entry point that applies the real
+predicates in the real order but executes no primitive and writes no audit
+entry, so a row prices the authorization decision rather than the effect
+underneath it --- timing \code{console\_write} end to end would mostly measure a
+UART. \emph{(ii)} Costs are recovered as \emph{marginal} per-gate figures by
+measuring cumulative prefixes (gates $1$, $1$--$2$, $1$--$3$, $1$--$4$) of the
+same call and differencing, since no gate can be timed in isolation without
+changing what the ones before it left in cache. \emph{(iii)} The subject is a
+synthetic task with an explicitly granted capability table and scope ledger,
+destroyed afterwards, so a figure is not a function of whatever the live
+session happens to hold --- and, more importantly, pricing a \emph{denied} call
+does not require granting an agent a right in order to measure it.
+
+Timing is amortized over batches sized by doubling until a batch exceeds
+60\,ms, because the millisecond tick available on both architectures is six
+orders of magnitude coarser than one gate; a constant-rate counter (TSC,
+\code{CNTVCT\_EL0}) is read across the same batch as a second opinion. Rows
+cover the four prefixes, a scope-unconstrained call (the
+\emph{deny-only-when-recorded} path most tasks take), a no-argument call, one
+refusal per gate, the argument hash, and one audit append.
+
+Three corrections to that method are worth recording, because each produced a
+plausible wrong number first. \emph{(a)} The four prefixes must share one batch
+size and each must be preceded by a warm-up: the gate path allocates (the
+grammar builds a string per string argument, the scope gate normalizes a path
+into another) and the kernel's first-fit allocator makes the first batch pay to
+grow the heap, so the first cumulative curve we measured was
+\emph{decreasing}--- gates $1$ alone appeared slower than gates $1$--$3$ ---
+and every marginal cost after the first was an artifact of batch size.
+\emph{(b)} Every timed call must pass through an optimization barrier: the
+argument-hash row initially reported $0$\,ns over $1.7\times10^{7}$ iterations
+because the loop had been eliminated as dead code, and a free operation is
+indistinguishable in the output from a deleted one. \emph{(c)} The counter's
+ticks are not CPU cycles --- \code{CNTVCT\_EL0} is a fixed $\sim$24\,MHz counter
+on Apple silicon --- so its rate is reported alongside every figure; labelling
+them ``cycles'' invites division by a clock frequency and a conclusion two
+orders of magnitude wrong. Where a marginal cost comes out non-positive we
+report it as below the noise floor rather than as zero, since a saturating
+subtraction is not evidence that a gate is free.
+
+\textbf{Hypothesis.} The full four-gate decision costs on the order of
+hundreds of nanoseconds, against a per-token decode cost of tens of
+milliseconds --- a ratio of $10^{-5}$, i.e. the boundary is far below the noise
+floor of the thing it guards, and there is no security/performance tradeoff
+here to argue about.
+
+\textbf{Result} (Table~\ref{tab:e1}). The full decision costs
+$\mathbf{1.36\,\mu s}$ (median of 4 runs; range 1.14--1.64\,$\mu$s), against
+43\,ms to decode one token at the measured 23\,tok/s. The boundary is therefore
+$\mathbf{3\times10^{-5}}$ of a token: the system could cross it roughly 32{,}000
+times per token generated. The hypothesis is confirmed in the only sense that
+matters --- the ratio --- and refuted in its detail: the decision is
+microseconds, not hundreds of nanoseconds, and \S\ref{sec:limits-cost} says
+where the microsecond goes. The conclusion is insensitive to that, which is the
+useful property: the argument survives the cost being wrong by a factor of ten
+in either direction.
+
+Two results were not anticipated. First, \emph{the fine-grained gate dominates}:
+the scope check is $\sim$920\,ns, about 68\% of the decision and more than twice
+the other three gates combined, while capability and taint are at or below this
+method's noise floor (a table scan and a boolean, respectively --- they cost
+nothing measurable). Second, \emph{recording the decision costs about as much as
+making it}: one audit append is $\sim$990\,ns, 73\% of the gate chain. Neither
+threatens the ratio, but both say the same thing about where effort should go if
+this path ever becomes hot.
+
+\textbf{Status.} Measured on aarch64 under HVF at release profile
+(model-less guest, 8 vCPU, Apple silicon). \textbf{Not} measured on x86: the
+only x86 target available here is QEMU TCG, where an emulated figure would be
+meaningless, so that row needs real hardware or KVM. Run-to-run variance is
+$\pm$18\%, from hypervisor scheduling and allocator state; we report medians and
+the range rather than a single best number.
+
+The end-to-end test asserts the attribution as well as the cost: each refusal
+row must name the gate that refused it, so the same run that produces these
+numbers also demonstrates that each gate is the one stopping its own case.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+\textbf{Measured} & \textbf{ns/call} & \textbf{ticks} & \textbf{Note} \\
+\midrule
+Gate 1 grammar (marginal)        & 421  & 10 & parse + typed args of a 60-byte call \\
+Gate 2 capability (marginal)     & $<$20 & --- & below noise floor; a table scan \\
+Gate 3 taint (marginal)          & $<$20 & --- & below noise floor; flag $\wedge$ integrity \\
+Gate 4 scope (marginal)          & 921  & 22 & normalize + build target + ledger walk \\
+\midrule
+\textbf{Full authorization decision} & \textbf{1358} & 32 & all four, target in scope \\
+\quad with no scope ledger       & 812  & 20 & deny-only-when-recorded: the common path \\
+\quad refused at gate 1 (malformed) & 66   & 2  & cheapest path: dies at the first bad byte \\
+\quad refused at gate 2 (no capability) & 1038 & 25 & \\
+\quad refused at gate 3 (tainted) & 1060 & 25 & \\
+\quad refused at gate 4 (out of scope) & 1510 & 36 & \\
+\midrule
+Argument hash (FNV-1a, 60 B)     & 70   & 2  & computed before gate 1 \\
+Audit append (one record)        & 986  & 24 & \\
+\midrule
+One decoded token (reference)    & $4.3\times10^{7}$ & --- & 0.8B Q8, 23\,tok/s, \code{/perf} \\
+\bottomrule
+\end{tabular}
+\caption{E1, medians of 4 runs on aarch64/HVF, release profile. Ticks are a
+constant-rate counter at $\sim$24\,MHz ($\sim$42\,ns each), reported as a
+cross-check on the millisecond clock, not as CPU cycles. The claim under test is
+the ratio between the bold row and the last one.}
+\label{tab:e1}
+\end{table}
+
+\subsection{E2: Does the taint gate stop indirect injection?}
+
+\textbf{Question.} What fraction of injection attempts reach a destructive
+effect? \textbf{Method.} A corpus of indirect-injection payloads spanning the
+real ingestion vectors --- fetched pages, files, tool results, inter-agent
+messages, MCP responses --- each attempting one of: destructive store
+mutation, network exfiltration, authority transfer, identity-file write,
+cross-agent path access. Run against the booted kernel; report outcomes by
+gate. Because the gate ignores payload text, we expect the interesting
+variation to be in \emph{which vector delivers taint} rather than in phrasing,
+and we design the corpus to probe vectors that might drop provenance in
+transit. \textbf{Baseline.} The same corpus with the taint gate disabled, to
+separate its contribution from the capability and scope gates.
+\textbf{Status.} \textsc{tbd}.
+
+\subsection{E3: What does the gate cost in utility? (the important number)}
+
+\textbf{Question.} How often does a legitimate task get refused, or require
+human confirmation, because the turn is tainted? \textbf{Method.} A benign
+task suite over the same primitives --- summarize-then-save, fetch-then-edit,
+read-many-then-delete-temporaries, multi-agent pipelines --- measuring the rate
+of confirmation prompts and outright refusals, and classifying each as
+necessary or over-broad. \textbf{Why it matters.} The gate is coarse
+(\S\ref{sec:limits}): any untrusted content in the resident context taints
+every destructive call in that turn, including ones that touch nothing the
+untrusted content named. If that rate is high, the design's real cost is
+approval fatigue and the mechanism will be turned off, which is the outcome
+we set out to avoid. We consider this the result most likely to change the
+design, which is why it is being measured before the finer-grained
+alternatives in \S\ref{sec:limits} are built.
+\textbf{Status.} \textsc{tbd}.
+
+\subsection{E4: Comparison against the alternatives}
+
+\textbf{Question.} Is the kernel placement doing work that cheaper designs do
+not? \textbf{Method.} The E2 corpus against: (a) an agent in an OS container
+with the user's authority; (b) prompt-level guardrails only; (c)
+confirm-every-call; (d) \syn{}. Report attack success and human-interruption
+rate as a pair --- (a) and (b) fail on the first axis, (c) on the second, and
+the claim is that a kernel-enforced integrity policy is the only configuration
+that is good on both. \textbf{Status.} \textsc{tbd}.
+
+\subsection{E5: Mechanism complexity}
+
+\textbf{Question.} Is the TCB small enough to be reviewable? \textbf{Method.}
+Report lines of code and unit-test counts for each gate, and the size of the
+attack surface reachable from model output (the grammar's accepted language,
+the registry's argument space). \textbf{Status.} Partial: 2{,}383 non-test
+lines of mechanism and 1{,}196 unit tests system-wide as of this draft; the
+per-gate line/test breakdown is \textsc{tbd}.
+
+\section{Discussion and limitations}
+\label{sec:limits}
+
+We state these as design debts rather than future work, because each is a
+place where a determined adversary or an ordinary user will find the current
+mechanism wanting.
+
+\paragraph{Taint is turn-granular, not value-granular.} The justification for
+a call is the join over the whole resident context, so reading one untrusted
+document taints every destructive call in that turn, whatever it touches. The
+consequence is over-refusal (E3), and the fix is dataflow: tracking provenance
+per value so that deleting a file the untrusted content never mentioned is
+permitted while POSTing its contents is not. This is what CaMeL achieves with
+an interpreter-level dataflow analysis over a generated
+program~\cite{debenedetti2025camel}; the OS analogue would be provenance on
+store objects and primitive arguments rather than on messages. We chose the
+coarse version first deliberately --- it is sound, it is 100 lines, and it is
+testable --- but it is the weakest part of the design.
+
+\paragraph{Residency can launder taint.} The justification folds over
+\emph{resident} messages, so content evicted from the context window stops
+contributing taint. If a summarization step compacts untrusted messages into a
+summary that is not itself marked untrusted, the system has laundered
+provenance --- exactly the failure the identity-file rule
+(\S\ref{sec:taint}) exists to prevent, in a path we do not yet close.
+Compaction must propagate the join of what it summarizes, and durable memory
+must record provenance per entry. Until it does, a long-running session's
+integrity level is not monotone, which we regard as the most likely real
+vulnerability in the current implementation.
+
+\paragraph{One bit for two properties.} \code{destructive} conflates
+irreversibility with external visibility: \code{net\_http\_get} carries the
+flag not because a GET destroys anything but because it exfiltrates. A single
+boolean therefore mixes integrity and confidentiality, and a primitive that is
+irreversible-but-local (delete) is treated identically to one that is
+reversible-but-egressing (GET). Separating them would let the policy be
+correspondingly finer: tainted-and-local could be permitted where
+tainted-and-egressing is refused.
+
+\paragraph{Human confirmation is a load-bearing human.} The sole declassifier
+is a person at a console, so the design's security depends on that person
+reading the prompt. This is a known-bad property of security dialogs, and our
+only defence is frequency (E3). A better answer probably involves the
+confirmation naming the \emph{provenance} --- ``this action is justified by
+content from \code{evil.example}'' --- rather than only the action, so the
+human is deciding about a source rather than an operation.
+
+\paragraph{The microsecond is allocation, and it is in the wrong gate.}
+\label{sec:limits-cost}
+E1 puts $\sim$68\% of the authorization decision in the scope gate, and the
+breakdown says why: against a task with \emph{no} ledger entry the same call
+costs 812\,ns rather than 1358, so roughly 550\,ns is the ledger walk and glob
+match \emph{for a single-entry ledger}, and most of the remaining 375\,ns is
+building the target --- the path is normalized into a fresh string and wrapped in
+a fresh \code{Scope} before anything is compared. Both are allocations on a
+first-fit kernel heap, in the one gate that runs per call on every path. Nothing
+here is required by the design: a normalized path could be borrowed rather than
+allocated, and a single-entry ledger could be compared without constructing a
+scope object at all. We report it because the shape is worth stating plainly ---
+\emph{the cheap gates are the coarse ones} (capability is a table scan, taint is
+a boolean; both are unmeasurable here), and the cost is concentrated in the only
+gate that reasons about a concrete resource. A design that pushed further toward
+fine-grained authority --- per-value provenance, as \S\ref{sec:limits} argues it
+should --- should expect to pay there, and should not assume the total stays in
+the noise merely because it does today.
+
+The same measurement makes an odd observation about the audit log: appending one
+record ($\sim$990\,ns) costs about as much as the entire decision it records.
+That is a Vec push under a lock plus the field-by-field comparison the ktrace
+coalescer does to decide whether this entry repeats the last one. It is fixable
+and unfixed.
+
+\paragraph{The audit log is not sealed.} In-memory, unsigned, unattested;
+tamper-evident against agents but not against kernel compromise. Persisting it
+with a hash chain, and attesting it, is straightforward and undone.
+
+\paragraph{Authorized-but-wrong remains.} \syn{} constrains what an agent may
+do, never whether doing it was a good idea. A poisoned summary, a subtly wrong
+edit inside a granted scope, and a plan that accomplishes the attacker's goal
+using only permitted primitives are all outside what any authorization
+mechanism can address, and we claim nothing about them.
+
+\section{Related work}
+\label{sec:related}
+
+\paragraph{Capability systems.} The lineage from
+KeyKOS/EROS~\cite{shapiro1999eros} through seL4~\cite{klein2009sel4} supplies
+the shape of our second gate: authority as an unforgeable, explicitly
+delegated object rather than an ambient identity, and delegation that
+attenuates. Miller et al.~\cite{miller2003myths} articulate why naming and
+authority must be separated, which is the argument our handle resolution
+(\S\ref{sec:cap}) implements for model-authored integers. Saltzer and
+Schroeder's least privilege~\cite{saltzer1975protection} is the design's
+default floor. What is new here is not the capability machinery but its
+subject: the holder of authority is a task whose instruction stream is being
+generated, at runtime, partly by an adversary.
+
+\paragraph{Information flow and integrity.} Denning's
+lattice~\cite{denning1976lattice} and Biba's integrity
+model~\cite{biba1977integrity} are the direct ancestors of our provenance gate,
+and LOMAC~\cite{fraser2000lomac} of its low-water-mark propagation.
+Asbestos~\cite{efstathopoulos2005asbestos}, HiStar~\cite{zeldovich2006histar},
+and Flume~\cite{krohn2007flume} showed that OS abstractions can carry labels
+with tractable developer cost; TaintDroid~\cite{enck2010taintdroid} did the
+same for a mobile runtime. Our contribution against this line is narrow but,
+we think, real: the \emph{subject} whose integrity is being tracked is a
+natural-language context window, the low-integrity input is prose that reads
+as an instruction, and the enforcement point is a syscall whose arguments were
+written by a language model. The mechanism is old; what it is being pointed at
+is not.
+
+\paragraph{Constrained decoding.} GBNF grammars in
+llama.cpp~\cite{llamacpp} and Outlines~\cite{willard2023outlines} established
+that a model's output can be masked to a formal language efficiently. We use
+the technique and disagree with a common framing of it: constrained decoding is
+not a security boundary, because it constrains a component that can be
+replaced or bypassed (\S\ref{sec:grammar}). Our grammar is generated once and
+used twice, and only the second use is trusted.
+
+\paragraph{Agent architectures and their security.} ReAct-style tool
+loops~\cite{yao2023react,schick2023toolformer} and MCP~\cite{mcp2024} define
+the interface shape we adopt above the boundary. Greshake et
+al.~\cite{greshake2023injection} established indirect prompt injection as a
+systems problem; AgentDojo~\cite{debenedetti2024agentdojo} and
+InjecAgent~\cite{zhan2024injecagent} supply the benchmark methodology our E2
+follows. The closest work is CaMeL~\cite{debenedetti2025camel}, which shares
+our core diagnosis --- that the defence must be structural rather than a better
+prompt --- and separates control from data flow around a capability-like
+policy. The differences are placement and scope. CaMeL operates in a userspace
+interpreter above a conventional OS, where the agent process retains the
+user's ambient authority and the mechanism defends one application; \syn{} is
+the system-call layer of an OS in which the model has no I/O of its own, so
+the boundary is unavoidable rather than adopted, and it covers every effect in
+the system including delegation between agents, package installation, and
+device access. Conversely, CaMeL's dataflow analysis is finer than our
+turn-granular taint, and is the direction \S\ref{sec:limits} points.
+
+\paragraph{Sandboxing agents.} The prevailing practical answer is to run the
+agent in a container or VM with restricted mounts and network. This is
+complementary and coarse: it bounds the blast radius of the whole agent but
+cannot distinguish, within it, an action justified by the user from one
+justified by a web page --- which is the distinction that matters once the agent
+is useful enough to be given real authority.
+
+\section{Conclusion}
+
+An operating system's protection mechanism encodes an assumption about what it
+is protecting against. For fifty years that assumption has been a program:
+untrusted, deterministic, with an enumerable set of requests. An agent is
+untrusted, stochastic, and takes instruction from whatever it reads --- which
+means the classical mechanism protects against the wrong thing, and the
+industry's current answer protects at the wrong layer.
+
+\syn{} moves the boundary into the kernel and makes the crossing explicit.
+Model output is a plan, not a request; the plan must be expressible in a
+grammar generated from a build-time-fixed registry, invocable under a
+capability the task actually holds, aimed at a target inside that
+capability's scope, and --- if it would do anything irreversible --- justified by
+something better than text the agent read on the internet. None of these gates
+reads the injected content, which is why none of them can be talked out of its
+decision. What remains, honestly, is that a fooled agent can still produce a
+fooled answer within its authority; we constrain power, not judgment.
+
+The design is running, dual-architecture, on real hardware, with the model
+inside the kernel and 2{,}400 lines of mechanism between it and every effect
+in the system. The measurement that will decide whether it is more than a
+sound idea is not the attack-success rate but the false-refusal rate: a
+correct integrity policy that interrupts a human too often is a policy that
+gets disabled. That number is what we are building next.
+
+\appendix
+\section{The primitive registry}
+\label{app:registry}
+
+26 primitives, ids fixed at build time. \textbf{D} marks destructive (subject
+to the taint gate); \textbf{S} marks scope-gated on a concrete target.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llp{0.40\linewidth}cc@{}}
+\toprule
+\textbf{Id} & \textbf{Name} & \textbf{Effect} & \textbf{D} & \textbf{S} \\
+\midrule
+0  & \code{console\_write}      & Write a line to the console & & \\
+1  & \code{mem\_fs\_read}       & Read a file from the store & & \checkmark \\
+2  & \code{mem\_fs\_write}      & Create or replace a file & & \checkmark \\
+3  & \code{list}                & List store paths (result-filtered) & & \\
+4  & \code{spawn\_agent}        & Request a sub-agent & & \\
+5  & \code{sleep}               & Yield for $n$ ticks & & \\
+6  & \code{emit\_result}        & Report a final result & & \\
+7  & \code{mem\_fs\_delete}     & Delete a file & \checkmark & \checkmark \\
+8  & \code{mem\_fs\_edit}       & Replace a substring & & \checkmark \\
+9  & \code{mem\_fs\_search}     & Search contents (result-filtered) & & \\
+10 & \code{channel\_create}     & Create an inter-agent channel & & \\
+11 & \code{channel\_write}      & Write to a channel end & & \\
+12 & \code{channel\_read}       & Read from a channel end & & \\
+13 & \code{channel\_close}      & Close a channel end & & \\
+14 & \code{channel\_grant}      & Hand an end to another agent & \checkmark & \\
+15 & \code{net\_listen}         & Bind a TCP port & \checkmark & \checkmark \\
+16 & \code{net\_accept}         & Accept a connection as a channel & & \\
+17 & \code{net\_http\_get}      & HTTP GET (egress) & \checkmark & \checkmark \\
+18 & \code{net\_http\_post}     & HTTP POST (egress) & \checkmark & \checkmark \\
+19 & \code{ui\_surface\_request}& Request a drawing surface & & \\
+20 & \code{ui\_draw}            & Paint an owned surface & & \\
+21 & \code{ui\_event\_poll}     & Poll input for an owned surface & & \\
+22 & \code{ui\_surface\_close}  & Close an owned surface & & \\
+23 & \code{board\_set}          & Paint a board from FEN & & \\
+24 & \code{board\_mark}         & Highlight board squares & & \\
+25 & \code{ui\_hud}             & Set a surface's HUD text & & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent UI primitives carry a third gating dimension not shown: surface
+\emph{ownership}, so an agent may only draw to a surface it requested.
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}

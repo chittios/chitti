@@ -660,6 +660,68 @@ def s_install_plan(g):
     return True, "read-only, refused a missing disk without touching anything"
 
 
+def s_synapse_bench(g):
+    """`/bench synapse` prices the determinism boundary, and each refusal row must
+    name the gate that actually refused.
+
+    Two things this covers that unit tests cannot. First, the cost: the security
+    argument for putting the capability gate in the kernel is that crossing it is
+    negligible against a token of inference, and that is a claim about a running
+    machine, not about arithmetic. Second, and more valuable, the *verdicts*: the
+    benchmark drives one call per refusal reason through the real gate predicates
+    on the booted kernel, so this asserts on live output that a malformed call
+    dies at the grammar, an ungranted primitive dies at the capability gate, a
+    destructive call under untrusted justification dies at the taint gate, and an
+    out-of-scope path dies at the scope gate. A gate silently stopping to bite
+    would show up here as the wrong `stop=` label.
+
+    Wall time is bounded by construction (each row is a batch sized to ~60 ms,
+    doubling up from 1024 iterations), so this costs a couple of seconds whether
+    the host is fast or emulating.
+    """
+    m = g.mark()
+    g.send("/bench synapse")
+    if not g.wait_for("full authorization decision", 90, m):
+        return False, "/bench synapse produced no summary line"
+    out = g.text()[m:]
+
+    # Each refusal must be attributed to the right gate.
+    want_stop = {
+        "refused: malformed": "grammar",
+        "refused: no capability": "capability",
+        "refused: tainted destructive": "taint",
+        "refused: outside scope": "scope",
+    }
+    for label, gate in want_stop.items():
+        row = next((l for l in out.splitlines() if label in l), None)
+        if row is None:
+            return False, f"missing benchmark row {label!r}"
+        if f"stop={gate}" not in row:
+            return False, f"{label!r} was not refused by the {gate} gate: {row.strip()!r}"
+
+    # The rows that are supposed to clear every gate must actually clear them --
+    # otherwise the headline number prices a denial, not an authorization.
+    for label in ("gates 1..4", "all gates, no-arg call"):
+        row = next((l for l in out.splitlines() if label in l), None)
+        if row is None:
+            return False, f"missing benchmark row {label!r}"
+        if "stop=passed" not in row:
+            return False, f"{label!r} did not pass all gates: {row.strip()!r}"
+
+    mt = re.search(r"full authorization decision: (\d+) ns/call", out)
+    if not mt:
+        return False, "no ns/call figure in the summary"
+    ns = int(mt.group(1))
+    # Sanity bounds, not a performance assertion: a plausible authorization
+    # decision is sub-millisecond even under emulation, and a zero would mean the
+    # batch never ran.
+    if ns == 0:
+        return False, "authorization decision measured as 0 ns (batch did not run)"
+    if ns > 1_000_000:
+        return False, f"authorization decision took {ns} ns/call -- gate path is pathological"
+    return True, f"4 gates attributed correctly; full decision {ns} ns/call"
+
+
 def s_network(g):
     m = g.mark()
     g.send("/network")
@@ -1888,6 +1950,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("memory_hierarchy", s_memory_hierarchy),
     ("fs_basic", s_fs_basic),
     ("install_plan", s_install_plan),
+    ("synapse_bench", s_synapse_bench),
     ("battery", s_battery),
     ("power_button", s_power_button),
     ("suspend_resume", s_suspend_resume),

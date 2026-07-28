@@ -797,6 +797,27 @@ FDT claims a GICv3 but carries no readable `reg`.
   egress or UI input aren't replayable from a seed alone (the I/O is external)
   — the audit log records the effects; treat such a session as
   non-deterministic to replay.
+  **What the boundary costs is measured, not asserted** (`synapse::bench`,
+  `/bench synapse`): the gate chain is priced through `executor::gate_prefix`,
+  which runs the real predicates in the real order but executes no primitive and
+  writes no audit entry, against a **synthetic parked task** whose table + scope
+  ledger are granted explicitly and killed after — measuring against the shell
+  agent would make a figure depend on what the session holds, and pricing a
+  *denied* call would mean granting an agent a right to measure it.
+  `gate_prefix` is a second copy of the gate order, so
+  `gate_prefix_agrees_with_execute` pins it to the real chain: a new gate that
+  isn't added to both fails that test. Three benchmark traps, each of which
+  printed a plausible wrong number first: a result-discarded pure call is
+  **deleted** by the optimizer (the FNV row read 0 ns over 16.7M iterations —
+  everything timed goes through `black_box`, and a zero-ms batch is flagged
+  SUSPECT rather than printed as 0); cumulative prefixes must share **one batch
+  size after a warm-up**, or the first batch pays to grow the heap and the curve
+  comes out *decreasing* (making every marginal cost an artifact); and
+  `cycle_count` is a **constant-rate tick, not a CPU cycle** (~24 MHz
+  `CNTVCT_EL0` on Apple silicon), so the rate is printed beside every figure. A
+  non-positive marginal cost prints "below noise floor" — a saturating
+  subtraction is not evidence that a gate is free. The design write-up lives in
+  [`paper/`](paper/).
 - **Microkernel** — tasks + context switch, cooperative + timer-preemptive
   scheduler, unforgeable capabilities, IPC, SMP, frame allocator + heap, MMU.
 - **UI** — a tmux-style split-pane framebuffer compositor in Geist Mono. The

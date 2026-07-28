@@ -23,6 +23,7 @@
 //! Phase 4 is capability checks only; provenance/taint gating is Phase 6.
 
 pub mod audit;
+pub mod bench;
 pub mod executor;
 pub mod fs;
 pub mod grammar;

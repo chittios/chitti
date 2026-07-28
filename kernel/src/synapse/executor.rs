@@ -134,6 +134,85 @@ pub fn execute_current(raw: &str) -> Invocation {
     execute(sched::current_task_id(), raw)
 }
 
+// --- Gate introspection (the measurement path) -------------------------------
+
+/// The gates a call clears before a primitive runs, in the order
+/// [`execute_with_justification`] applies them. 1-based, so 0 can mean "nothing
+/// refused".
+pub const GATE_GRAMMAR: u8 = 1;
+pub const GATE_CAPABILITY: u8 = 2;
+pub const GATE_TAINT: u8 = 3;
+pub const GATE_SCOPE: u8 = 4;
+/// How many gates guard the boundary. Bumping this is the deliberate edit a new
+/// gate requires (see [`gate_prefix`]).
+pub const GATE_COUNT: u8 = 4;
+
+/// Run the first `upto` gates of the real chain and report the 1-based gate that
+/// refused, or 0 if every gate it ran passed.
+///
+/// This is the **measurement** path, used by [`super::bench`] to price the
+/// authorization decision: it applies exactly the predicates
+/// [`execute_with_justification`] applies, in the same order, but never runs a
+/// primitive and never writes an audit entry — so timing it prices the gates and
+/// nothing else, and a benchmark loop cannot mutate the store or flood the log.
+///
+/// It is a second copy of the gate order, which is a real drift risk, so it is
+/// pinned: `gate_prefix_agrees_with_execute` asserts that for every outcome the
+/// real path produces, this function names the matching gate. A gate added above
+/// without being added here fails that test.
+pub fn gate_prefix(caller: TaskId, raw: &str, justification: Justification, upto: u8) -> u8 {
+    // Gate 1: grammar.
+    let call: Call = match grammar::parse(raw) {
+        Ok(call) => call,
+        Err(_) => return GATE_GRAMMAR,
+    };
+    if upto < GATE_CAPABILITY {
+        return 0;
+    }
+    // The real path `expect`s here; an unregistered id that the grammar accepted
+    // is a bug, and a measurement path must not panic the machine over it.
+    let Some(spec) = registry::by_id(call.id) else {
+        return GATE_GRAMMAR;
+    };
+
+    // Gate 2: capability.
+    if !cap::holds(caller, Right::InvokePrimitive(call.id)) {
+        return GATE_CAPABILITY;
+    }
+    if upto < GATE_TAINT {
+        return 0;
+    }
+
+    // Gate 3: taint.
+    let identity_write = is_identity_file_mutation(spec, &call.args);
+    if (spec.destructive || identity_write) && justification.blocks_destructive() {
+        return GATE_TAINT;
+    }
+    if upto < GATE_SCOPE {
+        return 0;
+    }
+
+    // Gate 3.5 ("4" here): scope.
+    if let Some((domain, want, target)) = scope_target(spec, &call.args) {
+        if !cap::scope_check(caller, domain, want, &target) {
+            return GATE_SCOPE;
+        }
+    }
+    0
+}
+
+/// The gate an [`Invocation`] outcome says refused the call — the inverse of
+/// [`gate_prefix`]'s return value, and the mapping the equivalence test uses.
+pub fn gate_of_outcome(inv: &Invocation) -> u8 {
+    match inv {
+        Invocation::Rejected(_) => GATE_GRAMMAR,
+        Invocation::Denied { .. } => GATE_CAPABILITY,
+        Invocation::RefusedTainted { .. } => GATE_TAINT,
+        Invocation::DeniedScope { .. } => GATE_SCOPE,
+        Invocation::Executed { .. } => 0,
+    }
+}
+
 /// Cooperative-blocking budget for `channel_read`: the model never sees an
 /// infinite hang — after this many ms with no data it gets `ok:blocked` and
 /// re-plans. Native service loops use `channel::read_blocking` directly with
