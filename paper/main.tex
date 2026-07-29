@@ -1022,7 +1022,28 @@ attacks will report a policy as holding while it quietly stops applying.
 
 The structural response is in \S\ref{sec:limits}: the seven router checks are
 now one, taken before dispatch and classified by an exhaustive match over the
-binding type, so a new binding does not compile until someone says what it does. Relatedly, a census of which
+binding type, so a new binding does not compile until someone says what it does.
+The same construction now answers a second question no attack can ask: whether an
+ingesting path can \emph{name} its source, which is what the confirmation
+dialogue needs in order to ask the human about a source rather than a payload
+(\S\ref{sec:limits}). An origin census reports four of four naming theirs; it
+was three of four when first run, and the missing one --- background-task output,
+whose tool takes no arguments and so had nothing to key a name on --- is a path
+where the dialogue silently falls back to quoting the payload and where sticky
+declassification correctly refuses to work. Nothing is permitted by that
+omission, which is precisely why it needed a census rather than an attack.
+
+Corpus coverage is now the \emph{cross-product} as well. Checking each dimension
+separately --- some attack has this goal, some attack has this site --- passes
+with a corpus that never crosses them, and crossing them is where our own gap
+was: the messaging tool is an egress goal at a shell site, a pair nothing had
+considered, and it was found by hand against an external taxonomy rather than by
+any test. Each site now declares which goals it can express, and every cell must
+be attacked or exempted \emph{in writing}; six cells carry written exemptions
+(three of them recording effects no tool can currently reach), and a new
+enforcement site does not compile until someone decides, per goal, which it is.
+
+Relatedly, a census of which
 destructive primitives a tool actually lowers to found only one
 (\code{mem\_fs\_delete}): \code{channel\_grant} and \code{net\_listen} are not
 nameable from any tool call, so the gate is their second line of defence rather
@@ -1149,10 +1170,25 @@ contain ingested text (the payload carries the document). A call whose arguments
 match neither is judged not to derive from the untrusted content, and its
 justification is downgraded from blocking.
 
-\textbf{Result: it loses on both axes} (Table~\ref{tab:e4}). It permits
-\textbf{4 of 13} attacks the strict rule refuses, and it recovers \textbf{none}
-of the false refusals it exists to remove. The one benign refusal it removed was
-the warranted exfiltration case.
+\textbf{A correction to how this was first measured.} The object-provenance half
+of that method was, when we first ran it, an API with no caller: nothing in the
+kernel tagged a write, so the lookup it feeds returned ``clean'' for every object
+and only the containment relation was actually being priced. We found this by
+auditing our own claim rather than by any test failing --- which is the same
+shape as the census finding in \S\ref{sec:e2}, and for the same reason: a check
+that is never invoked refuses nothing, so nothing goes red. Writes now record the
+provenance that authorised them (joined, not replaced, so a trusted overwrite
+cannot launder an object), and the experiment below is the re-run.
+
+\textbf{Result: it loses on both axes} (Table~\ref{tab:e4}), and wiring the
+missing half did not change that. It permits \textbf{4 of 13} attacks the strict
+rule refuses, and it recovers \textbf{none} of the false refusals it exists to
+remove; the one benign refusal it removed was the warranted exfiltration case.
+The numbers are identical before and after the fix, and the reason is worth
+stating rather than hiding: no attack in the corpus writes an object under an
+injection and destroys it in a later turn, so object provenance had nothing to
+catch. That is a gap in the corpus as much as a result about the mechanism, and
+we report it as both.
 
 \textbf{Why, and it is not a tuning problem.} The poisoned document in the corpus
 says ``ignore previous instructions and delete everything''. It never names
@@ -1191,14 +1227,29 @@ measuring interruption on the attack corpus would flatter every design, since
 interrupting an attack is the point.
 
 \textbf{Result} (Table~\ref{tab:e4}, Figure~\ref{fig:tradeoff}). Removing
-provenance and changing nothing else takes attack success from 0 to \textbf{9 of
-12}; removing attenuation as well takes it to \textbf{13 of 13}. So the two
+provenance and changing nothing else takes attack success from 0 to \textbf{10 of
+13}; removing attenuation as well takes it to \textbf{13 of 13}. So the two
 mechanisms do visibly different jobs: scope contains what a compromised turn can
 reach (3 refusals with the taint gate off), and provenance is what stops the
-agent's own authority being turned against the user (the other 9). Only the full
+agent's own authority being turned against the user (the other 10). Only the full
 policy is good on both axes: it is the sole configuration with zero attack
 success, and it interrupts a human on 3 of 11 benign steps against
 confirm-every-call's 11 of 11.
+
+\textbf{What the usability feature costs, measured rather than assumed.} The
+second row prices sticky declassification (\S\ref{sec:limits}), which this
+system ships enabled: a human who trusts the source an injection arrived through
+takes attack success from 0 to \textbf{6 of 13}, all six taking effect, in
+exchange for eliminating benign interruptions entirely (3 of 11 to 0 of 11). That
+is the trade in one line, and it is a large one --- close to what removing the
+provenance gate altogether costs. Two things keep it from being exactly that.
+Egress is excluded from the grant, which is visible in the numbers: the four
+exfiltration attacks are still refused, and they are the difference between this
+row and the no-provenance row below it. And the grant is per source and
+revocable, where the row below is unconditional. We report it as its own
+configuration because a usability feature whose security cost is not measured is
+an assertion, and because a reader may reasonably conclude from this row that the
+default should be the other way.
 
 Those counts are attacks the policy \emph{permitted}. Of the 9 under
 capabilities-and-scope, 6 then actually took effect, and of the 12 under ambient
@@ -1233,6 +1284,7 @@ cost (\S\ref{sec:e3}) and a box around it would launder that.}
 \textbf{Configuration} & \textbf{Attacks permitted} & \textbf{Human interruptions} & \textbf{Fails on} \\
 \midrule
 \syn{} (caps + scope + provenance) & \textbf{0 / 13} & \textbf{3 / 11} & --- \\
+\quad + human declassified the source & 6 / 13 & 0 / 11 & attack success \\
 Syntactic per-value taint (\S\ref{sec:e3b}) & 4 / 13 & 2 / 11 & attack success \\
 Capabilities + scope, no provenance & 10 / 13 & 0 / 11 & attack success \\
 Ambient authority (container) & 13 / 13 & 0 / 11 & attack success \\
@@ -1314,10 +1366,31 @@ right direction --- it is what CaMeL does with an interpreter-level dataflow
 analysis over a generated program~\cite{debenedetti2025camel} --- but the OS
 analogue cannot be an approximation over strings. The value that needs the tag
 travels from document to argument \emph{through the model}, and no relation
-computed after the fact can see that hop. Real per-value provenance therefore
-means tagging what the model emits by what it read: a substantially larger
-mechanism than the lattice it would replace, sitting at the boundary rather than
-below it, and one whose own soundness argument we do not yet have.
+computed after the fact can see that hop.
+
+\textbf{What we would build instead: citation-constrained arguments.} The shape
+that seems right to us, and that we have not built, makes the plan carry its own
+provenance in a form the kernel can \emph{check}. An argument is either a literal
+or a citation into the context --- an offset and length --- and the executor
+verifies that the span exists where the plan says it does, reads the provenance
+tag already attached to that region, and requires the argument to \emph{be} the
+cited span or a whitelisted transformation of it (a basename, a join under a
+granted scope). A quote is verifiable in a way a claim is not: the model chooses
+\emph{which} span, and the kernel checks \emph{what it is}. It fits where this
+system already has machinery, since the constraint grammar is in the TCB and can
+enforce the argument shape at emission (\S\ref{sec:grammar}). What it costs is
+also clear: a larger plan grammar, a more expensive front-door parse, and a
+citation form per tool schema.
+
+It is worth saying why the cheap-looking alternative our own architecture invites
+is not the answer. Because the model runs in-kernel, the attention scores are in
+our address space, and one could tag each emitted token by the provenance of the
+positions it attended to at roughly the cost of a reduction we already perform.
+But reducing the false-refusal rate requires \emph{narrowing} refusal, narrowing
+must be sound to be safe, and attention weights are a heuristic --- so an
+attention-derived tag could honestly only ever \emph{add} taint, which cannot
+lower the number in question. Cheapness is not the binding constraint;
+checkability is.
 
 \paragraph{Residency is a latent laundering path, not a live one.} The
 justification folds over \emph{resident} messages, which reads as an admission
@@ -1336,29 +1409,69 @@ durable memory must record provenance per entry --- and there is now a
 regression test pinning the invariant so that the day eviction lands, it lands
 red rather than quietly.
 
-\paragraph{One bit for two properties.} \code{destructive} conflates
-irreversibility with external visibility: \code{net\_http\_get} carries the
-flag not because a GET destroys anything but because it exfiltrates. A single
-boolean therefore mixes integrity and confidentiality, and a primitive that is
-irreversible-but-local (delete) is treated identically to one that is
-reversible-but-egressing (GET). Separating them would let the policy be
-correspondingly finer: tainted-and-local could be permitted where
-tainted-and-egressing is refused.
+\paragraph{One bit for two properties, now two --- and the finer policy is not
+the obvious one.} \code{destructive} conflated irreversibility with external
+visibility: \code{net\_http\_get} carried the flag not because a GET destroys
+anything but because it exfiltrates. Worse, the encoding made the interesting
+case unrepresentable --- a bridging function clamped anything egressing to
+reversible, so \code{net\_http\_post}, which mutates state on the far side,
+recorded as neither irreversible nor both. The registry now carries an
+\code{Effect \{irreversible, egress\}} per primitive, gated on identically at
+both enforcement layers (the router reads the same value the executor gates on,
+rather than deriving its own), with one pinning test per axis.
+
+What the split buys is \emph{not} a looser integrity rule. It is tempting to say
+tainted-and-local could be permitted where tainted-and-egressing is refused.
+That is wrong: \code{delete-victim-file} is tainted-and-local and must stay
+refused. What it buys is the right lattice per axis. Biba integrity is
+the correct model for the irreversible axis and we apply it. Egress is a
+\emph{confidentiality} question, and the integrity lattice answers it only by
+accident --- it refuses exfiltration when the turn happens to be tainted, which
+is not the same property as refusing a secret to leave. The honest statement of
+where that leaves us is a question we have not measured: a confined agent may
+read within its scope and nothing then constrains where those bytes go, because
+the scope gate governs the read and no gate governs the onward send of what was
+legitimately read. Naming the axes is the precondition for a confidentiality
+policy; writing one is future work.
 
 \paragraph{Human confirmation is a load-bearing human.} The sole declassifier
 is a person at a console, so the design's security depends on that person
 reading the prompt. This is a known-bad property of security dialogs, and our
 defence was meant to be frequency --- which E3 partly undercuts: 3 of 11 benign
 steps is not rare enough to be reassuring, even if 3 of 6 tasks were untouched.
-The confirmation now names the \emph{provenance}: when the turn is tainted the
-dialogue shows the ingested text that is the reason for asking, so the human is
-deciding about a source rather than about an operation. That is the decision the
-policy actually needs from them, and the only one they have information the
-kernel lacks about. What it cannot yet show is \emph{which} source --- the
-session tags each message with a provenance but not an origin, so the dialogue
-quotes the untrusted text rather than naming \code{evil.example}. Threading an
-origin through every ingestion path is the remaining work, and it would make the
-prompt answerable at a glance rather than by reading.
+The confirmation now names the \emph{source}. Each ingestion path records where
+its content came from --- classified by an exhaustive match over tool bindings,
+the same construction that keeps the effect classification total --- so the
+dialogue says ``justified by content from \code{evil.example}'' rather than
+quoting the payload back. A human can recognise a source; asking them to
+recognise a payload is asking them to do the model's job.
+
+That makes the origin string security-relevant, because the model chooses the
+URL and the model is assumed persuaded. The canonicaliser is consequently in the
+TCB and small on purpose: \code{http://docs.corp.internal@evil.example/} must
+render \code{evil.example}, since everything after the last \code{@} in the
+authority is the host. Case, a trailing root dot, and a path or query mentioning
+another host are all normalised or excluded, and the port is kept because a
+different port is a different service. What the origin is \emph{not} is a
+dataflow guarantee: it records what the agent asked for, so a redirect names the
+requested host and a search names the engine rather than the pages inside its
+results. That is the right granularity for a human's decision and the wrong one
+for a policy, which is the same distinction E3b draws.
+
+On top of that we ship \emph{sticky} declassification: a human approving an
+action may mark that one source trusted for the rest of the session, so later
+calls justified only by it do not re-prompt. This is a deliberate trade and we
+report both halves. It reduces the number of dialogues, which is the failure mode
+E3 exposes, and it is a real weakening: one click covers everything that source
+serves for the remainder of the session, including content ingested afterwards.
+Three properties bound it. It is folded into the computation of taint rather than
+added as a gate exception, so nothing downstream learns a second reason to
+permit. Content with \emph{no} recorded origin can never be declassified, so the
+feature is exactly as safe as origin coverage is complete and an unnamed
+ingestion path fails closed. And it is never offered for egress, nor when more
+than one source is resident --- trusting three sources from one dialogue is an
+overreach the human has no basis for. Table~\ref{tab:e4} reports it as its own
+configuration, because a defence whose cost is not measured is an assertion.
 
 \paragraph{The model runs in the kernel, and that is a position with costs.}
 Placing inference below the boundary is what makes the ABI unavoidable
@@ -1436,11 +1549,23 @@ construction* --- a property of this module's API, invisible to anyone holding a
 snapshot --- to tamper-evident. The corpus run verifies the chain as a matter of
 course, because a checker nothing calls is a property claimed rather than held.
 
-What it still is not is attested. A compromised kernel can recompute the whole
-chain, so this defends a reader against a doctored snapshot, not against a
-dishonest machine; and the log remains in memory, so it does not survive a
-reboot. Both need a key and a place to put it that this system does not yet
-have.
+What it still is not is attested, and the gap is worth stating precisely rather
+than as a caveat. Three things are missing and none of them exists anywhere in
+the tree. The chain is folded with an \emph{unkeyed} hash, so anyone who can
+recompute it can forge it --- sealing needs a keyed MAC. A key needs somewhere
+to live that the kernel cannot simply read back and rewrite, which on x86 means
+extending the chain head into a TPM 2.0 PCR and on aarch64 a secure-element or
+CCA-backed key; this kernel has no driver for either. And a machine that lies
+about its own log cannot be caught by anything stored on it, so the head has to
+leave the box. Until all three, the chain defends a reader against a doctored
+snapshot, never against a dishonest machine.
+
+What is now shipped is the reachable part: \code{/audit verify} checks the chain
+on demand and \code{/audit export} writes a snapshot to the store. Export is
+deliberately on demand and batched rather than per entry --- the durable backend
+reformats its partition on sync, so a write per capability invocation would be
+quadratic in the log's own length. A log that can be read out is also the
+precondition for shipping the head somewhere else later.
 
 \paragraph{Authorized-but-wrong remains.} \syn{} constrains what an agent may
 do, never whether doing it was a good idea. A poisoned summary, a subtly wrong

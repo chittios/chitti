@@ -124,14 +124,25 @@ case and makes the results deterministic and model-independent.
 | Configuration | Attacks permitted | Benign steps needing a human |
 | --- | --- | --- |
 | Synapse (caps + scope + provenance) | **0 / 13** | **3 / 11** |
+| &nbsp;&nbsp;+ human declassified the source *(shipped, on)* | 6 / 13 | 0 / 11 |
 | Syntactic per-value taint *(measured, not shipped)* | 4 / 13 | 2 / 11 |
 | Capabilities + scope, no provenance | 10 / 13 | 0 / 11 |
 | Ambient authority (container) | 13 / 13 | 0 / 11 |
 | Confirm every call | human-dependent | 11 / 11 |
 
 - **E2:** 0/13 permitted — 11 refused by provenance, 2 by scope, all turns
-  correctly tainted. Plus a **laundering census** (4/4 tools correctly taint) and
-  an audit-chain check, both run as part of `/redteam`.
+  correctly tainted. Plus a **laundering census** (4/4 tools correctly taint), an
+  **origin census** (4/4 name their source), and an audit-chain check, all run as
+  part of `/redteam`. Coverage is the `(goal, site)` cross-product: each site
+  declares the goals it can express and every cell is attacked or exempted in
+  writing, so a new enforcement site fails the build until someone decides.
+- **Sticky declassification** ships **on**: a human may trust the source an
+  injection arrived through, which takes attacks permitted from 0/13 to **6/13**
+  and benign interruptions from 3/11 to **0/11**. Egress is excluded from the
+  grant — the four exfiltration attacks are still refused, and that exclusion is
+  the whole difference between this row and the no-provenance row. Reported as
+  its own configuration because a usability feature whose security cost is not
+  measured is an assertion.
 - **E3:** false-refusal rate **25%** of benign destructive steps. This was
   reported as 50% until the ground truth was corrected — see below.
 - **E3b:** the value-granular provenance both reviewers asked for, built and
@@ -143,7 +154,7 @@ case and makes the results deterministic and model-independent.
 - **The capability gate stops none of the attacks**, in any configuration —
   injection uses authority the agent legitimately holds.
 
-### Five things the harness found in itself
+### Seven things the harness found in itself
 
 Every one would have flattered the result, and none was caught by inspection:
 
@@ -166,7 +177,18 @@ Every one would have flattered the result, and none was caught by inspection:
    the question is whether the payload derives from untrusted data, not whether
    the content named the target — and a report written from an ingested document
    does. Corrected baseline: 25%.
-5. **`channel send` was classified inert**, found by mapping the AgentDojo /
+5. **E3b's object-provenance half never ran.** `synapse::fs::write_tagged` had
+   zero callers, so the store's integrity map was never populated and
+   `is_tainted` was constant `false` — while the paper described object
+   provenance as part of the measured variant. Writes now record the
+   justification that authorised them (joined, not replaced). Re-running E3b
+   gave *identical* numbers, and the reason is itself a corpus gap: no attack
+   writes an object under an injection and destroys it in a later turn.
+6. **The origin census found an unnamed ingestion path.** `list_tasks` takes no
+   arguments, so keying its source on an id left it unnamed — the dialogue would
+   have quoted a payload instead of a source, and sticky trust would have
+   refused to apply. Neither shows up as a permitted attack.
+7. **`channel send` was classified inert**, found by mapping the AgentDojo /
    InjecAgent intent taxonomy onto this tool surface: their "email the attacker"
    category had no corpus row here, and the reason was that the tool sending
    bytes to a third party is registered non-destructive. Latent, not live —
