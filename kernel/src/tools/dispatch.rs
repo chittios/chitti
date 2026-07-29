@@ -193,7 +193,27 @@ pub fn effect_of(def: &registry::ToolDef, call: &ToolCall) -> Effect {
         // Shell commands: destructive by table, plus `/http` in any form —
         // a GET is an exfiltration channel even though it destroys nothing.
         ToolBinding::Shell { command, destructive } => {
-            let egress = command == "http" || shell_cmd_is_destructive_http(command, &call.args);
+            // `/http` in any form is egress -- a GET exfiltrates even though it
+            // destroys nothing. So is sending on a messaging channel: `channel
+            // send`/`reply` puts bytes in front of a third party, which is the
+            // "email the attacker" shape from the agent-injection benchmarks.
+            //
+            // Found by mapping those benchmarks' intent taxonomy onto this tool
+            // surface rather than by an attack failing: `channel` is registered
+            // non-destructive, so it classified inert. It is not currently in any
+            // agent's toolset, so this was a latent misclassification and not a
+            // live hole -- but "not reachable yet" is the wrong thing to depend
+            // on, since adding a tool to a toolset is a one-line change and
+            // nothing would have re-examined this.
+            let sends = command == "channel"
+                && todo::json_str(&call.args, "args")
+                    .map(|a| {
+                        let verb = a.trim().split_whitespace().next().unwrap_or("");
+                        matches!(verb, "send" | "reply")
+                    })
+                    .unwrap_or(false);
+            let egress =
+                command == "http" || sends || shell_cmd_is_destructive_http(command, &call.args);
             Effect { irreversible: *destructive, egress }
         }
         ToolBinding::RunShellCommand => {
@@ -284,7 +304,18 @@ impl ToolDispatch for Router {
         // redundancy is deliberate and cheap: this check is a property of the
         // router, and the router is not in the TCB.
         let effect = effect_of(&def, call);
-        if effect.is_effectful() && self.justification_for(session, effect, call).blocks_destructive() {
+        // Anything that lowers to a primitive is left to the executor, which
+        // applies the same policy AND writes the audit record. Refusing it here
+        // would be faster and would lose the entry: `synapse::audit` is keyed on
+        // `&'static str` primitive names, the router only has a dynamic tool
+        // name, and "every attempt, including every denial, is audited" is a
+        // property worth more than one avoided dispatch. An existing test caught
+        // this the moment the gate moved in front of the match.
+        let defer_to_executor = matches!(def.binding, ToolBinding::Synapse { .. });
+        if !defer_to_executor
+            && effect.is_effectful()
+            && self.justification_for(session, effect, call).blocks_destructive()
+        {
             let what = match (effect.irreversible, effect.egress) {
                 (true, true) => "irreversible and leaves the machine",
                 (true, false) => "irreversible",
@@ -1034,6 +1065,11 @@ mod tests {
             ("storage_get", r#"{"key":"k"}"#, false, false),
             ("run_shell_command", r#"{"command":"rm /tmp/x"}"#, true, false),
             ("run_shell_command", r#"{"command":"ls /"}"#, false, false),
+            // Messaging: sending reaches a third party, listing does not.
+            ("channel", r#"{"args":"send hello"}"#, false, true),
+            ("channel", r#"{"args":"reply ok"}"#, false, true),
+            ("channel", r#"{"args":"list"}"#, false, false),
+            ("channel", r#"{"args":"status"}"#, false, false),
         ];
         for (tool, args, irr, egr) in cases {
             let (def, call) = def_and_call(tool, args);

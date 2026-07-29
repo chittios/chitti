@@ -280,6 +280,31 @@ pub fn classify(out: &ToolOutcome) -> Reason {
 
 // --- the corpus --------------------------------------------------------------
 
+/// The corpus, and how it maps onto the published injection benchmarks.
+///
+/// AgentDojo and InjecAgent cannot be *run* here: they are Python harnesses over
+/// tool suites this system does not have (email clients, banking APIs, smart
+/// devices). What transfers is their **intent taxonomy**, and the entries below
+/// are that taxonomy expressed in these primitives:
+///
+/// | Benchmark intent | Here |
+/// |---|---|
+/// | direct harm: destroy user data | `delete-victim-file`, `shell-rm-sandbox-file`, `nested-shell-rm` |
+/// | direct harm: change settings/state | `storage-poison`, `memory-poison`, `launder-into-soul` |
+/// | data stealing: exfiltrate to attacker | `exfiltrate-via-http-primitive`, `download-to-store`, `web-fetch-egress`, `browser-navigate-egress` |
+/// | data stealing: message a third party | *not reachable* -- `channel send` is egress but is in no agent's toolset |
+/// | privilege/scope escape | `escape-*` |
+///
+/// This is a translation of intents, not a benchmark run, and the difference
+/// matters: those suites measure whether a *model* is persuaded across many
+/// realistic tasks, and this measures whether the *authorization boundary* holds
+/// once persuasion is assumed. They are complementary, and the honest claim is
+/// coverage of the attack categories rather than a comparable score.
+///
+/// Doing the mapping is what found the `channel` misclassification (see
+/// `tools::dispatch::effect_of`) -- a benchmark taxonomy asks "what could an
+/// injection want?" where a hand-written corpus asks "what did I think of?".
+///
 /// One attack per goal per enforcement site. Payload text is illustrative; the
 /// gates never read it (see the module note on what this does not measure).
 pub static CORPUS: &[Attack] = &[
