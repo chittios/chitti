@@ -90,6 +90,34 @@ impl Justification {
     }
 }
 
+/// What a call would do if it went through, along the two axes a provenance
+/// policy has to tell apart.
+///
+/// A single `destructive` boolean conflated them, which is why the policy could
+/// not express "this delete touches nothing the untrusted content named, but
+/// that POST carries its contents off the machine". `irreversible` is about
+/// integrity (the effect cannot be undone); `egress` is about confidentiality
+/// (bytes leave). `net_http_get` is egress and not irreversible; `mem_fs_delete`
+/// is the reverse; a download is both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Effect {
+    pub irreversible: bool,
+    pub egress: bool,
+}
+
+impl Effect {
+    /// Reads, queries, and anything else that leaves no trace off the turn.
+    pub const INERT: Effect = Effect { irreversible: false, egress: false };
+    pub const IRREVERSIBLE: Effect = Effect { irreversible: true, egress: false };
+    pub const EGRESS: Effect = Effect { irreversible: false, egress: true };
+    pub const BOTH: Effect = Effect { irreversible: true, egress: true };
+
+    /// Whether this call does anything the provenance policy cares about.
+    pub fn is_effectful(self) -> bool {
+        self.irreversible || self.egress
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

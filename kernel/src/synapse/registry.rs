@@ -286,6 +286,21 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
     },
 ];
 
+impl PrimitiveSpec {
+    /// This primitive's effect, on the two axes the provenance policy needs.
+    ///
+    /// The registry still carries one `destructive` bool; this is where the two
+    /// properties it conflates are separated, so the policy can say "tainted and
+    /// leaving the machine" apart from "tainted and irreversible but local".
+    /// Egress is named explicitly rather than inferred, because `net_http_get`
+    /// destroys nothing and is still the exfiltration channel that matters.
+    pub fn effect(&self) -> crate::security::taint::Effect {
+        use crate::security::taint::Effect;
+        let egress = matches!(self.id, NET_HTTP_GET | NET_HTTP_POST | NET_LISTEN);
+        Effect { irreversible: self.destructive && !egress, egress }
+    }
+}
+
 /// Look up a primitive by its wire name. `None` for any name not in the
 /// registry -- the grammar rejects those before this is ever reached, but
 /// the executor still treats an unknown id as a hard error.

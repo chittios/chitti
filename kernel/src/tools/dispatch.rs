@@ -14,7 +14,7 @@ use crate::agent::agent_loop::{ToolDispatch, ToolOutcome};
 use crate::agent::orchestrator::{synapse_call, synapse_call_for, to_taint};
 use crate::agent::types::{CapDomain, Provenance, Rights, Scope, Session, ToolCall};
 use crate::cap;
-use crate::security::taint::Justification;
+use crate::security::taint::{Effect, Justification};
 use crate::session::todo;
 use crate::synapse::{self, executor::Invocation, fs as store};
 use crate::tools::pathutil;
@@ -91,6 +91,97 @@ impl Router {
     }
 }
 
+/// What this call would do, classified by binding.
+///
+/// **This is the chokepoint.** It is an exhaustive `match` over `ToolBinding`
+/// with no wildcard arm, so adding a binding does not compile until someone
+/// says what it does — which is the difference between a policy that is
+/// enforced and one that is remembered. The seven scattered
+/// `blocks_destructive()` checks this replaces were each correct and each
+/// invisible from the others; the audit that found four unguarded arms
+/// (`security::redteam`) is what that arrangement costs.
+///
+/// Note the classification depends on the *call*, not only the binding: `/http`
+/// is egress but `/ls` is not, `memory_add` mutates but `memory_get` does not,
+/// and `run_shell_command` has to look inside its own argument to find the
+/// command it would run.
+pub fn effect_of(def: &registry::ToolDef, call: &ToolCall) -> Effect {
+    match &def.binding {
+        // Lowered to a primitive: the executor's gate 3 is the real decision,
+        // and it sees the primitive's own effect flags. Classifying here as
+        // inert would be wrong (the router would let a tainted delete reach the
+        // executor), so mirror the registry's view of the primitive.
+        ToolBinding::Synapse { primitive, .. } => crate::synapse::registry::by_name(primitive)
+            .map(|p| p.effect())
+            .unwrap_or(Effect::INERT),
+
+        // Shell commands: destructive by table, plus `/http` in any form —
+        // a GET is an exfiltration channel even though it destroys nothing.
+        ToolBinding::Shell { command, destructive } => {
+            let egress = command == "http" || shell_cmd_is_destructive_http(command, &call.args);
+            Effect { irreversible: *destructive, egress }
+        }
+        ToolBinding::RunShellCommand => {
+            let cmdline = todo::json_str(&call.args, "command")
+                .or_else(|| todo::json_str(&call.args, "cmd"))
+                .unwrap_or_default();
+            match crate::tools::shell_cmd::parse_command_line(&cmdline) {
+                Ok((name, rest)) => {
+                    let extra = todo::json_str(&call.args, "args").unwrap_or_default();
+                    let full = if extra.is_empty() {
+                        rest
+                    } else if rest.is_empty() {
+                        extra
+                    } else {
+                        format!("{rest} {extra}")
+                    };
+                    Effect {
+                        irreversible: crate::tools::shell_cmd::is_destructive_cmd(&name),
+                        egress: name == "http" || shell_http_args_destructive(&full),
+                    }
+                }
+                // Unparseable: treat as effectful. A command we cannot read is
+                // not a command we may assume is harmless.
+                Err(_) => Effect::BOTH,
+            }
+        }
+
+        // Remote calls and network fetches: egress by construction.
+        ToolBinding::Mcp { .. } => Effect::EGRESS,
+        ToolBinding::Web => Effect::EGRESS,
+        ToolBinding::Download => Effect::BOTH, // fetches *and* writes the store
+        ToolBinding::Browser => Effect {
+            irreversible: false,
+            egress: matches!(call.tool.as_str(), "browser_open" | "browser_navigate" | "browser_goto"),
+        },
+
+        // Durable state that re-enters the agent later. Mutations only.
+        ToolBinding::AgentMemory => Effect {
+            irreversible: matches!(call.tool.as_str(), "memory_add" | "remember" | "memory_md_append"),
+            egress: false,
+        },
+        ToolBinding::AgentStorage => Effect {
+            irreversible: matches!(call.tool.as_str(), "storage_set" | "storage_remove"),
+            egress: false,
+        },
+
+        // Inert with respect to the provenance policy. Each of these either
+        // touches nothing outside the turn, or reaches an effect only by
+        // lowering to a primitive that is gated in its own right.
+        ToolBinding::StoreQuery { .. } => Effect::INERT, // reads, result-filtered by scope
+        ToolBinding::SessionTodo => Effect::INERT,       // session-local list
+        ToolBinding::SpawnSubagent => Effect::INERT,     // delegation only attenuates
+        ToolBinding::LoadSkill => Effect::INERT,         // loads text into context
+        ToolBinding::RunIntent => Effect::INERT,         // its steps are gated individually
+        ToolBinding::McpResources { .. } => Effect::INERT, // resource *reads*
+        ToolBinding::AgentWasm => Effect::INERT,         // sandboxed; effects go via tools
+        ToolBinding::Media => Effect::INERT,             // playback state
+        ToolBinding::BgTask => Effect::INERT,            // inspects tasks; spawning is elsewhere
+        ToolBinding::AskUser => Effect::INERT,           // asks a human
+        ToolBinding::SearchReplace => Effect::INERT,     // lowers to gated mem_fs_read/write
+    }
+}
+
 impl Default for Router {
     fn default() -> Self {
         Self::new()
@@ -108,6 +199,26 @@ impl ToolDispatch for Router {
             if todo::json_str(&call.args, key).is_none() && !call.args.contains(&alloc::format!("\"{key}\"")) {
                 return ToolOutcome::error(alloc::format!("malformed {}: missing required arg '{key}'", call.tool));
             }
+        }
+
+        // THE gate. One call, before the dispatch match, classified by
+        // `effect_of` — which the compiler forces to stay exhaustive. Everything
+        // below this line has already been through the provenance policy.
+        //
+        // The executor gates again for anything that lowers to a primitive. That
+        // redundancy is deliberate and cheap: this check is a property of the
+        // router, and the router is not in the TCB.
+        let effect = effect_of(&def, call);
+        if effect.is_effectful() && self.justification(session).blocks_destructive() {
+            let what = match (effect.irreversible, effect.egress) {
+                (true, true) => "irreversible and leaves the machine",
+                (true, false) => "irreversible",
+                _ => "leaves the machine",
+            };
+            return ToolOutcome::error(alloc::format!(
+                "refused: '{}' is {what}, justified by untrusted content",
+                call.tool
+            ));
         }
 
         match &def.binding {
@@ -201,12 +312,6 @@ impl ToolDispatch for Router {
                 // like a DELETE: refused when justified by untrusted content and
                 // not human-confirmed. Any `/http` under taint is also refused
                 // (GET is an egress/exfil channel, same as net_http_get).
-                let dest = *destructive || *command == "http" || shell_cmd_is_destructive_http(command, &call.args);
-                if dest && self.justification(session).blocks_destructive() {
-                    return ToolOutcome::error(alloc::format!(
-                        "refused: destructive command '/{command}' justified by untrusted content"
-                    ));
-                }
                 let arg = todo::json_str(&call.args, "args").unwrap_or_default();
                 let out = crate::shell::run_tool_command(command, &arg);
                 ToolOutcome::ok(out, Provenance::UntrustedIngested)
@@ -215,11 +320,6 @@ impl ToolDispatch for Router {
                 // MCP tools/call is remote side-effectful egress. Gate it like a
                 // destructive primitive: untrusted justification cannot fire it
                 // without human confirmation (results stay UntrustedIngested).
-                if self.justification(session).blocks_destructive() {
-                    return ToolOutcome::error(alloc::format!(
-                        "refused: MCP '{server}/{tool}' justified by untrusted content"
-                    ));
-                }
                 match crate::mcp::call(server, tool, &call.args) {
                     Ok(text) => ToolOutcome::ok(text, Provenance::UntrustedIngested),
                     Err(e) => ToolOutcome::error(e),
@@ -258,13 +358,6 @@ impl ToolDispatch for Router {
                 //
                 // Writing is a durable mutation and gates like agent memory: an
                 // injection must not be able to leave a "preference" behind.
-                let mutating = matches!(call.tool.as_str(), "storage_set" | "storage_remove");
-                if mutating && self.justification(session).blocks_destructive() {
-                    return ToolOutcome::error(alloc::format!(
-                        "refused: durable storage write '{}' justified by untrusted content",
-                        call.tool
-                    ));
-                }
                 let agent_id = session.agent.manifest_id.0;
                 let out = crate::agent::storage::run_tool(agent_id, &call.tool, &call.args);
                 if out.starts_with("error:") {
@@ -315,11 +408,6 @@ impl ToolDispatch for Router {
             ToolBinding::Download => {
                 // Network egress + store write: refuse under untrusted
                 // justification (exfil / overwrite via injected "download …").
-                if self.justification(session).blocks_destructive() {
-                    return ToolOutcome::error(
-                        "refused: download justified by untrusted content",
-                    );
-                }
                 let out = crate::shell::run_download_tool(&call.args);
                 if out.starts_with("error:") {
                     ToolOutcome::error(out)
@@ -331,16 +419,6 @@ impl ToolDispatch for Router {
             ToolBinding::Browser => {
                 // Navigation / open under untrusted context is ambient network
                 // egress (and runs page scripts) — refuse like net_http_get.
-                let navigating = matches!(
-                    call.tool.as_str(),
-                    "browser_open" | "browser_navigate" | "browser_goto"
-                );
-                if navigating && self.justification(session).blocks_destructive() {
-                    return ToolOutcome::error(alloc::format!(
-                        "refused: '{}' justified by untrusted content",
-                        call.tool
-                    ));
-                }
                 let out = crate::shell::run_browser_tool(&call.tool, &call.args);
                 if out.starts_with("error:") {
                     ToolOutcome::error(out)
@@ -368,11 +446,6 @@ impl ToolDispatch for Router {
                     let dest = crate::tools::shell_cmd::is_destructive_cmd(&name)
                         || name == "http"
                         || shell_http_args_destructive(&full);
-                    if dest && self.justification(session).blocks_destructive() {
-                        return ToolOutcome::error(alloc::format!(
-                            "refused: destructive command '/{name}' justified by untrusted content"
-                        ));
-                    }
                 }
                 let out = crate::tools::shell_cmd::run_from_tool_args(&call.args);
                 if out.starts_with("error:") {
@@ -584,10 +657,9 @@ fn shell_cmd_is_destructive_http(command: &str, call_args: &str) -> bool {
 
 /// Web tools always hit the network; refuse when the Router's session
 /// justification is tainted (callers pass session via `call` wrapper).
-fn dispatch_web_tool_gated(session: &Session, router: &Router, name: &str, args: &str) -> String {
-    if router.justification(session).blocks_destructive() {
-        return format!("error: refused: '{name}' justified by untrusted content");
-    }
+/// Kept as a thin alias: the web tools' taint check now happens once, in
+/// `Router::call`, classified by `effect_of` as `Effect::EGRESS`.
+fn dispatch_web_tool_gated(_session: &Session, _router: &Router, name: &str, args: &str) -> String {
     dispatch_web_tool(name, args)
 }
 
@@ -847,5 +919,51 @@ impl Router {
             caller,
             &synapse_call("mem_fs_write", &[("path", path.as_str()), ("text", edited.as_str())]),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::ToString;
+
+    fn def_and_call(tool: &str, args: &str) -> (registry::ToolDef, ToolCall) {
+        let def = registry::get(tool).unwrap_or_else(|| panic!("no such tool: {tool}"));
+        (def, ToolCall { call_id: 1, tool: tool.to_string(), args: args.to_string() })
+    }
+
+    /// Every tool the attack corpus targets must classify as effectful, and the
+    /// read-only ones must not.
+    ///
+    /// `effect_of` is exhaustive over `ToolBinding`, so the compiler guarantees a
+    /// *new binding* gets classified. It cannot guarantee the classification is
+    /// right, and the seven checks it replaced each encoded a condition (`/http`
+    /// is egress though it destroys nothing; only `memory_add` mutates, not
+    /// `memory_get`; `run_shell_command` has to read its own argument). This pins
+    /// those conditions so a refactor cannot quietly relax one.
+    #[test_case]
+    fn effect_of_classifies_the_conditions_the_scattered_checks_encoded() {
+        let cases: &[(&str, &str, bool, bool)] = &[
+            ("rm", r#"{"args":"/tmp/x"}"#, true, false),
+            ("ls", r#"{"args":"/"}"#, false, false),
+            ("http", r#"{"args":"http://127.0.0.1:9/"}"#, false, true),
+            ("delete", r#"{"path":"/x"}"#, true, false),
+            ("read", r#"{"path":"/x"}"#, false, false),
+            ("download", r#"{"url":"http://127.0.0.1:9/","path":"/x"}"#, true, true),
+            ("web_fetch", r#"{"url":"http://127.0.0.1:9/"}"#, false, true),
+            ("browser_open", r#"{"url":"http://127.0.0.1:9/"}"#, false, true),
+            ("browser_status", r#"{}"#, false, false),
+            ("memory_add", r#"{"key":"k","value":"v"}"#, true, false),
+            ("memory_get", r#"{"key":"k"}"#, false, false),
+            ("storage_set", r#"{"key":"k","value":"v"}"#, true, false),
+            ("storage_get", r#"{"key":"k"}"#, false, false),
+            ("run_shell_command", r#"{"command":"rm /tmp/x"}"#, true, false),
+            ("run_shell_command", r#"{"command":"ls /"}"#, false, false),
+        ];
+        for (tool, args, irr, egr) in cases {
+            let (def, call) = def_and_call(tool, args);
+            let e = effect_of(&def, &call);
+            assert_eq!((e.irreversible, e.egress), (*irr, *egr), "{tool} {args} classified {:?}", e);
+        }
     }
 }
