@@ -58,7 +58,7 @@
 \author{Vinoth Kumar\\ \small \texttt{Refold}}
 
 % arXiv: avoid \today -- it makes the PDF differ on every rebuild.
-\date{Draft --- 29 July 2026}
+\date{30 July 2026}
 
 \begin{document}
 \maketitle
@@ -1289,6 +1289,64 @@ means we \emph{strengthened the baseline we argue against} before rejecting it.
 A negative result is only worth reporting against the strongest version of the
 thing it rejects.
 
+\subsection{E3c: Citation-constrained arguments, measured}
+\label{sec:e3c}
+
+\textbf{Question.} \S\ref{sec:e3b} rejects the cheap refinement and argues the
+replacement must be \emph{checkable} rather than inferred. A design nobody has
+measured is a sketch, so we implemented the policy and ran it over the same
+corpora.
+
+\textbf{Mechanism.} An effectful call must \emph{cite} the span of context each
+target came from --- a message index and a byte range. The kernel resolves the
+citation against its own copy of the context, requires the span to actually
+contain the argument (or a whitelisted transformation of it: a path's final
+component, surrounding punctuation), and takes the justification to be the join
+over \emph{the cited spans only} rather than over the whole turn. The model
+chooses which span; the kernel checks what it is. A value the plan cannot point
+at is refused, so the policy is fail-closed by construction.
+
+\textbf{Method, and its one soft spot.} The plan grammar does not carry
+citations yet, so a planner that emits them does not exist. The evaluation
+therefore cites \emph{on the plan's behalf}, choosing the most favourable span
+available and preferring trusted ones. That models a planner which cites
+correctly and cooperatively, which is the right assumption for measuring a
+policy --- every refusal below is a property of the rule rather than of a badly
+behaved planner --- and it is generous to the attacker, since a value appearing
+in both trusted and untrusted text is handed the trusted citation.
+
+\textbf{Result: the first configuration that is good on both axes.} It permits
+\textbf{0 of 13} of our attacks and \textbf{0 of 24} imported ones --- matching
+the shipped policy --- while taking the false-refusal rate from \textbf{25\% to
+0\%}: 2 of 4 benign destructive steps still need a human, and both are the
+warranted ones (a delete whose target came out of searched content, and an
+egress whose payload derives from an ingested document). Table~\ref{tab:e4}
+lists it beside the configurations that trade one axis for the other.
+
+\textbf{Why it separates cases the lattice cannot.} The information was always
+present and the lattice throws it away. ``Delete \code{/work/tmp/scratch.txt}''
+is in the user's own request; ``delete everything'' is in the document. Both
+produce the same turn-level join, so whole-turn taint must refuse both or permit
+both. A citation distinguishes them without reading intent, because the two
+values are quoted from spans with different provenance.
+
+\textbf{What it costs, and we found this by getting it wrong.} The policy moves
+the burden onto the user's phrasing: a request that does not name what it acts
+on --- ``clean up my temp files'' --- affords no citation, and the call is
+refused. Writing the benign suite's prompts, we initially gave one task a prompt
+naming a file the task does not touch; the policy correctly refused the step and
+scored it as a false refusal, and the fault was the prompt. That is the mirror
+image of \S\ref{sec:e2b}: there, a defence's score moved with how the
+\emph{attacker} phrased things, and here it moves with how the \emph{user}
+does. The second is the better failure --- a user who is not understood can
+rephrase, where an attacker who is not caught does not tell you --- but it is a
+real cost, and on four destructive steps it is a thin denominator.
+
+Not shipped, deliberately. Making it real means citations in the plan grammar
+and a citation form in every tool schema, which changes what the model must
+emit; shipping the checker alone would be a mechanism with no producer, which is
+a mistake this codebase has already made once (\S\ref{sec:e3b}).
+
 \subsection{E4: Comparison against the alternatives}
 \label{sec:e4}
 
@@ -1364,6 +1422,7 @@ cost (\S\ref{sec:e3}) and a box around it would launder that.}
 \textbf{Configuration} & \textbf{Attacks permitted} & \textbf{Human interruptions} & \textbf{Fails on} \\
 \midrule
 \syn{} (caps + scope + provenance) & \textbf{0 / 13} & \textbf{3 / 11} & --- \\
+Citation-constrained (\S\ref{sec:e3c}, proposed) & \textbf{0 / 13} & \textbf{2 / 11} & not built \\
 \quad + human declassified the source & 6 / 13 & 0 / 11 & attack success \\
 Syntactic per-value taint (\S\ref{sec:e3b}) & 4 / 13 & 2 / 11 & attack success \\
 Capabilities + scope, no provenance & 10 / 13 & 0 / 11 & attack success \\
@@ -1412,19 +1471,68 @@ absent --- it cannot be run here, because there is no guardrail implementation i
 this system to run, and simulating a strawman would be worse than omitting it.
 
 \subsection{E5: Mechanism complexity}
+\label{sec:e5}
 
-\textbf{Question.} Is the TCB small enough to be reviewable? \textbf{Method.}
-Report lines of code and unit-test counts for each gate, and the size of the
-attack surface reachable from model output (the grammar's accepted language,
-the registry's argument space).
+\textbf{Question.} Is the TCB small enough to be reviewable, and is the review
+effort spread the way the risk is?
 
-\textbf{Status.} Partial, and reported once rather than twice: the enforcement
-path's size and the test counts are in \S\ref{sec:impl}. What is missing here is
-the per-gate breakdown of both, and the more interesting figure: the size of
-the language a model can actually emit, which is bounded by the grammar and the
-registry's 26 primitives over a two-type argument lattice --- a
-\emph{finite, enumerable} request surface, which is the property a conventional
+\textbf{Method.} Lines per gate, excluding each file's own test module, counted
+by the script in the artifact's \code{README} so the figure is reproducible
+rather than asserted; tests counted as \code{\#[test\_case]} attributes in the
+same files.
+
+\textbf{Result} (Table~\ref{tab:e5}). The enforcement path is 2{,}671 lines
+against $\sim$178{,}000 for the OS around it. Two things in the table are worth
+more than the total.
+
+\emph{The executor and registry are 38\% of the mechanism} --- larger than the
+four gates put together. That is the part which dispatches to native
+implementations, and it is where a reviewer's attention belongs; the gates
+themselves are small enough to read in a sitting.
+
+\emph{The capability gate had no tests of its own}, which we did not know until
+this table was built. It was never untested --- it is exercised by the acceptance
+suite, by every corpus run, and by the scope-gate cases --- but nothing in
+\code{cap} pinned \code{cap} in isolation, and the one gate whose entire job is
+``holds this right, or does not'' was the one with no direct unit test. Two now
+exist (the count above includes them): one asserting that a grant confers exactly
+one right and that revocation revokes, one pinning the scope ledger's
+deny-only-when-recorded rule. We report the gap rather than only the fix, because
+the point is what a per-component count exposes and an aggregate hides.
+
+The other measure this section promised, and the one we think is more
+interesting, is the size of the language a model can emit at all: bounded by the
+grammar and the registry's 26 primitives over a two-type argument lattice, it is
+a \emph{finite, enumerable} request surface --- the property a conventional
 syscall table has and an agent's tool space normally does not.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Component} & \textbf{Lines} & \textbf{Unit tests} \\
+\midrule
+Grammar (gate 1) & 289 & 9 \\
+Capability (gate 2) & 212 & 2 \\
+Provenance (gate 3) & 196 & 2 \\
+Scope: path normalisation (gate 4) & 301 & 7 \\
+Executor + primitive registry & 1{,}009 & 5 \\
+Audit log & 221 & 4 \\
+Object store & 451 & 4 \\
+\midrule
+\textbf{Total} & \textbf{2{,}671} & \textbf{33} \\
+\bottomrule
+\end{tabular}
+\caption{E5: the enforcement path, per component, excluding each file's own
+tests. The test column counts only tests \emph{in that file}: the policy is
+additionally exercised by 11 corpus tests, 3 router tests, and the end-to-end
+acceptance suite, so a zero means ``nothing pins this in isolation'', not
+``untested''. The row that matters is the executor, larger than every gate
+combined. The capability gate's count was zero when this table was first built,
+which is what prompted the two tests it now has.}
+\label{tab:e5}
+\end{table}
 
 \section{Discussion and limitations}
 \label{sec:limits}
@@ -1449,9 +1557,9 @@ analogue cannot be an approximation over strings. The value that needs the tag
 travels from document to argument \emph{through the model}, and no relation
 computed after the fact can see that hop.
 
-\textbf{What we would build instead: citation-constrained arguments.} The shape
-that seems right to us, and that we have not built, makes the plan carry its own
-provenance in a form the kernel can \emph{check}. An argument is either a literal
+\textbf{What we would build instead: citation-constrained arguments}
+(\S\ref{sec:e3c} measures it). The shape that seems right to us makes the plan
+carry its own provenance in a form the kernel can \emph{check}. An argument is either a literal
 or a citation into the context --- an offset and length --- and the executor
 verifies that the span exists where the plan says it does, reads the provenance
 tag already attached to that region, and requires the argument to \emph{be} the
@@ -1486,7 +1594,14 @@ The hazard is real but arrives with the next feature rather than the current
 one: the first eviction or compaction that actually prunes messages will drop
 taint with them, and nothing would fail. So the rule to keep is that any
 context-shrinking step must propagate the \emph{join} of what it removes, and
-durable memory must record provenance per entry --- and there is now a
+durable memory must record provenance per entry. Citations (\S\ref{sec:e3c})
+make this sharper rather than easier: a citation names a span of a message, so
+compaction that rewrites messages invalidates outstanding citations, and a
+summary of a document cannot be cited for a value the summary no longer contains.
+A compacting agent must therefore either keep the cited spans or re-derive
+citations against the summary --- and for a long-running headless agent, where
+compaction is not optional, that is a requirement of the design rather than a
+detail of it --- and there is now a
 regression test pinning the invariant so that the day eviction lands, it lands
 red rather than quietly.
 
@@ -1513,7 +1628,19 @@ where that leaves us is a question we have not measured: a confined agent may
 read within its scope and nothing then constrains where those bytes go, because
 the scope gate governs the read and no gate governs the onward send of what was
 legitimately read. Naming the axes is the precondition for a confidentiality
-policy; writing one is future work.
+policy; writing one is future work, but not unmapped. The strawman we would try
+first is the dual of the integrity rule already here. Give each object a
+\emph{sensitivity} alongside the integrity tag the store now records, default it
+from the scope the object lives under, and take a call's confidentiality level to
+be the join over the objects it has read this turn. Egress is then refused when
+that join exceeds what the destination is cleared for --- Bell--LaPadula on the
+axis Biba does not cover, with the same shape of gate and the same declassifier.
+Two things make it harder than the integrity side rather than symmetric, and both
+are why it is not built. The read set has to be tracked per turn where integrity
+needs only a high-water mark, which is state the current design deliberately does
+not keep. And ``cleared for'' needs a lattice over destinations that somebody has
+to author, where integrity got its lattice for free from where the bytes came
+from.
 
 \paragraph{Human confirmation is a load-bearing human.} The sole declassifier
 is a person at a console, so the design's security depends on that person
@@ -1553,6 +1680,15 @@ ingestion path fails closed. And it is never offered for egress, nor when more
 than one source is resident --- trusting three sources from one dialogue is an
 overreach the human has no basis for. Table~\ref{tab:e4} reports it as its own
 configuration, because a defence whose cost is not measured is an assertion.
+
+On the default: we ship it enabled and would not argue with a deployment that
+does not. The number that decides it is not in this paper --- it is how often a
+real human, in a real session, is right about a source. Enabled is defensible
+where the operator is the person at the console and the alternative is
+click-through fatigue on a quarter of irreversible steps; disabled is the correct
+setting for an agent running unattended, where nobody is present to be right. It
+is one boolean either way, and the measured cost of choosing wrongly is in the
+table rather than in a footnote.
 
 \paragraph{The model runs in the kernel, and that is a position with costs.}
 Placing inference below the boundary is what makes the ABI unavoidable
