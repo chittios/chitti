@@ -12,6 +12,7 @@
 //! there is no runtime registration path an agent could use to smuggle in
 //! new authority.
 
+use crate::security::taint::Effect;
 use crate::cap::PrimitiveId;
 
 /// The JSON value type a parameter accepts. A deliberately tiny type
@@ -44,10 +45,21 @@ pub struct PrimitiveSpec {
     /// exactly this order, so a well-formed call is unambiguous to parse.
     pub params: &'static [Param],
     pub description: &'static str,
-    /// Whether this primitive is destructive / irreversible. The Synapse
-    /// taint gate (Phase 6) refuses a destructive call whose justification
-    /// traces to untrusted, ingested content unless a human confirms it.
-    pub destructive: bool,
+    /// What this primitive does that the provenance policy cares about, on two
+    /// independent axes: `irreversible` (the effect cannot be undone on this
+    /// machine) and `egress` (bytes leave it). The Synapse taint gate (Phase 6)
+    /// refuses an effectful call whose justification traces to untrusted,
+    /// ingested content unless a human confirms it.
+    ///
+    /// These were one `destructive: bool` until the split. One bit conflated
+    /// integrity with confidentiality: `net_http_get` carried it not because a
+    /// GET destroys anything but because it exfiltrates, while `net_http_post`
+    /// -- which does both -- could not say so. They are separate because the
+    /// lattices are separate: Biba integrity governs the irreversible axis, and
+    /// egress is a confidentiality question that an integrity lattice answers
+    /// only by accident. Today's gate is deliberately the same for both, so the
+    /// split changes no behaviour; it makes the finer policy expressible.
+    pub effect: Effect,
 }
 
 // Stable primitive ids. These are also the `cap::Right::InvokePrimitive`
@@ -107,199 +119,184 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
         name: "console_write",
         params: &[Param { key: "text", ty: STR }],
         description: "Write a line of text to the system console.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: MEM_FS_READ,
         name: "mem_fs_read",
         params: &[Param { key: "path", ty: STR }],
         description: "Read the contents of a file from the in-memory store.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: MEM_FS_WRITE,
         name: "mem_fs_write",
         params: &[Param { key: "path", ty: STR }, Param { key: "text", ty: STR }],
         description: "Write text to a file in the in-memory store, creating or replacing it.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: LIST,
         name: "list",
         params: &[],
         description: "List the file paths present in the in-memory store.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: SPAWN_AGENT,
         name: "spawn_agent",
         params: &[Param { key: "persona", ty: STR }],
         description: "Request a new agent be spawned with the given persona (lifecycle lands in Phase 5).",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: SLEEP,
         name: "sleep",
         params: &[Param { key: "ticks", ty: UINT }],
         description: "Yield for a number of scheduler ticks.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: EMIT_RESULT,
         name: "emit_result",
         params: &[Param { key: "text", ty: STR }],
         description: "Report the agent's final result for this intent.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: MEM_FS_DELETE,
         name: "mem_fs_delete",
         params: &[Param { key: "path", ty: STR }],
         description: "Delete a file from the in-memory store. Destructive and irreversible.",
-        destructive: true,
+        effect: Effect::IRREVERSIBLE,
     },
     PrimitiveSpec {
         id: MEM_FS_EDIT,
         name: "mem_fs_edit",
         params: &[Param { key: "path", ty: STR }, Param { key: "old", ty: STR }, Param { key: "new", ty: STR }],
         description: "Replace the first occurrence of `old` with `new` in a file. Not destructive (reversible edit).",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: MEM_FS_SEARCH,
         name: "mem_fs_search",
         params: &[Param { key: "query", ty: STR }],
         description: "List the paths of files whose contents contain `query`.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: CHANNEL_CREATE,
         name: "channel_create",
         params: &[Param { key: "kind", ty: STR }],
         description: "Create an inter-agent channel (kind: \"stream\" or \"datagram\"). Returns the read and write end cap slots granted to the caller.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: CHANNEL_WRITE,
         name: "channel_write",
         params: &[Param { key: "chan", ty: UINT }, Param { key: "text", ty: STR }],
         description: "Write text bytes to a channel. `chan` is the caller's write-end cap slot. Returns bytes written or blocked.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: CHANNEL_READ,
         name: "channel_read",
         params: &[Param { key: "chan", ty: UINT }, Param { key: "max", ty: UINT }],
         description: "Read up to `max` bytes from a channel. `chan` is the caller's read-end cap slot. Cooperatively blocks briefly; returns data or eof.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: CHANNEL_CLOSE,
         name: "channel_close",
         params: &[Param { key: "chan", ty: UINT }],
         description: "Close the caller's channel end named by cap slot `chan`.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: CHANNEL_GRANT,
         name: "channel_grant",
         params: &[Param { key: "chan", ty: UINT }, Param { key: "to_agent", ty: STR }],
         description: "Hand the channel end at cap slot `chan` to another agent (by service name or task id). Destructive: moves authority to another principal.",
-        destructive: true,
+        effect: Effect::IRREVERSIBLE,
     },
     PrimitiveSpec {
         id: NET_LISTEN,
         name: "net_listen",
         params: &[Param { key: "port", ty: UINT }, Param { key: "proto", ty: STR }],
         description: "Listen for inbound TCP connections on a port. Returns a listener cap slot. Destructive: binds an externally-visible port.",
-        destructive: true,
+        effect: Effect::IRREVERSIBLE,
     },
     PrimitiveSpec {
         id: NET_ACCEPT,
         name: "net_accept",
         params: &[Param { key: "listener", ty: UINT }],
         description: "Accept one inbound connection on a listener (cap slot). Returns the connection's read/write channel end cap slots. Blocks briefly.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: NET_HTTP_GET,
         name: "net_http_get",
         params: &[Param { key: "url", ty: STR }],
         description: "HTTP GET a URL (scope-gated by host/port). Returns the response body. Destructive under taint: GET is an egress/exfil channel.",
-        destructive: true,
+        effect: Effect::EGRESS,
     },
     PrimitiveSpec {
         id: NET_HTTP_POST,
         name: "net_http_post",
         params: &[Param { key: "url", ty: STR }, Param { key: "body", ty: STR }],
         description: "HTTP POST a body to a URL (scope-gated). Destructive: network egress that can exfiltrate.",
-        destructive: true,
+        effect: Effect::BOTH,
     },
     PrimitiveSpec {
         id: UI_SURFACE_REQUEST,
         name: "ui_surface_request",
         params: &[Param { key: "kind", ty: STR }],
         description: "Request a drawing surface (kind: canvas|board|image|video|html). Returns its surface id.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: UI_DRAW,
         name: "ui_draw",
         params: &[Param { key: "surface", ty: UINT }, Param { key: "ops", ty: STR }],
         description: "Paint a surface you own with draw ops: 'clear <hex>; rect x y w h <hex>; line x0 y0 x1 y1 <hex>; pixel x y <hex>'.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: UI_EVENT_POLL,
         name: "ui_event_poll",
         params: &[Param { key: "surface", ty: UINT }],
         description: "Poll one input event (click/key) for a surface you own. Returns the event or none.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: UI_SURFACE_CLOSE,
         name: "ui_surface_close",
         params: &[Param { key: "surface", ty: UINT }],
         description: "Close a surface you own.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: BOARD_SET,
         name: "board_set",
         params: &[Param { key: "surface", ty: UINT }, Param { key: "fen", ty: STR }],
         description: "Paint an 8x8 chess board from a FEN string onto a surface you own.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: BOARD_MARK,
         name: "board_mark",
         params: &[Param { key: "surface", ty: UINT }, Param { key: "squares", ty: STR }, Param { key: "color", ty: STR }],
         description: "Highlight squares (e.g. 'e2,e4') on a board surface you own.",
-        destructive: false,
+        effect: Effect::INERT,
     },
     PrimitiveSpec {
         id: UI_HUD,
         name: "ui_hud",
         params: &[Param { key: "surface", ty: UINT }, Param { key: "text", ty: STR }],
         description: "Set a surface's HUD (status + wrapped hint lines, '\\n'-separated), shown in a reserved strip below the surface. Empty clears it.",
-        destructive: false,
+        effect: Effect::INERT,
     },
 ];
-
-impl PrimitiveSpec {
-    /// This primitive's effect, on the two axes the provenance policy needs.
-    ///
-    /// The registry still carries one `destructive` bool; this is where the two
-    /// properties it conflates are separated, so the policy can say "tainted and
-    /// leaving the machine" apart from "tainted and irreversible but local".
-    /// Egress is named explicitly rather than inferred, because `net_http_get`
-    /// destroys nothing and is still the exfiltration channel that matters.
-    pub fn effect(&self) -> crate::security::taint::Effect {
-        use crate::security::taint::Effect;
-        let egress = matches!(self.id, NET_HTTP_GET | NET_HTTP_POST | NET_LISTEN);
-        Effect { irreversible: self.destructive && !egress, egress }
-    }
-}
 
 /// Look up a primitive by its wire name. `None` for any name not in the
 /// registry -- the grammar rejects those before this is ever reached, but
@@ -343,15 +340,50 @@ mod tests {
         assert!(is_name_prefix(""));
     }
 
+    /// One test per axis, because the point of the split is that a primitive
+    /// can be on one, both, or neither, and a single list cannot say which.
+    ///
+    /// The taint gate keys off these, so a careless future addition must be a
+    /// deliberate edit here.
     #[test_case]
-    fn destructive_primitives_are_exactly_the_known_set() {
-        // The taint gate keys off this flag, so guard against a careless future
-        // addition: any new destructive primitive must be a deliberate edit here.
-        // `mem_fs_delete` (irreversible), `channel_grant` (moves authority),
-        // `net_listen` (binds a port), `net_http_get`/`post` (egress/exfil).
-        let destructive: alloc::vec::Vec<_> = REGISTRY.iter().filter(|p| p.destructive).map(|p| p.name).collect();
+    fn irreversible_primitives_are_exactly_the_known_set() {
+        // `mem_fs_delete` destroys a stored object; `channel_grant` moves
+        // authority to another principal (not undoable by the granter);
+        // `net_listen` binds an externally-visible port; `net_http_post`
+        // mutates state on the far side, which the single-bit encoding could
+        // not express at all because it clamped anything egressing to
+        // reversible.
+        let irreversible: alloc::vec::Vec<_> =
+            REGISTRY.iter().filter(|p| p.effect.irreversible).map(|p| p.name).collect();
         assert_eq!(
-            destructive,
+            irreversible,
+            alloc::vec!["mem_fs_delete", "channel_grant", "net_listen", "net_http_post"]
+        );
+    }
+
+    #[test_case]
+    fn egress_primitives_are_exactly_the_known_set() {
+        // Bytes leave the machine. `net_http_get` is here and *not* in the
+        // irreversible set: a GET destroys nothing and is still the
+        // exfiltration channel that matters. `net_listen` is deliberately
+        // absent -- binding a port is inbound exposure, which is an
+        // irreversible externally-visible act, not egress; conflating the two
+        // is what the old single bit did.
+        let egress: alloc::vec::Vec<_> =
+            REGISTRY.iter().filter(|p| p.effect.egress).map(|p| p.name).collect();
+        assert_eq!(egress, alloc::vec!["net_http_get", "net_http_post"]);
+    }
+
+    #[test_case]
+    fn the_effectful_set_is_unchanged_by_the_split() {
+        // The split must not quietly change which calls the gate looks at. This
+        // is the list the single `destructive` bool used to produce; if a future
+        // edit adds an axis to a primitive, this is the test that says the gate's
+        // reach grew.
+        let effectful: alloc::vec::Vec<_> =
+            REGISTRY.iter().filter(|p| p.effect.is_effectful()).map(|p| p.name).collect();
+        assert_eq!(
+            effectful,
             alloc::vec![
                 "mem_fs_delete",
                 "channel_grant",

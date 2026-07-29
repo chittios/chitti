@@ -211,8 +211,12 @@ fn host_glob_covers(a: &str, b: &str) -> bool {
 /// grant of `/agent/7/**` never covers `/agent/7/../../etc/passwd` once the
 /// target is canonicalised to `/etc/passwd`.
 fn glob_covers(a: &str, b: &str) -> bool {
-    let a = crate::synapse::vpath::normalize(a);
-    let b = crate::synapse::vpath::normalize(b);
+    // `normalize_cow` borrows when the path is already canonical, which nearly
+    // every real path is. This runs once per ledger entry per gated call, and
+    // allocating here -- under the ledger spinlock, with interrupts off, so it
+    // takes the heap lock too -- was the bulk of the scope gate's cost.
+    let a = crate::synapse::vpath::normalize_cow(a);
+    let b = crate::synapse::vpath::normalize_cow(b);
     if a == b {
         return true;
     }
@@ -405,6 +409,17 @@ pub struct Session {
     pub subagents: Vec<SubagentRecord>,
     pub budget: BudgetState,
     pub audit_cursor: u64, // offset into the append-only audit log
+    /// Interned source names, indexed by [`Message::origin`]. Append-only and
+    /// never reused: a recycled index would silently relabel an existing
+    /// message's source, and under sticky declassification that would transfer
+    /// a human's trust decision to content they never saw.
+    pub origins: Vec<String>,
+    /// Origins the human has declassified for the rest of this session, as
+    /// indices into `origins`. Deliberately **not persisted**: a session
+    /// resumed weeks later must not silently carry a trust decision made in a
+    /// context nobody can see any more.
+    #[serde(skip)]
+    pub trusted_origins: Vec<u16>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -425,6 +440,11 @@ pub struct Message {
     pub ticks: Ticks,
     pub resident: bool, // true = live in context; false = compacted out
     pub store_ref: Option<StoreKey>, // where the full text lives once compacted
+    /// Index into [`Session::origins`] naming where this content came from, for
+    /// untrusted messages. `None` = unknown source, which is *not* the same as
+    /// trusted: it means the ingestion path did not report one, and every
+    /// decision that reads an origin must fail closed on it.
+    pub origin: Option<u16>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -665,6 +685,7 @@ mod tests {
                 ticks: 1005,
                 resident: true,
                 store_ref: None,
+                origin: None,
             }],
             context: ContextState { live_tokens: 22, window_limit: 8192, compactions: vec![], recall_index: None },
             todos: vec![Todo { id: 1, text: "Read report.txt".into(), status: TodoStatus::Done, created_ticks: 1008 }],
@@ -685,6 +706,8 @@ mod tests {
                 max_wall_ticks: 0,
             }),
             audit_cursor: 91,
+            origins: vec!["host:evil.example".into()],
+            trusted_origins: vec![],
         }
     }
 

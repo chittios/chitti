@@ -26,6 +26,33 @@ pub enum EntryClass {
     Dir,
 }
 
+/// Normalise without allocating when the path is already canonical.
+///
+/// The scope gate is ~68% of the authorization decision (`synapse::bench`), and
+/// most of that was this function: `glob_covers` normalises **both** sides on
+/// every ledger entry it examines, so a constant grant like `/agent/7/**` was
+/// re-normalised on every call forever and the target -- already normalised by
+/// the executor -- was normalised a second time. Nearly every real path is
+/// already canonical, so the fix is to notice that rather than to skip the
+/// normalisation, which is load-bearing: it is what stops `/agent/7/../../etc`
+/// from being covered by a grant of `/agent/7/**`.
+pub fn normalize_cow(path: &str) -> alloc::borrow::Cow<'_, str> {
+    let p = path.trim();
+    // Canonical: absolute, no empty/dot/dotdot segment, no trailing slash.
+    let canonical = p.len() > 1
+        && p.starts_with('/')
+        && !p.ends_with('/')
+        && !p.contains("//")
+        && !p.contains("/./")
+        && !p.contains("/../")
+        && !p.ends_with("/.")
+        && !p.ends_with("/..");
+    if canonical {
+        return alloc::borrow::Cow::Borrowed(p);
+    }
+    alloc::borrow::Cow::Owned(normalize(p))
+}
+
 /// Normalise a path: collapse `/./`, `//`, resolve `..`, strip trailing `/`
 /// (except for the root `/`). Bare names (no leading `/`) stay relative.
 pub fn normalize(path: &str) -> String {
@@ -274,6 +301,33 @@ pub fn format_short(e: &DirEntry) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The fast path must be indistinguishable from the slow one.
+    ///
+    /// `normalize_cow` decides by inspection whether a path is already
+    /// canonical and borrows if so. If that predicate is ever wrong in the
+    /// permissive direction, `glob_covers` compares an unnormalised target --
+    /// and a grant of `/agent/7/**` starts covering `/agent/7/../../etc/passwd`.
+    /// So the two must agree on every input, especially the escaping ones.
+    #[test_case]
+    fn normalize_cow_agrees_with_normalize() {
+        let cases = [
+            "/a/b", "/", "", ".", "//a//b", "/a/./b", "/a/../b", "/a/b/", "/a/b/..",
+            "/a/b/.", "/agent/7/../../etc/passwd", "a/b", "relative", "/a//", "/..",
+            "/a/b//c/./d/../e", "  /a/b  ", "/a/..b", "/a/b..c",
+        ];
+        for c in cases {
+            assert_eq!(
+                normalize_cow(c).as_ref(),
+                normalize(c).as_str(),
+                "normalize_cow disagreed with normalize on {c:?}"
+            );
+        }
+        // And the fast path must actually be taken for the common shape, or the
+        // optimisation is dead code.
+        assert!(matches!(normalize_cow("/agent/7/notes.md"), alloc::borrow::Cow::Borrowed(_)));
+        assert!(matches!(normalize_cow("/a/../b"), alloc::borrow::Cow::Owned(_)));
+    }
+
     use super::*;
     use alloc::string::String;
     use alloc::vec;

@@ -97,7 +97,7 @@ pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Just
     // even though mem_fs_write is not: those files re-enter the system prompt
     // as trusted persona, so an untrusted write is taint-laundering.
     let identity_write = is_identity_file_mutation(spec, &call.args);
-    if (spec.destructive || identity_write) && justification.blocks_destructive() {
+    if (spec.effect.is_effectful() || identity_write) && justification.blocks_destructive() {
         crate::ktrace::log_fmt(format_args!(
             "synapse.taint: REFUSED destructive '{}' by task {caller} -- justification is untrusted ingested content ({:?})",
             spec.name, justification.provenance
@@ -122,8 +122,10 @@ pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Just
         }
     }
 
-    // Gate 4: execute in isolation, then audit the effect.
-    let result = run_primitive(caller, spec, &call.args);
+    // Gate 4: execute in isolation, then audit the effect. The justification's
+    // provenance goes in so a write can record *who* authorised the bytes it
+    // stored -- see `run_primitive`'s MEM_FS_WRITE/EDIT arms.
+    let result = run_primitive(caller, spec, &call.args, justification.provenance);
     let result_hash = audit::fnv1a(result.as_bytes());
     audit::record(caller, spec.name, args_hash, audit::Outcome::Executed, result_hash);
     Invocation::Executed { primitive: spec.name, result }
@@ -185,7 +187,7 @@ pub fn gate_prefix(caller: TaskId, raw: &str, justification: Justification, upto
 
     // Gate 3: taint.
     let identity_write = is_identity_file_mutation(spec, &call.args);
-    if (spec.destructive || identity_write) && justification.blocks_destructive() {
+    if (spec.effect.is_effectful() || identity_write) && justification.blocks_destructive() {
         return GATE_TAINT;
     }
     if upto < GATE_SCOPE {
@@ -338,7 +340,17 @@ fn resolve_agent_target(name: &str) -> Option<TaskId> {
 /// are total for any call the grammar accepted. `caller` is threaded in so the
 /// channel primitives can resolve a handle arg against the caller's own cap
 /// table (the fine-grained second gate, on top of `InvokePrimitive`).
-fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> String {
+///
+/// `prov` is the justification this call cleared the taint gate under. The two
+/// arms that put bytes in the store record it (`fs::write_tagged`), because a
+/// stored object's integrity is a property of *who authorised writing it*, and
+/// this is the only place in the kernel that knows both at once.
+fn run_primitive(
+    caller: TaskId,
+    spec: &PrimitiveSpec,
+    args: &[ArgValue],
+    prov: crate::security::Provenance,
+) -> String {
     match spec.id {
         registry::CONSOLE_WRITE => {
             let text = arg_str(args, 0);
@@ -355,7 +367,7 @@ fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> Str
         registry::MEM_FS_WRITE => {
             let path = fs_path(args, 0);
             let text = arg_str(args, 1);
-            fs::write(&path, text.as_bytes());
+            fs::write_tagged(&path, text.as_bytes(), prov);
             format!("ok:wrote {} bytes to {path}", text.len())
         }
         registry::LIST => {
@@ -407,7 +419,7 @@ fn run_primitive(caller: TaskId, spec: &PrimitiveSpec, args: &[ArgValue]) -> Str
                     let content = String::from_utf8_lossy(&bytes).into_owned();
                     match crate::tools::pathutil::safe_edit(&content, old, new, false) {
                         Ok(edited) => {
-                            fs::write(&path, edited.as_bytes());
+                            fs::write_tagged(&path, edited.as_bytes(), prov);
                             format!("ok:edited {path}")
                         }
                         Err(e) => format!("error:{e}:{path}"),

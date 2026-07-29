@@ -36,14 +36,26 @@ pub struct ToolOutcome {
     pub result: String,
     pub provenance: Provenance,
     pub is_error: bool,
+    /// Where this content came from, when it can be named
+    /// (`tools::dispatch::origin_of`). Carried so the approval dialogue can say
+    /// *which source* justifies a destructive act rather than quoting the
+    /// payload text back at the human.
+    ///
+    /// Set in one place -- `Router::call`, after dispatch -- so the ~40
+    /// `ok`/`error` sites need not each remember to fill it in.
+    pub origin: Option<String>,
 }
 
 impl ToolOutcome {
     pub fn ok(result: impl Into<String>, provenance: Provenance) -> Self {
-        Self { result: result.into(), provenance, is_error: false }
+        Self { result: result.into(), provenance, is_error: false, origin: None }
     }
     pub fn error(result: impl Into<String>) -> Self {
-        Self { result: result.into(), provenance: Provenance::SystemTrusted, is_error: true }
+        Self { result: result.into(), provenance: Provenance::SystemTrusted, is_error: true, origin: None }
+    }
+    pub fn with_origin(mut self, origin: Option<String>) -> Self {
+        self.origin = origin;
+        self
     }
 }
 

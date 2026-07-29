@@ -314,12 +314,14 @@ impl RemoteChat {
             let mut results: alloc::vec::Vec<(String, String)> = alloc::vec::Vec::new();
             for (i, (cmd, args)) in batch.iter().enumerate() {
                 session.budget.tool_calls_used = session.budget.tool_calls_used.saturating_add(1);
+                let mut origin: Option<alloc::string::String> = None;
                 let obs = if cmd == "spawn_subagent" || cmd == "subagent" {
                     "spawn_subagent is unavailable on the remote backend; do the task yourself with tools"
                         .to_string()
                 } else {
                     super::print_tool_header(cmd, args);
-                    let o = super::execute_chat_tool(cmd, args, session);
+                    let (o, org) = super::execute_chat_tool_full(cmd, args, session);
+                    origin = org;
                     if !super::tool_self_prints(cmd) {
                         super::print_tool_output(&o);
                     }
@@ -330,7 +332,7 @@ impl RemoteChat {
                 } else {
                     Provenance::UntrustedIngested
                 };
-                session.push_tool_result(ids[i], obs.clone(), prov, now());
+                session.push_tool_result_from(ids[i], obs.clone(), prov, origin.as_deref(), now());
                 results.push((cmd.clone(), obs));
             }
             self.messages.push((

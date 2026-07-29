@@ -307,7 +307,7 @@ pub fn run() -> bool {
         "bench> synapse gate chain: {} gates, {} primitives ({} destructive), batch >= {} ms",
         GATE_COUNT,
         registry::REGISTRY.len(),
-        registry::REGISTRY.iter().filter(|p| p.destructive).count(),
+        registry::REGISTRY.iter().filter(|p| p.effect.is_effectful()).count(),
         TARGET_MS
     );
 

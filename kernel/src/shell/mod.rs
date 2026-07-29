@@ -336,6 +336,33 @@ pub fn run() -> ! {
                 "ws" => run_ws(arg),
                 "mcp" => run_mcp(arg),
                 "todos" | "todo" => run_todos(arg, &orch.session),
+                // Sticky declassification is authority a human handed out, so it
+                // has to be visible and revocable -- a standing grant nobody can
+                // see is worse than the prompt it replaced.
+                "trusted" => {
+                    let names = orch.session.trusted_origin_names();
+                    if names.is_empty() {
+                        serial_println!("trusted> no sources declassified (every ingested source still gates)");
+                    } else {
+                        serial_println!("trusted> {} source(s) declassified for this session:", names.len());
+                        for n in &names {
+                            serial_println!("trusted>   {n}");
+                        }
+                        serial_println!("trusted> content from these no longer blocks a destructive call; /untrust <source> revokes");
+                    }
+                }
+                "untrust" => {
+                    let target = arg.trim();
+                    if target.is_empty() {
+                        serial_println!("untrust> usage: /untrust <source>   (see /trusted)");
+                    } else {
+                        let idx = orch.session.origins.iter().position(|o| o == target);
+                        match idx.map(|i| orch.session.untrust_origin(i as u16)) {
+                            Some(true) => serial_println!("untrust> '{}' gates again", target),
+                            _ => serial_println!("untrust> '{}' was not a trusted source", target),
+                        }
+                    }
+                }
                 "plan" => {
                     set_plan_mode(true);
                     let p = crate::agent::prompt::plan_file_path(orch.session.id.0);
@@ -551,6 +578,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "redteam" => {
             crate::security::redteam::run();
         }
+        "audit" => run_audit(arg),
         "perf" => run_perf(arg),
         "modelhash" => {
             // Integrity probe for the bundled model region (diagnoses a corrupt
@@ -3729,10 +3757,45 @@ fn run_permissions(arg: &str) {
 /// orchestrator session (taint provenance + memory agent id + todos).
 ///
 /// `spawn_subagent` is handled by the caller before this.
+/// Run one chat tool call, returning only its text.
+///
+/// A wrapper over [`execute_chat_tool_full`] for the callers that do not record
+/// the result in the session (the `use_tool` meta-dispatch, the command hook).
 fn execute_chat_tool(
     name: &str,
     args: &str,
     session: &mut crate::agent::types::Session,
+) -> alloc::string::String {
+    execute_chat_tool_full(name, args, session).0
+}
+
+/// Run one chat tool call, returning its text **and where the content came
+/// from**.
+///
+/// The interactive path used to drop the `ToolOutcome` on the floor and
+/// re-derive provenance downstream by sniffing the text for an `error:` prefix.
+/// That is why the origin has to come out of here explicitly: without it the
+/// approval dialogue would keep falling back to quoting the payload on a real
+/// machine while every unit test passed.
+fn execute_chat_tool_full(
+    name: &str,
+    args: &str,
+    session: &mut crate::agent::types::Session,
+) -> (alloc::string::String, Option<alloc::string::String>) {
+    let mut origin = None;
+    let text = execute_chat_tool_inner(name, args, session, &mut origin);
+    (text, origin)
+}
+
+/// The body. Takes the origin as an out-parameter rather than returning it in a
+/// pair: this function has a dozen early `return`s for refusals and shape
+/// errors, none of which carry a source, and rewriting every one of them to
+/// build a tuple would be a large diff for no information.
+fn execute_chat_tool_inner(
+    name: &str,
+    args: &str,
+    session: &mut crate::agent::types::Session,
+    origin_out: &mut Option<alloc::string::String>,
 ) -> alloc::string::String {
     use crate::agent::agent_loop::{format_tool_result, ToolDispatch};
     use crate::agent::types::ToolCall;
@@ -3840,6 +3903,23 @@ fn execute_chat_tool(
     let rule_allow = matches!(rule, Some(crate::tools::permissions::Decision::Allow));
     let rule_ask = matches!(rule, Some(crate::tools::permissions::Decision::Ask));
 
+    // Whether this call puts bytes in front of somebody else. Read from the
+    // same classifier the router gates on, so the modal and the gate cannot
+    // disagree about what a tool does.
+    let egress_effect = crate::tools::registry::get(name)
+        .map(|def| {
+            crate::tools::dispatch::effect_of(
+                &def,
+                &crate::agent::types::ToolCall {
+                    call_id: 0,
+                    tool: String::from(name),
+                    args: args_json.clone(),
+                },
+            )
+            .egress
+        })
+        .unwrap_or(false);
+
     let needs_approval = if rule_allow {
         false // still cap-gated at Router
     } else {
@@ -3851,48 +3931,120 @@ fn execute_chat_tool(
             }
     };
     let human_confirmed = if needs_approval {
-        // Name the *provenance*, not just the action. A human asked "approve
-        // this delete?" can only answer from the operation; asked "approve this
-        // delete, which is justified by content the agent read from somewhere
-        // else", they are deciding about a source -- which is the decision the
-        // policy actually needs them to make, and the only one they have
-        // information the kernel lacks about.
+        // Name the *source*, not just the action. A human asked "approve this
+        // delete?" can only answer from the operation; asked "approve this
+        // delete, which is justified by content from evil.example", they are
+        // deciding about a source -- which is the decision the policy actually
+        // needs them to make, and the only one they hold information the kernel
+        // lacks about.
         //
-        // The session records a provenance tag per message but not an origin, so
-        // the honest thing to show is the untrusted text itself, truncated. A
-        // hostname would be better and is not available without threading origin
-        // through every ingestion path.
-        let why = if session.resident_max_taint() == crate::agent::types::Provenance::UntrustedIngested {
-            let excerpt = session
-                .untrusted_excerpts()
-                .first()
-                .map(|t| {
-                    let t = t.trim();
-                    let mut cut = t.char_indices().map(|(i, _)| i).take(97).last().unwrap_or(0);
-                    if cut >= t.len() {
-                        cut = t.len();
+        // `untrusted_sources` pairs each resident untrusted message with the
+        // origin recorded when it was ingested (`tools::dispatch::origin_of`).
+        // Where a path never reported one we still quote the text, because an
+        // unnamed source is a real state and hiding it would be worse than
+        // showing a payload.
+        // Owned, so the borrow of `session` ends here: declassifying below
+        // needs `&mut session`, and the whole point is to act on what was shown.
+        let (named, first_excerpt): (alloc::vec::Vec<alloc::string::String>, alloc::string::String) = {
+            let sources = session.untrusted_sources();
+            let mut named: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+            for (o, _) in &sources {
+                if let Some(o) = o {
+                    if !named.iter().any(|n| n == o) {
+                        named.push(alloc::string::String::from(*o));
                     }
-                    if cut < t.len() {
-                        alloc::format!("{}...", &t[..cut])
-                    } else {
-                        alloc::string::String::from(t)
+                }
+            }
+            let first = sources
+                .first()
+                .map(|(_, t)| {
+                    let t = t.trim();
+                    match t.char_indices().nth(97) {
+                        Some((cut, _)) => alloc::format!("{}...", &t[..cut]),
+                        None => alloc::string::String::from(t),
                     }
                 })
                 .unwrap_or_default();
-            alloc::format!("\n\nJUSTIFIED BY CONTENT THE AGENT INGESTED:\n  \u{201c}{excerpt}\u{201d}\nApprove only if you asked for this.")
-        } else {
-            alloc::string::String::new()
+            (named, first)
         };
-        let ok = crate::modal::confirm(
-            "Agent tool call \u{2014} approve?",
-            &alloc::format!(
-                "The agent wants to run: {} {}\n(mode: {}){}",
-                label,
-                args_json,
-                if destructive { "destructive" } else { "manual approval" },
-                why
-            ),
+        let tainted = session.resident_max_taint() == crate::agent::types::Provenance::UntrustedIngested;
+        let why = if !tainted {
+            alloc::string::String::new()
+        } else if !named.is_empty() {
+            let shown: alloc::vec::Vec<&str> = named.iter().take(3).map(|s| s.as_str()).collect();
+            let more = named.len().saturating_sub(shown.len());
+            let list = shown.join(", ");
+            let tail = if more > 0 { alloc::format!(" and {more} more") } else { alloc::string::String::new() };
+            alloc::format!(
+                "\n\nJUSTIFIED BY CONTENT FROM: {list}{tail}\nApprove only if you asked for this."
+            )
+        } else {
+            // No origin recorded on any ingesting path in this turn: fall back
+            // to the payload, truncated on a char boundary.
+            let excerpt = first_excerpt.clone();
+            alloc::format!("\n\nJUSTIFIED BY CONTENT THE AGENT INGESTED (source not recorded):\n  \u{201c}{excerpt}\u{201d}\nApprove only if you asked for this.")
+        };
+        // Where the plan came from is part of what the human is approving. With
+        // a hosted planner the prompt -- including whatever untrusted content
+        // this turn ingested -- has already gone to a third party, and the
+        // transport is plain HTTP today. That does not change what the call is
+        // authorised to do, but it changes who has already seen the context, and
+        // the person deciding should be told rather than have to remember.
+        let planner = if crate::shell::remote::is_remote_active() {
+            "\n\nNOTE: the planner is a remote endpoint -- this turn's context, ingested content included, was sent off this machine in cleartext."
+        } else {
+            ""
+        };
+        let body = alloc::format!(
+            "The agent wants to run: {} {}\n(mode: {}){}{}",
+            label,
+            args_json,
+            if destructive { "destructive" } else { "manual approval" },
+            why,
+            planner
         );
+        // Sticky declassification is offered only when the turn has exactly one
+        // named source. Trusting three sources from one dialogue is the
+        // overreach that turns a usability win into a hole -- the human can only
+        // have judged the one they recognise. Egress is never made sticky: a
+        // bounded grant to modify local state is a different thing from a
+        // standing licence to exfiltrate.
+        let offer_sticky = tainted && named.len() == 1 && !egress_effect;
+        let ok = if offer_sticky {
+            let src = named[0].clone();
+            let src = src.as_str();
+            // Options are ordered safest-first because the test build's modal
+            // stub picks index 0.
+            let choice = crate::modal::choose(
+                "Agent tool call \u{2014} approve?",
+                &body,
+                &[
+                    "Deny",
+                    "Approve once",
+                    &alloc::format!("Approve, and trust \u{201c}{src}\u{201d} for this session"),
+                ],
+            );
+            match choice {
+                Some(2) => {
+                    if let Some(i) = session.intern_origin(src) {
+                        session.trust_origin(i);
+                        crate::synapse::audit::record(
+                            chat_tool_caller(),
+                            "human_declassify_origin",
+                            crate::synapse::audit::fnv1a(src.as_bytes()),
+                            crate::synapse::audit::Outcome::Executed,
+                            0,
+                        );
+                        serial_println!("\x1b[33m[trusting \u{201c}{src}\u{201d} for this session \u{2014} /untrust to revoke]\x1b[0m");
+                    }
+                    true
+                }
+                Some(1) => true,
+                _ => false,
+            }
+        } else {
+            crate::modal::confirm("Agent tool call \u{2014} approve?", &body)
+        };
         if !ok {
             serial_println!("\x1b[33m[denied by user]\x1b[0m");
             return String::from(
@@ -3925,8 +4077,11 @@ fn execute_chat_tool(
     }
     // Auto-compact after tool use (same threshold as agent_loop).
     let _ = crate::agent::context::maybe_compact(session, crate::agent::orchestrator::now());
+    *origin_out = outcome.origin.clone();
     let text = format_tool_result(outcome.is_error, outcome.result);
-    // Spill key uses tool-call budget counter (unique per session turn).
+    // Spill key uses tool-call budget counter (unique per session turn). The
+    // spill truncates the *text*; the origin is unaffected by that, which is
+    // part of why naming a source beats quoting one.
     bound_chat_tool_result(
         session.id.0,
         session.budget.tool_calls_used as u64,
@@ -4467,6 +4622,11 @@ impl ChatSession {
                 session.budget.tool_calls_used = session.budget.tool_calls_used.saturating_add(1);
                 tools_this_turn = tools_this_turn.saturating_add(1);
                 let call_id = call_ids[i];
+                // Where this result's content came from, when the tool can name
+                // it. A sub-agent report has no single source (it is a summary
+                // of that agent's own turn), so it stays unnamed and therefore
+                // never declassifiable.
+                let mut origin: Option<alloc::string::String> = None;
                 let obs = if cmd == "spawn_subagent" || cmd == "subagent" {
                     let task = crate::session::todo::json_str(args, "task")
                         .or_else(|| crate::session::todo::json_str(args, "args"))
@@ -4479,7 +4639,8 @@ impl ChatSession {
                     alloc::format!("Subagent report:\n{summary}")
                 } else {
                     print_tool_header(cmd, args);
-                    let o = execute_chat_tool(cmd, args, session);
+                    let (o, org) = execute_chat_tool_full(cmd, args, session);
+                    origin = org;
                     if !tool_self_prints(cmd) {
                         print_tool_output(&o);
                     }
@@ -4494,7 +4655,7 @@ impl ChatSession {
                 } else {
                     Provenance::UntrustedIngested
                 };
-                session.push_tool_result(call_id, obs.clone(), prov, now());
+                session.push_tool_result_from(call_id, obs.clone(), prov, origin.as_deref(), now());
                 results.push((cmd.clone(), obs));
             }
             let fb = crate::agent::prompt::format_multi_tool_response(&results);
@@ -6570,6 +6731,48 @@ fn run_infer() {
 /// Builtin: `/bench [synapse]`. Bare `/bench` is the matvec/SDOT gauge; `/bench
 /// synapse` prices the determinism boundary itself (see `synapse::bench`) — the
 /// authorization decision in ns/call against a per-token cost from `/perf`.
+/// `/audit [verify|export <path>]` — read out the Synapse audit log.
+///
+/// The log is the record of every capability invocation, denials included, and
+/// until now it could only be counted, never read or checked from the shell. A
+/// verifier nothing can call is a property claimed rather than held.
+///
+/// `export` writes through the store's batch API on purpose: the durable ext4
+/// backend rewrites every file on sync, so a write per entry would be quadratic
+/// in the log's own length. On-demand export is the shape that costs nothing per
+/// invocation.
+fn run_audit(arg: &str) {
+    let mut it = arg.trim().splitn(2, char::is_whitespace);
+    let sub = it.next().unwrap_or("").trim();
+    let rest = it.next().unwrap_or("").trim();
+    match sub {
+        "" | "status" => {
+            let n = crate::synapse::audit::len();
+            match crate::synapse::audit::verify() {
+                Ok(_) => serial_println!("audit> {n} entries, chain intact, head {:#018x}", crate::synapse::audit::head()),
+                Err(seq) => serial_println!("audit> {n} entries, CHAIN BROKEN at #{seq}"),
+            }
+            serial_println!("audit> the chain is tamper-evident, not attested: a kernel that can");
+            serial_println!("audit>   write the log can recompute it. Quote the head elsewhere.");
+        }
+        "verify" => match crate::synapse::audit::verify() {
+            Ok(n) => serial_println!("audit> ok: {n} entries, chain intact, head {:#018x}", crate::synapse::audit::head()),
+            Err(seq) => serial_println!("audit> BROKEN: entry #{seq} does not follow the one before it"),
+        },
+        "export" => {
+            let path = if rest.is_empty() { "/audit.log" } else { rest };
+            let text = crate::synapse::audit::export();
+            let bytes = text.len();
+            crate::synapse::fs::begin_batch();
+            crate::synapse::fs::write(path, text.as_bytes());
+            crate::synapse::fs::end_batch();
+            serial_println!("audit> wrote {bytes} bytes ({} entries) to {path}", crate::synapse::audit::len());
+            serial_println!("audit> head {:#018x} — record it off-box for the export to prove anything", crate::synapse::audit::head());
+        }
+        other => serial_println!("audit> unknown subcommand '{other}' (try: status, verify, export [path])"),
+    }
+}
+
 fn run_bench(arg: &str) {
     if arg.trim() == "synapse" {
         crate::synapse::bench::run();

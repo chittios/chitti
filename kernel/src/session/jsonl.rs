@@ -145,6 +145,7 @@ mod tests {
             ticks: 0,
             resident: true,
             store_ref: None,
+            origin: None,
         }
     }
 

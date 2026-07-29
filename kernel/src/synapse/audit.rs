@@ -88,6 +88,20 @@ impl Entry {
 
 static LOG: Locked<Vec<Entry>> = Locked::new(Vec::new());
 
+/// The digest of the most recent entry, kept **outside** the log.
+///
+/// Chaining alone leaves one entry unprotected: `verify` checks each entry
+/// against the one before it, so altering the *last* record breaks no link and
+/// is invisible -- and the last record is the one an attacker most wants to
+/// change, because it is the call they just made. Holding the head separately
+/// gives the walk something to end at.
+///
+/// This is not attestation. A kernel that can write this static can also
+/// recompute it; what it defends is a *snapshot* whose head is quoted
+/// elsewhere. Sealing needs a key, and there is no key store in this system --
+/// see the module doc.
+static HEAD: Locked<u64> = Locked::new(0);
+
 /// ktrace-mirror coalescing state: how many consecutive entries identical to
 /// the last-printed one (all fields but `seq`) have been suppressed. The
 /// **log itself records every entry** — only the serial/ring mirror collapses
@@ -101,7 +115,9 @@ pub fn record(caller: crate::sched::TaskId, primitive: &'static str, args_hash: 
     let (seq, prev_hash) = LOG.with(|log| {
         let seq = log.len() as u64;
         let prev_hash = log.last().map(|e| e.digest()).unwrap_or(0);
-        log.push(Entry { seq, caller, primitive, args_hash, outcome, result_hash, prev_hash });
+        let entry = Entry { seq, caller, primitive, args_hash, outcome, result_hash, prev_hash };
+        HEAD.with(|h| *h = entry.digest());
+        log.push(entry);
         (seq, prev_hash)
     });
     let e = Entry { seq, caller, primitive, args_hash, outcome, result_hash, prev_hash };
@@ -131,6 +147,10 @@ pub fn record(caller: crate::sched::TaskId, primitive: &'static str, args_hash: 
 /// Cheap enough to run from a shell command on a log of any size a session
 /// produces, and the only way a holder of a snapshot can tell that what they
 /// have is what was written.
+///
+/// The walk ends at [`HEAD`], so tampering with the final entry -- which breaks
+/// no link and was therefore invisible to the chain alone -- is reported as a
+/// break at that entry.
 pub fn verify() -> Result<usize, u64> {
     LOG.with(|log| {
         let mut expected = 0u64;
@@ -140,8 +160,41 @@ pub fn verify() -> Result<usize, u64> {
             }
             expected = e.digest();
         }
+        if HEAD.with(|h| *h) != expected {
+            // Every link held but the last entry does not hash to the recorded
+            // head: the tail was rewritten. Name the last entry, since that is
+            // the one that differs from what was appended.
+            return Err(log.len().saturating_sub(1) as u64);
+        }
         Ok(log.len())
     })
+}
+
+/// The digest the chain currently ends at. Quote this somewhere the kernel does
+/// not control and a later [`verify`] on a snapshot becomes meaningful against
+/// a machine that rewrote its own tail.
+pub fn head() -> u64 {
+    HEAD.with(|h| *h)
+}
+
+/// The whole log as text, one entry per line, ending with the head digest.
+///
+/// The format is deliberately flat and self-contained: a reader with this text
+/// and an independently-quoted head can recompute every link without the
+/// kernel's cooperation.
+pub fn export() -> alloc::string::String {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "# chittios synapse audit log");
+    for e in snapshot() {
+        let _ = writeln!(
+            s,
+            "{} caller={} primitive={} args={:#018x} outcome={:?} result={:#018x} prev={:#018x} digest={:#018x}",
+            e.seq, e.caller, e.primitive, e.args_hash, e.outcome, e.result_hash, e.prev_hash, e.digest()
+        );
+    }
+    let _ = writeln!(s, "# head {:#018x}", head());
+    s
 }
 
 /// Number of entries recorded so far.
@@ -242,5 +295,47 @@ mod tests {
         // rather than at a following link; either way the chain no longer
         // reproduces.
         assert!(first_break.is_some() || snap[victim].digest() != original.digest());
+    }
+
+    /// The head closes the one gap chaining alone leaves: the final entry.
+    ///
+    /// `verify` walks links, and the last entry has no successor to link *from*,
+    /// so rewriting it broke nothing and was undetectable -- which is the entry
+    /// an attacker most wants to change, being the call they just made. The head
+    /// is what the walk now ends at, and it is also what a holder of a snapshot
+    /// checks against: quote the head somewhere the kernel does not control and
+    /// an offline verifier can catch a rewritten tail.
+    #[test_case]
+    fn the_head_catches_a_rewritten_tail() {
+        record(4, "list", 0x11, Outcome::Executed, 0x12);
+        record(4, "list", 0x13, Outcome::Executed, 0x14);
+        assert!(verify().is_ok());
+
+        let snap = snapshot();
+        let last = *snap.last().expect("just recorded two");
+        assert_eq!(head(), last.digest(), "the head must be the last entry's digest");
+
+        // An offline verifier holding (snapshot, head): rewrite the tail and the
+        // links still all hold, but the recomputed head does not match.
+        let mut tampered = snap.clone();
+        let n = tampered.len() - 1;
+        tampered[n].result_hash ^= 0xfeed_face;
+        let mut expected = 0u64;
+        let mut broke = false;
+        for e in &tampered {
+            if e.prev_hash != expected {
+                broke = true;
+                break;
+            }
+            expected = e.digest();
+        }
+        assert!(!broke, "rewriting only the tail breaks no link -- that is the gap");
+        assert_ne!(expected, head(), "...and the head is what catches it");
+
+        // Export carries both halves, so the check above is reproducible from
+        // the text alone.
+        let text = export();
+        assert!(text.contains("# head "), "export must publish the head");
+        assert!(text.lines().count() >= snap.len() + 2, "one line per entry plus banner and head");
     }
 }

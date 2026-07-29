@@ -77,10 +77,25 @@ impl Router {
     }
 
     fn justification(&self, session: &Session) -> Justification {
+        self.justification_with(session, false)
+    }
+
+    /// The turn's justification. `strict` ignores any source the human
+    /// declassified for this session.
+    ///
+    /// The two differ only once sticky declassification has been used. It is a
+    /// bounded grant and the bound is the effect: a human vouching for a source
+    /// so the agent may tidy a local file has not vouched for sending that file
+    /// anywhere, and the difference between those is the whole attack. Enforced
+    /// here rather than in the dialogue that offers the grant, because a
+    /// restriction that lives only at the granting site holds only for as long
+    /// as that is the sole way to grant.
+    fn justification_with(&self, session: &Session, strict: bool) -> Justification {
         if !self.taint_aware {
             return Justification::trusted();
         }
-        let j = Justification::from_context(to_taint(session.resident_max_taint()));
+        let taint = if strict { session.resident_max_taint_strict() } else { session.resident_max_taint() };
+        let j = Justification::from_context(to_taint(taint));
         if self.human_confirmed {
             j.confirmed()
         } else {
@@ -124,7 +139,10 @@ impl Router {
     /// per-value tags propagated by the code that moves values, not inferred
     /// after the fact from what the strings look like.
     fn justification_for(&self, session: &Session, effect: Effect, call: &ToolCall) -> Justification {
-        let j = self.justification(session);
+        // Declassification is never a licence to exfiltrate -- see
+        // `justification_with`. This is checked before the dataflow refinement
+        // so it holds whether or not that experiment is enabled.
+        let j = self.justification_with(session, effect.egress);
         if !self.dataflow || !j.blocks_destructive() || !effect.is_effectful() {
             return j;
         }
@@ -185,9 +203,11 @@ pub fn effect_of(def: &registry::ToolDef, call: &ToolCall) -> Effect {
         // Lowered to a primitive: the executor's gate 3 is the real decision,
         // and it sees the primitive's own effect flags. Classifying here as
         // inert would be wrong (the router would let a tainted delete reach the
-        // executor), so mirror the registry's view of the primitive.
+        // executor), so read the registry's own value -- since the split, this
+        // is the *same* `Effect` the executor gates on, not a second derivation
+        // that could drift from it.
         ToolBinding::Synapse { primitive, .. } => crate::synapse::registry::by_name(primitive)
-            .map(|p| p.effect())
+            .map(|p| p.effect)
             .unwrap_or(Effect::INERT),
 
         // Shell commands: destructive by table, plus `/http` in any form —
@@ -277,6 +297,143 @@ pub fn effect_of(def: &registry::ToolDef, call: &ToolCall) -> Effect {
     }
 }
 
+/// The host a URL names, canonicalised for display and comparison.
+///
+/// **This function is security-relevant and small on purpose.** Its output is
+/// shown to a human deciding whether to approve a destructive act, so a string
+/// that reads as one host while naming another is an attack, not a cosmetic
+/// bug. The threat model assumes the model is persuaded, and the model chooses
+/// the URL --- so the URL is attacker-influenced input.
+///
+/// The trap is userinfo: `http://docs.corp.internal@evil.example/x` connects to
+/// `evil.example`, and naive "text between `//` and the next `/`" reports
+/// `docs.corp.internal`. Everything after the last `@` in the authority is the
+/// host. Also normalised: scheme and case (hosts are case-insensitive), a
+/// trailing root dot (`evil.example.` and `evil.example` are the same name),
+/// and any `[v6]` brackets. The port is kept --- a different port is a
+/// different service and collapsing it would over-merge.
+pub fn url_host(url: &str) -> Option<alloc::string::String> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    // Authority ends at the first '/', '?' or '#'.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    // Userinfo may itself contain '@', so take everything after the LAST one.
+    let hostport = match authority.rfind('@') {
+        Some(i) => &authority[i + 1..],
+        None => authority,
+    };
+    if hostport.is_empty() {
+        return None;
+    }
+    let mut host = alloc::string::String::new();
+    for c in hostport.chars() {
+        host.extend(c.to_lowercase());
+    }
+    // Strip a trailing root dot, but never reduce a name to nothing.
+    while host.ends_with('.') && host.len() > 1 {
+        host.pop();
+    }
+    if host.is_empty() || host == "." {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+/// Where the content this call returns came from, if it can be named.
+///
+/// The counterpart to [`effect_of`], and exhaustive over `ToolBinding` for the
+/// same reason: a new binding that ingests must say what its source is or fail
+/// to build. Without this the approval dialogue can only quote the untrusted
+/// *text* back at the human, which asks them to recognise a payload instead of
+/// to recognise a source.
+///
+/// **What this is not.** The origin is what the agent *asked for*, not where the
+/// bytes physically came from: a redirect records the requested host, a search
+/// records the search engine rather than the pages inside its results, and
+/// `run_shell_command "cat /downloads/x.pdf"` records the command. That is the
+/// right answer for the human's decision ("the agent fetched evil.example") and
+/// it is not a dataflow guarantee --- see the E3b result for why a syntactic
+/// one is not available.
+pub fn origin_of(def: &registry::ToolDef, call: &ToolCall) -> Option<alloc::string::String> {
+    let arg = |k: &str| todo::json_str(&call.args, k);
+    let host_of = |k: &str| arg(k).and_then(|u| url_host(&u)).map(|h| format!("host:{h}"));
+    match &def.binding {
+        // Primitive-backed: the path or URL is the first argument, named by the
+        // registry's own parameter list rather than guessed.
+        ToolBinding::Synapse { primitive, .. } => match primitive.as_str() {
+            "net_http_get" | "net_http_post" => host_of("url"),
+            _ => arg("path").map(|p| format!("path:{p}")),
+        },
+        ToolBinding::StoreQuery { .. } => arg("path")
+            .or_else(|| arg("pattern"))
+            .or_else(|| arg("query"))
+            .map(|p| format!("path:{p}")),
+        ToolBinding::SearchReplace => arg("path").map(|p| format!("path:{p}")),
+
+        // Shell: `/http <url>` is the one that carries a remote source; every
+        // other command's output is the machine's own.
+        ToolBinding::Shell { command, .. } => {
+            if command == "http" {
+                arg("args")
+                    .and_then(|a| a.split_whitespace().find(|t| t.contains("://")).and_then(url_host))
+                    .map(|h| format!("host:{h}"))
+                    .or_else(|| Some(format!("cmd:{command}")))
+            } else {
+                Some(format!("cmd:{command}"))
+            }
+        }
+        ToolBinding::RunShellCommand => {
+            let cmdline = arg("command").or_else(|| arg("cmd")).unwrap_or_default();
+            match crate::tools::shell_cmd::parse_command_line(&cmdline) {
+                Ok((name, _)) => Some(format!("cmd:{name}")),
+                Err(_) => None,
+            }
+        }
+
+        // Remote sources.
+        ToolBinding::Mcp { server, tool } => Some(format!("mcp:{server}/{tool}")),
+        ToolBinding::McpResources { .. } => Some(alloc::string::String::from("mcp:resources")),
+        ToolBinding::Web => match call.tool.as_str() {
+            "web_fetch" => host_of("url"),
+            // A search result is a digest of pages this names none of. Recording
+            // the engine is honest about that: it says "the web", not "this page".
+            _ => Some(alloc::string::String::from("host:html.duckduckgo.com")),
+        },
+        ToolBinding::Download => host_of("url"),
+        ToolBinding::Browser => host_of("url").or_else(|| Some(alloc::string::String::from("host:<current page>"))),
+
+        // Durable per-agent state: the key is the source, because what comes
+        // back is whatever was last stored under it.
+        ToolBinding::AgentStorage => arg("key").map(|k| format!("storage:{k}")),
+        ToolBinding::AgentWasm => Some(format!("agent:{}", call.tool)),
+        // Background-task output is the output of commands this machine ran.
+        // `list_tasks` takes no arguments, so keying on an id left it unnamed --
+        // found by the origin census, which is the point of having one: an
+        // unnamed path refuses nothing, so no attack row would ever go red for
+        // it. The generic name is honest, because the source really is "tasks
+        // on this machine" rather than any one of them.
+        ToolBinding::BgTask => Some(
+            arg("id")
+                .or_else(|| arg("task"))
+                .map(|t| format!("task:{t}"))
+                .unwrap_or_else(|| alloc::string::String::from("task:local")),
+        ),
+        ToolBinding::AgentMemory => Some(alloc::string::String::from("memory:agent")),
+
+        // No external source: these produce session-local or kernel-authored
+        // content, so there is nothing for a human to recognise.
+        ToolBinding::SessionTodo => None,
+        ToolBinding::SpawnSubagent => None,
+        ToolBinding::LoadSkill => None,
+        ToolBinding::RunIntent => None,
+        ToolBinding::Media => None,
+        ToolBinding::AskUser => None,
+    }
+}
+
 impl Default for Router {
     fn default() -> Self {
         Self::new()
@@ -284,7 +441,25 @@ impl Default for Router {
 }
 
 impl ToolDispatch for Router {
+    /// Dispatch, then stamp the result with where its content came from.
+    ///
+    /// The stamp happens here, once, rather than at the ~40 `ToolOutcome::ok`
+    /// sites: `origin_of` is exhaustive over the binding, so one call covers
+    /// every arm and a new binding cannot silently skip it. Errors carry no
+    /// origin — a refusal is the kernel's own text, not ingested content, and
+    /// tagging it would let a failed fetch name a source.
     fn call(&mut self, session: &mut Session, caller: crate::sched::TaskId, call: &ToolCall) -> ToolOutcome {
+        let out = self.dispatch_inner(session, caller, call);
+        if out.is_error || out.origin.is_some() {
+            return out;
+        }
+        let origin = registry::get(&call.tool).and_then(|def| origin_of(&def, call));
+        out.with_origin(origin)
+    }
+}
+
+impl Router {
+    fn dispatch_inner(&mut self, session: &mut Session, caller: crate::sched::TaskId, call: &ToolCall) -> ToolOutcome {
         // Shape gate 1: the tool must be a registered tool.
         let Some(def) = registry::get(&call.tool) else {
             return ToolOutcome::error(alloc::format!("unknown tool: {}", call.tool));
@@ -1030,6 +1205,66 @@ impl Router {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The canonicalizer is the whole security argument for naming a source,
+    /// and doubly so once a human can declassify one.
+    ///
+    /// Its output is shown to a person deciding whether to approve a
+    /// destructive act, and the model -- assumed persuaded -- chooses the URL.
+    /// So the URL is attacker-controlled input to a security decision. Userinfo
+    /// is the trap: `http://docs.corp.internal@evil.example/` connects to
+    /// `evil.example` while reading as the intranet.
+    #[test_case]
+    fn url_host_cannot_be_spoofed_by_userinfo_or_case() {
+        // Userinfo: the host is what follows the LAST '@' in the authority.
+        assert_eq!(url_host("http://docs.corp.internal@evil.example/x").as_deref(), Some("evil.example"));
+        assert_eq!(url_host("https://a@b@evil.example/").as_deref(), Some("evil.example"));
+        assert_eq!(url_host("http://user:pw@evil.example:8080/p").as_deref(), Some("evil.example:8080"));
+
+        // Case and a trailing root dot are the same name.
+        assert_eq!(url_host("HTTP://EVIL.Example/").as_deref(), Some("evil.example"));
+        assert_eq!(url_host("http://evil.example./").as_deref(), Some("evil.example"));
+
+        // The authority ends at the first '/', '?' or '#' -- a path or query
+        // that mentions another host must not become the host.
+        assert_eq!(url_host("http://evil.example/?to=good.example").as_deref(), Some("evil.example"));
+        assert_eq!(url_host("http://evil.example#good.example").as_deref(), Some("evil.example"));
+
+        // The port is kept: a different port is a different service, and
+        // merging them would over-broaden a human's trust decision.
+        assert_ne!(url_host("http://a.example:1/"), url_host("http://a.example:2/"));
+
+        // Degenerate input names nothing rather than something wrong.
+        assert_eq!(url_host(""), None);
+        assert_eq!(url_host("http://"), None);
+        assert_eq!(url_host("http://@/x"), None);
+    }
+
+    /// Every ingesting binding names its source, and everything else says it
+    /// has none. `None` is not "trusted" -- it is "unknown", and the
+    /// declassification path must fail closed on it.
+    #[test_case]
+    fn origin_of_names_the_source_for_every_ingesting_tool() {
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            ("read", r#"{"path":"/notes/x.md"}"#, Some("path:/notes/x.md")),
+            ("web_fetch", r#"{"url":"http://evil.example/p"}"#, Some("host:evil.example")),
+            ("web_search", r#"{"query":"anything"}"#, Some("host:html.duckduckgo.com")),
+            ("download", r#"{"url":"https://cdn.example/f.bin"}"#, Some("host:cdn.example")),
+            ("storage_get", r#"{"key":"policy"}"#, Some("storage:policy")),
+            ("http", r#"{"args":"https://api.example/v1"}"#, Some("host:api.example")),
+            // Session-local: no external source to recognise.
+            ("todo_write", r#"{"todos":[]}"#, None),
+            ("ask_user", r#"{"question":"?"}"#, None),
+        ];
+        for (tool, args, want) in cases {
+            let Some(def) = registry::get(tool) else { continue };
+            let call = ToolCall { call_id: 0, tool: String::from(*tool), args: String::from(*args) };
+            let got = origin_of(&def, &call);
+            assert_eq!(got.as_deref(), *want, "origin_of({tool})");
+        }
+    }
+
     use super::*;
     use alloc::string::ToString;
 

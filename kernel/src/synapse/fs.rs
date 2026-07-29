@@ -48,14 +48,34 @@ static TAINT: Locked<BTreeMap<String, crate::security::Provenance>> = Locked::ne
 /// This is what lets a later destructive call ask "is the thing I am about to
 /// delete something an injection put here?" instead of only "was anything
 /// untrusted in the context?".
+///
+/// The tag **joins** with whatever was there rather than replacing it: a file
+/// written under a trusted justification and later edited under an injection
+/// holds attacker-chosen bytes, so it is tainted from that point on. Replacing
+/// would let a single trusted overwrite launder the object -- and an overwrite
+/// is exactly what an agent does after reading a poisoned document.
+///
+/// The path is normalised first, because [`write`] normalises its key and a tag
+/// filed under the raw string would never be found again.
 pub fn write_tagged(path: &str, contents: &[u8], prov: crate::security::Provenance) {
     write(path, contents);
-    TAINT.with(|m| m.insert(alloc::string::String::from(path), prov));
+    let key = vpath::normalize(path);
+    TAINT.with(|m| {
+        let joined = match m.get(&key) {
+            Some(prev) => prev.join(prov),
+            None => prov,
+        };
+        m.insert(key, joined);
+    });
 }
 
 /// The integrity tag of a stored object, if one was recorded.
+///
+/// Normalises, for the same reason [`write_tagged`] does: the caller here is a
+/// gate holding a model-supplied argument, and `/a/../b` must find `/b`'s tag.
 pub fn provenance(path: &str) -> Option<crate::security::Provenance> {
-    TAINT.with(|m| m.get(path).copied())
+    let key = vpath::normalize(path);
+    TAINT.with(|m| m.get(&key).copied())
 }
 
 /// Whether this object was last written under untrusted justification.
@@ -146,6 +166,10 @@ pub fn list() -> Vec<String> {
 /// provenance by the Synapse taint gate (Phase 6).
 pub fn delete(path: &str) -> bool {
     let path = vpath::normalize(path);
+    // Drop the integrity tag with the object. Keeping it would make a *new*
+    // file created at the same path inherit the deleted one's taint, which
+    // reads as a laundering defence and is really just a stale key.
+    TAINT.with(|m| m.remove(&path));
     STORE.with(|b| match b {
         Backend::Memory(s) => s.remove(&path).is_some(),
         Backend::Ext4(s) => s.delete(&path),
@@ -438,6 +462,50 @@ mod tests {
         assert_eq!(read("fs_test_a").as_deref(), Some(&b"world"[..]));
         assert!(exists("fs_test_a"));
         assert!(!exists("fs_test_missing"));
+    }
+
+    /// The object-provenance half of the value-granular experiment: a write
+    /// under an untrusted justification marks the object, a trusted one does
+    /// not, and the mark survives a later trusted overwrite.
+    ///
+    /// This test exists because the mechanism shipped with **no producer** --
+    /// `write_tagged` had zero callers, so `is_tainted` was constant `false`
+    /// and the E3b measurement priced only its other half. Nothing failed,
+    /// because an uninvoked gate refuses nothing. Same shape as the laundering
+    /// census: the way to catch a missing producer is to assert the tag
+    /// arrives, not to assert a call was refused.
+    #[test_case]
+    fn a_write_records_the_justification_that_authorised_it() {
+        use crate::security::Provenance;
+
+        write_tagged("/fs_test_prov/clean", b"a", Provenance::UserTyped);
+        assert_eq!(provenance("/fs_test_prov/clean"), Some(Provenance::UserTyped));
+        assert!(!is_tainted("/fs_test_prov/clean"));
+
+        write_tagged("/fs_test_prov/dirty", b"a", Provenance::UntrustedIngested);
+        assert!(is_tainted("/fs_test_prov/dirty"));
+
+        // Join, not replace: a trusted overwrite does not launder the object.
+        write_tagged("/fs_test_prov/dirty", b"b", Provenance::UserTyped);
+        assert!(is_tainted("/fs_test_prov/dirty"), "a trusted overwrite laundered a tainted object");
+
+        // Normalisation agrees between writer and reader.
+        assert!(is_tainted("/fs_test_prov/sub/../dirty"));
+
+        // Deleting drops the tag, so a fresh file at the path starts clean.
+        delete("/fs_test_prov/dirty");
+        assert_eq!(provenance("/fs_test_prov/dirty"), None);
+        write_tagged("/fs_test_prov/dirty", b"c", Provenance::UserTyped);
+        assert!(!is_tainted("/fs_test_prov/dirty"));
+
+        // An untracked write leaves no tag -- absent reads as trusted, which is
+        // what the boot-time installers rely on.
+        write("/fs_test_prov/untracked", b"a");
+        assert_eq!(provenance("/fs_test_prov/untracked"), None);
+
+        let _ = delete("/fs_test_prov/clean");
+        let _ = delete("/fs_test_prov/dirty");
+        let _ = delete("/fs_test_prov/untracked");
     }
 
     #[test_case]

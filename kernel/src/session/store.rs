@@ -8,6 +8,18 @@ use crate::agent::types::*;
 use alloc::format;
 use alloc::string::ToString;
 
+/// On-disk session format version, and the first field of a serialized
+/// `Session` so it can be read without decoding the rest.
+///
+/// Bump on **any** change to `Session` or `Message`. Postcard is
+/// non-self-describing: a trailing new field on `Session` would fail cleanly,
+/// but a new field on `Message` sits mid-`Vec` and mis-frames every element
+/// after it -- so an old blob decoded by a new build can *succeed* with garbage
+/// message bodies rather than error. `#[serde(default)]` does nothing here.
+///
+/// v2 added `Message::origin` and `Session::origins`.
+pub const SCHEMA_VERSION: u16 = 2;
+
 fn key_for(id: SessionId) -> alloc::string::String {
     format!("/sessions/{}", id.0)
 }
@@ -110,6 +122,29 @@ pub fn search_sessions(query: &str) -> alloc::vec::Vec<(u64, alloc::string::Stri
 /// a resumed id (counters otherwise restart at 1 each boot).
 pub fn resume(id: SessionId) -> Option<Session> {
     let bytes = crate::synapse::fs::read(&key_for(id))?;
+    // Check the version *before* decoding. `schema_version` is field 0, so it
+    // reads out of any version's blob; without this a v1 snapshot decoded as v2
+    // may succeed with mis-framed message bodies, and the failure mode of the
+    // check itself -- returning None -- was indistinguishable from "no such
+    // session", which is why a format break used to look like a lost session.
+    match postcard::take_from_bytes::<u16>(&bytes) {
+        Ok((v, _)) if v != SCHEMA_VERSION => {
+            crate::ktrace::log_fmt(format_args!(
+                "session.resume: id={} was written by schema v{v}; this build reads v{SCHEMA_VERSION} -- not resumed",
+                id.0
+            ));
+            crate::serial_println!(
+                "session {}: written by an older on-disk format (v{v}, this build reads v{SCHEMA_VERSION}) -- not resumed",
+                id.0
+            );
+            return None;
+        }
+        Ok(_) => {}
+        Err(_) => {
+            crate::ktrace::log_fmt(format_args!("session.resume: id={} snapshot is unreadable", id.0));
+            return None;
+        }
+    }
     match postcard::from_bytes::<Session>(&bytes) {
         Ok(s) => {
             notice_ids(&s);
