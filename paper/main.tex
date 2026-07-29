@@ -1154,14 +1154,27 @@ positive. We report the correction rather than quietly restating the number,
 because the value-granular experiment below would otherwise have been credited
 with fixing a mistake in our measurement.
 
-Three of six tasks completed with no interruption, 3 of 11 steps needed a human,
+Five of fourteen tasks completed with no interruption, 9 of 28 steps needed a human,
 and the control confirms the gate is provenance-based rather than a blanket
 block: with nothing untrusted in context, the destructive step proceeds
 untouched.
 
+\textbf{The number survived tripling the suite.} The first version of this
+measurement had six tasks and four destructive steps, which is a demonstration
+rather than a measurement --- a single mislabelled step would have moved the
+headline by 25 points. The suite is now fourteen tasks and 28 steps, eight of
+them the workloads people actually give agents (a coding agent refactoring and
+pruning a stale artifact, a research summariser over fetched content, filesystem
+cleanup, package-manifest pinning, log triage, document review and publish,
+inbox triage into durable memory, build-artifact pruning). The rate is
+\textbf{unchanged at 25\%} --- 3 over-broad refusals of 12 destructive steps
+against 1 of 4 --- which is the useful thing to learn from an expansion: the
+figure was not an artifact of a thin denominator.
+
 \textbf{Reading this honestly.} A 25\% false-refusal rate on destructive steps is
 smaller than we thought and still the design's main cost. Destructive steps are a
-minority of agent work (4 of 11 steps here), half the tasks were unaffected, and
+minority of agent work (12 of 28 steps here), a third of the tasks were
+unaffected, and
 a refusal is a confirmation prompt rather than a hard failure. Against that: the
 mechanism that asks is a dialogue, and a dialogue that appears on a quarter of a
 category of operations is a dialogue that gets clicked through. The next
@@ -1318,8 +1331,8 @@ in both trusted and untrusted text is handed the trusted citation.
 \textbf{Result: the first configuration that is good on both axes.} It permits
 \textbf{0 of 13} of our attacks and \textbf{0 of 24} imported ones --- matching
 the shipped policy --- while taking the false-refusal rate from \textbf{25\% to
-0\%}: 2 of 4 benign destructive steps still need a human, and both are the
-warranted ones (a delete whose target came out of searched content, and an
+0\%}: 5 of 12 benign destructive steps still need a human, and every one is
+warranted (a delete whose target came out of searched content, and an
 egress whose payload derives from an ingested document). Table~\ref{tab:e4}
 lists it beside the configurations that trade one axis for the other.
 
@@ -1394,14 +1407,14 @@ mechanisms do visibly different jobs: scope contains what a compromised turn can
 reach (3 refusals with the taint gate off), and provenance is what stops the
 agent's own authority being turned against the user (the other 10). Only the full
 policy is good on both axes: it is the sole configuration with zero attack
-success, and it interrupts a human on 3 of 11 benign steps against
-confirm-every-call's 11 of 11.
+success, and it interrupts a human on 9 of 28 benign steps against
+confirm-every-call's 28 of 28.
 
 \textbf{What the usability feature costs, measured rather than assumed.} The
 second row prices sticky declassification (\S\ref{sec:limits}), which this
 system ships enabled: a human who trusts the source an injection arrived through
 takes attack success from 0 to \textbf{6 of 13}, all six taking effect, in
-exchange for eliminating benign interruptions entirely (3 of 11 to 0 of 11). That
+exchange for eliminating benign interruptions entirely (9 of 28 to 0 of 28). That
 is the trade in one line, and it is a large one --- close to what removing the
 provenance gate altogether costs. Two things keep it from being exactly that.
 Egress is excluded from the grant, which is visible in the numbers: the four
@@ -1444,17 +1457,17 @@ cost (\S\ref{sec:e3}) and a box around it would launder that.}
 \toprule
 \textbf{Configuration} & \textbf{Attacks permitted} & \textbf{Human interruptions} & \textbf{Fails on} \\
 \midrule
-\syn{} (caps + scope + provenance) & \textbf{0 / 13} & \textbf{3 / 11} & --- \\
-Citation-constrained (\S\ref{sec:e3c}, proposed) & \textbf{0 / 13} & \textbf{2 / 11} & not built \\
-\quad + human declassified the source & 6 / 13 & 0 / 11 & attack success \\
-Syntactic per-value taint (\S\ref{sec:e3b}) & 4 / 13 & 2 / 11 & attack success \\
-Capabilities + scope, no provenance & 10 / 13 & 0 / 11 & attack success \\
-Ambient authority (container) & 13 / 13 & 0 / 11 & attack success \\
-Confirm every call & human-dependent & 11 / 11 & interruption \\
+\syn{} (caps + scope + provenance) & \textbf{0 / 13} & \textbf{9 / 28} & --- \\
+Citation-constrained (\S\ref{sec:e3c}, proposed) & \textbf{0 / 13} & \textbf{5 / 28} & not built \\
+\quad + human declassified the source & 6 / 13 & 0 / 28 & attack success \\
+Syntactic per-value taint (\S\ref{sec:e3b}) & 4 / 13 & 6 / 28 & attack success \\
+Capabilities + scope, no provenance & 10 / 13 & 0 / 28 & attack success \\
+Ambient authority (container) & 13 / 13 & 0 / 28 & attack success \\
+Confirm every call & human-dependent & 28 / 28 & interruption \\
 \bottomrule
 \end{tabular}
 \caption{E4: the pair. A defence is only interesting if it is good on both
-columns; interruptions are benign steps out of 11 that needed a human. The
+columns; interruptions are benign steps out of 28 that needed a human. The
 second row is the value-granular variant an earlier draft's reviewers asked for:
 measured and not shipped, because it buys one fewer interruption --- and that one
 was a warranted refusal --- for four more permitted attacks. Its figure is a
@@ -1674,8 +1687,8 @@ agent'' expressible without inventing a classification scheme.
 \paragraph{Human confirmation is a load-bearing human.} The sole declassifier
 is a person at a console, so the design's security depends on that person
 reading the prompt. This is a known-bad property of security dialogs, and our
-defence was meant to be frequency --- which E3 partly undercuts: 3 of 11 benign
-steps is not rare enough to be reassuring, even if 3 of 6 tasks were untouched.
+defence was meant to be frequency --- which E3 partly undercuts: 9 of 28 benign
+steps is not rare enough to be reassuring, even if 5 of 14 tasks were untouched.
 The confirmation now names the \emph{source}. Each ingestion path records where
 its content came from --- classified by an exhaustive match over tool bindings,
 the same construction that keeps the effect classification total --- so the
@@ -1847,6 +1860,96 @@ do, never whether doing it was a good idea. A poisoned summary, a subtly wrong
 edit inside a granted scope, and a plan that accomplishes the attacker's goal
 using only permitted primitives are all outside what any authorization
 mechanism can address, and we claim nothing about them.
+
+\section{Comparison}
+\label{sec:compare}
+
+Related work (\S\ref{sec:related}) says where the ideas come from. This section
+asks a narrower question a reviewer is entitled to ask directly: against the
+mechanisms a practitioner would actually reach for, what does this do that they
+do not? Table~\ref{tab:compare} is the short answer and the rest of the section
+is the argument.
+
+\textbf{The classical mechanisms are all authority-of-the-principal.} Unix DAC
+asks who the process runs as; SELinux and AppArmor ask what label it carries;
+Capsicum~\cite{watson2010capsicum} asks which descriptors it holds;
+seL4~\cite{klein2009sel4} asks which capabilities are in its CSpace. Every one
+of them answers ``may this principal do this?'' and every one of them is right to.
+None of them can express ``may this principal do this \emph{because of that
+text}'', because in their world the request's origin is not a thing a request
+has. That is not an oversight: for a compiled program the question is
+meaningless, since the instruction stream is fixed at build time and does not
+change because the program read a file. For an agent it is the only question
+that matters, and it is the one gap the whole design exists to fill.
+
+Capsicum and seL4 deserve more than a row, because we are closest to them and
+the difference is instructive. Both attenuate on delegation, as we do, and both
+would happily run an agent in a tiny authority set. Neither would have stopped a
+single attack in \S\ref{sec:e2}: every corpus attack uses authority the agent
+legitimately holds and would hold under any capability system, because an agent
+that cannot delete files cannot do its job either. Attenuation bounds the blast
+radius; it does not decide whether \emph{this} deletion was the user's idea.
+Scope (gate 4) is our version of their contribution and it refuses 2 of 13; the
+other 11 need provenance.
+
+\textbf{The agent-layer mechanisms are all above the boundary.} OpenAI and
+Anthropic tool calling, and MCP~\cite{mcp2024} as the wire format for
+both, define how a model \emph{requests} an effect --- a schema, a name, typed
+arguments. That is genuinely useful and it is not enforcement: the schema
+constrains shape, not authority, and the process that honours it holds the
+user's ambient rights. A tool definition cannot refuse itself. The practical
+consequence is that every one of these is compatible with this design rather
+than an alternative to it: our registry is MCP-shaped on purpose, and an MCP
+server reached over the network is gated here like any other binding
+(\S\ref{sec:impl}), with its results tagged untrusted because they are.
+
+\textbf{What is genuinely ours is narrow.} Two properties, and it is worth being
+exact about how small the claim is. First, authority depends on the
+\emph{provenance of the justification} rather than only on the identity of the
+principal --- Biba applied to a request rather than to a subject. Second, because
+the kernel owns the sampler, the request set can be constrained in the model's
+own token space, which no OS can do to a compiled program because a program's
+instruction stream is not the kernel's to mask. Everything else here --- the
+capability table, the attenuation, the audit log, the scope ledger --- is
+standard, deliberately, and is drawn from the systems in the table.
+
+\begin{table*}[t]
+\centering
+\small
+\begin{tabular}{@{}llccc@{}}
+\toprule
+\textbf{Mechanism} & \textbf{Unit of authority} & \textbf{Atten.} & \textbf{Provenance} & \textbf{Enforced at} \\
+ & & & \textbf{-based} & \\
+\midrule
+    Unix DAC & user id & no & no & kernel \\
+    SELinux / AppArmor & security label & no & no & kernel \\
+    Windows token / AppContainer & token + SID & partly & no & kernel \\
+    Capsicum & file descriptor & yes & no & kernel \\
+    seL4 & CSpace capability & yes & no & kernel \\
+\midrule
+    OpenAI / Anthropic tool use & ambient & no & no & prompt \\
+    MCP & ambient & no & no & wire format \\
+    Guardrail / filter wrappers & ambient & no & heuristic & userspace \\
+    CaMeL~\cite{debenedetti2025camel} & value (dataflow) & n/a & \textbf{yes} & interpreter \\
+\midrule
+    \textbf{\syn{}} & \textbf{task capability} & \textbf{yes} & \textbf{yes} & \textbf{kernel + sampler} \\
+\bottomrule
+\end{tabular}
+\caption{Where the mechanism sits. The column that separates the two halves of
+the table is \emph{authority depends on provenance}: the classical kernels
+answer ``may this principal?'', which is the right question for a program and
+the wrong one for an agent, while the agent-layer mechanisms describe requests
+without being able to refuse them. CaMeL is the closest prior work and the
+comparison is the useful one --- it obtains value-granular provenance by
+generating a program and analysing its dataflow in an interpreter; we obtain
+turn-granular provenance in a kernel, measure what that costs
+(\S\ref{sec:e3}), and measure a checkable per-value form that recovers it
+(\S\ref{sec:e3c}). ``Enforced at'' is the load-bearing column for the lower
+group: a schema is not a gate. One column is omitted for width --- whether the
+request set is enumerable, which is yes for every kernel row and for \syn{}'s
+26 primitives, and no for the open tool schemas.}
+\label{tab:compare}
+\end{table*}
 
 \section{Related work}
 \label{sec:related}
