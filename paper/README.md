@@ -143,7 +143,7 @@ case and makes the results deterministic and model-independent.
 - **The capability gate stops none of the attacks**, in any configuration —
   injection uses authority the agent legitimately holds.
 
-### Four things the harness found in itself
+### Five things the harness found in itself
 
 Every one would have flattered the result, and none was caught by inspection:
 
@@ -166,6 +166,14 @@ Every one would have flattered the result, and none was caught by inspection:
    the question is whether the payload derives from untrusted data, not whether
    the content named the target — and a report written from an ingested document
    does. Corrected baseline: 25%.
+5. **`channel send` was classified inert**, found by mapping the AgentDojo /
+   InjecAgent intent taxonomy onto this tool surface: their "email the attacker"
+   category had no corpus row here, and the reason was that the tool sending
+   bytes to a third party is registered non-destructive. Latent, not live —
+   `channel` is in no agent's toolset, so the model cannot call it — and now
+   classified as egress on the `send`/`reply` verbs. The general shape: a
+   taxonomy asks what an injection could *want*, a hand-written corpus asks what
+   its author *thought of*.
 
 ### Safety rules this harness must keep
 
@@ -287,9 +295,11 @@ non-ASCII character.
 3. Bib entries are verified; re-check only if a preprint has since appeared in
    proceedings.
 4. **§5 is filled** (E1–E4 measured; E5 partial — the per-gate LOC/test
-   breakdown is still TBD). Re-run E1 on an idle machine before camera-ready;
-   consider porting AgentDojo/InjecAgent for the model-in-the-loop half E2
-   deliberately assumes away.
+   breakdown is still TBD). Re-run E1 on an idle machine before camera-ready.
+   AgentDojo/InjecAgent are mapped by *intent* (the table on `redteam::CORPUS`),
+   not run — they are Python harnesses over tool suites this system does not
+   have. Running the model-in-the-loop half E2 assumes away needs those suites
+   reimplemented over these primitives, which is a paper of its own.
 5. Re-count the headline figures at submission time — LOC, primitive count,
    test count, and the `/perf` throughput numbers all drift:
 

@@ -1252,11 +1252,25 @@ loses on and the reason per-call approval is not a mechanism.}
 \end{table}
 
 \textbf{Threats to validity.} The corpus is 13 attacks written by the system's
-author, not a third-party benchmark, and 12 is small: it is a regression suite
-over enforcement sites, not a sample from a distribution of real attacks.
-Porting AgentDojo~\cite{debenedetti2024agentdojo} or
-InjecAgent~\cite{zhan2024injecagent} would test the model-in-the-loop half we
-deliberately assume away, and is the obvious next step. Four of the five
+author: a regression suite over enforcement sites, not a sample from a
+distribution of real attacks. AgentDojo~\cite{debenedetti2024agentdojo} and
+InjecAgent~\cite{zhan2024injecagent} cannot be run here --- they are harnesses
+over tool suites this system does not have (email clients, banking APIs, smart
+devices) --- but their \emph{intent taxonomy} transfers, and the corpus is now
+mapped against it: destroy user data, change persistent state, exfiltrate to an
+attacker, message a third party, escape scope. That is coverage of the attack
+categories, not a comparable score, and the distinction matters: those suites
+measure whether a model is persuaded across realistic tasks, while this measures
+whether the boundary holds once persuasion is assumed.
+
+Doing the mapping earned its keep immediately. It found that the messaging tool
+(\code{channel send}) is registered non-destructive and therefore classified
+inert, though sending puts bytes in front of a third party --- the ``email the
+attacker'' shape those benchmarks are built around. It is in no agent's toolset,
+so it was a latent misclassification rather than a live hole, and it is now
+classified as egress. The general point is that a taxonomy asks ``what could an
+injection want?'' where a hand-written corpus asks ``what did the author think
+of?'', and the two find different things. Four of the five
 ingestion vectors are \emph{modelled} by tagging a tool result rather than
 driven through a live network or peer agent; the file-read vector is driven
 end-to-end, which is what checks that the tool layer really tags what it
