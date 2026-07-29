@@ -1336,11 +1336,15 @@ is a person at a console, so the design's security depends on that person
 reading the prompt. This is a known-bad property of security dialogs, and our
 defence was meant to be frequency --- which E3 partly undercuts: 3 of 11 benign
 steps is not rare enough to be reassuring, even if 3 of 6 tasks were untouched.
-A better answer probably involves the confirmation naming the \emph{provenance}
---- ``this action is justified by content from \code{evil.example}'' --- rather
-than only the action, so the human is deciding about a source rather than an
-operation. That is a small change to the modal and a real improvement to what
-the human is being asked, and it is not implemented.
+The confirmation now names the \emph{provenance}: when the turn is tainted the
+dialogue shows the ingested text that is the reason for asking, so the human is
+deciding about a source rather than about an operation. That is the decision the
+policy actually needs from them, and the only one they have information the
+kernel lacks about. What it cannot yet show is \emph{which} source --- the
+session tags each message with a provenance but not an origin, so the dialogue
+quotes the untrusted text rather than naming \code{evil.example}. Threading an
+origin through every ingestion path is the remaining work, and it would make the
+prompt answerable at a glance rather than by reading.
 
 \paragraph{The model runs in the kernel, and that is a position with costs.}
 Placing inference below the boundary is what makes the ABI unavoidable

@@ -3851,13 +3851,46 @@ fn execute_chat_tool(
             }
     };
     let human_confirmed = if needs_approval {
+        // Name the *provenance*, not just the action. A human asked "approve
+        // this delete?" can only answer from the operation; asked "approve this
+        // delete, which is justified by content the agent read from somewhere
+        // else", they are deciding about a source -- which is the decision the
+        // policy actually needs them to make, and the only one they have
+        // information the kernel lacks about.
+        //
+        // The session records a provenance tag per message but not an origin, so
+        // the honest thing to show is the untrusted text itself, truncated. A
+        // hostname would be better and is not available without threading origin
+        // through every ingestion path.
+        let why = if session.resident_max_taint() == crate::agent::types::Provenance::UntrustedIngested {
+            let excerpt = session
+                .untrusted_excerpts()
+                .first()
+                .map(|t| {
+                    let t = t.trim();
+                    let mut cut = t.char_indices().map(|(i, _)| i).take(97).last().unwrap_or(0);
+                    if cut >= t.len() {
+                        cut = t.len();
+                    }
+                    if cut < t.len() {
+                        alloc::format!("{}...", &t[..cut])
+                    } else {
+                        alloc::string::String::from(t)
+                    }
+                })
+                .unwrap_or_default();
+            alloc::format!("\n\nJUSTIFIED BY CONTENT THE AGENT INGESTED:\n  \u{201c}{excerpt}\u{201d}\nApprove only if you asked for this.")
+        } else {
+            alloc::string::String::new()
+        };
         let ok = crate::modal::confirm(
             "Agent tool call \u{2014} approve?",
             &alloc::format!(
-                "The agent wants to run: {} {}\n(mode: {})",
+                "The agent wants to run: {} {}\n(mode: {}){}",
                 label,
                 args_json,
-                if destructive { "destructive" } else { "manual approval" }
+                if destructive { "destructive" } else { "manual approval" },
+                why
             ),
         );
         if !ok {
