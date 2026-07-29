@@ -57,61 +57,40 @@
 
 \author{Vinoth Kumar\\ \small \texttt{vinothsparrow@live.com}}
 
-\date{Draft --- \today}
+% arXiv: avoid \today -- it makes the PDF differ on every rebuild.
+\date{Draft --- 29 July 2026}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
 For fifty years the operating system's unit of execution has been the
-\emph{program}: untrusted, but deterministic, with a finite and statically
-knowable set of effects it can request. An LLM agent breaks all three
-properties at once. Its instruction stream is generated stochastically, its
-set of possible requests is unbounded, and --- most consequentially --- its
-apparent intent is derived from data it has read, so any adversary who
-controls that data controls the requests. Contemporary agent deployments
-answer this above the OS, with prompt-level guardrails and per-call human
-approval, while the agent process itself holds the user's full ambient
-authority.
+\emph{program}: untrusted, but deterministic, with knowable effects. An
+LLM agent breaks all three properties. Its instruction stream is generated
+stochastically, its request set is unbounded, and its apparent intent is derived
+from data it has read --- so whoever controls that data controls the requests.
+Practice answers above the OS, with prompt guardrails and per-call approval, while the agent holds the user's full ambient authority.
 
 We argue the answer belongs in the kernel, and present \syn{}, the capability
-ABI of \os{}, a from-scratch operating system in which the unit of execution
-is an agent rather than a binary. \syn{} draws an explicit
-\emph{determinism boundary}: above it, a stochastic planner emits an
-\emph{untrusted plan}; below it, deterministic native code executes
-capability-checked primitives. Model output never causes an effect directly.
-Five mechanisms enforce the crossing: (i) a build-time-fixed primitive
-registry, from which (ii) a prefix-closed constraint grammar is generated and
-applied \emph{in the model's own token space}, so a malformed or unregistered
-call is unrepresentable rather than merely rejected; (iii) unforgeable
-per-task capabilities whose delegation can only attenuate; (iv) a provenance
-lattice that makes \emph{taint a syscall argument}, refusing any destructive
-primitive whose justification traces to untrusted ingested content unless a
-physically-present human endorses it --- a Biba-style integrity policy
-low-water-marked over the live context window; and (v) a fine-grained scope
-gate that binds a granted capability to concrete paths, hosts, and ports.
-Every attempt, including every denial, appends to a structurally append-only
-audit log.
+ABI of \os{}, an OS whose unit of execution is an agent, not a binary.
+\syn{} draws an explicit \emph{determinism boundary}: above it a stochastic
+planner emits an \emph{untrusted plan}; below it deterministic native code
+executes capability-checked primitives. Model output never causes an effect
+directly. A fixed registry generates a prefix-closed grammar, applied in the
+model's own token space and revalidated at the executor; capabilities attenuate
+on delegation and a scope gate binds each to concrete paths and hosts; and a
+provenance lattice makes \emph{taint a syscall argument}, refusing destructive
+primitives justified by untrusted content --- Biba integrity, low-water-marked
+over the live context. Every attempt, denials included, is audited.
 
-\syn{} is implemented in a running system: a dual-architecture
-(\code{x86\_64}, \code{aarch64}) Rust \code{no\_std} kernel of
-$\sim$178k lines, in which the language model itself executes in-kernel on
-the CPU and therefore possesses no I/O of its own --- there is no channel
-around the ABI. The mechanism is 2.4k lines.
-
-Measured on the running system: the four-gate authorization decision costs
-1.4\,$\mu$s, $3\times10^{-5}$ of the cost of decoding one token, so the boundary
-is free relative to the thing it guards. An injection corpus spanning four
-attack goals and five ingestion vectors is refused 12 times out of 12; removing
-provenance and changing nothing else lets 9 of them past the policy (6 of which
-then take effect), and removing attenuation as well lets all 12 past --- so
-capabilities and provenance demonstrably do different jobs, and the capability
-gate alone stops none of the attacks, because indirect injection exploits
-authority the agent already holds.
-The cost is real and we report it as the headline liability: half of the
-\emph{legitimate} irreversible operations in a benign task suite are refused
-because turn-granular taint cannot tell which data justified them, which is the
-argument for per-value provenance rather than for this being finished.
+The implementation is a dual-architecture Rust kernel in which the
+model runs in-kernel with no I/O of its own, so there is no way around the ABI;
+the mechanism is 2.4k lines. Measured on the running system: the authorization
+decision costs 1.4\,$\mu$s ($3\times10^{-5}$ of one decoded token), and an
+injection corpus is refused 12 times out of 12 --- while removing provenance
+lets 9 through and removing attenuation all 12. The cost is the headline
+liability: half the \emph{legitimate} irreversible operations in a benign suite
+are refused, because turn-granular taint cannot tell which data justified them.
 \end{abstract}
 
 \section{Introduction}

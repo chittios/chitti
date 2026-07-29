@@ -219,6 +219,45 @@ Three decisions worth not undoing:
   script screendumped a machine that had not booted — and every dump was silently
   empty. It now waits for `Commands start with`, which only the booted shell emits.
 
+## arXiv compliance
+
+`./arxiv.sh` (or `make arxiv`) builds `arxiv-submission.tar.gz` and checks it
+against the rules that actually cause holds, each traced to
+[submit_tex](https://info.arxiv.org/help/submit_tex.html) /
+[prep](https://info.arxiv.org/help/prep.html) in the script's header. It packages
+exactly `main.tex`, `refs.bib`, `main.bbl` and the **five referenced** figures —
+289 KiB — and excludes the output PDF, aux files, hidden files, the generator
+scripts, and the five unused figures sitting in `figures/`.
+
+Verified, not assumed: the tarball was extracted to a clean directory and
+compiled there with nothing else present — 25 pages, 0 errors, 0 undefined
+references. That is the check that matters, because arXiv rebuilds from source
+and will not see your working directory.
+
+Four things the audit actually caught in this paper:
+
+1. **The abstract was 3,138 characters.** arXiv rejects anything over 1,920. It
+   is now 1,907 (13 to spare) and the paper's abstract was rewritten to match, so
+   the two cannot say different things.
+2. **`	oday` in `\date{}`** — arXiv asks you not to, because it makes the PDF
+   differ on every rebuild. Now a fixed date.
+3. **Five unused figures** in `figures/` would have shipped as "extraneous
+   content"; the packager excludes anything `main.tex` does not reference.
+4. **`main.pdf` must not be in the package** even though figure PDFs must. Easy
+   to get backwards with one glob.
+
+Things checked and already fine: all fonts embedded; every `\includegraphics`
+path matches its file **case-sensitively** (macOS's case-insensitive filesystem
+hides this class of bug until arXiv rejects it); no `\pdfoutput`, no `xr`, no
+`#` in URLs; file names use only the permitted character set; `main.bbl` matches
+the main `.tex` basename.
+
+`arxiv-metadata.txt` holds the title, the ASCII abstract, the category choice and
+the licence note to paste into the form. It is **generated** by `make arxiv-meta`
+from `main.tex` — deriving it is the only way the form and the PDF cannot drift —
+and the generator fails if the abstract exceeds 1,920 characters or picks up a
+non-ASCII character.
+
 ## Before submitting
 
 1. **Make `github.com/chittios/chitti` public, or remove the artifact link.** The
