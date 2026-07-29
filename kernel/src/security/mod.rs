@@ -16,6 +16,7 @@
 //! the policy is measured where it is actually enforced rather than where it is
 //! defined.
 
+pub mod citation;
 pub mod redteam;
 pub mod taint;
 

@@ -210,3 +210,71 @@ pub fn clear_scopes(task: TaskId) {
         m.remove(&task);
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The capability gate, pinned in isolation.
+    ///
+    /// It had no test of its own until a per-component count (paper E5) made
+    /// that visible. It was never *untested* -- the acceptance suite and every
+    /// corpus run go through it -- but nothing here pinned the one gate whose
+    /// entire job is "holds this right, or does not", and an aggregate test
+    /// count hid that. The asymmetry is what matters: granting one right must
+    /// not confer a neighbouring one, and revocation must actually revoke.
+    #[test_case]
+    fn a_grant_confers_exactly_one_right_and_revocation_takes_it_back() {
+        let task = crate::sched::spawn_parked("cap-test");
+
+        assert!(!holds(task, Right::InvokePrimitive(7)), "a fresh table grants nothing");
+        let cap = grant(task, Right::InvokePrimitive(7));
+        assert!(holds(task, Right::InvokePrimitive(7)));
+        // Holding one primitive must not imply the next one along.
+        assert!(!holds(task, Right::InvokePrimitive(8)));
+        assert!(!holds(task, Right::InvokePrimitive(6)));
+
+        assert_eq!(lookup(task, cap), Some(Right::InvokePrimitive(7)));
+        assert_eq!(revoke(task, cap), Some(Right::InvokePrimitive(7)));
+        assert!(!holds(task, Right::InvokePrimitive(7)), "revocation must actually revoke");
+        assert_eq!(revoke(task, cap), None, "revoking twice is not a second grant");
+
+        let _ = crate::sched::kill(task);
+    }
+
+    /// Deny-only-when-recorded, which is the rule the scope ledger is built on
+    /// and the one most likely to be broken by a well-meaning change: a task
+    /// with no ledger entry is unconstrained, and a recorded narrow entry bites.
+    #[test_case]
+    fn the_scope_ledger_constrains_only_what_it_records() {
+        use crate::agent::types::{CapDomain, CapabilityRequest, Rights, Scope};
+        let task = crate::sched::spawn_parked("scope-test");
+        let target = Scope::Path(alloc::string::String::from("/elsewhere/x"));
+
+        // No ledger entry for the domain: unconstrained.
+        assert!(scope_check(task, CapDomain::Fs, Rights::READ, &target));
+
+        grant_scopes(
+            task,
+            &[CapabilityRequest::new(
+                CapDomain::Fs,
+                Rights::READ,
+                Scope::Path(alloc::string::String::from("/home/**")),
+            )],
+        );
+        assert!(!scope_check(task, CapDomain::Fs, Rights::READ, &target), "a recorded narrow scope must bite");
+        assert!(scope_check(
+            task,
+            CapDomain::Fs,
+            Rights::READ,
+            &Scope::Path(alloc::string::String::from("/home/notes.txt"))
+        ));
+        // A domain the ledger says nothing about stays unconstrained even once
+        // another domain is recorded.
+        assert!(scope_check(task, CapDomain::Net, Rights::READ, &target));
+
+        clear_scopes(task);
+        assert!(scope_check(task, CapDomain::Fs, Rights::READ, &target), "clearing restores unconstrained");
+        let _ = crate::sched::kill(task);
+    }
+}
