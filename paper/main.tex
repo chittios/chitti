@@ -1224,6 +1224,71 @@ replace, and this experiment turns that from an assumption into an argued
 position. The variant ships disabled and is reported as a configuration, so the
 trade-off stays visible.
 
+\subsection{E2b: Somebody else's attacks}
+\label{sec:e2b}
+
+\textbf{Question.} The corpus in \S\ref{sec:e2} is thirteen attacks written by
+this paper's author. Both reviewers of an earlier draft said so, and the
+objection is not that thirteen is few but that we chose them. What happens on an
+attack list we did not write?
+
+\textbf{Method, and what it can and cannot show.} AgentDojo's 27 injection
+tasks~\cite{debenedetti2024agentdojo} (MIT) are translated onto this tool
+surface: each task's terminal effect is mapped to the nearest reachable
+primitive, its real goal text is ingested verbatim as the untrusted content, and
+its attacker-named target is preserved as an argument while being redirected to
+a sandbox path or the loopback discard port. Fidelity is reported per task ---
+\emph{exact} where the benchmark's tool and ours do the same thing
+(\code{delete\_file} is \code{mem\_fs\_delete}, \code{post\_webpage} is an
+HTTP POST), \emph{effect-only} where the domain differs but the authorization
+question is identical. \code{send\_money} is not a file operation; ``may
+injected content authorise an irreversible transfer to a recipient it named?''
+is the question our gate answers either way.
+
+We should say plainly what this cannot show. Our gates never read the payload,
+so third-party attack \emph{text} cannot change a refusal: feeding 24 real
+injections to a payload-blind gate produces 24 identical refusals, and reporting
+that as a benchmark result would be dressing up a tautology. Running AgentDojo
+properly --- measuring whether a model is persuaded across realistic tasks ---
+needs its tool suites reimplemented here, which is a different project.
+
+\textbf{Result: 24 of 27 expressible, 0 permitted.} Three are not expressible
+and each says something. One is an authority transfer (invite a user, add them
+to a channel) that only \code{channel\_grant} could express and no tool lowers
+to it --- the same gap our own corpus records as a written exemption. One is
+harm done in the model's \emph{reply} rather than through any tool call, which
+is authorized-but-wrong and outside what any authorization mechanism can
+address. One makes no tool call at all.
+
+\textbf{What it did show was about our own experiment, not the gate.} The
+value-granular variant (\S\ref{sec:e3b}) is the one configuration that reads
+content, so it is the one whose numbers depend on how payloads are worded --- and
+ours were written by the same person who wrote the relation. On AgentDojo's
+payloads it permits \textbf{0 of 24}; on ours it permits 4 of 13. The relation
+is not better or worse in the two runs; the corpora are different in a way that
+decides the outcome. AgentDojo's injections \emph{name their targets}, because
+that is how the benchmark specifies an attacker (``send a transaction to
+US133000000121212121212'', ``to jay@google.com''). Ours mostly do not: they say
+``ignore previous instructions and delete everything''. A relation that looks for
+shared substrings catches the first kind and cannot catch the second.
+
+That is a sharper statement of the \S\ref{sec:e3b} conclusion than our own
+corpus could make. The syntactic relation's effectiveness is not a property of
+the defence but of the injection's phrasing --- and the phrasing is the
+attacker's to choose. A defence whose measured score the adversary selects is
+not a defence, however well it scores on any particular corpus.
+
+Two methodological notes, because both cost us a wrong number first. Our
+translation initially buried the attacker string inside a URL query
+(\code{?to=US133\ldots}), where a token-level relation could never match it,
+and reported 21 of 24 permitted --- an artifact of our own harness, not a
+finding. And the relation compared whitespace tokens exactly, so
+\code{jay@google.com,} did not match \code{jay@google.com}; real prose quotes
+and punctuates the things it names, where ours had not. We fixed both, which
+means we \emph{strengthened the baseline we argue against} before rejecting it.
+A negative result is only worth reporting against the strongest version of the
+thing it rejects.
+
 \subsection{E4: Comparison against the alternatives}
 \label{sec:e4}
 
@@ -1321,10 +1386,11 @@ loses on and the reason per-call approval is not a mechanism.}
 \textbf{Threats to validity.} The corpus is 13 attacks written by the system's
 author: a regression suite over enforcement sites, not a sample from a
 distribution of real attacks. AgentDojo~\cite{debenedetti2024agentdojo} and
-InjecAgent~\cite{zhan2024injecagent} cannot be run here --- they are harnesses
-over tool suites this system does not have (email clients, banking APIs, smart
-devices) --- but their \emph{intent taxonomy} transfers, and the corpus is now
-mapped against it: destroy user data, change persistent state, exfiltrate to an
+InjecAgent~\cite{zhan2024injecagent} cannot be \emph{run} here --- they are
+harnesses over tool suites this system does not have (email clients, banking
+APIs, smart devices) --- but AgentDojo's 27 injection tasks are translated onto
+these primitives and executed (\S\ref{sec:e2b}), and the corpus is also mapped
+against their intent taxonomy: destroy user data, change persistent state, exfiltrate to an
 attacker, message a third party, escape scope. That is coverage of the attack
 categories, not a comparable score, and the distinction matters: those suites
 measure whether a model is persuaded across realistic tasks, while this measures

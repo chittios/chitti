@@ -312,3 +312,15 @@ tree.
 
 Licensed under the **MIT License** (Copyright The Asahi Linux Contributors;
 `third_party/m1n1/LICENSE`).
+
+## AgentDojo (MIT)
+
+`kernel/src/security/redteam.rs` embeds the **goal text of the 27 injection
+tasks** from AgentDojo, quoted verbatim with the suites' own attacker constants
+substituted, to run a third-party attack corpus against the Synapse boundary
+(`/redteam`, paper §E2b). No AgentDojo code is used --- only the task text and
+the tool each task drives, translated onto ChittiOS primitives.
+
+Copyright (c) 2024 Edoardo Debenedetti, Jie Zhang, Mislav Balunovic,
+Luca Beurer-Kellner, Marc Fischer, and Florian Tramer.
+Licensed under the MIT License. Source: https://github.com/ethz-spylab/agentdojo

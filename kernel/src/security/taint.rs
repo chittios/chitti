@@ -122,9 +122,22 @@ pub fn shares_content(value: &str, untrusted: &[&str]) -> bool {
 /// "the document named this path" when the path is embedded in a sentence on
 /// both sides rather than being one string inside the other.
 fn longest_shared_token(a: &str, b: &str) -> usize {
+    // Trim surrounding punctuation before comparing. Prose quotes and
+    // punctuates the things it names -- `jay@google.com,` and
+    // `'mark.black-2134@gmail.com'` and `www.secure-systems-252.com.` are the
+    // same targets as their bare forms, and an exact token match calls them
+    // different. This is deliberately *tuning the baseline we argue against*:
+    // without it the relation looked far worse on a third-party corpus than on
+    // our own, and the difference was punctuation rather than anything about
+    // dataflow. A negative result is only worth reporting against the strongest
+    // version of the thing it rejects.
+    fn norm(t: &str) -> &str {
+        t.trim_matches(|c: char| !c.is_alphanumeric())
+    }
     a.split_whitespace()
+        .map(norm)
         .filter(|t| t.len() >= 8)
-        .filter(|t| b.split_whitespace().any(|o| o == *t))
+        .filter(|t| b.split_whitespace().map(norm).any(|o| o == *t))
         .map(|t| t.len())
         .max()
         .unwrap_or(0)
