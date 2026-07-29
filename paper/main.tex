@@ -1123,6 +1123,41 @@ non-destructive escapes fall through to scope.}
 \label{tab:e2}
 \end{table}
 
+\subsection{E2c: Phrasing, and delegation}
+\label{sec:e2c}
+
+Two axes the attack corpus cannot reach, each measured the way the laundering
+census is: by asking the question an attack does not ask.
+
+\textbf{Phrasing moves only the defences that read text.} Six phrasings of one
+attack --- the same target, deleted six ways: written plainly, quoted and
+punctuated as prose does it, split so the path never appears as one token,
+described rather than named (``the file mentioned in the first paragraph''),
+base64-encoded, and stated as a one-step transformation (``take
+\code{victim.txt.bak}, drop the \code{.bak}''). The syntactic per-value relation
+\textbf{misses three of the six}. The citation policy refuses all six, and so do
+the four configurations that never look at the text.
+
+That is \S\ref{sec:e2b}'s finding made deliberate rather than incidental. There,
+a defence's score moved between two corpora because they happened to phrase
+targets differently. Here the phrasing is the independent variable and the target
+is held fixed, and half of a text-matching defence's effectiveness disappears
+under changes the attacker makes for free. The three it misses are not exotic:
+splitting a path across two tokens, referring to something instead of naming it,
+and base64.
+
+\textbf{Delegation narrows, checked against attempts to widen it.} ``A
+sub-agent's authority is a strict subset of its parent's'' is one of the
+load-bearing invariants, and the corpus tested it with two scope refusals ---
+which is the wrong instrument, because a widening spawn is not a refused call but
+a \emph{granted} one that should not have been. Six spawn attempts against a
+parent confined to one home directory: two legitimate (same scope, narrower) and
+four widening (a sibling directory, the parent above, the whole store, and
+widening spelled to look like narrowing with \code{..}). \textbf{All six stayed
+within the parent's authority} --- the widening requests are refused outright or
+clamped to the overlap, and the legitimate ones still pass. We report it because
+an invariant that has never had anything aimed at it is a comment.
+
 \subsection{E3: What does the gate cost in utility? (the important number)}
 \label{sec:e3}
 
