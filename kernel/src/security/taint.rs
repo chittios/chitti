@@ -90,6 +90,46 @@ impl Justification {
     }
 }
 
+/// Does `value` share content with anything the turn ingested?
+///
+/// Two directions, and both matter:
+///
+/// * the untrusted text *contains* the value — the injected document named this
+///   file, so a delete of it is the injection's idea; and
+/// * the value *contains* untrusted text — the body being POSTed was written
+///   from the document, which is the exfiltration case.
+///
+/// This is a substring relation, not a dataflow analysis, and it is **less sound
+/// than whole-turn taint**: an attacker who gets the agent to transform a name
+/// (reverse it, base64 it, describe it) defeats it. That is the price of the
+/// utility it buys, and it is why the strict whole-turn policy stays available
+/// rather than being replaced. Short needles are ignored because a two-character
+/// overlap is coincidence, not derivation.
+pub fn shares_content(value: &str, untrusted: &[&str]) -> bool {
+    const MIN: usize = 4;
+    if value.len() < MIN {
+        return false;
+    }
+    untrusted.iter().any(|u| {
+        if u.len() < MIN {
+            return false;
+        }
+        u.contains(value) || value.contains(*u) || longest_shared_token(value, u) >= 8
+    })
+}
+
+/// Longest whitespace-delimited token the two strings have in common. Catches
+/// "the document named this path" when the path is embedded in a sentence on
+/// both sides rather than being one string inside the other.
+fn longest_shared_token(a: &str, b: &str) -> usize {
+    a.split_whitespace()
+        .filter(|t| t.len() >= 8)
+        .filter(|t| b.split_whitespace().any(|o| o == *t))
+        .map(|t| t.len())
+        .max()
+        .unwrap_or(0)
+}
+
 /// What a call would do if it went through, along the two axes a provenance
 /// policy has to tell apart.
 ///

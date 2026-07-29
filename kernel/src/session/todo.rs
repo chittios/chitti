@@ -69,6 +69,52 @@ pub fn parse_args(json: &str) -> Vec<TodoInput> {
 /// Minimal `"key":"value"` string extractor for flat JSON objects. Handles
 /// `\"`, `\\`, `\n`, `\t` escapes. Sufficient for the controlled tool-args
 /// shapes the loop emits; full JSON validation lives in the tools registry.
+/// Every string *value* in a flat JSON object, ignoring the keys.
+///
+/// The value-granular taint policy asks whether any argument shares content with
+/// what the turn ingested, and it must not care which key carried it: a path
+/// under `"path"`, a URL inside `"args"`, and a body under `"content"` are all
+/// just values that may or may not derive from an injected document.
+pub fn json_values(json: &str) -> Vec<String> {
+    let b = json.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut expect_value = false;
+    while i < b.len() {
+        match b[i] {
+            b':' => expect_value = true,
+            b',' | b'{' => expect_value = false,
+            b'"' => {
+                // Read the string, honouring backslash escapes so a quote inside
+                // a value does not end it early.
+                let mut j = i + 1;
+                let mut buf = String::new();
+                while j < b.len() && b[j] != b'"' {
+                    if b[j] == b'\\' && j + 1 < b.len() {
+                        j += 1;
+                        buf.push(match b[j] {
+                            b'n' => '\n',
+                            b't' => '\t',
+                            c => c as char,
+                        });
+                    } else {
+                        buf.push(b[j] as char);
+                    }
+                    j += 1;
+                }
+                if expect_value {
+                    out.push(buf);
+                    expect_value = false;
+                }
+                i = j;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
 pub fn json_str(json: &str, key: &str) -> Option<String> {
     let pat = alloc::format!("\"{key}\"");
     let start = json.find(&pat)? + pat.len();

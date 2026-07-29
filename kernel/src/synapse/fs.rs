@@ -33,6 +33,36 @@ enum Backend {
 
 static STORE: Locked<Backend> = Locked::new(Backend::Memory(BTreeMap::new()));
 
+/// Integrity tag per stored object: the provenance of whatever last wrote it.
+///
+/// A parallel map rather than a field on the value, deliberately: `Backend` also
+/// has ext4 and disk variants, and threading a tag through them would mean a
+/// format change for a property that only matters while the object is being
+/// reasoned about. Absent means "not written under a tracked justification",
+/// which is read as trusted -- the kernel and the boot-time installers write
+/// most of the store.
+static TAINT: Locked<BTreeMap<String, crate::security::Provenance>> = Locked::new(BTreeMap::new());
+
+/// Write, recording the provenance of the justification that authorised it.
+///
+/// This is what lets a later destructive call ask "is the thing I am about to
+/// delete something an injection put here?" instead of only "was anything
+/// untrusted in the context?".
+pub fn write_tagged(path: &str, contents: &[u8], prov: crate::security::Provenance) {
+    write(path, contents);
+    TAINT.with(|m| m.insert(alloc::string::String::from(path), prov));
+}
+
+/// The integrity tag of a stored object, if one was recorded.
+pub fn provenance(path: &str) -> Option<crate::security::Provenance> {
+    TAINT.with(|m| m.get(path).copied())
+}
+
+/// Whether this object was last written under untrusted justification.
+pub fn is_tainted(path: &str) -> bool {
+    provenance(path) == Some(crate::security::Provenance::UntrustedIngested)
+}
+
 /// Adopt an ext4-backed store as the persistent backend. Any files already
 /// written to the in-memory backend are migrated into it (and thus persisted),
 /// so a boot sequence that wrote before the disk was mounted keeps its state.

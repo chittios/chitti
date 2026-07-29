@@ -121,6 +121,19 @@ impl Session {
             .fold(Provenance::SystemTrusted, |acc, p| acc.join(p))
     }
 
+    /// The text of every resident message that arrived untrusted.
+    ///
+    /// This is what a value-granular policy needs and a whole-turn one does not:
+    /// not "was anything untrusted here" but "*what* was, so we can ask whether
+    /// this particular call derives from it".
+    pub fn untrusted_excerpts(&self) -> Vec<&str> {
+        self.messages
+            .iter()
+            .filter(|m| m.resident && m.provenance == Provenance::UntrustedIngested)
+            .map(|m| m.content.as_str())
+            .collect()
+    }
+
     /// A compact transcript of resident messages, for a StepSource that needs
     /// to see the conversation (real Cortex renders this into tokens).
     pub fn transcript(&self) -> Vec<(Role, &str)> {

@@ -754,7 +754,8 @@ def s_redteam(g):
         mt = re.search(r"\[([^\]]+)\] permitted (\d+)/(\d+)", line)
         if mt:
             rows[mt.group(1)] = (int(mt.group(2)), int(mt.group(3)))
-    for want in ("synapse (caps+scope+taint)", "caps+scope, no taint", "ambient authority"):
+    for want in ("synapse (caps+scope+taint)", "syntactic per-value taint",
+                 "caps+scope, no taint", "ambient authority"):
         if want not in rows:
             return False, f"missing baseline row {want!r}; got {sorted(rows)}"
 
@@ -763,6 +764,15 @@ def s_redteam(g):
         return False, f"corpus is suspiciously small ({total} attacks)"
     if full_permitted != 0:
         return False, f"{full_permitted}/{total} injected attacks were PERMITTED under the full policy"
+
+    # The syntactic per-value variant is measured, not shipped: it must permit
+    # MORE than the strict policy, which is the whole reason the default stayed
+    # strict. If it ever ties at zero, either the corpus stopped exercising the
+    # difference or someone quietly turned it into the strict rule.
+    df_permitted = rows["syntactic per-value taint"][0]
+    if df_permitted <= full_permitted:
+        return False, (f"syntactic dataflow permitted {df_permitted}, strict permitted "
+                       f"{full_permitted} -- the measured trade-off has disappeared")
 
     no_taint = rows["caps+scope, no taint"][0]
     if no_taint == 0:
