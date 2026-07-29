@@ -85,7 +85,7 @@ attempt, denials included, is audited.
 
 The model runs in-kernel with no I/O of its own, so there is no way around the
 ABI; the mechanism is 2.7k lines of a dual-architecture Rust kernel. Measured:
-the authorization decision costs 1.0\,$\mu$s ($2.4\times10^{-5}$ of one
+the authorization decision costs 1.05\,$\mu$s ($2.4\times10^{-5}$ of one
 decoded token), and an injection corpus is refused 13 times out of 13 --- while
 removing provenance lets 10 through, removing attenuation all 13, and a human
 declassifying the attacker's source 6. The cost is a quarter of the
