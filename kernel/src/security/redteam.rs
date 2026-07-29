@@ -957,6 +957,15 @@ pub fn run() -> bool {
         }
     }
 
+    // The corpus just wrote a few hundred audit entries, including every
+    // refusal above, so this is the natural place to check the log still chains.
+    // A `verify()` nothing calls would be a property the paper claims and nobody
+    // exercises.
+    match crate::synapse::audit::verify() {
+        Ok(n) => crate::serial_println!("redteam> audit chain: {} entries, intact", n),
+        Err(seq) => crate::serial_println!("redteam> audit chain: BROKEN at entry #{seq}"),
+    }
+
     // --- laundering census: does any tool hand back trusted attacker bytes? ---
     let census = laundering_census();
     let leaks: Vec<&LaunderResult> = census.iter().filter(|r| r.launders()).collect();

@@ -1411,9 +1411,18 @@ That is a Vec push under a lock plus the field-by-field comparison the ktrace
 coalescer does to decide whether this entry repeats the last one. It is fixable
 and unfixed.
 
-\paragraph{The audit log is not sealed.} In-memory, unsigned, unattested;
-tamper-evident against agents but not against kernel compromise. Persisting it
-with a hash chain, and attesting it, is straightforward and undone.
+\paragraph{The audit log chains, but is not sealed.} Each entry now folds the
+digest of the one before it, so altering or removing an entry breaks every link
+after it and a verifier says where. That upgrades the log from append-only *by
+construction* --- a property of this module's API, invisible to anyone holding a
+snapshot --- to tamper-evident. The corpus run verifies the chain as a matter of
+course, because a checker nothing calls is a property claimed rather than held.
+
+What it still is not is attested. A compromised kernel can recompute the whole
+chain, so this defends a reader against a doctored snapshot, not against a
+dishonest machine; and the log remains in memory, so it does not survive a
+reboot. Both need a key and a place to put it that this system does not yet
+have.
 
 \paragraph{Authorized-but-wrong remains.} \syn{} constrains what an agent may
 do, never whether doing it was a good idea. A poisoned summary, a subtly wrong

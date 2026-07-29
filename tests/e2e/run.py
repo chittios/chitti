@@ -788,6 +788,10 @@ def s_redteam(g):
     # Nothing is *permitted* when that happens -- it just removes the reason to
     # refuse the next thing -- so it has to be asserted separately or it stays
     # invisible while every corpus row reads green.
+    if "audit chain: BROKEN" in out:
+        return False, "the audit chain does not verify after the corpus ran"
+    if "audit chain: " not in out:
+        return False, "no audit-chain check in the output"
     if "LAUNDERS" in out:
         leaked = [l.strip() for l in out.splitlines() if "LAUNDERS" in l]
         return False, f"provenance laundering channel(s): {leaked}"

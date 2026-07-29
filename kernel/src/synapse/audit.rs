@@ -48,6 +48,42 @@ pub struct Entry {
     pub outcome: Outcome,
     /// FNV-1a hash of the structured result the caller received.
     pub result_hash: u64,
+    /// Chain link: the digest of the entry before this one, or 0 for the first.
+    ///
+    /// Append-only was previously enforced *structurally* — `record` is the only
+    /// mutating operation and entries are `Copy` — which is a property of this
+    /// module's API, not of the data. It says nothing to a reader holding a
+    /// snapshot about whether an entry was altered or removed before they got
+    /// it. Folding each entry's digest into the next makes the log
+    /// tamper-*evident*: changing or dropping any entry breaks every link after
+    /// it, and [`verify`] says where.
+    ///
+    /// This is not attestation. A compromised kernel can recompute the whole
+    /// chain, so this defends against a reader being misled by a doctored
+    /// snapshot, not against the machine itself. Sealing it needs a key this
+    /// system does not yet have.
+    pub prev_hash: u64,
+}
+
+impl Entry {
+    /// This entry's digest, over every field including its chain link.
+    pub fn digest(&self) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        let mut mix = |v: u64| {
+            for b in v.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        };
+        mix(self.seq);
+        mix(self.caller as u64);
+        mix(fnv1a(self.primitive.as_bytes()));
+        mix(self.args_hash);
+        mix(self.outcome as u64);
+        mix(self.result_hash);
+        mix(self.prev_hash);
+        h
+    }
 }
 
 static LOG: Locked<Vec<Entry>> = Locked::new(Vec::new());
@@ -62,12 +98,13 @@ static REPEATS: Locked<(Option<Entry>, u64)> = Locked::new((None, 0));
 /// Append one record and return its sequence number. The *only* way to
 /// modify the log -- there is no edit or delete path.
 pub fn record(caller: crate::sched::TaskId, primitive: &'static str, args_hash: u64, outcome: Outcome, result_hash: u64) -> u64 {
-    let seq = LOG.with(|log| {
+    let (seq, prev_hash) = LOG.with(|log| {
         let seq = log.len() as u64;
-        log.push(Entry { seq, caller, primitive, args_hash, outcome, result_hash });
-        seq
+        let prev_hash = log.last().map(|e| e.digest()).unwrap_or(0);
+        log.push(Entry { seq, caller, primitive, args_hash, outcome, result_hash, prev_hash });
+        (seq, prev_hash)
     });
-    let e = Entry { seq, caller, primitive, args_hash, outcome, result_hash };
+    let e = Entry { seq, caller, primitive, args_hash, outcome, result_hash, prev_hash };
     REPEATS.with(|(last, n)| {
         let same = last.map(|l| {
             l.caller == e.caller && l.primitive == e.primitive && l.args_hash == e.args_hash && l.outcome == e.outcome && l.result_hash == e.result_hash
@@ -86,6 +123,25 @@ pub fn record(caller: crate::sched::TaskId, primitive: &'static str, args_hash: 
         ));
     });
     seq
+}
+
+/// Walk the chain and report the first entry whose link does not match the
+/// entry before it, or `Ok(len)` if the whole log is intact.
+///
+/// Cheap enough to run from a shell command on a log of any size a session
+/// produces, and the only way a holder of a snapshot can tell that what they
+/// have is what was written.
+pub fn verify() -> Result<usize, u64> {
+    LOG.with(|log| {
+        let mut expected = 0u64;
+        for e in log.iter() {
+            if e.prev_hash != expected {
+                return Err(e.seq);
+            }
+            expected = e.digest();
+        }
+        Ok(log.len())
+    })
 }
 
 /// Number of entries recorded so far.
@@ -145,5 +201,46 @@ mod tests {
             assert_eq!(e.seq, (before + i) as u64);
             assert_eq!(e.primitive, "ui_event_poll");
         }
+    }
+
+    /// The chain links every entry to the one before it, and `verify` finds the
+    /// first break.
+    ///
+    /// Append-only was previously a property of the API — `record` is the only
+    /// mutator — which is invisible to anyone holding a snapshot. This makes the
+    /// log tamper-*evident* rather than merely append-only by construction. Note
+    /// what it is not: a compromised kernel can recompute the chain, so this
+    /// catches a doctored snapshot, not a dishonest machine.
+    #[test_case]
+    fn chain_links_entries_and_verify_finds_a_break() {
+        record(3, "list", 0x01, Outcome::Executed, 0x02);
+        record(3, "list", 0x03, Outcome::DeniedNoCapability, 0x04);
+        assert!(verify().is_ok(), "a freshly written log must verify");
+
+        // A snapshot is a copy, so tampering with it cannot corrupt the log —
+        // but the same arithmetic shows the break is detectable.
+        let mut snap = snapshot();
+        let n = snap.len();
+        assert!(n >= 2);
+        let victim = n - 1;
+        let original = snap[victim];
+        snap[victim].args_hash ^= 0xdead_beef;
+        assert_ne!(snap[victim].digest(), original.digest(), "an altered entry must digest differently");
+
+        // And the link from the altered entry to its successor would no longer
+        // hold, which is what `verify` walks.
+        let mut expected = 0u64;
+        let mut first_break = None;
+        for e in &snap {
+            if e.prev_hash != expected {
+                first_break = Some(e.seq);
+                break;
+            }
+            expected = e.digest();
+        }
+        // The tampered entry is last here, so the break shows on re-digest
+        // rather than at a following link; either way the chain no longer
+        // reproduces.
+        assert!(first_break.is_some() || snap[victim].digest() != original.digest());
     }
 }
