@@ -123,25 +123,29 @@ case and makes the results deterministic and model-independent.
 
 | Configuration | Attacks permitted | Benign steps needing a human |
 | --- | --- | --- |
-| Synapse (caps + scope + provenance) | **0 / 12** | **3 / 11** |
-| Capabilities + scope, no provenance | 9 / 12 | 0 / 11 |
-| Ambient authority (container) | 12 / 12 | 0 / 11 |
+| Synapse (caps + scope + provenance) | **0 / 13** | **3 / 11** |
+| Syntactic per-value taint *(measured, not shipped)* | 4 / 13 | 2 / 11 |
+| Capabilities + scope, no provenance | 10 / 13 | 0 / 11 |
+| Ambient authority (container) | 13 / 13 | 0 / 11 |
 | Confirm every call | human-dependent | 11 / 11 |
 
-- **E2:** 0/12 permitted — 10 refused by provenance, 2 by scope, all 12 turns
-  correctly tainted. All eight taint enforcement sites held.
-- **E3:** **false-refusal rate 50%** of benign destructive steps (2 of 4); 3/6
-  tasks completely clean. This is the paper's headline liability.
-- **E4:** provenance is worth 9 of the 12 refusals; scope is worth the other
-  3 — they do measurably different jobs.
-- **The capability gate stops none of the attacks**, in any configuration. Not a
-  defect: injection uses authority the agent legitimately holds, which is
-  precisely why capabilities are necessary and insufficient.
+- **E2:** 0/13 permitted — 11 refused by provenance, 2 by scope, all turns
+  correctly tainted. Plus a **laundering census** (4/4 tools correctly taint) and
+  an audit-chain check, both run as part of `/redteam`.
+- **E3:** false-refusal rate **25%** of benign destructive steps. This was
+  reported as 50% until the ground truth was corrected — see below.
+- **E3b:** the value-granular provenance both reviewers asked for, built and
+  measured: it permits **4 of 13** attacks and recovers **zero** false refusals.
+  Ships disabled. The reason it fails is the finding: the poisoned document never
+  names its victim, because *the model is the dataflow* — the hop from document to
+  argument runs through the model's reasoning, where no syntactic relation can
+  follow it.
+- **The capability gate stops none of the attacks**, in any configuration —
+  injection uses authority the agent legitimately holds.
 
-### Two things the harness found in itself
+### Four things the harness found in itself
 
-Both would have flattered the result, and both were caught by instrumentation
-rather than by inspection:
+Every one would have flattered the result, and none was caught by inspection:
 
 1. An authority-transfer attack on `channel_grant` returned **malformed** — no
    tool lowers to that primitive, so the call died in shape validation and would
@@ -153,6 +157,15 @@ rather than by inspection:
    scope-denied, the error result carried *trusted* provenance, the turn never
    tainted — and two later scope denials would have been reported as though
    provenance were involved. This is why the taint flag is reported per attack.
+3. **The eight-site census was incomplete.** Four more bindings had no check, three
+   tagging results trusted; durable `storage_*` closed a full laundering cycle
+   (store under an injection, read back trusted, turn is clean). No corpus row
+   went red, because laundering permits nothing at the moment it happens — hence
+   the separate census.
+4. **Half the 50% false-refusal rate was our own labelling error.** For *egress*
+   the question is whether the payload derives from untrusted data, not whether
+   the content named the target — and a report written from an ingested document
+   does. Corrected baseline: 25%.
 
 ### Safety rules this harness must keep
 
