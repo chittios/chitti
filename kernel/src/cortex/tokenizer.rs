@@ -18,6 +18,23 @@
 
 use crate::cortex::gguf::Gguf;
 use alloc::collections::BTreeMap;
+
+/// Turn-delimiter ids for a vocab, as `(open, close)`, or `u32::MAX` for either
+/// that is absent.
+///
+/// Gemma-4 spells them `<|turn>` / `<turn|>`; Gemma-3 spelled them
+/// `<start_of_turn>` / `<end_of_turn>`. A vocab carries one pair or the other,
+/// and the rename is *silent* — the miss leaves `u32::MAX`, which is not a token
+/// id, and pushing it into a prompt indexes the embedding table out of bounds.
+/// Pure so the accepted spellings are pinned by a test rather than discovered by
+/// a kernel panic.
+fn turn_delims(vocab: &BTreeMap<&str, u32>) -> (u32, u32) {
+    let get = |s: &str| vocab.get(s).copied();
+    (
+        get("<start_of_turn>").or_else(|| get("<|turn>")).unwrap_or(u32::MAX),
+        get("<end_of_turn>").or_else(|| get("<turn|>")).unwrap_or(u32::MAX),
+    )
+}
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -121,8 +138,8 @@ impl<'a> Tokenizer<'a> {
             think_close: special("</think>", u32::MAX),
             tool_open: special("<tool_call>", u32::MAX),
             tool_close: special("</tool_call>", u32::MAX),
-            turn_open: special("<start_of_turn>", u32::MAX),
-            turn_close: special("<end_of_turn>", u32::MAX),
+            turn_open: turn_delims(&vocab).0,
+            turn_close: turn_delims(&vocab).1,
             byte_to_unicode,
             unicode_to_byte,
             vocab,
@@ -281,6 +298,35 @@ pub fn parse_byte_token(token: &str) -> Option<u8> {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    /// Gemma-4 renamed its turn markers, and the rename is silent: the lookup
+    /// misses, both ids stay `u32::MAX`, and `prefill_turn` pushes that as a
+    /// token id — `dequant_embed_row` then slices the embedding table at
+    /// `u32::MAX * row_bytes` and the kernel panics mid-prefill. Both spellings
+    /// must resolve, and an unknown vocab must still report "absent" rather than
+    /// something that looks like an id.
+    #[test_case]
+    fn turn_delimiters_accept_both_gemma_spellings() {
+        let mut g3 = BTreeMap::new();
+        g3.insert("<start_of_turn>", 105u32);
+        g3.insert("<end_of_turn>", 106u32);
+        assert_eq!(turn_delims(&g3), (105, 106));
+
+        let mut g4 = BTreeMap::new();
+        g4.insert("<|turn>", 105u32);
+        g4.insert("<turn|>", 106u32);
+        assert_eq!(turn_delims(&g4), (105, 106), "gemma-4 spelling");
+
+        // Neither present: absent, not a plausible id.
+        let none: BTreeMap<&str, u32> = BTreeMap::new();
+        assert_eq!(turn_delims(&none), (u32::MAX, u32::MAX));
+
+        // The Gemma-3 spelling wins when a vocab somehow carries both.
+        let mut both = BTreeMap::new();
+        both.insert("<start_of_turn>", 1u32);
+        both.insert("<|turn>", 9u32);
+        assert_eq!(turn_delims(&both).0, 1);
+    }
 
     /// Build a tokenizer directly from token/merge lists (no GGUF needed).
     fn tok(kind: Kind, tokens: &'static [&'static str], merges: &'static [&'static str]) -> Tokenizer<'static> {

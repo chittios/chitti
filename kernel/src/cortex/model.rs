@@ -928,7 +928,7 @@ impl<'a> Model<'a> {
         let ple_e = c.swa.map(|w| w.n_embd_per_layer).unwrap_or(0);
         let el = ple_e * c.block_count;
         let mut ple_all = alloc::vec![0.0f32; m * el];
-        let mut pl_gate = alloc::vec![0.0f32; ple_e];
+        let mut pl_gate_all = alloc::vec![0.0f32; m * ple_e];
         if el > 0 {
             // `hidden` is this call's own buffer, so its row can be handed over
             // directly — no per-position copy.
@@ -1052,20 +1052,34 @@ impl<'a> Model<'a> {
             // position-at-a-time loop costs exactly what `batched_proj` would
             // have fallen back to anyway.
             if el > 0 {
-                for mi in 0..m {
-                    let off = mi * dim;
-                    let ple_l = &ple_all[mi * el + l * ple_e..mi * el + (l + 1) * ple_e];
-                    // `proj_out` was just folded into `hidden`, so its row is free
-                    // and doubles as this block's output scratch.
-                    self.per_layer_block(
-                        l,
-                        &mut hidden[off..off + dim],
-                        ple_l,
-                        &mut pl_gate,
-                        &mut proj_out[off..off + dim],
-                        &mut xq,
-                        &mut xs,
-                    );
+                if let (Some(gw), Some(pw), Some(pn)) = (
+                    self.layers[l].pl_inp_gate,
+                    self.layers[l].pl_proj,
+                    self.layers[l].pl_post_norm,
+                ) {
+                    // Both projections go through `batched_proj` like every other
+                    // one: weight-stationary when the type has a kernel, a matvec
+                    // per position when it does not. They are F32/BF16 on the
+                    // published E4B (so today this is the fallback), but a
+                    // requantized file makes them batchable and a hand-rolled
+                    // per-position loop here would silently forfeit that.
+                    self.batched_proj(gw, &hidden, &mut pl_gate_all, &mut xq, &mut xs, m, ple_e, dim);
+                    for mi in 0..m {
+                        let (go, po) = (mi * ple_e, mi * el + l * ple_e);
+                        for j in 0..ple_e {
+                            pl_gate_all[go + j] =
+                                tensor::gelu(pl_gate_all[go + j]) * ple_all[po + j];
+                        }
+                    }
+                    // `proj_out` was just folded into `hidden`, so it is free and
+                    // doubles as this block's output scratch.
+                    self.batched_proj(pw, &pl_gate_all, &mut proj_out, &mut xq, &mut xs, m, dim, ple_e);
+                    for mi in 0..m {
+                        tensor::rmsnorm_inplace(&mut proj_out[mi * dim..(mi + 1) * dim], pn, c.rms_eps);
+                    }
+                    for i in 0..m * dim {
+                        hidden[i] += proj_out[i];
+                    }
                 }
             }
             t = phase_mark(&PHASE_ELEM, t);

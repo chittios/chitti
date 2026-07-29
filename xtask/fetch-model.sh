@@ -79,10 +79,10 @@ case "$MODEL" in
     ;;
   gemma-4-e4b|gemma-4-E4B|gemma4-e4b|gemma4-E4B|gemma-4-E4B-it|e4b|E4B)
     DEST="$DIR/assets/model-gemma4-e4b.gguf"
-    # Q4_K_M: Cortex has full Q4_K dequant + SDOT matvec; Gemma4 chat format
+    # Q4_0: Cortex has full Q4_0 dequant + SDOT matvec; Gemma4 chat format
     # is already architecture-dynamic in the kernel.
-    URL="https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf"
-    SIZE="~4.6 GB (Q4_K_M)"
+    URL="https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_0.gguf"
+    SIZE="~4.6 GB (Q4_0)"
     ;;
   bonsai-27b|bonsai27b|bonsai|bonsai-27b-1bit|bonsai-1bit)
     DEST="$DIR/assets/model-bonsai-27b-q1.gguf"

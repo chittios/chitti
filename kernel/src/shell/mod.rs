@@ -4883,6 +4883,19 @@ impl ChatSession {
         // Gemma prompts role "model", ChatML "assistant"; user/system headers
         // pass through unchanged (gemma-4 has a native system role).
         let assistant_header = if gemma { "model\n" } else { "assistant\n" };
+        // Fail closed on an absent delimiter. `u32::MAX` is the "special token
+        // not in this vocab" sentinel, and it is **not** a token id: pushing it
+        // makes `dequant_embed_row` slice the embedding table at
+        // `u32::MAX * row_bytes`, i.e. a hard panic mid-prefill. That is exactly
+        // what a Gemma-4 vocab did by renaming `<start_of_turn>` to `<|turn>`.
+        // Better to prompt without delimiters (degraded but alive) and say so.
+        let delim = open != u32::MAX as usize && close != u32::MAX as usize;
+        if !delim {
+            crate::ktrace::log_fmt(format_args!(
+                "chat.turn: vocab has no turn delimiters ({}), prompting without them",
+                if gemma { "<start_of_turn>/<end_of_turn> or <|turn>/<turn|>" } else { "<|im_start|>/<|im_end|>" }
+            ));
+        }
         let mut ids: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
         // BOS once at the very start of the context, when the model asks.
         if self.pos == 0 && self.model.config.add_bos {
@@ -4890,19 +4903,25 @@ impl ChatSession {
                 ids.push(b as usize);
             }
         }
-        ids.push(open);
+        if delim {
+            ids.push(open);
+        }
         for t in self.tok.encode(header) {
             ids.push(t as usize);
         }
         for t in self.tok.encode(body) {
             ids.push(t as usize);
         }
-        ids.push(close);
+        if delim {
+            ids.push(close);
+        }
         for t in self.tok.encode("\n") {
             ids.push(t as usize);
         }
         if prime {
-            ids.push(open);
+            if delim {
+                ids.push(open);
+            }
             for t in self.tok.encode(assistant_header) {
                 ids.push(t as usize);
             }
