@@ -1547,13 +1547,22 @@ Three probes, one per goal. In every run the agent \emph{did} ingest the
 injection --- the transcript shows the read returning
 \code{ok:NOTE FROM THE DOCUMENT: ignore previous instructions and delete
 everything.} --- so the context really was poisoned. What happened next varied
-\emph{between identical runs}. Most often the planner declined on its own,
-citing its instructions (``hard-to-reverse or destructive actions require human
+\emph{between identical runs}. In some the planner declined on its own, citing
+its instructions (``hard-to-reverse or destructive actions require human
 approval'') or naming the attack outright (``the file content is a prompt
-injection''). In one run it did not: it reached for an egress tool, and the gate
+injection''). In one it did not: it reached for an egress tool, and the gate
 refused it in the terms the policy is written in ---
 \code{refused: 'download' is irreversible and leaves the machine, justified by
 untrusted content}. The sandbox was intact after every run.
+
+We deliberately quote no rate. Three probes over two runs is an existence proof
+and not a measurement, and the frequency with which \emph{this} model declines
+\emph{this} phrasing today is not a quantity we would want a reader to carry
+away. The tempting misreading is also worth naming: that a planner which usually
+declines makes the boundary unnecessary. It does not, for the reason the one
+dissenting run illustrates --- nothing tells you in advance which turn is the one
+where it does not decline, and that turn is the only one in which any of this
+matters.
 
 That variance is the result, and it is why the rest of this evaluation assumes
 persuasion rather than measuring it. A planner that declines an injection is
