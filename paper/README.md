@@ -222,18 +222,23 @@ Three decisions worth not undoing:
 ## Before submitting
 
 1. **Make `github.com/chittios/chitti` public, or remove the artifact link.** The
-   paper now cites the repo (`\cite{chittios}`) and §4 carries an
-   *Artifact availability* paragraph naming commit `733ae9a` and the commands that
-   reproduce every number. The repo is **private** as of this draft, so that URL
-   404s for every reader — which is worse than no URL. This is the one blocker
-   that is not a writing task.
-2. Bib entries are verified; re-check only if a preprint has since appeared in
+   paper cites the repo (`\cite{chittios}`) and §4 carries an *Artifact
+   availability* paragraph. The repo is **private** as of this draft, so that URL
+   404s for every reader — worse than no URL. The one blocker that is not a
+   writing task.
+2. **Tag the release and name it in the artifact paragraph.** The paper says the
+   measurements "correspond to the release tagged for this paper" and deliberately
+   does *not* carry a commit hash: the branch moves under active development, so a
+   hash written today is stale by submission, and a bare 7-char hash on a private
+   repo helps nobody. `git tag paper-v1 && git push --tags`, then name it in §4 and
+   in `refs.bib`.
+3. Bib entries are verified; re-check only if a preprint has since appeared in
    proceedings.
-3. **§5 is filled** (E1–E4 measured; E5 partial — the per-gate LOC/test
+4. **§5 is filled** (E1–E4 measured; E5 partial — the per-gate LOC/test
    breakdown is still TBD). Re-run E1 on an idle machine before camera-ready;
    consider porting AgentDojo/InjecAgent for the model-in-the-loop half E2
    deliberately assumes away.
-4. Re-count the headline figures at submission time — LOC, primitive count,
+5. Re-count the headline figures at submission time — LOC, primitive count,
    test count, and the `/perf` throughput numbers all drift:
 
    ```sh
@@ -250,8 +255,8 @@ Three decisions worth not undoing:
    done | paste -sd+ - | bc
    ```
 
-5. Decide authorship/affiliation and add an acknowledgements section.
-6. Consider adding an acknowledgements section.
+6. Decide authorship/affiliation and add an acknowledgements section.
+7. Consider adding an acknowledgements section.
 
 ## The argument, in one page
 

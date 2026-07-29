@@ -735,8 +735,8 @@ real UEFI hardware.
 
 The mechanism this paper describes --- registry, grammar, executor, capability
 table and scope ledger, path normalization, provenance, object store, audit ---
-is \textbf{2{,}389 lines excluding its own tests}, against roughly 178{,}000 for
-the system as a whole. We report the non-test figure deliberately: it is the
+is \textbf{2{,}389 lines excluding its own tests}, against the $\sim$178{,}000
+above. We report the non-test figure deliberately: it is the
 code that has to be right for the argument to hold, so counting the tests
 alongside it (which would give $\sim$3{,}000) inflates the number that matters
 in the direction that flatters us. Either way the claim is the ratio: the
@@ -797,9 +797,9 @@ path into pure functions specifically so they could be tested exhaustively off
 hardware.
 
 \paragraph{Artifact availability.} \os{} is open source under the Apache
-License 2.0~\cite{chittios}. Every number in \S\ref{sec:eval} was taken at
-commit \code{733ae9a} and is reproducible from a checkout without special
-hardware: \code{cargo xtask test} runs the in-kernel unit suite under QEMU,
+License 2.0~\cite{chittios}. The measurements in \S\ref{sec:eval} correspond to
+the release tagged for this paper, and every one of them is reproducible from a
+checkout without special hardware: \code{cargo xtask test} runs the in-kernel unit suite under QEMU,
 \code{make e2e} boots the kernel and drives the shell over serial, and the two
 experiments are shell commands on the booted system --- \code{/bench synapse} for
 E1 and \code{/redteam} for E2--E4, each also wired as an end-to-end scenario
@@ -1216,10 +1216,9 @@ Report lines of code and unit-test counts for each gate, and the size of the
 attack surface reachable from model output (the grammar's accepted language,
 the registry's argument space).
 
-\textbf{Status.} Partial. The enforcement path is 2{,}389 non-test lines
-(\S\ref{sec:impl}) against $\sim$178{,}000 for the system, and the suite is
-1{,}204 in-kernel unit tests plus an end-to-end harness. The per-gate line and
-test breakdown is \textsc{tbd}, as is the more interesting figure: the size of
+\textbf{Status.} Partial, and reported once rather than twice: the enforcement
+path's size and the test counts are in \S\ref{sec:impl}. What is missing here is
+the per-gate breakdown of both, and the more interesting figure: the size of
 the language a model can actually emit, which is bounded by the grammar and the
 registry's 26 primitives over a two-type argument lattice --- a
 \emph{finite, enumerable} request surface, which is the property a conventional
