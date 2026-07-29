@@ -92,6 +92,13 @@ pub struct SwaConfig {
     pub freq_base_global: f32,
     /// Final-logit tanh softcap (0.0 = none).
     pub logit_softcap: f32,
+    /// Width of each layer's per-layer-embedding input (`E`), or 0 when the
+    /// model has no per-layer-embedding stack. The `E`-series Gemmas
+    /// (`Gemma-4-E4B`: E = 256 over 42 layers) feed every block an extra
+    /// gated signal derived from a *second*, per-layer token-embedding table;
+    /// without it the model runs but decodes gibberish, since the residual
+    /// stream is missing a term at every single layer.
+    pub n_embd_per_layer: usize,
 }
 
 /// The numeric hyperparameters Cortex's forward pass needs, pulled from the
@@ -477,6 +484,11 @@ impl<'a> Gguf<'a> {
                     rope_dim_global,
                     freq_base_global: f32_of("rope.freq_base").unwrap_or(1_000_000.0),
                     logit_softcap: f32_of("final_logit_softcapping").unwrap_or(0.0),
+                    // Per-layer input width (Gemma "E"-series per-layer
+                    // embeddings). 0 = absent, which is how a plain Gemma
+                    // without the PLE stack reads.
+                    n_embd_per_layer: u32_of("embedding_length_per_layer_input")
+                        .unwrap_or(0) as usize,
                 };
                 (kv_swa, head_dim_swa, rope_dim_swa, f32_of("rope.freq_base_swa").unwrap_or(10_000.0), Some(swa))
             }

@@ -713,6 +713,11 @@ pub struct Screen {
     /// Hint bar under the composer (left / right halves).
     composer_hint_l: String,
     composer_hint_r: String,
+    /// Per-character colours for the **leading** cells of `composer_hint_l`
+    /// (empty = the whole hint takes `theme.composer_hint`). This is what lets
+    /// the shell paint its gradient progress bar into the hint bar without the
+    /// framebuffer knowing anything about the animation.
+    composer_hint_l_lead: alloc::vec::Vec<Rgb>,
     /// Slash-command / @file suggestion popup above the composer.
     suggest_open: bool,
     suggest_items: alloc::vec::Vec<(String, String)>, // (label, detail)
@@ -1325,6 +1330,7 @@ impl Screen {
             composer_cur: 0,
             composer_hint_l: String::from("Tab select · ↑↓ menu · Enter send · /cmds · @files"),
             composer_hint_r: String::new(),
+            composer_hint_l_lead: alloc::vec::Vec::new(),
             suggest_open: false,
             suggest_items: alloc::vec::Vec::new(),
             suggest_sel: 0,
@@ -2655,13 +2661,41 @@ impl Screen {
         let left_cols = total_cols.saturating_sub(right_cols + if right_cols > 0 { gap } else { 0 });
         let left = crate::textsel::ellipsize(&self.composer_hint_l, left_cols);
         let right = crate::textsel::ellipsize(&self.composer_hint_r, right_cols);
-        self.draw_str(hx, hy, &left, self.theme.composer_hint, self.chat.bg);
+        self.draw_hint_left(hx, hy, &left);
         if !right.is_empty() {
             let rlen = right.chars().count() as u64 * cw;
             self.draw_str(hx + hw.saturating_sub(rlen), hy, &right, self.theme.composer_hint, self.chat.bg);
         }
         // Suggestion menu sits above the composer (slash commands / @files).
         self.draw_suggest_popup();
+    }
+
+    /// Draw the left hint, colouring its first `composer_hint_l_lead.len()`
+    /// characters from that list (the shell's progress bar) and the rest in
+    /// `theme.composer_hint`.
+    ///
+    /// The per-cell colours are dropped when `left` came back shorter than the
+    /// lead run: a narrow pane ellipsizes the hint, and painting the gradient
+    /// onto whatever characters survived would colour the label instead of the
+    /// bar.
+    fn draw_hint_left(&self, hx: u64, hy: u64, left: &str) {
+        let lead = self.composer_hint_l_lead.len();
+        if lead == 0 || left.chars().count() < lead {
+            self.draw_str(hx, hy, left, self.theme.composer_hint, self.chat.bg);
+            return;
+        }
+        let mut x = hx;
+        let mut split = left.len();
+        let mut buf = [0u8; 4];
+        for (i, (bi, ch)) in left.char_indices().enumerate() {
+            if i == lead {
+                split = bi;
+                break;
+            }
+            let c = self.composer_hint_l_lead[i];
+            x = self.draw_str(x, hy, ch.encode_utf8(&mut buf), c, self.chat.bg);
+        }
+        self.draw_str(x, hy, &left[split..], self.theme.composer_hint, self.chat.bg);
     }
 
     /// Geometry of the suggestion popup: `(x, y, w, h)` above the composer.
@@ -2822,7 +2856,7 @@ impl Screen {
         let left_cols = total_cols.saturating_sub(right_cols + if right_cols > 0 { gap } else { 0 });
         let left = crate::textsel::ellipsize(&self.composer_hint_l, left_cols);
         let right = crate::textsel::ellipsize(&self.composer_hint_r, right_cols);
-        self.draw_str(hx, hy, &left, self.theme.composer_hint, self.chat.bg);
+        self.draw_hint_left(hx, hy, &left);
         if !right.is_empty() {
             let rlen = right.chars().count() as u64 * cw;
             self.draw_str(hx + hw.saturating_sub(rlen), hy, &right, self.theme.composer_hint, self.chat.bg);
@@ -4653,10 +4687,23 @@ pub fn composer_set(line: &str, cursor: usize) {
 /// while a turn is running (`composer_active == false` after submit). The old
 /// gate only drew during typing, so wait animation never appeared.
 pub fn composer_set_hint_left(s: &str) {
+    composer_set_hint_left_lead(s, &[]);
+}
+
+/// Set the left hint, colouring its first `lead.len()` characters from `lead`
+/// (one colour per character) instead of `theme.composer_hint`.
+///
+/// This is the shell's progress-bar channel: the animation lives in
+/// `shell::chrome` and only the finished per-cell colours arrive here, so the
+/// compositor stays ignorant of the frame sequence. Pass an empty `lead` for
+/// an ordinary single-colour hint.
+pub fn composer_set_hint_left_lead(s: &str, lead: &[(u8, u8, u8)]) {
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
             sc.composer_hint_l.clear();
             sc.composer_hint_l.push_str(s);
+            sc.composer_hint_l_lead.clear();
+            sc.composer_hint_l_lead.extend_from_slice(lead);
             if sc.chat.has_composer {
                 sc.cursor_restore();
                 sc.cur_vis = false;
@@ -4665,6 +4712,18 @@ pub fn composer_set_hint_left(s: &str) {
             }
         }
     });
+}
+
+/// The live theme's progress-gradient endpoints: `(dim, bright)` =
+/// `(composer_hint, accent)`. The shell's wait animation ramps between these
+/// so it follows `/theme` and stays on the brand palette rather than carrying
+/// colours of its own. Falls back to the brand dark theme before the
+/// framebuffer exists (serial-only boot).
+pub fn hint_gradient() -> ((u8, u8, u8), (u8, u8, u8)) {
+    SCREEN.with(|slot| match slot.as_ref() {
+        Some(sc) => (sc.theme.composer_hint, sc.theme.accent),
+        None => (Theme::BRAND_DARK.composer_hint, Theme::BRAND_DARK.accent),
+    })
 }
 
 /// Mark the last `n` absolute chat lines as a user-prompt band (elevated
@@ -5041,6 +5100,7 @@ fn preserve_interactive(ns: &mut Screen, old: &Screen) {
     ns.composer_cur = old.composer_cur;
     ns.composer_hint_l = old.composer_hint_l.clone();
     ns.composer_hint_r = old.composer_hint_r.clone();
+    ns.composer_hint_l_lead = old.composer_hint_l_lead.clone();
     ns.suggest_open = old.suggest_open;
     ns.suggest_items = old.suggest_items.clone();
     ns.suggest_sel = old.suggest_sel;

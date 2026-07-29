@@ -30,3 +30,4 @@ tools/webcompat/wasm-testsuite/
 third_party/dtb/*.dtb
 third_party/dtb/.asahi-linux/
 scratchpad-agx/
+assets/*.partial

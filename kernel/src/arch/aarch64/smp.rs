@@ -170,6 +170,29 @@ fn add_busy(core: usize, cycles: u64) {
 /// barrier no longer waits on equal-share E-core stragglers under HVF.
 static LAST_SLICE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
+/// [`row_boundary`], snapped **down to an even row** — for the `i8mm` matmuls
+/// only.
+///
+/// Those kernels consume rows in 2-row `smmla` tiles and send an odd trailing
+/// row down a scalar `sdot_one_row_*` path, which accumulates in a different
+/// order. So if a split boundary lands on an odd row, that row's value depends
+/// on *where the split fell* — and `row_boundary` is adaptive (weighted by
+/// [`LAST_SLICE`]), so the split moves with measured core speed. Prefill logits
+/// were therefore not reproducible across core counts, nor even run to run,
+/// against `matvec_qw`'s explicit promise that the result is "independent of how
+/// the split falls".
+///
+/// Snapping every interior boundary to an even row keeps each 2-row tile whole
+/// inside one worker, so the only row that can take the scalar tail is the final
+/// global one — exactly as in the single-core case. Costs at most one row of
+/// balance per worker. Caught by `cortexdiff rangecheck`, which computes a range
+/// whole and then as uneven sub-ranges and compares; the in-kernel tests only
+/// ever called with `(0, n_rows)` and so could not see it.
+#[inline]
+fn row_boundary_even(n_rows: usize, n_parts: usize, k: usize) -> usize {
+    tensor::even_row_boundary(row_boundary(n_rows, n_parts, k), n_rows)
+}
+
 /// Exclusive end of part `k` in a `n_parts`-way split of `n_rows` (part 0 is
 /// the BSP). When every core has a [`LAST_SLICE`] sample, rows are allotted
 /// ∝ 1/cycles (faster cores get more work); otherwise equal split.
@@ -965,7 +988,7 @@ pub unsafe fn matmul_q1_0_i8mm(w: *const u8, xq: *const i8, xs: *const f32, y: *
         return;
     }
     let n_parts = workers + 1;
-    let b0 = row_boundary(n_rows, n_parts, 1);
+    let b0 = row_boundary_even(n_rows, n_parts, 1);
     JOB.w.store(w as *mut u8, Ordering::Relaxed);
     JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
     JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
@@ -975,8 +998,8 @@ pub unsafe fn matmul_q1_0_i8mm(w: *const u8, xq: *const i8, xs: *const f32, y: *
     JOB.n_rows.store(n_rows, Ordering::Relaxed);
     JOB.mode.store(9, Ordering::Relaxed); // Q1_0 i8mm matmul
     for s in 0..workers {
-        JOB.row_start[s].store(row_boundary(n_rows, n_parts, s + 1), Ordering::Relaxed);
-        JOB.row_end[s].store(row_boundary(n_rows, n_parts, s + 2), Ordering::Relaxed);
+        JOB.row_start[s].store(row_boundary_even(n_rows, n_parts, s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(row_boundary_even(n_rows, n_parts, s + 2), Ordering::Relaxed);
     }
     clear_unused_slots(workers);
     let g = JOB.go.load(Ordering::Relaxed) + 1;
@@ -1006,7 +1029,7 @@ pub unsafe fn matmul_q8_0_i8mm(w: *const u8, xq: *const i8, xs: *const f32, y: *
         return;
     }
     let n_parts = workers + 1;
-    let b0 = row_boundary(n_rows, n_parts, 1);
+    let b0 = row_boundary_even(n_rows, n_parts, 1);
     JOB.w.store(w as *mut u8, Ordering::Relaxed);
     JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
     JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
@@ -1016,8 +1039,8 @@ pub unsafe fn matmul_q8_0_i8mm(w: *const u8, xq: *const i8, xs: *const f32, y: *
     JOB.n_rows.store(n_rows, Ordering::Relaxed);
     JOB.mode.store(10, Ordering::Relaxed); // Q8_0 i8mm matmul
     for s in 0..workers {
-        JOB.row_start[s].store(row_boundary(n_rows, n_parts, s + 1), Ordering::Relaxed);
-        JOB.row_end[s].store(row_boundary(n_rows, n_parts, s + 2), Ordering::Relaxed);
+        JOB.row_start[s].store(row_boundary_even(n_rows, n_parts, s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(row_boundary_even(n_rows, n_parts, s + 2), Ordering::Relaxed);
     }
     clear_unused_slots(workers);
     let g = JOB.go.load(Ordering::Relaxed) + 1;
@@ -1047,7 +1070,7 @@ pub unsafe fn matmul_q4_0_i8mm(w: *const u8, xq: *const i8, xs: *const f32, y: *
         return;
     }
     let n_parts = workers + 1;
-    let b0 = row_boundary(n_rows, n_parts, 1);
+    let b0 = row_boundary_even(n_rows, n_parts, 1);
     JOB.w.store(w as *mut u8, Ordering::Relaxed);
     JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
     JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
@@ -1057,8 +1080,8 @@ pub unsafe fn matmul_q4_0_i8mm(w: *const u8, xq: *const i8, xs: *const f32, y: *
     JOB.n_rows.store(n_rows, Ordering::Relaxed);
     JOB.mode.store(11, Ordering::Relaxed); // Q4_0 i8mm matmul
     for s in 0..workers {
-        JOB.row_start[s].store(row_boundary(n_rows, n_parts, s + 1), Ordering::Relaxed);
-        JOB.row_end[s].store(row_boundary(n_rows, n_parts, s + 2), Ordering::Relaxed);
+        JOB.row_start[s].store(row_boundary_even(n_rows, n_parts, s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(row_boundary_even(n_rows, n_parts, s + 2), Ordering::Relaxed);
     }
     clear_unused_slots(workers);
     let g = JOB.go.load(Ordering::Relaxed) + 1;

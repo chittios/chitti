@@ -186,8 +186,165 @@ fn usage() -> ! {
     std::process::exit(2)
 }
 
+/// Row-range parity for the batched i8mm matmuls: computing `[0, n)` in one
+/// call must equal computing it as a set of adjacent sub-ranges.
+///
+/// This is what SMP dispatch actually does — `parallel_for` hands each core a
+/// `[row_start, row_end)` slice — and it is the one thing the in-kernel tests
+/// never covered: they only ever call with `(0, rows)`. `cortexdiff`'s stub
+/// runs the whole range on one core, so a range bug is invisible here too until
+/// you split it deliberately. Splits are uneven and land on odd rows so the
+/// kernels' odd-row tail path is exercised from a non-zero start.
+///
+/// Lives in the host harness because the kernels are aarch64+i8mm only, so the
+/// x86 `cargo xtask test` suite can never reach them.
+#[cfg(target_arch = "aarch64")]
+fn rangecheck() -> i32 {
+    use cortex::tensor;
+    fn lcg(s: &mut u32) -> u32 {
+        *s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+        *s >> 8
+    }
+    if !arch::has_i8mm() {
+        eprintln!("rangecheck: host has no FEAT_I8MM; nothing to check");
+        return 0;
+    }
+    // (label, block bytes, elements per block, runner)
+    type Run = unsafe fn(*const u8, *const i8, *const f32, *mut f32, usize, usize, usize, usize, usize);
+    let cases: [(&str, usize, usize, Run); 3] = [
+        ("q4_0", 18, 32, tensor::matmul_q4_0_i8mm_rows),
+        ("q8_0", 34, 32, tensor::matmul_q8_0_i8mm_rows),
+        ("q1_0", 18, 128, tensor::matmul_q1_0_i8mm_rows),
+    ];
+    let mut bad = 0;
+    for (name, block_bytes, elems, run) in cases {
+        for &(rows, cols, m) in &[(13usize, 256usize, 6usize), (16, 128, 8), (9, 384, 5)] {
+            if cols % elems != 0 {
+                continue;
+            }
+            let mut seed = 0x4D0Fu32 ^ (rows as u32) ^ ((m as u32) << 8);
+            let mut w = Vec::new();
+            for _ in 0..rows * (cols / elems) {
+                w.extend_from_slice(&[0x00, 0x38]); // f16 0.5 scale
+                for _ in 0..block_bytes - 2 {
+                    w.push((lcg(&mut seed) & 0xff) as u8);
+                }
+            }
+            let nb = cols / 32; // activation scales are always QK=32-blocked
+            let mut xq = vec![0i8; m * cols];
+            let mut xs = vec![0.0f32; m * nb];
+            for mi in 0..m {
+                let x: Vec<f32> =
+                    (0..cols).map(|_| (lcg(&mut seed) % 1000) as f32 / 500.0 - 1.0).collect();
+                tensor::quantize_activations_q8(
+                    &x,
+                    &mut xq[mi * cols..(mi + 1) * cols],
+                    &mut xs[mi * nb..(mi + 1) * nb],
+                );
+            }
+            // Cut points: raw (may land on odd rows, as the adaptive
+            // `row_boundary` used to) and even-snapped (what
+            // `row_boundary_even` now produces for these kernels).
+            let cuts = |even: bool| {
+                let mut v = vec![0usize];
+                let mut c = 0usize;
+                for step in [3usize, 5, 1, 4, 2, 7, 6] {
+                    c += step;
+                    if c >= rows {
+                        break;
+                    }
+                    let b = if even { c & !1 } else { c };
+                    if b > *v.last().unwrap() {
+                        v.push(b);
+                    }
+                }
+                v.push(rows);
+                v
+            };
+            let mut whole = vec![0.0f32; m * rows];
+            // SAFETY: buffers sized to the kernel contract; host has i8mm.
+            unsafe {
+                run(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), whole.as_mut_ptr(), m, rows, 0, rows, cols)
+            };
+            let mut worsts = [0.0f32; 2];
+            for (which, even) in [(0usize, false), (1usize, true)] {
+                let mut split = vec![0.0f32; m * rows];
+                for pair in cuts(even).windows(2) {
+                    // SAFETY: adjacent sub-ranges covering [0, rows).
+                    unsafe {
+                        run(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), split.as_mut_ptr(),
+                            m, rows, pair[0], pair[1], cols)
+                    };
+                }
+                worsts[which] =
+                    (0..m * rows).map(|i| (whole[i] - split[i]).abs()).fold(0.0f32, f32::max);
+            }
+            let ok = worsts[1] == 0.0;
+            println!(
+                "{:5} rows={rows:<3} cols={cols:<4} m={m}   raw-split {:>11e}   even-split {:>11e}  {}",
+                name, worsts[0], worsts[1],
+                if ok { "OK" } else { "FAIL" }
+            );
+            if !ok {
+                bad += 1;
+            }
+        }
+    }
+    if bad == 0 {
+        println!("rangecheck: all kernels are row-range exact");
+    } else {
+        println!("rangecheck: {bad} case(s) FAILED -- a split range does not equal the whole");
+    }
+    bad
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn rangecheck() -> i32 {
+    eprintln!("rangecheck: aarch64-only (the i8mm kernels do not exist on this target)");
+    0
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // `synthetic <model> [n_prompt] [chunk]` — reproduce `/perf`'s deterministic
+    // synthetic prompt and print the same per-chunk logits fingerprint the
+    // kernel ktraces, so the two can be diffed to the first divergent chunk.
+    if args.get(1).map(|s| s.as_str()) == Some("synthetic") {
+        let path = args.get(2).cloned().unwrap_or_else(|| usage());
+        let n_prompt: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(512);
+        let chunk: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(64);
+        let bytes = std::fs::read(&path).expect("read model");
+        let gguf = Gguf::parse(&bytes).expect("gguf parse");
+        let m = Model::load(gguf).expect("model load");
+        // Identical to `cortex::bench_inference`'s synthetic prompt.
+        let vocab = m.vocab().max(3);
+        let prompt: Vec<usize> = (0..n_prompt).map(|i| 1 + (i * 97) % (vocab - 2)).collect();
+        let mut kv = m.new_cache();
+        let mut state = m.new_state();
+        let (mut i, mut ck) = (0usize, 0usize);
+        while i < prompt.len() {
+            let j = (i + chunk).min(prompt.len());
+            m.prefill(&prompt[i..j], i, &mut kv, &mut state);
+            println!("chunk {ck} pos {i}..{j} logits_hash={:#018x}", cortex::tensor::logits_hash(&state.logits));
+            ck += 1;
+            i = j;
+        }
+        // Decode the same way `bench_inference` does (argmax, no sampler), so
+        // the long-context decode path can be diffed too.
+        let n_dec: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(8);
+        let mut pos = prompt.len();
+        let mut next = cortex::model::argmax(&state.logits);
+        for d in 0..n_dec {
+            m.forward(next, pos, &mut kv, &mut state, true);
+            pos += 1;
+            next = cortex::model::argmax(&state.logits);
+            println!("dec {d} pos {pos} tok {next} logits_hash={:#018x}", cortex::tensor::logits_hash(&state.logits));
+        }
+        return;
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("rangecheck") {
+        std::process::exit(if rangecheck() == 0 { 0 } else { 1 });
+    }
     let (cmd, path) = match (args.get(1), args.get(2)) {
         (Some(c), Some(p)) => (c.as_str(), p.as_str()),
         _ => usage(),

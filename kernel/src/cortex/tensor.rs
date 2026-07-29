@@ -1043,6 +1043,48 @@ unsafe fn zip_hi_s8(
     unsafe { vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(a), vreinterpretq_s64_s8(b))) }
 }
 
+/// Snap an interior row-split boundary down to an even row, for the `i8mm`
+/// matmuls whose kernels consume rows in 2-row `smmla` tiles.
+///
+/// An odd trailing row in a sub-range takes a scalar `sdot_one_row_*` path that
+/// accumulates in a different order than the tile, so a boundary on an odd row
+/// makes that row's value depend on *where the split fell*. The fleet's split is
+/// adaptive (weighted by measured per-core speed), so prefill logits were not
+/// reproducible across core counts or even between runs — against `matvec_qw`'s
+/// explicit promise that the result is "independent of how the split falls".
+///
+/// The final boundary (`raw >= n_rows`) passes through unchanged, or rows would
+/// be dropped; only the last *global* row can then take the scalar tail, exactly
+/// as in the single-core case.
+///
+/// Arch-neutral and pure so it is covered by the x86 `cargo xtask test` suite —
+/// the kernels themselves are aarch64+i8mm and can never be reached there, which
+/// is precisely how this went unnoticed.
+pub fn even_row_boundary(raw: usize, n_rows: usize) -> usize {
+    if raw >= n_rows {
+        n_rows
+    } else {
+        raw & !1
+    }
+}
+
+/// FNV-1a over a float slice's **bit patterns** — a fingerprint of prefill
+/// state, used to diff the kernel against the host harness chunk by chunk.
+///
+/// Lives here rather than in `cortex::mod` because `tools/cortexdiff` mounts the
+/// cortex *submodules* by `#[path]` and not `mod.rs`; a single definition means
+/// the two sides cannot drift and their hashes are always comparable. Hashing
+/// the bits, not the value, so a last-ulp difference still shows up.
+pub fn logits_hash(v: &[f32]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for x in v {
+        for b in x.to_bits().to_le_bytes() {
+            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    h
+}
+
 /// Software prefetch of the next sequential weight/activation address into L1
 /// (`pldl1strm` — streaming, not retained past use). The Q1/Q2 matvec walks
 /// rows and blocks contiguously, so this hides DRAM latency behind SDOT.
@@ -2900,6 +2942,11 @@ unsafe fn matvec_q8_0_avx2(w: *const u8, x: *const f32, y: *mut f32, row_start: 
 /// GGML quant type codes (the set Chitti dequantizes), matching the GGUF
 /// on-disk `ggml_type` values so a tensor's type can be carried straight
 /// through from the header.
+/// Raw `f32` rows. Not a quantization, but a *weight* can be stored this way —
+/// Gemma-4-E4B keeps its per-layer `inp_gate`/`proj` matrices in F32 — so the
+/// matvec path has to accept it like any other type rather than the loader
+/// rejecting the tensor. Blocked at `QK` to match every other `QK`-based type.
+pub const QT_F32: u32 = 0;
 pub const QT_F16: u32 = 1;
 pub const QT_Q4_0: u32 = 2;
 pub const QT_Q4_1: u32 = 3;
@@ -2928,6 +2975,7 @@ pub const QT_Q2_0: u32 = 42;
 /// Bytes per quantization block and elements per block for a quant type.
 pub fn block_layout(qt: u32) -> (usize, usize) {
     match qt {
+        QT_F32 => (QK * 4, QK),
         QT_F16 => (F16_BLOCK_BYTES, QK),
         QT_Q4_0 => (Q4_0_BLOCK_BYTES, QK),
         QT_Q4_1 => (Q4_1_BLOCK_BYTES, QK),
@@ -2958,6 +3006,13 @@ pub fn block_layout(qt: u32) -> (usize, usize) {
 /// block element count).
 pub fn dequant_block(qt: u32, block: &[u8], out: &mut [f32]) {
     match qt {
+        // Already f32 on disk: a little-endian byte copy, not a conversion.
+        QT_F32 => {
+            for (i, o) in out.iter_mut().enumerate() {
+                let b = &block[i * 4..i * 4 + 4];
+                *o = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
+        }
         QT_F16 => dequant_f16_block(block, out),
         QT_Q4_0 => dequant_q4_0_block(block, out),
         QT_Q4_1 => dequant_q4_1_block(block, out),
@@ -3479,6 +3534,37 @@ mod tests {
         }
         for i in 0..m * rows {
             assert!((got[i] - want[i]).abs() < 1e-3, "i8mm vs sdot idx {i}: {} vs {}", got[i], want[i]);
+        }
+    }
+
+    /// Every interior i8mm row-split boundary must be even, and the split must
+    /// still tile `[0, n_rows)` exactly.
+    ///
+    /// This is the determinism fix: those kernels tile rows in 2-row `smmla`
+    /// pairs and send an odd trailing row down a scalar path with a different
+    /// accumulation order, so a boundary on an odd row makes that row's value
+    /// depend on where the split fell. Since the fleet's split is adaptive
+    /// (weighted by measured core speed), the same model produced different
+    /// logits across core counts and between runs. Verified end-to-end by
+    /// `cortexdiff rangecheck`: raw splits diverge by ~1e-5, even-aligned splits
+    /// are bit-exact.
+    #[test_case]
+    fn i8mm_row_split_boundaries_are_even_and_lose_no_rows() {
+        for n_rows in [1usize, 2, 7, 9, 13, 16, 17, 1024, 5120] {
+            // The final boundary must be exactly n_rows, whatever is asked for.
+            assert_eq!(even_row_boundary(n_rows, n_rows), n_rows);
+            assert_eq!(even_row_boundary(n_rows + 9, n_rows), n_rows);
+            let mut prev = 0usize;
+            for raw in 0..=n_rows {
+                let b = even_row_boundary(raw, n_rows);
+                assert!(b <= n_rows, "n_rows={n_rows} raw={raw}: boundary {b} past the end");
+                assert!(b >= prev, "n_rows={n_rows} raw={raw}: boundary went backwards");
+                if b < n_rows {
+                    assert_eq!(b % 2, 0, "n_rows={n_rows} raw={raw}: interior boundary {b} is odd");
+                }
+                assert!(raw.saturating_sub(b) <= 1, "n_rows={n_rows} raw={raw}: snapped {b}, lost >1 row of balance");
+                prev = b;
+            }
         }
     }
 

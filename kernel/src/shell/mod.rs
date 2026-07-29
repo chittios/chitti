@@ -1317,10 +1317,18 @@ struct Spinner {
     start_ms: u64,
 }
 
-impl Spinner {
-    // ASCII frames (Geist Mono has no braille).
-    const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
+/// Gradient endpoints for the wait bar, taken from the live theme so the sweep
+/// follows `/theme` instead of carrying colours of its own. The `framebuffer`
+/// module is absent from the `--lib test` build, so tests take the brand values
+/// directly (same reason the paint calls in [`Spinner::draw`] are cfg-gated).
+fn bar_gradient() -> ((u8, u8, u8), (u8, u8, u8)) {
+    #[cfg(not(test))]
+    return crate::framebuffer::hint_gradient();
+    #[cfg(test)]
+    return ((108, 106, 100), (204, 120, 92)); // Theme::BRAND_DARK hint / accent
+}
 
+impl Spinner {
     fn new(label: &'static str) -> Self {
         let s = Self {
             frame: 0,
@@ -1347,20 +1355,28 @@ impl Spinner {
         self.draw();
     }
     fn draw(&self) {
-        let frame = Self::FRAMES[self.frame % Self::FRAMES.len()];
+        let (dim, bright) = bar_gradient();
+        let bar = chrome::format_bar_ansi(self.frame, dim, bright);
         if self.status_only {
             let secs = crate::arch::now_ms().saturating_sub(self.start_ms) as f32 / 1000.0;
-            let msg = chrome::format_thinking_status(secs, frame);
+            let tail = chrome::format_thinking_tail(secs);
+            // The framebuffer gets plain text plus the per-cell colours for the
+            // leading bar cells; a terminal-attached UART gets the same bar as
+            // truecolour escapes, so it animates there too.
             #[cfg(not(test))]
-            crate::framebuffer::composer_set_hint_left(&msg);
+            crate::framebuffer::composer_set_hint_left_lead(
+                &chrome::format_thinking_status(secs),
+                &chrome::bar_colors(self.frame, dim, bright),
+            );
             // UART only — must not go through serial_print! (that also paints
             // the chat pane via console_print).
             crate::serial::write_str_raw("\r");
-            crate::serial::write_str_raw(&msg);
+            crate::serial::write_str_raw(&bar);
+            crate::serial::write_str_raw(&tail);
             crate::serial::write_str_raw("\x1b[K");
             return;
         }
-        serial_print!("\r\x1b[2m{}\x1b[0m {}", frame, self.label);
+        serial_print!("\r{bar}  {}", self.label);
     }
     fn clear(&self) {
         if self.status_only {
@@ -1372,7 +1388,8 @@ impl Spinner {
             return;
         }
         serial_print!("\r");
-        for _ in 0..self.label.len() + 4 {
+        // Bar cells + the two-space gap + the label.
+        for _ in 0..chrome::BAR_CELLS + 2 + self.label.len() {
             serial_print!(" ");
         }
         serial_print!("\r");
@@ -4313,6 +4330,28 @@ const PREFIX_CACHE_BUDGET: usize = crate::mm::heap::HEAP_SIZE / 2;
 /// worth its memory — a short routing SOUL is a few hundred milliseconds.
 const PREFIX_CACHE_MIN_TOKENS: usize = 128;
 
+/// Free heap that must remain **after** a prefix snapshot is stored.
+///
+/// [`PREFIX_CACHE_BUDGET`] alone is not enough, because it is a fraction of the
+/// heap's *size* and says nothing about what is left in it. A 4B's 1546-token
+/// snapshot is ~147 MiB: comfortably under half of a 512 MiB heap, so the static
+/// test admitted it — and the next turn died in the allocator asking for 12 MiB
+/// (`memory allocation of 12664832 bytes failed`). The live context needs its own
+/// KV, the per-chunk prefill scratch, the vocab-sized logits and the answer, and
+/// none of that is visible to a compile-time constant. So admission also asks the
+/// allocator what is actually free right now and refuses to spend the last of it
+/// on a cache. A declined prefix costs a re-prefill; an exhausted heap costs the
+/// session.
+const PREFIX_CACHE_HEAP_RESERVE: usize = 96 << 20;
+
+/// Whether a `bytes`-sized prefix snapshot may be stored given `free` heap.
+///
+/// Saturating, so a reserve larger than the heap refuses rather than wrapping
+/// into "always fits" — the failure mode this whole check exists to prevent.
+pub(crate) fn prefix_snapshot_fits(bytes: usize, free: usize, reserve: usize) -> bool {
+    free >= bytes.saturating_add(reserve)
+}
+
 impl ChatSession {
     /// Load the bundled model + build the tokenizer. `None` if no model. Ticks
     /// `spin` between load steps so the caller's spinner animates. Failures are
@@ -4781,6 +4820,22 @@ impl ChatSession {
             ));
             return;
         }
+        // ...and the budget is only half the question: see
+        // `PREFIX_CACHE_HEAP_RESERVE`. The clone below allocates `bytes` on top
+        // of the live KV it copies, so require room for both it and the working
+        // set that the rest of the turn still needs.
+        let (_, free, _) = crate::mm::heap::stats();
+        if !prefix_snapshot_fits(bytes, free, PREFIX_CACHE_HEAP_RESERVE) {
+            crate::ktrace::log_fmt(format_args!(
+                "chat.prefix: NOT caching {}-token system prefix -- {} MiB snapshot + {} MiB reserve \
+                 exceeds {} MiB free heap (this context will be prefilled again from scratch)",
+                self.pos,
+                bytes >> 20,
+                PREFIX_CACHE_HEAP_RESERVE >> 20,
+                free >> 20
+            ));
+            return;
+        }
         let snap = crate::cortex::prefix::Snapshot { cache: self.kv.clone(), pos: self.pos };
         let stored = self.prefix.insert(alloc::string::String::from(sys), snap, bytes);
         crate::ktrace::log_fmt(format_args!(
@@ -4960,12 +5015,61 @@ impl ChatSession {
         ));
         self.pos += fed;
     }
+}
 
+/// What the answer loop does with the next token, as far as `<think>` markers
+/// are concerned. See [`think_action`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum ThinkAction {
+    /// `</think>` while inside the block: end thinking, switch to the answer.
+    CloseBlock,
+    /// A think marker with no block to act on: feed it to the model, render
+    /// nothing, keep decoding.
+    Swallow,
+    /// Not a marker — stream it as answer text.
+    Stream,
+}
+
+/// Classify the next token against the think markers.
+///
+/// The load-bearing case is a **stray close**. With `/think` off the turn is
+/// primed with an already-closed empty block (`<think>\n\n</think>\n\n` — what
+/// Qwen3.5's own chat template specifies), and some models answer that by
+/// emitting one more `</think>` before their first word. Qwen3.5-4B does it on
+/// every turn; the 2B never does. Streaming that token puts raw markup in the
+/// reply *and* latches the "something was displayed" flag, so the turn reports
+/// as answered while the user sees a stray tag and nothing else — which reads
+/// as broken inference rather than a one-token bookkeeping slip. A stray open
+/// was already swallowed; the close must be too, and the two live here together
+/// so they cannot drift apart again.
+///
+/// A model with no think tokens carries `u32::MAX` for both, an id no real
+/// token can equal, so everything streams.
+pub(crate) fn think_action(
+    next: usize,
+    in_think: bool,
+    think_open: usize,
+    think_close: usize,
+) -> ThinkAction {
+    if in_think && next == think_close {
+        ThinkAction::CloseBlock
+    } else if next == think_open || next == think_close {
+        ThinkAction::Swallow
+    } else {
+        ThinkAction::Stream
+    }
+}
+
+impl ChatSession {
     /// Decode one assistant reply from the current logits, streaming it to the
     /// chat pane (labelled `label`) and returning the **post-think** text (so
     /// the caller can detect a tool call; a plan inside `<think>` never triggers
     /// one). Thinking streams dim; it is force-closed at `MAX_THINK` tokens so a
     /// small model cannot ruminate forever. Closes the turn with `<|im_end|>`.
+    ///
+    /// The `<think>`/`</think>` bookkeeping is [`think_action`] — pure, so the
+    /// open/close symmetry is pinned by tests instead of living as two
+    /// hand-written branches that drifted apart once already.
     fn generate_assistant(&mut self, label: &str) -> alloc::string::String {
         use crate::cortex::tokenizer;
         let eos = self.model.eos();
@@ -5001,8 +5105,10 @@ impl ChatSession {
             if next == eos || next == im_end {
                 break;
             }
+            let act = think_action(next, in_think, think_open, think_close);
             // End of the think block: switch to answer (Thought footer at turn end).
-            if in_think && (next == think_close || n_think >= MAX_THINK) {
+            // The cap force-closes even when the model never emits the tag.
+            if act == ThinkAction::CloseBlock || (in_think && n_think >= MAX_THINK) {
                 in_think = false;
                 // Only count Thought for when think tokens were actually produced.
                 if n_think > 0 {
@@ -5017,8 +5123,10 @@ impl ChatSession {
                 run_len = 0;
                 continue;
             }
-            if next == think_open {
-                // Stray re-open: ignore the token, keep decoding.
+            if act == ThinkAction::Swallow {
+                // A stray `<think>` re-open, or a stray `</think>` with no block
+                // open (see `think_action`). Feed it so the model's own context
+                // stays what it sampled, print nothing, keep decoding.
                 self.model.forward(next, self.pos, &mut self.kv, &mut self.state, true);
                 self.pos += 1;
                 next = self.pick();
@@ -5076,6 +5184,21 @@ impl ChatSession {
         if in_think && n_think > 0 {
             let secs = crate::arch::now_ms().saturating_sub(think_start) as f32 / 1000.0;
             self.last_thought_secs = secs;
+        }
+        // A turn that generated tokens but displayed nothing is otherwise
+        // undiagnosable from outside: the raw text is swallowed by the think
+        // collapse (`in_think`), by `suppress_tools` latching on a `<tool_call>`
+        // that later fails to parse, or by the model emitting only specials.
+        // Those look identical to the user — a footer and no answer — so say
+        // which it was, with a bounded excerpt of what the model actually
+        // produced.
+        if n > 0 && !label_shown {
+            crate::ktrace::log_fmt(format_args!(
+                "chat.silent: {n} token(s) generated, nothing displayed \
+                 (think={n_think}, tools_suppressed={suppress_tools}, {} bytes): {:.200}",
+                out.len(),
+                out.trim()
+            ));
         }
         // Flush a held partial line + newline only if an answer actually
         // streamed (a pure tool-call turn printed nothing — the ◆ header comes
@@ -6731,6 +6854,55 @@ fn run_infer() {
 /// Builtin: `/bench [synapse]`. Bare `/bench` is the matvec/SDOT gauge; `/bench
 /// synapse` prices the determinism boundary itself (see `synapse::bench`) — the
 /// authorization decision in ns/call against a per-token cost from `/perf`.
+/// `/bench heap` — grow a Vec the way the KV cache does, and verify every byte.
+///
+/// `Cache::attn_k[l]` is a `Vec<f32>` extended once per prefill chunk, reaching
+/// ~100 MiB on a 1.5k-token context with a 4B. That is the one thing that scales
+/// with context *and* differs between the kernel (first-fit linked-list heap)
+/// and the host harness (system malloc) — and it fits the symptom: a 5-token
+/// `/infer` is exact, a 1546-token chat is garbage, while identical code at the
+/// same context on the host is correct. This reproduces that growth pattern with
+/// a self-describing pattern, so a realloc that loses or aliases data is caught
+/// directly instead of being inferred from bad logits.
+fn run_bench_heap() {
+    use alloc::vec::Vec;
+    const STEP: usize = 16 * 1024; // f32s per extend, ~ one prefill chunk of KV
+    const TOTAL: usize = 40 * 1024 * 1024; // f32 count -> ~160 MiB
+    let (used0, free0) = crate::mm::heap::alloc_stats();
+    let mut v: Vec<f32> = Vec::new();
+    let mut chunk = alloc::vec![0.0f32; STEP];
+    let mut n = 0usize;
+    while n < TOTAL {
+        for (i, c) in chunk.iter_mut().enumerate() {
+            // Encodes its own absolute index; indices stay under 2^24 so this
+            // is lossless in f32 and any mix-up is visible.
+            *c = (n + i) as f32;
+        }
+        v.extend_from_slice(&chunk);
+        n += STEP;
+    }
+    let mut bad = 0usize;
+    let mut first = usize::MAX;
+    for (i, &x) in v.iter().enumerate() {
+        if x != i as f32 {
+            if bad == 0 {
+                first = i;
+            }
+            bad += 1;
+        }
+    }
+    let (used1, free1) = crate::mm::heap::alloc_stats();
+    if bad == 0 {
+        serial_println!("bench> heap grow-and-verify: {} MiB OK ({} elements intact)", (v.len() * 4) >> 20, v.len());
+    } else {
+        serial_println!(
+            "bench> heap grow-and-verify: {} MiB CORRUPT -- {bad} bad element(s), first at {first} (got {}, want {})",
+            (v.len() * 4) >> 20, v[first], first as f32
+        );
+    }
+    serial_println!("bench>   heap allocs {used0} -> {used1}, free-list steps {free0} -> {free1}");
+}
+
 /// `/audit [verify|export <path>]` — read out the Synapse audit log.
 ///
 /// The log is the record of every capability invocation, denials included, and
@@ -6778,10 +6950,18 @@ fn run_bench(arg: &str) {
         crate::synapse::bench::run();
         return;
     }
+    if arg.trim() == "heap" {
+        run_bench_heap();
+        return;
+    }
     #[cfg(target_arch = "aarch64")]
     serial_println!("bench> Q4_0 SDOT vs exact rel_rms_err = {}", crate::cortex::check_q4_0_sdot());
     #[cfg(target_arch = "aarch64")]
     serial_println!("bench> Q4_K SDOT vs exact rel_rms_err = {}", crate::cortex::check_q4_k_sdot());
+    // The batched i8mm GEMM is what every prefill runs and had no in-kernel
+    // check; its unit tests are aarch64-gated and `cargo xtask test` is x86.
+    #[cfg(target_arch = "aarch64")]
+    serial_println!("bench> Q4_0 i8mm GEMM vs matvec rel_rms_err = {}", crate::cortex::check_q4_0_i8mm());
     let r = crate::cortex::bench_matvec();
     // MMAC/s = macs / (ms * 1000); guard against a zero interval.
     let mmacs = if r.ms > 0 { r.macs / (r.ms * 1000) } else { 0 };
@@ -14921,5 +15101,59 @@ mod agent_flow_tests {
         assert!(!is_image_bytes(b"<!DOCTYPE html>"));
         assert!(!is_image_bytes(b"404 Not Found"));
         assert!(!is_image_bytes(&[]));
+    }
+
+    // `<think>` bookkeeping. `OPEN`/`CLOSE` stand in for the vocab ids
+    // (Qwen3.5: 248068 / 248069).
+    const OPEN: usize = 8;
+    const CLOSE: usize = 9;
+
+    /// The asymmetry that made Qwen3.5-4B look like broken inference: with
+    /// `/think` off the turn is primed with an already-closed empty block, and
+    /// the 4B emits one more `</think>` before its first word. A stray open was
+    /// swallowed; a stray close fell through to the answer stream, printing raw
+    /// markup and latching "something was displayed". Both must swallow.
+    #[test_case]
+    fn a_stray_think_close_is_swallowed_exactly_like_a_stray_open() {
+        assert_eq!(think_action(CLOSE, false, OPEN, CLOSE), ThinkAction::Swallow);
+        assert_eq!(think_action(OPEN, false, OPEN, CLOSE), ThinkAction::Swallow);
+        // A re-open *inside* a block is still a stray — there is no nesting.
+        assert_eq!(think_action(OPEN, true, OPEN, CLOSE), ThinkAction::Swallow);
+    }
+
+    /// The real close still ends the block — the fix must not swallow the token
+    /// the collapsed-thinking path exists to catch.
+    #[test_case]
+    fn think_close_inside_the_block_still_closes_it() {
+        assert_eq!(think_action(CLOSE, true, OPEN, CLOSE), ThinkAction::CloseBlock);
+    }
+
+    /// Prefix-snapshot admission. The 4B case is the one that panicked: a
+    /// 147 MiB snapshot passes the static half-the-heap budget, but storing it
+    /// with only ~150 MiB free leaves the next turn unable to allocate 12 MiB.
+    #[test_case]
+    fn a_prefix_snapshot_is_refused_unless_the_working_set_still_fits() {
+        const MB: usize = 1 << 20;
+        // Plenty free → cache it.
+        assert!(prefix_snapshot_fits(147 * MB, 400 * MB, 96 * MB));
+        // The panic case: fits the budget, does not fit the heap.
+        assert!(!prefix_snapshot_fits(147 * MB, 150 * MB, 96 * MB));
+        // Exactly enough is enough.
+        assert!(prefix_snapshot_fits(100 * MB, 196 * MB, 96 * MB));
+        assert!(!prefix_snapshot_fits(100 * MB, 195 * MB, 96 * MB));
+        // A reserve larger than the heap refuses; it must not wrap to "fits".
+        assert!(!prefix_snapshot_fits(usize::MAX, 400 * MB, 96 * MB));
+    }
+
+    /// Ordinary tokens stream in both states, and a model with no think tokens
+    /// (absent specials are `u32::MAX`, an id no real token can equal) streams
+    /// everything rather than silently eating a word.
+    #[test_case]
+    fn ordinary_tokens_stream_and_a_model_without_think_tokens_streams_all() {
+        assert_eq!(think_action(42, false, OPEN, CLOSE), ThinkAction::Stream);
+        assert_eq!(think_action(42, true, OPEN, CLOSE), ThinkAction::Stream);
+        let none = u32::MAX as usize;
+        assert_eq!(think_action(42, false, none, none), ThinkAction::Stream);
+        assert_eq!(think_action(0, true, none, none), ThinkAction::Stream);
     }
 }

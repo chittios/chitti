@@ -329,6 +329,75 @@ pub fn bench_matvec() -> BenchResult {
     }
 }
 
+/// Batched **i8mm** matmul vs the per-column matvec, in the *kernel* build.
+///
+/// `/bench` only ever checked the matvecs, so the weight-stationary GEMMs that
+/// every prefill runs had no in-kernel numeric check at all — and their unit
+/// tests are `cfg(target_arch = "aarch64")` while `cargo xtask test` targets
+/// x86, so those never execute either. The host harness (`cortexdiff`) does
+/// exercise them, but it builds for `aarch64-apple-darwin` *without*
+/// `+strict-align`, so it cannot see a lowering that only the kernel's target
+/// produces. This closes that gap: same weights, same activations, i8mm GEMM
+/// against the matvec, run by the real kernel binary.
+///
+/// Returns the relative RMS error; quantization noise is ~1e-3, so anything
+/// materially larger means the GEMM is wrong *here* even if it is right on the
+/// host. `m` is 8 so the 2x2 tile and its column tail both run.
+#[cfg(target_arch = "aarch64")]
+pub fn check_q4_0_i8mm() -> f32 {
+    use tensor::{Q4_0_BLOCK_BYTES, QK};
+    const ROWS: usize = 512;
+    const COLS: usize = 1024;
+    const M: usize = 8;
+    if !crate::arch::has_i8mm() {
+        return 0.0;
+    }
+    let blocks = COLS / QK;
+    let row_bytes = blocks * Q4_0_BLOCK_BYTES;
+    let mut w = alloc::vec![0u8; ROWS * row_bytes];
+    let mut seed: u32 = 0x9e37_79b9;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        seed
+    };
+    for r in 0..ROWS {
+        for b in 0..blocks {
+            let base = r * row_bytes + b * Q4_0_BLOCK_BYTES;
+            w[base] = 0x00;
+            w[base + 1] = 0x20; // f16 ~0.125
+            for i in 0..QK / 2 {
+                w[base + 2 + i] = (next() >> 24) as u8;
+            }
+        }
+    }
+    // M activation columns, packed the way `batched_proj` packs them.
+    let mut xq = alloc::vec![0i8; M * COLS];
+    let mut xs = alloc::vec![0.0f32; M * blocks];
+    for mi in 0..M {
+        let x: Vec<f32> = (0..COLS).map(|i| (((i + mi * 7) % 23) as f32 - 11.0) * 0.07).collect();
+        tensor::quantize_activations_q8(&x, &mut xq[mi * COLS..(mi + 1) * COLS], &mut xs[mi * blocks..(mi + 1) * blocks]);
+    }
+    let mut y_mm = alloc::vec![0.0f32; M * ROWS];
+    let mut y_mv = alloc::vec![0.0f32; M * ROWS];
+    // SAFETY: sizes match both kernels' contracts; i8mm checked above.
+    unsafe {
+        tensor::matmul_q4_0_i8mm_rows(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), y_mm.as_mut_ptr(), M, ROWS, 0, ROWS, COLS);
+        for mi in 0..M {
+            tensor::matvec_q4_0_sdot_rows(
+                w.as_ptr(), xq.as_ptr().add(mi * COLS), xs.as_ptr().add(mi * blocks),
+                y_mv.as_mut_ptr().add(mi * ROWS), 0, ROWS, COLS,
+            );
+        }
+    }
+    let (mut num, mut den) = (0.0f32, 0.0f32);
+    for i in 0..M * ROWS {
+        let d = y_mm[i] - y_mv[i];
+        num += d * d;
+        den += y_mv[i] * y_mv[i];
+    }
+    if den > 0.0 { tensor::libm_sqrtf(num / den) } else { 0.0 }
+}
+
 /// Self-check: build a small Q4_0 weight + activation, and compare the exact
 /// scalar `matvec_q4_0` against the int8-activation `matvec_q4_0_sdot_rows`.
 /// Returns the aggregate relative RMS error (should be ~1% -- int8 activation
@@ -512,9 +581,20 @@ pub fn bench_inference(n_prompt: usize, n_decode: usize, pump: &mut dyn FnMut() 
     model::reset_prefill_phases();
     let t0 = crate::arch::now_ms();
     let mut i = 0usize;
+    let mut ck = 0usize;
     while i < prompt.len() {
         let j = core::cmp::min(i + chunk, prompt.len());
         m.prefill(&prompt[i..j], i, &mut kv, &mut state);
+        // Per-chunk logits fingerprint. The prompt is a deterministic synthetic
+        // sequence, so `tools/cortexdiff synthetic` reproduces it exactly and
+        // these hashes can be diffed chunk-by-chunk against the host. That turns
+        // "the kernel is right at 5 tokens and wrong at 1546, the host is right
+        // at both" into a single divergent chunk index.
+        crate::ktrace::log_fmt(format_args!(
+            "cortex.bench: chunk {ck} pos {i}..{j} logits_hash={:#018x}",
+            tensor::logits_hash(&state.logits)
+        ));
+        ck += 1;
         i = j;
         if pump() {
             return None;
@@ -533,9 +613,13 @@ pub fn bench_inference(n_prompt: usize, n_decode: usize, pump: &mut dyn FnMut() 
         m.forward(next, pos, &mut kv, &mut state, true);
         pos += 1;
         next = model::argmax(&state.logits);
-        if i % 8 == 7 {
-            crate::ktrace::log_fmt(format_args!("cortex.bench: decode {}/{n_decode}", i + 1));
-        }
+        // Same fingerprint as the prefill chunks, for the half `/infer` cannot
+        // reach: it decodes at pos 5..13, while a real chat turn decodes at
+        // pos 1500+. Diffed against `cortexdiff synthetic` the same way.
+        crate::ktrace::log_fmt(format_args!(
+            "cortex.bench: dec {i} pos {pos} tok {next} logits_hash={:#018x}",
+            tensor::logits_hash(&state.logits)
+        ));
         if pump() {
             return None;
         }

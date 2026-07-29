@@ -66,9 +66,16 @@ def main():
     print(f"prompt ids  llama : {' '.join(lprompt)}  {'MATCH' if tok_ok else 'MISMATCH  <-- tokenizer bug'}")
 
     # llama side: greedy CPU completion text.
+    # `-no-cnv` is load-bearing: llama-completion defaults to *conversation*
+    # mode whenever the GGUF carries a chat template, which silently wraps `-p`
+    # as a user turn and applies the template. On Qwen3.5 that means every
+    # comparison starts with the model's `<think>` block, so the kernel — doing
+    # a genuine raw completion — "diverges at token 0" against every model,
+    # working or not. That reads exactly like an engine bug and is purely an
+    # artifact of the harness. Raw completion on both sides or the oracle lies.
     cmd = [
         "llama-completion", "-m", model, "-p", prompt, "-n", str(n),
-        "--temp", "0", "--no-warmup", "--no-display-prompt", "-ngl", "0",
+        "--temp", "0", "--no-warmup", "--no-display-prompt", "-ngl", "0", "-no-cnv",
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, stdin=subprocess.DEVNULL)

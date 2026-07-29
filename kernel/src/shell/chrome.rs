@@ -1,8 +1,9 @@
 //! Chat chrome formatters (pure, no_std): thought/work timing, wait labels,
-//! tool headers, and text sanitization for the shell UI.
+//! the progress-bar sweep, tool headers, and text sanitization for the shell UI.
 
 use alloc::format;
 use alloc::string::{String, ToString};
+use core::fmt::Write;
 
 /// Prompt prefix for a submitted user line in scrollback.
 pub const PROMPT_ARROW: &str = ">";
@@ -38,10 +39,105 @@ pub fn format_thinking_live() -> &'static str {
     "Thinking"
 }
 
-/// Live status line with elapsed seconds + spinner frame.
-/// e.g. `Thinking  2.4s  |`
-pub fn format_thinking_status(secs: f32, frame: char) -> String {
-    format!("Thinking  {}  {}", format_duration_secs(secs), frame)
+// ---------------------------------------------------------------------------
+// Progress bar sweep
+// ---------------------------------------------------------------------------
+//
+// A block bar whose colour gradient sweeps, rather than a rotating `|/-\`
+// character: it reads as *work in progress* at a glance and does not look like
+// a stuck character when a frame is dropped (prefill ticks at ~10 Hz but a
+// single batched chunk can outlast several frames). The geometry and frame
+// sequence follow `@astrojs/cli-kit`'s spinner — a 6-cell window scrolled over
+// a 30-entry ramp — while the two gradient endpoints come from the live theme
+// (`composer_hint` -> `accent`), so it stays on-brand and follows `/theme`
+// instead of hardcoding astro's green/purple.
+
+/// One bar cell. Geist Mono covers the block-element range (verified: U+2588,
+/// U+2591..U+2593), so this needs no fallback face.
+pub const BAR_BLOCK: char = '\u{2588}';
+
+/// Cells in the bar (astro's `COLORS.length - 2`).
+pub const BAR_CELLS: usize = 6;
+
+/// Gradient stops the sweep interpolates through (astro's `COLORS`).
+pub const BAR_STOPS: usize = 8;
+
+/// Frames in one full sweep, i.e. `FULL_FRAMES.len()` below.
+pub const BAR_FRAMES: usize = 30;
+
+/// The bar as plain text — `BAR_CELLS` full blocks, no colour. Used where a
+/// surface paints its own per-cell colours (the composer hint bar) and as the
+/// degraded look on a console with no colour.
+pub const BAR: &str = "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}";
+
+/// Astro's `FULL_FRAMES`, as indices into the gradient stops: a dim run, the
+/// 8-stop ramp up, a bright run, then the ramp back down. A 6-cell window
+/// slides over it, so the bright band enters from one end, fills the bar, and
+/// retreats — 30 frames at the ~10 Hz [`super::upkeep`] tick is a ~3 s cycle.
+const FULL_FRAMES: [u8; BAR_FRAMES] = [
+    0, 0, 0, 0, 0, 0, 0, // dim run (BAR_STOPS - 1 entries)
+    0, 1, 2, 3, 4, 5, 6, 7, // ramp up
+    7, 7, 7, 7, 7, 7, 7, // bright run
+    7, 6, 5, 4, 3, 2, 1, 0, // ramp down
+];
+
+/// Gradient-stop index per cell for animation frame `frame` (wraps).
+///
+/// Astro walks the window offsets in reverse, which is what makes frame 0 the
+/// all-dim state and sends the band in from the left; a window running past the
+/// end pads with the dim stop.
+pub fn bar_stops(frame: usize) -> [u8; BAR_CELLS] {
+    let off = BAR_FRAMES - 1 - (frame % BAR_FRAMES);
+    let mut out = [0u8; BAR_CELLS];
+    for (i, cell) in out.iter_mut().enumerate() {
+        if let Some(&s) = FULL_FRAMES.get(off + i) {
+            *cell = s;
+        }
+    }
+    out
+}
+
+/// Linear ramp: stop `0` is `dim`, stop `BAR_STOPS - 1` is `bright`.
+pub fn bar_color(stop: u8, dim: (u8, u8, u8), bright: (u8, u8, u8)) -> (u8, u8, u8) {
+    let n = (BAR_STOPS - 1) as u32;
+    let t = (stop as u32).min(n);
+    let mix = |a: u8, b: u8| (((a as u32) * (n - t) + (b as u32) * t) / n) as u8;
+    (mix(dim.0, bright.0), mix(dim.1, bright.1), mix(dim.2, bright.2))
+}
+
+/// Per-cell colours for animation frame `frame`.
+pub fn bar_colors(frame: usize, dim: (u8, u8, u8), bright: (u8, u8, u8)) -> [(u8, u8, u8); BAR_CELLS] {
+    let stops = bar_stops(frame);
+    let mut out = [dim; BAR_CELLS];
+    for (cell, &stop) in out.iter_mut().zip(stops.iter()) {
+        *cell = bar_color(stop, dim, bright);
+    }
+    out
+}
+
+/// The bar as 24-bit ANSI, for the chat pane and a terminal-attached serial
+/// console — both parse `38;2;r;g;b` (`framebuffer::apply_sgr`). Closes with a
+/// reset so the label after it takes the pane's default colour.
+pub fn format_bar_ansi(frame: usize, dim: (u8, u8, u8), bright: (u8, u8, u8)) -> String {
+    let mut s = String::with_capacity(BAR_CELLS * 20 + 4);
+    for (r, g, b) in bar_colors(frame, dim, bright) {
+        let _ = write!(s, "\x1b[38;2;{r};{g};{b}m{BAR_BLOCK}");
+    }
+    s.push_str("\x1b[0m");
+    s
+}
+
+/// Everything after the bar on the live status line: `  Thinking  2.4s`.
+/// Split out so the serial path can print a colourised bar followed by this,
+/// without slicing the composed string at a hardcoded byte offset.
+pub fn format_thinking_tail(secs: f32) -> String {
+    format!("  {}  {}", format_thinking_live(), format_duration_secs(secs))
+}
+
+/// Live status line body: the bar, then the label + elapsed seconds.
+/// e.g. `██████  Thinking  2.4s`
+pub fn format_thinking_status(secs: f32) -> String {
+    format!("{BAR}{}", format_thinking_tail(secs))
 }
 
 /// True if `text` contains a model think/reasoning block we can strip.
@@ -98,11 +194,67 @@ mod tests {
     fn thought_worked_and_status() {
         assert_eq!(format_thought_done(0.6), "Thought for 0.6s");
         assert_eq!(format_worked_for(7.4), "Worked for 7.4s.");
-        let s = format_thinking_status(2.4, '|');
-        assert!(s.starts_with("Thinking"));
+        let s = format_thinking_status(2.4);
+        assert!(s.starts_with(BAR));
+        assert!(s.contains("Thinking"));
         assert!(s.contains("2.4s"));
         assert!(has_think_block("<think>x</think>hi"));
         assert!(!has_think_block("hi only"));
+    }
+
+    /// The bar is exactly `BAR_CELLS` blocks wide -- the composer hint bar
+    /// colours cell `i` from `bar_colors()[i]`, so a mismatch would paint the
+    /// gradient onto the label text.
+    #[test_case]
+    fn bar_is_cells_wide() {
+        assert_eq!(BAR.chars().count(), BAR_CELLS);
+        assert!(BAR.chars().all(|c| c == BAR_BLOCK));
+    }
+
+    /// The sweep: all dim, band in from the left, all bright, band out.
+    /// Pins the window direction -- walking the offsets forward instead of in
+    /// reverse runs the whole animation backwards and starts it fully lit.
+    #[test_case]
+    fn bar_sweeps_dim_to_bright_and_back() {
+        assert_eq!(bar_stops(0), [0, 0, 0, 0, 0, 0]);
+        assert_eq!(bar_stops(7), [7, 6, 5, 4, 3, 2]);
+        assert_eq!(bar_stops(14), [7, 7, 7, 7, 7, 7]);
+        assert_eq!(bar_stops(21), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(bar_stops(29), [0, 0, 0, 0, 0, 0]);
+        // Wraps, so a frame counter can run forever.
+        assert_eq!(bar_stops(BAR_FRAMES + 7), bar_stops(7));
+        // Every stop stays a valid gradient index.
+        for f in 0..BAR_FRAMES * 3 {
+            assert!(bar_stops(f).iter().all(|&s| (s as usize) < BAR_STOPS));
+        }
+    }
+
+    #[test_case]
+    fn bar_color_ramps_between_endpoints() {
+        let dim = (108, 106, 100);
+        let bright = (204, 120, 92);
+        assert_eq!(bar_color(0, dim, bright), dim);
+        assert_eq!(bar_color(BAR_STOPS as u8 - 1, dim, bright), bright);
+        // Out-of-range clamps to the bright end rather than wrapping dark.
+        assert_eq!(bar_color(200, dim, bright), bright);
+        // Monotonic on the channel that increases (red: 108 -> 204).
+        let mut prev = 0u8;
+        for s in 0..BAR_STOPS as u8 {
+            let c = bar_color(s, dim, bright).0;
+            assert!(c >= prev);
+            prev = c;
+        }
+    }
+
+    #[test_case]
+    fn bar_ansi_has_one_truecolour_run_per_cell() {
+        let s = format_bar_ansi(9, (108, 106, 100), (204, 120, 92));
+        assert_eq!(s.matches("\x1b[38;2;").count(), BAR_CELLS);
+        assert_eq!(s.matches(BAR_BLOCK).count(), BAR_CELLS);
+        assert!(s.ends_with("\x1b[0m"));
+        // Frame 0 is uniformly dim, so it names the dim colour every cell.
+        let d = format_bar_ansi(0, (108, 106, 100), (204, 120, 92));
+        assert_eq!(d.matches("\x1b[38;2;108;106;100m").count(), BAR_CELLS);
     }
 
     #[test_case]

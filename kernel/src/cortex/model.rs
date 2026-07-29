@@ -290,6 +290,12 @@ struct Layer<'a> {
     ffn_gate: QWeight<'a>,
     ffn_up: QWeight<'a>,
     ffn_down: QWeight<'a>,
+    /// Gemma E-series per-layer-embedding block, applied after the FFN residual:
+    /// `x += pl_post_norm(pl_proj @ (gelu(pl_inp_gate @ x) * ple[layer]))`.
+    /// All three are present together or not at all.
+    pl_inp_gate: Option<QWeight<'a>>, // [dim -> E]
+    pl_proj: Option<QWeight<'a>>,     // [E -> dim]
+    pl_post_norm: Option<&'a [f32]>,  // [dim]
 }
 
 pub struct Model<'a> {
@@ -300,6 +306,12 @@ pub struct Model<'a> {
     output_norm: &'a [f32],
     layers: Vec<Layer<'a>>,
     vocab: usize,
+    /// Gemma E-series per-layer embeddings: a second, per-layer token table
+    /// (`[E*n_layer, vocab]`) plus the projection of the *scaled* input
+    /// embedding that is added to it. `None` on every other model.
+    pl_tok_embd: Option<QWeight<'a>>,
+    pl_model_proj: Option<QWeight<'a>>,
+    pl_proj_norm: Option<&'a [f32]>,
     /// Whether prefill takes the window-batched path. Deliberately **not** a
     /// function of the quant mix: [`Model::batched_proj`] batches the tensors
     /// whose type has a weight-stationary kernel and applies the rest a position
@@ -366,6 +378,10 @@ pub struct State {
     // widest matvec input so it is reused across every projection.
     xq: Vec<i8>,
     xs: Vec<f32>,
+    /// Gemma E-series per-layer inputs for the current token (`E*n_layer`), and
+    /// the `E`-wide gate scratch. Empty on every other model.
+    ple: Vec<f32>,
+    pl_gate: Vec<f32>,
 }
 
 impl State {
@@ -379,6 +395,9 @@ impl State {
         // scratch must cover the wider of the two.
         let hd_g = c.swa.map(|s| s.head_dim_global).unwrap_or(0);
         let kv_g = c.swa.map(|s| s.head_count_kv_global * s.head_dim_global).unwrap_or(0);
+        // Gemma E-series per-layer-embedding scratch; zero-sized elsewhere.
+        let ple_e = c.swa.map(|s| s.n_embd_per_layer).unwrap_or(0);
+        let ple_len = ple_e * c.block_count;
         let q_width = (c.head_count * c.head_dim * 2).max(c.head_count * hd_g);
         let kv_width = (c.head_count_kv * c.head_dim).max(kv_g);
         // Widest matvec input across all projections (columns): the norm-fed
@@ -412,6 +431,8 @@ impl State {
             logits: v(vocab),
             xq: alloc::vec![0i8; max_cols],
             xs: alloc::vec![0.0f32; max_cols / QK],
+            ple: v(ple_len),
+            pl_gate: v(ple_e),
         }
     }
 }
@@ -624,6 +645,21 @@ impl<'a> Model<'a> {
                     (kind, f32_tensor(&gguf, &n("post_attention_norm.weight"), dim)?)
                 }
             };
+            // Gemma E-series per-layer-embedding block. All-or-nothing: a file
+            // with only some of the three is malformed, and silently running
+            // without the block is the failure this whole path exists to fix.
+            let (pl_inp_gate, pl_proj, pl_post_norm) = if c.family == Family::Gemma4
+                && c.swa.map(|s| s.n_embd_per_layer).unwrap_or(0) > 0
+            {
+                let e = c.swa.expect("gemma swa").n_embd_per_layer;
+                (
+                    Some(qtensor(&gguf, &n("inp_gate.weight"), dim, e)?),
+                    Some(qtensor(&gguf, &n("proj.weight"), e, dim)?),
+                    Some(f32_tensor(&gguf, &n("post_norm.weight"), dim)?),
+                )
+            } else {
+                (None, None, None)
+            };
             layers.push(Layer {
                 attn_norm: f32_tensor(&gguf, &n("attn_norm.weight"), dim)?,
                 post_norm,
@@ -634,8 +670,24 @@ impl<'a> Model<'a> {
                 ffn_gate: qtensor(&gguf, &n("ffn_gate.weight"), dim, ffn)?,
                 ffn_up: qtensor(&gguf, &n("ffn_up.weight"), dim, ffn)?,
                 ffn_down: qtensor(&gguf, &n("ffn_down.weight"), ffn, dim)?,
+                pl_inp_gate,
+                pl_proj,
+                pl_post_norm,
             });
         }
+        // Model-level halves of the per-layer-embedding stack.
+        let (pl_tok_embd, pl_model_proj, pl_proj_norm) =
+            match c.swa.map(|s| s.n_embd_per_layer).unwrap_or(0) {
+                0 => (None, None, None),
+                e => {
+                    let el = e * c.block_count;
+                    (
+                        Some(qtensor(&gguf, "per_layer_token_embd.weight", el, vocab)?),
+                        Some(qtensor(&gguf, "per_layer_model_proj.weight", dim, el)?),
+                        Some(f32_tensor(&gguf, "per_layer_proj_norm.weight", e)?),
+                    )
+                }
+            };
 
         // Batching is decided **per tensor**, not per model. The old gate
         // required one uniform quant type across every weight and anchored it on
@@ -678,9 +730,17 @@ impl<'a> Model<'a> {
                         acct(beta);
                         acct(out);
                     }
-                    // Gemma never reaches the batched path; leave it out of the
-                    // accounting rather than reporting a figure that cannot apply.
-                    LayerKind::GemmaAttn { .. } => {}
+                    // Gemma's projections go through the same `batched_proj`, so
+                    // they count exactly like the hybrid's. `v` is absent on a
+                    // global layer (V = K), hence the `Option`.
+                    LayerKind::GemmaAttn { q, k, v, o, .. } => {
+                        acct(q);
+                        acct(k);
+                        if let Some(v) = v {
+                            acct(v);
+                        }
+                        acct(o);
+                    }
                 }
             }
         }
@@ -690,9 +750,22 @@ impl<'a> Model<'a> {
         // heads (with the position loop inside), the conv ring advances once per
         // window instead of once per position, and the matvec work in the
         // fallback is exactly what the per-token path would have done anyway.
-        let batched = cfg!(target_arch = "aarch64") && c.family != Family::Gemma4;
+        let batched = cfg!(target_arch = "aarch64");
 
-        Ok(Self { config: c, gguf, token_embd, output, output_norm, layers, vocab, batched, batch_pct })
+        Ok(Self {
+            config: c,
+            gguf,
+            token_embd,
+            output,
+            output_norm,
+            layers,
+            vocab,
+            pl_tok_embd,
+            pl_model_proj,
+            pl_proj_norm,
+            batched,
+            batch_pct,
+        })
     }
 
     pub fn vocab(&self) -> usize {
@@ -774,15 +847,24 @@ impl<'a> Model<'a> {
         let (conv_dim, value_dim, nh) =
             c.ssm.map(|s| (s.conv_dim(), s.inner, s.dt_rank)).unwrap_or((0, 0, 0));
         let m = prompt.len();
-        let max_cols = dim.max(ffn).max(ao).max(value_dim);
+        // Gemma has *two* attention geometries and every buffer must cover the
+        // wider one — global layers carry `head_dim_global` (512 on E4B) against
+        // the sliding layers' 256, so a buffer sized from `c.head_dim` alone
+        // overflows on every global layer. Mirrors `State::new`.
+        let hd_g = c.swa.map(|s| s.head_dim_global).unwrap_or(0);
+        let kv_g = c.swa.map(|s| s.head_count_kv_global * s.head_dim_global).unwrap_or(0);
+        let q_width = qdim.max(nq * hd_g);
+        let kv_width = kv_dim.max(kv_g);
+        let ao_width = ao.max(nq * hd_g);
+        let max_cols = dim.max(ffn).max(ao_width).max(value_dim);
 
         // M-wide buffers (one prefill's worth; freed on return).
         let mut hidden = alloc::vec![0.0f32; m * dim];
         let mut norm = alloc::vec![0.0f32; m * dim];
-        let mut q = alloc::vec![0.0f32; m * qdim];
-        let mut k = alloc::vec![0.0f32; m * kv_dim];
-        let mut v = alloc::vec![0.0f32; m * kv_dim];
-        let mut attn_out = alloc::vec![0.0f32; m * ao];
+        let mut q = alloc::vec![0.0f32; m * q_width];
+        let mut k = alloc::vec![0.0f32; m * kv_width];
+        let mut v = alloc::vec![0.0f32; m * kv_width];
+        let mut attn_out = alloc::vec![0.0f32; m * ao_width];
         // One scores row per position, each `pos0 + mi + 1` long — the rows must
         // be separate because every position's attention runs concurrently.
         let mut scores = alloc::vec![0.0f32; m * (pos0 + m)];
@@ -803,6 +885,26 @@ impl<'a> Model<'a> {
         // Embeddings for all positions.
         for (mi, &tok) in prompt.iter().enumerate() {
             dequant_embed_row(self.token_embd, tok, &mut hidden[mi * dim..(mi + 1) * dim]);
+        }
+        // Gemma scales embeddings by sqrt(dim) — same as `forward`, applied to
+        // every position in the window.
+        if c.family == Family::Gemma4 {
+            let es = tensor_sqrtf(dim as f32);
+            hidden.iter_mut().for_each(|x| *x *= es);
+        }
+        // Gemma E-series per-layer inputs, one row of `E*n_layer` per position.
+        // Derived from the *scaled* embedding, so this follows the scale above.
+        let ple_e = c.swa.map(|w| w.n_embd_per_layer).unwrap_or(0);
+        let el = ple_e * c.block_count;
+        let mut ple_all = alloc::vec![0.0f32; m * el];
+        let mut pl_gate = alloc::vec![0.0f32; ple_e];
+        if el > 0 {
+            let mut scaled = alloc::vec![0.0f32; dim];
+            for mi in 0..m {
+                scaled.copy_from_slice(&hidden[mi * dim..(mi + 1) * dim]);
+                self.per_layer_inputs(prompt[mi], &scaled, s);
+                ple_all[mi * el..(mi + 1) * el].copy_from_slice(&s.ple[..el]);
+            }
         }
 
         // Phase timing: see `prefill_phases`. `t` is advanced at every boundary
@@ -826,9 +928,28 @@ impl<'a> Model<'a> {
                     t = phase_mark(&PHASE_ATTN, t);
                     self.batched_proj(o_w, &attn_out, &mut proj_out, &mut xq, &mut xs, m, dim, ao);
                 }
-                // The window path is never taken for Gemma (see `Model::load`
-                // sets `batched` false there), so this arm cannot be reached.
-                LayerKind::GemmaAttn { .. } => unreachable!("gemma never takes the batched-prefill path"),
+                // Gemma: per-layer geometry (a sliding layer's `head_dim` is not
+                // a global layer's), and V is the *pre-norm, pre-RoPE* K on
+                // global layers, which is why the copy happens here rather than
+                // inside the core — exactly the order `gemma_attn_layer` uses.
+                LayerKind::GemmaAttn { q: q_w, k: k_w, v: v_w, o: o_w, n_kv, head_dim, .. } => {
+                    let (q_w, k_w, v_w, o_w, n_kv, ghd) =
+                        (*q_w, *k_w, *v_w, *o_w, *n_kv, *head_dim);
+                    let gkv = n_kv * ghd;
+                    let gao = nq * ghd;
+                    self.batched_proj(q_w, &norm, &mut q, &mut xq, &mut xs, m, gao, dim);
+                    self.batched_proj(k_w, &norm, &mut k, &mut xq, &mut xs, m, gkv, dim);
+                    match v_w {
+                        Some(vw) => self.batched_proj(vw, &norm, &mut v, &mut xq, &mut xs, m, gkv, dim),
+                        None => v[..m * gkv].copy_from_slice(&k[..m * gkv]),
+                    }
+                    t = phase_mark(&PHASE_PROJ, t);
+                    self.gemma_attn_core_batched(
+                        l, pos0, m, &mut q, &mut k, &mut v, cache, &mut scores, &mut attn_out,
+                    );
+                    t = phase_mark(&PHASE_ATTN, t);
+                    self.batched_proj(o_w, &attn_out, &mut proj_out, &mut xq, &mut xs, m, dim, gao);
+                }
                 LayerKind::Delta { qkv: qkv_w, gate: gate_w, alpha: alpha_w, beta: beta_w, out: out_w, .. } => {
                     let (qkv_w, gate_w, alpha_w, beta_w, out_w) = (*qkv_w, *gate_w, *alpha_w, *beta_w, *out_w);
                     self.batched_proj(qkv_w, &norm, &mut qkv, &mut xq, &mut xs, m, conv_dim, dim);
@@ -844,6 +965,12 @@ impl<'a> Model<'a> {
                 }
             }
             t = phase_mark(&PHASE_PROJ, t);
+            // Gemma sandwich: normalize the block output before its residual.
+            if let Some(w) = self.layers[l].post_attn_norm {
+                for mi in 0..m {
+                    tensor::rmsnorm_inplace(&mut proj_out[mi * dim..(mi + 1) * dim], w, c.rms_eps);
+                }
+            }
             // Residual after the attn/delta block.
             for i in 0..m * dim {
                 hidden[i] += proj_out[i];
@@ -857,14 +984,53 @@ impl<'a> Model<'a> {
             self.batched_proj(self.layers[l].ffn_gate, &norm, &mut ffn_gate, &mut xq, &mut xs, m, ffn, dim);
             self.batched_proj(self.layers[l].ffn_up, &norm, &mut ffn_up, &mut xq, &mut xs, m, ffn, dim);
             t = phase_mark(&PHASE_PROJ, t);
-            for i in 0..m * ffn {
-                ffn_act[i] = tensor::silu(ffn_gate[i]) * ffn_up[i];
+            match c.family {
+                // Gemma is GELU-gated, not SwiGLU. Same elementwise shape, so
+                // the batched form is the per-position one over `m * ffn`.
+                Family::Gemma4 => tensor::gelu_mul(&ffn_gate, &ffn_up, &mut ffn_act),
+                _ => {
+                    for i in 0..m * ffn {
+                        ffn_act[i] = tensor::silu(ffn_gate[i]) * ffn_up[i];
+                    }
+                }
             }
             t = phase_mark(&PHASE_ELEM, t);
             self.batched_proj(self.layers[l].ffn_down, &ffn_act, &mut proj_out, &mut xq, &mut xs, m, dim, ffn);
             t = phase_mark(&PHASE_PROJ, t);
+            if let Some(w) = self.layers[l].ffn_post_norm {
+                for mi in 0..m {
+                    tensor::rmsnorm_inplace(&mut proj_out[mi * dim..(mi + 1) * dim], w, c.rms_eps);
+                }
+            }
             for i in 0..m * dim {
                 hidden[i] += proj_out[i];
+            }
+            // Gemma E-series per-layer-embedding block, per position. Its two
+            // matrices are F32/BF16, neither of which has a batched kernel, so a
+            // position-at-a-time loop costs exactly what `batched_proj` would
+            // have fallen back to anyway.
+            if el > 0 {
+                for mi in 0..m {
+                    let off = mi * dim;
+                    let ple_l = &ple_all[mi * el + l * ple_e..mi * el + (l + 1) * ple_e];
+                    // `proj_out` was just folded into `hidden`, so its row is free
+                    // and doubles as this block's output scratch.
+                    self.per_layer_block(
+                        l,
+                        &mut hidden[off..off + dim],
+                        ple_l,
+                        &mut pl_gate,
+                        &mut proj_out[off..off + dim],
+                        &mut xq,
+                        &mut xs,
+                    );
+                }
+            }
+            t = phase_mark(&PHASE_ELEM, t);
+            // Gemma per-layer output scalar (scales the whole stream).
+            if self.layers[l].out_scale != 1.0 {
+                let os = self.layers[l].out_scale;
+                hidden.iter_mut().for_each(|x| *x *= os);
             }
             t = phase_mark(&PHASE_ELEM, t);
         }
@@ -874,6 +1040,21 @@ impl<'a> Model<'a> {
         tensor::rmsnorm(&hidden[last * dim..(last + 1) * dim], self.output_norm, c.rms_eps, &mut s.norm);
         let out_w = self.output.unwrap_or(self.token_embd);
         matvec_qw(out_w, &s.norm, &mut s.logits, &mut s.xq, &mut s.xs, self.vocab, dim);
+        // Gemma final-logit softcap + suppressed-token bias — the same tail
+        // `forward` applies. Omitting it here would make the first sampled token
+        // after a batched prefill come from an uncapped distribution while every
+        // later one is capped.
+        if let Some(swa) = c.swa {
+            if swa.logit_softcap != 0.0 {
+                let cap = swa.logit_softcap;
+                s.logits.iter_mut().for_each(|x| *x = cap * tensor::tanhf(*x / cap));
+            }
+        }
+        for &id in &self.gguf.suppress_tokens {
+            if let Some(lg) = s.logits.get_mut(id as usize) {
+                *lg = f32::NEG_INFINITY;
+            }
+        }
         cache.positions = cache.positions.max(pos0 + m);
     }
 
@@ -990,6 +1171,12 @@ impl<'a> Model<'a> {
             let es = tensor_sqrtf(dim as f32);
             s.hidden.iter_mut().for_each(|x| *x *= es);
         }
+        // Per-layer inputs are derived from the *scaled* embedding, so this must
+        // follow the scale above and precede the layer loop.
+        if !s.ple.is_empty() {
+            let scaled = s.hidden.clone();
+            self.per_layer_inputs(token, &scaled, s);
+        }
 
         for l in 0..self.layers.len() {
             let ly = &self.layers[l];
@@ -1024,6 +1211,14 @@ impl<'a> Model<'a> {
             }
             for i in 0..dim {
                 s.hidden[i] = s.residual[i] + s.proj[i];
+            }
+            // Gemma E-series per-layer-embedding block: after the FFN residual,
+            // before the layer scalar (llama.cpp `gemma4.cpp` order).
+            if !s.ple.is_empty() {
+                let e = s.pl_gate.len();
+                // Disjoint field borrows: `ple` is read, the rest are scratch.
+                let State { hidden, ple, pl_gate, proj, xq, xs, .. } = s;
+                self.per_layer_block(l, hidden, &ple[l * e..(l + 1) * e], pl_gate, proj, xq, xs);
             }
             // Gemma per-layer output scalar (scales the whole stream).
             if ly.out_scale != 1.0 {
@@ -1352,13 +1547,266 @@ impl<'a> Model<'a> {
         unsafe { crate::arch::parallel_for(m, 1, positions, &mut ctx as *mut Ctx as *mut u8) };
     }
 
+    /// Window-wide Gemma-4 attention: the batched twin of [`Self::gemma_attn_core`],
+    /// fanning out over **positions** (each `(position, head)` is independent once
+    /// the window's K/V exist). Decode enters it as a one-position window so the
+    /// two paths cannot drift.
+    ///
+    /// **The sliding ring forces read-before-commit.** A local layer keeps a fixed
+    /// `W`-slot ring, so slot `t % W` is shared by `t` and `t - W` — and `t - W`
+    /// is *inside* the window of the earliest position in this chunk for any
+    /// `m >= 2`. Committing the window's K/V up front (what the Qwen path does,
+    /// safely, because its cache is append-only) would therefore overwrite history
+    /// that positions in this very chunk still have to attend to, and the damage
+    /// grows with chunk size — fluent output that quietly loses the oldest `m`
+    /// tokens of context. So attention reads history from the **cache** for
+    /// `t < pos0` and the in-flight window from the **chunk buffers** for
+    /// `t >= pos0`, and the ring is written only afterwards.
+    #[cfg(target_arch = "aarch64")]
+    fn gemma_attn_core_batched(
+        &self,
+        l: usize,
+        pos0: usize,
+        m: usize,
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &mut [f32],
+        cache: &mut Cache,
+        scores: &mut [f32],
+        out: &mut [f32],
+    ) {
+        let c = &self.config;
+        let (q_norm, k_norm, n_kv, hd, window, rope_base, freq_factors) = match &self.layers[l].kind {
+            LayerKind::GemmaAttn { q_norm, k_norm, n_kv, head_dim, window, rope_base, freq_factors, .. } => {
+                (*q_norm, *k_norm, *n_kv, *head_dim, *window, *rope_base, *freq_factors)
+            }
+            _ => unreachable!(),
+        };
+        let nq = c.head_count;
+        let kv_dim = n_kv * hd;
+        let ao = nq * hd;
+        let group = nq / n_kv;
+
+        // Per-head norms + full-dim RoPE, per position. Order-independent: a
+        // position's rotation depends only on its own absolute index. V takes a
+        // bare (unweighted) RMS and is never roped.
+        for mi in 0..m {
+            let pos = pos0 + mi;
+            for h in 0..nq {
+                let qh = &mut q[mi * ao + h * hd..mi * ao + (h + 1) * hd];
+                tensor::rmsnorm_inplace(qh, q_norm, c.rms_eps);
+                tensor::rope_ext(qh, pos, hd, rope_base, freq_factors);
+            }
+            for h in 0..n_kv {
+                let kh = &mut k[mi * kv_dim + h * hd..mi * kv_dim + (h + 1) * hd];
+                tensor::rmsnorm_inplace(kh, k_norm, c.rms_eps);
+                let vh = &mut v[mi * kv_dim + h * hd..mi * kv_dim + (h + 1) * hd];
+                rms_scale(vh, c.rms_eps);
+                tensor::rope_ext(kh, pos, hd, rope_base, freq_factors);
+            }
+        }
+
+        /// Shared, immutable view for the fan-out. `kc`/`vc` are the committed
+        /// cache (history only, `t < pos0`); `kb`/`vb` are this window's rows.
+        struct Ctx {
+            q: *const f32,
+            kc: *const f32,
+            vc: *const f32,
+            kb: *const f32,
+            vb: *const f32,
+            scores: *mut f32,
+            out: *mut f32,
+            pos0: usize,
+            nq: usize,
+            hd: usize,
+            kv_dim: usize,
+            group: usize,
+            ao: usize,
+            sl: usize,
+            /// Ring length for a sliding layer, or 0 for a full-history global
+            /// layer (whose cache is indexed by absolute `t`).
+            ring: usize,
+        }
+        /// # Safety
+        /// `ctx` is the live `Ctx` published below; `[start, end)` is a range of
+        /// positions disjoint from every other worker's, so the `scores`/`out`
+        /// rows written here are touched by no one else.
+        unsafe fn positions(start: usize, end: usize, ctx: *mut u8) {
+            // SAFETY: the caller passes the `Ctx` published below.
+            let c = unsafe { &*(ctx as *const Ctx) };
+            // Offset of time `t`'s K/V row, and which buffer it lives in.
+            let row = |t: usize, kvh: usize| -> (bool, usize) {
+                if t >= c.pos0 {
+                    (true, (t - c.pos0) * c.kv_dim + kvh * c.hd)
+                } else if c.ring != 0 {
+                    (false, (t % c.ring) * c.kv_dim + kvh * c.hd)
+                } else {
+                    (false, t * c.kv_dim + kvh * c.hd)
+                }
+            };
+            for mi in start..end {
+                let pos = c.pos0 + mi;
+                // A sliding layer attends only over its window.
+                let t_lo = if c.ring != 0 { (pos + 1).saturating_sub(c.ring) } else { 0 };
+                let n = pos + 1 - t_lo;
+                // SAFETY: this worker owns position `mi`, and `sl >= n`.
+                let sc = unsafe { core::slice::from_raw_parts_mut(c.scores.add(mi * c.sl), n) };
+                for h in 0..c.nq {
+                    let kvh = h / c.group;
+                    // SAFETY: `q` holds `m` rows of `ao`; head `h` is `hd` wide.
+                    let q_head =
+                        unsafe { core::slice::from_raw_parts(c.q.add(mi * c.ao + h * c.hd), c.hd) };
+                    for t in t_lo..=pos {
+                        let (in_win, off) = row(t, kvh);
+                        let base = if in_win { c.kb } else { c.kc };
+                        // SAFETY: `off` is in range for the buffer `in_win` picked
+                        // — the window holds `m` rows, the cache at least `pos0`.
+                        let k_t = unsafe { core::slice::from_raw_parts(base.add(off), c.hd) };
+                        sc[t - t_lo] = tensor::dot_f32(q_head, k_t);
+                    }
+                    // Scale 1.0: Gemma-4's QK-norms replace the 1/sqrt(d).
+                    tensor::softmax(sc);
+                    // SAFETY: this worker owns position `mi`'s `out` row.
+                    let o = unsafe {
+                        core::slice::from_raw_parts_mut(c.out.add(mi * c.ao + h * c.hd), c.hd)
+                    };
+                    o.iter_mut().for_each(|x| *x = 0.0);
+                    for t in t_lo..=pos {
+                        let (in_win, off) = row(t, kvh);
+                        let base = if in_win { c.vb } else { c.vc };
+                        // SAFETY: as above, for V.
+                        let v_t = unsafe { core::slice::from_raw_parts(base.add(off), c.hd) };
+                        let w = sc[t - t_lo];
+                        for i in 0..c.hd {
+                            o[i] += w * v_t[i];
+                        }
+                    }
+                }
+            }
+        }
+
+        let ring = window.unwrap_or(0);
+        let mut ctx = Ctx {
+            q: q.as_ptr(),
+            kc: cache.attn_k[l].as_ptr(),
+            vc: cache.attn_v[l].as_ptr(),
+            kb: k.as_ptr(),
+            vb: v.as_ptr(),
+            scores: scores.as_mut_ptr(),
+            out: out.as_mut_ptr(),
+            pos0,
+            nq,
+            hd,
+            kv_dim,
+            group,
+            ao,
+            sl: pos0 + m,
+            ring,
+        };
+        // SAFETY: `positions` is safe on disjoint position ranges sharing `ctx`,
+        // which lives until `parallel_for` returns.
+        unsafe { crate::arch::parallel_for(m, 1, positions, &mut ctx as *mut Ctx as *mut u8) };
+
+        // Commit the window now that every position has read the history it
+        // needed (see the read-before-commit note above).
+        match window {
+            Some(w) => {
+                for mi in 0..m {
+                    let slot = ((pos0 + mi) % w) * kv_dim;
+                    cache.attn_k[l][slot..slot + kv_dim]
+                        .copy_from_slice(&k[mi * kv_dim..(mi + 1) * kv_dim]);
+                    cache.attn_v[l][slot..slot + kv_dim]
+                        .copy_from_slice(&v[mi * kv_dim..(mi + 1) * kv_dim]);
+                }
+            }
+            None => {
+                cache.attn_k[l].extend_from_slice(&k[..m * kv_dim]);
+                cache.attn_v[l].extend_from_slice(&v[..m * kv_dim]);
+            }
+        }
+    }
+
+    /// Gemma E-series **per-layer inputs** for one token (llama.cpp
+    /// `build_inp_per_layer` + `project_per_layer_inputs`): writes `E*n_layer`
+    /// floats, layer `il`'s slice being `out[il*E..(il+1)*E]`.
+    ///
+    /// Two terms are summed and halved: the token's row of a second,
+    /// per-layer embedding table (scaled by `sqrt(E)`), and a projection of the
+    /// *already sqrt(dim)-scaled* input embedding (scaled by `1/sqrt(dim)`, then
+    /// RMS-normed per layer). The `1/sqrt(2)` is the reference's
+    /// `per_layer_input_scale` — it is what makes the sum an average rather than
+    /// a doubling, and dropping it silently doubles every layer's injected
+    /// signal.
+    fn per_layer_inputs(&self, token: usize, scaled_embd: &[f32], s: &mut State) {
+        let c = &self.config;
+        let e = match c.swa.map(|w| w.n_embd_per_layer).unwrap_or(0) {
+            0 => return,
+            e => e,
+        };
+        let (tok_w, proj_w, norm_w) = match (self.pl_tok_embd, self.pl_model_proj, self.pl_proj_norm) {
+            (Some(a), Some(b), Some(n)) => (a, b, n),
+            _ => return,
+        };
+        let el = e * c.block_count;
+        // Term 1: the per-layer embedding row for this token.
+        let mut ple = alloc::vec![0.0f32; el];
+        dequant_embed_row(tok_w, token, &mut ple);
+        let ts = tensor_sqrtf(e as f32);
+        ple.iter_mut().for_each(|x| *x *= ts);
+        // Term 2: project the scaled input embedding, then RMS-norm per layer.
+        let out = &mut s.ple[..el];
+        matvec_qw(proj_w, scaled_embd, out, &mut s.xq, &mut s.xs, el, c.embedding_length);
+        let ps = 1.0 / tensor_sqrtf(c.embedding_length as f32);
+        out.iter_mut().for_each(|x| *x *= ps);
+        for il in 0..c.block_count {
+            tensor::rmsnorm_inplace(&mut out[il * e..(il + 1) * e], norm_w, c.rms_eps);
+        }
+        // Combine. `1/sqrt(2)`, not `1/2` — the reference scales the sum, and the
+        // two terms are not independent draws.
+        let is = 1.0 / tensor_sqrtf(2.0);
+        for (o, p) in out.iter_mut().zip(ple.iter()) {
+            *o = (*o + *p) * is;
+        }
+    }
+
+    /// The per-layer-embedding block for layer `l`, applied to `x` in place
+    /// after the FFN residual (and before the layer output scalar):
+    /// `x += pl_post_norm(pl_proj @ (gelu(pl_inp_gate @ x) * ple_l))`.
+    /// A no-op on models without the stack.
+    fn per_layer_block(&self, l: usize, x: &mut [f32], ple_l: &[f32], gate: &mut [f32], proj: &mut [f32], xq: &mut [i8], xs: &mut [f32]) {
+        let c = &self.config;
+        let (gate_w, proj_w, post) = match (
+            self.layers[l].pl_inp_gate,
+            self.layers[l].pl_proj,
+            self.layers[l].pl_post_norm,
+        ) {
+            (Some(g), Some(p), Some(n)) => (g, p, n),
+            _ => return,
+        };
+        let e = ple_l.len();
+        let dim = c.embedding_length;
+        let g = &mut gate[..e];
+        matvec_qw(gate_w, x, g, xq, xs, e, dim);
+        for (v, p) in g.iter_mut().zip(ple_l.iter()) {
+            *v = tensor::gelu(*v) * *p;
+        }
+        let o = &mut proj[..dim];
+        matvec_qw(proj_w, g, o, xq, xs, dim, e);
+        tensor::rmsnorm_inplace(o, post, c.rms_eps);
+        for i in 0..dim {
+            x[i] += o[i];
+        }
+    }
+
     fn delta_layer(&self, l: usize, cache: &mut Cache, s: &mut State) {
         let c = &self.config;
         let dim = c.embedding_length;
         let ssm = c.ssm.expect("delta layer requires ssm config");
         let conv_dim = ssm.conv_dim();
         let value_dim = ssm.inner;
-        let nh = ssm.dt_rank; // = n_group; k and v head counts are equal
+        // Value heads. NOT `n_group` — they are equal on the 0.8B/2B but the 4B
+        // has 32 value heads over 16 key/query groups (see `delta_core_batched`).
+        let nh = ssm.dt_rank;
         let (qkv_w, gate_w, alpha_w, beta_w, out_w) = match &self.layers[l].kind {
             LayerKind::Delta { qkv, gate, alpha, beta, out, .. } => (*qkv, *gate, *alpha, *beta, *out),
             _ => unreachable!(),
@@ -1564,7 +2012,15 @@ impl<'a> Model<'a> {
             // SAFETY: `norm_w` is the layer's `hv`-wide DeltaNet norm weight.
             let norm_w = unsafe { core::slice::from_raw_parts(c.norm_w, c.hv) };
             for h in start..end {
-                let g = h % c.n_group; // key/query head (ggml_repeat tiling, per llama.cpp)
+                // Key/query head for value head `h`: tiling (`ggml_repeat`), per
+                // llama.cpp. NB the two candidate mappings are indistinguishable
+                // whenever `n_group == nh` (the 0.8B and the 2B), and the 4B
+                // (n_group 16, dt_rank 32 — ratio 2) is the first model that can
+                // tell them apart: on it, repeat-interleave (`h / g_rep`, what
+                // Qwen3-Next's own Python does) decodes pure gibberish while this
+                // decodes fluent-but-degenerating text. So the mapping is not the
+                // whole story — see the 4B long-context divergence vs llama.cpp.
+                let g = h % c.n_group;
                 // SAFETY: this worker owns head `h`'s `hk*hv` state slice.
                 let sh = unsafe { core::slice::from_raw_parts_mut(c.state.add(h * c.hk * c.hv), c.hk * c.hv) };
                 for mi in 0..c.m {
