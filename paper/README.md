@@ -82,20 +82,27 @@ remembering because each printed a plausible wrong number:
 
 ### Results (filled in §5.1, Table `tab:e1`)
 
-Medians of 5 runs, aarch64/HVF, release, idle host. Full authorization decision
-**1373 ns** (range 1144–1682, ±20%) against 43 ms per decoded token — a ratio of
-**3×10⁻⁵**, i.e. ~31,000 gate crossings per token. Two findings that were not
-expected:
+Medians of 5 runs, aarch64/HVF, release, idle host — each run gated on the load
+average before *and* after, because a competing guest inflated an earlier set by
+60%. Full authorization decision **1045 ns** (range 931–1057, ±7%) against 43 ms
+per decoded token — a ratio of **2.4×10⁻⁵**, i.e. ~41,000 gate crossings per
+token. Before the scope-gate fix below it was 1373 ns (range 1144–1682, ±20%).
+Two findings that were not expected:
 
-- **The fine-grained gate dominates.** Scope is ~934 ns (68% of the decision);
-  capability and taint are both *below the noise floor*. Against a task with no
-  ledger entry the same call is 832 ns, so ~540 ns is the ledger walk + glob for
-  a **single-entry** ledger and ~390 ns is building the normalized target. Both
-  are heap allocations in the one gate that runs on every path — fixable
-  (borrow the normalized path; compare a one-entry ledger without constructing a
-  `Scope`), and written up as a limitation rather than hidden.
+- **The fine-grained gate dominates.** Scope is ~580 ns (56% of the decision);
+  taint is *below the noise floor*, capability is ~84 ns. Against a task with no
+  ledger entry the same call is 862 ns, so ~183 ns is the ledger walk + glob for
+  a **single-entry** ledger and ~400 ns is building the normalized target.
+  **The first diagnosis was wrong in an instructive way**: it was not "an
+  allocation" but a *duplicated* one — `glob_covers` re-normalised both sides on
+  every ledger entry, so a constant grant was re-canonicalised on every call
+  forever and the target, already normalised by the executor, was normalised
+  again. Borrowing an already-canonical path (`vpath::normalize_cow`, with a test
+  asserting the fast and slow paths agree on every input) took the ledger walk
+  from ~540 ns to ~183 ns. The throwaway `Scope` per call remains, and is a
+  change to the capability type rather than to the gate.
 - **Recording the decision costs as much as making it.** One audit append is
-  ~966 ns, 71% of the whole gate chain: a `Vec` push under a lock plus the
+  ~713 ns, 68% of the whole gate chain: a `Vec` push under a lock plus the
   field-by-field comparison the ktrace coalescer does per record.
 
 Not measured on **x86** — the only x86 target here is QEMU TCG, where the figure

@@ -715,10 +715,10 @@ real UEFI hardware.
 
 The mechanism this paper describes --- registry, grammar, executor, capability
 table and scope ledger, path normalization, provenance, object store, audit ---
-is \textbf{2{,}389 lines excluding its own tests}, against the $\sim$178{,}000
+is \textbf{2{,}671 lines excluding its own tests}, against the $\sim$178{,}000
 above. We report the non-test figure deliberately: it is the
 code that has to be right for the argument to hold, so counting the tests
-alongside it (which would give $\sim$3{,}000) inflates the number that matters
+alongside it (which would give 3{,}240) inflates the number that matters
 in the direction that flatters us. Either way the claim is the ratio: the
 security argument does not depend on the correctness of the 98\% of the system
 that sits below or beside it --- the drivers, the filesystems, the network
@@ -768,7 +768,7 @@ engine that would occupy the ``Model'' slot on a model-loaded boot.}
 \paragraph{Testing posture.} Two layers, and the split reflects the
 determinism boundary itself. Pure logic --- grammar, provenance algebra,
 capability and scope arithmetic, path normalization, registry invariants --- is
-covered by 1{,}204 in-kernel unit tests runnable without a model or hardware.
+covered by 1{,}203 in-kernel unit tests that run without a model or hardware (1{,}226 are declared; the difference is aarch64-gated and does not run in the x86 suite).
 Anything that exists only on a running system is covered by an end-to-end
 harness that boots the real kernel under QEMU and drives the shell over
 serial. The gate logic is in the first category by construction, which is a
@@ -850,10 +850,10 @@ floor of the thing it guards, and there is no security/performance tradeoff
 here to argue about.
 
 \textbf{Result} (Table~\ref{tab:e1}). The full decision costs
-$\mathbf{1.37\,\mu s}$ (median of 5 runs; range 1.14--1.68\,$\mu$s), against
+$\mathbf{1.05\,\mu s}$ (median of 5 runs; range 0.93--1.06\,$\mu$s), against
 43\,ms to decode one token at the measured 23\,tok/s. The boundary is therefore
-$\mathbf{3\times10^{-5}}$ of a token: the system could cross it roughly 31{,}000
-times per token generated. The hypothesis is confirmed in the only sense that
+$\mathbf{2.4\times10^{-5}}$ of a token: the system could cross it roughly
+41{,}000 times per token generated. The hypothesis is confirmed in the only sense that
 matters --- the ratio --- and refuted in its detail: the decision is
 microseconds, not hundreds of nanoseconds, and \S\ref{sec:limits-cost} says
 where the microsecond goes. The conclusion is insensitive to that, which is the
@@ -861,19 +861,33 @@ useful property: the argument survives the cost being wrong by a factor of ten
 in either direction.
 
 Two results were not anticipated. First, \emph{the fine-grained gate dominates}:
-the scope check is $\sim$930\,ns, about 68\% of the decision and more than twice
-the other three gates combined, while capability and taint are at or below this
-method's noise floor (a table scan and a boolean, respectively --- they cost
-nothing measurable). Second, \emph{recording the decision costs about as much as
-making it}: one audit append is $\sim$970\,ns, 71\% of the gate chain. Neither
-threatens the ratio, but both say the same thing about where effort should go if
-this path ever becomes hot.
+the scope check is $\sim$580\,ns, about 56\% of the decision and more than the
+other three gates combined, while taint stays at or below this method's noise
+floor (it is a boolean). Second, \emph{recording the decision costs about as
+much as making it}: one audit append is $\sim$713\,ns, 68\% of the gate chain.
+Neither threatens the ratio, but both say the same thing about where effort
+should go if this path ever becomes hot.
+
+These are the second measurement. The first put the scope gate at 68\% and the
+whole decision at 1.37\,$\mu$s, and profiling it found that the glob comparison
+re-normalised \emph{both} paths on every ledger entry --- so a constant grant was
+re-canonicalised on every call for the life of the system, and the target, already
+normalised by the executor, was normalised again. Borrowing an
+already-canonical path (\S\ref{sec:limits-cost}) removed that: the ledger walk
+fell from $\sim$540\,ns to $\sim$183\,ns and the decision from 1.37 to
+1.05\,$\mu$s. We report both numbers because the first one is what the paper
+would have claimed, and because the residue is the more interesting half: the
+$\sim$400\,ns still spent before any comparison happens is a throwaway target
+object built per call, which is a design choice rather than an accident.
 
 \textbf{Status.} Measured on aarch64 under HVF at release profile
-(model-less guest, 8 vCPU, Apple silicon), 5 runs. \textbf{Not} measured on x86:
+(model-less guest, 8 vCPU, Apple silicon), 5 runs on an otherwise idle host ---
+a competing guest inflated an earlier attempt by 60\%, so each run here is gated
+on the host's load average before and after it. \textbf{Not} measured on x86:
 the only x86 target available here is QEMU TCG, where an emulated figure would be
 meaningless, so that row needs real hardware or KVM. Run-to-run variance is
-$\pm$20\%, from hypervisor scheduling and allocator state; we report medians and
+$\pm$7\% on an idle host (it was $\pm$20\% before the load gating), from
+hypervisor scheduling and allocator state; we report medians and
 the full range rather than a single best number, and no conclusion here turns on
 a factor of two.
 
@@ -885,12 +899,12 @@ numbers also demonstrates that each gate is the one stopping its own case.
 \centering
 \includegraphics[width=\linewidth]{figures/fig_cost.pdf}
 \caption{E1. \textbf{Left:} the authorization decision decomposed into its
-gates. The fine-grained gate dominates --- scope is 68\% of the total, and it is
-the only gate that allocates --- while capability and taint are at or below the
-method's noise floor. One audit append costs almost as much as the entire
-decision it records. \textbf{Right:} whether any of that matters. The decision
-is $3\times10^{-5}$ of the cost of decoding one token, so the boundary could be
-crossed roughly 31{,}000 times per token generated. Two panels rather than two
+gates. The fine-grained gate dominates --- scope is 56\% of the total, and it is
+the only gate that allocates --- while taint is at or below the method's noise
+floor. One audit append costs almost as much as the entire decision it records.
+\textbf{Right:} whether any of that matters. The decision is
+$2.4\times10^{-5}$ of the cost of decoding one token, so the boundary could be
+crossed roughly 41{,}000 times per token generated. Two panels rather than two
 y-axes: the measures are five orders of magnitude apart, and the ratio is stated
 rather than implied by geometry.}
 \label{fig:cost}
@@ -903,20 +917,20 @@ rather than implied by geometry.}
 \toprule
 \textbf{Measured} & \textbf{ns/call} & \textbf{ticks} & \textbf{Note} \\
 \midrule
-Gate 1 grammar (marginal)        & 435  & 10 & parse + typed args of a 60-byte call \\
-Gate 2 capability (marginal)     & $<$20 & --- & below noise floor; a table scan \\
+Gate 1 grammar (marginal)        & 378  & 9 & parse + typed args of a 60-byte call \\
+Gate 2 capability (marginal)     & 84   & 2 & a table scan \\
 Gate 3 taint (marginal)          & $<$20 & --- & below noise floor; flag $\wedge$ integrity \\
-Gate 4 scope (marginal)          & 934  & 22 & normalize + build target + ledger walk \\
+Gate 4 scope (marginal)          & 580  & 14 & build target + ledger walk \\
 \midrule
-\textbf{Full authorization decision} & \textbf{1373} & 32 & all four, target in scope \\
-\quad with no scope ledger       & 832  & 20 & deny-only-when-recorded: the common path \\
-\quad refused at gate 1 (malformed) & 72   & 2  & cheapest path: dies at the first bad byte \\
-\quad refused at gate 2 (no capability) & 992  & 24 & \\
-\quad refused at gate 3 (tainted) & 1053 & 25 & \\
-\quad refused at gate 4 (out of scope) & 1465 & 35 & \\
+\textbf{Full authorization decision} & \textbf{1045} & 25 & all four, target in scope \\
+\quad with no scope ledger       & 862  & 21 & deny-only-when-recorded: the common path \\
+\quad refused at gate 1 (malformed) & 60   & 1  & cheapest path: dies at the first bad byte \\
+\quad refused at gate 2 (no capability) & 977  & 24 & \\
+\quad refused at gate 3 (tainted) & 916 & 22 & \\
+\quad refused at gate 4 (out of scope) & 1007 & 24 & \\
 \midrule
-Argument hash (FNV-1a, 60 B)     & 69   & 2  & computed before gate 1 \\
-Audit append (one record)        & 966  & 23 & \\
+Argument hash (FNV-1a, 60 B)     & 63   & 2  & computed before gate 1 \\
+Audit append (one record)        & 713  & 17 & \\
 \midrule
 One decoded token (reference)    & $4.3\times10^{7}$ & --- & 0.8B Q8, 23\,tok/s, \code{/perf} \\
 \bottomrule
@@ -1520,39 +1534,38 @@ structural fix and remains undone.
 
 \paragraph{The microsecond is allocation, and it is in the wrong gate.}
 \label{sec:limits-cost}
-E1 puts $\sim$68\% of the authorization decision in the scope gate, and the
+E1 puts $\sim$56\% of the authorization decision in the scope gate, and the
 breakdown says why: against a task with \emph{no} ledger entry the same call
-costs 832\,ns rather than 1373, so roughly 540\,ns is the ledger walk and glob
-match \emph{for a single-entry ledger}, and most of the remaining 390\,ns is
-building the target --- the path is normalized into a fresh string and wrapped in
-a fresh \code{Scope} before anything is compared. Both are allocations on a
-first-fit kernel heap, in the one gate that runs per call on every path. Nothing
-here is required by the design: a normalized path could be borrowed rather than
-allocated, and a single-entry ledger could be compared without constructing a
-scope object at all. We report it because the shape is worth stating plainly ---
-\emph{the cheap gates are the coarse ones} (capability is a table scan, taint is
-a boolean; both are unmeasurable here), and the cost is concentrated in the only
-gate that reasons about a concrete resource. A design that pushed further toward
-fine-grained authority --- per-value provenance, as \S\ref{sec:limits} argues it
-should --- should expect to pay there, and should not assume the total stays in
-the noise merely because it does today.
+costs 862\,ns rather than 1045, so roughly 183\,ns is the ledger walk and glob
+match \emph{for a single-entry ledger}, and roughly 400\,ns more is building the
+target --- the path is normalized into a fresh string and wrapped in a fresh
+\code{Scope} before anything is compared. Both are allocations on a first-fit
+kernel heap, in the one gate that runs per call on every path.
 
-One half of that is now fixed and the figures above do not yet reflect it. The
-duplicated work was worse than ``an allocation'': the glob comparison normalised
-\emph{both} sides on every ledger entry it examined, so a constant grant was
-re-normalised on every call forever and the target --- already normalised by the
-executor --- was normalised again. Normalisation is load-bearing (it is what
-stops \code{/agent/7/../../etc} being covered by a grant of
-\code{/agent/7/**}), so the fix is to notice when a path is already canonical
-and borrow it, pinned by a test asserting the fast and slow paths agree on every
-input including the escaping ones. \textbf{The E1 numbers quoted here were taken
-before that change and have not been re-taken}; they are an upper bound on the
-shipped code rather than a measurement of it, and re-measuring needs an idle
-machine (\S\ref{sec:e1} explains why a loaded host makes this figure
-meaningless). Constructing a throwaway \code{Scope} per call remains.
+Half of that is now fixed, and the half that is worth reporting is how wrong the
+first diagnosis was. It was not ``an allocation'': the glob comparison
+normalised \emph{both} sides on every ledger entry it examined, so a constant
+grant such as \code{/agent/7/**} was re-canonicalised on every call for the life
+of the system, and the target --- already normalised by the executor --- was
+normalised a second time. Normalisation is load-bearing (it is what stops
+\code{/agent/7/../../etc} being covered by that grant), so the fix is not to
+skip it but to notice when a path is already canonical and borrow it, with a
+test asserting the fast and slow paths agree on every input including the
+escaping ones. The ledger walk fell from $\sim$540\,ns to $\sim$183\,ns.
+
+What remains is the throwaway target object, and it is a design choice rather
+than an oversight: the gate takes an owned \code{Scope} because the granted side
+must be owned, and giving the checked side a borrowed form is a change to the
+capability type rather than to the gate. We report it because the shape is worth
+stating plainly --- \emph{the cheap gates are the coarse ones} (capability is a
+table scan at $\sim$84\,ns, taint a boolean below the noise floor), and the cost
+is concentrated in the only gate that reasons about a concrete resource. A design
+that pushed further toward fine-grained authority --- per-value provenance, as
+\S\ref{sec:limits} argues it should --- should expect to pay there, and should
+not assume the total stays in the noise merely because it does today.
 
 The same measurement makes an odd observation about the audit log: appending one
-record ($\sim$970\,ns) costs about as much as the entire decision it records.
+record ($\sim$713\,ns) costs about as much as the entire decision it records.
 That is a Vec push under a lock plus the field-by-field comparison the ktrace
 coalescer does to decide whether this entry repeats the last one. It is fixable
 and unfixed.

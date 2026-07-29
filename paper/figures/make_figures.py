@@ -86,21 +86,26 @@ plt.rcParams.update({
 
 # --- measured data ----------------------------------------------------------
 DATA = {
-    # E1, medians of 5 runs, aarch64/HVF release. Marginal cost per gate (ns).
-    "gates": [("grammar", 435), ("capability", 4), ("taint", 0), ("scope", 934)],
-    "decision_ns": 1373,
-    "audit_ns": 966,
-    "hash_ns": 69,
-    "noledger_ns": 832,
+    # E1, medians of 5 runs, aarch64/HVF release, on an *idle* host: each run is
+    # gated on the load average before and after, because a competing guest
+    # inflated an earlier set by 60%. Marginal cost per gate (ns).
+    # These are the post-fix numbers; before the scope gate stopped re-normalising
+    # both sides per ledger entry they were grammar 435 / scope 934 / decision 1373.
+    "gates": [("grammar", 378), ("capability", 84), ("taint", 3), ("scope", 580)],
+    "decision_ns": 1045,
+    "audit_ns": 713,
+    "hash_ns": 63,
+    "noledger_ns": 862,
     "decode_token_ns": 43_478_261,  # 23 tok/s
     "prefill_token_ns": 9_523_810,  # 105 tok/s
-    # E2/E4: attacks (n=12) by outcome, per configuration.
+    # E2/E4: attacks (n=13) by outcome, per configuration.
     # `eff` = permitted AND the effect then happened. The gap is attacks the policy
     # allowed that failed for a reason which is not a defence (a loopback connect
     # refused; `/http` not being exposed to agents at all). Both numbers are
     # reported because either alone misleads.
     "attacks": {
         "Synapse\n(caps+scope+provenance)": {"eff": 0, "failed": 0, "prov": 11, "scope": 2},
+        "+ human declassified\nthe source": {"eff": 6, "failed": 0, "prov": 4, "scope": 3},
         "Capabilities + scope\n(no provenance)": {"eff": 7, "failed": 3, "prov": 0, "scope": 3},
         "Ambient authority\n(container)": {"eff": 10, "failed": 3, "prov": 0, "scope": 0},
     },
@@ -167,10 +172,10 @@ def fig_cost(path):
     a.set_xlabel("nanoseconds per call (median of 5 runs)")
     a.set_title("Where the decision goes", loc="left", color=INK, pad=6)
     _clean(a)
-    # Two real gates measured below the noise floor. Said out loud, in the empty
+    # One real gate measures below the noise floor. Said out loud, in the empty
     # band between the bars, rather than left as invisible slivers that would
     # imply they were free.
-    a.text(20, 0.52, "capability +4 ns; taint below\nthe method's noise floor",
+    a.text(20, 0.52, "capability +84 ns; taint below\nthe method's noise floor",
            fontsize=6.3, color=MUTED, va="center", linespacing=1.35)
 
     pts = [("authorization decision", DATA["decision_ns"], THROUGH),
@@ -188,7 +193,7 @@ def fig_cost(path):
     b.set_xlabel("nanoseconds (log scale)")
     b.set_title("…and whether it matters", loc="left", color=INK, pad=6)
     _clean(b)
-    b.text(1.1e4, 1.45, r"the decision is $3\times10^{-5}$" "\n" "of one decoded token",
+    b.text(1.1e4, 1.45, r"the decision is $2.4\times10^{-5}$" "\n" "of one decoded token",
            fontsize=7, color=INK, ha="center", va="center")
 
     fig.savefig(path)
@@ -285,9 +290,13 @@ def fig_tradeoff(path):
 
     # Labels are staggered rather than centred over their dots: at 75% and 100% the
     # two baselines sit close enough that centred captions overlap.
+    # The sticky point is the one that moves along BOTH axes: it is the only
+    # configuration a user reaches by choosing, rather than by the designer
+    # removing a mechanism, so it belongs on the same plot as the ablations.
     for label, x, y, dx, dy, ha in (("Synapse", 0.0, 27.3, 5, 6, "left"),
-                                    ("caps + scope,\nno provenance", 75.0, 0.0, -7, 1, "right"),
-                                    ("ambient\nauthority", 100.0, 0.0, 0, 9, "center")):
+                                    ("+ source\ndeclassified", 46.2, 0.0, 0, 6, "center"),
+                                    ("caps + scope,\nno provenance", 76.9, 0.0, 0, 20, "center"),
+                                    ("ambient\nauthority", 100.0, 0.0, -1, 6, "right")):
         ax.plot(x, y, "o", markersize=9, color=THROUGH, zorder=5,
                 markeredgecolor="white", markeredgewidth=1.4)
         ax.text(x + dx, y + dy, label, fontsize=7, color=BODY, ha=ha, va="bottom")
