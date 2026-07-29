@@ -1347,6 +1347,29 @@ and a citation form in every tool schema, which changes what the model must
 emit; shipping the checker alone would be a mechanism with no producer, which is
 a mistake this codebase has already made once (\S\ref{sec:e3b}).
 
+\textbf{What the producer side would cost.} Worth stating, because ``the model
+must emit more'' sounds expensive and mostly is not. A citation is a
+\emph{pointer, not a copy}: it costs the same whether it points at twelve
+characters or a twelve-kilobyte document, and it adds nothing to the context,
+since the cited text is already there. The cost is output tokens on effectful
+calls only. Concretely, adding \code{"cite":[\{"m":0,"s":31,"l":21\}]} to a
+representative delete takes the call from 62 to 93 characters --- around eight
+extra tokens, or $\sim$0.35\,s at the 23\,tok/s this kernel decodes at. That is
+four to five orders of magnitude above the 1\,$\mu$s authorization decision, and
+it is the honest number: on this axis the expensive part of the boundary is what
+the \emph{model} must say, not what the kernel must check.
+
+The sharper risk for a small local model is not latency but capability. Byte
+offsets are arithmetic, and arithmetic is what small models are worst at; a plan
+that miscounts an offset by one is refused, which is safe but useless. The
+mitigation is already implicit in what we measured: our evaluation resolves
+citations by \emph{content} (\code{best\_citation} finds a span containing the
+value), so what the numbers above actually price is a \emph{quote}-shaped
+citation --- the plan repeats the span verbatim and the kernel locates it --- and
+not an offset-shaped one. Quoting costs a few more characters, is equally
+checkable, and asks the model for copying rather than counting. If this ships, it
+should ship as quotes.
+
 \subsection{E4: Comparison against the alternatives}
 \label{sec:e4}
 
@@ -1640,7 +1663,13 @@ are why it is not built. The read set has to be tracked per turn where integrity
 needs only a high-water mark, which is state the current design deliberately does
 not keep. And ``cleared for'' needs a lattice over destinations that somebody has
 to author, where integrity got its lattice for free from where the bytes came
-from.
+from. The authoring problem is smaller than it sounds in the deployment this
+system actually has: egress already goes through a handful of named bindings and
+an agent's manifest already declares the hosts it may reach, so the first useful
+version is not a general lattice but a two-level one --- destinations the
+manifest names at install time, and everything else --- which makes ``a
+confidential read may only leave to somewhere the human already approved for this
+agent'' expressible without inventing a classification scheme.
 
 \paragraph{Human confirmation is a load-bearing human.} The sole declassifier
 is a person at a console, so the design's security depends on that person

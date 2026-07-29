@@ -27,6 +27,18 @@
 //! where a value came from cannot act on it, which is fail-closed by
 //! construction.
 //!
+//! **Offsets here, quotes on the wire.** [`Citation`] is a message index and a
+//! byte range, and [`check`] verifies exactly that. But the evaluation resolves
+//! citations by *content* ([`best_citation`] finds a span containing the value),
+//! so what is actually measured is a **quote**-shaped citation: the plan repeats
+//! the span and the kernel locates it. That is the form to ship, for a reason
+//! that has nothing to do with elegance --- byte offsets are arithmetic, and
+//! arithmetic is what a small local model is worst at. A plan that miscounts an
+//! offset by one gets refused, which is safe and useless. Quoting asks the model
+//! to copy rather than to count, costs a few more characters, and is equally
+//! checkable. The offset form stays because it is the stricter thing to verify
+//! and the two agree on every case the tests cover.
+//!
 //! **What this module is and is not.** It is the policy, pure and testable, and
 //! it is measured as a configuration in `security::redteam` over both attack
 //! corpora and the benign suite. It is **not** on the live path: making it real
