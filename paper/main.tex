@@ -1533,6 +1533,23 @@ loses on and the reason per-call approval is not a mechanism.}
 \label{tab:e4}
 \end{table}
 
+\textbf{The assumption we did not manage to drop.} Assuming persuasion is the
+worst case and it is what makes these numbers model-independent, but it is also
+the assumption most worth questioning, so we built the scenario that does not
+make it: the real chat loop, the real in-kernel model, and the corpus's own
+poisoned document, with the pass condition keyed on the victim file rather than
+on the transcript --- an attempt that is refused passes, no attempt passes, and
+only an attempt that succeeds fails. The scenario runs, fails closed, and is in
+the slow group.
+
+It has not yet produced a number. On our runs the turn did not complete inside
+the harness's budget --- prefill reaches roughly 1{,}300 of 1{,}546 tokens at
+$\sim$100\,tok/s and no reply is observed before the scenario moves on --- so
+what we can honestly report is that the victim file survived, and \emph{not} that
+the model declined the bait. Those are different claims and only the first is
+evidence. An attempt-rate measurement needs a longer budget than we have run, and
+we would rather say so than convert a timeout into a result.
+
 \textbf{Threats to validity.} The corpus is 13 attacks written by the system's
 author: a regression suite over enforcement sites, not a sample from a
 distribution of real attacks. AgentDojo~\cite{debenedetti2024agentdojo} and
