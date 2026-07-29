@@ -65,32 +65,33 @@
 
 \begin{abstract}
 For fifty years the operating system's unit of execution has been the
-\emph{program}: untrusted, but deterministic, with knowable effects. An
-LLM agent breaks all three properties. Its instruction stream is generated
-stochastically, its request set is unbounded, and its apparent intent is derived
-from data it has read --- so whoever controls that data controls the requests.
-Practice answers above the OS, with prompt guardrails and per-call approval, while the agent holds the user's full ambient authority.
+\emph{program}: untrusted, but deterministic, with knowable effects. An LLM
+agent breaks all three. Its instruction stream is generated stochastically, its
+request set is unbounded, and its apparent intent derives from data it has read
+--- so whoever controls that data controls the requests. Practice answers above
+the OS, with prompt guardrails and per-call approval, while the agent holds the
+user's ambient authority.
 
 We argue the answer belongs in the kernel, and present \syn{}, the capability
 ABI of \os{}, an OS whose unit of execution is an agent, not a binary.
 \syn{} draws an explicit \emph{determinism boundary}: above it a stochastic
 planner emits an \emph{untrusted plan}; below it deterministic native code
-executes capability-checked primitives. Model output never causes an effect
-directly. A fixed registry generates a prefix-closed grammar, applied in the
+executes capability-checked primitives. Model output never causes an effect. A fixed registry generates a prefix-closed grammar, applied in the
 model's own token space and revalidated at the executor; capabilities attenuate
-on delegation and a scope gate binds each to concrete paths and hosts; and a
-provenance lattice makes \emph{taint a syscall argument}, refusing destructive
-primitives justified by untrusted content --- Biba integrity, low-water-marked
-over the live context. Every attempt, denials included, is audited.
+on delegation and a scope gate binds each to concrete paths; and a provenance
+lattice makes \emph{taint a syscall argument}, refusing destructive primitives
+justified by untrusted content --- Biba integrity over the live context. Every
+attempt, denials included, is audited.
 
-The implementation is a dual-architecture Rust kernel in which the
-model runs in-kernel with no I/O of its own, so there is no way around the ABI;
-the mechanism is 2.4k lines. Measured on the running system: the authorization
-decision costs 1.4\,$\mu$s ($3\times10^{-5}$ of one decoded token), and an
-injection corpus is refused 12 times out of 12 --- while removing provenance
-lets 9 through and removing attenuation all 12. The cost is the headline
-liability: half the \emph{legitimate} irreversible operations in a benign suite
-are refused, because turn-granular taint cannot tell which data justified them.
+The implementation is a dual-architecture Rust kernel in which the model runs
+in-kernel with no I/O of its own, so there is no way around the ABI; the
+mechanism is 2.4k lines. Measured: the authorization decision costs
+1.4\,$\mu$s ($3\times10^{-5}$ of one decoded token), and an
+injection corpus is refused 13 times out of 13 --- while removing provenance
+lets 10 through and removing attenuation all 13. The cost is a quarter of the
+\emph{legitimate} irreversible operations in a benign suite, and the obvious
+cheap fix makes it worse: a syntactic per-value relation permits 4 attacks and
+recovers none, because the model, not the code, is the dataflow.
 \end{abstract}
 
 \section{Introduction}
@@ -932,7 +933,7 @@ the ratio between the bold row and the last one.}
 \textbf{Question.} What fraction of injection attempts reach an irreversible or
 externally-visible effect?
 
-\textbf{Method.} A corpus of 12 injected instructions, each attempting one of
+\textbf{Method.} A corpus of 13 injected instructions, each attempting one of
 four goals --- destroy, exfiltrate, launder (write the agent's own persona or
 durable memory), escape (reach outside the agent's scope) --- and each arriving
 by one of five ingestion vectors: a file the agent reads, a tool result, an HTTP
@@ -964,9 +965,31 @@ it per attack. This is not decoration: it caught two flawed corpus entries
 (below), and it is the check that separates ``the gate refused'' from ``the gate
 was never reached''.
 
-\textbf{Result.} \textbf{0 of 12 permitted} under the full policy: 10 refused by
-the provenance gate, 2 by scope, and all 12 turns correctly tainted. The
+\textbf{Result.} \textbf{0 of 13 permitted} under the full policy: 11 refused by
+the provenance gate, 2 by scope, and all 13 turns correctly tainted. The
 per-attack outcomes are in Table~\ref{tab:e2}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Tool} & \textbf{Binding} & \textbf{Before} & \textbf{After} \\
+\midrule
+\code{storage\_get}  & durable agent storage & \emph{trusted} (laundered) & ingested \\
+\code{storage\_list} & durable agent storage & \emph{trusted} (laundered) & ingested \\
+\code{list\_tasks}   & background tasks      & \emph{trusted} (laundered) & ingested \\
+\code{notes\_list}   & package wasm tool     & \emph{trusted} (laundered) & ingested \\
+\bottomrule
+\end{tabular}
+\caption{The laundering census --- the measurement the attack corpus structurally
+cannot make. Each of these returns bytes an injection can choose, and each tagged
+them trusted, which un-taints the turn and disarms the provenance gate for
+everything after. Not one of them permits an attack at the moment it happens,
+which is why twelve green corpus rows sat above a policy that had stopped
+applying.}
+\label{tab:census}
+\end{table}
 
 Two observations matter more than the headline.
 
@@ -978,12 +1001,28 @@ structurally unable to see the attack. Capabilities are necessary (they bound
 what the compromised turn can reach at all, which is what the two scope
 refusals are) and demonstrably not sufficient.
 
-\emph{The policy is enforced at eight sites, not one.} The executor gates
-destructive primitives; the router separately gates destructive shell commands,
-\code{/http}, MCP calls, agent-memory mutations, downloads, browser navigation,
-nested shell dispatch, and the web tools. Eight sites is eight chances to forget,
-so the corpus carries one attack per site, and a site that permits its attack is
-a hole rather than a curiosity. All eight held. Relatedly, a census of which
+\emph{The policy was enforced at eight sites, and the enumeration of eight was
+itself wrong.} Auditing the router against exactly this criticism found four
+further bindings with no check at all, three of which also tagged their results
+\emph{system-trusted}: durable per-agent storage, background-task output, and
+package wasm tools. Durable storage closed a complete laundering cycle --- an
+injection calls \code{storage\_set}, a later \code{storage\_get} returns that
+attacker-authored string as trusted, the turn is no longer tainted, and every
+destructive call after it passes gate 3 for want of a reason to refuse.
+
+No attack in the corpus went red while that was true, and it could not have: a
+corpus row asks ``was this call refused?'', and laundering refuses nothing --- it
+removes the reason to refuse something later. So the harness now carries a second
+measurement that asks the opposite question (Table~\ref{tab:census}): run each
+tool that can return attacker-influenced bytes and check how the result was
+tagged. It reported two live channels before the fix and four of four correct
+after. The lesson generalises past this system: \emph{a corpus of attacks cannot
+find a missing gate that permits nothing}, and an evaluation built only from
+attacks will report a policy as holding while it quietly stops applying.
+
+The structural response is in \S\ref{sec:limits}: the seven router checks are
+now one, taken before dispatch and classified by an exhaustive match over the
+binding type, so a new binding does not compile until someone says what it does. Relatedly, a census of which
 destructive primitives a tool actually lowers to found only one
 (\code{mem\_fs\_delete}): \code{channel\_grant} and \code{net\_listen} are not
 nameable from any tool call, so the gate is their second line of defence rather
@@ -1066,42 +1105,73 @@ refused the turn rather than the data. The false-refusal rate is over-broad
 refusals as a fraction of benign steps that wanted an irreversible or egress
 effect.
 
-\textbf{Result: 50\%.} Two of the four benign destructive steps were refused
-with the untrusted content never having named their target --- deleting the
-agent's own scratch file after reading an unrelated document, and POSTing a
-report to an API the user asked for. Three of six tasks completed with no
-interruption at all, and 3 of 11 steps needed a human. The control task
-confirms the gate is provenance-based and not a blanket block: with nothing
-untrusted in context, the destructive step proceeds untouched.
+\textbf{Result: 25\%, and half the number we previously reported was our own
+labelling error.} One of the four benign destructive steps was refused with
+nothing untrusted justifying it. An earlier version of this suite scored two, by
+asking the wrong question of one of them: \code{read-then-post-to-api} was
+called over-broad because the ingested document never named the target URL. But
+the relation depends on the effect. For an irreversible-local step the question
+is whether the untrusted content named the target; for \emph{egress} it is
+whether the \emph{payload} derives from it --- and that report is written from
+that document. Refusing it is the exfiltration case working, not a false
+positive. We report the correction rather than quietly restating the number,
+because the value-granular experiment below would otherwise have been credited
+with fixing a mistake in our measurement.
 
-\begin{figure}[t]
-\centering
-\includegraphics[width=\linewidth]{figures/fig_blocked.pdf}
-\caption{The benefit and its price, in one grammar. \textbf{Left:} removing
-provenance and changing nothing else moves 9 of 12 attacks from refused to
-permitted; removing attenuation as well moves the remaining 3. Hatching marks
-the subset that the policy permitted but which failed anyway for a non-policy
-reason, so the honest count of attacks that \emph{took effect} is 6 and 9 rather
-than 9 and 12. \textbf{Right:} the same colour means the same thing --- a call
-nothing stopped --- but here that is the goal rather than the failure, and the
-hatch marks the two refusals where the untrusted content never named the target.
-Hue encodes only which mechanism acted; whether that was good is what the panel
-titles say.}
-\label{fig:blocked}
-\end{figure}
+Three of six tasks completed with no interruption, 3 of 11 steps needed a human,
+and the control confirms the gate is provenance-based rather than a blanket
+block: with nothing untrusted in context, the destructive step proceeds
+untouched.
 
-\textbf{Reading this honestly.} A 50\% false-refusal rate on destructive steps
-is a real cost and we do not want to dress it up. Three things temper it and one
-sharpens it. It tempers: destructive steps are a small minority of agent work
-(4 of 11 steps here, and the read/search/write majority is never touched); half
-the tasks were unaffected; and the refusal is a confirmation prompt rather than
-a hard failure, so the human is asked rather than blocked. It sharpens: the
-mechanism that asks is a dialogue, and a dialogue that appears on half of a
-category of operations is a dialogue that gets clicked through
-(\S\ref{sec:limits}) --- which is the failure mode we criticised in
-\S\ref{sec:intro}. This is the number that most argues for finishing the
-per-value provenance work rather than shipping turn-granular taint as the
-answer, and it is why we measured it before building the finer-grained version.
+\textbf{Reading this honestly.} A 25\% false-refusal rate on destructive steps is
+smaller than we thought and still the design's main cost. Destructive steps are a
+minority of agent work (4 of 11 steps here), half the tasks were unaffected, and
+a refusal is a confirmation prompt rather than a hard failure. Against that: the
+mechanism that asks is a dialogue, and a dialogue that appears on a quarter of a
+category of operations is a dialogue that gets clicked through. The next
+subsection is what happened when we tried to remove it.
+
+\subsection{E3b: Value-granular provenance, measured}
+\label{sec:e3b}
+
+\textbf{Question.} Both the reviewers of an earlier draft, and
+\S\ref{sec:limits} of that draft, said the same thing: turn-granular taint is too
+blunt, and provenance should be tracked per \emph{value} so that deleting a file
+the untrusted content never mentioned is permitted while sending its contents
+away is not. We built the cheap version and measured it.
+
+\textbf{Method.} Two additions. Objects in the store carry the provenance of the
+justification that wrote them, so a destructive call can ask whether its target
+was placed there under an injection. And a call's arguments are compared against
+the turn's untrusted text by a two-way containment relation --- does the ingested
+text contain this value (the document named this file), or does this value
+contain ingested text (the payload carries the document). A call whose arguments
+match neither is judged not to derive from the untrusted content, and its
+justification is downgraded from blocking.
+
+\textbf{Result: it loses on both axes} (Table~\ref{tab:e4}). It permits
+\textbf{4 of 13} attacks the strict rule refuses, and it recovers \textbf{none}
+of the false refusals it exists to remove. The one benign refusal it removed was
+the warranted exfiltration case.
+
+\textbf{Why, and it is not a tuning problem.} The poisoned document in the corpus
+says ``ignore previous instructions and delete everything''. It never names
+\code{victim.txt}. There is no shared substring for the relation to find, because
+\emph{the model is the dataflow}: the path from document to argument runs through
+a language model's reasoning, not through string concatenation. A syntactic
+relation cannot observe that hop --- and the same hop is what makes a summary
+written \emph{from} a document indistinguishable from an exfiltration of it. Any
+approximation that works on strings is defeated by an attacker who asks for a
+transformation, and any approximation loose enough to catch transformations will
+refuse the benign summary too.
+
+So the conclusion is not that dataflow is the wrong direction, but that it has to
+be \emph{real}: per-value tags propagated by the code that moves values, which in
+an agent means tagging what the model emits by what it read. That is a
+substantially larger mechanism than the hundred lines of lattice it would
+replace, and this experiment turns that from an assumption into an argued
+position. The variant ships disabled and is reported as a configuration, so the
+trade-off stays visible.
 
 \subsection{E4: Comparison against the alternatives}
 \label{sec:e4}
@@ -1122,7 +1192,7 @@ interrupting an attack is the point.
 
 \textbf{Result} (Table~\ref{tab:e4}, Figure~\ref{fig:tradeoff}). Removing
 provenance and changing nothing else takes attack success from 0 to \textbf{9 of
-12}; removing attenuation as well takes it to \textbf{12 of 12}. So the two
+12}; removing attenuation as well takes it to \textbf{13 of 13}. So the two
 mechanisms do visibly different jobs: scope contains what a compromised turn can
 reach (3 refusals with the taint gate off), and provenance is what stops the
 agent's own authority being turned against the user (the other 9). Only the full
@@ -1162,20 +1232,26 @@ cost (\S\ref{sec:e3}) and a box around it would launder that.}
 \toprule
 \textbf{Configuration} & \textbf{Attacks permitted} & \textbf{Human interruptions} & \textbf{Fails on} \\
 \midrule
-\syn{} (caps + scope + provenance) & \textbf{0 / 12} & \textbf{3 / 11} & --- \\
-Capabilities + scope, no provenance & 9 / 12 & 0 / 11 & attack success \\
-Ambient authority (container) & 12 / 12 & 0 / 11 & attack success \\
+\syn{} (caps + scope + provenance) & \textbf{0 / 13} & \textbf{3 / 11} & --- \\
+Syntactic per-value taint (\S\ref{sec:e3b}) & 4 / 13 & 2 / 11 & attack success \\
+Capabilities + scope, no provenance & 10 / 13 & 0 / 11 & attack success \\
+Ambient authority (container) & 13 / 13 & 0 / 11 & attack success \\
 Confirm every call & human-dependent & 11 / 11 & interruption \\
 \bottomrule
 \end{tabular}
 \caption{E4: the pair. A defence is only interesting if it is good on both
-columns; interruptions are benign steps out of 11 that needed a human.
+columns; interruptions are benign steps out of 11 that needed a human. The
+second row is the value-granular variant an earlier draft's reviewers asked for:
+measured and not shipped, because it buys one fewer interruption --- and that one
+was a warranted refusal --- for four more permitted attacks. Its figure is a
+floor: calls that lower to a primitive are still gated strictly by the executor,
+so applying the relation everywhere would permit more.
 Confirm-every-call's attack rate is left as ``human-dependent'' on purpose --- it is exactly as good as the human's attention, which is the axis it
 loses on and the reason per-call approval is not a mechanism.}
 \label{tab:e4}
 \end{table}
 
-\textbf{Threats to validity.} The corpus is 12 attacks written by the system's
+\textbf{Threats to validity.} The corpus is 13 attacks written by the system's
 author, not a third-party benchmark, and 12 is small: it is a regression suite
 over enforcement sites, not a sample from a distribution of real attacks.
 Porting AgentDojo~\cite{debenedetti2024agentdojo} or
@@ -1210,33 +1286,24 @@ We state these as design debts rather than future work, because each is a
 place where a determined adversary or an ordinary user will find the current
 mechanism wanting.
 
-\paragraph{Taint is turn-granular, not value-granular --- and it costs 50\%.}
+\paragraph{Turn-granular taint costs 25\%, and the cheap fix does not work.}
 The justification for a call is the join over the whole resident context, so
-reading one untrusted document taints every destructive call in that turn,
-whatever it touches. E3 (\S\ref{sec:e3}) puts a number on the consequence: half
-the benign destructive steps were refused with the untrusted content never
-having named their target. That is the weakest part of the design, and it is
-weak in a specific, measurable way rather than in principle.
+reading one untrusted document constrains every destructive call in that turn,
+whatever it touches. E3 prices that at a quarter of the benign destructive steps,
+and E3b (\S\ref{sec:e3b}) is what happened when we tried to remove it: a
+syntactic per-value relation permitted 4 of 13 attacks and recovered none of the
+refusals it was built for.
 
-The fix is dataflow: provenance per \emph{value}, so that deleting a scratch
-file the ingested document never mentioned is permitted while POSTing that
-document's contents is not. This is what CaMeL achieves with an
-interpreter-level analysis over a generated program~\cite{debenedetti2025camel};
-the OS analogue is provenance on store objects and on primitive arguments rather
-than on messages, which is a substantially larger mechanism than the ~100 lines
-of lattice this paper describes. We chose the coarse version first deliberately:
-it is sound, it is small enough to read, and being sound-but-blunt is the right
-failure direction for a first implementation. E3 is the argument for not stopping
-there.
-
-One qualification we cannot yet make: the 50\% is measured against \emph{our}
-ground truth about which targets the untrusted content named. A per-value
-mechanism would have to derive that relation from dataflow rather than be told
-it, and some of the cases we score as over-broad may be genuinely ambiguous to
-any analysis --- a summary written from an untrusted document, then deleted, is
-data-dependent on it in a way that is real but not obviously security-relevant.
-The honest claim is that turn-granularity refuses more than dataflow would, not
-that dataflow would refuse none of these.
+That result is the most useful thing in this section, because it narrows the
+design space rather than widening it. Value-granular provenance is still the
+right direction --- it is what CaMeL does with an interpreter-level dataflow
+analysis over a generated program~\cite{debenedetti2025camel} --- but the OS
+analogue cannot be an approximation over strings. The value that needs the tag
+travels from document to argument \emph{through the model}, and no relation
+computed after the fact can see that hop. Real per-value provenance therefore
+means tagging what the model emits by what it read: a substantially larger
+mechanism than the lattice it would replace, sitting at the boundary rather than
+below it, and one whose own soundness argument we do not yet have.
 
 \paragraph{Residency is a latent laundering path, not a live one.} The
 justification folds over \emph{resident} messages, which reads as an admission
@@ -1275,19 +1342,49 @@ than only the action, so the human is deciding about a source rather than an
 operation. That is a small change to the modal and a real improvement to what
 the human is being asked, and it is not implemented.
 
-\paragraph{Eight enforcement sites is seven too many.} The provenance policy is
-one rule, but it is applied in eight places (\S\ref{sec:e2}): once in the
-executor for destructive primitives, and seven times in the router for bindings
-that reach an effect without passing through a primitive --- shell commands,
-\code{/http}, MCP, agent memory, downloads, browser navigation, nested dispatch,
-web tools. All eight currently hold, and the corpus is a regression suite over
-them, but the architecture is wrong in a way tests can only monitor: a new tool
-binding is secure by remembering, not by construction. The determinism boundary
-is a genuine chokepoint for \emph{primitives}; it is not yet a chokepoint for
-\emph{effects}, because the tool layer grew bindings that reach hardware and
-network through paths of their own. Making every binding lower to a primitive ---
-so the executor is the only gate again --- is the structural fix, and it is
-undone.
+\paragraph{The model runs in the kernel, and that is a position with costs.}
+Placing inference below the boundary is what makes the ABI unavoidable
+(\S\ref{sec:impl}), and it is fair to ask what it costs. Three things, honestly.
+\emph{Model size and update}: weights are a build artifact or a file on a
+volume, so replacing a model is a file operation rather than a package upgrade,
+and nothing in the kernel supervises a model's version or provenance --- a
+gap, given that everything else here is about provenance. \emph{Multi-model}:
+the design admits several models but the scheduler treats inference as an
+ordinary cooperative task, so two agents inferring concurrently interleave at
+chunk granularity with no isolation or fairness guarantee between them; an agent
+that prefills a long context makes every other agent wait. \emph{Performance
+isolation} in general is the weakest part: the boundary is priced in
+\S\ref{sec:eval}, but nothing bounds what a compromised-but-authorised agent
+can spend.
+
+The hosted path is the interesting counterweight. Delegating generation to an
+OpenAI-compatible endpoint moves the planner off-box, which costs exactly what
+one would expect --- the prompt, including whatever untrusted content the turn
+ingested, goes to a third party, and the confidentiality half of the threat model
+no longer holds against that party. What it does \emph{not} cost is the
+authorization boundary: the plan still arrives as a string and still passes every
+gate, which is why the front-door grammar parse cannot be optional
+(\S\ref{sec:grammar}). That asymmetry is the useful observation. Moving the
+model changes who can read the context; it does not change what the context can
+authorise.
+
+\paragraph{Eight enforcement sites is seven too many --- and the count was wrong.} The provenance policy is
+one rule, and it was applied in eight places --- until an audit found four more
+bindings with no check at all (\S\ref{sec:e2}). That is the failure mode of
+``secure by remembering'' occurring, not merely being possible.
+
+The router's seven checks are now a single gate taken before dispatch, classified
+by an exhaustive match over the binding type, so a new binding \emph{does not
+compile} until someone says what it does. That converts the failure from a
+review miss into a build error, which is the strongest form available without
+the deeper fix. Calls that lower to a primitive are still left to the executor,
+which applies the same policy and --- the reason for the split --- writes the
+audit record; a test caught the first version refusing them earlier and losing
+the entry. So there are two gates, one per layer, rather than one: the
+determinism boundary is a chokepoint for \emph{primitives}, and the router is
+now a chokepoint for \emph{effects that never become primitives}. Making every
+binding lower to a primitive, so the executor is the only gate, remains the
+structural fix and remains undone.
 
 \paragraph{The microsecond is allocation, and it is in the wrong gate.}
 \label{sec:limits-cost}

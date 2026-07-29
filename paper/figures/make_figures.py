@@ -100,12 +100,14 @@ DATA = {
     # refused; `/http` not being exposed to agents at all). Both numbers are
     # reported because either alone misleads.
     "attacks": {
-        "Synapse\n(caps+scope+provenance)": {"eff": 0, "failed": 0, "prov": 10, "scope": 2},
-        "Capabilities + scope\n(no provenance)": {"eff": 6, "failed": 3, "prov": 0, "scope": 3},
-        "Ambient authority\n(container)": {"eff": 9, "failed": 3, "prov": 0, "scope": 0},
+        "Synapse\n(caps+scope+provenance)": {"eff": 0, "failed": 0, "prov": 11, "scope": 2},
+        "Capabilities + scope\n(no provenance)": {"eff": 7, "failed": 3, "prov": 0, "scope": 3},
+        "Ambient authority\n(container)": {"eff": 10, "failed": 3, "prov": 0, "scope": 0},
     },
-    # E3: benign steps (n=11) under the full policy.
-    "benign": {"proceeded": 8, "warranted": 1, "over_broad": 2},
+    # E3: benign steps (n=11) under the full policy. `warranted` went 1 -> 2 and
+    # `over_broad` 2 -> 1 when the egress label was corrected: posting a report
+    # written from an ingested document is exfiltration, not a false positive.
+    "benign": {"proceeded": 8, "warranted": 2, "over_broad": 1},
     "destructive_steps": 4,
 }
 
@@ -219,10 +221,10 @@ def fig_blocked(path):
                    color=_label_on(colour), zorder=4)
             left += v
     a.set_yticks(ys, labels)
-    a.set_xlim(0, 12.4)
-    a.set_xticks([0, 3, 6, 9, 12])
+    a.set_xlim(0, 13.4)
+    a.set_xticks([0, 3, 6, 9, 13])
     a.set_ylim(-0.6, 2.6)
-    a.set_xlabel("injected attacks (n = 12)")
+    a.set_xlabel("injected attacks (n = 13)")
     a.set_title("Attacks: provenance is what stops them", loc="left", color=INK, pad=6)
     _clean(a)
 
@@ -247,7 +249,7 @@ def fig_blocked(path):
     b.set_xlim(0, 11.3)
     b.set_xticks([0, 4, 8, 11])
     b.set_xlabel("benign steps, full policy (n = 11)")
-    b.set_title("The cost: 2 of 4 destructive\nsteps refused over-broadly", loc="left", color=INK, pad=6)
+    b.set_title("The cost: 1 of 4 destructive\nsteps refused over-broadly", loc="left", color=INK, pad=6)
     _clean(b)
 
     # One key for both panels. A hatch always means "a subset of the segment beside
