@@ -252,12 +252,29 @@ impl ToolDispatch for Router {
                 }
             }
             ToolBinding::AgentStorage => {
+                // `storage_*` is DURABLE (`/agent/<id>/storage/<key>`), so it
+                // crosses turns and sessions — which makes it both an effect site
+                // and, read back, a laundering channel. Both halves were missing.
+                //
+                // Writing is a durable mutation and gates like agent memory: an
+                // injection must not be able to leave a "preference" behind.
+                let mutating = matches!(call.tool.as_str(), "storage_set" | "storage_remove");
+                if mutating && self.justification(session).blocks_destructive() {
+                    return ToolOutcome::error(alloc::format!(
+                        "refused: durable storage write '{}' justified by untrusted content",
+                        call.tool
+                    ));
+                }
                 let agent_id = session.agent.manifest_id.0;
                 let out = crate::agent::storage::run_tool(agent_id, &call.tool, &call.args);
                 if out.starts_with("error:") {
                     ToolOutcome::error(out)
                 } else {
-                    ToolOutcome::ok(out, Provenance::SystemTrusted)
+                    // Reading returns whatever was stored, by whoever stored it.
+                    // Tagging that trusted completed the cycle: store under an
+                    // injection, read back clean, and the turn has no reason left
+                    // to refuse anything.
+                    ToolOutcome::ok(out, Provenance::UntrustedIngested)
                 }
             }
             ToolBinding::Media => {
@@ -265,7 +282,12 @@ impl ToolDispatch for Router {
                 if out.starts_with("error:") {
                     ToolOutcome::error(out)
                 } else {
-                    // Paths + playback status are host-side facts (system-trusted).
+                    // Kernel-authored status ("ok:image_open <path>"), which may
+                    // echo an argument but carries no bytes the context did not
+                    // already hold. An echo cannot *lower* a turn's taint --
+                    // `join` is monotone within a turn -- so this one stays
+                    // trusted. The channels that had to change are the ones that
+                    // outlive the turn: durable storage, background tasks, wasm.
                     ToolOutcome::ok(out, Provenance::SystemTrusted)
                 }
             }
@@ -280,7 +302,13 @@ impl ToolDispatch for Router {
                     &call.args,
                 ) {
                     Ok(out) if out.starts_with("error:") => ToolOutcome::error(out),
-                    Ok(out) => ToolOutcome::ok(out, Provenance::SystemTrusted),
+                    // A package's wasm tool digests whatever it was handed -- a
+                    // PDF, a note, an HTTP request -- so its output is a function
+                    // of ingested bytes and re-enters as ingested bytes. The
+                    // module is sandboxed under fuel and memory limits; that
+                    // bounds what it can *do*, not how far its output can be
+                    // trusted.
+                    Ok(out) => ToolOutcome::ok(out, Provenance::UntrustedIngested),
                     Err(e) => ToolOutcome::error(alloc::format!("wasm:{e}")),
                 }
             }
@@ -358,7 +386,11 @@ impl ToolDispatch for Router {
                 if out.starts_with("error:") {
                     ToolOutcome::error(out)
                 } else {
-                    ToolOutcome::ok(out, Provenance::SystemTrusted)
+                    // Task output is the output of a *command*, and a task
+                    // outlives the turn that started it -- so the untrusted
+                    // message that prompted it may be long gone by the time the
+                    // output is collected. Ingested, not trusted.
+                    ToolOutcome::ok(out, Provenance::UntrustedIngested)
                 }
             }
             ToolBinding::AskUser => {

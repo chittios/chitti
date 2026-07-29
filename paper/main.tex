@@ -55,7 +55,7 @@
 \title{\textbf{The Determinism Boundary}\\[0.4em]
 \large An Operating-System Capability ABI for Agents as the Unit of Execution}
 
-\author{Vinoth Kumar\\ \small \texttt{vinothsparrow@live.com}}
+\author{Vinoth Kumar\\ \small \texttt{Refold}}
 
 % arXiv: avoid \today -- it makes the PDF differ on every rebuild.
 \date{Draft --- 29 July 2026}
@@ -1238,16 +1238,22 @@ data-dependent on it in a way that is real but not obviously security-relevant.
 The honest claim is that turn-granularity refuses more than dataflow would, not
 that dataflow would refuse none of these.
 
-\paragraph{Residency can launder taint.} The justification folds over
-\emph{resident} messages, so content evicted from the context window stops
-contributing taint. If a summarization step compacts untrusted messages into a
-summary that is not itself marked untrusted, the system has laundered
-provenance --- exactly the failure the identity-file rule
-(\S\ref{sec:taint}) exists to prevent, in a path we do not yet close.
-Compaction must propagate the join of what it summarizes, and durable memory
-must record provenance per entry. Until it does, a long-running session's
-integrity level is not monotone, which we regard as the most likely real
-vulnerability in the current implementation.
+\paragraph{Residency is a latent laundering path, not a live one.} The
+justification folds over \emph{resident} messages, which reads as an admission
+that evicting content would silently drop its taint. Checking the code rather
+than the design: nothing ever clears the resident flag, and the interactive
+\code{/compact} rebuilds the model's KV cache without pruning the session's
+message list, so the untrusted messages remain and the turn stays tainted. The
+integrity level is monotone within a session today, and an earlier draft of this
+paragraph overstated the risk as present.
+
+The hazard is real but arrives with the next feature rather than the current
+one: the first eviction or compaction that actually prunes messages will drop
+taint with them, and nothing would fail. So the rule to keep is that any
+context-shrinking step must propagate the \emph{join} of what it removes, and
+durable memory must record provenance per entry --- and there is now a
+regression test pinning the invariant so that the day eviction lands, it lands
+red rather than quietly.
 
 \paragraph{One bit for two properties.} \code{destructive} conflates
 irreversibility with external visibility: \code{net\_http\_get} carries the
