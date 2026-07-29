@@ -823,7 +823,7 @@ def s_redteam(g):
     # primitives. Its value is not the pass rate -- the gates never read the
     # payload, so that is predictable -- but that the selection of attacks is
     # not ours, and that the expressibility gap is stated.
-    if "imported corpus" not in out:
+    if "imported corpora" not in out:
         return False, "no imported-corpus run in the output"
     if not imported:
         return False, "imported corpus reported no per-configuration rows"
@@ -849,7 +849,7 @@ def s_redteam(g):
         f"0/{total} permitted under synapse; {sticky} with the source declassified, "
         f"{no_taint} without taint, {ambient} ambient; "
         f"{clean}/{tasks} benign tasks clean, false-refusal {ut.group(3)}%; "
-        f"imported {imp_strict[1]} AgentDojo tasks, {imp_strict[0]} permitted"
+        f"imported {imp_strict[1]} third-party cases, {imp_strict[0]} permitted"
     )
 
 

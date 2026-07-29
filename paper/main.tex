@@ -1259,13 +1259,33 @@ injected content authorise an irreversible transfer to a recipient it named?''
 is the question our gate answers either way.
 
 We should say plainly what this cannot show. Our gates never read the payload,
-so third-party attack \emph{text} cannot change a refusal: feeding 24 real
-injections to a payload-blind gate produces 24 identical refusals, and reporting
+so third-party attack \emph{text} cannot change a refusal: feeding 86 real
+injections to a payload-blind gate produces 86 identical refusals, and reporting
 that as a benchmark result would be dressing up a tautology. Running AgentDojo
 properly --- measuring whether a model is persuaded across realistic tasks ---
 needs its tool suites reimplemented here, which is a different project.
 
-\textbf{Result: 24 of 27 expressible, 0 permitted.} Three are not expressible
+\textbf{A second corpus, because one is a sample of one.}
+InjecAgent~\cite{zhan2024injecagent} (MIT) contributes 62 more cases over IoT,
+finance and personal-data tools, split by its authors into direct-harm and
+data-stealing. It is here not to make the number bigger but because the two
+benchmarks \emph{disagree about what an injection looks like}: AgentDojo's are
+workplace tasks that name an account or an address, InjecAgent's are device and
+finance commands (``unlock my front door'') whose target is often a device
+rather than a string. Since \S\ref{sec:e2b}'s finding is that a syntactic
+defence's score moves with exactly that difference, a second distribution is the
+check on whether the first flattered anyone. All 62 translate at effect
+fidelity: there is no smart lock and no payments here, so what carries over is
+the authorization question and not the domain.
+
+Together: \textbf{86 of 89 third-party cases expressible, 0 permitted} under the
+full policy, and 0 under the citation policy. The syntactic variant, which was
+0 of 24 on AgentDojo alone, permits \textbf{3 of 86} once InjecAgent is
+included --- small, and the direction is the whole point: its score is a
+property of the corpus's phrasing, so adding a corpus that phrases differently
+moves it. Nothing moves the configurations that do not read content.
+
+\textbf{Result on AgentDojo alone: 24 of 27 expressible, 0 permitted.} Three are not expressible
 and each says something. One is an authority transfer (invite a user, add them
 to a channel) that only \code{channel\_grant} could express and no tool lowers
 to it --- the same gap our own corpus records as a written exemption. One is
@@ -1458,7 +1478,7 @@ cost (\S\ref{sec:e3}) and a box around it would launder that.}
 \textbf{Configuration} & \textbf{Attacks permitted} & \textbf{Human interruptions} & \textbf{Fails on} \\
 \midrule
 \syn{} (caps + scope + provenance) & \textbf{0 / 13} & \textbf{9 / 28} & --- \\
-Citation-constrained (\S\ref{sec:e3c}, proposed) & \textbf{0 / 13} & \textbf{5 / 28} & not built \\
+Citation-constrained (\S\ref{sec:e3c}, proposed) & \textbf{0 / 13} & \textbf{6 / 28} & not built \\
 \quad + human declassified the source & 6 / 13 & 0 / 28 & attack success \\
 Syntactic per-value taint (\S\ref{sec:e3b}) & 4 / 13 & 6 / 28 & attack success \\
 Capabilities + scope, no provenance & 10 / 13 & 0 / 28 & attack success \\

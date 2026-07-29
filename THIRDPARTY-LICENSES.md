@@ -324,3 +324,15 @@ the tool each task drives, translated onto ChittiOS primitives.
 Copyright (c) 2024 Edoardo Debenedetti, Jie Zhang, Mislav Balunovic,
 Luca Beurer-Kellner, Marc Fischer, and Florian Tramer.
 Licensed under the MIT License. Source: https://github.com/ethz-spylab/agentdojo
+
+## InjecAgent (MIT)
+
+`kernel/src/security/redteam.rs` embeds the **attacker instructions of the 62
+cases** from InjecAgent (30 direct-harm, 32 data-stealing), quoted verbatim, to
+run a second third-party attack corpus against the Synapse boundary (`/redteam`,
+paper §E2b). No InjecAgent code is used --- only the instruction text and the
+attacker tool each case drives, translated onto ChittiOS primitives.
+
+Copyright (c) 2024 Qiusi Zhan, Zhixiang Liang, Zifan Ying, Daniel Kang.
+Licensed under the MIT License.
+Source: https://github.com/uiuc-kang-lab/InjecAgent
