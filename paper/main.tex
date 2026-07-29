@@ -797,6 +797,7 @@ contended host, a corpus we wrote ourselves, an architecture we could not test
 on --- it is stated beside the number rather than in a footnote.}
 
 \subsection{E1: What does the boundary cost?}
+\label{sec:e1}
 
 \textbf{Question.} Is enforcement free relative to inference?
 
@@ -1535,6 +1536,20 @@ gate that reasons about a concrete resource. A design that pushed further toward
 fine-grained authority --- per-value provenance, as \S\ref{sec:limits} argues it
 should --- should expect to pay there, and should not assume the total stays in
 the noise merely because it does today.
+
+One half of that is now fixed and the figures above do not yet reflect it. The
+duplicated work was worse than ``an allocation'': the glob comparison normalised
+\emph{both} sides on every ledger entry it examined, so a constant grant was
+re-normalised on every call forever and the target --- already normalised by the
+executor --- was normalised again. Normalisation is load-bearing (it is what
+stops \code{/agent/7/../../etc} being covered by a grant of
+\code{/agent/7/**}), so the fix is to notice when a path is already canonical
+and borrow it, pinned by a test asserting the fast and slow paths agree on every
+input including the escaping ones. \textbf{The E1 numbers quoted here were taken
+before that change and have not been re-taken}; they are an upper bound on the
+shipped code rather than a measurement of it, and re-measuring needs an idle
+machine (\S\ref{sec:e1} explains why a loaded host makes this figure
+meaningless). Constructing a throwaway \code{Scope} per call remains.
 
 The same measurement makes an odd observation about the audit log: appending one
 record ($\sim$970\,ns) costs about as much as the entire decision it records.
