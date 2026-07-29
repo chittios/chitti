@@ -1,8 +1,18 @@
 //! **Remote model backend** — chat through a *hosted* model instead of the
 //! embedded GGUF. Speaks the OpenAI-compatible `/v1/chat/completions` JSON
 //! shape over [`crate::net::http`], which is what llama.cpp's server, Ollama,
-//! vLLM, and LM Studio all serve — the self-hosted case the missing TLS
-//! doesn't hurt (plain `http://` on the host/LAN).
+//! vLLM, and LM Studio all serve.
+//!
+//! **`https://` works and is verified.** The URL goes through the shared
+//! [`crate::net::http`] client, so a TLS endpoint gets the same handshake and
+//! the same certificate validation as any other request. This comment used to
+//! say TLS was "missing" here, which was true when the transport was written and
+//! stopped being true when the HTTP client gained TLS — and it was believed and
+//! repeated as a limitation in the paper before anyone checked the code path.
+//! What is genuinely true is narrower: the self-hosted case this exists for is
+//! conventionally plain `http://` on a LAN, so the prompt and the bearer token
+//! usually do travel in the clear, and nothing warns the human when they
+//! configure such a URL.
 //!
 //! The remote chat runs the SAME agentic contract as the local one: the same
 //! system prompt (SOUL.md + operating rules + CORE tools + `search_tools`),

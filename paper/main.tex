@@ -1580,16 +1580,21 @@ gate, which is why the front-door grammar parse cannot be optional
 model changes who can read the context; it does not change what the context can
 authorise.
 
-Two details of the current implementation make that trade worse than it needs to
-be, and both are ours rather than inherent. The transport is plain HTTP, so the
-context and the endpoint's bearer token cross the network in cleartext --- the
-in-kernel TLS client exists (\S\ref{sec:impl}) and this path does not yet use
-it. And the confidentiality loss is invisible at the moment it matters: the
-approval dialogue now says when the planner is off-box, because a human
-authorising a destructive act justified by ingested content should know that the
-same content has already left the machine, but nothing marks the \emph{session}
-as having done so. Configuring a remote model is human-only and never an agent
-tool, which is the one part of this that is deliberate.
+One detail of the current implementation makes that trade worse than it needs to
+be, and it is ours rather than inherent: the confidentiality loss is invisible at
+the moment it matters. The approval dialogue now says when the planner is
+off-box, because a human authorising a destructive act justified by ingested
+content should know that the same content has already left the machine --- but
+nothing marks the \emph{session} as having done so, and nothing warns at the
+point the endpoint is configured. Configuring a remote model is human-only and
+never an agent tool, which is the one part of this that is deliberate.
+
+An \code{https://} endpoint gets the same verified TLS client as any other
+request (\S\ref{sec:impl}); the transport is not the gap. The gap is that the
+deployment this feature exists for --- llama.cpp or Ollama on the same LAN --- is
+conventionally plain \code{http://}, so in practice the prompt and the bearer
+token usually do cross a local network in the clear, and nothing in the system
+says so at the moment a human types the URL.
 
 \paragraph{Eight enforcement sites is seven too many --- and the count was wrong.} The provenance policy is
 one rule, and it was applied in eight places --- until an audit found four more
