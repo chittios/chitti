@@ -42,6 +42,11 @@ pub struct SubagentOutcome {
     pub record: SubagentRecord,
     /// The isolated sub-session (its full transcript). The parent never sees
     /// this — it exists so callers/tests can prove isolation. Discarded after.
+    ///
+    /// Its `capabilities` are **already revoked** by the time you hold this:
+    /// [`dispatch`] kills the sub-agent's task when the delegation ends, so the
+    /// transcript is readable but the authority is gone. Read it; do not try to
+    /// resume it.
     pub sub_session: Session,
 }
 
@@ -117,6 +122,16 @@ pub fn dispatch(
 
     let result = agent_loop::run(&mut sub_session, steps, tools, sub_task, now);
     let summary = condense(&result.answer, role.summary);
+
+    // The delegation is over, so the identity it ran under is retired. This is a
+    // capability fix before it is a memory one: without it every dispatch left a
+    // task holding a **live, attenuated capability table** in the scheduler for
+    // the rest of the boot — standing authority belonging to an agent that has
+    // finished, which is exactly the ambient authority this design exists to
+    // prevent. `sub_session` survives (callers and the isolation tests read its
+    // transcript), but its `capabilities` are revoked from here on, which is why
+    // it is documented as discarded after.
+    let _ = crate::sched::kill(sub_task);
 
     let record = SubagentRecord {
         id: sub_id,
@@ -212,6 +227,14 @@ mod tests {
         // The parent context does NOT contain the sub-agent's raw read tool-call.
         assert!(!parent.messages.iter().any(|m| m.tool_calls.iter().any(|c| c.tool == "read")));
         assert_eq!(parent.subagents.len(), 1);
+        // The delegation is over, so its identity is retired: no live task is
+        // left holding the attenuated capability table. Every dispatch used to
+        // leave one for the rest of the boot — standing authority owned by an
+        // agent that had finished.
+        assert!(
+            !crate::sched::list().iter().any(|t| t.1 == "subagent" && t.2 != "dead"),
+            "a completed sub-agent must not keep a live capability table"
+        );
     }
 
     /// (b) A sub-agent role requesting a capability the parent lacks is refused
