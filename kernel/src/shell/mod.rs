@@ -8797,7 +8797,18 @@ pub fn upkeep() {
 /// the alternative was a working task spinning on `upkeep` itself.
 extern "C" fn pump_task(_arg: u64) {
     use crate::sched::Wait;
+    const CONDITIONS: [Wait; 4] = [Wait::Console, Wait::Net, Wait::Block, Wait::SoundOut];
     loop {
+        // Belt and braces with `sched::pick_next`, which already declines to
+        // reach us unless a task is asleep: pump only for an actual sleeper.
+        // Running `upkeep` when nobody is blocked duplicates the pumping the
+        // yielding task is doing for itself, and that duplication is harmful
+        // rather than merely wasteful — `mouse::tick()` consumes the input that
+        // modal and editor loops read for themselves.
+        if !CONDITIONS.iter().any(|&w| crate::sched::blocked_count(w) > 0) {
+            crate::sched::yield_now();
+            continue;
+        }
         upkeep();
         // Spurious wakeups are allowed and expected: a woken task re-checks its
         // own condition and blocks again if it is not satisfied. That keeps this
@@ -8805,7 +8816,7 @@ extern "C" fn pump_task(_arg: u64) {
         // it is the seam for tightening later — a driver that calls
         // `sched::wake(Wait::Net)` exactly when it makes progress turns these
         // blanket wakes into precise ones without changing any waiter.
-        for w in [Wait::Console, Wait::Net, Wait::Block, Wait::SoundOut] {
+        for w in CONDITIONS {
             crate::sched::wake(w);
         }
         crate::sched::yield_now();

@@ -201,6 +201,22 @@ fn pick_next(s: &mut SchedulerState) -> Option<TaskId> {
     if idle == s.current {
         return None;
     }
+    // **Only when something is actually asleep.** The idle task exists to keep
+    // the world turning on behalf of *blocked* tasks; with nothing blocked, the
+    // task that would yield to it is still pumping for itself, so switching to
+    // the pump only duplicates that work. That duplication is not merely
+    // wasteful: `upkeep`'s `mouse::tick()` consumes the clicks that modal and
+    // editor loops read for themselves, which is exactly why those loops call
+    // `status_tick` instead of `upkeep`.
+    //
+    // Without this condition the fallback fires on the shell's very first yield,
+    // because the ready queue is empty in the ordinary case — a task's own
+    // `yield_now` re-queues it only *after* the pick. So "the pump is inert until
+    // something blocks" holds only with this test, not by virtue of the dedicated
+    // slot alone.
+    if !s.tasks.values().any(|t| matches!(t.state, TaskState::Blocked(_))) {
+        return None;
+    }
     s.tasks
         .get(&idle)
         .is_some_and(|t| t.fx_area.is_some() && !matches!(t.state, TaskState::Dead | TaskState::Blocked(_)))
@@ -973,18 +989,27 @@ mod tests {
     }
 
     #[test_case]
-    fn the_idle_task_only_runs_when_nothing_else_can() {
-        // The bug this pins would have been invisible: an idle task that
-        // re-enqueues itself on its own yield slides into the round-robin and
-        // takes every other turn, so the machine simply runs inference at half
-        // speed with nothing reporting anything wrong. Counting turns is the only
-        // way to see it — the queue looks reasonable either way.
+    fn the_idle_task_runs_only_for_a_blocked_task() {
+        // Two properties, both invisible if wrong.
+        //
+        // An idle task that re-enqueues itself on its own yield slides into the
+        // round-robin and takes every other turn — the machine just runs
+        // inference at half speed with nothing reporting anything. And an idle
+        // task reached merely because the ready queue is empty runs `upkeep`
+        // concurrently with whichever task yielded, which duplicates the pumping
+        // that task is doing for itself; `mouse::tick()` then consumes input the
+        // modal and pane loops read themselves. Counting turns is the only way to
+        // see either: the queue looks reasonable in both cases.
         SPIN_STOP.store(false, Ordering::SeqCst);
-        IDLE_TICKS.store(0, Ordering::SeqCst);
         WORKER_TICKS.store(0, Ordering::SeqCst);
 
         let idle = spawn("test-idle", idle_counter, 0);
         set_idle(idle);
+        // Zero the counter *after* registration, not before. Between `spawn`
+        // (which enqueues) and `set_idle` (which dequeues) it is an ordinary ready
+        // task, and a timer tick landing in that window legitimately gives it a
+        // turn — which is not the fallback firing, and cost a run to work out.
+        IDLE_TICKS.store(0, Ordering::SeqCst);
         SCHED.with(|slot| {
             assert!(
                 !slot.as_ref().unwrap().ready_queue.contains(&idle),
@@ -993,7 +1018,7 @@ mod tests {
         });
         let worker = spawn("test-worker", worker_counter, 0);
 
-        // While a task is ready, the idle task must get *nothing*.
+        // (1) While a task is ready, the idle task must get nothing.
         for _ in 0..50 {
             yield_now();
         }
@@ -1010,20 +1035,59 @@ mod tests {
             );
         });
 
-        // Retire the worker; with nothing ready, the fallback *should* reach the
-        // idle task — that is its whole purpose, and it is what lets `block_on`
-        // put the last working task to sleep.
+        // (2) Retire the worker. The queue is now empty — and that alone must
+        // still not reach the idle task, because nothing is asleep and the task
+        // yielding is pumping for itself.
         SPIN_STOP.store(true, Ordering::SeqCst);
         let mut spins = 0;
-        while (is_alive(worker) || is_alive(idle)) && spins < 5000 {
+        while is_alive(worker) && spins < 5000 {
             yield_now();
             spins += 1;
         }
         assert!(!is_alive(worker), "the worker did not finish");
-        assert!(!is_alive(idle), "the idle task was never reached once nothing else was ready");
-        assert!(IDLE_TICKS.load(Ordering::SeqCst) > 0, "the idle task must run when the queue empties");
+        for _ in 0..20 {
+            yield_now();
+        }
+        assert_eq!(
+            IDLE_TICKS.load(Ordering::SeqCst),
+            0,
+            "an empty ready queue alone must not reach the idle task — only a sleeper may"
+        );
 
+        // (3) Now something actually sleeps, which is the one situation the idle
+        // task exists for. Note the mutual dependence: `block_on` can only
+        // succeed *because* an idle task is registered, and the idle task can
+        // only be reached *because* something blocked.
+        BLOCKER_RELEASE.store(false, Ordering::SeqCst);
+        BLOCKER_STAGE.store(0, Ordering::SeqCst);
+        let sleeper = spawn("test-sleeper", blocker_task, 0);
+        let mut spins = 0;
+        while blocked_count(Wait::Block) == 0 && spins < 5000 {
+            yield_now();
+            spins += 1;
+        }
+        assert_eq!(blocked_count(Wait::Block), 1, "the sleeper never blocked");
+        let mut spins = 0;
+        while IDLE_TICKS.load(Ordering::SeqCst) == 0 && spins < 5000 {
+            yield_now();
+            spins += 1;
+        }
+        assert!(
+            IDLE_TICKS.load(Ordering::SeqCst) > 0,
+            "with a task asleep and the queue empty, the fallback must reach the idle task"
+        );
+
+        // Release the sleeper and leave the global scheduler as we found it.
+        BLOCKER_RELEASE.store(true, Ordering::SeqCst);
+        wake(Wait::Block);
+        let mut spins = 0;
+        while is_alive(sleeper) && spins < 5000 {
+            yield_now();
+            spins += 1;
+        }
+        assert!(!is_alive(sleeper), "the woken sleeper did not finish");
         clear_idle();
+        let _ = kill(idle); // already exited after its one tick; ignore
         assert!(idle_task().is_none(), "leave the global scheduler as we found it");
     }
 
