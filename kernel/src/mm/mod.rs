@@ -7,6 +7,7 @@
 //! boot-info — so `mm::init` is per-arch, but [`frame`] itself is shared: its
 //! constructor takes usable `(base, length)` regions and nothing more.
 
+pub mod armv8;
 pub mod frame;
 pub mod heap;
 pub mod ramlayout;

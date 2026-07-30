@@ -245,7 +245,7 @@ pub fn init(frame_allocator: &Locked<Option<super::frame::BitmapFrameAllocator>>
     use crate::arch::x86_64::paging::{self, NO_EXECUTE, PRESENT, WRITABLE};
 
     struct FrameAllocatorAdapter<'a>(&'a Locked<Option<super::frame::BitmapFrameAllocator>>);
-    impl paging::FrameAllocator for FrameAllocatorAdapter<'_> {
+    impl super::frame::TableFrames for FrameAllocatorAdapter<'_> {
         fn allocate_frame(&mut self) -> Option<u64> {
             self.0.with(|slot| slot.as_mut().and_then(|a| a.allocate()))
         }

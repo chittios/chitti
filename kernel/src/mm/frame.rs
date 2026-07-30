@@ -271,17 +271,37 @@ impl BitmapFrameAllocator {
         }
     }
 
+    /// Whether the frame containing `phys` is recorded as used (or is outside
+    /// the bitmap entirely, which is the same thing to a caller: not allocatable).
+    ///
+    /// Exists for the aarch64 boot self-check, which asserts every reserved
+    /// range reads back used. That check is the only way to catch a mistake in
+    /// the reserved list — a frame wrongly called free produces no error, just
+    /// corruption somewhere else later.
+    pub fn is_used(&self, phys: u64) -> bool {
+        let f = phys / FRAME_SIZE;
+        f >= self.frame_count || get_bit(self.bitmap, f)
+    }
+
     pub fn free_frame_count(&self) -> u64 {
         (0..self.frame_count).filter(|&f| !get_bit(self.bitmap, f)).count() as u64
     }
 }
 
-/// The page-table frame source x86's `paging::map_page` walks with. aarch64 does
-/// not implement this trait yet — it has no 4 KiB walker to feed (its map is 1 GiB
-/// and 2 MiB block descriptors), which is exactly the parity gap this module's
-/// promotion to both arches is the first half of closing.
-#[cfg(target_arch = "x86_64")]
-impl crate::arch::x86_64::paging::FrameAllocator for BitmapFrameAllocator {
+/// A source of fresh physical frames for new page-table levels.
+///
+/// Arch-neutral on purpose: both walkers — x86's
+/// [`crate::arch::x86_64::paging::map_page`] and aarch64's
+/// `arch::aarch64::mmu::map_page` — allocate intermediate tables through this,
+/// so neither is coupled to the concrete allocator's locking strategy and
+/// neither can grow its own private notion of "give me a frame".
+pub trait TableFrames {
+    /// A free 4 KiB frame's physical address, or `None` when exhausted. The
+    /// caller zeroes it before installing it as a table.
+    fn allocate_frame(&mut self) -> Option<u64>;
+}
+
+impl TableFrames for BitmapFrameAllocator {
     fn allocate_frame(&mut self) -> Option<u64> {
         self.allocate()
     }

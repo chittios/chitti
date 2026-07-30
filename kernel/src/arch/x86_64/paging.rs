@@ -36,6 +36,16 @@ pub fn phys_to_virt(phys: u64) -> u64 {
 
 pub const PRESENT: u64 = 1 << 0;
 pub const WRITABLE: u64 = 1 << 1;
+/// Ring 3 may access the mapping. Absent from every flag combination the kernel
+/// maps today (heap and MMIO are both supervisor-only), and the counterpart of
+/// aarch64's [`crate::mm::armv8::AP_USER`].
+///
+/// **It must be set on every level of the walk, not just the leaf.** The x86
+/// permission check ANDs `U/S` down the whole path, so a user page reached
+/// through a supervisor-only PDPT/PD/PT is unreachable from ring 3 — a
+/// page fault with no indication of which level refused. [`map_page`] therefore
+/// propagates this bit into the intermediate tables it creates.
+pub const USER_ACCESSIBLE: u64 = 1 << 2;
 /// Requires `arch::x86_64::fpu::enable_nx()` (`EFER.NXE`) to have run
 /// first: without it this bit is reserved and using it faults.
 pub const NO_EXECUTE: u64 = 1 << 63;
@@ -69,13 +79,11 @@ struct PageTable {
     entries: [PageTableEntry; 512],
 }
 
-/// A source of fresh, zeroed physical frames for new page-table levels.
-/// Implemented by `mm::frame::BitmapFrameAllocator` (via an adapter in
-/// `mm::heap`) so this module stays decoupled from the concrete
-/// allocator's locking strategy.
-pub trait FrameAllocator {
-    fn allocate_frame(&mut self) -> Option<u64>;
-}
+/// A source of fresh, zeroed physical frames for new page-table levels. Now
+/// [`crate::mm::frame::TableFrames`], shared with aarch64's walker so the two
+/// arches allocate intermediate tables through one trait; re-exported here under
+/// the name this module has always used.
+pub use crate::mm::frame::TableFrames as FrameAllocator;
 
 fn table_at(phys: u64) -> &'static mut PageTable {
     // SAFETY: `phys` is always either the current CR3 or a present page
@@ -122,10 +130,17 @@ fn table_index(virt: u64, level: u64) -> usize {
 /// Map the single page at `virt` (must be 4 KiB-aligned) to `phys` with
 /// `flags`, allocating any missing PML4/PDPT/PD entries via `alloc`.
 /// Walks from the *current* `CR3`.
+///
+/// When `flags` requests [`USER_ACCESSIBLE`], the bit is also set on every
+/// intermediate entry along the walk — created or pre-existing — because the
+/// hardware ANDs `U/S` down the path (see that constant). Widening an
+/// intermediate is safe: the leaf's own `U/S` still decides, so kernel pages
+/// sharing the table stay supervisor-only.
 pub fn map_page(virt: u64, phys: u64, flags: u64, alloc: &mut impl FrameAllocator) {
     debug_assert_eq!(virt % 4096, 0);
     debug_assert_eq!(phys % 4096, 0);
 
+    let intermediate = PRESENT | WRITABLE | (flags & USER_ACCESSIBLE);
     let mut table = table_at(read_cr3());
     for level in (1..=3u64).rev() {
         let idx = table_index(virt, level);
@@ -135,7 +150,9 @@ pub fn map_page(virt: u64, phys: u64, flags: u64, alloc: &mut impl FrameAllocato
                 .allocate_frame()
                 .expect("map_page: out of physical frames for page tables");
             zero_table(table_at(new_frame));
-            entry.set(new_frame, PRESENT | WRITABLE);
+            entry.set(new_frame, intermediate);
+        } else {
+            entry.0 |= intermediate & USER_ACCESSIBLE;
         }
         table = table_at(entry.addr());
     }
