@@ -8779,6 +8779,51 @@ pub fn upkeep() {
     }
 }
 
+/// The pump task: what the scheduler runs when every other task is blocked or
+/// there is nothing else to do.
+///
+/// **This is the "task that isn't you" that real blocking requires**, and its
+/// absence is why every waiting loop in this kernel is a busy-wait. A task
+/// waiting on I/O had to call [`upkeep`] itself — poll the network, service the
+/// UI, blink the caret, drive the package-UI apps — so the waiter *was* the
+/// pump and therefore could not afford to sleep. With the pumping moved here, a
+/// waiter can go to sleep on a [`crate::sched::Wait`] and something else keeps
+/// the world turning.
+///
+/// It never blocks and never returns, which is [`crate::sched::set_idle`]'s
+/// contract. It also does not `hlt`: it is a pump, not a halt, and the UI needs
+/// `upkeep` to keep running for the caret, the status clock and the network
+/// stack. That costs nothing extra today, because this loop only ever runs when
+/// the alternative was a working task spinning on `upkeep` itself.
+extern "C" fn pump_task(_arg: u64) {
+    use crate::sched::Wait;
+    loop {
+        upkeep();
+        // Spurious wakeups are allowed and expected: a woken task re-checks its
+        // own condition and blocks again if it is not satisfied. That keeps this
+        // loop from having to know what readiness means for any subsystem, and
+        // it is the seam for tightening later — a driver that calls
+        // `sched::wake(Wait::Net)` exactly when it makes progress turns these
+        // blanket wakes into precise ones without changing any waiter.
+        for w in [Wait::Console, Wait::Net, Wait::Block, Wait::SoundOut] {
+            crate::sched::wake(w);
+        }
+        crate::sched::yield_now();
+    }
+}
+
+/// Start the pump task and register it as the scheduler's idle task.
+///
+/// Deliberately a no-op in effect until something actually blocks: the pump is
+/// reachable only through the scheduler's empty-ready-queue fallback, so while
+/// every task stays runnable (as they all did before wait queues existed) it
+/// never takes a turn. That is what makes introducing it safe on a kernel whose
+/// entire UX runs through one task.
+pub fn start_pump() {
+    let id = crate::sched::spawn("pump", pump_task, 0);
+    crate::sched::set_idle(id);
+}
+
 /// Lighter upkeep for loops that consume their own mouse events (modals, the
 /// editor): caret blink + status bar + net only — no `mouse::tick()`, which
 /// would steal their clicks.

@@ -24,6 +24,11 @@ fn run_os() -> ! {
     chitti_kernel::tools::permissions::load();
     // External messaging channels (Telegram, …) — load after the store is up.
     chitti_kernel::msgchan::load();
+    // The pump/idle task, before the shell takes over: it is what lets a waiting
+    // task actually sleep instead of pumping `upkeep()` itself. Inert until
+    // something blocks (it is reached only via the scheduler's empty-queue
+    // fallback), so the boot path is unchanged for every task that stays runnable.
+    chitti_kernel::shell::start_pump();
     chitti_kernel::shell::run();
 }
 

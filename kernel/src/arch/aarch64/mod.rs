@@ -122,6 +122,15 @@ pub mod interrupts {
         INTERRUPTS_ENABLED.store(false, Ordering::Relaxed);
     }
 
+    /// Whether IRQs are unmasked **right now**, read from `DAIF` rather than
+    /// from the logging shadow above. The aarch64 counterpart of the x86
+    /// `are_enabled`; see there for why `sched::block_on` uses this as its
+    /// "am I holding a `Locked`" test.
+    #[inline]
+    pub fn are_enabled() -> bool {
+        !irqs_masked()
+    }
+
     #[inline]
     fn irqs_masked() -> bool {
         let daif: u64;

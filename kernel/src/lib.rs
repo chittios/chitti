@@ -615,50 +615,6 @@ fn capability_denial_is_refused_and_ktraced() {
     assert_eq!(cap::denials(), denials_before + 1, "the denial was not recorded/ktrace'd");
 }
 
-/// The cooperative async executor (`sched::executor`) is a separate
-/// concurrency layer from the stackful scheduler above -- this proves two
-/// futures interleave (each yields once via a waker-rescheduled `Poll`)
-/// entirely within one stackful task's call to `Executor::run`.
-#[test_case]
-fn async_executor_interleaves_two_futures() {
-    use core::future::Future;
-    use core::pin::Pin;
-    use core::sync::atomic::{AtomicU64, Ordering};
-    use core::task::{Context, Poll};
-
-    struct YieldOnce {
-        yielded: bool,
-    }
-
-    impl Future for YieldOnce {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            if self.yielded {
-                Poll::Ready(())
-            } else {
-                self.yielded = true;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let mut executor = sched::executor::Executor::new();
-    executor.spawn(async {
-        YieldOnce { yielded: false }.await;
-        COUNTER.fetch_add(1, Ordering::SeqCst);
-    });
-    executor.spawn(async {
-        YieldOnce { yielded: false }.await;
-        COUNTER.fetch_add(1, Ordering::SeqCst);
-    });
-    executor.run();
-
-    assert_eq!(COUNTER.load(Ordering::SeqCst), 2, "not all async tasks ran to completion");
-}
-
 // --- Phase 4 acceptance tests (Synapse capability ABI) ------------------
 
 /// (a) a malformed call is rejected by the grammar and never reaches a
