@@ -5,7 +5,7 @@
 //! there -- so this must run before any NEON/cached work.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 #[repr(align(4096))]
 struct Table(#[allow(dead_code)] [u64; 512]);
@@ -44,6 +44,34 @@ const FALLBACK_RAM_END: u64 = 0x4000_0000 + (4 << 30);
 /// Max RAM regions carried in boot-info (matches the stub's table size).
 const MAX_REGIONS: usize = 16;
 
+/// The RAM extents [`init`] typed its identity map from, republished so
+/// [`crate::mm`] can build a frame allocator without re-parsing the boot path.
+/// An array of atomics rather than a `static mut`: `init` writes them with the
+/// MMU already on, and every reader runs later.
+static RAM_REGIONS: [(AtomicU64, AtomicU64); MAX_REGIONS] =
+    [const { (AtomicU64::new(0), AtomicU64::new(0)) }; MAX_REGIONS];
+static N_RAM_REGIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// The **free** extents the UEFI stub reported (`CONVENTIONAL` memory only) —
+/// a strictly different list from [`RAM_REGIONS`], which is every DRAM address
+/// including firmware-owned memory. Empty on the `-kernel` path and on an older
+/// stub that does not publish the field.
+static FREE_REGIONS: [(AtomicU64, AtomicU64); MAX_REGIONS] =
+    [const { (AtomicU64::new(0), AtomicU64::new(0)) }; MAX_REGIONS];
+static N_FREE_REGIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// The stub's GOP framebuffer `(base, bytes)`, 0 on the `-kernel` path. Read by
+/// `mm` so a framebuffer that happens to live in RAM is never handed out as a
+/// free frame (on the UEFI path it is usually an MMIO aperture instead, in which
+/// case reserving it is a harmless no-op).
+static FB_REGION: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+
+/// Whether a valid boot-info page was present, i.e. whether this is the
+/// UEFI/stub path. Distinguishes "no firmware, the whole machine is ours" from
+/// "firmware owns memory we cannot enumerate" — a distinction the frame
+/// allocator's safety depends on, and which `ram_end != 0` cannot make.
+static HAVE_BOOTINFO: AtomicBool = AtomicBool::new(false);
+
 /// What [`detect`] found: the usable top address, (UEFI only) the stub's
 /// pre-allocated heap and model regions, and the machine's actual RAM extents
 /// (`(base, size)` pairs; `n_regions == 0` when the boot path can't provide
@@ -54,6 +82,12 @@ struct RamInfo {
     uefi_model: (u64, u64),
     regions: [(u64, u64); MAX_REGIONS],
     n_regions: usize,
+    /// UEFI only: `CONVENTIONAL` extents (see [`FREE_REGIONS`]).
+    free: [(u64, u64); MAX_REGIONS],
+    n_free: usize,
+    /// UEFI only: the GOP framebuffer `(base, bytes)`.
+    fb: (u64, u64),
+    have_bootinfo: bool,
 }
 
 impl RamInfo {
@@ -67,7 +101,17 @@ impl RamInfo {
         self
     }
     fn bare(ram_end: u64, uefi_heap_base: u64, uefi_model: (u64, u64)) -> RamInfo {
-        RamInfo { ram_end, uefi_heap_base, uefi_model, regions: [(0, 0); MAX_REGIONS], n_regions: 0 }
+        RamInfo {
+            ram_end,
+            uefi_heap_base,
+            uefi_model,
+            regions: [(0, 0); MAX_REGIONS],
+            n_regions: 0,
+            free: [(0, 0); MAX_REGIONS],
+            n_free: 0,
+            fb: (0, 0),
+            have_bootinfo: false,
+        }
     }
 }
 
@@ -97,6 +141,7 @@ fn detect() -> RamInfo {
         // type them correctly. Absent on an older stub → n_regions 0 → the
         // legacy Normal-to-ram_end map.
         let mut info = RamInfo::bare(ram_end, hb, (mb, ms));
+        info.have_bootinfo = true;
         let bi = super::boot::boot_x1() as *const u8;
         // SAFETY: same validated CHITTIBI page bootinfo_regions just read.
         let rd = |off: usize| -> u64 {
@@ -111,6 +156,19 @@ fn detect() -> RamInfo {
             }
             info = info.with_regions(&regs[..n]);
         }
+        // Free (`CONVENTIONAL`) extents at 520/528.., and the GOP framebuffer at
+        // 8/24/32. Both are for the frame allocator, not the map: the free list
+        // is what it may hand out, the framebuffer is what it must not. Absent
+        // (count 0) on a stub older than the field — deliberately not inferred
+        // from the RAM extents, which include firmware-owned memory.
+        let nf = rd(520) as usize;
+        if nf > 0 && nf <= MAX_REGIONS {
+            for i in 0..nf {
+                info.free[i] = (rd(528 + i * 16), rd(528 + i * 16 + 8));
+            }
+            info.n_free = nf;
+        }
+        info.fb = (rd(8), rd(24).saturating_mul(rd(32)));
         return info;
     }
     // QEMU `-kernel`: no DTB in x0 under HVF and no stub, so read the RAM size the
@@ -217,6 +275,23 @@ pub fn init() {
     UEFI_MODEL_BASE.store(info.uefi_model.0, Ordering::Relaxed);
     UEFI_MODEL_SIZE.store(info.uefi_model.1, Ordering::Relaxed);
     MAPPED_BYTES.store(map_gib << 30, Ordering::Relaxed);
+    // Republish the extents the map was typed from, plus the boot path's free
+    // list and framebuffer, so `mm` can build a frame allocator without
+    // re-parsing the DTB / boot-info page (which `detect` may have read with the
+    // MMU off, and which the framebuffer's own GiB may no longer be mapped for).
+    HAVE_BOOTINFO.store(info.have_bootinfo, Ordering::Relaxed);
+    for (i, &(b, s)) in info.regions[..info.n_regions].iter().enumerate() {
+        RAM_REGIONS[i].0.store(b, Ordering::Relaxed);
+        RAM_REGIONS[i].1.store(s, Ordering::Relaxed);
+    }
+    N_RAM_REGIONS.store(info.n_regions, Ordering::Relaxed);
+    for (i, &(b, s)) in info.free[..info.n_free].iter().enumerate() {
+        FREE_REGIONS[i].0.store(b, Ordering::Relaxed);
+        FREE_REGIONS[i].1.store(s, Ordering::Relaxed);
+    }
+    N_FREE_REGIONS.store(info.n_free, Ordering::Relaxed);
+    FB_REGION.0.store(info.fb.0, Ordering::Relaxed);
+    FB_REGION.1.store(info.fb.1, Ordering::Relaxed);
     if l2_overflow {
         crate::ktrace::log("mmu", "too many mixed RAM/MMIO GiB blocks; some mapped Normal (raise MAX_L2)");
     }
@@ -268,6 +343,53 @@ pub fn uefi_model() -> Option<(usize, usize)> {
 /// the kernel may dereference (e.g. the framebuffer must lie below this).
 pub fn mapped_bytes() -> u64 {
     MAPPED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Copy up to `out.len()` published extents out of `src`, returning the count.
+fn load_regions(
+    src: &[(AtomicU64, AtomicU64); MAX_REGIONS],
+    n: &AtomicUsize,
+    out: &mut [(u64, u64); MAX_REGIONS],
+) -> usize {
+    let n = n.load(Ordering::Relaxed).min(MAX_REGIONS);
+    for (o, s) in out.iter_mut().zip(src.iter()).take(n) {
+        *o = (s.0.load(Ordering::Relaxed), s.1.load(Ordering::Relaxed));
+    }
+    n
+}
+
+/// The machine's DRAM extents, as the identity map was typed from them. Written
+/// into `out` (no heap: the first caller runs during `mm::init`); returns how
+/// many are valid.
+///
+/// **This is every DRAM address, not free memory.** On the UEFI path it includes
+/// firmware runtime data, ACPI tables, the loaded kernel and the stub's own
+/// allocations — all correctly DRAM, none of it allocatable. Use
+/// [`free_regions`] to decide what may be handed out.
+pub fn ram_regions(out: &mut [(u64, u64); MAX_REGIONS]) -> usize {
+    load_regions(&RAM_REGIONS, &N_RAM_REGIONS, out)
+}
+
+/// The extents the UEFI stub reported as **free** (`CONVENTIONAL`) memory — the
+/// aarch64 counterpart of x86's `MEMMAP_USABLE` entries. 0 on the `-kernel` path
+/// (no firmware to ask) and on a stub predating the field; a caller that gets 0
+/// on the UEFI path must not substitute [`ram_regions`].
+pub fn free_regions(out: &mut [(u64, u64); MAX_REGIONS]) -> usize {
+    load_regions(&FREE_REGIONS, &N_FREE_REGIONS, out)
+}
+
+/// The stub's GOP framebuffer `(base, bytes)`, or `None` outside the UEFI path.
+pub fn framebuffer_region() -> Option<(u64, u64)> {
+    let (b, s) = (FB_REGION.0.load(Ordering::Relaxed), FB_REGION.1.load(Ordering::Relaxed));
+    (b != 0 && s != 0).then_some((b, s))
+}
+
+/// Whether the kernel was entered through the UEFI stub (a valid boot-info page
+/// in x1) rather than a firmware-less `-kernel`/m1n1 handoff. The two differ in
+/// who owns physical memory, which is why this is reported separately from
+/// whether any *particular* boot-info field was present.
+pub fn have_bootinfo() -> bool {
+    HAVE_BOOTINFO.load(Ordering::Relaxed)
 }
 
 /// Add a 1 GiB **Device** identity mapping for the block containing `pa`, live.

@@ -66,7 +66,12 @@ impl<T> Locked<T> {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+/// The physical frame allocator, on both arches.
+///
+/// `None` until built, and it can legitimately stay `None` on aarch64: unlike
+/// x86 — where Limine always states which memory is usable — some aarch64 boot
+/// paths give no trustworthy answer, and there the honest result is no allocator
+/// rather than a guessed pool. See [`aarch64_frames`].
 pub static FRAME_ALLOCATOR: Locked<Option<frame::BitmapFrameAllocator>> = Locked::new(None);
 
 use core::sync::atomic::AtomicU64;
@@ -316,6 +321,179 @@ pub fn init() {
     HEAP_BASE.store(base, Ordering::Relaxed);
     crate::ktrace::log_fmt(format_args!(
         "mm: aarch64 heap ready, {size} bytes at {base:#x} (top of RAM, identity-mapped normal memory)"
+    ));
+    // The physical frame allocator, for the 4 KiB page-table walker and (later)
+    // user pages. Optional: it declines rather than guess a pool. Not gated on
+    // `boot-limine`, whose aarch64 linker script publishes neither image symbol.
+    #[cfg(not(feature = "boot-limine"))]
+    aarch64_frames(base, size);
+}
+
+// The kernel image's own extent, from `linker-aarch64.ld`. `_image_start` is the
+// arm64 `Image` header at offset 0; `__stack_top` is past `.bss` *and* the boot
+// stack, so this one range covers text, rodata, data, the static L1/L2S
+// translation tables, the per-core AP stacks, and the boot stack the code
+// asking the question is running on. Runtime addresses (the kernel
+// self-relocates from `.rela.dyn`), which is what a physical reservation needs.
+#[cfg(all(target_arch = "aarch64", not(feature = "boot-limine")))]
+unsafe extern "C" {
+    static _image_start: u8;
+    static __stack_top: u8;
+}
+
+/// Build the aarch64 physical frame allocator, or decline and say why.
+///
+/// **The pool has to be memory nobody owns, and only some boot paths can say
+/// which memory that is.** The identity map is typed from *DRAM* extents, which
+/// on the UEFI path deliberately include firmware runtime data, ACPI tables and
+/// the stub's own allocations — correct for a map, catastrophic for an
+/// allocator. So the pool comes from a positive statement of freeness:
+///
+/// * **UEFI stub** — the `CONVENTIONAL` extents it publishes in boot-info, the
+///   exact counterpart of the `MEMMAP_USABLE` entries x86 builds from.
+/// * **QEMU `-kernel`** (DTB or fw_cfg, no firmware resident) — the whole
+///   machine is ours, so the DRAM extents minus what the kernel itself placed.
+/// * **anything else** — declined. Two real cases: a stub older than the free
+///   list (its DRAM extents cannot be distinguished from free memory), and
+///   Apple/m1n1, where m1n1 stays resident in RAM it does not describe.
+///
+/// Whatever the pool, [`ramlayout::carve_free`] then subtracts everything the
+/// kernel put in it. Getting that list wrong is silent corruption, so the result
+/// is verified against the reserved list before the allocator is published —
+/// and a failed check declines rather than panics, because this runs on
+/// platforms (VirtualBox-ARM, UTM, SBSA hardware) where an unbootable kernel is
+/// a worse outcome than a missing optional allocator. Nothing depends on it yet;
+/// once per-task address spaces do, the check should become fatal.
+#[cfg(all(target_arch = "aarch64", not(feature = "boot-limine")))]
+fn aarch64_frames(heap_base: usize, heap_size: usize) {
+    use crate::arch::aarch64::{boot, mmu};
+
+    let decline = |why: &str| crate::ktrace::log("mm", why);
+
+    let mut pool = [(0u64, 0u64); 16];
+    let mut n_pool = mmu::free_regions(&mut pool);
+    if n_pool == 0 {
+        if mmu::have_bootinfo() {
+            return decline(
+                "no free-memory extents in boot-info (stub predates the field): the DRAM extents \
+                 include firmware-owned memory, so there is no safe frame pool -- no frame allocator",
+            );
+        }
+        if crate::arch::aarch64::is_apple() {
+            return decline(
+                "Apple/m1n1 boot: m1n1 stays resident in RAM the device tree does not describe, \
+                 so no extent is known-free -- no frame allocator",
+            );
+        }
+        // Firmware-less `-kernel`: the DTB's `/memory` (or fw_cfg's ramsize) is
+        // the whole machine, and it is all ours.
+        n_pool = mmu::ram_regions(&mut pool);
+        if n_pool == 0 {
+            return decline("no RAM extents discovered at boot -- no frame allocator");
+        }
+    }
+    let pool = &pool[..n_pool];
+
+    // Everything the kernel or its loader placed inside that pool.
+    let mut reserved = [(0u64, 0u64); 8];
+    let mut k = 0usize;
+    let mut reserve = |base: u64, len: u64| {
+        if len > 0 && k < reserved.len() {
+            reserved[k] = (base, len);
+            k += 1;
+        }
+    };
+    // 1. The kernel image, including the stack this code is on.
+    let img = (&raw const _image_start) as u64;
+    let img_end = (&raw const __stack_top) as u64;
+    reserve(img, img_end.saturating_sub(img));
+    // 2. The heap just handed to the allocator.
+    reserve(heap_base as u64, heap_size as u64);
+    // 3. The model. Both shapes `cortex::model_module` may read: the extent the
+    //    stub reported, and the fixed-address window a QEMU `-device loader`
+    //    fills. The window runs to the top of RAM on the UEFI path (where the
+    //    heap is a separate firmware allocation) and to the heap otherwise —
+    //    mirroring `model_module` exactly, because a window it would read and
+    //    this would not is a model overwritten by a page table.
+    if let Some((b, s)) = mmu::uefi_model() {
+        reserve(b as u64, s as u64);
+    }
+    let model_addr = crate::cortex::MODEL_LOAD_ADDR as u64;
+    // Only touch the fixed address if it is genuinely RAM in this machine's
+    // layout. On Apple it is 2 GiB — 30 GiB below the RAM base — where the map
+    // is Device-typed and a read is a fatal abort, not a failed magic check.
+    let mut ram = [(0u64, 0u64); 16];
+    let n_ram = mmu::ram_regions(&mut ram);
+    if ramlayout::range_is_ram(model_addr, 4, &ram[..n_ram]) {
+        // SAFETY: those 4 bytes are inside a discovered RAM extent, which
+        // `mmu::init` identity-mapped Normal cacheable.
+        let magic = unsafe { core::slice::from_raw_parts(model_addr as *const u8, 4) };
+        if magic == b"GGUF" {
+            let end = if mmu::uefi_heap_base() != 0 { mmu::ram_end() } else { heap_base as u64 };
+            reserve(model_addr, end.saturating_sub(model_addr));
+        }
+    }
+    // 4. The device tree, which the boot path re-parses after `mm::init`.
+    // SAFETY: `boot_x0` is the DTB pointer (or not an FDT, rejected by magic).
+    if let Some(len) = unsafe { crate::fdt::total_size(boot::boot_x0()) } {
+        reserve(boot::boot_x0(), len);
+    }
+    // 5. The stub's boot-info page, still read for the RSDP and EDID.
+    if mmu::have_bootinfo() {
+        reserve(boot::boot_x1(), 4096);
+    }
+    // 6. The framebuffer. Usually an MMIO aperture outside the pool (in which
+    //    case this is a no-op), but on some platforms it is plain RAM.
+    if let Some((b, s)) = mmu::framebuffer_region() {
+        reserve(b, s);
+    }
+    let reserved = &reserved[..k];
+
+    let free = ramlayout::carve_free(pool, reserved);
+    if free.dropped() > 0 {
+        crate::ktrace::log_fmt(format_args!(
+            "mm: {} free fragment(s) did not fit the carve (raise ramlayout::MAX_FREE); \
+             the frame pool is under-reported",
+            free.dropped()
+        ));
+    }
+    if free.total() == 0 {
+        return decline("every discovered RAM extent is reserved -- no frame allocator");
+    }
+
+    // SAFETY: `free` is the pool minus every range the kernel placed in it, all
+    // frame-aligned, all inside extents `mmu::init` identity-mapped as Normal
+    // cacheable RAM — so `phys_offset` of 0 reaches them (VA == PA here).
+    let allocator = unsafe { frame::BitmapFrameAllocator::from_usable(free.as_slice().iter().copied(), 0) };
+
+    // Verify the carve before trusting it. Every frame of every reserved range
+    // must read back used: this is the only check that can catch a mistake in
+    // the list above, because the failure mode of a frame wrongly called free is
+    // not an error but corruption somewhere else, later, in whatever was
+    // overwritten.
+    for &(base, len) in reserved {
+        let end = base.saturating_add(len);
+        let mut p = base & !(frame::FRAME_SIZE - 1);
+        while p < end {
+            if !allocator.is_used(p) {
+                crate::ktrace::log_fmt(format_args!(
+                    "mm: BUG -- reserved frame {p:#x} (in {base:#x}+{len:#x}) reads back free; \
+                     declining the frame allocator rather than hand out kernel memory"
+                ));
+                return;
+            }
+            p += frame::FRAME_SIZE;
+        }
+    }
+
+    let (total, free_frames) = (allocator.frame_count(), allocator.free_frame_count());
+    FRAME_ALLOCATOR.with(|slot| *slot = Some(allocator));
+    crate::ktrace::log_fmt(format_args!(
+        "mm: aarch64 frame allocator ready, {free_frames}/{total} frames free ({} MiB) \
+         from {} pool extent(s) minus {k} reserved, {} fragment(s)",
+        free.total() >> 20,
+        pool.len(),
+        free.as_slice().len(),
     ));
 }
 

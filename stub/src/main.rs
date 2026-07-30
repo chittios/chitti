@@ -350,6 +350,55 @@ fn ram_regions() -> alloc::vec::Vec<(u64, u64)> {
     merged
 }
 
+/// The extents of memory that is **free for the OS to allocate from**:
+/// `CONVENTIONAL` descriptors only, sorted and merged.
+///
+/// This is a different question from [`ram_regions`] and conflating the two is a
+/// memory-corruption bug, not a tidiness one. `ram_regions` answers "which
+/// physical addresses are DRAM", which is what the kernel types its identity map
+/// from — so it deliberately includes firmware runtime data, ACPI tables, the
+/// stub's own allocations and the loaded kernel, all of which are DRAM and all of
+/// which must be mapped Normal-cacheable. A physical *frame allocator* needs the
+/// opposite: only memory nobody owns. Handing it `ram_regions` would let the
+/// kernel allocate a frame holding UEFI runtime services or the model it is about
+/// to run.
+///
+/// `CONVENTIONAL` is precisely UEFI's "free memory", i.e. the exact counterpart
+/// of Limine's `MEMMAP_USABLE` that x86's frame allocator is built from — so the
+/// two arches end up deriving their pool from the same statement by the firmware.
+/// Deliberately *not* included: `BOOT_SERVICES_CODE`/`DATA`, which do become free
+/// after `ExitBootServices` but which the firmware may still be using at the
+/// moment this runs, and `LOADER_*`, which is where the stub put the kernel,
+/// heap, model and this very page.
+///
+/// Must run *after* the stub's own `allocate_pages` calls, so that what it
+/// allocated is already excluded. Must run before `exit_boot_services`.
+fn free_regions() -> alloc::vec::Vec<(u64, u64)> {
+    use uefi::boot::MemoryType;
+    use uefi::mem::memory_map::MemoryMap;
+    let Ok(map) = boot::memory_map(MemoryType::LOADER_DATA) else {
+        return alloc::vec::Vec::new();
+    };
+    let mut ext: alloc::vec::Vec<(u64, u64)> = map
+        .entries()
+        .filter(|d| d.ty == MemoryType::CONVENTIONAL)
+        .map(|d| (d.phys_start, d.page_count * 4096))
+        .filter(|&(_, s)| s > 0)
+        .collect();
+    ext.sort_unstable();
+    let mut merged: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    for (b, s) in ext {
+        match merged.last_mut() {
+            Some((mb, ms)) if b <= *mb + *ms => {
+                let end = (b + s).max(*mb + *ms);
+                *ms = end - *mb;
+            }
+            _ => merged.push((b, s)),
+        }
+    }
+    merged
+}
+
 fn acpi_rsdp() -> u64 {
     use uefi::table::cfg::{ACPI2_GUID, ACPI_GUID};
     uefi::system::with_config_table(|entries| {
@@ -692,7 +741,26 @@ fn main() -> Status {
         let elen = edid_bytes.len().min(edid::BASE_BLOCK_LEN);
         page[384..388].copy_from_slice(&(elen as u32).to_le_bytes());
         page[388..388 + elen].copy_from_slice(&edid_bytes[..elen]);
-        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x}, heap {hb:#x}, model {mb:#x}, RAM {} MiB in {n} extent(s), EDID {elen}B -> boot-info {addr:#x}", ram >> 20);
+        // **Free** memory extents at 520.. : count@520, then up to 16
+        // (base@0, size@8) pairs from 528 (the EDID block ends at 516). These
+        // feed the kernel's physical frame allocator, and they are a strictly
+        // different list from the RAM extents at 104 — see `free_regions`. The
+        // count is written last of the two so an older kernel, which reads
+        // neither, is unaffected, and a newer kernel reading a count of 0 (an
+        // older stub) knows to decline rather than guess.
+        let free = free_regions();
+        let fnum = free.len().min(16);
+        if free.len() > 16 {
+            log::info!("chitti-stub: {} free extents; passing first 16", free.len());
+        }
+        page[520..528].copy_from_slice(&(fnum as u64).to_le_bytes());
+        let mut free_bytes = 0u64;
+        for (i, &(fb_, fsz)) in free.iter().take(fnum).enumerate() {
+            page[528 + i * 16..536 + i * 16].copy_from_slice(&fb_.to_le_bytes());
+            page[536 + i * 16..544 + i * 16].copy_from_slice(&fsz.to_le_bytes());
+            free_bytes += fsz;
+        }
+        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x}, heap {hb:#x}, model {mb:#x}, RAM {} MiB in {n} extent(s), free {} MiB in {fnum} extent(s), EDID {elen}B -> boot-info {addr:#x}", ram >> 20, free_bytes >> 20);
         Some(addr)
     })();
 
