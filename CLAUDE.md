@@ -83,8 +83,9 @@ Two layers, and new work adds to **both** where they apply:
    surfaces. A fix for something the harness could have caught gets a scenario
    too. Run `make e2e` before shipping boot-visible or networked changes.
 
-CI (`.github/workflows/ci.yml`) runs both on every push/PR: `unit` builds both
-arches + `cargo xtask test`; `e2e` boots the kernel and runs the os+net groups.
+CI (`.github/workflows/ci.yml`) runs the `unit` job on every push/PR: it builds
+both arches + `cargo xtask test`. The e2e suite is **not** run in CI — boot it
+locally with `make e2e` before shipping boot-visible or networked changes.
 It is **fork-PR-safe** — `pull_request` (never `pull_request_target`),
 `contents: read`, no secrets, GitHub-hosted runners only. Keep it that way.
 
