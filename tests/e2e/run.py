@@ -96,7 +96,14 @@ OS_CMDS = [
     # plumbing without needing inference.
     ("model_status", "/model", "model> active:"),
     ("think", "/think off", "think>"),
-    ("agents", "/agents", "agents>"),
+    # `/agents text` = flat serial list, for the same reason `/help text` is used
+    # above: bare `/agents` opens the framebuffer Agents browser, which captures
+    # every keystroke until Esc. The scenario itself still passed (its marker is
+    # printed *before* the browser opens), so the overlay stayed open and silently
+    # swallowed every command after it — which is what made `/ui`, `/ktrace`,
+    # `/top`, `/clear` and most of the suite below look broken. `shell::mod`'s
+    # dispatch offers this form explicitly "for e2e / scripting".
+    ("agents", "/agents text", "agents>"),
     ("ui", "/ui", "ui>"),
     ("ktrace", "/ktrace", "ktrace>"),
     ("close", "/close", "closed the active tab"),

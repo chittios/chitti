@@ -15029,6 +15029,33 @@ mod agent_flow_tests {
         );
         // No menu → nothing to accept, whatever is highlighted.
         assert!(!suggest_would_complete("/statusbar", 10, 0, &[]));
+
+        // The case the `/statusbar` pair above cannot catch, because nothing is
+        // named `/statusbarN`: a command typed in full that is also a **prefix of
+        // another command**. `/mode` is a prefix of `/model`, and the catalog
+        // declares `model` first, so item 0 used to be `/model` — Enter accepted
+        // it, the line became `/model `, the next command was appended onto it,
+        // and `/mode` could not be run at all. The gate was right; the candidate
+        // order was wrong (see `suggest::command_items`).
+        let buf = "/mode";
+        let it = items(buf);
+        assert!(
+            it.iter().any(|i| i.label == "/model"),
+            "test premise: /mode must still be a prefix of another command"
+        );
+        assert_eq!(it[0].label, "/mode", "a fully-typed command must be the highlighted candidate");
+        assert!(
+            !suggest_would_complete(buf, buf.len(), 0, &it),
+            "/mode must submit, not complete to /model"
+        );
+        // ...while the shared prefix of the two still completes normally.
+        let buf = "/mod";
+        let it = items(buf);
+        assert!(!it.is_empty(), "expected suggestions for {buf}");
+        assert!(
+            suggest_would_complete(buf, buf.len(), 0, &it),
+            "a genuine prefix must still complete on Enter"
+        );
     }
 
     /// `poll_interrupt` (the cancel-poll for running commands like `/http`)
