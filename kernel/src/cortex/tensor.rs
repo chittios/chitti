@@ -3064,6 +3064,23 @@ pub unsafe fn matvec_quant_rows(
     }
     let blocks = n_cols / elems;
     let row_bytes = blocks * block_bytes;
+    // F32 rows need no dequantization at all: going through the block loop
+    // copies every weight into a 32-float buffer just to dot it, which on
+    // Gemma-4-E4B's per-layer matrices is ~220 MB of pointless copying per
+    // token. Dot the row in place when the data is f32-aligned (GGUF pads tensor
+    // data to at least 32 bytes, so it is), else fall through to the safe path.
+    if qt == QT_F32 && (w as usize) % core::mem::align_of::<f32>() == 0 {
+        // SAFETY: caller's contract gives `n_rows` rows of `n_cols` f32 at `w`;
+        // the alignment check above makes the cast well-formed.
+        unsafe {
+            let xs = core::slice::from_raw_parts(x, n_cols);
+            for r in row_start..row_end {
+                let row = core::slice::from_raw_parts(w.add(r * row_bytes) as *const f32, n_cols);
+                *y.add(r) = dot_f32(row, xs);
+            }
+        }
+        return;
+    }
     let mut buf = [0.0f32; QK_K]; // holds one dequantized block (32 or 256)
     // SAFETY: caller's contract; every slice below is in bounds.
     unsafe {
@@ -4081,7 +4098,7 @@ mod tests {
         let types = [
             QT_F16, QT_Q4_0, QT_Q4_1, QT_Q5_0, QT_Q5_1, QT_Q8_0, QT_Q2_K, QT_Q3_K, QT_Q4_K, QT_Q5_K,
             QT_Q6_K, QT_Q8_K, QT_IQ2_XXS, QT_IQ2_XS, QT_IQ2_S, QT_IQ3_XXS, QT_IQ3_S, QT_IQ4_NL,
-            QT_IQ4_XS, QT_BF16,
+            QT_IQ4_XS, QT_BF16, QT_F32,
         ];
         let mut seed = 0x5EED_1234u32;
         for &qt in &types {
@@ -4111,5 +4128,22 @@ mod tests {
                 assert!(ok, "qt {qt} row {r}: got {got} want {want}");
             }
         }
+    }
+
+    /// `QT_F32` is a *weight* type, not a quantization: Gemma-4-E4B stores its
+    /// per-layer `inp_gate`/`proj` matrices as raw f32, and before this existed
+    /// the loader could not accept those tensors at all. Exact equality, since
+    /// the "dequant" is a little-endian copy.
+    #[test_case]
+    fn f32_weights_dequantize_to_themselves() {
+        assert_eq!(block_layout(QT_F32), (QK * 4, QK));
+        let vals: Vec<f32> = (0..QK).map(|i| i as f32 * 0.25 - 3.0).collect();
+        let mut bytes = Vec::new();
+        for v in &vals {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut out = [0.0f32; QK];
+        dequant_block(QT_F32, &bytes, &mut out);
+        assert_eq!(&out[..], &vals[..]);
     }
 }

@@ -99,6 +99,12 @@ pub struct SwaConfig {
     /// without it the model runs but decodes gibberish, since the residual
     /// stream is missing a term at every single layer.
     pub n_embd_per_layer: usize,
+    /// Number of leading layers that own a KV cache. Layers at or after this
+    /// index compute **only Q** and attend over an earlier layer's cache
+    /// (Gemma's "shared KV layers"): sliding ones reuse
+    /// `n_layer_kv_from_start - 2`, global ones `- 1`. Equal to `block_count`
+    /// when the model shares nothing.
+    pub n_layer_kv_from_start: usize,
 }
 
 /// The numeric hyperparameters Cortex's forward pass needs, pulled from the
@@ -141,6 +147,20 @@ impl Config {
     /// Is layer `l` a sliding-window layer (SWA families; false otherwise)?
     pub fn is_sliding(&self, l: usize) -> bool {
         self.swa.map(|s| (s.pattern >> l) & 1 == 1).unwrap_or(false)
+    }
+    /// Does layer `l` own a KV cache? False only for Gemma's shared-KV tail,
+    /// which attends over an earlier layer's cache and computes no K/V.
+    pub fn owns_kv(&self, l: usize) -> bool {
+        self.swa.map(|s| l < s.n_layer_kv_from_start).unwrap_or(true)
+    }
+    /// Slots in a sliding layer's KV ring. Deliberately **wider than the
+    /// window**: the window's K/V is committed to the ring before the shared-KV
+    /// layers that read it run, so a bare `window`-slot ring would have evicted
+    /// the oldest entries the earliest position of the chunk still needs (slot
+    /// `t % W` aliases `t - W`, which is inside the window). Doubling moves the
+    /// alias to `t - 2W`, outside it, for any prefill chunk up to `window`.
+    pub fn ring_slots(&self) -> usize {
+        self.swa.map(|s| s.window * 2).unwrap_or(0)
     }
 }
 
@@ -489,6 +509,9 @@ impl<'a> Gguf<'a> {
                     // without the PLE stack reads.
                     n_embd_per_layer: u32_of("embedding_length_per_layer_input")
                         .unwrap_or(0) as usize,
+                    n_layer_kv_from_start: block_count.saturating_sub(
+                        u32_of("attention.shared_kv_layers").unwrap_or(0) as usize,
+                    ),
                 };
                 (kv_swa, head_dim_swa, rope_dim_swa, f32_of("rope.freq_base_swa").unwrap_or(10_000.0), Some(swa))
             }
@@ -808,6 +831,47 @@ mod tests {
         assert_eq!(g.config.bos_token_id, Some(2));
         assert!(g.config.add_bos);
         assert_eq!(g.tokenizer_model, "gemma4");
+        // No per-layer-embedding stack and no shared KV in this fixture: absent
+        // keys must read as "every layer owns its KV", not as zero (which would
+        // make *every* layer a shared one).
+        assert_eq!(swa.n_embd_per_layer, 0);
+        assert_eq!(swa.n_layer_kv_from_start, g.config.block_count);
+        assert!(g.config.owns_kv(0) && g.config.owns_kv(3));
+        assert_eq!(g.config.ring_slots(), 256, "ring is 2x the window");
+    }
+
+    /// Gemma's shared-KV tail: layers at or after `n_layer_kv_from_start` own no
+    /// KV cache. `shared_kv_layers` counts the layers that *share*, so the
+    /// boundary is `block_count - shared` — reading it as the boundary directly
+    /// would invert the whole thing.
+    #[test_case]
+    fn gemma_shared_kv_layers_set_the_ownership_boundary() {
+        let mut b = B::new();
+        b.kv_str("general.architecture", "gemma4");
+        base_keys(&mut b, "gemma4");
+        b.kv_u32("gemma4.attention.sliding_window", 128);
+        b.kv_bool_array("gemma4.attention.sliding_window_pattern", &[true, true, true, false]);
+        b.kv_i32_array("gemma4.attention.head_count_kv", &[8, 8, 8, 1]);
+        b.kv_u32("gemma4.attention.key_length", 32);
+        b.kv_u32("gemma4.attention.key_length_swa", 16);
+        b.kv_u32("gemma4.rope.dimension_count", 32);
+        b.kv_u32("gemma4.rope.dimension_count_swa", 16);
+        b.kv_f32("gemma4.rope.freq_base", 1_000_000.0);
+        b.kv_f32("gemma4.rope.freq_base_swa", 10_000.0);
+        b.kv_u32("gemma4.attention.shared_kv_layers", 2);
+        b.kv_u32("gemma4.embedding_length_per_layer_input", 8);
+        b.kv_u32("tokenizer.ggml.bos_token_id", 2);
+        b.kv_u32("tokenizer.ggml.eos_token_id", 106);
+        b.kv_bool("tokenizer.ggml.add_bos_token", true);
+        b.kv_str("tokenizer.ggml.model", "gemma4");
+        let bytes = b.finish();
+        let g = Gguf::parse(&bytes).unwrap();
+        let swa = g.config.swa.unwrap();
+        assert_eq!(g.config.block_count, 4);
+        assert_eq!(swa.n_layer_kv_from_start, 2, "4 layers - 2 shared");
+        assert_eq!(swa.n_embd_per_layer, 8);
+        assert!(g.config.owns_kv(0) && g.config.owns_kv(1));
+        assert!(!g.config.owns_kv(2) && !g.config.owns_kv(3));
     }
 
     #[test_case]

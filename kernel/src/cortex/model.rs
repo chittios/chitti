@@ -273,6 +273,14 @@ enum LayerKind<'a> {
         rope_base: f32,
         /// p-RoPE frequency divisors (global layers; `rope_freqs.weight`).
         freq_factors: Option<&'a [f32]>,
+        /// Layer whose KV cache this layer attends over. Normally itself; for a
+        /// **shared-KV** layer (`il >= n_layer_kv_from_start`) it is an earlier
+        /// layer of the same kind, and this layer computes no K/V at all — its
+        /// `k`/`v` tensors exist in the file but are unused, exactly as
+        /// llama.cpp marks them `TENSOR_NOT_REQUIRED`. Getting this wrong is
+        /// silent: the layer still produces plausible activations from the wrong
+        /// history, which is what made 18 of Gemma-4-E4B's 42 layers wrong.
+        kv_src: usize,
     },
 }
 
@@ -381,6 +389,9 @@ pub struct State {
     /// Gemma E-series per-layer inputs for the current token (`E*n_layer`), and
     /// the `E`-wide gate scratch. Empty on every other model.
     ple: Vec<f32>,
+    /// The per-layer *table* row for the current token, kept here rather than
+    /// allocated per token.
+    ple_tok: Vec<f32>,
     pl_gate: Vec<f32>,
 }
 
@@ -432,6 +443,7 @@ impl State {
             xq: alloc::vec![0i8; max_cols],
             xs: alloc::vec![0.0f32; max_cols / QK],
             ple: v(ple_len),
+            ple_tok: v(ple_len),
             pl_gate: v(ple_e),
         }
     }
@@ -476,11 +488,22 @@ impl Cache {
                 // Sliding-window layers bound their KV to a W-slot ring (the
                 // base config geometry is the sliding-layer one); global /
                 // full-history layers grow with the actual sequence.
-                if c.is_sliding(l) {
-                    let w = c.swa.map(|s| s.window).unwrap_or(0);
+                // A shared-KV layer allocates nothing: it attends over `kv_src`'s
+                // cache (see `LayerKind::GemmaAttn::kv_src`).
+                if !c.owns_kv(l) {
+                    attn_k.push(Vec::new());
+                    attn_v.push(Vec::new());
+                    ring.push(c.is_sliding(l));
+                } else if c.is_sliding(l) {
+                    // `ring_slots`, not `window`: a shared layer reads this ring
+                    // *after* the window was committed, so a bare W-slot ring
+                    // would have already evicted the oldest entries that the
+                    // earliest position in the chunk still needs. See
+                    // `Config::ring_slots`.
+                    let slots = c.ring_slots();
                     let kv_dim = c.head_count_kv * c.head_dim;
-                    attn_k.push(alloc::vec![0.0f32; w * kv_dim]);
-                    attn_v.push(alloc::vec![0.0f32; w * kv_dim]);
+                    attn_k.push(alloc::vec![0.0f32; slots * kv_dim]);
+                    attn_v.push(alloc::vec![0.0f32; slots * kv_dim]);
                     ring.push(true);
                 } else {
                     attn_k.push(Vec::new());
@@ -612,6 +635,14 @@ impl<'a> Model<'a> {
                         window,
                         rope_base,
                         freq_factors,
+                        // Shared-KV layers reuse an earlier layer of the same
+                        // kind: sliding -> `kv_from_start - 2`, global -> `- 1`
+                        // (llama.cpp's `layer_reuse_cb` for GEMMA3N/GEMMA4).
+                        kv_src: if l < swa.n_layer_kv_from_start {
+                            l
+                        } else {
+                            swa.n_layer_kv_from_start - if sliding { 2 } else { 1 }
+                        },
                     };
                     (kind, f32_tensor(&gguf, &n("ffn_norm.weight"), dim)?)
                 }
@@ -899,11 +930,19 @@ impl<'a> Model<'a> {
         let mut ple_all = alloc::vec![0.0f32; m * el];
         let mut pl_gate = alloc::vec![0.0f32; ple_e];
         if el > 0 {
-            let mut scaled = alloc::vec![0.0f32; dim];
+            // `hidden` is this call's own buffer, so its row can be handed over
+            // directly — no per-position copy.
+            let State { ple, ple_tok, xq: sxq, xs: sxs, .. } = &mut *s;
             for mi in 0..m {
-                scaled.copy_from_slice(&hidden[mi * dim..(mi + 1) * dim]);
-                self.per_layer_inputs(prompt[mi], &scaled, s);
-                ple_all[mi * el..(mi + 1) * el].copy_from_slice(&s.ple[..el]);
+                self.per_layer_inputs(
+                    prompt[mi],
+                    &hidden[mi * dim..(mi + 1) * dim],
+                    ple,
+                    ple_tok,
+                    sxq,
+                    sxs,
+                );
+                ple_all[mi * el..(mi + 1) * el].copy_from_slice(&ple[..el]);
             }
         }
 
@@ -938,10 +977,13 @@ impl<'a> Model<'a> {
                     let gkv = n_kv * ghd;
                     let gao = nq * ghd;
                     self.batched_proj(q_w, &norm, &mut q, &mut xq, &mut xs, m, gao, dim);
-                    self.batched_proj(k_w, &norm, &mut k, &mut xq, &mut xs, m, gkv, dim);
-                    match v_w {
-                        Some(vw) => self.batched_proj(vw, &norm, &mut v, &mut xq, &mut xs, m, gkv, dim),
-                        None => v[..m * gkv].copy_from_slice(&k[..m * gkv]),
+                    // Shared-KV layer: Q only (see `GemmaAttn::kv_src`).
+                    if c.owns_kv(l) {
+                        self.batched_proj(k_w, &norm, &mut k, &mut xq, &mut xs, m, gkv, dim);
+                        match v_w {
+                            Some(vw) => self.batched_proj(vw, &norm, &mut v, &mut xq, &mut xs, m, gkv, dim),
+                            None => v[..m * gkv].copy_from_slice(&k[..m * gkv]),
+                        }
                     }
                     t = phase_mark(&PHASE_PROJ, t);
                     self.gemma_attn_core_batched(
@@ -1174,8 +1216,9 @@ impl<'a> Model<'a> {
         // Per-layer inputs are derived from the *scaled* embedding, so this must
         // follow the scale above and precede the layer loop.
         if !s.ple.is_empty() {
-            let scaled = s.hidden.clone();
-            self.per_layer_inputs(token, &scaled, s);
+            // Disjoint field borrows — no clone of the hidden row.
+            let State { hidden, ple, ple_tok, xq, xs, .. } = s;
+            self.per_layer_inputs(token, hidden, ple, ple_tok, xq, xs);
         }
 
         for l in 0..self.layers.len() {
@@ -1262,13 +1305,17 @@ impl<'a> Model<'a> {
         // Exact-length slices: the scratch is sized for the widest geometry
         // (`State::new`), and the int8-quantize path requires x.len == n_cols.
         matvec_qw(q_w, &s.norm, &mut s.q[..nq * hd], &mut s.xq, &mut s.xs, nq * hd, dim);
-        matvec_qw(k_w, &s.norm, &mut s.k[..kv_dim], &mut s.xq, &mut s.xs, kv_dim, dim);
-        match v_w {
-            Some(v) => matvec_qw(v, &s.norm, &mut s.v[..kv_dim], &mut s.xq, &mut s.xs, kv_dim, dim),
-            // Global layers have no V projection: V = K (pre-norm/rope copy).
-            None => {
-                let (k, v) = (&s.k[..kv_dim], &mut s.v[..kv_dim]);
-                v.copy_from_slice(k);
+        // A shared-KV layer projects **Q only** and attends over `kv_src`'s
+        // cache; its own k/v tensors are unused (llama.cpp: TENSOR_NOT_REQUIRED).
+        if c.owns_kv(l) {
+            matvec_qw(k_w, &s.norm, &mut s.k[..kv_dim], &mut s.xq, &mut s.xs, kv_dim, dim);
+            match v_w {
+                Some(v) => matvec_qw(v, &s.norm, &mut s.v[..kv_dim], &mut s.xq, &mut s.xs, kv_dim, dim),
+                // Global layers have no V projection: V = K (pre-norm/rope copy).
+                None => {
+                    let (k, v) = (&s.k[..kv_dim], &mut s.v[..kv_dim]);
+                    v.copy_from_slice(k);
+                }
             }
         }
 
@@ -1284,15 +1331,16 @@ impl<'a> Model<'a> {
     /// attention at scale 1.0 over the layer's window.
     fn gemma_attn_core(&self, l: usize, pos: usize, cache: &mut Cache, s: &mut State) {
         let c = &self.config;
-        let (q_norm, k_norm, n_kv, hd, window, rope_base, freq_factors) = match &self.layers[l].kind {
-            LayerKind::GemmaAttn { q_norm, k_norm, n_kv, head_dim, window, rope_base, freq_factors, .. } => {
-                (*q_norm, *k_norm, *n_kv, *head_dim, *window, *rope_base, *freq_factors)
+        let (q_norm, k_norm, n_kv, hd, window, rope_base, freq_factors, kv_src) = match &self.layers[l].kind {
+            LayerKind::GemmaAttn { q_norm, k_norm, n_kv, head_dim, window, rope_base, freq_factors, kv_src, .. } => {
+                (*q_norm, *k_norm, *n_kv, *head_dim, *window, *rope_base, *freq_factors, *kv_src)
             }
             _ => unreachable!(),
         };
         let nq = c.head_count;
         let kv_dim = n_kv * hd;
         let group = nq / n_kv;
+        let owns = c.owns_kv(l);
 
         // Per-head norms + full-dim RoPE. V gets a bare (unweighted) RMS norm.
         for h in 0..nq {
@@ -1300,30 +1348,41 @@ impl<'a> Model<'a> {
             tensor::rmsnorm_inplace(q, q_norm, c.rms_eps);
             tensor::rope_ext(q, pos, hd, rope_base, freq_factors);
         }
-        for h in 0..n_kv {
-            let k = &mut s.k[h * hd..(h + 1) * hd];
-            tensor::rmsnorm_inplace(k, k_norm, c.rms_eps);
-            let v = &mut s.v[h * hd..(h + 1) * hd];
-            rms_scale(v, c.rms_eps);
-            tensor::rope_ext(k, pos, hd, rope_base, freq_factors);
+        if owns {
+            for h in 0..n_kv {
+                let k = &mut s.k[h * hd..(h + 1) * hd];
+                tensor::rmsnorm_inplace(k, k_norm, c.rms_eps);
+                let v = &mut s.v[h * hd..(h + 1) * hd];
+                rms_scale(v, c.rms_eps);
+                tensor::rope_ext(k, pos, hd, rope_base, freq_factors);
+            }
         }
 
-        // KV store: sliding layers keep a fixed W-slot ring (keys roped at
-        // absolute position before insertion, so eviction never re-ropes);
-        // global layers append full history.
+        // KV store: sliding layers keep a ring (keys roped at absolute position
+        // before insertion, so eviction never re-ropes); global layers append
+        // full history. A shared-KV layer stores nothing — it only reads.
+        let slots = c.ring_slots();
         let (t_lo, ring) = match window {
             Some(w) => {
-                let slot = (pos % w) * kv_dim;
-                cache.attn_k[l][slot..slot + kv_dim].copy_from_slice(&s.k[..kv_dim]);
-                cache.attn_v[l][slot..slot + kv_dim].copy_from_slice(&s.v[..kv_dim]);
-                ((pos + 1).saturating_sub(w), Some(w))
+                if owns {
+                    let slot = (pos % slots) * kv_dim;
+                    cache.attn_k[l][slot..slot + kv_dim].copy_from_slice(&s.k[..kv_dim]);
+                    cache.attn_v[l][slot..slot + kv_dim].copy_from_slice(&s.v[..kv_dim]);
+                }
+                ((pos + 1).saturating_sub(w), Some(slots))
             }
             None => {
-                cache.attn_k[l].extend_from_slice(&s.k[..kv_dim]);
-                cache.attn_v[l].extend_from_slice(&s.v[..kv_dim]);
+                if owns {
+                    cache.attn_k[l].extend_from_slice(&s.k[..kv_dim]);
+                    cache.attn_v[l].extend_from_slice(&s.v[..kv_dim]);
+                }
                 (0, None)
             }
         };
+        // Read side: this layer's own cache, or its source's when shared. Named
+        // separately from `l` so a later edit cannot confuse "the layer I am"
+        // with "the layer whose history I read".
+        let src = kv_src;
 
         // Causal attention, scale 1.0 (Gemma-4: the QK-norms replace 1/sqrt(d)).
         for h in 0..nq {
@@ -1334,7 +1393,7 @@ impl<'a> Model<'a> {
                     Some(w) => (t % w) * kv_dim + kvh * hd,
                     None => t * kv_dim + kvh * hd,
                 };
-                s.scores[t - t_lo] = tensor::dot_f32(q_head, &cache.attn_k[l][off..off + hd]);
+                s.scores[t - t_lo] = tensor::dot_f32(q_head, &cache.attn_k[src][off..off + hd]);
             }
             tensor::softmax(&mut s.scores[0..=pos - t_lo]);
             let out = &mut s.attn_out[h * hd..(h + 1) * hd];
@@ -1344,7 +1403,7 @@ impl<'a> Model<'a> {
                     Some(w) => (t % w) * kv_dim + kvh * hd,
                     None => t * kv_dim + kvh * hd,
                 };
-                let v_t = &cache.attn_v[l][off..off + hd];
+                let v_t = &cache.attn_v[src][off..off + hd];
                 let w = s.scores[t - t_lo];
                 for i in 0..hd {
                     out[i] += w * v_t[i];
@@ -1576,9 +1635,9 @@ impl<'a> Model<'a> {
         out: &mut [f32],
     ) {
         let c = &self.config;
-        let (q_norm, k_norm, n_kv, hd, window, rope_base, freq_factors) = match &self.layers[l].kind {
-            LayerKind::GemmaAttn { q_norm, k_norm, n_kv, head_dim, window, rope_base, freq_factors, .. } => {
-                (*q_norm, *k_norm, *n_kv, *head_dim, *window, *rope_base, *freq_factors)
+        let (q_norm, k_norm, n_kv, hd, window, rope_base, freq_factors, kv_src) = match &self.layers[l].kind {
+            LayerKind::GemmaAttn { q_norm, k_norm, n_kv, head_dim, window, rope_base, freq_factors, kv_src, .. } => {
+                (*q_norm, *k_norm, *n_kv, *head_dim, *window, *rope_base, *freq_factors, *kv_src)
             }
             _ => unreachable!(),
         };
@@ -1586,6 +1645,7 @@ impl<'a> Model<'a> {
         let kv_dim = n_kv * hd;
         let ao = nq * hd;
         let group = nq / n_kv;
+        let owns = c.owns_kv(l);
 
         // Per-head norms + full-dim RoPE, per position. Order-independent: a
         // position's rotation depends only on its own absolute index. V takes a
@@ -1597,12 +1657,14 @@ impl<'a> Model<'a> {
                 tensor::rmsnorm_inplace(qh, q_norm, c.rms_eps);
                 tensor::rope_ext(qh, pos, hd, rope_base, freq_factors);
             }
-            for h in 0..n_kv {
-                let kh = &mut k[mi * kv_dim + h * hd..mi * kv_dim + (h + 1) * hd];
-                tensor::rmsnorm_inplace(kh, k_norm, c.rms_eps);
-                let vh = &mut v[mi * kv_dim + h * hd..mi * kv_dim + (h + 1) * hd];
-                rms_scale(vh, c.rms_eps);
-                tensor::rope_ext(kh, pos, hd, rope_base, freq_factors);
+            if owns {
+                for h in 0..n_kv {
+                    let kh = &mut k[mi * kv_dim + h * hd..mi * kv_dim + (h + 1) * hd];
+                    tensor::rmsnorm_inplace(kh, k_norm, c.rms_eps);
+                    let vh = &mut v[mi * kv_dim + h * hd..mi * kv_dim + (h + 1) * hd];
+                    rms_scale(vh, c.rms_eps);
+                    tensor::rope_ext(kh, pos, hd, rope_base, freq_factors);
+                }
             }
         }
 
@@ -1623,9 +1685,18 @@ impl<'a> Model<'a> {
             group: usize,
             ao: usize,
             sl: usize,
-            /// Ring length for a sliding layer, or 0 for a full-history global
+            /// Attention span of a sliding layer, 0 for a global layer. Distinct
+            /// from `slots`: this bounds *what is attended to*, `slots` is only
+            /// the ring's modulus.
+            win: usize,
+            /// Ring modulus for a sliding layer, 0 for a full-history global
             /// layer (whose cache is indexed by absolute `t`).
-            ring: usize,
+            slots: usize,
+            /// Whether this layer computed the window's K/V itself. False on a
+            /// shared-KV layer, whose chunk buffers are empty — every `t` must
+            /// then come from `kv_src`'s cache, which its source already
+            /// committed.
+            own_window: bool,
         }
         /// # Safety
         /// `ctx` is the live `Ctx` published below; `[start, end)` is a range of
@@ -1636,10 +1707,10 @@ impl<'a> Model<'a> {
             let c = unsafe { &*(ctx as *const Ctx) };
             // Offset of time `t`'s K/V row, and which buffer it lives in.
             let row = |t: usize, kvh: usize| -> (bool, usize) {
-                if t >= c.pos0 {
+                if c.own_window && t >= c.pos0 {
                     (true, (t - c.pos0) * c.kv_dim + kvh * c.hd)
-                } else if c.ring != 0 {
-                    (false, (t % c.ring) * c.kv_dim + kvh * c.hd)
+                } else if c.slots != 0 {
+                    (false, (t % c.slots) * c.kv_dim + kvh * c.hd)
                 } else {
                     (false, t * c.kv_dim + kvh * c.hd)
                 }
@@ -1647,7 +1718,7 @@ impl<'a> Model<'a> {
             for mi in start..end {
                 let pos = c.pos0 + mi;
                 // A sliding layer attends only over its window.
-                let t_lo = if c.ring != 0 { (pos + 1).saturating_sub(c.ring) } else { 0 };
+                let t_lo = if c.win != 0 { (pos + 1).saturating_sub(c.win) } else { 0 };
                 let n = pos + 1 - t_lo;
                 // SAFETY: this worker owns position `mi`, and `sl >= n`.
                 let sc = unsafe { core::slice::from_raw_parts_mut(c.scores.add(mi * c.sl), n) };
@@ -1685,11 +1756,11 @@ impl<'a> Model<'a> {
             }
         }
 
-        let ring = window.unwrap_or(0);
         let mut ctx = Ctx {
             q: q.as_ptr(),
-            kc: cache.attn_k[l].as_ptr(),
-            vc: cache.attn_v[l].as_ptr(),
+            // Read side is `kv_src`: itself normally, an earlier layer when shared.
+            kc: cache.attn_k[kv_src].as_ptr(),
+            vc: cache.attn_v[kv_src].as_ptr(),
             kb: k.as_ptr(),
             vb: v.as_ptr(),
             scores: scores.as_mut_ptr(),
@@ -1701,16 +1772,23 @@ impl<'a> Model<'a> {
             group,
             ao,
             sl: pos0 + m,
-            ring,
+            win: window.unwrap_or(0),
+            slots: if window.is_some() { c.ring_slots() } else { 0 },
+            own_window: owns,
         };
         // SAFETY: `positions` is safe on disjoint position ranges sharing `ctx`,
         // which lives until `parallel_for` returns.
         unsafe { crate::arch::parallel_for(m, 1, positions, &mut ctx as *mut Ctx as *mut u8) };
 
         // Commit the window now that every position has read the history it
-        // needed (see the read-before-commit note above).
+        // needed (see the read-before-commit note above). A shared-KV layer has
+        // nothing to commit.
+        if !owns {
+            return;
+        }
         match window {
-            Some(w) => {
+            Some(_) => {
+                let w = c.ring_slots();
                 for mi in 0..m {
                     let slot = ((pos0 + mi) % w) * kv_dim;
                     cache.attn_k[l][slot..slot + kv_dim]
@@ -1730,14 +1808,26 @@ impl<'a> Model<'a> {
     /// `build_inp_per_layer` + `project_per_layer_inputs`): writes `E*n_layer`
     /// floats, layer `il`'s slice being `out[il*E..(il+1)*E]`.
     ///
-    /// Two terms are summed and halved: the token's row of a second,
+    /// Two terms are summed and scaled by `1/sqrt(2)`: the token's row of a second,
     /// per-layer embedding table (scaled by `sqrt(E)`), and a projection of the
     /// *already sqrt(dim)-scaled* input embedding (scaled by `1/sqrt(dim)`, then
     /// RMS-normed per layer). The `1/sqrt(2)` is the reference's
     /// `per_layer_input_scale` — it is what makes the sum an average rather than
     /// a doubling, and dropping it silently doubles every layer's injected
     /// signal.
-    fn per_layer_inputs(&self, token: usize, scaled_embd: &[f32], s: &mut State) {
+    /// Takes explicit slices rather than `&mut State` so the caller can pass its
+    /// own hidden row as `scaled_embd` without cloning it, and so the `E*n_layer`
+    /// scratch is preallocated instead of heap-allocated per token (43 KiB per
+    /// token on the E4B — see the allocator-churn rule in CLAUDE.md).
+    fn per_layer_inputs(
+        &self,
+        token: usize,
+        scaled_embd: &[f32],
+        ple: &mut [f32],
+        ple_tok: &mut [f32],
+        xq: &mut [i8],
+        xs: &mut [f32],
+    ) {
         let c = &self.config;
         let e = match c.swa.map(|w| w.n_embd_per_layer).unwrap_or(0) {
             0 => return,
@@ -1749,13 +1839,13 @@ impl<'a> Model<'a> {
         };
         let el = e * c.block_count;
         // Term 1: the per-layer embedding row for this token.
-        let mut ple = alloc::vec![0.0f32; el];
-        dequant_embed_row(tok_w, token, &mut ple);
+        let tok_row = &mut ple_tok[..el];
+        dequant_embed_row(tok_w, token, tok_row);
         let ts = tensor_sqrtf(e as f32);
-        ple.iter_mut().for_each(|x| *x *= ts);
+        tok_row.iter_mut().for_each(|x| *x *= ts);
         // Term 2: project the scaled input embedding, then RMS-norm per layer.
-        let out = &mut s.ple[..el];
-        matvec_qw(proj_w, scaled_embd, out, &mut s.xq, &mut s.xs, el, c.embedding_length);
+        let out = &mut ple[..el];
+        matvec_qw(proj_w, scaled_embd, out, xq, xs, el, c.embedding_length);
         let ps = 1.0 / tensor_sqrtf(c.embedding_length as f32);
         out.iter_mut().for_each(|x| *x *= ps);
         for il in 0..c.block_count {
@@ -1764,7 +1854,7 @@ impl<'a> Model<'a> {
         // Combine. `1/sqrt(2)`, not `1/2` — the reference scales the sum, and the
         // two terms are not independent draws.
         let is = 1.0 / tensor_sqrtf(2.0);
-        for (o, p) in out.iter_mut().zip(ple.iter()) {
+        for (o, p) in out.iter_mut().zip(tok_row.iter()) {
             *o = (*o + *p) * is;
         }
     }
