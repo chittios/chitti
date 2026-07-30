@@ -456,6 +456,167 @@ pub fn map_ram_gib_if_unmapped(pa: u64) {
     }
 }
 
+// --- 4 KiB page mapping over the boot identity map -----------------------
+
+/// The hardware's half of [`crate::mm::walk`]: barriers and TLB maintenance.
+/// The descriptor manipulation, block splitting and break-before-make ordering
+/// live there, arch-neutral, so the x86-only unit suite actually executes them.
+struct HwMmu;
+
+impl crate::mm::walk::Mmu for HwMmu {
+    // `table_ptr` is the default identity: this kernel runs VA == PA, so a
+    // table's physical address *is* where it is readable.
+
+    fn publish(&self) {
+        // SAFETY: a store barrier. The table walker's accesses are
+        // inner-shareable cacheable (see `enable_mmu`'s TCR), so they are
+        // coherent with these stores once ordered — no cache maintenance needed.
+        unsafe { asm!("dsb ishst", options(nostack, preserves_flags)) };
+    }
+
+    fn invalidate_page(&self, va: u64) {
+        // SAFETY: TLB maintenance is always architecturally safe. `vaae1is` is
+        // the by-address, all-ASID, EL1, **inner-shareable** form: the shareable
+        // domain is what makes the other cores drop the entry too, which the
+        // non-shareable `tlbi vmalle1` this file used to reach for does not do.
+        // The operand is the VA in units of 4 KiB pages, not bytes.
+        unsafe {
+            asm!("tlbi vaae1is, {}", "dsb ish", "isb", in(reg) va >> 12, options(nostack, preserves_flags));
+        }
+    }
+
+    fn invalidate_all(&self) {
+        // SAFETY: as above, for every entry — the scope a block split needs.
+        unsafe { asm!("tlbi vmalle1is", "dsb ish", "isb", options(nostack, preserves_flags)) };
+    }
+}
+
+/// The kernel's root (level 1) translation table, by physical address. This is
+/// the table `TTBR0_EL1` points at on every core.
+pub fn kernel_root() -> u64 {
+    core::ptr::addr_of!(L1) as u64
+}
+
+/// Map the 4 KiB page at `va` to `pa` with `attrs` (see [`crate::mm::armv8`]) in
+/// the live kernel translation table, taking intermediate tables from the
+/// physical frame allocator.
+///
+/// **Blocks are never split here.** The boot identity map is built from 1 GiB and
+/// 2 MiB blocks, and every one of them covers running code, the stack, the heap,
+/// or MMIO a driver is mid-transaction with — while a split leaves that whole
+/// range unmapped between the break and the make, for every core, not just this
+/// one. So a `va` already covered by a block is refused
+/// ([`crate::mm::walk::MapError::WouldSplitBlock`]) rather than silently
+/// risked; splitting is for a table the caller owns exclusively, which is what
+/// per-task address spaces will build.
+///
+/// In practice that costs nothing: the addresses a new mapping wants are the ones
+/// the boot map left *invalid*, where the walk allocates tables and no split
+/// arises.
+pub fn map_page(va: u64, pa: u64, attrs: u64) -> Result<(), crate::mm::walk::MapError> {
+    use crate::mm::walk::{self, MapError, Split};
+    // `Locked::with` runs with interrupts disabled, which is also what the walk
+    // needs: it must not be interrupted between a break and its make.
+    crate::mm::FRAME_ALLOCATOR.with(|slot| match slot.as_mut() {
+        // SAFETY: `kernel_root` is the live L1 table `TTBR0_EL1` uses, reachable
+        // at its physical address (VA == PA), and `Split::Refuse` keeps the walk
+        // from unmapping any range this core is running out of.
+        Some(alloc) => unsafe {
+            walk::map_page(&HwMmu, kernel_root(), va, pa, attrs, Split::Refuse, alloc)
+        },
+        None => Err(MapError::NoFrameAllocator),
+    })
+}
+
+/// Unmap the 4 KiB page at `va` from the live kernel table; `true` if something
+/// was mapped there. A `va` covered by a **block** is left alone (reported
+/// `false`) — see [`crate::mm::walk::unmap_page`].
+pub fn unmap_page(va: u64) -> bool {
+    // SAFETY: the live L1 table, reachable at its physical address.
+    crate::arch::interrupts::without_interrupts(|| unsafe {
+        crate::mm::walk::unmap_page(&HwMmu, kernel_root(), va)
+    })
+}
+
+/// The physical address `va` currently translates to, resolving blocks as well
+/// as pages — i.e. what the hardware walker would find. For diagnostics and for
+/// confirming a mapping took, rather than discovering it did not via a fault.
+pub fn translate(va: u64) -> Option<u64> {
+    // SAFETY: the live L1 table, reachable at its physical address.
+    unsafe { crate::mm::walk::translate(&HwMmu, kernel_root(), va) }
+}
+
+/// Prove the 4 KiB walker works on *this* machine, once, at boot.
+///
+/// [`crate::mm::walk`]'s logic is covered by the x86 unit suite, but its
+/// platform half is not: the `tlbi vaae1is` operand scaling, where the `dsb`s
+/// sit, and whether a fresh mapping is actually usable are properties of the
+/// hardware, and nothing else in the kernel calls [`map_page`] yet. So this maps
+/// a frame at an unused high virtual address, writes a pattern through the new
+/// mapping and reads it back, then unmaps it — the same posture as the SMP wake
+/// self-test, and for the same reason: a mapping facility that silently does not
+/// work is far worse than one that says so at boot.
+///
+/// The write is the load-bearing part. Installing a descriptor over a previously
+/// *invalid* entry needs no break-before-make, but the architecture does permit a
+/// cached faulting entry — so the store only lands if the invalidate after the
+/// make is right. A wrong `tlbi` operand shows up here as a fault or a stale
+/// read, not as a compile error.
+///
+/// Returns `Err` with a short reason instead of panicking; the caller ktraces it.
+pub fn walker_self_test() -> Result<(), &'static str> {
+    use crate::mm::armv8;
+    // The last gigabyte of the 39-bit VA space: past anything `init` mapped on
+    // any plausible machine, and checked for emptiness rather than assumed.
+    let va = (1u64 << armv8::VA_BITS) - (1 << 30);
+    if translate(va).is_some() {
+        return Err("test address is already mapped");
+    }
+    let phys = crate::mm::FRAME_ALLOCATOR
+        .with(|slot| slot.as_mut().and_then(|a| a.allocate()))
+        .ok_or("no frame to map")?;
+    let attrs = armv8::normal_attrs() | armv8::UXN | armv8::PXN;
+    let outcome = map_page(va, phys, attrs)
+        .map_err(|_| "map_page refused")
+        .and_then(|()| {
+            if translate(va) != Some(phys) {
+                return Err("mapping does not read back");
+            }
+            const PATTERN: u64 = 0x0123_4567_89ab_cdef;
+            // SAFETY: `va` was unmapped a moment ago and now maps `phys`, a
+            // freshly-allocated frame owned by nothing else. Volatile so the
+            // write and the read cannot be folded away.
+            let seen = unsafe {
+                core::ptr::write_volatile(va as *mut u64, PATTERN);
+                core::ptr::read_volatile(va as *const u64)
+            };
+            if seen != PATTERN {
+                return Err("write through the new mapping did not land");
+            }
+            // The same bytes must be visible at the frame's identity address —
+            // proof the mapping points where it claims rather than somewhere
+            // that merely happens to be writable.
+            // SAFETY: `phys` is an owned frame inside the identity map.
+            if unsafe { core::ptr::read_volatile(phys as *const u64) } != PATTERN {
+                return Err("the mapping does not alias the frame it names");
+            }
+            Ok(())
+        });
+    // Always tear down, whatever happened: leaving a stray high mapping (and a
+    // leaked frame) behind would be a worse legacy than a failed self-test.
+    let unmapped = unmap_page(va);
+    crate::mm::FRAME_ALLOCATOR.with(|slot| {
+        if let Some(a) = slot.as_mut() {
+            a.free(phys)
+        }
+    });
+    outcome?;
+    if !unmapped || translate(va).is_some() {
+        return Err("unmap did not clear the mapping");
+    }
+    Ok(())
+}
+
 /// Enable the MMU + caches on a secondary core, reusing the BSP's already-built
 /// identity map (`L1`). A secondary starts (via PSCI `CPU_ON`) with the MMU
 /// off, where RAM is Device-typed and atomics/`Locked` can't complete -- so

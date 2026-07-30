@@ -11,6 +11,7 @@ pub mod armv8;
 pub mod frame;
 pub mod heap;
 pub mod ramlayout;
+pub mod walk;
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -495,6 +496,13 @@ fn aarch64_frames(heap_base: usize, heap_size: usize) {
         pool.len(),
         free.as_slice().len(),
     ));
+    // Now that there are frames, prove the 4 KiB walker actually works on this
+    // machine — its logic is unit-tested on x86, but its barriers and TLB
+    // maintenance are not, and nothing else calls it yet.
+    match mmu::walker_self_test() {
+        Ok(()) => crate::ktrace::log("mm", "page-table walker self-test ok"),
+        Err(why) => crate::ktrace::log_fmt(format_args!("mm: page-table walker self-test FAILED: {why}")),
+    }
 }
 
 /// Bring up the frame allocator (from the Limine memory map) and the

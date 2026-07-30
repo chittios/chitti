@@ -163,6 +163,35 @@ pub const fn descriptor_attrs(desc: u64) -> u64 {
     desc & ATTR_MASK
 }
 
+/// What a walker heading for a 4 KiB page must do with the descriptor it found.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Step {
+    /// Descend into the next-level table at this physical address.
+    Descend(u64),
+    /// Nothing is mapped here: a fresh zeroed table must be installed.
+    NeedTable,
+    /// A block maps this address at the current level. Reaching a finer granule
+    /// means breaking it into a next-level table first.
+    SplitBlock,
+}
+
+/// Classify `desc` at `level` for a walk towards [`PAGE_LEVEL`].
+///
+/// Only meaningful for `level < PAGE_LEVEL` — at L3 there is nothing to descend
+/// into, and the `0b11` that means "table" above would mean "page" there. That
+/// asymmetry is the whole reason this is a named function rather than an inline
+/// `match`: a walker that treated an L3 page as a table would walk *into the
+/// mapped memory* and read whatever it holds as descriptors.
+pub const fn walk_step(desc: u64, level: u32) -> Step {
+    if !is_valid(desc) {
+        Step::NeedTable
+    } else if is_table(desc, level) {
+        Step::Descend(descriptor_addr(desc))
+    } else {
+        Step::SplitBlock
+    }
+}
+
 /// Child `i` of a `level` block descriptor being split into a `level + 1`
 /// table: the same memory, same attributes, one level finer.
 ///
@@ -277,6 +306,15 @@ mod tests {
         // retain attributes while its type bits are cleared.)
         assert!(!is_valid(ATTR_MASK | ADDR_MASK));
         assert!(!is_leaf(0, 3) && !is_table(0, 1));
+    }
+
+    #[test_case]
+    fn walk_step_distinguishes_the_three_things_a_descriptor_can_be() {
+        assert_eq!(walk_step(0, 1), Step::NeedTable);
+        assert_eq!(walk_step(table_descriptor(0x9000), 1), Step::Descend(0x9000));
+        assert_eq!(walk_step(table_descriptor(0x9000), 2), Step::Descend(0x9000));
+        assert_eq!(walk_step(descriptor(1, GIB, normal_attrs()), 1), Step::SplitBlock);
+        assert_eq!(walk_step(descriptor(2, MIB2, device_attrs()), 2), Step::SplitBlock);
     }
 
     #[test_case]
