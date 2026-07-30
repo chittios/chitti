@@ -1,8 +1,12 @@
-//! Physical memory management: frame allocator + kernel heap, built from
-//! the Limine memory map. `chitti_kernel::init` calls `mm::init` once at
-//! boot so callers never touch `frame`/`heap` directly.
+//! Physical memory management: frame allocator + kernel heap.
+//! `chitti_kernel::init` calls `mm::init` once at boot so callers never touch
+//! `frame`/`heap` directly.
+//!
+//! The two arches learn their RAM extents from different places — x86 from the
+//! Limine memory map, aarch64 from the DTB `/memory` node or the UEFI stub's
+//! boot-info — so `mm::init` is per-arch, but [`frame`] itself is shared: its
+//! constructor takes usable `(base, length)` regions and nothing more.
 
-#[cfg(target_arch = "x86_64")]
 pub mod frame;
 pub mod heap;
 pub mod ramlayout;
