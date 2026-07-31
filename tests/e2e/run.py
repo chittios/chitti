@@ -96,14 +96,19 @@ OS_CMDS = [
     # plumbing without needing inference.
     ("model_status", "/model", "model> active:"),
     ("think", "/think off", "think>"),
-    # `/agents text` = flat serial list, for the same reason `/help text` is used
-    # above: bare `/agents` opens the framebuffer Agents browser, which captures
-    # every keystroke until Esc. The scenario itself still passed (its marker is
-    # printed *before* the browser opens), so the overlay stayed open and silently
-    # swallowed every command after it — which is what made `/ui`, `/ktrace`,
-    # `/top`, `/clear` and most of the suite below look broken. `shell::mod`'s
-    # dispatch offers this form explicitly "for e2e / scripting".
-    ("agents", "/agents text", "agents>"),
+    # `/agents list text` = flat serial list, for the same reason `/help text` is
+    # used above: bare `/agents` opens the framebuffer Agents browser, which
+    # captures every keystroke until Esc. The scenario itself still passed (its
+    # marker prints *before* the browser opens), so the overlay stayed open and
+    # silently swallowed every command after it — which is what made `/ui`,
+    # `/ktrace`, `/top`, `/clear` and most of the suite below look broken.
+    #
+    # Note the exact form: the text override is the *second* word (`sub` must be
+    # `list`), so `/agents text` parses `text` as the subcommand and is rejected —
+    # and would still pass this scenario, because the usage error also starts with
+    # `agents>`. Match a column header instead of the bare prefix so the assertion
+    # cannot be satisfied by an error message.
+    ("agents", "/agents list text", "agents> id"),
     ("ui", "/ui", "ui>"),
     ("ktrace", "/ktrace", "ktrace>"),
     ("close", "/close", "closed the active tab"),

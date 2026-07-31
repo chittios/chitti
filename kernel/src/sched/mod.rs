@@ -489,6 +489,11 @@ pub fn list() -> alloc::vec::Vec<(TaskId, &'static str, &'static str)> {
                     TaskState::Dead => "dead",
                     TaskState::Parked => "parked",
                     TaskState::Blocked(_) => "blocked",
+                    // The idle task's *state* is `Ready`, but it is deliberately
+                    // not in the queue, so reporting "ready" would recreate the
+                    // very inconsistency `Parked` was added to remove — a task
+                    // listed as queued that is not.
+                    TaskState::Ready if Some(id) == s.idle => "idle",
                     TaskState::Ready => "ready",
                 };
                 (id, tcb.name, state)
@@ -585,7 +590,37 @@ fn reschedule(park: Option<Wait>) -> bool {
                     return None;
                 }
             };
-            let next_id = pick_next(s)?;
+            // **Mark a blocking task asleep before choosing who runs next.**
+            // `pick_next` reaches the idle task only when some task is `Blocked`,
+            // and the task going to sleep is exactly what makes that true. Asking
+            // first would test "is anyone asleep?" while this task is still
+            // `Running`, answer no, and refuse — so the last runnable task could
+            // never block, `block_on` would always return false, and every waiter
+            // would silently keep polling. That is not a hypothetical: it is the
+            // ordinary case for the shell, which is usually the only ready task.
+            let prev_state = s.tasks.get(&current_id).map(|t| t.state);
+            if let Some(w) = park {
+                if let Some(cur) = s.tasks.get_mut(&current_id) {
+                    if cur.state != TaskState::Dead {
+                        cur.state = TaskState::Blocked(w);
+                    }
+                }
+            }
+            let next_id = match pick_next(s) {
+                Some(id) => id,
+                None => {
+                    // Nothing to switch to, so this task keeps the CPU — and must
+                    // get its state back. Leaving it `Blocked` here would be a
+                    // lost wakeup: marked asleep with nothing scheduled that could
+                    // wake it, and `block_on` reporting `false` to a caller that
+                    // will carry on polling as a task the scheduler thinks is
+                    // sleeping.
+                    if let (Some(prev), Some(cur)) = (prev_state, s.tasks.get_mut(&current_id)) {
+                        cur.state = prev;
+                    }
+                    return None;
+                }
+            };
             if let Some(cur) = s.tasks.get_mut(&current_id) {
                 if cur.state != TaskState::Dead {
                     match park {
@@ -604,10 +639,10 @@ fn reschedule(park: Option<Wait>) -> bool {
                                 s.ready_queue.push_back(current_id);
                             }
                         }
-                        // Block: asleep, and deliberately *not* enqueued —
-                        // that absence is what makes blocking cheaper than
-                        // polling, and what `wake` undoes.
-                        Some(w) => cur.state = TaskState::Blocked(w),
+                        // Block: already marked `Blocked` above, and deliberately
+                        // *not* enqueued — that absence is what makes blocking
+                        // cheaper than polling, and what `wake` undoes.
+                        Some(_) => {}
                     }
                 }
             }
@@ -981,6 +1016,18 @@ mod tests {
         }
     }
 
+    /// Stands in for the real pump: tick, wake the sleepers it pumped for, yield.
+    /// Never exits, so the test kills it — an idle task that exited while another
+    /// task slept on it would leave the sleeper with nothing to wake it, which is
+    /// a hang rather than a failure.
+    extern "C" fn waking_idle(_arg: u64) {
+        loop {
+            IDLE_TICKS.fetch_add(1, Ordering::SeqCst);
+            wake(Wait::SoundOut);
+            yield_now();
+        }
+    }
+
     extern "C" fn worker_counter(_arg: u64) {
         while !SPIN_STOP.load(Ordering::SeqCst) {
             WORKER_TICKS.fetch_add(1, Ordering::SeqCst);
@@ -1089,6 +1136,42 @@ mod tests {
         clear_idle();
         let _ = kill(idle); // already exited after its one tick; ignore
         assert!(idle_task().is_none(), "leave the global scheduler as we found it");
+    }
+
+    #[test_case]
+    fn the_last_runnable_task_can_block_when_an_idle_task_exists() {
+        // The case every other blocking test missed, and the ordinary one in
+        // practice: the shell is usually the *only* ready task, so a waiter that
+        // cannot block when it is last cannot block at all.
+        //
+        // It is also where the ordering inside `reschedule` bites. `pick_next`
+        // reaches the idle task only when some task is `Blocked`; if the outgoing
+        // task is marked asleep *after* the pick rather than before, the test runs
+        // while it is still `Running`, answers "nobody is asleep", and refuses —
+        // so `block_on` would return false forever and every waiter would fall
+        // back to polling with nothing reporting anything wrong.
+        IDLE_TICKS.store(0, Ordering::SeqCst);
+        let idle = spawn("test-last-idle", waking_idle, 0);
+        set_idle(idle);
+
+        // No other ready task: drain the queue so this really is the last one.
+        SCHED.with(|slot| {
+            let s = slot.as_mut().unwrap();
+            assert!(s.ready_queue.is_empty(), "test premise: nothing else may be ready");
+        });
+        // Without an idle task this must refuse (proved elsewhere); with one it
+        // must succeed, because the scheduler now has somewhere to go.
+        assert!(
+            block_on(Wait::SoundOut),
+            "the last runnable task must be able to sleep once an idle task exists"
+        );
+        // We are running again, so something woke us: the idle task ticked and
+        // exited, and `exit_current_task` picked us back up.
+        assert!(IDLE_TICKS.load(Ordering::SeqCst) > 0, "the idle task must have run while we slept");
+        assert_eq!(blocked_count(Wait::SoundOut), 0, "we must not still be marked asleep");
+
+        clear_idle();
+        let _ = kill(idle);
     }
 
     #[test_case]

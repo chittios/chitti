@@ -6406,10 +6406,15 @@ fn run_agents(
 
 /// Serial flat listing (also `/agents list text` / e2e).
 fn print_agents_text() {
-    let active = active_agent_id();
+    // The `*chat` marker names the **task** the chat's tool calls run as, so it
+    // must be compared against the chat context's caller task — not
+    // `active_agent_id()`, which is an *agent* id from a different numbering. The
+    // two only ever agreed by accident, and the pump task taking task 1 made
+    // agent 1 collide with it, marking the pump as the chat agent.
+    let active = CHAT_TOOL_CTX.with(|slot| slot.as_ref().map(|c| c.caller));
     serial_println!("agents> id   name              state     (agent tasks are scheduler processes)");
     for (id, name, state) in crate::sched::list() {
-        let marker = if id == active { " *chat" } else { "" };
+        let marker = if Some(id) == active { " *chat" } else { "" };
         serial_println!("agents> {:<4} {:<17} {:<9}{}", id, name, state, marker);
     }
     serial_println!("agents> system agents (UI canvas vs shell) — start with /agents start <name>:");
@@ -8160,20 +8165,33 @@ fn read_line(buf: &mut String) -> ReadOutcome {
             }
             Some(_) => {} // ignore other control bytes
             None => {
-                // Full upkeep (not just ui_tick): pumps net, service supervisor,
-                // **and messaging channels** (`msgchan::tick`). Without this,
-                // Telegram getUpdates never ran while the prompt was idle —
-                // offset stayed 0 and DMs were invisible.
-                upkeep();
                 // Wake the main loop so it can run the agent on queued DMs
                 // (drain only happens outside read_line — never block forever).
+                // Checked *before* sleeping, and re-checked on every wakeup, so a
+                // DM the pump's `msgchan::tick` queued while we slept is seen.
                 if crate::msgchan::inbound_len() > 0 {
                     #[cfg(not(test))]
                     crate::framebuffer::suggest_clear();
                     // Leave `buf` as the in-progress draft for the next prompt.
                     return ReadOutcome::ChannelWake;
                 }
-                crate::sched::yield_now();
+                // Sleep until something reports console input, instead of
+                // pumping the whole world from the prompt. The pumping still has
+                // to happen — net, the service supervisor, and **messaging
+                // channels** (`msgchan::tick`, without which Telegram
+                // `getUpdates` never ran while the prompt was idle and DMs were
+                // invisible) — but it now happens on `shell::pump_task`, whose
+                // whole purpose is to do it for a sleeping waiter.
+                //
+                // `block_on` reports whether it actually slept. `false` means the
+                // scheduler had nothing else to run — no pump task registered
+                // yet, or it died — and then this loop must drive the world
+                // itself, exactly as it always did. Keeping that path is what
+                // makes the migration safe rather than a cliff.
+                if !crate::sched::block_on(crate::sched::Wait::Console) {
+                    upkeep();
+                    crate::sched::yield_now();
+                }
             }
         }
     }
