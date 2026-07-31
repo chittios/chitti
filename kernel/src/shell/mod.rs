@@ -8789,6 +8789,29 @@ pub fn upkeep() {
     // The ACPI power button. One port read when armed, nothing at all otherwise. A
     // press is acted on *here* rather than inside the driver's poll, so the machine is
     // never powered off from underneath a repaint.
+    // Wake anything sleeping on a condition this pump may have advanced.
+    //
+    // **Here rather than only in `pump_task`**, because the idle task is by
+    // construction the *lowest* priority thing in the system: `pick_next` reaches
+    // it only when the ready queue is empty. A compute-bound task — a prefill, a
+    // video decode — keeps the queue non-empty for as long as it runs, so a
+    // sleeper whose wakeup depended on the pump task being scheduled would starve
+    // for exactly as long, with nothing reporting a problem. Every such loop
+    // already calls `upkeep` (the standing rule that keeps the UI alive), so
+    // waking from here makes the waker *whoever pumped*, and removes the
+    // dependence on scheduling the idle task at all.
+    //
+    // Spurious wakeups are fine and expected: a woken task re-checks its own
+    // condition and blocks again. That is what lets this stay a blanket wake
+    // instead of `upkeep` having to know what readiness means for each subsystem.
+    for w in [
+        crate::sched::Wait::Console,
+        crate::sched::Wait::Net,
+        crate::sched::Wait::Block,
+        crate::sched::Wait::SoundOut,
+    ] {
+        crate::sched::wake(w);
+    }
     crate::drivers::pwrbtn::poll();
     if crate::drivers::pwrbtn::take_press() {
         crate::ktrace::log("pwrbtn", "power button pressed -- powering off");
@@ -8827,16 +8850,10 @@ extern "C" fn pump_task(_arg: u64) {
             crate::sched::yield_now();
             continue;
         }
+        // `upkeep` wakes the sleepers itself (see there): the waker has to be
+        // whoever pumped, not specifically this task, because this task is the
+        // lowest-priority thing in the system and a busy ready queue starves it.
         upkeep();
-        // Spurious wakeups are allowed and expected: a woken task re-checks its
-        // own condition and blocks again if it is not satisfied. That keeps this
-        // loop from having to know what readiness means for any subsystem, and
-        // it is the seam for tightening later — a driver that calls
-        // `sched::wake(Wait::Net)` exactly when it makes progress turns these
-        // blanket wakes into precise ones without changing any waiter.
-        for w in CONDITIONS {
-            crate::sched::wake(w);
-        }
         crate::sched::yield_now();
     }
 }
