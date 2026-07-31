@@ -128,9 +128,15 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, error_c
     // currently being handled; reading it has no side effects.
     unsafe { asm!("mov {}, cr2", out(reg) faulting_addr, options(nomem, nostack, preserves_flags)) };
     crate::ktrace::log_fmt(format_args!(
-        "idt: PAGE FAULT accessing {faulting_addr:#x} (error={error_code:#x}, rip={:#x}) -- halting",
+        "idt: PAGE FAULT accessing {faulting_addr:#x} (error={error_code:#x}, rip={:#x})",
         frame.instruction_pointer
     ));
+    // Contain it to the faulting task if we can: this handler runs on that task's
+    // own stack (only #DF has an IST), so abandoning the task abandons this frame
+    // with it. Returns only when isolation is impossible — no scheduler yet, or
+    // the bootstrap task, where a fault is a kernel bug rather than a tenant's.
+    crate::sched::fault_current_task("page fault");
+    crate::ktrace::log("idt", "page fault not isolatable -- halting");
     loop {
         super::hlt();
     }
@@ -138,9 +144,11 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, error_c
 
 extern "x86-interrupt" fn general_protection_fault_handler(frame: InterruptStackFrame, error_code: u64) {
     crate::ktrace::log_fmt(format_args!(
-        "idt: GENERAL PROTECTION FAULT (error={error_code:#x}, rip={:#x}) -- halting",
+        "idt: GENERAL PROTECTION FAULT (error={error_code:#x}, rip={:#x})",
         frame.instruction_pointer
     ));
+    crate::sched::fault_current_task("general protection fault");
+    crate::ktrace::log("idt", "GP fault not isolatable -- halting");
     loop {
         super::hlt();
     }

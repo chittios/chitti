@@ -79,9 +79,17 @@ extern "C" fn aarch64_sync_dispatch(frame: *mut u64) {
     // SAFETY: reading FAR_EL1 is always valid at EL1.
     unsafe { core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack)) };
     crate::ktrace::log_fmt(format_args!(
-        "aarch64 FATAL sync exception: ESR_EL1={:#x} ELR_EL1={:#x} FAR_EL1={:#x}",
+        "aarch64 sync exception: ESR_EL1={:#x} ELR_EL1={:#x} FAR_EL1={:#x}",
         esr, elr, far
     ));
+    // Contain it to the faulting task if there is one, exactly as x86's #PF/#GP
+    // handlers do — the dual-arch rule: if a capability exists on one arch it
+    // exists on the other. This handler runs on the faulting task's own stack, so
+    // abandoning the task abandons this trap frame with it and nothing will
+    // `eret` from it. Returns only when isolation is impossible (no scheduler, or
+    // the bootstrap task, where a fault is a kernel bug rather than a tenant's).
+    crate::sched::fault_current_task("aarch64 synchronous exception");
+    crate::ktrace::log("aarch64", "sync exception not isolatable -- halting");
     loop {
         super::hlt();
     }

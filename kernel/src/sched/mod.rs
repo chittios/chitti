@@ -819,6 +819,63 @@ pub fn on_timer_tick() {
     }
 }
 
+/// Faults isolated to a task rather than taken as fatal.
+static FAULTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many faults have been contained by killing a task instead of halting.
+pub fn fault_count() -> u64 {
+    FAULTS.load(Ordering::Relaxed)
+}
+
+/// Abandon the current task because it took a CPU fault, and give the CPU to
+/// somebody else. **Does not return when it succeeds.**
+///
+/// Returning means the fault could not be isolated and the caller must halt, so
+/// call it as `fault_current_task(why); halt_forever()`. Two cases return:
+///
+/// * **no scheduler yet** — a fault during early boot has nothing to fall back to;
+/// * **the bootstrap task** — task 0 is the shell, so "isolating" a fault in it
+///   would trade a halt for a machine with no user interface, which is not an
+///   improvement. A fault there is a kernel bug and should look like one.
+///
+/// This is safe to call from an exception handler *because of where those
+/// handlers run*: on x86 only `#DF` uses an IST, so `#PF`/`#GP` are on the
+/// faulting task's own stack, and abandoning that stack abandons the exception
+/// frame with it — nothing will ever `iretq` from it. A CPU exception latches no
+/// in-service state (unlike an APIC IRQ), so there is nothing left to acknowledge.
+///
+/// **What this does not fix:** a task that faulted while holding a
+/// [`crate::mm::Locked`] leaves it locked forever, and the next taker spins with
+/// interrupts disabled. Kernel-mode faults are unrecoverable in that respect
+/// here, as they are in most kernels; containment buys a diagnosable machine and
+/// a surviving shell, not correctness after the fact.
+pub fn fault_current_task(reason: &'static str) {
+    let Some(current) = SCHED.with(|slot| slot.as_ref().map(|s| s.current)) else {
+        return; // pre-scheduler fault: caller halts
+    };
+    if current == 0 {
+        return; // the shell's own task; see above
+    }
+    FAULTS.fetch_add(1, Ordering::Relaxed);
+    crate::ktrace::log_fmt(format_args!(
+        "sched: task {current} faulted ({reason}) -- killing it, machine survives"
+    ));
+    // Revoke its authority as well as its memory: a task that died mid-operation
+    // should not leave a live capability table behind. Unlike a clean exit (see
+    // `reclaim`), a fault is never an identity holder finishing its work.
+    SCHED.with(|slot| {
+        if let Some(s) = slot.as_mut() {
+            if let Some(t) = s.tasks.get_mut(&current) {
+                t.cap_table = CapTable::new();
+            }
+        }
+    });
+    crate::cap::clear_scopes(current);
+    // Same path as a normal exit: mark Dead, park the stack for the reaper, and
+    // switch away for good. Halts by itself if there is genuinely nothing to run.
+    exit_current_task();
+}
+
 /// Marks the current task `Dead` and switches away for the last time.
 /// This is what every task's `context::trampoline` calls once its entry
 /// function returns; it never returns to its own caller.
@@ -1409,6 +1466,54 @@ mod tests {
             assert!(after.iter().all(|&(_, t)| t <= total_after), "no share may exceed the total");
         }
         let _ = kill(parked);
+    }
+
+    /// Dereferences a deliberately unmapped address, taking a page fault.
+    /// Address 0 is never mapped, so this is a translation fault on either arch.
+    extern "C" fn faulting_task(_arg: u64) {
+        // SAFETY: intentionally unsound — the whole point is to fault. Volatile so
+        // it cannot be optimised away, and `read` rather than `write` so nothing
+        // could be forwarded from a store.
+        let v = unsafe { core::ptr::read_volatile(core::ptr::null::<u64>()) };
+        // Unreachable; keeps the read live if the compiler ever proves otherwise.
+        FAULT_SINK.store(v, Ordering::SeqCst);
+    }
+
+    static FAULT_SINK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    #[test_case]
+    fn a_faulting_task_is_killed_and_the_machine_survives() {
+        // The whole of P4 in one assertion: **this test completing at all** is the
+        // result. Before fault isolation, a page fault in any task halted the
+        // machine — the suite would stop here with no further output and no
+        // verdict, which is exactly how a real fault used to present.
+        let faults_before = fault_count();
+        let id = spawn("test-faulter", faulting_task, 0);
+
+        // Give it turns until it dies. It cannot exit normally, so death means the
+        // fault handler killed it.
+        let mut spins = 0;
+        while is_alive(id) && spins < 5000 {
+            yield_now();
+            spins += 1;
+        }
+        assert!(!is_alive(id), "the faulting task was never killed");
+        assert_eq!(fault_count(), faults_before + 1, "the fault must be counted, once");
+
+        // Killed the same way a normal exit is: unschedulable, stack handed back.
+        SCHED.with(|slot| {
+            let s = slot.as_ref().unwrap();
+            let tcb = s.tasks.get(&id).expect("the TCB stays for /agents");
+            assert!(tcb.fx_area.is_none() && tcb.stack.is_none() && tcb.rsp == 0);
+            assert!(!s.ready.iter().any(|q| q.contains(&id)), "and out of every ready queue");
+        });
+        // Unlike a clean exit, a fault revokes authority: a task that died
+        // mid-operation is never an identity holder finishing its work.
+        assert!(!crate::cap::holds(id, crate::cap::Right::InvokePrimitive(1)));
+
+        // And we are still here, on a working scheduler.
+        yield_now();
+        assert_eq!(current_task_id(), 0);
     }
 
     #[test_case]
