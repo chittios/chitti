@@ -6412,10 +6412,17 @@ fn print_agents_text() {
     // two only ever agreed by accident, and the pump task taking task 1 made
     // agent 1 collide with it, marking the pump as the chat agent.
     let active = CHAT_TOOL_CTX.with(|slot| slot.as_ref().map(|c| c.caller));
-    serial_println!("agents> id   name              state     (agent tasks are scheduler processes)");
+    // Real per-task CPU share, sampled once so the column sums to ~100%. The
+    // status bar's `cpu_percent` is a whole-system heuristic and cannot say which
+    // task was busy; this can. Reads 0% where there is no timer to charge ticks
+    // from (Apple-HVF aarch64 stays cooperative) — an honest zero, not an error.
+    let (ticks, total) = crate::sched::cpu_ticks();
+    serial_println!("agents> id   name              state     cpu%  (agent tasks are scheduler processes)");
     for (id, name, state) in crate::sched::list() {
         let marker = if Some(id) == active { " *chat" } else { "" };
-        serial_println!("agents> {:<4} {:<17} {:<9}{}", id, name, state, marker);
+        let mine = ticks.iter().find(|&&(t, _)| t == id).map(|&(_, v)| v).unwrap_or(0);
+        let pct = if total > 0 { mine.saturating_mul(100) / total } else { 0 };
+        serial_println!("agents> {:<4} {:<17} {:<9} {:>3}%{}", id, name, state, pct, marker);
     }
     serial_println!("agents> system agents (UI canvas vs shell) — start with /agents start <name>:");
     let autostart = crate::agent::system::autostart_names();

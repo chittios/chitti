@@ -44,6 +44,36 @@ pub enum Wait {
     SoundOut,
 }
 
+/// Scheduling priority for a *queued* task. The scheduler always runs the
+/// highest-priority ready task, round-robin within a level.
+///
+/// The pump/idle task sits below both of these, and is deliberately **not** a
+/// level here: it needs "only when nothing else can run *and* a task is asleep",
+/// which a plain priority level cannot express (a level is picked whenever the
+/// levels above it are empty, which would reintroduce the duplicate-`upkeep`
+/// problem). It lives in [`SchedulerState::idle`] instead — see [`pick_next`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Priority {
+    /// Yields to anything interactive. For daemons and long-running service
+    /// work that should not compete with the shell.
+    Background,
+    /// The default, including the shell.
+    Normal,
+}
+
+impl Priority {
+    /// Index into [`SchedulerState::ready`], lowest priority first.
+    const fn level(self) -> usize {
+        match self {
+            Priority::Background => 0,
+            Priority::Normal => 1,
+        }
+    }
+}
+
+/// How many queued priority levels there are.
+const LEVELS: usize = 2;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TaskState {
     Ready,
@@ -85,6 +115,19 @@ struct TaskControlBlock {
     /// to with a dangling `rsp`.
     fx_area: Option<Box<context::FxArea>>,
     cap_table: CapTable,
+    /// Which ready queue this task joins when runnable.
+    priority: Priority,
+    /// Timer ticks observed with this task as `current` — real per-task CPU time,
+    /// replacing nothing (there was none) and complementing the shell's
+    /// whole-system `cpu_percent` heuristic, which infers busyness from gaps
+    /// between `upkeep` calls and cannot attribute it to anyone.
+    ///
+    /// **Approximate, in one direction.** Ticks are only counted while interrupts
+    /// are enabled, so time inside a long `Locked` critical section — or on a
+    /// platform with no timer at all, which is the Apple-HVF aarch64 case — is
+    /// undercounted rather than misattributed. Fine for a share-of-CPU display;
+    /// not a basis for billing.
+    ticks_run: u64,
 }
 
 /// What a dying task hands back, so the (potentially large) frees happen after
@@ -129,7 +172,9 @@ impl TaskControlBlock {
 
 struct SchedulerState {
     tasks: BTreeMap<TaskId, TaskControlBlock>,
-    ready_queue: VecDeque<TaskId>,
+    /// One round-robin queue per [`Priority`], indexed by `Priority::level()`,
+    /// lowest priority first. Scanned highest-first by [`pop_schedulable`].
+    ready: [VecDeque<TaskId>; LEVELS],
     current: TaskId,
     next_id: TaskId,
     tick_count: u64,
@@ -178,13 +223,37 @@ fn reap_zombie_stacks() {
 /// so finding anything else is a bug — dropped from the queue and asserted in
 /// debug rather than acted on.
 fn pop_schedulable(s: &mut SchedulerState) -> Option<TaskId> {
-    while let Some(id) = s.ready_queue.pop_front() {
-        if s.tasks.get(&id).is_some_and(|t| t.state == TaskState::Ready && t.fx_area.is_some()) {
-            return Some(id);
+    // Highest priority level first, round-robin within it. Strict priority: a
+    // ready `Normal` task always beats a ready `Background` one, so `Background`
+    // can starve — which is the point of asking for it, and why nothing is
+    // `Background` by default.
+    for level in (0..LEVELS).rev() {
+        while let Some(id) = s.ready[level].pop_front() {
+            if s.tasks.get(&id).is_some_and(|t| t.state == TaskState::Ready && t.fx_area.is_some()) {
+                return Some(id);
+            }
+            debug_assert!(false, "sched: an unschedulable task was in a ready queue");
         }
-        debug_assert!(false, "sched: an unschedulable task was in the ready queue");
     }
     None
+}
+
+/// Put a runnable task on the queue for its priority.
+fn enqueue(s: &mut SchedulerState, id: TaskId) {
+    let level = s.tasks.get(&id).map_or(Priority::Normal, |t| t.priority).level();
+    s.ready[level].push_back(id);
+}
+
+/// Whether any task is queued at any priority.
+fn any_ready(s: &SchedulerState) -> bool {
+    s.ready.iter().any(|q| !q.is_empty())
+}
+
+/// Drop `id` from whichever ready queue holds it.
+fn dequeue(s: &mut SchedulerState, id: TaskId) {
+    for q in s.ready.iter_mut() {
+        q.retain(|&t| t != id);
+    }
 }
 
 /// The next task to run: a ready one if there is one, else the idle task.
@@ -235,10 +304,49 @@ pub fn set_idle(id: TaskId) {
             s.idle = Some(id);
             // Out of the ready queue: it is reached only via `pick_next`'s
             // fallback, so it can never take a turn from a task with work.
-            s.ready_queue.retain(|&t| t != id);
+            dequeue(s, id);
         }
     });
     crate::ktrace::log_fmt(format_args!("sched: task {id} is the idle task"));
+}
+
+/// Set task `id`'s scheduling priority, moving it between ready queues if it is
+/// currently runnable. No-op for an unknown task.
+pub fn set_priority(id: TaskId, priority: Priority) {
+    SCHED.with(|slot| {
+        let Some(s) = slot.as_mut() else { return };
+        let Some(t) = s.tasks.get_mut(&id) else { return };
+        if t.priority == priority {
+            return;
+        }
+        t.priority = priority;
+        // A queued task must move to the queue its new priority names; leaving it
+        // where it was would keep scheduling it at the old level, which is a
+        // priority change that silently does nothing.
+        let was_queued = s.ready.iter().any(|q| q.contains(&id));
+        if was_queued {
+            dequeue(s, id);
+            enqueue(s, id);
+        }
+    });
+}
+
+/// Task `id`'s priority, or `None` if it does not exist.
+pub fn priority_of(id: TaskId) -> Option<Priority> {
+    SCHED.with(|slot| slot.as_ref().and_then(|s| s.tasks.get(&id)).map(|t| t.priority))
+}
+
+/// A consistent snapshot of per-task CPU time: `(id, ticks_run)` for every task,
+/// plus the total ticks the scheduler has seen.
+///
+/// One lock acquisition so the parts agree — sampling per task would let the
+/// total drift from the sum and produce percentages over 100. See
+/// [`TaskControlBlock::ticks_run`] for what "approximate" means here.
+pub fn cpu_ticks() -> (alloc::vec::Vec<(TaskId, u64)>, u64) {
+    SCHED.with(|slot| match slot.as_ref() {
+        Some(s) => (s.tasks.iter().map(|(&id, t)| (id, t.ticks_run)).collect(), s.tick_count),
+        None => (alloc::vec::Vec::new(), 0),
+    })
 }
 
 /// Unregister the idle task, so the scheduler goes back to having nothing to run
@@ -325,7 +433,7 @@ pub fn wake(w: Wait) -> usize {
                 if let Some(t) = s.tasks.get_mut(&id) {
                     t.state = TaskState::Ready;
                 }
-                s.ready_queue.push_back(id);
+                enqueue(s, id);
             }
             total += n;
         }
@@ -369,11 +477,13 @@ pub fn init() {
                 stack: None,
                 fx_area: Some(Box::new(context::FxArea::new())),
                 cap_table: CapTable::new(),
+                priority: Priority::Normal,
+                ticks_run: 0,
             },
         );
         *slot = Some(SchedulerState {
             tasks,
-            ready_queue: VecDeque::new(),
+            ready: [const { VecDeque::new() }; LEVELS],
             current: 0,
             next_id: 1,
             tick_count: 0,
@@ -415,6 +525,8 @@ pub fn spawn_parked(name: &'static str) -> TaskId {
                 stack: None,
                 fx_area: None,
                 cap_table: CapTable::new(),
+                priority: Priority::Normal,
+                ticks_run: 0,
             },
         );
         // Deliberately NOT enqueued — a cap-owning identity holder, never run.
@@ -447,9 +559,11 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(u64), arg: u64) -> TaskId 
                 stack: Some(stack),
                 fx_area: Some(Box::new(context::FxArea::new())),
                 cap_table: CapTable::new(),
+                priority: Priority::Normal,
+                ticks_run: 0,
             },
         );
-        s.ready_queue.push_back(id);
+        enqueue(s, id);
         id
     });
     crate::ktrace::log_fmt(format_args!("sched: spawned task {id} ({name})"));
@@ -528,7 +642,7 @@ pub fn kill(id: TaskId) -> Result<(), &'static str> {
         tcb.state = TaskState::Dead;
         tcb.cap_table = CapTable::new(); // revoke all authority — see `reclaim`
         let reclaimed = tcb.reclaim();
-        s.ready_queue.retain(|&t| t != id);
+        dequeue(s, id);
         Ok(reclaimed)
     })?;
     let bytes = reclaimed.bytes();
@@ -636,7 +750,7 @@ fn reschedule(park: Option<Wait>) -> bool {
                             // prevent. Nothing else would notice: the machine
                             // would just be half as fast at inference.
                             if Some(current_id) != s.idle {
-                                s.ready_queue.push_back(current_id);
+                                enqueue(s, current_id);
                             }
                         }
                         // Block: already marked `Blocked` above, and deliberately
@@ -691,7 +805,14 @@ pub fn on_timer_tick() {
     let due = SCHED.with(|slot| {
         let s = slot.as_mut().expect("sched not initialized");
         s.tick_count += 1;
-        s.tick_count % TIME_SLICE_TICKS == 0 && !s.ready_queue.is_empty()
+        // Per-task CPU accounting: charge this tick to whoever is running. The
+        // only place in the kernel that knows both "a unit of time passed" and
+        // "who had the CPU for it".
+        let current = s.current;
+        if let Some(t) = s.tasks.get_mut(&current) {
+            t.ticks_run += 1;
+        }
+        s.tick_count % TIME_SLICE_TICKS == 0 && any_ready(s)
     });
     if due {
         yield_now();
@@ -820,7 +941,7 @@ mod tests {
         // stack has been freed is a triple fault with no message.
         SCHED.with(|slot| {
             let s = slot.as_ref().unwrap();
-            assert!(!s.ready_queue.contains(&id), "a killed task must leave the ready queue");
+            assert!(!s.ready.iter().any(|q| q.contains(&id)), "a killed task must leave the ready queue");
             let tcb = s.tasks.get(&id).unwrap();
             assert!(tcb.fx_area.is_none() && tcb.stack.is_none() && tcb.rsp == 0);
         });
@@ -838,7 +959,7 @@ mod tests {
         assert_eq!(list().iter().find(|t| t.0 == id).map(|t| t.2), Some("parked"));
         SCHED.with(|slot| {
             let s = slot.as_ref().unwrap();
-            assert!(!s.ready_queue.contains(&id), "a parked task is never enqueued");
+            assert!(!s.ready.iter().any(|q| q.contains(&id)), "a parked task is never enqueued");
         });
         kill(id).expect("kill");
     }
@@ -962,7 +1083,7 @@ mod tests {
         assert_eq!(list().iter().find(|t| t.0 == id).map(|t| t.2), Some("blocked"));
         SCHED.with(|slot| {
             assert!(
-                !slot.as_ref().unwrap().ready_queue.contains(&id),
+                !slot.as_ref().unwrap().ready.iter().any(|q| q.contains(&id)),
                 "a blocked task must not sit in the ready queue"
             );
         });
@@ -1059,7 +1180,7 @@ mod tests {
         IDLE_TICKS.store(0, Ordering::SeqCst);
         SCHED.with(|slot| {
             assert!(
-                !slot.as_ref().unwrap().ready_queue.contains(&idle),
+                !slot.as_ref().unwrap().ready.iter().any(|q| q.contains(&idle)),
                 "`set_idle` must take it out of the queue that `spawn` put it in"
             );
         });
@@ -1077,7 +1198,7 @@ mod tests {
         );
         SCHED.with(|slot| {
             assert!(
-                !slot.as_ref().unwrap().ready_queue.contains(&idle),
+                !slot.as_ref().unwrap().ready.iter().any(|q| q.contains(&idle)),
                 "the idle task must never appear in the ready queue"
             );
         });
@@ -1157,7 +1278,7 @@ mod tests {
         // No other ready task: drain the queue so this really is the last one.
         SCHED.with(|slot| {
             let s = slot.as_mut().unwrap();
-            assert!(s.ready_queue.is_empty(), "test premise: nothing else may be ready");
+            assert!(!any_ready(s), "test premise: nothing else may be ready");
         });
         // Without an idle task this must refuse (proved elsewhere); with one it
         // must succeed, because the scheduler now has somewhere to go.
@@ -1172,6 +1293,122 @@ mod tests {
 
         clear_idle();
         let _ = kill(idle);
+    }
+
+    #[test_case]
+    fn a_normal_task_always_beats_a_background_one() {
+        // Strict priority, and `Background` really can starve — that is what
+        // asking for it means, and why nothing is `Background` by default.
+        SPIN_STOP.store(false, Ordering::SeqCst);
+        IDLE_TICKS.store(0, Ordering::SeqCst);
+        WORKER_TICKS.store(0, Ordering::SeqCst);
+        // `idle_counter` and `worker_counter` differ only in which counter they
+        // bump, so they stand in for a Background and a Normal task here.
+        let background = spawn("test-bg", idle_counter, 0);
+        set_priority(background, Priority::Background);
+        assert_eq!(priority_of(background), Some(Priority::Background));
+        let normal = spawn("test-normal", worker_counter, 0);
+        assert_eq!(priority_of(normal), Some(Priority::Normal), "Normal is the default");
+
+        for _ in 0..50 {
+            yield_now();
+        }
+        assert!(WORKER_TICKS.load(Ordering::SeqCst) > 0, "the Normal task must run");
+        assert_eq!(
+            IDLE_TICKS.load(Ordering::SeqCst),
+            0,
+            "a Background task must not get a turn while a Normal one is ready"
+        );
+
+        // Retire the Normal task; the Background one then runs, so it was queued
+        // all along rather than lost.
+        SPIN_STOP.store(true, Ordering::SeqCst);
+        let mut spins = 0;
+        while (is_alive(normal) || is_alive(background)) && spins < 5000 {
+            yield_now();
+            spins += 1;
+        }
+        assert!(!is_alive(normal) && !is_alive(background), "both tasks should have finished");
+        assert!(
+            IDLE_TICKS.load(Ordering::SeqCst) > 0,
+            "the Background task must run once nothing Normal is ready"
+        );
+    }
+
+    #[test_case]
+    fn changing_priority_moves_a_queued_task_between_levels() {
+        // A priority change that left the task in its old queue would keep
+        // scheduling it at the old level — a setting that silently does nothing.
+        // A task that cannot exit while we watch it. `noop_task` is unusable
+        // here: the timer can schedule it between any two statements, and then it
+        // has run to completion and is in no queue at all — which is what the
+        // first version of this test tripped over. `worker_counter` only ends when
+        // `SPIN_STOP` is set, and it re-queues itself on every yield, so it is
+        // queued whenever *this* task is the one executing.
+        SPIN_STOP.store(false, Ordering::SeqCst);
+        WORKER_TICKS.store(0, Ordering::SeqCst);
+        let id = spawn("test-prio-move", worker_counter, 0);
+        let level_of = |id: TaskId| {
+            SCHED.with(|slot| {
+                let s = slot.as_ref().unwrap();
+                (0..LEVELS).find(|&l| s.ready[l].contains(&id))
+            })
+        };
+        assert_eq!(level_of(id), Some(Priority::Normal.level()), "spawned Normal and queued there");
+        set_priority(id, Priority::Background);
+        assert_eq!(level_of(id), Some(Priority::Background.level()), "must move queues");
+        set_priority(id, Priority::Normal);
+        assert_eq!(level_of(id), Some(Priority::Normal.level()), "and back");
+        // Idempotent, and unknown ids are a no-op rather than a panic.
+        set_priority(id, Priority::Normal);
+        assert_eq!(level_of(id), Some(Priority::Normal.level()));
+        set_priority(u64::MAX, Priority::Background);
+        assert_eq!(priority_of(u64::MAX), None);
+        // Retire it at Normal priority — at Background it would starve behind
+        // this task and the drain loop would never finish.
+        SPIN_STOP.store(true, Ordering::SeqCst);
+        let mut spins = 0;
+        while is_alive(id) && spins < 5000 {
+            yield_now();
+            spins += 1;
+        }
+        assert!(!is_alive(id), "the worker did not finish");
+    }
+
+    #[test_case]
+    fn cpu_ticks_charges_the_running_task_and_nobody_else() {
+        // Per-task accounting: the shell's `cpu_percent` is a whole-system
+        // heuristic (gaps between `upkeep` calls) and cannot attribute time to
+        // anyone, so this is the only place a "which task burned the CPU"
+        // question can be answered.
+        let me = current_task_id();
+        let (before, total_before) = cpu_ticks();
+        let mine_before = before.iter().find(|&&(id, _)| id == me).map(|&(_, t)| t).unwrap_or(0);
+
+        // A parked task can never run, so it is the control: its count must not
+        // move however long we spin.
+        let parked = spawn_parked("test-tick-parked");
+
+        // Burn wall-clock so the timer fires. Bounded, and tolerant of a platform
+        // with no timer at all (then nothing advances and the assertions below
+        // are skipped rather than failing for the wrong reason).
+        let mut n: u64 = 0;
+        while n < 30_000_000 {
+            n = n.wrapping_add(1);
+            core::hint::spin_loop();
+        }
+
+        let (after, total_after) = cpu_ticks();
+        let mine_after = after.iter().find(|&&(id, _)| id == me).map(|&(_, t)| t).unwrap_or(0);
+        let parked_after = after.iter().find(|&&(id, _)| id == parked).map(|&(_, t)| t).unwrap_or(0);
+        assert_eq!(parked_after, 0, "a task that never runs must be charged nothing");
+        if total_after > total_before {
+            assert!(mine_after > mine_before, "ticks must be charged to the running task");
+            // The snapshot is taken under one lock, so the parts agree: no task's
+            // share can exceed the total.
+            assert!(after.iter().all(|&(_, t)| t <= total_after), "no share may exceed the total");
+        }
+        let _ = kill(parked);
     }
 
     #[test_case]
