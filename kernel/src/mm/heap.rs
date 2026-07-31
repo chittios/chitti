@@ -196,6 +196,36 @@ impl LinkedListAllocator {
 unsafe impl GlobalAlloc for Locked<LinkedListAllocator> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let (size, align) = LinkedListAllocator::size_align(layout);
+        let first = self.try_alloc(size, align);
+        if !first.is_null() {
+            return first;
+        }
+        // Out of room in the current arena — take more physical memory and retry
+        // once. `grow` **must** be called with the allocator lock released:
+        // `Locked` is not reentrant, so growing from inside `try_alloc`'s critical
+        // section would deadlock rather than fail.
+        if grow(size) {
+            return self.try_alloc(size, align);
+        }
+        OOM_FAILURES.fetch_add(1, Ordering::Relaxed);
+        null_mut()
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let (size, _) = LinkedListAllocator::size_align(layout);
+        self.with(|allocator| {
+            // SAFETY: caller (the `alloc::GlobalAlloc` contract) guarantees
+            // `ptr..ptr+size` was returned by a prior `alloc` with this
+            // same layout and is not aliased elsewhere.
+            unsafe { allocator.add_free_region(ptr as usize, size) };
+        });
+    }
+}
+
+impl Locked<LinkedListAllocator> {
+    /// One first-fit attempt against the current arena. Split out of
+    /// [`GlobalAlloc::alloc`] so growing can happen with this lock *released*.
+    fn try_alloc(&self, size: usize, align: usize) -> *mut u8 {
         self.with(|allocator| {
             if let Some((region, alloc_start)) = allocator.find_region(size, align) {
                 let alloc_end = alloc_start.checked_add(size).expect("mm::heap: overflow");
@@ -212,26 +242,92 @@ unsafe impl GlobalAlloc for Locked<LinkedListAllocator> {
             }
         })
     }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let (size, _) = LinkedListAllocator::size_align(layout);
-        self.with(|allocator| {
-            // SAFETY: caller (the `alloc::GlobalAlloc` contract) guarantees
-            // `ptr..ptr+size` was returned by a prior `alloc` with this
-            // same layout and is not aliased elsewhere.
-            unsafe { allocator.add_free_region(ptr as usize, size) };
-        });
-    }
 }
 
 #[global_allocator]
 static ALLOCATOR: Locked<LinkedListAllocator> = Locked::new(LinkedListAllocator::empty());
 
+/// Bytes added to the arena since boot by [`grow`].
+static GROWN_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Allocations that failed even after a growth attempt.
+static OOM_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Reentrancy guard for [`grow`]. Without it a growth that itself needed to
+/// allocate (a `ktrace` line, say) could recurse into `alloc` -> `grow` forever.
+static GROWING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Smallest chunk [`grow`] takes, so a run of small allocations near the limit
+/// does not turn into a run of frame-allocator round trips.
+const GROW_CHUNK: usize = 8 * 1024 * 1024;
+
+/// Where physical address `phys` is already readable. The heap grows into memory
+/// that is **already mapped** on both arches — through Limine's HHDM on x86, and
+/// through the boot identity map on aarch64 — so growth needs no page-table work
+/// and stays one arch-neutral function.
+#[cfg(target_arch = "x86_64")]
+fn phys_to_arena(phys: u64) -> usize {
+    crate::arch::x86_64::paging::phys_to_virt(phys) as usize
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn phys_to_arena(phys: u64) -> usize {
+    phys as usize // identity map
+}
+
+/// Add at least `min_bytes` of physical memory to the heap arena, returning
+/// whether anything was added.
+///
+/// **The arena does not have to be contiguous**, which is what makes this simple
+/// and identical on both arches: `add_free_region` inserts by address into a
+/// sorted free list, so a fresh run of frames anywhere in RAM is just another
+/// region. There is no need to extend the original `HEAP_START` mapping, and so
+/// no page-table work and no per-arch path.
+///
+/// Requires the frame allocator, which is why this is also the first thing that
+/// makes P0's aarch64 frame allocator load-bearing rather than merely present.
+/// A boot path that declined to build one (see `mm::aarch64_frames`) simply
+/// cannot grow, and reports that by returning `false`.
+///
+/// Must be called with the allocator lock **not** held.
+pub fn grow(min_bytes: usize) -> bool {
+    // Never recurse: `ktrace` below allocates, and an allocation inside a growth
+    // that was triggered by an allocation is how you get an unbounded chain.
+    if GROWING.swap(true, Ordering::Acquire) {
+        return false;
+    }
+    let want = min_bytes.max(GROW_CHUNK).next_multiple_of(super::frame::FRAME_SIZE as usize);
+    let frames = (want / super::frame::FRAME_SIZE as usize) as u64;
+    let phys = super::FRAME_ALLOCATOR
+        .with(|slot| slot.as_mut().and_then(|a| a.allocate_contiguous(frames)));
+    let added = match phys {
+        Some(phys) => {
+            let addr = phys_to_arena(phys);
+            // SAFETY: `frames` freshly-allocated, exclusively-owned, contiguous
+            // frames, reachable at `addr` (HHDM on x86, identity on aarch64) and
+            // referenced nowhere else. Frame-aligned, so `ListNode`-aligned and
+            // far larger than one node.
+            unsafe { ALLOCATOR.with(|a| a.add_free_region(addr, want)) };
+            GROWN_BYTES.fetch_add(want as u64, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    };
+    GROWING.store(false, Ordering::Release);
+    if added {
+        crate::ktrace::log_fmt(format_args!("mm: heap grew by {} MiB", want >> 20));
+    }
+    added
+}
+
+/// `(bytes grown since boot, allocations that failed anyway)`.
+pub fn growth_stats() -> (u64, u64) {
+    (GROWN_BYTES.load(Ordering::Relaxed), OOM_FAILURES.load(Ordering::Relaxed))
+}
+
 /// Heap usage snapshot for `/info`: `(total, free, used)` bytes. `total` is the
-/// compile-time [`HEAP_SIZE`]; `free` walks the free list; `used = total - free`.
+/// initial arena plus everything [`grow`] has since added — a fixed
+/// [`HEAP_SIZE`] would make `used` climb past `total` after the first growth.
 pub fn stats() -> (usize, usize, usize) {
     let free = ALLOCATOR.with(|a| a.free_bytes());
-    let total = HEAP_SIZE;
+    let total = HEAP_SIZE + GROWN_BYTES.load(Ordering::Relaxed) as usize;
     (total, free, total.saturating_sub(free))
 }
 
@@ -277,4 +373,64 @@ pub fn init_static(base: usize, size: usize) {
     // SAFETY: `[base, base+size)` is identity-mapped normal RAM, `ListNode`-
     // aligned (page-aligned base), and referenced nowhere else.
     ALLOCATOR.with(|allocator| unsafe { allocator.init(base, size) });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    #[test_case]
+    fn growth_adds_capacity_and_stats_track_it() {
+        // `total` must include grown bytes: reporting the compile-time HEAP_SIZE
+        // would let `used` climb past `total` after the first growth and print a
+        // percentage over 100.
+        let (total_before, _, _) = stats();
+        let (grown_before, _) = growth_stats();
+        assert!(grow(1), "growth needs a frame allocator; this arch/boot path has one under test");
+        let (grown_after, _) = growth_stats();
+        let (total_after, _, _) = stats();
+        assert!(grown_after > grown_before, "grow must report the bytes it added");
+        assert_eq!(
+            total_after - total_before,
+            (grown_after - grown_before) as usize,
+            "`total` must grow by exactly what was added"
+        );
+        // A minimum chunk, so a run of small allocations near the limit does not
+        // become a run of frame-allocator round trips.
+        assert!(grown_after - grown_before >= GROW_CHUNK as u64);
+    }
+
+    #[test_case]
+    fn the_grown_region_is_actually_usable_memory() {
+        // The region is handed over by address; if that address were wrong (a
+        // missing HHDM translation on x86, say) the free list would look healthy
+        // and the first write would fault. So write the whole thing and read it
+        // back, which is the only check that distinguishes the two.
+        let (grown_before, _) = growth_stats();
+        assert!(grow(1));
+        assert!(growth_stats().0 > grown_before);
+        // Allocate more than one chunk's worth in pieces, touching every byte.
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        for i in 0..8u8 {
+            let mut b = alloc::vec![0u8; 1 << 20];
+            b[0] = i;
+            b[(1 << 20) - 1] = i ^ 0xff;
+            blocks.push(b);
+        }
+        for (i, b) in blocks.iter().enumerate() {
+            assert_eq!(b[0], i as u8, "block {i} start survived");
+            assert_eq!(b[(1 << 20) - 1], (i as u8) ^ 0xff, "block {i} end survived");
+        }
+    }
+
+    #[test_case]
+    fn grow_is_not_reentrant() {
+        // The guard that stops an allocation inside a growth (a ktrace line, say)
+        // from recursing into `alloc` -> `grow` without bound.
+        GROWING.store(true, Ordering::Release);
+        assert!(!grow(1), "a growth already in progress must decline, not recurse");
+        GROWING.store(false, Ordering::Release);
+        assert!(grow(1), "and the guard must not latch");
+    }
 }
