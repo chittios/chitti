@@ -79,9 +79,17 @@ extern "C" fn aarch64_sync_dispatch(frame: *mut u64) {
     // SAFETY: reading FAR_EL1 is always valid at EL1.
     unsafe { core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack)) };
     crate::ktrace::log_fmt(format_args!(
-        "aarch64 FATAL sync exception: ESR_EL1={:#x} ELR_EL1={:#x} FAR_EL1={:#x}",
+        "aarch64 sync exception: ESR_EL1={:#x} ELR_EL1={:#x} FAR_EL1={:#x}",
         esr, elr, far
     ));
+    // Contain it to the faulting task if there is one, exactly as x86's #PF/#GP
+    // handlers do — the dual-arch rule: if a capability exists on one arch it
+    // exists on the other. This handler runs on the faulting task's own stack, so
+    // abandoning the task abandons this trap frame with it and nothing will
+    // `eret` from it. Returns only when isolation is impossible (no scheduler, or
+    // the bootstrap task, where a fault is a kernel bug rather than a tenant's).
+    crate::sched::fault_current_task("aarch64 synchronous exception");
+    crate::ktrace::log("aarch64", "sync exception not isolatable -- halting");
     loop {
         super::hlt();
     }
@@ -107,6 +115,62 @@ extern "C" fn aarch64_fatal_exception(esr: u64, elr: u64, kind: u64) -> ! {
 // caller-saved halves of v8-v15) so preemption is always correct.
 global_asm!(
     r#"
+// Lower-EL synchronous exception. Taking it to EL1h has already switched SP to
+// SP_EL1 — the kernel stack the `eret` left behind, with the entering frame safely
+// *above* this SP — so unlike x86's `syscall` there is no stack to establish and
+// we may `bl` into Rust immediately.
+//
+// **This vector is not only `svc`.** Every synchronous exception from EL0 arrives
+// here: an instruction abort because the tenant's code page was not mapped
+// executable-at-EL0, a data abort for a bad pointer, an undefined instruction. So
+// `ESR_EL1.EC` (bits 31:26) is checked first, and only `0x15` — SVC from AArch64 —
+// is a system call. Without that test a mis-mapped tenant would fault and be
+// reported to the kernel as a *clean syscall carrying garbage*, which is worse
+// than a crash: it looks like success.
+//
+// x0/x1/x2 hold the tenant's arguments by our convention, so the syndrome goes in
+// x9/x10 to leave them alone. `bl` clobbers x30, hence reloading the resume LR
+// afterwards rather than before.
+svc_from_el0:
+    mrs  x9, esr_el1
+    lsr  x10, x9, #26
+    cmp  x10, #0x15
+    b.ne 8f
+    bl   aarch64_svc_dispatch
+    // x0 now holds the reply length, and is the tenant's return value. Resume it
+    // unless the dispatcher asked to leave EL0 (a deliberate Exit, or no tenant).
+    //
+    // **Resumption needs no register save here.** `svc` writes ELR_EL1 (the
+    // instruction after it) and SPSR_EL1 (the tenant's PSTATE, EL0t), and nothing
+    // between there and this `eret` touches either: DAIF is masked by the exception
+    // itself, so no interrupt can nest, and the Rust handler cannot legally take a
+    // synchronous fault. So `eret` alone lands back in the tenant.
+    //
+    // What it does *not* preserve is the C ABI's caller-saved set — the `bl` above
+    // clobbers x1-x18 and x30. That is the tenant-visible contract, and it is the
+    // same shape as x86's (where `syscall_dispatch` clobbers the SysV caller-saved
+    // registers): a tenant that issues `svc` from an `asm!` with `clobber_abi("C")`
+    // gets it right for free, and one that caches a value in x1 across a call does
+    // not. x19-x28 and SP_EL0 are preserved.
+    adrp x9, EL0_EXIT_TO_KERNEL
+    add  x9, x9, :lo12:EL0_EXIT_TO_KERNEL
+    ldr  x10, [x9]
+    cbnz x10, 9f
+    eret
+    // A fault never resumes: fall through to the kernel return regardless of the
+    // flag, since there is no sensible instruction to `eret` to.
+8:  mov  x0, x9
+    mrs  x1, far_el1
+    bl   aarch64_el0_fault
+9:  adrp x9, EL0_RESUME_SP
+    add  x9, x9, :lo12:EL0_RESUME_SP
+    ldr  x10, [x9]
+    mov  sp, x10
+    adrp x9, EL0_RESUME_LR
+    add  x9, x9, :lo12:EL0_RESUME_LR
+    ldr  x30, [x9]
+    ret
+
 .macro FATAL kind
     // Save a couple of scratch regs, gather syndrome, call the Rust handler.
     mrs  x0, esr_el1
@@ -136,9 +200,9 @@ vectors:
     FATAL 6                      // 0x300 FIQ
     .balign 0x80
     FATAL 7                      // 0x380 SError
-    // --- Lower EL, AArch64 (unused: no EL0) ---
+    // --- Lower EL, AArch64 (EL0 tenants) ---
     .balign 0x80
-    FATAL 8                      // 0x400 Synchronous
+    b    svc_from_el0            // 0x400 Synchronous  <-- `svc` from a tenant
     .balign 0x80
     FATAL 9                      // 0x480 IRQ
     .balign 0x80

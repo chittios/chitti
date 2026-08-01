@@ -36,6 +36,16 @@ pub fn phys_to_virt(phys: u64) -> u64 {
 
 pub const PRESENT: u64 = 1 << 0;
 pub const WRITABLE: u64 = 1 << 1;
+/// Ring 3 may access the mapping. Absent from every flag combination the kernel
+/// maps today (heap and MMIO are both supervisor-only), and the counterpart of
+/// aarch64's [`crate::mm::armv8::AP_USER`].
+///
+/// **It must be set on every level of the walk, not just the leaf.** The x86
+/// permission check ANDs `U/S` down the whole path, so a user page reached
+/// through a supervisor-only PDPT/PD/PT is unreachable from ring 3 — a
+/// page fault with no indication of which level refused. [`map_page`] therefore
+/// propagates this bit into the intermediate tables it creates.
+pub const USER_ACCESSIBLE: u64 = 1 << 2;
 /// Requires `arch::x86_64::fpu::enable_nx()` (`EFER.NXE`) to have run
 /// first: without it this bit is reserved and using it faults.
 pub const NO_EXECUTE: u64 = 1 << 63;
@@ -69,13 +79,11 @@ struct PageTable {
     entries: [PageTableEntry; 512],
 }
 
-/// A source of fresh, zeroed physical frames for new page-table levels.
-/// Implemented by `mm::frame::BitmapFrameAllocator` (via an adapter in
-/// `mm::heap`) so this module stays decoupled from the concrete
-/// allocator's locking strategy.
-pub trait FrameAllocator {
-    fn allocate_frame(&mut self) -> Option<u64>;
-}
+/// A source of fresh, zeroed physical frames for new page-table levels. Now
+/// [`crate::mm::frame::TableFrames`], shared with aarch64's walker so the two
+/// arches allocate intermediate tables through one trait; re-exported here under
+/// the name this module has always used.
+pub use crate::mm::frame::TableFrames as FrameAllocator;
 
 fn table_at(phys: u64) -> &'static mut PageTable {
     // SAFETY: `phys` is always either the current CR3 or a present page
@@ -107,6 +115,62 @@ fn read_cr3() -> u64 {
     v & ADDR_MASK
 }
 
+/// Build a fresh top-level table that **shares every kernel mapping** and has an
+/// empty user half, returning its physical address.
+///
+/// On x86 that is exactly a PML4 whose upper 256 entries are copied from the
+/// kernel's: the kernel image and Limine's HHDM both live in the higher half, so
+/// copying those entries shares the whole kernel address space by reference —
+/// later kernel mappings appear in every space automatically, because they are
+/// installed *below* the copied entries. The lower 256 entries start empty and
+/// belong to the task.
+///
+/// # Safety
+/// `frame` must be an exclusively-owned 4 KiB frame reachable through the HHDM.
+pub unsafe fn new_root_sharing_kernel(frame: u64) -> u64 {
+    let src = table_at(read_cr3());
+    let dst = table_at(frame);
+    for i in 0..512 {
+        // Upper half = kernel (higher-half image + HHDM); lower half = user.
+        dst.entries[i] = if i >= 256 { src.entries[i] } else { PageTableEntry::empty() };
+    }
+    frame
+}
+
+/// The physical address `virt` translates to in the tree rooted at physical
+/// `root`, or `None` if nothing maps it. 4 KiB pages only — this kernel maps
+/// nothing with the 2 MiB/1 GiB page-size bit, so a large page here would be a
+/// bug rather than a case to resolve. Mirrors aarch64's
+/// [`crate::mm::walk::translate`], and exists for the same reason: confirming a
+/// mapping took, rather than discovering it did not via a fault.
+pub fn translate_in(root: u64, virt: u64) -> Option<u64> {
+    let mut table = table_at(root);
+    for level in (1..=3u64).rev() {
+        let entry = table.entries[table_index(virt, level)];
+        if !entry.is_present() {
+            return None;
+        }
+        table = table_at(entry.addr());
+    }
+    let leaf = table.entries[table_index(virt, 0)];
+    if !leaf.is_present() {
+        return None;
+    }
+    Some(leaf.addr() | (virt & 0xfff))
+}
+
+/// Switch the active address space to the tree rooted at physical `root`.
+///
+/// # Safety
+/// `root` must be a valid top-level table that maps all currently-executing
+/// kernel code, data and the current stack — which
+/// [`new_root_sharing_kernel`] guarantees by copying the kernel half.
+pub unsafe fn activate_root(root: u64) {
+    // SAFETY: caller's contract; writing CR3 replaces the address space and
+    // flushes non-global TLB entries.
+    unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
+}
+
 fn invlpg(virt: u64) {
     // SAFETY: invalidates the TLB entry for `virt`; always safe, at worst
     // costs a future TLB miss.
@@ -122,11 +186,26 @@ fn table_index(virt: u64, level: u64) -> usize {
 /// Map the single page at `virt` (must be 4 KiB-aligned) to `phys` with
 /// `flags`, allocating any missing PML4/PDPT/PD entries via `alloc`.
 /// Walks from the *current* `CR3`.
+///
+/// When `flags` requests [`USER_ACCESSIBLE`], the bit is also set on every
+/// intermediate entry along the walk — created or pre-existing — because the
+/// hardware ANDs `U/S` down the path (see that constant). Widening an
+/// intermediate is safe: the leaf's own `U/S` still decides, so kernel pages
+/// sharing the table stay supervisor-only.
 pub fn map_page(virt: u64, phys: u64, flags: u64, alloc: &mut impl FrameAllocator) {
+    map_page_in(read_cr3(), virt, phys, flags, alloc)
+}
+
+/// Like [`map_page`], but into the tree rooted at physical `root` rather than the
+/// one `CR3` currently points at. This is what per-task address spaces are built
+/// with ([`crate::mm::space`]): a fresh PML4 that shares the kernel's higher-half
+/// entries and gets its own lower-half user mappings.
+pub fn map_page_in(root: u64, virt: u64, phys: u64, flags: u64, alloc: &mut impl FrameAllocator) {
     debug_assert_eq!(virt % 4096, 0);
     debug_assert_eq!(phys % 4096, 0);
 
-    let mut table = table_at(read_cr3());
+    let intermediate = PRESENT | WRITABLE | (flags & USER_ACCESSIBLE);
+    let mut table = table_at(root);
     for level in (1..=3u64).rev() {
         let idx = table_index(virt, level);
         let entry = &mut table.entries[idx];
@@ -135,7 +214,9 @@ pub fn map_page(virt: u64, phys: u64, flags: u64, alloc: &mut impl FrameAllocato
                 .allocate_frame()
                 .expect("map_page: out of physical frames for page tables");
             zero_table(table_at(new_frame));
-            entry.set(new_frame, PRESENT | WRITABLE);
+            entry.set(new_frame, intermediate);
+        } else {
+            entry.0 |= intermediate & USER_ACCESSIBLE;
         }
         table = table_at(entry.addr());
     }

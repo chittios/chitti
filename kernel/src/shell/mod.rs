@@ -131,7 +131,25 @@ pub fn run() -> ! {
     // Register the bundled Noto script fonts as the system fallback chain so
     // Indic/emoji web text renders real glyphs instead of tofu.
     crate::font_ttf::register_bundled_fallbacks();
-    auto_mount_root();
+    if let Some(mt) = crate::fs::mount::auto_mount_data_root() {
+        serial_println!(
+            "Chitti: mounted / -> disk {} ({}, {} MiB, {}) [auto]",
+            mt.disk,
+            mt.fs.name(),
+            mt.sectors * 512 / 1024 / 1024,
+            if mt.writable { "rw" } else { "ro" }
+        );
+    }
+    // On a permanent disk the store must be ext4, never silent memfs.
+    serial_println!(
+        "Chitti: synapse store backend = {}{}",
+        crate::synapse::fs::backend_name(),
+        if crate::synapse::fs::is_durable() {
+            " (writes survive reboot)"
+        } else {
+            " (live ISO/image only — install + reboot for durable state)"
+        }
+    );
     // NB: the large CJK fallback font is loaded **lazily** (first browser use),
     // never at boot — reading it is fine now (idempotent probe + bounded FAT
     // walk), but *parsing* a 16 MB CFF font through fontdue churns the first-fit
@@ -614,6 +632,8 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "mount" => disk_mount(arg),
         "umount" => disk_umount(arg),
         "mounts" => disk_mounts(),
+        "encrypt" => disk_encrypt(arg),
+        "unlock" => disk_unlock(arg),
         "cat" => fs_cat(arg),
         "grep" => fs_grep(arg),
         "glob" => fs_glob(arg),
@@ -2661,25 +2681,40 @@ pub fn approval_mode_name() -> &'static str {
 /// in the settings app applies the same state as the shell command.
 pub fn set_approval_mode_name(name: &str) -> bool {
     use core::sync::atomic::Ordering;
-    match name.trim() {
-        "manual" | "0" => {
-            MODE.store(0, Ordering::Relaxed);
-            true
-        }
-        "auto" | "1" => {
-            MODE.store(1, Ordering::Relaxed);
-            true
-        }
-        "bypass" | "2" => {
-            MODE.store(2, Ordering::Relaxed);
-            true
-        }
-        "plan" | "3" => {
-            MODE.store(3, Ordering::Relaxed);
-            true
-        }
-        _ => false,
-    }
+    let slot = match name.trim() {
+        "manual" | "0" => 0,
+        "auto" | "1" => 1,
+        "bypass" | "2" => 2,
+        "plan" | "3" => 3,
+        _ => return false,
+    };
+    MODE.store(slot, Ordering::Relaxed);
+    mirror_mode_to_kernel_policy();
+    true
+}
+
+/// Mirror the shell's approval mode into `synapse::policy`, which is where the
+/// executor reads it.
+///
+/// Both copies exist on purpose and neither is redundant. The shell's is richer
+/// (it has `Plan`, and it knows tool names, so it can ask a human *before* a call
+/// is attempted, with the source of the justification in the prompt). The
+/// kernel's is the one that is actually **enforced**: the shell's copy is
+/// tenant-side, and a tenant reaching `synapse::executor::execute` through the
+/// syscall ABI would never consult it. Policy enforced by the thing being
+/// governed is not enforcement.
+///
+/// `Plan` maps to `Manual` at the kernel layer: plan mode refuses side effects
+/// entirely, and "requires an approval that the plan-mode path will never grant"
+/// is the closest honest translation of that into a two-valued check.
+fn mirror_mode_to_kernel_policy() {
+    use crate::synapse::policy;
+    let m = match approval_mode() {
+        ApprovalMode::Manual | ApprovalMode::Plan => policy::Mode::Manual,
+        ApprovalMode::Auto => policy::Mode::Auto,
+        ApprovalMode::Bypass => policy::Mode::Bypass,
+    };
+    policy::set_mode(m);
 }
 
 /// Enter / exit plan mode (also exposed as tools for the agent).
@@ -2690,6 +2725,10 @@ pub fn set_plan_mode(on: bool) {
     } else {
         MODE.store(1, Ordering::Relaxed); // back to auto
     }
+    // Mirror here too: `/mode plan` and the plan-mode *tool* are two ways to set
+    // the same state, and only mirroring one of them would make enforcement
+    // depend on which route the human took.
+    mirror_mode_to_kernel_policy();
 }
 
 pub fn is_plan_mode() -> bool {
@@ -3638,22 +3677,26 @@ fn run_view_plan(arg: &str) {
 
 /// `/mode manual|auto|bypass|plan` — set (or show) the approval mode.
 fn run_mode(arg: &str) {
-    use core::sync::atomic::Ordering;
+    // Every arm goes through `set_approval_mode_name`, never `MODE.store`
+    // directly: that setter is also what mirrors the mode into
+    // `synapse::policy`, which is where the executor actually enforces it. A
+    // fourth path storing the raw slot would make enforcement depend on which
+    // route the human took to set it — and this handler *was* such a path.
     match arg.trim() {
         "manual" => {
-            MODE.store(0, Ordering::Relaxed);
+            set_approval_mode_name("manual");
             serial_println!("mode> \x1b[1mmanual\x1b[0m — every agent tool call asks for approval");
         }
         "auto" => {
-            MODE.store(1, Ordering::Relaxed);
+            set_approval_mode_name("auto");
             serial_println!("mode> \x1b[1mauto\x1b[0m — only destructive tools ask for approval");
         }
         "bypass" => {
-            MODE.store(2, Ordering::Relaxed);
+            set_approval_mode_name("bypass");
             serial_println!("mode> \x1b[1mbypass\x1b[0m — no approvals (be careful)");
         }
         "plan" => {
-            MODE.store(3, Ordering::Relaxed);
+            set_approval_mode_name("plan");
             serial_println!(
                 "mode> \x1b[1mplan\x1b[0m — read-only + todos/skills only; write/delete/install refused until /mode auto"
             );
@@ -4352,6 +4395,17 @@ pub(crate) fn prefix_snapshot_fits(bytes: usize, free: usize, reserve: usize) ->
     free >= bytes.saturating_add(reserve)
 }
 
+/// Stack for a chat turn's task.
+///
+/// Four times the scheduler default, because this is the deepest chain the kernel has
+/// (turn -> model forward -> ONNX dispatch -> tool -> possibly a sub-agent) and it is
+/// the case the 256 KiB default was already known to be tight for: 64 KiB stacks used
+/// to *silently triple-fault* on the ONNX interpreter's ~55-arm dispatch frame alone.
+/// One allocation per user message, so being generous is free; an overflow is now
+/// reported by the stack canary (`sched::stack_overflows`) rather than corrupting the
+/// heap beneath it.
+const CHAT_TURN_STACK: usize = 1024 * 1024;
+
 impl ChatSession {
     /// Load the bundled model + build the tokenizer. `None` if no model. Ticks
     /// `spin` between load steps so the caller's spinner animates. Failures are
@@ -4494,6 +4548,31 @@ impl ChatSession {
     /// `max_tool_calls` (with a small interactive ceiling so a runaway model
     /// can't burn the whole session budget on one user message).
     fn turn(&mut self, msg: &str, session: &mut crate::agent::types::Session) -> alloc::string::String {
+        // **The chat loop runs on its own task**, not on whichever stack called it.
+        //
+        // This was the last thing in the system still borrowing its caller's stack for
+        // deep work, and the depth here is the worst in the kernel: the turn, a model
+        // prefill/decode, the ONNX interpreter's wide dispatch frames, a tool, and
+        // possibly a nested sub-agent. It used to be charged to the shell's boot stack —
+        // or, on the voice path, to whatever called *that*.
+        //
+        // Note this is not concurrency: the caller blocks throughout, so every existing
+        // call site keeps its exact semantics and this stays a one-line wrapper. What
+        // changes is whose stack overflows and who gets a canary. A joiner spinning on
+        // `yield_now` costs about two context switches per timeslice, not half the CPU —
+        // `yield_now` gives up the *remainder* of a slice rather than taking a turn's
+        // worth of work — and on a cooperative boot (no GIC) the chat task simply runs
+        // until it yields of its own accord.
+        let mut body = || self.turn_inner(msg, session);
+        crate::sched::run_on_new_task("chat-turn", CHAT_TURN_STACK, &mut body).unwrap_or_else(|| {
+            // The task died without answering. Surfaced to the user rather than
+            // panicking: a turn dying is an operational event and the REPL must survive.
+            crate::ktrace::log("chat", "the chat turn's task ended without an answer");
+            alloc::string::String::from("error: the chat turn ended unexpectedly")
+        })
+    }
+
+    fn turn_inner(&mut self, msg: &str, session: &mut crate::agent::types::Session) -> alloc::string::String {
         use crate::agent::orchestrator::now;
         use crate::agent::types::{Provenance, Role, ToolCall};
         // Per-message tool-call ceiling. The shell is a human-driven REPL, not a
@@ -6283,8 +6362,26 @@ fn run_surface(_arg: &str) {
         me,
         &alloc::vec![CapabilityRequest::new(CapDomain::Ui, Rights::EXEC | Rights::WRITE | Rights::DELETE, Scope::Any)],
     );
-    // Request a surface (board kind).
-    let req = crate::synapse::execute(me, r#"{"name":"ui_surface_request","arguments":{"kind":"board"}}"#);
+    // **This command's effects run in ring 3.** `/surface` is app-facing — its whole
+    // job is to drive UI primitives through the gated path — which is exactly the class
+    // the userspace migration is for, as against the hardware and diagnostic commands
+    // (`/lspci`, `/disks`, `/display`) that have to stay in the kernel because they touch
+    // devices. A human typed the command, so the justification is `UserTyped`; supplying
+    // it is what keeps the meaning of the call identical to the in-kernel version rather
+    // than silently maximally-tainted.
+    //
+    // The *structured* outcome comes back, so the parsing below is unchanged — reading
+    // the tenant's rendered prose instead would have meant matching on a different
+    // vocabulary, which is the mistake that once made refusals look like successes.
+    let human = crate::security::taint::Justification::from_context(crate::security::taint::Provenance::UserTyped);
+    let surface_call = r#"{"name":"ui_surface_request","arguments":{"kind":"board"}}"#;
+    let req = match crate::synapse::tenant::invoke_in_userspace(me, surface_call, human) {
+        Some(inv) => inv,
+        None => {
+            serial_println!("surface> the userspace call never reached the gates");
+            return;
+        }
+    };
     let sid = match req {
         crate::synapse::Invocation::Executed { result, .. } => {
             result.strip_prefix("ok:surface=").and_then(|s| s.trim().parse::<u32>().ok())
@@ -6307,9 +6404,10 @@ fn run_surface(_arg: &str) {
     }
     ops.push_str(" line 0 0 191 191 cc785c");
     let call = alloc::format!(r#"{{"name":"ui_draw","arguments":{{"surface":{sid},"ops":"{ops}"}}}}"#);
-    let drew = match crate::synapse::execute(me, &call) {
-        crate::synapse::Invocation::Executed { result, .. } => result,
-        other => alloc::format!("{other:?}"),
+    let drew = match crate::synapse::tenant::invoke_in_userspace(me, &call, human) {
+        Some(crate::synapse::Invocation::Executed { result, .. }) => result,
+        Some(other) => alloc::format!("{other:?}"),
+        None => alloc::string::String::from("the userspace call never reached the gates"),
     };
     let sum = crate::synapse::ui::checksum(sid).unwrap_or(0);
     serial_println!("surface> rendered surface {} ({}), checksum=0x{:016x}", sid, drew, sum);
@@ -6406,11 +6504,23 @@ fn run_agents(
 
 /// Serial flat listing (also `/agents list text` / e2e).
 fn print_agents_text() {
-    let active = active_agent_id();
-    serial_println!("agents> id   name              state     (agent tasks are scheduler processes)");
+    // The `*chat` marker names the **task** the chat's tool calls run as, so it
+    // must be compared against the chat context's caller task — not
+    // `active_agent_id()`, which is an *agent* id from a different numbering. The
+    // two only ever agreed by accident, and the pump task taking task 1 made
+    // agent 1 collide with it, marking the pump as the chat agent.
+    let active = CHAT_TOOL_CTX.with(|slot| slot.as_ref().map(|c| c.caller));
+    // Real per-task CPU share, sampled once so the column sums to ~100%. The
+    // status bar's `cpu_percent` is a whole-system heuristic and cannot say which
+    // task was busy; this can. Reads 0% where there is no timer to charge ticks
+    // from (Apple-HVF aarch64 stays cooperative) — an honest zero, not an error.
+    let (ticks, total) = crate::sched::cpu_ticks();
+    serial_println!("agents> id   name              state     cpu%  (agent tasks are scheduler processes)");
     for (id, name, state) in crate::sched::list() {
-        let marker = if id == active { " *chat" } else { "" };
-        serial_println!("agents> {:<4} {:<17} {:<9}{}", id, name, state, marker);
+        let marker = if Some(id) == active { " *chat" } else { "" };
+        let mine = ticks.iter().find(|&&(t, _)| t == id).map(|&(_, v)| v).unwrap_or(0);
+        let pct = if total > 0 { mine.saturating_mul(100) / total } else { 0 };
+        serial_println!("agents> {:<4} {:<17} {:<9} {:>3}%{}", id, name, state, pct, marker);
     }
     serial_println!("agents> system agents (UI canvas vs shell) — start with /agents start <name>:");
     let autostart = crate::agent::system::autostart_names();
@@ -8160,20 +8270,33 @@ fn read_line(buf: &mut String) -> ReadOutcome {
             }
             Some(_) => {} // ignore other control bytes
             None => {
-                // Full upkeep (not just ui_tick): pumps net, service supervisor,
-                // **and messaging channels** (`msgchan::tick`). Without this,
-                // Telegram getUpdates never ran while the prompt was idle —
-                // offset stayed 0 and DMs were invisible.
-                upkeep();
                 // Wake the main loop so it can run the agent on queued DMs
                 // (drain only happens outside read_line — never block forever).
+                // Checked *before* sleeping, and re-checked on every wakeup, so a
+                // DM the pump's `msgchan::tick` queued while we slept is seen.
                 if crate::msgchan::inbound_len() > 0 {
                     #[cfg(not(test))]
                     crate::framebuffer::suggest_clear();
                     // Leave `buf` as the in-progress draft for the next prompt.
                     return ReadOutcome::ChannelWake;
                 }
-                crate::sched::yield_now();
+                // Sleep until something reports console input, instead of
+                // pumping the whole world from the prompt. The pumping still has
+                // to happen — net, the service supervisor, and **messaging
+                // channels** (`msgchan::tick`, without which Telegram
+                // `getUpdates` never ran while the prompt was idle and DMs were
+                // invisible) — but it now happens on `shell::pump_task`, whose
+                // whole purpose is to do it for a sleeping waiter.
+                //
+                // `block_on` reports whether it actually slept. `false` means the
+                // scheduler had nothing else to run — no pump task registered
+                // yet, or it died — and then this loop must drive the world
+                // itself, exactly as it always did. Keeping that path is what
+                // makes the migration safe rather than a cliff.
+                if !crate::sched::block_on(crate::sched::Wait::Console) {
+                    upkeep();
+                    crate::sched::yield_now();
+                }
             }
         }
     }
@@ -8520,6 +8643,19 @@ fn repaint_active_tab() {
     repaint_tab(crate::framebuffer::right_mode());
 }
 
+/// Repaint pane interiors if the band changed since the last pump.
+///
+/// `framebuffer` is compiled out of the test build, so this carries the same cfg split as
+/// [`repaint_all_tabs`] rather than guarding at the call site.
+#[cfg(not(test))]
+fn drain_tab_repaint() {
+    if crate::framebuffer::take_tabs_dirty() {
+        repaint_visible_tabs();
+    }
+}
+#[cfg(test)]
+fn drain_tab_repaint() {}
+
 /// Repaint the active tab of **every visible action pane**.
 ///
 /// Anything that relayouts the band (a divider drag, `/pane grid|max|split`, a
@@ -8771,12 +8907,91 @@ pub fn upkeep() {
     // The ACPI power button. One port read when armed, nothing at all otherwise. A
     // press is acted on *here* rather than inside the driver's poll, so the machine is
     // never powered off from underneath a repaint.
+    // Wake anything sleeping on a condition this pump may have advanced.
+    //
+    // **Here rather than only in `pump_task`**, because the idle task is by
+    // construction the *lowest* priority thing in the system: `pick_next` reaches
+    // it only when the ready queue is empty. A compute-bound task — a prefill, a
+    // video decode — keeps the queue non-empty for as long as it runs, so a
+    // sleeper whose wakeup depended on the pump task being scheduled would starve
+    // for exactly as long, with nothing reporting a problem. Every such loop
+    // already calls `upkeep` (the standing rule that keeps the UI alive), so
+    // waking from here makes the waker *whoever pumped*, and removes the
+    // dependence on scheduling the idle task at all.
+    //
+    // Spurious wakeups are fine and expected: a woken task re-checks its own
+    // condition and blocks again. That is what lets this stay a blanket wake
+    // instead of `upkeep` having to know what readiness means for each subsystem.
+    for w in [
+        crate::sched::Wait::Console,
+        crate::sched::Wait::Net,
+        crate::sched::Wait::Block,
+        crate::sched::Wait::SoundOut,
+    ] {
+        crate::sched::wake(w);
+    }
+    // A band change (a view opening, a divider drag, `/pane grid|max|split`, a tab move)
+    // repaints pane *frames* but not their interiors, which the views own. Draining the
+    // flag here means every such change gets the repaint, instead of it depending on each
+    // call site remembering — which is how browser/chess/paint came to go blank whenever
+    // a new pane opened next to them.
+    drain_tab_repaint();
     crate::drivers::pwrbtn::poll();
     if crate::drivers::pwrbtn::take_press() {
         crate::ktrace::log("pwrbtn", "power button pressed -- powering off");
         serial_println!("Chitti: power button pressed, powering off.");
         crate::arch::poweroff();
     }
+}
+
+/// The pump task: what the scheduler runs when every other task is blocked or
+/// there is nothing else to do.
+///
+/// **This is the "task that isn't you" that real blocking requires**, and its
+/// absence is why every waiting loop in this kernel is a busy-wait. A task
+/// waiting on I/O had to call [`upkeep`] itself — poll the network, service the
+/// UI, blink the caret, drive the package-UI apps — so the waiter *was* the
+/// pump and therefore could not afford to sleep. With the pumping moved here, a
+/// waiter can go to sleep on a [`crate::sched::Wait`] and something else keeps
+/// the world turning.
+///
+/// It never blocks and never returns, which is [`crate::sched::set_idle`]'s
+/// contract. It also does not `hlt`: it is a pump, not a halt, and the UI needs
+/// `upkeep` to keep running for the caret, the status clock and the network
+/// stack. That costs nothing extra today, because this loop only ever runs when
+/// the alternative was a working task spinning on `upkeep` itself.
+extern "C" fn pump_task(_arg: u64) {
+    use crate::sched::Wait;
+    const CONDITIONS: [Wait; 4] = [Wait::Console, Wait::Net, Wait::Block, Wait::SoundOut];
+    loop {
+        // Belt and braces with `sched::pick_next`, which already declines to
+        // reach us unless a task is asleep: pump only for an actual sleeper.
+        // Running `upkeep` when nobody is blocked duplicates the pumping the
+        // yielding task is doing for itself, and that duplication is harmful
+        // rather than merely wasteful — `mouse::tick()` consumes the input that
+        // modal and editor loops read for themselves.
+        if !CONDITIONS.iter().any(|&w| crate::sched::blocked_count(w) > 0) {
+            crate::sched::yield_now();
+            continue;
+        }
+        // `upkeep` wakes the sleepers itself (see there): the waker has to be
+        // whoever pumped, not specifically this task, because this task is the
+        // lowest-priority thing in the system and a busy ready queue starves it.
+        upkeep();
+        crate::sched::yield_now();
+    }
+}
+
+/// Start the pump task and register it as the scheduler's idle task.
+///
+/// Deliberately a no-op in effect until something actually blocks: the pump is
+/// reachable only through the scheduler's empty-ready-queue fallback, so while
+/// every task stays runnable (as they all did before wait queues existed) it
+/// never takes a turn. That is what makes introducing it safe on a kernel whose
+/// entire UX runs through one task.
+pub fn start_pump() {
+    let id = crate::sched::spawn("pump", pump_task, 0);
+    crate::sched::set_idle(id);
 }
 
 /// Lighter upkeep for loops that consume their own mouse events (modals, the
@@ -13178,72 +13393,25 @@ fn parse_datetime(s: &str) -> Option<(i64, i64, i64, i64, i64, i64)> {
     Some((y, mo, d, h, mi, s))
 }
 
-// --- block-device / filesystem commands (x86 virtio-blk over PCI) ---------
-
-/// A mounted volume: a (disk, volume) bound to a path like `/mnt`, so `/ls` and
-/// `/cat` can address it by path (a lightweight, Linux-flavored mount table —
-/// not a full VFS: paths resolve to a volume's root, one directory level).
-#[derive(Clone)]
-struct Mount {
-    path: alloc::string::String,
-    disk: usize,
-    start_lba: u64,
-    sectors: u64,
-    fs: crate::fs::detect::FsType,
-    label: Option<alloc::string::String>,
-}
-
-static MOUNTS: crate::mm::Locked<alloc::vec::Vec<Mount>> = crate::mm::Locked::new(alloc::vec::Vec::new());
-
-/// The mount whose path is `path` (exact), if any.
-fn mount_lookup(path: &str) -> Option<Mount> {
-    MOUNTS.with(|m| m.iter().find(|mt| mt.path == path).cloned())
-}
+// --- block-device / filesystem commands (via `crate::fs::{mount,vfs}`) ----
 
 /// `/mount <disk> [vol] [/path]` — bind volume `vol` (default 0) of disk `disk`
-/// to a mount path (default the first free `/mnt`, `/mnt2`, …). The volume is
-/// discovered via the FS detector, exactly as `/disks` shows it.
-/// Auto-mount the ext4 **data** partition at `/` on boot, so `/ls`, `/cat`, and
-/// `/voice models load` work without a manual `/mount`. Picks the same partition
-/// the persistent store uses: the first ext4 that holds neither the model
-/// (`*.gguf`) nor the OS (kernel / `limine.conf`). No-op if none is present.
-fn auto_mount_root() {
-    use crate::block::{ext4_read::Ext4Reader, Partition};
-    use crate::fs::detect::FsType;
-    for disk in 0..4usize {
-        let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
-            continue;
-        };
-        let vols = crate::fs::detect::probe(&mut dev);
-        for (vi, v) in vols.iter().enumerate() {
-            if !matches!(v.fs, FsType::Ext2 | FsType::Ext3 | FsType::Ext4) {
-                continue;
-            }
-            let mut part = Partition::new(&mut dev, v.start_lba, v.sectors);
-            let is_os_or_model = Ext4Reader::open(&mut part)
-                .map(|mut r| r.list_root().iter().any(|(n, _, _)| n.contains(".gguf") || n == "chitti-kernel" || n == "limine.conf"))
-                .unwrap_or(true);
-            if is_os_or_model {
-                continue;
-            }
-            MOUNTS.with(|m| {
-                m.push(Mount { path: alloc::string::String::from("/"), disk, start_lba: v.start_lba, sectors: v.sectors, fs: v.fs, label: v.label.clone() });
-            });
-            serial_println!("Chitti: mounted / -> disk {} vol {} ({}, {} MiB) [auto]", disk, vi, v.fs.name(), v.sectors * 512 / 1024 / 1024);
-            return;
-        }
-    }
-}
-
+/// to a mount path (default the first free `/mnt`, `/mnt2`, …).
 fn disk_mount(arg: &str) {
-    use alloc::string::{String, ToString};
+    use alloc::string::String;
     let mut disk: Option<usize> = None;
     let mut vol: usize = 0;
     let mut path: Option<String> = None;
+    // Default RW for FAT/ext; `ro` forces read-only. NTFS always RO for now.
+    let mut want_rw = true;
     let mut nums = 0;
     for tok in arg.split_whitespace() {
-        if let Some(p) = tok.strip_prefix('/') {
-            path = Some(alloc::format!("/{}", p));
+        if tok == "ro" {
+            want_rw = false;
+        } else if tok == "rw" {
+            want_rw = true;
+        } else if let Some(p) = tok.strip_prefix('/') {
+            path = Some(alloc::format!("/{p}"));
         } else if let Ok(n) = tok.parse::<usize>() {
             if nums == 0 {
                 disk = Some(n);
@@ -13254,139 +13422,209 @@ fn disk_mount(arg: &str) {
         }
     }
     let Some(disk) = disk else {
-        serial_println!("mount> usage: /mount <disk> [vol] [/path]   (see /disks for disk + volume indices)");
+        serial_println!(
+            "mount> usage: /mount <disk> [vol] [/path] [rw|ro]\n\
+             mount> FAT/ext default rw; NTFS mounts read-only (writer not implemented)"
+        );
         return;
     };
-    let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
-        serial_println!("mount> no disk {} (see /disks)", disk);
-        return;
-    };
-    let vols = crate::fs::detect::probe(&mut dev);
-    let Some(v) = vols.get(vol).cloned() else {
-        serial_println!("mount> disk {} has no volume {} (see /disks)", disk, vol);
-        return;
-    };
-    // Default mount point: first free /mnt, /mnt2, /mnt3, ...
-    let path = path.unwrap_or_else(|| {
-        MOUNTS.with(|m| {
-            if !m.iter().any(|x| x.path == "/mnt") {
-                return "/mnt".to_string();
+    match crate::fs::mount::mount(disk, vol, path.as_deref(), want_rw) {
+        Ok(mt) => {
+            serial_println!(
+                "mount> {} -> disk {} ({}, {} MiB, label={}, {})",
+                mt.path,
+                mt.disk,
+                mt.fs.name(),
+                mt.sectors * 512 / 1024 / 1024,
+                mt.label.as_deref().unwrap_or("-"),
+                if mt.writable { "rw" } else { "ro" }
+            );
+            if want_rw && !mt.writable {
+                serial_println!(
+                    "mount> note: {} is mounted read-only (write support not implemented)",
+                    mt.fs.name()
+                );
             }
-            (2..).map(|i| alloc::format!("/mnt{}", i)).find(|p| !m.iter().any(|x| x.path == *p)).unwrap()
-        })
-    });
-    if mount_lookup(&path).is_some() {
-        serial_println!("mount> {} already mounted (/umount it first)", path);
-        return;
+        }
+        Err(crate::fs::mount::MountError::NoDisk) => {
+            serial_println!("mount> no disk {} (see /disks)", disk);
+        }
+        Err(crate::fs::mount::MountError::NoVolume) => {
+            serial_println!("mount> disk {} has no volume {} (see /disks)", disk, vol);
+        }
+        Err(crate::fs::mount::MountError::Busy) => {
+            serial_println!("mount> path already mounted (/umount it first)");
+        }
+        Err(crate::fs::mount::MountError::Unsupported) => {
+            serial_println!(
+                "mount> unsupported filesystem (FAT/ext: rw; NTFS: ro list+read; exFAT: detect only)"
+            );
+        }
+        Err(e) => serial_println!("mount> failed: {e:?}"),
     }
-    let mt = Mount { path: path.clone(), disk, start_lba: v.start_lba, sectors: v.sectors, fs: v.fs, label: v.label.clone() };
-    MOUNTS.with(|m| m.push(mt));
-    serial_println!(
-        "mount> {} -> disk {} vol {} ({}, {} MiB, label={})",
-        path,
-        disk,
-        vol,
-        v.fs.name(),
-        v.sectors * 512 / 1024 / 1024,
-        v.label.as_deref().unwrap_or("-")
-    );
 }
 
 /// `/umount <path>` — remove a mount.
 fn disk_umount(arg: &str) {
     let path = arg.trim();
-    let removed = MOUNTS.with(|m| {
-        let before = m.len();
-        m.retain(|x| x.path != path);
-        before - m.len()
-    });
-    if removed > 0 {
-        serial_println!("umount> {} unmounted", path);
-    } else {
-        serial_println!("umount> {} not mounted (see /mounts)", path);
+    match crate::fs::mount::umount(path) {
+        Ok(()) => serial_println!("umount> {} unmounted", path),
+        Err(_) => serial_println!("umount> {} not mounted (see /mounts)", path),
     }
 }
 
 /// `/mounts` — list the mount table.
 fn disk_mounts() {
-    MOUNTS.with(|m| {
-        if m.is_empty() {
-            serial_println!("mounts> (nothing mounted; /mount <disk> [vol] [/path])");
-            return;
-        }
-        for mt in m.iter() {
-            serial_println!(
-                "  {:<8} disk {} lba {:<10} {:>6} MiB  {:<8} label={}",
-                mt.path,
-                mt.disk,
-                mt.start_lba,
-                mt.sectors * 512 / 1024 / 1024,
-                mt.fs.name(),
-                mt.label.as_deref().unwrap_or("-")
-            );
-        }
-    });
+    let m = crate::fs::mount::list();
+    if m.is_empty() {
+        serial_println!("mounts> (nothing mounted; /mount <disk> [vol] [/path])");
+        return;
+    }
+    for mt in m.iter() {
+        serial_println!(
+            "  {:<8} disk {} lba {:<10} {:>6} MiB  {:<8} {} label={}",
+            mt.path,
+            mt.disk,
+            mt.start_lba,
+            mt.sectors * 512 / 1024 / 1024,
+            mt.fs.name(),
+            if mt.writable { "rw" } else { "ro" },
+            mt.label.as_deref().unwrap_or("-")
+        );
+    }
 }
 
-/// List the root directory of a mounted volume (`/ls /mnt`). Shared FAT/ext4
-/// readers over a partition view at the mount's LBA range.
-///
-/// When the mount is `/` (the auto-mounted data partition), prefer the live
-/// Synapse store tree — on-disk keys are flat percent-encoded names and are
-/// not a useful directory listing.
-fn ls_mount(mt: &Mount) {
-    if mt.path == "/" {
+/// `/encrypt <disk> [vol]` — format a **data** partition as C4VE (AES-XTS) and
+/// put an empty ext4 on the payload. **Human-only**, destructive: existing
+/// contents of that volume are wiped. Agent tools must not call this.
+fn disk_encrypt(arg: &str) {
+    use crate::block::ext4::Ext4Writer;
+    use crate::block::volcrypto::{self, DEFAULT_HDR_SECTORS, DEFAULT_ITERATIONS};
+    use crate::block::Partition;
+
+    let mut nums = arg.split_whitespace().filter_map(|t| t.parse::<usize>().ok());
+    let Some(disk) = nums.next() else {
+        serial_println!("encrypt> usage: /encrypt <disk> [vol]   (human-only; wipes the volume)");
+        return;
+    };
+    let vol = nums.next().unwrap_or(0);
+    if !crate::modal::confirm(
+        "Encrypt volume",
+        &alloc::format!("Wipe disk {disk} vol {vol} and encrypt with AES-XTS?"),
+    ) {
+        serial_println!("encrypt> cancelled");
+        return;
+    }
+    let pass = crate::modal::input("Set passphrase", "New passphrase:", true);
+    if pass.is_empty() {
+        serial_println!("encrypt> empty passphrase refused");
+        return;
+    }
+    let pass2 = crate::modal::input("Confirm passphrase", "Repeat:", true);
+    if pass != pass2 {
+        serial_println!("encrypt> passphrases do not match");
+        return;
+    }
+    let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
+        serial_println!("encrypt> no disk {disk}");
+        return;
+    };
+    let vols = crate::fs::detect::probe(&mut dev);
+    let Some(v) = vols.get(vol).cloned() else {
+        serial_println!("encrypt> no volume {vol} on disk {disk}");
+        return;
+    };
+    let mut part = Partition::new(&mut dev, v.start_lba, v.sectors);
+    let key = match volcrypto::format(&mut part, pass.as_bytes(), DEFAULT_ITERATIONS, DEFAULT_HDR_SECTORS)
+    {
+        Ok(k) => k,
+        Err(e) => {
+            serial_println!("encrypt> format header failed: {e:?}");
+            return;
+        }
+    };
+    // Empty ext4 on the encrypted payload.
+    let mut payload =
+        volcrypto::CryptoPart::encrypted(&mut dev, v.start_lba, v.sectors, DEFAULT_HDR_SECTORS, key);
+    if let Err(e) = Ext4Writer::format(&mut payload, &[]) {
+        serial_println!("encrypt> payload mkfs failed: {e:?}");
+        return;
+    }
+    serial_println!(
+        "encrypt> disk {disk} vol {vol} is C4VE + empty ext4 ({} MiB payload). Reboot and unlock, or /unlock.",
+        (v.sectors.saturating_sub(DEFAULT_HDR_SECTORS)) * 512 / 1024 / 1024
+    );
+}
+
+/// `/unlock [disk] [vol]` — unlock a C4VE data volume and adopt it as the
+/// synapse store (if not already mounted). Human-only.
+fn disk_unlock(arg: &str) {
+    use crate::block::ext4_store::Ext4Store;
+    use crate::block::volcrypto;
+    use crate::block::Partition;
+
+    let mut nums = arg.split_whitespace().filter_map(|t| t.parse::<usize>().ok());
+    let disk = nums.next().unwrap_or(0);
+    let vol = nums.next().unwrap_or(0);
+    let pass = crate::modal::input("Unlock volume", "Passphrase:", true);
+    if pass.is_empty() {
+        serial_println!("unlock> cancelled");
+        return;
+    }
+    let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
+        serial_println!("unlock> no disk {disk}");
+        return;
+    };
+    let vols = crate::fs::detect::probe(&mut dev);
+    let Some(v) = vols.get(vol).cloned() else {
+        serial_println!("unlock> no volume {vol}");
+        return;
+    };
+    let start = v.start_lba;
+    let count = v.sectors;
+    let (key, hdr) = {
+        let mut part = Partition::new(&mut dev, start, count);
+        match volcrypto::unlock(&mut part, pass.as_bytes()) {
+            Ok(x) => x,
+            Err(_) => {
+                serial_println!("unlock> wrong passphrase or not a C4VE volume");
+                return;
+            }
+        }
+    };
+    drop(dev); // free the handle so mount can re-probe the same disk
+    match Ext4Store::mount_encrypted(disk, start, count, key, hdr.hdr_sectors) {
+        Some(store) => {
+            crate::synapse::fs::mount_ext4(store);
+            serial_println!(
+                "unlock> adopted encrypted store (disk {disk} vol {vol}, hdr {} sectors)",
+                hdr.hdr_sectors
+            );
+        }
+        None => serial_println!("unlock> unlocked but payload is not a readable ext4"),
+    }
+}
+
+/// List the root of a non-store mount via the VFS.
+fn ls_mount(path: &str) {
+    if path == "/" {
         fs_ls("/");
         return;
     }
-    use crate::fs::detect::FsType;
-    let Some(mut dev) = crate::block::probe_disk_nth(mt.disk) else {
-        serial_println!("ls> disk {} gone", mt.disk);
-        return;
-    };
-    match mt.fs {
-        FsType::Fat16 | FsType::Fat32 => {
-            let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
-            match crate::block::fat_read::FatReader::open(&mut part) {
-                Some(mut r) => {
-                    let entries = r.list_root();
-                    serial_println!("ls> {} ({}) root ({} entries):", mt.path, mt.fs.name(), entries.len());
-                    for (name, size, is_dir) in entries {
-                        if is_dir {
-                            serial_println!("  {}/", name);
-                        } else {
-                            serial_println!("  {} ({} bytes)", name, size);
-                        }
-                    }
+    match crate::fs::vfs::readdir(path) {
+        Ok(entries) => {
+            serial_println!("ls> {} ({} entries):", path, entries.len());
+            for e in entries.into_iter().take(64) {
+                if e.is_dir {
+                    serial_println!("  {}/", e.name);
+                } else if e.size > 0 {
+                    serial_println!("  {} ({} bytes)", e.name, e.size);
+                } else {
+                    serial_println!("  {}", e.name);
                 }
-                None => serial_println!("ls> {} unreadable", mt.path),
             }
         }
-        FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => {
-            let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
-            match crate::block::ext4_read::Ext4Reader::open(&mut part) {
-                Some(mut r) => {
-                    let entries = r.list_root();
-                    serial_println!(
-                        "ls> {} ({}) root ({} on-disk entries; hierarchical store: /ls /):",
-                        mt.path,
-                        mt.fs.name(),
-                        entries.len()
-                    );
-                    for (name, _ino, is_dir) in entries.into_iter().take(64) {
-                        let shown = crate::block::ext4_store::key_decode(&name);
-                        let base = crate::synapse::vpath::basename(&shown);
-                        if is_dir {
-                            serial_println!("  {}/", base);
-                        } else {
-                            serial_println!("  {}", base);
-                        }
-                    }
-                }
-                None => serial_println!("ls> {} unreadable", mt.path),
-            }
-        }
-        other => serial_println!("ls> {} is {} -- listing unimplemented", mt.path, other.name()),
+        Err(e) => serial_println!("ls> {path}: {e:?}"),
     }
 }
 
@@ -13428,27 +13666,42 @@ fn fs_ls(arg: &str) {
 
     let path = crate::synapse::vpath::normalize(target);
 
-    // A non-root disk mount (e.g. /mnt) still lists the volume's on-disk root.
-    // The auto-mounted data partition at `/` is the Synapse store — list that
-    // hierarchically so we never dump every percent-encoded key as a "file".
+    // A non-root disk mount (e.g. /mnt) lists the volume via the VFS.
+    // `/` is the Synapse store tree (never dump percent-encoded on-disk keys).
     if path != "/" {
-        if let Some(mt) = mount_lookup(&path) {
-            ls_mount(&mt);
+        if crate::fs::mount::by_path(&path).is_some() {
+            ls_mount(&path);
             return;
         }
     }
 
-    // Store hierarchical listing.
+    // Store hierarchical listing, then VFS fallback for mount files.
     use crate::synapse::fs as store;
     use crate::synapse::vpath::{self, EntryClass};
 
     match store::classify(&path) {
         None => {
-            // Fall back: maybe a path under a disk mount (FAT/ext4 volume).
-            if read_mounted(&path).is_some() {
-                serial_println!("ls> {}: is a file (use /cat)", path);
-            } else {
-                serial_println!("ls> {}: no such file or directory", path);
+            // Store miss: try foreign-mount VFS (USB /mnt/…), then file read.
+            match crate::fs::vfs::readdir(&path) {
+                Ok(entries) if path_on_mount(&path) || crate::fs::mount::resolve(&path).is_some() => {
+                    serial_println!("ls> {}  ({} entries)", path, entries.len());
+                    for e in entries.into_iter().take(64) {
+                        if e.is_dir {
+                            serial_println!("  {}/", e.name);
+                        } else if e.size > 0 {
+                            serial_println!("  {} ({} bytes)", e.name, e.size);
+                        } else {
+                            serial_println!("  {}", e.name);
+                        }
+                    }
+                }
+                _ => {
+                    if crate::fs::vfs::read_mount(&path).is_ok() {
+                        serial_println!("ls> {}: is a file (use /cat)", path);
+                    } else {
+                        serial_println!("ls> {}: no such file or directory", path);
+                    }
+                }
             }
         }
         Some(EntryClass::File) => {
@@ -13463,7 +13716,15 @@ fn fs_ls(arg: &str) {
             }
             for e in &entries {
                 if long {
-                    serial_println!("  {}", vpath::format_long(e));
+                    let full = if path == "/" {
+                        alloc::format!("/{}", e.name)
+                    } else {
+                        alloc::format!("{}/{}", path, e.name)
+                    };
+                    let (mode, uid, mtime) = store::meta(&full)
+                        .map(|m| (m.mode, m.uid, m.mtime))
+                        .unwrap_or((0, 0, 0));
+                    serial_println!("  {}", vpath::format_long_meta(e, mode, uid, mtime));
                 } else {
                     serial_println!("  {}", vpath::format_short(e));
                 }
@@ -13483,10 +13744,10 @@ fn fs_cat(arg: &str) {
         serial_println!("cat> {}: is a directory", full);
         return;
     }
-    // Prefer the live store (agent homes, configs, downloads); then mounts.
-    let data = crate::synapse::fs::read(&full).or_else(|| read_mounted(&full));
+    // Store + mounts through the VFS facade.
+    let data = crate::fs::vfs::read(&full);
     match data {
-        Some(bytes) => {
+        Ok(bytes) => {
             serial_println!("cat> {} ({} bytes):", full, bytes.len());
             match core::str::from_utf8(&bytes) {
                 Ok(s) => match crate::highlight::lang_for_path(&full) {
@@ -13501,7 +13762,7 @@ fn fs_cat(arg: &str) {
                 Err(_) => serial_println!("(binary; {} bytes)", bytes.len()),
             }
         }
-        None => serial_println!("cat> {} not found (store or mounts; see /ls, /mounts)", full),
+        Err(_) => serial_println!("cat> {} not found (store or mounts; see /ls, /mounts)", full),
     }
 }
 
@@ -13549,7 +13810,39 @@ fn fs_glob(arg: &str) {
     }
 }
 
-/// `/mkdir [-p] <path>` — create a store directory (`.keep` marker).
+/// True when `path` is on a **foreign** mount (`/mnt`, USB, second disk), so
+/// shell FS ops should use raw VFS instead of the synapse store.
+///
+/// The auto-mounted data volume at `/` is **not** treated as a foreign mount:
+/// it is the durable synapse store itself. Routing `/mkdir /test` through VFS
+/// wrote an ext4 dir on disk that `/ls` (store view) never saw — the 01_30
+/// VirtualBox screenshot. Those paths stay on `synapse::fs` so they list and
+/// persist via Ext4Store.
+fn path_on_mount(path: &str) -> bool {
+    let Some((mt, _rel)) = crate::fs::mount::resolve(path) else {
+        return false;
+    };
+    mt.path != "/"
+}
+
+fn vfs_err_msg(op: &str, path: &str, e: crate::fs::vfs::VfsError) {
+    use crate::fs::vfs::VfsError;
+    match e {
+        VfsError::ReadOnly => serial_println!("{op}> {path}: read-only mount (remount with rw?)"),
+        VfsError::Unsupported => {
+            serial_println!(
+                "{op}> {path}: unsupported on this volume (FAT/ext RW; NTFS is read-only)"
+            )
+        }
+        VfsError::NotFound => serial_println!("{op}> {path}: not found"),
+        VfsError::NotAFile => serial_println!("{op}> {path}: not a file"),
+        VfsError::NotADir => serial_println!("{op}> {path}: not a directory"),
+        VfsError::NotMounted => serial_println!("{op}> {path}: not mounted (see /mounts)"),
+        VfsError::Io => serial_println!("{op}> {path}: I/O error"),
+    }
+}
+
+/// `/mkdir [-p] <path>` — create a directory (store or writable mount).
 fn fs_mkdir(arg: &str) {
     let (flags, pos) = fs_split_flags(arg);
     let parents = flags.contains(&'p');
@@ -13557,13 +13850,49 @@ fn fs_mkdir(arg: &str) {
         serial_println!("mkdir> usage: /mkdir [-p] <path>");
         return;
     };
+    if path_on_mount(path) {
+        let norm = crate::fs::path::normalize(path);
+        if parents {
+            let mut cur = alloc::string::String::new();
+            for part in norm.split('/').filter(|s| !s.is_empty()) {
+                cur.push('/');
+                cur.push_str(part);
+                if crate::fs::mount::by_path(&cur).is_some() {
+                    continue; // mount root
+                }
+                // Best-effort: skip if already present as a file or dir.
+                if crate::fs::vfs::readdir(&cur).is_ok() {
+                    continue;
+                }
+                if let Err(e) = crate::fs::vfs::mkdir(&cur) {
+                    // Exists as a file (NotAFile mapping) or already there.
+                    if matches!(
+                        e,
+                        crate::fs::vfs::VfsError::NotAFile | crate::fs::vfs::VfsError::Io
+                    ) {
+                        // FatRw Exists → NotAFile; treat "already exists" as ok for -p.
+                        continue;
+                    }
+                    vfs_err_msg("mkdir", &cur, e);
+                    return;
+                }
+            }
+            serial_println!("mkdir> {norm}");
+            return;
+        }
+        match crate::fs::vfs::mkdir(path) {
+            Ok(()) => serial_println!("mkdir> {norm}"),
+            Err(e) => vfs_err_msg("mkdir", path, e),
+        }
+        return;
+    }
     match crate::synapse::fs::mkdir(path, parents) {
         Ok(()) => serial_println!("mkdir> {}", crate::synapse::vpath::normalize(path)),
         Err(e) => serial_println!("mkdir> {}: {}", path, e),
     }
 }
 
-/// `/cp [-r] <src> <dst>` — copy file or tree in the store.
+/// `/cp [-r] <src> <dst>` — copy file (store and/or mounted volumes).
 fn fs_cp(arg: &str) {
     let (flags, pos) = fs_split_flags(arg);
     let recursive = flags.contains(&'r') || flags.contains(&'R');
@@ -13573,13 +13902,28 @@ fn fs_cp(arg: &str) {
     }
     let src = &pos[0];
     let dst = &pos[1];
+    // Volume path: single-file copy via VFS (recursive trees stay store-only).
+    if path_on_mount(src) || path_on_mount(dst) {
+        if recursive {
+            serial_println!("cp> recursive copy across mounts is not supported yet");
+            return;
+        }
+        match crate::fs::vfs::read(src) {
+            Ok(data) => match crate::fs::vfs::write(dst, &data) {
+                Ok(()) => serial_println!("cp> {} → {} ({} byte(s))", src, dst, data.len()),
+                Err(e) => vfs_err_msg("cp", dst, e),
+            },
+            Err(e) => vfs_err_msg("cp", src, e),
+        }
+        return;
+    }
     match crate::synapse::fs::copy(src, dst, recursive) {
         Ok(n) => serial_println!("cp> {} → {} ({} file(s))", src, dst, n),
         Err(e) => serial_println!("cp> {}: {}", src, e),
     }
 }
 
-/// `/mv <src> <dst>` — rename/move in the store.
+/// `/mv <src> <dst>` — rename/move in the store or on a writable ext mount.
 fn fs_mv(arg: &str) {
     let (_flags, pos) = fs_split_flags(arg);
     if pos.len() < 2 {
@@ -13588,13 +13932,20 @@ fn fs_mv(arg: &str) {
     }
     let src = &pos[0];
     let dst = &pos[1];
+    if path_on_mount(src) || path_on_mount(dst) {
+        match crate::fs::vfs::rename(src, dst) {
+            Ok(()) => serial_println!("mv> {} → {}", src, dst),
+            Err(e) => vfs_err_msg("mv", src, e),
+        }
+        return;
+    }
     match crate::synapse::fs::rename(src, dst) {
         Ok(n) => serial_println!("mv> {} → {} ({} file(s))", src, dst, n),
         Err(e) => serial_println!("mv> {}: {}", src, e),
     }
 }
 
-/// `/rm [-r] <path>` — remove a store file or tree.
+/// `/rm [-r] <path>` — remove a store file/tree or a file on a writable mount.
 fn fs_rm(arg: &str) {
     let (flags, pos) = fs_split_flags(arg);
     let recursive = flags.contains(&'r') || flags.contains(&'R');
@@ -13602,17 +13953,37 @@ fn fs_rm(arg: &str) {
         serial_println!("rm> usage: /rm [-r] <path>");
         return;
     };
+    if path_on_mount(path) {
+        if recursive {
+            serial_println!("rm> recursive remove on mounts is not supported yet");
+            return;
+        }
+        match crate::fs::vfs::unlink(path) {
+            Ok(()) => serial_println!("rm> {}", path),
+            Err(e) => vfs_err_msg("rm", path, e),
+        }
+        return;
+    }
     match crate::synapse::fs::remove(path, recursive) {
         Ok(n) => serial_println!("rm> {} ({} file(s))", path, n),
         Err(e) => serial_println!("rm> {}: {}", path, e),
     }
 }
 
-/// `/touch <path>` — create empty file or refresh existing.
+/// `/touch <path>` — create empty file or refresh existing (store or mount).
 fn fs_touch(arg: &str) {
     let path = arg.trim();
     if path.is_empty() {
         serial_println!("touch> usage: /touch <path>");
+        return;
+    }
+    if path_on_mount(path) {
+        // Create empty or leave existing contents (read + rewrite).
+        let data = crate::fs::vfs::read(path).unwrap_or_default();
+        match crate::fs::vfs::write(path, &data) {
+            Ok(()) => serial_println!("touch> {}", crate::fs::path::normalize(path)),
+            Err(e) => vfs_err_msg("touch", path, e),
+        }
         return;
     }
     match crate::synapse::fs::touch(path) {
@@ -14001,65 +14372,15 @@ fn ensure_disk_fallback_fonts() {
 
 /// Scan every disk + volume for the first readable file named one of
 /// `names` (FAT or ext4; root or subpath like `brcm/foo.bin`). Independent of
-/// `/mount`, so it finds a bundled voice model / WiFi firmware on the FAT ESP
-/// (aarch64) or the ext4 data partition regardless of what is mounted where.
+/// `/mount` — see [`crate::fs::vfs::find_on_disks`].
 pub(crate) fn find_on_disks(names: &[&str]) -> Option<alloc::vec::Vec<u8>> {
-    use crate::fs::detect::FsType;
-    for disk in 0..4usize {
-        let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
-            continue;
-        };
-        for v in crate::fs::detect::probe(&mut dev) {
-            let mut part = crate::block::Partition::new(&mut dev, v.start_lba, v.sectors);
-            for name in names {
-                let data = match v.fs {
-                    FsType::Fat16 | FsType::Fat32 => crate::block::fat_read::FatReader::open(&mut part).and_then(|mut r| r.read_file(name)),
-                    FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => crate::block::ext4_read::Ext4Reader::open(&mut part).and_then(|mut r| {
-                        let sz = r.file_size(name)? as usize;
-                        let mut buf = alloc::vec![0u8; sz];
-                        let n = r.read_root_file(name, &mut buf)?;
-                        buf.truncate(n);
-                        Some(buf)
-                    }),
-                    _ => None,
-                };
-                if data.is_some() {
-                    return data;
-                }
-            }
-        }
-    }
-    None
+    crate::fs::vfs::find_on_disks(names)
 }
 
-/// Read a file at an absolute path under some active `/mount` (FAT or ext4).
-/// Shared by `/cat` and `/voice models load`. `None` if not under a mount or
-/// not found.
+/// Read a file at an absolute path under some active mount (or the store).
+/// Shared by `/voice models load` and media open helpers.
 fn read_mounted(full: &str) -> Option<alloc::vec::Vec<u8>> {
-    use crate::fs::detect::FsType;
-    let mt = MOUNTS.with(|m| {
-        m.iter()
-            .filter(|mt| full == mt.path || full.starts_with(&alloc::format!("{}/", mt.path)))
-            .max_by_key(|mt| mt.path.len())
-            .cloned()
-    })?;
-    let rel = full[mt.path.len()..].trim_start_matches('/');
-    if rel.is_empty() {
-        return None;
-    }
-    let mut dev = crate::block::probe_disk_nth(mt.disk)?;
-    let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
-    match mt.fs {
-        FsType::Fat16 | FsType::Fat32 => crate::block::fat_read::FatReader::open(&mut part).and_then(|mut r| r.read_file(rel)),
-        FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => crate::block::ext4_read::Ext4Reader::open(&mut part).and_then(|mut r| {
-            let sz = r.file_size(rel)? as usize;
-            let mut buf = alloc::vec![0u8; sz];
-            let n = r.read_root_file(rel, &mut buf)?;
-            buf.truncate(n);
-            Some(buf)
-        }),
-        _ => None,
-    }
+    crate::fs::vfs::read(full).ok()
 }
 
 fn disk_list() {
@@ -14093,10 +14414,18 @@ fn disk_list() {
         }
     }
     if found == 0 {
-        serial_println!("disks> no block device (boot with a -drive)");
+        serial_println!(
+            "disks> no block device found\n\
+             disks>   expected: NVMe (VirtualBox default), AHCI/SATA, or virtio-blk\n\
+             disks>   after /install: reboot from the permanent disk alone — data is\n\
+             disks>   on the 'Chitti Data' GPT partition and mounts at boot"
+        );
         return;
     }
-    serial_println!("  ({} disk(s); /ls <n> reads a volume on disk 0; foreign filesystems are read-only)", found);
+    serial_println!(
+        "  ({} disk(s); /mount <disk> [vol] [/path]; data partition auto-mounts as synapse store)",
+        found
+    );
 }
 
 /// List volume `n` on disk 0 (on-disk root; for debugging real FAT/ext4 layouts).
@@ -14384,7 +14713,18 @@ fn disk_install(arg: &str) {
         serial_println!("install> installer payload missing (BOOTX64.EFI / kernel modules) -- build the ISO with xtask");
         return;
     };
-    let target_idx = target_override.unwrap_or(0);
+    // Default target: with 2+ disks, prefer disk 1 (the permanent second drive)
+    // over disk 0 (usually the boot/install image). Explicit `/install N` wins.
+    let target_idx = target_override.unwrap_or_else(|| {
+        if crate::block::probe_disk_nth(1).is_some() {
+            serial_println!(
+                "install> multiple disks present — defaulting to disk 1 (use /install 0 to target the boot disk)"
+            );
+            1
+        } else {
+            0
+        }
+    });
     let Some(mut dev) = crate::block::probe_disk_nth(target_idx) else {
         serial_println!("install> no disk {} (see /disks; boot with a -drive)", target_idx);
         return;
@@ -14973,6 +15313,33 @@ mod agent_flow_tests {
         );
         // No menu → nothing to accept, whatever is highlighted.
         assert!(!suggest_would_complete("/statusbar", 10, 0, &[]));
+
+        // The case the `/statusbar` pair above cannot catch, because nothing is
+        // named `/statusbarN`: a command typed in full that is also a **prefix of
+        // another command**. `/mode` is a prefix of `/model`, and the catalog
+        // declares `model` first, so item 0 used to be `/model` — Enter accepted
+        // it, the line became `/model `, the next command was appended onto it,
+        // and `/mode` could not be run at all. The gate was right; the candidate
+        // order was wrong (see `suggest::command_items`).
+        let buf = "/mode";
+        let it = items(buf);
+        assert!(
+            it.iter().any(|i| i.label == "/model"),
+            "test premise: /mode must still be a prefix of another command"
+        );
+        assert_eq!(it[0].label, "/mode", "a fully-typed command must be the highlighted candidate");
+        assert!(
+            !suggest_would_complete(buf, buf.len(), 0, &it),
+            "/mode must submit, not complete to /model"
+        );
+        // ...while the shared prefix of the two still completes normally.
+        let buf = "/mod";
+        let it = items(buf);
+        assert!(!it.is_empty(), "expected suggestions for {buf}");
+        assert!(
+            suggest_would_complete(buf, buf.len(), 0, &it),
+            "a genuine prefix must still complete on Enter"
+        );
     }
 
     /// `poll_interrupt` (the cancel-poll for running commands like `/http`)

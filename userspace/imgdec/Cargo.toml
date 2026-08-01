@@ -1,0 +1,30 @@
+# A **userspace** tenant: this crate is compiled for ring 3 / EL0 and is loaded by
+# `kernel/src/synapse/tenant.rs`. It shares no code with the kernel and links against
+# nothing but `core` — see ../../CLAUDE.md's ring-3 standing rule.
+#
+# Outside the workspace on purpose, exactly as `kernel/` is: it has its own target, its
+# own linker script, and must not inherit workspace-level settings.
+[package]
+name = "chitti-imgdec"
+version = "0.1.0"
+edition = "2024"
+
+# An empty table keeps this out of the repo workspace, the same way `kernel/` stays out:
+# a tenant must not inherit workspace profiles, features or dependencies.
+[workspace]
+
+[[bin]]
+name = "imgdec"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+# Small and predictable: the blob is copied into mapped pages at load time, so its size is
+# a per-run cost. `opt-level = "s"` rather than 3 for the same reason.
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = false
+
+[profile.dev]
+panic = "abort"

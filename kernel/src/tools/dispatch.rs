@@ -170,7 +170,47 @@ impl Router {
     }
 
     fn run_synapse(&self, session: &Session, caller: crate::sched::TaskId, raw: &str) -> ToolOutcome {
-        match synapse::execute_with_justification(caller, raw, self.justification(session)) {
+        let justification = self.justification(session);
+        // **P9: a non-orchestrator agent's effects are performed from ring 3.**
+        // The agent's own code submits the call across the privilege boundary instead of
+        // the kernel making it on the agent's behalf, so a bug in that path costs a
+        // fault in userspace rather than a wild write in kernel memory.
+        //
+        // Nothing about the authority model moves with it. Same task identity, so the
+        // same capability table; same `justification`, computed here from the session's
+        // resident taint and handed to the tenant runner rather than to the tenant; same
+        // four gates, same audit entry. That equivalence is the point — if migrating a
+        // caller changed what it may do, the ring boundary would be a policy change and
+        // not an isolation one.
+        //
+        // The orchestrator stays in the kernel: it *is* the shell, it holds root
+        // authority, and it has no meaningful isolation to gain from being confined
+        // relative to the kernel it drives.
+        if runs_in_userspace(session) {
+            // Classified from the structured outcome, so a ring-3 caller and a ring-0
+            // caller are indistinguishable downstream. There is no in-kernel fallback:
+            // retrying here would make an agent's confinement depend on whether the
+            // loader happened to work, which is the kind of quiet downgrade that makes
+            // an isolation claim untrue.
+            return match crate::synapse::tenant::invoke_in_userspace(caller, raw, justification) {
+                Some(inv) => Self::outcome_of(inv),
+                None => ToolOutcome::error(alloc::string::String::from(
+                    "error: the userspace call never reached the gates",
+                )),
+            };
+        }
+        Self::outcome_of(synapse::execute_with_justification(caller, raw, justification))
+    }
+
+    /// Turn a Synapse [`Invocation`] into the outcome an agent sees.
+    ///
+    /// **One function, used by both the in-kernel and the ring-3 paths**, because the
+    /// wording of a refusal is load-bearing: `security::redteam` classifies attacks by
+    /// it, and the model distinguishes success from failure by its prefix. A second
+    /// rendering of the same outcomes is not a cosmetic duplicate — it is a way for a
+    /// refusal to be read as a success.
+    fn outcome_of(inv: Invocation) -> ToolOutcome {
+        match inv {
             Invocation::Executed { result, .. } => ToolOutcome::ok(result, Provenance::UntrustedIngested),
             Invocation::Denied { primitive } => ToolOutcome::error(alloc::format!("denied: no capability for {primitive}")),
             Invocation::Rejected(err) => ToolOutcome::error(alloc::format!("rejected: {err:?}")),
@@ -179,6 +219,11 @@ impl Router {
             }
             Invocation::DeniedScope { primitive } => {
                 ToolOutcome::error(alloc::format!("denied: '{primitive}' target outside granted scope"))
+            }
+            // The agent is told to ask, not told it may proceed: the approval is
+            // recorded by the human's own path, never by the caller.
+            Invocation::NeedsApproval { primitive } => {
+                ToolOutcome::error(alloc::format!("denied: '{primitive}' needs human approval (\'/mode\' or the approval prompt)"))
             }
         }
     }
@@ -1312,4 +1357,18 @@ mod tests {
             assert_eq!((e.irreversible, e.egress), (*irr, *egr), "{tool} {args} classified {:?}", e);
         }
     }
+}
+
+/// Whether this session's agent performs its effects from **ring 3**.
+///
+/// True for every agent except the orchestrator. The orchestrator is the shell: it holds
+/// root authority, drives the kernel, and confining it relative to the kernel it directs
+/// buys nothing — while everything else is an installed or delegated agent whose code
+/// there is real reason to keep out of kernel memory.
+///
+/// Keyed on the session's manifest rather than on a per-task flag, because "is this the
+/// orchestrator" is a property of *which agent* is running, and a task id is recycled
+/// bookkeeping by comparison.
+pub fn runs_in_userspace(session: &Session) -> bool {
+    session.agent.manifest_id != crate::agent::manifest::ORCHESTRATOR_ID
 }

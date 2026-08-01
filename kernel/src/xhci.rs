@@ -63,17 +63,29 @@ struct Trb {
 /// Bounce-buffer size for a USB Ethernet endpoint: one full Ethernet frame plus
 /// slack, rounded up. CDC-ECM sends one frame per transfer, so this bounds a frame.
 const USB_ETH_BUF: usize = 2048;
+/// Bounce-buffer for USB MSC: one 4 KiB transfer (8×512) is enough for multi-sector
+/// reads without a huge DMA footprint; CBW/CSW are far smaller.
+const USB_MSC_BUF: usize = 4096;
 
-/// A configured bulk IN/OUT endpoint pair on one device — what a USB Ethernet
-/// adapter needs. Each direction has its own transfer ring and a bounce buffer.
+/// What the configured bulk pair is for — Ethernet and mass-storage share the
+/// same endpoint machinery but must not steal each other's traffic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BulkRole {
+    Eth,
+    Msc,
+}
+
+/// A configured bulk IN/OUT endpoint pair on one device — USB Ethernet or MSC.
 ///
 /// Completion is asynchronous: `pump_events` clears `in_flight` and records the
 /// transferred length when the controller posts the transfer event, so the
-/// `NetDevice` side polls rather than blocking.
+/// `NetDevice` side polls rather than blocking. MSC uses the same path through
+/// synchronous wait helpers.
 pub struct BulkEp {
     pub slot: u8,
     pub in_dci: u8,
     pub out_dci: u8,
+    pub role: BulkRole,
     in_ring_va: usize,
     in_ring_pa: u64,
     in_enq: usize,
@@ -90,6 +102,8 @@ pub struct BulkEp {
     buf_len: usize,
     /// An IN transfer is queued and has not completed.
     in_flight: bool,
+    /// Length requested in the outstanding IN TRB (for residual → delivered).
+    in_request_len: u32,
     /// Bytes the last completed IN transfer delivered, awaiting collection.
     in_ready: Option<usize>,
     out_flight: bool,
@@ -792,6 +806,8 @@ impl Xhci {
         // that already came up from being re-reset, so the extra passes only
         // re-try whatever is still missing and never disturb a working device.
         // QEMU gets both on the first pass and exits at once.
+        // Keep scanning for bulk (Ethernet / MSC) even after HID is complete —
+        // a keyboard on port 1 must not hide a stick on port 2.
         for attempt in 0..8 {
             if attempt > 0 {
                 spin_delay(300_000_000);
@@ -799,7 +815,7 @@ impl Xhci {
             }
             // SAFETY: single-threaded boot; all DMA regions are freshly allocated.
             unsafe { self.scan_ports() };
-            if self.kbd.is_some() && self.mouse.is_some() {
+            if self.kbd.is_some() && self.mouse.is_some() && self.bulk.is_some() {
                 break;
             }
         }
@@ -809,7 +825,7 @@ impl Xhci {
         if self.mouse.is_none() {
             crate::ktrace::log("xhci", "no HID pointer enumerated");
         }
-        self.kbd.is_some() || self.mouse.is_some()
+        self.kbd.is_some() || self.mouse.is_some() || self.bulk.is_some()
     }
 
     /// Whether a HID keyboard / pointer was enumerated (boot diagnostic).
@@ -830,7 +846,7 @@ impl Xhci {
     /// starves the others (each port is tried, not just the first).
     unsafe fn scan_ports(&mut self) {
         for port in 1..=self.max_ports {
-            if self.kbd.is_some() && self.mouse.is_some() {
+            if self.kbd.is_some() && self.mouse.is_some() && self.bulk.is_some() {
                 break;
             }
             // Never re-touch a port that already gave us a device: resetting it
@@ -883,23 +899,58 @@ impl Xhci {
                 }
             }
         }
-        // USB Ethernet: a CDC **Data** interface (class 0x0A) carrying a bulk
-        // IN/OUT pair. Matched by class rather than an id list because CDC-ECM is a
-        // standard; the vendor-specific ASIX/Realtek chips would need idVendor /
-        // idProduct, which `Common` does not retain, and are unimplemented anyway.
+        // Bulk devices: MSC BOT (class 08/06/50) first so a stick is not lost to
+        // a CDC-ECM match on the same composite (rare); then CDC Data (0x0A) for
+        // Ethernet. One bulk pair is claimed — the role tags which upper layer
+        // may use it.
         if self.bulk.is_none() {
             // SAFETY: `buf_va` holds `total` bytes of configuration descriptor read
             // during enumeration.
             let desc = unsafe { core::slice::from_raw_parts(c.buf_va as *const u8, c.total as usize) };
-            if let Some(bi) = find_bulk_iface(desc, Some(0x0a)) {
+            if let Some(bi) = find_msc_bot_iface(desc) {
+                if unsafe { self.ensure_configured(c) } && unsafe { self.configure_bulk(c, bi, USB_MSC_BUF, BulkRole::Msc) }
+                {
+                    crate::ktrace::log("xhci", "USB MSC (BOT) bulk endpoints configured");
+                    got = true;
+                }
+            } else if let Some(bi) = find_bulk_iface(desc, Some(0x0a)) {
                 // SAFETY: `c` is an addressed, configured device.
-                if unsafe { self.configure_bulk(c, bi, USB_ETH_BUF) } {
+                if unsafe { self.ensure_configured(c) } && unsafe { self.configure_bulk(c, bi, USB_ETH_BUF, BulkRole::Eth) }
+                {
                     crate::ktrace::log("xhci", "USB Ethernet (CDC-ECM) bulk endpoints configured");
                     got = true;
                 }
             }
         }
         got
+    }
+
+    /// SET_CONFIGURATION once per device (same guard as HID `finish_endpoint`).
+    ///
+    /// # Safety
+    /// `c` must be addressed on this controller.
+    unsafe fn ensure_configured(&mut self, c: &mut Common) -> bool {
+        if c.configured {
+            return true;
+        }
+        unsafe {
+            if !self.control(
+                c.slot,
+                c.ep0_va,
+                c.ep0_pa,
+                &mut c.ep0_enq,
+                &mut c.ep0_cycle,
+                setup(0x00, 9, c.cfg_val as u16, 0, 0),
+                0,
+                0,
+                false,
+            ) {
+                crate::ktrace::log("xhci", "SET_CONFIGURATION for bulk device failed");
+                return false;
+            }
+            c.configured = true;
+        }
+        true
     }
 
     /// Bring up a USB **hub** `c` (already addressed) and enumerate the devices
@@ -1541,7 +1592,10 @@ impl Xhci {
                         let residual = (ev.status & 0x00ff_ffff) as usize;
                         if dci == b.in_dci {
                             b.in_flight = false;
-                            b.in_ready = Some(b.buf_len.saturating_sub(residual));
+                            // Delivered = requested − residual (not buf capacity:
+                            // a 13-byte CSW requests 13, residual is of that).
+                            let req = b.in_request_len as usize;
+                            b.in_ready = Some(req.saturating_sub(residual));
                         } else {
                             b.out_flight = false;
                         }
@@ -1651,7 +1705,13 @@ impl Xhci {
     ///
     /// # Safety
     /// `c` must be a device this controller has addressed and configured.
-    pub unsafe fn configure_bulk(&mut self, c: &mut Common, bi: BulkIface, buf_len: usize) -> bool {
+    pub unsafe fn configure_bulk(
+        &mut self,
+        c: &mut Common,
+        bi: BulkIface,
+        buf_len: usize,
+        role: BulkRole,
+    ) -> bool {
         let Some((in_ring_pa, in_ring_va)) = (self.alloc)(RING_TRBS * 16) else { return false };
         let Some((out_ring_pa, out_ring_va)) = (self.alloc)(RING_TRBS * 16) else { return false };
         let Some((in_buf_pa, in_buf_va)) = (self.alloc)(buf_len) else { return false };
@@ -1683,13 +1743,14 @@ impl Xhci {
             }
         }
         crate::ktrace::log_fmt(format_args!(
-            "xhci: bulk endpoints up (slot {} in dci {in_dci} mps {} / out dci {out_dci} mps {})",
+            "xhci: bulk endpoints up (role={role:?} slot {} in dci {in_dci} mps {} / out dci {out_dci} mps {})",
             c.slot, bi.in_mps, bi.out_mps
         ));
         self.bulk = Some(BulkEp {
             slot: c.slot,
             in_dci,
             out_dci,
+            role,
             in_ring_va,
             in_ring_pa,
             in_enq: 0,
@@ -1704,6 +1765,7 @@ impl Xhci {
             out_buf_va: out_buf_va as usize,
             buf_len,
             in_flight: false,
+            in_request_len: 0,
             in_ready: None,
             out_flight: false,
         });
@@ -1715,6 +1777,11 @@ impl Xhci {
         self.bulk.is_some()
     }
 
+    /// Role of the configured bulk pair, if any.
+    pub fn bulk_role(&self) -> Option<BulkRole> {
+        self.bulk.as_ref().map(|b| b.role)
+    }
+
     /// Queue a bulk IN transfer if none is outstanding, so a frame can arrive.
     pub fn bulk_arm_in(&mut self) {
         let Some(b) = self.bulk.as_mut() else { return };
@@ -1724,6 +1791,7 @@ impl Xhci {
         let (va, pa, mut enq, mut cyc) = (b.in_ring_va, b.in_ring_pa, b.in_enq, b.in_cycle);
         let (buf, len, slot, dci) = (b.in_buf_pa, b.buf_len as u32, b.slot, b.in_dci);
         b.in_flight = true;
+        b.in_request_len = len;
         // SAFETY: the ring and buffer are live for the controller's lifetime.
         unsafe { self.arm_int(va, pa, &mut enq, &mut cyc, buf, len, slot, dci) };
         if let Some(b) = self.bulk.as_mut() {
@@ -1735,6 +1803,12 @@ impl Xhci {
     /// Take a received frame, if one has completed. Copies out of the bounce
     /// buffer and re-arms, so the caller can poll this in a loop.
     pub fn bulk_take_in(&mut self, out: &mut [u8]) -> Option<usize> {
+        self.bulk_take_in_ex(out, true)
+    }
+
+    /// Like [`bulk_take_in`], with optional re-arm (MSC BOT does not want a
+    /// free-running IN after the CSW).
+    pub fn bulk_take_in_ex(&mut self, out: &mut [u8], rearm: bool) -> Option<usize> {
         let b = self.bulk.as_mut()?;
         let n = b.in_ready.take()?;
         let n = n.min(out.len()).min(b.buf_len);
@@ -1742,7 +1816,9 @@ impl Xhci {
         dma_invalidate(src, n);
         // SAFETY: `src` is this endpoint's bounce buffer; `n <= buf_len`.
         unsafe { core::ptr::copy_nonoverlapping(src as *const u8, out.as_mut_ptr(), n) };
-        self.bulk_arm_in();
+        if rearm {
+            self.bulk_arm_in();
+        }
         Some(n)
     }
 
@@ -1768,6 +1844,72 @@ impl Xhci {
             b.out_cycle = cyc;
         }
         true
+    }
+
+    /// Synchronous bulk OUT for MSC BOT: wait for idle, send, wait for complete.
+    pub fn bulk_sync_out(&mut self, data: &[u8], timeout_ms: u64) -> bool {
+        let start = crate::arch::now_ms();
+        while self.bulk.as_ref().map(|b| b.out_flight).unwrap_or(true) {
+            self.pump_events();
+            if crate::arch::now_ms().wrapping_sub(start) > timeout_ms {
+                return false;
+            }
+        }
+        if !self.bulk_send(data) {
+            return false;
+        }
+        while self.bulk.as_ref().map(|b| b.out_flight).unwrap_or(true) {
+            self.pump_events();
+            if crate::arch::now_ms().wrapping_sub(start) > timeout_ms {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Synchronous bulk IN for MSC BOT: arm, wait, take without re-arm.
+    pub fn bulk_sync_in(&mut self, out: &mut [u8], timeout_ms: u64) -> Option<usize> {
+        let start = crate::arch::now_ms();
+        // Drain a stale ready packet without re-arming into the wrong phase.
+        if self.bulk.as_ref().and_then(|b| b.in_ready).is_some() {
+            let mut discard = [0u8; 64];
+            let _ = self.bulk_take_in_ex(&mut discard, false);
+        }
+        while self.bulk.as_ref().map(|b| b.in_flight).unwrap_or(false) {
+            self.pump_events();
+            if crate::arch::now_ms().wrapping_sub(start) > timeout_ms {
+                return None;
+            }
+        }
+        // Request exactly `out.len()` when it fits the bounce buffer, else the
+        // whole buffer (short packets are fine for CSW).
+        let want = {
+            let b = self.bulk.as_ref()?;
+            out.len().min(b.buf_len) as u32
+        };
+        {
+            let b = self.bulk.as_mut()?;
+            if b.in_flight || b.in_ready.is_some() {
+                return None;
+            }
+            let (va, pa, mut enq, mut cyc) = (b.in_ring_va, b.in_ring_pa, b.in_enq, b.in_cycle);
+            let (buf, slot, dci) = (b.in_buf_pa, b.slot, b.in_dci);
+            b.in_flight = true;
+            b.in_request_len = want;
+            // SAFETY: live bulk ring.
+            unsafe { self.arm_int(va, pa, &mut enq, &mut cyc, buf, want, slot, dci) };
+            if let Some(b) = self.bulk.as_mut() {
+                b.in_enq = enq;
+                b.in_cycle = cyc;
+            }
+        }
+        while self.bulk.as_ref().map(|b| b.in_ready.is_none()).unwrap_or(true) {
+            self.pump_events();
+            if crate::arch::now_ms().wrapping_sub(start) > timeout_ms {
+                return None;
+            }
+        }
+        self.bulk_take_in_ex(out, false)
     }
 
     fn key_push(&mut self, b: u8) {
@@ -2217,6 +2359,17 @@ pub struct BulkIface {
 /// length — a malformed or truncated descriptor would otherwise loop forever, and
 /// this parses bytes that came off an untrusted bus.
 pub(crate) fn find_bulk_iface(desc: &[u8], class_filter: Option<u8>) -> Option<BulkIface> {
+    find_bulk_iface_ex(desc, class_filter, None, None)
+}
+
+/// Like [`find_bulk_iface`], also matching optional subclass and protocol
+/// (needed for MSC BOT: class 08 / subclass 06 / proto 50).
+pub(crate) fn find_bulk_iface_ex(
+    desc: &[u8],
+    class_filter: Option<u8>,
+    subclass_filter: Option<u8>,
+    protocol_filter: Option<u8>,
+) -> Option<BulkIface> {
     const DT_INTERFACE: u8 = 0x04;
     const DT_ENDPOINT: u8 = 0x05;
     const XFER_BULK: u8 = 0x02;
@@ -2232,7 +2385,11 @@ pub(crate) fn find_bulk_iface(desc: &[u8], class_filter: Option<u8>) -> Option<B
             DT_INTERFACE if len >= 9 => {
                 let number = desc[i + 2];
                 let class = desc[i + 5];
-                let ok = class_filter.is_none_or(|c| c == class);
+                let subclass = desc[i + 6];
+                let protocol = desc[i + 7];
+                let ok = class_filter.is_none_or(|c| c == class)
+                    && subclass_filter.is_none_or(|s| s == subclass)
+                    && protocol_filter.is_none_or(|p| p == protocol);
                 cur = Some((number, ok));
                 // A new interface starts a fresh pair; a bulk IN on one interface
                 // must not be paired with a bulk OUT on another.
@@ -2271,12 +2428,20 @@ pub(crate) fn find_bulk_iface(desc: &[u8], class_filter: Option<u8>) -> Option<B
     None
 }
 
+/// MSC BOT interface: class 08, subclass 06 (SCSI), protocol 50 (Bulk-Only).
+pub(crate) fn find_msc_bot_iface(desc: &[u8]) -> Option<BulkIface> {
+    find_bulk_iface_ex(desc, Some(0x08), Some(0x06), Some(0x50))
+}
+
 #[cfg(test)]
 mod tests {
     // --- endpoint types + bulk descriptor parsing -------------------------
 
     fn iface_desc(number: u8, class: u8) -> [u8; 9] {
         [9, 0x04, number, 0, 2, class, 0, 0, 0]
+    }
+    fn iface_desc_full(number: u8, class: u8, subclass: u8, protocol: u8) -> [u8; 9] {
+        [9, 0x04, number, 0, 2, class, subclass, protocol, 0]
     }
     fn ep_desc(addr: u8, attrs: u8, mps: u16) -> [u8; 7] {
         [7, 0x05, addr, attrs, mps.to_le_bytes()[0], mps.to_le_bytes()[1], 0]
@@ -2343,6 +2508,26 @@ mod tests {
         d.extend_from_slice(&ep_desc(0x81, 0x03, 8)); // interrupt
         assert_eq!(find_bulk_iface(&d, Some(0xff)), None);
         assert_eq!(find_bulk_iface(&d, None), None); // no bulk endpoints at all
+    }
+
+    #[test_case]
+    fn find_msc_bot_requires_class_subclass_protocol() {
+        let mut d = alloc::vec::Vec::new();
+        d.extend_from_slice(&iface_desc_full(0, 0x08, 0x06, 0x50));
+        d.extend_from_slice(&ep_desc(0x81, 0x02, 512));
+        d.extend_from_slice(&ep_desc(0x02, 0x02, 512));
+        assert!(find_msc_bot_iface(&d).is_some());
+        // Wrong protocol (CBI) must not match.
+        let mut d2 = alloc::vec::Vec::new();
+        d2.extend_from_slice(&iface_desc_full(0, 0x08, 0x06, 0x00));
+        d2.extend_from_slice(&ep_desc(0x81, 0x02, 512));
+        d2.extend_from_slice(&ep_desc(0x02, 0x02, 512));
+        assert!(find_msc_bot_iface(&d2).is_none());
+        // HID must not match.
+        let mut d3 = alloc::vec::Vec::new();
+        d3.extend_from_slice(&iface_desc(0, 0x03));
+        d3.extend_from_slice(&ep_desc(0x81, 0x03, 8));
+        assert!(find_msc_bot_iface(&d3).is_none());
     }
 
     #[test_case]

@@ -1,10 +1,22 @@
 //! Physical frame allocator: one bit per 4 KiB frame, direct-indexed by
-//! `physical_address / FRAME_SIZE`, built from the Limine memory map.
+//! `physical_address / FRAME_SIZE`.
 //!
 //! The bitmap's own backing storage is bootstrapped out of the first
 //! usable region large enough to hold it (there is no heap yet — this
-//! *is* what the heap gets built on top of), reached via the HHDM.
+//! *is* what the heap gets built on top of), reached through the
+//! physical-to-virtual offset the caller supplies.
+//!
+//! **Arch-neutral by construction.** [`BitmapFrameAllocator::from_usable`] takes
+//! nothing but an iterator of usable `(base, length)` physical regions and the
+//! offset at which physical memory is addressable, because the two arches learn
+//! their RAM extents from completely different places: x86 from the Limine
+//! memory map (via [`BitmapFrameAllocator::init`], a thin adapter over the same
+//! core), aarch64 from the DTB `/memory` node or the UEFI stub's boot-info
+//! (`arch::aarch64::mmu`'s `RamInfo`). Keep new logic in the neutral core — the
+//! Limine types must not leak back in, or aarch64 loses its frame allocator
+//! again.
 
+#[cfg(target_arch = "x86_64")]
 use crate::limine_protocol::{self, MemmapEntry};
 
 pub const FRAME_SIZE: u64 = 4096;
@@ -61,45 +73,56 @@ fn mark_range(bitmap: &mut [u8], base: u64, length: u64, used: bool) {
     }
 }
 
+/// Where the bitmap for a set of usable regions must live, and how big it is:
+/// `(frame_count, bitmap_bytes, bitmap_phys)`. Split out of the constructor and
+/// kept pure so the sizing/placement decision — the part that is easy to get
+/// wrong and impossible to observe once the allocator is live — is unit-testable
+/// on either arch without a memory map or an MMU.
+///
+/// Returns `None` when no single usable region can host the bitmap, which is the
+/// one unrecoverable case: there is no heap yet, so there is nowhere else to put it.
+pub(crate) fn bitmap_placement<I>(usable: I) -> Option<(u64, usize, u64)>
+where
+    I: Iterator<Item = (u64, u64)> + Clone,
+{
+    // Size the bitmap off usable regions only: some firmware/bootloader memory
+    // maps include a final huge RESERVED entry covering the rest of the 64-bit
+    // address space as a sentinel, which would otherwise inflate the bitmap to
+    // cover terabytes of address space we will never allocate a frame from.
+    let max_addr = usable.clone().map(|(base, len)| base + len).max().unwrap_or(0);
+    let frame_count = max_addr.div_ceil(FRAME_SIZE);
+    let bitmap_bytes = (frame_count as usize).div_ceil(8);
+    let bitmap_phys = usable.clone().find(|&(_, len)| len as usize >= bitmap_bytes).map(|(base, _)| base)?;
+    Some((frame_count, bitmap_bytes, bitmap_phys))
+}
+
 impl BitmapFrameAllocator {
-    /// Build the allocator from Limine's memory map.
+    /// Build the allocator from an iterator of usable `(base, length)` physical
+    /// regions, with physical address `p` readable at virtual `p + phys_offset`
+    /// (the HHDM offset on x86; 0 on aarch64's identity map).
+    ///
+    /// The iterator is walked more than once — hence `Clone` — because the
+    /// bitmap has to be sized and placed before any region can be marked free.
     ///
     /// # Safety
-    /// `entries` must be the exact, still-valid memory map Limine
-    /// returned, and `hhdm_offset` the real HHDM offset it reported —
-    /// both are trusted verbatim to compute where physical memory is
-    /// reachable and which frames are safe to hand out.
-    pub unsafe fn init(entries: &[&MemmapEntry], hhdm_offset: u64) -> Self {
-        // Size the bitmap off USABLE entries only: some firmware/
-        // bootloader memory maps include a final huge RESERVED entry
-        // covering the rest of the 64-bit address space as a sentinel,
-        // which would otherwise inflate the bitmap to cover terabytes of
-        // address space we will never allocate a frame from anyway.
-        let max_addr = entries
-            .iter()
-            .filter(|e| e.entry_type == limine_protocol::MEMMAP_USABLE)
-            .map(|e| e.base + e.length)
-            .max()
-            .unwrap_or(0);
-        let frame_count = max_addr.div_ceil(FRAME_SIZE);
-        let bitmap_bytes = (frame_count as usize).div_ceil(8);
-
-        let region = entries
-            .iter()
-            .find(|e| e.entry_type == limine_protocol::MEMMAP_USABLE && e.length as usize >= bitmap_bytes)
+    /// Every `(base, length)` must be real, currently-unused, writable physical
+    /// memory, and `phys_offset` must map it to a valid virtual address. Both are
+    /// trusted verbatim: this decides which frames the kernel will hand out.
+    pub unsafe fn from_usable<I>(usable: I, phys_offset: u64) -> Self
+    where
+        I: Iterator<Item = (u64, u64)> + Clone,
+    {
+        let (frame_count, bitmap_bytes, bitmap_phys) = bitmap_placement(usable.clone())
             .expect("mm::frame: no usable region large enough to hold the frame bitmap");
 
-        let bitmap_phys = region.base;
-        let bitmap_ptr = (bitmap_phys + hhdm_offset) as *mut u8;
-        // SAFETY: `region` is a USABLE entry at least `bitmap_bytes` long,
-        // and `hhdm_offset` maps it to a valid, writable virtual address.
+        let bitmap_ptr = (bitmap_phys + phys_offset) as *mut u8;
+        // SAFETY: `bitmap_phys` starts a usable region at least `bitmap_bytes`
+        // long, and `phys_offset` maps it to a valid, writable virtual address.
         let bitmap = unsafe { core::slice::from_raw_parts_mut(bitmap_ptr, bitmap_bytes) };
         bitmap.fill(0xff); // default: every frame used/reserved
 
-        for entry in entries {
-            if entry.entry_type == limine_protocol::MEMMAP_USABLE {
-                mark_range(bitmap, entry.base, entry.length, false);
-            }
+        for (base, len) in usable {
+            mark_range(bitmap, base, len, false);
         }
 
         // Re-reserve the frames the bitmap itself now occupies.
@@ -107,6 +130,26 @@ impl BitmapFrameAllocator {
         mark_range(bitmap, bitmap_phys, bitmap_frames * FRAME_SIZE, true);
 
         Self { bitmap, frame_count, next_hint: 0 }
+    }
+
+    /// Build the allocator from Limine's memory map (x86). A thin adapter over
+    /// [`Self::from_usable`] — it only selects the USABLE entries.
+    ///
+    /// # Safety
+    /// `entries` must be the exact, still-valid memory map Limine returned, and
+    /// `hhdm_offset` the real HHDM offset it reported.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn init(entries: &[&MemmapEntry], hhdm_offset: u64) -> Self {
+        // SAFETY: forwarded from this function's own contract.
+        unsafe {
+            Self::from_usable(
+                entries
+                    .iter()
+                    .filter(|e| e.entry_type == limine_protocol::MEMMAP_USABLE)
+                    .map(|e| (e.base, e.length)),
+                hhdm_offset,
+            )
+        }
     }
 
     /// Allocate one free 4 KiB frame, returning its physical address.
@@ -228,12 +271,37 @@ impl BitmapFrameAllocator {
         }
     }
 
+    /// Whether the frame containing `phys` is recorded as used (or is outside
+    /// the bitmap entirely, which is the same thing to a caller: not allocatable).
+    ///
+    /// Exists for the aarch64 boot self-check, which asserts every reserved
+    /// range reads back used. That check is the only way to catch a mistake in
+    /// the reserved list — a frame wrongly called free produces no error, just
+    /// corruption somewhere else later.
+    pub fn is_used(&self, phys: u64) -> bool {
+        let f = phys / FRAME_SIZE;
+        f >= self.frame_count || get_bit(self.bitmap, f)
+    }
+
     pub fn free_frame_count(&self) -> u64 {
         (0..self.frame_count).filter(|&f| !get_bit(self.bitmap, f)).count() as u64
     }
 }
 
-impl crate::arch::x86_64::paging::FrameAllocator for BitmapFrameAllocator {
+/// A source of fresh physical frames for new page-table levels.
+///
+/// Arch-neutral on purpose: both walkers — x86's
+/// [`crate::arch::x86_64::paging::map_page`] and aarch64's
+/// `arch::aarch64::mmu::map_page` — allocate intermediate tables through this,
+/// so neither is coupled to the concrete allocator's locking strategy and
+/// neither can grow its own private notion of "give me a frame".
+pub trait TableFrames {
+    /// A free 4 KiB frame's physical address, or `None` when exhausted. The
+    /// caller zeroes it before installing it as a table.
+    fn allocate_frame(&mut self) -> Option<u64>;
+}
+
+impl TableFrames for BitmapFrameAllocator {
     fn allocate_frame(&mut self) -> Option<u64> {
         self.allocate()
     }
@@ -279,6 +347,51 @@ mod tests {
     #[test_case]
     fn run_fits_boundary_zero_disables_the_straddle_check() {
         assert!(run_fits(K64 - 0x1000, 0x8000, M16, 0));
+    }
+
+    // `bitmap_placement` is the aarch64 constructor's sizing/placement decision.
+    // It is tested here, on x86, because the unit suite only runs on x86 — the
+    // same trick `ramlayout`/`edid` use to cover arch-specific pure logic.
+
+    #[test_case]
+    fn bitmap_placement_sizes_from_the_highest_usable_address() {
+        // One frame per bit: 16 MiB of RAM is 4096 frames is 512 bytes.
+        let (frames, bytes, base) = bitmap_placement([(0u64, M16)].into_iter()).unwrap();
+        assert_eq!(frames, M16 / FRAME_SIZE);
+        assert_eq!(bytes, (M16 / FRAME_SIZE / 8) as usize);
+        assert_eq!(base, 0);
+    }
+
+    #[test_case]
+    fn bitmap_placement_spans_a_hole_between_regions() {
+        // aarch64 hardware really does report discontiguous RAM (a hole between
+        // banks). The bitmap must cover up to the TOP of the last region, not the
+        // sum of their lengths, or the high bank indexes off the end of the bitmap.
+        let regions = [(0u64, M16), (M16 * 4, M16)];
+        let (frames, _, _) = bitmap_placement(regions.into_iter()).unwrap();
+        assert_eq!(frames, (M16 * 5) / FRAME_SIZE, "must span the hole, not sum the regions");
+    }
+
+    #[test_case]
+    fn bitmap_placement_picks_a_region_that_can_hold_the_bitmap() {
+        // A tiny first region cannot host the bitmap; placement must skip it
+        // rather than scribbling past its end. The span has to be large enough
+        // that the bitmap itself exceeds 4 KiB — at 1 bit per 4 KiB frame that
+        // needs ~128 MiB of span, so a 32 MiB one would still fit and prove nothing.
+        let high = M16 * 64;
+        let (_, bytes, base) = bitmap_placement([(0u64, 0x1000), (high, M16)].into_iter()).unwrap();
+        assert!(bytes > 0x1000, "test premise: the bitmap must not fit in the first region");
+        assert_eq!(base, high, "must skip the region too small to hold it");
+    }
+
+    #[test_case]
+    fn bitmap_placement_reports_failure_rather_than_picking_nothing() {
+        // Every region too small: there is no heap yet, so there is nowhere else
+        // to put the bitmap. `None` lets the caller say so; a silent fallback
+        // would corrupt whatever follows the short region.
+        assert!(bitmap_placement([(0u64, 0x1000), (M16 * 64, 0x1000)].into_iter()).is_none());
+        // No regions at all is the degenerate case, not a panic.
+        assert!(bitmap_placement(core::iter::empty()).is_none());
     }
 
     #[test_case]

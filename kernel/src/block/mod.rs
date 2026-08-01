@@ -8,8 +8,13 @@
 pub mod ahci;
 pub mod ext4;
 pub mod ext4_read;
+pub mod ext4_rw;
 pub mod ext4_store;
 pub mod fat;
+pub mod fat_rw;
+pub mod ntfs_read;
+pub mod usb_msc;
+pub mod volcrypto;
 pub mod esp;
 pub mod fat32;
 pub mod fat_read;

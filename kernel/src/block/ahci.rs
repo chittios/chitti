@@ -37,14 +37,21 @@ const P_IS: u64 = 0x10; // interrupt status
 const P_CMD: u64 = 0x18; // command + status
 const P_TFD: u64 = 0x20; // task file data
 const P_SSTS: u64 = 0x28; // SATA status
+const P_SCTL: u64 = 0x2c; // SATA control (COMRESET)
+const P_SERR: u64 = 0x30; // SATA error
 const P_CI: u64 = 0x38; // command issue
 
 const CMD_ST: u32 = 1 << 0; // start
 const CMD_FRE: u32 = 1 << 4; // FIS receive enable
+const CMD_SUD: u32 = 1 << 1; // spin-up device
+const CMD_POD: u32 = 1 << 2; // power on device
 const CMD_FR: u32 = 1 << 14; // FIS receive running
 const CMD_CR: u32 = 1 << 15; // command list running
 const TFD_BSY: u32 = 1 << 7;
 const TFD_DRQ: u32 = 1 << 3;
+const SSTS_DET_MASK: u32 = 0xf;
+const SSTS_DET_PRESENT: u32 = 3; // device present, PHY communication established
+const SCTL_DET_COMRESET: u32 = 1; // initiate COMRESET
 
 const DATA_MAX: usize = 64 * 1024;
 
@@ -86,13 +93,47 @@ impl Ahci {
         unsafe { Self::bringup_nth(abar, alloc, 0) }
     }
 
+    /// Try to establish a SATA link on an implemented port. After UEFI/ExitBootServices
+    /// the PHY can be down (`DET != 3`) even though a disk is still attached — firmware
+    /// used it to load us and then stopped. A COMRESET brings the link back. Bounded
+    /// and silent when no device answers.
+    ///
+    /// # Safety
+    /// `port` is a valid mapped port register block inside ABAR.
+    unsafe fn ensure_link(port: u64) -> bool {
+        unsafe {
+            // Already up.
+            if r32(port + P_SSTS) & SSTS_DET_MASK == SSTS_DET_PRESENT {
+                return true;
+            }
+            // Power/spin-up bits (no-ops on controllers that ignore them).
+            let cmd = r32(port + P_CMD);
+            w32(port + P_CMD, cmd | CMD_SUD | CMD_POD);
+            // COMRESET: DET=1 for a short window, then DET=0 to complete.
+            let sctl = r32(port + P_SCTL) & !0xf;
+            w32(port + P_SCTL, sctl | SCTL_DET_COMRESET);
+            // ~1 ms-ish busy wait (no reliable timer here; spin is fine at boot).
+            for _ in 0..100_000 {
+                core::hint::spin_loop();
+            }
+            w32(port + P_SCTL, sctl); // DET=0, resume normal operation
+            // Wait for DET=3 (device present + PHY up).
+            for _ in 0..1_000_000 {
+                if r32(port + P_SSTS) & SSTS_DET_MASK == SSTS_DET_PRESENT {
+                    w32(port + P_SERR, 0xffff_ffff); // clear sticky errors
+                    return true;
+                }
+                core::hint::spin_loop();
+            }
+            false
+        }
+    }
+
     /// How many ports on this HBA are both implemented (`PI`) and have a device
     /// attached (`SSTS.DET == 3`) — i.e. how many disks this controller offers.
     ///
-    /// Pure register reads, no allocation and no state change beyond the
-    /// idempotent `GHC.AE` enable, so a caller can cheaply work out which
-    /// controller/port a global disk index lands on before committing to a
-    /// bring-up.
+    /// Attempts a COMRESET on implemented ports that are not yet linked, so a
+    /// disk that firmware used to boot us and then put idle is still found.
     ///
     /// # Safety
     /// `abar` must be a valid, mapped AHCI ABAR (at least [`MMIO_SPAN`] bytes).
@@ -100,10 +141,17 @@ impl Ahci {
         unsafe {
             w32(abar + HBA_GHC, r32(abar + HBA_GHC) | GHC_AE);
             let pi = r32(abar + HBA_PI);
-            (0..32u32)
-                .filter(|p| pi & (1 << p) != 0)
-                .filter(|p| r32(abar + 0x100 + *p as u64 * 0x80 + P_SSTS) & 0xf == 3)
-                .count()
+            let mut n = 0usize;
+            for p in 0..32u32 {
+                if pi & (1 << p) == 0 {
+                    continue;
+                }
+                let base = abar + 0x100 + p as u64 * 0x80;
+                if Self::ensure_link(base) {
+                    n += 1;
+                }
+            }
+            n
         }
     }
 
@@ -127,7 +175,7 @@ impl Ahci {
             w32(abar + HBA_GHC, r32(abar + HBA_GHC) | GHC_AE);
             let pi = r32(abar + HBA_PI);
             // Walk implemented ports, counting the ones with a device present
-            // (SSTS DET=3) until we reach `nth`.
+            // (SSTS DET=3, after ensure_link) until we reach `nth`.
             let mut port = 0u64;
             let mut seen = 0usize;
             for p in 0..32u32 {
@@ -135,7 +183,7 @@ impl Ahci {
                     continue;
                 }
                 let base = abar + 0x100 + p as u64 * 0x80;
-                if r32(base + P_SSTS) & 0xf != 3 {
+                if !Self::ensure_link(base) {
                     continue;
                 }
                 if seen == nth {

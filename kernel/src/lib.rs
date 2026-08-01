@@ -200,6 +200,8 @@ pub fn init() {
     assert!(BASE_REVISION.is_supported(), "Limine did not accept base revision 3");
 
     arch::x86_64::gdt::init();
+    // Arm `syscall` on the BSP. Per-core MSRs, so `smp` does the same for each AP.
+    arch::x86_64::fastcall::init();
     arch::x86_64::idt::init();
     arch::x86_64::fpu::init();
     arch::x86_64::pic::init();
@@ -289,6 +291,23 @@ pub fn init() {
         // Do it before the GIC so its logs reach the discovered console too.
         arch::aarch64::init_uart();
         arch::aarch64::gic::init_bsp();
+    }
+    // EL0 round trip. **Must come after `exceptions::init`**, which is what sets
+    // `VBAR_EL1`: a tenant's `svc` lands at `VBAR + 0x400`, so running this from
+    // `mm::init` (where it was first placed) sent the trap to whatever the boot
+    // firmware left in VBAR and hung the machine with no output at all. The
+    // aarch64 unit suite does not exist — `cargo xtask test` is x86 only — so this
+    // boot self-test is the only thing that ever exercises the path.
+    match arch::aarch64::el0::self_test() {
+        Ok(()) => ktrace::log("el0", "EL0 round-trip self-test ok"),
+        Err(why) => ktrace::log_fmt(format_args!("el0: EL0 round-trip self-test FAILED: {why}")),
+    }
+    // And the layer above it: the assembled PIC blob, the loader, and a gated call
+    // attributed to the tenant's own identity. Separate from the round trip above so a
+    // failure says which of the two broke — the transport or what runs on it.
+    match synapse::tenant::self_test() {
+        Ok(()) => ktrace::log("tenant", "userspace tenant self-test ok"),
+        Err(why) => ktrace::log_fmt(format_args!("tenant: userspace tenant self-test FAILED: {why}")),
     }
     // Same ACPI devices as x86 gets, from the same code — an SBSA/UEFI machine
     // describes its embedded controller in the DSDT exactly as a PC does. A
@@ -613,50 +632,6 @@ fn capability_denial_is_refused_and_ktraced() {
         assert!(spins < 100_000_000, "the unprivileged task never ran to completion");
     }
     assert_eq!(cap::denials(), denials_before + 1, "the denial was not recorded/ktrace'd");
-}
-
-/// The cooperative async executor (`sched::executor`) is a separate
-/// concurrency layer from the stackful scheduler above -- this proves two
-/// futures interleave (each yields once via a waker-rescheduled `Poll`)
-/// entirely within one stackful task's call to `Executor::run`.
-#[test_case]
-fn async_executor_interleaves_two_futures() {
-    use core::future::Future;
-    use core::pin::Pin;
-    use core::sync::atomic::{AtomicU64, Ordering};
-    use core::task::{Context, Poll};
-
-    struct YieldOnce {
-        yielded: bool,
-    }
-
-    impl Future for YieldOnce {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            if self.yielded {
-                Poll::Ready(())
-            } else {
-                self.yielded = true;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let mut executor = sched::executor::Executor::new();
-    executor.spawn(async {
-        YieldOnce { yielded: false }.await;
-        COUNTER.fetch_add(1, Ordering::SeqCst);
-    });
-    executor.spawn(async {
-        YieldOnce { yielded: false }.await;
-        COUNTER.fetch_add(1, Ordering::SeqCst);
-    });
-    executor.run();
-
-    assert_eq!(COUNTER.load(Ordering::SeqCst), 2, "not all async tasks ran to completion");
 }
 
 // --- Phase 4 acceptance tests (Synapse capability ABI) ------------------

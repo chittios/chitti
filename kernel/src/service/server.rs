@@ -61,8 +61,21 @@ pub fn read_asset_arg(home: &str, arg: &str) -> Option<Vec<u8>> {
 /// return the file text, or `None` on not-found / denied.
 fn read_via_tool(path: &str) -> Option<String> {
     let call = alloc::format!(r#"{{"name":"mem_fs_read","arguments":{{"path":"{path}"}}}}"#);
-    match crate::synapse::execute(crate::sched::current_task_id(), &call) {
-        crate::synapse::Invocation::Executed { result, .. } => result.strip_prefix("ok:").map(String::from),
+    // **From ring 3.** A content agent serves attacker-reachable input — an HTTP
+    // request from the network decides which asset is named — so this is among the
+    // better places in the system for the read to happen outside the kernel. It used to
+    // call `synapse::execute` directly and so bypassed the router, which is the only
+    // reason it was not already migrated with the rest of an agent's effects.
+    //
+    // `trusted()` preserves what `synapse::execute` supplied by default; the *path* is
+    // still scope-gated against the agent's own `assets/`, which is what actually
+    // confines it.
+    match crate::synapse::tenant::invoke_in_userspace(
+        crate::sched::current_task_id(),
+        &call,
+        crate::security::taint::Justification::trusted(),
+    ) {
+        Some(crate::synapse::Invocation::Executed { result, .. }) => result.strip_prefix("ok:").map(String::from),
         _ => None,
     }
 }

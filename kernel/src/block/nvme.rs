@@ -164,20 +164,50 @@ impl NvmeController {
             // NSID 1), so this — not a walk from NSID 1 — is the enumeration.
             if ctrl.admin(0x06, 0, ctrl.data_buf.phys, 0, 2, 0) {
                 let mut page = [0u8; 4096];
-                core::ptr::copy_nonoverlapping(ctrl.data_buf.virt as *const u8, page.as_mut_ptr(), 4096);
+                core::ptr::copy_nonoverlapping(
+                    ctrl.data_buf.virt as *const u8,
+                    page.as_mut_ptr(),
+                    4096,
+                );
                 ctrl.active = parse_ns_list(&page);
-                crate::ktrace::log_fmt(format_args!(
-                    "nvme: {} active namespace(s){}",
-                    ctrl.active.len(),
-                    match ctrl.active.first() {
-                        Some(first) => alloc::format!(" (first NSID {first})"),
-                        None => alloc::string::String::new(),
-                    }
-                ));
-            } else {
-                // Pre-1.1 controller: fall back to the contiguous walk.
-                crate::ktrace::log("nvme", "active-ns-list identify unsupported; assuming contiguous NSIDs");
             }
+            // If CNS=2 is unsupported *or* returned an empty list, probe live
+            // NSIDs directly. VirtualBox after the install medium is detached
+            // often leaves the only disk on a non-1 NSID; treating "empty list
+            // → NSID = n+1" made `/disks` report nothing and the data volume
+            // never mount.
+            if ctrl.active.is_empty() {
+                crate::ktrace::log(
+                    "nvme",
+                    "active-ns-list empty/unsupported; scanning NSIDs for live namespaces",
+                );
+                // Identify Controller CNS=1 gives NN (number of namespaces) at
+                // byte 516. Cap the walk — VirtualBox rarely has more than a
+                // handful of ports, and each miss is an admin round-trip.
+                let mut max_ns = 16u32;
+                if ctrl.admin(0x06, 0, ctrl.data_buf.phys, 0, 1, 0) {
+                    let nn = read_volatile((ctrl.data_buf.virt + 516) as *const u32);
+                    if nn > 0 && nn <= 64 {
+                        max_ns = nn;
+                    }
+                }
+                for nsid in 1..=max_ns {
+                    // Presence only: Identify NS; NSZE==0 / error → skip.
+                    // Do not call identify_namespace (it logs every miss).
+                    if !ctrl.admin(0x06, nsid, ctrl.data_buf.phys, 0, 0, 0) {
+                        continue;
+                    }
+                    let nsze = read_volatile(ctrl.data_buf.virt as *const u64);
+                    if nsze != 0 {
+                        ctrl.active.push(nsid);
+                    }
+                }
+            }
+            crate::ktrace::log_fmt(format_args!(
+                "nvme: {} active namespace(s){:?}",
+                ctrl.active.len(),
+                ctrl.active.as_slice()
+            ));
             Some(ctrl)
         }
     }
@@ -333,9 +363,8 @@ pub fn parse_ns_list(page: &[u8]) -> alloc::vec::Vec<u32> {
 }
 
 /// Bring up the controller (once) and attach to the `n`-th **active**
-/// namespace (per the IDENTIFY CNS=2 list — NSIDs may be sparse; legacy
-/// fallback is NSID `n+1`). `None` once namespaces run out. Called by the
-/// per-arch `probe_nth`.
+/// namespace (IDENTIFY CNS=2 list, or a live-NSID scan when that is empty).
+/// `None` once namespaces run out. Called by the per-arch `probe_nth`.
 ///
 /// # Safety
 /// `regs` must be a valid mapped NVMe BAR0; `alloc` real DMA memory.
@@ -346,13 +375,13 @@ pub unsafe fn probe_namespace(regs: u64, alloc: DmaAlloc, n: usize) -> Option<Nv
             *slot = unsafe { NvmeController::bringup(regs, alloc) };
         }
         let ctrl = slot.as_mut()?;
-        let nsid = match ctrl.active.get(n) {
-            Some(&id) => id,
-            None if ctrl.active.is_empty() => (n + 1) as u32, // legacy fallback
-            None => return None, // past the last active namespace
-        };
+        let &nsid = ctrl.active.get(n)?;
         let (capacity, lba_bytes) = ctrl.identify_namespace(nsid)?;
-        Some(NvmeNamespace { nsid, capacity, lba_bytes })
+        Some(NvmeNamespace {
+            nsid,
+            capacity,
+            lba_bytes,
+        })
     })
 }
 

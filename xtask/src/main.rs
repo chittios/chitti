@@ -3,6 +3,8 @@
 //! `cargo xtask <cmd>` (see CHITTI_OS_HANDOFF.md Part 7).
 
 use std::env;
+mod paper;
+mod rings;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -439,6 +441,11 @@ fn main() {
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
         // boot the real model, run the acceptance checks, exit pass/fail.
         "ref-check" => cmd_ref_check(arch, model),
+        // Verify the quantitative claims in `paper/main.tex` against the tree.
+        // Reports and exits non-zero on drift; never edits the paper.
+        "paper-check" => cmd_paper_check(&rest),
+        "ring-check" => cmd_ring_check(),
+        "imgdec" => cmd_imgdec(),
         // Hidden subcommand: installed as `[target.x86_64-chitti] runner` in
         // kernel/.cargo/config.toml so `cargo test` can boot each compiled
         // test binary in QEMU and translate isa-debug-exit into a real exit
@@ -979,6 +986,102 @@ fn detect_host_res() -> Option<(u32, u32)> {
     let wants_max = std::env::var("CHITTI_FB_RES").map(|v| v.trim().eq_ignore_ascii_case("max")).unwrap_or(false);
     let (w, h) = if wants_max { d.native } else { d.desktop };
     Some((w.clamp(640, 3840), h.clamp(480, 2400)))
+}
+
+/// `cargo xtask imgdec` — rebuild the userspace tenant blobs for **both** arches.
+///
+/// The kernel `include_bytes!`s the flat binaries, so they are checked in like
+/// `tools/*-wasm`'s modules. Both arches every time, deliberately: a blob rebuilt for one
+/// is the divergence the dual-arch standing rule exists to prevent, and it would not be
+/// caught by either build.
+fn cmd_imgdec() -> Result<(), String> {
+    let repo = repo_root();
+    let crate_dir = repo.join("userspace/imgdec");
+    let objcopy = find_objcopy()?;
+    for arch in ["x86_64", "aarch64"] {
+        let target = format!("../../targets/{arch}-chitti-user.json");
+        let st = std::process::Command::new("cargo")
+            .current_dir(&crate_dir)
+            .args(["build", "--release", "--target", &target])
+            .status()
+            .map_err(|e| format!("imgdec: cargo: {e}"))?;
+        if !st.success() {
+            return Err(format!("imgdec: build failed for {arch}"));
+        }
+        let elf = crate_dir.join(format!("target/{arch}-chitti-user/release/imgdec"));
+        let bin = crate_dir.join(format!("imgdec-{arch}.bin"));
+        let st = std::process::Command::new(&objcopy)
+            .args(["-O", "binary"])
+            .arg(&elf)
+            .arg(&bin)
+            .status()
+            .map_err(|e| format!("imgdec: objcopy: {e}"))?;
+        if !st.success() {
+            return Err(format!("imgdec: objcopy failed for {arch}"));
+        }
+        let n = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
+        println!("imgdec: {arch} -> {} ({n} bytes)", bin.display());
+    }
+    println!("imgdec: both blobs rebuilt -- commit them, the kernel include_bytes! them");
+    Ok(())
+}
+
+/// `cargo xtask ring-check` — enforce the ring-3 standing rule.
+///
+/// Fails if any file outside `rings::ALLOWED` calls the Synapse executor directly. See
+/// `rings` for why this is a check and not a code review item: a bypass keeps kernel
+/// privilege silently, so nothing else goes red.
+fn cmd_ring_check() -> Result<(), String> {
+    let repo = repo_root();
+    let hits = rings::check(&repo).map_err(|e| format!("ring-check: {e}"))?;
+    if hits.is_empty() {
+        println!("ring-check: ok -- no direct executor calls outside the allowlist");
+        println!("  agents and agent-facing commands must use synapse::tenant::invoke_in_userspace");
+        return Ok(());
+    }
+    println!("ring-check: {} direct executor call(s) outside the allowlist:", hits.len());
+    for h in &hits {
+        println!("  {}:{}  {}", h.file, h.line, h.text);
+    }
+    println!();
+    println!("These keep kernel privilege for work that should run in ring 3. Either route");
+    println!("them through `synapse::tenant::invoke_in_userspace` (passing the justification");
+    println!("the in-kernel path used), or add the file to `rings::ALLOWED` with a reason.");
+    Err(format!("ring-check: {} bypass(es) of the ring-3 rule", hits.len()))
+}
+
+/// `cargo xtask paper-check [--ran N]` — compare the paper's derivable claims
+/// with the tree. `--ran N` supplies the number of tests the x86 suite executed
+/// (from `cargo xtask test`); without it that one claim is skipped rather than
+/// guessed at.
+fn cmd_paper_check(rest: &[String]) -> Result<(), String> {
+    let ran = rest
+        .iter()
+        .position(|a| a == "--ran")
+        .and_then(|i| rest.get(i + 1))
+        .and_then(|v| v.parse::<u64>().ok());
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("cannot locate the repo root")?
+        .to_path_buf();
+    let claims = paper::check(&repo, ran).map_err(|e| format!("paper-check: {e}"))?;
+    if claims.is_empty() {
+        return Err("paper-check: found no claims to check -- has the prose changed?".into());
+    }
+    println!("paper-check: {} derivable claim(s)", claims.len());
+    for c in &claims {
+        println!("{c}");
+    }
+    if ran.is_none() {
+        println!("  skipped  unit tests run (x86): pass --ran N from `cargo xtask test`");
+    }
+    println!("  unchecked measured figures (tok/s, gate ns, attack rates) -- these come from");
+    println!("            running the kernel (/perf, /bench synapse, /redteam), not the source.");
+    let bad = claims.iter().filter(|c| !c.ok()).count();
+    if bad > 0 {
+        return Err(format!("paper-check: {bad} claim(s) no longer match the code"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2986,7 +3089,13 @@ fn cmd_runner(args: &[String]) -> Result<(), String> {
     let mut cmd = qemu_base_cmd(&iso);
     // The in-kernel test suite includes the Phase 7 SMP bring-up + spinlock
     // self-test, so the harness runs with four vCPUs.
-    cmd.args(["-smp", "4", "-serial", "stdio", "-display", "none"]); cmd.args(["-d","int,cpu_reset","-D","/tmp/qint2.log"]);
+    cmd.args(["-smp", "4", "-serial", "stdio", "-display", "none"]);
+    // NB: do not add `-d int` here. QEMU dumps the full CPU register state on
+    // every interrupt, and with a 1000 Hz APIC tick across these 4 vCPUs that is
+    // millions of formatted entries per run -- left on by accident it wrote an
+    // 818 MB, 14.2-million-line trace for a single `cargo xtask test`, all of it
+    // formatted and written synchronously while the guest waits. Enable it in a
+    // local shell for one debugging session, never in the committed runner.
     let status = cmd
         .status()
         .map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;

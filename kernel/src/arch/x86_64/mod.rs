@@ -8,6 +8,7 @@ pub mod apic;
 pub mod disk;
 pub mod sb16;
 pub mod fpu;
+pub mod fastcall;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;

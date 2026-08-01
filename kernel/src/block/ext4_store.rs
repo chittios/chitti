@@ -1,30 +1,41 @@
 //! A persistent, ext4-backed key/value store for `synapse::fs` — so agent
-//! runtime writes survive reboots on the installed system. It keeps the small
-//! set of agent files in an in-memory cache and **persists on every mutation by
-//! rewriting the (small, dedicated) ext4 data partition** with the verified
-//! [`Ext4Writer`] (mkfs + write-all), reading it back with [`Ext4Reader`] on
-//! mount.
+//! runtime writes survive reboots on the installed system.
 //!
-//! This reuses the two verified drivers, so every persisted image is
-//! e2fsck-clean by construction. It is *rewrite-on-sync*, not an incremental
-//! read-write ext4 driver — correct + durable for the KB-scale agent state
-//! (notes, facts, sessions), but O(total) per write; a true incremental RW
-//! layer (allocate/free from live bitmaps, in-place directory edits) is a
-//! documented follow-on.
+//! The small set of agent files is kept in an in-memory cache. Persistence
+//! prefers the live [`super::ext4_rw::Ext4Rw`] volume (allocate/free, real
+//! directories) so a single mutation is O(file). Fallbacks, in order:
+//!
+//! 1. **Live RW** ([`Ext4Rw`]) — hierarchical paths, create/delete/grow/shrink
+//! 2. **Same-size data rewrite** — when this session still holds an
+//!    [`Ext4Layout`] from a full format (legacy path)
+//! 3. **Full format** ([`Ext4Writer`]) — last resort / empty volume bootstrap
+//!
+//! Legacy volumes stored synapse keys as percent-encoded single-component
+//! root names (`%2F` for `/`). Mount migrates those into real directories once.
 
 use crate::block::ext4::{Ext4Writer, FileSpec};
 use crate::block::ext4_read::Ext4Reader;
-use crate::block::{DiskDevice, Partition};
-use alloc::collections::BTreeMap;
+use crate::block::ext4_rw::Ext4Rw;
+use crate::block::volcrypto::CryptoPart;
+use crate::block::DiskDevice;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+
+/// Active volume encryption (AES-XTS over the payload after the C4VE header).
+#[derive(Clone, Copy)]
+struct CryptoState {
+    key: [u8; 32],
+    hdr_sectors: u64,
+}
 
 /// synapse::fs keys are flat strings that routinely contain `/`
 /// (e.g. `/sessions/5/cmp/26`, `skills/1/body.md`), but `/` is the path separator
 /// and is illegal inside an ext4 directory-entry name. Percent-encode `/` (and
 /// `%` itself, so the mapping is reversible) into a legal single-component
-/// filename; [`key_decode`] inverts it on mount.
+/// filename — used only by the full-format fallback and legacy migration.
 fn key_encode(key: &str) -> String {
     let mut out = String::with_capacity(key.len());
     for c in key.chars() {
@@ -65,84 +76,258 @@ pub fn key_decode(name: &str) -> String {
     out
 }
 
+fn canon_key(path: &str) -> String {
+    if path.starts_with('/') {
+        String::from(path)
+    } else {
+        format!("/{path}")
+    }
+}
+
 pub struct Ext4Store {
-    dev: DiskDevice,
+    /// Global disk index ([`crate::block::probe_disk_nth`]), re-opened on each
+    /// sync. Holding a live [`DiskDevice`] monopolised AHCI ports and left
+    /// `/disks` empty after the boot mount (re-bringup of the same port failed
+    /// or corrupted the store's DMA). NVMe is already a shared controller; the
+    /// index model is correct for every transport.
+    disk: usize,
     start: u64,
     count: u64,
+    crypto: Option<CryptoState>,
     cache: BTreeMap<String, Vec<u8>>,
     /// While set, mutations only touch `cache`; see [`Ext4Store::begin_batch`].
     defer: bool,
     /// A mutation happened while deferring, so the flush has work to do.
     dirty: bool,
-    /// Block placement from the last successful full format, for the incremental
-    /// path in [`Ext4Store::sync`].
+    /// Block placement from the last successful full format, for the same-size
+    /// incremental fallback.
     layout: Option<crate::block::ext4::Ext4Layout>,
-    /// Names mutated since the last successful sync.
-    changed: alloc::collections::BTreeSet<String>,
+    /// Keys written/updated since the last successful sync.
+    changed: BTreeSet<String>,
+    /// Keys deleted since the last successful sync (not present in `cache`).
+    deleted: BTreeSet<String>,
 }
 
 impl Ext4Store {
-    /// Mount the ext4 data partition at `[start, start+count)` of `dev`, reading
-    /// its existing root files into the cache. Returns `None` if the partition
-    /// is not a readable ext4.
-    pub fn mount(mut dev: DiskDevice, start: u64, count: u64) -> Option<Ext4Store> {
+    /// Mount a plain (unencrypted) ext4 data partition on global disk `disk`.
+    pub fn mount(disk: usize, start: u64, count: u64) -> Option<Ext4Store> {
+        Self::mount_inner(disk, start, count, None)
+    }
+
+    /// Mount a C4VE-encrypted ext4 payload (after successful [`crate::block::volcrypto::unlock`]).
+    pub fn mount_encrypted(
+        disk: usize,
+        start: u64,
+        count: u64,
+        key: [u8; 32],
+        hdr_sectors: u64,
+    ) -> Option<Ext4Store> {
+        Self::mount_inner(disk, start, count, Some(CryptoState { key, hdr_sectors }))
+    }
+
+    fn mount_inner(
+        disk: usize,
+        start: u64,
+        count: u64,
+        crypto: Option<CryptoState>,
+    ) -> Option<Ext4Store> {
+        let mut dev = crate::block::probe_disk_nth(disk)?;
         let mut cache = BTreeMap::new();
+        let mut opened = false;
         {
-            let mut part = Partition::new(&mut dev, start, count);
-            let mut r = Ext4Reader::open(&mut part)?;
-            for (name, _ino, is_dir) in r.list_root() {
-                if is_dir {
-                    continue;
+            let mut part = Self::open_part(&mut dev, start, count, crypto);
+            // Live volume: migrate legacy `%2F` root names, then walk the tree.
+            // An empty freshly-formatted data partition is a successful open —
+            // do NOT require Ext4Reader after this (it used to fail-close empty
+            // volumes into memfs with `?` on the RO reader).
+            if let Ok(mut vol) = Ext4Rw::open(&mut part) {
+                opened = true;
+                if let Ok(root) = vol.readdir("/") {
+                    for (name, is_dir) in root {
+                        if is_dir {
+                            continue;
+                        }
+                        let legacy = name.contains("%2F")
+                            || name.contains("%2f")
+                            || name.contains("%25");
+                        if !legacy {
+                            continue;
+                        }
+                        if let Ok(data) = vol.read(&name) {
+                            let key = key_decode(&name);
+                            if vol.write(&key, &data).is_ok() {
+                                let _ = vol.unlink(&name);
+                                crate::ktrace::log_fmt(format_args!(
+                                    "ext4_store: migrated legacy key {} -> {}",
+                                    name, key
+                                ));
+                            }
+                        }
+                    }
                 }
-                if let Some(sz) = r.file_size(&name) {
-                    let mut buf = vec![0u8; sz as usize];
-                    let n = r.read_root_file(&name, &mut buf).unwrap_or(0);
-                    buf.truncate(n);
-                    cache.insert(key_decode(&name), buf);
+                if let Ok(files) = vol.list_files_recursive("/") {
+                    for path in files {
+                        if let Ok(data) = vol.read(&path) {
+                            cache.insert(canon_key(&path), data);
+                        }
+                    }
+                }
+            }
+            // Fallback when Ext4Rw cannot open (foreign geometry): flat RO walk.
+            if !opened {
+                let mut part = Self::open_part(&mut dev, start, count, crypto);
+                let mut r = Ext4Reader::open(&mut part)?;
+                opened = true;
+                for (name, _ino, is_dir) in r.list_root() {
+                    if is_dir {
+                        continue;
+                    }
+                    if let Some(sz) = r.file_size(&name) {
+                        let mut buf = vec![0u8; sz as usize];
+                        let n = r.read_root_file(&name, &mut buf).unwrap_or(0);
+                        buf.truncate(n);
+                        cache.insert(key_decode(&name), buf);
+                    }
                 }
             }
         }
-        crate::ktrace::log_fmt(format_args!("ext4_store: mounted ext4 data partition, {} file(s) recovered", cache.len()));
-        Some(Ext4Store { dev, start, count, cache, defer: false, dirty: false, layout: None, changed: alloc::collections::BTreeSet::new() })
+        if !opened {
+            return None;
+        }
+        // Drop `dev` before returning so later `/disks` / VFS probes can open
+        // the same controller without fighting a held AHCI port.
+        drop(dev);
+        crate::ktrace::log_fmt(format_args!(
+            "ext4_store: mounted disk {} lba {} ({} sectors), {} file(s) recovered{}",
+            disk,
+            start,
+            count,
+            cache.len(),
+            if crypto.is_some() { " (encrypted)" } else { "" }
+        ));
+        Some(Ext4Store {
+            disk,
+            start,
+            count,
+            crypto,
+            cache,
+            defer: false,
+            dirty: false,
+            layout: None,
+            changed: BTreeSet::new(),
+            deleted: BTreeSet::new(),
+        })
     }
 
-    /// Rewrite the partition from the current cache (verified mkfs + write-all).
-    /// Write the store to disk, rewriting only what changed when possible.
-    ///
-    /// A full [`Ext4Writer::format`] rewrites the entire partition, which is what
-    /// made a disk-backed boot cost minutes. But the block layout is fully
-    /// determined by the ordered `(name, size)` list (see
-    /// [`crate::block::ext4::Ext4Layout`]), so when only *contents* changed — no
-    /// additions, deletions or size changes — every file's blocks are exactly where
-    /// the last format put them, and the superblock, bitmaps, inode table and
-    /// directory are all still correct. Then only the changed files' data blocks
-    /// need writing.
-    ///
-    /// Any change to the name set or to a size shifts subsequent files, so that
-    /// falls back to a full format.
-    ///
-    /// **This does not speed up boot, and measurement confirms it.** At a fixed
-    /// 256 MiB image: 59 s fresh / 38 s second boot before, 74 s / 35 s after —
-    /// equal within noise. That is the expected result on reflection: the first boot
-    /// installs a *new* roster, so it is a full format either way, and on a second
-    /// boot `write` skips the byte-identical files outright so `sync` never runs.
-    /// The win is for **runtime** writes once the system is up — session saves,
-    /// agent memory, config — where a single changed file used to cost a
-    /// whole-partition rewrite. Don't re-measure boot expecting a difference.
+    fn open_part(
+        dev: &mut DiskDevice,
+        start: u64,
+        count: u64,
+        crypto: Option<CryptoState>,
+    ) -> CryptoPart<'_, DiskDevice> {
+        match crypto {
+            Some(c) => CryptoPart::encrypted(dev, start, count, c.hdr_sectors, c.key),
+            None => CryptoPart::plain(dev, start, count),
+        }
+    }
+
+    /// Open the data partition on a freshly probed disk for one sync pass.
+    fn with_part<R>(&mut self, f: impl FnOnce(&mut CryptoPart<'_, DiskDevice>) -> R) -> Option<R> {
+        let mut dev = crate::block::probe_disk_nth(self.disk)?;
+        let mut part = Self::open_part(&mut dev, self.start, self.count, self.crypto);
+        Some(f(&mut part))
+    }
+
+    /// Persist pending mutations. Prefers live RW; falls back to same-size
+    /// rewrite then full format.
     fn sync(&mut self) {
+        if self.sync_live() {
+            return;
+        }
         if self.sync_incremental() {
             return;
         }
         self.sync_full();
     }
 
-    /// The fast path. Returns false when the layout cannot be reused, leaving the
-    /// volume untouched so the caller can do a full format.
+    /// Apply creates/updates/deletes through [`Ext4Rw`]. Returns false when the
+    /// volume cannot be opened or a mutation fails (caller falls back).
+    fn sync_live(&mut self) -> bool {
+        let changed: Vec<String> = self.changed.iter().cloned().collect();
+        let deleted: Vec<String> = self.deleted.iter().cloned().collect();
+        if changed.is_empty() && deleted.is_empty() {
+            return true;
+        }
+        // Snapshot write payloads before borrowing the device for IO.
+        let writes: Vec<(String, Vec<u8>)> = changed
+            .iter()
+            .filter_map(|name| self.cache.get(name).map(|d| (name.clone(), d.clone())))
+            .collect();
+        let deleted_c = deleted.clone();
+        let ok = self.with_part(|part| {
+            let mut vol = match Ext4Rw::open(part) {
+                Ok(v) => v,
+                Err(e) => {
+                    crate::ktrace::log_fmt(format_args!(
+                        "ext4_store: live RW open failed ({e:?}); trying fallbacks"
+                    ));
+                    return false;
+                }
+            };
+            for name in &deleted_c {
+                if let Err(e) = vol.unlink(name) {
+                    if e != crate::block::ext4_rw::Ext4RwError::NotFound {
+                        crate::ktrace::log_fmt(format_args!(
+                            "ext4_store: live unlink {name}: {e:?}"
+                        ));
+                        return false;
+                    }
+                }
+                let enc = key_encode(name);
+                if enc != *name {
+                    let _ = vol.unlink(&enc);
+                }
+            }
+            for (name, data) in &writes {
+                if let Err(e) = vol.write(name, data) {
+                    crate::ktrace::log_fmt(format_args!(
+                        "ext4_store: live write {name}: {e:?} -- falling back"
+                    ));
+                    return false;
+                }
+            }
+            true
+        });
+        if ok != Some(true) {
+            if ok.is_none() {
+                crate::ktrace::log_fmt(format_args!(
+                    "ext4_store: disk {} gone during live sync",
+                    self.disk
+                ));
+            }
+            return false;
+        }
+        self.changed.clear();
+        self.deleted.clear();
+        // A live write invalidates any remembered full-format layout (block
+        // placement is no longer the sequential format order).
+        self.layout = None;
+        crate::ktrace::log_fmt(format_args!(
+            "ext4_store: live sync ({} written, {} deleted)",
+            changed.len(),
+            deleted.len()
+        ));
+        true
+    }
+
+    /// Same-name/same-size content rewrite using a remembered format layout.
     fn sync_incremental(&mut self) -> bool {
+        if !self.deleted.is_empty() {
+            return false;
+        }
         let Some(layout) = self.layout.clone() else {
-            return false; // never formatted in this session
+            return false;
         };
-        // Same names, same sizes, same order => same blocks.
         let want: Vec<(String, usize)> =
             self.cache.iter().map(|(k, v)| (key_encode(k), v.len())).collect();
         if want != layout.signature() {
@@ -152,17 +337,32 @@ impl Ext4Store {
         for name in &changed {
             let enc = key_encode(name);
             let Some(blocks) = layout.blocks_of(&enc) else {
-                return false; // should not happen given the signature matched
+                return false;
             };
             let Some(data) = self.cache.get(name) else {
-                return false; // a deletion; signature check should have caught it
+                return false;
             };
             let data = data.clone();
             let blocks = blocks.to_vec();
-            let mut part = Partition::new(&mut self.dev, self.start, self.count);
-            if let Err(e) = crate::block::ext4::write_file_blocks(&mut part, &blocks, &data) {
-                crate::ktrace::log_fmt(format_args!("ext4_store: incremental write failed: {:?} -- falling back to a full format", e));
-                return false;
+            let wrote = self.with_part(|part| {
+                crate::block::ext4::write_file_blocks(part, &blocks, &data)
+            });
+            match wrote {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    crate::ktrace::log_fmt(format_args!(
+                        "ext4_store: incremental write failed: {:?} -- falling back to a full format",
+                        e
+                    ));
+                    return false;
+                }
+                None => {
+                    crate::ktrace::log_fmt(format_args!(
+                        "ext4_store: disk {} gone during incremental sync",
+                        self.disk
+                    ));
+                    return false;
+                }
             }
         }
         self.changed.clear();
@@ -175,36 +375,44 @@ impl Ext4Store {
     }
 
     fn sync_full(&mut self) {
-        // Encode keys to legal ext4 filenames; hold the owned strings so the
-        // borrowed `FileSpec::name`s outlive the format call.
-        let names: Vec<String> = self.cache.keys().map(|k| key_encode(k)).collect();
-        let files: Vec<FileSpec> = names.iter().zip(self.cache.values()).map(|(n, d)| FileSpec { name: n.as_str(), data: d.as_slice() }).collect();
-        let mut part = Partition::new(&mut self.dev, self.start, self.count);
-        match Ext4Writer::format_with_layout(&mut part, &files) {
-            Ok(layout) => {
+        // Own all bytes before opening the partition (borrow checker).
+        let owned: Vec<(String, Vec<u8>)> = self
+            .cache
+            .iter()
+            .map(|(k, v)| (key_encode(k), v.clone()))
+            .collect();
+        let files: Vec<FileSpec> = owned
+            .iter()
+            .map(|(n, d)| FileSpec {
+                name: n.as_str(),
+                data: d.as_slice(),
+            })
+            .collect();
+        let result = self.with_part(|part| Ext4Writer::format_with_layout(part, &files));
+        match result {
+            Some(Ok(layout)) => {
                 self.layout = Some(layout);
                 self.changed.clear();
+                self.deleted.clear();
             }
-            Err(e) => {
-                // Drop the remembered layout: after a failed format the on-disk
-                // placement is unknown, so a later incremental write could scribble
-                // over the wrong blocks.
+            Some(Err(e)) => {
                 self.layout = None;
                 crate::ktrace::log_fmt(format_args!("ext4_store: sync failed: {:?}", e));
+            }
+            None => {
+                self.layout = None;
+                crate::ktrace::log_fmt(format_args!(
+                    "ext4_store: disk {} gone during full sync",
+                    self.disk
+                ));
             }
         }
     }
 
     /// Stop syncing after every mutation; the caller must call [`Self::end_batch`].
     ///
-    /// [`Self::sync`] re-formats the whole partition and rewrites **every** file,
-    /// so one `write` per file is quadratic in total bytes: installing the ~40
-    /// boot agents (~120 files, several MB once the wasm assets are in) meant ~120
-    /// full-partition rewrites and took *minutes* on a real disk. Batching turns
-    /// that into one.
-    ///
-    /// Reads stay correct inside a batch because they are served from `cache`,
-    /// which is authoritative; only the on-disk copy lags until the flush.
+    /// Boot agent install writes ~120 files; batching turns that into one flush
+    /// (live RW applies each file once, or a single full format on fallback).
     pub fn begin_batch(&mut self) {
         self.defer = true;
     }
@@ -219,19 +427,15 @@ impl Ext4Store {
     }
 
     pub fn write(&mut self, name: &str, data: &[u8]) {
-        // Writing identical content is not a change. This matters because `sync`
-        // re-formats the whole partition: on every reboot of an installed system
-        // the agent roster rewrites ~120 byte-identical files, which would
-        // otherwise dirty the store and trigger a full rewrite for no reason.
         if self.cache.get(name).is_some_and(|old| old.as_slice() == data) {
             return;
         }
         self.cache.insert(String::from(name), data.to_vec());
         self.changed.insert(String::from(name));
+        self.deleted.remove(name);
         self.touched();
     }
 
-    /// Record a mutation, syncing immediately unless a batch is open.
     fn touched(&mut self) {
         if self.defer {
             self.dirty = true;
@@ -239,6 +443,7 @@ impl Ext4Store {
             self.sync();
         }
     }
+
     pub fn read(&self, name: &str) -> Option<Vec<u8>> {
         self.cache.get(name).cloned()
     }
@@ -251,9 +456,8 @@ impl Ext4Store {
     pub fn delete(&mut self, name: &str) -> bool {
         let removed = self.cache.remove(name).is_some();
         if removed {
-            // A deletion changes the name set, so the layout cannot be reused; the
-            // signature check in `sync_incremental` will force a full format.
-            self.changed.insert(String::from(name));
+            self.changed.remove(name);
+            self.deleted.insert(String::from(name));
             self.touched();
         }
         removed

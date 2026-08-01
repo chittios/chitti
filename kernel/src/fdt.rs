@@ -236,6 +236,21 @@ pub unsafe fn present(dtb_pa: u64) -> bool {
     unsafe { header(dtb_pa).is_some() }
 }
 
+/// The blob's declared `totalsize`, i.e. how many bytes the FDT occupies at
+/// `dtb_pa`. `None` on anything that isn't an FDT.
+///
+/// Needed to *reserve* the blob: the boot loader (QEMU, m1n1) parks the DTB in
+/// RAM the kernel is otherwise free to allocate from, and handing those frames
+/// out would let a later allocation overwrite the device tree the boot path
+/// re-parses (`init_uart_apple`, the GIC/PSCI lookups) after `mm::init`.
+///
+/// # Safety
+/// As [`present`].
+pub unsafe fn total_size(dtb_pa: u64) -> Option<u64> {
+    // SAFETY: delegated to `header` (magic-checked, bounded reads).
+    unsafe { header(dtb_pa) }.map(|(_, h)| h.total as u64)
+}
+
 /// True if the `compatible` property value at `[data_off, data_off+len)` — a
 /// sequence of NUL-terminated strings — contains an exact match for `want`.
 ///

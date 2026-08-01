@@ -15,6 +15,7 @@ pub mod dtb;
 pub mod mmu;
 pub mod ahci;
 pub mod disk;
+pub mod el0;
 pub mod exceptions;
 pub mod gic;
 pub mod nvme;
@@ -120,6 +121,15 @@ pub mod interrupts {
         // SAFETY: masking IRQs has no memory-safety implications.
         unsafe { asm!("msr daifset, #2", options(nomem, nostack, preserves_flags)) };
         INTERRUPTS_ENABLED.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether IRQs are unmasked **right now**, read from `DAIF` rather than
+    /// from the logging shadow above. The aarch64 counterpart of the x86
+    /// `are_enabled`; see there for why `sched::block_on` uses this as its
+    /// "am I holding a `Locked`" test.
+    #[inline]
+    pub fn are_enabled() -> bool {
+        !irqs_masked()
     }
 
     #[inline]

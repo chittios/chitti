@@ -27,6 +27,21 @@ pub fn disable() {
     INTERRUPTS_ENABLED.store(false, Ordering::Relaxed);
 }
 
+/// Whether interrupts are enabled **right now**, read from the CPU rather than
+/// from the logging shadow above.
+///
+/// This is the kernel's test for "am I inside a critical section", and it works
+/// because [`crate::mm::Locked`] is the only thing that takes one: it disables
+/// interrupts for the whole of `with`. So code that finds interrupts disabled is
+/// either holding a `Locked`, inside an explicit [`without_interrupts`], or in an
+/// interrupt handler — and blocking is wrong in all three. `sched::block_on`
+/// checks this instead of maintaining a lock-depth counter, which would need
+/// per-CPU storage the kernel does not have.
+#[inline]
+pub fn are_enabled() -> bool {
+    flags_interrupts_enabled()
+}
+
 #[inline]
 fn flags_interrupts_enabled() -> bool {
     let flags: u64;

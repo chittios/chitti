@@ -31,3 +31,9 @@ third_party/dtb/*.dtb
 third_party/dtb/.asahi-linux/
 scratchpad-agx/
 assets/*.partial
+userspace/*/target/
+userspace/**/*.bin
+# ...except the tenant blobs, which are **deliberately checked in** — the kernel
+# `include_bytes!`s them, exactly as it does `agents/*/assets/tools.wasm`. Without them the
+# tree does not build for anyone who did not run `cargo xtask imgdec` locally.
+!userspace/imgdec/imgdec-*.bin

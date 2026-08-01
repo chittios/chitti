@@ -164,6 +164,11 @@ extern "C" fn ap_entry(info: *const SmpInfo) -> ! {
     crate::arch::x86_64::fpu::enable_sse();
 
     gdt::init_ap();
+    // `STAR`/`LSTAR`/`SFMASK` and `EFER.SCE` are per-CPU: an AP that skipped this
+    // would `#UD` on the first `syscall` from a task the scheduler placed on it —
+    // a fault that depends on which core a tenant happened to land on, which is
+    // the worst kind to reproduce.
+    crate::arch::x86_64::fastcall::init();
     idt::load_ap();
     apic::software_enable();
 

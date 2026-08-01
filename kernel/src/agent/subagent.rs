@@ -42,6 +42,11 @@ pub struct SubagentOutcome {
     pub record: SubagentRecord,
     /// The isolated sub-session (its full transcript). The parent never sees
     /// this — it exists so callers/tests can prove isolation. Discarded after.
+    ///
+    /// Its `capabilities` are **already revoked** by the time you hold this:
+    /// [`dispatch`] kills the sub-agent's task when the delegation ends, so the
+    /// transcript is readable but the authority is gone. Read it; do not try to
+    /// resume it.
     pub sub_session: Session,
 }
 
@@ -100,22 +105,51 @@ pub fn dispatch(
     }
     let effective = attenuate(parent_caps, &role)?;
 
-    // Isolated identity + capability table for the sub-agent.
-    let sub_task = crate::sched::spawn_parked("subagent");
-    let live = manifest::grant_to_task(sub_task, &effective);
-
     // Its own session (own context/KV). The delegated task is system-trusted
     // (orchestrator-authored); anything the sub-agent then ingests is tainted.
-    let mut sub_session = Session::new(&role, role.sampling.seed, live, now());
+    //
+    // The session's capability list starts **empty**, and is filled in after the run.
+    // It holds *live* handles, which cannot exist before the task that owns them:
+    // a sub-agent is now a real task created by `agent::task::run_on_own_task`, not a
+    // parked identity the parent's stack borrows. Safe because this field is
+    // bookkeeping — the capability gate checks the running task's own table, keyed by
+    // the `caller` TaskId, and nothing in the loop, the prompt, or tool dispatch reads
+    // it. The isolation tests that do read it run after the dispatch returns.
+    let mut sub_session = Session::new(&role, role.sampling.seed, alloc::vec::Vec::new(), now());
     let sub_id = role.id;
     sub_session.push_message(Role::User, task.to_string(), Provenance::SystemTrusted, now());
 
     crate::ktrace::log_fmt(format_args!(
-        "subagent.dispatch: '{}' (session {}, task {}, {} caps, core {:?}, depth {})",
-        role.name, sub_session.id.0, sub_task, effective.len(), core, parent_depth + 1
+        "subagent.dispatch: '{}' (session {}, {} caps, core {:?}, depth {})",
+        role.name, sub_session.id.0, effective.len(), core, parent_depth + 1
     ));
 
-    let result = agent_loop::run(&mut sub_session, steps, tools, sub_task, now);
+    // **The sub-agent runs on its own task**, so its loop no longer executes on the
+    // parent's stack. Two things follow, and both are the point of delegation: the
+    // identity the capability gate checks *is* the task doing the work, and a nested
+    // sub-agent no longer charges its depth to whichever stack the chain started on.
+    //
+    // `run_on_own_task` grants before the task can run and reaps it afterwards, which
+    // also retires the attenuated capability table — previously an explicit `kill`
+    // that a caller had to remember, and without which every dispatch left standing
+    // authority belonging to an agent that had finished.
+    let mut sub_task = 0;
+    let granted = core::cell::Cell::new(alloc::vec::Vec::new());
+    let result = crate::agent::task::run_on_own_task(
+        "subagent",
+        &mut sub_session,
+        steps,
+        tools,
+        &now,
+        &mut || false,
+        &mut |t| {
+            sub_task = t;
+            granted.set(manifest::grant_to_task(t, &effective));
+        },
+    );
+    // The live handles the gate issued, recorded on the session for the isolation
+    // tests that inspect what a sub-agent was actually holding.
+    sub_session.capabilities = granted.take();
     let summary = condense(&result.answer, role.summary);
 
     let record = SubagentRecord {
@@ -212,6 +246,14 @@ mod tests {
         // The parent context does NOT contain the sub-agent's raw read tool-call.
         assert!(!parent.messages.iter().any(|m| m.tool_calls.iter().any(|c| c.tool == "read")));
         assert_eq!(parent.subagents.len(), 1);
+        // The delegation is over, so its identity is retired: no live task is
+        // left holding the attenuated capability table. Every dispatch used to
+        // leave one for the rest of the boot — standing authority owned by an
+        // agent that had finished.
+        assert!(
+            !crate::sched::list().iter().any(|t| t.1 == "subagent" && t.2 != "dead"),
+            "a completed sub-agent must not keep a live capability table"
+        );
     }
 
     /// (b) A sub-agent role requesting a capability the parent lacks is refused

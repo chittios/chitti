@@ -9,30 +9,33 @@ use crate::arch::aarch64::virtio_pci::VirtioBlkPci;
 use crate::arch::aarch64::{ahci, nvme};
 use crate::block::ahci::Ahci;
 use crate::block::nvme::NvmeNamespace;
+use crate::block::usb_msc::UsbMsc;
 use crate::block::{BlockDevice, BlockError};
 
 /// The aarch64 boot disk, one variant per real transport. `probe_nth` tries
 /// them in order of preference — virtio (para-virtual, fast) first, then the
-/// real-hardware controllers NVMe and AHCI, then the QEMU-mmio fallback. A
-/// platform typically exposes exactly one, so ordering just skips the absent.
+/// real-hardware controllers NVMe and AHCI, then the QEMU-mmio fallback, then
+/// USB MSC. A platform typically exposes exactly one internal, so ordering just
+/// skips the absent; USB is last so stick plug-in does not renumber boot disks.
 pub enum Disk {
     Pci(VirtioBlkPci),
     Nvme(NvmeNamespace),
     Ahci(Ahci),
     Mmio(VirtioBlkMmio),
+    Usb(UsbMsc),
 }
 
 impl Disk {
     /// The `n`-th block device across ALL transports, counted globally: every
-    /// virtio-pci disk, then every NVMe namespace, then AHCI, then virtio-mmio.
-    /// (Passing `n` to each transport would let one transport's disks shadow
-    /// another's — e.g. two NVMe namespaces hiding the virtio-mmio ESP.)
+    /// virtio-pci disk, then every NVMe namespace, then AHCI, then virtio-mmio,
+    /// then USB MSC.
     pub fn probe_nth(n: usize) -> Option<Disk> {
         // No block transports on Apple Silicon yet: virtio-mmio (0x0a00_0000)
         // and the PCIe-based NVMe/AHCI/virtio-pci probes all read fixed
         // QEMU/SBSA addresses that data-abort under m1n1's hv. Apple's ANS2
         // storage is a follow-up; report no disks so every caller (model load,
         // persistent store, /install) cleanly finds nothing instead of faulting.
+        // USB MSC via xHCI is also not brought up under m1n1 hv yet.
         if super::is_apple() {
             return None;
         }
@@ -53,6 +56,7 @@ impl Disk {
         scan!(nvme::probe_nth, Disk::Nvme);
         scan!(ahci::probe_nth, Disk::Ahci);
         scan!(VirtioBlkMmio::probe_nth, Disk::Mmio);
+        scan!(UsbMsc::probe_nth, Disk::Usb);
         None
     }
 }
@@ -64,6 +68,7 @@ macro_rules! dispatch {
             Disk::Nvme(d) => d.$m($($a),*),
             Disk::Ahci(d) => d.$m($($a),*),
             Disk::Mmio(d) => d.$m($($a),*),
+            Disk::Usb(d) => d.$m($($a),*),
         }
     };
 }

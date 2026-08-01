@@ -94,6 +94,22 @@ pub fn command_items(prefix: &str, max: usize) -> Vec<Item> {
             contains.push(cmd_item(e.name, e.title));
         }
     }
+    // A **fully-typed command must come first**, whatever the catalog's
+    // declaration order. The menu highlights item 0, and the line editor submits
+    // on Enter only when accepting the highlighted item would not change the line
+    // (`shell::suggest_would_complete`). `model` is declared before `mode`, so
+    // typing `/mode` highlighted `/model`: Enter "accepted" it, the line became
+    // `/model `, and the next command was appended onto it — `/mode` could not be
+    // run at all, and every later line was one out of step. That is the same
+    // shape as the `/todos open` swallow this gate was originally added for; the
+    // gate was right, the candidate order was not.
+    //
+    // Done before `truncate` so the exact match cannot be cut, and as a
+    // move-to-front so everything else keeps its declaration order.
+    if let Some(i) = starts.iter().position(|it| it.label.len() > 1 && it.label[1..].eq_ignore_ascii_case(&p)) {
+        let exact = starts.remove(i);
+        starts.insert(0, exact);
+    }
     starts.extend(contains);
     starts.truncate(max.max(1).min(MAX_ITEMS));
     starts

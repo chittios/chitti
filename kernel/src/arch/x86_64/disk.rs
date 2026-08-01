@@ -8,6 +8,7 @@
 use crate::arch::x86_64::{ahci, nvme};
 use crate::block::ahci::Ahci;
 use crate::block::nvme::NvmeNamespace;
+use crate::block::usb_msc::UsbMsc;
 use crate::block::virtio::VirtioBlk;
 use crate::block::{BlockDevice, BlockError};
 
@@ -16,12 +17,16 @@ pub enum Disk {
     Virtio(VirtioBlk),
     Nvme(NvmeNamespace),
     Ahci(Ahci),
+    /// USB mass-storage stick (BOT); last so internal disks keep stable indices.
+    Usb(UsbMsc),
 }
 
 impl Disk {
     /// The `n`-th block device across ALL transports, counted globally: every
-    /// virtio-blk disk, then every NVMe namespace, then AHCI. (Passing `n` to
-    /// each transport would let one transport's disks shadow another's.)
+    /// virtio-blk disk, then every NVMe namespace, then AHCI, then USB MSC.
+    /// (Passing `n` to each transport would let one transport's disks shadow
+    /// another's.) USB is last so boot/install disk indices stay stable when a
+    /// stick is plugged in.
     pub fn probe_nth(n: usize) -> Option<Disk> {
         let mut idx = 0usize;
         macro_rules! scan {
@@ -39,6 +44,7 @@ impl Disk {
         scan!(VirtioBlk::probe_nth, Disk::Virtio);
         scan!(nvme::probe_nth, Disk::Nvme);
         scan!(ahci::probe_nth, Disk::Ahci);
+        scan!(UsbMsc::probe_nth, Disk::Usb);
         None
     }
 }
@@ -49,6 +55,7 @@ macro_rules! dispatch {
             Disk::Virtio(d) => d.$m($($a),*),
             Disk::Nvme(d) => d.$m($($a),*),
             Disk::Ahci(d) => d.$m($($a),*),
+            Disk::Usb(d) => d.$m($($a),*),
         }
     };
 }

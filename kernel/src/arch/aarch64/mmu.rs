@@ -5,7 +5,7 @@
 //! there -- so this must run before any NEON/cached work.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 #[repr(align(4096))]
 struct Table(#[allow(dead_code)] [u64; 512]);
@@ -44,6 +44,34 @@ const FALLBACK_RAM_END: u64 = 0x4000_0000 + (4 << 30);
 /// Max RAM regions carried in boot-info (matches the stub's table size).
 const MAX_REGIONS: usize = 16;
 
+/// The RAM extents [`init`] typed its identity map from, republished so
+/// [`crate::mm`] can build a frame allocator without re-parsing the boot path.
+/// An array of atomics rather than a `static mut`: `init` writes them with the
+/// MMU already on, and every reader runs later.
+static RAM_REGIONS: [(AtomicU64, AtomicU64); MAX_REGIONS] =
+    [const { (AtomicU64::new(0), AtomicU64::new(0)) }; MAX_REGIONS];
+static N_RAM_REGIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// The **free** extents the UEFI stub reported (`CONVENTIONAL` memory only) —
+/// a strictly different list from [`RAM_REGIONS`], which is every DRAM address
+/// including firmware-owned memory. Empty on the `-kernel` path and on an older
+/// stub that does not publish the field.
+static FREE_REGIONS: [(AtomicU64, AtomicU64); MAX_REGIONS] =
+    [const { (AtomicU64::new(0), AtomicU64::new(0)) }; MAX_REGIONS];
+static N_FREE_REGIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// The stub's GOP framebuffer `(base, bytes)`, 0 on the `-kernel` path. Read by
+/// `mm` so a framebuffer that happens to live in RAM is never handed out as a
+/// free frame (on the UEFI path it is usually an MMIO aperture instead, in which
+/// case reserving it is a harmless no-op).
+static FB_REGION: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+
+/// Whether a valid boot-info page was present, i.e. whether this is the
+/// UEFI/stub path. Distinguishes "no firmware, the whole machine is ours" from
+/// "firmware owns memory we cannot enumerate" — a distinction the frame
+/// allocator's safety depends on, and which `ram_end != 0` cannot make.
+static HAVE_BOOTINFO: AtomicBool = AtomicBool::new(false);
+
 /// What [`detect`] found: the usable top address, (UEFI only) the stub's
 /// pre-allocated heap and model regions, and the machine's actual RAM extents
 /// (`(base, size)` pairs; `n_regions == 0` when the boot path can't provide
@@ -54,6 +82,12 @@ struct RamInfo {
     uefi_model: (u64, u64),
     regions: [(u64, u64); MAX_REGIONS],
     n_regions: usize,
+    /// UEFI only: `CONVENTIONAL` extents (see [`FREE_REGIONS`]).
+    free: [(u64, u64); MAX_REGIONS],
+    n_free: usize,
+    /// UEFI only: the GOP framebuffer `(base, bytes)`.
+    fb: (u64, u64),
+    have_bootinfo: bool,
 }
 
 impl RamInfo {
@@ -67,7 +101,17 @@ impl RamInfo {
         self
     }
     fn bare(ram_end: u64, uefi_heap_base: u64, uefi_model: (u64, u64)) -> RamInfo {
-        RamInfo { ram_end, uefi_heap_base, uefi_model, regions: [(0, 0); MAX_REGIONS], n_regions: 0 }
+        RamInfo {
+            ram_end,
+            uefi_heap_base,
+            uefi_model,
+            regions: [(0, 0); MAX_REGIONS],
+            n_regions: 0,
+            free: [(0, 0); MAX_REGIONS],
+            n_free: 0,
+            fb: (0, 0),
+            have_bootinfo: false,
+        }
     }
 }
 
@@ -97,6 +141,7 @@ fn detect() -> RamInfo {
         // type them correctly. Absent on an older stub → n_regions 0 → the
         // legacy Normal-to-ram_end map.
         let mut info = RamInfo::bare(ram_end, hb, (mb, ms));
+        info.have_bootinfo = true;
         let bi = super::boot::boot_x1() as *const u8;
         // SAFETY: same validated CHITTIBI page bootinfo_regions just read.
         let rd = |off: usize| -> u64 {
@@ -111,6 +156,19 @@ fn detect() -> RamInfo {
             }
             info = info.with_regions(&regs[..n]);
         }
+        // Free (`CONVENTIONAL`) extents at 520/528.., and the GOP framebuffer at
+        // 8/24/32. Both are for the frame allocator, not the map: the free list
+        // is what it may hand out, the framebuffer is what it must not. Absent
+        // (count 0) on a stub older than the field — deliberately not inferred
+        // from the RAM extents, which include firmware-owned memory.
+        let nf = rd(520) as usize;
+        if nf > 0 && nf <= MAX_REGIONS {
+            for i in 0..nf {
+                info.free[i] = (rd(528 + i * 16), rd(528 + i * 16 + 8));
+            }
+            info.n_free = nf;
+        }
+        info.fb = (rd(8), rd(24).saturating_mul(rd(32)));
         return info;
     }
     // QEMU `-kernel`: no DTB in x0 under HVF and no stub, so read the RAM size the
@@ -217,6 +275,23 @@ pub fn init() {
     UEFI_MODEL_BASE.store(info.uefi_model.0, Ordering::Relaxed);
     UEFI_MODEL_SIZE.store(info.uefi_model.1, Ordering::Relaxed);
     MAPPED_BYTES.store(map_gib << 30, Ordering::Relaxed);
+    // Republish the extents the map was typed from, plus the boot path's free
+    // list and framebuffer, so `mm` can build a frame allocator without
+    // re-parsing the DTB / boot-info page (which `detect` may have read with the
+    // MMU off, and which the framebuffer's own GiB may no longer be mapped for).
+    HAVE_BOOTINFO.store(info.have_bootinfo, Ordering::Relaxed);
+    for (i, &(b, s)) in info.regions[..info.n_regions].iter().enumerate() {
+        RAM_REGIONS[i].0.store(b, Ordering::Relaxed);
+        RAM_REGIONS[i].1.store(s, Ordering::Relaxed);
+    }
+    N_RAM_REGIONS.store(info.n_regions, Ordering::Relaxed);
+    for (i, &(b, s)) in info.free[..info.n_free].iter().enumerate() {
+        FREE_REGIONS[i].0.store(b, Ordering::Relaxed);
+        FREE_REGIONS[i].1.store(s, Ordering::Relaxed);
+    }
+    N_FREE_REGIONS.store(info.n_free, Ordering::Relaxed);
+    FB_REGION.0.store(info.fb.0, Ordering::Relaxed);
+    FB_REGION.1.store(info.fb.1, Ordering::Relaxed);
     if l2_overflow {
         crate::ktrace::log("mmu", "too many mixed RAM/MMIO GiB blocks; some mapped Normal (raise MAX_L2)");
     }
@@ -268,6 +343,53 @@ pub fn uefi_model() -> Option<(usize, usize)> {
 /// the kernel may dereference (e.g. the framebuffer must lie below this).
 pub fn mapped_bytes() -> u64 {
     MAPPED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Copy up to `out.len()` published extents out of `src`, returning the count.
+fn load_regions(
+    src: &[(AtomicU64, AtomicU64); MAX_REGIONS],
+    n: &AtomicUsize,
+    out: &mut [(u64, u64); MAX_REGIONS],
+) -> usize {
+    let n = n.load(Ordering::Relaxed).min(MAX_REGIONS);
+    for (o, s) in out.iter_mut().zip(src.iter()).take(n) {
+        *o = (s.0.load(Ordering::Relaxed), s.1.load(Ordering::Relaxed));
+    }
+    n
+}
+
+/// The machine's DRAM extents, as the identity map was typed from them. Written
+/// into `out` (no heap: the first caller runs during `mm::init`); returns how
+/// many are valid.
+///
+/// **This is every DRAM address, not free memory.** On the UEFI path it includes
+/// firmware runtime data, ACPI tables, the loaded kernel and the stub's own
+/// allocations — all correctly DRAM, none of it allocatable. Use
+/// [`free_regions`] to decide what may be handed out.
+pub fn ram_regions(out: &mut [(u64, u64); MAX_REGIONS]) -> usize {
+    load_regions(&RAM_REGIONS, &N_RAM_REGIONS, out)
+}
+
+/// The extents the UEFI stub reported as **free** (`CONVENTIONAL`) memory — the
+/// aarch64 counterpart of x86's `MEMMAP_USABLE` entries. 0 on the `-kernel` path
+/// (no firmware to ask) and on a stub predating the field; a caller that gets 0
+/// on the UEFI path must not substitute [`ram_regions`].
+pub fn free_regions(out: &mut [(u64, u64); MAX_REGIONS]) -> usize {
+    load_regions(&FREE_REGIONS, &N_FREE_REGIONS, out)
+}
+
+/// The stub's GOP framebuffer `(base, bytes)`, or `None` outside the UEFI path.
+pub fn framebuffer_region() -> Option<(u64, u64)> {
+    let (b, s) = (FB_REGION.0.load(Ordering::Relaxed), FB_REGION.1.load(Ordering::Relaxed));
+    (b != 0 && s != 0).then_some((b, s))
+}
+
+/// Whether the kernel was entered through the UEFI stub (a valid boot-info page
+/// in x1) rather than a firmware-less `-kernel`/m1n1 handoff. The two differ in
+/// who owns physical memory, which is why this is reported separately from
+/// whether any *particular* boot-info field was present.
+pub fn have_bootinfo() -> bool {
+    HAVE_BOOTINFO.load(Ordering::Relaxed)
 }
 
 /// Add a 1 GiB **Device** identity mapping for the block containing `pa`, live.
@@ -332,6 +454,219 @@ pub fn map_ram_gib_if_unmapped(pa: u64) {
         *l1.add(idx) = normal_block((idx as u64) << 30);
         asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb", options(nostack));
     }
+}
+
+// --- 4 KiB page mapping over the boot identity map -----------------------
+
+/// The hardware's half of [`crate::mm::walk`]: barriers and TLB maintenance.
+/// The descriptor manipulation, block splitting and break-before-make ordering
+/// live there, arch-neutral, so the x86-only unit suite actually executes them.
+struct HwMmu;
+
+impl crate::mm::walk::Mmu for HwMmu {
+    // `table_ptr` is the default identity: this kernel runs VA == PA, so a
+    // table's physical address *is* where it is readable.
+
+    fn publish(&self) {
+        // SAFETY: a store barrier. The table walker's accesses are
+        // inner-shareable cacheable (see `enable_mmu`'s TCR), so they are
+        // coherent with these stores once ordered — no cache maintenance needed.
+        unsafe { asm!("dsb ishst", options(nostack, preserves_flags)) };
+    }
+
+    fn invalidate_page(&self, va: u64) {
+        // SAFETY: TLB maintenance is always architecturally safe. `vaae1is` is
+        // the by-address, all-ASID, EL1, **inner-shareable** form: the shareable
+        // domain is what makes the other cores drop the entry too, which the
+        // non-shareable `tlbi vmalle1` this file used to reach for does not do.
+        // The operand is the VA in units of 4 KiB pages, not bytes.
+        unsafe {
+            asm!("tlbi vaae1is, {}", "dsb ish", "isb", in(reg) va >> 12, options(nostack, preserves_flags));
+        }
+    }
+
+    fn invalidate_all(&self) {
+        // SAFETY: as above, for every entry — the scope a block split needs.
+        unsafe { asm!("tlbi vmalle1is", "dsb ish", "isb", options(nostack, preserves_flags)) };
+    }
+}
+
+/// The kernel's root (level 1) translation table, by physical address. This is
+/// the table `TTBR0_EL1` points at on every core.
+pub fn kernel_root() -> u64 {
+    core::ptr::addr_of!(L1) as u64
+}
+
+/// Map the 4 KiB page at `va` to `pa` with `attrs` (see [`crate::mm::armv8`]) in
+/// the live kernel translation table, taking intermediate tables from the
+/// physical frame allocator.
+///
+/// **Blocks are never split here.** The boot identity map is built from 1 GiB and
+/// 2 MiB blocks, and every one of them covers running code, the stack, the heap,
+/// or MMIO a driver is mid-transaction with — while a split leaves that whole
+/// range unmapped between the break and the make, for every core, not just this
+/// one. So a `va` already covered by a block is refused
+/// ([`crate::mm::walk::MapError::WouldSplitBlock`]) rather than silently
+/// risked; splitting is for a table the caller owns exclusively, which is what
+/// per-task address spaces will build.
+///
+/// In practice that costs nothing: the addresses a new mapping wants are the ones
+/// the boot map left *invalid*, where the walk allocates tables and no split
+/// arises.
+pub fn map_page(va: u64, pa: u64, attrs: u64) -> Result<(), crate::mm::walk::MapError> {
+    use crate::mm::walk::{self, MapError, Split};
+    // `Locked::with` runs with interrupts disabled, which is also what the walk
+    // needs: it must not be interrupted between a break and its make.
+    crate::mm::FRAME_ALLOCATOR.with(|slot| match slot.as_mut() {
+        // SAFETY: `kernel_root` is the live L1 table `TTBR0_EL1` uses, reachable
+        // at its physical address (VA == PA), and `Split::Refuse` keeps the walk
+        // from unmapping any range this core is running out of.
+        Some(alloc) => unsafe {
+            walk::map_page(&HwMmu, kernel_root(), va, pa, attrs, Split::Refuse, alloc)
+        },
+        None => Err(MapError::NoFrameAllocator),
+    })
+}
+
+/// Unmap the 4 KiB page at `va` from the live kernel table; `true` if something
+/// was mapped there. A `va` covered by a **block** is left alone (reported
+/// `false`) — see [`crate::mm::walk::unmap_page`].
+pub fn unmap_page(va: u64) -> bool {
+    // SAFETY: the live L1 table, reachable at its physical address.
+    crate::arch::interrupts::without_interrupts(|| unsafe {
+        crate::mm::walk::unmap_page(&HwMmu, kernel_root(), va)
+    })
+}
+
+/// The physical address `va` currently translates to, resolving blocks as well
+/// as pages — i.e. what the hardware walker would find. For diagnostics and for
+/// confirming a mapping took, rather than discovering it did not via a fault.
+pub fn translate(va: u64) -> Option<u64> {
+    // SAFETY: the live L1 table, reachable at its physical address.
+    unsafe { crate::mm::walk::translate(&HwMmu, kernel_root(), va) }
+}
+
+/// Build a fresh L1 table that **shares every kernel mapping** and has an empty
+/// user range, returning its physical address.
+///
+/// The aarch64 counterpart of x86's `new_root_sharing_kernel`, and the reason the
+/// kernel can have per-task address spaces without moving off VA == PA: the boot
+/// identity map is a set of L1 block/table descriptors covering
+/// `[0, mapped_bytes)`, so **copying those entries** gives a new root in which all
+/// kernel code, data, stacks and MMIO are still valid at the same addresses. The
+/// remaining entries — above the identity map, up to the 512 GiB the 39-bit VA
+/// covers — start empty and belong to the task.
+///
+/// Note the entries are copied, not shared through a table descriptor, so a
+/// *later* kernel mapping made with `map_device_gib`/`map_ram_gib_if_unmapped`
+/// will not appear in already-created spaces. That is acceptable while device
+/// discovery happens at boot, before any user space exists, and is the one thing
+/// to revisit if that stops being true.
+///
+/// # Safety
+/// `frame` must be an exclusively-owned, identity-mapped 4 KiB frame.
+pub unsafe fn new_root_sharing_kernel(frame: u64) -> u64 {
+    // SAFETY: `L1` is the live kernel root and `frame` is an owned 4 KiB table.
+    unsafe {
+        let src = core::ptr::addr_of!(L1) as *const u64;
+        let dst = frame as *mut u64;
+        for i in 0..crate::mm::armv8::ENTRIES {
+            dst.add(i).write(src.add(i).read());
+        }
+    }
+    frame
+}
+
+/// Switch `TTBR0_EL1` to the tree rooted at physical `root`.
+///
+/// # Safety
+/// `root` must map all currently-executing kernel code, data and the current
+/// stack — which [`new_root_sharing_kernel`] guarantees. The full TLB flush is
+/// the conservative choice: without ASIDs there is nothing finer to invalidate.
+pub unsafe fn activate_root(root: u64) {
+    // SAFETY: caller's contract; the standard EL1 address-space switch.
+    unsafe {
+        asm!(
+            "msr ttbr0_el1, {}",
+            "dsb ish",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            in(reg) root,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Prove the 4 KiB walker works on *this* machine, once, at boot.
+///
+/// [`crate::mm::walk`]'s logic is covered by the x86 unit suite, but its
+/// platform half is not: the `tlbi vaae1is` operand scaling, where the `dsb`s
+/// sit, and whether a fresh mapping is actually usable are properties of the
+/// hardware, and nothing else in the kernel calls [`map_page`] yet. So this maps
+/// a frame at an unused high virtual address, writes a pattern through the new
+/// mapping and reads it back, then unmaps it — the same posture as the SMP wake
+/// self-test, and for the same reason: a mapping facility that silently does not
+/// work is far worse than one that says so at boot.
+///
+/// The write is the load-bearing part. Installing a descriptor over a previously
+/// *invalid* entry needs no break-before-make, but the architecture does permit a
+/// cached faulting entry — so the store only lands if the invalidate after the
+/// make is right. A wrong `tlbi` operand shows up here as a fault or a stale
+/// read, not as a compile error.
+///
+/// Returns `Err` with a short reason instead of panicking; the caller ktraces it.
+pub fn walker_self_test() -> Result<(), &'static str> {
+    use crate::mm::armv8;
+    // The last gigabyte of the 39-bit VA space: past anything `init` mapped on
+    // any plausible machine, and checked for emptiness rather than assumed.
+    let va = (1u64 << armv8::VA_BITS) - (1 << 30);
+    if translate(va).is_some() {
+        return Err("test address is already mapped");
+    }
+    let phys = crate::mm::FRAME_ALLOCATOR
+        .with(|slot| slot.as_mut().and_then(|a| a.allocate()))
+        .ok_or("no frame to map")?;
+    let attrs = armv8::normal_attrs() | armv8::UXN | armv8::PXN;
+    let outcome = map_page(va, phys, attrs)
+        .map_err(|_| "map_page refused")
+        .and_then(|()| {
+            if translate(va) != Some(phys) {
+                return Err("mapping does not read back");
+            }
+            const PATTERN: u64 = 0x0123_4567_89ab_cdef;
+            // SAFETY: `va` was unmapped a moment ago and now maps `phys`, a
+            // freshly-allocated frame owned by nothing else. Volatile so the
+            // write and the read cannot be folded away.
+            let seen = unsafe {
+                core::ptr::write_volatile(va as *mut u64, PATTERN);
+                core::ptr::read_volatile(va as *const u64)
+            };
+            if seen != PATTERN {
+                return Err("write through the new mapping did not land");
+            }
+            // The same bytes must be visible at the frame's identity address —
+            // proof the mapping points where it claims rather than somewhere
+            // that merely happens to be writable.
+            // SAFETY: `phys` is an owned frame inside the identity map.
+            if unsafe { core::ptr::read_volatile(phys as *const u64) } != PATTERN {
+                return Err("the mapping does not alias the frame it names");
+            }
+            Ok(())
+        });
+    // Always tear down, whatever happened: leaving a stray high mapping (and a
+    // leaked frame) behind would be a worse legacy than a failed self-test.
+    let unmapped = unmap_page(va);
+    crate::mm::FRAME_ALLOCATOR.with(|slot| {
+        if let Some(a) = slot.as_mut() {
+            a.free(phys)
+        }
+    });
+    outcome?;
+    if !unmapped || translate(va).is_some() {
+        return Err("unmap did not clear the mapping");
+    }
+    Ok(())
 }
 
 /// Enable the MMU + caches on a secondary core, reusing the BSP's already-built

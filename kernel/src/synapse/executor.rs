@@ -19,7 +19,7 @@
 
 use super::grammar::{self, ArgValue, Call, GrammarError};
 use super::registry::{self, PrimitiveSpec};
-use super::{audit, fs};
+use super::{audit, fs, policy};
 use crate::agent::types::{CapDomain, Rights, Scope};
 use crate::cap::{self, Cap, ChannelId, Right};
 use crate::channel;
@@ -48,6 +48,10 @@ pub enum Invocation {
     /// The caller held the primitive but the concrete target (path/host/port)
     /// fell outside its granted scope (Gate 2.5). No primitive ran.
     DeniedScope { primitive: &'static str },
+    /// The policy requires a human to approve this exact call and none is on
+    /// record. No primitive ran. The caller may ask a human and retry; it cannot
+    /// assert approval itself.
+    NeedsApproval { primitive: &'static str },
 }
 
 /// Deterministic id source for `spawn_agent` requests. Real agent lifecycle
@@ -85,6 +89,33 @@ pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Just
         cap::record_denial(caller, spec.name);
         audit::record(caller, spec.name, args_hash, audit::Outcome::DeniedNoCapability, 0);
         return Invocation::Denied { primitive: spec.name };
+    }
+
+    // Consult policy once; `decide` consumes an approval when it uses one, so it
+    // must not be called twice for one invocation.
+    let policy_verdict = policy::decide(caller, spec.name, spec.effect.is_effectful(), justification.human_confirmed);
+
+    // **Approval check** — deliberately *not* one of the four gates. The four
+    // (grammar, capability, taint, scope) are the capability/provenance
+    // architecture; this is human policy layered over it, and conflating the two
+    // would renumber a chain that `paper/main.tex` publishes by number.
+    //
+    // It is here rather than in the tool layer because that layer is the thing
+    // being governed. `tools::permissions` and the approval modal were consulted
+    // only by the shell's tool dispatch, which suffices while every agent is
+    // kernel code reached through the shell and is nothing at all once an agent is
+    // a tenant that can call this function directly. See `synapse::policy`.
+    //
+    // Placed after the capability gate so "you may not do this at all" still wins
+    // over "a human must confirm this", and before the taint gate so an untrusted
+    // justification is refused outright rather than turned into a question.
+    if policy_verdict == policy::Verdict::NeedsApproval {
+        crate::ktrace::log_fmt(format_args!(
+            "synapse.policy: '{}' by task {caller} needs human approval",
+            spec.name
+        ));
+        audit::record(caller, spec.name, args_hash, audit::Outcome::NeedsApproval, 0);
+        return Invocation::NeedsApproval { primitive: spec.name };
     }
 
     // Gate 3: taint (Phase 6). A destructive primitive whose justification
@@ -147,6 +178,13 @@ pub const GATE_TAINT: u8 = 3;
 pub const GATE_SCOPE: u8 = 4;
 /// How many gates guard the boundary. Bumping this is the deliberate edit a new
 /// gate requires (see [`gate_prefix`]).
+///
+/// **This number is published.** `paper/main.tex` states "four gates in a fixed
+/// order", draws them, and prices them as cumulative prefixes 1, 1--2, 1--3,
+/// 1--4; the attack table cites "Gate 3 (taint)" and "Gate 4 (scope)" by number.
+/// Renumbering these silently invalidates a figure, a table and a measurement
+/// methodology, so `gate_numbering_is_the_published_contract` pins it — and a new
+/// *architectural* gate means updating the paper, not just this constant.
 pub const GATE_COUNT: u8 = 4;
 
 /// Run the first `upto` gates of the real chain and report the 1-based gate that
@@ -203,6 +241,35 @@ pub fn gate_prefix(caller: TaskId, raw: &str, justification: Justification, upto
     0
 }
 
+#[cfg(test)]
+mod gate_contract_tests {
+    use super::*;
+
+    #[test_case]
+    fn gate_numbering_is_the_published_contract() {
+        // `paper/main.tex` publishes these by number: a figure with four boxes,
+        // an attack table citing "Gate 3 (taint)" and "Gate 4 (scope)", and a cost
+        // methodology measuring cumulative prefixes 1, 1--2, 1--3, 1--4.
+        // Renumbering them invalidates a figure, a table and a measurement — so a
+        // new *architectural* gate is a paper edit, not just a constant bump.
+        //
+        // This is not hypothetical: adding the approval check as "Gate 2.75"
+        // renumbered taint to 4 and scope to 5, which `synapse::bench`'s own test
+        // caught. The approval check is therefore layered over the chain rather
+        // than numbered into it, and `gate_of_outcome` reports it as no gate.
+        assert_eq!(GATE_GRAMMAR, 1);
+        assert_eq!(GATE_CAPABILITY, 2);
+        assert_eq!(GATE_TAINT, 3);
+        assert_eq!(GATE_SCOPE, 4);
+        assert_eq!(GATE_COUNT, 4, "four gates: see paper/main.tex");
+        assert_eq!(
+            gate_of_outcome(&Invocation::NeedsApproval { primitive: "x" }),
+            0,
+            "the approval check is not one of the four gates"
+        );
+    }
+}
+
 /// The gate an [`Invocation`] outcome says refused the call — the inverse of
 /// [`gate_prefix`]'s return value, and the mapping the equivalence test uses.
 pub fn gate_of_outcome(inv: &Invocation) -> u8 {
@@ -211,6 +278,10 @@ pub fn gate_of_outcome(inv: &Invocation) -> u8 {
         Invocation::Denied { .. } => GATE_CAPABILITY,
         Invocation::RefusedTainted { .. } => GATE_TAINT,
         Invocation::DeniedScope { .. } => GATE_SCOPE,
+        // Not one of the four gates: the approval check is human policy layered
+        // over the chain, not part of the capability/provenance architecture the
+        // paper measures. Reported as "no gate refused" because none did.
+        Invocation::NeedsApproval { .. } => 0,
         Invocation::Executed { .. } => 0,
     }
 }

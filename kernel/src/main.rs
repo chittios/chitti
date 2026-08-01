@@ -24,6 +24,11 @@ fn run_os() -> ! {
     chitti_kernel::tools::permissions::load();
     // External messaging channels (Telegram, …) — load after the store is up.
     chitti_kernel::msgchan::load();
+    // The pump/idle task, before the shell takes over: it is what lets a waiting
+    // task actually sleep instead of pumping `upkeep()` itself. Inert until
+    // something blocks (it is reached only via the scheduler's empty-queue
+    // fallback), so the boot path is unchanged for every task that stays runnable.
+    chitti_kernel::shell::start_pump();
     chitti_kernel::shell::run();
 }
 
@@ -525,57 +530,135 @@ fn bootinfo_ram_bytes() -> Option<u64> {
 }
 
 /// Point `synapse::fs` at an ext4 *data* partition so agent writes are durable
-/// across reboots (the installed system). Chooses an ext4 volume that does NOT
-/// hold the model (`*.gguf`), so it never adopts the model/OS partition. No-op
-/// on the live ISO, or if there's no writable ext4 data volume. Arch-generic:
-/// the disk is `block::probe_disk()` (virtio-blk over PCI on x86, over
-/// virtio-mmio on aarch64).
+/// across reboots (the installed system).
+///
+/// **Memfs is only for the live ISO/image.** When a `Chitti Data` (or other
+/// data) volume is present — the permanent-disk case after `/install` — this
+/// *must* adopt Ext4Store. Uses the same finder as VFS auto-mount so the two
+/// never disagree.
 fn mount_persistent_store() {
-    use chitti_kernel::block::ext4_read::Ext4Reader;
     use chitti_kernel::block::ext4_store::Ext4Store;
+    use chitti_kernel::block::volcrypto;
+    use chitti_kernel::block::BlockDevice;
     use chitti_kernel::block::Partition;
-    use chitti_kernel::fs::detect::FsType;
 
-    let Some(mut dev) = chitti_kernel::block::probe_disk() else { return };
-    let vols = chitti_kernel::fs::detect::probe(&mut dev);
-    let mut chosen: Option<(u64, u64)> = None;
-    for v in vols {
-        if !matches!(v.fs, FsType::Ext2 | FsType::Ext3 | FsType::Ext4) {
-            continue;
-        }
-        let mut part = Partition::new(&mut dev, v.start_lba, v.sectors);
-        if let Some(mut r) = Ext4Reader::open(&mut part) {
-            // The data partition is the ext4 that holds neither the model
-            // (*.gguf) nor the boot/OS files (kernel, limine.conf) — so agent
-            // state never lands on the model/OS partition even when the model
-            // is absent (e.g. a --no-model install).
-            let is_os_or_model = r.list_root().iter().any(|(n, _, _)| n.contains(".gguf") || n == "chitti-kernel" || n == "limine.conf");
-            if !is_os_or_model {
-                chosen = Some((v.start_lba, v.sectors));
-                break;
-            }
-        }
+    // Inventory every disk (helps diagnose empty /disks after install).
+    let mut disks_seen = 0usize;
+    for disk in 0..16usize {
+        let Some(dev) = chitti_kernel::block::probe_disk_nth(disk) else {
+            break;
+        };
+        disks_seen += 1;
+        let sectors = dev.block_count();
+        serial_println!(
+            "Chitti: disk {}: {} sectors ({} MiB)",
+            disk,
+            sectors,
+            sectors * 512 / 1024 / 1024
+        );
     }
-    let Some((start, count)) = chosen else {
-        serial_println!("Chitti: synapse persistence -> none (no ext4 data partition; state is in-memory only)");
+
+    if disks_seen == 0 {
+        serial_println!(
+            "Chitti: no block device — live ISO/image mode; synapse store is memfs (not durable)"
+        );
+        return;
+    }
+
+    let Some(v) = chitti_kernel::fs::mount::find_data_volume() else {
+        serial_println!(
+            "Chitti: synapse persistence -> memfs (scanned {} disk(s); no data partition — ISO/image only)",
+            disks_seen
+        );
         return;
     };
-    if let Some(store) = Ext4Store::mount(dev, start, count) {
+
+    if v.named {
+        serial_println!(
+            "Chitti: found GPT 'Chitti Data' on disk {} lba {} ({} MiB{})",
+            v.disk,
+            v.start_lba,
+            v.sectors * 512 / 1024 / 1024,
+            if v.encrypted { ", encrypted" } else { "" }
+        );
+    }
+
+    let disk = v.disk;
+    let start = v.start_lba;
+    let count = v.sectors;
+    let encrypted = v.encrypted;
+
+    let store = if encrypted {
+        serial_println!(
+            "Chitti: encrypted data partition on disk {} at lba {start} — unlock required",
+            disk
+        );
+        let pass = chitti_kernel::modal::input("Unlock data volume", "Passphrase:", true);
+        if pass.is_empty() {
+            serial_println!(
+                "Chitti: unlock cancelled; refusing memfs on a persistence disk — store unmounted"
+            );
+            return;
+        }
+        let Some(mut dev) = chitti_kernel::block::probe_disk_nth(disk) else {
+            serial_println!("Chitti: disk {disk} disappeared during unlock");
+            return;
+        };
+        let mut part = Partition::new(&mut dev, start, count);
+        match volcrypto::unlock(&mut part, pass.as_bytes()) {
+            Ok((key, hdr)) => {
+                serial_println!(
+                    "Chitti: volume unlocked (hdr={} sectors)",
+                    hdr.hdr_sectors
+                );
+                drop(dev);
+                Ext4Store::mount_encrypted(disk, start, count, key, hdr.hdr_sectors)
+            }
+            Err(_) => {
+                serial_println!(
+                    "Chitti: wrong passphrase or corrupt header; refusing memfs on a persistence disk"
+                );
+                return;
+            }
+        }
+    } else {
+        Ext4Store::mount(disk, start, count)
+    };
+
+    if let Some(store) = store {
         chitti_kernel::synapse::fs::mount_ext4(store);
-        serial_println!("Chitti: synapse persistence -> ext4 data partition at lba {} ({} sectors); writes are durable", start, count);
-        // Prove the round-trip: a boot counter written *through synapse::fs*.
-        // It only increments if the previous boot's write was recovered from
-        // ext4 on mount — i.e. runtime writes truly persisted across the reboot.
+        serial_println!(
+            "Chitti: synapse persistence -> ext4 disk {} lba {} ({} sectors{}); NOT memfs",
+            disk,
+            start,
+            count,
+            if encrypted { ", encrypted" } else { "" }
+        );
         let prior = chitti_kernel::synapse::fs::read("synapse_boots")
-            .and_then(|b| core::str::from_utf8(&b).ok().and_then(|s| s.trim().parse::<u32>().ok()))
+            .and_then(|b| {
+                core::str::from_utf8(&b)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+            })
             .unwrap_or(0);
         let boots = prior + 1;
         let mut buf = [0u8; 12];
         chitti_kernel::synapse::fs::write("synapse_boots", fmt_u32(boots, &mut buf).as_bytes());
-        serial_println!("Chitti: synapse.fs boot #{} (persisted via ext4); files = {:?}", boots, chitti_kernel::synapse::fs::list());
+        serial_println!(
+            "Chitti: synapse.fs boot #{} (backend={}); durable files survive reboot",
+            boots,
+            chitti_kernel::synapse::fs::backend_name()
+        );
         if prior > 0 {
-            serial_println!("Chitti: synapse.fs (the counter survived a reboot -- agent writes persist on ext4)");
+            serial_println!(
+                "Chitti: synapse.fs (boot counter survived reboot — agent writes persist on ext4)"
+            );
         }
+    } else {
+        // Data volume *exists* but would not open — still must not silently use memfs.
+        serial_println!(
+            "Chitti: ERROR: data volume on disk {disk} lba {start} would not open — store left unmounted (not memfs)"
+        );
     }
 }
 

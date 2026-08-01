@@ -21,6 +21,96 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// Soft metadata for store keys (mtime / owner). Not a security boundary —
+/// Synapse path scope is. Absent means "never written under tracked meta"
+/// (defaults: uid 0, mode 0o644, mtime 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileMeta {
+    pub uid: u32,
+    pub mode: u16,
+    pub mtime: u32,
+    pub ctime: u32,
+}
+
+impl Default for FileMeta {
+    fn default() -> Self {
+        FileMeta {
+            uid: 0,
+            mode: 0o644,
+            mtime: 0,
+            ctime: 0,
+        }
+    }
+}
+
+static META: Locked<BTreeMap<String, FileMeta>> = Locked::new(BTreeMap::new());
+
+fn wall_secs() -> u32 {
+    let t = crate::clock::now_unix();
+    if t < 0 {
+        0
+    } else {
+        t as u32
+    }
+}
+
+fn touch_meta(path: &str) {
+    let key = vpath::normalize(path);
+    META.with(|m| {
+        let mut meta = m.get(&key).copied().unwrap_or_default();
+        let t = wall_secs();
+        meta.mtime = t;
+        meta.ctime = t;
+        if meta.mode == 0 {
+            meta.mode = 0o644;
+        }
+        m.insert(key, meta);
+    });
+}
+
+fn drop_meta(path: &str) {
+    let key = vpath::normalize(path);
+    META.with(|m| {
+        m.remove(&key);
+    });
+}
+
+/// Metadata for a store key, if recorded.
+pub fn meta(path: &str) -> Option<FileMeta> {
+    let key = vpath::normalize(path);
+    META.with(|m| m.get(&key).copied())
+}
+
+/// Set owner (agent id). Cosmetic — does not grant authority.
+pub fn chown(path: &str, uid: u32) -> Result<(), &'static str> {
+    let key = vpath::normalize(path);
+    if !exists(&key) {
+        return Err("no such file");
+    }
+    META.with(|m| {
+        let mut meta = m.get(&key).copied().unwrap_or_default();
+        meta.uid = uid;
+        meta.ctime = wall_secs();
+        m.insert(key, meta);
+    });
+    Ok(())
+}
+
+/// Set permission bits (low 12). Cosmetic for listings.
+pub fn chmod(path: &str, mode_bits: u16) -> Result<(), &'static str> {
+    let key = vpath::normalize(path);
+    if !exists(&key) {
+        return Err("no such file");
+    }
+    META.with(|m| {
+        let mut meta = m.get(&key).copied().unwrap_or_default();
+        meta.mode = mode_bits & 0x0fff;
+        meta.ctime = wall_secs();
+        m.insert(key, meta);
+    });
+    Ok(())
+}
+
 /// The store backend. The default is a pure in-memory map — deterministic, used
 /// by the test suite and the live (non-installed) ISO where nothing persists.
 /// On an installed system, [`mount_ext4`] swaps in an `Ext4Store` so every agent
@@ -97,13 +187,30 @@ pub fn mount_ext4(mut store: crate::block::ext4_store::Ext4Store) {
     });
 }
 
+/// Whether agent writes go to the ext4 data partition (survives reboot).
+///
+/// `false` only on the live ISO/image (or when the data volume failed to open)
+/// where the backend is pure memfs. On an installed permanent disk this must
+/// be `true` after [`mount_ext4`].
+pub fn is_durable() -> bool {
+    STORE.with(|b| matches!(b, Backend::Ext4(_)))
+}
+
+/// Human label for the current store backend (`"ext4"` or `"memfs"`).
+pub fn backend_name() -> &'static str {
+    if is_durable() {
+        "ext4"
+    } else {
+        "memfs"
+    }
+}
+
 /// Batch a group of writes into a single on-disk flush.
 ///
-/// The ext4 backend's sync **re-formats the partition and rewrites every file**, so
-/// one write per file is quadratic in total bytes. Installing the boot agent roster
-/// (~120 files, several MB with the wasm assets) that way took minutes on a real
-/// disk and was invisible in testing, because a diskless guest keeps everything in
-/// memory. Anything writing many files in one go should wrap the group.
+/// The ext4 backend applies mutations through live RW (or, on fallback, one full
+/// format). Installing the boot agent roster (~120 files) without a batch still
+/// works but costs one disk round-trip per file; wrapping the group is one flush.
+/// Anything writing many files in one go should still batch.
 ///
 /// Reads inside a batch are correct — the backend serves them from its
 /// authoritative in-memory cache; only the on-disk copy lags until [`end_batch`].
@@ -129,10 +236,11 @@ pub fn write(path: &str, contents: &[u8]) {
     let path = vpath::normalize(path);
     STORE.with(|b| match b {
         Backend::Memory(s) => {
-            s.insert(path, contents.to_vec());
+            s.insert(path.clone(), contents.to_vec());
         }
         Backend::Ext4(s) => s.write(&path, contents),
     });
+    touch_meta(&path);
 }
 
 /// Read the file at `path`, or `None` if it does not exist.
@@ -170,6 +278,7 @@ pub fn delete(path: &str) -> bool {
     // file created at the same path inherit the deleted one's taint, which
     // reads as a laundering defence and is really just a stale key.
     TAINT.with(|m| m.remove(&path));
+    drop_meta(&path);
     STORE.with(|b| match b {
         Backend::Memory(s) => s.remove(&path).is_some(),
         Backend::Ext4(s) => s.delete(&path),
@@ -377,7 +486,14 @@ pub fn rename(src: &str, dst: &str) -> Result<usize, &'static str> {
                     mkdir(&p, true)?;
                 }
             }
+            // Preserve soft meta across the rename when possible.
+            let old_meta = meta(&src);
             write(&dst, &data);
+            if let Some(m) = old_meta {
+                META.with(|map| {
+                    map.insert(dst.clone(), m);
+                });
+            }
             delete(&src);
             Ok(1)
         }
@@ -398,13 +514,19 @@ pub fn rename(src: &str, dst: &str) -> Result<usize, &'static str> {
             if pairs.is_empty() {
                 mkdir(&dst, true)?;
             }
-            for (_, data, mapped) in &pairs {
+            for (k, data, mapped) in &pairs {
                 if let Some(p) = vpath::parent(mapped) {
                     if p != "/" && classify(&p).is_none() {
                         let _ = mkdir(&p, true);
                     }
                 }
+                let old_meta = meta(k);
                 write(mapped, data);
+                if let Some(m) = old_meta {
+                    META.with(|map| {
+                        map.insert(mapped.clone(), m);
+                    });
+                }
                 n += 1;
             }
             for (k, _, _) in &pairs {

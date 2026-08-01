@@ -17,6 +17,7 @@
 //! flows down through Synapse (locked invariant #1).
 
 pub mod agent_loop;
+pub mod task;
 pub mod compiled;
 pub mod context;
 pub mod home;
