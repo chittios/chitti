@@ -187,6 +187,24 @@ pub fn mount_ext4(mut store: crate::block::ext4_store::Ext4Store) {
     });
 }
 
+/// Whether agent writes go to the ext4 data partition (survives reboot).
+///
+/// `false` only on the live ISO/image (or when the data volume failed to open)
+/// where the backend is pure memfs. On an installed permanent disk this must
+/// be `true` after [`mount_ext4`].
+pub fn is_durable() -> bool {
+    STORE.with(|b| matches!(b, Backend::Ext4(_)))
+}
+
+/// Human label for the current store backend (`"ext4"` or `"memfs"`).
+pub fn backend_name() -> &'static str {
+    if is_durable() {
+        "ext4"
+    } else {
+        "memfs"
+    }
+}
+
 /// Batch a group of writes into a single on-disk flush.
 ///
 /// The ext4 backend applies mutations through live RW (or, on fallback, one full

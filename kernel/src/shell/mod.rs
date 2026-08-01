@@ -133,12 +133,23 @@ pub fn run() -> ! {
     crate::font_ttf::register_bundled_fallbacks();
     if let Some(mt) = crate::fs::mount::auto_mount_data_root() {
         serial_println!(
-            "Chitti: mounted / -> disk {} ({}, {} MiB) [auto]",
+            "Chitti: mounted / -> disk {} ({}, {} MiB, {}) [auto]",
             mt.disk,
             mt.fs.name(),
-            mt.sectors * 512 / 1024 / 1024
+            mt.sectors * 512 / 1024 / 1024,
+            if mt.writable { "rw" } else { "ro" }
         );
     }
+    // On a permanent disk the store must be ext4, never silent memfs.
+    serial_println!(
+        "Chitti: synapse store backend = {}{}",
+        crate::synapse::fs::backend_name(),
+        if crate::synapse::fs::is_durable() {
+            " (writes survive reboot)"
+        } else {
+            " (live ISO/image only — install + reboot for durable state)"
+        }
+    );
     // NB: the large CJK fallback font is loaded **lazily** (first browser use),
     // never at boot — reading it is fine now (idempotent probe + bounded FAT
     // walk), but *parsing* a 16 MB CFF font through fontdue churns the first-fit
@@ -13569,15 +13580,20 @@ fn disk_unlock(arg: &str) {
         serial_println!("unlock> no volume {vol}");
         return;
     };
-    let mut part = Partition::new(&mut dev, v.start_lba, v.sectors);
-    let (key, hdr) = match volcrypto::unlock(&mut part, pass.as_bytes()) {
-        Ok(x) => x,
-        Err(_) => {
-            serial_println!("unlock> wrong passphrase or not a C4VE volume");
-            return;
+    let start = v.start_lba;
+    let count = v.sectors;
+    let (key, hdr) = {
+        let mut part = Partition::new(&mut dev, start, count);
+        match volcrypto::unlock(&mut part, pass.as_bytes()) {
+            Ok(x) => x,
+            Err(_) => {
+                serial_println!("unlock> wrong passphrase or not a C4VE volume");
+                return;
+            }
         }
     };
-    match Ext4Store::mount_encrypted(dev, v.start_lba, v.sectors, key, hdr.hdr_sectors) {
+    drop(dev); // free the handle so mount can re-probe the same disk
+    match Ext4Store::mount_encrypted(disk, start, count, key, hdr.hdr_sectors) {
         Some(store) => {
             crate::synapse::fs::mount_ext4(store);
             serial_println!(
@@ -13665,10 +13681,27 @@ fn fs_ls(arg: &str) {
 
     match store::classify(&path) {
         None => {
-            if crate::fs::vfs::read_mount(&path).is_ok() {
-                serial_println!("ls> {}: is a file (use /cat)", path);
-            } else {
-                serial_println!("ls> {}: no such file or directory", path);
+            // Store miss: try foreign-mount VFS (USB /mnt/…), then file read.
+            match crate::fs::vfs::readdir(&path) {
+                Ok(entries) if path_on_mount(&path) || crate::fs::mount::resolve(&path).is_some() => {
+                    serial_println!("ls> {}  ({} entries)", path, entries.len());
+                    for e in entries.into_iter().take(64) {
+                        if e.is_dir {
+                            serial_println!("  {}/", e.name);
+                        } else if e.size > 0 {
+                            serial_println!("  {} ({} bytes)", e.name, e.size);
+                        } else {
+                            serial_println!("  {}", e.name);
+                        }
+                    }
+                }
+                _ => {
+                    if crate::fs::vfs::read_mount(&path).is_ok() {
+                        serial_println!("ls> {}: is a file (use /cat)", path);
+                    } else {
+                        serial_println!("ls> {}: no such file or directory", path);
+                    }
+                }
             }
         }
         Some(EntryClass::File) => {
@@ -13777,9 +13810,19 @@ fn fs_glob(arg: &str) {
     }
 }
 
-/// True when `path` resolves to a mounted volume (not only the Synapse store).
+/// True when `path` is on a **foreign** mount (`/mnt`, USB, second disk), so
+/// shell FS ops should use raw VFS instead of the synapse store.
+///
+/// The auto-mounted data volume at `/` is **not** treated as a foreign mount:
+/// it is the durable synapse store itself. Routing `/mkdir /test` through VFS
+/// wrote an ext4 dir on disk that `/ls` (store view) never saw — the 01_30
+/// VirtualBox screenshot. Those paths stay on `synapse::fs` so they list and
+/// persist via Ext4Store.
 fn path_on_mount(path: &str) -> bool {
-    crate::fs::mount::resolve(path).is_some()
+    let Some((mt, _rel)) = crate::fs::mount::resolve(path) else {
+        return false;
+    };
+    mt.path != "/"
 }
 
 fn vfs_err_msg(op: &str, path: &str, e: crate::fs::vfs::VfsError) {
@@ -14371,10 +14414,18 @@ fn disk_list() {
         }
     }
     if found == 0 {
-        serial_println!("disks> no block device (boot with a -drive)");
+        serial_println!(
+            "disks> no block device found\n\
+             disks>   expected: NVMe (VirtualBox default), AHCI/SATA, or virtio-blk\n\
+             disks>   after /install: reboot from the permanent disk alone — data is\n\
+             disks>   on the 'Chitti Data' GPT partition and mounts at boot"
+        );
         return;
     }
-    serial_println!("  ({} disk(s); /ls <n> reads a volume on disk 0; foreign filesystems are read-only)", found);
+    serial_println!(
+        "  ({} disk(s); /mount <disk> [vol] [/path]; data partition auto-mounts as synapse store)",
+        found
+    );
 }
 
 /// List volume `n` on disk 0 (on-disk root; for debugging real FAT/ext4 layouts).
@@ -14662,7 +14713,18 @@ fn disk_install(arg: &str) {
         serial_println!("install> installer payload missing (BOOTX64.EFI / kernel modules) -- build the ISO with xtask");
         return;
     };
-    let target_idx = target_override.unwrap_or(0);
+    // Default target: with 2+ disks, prefer disk 1 (the permanent second drive)
+    // over disk 0 (usually the boot/install image). Explicit `/install N` wins.
+    let target_idx = target_override.unwrap_or_else(|| {
+        if crate::block::probe_disk_nth(1).is_some() {
+            serial_println!(
+                "install> multiple disks present — defaulting to disk 1 (use /install 0 to target the boot disk)"
+            );
+            1
+        } else {
+            0
+        }
+    });
     let Some(mut dev) = crate::block::probe_disk_nth(target_idx) else {
         serial_println!("install> no disk {} (see /disks; boot with a -drive)", target_idx);
         return;

@@ -187,16 +187,23 @@ fn read_on_volume(mt: &MountEntry, rel: &str) -> Result<Vec<u8>, VfsError> {
 /// [`crate::synapse::fs::write`].
 pub fn write(path: &str, data: &[u8]) -> Result<(), VfsError> {
     let path = path::normalize(path);
-    // Prefer store if the key already exists or is under agent homes.
+    // Prefer store if the key already exists or is under agent homes, or if
+    // the path lives on the auto-mounted data root (same volume as Ext4Store).
     if crate::synapse::fs::exists(&path)
         || path.starts_with("/agent/")
         || path.starts_with("/configs/")
         || path.starts_with("/sessions/")
+        || path.starts_with("/skills/")
+        || path.starts_with("/downloads/")
     {
         crate::synapse::fs::write(&path, data);
         return Ok(());
     }
     let (mt, rel) = mount::resolve(&path).ok_or(VfsError::NotMounted)?;
+    if mt.path == "/" {
+        crate::synapse::fs::write(&path, data);
+        return Ok(());
+    }
     if rel.is_empty() {
         return Err(VfsError::NotAFile);
     }
@@ -225,12 +232,24 @@ pub fn write(path: &str, data: &[u8]) -> Result<(), VfsError> {
 }
 
 /// Create a directory on a writable mount.
+///
+/// Paths under the auto-mounted data root (`/`) go through the durable
+/// synapse store (not raw Ext4Rw), so they appear in `/ls` and stay in the
+/// Ext4Store cache. Foreign mounts (`/mnt…`) use the volume writer.
 pub fn mkdir(path: &str) -> Result<(), VfsError> {
     let path = path::normalize(path);
-    if path.starts_with("/agent/") || path.starts_with("/configs/") {
+    if path.starts_with("/agent/")
+        || path.starts_with("/configs/")
+        || path.starts_with("/sessions/")
+        || path.starts_with("/skills/")
+    {
         return crate::synapse::fs::mkdir(&path, true).map_err(|_| VfsError::Io);
     }
     let (mt, rel) = mount::resolve(&path).ok_or(VfsError::NotMounted)?;
+    // Data volume at `/` == synapse store. Always create via store markers.
+    if mt.path == "/" {
+        return crate::synapse::fs::mkdir(&path, true).map_err(|_| VfsError::Io);
+    }
     if rel.is_empty() {
         return Ok(());
     }

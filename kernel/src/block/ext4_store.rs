@@ -85,7 +85,12 @@ fn canon_key(path: &str) -> String {
 }
 
 pub struct Ext4Store {
-    dev: DiskDevice,
+    /// Global disk index ([`crate::block::probe_disk_nth`]), re-opened on each
+    /// sync. Holding a live [`DiskDevice`] monopolised AHCI ports and left
+    /// `/disks` empty after the boot mount (re-bringup of the same port failed
+    /// or corrupted the store's DMA). NVMe is already a shared controller; the
+    /// index model is correct for every transport.
+    disk: usize,
     start: u64,
     count: u64,
     crypto: Option<CryptoState>,
@@ -104,33 +109,39 @@ pub struct Ext4Store {
 }
 
 impl Ext4Store {
-    /// Mount a plain (unencrypted) ext4 data partition.
-    pub fn mount(dev: DiskDevice, start: u64, count: u64) -> Option<Ext4Store> {
-        Self::mount_inner(dev, start, count, None)
+    /// Mount a plain (unencrypted) ext4 data partition on global disk `disk`.
+    pub fn mount(disk: usize, start: u64, count: u64) -> Option<Ext4Store> {
+        Self::mount_inner(disk, start, count, None)
     }
 
     /// Mount a C4VE-encrypted ext4 payload (after successful [`crate::block::volcrypto::unlock`]).
     pub fn mount_encrypted(
-        dev: DiskDevice,
+        disk: usize,
         start: u64,
         count: u64,
         key: [u8; 32],
         hdr_sectors: u64,
     ) -> Option<Ext4Store> {
-        Self::mount_inner(dev, start, count, Some(CryptoState { key, hdr_sectors }))
+        Self::mount_inner(disk, start, count, Some(CryptoState { key, hdr_sectors }))
     }
 
     fn mount_inner(
-        mut dev: DiskDevice,
+        disk: usize,
         start: u64,
         count: u64,
         crypto: Option<CryptoState>,
     ) -> Option<Ext4Store> {
+        let mut dev = crate::block::probe_disk_nth(disk)?;
         let mut cache = BTreeMap::new();
+        let mut opened = false;
         {
             let mut part = Self::open_part(&mut dev, start, count, crypto);
             // Live volume: migrate legacy `%2F` root names, then walk the tree.
+            // An empty freshly-formatted data partition is a successful open —
+            // do NOT require Ext4Reader after this (it used to fail-close empty
+            // volumes into memfs with `?` on the RO reader).
             if let Ok(mut vol) = Ext4Rw::open(&mut part) {
+                opened = true;
                 if let Ok(root) = vol.readdir("/") {
                     for (name, is_dir) in root {
                         if is_dir {
@@ -162,10 +173,11 @@ impl Ext4Store {
                     }
                 }
             }
-            // Fallback / supplement: flat root via the RO reader.
-            if cache.is_empty() {
+            // Fallback when Ext4Rw cannot open (foreign geometry): flat RO walk.
+            if !opened {
                 let mut part = Self::open_part(&mut dev, start, count, crypto);
                 let mut r = Ext4Reader::open(&mut part)?;
+                opened = true;
                 for (name, _ino, is_dir) in r.list_root() {
                     if is_dir {
                         continue;
@@ -179,13 +191,22 @@ impl Ext4Store {
                 }
             }
         }
+        if !opened {
+            return None;
+        }
+        // Drop `dev` before returning so later `/disks` / VFS probes can open
+        // the same controller without fighting a held AHCI port.
+        drop(dev);
         crate::ktrace::log_fmt(format_args!(
-            "ext4_store: mounted ext4 data partition, {} file(s) recovered{}",
+            "ext4_store: mounted disk {} lba {} ({} sectors), {} file(s) recovered{}",
+            disk,
+            start,
+            count,
             cache.len(),
             if crypto.is_some() { " (encrypted)" } else { "" }
         ));
         Some(Ext4Store {
-            dev,
+            disk,
             start,
             count,
             crypto,
@@ -210,8 +231,11 @@ impl Ext4Store {
         }
     }
 
-    fn part(&mut self) -> CryptoPart<'_, DiskDevice> {
-        Self::open_part(&mut self.dev, self.start, self.count, self.crypto)
+    /// Open the data partition on a freshly probed disk for one sync pass.
+    fn with_part<R>(&mut self, f: impl FnOnce(&mut CryptoPart<'_, DiskDevice>) -> R) -> Option<R> {
+        let mut dev = crate::block::probe_disk_nth(self.disk)?;
+        let mut part = Self::open_part(&mut dev, self.start, self.count, self.crypto);
+        Some(f(&mut part))
     }
 
     /// Persist pending mutations. Prefers live RW; falls back to same-size
@@ -239,38 +263,49 @@ impl Ext4Store {
             .iter()
             .filter_map(|name| self.cache.get(name).map(|d| (name.clone(), d.clone())))
             .collect();
-        let mut part = self.part();
-        let mut vol = match Ext4Rw::open(&mut part) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::ktrace::log_fmt(format_args!(
-                    "ext4_store: live RW open failed ({e:?}); trying fallbacks"
-                ));
-                return false;
-            }
-        };
-        for name in &deleted {
-            // Hierarchical path (current) and percent-encoded root name (legacy).
-            if let Err(e) = vol.unlink(name) {
-                if e != crate::block::ext4_rw::Ext4RwError::NotFound {
+        let deleted_c = deleted.clone();
+        let ok = self.with_part(|part| {
+            let mut vol = match Ext4Rw::open(part) {
+                Ok(v) => v,
+                Err(e) => {
                     crate::ktrace::log_fmt(format_args!(
-                        "ext4_store: live unlink {name}: {e:?}"
+                        "ext4_store: live RW open failed ({e:?}); trying fallbacks"
+                    ));
+                    return false;
+                }
+            };
+            for name in &deleted_c {
+                if let Err(e) = vol.unlink(name) {
+                    if e != crate::block::ext4_rw::Ext4RwError::NotFound {
+                        crate::ktrace::log_fmt(format_args!(
+                            "ext4_store: live unlink {name}: {e:?}"
+                        ));
+                        return false;
+                    }
+                }
+                let enc = key_encode(name);
+                if enc != *name {
+                    let _ = vol.unlink(&enc);
+                }
+            }
+            for (name, data) in &writes {
+                if let Err(e) = vol.write(name, data) {
+                    crate::ktrace::log_fmt(format_args!(
+                        "ext4_store: live write {name}: {e:?} -- falling back"
                     ));
                     return false;
                 }
             }
-            let enc = key_encode(name);
-            if enc != *name {
-                let _ = vol.unlink(&enc);
-            }
-        }
-        for (name, data) in &writes {
-            if let Err(e) = vol.write(name, data) {
+            true
+        });
+        if ok != Some(true) {
+            if ok.is_none() {
                 crate::ktrace::log_fmt(format_args!(
-                    "ext4_store: live write {name}: {e:?} -- falling back"
+                    "ext4_store: disk {} gone during live sync",
+                    self.disk
                 ));
-                return false;
             }
+            return false;
         }
         self.changed.clear();
         self.deleted.clear();
@@ -309,13 +344,25 @@ impl Ext4Store {
             };
             let data = data.clone();
             let blocks = blocks.to_vec();
-            let mut part = self.part();
-            if let Err(e) = crate::block::ext4::write_file_blocks(&mut part, &blocks, &data) {
-                crate::ktrace::log_fmt(format_args!(
-                    "ext4_store: incremental write failed: {:?} -- falling back to a full format",
-                    e
-                ));
-                return false;
+            let wrote = self.with_part(|part| {
+                crate::block::ext4::write_file_blocks(part, &blocks, &data)
+            });
+            match wrote {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    crate::ktrace::log_fmt(format_args!(
+                        "ext4_store: incremental write failed: {:?} -- falling back to a full format",
+                        e
+                    ));
+                    return false;
+                }
+                None => {
+                    crate::ktrace::log_fmt(format_args!(
+                        "ext4_store: disk {} gone during incremental sync",
+                        self.disk
+                    ));
+                    return false;
+                }
             }
         }
         self.changed.clear();
@@ -341,16 +388,23 @@ impl Ext4Store {
                 data: d.as_slice(),
             })
             .collect();
-        let mut part = self.part();
-        match Ext4Writer::format_with_layout(&mut part, &files) {
-            Ok(layout) => {
+        let result = self.with_part(|part| Ext4Writer::format_with_layout(part, &files));
+        match result {
+            Some(Ok(layout)) => {
                 self.layout = Some(layout);
                 self.changed.clear();
                 self.deleted.clear();
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 self.layout = None;
                 crate::ktrace::log_fmt(format_args!("ext4_store: sync failed: {:?}", e));
+            }
+            None => {
+                self.layout = None;
+                crate::ktrace::log_fmt(format_args!(
+                    "ext4_store: disk {} gone during full sync",
+                    self.disk
+                ));
             }
         }
     }

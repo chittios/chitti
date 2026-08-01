@@ -181,20 +181,97 @@ pub fn umount(path: &str) -> Result<(), MountError> {
     Ok(())
 }
 
-/// Auto-mount the ext4 **data** partition at `/` (same heuristic as before):
-/// first ext4 that holds neither a model (`*.gguf`) nor the OS kernel/limine.
-/// No-op if none is present or `/` is already mounted.
-pub fn auto_mount_data_root() -> Option<MountEntry> {
-    if is_busy("/") {
-        return by_path("/");
-    }
-    use crate::block::{ext4_read::Ext4Reader, Partition};
-    for disk in 0..4usize {
+/// A data volume suitable for durable agent state (and auto-mount at `/`).
+#[derive(Clone, Debug)]
+pub struct DataVolume {
+    pub disk: usize,
+    pub start_lba: u64,
+    pub sectors: u64,
+    pub fs: FsType,
+    pub label: Option<String>,
+    /// C4VE header present on the partition.
+    pub encrypted: bool,
+    /// Selected via GPT name `Chitti Data` (preferred) vs content heuristic.
+    pub named: bool,
+}
+
+/// Locate the Chitti **data** partition across every disk.
+///
+/// Preference order:
+/// 1. GPT partition named `Chitti Data` (what `/install` creates)
+/// 2. First ext2/3/4 volume that is not the OS/model partition (no `*.gguf`,
+///    no `chitti-kernel`, no `limine.conf` at root)
+/// 3. C4VE-encrypted volumes (only as a last heuristic hit)
+///
+/// Used by both the synapse durable store and VFS auto-mount so they never
+/// disagree about which volume is "the" data disk.
+pub fn find_data_volume() -> Option<DataVolume> {
+    use crate::block::ext4_read::Ext4Reader;
+    use crate::block::gpt;
+    use crate::block::volcrypto;
+    use crate::block::Partition;
+
+    let mut named: Option<DataVolume> = None;
+    let mut heuristic: Option<DataVolume> = None;
+
+    for disk in 0..16usize {
         let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
-            continue;
+            break;
         };
-        let vols = detect::probe(&mut dev);
-        for (vi, v) in vols.iter().enumerate() {
+
+        if named.is_none() {
+            if let Some((_chitti, parts)) = gpt::read(&mut dev) {
+                for p in &parts {
+                    if p.name != "Chitti Data" {
+                        continue;
+                    }
+                    let start = p.first_lba;
+                    let sectors = p.last_lba.saturating_sub(p.first_lba).saturating_add(1);
+                    let encrypted = volcrypto::probe_encrypted(&mut dev, start).is_some();
+                    // Classify FS when possible (plain ext4 after install).
+                    let mut fs = FsType::Ext4;
+                    let mut label = Some(String::from("Chitti Data"));
+                    for v in detect::probe(&mut dev) {
+                        if v.start_lba == start {
+                            fs = v.fs;
+                            if v.label.is_some() {
+                                label = v.label.clone();
+                            }
+                            break;
+                        }
+                    }
+                    named = Some(DataVolume {
+                        disk,
+                        start_lba: start,
+                        sectors,
+                        fs,
+                        label,
+                        encrypted,
+                        named: true,
+                    });
+                    break;
+                }
+            }
+        }
+        if named.is_some() {
+            continue;
+        }
+
+        for v in detect::probe(&mut dev) {
+            if volcrypto::probe_encrypted(&mut dev, v.start_lba).is_some() {
+                if heuristic.is_none() {
+                    heuristic = Some(DataVolume {
+                        disk,
+                        start_lba: v.start_lba,
+                        sectors: v.sectors,
+                        fs: v.fs,
+                        label: v.label.clone(),
+                        encrypted: true,
+                        named: false,
+                    });
+                }
+                continue;
+            }
             if !matches!(v.fs, FsType::Ext2 | FsType::Ext3 | FsType::Ext4) {
                 continue;
             }
@@ -206,32 +283,66 @@ pub fn auto_mount_data_root() -> Option<MountEntry> {
                     })
                 })
                 .unwrap_or(true);
-            if is_os_or_model {
-                continue;
+            if !is_os_or_model && heuristic.is_none() {
+                heuristic = Some(DataVolume {
+                    disk,
+                    start_lba: v.start_lba,
+                    sectors: v.sectors,
+                    fs: v.fs,
+                    label: v.label.clone(),
+                    encrypted: false,
+                    named: false,
+                });
             }
-            let entry = MountEntry {
-                path: String::from("/"),
-                disk,
-                start_lba: v.start_lba,
-                sectors: v.sectors,
-                fs: v.fs,
-                label: v.label.clone(),
-                // Data partition backs the store; shell writes go through
-                // synapse::fs, not raw VFS writes, so leave RO at this layer.
-                writable: false,
-            };
-            let _ = mount_entry(entry.clone());
-            crate::ktrace::log_fmt(format_args!(
-                "fs.mount: / -> disk {} vol {} ({}, {} MiB) [auto]",
-                disk,
-                vi,
-                v.fs.name(),
-                v.sectors * 512 / 1024 / 1024
-            ));
-            return Some(entry);
         }
     }
-    None
+    named.or(heuristic)
+}
+
+/// Auto-mount the ext4 **data** partition at `/` (RW).
+///
+/// Same volume selection as the durable synapse store ([`find_data_volume`]).
+/// Defaults to **writable** so `/mkdir` / `/touch` / VFS writes work on the
+/// installed system without a manual `/mount … rw`. No-op if `/` is busy or no
+/// data volume exists (live ISO / image).
+pub fn auto_mount_data_root() -> Option<MountEntry> {
+    if is_busy("/") {
+        return by_path("/");
+    }
+    let v = find_data_volume()?;
+    // Encrypted volumes need an unlock first; do not auto-bind them.
+    if v.encrypted {
+        crate::ktrace::log(
+            "fs.mount",
+            "data volume is C4VE-encrypted; use /unlock before auto-mount",
+        );
+        return None;
+    }
+    if !matches!(
+        v.fs,
+        FsType::Ext2 | FsType::Ext3 | FsType::Ext4 | FsType::Fat16 | FsType::Fat32
+    ) {
+        return None;
+    }
+    let entry = MountEntry {
+        path: String::from("/"),
+        disk: v.disk,
+        start_lba: v.start_lba,
+        sectors: v.sectors,
+        fs: v.fs,
+        label: v.label.clone(),
+        writable: true, // installed data volume is RW by default
+    };
+    let _ = mount_entry(entry.clone());
+    crate::ktrace::log_fmt(format_args!(
+        "fs.mount: / -> disk {} lba {} ({}, {} MiB, rw) [auto{}]",
+        v.disk,
+        v.start_lba,
+        v.fs.name(),
+        v.sectors * 512 / 1024 / 1024,
+        if v.named { ", Chitti Data" } else { "" }
+    ));
+    Some(entry)
 }
 
 /// Probe volumes on a disk (shell `/disks` helper).
