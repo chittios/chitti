@@ -225,7 +225,19 @@ impl Agent {
                 if self.confirm_destructive {
                     justification = justification.confirmed();
                 }
-                match synapse::execute_with_justification(self.task, &raw, justification) {
+                // **From ring 3.** A persona agent is an agent; its effects belong outside
+                // the kernel for the same reason a routed agent's do. The justification is
+                // still computed here, above the boundary, from the provenance of the
+                // context the call was planned from — the tenant never chooses it, and a
+                // migration must not change what a caller may do.
+                // Reported as its own failure, never folded into a grammar rejection or a
+                // refusal: "userspace could not run it" and "the gates said no" are
+                // different facts, and an agent that cannot tell them apart will retry the
+                // wrong one.
+                let Some(inv) = crate::synapse::tenant::invoke_in_userspace(self.task, &raw, justification) else {
+                    return alloc::string::String::from("error: the userspace call never reached the gates");
+                };
+                match inv {
                     Invocation::Executed { result, .. } => result,
                     Invocation::Denied { primitive } => alloc::format!("denied:{primitive}"),
                     Invocation::Rejected(err) => alloc::format!("rejected:{err:?}"),

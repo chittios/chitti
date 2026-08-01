@@ -130,13 +130,15 @@ fn syn_exec(task: TaskId, raw: &str) -> String {
     // (surface draw/event/close), not FS/net. Justification is system-trusted
     // because the call is native code below the determinism boundary, not model
     // output — the model never invents these strings.
-    match crate::synapse::execute_with_justification(
-        task,
-        raw,
-        crate::security::Justification::trusted(),
-    ) {
-        crate::synapse::Invocation::Executed { result, .. } => result,
-        other => format!("{other:?}"),
+    //
+    // **Performed from ring 3**, like every other effect an installed agent has. A
+    // running app is an agent: it just reaches its surface through a wasm module rather
+    // than through the tool router, and which code path an effect takes is not a reason
+    // for it to keep kernel privilege.
+    match crate::synapse::tenant::invoke_in_userspace(task, raw, crate::security::Justification::trusted()) {
+        Some(crate::synapse::Invocation::Executed { result, .. }) => result,
+        Some(other) => format!("{other:?}"),
+        None => alloc::string::String::from("error: the userspace call never reached the gates"),
     }
 }
 
