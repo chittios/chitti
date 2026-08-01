@@ -716,6 +716,51 @@ pub fn spawn_with_stack(name: &'static str, entry: extern "C" fn(u64), arg: u64,
     id
 }
 
+/// A closure loaned to another task, plus somewhere for its answer.
+///
+/// Module-level rather than nested inside [`run_on_new_task`] because `closure_entry`
+/// has to name this type, and a nested item cannot use the enclosing function's
+/// generics.
+struct ClosureJob<'a, R> {
+    f: &'a mut dyn FnMut() -> R,
+    out: Option<R>,
+}
+
+/// Entry point for a task running a loaned closure.
+extern "C" fn closure_entry<R>(arg: u64) {
+    // SAFETY: `arg` is the `&mut ClosureJob<R>` the caller parked for us. The caller
+    // blocks from before this task can be scheduled until after it is dead, so this is
+    // the only live reference for as long as this runs.
+    let job = unsafe { &mut *(arg as *mut ClosureJob<R>) };
+    job.out = Some((job.f)());
+}
+
+/// Run `f` on a **new task with its own stack** and return its result.
+///
+/// The general form of the loan `agent::task` makes for an agent loop: the caller hands
+/// its borrows over, blocks until the task is dead, and only then reads the result. That
+/// is what makes passing a `&mut` through a raw pointer sound — there is never a second
+/// accessor, and the borrow outlives the task.
+///
+/// Returns `None` if the task died without producing a value (killed, or it faulted).
+///
+/// # Why a caller would want this
+/// Not concurrency — the caller blocks throughout. It is about **whose stack the work
+/// runs on**: deep call chains (a model forward, an ONNX graph, a nested agent) get
+/// their own guard-canaried allocation instead of consuming the caller's, and the work
+/// runs under a task identity of its own rather than borrowing the caller's.
+///
+/// There must be **no early return between the spawn and the join** in anything built
+/// on this, or the task is left writing into a frame that no longer exists.
+pub fn run_on_new_task<R>(name: &'static str, stack_bytes: usize, f: &mut dyn FnMut() -> R) -> Option<R> {
+    let mut job = ClosureJob { f, out: None };
+    let arg = &mut job as *mut ClosureJob<R> as u64;
+    let task = spawn_with_stack(name, closure_entry::<R>, arg, stack_bytes);
+    join(task);
+    let _ = kill(task);
+    job.out.take()
+}
+
 pub fn current_task_id() -> TaskId {
     SCHED.with(|slot| slot.as_ref().expect("sched not initialized").current)
 }
@@ -1125,6 +1170,50 @@ mod tests {
         ready[Priority::Normal.level()].push_back(pinned);
         ready[Priority::Normal.level()].push_back(plain);
         SchedulerState { tasks, ready, current: 0, next_id: 100, tick_count: 0, idle: None }
+    }
+
+    #[test_case]
+    fn a_loaned_closure_runs_on_its_own_task_and_returns_its_value() {
+        // The mechanism behind moving deep work off a caller's stack — the chat turn,
+        // an agent loop. Three claims, and the middle one is the whole point.
+        let caller = current_task_id();
+        let mut ran_as = 0u64;
+        let mut side_effect = 0u64;
+        let mut body = || {
+            ran_as = current_task_id();
+            side_effect += 7;
+            "answered"
+        };
+        let got = run_on_new_task("test-loan", 128 * 1024, &mut body);
+
+        assert_eq!(got, Some("answered"), "the closure's value must come back");
+        assert_ne!(ran_as, caller, "the closure must not run on the caller's task");
+        assert_ne!(ran_as, 0, "the closure never ran");
+        // Mutation through the loan is visible to the caller afterwards: this is what
+        // makes it a *loan* and not a copy, and it is why the caller must block for the
+        // whole run rather than merely start it.
+        assert_eq!(side_effect, 7, "the closure's writes must reach the caller's frame");
+        // Reaped, so it leaves no task and no authority behind.
+        assert!(!is_alive(ran_as), "the loaned task must be reaped");
+    }
+
+    #[test_case]
+    fn a_loaned_task_gets_the_stack_size_it_asked_for() {
+        // The reason for the mechanism: a deep chain gets its *own* allocation rather
+        // than consuming its caller's. Asserted by measuring inside the run, where the
+        // stack exists — after the join it has been handed back.
+        let mut observed = 0usize;
+        let mut body = || {
+            observed = SCHED.with(|slot| {
+                slot.as_ref()
+                    .and_then(|s| s.tasks.get(&s.current))
+                    .and_then(|t| t.stack.as_ref().map(|st| st.len()))
+                    .unwrap_or(0)
+            });
+        };
+        let big = 512 * 1024;
+        run_on_new_task("test-loan-stack", big, &mut body).expect("the loaned task must run");
+        assert_eq!(observed, big, "the task must own a stack of the requested size");
     }
 
     #[test_case]

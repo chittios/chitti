@@ -4375,6 +4375,17 @@ pub(crate) fn prefix_snapshot_fits(bytes: usize, free: usize, reserve: usize) ->
     free >= bytes.saturating_add(reserve)
 }
 
+/// Stack for a chat turn's task.
+///
+/// Four times the scheduler default, because this is the deepest chain the kernel has
+/// (turn -> model forward -> ONNX dispatch -> tool -> possibly a sub-agent) and it is
+/// the case the 256 KiB default was already known to be tight for: 64 KiB stacks used
+/// to *silently triple-fault* on the ONNX interpreter's ~55-arm dispatch frame alone.
+/// One allocation per user message, so being generous is free; an overflow is now
+/// reported by the stack canary (`sched::stack_overflows`) rather than corrupting the
+/// heap beneath it.
+const CHAT_TURN_STACK: usize = 1024 * 1024;
+
 impl ChatSession {
     /// Load the bundled model + build the tokenizer. `None` if no model. Ticks
     /// `spin` between load steps so the caller's spinner animates. Failures are
@@ -4517,6 +4528,31 @@ impl ChatSession {
     /// `max_tool_calls` (with a small interactive ceiling so a runaway model
     /// can't burn the whole session budget on one user message).
     fn turn(&mut self, msg: &str, session: &mut crate::agent::types::Session) -> alloc::string::String {
+        // **The chat loop runs on its own task**, not on whichever stack called it.
+        //
+        // This was the last thing in the system still borrowing its caller's stack for
+        // deep work, and the depth here is the worst in the kernel: the turn, a model
+        // prefill/decode, the ONNX interpreter's wide dispatch frames, a tool, and
+        // possibly a nested sub-agent. It used to be charged to the shell's boot stack —
+        // or, on the voice path, to whatever called *that*.
+        //
+        // Note this is not concurrency: the caller blocks throughout, so every existing
+        // call site keeps its exact semantics and this stays a one-line wrapper. What
+        // changes is whose stack overflows and who gets a canary. A joiner spinning on
+        // `yield_now` costs about two context switches per timeslice, not half the CPU —
+        // `yield_now` gives up the *remainder* of a slice rather than taking a turn's
+        // worth of work — and on a cooperative boot (no GIC) the chat task simply runs
+        // until it yields of its own accord.
+        let mut body = || self.turn_inner(msg, session);
+        crate::sched::run_on_new_task("chat-turn", CHAT_TURN_STACK, &mut body).unwrap_or_else(|| {
+            // The task died without answering. Surfaced to the user rather than
+            // panicking: a turn dying is an operational event and the REPL must survive.
+            crate::ktrace::log("chat", "the chat turn's task ended without an answer");
+            alloc::string::String::from("error: the chat turn ended unexpectedly")
+        })
+    }
+
+    fn turn_inner(&mut self, msg: &str, session: &mut crate::agent::types::Session) -> alloc::string::String {
         use crate::agent::orchestrator::now;
         use crate::agent::types::{Provenance, Role, ToolCall};
         // Per-message tool-call ceiling. The shell is a human-driven REPL, not a
@@ -6306,8 +6342,26 @@ fn run_surface(_arg: &str) {
         me,
         &alloc::vec![CapabilityRequest::new(CapDomain::Ui, Rights::EXEC | Rights::WRITE | Rights::DELETE, Scope::Any)],
     );
-    // Request a surface (board kind).
-    let req = crate::synapse::execute(me, r#"{"name":"ui_surface_request","arguments":{"kind":"board"}}"#);
+    // **This command's effects run in ring 3.** `/surface` is app-facing — its whole
+    // job is to drive UI primitives through the gated path — which is exactly the class
+    // the userspace migration is for, as against the hardware and diagnostic commands
+    // (`/lspci`, `/disks`, `/display`) that have to stay in the kernel because they touch
+    // devices. A human typed the command, so the justification is `UserTyped`; supplying
+    // it is what keeps the meaning of the call identical to the in-kernel version rather
+    // than silently maximally-tainted.
+    //
+    // The *structured* outcome comes back, so the parsing below is unchanged — reading
+    // the tenant's rendered prose instead would have meant matching on a different
+    // vocabulary, which is the mistake that once made refusals look like successes.
+    let human = crate::security::taint::Justification::from_context(crate::security::taint::Provenance::UserTyped);
+    let surface_call = r#"{"name":"ui_surface_request","arguments":{"kind":"board"}}"#;
+    let req = match crate::synapse::tenant::invoke_in_userspace(me, surface_call, human) {
+        Some(inv) => inv,
+        None => {
+            serial_println!("surface> the userspace call never reached the gates");
+            return;
+        }
+    };
     let sid = match req {
         crate::synapse::Invocation::Executed { result, .. } => {
             result.strip_prefix("ok:surface=").and_then(|s| s.trim().parse::<u32>().ok())
@@ -6330,9 +6384,10 @@ fn run_surface(_arg: &str) {
     }
     ops.push_str(" line 0 0 191 191 cc785c");
     let call = alloc::format!(r#"{{"name":"ui_draw","arguments":{{"surface":{sid},"ops":"{ops}"}}}}"#);
-    let drew = match crate::synapse::execute(me, &call) {
-        crate::synapse::Invocation::Executed { result, .. } => result,
-        other => alloc::format!("{other:?}"),
+    let drew = match crate::synapse::tenant::invoke_in_userspace(me, &call, human) {
+        Some(crate::synapse::Invocation::Executed { result, .. }) => result,
+        Some(other) => alloc::format!("{other:?}"),
+        None => alloc::string::String::from("the userspace call never reached the gates"),
     };
     let sum = crate::synapse::ui::checksum(sid).unwrap_or(0);
     serial_println!("surface> rendered surface {} ({}), checksum=0x{:016x}", sid, drew, sum);

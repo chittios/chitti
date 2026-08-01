@@ -38,13 +38,16 @@ use super::types::{Session, Ticks};
 
 /// How much stack an agent's task gets.
 ///
-/// Deliberately the same as the scheduler's default for now. A deep chain (the loop, a
-/// model forward, the ONNX interpreter's wide dispatch frames, a tool, possibly a
-/// nested sub-agent) argues for more, and 1 MiB was tried — but that is the first
-/// thing in this kernel to ask the first-fit allocator for a megabyte repeatedly, and
-/// it takes the P5 heap-growth path that nothing else exercises this hard. Raising it
-/// is a change that needs its own validation rather than a ride along with this one.
-const AGENT_STACK: usize = 256 * 1024;
+/// Four times the scheduler default, because this is a deep chain by nature: the loop, a
+/// model forward, the ONNX interpreter's wide dispatch frames, a tool, and possibly a
+/// nested sub-agent. One allocation per agent run, so being generous is free.
+///
+/// This briefly sat at the 256 KiB default because a 1 MiB stack was *suspected* of
+/// triggering a `#GP` through the P5 heap-growth path. That attribution was wrong — the
+/// fault was the userspace crossing failing to preserve callee-saved registers — and the
+/// note is kept because a wrong diagnosis left in a comment is worse than none: it argues
+/// against the correct fix.
+const AGENT_STACK: usize = 1024 * 1024;
 
 /// The borrows an agent task runs against, plus somewhere to leave its answer.
 ///
