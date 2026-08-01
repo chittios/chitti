@@ -546,6 +546,58 @@ pub fn translate(va: u64) -> Option<u64> {
     unsafe { crate::mm::walk::translate(&HwMmu, kernel_root(), va) }
 }
 
+/// Build a fresh L1 table that **shares every kernel mapping** and has an empty
+/// user range, returning its physical address.
+///
+/// The aarch64 counterpart of x86's `new_root_sharing_kernel`, and the reason the
+/// kernel can have per-task address spaces without moving off VA == PA: the boot
+/// identity map is a set of L1 block/table descriptors covering
+/// `[0, mapped_bytes)`, so **copying those entries** gives a new root in which all
+/// kernel code, data, stacks and MMIO are still valid at the same addresses. The
+/// remaining entries — above the identity map, up to the 512 GiB the 39-bit VA
+/// covers — start empty and belong to the task.
+///
+/// Note the entries are copied, not shared through a table descriptor, so a
+/// *later* kernel mapping made with `map_device_gib`/`map_ram_gib_if_unmapped`
+/// will not appear in already-created spaces. That is acceptable while device
+/// discovery happens at boot, before any user space exists, and is the one thing
+/// to revisit if that stops being true.
+///
+/// # Safety
+/// `frame` must be an exclusively-owned, identity-mapped 4 KiB frame.
+pub unsafe fn new_root_sharing_kernel(frame: u64) -> u64 {
+    // SAFETY: `L1` is the live kernel root and `frame` is an owned 4 KiB table.
+    unsafe {
+        let src = core::ptr::addr_of!(L1) as *const u64;
+        let dst = frame as *mut u64;
+        for i in 0..crate::mm::armv8::ENTRIES {
+            dst.add(i).write(src.add(i).read());
+        }
+    }
+    frame
+}
+
+/// Switch `TTBR0_EL1` to the tree rooted at physical `root`.
+///
+/// # Safety
+/// `root` must map all currently-executing kernel code, data and the current
+/// stack — which [`new_root_sharing_kernel`] guarantees. The full TLB flush is
+/// the conservative choice: without ASIDs there is nothing finer to invalidate.
+pub unsafe fn activate_root(root: u64) {
+    // SAFETY: caller's contract; the standard EL1 address-space switch.
+    unsafe {
+        asm!(
+            "msr ttbr0_el1, {}",
+            "dsb ish",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            in(reg) root,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
 /// Prove the 4 KiB walker works on *this* machine, once, at boot.
 ///
 /// [`crate::mm::walk`]'s logic is covered by the x86 unit suite, but its

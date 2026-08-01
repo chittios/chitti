@@ -11,6 +11,7 @@ pub mod armv8;
 pub mod frame;
 pub mod heap;
 pub mod ramlayout;
+pub mod space;
 pub mod walk;
 
 use core::cell::UnsafeCell;
@@ -477,11 +478,18 @@ fn aarch64_frames(heap_base: usize, heap_size: usize) {
         let mut p = base & !(frame::FRAME_SIZE - 1);
         while p < end {
             if !allocator.is_used(p) {
-                crate::ktrace::log_fmt(format_args!(
-                    "mm: BUG -- reserved frame {p:#x} (in {base:#x}+{len:#x}) reads back free; \
-                     declining the frame allocator rather than hand out kernel memory"
-                ));
-                return;
+                // Fatal, not a decline. When this check was written nothing
+                // depended on the allocator, so declining was the conservative
+                // choice on platforms that cannot be booted here. `mm::heap::grow`
+                // now depends on it, and a silent decline means heap growth is
+                // quietly unavailable on that machine — a machine that then dies
+                // of OOM for reasons nothing in the log explains. A mismatch here
+                // is a logic bug in the reserved list (both sides are computed
+                // from the same inputs), so failing loudly is right.
+                panic!(
+                    "mm: reserved frame {p:#x} (in {base:#x}+{len:#x}) reads back free -- \
+                     the reserved list is wrong and the frame allocator would hand out kernel memory"
+                );
             }
             p += frame::FRAME_SIZE;
         }
