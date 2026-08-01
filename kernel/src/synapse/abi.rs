@@ -273,10 +273,29 @@ pub fn dispatch(
             // from the kernel's own record of this task. That is what stops a
             // tenant asserting `human_confirmed` or `SystemTrusted` and walking
             // through the taint gate and the approval check.
-            let justification = crate::security::taint::Justification::from_context(
-                crate::security::taint::Provenance::UntrustedIngested,
-            );
+            //
+            // The value is whatever the kernel *set before entering userspace*
+            // ([`set_run_justification`]), defaulting to fully-tainted when nothing
+            // did. That default is the safe one, and it is also what made the value
+            // worth parameterising: a caller migrated from ring 0 to ring 3 kept the
+            // same identity and the same capabilities but silently became maximally
+            // tainted, so every destructive call it used to make legitimately started
+            // being refused. Moving code across the ring boundary must not change what
+            // it is allowed to do — otherwise "migrate to userspace" is a behaviour
+            // change wearing a refactor's clothes. The tenant still cannot influence
+            // this: it is set outside ring 3, by the code that chose to run it.
+            let justification = run_justification();
             let inv = super::executor::execute_with_justification(caller, &raw, justification);
+            // **Record the structured outcome for the kernel, alongside the text for the
+            // tenant.** The tenant needs prose; the kernel needs to classify. Letting the
+            // kernel re-derive the classification from the prose is what broke the
+            // red-team census: a migrated caller's refusals came back through `render`,
+            // whose wording differs from the tool router's, so refusals were read as
+            // successes and five injected attacks were counted as *permitted*. The
+            // refusal text is load-bearing — it is how both the model and the harness
+            // tell success from failure — so there must be exactly one authority for
+            // what an outcome was, and it is this value, not a string.
+            set_last_invocation(inv.clone());
             let text = render(&inv);
             // Hand the answer back through the caller's own page tables. `copy_out`
             // validates the destination exactly as `copy_in` validated the source —
@@ -288,6 +307,65 @@ pub fn dispatch(
         }
         Entry::Exit => Reply::Exited,
     }
+}
+
+/// The justification the kernel has set for the tenant run now in progress.
+///
+/// A plain static rather than a parameter because it has to survive the trip through
+/// userspace and back: the value is chosen by whoever entered ring 3, and read again
+/// when that tenant traps. Single-slot is sufficient — a tenant runs on the boot CPU,
+/// pinned, and `enter_tenant` is not reentrant, so exactly one run is ever live.
+static RUN_JUSTIFICATION: crate::mm::Locked<Option<crate::security::taint::Justification>> =
+    crate::mm::Locked::new(None);
+
+/// Set the justification for the tenant run about to start. Call **before** entering
+/// userspace; pair with [`clear_run_justification`] after it returns.
+///
+/// # Why this is not a hole
+/// The tenant never touches it. It is written by kernel code that already knows the
+/// provenance of the content motivating the call — for an agent, the `Router`'s
+/// computation over its session's resident taint — and a tenant has no way to reach
+/// this slot. The unforgeable part of the design is that *the caller cannot choose its
+/// own provenance*, and that still holds: the choice is made by the kernel, above the
+/// boundary, exactly as it is for an in-kernel caller.
+pub fn set_run_justification(j: crate::security::taint::Justification) {
+    RUN_JUSTIFICATION.with(|slot| *slot = Some(j));
+}
+
+/// Forget any justification set for a finished run, so a later tenant cannot inherit
+/// a trust decision made about somebody else's content.
+pub fn clear_run_justification() {
+    RUN_JUSTIFICATION.with(|slot| *slot = None);
+}
+
+/// What the current run's calls are justified by, defaulting to fully tainted.
+fn run_justification() -> crate::security::taint::Justification {
+    RUN_JUSTIFICATION.with(|slot| *slot).unwrap_or_else(|| {
+        crate::security::taint::Justification::from_context(
+            crate::security::taint::Provenance::UntrustedIngested,
+        )
+    })
+}
+
+/// The structured outcome of the most recent [`Entry::Invoke`], for the kernel code
+/// that asked a tenant to make the call.
+///
+/// Deliberately *not* something the tenant can read: it is the kernel's own record, so
+/// that a caller migrated into userspace is classified from the same value an in-kernel
+/// caller would have been, rather than from a re-parse of the reply text.
+static LAST_INVOCATION: crate::mm::Locked<Option<super::executor::Invocation>> = crate::mm::Locked::new(None);
+
+fn set_last_invocation(inv: super::executor::Invocation) {
+    LAST_INVOCATION.with(|slot| *slot = Some(inv));
+}
+
+/// Take the structured outcome of the tenant's last `Invoke`, clearing it.
+///
+/// Taken rather than peeked so a later caller cannot read someone else's result if the
+/// run it expected never happened — an absent value is then a visible `None` rather
+/// than a stale success.
+pub fn take_last_invocation() -> Option<super::executor::Invocation> {
+    LAST_INVOCATION.with(|slot| slot.take())
 }
 
 /// Copy as much of `text` as fits into the caller's output buffer, returning how

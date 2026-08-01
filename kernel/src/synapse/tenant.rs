@@ -277,6 +277,76 @@ mod tests {
     }
 
     #[test_case]
+    fn the_shared_tenant_really_performs_the_call_in_userspace() {
+        // The migration's witness. Both paths yield the same reply and the same audit
+        // entry — that equivalence is the goal — so the only way to show the effect
+        // actually crossed into ring 3 is to count crossings.
+        let tenant = crate::sched::spawn_parked("shared-tenant-probe");
+        let before = userspace_calls();
+        let j = crate::security::taint::Justification::from_context(
+            crate::security::taint::Provenance::UserTyped,
+        );
+        let reply = call_in_userspace(tenant, r#"{"name":"mem_fs_read","arguments":{"path":"nope"}}"#, j)
+            .expect("the shared tenant must run");
+        assert!(!reply.is_empty(), "the call must produce a reply");
+        assert_eq!(userspace_calls(), before + 1, "the call must have crossed into userspace");
+
+        // Reused, not rebuilt: a second call goes through the same address space.
+        let reply2 = call_in_userspace(tenant, r#"{"name":"list","arguments":{}}"#, j)
+            .expect("the shared tenant must be reusable");
+        assert!(!reply2.is_empty());
+        assert_eq!(userspace_calls(), before + 2);
+        let _ = crate::sched::kill(tenant);
+    }
+
+    #[test_case]
+    fn the_kernel_supplied_justification_survives_the_crossing() {
+        // **Moving a caller to ring 3 must not change what it may do.** A destructive
+        // primitive justified by user-typed content passes the taint gate in the kernel,
+        // so it must pass it from userspace too — and it only does because the kernel
+        // hands the tenant runner the real justification instead of letting the ABI's
+        // fully-tainted default stand. Without this, migrating an agent would quietly
+        // refuse every destructive call it legitimately makes.
+        //
+        // Asserted by contrast so it cannot pass for the wrong reason: the same call, as
+        // the same task, differing *only* in the justification the kernel set. Note the
+        // primitive has to be a genuinely destructive one — `mem_fs_write` is
+        // `Effect::INERT` and the taint gate does not touch it, which is what made a
+        // first version of this test pass a tainted write and prove nothing.
+        let tenant = crate::sched::spawn_parked("justification-probe");
+        let spec = crate::synapse::registry::by_name("mem_fs_delete").expect("mem_fs_delete is registered");
+        crate::cap::grant(tenant, crate::cap::Right::InvokePrimitive(spec.id));
+        crate::synapse::fs::write("just_probe", b"x");
+        let call = r#"{"name":"mem_fs_delete","arguments":{"path":"just_probe"}}"#;
+
+        let tainted = call_in_userspace(
+            tenant,
+            call,
+            crate::security::taint::Justification::from_context(
+                crate::security::taint::Provenance::UntrustedIngested,
+            ),
+        )
+        .expect("the tenant must run");
+        assert!(tainted.starts_with("refused:"), "untrusted-ingested must be refused, got {tainted}");
+        assert!(crate::synapse::fs::exists("just_probe"), "the refused delete must not have happened");
+
+        let typed = call_in_userspace(
+            tenant,
+            call,
+            crate::security::taint::Justification::from_context(
+                crate::security::taint::Provenance::UserTyped,
+            ),
+        )
+        .expect("the tenant must run");
+        assert!(
+            !typed.starts_with("refused:") && !typed.starts_with("denied:"),
+            "user-typed must clear the taint gate, got {typed}"
+        );
+        assert!(!crate::synapse::fs::exists("just_probe"), "the allowed delete must have happened");
+        let _ = crate::sched::kill(tenant);
+    }
+
+    #[test_case]
     fn a_call_too_large_for_the_startup_block_is_refused_before_running() {
         // Bounded up front rather than truncated: a silently shortened call is a
         // *different* call, and one that might pass gates the original would not.
@@ -450,6 +520,136 @@ pub fn call_blob() -> &'static [u8] {
 /// `Err` means the tenant could not be set up or did not exit cleanly. A *refusal* is
 /// a successful run whose reply says so — the distinction matters, because "the gates
 /// said no" and "userspace is broken" want different responses.
+/// A loaded parameterised tenant, reusable across calls.
+///
+/// Building an [`AddressSpace`] costs frames and a page-table walk per page, so doing
+/// it per call would put that cost on every effect an agent has. The space holds only
+/// code, stack and the startup block — no per-agent state — so one can serve every
+/// caller.
+///
+/// **The block page is zeroed before each call.** It is the only page a tenant both
+/// reads and writes, so a reused space would otherwise leave one agent's call text and
+/// reply readable by the next. That is a cross-agent leak, and the isolation this
+/// boundary exists for is between *principals*, not only between userspace and kernel.
+pub struct Tenant {
+    loaded: Loaded,
+    args_va: u64,
+    args_kernel: u64,
+}
+
+impl Tenant {
+    /// Load the parameterised blob and map its startup-block page.
+    pub fn new() -> Result<Self, LoadError> {
+        let mut loaded = load(call_blob())?;
+        let args_va = loaded.stack_page + 0x1000;
+        let args_phys = loaded.space.map_new_page(args_va, UserPerms::RW).map_err(|_| LoadError::Map)?;
+        let args_kernel = space::phys_to_kernel(args_phys);
+        Ok(Self { loaded, args_va, args_kernel })
+    }
+
+    /// Run `call` as `task`, justified by `justification`, and return the gates' reply.
+    pub fn call(
+        &mut self,
+        task: crate::sched::TaskId,
+        call: &str,
+        justification: crate::security::taint::Justification,
+    ) -> Result<alloc::string::String, LoadError> {
+        if call.len() > block::CAPACITY {
+            return Err(LoadError::TooBig { len: call.len() });
+        }
+        // SAFETY: one page this space owns, reachable by the kernel. Zeroed first so no
+        // remnant of a previous caller is visible to this one; then every write is
+        // inside the page (header < 64 bytes, text bounded by `CAPACITY`, reply area
+        // starting at the midpoint).
+        unsafe {
+            core::ptr::write_bytes(self.args_kernel as *mut u8, 0, 0x1000);
+            let base = self.args_kernel as *mut u8;
+            let put = |off: usize, v: u64| core::ptr::write_unaligned(base.add(off) as *mut u64, v);
+            put(block::CALL_PTR, self.args_va + block::TEXT as u64);
+            put(block::CALL_LEN, call.len() as u64);
+            put(block::REPLY_PTR, self.args_va + block::REPLY as u64);
+            put(block::REPLY_CAP, block::CAPACITY as u64);
+            core::ptr::copy_nonoverlapping(call.as_ptr(), base.add(block::TEXT), call.len());
+        }
+
+        crate::synapse::abi::set_run_justification(justification);
+        // SAFETY: `new` mapped code RX, stack RW and the block page RW in a space that
+        // shares the kernel mappings.
+        let exit = unsafe {
+            crate::arch::enter_tenant(task, &self.loaded.space, self.loaded.entry, self.loaded.stack, self.args_va)
+        };
+        // Cleared unconditionally, including on the failure path: a justification left
+        // behind would be inherited by the next tenant, handing it a trust decision
+        // made about content it never saw.
+        crate::synapse::abi::clear_run_justification();
+
+        if !exit.is_deliberate_exit() {
+            crate::ktrace::log_fmt(format_args!("tenant: call did not exit cleanly: {exit:?}"));
+            return Err(LoadError::Faulted);
+        }
+        // SAFETY: same page; the length is clamped to the capacity the tenant was
+        // given, so a tenant that wrote a larger number cannot make us read past it.
+        let reply = unsafe {
+            let len = (core::ptr::read_unaligned(
+                (self.args_kernel as *const u8).add(block::REPLY_LEN) as *const u64,
+            ) as usize)
+                .min(block::CAPACITY);
+            let bytes = core::slice::from_raw_parts((self.args_kernel as *const u8).add(block::REPLY), len);
+            alloc::string::String::from_utf8_lossy(bytes).into_owned()
+        };
+        Ok(reply)
+    }
+}
+
+/// The one tenant the system reuses. See [`Tenant`] on why sharing is sound.
+///
+/// Single-slot because only one tenant can be running: they are pinned to the boot CPU
+/// and `enter_tenant` is not reentrant. If that ever changes this becomes a per-CPU
+/// slot rather than a lock — a second core entering userspace through it would be a
+/// correctness bug, not merely contention.
+static SHARED: crate::mm::Locked<Option<Tenant>> = crate::mm::Locked::new(None);
+
+/// How many Synapse calls have been made from userspace.
+///
+/// Exists so the migration is *observable*: "an agent's effects run in ring 3" is
+/// otherwise indistinguishable from the kernel doing it, since both produce the same
+/// reply and the same audit entry — which is exactly the equivalence the migration
+/// aims for, and exactly why it needs a separate witness.
+static USERSPACE_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Number of Synapse calls performed from ring 3 / EL0 so far.
+pub fn userspace_calls() -> u64 {
+    USERSPACE_CALLS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Run one Synapse call in userspace on the shared tenant.
+///
+/// The entry point a migrated caller uses. Built on first use, so a boot that never
+/// runs anything in userspace pays nothing for the capability.
+pub fn call_in_userspace(
+    task: crate::sched::TaskId,
+    call: &str,
+    justification: crate::security::taint::Justification,
+) -> Result<alloc::string::String, LoadError> {
+    // The lock is **not** held across the crossing: `enter_tenant` runs userspace code
+    // that traps back into the kernel, where a Synapse primitive may touch anything.
+    // Taking the tenant out and putting it back is the same borrow discipline the video
+    // player uses when it loans its decoder to a worker.
+    let mut tenant = match SHARED.with(|slot| slot.take()) {
+        Some(t) => t,
+        None => Tenant::new()?,
+    };
+    let out = tenant.call(task, call, justification);
+    SHARED.with(|slot| *slot = Some(tenant));
+    if out.is_ok() {
+        let n = USERSPACE_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n == 0 {
+            crate::ktrace::log("tenant", "first Synapse call performed from userspace");
+        }
+    }
+    out
+}
+
 pub fn run_call(task: crate::sched::TaskId, call: &str) -> Result<alloc::string::String, LoadError> {
     if call.len() > block::CAPACITY {
         return Err(LoadError::TooBig { len: call.len() });
