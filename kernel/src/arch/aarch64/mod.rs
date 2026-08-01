@@ -15,6 +15,7 @@ pub mod dtb;
 pub mod mmu;
 pub mod ahci;
 pub mod disk;
+pub mod el0;
 pub mod exceptions;
 pub mod gic;
 pub mod nvme;
