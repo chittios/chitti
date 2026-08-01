@@ -180,6 +180,11 @@ impl Router {
             Invocation::DeniedScope { primitive } => {
                 ToolOutcome::error(alloc::format!("denied: '{primitive}' target outside granted scope"))
             }
+            // The agent is told to ask, not told it may proceed: the approval is
+            // recorded by the human's own path, never by the caller.
+            Invocation::NeedsApproval { primitive } => {
+                ToolOutcome::error(alloc::format!("denied: '{primitive}' needs human approval (\'/mode\' or the approval prompt)"))
+            }
         }
     }
 }

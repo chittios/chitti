@@ -2661,25 +2661,40 @@ pub fn approval_mode_name() -> &'static str {
 /// in the settings app applies the same state as the shell command.
 pub fn set_approval_mode_name(name: &str) -> bool {
     use core::sync::atomic::Ordering;
-    match name.trim() {
-        "manual" | "0" => {
-            MODE.store(0, Ordering::Relaxed);
-            true
-        }
-        "auto" | "1" => {
-            MODE.store(1, Ordering::Relaxed);
-            true
-        }
-        "bypass" | "2" => {
-            MODE.store(2, Ordering::Relaxed);
-            true
-        }
-        "plan" | "3" => {
-            MODE.store(3, Ordering::Relaxed);
-            true
-        }
-        _ => false,
-    }
+    let slot = match name.trim() {
+        "manual" | "0" => 0,
+        "auto" | "1" => 1,
+        "bypass" | "2" => 2,
+        "plan" | "3" => 3,
+        _ => return false,
+    };
+    MODE.store(slot, Ordering::Relaxed);
+    mirror_mode_to_kernel_policy();
+    true
+}
+
+/// Mirror the shell's approval mode into `synapse::policy`, which is where the
+/// executor reads it.
+///
+/// Both copies exist on purpose and neither is redundant. The shell's is richer
+/// (it has `Plan`, and it knows tool names, so it can ask a human *before* a call
+/// is attempted, with the source of the justification in the prompt). The
+/// kernel's is the one that is actually **enforced**: the shell's copy is
+/// tenant-side, and a tenant reaching `synapse::executor::execute` through the
+/// syscall ABI would never consult it. Policy enforced by the thing being
+/// governed is not enforcement.
+///
+/// `Plan` maps to `Manual` at the kernel layer: plan mode refuses side effects
+/// entirely, and "requires an approval that the plan-mode path will never grant"
+/// is the closest honest translation of that into a two-valued check.
+fn mirror_mode_to_kernel_policy() {
+    use crate::synapse::policy;
+    let m = match approval_mode() {
+        ApprovalMode::Manual | ApprovalMode::Plan => policy::Mode::Manual,
+        ApprovalMode::Auto => policy::Mode::Auto,
+        ApprovalMode::Bypass => policy::Mode::Bypass,
+    };
+    policy::set_mode(m);
 }
 
 /// Enter / exit plan mode (also exposed as tools for the agent).
@@ -2690,6 +2705,10 @@ pub fn set_plan_mode(on: bool) {
     } else {
         MODE.store(1, Ordering::Relaxed); // back to auto
     }
+    // Mirror here too: `/mode plan` and the plan-mode *tool* are two ways to set
+    // the same state, and only mirroring one of them would make enforcement
+    // depend on which route the human took.
+    mirror_mode_to_kernel_policy();
 }
 
 pub fn is_plan_mode() -> bool {
@@ -3638,22 +3657,26 @@ fn run_view_plan(arg: &str) {
 
 /// `/mode manual|auto|bypass|plan` — set (or show) the approval mode.
 fn run_mode(arg: &str) {
-    use core::sync::atomic::Ordering;
+    // Every arm goes through `set_approval_mode_name`, never `MODE.store`
+    // directly: that setter is also what mirrors the mode into
+    // `synapse::policy`, which is where the executor actually enforces it. A
+    // fourth path storing the raw slot would make enforcement depend on which
+    // route the human took to set it — and this handler *was* such a path.
     match arg.trim() {
         "manual" => {
-            MODE.store(0, Ordering::Relaxed);
+            set_approval_mode_name("manual");
             serial_println!("mode> \x1b[1mmanual\x1b[0m — every agent tool call asks for approval");
         }
         "auto" => {
-            MODE.store(1, Ordering::Relaxed);
+            set_approval_mode_name("auto");
             serial_println!("mode> \x1b[1mauto\x1b[0m — only destructive tools ask for approval");
         }
         "bypass" => {
-            MODE.store(2, Ordering::Relaxed);
+            set_approval_mode_name("bypass");
             serial_println!("mode> \x1b[1mbypass\x1b[0m — no approvals (be careful)");
         }
         "plan" => {
-            MODE.store(3, Ordering::Relaxed);
+            set_approval_mode_name("plan");
             serial_println!(
                 "mode> \x1b[1mplan\x1b[0m — read-only + todos/skills only; write/delete/install refused until /mode auto"
             );

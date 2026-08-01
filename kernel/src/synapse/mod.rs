@@ -22,11 +22,14 @@
 //!
 //! Phase 4 is capability checks only; provenance/taint gating is Phase 6.
 
+pub mod abi;
+pub mod tenant;
 pub mod audit;
 pub mod bench;
 pub mod executor;
 pub mod fs;
 pub mod grammar;
+pub mod policy;
 pub mod registry;
 pub mod ui;
 pub mod vpath;
@@ -76,6 +79,9 @@ pub fn demo() {
             }
             Invocation::RefusedTainted { primitive } => {
                 crate::serial_println!("Chitti: synapse [{}] REFUSED (tainted justification)", primitive);
+            }
+            Invocation::NeedsApproval { primitive } => {
+                crate::serial_println!("Chitti: synapse [{}] NEEDS HUMAN APPROVAL", primitive);
             }
             Invocation::DeniedScope { primitive } => {
                 crate::serial_println!("Chitti: synapse [{}] DENIED (target outside granted scope)", primitive);

@@ -30,6 +30,10 @@ pub enum Outcome {
     /// Capability held, but the concrete target (path/host/port) fell outside
     /// the granted scope (Gate 2.5). The primitive did not run.
     DeniedScope,
+    /// The policy requires human approval for this call and none was on record.
+    /// The primitive did not run. Not a gate refusal: see
+    /// `executor::gate_of_outcome`.
+    NeedsApproval,
 }
 
 /// One immutable audit record. Every field is `Copy` (the primitive name is
