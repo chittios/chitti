@@ -8623,6 +8623,19 @@ fn repaint_active_tab() {
     repaint_tab(crate::framebuffer::right_mode());
 }
 
+/// Repaint pane interiors if the band changed since the last pump.
+///
+/// `framebuffer` is compiled out of the test build, so this carries the same cfg split as
+/// [`repaint_all_tabs`] rather than guarding at the call site.
+#[cfg(not(test))]
+fn drain_tab_repaint() {
+    if crate::framebuffer::take_tabs_dirty() {
+        repaint_visible_tabs();
+    }
+}
+#[cfg(test)]
+fn drain_tab_repaint() {}
+
 /// Repaint the active tab of **every visible action pane**.
 ///
 /// Anything that relayouts the band (a divider drag, `/pane grid|max|split`, a
@@ -8897,6 +8910,12 @@ pub fn upkeep() {
     ] {
         crate::sched::wake(w);
     }
+    // A band change (a view opening, a divider drag, `/pane grid|max|split`, a tab move)
+    // repaints pane *frames* but not their interiors, which the views own. Draining the
+    // flag here means every such change gets the repaint, instead of it depending on each
+    // call site remembering — which is how browser/chess/paint came to go blank whenever
+    // a new pane opened next to them.
+    drain_tab_repaint();
     crate::drivers::pwrbtn::poll();
     if crate::drivers::pwrbtn::take_press() {
         crate::ktrace::log("pwrbtn", "power button pressed -- powering off");

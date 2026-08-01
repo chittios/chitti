@@ -3526,8 +3526,17 @@ pub fn draw_top(v: &TopView) {
 
         // --- process rows --------------------------------------------------
         let footer_h = ch; // reserve one line for F-keys
+        // **How many rows fit, decided up front so truncation can be *reported*.**
+        // This used to just `break` when it ran out of room, which reads as "these are
+        // all the tasks" — and in a small pane that meant three rows standing in for a
+        // dozen, so a running agent looked absent. Same rule as everywhere else here: no
+        // silent caps.
+        let room = if bottom > y + footer_h { ((bottom - y - footer_h) / ch) as usize } else { 0 };
+        let truncated = v.tasks.len() > room;
+        // Give up one row to the "+N more" marker when there is something to say.
+        let show = if truncated { room.saturating_sub(1) } else { v.tasks.len() };
         let mut first_running_painted = false;
-        for t in v.tasks {
+        for t in v.tasks.iter().take(show) {
             if y + ch + footer_h > bottom {
                 break;
             }
@@ -3568,6 +3577,15 @@ pub fn draw_top(v: &TopView) {
             xx = sc.draw_str(xx, y, &st, state_fg, row_bg);
             xx = sc.draw_str(xx, y, " ", row_fg, row_bg);
             let _ = sc.draw_str(xx, y, &name, row_fg, row_bg);
+            y += ch;
+        }
+        // Say what was left out. The count is the honest one — total tasks the scheduler
+        // holds, not just the ones that fit — so a full list in a taller pane and a
+        // clipped one here describe the same system.
+        if truncated && y + ch + footer_h <= bottom {
+            let hidden = v.tasks.len().saturating_sub(show);
+            let more = alloc::format!("  +{hidden} more of {} tasks -- taller pane to see all", v.tasks_total);
+            sc.draw_str_bg(px, y, &crate::textsel::fit_width(&more, cols), sc.theme.title_dim, bg);
             y += ch;
         }
         // Blank any leftover process-area rows so a shrinking task list
@@ -5211,7 +5229,34 @@ pub fn has_tab(mode: RightMode) -> bool {
 
 /// Open `mode` on the focused action column (or select it if already open
 /// anywhere — focuses that column). First tab on a collapsed band opens the split.
+/// Set when the action band's geometry or tab set changed, so the pump knows the
+/// panes' *interiors* need repainting.
+///
+/// The compositor redraws frames on a relayout, but each view owns its interior — a
+/// browser page, a chess board, a paint canvas are RGB buffers the app holds, and
+/// `Screen::redraw` cannot reproduce them. So an unfocused surface pane goes blank until
+/// it happens to tick, which for a browser or a finished game is never.
+///
+/// `shell::repaint_visible_tabs` has always existed for this and documented that "a
+/// divider drag, `/pane grid|max|split`, a tab move" must call it — and then had exactly
+/// **one** caller (the theme path), so every other band change blanked its neighbours.
+/// A flag drained by the pump fixes that class rather than that instance: a band mutation
+/// added later gets the repaint without anyone remembering to ask.
+static TABS_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Note that the action band changed and its panes' interiors need repainting.
+pub fn mark_tabs_dirty() {
+    TABS_DIRTY.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Consume the flag. Cleared *before* the caller repaints, so a view that pumps while
+/// painting cannot drive itself round the loop again.
+pub fn take_tabs_dirty() -> bool {
+    TABS_DIRTY.swap(false, core::sync::atomic::Ordering::Relaxed)
+}
+
 fn open_view_slot(slot: &mut Option<Screen>, mode: RightMode) {
+    mark_tabs_dirty();
     let Some(old) = slot else { return };
     // NB: opening a view must **not** move keyboard focus to the action pane.
     // The user typed a command at the composer and is still typing there — see
@@ -6112,6 +6157,8 @@ pub fn relayout(cfg: &LayoutCfg) {
             }
             ns.redraw();
             *slot = Some(ns);
+            // Frames are painted; interiors are the views' own and must follow.
+            mark_tabs_dirty();
         }
     });
 }
