@@ -438,6 +438,7 @@ pub unsafe fn enter_ring3(
     space: &crate::mm::space::AddressSpace,
     entry_va: u64,
     stack_va: u64,
+    arg: u64,
 ) -> Exit {
     const LAND_SIZE: usize = 16 * 1024;
     let land: alloc::boxed::Box<[u8]> = alloc::vec![0u8; LAND_SIZE].into_boxed_slice();
@@ -478,7 +479,24 @@ pub unsafe fn enter_ring3(
             super::gdt::set_kernel_stack(fault_top);
             space.activate();
             asm!(
-                // Park the resume point exactly as `trap_from_kernel` does.
+                // **Save the callee-saved registers across the crossing**, for the
+                // same reason the aarch64 path does: `clobber_abi("C")` covers only the
+                // caller-saved set, and a tenant is userspace — it honours no ABI and
+                // may use rbx/rbp/r12-r15 freely. The compiler, believing they survive,
+                // keeps live values there; the tenant overwrites them and the kernel
+                // resumes on garbage. On aarch64 this presented as a data abort on the
+                // tenant's own argument address, inside the entry function, after the
+                // tenant had exited. Here it was purely latent: the first blob happened
+                // to touch none of them. Saved rather than declared clobbered because
+                // LLVM reserves rbp and refuses it as an operand.
+                "push rbx",
+                "push rbp",
+                "push r12",
+                "push r13",
+                "push r14",
+                "push r15",
+                // Park the resume point exactly as `trap_from_kernel` does. After the
+                // saves, so the stub's `mov rsp, [resume]` + `ret` lands on them.
                 "lea rax, [rip + 4f]",
                 "push rax",
                 "mov [rip + {resume}], rsp",
@@ -491,6 +509,17 @@ pub unsafe fn enter_ring3(
                 "push {urip}",
                 "iretq",
                 "4:",
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop rbp",
+                "pop rbx",
+                // The tenant's startup argument, in the C ABI's first register so a
+                // tenant compiled from Rust or C finds it where it expects. This is
+                // what makes a blob reusable: the work is chosen by the kernel at load
+                // time rather than assembled in.
+                inout("rdi") arg => _,
                 resume = sym RESUME_SLOT,
                 ss = in(reg) super::gdt::USER_DATA_SELECTOR as u64,
                 ursp = in(reg) stack_va,
@@ -622,7 +651,7 @@ mod tests {
         let tenant = crate::sched::spawn_parked("ring3-exit-tenant");
         // SAFETY: both pages are mapped user-accessible with the permissions
         // `enter_ring3` requires, and the space shares the kernel mappings.
-        let got = unsafe { enter_ring3(tenant, &sp, code_va, stack_top) };
+        let got = unsafe { enter_ring3(tenant, &sp, code_va, stack_top, 0) };
         assert_eq!(
             got,
             Exit::Svc(Trapped { number: 2, arg0: 0, arg1: 0 }),
@@ -713,7 +742,7 @@ mod tests {
         let tenant = crate::sched::spawn_parked("ring3-tenant");
         // SAFETY: all three pages mapped with the permissions `enter_ring3`
         // requires; the space shares the kernel mappings.
-        let last = match unsafe { enter_ring3(tenant, &sp, code_va, stack_va + 0x1000 - 16) } {
+        let last = match unsafe { enter_ring3(tenant, &sp, code_va, stack_va + 0x1000 - 16, 0) } {
             Exit::Svc(t) => t,
             Exit::Fault { code, addr } => panic!("tenant faulted: code={code:#x} addr={addr:#x}"),
         };
@@ -743,6 +772,69 @@ mod tests {
         // And the primitive really did not run.
         assert!(!crate::synapse::fs::exists("ring3_probe"), "the gates must have stopped it");
         let _ = crate::sched::kill(tenant);
+    }
+
+    #[test_case]
+    fn a_tenant_that_trashes_every_callee_saved_register_does_not_corrupt_the_kernel() {
+        // **The invariant: userspace honours no ABI.** A tenant may put anything in
+        // rbx/rbp/r12-r15, and the kernel resumes afterwards believing them intact
+        // unless the crossing saves them. Getting this wrong is not a wrong answer, it
+        // is the kernel dereferencing whatever userspace chose — and it was invisible
+        // for as long as every test blob happened to leave those registers alone.
+        //
+        // The value planted here is deliberately a *plausible* pointer (the tenant's
+        // own data page): a wild value might fault immediately and obviously, whereas a
+        // valid-looking one is what silently corrupts.
+        use crate::mm::space::{self, AddressSpace, UserPerms};
+        let mut sp = AddressSpace::new().expect("address space");
+        let data_va = space::USER_BASE;
+        sp.map_new_page(data_va, UserPerms::RW).expect("map data");
+
+        let mut blob = alloc::vec::Vec::new();
+        // mov <reg>, imm64 = data_va, for each callee-saved register.
+        for rex_op in [
+            [0x48u8, 0xbb], // rbx
+            [0x48, 0xbd],   // rbp
+            [0x49, 0xbc],   // r12
+            [0x49, 0xbd],   // r13
+            [0x49, 0xbe],   // r14
+            [0x49, 0xbf],   // r15
+        ] {
+            blob.extend_from_slice(&rex_op);
+            blob.extend_from_slice(&data_va.to_le_bytes());
+        }
+        blob.extend_from_slice(&[0x48, 0xc7, 0xc7, 0x02, 0x00, 0x00, 0x00]); // mov rdi, 2 (Exit)
+        blob.extend_from_slice(&[0x0f, 0x05]); // syscall
+
+        let code_va = data_va + 0x1000;
+        let code_phys = sp.map_new_page(code_va, UserPerms::RX).expect("map code");
+        // SAFETY: a freshly mapped frame this space owns, reachable by the kernel.
+        unsafe {
+            core::ptr::copy_nonoverlapping(blob.as_ptr(), space::phys_to_kernel(code_phys) as *mut u8, blob.len());
+        }
+        let stack_va = code_va + 0x1000;
+        sp.map_new_page(stack_va, UserPerms::RW).expect("map stack");
+
+        let tenant = crate::sched::spawn_parked("register-trasher");
+        // SAFETY: all three pages mapped with the permissions `enter_ring3` requires.
+        let exit = unsafe { enter_ring3(tenant, &sp, code_va, stack_va + 0x1000 - 16, 0) };
+        // Reaching here at all is most of the result; the assertions confirm we got the
+        // *right* answer rather than merely surviving.
+        // Only the entry number is asserted: this blob sets `rdi` and nothing else, so
+        // rsi/rdx carry leftovers. `Exit` ignores them, and demanding zeroes here would
+        // be asserting a property the ABI does not promise — the tenant's own job is to
+        // set every register the entry it chose actually reads.
+        assert!(
+            matches!(exit, Exit::Svc(t) if t.number == 2),
+            "the tenant must exit cleanly, got {exit:?}"
+        );
+        let _ = crate::sched::kill(tenant);
+
+        // And the kernel is still healthy enough to do ordinary work afterwards: an
+        // allocation and a scheduler round trip both touch the registers in question.
+        let probe = alloc::vec![7u8; 4096];
+        assert_eq!(probe.len(), 4096);
+        crate::sched::yield_now();
     }
 
     #[test_case]
@@ -793,7 +885,7 @@ mod tests {
 
         let tenant = crate::sched::spawn_parked("resume-tenant");
         // SAFETY: every page mapped with the permissions `enter_ring3` requires.
-        let last = match unsafe { enter_ring3(tenant, &sp, code_va, stack_va + 0x1000 - 16) } {
+        let last = match unsafe { enter_ring3(tenant, &sp, code_va, stack_va + 0x1000 - 16, 0) } {
             Exit::Svc(t) => t,
             Exit::Fault { code, addr } => panic!("tenant faulted: code={code:#x} addr={addr:#x}"),
         };
@@ -834,7 +926,7 @@ mod tests {
 
         let tenant = crate::sched::spawn_parked("faulting-tenant");
         // SAFETY: pages mapped as `enter_ring3` requires; the blob faults on purpose.
-        match unsafe { enter_ring3(tenant, &sp, code_va, stack_va + 0x1000 - 16) } {
+        match unsafe { enter_ring3(tenant, &sp, code_va, stack_va + 0x1000 - 16, 0) } {
             Exit::Fault { addr, .. } => {
                 assert_eq!(addr, unmapped, "the reported address must be the one it touched");
             }

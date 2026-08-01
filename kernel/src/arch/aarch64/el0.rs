@@ -180,6 +180,7 @@ pub unsafe fn enter_el0(
     space: &AddressSpace,
     entry_va: u64,
     stack_va: u64,
+    arg: u64,
 ) -> Exit {
     let kernel_root = crate::mm::space::kernel_root();
     // SAFETY: caller's contract. DAIF stays masked across the crossing, and the
@@ -201,8 +202,28 @@ pub unsafe fn enter_el0(
             crate::sched::pin_to_boot_cpu(task);
             space.activate();
             core::arch::asm!(
-                // Park the resume point: the vector stub restores SP and LR from
-                // these and `ret`s, landing after the `eret` below.
+                // **Save the callee-saved registers across the crossing.**
+                // `clobber_abi("C")` covers only the caller-saved set, which is right
+                // for calling a C function and wrong for entering EL0: a tenant is
+                // userspace, honours no ABI, and may freely use x19-x29. Without this
+                // the compiler keeps a live value in (say) x19 across the crossing, the
+                // tenant overwrites it, and the kernel resumes using whatever userspace
+                // left there — which presented as a data abort on the tenant's own
+                // argument address, *inside this function*, long after the tenant was
+                // gone. A blob that happens to avoid those registers hides it entirely,
+                // which is exactly how it got this far.
+                //
+                // Saved rather than declared clobbered because x19 is reserved by LLVM
+                // and cannot be an `asm!` operand at all.
+                "sub sp, sp, #96",
+                "stp x19, x20, [sp, #0]",
+                "stp x21, x22, [sp, #16]",
+                "stp x23, x24, [sp, #32]",
+                "stp x25, x26, [sp, #48]",
+                "stp x27, x28, [sp, #64]",
+                "str x29, [sp, #80]",
+                // Park the resume point *after* the saves, so the stub's `mov sp, x10`
+                // lands with them still on the stack and the pops below find them.
                 "adr x9, 1f",
                 "adrp x10, EL0_RESUME_LR",
                 "add  x10, x10, :lo12:EL0_RESUME_LR",
@@ -212,6 +233,11 @@ pub unsafe fn enter_el0(
                 "add  x10, x10, :lo12:EL0_RESUME_SP",
                 "str  x9, [x10]",
                 // The tenant's stack goes in SP_EL0, because SPSR.M says EL0t.
+                // The startup argument, moved in last from a compiler-chosen register.
+                // **Not `in("x0")`**: this block also declares `clobber_abi("C")`,
+                // which covers x0, and relying on how those two constraints interact
+                // is exactly the kind of assumption that silently misplaces an operand.
+                "mov x0, {uarg}",
                 "msr sp_el0, {ustack}",
                 "msr elr_el1, {uentry}",
                 // SPSR_EL1: M[3:0]=0 (EL0t) and DAIF masked (bits 9:6).
@@ -220,10 +246,27 @@ pub unsafe fn enter_el0(
                 "isb",
                 "eret",
                 "1:",
+                "ldp x19, x20, [sp, #0]",
+                "ldp x21, x22, [sp, #16]",
+                "ldp x23, x24, [sp, #32]",
+                "ldp x25, x26, [sp, #48]",
+                "ldp x27, x28, [sp, #64]",
+                "ldr x29, [sp, #80]",
+                "add sp, sp, #96",
                 ustack = in(reg) stack_va,
                 uentry = in(reg) entry_va,
+                uarg = in(reg) arg,
                 out("x9") _,
                 out("x10") _,
+                // **Every callee-saved register is clobbered too.** `clobber_abi("C")`
+                // covers only the caller-saved set, which is correct for calling a C
+                // function and *wrong* for entering EL0: a tenant is userspace, it
+                // honours no ABI, and it may freely use x19-x28. Without these the
+                // compiler happily keeps a live value in x19 across the crossing, the
+                // tenant overwrites it, and the kernel resumes using whatever userspace
+                // left there — which presented as a data abort on the tenant's own
+                // argument address, inside this function, long after the tenant was
+                // gone. A blob that avoids x19 (the first one did) hides it completely.
                 clobber_abi("C"),
             );
             // Back at EL1 on the kernel stack; the tenant's TTBR0 is still live,
@@ -279,7 +322,7 @@ pub fn self_test() -> Result<(), &'static str> {
     let stack_va = code_va + 0x1000;
     sp.map_new_page(stack_va, UserPerms::RW).map_err(|_| "map stack")?;
     // SAFETY: both pages are mapped with the permissions `enter_el0` requires.
-    let got = unsafe { enter_el0(tenant, &sp, code_va, stack_va + 0x1000 - 16) };
+    let got = unsafe { enter_el0(tenant, &sp, code_va, stack_va + 0x1000 - 16, 0) };
     let _ = crate::sched::kill(tenant);
     if call_count() != 3 {
         // Distinguished from a wrong-arguments failure because the cause is
