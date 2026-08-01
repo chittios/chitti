@@ -40,6 +40,97 @@ exists to serve that, not to run `/bin/sh`.
 Capabilities are unforgeable (opaque per-task indices, no ambient authority).
 Effective authority is always `intersection(requested, granting-context)`.
 
+## STANDING RULE — ring 0 is for drivers; agents and their commands run in ring 3
+
+**Only the kernel proper and the drivers execute in ring 0 / EL1.** Every agent, and
+every agent- or app-facing command, performs its effects in **ring 3 / EL0** as a
+userspace tenant. This is the execution-model half of invariant #1: "all effects route
+through Synapse" is a claim about *authority*, and this rule is the claim about
+*privilege* — an agent should not be able to corrupt kernel memory by getting a tool
+wrong, only to be refused by a gate.
+
+**How to make a call from a migrated caller** — one function, always:
+
+```rust
+crate::synapse::tenant::invoke_in_userspace(task, raw, justification) // -> Option<Invocation>
+```
+
+It runs the call in ring 3 under `task`'s own identity, through all four gates, and
+returns the **structured** `Invocation`.
+
+Three rules that are not style preferences — each is a bug that already happened:
+
+1. **Never parse the tenant's reply text to decide what happened.** A tenant's reply is
+   prose rendered by `synapse::abi::render`, whose vocabulary (`denied:capability:X`)
+   differs from the tool router's (`denied: no capability for X`). Classifying from the
+   text made refusals read as successes and `security::redteam` reported **five injected
+   attacks as permitted** where it had reported zero. There is exactly one authority for
+   what an outcome was, and it is the `Invocation`, not a string.
+2. **The justification is computed above the boundary and passed in.** The ABI defaults
+   to `UntrustedIngested`, so a caller moved into ring 3 without one keeps its identity
+   and capabilities but silently becomes maximally tainted — every destructive call it
+   used to make legitimately starts being refused. **Moving code across the ring boundary
+   must not change what it is allowed to do**, or the migration is a policy change
+   wearing a refactor's clothes. Pass what the in-kernel path passed
+   (`Justification::trusted()` where it called plain `synapse::execute`). The tenant
+   still cannot choose it — the kernel sets it before entering ring 3.
+3. **No in-kernel fallback when userspace fails.** Retrying the call in ring 0 would make
+   confinement depend on whether the loader happened to work. Report
+   "the userspace call never reached the gates" as its own failure — never folded into a
+   refusal or a grammar rejection, because "the gates said no" and "userspace could not
+   run it" are different facts and a caller that cannot tell them apart retries the wrong
+   one.
+
+**`synapse::executor::execute` / `execute_with_justification` are for the kernel and
+drivers only.** Calling them from anything agent-shaped is the bug this rule exists to
+prevent, and it is invisible — the call still works, it just keeps kernel privilege. The
+legitimate callers are exactly:
+
+- `synapse::abi::dispatch` — the kernel side of the tenant trap. This *is* the ring-3
+  path; it must call the executor directly or nothing could.
+- `tools::dispatch::run_synapse` — the in-kernel arm, taken only when
+  `runs_in_userspace(session)` is false, i.e. for the orchestrator.
+- `synapse::bench` — measuring the gate chain, kernel-internal by definition.
+- `#[test_case]` tests of the gate chain itself (`lib.rs`'s `phase*` tests, `cap`,
+  `redteam`). A test of the executor should call the executor.
+
+Anything else is a bypass. Four existed at once and every one was found by grepping for
+the call rather than by review, because a bypass looks exactly like ordinary code and
+*works*: `agent/wasm_rt.rs` (app UI ops), `service/server.rs` (content-agent asset read),
+`service/package_ui.rs` (the running app-UI pump), `persona/agent.rs` (a persona agent's
+plan/act loop). All four are migrated.
+
+**This is enforced, not remembered: `cargo xtask ring-check`** scans `kernel/src` and
+fails on any direct executor call outside the allowlist in `xtask/src/rings.rs`, printing
+file:line. Run it after adding a Synapse call site; to add a legitimate caller, add the
+file to `ALLOWED` *with a reason* (a test asserts every entry has one). The scanner skips
+comments — the rule is documented in prose that names the function, and a check that
+counted those would be deleted for crying wolf — and a host test plants a fake bypass to
+prove the walk is not vacuously green.
+
+**The one documented exception is the orchestrator (the shell agent)**, which stays in
+ring 0: it *is* the shell, holds root authority, and drives the kernel it would be
+confined relative to — so there is no isolation to gain. Revisit that deliberately if
+ever, not by accident.
+
+**Where "run it in ring 3" is not the right question.** Ring 3 has no device access by
+construction — that is the property being bought. So a command that touches hardware
+(`/voice` on the sound device and ONNX models, `/model` DMA-loading a GGUF, `/ping` on an
+ICMP socket, `/lspci`, `/disks`, `/display`, `/battery`, `/install`) cannot itself execute
+there without mapping device memory into a tenant, which destroys the isolation. The
+correct shape is always **driver in ring 0, effect requested from ring 3 through a
+Synapse primitive** — so "migrate X" for such a command means *designing a primitive*,
+not moving code. That is a real design act: each primitive is a new gated, audited
+authority surface, it moves the paper's primitive count (which `cargo xtask paper-check`
+pins), and it adds an entry to the `security::redteam` census.
+
+**Still in ring 0 for want of a primitive, not by choice:** the `http` tool (binds to
+`Shell{command:"http"}`, and `net_http_get`/`net_http_post` do not express its
+`-X`/`-H`/`-d`/`--stream` surface), MCP `tools/call` (a stateful JSON-RPC/SSE session),
+downloads (fetch *and* store write), browser navigation and the web tools (the JS engine
+plus the net stack), and agent memory (its own store, though this one is expressible as
+`mem_fs_*` and is the cheapest next migration).
+
 ## STANDING RULE — dual-architecture, no divergence
 
 The kernel is **one codebase for two architectures: `x86_64` and `aarch64`**, and
@@ -1425,6 +1516,8 @@ host-detected. See [DEVELOPMENT.md](DEVELOPMENT.md) for the full setup.
 
 ```sh
 cargo xtask test                       # in-kernel unit suite under QEMU (x86) — pure logic, no model
+cargo xtask ring-check                 # enforce the ring-3 rule: no direct synapse::executor
+                                       #   calls outside the allowlist (xtask/src/rings.rs)
 make e2e                               # end-to-end: boot the kernel, drive the shell over serial,
                                        #   exercise every OS command + the http/https/ws/wss/ping/
                                        #   hosted-model flows vs local servers (tests/e2e/, stdlib-only

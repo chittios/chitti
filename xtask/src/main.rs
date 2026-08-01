@@ -4,6 +4,7 @@
 
 use std::env;
 mod paper;
+mod rings;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -443,6 +444,7 @@ fn main() {
         // Verify the quantitative claims in `paper/main.tex` against the tree.
         // Reports and exits non-zero on drift; never edits the paper.
         "paper-check" => cmd_paper_check(&rest),
+        "ring-check" => cmd_ring_check(),
         // Hidden subcommand: installed as `[target.x86_64-chitti] runner` in
         // kernel/.cargo/config.toml so `cargo test` can boot each compiled
         // test binary in QEMU and translate isa-debug-exit into a real exit
@@ -983,6 +985,30 @@ fn detect_host_res() -> Option<(u32, u32)> {
     let wants_max = std::env::var("CHITTI_FB_RES").map(|v| v.trim().eq_ignore_ascii_case("max")).unwrap_or(false);
     let (w, h) = if wants_max { d.native } else { d.desktop };
     Some((w.clamp(640, 3840), h.clamp(480, 2400)))
+}
+
+/// `cargo xtask ring-check` — enforce the ring-3 standing rule.
+///
+/// Fails if any file outside `rings::ALLOWED` calls the Synapse executor directly. See
+/// `rings` for why this is a check and not a code review item: a bypass keeps kernel
+/// privilege silently, so nothing else goes red.
+fn cmd_ring_check() -> Result<(), String> {
+    let repo = repo_root();
+    let hits = rings::check(&repo).map_err(|e| format!("ring-check: {e}"))?;
+    if hits.is_empty() {
+        println!("ring-check: ok -- no direct executor calls outside the allowlist");
+        println!("  agents and agent-facing commands must use synapse::tenant::invoke_in_userspace");
+        return Ok(());
+    }
+    println!("ring-check: {} direct executor call(s) outside the allowlist:", hits.len());
+    for h in &hits {
+        println!("  {}:{}  {}", h.file, h.line, h.text);
+    }
+    println!();
+    println!("These keep kernel privilege for work that should run in ring 3. Either route");
+    println!("them through `synapse::tenant::invoke_in_userspace` (passing the justification");
+    println!("the in-kernel path used), or add the file to `rings::ALLOWED` with a reason.");
+    Err(format!("ring-check: {} bypass(es) of the ring-3 rule", hits.len()))
 }
 
 /// `cargo xtask paper-check [--ran N]` — compare the paper's derivable claims
