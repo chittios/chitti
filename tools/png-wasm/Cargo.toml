@@ -1,0 +1,25 @@
+[package]
+name = "chitti-png-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "PNG decoder as a wasm module -- the kernel's own image/png.rs, sandboxed"
+
+# Stand-alone crate (not part of the root workspace / host xtask).
+[workspace]
+
+[lib]
+# cdylib = the wasm module; rlib lets `cargo test` run the pure parser on the host.
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[dependencies]
+# none — pure no_std + growable bump alloc; inflate is the kernel's own
+# `image/inflate.rs` mounted via #[path] (the h264diff pattern).
