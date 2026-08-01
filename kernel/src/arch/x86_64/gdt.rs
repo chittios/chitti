@@ -26,13 +26,55 @@ const ACCESS_EXECUTABLE: u8 = 1 << 3;
 const ACCESS_RW: u8 = 1 << 1; // readable (code) / writable (data)
 const FLAGS_LONG_MODE: u8 = 1 << 1; // L bit: this is a 64-bit code segment
 
+/// Descriptor privilege level 3 — ring 3. Bits 46:45 of the descriptor, which is
+/// bits 6:5 of the access byte.
+const ACCESS_DPL3: u8 = 3 << 5;
+
 const KERNEL_CODE64: u64 =
     segment_descriptor(ACCESS_PRESENT | ACCESS_SEGMENT | ACCESS_EXECUTABLE | ACCESS_RW, FLAGS_LONG_MODE);
 const KERNEL_DATA: u64 = segment_descriptor(ACCESS_PRESENT | ACCESS_SEGMENT | ACCESS_RW, 0);
+/// Ring-3 data and code. Identical to the kernel pair but for `DPL3`; in long
+/// mode base/limit are ignored, so privilege is the entire difference.
+const USER_DATA: u64 = segment_descriptor(ACCESS_PRESENT | ACCESS_SEGMENT | ACCESS_RW | ACCESS_DPL3, 0);
+const USER_CODE64: u64 = segment_descriptor(
+    ACCESS_PRESENT | ACCESS_SEGMENT | ACCESS_EXECUTABLE | ACCESS_RW | ACCESS_DPL3,
+    FLAGS_LONG_MODE,
+);
 
-pub const KERNEL_CODE_SELECTOR: u16 = 1 << 3; // index 1
-pub const KERNEL_DATA_SELECTOR: u16 = 2 << 3; // index 2
-const TSS_SELECTOR: u16 = 3 << 3; // index 3 (occupies indices 3 and 4)
+// **The order of these is not a style choice; `syscall`/`sysret` derive selectors
+// from it arithmetically.** `syscall` loads `CS = STAR[47:32]` and
+// `SS = STAR[47:32] + 8`, so kernel code must be immediately followed by kernel
+// data. `sysretq` loads `CS = STAR[63:48] + 16` and `SS = STAR[63:48] + 8`, so
+// from a base B the GDT must hold user *data* at B+8 and user *code* at B+16 —
+// note the inversion relative to the kernel pair, which is the detail that makes
+// a hand-built GDT fault on the first return to ring 3 rather than at setup.
+//
+// Hence: null, kernel code, kernel data, user data, user code, TSS. The TSS moved
+// to the end so `STAR[63:48]` does not have to point into the middle of it.
+pub const KERNEL_CODE_SELECTOR: u16 = 1 << 3; // index 1 -> 0x08
+pub const KERNEL_DATA_SELECTOR: u16 = 2 << 3; // index 2 -> 0x10
+/// Ring-3 selectors, **including RPL 3 in the low bits**. Loading these without
+/// the RPL set is a general-protection fault, and one that looks like a bad
+/// descriptor rather than a bad selector.
+pub const USER_DATA_SELECTOR: u16 = (3 << 3) | 3; // index 3 -> 0x1b
+pub const USER_CODE_SELECTOR: u16 = (4 << 3) | 3; // index 4 -> 0x23
+const TSS_SELECTOR: u16 = 5 << 3; // index 5 (occupies indices 5 and 6)
+
+/// The `sysret` base: `STAR[63:48]`. `sysretq` computes user CS as base+16 and
+/// user SS as base+8, which with the layout above is index 4 and index 3.
+const SYSRET_BASE_SELECTOR: u16 = 2 << 3; // 0x10
+
+/// The `sysret` base selector, for `fastcall`'s `STAR` composition.
+pub const fn sysret_base_selector() -> u16 {
+    SYSRET_BASE_SELECTOR
+}
+
+/// Compose the `STAR` MSR: kernel CS for `syscall` in 47:32, the `sysret` base in
+/// 63:48. Pure so the arithmetic that decides which selectors ring 3 gets is
+/// checkable without a CPU.
+pub const fn star_value(syscall_cs: u16, sysret_base: u16) -> u64 {
+    ((sysret_base as u64) << 48) | ((syscall_cs as u64) << 32)
+}
 
 /// Index into the TSS's Interrupt Stack Table used by the double-fault
 /// handler (`idt.rs`). IST indices are 1-based; 0 means "don't switch
@@ -84,9 +126,10 @@ struct DescriptorTablePointer {
     base: u64,
 }
 
-/// 5 slots: null, kernel code, kernel data, TSS (2 slots: a 64-bit system
-/// descriptor is twice the width of a code/data descriptor).
-static mut GDT: [u64; 5] = [0, KERNEL_CODE64, KERNEL_DATA, 0, 0];
+/// 7 slots: null, kernel code, kernel data, user data, user code, TSS (2 slots:
+/// a 64-bit system descriptor is twice the width of a code/data descriptor).
+/// See the selector constants for why user *data* precedes user *code*.
+static mut GDT: [u64; 7] = [0, KERNEL_CODE64, KERNEL_DATA, USER_DATA, USER_CODE64, 0, 0];
 
 fn tss_descriptor(tss_addr: u64) -> (u64, u64) {
     let limit = (size_of::<Tss>() - 1) as u64;
@@ -112,17 +155,127 @@ pub fn init() {
 
         let tss_addr = core::ptr::addr_of!(TSS) as u64;
         let (low, high) = tss_descriptor(tss_addr);
-        GDT[3] = low;
-        GDT[4] = high;
+        GDT[5] = low;
+        GDT[6] = high;
 
         let gdt_ptr = DescriptorTablePointer {
-            limit: (size_of::<[u64; 5]>() - 1) as u16,
+            limit: (size_of::<[u64; 7]>() - 1) as u16,
             base: core::ptr::addr_of!(GDT) as u64,
         };
         asm!("lgdt [{}]", in(reg) &gdt_ptr, options(readonly, nostack, preserves_flags));
         reload_segments();
     }
     crate::ktrace::log("gdt", "GDT + TSS loaded, IST1 stack ready for double-fault");
+}
+
+/// Set `TSS.rsp0`: the stack the CPU switches to when a trap arrives **from ring
+/// 3**. Must name the current task's kernel stack.
+///
+/// Nothing needed this while every task ran in ring 0 — a trap from ring 0 keeps
+/// the current stack and never consults `rsp0`, which is why the TSS has carried
+/// an all-zero `rsp` array until now. The moment a task runs in ring 3 it becomes
+/// load-bearing: a zero here means the first syscall or interrupt from userspace
+/// pushes its frame at address 0, which is a page fault whose own handler also
+/// has no stack — a double fault, then a triple. So this is called on every switch
+/// to a task that can enter ring 3, not once at boot.
+pub fn set_kernel_stack(top: u64) {
+    // SAFETY: `TSS` is this core's task-state segment; `rsp0` is only read by the
+    // CPU on a privilege-raising trap, and writing it does not affect the
+    // currently-executing (ring 0) context.
+    unsafe { TSS.rsp[0] = top };
+}
+
+/// The current `TSS.rsp0`, for diagnostics and tests.
+pub fn kernel_stack() -> u64 {
+    // SAFETY: a plain read of this core's TSS field.
+    unsafe { TSS.rsp[0] }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The descriptor's DPL field, bits 46:45.
+    fn dpl(desc: u64) -> u8 {
+        ((desc >> 45) & 0b11) as u8
+    }
+    fn present(desc: u64) -> bool {
+        desc & (1 << 47) != 0
+    }
+    fn long_mode(desc: u64) -> bool {
+        desc & (1 << 53) != 0
+    }
+    fn executable(desc: u64) -> bool {
+        desc & (1 << 43) != 0
+    }
+
+    #[test_case]
+    fn user_descriptors_are_ring_three_and_kernel_ones_are_not() {
+        // A DPL that silently stayed 0 would give "userspace" full privilege
+        // while every other part of the transition appeared to work — the failure
+        // would be no isolation rather than a fault.
+        assert_eq!(dpl(USER_CODE64), 3);
+        assert_eq!(dpl(USER_DATA), 3);
+        assert_eq!(dpl(KERNEL_CODE64), 0);
+        assert_eq!(dpl(KERNEL_DATA), 0);
+        assert!(present(USER_CODE64) && present(USER_DATA));
+        // 64-bit code needs the L bit; data segments must not set it.
+        assert!(long_mode(USER_CODE64) && executable(USER_CODE64));
+        assert!(!long_mode(USER_DATA) && !executable(USER_DATA));
+    }
+
+    #[test_case]
+    fn selectors_carry_rpl_three() {
+        // Loading a ring-3 selector with RPL 0 is a #GP that reads like a bad
+        // descriptor rather than a bad selector, so the RPL is part of the
+        // constant rather than something each call site remembers.
+        assert_eq!(USER_CODE_SELECTOR & 3, 3);
+        assert_eq!(USER_DATA_SELECTOR & 3, 3);
+        assert_eq!(KERNEL_CODE_SELECTOR & 3, 0);
+        // Index bits still name the right GDT slots.
+        assert_eq!(USER_DATA_SELECTOR >> 3, 3);
+        assert_eq!(USER_CODE_SELECTOR >> 3, 4);
+    }
+
+    #[test_case]
+    fn the_gdt_layout_satisfies_what_syscall_and_sysret_compute() {
+        // The whole reason the order is what it is. `syscall` takes CS from
+        // STAR[47:32] and SS from that +8; `sysretq` takes CS from STAR[63:48]+16
+        // and SS from +8 — note the inversion. Getting this wrong faults on the
+        // first *return* to ring 3, long after setup looked fine.
+        let star = star_value(KERNEL_CODE_SELECTOR, SYSRET_BASE_SELECTOR);
+        let syscall_cs = ((star >> 32) & 0xffff) as u16;
+        let sysret_base = ((star >> 48) & 0xffff) as u16;
+        assert_eq!(syscall_cs, KERNEL_CODE_SELECTOR);
+        assert_eq!(syscall_cs + 8, KERNEL_DATA_SELECTOR, "syscall's SS must follow its CS");
+        assert_eq!(sysret_base + 16, USER_CODE_SELECTOR & !3, "sysret CS = base + 16");
+        assert_eq!(sysret_base + 8, USER_DATA_SELECTOR & !3, "sysret SS = base + 8");
+        // And the descriptors those selectors name really are the user pair.
+        // SAFETY: boot-time-initialised static, read-only here.
+        let gdt = unsafe { &*core::ptr::addr_of!(GDT) };
+        assert_eq!(gdt[(USER_CODE_SELECTOR >> 3) as usize], USER_CODE64);
+        assert_eq!(gdt[(USER_DATA_SELECTOR >> 3) as usize], USER_DATA);
+    }
+
+    #[test_case]
+    fn the_tss_moved_clear_of_the_sysret_base() {
+        // The TSS occupies two slots; it sits after the user pair so
+        // `STAR[63:48]` never has to point into the middle of it.
+        assert_eq!(TSS_SELECTOR >> 3, 5);
+        assert!(TSS_SELECTOR > USER_CODE_SELECTOR & !3);
+    }
+
+    #[test_case]
+    fn rsp0_round_trips_and_starts_unset() {
+        // Zero until a ring-3-capable task is switched to — and that zero is
+        // exactly what would triple-fault on the first trap from userspace, which
+        // is why `set_kernel_stack` exists and is called per switch.
+        let saved = kernel_stack();
+        set_kernel_stack(0xdead_beef_0000);
+        assert_eq!(kernel_stack(), 0xdead_beef_0000);
+        set_kernel_stack(saved);
+        assert_eq!(kernel_stack(), saved);
+    }
 }
 
 /// Reload `CS` (via a far return), the data segment registers, and the task
@@ -182,14 +335,22 @@ pub fn init_ap() {
     let tss_addr = tss as *const Tss as u64;
     let (low, high) = tss_descriptor(tss_addr);
 
-    let gdt: &'static mut [u64; 5] = Box::leak(Box::new([0, KERNEL_CODE64, KERNEL_DATA, low, high]));
+    // **The same layout as the BSP's, slot for slot.** `reload_segments` below
+    // `ltr`s `TSS_SELECTOR`, and every selector constant in this module is an
+    // index into whichever GDT is loaded — so an AP GDT that put the TSS
+    // somewhere else would `ltr` past its own limit. That is what happened when
+    // the user pair was inserted and this array was left at five slots: the BSP
+    // came up, the first AP died on `ltr`, and the machine reset during SMP
+    // bring-up with no panic and no output after `smp: Limine reports 4 cpu(s)`.
+    let gdt: &'static mut [u64; 7] =
+        Box::leak(Box::new([0, KERNEL_CODE64, KERNEL_DATA, USER_DATA, USER_CODE64, low, high]));
 
     // SAFETY: `gdt` is a valid, correctly-laid-out GDT that outlives this
     // core; loading it and reloading segments to its selectors is the AP
     // equivalent of what `init` does on the BSP.
     unsafe {
         let gdt_ptr = DescriptorTablePointer {
-            limit: (size_of::<[u64; 5]>() - 1) as u16,
+            limit: (size_of::<[u64; 7]>() - 1) as u16,
             base: gdt.as_ptr() as u64,
         };
         asm!("lgdt [{}]", in(reg) &gdt_ptr, options(readonly, nostack, preserves_flags));

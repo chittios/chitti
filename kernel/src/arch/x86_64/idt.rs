@@ -131,10 +131,20 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, error_c
         "idt: PAGE FAULT accessing {faulting_addr:#x} (error={error_code:#x}, rip={:#x})",
         frame.instruction_pointer
     ));
-    // Contain it to the faulting task if we can: this handler runs on that task's
-    // own stack (only #DF has an IST), so abandoning the task abandons this frame
-    // with it. Returns only when isolation is impossible — no scheduler yet, or
-    // the bootstrap task, where a fault is a kernel bug rather than a tenant's.
+    // A tenant's fault is not the kernel's. The scheduler task here is the *kernel*
+    // one that called `enter_ring3` — a tenant is ring-3 code inside that task, not a
+    // task of its own — so `fault_current_task` would correctly refuse to kill it and
+    // we would then halt a working machine over a tenant's bad pointer. Hand control
+    // back to `enter_ring3`, which reports `Exit::Fault`.
+    if super::fastcall::tenant_live() {
+        // SAFETY: a tenant is live, so `RESUME_SLOT` names the kernel stack that
+        // entered ring 3.
+        unsafe { super::fastcall::abort_tenant(error_code, faulting_addr) };
+    }
+    // Otherwise contain it to the faulting task: this handler runs on that task's own
+    // stack (only #DF has an IST), so abandoning the task abandons this frame with
+    // it. Returns only when isolation is impossible — no scheduler yet, or the
+    // bootstrap task, where a fault is a kernel bug.
     crate::sched::fault_current_task("page fault");
     crate::ktrace::log("idt", "page fault not isolatable -- halting");
     loop {
@@ -147,6 +157,10 @@ extern "x86-interrupt" fn general_protection_fault_handler(frame: InterruptStack
         "idt: GENERAL PROTECTION FAULT (error={error_code:#x}, rip={:#x})",
         frame.instruction_pointer
     ));
+    if super::fastcall::tenant_live() {
+        // SAFETY: as in the page-fault handler above.
+        unsafe { super::fastcall::abort_tenant(error_code, frame.instruction_pointer) };
+    }
     crate::sched::fault_current_task("general protection fault");
     crate::ktrace::log("idt", "GP fault not isolatable -- halting");
     loop {
