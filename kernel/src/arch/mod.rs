@@ -334,6 +334,10 @@ impl TenantExit {
 /// Run `task` in userspace at `entry_va` with stack `stack_va` in `space`, and report
 /// how it left. The arch-neutral entry point for [`crate::synapse::tenant`].
 ///
+/// `arg` is handed to the tenant in its first C-ABI argument register (`rdi` / `x0`),
+/// which is what lets one position-independent blob be pointed at different work
+/// instead of having the work assembled into it.
+///
 /// # Safety
 /// `entry_va` must be mapped user-executable in `space` and `stack_va` user-writable;
 /// `space` must share the kernel mappings. Not reentrant.
@@ -342,11 +346,12 @@ pub unsafe fn enter_tenant(
     space: &crate::mm::space::AddressSpace,
     entry_va: u64,
     stack_va: u64,
+    arg: u64,
 ) -> TenantExit {
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: forwarded verbatim; the caller carries the contract.
-        match unsafe { x86_64::fastcall::enter_ring3(task, space, entry_va, stack_va) } {
+        match unsafe { x86_64::fastcall::enter_ring3(task, space, entry_va, stack_va, arg) } {
             x86_64::fastcall::Exit::Svc(t) => {
                 TenantExit::Called { number: t.number, arg0: t.arg0, arg1: t.arg1 }
             }
@@ -358,7 +363,7 @@ pub unsafe fn enter_tenant(
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: as above.
-        match unsafe { aarch64::el0::enter_el0(task, space, entry_va, stack_va) } {
+        match unsafe { aarch64::el0::enter_el0(task, space, entry_va, stack_va, arg) } {
             aarch64::el0::Exit::Svc(t) => TenantExit::Called { number: t.number, arg0: t.arg0, arg1: t.arg1 },
             aarch64::el0::Exit::Fault { esr, far } => TenantExit::Faulted { syndrome: esr, address: far },
         }
