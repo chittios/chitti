@@ -880,34 +880,43 @@ fn write_guest_bytes(
     Ok(())
 }
 
+/// Submit one Synapse call **from ring 3**, as `task`, and report whether it ran.
+///
+/// A wasm app's UI effects used to call `synapse::execute` directly, which meant they
+/// skipped the tool router — and so skipped the userspace migration that routes an
+/// agent's other effects through a tenant. The result was a split with nothing behind
+/// it: chess's *filesystem* calls crossed the privilege boundary while its *board* calls
+/// did not, for no reason except which code path they happened to take.
+///
+/// `Justification::trusted()` because that is what `synapse::execute` supplies by
+/// default, and the rule for a migration is that it must not change what a caller may
+/// do. The tenant does not choose this — the kernel sets it before entering ring 3.
+fn syn_in_userspace(task: TaskId, raw: &str) -> bool {
+    matches!(
+        crate::synapse::tenant::invoke_in_userspace(task, raw, crate::security::taint::Justification::trusted()),
+        Some(crate::synapse::Invocation::Executed { result, .. }) if result.starts_with("ok:")
+    )
+}
+
 fn syn_board_set(task: TaskId, surface: u32, fen: &str) -> bool {
     let fen_esc = fen.replace('\\', "\\\\").replace('"', "\\\"");
     let raw = format!(
         r#"{{"name":"board_set","arguments":{{"surface":{surface},"fen":"{fen_esc}"}}}}"#
     );
-    matches!(
-        crate::synapse::execute(task, &raw),
-        crate::synapse::Invocation::Executed { result, .. } if result.starts_with("ok:")
-    )
+    syn_in_userspace(task, &raw)
 }
 
 fn syn_board_mark(task: TaskId, surface: u32, squares: &str, color: &str) -> bool {
     let raw = format!(
         r#"{{"name":"board_mark","arguments":{{"surface":{surface},"squares":"{squares}","color":"{color}"}}}}"#
     );
-    matches!(
-        crate::synapse::execute(task, &raw),
-        crate::synapse::Invocation::Executed { result, .. } if result.starts_with("ok:")
-    )
+    syn_in_userspace(task, &raw)
 }
 
 fn syn_ui_hud(task: TaskId, surface: u32, text: &str) -> bool {
     let esc = text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
     let raw = format!(r#"{{"name":"ui_hud","arguments":{{"surface":{surface},"text":"{esc}"}}}}"#);
-    matches!(
-        crate::synapse::execute(task, &raw),
-        crate::synapse::Invocation::Executed { result, .. } if result.starts_with("ok:")
-    )
+    syn_in_userspace(task, &raw)
 }
 
 fn syn_ui_draw(task: TaskId, surface: u32, ops: &str) -> bool {
@@ -915,10 +924,7 @@ fn syn_ui_draw(task: TaskId, surface: u32, ops: &str) -> bool {
     let raw = format!(
         r#"{{"name":"ui_draw","arguments":{{"surface":{surface},"ops":"{ops_esc}"}}}}"#
     );
-    matches!(
-        crate::synapse::execute(task, &raw),
-        crate::synapse::Invocation::Executed { result, .. } if result.starts_with("ok:")
-    )
+    syn_in_userspace(task, &raw)
 }
 
 fn map_trap(err: wasmi::Error) -> &'static str {
