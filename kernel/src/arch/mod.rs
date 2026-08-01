@@ -202,6 +202,20 @@ pub fn usb_bulk_ready() -> bool {
     false
 }
 
+/// Whether a USB mass-storage (BOT) bulk pair is configured.
+#[cfg(target_arch = "x86_64")]
+pub fn usb_msc_ready() -> bool {
+    x86_64::xhci::usb_msc_ready()
+}
+#[cfg(target_arch = "aarch64")]
+pub fn usb_msc_ready() -> bool {
+    aarch64::xhci::usb_msc_ready()
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn usb_msc_ready() -> bool {
+    false
+}
+
 /// USB Ethernet bulk transport, arch-neutral (the controller lives under the
 /// per-arch xHCI wrapper, exactly like `mouse_poll`). Used by `net::usb_eth`.
 #[cfg(target_arch = "x86_64")]
@@ -239,6 +253,34 @@ pub fn usb_bulk_send(data: &[u8]) -> bool {
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub fn usb_bulk_send(_data: &[u8]) -> bool {
     false
+}
+
+/// Synchronous bulk OUT for USB MSC BOT.
+#[cfg(target_arch = "x86_64")]
+pub fn usb_bulk_sync_out(data: &[u8], timeout_ms: u64) -> bool {
+    x86_64::xhci::usb_bulk_sync_out(data, timeout_ms)
+}
+#[cfg(target_arch = "aarch64")]
+pub fn usb_bulk_sync_out(data: &[u8], timeout_ms: u64) -> bool {
+    aarch64::xhci::usb_bulk_sync_out(data, timeout_ms)
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn usb_bulk_sync_out(_data: &[u8], _timeout_ms: u64) -> bool {
+    false
+}
+
+/// Synchronous bulk IN for USB MSC BOT.
+#[cfg(target_arch = "x86_64")]
+pub fn usb_bulk_sync_in(out: &mut [u8], timeout_ms: u64) -> Option<usize> {
+    x86_64::xhci::usb_bulk_sync_in(out, timeout_ms)
+}
+#[cfg(target_arch = "aarch64")]
+pub fn usb_bulk_sync_in(out: &mut [u8], timeout_ms: u64) -> Option<usize> {
+    aarch64::xhci::usb_bulk_sync_in(out, timeout_ms)
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn usb_bulk_sync_in(_out: &mut [u8], _timeout_ms: u64) -> Option<usize> {
+    None
 }
 
 /// This core's hardware identity, cheap and MMIO-free.

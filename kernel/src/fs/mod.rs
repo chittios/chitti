@@ -1,9 +1,22 @@
-//! Filesystem support. The on-disk filesystems Chitti actually uses are
-//! **ext4** (the default — durable agent state, OS partition) and **FAT**
-//! (UEFI ESP), read/written through `crate::block::{ext4_read, ext4_store,
-//! fat_read, fat_write}`. This module hosts the shared filesystem-type
-//! [`detect`]or that sniffs a volume's superblock/BPB to route it to the
-//! right reader. (The old SimpleFS demo filesystem was removed — ext4 is the
-//! default filesystem.)
+//! Filesystem support for ChittiOS.
+//!
+//! - [`detect`] — superblock/BPB type sniffer (partition walk, labels)
+//! - [`path`] — pure path normalize + longest-prefix mount resolve
+//! - [`mount`] — global mount table
+//! - [`vfs`] — unified read/write/readdir over the Synapse store + mounts
+//!
+//! On-disk formats on **internal and external** disks (USB MSC included):
+//! - **FAT16/32** — full RW (create/write/unlink/mkdir; 8.3 create names)
+//! - **ext2/3/4** — full RW via [`crate::block::ext4_rw`] (journal when safe)
+//! - **NTFS** — detect + mount **read-only** (writer not implemented)
+//!
+//! Agent durable state still goes through `synapse::fs` (ext4-backed store).
 
 pub mod detect;
+pub mod mount;
+pub mod path;
+pub mod vfs;
+
+pub use detect::{FsType, Volume};
+pub use mount::MountEntry;
+pub use vfs::{DirEntry, FileStat, VfsError};

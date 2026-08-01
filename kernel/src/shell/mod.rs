@@ -131,7 +131,14 @@ pub fn run() -> ! {
     // Register the bundled Noto script fonts as the system fallback chain so
     // Indic/emoji web text renders real glyphs instead of tofu.
     crate::font_ttf::register_bundled_fallbacks();
-    auto_mount_root();
+    if let Some(mt) = crate::fs::mount::auto_mount_data_root() {
+        serial_println!(
+            "Chitti: mounted / -> disk {} ({}, {} MiB) [auto]",
+            mt.disk,
+            mt.fs.name(),
+            mt.sectors * 512 / 1024 / 1024
+        );
+    }
     // NB: the large CJK fallback font is loaded **lazily** (first browser use),
     // never at boot — reading it is fine now (idempotent probe + bounded FAT
     // walk), but *parsing* a 16 MB CFF font through fontdue churns the first-fit
@@ -614,6 +621,8 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "mount" => disk_mount(arg),
         "umount" => disk_umount(arg),
         "mounts" => disk_mounts(),
+        "encrypt" => disk_encrypt(arg),
+        "unlock" => disk_unlock(arg),
         "cat" => fs_cat(arg),
         "grep" => fs_grep(arg),
         "glob" => fs_glob(arg),
@@ -13373,72 +13382,25 @@ fn parse_datetime(s: &str) -> Option<(i64, i64, i64, i64, i64, i64)> {
     Some((y, mo, d, h, mi, s))
 }
 
-// --- block-device / filesystem commands (x86 virtio-blk over PCI) ---------
-
-/// A mounted volume: a (disk, volume) bound to a path like `/mnt`, so `/ls` and
-/// `/cat` can address it by path (a lightweight, Linux-flavored mount table —
-/// not a full VFS: paths resolve to a volume's root, one directory level).
-#[derive(Clone)]
-struct Mount {
-    path: alloc::string::String,
-    disk: usize,
-    start_lba: u64,
-    sectors: u64,
-    fs: crate::fs::detect::FsType,
-    label: Option<alloc::string::String>,
-}
-
-static MOUNTS: crate::mm::Locked<alloc::vec::Vec<Mount>> = crate::mm::Locked::new(alloc::vec::Vec::new());
-
-/// The mount whose path is `path` (exact), if any.
-fn mount_lookup(path: &str) -> Option<Mount> {
-    MOUNTS.with(|m| m.iter().find(|mt| mt.path == path).cloned())
-}
+// --- block-device / filesystem commands (via `crate::fs::{mount,vfs}`) ----
 
 /// `/mount <disk> [vol] [/path]` — bind volume `vol` (default 0) of disk `disk`
-/// to a mount path (default the first free `/mnt`, `/mnt2`, …). The volume is
-/// discovered via the FS detector, exactly as `/disks` shows it.
-/// Auto-mount the ext4 **data** partition at `/` on boot, so `/ls`, `/cat`, and
-/// `/voice models load` work without a manual `/mount`. Picks the same partition
-/// the persistent store uses: the first ext4 that holds neither the model
-/// (`*.gguf`) nor the OS (kernel / `limine.conf`). No-op if none is present.
-fn auto_mount_root() {
-    use crate::block::{ext4_read::Ext4Reader, Partition};
-    use crate::fs::detect::FsType;
-    for disk in 0..4usize {
-        let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
-            continue;
-        };
-        let vols = crate::fs::detect::probe(&mut dev);
-        for (vi, v) in vols.iter().enumerate() {
-            if !matches!(v.fs, FsType::Ext2 | FsType::Ext3 | FsType::Ext4) {
-                continue;
-            }
-            let mut part = Partition::new(&mut dev, v.start_lba, v.sectors);
-            let is_os_or_model = Ext4Reader::open(&mut part)
-                .map(|mut r| r.list_root().iter().any(|(n, _, _)| n.contains(".gguf") || n == "chitti-kernel" || n == "limine.conf"))
-                .unwrap_or(true);
-            if is_os_or_model {
-                continue;
-            }
-            MOUNTS.with(|m| {
-                m.push(Mount { path: alloc::string::String::from("/"), disk, start_lba: v.start_lba, sectors: v.sectors, fs: v.fs, label: v.label.clone() });
-            });
-            serial_println!("Chitti: mounted / -> disk {} vol {} ({}, {} MiB) [auto]", disk, vi, v.fs.name(), v.sectors * 512 / 1024 / 1024);
-            return;
-        }
-    }
-}
-
+/// to a mount path (default the first free `/mnt`, `/mnt2`, …).
 fn disk_mount(arg: &str) {
-    use alloc::string::{String, ToString};
+    use alloc::string::String;
     let mut disk: Option<usize> = None;
     let mut vol: usize = 0;
     let mut path: Option<String> = None;
+    // Default RW for FAT/ext; `ro` forces read-only. NTFS always RO for now.
+    let mut want_rw = true;
     let mut nums = 0;
     for tok in arg.split_whitespace() {
-        if let Some(p) = tok.strip_prefix('/') {
-            path = Some(alloc::format!("/{}", p));
+        if tok == "ro" {
+            want_rw = false;
+        } else if tok == "rw" {
+            want_rw = true;
+        } else if let Some(p) = tok.strip_prefix('/') {
+            path = Some(alloc::format!("/{p}"));
         } else if let Ok(n) = tok.parse::<usize>() {
             if nums == 0 {
                 disk = Some(n);
@@ -13449,139 +13411,204 @@ fn disk_mount(arg: &str) {
         }
     }
     let Some(disk) = disk else {
-        serial_println!("mount> usage: /mount <disk> [vol] [/path]   (see /disks for disk + volume indices)");
+        serial_println!(
+            "mount> usage: /mount <disk> [vol] [/path] [rw|ro]\n\
+             mount> FAT/ext default rw; NTFS mounts read-only (writer not implemented)"
+        );
         return;
     };
-    let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
-        serial_println!("mount> no disk {} (see /disks)", disk);
-        return;
-    };
-    let vols = crate::fs::detect::probe(&mut dev);
-    let Some(v) = vols.get(vol).cloned() else {
-        serial_println!("mount> disk {} has no volume {} (see /disks)", disk, vol);
-        return;
-    };
-    // Default mount point: first free /mnt, /mnt2, /mnt3, ...
-    let path = path.unwrap_or_else(|| {
-        MOUNTS.with(|m| {
-            if !m.iter().any(|x| x.path == "/mnt") {
-                return "/mnt".to_string();
+    match crate::fs::mount::mount(disk, vol, path.as_deref(), want_rw) {
+        Ok(mt) => {
+            serial_println!(
+                "mount> {} -> disk {} ({}, {} MiB, label={}, {})",
+                mt.path,
+                mt.disk,
+                mt.fs.name(),
+                mt.sectors * 512 / 1024 / 1024,
+                mt.label.as_deref().unwrap_or("-"),
+                if mt.writable { "rw" } else { "ro" }
+            );
+            if want_rw && !mt.writable {
+                serial_println!(
+                    "mount> note: {} is mounted read-only (write support not implemented)",
+                    mt.fs.name()
+                );
             }
-            (2..).map(|i| alloc::format!("/mnt{}", i)).find(|p| !m.iter().any(|x| x.path == *p)).unwrap()
-        })
-    });
-    if mount_lookup(&path).is_some() {
-        serial_println!("mount> {} already mounted (/umount it first)", path);
-        return;
+        }
+        Err(crate::fs::mount::MountError::NoDisk) => {
+            serial_println!("mount> no disk {} (see /disks)", disk);
+        }
+        Err(crate::fs::mount::MountError::NoVolume) => {
+            serial_println!("mount> disk {} has no volume {} (see /disks)", disk, vol);
+        }
+        Err(crate::fs::mount::MountError::Busy) => {
+            serial_println!("mount> path already mounted (/umount it first)");
+        }
+        Err(crate::fs::mount::MountError::Unsupported) => {
+            serial_println!(
+                "mount> unsupported filesystem (FAT/ext: rw; NTFS: ro list+read; exFAT: detect only)"
+            );
+        }
+        Err(e) => serial_println!("mount> failed: {e:?}"),
     }
-    let mt = Mount { path: path.clone(), disk, start_lba: v.start_lba, sectors: v.sectors, fs: v.fs, label: v.label.clone() };
-    MOUNTS.with(|m| m.push(mt));
-    serial_println!(
-        "mount> {} -> disk {} vol {} ({}, {} MiB, label={})",
-        path,
-        disk,
-        vol,
-        v.fs.name(),
-        v.sectors * 512 / 1024 / 1024,
-        v.label.as_deref().unwrap_or("-")
-    );
 }
 
 /// `/umount <path>` — remove a mount.
 fn disk_umount(arg: &str) {
     let path = arg.trim();
-    let removed = MOUNTS.with(|m| {
-        let before = m.len();
-        m.retain(|x| x.path != path);
-        before - m.len()
-    });
-    if removed > 0 {
-        serial_println!("umount> {} unmounted", path);
-    } else {
-        serial_println!("umount> {} not mounted (see /mounts)", path);
+    match crate::fs::mount::umount(path) {
+        Ok(()) => serial_println!("umount> {} unmounted", path),
+        Err(_) => serial_println!("umount> {} not mounted (see /mounts)", path),
     }
 }
 
 /// `/mounts` — list the mount table.
 fn disk_mounts() {
-    MOUNTS.with(|m| {
-        if m.is_empty() {
-            serial_println!("mounts> (nothing mounted; /mount <disk> [vol] [/path])");
-            return;
-        }
-        for mt in m.iter() {
-            serial_println!(
-                "  {:<8} disk {} lba {:<10} {:>6} MiB  {:<8} label={}",
-                mt.path,
-                mt.disk,
-                mt.start_lba,
-                mt.sectors * 512 / 1024 / 1024,
-                mt.fs.name(),
-                mt.label.as_deref().unwrap_or("-")
-            );
-        }
-    });
+    let m = crate::fs::mount::list();
+    if m.is_empty() {
+        serial_println!("mounts> (nothing mounted; /mount <disk> [vol] [/path])");
+        return;
+    }
+    for mt in m.iter() {
+        serial_println!(
+            "  {:<8} disk {} lba {:<10} {:>6} MiB  {:<8} {} label={}",
+            mt.path,
+            mt.disk,
+            mt.start_lba,
+            mt.sectors * 512 / 1024 / 1024,
+            mt.fs.name(),
+            if mt.writable { "rw" } else { "ro" },
+            mt.label.as_deref().unwrap_or("-")
+        );
+    }
 }
 
-/// List the root directory of a mounted volume (`/ls /mnt`). Shared FAT/ext4
-/// readers over a partition view at the mount's LBA range.
-///
-/// When the mount is `/` (the auto-mounted data partition), prefer the live
-/// Synapse store tree — on-disk keys are flat percent-encoded names and are
-/// not a useful directory listing.
-fn ls_mount(mt: &Mount) {
-    if mt.path == "/" {
+/// `/encrypt <disk> [vol]` — format a **data** partition as C4VE (AES-XTS) and
+/// put an empty ext4 on the payload. **Human-only**, destructive: existing
+/// contents of that volume are wiped. Agent tools must not call this.
+fn disk_encrypt(arg: &str) {
+    use crate::block::ext4::Ext4Writer;
+    use crate::block::volcrypto::{self, DEFAULT_HDR_SECTORS, DEFAULT_ITERATIONS};
+    use crate::block::Partition;
+
+    let mut nums = arg.split_whitespace().filter_map(|t| t.parse::<usize>().ok());
+    let Some(disk) = nums.next() else {
+        serial_println!("encrypt> usage: /encrypt <disk> [vol]   (human-only; wipes the volume)");
+        return;
+    };
+    let vol = nums.next().unwrap_or(0);
+    if !crate::modal::confirm(
+        "Encrypt volume",
+        &alloc::format!("Wipe disk {disk} vol {vol} and encrypt with AES-XTS?"),
+    ) {
+        serial_println!("encrypt> cancelled");
+        return;
+    }
+    let pass = crate::modal::input("Set passphrase", "New passphrase:", true);
+    if pass.is_empty() {
+        serial_println!("encrypt> empty passphrase refused");
+        return;
+    }
+    let pass2 = crate::modal::input("Confirm passphrase", "Repeat:", true);
+    if pass != pass2 {
+        serial_println!("encrypt> passphrases do not match");
+        return;
+    }
+    let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
+        serial_println!("encrypt> no disk {disk}");
+        return;
+    };
+    let vols = crate::fs::detect::probe(&mut dev);
+    let Some(v) = vols.get(vol).cloned() else {
+        serial_println!("encrypt> no volume {vol} on disk {disk}");
+        return;
+    };
+    let mut part = Partition::new(&mut dev, v.start_lba, v.sectors);
+    let key = match volcrypto::format(&mut part, pass.as_bytes(), DEFAULT_ITERATIONS, DEFAULT_HDR_SECTORS)
+    {
+        Ok(k) => k,
+        Err(e) => {
+            serial_println!("encrypt> format header failed: {e:?}");
+            return;
+        }
+    };
+    // Empty ext4 on the encrypted payload.
+    let mut payload =
+        volcrypto::CryptoPart::encrypted(&mut dev, v.start_lba, v.sectors, DEFAULT_HDR_SECTORS, key);
+    if let Err(e) = Ext4Writer::format(&mut payload, &[]) {
+        serial_println!("encrypt> payload mkfs failed: {e:?}");
+        return;
+    }
+    serial_println!(
+        "encrypt> disk {disk} vol {vol} is C4VE + empty ext4 ({} MiB payload). Reboot and unlock, or /unlock.",
+        (v.sectors.saturating_sub(DEFAULT_HDR_SECTORS)) * 512 / 1024 / 1024
+    );
+}
+
+/// `/unlock [disk] [vol]` — unlock a C4VE data volume and adopt it as the
+/// synapse store (if not already mounted). Human-only.
+fn disk_unlock(arg: &str) {
+    use crate::block::ext4_store::Ext4Store;
+    use crate::block::volcrypto;
+    use crate::block::Partition;
+
+    let mut nums = arg.split_whitespace().filter_map(|t| t.parse::<usize>().ok());
+    let disk = nums.next().unwrap_or(0);
+    let vol = nums.next().unwrap_or(0);
+    let pass = crate::modal::input("Unlock volume", "Passphrase:", true);
+    if pass.is_empty() {
+        serial_println!("unlock> cancelled");
+        return;
+    }
+    let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
+        serial_println!("unlock> no disk {disk}");
+        return;
+    };
+    let vols = crate::fs::detect::probe(&mut dev);
+    let Some(v) = vols.get(vol).cloned() else {
+        serial_println!("unlock> no volume {vol}");
+        return;
+    };
+    let mut part = Partition::new(&mut dev, v.start_lba, v.sectors);
+    let (key, hdr) = match volcrypto::unlock(&mut part, pass.as_bytes()) {
+        Ok(x) => x,
+        Err(_) => {
+            serial_println!("unlock> wrong passphrase or not a C4VE volume");
+            return;
+        }
+    };
+    match Ext4Store::mount_encrypted(dev, v.start_lba, v.sectors, key, hdr.hdr_sectors) {
+        Some(store) => {
+            crate::synapse::fs::mount_ext4(store);
+            serial_println!(
+                "unlock> adopted encrypted store (disk {disk} vol {vol}, hdr {} sectors)",
+                hdr.hdr_sectors
+            );
+        }
+        None => serial_println!("unlock> unlocked but payload is not a readable ext4"),
+    }
+}
+
+/// List the root of a non-store mount via the VFS.
+fn ls_mount(path: &str) {
+    if path == "/" {
         fs_ls("/");
         return;
     }
-    use crate::fs::detect::FsType;
-    let Some(mut dev) = crate::block::probe_disk_nth(mt.disk) else {
-        serial_println!("ls> disk {} gone", mt.disk);
-        return;
-    };
-    match mt.fs {
-        FsType::Fat16 | FsType::Fat32 => {
-            let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
-            match crate::block::fat_read::FatReader::open(&mut part) {
-                Some(mut r) => {
-                    let entries = r.list_root();
-                    serial_println!("ls> {} ({}) root ({} entries):", mt.path, mt.fs.name(), entries.len());
-                    for (name, size, is_dir) in entries {
-                        if is_dir {
-                            serial_println!("  {}/", name);
-                        } else {
-                            serial_println!("  {} ({} bytes)", name, size);
-                        }
-                    }
+    match crate::fs::vfs::readdir(path) {
+        Ok(entries) => {
+            serial_println!("ls> {} ({} entries):", path, entries.len());
+            for e in entries.into_iter().take(64) {
+                if e.is_dir {
+                    serial_println!("  {}/", e.name);
+                } else if e.size > 0 {
+                    serial_println!("  {} ({} bytes)", e.name, e.size);
+                } else {
+                    serial_println!("  {}", e.name);
                 }
-                None => serial_println!("ls> {} unreadable", mt.path),
             }
         }
-        FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => {
-            let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
-            match crate::block::ext4_read::Ext4Reader::open(&mut part) {
-                Some(mut r) => {
-                    let entries = r.list_root();
-                    serial_println!(
-                        "ls> {} ({}) root ({} on-disk entries; hierarchical store: /ls /):",
-                        mt.path,
-                        mt.fs.name(),
-                        entries.len()
-                    );
-                    for (name, _ino, is_dir) in entries.into_iter().take(64) {
-                        let shown = crate::block::ext4_store::key_decode(&name);
-                        let base = crate::synapse::vpath::basename(&shown);
-                        if is_dir {
-                            serial_println!("  {}/", base);
-                        } else {
-                            serial_println!("  {}", base);
-                        }
-                    }
-                }
-                None => serial_println!("ls> {} unreadable", mt.path),
-            }
-        }
-        other => serial_println!("ls> {} is {} -- listing unimplemented", mt.path, other.name()),
+        Err(e) => serial_println!("ls> {path}: {e:?}"),
     }
 }
 
@@ -13623,24 +13650,22 @@ fn fs_ls(arg: &str) {
 
     let path = crate::synapse::vpath::normalize(target);
 
-    // A non-root disk mount (e.g. /mnt) still lists the volume's on-disk root.
-    // The auto-mounted data partition at `/` is the Synapse store — list that
-    // hierarchically so we never dump every percent-encoded key as a "file".
+    // A non-root disk mount (e.g. /mnt) lists the volume via the VFS.
+    // `/` is the Synapse store tree (never dump percent-encoded on-disk keys).
     if path != "/" {
-        if let Some(mt) = mount_lookup(&path) {
-            ls_mount(&mt);
+        if crate::fs::mount::by_path(&path).is_some() {
+            ls_mount(&path);
             return;
         }
     }
 
-    // Store hierarchical listing.
+    // Store hierarchical listing, then VFS fallback for mount files.
     use crate::synapse::fs as store;
     use crate::synapse::vpath::{self, EntryClass};
 
     match store::classify(&path) {
         None => {
-            // Fall back: maybe a path under a disk mount (FAT/ext4 volume).
-            if read_mounted(&path).is_some() {
+            if crate::fs::vfs::read_mount(&path).is_ok() {
                 serial_println!("ls> {}: is a file (use /cat)", path);
             } else {
                 serial_println!("ls> {}: no such file or directory", path);
@@ -13658,7 +13683,15 @@ fn fs_ls(arg: &str) {
             }
             for e in &entries {
                 if long {
-                    serial_println!("  {}", vpath::format_long(e));
+                    let full = if path == "/" {
+                        alloc::format!("/{}", e.name)
+                    } else {
+                        alloc::format!("{}/{}", path, e.name)
+                    };
+                    let (mode, uid, mtime) = store::meta(&full)
+                        .map(|m| (m.mode, m.uid, m.mtime))
+                        .unwrap_or((0, 0, 0));
+                    serial_println!("  {}", vpath::format_long_meta(e, mode, uid, mtime));
                 } else {
                     serial_println!("  {}", vpath::format_short(e));
                 }
@@ -13678,10 +13711,10 @@ fn fs_cat(arg: &str) {
         serial_println!("cat> {}: is a directory", full);
         return;
     }
-    // Prefer the live store (agent homes, configs, downloads); then mounts.
-    let data = crate::synapse::fs::read(&full).or_else(|| read_mounted(&full));
+    // Store + mounts through the VFS facade.
+    let data = crate::fs::vfs::read(&full);
     match data {
-        Some(bytes) => {
+        Ok(bytes) => {
             serial_println!("cat> {} ({} bytes):", full, bytes.len());
             match core::str::from_utf8(&bytes) {
                 Ok(s) => match crate::highlight::lang_for_path(&full) {
@@ -13696,7 +13729,7 @@ fn fs_cat(arg: &str) {
                 Err(_) => serial_println!("(binary; {} bytes)", bytes.len()),
             }
         }
-        None => serial_println!("cat> {} not found (store or mounts; see /ls, /mounts)", full),
+        Err(_) => serial_println!("cat> {} not found (store or mounts; see /ls, /mounts)", full),
     }
 }
 
@@ -13744,7 +13777,29 @@ fn fs_glob(arg: &str) {
     }
 }
 
-/// `/mkdir [-p] <path>` — create a store directory (`.keep` marker).
+/// True when `path` resolves to a mounted volume (not only the Synapse store).
+fn path_on_mount(path: &str) -> bool {
+    crate::fs::mount::resolve(path).is_some()
+}
+
+fn vfs_err_msg(op: &str, path: &str, e: crate::fs::vfs::VfsError) {
+    use crate::fs::vfs::VfsError;
+    match e {
+        VfsError::ReadOnly => serial_println!("{op}> {path}: read-only mount (remount with rw?)"),
+        VfsError::Unsupported => {
+            serial_println!(
+                "{op}> {path}: unsupported on this volume (FAT/ext RW; NTFS is read-only)"
+            )
+        }
+        VfsError::NotFound => serial_println!("{op}> {path}: not found"),
+        VfsError::NotAFile => serial_println!("{op}> {path}: not a file"),
+        VfsError::NotADir => serial_println!("{op}> {path}: not a directory"),
+        VfsError::NotMounted => serial_println!("{op}> {path}: not mounted (see /mounts)"),
+        VfsError::Io => serial_println!("{op}> {path}: I/O error"),
+    }
+}
+
+/// `/mkdir [-p] <path>` — create a directory (store or writable mount).
 fn fs_mkdir(arg: &str) {
     let (flags, pos) = fs_split_flags(arg);
     let parents = flags.contains(&'p');
@@ -13752,13 +13807,49 @@ fn fs_mkdir(arg: &str) {
         serial_println!("mkdir> usage: /mkdir [-p] <path>");
         return;
     };
+    if path_on_mount(path) {
+        let norm = crate::fs::path::normalize(path);
+        if parents {
+            let mut cur = alloc::string::String::new();
+            for part in norm.split('/').filter(|s| !s.is_empty()) {
+                cur.push('/');
+                cur.push_str(part);
+                if crate::fs::mount::by_path(&cur).is_some() {
+                    continue; // mount root
+                }
+                // Best-effort: skip if already present as a file or dir.
+                if crate::fs::vfs::readdir(&cur).is_ok() {
+                    continue;
+                }
+                if let Err(e) = crate::fs::vfs::mkdir(&cur) {
+                    // Exists as a file (NotAFile mapping) or already there.
+                    if matches!(
+                        e,
+                        crate::fs::vfs::VfsError::NotAFile | crate::fs::vfs::VfsError::Io
+                    ) {
+                        // FatRw Exists → NotAFile; treat "already exists" as ok for -p.
+                        continue;
+                    }
+                    vfs_err_msg("mkdir", &cur, e);
+                    return;
+                }
+            }
+            serial_println!("mkdir> {norm}");
+            return;
+        }
+        match crate::fs::vfs::mkdir(path) {
+            Ok(()) => serial_println!("mkdir> {norm}"),
+            Err(e) => vfs_err_msg("mkdir", path, e),
+        }
+        return;
+    }
     match crate::synapse::fs::mkdir(path, parents) {
         Ok(()) => serial_println!("mkdir> {}", crate::synapse::vpath::normalize(path)),
         Err(e) => serial_println!("mkdir> {}: {}", path, e),
     }
 }
 
-/// `/cp [-r] <src> <dst>` — copy file or tree in the store.
+/// `/cp [-r] <src> <dst>` — copy file (store and/or mounted volumes).
 fn fs_cp(arg: &str) {
     let (flags, pos) = fs_split_flags(arg);
     let recursive = flags.contains(&'r') || flags.contains(&'R');
@@ -13768,13 +13859,28 @@ fn fs_cp(arg: &str) {
     }
     let src = &pos[0];
     let dst = &pos[1];
+    // Volume path: single-file copy via VFS (recursive trees stay store-only).
+    if path_on_mount(src) || path_on_mount(dst) {
+        if recursive {
+            serial_println!("cp> recursive copy across mounts is not supported yet");
+            return;
+        }
+        match crate::fs::vfs::read(src) {
+            Ok(data) => match crate::fs::vfs::write(dst, &data) {
+                Ok(()) => serial_println!("cp> {} → {} ({} byte(s))", src, dst, data.len()),
+                Err(e) => vfs_err_msg("cp", dst, e),
+            },
+            Err(e) => vfs_err_msg("cp", src, e),
+        }
+        return;
+    }
     match crate::synapse::fs::copy(src, dst, recursive) {
         Ok(n) => serial_println!("cp> {} → {} ({} file(s))", src, dst, n),
         Err(e) => serial_println!("cp> {}: {}", src, e),
     }
 }
 
-/// `/mv <src> <dst>` — rename/move in the store.
+/// `/mv <src> <dst>` — rename/move in the store or on a writable ext mount.
 fn fs_mv(arg: &str) {
     let (_flags, pos) = fs_split_flags(arg);
     if pos.len() < 2 {
@@ -13783,13 +13889,20 @@ fn fs_mv(arg: &str) {
     }
     let src = &pos[0];
     let dst = &pos[1];
+    if path_on_mount(src) || path_on_mount(dst) {
+        match crate::fs::vfs::rename(src, dst) {
+            Ok(()) => serial_println!("mv> {} → {}", src, dst),
+            Err(e) => vfs_err_msg("mv", src, e),
+        }
+        return;
+    }
     match crate::synapse::fs::rename(src, dst) {
         Ok(n) => serial_println!("mv> {} → {} ({} file(s))", src, dst, n),
         Err(e) => serial_println!("mv> {}: {}", src, e),
     }
 }
 
-/// `/rm [-r] <path>` — remove a store file or tree.
+/// `/rm [-r] <path>` — remove a store file/tree or a file on a writable mount.
 fn fs_rm(arg: &str) {
     let (flags, pos) = fs_split_flags(arg);
     let recursive = flags.contains(&'r') || flags.contains(&'R');
@@ -13797,17 +13910,37 @@ fn fs_rm(arg: &str) {
         serial_println!("rm> usage: /rm [-r] <path>");
         return;
     };
+    if path_on_mount(path) {
+        if recursive {
+            serial_println!("rm> recursive remove on mounts is not supported yet");
+            return;
+        }
+        match crate::fs::vfs::unlink(path) {
+            Ok(()) => serial_println!("rm> {}", path),
+            Err(e) => vfs_err_msg("rm", path, e),
+        }
+        return;
+    }
     match crate::synapse::fs::remove(path, recursive) {
         Ok(n) => serial_println!("rm> {} ({} file(s))", path, n),
         Err(e) => serial_println!("rm> {}: {}", path, e),
     }
 }
 
-/// `/touch <path>` — create empty file or refresh existing.
+/// `/touch <path>` — create empty file or refresh existing (store or mount).
 fn fs_touch(arg: &str) {
     let path = arg.trim();
     if path.is_empty() {
         serial_println!("touch> usage: /touch <path>");
+        return;
+    }
+    if path_on_mount(path) {
+        // Create empty or leave existing contents (read + rewrite).
+        let data = crate::fs::vfs::read(path).unwrap_or_default();
+        match crate::fs::vfs::write(path, &data) {
+            Ok(()) => serial_println!("touch> {}", crate::fs::path::normalize(path)),
+            Err(e) => vfs_err_msg("touch", path, e),
+        }
         return;
     }
     match crate::synapse::fs::touch(path) {
@@ -14196,65 +14329,15 @@ fn ensure_disk_fallback_fonts() {
 
 /// Scan every disk + volume for the first readable file named one of
 /// `names` (FAT or ext4; root or subpath like `brcm/foo.bin`). Independent of
-/// `/mount`, so it finds a bundled voice model / WiFi firmware on the FAT ESP
-/// (aarch64) or the ext4 data partition regardless of what is mounted where.
+/// `/mount` — see [`crate::fs::vfs::find_on_disks`].
 pub(crate) fn find_on_disks(names: &[&str]) -> Option<alloc::vec::Vec<u8>> {
-    use crate::fs::detect::FsType;
-    for disk in 0..4usize {
-        let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
-            continue;
-        };
-        for v in crate::fs::detect::probe(&mut dev) {
-            let mut part = crate::block::Partition::new(&mut dev, v.start_lba, v.sectors);
-            for name in names {
-                let data = match v.fs {
-                    FsType::Fat16 | FsType::Fat32 => crate::block::fat_read::FatReader::open(&mut part).and_then(|mut r| r.read_file(name)),
-                    FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => crate::block::ext4_read::Ext4Reader::open(&mut part).and_then(|mut r| {
-                        let sz = r.file_size(name)? as usize;
-                        let mut buf = alloc::vec![0u8; sz];
-                        let n = r.read_root_file(name, &mut buf)?;
-                        buf.truncate(n);
-                        Some(buf)
-                    }),
-                    _ => None,
-                };
-                if data.is_some() {
-                    return data;
-                }
-            }
-        }
-    }
-    None
+    crate::fs::vfs::find_on_disks(names)
 }
 
-/// Read a file at an absolute path under some active `/mount` (FAT or ext4).
-/// Shared by `/cat` and `/voice models load`. `None` if not under a mount or
-/// not found.
+/// Read a file at an absolute path under some active mount (or the store).
+/// Shared by `/voice models load` and media open helpers.
 fn read_mounted(full: &str) -> Option<alloc::vec::Vec<u8>> {
-    use crate::fs::detect::FsType;
-    let mt = MOUNTS.with(|m| {
-        m.iter()
-            .filter(|mt| full == mt.path || full.starts_with(&alloc::format!("{}/", mt.path)))
-            .max_by_key(|mt| mt.path.len())
-            .cloned()
-    })?;
-    let rel = full[mt.path.len()..].trim_start_matches('/');
-    if rel.is_empty() {
-        return None;
-    }
-    let mut dev = crate::block::probe_disk_nth(mt.disk)?;
-    let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
-    match mt.fs {
-        FsType::Fat16 | FsType::Fat32 => crate::block::fat_read::FatReader::open(&mut part).and_then(|mut r| r.read_file(rel)),
-        FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => crate::block::ext4_read::Ext4Reader::open(&mut part).and_then(|mut r| {
-            let sz = r.file_size(rel)? as usize;
-            let mut buf = alloc::vec![0u8; sz];
-            let n = r.read_root_file(rel, &mut buf)?;
-            buf.truncate(n);
-            Some(buf)
-        }),
-        _ => None,
-    }
+    crate::fs::vfs::read(full).ok()
 }
 
 fn disk_list() {

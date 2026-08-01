@@ -1,10 +1,10 @@
-//! Read-only **filesystem detection** for external disks / USB drives: identify
-//! FAT32, exFAT, NTFS, ext2/3/4, and XFS by their on-disk
-//! signatures, and parse MBR / GPT partition tables so per-partition volumes are
-//! recognized. No writes are ever issued to a foreign filesystem (per the
-//! locked decision) — this module only reads a handful of sectors to classify a
-//! volume and pull an easy label. Directory listing uses `block::fat_read` /
-//! `block::ext4_read`.
+//! **Filesystem detection** for internal disks and external/USB drives:
+//! identify FAT16/32, exFAT, NTFS, ext2/3/4, and XFS by on-disk signatures,
+//! and parse MBR / GPT so per-partition volumes are recognized.
+//!
+//! This module only **reads** a handful of sectors to classify a volume and
+//! pull a label. Read/write happens in [`super::vfs`] via
+//! `block::{fat_rw,ext4_rw,ntfs_read}` after an explicit [`super::mount`].
 
 use crate::block::{BlockDevice, BLOCK_SIZE};
 use alloc::string::String;

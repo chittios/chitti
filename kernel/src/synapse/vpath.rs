@@ -281,13 +281,32 @@ pub fn remap_under(src_root: &str, dst_root: &str, key: &str) -> Option<String> 
     })
 }
 
-/// Long listing line: type flag, size, name.
+/// Long listing line: type flag, mode octal, uid, mtime, size, name.
+///
+/// `mode` / `uid` / `mtime` are optional soft metadata (zeros if unknown).
 pub fn format_long(e: &DirEntry) -> String {
-    if e.is_dir {
-        alloc::format!("d {:>10}  {}/", "", e.name)
+    format_long_meta(e, 0, 0, 0)
+}
+
+/// Like [`format_long`], with explicit soft metadata fields.
+pub fn format_long_meta(e: &DirEntry, mode: u16, uid: u32, mtime: u32) -> String {
+    let t = if e.is_dir { 'd' } else { '-' };
+    let name = if e.is_dir {
+        alloc::format!("{}/", e.name)
     } else {
-        alloc::format!("- {:>10}  {}", e.size, e.name)
+        e.name.clone()
+    };
+    // mtime: raw unix when non-zero (shell can pretty-print later).
+    if mtime == 0 && mode == 0 && uid == 0 {
+        return alloc::format!("{t} {:>10}  {name}", e.size);
     }
+    alloc::format!(
+        "{t} {:04o} uid={:<4} mtime={:<10} {:>10}  {name}",
+        mode & 0o7777,
+        uid,
+        mtime,
+        e.size
+    )
 }
 
 /// Short listing name (dirs get a trailing `/`).

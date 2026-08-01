@@ -223,22 +223,27 @@ pub fn poll_mouse() {
 /// uses whichever controller actually has the bulk endpoints — the adapter could be
 /// plugged into either port.
 pub fn usb_bulk_ready() -> bool {
-    XHCI.with(|s| s.iter().any(|x| x.has_bulk()))
+    XHCI.with(|s| s.iter().any(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Eth)))
 }
 
-/// Queue a bulk IN transfer on the controller holding the adapter.
+/// Whether a USB mass-storage bulk pair is configured on any controller.
+pub fn usb_msc_ready() -> bool {
+    XHCI.with(|s| s.iter().any(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Msc)))
+}
+
+/// Queue a bulk IN transfer on the controller holding the Ethernet adapter.
 pub fn usb_bulk_arm_in() {
     XHCI.with(|s| {
-        for x in s.iter_mut().filter(|x| x.has_bulk()) {
+        for x in s.iter_mut().filter(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Eth)) {
             x.bulk_arm_in();
         }
     });
 }
 
-/// Collect a received frame from whichever controller has one.
+/// Collect a received frame from whichever Ethernet controller has one.
 pub fn usb_bulk_take_in(out: &mut [u8]) -> Option<usize> {
     XHCI.with(|s| {
-        for x in s.iter_mut().filter(|x| x.has_bulk()) {
+        for x in s.iter_mut().filter(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Eth)) {
             if let Some(n) = x.bulk_take_in(out) {
                 return Some(n);
             }
@@ -247,15 +252,39 @@ pub fn usb_bulk_take_in(out: &mut [u8]) -> Option<usize> {
     })
 }
 
-/// Queue a frame on the controller holding the adapter.
+/// Queue a frame on the controller holding the Ethernet adapter.
 pub fn usb_bulk_send(data: &[u8]) -> bool {
     XHCI.with(|s| {
-        for x in s.iter_mut().filter(|x| x.has_bulk()) {
+        for x in s.iter_mut().filter(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Eth)) {
             if x.bulk_send(data) {
                 return true;
             }
         }
         false
+    })
+}
+
+/// Synchronous bulk OUT for MSC BOT on the controller holding the stick.
+pub fn usb_bulk_sync_out(data: &[u8], timeout_ms: u64) -> bool {
+    XHCI.with(|s| {
+        for x in s.iter_mut().filter(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Msc)) {
+            if x.bulk_sync_out(data, timeout_ms) {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Synchronous bulk IN for MSC BOT.
+pub fn usb_bulk_sync_in(out: &mut [u8], timeout_ms: u64) -> Option<usize> {
+    XHCI.with(|s| {
+        for x in s.iter_mut().filter(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Msc)) {
+            if let Some(n) = x.bulk_sync_in(out, timeout_ms) {
+                return Some(n);
+            }
+        }
+        None
     })
 }
 
