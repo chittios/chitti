@@ -223,18 +223,30 @@ pub extern "C" fn png_decode(ptr: i32, len: i32) -> i64 {
 
 /// Pack a decode result into the raw wire form: `[w, h, ok]` then pixels.
 fn encode(img: Option<Image>) -> Vec<u8> {
-    let mut out = Vec::new();
+    // Exact capacity up front: the arena never frees, so every growth is a fresh block plus a
+    // copy of everything so far.
+    let mut out = Vec::with_capacity(match &img {
+        Some(i) => 12 + i.pixels.len() * 4,
+        None => 12,
+    });
     match img {
         Some(i) => {
             out.extend_from_slice(&(i.w as u32).to_le_bytes());
             out.extend_from_slice(&(i.h as u32).to_le_bytes());
             out.extend_from_slice(&1u32.to_le_bytes());
-            // Pixels as little-endian u32s, byte-for-byte what `Image::pixels` holds, so the
-            // host can memcpy rather than convert.
-            out.reserve(i.pixels.len() * 4);
-            for px in &i.pixels {
-                out.extend_from_slice(&px.to_le_bytes());
-            }
+            // **One memcpy, not a per-pixel append.** The first version pushed each pixel's
+            // four bytes in turn — 1.3M `extend_from_slice` calls on a bump-allocated Vec for
+            // a 1.3 MP image, which dominated the measured decode time and made the
+            // interpreter look far worse than it is. `Image::pixels` is already a contiguous
+            // little-endian `u32` run, which is exactly the wire format, so reinterpret it.
+            //
+            // SAFETY: `[u32]` -> `[u8]` over the same allocation: 4x the elements, alignment
+            // only ever relaxed, and the bytes are read immediately by the host. Both wasm and
+            // every target here are little-endian, so no swap is needed.
+            let raw = unsafe {
+                core::slice::from_raw_parts(i.pixels.as_ptr() as *const u8, i.pixels.len() * 4)
+            };
+            out.extend_from_slice(raw);
         }
         None => {
             out.extend_from_slice(&0u32.to_le_bytes());

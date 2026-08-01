@@ -14,7 +14,10 @@ crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [profile.release]
-opt-level = "s"
+# **3, not "s".** Size was copied from `pdf-wasm`, where a module is parsed once per tool call
+# and bytes matter more than cycles. A decoder is the opposite: it is the hot path, and `"s"`
+# costs real time in inflate's inner loops. 19 KiB -> a few KiB more is a trade worth making.
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
