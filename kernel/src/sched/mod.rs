@@ -128,6 +128,19 @@ struct TaskControlBlock {
     /// undercounted rather than misattributed. Fine for a share-of-CPU display;
     /// not a basis for billing.
     ticks_run: u64,
+    /// Runnable **only on the boot CPU**.
+    ///
+    /// Set for any task holding a user [`AddressSpace`](crate::mm::space::AddressSpace),
+    /// because there is no TLB shootdown on either arch: a space is only valid on
+    /// the core that activated it, so running such a task elsewhere reads through
+    /// stale translations. That failure mode is *silent memory corruption*, not a
+    /// fault, which is why this is a hard property of the task rather than a comment.
+    ///
+    /// Nothing sets it yet — tenants are entered synchronously from the BSP and are
+    /// never queued — so today it guards a path that cannot be reached. It is here
+    /// because P8 makes tenants real scheduler tasks, and at that moment the guard
+    /// has to already exist: the alternative is discovering it as corruption.
+    bsp_only: bool,
 }
 
 /// What a dying task hands back, so the (potentially large) frees happen after
@@ -166,6 +179,17 @@ impl TaskControlBlock {
     /// need for identity-holder tasks and lets this become unconditional.
     fn reclaim(&mut self) -> Reclaimed {
         self.rsp = 0;
+        // **A dead task keeps no authority.** Reclamation used to hand back memory
+        // and leave the capability table intact, so a task that had exited still
+        // held live, unforgeable rights in the scheduler — ambient authority of
+        // exactly the kind this design exists to prevent, and reachable because a
+        // `TaskId` is reused by nothing but is still a valid key for the gates.
+        //
+        // Doing this was blocked by callers that used a *spawned* task as a bare
+        // identity holder and kept invoking as it after its entry had returned. The
+        // pattern they wanted is [`spawn_parked`] — never scheduled, so never
+        // reclaimed, and cheap because it owns no stack.
+        self.cap_table = CapTable::new();
         Reclaimed { stack: self.stack.take(), fx_area: self.fx_area.take() }
     }
 }
@@ -222,20 +246,60 @@ fn reap_zombie_stacks() {
 /// fault with no message and no way back. Only `Ready` tasks are ever enqueued,
 /// so finding anything else is a bug — dropped from the queue and asserted in
 /// debug rather than acted on.
-fn pop_schedulable(s: &mut SchedulerState) -> Option<TaskId> {
+/// Take the next runnable task, or `None`.
+///
+/// `on_bsp` says which core is asking. It is a parameter rather than a call to
+/// [`crate::arch::is_boot_cpu`] so the pinning rule can be tested: the unit suite
+/// only ever runs on the boot CPU, so a function that asked the hardware directly
+/// would have no way to exercise the `false` arm — the one that matters.
+fn pop_schedulable(s: &mut SchedulerState, on_bsp: bool) -> Option<TaskId> {
     // Highest priority level first, round-robin within it. Strict priority: a
     // ready `Normal` task always beats a ready `Background` one, so `Background`
     // can starve — which is the point of asking for it, and why nothing is
     // `Background` by default.
     for level in (0..LEVELS).rev() {
+        // Bound the scan by the queue length as it stands now, so a queue holding
+        // nothing but BSP-pinned tasks terminates instead of cycling them forever.
+        let mut requeued = 0;
+        let mut budget = s.ready[level].len();
         while let Some(id) = s.ready[level].pop_front() {
             if s.tasks.get(&id).is_some_and(|t| t.state == TaskState::Ready && t.fx_area.is_some()) {
+                // A pinned task is *put back*, not dropped: it is perfectly
+                // runnable, just not here. Dropping it would strand a live task.
+                if !on_bsp && s.tasks.get(&id).is_some_and(|t| t.bsp_only) {
+                    s.ready[level].push_back(id);
+                    requeued += 1;
+                    if requeued >= budget {
+                        break;
+                    }
+                    continue;
+                }
                 return Some(id);
             }
             debug_assert!(false, "sched: an unschedulable task was in a ready queue");
+            // An unschedulable entry leaves the queue for good, so it shortens the
+            // scan rather than extending it.
+            budget = budget.saturating_sub(1);
         }
     }
     None
+}
+
+/// Confine `id` to the boot CPU from now on. See [`TaskControlBlock::bsp_only`].
+///
+/// One-way on purpose: a task that has ever activated a user address space has
+/// touched this core's TLB, and there is no shootdown to undo that.
+pub fn pin_to_boot_cpu(id: TaskId) {
+    SCHED.with(|slot| {
+        if let Some(t) = slot.as_mut().and_then(|s| s.tasks.get_mut(&id)) {
+            t.bsp_only = true;
+        }
+    });
+}
+
+/// Whether `id` is confined to the boot CPU.
+pub fn is_pinned_to_boot_cpu(id: TaskId) -> bool {
+    SCHED.with(|slot| slot.as_ref().and_then(|s| s.tasks.get(&id)).is_some_and(|t| t.bsp_only))
 }
 
 /// Put a runnable task on the queue for its priority.
@@ -263,7 +327,7 @@ fn dequeue(s: &mut SchedulerState, id: TaskId) {
 /// task, or an idle task that yielded, would be picked in preference to nothing
 /// and the scheduler would spin on it.
 fn pick_next(s: &mut SchedulerState) -> Option<TaskId> {
-    if let Some(id) = pop_schedulable(s) {
+    if let Some(id) = pop_schedulable(s, crate::arch::is_boot_cpu()) {
         return Some(id);
     }
     let idle = s.idle?;
@@ -477,6 +541,7 @@ pub fn init() {
                 stack: None,
                 fx_area: Some(Box::new(context::FxArea::new())),
                 cap_table: CapTable::new(),
+                bsp_only: false,
                 priority: Priority::Normal,
                 ticks_run: 0,
             },
@@ -491,6 +556,8 @@ pub fn init() {
         });
     });
     INITIALIZED.store(true, Ordering::SeqCst);
+    // Remember which core owns the scheduler; see `arch::is_boot_cpu`.
+    crate::arch::claim_boot_cpu();
     crate::ktrace::log("sched", "scheduler initialized, current context is bootstrap task 0");
 }
 
@@ -525,6 +592,7 @@ pub fn spawn_parked(name: &'static str) -> TaskId {
                 stack: None,
                 fx_area: None,
                 cap_table: CapTable::new(),
+                bsp_only: false,
                 priority: Priority::Normal,
                 ticks_run: 0,
             },
@@ -559,6 +627,7 @@ pub fn spawn(name: &'static str, entry: extern "C" fn(u64), arg: u64) -> TaskId 
                 stack: Some(stack),
                 fx_area: Some(Box::new(context::FxArea::new())),
                 cap_table: CapTable::new(),
+                bsp_only: false,
                 priority: Priority::Normal,
                 ticks_run: 0,
             },
@@ -648,6 +717,10 @@ pub fn kill(id: TaskId) -> Result<(), &'static str> {
     let bytes = reclaimed.bytes();
     drop(reclaimed); // deallocate outside the scheduler lock
     crate::cap::clear_scopes(id); // drop the fine-grained scope ledger too
+    // And any human approval held for it. Task ids are reused, so a stale
+    // approval would hand a future tenant a permission a human gave to something
+    // else entirely.
+    crate::synapse::policy::clear_task(id);
     crate::ktrace::log_fmt(format_args!("sched: task {id} killed ({bytes} bytes reclaimed)"));
     Ok(())
 }
@@ -687,6 +760,16 @@ pub fn yield_now() {
 /// `w` (a block — off the queue until [`wake`]). Returns whether a switch
 /// actually happened; see [`block_on`] for why a caller cares.
 fn reschedule(park: Option<Wait>) -> bool {
+    // **The scheduler is single-core, and a user address space depends on it.**
+    // There is no TLB shootdown on either arch, so an `AddressSpace` activated here
+    // is only valid here. APs never reach this today — they park for IPI work and
+    // arm no timer — so this is a tripwire for the change that would alter that
+    // (giving APs a timer tick), whose symptom would otherwise be stale-TLB
+    // corruption rather than a fault. See `arch::is_boot_cpu`.
+    debug_assert!(
+        crate::arch::is_boot_cpu(),
+        "sched::reschedule on a non-boot core: a tenant's address space would be stale here"
+    );
     let mut switched = false;
     interrupts::without_interrupts(|| {
         let switch = SCHED.with(|slot| {
@@ -871,6 +954,7 @@ pub fn fault_current_task(reason: &'static str) {
         }
     });
     crate::cap::clear_scopes(current);
+    crate::synapse::policy::clear_task(current);
     // Same path as a normal exit: mark Dead, park the stack for the reaper, and
     // switch away for good. Halts by itself if there is genuinely nothing to run.
     exit_current_task();
@@ -929,6 +1013,68 @@ pub extern "C" fn exit_current_task() -> ! {
 mod tests {
     use super::*;
 
+    /// A scheduler state built from scratch, so the pinning rule can be exercised
+    /// without touching the live scheduler.
+    ///
+    /// Necessary because the unit suite runs on the boot CPU: the interesting arm of
+    /// [`pop_schedulable`] is the one taken on an AP, which no test can reach by
+    /// asking the hardware. Building the state also keeps the assertions away from
+    /// the real ready queues, where dequeuing a task to make a point would leave the
+    /// system with a task the scheduler had forgotten.
+    fn synthetic_state(pinned: TaskId, plain: TaskId) -> SchedulerState {
+        let mut tasks = BTreeMap::new();
+        for (id, bsp_only) in [(pinned, true), (plain, false)] {
+            tasks.insert(
+                id,
+                TaskControlBlock {
+                    name: "synthetic",
+                    state: TaskState::Ready,
+                    rsp: 0,
+                    stack: None,
+                    // `Some` is what makes a task schedulable at all, so a synthetic
+                    // task without one would be skipped for the wrong reason and the
+                    // test would pass whatever the pinning code did.
+                    fx_area: Some(Box::new(context::FxArea::new())),
+                    cap_table: CapTable::new(),
+                    priority: Priority::Normal,
+                    ticks_run: 0,
+                    bsp_only,
+                },
+            );
+        }
+        let mut ready: [VecDeque<TaskId>; LEVELS] = Default::default();
+        // Pinned first, so a core that must skip it has to look past the head of the
+        // queue rather than happening to find the right task immediately.
+        ready[Priority::Normal.level()].push_back(pinned);
+        ready[Priority::Normal.level()].push_back(plain);
+        SchedulerState { tasks, ready, current: 0, next_id: 100, tick_count: 0, idle: None }
+    }
+
+    #[test_case]
+    fn a_bsp_pinned_task_is_never_selected_on_another_core() {
+        let (pinned, plain) = (101, 102);
+
+        // On an AP the pinned task is passed over -- and *kept*, not dropped.
+        let mut s = synthetic_state(pinned, plain);
+        assert_eq!(pop_schedulable(&mut s, false), Some(plain), "an AP must skip the pinned task");
+        assert!(
+            s.ready[Priority::Normal.level()].contains(&pinned),
+            "the pinned task must stay queued for the boot CPU, not be stranded"
+        );
+
+        // With nothing but pinned work, an AP finds nothing — and terminates. A
+        // requeue-and-retry loop without the length bound spins here forever, which
+        // is a hang rather than a wrong answer, so this case is the one worth pinning.
+        let mut only_pinned = synthetic_state(pinned, plain);
+        only_pinned.tasks.get_mut(&plain).expect("synthetic task").bsp_only = true;
+        assert_eq!(pop_schedulable(&mut only_pinned, false), None, "an AP has nothing runnable here");
+        assert_eq!(only_pinned.ready[Priority::Normal.level()].len(), 2, "both stay queued");
+
+        // The boot CPU is unaffected: it takes the head of the queue as before.
+        let mut on_bsp = synthetic_state(pinned, plain);
+        assert_eq!(pop_schedulable(&mut on_bsp, true), Some(pinned), "the boot CPU may run pinned work");
+    }
+
     /// Bytes currently allocated on the kernel heap. The tests below assert on
     /// *changes* in this, because task reclamation is a claim about memory and
     /// nothing else can check it: a leaked stack has no other observable effect
@@ -940,7 +1086,23 @@ mod tests {
     /// Entry point for a spawned test task. Returns immediately, so if the timer
     /// ever preempts into it, it exits cleanly through `exit_current_task` — the
     /// deferred-free path — rather than running off the end of its stack.
+    ///
+    /// **Only use this where the test wants the task to finish.** The timer can
+    /// schedule any ready task between any two statements, so a `noop_task` may
+    /// already be dead and reaped by the next line — which makes it useless for
+    /// asserting anything that requires the task to still exist (that it is alive,
+    /// that it owns a stack, that it is queued, that it can be killed). For those,
+    /// use [`live_task`], which cannot exit while it is being observed. Several of
+    /// these tests were passing on timing luck until this was written down.
     extern "C" fn noop_task(_arg: u64) {}
+
+    /// A task that stays alive until `SPIN_STOP` is set, so a test can observe it
+    /// in a definite state. Yields, so it never monopolises the CPU.
+    extern "C" fn live_task(_arg: u64) {
+        while !SPIN_STOP.load(Ordering::SeqCst) {
+            yield_now();
+        }
+    }
 
     #[test_case]
     fn a_parked_task_allocates_no_stack() {
@@ -948,25 +1110,46 @@ mod tests {
         // that is never scheduled has no business owning 256 KiB. This used to
         // allocate a full STACK_SIZE stack plus an FPU area for a task the same
         // function then declined to enqueue.
-        let before = heap_used();
+        //
+        // **Asserted structurally, not as a heap delta.** A byte delta across the
+        // spawn is not attributable to the spawn: any other task may free its
+        // 256 KiB stack in between, and here that would make the number *smaller* —
+        // i.e. a broken `spawn_parked` that allocated a full stack could still pass.
+        // Stack ownership is the property being claimed, so claim it directly.
         let id = spawn_parked("test-parked");
-        let cost = heap_used().saturating_sub(before);
-        assert!(
-            cost < STACK_SIZE / 8,
-            "a parked task cost {cost} bytes; it must not be allocating a {STACK_SIZE}-byte stack"
-        );
+        assert!(!owns_a_stack(id), "a parked task must not own a stack");
         kill(id).expect("kill the parked task");
     }
 
     #[test_case]
     fn a_spawned_task_really_does_take_a_stack() {
-        // The control for the test above: without this, "parked is cheap" could
-        // pass because the measurement itself is broken.
-        let before = heap_used();
-        let id = spawn("test-spawn-cost", noop_task, 0);
-        let cost = heap_used().saturating_sub(before);
-        assert!(cost >= STACK_SIZE, "a runnable task must own a stack; measured {cost} bytes");
+        // The control for the test above: without this, "parked owns no stack" could
+        // pass because `owns_a_stack` never answers true.
+        SPIN_STOP.store(false, Ordering::SeqCst);
+        // `live_task`, not `noop_task`: a task that had already run and been
+        // reaped by the time we look would own no stack for a different reason.
+        let id = spawn("test-spawn-cost", live_task, 0);
+        assert!(owns_a_stack(id), "a runnable task must own a stack");
+        SPIN_STOP.store(true, Ordering::SeqCst);
         let _ = kill(id);
+    }
+
+    /// Does this task actually own a stack? The structural form of "the spawn
+    /// allocated one".
+    ///
+    /// Replaces a `heap_used()` byte-delta premise, which stopped being stable
+    /// once `mm::heap` could **grow**: `used` is `total - free`, and a growth
+    /// moves both, so a delta measured across an allocation that happens to
+    /// trigger one says nothing reliable. Asserting on the field is the thing the
+    /// test actually means, and it cannot be perturbed by an unrelated allocation
+    /// landing between the two measurements.
+    fn owns_a_stack(id: TaskId) -> bool {
+        SCHED.with(|slot| {
+            slot.as_ref()
+                .and_then(|s| s.tasks.get(&id))
+                .and_then(|t| t.stack.as_ref())
+                .is_some_and(|st| st.len() >= STACK_SIZE)
+        })
     }
 
     #[test_case]
@@ -974,21 +1157,26 @@ mod tests {
         // The leak this fixes: `kill` marked the task Dead and left the stack
         // allocated for the life of the kernel, so every agent switch and every
         // sub-agent delegation cost 256 KiB that never came back.
-        let before = heap_used();
-        let id = spawn("test-kill-frees", noop_task, 0);
-        assert!(heap_used() > before + STACK_SIZE / 2, "test premise: the spawn allocated a stack");
+        SPIN_STOP.store(false, Ordering::SeqCst);
+        let id = spawn("test-kill-frees", live_task, 0);
+        assert!(owns_a_stack(id), "test premise: the spawn allocated a stack");
+        // Measure across the kill only. The *spawn* delta is not a usable
+        // baseline any more (see `owns_a_stack`), but the kill's is: whatever the
+        // arena's size, freeing a stack must return at least a stack's worth.
+        let before_kill = heap_used();
         kill(id).expect("kill");
         let after = heap_used();
         assert!(
-            after < before + STACK_SIZE / 8,
-            "after kill the heap still holds {} extra bytes; the stack was not freed",
-            after.saturating_sub(before)
+            before_kill.saturating_sub(after) >= STACK_SIZE / 2,
+            "kill returned only {} bytes; the stack was not freed",
+            before_kill.saturating_sub(after)
         );
     }
 
     #[test_case]
     fn a_killed_task_is_dead_and_unschedulable() {
-        let id = spawn("test-kill-state", noop_task, 0);
+        SPIN_STOP.store(false, Ordering::SeqCst);
+        let id = spawn("test-kill-state", live_task, 0);
         assert!(is_alive(id));
         kill(id).expect("kill");
         assert!(!is_alive(id));
@@ -1022,6 +1210,19 @@ mod tests {
     }
 
     #[test_case]
+    fn the_scheduler_knows_which_core_owns_it() {
+        // The tripwire's own premise. `reschedule` asserts this, so if the identity
+        // read were broken the assertion would fire on every switch in a debug
+        // build — which is a loud failure, but only if the read works at all.
+        assert!(crate::arch::is_boot_cpu(), "the suite runs on the boot core");
+        // And the id is stable: a hardware read that returned garbage per call would
+        // make the assertion fire intermittently, which is far worse than never.
+        let a = crate::arch::hw_cpu_id();
+        let b = crate::arch::hw_cpu_id();
+        assert_eq!(a, b, "the hardware cpu id must be stable");
+    }
+
+    #[test_case]
     fn kill_refuses_the_bootstrap_task_and_unknown_ids() {
         // These refusals are what make `kill`'s immediate free safe: it can only
         // ever free a stack nothing is executing on.
@@ -1041,9 +1242,12 @@ mod tests {
         // The deferred-free path. The task cannot free the stack under its own
         // feet, so `exit_current_task` parks it and the next `yield_now` — which
         // by definition runs on a different stack — frees it.
+        // `noop_task` is correct here — the point is that it finishes — so there
+        // is no premise to assert about it still being alive. Measure across the
+        // whole spawn-run-reap cycle instead: growth does not move `used`, so
+        // `after` returning to `before` is exactly the claim.
         let before = heap_used();
         let id = spawn("test-exit-reaps", noop_task, 0);
-        assert!(heap_used() > before + STACK_SIZE / 2, "test premise: the spawn allocated a stack");
         // Yield until it has run to completion. Bounded so a scheduling
         // regression fails the test instead of hanging the suite.
         let mut spins = 0;
@@ -1058,20 +1262,27 @@ mod tests {
         let after = heap_used();
         assert!(
             after < before + STACK_SIZE / 8,
-            "after exit + reap the heap still holds {} extra bytes",
+            "after exit + reap the heap still holds {} extra bytes; the stack was not freed",
             after.saturating_sub(before)
         );
+        assert!(!owns_a_stack(id), "and the TCB must no longer hold one");
     }
 
     #[test_case]
-    fn a_task_that_exits_keeps_its_capabilities_but_kill_revokes_them() {
-        // The regression this pins, which cost a full suite run to find: making
-        // `reclaim` revoke authority looks obviously right — a dead task should
-        // hold none — but `persona::Agent::spawn` and the agent layer use a task
-        // as an *identity holder* whose entry returns immediately, and keep
-        // invoking Synapse primitives as that task afterwards. Revoking on exit
-        // made every persona agent lose its own manifest's capabilities the
-        // instant the scheduler ran it, surfacing as `denied:mem_fs_read`.
+    fn a_task_that_exits_loses_its_capabilities() {
+        // **This test used to assert the opposite**, and the inversion is the point.
+        // Making `reclaim` revoke authority is obviously right — a dead task should
+        // hold none — but it broke every persona agent, because
+        // `persona::Agent::spawn` used a *spawned* task as an identity holder whose
+        // entry returned immediately, then kept invoking Synapse as it. An entry that
+        // returns does not park a task, it kills it, so the agents were relying on a
+        // dead task keeping live rights and revoking surfaced as `denied:mem_fs_read`.
+        //
+        // The fix was at that caller, not here: `spawn_parked` is the identity-holder
+        // pattern (never scheduled, so never reclaimed, and no stack). With it gone,
+        // reclamation can enforce the property the system actually wants — no dead
+        // task anywhere holds authority — so this now pins that instead of the
+        // workaround it used to protect.
         use crate::cap::{self, Right};
         let id = spawn("test-exit-keeps-caps", noop_task, 0);
         let right = Right::InvokePrimitive(1);
@@ -1084,13 +1295,13 @@ mod tests {
             spins += 1;
         }
         assert!(!is_alive(id), "the task did not run to completion in {spins} yields");
-        // Exited, stack reclaimed — and still holding its authority.
+        // Exited, stack reclaimed — and no longer holding authority.
         assert!(
-            cap::holds(id, right),
-            "a self-exited identity holder must keep its capability table; retiring an identity is `kill`'s job"
+            !cap::holds(id, right),
+            "a task that has exited must hold no capabilities: reclamation revokes"
         );
 
-        // `kill` is the explicit retirement, and it does revoke.
+        // `kill` a dead task still reports it was already dead.
         kill(id).expect_err("already dead");
         // A dead task cannot be killed again, so revoke through the same policy
         // path a live identity would take.
@@ -1357,13 +1568,18 @@ mod tests {
         // Strict priority, and `Background` really can starve — that is what
         // asking for it means, and why nothing is `Background` by default.
         SPIN_STOP.store(false, Ordering::SeqCst);
-        IDLE_TICKS.store(0, Ordering::SeqCst);
         WORKER_TICKS.store(0, Ordering::SeqCst);
         // `idle_counter` and `worker_counter` differ only in which counter they
         // bump, so they stand in for a Background and a Normal task here.
         let background = spawn("test-bg", idle_counter, 0);
         set_priority(background, Priority::Background);
         assert_eq!(priority_of(background), Some(Priority::Background));
+        // Zero the counter *after* the demotion, for the same reason the idle
+        // test zeroes after `set_idle`: `spawn` enqueues at `Normal`, so a timer
+        // tick landing between the spawn and the `set_priority` legitimately
+        // gives this task one Normal turn. Counting that as a Background turn
+        // would fail a test whose subject behaved correctly.
+        IDLE_TICKS.store(0, Ordering::SeqCst);
         let normal = spawn("test-normal", worker_counter, 0);
         assert_eq!(priority_of(normal), Some(Priority::Normal), "Normal is the default");
 
@@ -1539,7 +1755,8 @@ mod tests {
         // `state` used to go stale the moment anything was spawned: task 0 stayed
         // `Running` forever and every other task stayed `Ready` even while
         // executing, so `/agents` and `/top` could only ever show task 0 running.
-        let id = spawn("test-state-honest", noop_task, 0);
+        SPIN_STOP.store(false, Ordering::SeqCst);
+        let id = spawn("test-state-honest", live_task, 0);
         let listed = list();
         let me = current_task_id();
         assert_eq!(listed.iter().find(|t| t.0 == me).map(|t| t.2), Some("running"));

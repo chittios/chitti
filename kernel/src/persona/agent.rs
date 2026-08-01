@@ -74,18 +74,23 @@ pub struct Agent {
     confirm_destructive: bool,
 }
 
-/// Entry point for an agent's task. The plan/act loop runs synchronously in
-/// the driver (shell or test), so the task itself only needs to exist to own
-/// the agent's identity and capability table; it parks immediately. (Agents
-/// that must run concurrently -- e.g. the IPC-coordination test -- are spawned
-/// as ordinary tasks with their own entry, not through `Agent`.)
-extern "C" fn agent_task_entry(_arg: u64) {}
-
 impl Agent {
     /// Spawn an agent from its manifest: create its task, and grant that task
     /// exactly the capabilities the manifest declares (no ambient authority).
     pub fn spawn(manifest: Manifest) -> Agent {
-        let task = sched::spawn("persona-agent", agent_task_entry, 0);
+        // **Parked, not spawned-and-returned.** The plan/act loop runs synchronously
+        // in the driver (shell or test), so this task exists only to own the agent's
+        // identity and capability table. It used to be a real `spawn` whose entry
+        // returned immediately — which does not park a task, it *kills* it, and the
+        // agent then went on invoking Synapse as a dead task. That is what forced
+        // `TaskControlBlock::reclaim` to leave capability tables intact, i.e. one
+        // caller's shortcut kept authority alive for every dead task in the system.
+        //
+        // `spawn_parked` is the pattern this wanted all along: never scheduled, so
+        // never reclaimed, and it allocates no stack for a task that never runs.
+        // (Agents that must run concurrently -- e.g. the IPC-coordination test -- are
+        // spawned as ordinary tasks with their own entry, not through `Agent`.)
+        let task = sched::spawn_parked("persona-agent");
         for &prim in &manifest.capabilities {
             cap::grant(task, Right::InvokePrimitive(prim));
         }
@@ -226,6 +231,7 @@ impl Agent {
                     Invocation::Rejected(err) => alloc::format!("rejected:{err:?}"),
                     Invocation::RefusedTainted { primitive } => alloc::format!("refused:tainted:{primitive}"),
                     Invocation::DeniedScope { primitive } => alloc::format!("denied:scope:{primitive}"),
+                    Invocation::NeedsApproval { primitive } => alloc::format!("denied:needs-approval:{primitive}"),
                 }
             }
             Action::Remember(key, value) => {
