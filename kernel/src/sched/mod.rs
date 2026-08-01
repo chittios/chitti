@@ -6,11 +6,20 @@
 //! slice of ticks elapses (`on_timer_tick`), so the same primitive serves
 //! both "cooperative" and "timer-preemptive" scheduling.
 //!
-//! There is no ring 3 / user-mode separation yet -- every task runs in
-//! ring 0. The capability system (`cap`) is what enforces "no ambient
-//! authority" here: tasks can only reach another task's resources through
-//! a `Cap` they were explicitly granted, never by holding a raw pointer
-//! or task ID to reach in directly.
+//! **Ring 3 / EL0 exists now** (`arch::enter_tenant` over
+//! `arch::x86_64::fastcall` / `arch::aarch64::el0`), and a task can hold its own
+//! address space (`mm::space::AddressSpace`). But note carefully what does and
+//! does not run there, because the difference is easy to overstate: an agent's
+//! *Synapse calls* cross the boundary (`synapse::tenant`), while the code that
+//! plans them -- the model, the tool layer, the wasm host -- still runs in ring 0,
+//! as do all the drivers and every decoder. So the capability system (`cap`) is
+//! still the primary boundary for most of the kernel: tasks reach another task's
+//! resources only through a `Cap` they were granted, never by holding a raw
+//! pointer or task id.
+//!
+//! A task stack is a plain heap `Box` with **no guard page** — see
+//! [`spawn_with_stack`], which puts a canary at the low end so an overflow is
+//! reported rather than silently corrupting the heap beneath it.
 
 pub mod context;
 
