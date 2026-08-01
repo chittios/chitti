@@ -166,19 +166,30 @@ impl TaskControlBlock {
     /// that matters — [`exit_current_task`] — is executing on it, and must defer
     /// the free until it has switched away.
     ///
-    /// **Deliberately does not revoke capabilities.** That is [`kill`]'s policy,
-    /// and it has to stay there: `persona::Agent::spawn` and the agent layer use
-    /// a task as an *identity holder* whose entry function returns immediately,
-    /// then keep invoking Synapse primitives as that task — so a dead task's
-    /// capability table is load-bearing, not vestigial. Revoking it here (which
-    /// the first version of this did, on the reasonable-sounding grounds that a
-    /// dead task should hold no authority) makes every persona agent lose its
-    /// capabilities the instant it is scheduled, which reads as "the agent was
-    /// denied its own manifest". Retiring an identity is an explicit act:
-    /// `kill`. P8, where agents become real running tasks, is what removes the
-    /// need for identity-holder tasks and lets this become unconditional.
+    /// **Revokes capabilities**, and the history is worth keeping: this deliberately
+    /// did *not*, because `persona::Agent::spawn` used a task as an identity holder
+    /// whose entry returned immediately and then kept invoking Synapse as it — so a
+    /// dead task's capability table was load-bearing. Revoking here made every
+    /// persona agent lose its own manifest's rights the instant it was scheduled.
+    /// The fix was at that caller (`spawn_parked` is the identity-holder pattern,
+    /// never scheduled and so never reclaimed), which is what let this become
+    /// unconditional.
     fn reclaim(&mut self) -> Reclaimed {
         self.rsp = 0;
+        // Check the canary while we still know whose stack this is. A stack with no
+        // canary (the bootstrap task, a parked task) has no `stack` to check.
+        //
+        // **Counts, does not log.** `reclaim` runs with the scheduler lock held, and
+        // `ktrace` is not a leaf: it formats, and on this kernel it can reach the
+        // console and the compositor. Doing that under `Locked` — which is
+        // non-reentrant and holds interrupts off — is the deadlock the whole
+        // "never block while holding a lock" rule exists for. Report via
+        // `stack_overflows()` from somewhere that holds nothing.
+        if let Some(st) = self.stack.as_ref() {
+            if st.len() >= 8 && st[..8] != STACK_CANARY.to_ne_bytes() {
+                CANARIES_LOST.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         // **A dead task keeps no authority.** Reclamation used to hand back memory
         // and leave the capability table intact, so a task that had exited still
         // held live, unforgeable rights in the scheduler — ambient authority of
@@ -504,6 +515,39 @@ pub fn wake(w: Wait) -> usize {
     })
 }
 
+/// Wait until `id` has finished. Returns false if it never existed.
+///
+/// **Polls with `yield_now` rather than blocking on a wait queue**, and that is a
+/// deliberate retreat from a `Wait::Task(id)` variant that worked but was not worth
+/// its cost. Waking a joiner from `exit_current_task` means running the wake scan on
+/// the *fault-recovery* path — `fault_current_task` exits the task from inside the
+/// page-fault handler — where `enqueue`'s `VecDeque::push_back` can allocate, inside
+/// the scheduler lock, with interrupts off, on the faulting task's own stack. That
+/// reliably turned a cleanly-survived page fault into a `#GP` and a dead machine,
+/// which is the exact guarantee P4 exists to provide.
+///
+/// So the fault path stays as it was, and the cost is paid here instead: a joiner
+/// takes scheduling turns doing nothing while its agent works. That is real but
+/// small (a context switch per turn, against seconds of model inference), it cannot
+/// deadlock, and it cannot lose a wakeup — there is no wakeup to lose.
+pub fn join(id: TaskId) -> bool {
+    if !exists(id) {
+        return false;
+    }
+    let mut spins = 0u64;
+    while is_alive(id) {
+        yield_now();
+        spins = spins.saturating_add(1);
+        debug_assert!(spins < 100_000_000, "sched::join: task {id} never finished");
+    }
+    true
+}
+
+/// Whether the scheduler still has a record of `id`, alive or dead.
+pub fn exists(id: TaskId) -> bool {
+    SCHED.with(|slot| slot.as_ref().is_some_and(|s| s.tasks.contains_key(&id)))
+}
+
 /// How many tasks are currently sleeping on `w`. For diagnostics and for the
 /// idle task, which only needs to pump when someone is waiting on it.
 pub fn blocked_count(w: Wait) -> usize {
@@ -608,10 +652,43 @@ pub fn spawn_parked(name: &'static str) -> TaskId {
 /// task starts `Ready` and joins the round-robin queue; it does not run
 /// until some task (or the timer) yields to it.
 pub fn spawn(name: &'static str, entry: extern "C" fn(u64), arg: u64) -> TaskId {
-    let mut stack = alloc::vec![0u8; STACK_SIZE].into_boxed_slice();
-    let stack_top = (stack.as_mut_ptr() as u64 + STACK_SIZE as u64) & !0xf;
-    // SAFETY: `stack` is a freshly allocated, exclusively-owned 64 KiB
-    // region; `stack_top` is 16-byte aligned and well within it.
+    spawn_with_stack(name, entry, arg, STACK_SIZE)
+}
+
+/// Written at the lowest address of every task stack, and checked when the task is
+/// reaped. A stack grows *down*, so this is the first thing an overflow destroys.
+const STACK_CANARY: u64 = 0xc0ff_ee57_ac_4d_ea_d1;
+
+/// Tasks whose stack canary was found overwritten. Non-zero means some task
+/// overflowed its stack and corrupted the heap beneath it.
+static CANARIES_LOST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many task stacks have been found overflowed.
+pub fn stack_overflows() -> u64 {
+    CANARIES_LOST.load(Ordering::Relaxed)
+}
+
+/// [`spawn`] with an explicit stack size.
+///
+/// Exists because a task stack is a plain heap `Box` with **no guard page**, so an
+/// overflow silently corrupts whatever the allocator put beneath it. That is not
+/// hypothetical here: 64 KiB stacks used to triple-fault on the ONNX interpreter's
+/// ~55-arm dispatch frame, and the diagnosis was a dead machine with no output.
+/// Moving deep call chains (an agent's whole plan/act loop, model forwards and all)
+/// onto task stacks makes the headroom a per-caller decision, so it is a parameter
+/// rather than one constant that has to satisfy everybody.
+///
+/// A canary at the low end turns the silent case into a reported one. It is checked
+/// when the stack is handed back, which is late — the corruption has already
+/// happened — but it names the task, and "task X overflowed" is a different
+/// investigation from "the machine stopped".
+pub fn spawn_with_stack(name: &'static str, entry: extern "C" fn(u64), arg: u64, stack_bytes: usize) -> TaskId {
+    let stack_bytes = stack_bytes.max(STACK_SIZE / 8);
+    let mut stack = alloc::vec![0u8; stack_bytes].into_boxed_slice();
+    let stack_top = (stack.as_mut_ptr() as u64 + stack_bytes as u64) & !0xf;
+    stack[..8].copy_from_slice(&STACK_CANARY.to_ne_bytes());
+    // SAFETY: `stack` is a freshly allocated, exclusively-owned region;
+    // `stack_top` is 16-byte aligned and well within it.
     let rsp = unsafe { context::init_stack(stack_top, entry, arg) };
 
     let id = SCHED.with(|slot| {
