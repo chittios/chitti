@@ -161,6 +161,26 @@ pub struct Loaded {
     pub stack_page: u64,
 }
 
+impl Loaded {
+    /// Map kernel-owned `frames` consecutively at `va` in the tenant.
+    ///
+    /// The frames stay the **kernel's** — this shares them rather than handing them over,
+    /// which is what lets megabytes of input and output cross the boundary with no copy.
+    /// The kernel keeps its own alias (`space::phys_to_kernel`) and can read the result
+    /// straight out after the tenant exits.
+    ///
+    /// Read-only for input is not a formality: a decoder must not be able to rewrite the
+    /// bitstream it was handed, or a second pass over the "same" data is not the same data.
+    pub fn map_shared(&mut self, va: u64, frames: &[u64], perms: UserPerms) -> Result<(), LoadError> {
+        for (i, &phys) in frames.iter().enumerate() {
+            self.space
+                .map_frame(va + (i as u64) * 0x1000, phys, perms)
+                .map_err(|_| LoadError::Map)?;
+        }
+        Ok(())
+    }
+}
+
 /// Lay `blob` out as a tenant: one RX code page and one RW stack page.
 ///
 /// The smallest layout that can run anything, and enough for a first-party agent
@@ -347,6 +367,52 @@ mod tests {
     }
 
     #[test_case]
+    fn a_tenant_computes_over_bulk_shared_buffers_with_no_authority() {
+        // **The decoder shape, proven end to end.** Megabytes in and out through shared
+        // frames, computed in ring 3, with the tenant holding *no capability at all* —
+        // which is why moving PNG/JPEG/H.264 here needs no new Synapse primitive. The
+        // payload is a checksum so the assertion can be differential against a trivially
+        // correct kernel-side computation; porting a real decoder changes what runs
+        // inside, not whether the boundary works.
+        let tenant = crate::sched::spawn_parked("bulk-tenant");
+
+        // Spans several pages on purpose: a single-page buffer would pass even if
+        // `map_shared` mapped only the first frame, which is the mistake worth catching.
+        let input: alloc::vec::Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let expected: u64 = input.iter().map(|&b| b as u64).sum();
+
+        let out = run_bulk(tenant, &input).expect("the bulk tenant must run");
+        assert_eq!(out.len(), 8, "expected an 8-byte sum, got {}", out.len());
+        let got = u64::from_le_bytes(out[..8].try_into().unwrap());
+        assert_eq!(got, expected, "ring-3 result must match the kernel's own computation");
+
+        // It really held nothing: the whole point is that a decoder needs no authority, so
+        // a capability appearing here would mean the loader was granting one silently.
+        assert!(
+            !crate::cap::holds(tenant, crate::cap::Right::InvokePrimitive(1)),
+            "a compute tenant must hold no capabilities"
+        );
+        let _ = crate::sched::kill(tenant);
+    }
+
+    #[test_case]
+    fn bulk_tenant_frames_are_returned_so_repeated_runs_do_not_leak() {
+        // A decoder runs once per frame of video, so a per-run frame leak would exhaust
+        // memory in seconds rather than eventually. Asserted across several runs, since a
+        // single run could be masked by the allocator's own slack.
+        let tenant = crate::sched::spawn_parked("bulk-tenant-leak");
+        let input = alloc::vec![7u8; 9000];
+        let before = space::free_frames();
+        for _ in 0..3 {
+            let out = run_bulk(tenant, &input).expect("run");
+            assert_eq!(u64::from_le_bytes(out[..8].try_into().unwrap()), 7 * 9000);
+        }
+        let after = space::free_frames();
+        assert_eq!(after, before, "frames must be returned: {before} -> {after}");
+        let _ = crate::sched::kill(tenant);
+    }
+
+    #[test_case]
     fn a_call_too_large_for_the_startup_block_is_refused_before_running() {
         // Bounded up front rather than truncated: a silently shortened call is a
         // *different* call, and one that might pass gates the original would not.
@@ -415,12 +481,32 @@ pub mod block {
     pub const REPLY_CAP: usize = 24;
     /// Written *by the tenant*: how many bytes of reply it received.
     pub const REPLY_LEN: usize = 32;
+    /// Base of the tenant's input buffer (read-only shared frames).
+    pub const INPUT_PTR: usize = 40;
+    /// How many bytes of input there are.
+    pub const INPUT_LEN: usize = 48;
+    /// Base of the tenant's output buffer (writable shared frames).
+    pub const OUTPUT_PTR: usize = 56;
+    /// How much room the output buffer has.
+    pub const OUTPUT_CAP: usize = 64;
+    /// Written *by the tenant*: how many output bytes it produced.
+    pub const OUTPUT_LEN: usize = 72;
+    /// Base of the tenant's private heap.
+    pub const HEAP_PTR: usize = 80;
+    /// How large that heap is.
+    pub const HEAP_LEN: usize = 88;
+    /// Written *by the tenant*: 0 on success, else its own error code. Distinct from a
+    /// fault — a decoder that cleanly rejects a malformed file is not a crash.
+    pub const STATUS: usize = 96;
     /// Where the loader puts the call text, clear of the header.
-    pub const TEXT: usize = 64;
+    ///
+    /// Moved from 64 when the buffer fields were added. Safe to move because no blob
+    /// hard-codes it — they read `CALL_PTR` — so this offset is known only to the loader.
+    pub const TEXT: usize = 128;
     /// Where the reply lands. Half a page each way, so neither can reach the other.
     pub const REPLY: usize = 2048;
     /// Room for the reply, and so also the largest call text.
-    pub const CAPACITY: usize = 2048 - 64;
+    pub const CAPACITY: usize = 2048 - TEXT;
 }
 
 /// The parameterised tenant: read the startup block, submit the call it names, record
@@ -497,6 +583,188 @@ chitti_tenant_call_end:
 unsafe extern "C" {
     static chitti_tenant_call_start: u8;
     static chitti_tenant_call_end: u8;
+}
+
+/// A tenant that consumes a **bulk input buffer** and produces a **bulk output buffer**,
+/// making no Synapse call at all.
+///
+/// This is the shape every decoder has, and the reason moving PNG/JPEG/H.264 into ring 3
+/// needs no new Synapse primitive: a decoder reads bytes, writes pixels, and exits. It
+/// requires no authority, so there is nothing for a gate to decide. What it does need is
+/// exactly what this proves — bulk data crossing in both directions through shared frames,
+/// and the kernel reading the result back out afterwards.
+///
+/// The payload is a checksum rather than a decode, so the test can be *differential*
+/// against a trivially correct kernel-side computation. Porting the real decoder then
+/// changes what runs inside, not whether the boundary works.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    r#"
+.att_syntax prefix
+.section .rodata
+.balign 16
+.globl chitti_tenant_bulk_start
+.globl chitti_tenant_bulk_end
+chitti_tenant_bulk_start:
+    movq %rdi, %rbx                     // startup block (callee-saved: survives a trap)
+    movq 40(%rbx), %rsi                 // input_ptr
+    movq 48(%rbx), %rcx                 // input_len
+    xorq %rax, %rax                     // running sum
+1:  testq %rcx, %rcx
+    jz 2f
+    movzbl (%rsi), %edx                 // zero-extends, so the high bits stay clean
+    addq %rdx, %rax
+    incq %rsi
+    decq %rcx
+    jmp 1b
+2:  movq 56(%rbx), %rdx                 // output_ptr
+    movq %rax, (%rdx)                   // the sum, little-endian
+    movq $8, 72(%rbx)                   // output_len
+    movq $0, 96(%rbx)                   // status: ok
+    movq $2, %rdi                       // Entry::Exit
+    xorq %r8, %r8
+    xorq %r9, %r9
+    syscall
+    ud2
+chitti_tenant_bulk_end:
+.section .text
+.intel_syntax noprefix
+"#
+);
+
+/// The aarch64 twin.
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    r#"
+.section .rodata
+.balign 16
+.globl chitti_tenant_bulk_start
+.globl chitti_tenant_bulk_end
+chitti_tenant_bulk_start:
+    mov x19, x0                         // startup block (callee-saved)
+    ldr x1, [x19, #40]                  // input_ptr
+    ldr x2, [x19, #48]                  // input_len
+    mov x3, #0                          // running sum
+1:  cbz x2, 2f
+    ldrb w4, [x1], #1
+    add x3, x3, x4
+    sub x2, x2, #1
+    b 1b
+2:  ldr x5, [x19, #56]                  // output_ptr
+    str x3, [x5]
+    mov x6, #8
+    str x6, [x19, #72]                  // output_len
+    str xzr, [x19, #96]                 // status: ok
+    mov x0, #2                          // Entry::Exit
+    mov x3, #0
+    mov x4, #0
+    svc #0
+    brk #0
+chitti_tenant_bulk_end:
+.section .text
+"#
+);
+
+unsafe extern "C" {
+    static chitti_tenant_bulk_start: u8;
+    static chitti_tenant_bulk_end: u8;
+}
+
+/// The assembled bytes of the bulk-buffer tenant.
+pub fn bulk_blob() -> &'static [u8] {
+    // SAFETY: as the other blobs — two symbols bracketing one `.rodata` run.
+    unsafe {
+        let start = &chitti_tenant_bulk_start as *const u8;
+        let end = &chitti_tenant_bulk_end as *const u8;
+        core::slice::from_raw_parts(start, end.offset_from(start) as usize)
+    }
+}
+
+/// Run the bulk tenant over `input`, returning what it wrote.
+///
+/// The decoder-shaped path end to end: frames the kernel owns are shared into a tenant
+/// (input read-only, output writable), the tenant computes with no authority whatsoever,
+/// and the kernel reads the result out of its own alias afterwards.
+pub fn run_bulk(task: crate::sched::TaskId, input: &[u8]) -> Result<alloc::vec::Vec<u8>, LoadError> {
+    const PAGE: usize = 0x1000;
+    let in_pages = input.len().div_ceil(PAGE).max(1);
+    let mut loaded = load(bulk_blob())?;
+
+    // Frames for the shared buffers, taken from the global allocator and handed back at
+    // the end: they stay the *kernel's*, because the kernel reads through its own alias
+    // after the tenant's space is gone.
+    let mut frames: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    for _ in 0..in_pages + 1 {
+        match space::take_shared_frame() {
+            Some(f) => frames.push(f),
+            None => {
+                for f in frames {
+                    space::give_frame(f);
+                }
+                return Err(LoadError::NoAddressSpace);
+            }
+        }
+    }
+    let (in_frames, out_frames) = frames.split_at(in_pages);
+
+    // Copy the input in through the kernel alias. Mapped **read-only** below: a decoder
+    // must not be able to rewrite the bitstream it was handed, or a second pass over the
+    // "same" data is not the same data.
+    for (i, &f) in in_frames.iter().enumerate() {
+        let off = i * PAGE;
+        let n = (input.len() - off).min(PAGE);
+        // SAFETY: a frame the kernel owns, reachable by its alias; `n` is bounded by both
+        // the page and the remaining input.
+        unsafe {
+            core::ptr::copy_nonoverlapping(input.as_ptr().add(off), space::phys_to_kernel(f) as *mut u8, n);
+        }
+    }
+
+    let args_va = loaded.stack_page + PAGE as u64;
+    let in_va = args_va + PAGE as u64;
+    let out_va = in_va + (in_pages as u64) * PAGE as u64;
+
+    let run = (|| -> Result<alloc::vec::Vec<u8>, LoadError> {
+        let args_phys = loaded.space.map_new_page(args_va, UserPerms::RW).map_err(|_| LoadError::Map)?;
+        loaded.map_shared(in_va, in_frames, UserPerms::RO)?;
+        loaded.map_shared(out_va, out_frames, UserPerms::RW)?;
+        let args_kernel = space::phys_to_kernel(args_phys);
+        // SAFETY: one page the space owns, reachable by the kernel; offsets are inside it.
+        unsafe {
+            let base = args_kernel as *mut u8;
+            let put = |off: usize, v: u64| core::ptr::write_unaligned(base.add(off) as *mut u64, v);
+            put(block::INPUT_PTR, in_va);
+            put(block::INPUT_LEN, input.len() as u64);
+            put(block::OUTPUT_PTR, out_va);
+            put(block::OUTPUT_CAP, PAGE as u64);
+        }
+        // **No justification is set**, because this tenant makes no Synapse call and so
+        // there is nothing for one to justify. That is the decoder shape in one line.
+        // SAFETY: code RX, stack RW, block RW, input RO and output RW are all mapped.
+        let exit =
+            unsafe { crate::arch::enter_tenant(task, &loaded.space, loaded.entry, loaded.stack, args_va) };
+        if !exit.is_deliberate_exit() {
+            crate::ktrace::log_fmt(format_args!("tenant: bulk tenant did not exit cleanly: {exit:?}"));
+            return Err(LoadError::Faulted);
+        }
+        // SAFETY: the loader's own page and frame; the length is clamped to the capacity
+        // the tenant was given, so a larger claim cannot walk off the page.
+        Ok(unsafe {
+            let len = (core::ptr::read_unaligned(
+                (args_kernel as *const u8).add(block::OUTPUT_LEN) as *const u64,
+            ) as usize)
+                .min(PAGE);
+            core::slice::from_raw_parts(space::phys_to_kernel(out_frames[0]) as *const u8, len).to_vec()
+        })
+    })();
+
+    // Drop the space **before** returning the frames. Freeing while a tenant mapping still
+    // referenced them would hand a live cross-privilege mapping to the next allocation.
+    drop(loaded);
+    for &f in in_frames.iter().chain(out_frames.iter()) {
+        space::give_frame(f);
+    }
+    run
 }
 
 /// The assembled bytes of the parameterised tenant.

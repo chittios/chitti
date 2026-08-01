@@ -105,6 +105,31 @@ pub struct AddressSpace {
 }
 
 /// Take a zeroed frame from the global allocator.
+/// Take a zeroed frame to **share** into a tenant.
+///
+/// Separate from the frames an [`AddressSpace`] owns, and deliberately so: a shared frame
+/// stays the kernel's, because the kernel goes on reading through its own alias after the
+/// tenant's space has been dropped. Return it with [`give_frame`] once the space is gone —
+/// freeing while a tenant mapping still exists is a use-after-free that spans a privilege
+/// boundary.
+pub fn take_shared_frame() -> Option<u64> {
+    take_frame()
+}
+
+/// Frames the allocator still has. For leak assertions around tenant runs.
+pub fn free_frames() -> u64 {
+    super::FRAME_ALLOCATOR.with(|slot| slot.as_ref().map_or(0, |a| a.free_frame_count()))
+}
+
+/// Hand a frame from [`take_shared_frame`] back to the allocator.
+pub fn give_frame(phys: u64) {
+    super::FRAME_ALLOCATOR.with(|slot| {
+        if let Some(a) = slot.as_mut() {
+            a.free(phys);
+        }
+    });
+}
+
 fn take_frame() -> Option<u64> {
     let phys = super::FRAME_ALLOCATOR.with(|slot| slot.as_mut().and_then(|a| a.allocate()))?;
     let virt = phys_to_ptr(phys);
