@@ -3,6 +3,7 @@
 //! `cargo xtask <cmd>` (see CHITTI_OS_HANDOFF.md Part 7).
 
 use std::env;
+mod paper;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -439,6 +440,9 @@ fn main() {
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
         // boot the real model, run the acceptance checks, exit pass/fail.
         "ref-check" => cmd_ref_check(arch, model),
+        // Verify the quantitative claims in `paper/main.tex` against the tree.
+        // Reports and exits non-zero on drift; never edits the paper.
+        "paper-check" => cmd_paper_check(&rest),
         // Hidden subcommand: installed as `[target.x86_64-chitti] runner` in
         // kernel/.cargo/config.toml so `cargo test` can boot each compiled
         // test binary in QEMU and translate isa-debug-exit into a real exit
@@ -979,6 +983,40 @@ fn detect_host_res() -> Option<(u32, u32)> {
     let wants_max = std::env::var("CHITTI_FB_RES").map(|v| v.trim().eq_ignore_ascii_case("max")).unwrap_or(false);
     let (w, h) = if wants_max { d.native } else { d.desktop };
     Some((w.clamp(640, 3840), h.clamp(480, 2400)))
+}
+
+/// `cargo xtask paper-check [--ran N]` — compare the paper's derivable claims
+/// with the tree. `--ran N` supplies the number of tests the x86 suite executed
+/// (from `cargo xtask test`); without it that one claim is skipped rather than
+/// guessed at.
+fn cmd_paper_check(rest: &[String]) -> Result<(), String> {
+    let ran = rest
+        .iter()
+        .position(|a| a == "--ran")
+        .and_then(|i| rest.get(i + 1))
+        .and_then(|v| v.parse::<u64>().ok());
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("cannot locate the repo root")?
+        .to_path_buf();
+    let claims = paper::check(&repo, ran).map_err(|e| format!("paper-check: {e}"))?;
+    if claims.is_empty() {
+        return Err("paper-check: found no claims to check -- has the prose changed?".into());
+    }
+    println!("paper-check: {} derivable claim(s)", claims.len());
+    for c in &claims {
+        println!("{c}");
+    }
+    if ran.is_none() {
+        println!("  skipped  unit tests run (x86): pass --ran N from `cargo xtask test`");
+    }
+    println!("  unchecked measured figures (tok/s, gate ns, attack rates) -- these come from");
+    println!("            running the kernel (/perf, /bench synapse, /redteam), not the source.");
+    let bad = claims.iter().filter(|c| !c.ok()).count();
+    if bad > 0 {
+        return Err(format!("paper-check: {bad} claim(s) no longer match the code"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
