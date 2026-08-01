@@ -1,0 +1,20 @@
+# Host-side benchmark: the kernel's PNG decoder run **natively** vs the same source compiled
+# to wasm and run under wasmi — the interpreter the kernel would use.
+#
+# Host rather than in-kernel on purpose (the `cortexdiff`/`onnxdiff`/`h264diff` pattern): the
+# question is the interpreter's *ratio*, which is a property of wasmi and the code, not of
+# QEMU. Measuring here takes seconds and needs no kernel build.
+[package]
+name = "chitti-pngbench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Stand-alone: not part of the root workspace.
+[workspace]
+
+[dependencies]
+wasmi = "0.40"
+
+[profile.release]
+opt-level = 3
