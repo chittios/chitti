@@ -187,32 +187,17 @@ impl Router {
         // authority, and it has no meaningful isolation to gain from being confined
         // relative to the kernel it drives.
         if runs_in_userspace(session) {
-            match crate::synapse::tenant::call_in_userspace(caller, raw, justification) {
-                Ok(_reply) => {
-                    // The tenant got the reply text; *we* classify from the structured
-                    // outcome the executor produced, so a ring-3 caller and a ring-0
-                    // caller are indistinguishable downstream. Re-parsing the reply
-                    // prose here is precisely the bug this replaced.
-                    return match crate::synapse::abi::take_last_invocation() {
-                        Some(inv) => Self::outcome_of(inv),
-                        // The tenant exited without invoking anything — it never reached
-                        // the gates. An error, not an empty success: a call that silently
-                        // did nothing must not read as one that was allowed.
-                        None => ToolOutcome::error(alloc::string::String::from(
-                            "error: the userspace call never reached the gates",
-                        )),
-                    };
-                }
-                Err(why) => {
-                    // Userspace could not be entered, or the tenant faulted. Reported as
-                    // an error rather than silently retried in the kernel: falling back
-                    // would mean an agent's confinement depends on whether the loader
-                    // happened to work, which is the kind of quiet downgrade that makes
-                    // an isolation claim untrue.
-                    crate::ktrace::log_fmt(format_args!("tools.dispatch: userspace call failed: {why:?}"));
-                    return ToolOutcome::error(alloc::format!("error: userspace execution failed ({why:?})"));
-                }
-            }
+            // Classified from the structured outcome, so a ring-3 caller and a ring-0
+            // caller are indistinguishable downstream. There is no in-kernel fallback:
+            // retrying here would make an agent's confinement depend on whether the
+            // loader happened to work, which is the kind of quiet downgrade that makes
+            // an isolation claim untrue.
+            return match crate::synapse::tenant::invoke_in_userspace(caller, raw, justification) {
+                Some(inv) => Self::outcome_of(inv),
+                None => ToolOutcome::error(alloc::string::String::from(
+                    "error: the userspace call never reached the gates",
+                )),
+            };
         }
         Self::outcome_of(synapse::execute_with_justification(caller, raw, justification))
     }

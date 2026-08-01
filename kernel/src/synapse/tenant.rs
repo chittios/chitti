@@ -609,6 +609,31 @@ impl Tenant {
 /// correctness bug, not merely contention.
 static SHARED: crate::mm::Locked<Option<Tenant>> = crate::mm::Locked::new(None);
 
+/// Run one Synapse call in userspace and return the **structured** outcome.
+///
+/// The form every migrated caller should use. A tenant's reply is prose rendered by
+/// [`crate::synapse::abi`], whose vocabulary differs from the tool router's — so a
+/// caller that re-parses the text to decide what happened will eventually disagree with
+/// the kernel about it. That is not hypothetical: doing exactly that made
+/// `security::redteam` read refusals as successes and report five injected attacks as
+/// permitted. There is one authority for what an outcome was, and it is this value.
+///
+/// `None` means the tenant never reached the gates (it faulted, or exited without
+/// invoking) — deliberately not conflated with a refusal, which *is* an outcome.
+pub fn invoke_in_userspace(
+    task: crate::sched::TaskId,
+    call: &str,
+    justification: crate::security::taint::Justification,
+) -> Option<crate::synapse::executor::Invocation> {
+    match call_in_userspace(task, call, justification) {
+        Ok(_prose) => crate::synapse::abi::take_last_invocation(),
+        Err(why) => {
+            crate::ktrace::log_fmt(format_args!("tenant: userspace invoke failed: {why:?}"));
+            None
+        }
+    }
+}
+
 /// How many Synapse calls have been made from userspace.
 ///
 /// Exists so the migration is *observable*: "an agent's effects run in ring 3" is
