@@ -441,6 +441,70 @@ mod tests {
     }
 
     #[test_case]
+    fn what_ring_three_actually_costs() {
+        // The counterpart to `tools/pngbench`'s 38x for wasm: what does the *other* sandbox
+        // cost? Measured as two numbers, because they scale differently and quoting one alone
+        // is how a per-run setup cost gets mistaken for a per-byte one.
+        //
+        //   fixed  — build an address space, map the pages, cross, tear down, free the frames.
+        //            Paid once per decode.
+        //   marginal — the compute itself, which is the *same machine code* either side of the
+        //            boundary, so the expectation is ~1x and anything else wants explaining.
+        //
+        // Coarse on purpose: `now_ms` has millisecond resolution, so each figure is a batch of
+        // `N` runs and the per-run cost is a division. Enough to separate "a trap" from "38x".
+        const N: usize = 20;
+        const SMALL: usize = 0x1000; // 1 page
+        const LARGE: usize = 64 * 0x1000; // 64 pages, 256 KiB
+
+        let tenant = crate::sched::spawn_parked("cost-tenant");
+        let small = alloc::vec![0xa5u8; SMALL];
+        let large = alloc::vec![0x5au8; LARGE];
+
+        // Warm up: the first run grows the heap and faults in the loader's own pages, and
+        // charging that to the measurement is how a curve comes out decreasing.
+        let _ = run_bulk(tenant, &small).expect("warm-up");
+
+        let t0 = crate::arch::now_ms();
+        for _ in 0..N {
+            let _ = core::hint::black_box(run_bulk(tenant, &small).expect("small"));
+        }
+        let t_small = crate::arch::now_ms().saturating_sub(t0);
+
+        let t0 = crate::arch::now_ms();
+        for _ in 0..N {
+            let _ = core::hint::black_box(run_bulk(tenant, &large).expect("large"));
+        }
+        let t_large = crate::arch::now_ms().saturating_sub(t0);
+
+        crate::ktrace::log_fmt(format_args!(
+            "tenant.cost: {N} runs -- 1 page {t_small}ms, 256KiB {t_large}ms  (per run: fixed ~{}us, +256KiB ~{}us)",
+            t_small * 1000 / N as u64,
+            t_large.saturating_sub(t_small) * 1000 / N as u64
+        ));
+
+        // **No ring-0 comparison here, deliberately.** The obvious thing is to sum the same
+        // bytes in the kernel and divide -- and it produces a *flattering lie*: the tenant runs
+        // a hand-written asm loop while the kernel side is debug-build Rust with bounds checks,
+        // which measured ~9x slower and made ring 3 look faster than ring 0. The same mistake as
+        // timing `opt-level="s"` wasm against `opt-level=3` native, in the other direction.
+        //
+        // The honest position is that the ratio does not need measuring: ring 3 runs the same
+        // instructions on the same CPU with the same caches, so marginal cost is native *by
+        // construction* -- there is no interpreter to be slow. What is worth measuring is the
+        // **fixed** cost above, against the work it protects: ~650 us against a 19 ms PNG decode
+        // is ~3%, where wasm's 38x is 3800%.
+        //
+        // A real ratio needs the identical decoder compiled for both sides, which is what
+        // `tools/pngbench` gives once the native tenant runs `image/png.rs`.
+        assert!(
+            t_large >= t_small,
+            "more work took less time: {t_large}ms for 256KiB vs {t_small}ms for one page"
+        );
+        let _ = crate::sched::kill(tenant);
+    }
+
+    #[test_case]
     fn bulk_tenant_frames_are_returned_so_repeated_runs_do_not_leak() {
         // A decoder runs once per frame of video, so a per-run frame leak would exhaust
         // memory in seconds rather than eventually. Asserted across several runs, since a
