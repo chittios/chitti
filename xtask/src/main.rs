@@ -445,6 +445,7 @@ fn main() {
         // Reports and exits non-zero on drift; never edits the paper.
         "paper-check" => cmd_paper_check(&rest),
         "ring-check" => cmd_ring_check(),
+        "imgdec" => cmd_imgdec(),
         // Hidden subcommand: installed as `[target.x86_64-chitti] runner` in
         // kernel/.cargo/config.toml so `cargo test` can boot each compiled
         // test binary in QEMU and translate isa-debug-exit into a real exit
@@ -985,6 +986,44 @@ fn detect_host_res() -> Option<(u32, u32)> {
     let wants_max = std::env::var("CHITTI_FB_RES").map(|v| v.trim().eq_ignore_ascii_case("max")).unwrap_or(false);
     let (w, h) = if wants_max { d.native } else { d.desktop };
     Some((w.clamp(640, 3840), h.clamp(480, 2400)))
+}
+
+/// `cargo xtask imgdec` — rebuild the userspace tenant blobs for **both** arches.
+///
+/// The kernel `include_bytes!`s the flat binaries, so they are checked in like
+/// `tools/*-wasm`'s modules. Both arches every time, deliberately: a blob rebuilt for one
+/// is the divergence the dual-arch standing rule exists to prevent, and it would not be
+/// caught by either build.
+fn cmd_imgdec() -> Result<(), String> {
+    let repo = repo_root();
+    let crate_dir = repo.join("userspace/imgdec");
+    let objcopy = find_objcopy()?;
+    for arch in ["x86_64", "aarch64"] {
+        let target = format!("../../targets/{arch}-chitti-user.json");
+        let st = std::process::Command::new("cargo")
+            .current_dir(&crate_dir)
+            .args(["build", "--release", "--target", &target])
+            .status()
+            .map_err(|e| format!("imgdec: cargo: {e}"))?;
+        if !st.success() {
+            return Err(format!("imgdec: build failed for {arch}"));
+        }
+        let elf = crate_dir.join(format!("target/{arch}-chitti-user/release/imgdec"));
+        let bin = crate_dir.join(format!("imgdec-{arch}.bin"));
+        let st = std::process::Command::new(&objcopy)
+            .args(["-O", "binary"])
+            .arg(&elf)
+            .arg(&bin)
+            .status()
+            .map_err(|e| format!("imgdec: objcopy: {e}"))?;
+        if !st.success() {
+            return Err(format!("imgdec: objcopy failed for {arch}"));
+        }
+        let n = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
+        println!("imgdec: {arch} -> {} ({n} bytes)", bin.display());
+    }
+    println!("imgdec: both blobs rebuilt -- commit them, the kernel include_bytes! them");
+    Ok(())
 }
 
 /// `cargo xtask ring-check` — enforce the ring-3 standing rule.

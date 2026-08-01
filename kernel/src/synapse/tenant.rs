@@ -143,6 +143,10 @@ pub enum LoadError {
     /// The tenant faulted, or stopped without exiting deliberately. Distinct from a
     /// refusal: this says userspace misbehaved, not that the gates said no.
     Faulted,
+    /// The tenant ran and reported its own failure — a malformed input, or a panic it
+    /// caught. The interesting case for a decoder, and deliberately not `Faulted`: a
+    /// corrupt file is an ordinary answer, not a broken boundary.
+    Declined { status: u64 },
 }
 
 /// A loaded tenant: its address space and the addresses it was laid out at.
@@ -396,6 +400,47 @@ mod tests {
     }
 
     #[test_case]
+    fn the_compiled_userspace_crate_runs_as_a_tenant() {
+        // **The crate half of the boundary, proven.** `userspace/imgdec/` is ordinary safe
+        // Rust compiled for a freestanding target, linked at `USER_BASE`, objcopy'd to a
+        // flat binary and checked in — and here it executes in ring 3 and produces the same
+        // answer as the kernel and as the hand-assembled tenant.
+        //
+        // A *triple* differential, which is stronger than it looks: kernel arithmetic vs an
+        // asm tenant vs a compiled-Rust tenant, all over the same bytes through the same
+        // loader. Agreement means the crate's startup-block offsets, its entry convention,
+        // its linker script's load address and its exit path are all right — any one of
+        // which being wrong yields a plausible number rather than an obvious failure.
+        let tenant = crate::sched::spawn_parked("imgdec-tenant");
+        let input: alloc::vec::Vec<u8> = (0..9_000u32).map(|i| (i % 253) as u8).collect();
+        let expected: u64 = input.iter().map(|&b| b as u64).sum();
+
+        let out = run_imgdec(tenant, &input).expect("the compiled tenant must run");
+        assert_eq!(out.len(), 8, "expected an 8-byte sum, got {}", out.len());
+        assert_eq!(
+            u64::from_le_bytes(out[..8].try_into().unwrap()),
+            expected,
+            "the compiled userspace tenant must agree with the kernel"
+        );
+
+        let asm_out = run_bulk(tenant, &input).expect("the asm tenant must run");
+        assert_eq!(asm_out, out, "the compiled and assembled tenants must agree");
+        let _ = crate::sched::kill(tenant);
+    }
+
+    #[test_case]
+    fn the_compiled_tenant_is_a_plausible_flat_binary() {
+        // Cheap guards on the checked-in artefact, because the failure mode of a stale or
+        // wrongly-objcopy'd blob is a tenant that faults at its first instruction — which
+        // reads as "ring 3 is broken" rather than "rebuild the blob".
+        let b = imgdec_blob();
+        assert!(!b.is_empty(), "the compiled tenant blob is empty -- run `cargo xtask imgdec`");
+        assert!(b.len() <= 0x1000, "blob is {} bytes; the loader maps one code page", b.len());
+        // A flat binary, not an ELF: objcopy was skipped if this still has a magic number.
+        assert_ne!(&b[..4.min(b.len())], b"\x7fELF", "the blob is an ELF, not a flat image");
+    }
+
+    #[test_case]
     fn bulk_tenant_frames_are_returned_so_repeated_runs_do_not_leak() {
         // A decoder runs once per frame of video, so a per-run frame leak would exhaust
         // memory in seconds rather than eventually. Asserted across several runs, since a
@@ -498,6 +543,11 @@ pub mod block {
     /// Written *by the tenant*: 0 on success, else its own error code. Distinct from a
     /// fault — a decoder that cleanly rejects a malformed file is not a crash.
     pub const STATUS: usize = 96;
+    /// What the loader writes here **before** entry, so the field is fail-closed: a tenant
+    /// that exits without claiming success (because it panicked, or never got that far)
+    /// leaves this behind rather than an ambiguous zero. It is why the tenant's
+    /// `panic_handler` can simply leave, and needs no writable memory to report through.
+    pub const STATUS_NOT_RUN: u64 = u64::MAX;
     /// Where the loader puts the call text, clear of the header.
     ///
     /// Moved from 64 when the buffer fields were added. Safe to move because no blob
@@ -680,15 +730,54 @@ pub fn bulk_blob() -> &'static [u8] {
     }
 }
 
+/// The **Rust userspace tenant**, built from `userspace/imgdec/` and linked at
+/// `space::USER_BASE`.
+///
+/// This is the seam the real decoders arrive through. Unlike the assembled blobs above it
+/// is ordinary safe Rust with a `panic_handler` that reports a status word — so a bounds
+/// check tripped by a malformed file becomes "this input is corrupt" instead of halting the
+/// machine, which is the entire reason for moving a parser across the boundary.
+///
+/// Checked in and `include_bytes!`d per arch, like `tools/*-wasm`'s modules; rebuild with
+/// `cargo xtask imgdec`. Linked at a fixed address rather than made position-independent,
+/// which is what keeps the loader free of any relocation handling.
+#[cfg(target_arch = "x86_64")]
+static IMGDEC_BLOB: &[u8] = include_bytes!("../../../userspace/imgdec/imgdec-x86_64.bin");
+#[cfg(target_arch = "aarch64")]
+static IMGDEC_BLOB: &[u8] = include_bytes!("../../../userspace/imgdec/imgdec-aarch64.bin");
+
+/// The compiled userspace tenant's bytes.
+pub fn imgdec_blob() -> &'static [u8] {
+    IMGDEC_BLOB
+}
+
+/// Run the compiled userspace tenant over `input`.
+pub fn run_imgdec(task: crate::sched::TaskId, input: &[u8]) -> Result<alloc::vec::Vec<u8>, LoadError> {
+    run_bulk_with(task, imgdec_blob(), input)
+}
+
 /// Run the bulk tenant over `input`, returning what it wrote.
 ///
 /// The decoder-shaped path end to end: frames the kernel owns are shared into a tenant
 /// (input read-only, output writable), the tenant computes with no authority whatsoever,
 /// and the kernel reads the result out of its own alias afterwards.
 pub fn run_bulk(task: crate::sched::TaskId, input: &[u8]) -> Result<alloc::vec::Vec<u8>, LoadError> {
+    run_bulk_with(task, bulk_blob(), input)
+}
+
+/// [`run_bulk`] with the blob named explicitly.
+///
+/// Parameterised so the hand-assembled tenant and the compiled Rust one run through the
+/// *same* loader, mappings and teardown — which is what makes comparing their output a test
+/// of the crate rather than a test of two different code paths.
+pub fn run_bulk_with(
+    task: crate::sched::TaskId,
+    blob: &[u8],
+    input: &[u8],
+) -> Result<alloc::vec::Vec<u8>, LoadError> {
     const PAGE: usize = 0x1000;
     let in_pages = input.len().div_ceil(PAGE).max(1);
-    let mut loaded = load(bulk_blob())?;
+    let mut loaded = load(blob)?;
 
     // Frames for the shared buffers, taken from the global allocator and handed back at
     // the end: they stay the *kernel's*, because the kernel reads through its own alias
@@ -737,6 +826,7 @@ pub fn run_bulk(task: crate::sched::TaskId, input: &[u8]) -> Result<alloc::vec::
             put(block::INPUT_LEN, input.len() as u64);
             put(block::OUTPUT_PTR, out_va);
             put(block::OUTPUT_CAP, PAGE as u64);
+            put(block::STATUS, block::STATUS_NOT_RUN);
         }
         // **No justification is set**, because this tenant makes no Synapse call and so
         // there is nothing for one to justify. That is the decoder shape in one line.
@@ -746,6 +836,18 @@ pub fn run_bulk(task: crate::sched::TaskId, input: &[u8]) -> Result<alloc::vec::
         if !exit.is_deliberate_exit() {
             crate::ktrace::log_fmt(format_args!("tenant: bulk tenant did not exit cleanly: {exit:?}"));
             return Err(LoadError::Faulted);
+        }
+        // SAFETY: the loader's own block page.
+        let status = unsafe {
+            core::ptr::read_unaligned((args_kernel as *const u8).add(block::STATUS) as *const u64)
+        };
+        if status != 0 {
+            // The tenant declined — a malformed input, or a panic caught by its own handler.
+            // Reported as a rejection, **not** a fault: "this file is corrupt" is a different
+            // fact from "userspace misbehaved", and conflating them would make a decoder's
+            // ordinary error path look like a broken boundary.
+            crate::ktrace::log_fmt(format_args!("tenant: bulk tenant declined, status={status:#x}"));
+            return Err(LoadError::Declined { status });
         }
         // SAFETY: the loader's own page and frame; the length is clamped to the capacity
         // the tenant was given, so a larger claim cannot walk off the page.

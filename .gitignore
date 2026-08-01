@@ -31,3 +31,5 @@ third_party/dtb/*.dtb
 third_party/dtb/.asahi-linux/
 scratchpad-agx/
 assets/*.partial
+userspace/*/target/
+userspace/**/*.bin
