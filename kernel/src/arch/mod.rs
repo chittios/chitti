@@ -240,3 +240,127 @@ pub fn usb_bulk_send(data: &[u8]) -> bool {
 pub fn usb_bulk_send(_data: &[u8]) -> bool {
     false
 }
+
+/// This core's hardware identity, cheap and MMIO-free.
+///
+/// x86 reads the *initial* APIC id out of `CPUID.01:EBX[31:24]` rather than the
+/// local-APIC `ID` register, because this has to work before `apic::init` has
+/// mapped that MMIO — and on x86 `sched::init` runs *before* the APIC is up.
+/// aarch64 reads `MPIDR_EL1`'s affinity bits, which are always available at EL1.
+#[cfg(target_arch = "x86_64")]
+pub fn hw_cpu_id() -> u64 {
+    let ebx: u32;
+    // SAFETY: CPUID leaf 1 exists on every x86_64 CPU and has no side effects.
+    unsafe {
+        core::arch::asm!(
+            "push rbx", "mov eax, 1", "cpuid", "mov {out:e}, ebx", "pop rbx",
+            out = out(reg) ebx,
+            out("eax") _, out("ecx") _, out("edx") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    (ebx >> 24) as u64
+}
+#[cfg(target_arch = "aarch64")]
+pub fn hw_cpu_id() -> u64 {
+    let v: u64;
+    // SAFETY: MPIDR_EL1 is readable at EL1 and has no side effects.
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v & 0xff_ffff // Aff2:Aff1:Aff0
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn hw_cpu_id() -> u64 {
+    0
+}
+
+/// The core the scheduler was brought up on. `u64::MAX` until recorded.
+static BOOT_CPU: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Record the current core as the one that owns the scheduler. Called once from
+/// `sched::init`.
+pub fn claim_boot_cpu() {
+    BOOT_CPU.store(hw_cpu_id(), core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether this core is the one the scheduler was brought up on.
+///
+/// # Why the scheduler is single-core, and why that is load-bearing
+///
+/// There is **no TLB shootdown on either arch**, so a `mm::space::AddressSpace` is
+/// only valid on the core that activated it. Today that is safe by construction
+/// rather than by policy: application processors never touch `sched` — they park
+/// waiting for IPI-driven `parallel_for` work and arm no timer, so `reschedule`
+/// only ever runs here. A future change that gave APs a timer tick to get real SMP
+/// scheduling would reintroduce the hazard silently, and the symptom would be
+/// stale-TLB memory corruption rather than a fault. Hence the assertion in
+/// `sched::reschedule` — this is a tripwire for that change, not a mechanism.
+pub fn is_boot_cpu() -> bool {
+    match BOOT_CPU.load(core::sync::atomic::Ordering::SeqCst) {
+        u64::MAX => true, // not yet recorded: early boot, single-threaded
+        id => id == hw_cpu_id(),
+    }
+}
+
+/// How a userspace tenant left ring 3 / EL0, in arch-neutral terms.
+///
+/// The two transports report the same two outcomes with different syndromes — x86 an
+/// interrupt vector plus `CR2`, aarch64 `ESR_EL1` plus `FAR_EL1` — so this is a
+/// translation, not a lowest common denominator: both fields survive, only their
+/// names generalise. Callers above the transport (the loader, the tests, eventually
+/// the scheduler) go through this so a tenant behaves identically on both machines,
+/// which is the standing dual-architecture rule applied to the newest subsystem
+/// rather than retrofitted to it later.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TenantExit {
+    /// It submitted an ABI call. `number` is the [`crate::synapse::abi::Entry`].
+    Called { number: u64, arg0: u64, arg1: u64 },
+    /// It took a fault instead. `syndrome` is the vector (x86) or `ESR_EL1`
+    /// (aarch64); `address` is `CR2` or `FAR_EL1`.
+    Faulted { syndrome: u64, address: u64 },
+}
+
+impl TenantExit {
+    /// Did the tenant stop because it asked to?
+    ///
+    /// The distinction that matters to a loader: any other outcome — a fault, or a
+    /// call that is not `Exit` — means the tenant was interrupted rather than
+    /// finished, and for a fault the likeliest cause is that the *kernel* mapped it
+    /// wrong.
+    pub fn is_deliberate_exit(&self) -> bool {
+        matches!(self, TenantExit::Called { number, .. } if crate::synapse::abi::Entry::from_raw(*number) == Some(crate::synapse::abi::Entry::Exit))
+    }
+}
+
+/// Run `task` in userspace at `entry_va` with stack `stack_va` in `space`, and report
+/// how it left. The arch-neutral entry point for [`crate::synapse::tenant`].
+///
+/// # Safety
+/// `entry_va` must be mapped user-executable in `space` and `stack_va` user-writable;
+/// `space` must share the kernel mappings. Not reentrant.
+pub unsafe fn enter_tenant(
+    task: crate::sched::TaskId,
+    space: &crate::mm::space::AddressSpace,
+    entry_va: u64,
+    stack_va: u64,
+) -> TenantExit {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: forwarded verbatim; the caller carries the contract.
+        match unsafe { x86_64::fastcall::enter_ring3(task, space, entry_va, stack_va) } {
+            x86_64::fastcall::Exit::Svc(t) => {
+                TenantExit::Called { number: t.number, arg0: t.arg0, arg1: t.arg1 }
+            }
+            x86_64::fastcall::Exit::Fault { code, addr } => {
+                TenantExit::Faulted { syndrome: code, address: addr }
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: as above.
+        match unsafe { aarch64::el0::enter_el0(task, space, entry_va, stack_va) } {
+            aarch64::el0::Exit::Svc(t) => TenantExit::Called { number: t.number, arg0: t.arg0, arg1: t.arg1 },
+            aarch64::el0::Exit::Fault { esr, far } => TenantExit::Faulted { syndrome: esr, address: far },
+        }
+    }
+}

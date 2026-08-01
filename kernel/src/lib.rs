@@ -200,6 +200,8 @@ pub fn init() {
     assert!(BASE_REVISION.is_supported(), "Limine did not accept base revision 3");
 
     arch::x86_64::gdt::init();
+    // Arm `syscall` on the BSP. Per-core MSRs, so `smp` does the same for each AP.
+    arch::x86_64::fastcall::init();
     arch::x86_64::idt::init();
     arch::x86_64::fpu::init();
     arch::x86_64::pic::init();
@@ -289,6 +291,23 @@ pub fn init() {
         // Do it before the GIC so its logs reach the discovered console too.
         arch::aarch64::init_uart();
         arch::aarch64::gic::init_bsp();
+    }
+    // EL0 round trip. **Must come after `exceptions::init`**, which is what sets
+    // `VBAR_EL1`: a tenant's `svc` lands at `VBAR + 0x400`, so running this from
+    // `mm::init` (where it was first placed) sent the trap to whatever the boot
+    // firmware left in VBAR and hung the machine with no output at all. The
+    // aarch64 unit suite does not exist — `cargo xtask test` is x86 only — so this
+    // boot self-test is the only thing that ever exercises the path.
+    match arch::aarch64::el0::self_test() {
+        Ok(()) => ktrace::log("el0", "EL0 round-trip self-test ok"),
+        Err(why) => ktrace::log_fmt(format_args!("el0: EL0 round-trip self-test FAILED: {why}")),
+    }
+    // And the layer above it: the assembled PIC blob, the loader, and a gated call
+    // attributed to the tenant's own identity. Separate from the round trip above so a
+    // failure says which of the two broke — the transport or what runs on it.
+    match synapse::tenant::self_test() {
+        Ok(()) => ktrace::log("tenant", "userspace tenant self-test ok"),
+        Err(why) => ktrace::log_fmt(format_args!("tenant: userspace tenant self-test FAILED: {why}")),
     }
     // Same ACPI devices as x86 gets, from the same code — an SBSA/UEFI machine
     // describes its embedded controller in the DSDT exactly as a PC does. A
