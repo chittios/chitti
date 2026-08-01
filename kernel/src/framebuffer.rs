@@ -5163,6 +5163,10 @@ fn carry_tabs(ns: &mut Screen, old: &Screen) {
 /// Rebuild geometry for a new split state, preserving layout config, status,
 /// interactive state, action tabs, and pane text via [`Pane::adopt`].
 fn rebuilt(old: &Screen, split: bool) -> Screen {
+    // **Every screen rebuild invalidates pane interiors**, so the mark belongs here
+    // rather than at each caller. Opening a view was wired up and closing one was not,
+    // which is the same omission twice — a choke point ends that.
+    mark_tabs_dirty();
     let mut ns = Screen::build(
         // `fb_w`/`fb_h`, never `width`/`height` — those are the logical desktop,
         // and feeding them back in would shrink the viewport on every rebuild.
@@ -5547,6 +5551,12 @@ fn close_active_slot(slot: &mut Option<Screen>) {
         old.actions[fi].active = old.actions[fi].tabs.len() - 1;
     }
     let any = old.any_action_open();
+    // Closing a tab invalidates the other panes' interiors either way: the collapse
+    // branch rebuilds the screen, and the grid branch repaints frames while leaving
+    // each view's own pixels to be redrawn. Marked here so both are covered — the grid
+    // case is the one that shipped broken, because `repaint_action` looks like it has
+    // already done the work.
+    mark_tabs_dirty();
     // A lone action pane collapses the band when its last tab closes (the classic
     // two-pane behaviour); a grid keeps its now-empty pane as a drop target.
     if !any && old.actions.len() == 1 {
