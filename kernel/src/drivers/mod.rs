@@ -13,10 +13,14 @@
 //! - [`ec`] — the ACPI embedded controller, which owns a laptop's battery,
 //!   lid and thermal state
 //! - [`wifi`] — Broadcom FullMAC PCIe (brcmfmac-class) on Apple Silicon
+//! - [`bluetooth`] — USB Bluetooth identify + pure HCI codec (transport later)
+//! - [`uvc`] — USB Video Class descriptor parse + identify (isoc capture later)
 
 pub mod battery;
+pub mod bluetooth;
 pub mod ec;
 pub mod i2c;
 pub mod i2c_hid;
 pub mod pwrbtn;
+pub mod uvc;
 pub mod wifi;

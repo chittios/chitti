@@ -628,6 +628,9 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "memory" => run_memory_cmd(arg),
         "disks" => disk_list(),
         "battery" | "bat" => run_battery(),
+        "bluetooth" | "bt" => run_bluetooth(arg),
+        "camera" | "uvc" => run_camera(arg),
+        "touch" | "touchscreen" => run_touch(arg),
         "suspend" | "sleep" => run_suspend(arg),
         // Top-level `/power` (idle + energy mode). WiFi uses `/wifi power`, not this.
         "power" => run_power(arg),
@@ -9108,6 +9111,61 @@ fn run_power(arg: &str) {
         }
         _ => serial_println!("power> usage: /power [status|mode <performance|powersave|auto>]"),
     }
+}
+
+/// `/bluetooth [status]` — USB BT identify + HCI codec stage.
+fn run_bluetooth(arg: &str) {
+    let a = arg.trim();
+    if !(a.is_empty() || a == "status" || a == "info") {
+        serial_println!("bluetooth> usage: /bluetooth [status]");
+        return;
+    }
+    serial_println!("bluetooth> staged stack (identify + HCI codec):");
+    for line in crate::drivers::bluetooth::status_lines() {
+        serial_println!("  {line}");
+    }
+}
+
+/// `/camera [status]` — UVC identify + format parse stage.
+fn run_camera(arg: &str) {
+    let a = arg.trim();
+    if !(a.is_empty() || a == "status" || a == "info") {
+        serial_println!("camera> usage: /camera [status]");
+        return;
+    }
+    serial_println!("camera> UVC staged (descriptor parse, no capture yet):");
+    for line in crate::drivers::uvc::status_lines() {
+        serial_println!("  {line}");
+    }
+}
+
+/// `/touch [status]` — digitizer path shares HID pointer decode (Tip Switch → click).
+fn run_touch(arg: &str) {
+    let a = arg.trim();
+    if !(a.is_empty() || a == "status" || a == "info") {
+        serial_println!("touch> usage: /touch [status]");
+        return;
+    }
+    serial_println!("touch> HID digitizer:");
+    serial_println!(
+        "  path: same as USB/I2C pointer — Tip Switch (0x0D/0x42) → left click,"
+    );
+    serial_println!("         absolute X/Y scaled to the framebuffer via mouse::set_abs");
+    #[cfg(target_arch = "x86_64")]
+    let has_usb = crate::arch::x86_64::xhci::has_mouse();
+    #[cfg(target_arch = "aarch64")]
+    let has_usb = crate::arch::aarch64::xhci::has_mouse();
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let has_usb = false;
+    serial_println!(
+        "  usb pointer: {}",
+        if has_usb {
+            "enumerated (touch panels use this path when their report layout parses)"
+        } else {
+            "none enumerated yet"
+        }
+    );
+    serial_println!("  note: multi-touch / gestures not implemented; first contact only");
 }
 
 fn run_power_status() {

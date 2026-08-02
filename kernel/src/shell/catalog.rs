@@ -39,6 +39,10 @@ pub const COMMAND_ALIASES: &[&str] = &[
     "panes",      // → pane
     "resolution", // → display
     "res",        // → display
+    "bt",         // → bluetooth
+    "uvc",        // → camera
+    "touchscreen", // → touch
+    "bat",        // → battery
 ];
 
 /// Whether `name` is a known slash command or alias (for completion).
@@ -143,6 +147,10 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "System & UI", title: "Date / Time", name: "datetime", shortcut: "" },
     Entry { category: "System & UI", title: "PCI Devices", name: "lspci", shortcut: "" },
     Entry { category: "System & UI", title: "Battery", name: "battery", shortcut: "" },
+    Entry { category: "System & UI", title: "Power / Energy Mode", name: "power", shortcut: "" },
+    Entry { category: "System & UI", title: "Bluetooth", name: "bluetooth", shortcut: "" },
+    Entry { category: "System & UI", title: "Camera (UVC)", name: "camera", shortcut: "" },
+    Entry { category: "System & UI", title: "Touchscreen", name: "touch", shortcut: "" },
     Entry { category: "System & UI", title: "Suspend", name: "suspend", shortcut: "" },
     Entry { category: "System & UI", title: "UI Config", name: "ui", shortcut: "" },
     Entry { category: "System & UI", title: "Theme", name: "theme", shortcut: "" },

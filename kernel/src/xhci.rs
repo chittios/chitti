@@ -946,6 +946,11 @@ impl Xhci {
     /// one slot. Returns whether anything was registered.
     unsafe fn classify_and_finish(&mut self, c: &mut Common) -> bool {
         let mut got = false;
+        // Side-channel inventory (BT / UVC): note presence without claiming the
+        // only bulk pair — those stacks are staged and must not steal MSC/Eth.
+        unsafe {
+            note_peripheral_classes(c.buf_va, c.total as usize, c.loc.root_port, c.slot);
+        }
         if self.kbd.is_none() {
             if let Some((iface, ep, mps, ivl)) = unsafe { parse_hid_keyboard(c.buf_va, c.total as usize) } {
                 if let Some(k) = unsafe { self.finish_keyboard(c, iface, ep, mps, ivl) } {
@@ -2101,6 +2106,8 @@ impl Xhci {
         if port < 32 {
             self.done_ports &= !(1u32 << port);
         }
+        crate::drivers::bluetooth::clear_if_port(port);
+        crate::drivers::uvc::clear_if_port(port);
         if had_msc {
             // Deferred: arch poll path calls [`take_msc_unplug_prune`] after
             // releasing the controller lock (see that function's doc).
@@ -2145,6 +2152,43 @@ impl Xhci {
             // SAFETY: same single-threaded host path as cold-plug enumeration.
             unsafe { self.scan_ports() };
         }
+    }
+}
+
+/// Scan a configuration descriptor for Bluetooth / UVC interface classes and
+/// register them with the staged peripheral drivers (identify-only).
+///
+/// # Safety
+/// `buf` must be a readable config descriptor of `len` bytes.
+unsafe fn note_peripheral_classes(buf: usize, len: usize, root_port: u8, slot: u8) {
+    let mut i = 0usize;
+    let mut saw_uvc = false;
+    while i + 9 <= len {
+        let blen = unsafe { read_volatile((buf + i) as *const u8) } as usize;
+        let btype = unsafe { read_volatile((buf + i + 1) as *const u8) };
+        if blen < 2 {
+            break;
+        }
+        if btype == 0x04 && blen >= 9 {
+            let class = unsafe { read_volatile((buf + i + 5) as *const u8) };
+            let sub = unsafe { read_volatile((buf + i + 6) as *const u8) };
+            let proto = unsafe { read_volatile((buf + i + 7) as *const u8) };
+            if crate::drivers::bluetooth::is_usb_bluetooth(class, sub, proto) {
+                crate::drivers::bluetooth::note_usb_device(root_port, slot, class, sub, proto);
+            }
+            if crate::drivers::uvc::is_video_control(class, sub, proto)
+                || crate::drivers::uvc::is_video_streaming(class, sub, proto)
+            {
+                crate::drivers::uvc::note_usb_iface(root_port, slot, class, sub, proto);
+                saw_uvc = true;
+            }
+        }
+        i += blen.max(1);
+    }
+    if saw_uvc {
+        // SAFETY: config buffer is live for this enumeration step.
+        let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+        crate::drivers::uvc::try_parse_config(slice);
     }
 }
 
@@ -2259,8 +2303,9 @@ unsafe fn parse_hid_pointer(buf: usize, len: usize) -> Option<(u8, u8, u32, u8, 
                 iface_num = unsafe { read_volatile((buf + i + 2) as *const u8) };
                 let class = unsafe { read_volatile((buf + i + 5) as *const u8) };
                 let p = unsafe { read_volatile((buf + i + 7) as *const u8) };
-                // HID pointer: mouse (proto 2) or tablet/absolute (proto 0). Not
-                // the keyboard (proto 1).
+                // HID pointer: mouse (proto 2), tablet/absolute (proto 0), or a
+                // digitizer/touch panel that also reports as HID class 3 with
+                // protocol 0 (same as tablet). Not the keyboard (proto 1).
                 in_ptr_iface = class == 3 && (p == 2 || p == 0);
                 proto = p;
             }
@@ -2406,16 +2451,25 @@ pub(crate) unsafe fn parse_report_layout(buf: usize, len: usize) -> Option<PtrLa
                             0
                         };
                         let fb = bit + f * report_size;
-                        if usage_page == 0x01 && u == 0x30 && x.is_none() {
+                        // X/Y: Generic Desktop (mouse/tablet) **or** Digitizer page
+                        // (touch panels often put X/Y under 0x0D as well as 0x01).
+                        let xy_page = usage_page == 0x01 || usage_page == 0x0d;
+                        if xy_page && u == 0x30 && x.is_none() {
                             x = Some((fb, report_size));
                             rel = data & 4 != 0;
                             x_scale = logical_max; // capture the max in effect for X
                             x_report_id = report_id_cur; // the pointer's report ID
-                        } else if usage_page == 0x01 && u == 0x31 && y.is_none() {
+                        } else if xy_page && u == 0x31 && y.is_none() {
                             y = Some((fb, report_size));
                         } else if usage_page == 0x01 && u == 0x38 && wheel.is_none() {
                             wheel = Some((fb, report_size)); // Generic Desktop / Wheel
                         } else if usage_page == 0x09 && btn.is_none() {
+                            // Button page (mouse left/right).
+                            btn = Some(fb);
+                        } else if usage_page == 0x0d && (u == 0x42 || u == 0x33) && btn.is_none()
+                        {
+                            // Digitizer Tip Switch (0x42) or Touch (0x33) → contact =
+                            // left click for the compositor.
                             btn = Some(fb);
                         }
                     }
@@ -2895,6 +2949,57 @@ mod tests {
         let d2 = parent_slot | (parent_port << 8);
         assert_eq!(d2 & 0xff, 4);
         assert_eq!((d2 >> 8) & 0xff, 3);
+    }
+
+    /// A minimal single-touch digitizer: Tip Switch on Digitizer page + abs X/Y.
+    #[test_case]
+    fn parses_digitizer_tip_switch_and_abs_xy() {
+        #[rustfmt::skip]
+        let desc: &[u8] = &[
+            0x05, 0x0d,       // Usage Page (Digitizer)
+            0x09, 0x04,       // Usage (Touch Screen)
+            0xA1, 0x01,       // Collection (Application)
+            0x09, 0x22,       //   Usage (Finger)
+            0xA1, 0x02,       //   Collection (Logical)
+            0x09, 0x42,       //     Usage (Tip Switch)
+            0x15, 0x00, 0x25, 0x01,
+            0x75, 0x01, 0x95, 0x01,
+            0x81, 0x02,       //     Input (Data,Var,Abs) — tip @ bit 0
+            0x75, 0x07, 0x95, 0x01,
+            0x81, 0x03,       //     Input (Const) pad 7 bits
+            0x05, 0x01,       //     Usage Page (Generic Desktop)
+            0x09, 0x30,       //     Usage (X)
+            0x09, 0x31,       //     Usage (Y)
+            0x15, 0x00, 0x26, 0xff, 0x0f, // Logical Max 4095
+            0x75, 0x10, 0x95, 0x02,
+            0x81, 0x02,       //     Input 2×16-bit abs
+            0xC0, 0xC0,
+        ];
+        let lo = unsafe { parse_report_layout(desc.as_ptr() as usize, desc.len()) }.expect("layout");
+        assert!(!lo.relative, "touch is absolute");
+        assert_eq!(lo.btn_bit, 0, "tip switch is bit 0");
+        assert_eq!(lo.x_bit, 8, "X after tip+pad byte");
+        assert_eq!(lo.x_bits, 16);
+        assert_eq!(lo.y_bit, 24);
+        assert_eq!(lo.y_bits, 16);
+        assert_eq!(lo.scale_max, 0x0fff);
+        // tip down, X=100, Y=200
+        let rep = [
+            0x01u8,
+            100u16.to_le_bytes()[0],
+            100u16.to_le_bytes()[1],
+            200u16.to_le_bytes()[0],
+            200u16.to_le_bytes()[1],
+        ];
+        assert_ne!(extract_bits(&rep, lo.btn_bit as usize, 1), 0);
+        assert_eq!(
+            extract_bits(&rep, lo.x_bit as usize, lo.x_bits as usize),
+            100
+        );
+        assert_eq!(
+            extract_bits(&rep, lo.y_bit as usize, lo.y_bits as usize),
+            200
+        );
     }
 
     /// PORTSC connect-status change + CCS → attach/detach for hot-plug.
