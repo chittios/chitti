@@ -155,7 +155,7 @@ pub const ENTRIES: &[Entry] = &[
         name: "camera",
         shortcut: "",
     },
-    Entry { category: "System & UI", title: "Touchscreen", name: "touch", shortcut: "" },
+    Entry { category: "System & UI", title: "Touchscreen", name: "touchscreen", shortcut: "" },
     Entry { category: "System & UI", title: "Suspend", name: "suspend", shortcut: "" },
     Entry { category: "System & UI", title: "UI Config", name: "ui", shortcut: "" },
     Entry { category: "System & UI", title: "Theme", name: "theme", shortcut: "" },

@@ -630,7 +630,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "battery" | "bat" => run_battery(),
         "bluetooth" | "bt" => run_bluetooth(arg),
         "camera" | "uvc" => run_camera(arg),
-        "touch" | "touchscreen" => run_touch(arg),
+        "touchscreen" => run_touch(arg),
         "suspend" | "sleep" => run_suspend(arg),
         // Top-level `/power` (idle + energy mode). WiFi uses `/wifi power`, not this.
         "power" => run_power(arg),
@@ -6705,7 +6705,7 @@ fn run_agent_start(
                         *chat = None;
                     }
                     serial_println!(
-                        "agents> started package UI '{pkg}' (surface {sid}) — action pane focused; keys go to the app (Ctrl+Tab for chat)"
+                        "agents> started package UI '{pkg}' (surface {sid}) — action pane focused; keys go to the app (Ctrl+Tab returns to shell)"
                     );
                 }
                 Err(e) => serial_println!("agents> {pkg} start failed: {e}"),
@@ -7553,17 +7553,23 @@ fn fb_focus_is_action() -> bool {
     #[cfg(test)]
     false
 }
-#[allow(dead_code)] // retained for a future explicit focus-toggle binding
 fn fb_focus_toggle() {
     #[cfg(not(test))]
     crate::framebuffer::focus_toggle();
 }
-/// True when the active action tab is the editor (so input routes to it).
+/// True when the editor tab holds keyboard focus (action-focused and active).
+/// Opening the editor sets focus onto the action band; Ctrl+Tab returns to the
+/// shell without closing the tab — keys then go to the composer again.
 fn fb_editor_active() -> bool {
     #[cfg(not(test))]
-    return crate::framebuffer::right_mode() == crate::framebuffer::RightMode::Editor;
+    {
+        crate::framebuffer::focus_is_action()
+            && crate::framebuffer::right_mode() == crate::framebuffer::RightMode::Editor
+    }
     #[cfg(test)]
-    false
+    {
+        false
+    }
 }
 /// The focused action tab if it's a media viewer/player (image or audio) —
 /// keys route to its controls only while the action pane is focused, so typing
@@ -7783,7 +7789,25 @@ fn media_nav(_fin: u8, _steps: usize) -> bool {
     false
 }
 
-/// Switch to the next/previous action tab, focus the pane, repaint it.
+/// Cycle keyboard focus across the shell chat and every visible action pane
+/// (Ctrl+Tab / Ctrl+Shift+Tab). Grid-aware: chat → pane1 → pane2 → … → chat.
+/// Always returns focus to the shell so apps/media/editor cannot trap keys.
+fn focus_cycle(forward: bool) {
+    #[cfg(not(test))]
+    {
+        let on_action = crate::framebuffer::focus_cycle_all(forward);
+        if on_action {
+            repaint_active_tab();
+        }
+    }
+    #[cfg(test)]
+    let _ = forward;
+}
+
+/// Cycle tabs on the **focused** action column only (in-pane). Used when the
+/// action band already has focus and the user wants the next tab without
+/// leaving the pane — not the primary Ctrl+Tab binding (that is [`focus_cycle`]).
+#[allow(dead_code)]
 fn tab_switch(forward: bool) {
     #[cfg(not(test))]
     {
@@ -8017,14 +8041,16 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                     }
                     continue;
                 }
-                // Ctrl+Tab / Shift+Tab: cycle action-pane tabs (tmux-style), a
-                // global chord that works even while the editor tab is focused.
+                // Ctrl+Tab / Ctrl+Shift+Tab (CSI `T` / `Z`): cycle keyboard
+                // focus shell ↔ action panes (grid-aware). Returns to the
+                // shell composer so a package UI / media / editor cannot trap
+                // keys. In-pane tab cycling is click / `/pane` (and mouse).
                 if matches!(fin, Some(b'T')) {
-                    tab_switch(true);
+                    focus_cycle(true);
                     continue;
                 }
                 if matches!(fin, Some(b'Z')) {
-                    tab_switch(false);
+                    focus_cycle(false);
                     continue;
                 }
                 // Cmd/Super+Space → Agents browser (macOS Spotlight-style).
@@ -8161,7 +8187,7 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                         composer_sync(buf, cur);
                         suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
                     }
-                    // (Ctrl+Tab / Shift+Tab handled above as tab switching.)
+                    // (Ctrl+Tab / Ctrl+Shift+Tab handled above as focus cycle.)
                     Some(b'~') => match param {
                         1 | 7 => {
                             cursor_shift(cur, false);
@@ -9762,7 +9788,7 @@ fn toggle_ktrace() {
             serial_println!("ktrace> tab closed");
         } else {
             framebuffer::open_ktrace();
-            serial_println!("ktrace> showing as an action tab (Ctrl+Tab switches tabs, /close closes it)");
+            serial_println!("ktrace> showing as an action tab (Ctrl+Tab cycles focus, /close closes it)");
         }
     }
 }
@@ -12104,7 +12130,7 @@ fn run_open_inner(
         // No hook: text editor tab.
         crate::editor::open(arg);
         crate::framebuffer::focus_set(true);
-        serial_println!("editor> {} open in a tab — i insert, Esc normal, :w write, :q quit; Ctrl+Tab switches tabs", arg);
+        serial_println!("editor> {} open in a tab — i insert, Esc normal, :w write, :q quit; Ctrl+Tab returns to shell", arg);
     }
     #[cfg(test)]
     let _ = (arg, chat, orch);

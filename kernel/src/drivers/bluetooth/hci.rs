@@ -313,11 +313,17 @@ pub fn parse_inquiry_result(params: &[u8]) -> Vec<InquiryEntry> {
         let mut bd = [0u8; 6];
         bd.copy_from_slice(&params[off..off + 6]);
         let psrm = params[off + 6];
-        // reserved off+7
+        // **Two** reserved bytes, off+7 and off+8 — the Core spec's HCI_Inquiry_Result entry is
+        // BD_ADDR(6) PSRM(1) Reserved(1) Reserved(1) CoD(3) Clock_Offset(2) = 14. Reading the
+        // class from off+8 assumed one, which is a *plausible* wrong answer rather than an
+        // obvious one: it takes the last reserved byte as the class's low octet, so a real
+        // device's major class silently comes out as something else. The 14-byte stride and the
+        // bounds check were already right, which is what made the entry-length arithmetic
+        // disagree with the field offsets.
         let cod = u32::from_le_bytes([
-            params[off + 8],
             params[off + 9],
             params[off + 10],
+            params[off + 11],
             0,
         ]);
         out.push(InquiryEntry {
@@ -428,7 +434,9 @@ mod tests {
         let mut p = alloc::vec![1u8];
         p.extend_from_slice(&[0x66, 0x55, 0x44, 0x33, 0x22, 0x11]);
         p.push(0x01); // psrm
-        p.push(0x00); // reserved
+        p.push(0x00); // reserved 1
+        p.push(0x00); // reserved 2 -- the spec has two, and omitting one made the 14-byte
+                      // bounds check reject a 13-byte entry, so this parsed as zero responses
         p.extend_from_slice(&[0x40, 0x05, 0x00]); // CoD
         p.extend_from_slice(&[0, 0]); // clock offset
         let e = parse_inquiry_result(&p);
@@ -473,7 +481,9 @@ mod tests {
     #[test_case]
     fn local_name_and_bd_addr_decode() {
         let mut ret = alloc::vec![0u8; 249];
-        ret[1..6].copy_from_slice(b"Chitti");
+        // `1..7`, not `1..6`: Read_Local_Name returns status(1) then 248 name bytes, and
+        // "Chitti" is six. The rest stays zero, which is the NUL the parser stops at.
+        ret[1..7].copy_from_slice(b"Chitti");
         assert_eq!(local_name_from_return(&ret), Some("Chitti"));
         let bd = [0u8, 0x56, 0x34, 0x12, 0xab, 0xcd, 0xef];
         assert_eq!(format_bd_addr(&bd_addr_from_return(&bd).unwrap()), "EF:CD:AB:12:34:56");
