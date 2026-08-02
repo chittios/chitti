@@ -163,6 +163,16 @@ pub fn bt_acl_recv(out: &mut [u8], timeout_ms: u64) -> Option<usize> {
     XHCI.with(|s| s.as_mut().and_then(|x| x.bt_acl_recv(out, timeout_ms)))
 }
 
+pub fn uvc_ready() -> bool {
+    XHCI.with(|s| s.as_ref().map(|x| x.has_uvc()).unwrap_or(false))
+}
+
+pub fn uvc_grab(
+    timeout_ms: u64,
+) -> Option<(crate::drivers::uvc::StreamPlan, alloc::vec::Vec<u8>)> {
+    XHCI.with(|s| s.as_mut().and_then(|x| x.uvc_grab_frame(timeout_ms)))
+}
+
 /// `mm::alloc_dma` adapted to the core's `(phys, virt)` allocator shape.
 fn x86_alloc(bytes: usize) -> Option<(u64, usize)> {
     alloc_dma(bytes).map(|(pa, va)| (pa, va as usize))

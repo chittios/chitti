@@ -9206,16 +9206,80 @@ fn run_bluetooth(arg: &str) {
     }
 }
 
-/// `/camera [status]` — UVC identify + format parse stage.
+/// `/camera [status|grab]` — UVC still capture to `/downloads/`.
 fn run_camera(arg: &str) {
     let a = arg.trim();
-    if !(a.is_empty() || a == "status" || a == "info") {
-        serial_println!("camera> usage: /camera [status]");
+    if a.is_empty() || a == "status" || a == "info" {
+        serial_println!("camera> UVC:");
+        for line in crate::drivers::uvc::status_lines() {
+            serial_println!("  {line}");
+        }
+        serial_println!("  cmds: status | grab [path]");
         return;
     }
-    serial_println!("camera> UVC staged (descriptor parse, no capture yet):");
-    for line in crate::drivers::uvc::status_lines() {
-        serial_println!("  {line}");
+    let mut parts = a.split_whitespace();
+    match parts.next().unwrap_or("") {
+        "grab" | "capture" | "snap" => {
+            let dest = parts.next().map(|p| {
+                if p.starts_with('/') {
+                    p.to_string()
+                } else {
+                    alloc::format!("/downloads/{p}")
+                }
+            });
+            camera_grab(dest.as_deref());
+        }
+        _ => serial_println!("camera> usage: /camera [status|grab [path]]"),
+    }
+}
+
+fn camera_grab(dest: Option<&str>) {
+    if !crate::arch::uvc_ready() {
+        serial_println!("camera> no stream transport — plug a UVC webcam and reboot/re-enum");
+        return;
+    }
+    serial_println!("camera> grabbing still (up to 8 s)…");
+    let Some((plan, frame)) = crate::arch::uvc_grab(8_000) else {
+        serial_println!("camera> grab failed (timeout or empty frame)");
+        return;
+    };
+    let ext = match plan.format {
+        crate::drivers::uvc::PixelFormat::Mjpeg => "jpg",
+        crate::drivers::uvc::PixelFormat::Yuy2 => "yuy2",
+        crate::drivers::uvc::PixelFormat::UncompressedOther => "bin",
+    };
+    let path = dest
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            let t = crate::arch::now_ms();
+            alloc::format!("/downloads/camera-{t}.{ext}")
+        });
+    // MJPEG should start with JPEG SOI; still save whatever we assembled.
+    if matches!(plan.format, crate::drivers::uvc::PixelFormat::Mjpeg)
+        && (frame.len() < 2 || frame[0] != 0xff || frame[1] != 0xd8)
+    {
+        serial_println!(
+            "camera> warning: frame is not a JPEG SOI ({} bytes) — saving anyway",
+            frame.len()
+        );
+    }
+    crate::synapse::fs::write(&path, &frame);
+    crate::drivers::uvc::mark_grab_ok();
+    serial_println!(
+        "camera> saved {} ({} bytes, {} {}x{}) — /open {}",
+        path,
+        frame.len(),
+        plan.format.name(),
+        plan.width,
+        plan.height,
+        path
+    );
+    // Best-effort: if JPEG, try decoding to prove the frame is real.
+    if matches!(plan.format, crate::drivers::uvc::PixelFormat::Mjpeg) {
+        match crate::image::decode(&frame) {
+            Ok(img) => serial_println!("camera> jpeg decode ok {}x{}", img.w, img.h),
+            Err(e) => serial_println!("camera> jpeg decode: {e}"),
+        }
     }
 }
 

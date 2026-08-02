@@ -149,7 +149,12 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "System & UI", title: "Battery", name: "battery", shortcut: "" },
     Entry { category: "System & UI", title: "Power / Energy Mode", name: "power", shortcut: "" },
     Entry { category: "System & UI", title: "Bluetooth", name: "bluetooth", shortcut: "" },
-    Entry { category: "System & UI", title: "Camera (UVC)", name: "camera", shortcut: "" },
+    Entry {
+        category: "System & UI",
+        title: "Camera grab (UVC still)",
+        name: "camera",
+        shortcut: "",
+    },
     Entry { category: "System & UI", title: "Touchscreen", name: "touch", shortcut: "" },
     Entry { category: "System & UI", title: "Suspend", name: "suspend", shortcut: "" },
     Entry { category: "System & UI", title: "UI Config", name: "ui", shortcut: "" },

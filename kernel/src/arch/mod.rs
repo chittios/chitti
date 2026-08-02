@@ -350,6 +350,34 @@ pub fn bt_acl_recv(_out: &mut [u8], _timeout_ms: u64) -> Option<usize> {
     None
 }
 
+// ── UVC still capture ────────────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+pub fn uvc_ready() -> bool {
+    x86_64::xhci::uvc_ready()
+}
+#[cfg(target_arch = "aarch64")]
+pub fn uvc_ready() -> bool {
+    aarch64::xhci::uvc_ready()
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn uvc_ready() -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn uvc_grab(timeout_ms: u64) -> Option<(crate::drivers::uvc::StreamPlan, alloc::vec::Vec<u8>)> {
+    x86_64::xhci::uvc_grab(timeout_ms)
+}
+#[cfg(target_arch = "aarch64")]
+pub fn uvc_grab(timeout_ms: u64) -> Option<(crate::drivers::uvc::StreamPlan, alloc::vec::Vec<u8>)> {
+    aarch64::xhci::uvc_grab(timeout_ms)
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn uvc_grab(_timeout_ms: u64) -> Option<(crate::drivers::uvc::StreamPlan, alloc::vec::Vec<u8>)> {
+    None
+}
+
 /// This core's hardware identity, cheap and MMIO-free.
 ///
 /// x86 reads the *initial* APIC id out of `CPUID.01:EBX[31:24]` rather than the

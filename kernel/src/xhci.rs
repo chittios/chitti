@@ -172,6 +172,34 @@ struct BtHci {
     acl_out_flight: bool,
 }
 
+/// UVC still-capture stream (bulk or isoc IN) on one device slot.
+struct UvcCam {
+    slot: u8,
+    root_port: u8,
+    vs_iface: u8,
+    ep0_va: usize,
+    ep0_pa: u64,
+    ep0_enq: usize,
+    ep0_cycle: u32,
+    plan: crate::drivers::uvc::StreamPlan,
+    stream_dci: u8,
+    stream_ring_va: usize,
+    stream_ring_pa: u64,
+    stream_enq: usize,
+    stream_cycle: u32,
+    /// Bounce buffer for one USB packet (MPS).
+    pkt_buf_pa: u64,
+    pkt_buf_va: usize,
+    pkt_mps: u32,
+    /// Control bounce (PROBE/COMMIT).
+    ctl_buf_pa: u64,
+    ctl_buf_va: usize,
+    in_flight: bool,
+    in_req: u32,
+    in_ready: Option<usize>,
+    bulk: bool,
+}
+
 pub struct Xhci {
     mmio: usize,     // virtual base of the mapped register space
     op: usize,       // virtual base of operational registers
@@ -204,6 +232,8 @@ pub struct Xhci {
     bulk: Option<BulkEp>,
     /// USB Bluetooth HCI (own interrupt + ACL bulk; does not use [`bulk`]).
     bt: Option<BtHci>,
+    /// USB Video Class still stream (isoc or bulk IN).
+    uvc: Option<UvcCam>,
     // Ports that already produced a working device. On an enumeration retry
     // (VirtualBox's async VUSB reset makes the *other* device time out) these
     // are skipped so we don't reset a port whose device already enumerated —
@@ -379,6 +409,8 @@ const TRB_NORMAL: u32 = 1;
 const TRB_SETUP: u32 = 2;
 const TRB_DATA: u32 = 3;
 const TRB_STATUS: u32 = 4;
+/// Isochronous data TRB (xHCI §6.4.1.2).
+const TRB_ISOCH: u32 = 5;
 const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_DISABLE_SLOT: u32 = 10;
 const TRB_ADDRESS_DEVICE: u32 = 11;
@@ -685,6 +717,7 @@ impl Xhci {
                 mouse: None,
                 bulk: None,
                 bt: None,
+                uvc: None,
                 done_ports: 0,
                 key_buf: [0; 16],
                 key_head: 0,
@@ -1005,6 +1038,14 @@ impl Xhci {
             let desc = unsafe { core::slice::from_raw_parts(c.buf_va as *const u8, c.total as usize) };
             if let Some(eps) = crate::drivers::bluetooth::usb::find_bt_endpoints(desc) {
                 if unsafe { self.finish_bluetooth(c, eps) } {
+                    got = true;
+                }
+            }
+        }
+        if self.uvc.is_none() {
+            let desc = unsafe { core::slice::from_raw_parts(c.buf_va as *const u8, c.total as usize) };
+            if let Some(plan) = crate::drivers::uvc::plan_stream(desc) {
+                if unsafe { self.finish_uvc(c, plan) } {
                     got = true;
                 }
             }
@@ -1718,6 +1759,7 @@ impl Xhci {
         let mut mouse = self.mouse.take();
         let mut bulk = self.bulk.take();
         let mut bt = self.bt.take();
+        let mut uvc = self.uvc.take();
         // SAFETY: rings/buffers are live for the controller's lifetime.
         unsafe {
             while let Some(ev) = self.next_event() {
@@ -1780,6 +1822,14 @@ impl Xhci {
                             bt.acl_out_flight = false;
                             continue;
                         }
+                    }
+                }
+                if let Some(u) = uvc.as_mut() {
+                    if u.slot == slot && dci == u.stream_dci {
+                        let residual = (ev.status & 0x00ff_ffff) as usize;
+                        u.in_flight = false;
+                        u.in_ready = Some((u.in_req as usize).saturating_sub(residual));
+                        continue;
                     }
                 }
                 if let Some(k) = kbd.as_mut() {
@@ -1874,6 +1924,356 @@ impl Xhci {
         self.mouse = mouse;
         self.bulk = bulk;
         self.bt = bt;
+        self.uvc = uvc;
+    }
+
+    /// Bring up a UVC still stream: SET_INTERFACE → PROBE/COMMIT → configure ep.
+    ///
+    /// # Safety
+    /// `c` addressed; `plan` from the same config descriptor.
+    unsafe fn finish_uvc(
+        &mut self,
+        c: &mut Common,
+        plan: crate::drivers::uvc::StreamPlan,
+    ) -> bool {
+        use crate::drivers::uvc;
+        if !unsafe { self.ensure_configured(c) } {
+            return false;
+        }
+        // SET_INTERFACE(alt) on the VS interface.
+        let set_if = setup(0x01, 0x0b, plan.ep.alt as u16, plan.ep.vs_iface as u16, 0);
+        if !unsafe {
+            self.control(
+                c.slot,
+                c.ep0_va,
+                c.ep0_pa,
+                &mut c.ep0_enq,
+                &mut c.ep0_cycle,
+                set_if,
+                0,
+                0,
+                false,
+            )
+        } {
+            crate::ktrace::log("xhci", "uvc: SET_INTERFACE failed");
+            return false;
+        }
+        let max_frame = uvc::max_frame_bytes(&plan);
+        let max_payload = (plan.ep.mps as u32).max(1024);
+        let mut probe = uvc::build_probe(
+            plan.format_index,
+            plan.frame_index,
+            plan.frame_interval,
+            max_frame,
+            max_payload,
+        );
+        // SET_CUR PROBE
+        // SAFETY: bounce buffer is the enumeration page.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                probe.as_ptr(),
+                c.buf_va as *mut u8,
+                uvc::PROBE_LEN,
+            );
+        }
+        dma_clean(c.buf_va, uvc::PROBE_LEN);
+        let wvalue = (uvc::VS_PROBE_CONTROL as u16) << 8;
+        let set_probe = setup(
+            0x21,
+            uvc::SET_CUR,
+            wvalue,
+            plan.ep.vs_iface as u16,
+            uvc::PROBE_LEN as u16,
+        );
+        if !unsafe {
+            self.control(
+                c.slot,
+                c.ep0_va,
+                c.ep0_pa,
+                &mut c.ep0_enq,
+                &mut c.ep0_cycle,
+                set_probe,
+                c.buf_pa,
+                uvc::PROBE_LEN as u32,
+                false,
+            )
+        } {
+            crate::ktrace::log("xhci", "uvc: SET_CUR PROBE failed");
+            return false;
+        }
+        // GET_CUR PROBE — device fills negotiated params.
+        let get_probe = setup(
+            0xa1,
+            uvc::GET_CUR,
+            wvalue,
+            plan.ep.vs_iface as u16,
+            uvc::PROBE_LEN as u16,
+        );
+        if unsafe {
+            self.control(
+                c.slot,
+                c.ep0_va,
+                c.ep0_pa,
+                &mut c.ep0_enq,
+                &mut c.ep0_cycle,
+                get_probe,
+                c.buf_pa,
+                uvc::PROBE_LEN as u32,
+                true,
+            )
+        } {
+            dma_invalidate(c.buf_va, uvc::PROBE_LEN);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    c.buf_va as *const u8,
+                    probe.as_mut_ptr(),
+                    uvc::PROBE_LEN,
+                );
+            }
+        }
+        // SET_CUR COMMIT
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                probe.as_ptr(),
+                c.buf_va as *mut u8,
+                uvc::PROBE_LEN,
+            );
+        }
+        dma_clean(c.buf_va, uvc::PROBE_LEN);
+        let wcommit = (uvc::VS_COMMIT_CONTROL as u16) << 8;
+        let set_commit = setup(
+            0x21,
+            uvc::SET_CUR,
+            wcommit,
+            plan.ep.vs_iface as u16,
+            uvc::PROBE_LEN as u16,
+        );
+        if !unsafe {
+            self.control(
+                c.slot,
+                c.ep0_va,
+                c.ep0_pa,
+                &mut c.ep0_enq,
+                &mut c.ep0_cycle,
+                set_commit,
+                c.buf_pa,
+                uvc::PROBE_LEN as u32,
+                false,
+            )
+        } {
+            crate::ktrace::log("xhci", "uvc: SET_CUR COMMIT failed");
+            return false;
+        }
+        let stream_dci = ((plan.ep.ep_addr & 0x0f) * 2 + 1) as u8;
+        let Some((ring_pa, ring_va)) = (self.alloc)(RING_TRBS * 16) else {
+            return false;
+        };
+        let mps = (plan.ep.mps as u32).clamp(64, 3072);
+        let Some((pkt_pa, pkt_va)) = (self.alloc)(4096) else {
+            return false;
+        };
+        let ring_va = ring_va as usize;
+        unsafe { self.init_link(ring_va, ring_pa) };
+        let ep_type = if plan.ep.bulk {
+            EpType::BulkIn
+        } else {
+            EpType::IsochIn
+        };
+        // Isoch: Interval = bInterval-1 on HS; Mult=0; ESIT=MPS.
+        unsafe {
+            self.build_input_configure_stream(
+                c,
+                stream_dci,
+                mps,
+                plan.ep.interval,
+                ring_pa,
+                ep_type,
+            );
+        }
+        let Some((cc, _)) = (unsafe {
+            self.command(
+                c.in_ctx_pa,
+                (TRB_CONFIGURE_ENDPOINT << 10) | ((c.slot as u32) << 24),
+            )
+        }) else {
+            return false;
+        };
+        if cc != CC_SUCCESS {
+            crate::ktrace::log_fmt(format_args!("xhci: uvc configure ep failed cc={cc}"));
+            return false;
+        }
+        let cam = UvcCam {
+            slot: c.slot,
+            root_port: c.loc.root_port,
+            vs_iface: plan.ep.vs_iface,
+            ep0_va: c.ep0_va,
+            ep0_pa: c.ep0_pa,
+            ep0_enq: c.ep0_enq,
+            ep0_cycle: c.ep0_cycle,
+            plan,
+            stream_dci,
+            stream_ring_va: ring_va,
+            stream_ring_pa: ring_pa,
+            stream_enq: 0,
+            stream_cycle: 1,
+            pkt_buf_pa: pkt_pa,
+            pkt_buf_va: pkt_va as usize,
+            pkt_mps: mps,
+            ctl_buf_pa: c.buf_pa,
+            ctl_buf_va: c.buf_va,
+            in_flight: false,
+            in_req: 0,
+            in_ready: None,
+            bulk: plan.ep.bulk,
+        };
+        crate::ktrace::log_fmt(format_args!(
+            "xhci: UVC stream up {} {}x{} {} dci {} mps {}",
+            plan.format.name(),
+            plan.width,
+            plan.height,
+            if plan.ep.bulk { "bulk" } else { "isoc" },
+            stream_dci,
+            mps
+        ));
+        crate::drivers::uvc::note_transport_ready();
+        self.uvc = Some(cam);
+        true
+    }
+
+    /// Configure stream EP with isoc-aware interval encoding.
+    unsafe fn build_input_configure_stream(
+        &self,
+        c: &Common,
+        dci: u8,
+        mps: u32,
+        interval: u8,
+        ring_pa: u64,
+        ep_type: EpType,
+    ) {
+        unsafe {
+            let in_ctx_va = c.in_ctx_va;
+            w32(in_ctx_va, 0);
+            w32(in_ctx_va + 4, 0b1 | (1u32 << dci));
+            let in_slot = in_ctx_va + self.ctx_size;
+            core::ptr::copy_nonoverlapping(
+                c.dev_ctx_va as *const u8,
+                in_slot as *mut u8,
+                self.ctx_size,
+            );
+            let cur_entries = (r32(in_slot) >> 27) & 0x1f;
+            let entries = cur_entries.max(dci as u32);
+            let d0 = r32(in_slot) & !(0x1f << 27);
+            w32(in_slot, d0 | (entries << 27));
+            let ep = in_ctx_va + self.ctx_size * (dci as usize + 1);
+            core::ptr::write_bytes(ep as *mut u8, 0, self.ctx_size);
+            // HS/SS isoc: Interval = bInterval - 1; bulk ignores interval.
+            let ivl = match ep_type {
+                EpType::IsochIn | EpType::IsochOut => interval.saturating_sub(1).min(15) as u32,
+                _ => {
+                    let biv = interval.max(1) as u32;
+                    (biv.ilog2()).min(12) + 3
+                }
+            };
+            w32(ep, ivl << 16); // Mult=0 in bits 9:8
+            w32(ep + 4, ep_ctx_dword1(ep_type, mps));
+            w64(ep + 8, ring_pa | 1);
+            let esit = mps.min(0xffff);
+            w32(ep + 16, esit | (esit << 16));
+        }
+    }
+
+    pub fn has_uvc(&self) -> bool {
+        self.uvc.is_some()
+    }
+
+    /// Capture one still frame (assembled UVC payloads). Timeout in ms.
+    pub fn uvc_grab_frame(&mut self, timeout_ms: u64) -> Option<(crate::drivers::uvc::StreamPlan, alloc::vec::Vec<u8>)> {
+        use crate::drivers::uvc::FrameAssembler;
+        let plan = self.uvc.as_ref()?.plan;
+        let mut asm = FrameAssembler::new();
+        let start = crate::arch::now_ms();
+        let mut pkt = [0u8; 4096];
+        // Arm transfers until a full frame or timeout.
+        loop {
+            if crate::arch::now_ms().wrapping_sub(start) > timeout_ms {
+                crate::ktrace::log("xhci", "uvc: grab timeout");
+                return None;
+            }
+            crate::shell::upkeep();
+            // Ensure a transfer is outstanding.
+            if let Some(u) = self.uvc.as_mut() {
+                if !u.in_flight && u.in_ready.is_none() {
+                    let (va, pa, mut enq, mut cyc) = (
+                        u.stream_ring_va,
+                        u.stream_ring_pa,
+                        u.stream_enq,
+                        u.stream_cycle,
+                    );
+                    let want = u.pkt_mps;
+                    u.in_flight = true;
+                    u.in_req = want;
+                    let (buf, slot, dci, bulk) =
+                        (u.pkt_buf_pa, u.slot, u.stream_dci, u.bulk);
+                    unsafe {
+                        if bulk {
+                            self.arm_int(va, pa, &mut enq, &mut cyc, buf, want, slot, dci);
+                        } else {
+                            self.arm_isoc(va, pa, &mut enq, &mut cyc, buf, want, slot, dci);
+                        }
+                    }
+                    if let Some(u) = self.uvc.as_mut() {
+                        u.stream_enq = enq;
+                        u.stream_cycle = cyc;
+                    }
+                }
+            } else {
+                return None;
+            }
+            self.pump_events();
+            if let Some(u) = self.uvc.as_mut() {
+                if let Some(n) = u.in_ready.take() {
+                    let n = n.min(pkt.len()).min(u.pkt_mps as usize);
+                    if n == 0 {
+                        continue;
+                    }
+                    dma_invalidate(u.pkt_buf_va, n);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            u.pkt_buf_va as *const u8,
+                            pkt.as_mut_ptr(),
+                            n,
+                        );
+                    }
+                    if let Some(frame) = asm.push(&pkt[..n]) {
+                        if !frame.is_empty() {
+                            return Some((plan, frame));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Queue an Isoch TRB (SIA+IOC+ISP) for one microframe-sized transfer.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn arm_isoc(
+        &self,
+        ring_va: usize,
+        ring_pa: u64,
+        enq: &mut usize,
+        cycle: &mut u32,
+        buf_pa: u64,
+        len: u32,
+        slot: u8,
+        dci: u8,
+    ) {
+        // Isoch TRB control: Type=5, IOC(5), ISP(2), SIA(31).
+        // status: Transfer Length in bits 16:0; TD Size / TBC = 0 for single packet.
+        let control = (TRB_ISOCH << 10) | (1 << 5) | (1 << 2) | (1u32 << 31) | (*cycle & 1);
+        unsafe {
+            Self::ring_push(ring_va, ring_pa, enq, cycle, buf_pa, len, control);
+            self.doorbell(slot, dci as u32);
+        }
     }
 
     /// Bring up USB Bluetooth HCI endpoints on an addressed device.
@@ -2569,6 +2969,15 @@ impl Xhci {
                 crate::ktrace::log_fmt(format_args!(
                     "xhci: Bluetooth HCI unplugged (root port {port}, slot {})",
                     b.slot
+                ));
+            }
+        }
+        if self.uvc.as_ref().is_some_and(|u| u.root_port == port) {
+            if let Some(u) = self.uvc.take() {
+                push(u.slot);
+                crate::ktrace::log_fmt(format_args!(
+                    "xhci: UVC unplugged (root port {port}, slot {})",
+                    u.slot
                 ));
             }
         }

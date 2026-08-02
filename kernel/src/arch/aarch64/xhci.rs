@@ -357,6 +357,23 @@ pub fn bt_acl_recv(out: &mut [u8], timeout_ms: u64) -> Option<usize> {
     })
 }
 
+pub fn uvc_ready() -> bool {
+    XHCI.with(|s| s.iter().any(|x| x.has_uvc()))
+}
+
+pub fn uvc_grab(
+    timeout_ms: u64,
+) -> Option<(crate::drivers::uvc::StreamPlan, alloc::vec::Vec<u8>)> {
+    XHCI.with(|s| {
+        for x in s.iter_mut() {
+            if x.has_uvc() {
+                return x.uvc_grab_frame(timeout_ms);
+            }
+        }
+        None
+    })
+}
+
 /// Page-aligned identity DMA: VA == PA on the aarch64 identity map (or via
 /// `dma_to_phys` under the HHDM handoff). Returns `(phys, virt)`.
 fn aa_alloc(bytes: usize) -> Option<(u64, usize)> {
