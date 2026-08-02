@@ -141,6 +141,28 @@ pub fn usb_bulk_sync_in(out: &mut [u8], timeout_ms: u64) -> Option<usize> {
     r
 }
 
+// ── Bluetooth HCI ────────────────────────────────────────────────────────
+
+pub fn bt_hci_ready() -> bool {
+    XHCI.with(|s| s.as_ref().map(|x| x.has_bluetooth()).unwrap_or(false))
+}
+
+pub fn bt_hci_cmd(cmd: &[u8], timeout_ms: u64) -> Option<alloc::vec::Vec<u8>> {
+    XHCI.with(|s| s.as_mut().and_then(|x| x.bt_hci_cmd(cmd, timeout_ms)))
+}
+
+pub fn bt_take_event(out: &mut [u8]) -> Option<usize> {
+    XHCI.with(|s| s.as_mut().and_then(|x| x.bt_take_event(out)))
+}
+
+pub fn bt_acl_send_sync(data: &[u8], timeout_ms: u64) -> bool {
+    XHCI.with(|s| s.as_mut().map(|x| x.bt_acl_send_sync(data, timeout_ms)).unwrap_or(false))
+}
+
+pub fn bt_acl_recv(out: &mut [u8], timeout_ms: u64) -> Option<usize> {
+    XHCI.with(|s| s.as_mut().and_then(|x| x.bt_acl_recv(out, timeout_ms)))
+}
+
 /// `mm::alloc_dma` adapted to the core's `(phys, virt)` allocator shape.
 fn x86_alloc(bytes: usize) -> Option<(u64, usize)> {
     alloc_dma(bytes).map(|(pa, va)| (pa, va as usize))

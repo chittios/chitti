@@ -8958,6 +8958,8 @@ pub fn upkeep() {
     }
     // `auto` energy mode tracks idle fraction + battery; cheap when unchanged.
     crate::power::cpu::tick();
+    // Bluetooth HID interrupt reports (classic boot keyboard).
+    crate::drivers::bluetooth::host::poll_hid_input();
 }
 
 /// The pump task: what the scheduler runs when every other task is blocked or
@@ -9113,16 +9115,94 @@ fn run_power(arg: &str) {
     }
 }
 
-/// `/bluetooth [status]` — USB BT identify + HCI codec stage.
+/// `/bluetooth` — HCI transport, scan, PIN pair, HID host.
 fn run_bluetooth(arg: &str) {
     let a = arg.trim();
-    if !(a.is_empty() || a == "status" || a == "info") {
-        serial_println!("bluetooth> usage: /bluetooth [status]");
+    if a.is_empty() || a == "status" || a == "info" {
+        serial_println!("bluetooth> host + HCI USB:");
+        for line in crate::drivers::bluetooth::status_lines() {
+            serial_println!("  {line}");
+        }
+        serial_println!(
+            "  cmds: status|reset|scan [n]|pair <AA:BB:…>|hid|bonds|disconnect"
+        );
         return;
     }
-    serial_println!("bluetooth> staged stack (identify + HCI codec):");
-    for line in crate::drivers::bluetooth::status_lines() {
-        serial_println!("  {line}");
+    let mut parts = a.split_whitespace();
+    let cmd = parts.next().unwrap_or("");
+    match cmd {
+        "reset" | "up" => match crate::drivers::bluetooth::host::reset_and_info() {
+            Ok(s) => serial_println!("bluetooth> {s}"),
+            Err(e) => serial_println!("bluetooth> {e}"),
+        },
+        "scan" => {
+            let slots: u8 = parts
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5);
+            serial_println!("bluetooth> inquiry ({slots}×1.28s)…");
+            match crate::drivers::bluetooth::host::scan(slots) {
+                Ok(list) if list.is_empty() => {
+                    serial_println!("bluetooth> no devices (dongle powered? transport up?)")
+                }
+                Ok(list) => {
+                    for (i, e) in list.iter().enumerate() {
+                        let major = crate::drivers::bluetooth::hci::cod_major(e.class_of_device);
+                        serial_println!(
+                            "  [{i}] {}  CoD={:#x} major={major}",
+                            crate::drivers::bluetooth::hci::format_bd_addr(&e.bd_addr),
+                            e.class_of_device
+                        );
+                    }
+                }
+                Err(e) => serial_println!("bluetooth> scan: {e}"),
+            }
+        }
+        "pair" => {
+            let Some(addr) = parts.next() else {
+                serial_println!("bluetooth> usage: /bluetooth pair <AA:BB:CC:DD:EE:FF>");
+                return;
+            };
+            let pin = if let Some(p) = parts.next() {
+                p.to_string()
+            } else {
+                let p = crate::modal::input(
+                    "Bluetooth PIN",
+                    &alloc::format!("PIN for {addr} (default 0000 if empty)"),
+                    true,
+                );
+                if p.is_empty() {
+                    "0000".into()
+                } else {
+                    p
+                }
+            };
+            match crate::drivers::bluetooth::host::pair(addr, Some(&pin)) {
+                Ok(s) => serial_println!("bluetooth> {s}"),
+                Err(e) => serial_println!("bluetooth> pair: {e}"),
+            }
+        }
+        "hid" => match crate::drivers::bluetooth::host::open_hid() {
+            Ok(s) => serial_println!("bluetooth> {s}"),
+            Err(e) => serial_println!("bluetooth> hid: {e}"),
+        },
+        "bonds" => {
+            let bonds = crate::drivers::bluetooth::bond::load();
+            if bonds.is_empty() {
+                serial_println!("bluetooth> no bonds stored");
+            } else {
+                for b in bonds {
+                    serial_println!("  {}  {}", b.addr, b.name);
+                }
+            }
+        }
+        "disconnect" | "down" => match crate::drivers::bluetooth::host::disconnect() {
+            Ok(()) => serial_println!("bluetooth> disconnected"),
+            Err(e) => serial_println!("bluetooth> {e}"),
+        },
+        _ => serial_println!(
+            "bluetooth> usage: /bluetooth [status|reset|scan|pair <addr>|hid|bonds|disconnect]"
+        ),
     }
 }
 

@@ -1,19 +1,23 @@
-//! **Bluetooth (staged)** — identify USB Bluetooth controllers; pure HCI codec.
+//! **Bluetooth (staged)** — USB HCI transport, classic host ops, PIN pairing.
 //!
 //! ## Stages (hardware plan PR6)
 //!
-//! 1. **Identify** — USB class `E0/01/01` (Wireless Controller / RF / Bluetooth)
-//!    noted during xHCI config walk; `/bluetooth status` reports it.
-//! 2. **HCI codec** — packet framing, HCI_Reset, Read Local Name (this module's
-//!    [`hci`]; unit-tested). No firmware download yet.
-//! 3. **Transport + HID host** — HCI over USB bulk/interrupt, then BLE HOGP or
-//!    BR/EDR HID (not yet).
-//! 4. **Pairing** — human modal + store bond (not yet).
+//! 1. **Identify** — USB class `E0/01/01` noted at enumeration.
+//! 2. **HCI codec** — [`hci`] pure builders/parsers (unit-tested).
+//! 3. **Transport + HID host** — HCI commands via USB class control, events on
+//!    interrupt IN, ACL on a dedicated bulk pair ([`usb`] + xHCI `BtHci`);
+//!    classic HID opens L2CAP PSM 0x11/0x13 after ACL + auth ([`l2cap`]/[`hidp`]).
+//! 4. **Pairing** — PIN modal + durable [`bond`] store under `/configs/core/`.
 //!
-//! A USB Bluetooth dongle must **not** steal the single bulk pair used by MSC
-//! or Ethernet; presence is recorded without configuring endpoints.
+//! ACL bulk is **separate** from the MSC/Ethernet bulk claim so a stick and a
+//! dongle can coexist.
 
+pub mod bond;
 pub mod hci;
+pub mod hidp;
+pub mod host;
+pub mod l2cap;
+pub mod usb;
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -28,6 +32,7 @@ pub fn is_usb_bluetooth(class: u8, subclass: u8, protocol: u8) -> bool {
 }
 
 static SEEN: AtomicBool = AtomicBool::new(false);
+static TRANSPORT: AtomicBool = AtomicBool::new(false);
 static ROOT_PORT: AtomicU8 = AtomicU8::new(0);
 static SLOT: AtomicU8 = AtomicU8::new(0);
 static IFACE_CLASS: AtomicU8 = AtomicU8::new(0);
@@ -43,14 +48,24 @@ pub fn note_usb_device(root_port: u8, slot: u8, class: u8, sub: u8, proto: u8) {
     IFACE_SUB.store(sub, Ordering::Relaxed);
     IFACE_PROTO.store(proto, Ordering::Relaxed);
     crate::ktrace::log_fmt(format_args!(
-        "bluetooth: USB BT noted (root port {root_port} slot {slot} {class:02x}/{sub:02x}/{proto:02x}) — identify only, no HCI transport yet"
+        "bluetooth: USB BT noted (root port {root_port} slot {slot} {class:02x}/{sub:02x}/{proto:02x})"
     ));
+}
+
+/// Called when xHCI finished configuring HCI endpoints.
+pub fn note_transport_ready(root_port: u8, slot: u8) {
+    TRANSPORT.store(true, Ordering::Release);
+    ROOT_PORT.store(root_port, Ordering::Relaxed);
+    SLOT.store(slot, Ordering::Relaxed);
+    crate::ktrace::log("bluetooth", "HCI USB transport ready");
 }
 
 /// Forget BT claim when its root port is unplugged.
 pub fn clear_if_port(root_port: u8) {
     if SEEN.load(Ordering::Acquire) && ROOT_PORT.load(Ordering::Relaxed) == root_port {
         SEEN.store(false, Ordering::Release);
+        TRANSPORT.store(false, Ordering::Release);
+        host::on_transport_lost();
         crate::ktrace::log("bluetooth", "USB BT gone with root port");
     }
 }
@@ -58,6 +73,11 @@ pub fn clear_if_port(root_port: u8) {
 /// Whether any Bluetooth interface has been noted since boot (or last clear).
 pub fn present() -> bool {
     SEEN.load(Ordering::Acquire)
+}
+
+/// Whether the HCI USB transport is live (endpoints configured).
+pub fn transport_ready() -> bool {
+    TRANSPORT.load(Ordering::Acquire) && crate::arch::bt_hci_ready()
 }
 
 /// Snapshot for `/bluetooth status`.
@@ -77,20 +97,22 @@ pub fn status_lines() -> alloc::vec::Vec<alloc::string::String> {
     } else {
         v.push(String::from("usb: no Bluetooth interface noted at enumeration"));
     }
-    v.push(String::from(
-        "hci: codec ready (HCI_Reset / Read Local Name pure); USB transport not wired",
-    ));
-    v.push(String::from(
-        "next: HCI over USB bulk/interrupt, then BLE HOGP or BR/EDR HID host",
-    ));
-    // Prove the pure codec is linked and self-consistent.
-    let reset = hci::cmd_reset();
-    v.push(format!(
-        "hci sample: Reset command {} bytes (ogf={:#x} ocf={:#x})",
-        reset.len(),
-        hci::OGF_CONTROLLER_BASEBAND,
-        hci::OCF_RESET
-    ));
+    if transport_ready() {
+        v.push(String::from(
+            "hci: USB transport up (class control + interrupt events + ACL bulk)",
+        ));
+    } else if present() {
+        v.push(String::from(
+            "hci: interface seen but transport not configured (endpoint layout?)",
+        ));
+    } else {
+        v.push(String::from("hci: idle"));
+    }
+    for line in host::status_extra() {
+        v.push(line);
+    }
+    let bonds = bond::load();
+    v.push(format!("bonds: {} stored ({})", bonds.len(), bond::BOND_PATH));
     v
 }
 

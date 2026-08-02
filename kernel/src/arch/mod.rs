@@ -283,6 +283,73 @@ pub fn usb_bulk_sync_in(_out: &mut [u8], _timeout_ms: u64) -> Option<usize> {
     None
 }
 
+// ── Bluetooth HCI USB (xHCI BtHci transport) ─────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+pub fn bt_hci_ready() -> bool {
+    x86_64::xhci::bt_hci_ready()
+}
+#[cfg(target_arch = "aarch64")]
+pub fn bt_hci_ready() -> bool {
+    aarch64::xhci::bt_hci_ready()
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn bt_hci_ready() -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn bt_hci_cmd(cmd: &[u8], timeout_ms: u64) -> Option<alloc::vec::Vec<u8>> {
+    x86_64::xhci::bt_hci_cmd(cmd, timeout_ms)
+}
+#[cfg(target_arch = "aarch64")]
+pub fn bt_hci_cmd(cmd: &[u8], timeout_ms: u64) -> Option<alloc::vec::Vec<u8>> {
+    aarch64::xhci::bt_hci_cmd(cmd, timeout_ms)
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn bt_hci_cmd(_cmd: &[u8], _timeout_ms: u64) -> Option<alloc::vec::Vec<u8>> {
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn bt_take_event(out: &mut [u8]) -> Option<usize> {
+    x86_64::xhci::bt_take_event(out)
+}
+#[cfg(target_arch = "aarch64")]
+pub fn bt_take_event(out: &mut [u8]) -> Option<usize> {
+    aarch64::xhci::bt_take_event(out)
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn bt_take_event(_out: &mut [u8]) -> Option<usize> {
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn bt_acl_send_sync(data: &[u8], timeout_ms: u64) -> bool {
+    x86_64::xhci::bt_acl_send_sync(data, timeout_ms)
+}
+#[cfg(target_arch = "aarch64")]
+pub fn bt_acl_send_sync(data: &[u8], timeout_ms: u64) -> bool {
+    aarch64::xhci::bt_acl_send_sync(data, timeout_ms)
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn bt_acl_send_sync(_data: &[u8], _timeout_ms: u64) -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn bt_acl_recv(out: &mut [u8], timeout_ms: u64) -> Option<usize> {
+    x86_64::xhci::bt_acl_recv(out, timeout_ms)
+}
+#[cfg(target_arch = "aarch64")]
+pub fn bt_acl_recv(out: &mut [u8], timeout_ms: u64) -> Option<usize> {
+    aarch64::xhci::bt_acl_recv(out, timeout_ms)
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn bt_acl_recv(_out: &mut [u8], _timeout_ms: u64) -> Option<usize> {
+    None
+}
+
 /// This core's hardware identity, cheap and MMIO-free.
 ///
 /// x86 reads the *initial* APIC id out of `CPUID.01:EBX[31:24]` rather than the

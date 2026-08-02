@@ -125,6 +125,53 @@ pub struct BulkEp {
     out_flight: bool,
 }
 
+/// USB Bluetooth HCI transport on one device slot (commands = class control,
+/// events = interrupt IN, ACL = dedicated bulk pair — separate from MSC/Eth).
+struct BtHci {
+    slot: u8,
+    root_port: u8,
+    iface: u8,
+    ep0_va: usize,
+    ep0_pa: u64,
+    ep0_enq: usize,
+    ep0_cycle: u32,
+    dev_ctx_va: usize,
+    in_ctx_va: usize,
+    in_ctx_pa: u64,
+    /// Bounce buffer for control OUT / misc.
+    cmd_buf_pa: u64,
+    cmd_buf_va: usize,
+    evt_dci: u8,
+    evt_ring_va: usize,
+    evt_ring_pa: u64,
+    evt_enq: usize,
+    evt_cycle: u32,
+    evt_buf_pa: u64,
+    evt_buf_va: usize,
+    evt_mps: u32,
+    /// Completed event lengths queued for the host (USB form: code|plen|params).
+    evt_q: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    acl_in_dci: u8,
+    acl_out_dci: u8,
+    acl_in_ring_va: usize,
+    acl_in_ring_pa: u64,
+    acl_in_enq: usize,
+    acl_in_cycle: u32,
+    acl_out_ring_va: usize,
+    acl_out_ring_pa: u64,
+    acl_out_enq: usize,
+    acl_out_cycle: u32,
+    acl_in_buf_pa: u64,
+    acl_in_buf_va: usize,
+    acl_out_buf_pa: u64,
+    acl_out_buf_va: usize,
+    acl_buf_len: usize,
+    acl_in_flight: bool,
+    acl_in_req: u32,
+    acl_in_ready: Option<usize>,
+    acl_out_flight: bool,
+}
+
 pub struct Xhci {
     mmio: usize,     // virtual base of the mapped register space
     op: usize,       // virtual base of operational registers
@@ -155,6 +202,8 @@ pub struct Xhci {
     mouse: Option<Ptr>,
     /// A bulk IN/OUT pair (USB Ethernet); `None` until one is configured.
     bulk: Option<BulkEp>,
+    /// USB Bluetooth HCI (own interrupt + ACL bulk; does not use [`bulk`]).
+    bt: Option<BtHci>,
     // Ports that already produced a working device. On an enumeration retry
     // (VirtualBox's async VUSB reset makes the *other* device time out) these
     // are skipped so we don't reset a port whose device already enumerated —
@@ -635,6 +684,7 @@ impl Xhci {
                 kbd: None,
                 mouse: None,
                 bulk: None,
+                bt: None,
                 done_ports: 0,
                 key_buf: [0; 16],
                 key_head: 0,
@@ -946,10 +996,18 @@ impl Xhci {
     /// one slot. Returns whether anything was registered.
     unsafe fn classify_and_finish(&mut self, c: &mut Common) -> bool {
         let mut got = false;
-        // Side-channel inventory (BT / UVC): note presence without claiming the
-        // only bulk pair — those stacks are staged and must not steal MSC/Eth.
+        // Side-channel inventory (BT / UVC): note presence; BT may also take its
+        // own interrupt+ACL endpoints without claiming the MSC/Eth bulk pair.
         unsafe {
             note_peripheral_classes(c.buf_va, c.total as usize, c.loc.root_port, c.slot);
+        }
+        if self.bt.is_none() {
+            let desc = unsafe { core::slice::from_raw_parts(c.buf_va as *const u8, c.total as usize) };
+            if let Some(eps) = crate::drivers::bluetooth::usb::find_bt_endpoints(desc) {
+                if unsafe { self.finish_bluetooth(c, eps) } {
+                    got = true;
+                }
+            }
         }
         if self.kbd.is_none() {
             if let Some((iface, ep, mps, ivl)) = unsafe { parse_hid_keyboard(c.buf_va, c.total as usize) } {
@@ -1659,6 +1717,7 @@ impl Xhci {
         let mut kbd = self.kbd.take();
         let mut mouse = self.mouse.take();
         let mut bulk = self.bulk.take();
+        let mut bt = self.bt.take();
         // SAFETY: rings/buffers are live for the controller's lifetime.
         unsafe {
             while let Some(ev) = self.next_event() {
@@ -1685,6 +1744,42 @@ impl Xhci {
                             b.out_flight = false;
                         }
                         continue;
+                    }
+                }
+                if let Some(bt) = bt.as_mut() {
+                    if bt.slot == slot {
+                        let residual = (ev.status & 0x00ff_ffff) as usize;
+                        if dci == bt.evt_dci {
+                            let req = bt.evt_mps as usize;
+                            let n = req.saturating_sub(residual).min(bt.evt_mps as usize);
+                            if n >= 2 && bt.evt_q.len() < 32 {
+                                dma_invalidate(bt.evt_buf_va, n);
+                                let mut v = alloc::vec::Vec::with_capacity(n);
+                                for i in 0..n {
+                                    v.push(read_volatile((bt.evt_buf_va + i) as *const u8));
+                                }
+                                bt.evt_q.push(v);
+                            }
+                            // Re-arm event endpoint.
+                            let (va, pa, mut enq, mut cyc) =
+                                (bt.evt_ring_va, bt.evt_ring_pa, bt.evt_enq, bt.evt_cycle);
+                            let (buf, mps, sl, dci) =
+                                (bt.evt_buf_pa, bt.evt_mps, bt.slot, bt.evt_dci);
+                            self.arm_int(va, pa, &mut enq, &mut cyc, buf, mps, sl, dci);
+                            bt.evt_enq = enq;
+                            bt.evt_cycle = cyc;
+                            continue;
+                        }
+                        if dci == bt.acl_in_dci {
+                            bt.acl_in_flight = false;
+                            bt.acl_in_ready =
+                                Some((bt.acl_in_req as usize).saturating_sub(residual));
+                            continue;
+                        }
+                        if dci == bt.acl_out_dci {
+                            bt.acl_out_flight = false;
+                            continue;
+                        }
                     }
                 }
                 if let Some(k) = kbd.as_mut() {
@@ -1778,6 +1873,402 @@ impl Xhci {
         self.kbd = kbd;
         self.mouse = mouse;
         self.bulk = bulk;
+        self.bt = bt;
+    }
+
+    /// Bring up USB Bluetooth HCI endpoints on an addressed device.
+    ///
+    /// # Safety
+    /// `c` must be addressed; `eps` from the same config descriptor.
+    unsafe fn finish_bluetooth(
+        &mut self,
+        c: &mut Common,
+        eps: crate::drivers::bluetooth::usb::BtEndpoints,
+    ) -> bool {
+        if !unsafe { self.ensure_configured(c) } {
+            return false;
+        }
+        let evt_dci = ((eps.evt_ep & 0x0f) * 2 + 1) as u8;
+        let acl_in_dci = ((eps.acl_in_ep & 0x0f) * 2 + 1) as u8;
+        let acl_out_dci = ((eps.acl_out_ep & 0x0f) * 2) as u8;
+        let Some((evt_ring_pa, evt_ring_va)) = (self.alloc)(RING_TRBS * 16) else {
+            return false;
+        };
+        let Some((evt_buf_pa, evt_buf_va)) = (self.alloc)(4096) else {
+            return false;
+        };
+        let Some((ain_pa, ain_va)) = (self.alloc)(RING_TRBS * 16) else {
+            return false;
+        };
+        let Some((aout_pa, aout_va)) = (self.alloc)(RING_TRBS * 16) else {
+            return false;
+        };
+        let acl_len = 1024usize;
+        let Some((ain_buf_pa, ain_buf_va)) = (self.alloc)(acl_len) else {
+            return false;
+        };
+        let Some((aout_buf_pa, aout_buf_va)) = (self.alloc)(acl_len) else {
+            return false;
+        };
+        let (evt_ring_va, ain_va, aout_va) =
+            (evt_ring_va as usize, ain_va as usize, aout_va as usize);
+        unsafe {
+            self.init_link(evt_ring_va, evt_ring_pa);
+            self.init_link(ain_va, ain_pa);
+            self.init_link(aout_va, aout_pa);
+        }
+        // Configure interrupt (events), then ACL bulk IN/OUT.
+        for (dci, mps, pa, ivl, ty) in [
+            (
+                evt_dci,
+                eps.evt_mps as u32,
+                evt_ring_pa,
+                eps.evt_interval,
+                EpType::InterruptIn,
+            ),
+            (
+                acl_in_dci,
+                eps.acl_in_mps as u32,
+                ain_pa,
+                1,
+                EpType::BulkIn,
+            ),
+            (
+                acl_out_dci,
+                eps.acl_out_mps as u32,
+                aout_pa,
+                1,
+                EpType::BulkOut,
+            ),
+        ] {
+            unsafe { self.build_input_configure(c, dci, mps, ivl, pa, ty) };
+            let Some((cc, _)) = (unsafe {
+                self.command(
+                    c.in_ctx_pa,
+                    (TRB_CONFIGURE_ENDPOINT << 10) | ((c.slot as u32) << 24),
+                )
+            }) else {
+                return false;
+            };
+            if cc != CC_SUCCESS {
+                crate::ktrace::log_fmt(format_args!(
+                    "xhci: BT configure dci={dci} failed cc={cc}"
+                ));
+                return false;
+            }
+        }
+        let mut bt = BtHci {
+            slot: c.slot,
+            root_port: c.loc.root_port,
+            iface: eps.iface,
+            ep0_va: c.ep0_va,
+            ep0_pa: c.ep0_pa,
+            ep0_enq: c.ep0_enq,
+            ep0_cycle: c.ep0_cycle,
+            dev_ctx_va: c.dev_ctx_va,
+            in_ctx_va: c.in_ctx_va,
+            in_ctx_pa: c.in_ctx_pa,
+            cmd_buf_pa: c.buf_pa,
+            cmd_buf_va: c.buf_va,
+            evt_dci,
+            evt_ring_va,
+            evt_ring_pa,
+            evt_enq: 0,
+            evt_cycle: 1,
+            evt_buf_pa,
+            evt_buf_va: evt_buf_va as usize,
+            evt_mps: (eps.evt_mps as u32).clamp(16, 256),
+            evt_q: alloc::vec::Vec::new(),
+            acl_in_dci,
+            acl_out_dci,
+            acl_in_ring_va: ain_va,
+            acl_in_ring_pa: ain_pa,
+            acl_in_enq: 0,
+            acl_in_cycle: 1,
+            acl_out_ring_va: aout_va,
+            acl_out_ring_pa: aout_pa,
+            acl_out_enq: 0,
+            acl_out_cycle: 1,
+            acl_in_buf_pa: ain_buf_pa,
+            acl_in_buf_va: ain_buf_va as usize,
+            acl_out_buf_pa: aout_buf_pa,
+            acl_out_buf_va: aout_buf_va as usize,
+            acl_buf_len: acl_len,
+            acl_in_flight: false,
+            acl_in_req: 0,
+            acl_in_ready: None,
+            acl_out_flight: false,
+        };
+        // Arm first event transfer.
+        unsafe {
+            let (va, pa, mut enq, mut cyc) =
+                (bt.evt_ring_va, bt.evt_ring_pa, bt.evt_enq, bt.evt_cycle);
+            self.arm_int(
+                va,
+                pa,
+                &mut enq,
+                &mut cyc,
+                bt.evt_buf_pa,
+                bt.evt_mps,
+                bt.slot,
+                bt.evt_dci,
+            );
+            bt.evt_enq = enq;
+            bt.evt_cycle = cyc;
+        }
+        // Keep Common's EP0 cursor in sync if later code uses c (unlikely after).
+        c.ep0_enq = bt.ep0_enq;
+        c.ep0_cycle = bt.ep0_cycle;
+        crate::ktrace::log_fmt(format_args!(
+            "xhci: Bluetooth HCI up (slot {} iface {} evt dci {} acl in/out dci {}/{})",
+            bt.slot, bt.iface, bt.evt_dci, bt.acl_in_dci, bt.acl_out_dci
+        ));
+        crate::drivers::bluetooth::note_transport_ready(bt.root_port, bt.slot);
+        self.bt = Some(bt);
+        true
+    }
+
+    /// True when a USB Bluetooth HCI transport is configured.
+    pub fn has_bluetooth(&self) -> bool {
+        self.bt.is_some()
+    }
+
+    /// Send one HCI command (USB body: opcode|plen|params) and wait for
+    /// Command Complete with matching opcode. Returns return_parameters.
+    pub fn bt_hci_cmd(&mut self, cmd: &[u8], timeout_ms: u64) -> Option<alloc::vec::Vec<u8>> {
+        if cmd.len() < 3 || cmd.len() > 256 {
+            return None;
+        }
+        let opcode = u16::from_le_bytes([cmd[0], cmd[1]]);
+        let Some(bt) = self.bt.as_mut() else {
+            return None;
+        };
+        // Copy command into DMA bounce buffer.
+        // SAFETY: cmd_buf is a live DMA page.
+        unsafe {
+            core::ptr::copy_nonoverlapping(cmd.as_ptr(), bt.cmd_buf_va as *mut u8, cmd.len());
+        }
+        dma_clean(bt.cmd_buf_va, cmd.len());
+        let (slot, va, pa, mut enq, mut cyc, buf_pa, iface) = (
+            bt.slot,
+            bt.ep0_va,
+            bt.ep0_pa,
+            bt.ep0_enq,
+            bt.ep0_cycle,
+            bt.cmd_buf_pa,
+            bt.iface,
+        );
+        // Class OUT to device, wIndex = interface (some stacks use 0; iface is safer).
+        let setup_pkt = setup(0x21, 0x00, 0, iface as u16, cmd.len() as u16);
+        let ok = unsafe {
+            self.control(
+                slot,
+                va,
+                pa,
+                &mut enq,
+                &mut cyc,
+                setup_pkt,
+                buf_pa,
+                cmd.len() as u32,
+                false,
+            )
+        };
+        if let Some(bt) = self.bt.as_mut() {
+            bt.ep0_enq = enq;
+            bt.ep0_cycle = cyc;
+        }
+        if !ok {
+            // Retry with wIndex=0 (USB HCI transport default in many dongles).
+            let setup0 = setup(0x20, 0x00, 0, 0, cmd.len() as u16);
+            let Some(bt) = self.bt.as_mut() else {
+                return None;
+            };
+            let (slot, va, pa, mut enq, mut cyc, buf_pa) = (
+                bt.slot,
+                bt.ep0_va,
+                bt.ep0_pa,
+                bt.ep0_enq,
+                bt.ep0_cycle,
+                bt.cmd_buf_pa,
+            );
+            let ok2 = unsafe {
+                self.control(
+                    slot,
+                    va,
+                    pa,
+                    &mut enq,
+                    &mut cyc,
+                    setup0,
+                    buf_pa,
+                    cmd.len() as u32,
+                    false,
+                )
+            };
+            if let Some(bt) = self.bt.as_mut() {
+                bt.ep0_enq = enq;
+                bt.ep0_cycle = cyc;
+            }
+            if !ok2 {
+                return None;
+            }
+        }
+        let start = crate::arch::now_ms();
+        loop {
+            self.pump_events();
+            if let Some(bt) = self.bt.as_mut() {
+                // Drain queue looking for Command Complete.
+                let mut i = 0;
+                while i < bt.evt_q.len() {
+                    if let Some(ev) =
+                        crate::drivers::bluetooth::hci::parse_event_usb(&bt.evt_q[i])
+                    {
+                        if ev.code == crate::drivers::bluetooth::hci::EVT_COMMAND_COMPLETE {
+                            if let Some(cc) =
+                                crate::drivers::bluetooth::hci::parse_command_complete(ev.params)
+                            {
+                                if cc.opcode == opcode {
+                                    let ret = cc.return_params.to_vec();
+                                    bt.evt_q.remove(i);
+                                    return Some(ret);
+                                }
+                            }
+                        }
+                        // Command Status with non-zero is a failure for some cmds.
+                        if ev.code == crate::drivers::bluetooth::hci::EVT_COMMAND_STATUS {
+                            if let Some(cs) =
+                                crate::drivers::bluetooth::hci::parse_command_status(ev.params)
+                            {
+                                if cs.opcode == opcode && cs.status != 0 {
+                                    bt.evt_q.remove(i);
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+            } else {
+                return None;
+            }
+            if crate::arch::now_ms().wrapping_sub(start) > timeout_ms {
+                return None;
+            }
+            crate::shell::upkeep();
+        }
+    }
+
+    /// Pop one queued HCI event (USB form), if any.
+    pub fn bt_take_event(&mut self, out: &mut [u8]) -> Option<usize> {
+        self.pump_events();
+        let bt = self.bt.as_mut()?;
+        if bt.evt_q.is_empty() {
+            return None;
+        }
+        let v = bt.evt_q.remove(0);
+        let n = v.len().min(out.len());
+        out[..n].copy_from_slice(&v[..n]);
+        Some(n)
+    }
+
+    /// Queue ACL bulk OUT (full HCI ACL packet including 4-byte header).
+    pub fn bt_acl_send(&mut self, data: &[u8]) -> bool {
+        let Some(bt) = self.bt.as_mut() else {
+            return false;
+        };
+        if bt.acl_out_flight || data.is_empty() || data.len() > bt.acl_buf_len {
+            return false;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), bt.acl_out_buf_va as *mut u8, data.len());
+        }
+        dma_clean(bt.acl_out_buf_va, data.len());
+        let (va, pa, mut enq, mut cyc) = (
+            bt.acl_out_ring_va,
+            bt.acl_out_ring_pa,
+            bt.acl_out_enq,
+            bt.acl_out_cycle,
+        );
+        let (buf, slot, dci) = (bt.acl_out_buf_pa, bt.slot, bt.acl_out_dci);
+        bt.acl_out_flight = true;
+        unsafe {
+            self.arm_int(va, pa, &mut enq, &mut cyc, buf, data.len() as u32, slot, dci);
+        }
+        if let Some(bt) = self.bt.as_mut() {
+            bt.acl_out_enq = enq;
+            bt.acl_out_cycle = cyc;
+        }
+        true
+    }
+
+    /// Wait for ACL OUT complete.
+    pub fn bt_acl_send_sync(&mut self, data: &[u8], timeout_ms: u64) -> bool {
+        let start = crate::arch::now_ms();
+        while self.bt.as_ref().map(|b| b.acl_out_flight).unwrap_or(true) {
+            self.pump_events();
+            if crate::arch::now_ms().wrapping_sub(start) > timeout_ms {
+                return false;
+            }
+        }
+        if !self.bt_acl_send(data) {
+            return false;
+        }
+        let start = crate::arch::now_ms();
+        while self.bt.as_ref().map(|b| b.acl_out_flight).unwrap_or(true) {
+            self.pump_events();
+            if crate::arch::now_ms().wrapping_sub(start) > timeout_ms {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Arm ACL IN and take a completed packet.
+    pub fn bt_acl_recv(&mut self, out: &mut [u8], timeout_ms: u64) -> Option<usize> {
+        let start = crate::arch::now_ms();
+        // Arm if idle.
+        if let Some(bt) = self.bt.as_mut() {
+            if !bt.acl_in_flight && bt.acl_in_ready.is_none() {
+                let (va, pa, mut enq, mut cyc) = (
+                    bt.acl_in_ring_va,
+                    bt.acl_in_ring_pa,
+                    bt.acl_in_enq,
+                    bt.acl_in_cycle,
+                );
+                let want = bt.acl_buf_len as u32;
+                bt.acl_in_flight = true;
+                bt.acl_in_req = want;
+                let (buf, slot, dci) = (bt.acl_in_buf_pa, bt.slot, bt.acl_in_dci);
+                unsafe {
+                    self.arm_int(va, pa, &mut enq, &mut cyc, buf, want, slot, dci);
+                }
+                if let Some(bt) = self.bt.as_mut() {
+                    bt.acl_in_enq = enq;
+                    bt.acl_in_cycle = cyc;
+                }
+            }
+        }
+        loop {
+            self.pump_events();
+            if let Some(bt) = self.bt.as_mut() {
+                if let Some(n) = bt.acl_in_ready.take() {
+                    let n = n.min(out.len()).min(bt.acl_buf_len);
+                    dma_invalidate(bt.acl_in_buf_va, n);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            bt.acl_in_buf_va as *const u8,
+                            out.as_mut_ptr(),
+                            n,
+                        );
+                    }
+                    return Some(n);
+                }
+            } else {
+                return None;
+            }
+            if crate::arch::now_ms().wrapping_sub(start) > timeout_ms {
+                return None;
+            }
+        }
     }
 
     /// Configure a bulk IN/OUT pair on an already-addressed device.
@@ -2072,6 +2563,15 @@ impl Xhci {
             }
         };
         let mut had_msc = false;
+        if self.bt.as_ref().is_some_and(|b| b.root_port == port) {
+            if let Some(b) = self.bt.take() {
+                push(b.slot);
+                crate::ktrace::log_fmt(format_args!(
+                    "xhci: Bluetooth HCI unplugged (root port {port}, slot {})",
+                    b.slot
+                ));
+            }
+        }
         if self.kbd.as_ref().is_some_and(|k| k.root_port == port) {
             if let Some(k) = self.kbd.take() {
                 push(k.slot);

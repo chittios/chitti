@@ -307,6 +307,56 @@ pub fn usb_bulk_sync_in(out: &mut [u8], timeout_ms: u64) -> Option<usize> {
     r
 }
 
+// ── Bluetooth HCI ────────────────────────────────────────────────────────
+
+pub fn bt_hci_ready() -> bool {
+    XHCI.with(|s| s.iter().any(|x| x.has_bluetooth()))
+}
+
+pub fn bt_hci_cmd(cmd: &[u8], timeout_ms: u64) -> Option<alloc::vec::Vec<u8>> {
+    XHCI.with(|s| {
+        for x in s.iter_mut() {
+            if x.has_bluetooth() {
+                return x.bt_hci_cmd(cmd, timeout_ms);
+            }
+        }
+        None
+    })
+}
+
+pub fn bt_take_event(out: &mut [u8]) -> Option<usize> {
+    XHCI.with(|s| {
+        for x in s.iter_mut() {
+            if let Some(n) = x.bt_take_event(out) {
+                return Some(n);
+            }
+        }
+        None
+    })
+}
+
+pub fn bt_acl_send_sync(data: &[u8], timeout_ms: u64) -> bool {
+    XHCI.with(|s| {
+        for x in s.iter_mut() {
+            if x.has_bluetooth() {
+                return x.bt_acl_send_sync(data, timeout_ms);
+            }
+        }
+        false
+    })
+}
+
+pub fn bt_acl_recv(out: &mut [u8], timeout_ms: u64) -> Option<usize> {
+    XHCI.with(|s| {
+        for x in s.iter_mut() {
+            if x.has_bluetooth() {
+                return x.bt_acl_recv(out, timeout_ms);
+            }
+        }
+        None
+    })
+}
+
 /// Page-aligned identity DMA: VA == PA on the aarch64 identity map (or via
 /// `dma_to_phys` under the HHDM handoff). Returns `(phys, virt)`.
 fn aa_alloc(bytes: usize) -> Option<(u64, usize)> {
