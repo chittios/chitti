@@ -109,7 +109,14 @@ pub mod png;
 /// 1025, and caps decodable images at roughly 0.4 MP until the loader learns either larger
 /// pages or a reusable tenant. Bigger inputs are refused, never truncated.
 const ARENA_BYTES: usize = 4 * 1024 * 1024;
-static mut ARENA: [u8; ARENA_BYTES] = [0; ARENA_BYTES];
+/// **16-byte aligned.** A bare `[u8; N]` has align 1, so the arena's base was arbitrary — and
+/// while `alloc` below aligns each allocation to its own `Layout`, anything the compiler emits
+/// assuming a stricter alignment than the type demands (SSE moves over a byte buffer) faults.
+/// That presented as a deterministic `#GP(0)` at one instruction during a *valid* decode, while
+/// an early-rejected input succeeded on the same path.
+#[repr(C, align(16))]
+struct Arena([u8; ARENA_BYTES]);
+static mut ARENA: Arena = Arena([0; ARENA_BYTES]);
 static mut CURSOR: usize = 0;
 
 struct Bump;
@@ -119,7 +126,7 @@ struct Bump;
 unsafe impl core::alloc::GlobalAlloc for Bump {
     unsafe fn alloc(&self, l: core::alloc::Layout) -> *mut u8 {
         unsafe {
-            let base = core::ptr::addr_of_mut!(ARENA) as usize;
+            let base = core::ptr::addr_of_mut!(ARENA.0) as usize;
             let start = (base + CURSOR + l.align() - 1) & !(l.align() - 1);
             let end = start.saturating_sub(base).saturating_add(l.size());
             if end > ARENA_BYTES {

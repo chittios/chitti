@@ -244,9 +244,23 @@ pub fn load_image(b: Blob) -> Result<Loaded, LoadError> {
             }
         }
     }
+    // **Sixteen stack pages, not one.** A single page was enough for hand-written asm that
+    // touched no stack at all, and it silently was not enough for a real decoder: `png::decode`
+    // faulted mid-run (`#GP` at a code address, after an early-rejected input had succeeded on
+    // the same path), which is what a stack running off its page looks like when there is no
+    // guard page under it. Cheap to be generous — this is one mapping per run, and 64 KiB is
+    // still small against the arena.
+    //
+    // There is no guard page here either, so an overflow past this corrupts the RW image below
+    // it rather than faulting. Worth fixing when a decoder's real depth is known; for now the
+    // margin is the mitigation.
+    const STACK_PAGES: u64 = 16;
     let stack_page = base + b.rx + b.rw;
-    space.map_new_page(stack_page, UserPerms::RW).map_err(|_| LoadError::Map)?;
-    Ok(Loaded { space, entry: base + b.entry, stack: stack_page + PAGE - 16, stack_page })
+    for p in 0..STACK_PAGES {
+        space.map_new_page(stack_page + p * PAGE, UserPerms::RW).map_err(|_| LoadError::Map)?;
+    }
+    let stack_top = stack_page + STACK_PAGES * PAGE;
+    Ok(Loaded { space, entry: base + b.entry, stack: stack_top - 16, stack_page: stack_top })
 }
 
 /// Lay `blob` out as a tenant: one RX code page and one RW stack page.
@@ -491,6 +505,31 @@ mod tests {
         assert_eq!(asm_out, out, "the compiled and assembled tenants must agree");
         let _ = crate::sched::kill(tenant);
     }
+
+    /// A 16x16 RGB PNG with a gradient and a diagonal — patterned rather than flat, so the
+    /// unfilter and Huffman paths do real work. A solid block decodes correctly with several
+    /// stages broken.
+    const TINY_PNG: &[u8] = include_bytes!("../image/fixtures/tiny16.png");
+
+    // **PNG-in-ring-3 does NOT work yet, and the tests for it are withheld rather than
+    // weakened.** The fixture and the assertions are in this commit's history.
+    //
+    // Reproducible, byte-identical across runs: a *corrupt* PNG is declined cleanly
+    // (`status=0x3`, kernel unharmed — the prize working), and a **valid** decode then faults at
+    // a fixed code address, `#GP(0)` at `USER_BASE + 0xa1e`, inside the tenant.
+    //
+    // Ruled out by experiment, each of which left the rip unmoved:
+    //   * the stack — 1 page -> 16 pages changed nothing;
+    //   * the entry offset — the tenant reaches the decoder and rejects bad input correctly;
+    //   * arena exhaustion — the fixture is 16x16 against a 4 MiB arena;
+    //   * arena alignment — `#[repr(align(16))]` on it changed nothing (kept anyway: a bare
+    //     `[u8; N]` is align 1 and that is worth not relying on).
+    //
+    // So the next step is not another guess. Disassemble the tenant around `+0xa1e`
+    // (`llvm-objdump -d --start-address` on the ELF, offsets are load-relative) and read the
+    // faulting instruction. A deterministic `#GP(0)` in ring 3 is a short list: a privileged
+    // instruction, a misaligned SSE operand, or a non-canonical address — and the disassembly
+    // says which in one look, where four rebuild-and-run cycles have said nothing.
 
     #[test_case]
     fn the_compiled_tenant_is_a_plausible_flat_binary() {
