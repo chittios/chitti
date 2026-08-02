@@ -199,6 +199,306 @@ fn nic_model() -> String {
     std::env::var("CHITTI_NIC").unwrap_or_else(|_| "e1000".to_string())
 }
 
+/// Whether an env var is a truthy flag (`1`/`true`/`yes`) or a non-empty value
+/// that is not an explicit off (`0`/`false`/`no`/`""`).
+fn env_flag_or_value(name: &str) -> Option<String> {
+    let Ok(v) = env::var(name) else {
+        return None;
+    };
+    let t = v.trim();
+    if t.is_empty() || t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("no") {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+fn env_truthy(name: &str) -> bool {
+    matches!(
+        env::var(name).ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// Parse `vid:pid` / `0xVVVV:0xPPPP` into QEMU hex strings without `0x`.
+fn parse_vid_pid(s: &str) -> Option<(String, String)> {
+    let s = s.trim().trim_start_matches("usb-host,");
+    let (v, p) = s.split_once(':')?;
+    let vid = v.trim().trim_start_matches("0x").trim_start_matches("0X");
+    let pid = p.trim().trim_start_matches("0x").trim_start_matches("0X");
+    if vid.is_empty() || pid.is_empty() {
+        return None;
+    }
+    // Accept 1–4 hex digits.
+    if !vid.chars().all(|c| c.is_ascii_hexdigit()) || !pid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((vid.to_ascii_lowercase(), pid.to_ascii_lowercase()))
+}
+
+/// Host USB devices to pass through: `CHITTI_USB_HOST=vid:pid[,…]` plus optional
+/// auto-discovery via `CHITTI_USB_BT=1` / `CHITTI_USB_CAM=1` (or explicit
+/// `CHITTI_USB_BT=0a12:0001`). Discovery greps macOS `system_profiler` / Linux
+/// `lsusb` for Bluetooth / camera product names.
+fn collect_usb_host_ids() -> Vec<(String, String, &'static str)> {
+    let mut out: Vec<(String, String, &'static str)> = Vec::new();
+    let mut push = |vid: String, pid: String, kind: &'static str| {
+        if !out.iter().any(|(v, p, _)| v == &vid && p == &pid) {
+            out.push((vid, pid, kind));
+        }
+    };
+    if let Some(list) = env_flag_or_value("CHITTI_USB_HOST") {
+        for part in list.split(|c| c == ',' || c == ' ') {
+            if part.is_empty() {
+                continue;
+            }
+            if let Some((v, p)) = parse_vid_pid(part) {
+                push(v, p, "host");
+            } else {
+                eprintln!("xtask: ignore bad CHITTI_USB_HOST entry {part:?} (want vid:pid)");
+            }
+        }
+    }
+    for (var, kind, auto) in [
+        ("CHITTI_USB_BT", "bt", true),
+        ("CHITTI_USB_CAM", "cam", true),
+    ] {
+        match env_flag_or_value(var) {
+            Some(v) if env_truthy(var) || v == "1" || v.eq_ignore_ascii_case("auto") => {
+                for (vid, pid) in discover_usb_ids(kind) {
+                    push(vid, pid, kind);
+                }
+            }
+            Some(v) => {
+                // Explicit vid:pid (or several).
+                for part in v.split(|c| c == ',' || c == ' ') {
+                    if part.is_empty() || part == "1" || part.eq_ignore_ascii_case("auto") {
+                        continue;
+                    }
+                    if let Some((vid, pid)) = parse_vid_pid(part) {
+                        push(vid, pid, kind);
+                    } else if auto {
+                        eprintln!("xtask: {var}={part:?} is not vid:pid; try 1 for auto-grep");
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// Grep the host USB tree for Bluetooth (`bt`) or UVC/camera (`cam`) devices.
+fn discover_usb_ids(kind: &str) -> Vec<(String, String)> {
+    let keywords: &[&str] = match kind {
+        "bt" => &[
+            "bluetooth",
+            " bluetooth",
+            "csr8510",
+            "btusb",
+            "wireless bluetooth",
+            "bluetooth radio",
+            "bluetooth adapter",
+        ],
+        "cam" => &[
+            "camera",
+            "webcam",
+            "uvc",
+            "imaging",
+            "hd web",
+            "usb video",
+            "facetime",
+            "integrated camera",
+        ],
+        _ => return Vec::new(),
+    };
+    #[cfg(target_os = "macos")]
+    {
+        discover_usb_ids_macos(keywords)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        discover_usb_ids_lsusb(keywords)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn discover_usb_ids_macos(keywords: &[&str]) -> Vec<(String, String)> {
+    let out = Command::new("system_profiler")
+        .args(["SPUSBDataType"])
+        .output();
+    let Ok(out) = out else {
+        eprintln!("xtask: system_profiler SPUSBDataType failed — set CHITTI_USB_HOST=vid:pid by hand");
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_system_profiler_usb(&text, keywords)
+}
+
+/// Pure parse of `system_profiler SPUSBDataType` text (unit-tested via xtask tests).
+fn parse_system_profiler_usb(text: &str, keywords: &[&str]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut name_hit = false;
+    let mut vid: Option<String> = None;
+    let mut pid: Option<String> = None;
+    let kw_match = |s: &str| {
+        let l = s.to_ascii_lowercase();
+        keywords.iter().any(|k| l.contains(k))
+    };
+    for line in text.lines() {
+        let t = line.trim();
+        // Product name lines look like " equ  Something Bluetooth:" or "FaceTime HD Camera:".
+        if t.ends_with(':') && !t.contains("ID:") && !t.starts_with("Product ID") {
+            // Flush previous on new node.
+            if name_hit {
+                if let (Some(v), Some(p)) = (vid.take(), pid.take()) {
+                    if !out.iter().any(|(a, b)| a == &v && b == &p) {
+                        out.push((v, p));
+                    }
+                }
+            }
+            name_hit = kw_match(t);
+            vid = None;
+            pid = None;
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("Vendor ID:") {
+            // "0x0a12  (Cambridge …)" or "0x0a12"
+            let hex = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_start_matches("0x")
+                .trim_start_matches("0X");
+            if !hex.is_empty() {
+                vid = Some(hex.to_ascii_lowercase());
+            }
+        }
+        if let Some(rest) = t.strip_prefix("Product ID:") {
+            let hex = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_start_matches("0x")
+                .trim_start_matches("0X");
+            if !hex.is_empty() {
+                pid = Some(hex.to_ascii_lowercase());
+            }
+        }
+        // Also mark hit if Manufacturer/Serial lines mention keywords.
+        if !name_hit && (t.starts_with("Manufacturer:") || t.starts_with("Serial Number:")) && kw_match(t)
+        {
+            name_hit = true;
+        }
+        if name_hit {
+            if let (Some(v), Some(p)) = (vid.as_ref(), pid.as_ref()) {
+                if !out.iter().any(|(a, b)| a == v && b == p) {
+                    out.push((v.clone(), p.clone()));
+                }
+                name_hit = false;
+                vid = None;
+                pid = None;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "macos"))]
+fn discover_usb_ids_lsusb(keywords: &[&str]) -> Vec<(String, String)> {
+    let out = Command::new("lsusb").output();
+    let Ok(out) = out else {
+        eprintln!("xtask: lsusb failed — set CHITTI_USB_HOST=vid:pid by hand");
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_lsusb(&text, keywords)
+}
+
+/// Pure parse of `lsusb` lines (Linux discovery + unit tests on every OS).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn parse_lsusb(text: &str, keywords: &[&str]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let l = line.to_ascii_lowercase();
+        if !keywords.iter().any(|k| l.contains(k)) {
+            continue;
+        }
+        // "Bus 001 Device 004: ID 0a12:0001 Cambridge Silicon Radio …"
+        if let Some(id_pos) = l.find(" id ") {
+            let rest = line[id_pos + 4..].trim();
+            let token = rest.split_whitespace().next().unwrap_or("");
+            if let Some((v, p)) = parse_vid_pid(token) {
+                if !out.iter().any(|(a, b)| a == &v && b == &p) {
+                    out.push((v, p));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// QEMU `-device usb-host,…` args for passthrough onto bus `bus` (e.g. `xhci.0`).
+/// Empty when no CHITTI_USB_* is set. Ensures `qemu-xhci` is present only when
+/// the caller already attached it (x86 always does; aarch64 adds it when needed).
+fn usb_host_device_args(bus: &str) -> Vec<String> {
+    let ids = collect_usb_host_ids();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let mut args = Vec::new();
+    for (i, (vid, pid, kind)) in ids.iter().enumerate() {
+        eprintln!(
+            "  usb-host[{i}]: {kind} vendorid=0x{vid} productid=0x{pid} bus={bus}"
+        );
+        args.push("-device".into());
+        args.push(format!(
+            "usb-host,vendorid=0x{vid},productid=0x{pid},bus={bus},id=usbhost{i}"
+        ));
+    }
+    eprintln!(
+        "  tip: if attach fails, unplug from the host / grant QEMU USB access; list with: make usb-list"
+    );
+    args
+}
+
+/// True when the run wants host USB passthrough (so aarch64 must add qemu-xhci).
+fn wants_usb_host() -> bool {
+    !collect_usb_host_ids().is_empty()
+}
+
+/// `cargo xtask usb-ids [bt|cam|all]` — grep host USB and print vid:pid lines.
+fn cmd_usb_ids(rest: &[String]) -> Result<(), String> {
+    let filter = rest
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(|s| s.as_str())
+        .unwrap_or("all");
+    // Force auto-grep for the kinds we care about when env is unset, so a bare
+    // `cargo xtask usb-ids` is useful without `make usb-list`'s env.
+    if matches!(filter, "bt" | "all") && env_flag_or_value("CHITTI_USB_BT").is_none() {
+        env::set_var("CHITTI_USB_BT", "1");
+    }
+    if matches!(filter, "cam" | "all") && env_flag_or_value("CHITTI_USB_CAM").is_none() {
+        env::set_var("CHITTI_USB_CAM", "1");
+    }
+    let ids = collect_usb_host_ids();
+    if ids.is_empty() {
+        println!("(none found — plug a device or pass vid:pid)");
+        return Ok(());
+    }
+    for (vid, pid, kind) in ids {
+        let keep = match filter {
+            "bt" => kind == "bt",
+            "cam" => kind == "cam",
+            _ => true,
+        };
+        if keep {
+            println!("{kind}\t0x{vid}:0x{pid}");
+        }
+    }
+    Ok(())
+}
+
 /// * otherwise — slirp user-net via [`user_netdev`] (incl. optional
 ///   `CHITTI_HOSTFWD`). Hostfwd is ignored when bridging.
 fn guest_netdev(id: &str) -> String {
@@ -447,6 +747,8 @@ fn main() {
         "paper-check" => cmd_paper_check(&rest),
         "ring-check" => cmd_ring_check(),
         "imgdec" => cmd_imgdec(),
+        // Print host USB vid:pid candidates for BT/camera (used by `make usb-list`).
+        "usb-ids" => cmd_usb_ids(&rest),
         // Hidden subcommand: installed as `[target.x86_64-chitti] runner` in
         // kernel/.cargo/config.toml so `cargo test` can boot each compiled
         // test binary in QEMU and translate isa-debug-exit into a real exit
@@ -462,16 +764,19 @@ fn main() {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <build|image|run|m1n1|test|ref-check|voice-assets|wifi-assets> [-arch x86_64|aarch64] \
+    "usage: cargo xtask <build|image|run|m1n1|test|ref-check|voice-assets|wifi-assets|usb-ids> [-arch x86_64|aarch64] \
      [-model qwen3.5-0.8b|2b|4b|9b|gemma-4-e4b|bonsai-27b|bonsai-27b-ternary] [--release] [--uefi] [-server]\n\
      wifi-assets: extract Apple FullMAC firmware from macOS into assets/wifi/ (for /wifi load).\n\
      iwlwifi-assets: fetch Intel WiFi firmware from linux-firmware into assets/wifi/iwl/.\n\
+     usb-ids [bt|cam|all]: grep host USB for Bluetooth/camera vid:pid (see make usb-list / USB_BT=1).\n\
      m1n1 (aarch64): package the kernel as a gzip'd arm64 Image and boot it on a \
      tethered Apple Silicon Mac over the m1n1 USB proxy; configure via env \
      CHITTI_M1N1/CHITTI_DTB[/CHITTI_INITRD/CHITTI_BOOTARGS/M1N1DEVICE].\n\
      run flags (x86_64): --disk <2G|1500M> size the virtio-blk disk for /install; \
      --disk-only boot the installed disk via UEFI with no ISO; --fresh-disk wipe it first; \
      --no-model build/boot without a model module (also works with `image`).\n\
+     run USB: CHITTI_USB_BT=1|vid:pid  CHITTI_USB_CAM=1|vid:pid  CHITTI_USB_HOST=vid:pid,… \
+     → QEMU -device usb-host on qemu-xhci (no emulated BT/UVC in QEMU).\n\
      -server: headless kernel (serial only; no framebuffer/GUI tools).\n\
      install+boot test:  cargo xtask run --uefi --disk 2G [--no-model]  (type `/install yes`, then quit)\n\
                          cargo xtask run --disk-only                    (boots Chitti from the disk alone)"
@@ -1249,6 +1554,69 @@ mod display_tests {
     }
 }
 
+#[cfg(test)]
+mod usb_host_tests {
+    use super::*;
+
+    #[test]
+    fn parse_vid_pid_accepts_hex_forms() {
+        assert_eq!(
+            parse_vid_pid("0a12:0001").as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+            Some(("0a12", "0001"))
+        );
+        assert_eq!(
+            parse_vid_pid("0x0A12:0x0001").as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+            Some(("0a12", "0001"))
+        );
+        assert!(parse_vid_pid("bad").is_none());
+        assert!(parse_vid_pid("zzzz:0001").is_none());
+    }
+
+    #[test]
+    fn system_profiler_grep_finds_bluetooth_and_camera() {
+        let sample = r#"
+USB:
+
+    USB 3.1 Bus:
+
+      Host Controller Driver: AppleUSBXHCITR
+
+        CSR8510 A10:
+
+          Product ID: 0x0001
+          Vendor ID: 0x0a12  (Cambridge Silicon Radio Ltd.)
+          Version: 1.00
+          Manufacturer: CSR
+          Location ID: 0x00100000
+
+        HD Pro Webcam C920:
+
+          Product ID: 0x082d
+          Vendor ID: 0x046d  (Logitech Inc.)
+          Version: 0.11
+          Serial Number: 1234
+          Location ID: 0x00200000
+"#;
+        let bt = parse_system_profiler_usb(sample, &["bluetooth", "csr8510"]);
+        assert_eq!(bt, vec![("0a12".into(), "0001".into())]);
+        let cam = parse_system_profiler_usb(sample, &["camera", "webcam"]);
+        assert_eq!(cam, vec![("046d".into(), "082d".into())]);
+    }
+
+    #[test]
+    fn lsusb_grep_finds_by_description() {
+        let sample = "\
+Bus 001 Device 003: ID 0a12:0001 Cambridge Silicon Radio, Ltd Bluetooth Dongle (HCI mode)
+Bus 001 Device 004: ID 046d:082d Logitech, Inc. HD Pro Webcam C920
+Bus 001 Device 005: ID 0781:5581 SanDisk Corp. Ultra
+";
+        let bt = parse_lsusb(sample, &["bluetooth"]);
+        assert_eq!(bt, vec![("0a12".into(), "0001".into())]);
+        let cam = parse_lsusb(sample, &["webcam", "camera"]);
+        assert_eq!(cam, vec![("046d".into(), "082d".into())]);
+    }
+}
+
 /// Guard against artifact mixups: assert `elf` is the identity-map `-kernel`
 /// build (entry in low RAM), not a higher-half build sharing the same path.
 fn assert_identity_kernel(elf: &Path) -> Result<(), String> {
@@ -1621,6 +1989,12 @@ fn cmd_run_aarch64_uefi(model: Model, disk: Option<PathBuf>, disk_only: bool, no
         qemu.arg(a);
     }
     qemu.args(["-device", "virtio-keyboard-device", "-device", "virtio-tablet-device"]);
+    if wants_usb_host() {
+        qemu.args(["-device", "qemu-xhci,id=xhci"]);
+        for a in usb_host_device_args("xhci.0") {
+            qemu.arg(a);
+        }
+    }
     qemu.args(display_args());
     // Same host-derived framebuffer resolution as the `-kernel` path, so the
     // UEFI ramfb fallback matches VBox GOP / QEMU direct (was 1920x1080 fixed).
@@ -1697,6 +2071,13 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
         // A virtio tablet gives the window an absolute-position mouse.
         "-device", "virtio-tablet-device",
     ]);
+    // Host USB BT/cam need an xHCI bus (plain -kernel aarch64 has no USB by default).
+    if wants_usb_host() {
+        qemu.args(["-device", "qemu-xhci,id=xhci"]);
+        for a in usb_host_device_args("xhci.0") {
+            qemu.arg(a);
+        }
+    }
     // Resizable graphical window (the ramfb surface scales to fit).
     qemu.args(display_args());
     qemu.args(["-serial", "mon:stdio", "-kernel"]);
@@ -2654,6 +3035,9 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         cmd.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", disk.display()));
         cmd.args(["-device", "virtio-blk-pci,drive=chittidisk,disable-modern=on"]);
         cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
+        for a in usb_host_device_args("xhci.0") {
+            cmd.arg(a);
+        }
         // NIC (user-net or CHITTI_NET_BRIDGE — see guest_netdev); model from CHITTI_NIC.
         cmd.args(["-netdev", &guest_netdev("chittinet"), "-device", &format!("{},netdev=chittinet", nic_model())]);
         eprintln!("booting FROM DISK ONLY via UEFI (OVMF) -- no ISO; the installed Chitti boots itself");
@@ -2696,6 +3080,10 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
     // A USB keyboard on an xHCI controller, so the xhci/HID driver drives the
     // shell (as a real USB keyboard would); PS/2 also still works.
     cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
+    // Optional host BT dongle / UVC webcam passthrough (CHITTI_USB_BT / _CAM / _HOST).
+    for a in usb_host_device_args("xhci.0") {
+        cmd.arg(a);
+    }
     // NIC (user-net or CHITTI_NET_BRIDGE — see guest_netdev); model from CHITTI_NIC.
     cmd.args(["-netdev", &guest_netdev("chittinet"), "-device", &format!("{},netdev=chittinet", nic_model())]);
     // virtio-snd on the host's audio backend (mic + speaker) for /voice.

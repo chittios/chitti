@@ -26,6 +26,18 @@ REMOTE_MODEL ?= ornith-1.0-9b
 # Hosted backend seeded by `run-remote` (override on the command line).
 REMOTE_RUN_URL ?= http://10.0.2.2:1234
 
+# Host USB passthrough into QEMU (Bluetooth / UVC camera). Empty = none.
+#   USB_BT=1              auto: grep host USB for a Bluetooth dongle and add it
+#   USB_CAM=1             auto: grep host USB for a webcam / UVC device and add it
+#   USB_BT=0a12:0001      explicit vendor:product (hex)
+#   USB_CAM=046d:082d
+#   USB_HOST=vid:pid,...  extra devices (comma-separated)
+# List candidates: `make usb-list`. Needs a real stick/camera; QEMU has no
+# emulated BT/UVC. macOS may require granting QEMU USB access / unplugging from host.
+USB_BT   ?=
+USB_CAM  ?=
+USB_HOST ?=
+
 # VirtualBox (the `vbox` target): which VM to (re)load the aarch64 image into,
 # and where its boot disk is attached. Override e.g. `make vbox VBOX_VM=MyVM`.
 # Guest screen resolution, e.g. `make vbox VBOX_RES=1920x1080`. Empty = leave the
@@ -76,6 +88,9 @@ help:
 	@echo "  make model MODEL=bonsai-27b-ternary && make run MODEL=bonsai-27b-ternary  # Q2_0 build"
 	@echo "  make run-remote REMOTE_RUN_URL=http://10.0.2.2:1234 REMOTE_MODEL=ornith-1.0-9b"
 	@echo "  make run BRIDGE=en0           # L2 bridge (often needs sudo on macOS)"
+	@echo "  make usb-list                 # grep host USB for BT / camera candidates"
+	@echo "  make run USB_BT=1 USB_CAM=1   # passthrough grepped BT dongle + webcam"
+	@echo "  make run USB_BT=0a12:0001     # or pass explicit vid:pid"
 
 ## test: in-kernel test suite under QEMU (x86_64) — the gate, keep it 104/104
 .PHONY: test
@@ -93,13 +108,49 @@ build-all:
 	$(XTASK) build -arch x86_64 -model $(MODEL) $(REL)
 	$(XTASK) build -arch aarch64 -model $(MODEL) $(REL)
 
+## usb-list: grep the host USB tree for Bluetooth / camera devices (vid:pid)
+##           macOS: system_profiler | grep; Linux: lsusb | grep
+.PHONY: usb-list
+usb-list:
+	@echo "=== host USB (Bluetooth / camera candidates) ==="
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+	  system_profiler SPUSBDataType 2>/dev/null \
+	    | grep -iE -B2 -A6 'bluetooth|camera|webcam|uvc|imaging|facetime|csr8510|hd web' \
+	    || echo "(no Bluetooth/camera lines — plug a dongle/webcam, or USB_HOST=vid:pid)"; \
+	else \
+	  lsusb 2>/dev/null | grep -iE 'bluetooth|camera|webcam|uvc|imaging' \
+	    || echo "(no matches in lsusb)"; \
+	fi
+	@echo
+	@echo "=== auto vid:pid (same rules as make run USB_BT=1 / USB_CAM=1) ==="
+	@CHITTI_USB_BT=1 CHITTI_USB_CAM=1 $(XTASK) usb-ids
+	@echo
+	@echo "Attach:  make run USB_BT=1 USB_CAM=1"
+	@echo "Or:      make run USB_BT=0a12:0001 USB_CAM=046d:082d"
+	@echo "Guest:   /bluetooth status   /camera status   /camera grab"
+
 ## run: boot the kernel in QEMU for ARCH (serial on stdio + a graphical window)
 ##      uses the local bundled GGUF (MODEL); no remote seed (see run-remote)
+##      USB_BT / USB_CAM / USB_HOST → QEMU usb-host passthrough (see usb-list)
 .PHONY: run
 run:
+	@if [ -n "$(USB_BT)$(USB_CAM)$(USB_HOST)" ]; then \
+	  echo "run: host USB passthrough (BT='$(USB_BT)' CAM='$(USB_CAM)' HOST='$(USB_HOST)')"; \
+	  echo "run: grepping host USB tree…"; \
+	  if [ "$$(uname -s)" = "Darwin" ]; then \
+	    system_profiler SPUSBDataType 2>/dev/null \
+	      | grep -iE -B1 -A4 'bluetooth|camera|webcam|uvc|imaging|facetime|csr8510' \
+	      | head -40 || true; \
+	  else \
+	    lsusb 2>/dev/null | grep -iE 'bluetooth|camera|webcam|uvc|imaging' || true; \
+	  fi; \
+	fi
 	CHITTI_NET_BRIDGE='$(BRIDGE)' \
 	CHITTI_REMOTE_URL='$(REMOTE_URL)' \
 	CHITTI_REMOTE_MODEL='$(REMOTE_MODEL)' \
+	CHITTI_USB_BT='$(USB_BT)' \
+	CHITTI_USB_CAM='$(USB_CAM)' \
+	CHITTI_USB_HOST='$(USB_HOST)' \
 	$(XTASK) run $(FLAGS)
 
 ## run-remote: like `run`, but seed `/model remote` at boot from REMOTE_RUN_URL
@@ -110,6 +161,9 @@ run-remote:
 	CHITTI_NET_BRIDGE='$(BRIDGE)' \
 	CHITTI_REMOTE_URL='$(REMOTE_RUN_URL)' \
 	CHITTI_REMOTE_MODEL='$(REMOTE_MODEL)' \
+	CHITTI_USB_BT='$(USB_BT)' \
+	CHITTI_USB_CAM='$(USB_CAM)' \
+	CHITTI_USB_HOST='$(USB_HOST)' \
 	$(XTASK) run $(FLAGS)
 
 ## model: fetch the GGUF for MODEL into assets/ (required before run / run-uefi)
