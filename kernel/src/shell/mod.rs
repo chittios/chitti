@@ -9325,6 +9325,18 @@ fn run_power_status() {
     };
     serial_println!("power> CPU idle (hlt/wfi):");
     serial_println!("  halts     {halts}");
+    serial_println!(
+        "  skipped   {} (no timer IRQ — cooperative poll, not WFI)",
+        crate::power::idle::skipped_count()
+    );
+    serial_println!(
+        "  halt ok   {}",
+        if crate::arch::idle_halt_ok() {
+            "yes (timer IRQ live)"
+        } else {
+            "no (cooperative — WFI would freeze)"
+        }
+    );
     serial_println!("  idle time ~{idle_ms} ms ({pct}% of uptime {up} ms)");
     serial_println!("power> energy policy:");
     for line in crate::power::cpu::status_lines() {

@@ -33,6 +33,25 @@ pub fn now_ms() -> u64 {
     aarch64::time_ms()
 }
 
+/// Whether [`hlt`] is safe for the BSP idle path (a timer or other IRQ will
+/// wake it). On aarch64 `-kernel` with no GIC, `wfi` never returns — the shell
+/// looks frozen — so the idle path must spin/poll instead.
+#[cfg(target_arch = "x86_64")]
+pub fn idle_halt_ok() -> bool {
+    // PIT/APIC timer is brought up before the shell; HLT is woken by IRQ0/keyboard.
+    true
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn idle_halt_ok() -> bool {
+    aarch64::gic::timer_live()
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn idle_halt_ok() -> bool {
+    false
+}
+
 /// Current wall-clock time as a Unix timestamp read from the hardware RTC, or
 /// `None` if no RTC is readable (the wall clock then falls back to a default
 /// until `/datetime` sets it). CMOS on x86, PL031 on aarch64.

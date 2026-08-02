@@ -93,6 +93,16 @@ static PROBE_FAULTED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// framebuffer + devices are up, so device bring-up runs with IRQs masked (as in
 /// the cooperative path) and the display is never left uninitialized.
 static PREEMPTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// True only after [`start_preemption`] has *observed* a timer tick. Distinct
+/// from [`PREEMPTIVE`]: init can arm the timer while delivery still fails (HVF
+/// `-kernel` with no GIC), and then `wfi` in the idle path never wakes — the
+/// shell looks frozen. [`crate::power::idle::halt`] consults this.
+static TIMER_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether a timer IRQ has been observed (safe to `wfi` / halt the BSP).
+pub fn timer_live() -> bool {
+    TIMER_LIVE.load(Ordering::Acquire)
+}
 
 /// True while a CPU-interface access is being probed (read by the sync handler).
 pub fn probing() -> bool {
@@ -348,9 +358,11 @@ pub fn start_preemption() {
     }
     if ticks() == 0 {
         super::interrupts::disable();
+        TIMER_LIVE.store(false, Ordering::Release);
         crate::ktrace::log("gic", "timer IRQs not delivered -- re-masked, staying cooperative");
         return;
     }
+    TIMER_LIVE.store(true, Ordering::Release);
     crate::ktrace::log_fmt(format_args!("gic: timer delivering IRQs ({} ticks) -- preemptive scheduling", ticks()));
 }
 
