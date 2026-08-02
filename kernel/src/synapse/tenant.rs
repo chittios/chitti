@@ -260,7 +260,22 @@ pub fn load_image(b: Blob) -> Result<Loaded, LoadError> {
         space.map_new_page(stack_page + p * PAGE, UserPerms::RW).map_err(|_| LoadError::Map)?;
     }
     let stack_top = stack_page + STACK_PAGES * PAGE;
-    Ok(Loaded { space, entry: base + b.entry, stack: stack_top - 16, stack_page: stack_top })
+    // **The initial stack pointer is arch-specific, and getting it wrong is silent until it
+    // is not.** x86-64 SysV guarantees `rsp % 16 == 8` at function *entry*, because a `call`
+    // pushed an 8-byte return address onto a 16-aligned stack. A tenant arrives by `iretq`,
+    // which pushes nothing — so handing `_start` a 16-aligned rsp leaves the compiler's frame
+    // off by 8, and the first 16-byte spill it emits (`movaps %xmm0, 0x180(%rsp)`) raises
+    // `#GP`. That is exactly what a valid PNG decode did, deterministically, at
+    // `USER_BASE + 0xa1e` — while a corrupt input returned before reaching any code that
+    // spilled a vector register, which is why rejection worked and success did not.
+    //
+    // AAPCS64 is the different rule, not the same one: SP must be 16-aligned at *all* times,
+    // and nothing is pushed on entry.
+    #[cfg(target_arch = "x86_64")]
+    let sp = stack_top - 8;
+    #[cfg(target_arch = "aarch64")]
+    let sp = stack_top - 16;
+    Ok(Loaded { space, entry: base + b.entry, stack: sp, stack_page: stack_top })
 }
 
 /// Lay `blob` out as a tenant: one RX code page and one RW stack page.
@@ -511,25 +526,71 @@ mod tests {
     /// stages broken.
     const TINY_PNG: &[u8] = include_bytes!("../image/fixtures/tiny16.png");
 
-    // **PNG-in-ring-3 does NOT work yet, and the tests for it are withheld rather than
-    // weakened.** The fixture and the assertions are in this commit's history.
-    //
-    // Reproducible, byte-identical across runs: a *corrupt* PNG is declined cleanly
-    // (`status=0x3`, kernel unharmed — the prize working), and a **valid** decode then faults at
-    // a fixed code address, `#GP(0)` at `USER_BASE + 0xa1e`, inside the tenant.
-    //
-    // Ruled out by experiment, each of which left the rip unmoved:
-    //   * the stack — 1 page -> 16 pages changed nothing;
-    //   * the entry offset — the tenant reaches the decoder and rejects bad input correctly;
-    //   * arena exhaustion — the fixture is 16x16 against a 4 MiB arena;
-    //   * arena alignment — `#[repr(align(16))]` on it changed nothing (kept anyway: a bare
-    //     `[u8; N]` is align 1 and that is worth not relying on).
-    //
-    // So the next step is not another guess. Disassemble the tenant around `+0xa1e`
-    // (`llvm-objdump -d --start-address` on the ELF, offsets are load-relative) and read the
-    // faulting instruction. A deterministic `#GP(0)` in ring 3 is a short list: a privileged
-    // instruction, a misaligned SSE operand, or a non-canonical address — and the disassembly
-    // says which in one look, where four rebuild-and-run cycles have said nothing.
+    #[test_case]
+    fn a_png_decodes_in_ring_three_identically_to_the_kernel() {
+        // **What the native path exists for**: attacker-supplied image bytes parsed outside the
+        // kernel, producing exactly what the kernel produces.
+        //
+        // Differential, and unusually strong because both sides are the *same source* —
+        // `userspace/imgdec` mounts `kernel/src/image/png.rs` by `#[path]`. A mismatch cannot be
+        // a decoder difference; it can only be the boundary: the layout, the entry offset, the
+        // RW mapping, the arena, the stack ABI, or the output copy.
+        let tenant = crate::sched::spawn_parked("png-tenant");
+        let native = crate::image::png::decode(TINY_PNG).expect("the kernel must decode its own fixture");
+
+        let out = run_imgdec(tenant, TINY_PNG).expect("the tenant must decode the PNG");
+        assert!(out.len() >= 12, "reply too short to hold a header: {}", out.len());
+        let g = |i: usize| u32::from_le_bytes([out[i], out[i + 1], out[i + 2], out[i + 3]]) as usize;
+        let (w, h, ok) = (g(0), g(4), g(8));
+        assert_eq!(ok, 1, "the tenant reported a decode failure");
+        assert_eq!((w, h), (native.w, native.h), "dimensions disagree");
+        assert_eq!(out.len(), 12 + native.pixels.len() * 4, "pixel payload is the wrong length");
+        let same = native
+            .pixels
+            .iter()
+            .zip(out[12..].chunks_exact(4))
+            .all(|(a, b)| *a == u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        assert!(same, "same source, different pixels -- the boundary is wrong, not the decoder");
+
+        const N: usize = 5;
+        let t0 = crate::arch::now_ms();
+        for _ in 0..N {
+            let _ = core::hint::black_box(run_imgdec(tenant, TINY_PNG).expect("repeat"));
+        }
+        let ring3 = crate::arch::now_ms().saturating_sub(t0);
+        let t0 = crate::arch::now_ms();
+        for _ in 0..N {
+            let _ = core::hint::black_box(crate::image::png::decode(TINY_PNG).expect("repeat"));
+        }
+        let kernel = crate::arch::now_ms().saturating_sub(t0);
+        crate::ktrace::log_fmt(format_args!(
+            "tenant.png: {w}x{h} -- ring3 {}us/decode, in-kernel {}us/decode (N={N})",
+            ring3 * 1000 / N as u64,
+            kernel * 1000 / N as u64
+        ));
+        let _ = crate::sched::kill(tenant);
+    }
+
+    #[test_case]
+    fn a_corrupt_png_is_declined_and_the_kernel_survives() {
+        // The prize as a test: in the kernel a malformed image is a parser bug away from a
+        // halted machine; here it comes back as an answer, and the path still works afterwards.
+        let tenant = crate::sched::spawn_parked("png-corrupt-tenant");
+        let mut bad = TINY_PNG.to_vec();
+        // Corrupt the compressed data past the header, so it parses as a PNG and fails inside
+        // inflate — truncating would be rejected before the interesting code runs.
+        for b in bad.iter_mut().skip(64).take(32) {
+            *b ^= 0xff;
+        }
+        let got = run_imgdec(tenant, &bad);
+        assert!(
+            matches!(got, Err(LoadError::Declined { .. })) || matches!(&got, Ok(o) if o.len() >= 12 && o[8] == 0),
+            "a corrupt PNG must be declined, got {got:?}"
+        );
+        let good = run_imgdec(tenant, TINY_PNG).expect("a good PNG must still decode after a bad one");
+        assert_eq!(u32::from_le_bytes([good[8], good[9], good[10], good[11]]), 1);
+        let _ = crate::sched::kill(tenant);
+    }
 
     #[test_case]
     fn the_compiled_tenant_is_a_plausible_flat_binary() {
