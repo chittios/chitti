@@ -499,7 +499,14 @@ mod tests {
         // reads as "ring 3 is broken" rather than "rebuild the blob".
         let b = imgdec_blob();
         assert!(!b.is_empty(), "the compiled tenant blob is empty -- run `cargo xtask imgdec`");
-        assert!(b.len() <= 0x1000, "blob is {} bytes; the loader maps one code page", b.len());
+        // Checked against the image's *own* layout, not a one-page assumption: the loader maps
+        // `rx` bytes read-execute and `rw` read-write, and the whole point of that split was to
+        // let the blob outgrow a page — it is ~11 KiB now that the real decoder is in it.
+        let img = imgdec_image();
+        assert!(img.rx >= b.len() as u64 || b.len() as u64 <= img.rx + img.rw,
+            "blob is {} bytes but the layout only covers rx {} + rw {}", b.len(), img.rx, img.rw);
+        assert_eq!(img.rx % 0x1000, 0, "rx must be page-aligned, is {}", img.rx);
+        assert!(img.rx > 0, "an image with no executable pages cannot run");
         // A flat binary, not an ELF: objcopy was skipped if this still has a magic number.
         assert_ne!(&b[..4.min(b.len())], b"\x7fELF", "the blob is an ELF, not a flat image");
     }

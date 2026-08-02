@@ -7,7 +7,9 @@
 target = "../../targets/x86_64-chitti-user.json"
 
 [unstable]
-build-std = ["core", "compiler_builtins"]
+# `alloc` too, now that the mounted decoder uses `Vec`. The tenant supplies the allocator
+# itself (a bump arena in `.bss`), so this pulls in the collections, not a heap.
+build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
 json-target-spec = true
 

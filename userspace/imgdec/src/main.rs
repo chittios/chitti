@@ -27,6 +27,10 @@
 #![no_std]
 #![no_main]
 
+// The mounted kernel modules and the decoder's own buffers are `alloc`-based; the tenant
+// provides the allocator below, over a static arena.
+extern crate alloc;
+
 /// Startup-block offsets. **Must match `synapse::tenant::block`** — the kernel asserts the
 /// ones it can see, and the rest are pinned by the differential test: a wrong offset here
 /// reads a neighbouring field, which is a plausible number rather than an obvious fault.
@@ -47,6 +51,9 @@ const ENTRY_EXIT: u64 = 2;
 const STATUS_OK: u64 = 0;
 const STATUS_PANIC: u64 = 1;
 const STATUS_OUTPUT_TOO_SMALL: u64 = 2;
+/// The decoder rejected the input — malformed PNG, unsupported feature. An *answer*, not a
+/// crash, which is the distinction the whole boundary exists to preserve.
+const STATUS_DECODE_FAILED: u64 = 3;
 
 /// Leave EL0 for good. Never returns.
 fn exit() -> ! {
@@ -68,6 +75,65 @@ fn exit() -> ! {
         );
     }
 }
+
+/// The decoder itself — the **kernel's own source**, mounted rather than copied
+/// (`pdf-wasm`/`h264diff`/`pngbench` all do this), so the repo keeps exactly one PNG
+/// implementation and moving it into ring 3 cannot regress it.
+///
+/// `png.rs` resolves `super::Image` and `super::inflate`, both of which the crate root provides.
+#[path = "../../../kernel/src/image/inflate.rs"]
+pub mod inflate;
+
+/// Mirrors `kernel/src/image/mod.rs`'s `Image`; `png.rs` constructs it. Declared here rather
+/// than mounting `image/mod.rs`, which drags in resize/render and framebuffer types a sandboxed
+/// decoder has no business seeing.
+pub struct Image {
+    pub w: usize,
+    pub h: usize,
+    pub pixels: alloc::vec::Vec<u32>,
+}
+
+#[path = "../../../kernel/src/image/png.rs"]
+pub mod png;
+
+/// Bump arena in `.bss`, and the reason the text/data split had to come first.
+///
+/// `png.rs` allocates — the inflated scanlines, the pixel buffer — so the tenant needs a heap.
+/// It never frees: one decode per instance, and the whole arena dies with the address space, so
+/// a free list would be code with no purpose. Sized for a ~1.3 MP image (≈5 MB of pixels plus
+/// the inflate output and a scanline pair); a larger image is refused by `STATUS_OUT_OF_MEMORY`
+/// rather than corrupting anything, which is the behaviour a sandbox is for.
+/// 4 MiB. Every byte of this is **mapped page by page on every run** — `load_image` has no
+/// demand paging, so the arena is a per-decode cost of `ARENA_BYTES / 4096` frame allocations
+/// and page-table walks, not free address space. 16 MiB meant 4097 pages a run; 4 MiB means
+/// 1025, and caps decodable images at roughly 0.4 MP until the loader learns either larger
+/// pages or a reusable tenant. Bigger inputs are refused, never truncated.
+const ARENA_BYTES: usize = 4 * 1024 * 1024;
+static mut ARENA: [u8; ARENA_BYTES] = [0; ARENA_BYTES];
+static mut CURSOR: usize = 0;
+
+struct Bump;
+
+// SAFETY: single-threaded tenant, one decode per instance. `alloc` hands out disjoint aligned
+// slices from a static arena and never reuses them, so no two live allocations overlap.
+unsafe impl core::alloc::GlobalAlloc for Bump {
+    unsafe fn alloc(&self, l: core::alloc::Layout) -> *mut u8 {
+        unsafe {
+            let base = core::ptr::addr_of_mut!(ARENA) as usize;
+            let start = (base + CURSOR + l.align() - 1) & !(l.align() - 1);
+            let end = start.saturating_sub(base).saturating_add(l.size());
+            if end > ARENA_BYTES {
+                return core::ptr::null_mut(); // out of arena: Rust turns this into a panic -> STATUS_PANIC
+            }
+            CURSOR = end;
+            start as *mut u8
+        }
+    }
+    unsafe fn dealloc(&self, _p: *mut u8, _l: core::alloc::Layout) {}
+}
+
+#[global_allocator]
+static ALLOC: Bump = Bump;
 
 /// Scratch that lives in `.bss`, proving the loader's read-write mapping works.
 ///
@@ -139,13 +205,46 @@ pub extern "C" fn _start(blk: *mut u8) -> ! {
 /// `fn(&[u8], &mut [u8]) -> Result<usize, u64>` is the point: it is ordinary safe Rust with
 /// no access to anything, which is what the whole boundary exists to arrange.
 fn run(input: &[u8], out: &mut [u8]) -> Result<usize, u64> {
+    // The whole tenant, and the point of all of it: attacker-supplied bytes parsed **outside the
+    // kernel**. A malformed PNG that would have been a halted machine is now either a clean
+    // `Err` or, if it trips a bounds check, a wasm-style trap the kernel reports about a tenant
+    // it can discard.
+    // **Not a PNG?** Fall back to the checksum the boundary tests use. Keeping it is deliberate:
+    // it is the payload `tenant::self_test` and the triple differential run, and it exercises
+    // the crossing without depending on a decoder — so a PNG bug and a boundary bug stay
+    // distinguishable. The signature check is the file format's own, not a guess.
+    const PNG_SIG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if !input.starts_with(PNG_SIG) {
+        return checksum(input, out);
+    }
+    let img = png::decode(input).map_err(|_| STATUS_DECODE_FAILED)?;
+    let need = 12 + img.pixels.len() * 4;
+    if out.len() < need {
+        return Err(STATUS_OUTPUT_TOO_SMALL);
+    }
+    out[0..4].copy_from_slice(&(img.w as u32).to_le_bytes());
+    out[4..8].copy_from_slice(&(img.h as u32).to_le_bytes());
+    out[8..12].copy_from_slice(&1u32.to_le_bytes());
+    // One memcpy: `Image::pixels` is already a contiguous little-endian `u32` run, which is the
+    // wire format. A per-pixel append is what made the wasm benchmark look 67x instead of 38x.
+    //
+    // SAFETY: `[u32]` -> `[u8]` over the same allocation; 4x the elements, alignment only
+    // relaxed, and every target here is little-endian.
+    let raw = unsafe {
+        core::slice::from_raw_parts(img.pixels.as_ptr() as *const u8, img.pixels.len() * 4)
+    };
+    out[12..need].copy_from_slice(raw);
+    Ok(need)
+}
+
+/// The boundary's own payload: sum the input through a `.bss` histogram.
+///
+/// Kept alongside the decoder so the crossing can be tested without a PNG, and so the RW mapping
+/// is exercised even when no image is involved.
+fn checksum(input: &[u8], out: &mut [u8]) -> Result<usize, u64> {
     if out.len() < 8 {
         return Err(STATUS_OUTPUT_TOO_SMALL);
     }
-    // Routed through a `.bss` histogram rather than a plain accumulator, so the read-write
-    // mapping is genuinely exercised: without it this faults on the first store, which is the
-    // failure the text/data split exists to fix.
-    //
     // SAFETY: single-threaded tenant, one call per instance, no aliasing.
     let hist = unsafe { &mut *core::ptr::addr_of_mut!(SCRATCH) };
     hist.fill(0);
