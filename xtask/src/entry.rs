@@ -34,6 +34,45 @@ pub fn parse_nm_start(out: &str) -> Option<u64> {
     None
 }
 
+/// Any symbol's address from `llvm-nm` output, by name.
+///
+/// Type letter ignored: linker-defined symbols like `__rw_start` show up as `A`/`D`/`B`
+/// depending on the section they fall in, and which one is not the caller's business.
+pub fn parse_nm_symbol(out: &str, want: &str) -> Option<u64> {
+    for line in out.lines() {
+        let mut it = line.split_whitespace();
+        let (addr, _ty, name) = (it.next()?, it.next()?, it.next()?);
+        if name == want {
+            return u64::from_str_radix(addr, 16).ok();
+        }
+    }
+    None
+}
+
+/// How a tenant image is laid out, in bytes from the start of the flat binary.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Layout {
+    /// Entry point, from the start of the image.
+    pub entry: u64,
+    /// Bytes of read-execute image (text + rodata). Page-aligned by the linker script.
+    pub rx: u64,
+    /// Bytes of read-write image (data + bss). The flat binary holds only the `.data` part;
+    /// the loader zeroes the rest, which is `.bss`.
+    pub rw: u64,
+}
+
+/// Read the whole layout from `nm` output plus the linker script.
+pub fn layout(nm_out: &str, ld: &str) -> Option<Layout> {
+    let base = parse_link_base(ld)?;
+    let rw_start = parse_nm_symbol(nm_out, "__rw_start")?;
+    let rw_end = parse_nm_symbol(nm_out, "__rw_end")?;
+    Some(Layout {
+        entry: parse_nm_start(nm_out)?.checked_sub(base)?,
+        rx: rw_start.checked_sub(base)?,
+        rw: rw_end.checked_sub(rw_start)?,
+    })
+}
+
 /// The load address a linker script sets, from its `. = <addr>;` line.
 ///
 /// Read rather than duplicated: the script is the authority on where the image is based, and a
@@ -85,6 +124,21 @@ mod tests {
         // `_start_of_something` must not match, or the offset silently comes from elsewhere.
         assert_eq!(parse_nm_start("0000000040000010 T _start_helper\n"), None);
         assert_eq!(parse_nm_start("0000000040000010 D _start\n"), None, "data symbol is not the entry");
+    }
+
+    #[test]
+    fn the_layout_splits_read_execute_from_read_write() {
+        // The split that lets a tenant have a mutable static at all: everything below
+        // `__rw_start` is mapped RX, everything above RW.
+        let nm = "000000004000000c T _start\n0000000040001000 A __rw_start\n0000000040003000 A __rw_end\n";
+        assert_eq!(layout(nm, LD), Some(Layout { entry: 12, rx: 0x1000, rw: 0x2000 }));
+    }
+
+    #[test]
+    fn a_layout_missing_its_markers_is_refused() {
+        // Defaulting `rw` to 0 would map the data page RX and reproduce the original fault, so
+        // an image without the markers must be rejected rather than guessed at.
+        assert_eq!(layout("000000004000000c T _start\n", LD), None);
     }
 
     #[test]

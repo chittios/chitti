@@ -69,6 +69,14 @@ fn exit() -> ! {
     }
 }
 
+/// Scratch that lives in `.bss`, proving the loader's read-write mapping works.
+///
+/// A mutable static is what a real decoder needs (inflate's window, Huffman tables) and what
+/// the single-RX-page layout could not support: the first version of this file kept one, the
+/// linker put it in the code page, and the tenant faulted writing it on its own first
+/// instruction. Used below so it cannot be optimised away.
+static mut SCRATCH: [u32; 256] = [0; 256];
+
 /// A panic in a decoder is a **rejected file**, not a crash.
 ///
 /// Rust's bounds checks are a decoder's last line of defence against a malformed input, and
@@ -134,9 +142,19 @@ fn run(input: &[u8], out: &mut [u8]) -> Result<usize, u64> {
     if out.len() < 8 {
         return Err(STATUS_OUTPUT_TOO_SMALL);
     }
-    let mut sum: u64 = 0;
+    // Routed through a `.bss` histogram rather than a plain accumulator, so the read-write
+    // mapping is genuinely exercised: without it this faults on the first store, which is the
+    // failure the text/data split exists to fix.
+    //
+    // SAFETY: single-threaded tenant, one call per instance, no aliasing.
+    let hist = unsafe { &mut *core::ptr::addr_of_mut!(SCRATCH) };
+    hist.fill(0);
     for &b in input {
-        sum += b as u64;
+        hist[b as usize] += 1;
+    }
+    let mut sum: u64 = 0;
+    for (b, &n) in hist.iter().enumerate() {
+        sum += n as u64 * b as u64;
     }
     out[..8].copy_from_slice(&sum.to_le_bytes());
     Ok(8)

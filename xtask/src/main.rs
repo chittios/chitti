@@ -1037,12 +1037,20 @@ fn cmd_imgdec() -> Result<(), String> {
             .map_err(|e| format!("imgdec: nm: {e}"))?;
         let ld = std::fs::read_to_string(crate_dir.join(format!("link-{arch}.ld")))
             .map_err(|e| format!("imgdec: read linker script: {e}"))?;
-        let off = entry::entry_offset(&String::from_utf8_lossy(&nm_out.stdout), &ld)
-            .ok_or_else(|| format!("imgdec: {arch}: could not locate _start via nm + linker script"))?;
+        let lay = entry::layout(&String::from_utf8_lossy(&nm_out.stdout), &ld)
+            .ok_or_else(|| format!("imgdec: {arch}: could not read the layout via nm + linker script"))?;
+        // A tuple expression, so the kernel can `include!` it straight into a `const`.
         let off_file = crate_dir.join(format!("entry-{arch}.in"));
-        std::fs::write(&off_file, format!("{off}\n")).map_err(|e| format!("imgdec: write {}: {e}", off_file.display()))?;
+        std::fs::write(&off_file, format!("({}, {}, {})\n", lay.entry, lay.rx, lay.rw))
+            .map_err(|e| format!("imgdec: write {}: {e}", off_file.display()))?;
         let n = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
-        println!("imgdec: {arch} -> {} ({n} bytes, entry at +{off})", bin.display());
+        println!(
+            "imgdec: {arch} -> {} ({n} bytes; entry +{}, rx {} B, rw {} B)",
+            bin.display(),
+            lay.entry,
+            lay.rx,
+            lay.rw
+        );
     }
     println!("imgdec: both blobs rebuilt -- commit them, the kernel include_bytes! them");
     Ok(())

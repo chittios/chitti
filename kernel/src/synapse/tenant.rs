@@ -185,6 +185,70 @@ impl Loaded {
     }
 }
 
+/// A tenant image: its bytes plus where things are inside them.
+///
+/// The layout comes from `cargo xtask imgdec` (via `llvm-nm` and the linker script), because
+/// requiring the linker to put `_start` first and to keep everything read-only did not survive
+/// contact with either arch: x86 put the entry 12 bytes in, and a single mutable static landed
+/// in the code page and faulted the tenant on its own first instruction.
+#[derive(Clone, Copy)]
+pub struct Blob {
+    pub bytes: &'static [u8],
+    /// Entry offset within `bytes`.
+    pub entry: u64,
+    /// Bytes to map **read-execute** (text + rodata), page-aligned.
+    pub rx: u64,
+    /// Bytes to map **read-write** (data + bss), page-aligned. Only the `.data` prefix is
+    /// present in `bytes`; the rest is `.bss` and is zeroed by the loader.
+    pub rw: u64,
+}
+
+impl Blob {
+    /// A hand-assembled blob: entry first, one code page, no writable data.
+    pub const fn flat(bytes: &'static [u8]) -> Self {
+        Self { bytes, entry: 0, rx: 0x1000, rw: 0 }
+    }
+}
+
+/// Lay a [`Blob`] out: its RX pages, then its RW pages, then a stack page.
+///
+/// The RW pages are the point. A decoder needs statics — inflate's window, Huffman tables — and
+/// mapping them into the code page is what made the tenant fault writing its own memory
+/// (`error=0x7`: a write to a present read-only page, at the entry instruction).
+pub fn load_image(b: Blob) -> Result<Loaded, LoadError> {
+    const PAGE: u64 = 0x1000;
+    if (b.bytes.len() as u64) > b.rx + b.rw {
+        return Err(LoadError::TooBig { len: b.bytes.len() });
+    }
+    let mut space = AddressSpace::new().ok_or(LoadError::NoAddressSpace)?;
+    let base = space::USER_BASE;
+    let mut copied = 0usize;
+    for (off, perms) in [(0u64, UserPerms::RX), (b.rx, UserPerms::RW)] {
+        let len = if off == 0 { b.rx } else { b.rw };
+        for p in 0..len / PAGE {
+            let va = base + off + p * PAGE;
+            let phys = space.map_new_page(va, perms).map_err(|_| LoadError::Map)?;
+            // SAFETY: a freshly mapped, zeroed frame this space owns, reachable by the kernel.
+            // `take` is bounded by what remains of the image, so `.bss` — which is inside the
+            // RW range but absent from the file — simply stays zero.
+            let take = b.bytes.len().saturating_sub(copied).min(PAGE as usize);
+            if take > 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        b.bytes.as_ptr().add(copied),
+                        space::phys_to_kernel(phys) as *mut u8,
+                        take,
+                    );
+                }
+                copied += take;
+            }
+        }
+    }
+    let stack_page = base + b.rx + b.rw;
+    space.map_new_page(stack_page, UserPerms::RW).map_err(|_| LoadError::Map)?;
+    Ok(Loaded { space, entry: base + b.entry, stack: stack_page + PAGE - 16, stack_page })
+}
+
 /// Lay `blob` out as a tenant: one RX code page and one RW stack page.
 ///
 /// The smallest layout that can run anything, and enough for a first-party agent
@@ -824,13 +888,19 @@ pub fn imgdec_blob() -> &'static [u8] {
 /// `ASSERT(_start == base)` in the linker script did not fire, so the guard was not guarding.
 /// The ELF already records the entry and the load base — this is the difference.
 #[cfg(target_arch = "x86_64")]
-const IMGDEC_ENTRY_OFFSET: u64 = include!("../../../userspace/imgdec/entry-x86_64.in");
+const IMGDEC_LAYOUT: (u64, u64, u64) = include!("../../../userspace/imgdec/entry-x86_64.in");
 #[cfg(target_arch = "aarch64")]
-const IMGDEC_ENTRY_OFFSET: u64 = include!("../../../userspace/imgdec/entry-aarch64.in");
+const IMGDEC_LAYOUT: (u64, u64, u64) = include!("../../../userspace/imgdec/entry-aarch64.in");
+
+/// The compiled tenant as a loadable image.
+pub fn imgdec_image() -> Blob {
+    let (entry, rx, rw) = IMGDEC_LAYOUT;
+    Blob { bytes: IMGDEC_BLOB, entry, rx, rw }
+}
 
 /// Run the compiled userspace tenant over `input`.
 pub fn run_imgdec(task: crate::sched::TaskId, input: &[u8]) -> Result<alloc::vec::Vec<u8>, LoadError> {
-    run_bulk_at(task, imgdec_blob(), IMGDEC_ENTRY_OFFSET, input)
+    run_bulk_image(task, imgdec_image(), input)
 }
 
 /// Run the bulk tenant over `input`, returning what it wrote.
@@ -863,9 +933,26 @@ pub fn run_bulk_at(
     entry_offset: u64,
     input: &[u8],
 ) -> Result<alloc::vec::Vec<u8>, LoadError> {
+    // SAFETY of the lifetime cast: every caller passes either a `'static` blob or a slice that
+    // outlives this call, and `load_image` copies the bytes before returning.
+    let b = Blob {
+        bytes: unsafe { core::slice::from_raw_parts(blob.as_ptr(), blob.len()) },
+        entry: entry_offset,
+        rx: 0x1000,
+        rw: 0,
+    };
+    run_bulk_image(task, b, input)
+}
+
+/// [`run_bulk_at`] for an image with a real layout.
+pub fn run_bulk_image(
+    task: crate::sched::TaskId,
+    image: Blob,
+    input: &[u8],
+) -> Result<alloc::vec::Vec<u8>, LoadError> {
     const PAGE: usize = 0x1000;
     let in_pages = input.len().div_ceil(PAGE).max(1);
-    let mut loaded = load(blob)?;
+    let mut loaded = load_image(image)?;
 
     // Frames for the shared buffers, taken from the global allocator and handed back at
     // the end: they stay the *kernel's*, because the kernel reads through its own alias
@@ -919,9 +1006,8 @@ pub fn run_bulk_at(
         // **No justification is set**, because this tenant makes no Synapse call and so
         // there is nothing for one to justify. That is the decoder shape in one line.
         // SAFETY: code RX, stack RW, block RW, input RO and output RW are all mapped.
-        let exit = unsafe {
-            crate::arch::enter_tenant(task, &loaded.space, loaded.entry + entry_offset, loaded.stack, args_va)
-        };
+        let exit =
+            unsafe { crate::arch::enter_tenant(task, &loaded.space, loaded.entry, loaded.stack, args_va) };
         if !exit.is_deliberate_exit() {
             crate::ktrace::log_fmt(format_args!("tenant: bulk tenant did not exit cleanly: {exit:?}"));
             return Err(LoadError::Faulted);
