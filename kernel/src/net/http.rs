@@ -17,7 +17,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use smoltcp::socket::tcp;
-use smoltcp::wire::{IpAddress, Ipv4Address};
+use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address};
 
 /// A parsed HTTP response: status code, headers, and (de-chunked) body bytes.
 pub struct Response {
@@ -149,8 +149,8 @@ pub fn get_follow_headers(
 /// the scheme (80 / 443).
 ///
 /// Rejects userinfo (`user:pass@host`) to block credential smuggling / some
-/// open-redirect and parser-diff tricks. Bare IPv6 in brackets is not yet
-/// supported (returns `bad host`).
+/// open-redirect and parser-diff tricks. IPv6 literals use brackets:
+/// `http://[2001:db8::1]:8080/path`.
 pub(crate) fn parse_url(url: &str) -> Result<(bool, String, u16, String), String> {
     let (tls, rest, default_port) = if let Some(r) = url.strip_prefix("https://") {
         (true, r, 443u16)
@@ -168,18 +168,38 @@ pub(crate) fn parse_url(url: &str) -> Result<(bool, String, u16, String), String
     if hostport.contains('@') {
         return Err("URL userinfo (user@host) is not allowed".into());
     }
-    if hostport.starts_with('[') {
-        return Err("IPv6 host literals are not supported".into());
-    }
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) => {
-            // Ambiguous "host:port" vs IPv4 — require port is all digits.
+    let (host, port) = if hostport.starts_with('[') {
+        // [IPv6] or [IPv6]:port
+        let end = hostport
+            .find(']')
+            .ok_or_else(|| String::from("unclosed IPv6 bracket"))?;
+        let host = &hostport[1..end];
+        if host.is_empty() {
+            return Err("empty IPv6 host".into());
+        }
+        let rest = &hostport[end + 1..];
+        let port = if rest.is_empty() {
+            default_port
+        } else if let Some(p) = rest.strip_prefix(':') {
             if !p.bytes().all(|b| b.is_ascii_digit()) {
                 return Err("bad port".into());
             }
-            (h, p.parse::<u16>().map_err(|_| "bad port")?)
+            p.parse::<u16>().map_err(|_| "bad port")?
+        } else {
+            return Err("junk after IPv6 host".into());
+        };
+        (host, port)
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => {
+                // Ambiguous "host:port" vs IPv4 — require port is all digits.
+                if !p.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err("bad port".into());
+                }
+                (h, p.parse::<u16>().map_err(|_| "bad port")?)
+            }
+            None => (hostport, default_port),
         }
-        None => (hostport, default_port),
     };
     if host.is_empty() {
         return Err("empty host".into());
@@ -191,11 +211,25 @@ pub(crate) fn parse_url(url: &str) -> Result<(bool, String, u16, String), String
     Ok((tls, host.to_string(), port, path.to_string()))
 }
 
-/// `host` as an IPv4 literal, or resolved via DNS. `localhost` is the loopback
-/// address 127.0.0.1 (no DNS), so in-OS servers are reachable by name.
+/// `host` as an IPv4/IPv6 literal, or resolved via DNS (A, then AAAA).
+/// `localhost` → 127.0.0.1.
 pub(crate) fn host_ip(host: &str) -> Result<Ipv4Address, String> {
+    match host_addr(host)? {
+        IpAddress::Ipv4(v) => Ok(v),
+        IpAddress::Ipv6(_) => Err("IPv6-only host (use a dual-stack URL path)".into()),
+    }
+}
+
+/// Resolve `host` to any [`IpAddress`] (v4 preferred, then v6).
+pub(crate) fn host_addr(host: &str) -> Result<IpAddress, String> {
     if host.eq_ignore_ascii_case("localhost") {
-        return Ok(Ipv4Address::new(127, 0, 0, 1));
+        return Ok(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)));
+    }
+    // IPv6 literal (no brackets here — parse_url already stripped them).
+    if host.contains(':') {
+        return parse_ipv6_literal(host)
+            .map(IpAddress::Ipv6)
+            .ok_or_else(|| String::from("bad IPv6 literal"));
     }
     let mut parts = [0u8; 4];
     let mut n = 0;
@@ -216,9 +250,20 @@ pub(crate) fn host_ip(host: &str) -> Result<Ipv4Address, String> {
         }
     }
     if n == 4 {
-        return Ok(Ipv4Address::new(parts[0], parts[1], parts[2], parts[3]));
+        return Ok(IpAddress::Ipv4(Ipv4Address::new(
+            parts[0], parts[1], parts[2], parts[3],
+        )));
     }
-    resolve(host, 5_000).map_err(|e| format!("DNS {host}: {e}"))
+    super::resolve_any(host, 5_000).map_err(|e| format!("DNS {host}: {e}"))
+}
+
+/// Parse a textual IPv6 address (`2001:db8::1`, `::1`). Not a full RFC parser —
+/// uses a small pure expander for the cases we need.
+fn parse_ipv6_literal(s: &str) -> Option<smoltcp::wire::Ipv6Address> {
+    // core::net::Ipv6Addr::from_str works in no_std via alloc? In Rust 1.82+
+    // FromStr is on Ipv6Addr without std. Try it.
+    use core::str::FromStr;
+    smoltcp::wire::Ipv6Address::from_str(s).ok()
 }
 
 /// Response head: status + all headers (curl `-v` prints these; the hosted-
@@ -280,7 +325,7 @@ pub fn perform(
     on_body: &mut dyn FnMut(&[u8]),
 ) -> Result<Head, String> {
     let (tls, host, port, path) = parse_url(url)?;
-    let ip = host_ip(&host)?;
+    let ip = host_addr(&host)?;
     let deadline = crate::arch::now_ms() + timeout_ms;
 
     // Build the request bytes. `Connection: close` so the body ends at EOF when
@@ -308,7 +353,7 @@ pub fn perform(
     let mut wire = req.into_bytes();
     wire.extend_from_slice(body);
 
-    let handle = tcp_connect(ip, port, deadline)?;
+    let handle = tcp_connect_addr(ip, port, deadline)?;
     let mut conn = if tls {
         Conn::Secure(super::tls::handshake(super::tls::TcpStream::new(handle, deadline), &host)?)
     } else {
@@ -411,42 +456,61 @@ pub fn request(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8], t
 /// Open a TCP socket to `ip:port` and wait for the connection to establish
 /// (bounded by `deadline`). Returns the socket handle (caller removes it).
 pub(crate) fn tcp_connect(ip: Ipv4Address, port: u16, deadline: u64) -> Result<super::TcpHandle, String> {
+    tcp_connect_addr(IpAddress::Ipv4(ip), port, deadline)
+}
+
+/// Dual-stack TCP connect.
+pub(crate) fn tcp_connect_addr(
+    ip: IpAddress,
+    port: u16,
+    deadline: u64,
+) -> Result<super::TcpHandle, String> {
     // 64 KiB rx keeps the window open for a large completion; 16 KiB tx.
-    let is_loopback = ip.is_loopback();
+    let is_loopback = ip.is_unspecified() || ip.is_loopback();
     let handle = NET.with(|n| {
         let s = n.as_mut().ok_or("no network interface (try /network dhcp)")?;
-        // A loopback destination is always reachable via the loopback interface
-        // (127.0.0.1/8), so it needs no DHCP/static address; anything else does.
-        if !is_loopback && s.ip.is_none() {
-            return Err("no IPv4 address (try /network dhcp)");
+        // Loopback needs no DHCP; IPv4 remote needs a v4 addr; IPv6 remote needs
+        // any IPv6 on the iface (link-local is enough for on-link).
+        match ip {
+            IpAddress::Ipv4(_) if !is_loopback && s.ip.is_none() => {
+                return Err("no IPv4 address (try /network dhcp)");
+            }
+            IpAddress::Ipv6(_) if !is_loopback => {
+                let has_v6 = s.iface.ip_addrs().iter().any(|c| matches!(c, IpCidr::Ipv6(_)));
+                if !has_v6 {
+                    return Err("no IPv6 address on interface");
+                }
+            }
+            _ => {}
         }
         let sock = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
             tcp::SocketBuffer::new(vec![0u8; 16 * 1024]),
         );
-        // The socket lives in the interface's own set, connected via that
-        // interface's context so its source address is chosen from it: 127.0.0.1
-        // for loopback (segments loop back to a local listener), the NIC address
-        // otherwise. The two sets are polled independently, never cross-dispatched.
-        // Ephemeral source port from a monotonically-advancing counter (not the
-        // clock): rapid back-to-back connects — e.g. an MCP `/mcp connect`'s
-        // initialize→notify→tools/list within a few ms — must not reuse the same
-        // port while the prior socket is still closing, which would stall the
-        // new connect. Wraps over the 49152..=65535 ephemeral range.
+        // Ephemeral source port from a monotonically-advancing counter.
         static EPHEMERAL: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
         let local = 49152 + (EPHEMERAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 16000);
         let h = if is_loopback {
             let h = s.lo_sockets.add(sock);
             let cx = s.lo_iface.context();
-            s.lo_sockets.get_mut::<tcp::Socket>(h).connect(cx, (IpAddress::Ipv4(ip), port), local).map_err(|_| "TCP connect failed to start")?;
+            s.lo_sockets
+                .get_mut::<tcp::Socket>(h)
+                .connect(cx, (ip, port), local)
+                .map_err(|_| "TCP connect failed to start")?;
             h
         } else {
             let h = s.sockets.add(sock);
             let cx = s.iface.context();
-            s.sockets.get_mut::<tcp::Socket>(h).connect(cx, (IpAddress::Ipv4(ip), port), local).map_err(|_| "TCP connect failed to start")?;
+            s.sockets
+                .get_mut::<tcp::Socket>(h)
+                .connect(cx, (ip, port), local)
+                .map_err(|_| "TCP connect failed to start")?;
             h
         };
-        Ok(super::TcpHandle { handle: h, loopback: is_loopback })
+        Ok(super::TcpHandle {
+            handle: h,
+            loopback: is_loopback,
+        })
     })
     .map_err(|e: &str| e.to_string())?;
     // Wait for the handshake so TLS starts on an established socket.
@@ -599,9 +663,28 @@ mod tests {
         // A bad scheme is rejected.
         assert!(parse_url("ftp://x").is_err());
         assert!(parse_url("http://").is_err());
-        // Userinfo and IPv6 literals refused (hardening).
+        // Userinfo refused (hardening).
         assert!(parse_url("http://user:pass@evil.com/").is_err());
-        assert!(parse_url("https://[::1]/").is_err());
+        // IPv6 literals in brackets.
+        let (tls, host, port, path) = parse_url("https://[::1]/").unwrap();
+        assert!(tls);
+        assert_eq!((host.as_str(), port, path.as_str()), ("::1", 443, "/"));
+        let (_, host, port, path) = parse_url("http://[2001:db8::1]:8080/v1").unwrap();
+        assert_eq!((host.as_str(), port, path.as_str()), ("2001:db8::1", 8080, "/v1"));
+        assert!(parse_url("http://[::1").is_err()); // unclosed
+    }
+
+    #[test_case]
+    fn host_addr_parses_ipv6_and_localhost() {
+        use smoltcp::wire::IpAddress;
+        assert!(matches!(
+            host_addr("::1").unwrap(),
+            IpAddress::Ipv6(a) if a.is_loopback()
+        ));
+        assert!(matches!(
+            host_addr("localhost").unwrap(),
+            IpAddress::Ipv4(_)
+        ));
     }
 
     #[test_case]

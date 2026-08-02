@@ -20,7 +20,10 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Loopback, Medium};
 use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::{
+    DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr,
+    Ipv6Address, Ipv6Cidr,
+};
 
 pub mod e1000;
 pub mod igb;
@@ -67,6 +70,7 @@ pub mod hashes;
 pub mod http;
 pub mod rsa;
 pub mod sha1;
+pub mod sntp;
 pub mod tls;
 pub mod ws;
 pub mod x509;
@@ -211,6 +215,14 @@ pub fn init(dev: Box<dyn NetDevice>, ifname: &str) {
     let mut lo_iface = Interface::new(lo_config, &mut lo_phy, now());
     lo_iface.update_ip_addrs(|a| {
         let _ = a.push(IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8)));
+        let _ = a.push(IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::LOCALHOST, 128)));
+    });
+    // NIC: link-local IPv6 from MAC (EUI-64) so dual-stack is live even before
+    // DHCPv4 / SLAAC global. Global addresses may arrive later via SLAAC.
+    let mut iface = iface;
+    let ll = ipv6_link_local_eui64(mac);
+    iface.update_ip_addrs(|a| {
+        let _ = a.push(IpCidr::Ipv6(Ipv6Cidr::new(ll, 64)));
     });
     let lo_sockets = SocketSet::new(Vec::new());
     let mut sockets = SocketSet::new(Vec::new());
@@ -237,7 +249,28 @@ pub fn init(dev: Box<dyn NetDevice>, ifname: &str) {
             listeners: BTreeMap::new(),
         });
     });
-    crate::ktrace::log_fmt(format_args!("net: {ifname} up, MAC {}", fmt_mac(&mac)));
+    crate::ktrace::log_fmt(format_args!(
+        "net: {ifname} up, MAC {}, IPv6 LL {}",
+        fmt_mac(&mac),
+        ll
+    ));
+}
+
+/// Link-local `fe80::/64` address from a MAC via modified EUI-64 (RFC 4291).
+fn ipv6_link_local_eui64(mac: [u8; 6]) -> Ipv6Address {
+    let mut o = [0u8; 16];
+    o[0] = 0xfe;
+    o[1] = 0x80;
+    // interface id
+    o[8] = mac[0] ^ 0x02;
+    o[9] = mac[1];
+    o[10] = mac[2];
+    o[11] = 0xff;
+    o[12] = 0xfe;
+    o[13] = mac[3];
+    o[14] = mac[4];
+    o[15] = mac[5];
+    Ipv6Address::from(o)
 }
 
 /// True once a NIC has been brought up.
@@ -280,10 +313,44 @@ pub fn autodetect() {
     }
     // Autoconnect: kick off DHCP immediately; the shell idle loop pumps `poll`
     // and the lease lands a moment later (or the user sets a static IP, which
-    // supersedes it).
+    // supersedes it). Best-effort SNTP runs once the first lease is applied
+    // ([`try_boot_ntp`]).
     if brought_up {
         let _ = dhcp_start();
         crate::ktrace::log("net", "autoconnect: DHCP started on eth0");
+    }
+}
+
+/// One-shot flag: best-effort SNTP after first IPv4 config (DHCP or static).
+static NTP_BOOT_TRIED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// After DHCP/static brings up IPv4 + DNS, try SNTP once (non-blocking timeout).
+/// No-op if already tried, no interface, or the clock is already NTP/manual.
+pub fn try_boot_ntp() {
+    use core::sync::atomic::Ordering;
+    if NTP_BOOT_TRIED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // Don't stomp a human-set or already-NTP clock.
+    if matches!(
+        crate::clock::source(),
+        crate::clock::ClockSource::Ntp | crate::clock::ClockSource::Manual
+    ) {
+        return;
+    }
+    let has_dns = NET.with(|n| n.as_ref().map(|s| !s.dns_servers.is_empty()).unwrap_or(false));
+    if !has_dns {
+        // Retry allowed if DNS wasn't ready yet.
+        NTP_BOOT_TRIED.store(false, Ordering::Relaxed);
+        return;
+    }
+    match ntp_sync_host("pool.ntp.org", 3_000) {
+        Ok(u) => crate::ktrace::log_fmt(format_args!("net: boot SNTP ok (unix {u})")),
+        Err(e) => {
+            crate::ktrace::log_fmt(format_args!("net: boot SNTP skipped: {e}"));
+            // Leave tried=true so a dead NTP server doesn't retry every poll.
+        }
     }
 }
 
@@ -313,7 +380,11 @@ pub fn poll() {
                 None,
             }
             let act = match s.sockets.get_mut::<dhcpv4::Socket>(s.dhcp).poll() {
-                Some(dhcpv4::Event::Configured(cfg)) => Act::Cfg(cfg.address, cfg.router, cfg.dns_servers.iter().copied().collect()),
+                Some(dhcpv4::Event::Configured(cfg)) => Act::Cfg(
+                    cfg.address,
+                    cfg.router,
+                    cfg.dns_servers.iter().copied().collect(),
+                ),
                 Some(dhcpv4::Event::Deconfigured) => Act::Deconf,
                 None => Act::None,
             };
@@ -324,12 +395,29 @@ pub fn poll() {
             }
         }
     });
+    // Outside the lock: one-shot SNTP when we have IPv4 + DNS (after DHCP).
+    if NET.with(|n| {
+        n.as_ref()
+            .map(|s| s.ip.is_some() && !s.dns_servers.is_empty())
+            .unwrap_or(false)
+    }) {
+        try_boot_ntp();
+    }
 }
 
 fn apply_ipv4(s: &mut NetState, cidr: Ipv4Cidr, router: Option<Ipv4Address>, dns: &[Ipv4Address]) {
+    // Preserve IPv6 addresses (link-local / SLAAC) when DHCPv4 reconfigures v4.
     s.iface.update_ip_addrs(|a| {
+        let v6: Vec<IpCidr> = a
+            .iter()
+            .filter(|c| matches!(c, IpCidr::Ipv6(_)))
+            .copied()
+            .collect();
         a.clear();
         let _ = a.push(IpCidr::Ipv4(cidr));
+        for c in v6 {
+            let _ = a.push(c);
+        }
     });
     s.iface.routes_mut().remove_default_ipv4_route();
     if let Some(gw) = router {
@@ -344,7 +432,18 @@ fn apply_ipv4(s: &mut NetState, cidr: Ipv4Cidr, router: Option<Ipv4Address>, dns
 }
 
 fn clear_addrs(s: &mut NetState) {
-    s.iface.update_ip_addrs(|a| a.clear());
+    // Drop IPv4 only; keep IPv6 link-local.
+    s.iface.update_ip_addrs(|a| {
+        let v6: Vec<IpCidr> = a
+            .iter()
+            .filter(|c| matches!(c, IpCidr::Ipv6(_)))
+            .copied()
+            .collect();
+        a.clear();
+        for c in v6 {
+            let _ = a.push(c);
+        }
+    });
     s.iface.routes_mut().remove_default_ipv4_route();
     s.ip = None;
     s.gateway = None;
@@ -391,19 +490,86 @@ pub struct Info {
     pub gateway: Option<Ipv4Address>,
     pub dns: Vec<Ipv4Address>,
     pub dhcp: bool,
+    /// IPv6 addresses currently on the NIC (link-local and any SLAAC globals).
+    pub ipv6: Vec<Ipv6Cidr>,
 }
 
 pub fn info() -> Option<Info> {
     NET.with(|n| {
-        n.as_ref().map(|s| Info {
-            ifname: s.ifname.clone(),
-            mac: s.mac,
-            ip: s.ip,
-            gateway: s.gateway,
-            dns: s.dns_servers.clone(),
-            dhcp: s.dhcp_on,
+        n.as_ref().map(|s| {
+            let ipv6: Vec<Ipv6Cidr> = s
+                .iface
+                .ip_addrs()
+                .iter()
+                .filter_map(|c| match c {
+                    IpCidr::Ipv6(v) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            Info {
+                ifname: s.ifname.clone(),
+                mac: s.mac,
+                ip: s.ip,
+                gateway: s.gateway,
+                dns: s.dns_servers.clone(),
+                dhcp: s.dhcp_on,
+                ipv6,
+            }
         })
     })
+}
+
+/// Resolve `name` to any IP (A then AAAA). Prefer IPv4 when both exist so
+/// existing DHCP-only networks keep working; IPv6-only hosts get AAAA.
+pub fn resolve_any(name: &str, timeout_ms: u64) -> Result<IpAddress, &'static str> {
+    match resolve(name, timeout_ms) {
+        Ok(v4) => Ok(IpAddress::Ipv4(v4)),
+        Err(_) => resolve_aaaa(name, timeout_ms).map(IpAddress::Ipv6),
+    }
+}
+
+/// DNS AAAA query (uncached path).
+pub fn resolve_aaaa(name: &str, timeout_ms: u64) -> Result<Ipv6Address, &'static str> {
+    let query = NET.with(|n| {
+        let s = n.as_mut().ok_or("no network interface")?;
+        if s.dns_servers.is_empty() {
+            return Err("no DNS server configured");
+        }
+        let dns_h = s.dns;
+        let cx = s.iface.context();
+        s.sockets
+            .get_mut::<dns::Socket>(dns_h)
+            .start_query(cx, name, DnsQueryType::Aaaa)
+            .map_err(|_| "DNS AAAA query failed to start")
+    })?;
+    let deadline = crate::arch::now_ms() + timeout_ms;
+    loop {
+        poll();
+        let done = NET.with(|n| {
+            let s = n.as_mut().ok_or("no network interface")?;
+            match s.sockets.get_mut::<dns::Socket>(s.dns).get_query_result(query) {
+                Ok(addrs) => {
+                    let v6 = addrs.iter().find_map(|a| match a {
+                        IpAddress::Ipv6(v) => Some(*v),
+                        _ => None,
+                    });
+                    v6.map(Some).ok_or("no AAAA record")
+                }
+                Err(dns::GetQueryResultError::Pending) => Ok(None),
+                Err(_) => Err("DNS AAAA query failed"),
+            }
+        })?;
+        if let Some(a) = done {
+            return Ok(a);
+        }
+        if crate::arch::now_ms() >= deadline {
+            return Err("DNS AAAA timeout");
+        }
+        if crate::shell::poll_interrupt() {
+            return Err("cancelled");
+        }
+        crate::sched::yield_now();
+    }
 }
 
 /// Rename the interface (used by the `/wifi` facade to present "wlan0").
@@ -607,6 +773,121 @@ pub fn ping(addr: Ipv4Address, timeout_ms: u64) -> Result<u64, &'static str> {
         }
     });
     result
+}
+
+// --- SNTP (UDP/123) -------------------------------------------------------
+
+/// Synchronise the wall clock from an SNTP server at `addr` (typically after
+/// DNS of `pool.ntp.org`). Returns the new Unix time on success.
+///
+/// Human-driven (`/ntp`); not an agent tool. Pumps `poll` + Ctrl+C.
+pub fn ntp_sync(addr: Ipv4Address, timeout_ms: u64) -> Result<u64, &'static str> {
+    use smoltcp::socket::udp;
+    use smoltcp::wire::IpEndpoint;
+
+    let handle = NET.with(|n| {
+        let s = n.as_mut().ok_or("no network interface")?;
+        if s.ip.is_none() {
+            return Err("interface has no IP address");
+        }
+        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 512]);
+        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 512]);
+        let mut sock = udp::Socket::new(rx, tx);
+        sock.bind(12300u16).map_err(|_| "udp bind failed")?;
+        Ok(s.sockets.add(sock))
+    })?;
+
+    let now = crate::clock::now_unix().max(0) as u64;
+    let req = sntp::build_request(now);
+    let result = (|| {
+        NET.with(|n| {
+            let s = n.as_mut().ok_or("no network interface")?;
+            let sock = s.sockets.get_mut::<udp::Socket>(handle);
+            let endpoint = IpEndpoint::new(IpAddress::Ipv4(addr), 123);
+            sock.send_slice(&req, endpoint).map_err(|_| "udp send failed")?;
+            Ok(())
+        })?;
+        let deadline = crate::arch::now_ms() + timeout_ms;
+        loop {
+            poll();
+            let got = NET.with(|n| {
+                let s = n.as_mut().ok_or("no network interface")?;
+                let sock = s.sockets.get_mut::<udp::Socket>(handle);
+                match sock.recv() {
+                    Ok((data, _meta)) => {
+                        let mut buf = [0u8; 48];
+                        let n = data.len().min(48);
+                        buf[..n].copy_from_slice(&data[..n]);
+                        Ok(Some(buf))
+                    }
+                    Err(udp::RecvError::Exhausted) => Ok(None),
+                    Err(_) => Err("udp recv failed"),
+                }
+            })?;
+            if let Some(pkt) = got {
+                let unix = sntp::parse_reply(&pkt).map_err(|e| match e {
+                    sntp::SntpError::KissOfDeath => "SNTP kiss-o'-death (server unsync)",
+                    sntp::SntpError::Unsync => "SNTP server unsynchronised",
+                    sntp::SntpError::BadMode => "SNTP bad mode",
+                    sntp::SntpError::Implausible => "SNTP implausible timestamp",
+                    _ => "SNTP parse failed",
+                })?;
+                let trusted = crate::clock::source().trusted();
+                if !sntp::plausible(crate::clock::now_unix(), unix, trusted) {
+                    return Err("SNTP time outside plausible window");
+                }
+                crate::clock::set_unix_with_source(unix as i64, crate::clock::ClockSource::Ntp);
+                crate::ktrace::log_fmt(format_args!("net: SNTP synced from {addr} → unix {unix}"));
+                return Ok(unix);
+            }
+            if crate::arch::now_ms() >= deadline {
+                return Err("SNTP timeout");
+            }
+            if crate::shell::poll_interrupt() {
+                return Err("cancelled");
+            }
+            crate::shell::upkeep();
+            crate::sched::yield_now();
+        }
+    })();
+
+    NET.with(|n| {
+        if let Some(s) = n.as_mut() {
+            s.sockets.remove(handle);
+        }
+    });
+    result
+}
+
+/// Resolve `pool.ntp.org` (or `host`) and run [`ntp_sync`].
+pub fn ntp_sync_host(host: &str, timeout_ms: u64) -> Result<u64, &'static str> {
+    let host = if host.is_empty() { "pool.ntp.org" } else { host };
+    // Dotted-quad literal.
+    if let Ok(a) = host.parse::<Ipv4Address>() {
+        return ntp_sync(a, timeout_ms);
+    }
+    // smoltcp Ipv4Address doesn't implement FromStr the same way — try manual.
+    if let Some(a) = parse_ipv4(host) {
+        return ntp_sync(a, timeout_ms);
+    }
+    let addr = resolve(host, timeout_ms.min(5_000).max(2_000))?;
+    ntp_sync(addr, timeout_ms)
+}
+
+fn parse_ipv4(s: &str) -> Option<Ipv4Address> {
+    let mut o = [0u8; 4];
+    let mut i = 0;
+    for part in s.split('.') {
+        if i >= 4 {
+            return None;
+        }
+        o[i] = part.parse().ok()?;
+        i += 1;
+    }
+    if i != 4 {
+        return None;
+    }
+    Some(Ipv4Address::new(o[0], o[1], o[2], o[3]))
 }
 
 // --- TCP listeners + raw socket I/O (inter-agent stream handoff) ------------

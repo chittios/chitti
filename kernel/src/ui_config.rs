@@ -77,7 +77,9 @@ pub struct UiConfig {
     /// `panes_layout::StatusPos::parse`, which rejects a typo rather than moving
     /// the bar somewhere unasked-for.
     pub status_pos: String,
-    pub tz_offset: i32,       // seconds east of UTC
+    pub tz_offset: i32,       // seconds east of UTC (cache / fixed-offset zones)
+    /// IANA zone name (`America/New_York`); empty = use fixed `tz_offset` only.
+    pub tz_name: String,
     pub splash: bool,         // show the boot splash (logo + wordmark)
     /// Colour palette as `(name, "#rrggbb")` pairs (kept as strings so the config
     /// layer stays independent of the framebuffer, which is absent in test builds).
@@ -109,6 +111,7 @@ impl Default for UiConfig {
             status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${datetime} ${tz}".to_string(),
             status_pos: crate::panes_layout::StatusPos::default().as_str().to_string(),
             tz_offset: 0,
+            tz_name: String::new(),
             splash: true,
             theme: THEME_DEFAULTS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             theme_name: "dark".to_string(),
@@ -136,6 +139,7 @@ impl UiConfig {
             ("status_right".to_string(), Json::Str(self.status_right.clone())),
             ("status_pos".to_string(), Json::Str(self.status_pos.clone())),
             ("tz_offset".to_string(), Json::Num(self.tz_offset as f64)),
+            ("tz_name".to_string(), Json::Str(self.tz_name.clone())),
             ("splash".to_string(), Json::Bool(self.splash)),
             ("theme_name".to_string(), Json::Str(self.theme_name.clone())),
             ("wallpaper".to_string(), Json::Str(self.wallpaper.clone())),
@@ -199,6 +203,7 @@ impl UiConfig {
                 .as_str()
                 .to_string(),
             tz_offset: j.get("tz_offset").and_then(|v| v.as_i64()).map(|n| n as i32).unwrap_or(d.tz_offset),
+            tz_name: s("tz_name", &d.tz_name),
             splash: j.get("splash").and_then(|v| v.as_bool()).unwrap_or(d.splash),
             theme,
             theme_name: s("theme_name", &d.theme_name),
@@ -264,7 +269,7 @@ fn store(cfg: UiConfig) {
 /// appearance. Used by the theme system (`/theme set`) to install a preset.
 pub fn set_config(cfg: UiConfig) {
     write_ui(&cfg);
-    crate::clock::set_tz(cfg.tz_offset);
+    apply_clock_tz(&cfg);
     store(cfg);
     #[cfg(not(test))]
     apply_appearance();
@@ -285,8 +290,15 @@ pub fn load() {
             d
         }
     };
-    crate::clock::set_tz(cfg.tz_offset);
+    apply_clock_tz(&cfg);
     store(cfg);
+}
+
+fn apply_clock_tz(cfg: &UiConfig) {
+    if !cfg.tz_name.is_empty() && crate::clock::set_tz_name(&cfg.tz_name) {
+        return;
+    }
+    crate::clock::set_tz(cfg.tz_offset);
 }
 
 fn write_ui(cfg: &UiConfig) {
@@ -347,7 +359,7 @@ pub fn reload_and_apply() {
 pub fn reset() {
     let d = UiConfig::default();
     write_ui(&d);
-    crate::clock::set_tz(d.tz_offset);
+    apply_clock_tz(&d);
     store(d);
     #[cfg(not(test))]
     {
@@ -370,9 +382,19 @@ pub fn shortcuts_path() -> &'static str {
     SHORTCUTS_PATH
 }
 
-/// Persist a new timezone offset into the config (called by `/datetime tz`).
+/// Persist a new timezone offset into the config (called by `/datetime tz +N`).
 pub fn persist_tz(offset_secs: i32) {
     let mut cfg = current();
+    cfg.tz_offset = offset_secs;
+    cfg.tz_name.clear();
+    write_ui(&cfg);
+    store(cfg);
+}
+
+/// Persist an IANA zone name (+ current offset cache) from `/datetime tz Name`.
+pub fn persist_tz_name(name: &str, offset_secs: i32) {
+    let mut cfg = current();
+    cfg.tz_name = alloc::string::String::from(name);
     cfg.tz_offset = offset_secs;
     write_ui(&cfg);
     store(cfg);

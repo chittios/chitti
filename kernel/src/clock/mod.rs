@@ -3,20 +3,52 @@
 //! keeps a **base** — a Unix timestamp captured at a known `now_ms()` — and
 //! derives the current time by adding the elapsed monotonic milliseconds. The
 //! base is seeded from a hardware RTC at boot (`arch::rtc_unix`: CMOS on x86,
-//! PL031 on aarch64) and can be overridden with the `/datetime` shell command;
-//! the timezone offset is persisted in the UI config.
+//! PL031 on aarch64), refined by SNTP (`/ntp`), or overridden with `/datetime`.
+//!
+//! Timezone: either a fixed offset (`tz_offset`) or a named IANA zone with DST
+//! rules ([`tz`]). Display helpers use [`offset_at`] so DST is correct.
 //!
 //! All calendar math is the proleptic-Gregorian civil-date algorithm (Howard
 //! Hinnant's `days_from_civil` / `civil_from_days`), pure integer arithmetic so
 //! it is `no_std` and deterministic.
 
+pub mod tz;
+
 use crate::mm::Locked;
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 
 /// Fallback base if no RTC is readable: 2026-01-01 00:00:00 UTC. `/datetime`
 /// (and, on most platforms, the RTC) replace it with the real time.
 const DEFAULT_UNIX: i64 = 1_767_225_600;
+
+/// How the wall-clock base was last set — TLS / diagnostics care about this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClockSource {
+    /// Baked fallback (no RTC).
+    Fallback,
+    /// Hardware RTC at boot.
+    Rtc,
+    /// SNTP / `/ntp`.
+    Ntp,
+    /// Human `/datetime` set.
+    Manual,
+}
+
+impl ClockSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClockSource::Fallback => "fallback",
+            ClockSource::Rtc => "rtc",
+            ClockSource::Ntp => "ntp",
+            ClockSource::Manual => "manual",
+        }
+    }
+    /// RTC / NTP / manual are "trusted" for SNTP plausibility windows.
+    pub fn trusted(self) -> bool {
+        !matches!(self, ClockSource::Fallback)
+    }
+}
 
 struct Clock {
     /// Unix seconds at the moment `base_ms` was recorded.
@@ -24,24 +56,44 @@ struct Clock {
     /// `arch::now_ms()` reading when `base_unix` was set.
     base_ms: u64,
     /// Local timezone offset from UTC, in seconds (e.g. +5:30 IST = 19800).
+    /// Used when `tz_name` is empty; otherwise [`tz::offset_at`] wins.
     tz_offset: i32,
+    /// IANA zone name (e.g. `America/New_York`); empty = fixed offset only.
+    tz_name: String,
+    source: ClockSource,
     initialized: bool,
 }
 
-static CLOCK: Locked<Clock> = Locked::new(Clock { base_unix: DEFAULT_UNIX, base_ms: 0, tz_offset: 0, initialized: false });
+static CLOCK: Locked<Clock> = Locked::new(Clock {
+    base_unix: DEFAULT_UNIX,
+    base_ms: 0,
+    tz_offset: 0,
+    tz_name: String::new(),
+    source: ClockSource::Fallback,
+    initialized: false,
+});
 
 /// Seed the wall clock from the hardware RTC (or the fallback). Idempotent; the
-/// first call wins unless `/datetime` later overrides it.
+/// first call wins unless `/datetime` / `/ntp` later overrides it.
 pub fn init() {
     let now = crate::arch::now_ms();
-    let unix = crate::arch::rtc_unix().map(|s| s as i64).unwrap_or(DEFAULT_UNIX);
+    let (unix, src) = match crate::arch::rtc_unix() {
+        Some(s) => (s as i64, ClockSource::Rtc),
+        None => (DEFAULT_UNIX, ClockSource::Fallback),
+    };
     CLOCK.with(|c| {
         if !c.initialized {
             c.base_unix = unix;
             c.base_ms = now;
+            c.source = src;
             c.initialized = true;
         }
     });
+}
+
+/// How the clock base was last established.
+pub fn source() -> ClockSource {
+    CLOCK.with(|c| c.source)
 }
 
 /// Current UTC Unix timestamp (seconds).
@@ -64,36 +116,99 @@ pub fn local_hms_ms() -> (i64, i64, i64, i64) {
     (h, mi, s, ms.rem_euclid(1000))
 }
 
-/// The configured timezone offset from UTC, in seconds.
+/// Effective timezone offset from UTC **right now**, in seconds.
+/// Named zones use DST rules; otherwise the fixed `tz_offset`.
 pub fn tz_offset() -> i32 {
+    offset_at(now_unix())
+}
+
+/// Offset east of UTC at a given Unix second (named zone or fixed).
+pub fn offset_at(unix: i64) -> i32 {
+    CLOCK.with(|c| {
+        if !c.tz_name.is_empty() {
+            if let Some(off) = tz::offset_at(&c.tz_name, unix) {
+                return off;
+            }
+        }
+        c.tz_offset
+    })
+}
+
+/// Fixed offset currently stored (ignoring DST). For persistence / display of
+/// the configured baseline when no name is set.
+pub fn fixed_tz_offset() -> i32 {
     CLOCK.with(|c| c.tz_offset)
 }
 
-/// Set the timezone offset (seconds east of UTC). Persisted by the caller into
-/// the UI config so it survives a reboot. Used at boot (applying the persisted
-/// offset to the RTC-seeded UTC base) — display shifts by the offset.
-pub fn set_tz(offset_secs: i32) {
-    CLOCK.with(|c| c.tz_offset = offset_secs);
+/// Configured IANA name, if any.
+pub fn tz_name() -> String {
+    CLOCK.with(|c| c.tz_name.clone())
 }
 
-/// Change the timezone **without changing the wall time shown** — the
-/// `/datetime tz` semantics. The user set the displayed local time earlier
-/// (or trusts what the clock shows); relabeling the zone must not jump the
-/// clock, so the UTC base shifts by the offset delta instead.
-pub fn set_tz_keep_local(offset_secs: i32) {
+/// Set a fixed timezone offset (seconds east of UTC). Clears any IANA name.
+/// Persisted by the caller into the UI config.
+pub fn set_tz(offset_secs: i32) {
     CLOCK.with(|c| {
-        let delta = c.tz_offset as i64 - offset_secs as i64; // old - new
-        c.base_unix += delta;
         c.tz_offset = offset_secs;
+        c.tz_name.clear();
     });
 }
 
+/// Set timezone by IANA name (`America/New_York`). Returns false if unknown.
+/// Keeps displayed local time stable (UTC base shifts by offset delta).
+pub fn set_tz_name(name: &str) -> bool {
+    if tz::lookup(name).is_none() {
+        return false;
+    }
+    let now = now_unix();
+    CLOCK.with(|c| {
+        let old = if !c.tz_name.is_empty() {
+            tz::offset_at(&c.tz_name, now).unwrap_or(c.tz_offset)
+        } else {
+            c.tz_offset
+        };
+        let new = tz::offset_at(name, now).unwrap_or(0);
+        c.base_unix += (old - new) as i64;
+        c.tz_name = name.to_string();
+        c.tz_offset = new; // cache current for config writers
+    });
+    true
+}
+
+/// Change the fixed timezone **without changing the wall time shown** — the
+/// `/datetime tz +5:30` semantics. Clears IANA name.
+pub fn set_tz_keep_local(offset_secs: i32) {
+    CLOCK.with(|c| {
+        let old = if !c.tz_name.is_empty() {
+            tz::offset_at(&c.tz_name, now_unix_inner(c)).unwrap_or(c.tz_offset)
+        } else {
+            c.tz_offset
+        };
+        let delta = old as i64 - offset_secs as i64;
+        c.base_unix += delta;
+        c.tz_offset = offset_secs;
+        c.tz_name.clear();
+    });
+}
+
+fn now_unix_inner(c: &Clock) -> i64 {
+    let elapsed = crate::arch::now_ms().saturating_sub(c.base_ms) as i64;
+    c.base_unix + elapsed / 1000
+}
+
 /// Set the current UTC time to `unix` seconds (rebasing against `now_ms`).
+/// Marks source as [`ClockSource::Manual`].
 pub fn set_unix(unix: i64) {
+    set_unix_with_source(unix, ClockSource::Manual);
+}
+
+/// Set UTC time and record how it was obtained (NTP / RTC / manual).
+pub fn set_unix_with_source(unix: i64, src: ClockSource) {
     let now = crate::arch::now_ms();
     CLOCK.with(|c| {
         c.base_unix = unix;
         c.base_ms = now;
+        c.source = src;
         c.initialized = true;
     });
 }
@@ -171,13 +286,21 @@ pub fn format_time() -> String {
     format!("{:02}:{:02}:{:02}", h, mi, s)
 }
 
-/// The timezone as `"UTC+05:30"` / `"UTC-08:00"` / `"UTC"`.
+/// The timezone as `"America/New_York (UTC-04:00)"` or `"UTC+05:30"` / `"UTC"`.
 pub fn format_tz() -> String {
     let off = tz_offset();
-    if off == 0 {
-        return String::from("UTC");
-    }
-    let sign = if off > 0 { '+' } else { '-' };
-    let a = off.unsigned_abs();
-    format!("UTC{}{:02}:{:02}", sign, a / 3600, a % 3600 / 60)
+    let off_s = if off == 0 {
+        String::from("UTC")
+    } else {
+        let sign = if off > 0 { '+' } else { '-' };
+        let a = off.unsigned_abs();
+        format!("UTC{}{:02}:{:02}", sign, a / 3600, a % 3600 / 60)
+    };
+    CLOCK.with(|c| {
+        if !c.tz_name.is_empty() {
+            format!("{} ({})", c.tz_name, off_s)
+        } else {
+            off_s
+        }
+    })
 }

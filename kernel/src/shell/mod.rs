@@ -613,6 +613,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
             }
         }
         "datetime" | "date" => run_datetime(arg),
+        "ntp" => run_ntp(arg),
         "ui" => run_ui(arg),
         "theme" | "themes" => run_theme(arg),
         "statusbar" | "bar" => run_statusbar(arg),
@@ -716,6 +717,13 @@ fn net_cmd(arg: &str) {
             match i.ip {
                 Some(cidr) => serial_println!("  ip     {} ({})", cidr, if i.dhcp { "dhcp" } else { "static" }),
                 None => serial_println!("  ip     (none — try /network dhcp or /network static)"),
+            }
+            if i.ipv6.is_empty() {
+                serial_println!("  ipv6   (none)");
+            } else {
+                for a in &i.ipv6 {
+                    serial_println!("  ipv6   {a}");
+                }
             }
             match i.gateway {
                 Some(gw) => serial_println!("  gw     {gw}"),
@@ -1726,6 +1734,7 @@ pub(crate) const CORE_TOOLS: &[&str] = &[
     "exit_plan_mode",
     "use_tool",
     "datetime",
+    "ntp",
     "disks",
     "network",
     "draw_image",
@@ -9114,23 +9123,55 @@ fn run_battery() {
 fn run_datetime(arg: &str) {
     use crate::clock;
     if arg.is_empty() {
-        serial_println!("datetime> {}  {}", clock::format_datetime(), clock::format_tz());
+        serial_println!(
+            "datetime> {}  {}  (source={})",
+            clock::format_datetime(),
+            clock::format_tz(),
+            clock::source().as_str()
+        );
         serial_println!("  set time: /datetime 2026-07-04 13:45[:00]");
-        serial_println!("  set zone: /datetime tz +5:30   (also -8, +05:30, 0/UTC)");
+        serial_println!("  set zone: /datetime tz America/New_York | +5:30 | list");
         return;
     }
     if let Some(tz) = arg.strip_prefix("tz") {
-        match parse_tz(tz.trim()) {
+        let tz = tz.trim();
+        if tz == "list" || tz == "ls" {
+            serial_println!("datetime> zones:");
+            for n in clock::tz::list_names() {
+                if let Some(d) = clock::tz::describe(n, clock::now_unix()) {
+                    serial_println!("  {d}");
+                }
+            }
+            return;
+        }
+        // IANA name first (contains '/'), then fixed offset.
+        if tz.contains('/') || clock::tz::lookup(tz).is_some() {
+            if clock::set_tz_name(tz) {
+                crate::ui_config::persist_tz_name(tz, clock::fixed_tz_offset());
+                update_status();
+                serial_println!(
+                    "datetime> timezone {}  (now {})",
+                    clock::format_tz(),
+                    clock::format_datetime()
+                );
+            } else {
+                serial_println!("datetime> unknown zone '{tz}' — try /datetime tz list");
+            }
+            return;
+        }
+        match parse_tz(tz) {
             Some(secs) => {
-                // Keep the displayed wall time fixed when relabeling the zone
-                // (the common case: the clock already shows the right local
-                // time; only the zone label was wrong).
+                // Keep the displayed wall time fixed when relabeling the zone.
                 clock::set_tz_keep_local(secs);
                 crate::ui_config::persist_tz(secs);
                 update_status();
-                serial_println!("datetime> timezone {}  (now {})", clock::format_tz(), clock::format_datetime());
+                serial_println!(
+                    "datetime> timezone {}  (now {})",
+                    clock::format_tz(),
+                    clock::format_datetime()
+                );
             }
-            None => serial_println!("usage: /datetime tz +5:30"),
+            None => serial_println!("usage: /datetime tz America/New_York | +5:30 | list"),
         }
         return;
     }
@@ -9138,9 +9179,37 @@ fn run_datetime(arg: &str) {
         Some((y, mo, d, h, mi, s)) => {
             clock::set_local(y, mo, d, h, mi, s);
             update_status();
-            serial_println!("datetime> set to {}  {}", clock::format_datetime(), clock::format_tz());
+            serial_println!(
+                "datetime> set to {}  {}",
+                clock::format_datetime(),
+                clock::format_tz()
+            );
         }
         None => serial_println!("usage: /datetime YYYY-MM-DD HH:MM[:SS]"),
+    }
+}
+
+/// `/ntp [host|ip]` — SNTP sync (default `pool.ntp.org`). Human-only.
+fn run_ntp(arg: &str) {
+    let host = arg.trim();
+    if !crate::net::is_up() {
+        serial_println!("ntp> no network (try /network dhcp)");
+        return;
+    }
+    serial_println!(
+        "ntp> querying {} …",
+        if host.is_empty() { "pool.ntp.org" } else { host }
+    );
+    match crate::net::ntp_sync_host(host, 8_000) {
+        Ok(unix) => {
+            update_status();
+            serial_println!(
+                "ntp> ok — unix {unix}  {}  {}  (source=ntp)",
+                crate::clock::format_datetime(),
+                crate::clock::format_tz()
+            );
+        }
+        Err(e) => serial_println!("ntp> {e}"),
     }
 }
 
