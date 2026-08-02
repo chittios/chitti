@@ -902,6 +902,9 @@ fn reschedule(park: Option<Wait>) -> bool {
         "sched::reschedule on a non-boot core: a tenant's address space would be stale here"
     );
     let mut switched = false;
+    // When pick_next finds nowhere to go, wait for an IRQ *after* re-enabling
+    // interrupts — hlt/wfi with IF=0 never wakes.
+    let mut idle_wait = false;
     interrupts::without_interrupts(|| {
         let switch = SCHED.with(|slot| {
             let s = slot.as_mut().expect("sched not initialized");
@@ -946,6 +949,7 @@ fn reschedule(park: Option<Wait>) -> bool {
                     if let (Some(prev), Some(cur)) = (prev_state, s.tasks.get_mut(&current_id)) {
                         cur.state = prev;
                     }
+                    idle_wait = true;
                     return None;
                 }
             };
@@ -1006,6 +1010,11 @@ fn reschedule(park: Option<Wait>) -> bool {
             }
         }
     });
+    // No better task to run: wait for an interrupt instead of a tight spin.
+    // Interrupts are re-enabled above; do not move this inside the critical section.
+    if idle_wait {
+        crate::power::idle::halt();
+    }
     switched
 }
 

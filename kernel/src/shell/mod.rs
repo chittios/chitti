@@ -629,6 +629,15 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "disks" => disk_list(),
         "battery" | "bat" => run_battery(),
         "suspend" | "sleep" => run_suspend(arg),
+        // Top-level `/power` (idle stats). WiFi uses `/wifi power`, not this.
+        "power" => {
+            let a = arg.trim();
+            if a.is_empty() || a == "status" || a == "info" {
+                run_power_status();
+            } else {
+                serial_println!("power> usage: /power [status]");
+            }
+        }
         "ls" => fs_ls(arg),
         "mount" => disk_mount(arg),
         "umount" => disk_umount(arg),
@@ -8965,10 +8974,9 @@ pub fn upkeep() {
 /// the world turning.
 ///
 /// It never blocks and never returns, which is [`crate::sched::set_idle`]'s
-/// contract. It also does not `hlt`: it is a pump, not a halt, and the UI needs
-/// `upkeep` to keep running for the caret, the status clock and the network
-/// stack. That costs nothing extra today, because this loop only ever runs when
-/// the alternative was a working task spinning on `upkeep` itself.
+/// contract. Between pumps it **halts** the CPU ([`crate::power::idle::halt`])
+/// so a laptop waiting for a keystroke is not pegged at full package power;
+/// the timer tick and input IRQs wake it for the next `upkeep`.
 extern "C" fn pump_task(_arg: u64) {
     use crate::sched::Wait;
     const CONDITIONS: [Wait; 4] = [Wait::Console, Wait::Net, Wait::Block, Wait::SoundOut];
@@ -8980,6 +8988,7 @@ extern "C" fn pump_task(_arg: u64) {
         // rather than merely wasteful — `mouse::tick()` consumes the input that
         // modal and editor loops read for themselves.
         if !CONDITIONS.iter().any(|&w| crate::sched::blocked_count(w) > 0) {
+            crate::power::idle::halt();
             crate::sched::yield_now();
             continue;
         }
@@ -8987,6 +8996,8 @@ extern "C" fn pump_task(_arg: u64) {
         // whoever pumped, not specifically this task, because this task is the
         // lowest-priority thing in the system and a busy ready queue starves it.
         upkeep();
+        // Quiet until the next timer/input IRQ, then yield so a woken task can run.
+        crate::power::idle::halt();
         crate::sched::yield_now();
     }
 }
@@ -9059,6 +9070,23 @@ fn update_composer_hint(_remote_on: bool, _remote_cfg: Option<&remote::RemoteCon
 /// The transition itself confirms first. A suspend that does not resume loses
 /// everything unsaved and can only be escaped by holding the power button, so this is
 /// exactly the class of action the permission modal exists for.
+/// `/power [status]` — CPU idle stats (hlt/wfi entries). P-states come later.
+fn run_power_status() {
+    let halts = crate::power::idle::halt_count();
+    let idle_ms = crate::power::idle::idle_ms();
+    let up = crate::arch::now_ms();
+    let pct = if up > 0 {
+        (idle_ms.saturating_mul(100) / up).min(100)
+    } else {
+        0
+    };
+    serial_println!("power> CPU idle (hlt/wfi):");
+    serial_println!("  halts     {halts}");
+    serial_println!("  idle time ~{idle_ms} ms ({pct}% of uptime {up} ms)");
+    serial_println!("  modes     performance|powersave|auto  (not yet — idle only)");
+    serial_println!("  suspend   /suspend plan");
+}
+
 fn run_suspend(arg: &str) {
     let plan = crate::power::plan();
     let a = arg.trim();
