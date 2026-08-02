@@ -629,15 +629,8 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "disks" => disk_list(),
         "battery" | "bat" => run_battery(),
         "suspend" | "sleep" => run_suspend(arg),
-        // Top-level `/power` (idle stats). WiFi uses `/wifi power`, not this.
-        "power" => {
-            let a = arg.trim();
-            if a.is_empty() || a == "status" || a == "info" {
-                run_power_status();
-            } else {
-                serial_println!("power> usage: /power [status]");
-            }
-        }
+        // Top-level `/power` (idle + energy mode). WiFi uses `/wifi power`, not this.
+        "power" => run_power(arg),
         "ls" => fs_ls(arg),
         "mount" => disk_mount(arg),
         "umount" => disk_umount(arg),
@@ -8960,6 +8953,8 @@ pub fn upkeep() {
         serial_println!("Chitti: power button pressed, powering off.");
         crate::arch::poweroff();
     }
+    // `auto` energy mode tracks idle fraction + battery; cheap when unchanged.
+    crate::power::cpu::tick();
 }
 
 /// The pump task: what the scheduler runs when every other task is blocked or
@@ -9070,8 +9065,54 @@ fn update_composer_hint(_remote_on: bool, _remote_cfg: Option<&remote::RemoteCon
 /// The transition itself confirms first. A suspend that does not resume loses
 /// everything unsaved and can only be escaped by holding the power button, so this is
 /// exactly the class of action the permission modal exists for.
-/// `/power [status]` — CPU idle stats (hlt/wfi entries). P-states come later.
+/// `/power [status|mode …]` — idle counters + energy policy.
+fn run_power(arg: &str) {
+    let a = arg.trim();
+    if a.is_empty() || a == "status" || a == "info" {
+        run_power_status();
+        return;
+    }
+    let mut parts = a.split_whitespace();
+    let cmd = parts.next().unwrap_or("");
+    match cmd {
+        "mode" => {
+            let Some(name) = parts.next() else {
+                serial_println!(
+                    "power> mode is {} — usage: /power mode performance|powersave|auto",
+                    crate::power::cpu::mode().as_str()
+                );
+                return;
+            };
+            let Some(m) = crate::power::cpu::Mode::parse(name) else {
+                serial_println!("power> unknown mode '{name}' (performance|powersave|auto)");
+                return;
+            };
+            match crate::power::cpu::set_mode(m) {
+                Ok(()) => {
+                    serial_println!(
+                        "power> mode {} (effective {})",
+                        m.as_str(),
+                        crate::power::cpu::last_effective()
+                            .map(|e| e.as_str())
+                            .unwrap_or("?")
+                    );
+                }
+                Err(why) => {
+                    // Policy is still recorded; hardware may not support it.
+                    serial_println!(
+                        "power> mode {} recorded — {why}",
+                        m.as_str()
+                    );
+                }
+            }
+        }
+        _ => serial_println!("power> usage: /power [status|mode <performance|powersave|auto>]"),
+    }
+}
+
 fn run_power_status() {
+    // Keep auto mode tracking idle/battery without requiring a human to re-type.
+    crate::power::cpu::tick();
     let halts = crate::power::idle::halt_count();
     let idle_ms = crate::power::idle::idle_ms();
     let up = crate::arch::now_ms();
@@ -9083,7 +9124,11 @@ fn run_power_status() {
     serial_println!("power> CPU idle (hlt/wfi):");
     serial_println!("  halts     {halts}");
     serial_println!("  idle time ~{idle_ms} ms ({pct}% of uptime {up} ms)");
-    serial_println!("  modes     performance|powersave|auto  (not yet — idle only)");
+    serial_println!("power> energy policy:");
+    for line in crate::power::cpu::status_lines() {
+        serial_println!("  {line}");
+    }
+    serial_println!("  set       /power mode performance|powersave|auto");
     serial_println!("  suspend   /suspend plan");
 }
 

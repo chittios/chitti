@@ -1,6 +1,7 @@
-//! **Power management** — CPU idle, suspend/resume.
+//! **Power management** — CPU idle, frequency/energy policy, suspend/resume.
 //!
 //! - [`idle`] — `hlt` / `wfi` when the scheduler has no runnable work.
+//! - [`cpu`] — `performance` / `powersave` / `auto` energy policy (EPB on x86).
 //! - Suspend/resume — closing a laptop's lid and having it come back.
 //!
 //! Powering *off* already worked ([`crate::arch::poweroff`], ACPI S5). Suspending is a
@@ -29,6 +30,7 @@
 //! precondition, `/suspend plan` shows it, and the transition refuses unless all of
 //! them hold. On a machine that cannot suspend, saying so is the correct outcome.
 
+pub mod cpu;
 pub mod idle;
 
 use alloc::string::String;
