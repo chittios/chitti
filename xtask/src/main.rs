@@ -437,12 +437,32 @@ fn parse_lsusb(text: &str, keywords: &[&str]) -> Vec<(String, String)> {
     out
 }
 
+/// Whether the user asked for host USB passthrough (even if discovery found none).
+fn usb_host_requested() -> bool {
+    env_flag_or_value("CHITTI_USB_HOST").is_some()
+        || env_flag_or_value("CHITTI_USB_BT").is_some()
+        || env_flag_or_value("CHITTI_USB_CAM").is_some()
+}
+
 /// QEMU `-device usb-host,…` args for passthrough onto bus `bus` (e.g. `xhci.0`).
-/// Empty when no CHITTI_USB_* is set. Ensures `qemu-xhci` is present only when
-/// the caller already attached it (x86 always does; aarch64 adds it when needed).
+/// Empty when no CHITTI_USB_* is set. When requested but **nothing was found**,
+/// prints a clear warning and continues without attaching (QEMU still boots).
 fn usb_host_device_args(bus: &str) -> Vec<String> {
+    let requested = usb_host_requested();
     let ids = collect_usb_host_ids();
     if ids.is_empty() {
+        if requested {
+            eprintln!(
+                "xtask: USB_BT/USB_CAM/USB_HOST set but no host device matched — \
+                 continuing without passthrough"
+            );
+            eprintln!("  list candidates:  make usb-list");
+            eprintln!("  explicit IDs:     make run USB_BT=0a12:0001 USB_CAM=046d:082d");
+            eprintln!(
+                "  note: QEMU has no emulated Bluetooth/UVC; macOS may hide \
+                 internal FaceTime/BT from system_profiler — use a USB dongle/webcam"
+            );
+        }
         return Vec::new();
     }
     let mut args = Vec::new();
@@ -451,12 +471,15 @@ fn usb_host_device_args(bus: &str) -> Vec<String> {
             "  usb-host[{i}]: {kind} vendorid=0x{vid} productid=0x{pid} bus={bus}"
         );
         args.push("-device".into());
+        // guest-reset=false: a failed reset on an in-use host device must not
+        // kill the whole VM; the guest simply sees no device.
         args.push(format!(
-            "usb-host,vendorid=0x{vid},productid=0x{pid},bus={bus},id=usbhost{i}"
+            "usb-host,vendorid=0x{vid},productid=0x{pid},bus={bus},id=usbhost{i},guest-reset=false"
         ));
     }
     eprintln!(
-        "  tip: if attach fails, unplug from the host / grant QEMU USB access; list with: make usb-list"
+        "  tip: if the guest sees no device, unplug from macOS, grant QEMU USB access, \
+         or re-check make usb-list"
     );
     args
 }
@@ -2938,28 +2961,25 @@ fn image(release: bool, model: Model, no_model: bool) -> Result<(), String> {
 // exit on a guest-triggered shutdown, which is exactly what writing to
 // isa-debug-exit causes. The test runner needs the process to actually
 // exit so it can read the isa-debug-exit status code back.
-const QEMU_BASE_ARGS: &[&str] = &[
-    "-M",
-    "q35",
-    // `-cpu max`: expose AVX2 + XSAVE under TCG so the Cortex kernels can
-    // use the AVX2/FMA path (the default `qemu64` lacks them, and the kernel
-    // then falls back to SSE2 -- correct, just slower).
-    "-cpu",
-    "max",
-    // NB: SMP (`-smp 4`) is added only by the test runner (`cmd_runner`), where
-    // the SMP bring-up + spinlock self-test runs. Interactive `run` and
-    // `ref-check` stay single-CPU: inference is BSP-bound, and under
-    // single-thread TCG extra vCPUs only cost round-robin overhead.
-    "-m",
-    "2G",
-    "-device",
-    "isa-debug-exit,iobase=0xf4,iosize=0x04",
-    "-no-reboot",
-];
+//
+// Interactive `run` and `ref-check` stay single-CPU (`-smp` only on the
+// test runner): inference is BSP-bound, and under single-thread TCG extra
+// vCPUs only cost round-robin overhead. `-cpu max` exposes AVX2/XSAVE.
 
-fn qemu_base_cmd(iso: &Path) -> Command {
+fn qemu_base_cmd(iso: &Path, mem: &str) -> Command {
     let mut cmd = Command::new("qemu-system-x86_64");
-    cmd.args(QEMU_BASE_ARGS);
+    // `-m` comes from the model (0.8b → 3G, 9b → 10G, …).
+    cmd.args([
+        "-M",
+        "q35",
+        "-cpu",
+        "max",
+        "-m",
+        mem,
+        "-device",
+        "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        "-no-reboot",
+    ]);
     cmd.arg("-cdrom").arg(iso);
     cmd
 }
@@ -3054,7 +3074,8 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         None => assemble_image_opt(&bin, None)?,
         Some(_) => assemble_image_with(&bin, model.gguf_rel())?,
     };
-    let mut cmd = qemu_base_cmd(&iso);
+    let mem = model.qemu_mem();
+    let mut cmd = qemu_base_cmd(&iso, mem);
     if uefi {
         for arg in ovmf_pflash_args()? {
             cmd.arg(arg);
@@ -3063,6 +3084,12 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
     }
     cmd.args(["-serial", "mon:stdio"]);
     cmd.args(x86_run_extra_args()); // headless (-display none) + KVM on CI
+    // Cocoa/GTK window for interactive use (skip when CHITTI_DISPLAY=none).
+    if env::var("CHITTI_DISPLAY").as_deref() != Ok("none") {
+        for a in display_args() {
+            cmd.arg(a);
+        }
+    }
     for a in remote_model_fw_cfg()? {
         cmd.arg(a);
     }
@@ -3087,14 +3114,25 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
     // NIC (user-net or CHITTI_NET_BRIDGE — see guest_netdev); model from CHITTI_NIC.
     cmd.args(["-netdev", &guest_netdev("chittinet"), "-device", &format!("{},netdev=chittinet", nic_model())]);
     // virtio-snd on the host's audio backend (mic + speaker) for /voice.
+    // Missing host audio is noisy but non-fatal; use CHITTI_AUDIO=off to silence.
     cmd.args(audio_args("virtio-sound-pci"));
     if disk_size.is_some() {
         eprintln!("  disk: {} ({}) -- run `/install yes` at the shell, then reboot with `--disk-only`", disk.display(), disk_size.as_deref().unwrap_or(""));
     }
+    eprintln!(
+        "booting x86_64 Chitti ({}) under QEMU -m {mem} (close the window or Ctrl-A X to quit)",
+        model.label()
+    );
     let status = cmd
         .status()
         .map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
     eprintln!("qemu exited: {status}");
+    if status.success() {
+        eprintln!(
+            "  (exit 0 = window closed or guest poweroff; if it quit instantly, \
+             check the lines above for USB/audio errors)"
+        );
+    }
     Ok(())
 }
 
@@ -3504,7 +3542,7 @@ fn cmd_runner(args: &[String]) -> Result<(), String> {
     // quickly (the tensor-kernel tests validate against baked-in NumPy
     // reference vectors, not the real model).
     let iso = assemble_image_opt(Path::new(bin_path), None)?;
-    let mut cmd = qemu_base_cmd(&iso);
+    let mut cmd = qemu_base_cmd(&iso, "2G");
     // The in-kernel test suite includes the Phase 7 SMP bring-up + spinlock
     // self-test, so the harness runs with four vCPUs.
     cmd.args(["-smp", "4", "-serial", "stdio", "-display", "none"]);
