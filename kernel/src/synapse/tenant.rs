@@ -815,9 +815,22 @@ pub fn imgdec_blob() -> &'static [u8] {
     IMGDEC_BLOB
 }
 
+/// Byte offset of the tenant's entry point within [`imgdec_blob`], emitted by
+/// `cargo xtask imgdec` from the ELF's own header.
+///
+/// **Read, not arranged.** The loader used to jump to offset 0 and require the linker to put
+/// `_start` there; on x86 it landed at `+0xc` while aarch64 was exact, so a tenant executed into
+/// the middle of an unrelated function and faulted reading a kernel address. An
+/// `ASSERT(_start == base)` in the linker script did not fire, so the guard was not guarding.
+/// The ELF already records the entry and the load base — this is the difference.
+#[cfg(target_arch = "x86_64")]
+const IMGDEC_ENTRY_OFFSET: u64 = include!("../../../userspace/imgdec/entry-x86_64.in");
+#[cfg(target_arch = "aarch64")]
+const IMGDEC_ENTRY_OFFSET: u64 = include!("../../../userspace/imgdec/entry-aarch64.in");
+
 /// Run the compiled userspace tenant over `input`.
 pub fn run_imgdec(task: crate::sched::TaskId, input: &[u8]) -> Result<alloc::vec::Vec<u8>, LoadError> {
-    run_bulk_with(task, imgdec_blob(), input)
+    run_bulk_at(task, imgdec_blob(), IMGDEC_ENTRY_OFFSET, input)
 }
 
 /// Run the bulk tenant over `input`, returning what it wrote.
@@ -837,6 +850,17 @@ pub fn run_bulk(task: crate::sched::TaskId, input: &[u8]) -> Result<alloc::vec::
 pub fn run_bulk_with(
     task: crate::sched::TaskId,
     blob: &[u8],
+    input: &[u8],
+) -> Result<alloc::vec::Vec<u8>, LoadError> {
+    // The hand-assembled blobs put their entry first by construction; a compiled one says where.
+    run_bulk_at(task, blob, 0, input)
+}
+
+/// [`run_bulk_with`], entering at `entry_offset` bytes into the blob.
+pub fn run_bulk_at(
+    task: crate::sched::TaskId,
+    blob: &[u8],
+    entry_offset: u64,
     input: &[u8],
 ) -> Result<alloc::vec::Vec<u8>, LoadError> {
     const PAGE: usize = 0x1000;
@@ -895,8 +919,9 @@ pub fn run_bulk_with(
         // **No justification is set**, because this tenant makes no Synapse call and so
         // there is nothing for one to justify. That is the decoder shape in one line.
         // SAFETY: code RX, stack RW, block RW, input RO and output RW are all mapped.
-        let exit =
-            unsafe { crate::arch::enter_tenant(task, &loaded.space, loaded.entry, loaded.stack, args_va) };
+        let exit = unsafe {
+            crate::arch::enter_tenant(task, &loaded.space, loaded.entry + entry_offset, loaded.stack, args_va)
+        };
         if !exit.is_deliberate_exit() {
             crate::ktrace::log_fmt(format_args!("tenant: bulk tenant did not exit cleanly: {exit:?}"));
             return Err(LoadError::Faulted);

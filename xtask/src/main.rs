@@ -5,6 +5,7 @@
 use std::env;
 mod paper;
 mod rings;
+mod entry;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -998,6 +999,9 @@ fn cmd_imgdec() -> Result<(), String> {
     let repo = repo_root();
     let crate_dir = repo.join("userspace/imgdec");
     let objcopy = find_objcopy()?;
+    // `llvm-nm` ships beside `llvm-objcopy` in the same rustup component, so derive it rather
+    // than searching again.
+    let nm = objcopy.replace("objcopy", "nm");
     for arch in ["x86_64", "aarch64"] {
         let target = format!("../../targets/{arch}-chitti-user.json");
         let st = std::process::Command::new("cargo")
@@ -1019,8 +1023,26 @@ fn cmd_imgdec() -> Result<(), String> {
         if !st.success() {
             return Err(format!("imgdec: objcopy failed for {arch}"));
         }
+        // **Record where the entry is, rather than requiring it to be first.** Arranging that in
+        // the linker script cost several builds and still failed on x86 (`_start` at
+        // `USER_BASE + 0xc` while aarch64 was exact), and the script-level `ASSERT` did not even
+        // fire. The kernel `include!`s this number and jumps to `USER_BASE + offset`.
+        // From `llvm-nm` plus the linker script, **not** the ELF header: CLAUDE.md's "no ELF
+        // loader" is a rule about what this project learns to parse, and it is unnecessary here
+        // — two lines of text already carry the answer, and the base comes from the very file
+        // the linker used rather than a second copy of the constant.
+        let nm_out = std::process::Command::new(&nm)
+            .arg(&elf)
+            .output()
+            .map_err(|e| format!("imgdec: nm: {e}"))?;
+        let ld = std::fs::read_to_string(crate_dir.join(format!("link-{arch}.ld")))
+            .map_err(|e| format!("imgdec: read linker script: {e}"))?;
+        let off = entry::entry_offset(&String::from_utf8_lossy(&nm_out.stdout), &ld)
+            .ok_or_else(|| format!("imgdec: {arch}: could not locate _start via nm + linker script"))?;
+        let off_file = crate_dir.join(format!("entry-{arch}.in"));
+        std::fs::write(&off_file, format!("{off}\n")).map_err(|e| format!("imgdec: write {}: {e}", off_file.display()))?;
         let n = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
-        println!("imgdec: {arch} -> {} ({n} bytes)", bin.display());
+        println!("imgdec: {arch} -> {} ({n} bytes, entry at +{off})", bin.display());
     }
     println!("imgdec: both blobs rebuilt -- commit them, the kernel include_bytes! them");
     Ok(())
