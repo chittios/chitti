@@ -181,6 +181,25 @@ pub fn umount(path: &str) -> Result<(), MountError> {
     Ok(())
 }
 
+/// Drop mounts whose `disk` index no longer probes (USB stick yanked, etc.).
+///
+/// USB MSC is last in the probe order, so removing it does not renumber
+/// internal disks — only mounts that named a now-missing index are removed.
+/// Returns how many mounts were pruned.
+pub fn prune_missing_disks() -> usize {
+    let removed = TABLE.with(|t| {
+        let before = t.len();
+        t.retain(|m| crate::block::probe_disk_nth(m.disk).is_some());
+        before - t.len()
+    });
+    if removed > 0 {
+        crate::ktrace::log_fmt(format_args!(
+            "fs.mount: pruned {removed} mount(s) whose disk is gone"
+        ));
+    }
+    removed
+}
+
 /// A data volume suitable for durable agent state (and auto-mount at `/`).
 #[derive(Clone, Debug)]
 pub struct DataVolume {

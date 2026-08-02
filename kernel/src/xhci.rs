@@ -5,8 +5,8 @@
 //! `arch::aarch64::xhci`) discover the controller, map its MMIO, and hand this
 //! core the register base + a DMA allocator, then reuse it verbatim.
 //!
-//! Scope: a polled, single-device bring-up sufficient for a boot-protocol
-//! keyboard — not a general USB stack. Stages:
+//! Scope: a polled HID + bulk (Ethernet/MSC) host — not a general USB stack.
+//! Stages:
 //!   C1 controller bring-up: reset, set up the DCBAA + command ring + event
 //!      ring, start the controller (from a wrapper-supplied MMIO base).
 //!   C2 enumerate: detect the port, reset it, enable a device slot, address it.
@@ -14,6 +14,9 @@
 //!      set the configuration, arm its interrupt IN endpoint.
 //!   C4 input: poll the interrupt endpoint for 8-byte boot reports, map USB HID
 //!      usage codes -> ASCII, and push them into the console ring.
+//!   C5 hot-plug: each `pump_events` pass watches PORTSC; a disconnect
+//!      disables the slot and drops HID/bulk claims, a connect reuses the
+//!      cold-plug enumerator.
 //!
 //! DMA memory comes from the wrapper's `Alloc` (returns `(physical, virtual)`):
 //! the device is handed the physical address, the CPU uses the virtual one
@@ -22,9 +25,20 @@
 #![allow(dead_code)]
 
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// A page-aligned DMA allocator: `bytes -> (physical_addr, virtual_addr)`.
 pub type Alloc = fn(usize) -> Option<(u64, usize)>;
+
+/// Set when an MSC bulk device is torn down; consumed **outside** the xHCI
+/// `Locked` so [`crate::fs::mount::prune_missing_disks`] can re-probe disks
+/// (which re-enters `usb_msc_ready` and would deadlock if done under the lock).
+static MSC_UNPLUG_PRUNE: AtomicBool = AtomicBool::new(false);
+
+/// True once since the last call if a USB mass-storage disconnect needs mount prune.
+pub fn take_msc_unplug_prune() -> bool {
+    MSC_UNPLUG_PRUNE.swap(false, Ordering::AcqRel)
+}
 
 // --- xHCI capability register offsets (from BAR base) ------------------
 const CAP_CAPLENGTH: usize = 0x00; // u8 caplength, u16 version at +2
@@ -83,6 +97,8 @@ pub enum BulkRole {
 /// synchronous wait helpers.
 pub struct BulkEp {
     pub slot: u8,
+    /// Root-hub port this device (or its top-tier hub) hangs off — for unplug.
+    pub root_port: u8,
     pub in_dci: u8,
     pub out_dci: u8,
     pub role: BulkRole,
@@ -154,6 +170,8 @@ pub struct Xhci {
 /// A configured HID boot keyboard.
 struct Kbd {
     slot: u8,
+    /// Root-hub port for hot-unplug (see [`BulkEp::root_port`]).
+    root_port: u8,
     int_dci: u8,       // doorbell target for the interrupt IN endpoint
     int_ring_va: usize,
     int_ring_pa: u64,
@@ -175,6 +193,7 @@ struct Kbd {
 /// interprets the report.
 struct Ptr {
     slot: u8,
+    root_port: u8,
     int_dci: u8,
     int_ring_va: usize,
     int_ring_pa: u64,
@@ -312,6 +331,7 @@ const TRB_SETUP: u32 = 2;
 const TRB_DATA: u32 = 3;
 const TRB_STATUS: u32 = 4;
 const TRB_ENABLE_SLOT: u32 = 9;
+const TRB_DISABLE_SLOT: u32 = 10;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 const TRB_EVALUATE_CONTEXT: u32 = 13;
@@ -327,8 +347,51 @@ const CC_STALL: u32 = 6;
 const PORTSC_CCS: u32 = 1 << 0; // current connect status
 const PORTSC_PED: u32 = 1 << 1; // port enabled
 const PORTSC_PR: u32 = 1 << 4; // port reset
+/// Connect Status Change (RW1C) — device attached or yanked.
+pub const PORTSC_CSC: u32 = 1 << 17;
+/// Port Enabled/Disabled Change (RW1C).
+pub const PORTSC_PEC: u32 = 1 << 18;
+/// Over-current Change (RW1C).
+pub const PORTSC_OCC: u32 = 1 << 20;
+/// All PORTSC change bits (17..23) — write-1-to-clear as a group.
+pub const PORTSC_CHANGE_MASK: u32 = 0x7f << 17;
 // RW1C/RW1CS bits to preserve (write 0) when doing a read-modify-write.
-const PORTSC_RW1CS: u32 = PORTSC_PED | (0x7f << 17);
+const PORTSC_RW1CS: u32 = PORTSC_PED | PORTSC_CHANGE_MASK;
+
+/// Lifecycle signal from a single PORTSC read (pure — unit-tested).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortAttach {
+    /// No connect-status change; caller may still check CCS for a silent yank.
+    Quiet,
+    /// CSC set and a device is present.
+    Connected,
+    /// CSC set and no device (unplug), or change bits that imply detachment.
+    Disconnected,
+}
+
+/// Decode PORTSC for hot-plug: CSC + CCS.
+///
+/// Without CSC this returns [`PortAttach::Quiet`] even if CCS is clear — a
+/// controller may leave CCS clear without a fresh CSC after we already acked;
+/// owners of a live device still check CCS alone.
+pub fn port_attach_state(psc: u32) -> PortAttach {
+    if psc & PORTSC_CSC == 0 {
+        return PortAttach::Quiet;
+    }
+    if psc & PORTSC_CCS != 0 {
+        PortAttach::Connected
+    } else {
+        PortAttach::Disconnected
+    }
+}
+
+/// PORTSC write that acknowledges every pending change bit without clearing PED.
+///
+/// Change bits are RW1C (write 1 clears); PED is RW1CS and must be written 0 on
+/// an RMW that is not intentionally disabling the port.
+pub fn portsc_ack_write(psc: u32) -> u32 {
+    (psc & !PORTSC_RW1CS) | (psc & PORTSC_CHANGE_MASK)
+}
 
 /// Full barrier between CPU writes to (cacheable) DMA memory and the following
 /// device MMIO write. On aarch64 a `dsb sy` orders the Normal-memory TRB writes
@@ -1398,10 +1461,18 @@ impl Xhci {
         let (int_dci, int_va, int_pa, report_pa, report_va) =
             unsafe { self.finish_endpoint(c, iface, ep_addr, ep_mps, interval, true) }?;
         let mut kbd = Kbd {
-            slot: c.slot, int_dci, int_ring_va: int_va, int_ring_pa: int_pa,
-            int_enqueue: 0, int_cycle: 1, report_pa, report_va,
+            slot: c.slot,
+            root_port: c.loc.root_port,
+            int_dci,
+            int_ring_va: int_va,
+            int_ring_pa: int_pa,
+            int_enqueue: 0,
+            int_cycle: 1,
+            report_pa,
+            report_va,
             prev: [0; 8],
-            rep: crate::keyrepeat::Typematic::new(), rep_usage: 0,
+            rep: crate::keyrepeat::Typematic::new(),
+            rep_usage: 0,
         };
         unsafe { self.queue_interrupt(&mut kbd) };
         crate::ktrace::log_fmt(format_args!("xhci: HID keyboard ready (slot {}, ep {ep_addr:#x}, dci {int_dci})", c.slot));
@@ -1439,8 +1510,15 @@ impl Xhci {
             TABLET_FALLBACK
         };
         let mut ptr = Ptr {
-            slot: c.slot, int_dci, int_ring_va: int_va, int_ring_pa: int_pa,
-            int_enqueue: 0, int_cycle: 1, report_pa, report_va,
+            slot: c.slot,
+            root_port: c.loc.root_port,
+            int_dci,
+            int_ring_va: int_va,
+            int_ring_pa: int_pa,
+            int_enqueue: 0,
+            int_cycle: 1,
+            report_pa,
+            report_va,
             report_len: ep_mps.clamp(4, 16),
             layout,
             dbg: 24,
@@ -1571,6 +1649,8 @@ impl Xhci {
     /// `poll_mouse` call this; a single drainer avoids the two stealing each
     /// other's events off the one ring.
     fn pump_events(&mut self) {
+        // Port status first: a yank must drop claims before we re-arm a dead EP.
+        self.poll_hotplug();
         let mut kbd = self.kbd.take();
         let mut mouse = self.mouse.take();
         let mut bulk = self.bulk.take();
@@ -1748,6 +1828,7 @@ impl Xhci {
         ));
         self.bulk = Some(BulkEp {
             slot: c.slot,
+            root_port: c.loc.root_port,
             in_dci,
             out_dci,
             role,
@@ -1945,6 +2026,125 @@ impl Xhci {
     /// pointer). Shares the event drain with `poll_key`.
     pub fn poll_mouse(&mut self) {
         self.pump_events();
+    }
+
+    /// Whether any claimed device (HID or bulk) sits on root-hub `port`.
+    fn port_has_device(&self, port: u8) -> bool {
+        self.kbd.as_ref().is_some_and(|k| k.root_port == port)
+            || self.mouse.as_ref().is_some_and(|p| p.root_port == port)
+            || self.bulk.as_ref().is_some_and(|b| b.root_port == port)
+    }
+
+    /// Disable a device slot and clear its DCBAA entry (xHCI §4.6.4).
+    fn disable_slot(&mut self, slot: u8) {
+        if slot == 0 {
+            return;
+        }
+        match unsafe { self.command(0, (TRB_DISABLE_SLOT << 10) | ((slot as u32) << 24)) } {
+            Some((cc, _)) if cc == CC_SUCCESS => {}
+            other => crate::ktrace::log_fmt(format_args!(
+                "xhci: disable slot {slot} cc={other:?} (continuing teardown)"
+            )),
+        }
+        // SAFETY: DCBAA was allocated at bring-up and stays mapped.
+        unsafe {
+            write_volatile((self.dcbaa_va as *mut u64).add(slot as usize), 0);
+        }
+    }
+
+    /// Drop every claim on root-hub `port`, disable unique slots, free the
+    /// `done_ports` bit so a re-plug can enumerate, and prune MSC mounts.
+    fn teardown_root_port(&mut self, port: u8) {
+        let mut slots = [0u8; 4];
+        let mut nslots = 0usize;
+        let mut push = |slot: u8| {
+            if slot == 0 || nslots >= slots.len() {
+                return;
+            }
+            if !slots[..nslots].contains(&slot) {
+                slots[nslots] = slot;
+                nslots += 1;
+            }
+        };
+        let mut had_msc = false;
+        if self.kbd.as_ref().is_some_and(|k| k.root_port == port) {
+            if let Some(k) = self.kbd.take() {
+                push(k.slot);
+                crate::ktrace::log_fmt(format_args!(
+                    "xhci: keyboard unplugged (root port {port}, slot {})",
+                    k.slot
+                ));
+            }
+        }
+        if self.mouse.as_ref().is_some_and(|p| p.root_port == port) {
+            if let Some(p) = self.mouse.take() {
+                push(p.slot);
+                crate::ktrace::log_fmt(format_args!(
+                    "xhci: pointer unplugged (root port {port}, slot {})",
+                    p.slot
+                ));
+            }
+        }
+        if self.bulk.as_ref().is_some_and(|b| b.root_port == port) {
+            if let Some(b) = self.bulk.take() {
+                push(b.slot);
+                had_msc = b.role == BulkRole::Msc;
+                crate::ktrace::log_fmt(format_args!(
+                    "xhci: bulk {:?} unplugged (root port {port}, slot {})",
+                    b.role, b.slot
+                ));
+            }
+        }
+        for i in 0..nslots {
+            self.disable_slot(slots[i]);
+        }
+        if port < 32 {
+            self.done_ports &= !(1u32 << port);
+        }
+        if had_msc {
+            // Deferred: arch poll path calls [`take_msc_unplug_prune`] after
+            // releasing the controller lock (see that function's doc).
+            MSC_UNPLUG_PRUNE.store(true, Ordering::Release);
+        }
+    }
+
+    /// Poll root-hub PORTSC for connect/disconnect (human-timescale, from
+    /// [`pump_events`]). Disconnect always tears down; connect reuses one
+    /// [`scan_ports`] pass (no multi-retry settle — cold plug already did that).
+    pub fn poll_hotplug(&mut self) {
+        let mut detach = 0u32;
+        let mut need_scan = false;
+        for port in 1..=self.max_ports {
+            // SAFETY: operational registers mapped for the controller lifetime.
+            let psc = unsafe { r32(self.portsc(port)) };
+            let ccs = psc & PORTSC_CCS != 0;
+            // Owned device whose CCS cleared (yank) — even if CSC was already acked.
+            if !ccs && self.port_has_device(port) {
+                detach |= 1u32 << port;
+            }
+            match port_attach_state(psc) {
+                PortAttach::Disconnected => detach |= 1u32 << port,
+                PortAttach::Connected => {
+                    if port < 32 && self.done_ports & (1 << port) == 0 {
+                        need_scan = true;
+                    }
+                }
+                PortAttach::Quiet => {}
+            }
+            if psc & PORTSC_CHANGE_MASK != 0 {
+                // SAFETY: W1C of change bits only; PED written 0 so it stays.
+                unsafe { w32(self.portsc(port), portsc_ack_write(psc)) };
+            }
+        }
+        for port in 1..=self.max_ports {
+            if detach & (1u32 << port) != 0 {
+                self.teardown_root_port(port);
+            }
+        }
+        if need_scan {
+            // SAFETY: same single-threaded host path as cold-plug enumeration.
+            unsafe { self.scan_ports() };
+        }
     }
 }
 
@@ -2695,6 +2895,36 @@ mod tests {
         let d2 = parent_slot | (parent_port << 8);
         assert_eq!(d2 & 0xff, 4);
         assert_eq!((d2 >> 8) & 0xff, 3);
+    }
+
+    /// PORTSC connect-status change + CCS → attach/detach for hot-plug.
+    #[test_case]
+    fn port_attach_state_needs_csc_and_reads_ccs() {
+        assert_eq!(port_attach_state(0), PortAttach::Quiet);
+        assert_eq!(port_attach_state(PORTSC_CCS), PortAttach::Quiet); // present, no change
+        assert_eq!(
+            port_attach_state(PORTSC_CCS | PORTSC_CSC),
+            PortAttach::Connected
+        );
+        assert_eq!(port_attach_state(PORTSC_CSC), PortAttach::Disconnected);
+        // Change bits other than CSC alone do not claim a connect event.
+        assert_eq!(port_attach_state(PORTSC_PEC | PORTSC_OCC), PortAttach::Quiet);
+    }
+
+    /// Acknowledging change bits must write 1 to each pending RW1C bit and
+    /// must **not** write 1 to PED (which would disable the port).
+    #[test_case]
+    fn portsc_ack_clears_change_bits_without_disabling() {
+        let psc = PORTSC_CCS | PORTSC_PED | PORTSC_CSC | PORTSC_PEC | (1 << 9); // PP
+        let w = portsc_ack_write(psc);
+        assert_eq!(w & PORTSC_PED, 0, "PED must be written 0 (preserve)");
+        assert_ne!(w & PORTSC_CSC, 0, "CSC written 1 to clear");
+        assert_ne!(w & PORTSC_PEC, 0, "PEC written 1 to clear");
+        assert_ne!(w & (1 << 9), 0, "Port Power preserved");
+        assert_ne!(w & PORTSC_CCS, 0, "CCS is RO but left in the word");
+        // No change bits pending → ack write carries none of them.
+        let quiet = PORTSC_CCS | PORTSC_PED | (1 << 9);
+        assert_eq!(portsc_ack_write(quiet) & PORTSC_CHANGE_MASK, 0);
     }
 
     /// `mark_hub`'s slot-context bit math: Hub flag at bit 26, number of ports in

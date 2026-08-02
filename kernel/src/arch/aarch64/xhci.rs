@@ -198,14 +198,16 @@ pub fn has_mouse() -> bool {
 /// The next byte from any USB keyboard, if one is ready (checks every
 /// controller — a keyboard may be on a different dwc3 than the mouse).
 pub fn poll_key() -> Option<u8> {
-    XHCI.with(|s| {
+    let b = XHCI.with(|s| {
         for x in s.iter_mut() {
             if let Some(b) = x.poll_key() {
                 return Some(b);
             }
         }
         None
-    })
+    });
+    maybe_prune_msc_mounts();
+    b
 }
 
 /// Drain USB HID mouse reports into `crate::mouse` from every controller
@@ -216,6 +218,19 @@ pub fn poll_mouse() {
             x.poll_mouse();
         }
     });
+    maybe_prune_msc_mounts();
+}
+
+/// After releasing the xHCI lock: drop mounts whose USB disk vanished.
+fn maybe_prune_msc_mounts() {
+    if crate::xhci::take_msc_unplug_prune() {
+        let n = crate::fs::mount::prune_missing_disks();
+        if n > 0 {
+            crate::ktrace::log_fmt(format_args!(
+                "xhci: pruned {n} mount(s) after USB MSC disconnect"
+            ));
+        }
+    }
 }
 
 /// USB Ethernet bulk transport. aarch64 keeps a **list** of controllers (Apple
@@ -266,26 +281,30 @@ pub fn usb_bulk_send(data: &[u8]) -> bool {
 
 /// Synchronous bulk OUT for MSC BOT on the controller holding the stick.
 pub fn usb_bulk_sync_out(data: &[u8], timeout_ms: u64) -> bool {
-    XHCI.with(|s| {
+    let r = XHCI.with(|s| {
         for x in s.iter_mut().filter(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Msc)) {
             if x.bulk_sync_out(data, timeout_ms) {
                 return true;
             }
         }
         false
-    })
+    });
+    maybe_prune_msc_mounts();
+    r
 }
 
 /// Synchronous bulk IN for MSC BOT.
 pub fn usb_bulk_sync_in(out: &mut [u8], timeout_ms: u64) -> Option<usize> {
-    XHCI.with(|s| {
+    let r = XHCI.with(|s| {
         for x in s.iter_mut().filter(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Msc)) {
             if let Some(n) = x.bulk_sync_in(out, timeout_ms) {
                 return Some(n);
             }
         }
         None
-    })
+    });
+    maybe_prune_msc_mounts();
+    r
 }
 
 /// Page-aligned identity DMA: VA == PA on the aarch64 identity map (or via
