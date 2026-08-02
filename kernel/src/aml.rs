@@ -563,6 +563,28 @@ pub fn device_name(aml: &[u8], dev: &DeviceNode, name: &str) -> Option<Value> {
     None
 }
 
+/// Extract the **GPE number** from a `_PRW` package value.
+///
+/// ACPI shapes:
+/// - `Package { Integer(gpe), Integer(sleep) }`
+/// - `Package { Package { Integer(gpe), Integer(block) }, Integer(sleep) }`
+///
+/// Returns `None` rather than guessing when the shape is unrecognised.
+pub fn prw_gpe_number(v: &Value) -> Option<u32> {
+    let Value::Package(items) = v else {
+        return None;
+    };
+    let first = items.first()?;
+    match first {
+        Value::Integer(n) => Some(*n as u32),
+        Value::Package(inner) => match inner.first()? {
+            Value::Integer(n) => Some(*n as u32),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Find the device whose `_HID` (or `_CID`) matches `hid`.
 ///
 /// `PNP0C50` is the HID-over-I2C touchpad identifier, which is what makes this the
@@ -1265,6 +1287,21 @@ mod tests {
             device_name(&aml, sen, "_CRS").and_then(|v| v.as_buffer().map(|b| b.to_vec())),
             Some(vec![0x11, 0x22])
         );
+    }
+
+    #[test_case]
+    fn prw_gpe_number_accepts_both_package_shapes() {
+        // Flat: Package { gpe, sleep }
+        let flat = Value::Package(vec![Value::Integer(0x1d), Value::Integer(3)]);
+        assert_eq!(prw_gpe_number(&flat), Some(0x1d));
+        // Nested: Package { Package { gpe, block }, sleep }
+        let nested = Value::Package(vec![
+            Value::Package(vec![Value::Integer(8), Value::Integer(0)]),
+            Value::Integer(4),
+        ]);
+        assert_eq!(prw_gpe_number(&nested), Some(8));
+        assert_eq!(prw_gpe_number(&Value::Integer(1)), None);
+        assert_eq!(prw_gpe_number(&Value::Package(vec![])), None);
     }
 
     #[test_case]

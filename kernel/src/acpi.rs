@@ -290,6 +290,119 @@ const FADT_ACPI_ENABLE: usize = 52;
 /// FADT `Flags` — bit 4 says the power button is a control-method device, bit 5 the
 /// same of the sleep button.
 const FADT_FLAGS: usize = 112;
+/// `GPE0_BLK` (32-bit I/O port of the GPE0 status register base).
+const FADT_GPE0_BLK: usize = 80;
+/// `GPE1_BLK`.
+const FADT_GPE1_BLK: usize = 84;
+/// `GPE0_BLK_LEN` — full block length in bytes (status half + enable half).
+const FADT_GPE0_BLK_LEN: usize = 92;
+/// `GPE1_BLK_LEN`.
+const FADT_GPE1_BLK_LEN: usize = 93;
+/// `GPE1_BASE` — GPE number of the first bit in GPE1.
+const FADT_GPE1_BASE: usize = 94;
+/// `X_GPE0_BLK` GAS (12 bytes).
+const FADT_X_GPE0_BLK: usize = 220;
+/// `X_GPE1_BLK` GAS.
+const FADT_X_GPE1_BLK: usize = 232;
+
+/// One GPE register block (status then enable, equal halves).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GpeBlock {
+    /// I/O port of the status register base (first half of the block).
+    pub sts: u16,
+    /// I/O port of the enable register base (`sts + half_len`).
+    pub en: u16,
+    /// Length of **one half** (status or enable) in bytes.
+    pub half_len: u8,
+    /// GPE number of bit 0 in this block (`0` for GPE0, `GPE1_BASE` for GPE1).
+    pub base: u8,
+}
+
+impl GpeBlock {
+    /// True when this block is usable (I/O, non-zero, even total length ≥ 2).
+    pub fn present(self) -> bool {
+        self.sts != 0 && self.half_len != 0
+    }
+
+    /// Byte offset and bit within the status/enable half for global GPE `n`.
+    /// `None` if `n` is not in this block.
+    pub fn bit_of(self, n: u32) -> Option<(u8, u8)> {
+        if !self.present() {
+            return None;
+        }
+        let base = self.base as u32;
+        let bits = self.half_len as u32 * 8;
+        if n < base || n >= base + bits {
+            return None;
+        }
+        let off = n - base;
+        Some(((off / 8) as u8, (off % 8) as u8))
+    }
+}
+
+/// Both GPE blocks from a FADT (either may be absent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GpeBlocks {
+    pub gpe0: GpeBlock,
+    pub gpe1: GpeBlock,
+}
+
+impl GpeBlocks {
+    /// Locate which block owns global GPE `n`.
+    pub fn block_for(self, n: u32) -> Option<GpeBlock> {
+        if self.gpe0.bit_of(n).is_some() {
+            Some(self.gpe0)
+        } else if self.gpe1.bit_of(n).is_some() {
+            Some(self.gpe1)
+        } else {
+            None
+        }
+    }
+}
+
+/// Decode GPE0/GPE1 from a FADT (pure). Only System I/O GAS / legacy ports.
+///
+/// Register layout (ACPI): for a block of length `L` (must be even), bytes
+/// `0..L/2` are status and `L/2..L` are enable — same split as PM1 events.
+pub fn fadt_gpe(fadt: &[u8]) -> GpeBlocks {
+    fn one(fadt: &[u8], legacy: usize, xgas: usize, len_off: usize, base: u8) -> GpeBlock {
+        let port = fadt_port(fadt, legacy, xgas);
+        let total = fadt.get(len_off).copied().unwrap_or(0);
+        if port == 0 || total < 2 || total % 2 != 0 {
+            return GpeBlock::default();
+        }
+        let half = total / 2;
+        GpeBlock {
+            sts: port,
+            en: port.saturating_add(half as u16),
+            half_len: half,
+            base,
+        }
+    }
+    let gpe1_base = fadt.get(FADT_GPE1_BASE).copied().unwrap_or(0);
+    GpeBlocks {
+        gpe0: one(fadt, FADT_GPE0_BLK, FADT_X_GPE0_BLK, FADT_GPE0_BLK_LEN, 0),
+        gpe1: one(fadt, FADT_GPE1_BLK, FADT_X_GPE1_BLK, FADT_GPE1_BLK_LEN, gpe1_base),
+    }
+}
+
+/// GPE blocks from the FADT at `rsdp`, if any.
+pub fn gpe_from_rsdp(rsdp: u64) -> Option<GpeBlocks> {
+    let f = find_table(rsdp, b"FACP")?;
+    // SAFETY: `find_table` mapped the FADT.
+    let fadt = unsafe { table_slice(f)? };
+    let b = fadt_gpe(fadt);
+    (b.gpe0.present() || b.gpe1.present()).then_some(b)
+}
+
+/// FADT flags alone (no PM1 required) — for control-method button detection when
+/// the platform has no fixed-feature PM1 event block.
+pub fn fadt_flags_from_rsdp(rsdp: u64) -> Option<u32> {
+    let f = find_table(rsdp, b"FACP")?;
+    // SAFETY: as above.
+    let fadt = unsafe { table_slice(f)? };
+    Some(read_u32(fadt, FADT_FLAGS).unwrap_or(0))
+}
 
 /// The PM1 blocks plus the FADT flags that say what they mean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1088,7 +1201,47 @@ mod tests {
         f[172] = 1;
         f[173] = 16;
         f[176..184].copy_from_slice(&0x0000_2804u64.to_le_bytes());
+        // GPE0: legacy port 0xB00, length 4 → status 0xB00, enable 0xB02
+        f[80..84].copy_from_slice(&0x0000_0b00u32.to_le_bytes());
+        f[92] = 4;
+        // GPE1: port 0xB04, length 2, base 32
+        f[84..88].copy_from_slice(&0x0000_0b04u32.to_le_bytes());
+        f[93] = 2;
+        f[94] = 32;
         f
+    }
+
+    #[test_case]
+    fn gpe_blocks_split_status_and_enable_like_pm1() {
+        let g = fadt_gpe(&fadt_bytes());
+        assert!(g.gpe0.present());
+        assert_eq!(g.gpe0.sts, 0xb00);
+        assert_eq!(g.gpe0.en, 0xb02);
+        assert_eq!(g.gpe0.half_len, 2);
+        assert_eq!(g.gpe0.base, 0);
+        assert!(g.gpe1.present());
+        assert_eq!(g.gpe1.sts, 0xb04);
+        assert_eq!(g.gpe1.en, 0xb05);
+        assert_eq!(g.gpe1.base, 32);
+        // GPE 3 is bit 3 of byte 0 in GPE0.
+        assert_eq!(g.gpe0.bit_of(3), Some((0, 3)));
+        // GPE 32 is bit 0 of GPE1.
+        assert_eq!(g.gpe1.bit_of(32), Some((0, 0)));
+        assert_eq!(g.block_for(3).map(|b| b.sts), Some(0xb00));
+        assert_eq!(g.block_for(32).map(|b| b.sts), Some(0xb04));
+        assert!(g.block_for(999).is_none());
+    }
+
+    #[test_case]
+    fn gpe_offsets_are_pinned() {
+        // Same discipline as X_DSDT: wrong offsets silently give wrong I/O ports.
+        assert_eq!(FADT_GPE0_BLK, 80);
+        assert_eq!(FADT_GPE1_BLK, 84);
+        assert_eq!(FADT_GPE0_BLK_LEN, 92);
+        assert_eq!(FADT_GPE1_BLK_LEN, 93);
+        assert_eq!(FADT_GPE1_BASE, 94);
+        assert_eq!(FADT_X_GPE0_BLK, 220);
+        assert_eq!(FADT_X_GPE1_BLK, 232);
     }
 
     #[test_case]

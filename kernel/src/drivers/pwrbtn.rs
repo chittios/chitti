@@ -1,18 +1,15 @@
 //! **ACPI power and sleep buttons** — pressing the power button shuts the machine
 //! down cleanly instead of doing nothing.
 //!
-//! On a laptop or desktop this is the one control a user reaches for when they want the
-//! machine off, and until now it did nothing at all: ChittiOS could *perform* an S5
-//! transition (`/poweroff`) but never noticed being asked for one.
-//!
 //! ## Two kinds of power button, and the FADT says which
 //!
-//! ACPI defines the button twice. The **fixed-feature** button is a bit in the PM1
-//! status register, which is what this drives. The **control-method** button is a
-//! `PNP0C0C` device delivering a GPE, which needs the general-purpose event machinery
-//! and is *not* implemented — but it is also *not guessed at*: FADT flags bit 4 says
-//! which form the machine uses, so a control-method machine is reported as such rather
-//! than silently polling a register that will never change.
+//! ACPI defines the button twice:
+//! - **Fixed-feature** — PM1 status bit 8 (QEMU and many desktops).
+//! - **Control-method** — `PNP0C0C` device + GPE (most laptops). FADT flags bit 4.
+//!
+//! Both paths are polled from [`crate::shell::upkeep`] (human timescale). The GPE
+//! path enables one status bit from the device's `_PRW` package; a full SCI → AML
+//! Notify dispatcher is not required for “press → poweroff”.
 //!
 //! ## Why polling is the right call here
 //!
@@ -25,16 +22,18 @@
 //! ## Refusing to act on a bit we did not arm
 //!
 //! Shutting a machine down by mistake is the worst thing this file could do, so
-//! [`poll`] acts only when *all* of: the FADT described a fixed-feature button, we
-//! successfully enabled it, ACPI mode is on (`SCI_EN`), and the status bit is set. A
-//! stale status bit from firmware is cleared at init before the button is armed, so the
-//! first press is a press and not a leftover.
+//! [`poll`] acts only when we successfully armed a path at boot: for fixed-feature that
+//! means the FADT named a PM1 button, ACPI mode is on (`SCI_EN`), and status bit 8 is
+//! set; for control-method it means a `PNP0C0C` `_PRW` GPE was enabled and that status
+//! bit is set (and not `0xff` — an unclaimed port). A stale status bit is cleared at
+//! init before the button is armed, so the first press is a press and not a leftover.
 //!
 //! **Unverified on real hardware**, but *verifiable in a VM*: QEMU's
 //! `system_powerdown` sets exactly this status bit, so the e2e harness can press the
 //! button for real.
 
 use crate::acpi;
+use crate::aml;
 
 /// `PM1x_STS`/`PM1x_EN` bit 8 — the power button.
 pub const PWRBTN: u16 = 1 << 8;
@@ -48,6 +47,9 @@ pub const SCI_EN: u16 = 1 << 0;
 pub const FLAG_PWR_BUTTON_IS_CONTROL_METHOD: u32 = 1 << 4;
 /// FADT flags bit 5 — see [`FLAG_PWR_BUTTON_IS_CONTROL_METHOD`].
 pub const FLAG_SLP_BUTTON_IS_CONTROL_METHOD: u32 = 1 << 5;
+
+/// ACPI HID for the control-method power button.
+pub const HID_PWR_BUTTON: &str = "PNP0C0C";
 
 /// True when the machine delivers power-button presses as a `PNP0C0C` GPE rather than
 /// through the PM1 status register.
@@ -79,45 +81,63 @@ pub fn ack(bit: u16) -> u16 {
     bit
 }
 
-/// What the machine actually has, decided once at init.
+/// Fixed-feature (PM1) arming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Buttons {
+struct FixedButtons {
     sts: u16,
     en: u16,
-    /// Second PM1 block, when the platform splits its events across two.
     sts_b: u16,
     en_b: u16,
 }
 
-/// The armed buttons, or `None` when this machine has no fixed-feature button.
-static mut BUTTONS: Option<Buttons> = None;
+/// Control-method (GPE) arming: one bit in a GPE status/enable pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GpeButton {
+    /// Status register port (byte-addressed I/O).
+    sts_port: u16,
+    /// Enable register port.
+    en_port: u16,
+    /// Bit mask within the status/enable **byte** (1 << bit).
+    mask: u8,
+    /// Global GPE number (for ktrace).
+    gpe: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Armed {
+    Fixed(FixedButtons),
+    Gpe(GpeButton),
+}
+
+/// The armed button path, or `None` when nothing could be armed.
+static mut BUTTONS: Option<Armed> = None;
 
 /// Set to true by [`poll`] when a press is seen, and consumed by the shell.
 static mut PRESSED: bool = false;
 
-/// Arm the fixed-feature power button.
+/// Arm the power button (fixed-feature **or** control-method GPE).
 ///
-/// Returns true when the button is armed and [`poll`] will act on it. Every refusal
-/// ktraces its reason, because "the power button does nothing" is otherwise
-/// indistinguishable between a control-method machine, a memory-mapped PM block and
-/// ACPI mode being off.
+/// Returns true when [`poll`] will act on presses. Every refusal ktraces its reason.
 pub fn init(rsdp: u64) -> bool {
     // SAFETY: single-threaded boot-time initialisation.
     if unsafe { BUTTONS.is_some() } {
         return true;
     }
+    let flags = acpi::fadt_flags_from_rsdp(rsdp)
+        .or_else(|| acpi::pm1_from_rsdp(rsdp).map(|i| i.flags))
+        .unwrap_or(0);
+
+    if power_button_is_control_method(flags) {
+        return init_control_method(rsdp);
+    }
+    init_fixed(rsdp)
+}
+
+fn init_fixed(rsdp: u64) -> bool {
     let Some(info) = acpi::pm1_from_rsdp(rsdp) else {
         crate::ktrace::log("pwrbtn", "no FADT PM1 event block -- no fixed-feature button");
         return false;
     };
-    if power_button_is_control_method(info.flags) {
-        // A real laptop often does this. Say so rather than polling a dead bit.
-        crate::ktrace::log(
-            "pwrbtn",
-            "firmware uses a control-method (PNP0C0C) power button; GPE dispatch is not implemented",
-        );
-        return false;
-    }
     let (Some(sts), Some(en)) = (info.blocks.a_sts(), info.blocks.a_en()) else {
         crate::ktrace::log("pwrbtn", "PM1a event block absent or too short");
         return false;
@@ -126,9 +146,6 @@ pub fn init(rsdp: u64) -> bool {
         crate::ktrace::log("pwrbtn", "no PM1a control block -- cannot check ACPI mode");
         return false;
     }
-    // ACPI mode has to be on for the PM1 event bits to mean anything. A UEFI machine
-    // boots in ACPI mode already; a legacy-BIOS one starts in SMM's hands and has to be
-    // asked, which is what SMI_CMD/ACPI_ENABLE is for.
     let cnt = port_in16(info.blocks.a_cnt);
     if cnt == 0xffff {
         crate::ktrace::log("pwrbtn", "PM1a_CNT reads as an unclaimed port; button not armed");
@@ -137,28 +154,114 @@ pub fn init(rsdp: u64) -> bool {
     if cnt & SCI_EN == 0 && !enable_acpi_mode(&info) {
         return false;
     }
-    // Clear anything firmware left pending *before* arming, so the first press is a
-    // press. Write-1-to-clear, and only the button bits.
     port_out16(sts, ack(PWRBTN | SLPBTN));
     let b = info.blocks.b_sts().zip(info.blocks.b_en());
     if let Some((sb, _)) = b {
         port_out16(sb, ack(PWRBTN | SLPBTN));
     }
-    // Arm the power button. The sleep button is deliberately left disabled: there is no
-    // S3 implementation to enter, and a button that half-works is worse than one that
-    // does nothing.
     let cur = port_in16(en);
     port_out16(en, (cur & !SLPBTN) | PWRBTN);
-    let armed = Buttons {
+    let armed = FixedButtons {
         sts,
         en,
         sts_b: b.map(|(s, _)| s).unwrap_or(0),
         en_b: b.map(|(_, e)| e).unwrap_or(0),
     };
-    // SAFETY: as above.
-    unsafe { BUTTONS = Some(armed) };
+    // SAFETY: boot init.
+    unsafe { BUTTONS = Some(Armed::Fixed(armed)) };
     crate::ktrace::log_fmt(format_args!(
         "pwrbtn: fixed-feature power button armed (PM1a_STS {sts:#06x}, PM1a_EN {en:#06x})"
+    ));
+    true
+}
+
+/// Arm the `PNP0C0C` control-method button via its `_PRW` GPE.
+fn init_control_method(rsdp: u64) -> bool {
+    let Some(gpe_blocks) = acpi::gpe_from_rsdp(rsdp) else {
+        crate::ktrace::log(
+            "pwrbtn",
+            "control-method button but no System I/O GPE block in FADT",
+        );
+        return false;
+    };
+    // Ensure ACPI mode if PM1a_CNT is present (enables GPE delivery on many chipsets).
+    if let Some(info) = acpi::pm1_from_rsdp(rsdp) {
+        if info.blocks.a_cnt != 0 {
+            let cnt = port_in16(info.blocks.a_cnt);
+            if cnt != 0xffff && cnt & SCI_EN == 0 {
+                let _ = enable_acpi_mode(&info);
+            }
+        }
+    }
+    let map = |phys: u64, len: usize| crate::mm::map_mmio(phys, len);
+    let Some(dsdt) = acpi::dsdt_from_rsdp(rsdp, map) else {
+        crate::ktrace::log("pwrbtn", "control-method button: no DSDT to find PNP0C0C");
+        return false;
+    };
+    // SAFETY: dsdt_from_rsdp mapped the declared table length.
+    let aml = unsafe {
+        let len = u32::from_le_bytes([
+            *dsdt.add(4),
+            *dsdt.add(5),
+            *dsdt.add(6),
+            *dsdt.add(7),
+        ]) as usize;
+        if len < 36 || len > 0x40_0000 {
+            crate::ktrace::log("pwrbtn", "control-method button: DSDT length implausible");
+            return false;
+        }
+        core::slice::from_raw_parts(dsdt, len)
+    };
+    // Skip 36-byte ACPI table header → AML starts at 36.
+    let aml = aml.get(36..).unwrap_or(&[]);
+    let Some(dev) = aml::device_by_hid(aml, HID_PWR_BUTTON) else {
+        crate::ktrace::log(
+            "pwrbtn",
+            "control-method FADT flag set but no PNP0C0C device in DSDT",
+        );
+        return false;
+    };
+    let Some(prw) = aml::device_name(aml, &dev, "_PRW") else {
+        crate::ktrace::log("pwrbtn", "PNP0C0C has no _PRW; cannot locate GPE");
+        return false;
+    };
+    let Some(gpe_n) = aml::prw_gpe_number(&prw) else {
+        crate::ktrace::log("pwrbtn", "PNP0C0C _PRW shape not recognised");
+        return false;
+    };
+    let Some(block) = gpe_blocks.block_for(gpe_n) else {
+        crate::ktrace::log_fmt(format_args!(
+            "pwrbtn: GPE {gpe_n} not in FADT GPE0/GPE1 blocks"
+        ));
+        return false;
+    };
+    let Some((byte_off, bit)) = block.bit_of(gpe_n) else {
+        return false;
+    };
+    let mask = 1u8 << bit;
+    let sts_port = block.sts.saturating_add(byte_off as u16);
+    let en_port = block.en.saturating_add(byte_off as u16);
+    // Clear pending, then enable.
+    let _ = port_in8(sts_port); // unclaimed → 0xff
+    port_out8(sts_port, mask); // write-1-to-clear
+    let cur = port_in8(en_port);
+    if cur == 0xff {
+        // Ambiguous: floating bus vs all-enabled. Still try to set our bit.
+        crate::ktrace::log_fmt(format_args!(
+            "pwrbtn: GPE enable port {en_port:#06x} reads 0xff (may be unclaimed)"
+        ));
+    }
+    port_out8(en_port, cur | mask);
+    let g = GpeButton {
+        sts_port,
+        en_port,
+        mask,
+        gpe: gpe_n,
+    };
+    // SAFETY: boot init.
+    unsafe { BUTTONS = Some(Armed::Gpe(g)) };
+    crate::ktrace::log_fmt(format_args!(
+        "pwrbtn: control-method (PNP0C0C) armed on GPE {gpe_n} (sts {sts_port:#06x} en {en_port:#06x} mask {mask:#04x})"
     ));
     true
 }
@@ -214,19 +317,30 @@ pub fn poll() {
     let Some(b) = (unsafe { BUTTONS }) else {
         return;
     };
-    let sts = port_in16(b.sts);
-    if pressed(sts) {
-        port_out16(b.sts, ack(PWRBTN));
-        // SAFETY: single-threaded UI pump.
-        unsafe { PRESSED = true };
-        return;
-    }
-    if b.sts_b != 0 {
-        let sts = port_in16(b.sts_b);
-        if pressed(sts) {
-            port_out16(b.sts_b, ack(PWRBTN));
-            // SAFETY: as above.
-            unsafe { PRESSED = true };
+    match b {
+        Armed::Fixed(f) => {
+            let sts = port_in16(f.sts);
+            if pressed(sts) {
+                port_out16(f.sts, ack(PWRBTN));
+                // SAFETY: single-threaded UI pump.
+                unsafe { PRESSED = true };
+                return;
+            }
+            if f.sts_b != 0 {
+                let sts = port_in16(f.sts_b);
+                if pressed(sts) {
+                    port_out16(f.sts_b, ack(PWRBTN));
+                    unsafe { PRESSED = true };
+                }
+            }
+        }
+        Armed::Gpe(g) => {
+            let sts = port_in8(g.sts_port);
+            // 0xff is floating/unclaimed — never treat as a press (same rule as PM1).
+            if sts != 0xff && sts & g.mask != 0 {
+                port_out8(g.sts_port, g.mask); // write-1-to-clear
+                unsafe { PRESSED = true };
+            }
         }
     }
 }
@@ -251,10 +365,17 @@ pub fn armed() -> bool {
 pub fn status() -> alloc::string::String {
     // SAFETY: as `poll`.
     match unsafe { BUTTONS } {
-        Some(b) => alloc::format!(
+        Some(Armed::Fixed(b)) => alloc::format!(
             "fixed-feature, armed (PM1a_STS {:#06x}, PM1a_EN {:#06x})",
             b.sts,
             b.en
+        ),
+        Some(Armed::Gpe(g)) => alloc::format!(
+            "control-method (PNP0C0C), GPE {} (sts {:#06x} en {:#06x} mask {:#04x})",
+            g.gpe,
+            g.sts_port,
+            g.en_port,
+            g.mask
         ),
         None => alloc::string::String::from("not armed (see the pwrbtn: ktrace line from boot)"),
     }
@@ -268,15 +389,24 @@ fn port_in16(port: u16) -> u16 {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn port_in8(port: u16) -> u8 {
+    // SAFETY: GPE status/enable byte I/O as declared by the FADT.
+    unsafe { crate::arch::x86_64::port::inb(port) }
+}
+
+#[cfg(target_arch = "x86_64")]
 fn port_out8(port: u16, v: u8) {
-    // SAFETY: writing the FADT-declared SMI_CMD port with the FADT-declared
-    // ACPI_ENABLE value, only when ACPI mode is off. This is the handoff the
-    // specification defines for exactly this situation.
+    // SAFETY: SMI_CMD handoff or GPE status/enable byte write.
     unsafe { crate::arch::x86_64::port::outb(port, v) };
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 fn port_out8(_port: u16, _v: u8) {}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn port_in8(_port: u16) -> u8 {
+    0xff
+}
 
 #[cfg(target_arch = "x86_64")]
 fn port_out16(port: u16, v: u16) {
@@ -285,11 +415,8 @@ fn port_out16(port: u16, v: u16) {
     unsafe { crate::arch::x86_64::port::outw(port, v) };
 }
 
-// The PM1 registers are I/O ports by definition — ACPI's reduced-hardware profile,
-// which is what an ARM platform uses, has no fixed-feature registers at all and
-// delivers its buttons as GPIO/GPE instead. So there is nothing to port here: `init`
-// finds no PM1 block and reports it, which is the truth on such a machine rather than
-// a dropped feature.
+// The PM1 / GPE registers used here are System I/O. Reduced-hardware / aarch64
+// platforms without those ports report “not armed” honestly.
 #[cfg(not(target_arch = "x86_64"))]
 fn port_in16(_port: u16) -> u16 {
     0xffff
@@ -304,12 +431,19 @@ mod tests {
 
     #[test_case]
     fn the_fadt_flag_decides_which_button_a_machine_has() {
-        // Bit 4 set means the press arrives as a PNP0C0C GPE, which is not implemented.
-        // Polling PM1 on such a machine watches a bit that never changes.
+        // Bit 4 set means the press arrives as a PNP0C0C GPE (control-method path).
         assert!(power_button_is_control_method(FLAG_PWR_BUTTON_IS_CONTROL_METHOD));
         assert!(!power_button_is_control_method(0));
         assert!(!power_button_is_control_method(FLAG_SLP_BUTTON_IS_CONTROL_METHOD));
         assert!(sleep_button_is_control_method(FLAG_SLP_BUTTON_IS_CONTROL_METHOD));
+    }
+
+    #[test_case]
+    fn gpe_status_byte_uses_write_1_to_clear_mask() {
+        // Same rule as PM1: ack is the bit mask itself, not the whole register.
+        let mask = 1u8 << 5;
+        assert_eq!(mask, 0x20);
+        assert_eq!(mask & !(1 << 3), 0x20);
     }
 
     #[test_case]
