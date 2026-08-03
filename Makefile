@@ -68,6 +68,15 @@ VBOX_PORT ?= 0
 # little → "chitti-stub: model alloc failed -- booting without a model".
 VBOX_MEM  ?= 8192
 
+# SAMPLES: bundle the `/samples/` corpus (images, videos, audios, misc) into the
+# image, so a freshly booted machine can `/open /samples/images/fruits.jpg` with
+# no network and no disk. **On by default for `run` / `run-remote` / `run-uefi` /
+# `image` / `vbox`.** First use downloads ~10 MiB into the gitignored
+# `assets/samples/` (`cargo xtask sample-files`, cached afterwards) and embeds it
+# in the kernel; a failed download is a warning, never a failed build. Set
+# `SAMPLES=` (or 0/off) for an image without them.
+SAMPLES   ?= 1
+
 XTASK   := cargo xtask
 REL     := $(if $(filter 1 true yes,$(RELEASE)),--release,)
 FLAGS   := -arch $(ARCH) -model $(MODEL) $(REL)
@@ -79,6 +88,7 @@ FLAGS   := -arch $(ARCH) -model $(MODEL) $(REL)
 help:
 	@echo "ChittiOS — make targets (ARCH=$(ARCH) MODEL=$(MODEL) RELEASE=$(RELEASE))"
 	@echo "  BRIDGE=$(BRIDGE)  REMOTE_URL=$(REMOTE_URL)  REMOTE_MODEL=$(REMOTE_MODEL)"
+	@echo "  SAMPLES=$(SAMPLES) (bundle /samples files)"
 	@echo
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /'
 	@echo
@@ -151,6 +161,7 @@ run:
 	CHITTI_USB_BT='$(USB_BT)' \
 	CHITTI_USB_CAM='$(USB_CAM)' \
 	CHITTI_USB_HOST='$(USB_HOST)' \
+	CHITTI_SAMPLE_FILES='$(SAMPLES)' \
 	$(XTASK) run $(FLAGS)
 
 ## run-remote: like `run`, but seed `/model remote` at boot from REMOTE_RUN_URL
@@ -164,6 +175,7 @@ run-remote:
 	CHITTI_USB_BT='$(USB_BT)' \
 	CHITTI_USB_CAM='$(USB_CAM)' \
 	CHITTI_USB_HOST='$(USB_HOST)' \
+	CHITTI_SAMPLE_FILES='$(SAMPLES)' \
 	$(XTASK) run $(FLAGS)
 
 ## model: fetch the GGUF for MODEL into assets/ (required before run / run-uefi)
@@ -175,6 +187,13 @@ model:
 .PHONY: voice-assets
 voice-assets:
 	$(XTASK) voice-assets
+
+## sample-files: download the /samples corpus (images/videos/audios/misc) into
+##               assets/samples/ (~10 MiB, cached). `make run` / `make vbox` do
+##               this for you via SAMPLES=1; add --refresh to re-fetch.
+.PHONY: sample-files
+sample-files:
+	$(XTASK) sample-files
 
 ## wifi-assets: extract Apple FullMAC dongle firmware (miyake 4388) into
 ##              assets/wifi/brcm/ from this Mac's /usr/share/firmware/wifi.
@@ -188,12 +207,12 @@ wifi-assets:
 ##          needs assets GGUF for MODEL — `make model MODEL=e4b` first
 .PHONY: run-uefi
 run-uefi:
-	$(XTASK) run -arch aarch64 -model $(MODEL) $(REL) --uefi
+	CHITTI_SAMPLE_FILES='$(SAMPLES)' $(XTASK) run -arch aarch64 -model $(MODEL) $(REL) --uefi
 
 ## image: assemble a bootable image/ISO for ARCH
 .PHONY: image
 image:
-	$(XTASK) image $(FLAGS)
+	CHITTI_SAMPLE_FILES='$(SAMPLES)' $(XTASK) image $(FLAGS)
 
 ## m1n1: package the aarch64 kernel as a gzip'd arm64 Image and boot it on a
 ##       tethered Apple Silicon Mac over the m1n1 USB proxy. Configure via env:
@@ -215,7 +234,7 @@ m1n1:
 ##       line continuation and re-run later lines in a fresh shell with VM empty.
 .PHONY: vbox
 vbox:
-	CHITTI_RESOLUTION='$(VBOX_RES)' $(XTASK) image -arch aarch64 -model $(MODEL)
+	CHITTI_RESOLUTION='$(VBOX_RES)' CHITTI_SAMPLE_FILES='$(SAMPLES)' $(XTASK) image -arch aarch64 -model $(MODEL)
 	@command -v VBoxManage >/dev/null || { echo "VBoxManage not found — install VirtualBox"; exit 1; }
 	@set -e; \
 	VM='$(VBOX_VM)'; CTL='$(VBOX_CTL)'; PORT='$(VBOX_PORT)'; \
@@ -281,8 +300,11 @@ clean:
 # (http/https, ws/wss, hosted-model chat) against local host servers. Uses a
 # TLS-1.3-capable python for the https/wss scenarios (Homebrew's, if present).
 E2E_PY ?= $(shell [ -x /opt/homebrew/bin/python3 ] && echo /opt/homebrew/bin/python3 || echo python3)
+# The `samples` scenario needs the corpus embedded in the booted kernel, so the
+# suite builds with it exactly as `make run` does (SAMPLES= skips that scenario,
+# it does not fail it).
 e2e:
-	$(E2E_PY) tests/e2e/run.py -arch $(ARCH) -model $(MODEL)
+	CHITTI_SAMPLE_FILES='$(SAMPLES)' $(E2E_PY) tests/e2e/run.py -arch $(ARCH) -model $(MODEL)
 # Full e2e incl. local inference + voice (slow; needs assets/model.gguf + assets/voice/).
 e2e-full:
-	$(E2E_PY) tests/e2e/run.py -arch $(ARCH) -model $(MODEL) --slow
+	CHITTI_SAMPLE_FILES='$(SAMPLES)' $(E2E_PY) tests/e2e/run.py -arch $(ARCH) -model $(MODEL) --slow

@@ -760,6 +760,9 @@ fn main() {
         "m1n1" => cmd_m1n1(release),
         "test" => cmd_test(),
         "voice-assets" => cmd_voice_assets(),
+        // Fetch the `/samples/` corpus (images/videos/audios/misc). The build
+        // paths call this for you when CHITTI_SAMPLE_FILES is set.
+        "sample-files" | "samples" => cmd_sample_files(&rest),
         "wifi-assets" => cmd_wifi_assets(),
         "iwlwifi-assets" => cmd_iwlwifi_assets(),
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
@@ -787,8 +790,11 @@ fn main() {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <build|image|run|m1n1|test|ref-check|voice-assets|wifi-assets|usb-ids> [-arch x86_64|aarch64] \
+    "usage: cargo xtask <build|image|run|m1n1|test|ref-check|voice-assets|sample-files|wifi-assets|usb-ids> [-arch x86_64|aarch64] \
      [-model qwen3.5-0.8b|2b|4b|9b|gemma-4-e4b|bonsai-27b|bonsai-27b-ternary] [--release] [--uefi] [-server]\n\
+     sample-files [--refresh]: fetch the /samples corpus (images/videos/audios/misc) into \
+     assets/samples/; embedded into the image and seeded to /samples/ at boot. \
+     CHITTI_SAMPLE_FILES=1 (default in `make run` / `make vbox`) fetches + embeds it automatically.\n\
      wifi-assets: extract Apple FullMAC firmware from macOS into assets/wifi/ (for /wifi load).\n\
      iwlwifi-assets: fetch Intel WiFi firmware from linux-firmware into assets/wifi/iwl/.\n\
      usb-ids [bt|cam|all]: grep host USB for Bluetooth/camera vid:pid (see make usb-list / USB_BT=1).\n\
@@ -819,6 +825,9 @@ fn cmd_build(release: bool, arch: Arch, model: Model) -> Result<(), String> {
 /// the given extra cargo `features`, returning the path to the resulting ELF
 /// (`-M virt -kernel` bootable).
 fn build_kernel_aarch64(release: bool, features: &[&str]) -> Result<PathBuf, String> {
+    // See `build_kernel_with`: samples are embedded at compile time, so fetch
+    // before cargo runs. No-op without CHITTI_SAMPLE_FILES.
+    ensure_sample_files();
     let kdir = kernel_dir();
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&kdir).args(["build", "--target", "../targets/aarch64-chitti.json"]);
@@ -1578,6 +1587,120 @@ mod display_tests {
 }
 
 #[cfg(test)]
+mod sample_file_tests {
+    use super::*;
+
+    /// The corpus is embedded in the kernel image, so a duplicate destination
+    /// would silently shadow one entry (the later fetch overwrites the file) and
+    /// a category typo would put a file in a `/samples/` folder nothing lists.
+    #[test]
+    fn every_sample_has_a_unique_destination_in_a_known_category() {
+        let mut seen: Vec<String> = Vec::new();
+        for s in SAMPLE_FILES {
+            assert!(
+                matches!(s.category, "images" | "videos" | "audios" | "misc"),
+                "{}: unknown category {:?}",
+                s.name,
+                s.category
+            );
+            assert!(!s.note.is_empty(), "{}: no provenance note", s.name);
+            assert!(
+                s.url.starts_with("http://") || s.url.starts_with("https://"),
+                "{}: not an http(s) url: {}",
+                s.name,
+                s.url
+            );
+            let dst = format!("{}/{}", s.category, s.name);
+            assert!(!seen.contains(&dst), "duplicate sample destination {dst}");
+            seen.push(dst);
+        }
+    }
+
+    /// Every extension claimed openable must be one the OS can actually open —
+    /// otherwise a `.flac` sample creeps in as a file that only ever errors. A
+    /// format with no decoder yet is allowed, but only when it says so, and its
+    /// note must warn the human reading `/samples/README.md`.
+    #[test]
+    fn every_sample_extension_is_one_the_os_can_open() {
+        // Media hooks (agents/media + agents/pdf manifests) plus the text kinds
+        // that fall through to the editor.
+        const OPENABLE: &[&str] = &[
+            "png", "jpg", "jpeg", "wav", "mp3", "aac", "mp4", "mov", "mkv", "webm", "pdf", "txt",
+            "json", "csv", "html", "md",
+        ];
+        for s in SAMPLE_FILES {
+            let ext = s.name.rsplit('.').next().unwrap_or_default();
+            if s.openable {
+                assert!(OPENABLE.contains(&ext), "{}: /open cannot handle .{ext}", s.name);
+            } else {
+                assert!(
+                    !OPENABLE.contains(&ext),
+                    "{}: marked unopenable but .{ext} has a decoder",
+                    s.name
+                );
+                assert!(
+                    s.note.contains("NO decoder"),
+                    "{}: an unopenable sample must say so in its note",
+                    s.name
+                );
+            }
+        }
+    }
+
+    /// `make` passes `CHITTI_SAMPLE_FILES` through unconditionally, so an empty
+    /// value must read as "off" — the trap `CHITTI_RESOLUTION` hit. Explicitly
+    /// negative values are off too, so a wrapper can disable without unsetting.
+    #[test]
+    fn samples_requested_treats_empty_as_unset() {
+        // Serialised by construction: one test touches this variable.
+        let restore = env::var("CHITTI_SAMPLE_FILES").ok();
+        for (val, want) in [
+            ("", false),
+            ("0", false),
+            ("off", false),
+            ("no", false),
+            ("false", false),
+            ("1", true),
+            ("yes", true),
+            ("true", true),
+            (" 1 ", true),
+        ] {
+            env::set_var("CHITTI_SAMPLE_FILES", val);
+            assert_eq!(samples_requested(), want, "CHITTI_SAMPLE_FILES={val:?}");
+        }
+        env::remove_var("CHITTI_SAMPLE_FILES");
+        assert!(!samples_requested(), "unset must be off");
+        if let Some(v) = restore {
+            env::set_var("CHITTI_SAMPLE_FILES", v);
+        }
+    }
+
+    /// The README is the provenance record and is itself embedded, so it must
+    /// name every file and its source even when nothing has been fetched yet.
+    #[test]
+    fn readme_lists_every_sample_and_its_source() {
+        // Rendered against an empty "present" set: the absent case is the one a
+        // fresh clone produces.
+        let dir = samples_dir();
+        let existing = fs::read_to_string(dir.join("README.md")).ok();
+        write_samples_readme(&[]).expect("render readme");
+        let md = fs::read_to_string(dir.join("README.md")).expect("readme written");
+        for s in SAMPLE_FILES {
+            assert!(md.contains(s.name), "readme omits {}", s.name);
+            assert!(md.contains(s.url), "readme omits the source of {}", s.name);
+        }
+        assert!(md.contains("absent"), "sizes should report absent files as such");
+        // Leave the tree as it was found (a real fetch rewrites it with sizes).
+        match existing {
+            Some(prev) => fs::write(dir.join("README.md"), prev).unwrap(),
+            None => {
+                let _ = fs::remove_file(dir.join("README.md"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod usb_host_tests {
     use super::*;
 
@@ -1738,8 +1861,14 @@ fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> 
     let voice_bytes: u64 = voice.iter().map(|(_, p)| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
     let wifi = wifi_fw_assets();
     let wifi_bytes: u64 = wifi.iter().map(|(_, p)| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
+    // Count the payload the ESP must actually hold, kernel + stub included: the
+    // kernel is not a fixed size (a debug build, or an embedded `/samples`
+    // corpus, adds tens of MiB) and a fixed 64 MiB base silently overflows the
+    // volume instead of reporting anything.
+    let img_bytes: u64 = fs::metadata(kernel).map(|m| m.len()).unwrap_or(0)
+        + fs::metadata(stub).map(|m| m.len()).unwrap_or(0);
     let size_mb = 64
-        + ((model_bytes + voice_bytes + wifi_bytes) / (1024 * 1024))
+        + ((model_bytes + voice_bytes + wifi_bytes + img_bytes) / (1024 * 1024))
         + if model_bytes > 0 { 64 } else { 0 }
         + if wifi_bytes > 0 { 8 } else { 0 };
     // Recreate the image only when contents changed (cheap heuristic: sizes).
@@ -2283,6 +2412,11 @@ fn run_tee(cmd: &mut Command, log: Option<&Path>) -> Result<(), String> {
 
 /// As `build_kernel`, but with extra cargo features enabled.
 fn build_kernel_with(release: bool, features: &[&str]) -> Result<PathBuf, String> {
+    // Fetch the /samples corpus first when it was asked for: the kernel's build
+    // script embeds whatever is on disk *at compile time*, so a fetch afterwards
+    // would silently produce an image with no samples. No-op unless
+    // CHITTI_SAMPLE_FILES is set, so `test` / `ref-check` builds are unchanged.
+    ensure_sample_files();
     let kdir = kernel_dir();
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&kdir)
@@ -3209,6 +3343,328 @@ fn ensure_disk_image(want_bytes: u64, fresh: bool) -> Result<PathBuf, String> {
         eprintln!("disk image {} sized to {} MiB (sparse)", path.display(), want / (1024 * 1024));
     }
     Ok(path)
+}
+
+// --- sample files (`/samples/…` in the booted OS) --------------------------
+
+/// One bundled sample file: the `/samples/<category>/` folder it lands in, the
+/// name it takes there, where it is fetched from, and what it is for.
+///
+/// `category` is the folder under `assets/samples/` **and** under `/samples/`
+/// in the booted OS, so the two cannot drift: the kernel's build script walks
+/// the directory rather than carrying a second copy of this table.
+struct SampleFile {
+    category: &'static str,
+    name: &'static str,
+    url: &'static str,
+    /// Provenance + what it exercises. Printed by the fetch and written into
+    /// the in-OS `/samples/README.md`, because a sample whose origin and
+    /// licence are unrecorded is a sample nobody can ship an image with.
+    note: &'static str,
+    /// False for a format the OS has **no decoder for yet**. Such a file is
+    /// deliberately included (it is the next decoder's input), but it is marked
+    /// so the corpus cannot quietly accumulate files that only ever produce an
+    /// error — `every_sample_extension_is_one_the_os_can_open` holds for the
+    /// rest, and the README says which ones will not play.
+    openable: bool,
+}
+
+/// The sample corpus. Chosen to cover **every decoder `/open` can reach** —
+/// PNG (RGB / RGBA / grayscale), baseline JPEG, H.264+AAC mp4, PCM WAV, MP3
+/// (with an ID3v2 tag, which the decoder must skip), ADTS AAC, PDF — plus the
+/// text kinds that land in the editor with syntax highlighting.
+///
+/// Every URL is a **well-known, stable sample source** (upstream project test
+/// data, not a random file host), and every file is small on purpose: the whole
+/// corpus is embedded in the kernel image, so this is ~2 MiB, not ~200.
+const SAMPLE_FILES: &[SampleFile] = &[
+    // Images — the PNG + baseline-JPEG paths of `image/`.
+    SampleFile {
+        category: "images",
+        name: "fruits.jpg",
+        url: "https://raw.githubusercontent.com/opencv/opencv/4.x/samples/data/fruits.jpg",
+        note: "baseline JPEG, colour photo (OpenCV samples/data, Apache-2.0)",
+        openable: true,
+    },
+    SampleFile {
+        category: "images",
+        name: "baboon.jpg",
+        url: "https://raw.githubusercontent.com/opencv/opencv/4.x/samples/data/baboon.jpg",
+        note: "baseline JPEG, high-detail (OpenCV samples/data, Apache-2.0)",
+        openable: true,
+    },
+    SampleFile {
+        category: "images",
+        name: "sudoku.png",
+        url: "https://raw.githubusercontent.com/opencv/opencv/4.x/samples/data/sudoku.png",
+        note: "PNG photo, large IDAT (OpenCV samples/data, Apache-2.0)",
+        openable: true,
+    },
+    SampleFile {
+        category: "images",
+        name: "transparency.png",
+        url: "https://raw.githubusercontent.com/glennrp/libpng/libpng16/contrib/pngsuite/basn6a08.png",
+        note: "PNG RGBA 8-bit, alpha channel (libpng PNGSuite, basn6a08.png)",
+        openable: true,
+    },
+    SampleFile {
+        category: "images",
+        name: "grayscale.png",
+        url: "https://raw.githubusercontent.com/glennrp/libpng/libpng16/contrib/pngsuite/basn0g08.png",
+        note: "PNG grayscale 8-bit, colour type 0 (libpng PNGSuite, basn0g08.png)",
+        openable: true,
+    },
+    // Video — H.264 in mp4 with an AAC track, so `/open` exercises the demuxer,
+    // the decoder, the HUD, and the audio-locked clock at once.
+    SampleFile {
+        category: "videos",
+        name: "sample.mp4",
+        url: "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4",
+        note: "H.264 + AAC in mp4, 360p 10s (Big Buck Bunny, (c) Blender Foundation, CC-BY 3.0)",
+        openable: true,
+    },
+    // Audio — one file per decoder in `audio/`.
+    SampleFile {
+        category: "audios",
+        name: "sample.wav",
+        url: "https://raw.githubusercontent.com/rafaelreis-hotmart/Audio-Sample-files/master/sample.wav",
+        note: "PCM WAV, 16-bit stereo 44.1 kHz — the stereo-downmix + resample path (rafaelreis-hotmart/Audio-Sample-files)",
+        openable: true,
+    },
+    SampleFile {
+        category: "audios",
+        name: "sample.mp3",
+        url: "https://raw.githubusercontent.com/rafaelreis-hotmart/Audio-Sample-files/master/sample.mp3",
+        note: "MPEG Layer III, full-length track with an ID3v2 tag the decoder must skip — the largest sample here (~7 MiB) (rafaelreis-hotmart/Audio-Sample-files)",
+        openable: true,
+    },
+    SampleFile {
+        category: "audios",
+        name: "sample.aac",
+        url: "https://samples.ffmpeg.org/A-codecs/AAC/ct_faac-adts.aac",
+        note: "ADTS AAC-LC, 44.1 kHz stereo (FFmpeg sample archive)",
+        openable: true,
+    },
+    SampleFile {
+        category: "audios",
+        name: "sample.ogg",
+        url: "https://raw.githubusercontent.com/rafaelreis-hotmart/Audio-Sample-files/master/sample.ogg",
+        // Included on purpose and marked unopenable: there is no Vorbis decoder,
+        // and `.ogg` is not in the media agent's `/open` hook, so this one falls
+        // through to the **editor** (bytes, not audio) until one exists. Better a
+        // labelled gap than a sample that looks broken.
+        note: "Ogg Vorbis — NO decoder yet: `/open` puts it in the editor, it does not play (rafaelreis-hotmart/Audio-Sample-files)",
+        openable: false,
+    },
+    // Misc — the pdf agent, and the text kinds that open in the editor.
+    SampleFile {
+        category: "misc",
+        name: "minimal.pdf",
+        url: "https://raw.githubusercontent.com/py-pdf/sample-files/main/001-trivial/minimal-document.pdf",
+        note: "single-page PDF, classic xref table (py-pdf/sample-files)",
+        openable: true,
+    },
+    SampleFile {
+        category: "misc",
+        name: "document.pdf",
+        url: "https://raw.githubusercontent.com/py-pdf/sample-files/main/002-trivial-libre-office-writer/002-trivial-libre-office-writer.pdf",
+        note: "PDF with extractable text, LibreOffice-produced (py-pdf/sample-files)",
+        openable: true,
+    },
+    SampleFile {
+        category: "misc",
+        name: "rfc1951-deflate.txt",
+        url: "https://www.rfc-editor.org/rfc/rfc1951.txt",
+        note: "plain text — the DEFLATE spec `image/inflate.rs` implements (IETF RFC 1951)",
+        openable: true,
+    },
+    SampleFile {
+        category: "misc",
+        name: "cars.json",
+        url: "https://raw.githubusercontent.com/vega/vega-datasets/main/data/cars.json",
+        note: "JSON array, editor syntax highlighting (vega-datasets, BSD-3-Clause)",
+        openable: true,
+    },
+    SampleFile {
+        category: "misc",
+        name: "seattle-weather.csv",
+        url: "https://raw.githubusercontent.com/vega/vega-datasets/main/data/seattle-weather.csv",
+        note: "CSV table (vega-datasets, BSD-3-Clause)",
+        openable: true,
+    },
+    SampleFile {
+        category: "misc",
+        name: "first-web-page.html",
+        url: "http://info.cern.ch/hypertext/WWW/TheProject.html",
+        note: "HTML for the browser agent — the first web page (CERN)",
+        openable: true,
+    },
+];
+
+/// Where the corpus lives on the host. Gitignored: fetched, never committed —
+/// the same rule the voice and WiFi assets follow, and the reason this needed
+/// no redistribution decision.
+fn samples_dir() -> PathBuf {
+    repo_root().join("assets/samples")
+}
+
+/// Whether this build should embed the sample corpus, from `CHITTI_SAMPLE_FILES`.
+///
+/// **Empty means unset**: `make` passes the variable through unconditionally, so
+/// `CHITTI_SAMPLE_FILES=` must read as "off" rather than as a request (the same
+/// trap `CHITTI_RESOLUTION` hit). Anything explicitly negative is off too, so a
+/// wrapper can disable it without unsetting.
+fn samples_requested() -> bool {
+    match env::var("CHITTI_SAMPLE_FILES") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && !matches!(v.as_str(), "0" | "no" | "off" | "false")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Sample files already on disk, as `(category, name, bytes)`.
+fn samples_present() -> Vec<(&'static str, &'static str, u64)> {
+    let dir = samples_dir();
+    SAMPLE_FILES
+        .iter()
+        .filter_map(|s| {
+            let p = dir.join(s.category).join(s.name);
+            fs::metadata(&p).ok().map(|m| (s.category, s.name, m.len()))
+        })
+        .collect()
+}
+
+/// Called from the build paths: when `CHITTI_SAMPLE_FILES` asks for samples,
+/// fetch whatever is missing before the kernel's build script looks for them.
+///
+/// **Best-effort by design.** A failed download must not fail a build — the
+/// kernel is fully functional without samples, and the alternative is a machine
+/// with no network being unable to build. It says which files it did not get,
+/// and (loudly) when it got none at all, because "the samples are missing" and
+/// "the flag did nothing" are different facts.
+fn ensure_sample_files() {
+    if !samples_requested() {
+        return;
+    }
+    let missing = SAMPLE_FILES.len() - samples_present().len();
+    if missing > 0 {
+        eprintln!("samples: CHITTI_SAMPLE_FILES set — fetching {missing} missing file(s) into assets/samples/");
+        if let Err(e) = cmd_sample_files(&[]) {
+            eprintln!("samples: {e}");
+        }
+    }
+    let have = samples_present();
+    if have.is_empty() {
+        eprintln!(
+            "samples: WARNING — CHITTI_SAMPLE_FILES is set but assets/samples/ is empty; \
+             building WITHOUT /samples (run `cargo xtask sample-files` with network access)"
+        );
+    } else {
+        let bytes: u64 = have.iter().map(|(_, _, n)| *n).sum();
+        eprintln!(
+            "samples: embedding {} file(s), {} KiB → /samples/ in the booted OS",
+            have.len(),
+            bytes / 1024
+        );
+    }
+}
+
+/// `cargo xtask sample-files [--refresh]`: download the `/samples/` corpus into
+/// `assets/samples/{images,videos,audios,misc}/` (cached — skips files already
+/// present; `--refresh` re-fetches). `make run` / `make vbox` call this for you
+/// via `CHITTI_SAMPLE_FILES=1`.
+///
+/// The kernel embeds whatever is in that directory (see `kernel/build.rs`) and
+/// seeds it into the Synapse store at boot, so `/open /samples/images/fruits.jpg`
+/// works on a freshly booted machine with no network and no disk.
+fn cmd_sample_files(rest: &[String]) -> Result<(), String> {
+    let refresh = rest.iter().any(|a| a == "--refresh" || a == "-f");
+    let dir = samples_dir();
+    let mut failed: Vec<&str> = Vec::new();
+    let mut fetched = 0usize;
+    for s in SAMPLE_FILES {
+        let sub = dir.join(s.category);
+        fs::create_dir_all(&sub).map_err(|e| format!("mkdir {}: {e}", sub.display()))?;
+        let dst = sub.join(s.name);
+        if dst.exists() && !refresh {
+            continue;
+        }
+        // `-f` so an HTTP error is a failure rather than an error page saved as a
+        // JPEG (which would then be embedded and fail to decode in the OS).
+        let ok = Command::new("curl")
+            .args(["-fsSL", "--max-time", "120", "-o"])
+            .arg(&dst)
+            .arg(s.url)
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false);
+        if ok && fs::metadata(&dst).map(|m| m.len() > 0).unwrap_or(false) {
+            eprintln!("sample-files: fetched {}/{} ({})", s.category, s.name, s.note);
+            fetched += 1;
+        } else {
+            // Remove the empty/partial file curl may have left, or the next build
+            // embeds a truncated sample.
+            let _ = fs::remove_file(&dst);
+            eprintln!("sample-files: FAILED {}/{} <- {}", s.category, s.name, s.url);
+            failed.push(s.name);
+        }
+    }
+    let have = samples_present();
+    write_samples_readme(&have)?;
+    let bytes: u64 = have.iter().map(|(_, _, n)| *n).sum();
+    eprintln!(
+        "sample-files: {} of {} file(s) present ({} KiB) in {}{}",
+        have.len(),
+        SAMPLE_FILES.len(),
+        bytes / 1024,
+        dir.display(),
+        if fetched > 0 { format!(" — {fetched} newly fetched") } else { String::new() }
+    );
+    if !failed.is_empty() {
+        eprintln!("sample-files: could not fetch: {}", failed.join(", "));
+    }
+    if have.is_empty() {
+        return Err("sample-files: fetched nothing -- check network access".into());
+    }
+    Ok(())
+}
+
+/// Write `assets/samples/README.md` — the provenance record, which is itself
+/// embedded (files at the root of the corpus land at `/samples/README.md`), so
+/// the booted OS can say where its own samples came from.
+fn write_samples_readme(present: &[(&'static str, &'static str, u64)]) -> Result<(), String> {
+    let mut md = String::from(
+        "# ChittiOS sample files\n\n\
+         Fetched by `cargo xtask sample-files` (automatically by `make run` / `make vbox`,\n\
+         which set `CHITTI_SAMPLE_FILES=1`), embedded into the kernel image, and written to\n\
+         `/samples/` at boot. **Not committed to the repository** — `assets/samples/` is\n\
+         gitignored, so nothing here is redistributed by the source tree.\n\n\
+         Open one with `/open <path>`; text files land in the editor, media in a player tab.\n\n",
+    );
+    let mut cats: Vec<&str> = SAMPLE_FILES.iter().map(|s| s.category).collect();
+    cats.dedup();
+    for cat in cats {
+        md.push_str(&format!("## /samples/{cat}\n\n"));
+        for s in SAMPLE_FILES.iter().filter(|s| s.category == cat) {
+            let size = present.iter().find(|(c, n, _)| *c == s.category && *n == s.name).map(|(_, _, b)| *b);
+            let size = match size {
+                Some(b) => format!("{} KiB", b.div_ceil(1024)),
+                None => "absent".to_string(),
+            };
+            let flag = if s.openable { "" } else { " **(not playable yet)**" };
+            md.push_str(&format!("- `{}` — {size}{flag} — {}\n  <{}>\n", s.name, s.note, s.url));
+        }
+        md.push('\n');
+    }
+    md.push_str(
+        "Each file keeps the licence of its upstream source, listed above; they are sample\n\
+         data from the projects' own test corpora, used unmodified.\n",
+    );
+    let dir = samples_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    fs::write(dir.join("README.md"), md).map_err(|e| format!("writing samples README: {e}"))
 }
 
 /// `cargo xtask voice-assets`: download the /voice ONNX models into

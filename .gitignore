@@ -6,6 +6,14 @@ target/
 assets/voice/
 assets/wifi/
 
+# The `/samples/` corpus (images/videos/audios/misc) fetched by
+# `cargo xtask sample-files` and embedded into the image when
+# CHITTI_SAMPLE_FILES is set (default for `make run` / `make vbox`).
+# Fetched, never committed — the same rule as the voice/WiFi assets, so the
+# tree redistributes none of it; provenance + licences are recorded in the
+# generated assets/samples/README.md.
+assets/samples/
+
 __pycache__/
 # e2e test-generated TLS certs
 tests/e2e/certs/

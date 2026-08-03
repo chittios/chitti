@@ -19,6 +19,11 @@ fn run_os() -> ! {
     chitti_kernel::agent::system::install_all(chitti_kernel::arch::now_ms());
     // Bundled skills (L0 index only until `skill` is invoked).
     chitti_kernel::skills::bundled::install_all();
+    // The `/samples/` corpus, when this image was built with one
+    // (CHITTI_SAMPLE_FILES): openable images/video/audio/PDFs on a first boot
+    // with no network. Skips files that already exist, so an edited sample on an
+    // installed system is never reverted; a no-op when nothing is embedded.
+    chitti_kernel::samples::seed();
     // Optional allow/ask/deny tool patterns (creates a default file if missing).
     chitti_kernel::tools::permissions::ensure_default();
     chitti_kernel::tools::permissions::load();

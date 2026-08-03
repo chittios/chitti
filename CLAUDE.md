@@ -1629,7 +1629,45 @@ make e2e-full                          # + local inference (/infer,/perf,chat,/c
 cargo xtask build -arch x86_64|aarch64 # cross-build the kernel
 cargo xtask run   -arch x86_64|aarch64 # boot in QEMU (aarch64 = native HVF on Apple Silicon)
 cargo xtask image -arch x86_64|aarch64 # assemble a bootable image/ISO
+cargo xtask sample-files [--refresh]   # fetch the /samples corpus into assets/samples/
+                                       #   (the build paths do this for you — see below)
 ```
+
+**Every decoder needs a file, and a fresh boot has none** — which made the media
+stack (ring-3 PNG/JPEG, H.264+AAC, MP3/WAV/AAC, the PDF wasm, the editor's
+highlighters) awkward to even try without `/http -O` first. So a ~10 MiB corpus is
+embedded in the image and seeded into the store at boot — `/samples/images/`,
+`/samples/videos/`, `/samples/audios/`, `/samples/misc/`, plus a
+`/samples/README.md` recording each file's source and licence — and
+`/open /samples/images/fruits.jpg` works offline on the first boot
+(`kernel/src/samples.rs`, `SAMPLE_FILES` in `xtask/src/main.rs`,
+`kernel::build.rs`'s directory walk).
+
+Five rules it follows, each of which is a way this could have gone wrong:
+
+- **Opt-in, and default-on only for the dev flows.** `CHITTI_SAMPLE_FILES` gates
+  it; `make run|run-remote|run-uefi|image|vbox|e2e` set it (the `SAMPLES` knob),
+  and a plain `cargo xtask build` / CI / `cargo xtask test` embeds nothing, so
+  those kernels are byte-identical to before. **Empty reads as unset** — `make`
+  passes the variable through unconditionally, the same trap `CHITTI_RESOLUTION`
+  hit.
+- **Fetched, never committed** (`assets/samples/` is gitignored), so the tree
+  redistributes nothing and no licensing decision was needed — the same rule the
+  voice and WiFi assets follow. A failed download is a **warning, not a failed
+  build**: the OS is fully functional without samples, and the alternative is a
+  machine with no network being unable to build.
+- **One definition, walked not duplicated.** xtask owns the table (URL,
+  destination, provenance, and an `openable` flag); `kernel/build.rs` walks the
+  directory and generates the `include_bytes!` table. A second list in the kernel
+  would be a second thing to drift.
+- **Seeding never overwrites.** On an installed system the store is ext4-backed
+  and durable, so re-writing every boot would silently revert a sample the user
+  edited; `samples::seed_plan` writes only absent paths (and is unit-tested on
+  exactly that).
+- **A format with no decoder is labelled, not omitted.** `sample.ogg` is there as
+  the next decoder's input, marked unopenable, and the corpus test asserts every
+  *openable* entry has an extension `/open` really handles — so a `.flac` cannot
+  creep in as a file that only ever errors.
 
 ## Conventions
 

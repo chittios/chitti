@@ -78,6 +78,9 @@ pub mod kms;
 pub mod panes_layout;
 #[cfg(target_arch = "x86_64")]
 pub mod qemu;
+/// Bundled `/samples/` corpus: openable media/documents seeded into the store at
+/// boot (opt-in via `CHITTI_SAMPLE_FILES`; empty otherwise).
+pub mod samples;
 pub mod sched;
 pub mod security;
 pub mod serial;

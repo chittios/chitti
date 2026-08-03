@@ -61,6 +61,7 @@ A [`Makefile`](Makefile) wraps the common flows (`make help` lists them);
 | `make e2e` / `make e2e-full` | boot the real kernel + drive the shell over serial (`--slow` adds model/voice) |
 | `make verify` | x86 build + `test` + aarch64 build (the standing-rule gate) |
 | `make vbox` | rebuild the aarch64 image and reload it into a VirtualBox VM |
+| `make sample-files` | `cargo xtask sample-files` — fetch the `/samples/` corpus (see below) |
 | `make model` / `make fmt` / `make clean` | fetch the GGUF / format / clean |
 
 The underlying `cargo xtask` commands:
@@ -71,6 +72,7 @@ The underlying `cargo xtask` commands:
 | `cargo xtask run   -arch <arch> [--release] [-model <m>]` | Build the image and boot it in QEMU (serial to stdio + a graphical window). |
 | `cargo xtask image -arch <arch> [-model <m>]` | Assemble a bootable image (x86: hybrid BIOS/UEFI ISO; aarch64: a GPT disk image that boots standalone via UEFI). |
 | `cargo xtask test` | Run the in-kernel `custom_test_frameworks` suite under `qemu-system-x86_64`, headless, asserting via serial + `isa-debug-exit`. **Keep it green** (currently ~420 cases). |
+| `cargo xtask sample-files [--refresh]` | Download the `/samples/` corpus into `assets/samples/` (cached). Called automatically by the build paths when `CHITTI_SAMPLE_FILES` is set. |
 
 `-model qwen3.5-0.8b` (the default), `-model qwen3.5-2b|4b|9b`, **or any
 `.gguf` path** selects the bundled model and its heap-size tier. The memory
@@ -515,6 +517,48 @@ Modules are string-ABI (`export(args_ptr, args_len) -> i64 = (ptr<<32)|len`),
 no_std, and run under manifest-declared fuel + memory limits — see the Apps
 bullet in [CLAUDE.md](CLAUDE.md) for the ABI contract and gotchas. `pdf-wasm`
 also runs host-side parser tests: `cargo test` in its folder.
+
+## Sample files (`/samples/…`)
+
+Every interesting path in this OS needs a file — a PNG for the ring-3 decoder, an
+mp4 for the H.264 player, a WAV for the sound device, a PDF for the wasm digest —
+and a freshly booted machine has none, which makes the media stack awkward to try.
+So a small corpus is **embedded in the kernel image** and seeded into the Synapse
+store at boot:
+
+```text
+/samples/images/   fruits.jpg  baboon.jpg  sudoku.png  transparency.png  grayscale.png
+/samples/videos/   sample.mp4                 (H.264 + AAC, 360p)
+/samples/audios/   sample.wav  sample.mp3  sample.aac  jfk-speech.wav  sample.ogg*
+/samples/misc/     minimal.pdf  document.pdf  rfc1951-deflate.txt  cars.json
+                   seattle-weather.csv  first-web-page.html
+/samples/README.md provenance + licence of every file
+```
+
+`/open /samples/images/fruits.jpg` works on the first boot, offline. `*` — the Ogg
+Vorbis file has **no decoder yet**; it is there as the next decoder's input and
+opens in the editor, not the player.
+
+- **It is opt-in, and on by default only for the dev flows.** `make run`,
+  `make run-remote`, `make run-uefi`, `make image`, `make vbox` and `make e2e`
+  pass `CHITTI_SAMPLE_FILES=1` (the `SAMPLES` knob). A plain
+  `cargo xtask build` / CI / the unit suite embeds nothing, so their kernels are
+  unchanged.
+- **First use downloads ~10 MiB** into the gitignored `assets/samples/`
+  (`cargo xtask sample-files`, or `make sample-files`; cached afterwards,
+  `--refresh` re-fetches). The build paths fetch it for you. A failed download is
+  a **warning, never a failed build** — the OS is fully functional without samples.
+- **Fetched, never committed**, the same rule the voice/WiFi assets follow: the
+  repository redistributes none of it, and every file's source + licence is
+  recorded in the generated `assets/samples/README.md`, which is itself embedded
+  as `/samples/README.md`.
+- **Seeding never overwrites.** On an installed (ext4-backed) system the store is
+  durable, so a sample you edited stays edited across reboots; boot only writes
+  paths that are absent.
+- The corpus is defined in one place — the `SAMPLE_FILES` table in
+  `xtask/src/main.rs` (URL, destination, provenance) — and `kernel/build.rs`
+  **walks the directory** rather than carrying a second list. To add a sample,
+  add a row and re-run the fetch. Set `SAMPLES=` for an image without any.
 
 ## Voice (`/voice`) — audio + models
 

@@ -1433,6 +1433,76 @@ def _mux_h264_mp4(annexb, w, h, timescale=25, all_sync=False):
     return ftyp + moov + mdat, n
 
 
+def s_samples(g):
+    """The bundled `/samples/` corpus: real images / video / audio / PDF seeded
+    into the store at boot, openable with no network and no disk.
+
+    Skips (does not fail) when the kernel was built without
+    `CHITTI_SAMPLE_FILES` — the corpus is opt-in and gitignored, so a fresh
+    clone has none. `make e2e` builds with it by default (SAMPLES=1).
+
+    Asserts the seeding *and* one real decode per media kind, because the
+    interesting failure is not "the file is missing" — it is a file embedded
+    truncated, which lists fine and then fails to decode."""
+    m = g.mark()
+    g.send("/ls /samples")
+    if not g.wait_for("ls> /samples", 15, m):
+        return False, "/ls /samples produced nothing"
+    out = g.text()[m:]
+    if "no such file or directory" in out:
+        return None, "skipped (kernel built without CHITTI_SAMPLE_FILES)"
+    for cat in ("images/", "videos/", "audios/", "misc/"):
+        if cat not in out:
+            return False, f"/samples is missing the {cat} category"
+
+    # Each category lists something.
+    for cat, expect in (("images", ".png"), ("videos", ".mp4"), ("audios", ".wav"), ("misc", ".pdf")):
+        m = g.mark()
+        g.send(f"/ls /samples/{cat}")
+        if not g.wait_for(f"ls> /samples/{cat}", 12, m):
+            return False, f"/ls /samples/{cat} failed"
+        if expect not in g.text()[m:]:
+            return False, f"/samples/{cat} has no {expect} file"
+
+    # A PNG decode (in ring 3) proves the bytes survived the embed intact.
+    m = g.mark()
+    g.send("/open /samples/images/transparency.png")
+    if not g.wait_for("32x32 px", 20, m):
+        return False, "sample PNG did not decode (embedded truncated?)"
+    # A JPEG too — a different decoder over a much larger file.
+    m = g.mark()
+    g.send("/open /samples/images/fruits.jpg")
+    if not g.wait_for("open> /samples/images/fruits.jpg", 25, m):
+        return False, "sample JPEG did not decode"
+    # WAV: parsed and handed to the sound device (headless guests report the
+    # decode either way; "playing" needs a device, so accept either report).
+    m = g.mark()
+    g.send("/open /samples/audios/sample.wav")
+    if not (g.wait_for("open> playing", 25, m) or g.wait_for("open> /samples/audios/sample.wav", 5, m)):
+        return False, "sample WAV was not opened"
+    g.send_raw(b"\x03")
+    g.wait_quiet(0.5, 15)
+    # Video: probe + streaming decode of the H.264/AAC clip.
+    m = g.mark()
+    g.send("/open /samples/videos/sample.mp4")
+    if not g.wait_for("frame(s)", 60, m):
+        return False, "sample mp4 did not probe/decode"
+    g.send_raw(b"\x03")
+    g.wait_quiet(0.5, 15)
+    # PDF: the pdf agent's wasm digest.
+    m = g.mark()
+    g.send("/open /samples/misc/minimal.pdf")
+    if not g.wait_for("page(s)", 30, m):
+        return False, "sample PDF was not digested"
+    # The corpus records its own provenance, which is what makes shipping an
+    # image with it defensible.
+    m = g.mark()
+    g.send("/cat /samples/README.md")
+    if not g.wait_for("ChittiOS sample files", 15, m):
+        return False, "/samples/README.md (provenance record) missing"
+    return True, "/samples seeded: png+jpeg decoded, wav opened, mp4 decoded, pdf digested, README present"
+
+
 def s_open_video(_g):
     """Integration test of the whole video demux path on the real kernel: encode
     a tiny baseline H.264 clip with x264, mux it into mp4 (stdlib), mount it, and
@@ -2213,6 +2283,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("session", s_session),
     ("open_media", s_open_media),
     ("open_video", s_open_video),
+    ("samples", s_samples),
     ("tabs", s_tabs),
     ("panes", s_panes),
     ("pane_grid", s_pane_grid),
