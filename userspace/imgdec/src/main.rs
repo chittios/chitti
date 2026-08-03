@@ -65,6 +65,8 @@ mod block {
     /// Written by the tenant in the **heap-output** mode: the decoded image's size.
     pub const IMG_W: usize = 104;
     pub const IMG_H: usize = 112;
+    /// Written by the tenant **before it decodes**: the arena this input looks like it needs.
+    pub const HEAP_WANT: usize = 120;
 }
 
 /// ABI entry numbers, from `synapse::abi::Entry`.
@@ -149,6 +151,107 @@ fn decode_image(input: &[u8]) -> Result<Image, u64> {
     }
 }
 
+/// How much arena this input looks like it will need, **from its header alone**.
+///
+/// Reported to the loader before any decoding, and this is the difference between a large photo
+/// decoding and being refused. Without it the loader can only *guess* — it doubles the arena and
+/// re-enters, so a 32 MP image needs six full attempts to walk from 8 MiB up, each one doing real
+/// work before running out; with it there is one retry at the right size. Nothing here decides
+/// anything, so a wrong answer costs a retry, never a wrong picture: too small and the loader
+/// falls back to doubling, too large and it is capped by the ceiling and the free-frame guard.
+///
+/// **This is the header parse that belongs in ring 3.** The loader could have read these same
+/// bytes itself and skipped the round trip — and that is exactly the mistake: it would put an
+/// attacker-shaped parse back in the kernel to save a page-table walk. Every access below is
+/// bounds-checked and returns `None` rather than assuming, because an estimate that panicked
+/// would reject a file the decoder could have read.
+fn arena_estimate(input: &[u8]) -> usize {
+    const SLACK: usize = 1 << 20;
+    // A doubling `Vec` can hold up to twice what it needs, and both of the big buffers below are
+    // grown that way, so the factor is real rather than defensive.
+    let two = |n: usize| n.saturating_mul(2);
+    if input.starts_with(PNG_SIG) {
+        if let Some((w, h, channels, depth)) = png_geometry(input) {
+            let stride = w.saturating_mul(channels).saturating_mul(depth).div_ceil(8);
+            let raw = h.saturating_mul(stride.saturating_add(1));
+            return two(input.len())
+                .saturating_add(two(raw))
+                .saturating_add(w.saturating_mul(h).saturating_mul(4))
+                .saturating_add(SLACK);
+        }
+    } else if input.starts_with(JPEG_SOI) {
+        if let Some((w, h)) = jpeg_geometry(input) {
+            // Component planes (~1.5x the pixels at 4:2:0, padded up to whole MCUs) plus the
+            // 4-byte-per-pixel output; 8 covers both with room for the padding.
+            return two(input.len())
+                .saturating_add(w.saturating_mul(h).saturating_mul(8))
+                .saturating_add(SLACK);
+        }
+    }
+    // No idea: 0 means "no estimate", and the loader goes back to doubling.
+    0
+}
+
+/// A PNG's geometry from IHDR, which the format requires to be the first chunk.
+fn png_geometry(b: &[u8]) -> Option<(usize, usize, usize, usize)> {
+    if b.get(12..16)? != b"IHDR" {
+        return None;
+    }
+    let be = |o: usize| -> Option<usize> {
+        let s = b.get(o..o + 4)?;
+        Some(u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as usize)
+    };
+    let (w, h) = (be(16)?, be(20)?);
+    let depth = *b.get(24)? as usize;
+    let channels = match *b.get(25)? {
+        0 | 3 => 1,
+        2 => 3,
+        4 => 2,
+        6 => 4,
+        _ => return None,
+    };
+    // The same bounds `png::decode` enforces, so an absurd header produces no estimate rather
+    // than an absurd one.
+    if w == 0 || h == 0 || w > 16384 || h > 16384 || !matches!(depth, 1 | 2 | 4 | 8 | 16) {
+        return None;
+    }
+    Some((w, h, channels, depth))
+}
+
+/// A baseline JPEG's geometry from SOF0/SOF1, found by walking the marker segments.
+fn jpeg_geometry(b: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 2usize;
+    while i + 4 <= b.len() {
+        if *b.get(i)? != 0xff {
+            i += 1;
+            continue;
+        }
+        let m = *b.get(i + 1)?;
+        match m {
+            // Fill byte, or a marker that carries no length.
+            0xff => {
+                i += 1;
+                continue;
+            }
+            0x01 | 0xd8 | 0xd0..=0xd7 => {
+                i += 2;
+                continue;
+            }
+            // The scan, or the end: past here there is no frame header to find.
+            0xda | 0xd9 => return None,
+            0xc0 | 0xc1 => {
+                let h = ((*b.get(i + 5)? as usize) << 8) | *b.get(i + 6)? as usize;
+                let w = ((*b.get(i + 7)? as usize) << 8) | *b.get(i + 8)? as usize;
+                return if w == 0 || h == 0 { None } else { Some((w, h)) };
+            }
+            _ => {}
+        }
+        let len = ((*b.get(i + 2)? as usize) << 8) | *b.get(i + 3)? as usize;
+        i += 2 + len.max(2);
+    }
+    None
+}
+
 /// Bump arena over the **loader-mapped heap** named in the startup block.
 ///
 /// `png.rs` allocates — the inflated scanlines, the pixel buffer — so the tenant needs a heap.
@@ -180,9 +283,10 @@ static mut BLOCK: *mut u8 = core::ptr::null_mut();
 struct Bump;
 
 // SAFETY: single-threaded tenant, one decode at a time. `alloc` hands out disjoint aligned
-// slices from the loader's heap and never reuses them, so no two live allocations overlap.
-// Every returned pointer is inside `[HEAP_BASE, HEAP_BASE + HEAP_LEN)`, which the loader
-// mapped read-write; an allocation that would leave it returns null instead of wrapping.
+// slices from the loader's heap; the only reuse is of the **top** allocation, which by
+// definition nothing later overlaps. Every returned pointer is inside
+// `[HEAP_BASE, HEAP_BASE + HEAP_LEN)`, which the loader mapped read-write; an allocation that
+// would leave it returns null instead of wrapping.
 unsafe impl core::alloc::GlobalAlloc for Bump {
     unsafe fn alloc(&self, l: core::alloc::Layout) -> *mut u8 {
         unsafe {
@@ -190,8 +294,8 @@ unsafe impl core::alloc::GlobalAlloc for Bump {
             let start = (base + CURSOR).next_multiple_of(l.align().max(1));
             let end = start.saturating_sub(base).saturating_add(l.size());
             if base == 0 || end > HEAP_LEN {
-                // Out of arena. Rust turns a null here into `handle_alloc_error` -> panic,
-                // and the flag is what tells the panic handler which status to report.
+                // Out of arena. Rust turns a null here into `handle_alloc_error`, and the flag is
+                // what tells the handler which status to report.
                 OOM = true;
                 return core::ptr::null_mut();
             }
@@ -199,7 +303,54 @@ unsafe impl core::alloc::GlobalAlloc for Bump {
             start as *mut u8
         }
     }
-    unsafe fn dealloc(&self, _p: *mut u8, _l: core::alloc::Layout) {}
+
+    /// Free **only the top allocation**, by rolling the cursor back.
+    ///
+    /// The cheapest possible reclaim, and it happens to be the one a decoder needs: scratch is
+    /// allocated and dropped in LIFO order (a scanline buffer, an intermediate `Vec` that is
+    /// consumed and released), so rolling back turns a permanent leak into free reuse. Without
+    /// it a bump arena's size is the *sum* of every temporary a decode ever made rather than its
+    /// high-water mark — which for a large image was several times the picture.
+    unsafe fn dealloc(&self, p: *mut u8, l: core::alloc::Layout) {
+        unsafe {
+            if HEAP_BASE != 0 && (p as usize).saturating_add(l.size()) == HEAP_BASE + CURSOR {
+                CURSOR = (p as usize) - HEAP_BASE;
+            }
+        }
+    }
+
+    /// Grow or shrink **in place** when the block is on top of the arena.
+    ///
+    /// This is the other half, and the more valuable one: `Vec` growth doubles, and the default
+    /// `realloc` (allocate, copy, free) leaves every intermediate size stranded — a `Vec` grown
+    /// to N bytes by doubling costs ~2N of arena and copies N bytes for nothing. The buffers that
+    /// grow this way are the largest a decoder has (the accumulated compressed data, the inflate
+    /// output), so in-place growth is most of the difference between an arena sized like the
+    /// image and an arena sized like several copies of it.
+    unsafe fn realloc(&self, p: *mut u8, l: core::alloc::Layout, new_size: usize) -> *mut u8 {
+        unsafe {
+            let top = HEAP_BASE != 0 && (p as usize).saturating_add(l.size()) == HEAP_BASE + CURSOR;
+            if top {
+                let end = (p as usize).saturating_sub(HEAP_BASE).saturating_add(new_size);
+                if end <= HEAP_LEN {
+                    CURSOR = end;
+                    return p;
+                }
+                // A top block that cannot grow will not fit anywhere else either — the arena
+                // ends here. Report it rather than falling through to a copy that must fail.
+                OOM = true;
+                return core::ptr::null_mut();
+            }
+            // Not on top: the ordinary allocate-copy-free, with the copy bounded by the smaller
+            // of the two sizes as `GlobalAlloc` requires.
+            let new = self.alloc(core::alloc::Layout::from_size_align_unchecked(new_size, l.align()));
+            if !new.is_null() {
+                core::ptr::copy_nonoverlapping(p, new, l.size().min(new_size));
+                self.dealloc(p, l);
+            }
+            new
+        }
+    }
 }
 
 #[global_allocator]
@@ -293,6 +444,11 @@ pub extern "C" fn _start(blk: *mut u8) -> ! {
 
         let input =
             core::slice::from_raw_parts(get(blk, block::INPUT_PTR) as *const u8, get(blk, block::INPUT_LEN) as usize);
+        // Told to the loader **before** decoding, so it is already there if the decode runs out.
+        // Computing it in the failure path instead would mean parsing the header while unwinding
+        // from an allocation failure, which is the worst place to do anything.
+        put(blk, block::HEAP_WANT, arena_estimate(input) as u64);
+
         let out_cap = get(blk, block::OUTPUT_CAP) as usize;
         if out_cap == 0 {
             // **Heap-output mode.** No output buffer was mapped, so the answer stays where it

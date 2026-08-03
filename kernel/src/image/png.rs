@@ -12,7 +12,10 @@ use alloc::vec::Vec;
 
 /// CRC-32 (IEEE, reflected) over `data` — PNG chunk checksums. Bitwise (no
 /// table): chunks are small and this keeps the module self-contained.
-fn crc32(data: &[u8]) -> u32 {
+/// `pub(crate)` so tests elsewhere can build a valid PNG: the ring-3 differential needs images
+/// larger than any sensible checked-in fixture, and a chunk with a wrong CRC is rejected before
+/// the interesting code runs.
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
     for &b in data {
         crc ^= b as u32;
@@ -120,7 +123,11 @@ pub fn decode(bytes: &[u8]) -> Result<Image, &'static str> {
         return Err("png: palette image without PLTE");
     }
 
-    let raw = zlib_decompress(&idat)?;
+    let mut raw = zlib_decompress(&idat)?;
+    // The compressed bytes are dead the moment they are inflated, and for a large photo they are
+    // tens of MB. Dropping them here rather than at the end of the function is what lets the
+    // *peak* be the inflated data plus the pixels, instead of all three at once.
+    drop(idat);
     let bits_per_px = depth as usize * channels;
     let stride = (w * bits_per_px).div_ceil(8);
     if raw.len() < h * (stride + 1) {
@@ -129,19 +136,31 @@ pub fn decode(bytes: &[u8]) -> Result<Image, &'static str> {
     // Filtering works on byte units of one pixel (min 1).
     let fbpp = bits_per_px.div_ceil(8).max(1);
 
-    // Unfilter in place, row by row (each row: 1 filter byte + stride bytes).
-    let mut rows: Vec<u8> = Vec::with_capacity(h * stride);
+    // **Unfilter in place, inside `raw`.** A PNG filter references only the bytes to its left and
+    // the row above — both already unfiltered once the walk is row-major — so the second buffer
+    // this used to build is not needed at all.
+    //
+    // It used to allocate a `rows` of the whole image *plus a fresh `cur` per scanline*, which is
+    // one allocation per row and a full extra copy of the pixel data. That is heap churn the
+    // standing performance rule warns about, and in the ring-3 tenant it was worse than churn:
+    // the arena there is a bump allocator, so a per-row allocation is never reclaimed and the
+    // per-row buffers alone accounted for as much of the arena as the image itself — which is
+    // what put a 32 MP PNG over the ceiling and made it refused rather than decoded.
+    //
+    // Every access is by index rather than by slice: the write target and the three references
+    // live in the same buffer, which no pair of slices can express.
     for y in 0..h {
-        let src = &raw[y * (stride + 1)..(y + 1) * (stride + 1)];
-        let filter = src[0];
-        let line = &src[1..];
-        let prev_start = rows.len().wrapping_sub(stride);
-        let mut cur: Vec<u8> = Vec::with_capacity(stride);
+        let base = y * (stride + 1);
+        let filter = raw[base];
+        // Where the previous row's *data* starts — one row back, past its filter byte. Unused
+        // (and deliberately not computed) on the first row, which has no row above it.
+        let prev = base.wrapping_sub(stride);
         for x in 0..stride {
-            let rawb = line[x] as i32;
-            let a = if x >= fbpp { cur[x - fbpp] as i32 } else { 0 };
-            let b = if y > 0 { rows[prev_start + x] as i32 } else { 0 };
-            let c = if y > 0 && x >= fbpp { rows[prev_start + x - fbpp] as i32 } else { 0 };
+            let i = base + 1 + x;
+            let rawb = raw[i] as i32;
+            let a = if x >= fbpp { raw[i - fbpp] as i32 } else { 0 };
+            let b = if y > 0 { raw[prev + x] as i32 } else { 0 };
+            let c = if y > 0 && x >= fbpp { raw[prev + x - fbpp] as i32 } else { 0 };
             let v = match filter {
                 0 => rawb,
                 1 => rawb + a,
@@ -150,9 +169,8 @@ pub fn decode(bytes: &[u8]) -> Result<Image, &'static str> {
                 4 => rawb + paeth(a, b, c) as i32,
                 _ => return Err("png: bad filter type"),
             };
-            cur.push(v as u8);
+            raw[i] = v as u8;
         }
-        rows.extend_from_slice(&cur);
     }
 
     // Expand unfiltered scanlines to 0xRRGGBB.
@@ -181,7 +199,8 @@ pub fn decode(bytes: &[u8]) -> Result<Image, &'static str> {
     };
     let bytes_per_ch = if depth == 16 { 2 } else { 1 };
     for y in 0..h {
-        let row = &rows[y * stride..(y + 1) * stride];
+        // The unfiltered scanline, in place: past this row's filter byte.
+        let row = &raw[y * (stride + 1) + 1..y * (stride + 1) + 1 + stride];
         for x in 0..w {
             let px = match color {
                 0 => {

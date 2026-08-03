@@ -157,9 +157,37 @@ Five things that path pins down, each of which cost a debugging cycle:
   The alternative is parsing the header in ring 0, which is the thing being undone.
   Symmetrically there is **no output buffer**: the tenant leaves the pixels in its arena and
   reports where, and every number it reports is bounds-checked against the frames the loader
-  owns rather than trusted.
+  owns rather than trusted. The tenant also parses the header *itself* and reports the arena it
+  expects to need (`HEAP_WANT`), so an oversized image costs **one** retry instead of a
+  doubling search — six full attempts, each doing real work before running out, is what made a
+  large photo effectively undecodable.
+- **A bump allocator's size is the sum of everything it ever allocated, unless it reclaims.**
+  Freeing the *top* allocation (roll the cursor back) and growing the top block *in place* are
+  four lines each, and together they turn that sum back into a high-water mark: a `Vec` grown
+  by doubling stops stranding every intermediate size, and per-row scratch stops accumulating.
+  Before them a 16x16 PNG needed more than a 4 KiB arena; after them it fits in one page, which
+  is what `a_16x16_png_decodes_inside_a_single_page_of_arena` pins. The other half of that fix
+  is in `image/png.rs` itself — it unfilters **in place** rather than building a second
+  whole-image buffer plus a `Vec` per scanline, which is also one allocation per row of heap
+  churn removed from the kernel path (performance trap #3).
 - **No in-kernel fallback**, per the rule above: a decode that cannot be sandboxed is an
   error, not a quiet retry in ring 0.
+
+**The next decoders need a chunked, stateful tenant, and that is a design act rather than a
+port.** H.264, AAC and ONNX are all on the list, and the blocker they share is not the mount:
+it is that **Ctrl+C and `upkeep()` are standing rules** and a tenant has no device access by
+construction. A whole-file AAC decode takes seconds — the in-kernel one pumps `upkeep()` every
+32 frames for exactly that reason — so doing it in one crossing would freeze the clock, mouse
+and net stack and ignore Ctrl+C. The shape that works is the tenant decoding a **bounded number
+of frames per entry** while the kernel pumps and polls between entries, which means a command
+word in the startup block, decoder state that survives an entry, and an arena that is *not*
+reset per call (the opposite of the image tenant's one line). H.264 has that plus a second
+problem: **tenants are pinned to the boot CPU** (no TLB shootdown), while 1080p30 was reached
+partly by loaning the decoder to an SMP worker — so a naive port trades a measured 30 fps for
+~12. ONNX is last for the reason it always was: weights live in DMA frames and its ops fan out
+across the fleet. Note what is *not* a blocker — the H.264 decoder core is pure (`video/mt.rs`
+is the only SMP dependency and it covers YUV→RGB and letterbox scale, i.e. presentation, not
+parsing), so the natural split is **bitstream→YUV in ring 3, YUV→RGB in ring 0**.
 
 wasm was measured and rejected for this: `tools/pngbench` (a permanent host tool, the
 `*diff` pattern) put wasmi at **47-67x native** on a 1.3 MP PNG — and "small images via

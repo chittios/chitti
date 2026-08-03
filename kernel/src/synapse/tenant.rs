@@ -666,26 +666,25 @@ mod tests {
     }
 
     #[test_case]
-    fn a_small_arena_is_reported_as_out_of_memory_and_growing_it_fixes_it() {
-        // The arena-sizing protocol, which exists because **how much heap an image needs is a
-        // number inside the file**. The loader starts small and the tenant says when that was
-        // not enough; the alternative is parsing the header in the kernel, which is the thing
-        // being undone.
+    fn a_16x16_png_decodes_inside_a_single_page_of_arena() {
+        // **A canary on the tenant's allocator, and it earned its place by failing.** This test
+        // used to assert the *opposite* — that one page was too small for a 16x16 image — and it
+        // was right, because the bump arena never reclaimed anything: every scratch buffer and
+        // every intermediate size of a growing `Vec` stayed spent, so a 2.5 KB decode wanted more
+        // than 4 KB of arena. With LIFO reclaim and in-place growth, the arena's size is the
+        // decode's high-water mark instead of the *sum* of everything it ever allocated, and the
+        // same fixture now fits in one page.
         //
-        // It doubles as the sharpest test of the cursor reset: the successful decode below runs
-        // in the *same* address space as the failed one, so a tenant that did not reset its bump
-        // cursor would still be out of memory with sixty times the arena.
+        // If this ever fails, the question is what started leaking — not what number to raise.
+        // The arena-sizing protocol for images that genuinely do not fit is tested by
+        // `an_image_larger_than_the_arena_grows_it_once_and_decodes`.
         let mut t = ImageTenant::new(0x1000).expect("the decode tenant must load");
-        // Mapped to its dimensions rather than kept whole: a decoded `Image` is millions of
-        // pixels and these asserts print their subject on failure.
-        let got = t.decode(TINY_PNG).map(|i| (i.w, i.h));
-        assert!(
-            matches!(got, Err(LoadError::Declined { status }) if status == block::STATUS_OUT_OF_MEMORY),
-            "a one-page arena must be reported as out of memory, got {got:?}"
-        );
-        assert!(t.grow_heap(1 << 20), "the arena must grow");
-        let img = t.decode(TINY_PNG).expect("with a real arena the same file must decode");
+        let img = t.decode(TINY_PNG).expect("a 16x16 PNG must decode in a single page of arena");
         assert_same_as_kernel(&img, TINY_PNG);
+        // Twice, because reclaim is what makes the *second* decode fit too: a cursor that only
+        // ever moved forward would be out of arena here even though the first decode succeeded.
+        let again = t.decode(TINY_PNG).expect("and again in the same page");
+        assert_same_as_kernel(&again, TINY_PNG);
     }
 
     #[test_case]
@@ -735,7 +734,7 @@ mod tests {
         // `/open`'s path. Two claims: the tenant is reused across calls (the build count stops
         // moving), and the flag really does select between two implementations that agree —
         // which is what makes the in-kernel decoder deletable later rather than merely unused.
-        let (_, builds_before) = decode_stats();
+        let (_, builds_before, _) = decode_stats();
         let first = decode_image(TINY_PNG).expect("the shared tenant must decode");
         assert_same_as_kernel(&first, TINY_PNG);
         let builds_after = decode_stats().1;
@@ -752,6 +751,98 @@ mod tests {
         let in_kernel = decode_image_for_view(TINY_JPG).expect("in-kernel");
         set_sandboxed_decode(true);
         assert!(sandboxed.pixels == in_kernel.pixels, "the flag must not change the pixels");
+    }
+
+    /// A synthetic `w`x`h` RGB PNG, patterned so the filters and Huffman coding do real work.
+    ///
+    /// Built here rather than checked in because the interesting sizes are megabytes: the point is
+    /// an image whose arena is *larger than the loader's default guess*, which is the case the
+    /// estimate protocol exists for and the one a 673-byte fixture cannot reach.
+    fn synth_png(w: usize, h: usize) -> alloc::vec::Vec<u8> {
+        let mut raw = alloc::vec::Vec::with_capacity(h * (w * 3 + 1));
+        for y in 0..h {
+            raw.push(0u8); // filter: none, so the bytes below are the pixels
+            for x in 0..w {
+                raw.push((x ^ y) as u8);
+                raw.push((x.wrapping_mul(3) ^ y) as u8);
+                raw.push((x + y) as u8);
+            }
+        }
+        // Stored-only DEFLATE inside a zlib wrapper: no compressor needed in the kernel, and it
+        // makes the input length (and so the arena) proportional to the image.
+        let mut z = alloc::vec![0x78u8, 0x01];
+        let mut off = 0;
+        while off < raw.len() {
+            let n = (raw.len() - off).min(0xffff);
+            z.push(if off + n == raw.len() { 1 } else { 0 });
+            z.extend_from_slice(&(n as u16).to_le_bytes());
+            z.extend_from_slice(&(!(n as u16)).to_le_bytes());
+            z.extend_from_slice(&raw[off..off + n]);
+            off += n;
+        }
+        let (mut a, mut b) = (1u32, 0u32);
+        for &v in &raw {
+            a = (a + v as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        z.extend_from_slice(&((b << 16) | a).to_be_bytes());
+
+        let mut ihdr = alloc::vec::Vec::new();
+        ihdr.extend_from_slice(&(w as u32).to_be_bytes());
+        ihdr.extend_from_slice(&(h as u32).to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit, truecolour, no interlace
+        let chunk = |typ: &[u8], data: &[u8]| {
+            let mut c = alloc::vec::Vec::with_capacity(data.len() + 12);
+            c.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            c.extend_from_slice(typ);
+            c.extend_from_slice(data);
+            let mut crc_in = alloc::vec::Vec::with_capacity(typ.len() + data.len());
+            crc_in.extend_from_slice(typ);
+            crc_in.extend_from_slice(data);
+            c.extend_from_slice(&crate::image::png::crc32(&crc_in).to_be_bytes());
+            c
+        };
+        let mut png = alloc::vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&chunk(b"IHDR", &ihdr));
+        png.extend_from_slice(&chunk(b"IDAT", &z));
+        png.extend_from_slice(&chunk(b"IEND", &[]));
+        png
+    }
+
+    #[test_case]
+    fn an_image_larger_than_the_arena_grows_it_once_and_decodes() {
+        // **The fix for "a large PNG is refused rather than decoded."** Three claims, and the
+        // third is the one that makes the first two affordable:
+        //
+        //   1. An image needing more arena than the loader's default still decodes.
+        //   2. It is byte-identical to the kernel's own decode.
+        //   3. It takes **one** growth, because the tenant reports what it needs instead of
+        //      letting the loader double blindly from 8 MiB.
+        //
+        // 640x640 is ~1.6 MB of pixels and ~2.6 MB of input — comfortably past what a small arena
+        // holds while staying quick enough for the unit suite.
+        let png = synth_png(640, 640);
+        let mut t = ImageTenant::new(0x1000).expect("the decode tenant must load");
+        let first = t.decode(&png).map(|i| (i.w, i.h));
+        assert!(
+            matches!(first, Err(LoadError::Declined { status }) if status == block::STATUS_OUT_OF_MEMORY),
+            "a one-page arena must be out of memory for a 640x640 image, got {first:?}"
+        );
+        // The tenant read the header and said what it needs — the hint the loader retries with.
+        let want = t.wanted_heap();
+        assert!(want > 0, "the tenant must report an arena estimate");
+        assert!(want >= 640 * 640 * 4, "the estimate must at least cover the pixels, is {want}");
+        assert!(t.grow_heap(want), "the arena must grow to the estimate");
+        let img = t.decode(&png).expect("at the estimated size the image must decode");
+        assert_same_as_kernel(&img, &png);
+
+        // And the same thing through the shared path, where the retry policy lives: one growth,
+        // not a doubling search.
+        let (_, _, grows_before) = decode_stats();
+        let via_loader = decode_image(&png).expect("the shared path must decode a large image");
+        assert_same_as_kernel(&via_loader, &png);
+        let grows = decode_stats().2 - grows_before;
+        assert!(grows <= 1, "an oversized image must cost at most one arena growth, took {grows}");
     }
 
     #[test_case]
@@ -991,6 +1082,14 @@ pub mod block {
     /// Written *by the tenant* in heap-output mode: the decoded image's dimensions.
     pub const IMG_W: usize = 104;
     pub const IMG_H: usize = 112;
+    /// Written *by the tenant* before it decodes: how much arena this input looks like it needs.
+    ///
+    /// A hint, and the reason a large photo decodes at all. Without it the loader can only double
+    /// its guess and re-enter — six attempts to reach a 32 MP image's arena, each doing real work
+    /// before running out. With it there is one retry, at the size the file itself implies. It is
+    /// still only a hint: it is clamped by [`MAX_HEAP_BYTES`] and by what the machine can spare,
+    /// and a *too small* hint falls back to doubling.
+    pub const HEAP_WANT: usize = 120;
     /// The tenant declined because its input was malformed or unsupported. **An answer.**
     pub const STATUS_DECODE_FAILED: u64 = 3;
     /// The tenant's arena was too small. Not a rejection: how much heap an image needs is a
@@ -1435,6 +1534,8 @@ pub struct ImageTenant {
     in_frames: alloc::vec::Vec<u64>,
     heap_va: u64,
     heap_frames: alloc::vec::Vec<u64>,
+    /// What the last run said it needed — see [`block::HEAP_WANT`]. Zero means it had no idea.
+    want: usize,
 }
 
 /// How much of the tenant's address space is reserved for input before the heap starts.
@@ -1461,6 +1562,7 @@ impl ImageTenant {
             in_frames: alloc::vec::Vec::new(),
             heap_va,
             heap_frames: alloc::vec::Vec::new(),
+            want: 0,
         };
         if !me.grow_heap(heap_bytes) {
             return Err(LoadError::NoAddressSpace);
@@ -1471,6 +1573,11 @@ impl ImageTenant {
     /// Bytes of arena currently mapped.
     pub fn heap_bytes(&self) -> usize {
         self.heap_frames.len() * 0x1000
+    }
+
+    /// What the last decode said it needed, clamped to [`MAX_HEAP_BYTES`]; 0 if it had no idea.
+    pub fn wanted_heap(&self) -> usize {
+        self.want
     }
 
     /// Map shared frames at `va` until `frames` holds `want` of them.
@@ -1572,11 +1679,20 @@ impl ImageTenant {
             return Err(LoadError::Faulted);
         }
         // SAFETY: the tenant's own block page.
-        let (status, out_ptr, out_len, w, h) = unsafe {
+        let (status, out_ptr, out_len, w, h, want) = unsafe {
             let base = self.args_kernel as *const u8;
             let get = |off: usize| core::ptr::read_unaligned(base.add(off) as *const u64);
-            (get(block::STATUS), get(block::OUTPUT_PTR), get(block::OUTPUT_LEN), get(block::IMG_W), get(block::IMG_H))
+            (
+                get(block::STATUS),
+                get(block::OUTPUT_PTR),
+                get(block::OUTPUT_LEN),
+                get(block::IMG_W),
+                get(block::IMG_H),
+                get(block::HEAP_WANT),
+            )
         };
+        // Recorded even on the failure path — especially there, since that is when it is used.
+        self.want = want.min(MAX_HEAP_BYTES as u64) as usize;
         if status != 0 {
             return Err(LoadError::Declined { status });
         }
@@ -1639,12 +1755,17 @@ impl Drop for ImageTenant {
 /// claimed more than this is not describing a picture.
 const MAX_PIXELS: usize = 32 << 20;
 
-/// Arena a fresh decode tenant starts with. Enough for roughly a 0.5 MP image; bigger ones grow
-/// it by asking, which costs one extra decode of the same file and nothing at all afterwards.
+/// Arena a fresh decode tenant starts with. Enough for roughly a 1 MP image; bigger ones grow it
+/// by asking, which costs one extra decode of the same file and nothing at all afterwards.
 const DEFAULT_HEAP_BYTES: usize = 8 << 20;
-/// Ceiling on that growth. A 4 MP photo wants ~5x its pixel buffer once the inflate output, the
-/// unfiltered scanlines and the bump allocator's lack of reuse are counted.
-const MAX_HEAP_BYTES: usize = 256 << 20;
+/// Ceiling on that growth, and it is deliberately generous enough for the **largest image
+/// `image::png` will accept** (32 MP: ~390 MB of arena once the inflate output's doubling and the
+/// pixel buffer are counted). A smaller ceiling refused files the decoder could read, which is a
+/// worse answer than a slow one.
+///
+/// This is not the operative limit on a small machine — [`decode_image`] refuses to take frames
+/// the machine cannot spare, so the real bound is memory, reported as such.
+const MAX_HEAP_BYTES: usize = 512 << 20;
 /// A tenant whose arena grew past this is dropped rather than cached: it would otherwise hold
 /// those frames for the rest of the boot because nothing here can unmap. Opening one large
 /// image should not permanently cost the machine its memory.
@@ -1654,14 +1775,24 @@ const KEEP_HEAP_BYTES: usize = 16 << 20;
 /// to the boot CPU and `enter_tenant` is not reentrant.
 static IMAGE_TENANT: crate::mm::Locked<Option<ImageTenant>> = crate::mm::Locked::new(None);
 
-/// How many images have been decoded in ring 3, and how many of those had to grow the arena.
+/// How many images have been decoded in ring 3, how many tenants were built, and how many arena
+/// growths that took.
 static DECODES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static REBUILDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static GROWS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// `(decodes, tenant builds)` — a reused tenant makes the second number stop growing, which is
-/// the only externally visible difference between reuse working and reuse silently not.
-pub fn decode_stats() -> (u64, u64) {
-    (DECODES.load(core::sync::atomic::Ordering::Relaxed), REBUILDS.load(core::sync::atomic::Ordering::Relaxed))
+/// `(decodes, tenant builds, arena growths)`.
+///
+/// Builds stop growing when reuse works, which is the only externally visible difference between
+/// reuse working and reuse silently not. Growths are the retry count: one per oversized image is
+/// the estimate doing its job; several per image means the estimate is wrong and the loader is
+/// back to doubling.
+pub fn decode_stats() -> (u64, u64, u64) {
+    (
+        DECODES.load(core::sync::atomic::Ordering::Relaxed),
+        REBUILDS.load(core::sync::atomic::Ordering::Relaxed),
+        GROWS.load(core::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// **Decode an image outside the kernel.** PNG or JPEG in, pixels out, parsed in ring 3 by a
@@ -1689,17 +1820,29 @@ pub fn decode_image(bytes: &[u8]) -> Result<crate::image::Image, LoadError> {
     };
     let mut out = tenant.decode(bytes);
     while matches!(out, Err(LoadError::Declined { status }) if status == block::STATUS_OUT_OF_MEMORY) {
-        let want = (tenant.heap_bytes() * 2).min(MAX_HEAP_BYTES);
+        // **The tenant's own estimate first, doubling only as a fallback.** It parsed the header
+        // in ring 3 and knows the shape of the image; the loader knows nothing about the file and
+        // would otherwise double from 8 MiB, which for a 32 MP photo is six full attempts that
+        // each do real work before running out. `max` with the double, so a hint that is too
+        // small (or absent) still converges instead of retrying the same size forever.
+        let want = tenant.wanted_heap().max(tenant.heap_bytes() * 2).min(MAX_HEAP_BYTES);
         // Never take the machine's last frames for a picture: leave at least as many free as the
         // growth would consume. A decode that stops here reports the tenant's own out-of-memory
         // status, which is a true statement about what happened.
-        let need = (want - tenant.heap_bytes()) / 0x1000;
+        let need = (want.saturating_sub(tenant.heap_bytes())) / 0x1000;
         if want <= tenant.heap_bytes() || space::free_frames() < (need as u64) * 2 {
+            crate::ktrace::log_fmt(format_args!(
+                "tenant: decode wants {} MiB of arena, have {} MiB and {} MiB free -- refusing",
+                want >> 20,
+                tenant.heap_bytes() >> 20,
+                (space::free_frames() * 0x1000) >> 20
+            ));
             break;
         }
         if !tenant.grow_heap(want) {
             break;
         }
+        GROWS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         out = tenant.decode(bytes);
     }
     if out.is_ok() {
