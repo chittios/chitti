@@ -1119,14 +1119,46 @@ FDT claims a GICv3 but carries no readable `reg`.
   stopping when they would meet. The column width is a **fixed**
   `STATUS_V_COLS`, never fitted to the longest segment: the fields hold live values,
   so a fitted width would relayout every pane — reflowing scrollback — each time the
-  clock ticked a digit. The brand — logo, the terracotta `#cc785c` / warm-ink /
+  clock ticked a digit.
+  **System icons are Font Awesome 7 Free Solid** — not emoji, not hand-drawn
+  rects for chrome. The face is `assets/fonts/FontAwesome7Free-Solid-900.otf`
+  (SIL OFL / icons CC BY 4.0; see [THIRDPARTY-LICENSES.md](THIRDPARTY-LICENSES.md)),
+  registered **first** in the TTF fallback chain at boot
+  (`font_ttf::register_bundled_fallbacks`, name `FA_FALLBACK_NAME` =
+  `"Font Awesome 7 Free Solid"`) so Private-Use-Area scalars resolve before
+  Noto/emoji/CJK scans. Codepoints and helpers live in
+  [`kernel/src/icons.rs`](kernel/src/icons.rs) (`icons::fa::*`, `is_icon`,
+  `close_mark`, `for_agent`, `for_command` / `for_command_category`,
+  `chess_piece`, `cursor_glyph`, status helpers); package-UI wasm guests cannot
+  import the kernel crate, so they mirror the same literals in
+  [`tools/apps-wasm/src/fa.rs`](tools/apps-wasm/src/fa.rs) and must stay in
+  lockstep when a codepoint is added. **Where FA is used today:** status-bar
+  `${kbd}` / `${mouse}` / `${net}` (active input is a body-size middle-dot, never
+  a full FA circle — that ballooned at icon scale); OS mouse cursors
+  (`arrow-pointer` / `hand-pointer` / `i-cursor` / `hourglass`, rasterized to
+  fill+outline sprites with theme custom sprites still winning); pane and modal
+  **close** (`xmark`, painted with `theme.accent` so `/theme` recolours it);
+  action **tab labels** (ktrace/editor/top/todos/audio/image/video/browser +
+  package-UI agent names via `for_agent`); `/help` and `/agents` browsers
+  (category headers + command/agent rows); todos status marks; chess pieces on
+  the board (`chess-pawn`…`chess-king` via `synapse::ui` text ops); settings /
+  files / notes / activity package-UI chrome. **Sizing rules that bit us:**
+  (1) size FA by **line height**, not `min(cw, ch)` — mono cells are tall and
+  narrow, and width-first sizing made agent-list and close marks look like
+  dots; (2) `blit_glyph` / `draw_str` give FA a **square cell of body line
+  height** and advance by that width; (3) fontdue's `px` is an em size, not a
+  max bitmap edge — solids often rasterize larger, so `build_ui_glyph` measures
+  and **shrink-to-fits** with a little air so AA edges aren't clipped (status
+  bar icons used to lose their tops). Only Free Solid is vendored (no Brands
+  pack). The brand — logo, the terracotta `#cc785c` / warm-ink /
   cream palette (fully re-themable from `ui.json`), and typography — is specified
   in [DESIGN.md](DESIGN.md); honour it for any UI change. **Themes**
   (`theme.rs`, `/theme`) are presets layered over `ui.json` (still the single
   source of truth for the live look): bundled JSON in `assets/themes/*.json`
   (`dark`/`light`/`solarized-dark`/`nord`/`dracula`/`ubuntu`), installable to
   `/configs/themes/`, each carrying the chrome palette, `highlight` **syntax**
-  colours, **cursor** fill/outline + optional sprite bitmaps, `font`+scale, a
+  colours, **cursor** fill/outline + optional sprite bitmaps (else FA default
+  cursors), `font`+scale, a
   **wallpaper** (`""` ∣ `gradient:#a,#b` ∣ a store-image path, cover-scaled by
   `image::cover`, `/theme wallpaper` fetches a URL) and **opacity** (0–255).
   **NEW UI SURFACES MUST RESPECT THE THEME BACKGROUND:** with a translucent
