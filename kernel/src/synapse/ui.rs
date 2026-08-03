@@ -644,20 +644,24 @@ fn piece_style(p: char) -> (u32, u32) {
     }
 }
 
-/// A piece is a rounded-ish chip with its letter (K Q R B N P) on it — the
-/// letter says WHAT it is, the chip colour says WHOSE it is.
+/// Chess piece **icons** from Font Awesome Free Solid (`chess-pawn` …
+/// `chess-king`). A soft chip pad keeps light pieces readable on light squares;
+/// the glyph colour is the contrasting ink from [`piece_style`].
 fn paint_piece_ops(ops: &mut alloc::string::String, x: i32, y: i32, piece: char, fill: u32, letter_color: u32) {
     use alloc::format;
     let cx = x + BOARD_SQ / 2;
     let cy = y + BOARD_SQ / 2;
     let f = fill & 0xff_ffff;
-    let lc = letter_color & 0xff_ffff;
-    // Chip: 14×16 body with 1-px corner cuts (cheap rounding).
-    ops.push_str(&format!("rect {} {} 14 16 {f:06x}; ", cx - 7, cy - 8));
-    ops.push_str(&format!("rect {} {} 16 14 {f:06x}; ", cx - 8, cy - 7));
-    // Letter, half-ish scale (12 px tall fits the 20-px square).
-    let ch = piece.to_ascii_uppercase();
-    ops.push_str(&format!("text {} {} 12 {lc:06x} {ch}; ", cx - 3, cy - 6));
+    let edge = letter_color & 0xff_ffff;
+    let glyph = crate::icons::chess_piece(piece);
+    // Soft pad under every piece so light pieces stay readable on light squares.
+    ops.push_str(&format!("rect {} {} 18 18 {f:06x}; ", cx - 9, cy - 9));
+    // FA chess glyphs ~16 px in a 24 px square, centred.
+    let size = 16;
+    let tx = cx - size / 2;
+    let ty = cy - size / 2;
+    // Host rasterizes via the FA face (first in the TTF fallback chain).
+    ops.push_str(&format!("text {tx} {ty} {size} {edge:06x} {glyph}; "));
 }
 
 /// Highlight squares (e.g. `"e2,e4"`) with a translucent-ish overlay colour.

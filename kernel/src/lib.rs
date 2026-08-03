@@ -119,6 +119,8 @@ pub mod font_shape;
 // Runtime TTF/OTF (fontdue) — browser paint + optional UI faces. Available
 // under test so browser unit tests exercise real glyph rasterization.
 pub mod font_ttf;
+/// Font Awesome Free Solid codepoints for status bar / UI chrome.
+pub mod icons;
 // WOFF1 → SFNT web-font container converter (WOFF2 detected, unsupported).
 pub mod font_woff;
 // WOFF2 → SFNT converter (Brotli payload + transformed glyf/loca).

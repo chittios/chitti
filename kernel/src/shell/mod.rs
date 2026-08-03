@@ -9653,10 +9653,11 @@ fn run_statusbar_inner(arg: &str) {
         serial_println!("statusbar> {} (top | bottom | left | right)", cur.as_str());
         if cur.vertical() {
             serial_println!(
-                "statusbar>   a side bar is {} columns wide and stacks its fields as rows",
+                "statusbar>   side bar: {} cols, fields stack top→bottom (one token per row)",
                 crate::panes_layout::STATUS_V_COLS
             );
         }
+        serial_println!("statusbar>   default is top; icons paint ~1.5× body text");
         serial_println!("statusbar> usage: /statusbar <top|bottom|left|right>");
         return;
     }

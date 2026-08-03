@@ -72,3 +72,10 @@ from the local macOS firmware tree (same source Asahi's fwextract uses).
 Built-in agent packages (SOULs, manifests, and their `tools.wasm` modules)
 live under [`agents/`](../agents/), with the wasm sources in
 `tools/<name>-wasm/` — see the Apps bullet in [CLAUDE.md](../CLAUDE.md).
+## Font Awesome Free Solid
+
+`FontAwesome6Free-Solid-900.otf` (SIL OFL 1.1 / icons CC BY 4.0) — system UI
+icons. Registered **first** in the kernel TTF fallback chain so status-bar,
+agents browser, and package-UI chrome resolve Private-Use-Area codepoints
+(`kernel/src/icons.rs`, mirrored in `tools/apps-wasm/src/fa.rs`) to real
+glyphs. See [THIRDPARTY-LICENSES.md](../THIRDPARTY-LICENSES.md).

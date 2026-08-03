@@ -16,7 +16,18 @@ static mut MODE: u8 = 1; // 0 manual 1 auto 2 bypass (matches shell default = au
 /// Theme preset names — must match `assets/themes/*.json` / `theme::apply`.
 const THEMES: [&str; 6] = ["dark", "light", "nord", "dracula", "solarized-dark", "ubuntu"];
 const THEME_LABELS: [&str; 6] = ["Dark", "Light", "Nord", "Dracula", "Solar", "Ubuntu"];
-const NAV: [&str; 5] = ["Theme", "Net", "Model", "Voice", "Mode"];
+/// Nav labels with Font Awesome Free Solid icons (host TTF fallback chain).
+fn nav_label(i: usize) -> String {
+    use crate::fa;
+    let (icon, label) = match i {
+        0 => (fa::PALETTE, "Theme"),
+        1 => (fa::WIFI, "Net"),
+        2 => (fa::ROBOT, "Model"),
+        3 => (fa::MICROPHONE, "Voice"),
+        _ => (fa::SHIELD, "Mode"),
+    };
+    format!("{icon} {label}")
+}
 const MODES: [&str; 3] = ["Manual", "Auto", "Bypass"];
 const MODE_NAMES: [&str; 3] = ["manual", "auto", "bypass"];
 
@@ -28,7 +39,15 @@ fn paint() {
 
     let mut ops = String::from("clear 1a1816; ");
     ops.push_str("rect 0 0 256 18 3a3632; ");
-    text_op(&mut ops, 8, 2, 12, "e8e4df", "Settings");
+    // Gear glyph (Font Awesome) + title.
+    text_op(
+        &mut ops,
+        8,
+        2,
+        12,
+        "e8e4df",
+        &format!("{} Settings", crate::fa::GEAR),
+    );
     for i in 0..5i32 {
         let y = 24 + i * 28;
         let c = if panel as i32 == i {
@@ -36,8 +55,8 @@ fn paint() {
         } else {
             "3a3632"
         };
-        ops.push_str(&format!("rect 8 {y} 64 24 {c}; "));
-        text_op(&mut ops, 14, y + 4, 11, "e8e4df", NAV[i as usize]);
+        ops.push_str(&format!("rect 4 {y} 72 24 {c}; "));
+        text_op(&mut ops, 8, y + 4, 10, "e8e4df", &nav_label(i as usize));
     }
     ops.push_str("rect 80 24 168 144 2c2926; ");
     match panel {
@@ -119,7 +138,7 @@ fn paint() {
     hud_status(
         &format!(
             "settings  {}  theme={}  mode={}  opacity={}",
-            NAV[panel as usize],
+            nav_label(panel as usize),
             THEMES[theme as usize],
             MODE_NAMES[mode as usize],
             opacity

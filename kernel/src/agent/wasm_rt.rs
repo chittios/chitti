@@ -778,6 +778,125 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
         )
         .map_err(|_| "define host_sys_get")?;
 
+    // host_tasks_list(out, cap) → n bytes written. Lines: `id\tname\tstate\n`.
+    // Read-only snapshot of the scheduler for the Activity package UI so it is
+    // not a fake progress toy. Unbound (agent_id 0) callers get an empty list.
+    linker
+        .func_wrap(
+            "chitti",
+            "host_tasks_list",
+            |mut caller: Caller<'_, HostState>, out_ptr: i32, out_cap: i32| -> i32 {
+                if out_ptr < 0 || out_cap <= 0 {
+                    return -1;
+                }
+                if caller.data().bind.agent_id == 0 {
+                    return 0;
+                }
+                let mut s = alloc::string::String::new();
+                for (id, name, state) in crate::sched::list() {
+                    use core::fmt::Write;
+                    let _ = write!(s, "{id}\t{name}\t{state}\n");
+                    if s.len() >= out_cap as usize {
+                        s.truncate(out_cap as usize);
+                        break;
+                    }
+                }
+                // Also surface heap / reclaim pressure so Activity's "mem" bar
+                // is real rather than a random walk.
+                let (_, free, used) = crate::mm::heap::stats();
+                let total = free.saturating_add(used).max(1);
+                let pct = ((used as u64 * 100) / total as u64).min(100);
+                use core::fmt::Write;
+                let _ = write!(s, "heap\t{used}/{total}\t{pct}%\n");
+                let bytes = s.as_bytes();
+                let n = bytes.len().min(out_cap as usize);
+                if write_guest_bytes(&mut caller, out_ptr, &bytes[..n]).is_err() {
+                    return -1;
+                }
+                n as i32
+            },
+        )
+        .map_err(|_| "define host_tasks_list")?;
+
+    // host_fs_list(path, out, cap) → n. Lines `name\tkind\tsize\n` for children
+    // of `path` (Synapse virtual FS, same view as shell `/ls`). kind is `d` or `f`.
+    linker
+        .func_wrap(
+            "chitti",
+            "host_fs_list",
+            |mut caller: Caller<'_, HostState>,
+             path_ptr: i32,
+             path_len: i32,
+             out_ptr: i32,
+             out_cap: i32|
+             -> i32 {
+                if caller.data().bind.agent_id == 0 {
+                    return -3;
+                }
+                if out_ptr < 0 || out_cap <= 0 {
+                    return -1;
+                }
+                let Some(path) = read_guest_str(&caller, path_ptr, path_len) else {
+                    return -1;
+                };
+                let path = if path.is_empty() { "/" } else { path.as_str() };
+                let mut s = alloc::string::String::new();
+                use core::fmt::Write;
+                for e in crate::synapse::fs::list_dir(path) {
+                    let kind = if e.is_dir { 'd' } else { 'f' };
+                    let name = e.name.as_str();
+                    // Skip empty / weird names.
+                    if name.is_empty() || name == "." || name == ".." {
+                        continue;
+                    }
+                    let _ = write!(s, "{name}\t{kind}\t{}\n", e.size);
+                    if s.len() >= out_cap as usize {
+                        s.truncate(out_cap as usize);
+                        break;
+                    }
+                }
+                let bytes = s.as_bytes();
+                let n = bytes.len().min(out_cap as usize);
+                if write_guest_bytes(&mut caller, out_ptr, &bytes[..n]).is_err() {
+                    return -1;
+                }
+                n as i32
+            },
+        )
+        .map_err(|_| "define host_fs_list")?;
+
+    // host_fs_read(path, out, cap) → n bytes of file content (capped).
+    linker
+        .func_wrap(
+            "chitti",
+            "host_fs_read",
+            |mut caller: Caller<'_, HostState>,
+             path_ptr: i32,
+             path_len: i32,
+             out_ptr: i32,
+             out_cap: i32|
+             -> i32 {
+                if caller.data().bind.agent_id == 0 {
+                    return -3;
+                }
+                if out_ptr < 0 || out_cap <= 0 {
+                    return -1;
+                }
+                let Some(path) = read_guest_str(&caller, path_ptr, path_len) else {
+                    return -1;
+                };
+                let Some(data) = crate::synapse::fs::read(&path) else {
+                    return -2;
+                };
+                let n = data.len().min(out_cap as usize);
+                if write_guest_bytes(&mut caller, out_ptr, &data[..n]).is_err() {
+                    return -1;
+                }
+                n as i32
+            },
+        )
+        .map_err(|_| "define host_fs_read")?;
+
     Ok(())
 }
 

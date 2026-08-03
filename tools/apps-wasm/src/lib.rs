@@ -19,6 +19,7 @@ mod contacts;
 mod dict;
 mod diff;
 mod endscreen;
+mod fa;
 mod files;
 mod gallery;
 mod game2048;
@@ -60,6 +61,7 @@ macro_rules! tool {
 }
 
 // --- existing apps ----------------------------------------------------------
+tool!(notes_start, notes::start);
 tool!(notes_list, notes::list);
 tool!(notes_get, notes::get);
 tool!(notes_set, notes::set);
@@ -264,6 +266,7 @@ pub extern "C" fn on_click(args_ptr: i32, args_len: i32) -> i64 {
         "console" => console::on_click(x, y),
         "maps" => maps::on_click(x, y),
         "radio" => radio::on_click(x, y),
+        "notes" => notes::on_click(x, y),
         "sandbox-lab" | "sandbox" => sandbox::on_click(x, y),
         _ => alloc::string::String::from("ok"),
     };
@@ -307,6 +310,7 @@ pub extern "C" fn on_key(args_ptr: i32, args_len: i32) -> i64 {
         "console" => console::on_key(&key),
         "maps" => maps::on_key(&key),
         "radio" => radio::on_key(&key),
+        "notes" => notes::on_key(&key),
         "sandbox-lab" | "sandbox" => sandbox::on_key(&key),
         _ => alloc::string::String::from("ok"),
     };

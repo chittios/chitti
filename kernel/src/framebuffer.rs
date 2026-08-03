@@ -177,19 +177,29 @@ fn aa_coverage<F: Fn(i64, i64) -> bool>(dx: i64, dy: i64, inside: F) -> u32 {
 }
 
 /// Padding around the status bar's text, on both sides of its short axis.
-const STATUS_PAD: u64 = 8;
+const STATUS_PAD: u64 = 10;
+
+/// Extra height for horizontal bars so status icons (Font Awesome) get a little
+/// headroom without dominating the bar. Keep small — large extras made icons
+/// and the old solid-circle activity mark look uneven next to mono text.
+const STATUS_ICON_EXTRA: u64 = 2;
 
 /// How thick the status bar is on a given edge, in pixels.
 ///
-/// Horizontal (top/bottom): one text row plus padding — the historical `ch + 8`.
+/// Horizontal (top/bottom): text row + icon headroom + padding.
 /// Vertical (left/right): a fixed [`crate::panes_layout::STATUS_V_COLS`]-column
 /// span, because text cannot run across a column and its content stacks instead.
 fn status_thickness(pos: crate::panes_layout::StatusPos, cw: u64, ch: u64) -> u64 {
     if pos.vertical() {
         crate::panes_layout::STATUS_V_COLS * cw + STATUS_PAD
     } else {
-        ch + STATUS_PAD
+        ch + STATUS_ICON_EXTRA + STATUS_PAD
     }
+}
+
+/// True for status-bar icons we draw slightly larger (Font Awesome PUA).
+fn is_status_icon(ch: char) -> bool {
+    crate::icons::is_icon(ch)
 }
 
 const OUTER: u64 = 8; // margin around the whole content region
@@ -747,8 +757,8 @@ pub struct Screen {
     /// The status bar's rect and the content rect left over, from
     /// `panes_layout::status_split`. Every pane-layout calculation works inside
     /// `content_*` rather than `0..width`/`0..height`, so the bar can sit on any
-    /// edge without a second set of layout paths. At the default `Bottom` the
-    /// content origin is `(0, 0)` and this is the historical geometry exactly.
+    /// edge without a second set of layout paths. At `Top` (the default) the
+    /// content origin is `(0, bar_h)`; at `Bottom` it is `(0, 0)`.
     status_rect: crate::panes_layout::Rect,
     content_x: u64,
     content_y: u64,
@@ -978,9 +988,36 @@ pub fn reset_cursor_theme() {
     });
 }
 
+/// Cached Font Awesome cursor sprites (Arrow/Hand/IBeam/Wait), built once the
+/// first time each shape is drawn. Falls back to the hand-drawn bitmaps if FA
+/// is not yet registered or rasterization fails.
+static FA_CURSOR_CACHE: Locked<[Option<(u64, u64, Vec<u8>)>; 4]> =
+    Locked::new([None, None, None, None]);
+
+fn cursor_fa_sprite(shape: CursorShape) -> Option<(u64, u64, Vec<u8>)> {
+    let i = shape as usize;
+    FA_CURSOR_CACHE.with(|cache| {
+        if let Some(hit) = &cache[i] {
+            return Some(hit.clone());
+        }
+        let ch = crate::icons::cursor_glyph(shape as u8);
+        // ~18 px matches the classic 12×19 hand-drawn arrow optical weight.
+        let Some((w, h, data)) = crate::font_ttf::raster_cursor_sprite(ch, 18.0) else {
+            return None;
+        };
+        if w == 0 || h == 0 || data.is_empty() {
+            return None;
+        }
+        let entry = (w as u64, h as u64, data);
+        cache[i] = Some(entry.clone());
+        Some(entry)
+    })
+}
+
 /// Resolve the active cursor for the current shape: `(w, h, index-data,
-/// fill, outline)`. Uses a theme's custom sprite when present + non-empty,
-/// else the built-in bitmap; colours come from the theme or the defaults.
+/// fill, outline)`. Order: theme custom sprite → Font Awesome Free Solid
+/// (`arrow-pointer` / `hand-pointer` / `i-cursor` / `hourglass`) → hand-drawn
+/// built-in bitmap.
 fn cursor_active() -> (u64, u64, alloc::borrow::Cow<'static, [u8]>, Rgb, Rgb) {
     let shape = cursor_shape();
     CURSOR_THEME.with(|t| {
@@ -996,6 +1033,9 @@ fn cursor_active() -> (u64, u64, alloc::borrow::Cow<'static, [u8]>, Rgb, Rgb) {
                     outline,
                 );
             }
+        }
+        if let Some((w, h, data)) = cursor_fa_sprite(shape) {
+            return (w, h, alloc::borrow::Cow::Owned(data), fill, outline);
         }
         (
             CUR_W,
@@ -2437,87 +2477,168 @@ impl Screen {
         }
     }
 
+    /// Draw status text with icon glyphs (Font Awesome PUA). Body text and the
+    /// activity middle-dot stay at the normal cell size; icons share a modest
+    /// square cell (~1.15× width) so keyboard / mouse / wifi look even.
+    fn draw_status_str(&self, mut x: u64, y: u64, s: &str, fg: Rgb, bg: Rgb, max_x: u64) -> u64 {
+        let cw = self.cw();
+        let ch = self.ch();
+        // Slightly wider than a mono cell; not 1.5× (that plus advance-based FA
+        // sizing made the solid-circle activity mark a giant blob).
+        let icon_cw = cw + (cw / 6).max(1);
+        let icon_ch = ch + STATUS_ICON_EXTRA;
+        let body_y = y + STATUS_ICON_EXTRA / 2;
+        for ch_c in s.chars() {
+            if is_status_icon(ch_c) {
+                if x + icon_cw > max_x {
+                    break;
+                }
+                for gy in 0..icon_ch {
+                    for gx in 0..icon_cw {
+                        self.put_pixel(x + gx, y + gy, bg);
+                    }
+                }
+                let mut painted = false;
+                let ok = crate::font_ttf::blit_ui_cell(
+                    ch_c,
+                    icon_cw as usize,
+                    icon_ch as usize,
+                    |gx, gy, a| {
+                        if a == 0 {
+                            return;
+                        }
+                        painted = true;
+                        let px = x + gx as u64;
+                        let py = y + gy as u64;
+                        if px >= max_x {
+                            return;
+                        }
+                        let mix = |b: u8, f: u8, aa: u32| {
+                            (((b as u32) * (255 - aa) + (f as u32) * aa) / 255) as u8
+                        };
+                        let c = (
+                            mix(bg.0, fg.0, a as u32),
+                            mix(bg.1, fg.1, a as u32),
+                            mix(bg.2, fg.2, a as u32),
+                        );
+                        self.put_pixel(px, py, c);
+                    },
+                );
+                if !ok || !painted {
+                    self.blit_glyph(
+                        x + icon_cw.saturating_sub(cw) / 2,
+                        body_y,
+                        ch_c,
+                        fg,
+                        bg,
+                    );
+                }
+                x += icon_cw;
+            } else {
+                if x + cw > max_x {
+                    break;
+                }
+                self.blit_glyph(x, body_y, ch_c, fg, bg);
+                x += cw;
+            }
+        }
+        x
+    }
+
     /// The status bar as a **column** (left/right edge).
     ///
-    /// Text cannot run across a 16-cell column, so the two templates are split
-    /// into their groups by `panes_layout::status_segments` and stacked as rows —
-    /// `status_left` from the top under the brand mark, `status_right` up from the
-    /// bottom. That mirrors the horizontal bar, where "right" means the far edge.
+    /// Reading order is **top → bottom** for *both* templates: brand, then
+    /// `status_left` fields (one per row), then `status_right` fields continuing
+    /// down the column. Previously `status_right` stacked upward from the bottom,
+    /// which felt like horizontal "ends" rather than a vertical strip.
     fn draw_status_vertical(&self) {
         let (bx, by, bw, bh) = self.status_rect;
         self.paint_surface(bx, by, bw, bh, self.theme.status_bg);
         let (cw, ch) = (self.cw(), self.ch());
-        let row = ch + 4;
-        // Brand mark centred across the column, one row tall.
-        let lr = (((row / 2).saturating_sub(2)) * 6 / 7).max(5);
-        self.draw_logo(bx + bw / 2, by + STATUS_PAD / 2 + row / 2, lr, self.theme.accent, self.theme.chat_fg);
+        // Slightly taller rows so icons have room; body text is vertically centred
+        // by `draw_status_str`.
+        let row = ch + STATUS_ICON_EXTRA + 4;
+        let lr = (((row / 2).saturating_sub(2)) * 6 / 7).max(6);
+        self.draw_logo(
+            bx + bw / 2,
+            by + STATUS_PAD / 2 + row / 2,
+            lr,
+            self.theme.accent,
+            self.theme.chat_fg,
+        );
         let tx = bx + STATUS_PAD / 2;
+        let max_x = bx + bw.saturating_sub(STATUS_PAD / 2);
         let cols = (bw.saturating_sub(STATUS_PAD) / cw).max(4) as usize;
-        // Rows available below the brand mark. The two stacks grow towards each
-        // other and stop when they would meet, so neither can overdraw the other
-        // however long the templates get.
         let first = by + STATUS_PAD / 2 + row;
-        let last = by + bh;
-        // Each segment wraps to as many rows as it needs, so a long field (the
-        // clock) keeps its tail instead of being cut.
-        let wrap = |s: &str| -> alloc::vec::Vec<alloc::string::String> {
-            crate::panes_layout::status_segments(s)
-                .into_iter()
-                .flat_map(|seg| crate::panes_layout::wrap_segment(seg, cols))
-                .map(|r| crate::textsel::ellipsize(r, cols))
-                .collect()
-        };
+        let last = by + bh.saturating_sub(STATUS_PAD / 2);
+        // One token per row, top → bottom (left template, then right).
+        let mut lines: alloc::vec::Vec<(alloc::string::String, bool)> = alloc::vec::Vec::new();
+        for line in crate::panes_layout::status_lines_vertical(&self.status_left, cols) {
+            lines.push((line, true)); // accent
+        }
+        for line in crate::panes_layout::status_lines_vertical(&self.status_right, cols) {
+            lines.push((line, false)); // body
+        }
         let mut top = first;
-        for line in wrap(&self.status_left) {
+        for (line, accent) in lines {
             if top + row > last {
                 break;
             }
-            self.draw_str(tx, top, &line, self.theme.accent, self.theme.status_bg);
+            let fg = if accent {
+                self.theme.accent
+            } else {
+                self.theme.status_fg
+            };
+            self.draw_status_str(tx, top, &line, fg, self.theme.status_bg, max_x);
             top += row;
-        }
-        let right = wrap(&self.status_right);
-        let mut bot = last;
-        for line in right.iter().rev() {
-            if bot < top + row {
-                break;
-            }
-            bot -= row;
-            self.draw_str(tx, bot, line, self.theme.status_fg, self.theme.status_bg);
         }
     }
 
     /// The status bar as a **row** (top/bottom edge) — brand left, system info
-    /// right, each ellipsized into its half.
+    /// right, each ellipsized into its half. Icons are drawn larger than text.
     fn draw_status_horizontal(&self) {
         let (_, sy_top, _, bar_h) = self.status_rect;
         self.paint_surface(0, sy_top, self.width, bar_h, self.theme.status_bg);
-        let ty = sy_top + 4;
+        // Vertically centre the text/icon run in the bar.
+        let ty = sy_top + bar_h.saturating_sub(self.ch() + STATUS_ICON_EXTRA) / 2;
         let cw = self.cw();
-        // Left = the brand mark then the brand text (accent). The glyph radius is
-        // sized so the ring (extent ≈ 7/6·r) fits within the bar height.
-        let lr = (((bar_h / 2).saturating_sub(2)) * 6 / 7).max(5);
+        let lr = (((bar_h / 2).saturating_sub(2)) * 6 / 7).max(6);
         let lhalf = ((lr / 3).max(3)) / 2;
         let lcx = OUTER + lr + lhalf;
         self.draw_logo(lcx, sy_top + bar_h / 2, lr, self.theme.accent, self.theme.chat_fg);
         let text_x = lcx + lr + lhalf + cw / 2;
-        // Split the bar: left brand, right system info. Never overlap — each
-        // side is ellipsized into its half (with a 2-cell gap in the middle).
         let gap = 2 * cw;
         let usable = self.width.saturating_sub(text_x + OUTER + gap);
         let left_budget = (usable / 2 / cw).max(4) as usize;
         let right_budget = (usable.saturating_sub(left_budget as u64 * cw) / cw).max(4) as usize;
         let left = crate::textsel::ellipsize(&self.status_left, left_budget);
         let right = crate::textsel::ellipsize(&self.status_right, right_budget);
-        self.draw_str(text_x, ty, &left, self.theme.accent, self.theme.status_bg);
-        let rlen = right.chars().count() as u64;
-        let rx = self.width.saturating_sub(rlen * cw + OUTER);
-        // Guard: right edge of left text must stay left of right text.
-        let left_end = text_x + left.chars().count() as u64 * cw + gap;
+        let max_left = text_x + left_budget as u64 * cw;
+        self.draw_status_str(
+            text_x,
+            ty,
+            &left,
+            self.theme.accent,
+            self.theme.status_bg,
+            max_left,
+        );
+        // Approximate right start: icons widen the run slightly (match draw_status_str).
+        let icon_cw = cw + (cw / 6).max(1);
+        let mut r_w = 0u64;
+        for c in right.chars() {
+            r_w += if is_status_icon(c) { icon_cw } else { cw };
+        }
+        let rx = self.width.saturating_sub(r_w + OUTER);
+        let left_end = text_x + left.chars().count() as u64 * (cw + cw / 4) + gap;
         let rx = rx.max(left_end).min(self.width.saturating_sub(OUTER));
-        // Re-ellipsize right if the guard ate columns.
-        let right_cols = ((self.width.saturating_sub(rx + OUTER)) / cw) as usize;
-        let right = crate::textsel::ellipsize(&self.status_right, right_cols);
-        self.draw_str(rx, ty, &right, self.theme.status_fg, self.theme.status_bg);
+        self.draw_status_str(
+            rx,
+            ty,
+            &right,
+            self.theme.status_fg,
+            self.theme.status_bg,
+            self.width.saturating_sub(OUTER / 2),
+        );
     }
 
     /// Draw `s` within `[x, x+max_w)`, ellipsizing when it would overflow.

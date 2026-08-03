@@ -47,10 +47,14 @@ fn paint() {
                     "5a5652"
                 };
                 ops.push_str(&format!("rect {x} {y} {} {} {color}; ", CELL - 1, CELL - 1));
-                // Number / flag / mine glyph on the cell.
+                // Icons: mine = spiked disc, flag = pole+pennant, numbers stay text.
                 if OPEN[r][c] != 0 {
                     if MINE[r][c] != 0 {
-                        text_op(&mut ops, x + 5, y + 2, 12, "e8e4df", "*");
+                        let mx = x + CELL / 2 - 1;
+                        let my = y + CELL / 2 - 1;
+                        ops.push_str(&format!("rect {} {} 6 6 1a1816; ", mx - 2, my - 2));
+                        ops.push_str(&format!("rect {} {} 10 2 1a1816; ", mx - 4, my));
+                        ops.push_str(&format!("rect {} {} 2 10 1a1816; ", mx, my - 4));
                     } else {
                         let n = adj(r, c);
                         if n > 0 {
@@ -58,7 +62,10 @@ fn paint() {
                         }
                     }
                 } else if FLAG[r][c] != 0 {
-                    text_op(&mut ops, x + 5, y + 2, 12, "1a1816", "F");
+                    // Flag pole + triangle pennant.
+                    ops.push_str(&format!("rect {} {} 2 12 1a1816; ", x + 6, y + 3));
+                    ops.push_str(&format!("rect {} {} 8 5 e8e4df; ", x + 8, y + 3));
+                    ops.push_str(&format!("rect {} {} 5 3 e8e4df; ", x + 8, y + 8));
                 }
             }
         }

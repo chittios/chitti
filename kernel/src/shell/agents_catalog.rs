@@ -42,16 +42,19 @@ pub fn filter_rows(query: &str) -> Vec<Row> {
         if !q.is_empty() && !hay.contains(&q) {
             continue;
         }
+        let icon = crate::icons::for_agent(name);
+        let class_icon = crate::icons::ui_class_icon(matches!(class, AgentUiClass::UiCanvas));
         let badge = system::ui_class_label(class);
         let live = match class {
             AgentUiClass::UiCanvas if running_ui.iter().any(|n| n == name) => " run",
             _ => "",
         };
-        // Keep titles short and ASCII-safe for the modal paint path.
+        // Title: FA agent glyph + name (+ short description). Glyphs paint via
+        // the Font Awesome face registered first in the TTF fallback chain.
         let title = if desc.is_empty() {
-            name.to_string()
+            format!("{icon} {name}")
         } else {
-            format!("{name} - {}", take_chars(&desc, 36))
+            format!("{icon} {name} - {}", take_chars(&desc, 36))
         };
         let item = Row::Item {
             title,
@@ -60,7 +63,7 @@ pub fn filter_rows(query: &str) -> Vec<Row> {
                 AgentUiClass::UiCanvas => format!("ui:{name}"),
                 AgentUiClass::Shell => format!("shell:{name}"),
             },
-            shortcut: format!("{badge}{live} id{agent_id}"),
+            shortcut: format!("{class_icon} {badge}{live} id{agent_id}"),
         };
         match class {
             AgentUiClass::UiCanvas => ui_items.push(item),
@@ -83,23 +86,26 @@ pub fn filter_rows(query: &str) -> Vec<Row> {
         if name == "bootstrap" || id == 0 {
             continue;
         }
-        let title = format!("{name}  #{id}");
-        let hay = format!("{title} {state}").to_ascii_lowercase();
+        let base_title = format!("{name}  #{id}");
+        let hay = format!("{base_title} {state}").to_ascii_lowercase();
         if !q.is_empty() && !hay.contains(&q) {
             continue;
         }
-        let kind = if name == "orchestrator" || id == 1 {
-            "shell"
+        let (kind_icon, kind) = if name == "orchestrator" || id == 1 {
+            (crate::icons::fa::COMMENTS, "shell")
         } else if name.starts_with("pkg-") {
-            "ui/canvas"
+            (crate::icons::fa::DISPLAY, "ui/canvas")
         } else {
-            "process"
+            (crate::icons::fa::MICROCHIP, "process")
         };
+        // Strip a leading "pkg-" for icon lookup when present.
+        let agent_key = name.strip_prefix("pkg-").unwrap_or(name);
+        let icon = crate::icons::for_agent(agent_key);
         running_items.push(Row::Item {
-            title,
+            title: format!("{icon} {base_title}"),
             // Encoded pick: `switch:<id>`
             name: format!("switch:{id}"),
-            shortcut: format!("{kind} {state}"),
+            shortcut: format!("{kind_icon} {kind} {state}"),
         });
     }
     if !running_items.is_empty() {
@@ -156,8 +162,8 @@ mod tests {
         );
         assert!(
             rows.iter()
-                .any(|r| matches!(r, Row::Item { name, .. } if name == "shell:notes")),
-            "notes should be shell:notes"
+                .any(|r| matches!(r, Row::Item { name, .. } if name == "ui:notes")),
+            "notes should be ui:notes (package UI list/reader)"
         );
         // UI section must come before Running so default Enter starts a canvas.
         let ui_pos = rows.iter().position(|r| matches!(r, Row::Header(h) if h.contains("UI")));

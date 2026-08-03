@@ -158,3 +158,16 @@ pest_generator = { path = "../third_party/pest_generator" }
 pest_meta = { path = "../third_party/pest_meta" }
 pest_consume = { path = "../third_party/pest_consume" }
 pest_consume_macros = { path = "../third_party/pest_consume_macros" }
+
+# **Third-party dependencies are optimised even in the dev/test profile.**
+#
+# The unit suite runs real work through these crates — `fontdue` parses ~2 MB TrueType faces,
+# glyph by glyph — and at `opt-level = 0` a single font parse took ~30 s of the suite's runtime.
+# Optimising the *dependencies* fixes that without touching the kernel's own code, which stays
+# unoptimised and debuggable (and which several tests describe as a debug build when they compare
+# against optimised ring-3 code).
+#
+# Applies to `cargo test` too: the `test` profile inherits `dev`, and package overrides come with
+# it. Costs one rebuild of the dependency graph.
+[profile.dev.package."*"]
+opt-level = 2

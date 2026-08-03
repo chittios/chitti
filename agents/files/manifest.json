@@ -2,41 +2,27 @@
   "name": "files",
   "version": "1.0.0",
   "kind": "skill_agent",
-  "description": "Storage file browser (tools.wasm).",
+  "description": "Synapse FS browser — same store as shell /ls (browse directories and preview files).",
   "package_ui": true,
   "toolset": [
     "files_start",
     "files_list",
     "files_get",
-    "files_set",
-    "files_remove",
-    "files_status"
+    "files_status",
+    "ls",
+    "cat",
+    "list",
+    "read"
   ],
   "capabilities": [
     {
       "domain": "ui",
-      "rights": [
-        "exec",
-        "write",
-        "delete"
-      ],
+      "rights": ["exec", "write", "delete"],
       "scope": "any"
     },
     {
       "domain": "fs",
-      "rights": [
-        "read",
-        "write",
-        "list"
-      ],
-      "scope": "home"
-    },
-    {
-      "domain": "todo",
-      "rights": [
-        "read",
-        "write"
-      ],
+      "rights": ["read", "list"],
       "scope": "any"
     }
   ],

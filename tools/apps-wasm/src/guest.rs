@@ -56,6 +56,12 @@ extern "C" {
     pub fn host_sys_set(k: i32, kl: i32, v: i32, vl: i32) -> i32;
     /// Read a shell/UI preference into `out`; returns byte length or <0 on error.
     pub fn host_sys_get(k: i32, kl: i32, out: i32, cap: i32) -> i32;
+    /// Snapshot of scheduler tasks + heap line into `out`. Lines `id\\tname\\tstate\\n`.
+    pub fn host_tasks_list(out: i32, cap: i32) -> i32;
+    /// List Synapse FS children of `path` into `out`: `name\\tkind\\tsize\\n` (kind d|f).
+    pub fn host_fs_list(path: i32, pl: i32, out: i32, cap: i32) -> i32;
+    /// Read up to `cap` bytes of a Synapse FS file at `path` into `out`.
+    pub fn host_fs_read(path: i32, pl: i32, out: i32, cap: i32) -> i32;
 }
 
 /// Reset the bump allocator. Called at the start of every host→guest call
@@ -249,6 +255,36 @@ pub fn sys_get(key: &str) -> Option<String> {
     core::str::from_utf8(&buf[..n as usize])
         .ok()
         .map(|s| s.to_string())
+}
+
+/// Scheduler task snapshot from the host (`id\\tname\\tstate\\n` plus a
+/// trailing `heap\\tused/total\\tpct%\\n` line). Empty when unbound.
+pub fn tasks_list(buf: &mut [u8]) -> i32 {
+    unsafe { host_tasks_list(buf.as_mut_ptr() as i32, buf.len() as i32) }
+}
+
+/// List directory `path` on the host Synapse FS (same as shell `/ls`).
+pub fn fs_list(path: &str, buf: &mut [u8]) -> i32 {
+    unsafe {
+        host_fs_list(
+            path.as_ptr() as i32,
+            path.len() as i32,
+            buf.as_mut_ptr() as i32,
+            buf.len() as i32,
+        )
+    }
+}
+
+/// Read file `path` from the host Synapse FS into `buf`.
+pub fn fs_read(path: &str, buf: &mut [u8]) -> i32 {
+    unsafe {
+        host_fs_read(
+            path.as_ptr() as i32,
+            path.len() as i32,
+            buf.as_mut_ptr() as i32,
+            buf.len() as i32,
+        )
+    }
 }
 
 pub use result_string as export;

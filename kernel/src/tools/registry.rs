@@ -570,6 +570,13 @@ fn builtins() -> Vec<ToolDef> {
         },
         // Package WASM app tools (export name == tool name in agent tools.wasm).
         ToolDef {
+            name: "notes_start".to_string(),
+            description: "Open the Notes package UI (list/read durable notes).".to_string(),
+            input_schema: r#"{"type":"object","properties":{}}"#.to_string(),
+            required: Vec::new(),
+            binding: ToolBinding::AgentWasm,
+        },
+        ToolDef {
             name: "notes_list".to_string(),
             description: "List durable note keys (notes agent WASM).".to_string(),
             input_schema: r#"{"type":"object","properties":{}}"#.to_string(),

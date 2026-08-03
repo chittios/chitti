@@ -2,38 +2,35 @@
   "name": "weather",
   "version": "1.0.0",
   "kind": "skill_agent",
-  "description": "Weather card UI (tools.wasm).",
+  "description": "Weather card UI (tools.wasm) + HTTP fetch for live conditions.",
   "package_ui": true,
   "toolset": [
     "weather_start",
     "weather_set",
-    "weather_status"
+    "weather_status",
+    "http",
+    "memory_add",
+    "emit_result"
   ],
   "capabilities": [
     {
       "domain": "ui",
-      "rights": [
-        "exec",
-        "write",
-        "delete"
-      ],
+      "rights": ["exec", "write", "delete"],
       "scope": "any"
     },
     {
       "domain": "fs",
-      "rights": [
-        "read",
-        "write",
-        "list"
-      ],
+      "rights": ["read", "write", "list"],
       "scope": "home"
     },
     {
+      "domain": "net",
+      "rights": ["read", "write"],
+      "scope": "any"
+    },
+    {
       "domain": "todo",
-      "rights": [
-        "read",
-        "write"
-      ],
+      "rights": ["read", "write"],
       "scope": "any"
     }
   ],

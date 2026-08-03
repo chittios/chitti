@@ -336,3 +336,19 @@ attacker tool each case drives, translated onto ChittiOS primitives.
 Copyright (c) 2024 Qiusi Zhan, Zhixiang Liang, Zifan Ying, Daniel Kang.
 Licensed under the MIT License.
 Source: https://github.com/uiuc-kang-lab/InjecAgent
+
+---
+
+## Font Awesome Free — `assets/fonts/FontAwesome6Free-Solid-900.otf`
+
+[Font Awesome Free](https://fontawesome.com) 6 Solid face used for system UI
+icons (status bar, settings chrome, agent badges). Bundled as a single OTF and
+registered first in the kernel TTF fallback chain (`font_ttf::register_bundled_fallbacks`).
+
+- **Fonts**: SIL Open Font License 1.1  
+- **Icons**: CC BY 4.0  
+- **Code** (upstream JS, unused here): MIT  
+
+Full license text: https://fontawesome.com/license/free  
+Only the **Free Solid** face is vendored (no Brands pack). Codepoints are the
+Font Awesome 6 Free Solid Private Use Area map (`kernel/src/icons.rs`).

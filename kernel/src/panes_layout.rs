@@ -96,8 +96,9 @@ pub type Rect = (u64, u64, u64, u64);
 /// rather than overlapping it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum StatusPos {
-    Top,
+    /// Default: bar along the top edge (keyboard-first layout keeps chrome above content).
     #[default]
+    Top,
     Bottom,
     Left,
     Right,
@@ -141,8 +142,24 @@ impl StatusPos {
 /// Deliberately fixed rather than fitted to the longest segment: the segments
 /// hold live values (a clock, an IP, a battery percentage), so a fitted width
 /// would relayout every pane — reflowing scrollback — each time one of them
-/// changed a digit. 16 columns holds `255.255.255.255` and `00:00:00 UTC`.
-pub const STATUS_V_COLS: u64 = 16;
+/// changed a digit. 18 columns holds icon + label rows and `255.255.255.255`.
+pub const STATUS_V_COLS: u64 = 18;
+
+/// For a **vertical** bar: one field per row (split on every space), then wrap
+/// any field that is still wider than `cols`. Top→bottom reading order — not
+/// the horizontal bar's left/right half layout.
+pub fn status_lines_vertical(s: &str, cols: usize) -> Vec<alloc::string::String> {
+    let mut out = alloc::vec::Vec::new();
+    for word in s.split_whitespace() {
+        if word.is_empty() {
+            continue;
+        }
+        for row in wrap_segment(word, cols) {
+            out.push(crate::textsel::ellipsize(row, cols));
+        }
+    }
+    out
+}
 
 /// Carve the status bar off one edge of a `w × h` desktop, returning
 /// `(bar, content)`.
@@ -1072,10 +1089,25 @@ mod tests {
         assert_eq!(StatusPos::parse("botom"), None);
         assert_eq!(StatusPos::parse("centre"), None);
         assert_eq!(StatusPos::parse(""), None);
-        // Bottom is the default, so an absent setting is today's look.
-        assert_eq!(StatusPos::default(), StatusPos::Bottom);
+        // Top is the default (chrome above content).
+        assert_eq!(StatusPos::default(), StatusPos::Top);
         assert!(StatusPos::Left.vertical() && StatusPos::Right.vertical());
         assert!(!StatusPos::Top.vertical() && !StatusPos::Bottom.vertical());
+    }
+
+    #[test_case]
+    fn status_lines_vertical_is_one_field_per_row_top_to_bottom() {
+        // Font Awesome PUA icons (same shape the live status bar emits).
+        let kbd = crate::icons::fa::KEYBOARD;
+        let mouse = crate::icons::fa::MOUSE;
+        let sample = alloc::format!("{kbd} {mouse}  net  mem 88M  cpu 3%");
+        let lines = status_lines_vertical(&sample, 18);
+        assert!(lines.len() >= 5, "each token becomes its own row, got {lines:?}");
+        assert_eq!(lines[0].chars().next(), Some(kbd));
+        // Long token wraps rather than vanishing.
+        let clock = status_lines_vertical("Mon 2026-07-27 05:59:12 UTC", 10);
+        assert!(clock.len() >= 2);
+        assert!(clock.iter().any(|l| l.contains("05:59") || l.contains("UTC") || l.contains("2026")));
     }
 
     #[test_case]

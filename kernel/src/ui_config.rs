@@ -494,16 +494,19 @@ fn resolve_var(var: &str) -> String {
         "battery" => crate::drivers::battery::cached()
             .map(|b| crate::drivers::battery::format(&b))
             .unwrap_or_default(),
-        "net" => (if crate::net::is_up() { "net up" } else { "net --" }).to_string(),
+        // Status-bar icons: Font Awesome Free Solid (see `icons::fa`). The FA
+        // face is first in the TTF fallback chain so these PUA scalars paint as
+        // real glyphs. Active input appends a solid circle.
+        "net" => crate::icons::status_net(crate::net::is_up()),
         "kbd" => {
             let last = crate::console::input_activity_ms();
             let active = last != 0 && crate::arch::now_ms().saturating_sub(last) < 1500;
-            (if active { "kbd*" } else { "kbd " }).to_string()
+            crate::icons::status_kbd(active)
         }
         "mouse" => {
             let last = crate::mouse::activity_ms();
             let active = last != 0 && crate::arch::now_ms().saturating_sub(last) < 1500;
-            (if active { "mse*" } else { "mse " }).to_string()
+            crate::icons::status_mouse(active)
         }
         other => alloc::format!("${{{}}}", other),
     }

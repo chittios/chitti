@@ -1249,7 +1249,7 @@ mod tests {
         assert_eq!(ui_class("paint"), AgentUiClass::UiCanvas);
         assert_eq!(ui_class("snake"), AgentUiClass::UiCanvas);
         assert_eq!(ui_class("synth"), AgentUiClass::UiCanvas);
-        assert_eq!(ui_class("notes"), AgentUiClass::Shell);
+        assert_eq!(ui_class("notes"), AgentUiClass::UiCanvas);
         assert_eq!(ui_class("download"), AgentUiClass::Shell);
         assert_eq!(ui_class("doc"), AgentUiClass::Shell);
         // Have Ui caps / tools but are chat agents, not package_ui canvases.
@@ -1299,7 +1299,7 @@ mod tests {
             Scope::Any,
         ));
         assert!(is_package_ui_manifest(&m));
-        // Notes: no package_ui flag, wasm tools but no Ui surface.
+        // Notes: package UI list/reader + wasm tools (autostart chat tools too).
         let notes = parse_manifest(
             SYSTEM_AGENTS
                 .iter()
@@ -1308,9 +1308,9 @@ mod tests {
                 .manifest_json,
         )
         .unwrap();
-        assert!(notes.package_ui.is_none());
+        assert_eq!(notes.package_ui, Some(true));
         assert!(notes.wasm_module.is_some());
-        assert!(!is_package_ui_manifest(&notes));
+        assert!(is_package_ui_manifest(&notes));
         // Browser: Ui but no guest tools.wasm / no package_ui flag.
         let browser = parse_manifest(
             SYSTEM_AGENTS

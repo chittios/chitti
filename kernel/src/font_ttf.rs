@@ -20,6 +20,12 @@ use fontdue::{Font, FontSettings};
 static GEIST_TTF: &[u8] = include_bytes!("../../assets/fonts/GeistMono-Regular.ttf");
 static UBUNTU_MONO_TTF: &[u8] = include_bytes!("../../assets/fonts/UbuntuMono-Regular.ttf");
 
+/// Font Awesome 6 Free Solid (SIL OFL) — system UI icons in the Private Use
+/// Area (`U+F000`…). Registered **first** in the fallback chain so status-bar
+/// and chrome icons resolve here before Noto/emoji scans. See [`crate::icons`].
+static FONTAWESOME_SOLID: &[u8] =
+    include_bytes!("../../assets/fonts/FontAwesome6Free-Solid-900.otf");
+
 /// Bundled **Noto Sans** script fonts (SIL Open Font License — see
 /// THIRDPARTY-LICENSES.md) forming the system fallback chain, so Indic web
 /// text renders real glyphs instead of tofu. These are the same faces Linux
@@ -46,16 +52,63 @@ pub static NOTO_FALLBACKS: &[(&str, &[u8])] = &[
     ("Noto Sans CJK", include_bytes!("../../assets/fonts/Noto-CJK.otf")),
 ];
 
-/// Register every bundled Noto fallback face (idempotent). Call once at boot,
-/// before the browser/UI render any non-Latin text.
+/// Register every bundled fallback face (idempotent). Call once at boot,
+/// before the browser/UI render any non-Latin or icon text.
+///
+/// Order: **Font Awesome first** (PUA icons), then Noto scripts / emoji / CJK.
 pub fn register_bundled_fallbacks() {
+    // Icons before Noto so U+Fxxx never walks the huge CJK cmap first.
+    const FA_NAME: &str = "Font Awesome 6 Free Solid";
+    if !fallback_loaded(FA_NAME) {
+        match register_fallback(FA_NAME, FONTAWESOME_SOLID) {
+            Ok(()) => crate::ktrace::log_fmt(format_args!(
+                "font: fallback '{FA_NAME}' ok ({} KiB)",
+                FONTAWESOME_SOLID.len() / 1024
+            )),
+            Err(e) => crate::ktrace::log_fmt(format_args!("font: fallback '{FA_NAME}' failed: {e}")),
+        }
+    }
     for (name, bytes) in NOTO_FALLBACKS {
+        // **Idempotent means "do not redo the work", not "do it again and overwrite".** These are
+        // `include_bytes!` statics, so a face already registered under this name was parsed from
+        // exactly these bytes and re-parsing cannot change the result — it only costs the parse
+        // again. That is not a small cost: fontdue walks every glyph, and the emoji and CJK faces
+        // are ~1.9 MB each; unoptimised (the unit suite) all ten take minutes.
+        //
+        // `register_fallback` itself still replaces unconditionally, because replacing a face
+        // with *different* bytes is exactly what an installed font needs.
+        if fallback_loaded(name) {
+            continue;
+        }
         if let Err(e) = register_fallback(name, bytes) {
             crate::ktrace::log_fmt(format_args!("font: fallback '{name}' failed: {e}"));
         } else {
             crate::ktrace::log_fmt(format_args!("font: fallback '{name}' ok ({} KiB)", bytes.len() / 1024));
         }
     }
+}
+
+/// Register **one** bundled fallback by name, if it is not already registered.
+///
+/// For a caller that needs a single script's coverage rather than the whole chain — notably the
+/// unit suite, where parsing all ten faces to exercise one is minutes of a debug build.
+///
+/// Accepts `"Font Awesome 6 Free Solid"` (or `"fontawesome"`) as well as every
+/// name in [`NOTO_FALLBACKS`].
+pub fn register_bundled_fallback(want: &str) -> Result<(), &'static str> {
+    if fallback_loaded(want) {
+        return Ok(());
+    }
+    const FA_NAME: &str = "Font Awesome 6 Free Solid";
+    let w = norm_family(want);
+    if w == norm_family(FA_NAME) || w == "fontawesome" || w == "fa" {
+        return register_fallback(FA_NAME, FONTAWESOME_SOLID);
+    }
+    let (name, bytes) = NOTO_FALLBACKS
+        .iter()
+        .find(|(name, _)| norm_family(name) == w)
+        .ok_or("no such bundled fallback")?;
+    register_fallback(name, bytes)
 }
 
 /// Monospace faces bundled for the UI, selectable by name from `ui.json`
@@ -131,12 +184,37 @@ pub fn ui_font_name() -> Option<String> {
     UI_FONT_NAME.with(|n| n.clone())
 }
 
-/// Build the sparse placed coverage for `ch` in a `cw × ch_px` monospace cell:
-/// size the glyph so its advance fills the cell **width** (sizing by the cell
-/// height over-sizes the glyph and clips its right edge), centre the
-/// ascent/descent box vertically, place on the baseline, and clip to the cell.
+/// True for Font Awesome Private-Use scalars (Free Solid + FA6 extension).
+#[inline]
+fn is_fa_icon(ch: char) -> bool {
+    let u = ch as u32;
+    (0xf000..=0xf8ff).contains(&u) || (0xe000..=0xefff).contains(&u)
+}
+
+/// Build the sparse placed coverage for `ch` in a `cw × ch_px` monospace cell.
+///
+/// Default (Latin / emoji / CJK): size so the glyph's advance fills cell width,
+/// centre the ascent/descent box vertically, place on the baseline.
+///
+/// **Font Awesome** is special: FA advances vary a lot (a solid circle is a
+/// narrow advance; a keyboard is wide). Sizing by advance makes icons look
+/// uneven and balloons markers. FA glyphs are scaled to a **fixed fraction of
+/// cell height** and centred in the cell so keyboard / mouse / wifi / gear all
+/// share one optical size.
+///
 /// Returns `(x, y, alpha)` for each ink pixel.
 fn build_ui_glyph(font: &Font, ch: char, cw: usize, ch_px: usize) -> Vec<(u16, u16, u8)> {
+    if is_fa_icon(ch) {
+        // ~70% of cell height: readable next to mono body text without dominating.
+        let px = (ch_px as f32 * 0.70).max(1.0);
+        let (m, cov) = font.rasterize(ch, px);
+        // Centre the bitmap in the cell (ignore xmin bearing — FA icons are
+        // designed as squares and look even when optically centred).
+        let gx0 = (cw as i32 - m.width as i32) / 2;
+        let gy0 = (ch_px as i32 - m.height as i32) / 2;
+        return pack_ui_glyph(m, &cov, gx0, gy0, cw, ch_px);
+    }
+
     // Size by the glyph's own advance when non-ASCII (emoji / CJK). Sizing emoji
     // from the Latin '0' advance of Noto Emoji can over/under-scale and clip
     // all ink out of the cell — looks like empty boxes.
@@ -170,6 +248,17 @@ fn build_ui_glyph(font: &Font, ch: char, cw: usize, ch_px: usize) -> Vec<(u16, u
     // Advance now equals the cell width; place at the glyph's own left bearing.
     let gx0 = m.xmin;
     let gy0 = (baseline - m.height as f32 - m.ymin as f32) as i32;
+    pack_ui_glyph(m, &cov, gx0, gy0, cw, ch_px)
+}
+
+fn pack_ui_glyph(
+    m: fontdue::Metrics,
+    cov: &[u8],
+    gx0: i32,
+    gy0: i32,
+    cw: usize,
+    ch_px: usize,
+) -> Vec<(u16, u16, u8)> {
     let mut out = Vec::new();
     if m.width > 0 && m.height > 0 && cov.len() >= m.width * m.height {
         for row in 0..m.height {
@@ -296,6 +385,119 @@ pub fn fallback_loaded(name: &str) -> bool {
 /// Number of registered fallback faces.
 pub fn fallback_count() -> usize {
     FALLBACKS.with(|fb| fb.len())
+}
+
+/// Ensure Font Awesome is in the fallback chain (idempotent, cheap if loaded).
+fn ensure_font_awesome() {
+    if fallback_loaded("Font Awesome 6 Free Solid") {
+        return;
+    }
+    let _ = register_bundled_fallback("Font Awesome 6 Free Solid");
+}
+
+/// Rasterize a single glyph (typically Font Awesome) to a **cursor index sprite**:
+/// `0` transparent, `1` fill, `2` outline.
+///
+/// Outline is a 1-px ring around solid ink so the pointer stays readable on both
+/// light and dark backgrounds (same encoding as the hand-drawn built-ins).
+/// Empty top/left margins are cropped so the arrow tip sits near (0,0) — the
+/// framebuffer hotspots the sprite's top-left.
+///
+/// Returns `None` if the face is missing the glyph or produces no ink.
+pub fn raster_cursor_sprite(ch: char, px: f32) -> Option<(usize, usize, Vec<u8>)> {
+    ensure_font_awesome();
+    ensure_default();
+    let px = px.max(8.0).min(28.0);
+    let (metrics, cov) = FALLBACKS.with(|chain| {
+        for (_, f) in chain.iter() {
+            if f.lookup_glyph_index(ch) == 0 {
+                continue;
+            }
+            return Some(f.rasterize(ch, px));
+        }
+        // Last resort: active UI face (usually no FA coverage).
+        FACE.with(|slot| slot.as_ref().map(|face| face.font.rasterize(ch, px)))
+    })?;
+    if metrics.width == 0 || metrics.height == 0 || cov.len() < metrics.width * metrics.height {
+        return None;
+    }
+    let gw = metrics.width;
+    let gh = metrics.height;
+    // Pad 1 px for outline dilation.
+    let pad = 1usize;
+    let aw = gw + pad * 2;
+    let ah = gh + pad * 2;
+    let mut alpha = alloc::vec![0u8; aw * ah];
+    for row in 0..gh {
+        for col in 0..gw {
+            let a = cov[row * gw + col];
+            if a > 0 {
+                alpha[(row + pad) * aw + (col + pad)] = a;
+            }
+        }
+    }
+    // 0/1/2: solid ink → fill; halo of near-ink + empty neighbours of fill → outline.
+    let mut idx = alloc::vec![0u8; aw * ah];
+    for y in 0..ah {
+        for x in 0..aw {
+            let a = alpha[y * aw + x];
+            if a >= 140 {
+                idx[y * aw + x] = 1;
+            } else if a >= 40 {
+                idx[y * aw + x] = 2;
+            }
+        }
+    }
+    // Dilate outline around fill where transparent.
+    let mut out = idx.clone();
+    for y in 0..ah {
+        for x in 0..aw {
+            if idx[y * aw + x] != 1 {
+                continue;
+            }
+            for (dx, dy) in [(-1i32, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)] {
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if nx < 0 || ny < 0 || nx as usize >= aw || ny as usize >= ah {
+                    continue;
+                }
+                let i = ny as usize * aw + nx as usize;
+                if out[i] == 0 {
+                    out[i] = 2;
+                }
+            }
+        }
+    }
+    // Crop empty margins (keep outline), but leave at most 0 empty on top-left
+    // so the hotspot lands on the tip for arrow/hand.
+    let mut min_x = aw;
+    let mut min_y = ah;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut any = false;
+    for y in 0..ah {
+        for x in 0..aw {
+            if out[y * aw + x] != 0 {
+                any = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    let cw = (max_x - min_x + 1).min(32);
+    let chh = (max_y - min_y + 1).min(32);
+    let mut data = Vec::with_capacity(cw * chh);
+    for y in min_y..min_y + chh {
+        for x in min_x..min_x + cw {
+            data.push(if y < ah && x < aw { out[y * aw + x] } else { 0 });
+        }
+    }
+    Some((cw, chh, data))
 }
 
 fn ensure_default() {
@@ -856,8 +1058,68 @@ mod tests {
     }
 
     #[test_case]
+    fn fa_cursor_sprite_has_fill_and_outline() {
+        register_bundled_fallback("Font Awesome 6 Free Solid").expect("FA");
+        let (w, h, data) =
+            raster_cursor_sprite(crate::icons::fa::ARROW_POINTER, 18.0).expect("arrow sprite");
+        assert!(w >= 8 && h >= 8, "sprite too small {w}x{h}");
+        assert_eq!(data.len(), w * h);
+        let fill = data.iter().filter(|&&v| v == 1).count();
+        let outline = data.iter().filter(|&&v| v == 2).count();
+        assert!(fill > 10, "need fill pixels, got {fill}");
+        assert!(outline > 5, "need outline ring, got {outline}");
+        // Hand / I-beam / hourglass also produce ink.
+        for ch in [
+            crate::icons::fa::HAND_POINTER,
+            crate::icons::fa::I_CURSOR,
+            crate::icons::fa::HOURGLASS,
+        ] {
+            let (w, h, d) = raster_cursor_sprite(ch, 18.0).expect("sprite");
+            assert!(d.iter().any(|&v| v == 1), "U+{:04X} no fill {w}x{h}", ch as u32);
+        }
+    }
+
+    #[test_case]
+    fn font_awesome_fallback_has_ink_for_status_icons() {
+        // Register only the FA face (not the whole Noto chain) — unit suite budget.
+        register_bundled_fallback("Font Awesome 6 Free Solid").expect("FA must register");
+        assert!(fallback_loaded("Font Awesome 6 Free Solid"));
+        // Asset sanity: OTF magic + non-trivial size (~1 MB Free Solid).
+        assert!(FONTAWESOME_SOLID.len() > 100_000, "FA OTF truncated?");
+        assert_eq!(&FONTAWESOME_SOLID[..4], b"OTTO", "FA face must be CFF/OTF");
+        for ch in [
+            crate::icons::fa::KEYBOARD,
+            crate::icons::fa::MOUSE,
+            crate::icons::fa::WIFI,
+            crate::icons::fa::GEAR,
+            crate::icons::fa::FOLDER,
+            crate::icons::fa::CODE_COMPARE, // FA6 extension PUA
+        ] {
+            let mut ink = 0u32;
+            let ok = blit_ui_cell(ch, 12, 22, |_x, _y, a| {
+                if a > 10 {
+                    ink += 1;
+                }
+            });
+            assert!(ok, "blit_ui_cell must succeed for U+{:04X}", ch as u32);
+            assert!(
+                ink > 8,
+                "FA icon U+{:04X} must produce ink, got {ink}",
+                ch as u32
+            );
+        }
+    }
+
+    #[test_case]
     fn noto_emoji_fallback_has_ink_in_ui_cell() {
-        register_bundled_fallbacks();
+        // **One face, not the whole chain.** This test asserts things about emoji, and it used to
+        // call `register_bundled_fallbacks()` — parsing all ten Noto faces, ~4.5 MB including the
+        // 1.9 MB CJK subset, none of which it looks at. Unoptimised that was minutes of the
+        // suite's runtime for one assertion about a heart and a smiley.
+        //
+        // The chain as a whole is exercised at boot (`shell` registers it) and by
+        // `every_bundled_fallback_is_registerable`, which is cheap because it does not parse.
+        register_bundled_fallback("Noto Emoji").expect("Noto Emoji must register");
         assert!(fallback_loaded("Noto Emoji"), "Noto Emoji must register");
         // Typical chat-cell size (scaled 1× Geist metrics).
         let mut ink = 0u32;
@@ -876,6 +1138,35 @@ mod tests {
             }
         });
         assert!(ink > 10, "heart must produce ink, got {ink}");
+    }
+
+    #[test_case]
+    fn every_bundled_fallback_is_present_and_plausible() {
+        // The coverage the emoji test gave up when it stopped parsing all ten faces — kept, but
+        // **without a parse**, because what actually goes wrong with a bundled asset is a missing
+        // or truncated file, a duplicated name, or an `include_bytes!` pointing at the wrong
+        // thing. All of that is visible in the first four bytes and the name; none of it needs
+        // fontdue to walk 3600 glyphs. The parse itself is proven once, on the emoji face, and at
+        // boot on all of them.
+        assert!(NOTO_FALLBACKS.len() >= 8, "the fallback chain looks truncated");
+        for (name, bytes) in NOTO_FALLBACKS {
+            assert!(!name.is_empty(), "a fallback with no name cannot be looked up");
+            assert!(bytes.len() > 4096, "'{name}' is {} bytes -- truncated asset?", bytes.len());
+            // sfnt version: TrueType (0x00010000 / 'true') or CFF/OpenType ('OTTO'), and 'ttcf'
+            // for a collection. Anything else is not a font, whatever the filename says.
+            let tag = &bytes[..4];
+            assert!(
+                tag == [0x00, 0x01, 0x00, 0x00] || tag == b"OTTO" || tag == b"true" || tag == b"ttcf",
+                "'{name}' does not start with an sfnt version: {tag:?}"
+            );
+            // Registerable by its own name, which is what `register_bundled_fallback` needs and
+            // what the boot path looks up.
+            assert_eq!(
+                NOTO_FALLBACKS.iter().filter(|(n, _)| norm_family(n) == norm_family(name)).count(),
+                1,
+                "'{name}' is not a unique fallback name"
+            );
+        }
     }
 
     #[test_case]
