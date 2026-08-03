@@ -1,6 +1,6 @@
-//! **System icons** — Font Awesome 6 Free Solid codepoints.
+//! **System icons** — Font Awesome 7 Free Solid codepoints.
 //!
-//! The face is bundled as `assets/fonts/FontAwesome6Free-Solid-900.otf` and
+//! The face is bundled as `assets/fonts/FontAwesome7Free-Solid-900.otf` and
 //! registered first in the TTF fallback chain ([`crate::font_ttf`]), so UI text
 //! that uses these Private-Use-Area scalars paints FA glyphs rather than tofu.
 //!
@@ -8,13 +8,13 @@
 //! Only **Free Solid** is vendored (no brands pack — brand icons need a separate
 //! face and have stricter trademark rules).
 //!
-//! Codepoints match Font Awesome 6 Free Solid (desktop OTF). Names follow the
+//! Codepoints match Font Awesome 7 Free Solid (desktop OTF). Names follow the
 //! FA slug in SCREAMING_SNAKE. Apps that cannot import this module (wasm guests)
 //! mirror the same literals in `tools/apps-wasm/src/fa.rs`.
 
 use alloc::string::ToString;
 
-/// Font Awesome 6 Free Solid Private Use Area icons used by the shell / apps.
+/// Font Awesome 7 Free Solid Private Use Area icons used by the shell / apps.
 pub mod fa {
     // --- chrome / status bar ---
     /// keyboard
@@ -45,6 +45,8 @@ pub mod fa {
     pub const SERVER: char = '\u{f233}';
     /// bolt
     pub const BOLT: char = '\u{f0e7}';
+    /// power-off
+    pub const POWER_OFF: char = '\u{f011}';
 
     // --- files / documents ---
     /// folder
@@ -129,10 +131,58 @@ pub mod fa {
     pub const SEARCH: char = '\u{f002}';
     /// list-check — todos
     pub const LIST_CHECK: char = '\u{f0ae}';
+    /// list
+    pub const LIST: char = '\u{f03a}';
     /// clipboard-list
     pub const CLIPBOARD_LIST: char = '\u{f46d}';
     /// layer-group
     pub const LAYER_GROUP: char = '\u{f5fd}';
+    /// bars — menu
+    pub const BARS: char = '\u{f0c9}';
+    /// check
+    pub const CHECK: char = '\u{f00c}';
+    /// square-check
+    pub const SQUARE_CHECK: char = '\u{f14a}';
+    /// square (empty checkbox)
+    pub const SQUARE: char = '\u{f0c8}';
+    /// minus
+    pub const MINUS: char = '\u{f068}';
+    /// chevron-right
+    pub const CHEVRON_RIGHT: char = '\u{f054}';
+    /// angle-right
+    pub const ANGLE_RIGHT: char = '\u{f105}';
+    /// pen-to-square — editor
+    pub const PEN_TO_SQUARE: char = '\u{f044}';
+    /// scroll / log stream
+    pub const SCROLL: char = '\u{f70e}';
+    /// bug — ktrace
+    pub const BUG: char = '\u{f188}';
+    /// gauge-high — /top
+    pub const GAUGE: char = '\u{f624}';
+    /// wave-square — audio
+    pub const WAVE_SQUARE: char = '\u{f83e}';
+    /// film — video
+    pub const FILM: char = '\u{f008}';
+    /// circle-info
+    pub const CIRCLE_INFO: char = '\u{f05a}';
+    /// triangle-exclamation
+    pub const TRIANGLE_EXCLAMATION: char = '\u{f071}';
+    /// ban
+    pub const BAN: char = '\u{f05e}';
+    /// circle-notch — spinner-ish
+    pub const CIRCLE_NOTCH: char = '\u{f1ce}';
+    /// star
+    pub const STAR: char = '\u{f005}';
+    /// ellipsis
+    pub const ELLIPSIS: char = '\u{f141}';
+    /// table-columns
+    pub const TABLE_COLUMNS: char = '\u{f0db}';
+
+    // --- chrome controls ---
+    /// xmark — pane / modal close
+    pub const XMARK: char = '\u{f00d}';
+    /// circle-xmark
+    pub const CIRCLE_XMARK: char = '\u{f057}';
 
     // --- cursor shapes (OS mouse pointer) ---
     /// arrow-pointer — default pointer
@@ -264,6 +314,55 @@ pub fn chess_piece(fen: char) -> char {
     }
 }
 
+/// Font Awesome close mark used by pane tabs and list-browser modals.
+#[inline]
+pub fn close_mark() -> char {
+    fa::XMARK
+}
+
+/// Icon for a `/help` command category header.
+pub fn for_command_category(cat: &str) -> char {
+    match cat {
+        "Session" => fa::COMMENTS,
+        "Context" => fa::CLIPBOARD_LIST,
+        "Model & Agent" => fa::ROBOT,
+        "Files" => fa::FOLDER,
+        "Storage" => fa::HARD_DRIVE,
+        "Network" => fa::WIFI,
+        "System & UI" => fa::GEAR,
+        "Media" => fa::MUSIC,
+        _ => fa::LIST,
+    }
+}
+
+/// Best-effort icon for a shell slash-command name (help browser + suggest).
+pub fn for_command(name: &str) -> char {
+    match name {
+        "session" | "clear" | "compact" => fa::COMMENTS,
+        "agents" => fa::ROBOT,
+        "exit" | "restart" => fa::POWER_OFF,
+        "memory" | "skills" | "skill" | "plan" | "permissions" => fa::BOOK,
+        "todos" => fa::LIST_CHECK,
+        "model" | "infer" | "perf" | "bench" | "think" | "mode" => fa::ROBOT,
+        "redteam" | "audit" => fa::SHIELD,
+        "ls" | "cat" | "open" | "mkdir" | "cp" | "mv" | "rm" | "touch" | "glob" | "grep"
+        | "pwd" | "decoder" => fa::FOLDER,
+        "disks" | "mounts" | "mount" | "umount" | "install" | "mkext4" => fa::HARD_DRIVE,
+        "network" | "ping" | "wifi" | "http" | "ws" | "mcp" | "channel" | "browse" => fa::WIFI,
+        "info" | "ui" | "shortcuts" | "help" => fa::CIRCLE_INFO,
+        "top" => fa::GAUGE,
+        "ktrace" => fa::BUG,
+        "datetime" => fa::CLOCK,
+        "battery" | "power" | "suspend" => fa::BATTERY,
+        "theme" | "statusbar" | "pane" | "display" => fa::PALETTE,
+        "clip" => fa::FILE_LINES,
+        "close" => fa::XMARK,
+        "voice" | "onnx" => fa::MICROPHONE,
+        "bluetooth" | "camera" | "touchscreen" | "lspci" => fa::MICROCHIP,
+        _ => fa::TERMINAL,
+    }
+}
+
 /// Font Awesome glyph for an OS cursor shape (CSS-ish set).
 ///
 /// - Arrow → `arrow-pointer`
@@ -379,5 +478,7 @@ mod tests {
         assert_eq!(cursor_glyph(2), fa::I_CURSOR);
         assert_eq!(cursor_glyph(3), fa::HOURGLASS);
         assert!(is_icon(cursor_glyph(0)));
+        assert_eq!(close_mark(), fa::XMARK);
+        assert!(is_icon(close_mark()));
     }
 }

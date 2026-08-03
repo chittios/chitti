@@ -74,8 +74,9 @@ live under [`agents/`](../agents/), with the wasm sources in
 `tools/<name>-wasm/` — see the Apps bullet in [CLAUDE.md](../CLAUDE.md).
 ## Font Awesome Free Solid
 
-`FontAwesome6Free-Solid-900.otf` (SIL OFL 1.1 / icons CC BY 4.0) — system UI
-icons. Registered **first** in the kernel TTF fallback chain so status-bar,
-agents browser, and package-UI chrome resolve Private-Use-Area codepoints
-(`kernel/src/icons.rs`, mirrored in `tools/apps-wasm/src/fa.rs`) to real
-glyphs. See [THIRDPARTY-LICENSES.md](../THIRDPARTY-LICENSES.md).
+`FontAwesome7Free-Solid-900.otf` (v7.3.1, SIL OFL 1.1 / icons CC BY 4.0) —
+system UI icons. Registered **first** in the kernel TTF fallback chain so
+status-bar, cursors, close marks, tab labels, agents browser, and package-UI
+chrome resolve Private-Use-Area codepoints (`kernel/src/icons.rs`, mirrored in
+`tools/apps-wasm/src/fa.rs`) to real glyphs. See
+[THIRDPARTY-LICENSES.md](../THIRDPARTY-LICENSES.md).

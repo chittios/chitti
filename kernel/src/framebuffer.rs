@@ -179,10 +179,9 @@ fn aa_coverage<F: Fn(i64, i64) -> bool>(dx: i64, dy: i64, inside: F) -> u32 {
 /// Padding around the status bar's text, on both sides of its short axis.
 const STATUS_PAD: u64 = 10;
 
-/// Extra height for horizontal bars so status icons (Font Awesome) get a little
-/// headroom without dominating the bar. Keep small — large extras made icons
-/// and the old solid-circle activity mark look uneven next to mono text.
-const STATUS_ICON_EXTRA: u64 = 2;
+/// Extra vertical room in the horizontal status bar so FA icons sit fully inside
+/// the bar with air above/below body text (not clipped against the edge).
+const STATUS_ICON_EXTRA: u64 = 6;
 
 /// How thick the status bar is on a given edge, in pixels.
 ///
@@ -1129,29 +1128,31 @@ pub const VIDEO_SURFACE: u32 = u32::MAX - 1;
 /// Surface id the browser agent paints pages on (labelled "browser").
 pub const BROWSER_SURFACE: u32 = u32::MAX - 2;
 
-/// The short tab-bar label for a view.
+/// The short tab-bar label for a view (Font Awesome glyph + name).
 ///
 /// Package-UI agent surfaces use the **agent name** (chess, paint, …) rather
 /// than the generic "surface" — the action-pane window title tracks the app.
 fn tab_label(m: RightMode) -> alloc::string::String {
+    use crate::icons::fa;
     match m {
         RightMode::Closed => alloc::string::String::new(),
-        RightMode::Ktrace => alloc::string::String::from("ktrace"),
-        RightMode::Editor => alloc::string::String::from("editor"),
-        RightMode::Top => alloc::string::String::from("top"),
-        RightMode::Todos => alloc::string::String::from("todos"),
-        RightMode::Audio => alloc::string::String::from("audio"),
-        RightMode::Surface(IMAGE_SURFACE) => alloc::string::String::from("image"),
-        RightMode::Surface(VIDEO_SURFACE) => alloc::string::String::from("video"),
-        RightMode::Surface(BROWSER_SURFACE) => alloc::string::String::from("browser"),
+        RightMode::Ktrace => alloc::format!("{} ktrace", fa::BUG),
+        RightMode::Editor => alloc::format!("{} editor", fa::PEN_TO_SQUARE),
+        RightMode::Top => alloc::format!("{} top", fa::GAUGE),
+        RightMode::Todos => alloc::format!("{} todos", fa::LIST_CHECK),
+        RightMode::Audio => alloc::format!("{} audio", fa::WAVE_SQUARE),
+        RightMode::Surface(IMAGE_SURFACE) => alloc::format!("{} image", fa::IMAGE),
+        RightMode::Surface(VIDEO_SURFACE) => alloc::format!("{} video", fa::FILM),
+        RightMode::Surface(BROWSER_SURFACE) => alloc::format!("{} browser", fa::GLOBE),
         RightMode::Surface(id) => {
-            // Running package UI (chess/paint/snake/…) — title = agent name.
+            // Running package UI (chess/paint/snake/…) — FA agent icon + name.
             // Use surface_tab_name (display cache), never RUN: tab paint runs
             // while SCREEN is held, often mid-present from a guest host import.
             if let Some(name) = crate::service::package_ui::surface_tab_name(id) {
-                return name;
+                let icon = crate::icons::for_agent(&name);
+                return alloc::format!("{icon} {name}");
             }
-            alloc::format!("surface-{id}")
+            alloc::format!("{} surface-{id}", fa::WINDOW)
         }
     }
 }
@@ -1901,12 +1902,13 @@ impl Screen {
         }
     }
 
-    /// The action-pane close-button rectangle `(x, y, w, h)` — a `[x]` at the
+    /// The action-pane close-button rectangle `(x, y, w, h)` — FA `xmark` at the
     /// top-right of the action pane title. Only meaningful when the pane is open.
-    /// The `[x]` rectangle for action column `pane_i` — the one geometry both the
-    /// renderer and the click hit-test use, so they can never disagree.
+    /// Geometry is shared by the renderer and the click hit-test so they cannot
+    /// disagree. Width matches the square FA cell (body line height) so the mark
+    /// isn't squeezed into a mono column.
     fn close_btn_for(&self, pane_i: usize) -> (u64, u64, u64, u64) {
-        let w = self.cw() * 3;
+        let w = self.ch().max(self.cw() * 2);
         let Some(a) = self.actions.get(pane_i) else {
             return (0, 0, 0, 0);
         };
@@ -1984,10 +1986,20 @@ impl Screen {
         }
     }
 
+    /// Cell size for one glyph. Font Awesome icons get a **square** cell of the
+    /// body line height so they read at text size; mono cells are tall+narrow
+    /// and squashing FA into `cw×ch` made agent-list / close marks tiny.
+    fn glyph_cell(&self, ch: char) -> (u64, u64) {
+        if crate::icons::is_icon(ch) {
+            let side = self.ch();
+            (side, side)
+        } else {
+            (self.cw(), self.ch())
+        }
+    }
+
     fn blit_glyph(&self, px: u64, py: u64, ch: char, fg: Rgb, bg: Rgb) {
-        let s = self.scale;
-        let cell_w = CW as u64 * s;
-        let cell_h = CH as u64 * s;
+        let (cell_w, cell_h) = self.glyph_cell(ch);
         // Background fill first (both paths blend ink over it). With a
         // translucent wallpaper the cell bg is the wallpaper tinted by `bg` at
         // `opacity`, per pixel — so text sits over the see-through desktop too.
@@ -2025,6 +2037,7 @@ impl Screen {
         }
         // Bitmap fallback: the 10×22 ASCII atlas. Non-ASCII with no TTF face
         // stays blank (bg already filled).
+        let s = self.scale;
         let cp = ch as u32;
         if !(FIRST as u32..=LAST as u32).contains(&cp) {
             return;
@@ -2049,24 +2062,31 @@ impl Screen {
         }
     }
 
-    /// Render `s` at pixel `(px,py)`, advancing one scaled cell per char. Returns
-    /// the x past the last glyph. Clips at `self.width`. Titles + status bar.
+    /// Render `s` at pixel `(px,py)`. Body text advances one mono cell; Font
+    /// Awesome icons advance a square of the body line height. Returns the x
+    /// past the last glyph. Clips at `self.width`.
     fn draw_str(&self, px: u64, py: u64, s: &str, fg: Rgb, bg: Rgb) -> u64 {
-        // Glyphs blit pixel-by-pixel, so report the whole run's box once.
+        let cw = self.cw();
+        let ch = self.ch();
+        // Upper-bound the damage box (icons are wider than one mono cell).
+        let mut approx_w = 0u64;
+        for c in s.chars() {
+            approx_w += if crate::icons::is_icon(c) { ch } else { cw };
+        }
         crate::kms::damage(
             (px + self.origin_x) as u32,
             (py + self.origin_y) as u32,
-            (s.chars().count() as u64 * self.cw()) as u32,
-            self.ch() as u32,
+            approx_w as u32,
+            ch as u32,
         );
         let mut x = px;
-        let cw = self.cw();
-        for ch in s.chars() {
-            if x + cw > self.width {
+        for c in s.chars() {
+            let advance = if crate::icons::is_icon(c) { ch } else { cw };
+            if x + advance > self.width {
                 break;
             }
-            self.blit_glyph(x, py, ch, fg, bg);
-            x += cw;
+            self.blit_glyph(x, py, c, fg, bg);
+            x += advance;
         }
         x
     }
@@ -2478,16 +2498,18 @@ impl Screen {
     }
 
     /// Draw status text with icon glyphs (Font Awesome PUA). Body text and the
-    /// activity middle-dot stay at the normal cell size; icons share a modest
-    /// square cell (~1.15× width) so keyboard / mouse / wifi look even.
+    /// activity middle-dot stay at the normal cell size; icons use a square cell
+    /// equal to the body line height (FA is fit-to-cell so nothing clips).
     fn draw_status_str(&self, mut x: u64, y: u64, s: &str, fg: Rgb, bg: Rgb, max_x: u64) -> u64 {
         let cw = self.cw();
         let ch = self.ch();
-        // Slightly wider than a mono cell; not 1.5× (that plus advance-based FA
-        // sizing made the solid-circle activity mark a giant blob).
-        let icon_cw = cw + (cw / 6).max(1);
-        let icon_ch = ch + STATUS_ICON_EXTRA;
-        let body_y = y + STATUS_ICON_EXTRA / 2;
+        // Square icon cell matching the text line — wider cells clipped the sides
+        // of wide FA glyphs (keyboard); taller-than-bar cells clipped top/bottom.
+        let icon_cw = ch.max(cw);
+        let icon_ch = ch;
+        // Vertically centre the body line against the icon row when the bar gave
+        // us extra headroom (`y` is already the icon/text band top).
+        let body_y = y;
         for ch_c in s.chars() {
             if is_status_icon(ch_c) {
                 if x + icon_cw > max_x {
@@ -2595,12 +2617,13 @@ impl Screen {
     }
 
     /// The status bar as a **row** (top/bottom edge) — brand left, system info
-    /// right, each ellipsized into its half. Icons are drawn larger than text.
+    /// right, each ellipsized into its half. Icons share the body line height.
     fn draw_status_horizontal(&self) {
         let (_, sy_top, _, bar_h) = self.status_rect;
         self.paint_surface(0, sy_top, self.width, bar_h, self.theme.status_bg);
-        // Vertically centre the text/icon run in the bar.
-        let ty = sy_top + bar_h.saturating_sub(self.ch() + STATUS_ICON_EXTRA) / 2;
+        // Vertically centre the text/icon line in the bar (icons = body cell height).
+        let line_h = self.ch();
+        let ty = sy_top + bar_h.saturating_sub(line_h) / 2;
         let cw = self.cw();
         let lr = (((bar_h / 2).saturating_sub(2)) * 6 / 7).max(6);
         let lhalf = ((lr / 3).max(3)) / 2;
@@ -2622,8 +2645,8 @@ impl Screen {
             self.theme.status_bg,
             max_left,
         );
-        // Approximate right start: icons widen the run slightly (match draw_status_str).
-        let icon_cw = cw + (cw / 6).max(1);
+        // Icon cells are square at body line height (match draw_status_str).
+        let icon_cw = line_h.max(cw);
         let mut r_w = 0u64;
         for c in right.chars() {
             r_w += if is_status_icon(c) { icon_cw } else { cw };
@@ -3314,8 +3337,13 @@ impl Screen {
         if a.pane.w == 0 || a.is_empty() {
             return;
         }
-        let (x, y, ..) = self.close_btn_for(pane_i);
-        self.draw_str(x, y, "[x]", (230, 120, 120), a.pane.bg);
+        let (x, y, w, _) = self.close_btn_for(pane_i);
+        // Font Awesome xmark in a square line-height cell (see `glyph_cell`),
+        // centred in the hit box; ink from the live theme accent.
+        let mark = crate::icons::close_mark();
+        let (iw, _) = self.glyph_cell(mark);
+        let ix = x + w.saturating_sub(iw) / 2;
+        self.blit_glyph(ix, y, mark, self.theme.accent, a.pane.bg);
     }
 
     /// Per-tab header layout for action column `pane_i`.
@@ -4167,7 +4195,7 @@ pub enum ModalHit {
     Yes,
     No,
     Ok,
-    /// Commands/agents-browser close `[x]` (slot 0 reused when that modal is up).
+    /// Commands/agents-browser close (FA xmark; slot 0 reused when that modal is up).
     Close,
     /// Absolute row index in a list browser (`scroll + visible row`). Headers
     /// and items share the index space; callers skip non-selectable rows.
@@ -4491,26 +4519,36 @@ pub fn draw_list_browser(
         let mut y = by + BORDER + PAD;
         let content_w = cols * cw;
 
-        // Title + [x] close.
+        // Title + FA xmark close (theme accent — same as pane close).
+        let mark = crate::icons::close_mark();
+        let (close_w, _) = sc.glyph_cell(mark);
+        let close_w = close_w.max(cw * 2);
         sc.draw_str(
             ix,
             y,
-            &crate::textsel::ellipsize(title, cols as usize),
+            &crate::textsel::ellipsize(
+                title,
+                cols.saturating_sub((close_w / cw).max(2)) as usize,
+            ),
             sc.theme.accent,
             bg,
         );
-        let close = "[x]";
-        let cx = ix + content_w - close.len() as u64 * cw;
-        sc.draw_str(cx, y, close, sc.theme.title_dim, bg);
-        MODAL_RECTS.with(|m| m[0] = (cx, y, close.len() as u64 * cw, ch));
+        // Hit target ≥ square FA cell; glyph centred like the pane close chrome.
+        let cx = ix + content_w.saturating_sub(close_w);
+        let (iw, _) = sc.glyph_cell(mark);
+        sc.blit_glyph(cx + close_w.saturating_sub(iw) / 2, y, mark, sc.theme.accent, bg);
+        MODAL_RECTS.with(|m| m[0] = (cx, y, close_w, ch));
         y += ch + 4;
         sc.fill_rect(ix, y, content_w, 1, sc.theme.sep_dim);
         y += 6;
 
-        // Search field.
-        sc.draw_str(ix, y, "search:", sc.theme.title_dim, bg);
-        let field_x = ix + 8 * cw;
-        let field_w = content_w.saturating_sub(8 * cw);
+        // Search field (FA magnifying-glass + label).
+        let search_lab = alloc::format!("{} search", crate::icons::fa::SEARCH);
+        sc.draw_str(ix, y, &search_lab, sc.theme.title_dim, bg);
+        // Label width: FA cell (= line height) + " search" (7 mono cells).
+        let lab_w = ch + 7 * cw;
+        let field_x = ix + lab_w + cw / 2;
+        let field_w = content_w.saturating_sub(lab_w + cw / 2);
         sc.fill_rect(field_x, y, field_w, ch, list_bg);
         sc.rect_outline(field_x, y, field_w, ch, 1, sc.theme.border_dim);
         let qshow = crate::textsel::ellipsize(query, (field_w / cw).saturating_sub(1) as usize);
@@ -6271,8 +6309,12 @@ pub fn draw_todos(items: &[TodoViewItem<'_>], title: &str) {
         let rows = d.rows;
         let cols = (iw / sc.cw()).max(1) as usize;
         let mut y = iy;
-        let head = if title.is_empty() { "Todos" } else { title };
-        let head_fmt = pad_trunc(head, cols);
+        let head = if title.is_empty() {
+            alloc::format!("{} Todos", crate::icons::fa::LIST_CHECK)
+        } else {
+            alloc::format!("{} {title}", crate::icons::fa::LIST_CHECK)
+        };
+        let head_fmt = pad_trunc(&head, cols);
         sc.draw_str_bg(px, y, &head_fmt, sc.theme.accent, bg);
         y += ch + ch / 4;
         if items.is_empty() {
@@ -6281,11 +6323,12 @@ pub fn draw_todos(items: &[TodoViewItem<'_>], title: &str) {
             return;
         }
         for it in items {
+            use crate::icons::fa;
             let mark = match it.status {
-                "done" => "[x]",
-                "in_progress" => "[>]",
-                "cancelled" => "[-]",
-                _ => "[ ]",
+                "done" => fa::SQUARE_CHECK,
+                "in_progress" => fa::CHEVRON_RIGHT,
+                "cancelled" => fa::BAN,
+                _ => fa::SQUARE,
             };
             let row = alloc::format!("{mark} {}: {}", it.id, it.text);
             let fg = match it.status {

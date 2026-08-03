@@ -339,11 +339,12 @@ Source: https://github.com/uiuc-kang-lab/InjecAgent
 
 ---
 
-## Font Awesome Free — `assets/fonts/FontAwesome6Free-Solid-900.otf`
+## Font Awesome Free — `assets/fonts/FontAwesome7Free-Solid-900.otf`
 
-[Font Awesome Free](https://fontawesome.com) 6 Solid face used for system UI
-icons (status bar, settings chrome, agent badges). Bundled as a single OTF and
-registered first in the kernel TTF fallback chain (`font_ttf::register_bundled_fallbacks`).
+[Font Awesome Free](https://fontawesome.com) **7.3.1** Solid face used for system
+UI icons (status bar, cursors, close marks, tab labels, agents browser, todos,
+settings chrome). Bundled as a single OTF and registered first in the kernel TTF
+fallback chain (`font_ttf::register_bundled_fallbacks` / `FA_FALLBACK_NAME`).
 
 - **Fonts**: SIL Open Font License 1.1  
 - **Icons**: CC BY 4.0  
@@ -351,4 +352,4 @@ registered first in the kernel TTF fallback chain (`font_ttf::register_bundled_f
 
 Full license text: https://fontawesome.com/license/free  
 Only the **Free Solid** face is vendored (no Brands pack). Codepoints are the
-Font Awesome 6 Free Solid Private Use Area map (`kernel/src/icons.rs`).
+Font Awesome 7 Free Solid Private Use Area map (`kernel/src/icons.rs`).

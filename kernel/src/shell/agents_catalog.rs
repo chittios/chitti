@@ -71,11 +71,17 @@ pub fn filter_rows(query: &str) -> Vec<Row> {
         }
     }
     if !ui_items.is_empty() {
-        out.push(Row::Header(String::from("UI (canvas)")));
+        out.push(Row::Header(alloc::format!(
+            "{} UI (canvas)",
+            crate::icons::fa::DISPLAY
+        )));
         out.extend(ui_items);
     }
     if !shell_items.is_empty() {
-        out.push(Row::Header(String::from("Shell agents")));
+        out.push(Row::Header(alloc::format!(
+            "{} Shell agents",
+            crate::icons::fa::COMMENTS
+        )));
         out.extend(shell_items);
     }
 
@@ -109,7 +115,10 @@ pub fn filter_rows(query: &str) -> Vec<Row> {
         });
     }
     if !running_items.is_empty() {
-        out.push(Row::Header(String::from("Running")));
+        out.push(Row::Header(alloc::format!(
+            "{} Running",
+            crate::icons::fa::MICROCHIP
+        )));
         out.extend(running_items);
     }
 

@@ -20,11 +20,11 @@ use fontdue::{Font, FontSettings};
 static GEIST_TTF: &[u8] = include_bytes!("../../assets/fonts/GeistMono-Regular.ttf");
 static UBUNTU_MONO_TTF: &[u8] = include_bytes!("../../assets/fonts/UbuntuMono-Regular.ttf");
 
-/// Font Awesome 6 Free Solid (SIL OFL) — system UI icons in the Private Use
+/// Font Awesome 7 Free Solid (SIL OFL) — system UI icons in the Private Use
 /// Area (`U+F000`…). Registered **first** in the fallback chain so status-bar
 /// and chrome icons resolve here before Noto/emoji scans. See [`crate::icons`].
 static FONTAWESOME_SOLID: &[u8] =
-    include_bytes!("../../assets/fonts/FontAwesome6Free-Solid-900.otf");
+    include_bytes!("../../assets/fonts/FontAwesome7Free-Solid-900.otf");
 
 /// Bundled **Noto Sans** script fonts (SIL Open Font License — see
 /// THIRDPARTY-LICENSES.md) forming the system fallback chain, so Indic web
@@ -56,9 +56,12 @@ pub static NOTO_FALLBACKS: &[(&str, &[u8])] = &[
 /// before the browser/UI render any non-Latin or icon text.
 ///
 /// Order: **Font Awesome first** (PUA icons), then Noto scripts / emoji / CJK.
+/// Canonical name of the bundled Font Awesome Free Solid face.
+pub const FA_FALLBACK_NAME: &str = "Font Awesome 7 Free Solid";
+
 pub fn register_bundled_fallbacks() {
     // Icons before Noto so U+Fxxx never walks the huge CJK cmap first.
-    const FA_NAME: &str = "Font Awesome 6 Free Solid";
+    const FA_NAME: &str = FA_FALLBACK_NAME;
     if !fallback_loaded(FA_NAME) {
         match register_fallback(FA_NAME, FONTAWESOME_SOLID) {
             Ok(()) => crate::ktrace::log_fmt(format_args!(
@@ -93,16 +96,20 @@ pub fn register_bundled_fallbacks() {
 /// For a caller that needs a single script's coverage rather than the whole chain — notably the
 /// unit suite, where parsing all ten faces to exercise one is minutes of a debug build.
 ///
-/// Accepts `"Font Awesome 6 Free Solid"` (or `"fontawesome"`) as well as every
-/// name in [`NOTO_FALLBACKS`].
+/// Accepts [`FA_FALLBACK_NAME`] / `"fontawesome"` / `"fa"` (and the FA6 alias)
+/// as well as every name in [`NOTO_FALLBACKS`].
 pub fn register_bundled_fallback(want: &str) -> Result<(), &'static str> {
     if fallback_loaded(want) {
         return Ok(());
     }
-    const FA_NAME: &str = "Font Awesome 6 Free Solid";
     let w = norm_family(want);
-    if w == norm_family(FA_NAME) || w == "fontawesome" || w == "fa" {
-        return register_fallback(FA_NAME, FONTAWESOME_SOLID);
+    if w == norm_family(FA_FALLBACK_NAME)
+        || w == "fontawesome"
+        || w == "fa"
+        // Older docs / tests named the FA6 face — same binary after the upgrade.
+        || w == norm_family("Font Awesome 6 Free Solid")
+    {
+        return register_fallback(FA_FALLBACK_NAME, FONTAWESOME_SOLID);
     }
     let (name, bytes) = NOTO_FALLBACKS
         .iter()
@@ -205,11 +212,27 @@ fn is_fa_icon(ch: char) -> bool {
 /// Returns `(x, y, alpha)` for each ink pixel.
 fn build_ui_glyph(font: &Font, ch: char, cw: usize, ch_px: usize) -> Vec<(u16, u16, u8)> {
     if is_fa_icon(ch) {
-        // ~70% of cell height: readable next to mono body text without dominating.
-        let px = (ch_px as f32 * 0.70).max(1.0);
-        let (m, cov) = font.rasterize(ch, px);
-        // Centre the bitmap in the cell (ignore xmin bearing — FA icons are
-        // designed as squares and look even when optically centred).
+        // Size by **line height**, not min(cw, ch). Mono cells are tall and
+        // narrow (≈10×22); using the width made agent-list / close marks look
+        // like tiny dots. Callers that want square icons (status bar, FA in
+        // draw_str) pass cw ≈ ch_px.
+        //
+        // fontdue's `px` is an em size, not a max bitmap edge — solids often
+        // rasterize larger than `px`, so we measure and shrink-to-fit with a
+        // little air so AA edges aren't clipped.
+        let mut px = (ch_px as f32 * 0.82).max(1.0);
+        let (mut m, mut cov) = font.rasterize(ch, px);
+        if m.width > 0 && m.height > 0 {
+            let overflow_w = m.width as f32 / cw.max(1) as f32;
+            let overflow_h = m.height as f32 / ch_px.max(1) as f32;
+            let overflow = overflow_w.max(overflow_h);
+            if overflow > 1.0 {
+                px = (px / overflow * 0.90).max(1.0);
+                let r = font.rasterize(ch, px);
+                m = r.0;
+                cov = r.1;
+            }
+        }
         let gx0 = (cw as i32 - m.width as i32) / 2;
         let gy0 = (ch_px as i32 - m.height as i32) / 2;
         return pack_ui_glyph(m, &cov, gx0, gy0, cw, ch_px);
@@ -389,10 +412,10 @@ pub fn fallback_count() -> usize {
 
 /// Ensure Font Awesome is in the fallback chain (idempotent, cheap if loaded).
 fn ensure_font_awesome() {
-    if fallback_loaded("Font Awesome 6 Free Solid") {
+    if fallback_loaded(FA_FALLBACK_NAME) {
         return;
     }
-    let _ = register_bundled_fallback("Font Awesome 6 Free Solid");
+    let _ = register_bundled_fallback(FA_FALLBACK_NAME);
 }
 
 /// Rasterize a single glyph (typically Font Awesome) to a **cursor index sprite**:
@@ -1058,8 +1081,51 @@ mod tests {
     }
 
     #[test_case]
+    fn fa_ui_glyph_fits_inside_cell_without_clipping_ink() {
+        // Square cells (status bar / agent list / close): full line-height icons.
+        register_bundled_fallback(FA_FALLBACK_NAME).expect("FA");
+        for (ch, side) in [
+            (crate::icons::fa::KEYBOARD, 22usize),
+            (crate::icons::fa::MOUSE, 22),
+            (crate::icons::fa::WIFI, 22),
+            (crate::icons::fa::XMARK, 22),
+            (crate::icons::fa::CHESS_KNIGHT, 18),
+        ] {
+            let mut min_y = side;
+            let mut max_y = 0usize;
+            let mut min_x = side;
+            let mut max_x = 0usize;
+            let mut ink = 0u32;
+            let ok = blit_ui_cell(ch, side, side, |x, y, a| {
+                if a > 20 {
+                    ink += 1;
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            });
+            assert!(ok, "blit U+{:04X}", ch as u32);
+            assert!(ink > 10, "U+{:04X} needs ink, got {ink}", ch as u32);
+            assert!(max_x < side && max_y < side, "U+{:04X} out of cell", ch as u32);
+            let ink_h = max_y - min_y + 1;
+            // Icons should use most of the line height (not tiny dots).
+            assert!(
+                ink_h >= side * 4 / 10,
+                "U+{:04X} too small: ink_h={ink_h} side={side}",
+                ch as u32
+            );
+            assert!(
+                ink_h < side,
+                "U+{:04X} fills whole cell height — likely clipped",
+                ch as u32
+            );
+        }
+    }
+
+    #[test_case]
     fn fa_cursor_sprite_has_fill_and_outline() {
-        register_bundled_fallback("Font Awesome 6 Free Solid").expect("FA");
+        register_bundled_fallback(FA_FALLBACK_NAME).expect("FA");
         let (w, h, data) =
             raster_cursor_sprite(crate::icons::fa::ARROW_POINTER, 18.0).expect("arrow sprite");
         assert!(w >= 8 && h >= 8, "sprite too small {w}x{h}");
@@ -1082,9 +1148,9 @@ mod tests {
     #[test_case]
     fn font_awesome_fallback_has_ink_for_status_icons() {
         // Register only the FA face (not the whole Noto chain) — unit suite budget.
-        register_bundled_fallback("Font Awesome 6 Free Solid").expect("FA must register");
-        assert!(fallback_loaded("Font Awesome 6 Free Solid"));
-        // Asset sanity: OTF magic + non-trivial size (~1 MB Free Solid).
+        register_bundled_fallback(FA_FALLBACK_NAME).expect("FA must register");
+        assert!(fallback_loaded(FA_FALLBACK_NAME));
+        // Asset sanity: OTF magic + non-trivial size (FA7 Free Solid is ~400 KiB).
         assert!(FONTAWESOME_SOLID.len() > 100_000, "FA OTF truncated?");
         assert_eq!(&FONTAWESOME_SOLID[..4], b"OTTO", "FA face must be CFF/OTF");
         for ch in [

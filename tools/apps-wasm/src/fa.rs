@@ -1,4 +1,4 @@
-//! Font Awesome 6 Free Solid codepoints for package-UI chrome.
+//! Font Awesome 7 Free Solid codepoints for package-UI chrome.
 //!
 //! Mirrors `kernel/src/icons.rs` — wasm guests cannot import the kernel crate,
 //! so these literals must stay in lockstep. Host rasterizes them via the

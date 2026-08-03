@@ -190,11 +190,13 @@ pub fn filter_rows(query: &str) -> Vec<Row> {
             }
         }
         if e.category != last_cat {
-            out.push(Row::Header(String::from(e.category)));
+            let icon = crate::icons::for_command_category(e.category);
+            out.push(Row::Header(alloc::format!("{icon} {}", e.category)));
             last_cat = e.category;
         }
+        let icon = crate::icons::for_command(e.name);
         out.push(Row::Item {
-            title: String::from(e.title),
+            title: alloc::format!("{icon} {}", e.title),
             name: String::from(e.name),
             shortcut: String::from(e.shortcut),
         });
@@ -264,8 +266,14 @@ mod tests {
     #[test_case]
     fn filter_groups_and_search() {
         let all = filter_rows("");
-        assert!(all.iter().any(|r| matches!(r, Row::Header(h) if h == "Files")));
+        // Headers carry an FA glyph prefix (e.g. "📁 Files").
+        assert!(all.iter().any(|r| matches!(r, Row::Header(h) if h.contains("Files"))));
         assert!(all.iter().any(|r| matches!(r, Row::Item { name, .. } if name == "ls")));
+        assert!(
+            all.iter()
+                .any(|r| matches!(r, Row::Item { title, name, .. } if name == "ls" && title.contains("List"))),
+            "item titles keep the friendly label after the FA icon"
+        );
 
         let f = filter_rows("comp");
         // compact + maybe others
