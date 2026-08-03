@@ -2490,6 +2490,9 @@ impl Screen {
     }
 
     fn draw_status(&self) {
+        // Icons must hit the FA face (first fallback); if registration was
+        // skipped or failed earlier, status chips paint as thin tofu bars.
+        let _ = crate::font_ttf::register_bundled_fallback(crate::font_ttf::FA_FALLBACK_NAME);
         if self.layout.status_pos.vertical() {
             self.draw_status_vertical();
         } else {
@@ -2575,6 +2578,8 @@ impl Screen {
     /// which felt like horizontal "ends" rather than a vertical strip.
     fn draw_status_vertical(&self) {
         let (bx, by, bw, bh) = self.status_rect;
+        STATUS_BAR_RECT.with(|r| *r = (bx, by, bw, bh));
+        clear_status_chip_rects();
         self.paint_surface(bx, by, bw, bh, self.theme.status_bg);
         let (cw, ch) = (self.cw(), self.ch());
         // Slightly taller rows so icons have room; body text is vertically centred
@@ -2588,38 +2593,42 @@ impl Screen {
             self.theme.accent,
             self.theme.chat_fg,
         );
+        // Brand hit = logo row (+ first left field when present).
+        set_status_chip_rect(StatusChip::Brand, (bx, by, bw, row.min(bh)));
         let tx = bx + STATUS_PAD / 2;
         let max_x = bx + bw.saturating_sub(STATUS_PAD / 2);
         let cols = (bw.saturating_sub(STATUS_PAD) / cw).max(4) as usize;
         let first = by + STATUS_PAD / 2 + row;
         let last = by + bh.saturating_sub(STATUS_PAD / 2);
-        // One token per row, top → bottom (left template, then right).
-        let mut lines: alloc::vec::Vec<(alloc::string::String, bool)> = alloc::vec::Vec::new();
-        for line in crate::panes_layout::status_lines_vertical(&self.status_left, cols) {
-            lines.push((line, true)); // accent
-        }
-        for line in crate::panes_layout::status_lines_vertical(&self.status_right, cols) {
-            lines.push((line, false)); // body
-        }
+        // One token per row, top → bottom (left template, then right chips).
         let mut top = first;
-        for (line, accent) in lines {
+        let left_lines = crate::panes_layout::status_lines_vertical(&self.status_left, cols);
+        for (i, line) in left_lines.iter().enumerate() {
             if top + row > last {
                 break;
             }
-            let fg = if accent {
-                self.theme.accent
-            } else {
-                self.theme.status_fg
-            };
-            self.draw_status_str(tx, top, &line, fg, self.theme.status_bg, max_x);
+            self.draw_status_str(tx, top, line, self.theme.accent, self.theme.status_bg, max_x);
+            if i == 0 {
+                set_status_chip_rect(StatusChip::Brand, (bx, by, bw, (top + row - by).min(bh)));
+            }
+            top += row;
+        }
+        for (chip, text) in status_right_chips() {
+            if top + row > last {
+                break;
+            }
+            self.draw_status_str(tx, top, &text, self.theme.status_fg, self.theme.status_bg, max_x);
+            set_status_chip_rect(chip, (bx, top, bw, row));
             top += row;
         }
     }
 
-    /// The status bar as a **row** (top/bottom edge) — brand left, system info
-    /// right, each ellipsized into its half. Icons share the body line height.
+    /// The status bar as a **row** (top/bottom edge) — brand left, system chips
+    /// right. Each right chip is individually clickable (macOS menu-bar style).
     fn draw_status_horizontal(&self) {
         let (_, sy_top, _, bar_h) = self.status_rect;
+        STATUS_BAR_RECT.with(|r| *r = (0, sy_top, self.width, bar_h));
+        clear_status_chip_rects();
         self.paint_surface(0, sy_top, self.width, bar_h, self.theme.status_bg);
         // Vertically centre the text/icon line in the bar (icons = body cell height).
         let line_h = self.ch();
@@ -2633,9 +2642,7 @@ impl Screen {
         let gap = 2 * cw;
         let usable = self.width.saturating_sub(text_x + OUTER + gap);
         let left_budget = (usable / 2 / cw).max(4) as usize;
-        let right_budget = (usable.saturating_sub(left_budget as u64 * cw) / cw).max(4) as usize;
         let left = crate::textsel::ellipsize(&self.status_left, left_budget);
-        let right = crate::textsel::ellipsize(&self.status_right, right_budget);
         let max_left = text_x + left_budget as u64 * cw;
         self.draw_status_str(
             text_x,
@@ -2645,23 +2652,52 @@ impl Screen {
             self.theme.status_bg,
             max_left,
         );
-        // Icon cells are square at body line height (match draw_status_str).
-        let icon_cw = line_h.max(cw);
-        let mut r_w = 0u64;
-        for c in right.chars() {
-            r_w += if is_status_icon(c) { icon_cw } else { cw };
-        }
-        let rx = self.width.saturating_sub(r_w + OUTER);
-        let left_end = text_x + left.chars().count() as u64 * (cw + cw / 4) + gap;
-        let rx = rx.max(left_end).min(self.width.saturating_sub(OUTER));
-        self.draw_status_str(
-            rx,
-            ty,
-            &right,
-            self.theme.status_fg,
-            self.theme.status_bg,
-            self.width.saturating_sub(OUTER / 2),
+        // Logo + "ChittiOS v…" left text is the About click target.
+        set_status_chip_rect(
+            StatusChip::Brand,
+            (OUTER, sy_top, max_left.saturating_sub(OUTER / 2), bar_h),
         );
+
+        // Right chips painted individually so each has a hit rect.
+        let chips = status_right_chips();
+        let gap1 = cw; // within a tight group
+        let gap2 = 2 * cw; // between groups
+        let mut total = 0u64;
+        for (i, (_, text)) in chips.iter().enumerate() {
+            if i > 0 {
+                // kbd–mouse single space; otherwise group gap
+                total += if i == 1 { gap1 } else { gap2 };
+            }
+            total += status_str_advance(text, cw, line_h);
+        }
+        let left_end = text_x + status_str_advance(&left, cw, line_h) + gap;
+        let mut x = self
+            .width
+            .saturating_sub(total + OUTER)
+            .max(left_end)
+            .min(self.width.saturating_sub(OUTER));
+        let max_x = self.width.saturating_sub(OUTER / 2);
+        for (i, (chip, text)) in chips.iter().enumerate() {
+            if i > 0 {
+                x += if i == 1 { gap1 } else { gap2 };
+            }
+            let w = status_str_advance(text, cw, line_h);
+            if x + w > max_x {
+                break;
+            }
+            // Icon chips (kbd/mouse/net) use accent so FA glyphs read clearly;
+            // text chips keep the dimmer status_fg.
+            let fg = match chip {
+                StatusChip::Kbd | StatusChip::Mouse | StatusChip::Net => self.theme.accent,
+                _ => self.theme.status_fg,
+            };
+            let x1 = self.draw_status_str(x, ty, text, fg, self.theme.status_bg, max_x);
+            // Hit pad a few px for easy clicking.
+            let hx = x.saturating_sub(2);
+            let hw = x1.saturating_sub(hx) + 2;
+            set_status_chip_rect(*chip, (hx, sy_top, hw, bar_h));
+            x = x1;
+        }
     }
 
     /// Draw `s` within `[x, x+max_w)`, ellipsizing when it would overflow.
@@ -4208,6 +4244,19 @@ pub enum ModalHit {
 /// modal is drawn, read by [`modal_hit`] for mouse routing. Zero-size = absent.
 static MODAL_RECTS: Locked<[(u64, u64, u64, u64); 3]> = Locked::new([(0, 0, 0, 0); 3]);
 
+/// Dedicated close-mark rect (FA xmark). Checked **first** in [`modal_hit`] so
+/// About / status menus can put Close in slot 0 *and* use slots 1–2 for other
+/// chrome without Close being mis-classified as Yes.
+static MODAL_CLOSE_RECT: Locked<(u64, u64, u64, u64)> = Locked::new((0, 0, 0, 0));
+
+fn set_modal_close_rect(r: (u64, u64, u64, u64)) {
+    MODAL_CLOSE_RECT.with(|c| *c = r);
+}
+
+fn clear_modal_close_rect() {
+    MODAL_CLOSE_RECT.with(|c| *c = (0, 0, 0, 0));
+}
+
 /// Geometry of the scrollable list in `/help` and `/agents` browsers, for
 /// mouse row hit-testing. Cleared on dismiss.
 #[derive(Clone, Copy)]
@@ -4234,21 +4283,148 @@ static CHOOSE_COUNT: core::sync::atomic::AtomicUsize =
 /// compute pumps `shell::upkeep`) must not blink the pane caret into the box.
 static MODAL_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Clickable status-bar chips (macOS menu-bar style). Brand opens About; the
+/// rest open a dropdown popover with live details.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StatusChip {
+    Brand = 0,
+    Kbd = 1,
+    Mouse = 2,
+    Net = 3,
+    Mem = 4,
+    Cpu = 5,
+    Battery = 6,
+    Clock = 7,
+}
+
+const STATUS_CHIP_N: usize = 8;
+
+/// Hit rects for [`StatusChip`] (index = `chip as usize`). Zero-size = absent.
+static STATUS_CHIP_RECTS: Locked<[(u64, u64, u64, u64); STATUS_CHIP_N]> =
+    Locked::new([(0, 0, 0, 0); STATUS_CHIP_N]);
+
+/// Full status-bar rect (for anchoring menus above/below/beside).
+static STATUS_BAR_RECT: Locked<(u64, u64, u64, u64)> = Locked::new((0, 0, 0, 0));
+
 fn in_rect(x: u64, y: u64, r: (u64, u64, u64, u64)) -> bool {
     r.2 != 0 && x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3
 }
 
+fn clear_status_chip_rects() {
+    STATUS_CHIP_RECTS.with(|a| *a = [(0, 0, 0, 0); STATUS_CHIP_N]);
+}
+
+fn set_status_chip_rect(chip: StatusChip, r: (u64, u64, u64, u64)) {
+    STATUS_CHIP_RECTS.with(|a| a[chip as usize] = r);
+}
+
+/// True if `(x, y)` is on the status-bar brand (logo / "ChittiOS" name).
+pub fn status_brand_hit(x: u64, y: u64) -> bool {
+    status_chip_hit(x, y) == Some(StatusChip::Brand)
+}
+
+/// Which status-bar chip is under `(x, y)`, if any (inactive while a modal is up).
+pub fn status_chip_hit(x: u64, y: u64) -> Option<StatusChip> {
+    if MODAL_ON.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    STATUS_CHIP_RECTS.with(|a| {
+        for i in 0..STATUS_CHIP_N {
+            if in_rect(x, y, a[i]) {
+                return Some(match i {
+                    0 => StatusChip::Brand,
+                    1 => StatusChip::Kbd,
+                    2 => StatusChip::Mouse,
+                    3 => StatusChip::Net,
+                    4 => StatusChip::Mem,
+                    5 => StatusChip::Cpu,
+                    6 => StatusChip::Battery,
+                    _ => StatusChip::Clock,
+                });
+            }
+        }
+        None
+    })
+}
+
+/// Pixel advance of a status string (icons use square line-height cells).
+fn status_str_advance(s: &str, cw: u64, ch: u64) -> u64 {
+    let icon_cw = ch.max(cw);
+    let mut w = 0u64;
+    for c in s.chars() {
+        w += if is_status_icon(c) { icon_cw } else { cw };
+    }
+    w
+}
+
+/// Live right-side status chips (same content the bar paints, in order).
+fn status_right_chips() -> alloc::vec::Vec<(StatusChip, alloc::string::String)> {
+    let mut out = alloc::vec::Vec::new();
+    let last_k = crate::console::input_activity_ms();
+    let k_active = last_k != 0 && crate::arch::now_ms().saturating_sub(last_k) < 1500;
+    out.push((StatusChip::Kbd, crate::icons::status_kbd(k_active)));
+    let last_m = crate::mouse::activity_ms();
+    let m_active = last_m != 0 && crate::arch::now_ms().saturating_sub(last_m) < 1500;
+    out.push((StatusChip::Mouse, crate::icons::status_mouse(m_active)));
+    out.push((StatusChip::Net, crate::icons::status_net(crate::net::is_up())));
+    // mem / cpu / cores — match ui_config::resolve_var labels
+    {
+        let m = crate::mm::mem_stats();
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        let mem = if m.ram_total >= gib {
+            alloc::format!(
+                "mem {}M/{}.{}G",
+                (m.heap_used + (m.ram_reserved - m.heap_total)) / mib,
+                m.ram_total / gib,
+                (m.ram_total % gib) * 10 / gib
+            )
+        } else {
+            alloc::format!("mem {}/{}M", m.heap_used / mib, m.ram_total / mib)
+        };
+        out.push((StatusChip::Mem, mem));
+    }
+    out.push((
+        StatusChip::Cpu,
+        alloc::format!(
+            "cpu {:>3}% {}c",
+            crate::shell::cpu_percent(),
+            crate::arch::cpu_count()
+        ),
+    ));
+    if let Some(b) = crate::drivers::battery::cached() {
+        let s = crate::drivers::battery::format(&b);
+        if !s.is_empty() {
+            out.push((StatusChip::Battery, s));
+        }
+    }
+    out.push((
+        StatusChip::Clock,
+        alloc::format!(
+            "{} {}",
+            crate::clock::format_datetime(),
+            crate::clock::format_tz()
+        ),
+    ));
+    out
+}
+
 /// Hit-test the modal controls against a click at `(x, y)`.
 pub fn modal_hit(x: u64, y: u64) -> ModalHit {
+    // Close mark first (dedicated rect) so it wins over the menu-body rect that
+    // fully contains it (status dropdown) and over slot-0 Yes (confirm).
+    if MODAL_CLOSE_RECT.with(|c| in_rect(x, y, *c)) {
+        return ModalHit::Close;
+    }
     let r = MODAL_RECTS.with(|m| *m);
-    // Commands browser stashes Close in slot 0 and leaves 1 empty; confirm uses
-    // Yes/No in 0/1. Disambiguate: if slot 1 is empty and slot 0 is set, it's Close.
+    // Confirm: Yes/No in 0/1. List browsers also leave Close in slot 0 with 1/2
+    // empty — keep that path for older drawers that only set slot 0.
     if in_rect(x, y, r[0]) {
         if r[1] == (0, 0, 0, 0) && r[2] == (0, 0, 0, 0) {
             return ModalHit::Close;
-        } else {
-            return ModalHit::Yes;
         }
+        return ModalHit::Yes;
     } else if in_rect(x, y, r[1]) {
         return ModalHit::No;
     } else if in_rect(x, y, r[2]) {
@@ -4427,6 +4603,589 @@ pub fn draw_confirm(title: &str, msg: &str, focus_yes: bool) {
     });
 }
 
+/// Draw a macOS-style **About ChittiOS** dialog: logo, version, build, arch,
+/// tagline, and an OK button (plus FA close). Clicking the status-bar brand or
+/// running `/about` opens this.
+pub fn draw_about() {
+    MODAL_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+    SCREEN.with(|slot| {
+        let Some(sc) = slot else { return };
+        sc.cursor_restore();
+        sc.cur_vis = false;
+        MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
+        clear_modal_close_rect();
+        LIST_BROWSER_GEOM.with(|g| *g = None);
+        CHOOSE_COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
+
+        let cw = sc.cw();
+        let ch = sc.ch();
+        // Size the card from content so the tagline + OK never clip the border.
+        let cols = ((sc.width / cw) * 2 / 5).clamp(30, 42);
+        let logo_r = (ch * 2).max(18);
+        // close pad + logo (2r) + gaps + name + ver + built + arch + sep + 2 tags + OK + pads
+        let content_h = ch // top pad / close row
+            + logo_r * 2
+            + ch // gap under logo
+            + ch // name
+            + ch / 4
+            + ch // version
+            + ch // built
+            + ch // arch
+            + ch / 2 // sep gap
+            + 2 // sep
+            + ch / 2
+            + ch // tag1
+            + ch // tag2
+            + ch / 2
+            + ch // OK
+            + ch / 2; // bottom pad
+        let bw = cols * cw + 2 * (BORDER + PAD);
+        let bh = content_h + 2 * (BORDER + PAD);
+        let bx = (sc.width - bw) / 2;
+        let by = (sc.height - bh) / 2;
+        let bg = sc.theme.status_bg;
+        sc.drop_shadow(bx, by, bw, bh);
+        sc.fill_rect(bx, by, bw, bh, bg);
+        sc.rect_outline(bx, by, bw, bh, BORDER, sc.theme.accent);
+
+        let ix = bx + BORDER + PAD;
+        let content_w = cols * cw;
+        // Close (FA xmark) top-right — dedicated hit rect so it always works.
+        let mark = crate::icons::close_mark();
+        let (close_w, _) = sc.glyph_cell(mark);
+        let close_w = close_w.max(cw * 2);
+        let cx = ix + content_w.saturating_sub(close_w);
+        let close_y = by + BORDER + PAD / 2;
+        let (iw, _) = sc.glyph_cell(mark);
+        sc.blit_glyph(
+            cx + close_w.saturating_sub(iw) / 2,
+            close_y,
+            mark,
+            sc.theme.accent,
+            bg,
+        );
+        set_modal_close_rect((cx, close_y, close_w, ch));
+
+        // Large brand logo.
+        let logo_cy = by + BORDER + PAD + ch / 2 + logo_r;
+        sc.draw_logo(
+            bx + bw / 2,
+            logo_cy,
+            logo_r,
+            sc.theme.accent,
+            sc.theme.chat_fg,
+        );
+
+        let mut y = logo_cy + logo_r + ch / 2;
+        let centre = |s: &str| bx + (bw.saturating_sub(s.chars().count() as u64 * cw)) / 2;
+
+        sc.draw_str(centre("ChittiOS"), y, "ChittiOS", sc.theme.accent, bg);
+        y += ch + ch / 4;
+
+        let ver = alloc::format!("Version {}", crate::VERSION);
+        sc.draw_str(centre(&ver), y, &ver, sc.theme.chat_fg, bg);
+        y += ch;
+
+        let built = alloc::format!("Built {}", crate::BUILD_TIME);
+        sc.draw_str(centre(&built), y, &built, sc.theme.title_dim, bg);
+        y += ch;
+
+        #[cfg(target_arch = "x86_64")]
+        let arch = "x86_64";
+        #[cfg(target_arch = "aarch64")]
+        let arch = "aarch64";
+        let arch_line = alloc::format!("{arch}  ·  {} cores", crate::arch::cpu_count());
+        sc.draw_str(centre(&arch_line), y, &arch_line, sc.theme.title_dim, bg);
+        y += ch + ch / 2;
+
+        sc.fill_rect(ix + cw * 2, y, content_w.saturating_sub(cw * 4), 1, sc.theme.sep_dim);
+        y += ch / 2 + 2;
+
+        let tag = "An agentic operating system.";
+        sc.draw_str(centre(tag), y, tag, sc.theme.chat_fg, bg);
+        y += ch;
+        let tag2 = "The agent is the driver.";
+        sc.draw_str(centre(tag2), y, tag2, sc.theme.title_dim, bg);
+        y += ch + ch / 2;
+
+        // OK button, centred, inside the card.
+        let btn_w = 4 * cw;
+        let btn_x = bx + (bw.saturating_sub(btn_w)) / 2;
+        sc.modal_button(btn_x, y, "OK", true, 2);
+        sc.cursor_overlay();
+    });
+}
+
+/// macOS-style status-bar dropdown for `chip`. Anchored under/above the bar
+/// near the chip's hit rect. Click outside, Esc, or Close dismisses.
+pub fn draw_status_menu(chip: StatusChip) {
+    MODAL_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+    SCREEN.with(|slot| {
+        let Some(sc) = slot else { return };
+        sc.cursor_restore();
+        sc.cur_vis = false;
+        MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
+        clear_modal_close_rect();
+        LIST_BROWSER_GEOM.with(|g| *g = None);
+        CHOOSE_COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
+
+        // Repaint the bar so chip rects / live values are current, then overlay.
+        sc.draw_status();
+
+        let cw = sc.cw();
+        let ch = sc.ch();
+        let anchor = STATUS_CHIP_RECTS.with(|a| a[chip as usize]);
+        let bar = STATUS_BAR_RECT.with(|r| *r);
+        let pos = sc.layout.status_pos;
+
+        // Menu size: clock is larger (analog face); others are compact lists.
+        let (cols, rows) = match chip {
+            StatusChip::Clock => (32u64, 16u64),
+            StatusChip::Net => (36, 12),
+            StatusChip::Mem | StatusChip::Cpu => (34, 10),
+            StatusChip::Battery => (30, 9),
+            StatusChip::Kbd | StatusChip::Mouse => (28, 8),
+            StatusChip::Brand => (28, 8),
+        };
+        let bw = cols * cw + 2 * (BORDER + PAD);
+        let bh = rows * ch + 2 * (BORDER + PAD);
+
+        // Anchor: prefer under a top bar, above a bottom bar, else to the side.
+        let mut bx = if anchor.2 > 0 {
+            anchor.0.saturating_add(anchor.2 / 2).saturating_sub(bw / 2)
+        } else {
+            (sc.width - bw) / 2
+        };
+        if bx + bw > sc.width.saturating_sub(OUTER) {
+            bx = sc.width.saturating_sub(bw + OUTER);
+        }
+        if bx < OUTER {
+            bx = OUTER;
+        }
+        let by = match pos {
+            crate::panes_layout::StatusPos::Top => bar.1 + bar.3 + 4,
+            crate::panes_layout::StatusPos::Bottom => bar.1.saturating_sub(bh + 4),
+            crate::panes_layout::StatusPos::Left => {
+                bx = bar.0 + bar.2 + 4;
+                if anchor.2 > 0 {
+                    anchor.1
+                } else {
+                    (sc.height - bh) / 2
+                }
+            }
+            crate::panes_layout::StatusPos::Right => {
+                bx = bar.0.saturating_sub(bw + 4);
+                if anchor.2 > 0 {
+                    anchor.1
+                } else {
+                    (sc.height - bh) / 2
+                }
+            }
+        };
+        let by = by.min(sc.height.saturating_sub(bh + OUTER)).max(OUTER);
+
+        let bg = sc.theme.status_bg;
+        sc.drop_shadow(bx, by, bw, bh);
+        sc.fill_rect(bx, by, bw, bh, bg);
+        sc.rect_outline(bx, by, bw, bh, BORDER, sc.theme.accent);
+
+        let ix = bx + BORDER + PAD;
+        let mut y = by + BORDER + PAD;
+        let content_w = cols * cw;
+
+        // Title row + close.
+        let title = match chip {
+            StatusChip::Brand => "ChittiOS",
+            StatusChip::Kbd => "Keyboard",
+            StatusChip::Mouse => "Mouse",
+            StatusChip::Net => "Network",
+            StatusChip::Mem => "Memory",
+            StatusChip::Cpu => "Processor",
+            StatusChip::Battery => "Battery",
+            StatusChip::Clock => "Clock",
+        };
+        let icon = match chip {
+            StatusChip::Brand => crate::icons::fa::HOUSE,
+            StatusChip::Kbd => crate::icons::fa::KEYBOARD,
+            StatusChip::Mouse => crate::icons::fa::MOUSE,
+            StatusChip::Net => crate::icons::fa::WIFI,
+            StatusChip::Mem => crate::icons::fa::MEMORY,
+            StatusChip::Cpu => crate::icons::fa::MICROCHIP,
+            StatusChip::Battery => crate::icons::fa::BATTERY,
+            StatusChip::Clock => crate::icons::fa::CLOCK,
+        };
+        sc.draw_str(
+            ix,
+            y,
+            &alloc::format!("{icon} {title}"),
+            sc.theme.accent,
+            bg,
+        );
+        let mark = crate::icons::close_mark();
+        let (close_w, _) = sc.glyph_cell(mark);
+        let close_w = close_w.max(cw * 2);
+        let cx = ix + content_w.saturating_sub(close_w);
+        let (iw, _) = sc.glyph_cell(mark);
+        sc.blit_glyph(
+            cx + close_w.saturating_sub(iw) / 2,
+            y,
+            mark,
+            sc.theme.accent,
+            bg,
+        );
+        // Dedicated close rect (must not share slot 0 with Yes / menu body).
+        set_modal_close_rect((cx, y, close_w, ch));
+        y += ch + 4;
+        sc.fill_rect(ix, y, content_w, 1, sc.theme.sep_dim);
+        y += ch / 2;
+
+        match chip {
+            StatusChip::Clock => {
+                y = draw_clock_menu_body(sc, ix, y, content_w, ch, cw, bg);
+            }
+            StatusChip::Net => {
+                y = draw_net_menu_body(sc, ix, y, ch, bg);
+            }
+            StatusChip::Mem => {
+                y = draw_mem_menu_body(sc, ix, y, ch, bg);
+            }
+            StatusChip::Cpu => {
+                y = draw_cpu_menu_body(sc, ix, y, ch, bg);
+            }
+            StatusChip::Battery => {
+                y = draw_battery_menu_body(sc, ix, y, ch, bg);
+            }
+            StatusChip::Kbd => {
+                y = draw_input_menu_body(sc, ix, y, ch, bg, true);
+            }
+            StatusChip::Mouse => {
+                y = draw_input_menu_body(sc, ix, y, ch, bg, false);
+            }
+            StatusChip::Brand => {
+                sc.draw_str(ix, y, "Click for About…", sc.theme.chat_fg, bg);
+                y += ch;
+                sc.draw_str(ix, y, &alloc::format!("v{}", crate::VERSION), sc.theme.title_dim, bg);
+            }
+        }
+
+        // Footer hint.
+        let foot_y = by + bh - BORDER - PAD - ch;
+        sc.draw_str(ix, foot_y, "Esc / click outside to close", sc.theme.title_dim, bg);
+        // Full card is clickable for "inside" hit tests (slot 1 = menu body).
+        MODAL_RECTS.with(|m| m[1] = (bx, by, bw, bh));
+        sc.cursor_overlay();
+    });
+}
+
+/// True if `(x,y)` is inside the open status menu panel (not the close mark).
+pub fn status_menu_contains(x: u64, y: u64) -> bool {
+    MODAL_RECTS.with(|m| in_rect(x, y, m[1]))
+}
+
+fn draw_clock_menu_body(
+    sc: &Screen,
+    ix: u64,
+    mut y: u64,
+    content_w: u64,
+    ch: u64,
+    cw: u64,
+    bg: Rgb,
+) -> u64 {
+    let (yy, mo, d, h, mi, s, wd) =
+        crate::clock::civil_from_unix(crate::clock::now_unix() + crate::clock::tz_offset() as i64);
+    let weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let date = alloc::format!(
+        "{}, {} {} {}",
+        weekdays[wd as usize],
+        d,
+        months[(mo as usize).saturating_sub(1).min(11)],
+        yy
+    );
+    sc.draw_str(ix, y, &date, sc.theme.chat_fg, bg);
+    y += ch + 4;
+
+    // Analog face centred in the content width.
+    let face_r = (ch * 3).max(28).min(content_w / 2 - 4);
+    let fcx = ix + content_w / 2;
+    let fcy = y + face_r + 4;
+    draw_analog_clock(sc, fcx as i64, fcy as i64, face_r as i64, h, mi, s);
+    y = fcy + face_r + ch;
+
+    let time = alloc::format!("{:02}:{:02}:{:02}", h, mi, s);
+    let tx = ix + content_w.saturating_sub(time.len() as u64 * cw) / 2;
+    sc.draw_str(tx, y, &time, sc.theme.accent, bg);
+    y += ch;
+    let tz = crate::clock::format_tz();
+    let tzx = ix + content_w.saturating_sub(tz.chars().count() as u64 * cw) / 2;
+    sc.draw_str(tzx, y, &tz, sc.theme.title_dim, bg);
+    y += ch + ch / 2;
+    sc.draw_str(ix, y, "Timezone via /datetime tz …", sc.theme.title_dim, bg);
+    y + ch
+}
+
+/// Analog clock: 0° at 12 o'clock, clockwise. Integer Q10 sin/cos.
+fn draw_analog_clock(sc: &Screen, cx: i64, cy: i64, r: i64, h: i64, mi: i64, s: i64) {
+    let ring = sc.theme.border_dim;
+    let fg = sc.theme.chat_fg;
+    let accent = sc.theme.accent;
+    // Outer ring + centre hub.
+    sc.fill_disc(cx, cy, r, sc.theme.chat_bg);
+    // Ring outline ≈ 2px via two discs.
+    let t = (r / 16).max(1);
+    for deg in (0..360).step_by(2) {
+        let (dx, dy) = clock_offset(r, deg);
+        sc.put_pixel((cx + dx) as u64, (cy + dy) as u64, ring);
+        let (dx2, dy2) = clock_offset(r - t, deg);
+        sc.put_pixel((cx + dx2) as u64, (cy + dy2) as u64, ring);
+    }
+    // Hour ticks.
+    for hour in 0..12 {
+        let deg = hour * 30;
+        let (ox, oy) = clock_offset(r - 2, deg);
+        let (ix, iy) = clock_offset(r - r / 5, deg);
+        draw_line_i(sc, cx + ix, cy + iy, cx + ox, cy + oy, fg);
+    }
+    // Hands: hour (short), minute, second (accent).
+    let h_deg = ((h % 12) * 30 + mi / 2) as i32;
+    let m_deg = (mi * 6 + s / 10) as i32;
+    let s_deg = (s * 6) as i32;
+    let (hx, hy) = clock_offset(r * 55 / 100, h_deg);
+    draw_line_i(sc, cx, cy, cx + hx, cy + hy, fg);
+    // Thicken hour hand with a parallel stroke.
+    draw_line_i(sc, cx + 1, cy, cx + hx + 1, cy + hy, fg);
+    let (mx, my) = clock_offset(r * 78 / 100, m_deg);
+    draw_line_i(sc, cx, cy, cx + mx, cy + my, fg);
+    let (sx, sy) = clock_offset(r * 88 / 100, s_deg);
+    draw_line_i(sc, cx, cy, cx + sx, cy + sy, accent);
+    sc.fill_disc(cx, cy, (r / 12).max(2), accent);
+}
+
+/// (dx, dy) from centre: deg 0 = 12 o'clock, clockwise. Length `r`.
+fn clock_offset(r: i64, deg: i32) -> (i64, i64) {
+    // math angle from +x: 90° − deg → cos/sin in Q10
+    let m = (90 - deg).rem_euclid(360);
+    let (c, s) = cos_sin_q10(m);
+    // clock: x = r·sin(deg), y = −r·cos(deg); sin(deg)=cos(m), cos(deg)=sin(m)
+    ((r * c as i64) / 1024, -((r * s as i64) / 1024))
+}
+
+/// cos/sin of `deg` (0..359) in Q10 (1024 = 1.0).
+fn cos_sin_q10(deg: i32) -> (i32, i32) {
+    let d = deg.rem_euclid(360) as usize;
+    // 0..90 table for cos; sin(d)=cos(90-d)
+    const COS: [i32; 91] = [
+        1024, 1023, 1023, 1022, 1021, 1020, 1018, 1016, 1014, 1011, 1008, 1005, 1001, 997, 993, 988,
+        983, 978, 972, 966, 960, 953, 946, 939, 931, 923, 915, 906, 897, 888, 878, 868, 858, 847,
+        836, 825, 814, 802, 790, 777, 765, 752, 739, 725, 711, 697, 683, 668, 653, 638, 623, 607,
+        591, 575, 559, 542, 526, 509, 492, 475, 457, 440, 422, 404, 386, 368, 350, 331, 313, 294,
+        275, 256, 237, 218, 199, 180, 160, 141, 121, 102, 82, 62, 42, 22, 2, 0, 0, 0, 0, 0, 0,
+    ];
+    // Fix last entries properly for 85..90
+    // Actually COS[90] should be 0; above is approximate. Use safe index.
+    let cos_q = |a: usize| -> i32 {
+        let a = a.min(90);
+        // regenerate clean values for key angles
+        match a {
+            0 => 1024,
+            30 => 887,
+            45 => 724,
+            60 => 512,
+            90 => 0,
+            _ => COS[a],
+        }
+    };
+    let (c, s) = match d {
+        0..=90 => (cos_q(d), cos_q(90 - d)),
+        91..=180 => (-cos_q(d - 90), cos_q(180 - d)),
+        181..=270 => (-cos_q(270 - d), -cos_q(d - 180)),
+        _ => (cos_q(360 - d), -cos_q(d - 270)),
+    };
+    (c, s)
+}
+
+fn draw_line_i(sc: &Screen, x0: i64, y0: i64, x1: i64, y1: i64, c: Rgb) {
+    let mut x0 = x0;
+    let mut y0 = y0;
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    loop {
+        if x0 >= 0 && y0 >= 0 {
+            sc.put_pixel(x0 as u64, y0 as u64, c);
+        }
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn draw_net_menu_body(sc: &Screen, ix: u64, mut y: u64, ch: u64, bg: Rgb) -> u64 {
+    let up = crate::net::is_up();
+    sc.draw_str(
+        ix,
+        y,
+        if up { "Status   Connected" } else { "Status   Offline" },
+        if up { sc.theme.accent } else { sc.theme.title_dim },
+        bg,
+    );
+    y += ch;
+    if let Some(info) = crate::net::info() {
+        sc.draw_str(ix, y, &alloc::format!("Interface  {}", info.ifname), sc.theme.chat_fg, bg);
+        y += ch;
+        let mac = alloc::format!(
+            "MAC  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            info.mac[0], info.mac[1], info.mac[2], info.mac[3], info.mac[4], info.mac[5]
+        );
+        sc.draw_str(ix, y, &mac, sc.theme.title_dim, bg);
+        y += ch;
+        if let Some(ip) = info.ip {
+            sc.draw_str(ix, y, &alloc::format!("IPv4  {}", ip), sc.theme.chat_fg, bg);
+            y += ch;
+        }
+        if let Some(gw) = info.gateway {
+            sc.draw_str(ix, y, &alloc::format!("Gateway  {}", gw), sc.theme.title_dim, bg);
+            y += ch;
+        }
+        if !info.dns.is_empty() {
+            sc.draw_str(ix, y, &alloc::format!("DNS  {}", info.dns[0]), sc.theme.title_dim, bg);
+            y += ch;
+        }
+        sc.draw_str(
+            ix,
+            y,
+            if info.dhcp { "Config  DHCP" } else { "Config  Static" },
+            sc.theme.title_dim,
+            bg,
+        );
+        y += ch;
+    } else {
+        sc.draw_str(ix, y, "No network device bound", sc.theme.title_dim, bg);
+        y += ch;
+    }
+    y += ch / 2;
+    sc.draw_str(ix, y, "Shell: /network  /wifi  /ping", sc.theme.title_dim, bg);
+    y + ch
+}
+
+fn draw_mem_menu_body(sc: &Screen, ix: u64, mut y: u64, ch: u64, bg: Rgb) -> u64 {
+    let m = crate::mm::mem_stats();
+    let mib = 1024 * 1024;
+    sc.draw_str(
+        ix,
+        y,
+        &alloc::format!("Heap used   {} MiB", m.heap_used / mib),
+        sc.theme.chat_fg,
+        bg,
+    );
+    y += ch;
+    sc.draw_str(
+        ix,
+        y,
+        &alloc::format!("Heap total  {} MiB", m.heap_total / mib),
+        sc.theme.title_dim,
+        bg,
+    );
+    y += ch;
+    sc.draw_str(
+        ix,
+        y,
+        &alloc::format!("RAM total   {} MiB", m.ram_total / mib),
+        sc.theme.title_dim,
+        bg,
+    );
+    y += ch;
+    let reserved = m.ram_reserved.saturating_sub(m.heap_total);
+    sc.draw_str(
+        ix,
+        y,
+        &alloc::format!("Reserved    {} MiB", reserved / mib),
+        sc.theme.title_dim,
+        bg,
+    );
+    y + ch
+}
+
+fn draw_cpu_menu_body(sc: &Screen, ix: u64, mut y: u64, ch: u64, bg: Rgb) -> u64 {
+    let pct = crate::shell::cpu_percent();
+    let cores = crate::arch::cpu_count();
+    sc.draw_str(ix, y, &alloc::format!("Load     {pct}%"), sc.theme.chat_fg, bg);
+    y += ch;
+    sc.draw_str(ix, y, &alloc::format!("Cores    {cores}"), sc.theme.title_dim, bg);
+    y += ch;
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+    sc.draw_str(ix, y, &alloc::format!("Arch     {arch}"), sc.theme.title_dim, bg);
+    y += ch + ch / 2;
+    sc.draw_str(ix, y, "Shell: /top  /perf", sc.theme.title_dim, bg);
+    y + ch
+}
+
+fn draw_battery_menu_body(sc: &Screen, ix: u64, mut y: u64, ch: u64, bg: Rgb) -> u64 {
+    if let Some(b) = crate::drivers::battery::cached() {
+        sc.draw_str(
+            ix,
+            y,
+            &alloc::format!("Charge   {}", crate::drivers::battery::format(&b)),
+            sc.theme.chat_fg,
+            bg,
+        );
+        y += ch;
+        sc.draw_str(ix, y, "Source   ACPI _BST / EC", sc.theme.title_dim, bg);
+        y += ch;
+        sc.draw_str(ix, y, "Shell: /battery", sc.theme.title_dim, bg);
+    } else {
+        sc.draw_str(ix, y, "No battery reported", sc.theme.title_dim, bg);
+        y += ch;
+        sc.draw_str(ix, y, "(desktop / no ACPI pack)", sc.theme.title_dim, bg);
+    }
+    y + ch
+}
+
+fn draw_input_menu_body(sc: &Screen, ix: u64, mut y: u64, ch: u64, bg: Rgb, kbd: bool) -> u64 {
+    if kbd {
+        let last = crate::console::input_activity_ms();
+        let active = last != 0 && crate::arch::now_ms().saturating_sub(last) < 1500;
+        sc.draw_str(
+            ix,
+            y,
+            if active { "Keyboard  Active" } else { "Keyboard  Idle" },
+            if active { sc.theme.accent } else { sc.theme.chat_fg },
+            bg,
+        );
+        y += ch;
+        sc.draw_str(ix, y, "USB HID / virtio / PS-2", sc.theme.title_dim, bg);
+    } else {
+        let last = crate::mouse::activity_ms();
+        let active = last != 0 && crate::arch::now_ms().saturating_sub(last) < 1500;
+        sc.draw_str(
+            ix,
+            y,
+            if active { "Mouse  Active" } else { "Mouse  Idle" },
+            if active { sc.theme.accent } else { sc.theme.chat_fg },
+            bg,
+        );
+        y += ch;
+        sc.draw_str(ix, y, "Pointer + wheel scroll", sc.theme.title_dim, bg);
+    }
+    y + ch
+}
+
 /// Draw a text-input modal (masked = password dots). `caret_on` blinks the caret.
 pub fn draw_input(title: &str, prompt: &str, buf: &str, masked: bool, caret_on: bool) {
     MODAL_ON.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -4537,7 +5296,9 @@ pub fn draw_list_browser(
         let cx = ix + content_w.saturating_sub(close_w);
         let (iw, _) = sc.glyph_cell(mark);
         sc.blit_glyph(cx + close_w.saturating_sub(iw) / 2, y, mark, sc.theme.accent, bg);
-        MODAL_RECTS.with(|m| m[0] = (cx, y, close_w, ch));
+        set_modal_close_rect((cx, y, close_w, ch));
+        // Keep slot 0 empty so Close is only the dedicated rect (not Yes).
+        MODAL_RECTS.with(|m| m[0] = (0, 0, 0, 0));
         y += ch + 4;
         sc.fill_rect(ix, y, content_w, 1, sc.theme.sep_dim);
         y += 6;
@@ -4708,6 +5469,7 @@ pub fn redraw_all() {
 pub fn modal_dismiss() {
     MODAL_ON.store(false, core::sync::atomic::Ordering::Relaxed);
     MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
+    clear_modal_close_rect();
     LIST_BROWSER_GEOM.with(|g| *g = None);
     CHOOSE_COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
     CHOOSE_RECTS.with(|c| *c = [(0, 0, 0, 0); 9]);

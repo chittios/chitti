@@ -175,6 +175,120 @@ pub fn input(_title: &str, _prompt: &str, _masked: bool) -> String {
     String::new()
 }
 
+/// macOS-style **About ChittiOS** dialog (logo, version, build, arch, tagline).
+/// Dismiss with Enter / Esc / Ctrl+C / OK click / close mark. Used by `/about`
+/// and a click on the status-bar brand.
+#[cfg(not(test))]
+pub fn about() {
+    use crate::framebuffer::{self, ModalHit};
+    framebuffer::draw_about();
+    loop {
+        if let Some(b) = crate::console::read_byte() {
+            match b {
+                b'\r' | b'\n' | 0x03 => {
+                    framebuffer::modal_dismiss();
+                    return;
+                }
+                0x1b => {
+                    // Bare Esc dismisses; arrow CSI is ignored.
+                    if esc_seq().is_none() {
+                        framebuffer::modal_dismiss();
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let t = crate::mouse::tick();
+        if t.moved {
+            framebuffer::cursor_move(t.x, t.y);
+        }
+        if t.pressed {
+            match framebuffer::modal_hit(t.x, t.y) {
+                ModalHit::Ok | ModalHit::Close => {
+                    framebuffer::modal_dismiss();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        crate::shell::status_tick();
+        crate::sched::yield_now();
+    }
+}
+
+/// Test stub: no framebuffer About dialog.
+#[cfg(test)]
+pub fn about() {}
+
+/// macOS-style **status-bar dropdown** for a chip (net / clock / mem / …).
+/// Live-refreshes the clock once a second. Dismiss with Esc, Ctrl+C, close
+/// mark, or a click outside the panel.
+#[cfg(not(test))]
+pub fn status_menu(chip: crate::framebuffer::StatusChip) {
+    use crate::framebuffer::{self, ModalHit, StatusChip};
+    // Brand is About, not a dropdown.
+    if chip == StatusChip::Brand {
+        about();
+        return;
+    }
+    let mut last_paint = 0u64;
+    loop {
+        let now = crate::arch::now_ms();
+        // Clock ticks every second; other menus paint once (and after open).
+        let due = match chip {
+            StatusChip::Clock => now.saturating_sub(last_paint) >= 1000,
+            _ => last_paint == 0,
+        };
+        if due {
+            framebuffer::draw_status_menu(chip);
+            last_paint = now;
+        }
+        if let Some(b) = crate::console::read_byte() {
+            match b {
+                0x03 => {
+                    framebuffer::modal_dismiss();
+                    return;
+                }
+                0x1b => {
+                    if esc_seq().is_none() {
+                        framebuffer::modal_dismiss();
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let t = crate::mouse::tick();
+        if t.moved {
+            framebuffer::cursor_move(t.x, t.y);
+        }
+        if t.pressed {
+            match framebuffer::modal_hit(t.x, t.y) {
+                ModalHit::Close | ModalHit::Ok => {
+                    framebuffer::modal_dismiss();
+                    return;
+                }
+                // Clicks on the panel body (slot 1) keep the menu open; anywhere
+                // else (including the status bar) dismisses.
+                ModalHit::No if framebuffer::status_menu_contains(t.x, t.y) => {}
+                _ => {
+                    if !framebuffer::status_menu_contains(t.x, t.y) {
+                        framebuffer::modal_dismiss();
+                        return;
+                    }
+                }
+            }
+        }
+        crate::shell::status_tick();
+        crate::sched::yield_now();
+    }
+}
+
+/// Test stub: no status-bar dropdowns (framebuffer is not linked under `--test`).
+#[cfg(test)]
+pub fn status_menu(_chip: u8) {}
+
 /// Multi-option question for agents (`ask_user_question`). Returns the chosen
 /// option index, or `None` if cancelled. Keyboard: arrows/Tab move, Enter
 /// selects, 1..9 jump, Esc cancels. Mouse: click a row to select it.

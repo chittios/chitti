@@ -325,31 +325,37 @@ pub fn blit_ui_cell<F: FnMut(usize, usize, u8)>(
         // renders non-Latin text OS-wide, not just the browser.
         let use_fallback = ch != ' ' && uifont.lookup_glyph_index(ch) == 0;
         UI_CACHE.with(|cache| {
-            if !cache.contains_key(&key) {
-                let glyph = if use_fallback {
-                    FALLBACKS.with(|chain| {
-                        // Prefer the first face that both covers the codepoint
-                        // and produces ink at cell size (skip empty .notdef).
-                        for (_, f) in chain.iter() {
-                            if f.lookup_glyph_index(ch) == 0 {
-                                continue;
-                            }
-                            let g = build_ui_glyph(f, ch, cw, ch_px);
-                            if !g.is_empty() {
-                                return g;
-                            }
-                        }
-                        build_ui_glyph(uifont, ch, cw, ch_px)
-                    })
-                } else {
-                    build_ui_glyph(uifont, ch, cw, ch_px)
-                };
-                cache.insert(key, glyph);
-            }
             if let Some(glyph) = cache.get(&key) {
                 for &(x, y, a) in glyph.iter() {
                     plot(x as usize, y as usize, a);
                 }
+                return;
+            }
+            let glyph = if use_fallback {
+                FALLBACKS.with(|chain| {
+                    // Prefer the first face that both covers the codepoint
+                    // and produces ink at cell size (skip empty .notdef).
+                    for (_, f) in chain.iter() {
+                        if f.lookup_glyph_index(ch) == 0 {
+                            continue;
+                        }
+                        let g = build_ui_glyph(f, ch, cw, ch_px);
+                        if !g.is_empty() {
+                            return g;
+                        }
+                    }
+                    build_ui_glyph(uifont, ch, cw, ch_px)
+                })
+            } else {
+                build_ui_glyph(uifont, ch, cw, ch_px)
+            };
+            for &(x, y, a) in glyph.iter() {
+                plot(x as usize, y as usize, a);
+            }
+            // Do not cache empty ink for fallback chars — FA/emoji may register
+            // a tick later; caching notdef made status-bar icons stick as bars.
+            if !glyph.is_empty() || !use_fallback {
+                cache.insert(key, glyph);
             }
         });
         true
@@ -396,6 +402,9 @@ pub fn register_fallback(name: &str, data: &[u8]) -> Result<(), &'static str> {
             fb.push((name, font));
         }
     });
+    // Drop UI cell cache so previously-missed FA/emoji codepoints re-rasterize
+    // against the new face (empty notdef entries would stick forever).
+    UI_CACHE.with(|c| c.clear());
     Ok(())
 }
 

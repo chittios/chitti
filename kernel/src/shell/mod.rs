@@ -588,6 +588,7 @@ pub fn run() -> ! {
 pub fn dispatch_system(name: &str, arg: &str) -> bool {
     match name {
         "help" => print_help(arg),
+        "about" => run_about(arg),
         "infer" => run_infer(),
         "bench" => run_bench(arg),
         // Self-evaluation of the determinism boundary: an injection corpus, the
@@ -1262,6 +1263,35 @@ fn take_pending_input() -> Option<String> {
     PENDING_INPUT.with(|p| p.take())
 }
 
+/// `/about` — macOS-style About dialog (logo, version, build, arch). Also opened
+/// by clicking the status-bar brand ("ChittiOS …"). `/about text` prints the
+/// same facts on serial (e2e / no framebuffer).
+fn run_about(arg: &str) {
+    let force_text = matches!(arg.trim(), "text" | "list" | "--text" | "-t");
+    #[cfg(not(test))]
+    {
+        if !force_text && crate::framebuffer::composer_available() {
+            crate::modal::about();
+            return;
+        }
+    }
+    let _ = force_text;
+    print_about_text();
+}
+
+/// Serial / text form of About (also used when no framebuffer is available).
+fn print_about_text() {
+    serial_println!("ChittiOS");
+    serial_println!("  Version {}", crate::VERSION);
+    serial_println!("  Built   {}", crate::BUILD_TIME);
+    #[cfg(target_arch = "x86_64")]
+    serial_println!("  Arch    x86_64  ·  {} cores", crate::arch::cpu_count());
+    #[cfg(target_arch = "aarch64")]
+    serial_println!("  Arch    aarch64  ·  {} cores", crate::arch::cpu_count());
+    serial_println!("  An agentic operating system — the agent is the driver.");
+    serial_println!("  (Also: click the status-bar brand, or /info for full system status.)");
+}
+
 /// `/help` — open the searchable Commands browser on the framebuffer, or print
 /// the flat list. `/help text` (or `list`) always prints the serial catalogue
 /// (used by e2e / scripting so the shell is not blocked on a modal).
@@ -1297,9 +1327,10 @@ fn print_help_text() {
     serial_println!("Chitti commands:");
     serial_println!("  <message>        chat with the agent — it calls /commands as tools (Ctrl+C to stop)");
     serial_println!("  /help            Commands browser (search + scroll); /help text = this list");
+    serial_println!("  /about           About ChittiOS (or click the status-bar brand)");
     serial_println!("  /agents          Agents browser (Ctrl+Space); /agents text = list");
     for e in catalog::ENTRIES {
-        if e.name == "agents" {
+        if e.name == "agents" || e.name == "about" {
             continue; // printed above with the fuller blurb
         }
         serial_println!("  /{:<14} {}", e.name, e.title);
@@ -8470,11 +8501,12 @@ fn ui_tick() {
         let t = crate::mouse::tick();
         if t.moved {
             crate::framebuffer::cursor_move(t.x, t.y);
-            // Hovering a divider shows the grab cursor, so it is discoverable
-            // that the shell|band split *and* every grid gap can be dragged.
-            // Skipped mid-drag, where the drag itself owns the cursor.
+            // Hovering a divider or status-bar chip → hand cursor (macOS menu bar).
+            // Skipped mid-drag.
             if DIVIDER_DRAG.with(|d| d.is_none()) {
-                if crate::framebuffer::divider_hit(t.x, t.y).is_some() {
+                if crate::framebuffer::divider_hit(t.x, t.y).is_some()
+                    || crate::framebuffer::status_chip_hit(t.x, t.y).is_some()
+                {
                     crate::framebuffer::set_cursor_shape(
                         crate::framebuffer::CursorShape::Hand,
                     );
@@ -8499,7 +8531,14 @@ fn ui_tick() {
             }
         }
         if t.pressed {
-            if let Some(which) = crate::framebuffer::divider_hit(t.x, t.y) {
+            if let Some(chip) = crate::framebuffer::status_chip_hit(t.x, t.y) {
+                // macOS-style status menus: brand → About; others → dropdown.
+                use crate::framebuffer::StatusChip;
+                match chip {
+                    StatusChip::Brand => run_about(""),
+                    other => crate::modal::status_menu(other),
+                }
+            } else if let Some(which) = crate::framebuffer::divider_hit(t.x, t.y) {
                 // Grab a divider: the shell|band split, or a grid column/row gap.
                 DIVIDER_DRAG.with(|d| *d = Some(which));
             } else if let Some(ci) = crate::framebuffer::close_hit_pane(t.x, t.y) {

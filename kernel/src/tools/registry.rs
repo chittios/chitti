@@ -169,6 +169,11 @@ impl ToolDef {
 fn shell_commands() -> Vec<ToolDef> {
     alloc::vec![
         ToolDef::shell("help", "Open the Commands browser (search + scroll). args: empty=modal, 'text'=flat list.", false),
+        ToolDef::shell(
+            "about",
+            "About ChittiOS (logo, version, build) — same as clicking the status-bar brand. args: empty=modal, 'text'=serial.",
+            false,
+        ),
         ToolDef::shell("disks", "List every block device and its detected filesystems (read-only).", false),
         ToolDef::shell("ls", "List a store directory (Linux-like). args: '[path] [-l]' (default /). Numeric arg lists a disk volume root.", false),
         ToolDef::shell("cat", "Print a store or mounted file. args: a /path.", false),

@@ -349,7 +349,7 @@ pub fn for_command(name: &str) -> char {
         | "pwd" | "decoder" => fa::FOLDER,
         "disks" | "mounts" | "mount" | "umount" | "install" | "mkext4" => fa::HARD_DRIVE,
         "network" | "ping" | "wifi" | "http" | "ws" | "mcp" | "channel" | "browse" => fa::WIFI,
-        "info" | "ui" | "shortcuts" | "help" => fa::CIRCLE_INFO,
+        "info" | "about" | "ui" | "shortcuts" | "help" => fa::CIRCLE_INFO,
         "top" => fa::GAUGE,
         "ktrace" => fa::BUG,
         "datetime" => fa::CLOCK,
