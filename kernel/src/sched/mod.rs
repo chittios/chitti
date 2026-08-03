@@ -137,6 +137,15 @@ struct TaskControlBlock {
     /// undercounted rather than misattributed. Fine for a share-of-CPU display;
     /// not a basis for billing.
     ticks_run: u64,
+    /// Soft heap charge for this task (bytes currently attributed via
+    /// [`charge_heap`] / [`uncharge_heap`]). Approximate — a free on another
+    /// task's pointer cannot re-attribute, so the counter is "upper bound of
+    /// peak while current".
+    heap_used: usize,
+    /// When `Some(limit)`, allocations that would push `heap_used` over
+    /// `limit` fail for this task (OOM) rather than growing the shared arena.
+    /// `None` = unlimited (bootstrap / kernel work).
+    heap_limit: Option<usize>,
     /// Runnable **only on the boot CPU**.
     ///
     /// Set for any task holding a user [`AddressSpace`](crate::mm::space::AddressSpace),
@@ -597,6 +606,8 @@ pub fn init() {
                 bsp_only: false,
                 priority: Priority::Normal,
                 ticks_run: 0,
+                heap_used: 0,
+                heap_limit: None, // bootstrap: unlimited
             },
         );
         *slot = Some(SchedulerState {
@@ -646,8 +657,13 @@ pub fn spawn_parked(name: &'static str) -> TaskId {
                 fx_area: None,
                 cap_table: CapTable::new(),
                 bsp_only: false,
-                priority: Priority::Normal,
+                // Agents are identity holders that must not starve the shell:
+                // Background priority + a default heap quota. The orchestrator
+                // is task 0 (bootstrap), not a parked task.
+                priority: Priority::Background,
                 ticks_run: 0,
+                heap_used: 0,
+                heap_limit: Some(DEFAULT_AGENT_HEAP_LIMIT),
             },
         );
         // Deliberately NOT enqueued — a cap-owning identity holder, never run.
@@ -656,6 +672,11 @@ pub fn spawn_parked(name: &'static str) -> TaskId {
     crate::ktrace::log_fmt(format_args!("sched: spawned parked task {id} ({name}) [cap-owner, not scheduled]"));
     id
 }
+
+/// Default soft heap ceiling for a non-orchestrator agent (64 MiB).
+/// Enough for a plan/act loop + modest tool results; a media decode or runaway
+/// buffer hits the limit and OOM-kills the agent rather than the shell.
+pub const DEFAULT_AGENT_HEAP_LIMIT: usize = 64 * 1024 * 1024;
 
 /// Spawn a new task running `entry(arg)` on a fresh 64 KiB stack. The
 /// task starts `Ready` and joins the round-robin queue; it does not run
@@ -716,6 +737,11 @@ pub fn spawn_with_stack(name: &'static str, entry: extern "C" fn(u64), arg: u64,
                 bsp_only: false,
                 priority: Priority::Normal,
                 ticks_run: 0,
+                heap_used: 0,
+                // Runnable tasks default unlimited; call [`set_heap_limit`] for
+                // agent work that needs a ceiling (parked agents get one by
+                // default).
+                heap_limit: None,
             },
         );
         enqueue(s, id);
@@ -814,6 +840,146 @@ pub fn list() -> alloc::vec::Vec<(TaskId, &'static str, &'static str)> {
             })
             .collect()
     })
+}
+
+/// Live heap-accounting atomics for the **charge target**.
+///
+/// **Must never take [`SCHED`].** `GlobalAlloc` is reached from inside
+/// `SCHED.with` (e.g. `BTreeMap` growth while inserting a task), so a charge
+/// path that re-entered the scheduler lock deadlocked the first `spawn_parked`
+/// after this feature landed — QEMU hung until the test harness SIGTERM'd it.
+///
+/// Limits and used counters for non-current agents live on the TCB and are
+/// swapped into these atomics by [`with_heap_charge_as`] / task switch.
+static CHARGE_USED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+/// 0 = unlimited.
+static CHARGE_LIMIT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+/// Task id the atomics currently mirror (`u64::MAX` = bootstrap / none).
+static CHARGE_TASK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Run `f` with heap charges attributed to `task` (agent identity). Nested
+/// calls restore the previous charge target. Flushes the previous target's
+/// used counter back to its TCB and loads the new one's.
+pub fn with_heap_charge_as<R>(task: TaskId, f: impl FnOnce() -> R) -> R {
+    let prev_task = CHARGE_TASK.load(Ordering::SeqCst);
+    let prev_used = CHARGE_USED.load(Ordering::SeqCst);
+    let prev_limit = CHARGE_LIMIT.load(Ordering::SeqCst);
+    // Flush previous target into its TCB (best-effort; skip if SCHED busy).
+    flush_charge_to_tcb(prev_task, prev_used);
+    // Load new target.
+    let (used, limit) = heap_usage(task).unwrap_or((0, Some(DEFAULT_AGENT_HEAP_LIMIT)));
+    CHARGE_TASK.store(task, Ordering::SeqCst);
+    CHARGE_USED.store(used, Ordering::SeqCst);
+    CHARGE_LIMIT.store(limit.unwrap_or(0), Ordering::SeqCst);
+    let r = f();
+    // Flush agent used back, restore previous.
+    let end_used = CHARGE_USED.load(Ordering::SeqCst);
+    flush_charge_to_tcb(task, end_used);
+    CHARGE_TASK.store(prev_task, Ordering::SeqCst);
+    CHARGE_USED.store(prev_used, Ordering::SeqCst);
+    CHARGE_LIMIT.store(prev_limit, Ordering::SeqCst);
+    r
+}
+
+fn flush_charge_to_tcb(task: TaskId, used: usize) {
+    if task == u64::MAX || !INITIALIZED.load(Ordering::SeqCst) {
+        return;
+    }
+    // Taking SCHED is fine here — we are *not* inside GlobalAlloc.
+    SCHED.with(|slot| {
+        if let Some(s) = slot.as_mut() {
+            if let Some(t) = s.tasks.get_mut(&task) {
+                t.heap_used = used;
+            }
+        }
+    });
+}
+
+/// Charge `bytes` against the active heap-accounting target's quota.
+///
+/// Returns `false` if the target has a limit and this charge would exceed it.
+/// **Must not allocate and must not take [`SCHED`]** — called from the global
+/// allocator, including from inside scheduler critical sections.
+pub fn charge_heap(bytes: usize) -> bool {
+    if bytes == 0 || !INITIALIZED.load(Ordering::SeqCst) {
+        return true;
+    }
+    let limit = CHARGE_LIMIT.load(Ordering::Relaxed);
+    if limit == 0 {
+        // Unlimited: still track used for `/top` / diagnostics.
+        CHARGE_USED.fetch_add(bytes, Ordering::Relaxed);
+        return true;
+    }
+    // CAS loop so concurrent frees don't let us race past the limit.
+    loop {
+        let used = CHARGE_USED.load(Ordering::Relaxed);
+        if used.saturating_add(bytes) > limit {
+            return false;
+        }
+        if CHARGE_USED
+            .compare_exchange_weak(used, used + bytes, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
+/// Reverse a prior [`charge_heap`] of the same size (on free).
+/// Same constraints: no alloc, no SCHED.
+pub fn uncharge_heap(bytes: usize) {
+    if bytes == 0 || !INITIALIZED.load(Ordering::SeqCst) {
+        return;
+    }
+    // Saturating sub via CAS.
+    loop {
+        let used = CHARGE_USED.load(Ordering::Relaxed);
+        let next = used.saturating_sub(bytes);
+        if CHARGE_USED
+            .compare_exchange_weak(used, next, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+/// Set (or clear, with `None`) the soft heap ceiling for `id`.
+pub fn set_heap_limit(id: TaskId, limit: Option<usize>) {
+    SCHED.with(|slot| {
+        if let Some(s) = slot.as_mut() {
+            if let Some(t) = s.tasks.get_mut(&id) {
+                t.heap_limit = limit;
+            }
+        }
+    });
+    // If this is the live charge target, update the atomic too.
+    if CHARGE_TASK.load(Ordering::Relaxed) == id {
+        CHARGE_LIMIT.store(limit.unwrap_or(0), Ordering::SeqCst);
+    }
+}
+
+/// `(heap_used, heap_limit)` for `id`, if the task exists.
+pub fn heap_usage(id: TaskId) -> Option<(usize, Option<usize>)> {
+    // Live charge target: prefer atomics (more up-to-date than the TCB).
+    if CHARGE_TASK.load(Ordering::Relaxed) == id {
+        let used = CHARGE_USED.load(Ordering::Relaxed);
+        let lim = CHARGE_LIMIT.load(Ordering::Relaxed);
+        return Some((used, if lim == 0 { None } else { Some(lim) }));
+    }
+    SCHED.with(|slot| {
+        slot.as_ref()
+            .and_then(|s| s.tasks.get(&id))
+            .map(|t| (t.heap_used, t.heap_limit))
+    })
+}
+
+/// Whether the scheduler has been initialised (heap charge is a no-op before).
+pub fn initialized() -> bool {
+    INITIALIZED.load(Ordering::SeqCst)
 }
 
 /// Terminate task `id`: mark it Dead, drop it from the ready queue, revoke all
@@ -1178,6 +1344,8 @@ mod tests {
                     cap_table: CapTable::new(),
                     priority: Priority::Normal,
                     ticks_run: 0,
+                    heap_used: 0,
+                    heap_limit: None,
                     bsp_only,
                 },
             );

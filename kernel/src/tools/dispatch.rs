@@ -192,12 +192,17 @@ impl Router {
             // retrying here would make an agent's confinement depend on whether the
             // loader happened to work, which is the kind of quiet downgrade that makes
             // an isolation claim untrue.
-            return match crate::synapse::tenant::invoke_in_userspace(caller, raw, justification) {
-                Some(inv) => Self::outcome_of(inv),
-                None => ToolOutcome::error(alloc::string::String::from(
-                    "error: the userspace call never reached the gates",
-                )),
-            };
+            //
+            // Heap charges follow `caller` (the agent's parked identity), not the
+            // shell stack that is driving the turn — that is the per-agent quota.
+            return crate::sched::with_heap_charge_as(caller, || {
+                match crate::synapse::tenant::invoke_in_userspace(caller, raw, justification) {
+                    Some(inv) => Self::outcome_of(inv),
+                    None => ToolOutcome::error(alloc::string::String::from(
+                        "error: the userspace call never reached the gates",
+                    )),
+                }
+            });
         }
         Self::outcome_of(synapse::execute_with_justification(caller, raw, justification))
     }

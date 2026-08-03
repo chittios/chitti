@@ -196,6 +196,12 @@ impl LinkedListAllocator {
 unsafe impl GlobalAlloc for Locked<LinkedListAllocator> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let (size, align) = LinkedListAllocator::size_align(layout);
+        // Per-task heap quota (agents): refuse before touching the free list so
+        // a runaway agent cannot exhaust the shared arena for the shell.
+        if !crate::sched::charge_heap(size) {
+            OOM_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return null_mut();
+        }
         let first = self.try_alloc(size, align);
         if !first.is_null() {
             return first;
@@ -205,14 +211,33 @@ unsafe impl GlobalAlloc for Locked<LinkedListAllocator> {
         // `Locked` is not reentrant, so growing from inside `try_alloc`'s critical
         // section would deadlock rather than fail.
         if grow(size) {
-            return self.try_alloc(size, align);
+            let p = self.try_alloc(size, align);
+            if !p.is_null() {
+                return p;
+            }
         }
+        // Still out: drop reclaimable caches and try once more.
+        if super::reclaim::run() > 0 {
+            let p = self.try_alloc(size, align);
+            if !p.is_null() {
+                return p;
+            }
+            if grow(size) {
+                let p = self.try_alloc(size, align);
+                if !p.is_null() {
+                    return p;
+                }
+            }
+        }
+        // Undo the charge — the bytes were never handed out.
+        crate::sched::uncharge_heap(size);
         OOM_FAILURES.fetch_add(1, Ordering::Relaxed);
         null_mut()
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let (size, _) = LinkedListAllocator::size_align(layout);
+        crate::sched::uncharge_heap(size);
         self.with(|allocator| {
             // SAFETY: caller (the `alloc::GlobalAlloc` contract) guarantees
             // `ptr..ptr+size` was returned by a prior `alloc` with this
@@ -220,6 +245,36 @@ unsafe impl GlobalAlloc for Locked<LinkedListAllocator> {
             unsafe { allocator.add_free_region(ptr as usize, size) };
         });
     }
+}
+
+/// Called from the global alloc-error path when `alloc` returned null and Rust
+/// is about to panic. Tries one last reclaim, then **OOM-kills** the current
+/// non-bootstrap task so the shell survives. Bootstrap still panics.
+pub fn on_alloc_error(layout: Layout) -> ! {
+    let size = layout.size();
+    crate::ktrace::log_fmt(format_args!(
+        "mm: OOM allocating {} bytes (after grow+reclaim)",
+        size
+    ));
+    // One more reclaim pass — a hook registered after the first pass may help.
+    let _ = super::reclaim::run();
+    if grow(size.max(GROW_CHUNK)) {
+        // Cannot usefully return the pointer to the original caller from here;
+        // the allocation already failed. Fall through to kill / panic.
+    }
+    // Kill the current agent task rather than the whole OS.
+    if crate::sched::initialized() {
+        let cur = crate::sched::current_task_id();
+        if cur != 0 {
+            super::reclaim::note_oom_kill();
+            crate::ktrace::log_fmt(format_args!(
+                "mm: OOM-killing task {cur} (quota or arena exhausted)"
+            ));
+            // Does not return when it succeeds (switches to another task).
+            crate::sched::fault_current_task("oom");
+        }
+    }
+    panic!("mm: out of memory allocating {} bytes (bootstrap / no kill path)", size);
 }
 
 impl Locked<LinkedListAllocator> {

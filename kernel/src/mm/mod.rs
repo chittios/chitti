@@ -11,6 +11,8 @@ pub mod armv8;
 pub mod frame;
 pub mod heap;
 pub mod ramlayout;
+/// OOM reclaim registry — free caches before killing a task.
+pub mod reclaim;
 pub mod space;
 pub mod walk;
 

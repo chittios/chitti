@@ -5,6 +5,7 @@
 #![no_std]
 #![cfg_attr(test, no_main)]
 #![feature(custom_test_frameworks)]
+#![feature(alloc_error_handler)]
 // `vmmlaq_s32` (FEAT_I8MM int8 matrix-multiply) for the Q1_0/Q2_0 batched
 // matmul fast path — still unstable in core::arch::aarch64.
 #![cfg_attr(target_arch = "aarch64", feature(stdarch_neon_i8mm))]
@@ -14,6 +15,14 @@
 #![cfg_attr(target_arch = "x86_64", test_runner(crate::test_runner))]
 #![cfg_attr(target_arch = "x86_64", reexport_test_harness_main = "test_main")]
 extern crate alloc;
+
+/// Global allocation failure: reclaim caches, then OOM-kill the current
+/// non-bootstrap task rather than taking down the whole OS. See
+/// [`mm::heap::on_alloc_error`].
+#[alloc_error_handler]
+fn on_alloc_error(layout: core::alloc::Layout) -> ! {
+    crate::mm::heap::on_alloc_error(layout)
+}
 
 /// ChittiOS version, shown in the status bar and `/info`.
 pub const VERSION: &str = env!("CHITTI_VERSION");
@@ -217,6 +226,9 @@ pub fn init() {
         .entries();
     mm::init(memmap, hhdm_offset);
     sched::init();
+    // OOM path: reclaim caches before killing a task. After heap + scheduler so
+    // hooks that free storage or compact the audit log can run.
+    mm::reclaim::register_builtin();
 
     // Move the scheduler tick to the local-APIC timer where we can. The PIT/PIC
     // arrangement programmed above is legacy-PC hardware a UEFI-only machine may
@@ -262,6 +274,7 @@ pub fn init() {
 pub fn init() {
     mm::init();
     sched::init();
+    mm::reclaim::register_builtin();
     // Bring up the other vCPUs (count discovered via PSCI, like x86 discovers APs
     // from Limine). They enable their MMU, claim a worker slot, and park spinning
     // on the matvec job pool. On an Apple-Silicon host we run QEMU with `-smp 4`

@@ -861,14 +861,16 @@ fn decoder_cmd(arg: &str) {
     let arg = arg.trim();
     match arg {
         "" | "status" => {
-            let (decodes, builds) = crate::synapse::tenant::decode_stats();
+            let (decodes, builds, grows) = crate::synapse::tenant::decode_stats();
             let where_ = if crate::synapse::tenant::sandboxed_decode() {
                 "ring 3 (sandboxed tenant -- a corrupt file cannot touch the kernel)"
             } else {
                 "in-kernel (A/B comparison mode)"
             };
             serial_println!("decoder> images decode in {where_}");
-            serial_println!("decoder>   {decodes} decode(s), {builds} tenant build(s) -- a reused tenant stops building");
+            serial_println!(
+                "decoder>   {decodes} decode(s), {builds} tenant build(s), {grows} arena growth(s) -- a reused tenant stops building"
+            );
             serial_println!("decoder>   /decoder ring3|kernel");
         }
         "ring3" | "ring-3" | "sandbox" | "on" => {
@@ -7099,16 +7101,38 @@ fn run_audit(arg: &str) {
         "" | "status" => {
             let n = crate::synapse::audit::len();
             match crate::synapse::audit::verify() {
-                Ok(_) => serial_println!("audit> {n} entries, chain intact, head {:#018x}", crate::synapse::audit::head()),
+                Ok(_) => serial_println!(
+                    "audit> {n} entries (cap {}), chain intact, head {:#018x}",
+                    crate::synapse::audit::MAX_ENTRIES,
+                    crate::synapse::audit::head()
+                ),
                 Err(seq) => serial_println!("audit> {n} entries, CHAIN BROKEN at #{seq}"),
             }
-            serial_println!("audit> the chain is tamper-evident, not attested: a kernel that can");
-            serial_println!("audit>   write the log can recompute it. Quote the head elsewhere.");
+            if let Some(ph) = crate::synapse::audit::load_persisted_head() {
+                let match_ = if ph == crate::synapse::audit::head() {
+                    "matches live head"
+                } else {
+                    "differs from live head (export if you need the body)"
+                };
+                serial_println!("audit> persisted head {:#018x} ({match_})", ph);
+            } else {
+                serial_println!("audit> no persisted head yet (written every {} records + export)", 256);
+            }
+            serial_println!("audit> keyed session chain is tamper-evident, not TPM-attested:");
+            serial_println!("audit>   a kernel that can write the log can recompute it. Quote the head off-box.");
         }
         "verify" => match crate::synapse::audit::verify() {
             Ok(n) => serial_println!("audit> ok: {n} entries, chain intact, head {:#018x}", crate::synapse::audit::head()),
             Err(seq) => serial_println!("audit> BROKEN: entry #{seq} does not follow the one before it"),
         },
+        "persist" => {
+            crate::synapse::audit::persist_head();
+            serial_println!(
+                "audit> wrote head {:#018x} to {}",
+                crate::synapse::audit::head(),
+                crate::synapse::audit::HEAD_PATH
+            );
+        }
         "export" => {
             let path = if rest.is_empty() { "/audit.log" } else { rest };
             let text = crate::synapse::audit::export();
@@ -7116,10 +7140,11 @@ fn run_audit(arg: &str) {
             crate::synapse::fs::begin_batch();
             crate::synapse::fs::write(path, text.as_bytes());
             crate::synapse::fs::end_batch();
+            crate::synapse::audit::persist_head();
             serial_println!("audit> wrote {bytes} bytes ({} entries) to {path}", crate::synapse::audit::len());
             serial_println!("audit> head {:#018x} — record it off-box for the export to prove anything", crate::synapse::audit::head());
         }
-        other => serial_println!("audit> unknown subcommand '{other}' (try: status, verify, export [path])"),
+        other => serial_println!("audit> unknown subcommand '{other}' (try: status, verify, persist, export [path])"),
     }
 }
 

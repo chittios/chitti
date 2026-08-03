@@ -150,6 +150,25 @@ pub fn remove(id: u64, scope: Scope, key: &str) -> Result<bool, &'static str> {
     }
 }
 
+/// Drop every agent's **session** storage and return approximate bytes freed.
+///
+/// Used by the OOM reclaim path: session maps are pure cache and safe to wipe.
+/// Durable store is left alone (the human may care).
+pub fn reclaim_all_session() -> usize {
+    SESSION.with(|m| {
+        let bytes: usize = m.values().map(|v| v.len()).sum();
+        let n = m.len();
+        m.clear();
+        if n > 0 {
+            crate::ktrace::log_fmt(format_args!(
+                "storage: reclaimed session maps ({n} key(s), ~{} KiB)",
+                bytes / 1024
+            ));
+        }
+        bytes
+    })
+}
+
 /// List keys for an agent in the given scope.
 pub fn list(id: u64, scope: Scope) -> Vec<String> {
     match scope {

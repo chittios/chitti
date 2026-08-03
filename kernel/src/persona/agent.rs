@@ -234,7 +234,11 @@ impl Agent {
                 // refusal: "userspace could not run it" and "the gates said no" are
                 // different facts, and an agent that cannot tell them apart will retry the
                 // wrong one.
-                let Some(inv) = crate::synapse::tenant::invoke_in_userspace(self.task, &raw, justification) else {
+                // Heap quota follows this agent's identity (parked task), not the
+                // shell stack driving the plan/act loop — same as tools::Router.
+                let Some(inv) = crate::sched::with_heap_charge_as(self.task, || {
+                    crate::synapse::tenant::invoke_in_userspace(self.task, &raw, justification)
+                }) else {
                     return alloc::string::String::from("error: the userspace call never reached the gates");
                 };
                 match inv {
