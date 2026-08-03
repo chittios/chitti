@@ -1292,6 +1292,27 @@ def s_open_media(_g):
             g2.send(f"/open /img{d}/chitti-e2e.png")
             if not g2.wait_for("3x2 px", 15, m):
                 continue
+            # That decode ran **in ring 3**: a malformed PNG is a tenant's status word, not a
+            # kernel parser bug. Prove the A/B on the running OS — the same file through the
+            # in-kernel path must report the same image (both sides run the same source, so a
+            # difference would be the boundary), and the tenant must be reused rather than
+            # rebuilt per decode.
+            m = g2.mark()
+            g2.send("/decoder")
+            if not g2.wait_for("images decode in ring 3", 10, m):
+                return False, "/decoder did not report the sandboxed path"
+            m = g2.mark()
+            g2.send("/decoder kernel")
+            g2.wait_quiet(0.3, 10)
+            g2.send(f"/open /img{d}/chitti-e2e.png")
+            if not g2.wait_for("3x2 px", 15, m):
+                return False, "in-kernel decode disagreed with the sandboxed one"
+            m = g2.mark()
+            g2.send("/decoder ring3")
+            g2.wait_quiet(0.3, 10)
+            g2.send("/decoder")
+            if not g2.wait_for("tenant build(s)", 10, m):
+                return False, "/decoder did not report its reuse counters"
             # Same mount also carries the WAV: decode + play it.
             m = g2.mark()
             g2.send(f"/open /img{d}/chitti-e2e.wav")
@@ -1320,7 +1341,7 @@ def s_open_media(_g):
                 return False, "pdf preview did not report pages"
             if not g2.wait_for("/preview/chitti-e2e.txt", 5, m3):
                 return False, "pdf preview did not open the text tab"
-            return True, "PNG previewed + WAV played + media controls + PDF digested via wasm"
+            return True, "PNG previewed in ring 3 (A/B vs kernel) + WAV played + media controls + PDF digested via wasm"
         return False, "no '3x2 px' decode report from /open on any mount"
     finally:
         g2.close()

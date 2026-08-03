@@ -387,7 +387,12 @@ pub fn decode_image_or_svg(
         }
         return Some(crate::image::Image { w, h, pixels: svg::raster(&sbox) });
     }
-    crate::image::decode(bytes).ok()
+    // **Ring 3, like `/open`.** A raster image on a web page is the most attacker-controlled
+    // input this OS accepts — chosen by whoever wrote the page, fetched without being asked —
+    // so it is parsed by a tenant holding no capability rather than in the kernel. The SVG path
+    // above stays in ring 0 for now: it is not a buffer-in/buffer-out decoder but the HTML
+    // parser plus the rasteriser, and moving it means moving those too.
+    crate::synapse::tenant::decode_image_for_view(bytes).ok()
 }
 
 fn find_svg_node(n: &html::Node) -> Option<&html::Node> {

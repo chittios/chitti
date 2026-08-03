@@ -341,11 +341,52 @@ pub fn self_test() -> Result<(), &'static str> {
     match got {
         // Refused is the expected answer: the throwaway identity holds nothing. What
         // is being checked here is that the reply travelled back through the block.
-        Ok(reply) if reply.starts_with("denied:") || reply.starts_with("refused:") => Ok(()),
-        Ok(reply) if reply.is_empty() => Err("the parameterised tenant returned no reply"),
-        Ok(_) => Err("an unauthorised parameterised call was not refused"),
-        Err(_) => Err("the parameterised tenant could not be run"),
+        Ok(reply) if reply.starts_with("denied:") || reply.starts_with("refused:") => {}
+        Ok(reply) if reply.is_empty() => return Err("the parameterised tenant returned no reply"),
+        Ok(_) => return Err("an unauthorised parameterised call was not refused"),
+        Err(_) => return Err("the parameterised tenant could not be run"),
     }
+
+    // And the **decode tenant**, which is what `/open` runs on every image. Same reason again,
+    // and more pressing here than for the blobs above: this is a compiled Rust tenant with a
+    // heap, statics and a real parser in it, and on aarch64 nothing else executes any of that.
+    // The claim is differential — ring 3 must produce exactly what the kernel produces — so a
+    // boundary that is subtly wrong (the entry offset, the initial stack alignment, the arena,
+    // the pixel gather) fails here rather than as a wrong-looking picture much later.
+    decode_self_test()
+}
+
+/// The 16x16 fixture the differential tests use, embedded for the boot self-test as well.
+const SELFTEST_PNG: &[u8] = include_bytes!("../image/fixtures/tiny16.png");
+const SELFTEST_JPG: &[u8] = include_bytes!("../image/fixtures/tiny16.jpg");
+
+/// Decode both fixtures in ring 3 and compare with the kernel's own decode.
+fn decode_self_test() -> Result<(), &'static str> {
+    let mut t = ImageTenant::new(4 << 20).map_err(|_| "the decode tenant could not be loaded")?;
+    for (bytes, what) in [(SELFTEST_PNG, "png"), (SELFTEST_JPG, "jpeg")] {
+        let native = crate::image::decode(bytes).map_err(|_| "the kernel could not decode its own fixture")?;
+        let got = t.decode(bytes).map_err(|e| {
+            crate::ktrace::log_fmt(format_args!("tenant: {what} self-test failed: {e:?}"));
+            "the decode tenant did not decode the fixture"
+        })?;
+        if (got.w, got.h) != (native.w, native.h) || got.pixels != native.pixels {
+            return Err("the decode tenant disagreed with the kernel about a fixture");
+        }
+    }
+    // A malformed file must come back as a *rejection* — the whole point — and the tenant must
+    // still work afterwards. Checked here too, because "the sandbox survives bad input" is a
+    // property of the arch's fault path, which is exactly what a boot self-test is for.
+    let mut bad = SELFTEST_PNG.to_vec();
+    for b in bad.iter_mut().skip(64).take(32) {
+        *b ^= 0xff;
+    }
+    if !matches!(t.decode(&bad), Err(LoadError::Declined { .. })) {
+        return Err("a corrupt image was not declined by the decode tenant");
+    }
+    if t.decode(SELFTEST_PNG).is_err() {
+        return Err("the decode tenant stopped working after a corrupt file");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -525,6 +566,22 @@ mod tests {
     /// unfilter and Huffman paths do real work. A solid block decodes correctly with several
     /// stages broken.
     const TINY_PNG: &[u8] = include_bytes!("../image/fixtures/tiny16.png");
+    /// The same image as baseline JPEG (with EXIF and a restart interval, so the marker walk,
+    /// the Huffman tables and `sync_restart` all run). The second format matters: PNG and JPEG
+    /// share only the `Image` type, so a boundary that worked for one and not the other would
+    /// be a real divergence rather than a rounding difference.
+    const TINY_JPG: &[u8] = include_bytes!("../image/fixtures/tiny16.jpg");
+
+    /// Both fixtures decoded in ring 3 must equal the kernel's own decode, pixel for pixel.
+    fn assert_same_as_kernel(img: &crate::image::Image, bytes: &[u8]) {
+        let native = crate::image::decode(bytes).expect("the kernel must decode its own fixture");
+        assert_eq!((img.w, img.h), (native.w, native.h), "dimensions disagree");
+        assert_eq!(img.pixels.len(), native.pixels.len(), "pixel count disagrees");
+        assert!(
+            img.pixels == native.pixels,
+            "same source, different pixels -- the boundary is wrong, not the decoder"
+        );
+    }
 
     #[test_case]
     fn a_png_decodes_in_ring_three_identically_to_the_kernel() {
@@ -590,6 +647,159 @@ mod tests {
         let good = run_imgdec(tenant, TINY_PNG).expect("a good PNG must still decode after a bad one");
         assert_eq!(u32::from_le_bytes([good[8], good[9], good[10], good[11]]), 1);
         let _ = crate::sched::kill(tenant);
+    }
+
+    #[test_case]
+    fn a_reused_tenant_decodes_png_and_jpeg_identically_to_the_kernel() {
+        // **The cutover's precondition.** `/open` routes through one tenant that stays loaded,
+        // so what has to hold is that the *second* and *third* decodes are as correct as the
+        // first — a reused address space keeps its `.bss`, and the bump cursor left at the end
+        // of the previous decode is exactly the kind of state that makes run 2 fail while run 1
+        // passes. Both formats, alternating, so no ordering can be got away with.
+        let mut t = ImageTenant::new(4 << 20).expect("the decode tenant must load");
+        for _ in 0..3 {
+            let png = t.decode(TINY_PNG).expect("the tenant must decode the PNG");
+            assert_same_as_kernel(&png, TINY_PNG);
+            let jpg = t.decode(TINY_JPG).expect("the tenant must decode the JPEG");
+            assert_same_as_kernel(&jpg, TINY_JPG);
+        }
+    }
+
+    #[test_case]
+    fn a_small_arena_is_reported_as_out_of_memory_and_growing_it_fixes_it() {
+        // The arena-sizing protocol, which exists because **how much heap an image needs is a
+        // number inside the file**. The loader starts small and the tenant says when that was
+        // not enough; the alternative is parsing the header in the kernel, which is the thing
+        // being undone.
+        //
+        // It doubles as the sharpest test of the cursor reset: the successful decode below runs
+        // in the *same* address space as the failed one, so a tenant that did not reset its bump
+        // cursor would still be out of memory with sixty times the arena.
+        let mut t = ImageTenant::new(0x1000).expect("the decode tenant must load");
+        // Mapped to its dimensions rather than kept whole: a decoded `Image` is millions of
+        // pixels and these asserts print their subject on failure.
+        let got = t.decode(TINY_PNG).map(|i| (i.w, i.h));
+        assert!(
+            matches!(got, Err(LoadError::Declined { status }) if status == block::STATUS_OUT_OF_MEMORY),
+            "a one-page arena must be reported as out of memory, got {got:?}"
+        );
+        assert!(t.grow_heap(1 << 20), "the arena must grow");
+        let img = t.decode(TINY_PNG).expect("with a real arena the same file must decode");
+        assert_same_as_kernel(&img, TINY_PNG);
+    }
+
+    #[test_case]
+    fn a_corrupt_image_is_declined_by_a_reused_tenant_which_keeps_working() {
+        // The prize, on the path `/open` actually takes: a malformed file is an *answer*, the
+        // kernel is untouched, and — the part reuse adds — the tenant that rejected it is still
+        // the tenant the next decode uses.
+        let mut t = ImageTenant::new(4 << 20).expect("the decode tenant must load");
+        let mut bad = TINY_PNG.to_vec();
+        for b in bad.iter_mut().skip(64).take(32) {
+            *b ^= 0xff;
+        }
+        let got = t.decode(&bad).map(|i| (i.w, i.h));
+        assert!(
+            matches!(got, Err(LoadError::Declined { status }) if status == block::STATUS_DECODE_FAILED),
+            "a corrupt PNG must be declined, got {got:?}"
+        );
+        // Truncated is a different failure path (it is rejected before inflate runs at all).
+        let short = t.decode(&TINY_PNG[..TINY_PNG.len() / 2]).map(|i| (i.w, i.h));
+        assert!(matches!(short, Err(LoadError::Declined { .. })), "a truncated PNG must be declined, got {short:?}");
+        // Not an image at all: the tenant's checksum fallback must not be mistaken for a decode.
+        let junk = t.decode(b"GIF89a not an image at all").map(|i| (i.w, i.h));
+        assert!(matches!(junk, Err(LoadError::Declined { .. })), "junk must be declined, got {junk:?}");
+
+        let good = t.decode(TINY_PNG).expect("a good PNG must still decode after three bad ones");
+        assert_same_as_kernel(&good, TINY_PNG);
+    }
+
+    #[test_case]
+    fn a_decode_tenant_returns_every_frame_it_took() {
+        // A tenant holds its arena for its whole life — nothing here can unmap — so the only
+        // thing standing between "reuse" and "a leak" is `Drop` returning the shared frames
+        // *after* the space is gone. Asserted around a build-and-drop, since a frame still
+        // mapped by a live tenant when it is freed is a use-after-free across a privilege
+        // boundary rather than merely lost memory.
+        let before = space::free_frames();
+        {
+            let mut t = ImageTenant::new(1 << 20).expect("the decode tenant must load");
+            let img = t.decode(TINY_PNG).expect("decode");
+            assert_eq!((img.w, img.h), (16, 16));
+        }
+        assert_eq!(space::free_frames(), before, "frames must be returned when a tenant is dropped");
+    }
+
+    #[test_case]
+    fn the_shared_decode_tenant_is_built_once_and_the_flag_agrees_with_it() {
+        // `/open`'s path. Two claims: the tenant is reused across calls (the build count stops
+        // moving), and the flag really does select between two implementations that agree —
+        // which is what makes the in-kernel decoder deletable later rather than merely unused.
+        let (_, builds_before) = decode_stats();
+        let first = decode_image(TINY_PNG).expect("the shared tenant must decode");
+        assert_same_as_kernel(&first, TINY_PNG);
+        let builds_after = decode_stats().1;
+        for _ in 0..3 {
+            let img = decode_image(TINY_JPG).expect("the shared tenant must decode");
+            assert_same_as_kernel(&img, TINY_JPG);
+        }
+        assert_eq!(decode_stats().1, builds_after, "a reused tenant must not be rebuilt per decode");
+        assert!(builds_after <= builds_before + 1, "at most one build was needed");
+
+        assert!(sandboxed_decode(), "images decode in ring 3 by default");
+        let sandboxed = decode_image_for_view(TINY_JPG).expect("sandboxed");
+        set_sandboxed_decode(false);
+        let in_kernel = decode_image_for_view(TINY_JPG).expect("in-kernel");
+        set_sandboxed_decode(true);
+        assert!(sandboxed.pixels == in_kernel.pixels, "the flag must not change the pixels");
+    }
+
+    #[test_case]
+    fn what_a_reused_decode_tenant_costs() {
+        // **The number the reuse work exists for**, and it is a ring-3-vs-ring-3 comparison on
+        // purpose: the same tenant, the same file, with and without paying for an address space.
+        // `a_png_decodes_in_ring_three_identically_to_the_kernel` prints the one-shot figure —
+        // building a space and mapping ~1000 arena pages per decode — and this prints what is
+        // left once that is paid once instead of every time.
+        //
+        // **The in-kernel figure beside it is NOT a fair ratio and must not be quoted as one.**
+        // The unit suite is a *debug* build, so `image::png::decode` runs unoptimized with bounds
+        // checks while the tenant is `opt-level = "s"` with LTO — which flatters ring 3 by about
+        // an order of magnitude, the same mistake `what_ring_three_actually_costs` documents in
+        // the other direction. It is printed only so a *regression* is visible: what ring 3
+        // genuinely costs is a page-table switch and a trap, because it is the same instructions
+        // on the same CPU. `tools/pngbench` is where a real ratio comes from.
+        const N: usize = 20;
+        let mut t = ImageTenant::new(4 << 20).expect("load");
+        let _ = t.decode(TINY_PNG).expect("warm-up");
+        let t0 = crate::arch::now_ms();
+        for _ in 0..N {
+            let _ = core::hint::black_box(t.decode(TINY_PNG).expect("repeat"));
+        }
+        let reused = crate::arch::now_ms().saturating_sub(t0);
+
+        // The same blob decoding the same file, one address space per decode. Measured here
+        // rather than quoted from another test, so the comparison cannot go stale.
+        let one_shot_task = crate::sched::spawn_parked("imgdec-oneshot");
+        let t0 = crate::arch::now_ms();
+        for _ in 0..N {
+            let _ = core::hint::black_box(run_imgdec(one_shot_task, TINY_PNG).expect("repeat"));
+        }
+        let one_shot = crate::arch::now_ms().saturating_sub(t0);
+        let _ = crate::sched::kill(one_shot_task);
+
+        let t0 = crate::arch::now_ms();
+        for _ in 0..N {
+            let _ = core::hint::black_box(crate::image::png::decode(TINY_PNG).expect("repeat"));
+        }
+        let kernel = crate::arch::now_ms().saturating_sub(t0);
+        crate::ktrace::log_fmt(format_args!(
+            "tenant.png: reused {}us/decode vs one-shot {}us/decode; in-kernel debug build {}us -- NOT a fair ratio, see the test (N={N})",
+            reused * 1000 / N as u64,
+            one_shot * 1000 / N as u64,
+            kernel * 1000 / N as u64
+        ));
+        assert!(reused <= one_shot, "reuse must not be slower than rebuilding: {reused}ms vs {one_shot}ms");
     }
 
     #[test_case]
@@ -778,6 +988,16 @@ pub mod block {
     /// Written *by the tenant*: 0 on success, else its own error code. Distinct from a
     /// fault — a decoder that cleanly rejects a malformed file is not a crash.
     pub const STATUS: usize = 96;
+    /// Written *by the tenant* in heap-output mode: the decoded image's dimensions.
+    pub const IMG_W: usize = 104;
+    pub const IMG_H: usize = 112;
+    /// The tenant declined because its input was malformed or unsupported. **An answer.**
+    pub const STATUS_DECODE_FAILED: u64 = 3;
+    /// The tenant's arena was too small. Not a rejection: how much heap an image needs is a
+    /// number inside the file, so the only honest protocol is for the tenant to say "not
+    /// enough" and for the loader to map more and re-enter. Conflating this with
+    /// [`STATUS_DECODE_FAILED`] would report a perfectly good photo as corrupt.
+    pub const STATUS_OUT_OF_MEMORY: u64 = 4;
     /// What the loader writes here **before** entry, so the field is fail-closed: a tenant
     /// that exits without claiming success (because it panicked, or never got that far)
     /// leaves this behind rather than an ambiguous zero. It is why the tenant's
@@ -1005,9 +1225,16 @@ pub fn imgdec_image() -> Blob {
     Blob { bytes: IMGDEC_BLOB, entry, rx, rw }
 }
 
-/// Run the compiled userspace tenant over `input`.
+/// Run the compiled userspace tenant over `input`, once, in a fresh address space.
+///
+/// The one-shot form, kept for the differential tests and the boot self-test. Anything that
+/// decodes more than once should use [`ImageTenant`], which pays this setup once.
+///
+/// The heap is the tenant's arena and is mapped per run here, so it is a direct latency cost:
+/// 4 MiB is 1024 frame allocations and page-table walks. Enough for the small fixtures; a real
+/// image goes through [`decode_image`], which sizes the arena by asking the tenant.
 pub fn run_imgdec(task: crate::sched::TaskId, input: &[u8]) -> Result<alloc::vec::Vec<u8>, LoadError> {
-    run_bulk_image(task, imgdec_image(), input)
+    run_bulk_image(task, imgdec_image(), input, 4 << 20)
 }
 
 /// Run the bulk tenant over `input`, returning what it wrote.
@@ -1048,17 +1275,21 @@ pub fn run_bulk_at(
         rx: 0x1000,
         rw: 0,
     };
-    run_bulk_image(task, b, input)
+    // The hand-assembled blobs allocate nothing, so they get no heap: an arena mapped for a
+    // tenant that never calls an allocator is a per-run cost with no purpose.
+    run_bulk_image(task, b, input, 0)
 }
 
-/// [`run_bulk_at`] for an image with a real layout.
+/// [`run_bulk_at`] for an image with a real layout, plus `heap_bytes` of arena.
 pub fn run_bulk_image(
     task: crate::sched::TaskId,
     image: Blob,
     input: &[u8],
+    heap_bytes: usize,
 ) -> Result<alloc::vec::Vec<u8>, LoadError> {
     const PAGE: usize = 0x1000;
     let in_pages = input.len().div_ceil(PAGE).max(1);
+    let heap_pages = heap_bytes.div_ceil(PAGE);
     let mut loaded = load_image(image)?;
 
     // Frames for the shared buffers, taken from the global allocator and handed back at
@@ -1094,9 +1325,18 @@ pub fn run_bulk_image(
     let args_va = loaded.stack_page + PAGE as u64;
     let in_va = args_va + PAGE as u64;
     let out_va = in_va + (in_pages as u64) * PAGE as u64;
+    let heap_va = out_va + PAGE as u64;
 
     let run = (|| -> Result<alloc::vec::Vec<u8>, LoadError> {
         let args_phys = loaded.space.map_new_page(args_va, UserPerms::RW).map_err(|_| LoadError::Map)?;
+        // The tenant's arena, private to it: unlike the shared buffers the kernel never reads
+        // this back, so it is mapped from the space's own frames and dies with it.
+        for p in 0..heap_pages {
+            loaded
+                .space
+                .map_new_page(heap_va + (p as u64) * PAGE as u64, UserPerms::RW)
+                .map_err(|_| LoadError::Map)?;
+        }
         loaded.map_shared(in_va, in_frames, UserPerms::RO)?;
         loaded.map_shared(out_va, out_frames, UserPerms::RW)?;
         let args_kernel = space::phys_to_kernel(args_phys);
@@ -1108,6 +1348,8 @@ pub fn run_bulk_image(
             put(block::INPUT_LEN, input.len() as u64);
             put(block::OUTPUT_PTR, out_va);
             put(block::OUTPUT_CAP, PAGE as u64);
+            put(block::HEAP_PTR, if heap_pages > 0 { heap_va } else { 0 });
+            put(block::HEAP_LEN, (heap_pages * PAGE) as u64);
             put(block::STATUS, block::STATUS_NOT_RUN);
         }
         // **No justification is set**, because this tenant makes no Synapse call and so
@@ -1149,6 +1391,368 @@ pub fn run_bulk_image(
         space::give_frame(f);
     }
     run
+}
+
+// ---------------------------------------------------------------------------
+// A reusable decode tenant
+// ---------------------------------------------------------------------------
+
+/// A loaded [`imgdec_image`] kept alive across decodes.
+///
+/// **The whole ~2x that ring 3 measured was setup, not execution.** A decode through
+/// [`run_bulk_image`] builds an address space, maps the image, a stack, an arena and the shared
+/// buffers, crosses once, and frees all of it — for a 16x16 PNG that dwarfed the decode. Keeping
+/// the space means a decode costs a page-table switch, a trap, and rebinding the input frames.
+///
+/// Two consequences worth stating, because they are the reasons this is a struct rather than a
+/// flag on the existing function:
+///
+/// - **The arena grows and is never returned during the tenant's life.** Nothing here can unmap,
+///   so a tenant that decoded one huge image would hold its frames forever; [`decode_image`]
+///   answers that by *dropping* a tenant whose heap outgrew [`KEEP_HEAP_BYTES`] instead of
+///   caching it.
+/// - **A reused address space keeps its `.bss`**, so the tenant resets its own bump cursor at
+///   entry. Without that the second decode starts with a full arena and reports
+///   [`block::STATUS_OUT_OF_MEMORY`] — a failure whose cause nothing in the loader points at.
+///
+/// The heap and the input region live far apart in the tenant's address space so the heap can
+/// grow upward without meeting anything; user address space is 256 GiB at its smallest, and
+/// this reserves 4 GiB of it for input.
+pub struct ImageTenant {
+    /// `Option` only so [`Drop`] can drop the space *before* handing the shared frames back —
+    /// freeing a frame a live tenant mapping still points at is a use-after-free across a
+    /// privilege boundary. Field drop order runs after `Drop::drop`, which is the wrong way
+    /// round here.
+    space: Option<AddressSpace>,
+    entry: u64,
+    stack: u64,
+    /// The identity the tenant runs under: a parked task holding no capabilities, which is the
+    /// whole authority story for a decoder.
+    task: crate::sched::TaskId,
+    args_va: u64,
+    args_kernel: u64,
+    in_va: u64,
+    in_frames: alloc::vec::Vec<u64>,
+    heap_va: u64,
+    heap_frames: alloc::vec::Vec<u64>,
+}
+
+/// How much of the tenant's address space is reserved for input before the heap starts.
+const INPUT_WINDOW: u64 = 4 << 30;
+
+impl ImageTenant {
+    /// Build a tenant with `heap_bytes` of arena.
+    pub fn new(heap_bytes: usize) -> Result<Self, LoadError> {
+        const PAGE: u64 = 0x1000;
+        let mut loaded = load_image(imgdec_image())?;
+        let args_va = loaded.stack_page + PAGE;
+        let args_phys = loaded.space.map_new_page(args_va, UserPerms::RW).map_err(|_| LoadError::Map)?;
+        let args_kernel = space::phys_to_kernel(args_phys);
+        let in_va = args_va + PAGE;
+        let heap_va = args_va + INPUT_WINDOW;
+        let mut me = Self {
+            space: Some(loaded.space),
+            entry: loaded.entry,
+            stack: loaded.stack,
+            task: crate::sched::spawn_parked("imgdec"),
+            args_va,
+            args_kernel,
+            in_va,
+            in_frames: alloc::vec::Vec::new(),
+            heap_va,
+            heap_frames: alloc::vec::Vec::new(),
+        };
+        if !me.grow_heap(heap_bytes) {
+            return Err(LoadError::NoAddressSpace);
+        }
+        Ok(me)
+    }
+
+    /// Bytes of arena currently mapped.
+    pub fn heap_bytes(&self) -> usize {
+        self.heap_frames.len() * 0x1000
+    }
+
+    /// Map shared frames at `va` until `frames` holds `want` of them.
+    ///
+    /// The frames stay the **kernel's** (`take_shared_frame`), not the space's, because the
+    /// kernel reads the decoded pixels out of its own alias after the tenant has exited — the
+    /// same arrangement the one-shot path uses for its output buffer.
+    fn extend(
+        space: &mut AddressSpace,
+        frames: &mut alloc::vec::Vec<u64>,
+        va: u64,
+        want: usize,
+        perms: UserPerms,
+    ) -> bool {
+        while frames.len() < want {
+            let Some(f) = space::take_shared_frame() else { return false };
+            let at = va + (frames.len() as u64) * 0x1000;
+            if space.map_frame(at, f, perms).is_err() {
+                space::give_frame(f);
+                return false;
+            }
+            frames.push(f);
+        }
+        true
+    }
+
+    /// Grow the arena to at least `bytes`. `false` if the frames were not available — in which
+    /// case whatever was mapped before is still mapped and still usable.
+    pub fn grow_heap(&mut self, bytes: usize) -> bool {
+        let want = bytes.div_ceil(0x1000);
+        let heap_va = self.heap_va;
+        let Some(space) = self.space.as_mut() else { return false };
+        Self::extend(space, &mut self.heap_frames, heap_va, want, UserPerms::RW)
+    }
+
+    /// Decode `bytes` in ring 3 and read the pixels back out of the kernel's own alias.
+    pub fn decode(&mut self, bytes: &[u8]) -> Result<crate::image::Image, LoadError> {
+        const PAGE: usize = 0x1000;
+        let want = bytes.len().div_ceil(PAGE).max(1);
+        let (in_va, heap_va) = (self.in_va, self.heap_va);
+        {
+            let Some(space) = self.space.as_mut() else { return Err(LoadError::NoAddressSpace) };
+            if !Self::extend(space, &mut self.in_frames, in_va, want, UserPerms::RO) {
+                return Err(LoadError::NoAddressSpace);
+            }
+        }
+        // Copy the input in through the kernel alias, and clear the tail of the last page: a
+        // reused tenant keeps the frames from the previous, possibly larger, image, and a
+        // decoder that read past its declared length would then read plausible bytes instead of
+        // zeros — which is the difference between a bug that shows up in a test and one that
+        // does not.
+        for (i, &f) in self.in_frames.iter().take(want).enumerate() {
+            let off = i * PAGE;
+            let n = bytes.len().saturating_sub(off).min(PAGE);
+            // SAFETY: a frame the kernel owns, reachable by its alias; `n` is bounded by both
+            // the page and the remaining input.
+            unsafe {
+                let dst = space::phys_to_kernel(f) as *mut u8;
+                if n > 0 {
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr().add(off), dst, n);
+                }
+                if n < PAGE {
+                    core::ptr::write_bytes(dst.add(n), 0, PAGE - n);
+                }
+            }
+        }
+
+        let heap_len = self.heap_bytes() as u64;
+        // SAFETY: the block page this tenant owns, mapped read-write and reachable by the
+        // kernel. Zeroed first so no field of the previous decode is mistaken for this one's —
+        // in particular `IMG_W`/`IMG_H`, which the tenant only writes on success.
+        unsafe {
+            core::ptr::write_bytes(self.args_kernel as *mut u8, 0, PAGE);
+            let base = self.args_kernel as *mut u8;
+            let put = |off: usize, v: u64| core::ptr::write_unaligned(base.add(off) as *mut u64, v);
+            put(block::INPUT_PTR, in_va);
+            put(block::INPUT_LEN, bytes.len() as u64);
+            // **No output buffer, deliberately.** How many pixels an image has is a number
+            // inside the file, so a loader that had to map an output buffer first would have to
+            // either parse the header itself — putting attacker bytes back in ring 0, which is
+            // the thing being undone — or decode twice. Instead the tenant leaves the pixels in
+            // its arena and reports where they are; the arena is made of frames the kernel owns,
+            // so reading them costs nothing but a bounds check.
+            put(block::OUTPUT_PTR, 0);
+            put(block::OUTPUT_CAP, 0);
+            put(block::HEAP_PTR, heap_va);
+            put(block::HEAP_LEN, heap_len);
+            put(block::STATUS, block::STATUS_NOT_RUN);
+        }
+
+        let Some(space) = self.space.as_ref() else { return Err(LoadError::NoAddressSpace) };
+        // **No justification is set**: this tenant makes no Synapse call, so there is nothing
+        // for one to justify.
+        // SAFETY: code RX, stack RW, block RW, input RO, heap RW — all mapped in this space,
+        // which shares the kernel mappings.
+        let exit = unsafe { crate::arch::enter_tenant(self.task, space, self.entry, self.stack, self.args_va) };
+        if !exit.is_deliberate_exit() {
+            crate::ktrace::log_fmt(format_args!("tenant: image tenant did not exit cleanly: {exit:?}"));
+            return Err(LoadError::Faulted);
+        }
+        // SAFETY: the tenant's own block page.
+        let (status, out_ptr, out_len, w, h) = unsafe {
+            let base = self.args_kernel as *const u8;
+            let get = |off: usize| core::ptr::read_unaligned(base.add(off) as *const u64);
+            (get(block::STATUS), get(block::OUTPUT_PTR), get(block::OUTPUT_LEN), get(block::IMG_W), get(block::IMG_H))
+        };
+        if status != 0 {
+            return Err(LoadError::Declined { status });
+        }
+        // **Everything the tenant wrote is a claim, and is checked as one.** It reports where in
+        // its heap the pixels are; a wrong or hostile answer must not become a kernel read
+        // outside the frames this loader owns, so the range is resolved against the heap rather
+        // than trusted, and the length must be exactly the image the dimensions describe.
+        let off = out_ptr.checked_sub(heap_va).map(|o| o as usize).unwrap_or(usize::MAX);
+        let (w, h) = (w as usize, h as usize);
+        let px = w.saturating_mul(h);
+        if off % 4 != 0
+            || px == 0
+            || px > MAX_PIXELS
+            || out_len != (px as u64) * 4
+            || off.saturating_add(out_len as usize) > self.heap_bytes()
+        {
+            crate::ktrace::log_fmt(format_args!(
+                "tenant: image tenant reported an impossible result: ptr={out_ptr:#x} len={out_len} {w}x{h}"
+            ));
+            return Err(LoadError::Faulted);
+        }
+
+        let mut pixels: alloc::vec::Vec<u32> = alloc::vec::Vec::with_capacity(px);
+        // SAFETY: `px` elements are copied over immediately below, from a range proven above to
+        // lie inside the heap frames this tenant owns.
+        unsafe {
+            pixels.set_len(px);
+            let dst = pixels.as_mut_ptr() as *mut u8;
+            let mut done = 0usize;
+            while done < out_len as usize {
+                let at = off + done;
+                let frame = self.heap_frames[at / PAGE];
+                let within = at % PAGE;
+                let n = (PAGE - within).min(out_len as usize - done);
+                core::ptr::copy_nonoverlapping(
+                    (space::phys_to_kernel(frame) as *const u8).add(within),
+                    dst.add(done),
+                    n,
+                );
+                done += n;
+            }
+        }
+        Ok(crate::image::Image { w, h, pixels })
+    }
+}
+
+impl Drop for ImageTenant {
+    fn drop(&mut self) {
+        // Space first, frames second. The other order hands a live cross-privilege mapping to
+        // whatever allocates next.
+        drop(self.space.take());
+        for &f in self.in_frames.iter().chain(self.heap_frames.iter()) {
+            space::give_frame(f);
+        }
+        let _ = crate::sched::kill(self.task);
+    }
+}
+
+/// Ceiling on a decoded image, matching `image::png`'s own dimension check. A tenant that
+/// claimed more than this is not describing a picture.
+const MAX_PIXELS: usize = 32 << 20;
+
+/// Arena a fresh decode tenant starts with. Enough for roughly a 0.5 MP image; bigger ones grow
+/// it by asking, which costs one extra decode of the same file and nothing at all afterwards.
+const DEFAULT_HEAP_BYTES: usize = 8 << 20;
+/// Ceiling on that growth. A 4 MP photo wants ~5x its pixel buffer once the inflate output, the
+/// unfiltered scanlines and the bump allocator's lack of reuse are counted.
+const MAX_HEAP_BYTES: usize = 256 << 20;
+/// A tenant whose arena grew past this is dropped rather than cached: it would otherwise hold
+/// those frames for the rest of the boot because nothing here can unmap. Opening one large
+/// image should not permanently cost the machine its memory.
+const KEEP_HEAP_BYTES: usize = 16 << 20;
+
+/// The reused decode tenant. Single-slot for the same reason [`SHARED`] is: tenants are pinned
+/// to the boot CPU and `enter_tenant` is not reentrant.
+static IMAGE_TENANT: crate::mm::Locked<Option<ImageTenant>> = crate::mm::Locked::new(None);
+
+/// How many images have been decoded in ring 3, and how many of those had to grow the arena.
+static DECODES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static REBUILDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `(decodes, tenant builds)` — a reused tenant makes the second number stop growing, which is
+/// the only externally visible difference between reuse working and reuse silently not.
+pub fn decode_stats() -> (u64, u64) {
+    (DECODES.load(core::sync::atomic::Ordering::Relaxed), REBUILDS.load(core::sync::atomic::Ordering::Relaxed))
+}
+
+/// **Decode an image outside the kernel.** PNG or JPEG in, pixels out, parsed in ring 3 by a
+/// tenant holding no capability at all.
+///
+/// This is what the whole native-tenant path was built for: `image::decode` is the largest
+/// attacker-reachable parser the OS has that needs no authority whatsoever, so it is the one
+/// place where confinement is nearly free. A malformed file that would have been a wild write in
+/// ring 0 is now a status word.
+///
+/// Sizing the arena is the only interesting part. The loader cannot know how much heap an image
+/// needs without parsing it, and parsing it in the kernel is precisely what is being undone — so
+/// it starts small, and grows only when the tenant says it ran out. There is **no in-kernel
+/// fallback**: a decode that cannot be sandboxed is an error, because a fallback would make
+/// confinement depend on whether the loader happened to work.
+pub fn decode_image(bytes: &[u8]) -> Result<crate::image::Image, LoadError> {
+    // Taken out of the slot rather than locked across the crossing: userspace runs, traps back
+    // into the kernel, and anything reachable from there must not find this lock held.
+    let mut tenant = match IMAGE_TENANT.with(|slot| slot.take()) {
+        Some(t) => t,
+        None => {
+            REBUILDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            ImageTenant::new(DEFAULT_HEAP_BYTES)?
+        }
+    };
+    let mut out = tenant.decode(bytes);
+    while matches!(out, Err(LoadError::Declined { status }) if status == block::STATUS_OUT_OF_MEMORY) {
+        let want = (tenant.heap_bytes() * 2).min(MAX_HEAP_BYTES);
+        // Never take the machine's last frames for a picture: leave at least as many free as the
+        // growth would consume. A decode that stops here reports the tenant's own out-of-memory
+        // status, which is a true statement about what happened.
+        let need = (want - tenant.heap_bytes()) / 0x1000;
+        if want <= tenant.heap_bytes() || space::free_frames() < (need as u64) * 2 {
+            break;
+        }
+        if !tenant.grow_heap(want) {
+            break;
+        }
+        out = tenant.decode(bytes);
+    }
+    if out.is_ok() {
+        DECODES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    if tenant.heap_bytes() <= KEEP_HEAP_BYTES {
+        IMAGE_TENANT.with(|slot| *slot = Some(tenant));
+    }
+    out
+}
+
+/// Whether `/open` decodes images in ring 3. On by default; `/decoder kernel` puts the old
+/// in-kernel path back for an A/B comparison.
+///
+/// A flag, not a permanent choice: the in-kernel decoder stays until the differential has run
+/// over every fixture on both arches, and being able to switch at run time is what makes
+/// "same bytes either way" checkable on a booted machine rather than only in the unit suite.
+static SANDBOXED_DECODE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Whether image decoding is currently sandboxed.
+pub fn sandboxed_decode() -> bool {
+    SANDBOXED_DECODE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn ring-3 image decoding on or off.
+pub fn set_sandboxed_decode(on: bool) {
+    SANDBOXED_DECODE.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Decode an image the way `/open` should: in ring 3 unless that has been turned off.
+///
+/// Returns the same `Err(&str)` shape as [`crate::image::decode`] so a caller reads one way
+/// either side of the flag, and so the failure text names what actually happened — a tenant that
+/// *declined* a file and one that *faulted* on it are different facts, and only the second says
+/// the decoder has a bug.
+pub fn decode_image_for_view(bytes: &[u8]) -> Result<crate::image::Image, &'static str> {
+    if !sandboxed_decode() {
+        return crate::image::decode(bytes);
+    }
+    match decode_image(bytes) {
+        Ok(img) => Ok(img),
+        Err(LoadError::Declined { status }) if status == block::STATUS_DECODE_FAILED => {
+            Err("the sandboxed decoder rejected this file (corrupt, or an unsupported variant)")
+        }
+        Err(LoadError::Declined { status }) if status == block::STATUS_OUT_OF_MEMORY => {
+            Err("too large for the decode sandbox (see /decoder)")
+        }
+        Err(LoadError::Faulted) => Err("the sandboxed decoder faulted on this file -- the kernel is unharmed"),
+        Err(e) => {
+            crate::ktrace::log_fmt(format_args!("tenant: image tenant could not be loaded: {e:?}"));
+            Err("the decode sandbox could not be started (see /decoder)")
+        }
+    }
 }
 
 /// The assembled bytes of the parameterised tenant.

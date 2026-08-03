@@ -124,6 +124,48 @@ not moving code. That is a real design act: each primitive is a new gated, audit
 authority surface, it moves the paper's primitive count (which `cargo xtask paper-check`
 pins), and it adds an entry to the `security::redteam` census.
 
+**The other half of ring 3 is the parsers, and they are the cheap case: a decoder needs no
+authority at all.** It reads a byte buffer, writes a pixel buffer, exits — zero Synapse
+calls, so no new primitive, no gate change, nothing in the `paper-check` count or the
+`redteam` census. That is the exact opposite of `/http` or MCP, and it is why the largest
+attacker-reachable code in the OS is also the easiest thing to confine. **`/open` decodes
+PNG and JPEG in ring 3** (`userspace/imgdec/`, driven by `synapse::tenant::ImageTenant`):
+a malformed file becomes a status word from a tenant the kernel discards, where in ring 0
+it is a parser bug away from a wild write. `/decoder ring3|kernel` switches back for an
+A/B, and the in-kernel decoder stays until the differential has run on both arches.
+
+Five things that path pins down, each of which cost a debugging cycle:
+
+- **The tenant mounts the kernel's own source** (`#[path] = "../../../kernel/src/image/…"`,
+  the `pdf-wasm`/`h264diff` pattern), so there is **one** decoder and porting it cannot
+  regress it. What the differential test then compares is the *boundary* — layout, entry
+  offset, stack ABI, arena, pixel gather — which is the thing that can actually be wrong.
+- **x86-64 SysV guarantees `rsp % 16 == 8` at function entry**, because a `call` pushed a
+  return address. A tenant arrives by `iretq`, which pushes nothing, so a 16-aligned initial
+  rsp leaves every compiler frame 8 bytes off and the first `movaps` spill raises `#GP`.
+  Corrupt inputs returned before spilling a vector register, so *rejection worked and
+  success did not*. AAPCS64 is the opposite rule (SP always 16-aligned), so the initial SP
+  is arch-specific.
+- **The tenant is reused, and a reused address space keeps its `.bss`** — so it resets its
+  own bump cursor at `_start`. Without that line the second decode starts with a full arena
+  and reports out-of-memory, and nothing in the loader points at the cause. Reuse is not a
+  micro-optimisation: building a space, mapping ~1000 arena pages and tearing it down was
+  the entire measured overhead of ring 3, not the execution.
+- **How much heap an image needs is a number inside the file.** So the loader does not size
+  the arena — it starts small, and the tenant reports `STATUS_OUT_OF_MEMORY` (distinct from
+  "corrupt", or a good photo reads as a broken one) and the loader maps more and re-enters.
+  The alternative is parsing the header in ring 0, which is the thing being undone.
+  Symmetrically there is **no output buffer**: the tenant leaves the pixels in its arena and
+  reports where, and every number it reports is bounds-checked against the frames the loader
+  owns rather than trusted.
+- **No in-kernel fallback**, per the rule above: a decode that cannot be sandboxed is an
+  error, not a quiet retry in ring 0.
+
+wasm was measured and rejected for this: `tools/pngbench` (a permanent host tool, the
+`*diff` pattern) put wasmi at **47-67x native** on a 1.3 MP PNG — and "small images via
+wasm" does not rescue it, because an attacker sends a *large* one. Ring 3 costs a page-table
+switch and a trap. wasm stays right for `pdf`, which is already there.
+
 **Still in ring 0 for want of a primitive, not by choice:** the `http` tool (binds to
 `Shell{command:"http"}`, and `net_http_get`/`net_http_post` do not express its
 `-X`/`-H`/`-d`/`--stream` surface), MCP `tools/call` (a stateful JSON-RPC/SSE session),
