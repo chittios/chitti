@@ -177,10 +177,10 @@ pub fn input(_title: &str, _prompt: &str, _masked: bool) -> String {
 
 /// Multi-option question for agents (`ask_user_question`). Returns the chosen
 /// option index, or `None` if cancelled. Keyboard: arrows/Tab move, Enter
-/// selects, 1..9 jump, Esc cancels.
+/// selects, 1..9 jump, Esc cancels. Mouse: click a row to select it.
 #[cfg(not(test))]
 pub fn choose(title: &str, question: &str, options: &[&str]) -> Option<usize> {
-    use crate::framebuffer;
+    use crate::framebuffer::{self, ModalHit};
     if options.is_empty() {
         return None;
     }
@@ -231,6 +231,15 @@ pub fn choose(title: &str, question: &str, options: &[&str]) -> Option<usize> {
         if t.moved {
             framebuffer::cursor_move(t.x, t.y);
         }
+        if t.pressed {
+            match framebuffer::modal_hit(t.x, t.y) {
+                ModalHit::Choose(i) if i < n => {
+                    framebuffer::modal_dismiss();
+                    return Some(i);
+                }
+                _ => {}
+            }
+        }
         crate::shell::status_tick();
         crate::sched::yield_now();
     }
@@ -247,9 +256,10 @@ pub fn choose(_title: &str, _question: &str, options: &[&str]) -> Option<usize> 
 }
 
 /// Open the searchable **Commands** browser (the `/help` modal). Returns the
-/// selected command **name** (without `/`) on Enter, or `None` if dismissed.
-/// Typing filters the list; ↑/↓ move the highlight (skipping category headers);
-/// PgUp/PgDn page the list; Esc / Ctrl+C / `[x]` cancel.
+/// selected command **name** (without `/`) on Enter or a list-row click, or
+/// `None` if dismissed. Typing filters the list; ↑/↓ move the highlight
+/// (skipping category headers); PgUp/PgDn / mouse wheel page; Esc / Ctrl+C /
+/// `[x]` cancel.
 #[cfg(not(test))]
 pub fn browse_commands() -> Option<String> {
     use crate::framebuffer::{self, CommandsRow, ModalHit};
@@ -380,9 +390,30 @@ pub fn browse_commands() -> Option<String> {
         if t.moved {
             framebuffer::cursor_move(t.x, t.y);
         }
-        if t.pressed && framebuffer::modal_hit(t.x, t.y) == ModalHit::Close {
-            crate::framebuffer::modal_dismiss();
-            return None;
+        if t.wheel != 0 {
+            // Wheel up (+): previous items; wheel down (−): next.
+            let steps = t.wheel.clamp(-3, 3);
+            sel = catalog::move_sel(&rows, sel, -steps);
+            scroll = catalog::clamp_scroll(sel, scroll, VIEW, rows.len());
+            paint(&query, &rows, sel, scroll, caret_on);
+        }
+        if t.pressed {
+            match framebuffer::modal_hit(t.x, t.y) {
+                ModalHit::Close => {
+                    crate::framebuffer::modal_dismiss();
+                    return None;
+                }
+                ModalHit::ListRow(abs) => {
+                    // Click a selectable item → accept immediately (mouse-first).
+                    // Headers are ignored so a mis-click doesn't dismiss.
+                    if let Some(name) = catalog::name_at(&rows, abs) {
+                        let n = String::from(name);
+                        crate::framebuffer::modal_dismiss();
+                        return Some(n);
+                    }
+                }
+                _ => {}
+            }
         }
         let now = crate::arch::now_ms();
         if now.saturating_sub(last_blink) >= 500 {
@@ -421,7 +452,7 @@ pub fn browse_commands() -> Option<String> {
 }
 
 /// Open the searchable **Agents** browser (the `/agents` modal). Returns an
-/// encoded pick on Enter:
+/// encoded pick on Enter or a list-row click:
 /// * `switch:<id>` — rebind chat to a live task
 /// * `ui:<name>` — start package UI (`/agents start <name>`)
 /// * `shell:<name>` — rebind chat to that SOUL package
@@ -457,7 +488,8 @@ pub fn browse_agents() -> Option<String> {
     let mut caret_on = true;
     let mut last_blink = crate::arch::now_ms();
     // Ignore Enter for a short window so the same key that submitted `/agents`
-    // cannot immediately pick the first row.
+    // cannot immediately pick the first row. Mouse clicks are armed immediately
+    // (they are not residual from the command submit).
     let opened_ms = crate::arch::now_ms();
     let mut arm_enter = false;
 
@@ -501,7 +533,7 @@ pub fn browse_agents() -> Option<String> {
     }
 
     crate::serial_println!(
-        "agents> browser open ({} rows) — type to search, Enter select, Esc close",
+        "agents> browser open ({} rows) — type to search, Enter/click select, Esc close",
         rows.len()
     );
     paint(&query, &rows, sel, scroll, caret_on);
@@ -585,9 +617,27 @@ pub fn browse_agents() -> Option<String> {
         if t.moved {
             framebuffer::cursor_move(t.x, t.y);
         }
-        if t.pressed && framebuffer::modal_hit(t.x, t.y) == ModalHit::Close {
-            crate::framebuffer::modal_dismiss();
-            return None;
+        if t.wheel != 0 {
+            let steps = t.wheel.clamp(-3, 3);
+            sel = agents_catalog::move_sel(&rows, sel, -steps);
+            scroll = agents_catalog::clamp_scroll(sel, scroll, VIEW, rows.len());
+            paint(&query, &rows, sel, scroll, caret_on);
+        }
+        if t.pressed {
+            match framebuffer::modal_hit(t.x, t.y) {
+                ModalHit::Close => {
+                    crate::framebuffer::modal_dismiss();
+                    return None;
+                }
+                ModalHit::ListRow(abs) => {
+                    if let Some(name) = agents_catalog::name_at(&rows, abs) {
+                        let n = String::from(name);
+                        crate::framebuffer::modal_dismiss();
+                        return Some(n);
+                    }
+                }
+                _ => {}
+            }
         }
         // Blink the search caret less often than /help did for full repaints —
         // full modal redraws every 500 ms felt like flicker on large FB.

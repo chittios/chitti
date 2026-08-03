@@ -657,6 +657,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "ping" => net_ping(arg),
         "wifi" => wifi_cmd(arg),
         "tls" => tls_cmd(arg),
+        "decoder" => decoder_cmd(arg),
         "js" => run_js(arg),
         "think" => run_think(arg),
         "mode" => run_mode(arg),
@@ -845,6 +846,40 @@ fn tls_cmd(arg: &str) {
             serial_println!("tls> certificate verification ON (Mozilla root store).");
         }
         _ => serial_println!("tls> usage: /tls [status] | /tls insecure on|off"),
+    }
+}
+
+/// `/decoder [ring3|kernel]` — where `/open` parses an image.
+///
+/// Image decoding is the OS's largest attacker-reachable parser that needs no authority at all,
+/// so it runs in ring 3 by default: a malformed PNG or JPEG becomes a status word from a tenant
+/// the kernel discards, instead of a wild write in ring 0. `kernel` puts the in-kernel path back
+/// for an A/B comparison — the same source runs either side of the boundary
+/// (`userspace/imgdec` mounts `image/{png,jpeg}.rs`), so any difference in the *pixels* is the
+/// boundary, not the decoder.
+fn decoder_cmd(arg: &str) {
+    let arg = arg.trim();
+    match arg {
+        "" | "status" => {
+            let (decodes, builds) = crate::synapse::tenant::decode_stats();
+            let where_ = if crate::synapse::tenant::sandboxed_decode() {
+                "ring 3 (sandboxed tenant -- a corrupt file cannot touch the kernel)"
+            } else {
+                "in-kernel (A/B comparison mode)"
+            };
+            serial_println!("decoder> images decode in {where_}");
+            serial_println!("decoder>   {decodes} decode(s), {builds} tenant build(s) -- a reused tenant stops building");
+            serial_println!("decoder>   /decoder ring3|kernel");
+        }
+        "ring3" | "ring-3" | "sandbox" | "on" => {
+            crate::synapse::tenant::set_sandboxed_decode(true);
+            serial_println!("decoder> images now decode in ring 3");
+        }
+        "kernel" | "ring0" | "off" => {
+            crate::synapse::tenant::set_sandboxed_decode(false);
+            serial_println!("decoder> images now decode IN THE KERNEL -- a malformed file is a kernel parser bug away from halting the machine");
+        }
+        _ => serial_println!("decoder> usage: /decoder [status] | /decoder ring3|kernel"),
     }
 }
 
@@ -12799,7 +12834,7 @@ fn play_video_bytes(name: &str, bytes: alloc::vec::Vec<u8>) {
             // Stream like VLC: demux + first frame only — no full-clip RGB cache.
             dec.seek_decode(0);
             serial_println!(
-                "open>   {}x{}  {} frame(s)  decoder={}  ready in {} ms (streaming) — Ctrl+Tab focus, space=pause",
+                "open>   {}x{}  {} frame(s)  decoder={}  ready in {} ms (streaming) — Ctrl+Tab cycles focus, space=pause",
                 dec.src_w,
                 dec.src_h,
                 frame_count,
@@ -13396,7 +13431,10 @@ fn view_image(path: &str) {
         return;
     };
     let t0 = crate::arch::now_ms();
-    match crate::image::decode(&bytes) {
+    // **Decoded in ring 3.** The bytes are attacker-supplied and the decoder needs no authority
+    // to turn them into pixels, so it runs as a tenant that holds nothing and can be discarded —
+    // see `/decoder`, which switches back to the in-kernel path for an A/B.
+    match crate::synapse::tenant::decode_image_for_view(&bytes) {
         Ok(img) => {
             let (iw, ih) = (img.w, img.h);
             #[cfg(not(test))]
@@ -13422,7 +13460,7 @@ fn view_image(path: &str) {
             #[cfg(test)]
             drop(img);
             serial_println!(
-                "open> {} — {}x{} px, {} KiB, decoded in {} ms  (Ctrl+Tab to focus, then +/- zoom, r/l rotate, arrows pan, 0 reset; /close hides)",
+                "open> {} — {}x{} px, {} KiB, decoded in {} ms  (Ctrl+Tab to focus pane, then +/- zoom, r/l rotate, arrows pan, 0 reset; Ctrl+Tab again returns to shell; /close hides)",
                 path,
                 iw,
                 ih,
@@ -13562,7 +13600,7 @@ fn play_audio(path: &str) {
         serial_println!("open> no sound device — decoded OK but cannot play");
         return;
     }
-    serial_println!("open>   switch tabs freely, it keeps playing; Ctrl+Tab to focus then space=pause <-/->=seek up/dn=volume 0=restart m=mute; Ctrl+C or /close stops");
+    serial_println!("open>   switch tabs freely, it keeps playing; Ctrl+Tab to focus then space=pause <-/->=seek up/dn=volume 0=restart m=mute; Ctrl+Tab again returns to shell; Ctrl+C or /close stops");
     let name = path.rsplit('/').next().unwrap_or(path).to_string();
     let peaks = crate::audio::waveform_peaks(&audio.pcm, crate::audio::WAVEFORM_BINS);
     AUDIO.with(|a| {

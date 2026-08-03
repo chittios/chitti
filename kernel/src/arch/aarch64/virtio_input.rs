@@ -364,7 +364,7 @@ fn handle_event(dev: &mut VirtioInput, ev: InputEvent) {
     }
     // Arrow/nav keys (Linux keycodes) become the ANSI sequences a serial
     // terminal sends, so the shell/editor decode one encoding for every input
-    // path. Ctrl+Tab is the pane-focus toggle (private CSI `ESC [ T`).
+    // path. Ctrl+Tab / Ctrl+Shift+Tab cycle focus (`ESC [ T` / `Z`).
     // Cmd/Super+Space opens the Agents browser (`ESC [ g`) — macOS Spotlight-style.
     if let Some(seq) = match ev.code {
         103 => Some(&b"[A"[..]),           // KEY_UP
@@ -376,7 +376,8 @@ fn handle_event(dev: &mut VirtioInput, ev: InputEvent) {
         104 => Some(&b"[5~"[..]),          // KEY_PAGEUP
         109 => Some(&b"[6~"[..]),          // KEY_PAGEDOWN
         111 => Some(&b"[3~"[..]),          // KEY_DELETE
-        15 if dev.ctrl => Some(&b"[T"[..]), // Ctrl+Tab
+        15 if dev.ctrl && dev.shift => Some(&b"[Z"[..]), // Ctrl+Shift+Tab
+        15 if dev.ctrl => Some(&b"[T"[..]),               // Ctrl+Tab
         // Agents: GUI+Space or Ctrl+Space (host macOS often steals ⌘+Space).
         KEY_SPACE if dev.gui || dev.ctrl => Some(&b"[g"[..]),
         _ => None,

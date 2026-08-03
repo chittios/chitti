@@ -170,11 +170,15 @@ extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
         SC_CAPS => {
             CAPS_ON.fetch_xor(true, Ordering::Relaxed);
         }
-        // Ctrl+Tab: pane-focus toggle, encoded as the private CSI `ESC [ T`.
+        // Ctrl+Tab / Ctrl+Shift+Tab: focus cycle forward/back (`ESC [ T` / `Z`).
         0x0f if CTRL_DOWN.load(Ordering::Relaxed) => KEYS.with(|r| {
             r.push(0x1b);
             r.push(b'[');
-            r.push(b'T');
+            r.push(if SHIFT_DOWN.load(Ordering::Relaxed) {
+                b'Z'
+            } else {
+                b'T'
+            });
         }),
         // Cmd/Super+Space or Ctrl+Space: Agents browser (`ESC [ g`).
         // (macOS hosts often eat ⌘+Space for Spotlight — Ctrl+Space is reliable.)

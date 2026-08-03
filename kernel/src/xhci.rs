@@ -1851,7 +1851,8 @@ impl Xhci {
                                 // Arrow/nav keys become the ANSI sequences a
                                 // serial terminal sends, so the shell/editor
                                 // decode one encoding for every input path.
-                                // Ctrl+Tab = pane-focus toggle (`ESC [ T`).
+                                // Ctrl+Tab = focus cycle forward (`ESC [ T`);
+                                // Ctrl+Shift+Tab = reverse (`ESC [ Z`).
                                 // Cmd/Super+Space = Agents browser (`ESC [ g`)
                                 // — macOS Spotlight-style.
                                 let mut seq = [0u8; crate::keyrepeat::SEQ_MAX];
@@ -1866,6 +1867,7 @@ impl Xhci {
                                     0x4b => Some(&b"[5~"[..]), // PgUp
                                     0x4e => Some(&b"[6~"[..]), // PgDn
                                     0x4c => Some(&b"[3~"[..]), // Delete
+                                    0x2b if ctrl && shift => Some(&b"[Z"[..]), // Ctrl+Shift+Tab
                                     0x2b if ctrl => Some(&b"[T"[..]), // Ctrl+Tab
                                     // Agents browser (Spotlight-style). Prefer
                                     // GUI (⌘/Super); also Ctrl+Space — macOS

@@ -39,6 +39,44 @@ pub fn action_band_visible(max_panes: u8, any_tab_open: bool) -> bool {
     }
 }
 
+/// Pure focus-cycle math for Ctrl+Tab: slots are **shell chat** then each
+/// visible action column (row-major). Returns `(to_action, action_index)`.
+///
+/// The shell is part of the ring so focus can always return to the composer —
+/// without this, cycling only among action panes traps the keyboard. Unit-
+/// tested here because `framebuffer` is gated out of the test binary.
+pub fn cycle_focus_target(
+    visible: &[usize],
+    at_action: bool,
+    focused_action: usize,
+    forward: bool,
+) -> (bool, usize) {
+    if visible.is_empty() {
+        return (false, focused_action);
+    }
+    // Virtual list: index 0 = chat, 1.. = visible[i-1].
+    let n = visible.len() + 1;
+    let cur = if !at_action {
+        0
+    } else {
+        visible
+            .iter()
+            .position(|&i| i == focused_action)
+            .map(|p| p + 1)
+            .unwrap_or(1)
+    };
+    let next = if forward {
+        (cur + 1) % n
+    } else {
+        (cur + n - 1) % n
+    };
+    if next == 0 {
+        (false, focused_action)
+    } else {
+        (true, visible[next - 1])
+    }
+}
+
 /// Smallest track size in pixels a resize drag may leave a pane at, so a
 /// divider can never be dragged far enough to make a pane vanish (a zero-width
 /// pane would reflow its whole scrollback to one column and be unreachable).
@@ -1080,6 +1118,39 @@ mod tests {
         assert!(wrap_segment("anything", 0).is_empty());
         // Multi-byte content must not slice a char boundary (byte ranges, char counts).
         assert_eq!(wrap_segment("84%≡ 12°C", 5), alloc::vec!["84%≡", "12°C"]);
+    }
+
+    #[test_case]
+    fn cycle_focus_includes_shell_and_wraps() {
+        // One action pane: chat ↔ action0.
+        let vis = [0usize];
+        assert_eq!(cycle_focus_target(&vis, false, 0, true), (true, 0));
+        assert_eq!(cycle_focus_target(&vis, true, 0, true), (false, 0));
+        assert_eq!(cycle_focus_target(&vis, true, 0, false), (false, 0));
+        assert_eq!(cycle_focus_target(&vis, false, 0, false), (true, 0));
+    }
+
+    #[test_case]
+    fn cycle_focus_grid_walks_all_panes_then_shell() {
+        // Grid of 3 visible action columns.
+        let vis = [0usize, 1, 2];
+        // chat → 0 → 1 → 2 → chat
+        assert_eq!(cycle_focus_target(&vis, false, 0, true), (true, 0));
+        assert_eq!(cycle_focus_target(&vis, true, 0, true), (true, 1));
+        assert_eq!(cycle_focus_target(&vis, true, 1, true), (true, 2));
+        assert_eq!(cycle_focus_target(&vis, true, 2, true), (false, 2));
+        // reverse: chat → 2 → 1 → 0 → chat
+        assert_eq!(cycle_focus_target(&vis, false, 0, false), (true, 2));
+        assert_eq!(cycle_focus_target(&vis, true, 2, false), (true, 1));
+        assert_eq!(cycle_focus_target(&vis, true, 1, false), (true, 0));
+        assert_eq!(cycle_focus_target(&vis, true, 0, false), (false, 0));
+    }
+
+    #[test_case]
+    fn cycle_focus_empty_band_stays_on_shell() {
+        let vis: [usize; 0] = [];
+        assert_eq!(cycle_focus_target(&vis, false, 0, true), (false, 0));
+        assert_eq!(cycle_focus_target(&vis, true, 3, true), (false, 3));
     }
 
     #[test_case]

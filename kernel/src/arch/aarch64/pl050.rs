@@ -217,9 +217,14 @@ pub fn poll_key() -> Option<u8> {
                     SC_CAPS if !breaking => {
                         CAPS_ON.fetch_xor(true, Ordering::Relaxed);
                     }
-                    // Ctrl+Tab: pane-focus toggle, encoded as the private CSI `ESC [ T`.
+                    // Ctrl+Tab / Ctrl+Shift+Tab: focus cycle (`ESC [ T` / `Z`).
                     0x0D if !breaking && CTRL_DOWN.load(Ordering::Relaxed) => {
-                        PENDING.with(|p| p.extend_from_slice(b"[T"));
+                        let seq = if SHIFT_DOWN.load(Ordering::Relaxed) {
+                            &b"[Z"[..]
+                        } else {
+                            &b"[T"[..]
+                        };
+                        PENDING.with(|p| p.extend_from_slice(seq));
                         return Some(0x1b);
                     }
                     // Cmd/Super+Space or Ctrl+Space: Agents browser (`ESC [ g`).

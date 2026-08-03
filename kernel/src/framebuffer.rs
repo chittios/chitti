@@ -3053,17 +3053,20 @@ impl Screen {
         self.draw_str(tx, cy + r + r / 2 + self.ch() + 6, tag, self.theme.title_dim, self.theme.screen_bg);
     }
 
-    /// Whether the action (right) pane holds keyboard focus: always while the
-    /// editor owns it, by toggle (`focus_toggle` / click) while it shows ktrace.
+    /// Whether an action pane holds keyboard focus. Chat keeps focus by
+    /// default so you can keep typing; Ctrl+Tab / a click / `/pane focus`
+    /// moves it onto the band. The editor is the same rule now — opening it
+    /// sets `focus_action` so keys land there, and Ctrl+Tab returns to the
+    /// shell without closing the tab.
     fn action_focused(&self) -> bool {
         match self.right() {
-            RightMode::Editor => true,
             RightMode::Closed => false,
-            // ktrace / top / surface: chat keeps focus by default so you can keep
-            // typing; Ctrl+Tab / a click can move focus to the pane.
-            RightMode::Ktrace | RightMode::Top | RightMode::Todos | RightMode::Audio | RightMode::Surface(_) => {
-                self.focus_action
-            }
+            RightMode::Editor
+            | RightMode::Ktrace
+            | RightMode::Top
+            | RightMode::Todos
+            | RightMode::Audio
+            | RightMode::Surface(_) => self.focus_action,
         }
     }
 
@@ -4037,19 +4040,46 @@ static SCREEN: Locked<Option<Screen>> = Locked::new(None);
 // --- modal overlay (approval / input dialogs) ---------------------------
 
 /// Which modal control the mouse hit, for [`modal_hit`].
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ModalHit {
     None,
     Yes,
     No,
     Ok,
-    /// Commands-browser close `[x]` (slot 0 reused when that modal is up).
+    /// Commands/agents-browser close `[x]` (slot 0 reused when that modal is up).
     Close,
+    /// Absolute row index in a list browser (`scroll + visible row`). Headers
+    /// and items share the index space; callers skip non-selectable rows.
+    ListRow(usize),
+    /// Option index in a [`draw_choose`] multi-choice modal.
+    Choose(usize),
 }
 
 /// Pixel rects of the modal's clickable controls: `[yes, no, ok]`. Set when a
 /// modal is drawn, read by [`modal_hit`] for mouse routing. Zero-size = absent.
 static MODAL_RECTS: Locked<[(u64, u64, u64, u64); 3]> = Locked::new([(0, 0, 0, 0); 3]);
+
+/// Geometry of the scrollable list in `/help` and `/agents` browsers, for
+/// mouse row hit-testing. Cleared on dismiss.
+#[derive(Clone, Copy)]
+struct ListBrowserGeom {
+    list_x: u64,
+    list_y: u64,
+    list_w: u64,
+    row_h: u64,
+    /// Visible row count (≤ 12).
+    n_rows: usize,
+    /// Absolute index of the first visible row.
+    scroll: usize,
+}
+
+static LIST_BROWSER_GEOM: Locked<Option<ListBrowserGeom>> = Locked::new(None);
+
+/// Option row rects for [`draw_choose`] (up to 9 numbered choices).
+static CHOOSE_RECTS: Locked<[(u64, u64, u64, u64); 9]> =
+    Locked::new([(0, 0, 0, 0); 9]);
+static CHOOSE_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 /// True while a modal overlays the panes: upkeep ticks running under it (long
 /// compute pumps `shell::upkeep`) must not blink the pane caret into the box.
@@ -4066,17 +4096,41 @@ pub fn modal_hit(x: u64, y: u64) -> ModalHit {
     // Yes/No in 0/1. Disambiguate: if slot 1 is empty and slot 0 is set, it's Close.
     if in_rect(x, y, r[0]) {
         if r[1] == (0, 0, 0, 0) && r[2] == (0, 0, 0, 0) {
-            ModalHit::Close
+            return ModalHit::Close;
         } else {
-            ModalHit::Yes
+            return ModalHit::Yes;
         }
     } else if in_rect(x, y, r[1]) {
-        ModalHit::No
+        return ModalHit::No;
     } else if in_rect(x, y, r[2]) {
-        ModalHit::Ok
-    } else {
-        ModalHit::None
+        return ModalHit::Ok;
     }
+    // List browser rows (/help, /agents).
+    if let Some(g) = LIST_BROWSER_GEOM.with(|g| *g) {
+        if g.row_h > 0
+            && g.list_w > 0
+            && x >= g.list_x
+            && x < g.list_x + g.list_w
+            && y >= g.list_y
+            && y < g.list_y + g.row_h * g.n_rows as u64
+        {
+            let row = ((y - g.list_y) / g.row_h) as usize;
+            if row < g.n_rows {
+                return ModalHit::ListRow(g.scroll + row);
+            }
+        }
+    }
+    // Multi-choice options.
+    let n = CHOOSE_COUNT.load(core::sync::atomic::Ordering::Relaxed).min(9);
+    if n > 0 {
+        let rects = CHOOSE_RECTS.with(|c| *c);
+        for i in 0..n {
+            if in_rect(x, y, rects[i]) {
+                return ModalHit::Choose(i);
+            }
+        }
+    }
+    ModalHit::None
 }
 
 /// One visible row for [`draw_commands_browser`].
@@ -4135,6 +4189,7 @@ impl Screen {
 
 /// Draw a multi-option question modal. `focus` is the highlighted option index.
 /// Options are rendered as numbered rows; the footer shows Enter=select Esc=cancel.
+/// Each option row is mouse-clickable ([`ModalHit::Choose`]).
 pub fn draw_choose(title: &str, msg: &str, options: &[&str], focus: usize) {
     MODAL_ON.store(true, core::sync::atomic::Ordering::Relaxed);
     SCREEN.with(|slot| {
@@ -4142,29 +4197,49 @@ pub fn draw_choose(title: &str, msg: &str, options: &[&str], focus: usize) {
             sc.cursor_restore();
             sc.cur_vis = false;
             MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
-            let mut body = alloc::string::String::new();
+            LIST_BROWSER_GEOM.with(|g| *g = None);
+            CHOOSE_RECTS.with(|c| *c = [(0, 0, 0, 0); 9]);
+            let n = options.len().min(9);
+            CHOOSE_COUNT.store(n, core::sync::atomic::Ordering::Relaxed);
+            let cols = sc.modal_cols() as usize;
+            let mut pre: Vec<String> = Vec::new();
             if !msg.is_empty() {
-                body.push_str(msg);
-                body.push('\n');
+                pre.extend(wrap(msg, cols));
             }
-            for (i, opt) in options.iter().enumerate() {
+            // One option per row (ellipsized) so hit-testing is 1:1 with indices.
+            let mut opt_lines: Vec<String> = Vec::new();
+            for (i, opt) in options.iter().take(n).enumerate() {
                 let mark = if i == focus { ">" } else { " " };
-                body.push_str(&alloc::format!("{mark} {}. {}\n", i + 1, opt));
+                let line = alloc::format!("{mark} {}. {}", i + 1, opt);
+                opt_lines.push(crate::textsel::ellipsize(&line, cols));
             }
-            body.push_str("Enter select  Esc cancel  arrows move");
-            let lines = wrap(&body, sc.modal_cols() as usize);
-            let (ix, iy, _cols) = sc.modal_box(title, lines.len() as u64);
+            let foot = "Enter select  Esc cancel  arrows/click";
+            let rows = pre.len() + opt_lines.len() + 1;
+            let (ix, iy, mcols) = sc.modal_box(title, rows as u64);
             let ch = sc.ch();
+            let cw = sc.cw();
             let mut y = iy;
-            for line in &lines {
-                let fg = if line.starts_with('>') {
+            for line in &pre {
+                sc.draw_str(ix, y, line, sc.theme.chat_fg, sc.theme.status_bg);
+                y += ch;
+            }
+            for (i, line) in opt_lines.iter().enumerate() {
+                let fg = if i == focus {
                     sc.theme.accent
                 } else {
                     sc.theme.chat_fg
                 };
-                sc.draw_str(ix, y, line, fg, sc.theme.status_bg);
+                let bg = if i == focus {
+                    sc.theme.chat_bg
+                } else {
+                    sc.theme.status_bg
+                };
+                sc.fill_rect(ix, y, mcols * cw, ch, bg);
+                sc.draw_str(ix, y, line, fg, bg);
+                CHOOSE_RECTS.with(|c| c[i] = (ix, y, mcols * cw, ch));
                 y += ch;
             }
+            sc.draw_str(ix, y, foot, sc.theme.composer_hint, sc.theme.status_bg);
             sc.cursor_overlay();
         }
     });
@@ -4178,6 +4253,8 @@ pub fn draw_confirm(title: &str, msg: &str, focus_yes: bool) {
             sc.cursor_restore();
             sc.cur_vis = false;
             MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
+            LIST_BROWSER_GEOM.with(|g| *g = None);
+            CHOOSE_COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
             // Wrap first, then size the box to the wrapped line count + a gap +
             // the button row, so a long consent message never overflows.
             let lines = wrap(msg, sc.modal_cols() as usize);
@@ -4209,6 +4286,8 @@ pub fn draw_input(title: &str, prompt: &str, buf: &str, masked: bool, caret_on: 
             sc.cursor_restore();
             sc.cur_vis = false;
             MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
+            LIST_BROWSER_GEOM.with(|g| *g = None);
+            CHOOSE_COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
             // 4 content rows: the prompt, the input field, and the OK button each
             // occupy a row and the inter-row gaps (ch/2 + a few px) need the
             // extra row so the button clears the bottom border.
@@ -4265,6 +4344,7 @@ pub fn draw_list_browser(
         sc.cursor_restore();
         sc.cur_vis = false;
         MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
+        CHOOSE_COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
 
         let cw = sc.cw();
         let ch = sc.ch();
@@ -4326,6 +4406,7 @@ pub fn draw_list_browser(
         sc.fill_rect(ix, list_top, list_w, list_h, list_bg);
 
         let mut ly = list_top;
+        let visible_n = rows.len().min(view_rows as usize);
         for row in rows.iter().take(view_rows as usize) {
             match row {
                 CommandsRow::Header(h) => {
@@ -4367,6 +4448,18 @@ pub fn draw_list_browser(
             }
             ly += ch;
         }
+        // Mouse hit-testing for every visible row (headers included; caller
+        // skips non-items). Absolute index = scroll + visible row.
+        LIST_BROWSER_GEOM.with(|g| {
+            *g = Some(ListBrowserGeom {
+                list_x: ix,
+                list_y: list_top,
+                list_w,
+                row_h: ch,
+                n_rows: visible_n,
+                scroll,
+            });
+        });
 
         // Scrollbar (right edge of list).
         let sb_x = ix + list_w + 2;
@@ -4387,9 +4480,9 @@ pub fn draw_list_browser(
         sc.fill_rect(ix, y, content_w, 1, sc.theme.sep_dim);
         y += 4;
         let foot = if title.eq_ignore_ascii_case("Agents") {
-            "up/dn nav  |  Enter start/switch  |  Esc close"
+            "up/dn  |  Enter/click select  |  Esc close"
         } else {
-            "up/dn nav  |  Enter fill input  |  Esc close"
+            "up/dn  |  Enter/click fill  |  Esc close"
         };
         sc.draw_str(
             ix,
@@ -4456,6 +4549,9 @@ pub fn redraw_all() {
 pub fn modal_dismiss() {
     MODAL_ON.store(false, core::sync::atomic::Ordering::Relaxed);
     MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
+    LIST_BROWSER_GEOM.with(|g| *g = None);
+    CHOOSE_COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
+    CHOOSE_RECTS.with(|c| *c = [(0, 0, 0, 0); 9]);
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
             sc.redraw();
@@ -5262,15 +5358,18 @@ pub fn take_tabs_dirty() -> bool {
 fn open_view_slot(slot: &mut Option<Screen>, mode: RightMode) {
     mark_tabs_dirty();
     let Some(old) = slot else { return };
-    // NB: opening a view must **not** move keyboard focus to the action pane.
-    // The user typed a command at the composer and is still typing there — see
-    // `action_focused`, where every mode but the editor leaves focus on the chat
-    // deliberately. Setting `focus_action` here made the *next* command go to the
-    // pane instead of the prompt, which reads as the shell having frozen. Focus
-    // moves only on an explicit act: clicking a pane, `/pane focus`, Ctrl+Tab.
-    //
+    // NB: opening a view must **not** move keyboard focus to the action pane
+    // for most modes — the user typed a command at the composer and is still
+    // typing there. Setting `focus_action` here made the *next* command go to
+    // the pane instead of the prompt, which reads as the shell having frozen.
+    // Focus moves only on an explicit act: clicking a pane, `/pane focus`,
+    // Ctrl+Tab. **Exception: the editor** — it is an interactive text surface,
+    // so keys must land there on open (and Ctrl+Tab still returns to the shell).
+    if mode == RightMode::Editor {
+        old.focus_action = true;
+    }
     // Already open somewhere → select that pane's tab (and make it the open
-    // target for the next view) without taking focus.
+    // target for the next view) without taking focus (except editor above).
     if let Some((pi, ti)) = old.find_mode(mode) {
         old.focused_action = pi;
         old.actions[pi].active = ti;
@@ -5461,6 +5560,99 @@ pub fn focus_cycle_column(forward: bool) -> usize {
     });
     focus_action_column(target);
     target
+}
+
+/// Pure focus-cycle math — re-export from [`crate::panes_layout`] so call sites
+/// can stay in the framebuffer API. Tests live next to the pure function
+/// (framebuffer itself is gated out of the test binary).
+pub use crate::panes_layout::cycle_focus_target;
+
+/// Cycle keyboard focus across the shell chat, action panes, and in-pane tabs.
+/// Ctrl+Tab / Ctrl+Shift+Tab. Returns true if an action pane holds focus after
+/// the move.
+///
+/// Order (forward): chat → pane0/tab0 → pane0/tab1 → … → pane1/tab0 → … → chat.
+/// Within a focused action column that has several tabs, Ctrl+Tab walks those
+/// tabs first; only after the last tab does focus move to the next column (or
+/// back to the shell). Parked columns are skipped. No action pane open → shell.
+pub fn focus_cycle_all(forward: bool) -> bool {
+    // 1) If already on an action column with more tabs in this direction,
+    //    advance the tab and stay — keyboard-first tab bar.
+    let tab_step = SCREEN.with(|slot| {
+        let Some(sc) = slot.as_ref() else {
+            return false;
+        };
+        if !sc.focus_action || !sc.any_column_visible() {
+            return false;
+        }
+        let fi = sc.focused_action.min(sc.actions.len().saturating_sub(1));
+        let n = sc.actions.get(fi).map(|a| a.tabs.len()).unwrap_or(0);
+        if n <= 1 {
+            return false;
+        }
+        let active = sc.actions[fi].active;
+        if forward && active + 1 < n {
+            return true; // will cycle_tab below
+        }
+        if !forward && active > 0 {
+            return true;
+        }
+        false
+    });
+    if tab_step {
+        cycle_tab(forward);
+        // Ensure action still holds focus (cycle_tab does not touch it).
+        focus_set(true);
+        return true;
+    }
+
+    // 2) Otherwise walk the chat ↔ action-column ring.
+    let (to_action, target) = SCREEN.with(|slot| {
+        let Some(sc) = slot.as_ref() else {
+            return (false, 0usize);
+        };
+        let visible: Vec<usize> = (0..sc.actions.len())
+            .filter(|&i| sc.column_visible(i))
+            .collect();
+        let at_action = sc.focus_action && !visible.is_empty();
+        crate::panes_layout::cycle_focus_target(
+            &visible,
+            at_action,
+            sc.focused_action,
+            forward,
+        )
+    });
+    if to_action {
+        // Landing on a column from the shell (or another pane): for reverse
+        // walks, start at the last tab so reverse is the true inverse of
+        // forward's "exhaust tabs then leave".
+        if !forward {
+            SCREEN.with(|slot| {
+                if let Some(sc) = slot {
+                    if target < sc.actions.len() {
+                        let n = sc.actions[target].tabs.len();
+                        if n > 0 {
+                            sc.actions[target].active = n - 1;
+                        }
+                    }
+                }
+            });
+        } else {
+            // Forward into a new column → first tab.
+            SCREEN.with(|slot| {
+                if let Some(sc) = slot {
+                    if target < sc.actions.len() && !sc.actions[target].tabs.is_empty() {
+                        sc.actions[target].active = 0;
+                    }
+                }
+            });
+        }
+        focus_action_column(target);
+        true
+    } else {
+        focus_set(false);
+        false
+    }
 }
 
 /// Move a tab from one action column to another (drag-drop). Pure list surgery
@@ -6682,7 +6874,8 @@ pub fn scroll_live(action: bool) {
 
 /// Toggle keyboard focus between the chat pane and an open action pane.
 /// Returns true if the action pane now holds focus. No-op (false) when the
-/// action pane is closed or owned by the editor.
+/// action band is collapsed. Works while the editor tab is open — leaving
+/// the editor for the shell is intentional (Ctrl+Tab back).
 ///
 /// When focus returns to the chat pane, the bordered composer is repainted
 /// immediately (accent border + caret) so the shell is ready for input without
@@ -6690,9 +6883,8 @@ pub fn scroll_live(action: bool) {
 pub fn focus_toggle() -> bool {
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
-            if !sc.any_column_visible() || sc.right() == RightMode::Editor {
-                // Nothing to focus (band collapsed), or the editor owns input.
-                return sc.right() == RightMode::Editor;
+            if !sc.any_column_visible() {
+                return false;
             }
             sc.focus_action = !sc.focus_action;
             sc.cursor_restore();
@@ -6732,27 +6924,51 @@ pub fn focus_is_action() -> bool {
 }
 
 /// Give keyboard focus to the action pane (true) or the chat pane (false),
-/// e.g. from a mouse click. Same constraints as [`focus_toggle`].
+/// e.g. from a mouse click or Ctrl+Tab. Same constraints as [`focus_toggle`].
 ///
 /// Always refreshes the composer when focusing the chat, even if focus was
 /// already on chat — so a click on the shell agent immediately arms the input.
+/// Leaving the editor for the shell is allowed (editor tab stays open).
 pub fn focus_set(action: bool) {
     let (flips, need_composer) = SCREEN.with(|slot| {
         slot.as_ref()
             .map(|sc| {
-                let editor = sc.right() == RightMode::Editor;
                 let closed = !sc.any_column_visible();
-                let flips = !closed && !editor && sc.focus_action != action;
+                // Focusing action with no panes is a no-op; focusing chat always
+                // works (and must work while the editor tab is open).
+                let flips = if action {
+                    !closed && sc.focus_action != action
+                } else {
+                    sc.focus_action != action
+                };
                 // Focusing chat: repaint composer even when already focused so
                 // the caret/border activate without a first keystroke.
-                let need_composer = !action && sc.chat.has_composer && !editor;
+                let need_composer = !action && sc.chat.has_composer;
                 (flips, need_composer)
             })
             .unwrap_or((false, false))
     });
     if flips {
-        focus_toggle();
-    } else if need_composer {
+        // Direct path when only clearing focus_action (focus_toggle needs a
+        // visible band; chat focus while band collapsed still needs composer).
+        let can_toggle = SCREEN.with(|slot| {
+            slot.as_ref()
+                .map(|sc| sc.any_column_visible())
+                .unwrap_or(false)
+        });
+        if can_toggle {
+            focus_toggle();
+            // focus_toggle already re-armed the composer when leaving action.
+            return;
+        }
+        SCREEN.with(|slot| {
+            if let Some(sc) = slot {
+                sc.focus_action = action;
+            }
+        });
+    }
+    if !action && need_composer {
+        // Already on chat (click re-arm) or band collapsed with focus cleared.
         SCREEN.with(|slot| {
             if let Some(sc) = slot {
                 sc.cursor_restore();
