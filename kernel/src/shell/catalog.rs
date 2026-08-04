@@ -176,6 +176,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "System & UI", title: "Commands Help", name: "help", shortcut: "" },
     // Media
     Entry { category: "Media", title: "Voice", name: "voice", shortcut: "" },
+    Entry { category: "Media", title: "PDF Viewer", name: "pdf", shortcut: "" },
     Entry { category: "Media", title: "ONNX Models", name: "onnx", shortcut: "" },
 ];
 

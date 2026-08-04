@@ -1,0 +1,20 @@
+# Host-side harness for the PDF page rasterizer: the same `tools/pdfrender-wasm`
+# code run **natively** and **under wasmi** (the interpreter the kernel uses), so
+# the interpreter's tax and the pixels are both checkable in seconds without a
+# kernel build — the `pngbench`/`h264diff`/`onnxdiff` pattern.
+[package]
+name = "chitti-pdfbench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Stand-alone: not part of the root workspace.
+[workspace]
+
+[dependencies]
+wasmi = "0.40"
+# The renderer itself, as an rlib, for the native side of the comparison.
+chitti-pdfrender-wasm = { path = "../pdfrender-wasm" }
+
+[profile.release]
+opt-level = 3

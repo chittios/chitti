@@ -71,6 +71,34 @@ source under `~/.cargo/registry/` and upstream.
 
 ---
 
+## hayro + vello_cpu — crates.io (PDF page rasterizer, `assets/wasm/pdfrender.wasm`)
+
+The PDF viewer renders real pages with [hayro](https://github.com/LaurenzV/hayro)
+— a pure-Rust PDF interpreter — over
+[vello_cpu](https://github.com/linebender/vello), a CPU 2D rasterizer. Neither is
+vendored: `tools/pdfrender-wasm/` depends on them from crates.io (pinned by its
+`Cargo.lock`) and is compiled to **wasm**, and it is that module
+(`assets/wasm/pdfrender.wasm`, checked in) which ships in the kernel image and runs
+under the `wasmi` sandbox above. The tree therefore redistributes the compiled
+artifact but carries no copy of the sources.
+
+hayro's own NOTICE records code adapted from **PDFBox** (Apache-2.0), **pdf.js**
+(Apache-2.0) and the **png** crate (Apache-2.0). Its dependency set includes
+`skrifa`/`read-fonts`, `kurbo`, `peniko`, `color`, `zune-jpeg`, `flate2`, `brotli`,
+`pic-scale`, `moxcms`, `image` and `fearless_simd`, and hayro embeds substitute
+fonts for the 14 PDF standard faces plus the 61 predefined CMaps.
+
+hayro and vello_cpu are licensed under **MIT OR Apache-2.0**. Because the compiled
+module is what this tree distributes, the data baked into it is worth naming
+explicitly: the substitute standard fonts are the **Foxit/PDFium** Type 1 faces
+(`FoxitSans`, `FoxitSerif`, `FoxitFixed`, `FoxitDingbats`, …), "Copyright 2014
+PDFium Authors / original code copyright 2014 Foxit Software Inc.", under PDFium's
+**BSD-3-Clause**; the bundled CMYK ICC profile is **CC0-1.0** (Compact ICC
+Profiles). Full license texts ship in each crate's source under
+`~/.cargo/registry/` and upstream.
+
+---
+
 ## brotli-decompressor — crates.io (WOFF2 web fonts)
 
 WOFF2 web fonts are Brotli-compressed. `kernel/src/font_woff2.rs` decompresses

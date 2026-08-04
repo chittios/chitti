@@ -1503,15 +1503,23 @@ def s_open_media(_g):
     w.writeframes(b"".join(struct.pack("<h", int(8000 * ((i // 20) % 2 * 2 - 1))) for i in range(n)))
     w.close()
     # A minimal single-page PDF (classic xref, uncompressed content): the pdf
-    # agent's command hook must digest it through the wasm and report pages.
+    # agent's command hook must both **rasterize** it (hayro in wasm -> a page
+    # image in the viewer tab) and digest its text through the wasm.
+    #
+    # The page carries a real /Resources font dictionary — Helvetica, one of the
+    # 14 standard fonts, which the renderer substitutes from its embedded set.
+    # Without it /F1 is undefined and a conforming renderer draws no glyphs, so
+    # the fixture would exercise the pipeline while proving nothing about text.
     def build_pdf():
-        content = b"BT /F1 12 Tf 72 700 Td (Chitti e2e pdf text) Tj ET"
+        content = b"BT /F1 24 Tf 72 700 Td (Chitti e2e pdf text) Tj ET"
         bodies = [
             b"<< /Type /Catalog /Pages 2 0 R >>",
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /MediaBox [0 0 612 792] >>",
+            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 6 0 R >> >> >>",
             b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
             b"<< /Title (E2E Doc) >>",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
         ]
         out = bytearray(b"%PDF-1.4\n")
         offs = []
@@ -1590,14 +1598,51 @@ def s_open_media(_g):
             # Shift+Tab returns focus to the chat composer before the next command.
             g2.send_raw(b"\x1b[Z")
             g2.wait_quiet(0.4, 10)
-            # The pdf agent's /open hook: wasm digest → page count + editor tab.
+            # The pdf agent's /open hook: the hayro rasterizer in wasm turns the
+            # page into pixels in a viewer tab. This is the whole boundary —
+            # instantiate, stage the file, parse, render, copy the pixels out —
+            # so a broken ABI shows up here as a parsed document that never
+            # produced a page.
             m3 = g2.mark()
             g2.send(f"/open /img{d}/chitti-e2e.pdf")
-            if not g2.wait_for("pdf 1 page(s)", 20, m3):
-                return False, "pdf preview did not report pages"
-            if not g2.wait_for("/preview/chitti-e2e.txt", 5, m3):
-                return False, "pdf preview did not open the text tab"
-            return True, "PNG previewed in ring 3 (A/B vs kernel) + WAV played + media controls + PDF digested via wasm"
+            if not g2.wait_for("1 page(s)", 40, m3):
+                return False, "pdf viewer did not report pages"
+            if not g2.wait_for("page 1 rendered in", 40, m3):
+                return False, "pdf viewer parsed the document but rendered no page"
+            # `/pdf` reports where the viewer is; `/pdf page` navigates (clamped
+            # on a one-page document, which is the case worth pinning).
+            m4 = g2.mark()
+            g2.send("/pdf")
+            if not g2.wait_for("page 1/1", 15, m4):
+                return False, "/pdf did not report the open document"
+            # The text digest is still reachable — a raster cannot be grepped, so
+            # both paths have to keep working.
+            m5 = g2.mark()
+            g2.send("/pdf text")
+            if not g2.wait_for("/preview/chitti-e2e.txt", 40, m5):
+                return False, "/pdf text did not produce the text digest tab"
+            # Ctrl+C closes the document. This also pins the "a stopped tab must
+            # not eat keystrokes" rule for the viewer: while a PDF is open its
+            # focused tab consumes `p` (prev page) and `-` (zoom out), so a
+            # `/cat /preview/…` typed then arrives as `/cat /review/…` — which is
+            # exactly how this was caught. After the close, the keys are the
+            # shell's again.
+            m6 = g2.mark()
+            g2.send_raw(b"\x03")
+            if not g2.wait_for("closed the PDF", 15, m6):
+                return False, "Ctrl+C did not close the PDF"
+            # The editor is the one view that *does* take keyboard focus when it
+            # opens (the documented exception), so Shift+Tab back to the prompt.
+            g2.send_raw(b"\x1b[Z")
+            g2.wait_quiet(0.4, 10)
+            # The digest is written to the store and shown in an editor tab, so
+            # its *content* is checked by reading the file back — the tab paints
+            # to the framebuffer, which the serial console never sees.
+            m7 = g2.mark()
+            g2.send("/cat /preview/chitti-e2e.txt")
+            if not g2.wait_for("Chitti e2e pdf text", 20, m7):
+                return False, "the text digest lost the page's text"
+            return True, "PNG previewed in ring 3 (A/B vs kernel) + WAV played + media controls + PDF rendered by hayro/wasm + text digested"
         return False, "no '3x2 px' decode report from /open on any mount"
     finally:
         g2.close()
@@ -1748,13 +1793,20 @@ def s_samples(g):
         return False, "sample mp4 has no audio track"
     g.send_raw(b"\x03")
     g.wait_quiet(0.5, 15)
-    # PDF: the pdf agent's wasm digest.
+    # PDF: rendered by the hayro rasterizer into the viewer tab.
     m = g.mark()
     g.send("/open /samples/misc/minimal.pdf")
-    if not g.wait_for("page(s)", 30, m):
-        return False, "sample PDF was not digested"
-    # The PDF opens an editor tab, which then holds keyboard focus — a `/cat`
-    # typed now would lose letters to the editor. Shift+Tab back to the chat.
+    if not g.wait_for("page(s)", 60, m):
+        return False, "sample PDF was not opened"
+    if not g.wait_for("rendered in", 60, m):
+        return False, "sample PDF produced no rendered page"
+    # Close it before typing again: a focused viewer tab owns single-letter keys
+    # (`p` prev page, `f` fit), so a command typed with the pane focused loses
+    # those characters — `/cat /samples/README.md` arrived as `/cat /samles/REME.md`
+    # while this was still routing typed letters as arrows. Ctrl+C hands the keys
+    # back, and Shift+Tab returns focus to the composer.
+    g.send_raw(b"\x03")
+    g.wait_quiet(0.5, 15)
     g.send_raw(b"\x1b[Z")
     g.wait_quiet(0.4, 10)
     # The corpus records its own provenance, which is what makes shipping an
@@ -1763,7 +1815,126 @@ def s_samples(g):
     g.send("/cat /samples/README.md")
     if not g.wait_for("ChittiOS sample files", 15, m):
         return False, "/samples/README.md (provenance record) missing"
-    return True, "/samples seeded: png+jpeg decoded, wav opened, mp4 decoded, pdf digested, README present"
+    return True, "/samples seeded: png+jpeg decoded, wav opened, mp4 decoded, pdf rendered, README present"
+
+
+def s_open_pdf(g):
+    """The PDF viewer on a **multi-page** document, which is where the parts that
+    a one-page fixture cannot reach live: per-page geometry (pages in one file may
+    differ in size, so the fit scale is re-derived per page), page navigation, the
+    zoom re-render, and the fail-closed path for a damaged file.
+
+    Built as a fixture rather than shipped, stdlib only, so this runs anywhere:
+    three pages of two different sizes, each with real text in a standard font
+    (Helvetica, substituted from the renderer's embedded set), and each page a
+    different length of text so a stuck cache would show as an unchanged size.
+    """
+    def build_multipage():
+        # (MediaBox, text) per page — page 2 is landscape A4, so its fit scale
+        # must differ from the portrait pages either side of it.
+        pages = [
+            (b"[0 0 612 792]", b"Page one of three"),
+            (b"[0 0 842 595]", b"Page two is landscape"),
+            (b"[0 0 612 792]", b"Page three ends the document"),
+        ]
+        bodies = []
+        # 1 = catalog, 2 = pages, 3 = font, then (page, contents) pairs.
+        kid_ids = [4 + 2 * i for i in range(len(pages))]
+        kids = b" ".join(b"%d 0 R" % k for k in kid_ids)
+        bodies.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+        bodies.append(b"<< /Type /Pages /Kids [" + kids + b"] /Count %d >>" % len(pages))
+        bodies.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+        for i, (box, text) in enumerate(pages):
+            content = b"BT /F1 28 Tf 60 700 Td (" + text + b") Tj ET"
+            bodies.append(
+                b"<< /Type /Page /Parent 2 0 R /Contents %d 0 R /MediaBox " % (kid_ids[i] + 1)
+                + box + b" /Resources << /Font << /F1 3 0 R >> >> >>"
+            )
+            bodies.append(b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream")
+        out = bytearray(b"%PDF-1.4\n")
+        offs = []
+        for i, b in enumerate(bodies):
+            offs.append(len(out))
+            out += b"%d 0 obj\n" % (i + 1) + b + b"\nendobj\n"
+        xref = len(out)
+        out += b"xref\n0 %d\n" % (len(bodies) + 1) + b"0000000000 65535 f \n"
+        for o in offs:
+            out += b"%010d 00000 n \n" % o
+        out += (b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+                % (len(bodies) + 1, xref))
+        return bytes(out)
+
+    import tempfile
+
+    multi = os.path.join(tempfile.gettempdir(), "chitti-e2e-multi.pdf")
+    with open(multi, "wb") as f:
+        f.write(build_multipage())
+    # A file that claims to be a PDF and is not: the renderer must refuse it with
+    # a reason and leave the shell usable, never trap or hang.
+    broken = os.path.join(tempfile.gettempdir(), "chitti-e2e-broken.pdf")
+    with open(broken, "wb") as f:
+        f.write(b"%PDF-1.4\nthis is not a cross-reference table\n%%EOF\n")
+
+    g2 = Guest(arch=RUN_ARCH, verbose=RUN_VERBOSE, no_model=True, audio="none",
+               model_disk=f"{multi}:{broken}")
+    try:
+        if not g2.wait_for("net: configured", 180):
+            return False, "pdf guest never booted"
+        for d in range(4):
+            g2.send(f"/mount {d} 0 /img{d}")
+            g2.wait_quiet(0.5, 30)
+            m = g2.mark()
+            g2.send(f"/open /img{d}/chitti-e2e-multi.pdf")
+            if not g2.wait_for("3 page(s)", 40, m):
+                continue
+            if not g2.wait_for("page 1 rendered in", 40, m):
+                return False, "multi-page PDF parsed but page 1 did not render"
+            # Page 2 is landscape: navigating must re-read the page size, so the
+            # scale reported by /pdf changes. A viewer that cached page 1's size
+            # would render page 2 at the wrong scale and report the old percentage.
+            m = g2.mark()
+            g2.send("/pdf")
+            if not g2.wait_for("page 1/3", 15, m):
+                return False, "/pdf did not report page 1 of 3"
+            m = g2.mark()
+            g2.send("/pdf page 2")
+            if not g2.wait_for("pdf> page 2", 40, m):
+                return False, "/pdf page 2 did not navigate"
+            m = g2.mark()
+            g2.send("/pdf")
+            if not g2.wait_for("page 2/3", 15, m):
+                return False, "/pdf did not report page 2 of 3"
+            # Past the end clamps rather than wrapping (losing your place in a
+            # document is worse than not moving).
+            m = g2.mark()
+            g2.send("/pdf page 99")
+            if not g2.wait_for("pdf> page 3", 40, m):
+                return False, "/pdf page 99 did not clamp to the last page"
+            # Ctrl+C frees the document (and its wasm instance) and hands the
+            # keys back to the shell.
+            m = g2.mark()
+            g2.send_raw(b"\x03")
+            if not g2.wait_for("closed the PDF", 15, m):
+                return False, "Ctrl+C did not close the PDF"
+            m = g2.mark()
+            g2.send("/pdf")
+            if not g2.wait_for("nothing open", 15, m):
+                return False, "/pdf still reports a document after Ctrl+C"
+            # Fail closed on a damaged file: a reason, not a trap, and the shell
+            # answers the next command.
+            m = g2.mark()
+            g2.send(f"/open /img{d}/chitti-e2e-broken.pdf")
+            if not g2.wait_for("cannot read", 40, m):
+                return False, "a damaged PDF was not refused with a reason"
+            m = g2.mark()
+            g2.send("/pwd")
+            if not g2.wait_for("/home/chitti", 15, m):
+                return False, "the shell did not survive a damaged PDF"
+            return True, ("3-page PDF rendered (per-page geometry, nav clamped at both ends), "
+                          "Ctrl+C freed it, damaged file refused cleanly")
+        return False, "no multi-page PDF report from /open on any mount"
+    finally:
+        g2.close()
 
 
 def s_open_video(_g):
@@ -2570,6 +2741,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("todos_pane", s_todos_pane),
     ("session", s_session),
     ("open_media", s_open_media),
+    ("open_pdf", s_open_pdf),
     ("open_video", s_open_video),
     ("samples", s_samples),
     ("tabs", s_tabs),

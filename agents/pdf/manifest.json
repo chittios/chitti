@@ -2,10 +2,12 @@
   "name": "pdf",
   "version": "1.0.0",
   "kind": "skill_agent",
-  "description": "PDF reader: previews and answers questions about PDF documents; parsing is deterministic (assets/tools.wasm pdf_digest). Requests FULL filesystem read access so it can open PDFs on any mount.",
+  "description": "PDF reader: renders pages in the viewer (hayro rasterizer in wasm) and answers questions about documents from deterministic extracted text (assets/tools.wasm pdf_digest). Requests FULL filesystem read access so it can open PDFs on any mount.",
   "toolset": [
     "pdf_digest",
     "pdf_preview",
+    "pdf_text",
+    "pdf_control",
     "mem_fs_read",
     "memory_add",
     "memory_get",
@@ -14,7 +16,7 @@
   "command_hooks": [
     {
       "command": "/open",
-      "description": "Shell /open routes .pdf through this agent: deterministic wasm digest, preview in an editor tab.",
+      "description": "Shell /open routes .pdf through this agent: the page is rasterized (hayro in wasm) into the pdf viewer tab; /pdf text gets the extracted text instead.",
       "match": { "extensions": [".pdf"] },
       "dispatch": {
         ".pdf": { "tool": "pdf_preview", "path_arg": "path" }

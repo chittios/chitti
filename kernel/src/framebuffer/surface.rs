@@ -13,6 +13,9 @@ pub const VIDEO_SURFACE: u32 = u32::MAX - 1;
 /// Surface id the browser agent paints pages on (labelled "browser").
 pub const BROWSER_SURFACE: u32 = u32::MAX - 2;
 
+/// Surface id the `/open` PDF viewer presents rendered pages on (labelled "pdf").
+pub const PDF_SURFACE: u32 = u32::MAX - 3;
+
 /// Present an agent's surface backing buffer (`sw`×`sh`, 0xRRGGBB pixels) into
 /// the action pane, opening it in `Surface(id)` mode on first present. The image
 /// is nearest-neighbour scaled to fit the pane interior, letterboxed. Called by

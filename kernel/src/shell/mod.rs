@@ -25,6 +25,7 @@ mod browser;
 mod fs;
 mod install;
 mod media;
+mod pdf;
 mod system;
 mod tooljson;
 mod video;
@@ -39,6 +40,7 @@ pub(crate) use voice::*;
 use agents::*;
 use install::*;
 use media::*;
+use pdf::*;
 use system::*;
 use video::*;
 
@@ -651,6 +653,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "clip" | "clipboard" => run_clip(arg),
         "ktrace" | "logs" => toggle_ktrace(),
         "close" => close_action(),
+        "pdf" => run_pdf(arg),
         "skills" => run_skills_cmd(arg),
         // Human/e2e surface over the same store as the agent `memory_*` tools.
         "memory" => run_memory_cmd(arg),
@@ -6161,8 +6164,13 @@ fn media_key(c: u8) -> bool {
             }
             _ => false,
         },
+        // The PDF viewer must come **before** the image arm below, which is a
+        // catch-all over every non-video surface: without this a pdf tab's keys
+        // would drive the image viewer (rotating an image nobody is looking at).
+        // Like video, an unloaded pdf tab must not eat keystrokes.
+        Some(crate::framebuffer::RightMode::Surface(id)) if id == PDF_SURFACE && pdf_loaded() => pdf_cmd(c),
         Some(crate::framebuffer::RightMode::Surface(id))
-            if id != VIDEO_SURFACE && !crate::service::package_ui::owns_surface(id) =>
+            if id != VIDEO_SURFACE && id != PDF_SURFACE && !crate::service::package_ui::owns_surface(id) =>
         {
             match c {
                 b'+' | b'=' | b'-' | b'_' | b'r' | b'R' | b'l' | b'L' | b'0' => {
@@ -6241,8 +6249,10 @@ fn media_nav(fin: u8, steps: usize) -> bool {
             }
             _ => false,
         },
+        // Before the image catch-all, as in `media_key`.
+        Some(crate::framebuffer::RightMode::Surface(id)) if id == PDF_SURFACE && pdf_loaded() => pdf_nav(fin),
         Some(crate::framebuffer::RightMode::Surface(id))
-            if id != VIDEO_SURFACE && !crate::service::package_ui::owns_surface(id) =>
+            if id != VIDEO_SURFACE && id != PDF_SURFACE && !crate::service::package_ui::owns_surface(id) =>
         {
             match fin {
                 b'A' | b'B' | b'C' | b'D' => {
@@ -6536,6 +6546,13 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                 if video_loaded() {
                     stop_video();
                 }
+                // A document holds a wasm instance with the whole file plus a
+                // rendered page in it, so Ctrl+C frees it rather than hiding it.
+                #[cfg(not(feature = "server"))]
+                if pdf_loaded() {
+                    close_pdf();
+                    serial_println!("(closed the PDF)");
+                }
             }
             // The editor tab owns input while it's the active action tab: every
             // byte except ESC (nav, handled below) and the reserved globals
@@ -6799,8 +6816,22 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                             delete_at(buf, &mut cur);
                             suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
                         }
-                        5 => fb_scroll_page(action, true),
-                        6 => fb_scroll_page(action, false),
+                        // PgUp/PgDn page a focused PDF (what they mean in a
+                        // document) and otherwise scroll the pane's scrollback.
+                        // Deliberately **not** through `media_key`: that would
+                        // offer the key to a focused package-UI app first, so an
+                        // app that happens to handle `<` would silently swallow
+                        // PgUp's scrollback.
+                        5 => {
+                            if !pdf_page_key(true) {
+                                fb_scroll_page(action, true)
+                            }
+                        }
+                        6 => {
+                            if !pdf_page_key(false) {
+                                fb_scroll_page(action, false)
+                            }
+                        }
                         _ => {}
                     },
                     _ => {}
@@ -7387,6 +7418,9 @@ fn repaint_tab(mode: crate::framebuffer::RightMode) {
         {
             crate::synapse::ui::represent(id);
         }
+        // Before the image fallthrough: the pdf tab re-presents its cached page
+        // (no re-render — the cache is keyed by page+scale and is still valid).
+        crate::framebuffer::RightMode::Surface(id) if id == PDF_SURFACE && pdf_loaded() => repaint_pdf(),
         crate::framebuffer::RightMode::Surface(_) => repaint_image(),
         crate::framebuffer::RightMode::Editor => crate::editor::repaint(),
         _ => {}
@@ -7407,6 +7441,13 @@ fn close_active_tab() {
         }
         crate::framebuffer::RightMode::Surface(id) if id == crate::framebuffer::VIDEO_SURFACE => {
             stop_video();
+            crate::framebuffer::close_action();
+        }
+        // The pdf tab holds a wasm instance with the document and a rendered
+        // page in it (tens of MiB), so closing the tab frees it rather than
+        // leaving it resident the way the image tab keeps its source bitmap.
+        crate::framebuffer::RightMode::Surface(id) if id == crate::framebuffer::PDF_SURFACE => {
+            close_pdf();
             crate::framebuffer::close_action();
         }
         crate::framebuffer::RightMode::Editor => {
@@ -7808,8 +7849,24 @@ pub(crate) fn run_download_tool(args_json: &str) -> alloc::string::String {
 
 // --- Browser agent (host HTML engine) --------------------------------------
 // (moved to shell/browser.rs)
+
+/// `pdf_preview` — **the rendered page viewer** (`shell::pdf`). What `/open
+/// x.pdf` reaches through the pdf agent's command hook.
+///
+/// The text digest it used to show now lives in [`pdf_text`]: a page image and a
+/// text dump answer different questions, and the one a human means by "open this
+/// PDF" is the picture. The agent's own question-answering path still calls
+/// `pdf_digest` directly, so nothing about chat changed.
 #[cfg(all(not(feature = "server"), not(test)))]
 fn pdf_preview(path: &str) -> alloc::string::String {
+    view_pdf(path)
+}
+
+/// `pdf_text` — the deterministic wasm **text** digest in an editor tab (the
+/// former `pdf_preview`). Kept as its own tool because it is what makes a PDF
+/// greppable/quotable, which a raster cannot do.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn pdf_text(path: &str) -> alloc::string::String {
     const MAX_PDF: usize = 4 << 20; // b64 + parse arena bounds
     let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
         return alloc::format!("error: {path} not found under any mount or in the store");
@@ -7911,14 +7968,14 @@ pub(crate) fn run_media_tool(name: &str, args_json: &str) -> alloc::string::Stri
             .unwrap_or_default();
         return match name {
             "draw_image" | "image_open" | "audio_player" | "audio_open" | "video_player"
-            | "video_open" | "pdf_preview" => {
+            | "video_open" | "pdf_preview" | "pdf_text" => {
                 if path.is_empty() {
                     alloc::string::String::from("error: missing path")
                 } else {
                     alloc::format!("ok:{name} {path} (stub)")
                 }
             }
-            "image_control" | "audio_control" | "video_control" => {
+            "image_control" | "audio_control" | "video_control" | "pdf_control" => {
                 if cmd.is_empty() {
                     alloc::string::String::from("error: missing cmd")
                 } else {
@@ -7968,6 +8025,43 @@ pub(crate) fn run_media_tool(name: &str, args_json: &str) -> alloc::string::Stri
                     return alloc::string::String::from("error: missing path");
                 }
                 pdf_preview(&path)
+            }
+            "pdf_text" => {
+                if path.is_empty() {
+                    return alloc::string::String::from("error: missing path");
+                }
+                pdf_text(&path)
+            }
+            "pdf_control" => {
+                let c = match cmd.as_str() {
+                    "next_page" | "next" | "n" => b'n',
+                    "prev_page" | "prev" | "p" => b'p',
+                    "first_page" | "first" => b'g',
+                    "last_page" | "last" => b'G',
+                    "zoom_in" | "+" | "in" => b'+',
+                    "zoom_out" | "-" | "out" => b'-',
+                    "fit" | "f" => b'f',
+                    "reset" | "0" => b'0',
+                    "scroll_up" | "up" => b'A',
+                    "scroll_down" | "down" => b'B',
+                    "pan_right" | "right" => b'C',
+                    "pan_left" | "left" => b'D',
+                    other => {
+                        return alloc::format!(
+                            "error:unknown pdf cmd '{other}' (next_page|prev_page|first_page|last_page|zoom_in|zoom_out|fit|reset|scroll_*|pan_*)"
+                        );
+                    }
+                };
+                // Scroll/pan are the arrow actions, so they go through the
+                // nav path — `pdf_cmd` deliberately rejects A..D (see its docs).
+                let ok = match c {
+                    b'A' | b'B' | b'C' | b'D' => pdf_nav(c),
+                    other => pdf_cmd(other),
+                };
+                if !ok {
+                    return alloc::string::String::from("error: no PDF open");
+                }
+                alloc::format!("ok:pdf {cmd}")
             }
             "audio_player" | "audio_open" => {
                 if path.is_empty() {

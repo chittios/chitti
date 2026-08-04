@@ -533,9 +533,23 @@ fn builtins() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "pdf_preview".to_string(),
-            description: "Preview a PDF: deterministic wasm digest (pdf agent), text in an editor tab. args: path.".to_string(),
+            description: "Open a PDF in the viewer: real rendered pages (hayro rasterizer in wasm), page nav + zoom. args: path.".to_string(),
             input_schema: r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#.to_string(),
             required: alloc::vec!["path".to_string()],
+            binding: ToolBinding::Media,
+        },
+        ToolDef {
+            name: "pdf_text".to_string(),
+            description: "Extract a PDF's text: deterministic wasm digest (pdf agent), text in an editor tab. args: path.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#.to_string(),
+            required: alloc::vec!["path".to_string()],
+            binding: ToolBinding::Media,
+        },
+        ToolDef {
+            name: "pdf_control".to_string(),
+            description: "Control the PDF viewer: cmd=next_page|prev_page|first_page|last_page|zoom_in|zoom_out|fit|reset|scroll_up|scroll_down|pan_left|pan_right.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}"#.to_string(),
+            required: alloc::vec!["cmd".to_string()],
             binding: ToolBinding::Media,
         },
         ToolDef {

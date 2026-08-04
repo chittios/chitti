@@ -19,6 +19,7 @@ fn tab_label(m: RightMode) -> alloc::string::String {
         RightMode::Surface(IMAGE_SURFACE) => alloc::format!("{} image", fa::IMAGE),
         RightMode::Surface(VIDEO_SURFACE) => alloc::format!("{} video", fa::FILM),
         RightMode::Surface(BROWSER_SURFACE) => alloc::format!("{} browser", fa::GLOBE),
+        RightMode::Surface(PDF_SURFACE) => alloc::format!("{} pdf", fa::FILE_LINES),
         RightMode::Surface(id) => {
             // Running package UI (chess/paint/snake/…) — FA agent icon + name.
             // Use surface_tab_name (display cache), never RUN: tab paint runs

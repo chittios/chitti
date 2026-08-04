@@ -46,6 +46,10 @@ use wasmi::{Caller, Config, Engine, Extern, Linker, Memory, Module, ResourceLimi
 pub const DEFAULT_FUEL: u64 = 5_000_000;
 /// Default max linear memory: 32 × 64 KiB = 2 MiB (chess tools.wasm starts at 18 pages).
 pub const DEFAULT_MAX_MEMORY_PAGES: u32 = 32;
+
+/// Default function-table ceiling. Unchanged from the value that was hardcoded
+/// in the limiter, so every existing agent module keeps exactly its old bound.
+pub const DEFAULT_MAX_TABLE_ELEMS: u32 = 256;
 /// Wasm page size in bytes.
 const PAGE_SIZE: usize = 64 * 1024;
 
@@ -54,6 +58,14 @@ const PAGE_SIZE: usize = 64 * 1024;
 pub struct Limits {
     pub fuel: u64,
     pub max_memory_pages: u32,
+    /// Ceiling on function-table elements. An indirect-call table is how a
+    /// module does dynamic dispatch, so its size tracks how much abstraction the
+    /// guest was compiled with: a hand-written app tool needs tens of entries,
+    /// while a renderer built on trait objects and closures needs hundreds (the
+    /// PDF rasterizer declares 693). This used to be a hardcoded 256 in the
+    /// limiter, which is why such a module failed at *instantiate* with a
+    /// "missing imports?" error — the one message that does not point at tables.
+    pub max_table_elems: u32,
 }
 
 impl Default for Limits {
@@ -61,6 +73,7 @@ impl Default for Limits {
         Self {
             fuel: DEFAULT_FUEL,
             max_memory_pages: DEFAULT_MAX_MEMORY_PAGES,
+            max_table_elems: DEFAULT_MAX_TABLE_ELEMS,
         }
     }
 }
@@ -73,6 +86,11 @@ impl Limits {
 
     pub fn with_pages(mut self, pages: u32) -> Self {
         self.max_memory_pages = pages.max(1);
+        self
+    }
+
+    pub fn with_table_elems(mut self, elems: u32) -> Self {
+        self.max_table_elems = elems.max(1);
         self
     }
 }
@@ -110,12 +128,14 @@ pub struct HostState {
 
 struct PageLimiter {
     max_bytes: usize,
+    max_table_elems: u32,
 }
 
 impl PageLimiter {
-    fn new(max_pages: u32) -> Self {
+    fn new(max_pages: u32, max_table_elems: u32) -> Self {
         Self {
             max_bytes: (max_pages as usize).saturating_mul(PAGE_SIZE),
+            max_table_elems,
         }
     }
 }
@@ -136,7 +156,7 @@ impl ResourceLimiter for PageLimiter {
         desired: u32,
         _maximum: Option<u32>,
     ) -> Result<bool, TableError> {
-        Ok(desired <= 256)
+        Ok(desired <= self.max_table_elems)
     }
 
     fn instances(&self) -> usize {
@@ -254,7 +274,7 @@ impl Session {
         let module = Module::new(&engine, wasm).map_err(|_| "wasm parse/validate failed")?;
 
         let host = HostState {
-            limiter: PageLimiter::new(limits.max_memory_pages),
+            limiter: PageLimiter::new(limits.max_memory_pages, limits.max_table_elems),
             bind,
             last_error: None,
             log_count: 0,
@@ -347,6 +367,46 @@ impl Session {
             return Err("guest returned negative ptr/len");
         }
         self.read_guest_string(rptr as usize, rlen as usize)
+    }
+
+    /// Stage `bytes` in guest memory and return their address — the binary-in
+    /// half of a bulk ABI, for a guest whose input is megabytes (a PDF) rather
+    /// than a JSON string. Base64-through-`call_string` would cost a 4/3-sized
+    /// string on both sides of the boundary plus the guest's decode.
+    pub fn put_bytes(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
+        let ptr = self.guest_alloc(bytes.len())?;
+        self.write_guest(ptr, bytes)?;
+        Ok(ptr)
+    }
+
+    /// Copy `len` bytes out of guest memory at `ptr` — the binary-out half, for
+    /// a guest that produces a pixel buffer.
+    ///
+    /// **Both arguments come from the guest**, which is the untrusted side, so
+    /// this bounds-checks them against the live memory size rather than trusting
+    /// the report — the same rule the image tenant's loader follows for every
+    /// number a tenant hands back.
+    pub fn get_bytes(&self, ptr: usize, len: usize) -> Result<Vec<u8>, &'static str> {
+        let mem = self
+            .instance
+            .get_memory(&self.store, "memory")
+            .ok_or("guest did not export memory")?;
+        let data = mem.data(&self.store);
+        let end = ptr.checked_add(len).ok_or("guest read overflow")?;
+        if end > data.len() {
+            return Err("guest read out of bounds");
+        }
+        Ok(data[ptr..end].to_vec())
+    }
+
+    /// Read `n` little-endian `u32`s out of guest memory — a guest-reported
+    /// header (`[w, h, ptr, len]`), bounds-checked like [`Self::get_bytes`].
+    pub fn get_u32s(&self, ptr: usize, n: usize) -> Result<Vec<u32>, &'static str> {
+        let bytes = self.get_bytes(ptr, n * 4)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
     }
 
     fn guest_alloc(&mut self, len: usize) -> Result<usize, &'static str> {
@@ -1438,6 +1498,7 @@ mod tests {
             Limits {
                 fuel: 50_000,
                 max_memory_pages: 2,
+                ..Limits::default()
             },
             HostBindings::default(),
         )

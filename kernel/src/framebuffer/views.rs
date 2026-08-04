@@ -732,6 +732,76 @@ pub fn video_hud_height() -> u64 {
     SCREEN.with(|slot| slot.as_ref().map(|sc| sc.ch() * 4 + sc.ch() / 2).unwrap_or(0))
 }
 
+/// Height in px the PDF viewer's status strip reserves — two text rows: where
+/// you are in the document, and the keys. Shorter than the video HUD because a
+/// document needs no scrubber or volume.
+pub fn pdf_hud_height() -> u64 {
+    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.ch() * 2 + sc.ch() / 2).unwrap_or(0))
+}
+
+/// Overlay the PDF viewer's status strip along the bottom of its pane. Drawn
+/// *after* the page blit, in the strip `present_surface_reserve` left alone, so
+/// it updates in place rather than flickering under each re-render.
+///
+/// `line` comes from [`crate::pdfview::hud`] — built there, not here, so the
+/// wording is unit-tested; this function only lays it out. It is split on the
+/// double spaces the author used to group fields, then packed into rows that fit
+/// the pane, which is the same trick the vertical status bar uses: a document
+/// pane can be narrow, and an ellipsized status line loses the page number,
+/// which is the one field a reader actually needs.
+pub fn draw_pdf_status(line: &str) {
+    SCREEN.with(|slot| {
+        let Some(sc) = slot else { return };
+        let Some(d) = sc.mode_dims(RightMode::Surface(PDF_SURFACE)) else {
+            return;
+        };
+        sc.cursor_restore();
+        sc.cur_vis = false;
+        let (ch, cw) = (sc.ch(), sc.cw());
+        let (px, py, pw, ph) = (d.ix, d.iy, d.iw, d.ih);
+        let bg = d.bg;
+        let barh = ch * 2 + ch / 2;
+        let by = py + ph.saturating_sub(barh);
+        // Fill the whole strip once so a shorter status never leaves glyph
+        // trails, then a hairline to separate it from the page.
+        sc.fill_rect(px, by, pw, barh, bg);
+        sc.fill_rect(px, by, pw, 1, sc.theme.accent);
+        let cols = (pw / cw).saturating_sub(2).max(4) as usize;
+        let mut y = by + ch / 3;
+        let hud_bottom = py + ph;
+        // The first row is the position/zoom group (accent), the rest hints.
+        let mut first = true;
+        let mut linebuf = String::new();
+        let flush = |sc: &mut Screen, y: &mut u64, s: &str, first: bool| {
+            let colour = if first { sc.theme.accent } else { sc.theme.logs_fg };
+            sc.draw_str_bg(px + cw, *y, &crate::textsel::fit_width(s, cols), colour, bg);
+            *y += ch;
+        };
+        for group in line.split("  ").filter(|s| !s.trim().is_empty()) {
+            let group = group.trim();
+            let cand = if linebuf.is_empty() {
+                String::from(group)
+            } else {
+                alloc::format!("{}  {}", linebuf, group)
+            };
+            if cand.chars().count() > cols && !linebuf.is_empty() {
+                if y + ch > hud_bottom {
+                    return;
+                }
+                flush(sc, &mut y, &linebuf, first);
+                first = false;
+                linebuf = String::from(group);
+            } else {
+                linebuf = cand;
+            }
+        }
+        if !linebuf.is_empty() && y + ch <= hud_bottom {
+            flush(sc, &mut y, &linebuf, first);
+        }
+        sc.cursor_overlay();
+    });
+}
+
 /// Open the `/top` dashboard in the action pane (filled by the shell's idle
 /// tick). Returns true if it is now open (false if it was already).
 pub fn open_top() {

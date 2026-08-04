@@ -194,6 +194,49 @@ wasm was measured and rejected for this: `tools/pngbench` (a permanent host tool
 wasm" does not rescue it, because an attacker sends a *large* one. Ring 3 costs a page-table
 switch and a trap. wasm stays right for `pdf`, which is already there.
 
+**`/open x.pdf` renders real pages, and wasm is the sandbox there because ring 3 is not
+available.** The rasterizer is [hayro](https://github.com/LaurenzV/hayro) over
+`vello_cpu` — `tools/pdfrender-wasm/` from crates.io, compiled to
+`assets/wasm/pdfrender.wasm` (4 MiB, checked in, `include_bytes!`) and driven by
+`shell/pdf.rs` + the pure `pdfview.rs`. It would rather be a tenant like `imgdec`, but its
+tree is `std`-bound in three places that are *not* features (`moxcms`, `pxfm`,
+`pic-scale`), so the confinement comes from wasm instead of a page table: **zero imports**,
+a memory-page limiter, a per-call fuel bound. Five things that path pins down:
+
+- **The build profile is worth 8.5x.** `opt-level = "s"` renders a dense LaTeX page in
+  ~7.0 s under wasmi, `3` in ~0.82 s — and the `3` module is *smaller* (4.1 vs 5.4 MiB), so
+  there is no trade to make: the size profile drops the inlining vello_cpu's per-pixel
+  pipelines are built around. `tools/pdfbench` is the permanent harness (native *and* wasm,
+  same crate, seconds on the host — the `pngbench` pattern); the interpreter tax is
+  **30-90x**, worse than PNG's 47-67x because the SIMD blend paths are lost entirely.
+  In-kernel: ~70-150 ms for a simple page, ~990 ms for a page of this repo's own paper.
+- **The `ResourceLimiter` capped function tables at a hardcoded 256**, and a renderer built
+  on trait objects declares **693**. The failure is
+  `wasm instantiate failed (missing imports?)` — the one message that does not mention
+  tables. It is now `Limits::with_table_elems`, defaulted to the old 256 so every existing
+  agent module keeps exactly its old bound.
+- **Pixels and documents do not go through the string ABI.** A page is megabytes;
+  base64-through-JSON would cost that 4/3 twice plus a guest decode. `Session::put_bytes` /
+  `get_bytes` / `get_u32s` move bytes directly, and every number the guest reports is
+  bounds-checked against live linear memory — the image tenant's rule, because a guest is
+  the untrusted side even when it is our own code.
+- **An oversized render is refused, not attempted.** Under `panic = "abort"` an allocation
+  failure is a trap that kills the instance, so the *parsed document* would be lost with it;
+  the guest checks `MAX_PIXELS` first and answers `ERR_TOO_LARGE`, and the host clamps to
+  the same number (`pdfview::cap_permille`) so it rarely has to ask.
+- **One instance holds one document, and it stays parsed.** The `Session` is retained, so
+  paging a 35-page paper parses it once and the render cache keeps glyphs warm; the rendered
+  page is cached by `(page, scale)`, so scrolling, panning and tab switches are a memcpy and
+  only a page or zoom change pays the renderer. Zoom re-renders rather than scaling the
+  bitmap — that is the whole point of "proper preview" — and the view only ever moves a 1:1
+  window over the result (`pdfview::compose`).
+
+Note also a viewer-shaped trap that is not about PDF at all: `media_key` hands a painter
+**typed bytes** while `media_nav` hands the **finals of an escape sequence**, and both are
+`u8`. A viewer that read `A`..`D` as arrows in the typed path scrolled the page whenever a
+capital letter was typed — with the tab focused, `/cat /samples/README.md` arrived as
+`/cat /samles/REME.md`. Arrows belong only to the nav path.
+
 **Still in ring 0 for want of a primitive, not by choice:** the `http` tool (binds to
 `Shell{command:"http"}`, and `net_http_get`/`net_http_post` do not express its
 `-X`/`-H`/`-d`/`--stream` surface), MCP `tools/call` (a stateful JSON-RPC/SSE session),
@@ -860,7 +903,8 @@ FDT claims a GICv3 but carries no readable `reg`.
   `tools/chess-wasm`), doc's HTTP router (`route_request`, `tools/doc-wasm`),
   pdf's document digest (`pdf_digest`, `tools/pdf-wasm` — xref tables+streams,
   ObjStm, FlateDecode reusing the kernel's `image/inflate.rs`, text
-  extraction), the full **chess game** (`tools/chess-wasm` — rules, board UI,
+  extraction; its page *renderer* is a separate `std` module — see the ring-3
+  section), the full **chess game** (`tools/chess-wasm` — rules, board UI,
   and the agent-opponent flow; zero chess code in the kernel), and the app
   suite `notes/paint/slides/minesweeper/snake/synth` (one shared module from
   `tools/apps-wasm`). **git** is a wasm-tool agent too (`git_command` from

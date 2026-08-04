@@ -76,6 +76,7 @@ pub mod edid;
 pub mod kms;
 /// Pure multi-pane geometry + tab-move helpers (unit-tested).
 pub mod panes_layout;
+pub mod pdfview;
 #[cfg(target_arch = "x86_64")]
 pub mod qemu;
 /// Bundled `/samples/` corpus: openable media/documents seeded into the store at

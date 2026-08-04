@@ -1,0 +1,36 @@
+[package]
+name = "chitti-pdfrender-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "PDF page rasterizer for the Chitti pdf agent (agents/pdf/assets/render.wasm)"
+
+# Stand-alone crate (not part of the root workspace / host xtask).
+[workspace]
+
+[lib]
+# cdylib = the wasm module. `rlib` + the `native` example let the same code run
+# on the host for A/B timing (the h264diff/onnxdiff pattern).
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[profile.release]
+# **opt-level 3, not "s".** Measured on a figure-heavy LaTeX page under wasmi:
+# "s" renders in ~7.0 s, 3 in ~0.82 s — an 8.5x difference, because the size
+# profile drops the inlining vello_cpu's per-pixel pipelines are built around.
+# The module is bigger (4.2 MiB vs 5.4 MiB — LTO actually wins here too), so
+# there is no size/speed trade to make: 3 is smaller *and* faster.
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[dependencies]
+# hayro: a pure-Rust PDF interpreter + CPU rasterizer (MIT/Apache-2.0, see
+# THIRDPARTY-LICENSES.md). Rendering is vello_cpu; fonts are skrifa. Nothing
+# here touches the host: the module declares **zero wasm imports**, which is
+# what lets it run under the kernel's `wasm_rt` page sandbox.
+hayro = "0.7"
+hayro-interpret = "0.7"
+hayro-syntax = "0.7"
