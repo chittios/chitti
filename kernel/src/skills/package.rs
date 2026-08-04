@@ -252,7 +252,7 @@ pub fn sample_report_agent(skill_id: SkillId, agent_id: AgentId) -> SkillPackage
             max_turns: 12,
             max_context_tokens: 4096,
             compact_threshold: 3500,
-            max_tool_calls: 32,
+            max_tool_calls: 128,
             max_subagents: 0,
             max_depth: 0,
             max_wall_ticks: 0,

@@ -342,7 +342,7 @@ mod tests {
                 max_turns: 8,
                 max_context_tokens: 4096,
                 compact_threshold: 3000,
-                max_tool_calls: 32,
+                max_tool_calls: 256,
                 max_subagents: 2,
                 max_wall_ticks: 1_000_000,
                 max_depth: 2,

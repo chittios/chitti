@@ -193,7 +193,10 @@ pub fn run_with_cancel(
                             return cancelled(session, &now);
                         }
                     }
-                    if session.budget.tool_calls_used >= limits.max_tool_calls {
+                    // `max_tool_calls == 0` means **no tool-call limit** (the
+                    // shell agent and long-running helpers run arbitrarily many
+                    // calls); the turn/context/wall budgets still bound the loop.
+                    if limits.max_tool_calls != 0 && session.budget.tool_calls_used >= limits.max_tool_calls {
                         let answer = "stopped: tool-call budget exhausted".to_string();
                         session.push_message(Role::Assistant, answer.clone(), Provenance::SystemTrusted, now());
                         return LoopResult {

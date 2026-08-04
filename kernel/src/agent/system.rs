@@ -1042,7 +1042,7 @@ fn build_package(def: &SystemAgentDef, m: &ParsedManifest, caps: &[CapabilityReq
             max_turns: 8,
             max_context_tokens: 4096,
             compact_threshold: 3500,
-            max_tool_calls: 64,
+            max_tool_calls: 256,
             max_subagents: 2,
             max_depth: 1,
             max_wall_ticks: 0,

@@ -133,7 +133,9 @@ pub fn orchestrator_manifest() -> AgentManifest {
             // keeps prefill cheap once the KV fills with tool transcripts.
             max_context_tokens: 4096,
             compact_threshold: 2800,
-            max_tool_calls: 256,
+            // The shell agent is the root: no tool-call cap (`0` = unlimited);
+            // the turn/context budgets still bound a single reply.
+            max_tool_calls: 0,
             max_subagents: 8,
             max_depth: 2,
             max_wall_ticks: 0,
@@ -188,7 +190,7 @@ pub fn explore_subagent_manifest() -> AgentManifest {
             max_turns: 10,
             max_context_tokens: 3072,
             compact_threshold: 2200,
-            max_tool_calls: 16,
+            max_tool_calls: 128,
             max_subagents: 0,
             max_depth: 0,
             max_wall_ticks: 0,
@@ -232,7 +234,7 @@ pub fn plan_subagent_manifest() -> AgentManifest {
             max_turns: 8,
             max_context_tokens: 3072,
             compact_threshold: 2200,
-            max_tool_calls: 12,
+            max_tool_calls: 128,
             max_subagents: 0,
             max_depth: 0,
             max_wall_ticks: 0,
@@ -291,7 +293,7 @@ pub fn worker_subagent_manifest() -> AgentManifest {
             max_turns: 8,
             max_context_tokens: 3072,
             compact_threshold: 2200,
-            max_tool_calls: 8,
+            max_tool_calls: 256,
             max_subagents: 0,
             max_depth: 0,
             max_wall_ticks: 0,
@@ -322,7 +324,7 @@ pub fn reader_subagent_manifest() -> AgentManifest {
             max_turns: 12,
             max_context_tokens: 4096,
             compact_threshold: 3500,
-            max_tool_calls: 32,
+            max_tool_calls: 64,
             max_subagents: 0,
             max_depth: 0,
             max_wall_ticks: 0,
@@ -445,4 +447,25 @@ pub fn render_cap(c: &CapabilityRequest) -> String {
         }
     };
     alloc::format!("{:?} {:?} @ {}", c.domain, c.rights, scope)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// The shell agent (orchestrator) has **no tool-call cap** (`0` = unlimited,
+    /// enforced by the loop guard); sub-agent roles get generous budgets so a
+    /// multi-step task with many small tools is not cut off mid-flight.
+    #[test_case]
+    fn orchestrator_is_unlimited_and_subagents_are_generous() {
+        let shell = orchestrator_manifest();
+        assert_eq!(shell.budgets.max_tool_calls, 0, "shell agent must be uncapped");
+        // Worker (the workhorse spawn) is the most likely to chain many calls.
+        let worker = subagent_role("worker").unwrap();
+        assert!(worker.budgets.max_tool_calls >= 128, "worker budget too tight");
+        for name in ["explore", "plan", "reader"] {
+            let m = subagent_role(name).unwrap();
+            assert!(m.budgets.max_tool_calls >= 64, "{name} budget too tight");
+        }
+    }
 }
