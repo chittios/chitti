@@ -3542,9 +3542,9 @@ const SAMPLE_FILES: &[SampleFile] = &[
     },
     SampleFile {
         category: "videos",
-        name: "sintel-trailer.mp4",
-        url: "https://media.w3.org/2010/05/sintel/trailer.mp4",
-        note: "H.264 (High/CABAC) + AAC in mp4, ~4.3 MB, the Sintel trailer — the largest sample here, and the audio-locked-clock stress test (Sintel, (c) Blender Foundation, CC-BY 3.0)",
+        name: "friday.mp4",
+        url: "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/friday.mp4",
+        note: "H.264 + AAC in mp4, ~0.5 MB (MDN CC0-videos, friday.mp4 — public domain, has sound)",
         openable: true,
     },
     // Audio — one file per decoder in `audio/`.
