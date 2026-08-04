@@ -1738,11 +1738,14 @@ def s_samples(g):
         return False, "sample WAV was not opened"
     g.send_raw(b"\x03")
     g.wait_quiet(0.5, 15)
-    # Video: probe + streaming decode of the H.264/AAC clip.
+    # Video: probe + streaming decode of the H.264/AAC clip (flower.mp4, one of
+    # the two "with sound" samples — 30 s, AAC 48 kHz).
     m = g.mark()
-    g.send("/open /samples/videos/sample.mp4")
+    g.send("/open /samples/videos/flower.mp4")
     if not g.wait_for("frame(s)", 60, m):
         return False, "sample mp4 did not probe/decode"
+    if not g.wait_for("audio ready", 30, m):
+        return False, "sample mp4 has no audio track"
     g.send_raw(b"\x03")
     g.wait_quiet(0.5, 15)
     # PDF: the pdf agent's wasm digest.

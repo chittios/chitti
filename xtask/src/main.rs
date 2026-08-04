@@ -3529,13 +3529,22 @@ const SAMPLE_FILES: &[SampleFile] = &[
         note: "PNG grayscale 8-bit, colour type 0 (libpng PNGSuite, basn0g08.png)",
         openable: true,
     },
-    // Video — H.264 in mp4 with an AAC track, so `/open` exercises the demuxer,
-    // the decoder, the HUD, and the audio-locked clock at once.
+    // Video — H.264 in mp4 **with an AAC audio track**, so `/open` exercises
+    // the demuxer, the decoder, the HUD, the audio-locked clock, and the AAC
+    // playback path at once (test-videos.co.uk's 1–5 MB clips are video-only,
+    // so a "with sound" sample must come from a source that keeps the audio).
     SampleFile {
         category: "videos",
-        name: "sample.mp4",
-        url: "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4",
-        note: "H.264 + AAC in mp4, 360p 10s (Big Buck Bunny, (c) Blender Foundation, CC-BY 3.0)",
+        name: "flower.mp4",
+        url: "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4",
+        note: "H.264 + AAC in mp4, ~1.1 MB, 30 s (MDN CC0-videos, flower.mp4 — public domain, has sound)",
+        openable: true,
+    },
+    SampleFile {
+        category: "videos",
+        name: "sintel-trailer.mp4",
+        url: "https://media.w3.org/2010/05/sintel/trailer.mp4",
+        note: "H.264 (High/CABAC) + AAC in mp4, ~4.3 MB, the Sintel trailer — the largest sample here, and the audio-locked-clock stress test (Sintel, (c) Blender Foundation, CC-BY 3.0)",
         openable: true,
     },
     // Audio — one file per decoder in `audio/`.
