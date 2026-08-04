@@ -109,9 +109,12 @@ pub mod xhci;
 #[cfg(not(test))]
 pub mod framebuffer;
 // The vim-like `/open` editor draws into the framebuffer, so it shares the same
-// not(test) gate.
+// not(test) gate. Soft-wrap viewport math is pure and lives in `editor_wrap`
+// so unit tests can pin it without the compositor.
 #[cfg(not(test))]
 pub mod editor;
+/// Soft-wrap math for the `/open` editor (always built; pure + unit-tested).
+pub mod editor_wrap;
 // The Geist Mono glyph atlas the framebuffer console renders with (data-only).
 // (`synapse::ui`'s `text` draw op uses the runtime `font_ttf` rasterizer, not
 // this fixed-cell atlas — sizes below the cell smear when downscaled.)

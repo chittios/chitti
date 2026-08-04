@@ -24,7 +24,9 @@ const ARCH: &str = "?";
 /// `theme` object so every colour is discoverable + overridable; the framebuffer
 /// applies them over its dark default via `theme_from_pairs`.
 const THEME_DEFAULTS: &[(&str, &str)] = &[
-    ("accent", "#cc785c"),       // primary — active border, caret, brand, logo
+    ("accent", "#cc785c"),       // primary — active border, caret, selection
+    ("logo", "#cc785c"),         // status-bar / splash Synapse-C ring (override independently of accent)
+    ("logo_node", "#faf9f5"),    // logo centre node
     ("screen_bg", "#181715"),    // surface-dark
     ("chat_bg", "#1f1e1b"),      // surface-dark-soft
     ("logs_bg", "#141311"),
@@ -34,8 +36,8 @@ const THEME_DEFAULTS: &[(&str, &str)] = &[
     ("title_active", "#cc785c"),
     ("title_dim", "#6c6a64"),    // muted
     ("sep_dim", "#2a2825"),
-    ("status_bg", "#252320"),    // surface-dark-elevated
-    ("status_fg", "#a09d96"),
+    ("status_bg", "#252320"),    // surface-dark-elevated — status bar fill
+    ("status_fg", "#a09d96"),    // status bar text **and** FA icons
     ("editor_bg", "#1f1e1b"),
     ("editor_fg", "#faf9f5"),
     ("editor_lineno", "#6c6a64"),
@@ -108,7 +110,9 @@ impl Default for UiConfig {
             chat_title: "Shell Agent".to_string(),
             logs_title: "ktrace".to_string(),
             status_left: "ChittiOS v${version}".to_string(),
-            status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${datetime} ${tz}".to_string(),
+            // Compact macOS-style clock by default (`Tue Aug 4  19:45`); full
+            // form stays available as `${datetime}` / `${tz}` if a user wants it.
+            status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${datetime_short}".to_string(),
             status_pos: crate::panes_layout::StatusPos::default().as_str().to_string(),
             tz_offset: 0,
             tz_name: String::new(),
@@ -185,6 +189,9 @@ impl UiConfig {
             t if t == "${datetime}  ${tz}" => d.status_right.clone(),
             t if t == "${kbd} ${mouse}  ${net}  ${mem}  ${cpu}  ${datetime} ${tz}" => d.status_right.clone(),
             t if t == "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${datetime} ${tz}" => d.status_right.clone(),
+            t if t == "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${datetime} ${tz}" => {
+                d.status_right.clone()
+            }
             t => t,
         };
         UiConfig {
@@ -461,7 +468,10 @@ fn resolve_var(var: &str) -> String {
         "build" => crate::BUILD_TIME.to_string(),
         "date" => crate::clock::format_date(),
         "time" => crate::clock::format_time(),
+        // Full form (`Wed 2026-07-04 13:45:02`); the live status chips use the
+        // compact macOS-style form via `format_datetime_short` instead.
         "datetime" => crate::clock::format_datetime(),
+        "datetime_short" => crate::clock::format_datetime_short(),
         "tz" => crate::clock::format_tz(),
         // The booted GGUF's own `general.name` (runtime, not compiled in).
         "model" => crate::cortex::model_name().unwrap_or_else(|| "no model".to_string()),
@@ -575,7 +585,7 @@ mod tests {
     use super::*;
 
     /// The default status-bar template, so the tests below exercise the real layout.
-    const BAR: &str = "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${datetime} ${tz}";
+    const BAR: &str = "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${datetime_short}";
 
     #[test_case]
     fn a_present_battery_appears_between_cores_and_the_clock() {
@@ -588,14 +598,42 @@ mod tests {
                 "cpu" => "cpu   3%".to_string(),
                 "cores" => "8c".to_string(),
                 "battery" => "+42%".to_string(),
-                "datetime" => "2026-07-25 19:30".to_string(),
-                "tz" => "UTC".to_string(),
+                "datetime_short" => "Fri Jul 25  19:30".to_string(),
                 other => alloc::format!("${{{}}}", other),
             }
         };
         assert_eq!(
             expand(BAR, &r),
-            "kbd  mse   net up  mem 40M/6.0G  cpu   3% 8c  +42%  2026-07-25 19:30 UTC"
+            "kbd  mse   net up  mem 40M/6.0G  cpu   3% 8c  +42%  Fri Jul 25  19:30"
+        );
+    }
+
+    #[test_case]
+    fn theme_defaults_include_status_and_logo_slots() {
+        let keys: alloc::vec::Vec<&str> = THEME_DEFAULTS.iter().map(|(k, _)| *k).collect();
+        for need in ["status_bg", "status_fg", "logo", "logo_node"] {
+            assert!(keys.contains(&need), "THEME_DEFAULTS missing {need}");
+        }
+        let get = |k: &str| THEME_DEFAULTS.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
+        assert_eq!(get("status_bg"), Some("#252320"));
+        assert_eq!(get("status_fg"), Some("#a09d96"));
+        assert_eq!(get("logo"), Some("#cc785c"));
+        assert_eq!(get("logo_node"), Some("#faf9f5"));
+    }
+
+    #[test_case]
+    fn default_status_right_uses_datetime_short() {
+        let d = UiConfig::default();
+        assert!(
+            d.status_right.contains("${datetime_short}"),
+            "default status_right should use compact clock: {}",
+            d.status_right
+        );
+        // Not the full `${datetime}` token (would also match datetime_short).
+        assert!(
+            !d.status_right.replace("${datetime_short}", "").contains("${datetime}"),
+            "default should not pin the full datetime form: {}",
+            d.status_right
         );
     }
 

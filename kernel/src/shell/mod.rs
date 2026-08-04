@@ -1264,8 +1264,8 @@ fn take_pending_input() -> Option<String> {
 }
 
 /// `/about` — macOS-style About dialog (logo, version, build, arch). Also opened
-/// by clicking the status-bar brand ("ChittiOS …"). `/about text` prints the
-/// same facts on serial (e2e / no framebuffer).
+/// by clicking the status-bar **logo** (not the wordmark or empty bar). `/about text`
+/// prints the same facts on serial (e2e / no framebuffer).
 fn run_about(arg: &str) {
     let force_text = matches!(arg.trim(), "text" | "list" | "--text" | "-t");
     #[cfg(not(test))]
@@ -1327,7 +1327,7 @@ fn print_help_text() {
     serial_println!("Chitti commands:");
     serial_println!("  <message>        chat with the agent — it calls /commands as tools (Ctrl+C to stop)");
     serial_println!("  /help            Commands browser (search + scroll); /help text = this list");
-    serial_println!("  /about           About ChittiOS (or click the status-bar brand)");
+    serial_println!("  /about           About ChittiOS (or click the status-bar logo)");
     serial_println!("  /agents          Agents browser (Ctrl+Space); /agents text = list");
     for e in catalog::ENTRIES {
         if e.name == "agents" || e.name == "about" {

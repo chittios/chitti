@@ -7,6 +7,8 @@
   "cursor": { "fill": "#0f0f11", "outline": "#f5f5f8" },
   "palette": {
     "accent": "#cc785c",
+    "logo": "#cc785c",
+    "logo_node": "#faf9f5",
     "screen_bg": "#181715",
     "chat_bg": "#1f1e1b",
     "logs_bg": "#141311",

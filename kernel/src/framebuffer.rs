@@ -53,7 +53,13 @@ pub struct Theme {
     pub logs_bg: Rgb,
     pub chat_fg: Rgb,
     pub logs_fg: Rgb,
-    pub accent: Rgb, // active border / caret / brand / logo
+    pub accent: Rgb, // active border / caret / selection chrome
+    /// Status-bar / splash Synapse-C logo **ring** (from `ui.json` `theme.logo`;
+    /// defaults to `accent` when omitted).
+    pub logo: Rgb,
+    /// Status-bar / splash logo **node** (from `theme.logo_node`; defaults to
+    /// `chat_fg` when omitted).
+    pub logo_node: Rgb,
     pub border_dim: Rgb,
     pub title_active: Rgb,
     pub title_dim: Rgb,
@@ -82,12 +88,14 @@ impl Theme {
         chat_fg: (250, 249, 245),      // on-dark / cream #faf9f5
         logs_fg: (160, 157, 150),      // on-dark-soft #a09d96
         accent: (204, 120, 92),        // primary #cc785c
+        logo: (204, 120, 92),          // matches accent unless ui.json overrides
+        logo_node: (250, 249, 245),    // cream node
         border_dim: (58, 55, 51),      // inactive border
         title_active: (204, 120, 92),  // primary
         title_dim: (108, 106, 100),    // muted #6c6a64
         sep_dim: (42, 40, 37),
         status_bg: (37, 35, 32),       // surface-dark-elevated #252320
-        status_fg: (160, 157, 150),    // on-dark-soft
+        status_fg: (160, 157, 150),    // on-dark-soft — icons + status text
         editor_bg: (31, 30, 27),       // surface-dark-soft
         editor_fg: (250, 249, 245),    // cream
         editor_lineno: (108, 106, 100),
@@ -122,6 +130,8 @@ pub fn parse_hex(s: &str, def: Rgb) -> Rgb {
 /// hex keeps the brand value. This is how `ui.json`'s `theme` object is applied.
 pub fn theme_from_pairs(pairs: &[(alloc::string::String, alloc::string::String)]) -> Theme {
     let mut t = Theme::BRAND_DARK;
+    let mut has_logo = false;
+    let mut has_logo_node = false;
     for (name, hex) in pairs {
         let slot = match name.as_str() {
             "screen_bg" => &mut t.screen_bg,
@@ -130,6 +140,14 @@ pub fn theme_from_pairs(pairs: &[(alloc::string::String, alloc::string::String)]
             "chat_fg" => &mut t.chat_fg,
             "logs_fg" => &mut t.logs_fg,
             "accent" => &mut t.accent,
+            "logo" => {
+                has_logo = true;
+                &mut t.logo
+            }
+            "logo_node" => {
+                has_logo_node = true;
+                &mut t.logo_node
+            }
             "border_dim" => &mut t.border_dim,
             "title_active" => &mut t.title_active,
             "title_dim" => &mut t.title_dim,
@@ -146,6 +164,14 @@ pub fn theme_from_pairs(pairs: &[(alloc::string::String, alloc::string::String)]
             _ => continue,
         };
         *slot = parse_hex(hex, *slot);
+    }
+    // Omitted logo keys track the brand palette so a theme that only sets
+    // `accent` / `chat_fg` still recolors the mark without a second key.
+    if !has_logo {
+        t.logo = t.accent;
+    }
+    if !has_logo_node {
+        t.logo_node = t.chat_fg;
     }
     t
 }
@@ -2586,15 +2612,23 @@ impl Screen {
         // by `draw_status_str`.
         let row = ch + STATUS_ICON_EXTRA + 4;
         let lr = (((row / 2).saturating_sub(2)) * 6 / 7).max(6);
+        // Logo colours from ui.json theme (`logo` / `logo_node`, else accent/chat_fg).
+        let logo_cx = bx + bw / 2;
+        let logo_cy = by + STATUS_PAD / 2 + row / 2;
         self.draw_logo(
-            bx + bw / 2,
-            by + STATUS_PAD / 2 + row / 2,
+            logo_cx,
+            logo_cy,
             lr,
-            self.theme.accent,
-            self.theme.chat_fg,
+            self.theme.logo,
+            self.theme.logo_node,
         );
-        // Brand hit = logo row (+ first left field when present).
-        set_status_chip_rect(StatusChip::Brand, (bx, by, bw, row.min(bh)));
+        // About opens only on the logo mark — not the wordmark or empty bar space.
+        let logo_ext = lr + (lr / 3).max(3) + 4;
+        let hx = logo_cx.saturating_sub(logo_ext).max(bx);
+        let hy = logo_cy.saturating_sub(logo_ext).max(by);
+        let hw = (logo_ext * 2).min(bw.saturating_sub(hx.saturating_sub(bx)));
+        let hh = (logo_ext * 2).min(bh.saturating_sub(hy.saturating_sub(by)));
+        set_status_chip_rect(StatusChip::Brand, (hx, hy, hw, hh));
         let tx = bx + STATUS_PAD / 2;
         let max_x = bx + bw.saturating_sub(STATUS_PAD / 2);
         let cols = (bw.saturating_sub(STATUS_PAD) / cw).max(4) as usize;
@@ -2607,10 +2641,13 @@ impl Screen {
             if top + row > last {
                 break;
             }
-            self.draw_status_str(tx, top, line, self.theme.accent, self.theme.status_bg, max_x);
-            if i == 0 {
-                set_status_chip_rect(StatusChip::Brand, (bx, by, bw, (top + row - by).min(bh)));
-            }
+            // Brand wordmark uses logo colour; all status text/icons use status_fg.
+            let fg = if i == 0 {
+                self.theme.logo
+            } else {
+                self.theme.status_fg
+            };
+            self.draw_status_str(tx, top, line, fg, self.theme.status_bg, max_x);
             top += row;
         }
         for (chip, text) in status_right_chips() {
@@ -2637,28 +2674,40 @@ impl Screen {
         let lr = (((bar_h / 2).saturating_sub(2)) * 6 / 7).max(6);
         let lhalf = ((lr / 3).max(3)) / 2;
         let lcx = OUTER + lr + lhalf;
-        self.draw_logo(lcx, sy_top + bar_h / 2, lr, self.theme.accent, self.theme.chat_fg);
+        // Logo from ui.json theme.logo / logo_node (see theme_from_pairs).
+        self.draw_logo(
+            lcx,
+            sy_top + bar_h / 2,
+            lr,
+            self.theme.logo,
+            self.theme.logo_node,
+        );
+        // About opens only on the logo mark — not the wordmark or empty bar space.
+        let logo_x0 = lcx.saturating_sub(lr + lhalf);
+        let logo_w = (lr + lhalf) * 2 + 4;
+        set_status_chip_rect(
+            StatusChip::Brand,
+            (logo_x0.saturating_sub(2), sy_top, logo_w + 4, bar_h),
+        );
         let text_x = lcx + lr + lhalf + cw / 2;
         let gap = 2 * cw;
         let usable = self.width.saturating_sub(text_x + OUTER + gap);
         let left_budget = (usable / 2 / cw).max(4) as usize;
         let left = crate::textsel::ellipsize(&self.status_left, left_budget);
         let max_left = text_x + left_budget as u64 * cw;
+        // Brand wordmark ("ChittiOS v…") uses logo colour; bar field colour is status_fg.
+        // Wordmark is not a hit target (About is logo-only).
         self.draw_status_str(
             text_x,
             ty,
             &left,
-            self.theme.accent,
+            self.theme.logo,
             self.theme.status_bg,
             max_left,
         );
-        // Logo + "ChittiOS v…" left text is the About click target.
-        set_status_chip_rect(
-            StatusChip::Brand,
-            (OUTER, sy_top, max_left.saturating_sub(OUTER / 2), bar_h),
-        );
 
         // Right chips painted individually so each has a hit rect.
+        // Icons and labels share status_fg so they match the theme text colour.
         let chips = status_right_chips();
         let gap1 = cw; // within a tight group
         let gap2 = 2 * cw; // between groups
@@ -2685,13 +2734,14 @@ impl Screen {
             if x + w > max_x {
                 break;
             }
-            // Icon chips (kbd/mouse/net) use accent so FA glyphs read clearly;
-            // text chips keep the dimmer status_fg.
-            let fg = match chip {
-                StatusChip::Kbd | StatusChip::Mouse | StatusChip::Net => self.theme.accent,
-                _ => self.theme.status_fg,
-            };
-            let x1 = self.draw_status_str(x, ty, text, fg, self.theme.status_bg, max_x);
+            let x1 = self.draw_status_str(
+                x,
+                ty,
+                text,
+                self.theme.status_fg,
+                self.theme.status_bg,
+                max_x,
+            );
             // Hit pad a few px for easy clicking.
             let hx = x.saturating_sub(2);
             let hw = x1.saturating_sub(hx) + 2;
@@ -3223,8 +3273,8 @@ impl Screen {
         self.paint_wallpaper(0, 0, self.width, self.height, self.theme.screen_bg);
         let r = (self.height / 7).max(24);
         let cy = self.height * 2 / 5;
-        // Ring in terracotta (accent), node in cream (chat_fg) — see the SVG.
-        self.draw_logo(self.width / 2, cy, r, self.theme.accent, self.theme.chat_fg);
+        // Ring/node from theme.logo / logo_node (ui.json), defaulting to brand.
+        self.draw_logo(self.width / 2, cy, r, self.theme.logo, self.theme.logo_node);
         let name = "ChittiOS";
         let nx = self.width / 2 - (name.len() as u64 * self.cw()) / 2;
         self.draw_str(nx, cy + r + r / 2, name, self.theme.accent, self.theme.screen_bg);
@@ -4319,7 +4369,7 @@ fn set_status_chip_rect(chip: StatusChip, r: (u64, u64, u64, u64)) {
     STATUS_CHIP_RECTS.with(|a| a[chip as usize] = r);
 }
 
-/// True if `(x, y)` is on the status-bar brand (logo / "ChittiOS" name).
+/// True if `(x, y)` is on the status-bar **logo** (About hit target; not the wordmark).
 pub fn status_brand_hit(x: u64, y: u64) -> bool {
     status_chip_hit(x, y) == Some(StatusChip::Brand)
 }
@@ -4399,14 +4449,8 @@ fn status_right_chips() -> alloc::vec::Vec<(StatusChip, alloc::string::String)> 
             out.push((StatusChip::Battery, s));
         }
     }
-    out.push((
-        StatusChip::Clock,
-        alloc::format!(
-            "{} {}",
-            crate::clock::format_datetime(),
-            crate::clock::format_tz()
-        ),
-    ));
+    // Compact macOS-style clock (no year / seconds / tz — dropdown has the rest).
+    out.push((StatusChip::Clock, crate::clock::format_datetime_short()));
     out
 }
 
@@ -4604,7 +4648,7 @@ pub fn draw_confirm(title: &str, msg: &str, focus_yes: bool) {
 }
 
 /// Draw a macOS-style **About ChittiOS** dialog: logo, version, build, arch,
-/// tagline, and an OK button (plus FA close). Clicking the status-bar brand or
+/// tagline, and an OK button (plus FA close). Clicking the status-bar **logo** or
 /// running `/about` opens this.
 pub fn draw_about() {
     MODAL_ON.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -4666,20 +4710,20 @@ pub fn draw_about() {
         );
         set_modal_close_rect((cx, close_y, close_w, ch));
 
-        // Large brand logo.
+        // Large brand logo (ui.json theme.logo / logo_node).
         let logo_cy = by + BORDER + PAD + ch / 2 + logo_r;
         sc.draw_logo(
             bx + bw / 2,
             logo_cy,
             logo_r,
-            sc.theme.accent,
-            sc.theme.chat_fg,
+            sc.theme.logo,
+            sc.theme.logo_node,
         );
 
         let mut y = logo_cy + logo_r + ch / 2;
         let centre = |s: &str| bx + (bw.saturating_sub(s.chars().count() as u64 * cw)) / 2;
 
-        sc.draw_str(centre("ChittiOS"), y, "ChittiOS", sc.theme.accent, bg);
+        sc.draw_str(centre("ChittiOS"), y, "ChittiOS", sc.theme.logo, bg);
         y += ch + ch / 4;
 
         let ver = alloc::format!("Version {}", crate::VERSION);
@@ -7139,9 +7183,12 @@ pub fn editor_leave() {
 
 /// Render the editor into the right pane: title `editor: <file>`, the visible
 /// slice of `lines` from `top`, a reverse-video block cursor at
-/// `(cur_row, cur_col)`, and a bottom mode line. `gutter` toggles line numbers.
-/// `hl` is optional per-byte syntax colours for the visible lines (indexed
-/// from `top`; `None` entries fall back to the theme's `editor_fg`).
+/// `(cur_row, cur_col)`, and a bottom mode line. Soft-wraps long lines so the
+/// full buffer is reachable (vim-like; previously clipped mid-line).
+///
+/// `top` is the first **visual** row (soft-wrap aware). `hl` is optional per-byte
+/// syntax colours for logical lines starting at `hl_base` (index 0 = that line;
+/// `None` entries fall back to the theme's `editor_fg`).
 #[allow(clippy::too_many_arguments)]
 pub fn editor_render(
     title: &str,
@@ -7152,6 +7199,7 @@ pub fn editor_render(
     modeline: &str,
     sel: Option<((usize, usize), (usize, usize))>,
     hl: Option<&[Vec<Option<Rgb>>]>,
+    hl_base: usize,
 ) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
@@ -7190,48 +7238,77 @@ pub fn editor_render(
             }
             (w + 1) as u64
         };
+        let tw = (cols.saturating_sub(gutter) as usize).max(1);
+        let lenses: alloc::vec::Vec<usize> = lines.iter().map(|l| l.chars().count()).collect();
+        // Walk visual rows from `top`, painting one soft-wrap segment per screen row.
         for i in 0..text_rows {
-            let li = top + i as usize;
+            let vis = top + i as usize;
+            let (li, seg) = crate::editor_wrap::unvis(&lenses, vis, tw);
             if li >= lines.len() {
                 break;
             }
-            let y = iy + i * ch;
-            // Gutter: right-aligned 1-based line number.
-            let num = alloc::format!("{:>width$} ", li + 1, width = (gutter - 1) as usize);
-            let mut x = ix;
-            for chr in num.chars() {
-                sc.blit_glyph(x, y, chr, sc.theme.editor_lineno, sc.theme.editor_bg);
-                x += cw;
-            }
-            // Text, clipped to the pane width; selected cells get a highlight
-            // bg; syntax-highlighted chars their class colour. (Column index is
-            // per-char; for ASCII — the common editor case — it equals the byte
-            // index the highlighter used.)
-            let mut c = gutter;
-            for (col, chr) in lines[li].chars().enumerate() {
-                if c >= cols {
-                    break;
+            // Past the end of the buffer's visual extent — stop filling.
+            let total_vis = {
+                let mut t = 0usize;
+                for &len in &lenses {
+                    t += crate::editor_wrap::soft_wraps(len, tw);
                 }
-                let bg = if in_sel(li, col) { sc.theme.editor_sel } else { sc.theme.editor_bg };
+                t
+            };
+            if vis >= total_vis {
+                break;
+            }
+            let y = iy + i * ch;
+            // Gutter: number only on the first wrap segment of a logical line.
+            let mut x = ix;
+            if seg == 0 {
+                let num = alloc::format!("{:>width$} ", li + 1, width = (gutter - 1) as usize);
+                for chr in num.chars() {
+                    sc.blit_glyph(x, y, chr, sc.theme.editor_lineno, sc.theme.editor_bg);
+                    x += cw;
+                }
+            } else {
+                // Continuation marker gutter (spaces) so wrap segments stay aligned.
+                for _ in 0..gutter {
+                    sc.blit_glyph(x, y, ' ', sc.theme.editor_lineno, sc.theme.editor_bg);
+                    x += cw;
+                }
+            }
+            let start = seg * tw;
+            let line = &lines[li];
+            let hl_row = li.saturating_sub(hl_base);
+            for (off, chr) in line.chars().enumerate().skip(start).take(tw) {
+                let col = off;
+                let bg = if in_sel(li, col) {
+                    sc.theme.editor_sel
+                } else {
+                    sc.theme.editor_bg
+                };
                 let fg = hl
-                    .and_then(|h| h.get(i as usize))
+                    .and_then(|h| h.get(hl_row))
                     .and_then(|v| v.get(col).copied().flatten())
                     .unwrap_or(sc.theme.editor_fg);
                 sc.blit_glyph(x, y, chr, fg, bg);
                 x += cw;
-                c += 1;
             }
         }
-        // Reverse-video block cursor.
-        if cur_row >= top && (cur_row - top) < text_rows as usize {
-            let scr = (cur_row - top) as u64;
-            let col_on_screen = gutter + cur_col as u64;
-            if col_on_screen < cols {
-                let y = iy + scr * ch;
-                let x = ix + col_on_screen * cw;
-                let chr = lines.get(cur_row).and_then(|l| l.chars().nth(cur_col)).unwrap_or(' ');
-                let chr = if chr.is_control() { ' ' } else { chr };
-                sc.blit_glyph(x, y, chr, sc.theme.editor_bg, sc.theme.accent); // fg/bg swapped = block cursor
+        // Reverse-video block cursor on the soft-wrap cell that holds (cur_row, cur_col).
+        {
+            let cur_vis = crate::editor_wrap::vis_index(&lenses, cur_row, cur_col, tw);
+            if cur_vis >= top && (cur_vis - top) < text_rows as usize {
+                let scr = (cur_vis - top) as u64;
+                let col_in_seg = (cur_col % tw) as u64;
+                let col_on_screen = gutter + col_in_seg;
+                if col_on_screen < cols {
+                    let y = iy + scr * ch;
+                    let x = ix + col_on_screen * cw;
+                    let chr = lines
+                        .get(cur_row)
+                        .and_then(|l| l.chars().nth(cur_col))
+                        .unwrap_or(' ');
+                    let chr = if chr.is_control() { ' ' } else { chr };
+                    sc.blit_glyph(x, y, chr, sc.theme.editor_bg, sc.theme.accent);
+                }
             }
         }
         // Mode line across the bottom interior row — ellipsize so a long path

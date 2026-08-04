@@ -5,6 +5,9 @@
 //!
 //! Modes: Normal (motions + operators), Insert (typing), Command (`:` ex line).
 //! Motions h/j/k/l/0/$/w/b/gg/G; edits i/a/o/O/x/dd; ex `:w [file] :q :wq :q!`.
+//! Long lines **soft-wrap** to the pane width (and the viewport scrolls so the
+//! cursor stays visible) — the previous paint clipped mid-line with no wrap or
+//! horizontal scroll, so a JSON one-liner looked truncated like a broken view.
 //! The editor owns the right pane for the duration (ktrace pauses drawing there)
 //! and restores it on quit.
 
@@ -25,6 +28,8 @@ struct Editor {
     lines: Vec<String>,
     cx: usize, // column (byte == char, ASCII)
     cy: usize, // row
+    /// First **visual** row shown (soft-wrap aware). Logical line `0` starts at
+    /// visual row 0; a long line consumes multiple visual rows.
     top: usize,
     mode: Mode,
     cmd: String,
@@ -35,6 +40,8 @@ struct Editor {
     pending: u8, // pending operator: b'd', b'g', b'y', or 0
     sel_anchor: Option<(usize, usize)>, // (row, col) where Visual selection began
     rows: usize,
+    /// Text columns available after the line-number gutter (pane width − gutter).
+    cols: usize,
     accel: crate::keyrepeat::Accel,
 }
 
@@ -62,7 +69,7 @@ pub fn open(path: &str) {
         lines.pop();
     }
     crate::framebuffer::editor_enter(); // add/select the editor tab
-    let (_cols, rows) = crate::framebuffer::editor_dims().unwrap_or((60, 24));
+    let (cols, rows) = crate::framebuffer::editor_dims().unwrap_or((60, 24));
     let exists = crate::synapse::fs::exists(path);
     let ed = Editor {
         path: path.to_string(),
@@ -79,6 +86,7 @@ pub fn open(path: &str) {
         pending: 0,
         sel_anchor: None,
         rows,
+        cols,
         accel: crate::keyrepeat::Accel::new(),
     };
     EDITOR.with(|e| *e = Some(ed));
@@ -174,6 +182,39 @@ impl Editor {
         let max = self.line_len().saturating_sub(1);
         if self.cx > max {
             self.cx = max;
+        }
+    }
+
+    /// Refresh pane geometry (a layout change can resize the editor mid-session).
+    fn sync_dims(&mut self) {
+        if let Some((cols, rows)) = crate::framebuffer::editor_dims() {
+            self.cols = cols;
+            self.rows = rows;
+        }
+    }
+
+    /// Text columns after the line-number gutter.
+    fn text_width(&self) -> usize {
+        let g = self.gutter() as usize;
+        self.cols.saturating_sub(g).max(1)
+    }
+
+    fn line_lens(&self) -> Vec<usize> {
+        self.lines.iter().map(|l| l.chars().count()).collect()
+    }
+
+    fn vis_of(&self, row: usize, col: usize) -> usize {
+        crate::editor_wrap::vis_index(&self.line_lens(), row, col, self.text_width())
+    }
+
+    /// Keep the cursor's visual row inside the viewport (soft-wrap aware).
+    fn ensure_visible(&mut self) {
+        let text_rows = self.rows.saturating_sub(1).max(1);
+        let vr = self.vis_of(self.cy, self.cx);
+        if vr < self.top {
+            self.top = vr;
+        } else if vr >= self.top + text_rows {
+            self.top = vr + 1 - text_rows;
         }
     }
 
@@ -584,12 +625,8 @@ impl Editor {
     }
 
     fn render(&mut self) {
-        // Keep the cursor within the viewport.
-        if self.cy < self.top {
-            self.top = self.cy;
-        } else if self.cy >= self.top + self.rows {
-            self.top = self.cy - self.rows + 1;
-        }
+        self.sync_dims();
+        self.ensure_visible();
         let base = self.path.rsplit('/').next().unwrap_or(&self.path);
         let title = alloc::format!("editor: {}{}", base, if self.dirty { " [+]" } else { "" });
         let modeline = match self.mode {
@@ -599,18 +636,25 @@ impl Editor {
             Mode::Command => alloc::format!(":{}", self.cmd),
         };
         let sel = if self.mode == Mode::Visual { Some(self.sel_range()) } else { None };
-        // Syntax highlighting: per-byte colours for the visible lines (None =
-        // the theme's editor_fg). The lexer state (block comments, md fences)
-        // is seeded by a cheap scan of the lines above the viewport.
+        // Syntax highlighting for every logical line that may appear in the
+        // viewport. Soft-wrap can show a long mid-file line after many wraps, so
+        // seed the lexer from the buffer start through the first visible line.
+        let tw = self.text_width();
+        let lenses: Vec<usize> = self.line_lens();
+        let (first_line, _) = crate::editor_wrap::unvis(&lenses, self.top, tw);
+        let text_rows = self.rows.saturating_sub(1).max(1);
+        let (last_line, _) =
+            crate::editor_wrap::unvis(&lenses, self.top + text_rows.saturating_sub(1), tw);
         let hl: Option<Vec<Vec<Option<(u8, u8, u8)>>>> = crate::highlight::lang_for_path(&self.path).map(|lang| {
             let mut st = crate::highlight::State::default();
-            for line in self.lines.iter().take(self.top) {
+            for line in self.lines.iter().take(first_line) {
                 crate::highlight::advance(lang, line, &mut st);
             }
+            // Index 0 = first_line; editor_render offsets by first visible line.
             self.lines
                 .iter()
-                .skip(self.top)
-                .take(self.rows)
+                .skip(first_line)
+                .take(last_line.saturating_sub(first_line) + 1)
                 .map(|line| {
                     crate::highlight::classes(lang, line, &mut st)
                         .into_iter()
@@ -619,7 +663,17 @@ impl Editor {
                 })
                 .collect()
         });
-        crate::framebuffer::editor_render(&title, &self.lines, self.top, self.cy, self.cx, &modeline, sel, hl.as_deref());
+        crate::framebuffer::editor_render(
+            &title,
+            &self.lines,
+            self.top,
+            self.cy,
+            self.cx,
+            &modeline,
+            sel,
+            hl.as_deref(),
+            first_line,
+        );
     }
 
     /// Line-number gutter width (matches framebuffer::editor_render).
@@ -634,7 +688,7 @@ impl Editor {
     }
 
     /// Map a framebuffer pixel to an editor `(row, col)`, or `None` if outside
-    /// the text area.
+    /// the text area. Soft-wrap aware: screen row → visual row → (line, segment).
     fn cell_at(&self, px: u64, py: u64) -> Option<(usize, usize)> {
         let (ix, iy, cw, ch, cols, text_rows) = crate::framebuffer::editor_pane_geom()?;
         if px < ix || py < iy {
@@ -646,11 +700,17 @@ impl Editor {
             return None;
         }
         let g = self.gutter();
-        let col = col_scr.saturating_sub(g) as usize;
-        let row = self.top + row_scr as usize;
+        if col_scr < g {
+            return None;
+        }
+        let tw = self.text_width();
+        let col_in_row = (col_scr - g) as usize;
+        let vis = self.top + row_scr as usize;
+        let (row, seg) = crate::editor_wrap::unvis(&self.line_lens(), vis, tw);
         if row >= self.lines.len() {
             return None;
         }
+        let col = seg * tw + col_in_row;
         Some((row, col.min(self.lines[row].len().saturating_sub(1))))
     }
 

@@ -260,11 +260,31 @@ pub fn civil_from_unix(secs: i64) -> (i64, i64, i64, i64, i64, i64, i64) {
 }
 
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
-/// The current **local** time as `"Wed 2026-07-04 13:45:02"`.
+/// The current **local** time as `"Wed 2026-07-04 13:45:02"` (full, with year + seconds).
 pub fn format_datetime() -> String {
     let (y, mo, d, h, mi, s, wd) = civil_from_unix(now_unix() + tz_offset() as i64);
     format!("{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}", WEEKDAYS[wd as usize], y, mo, d, h, mi, s)
+}
+
+/// Compact **menu-bar** local time, macOS-style: `"Tue Aug 4  19:45"`.
+///
+/// No year, no seconds, no timezone — the status bar is a glance target; full
+/// detail lives in the clock dropdown (`/datetime`, status-chip menu).
+pub fn format_datetime_short() -> String {
+    let (_y, mo, d, h, mi, _s, wd) = civil_from_unix(now_unix() + tz_offset() as i64);
+    let mon = MONTHS[(mo as usize).saturating_sub(1).min(11)];
+    format!("{} {} {}  {:02}:{:02}", WEEKDAYS[wd as usize], mon, d, h, mi)
+}
+
+/// Pure form of [`format_datetime_short`] for a given Unix second + offset (tests).
+pub fn format_datetime_short_at(unix: i64, tz_secs: i32) -> String {
+    let (_y, mo, d, h, mi, _s, wd) = civil_from_unix(unix + tz_secs as i64);
+    let mon = MONTHS[(mo as usize).saturating_sub(1).min(11)];
+    format!("{} {} {}  {:02}:{:02}", WEEKDAYS[wd as usize], mon, d, h, mi)
 }
 
 /// The current UTC time as an ISO-8601 instant, `"2026-07-13T02:36:19Z"` —
@@ -303,4 +323,30 @@ pub fn format_tz() -> String {
             off_s
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn datetime_short_is_macos_menu_bar_shape() {
+        // 2026-08-04 19:45:32 UTC → weekday Tue (check civil math) at offset 0.
+        let unix = unix_from_civil(2026, 8, 4, 19, 45, 32);
+        let s = format_datetime_short_at(unix, 0);
+        // "Tue Aug 4  19:45" — no year, no seconds, double-space before time.
+        assert!(s.starts_with("Tue Aug 4"), "got {s}");
+        assert!(s.ends_with("19:45"), "got {s}");
+        assert!(!s.contains("2026"), "year must not appear in short form: {s}");
+        assert!(!s.contains(":32"), "seconds must not appear: {s}");
+        // Compact: shorter than the full form.
+        let full = {
+            let (y, mo, d, h, mi, sec, wd) = civil_from_unix(unix);
+            format!(
+                "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                WEEKDAYS[wd as usize], y, mo, d, h, mi, sec
+            )
+        };
+        assert!(s.len() < full.len(), "short={s} full={full}");
+    }
 }

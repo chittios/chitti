@@ -224,7 +224,28 @@ mod tests {
                 Some(*name),
                 "{name} name field matches"
             );
+            // Status chrome + Synapse-C logo slots must be explicit so a theme
+            // switch recolors the bar (overlay_pairs only updates present keys).
+            let pal = j.get("palette").unwrap();
+            for key in ["status_bg", "status_fg", "logo", "logo_node"] {
+                assert!(
+                    pal.get(key).and_then(|v| v.as_str()).is_some(),
+                    "{name} palette missing {key}"
+                );
+            }
         }
+    }
+
+    #[test_case]
+    fn dark_theme_matches_brand_status_and_logo() {
+        let text = load_text("dark").expect("dark theme");
+        let j = Json::parse(&text).expect("parse");
+        let pal = j.get("palette").unwrap();
+        let get = |k: &str| pal.get(k).and_then(|v| v.as_str());
+        assert_eq!(get("status_bg"), Some("#252320"));
+        assert_eq!(get("status_fg"), Some("#a09d96"));
+        assert_eq!(get("logo"), Some("#cc785c"));
+        assert_eq!(get("logo_node"), Some("#faf9f5"));
     }
 
     #[test_case]

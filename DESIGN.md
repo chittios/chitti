@@ -124,11 +124,13 @@ omit any key to keep the brand default.
   "chat_title": "chat",
   "logs_title": "ktrace",
   "status_left": "ChittiOS v${version}",
-  "status_right": "${datetime}  ${tz}",
+  "status_right": "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${datetime_short}",
   "tz_offset": 0,
   "splash": true,
   "theme": {
     "accent": "#cc785c",
+    "logo": "#cc785c",
+    "logo_node": "#faf9f5",
     "screen_bg": "#181715",
     "chat_bg": "#1f1e1b",
     "logs_bg": "#141311",
@@ -150,9 +152,14 @@ omit any key to keep the brand default.
 
 - **`theme.<slot>`** — any of the colour slots above; a light theme is just a
   different set (e.g. `screen_bg`/`chat_bg` = `#faf9f5`/`#f5f0e8`, `*_fg` = ink).
+  Status chrome uses `status_bg` / `status_fg`; the Synapse-C mark uses `logo` /
+  `logo_node` (default terracotta ring + cream node, independent of `accent`).
 - **`splash`** — show the boot splash (default `true`).
 - **`status_left` / `status_right`** — templates with `${version}`,
-  `${datetime}`, `${tz}`, `${model}`, `${arch}`, `${uptime}`, `${brand}`.
+  `${datetime}`, `${datetime_short}`, `${tz}`, `${model}`, `${arch}`,
+  `${uptime}`, `${brand}`. The default status bar uses **`${datetime_short}`**
+  (macOS-style `Tue Aug 4  19:45`); full datetime + timezone live in the clock
+  dropdown / `${datetime}` + `${tz}`.
 - Layout (`chat_pct`, `font_scale`, `swap_panes`, titles) and shortcuts
   (`/configs/core/shortcuts.json`) are configured the same way.
 
